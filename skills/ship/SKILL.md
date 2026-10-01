@@ -50,9 +50,9 @@ permission allowlist matches). Every `P` command prints one JSON object; exit co
 
 ```
 git fetch origin <default_branch>
-git worktree add <worktree_dir>/agent-<slug> -b agent/<slug> origin/<default_branch>
+git worktree add --no-track -b agent/<slug> <worktree_dir>/agent-<slug> origin/<default_branch>
 ```
-`<slug>`: 2–5 lowercase words from the request. All later work happens in that worktree; tell
+`--no-track` matters: a branch tracking `origin/main` can make a bare `git push` target main. `<slug>`: 2–5 lowercase words from the request. All later work happens in that worktree; tell
 every subagent its absolute path. Estimate risk from the paths you expect to touch (final risk
 comes from `P risk` on the real diff; the higher wins).
 
