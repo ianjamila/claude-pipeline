@@ -34,6 +34,11 @@ test('validateConfig does not mutate DEFAULTS or its input', () => {
   assert.equal(JSON.stringify(input), before);
   assert.deepEqual(DEFAULTS.ci.required_checks, []);
   assert.equal(DEFAULTS.review.effort.low, 'medium');
+  // DEFAULTS is deep-frozen; the merged config is a fresh, mutable copy.
+  assert.ok(Object.isFrozen(DEFAULTS) && Object.isFrozen(DEFAULTS.ci.required_checks));
+  assert.ok(Object.isFrozen(DEFAULTS.review.effort) && Object.isFrozen(DEFAULTS.integrity.test_globs));
+  assert.throws(() => { 'use strict'; DEFAULTS.ci.required_checks.push('x'); }, TypeError);
+  assert.ok(!Object.isFrozen(r.config) && !Object.isFrozen(r.config.ci.required_checks));
 });
 
 test('realistic eaglewatch config is ok', () => {
@@ -299,4 +304,158 @@ test('fill replaces known {name} and leaves unknown untouched', () => {
   assert.equal(fill('{pr}-{pr}', { pr: 7 }), '7-7');
   assert.equal(fill('x {n}', { n: 0 }), 'x 0');
   assert.equal(fill('{toString} {constructor}', {}), '{toString} {constructor}');
+});
+
+// ---- stricter validation (fail-closed) ----
+
+test('default merge command is exactly the safe default (pins head with {sha})', () => {
+  const r = validateConfig(minimal());
+  assert.equal(r.config.merge.command, 'gh pr merge {pr} --squash --auto --delete-branch --match-head-commit {sha}');
+});
+
+test('invalid config returns config: null so nobody can run on it', () => {
+  const r = validateConfig({ ...minimal(), enforcement: 'yolo' });
+  assert.equal(r.ok, false);
+  assert.equal(r.config, null);
+  assert.ok(validateConfig(minimal()).config !== null);
+});
+
+test('unknown keys are rejected per section, with the dotted path', () => {
+  const cases = [
+    [{ hard_stops: { path: ['x'] } }, 'unknown key: hard_stops.path'],
+    [{ risk: { high_risk_path: [] } }, 'unknown key: risk.high_risk_path'],
+    [{ integrity: { test_glob: [] } }, 'unknown key: integrity.test_glob'],
+    [{ verify: { full: 'f', quick: 'q', ful: 'x' } }, 'unknown key: verify.ful'],
+    [{ ci: { required_check: [] } }, 'unknown key: ci.required_check'],
+    [{ merge: { comand: 'x' } }, 'unknown key: merge.comand'],
+    [{ review: { max_round: 2 } }, 'unknown key: review.max_round'],
+    [{ review: { effort: { urgent: 'high' } } }, 'unknown key: review.effort.urgent'],
+    [{ preview: { environment: 'P', smoke: 'curl {url}', provder: 'x' } }, 'unknown key: preview.provder'],
+    [
+      { production: { url: 'https://x.example.com', environment: 'P', smoke: 'curl {url}', rollback: { command: 'u' }, rolback: {} } },
+      'unknown key: production.rolback',
+    ],
+    [
+      { production: { url: 'https://x.example.com', environment: 'P', smoke: 'curl {url}', rollback: { command: 'u', note: 'n' } } },
+      'unknown key: production.rollback.note',
+    ],
+    [{ hard_stops: { patterns: [{ name: 'a', regex: 'x', path: ['src'] }] } }, 'unknown key: hard_stops.patterns[0].path'],
+    [{ smoke_checks: [{ path: '/x', contain: ['a'] }] }, 'unknown key: smoke_checks[0].contain'],
+  ];
+  for (const [patch, expected] of cases) {
+    const r = validateConfig({ ...minimal(), ...patch });
+    assert.equal(r.ok, false, expected);
+    assert.ok(has(r, expected), `${expected}: ${r.errors.join(' | ')}`);
+  }
+});
+
+test('effort lanes must be exactly low|medium|high|followup', () => {
+  const r = validateConfig({ ...minimal(), review: { effort: { xhigh: 'high' } } });
+  assert.ok(has(r, 'unknown key: review.effort.xhigh'));
+  const ok = validateConfig({ ...minimal(), review: { effort: { low: 'low', medium: 'medium', high: 'xhigh', followup: 'high' } } });
+  assert.equal(ok.ok, true, ok.errors.join('; '));
+});
+
+test('inherited and __proto__ names are flagged as unknown keys (own-property check)', () => {
+  const top = JSON.parse(
+    '{"version":1,"project":"p","verify":{"full":"f","quick":"q"},"__proto__":{"x":1},"constructor":1,"toString":2}',
+  );
+  const r = validateConfig(top);
+  assert.equal(r.ok, false);
+  for (const k of ['__proto__', 'constructor', 'toString']) assert.ok(has(r, `unknown key: ${k}`), `${k}: ${r.errors.join(' | ')}`);
+  const nested = validateConfig({ ...minimal(), verify: JSON.parse('{"full":"f","quick":"q","constructor":"x","__proto__":"y"}') });
+  assert.ok(has(nested, 'unknown key: verify.constructor'));
+  assert.ok(has(nested, 'unknown key: verify.__proto__'));
+  const lanes = validateConfig({ ...minimal(), review: { effort: JSON.parse('{"toString":"high"}') } });
+  assert.ok(has(lanes, 'unknown key: review.effort.toString'));
+});
+
+test('removed keys stay unknown: review.exempt_docs_only and top-level labels', () => {
+  const r = validateConfig({ ...minimal(), review: { exempt_docs_only: true }, labels: ['x'] });
+  assert.ok(has(r, 'unknown key: review.exempt_docs_only'));
+  assert.ok(has(r, 'unknown key: labels'));
+});
+
+test('numeric fields must be non-negative integers', () => {
+  const cases = [
+    [{ risk: { medium_lines: -1 } }, 'risk.medium_lines'],
+    [{ risk: { medium_lines: 1.5 } }, 'risk.medium_lines'],
+    [{ risk: { medium_lines: '150' } }, 'risk.medium_lines'],
+    [{ risk: { high_lines: -5 } }, 'risk.high_lines'],
+    [{ risk: { high_lines: null } }, 'risk.high_lines'],
+    [{ risk: { medium_files: 'ten' } }, 'risk.medium_files'],
+    [{ risk: { medium_files: -1 } }, 'risk.medium_files'],
+    [{ review: { light_lane_max_lines: -1 } }, 'review.light_lane_max_lines'],
+    [{ review: { light_lane_max_lines: true } }, 'review.light_lane_max_lines'],
+  ];
+  for (const [patch, expected] of cases) {
+    const r = validateConfig({ ...minimal(), ...patch });
+    assert.equal(r.ok, false, JSON.stringify(patch));
+    assert.ok(has(r, expected), `${expected}: ${r.errors.join(' | ')}`);
+  }
+  assert.equal(validateConfig({ ...minimal(), risk: { medium_lines: 0, high_lines: 0, medium_files: 0 }, review: { light_lane_max_lines: 0 } }).ok, true);
+});
+
+test('merge.wait_minutes must be an integer 1..120', () => {
+  for (const bad of [0, -3, 121, 2.5, '15', null]) {
+    const r = validateConfig({ ...minimal(), merge: { wait_minutes: bad } });
+    assert.ok(has(r, 'merge.wait_minutes'), `${bad}: ${r.errors.join(' | ')}`);
+  }
+  assert.equal(validateConfig({ ...minimal(), merge: { wait_minutes: 1 } }).ok, true);
+  assert.equal(validateConfig({ ...minimal(), merge: { wait_minutes: 120 } }).ok, true);
+});
+
+test('risk.medium_lines <= risk.high_lines, and light_lane_max_lines <= risk.medium_lines', () => {
+  const inverted = validateConfig({ ...minimal(), risk: { medium_lines: 700, high_lines: 600 } });
+  assert.ok(has(inverted, 'risk.medium_lines must be <= risk.high_lines'), inverted.errors.join(' | '));
+  assert.equal(validateConfig({ ...minimal(), risk: { medium_lines: 600, high_lines: 600 } }).ok, true);
+  const light = validateConfig({ ...minimal(), risk: { medium_lines: 40 } });
+  assert.ok(has(light, 'review.light_lane_max_lines must be <= risk.medium_lines'), light.errors.join(' | '));
+  const lightOk = validateConfig({ ...minimal(), risk: { medium_lines: 40 }, review: { light_lane_max_lines: 40 } });
+  assert.equal(lightOk.ok, true, lightOk.errors.join('; '));
+});
+
+test('production.deploy_timeout_minutes: 0 is rejected (and 121, 1.5)', () => {
+  const prod = (n) => ({
+    ...minimal(),
+    production: { url: 'https://x.example.com', environment: 'P', smoke: 'curl {url}', rollback: { command: 'u' }, deploy_timeout_minutes: n },
+  });
+  for (const bad of [0, 121, 1.5, -1]) assert.ok(has(validateConfig(prod(bad)), 'deploy_timeout_minutes'), String(bad));
+  assert.equal(validateConfig(prod(1)).ok, true);
+});
+
+test('smoke_checks[].status must be a non-empty array of integers 100..599', () => {
+  const bad = (status) => validateConfig({ ...minimal(), smoke_checks: [{ path: '/x', status }] });
+  for (const s of [[], [99], [600], [200.5], ['200'], 200]) {
+    assert.ok(has(bad(s), 'smoke_checks[0].status'), JSON.stringify(s));
+  }
+  assert.equal(bad([100, 599]).ok, true);
+  assert.equal(validateConfig({ ...minimal(), smoke_checks: [{ path: '/x' }] }).ok, true);
+});
+
+test('fill never interprets $ patterns in values', () => {
+  assert.equal(fill('x {v} y', { v: '$&' }), 'x $& y');
+  assert.equal(fill('x {v} y', { v: '$1' }), 'x $1 y');
+  assert.equal(fill('x {v} y', { v: "$'" }), "x $' y");
+  assert.equal(fill('x {v} y', { v: '$`' }), 'x $` y');
+  assert.equal(fill('x {v} y', { v: '$$' }), 'x $$ y');
+});
+
+test('fill strict: throws on missing, undefined, null or empty values for placeholders in the template', () => {
+  const tpl = 'npm run merge -- {pr} --expect-head {sha}';
+  assert.equal(fill(tpl, { pr: 12, sha: 'abc' }, { strict: true }), 'npm run merge -- 12 --expect-head abc');
+  assert.throws(() => fill(tpl, { pr: 12, sha: undefined }, { strict: true }), /sha/);
+  assert.throws(() => fill(tpl, { pr: 12, sha: '' }, { strict: true }), /sha/);
+  assert.throws(() => fill(tpl, { pr: 12, sha: null }, { strict: true }), /sha/);
+  assert.throws(() => fill(tpl, { pr: 12 }, { strict: true }), /sha/);
+  assert.throws(() => fill('{url}/login', {}, { strict: true }), /url/);
+  // every missing name is reported
+  assert.throws(() => fill(tpl, {}, { strict: true }), (e) => /pr/.test(e.message) && /sha/.test(e.message));
+  // values for names the template does not use are irrelevant
+  assert.equal(fill('{pr}', { pr: 3, sha: undefined }, { strict: true }), '3');
+  // 0 is a real value
+  assert.equal(fill('{n}', { n: 0 }, { strict: true }), '0');
+  // non-strict behaviour is unchanged
+  assert.equal(fill('{url}/login', {}), '{url}/login');
+  assert.equal(fill('{url}/login', {}, { strict: false }), '{url}/login');
 });
