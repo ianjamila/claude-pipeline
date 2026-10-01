@@ -17,8 +17,11 @@ export function realGitWiring() {
   };
 
   // Where git would send a bare `git push` (e.g. "origin/main"); null when it cannot say (no upstream, detached, error).
-  const pushDestination = (dir, { gitDir } = {}) => {
-    const args = ['-C', dir, ...(gitDir ? ['--git-dir', gitDir] : []), 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{push}'];
+  // With `branch` it answers for that branch instead of HEAD (a branch the command line switches to first).
+  const pushDestination = (dir, { gitDir, branch } = {}) => {
+    if (branch !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch)) return null; // never feed odd text to rev-parse
+    const rev = branch === undefined ? '@{push}' : `${branch}@{push}`;
+    const args = ['-C', dir, ...(gitDir ? ['--git-dir', gitDir] : []), 'rev-parse', '--abbrev-ref', '--symbolic-full-name', rev];
     const r = run('git', args, { timeoutMs: PUSH_LOOKUP_TIMEOUT_MS });
     const dest = r.stdout.trim();
     return r.code === 0 && dest ? dest : null;

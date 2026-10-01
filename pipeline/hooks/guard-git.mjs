@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Why: global PreToolUse hook (matcher `Bash`, ~/.claude/settings.json) that stops any agent in any repo from
+// Why: global PreToolUse hook (matcher `Bash|PowerShell`, ~/.claude/settings.json) that stops any agent in any repo from
 // pushing to main, force-pushing, admin-merging, editing protection, approving its own work with owner-only
 // labels, or closing pause/rollback issues. All judgement lives in lib/git-policy.mjs; this file only wires the
 // real branch/label lookups (lib/git-wiring.mjs, shared with `pipeline job start`). The policy and wiring modules
@@ -8,7 +8,8 @@
 import { runHook } from './lib/hook-io.mjs';
 
 async function evaluate(input) {
-  if (input.tool_name !== 'Bash') return { decision: 'allow', reason: '' };
+  // Bash and PowerShell take the same `tool_input.command` text; the shell parser reads both spellings
+  if (input.tool_name !== 'Bash' && input.tool_name !== 'PowerShell') return { decision: 'allow', reason: '' };
   const { evaluateGitCommand } = await import('./lib/git-policy.mjs');
   const { realGitWiring } = await import('./lib/git-wiring.mjs');
 
