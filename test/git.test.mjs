@@ -1,11 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
-import { symlinkSync, rmSync, cpSync } from 'node:fs';
+import { symlinkSync, rmSync, cpSync, writeFileSync, mkdtempSync, chmodSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import {
   git, GitError, mergeBase, headSha, currentBranch, isClean, revParse, diffFiles, showFile, grepAtRef,
   commitTime, contentHash, treeFingerprint,
 } from '../pipeline/lib/git.mjs';
+import { run } from '../pipeline/lib/proc.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 
 // A repo with `main` holding a few files, plus helpers bound to it.
@@ -17,6 +19,28 @@ function baseRepo() {
   const base = repo.commit('base');
   return { repo, base, o: { cwd: repo.dir } };
 }
+
+const REDIRECTING_ENV = [
+  'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+  'GIT_COMMON_DIR', 'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES',
+];
+
+// Sets process.env for the duration of fn (sync) and restores it, even on failure.
+function withProcessEnv(vars, fn) {
+  const saved = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+  Object.assign(process.env, vars);
+  try {
+    return fn();
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
+// A runner that behaves like proc.run but with the result tampered by `patch` (what a killed/missing git looks like).
+const fakeRun = (result) => () => ({ code: 0, stdout: '', stderr: '', timedOut: false, signal: null, ...result });
 
 test('diffFiles: added/removed lines with line numbers, and a rename detected as R', () => {
   const { repo, o } = baseRepo();
@@ -390,11 +414,18 @@ test('git() forces its config and environment through an injected runner, and re
   assert.equal(calls[0].cmd, 'git');
   assert.deepEqual(calls[0].args, [
     '-c', 'core.quotePath=true', '-c', 'diff.noprefix=false', '-c', 'diff.mnemonicPrefix=false',
-    '-c', 'diff.renames=true', '-c', 'color.ui=false', '-c', 'core.autocrlf=false', 'status', '--short',
+    '-c', 'diff.renames=true', '-c', 'color.ui=false', '-c', 'core.autocrlf=false',
+    '-c', 'diff.interHunkContext=0', '-c', 'diff.algorithm=myers', '-c', 'diff.indentHeuristic=true', 'status', '--short',
   ]);
   assert.equal(calls[0].opts.cwd, '/somewhere');
   assert.equal(calls[0].opts.input, 'piped');
   assert.equal(calls[0].opts.env.LC_ALL, 'C'); // stderr is matched by text, so it must not be translated
+  for (const k of REDIRECTING_ENV) {
+    assert.ok(k in calls[0].opts.env && calls[0].opts.env[k] === undefined, `${k} must be scrubbed from the child env`);
+  }
+  git(['status'], { run: fake, env: { GIT_DIR: '/explicit' } });
+  assert.equal(calls[1].opts.env.GIT_DIR, '/explicit'); // unless the caller asks for it
+  assert.equal(calls[1].opts.env.GIT_WORK_TREE, undefined);
 
   const failing = () => ({ code: 128, stdout: '', stderr: 'fatal: boom\n', timedOut: false });
   assert.throws(() => git(['log'], { run: failing }), (e) => e instanceof GitError && e.code === 128 && e.stderr === 'fatal: boom\n');
@@ -410,4 +441,309 @@ test('refs that look like options or are empty are rejected before git sees them
     assert.throws(() => grepAtRef(bad, 'x', o), GitError);
     assert.throws(() => commitTime(bad, o), GitError);
   }
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Review hardening
+// ---------------------------------------------------------------------------------------------------------------
+
+const dupSource = (aReturn, bReturn) => [
+  'function a() {', '  const first = 1;', '  const second = 2;', '  const third = 3;', `  return ${aReturn};`, '}', '',
+  'function b() {', "  const alpha = 'a';", "  const beta = 'b';", "  const gamma = 'c';", `  return ${bReturn};`, '}', '',
+].join('\n');
+
+test('contentHash: the identical edit relocated to a different function changes the hash', () => {
+  const { repo, o } = baseRepo();
+  repo.write('src/dup.js', dupSource('false', 'false'));
+  repo.commit('two functions');
+  repo.branch('edit-a');
+  repo.write('src/dup.js', dupSource('true', 'false'));
+  repo.commit('flip a');
+  repo.checkout('main');
+  repo.branch('edit-b');
+  repo.write('src/dup.js', dupSource('false', 'true'));
+  repo.commit('flip b');
+  // the changed lines are byte-identical (`-  return false;` / `+  return true;`); only the context tells them apart
+  assert.notEqual(contentHash('main', 'edit-a', o), contentHash('main', 'edit-b', o));
+  // and the same edit in the same place is still the same hash
+  repo.checkout('main');
+  repo.branch('edit-a-again');
+  repo.write('src/dup.js', dupSource('true', 'false'));
+  repo.commit('flip a, different message');
+  assert.equal(contentHash('main', 'edit-a-again', o), contentHash('main', 'edit-a', o));
+});
+
+// 40-line file; `over` replaces numbered lines.
+const longFile = (over = {}) => Array.from({ length: 40 }, (_, i) => over[i + 1] ?? `const v${i + 1} = ${i + 1};`).join('\n') + '\n';
+
+// The branch edits line 30; then main edits `mainLine` of the same file and the branch merges main.
+function hashAcrossBaseEdit(mainLine) {
+  const { repo, o } = baseRepo();
+  repo.write('src/long.js', longFile());
+  repo.commit('long file');
+  repo.branch('feat');
+  repo.write('src/long.js', longFile({ 30: 'const v30 = "changed";' }));
+  repo.commit('feature');
+  const before = contentHash('main', 'feat', o);
+  repo.checkout('main');
+  repo.write('src/long.js', longFile({ [mainLine]: `const v${mainLine} = "main edit";` }));
+  repo.commit('main edits the same file');
+  repo.checkout('feat');
+  repo.git(['merge', '--no-ff', '-q', '-m', 'merge main', 'main']);
+  return { before, after: contentHash('main', 'feat', o) };
+}
+
+test('contentHash: a base edit more than 3 lines from the PR hunk keeps the hash; within 3 lines changes it (forces re-review)', () => {
+  for (const line of [5, 26, 34]) { // 26 and 34 are the first lines OUTSIDE the 3-line context of the edit at 30
+    const { before, after } = hashAcrossBaseEdit(line);
+    assert.equal(after, before, `base edit at line ${line} must not change the hash`);
+  }
+  for (const line of [27, 33]) { // the last lines INSIDE the context
+    const { before, after } = hashAcrossBaseEdit(line);
+    assert.notEqual(after, before, `base edit at line ${line} sits in the hunk's context and must change the hash`);
+  }
+});
+
+test('diffFiles still returns lines for files git would call binary (NUL byte, -diff attribute)', () => {
+  const { repo, o } = baseRepo();
+  repo.write('.gitattributes', '*.ts -diff\n');
+  repo.write('src/x.test.ts', 'it("keeps", () => {});\nit("drops", () => {});\n');
+  repo.write('src/y.test.js', 'it("keeps", () => {});\nit("drops", () => {});\n');
+  repo.commit('test files');
+  repo.branch('feat');
+  repo.write('src/x.test.ts', 'it("keeps", () => {});\nit.skip("drops", () => {});\n');
+  repo.write('src/y.test.js', 'it("keeps", () => {});\nit.skip("drops", () => {}); // note:\0 nul\n');
+  repo.commit('skip them');
+
+  // precondition: plain git really does hide both
+  assert.equal(repo.git(['diff', '-U0', 'main..feat']).match(/Binary files/g).length, 2);
+
+  const by = Object.fromEntries(diffFiles('main', 'feat', o).map((f) => [f.path, f]));
+  for (const p of ['src/x.test.ts', 'src/y.test.js']) {
+    assert.equal(by[p].binary, false, p);
+    assert.deepEqual(by[p].removed, [{ line: 2, text: 'it("drops", () => {});' }], p);
+    assert.equal(by[p].added.length, 1, p);
+    assert.match(by[p].added[0].text, /^it\.skip\("drops", \(\) => \{\}\);/, p);
+  }
+  assert.ok(by['src/y.test.js'].added[0].text.includes('\0'));
+});
+
+test('contentHash and treeFingerprint stay byte-exact for NUL and -diff files, even for invalid UTF-8 bytes', () => {
+  const { repo, o } = baseRepo();
+  repo.write('.gitattributes', '*.dat -diff\n');
+  repo.write('legacy.dat', Buffer.from('caf\xe9 one\n', 'latin1'));
+  repo.commit('latin-1 data file');
+  repo.branch('e9');
+  repo.write('legacy.dat', Buffer.from('caf\xe9 two\n', 'latin1'));
+  repo.commit('e9');
+  repo.checkout('main');
+  repo.branch('ea');
+  repo.write('legacy.dat', Buffer.from('caf\xea two\n', 'latin1'));
+  repo.commit('ea');
+  // 0xE9 and 0xEA are both invalid UTF-8: decoded as text they would collapse to the same U+FFFD
+  assert.notEqual(contentHash('main', 'e9', o), contentHash('main', 'ea', o));
+
+  repo.checkout('main');
+  const f0 = treeFingerprint(o);
+  repo.write('legacy.dat', Buffer.from('caf\xe9 one!\n', 'latin1'));
+  const f1 = treeFingerprint(o);
+  repo.write('legacy.dat', Buffer.from('caf\xea one!\n', 'latin1'));
+  const f2 = treeFingerprint(o);
+  assert.equal(new Set([f0, f1, f2]).size, 3);
+});
+
+test('a textconv driver configured in the repo cannot change contentHash or treeFingerprint', () => {
+  const { repo, o } = baseRepo();
+  // a converter whose output differs on every call: if git ever applies it, nothing is reproducible
+  const script = join(repo.dir, '.git', 'textconv.mjs');
+  writeFileSync(script, 'process.stdout.write(`${process.hrtime.bigint()}-${Math.random()}\\n`);\n');
+  repo.git(['config', 'diff.noisy.textconv', `node "${script.replaceAll('\\', '/')}"`]);
+  repo.write('.gitattributes', '*.txt diff=noisy\n');
+  repo.write('notes.txt', 'v1\n');
+  repo.commit('notes');
+  repo.branch('feat');
+  repo.write('notes.txt', 'v2\n');
+  repo.commit('change notes');
+
+  // precondition: the driver is live, so plain `git diff` is not reproducible here
+  assert.notEqual(repo.git(['diff', '-U0', 'main..feat']), repo.git(['diff', '-U0', 'main..feat']));
+
+  const h = contentHash('main', 'feat', o);
+  assert.equal(contentHash('main', 'feat', o), h);
+  repo.write('notes.txt', 'v3 uncommitted\n');
+  assert.notEqual(repo.git(['diff', 'HEAD']), repo.git(['diff', 'HEAD']));
+  const f = treeFingerprint(o);
+  assert.equal(treeFingerprint(o), f);
+});
+
+test('git() ignores repo-redirecting variables from the process env, unless the caller passes them explicitly', () => {
+  const a = baseRepo();
+  const b = createTmpRepo();
+  b.write('only-b.txt', 'b\n');
+  const bSha = b.commit('b root');
+  const redirect = {
+    GIT_DIR: join(a.repo.dir, '.git'),
+    GIT_WORK_TREE: a.repo.dir,
+    GIT_INDEX_FILE: join(a.repo.dir, '.git', 'index'),
+    GIT_OBJECT_DIRECTORY: join(a.repo.dir, '.git', 'objects'),
+    GIT_COMMON_DIR: join(a.repo.dir, '.git'),
+    GIT_NAMESPACE: 'elsewhere',
+    GIT_CEILING_DIRECTORIES: tmpdir(),
+    GIT_ALTERNATE_OBJECT_DIRECTORIES: join(a.repo.dir, '.git', 'objects'),
+  };
+  assert.deepEqual(Object.keys(redirect).sort(), [...REDIRECTING_ENV].sort());
+  withProcessEnv(redirect, () => {
+    assert.notEqual(a.base, bSha);
+    assert.equal(headSha({ cwd: b.dir }), bSha);
+    assert.equal(currentBranch({ cwd: b.dir }), 'main');
+    assert.equal(isClean({ cwd: b.dir }), true);
+    assert.equal(showFile('HEAD', 'only-b.txt', { cwd: b.dir }), 'b\n'); // B's tree, not A's
+    // an explicit env option is the one way to point git elsewhere
+    assert.equal(git(['rev-parse', 'HEAD'], { cwd: b.dir, env: { GIT_DIR: join(a.repo.dir, '.git') } }).trim(), a.base);
+  });
+});
+
+test('fail closed: a git that failed to run is never read as "no match", "not found" or "detached"', (t) => {
+  const { o } = baseRepo();
+
+  // real failures
+  const missingCwd = { cwd: join(tmpdir(), `cp-git-missing-dir-${process.pid}`) };
+  for (const call of [
+    () => grepAtRef('HEAD', 'x', missingCwd), () => currentBranch(missingCwd), () => mergeBase('HEAD', 'HEAD', missingCwd),
+    () => showFile('HEAD', 'a.txt', missingCwd), () => isClean(missingCwd), () => headSha(missingCwd),
+  ]) assert.throws(call, GitError);
+
+  const notRepo = mkdtempSync(join(tmpdir(), 'cp-git-norepo-'));
+  try {
+    const nr = { cwd: notRepo, env: { GIT_CEILING_DIRECTORIES: tmpdir() } }; // never walk up into some enclosing repo
+    assert.throws(() => grepAtRef('HEAD', 'x', nr), GitError);
+    assert.throws(() => currentBranch(nr), GitError);
+    assert.throws(() => showFile('HEAD', 'a.txt', nr), GitError);
+  } finally {
+    rmSync(notRepo, { recursive: true, force: true });
+  }
+
+  if (process.platform !== 'win32') {
+    const noGit = { ...o, env: { PATH: join(tmpdir(), 'cp-git-no-such-bin-dir') } }; // git cannot be found
+    assert.throws(() => grepAtRef('HEAD', 'x', noGit), (e) => e instanceof GitError && /ENOENT/.test(e.stderr));
+    assert.throws(() => currentBranch(noGit), (e) => e instanceof GitError && /ENOENT/.test(e.stderr));
+    const killed = { ...o, run: (cmd, args, opts) => run(process.execPath, ['-e', "process.kill(process.pid, 'SIGKILL')"], { cwd: opts.cwd }) };
+    assert.throws(() => grepAtRef('HEAD', 'x', killed), (e) => e instanceof GitError && /SIGKILL/.test(e.stderr));
+    assert.throws(() => currentBranch(killed), (e) => e instanceof GitError && /SIGKILL/.test(e.stderr));
+  } else {
+    t.diagnostic('real missing-git and signal cases skipped on win32; the injected cases below cover the logic');
+  }
+
+  // injected runners: git's documented answers vs everything else
+  const noMatch = fakeRun({ code: 1 });
+  assert.equal(grepAtRef('HEAD', 'x', { run: noMatch }), false); // exit 1, nothing on stderr: git says "no match"
+  assert.equal(currentBranch({ run: noMatch }), 'HEAD'); // exit 1 with -q: HEAD is not a symbolic ref
+  assert.throws(() => mergeBase('a', 'b', { run: noMatch }), (e) => e instanceof GitError && /no common ancestor/.test(e.stderr));
+
+  for (const [label, patch] of [
+    ['exit 1 with stderr (spawn failure)', { code: 1, stderr: 'spawnSync git ENOENT' }],
+    ['killed by a signal', { code: 1, signal: 'SIGKILL' }],
+    ['timed out', { code: 1, timedOut: true }],
+    ['exit 2', { code: 2 }],
+    ['exit 128', { code: 128, stderr: 'fatal: not a git repository' }],
+    ['exit 129', { code: 129, stderr: 'usage: git grep' }],
+  ]) {
+    const r = { run: fakeRun(patch) };
+    assert.throws(() => grepAtRef('HEAD', 'x', r), GitError, `grepAtRef: ${label}`);
+    assert.throws(() => currentBranch(r), GitError, `currentBranch: ${label}`);
+    assert.throws(() => mergeBase('a', 'b', r), (e) => e instanceof GitError && !/no common ancestor/.test(e.stderr), `mergeBase: ${label}`);
+    assert.throws(() => showFile('HEAD', 'p', r), GitError, `showFile: ${label}`);
+    assert.throws(() => isClean(r), GitError, `isClean: ${label}`);
+  }
+  // a signal or timeout wins even over a zero exit code with output
+  assert.throws(() => headSha({ run: fakeRun({ code: 0, stdout: 'abc\n', signal: 'SIGTERM' }) }), GitError);
+  assert.throws(() => headSha({ run: fakeRun({ code: 0, stdout: 'abc\n', timedOut: true }) }), GitError);
+
+  // showFile: null only for git's two documented "not in the tree" messages, with exit 128
+  const missing = (stderr, code = 128) => ({ run: fakeRun({ code, stderr }) });
+  assert.equal(showFile('HEAD', 'p', missing("fatal: path 'p' does not exist in 'HEAD'")), null);
+  assert.equal(showFile('HEAD', 'p', missing("fatal: path 'p' exists on disk, but not in 'HEAD'")), null);
+  assert.throws(() => showFile('HEAD', 'p', missing("fatal: path 'p' does not exist in 'HEAD'", 1)), GitError);
+  assert.throws(() => showFile('HEAD', 'p', missing("fatal: bad object HEAD")), GitError);
+});
+
+test('contentHash exclude is literal and anchored at the repo root', () => {
+  const { repo, o } = baseRepo();
+  repo.write('docs/other.md', 'other\n');
+  repo.write('sub/docs/agent-log.md', 'nested\n');
+  repo.commit('more files');
+  const ex = { ...o, exclude: ['docs/agent-log.md'] };
+  const emptyHash = contentHash('main', 'main', o);
+
+  repo.branch('log-only');
+  repo.write('docs/agent-log.md', '# log\nentry\n');
+  repo.commit('log');
+  assert.equal(contentHash('main', 'log-only', ex), emptyHash); // the excluded file is the only change
+
+  for (const [i, p] of ['docs/other.md', 'sub/docs/agent-log.md', 'agent-log.md', 'docs/agent-log.md.bak', 'src/a.js'].entries()) {
+    repo.checkout('main');
+    repo.branch(`edit-${i}`);
+    repo.write(p, 'edited\n');
+    repo.commit(`edit ${p}`);
+    assert.notEqual(contentHash('main', `edit-${i}`, ex), emptyHash, `${p} must not be excluded`);
+  }
+
+  // `*` is not a wildcard: nothing is called `*.js`, so nothing is excluded
+  repo.checkout('main');
+  repo.branch('js');
+  repo.write('src/a.js', 'changed\n');
+  repo.write('src/keep.js', 'changed too\n');
+  repo.commit('js changes');
+  const plain = contentHash('main', 'js', o);
+  for (const glob of ['*.js', 'src/*', 'src/**', 'src/?.js', ':(glob)src/*']) {
+    assert.equal(contentHash('main', 'js', { ...o, exclude: [glob] }), plain, glob);
+  }
+});
+
+test('treeFingerprint: a tracked binary file changing, even between invalid-UTF-8 byte values', () => {
+  const { repo, o } = baseRepo();
+  repo.write('img.bin', Buffer.from([0, 1, 255, 254]));
+  repo.commit('binary');
+  const f0 = treeFingerprint(o);
+  repo.write('img.bin', Buffer.from([0, 1, 255, 253]));
+  const f1 = treeFingerprint(o);
+  assert.notEqual(f1, f0);
+  repo.write('img.bin', Buffer.from([0, 1, 255, 254]));
+  assert.equal(treeFingerprint(o), f0); // back to the committed bytes
+});
+
+test('treeFingerprint: renaming an untracked file changes it, content unchanged', () => {
+  const { repo, o } = baseRepo();
+  repo.write('first.txt', 'same bytes\n');
+  const f1 = treeFingerprint(o);
+  repo.write('second.txt', 'same bytes\n');
+  repo.rm('first.txt');
+  const f2 = treeFingerprint(o);
+  assert.notEqual(f2, f1);
+  repo.write('dir/second.txt', 'same bytes\n');
+  repo.rm('second.txt');
+  assert.notEqual(treeFingerprint(o), f2); // moving it into a directory counts too
+});
+
+// Flips the exec bit in the index and on disk (with core.fileMode on, an index-only flip leaves the worktree dirty).
+function makeExecutable(repo, rel) {
+  repo.git(['update-index', '--chmod=+x', rel]);
+  chmodSync(join(repo.dir, rel), 0o755);
+}
+
+test('contentHash: a mode-only change (chmod +x) changes the hash', () => {
+  const { repo, o } = baseRepo();
+  repo.branch('mode');
+  makeExecutable(repo, 'src/keep.js');
+  repo.git(['commit', '-q', '-m', 'make executable']);
+  // precondition: the diff really is mode-only
+  assert.match(repo.git(['diff', 'main..mode']), /old mode 100644\nnew mode 100755/);
+  assert.doesNotMatch(repo.git(['diff', 'main..mode']), /^@@/m);
+  assert.notEqual(contentHash('main', 'mode', o), contentHash('main', 'main', o));
+  // and the mode bit is part of the hash, not just "some change": +x vs a different file made +x
+  repo.checkout('main');
+  repo.branch('mode-other');
+  makeExecutable(repo, 'src/a.js');
+  repo.git(['commit', '-q', '-m', 'make a executable']);
+  assert.notEqual(contentHash('main', 'mode', o), contentHash('main', 'mode-other', o));
 });

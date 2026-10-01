@@ -1,8 +1,12 @@
 // The only way the pipeline reads git. Three jobs: PR diffs for hard-stop/integrity checks, a content hash that proves
 // the code that was reviewed is the code being merged, and a working-tree fingerprint that binds a verify report to
-// one exact tree. Because those outputs feed trust decisions, git() forces the config that shapes its output (a user's
-// diff.noprefix or core.quotePath must not change what the parser sees) and LC_ALL=C (stderr is matched by text).
-// Reads go through proc.run, so output is decoded as UTF-8: invalid UTF-8 inside a diffed text file is not byte-exact.
+// one exact tree. Because those outputs feed trust decisions, git() pins everything that could change them: the config
+// that shapes diff output (a user's diff.noprefix or core.quotePath must not change what the parser sees), LC_ALL=C
+// (stderr is matched by text), and the GIT_* variables that would silently point git at a different repository.
+// Fail closed: a git that did not run, was killed or timed out is an error, never an answer ("no match", "no such
+// file", "detached"). Only git's own documented answers (see gitOrNull, showFile) are mapped to false/null/'HEAD'.
+// Reads go through proc.run, so output is decoded as UTF-8: invalid UTF-8 inside a diffed text-looking file is not
+// byte-exact (binary files are: --binary emits ASCII).
 import { createHash } from 'node:crypto';
 import { openSync, readSync, closeSync, lstatSync, readlinkSync } from 'node:fs';
 import { join } from 'node:path';
@@ -19,16 +23,36 @@ export class GitError extends Error {
   }
 }
 
+// interHunkContext/algorithm/indentHeuristic decide where git cuts hunks and which of several equal diffs it prints, so
+// leaving them to user config would let the same change hash differently on two machines.
 const FORCED_CONFIG = [
   '-c', 'core.quotePath=true', '-c', 'diff.noprefix=false', '-c', 'diff.mnemonicPrefix=false',
   '-c', 'diff.renames=true', '-c', 'color.ui=false', '-c', 'core.autocrlf=false',
+  '-c', 'diff.interHunkContext=0', '-c', 'diff.algorithm=myers', '-c', 'diff.indentHeuristic=true',
 ];
 // GIT_OPTIONAL_LOCKS=0: these are reads; they must never fight a concurrent git for the index lock.
 const GIT_ENV = { LC_ALL: 'C', GIT_OPTIONAL_LOCKS: '0' };
+// Variables that make git operate on some other repository than `cwd` (a hook or wrapper leaves them behind).
+// An undefined value removes the variable from the child's environment (proc.run merges over process.env).
+const SCRUBBED_ENV = Object.fromEntries([
+  'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+  'GIT_COMMON_DIR', 'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES',
+].map((k) => [k, undefined]));
 
-// Runs git with forced config and returns stdout untouched (callers trim what they need to).
-export function git(args, { cwd, run: runFn = run, input } = {}) {
-  const r = runFn('git', [...FORCED_CONFIG, ...args], { cwd, env: GIT_ENV, input });
+// Runs git with forced config; returns the raw result unless the process did not finish on its own. `env` is the
+// one way to point git elsewhere on purpose (e.g. GIT_CEILING_DIRECTORIES in a test).
+function exec(args, { cwd, run: runFn = run, input, env } = {}) {
+  const r = runFn('git', [...FORCED_CONFIG, ...args], { cwd, env: { ...SCRUBBED_ENV, ...GIT_ENV, ...env }, input });
+  const abnormal = r.timedOut ? 'timed out' : r.signal ? `terminated by signal ${r.signal}` : null;
+  if (abnormal) {
+    throw new GitError({ args, code: r.code, stderr: [abnormal, (r.stderr ?? '').trim()].filter(Boolean).join(': ') });
+  }
+  return r;
+}
+
+// Returns stdout untouched (callers trim what they need to); throws GitError on any non-zero exit.
+export function git(args, o) {
+  const r = exec(args, o);
   if (r.code !== 0) throw new GitError({ args, code: r.code, stderr: r.stderr });
   return r.stdout;
 }
@@ -42,14 +66,15 @@ function assertRef(ref, args) {
   return ref;
 }
 
-// Runs git and maps one exit code to `null` (the caller's "answer is no", e.g. grep found nothing); anything else throws.
+// Runs git and maps git's own "no" to `null` (grep found nothing, HEAD is not a symbolic ref, no merge base). That
+// answer is exactly `expectedCode` with NOTHING on stderr. proc.run reports a spawn failure (missing git, missing cwd)
+// as code 1 with the error text on stderr, and a killed child as code 1 and an empty stderr plus `signal`; both are
+// told apart here, so only a real answer from a git that ran is ever swallowed. Everything else throws.
 function gitOrNull(args, expectedCode, o) {
-  try {
-    return git(args, o);
-  } catch (e) {
-    if (e instanceof GitError && e.code === expectedCode) return null;
-    throw e;
-  }
+  const r = exec(args, o); // throws for signals and timeouts
+  if (r.code === 0) return r.stdout;
+  if (r.code === expectedCode && (r.stderr ?? '').trim() === '') return null;
+  throw new GitError({ args, code: r.code, stderr: r.stderr });
 }
 
 export function mergeBase(a, b, o) {
@@ -74,10 +99,13 @@ export const revParse = (ref, o) => git(['rev-parse', '--verify', assertRef(ref,
 
 // What the branch changes relative to where it forked: the diff is taken from the merge-base, not from `base`'s tip,
 // so commits that landed on base after the fork never show up as the branch deleting them.
+// --text: a NUL byte in a comment, or a `*.ts -diff` line in .gitattributes, makes git print "Binary files differ" and
+// no lines at all, which would hide an added `.skip` or a deleted test from every check built on this. --no-textconv /
+// --no-ext-diff: a repo-configured converter or external diff tool must not rewrite what we parse (or run at all).
 export function diffFiles(base, head, o) {
   const mb = mergeBase(base, head, o);
   const text = git([
-    'diff', '-M', '--unified=0', '--no-color', '--no-ext-diff', '--src-prefix=a/', '--dst-prefix=b/',
+    'diff', '-M', '--unified=0', '--no-color', '--no-ext-diff', '--no-textconv', '--text', '--src-prefix=a/', '--dst-prefix=b/',
     `${mb}..${assertRef(head, ['diff', head])}`,
   ], o);
   return parseUnifiedDiff(text);
@@ -120,6 +148,7 @@ const INDEX_LINE = /^index [0-9a-f]+\.\.[0-9a-f]+(?: \d+)?$/;
 // Makes a diff independent of where in the file, and on top of which base, the change sits:
 // `@@ -a,b +c,d @@ <function context>` becomes `@@`, and the `index` blob ids are dropped. Both move whenever the base
 // edits the same file (verified: hunk header AND index line change), so keeping either would defeat the point.
+// What is left per hunk is the change plus its context lines, which is what pins an edit to its location.
 // Split on \n by hand: a regex `^` with /m also matches after U+2028/U+2029/\r inside content, which would let a
 // crafted content line be rewritten.
 function normaliseDiff(text) {
@@ -131,14 +160,29 @@ function normaliseDiff(text) {
   return out.join('\n');
 }
 
-// sha256 of the changes the branch makes (-U0, binary-safe), insensitive to pure line shifts from a base update and
-// sensitive to every byte of changed content, whitespace included. `exclude` paths (e.g. an agent log the pipeline
-// itself appends to) are left out. Pathspecs are anchored at the repo root so cwd cannot narrow what is hashed.
+// sha256 proving "the code that was reviewed is the code being merged" without breaking on a routine base update.
+// The input is `git diff --unified=3 --binary <merge-base>..<head>`, normalised, so the hash COVERS:
+//   - every added/removed line, byte for byte (whitespace and CRLF included), and 3 unchanged lines of context on each
+//     side of every change (nearby changes merge into one hunk, as git does);
+//   - file paths, add/delete/rename/mode changes, and the full content of binary files (--binary: ASCII base85).
+// and does NOT cover (so these never move the hash): line numbers, the function name git prints after `@@`, and the
+// `index <blob>..<blob>` ids. Hence:
+//   - an identical edit moved to a different place changes the hash, because its context changes;
+//   - a base update that edits the same file MORE than 3 lines from every hunk leaves the hash alone (the line shift is
+//     invisible), while one that edits a line WITHIN 3 lines of a hunk changes it. That is accepted on purpose: the
+//     reviewed hunk now sits in different surroundings, so the safe answer is "re-review";
+//   - blind spots: moving a change between two places with identical 3-line context, and invalid UTF-8 inside a
+//     text-looking file (proc.run decodes UTF-8) both go unnoticed.
+// No --text here, unlike diffFiles: --text turns binary files into raw bytes, which the UTF-8 decode would collapse
+// (0xFE and 0xFD both become U+FFFD), whereas --binary alone keeps NUL and `-diff` files byte-exact.
+// `exclude` paths (e.g. an agent log the pipeline itself appends to) are left out: each is a literal repo-root-relative
+// path (`:(top,exclude,literal)`), so `*.js` is not a glob and `docs/x.md` does not match `sub/docs/x.md`. Pathspecs
+// are anchored at the repo root so cwd cannot narrow what is hashed.
 export function contentHash(base, head, { exclude = [], ...o } = {}) {
   const mb = mergeBase(base, head, o);
   const text = git([
-    'diff', '-U0', '--binary', '--no-color', '--no-ext-diff', '--src-prefix=a/', '--dst-prefix=b/',
-    `${mb}..${assertRef(head, ['diff', head])}`, '--', ':/', ...exclude.map((p) => `:(top,exclude)${p}`),
+    'diff', '--unified=3', '--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--src-prefix=a/', '--dst-prefix=b/',
+    `${mb}..${assertRef(head, ['diff', head])}`, '--', ':/', ...exclude.map((p) => `:(top,exclude,literal)${p}`),
   ], o);
   return createHash('sha256').update(normaliseDiff(text)).digest('hex');
 }
@@ -173,7 +217,10 @@ export function treeFingerprint(o) {
   const hash = createHash('sha256');
   hash.update(headSha(o));
   hash.update('\0');
-  hash.update(git(['diff', 'HEAD', '--binary', '--no-color', '--no-ext-diff'], o));
+  // No --text: --binary already makes NUL and `-diff` files exact and compact (the `index` blob ids stay in this diff, so
+  // even a lossy decode could not hide a change), where --text would dump whole binaries as raw text. --no-textconv:
+  // a configured converter must not decide what counts as a change.
+  hash.update(git(['diff', 'HEAD', '--binary', '--no-color', '--no-ext-diff', '--no-textconv'], o));
   hash.update('\0');
   const top = git(['rev-parse', '--show-toplevel'], o).trim();
   // `-- :/` + --full-name: every untracked file in the repo, named from the root, whatever the cwd.

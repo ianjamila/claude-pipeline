@@ -30,13 +30,21 @@ function fakeGhEnv(entries) {
 
 test('run captures stdout and exit code', () => {
   const r = run('node', ['-e', 'process.stdout.write("hi")']);
-  assert.deepEqual(r, { code: 0, stdout: 'hi', stderr: '', timedOut: false });
+  assert.deepEqual(r, { code: 0, stdout: 'hi', stderr: '', timedOut: false, signal: null });
 });
 
 test('run reports a non-zero exit code and stderr', () => {
   const r = run('node', ['-e', 'process.stderr.write("bad"); process.exit(3)']);
   assert.equal(r.code, 3);
   assert.equal(r.stderr, 'bad');
+  assert.equal(r.timedOut, false);
+});
+
+test('run reports the signal that killed the child (code alone cannot tell it from a plain exit 1)', { skip: process.platform === 'win32' }, () => {
+  const r = run('node', ['-e', "process.kill(process.pid, 'SIGKILL')"]);
+  assert.equal(r.signal, 'SIGKILL');
+  assert.equal(r.code, 1);
+  assert.equal(r.stderr, '');
   assert.equal(r.timedOut, false);
 });
 
