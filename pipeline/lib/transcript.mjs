@@ -3,6 +3,13 @@
 // transcript, proves (or disproves) the model/effort, and pulls the ruling JSON out of the verified
 // transcript itself. The transcript format is undocumented and unstable, so every unknown shape
 // FAILS CLOSED: it adds an error and ok stays false.
+//
+// Completeness caveat: interactive (entrypoint "cli") transcripts keep the streaming snapshot, so a
+// finished final message still shows stop_reason null; only headless runs record "end_turn". The proof
+// therefore accepts null/absent but rejects any other explicit stop_reason (max_tokens, refusal, ...)
+// and requires the final line to hold a text block. It cannot see truncation itself: callers MUST also
+// require extractJsonBlock() to parse the final text AND the rulings to validate against every
+// expected id, which is what catches a message cut off mid-answer.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -241,7 +248,7 @@ export function proveModel({ jsonlText, metaText, expectModelPrefix, expectEffor
   }
 
   // The final message is every line sharing the LAST assistant message.id (one line per content block);
-  // only its last line carries the settled stop_reason. A line with no id cannot be grouped, so it stands alone.
+  // its last line is the one judged. A line with no id cannot be grouped, so it stands alone.
   let finalAssistantText = '';
   let finalStopReason = null;
   if (asst.length > 0) {
@@ -251,8 +258,13 @@ export function proveModel({ jsonlText, metaText, expectModelPrefix, expectEffor
     const closing = group[group.length - 1].line.message;
     finalStopReason = isPlainObject(closing) && closing.stop_reason !== undefined ? closing.stop_reason : null;
     finalAssistantText = group.flatMap((a) => textBlocks(a.line.message?.content)).join('\n');
-    if (finalStopReason !== 'end_turn') {
+    // null/absent is a streaming snapshot (see header); any other explicit value is a real non-answer.
+    if (finalStopReason !== null && finalStopReason !== 'end_turn') {
       errors.push(`final message incomplete (stop_reason ${String(finalStopReason)})`);
+    }
+    // The last line must itself carry text: a group ending in tool_use or thinking has not answered yet.
+    if (textBlocks(closing?.content).length === 0) {
+      errors.push('final message is not a text answer');
     } else if (finalAssistantText.trim() === '') {
       errors.push('final message has no text');
     }

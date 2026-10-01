@@ -182,16 +182,18 @@ test('the stop_reason of the LAST line of the final group is the one that counts
   const lines = [
     userLine('p'),
     asstLine({ id: 'msg_2', stop: 'end_turn', content: text('a') }),
-    asstLine({ id: 'msg_2', stop: null, content: text('b') }),
+    asstLine({ id: 'msg_2', stop: 'max_tokens', content: text('b') }),
   ];
   const r = proveText(lines);
-  assert.deepEqual(r.errors, ['final message incomplete (stop_reason null)']);
-  assert.equal(r.finalStopReason, null);
+  assert.deepEqual(r.errors, ['final message incomplete (stop_reason max_tokens)']);
+  assert.equal(r.finalStopReason, 'max_tokens');
+  const ok = proveText([userLine('p'), asstLine({ id: 'msg_2', stop: 'max_tokens', content: text('a') }), asstLine({ id: 'msg_2', stop: 'end_turn', content: text('b') })]);
+  assert.deepEqual(ok.errors, [], 'an earlier line of the group is not consulted');
 });
 
-test('a final message ending in tool_use (no answer yet) is incomplete', () => {
+test('a final message ending in tool_use (no answer yet) is incomplete and not a text answer', () => {
   const r = proveText([userLine('p'), asstLine({ stop: 'tool_use', content: [{ type: 'tool_use', id: 't', name: 'Read', input: {} }] })]);
-  assert.deepEqual(r.errors, ['final message incomplete (stop_reason tool_use)']);
+  assert.deepEqual(r.errors, ['final message incomplete (stop_reason tool_use)', 'final message is not a text answer']);
 });
 
 test('a final assistant line without a message id is treated as a group of one', () => {
@@ -538,14 +540,10 @@ test('API-error markers fail on their own: odd isApiErrorMessage values and any 
   assert.deepEqual(one({ isApiErrorMessage: true, error: 'overloaded', apiErrorStatus: 529 }).errors, ['API error on line 2: overloaded'], 'one error per line');
 });
 
-test('an end_turn final message with no text is a failure', () => {
-  const thinkingOnly = [{ type: 'thinking', thinking: 'hmm', signature: 's' }];
-  assert.deepEqual(proveText([userLine('p'), asstLine({ content: thinkingOnly })]).errors, ['final message has no text']);
+test('a final message whose text is blank is a failure', () => {
   assert.deepEqual(proveText([userLine('p'), asstLine({ content: text('  \n\t') })]).errors, ['final message has no text']);
-  assert.deepEqual(proveText([userLine('p'), asstLine({ content: [] })]).errors, ['final message has no text']);
+  assert.deepEqual(proveText([userLine('p'), asstLine({ stop: null, content: text('') })]).errors, ['final message has no text']);
   assert.deepEqual(proveText([userLine('p'), asstLine({ content: text('x') })]).errors, []);
-  const cut = proveText([userLine('p'), asstLine({ stop: 'max_tokens', content: thinkingOnly })]);
-  assert.deepEqual(cut.errors, ['final message incomplete (stop_reason max_tokens)'], 'no second error for an already-incomplete message');
 });
 
 test('models and efforts counts survive keys that collide with Object.prototype', () => {
@@ -626,4 +624,71 @@ test('bad call shapes and non-finite numbers return null instead of throwing', (
   }
   assert.equal(findSubagentTranscript({ tag: 42, projectsDir: root }), null);
   assert.ok(findSubagentTranscript({ tag: TAG, projectsDir: root, now }), 'sanity: valid input still finds it');
+});
+
+// ---------- rule 7: streaming null stop_reason ----------
+
+const THINKING = [{ type: 'thinking', thinking: 'hmm', signature: 's' }];
+
+test('a null or absent stop_reason with a text answer is accepted (interactive streaming snapshots)', () => {
+  const nul = proveText([userLine('p'), asstLine({ stop: null, content: text('answer') })]);
+  assert.deepEqual(nul.errors, []);
+  assert.equal(nul.ok, true);
+  assert.equal(nul.finalStopReason, null);
+  assert.equal(nul.finalAssistantText, 'answer');
+  const absent = JSON.stringify({ type: 'assistant', effort: 'high', message: { model: 'claude-fable-5-1', id: 'msg_1', role: 'assistant', content: text('answer') } });
+  const r = proveText([userLine('p'), absent]);
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.finalStopReason, null);
+  const grouped = proveText([userLine('p'), asstLine({ stop: null, content: THINKING }), asstLine({ stop: null, content: text('answer') })]);
+  assert.deepEqual(grouped.errors, []);
+});
+
+test('any explicit stop_reason other than end_turn is incomplete', () => {
+  for (const stop of ['max_tokens', 'refusal', 'stop_sequence', 'tool_use', 'pause_turn', 'model_context_window_exceeded', '', 0, false]) {
+    const r = proveText([userLine('p'), asstLine({ stop, content: text('answer') })]);
+    assert.deepEqual(r.errors, [`final message incomplete (stop_reason ${String(stop)})`], `stop_reason ${JSON.stringify(stop)}`);
+    assert.equal(r.ok, false);
+  }
+});
+
+test('a final group that ends without a text block is not an answer, even with a null stop_reason', () => {
+  const toolUse = proveText([userLine('p'), asstLine({ stop: null, content: TOOL_USE })]);
+  assert.deepEqual(toolUse.errors, ['final message is not a text answer']);
+  const thinkingOnly = proveText([userLine('p'), asstLine({ stop: null, content: THINKING })]);
+  assert.deepEqual(thinkingOnly.errors, ['final message is not a text answer']);
+  const empty = proveText([userLine('p'), asstLine({ stop: 'end_turn', content: [] })]);
+  assert.deepEqual(empty.errors, ['final message is not a text answer']);
+  // The LAST line of the group is what must carry the text: text followed by a trailing thinking/tool_use line is not an answer.
+  const textThenTool = proveText([userLine('p'), asstLine({ stop: null, content: text('draft') }), asstLine({ stop: null, content: TOOL_USE })]);
+  assert.deepEqual(textThenTool.errors, ['final message is not a text answer']);
+  const textThenThinking = proveText([userLine('p'), asstLine({ stop: null, content: text('draft') }), asstLine({ stop: 'end_turn', content: THINKING })]);
+  assert.deepEqual(textThenThinking.errors, ['final message is not a text answer']);
+  const mixed = proveText([userLine('p'), asstLine({ stop: null, content: [...THINKING, { type: 'text', text: 'answer' }] })]);
+  assert.deepEqual(mixed.errors, [], 'text anywhere in the last line counts');
+});
+
+test('an incomplete stop_reason and a missing text answer are both reported', () => {
+  const r = proveText([userLine('p'), asstLine({ stop: 'max_tokens', content: THINKING })]);
+  assert.deepEqual(r.errors, ['final message incomplete (stop_reason max_tokens)', 'final message is not a text answer']);
+});
+
+test('a real-shaped interactive (cli) transcript with a null stop_reason proves ok', () => {
+  assert.match(read('fable-cli-null-stop.jsonl'), /"entrypoint":"cli"/);
+  assert.match(read('fable-cli-null-stop.jsonl'), /"stop_reason":null/);
+  const r = prove('fable-cli-null-stop', { expectAgentType: 'arbiter' });
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.models, { 'claude-fable-5-1': 2 });
+  assert.deepEqual(r.efforts, { high: 2 });
+  assert.equal(r.finalStopReason, null);
+  assert.match(r.firstUserText, /^ROUND: 2\nINPUT-DIGEST: 0123456789abcdef/);
+  assert.equal(extractJsonBlock(r.finalAssistantText).rulings[0].id, 'R2-B1');
+});
+
+test('a cli transcript cut off mid-answer is left for the downstream JSON check to catch', () => {
+  // stop_reason cannot show truncation in cli transcripts, so the proof passes but the ruling cannot parse.
+  const cut = proveText([userLine('p'), asstLine({ stop: null, content: text('```json\n{"rulings":[{"id":"R1-S1"') })]);
+  assert.deepEqual(cut.errors, []);
+  assert.throws(() => extractJsonBlock(cut.finalAssistantText), /no JSON found/);
 });
