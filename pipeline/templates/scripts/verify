@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+# Proves this repo works. Windows: run `node scripts/verify.mjs` directly.
+set -eu
+exec node "$(dirname "$0")/verify.mjs" "$@"

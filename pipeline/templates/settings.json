@@ -1,0 +1,30 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node", "args": ["scripts/pipeline/stop-verify.mjs"], "timeout": 900 }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(node scripts/verify.mjs:*)",
+      "Bash(scripts/verify:*)",
+      "Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)",
+      "Bash(node scripts/pipeline/smoke.mjs:*)",
+      "Bash(gh pr view:*)",
+      "Bash(gh pr checks:*)",
+      "Bash(gh pr list:*)",
+      "Bash(gh pr create:*)",
+      "Bash(gh pr ready:*)",
+      "Bash(gh issue list:*)",
+      "Bash(gh issue view:*)",
+      "Bash(git worktree add:*)",
+      "Bash(git worktree list:*)",
+      "Bash(git fetch:*)",
+      "Bash(npx playwright test:*)"
+    ]
+  }
+}
