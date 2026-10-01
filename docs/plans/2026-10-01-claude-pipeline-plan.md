@@ -46,6 +46,11 @@ Spec §17 (R1–R13) supersedes earlier text. Per-task deltas; each bullet is ma
 - **Phase 9:** each proof records immutable base/head SHAs; P5 change = an unbounded in-memory cache in a low-traffic helper.
 - **Phase 10:** reviews pin `--base <sha>` of an immutable range (claude-pipeline: root commit..tag `v0.1.0-review`; EagleWatch: onboarding PR's base..merge SHAs).
 
+- **Revision 3 (spec §18) also binding:** 1.4 adds `contentHash()` (R3′) instead of patchId; 1.5 adds enclosing-SQL-statement classification (R7′) with the `schema.sql` predicate test; 1.9 state stores `{fromHead,toHead,contentHashAtToHead}` per round and `reviewValidFor(state, contentHash)`; 1.12 locks follow R12′; 0.2 `quoteForCmd`/spawn follow R10′ (cross-spawn port) + Windows CI `.cmd` fixture test; 2.4 prod-watch follows R8′; 5.4 `pipeline-guards.yml` implements R5′ (timeline + check-suite timestamps, owner actor check, best-effort stale-label removal); 8.1 removes the `paths:` filter in `checks.yml` and registers the guard workflow in `KNOWN_NON_GATES`.
+- **Arbiter/judge transcript lookup:** ship sets the Agent `description` to `pipeline-judge R<N> <digest8>` / `pipeline-arbiter R<N> <digest8>`; `triage validate --from-tag` and `arbiter apply --tag` locate the transcript via `subagents/*.meta.json` `description` (newest within 6 h) when no agent id is given, and parse the JSON from the final assistant message. Judge transcript model is recorded (expected `claude-opus-`, warning only).
+- **New CLI helpers:** `artifacts push --pr-branch B --dir D` (orphan branch `pipeline-artifacts`, returns markdown links); `followups create --round R` (gh issue per FOLLOW-UP item, label `agent-suggestion`, records URLs); `triage light-lane --round R`.
+- **Hard-stop PRs:** ship runs the review loop before ending in `needs-human` (owner gets a reviewed PR); no final gate/merge.
+
 ## File map
 
 ```
