@@ -1,0 +1,834 @@
+// Why: the installer edits the owner's real ~/.claude/settings.json and the files the safety hooks run from, so
+// these tests pin the properties that matter: nothing else in settings changes, a second run changes nothing,
+// foreign files are never clobbered, the agent gate holds, and --check reports real drift. Everything runs against
+// temp claude-homes (one with a space in its path) and the miniature repo in test/fixtures/src-tree.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import {
+  mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, cpSync,
+  realpathSync, symlinkSync, lstatSync, chmodSync, statSync,
+} from 'node:fs';
+import { createHash } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { join, dirname, delimiter } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import {
+  mergeSettings, removeOurSettings, isOurHandler, ourAllowEntries, renameWithRetry, collectDiagnostics,
+  shellRcPaths, parseArgs, buildPlan, walkFiles, safeManifestKey, GUARD_FILES_MATCHER,
+} from '../pipeline/lib/installer.mjs';
+
+const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
+const INSTALL = join(REPO, 'install.mjs');
+const FIXTURE = join(REPO, 'test', 'fixtures', 'src-tree');
+const posix = (p) => String(p).replace(/\\/g, '/');
+
+const made = [];
+process.on('exit', () => { for (const d of made) rmSync(d, { recursive: true, force: true }); });
+function scratch(label = 'cp-install') {
+  const d = realpathSync(mkdtempSync(join(tmpdir(), `${label}-`)));
+  made.push(d);
+  return d;
+}
+// A claude-home path that does not exist yet; `space` puts a space in it (R10).
+function newHome({ space = false } = {}) {
+  return join(scratch(space ? 'cp install' : 'cp-install'), space ? 'claude home' : 'claude');
+}
+function copyFixture() {
+  const dir = join(scratch('cp-src'), 'src');
+  cpSync(FIXTURE, dir, { recursive: true });
+  return dir;
+}
+
+// The child must not inherit CLAUDECODE (the tests may themselves run inside Claude Code), nor the real HOME.
+function run(args, { env = {}, script = INSTALL, command = process.execPath, lead = [] } = {}) {
+  const userHome = scratch('cp-userhome');
+  const childEnv = { ...process.env, HOME: userHome, USERPROFILE: userHome, PIPELINE_INSTALL_NO_PROBES: '1' };
+  for (const k of ['CLAUDECODE', 'PIPELINE_ADMIN', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_SUBAGENT_MODEL']) delete childEnv[k];
+  Object.assign(childEnv, env);
+  const r = spawnSync(command, [...lead, script, ...args], { encoding: 'utf8', env: childEnv, timeout: 60000 });
+  return { status: r.status, stdout: r.stdout, stderr: r.stderr, userHome };
+}
+function install(home, extra = [], { source = FIXTURE, env } = {}) {
+  return run(['--claude-home', home, '--source', source, ...extra], { env });
+}
+const readJson = (p) => JSON.parse(readFileSync(p, 'utf8'));
+const settingsPath = (home) => join(home, 'settings.json');
+const readSettings = (home) => readJson(settingsPath(home));
+const readManifest = (home) => readJson(join(home, 'pipeline', 'INSTALLED.json'));
+const sha = (p) => createHash('sha256').update(readFileSync(p)).digest('hex');
+function writeSettings(home, obj) {
+  mkdirSync(home, { recursive: true });
+  writeFileSync(settingsPath(home), `${JSON.stringify(obj, null, 2)}\n`);
+}
+
+const guardGit = (home) => ({
+  matcher: 'Bash',
+  hooks: [{ type: 'command', command: 'node', args: [join(home, 'pipeline', 'hooks', 'guard-git.mjs')], timeout: 15 }],
+});
+const guardFiles = (home) => ({
+  matcher: 'Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|mcp__.*',
+  hooks: [{ type: 'command', command: 'node', args: [join(home, 'pipeline', 'hooks', 'guard-files.mjs')], timeout: 15 }],
+});
+const allowEntries = (home) => [
+  `Bash(node ${posix(home)}/pipeline/bin/pipeline.mjs:*)`,
+  'Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)',
+];
+
+// A settings file shaped like the owner's: other hooks on several events, env, permissions, plugins.
+function ownersSettings() {
+  return {
+    model: 'opus',
+    env: { FOO: 'bar', CLAUDE_CODE_SUBAGENT_MODEL: 'sonnet' },
+    permissions: { allow: ['Bash(ls:*)', 'Read(~/notes/**)'], deny: ['Bash(rm -rf /:*)'], defaultMode: 'acceptEdits' },
+    enabledPlugins: { 'superpowers@marketplace': true },
+    hooks: {
+      PreToolUse: [
+        { matcher: 'Edit|Write', hooks: [{ type: 'command', command: 'node /opt/memory-guard.js' }] },
+      ],
+      PostToolUse: [
+        { matcher: 'Edit|Write', hooks: [{ type: 'command', command: 'node /opt/memory-index.js', timeout: 5 }] },
+      ],
+      SessionStart: [{ hooks: [{ type: 'command', command: 'echo start' }] }],
+      UserPromptSubmit: [{ hooks: [{ type: 'command', command: 'echo prompt' }] }],
+      Stop: [{ hooks: [{ type: 'command', command: 'echo stop' }] }],
+    },
+    statusLine: { type: 'command', command: 'echo status' },
+  };
+}
+
+function listTree(dir) {
+  const out = [];
+  const visit = (d, rel) => {
+    for (const e of readdirSync(d, { withFileTypes: true })) {
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) visit(join(d, e.name), r); else out.push(r);
+    }
+  };
+  visit(dir, '');
+  return out.sort();
+}
+
+// 1
+test('fresh install into an empty home (path with a space): files, manifest, hooks, allow entries', () => {
+  const home = newHome({ space: true });
+  const r = install(home);
+  assert.equal(r.status, 0, r.stderr + r.stdout);
+
+  for (const rel of [
+    'skills/ship/SKILL.md', 'skills/ship/reference/notes.md', 'skills/verify/SKILL.md', 'skills/pipeline-setup/SKILL.md',
+    'agents/implementer.md', 'agents/verifier.md', 'agents/judge.md', 'agents/arbiter.md',
+    'pipeline/bin/pipeline.mjs', 'pipeline/hooks/guard-git.mjs', 'pipeline/hooks/guard-files.mjs',
+    'pipeline/lib/answer.mjs', 'pipeline/templates/example.md', 'pipeline/VERSION', 'pipeline/INSTALLED.json',
+  ]) assert.ok(existsSync(join(home, ...rel.split('/'))), `${rel} should be installed`);
+  assert.equal(readFileSync(join(home, 'pipeline', 'VERSION'), 'utf8'), readFileSync(join(FIXTURE, 'VERSION'), 'utf8'));
+
+  const m = readManifest(home);
+  assert.equal(m.version, '9.9.9');
+  assert.ok(m.sourceSha === null || /^[0-9a-f]{40}$/.test(m.sourceSha), `sourceSha: ${m.sourceSha}`);
+  assert.match(m.installedAt, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$/);
+  assert.deepEqual(m.hooks, { guardGit: true, guardFiles: true });
+  const expectedFiles = {};
+  for (const rel of listTree(FIXTURE)) {
+    if (rel === 'VERSION') expectedFiles['pipeline/VERSION'] = sha(join(FIXTURE, 'VERSION'));
+    else expectedFiles[rel] = sha(join(FIXTURE, ...rel.split('/')));
+  }
+  assert.deepEqual(m.files, expectedFiles);
+  for (const [rel, h] of Object.entries(m.files)) assert.equal(sha(join(home, ...rel.split('/'))), h, rel);
+
+  const s = readSettings(home);
+  assert.deepEqual(s.hooks.PreToolUse, [guardGit(home), guardFiles(home)]);
+  assert.deepEqual(s.permissions.allow, allowEntries(home));
+  assert.deepEqual(Object.keys(s).sort(), ['hooks', 'permissions']);
+  assert.equal(existsSync(join(home, 'backups')), false, 'no settings existed, so nothing to back up');
+  assert.ok(listTree(home).every((f) => !/\.(new|old)-/.test(f)), 'no staging leftovers');
+  assert.ok(readdirSync(join(home, 'skills')).every((n) => !/\.(new|old)-/.test(n)));
+});
+
+test('excluded names (node_modules, .DS_Store, test) are never copied or listed', () => {
+  const home = newHome();
+  const src = copyFixture();
+  mkdirSync(join(src, 'pipeline', 'node_modules', 'x'), { recursive: true });
+  writeFileSync(join(src, 'pipeline', 'node_modules', 'x', 'index.js'), 'x');
+  mkdirSync(join(src, 'pipeline', 'test'), { recursive: true });
+  writeFileSync(join(src, 'pipeline', 'test', 't.mjs'), 'x');
+  writeFileSync(join(src, 'pipeline', '.DS_Store'), 'x');
+  writeFileSync(join(src, 'skills', 'ship', '.DS_Store'), 'x');
+  const r = install(home, [], { source: src });
+  assert.equal(r.status, 0, r.stderr);
+  const files = listTree(home);
+  assert.ok(!files.some((f) => /node_modules|\.DS_Store|\/test\//.test(f)), files.join('\n'));
+  assert.ok(!Object.keys(readManifest(home).files).some((f) => /node_modules|\.DS_Store|\/test\//.test(f)));
+});
+
+// 2
+test('existing settings: every other key survives unchanged, ours is appended once', () => {
+  const home = newHome();
+  const before = ownersSettings();
+  writeSettings(home, before);
+  const r = install(home);
+  assert.equal(r.status, 0, r.stderr);
+  const after = readSettings(home);
+
+  const expected = structuredClone(before);
+  expected.hooks.PreToolUse.push(guardGit(home), guardFiles(home));
+  expected.permissions.allow.push(...allowEntries(home));
+  assert.deepEqual(after, expected);
+  assert.deepEqual(Object.keys(after), Object.keys(before), 'top-level key order is preserved');
+  assert.deepEqual(Object.keys(after.hooks), Object.keys(before.hooks));
+  assert.ok(readFileSync(settingsPath(home), 'utf8').endsWith('}\n'), 'trailing newline');
+  assert.match(readFileSync(settingsPath(home), 'utf8'), /^\{\n {2}"model"/, '2-space indent');
+});
+
+// 3
+test('a second install changes nothing: settings, manifest files and hooks are identical', () => {
+  const home = newHome();
+  writeSettings(home, ownersSettings());
+  assert.equal(install(home).status, 0);
+  const s1 = readFileSync(settingsPath(home), 'utf8');
+  const m1 = readManifest(home);
+  const r2 = install(home, ['--json']);
+  assert.equal(r2.status, 0, r2.stderr);
+  assert.equal(readFileSync(settingsPath(home), 'utf8'), s1);
+  assert.deepEqual(readSettings(home), JSON.parse(s1));
+  assert.deepEqual(readManifest(home).files, m1.files);
+  const s = readSettings(home);
+  assert.equal(s.hooks.PreToolUse.filter((g) => g.hooks.some(isOurHandler)).length, 2);
+  for (const e of allowEntries(home)) assert.equal(s.permissions.allow.filter((x) => x === e).length, 1);
+  const report = JSON.parse(r2.stdout);
+  assert.equal(report.files.copied, 0, 'identical units are not rewritten');
+  assert.equal(report.settings.changed, false);
+  assert.equal(readdirSync(join(home, 'backups')).length, 1, 'only the first run, which changed settings, backed up');
+});
+
+test('reinstall repairs an installed file that was edited', () => {
+  const home = newHome();
+  assert.equal(install(home).status, 0);
+  writeFileSync(join(home, 'skills', 'ship', 'SKILL.md'), 'tampered\n');
+  writeFileSync(join(home, 'skills', 'ship', 'stray.md'), 'stray\n');
+  assert.equal(install(home).status, 0);
+  assert.equal(readFileSync(join(home, 'skills', 'ship', 'SKILL.md'), 'utf8'), readFileSync(join(FIXTURE, 'skills', 'ship', 'SKILL.md'), 'utf8'));
+  assert.equal(existsSync(join(home, 'skills', 'ship', 'stray.md')), false);
+});
+
+// 4
+test('--skip-file-guard installs only guard-git; a later full install adds guard-files last', () => {
+  const home = newHome();
+  const before = ownersSettings();
+  writeSettings(home, before);
+  assert.equal(install(home, ['--skip-file-guard']).status, 0);
+  let s = readSettings(home);
+  assert.deepEqual(s.hooks.PreToolUse.slice(1), [guardGit(home)]);
+  assert.deepEqual(readManifest(home).hooks, { guardGit: true, guardFiles: false });
+
+  assert.equal(install(home).status, 0);
+  s = readSettings(home);
+  assert.deepEqual(s.hooks.PreToolUse, [...before.hooks.PreToolUse, guardGit(home), guardFiles(home)]);
+  assert.deepEqual(readManifest(home).hooks, { guardGit: true, guardFiles: true });
+  assert.equal(readdirSync(join(home, 'backups')).length, 2, 'two settings changes, two distinct backups (none overwritten)');
+});
+
+// 5
+test('an older install in the string command form is replaced, not duplicated', () => {
+  const home = newHome();
+  const before = ownersSettings();
+  before.hooks.PreToolUse.push(
+    { matcher: 'Bash', hooks: [{ type: 'command', command: `node ${join(home, 'pipeline', 'hooks', 'guard-git.mjs')}`, timeout: 10 }] },
+    // A user handler sharing a group with an old handler of ours (Windows-style path) must survive.
+    { matcher: 'Bash', hooks: [
+      { type: 'command', command: 'echo mine' },
+      { type: 'command', command: 'node', args: ['C:\\Users\\u\\.claude\\pipeline\\hooks\\guard-files.mjs'] },
+    ] },
+  );
+  writeSettings(home, before);
+  assert.equal(install(home).status, 0);
+  const after = readSettings(home);
+  const expected = structuredClone(ownersSettings());
+  expected.hooks.PreToolUse.push({ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }] }, guardGit(home), guardFiles(home));
+  expected.permissions.allow.push(...allowEntries(home));
+  assert.deepEqual(after, expected);
+});
+
+// 6
+test('a foreign skill dir not in the manifest is refused (exit 1, nothing written); --force replaces it', () => {
+  const home = newHome();
+  mkdirSync(join(home, 'skills', 'verify'), { recursive: true });
+  writeFileSync(join(home, 'skills', 'verify', 'SKILL.md'), 'my own verify skill\n');
+  writeSettings(home, ownersSettings());
+  const settingsBefore = readFileSync(settingsPath(home), 'utf8');
+
+  const r = install(home);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /skills\/verify/);
+  assert.equal(readFileSync(join(home, 'skills', 'verify', 'SKILL.md'), 'utf8'), 'my own verify skill\n');
+  assert.equal(existsSync(join(home, 'pipeline')), false, 'nothing was installed');
+  assert.equal(existsSync(join(home, 'skills', 'ship')), false);
+  assert.equal(readFileSync(settingsPath(home), 'utf8'), settingsBefore);
+
+  const f = install(home, ['--force']);
+  assert.equal(f.status, 0, f.stderr);
+  assert.equal(readFileSync(join(home, 'skills', 'verify', 'SKILL.md'), 'utf8'), readFileSync(join(FIXTURE, 'skills', 'verify', 'SKILL.md'), 'utf8'));
+  const saved = readdirSync(join(home, 'backups')).filter((n) => n.startsWith('verify.'));
+  assert.equal(saved.length, 1, 'the replaced foreign skill is kept in backups');
+  assert.equal(readFileSync(join(home, 'backups', saved[0], 'SKILL.md'), 'utf8'), 'my own verify skill\n');
+});
+
+test('a foreign agent file is refused; a foreign pipeline dir is refused', () => {
+  const home = newHome();
+  mkdirSync(join(home, 'agents'), { recursive: true });
+  writeFileSync(join(home, 'agents', 'judge.md'), 'mine\n');
+  let r = install(home);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /agents\/judge\.md/);
+  rmSync(join(home, 'agents'), { recursive: true });
+
+  mkdirSync(join(home, 'pipeline'), { recursive: true });
+  writeFileSync(join(home, 'pipeline', 'something.txt'), 'mine\n');
+  r = install(home);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /pipeline/);
+  assert.equal(readFileSync(join(home, 'pipeline', 'something.txt'), 'utf8'), 'mine\n');
+});
+
+// 7
+test('inside Claude Code (CLAUDECODE=1) the installer refuses unless PIPELINE_ADMIN=1; --check always works', () => {
+  const home = newHome();
+  const blocked = install(home, [], { env: { CLAUDECODE: '1' } });
+  assert.equal(blocked.status, 2);
+  assert.match(blocked.stderr, /own terminal/);
+  assert.match(blocked.stderr, /PIPELINE_ADMIN=1/);
+  assert.equal(existsSync(home), false, 'nothing written');
+
+  assert.equal(install(home, ['--uninstall'], { env: { CLAUDECODE: '1' } }).status, 2);
+  assert.equal(install(home, [], { env: { CLAUDECODE: '1', PIPELINE_ADMIN: '0' } }).status, 2);
+
+  const ok = install(home, [], { env: { CLAUDECODE: '1', PIPELINE_ADMIN: '1' } });
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.ok(existsSync(join(home, 'pipeline', 'INSTALLED.json')));
+
+  const check = install(home, ['--check'], { env: { CLAUDECODE: '1' } });
+  assert.equal(check.status, 0, check.stdout + check.stderr);
+});
+
+// 8
+test('--check: clean after install, names an edited file, notices a deleted hook, never writes', () => {
+  const home = newHome();
+  const pre = install(home, ['--check']);
+  assert.equal(pre.status, 1, 'nothing installed is drift');
+  assert.equal(existsSync(home), false, '--check must not create the home');
+
+  assert.equal(install(home).status, 0);
+  const before = listTree(home);
+  const clean = install(home, ['--check']);
+  assert.equal(clean.status, 0, clean.stdout + clean.stderr);
+  assert.deepEqual(listTree(home), before);
+
+  writeFileSync(join(home, 'pipeline', 'hooks', 'guard-git.mjs'), '// edited\n');
+  const edited = install(home, ['--check']);
+  assert.equal(edited.status, 1);
+  assert.match(edited.stdout, /pipeline\/hooks\/guard-git\.mjs/);
+  assert.equal(readFileSync(join(home, 'pipeline', 'hooks', 'guard-git.mjs'), 'utf8'), '// edited\n', 'check does not repair');
+  assert.equal(install(home).status, 0);
+  assert.equal(install(home, ['--check']).status, 0);
+
+  const s = readSettings(home);
+  s.hooks.PreToolUse = s.hooks.PreToolUse.filter((g) => !g.hooks.some((h) => (h.args ?? []).some((a) => a.endsWith('guard-git.mjs'))));
+  writeSettings(home, s);
+  const noHook = install(home, ['--check']);
+  assert.equal(noHook.status, 1);
+  assert.match(noHook.stdout, /guard-git/);
+});
+
+test('--check also reports a missing file, a duplicated hook, a missing allow entry and a removed-from-source file', () => {
+  const home = newHome();
+  const src = copyFixture();
+  assert.equal(install(home, [], { source: src }).status, 0);
+
+  rmSync(join(home, 'agents', 'judge.md'));
+  let c = install(home, ['--check'], { source: src });
+  assert.equal(c.status, 1);
+  assert.match(c.stdout, /agents\/judge\.md/);
+  assert.equal(install(home, [], { source: src }).status, 0);
+
+  const s = readSettings(home);
+  s.hooks.PreToolUse.push(guardGit(home));
+  s.permissions.allow = s.permissions.allow.filter((e) => !e.startsWith('Bash(node ~'));
+  writeSettings(home, s);
+  c = install(home, ['--check'], { source: src });
+  assert.equal(c.status, 1);
+  assert.match(c.stdout, /duplicat/i);
+  assert.match(c.stdout, /allow/i);
+  assert.equal(install(home, [], { source: src }).status, 0);
+  assert.equal(install(home, ['--check'], { source: src }).status, 0);
+
+  writeFileSync(join(src, 'skills', 'ship', 'SKILL.md'), 'new source\n');
+  c = install(home, ['--check'], { source: src });
+  assert.equal(c.status, 1, 'source changed since install');
+  assert.match(c.stdout, /skills\/ship\/SKILL\.md/);
+  assert.equal(install(home, [], { source: src }).status, 0);
+
+  rmSync(join(src, 'agents', 'arbiter.md'));
+  c = install(home, ['--check'], { source: src });
+  assert.equal(c.status, 1);
+  assert.match(c.stdout, /agents\/arbiter\.md/);
+});
+
+test('--check after --skip-file-guard install is clean without repeating the flag; guard-files appearing is drift', () => {
+  const home = newHome();
+  assert.equal(install(home, ['--skip-file-guard']).status, 0);
+  assert.equal(install(home, ['--check']).status, 0);
+  assert.equal(install(home, ['--check', '--skip-file-guard']).status, 0);
+  assert.equal(install(home).status, 0);
+  assert.equal(install(home, ['--check']).status, 0);
+  const c = install(home, ['--check', '--skip-file-guard']);
+  assert.equal(c.status, 1);
+  assert.match(c.stdout, /guard-files/);
+});
+
+test('--check notices guard-files no longer last', () => {
+  const home = newHome();
+  assert.equal(install(home).status, 0);
+  const s = readSettings(home);
+  s.hooks.PreToolUse.push({ matcher: 'Read', hooks: [{ type: 'command', command: 'echo later' }] });
+  writeSettings(home, s);
+  const c = install(home, ['--check']);
+  assert.equal(c.status, 1);
+  assert.match(c.stdout, /last|order/i);
+  assert.equal(install(home).status, 0);
+  const after = readSettings(home);
+  assert.deepEqual(after.hooks.PreToolUse.slice(-2), [guardGit(home), guardFiles(home)]);
+  assert.equal(install(home, ['--check']).status, 0);
+});
+
+// 9
+test('--uninstall removes our files, hooks and allow entries, keeps everything else, and backs up settings', () => {
+  const home = newHome();
+  const before = ownersSettings();
+  writeSettings(home, before);
+  mkdirSync(join(home, 'skills', 'mine'), { recursive: true });
+  writeFileSync(join(home, 'skills', 'mine', 'SKILL.md'), 'keep me\n');
+  assert.equal(install(home).status, 0);
+  const backupsAfterInstall = readdirSync(join(home, 'backups')).length;
+
+  const r = install(home, ['--uninstall']);
+  assert.equal(r.status, 0, r.stderr);
+  for (const rel of ['skills/ship', 'skills/verify', 'skills/pipeline-setup', 'agents/judge.md', 'agents/implementer.md', 'pipeline']) {
+    assert.equal(existsSync(join(home, ...rel.split('/'))), false, `${rel} should be gone`);
+  }
+  assert.equal(readFileSync(join(home, 'skills', 'mine', 'SKILL.md'), 'utf8'), 'keep me\n');
+  assert.deepEqual(readSettings(home), before, 'settings are back to exactly the owner\'s original');
+  assert.equal(readdirSync(join(home, 'backups')).length, backupsAfterInstall + 1, 'uninstall backed up settings first');
+  const last = readdirSync(join(home, 'backups')).sort().at(-1);
+  assert.ok(readJson(join(home, 'backups', last)).hooks.PreToolUse.some((g) => g.hooks.some(isOurHandler)), 'the backup holds the pre-uninstall settings');
+
+  assert.equal(install(home, ['--check']).status, 1, 'no longer installed');
+  assert.equal(install(home, ['--uninstall']).status, 0, 'uninstalling twice is harmless');
+});
+
+test('--uninstall keeps files in our directories that we did not install', () => {
+  const home = newHome();
+  assert.equal(install(home).status, 0);
+  writeFileSync(join(home, 'pipeline', 'my-notes.txt'), 'mine\n');
+  assert.equal(install(home, ['--uninstall']).status, 0);
+  assert.equal(readFileSync(join(home, 'pipeline', 'my-notes.txt'), 'utf8'), 'mine\n');
+  assert.equal(existsSync(join(home, 'pipeline', 'INSTALLED.json')), false);
+  assert.equal(existsSync(join(home, 'pipeline', 'hooks')), false);
+});
+
+// 10
+test('invalid JSON in settings.json: exit 1, file and tree untouched', () => {
+  const home = newHome();
+  mkdirSync(home, { recursive: true });
+  writeFileSync(settingsPath(home), '{ "hooks": { oops ');
+  for (const args of [[], ['--uninstall'], ['--check']]) {
+    const r = install(home, args);
+    assert.equal(r.status, 1, args.join(' '));
+    assert.match(r.stderr + r.stdout, /valid JSON/);
+  }
+  assert.equal(readFileSync(settingsPath(home), 'utf8'), '{ "hooks": { oops ');
+  assert.deepEqual(readdirSync(home), ['settings.json']);
+});
+
+test('settings.json with a wrongly shaped hooks/permissions value: exit 1, nothing written', () => {
+  const home = newHome();
+  writeSettings(home, { hooks: { PreToolUse: 'nope' } });
+  const r = install(home);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /PreToolUse/);
+  assert.deepEqual(readdirSync(home), ['settings.json']);
+});
+
+// 11
+test('a file removed from the source between installs is removed from home on reinstall', () => {
+  const home = newHome();
+  const src = copyFixture();
+  assert.equal(install(home, [], { source: src }).status, 0);
+  assert.ok(existsSync(join(home, 'agents', 'arbiter.md')));
+  assert.ok(existsSync(join(home, 'skills', 'ship', 'reference', 'notes.md')));
+  assert.ok(existsSync(join(home, 'pipeline', 'templates', 'example.md')));
+  rmSync(join(src, 'agents', 'arbiter.md'));
+  rmSync(join(src, 'skills', 'ship', 'reference'), { recursive: true });
+  rmSync(join(src, 'pipeline', 'templates'), { recursive: true });
+  const r = install(home, ['--json'], { source: src });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(existsSync(join(home, 'agents', 'arbiter.md')), false);
+  assert.equal(existsSync(join(home, 'skills', 'ship', 'reference')), false);
+  assert.equal(existsSync(join(home, 'pipeline', 'templates')), false);
+  assert.ok(existsSync(join(home, 'agents', 'judge.md')));
+  const m = readManifest(home);
+  assert.ok(!('agents/arbiter.md' in m.files));
+  assert.deepEqual(JSON.parse(r.stdout).files.removed.sort(), [
+    'agents/arbiter.md', 'pipeline/templates/example.md', 'skills/ship/reference/notes.md',
+  ]);
+});
+
+// 12
+test('backup filename is settings.json.YYYYMMDDTHHMMSSZ with no colons', () => {
+  const home = newHome();
+  writeSettings(home, ownersSettings());
+  const r = install(home, ['--json']);
+  assert.equal(r.status, 0, r.stderr);
+  const names = readdirSync(join(home, 'backups'));
+  assert.equal(names.length, 1);
+  assert.match(names[0], /^settings\.json\.\d{8}T\d{6}Z$/);
+  assert.deepEqual(readJson(join(home, 'backups', names[0])), ownersSettings(), 'the backup is the file as it was');
+  assert.equal(JSON.parse(r.stdout).settings.backup, join(home, 'backups', names[0]));
+});
+
+// 13
+test('install.sh runs the Node installer (sh wrapper)', { skip: process.platform === 'win32' }, () => {
+  const home = newHome({ space: true });
+  const r = run(['--claude-home', home, '--source', FIXTURE], { script: join(REPO, 'install.sh'), command: 'sh' });
+  assert.equal(r.status, 0, r.stderr + r.stdout);
+  assert.ok(existsSync(join(home, 'pipeline', 'INSTALLED.json')));
+  const text = readFileSync(join(REPO, 'install.sh'), 'utf8');
+  assert.match(text, /^#!\/usr\/bin\/env sh\n/);
+  assert.match(text, /set -eu/);
+  assert.match(text, /exec node "\$\(dirname "\$0"\)\/install\.mjs" "\$@"/);
+  assert.ok(statSync(join(REPO, 'install.sh')).mode & 0o100, 'install.sh is executable');
+  const ps1 = readFileSync(join(REPO, 'install.ps1'), 'utf8');
+  assert.match(ps1, /\$ErrorActionPreference\s*=\s*'Stop'/);
+  assert.match(ps1, /node "\$PSScriptRoot\/install\.mjs" @args/);
+  assert.match(ps1, /exit \$LASTEXITCODE/);
+});
+
+// ---- more end-to-end behaviour ------------------------------------------------------------------------------
+
+test('a missing settings.json is created minimal; --claude-home beats CLAUDE_CONFIG_DIR, which beats ~/.claude', () => {
+  const viaFlag = newHome();
+  const viaEnv = newHome();
+  const r = install(viaFlag, [], { env: { CLAUDE_CONFIG_DIR: viaEnv } });
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(existsSync(settingsPath(viaFlag)));
+  assert.equal(existsSync(viaEnv), false);
+
+  const r2 = run(['--source', FIXTURE], { env: { CLAUDE_CONFIG_DIR: viaEnv } });
+  assert.equal(r2.status, 0, r2.stderr);
+  assert.ok(existsSync(join(viaEnv, 'pipeline', 'INSTALLED.json')), 'CLAUDE_CONFIG_DIR is honoured');
+
+  const r3 = run(['--source', FIXTURE]);
+  assert.equal(r3.status, 0, r3.stderr);
+  assert.ok(existsSync(join(r3.userHome, '.claude', 'pipeline', 'INSTALLED.json')), 'defaults to ~/.claude');
+});
+
+test('a settings.json that is a symlink stays a symlink and its target is updated', { skip: process.platform === 'win32' }, () => {
+  const home = newHome();
+  mkdirSync(home, { recursive: true });
+  const real = join(scratch('cp-dotfiles'), 'settings.real.json');
+  writeFileSync(real, `${JSON.stringify(ownersSettings(), null, 2)}\n`);
+  symlinkSync(real, settingsPath(home));
+  assert.equal(install(home).status, 0);
+  assert.ok(lstatSync(settingsPath(home)).isSymbolicLink());
+  assert.ok(readJson(real).hooks.PreToolUse.some((g) => g.hooks.some(isOurHandler)));
+});
+
+test('an existing settings.json keeps its file mode', { skip: process.platform === 'win32' }, () => {
+  const home = newHome();
+  writeSettings(home, ownersSettings());
+  chmodSync(settingsPath(home), 0o600);
+  assert.equal(install(home).status, 0);
+  assert.equal(statSync(settingsPath(home)).mode & 0o777, 0o600);
+});
+
+test('--json prints one machine-readable report with the diagnostics block', () => {
+  const home = newHome();
+  writeSettings(home, ownersSettings());
+  const r = install(home, ['--json'], { env: { CLAUDE_CODE_SUBAGENT_MODEL: 'haiku' } });
+  assert.equal(r.status, 0, r.stderr);
+  const j = JSON.parse(r.stdout);
+  assert.equal(j.ok, true);
+  assert.equal(j.version, '9.9.9');
+  assert.equal(j.hooks.guardGit, true);
+  assert.equal(j.hooks.guardFiles, true);
+  assert.equal(j.files.total, Object.keys(readManifest(home).files).length);
+  assert.equal(j.diagnostics.subagentModel.settingsEnv, 'sonnet');
+  assert.equal(j.diagnostics.subagentModel.processEnv, 'haiku');
+  assert.match(j.diagnostics.note, /Pinned agent models \(judge=opus, arbiter=fable\) still win over this env var/);
+});
+
+test('the human report lists version, files, hooks, backup and the model diagnostics', () => {
+  const home = newHome();
+  writeSettings(home, ownersSettings());
+  const r = install(home);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /9\.9\.9/);
+  assert.match(r.stdout, /guard-files/i);
+  assert.match(r.stdout, /backups/);
+  assert.match(r.stdout, /CLAUDE_CODE_SUBAGENT_MODEL/);
+  assert.match(r.stdout, /Pinned agent models/);
+});
+
+test('tool versions are probed with a timeout and reported; a missing tool never fails the install', { skip: process.platform === 'win32' }, () => {
+  const bin = scratch('cp-fakebin');
+  for (const [name, text] of [['claude', '2.1.285 (Claude Code)'], ['codex', 'codex-cli 0.9.9']]) {
+    writeFileSync(join(bin, name), `#!/bin/sh\necho "${text}"\n`);
+    chmodSync(join(bin, name), 0o755);
+  }
+  writeFileSync(join(bin, 'gh'), '#!/bin/sh\nexit 127\n');
+  chmodSync(join(bin, 'gh'), 0o755);
+  const home = newHome();
+  const r = install(home, ['--json'], { env: { PIPELINE_INSTALL_NO_PROBES: '', PATH: `${bin}${delimiter}${process.env.PATH}` } });
+  assert.equal(r.status, 0, r.stderr);
+  const v = JSON.parse(r.stdout).diagnostics.versions;
+  assert.match(v.claude, /2\.1\.285/);
+  assert.match(v.codex, /0\.9\.9/);
+  assert.equal(typeof v.gh, 'string');
+  assert.notEqual(v.gh, '');
+});
+
+test('usage errors exit 2: unknown flag, missing value, --check with --uninstall', () => {
+  assert.equal(run(['--bogus']).status, 2);
+  assert.equal(run(['--claude-home']).status, 2);
+  assert.equal(run(['--check', '--uninstall']).status, 2);
+  assert.match(run(['--help']).stdout, /--claude-home/);
+});
+
+test('an incomplete source tree is rejected before anything is written; a missing skill or agent is only a warning', () => {
+  const home = newHome();
+  const src = copyFixture();
+  rmSync(join(src, 'VERSION'));
+  rmSync(join(src, 'pipeline', 'hooks', 'guard-files.mjs'));
+  const r = install(home, [], { source: src });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /VERSION/);
+  assert.match(r.stderr, /guard-files\.mjs/);
+  assert.equal(existsSync(home), false);
+
+  const partial = copyFixture();
+  rmSync(join(partial, 'skills', 'verify'), { recursive: true });
+  const ok = install(home, ['--json'], { source: partial });
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.match(JSON.parse(ok.stdout).warnings.join('\n'), /skills\/verify/);
+  assert.equal(existsSync(join(home, 'skills', 'verify')), false);
+  assert.ok(existsSync(join(home, 'skills', 'ship')));
+});
+
+test('a manifest key that escapes the home is ignored, never deleted', () => {
+  const home = newHome();
+  assert.equal(install(home).status, 0);
+  const victim = join(dirname(home), 'precious.txt');
+  writeFileSync(victim, 'precious\n');
+  const m = readManifest(home);
+  m.files['../precious.txt'] = 'x';
+  m.files['skills/../../precious.txt'] = 'x';
+  m.files['pipeline/../../precious.txt'] = 'x';
+  writeFileSync(join(home, 'pipeline', 'INSTALLED.json'), JSON.stringify(m));
+  const r = install(home, ['--uninstall']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(readFileSync(victim, 'utf8'), 'precious\n');
+  assert.match(r.stdout, /ignoring unsafe manifest entry/);
+});
+
+// ---- pure logic ---------------------------------------------------------------------------------------------
+
+test('mergeSettings never mutates its input and returns a new object', () => {
+  const input = ownersSettings();
+  const snapshot = structuredClone(input);
+  const out = mergeSettings(input, { home: '/h/.claude' });
+  assert.deepEqual(input, snapshot);
+  assert.notEqual(out, input);
+  assert.notEqual(out.hooks, input.hooks);
+  assert.equal(out.hooks.PreToolUse.length, input.hooks.PreToolUse.length + 2);
+});
+
+test('mergeSettings on an empty object builds the minimal structure; skipFileGuard omits guard-files', () => {
+  const full = mergeSettings({}, { home: '/h/.claude' });
+  assert.equal(full.hooks.PreToolUse.length, 2);
+  assert.equal(full.hooks.PreToolUse[1].matcher, GUARD_FILES_MATCHER);
+  assert.deepEqual(full.permissions.allow, ['Bash(node /h/.claude/pipeline/bin/pipeline.mjs:*)', 'Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)']);
+  const partial = mergeSettings({}, { home: '/h/.claude', skipFileGuard: true });
+  assert.equal(partial.hooks.PreToolUse.length, 1);
+  assert.equal(partial.hooks.PreToolUse[0].matcher, 'Bash');
+});
+
+test('mergeSettings writes native Windows paths in args and a posix path in the allow entry', () => {
+  const home = 'C:\\Users\\Jo Smith\\.claude';
+  const out = mergeSettings({}, { home });
+  assert.deepEqual(out.hooks.PreToolUse[0].hooks[0].args, ['C:\\Users\\Jo Smith\\.claude\\pipeline\\hooks\\guard-git.mjs']);
+  assert.deepEqual(out.hooks.PreToolUse[1].hooks[0].args, ['C:\\Users\\Jo Smith\\.claude\\pipeline\\hooks\\guard-files.mjs']);
+  assert.equal(out.permissions.allow[0], 'Bash(node C:/Users/Jo Smith/.claude/pipeline/bin/pipeline.mjs:*)');
+  // and an earlier Windows-style entry is recognised as ours and replaced
+  const again = mergeSettings(out, { home });
+  assert.deepEqual(again, out);
+});
+
+test('isOurHandler matches the pipeline hooks dir in command or args, either slash direction', () => {
+  assert.equal(isOurHandler({ command: 'node /a/.claude/pipeline/hooks/guard-git.mjs' }), true);
+  assert.equal(isOurHandler({ command: 'node "C:\\Users\\u\\.claude\\pipeline\\hooks\\guard-files.mjs"' }), true);
+  assert.equal(isOurHandler({ command: 'node', args: ['/custom home/pipeline/hooks/guard-git.mjs'] }), true);
+  assert.equal(isOurHandler({ command: 'node', args: ['D:\\x y\\pipeline\\hooks\\guard-files.mjs'] }), true);
+  assert.equal(isOurHandler({ command: 'node /opt/memory-guard.js' }), false);
+  assert.equal(isOurHandler({ command: 'echo pipeline hooks' }), false);
+  assert.equal(isOurHandler(null), false);
+  assert.equal(isOurHandler({ type: 'prompt', prompt: 'x' }), false);
+});
+
+test('mergeSettings drops a group left empty but keeps a group with other handlers; non-PreToolUse hooks are never touched', () => {
+  const input = {
+    hooks: {
+      PreToolUse: [
+        { matcher: 'Bash', hooks: [{ type: 'command', command: 'node /a/.claude/pipeline/hooks/guard-git.mjs' }] },
+        { matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }, { type: 'command', command: 'node /a/.claude/pipeline/hooks/guard-files.mjs' }] },
+        { matcher: 'Read', hooks: [] },
+      ],
+      PostToolUse: [{ hooks: [{ type: 'command', command: 'node /a/.claude/pipeline/hooks/guard-git.mjs' }] }],
+    },
+  };
+  const out = mergeSettings(input, { home: '/h/.claude' });
+  assert.deepEqual(out.hooks.PreToolUse.slice(0, 2), [
+    { matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }] },
+    { matcher: 'Read', hooks: [] },
+  ]);
+  assert.deepEqual(out.hooks.PostToolUse, input.hooks.PostToolUse);
+});
+
+test('mergeSettings rejects wrongly shaped settings instead of guessing', () => {
+  assert.throws(() => mergeSettings([], { home: '/h' }), /object/);
+  assert.throws(() => mergeSettings({ hooks: [] }, { home: '/h' }), /hooks/);
+  assert.throws(() => mergeSettings({ hooks: { PreToolUse: {} } }, { home: '/h' }), /PreToolUse/);
+  assert.throws(() => mergeSettings({ permissions: { allow: 'x' } }, { home: '/h' }), /allow/);
+  assert.throws(() => mergeSettings({ permissions: [] }, { home: '/h' }), /permissions/);
+});
+
+test('removeOurSettings is the inverse of mergeSettings on settings that had neither hooks nor allow entries', () => {
+  const home = '/h/.claude';
+  for (const base of [{}, { env: { A: '1' } }, ownersSettings(), { permissions: { deny: ['x'] }, hooks: { Stop: [] } }]) {
+    const merged = mergeSettings(base, { home });
+    assert.deepEqual(removeOurSettings(merged, { home }), base);
+  }
+  assert.deepEqual(ourAllowEntries(home), ['Bash(node /h/.claude/pipeline/bin/pipeline.mjs:*)', 'Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)']);
+});
+
+test('renameWithRetry retries EPERM/EBUSY on Windows only, gives up after the attempt limit, and rethrows other errors', () => {
+  const failing = (n, code) => {
+    let calls = 0;
+    return { calls: () => calls, rename: () => { calls++; if (calls <= n) throw Object.assign(new Error(code), { code }); } };
+  };
+  const sleeps = [];
+  const sleep = (ms) => sleeps.push(ms);
+
+  let f = failing(3, 'EPERM');
+  renameWithRetry('a', 'b', { rename: f.rename, platform: 'win32', sleep });
+  assert.equal(f.calls(), 4);
+  assert.deepEqual(sleeps, [50, 50, 50]);
+
+  f = failing(2, 'EBUSY');
+  renameWithRetry('a', 'b', { rename: f.rename, platform: 'win32', sleep });
+  assert.equal(f.calls(), 3);
+
+  f = failing(100, 'EPERM');
+  assert.throws(() => renameWithRetry('a', 'b', { rename: f.rename, platform: 'win32', sleep }), /EPERM/);
+  assert.equal(f.calls(), 20);
+
+  f = failing(1, 'EPERM');
+  assert.throws(() => renameWithRetry('a', 'b', { rename: f.rename, platform: 'linux', sleep }), /EPERM/);
+  assert.equal(f.calls(), 1);
+
+  f = failing(1, 'ENOENT');
+  assert.throws(() => renameWithRetry('a', 'b', { rename: f.rename, platform: 'win32', sleep }), /ENOENT/);
+  assert.equal(f.calls(), 1);
+});
+
+test('parseArgs reads every flag, both --flag value and --flag=value', () => {
+  const a = parseArgs(['--claude-home', '/h', '--source=/s', '--check', '--skip-file-guard', '--force', '--json']);
+  assert.deepEqual(a.opts, { claudeHome: '/h', source: '/s', check: true, uninstall: false, skipFileGuard: true, force: true, json: true });
+  assert.equal(parseArgs(['--uninstall']).opts.uninstall, true);
+  assert.ok(parseArgs(['--nope']).error);
+  assert.ok(parseArgs(['--source']).error);
+  assert.ok(parseArgs(['--claude-home', '--check']).error);
+  assert.ok(parseArgs(['--check', '--uninstall']).error);
+  assert.ok(parseArgs(['stray']).error);
+  assert.equal(parseArgs(['-h']).help, true);
+});
+
+test('safeManifestKey accepts only relative posix keys under skills/, agents/ or pipeline/', () => {
+  for (const ok of ['skills/ship/SKILL.md', 'agents/judge.md', 'pipeline/VERSION', 'pipeline/a/b.mjs']) assert.equal(safeManifestKey(ok), true, ok);
+  for (const bad of ['', '/etc/passwd', 'C:/x', '../x', 'skills/../../x', 'skills//x', 'skills/./x', 'skills\\ship', 'settings.json', 'projects/x', 'pipeline', 'skills', 42, null]) {
+    assert.equal(safeManifestKey(bad), false, String(bad));
+  }
+});
+
+test('buildPlan and walkFiles read the fixture: sorted, excluded names skipped, VERSION lands in pipeline/', () => {
+  const plan = buildPlan(FIXTURE);
+  assert.deepEqual(plan.problems, []);
+  assert.equal(plan.version, '9.9.9');
+  assert.ok(plan.files.has('pipeline/VERSION'));
+  assert.ok(plan.files.has('skills/ship/reference/notes.md'));
+  assert.ok(plan.files.has('agents/arbiter.md'));
+  assert.deepEqual(plan.units.map((u) => u.rel), [
+    'pipeline', 'agents/implementer.md', 'agents/verifier.md', 'agents/judge.md', 'agents/arbiter.md',
+    'skills/ship', 'skills/verify', 'skills/pipeline-setup',
+  ]);
+  const walked = walkFiles(join(FIXTURE, 'skills'));
+  assert.deepEqual(walked, [...walked].sort());
+  assert.equal(buildPlan(join(FIXTURE, 'nope')).problems.length > 0, true);
+});
+
+test('collectDiagnostics: model var from settings env, process env and shell files; versions with timeouts; never throws', () => {
+  const home = scratch('cp-diag-home');
+  writeFileSync(join(home, '.zshrc'), '# export CLAUDE_CODE_SUBAGENT_MODEL=commented\nexport PATH=x\nexport CLAUDE_CODE_SUBAGENT_MODEL=opus\n');
+  writeFileSync(join(home, '.bashrc'), 'echo hi\n');
+  const calls = [];
+  const runFn = (cmd, args, opts) => {
+    calls.push({ cmd, args, timeoutMs: opts.timeoutMs });
+    if (cmd === 'claude') return { code: 0, stdout: '2.1.285 (Claude Code)\n', stderr: '', timedOut: false };
+    if (cmd === 'codex') return { code: 1, stdout: '', stderr: 'spawnSync codex ENOENT', timedOut: false };
+    throw new Error('boom');
+  };
+  const d = collectDiagnostics({
+    settings: { env: { CLAUDE_CODE_SUBAGENT_MODEL: 'sonnet' } },
+    env: { CLAUDE_CODE_SUBAGENT_MODEL: 'haiku' },
+    home, platform: 'linux', runFn,
+  });
+  assert.equal(d.subagentModel.settingsEnv, 'sonnet');
+  assert.equal(d.subagentModel.processEnv, 'haiku');
+  assert.deepEqual(d.subagentModel.shellFiles, [{ file: join(home, '.zshrc'), line: 3, text: 'export CLAUDE_CODE_SUBAGENT_MODEL=opus' }]);
+  assert.match(d.note, /Pinned agent models \(judge=opus, arbiter=fable\) still win over this env var — verified on Claude Code 2\.1\.285; unpinned subagents use it\./);
+  assert.equal(d.versions.claude, '2.1.285 (Claude Code)');
+  assert.equal(d.versions.codex, 'not found');
+  assert.equal(d.versions.gh, 'not found');
+  assert.deepEqual(calls.map((c) => [c.cmd, c.args, c.timeoutMs]), [
+    ['claude', ['--version'], 10000], ['codex', ['--version'], 10000], ['gh', ['--version'], 10000],
+  ]);
+
+  const none = collectDiagnostics({ settings: {}, env: {}, home, platform: 'linux', runFn: null });
+  assert.equal(none.subagentModel.settingsEnv, null);
+  assert.equal(none.subagentModel.processEnv, null);
+  assert.equal(none.versions, null);
+});
+
+test('shellRcPaths: POSIX rc files everywhere, PowerShell profiles on win32', () => {
+  const h = '/home/u';
+  assert.deepEqual(shellRcPaths(h, 'linux').map((p) => posix(p).replace(h, '~')), ['~/.zshrc', '~/.bashrc', '~/.zprofile', '~/.profile', '~/.bash_profile']);
+  const win = shellRcPaths('C:\\Users\\u', 'win32').map(posix);
+  assert.ok(win.some((p) => /Documents\/PowerShell\/Microsoft\.PowerShell_profile\.ps1$/.test(p)));
+  assert.ok(win.some((p) => /Documents\/WindowsPowerShell\/Microsoft\.PowerShell_profile\.ps1$/.test(p)));
+  assert.ok(win.some((p) => /\.zshrc$/.test(p)));
+
+  const home = scratch('cp-win-home');
+  mkdirSync(join(home, 'Documents', 'PowerShell'), { recursive: true });
+  writeFileSync(join(home, 'Documents', 'PowerShell', 'Microsoft.PowerShell_profile.ps1'), '$env:CLAUDE_CODE_SUBAGENT_MODEL = "opus"\n');
+  const d = collectDiagnostics({ settings: {}, env: {}, home, platform: 'win32', runFn: null });
+  assert.equal(d.subagentModel.shellFiles.length, 1);
+  assert.equal(d.subagentModel.shellFiles[0].line, 1);
+});
