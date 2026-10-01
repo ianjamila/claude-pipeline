@@ -1,0 +1,4 @@
+# Fixtures are byte-exact test inputs (diffs, .cmd files, transcripts): never convert line endings.
+test/fixtures/** -text
+*.sh text eol=lf
+*.mjs text eol=lf
