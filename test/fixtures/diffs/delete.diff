@@ -1,0 +1,10 @@
+diff --git a/src/gone.ts b/src/gone.ts
+deleted file mode 100644
+index 7a28df3..0000000
+--- a/src/gone.ts
++++ /dev/null
+@@ -1,4 +0,0 @@
+-alpha
+-beta
+-gamma
+-delta
