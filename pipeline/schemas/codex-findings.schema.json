@@ -1,0 +1,199 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "summary",
+    "blocking",
+    "suggestions",
+    "worth_considering"
+  ],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "One short paragraph: overall verdict on the change."
+    },
+    "blocking": {
+      "type": "array",
+      "description": "Bugs, security issues, data loss, or broken behaviour.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "title",
+          "file",
+          "line",
+          "category",
+          "detail",
+          "reasoning",
+          "testable"
+        ],
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "One-line statement of the problem or idea."
+          },
+          "file": {
+            "type": "string",
+            "description": "Repository-relative path of the most relevant file, or an empty string if none."
+          },
+          "line": {
+            "type": "integer",
+            "description": "Line number in the changed file, or 0 if the finding is not line-specific."
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "bug",
+              "security",
+              "auth",
+              "permissions",
+              "data-integrity",
+              "data-loss",
+              "broken-behaviour",
+              "performance",
+              "maintainability",
+              "testing",
+              "design",
+              "docs",
+              "other"
+            ]
+          },
+          "detail": {
+            "type": "string",
+            "description": "What is wrong or worth doing, concretely."
+          },
+          "reasoning": {
+            "type": "string",
+            "description": "Why this matters and how you reached the conclusion."
+          },
+          "testable": {
+            "type": "boolean",
+            "description": "True if a unit or integration test could prove or disprove this finding."
+          }
+        }
+      }
+    },
+    "suggestions": {
+      "type": "array",
+      "description": "Clear improvements.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "title",
+          "file",
+          "line",
+          "category",
+          "detail",
+          "reasoning",
+          "testable"
+        ],
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "One-line statement of the problem or idea."
+          },
+          "file": {
+            "type": "string",
+            "description": "Repository-relative path of the most relevant file, or an empty string if none."
+          },
+          "line": {
+            "type": "integer",
+            "description": "Line number in the changed file, or 0 if the finding is not line-specific."
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "bug",
+              "security",
+              "auth",
+              "permissions",
+              "data-integrity",
+              "data-loss",
+              "broken-behaviour",
+              "performance",
+              "maintainability",
+              "testing",
+              "design",
+              "docs",
+              "other"
+            ]
+          },
+          "detail": {
+            "type": "string",
+            "description": "What is wrong or worth doing, concretely."
+          },
+          "reasoning": {
+            "type": "string",
+            "description": "Why this matters and how you reached the conclusion."
+          },
+          "testable": {
+            "type": "boolean",
+            "description": "True if a unit or integration test could prove or disprove this finding."
+          }
+        }
+      }
+    },
+    "worth_considering": {
+      "type": "array",
+      "description": "Ideas, trade-offs, future work.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "title",
+          "file",
+          "line",
+          "category",
+          "detail",
+          "reasoning",
+          "testable"
+        ],
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "One-line statement of the problem or idea."
+          },
+          "file": {
+            "type": "string",
+            "description": "Repository-relative path of the most relevant file, or an empty string if none."
+          },
+          "line": {
+            "type": "integer",
+            "description": "Line number in the changed file, or 0 if the finding is not line-specific."
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "bug",
+              "security",
+              "auth",
+              "permissions",
+              "data-integrity",
+              "data-loss",
+              "broken-behaviour",
+              "performance",
+              "maintainability",
+              "testing",
+              "design",
+              "docs",
+              "other"
+            ]
+          },
+          "detail": {
+            "type": "string",
+            "description": "What is wrong or worth doing, concretely."
+          },
+          "reasoning": {
+            "type": "string",
+            "description": "Why this matters and how you reached the conclusion."
+          },
+          "testable": {
+            "type": "boolean",
+            "description": "True if a unit or integration test could prove or disprove this finding."
+          }
+        }
+      }
+    }
+  }
+}
