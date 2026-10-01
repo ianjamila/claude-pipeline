@@ -700,3 +700,44 @@ sections where they conflict.
   force switch as fallback. Post-build reviews pin immutable base/head SHAs.
 - **Also adopted.** pgTAP RLS tests switch to real session roles (`set local role
   authenticated` + `request.jwt.claims`), never a privileged connection.
+
+## 18. Revision 3 — after Codex recheck (2026-10-01)
+
+Recheck: resolved 1, 2, 6, 11, 13, P3-order; partial 3, 4, 5, 7, 8, 9, 10, 12; three new issues.
+
+- **R3' Byte-exact review identity.** Replace patch-id with `contentHash` = sha256 of
+  `git diff -U0 --binary --no-color <mergeBase>..<head> -- . ':!<agent_log>'` with hunk headers
+  normalised to `@@` (content incl. whitespace is preserved; pure line shifts from base updates
+  are not). Each review round records `{fromHead, toHead, contentHashAtToHead}`; review coverage
+  is valid iff the most recent clean round's `contentHashAtToHead` equals the current
+  `contentHash`. Any PR-content change after it ⇒ another round.
+- **R5' Approval without event dependence.** Every guard run (any event) recomputes approval:
+  valid iff `human-approved` is present AND its latest `labeled` timeline event (actor = repo
+  owner) is later than `headSeenAt` = earliest `created_at` among the head SHA's check suites
+  (GitHub creates them at push). No check suite ⇒ invalid (fail closed). Same for
+  `test-change-approved`. A stale approval label is removed (best effort) so the owner can
+  re-add it. Each run re-reads labels + head immediately before posting statuses, so the last
+  run to post uses current state; statuses are per-SHA, so runs for older heads can't affect
+  the current one. Reordered-event test: approve A → push B → unrelated label run → red.
+- **R7' Enclosing SQL statement.** For every changed line in any `*.sql` file, the classifier
+  extracts the enclosing statement from the base and head file contents (from the previous `;`
+  to the next `;`, comments stripped) and applies the R2 keyword rules to the whole statement.
+  Test: predicate-only change `using (owner = auth.uid())` → `using (true)` inside an existing
+  multi-line `create policy` in `schema.sql` → hit.
+- **R8' Rollback.** Before merging, smoke the live production and record its deployment as
+  known-good. On failure: re-read the live deployment; if it isn't the merge's deployment, smoke
+  it — healthy ⇒ `superseded`, failing ⇒ continue. Immediately before rollback re-read the live
+  deployment (abort to `needs-human` if it changed), roll back to known-good, re-read + smoke ⇒
+  `recovered` or `rollback-failed`. Residual race with deploys from merges outside this run is
+  documented and detected by the post-rollback check (never silent).
+- **R9' Logging.** `checks.yml` drops its `paths:` filter (not `paths-ignore`). Agent-log
+  outcome lines are flushed into the next ship PR; the per-PR summary comment is the immediate
+  record. Delayed logging is stated in the README.
+- **R10' Windows quoting.** Port cross-spawn's (MIT) `escapeArgument`/`escapeCommand` incl.
+  double meta-char escaping for `.cmd`/`.bat` targets; Windows CI runs a real `echo-args.cmd`
+  fixture and asserts round-trip of args with spaces, `&`, `%`, `!`, `"`, and trailing `\`.
+- **R12' Locks.** Never reclaim a lock whose owner PID is alive on this host, whatever its age;
+  release only by matching `runId`. Tests: live owner past timeout keeps the lock; a replaced
+  owner's release is a no-op.
+- **R1 note.** EagleWatch exemption goes in `KNOWN_NON_GATES` in
+  `scripts/lib/expected-checks-matchers.mjs`.
