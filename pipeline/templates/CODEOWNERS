@@ -1,0 +1,8 @@
+# Hard-stop paths: changes here never auto-merge. The pipeline labels such PRs needs-human and
+# the owner approves by adding the `human-approved` label (single GitHub identity, so this file
+# documents ownership rather than enforcing reviews).
+# {{HARD_STOP_LINES}}   e.g.  /supabase/migrations/  @owner
+/.github/               {{OWNER}}
+/.claude/               {{OWNER}}
+/scripts/pipeline/      {{OWNER}}
+/scripts/verify*        {{OWNER}}

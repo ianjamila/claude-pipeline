@@ -1,0 +1,73 @@
+# Pipeline guards — tamper-proof "Test integrity" and "Hard-stop scan" required checks.
+#
+# Why pull_request_target: the workflow file, the guard scripts (scripts/pipeline/) and
+# .claude/pipeline.yml all come from the BASE branch, so a pull request cannot change how it is
+# judged. The PR's code is fetched as git data and diffed — it is never checked out or executed.
+# Results are published as commit statuses on the PR head SHA (what branch protection requires).
+#
+# Do not add steps that run code from the PR (npm install, its scripts, its actions).
+name: Pipeline guards
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+
+permissions:
+  contents: read        # read base + fetch the PR head as data
+  pull-requests: write  # only to remove an approval label that predates the latest commit
+  issues: read          # label timeline (who approved, when)
+  statuses: write       # publish the two required statuses
+  checks: read          # check-suite timestamps (when the head commit appeared)
+
+concurrency:
+  group: pipeline-guards-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  guards:
+    name: pipeline-guards
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Mark pending
+        run: |
+          for ctx in "Test integrity" "Hard-stop scan"; do
+            gh api "repos/$REPO/statuses/$EVENT_HEAD" -f state=pending -f context="$ctx" \
+              -f description="evaluating" -f target_url="$RUN_URL" > /dev/null
+          done
+
+      - name: Check out base branch (trusted code only)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          # Needed to fetch refs/pull/N/head below. Safe: no PR code ever runs in this job.
+          persist-credentials: true
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+
+      - name: Evaluate and publish statuses
+        run: node scripts/pipeline/ci-guards-run.mjs
+
+      - name: Fail closed if evaluation did not finish
+        if: failure() || cancelled()
+        run: |
+          for ctx in "Test integrity" "Hard-stop scan"; do
+            cur=$(gh api "repos/$REPO/commits/$EVENT_HEAD/statuses" \
+              --jq "[.[] | select(.context == \"$ctx\")][0].state" 2>/dev/null || true)
+            if [ -z "$cur" ] || [ "$cur" = "pending" ]; then
+              gh api "repos/$REPO/statuses/$EVENT_HEAD" -f state=error -f context="$ctx" \
+                -f description="guard did not finish — re-run the Pipeline guards workflow" \
+                -f target_url="$RUN_URL" > /dev/null || true
+            fi
+          done
