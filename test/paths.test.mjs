@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import os from 'node:os';
 import { toPosix, expandHome, isInside, samePath, safeTimestamp } from '../pipeline/lib/paths.mjs';
 
 test('toPosix replaces every backslash', () => {
@@ -26,7 +27,10 @@ test('expandHome leaves other paths alone', () => {
 });
 
 test('expandHome defaults to the real home directory', () => {
-  assert.notEqual(expandHome('~/x'), '~/x');
+  const home = os.homedir();
+  assert.equal(expandHome('~/x'), `${home}/x`);
+  assert.equal(expandHome('~'), home);
+  assert.equal(expandHome('$HOME/x'), `${home}/x`);
 });
 
 test('isInside: child equal to or below parent', () => {
@@ -61,6 +65,34 @@ test('isInside accepts Windows separators and drive letters', () => {
   assert.equal(isInside('C:\\Users\\u2\\x', 'C:\\Users\\u', 'win32'), false);
   assert.equal(isInside('D:\\x', 'C:\\', 'win32'), false);
   assert.equal(isInside('C:\\x', 'C:\\', 'win32'), true);
+});
+
+test('isInside: drive letters are case-insensitive on win32 and must match', () => {
+  assert.equal(isInside('c:\\Users\\u\\x', 'C:/Users/u', 'win32'), true);
+  assert.equal(isInside('C:/Users/u/x', 'c:\\users\\u', 'win32'), true);
+  assert.equal(isInside('C:\\Users\\u\\x', 'D:\\Users\\u', 'win32'), false);
+  assert.equal(isInside('C:\\Users\\u\\..\\v\\x', 'C:\\Users\\v', 'win32'), true);
+  assert.equal(isInside('C:\\Users\\u\\..\\v\\x', 'C:\\Users\\u', 'win32'), false);
+});
+
+test('isInside: UNC paths keep server and share, and are not the same as a rooted path', () => {
+  assert.equal(isInside('\\\\server\\share\\dir\\f', '\\\\server\\share', 'win32'), true);
+  assert.equal(isInside('//SERVER/Share/dir/f', '\\\\server\\share', 'win32'), true);
+  assert.equal(isInside('\\\\server\\share2\\f', '\\\\server\\share', 'win32'), false);
+  assert.equal(isInside('\\\\other\\share\\f', '\\\\server\\share', 'win32'), false);
+  assert.equal(isInside('\\\\server\\share\\f', '/server/share', 'win32'), false);
+  assert.equal(isInside('/server/share/f', '\\\\server\\share', 'win32'), false);
+});
+
+test('isInside: relative paths resolve against the current directory', () => {
+  assert.equal(isInside('x/y', 'x'), true);
+  assert.equal(isInside('x/../y', 'x'), false);
+  assert.equal(isInside('./a/b', 'a'), true);
+  assert.equal(isInside('.', process.cwd()), true);
+  assert.equal(isInside(`${process.cwd()}/sub/f`, '.'), true);
+  assert.equal(isInside('..', '.'), false);
+  assert.equal(isInside('.', '..'), true);
+  assert.equal(isInside('sub', process.cwd().replace(/\\/g, '/') + '/sub/'), true);
 });
 
 test('samePath compares after normalisation', () => {

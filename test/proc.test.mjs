@@ -1,11 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, realpathSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, realpathSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  run, runShell, splitCommand, escapeArgument, escapeCommand, quoteForCmd, planSpawn,
+  run, runShell, runShellAsync, splitCommand, escapeArgument, escapeCommand, quoteForCmd, planSpawn,
+  cmdExe, createResolver, toResult,
   gh, ghJson, GhError, codexCommand,
 } from '../pipeline/lib/proc.mjs';
 
@@ -206,8 +207,8 @@ test('planSpawn: Windows .exe is spawned directly', () => {
 
 test('planSpawn: Windows .cmd shim goes through cmd.exe with cross-spawn quoting', () => {
   const resolve = () => String.raw`C:\Program Files\nodejs\npm.cmd`;
-  const plan = planSpawn('npm', ['run', 'x y'], { platform: 'win32', resolve });
-  assert.equal(plan.file, 'cmd.exe');
+  const plan = planSpawn('npm', ['run', 'x y'], { platform: 'win32', resolve, env: {} });
+  assert.equal(plan.file, String.raw`C:\Windows\System32\cmd.exe`);
   assert.equal(plan.windowsVerbatimArguments, true);
   assert.deepEqual(plan.args.slice(0, 3), ['/d', '/s', '/c']);
   // command escaped once, args double-escaped, whole line wrapped in one extra pair of quotes (cmd /s strips it)
@@ -216,8 +217,8 @@ test('planSpawn: Windows .cmd shim goes through cmd.exe with cross-spawn quoting
 });
 
 test('planSpawn: Windows .bat target with a forward-slash path is normalised to backslashes', () => {
-  const plan = planSpawn('C:/tools/run it.bat', ['x'], { platform: 'win32' });
-  assert.equal(plan.file, 'cmd.exe');
+  const plan = planSpawn('C:/tools/run it.bat', ['x'], { platform: 'win32', env: {} });
+  assert.equal(plan.file, String.raw`C:\Windows\System32\cmd.exe`);
   assert.equal(plan.args[3], String.raw`"C:\tools\run^ it.bat ^^^"x^^^""`);
 });
 
@@ -301,6 +302,184 @@ test('codexCommand reads process.env by default', () => {
     if (prev === undefined) delete process.env.PIPELINE_CODEX;
     else process.env.PIPELINE_CODEX = prev;
   }
+});
+
+const fixtures = join(dirname(fileURLToPath(import.meta.url)), 'fixtures');
+const trapSigterm = join(fixtures, 'trap-sigterm.mjs');
+const spawnSleeper = join(fixtures, 'spawn-sleeper.mjs');
+
+function isAlive(pid) {
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return false;
+  }
+  if (process.platform === 'linux') {
+    try {
+      return !/^\d+ \(.*\) Z/.test(readFileSync(`/proc/${pid}/stat`, 'utf8')); // a zombie is already dead
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function waitUntilDead(pid, ms = 3000) {
+  const deadline = Date.now() + ms;
+  while (isAlive(pid) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+  return !isAlive(pid);
+}
+
+test('run SIGKILLs on timeout: a child that traps SIGTERM and exits 0 still cannot report success', () => {
+  const marker = join(scratch(), 'sigterm.marker');
+  const t0 = Date.now();
+  const r = run('node', [trapSigterm, marker], { timeoutMs: 500 });
+  assert.equal(r.timedOut, true);
+  assert.notEqual(r.code, 0);
+  assert.ok(Date.now() - t0 < 1500, `took ${Date.now() - t0} ms`);
+  assert.equal(existsSync(marker), false, 'the child was sent SIGTERM, not SIGKILL');
+});
+
+test('runShell SIGKILLs on timeout and never reports exit 0', () => {
+  const marker = join(scratch(), 'sigterm.marker');
+  const t0 = Date.now();
+  const r = runShell(`node "${trapSigterm}" "${marker}"`, { timeoutMs: 500 });
+  assert.equal(r.timedOut, true);
+  assert.notEqual(r.code, 0);
+  assert.ok(Date.now() - t0 < 1500, `took ${Date.now() - t0} ms`);
+  assert.equal(existsSync(marker), false, 'the shell command was sent SIGTERM, not SIGKILL');
+});
+
+test('toResult: a timeout is never exit 0, whatever status the child reported', () => {
+  const timeout = { code: 'ETIMEDOUT' };
+  assert.equal(toResult({ status: 0, error: timeout }).code, 124);
+  assert.equal(toResult({ status: null, error: timeout }).code, 124);
+  assert.equal(toResult({ status: 3, error: timeout }).code, 3);
+  assert.equal(toResult({ status: 0, error: timeout }).timedOut, true);
+  assert.equal(toResult({ status: 0 }).code, 0);
+  assert.equal(toResult({ status: null }).code, 1);
+  assert.equal(toResult({ status: null, error: new Error('spawn x ENOENT') }).stderr, 'spawn x ENOENT');
+});
+
+test('runShell honours input', () => {
+  const r = runShell('node -e "process.stdin.pipe(process.stdout)"', { input: 'from stdin' });
+  assert.equal(r.stdout, 'from stdin');
+});
+
+test('runShellAsync captures output, exit code, env, cwd and input', async () => {
+  const dir = realpathSync(scratch());
+  const ok = await runShellAsync('node -e "process.stdout.write(process.env.CP_A + \'|\' + process.cwd())"', {
+    env: { CP_A: 'x' }, cwd: dir,
+  });
+  assert.deepEqual(ok, { code: 0, stdout: `x|${dir}`, stderr: '', timedOut: false });
+  const bad = await runShellAsync('node -e "process.stderr.write(\'e\'); process.exit(4)"');
+  assert.equal(bad.code, 4);
+  assert.equal(bad.stderr, 'e');
+  const echoed = await runShellAsync('node -e "process.stdin.pipe(process.stdout)"', { input: 'piped' });
+  assert.equal(echoed.stdout, 'piped');
+});
+
+test('runShellAsync SIGKILLs a command that traps SIGTERM', async () => {
+  const t0 = Date.now();
+  const r = await runShellAsync(`node "${trapSigterm}"`, { timeoutMs: 500 });
+  assert.equal(r.timedOut, true);
+  assert.notEqual(r.code, 0);
+  assert.ok(Date.now() - t0 < 1500, `took ${Date.now() - t0} ms`);
+});
+
+test('runShellAsync timeout kills the whole process tree, not just the direct child', async () => {
+  const pidFile = join(scratch(), 'grandchild.pid');
+  const r = await runShellAsync(`node "${spawnSleeper}" "${pidFile}"`, { timeoutMs: 1500 });
+  assert.equal(r.timedOut, true);
+  assert.notEqual(r.code, 0);
+  const pid = Number(readFileSync(pidFile, 'utf8'));
+  assert.ok(pid > 0);
+  assert.equal(await waitUntilDead(pid), true, `grandchild ${pid} survived the timeout`);
+});
+
+test('planSpawn: Windows .cmd rejects args cmd.exe cannot carry', () => {
+  const resolve = () => String.raw`C:\x\tool.cmd`;
+  const plan = (args) => planSpawn('tool', args, { platform: 'win32', resolve });
+  assert.throws(() => plan(['line1\nline2']), /newline/i);
+  assert.throws(() => plan(['a\rb']), /newline/i);
+  assert.throws(() => plan(['x'.repeat(9000)]), /8191/);
+  assert.doesNotThrow(() => plan(['x'.repeat(2000)]));
+});
+
+test('planSpawn: Windows .exe targets are not limited by cmd.exe rules', () => {
+  const resolve = () => String.raw`C:\x\tool.exe`;
+  const plan = planSpawn('tool', ['line1\nline2', 'x'.repeat(9000)], { platform: 'win32', resolve });
+  assert.equal(plan.file, String.raw`C:\x\tool.exe`);
+});
+
+test('cmdExe prefers ComSpec and otherwise uses the absolute system path', () => {
+  assert.equal(cmdExe({ ComSpec: String.raw`D:\Win\cmd.exe` }), String.raw`D:\Win\cmd.exe`);
+  assert.equal(cmdExe({}), String.raw`C:\Windows\System32\cmd.exe`);
+});
+
+test('planSpawn launches an absolute cmd.exe, never the bare name', () => {
+  const resolve = () => String.raw`C:\x\tool.cmd`;
+  assert.equal(
+    planSpawn('tool', [], { platform: 'win32', resolve, env: { ComSpec: String.raw`D:\Win\cmd.exe` } }).file,
+    String.raw`D:\Win\cmd.exe`,
+  );
+  assert.equal(planSpawn('tool', [], { platform: 'win32', resolve, env: {} }).file, String.raw`C:\Windows\System32\cmd.exe`);
+});
+
+test('createResolver: searches from the temp dir, prefers executables, caches hits but not misses', () => {
+  const calls = [];
+  let hits = null;
+  const resolve = createResolver((cmd, cwd) => { calls.push({ cmd, cwd }); return hits; });
+  assert.equal(resolve('npm'), null);
+  assert.equal(resolve('npm'), null);
+  assert.equal(calls.length, 2, 'a miss must be looked up again');
+  assert.equal(calls[0].cwd, tmpdir(), 'where must not search the repo directory');
+  hits = [String.raw`C:\nodejs\npm`, String.raw`C:\nodejs\npm.cmd`];
+  assert.equal(resolve('npm'), String.raw`C:\nodejs\npm.cmd`);
+  assert.equal(resolve('npm'), String.raw`C:\nodejs\npm.cmd`);
+  assert.equal(calls.length, 3, 'a hit is cached');
+  assert.equal(resolve(String.raw`C:\tools\x.exe`), String.raw`C:\tools\x.exe`, 'explicit paths skip the lookup');
+  assert.equal(calls.length, 3);
+});
+
+test('GhError carries timedOut and says so in its message', () => {
+  const { env } = fakeGhEnv([]);
+  const slow = { ...env, PIPELINE_GH: `node "${trapSigterm}"` };
+  assert.throws(
+    () => ghJson(['pr', 'view', '1'], { env: slow, timeoutMs: 500 }),
+    (err) => {
+      assert.ok(err instanceof GhError);
+      assert.equal(err.timedOut, true);
+      assert.notEqual(err.code, 0);
+      assert.match(err.message, /timed out/);
+      return true;
+    },
+  );
+  const { env: failing } = fakeGhEnv([{ match: '.*', code: 1, stderr: 'boom' }]);
+  assert.throws(() => ghJson(['x'], { env: failing }), (err) => err.timedOut === false && !/timed out/.test(err.message));
+});
+
+// Every cmd.exe metacharacter must come out caret-escaped (twice for batch targets); dropping one
+// from META_CHARS must fail here. Expected shapes, with c the metachar in the arg "a<c>b":
+//   single  ^"a^<c>b^"   double  ^^^"a^^^<c>b^^^"   (a " also gets the backslash: ...a\^"b...)
+const META = ['(', ')', '[', ']', '%', '!', '^', '"', '`', '<', '>', '&', '|', ';', ',', '*', '?', ' '];
+
+test('escapeArgument caret-escapes every cmd metacharacter, one char at a time', () => {
+  for (const c of META) {
+    const bs = c === '"' ? '\\' : '';
+    assert.equal(escapeArgument(`a${c}b`, false), `^"a${bs}^${c}b^"`, `single, char ${JSON.stringify(c)}`);
+    assert.equal(escapeArgument(`a${c}b`, true), `^^^"a${bs}^^^${c}b^^^"`, `double, char ${JSON.stringify(c)}`);
+  }
+});
+
+test('escapeArgument leaves ordinary punctuation alone', () => {
+  for (const c of [':', '/', '.', '-', '_', '\\', '$', '{', '}', "'", '@', '#', '~', '+']) {
+    assert.equal(escapeArgument(`a${c}b`, true), `^^^"a${c}b^^^"`, `char ${JSON.stringify(c)}`);
+  }
+});
+
+test('escapeCommand caret-escapes every cmd metacharacter too', () => {
+  for (const c of META) assert.equal(escapeCommand(`a${c}b`), `a^${c}b`, `char ${JSON.stringify(c)}`);
 });
 
 // Real round trip through a .cmd shim. Only meaningful on Windows (runs on the Windows CI runner).

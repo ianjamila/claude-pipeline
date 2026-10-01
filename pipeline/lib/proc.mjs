@@ -1,6 +1,7 @@
 // Every external process the pipeline starts goes through here, so Windows quirks live in one place:
 // npm/codex/vercel/npx are .cmd shims that spawn cannot run directly, and cmd.exe needs its own quoting.
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import os from 'node:os';
 import path from 'node:path';
 
 const MAX_BUFFER = 64 * 1024 * 1024;
@@ -42,40 +43,73 @@ export function quoteForCmd(args) {
   return args.map((a) => escapeArgument(a, true)).join(' ');
 }
 
-const whereCache = new Map();
-
-// Windows: find the real file for a bare command name. `where` lists extensionless shims first, so
-// pick the first hit that is actually executable.
-function resolveOnWindows(cmd) {
-  if (/[\\/]/.test(cmd)) return cmd;
-  if (whereCache.has(cmd)) return whereCache.get(cmd);
-  const r = spawnSync('where', [cmd], { encoding: 'utf8', windowsHide: true });
-  let found = null;
-  if (r.status === 0) {
-    const hits = r.stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-    found = hits.find((h) => /\.(exe|com|cmd|bat)$/i.test(h)) ?? hits[0] ?? null;
-  }
-  whereCache.set(cmd, found);
-  return found;
+// Windows: `where` (like cmd.exe itself) searches the current directory first, so run it from the
+// temp dir; otherwise a planted git.exe / npm.cmd in the repo being worked on would win.
+function whereLookup(cmd, cwd) {
+  const r = spawnSync('where', [cmd], { cwd, encoding: 'utf8', windowsHide: true });
+  if (r.status !== 0) return null;
+  return r.stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
 }
+
+// Finds the real file for a bare command name. `where` lists extensionless shims first, so pick the
+// first hit that is actually executable. Only hits are cached: a miss may be fixed by installing the
+// tool mid-run. `where` is injectable for tests.
+export function createResolver(where = whereLookup) {
+  const cache = new Map();
+  return (cmd) => {
+    if (/[\\/]/.test(cmd)) return cmd;
+    if (cache.has(cmd)) return cache.get(cmd);
+    const hits = where(cmd, os.tmpdir());
+    if (!hits || hits.length === 0) return null;
+    const found = hits.find((h) => /\.(exe|com|cmd|bat)$/i.test(h)) ?? hits[0];
+    cache.set(cmd, found);
+    return found;
+  };
+}
+
+const resolveOnWindows = createResolver();
+
+// Absolute path to cmd.exe: a bare "cmd.exe" would be searched for in the working directory first.
+export function cmdExe(env = process.env) {
+  return env.ComSpec || 'C:\\Windows\\System32\\cmd.exe';
+}
+
+// cmd.exe truncates its command line at 8191 characters and ends it at a newline.
+const CMD_LINE_LIMIT = 8191;
 
 // Pure planner (so the Windows branch is testable anywhere): what to actually hand to spawnSync.
 // The .cmd line is wrapped in one extra pair of quotes because `cmd /s` strips the outermost pair.
-export function planSpawn(cmd, args, { platform = process.platform, resolve = resolveOnWindows } = {}) {
+// Callers must pass long or multi-line input through stdin or a file, never as an argument.
+export function planSpawn(cmd, args, { platform = process.platform, resolve = resolveOnWindows, env = process.env } = {}) {
   if (platform !== 'win32') return { file: cmd, args, windowsVerbatimArguments: false };
   const resolved = resolve(cmd) ?? cmd;
   if (/\.(cmd|bat)$/i.test(resolved)) {
+    if (args.some((a) => /[\r\n]/.test(String(a)))) {
+      throw new Error(`cannot pass an argument containing a newline to ${resolved} via cmd.exe; pass it through stdin or a file`);
+    }
     const line = [escapeCommand(path.win32.normalize(resolved)), ...args.map((a) => escapeArgument(a, true))].join(' ');
-    return { file: 'cmd.exe', args: ['/d', '/s', '/c', `"${line}"`], windowsVerbatimArguments: true };
+    const file = cmdExe(env);
+    const wrapped = `"${line}"`;
+    const total = file.length + ' /d /s /c '.length + wrapped.length;
+    if (total > CMD_LINE_LIMIT) {
+      throw new Error(`command line for ${resolved} is ${total} characters; cmd.exe allows ${CMD_LINE_LIMIT}. Pass long input through stdin or a file`);
+    }
+    return { file, args: ['/d', '/s', '/c', wrapped], windowsVerbatimArguments: true };
   }
   return { file: resolved, args, windowsVerbatimArguments: false };
 }
 
-function toResult(r) {
+// A command that was killed for running too long must never look successful: whatever status the
+// child reported (a SIGTERM handler can exit 0), a timeout is a non-zero code.
+const TIMEOUT_EXIT_CODE = 124;
+
+// Exported for tests.
+export function toResult(r) {
   const timedOut = r.error?.code === 'ETIMEDOUT';
   let stderr = r.stderr ?? '';
   if (r.error && !timedOut && !stderr) stderr = r.error.message; // e.g. ENOENT: surface why nothing ran
-  return { code: r.status ?? 1, stdout: r.stdout ?? '', stderr, timedOut };
+  const code = timedOut ? (r.status || TIMEOUT_EXIT_CODE) : (r.status ?? 1);
+  return { code, stdout: r.stdout ?? '', stderr, timedOut };
 }
 
 function baseOptions({ cwd, env, timeoutMs } = {}) {
@@ -83,6 +117,7 @@ function baseOptions({ cwd, env, timeoutMs } = {}) {
     cwd,
     env: env ? { ...process.env, ...env } : undefined,
     timeout: timeoutMs,
+    killSignal: 'SIGKILL', // SIGTERM can be trapped; a timeout has to stick
     encoding: 'utf8',
     windowsHide: true,
     maxBuffer: MAX_BUFFER,
@@ -100,8 +135,76 @@ export function run(cmd, args = [], { cwd, env, input, timeoutMs } = {}) {
 }
 
 // For project-configured command lines (e.g. `npm run merge -- 12`): POSIX sh, or cmd.exe on Windows.
-export function runShell(command, { cwd, env, timeoutMs } = {}) {
-  return toResult(spawnSync(command, { ...baseOptions({ cwd, env, timeoutMs }), shell: true }));
+// Sync, so on timeout it only kills the direct shell: a grandchild that keeps the output pipes open
+// can leave this call waiting. Use runShellAsync for anything that may spawn long-lived children.
+export function runShell(command, { cwd, env, input, timeoutMs } = {}) {
+  return toResult(spawnSync(command, { ...baseOptions({ cwd, env, timeoutMs }), input, shell: true }));
+}
+
+// Kill a process and everything it started: POSIX signals the process group (the child is spawned
+// detached, so it leads its own group); Windows asks taskkill to walk the tree.
+function killTree(pid) {
+  if (pid === undefined) return;
+  if (process.platform === 'win32') {
+    spawnSync('taskkill', ['/T', '/F', '/PID', String(pid)], { cwd: os.tmpdir(), windowsHide: true });
+    return;
+  }
+  try {
+    process.kill(-pid, 'SIGKILL');
+  } catch {
+    try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+  }
+}
+
+// Async runShell whose timeout takes the whole process tree down, so no orphan keeps working (or
+// holding the pipes) after the caller has moved on. Resolves; never rejects.
+export function runShellAsync(command, { cwd, env, input, timeoutMs } = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(command, {
+      cwd,
+      env: env ? { ...process.env, ...env } : undefined,
+      shell: true,
+      detached: process.platform !== 'win32',
+      windowsHide: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    let settled = false;
+    let timer;
+    let grace;
+    const finish = (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(grace);
+      resolve({ code: timedOut ? (code || TIMEOUT_EXIT_CODE) : (code ?? 1), stdout, stderr, timedOut });
+    };
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (c) => { stdout += c; });
+    child.stderr.on('data', (c) => { stderr += c; });
+    child.stdin.on('error', () => {}); // EPIPE when the command exits without reading its input
+    child.on('error', (err) => {
+      if (!stderr) stderr = err.message;
+      finish(1);
+    });
+    child.on('close', (code) => finish(code));
+    child.stdin.end(input);
+    if (timeoutMs) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        killTree(child.pid);
+        // Safety net: if something still holds the pipes open, give up on them rather than hang.
+        grace = setTimeout(() => {
+          child.stdout.destroy();
+          child.stderr.destroy();
+          finish(null);
+        }, 2000);
+      }, timeoutMs);
+    }
+  });
 }
 
 // Minimal quote-aware splitter for the PIPELINE_GH / PIPELINE_CODEX override strings.
@@ -157,12 +260,13 @@ function overrideCommand(name, fallback, env) {
 }
 
 export class GhError extends Error {
-  constructor({ code, stderr, args }) {
-    super(`gh ${args.join(' ')} failed (exit ${code})${stderr ? `: ${stderr.trim()}` : ''}`);
+  constructor({ code, stderr, args, timedOut = false }) {
+    super(`gh ${args.join(' ')} ${timedOut ? 'timed out' : 'failed'} (exit ${code})${stderr ? `: ${stderr.trim()}` : ''}`);
     this.name = 'GhError';
     this.code = code;
     this.stderr = stderr;
     this.args = args;
+    this.timedOut = timedOut;
   }
 }
 
@@ -173,7 +277,7 @@ export function gh(args, opts = {}) {
 
 export function ghJson(args, opts = {}) {
   const r = gh(args, opts);
-  if (r.code !== 0) throw new GhError({ code: r.code, stderr: r.stderr, args });
+  if (r.code !== 0 || r.timedOut) throw new GhError({ code: r.code, stderr: r.stderr, args, timedOut: r.timedOut });
   try {
     return JSON.parse(r.stdout);
   } catch {
