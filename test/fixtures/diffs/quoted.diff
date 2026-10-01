@@ -1,0 +1,52 @@
+diff --git "a/docs/back\\slash.md" "b/docs/back\\slash.md"
+index 422c2b7..55dce13 100644
+--- "a/docs/back\\slash.md"
++++ "b/docs/back\\slash.md"
+@@ -2 +2 @@ a
+-b
++B
+diff --git "a/docs/caf\303\251 old.md" "b/docs/caf\303\251 new.md"
+similarity index 75%
+rename from "docs/caf\303\251 old.md"
+rename to "docs/caf\303\251 new.md"
+index 29b1d51..ee83103 100644
+--- "a/docs/caf\303\251 old.md"	
++++ "b/docs/caf\303\251 new.md"	
+@@ -3 +3 @@ k2
+-k3
++K3
+diff --git "a/docs/caf\303\251.md" "b/docs/caf\303\251.md"
+index 422c2b7..55dce13 100644
+--- "a/docs/caf\303\251.md"
++++ "b/docs/caf\303\251.md"
+@@ -2 +2 @@ a
+-b
++B
+diff --git "a/docs/emoji \360\237\231\202.md" "b/docs/emoji \360\237\231\202.md"
+index 422c2b7..55dce13 100644
+--- "a/docs/emoji \360\237\231\202.md"	
++++ "b/docs/emoji \360\237\231\202.md"	
+@@ -2 +2 @@ a
+-b
++B
+diff --git "a/docs/say \"hi\".md" "b/docs/say \"hi\".md"
+index 422c2b7..55dce13 100644
+--- "a/docs/say \"hi\".md"	
++++ "b/docs/say \"hi\".md"	
+@@ -2 +2 @@ a
+-b
++B
+diff --git "a/docs/tab\there.md" "b/docs/tab\there.md"
+index 422c2b7..55dce13 100644
+--- "a/docs/tab\there.md"
++++ "b/docs/tab\there.md"
+@@ -2 +2 @@ a
+-b
++B
+diff --git "a/na\303\257ve/new \303\237.md" "b/na\303\257ve/new \303\237.md"
+new file mode 100644
+index 0000000..92d5444
+--- /dev/null
++++ "b/na\303\257ve/new \303\237.md"	
+@@ -0,0 +1 @@
++fresh

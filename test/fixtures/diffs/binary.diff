@@ -1,0 +1,11 @@
+diff --git a/img/logo.bin b/img/logo.bin
+index bf65dc8..ef0fea7 100644
+Binary files a/img/logo.bin and b/img/logo.bin differ
+diff --git a/img/new.bin b/img/new.bin
+new file mode 100644
+index 0000000..4667e1e
+Binary files /dev/null and b/img/new.bin differ
+diff --git a/img/old.bin b/img/old.bin
+deleted file mode 100644
+index 4f94ecf..0000000
+Binary files a/img/old.bin and /dev/null differ
