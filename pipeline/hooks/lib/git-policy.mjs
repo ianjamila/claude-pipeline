@@ -123,6 +123,17 @@ function branchOf(dir, gitDir, ctx) {
   return b === '' || b === 'HEAD' ? null : b;
 }
 
+// Where git itself says a bare `git push` would go (`rev-parse @{push}`, e.g. origin/main). null when unknown.
+function pushDestOf(dir, gitDir, ctx) {
+  if (dir === null) return null;
+  let d;
+  try { d = ctx.pushDestination(dir, { gitDir }); } catch { return null; }
+  return typeof d === 'string' && d.trim() ? d.trim() : null;
+}
+
+// origin/main, upstream/master, refs/heads/main, refs/remotes/origin/master, main
+const isProtectedRef = (ref) => /^(?:[^/]+\/)?(?:main|master)$/.test(ref.replace(/^refs\/(?:heads|remotes)\//, ''));
+
 // ---- git push -------------------------------------------------------------------------------------------
 
 const FORCE_REASON = 'force-pushing (-f, --force*, +refspec, --mirror) is blocked. Push your agent branch with a plain `git push`.';
@@ -190,6 +201,9 @@ function checkPush(args, dir, gitDir, ctx) {
   else refspecs = positionals.slice(1);
   if (refspecs.length === 0) {
     if (dir === null) return deny('cannot tell which directory this `git push` runs in (unresolved cd / -C), so the current branch cannot be verified.');
+    // push.default=upstream (or a branch created from origin/main) can send agent/x to main: ask git where it goes
+    const dest = pushDestOf(dir, gitDir, ctx);
+    if (dest !== null && isProtectedRef(dest)) return deny(`a bare \`git push\` here would update ${dest} (the branch's push destination). Push explicitly: git push -u origin HEAD:agent/<slug>.`);
     const b = branchOf(dir, gitDir, ctx);
     if (b === null) return deny('cannot determine the current branch (detached HEAD or not a repository), so a push with no refspec cannot be verified. Name the branch: `git push -u origin agent/<slug>`.');
     if (isProtectedBranch(b)) return deny(`this checkout is on ${b}; a push with no refspec would push it. Switch to an agent/<slug> branch.`);
@@ -443,11 +457,12 @@ export function evaluateGitCommand(command, {
   cwd,
   home = os.homedir(),
   currentBranch = () => null,
+  pushDestination = () => null,
   issueLabels = () => { throw new Error('no issue label lookup is available'); },
   readText = defaultReadText,
 } = {}) {
   const text = typeof command === 'string' ? command : String(command ?? '');
   const base = cwd || process.cwd();
-  const ctx = { cwd: base, home, currentBranch, issueLabels, readText, fullText: text, vars: Object.create(null) };
+  const ctx = { cwd: base, home, currentBranch, pushDestination, issueLabels, readText, fullText: text, vars: Object.create(null) };
   return evalString(text, path.resolve(base), ctx, 0);
 }

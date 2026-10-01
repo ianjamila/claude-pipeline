@@ -7,6 +7,7 @@
 import { runHook } from './lib/hook-io.mjs';
 
 const LOOKUP_TIMEOUT_MS = 5000;
+const PUSH_LOOKUP_TIMEOUT_MS = 3000;
 
 async function evaluate(input) {
   if (input.tool_name !== 'Bash') return { decision: 'allow', reason: '' };
@@ -21,6 +22,14 @@ async function evaluate(input) {
     return r.code === 0 && branch ? branch : null;
   };
 
+  // Where git would send a bare `git push` (e.g. "origin/main"); null when it cannot say (no upstream, detached, error).
+  const pushDestination = (dir, { gitDir } = {}) => {
+    const args = ['-C', dir, ...(gitDir ? ['--git-dir', gitDir] : []), 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{push}'];
+    const r = run('git', args, { timeoutMs: PUSH_LOOKUP_TIMEOUT_MS });
+    const dest = r.stdout.trim();
+    return r.code === 0 && dest ? dest : null;
+  };
+
   // throws when the lookup fails, so the policy denies instead of guessing
   const issueLabels = (n, repoArgs = [], cwd) => {
     const r = gh(['issue', 'view', String(n), ...repoArgs, '--json', 'labels', '-q', '.labels[].name'], { cwd, timeoutMs: LOOKUP_TIMEOUT_MS });
@@ -33,6 +42,7 @@ async function evaluate(input) {
   return evaluateGitCommand(typeof command === 'string' ? command : '', {
     cwd: typeof input.cwd === 'string' && input.cwd ? input.cwd : process.cwd(),
     currentBranch,
+    pushDestination,
     issueLabels,
   });
 }

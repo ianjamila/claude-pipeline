@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync, realpathSync, readFileSync, cpSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, devNull } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
@@ -13,9 +13,10 @@ const FAKE_GH = resolve(HERE, 'fixtures/fake-gh.mjs');
 
 // Evaluate with injected branch / label lookups. `o.branch`: branch name, or null for detached.
 // `o.byDir`: branch per directory. `o.labels`: labels of any issue, or an Error to throw.
+// `o.pushDest`: what `git rev-parse @{push}` says (string), null when it fails, or an Error to throw.
 // Paths go through resolve() so the table reads the same on Windows, where '/other' becomes 'C:\\other'.
 function evaluate(command, o = {}) {
-  const calls = { labels: [], branchDirs: [] };
+  const calls = { labels: [], branchDirs: [], pushDirs: [] };
   const byDir = o.byDir && Object.fromEntries(Object.entries(o.byDir).map(([k, v]) => [resolve(k), v]));
   const verdict = evaluateGitCommand(command, {
     cwd: o.cwd ?? '/work/repo',
@@ -24,6 +25,11 @@ function evaluate(command, o = {}) {
       calls.branchDirs.push({ dir, ...extra });
       if (byDir) return byDir[dir] ?? null;
       return o.branch === undefined ? 'agent/x' : o.branch;
+    },
+    pushDestination: (dir, extra) => {
+      calls.pushDirs.push({ dir, ...extra });
+      if (o.pushDest instanceof Error) throw o.pushDest;
+      return o.pushDest ?? null;
     },
     issueLabels: (n, repoArgs, cwd) => {
       calls.labels.push({ n, repoArgs, cwd });
@@ -150,6 +156,20 @@ const MORE_DENY = [
   ['git push origin HEAD:heads/main'],
   ['git push origin HEAD:@', { branch: 'master' }],
   ['git push origin main:main'],
+  // a bare push goes where git would send it (@{push}), not where the branch name suggests
+  ['git push', { pushDest: 'origin/main' }],
+  ['git push origin', { pushDest: 'origin/master' }],
+  ['git push -u origin', { pushDest: 'origin/main' }],
+  ['git push --dry-run', { pushDest: 'origin/main' }],
+  ['git push', { pushDest: 'refs/heads/main' }],
+  ['git push', { pushDest: 'refs/remotes/origin/master' }],
+  ['git push', { pushDest: 'upstream/main' }],
+  ['git push', { pushDest: 'main' }],
+  ['git push', { pushDest: 'origin/main', branch: null }],
+  ['git push', { pushDest: null, branch: 'main' }], // lookup failed: fall back to the current-branch rule
+  ['git push', { pushDest: new Error('git: timed out'), branch: 'master' }],
+  ['git push', { pushDest: null, branch: null }],
+  ['cd /other && git push', { pushDest: 'origin/main', byDir: { '/other': 'agent/y' } }],
   ['git push origin agent/x main'],
   ['git push git@github.com:o/r.git main'],
   ['git push https://github.com/o/r.git HEAD:main'],
@@ -268,6 +288,15 @@ const MORE_ALLOW = [
   ['git push origin HEAD:agent/x', { branch: 'main' }], // the destination is explicit
   ['git push origin main:agent/x'],
   ['git push origin agent/*:agent/*'],
+  ['git push', { pushDest: 'origin/agent/x' }],
+  ['git push -u origin', { pushDest: 'origin/agent/x' }],
+  ['git push', { pushDest: 'origin/agent/main-menu-fix' }],
+  ['git push', { pushDest: 'origin/feature/master-data' }],
+  ['git push', { pushDest: 'refs/remotes/origin/agent/x' }],
+  ['git push', { pushDest: null, branch: 'agent/x' }],
+  ['git push', { pushDest: new Error('boom'), branch: 'agent/x' }],
+  ['git push origin agent/x', { pushDest: 'origin/main' }], // explicit refspec: @{push} is irrelevant
+  ['git push origin HEAD:agent/x', { pushDest: 'origin/main' }],
   ['git push --no-verify -u origin agent/x'],
   ['git push --no-force-with-lease origin agent/x'],
   ['git push --follow-tags --atomic origin agent/x'],
@@ -372,8 +401,14 @@ test('what the evaluator asks its collaborators', () => {
   assert.deepEqual(v.calls.labels[0], { n: '7', repoArgs: ['-R', 'o/r'], cwd: resolve('/work/repo') });
   v = evaluate('gh api -X PATCH "repos/{owner}/{repo}/issues/7" -f state=closed', { labels: [] });
   assert.deepEqual(v.calls.labels[0], { n: '7', repoArgs: [], cwd: resolve('/work/repo') });
+  v = evaluate('git -C /other push', { pushDest: 'origin/agent/y' });
+  assert.deepEqual(v.calls.pushDirs, [{ dir: resolve('/other'), gitDir: null }]);
+  v = evaluate('git --git-dir=/g/.git push', { pushDest: 'origin/agent/y' });
+  assert.equal(v.calls.pushDirs[0].gitDir, resolve('/g/.git'));
+  v = evaluate('git push origin agent/x', { pushDest: 'origin/main' });
+  assert.deepEqual(v.calls.pushDirs, []);
   v = evaluate('git status');
-  assert.deepEqual([v.calls.branchDirs, v.calls.labels], [[], []]);
+  assert.deepEqual([v.calls.branchDirs, v.calls.pushDirs, v.calls.labels], [[], [], []]);
 });
 
 test('an explicit destination does not need the current branch', () => {
@@ -513,6 +548,80 @@ test('spawn: bare git push with a detached HEAD is denied', () => {
   const r = hook(bashInput('git push', dir));
   assert.equal(JSON.parse(r.stdout).hookSpecificOutput.permissionDecision, 'deny');
   assert.match(JSON.parse(r.stdout).hookSpecificOutput.permissionDecisionReason, /current branch/);
+});
+
+// A working clone on main with a bare "origin", so @{push} resolves exactly as it does for a real checkout.
+// Global/system git config is neutralised for both the setup commands and the spawned hook.
+const GIT_ENV = { GIT_CONFIG_GLOBAL: devNull, GIT_CONFIG_SYSTEM: devNull, GIT_CONFIG_NOSYSTEM: '1' };
+function makeClone(name) {
+  const bare = join(TMP, name + '-origin.git');
+  const work = join(TMP, name);
+  const git = (...args) => execFileSync('git', ['-C', work, '-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { env: { ...process.env, ...GIT_ENV }, stdio: 'pipe' });
+  execFileSync('git', ['init', '-q', '--bare', bare], { env: { ...process.env, ...GIT_ENV } });
+  execFileSync('git', ['init', '-q', work], { env: { ...process.env, ...GIT_ENV } });
+  git('symbolic-ref', 'HEAD', 'refs/heads/main');
+  git('commit', '-q', '--allow-empty', '-m', 'init');
+  git('remote', 'add', 'origin', bare);
+  git('push', '-q', 'origin', 'main');
+  git('fetch', '-q', 'origin');
+  return { dir: realpathSync(work), git };
+}
+const verdictOf = (r) => (r.stdout ? JSON.parse(r.stdout).hookSpecificOutput : null);
+
+test('spawn: bare git push follows @{push}: agent branch tracking origin/main with push.default=upstream is denied', () => {
+  const { dir, git } = makeClone('pd-upstream');
+  git('checkout', '-q', '--track', '-b', 'agent/x', 'origin/main');
+  git('config', 'push.default', 'upstream');
+  const r = hook(bashInput('git push', dir), { env: GIT_ENV });
+  assert.equal(r.status, 0);
+  assert.equal(verdictOf(r).permissionDecision, 'deny');
+  assert.match(verdictOf(r).permissionDecisionReason, /origin\/main/);
+  assert.equal(verdictOf(hook(bashInput('git push -u origin', dir), { env: GIT_ENV })).permissionDecision, 'deny');
+  assert.equal(verdictOf(hook(bashInput('git push --dry-run', dir), { env: GIT_ENV })).permissionDecision, 'deny');
+  // from another directory, -C and cd resolve the checkout the push really runs in
+  const elsewhere = makeClone('pd-elsewhere').dir;
+  assert.equal(verdictOf(hook(bashInput('git -C ' + dir + ' push', elsewhere), { env: GIT_ENV })).permissionDecision, 'deny');
+  assert.equal(verdictOf(hook(bashInput('cd ' + dir + ' && git push', elsewhere), { env: GIT_ENV })).permissionDecision, 'deny');
+  // an explicit destination is judged by itself, whatever @{push} says
+  assert.equal(hook(bashInput('git push origin agent/x', dir), { env: GIT_ENV }).stdout, '');
+});
+
+test('spawn: with push.default=simple (git default) a mismatched upstream is refused by git itself, so @{push} fails and the branch rule allows', () => {
+  const { dir, git } = makeClone('pd-simple');
+  git('checkout', '-q', '--track', '-b', 'agent/x', 'origin/main');
+  git('config', 'push.default', 'simple');
+  assert.throws(() => git('rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{push}')); // pins the git behaviour
+  const r = hook(bashInput('git push', dir), { env: GIT_ENV });
+  assert.equal(r.status, 0);
+  assert.equal(r.stdout, '');
+});
+
+test('spawn: push.default=current sends agent/x to origin/agent/x even though it tracks origin/main, so it is allowed', () => {
+  const { dir, git } = makeClone('pd-current');
+  git('checkout', '-q', '--track', '-b', 'agent/x', 'origin/main');
+  git('config', 'push.default', 'current');
+  assert.equal(hook(bashInput('git push', dir), { env: GIT_ENV }).stdout, '');
+});
+
+test('spawn: a branch whose upstream has the same name resolves to origin/<branch> and is allowed', () => {
+  const { dir, git } = makeClone('pd-same');
+  git('checkout', '-q', '--no-track', '-b', 'agent/y', 'main');
+  git('push', '-q', '-u', 'origin', 'agent/y');
+  assert.equal(git('rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{push}').toString().trim(), 'origin/agent/y');
+  assert.equal(hook(bashInput('git push', dir), { env: GIT_ENV }).stdout, '');
+});
+
+test('spawn: no upstream (or no @{push}) falls back to the current-branch rule', () => {
+  const { dir, git } = makeClone('pd-none');
+  git('checkout', '-q', '--no-track', '-b', 'agent/z', 'main');
+  assert.equal(hook(bashInput('git push', dir), { env: GIT_ENV }).stdout, '', 'agent branch without upstream is allowed');
+  git('checkout', '-q', 'main');
+  const onMain = hook(bashInput('git push', dir), { env: GIT_ENV });
+  assert.equal(verdictOf(onMain).permissionDecision, 'deny'); // upstream origin/main resolves under push.default=simple
+  git('checkout', '-q', '--detach');
+  const detached = hook(bashInput('git push', dir), { env: GIT_ENV });
+  assert.equal(verdictOf(detached).permissionDecision, 'deny');
+  assert.match(verdictOf(detached).permissionDecisionReason, /current branch/);
 });
 
 test('spawn: gh issue close looks labels up through PIPELINE_GH (fake gh)', () => {
