@@ -1,15 +1,45 @@
 // Every external process the pipeline starts goes through here, so Windows quirks live in one place:
 // npm/codex/vercel/npx are .cmd shims that spawn cannot run directly, and cmd.exe needs its own quoting.
 import { spawnSync } from 'node:child_process';
+import path from 'node:path';
 
 const MAX_BUFFER = 64 * 1024 * 1024;
 
-// Quote args for a cmd.exe command line. Inside double quotes only `"` (doubled) and the
-// expansion characters `%` and `!` (caret-escaped) need care.
+// cmd.exe quoting, ported from cross-spawn (MIT, Copyright (c) 2018 Made With MOXY Lda):
+// lib/util/escape.js (escapeCommand, escapeArgument) and lib/parse.js (the `cmd /d /s /c "..."`
+// command line). The backslash rules come from https://qntm.org/cmd.
+// One deliberate difference: cross-spawn 7.0.x does the backslash step with a lookahead regex that
+// only touches the LAST backslash of a run, so `a\\"b` and trailing `\\` come out under-escaped.
+// Here the same rules (n backslashes before " -> 2n+1; n trailing -> 2n) are applied run by run,
+// which is correct for any run length and linear time. Output is identical for runs of one.
+const META_CHARS = /([()\][%!^"`<>&|;, *?])/g;
+
+export function escapeCommand(cmd) {
+  return cmd.replace(META_CHARS, '^$1');
+}
+
+function escapeBackslashes(arg) {
+  let out = '';
+  let run = 0;
+  for (const ch of arg) {
+    if (ch === '\\') { run++; continue; }
+    out += '\\'.repeat(ch === '"' ? run * 2 + 1 : run) + ch;
+    run = 0;
+  }
+  return out + '\\'.repeat(run * 2); // trailing backslashes sit before the closing quote we add
+}
+
+// doubleEscapeMetaChars: batch files (.cmd/.bat) re-parse their arguments, so escape twice.
+export function escapeArgument(arg, doubleEscapeMetaChars = false) {
+  let out = `"${escapeBackslashes(String(arg))}"`;
+  out = out.replace(META_CHARS, '^$1');
+  if (doubleEscapeMetaChars) out = out.replace(META_CHARS, '^$1');
+  return out;
+}
+
+// Args as they appear on a cmd.exe line that launches a batch file.
 export function quoteForCmd(args) {
-  return args
-    .map((a) => `"${String(a).replace(/"/g, '""').replace(/[%!]/g, '^$&')}"`)
-    .join(' ');
+  return args.map((a) => escapeArgument(a, true)).join(' ');
 }
 
 const whereCache = new Map();
@@ -35,11 +65,8 @@ export function planSpawn(cmd, args, { platform = process.platform, resolve = re
   if (platform !== 'win32') return { file: cmd, args, windowsVerbatimArguments: false };
   const resolved = resolve(cmd) ?? cmd;
   if (/\.(cmd|bat)$/i.test(resolved)) {
-    return {
-      file: 'cmd.exe',
-      args: ['/d', '/s', '/c', `"${quoteForCmd([resolved, ...args])}"`],
-      windowsVerbatimArguments: true,
-    };
+    const line = [escapeCommand(path.win32.normalize(resolved)), ...args.map((a) => escapeArgument(a, true))].join(' ');
+    return { file: 'cmd.exe', args: ['/d', '/s', '/c', `"${line}"`], windowsVerbatimArguments: true };
   }
   return { file: resolved, args, windowsVerbatimArguments: false };
 }
