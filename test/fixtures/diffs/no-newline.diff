@@ -1,0 +1,16 @@
+diff --git a/src/nonl.txt b/src/nonl.txt
+index 54d55bf..c43d932 100644
+--- a/src/nonl.txt
++++ b/src/nonl.txt
+@@ -3 +3 @@ two
+-three
+\ No newline at end of file
++three changed
+\ No newline at end of file
+diff --git a/src/tail.txt b/src/tail.txt
+new file mode 100644
+index 0000000..587be6b
+--- /dev/null
++++ b/src/tail.txt
+@@ -0,0 +1 @@
++x

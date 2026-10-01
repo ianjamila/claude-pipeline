@@ -1,0 +1,4 @@
+diff --git a/lib/before.ts b/lib/after/after.ts
+similarity index 100%
+rename from lib/before.ts
+rename to lib/after/after.ts
