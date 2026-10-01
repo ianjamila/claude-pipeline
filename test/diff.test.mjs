@@ -194,3 +194,105 @@ test('diffStats totals files, added, removed and changedLines over a combined fi
   assert.deepEqual(diffStats(parseUnifiedDiff(combined)), { files: 10, added: 10, removed: 9, changedLines: 19 });
   assert.deepEqual(diffStats([]), { files: 0, added: 0, removed: 0, changedLines: 0 });
 });
+
+// ---- strictness and robustness (review follow-ups) ----
+
+const PREFIX_ERROR = 'unexpected diff path prefix — run git diff with --src-prefix=a/ --dst-prefix=b/';
+const HEAD = 'diff --git a/f b/f\n--- a/f\n+++ b/f\n';
+
+test('--no-prefix output throws instead of guessing (header-only, top-level b/ dir, quoted names)', () => {
+  // Real `git diff --no-prefix` output. The `b/top.ts` file is the dangerous one: its path starts with "b/", so a
+  // lenient parser would strip it and report `top.ts`.
+  for (const name of ['no-prefix-header-only', 'no-prefix-b-dir', 'no-prefix-quoted']) {
+    assert.throws(() => parseUnifiedDiff(fixture(name)), { message: PREFIX_ERROR }, name);
+  }
+});
+
+test('a wrong prefix on the header pair or on a ---/+++ path throws; /dev/null stays allowed', () => {
+  assert.throws(() => parseUnifiedDiff('diff --git c/f w/f\nold mode 100644\nnew mode 100755\n'), { message: PREFIX_ERROR });
+  assert.throws(() => parseUnifiedDiff('diff --git a/f a/f\nold mode 100644\nnew mode 100755\n'), { message: PREFIX_ERROR });
+  assert.throws(() => parseUnifiedDiff('diff --git "a/f" "w/f"\nold mode 100644\nnew mode 100755\n'), { message: PREFIX_ERROR });
+  assert.throws(() => parseUnifiedDiff('diff --git a/f b/f\n--- f\n+++ b/f\n@@ -1 +1 @@\n-x\n+y\n'), { message: PREFIX_ERROR });
+  assert.throws(() => parseUnifiedDiff('diff --git a/f b/f\n--- a/f\n+++ f\n@@ -1 +1 @@\n-x\n+y\n'), { message: PREFIX_ERROR });
+  assert.equal(parseUnifiedDiff(fixture('add'))[0].status, 'A');
+  assert.equal(parseUnifiedDiff(fixture('delete'))[0].status, 'D');
+});
+
+const ALL_FIXTURES = [
+  'add', 'delete', 'modify-two-hunks', 'rename-edit', 'rename-pure', 'binary', 'spaces', 'quoted', 'plusplus',
+  'no-newline', 'mode-only', 'rename-ambiguous-header', 'quoted-header-only',
+];
+
+test('CRLF-converted fixtures (git autocrlf checkouts) parse the same; only content lines keep their \\r', () => {
+  const withCr = (l) => ({ ...l, text: `${l.text}\r` });
+  for (const name of ALL_FIXTURES) {
+    const lf = parseUnifiedDiff(fixture(name));
+    const crlf = parseUnifiedDiff(fixture(name).replace(/\n/g, '\r\n'));
+    const expected = lf.map((f) => ({ ...f, added: f.added.map(withCr), removed: f.removed.map(withCr) }));
+    assert.deepEqual(crlf, expected, name);
+  }
+});
+
+test('CRLF header lines: trailing \\r is stripped from rename, similarity, binary and ---/+++ tab-suffixed paths', () => {
+  const text = 'diff --git a/p b/q.txt b/r.txt\r\nsimilarity index 75%\r\nrename from p b/q.txt\r\nrename to r.txt\r\n'
+    + 'index 1..2 100644\r\n--- a/p b/q.txt\t\r\n+++ b/r.txt\r\n@@ -1 +1 @@\r\n-a\r\n+b\r\n'
+    + 'diff --git a/i.bin b/i.bin\r\nindex 1..2 100644\r\nBinary files a/i.bin and b/i.bin differ\r\n';
+  assert.deepEqual(parseUnifiedDiff(text), [
+    entry({
+      oldPath: 'p b/q.txt', newPath: 'r.txt', path: 'r.txt', status: 'R', similarity: 75,
+      removed: [ln(1, 'a\r')], added: [ln(1, 'b\r')],
+    }),
+    entry({ oldPath: 'i.bin', newPath: 'i.bin', path: 'i.bin', status: 'M', binary: true }),
+  ]);
+});
+
+test('hunk count overflow throws: lines beyond the declared counts are never silently dropped', () => {
+  assert.throws(() => parseUnifiedDiff(`${HEAD}@@ -1 +1 @@\n-a\n+b\n+c\n`), /overflow/); // extra line after the hunk is full
+  assert.throws(() => parseUnifiedDiff(`${HEAD}@@ -1 +1 @@\n-a\n-b\n+c\n`), /overflow/); // second removal exceeds old count
+  assert.throws(() => parseUnifiedDiff(`${HEAD}@@ -1 +1 @@\n-a\n+b\n+++ b/g\n`), /overflow/); // header lookalike after a full hunk
+  assert.throws(() => parseUnifiedDiff(`${HEAD}@@ -1 +1 @@\n-a\n+b\n--- y\n`), /overflow/);
+  // At exactly the declared counts, and with a following hunk, it still parses.
+  const [f] = parseUnifiedDiff(`${HEAD}@@ -1 +1 @@\n-a\n+b\n@@ -3,0 +3 @@\n+c\n`);
+  assert.deepEqual(f.removed, [ln(1, 'a')]);
+  assert.deepEqual(f.added, [ln(1, 'b'), ln(3, 'c')]);
+});
+
+test('hunk count underflow throws: a hunk cut short by the next header is malformed', () => {
+  assert.throws(() => parseUnifiedDiff(`${HEAD}@@ -1,2 +1 @@\n-a\ndiff --git a/g b/g\n`), /ended early/);
+  assert.throws(() => parseUnifiedDiff(`${HEAD}@@ -1,2 +1 @@\n-a\n@@ -9 +9 @@\n-z\n`), /ended early/);
+});
+
+test('a blank line inside a hunk is a context line, but only while both sides have lines left', () => {
+  const [f] = parseUnifiedDiff(`${HEAD}@@ -1,3 +1,3 @@\n a\n\n-x\n+y\n`);
+  assert.deepEqual(f.removed, [ln(3, 'x')]);
+  assert.deepEqual(f.added, [ln(3, 'y')]);
+  assert.throws(() => parseUnifiedDiff(`${HEAD}@@ -1,2 +1,0 @@\n-a\n\n`), /overflow/);
+  // CRLF-converted: the blank context line arrives as a bare \r.
+  const [g] = parseUnifiedDiff(`${HEAD}@@ -1,3 +1,3 @@\n a\n\n-x\n+y\n`.replace(/\n/g, '\r\n'));
+  assert.deepEqual(g.removed, [ln(3, 'x\r')]);
+  assert.deepEqual(g.added, [ln(3, 'y\r')]);
+});
+
+test('rename from/to override a wrong guess from the `diff --git` line', () => {
+  // `diff --git a/p b/q.txt b/r.txt` cannot be split reliably: the first " b/" lands inside the old name.
+  assert.deepEqual(parseUnifiedDiff(fixture('rename-ambiguous-header')), [
+    entry({ oldPath: 'p b/q.txt', newPath: 'r.txt', path: 'r.txt', status: 'R', similarity: 100 }),
+  ]);
+});
+
+test('quoted-header-only.diff: header-only entries on quoted non-ASCII names (empty add, binary add/del/mod, mode-only)', () => {
+  assert.deepEqual(parseUnifiedDiff(fixture('quoted-header-only')), [
+    entry({ oldPath: null, newPath: 'naïve/empty é.txt', path: 'naïve/empty é.txt', status: 'A' }),
+    entry({ oldPath: 'naïve/gone ✓.bin', newPath: null, path: 'naïve/gone ✓.bin', status: 'D', binary: true }),
+    entry({ oldPath: null, newPath: 'naïve/new ✓.bin', path: 'naïve/new ✓.bin', status: 'A', binary: true }),
+    entry({ oldPath: 'naïve/ß.bin', newPath: 'naïve/ß.bin', path: 'naïve/ß.bin', status: 'M', binary: true }),
+    entry({ oldPath: 'naïve/é ü.sh', newPath: 'naïve/é ü.sh', path: 'naïve/é ü.sh', status: 'M' }),
+  ]);
+});
+
+test('unquoteCPath rejects trailing text and input that is not a quoted token', () => {
+  assert.throws(() => unquoteCPath('"a" b'), /trailing/);
+  assert.throws(() => unquoteCPath('"a"x'), /trailing/);
+  assert.throws(() => unquoteCPath('abc"'), /not a quoted/);
+  assert.throws(() => unquoteCPath(''), /not a quoted/);
+});

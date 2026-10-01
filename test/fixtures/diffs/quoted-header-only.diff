@@ -1,0 +1,17 @@
+diff --git "a/na\303\257ve/empty \303\251.txt" "b/na\303\257ve/empty \303\251.txt"
+new file mode 100644
+index 0000000..e69de29
+diff --git "a/na\303\257ve/gone \342\234\223.bin" "b/na\303\257ve/gone \342\234\223.bin"
+deleted file mode 100644
+index 5b27ff3..0000000
+Binary files "a/na\303\257ve/gone \342\234\223.bin" and /dev/null differ
+diff --git "a/na\303\257ve/new \342\234\223.bin" "b/na\303\257ve/new \342\234\223.bin"
+new file mode 100644
+index 0000000..4667e1e
+Binary files /dev/null and "b/na\303\257ve/new \342\234\223.bin" differ
+diff --git "a/na\303\257ve/\303\237.bin" "b/na\303\257ve/\303\237.bin"
+index a1d6348..520bb6b 100644
+Binary files "a/na\303\257ve/\303\237.bin" and "b/na\303\257ve/\303\237.bin" differ
+diff --git "a/na\303\257ve/\303\251 \303\274.sh" "b/na\303\257ve/\303\251 \303\274.sh"
+old mode 100644
+new mode 100755

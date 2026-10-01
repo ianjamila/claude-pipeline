@@ -1,0 +1,7 @@
+diff --git b/top.ts b/top.ts
+index 814f4a4..879de50 100644
+--- b/top.ts
++++ b/top.ts
+@@ -2 +2 @@ one
+-two
++TWO

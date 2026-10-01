@@ -3,11 +3,13 @@
 // added `.skip`, edited assertions), and a regex over raw diff text misreads `+++ x` content lines as file headers.
 // So the parser counts hunk lines from each `@@` header and only reads headers while outside a hunk.
 // Added lines carry NEW-file numbers, removed lines OLD-file numbers. Line text is kept exactly (a CRLF stays in `text`).
-// Malformed or truncated hunks throw: guessing would let a deleted test slip through unnoticed.
+// Anything unexpected throws rather than guessing (truncated or overflowing hunks, non-a/ b/ prefixes): a guess
+// could let a deleted test slip through unnoticed. Trailing \r is stripped from header lines only, never from content.
 
 const HUNK_HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
 const SIMPLE_ESCAPES = { a: 7, b: 8, f: 12, n: 10, r: 13, t: 9, v: 11, '"': 34, '\\': 92 };
 const isOctal = (ch) => ch >= '0' && ch <= '7';
+const PREFIX_ERROR = 'unexpected diff path prefix — run git diff with --src-prefix=a/ --dst-prefix=b/';
 
 // "@@ -a,b +c,d @@": a missing count means 1, a count of 0 means no lines on that side.
 export function parseHunkHeader(line) {
@@ -48,6 +50,7 @@ function readQuoted(s, start) {
 }
 
 export function unquoteCPath(s) {
+  if (s[0] !== '"') throw new Error(`not a quoted path: ${s}`);
   const { value, end } = readQuoted(s, 0);
   if (end !== s.length) throw new Error(`trailing text after quoted path: ${s}`);
   return value;
@@ -59,7 +62,12 @@ function readPath(s) {
   return s.startsWith('"') ? readQuoted(s, 0).value : s.replace(/\t$/, '');
 }
 
-const stripPrefix = (p, prefix) => (p.startsWith(prefix) ? p.slice(prefix.length) : p);
+// Paths are only trustworthy with git's default a/ b/ prefixes; with --no-prefix a top-level `b/` directory
+// would be silently mangled, so any other prefix is an error.
+function stripPrefix(p, prefix) {
+  if (!p.startsWith(prefix)) throw new Error(PREFIX_ERROR);
+  return p.slice(prefix.length);
+}
 
 // Splits the `a/<old> b/<new>` tail of a `diff --git` line. Plain spaces are NOT quoted by git, so when both
 // sides are raw: a non-rename diff has identical sides (cut in the middle); a rename is also described by its
@@ -97,7 +105,7 @@ function beginFile(headerLine) {
   const { oldPath, newPath } = splitGitHeader(headerLine.slice('diff --git '.length));
   return {
     headerOld: oldPath, headerNew: newPath, minusPath: null, plusPath: null, renameFrom: null, renameTo: null,
-    minusDevNull: false, plusDevNull: false, isNew: false, isDeleted: false, similarity: null, binary: false,
+    minusDevNull: false, plusDevNull: false, hasHunks: false, isNew: false, isDeleted: false, similarity: null, binary: false,
     added: [], removed: [],
   };
 }
@@ -132,27 +140,31 @@ export function parseUnifiedDiff(text) {
   let hunk = null; // { oldLine, newLine, oldLeft, newLeft }
 
   for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
+    const raw = lines[i];
 
     if (hunk) {
       // Inside a hunk every +/-/space line is content, whatever it looks like; counts say when the hunk ends.
-      const c = line[0];
+      const c = raw[0];
       if (c === '\\') continue; // "\ No newline at end of file" belongs to no side
       if (c === '+' && hunk.newLeft > 0) {
-        cur.added.push({ line: hunk.newLine++, text: line.slice(1) });
+        cur.added.push({ line: hunk.newLine++, text: raw.slice(1) });
         hunk.newLeft--;
       } else if (c === '-' && hunk.oldLeft > 0) {
-        cur.removed.push({ line: hunk.oldLine++, text: line.slice(1) });
+        cur.removed.push({ line: hunk.oldLine++, text: raw.slice(1) });
         hunk.oldLeft--;
-      } else if ((c === ' ' || line === '') && hunk.oldLeft > 0 && hunk.newLeft > 0) {
+      } else if ((c === ' ' || raw === '' || raw === '\r') && hunk.oldLeft > 0 && hunk.newLeft > 0) {
+        // A blank line is a context line whose single space was stripped (with CRLF it arrives as a bare \r).
         hunk.oldLine++; hunk.newLine++; hunk.oldLeft--; hunk.newLeft--;
+      } else if (c === '+' || c === '-' || c === ' ' || raw === '' || raw === '\r') {
+        throw new Error(`malformed diff: hunk line count overflow at line ${i + 1}: ${raw}`);
       } else {
-        throw new Error(`malformed diff: hunk ended early at line ${i + 1}: ${line}`);
+        throw new Error(`malformed diff: hunk ended early at line ${i + 1}: ${raw}`);
       }
       if (hunk.oldLeft === 0 && hunk.newLeft === 0) hunk = null;
       continue;
     }
 
+    const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw; // header lines may arrive CRLF-converted
     if (line.startsWith('diff --git ')) {
       if (cur) done.push(finishFile(cur));
       cur = beginFile(line);
@@ -160,9 +172,13 @@ export function parseUnifiedDiff(text) {
       const h = parseHunkHeader(line);
       if (!cur) throw new Error(`malformed diff: hunk header before any file header at line ${i + 1}`);
       if (!h) throw new Error(`malformed diff: bad hunk header at line ${i + 1}: ${line}`);
+      cur.hasHunks = true;
       if (h.oldCount + h.newCount > 0) hunk = { oldLine: h.oldStart, newLine: h.newStart, oldLeft: h.oldCount, newLeft: h.newCount };
     } else if (!cur) {
       continue; // preamble (e.g. `git show` commit header) before the first file
+    } else if (cur.hasHunks && (line[0] === '+' || line[0] === '-' || line[0] === ' ')) {
+      // Headers precede hunks, so a +/-/space line after the last hunk filled its counts is surplus content.
+      throw new Error(`malformed diff: hunk line count overflow at line ${i + 1}: ${line}`);
     } else if (line.startsWith('new file mode')) {
       cur.isNew = true;
     } else if (line.startsWith('deleted file mode')) {
