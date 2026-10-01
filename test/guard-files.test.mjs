@@ -49,13 +49,13 @@ const FILE_DENY = [
   ['NotebookEdit under pipeline', 'NotebookEdit', { notebook_path: '/home/u/.claude/pipeline/x.ipynb', new_source: 'x' }],
   ['Write repo settings.local.json with disableAllHooks', 'Write', { file_path: '/repo/.claude/settings.local.json', content: '{"disableAllHooks": true}' }],
   ['Edit repo settings.json adding disableAllHooks', 'Edit', { file_path: '/repo/.claude/settings.json', old_string: '{', new_string: '{"disableAllHooks":true,' }],
-  ['Write a script mentioning PIPELINE_ADMIN', 'Write', { file_path: '/tmp/x.sh', content: 'export PIPELINE_ADMIN=1\nclaude' }],
+  ['Write a script exporting PIPELINE_ADMIN', 'Write', { file_path: '/tmp/x.sh', content: 'export PIPELINE_ADMIN=1\nclaude' }],
   ['Edit through a .. segment', 'Edit', { file_path: '/home/u/.claude/skills/ship/../ship/SKILL.md', old_string: 'a', new_string: 'b' }],
   ['Write pipeline-setup skill', 'Write', { file_path: '/home/u/.claude/skills/pipeline-setup/SKILL.md', content: 'x' }],
   ['Write the ship skill directory itself', 'Write', { file_path: '/home/u/.claude/skills/ship', content: 'x' }],
   ['relative path resolved against cwd', 'Edit', { file_path: '../home/u/.claude/pipeline/x', old_string: 'a', new_string: 'b' }, '/repo'],
-  ['MultiEdit with PIPELINE_ADMIN in the second edit', 'MultiEdit', { file_path: '/repo/run.sh', edits: [{ old_string: 'a', new_string: 'b' }, { old_string: 'c', new_string: 'PIPELINE_ADMIN=1' }] }],
-  ['NotebookEdit new_source with PIPELINE_ADMIN', 'NotebookEdit', { notebook_path: '/repo/n.ipynb', new_source: 'os.environ["PIPELINE_ADMIN"]="1"' }],
+  ['MultiEdit assigning PIPELINE_ADMIN in the second edit', 'MultiEdit', { file_path: '/repo/run.sh', edits: [{ old_string: 'a', new_string: 'b' }, { old_string: 'c', new_string: 'PIPELINE_ADMIN=1' }] }],
+  ['NotebookEdit new_source setting PIPELINE_ADMIN', 'NotebookEdit', { notebook_path: '/repo/n.ipynb', new_source: 'os.environ["PIPELINE_ADMIN"]="1"' }],
   ['unicode-escaped disableAllHooks in settings', 'Write', { file_path: '/repo/.claude/settings.json', content: '{"disable\\u0041llHooks": true}' }],
 ];
 
@@ -445,6 +445,221 @@ test('file tool: a dangling symlink pointing into a protected root is denied', (
   assert.equal(r.decision, 'deny');
 });
 
+// ---- MCP file tools ---------------------------------------------------------------------------
+
+const mcp = (tool_name, tool_input, opts = {}, cwd = '/repo') => evaluateFileTool({ tool_name, tool_input, cwd }, { ...LINUX, ...opts }).decision;
+
+const MCP_DENY = [
+  ['filesystem write_file to settings via ~', 'mcp__filesystem__write_file', { path: '~/.claude/settings.json', content: '{}' }],
+  ['filesystem edit_file on the ship skill', 'mcp__filesystem__edit_file', { path: '/home/u/.claude/skills/ship/SKILL.md', edits: [{ oldText: 'a', newText: 'b' }], dryRun: false }],
+  ['filesystem move_file onto an agent', 'mcp__filesystem__move_file', { source: '/tmp/x', destination: '/home/u/.claude/agents/judge.md' }],
+  ['filesystem move_file away from a protected dir', 'mcp__filesystem__move_file', { source: '/home/u/.claude/skills/verify', destination: '/tmp/v' }],
+  ['filesystem create_directory under a skill', 'mcp__filesystem__create_directory', { path: '/home/u/.claude/skills/ship/new' }],
+  ['other server put_object into the pipeline dir', 'mcp__other__put_object', { path: '/home/u/.claude/pipeline/x' }],
+  ['filePath key', 'mcp__editor__write_file', { filePath: '~/.claude/pipeline/hooks/guard-git.mjs', content: 'x' }],
+  ['file_path key', 'mcp__editor__apply_patch', { file_path: '/home/u/.claude/agents/arbiter.md', patch: '...' }],
+  ['from key only', 'mcp__files__move_path', { from: '/home/u/.claude/pipeline/hooks/guard-git.mjs', to: '/tmp/x' }],
+  ['dest key', 'mcp__files__copy_file', { from: '/tmp/a', dest: '/home/u/.claude/agents/verifier.md' }],
+  ['to key', 'mcp__files__rename_path', { from: '/tmp/a', to: '/home/u/.claude/skills/pipeline-setup/SKILL.md' }],
+  ['paths array', 'mcp__files__delete_files', { paths: ['/repo/a.ts', '/home/u/.claude/agents/implementer.md'] }],
+  ['nested path inside edits[]', 'mcp__files__update_files', { edits: [{ path: '/home/u/.claude/settings.json', newText: '{}' }] }],
+  ['directory key', 'mcp__files__remove_directory', { directory: '~/.claude/pipeline' }],
+  ['.. segment', 'mcp__filesystem__write_file', { path: '/home/u/.claude/skills/ship/../ship/SKILL.md', content: 'x' }],
+  ['relative path resolved against cwd', 'mcp__filesystem__write_file', { path: '../home/u/.claude/pipeline/x', content: 'x' }],
+  ['write_file of a script that sets PIPELINE_ADMIN', 'mcp__filesystem__write_file', { path: '/tmp/x.sh', content: 'export PIPELINE_ADMIN=1' }],
+  ['edit_file newText that sets PIPELINE_ADMIN', 'mcp__filesystem__edit_file', { path: '/repo/run.sh', edits: [{ oldText: 'a', newText: 'PIPELINE_ADMIN=1 claude' }] }],
+  ['write_file disableAllHooks into repo settings', 'mcp__filesystem__write_file', { path: '/repo/.claude/settings.json', content: '{"disableAllHooks": true}' }],
+  ['edit_file newText adds disableAllHooks', 'mcp__filesystem__edit_file', { path: '/repo/.claude/settings.local.json', edits: [{ oldText: '{', newText: '{"disableAllHooks":true,' }] }],
+  ['body key', 'mcp__files__put_file', { path: '/repo/.claude/settings.json', body: '{"disableAllHooks":true}' }],
+  ['chmod verb in an unusual tool name', 'mcp__plugin_x_files__chmod', { path: '/home/u/.claude/pipeline/bin/pipeline.mjs', mode: '000' }],
+  ['save_file', 'mcp__files__save_file', { path: '~/.claude/settings.json', text: '{}' }],
+  ['replace_in_file', 'mcp__files__replace_in_file', { path: '~/.claude/pipeline/hooks/guard-git.mjs', search: 'a', replace: 'b' }],
+  ['rm verb on its own word', 'mcp__files__rm', { path: '/home/u/.claude/agents/judge.md' }],
+];
+
+for (const [name, tool, input] of MCP_DENY) {
+  test(`mcp tool DENY: ${name}`, () => {
+    const r = evaluateFileTool({ tool_name: tool, tool_input: input, cwd: '/repo' }, LINUX);
+    assert.equal(r.decision, 'deny', JSON.stringify(input));
+    assert.ok(r.reason.length > 0);
+  });
+}
+
+const MCP_ALLOW = [
+  ['filesystem read_text_file of settings', 'mcp__filesystem__read_text_file', { path: '~/.claude/settings.json' }],
+  ['filesystem read_file', 'mcp__filesystem__read_file', { path: '/home/u/.claude/skills/ship/SKILL.md' }],
+  ['filesystem read_multiple_files', 'mcp__filesystem__read_multiple_files', { paths: ['/home/u/.claude/agents/judge.md', '/home/u/.claude/pipeline/VERSION'] }],
+  ['filesystem list_directory', 'mcp__filesystem__list_directory', { path: '~/.claude/pipeline' }],
+  ['filesystem directory_tree', 'mcp__filesystem__directory_tree', { path: '/home/u/.claude' }],
+  ['filesystem search_files', 'mcp__filesystem__search_files', { path: '~/.claude/pipeline', pattern: 'disableAllHooks' }],
+  ['filesystem get_file_info', 'mcp__filesystem__get_file_info', { path: '~/.claude/settings.json' }],
+  ['read tool with a disableAllHooks query and a settings path', 'mcp__files__search_text', { path: '/repo/.claude/settings.json', text: 'disableAllHooks' }],
+  ['filesystem write_file to a repo file', 'mcp__filesystem__write_file', { path: '/repo/a.ts', content: 'x' }],
+  ['filesystem write_file to a lookalike skill', 'mcp__filesystem__write_file', { path: '/home/u/.claude/skills/shipping/SKILL.md', content: 'x' }],
+  ['filesystem write_file to CLAUDE.md', 'mcp__filesystem__write_file', { path: '/home/u/.claude/CLAUDE.md', content: 'x' }],
+  ['filesystem move_file between unprotected paths', 'mcp__filesystem__move_file', { source: '/tmp/a', destination: '/repo/b' }],
+  ['write_file of a repo settings file without disableAllHooks', 'mcp__filesystem__write_file', { path: '/repo/.claude/settings.json', content: '{"permissions":{}}' }],
+  ['write_file mentioning disableAllHooks outside a settings file', 'mcp__filesystem__write_file', { path: '/repo/docs/n.md', content: 'about disableAllHooks' }],
+  ['write_file documenting the guard without assigning PIPELINE_ADMIN', 'mcp__filesystem__write_file', { path: '/repo/docs/n.md', content: 'the PIPELINE_ADMIN guard' }],
+  ['write tool with no path keys', 'mcp__notes__create_note', { title: 't', text: 'launch with PIPELINE_ADMIN=1 claude' }],
+  ['database tool', 'mcp__plugin_supabase_supabase__apply_migration', { name: 'x', query: 'select 1' }],
+  ['issue update with no path keys', 'mcp__sentry__update_issue', { issueId: 'A-1', status: 'resolved' }],
+  ['write verb but only an unrelated string key', 'mcp__files__write_file', { name: '/home/u/.claude/settings.json', content: 'x' }],
+  ['no tool_input', 'mcp__filesystem__write_file', undefined],
+  ['non-string path values', 'mcp__filesystem__write_file', { path: 7, paths: [null, {}], content: 'x' }],
+];
+
+for (const [name, tool, input] of MCP_ALLOW) {
+  test(`mcp tool ALLOW: ${name}`, () => {
+    assert.equal(mcp(tool, input), 'allow', JSON.stringify(input));
+  });
+}
+
+test('mcp tool: PIPELINE_ADMIN=1 in the process env allows everything', () => {
+  const env = { PIPELINE_ADMIN: '1' };
+  assert.equal(mcp('mcp__filesystem__write_file', { path: '~/.claude/settings.json', content: '{}' }, { env }), 'allow');
+  assert.equal(mcp('mcp__filesystem__move_file', { source: '/tmp/x', destination: '/home/u/.claude/agents/judge.md' }, { env }), 'allow');
+});
+
+test('mcp tool: a target that resolves into a protected root through a symlink is denied', () => {
+  const realpath = (p) => (p.startsWith('/tmp/link') ? p.replace('/tmp/link', '/home/u/.claude/skills/ship') : p);
+  const existsSync = (p) => p === '/tmp/link';
+  assert.equal(mcp('mcp__filesystem__write_file', { path: '/tmp/link/SKILL.md', content: 'x' }, { realpath, existsSync }), 'deny');
+});
+
+test('mcp tool: case-insensitive on darwin and Windows paths on win32', () => {
+  assert.equal(mcp('mcp__filesystem__write_file', { path: '/HOME/U/.Claude/Settings.json', content: 'x' }, MAC), 'deny');
+  assert.equal(mcp('mcp__filesystem__write_file', { path: '/HOME/U/.Claude/Settings.json', content: 'x' }, LINUX), 'allow');
+  assert.equal(mcp('mcp__filesystem__write_file', { path: 'C:\\Users\\u\\.claude\\skills\\ship\\SKILL.md', content: 'x' }, WIN, 'C:\\repo'), 'deny');
+});
+
+test('mcp tool: deeply nested or huge inputs do not throw', () => {
+  let deep = { path: '/repo/a' };
+  for (let i = 0; i < 500; i++) deep = { wrap: deep };
+  assert.doesNotThrow(() => mcp('mcp__x__write_file', deep));
+  assert.doesNotThrow(() => mcp('mcp__x__write_file', { paths: Array.from({ length: 5000 }, (_, i) => `/repo/f${i}`), content: 'x' }));
+});
+
+// ---- PIPELINE_ADMIN: naming it is fine, setting it is not -----------------------------------------
+
+const ADMIN_BASH_DENY = [
+  ['export', 'export PIPELINE_ADMIN=1'],
+  ['export without a value', 'export PIPELINE_ADMIN'],
+  ['command prefix', 'PIPELINE_ADMIN=1 node install.mjs'],
+  ['env prefix', 'env PIPELINE_ADMIN=1 claude'],
+  ['env with flags', 'env -i -u X PIPELINE_ADMIN=1 claude'],
+  ['declare -x', 'declare -x PIPELINE_ADMIN=1'],
+  ['JSON key in an echo redirect', `echo '{"env":{"PIPELINE_ADMIN":"1"}}' > x.json`],
+  ['env["..."] lookup', `node -e "process.env['PIPELINE_ADMIN']='1'"`],
+  ['putenv with a comma', `python3 -c "import os; os.putenv('PIPELINE_ADMIN', '1')"`],
+  ['PowerShell $env:', '$env:PIPELINE_ADMIN = "1"'],
+  ['PowerShell $env: with a different case', '$ENV:pipeline_admin="1"'],
+  ['cmd set', 'set PIPELINE_ADMIN=1'],
+  ['setx', 'setx PIPELINE_ADMIN 1'],
+  ['csh setenv', 'setenv PIPELINE_ADMIN 1'],
+  ['spaces around =', 'PIPELINE_ADMIN = 1'],
+  ['quote-split name', "export PIPELINE_'ADMIN'=1"],
+  ['backslash-split name', 'export PIPELINE_AD\\MIN=1'],
+  ['ANSI-C split name', "env $'PIPELINE_\\x41DMIN=1' claude"],
+  ['inside bash -c', 'bash -c "export PIPELINE_ADMIN=1; claude"'],
+  ['inside a job', 'node ~/.claude/pipeline/bin/pipeline.mjs job start x -- env PIPELINE_ADMIN=1 claude'],
+  ['octal ANSI-C name (only the parsed words reveal it)', "env $'\\120IPELINE_ADMIN=1' claude"],
+  ['js-escaped name inside a one-liner', `node -e "process.env['PIPELINE_\\x41DMIN']='1'"`],
+  ['quote-split name after a command line too deep to parse', `echo ${'$('.repeat(250)}x${')'.repeat(250)}; export PIPELINE_"ADMIN"=1`],
+  ['prefix on a bash that reads a heredoc', 'PIPELINE_ADMIN=1 bash <<EOF\nclaude\nEOF'],
+];
+
+for (const [name, cmd] of ADMIN_BASH_DENY) {
+  test(`PIPELINE_ADMIN set in bash DENY: ${name}`, () => {
+    assert.equal(bash(cmd), 'deny', cmd);
+  });
+}
+
+const ADMIN_BASH_ALLOW = [
+  ['grep for the name', 'grep -r PIPELINE_ADMIN docs/'],
+  ['grep with quotes', 'grep -rn "PIPELINE_ADMIN" docs/ src/'],
+  ['grep in a pipe', 'cat docs/admin.md | grep -n PIPELINE_ADMIN'],
+  ['echo of prose', 'echo "the PIPELINE_ADMIN guard"'],
+  ['commit message prose', 'git commit -m "docs: explain the PIPELINE_ADMIN switch"'],
+  ['rg count', 'rg -c PIPELINE_ADMIN'],
+  ['lookalike variable prefix', 'FOO_PIPELINE_ADMIN=1 node x.js'],
+  ['lookalike longer name', 'echo PIPELINE_ADMINISTRATOR'],
+  ['lowercase name on POSIX is a different variable', 'pipeline_admin=1 node x.js'],
+];
+
+for (const [name, cmd] of ADMIN_BASH_ALLOW) {
+  test(`PIPELINE_ADMIN named in bash ALLOW: ${name}`, () => {
+    assert.equal(bash(cmd), 'allow', cmd);
+  });
+}
+
+test('PIPELINE_ADMIN on win32: variable names are case-insensitive', () => {
+  const w = (cmd) => evaluateBashForFiles(cmd, { ...WIN, cwd: 'C:\\repo' }).decision;
+  assert.equal(w('pipeline_admin=1 node x.js'), 'deny');
+  assert.equal(w('set pipeline_admin=1'), 'deny');
+  assert.equal(w('$env:pipeline_admin = "1"'), 'deny');
+  assert.equal(w('grep -r PIPELINE_ADMIN docs/'), 'allow');
+});
+
+const ADMIN_FILE_DENY = [
+  ['README telling people how to launch', 'Launch with `PIPELINE_ADMIN=1 claude`'],
+  ['export line', 'export PIPELINE_ADMIN=1\nclaude'],
+  ['JSON object key', '{"env": {"PIPELINE_ADMIN": "1"}}'],
+  ['env lookup', 'env["PIPELINE_ADMIN"] = "1"'],
+  ['process.env assignment', "process.env.PIPELINE_ADMIN = '1'"],
+  ['PowerShell', '$env:PIPELINE_ADMIN = "1"'],
+  ['setx', 'setx PIPELINE_ADMIN 1'],
+  ['YAML env block', 'env:\n  PIPELINE_ADMIN: 1\n'],
+  ['unicode-escaped name', 'PIPELINE_\\u0041DMIN=1 claude'],
+];
+
+for (const [name, content] of ADMIN_FILE_DENY) {
+  test(`PIPELINE_ADMIN set in file content DENY: ${name}`, () => {
+    assert.equal(file('Write', { file_path: '/repo/README.md', content }), 'deny', content);
+    assert.equal(file('Edit', { file_path: '/repo/README.md', old_string: 'x', new_string: content }), 'deny', content);
+  });
+}
+
+const ADMIN_FILE_ALLOW = [
+  ['prose naming the guard', 'the PIPELINE_ADMIN guard'],
+  ['prose about the switch', 'Only the owner can turn on PIPELINE_ADMIN when launching Claude Code.'],
+  ['a doc path', 'See docs/PIPELINE_ADMIN.md'],
+  ['YAML key documented with a description', 'PIPELINE_ADMIN: owner switch, never set by agents'],
+  ['lookalike name', 'FOO_PIPELINE_ADMIN=1'],
+  ['JS comparison', "if (process.env.PIPELINE_ADMIN === '1') return;"],
+  ['JS inequality', "if (env.PIPELINE_ADMIN !== '1') deny();"],
+  ['bash test', 'if [[ $PIPELINE_ADMIN == 1 ]]; then echo admin; fi'],
+  ['bash regex test', 'if [[ $PIPELINE_ADMIN =~ ^1$ ]]; then echo admin; fi'],
+];
+
+for (const [name, content] of ADMIN_FILE_ALLOW) {
+  test(`PIPELINE_ADMIN named in file content ALLOW: ${name}`, () => {
+    assert.equal(file('Write', { file_path: '/repo/README.md', content }), 'allow', content);
+    assert.equal(file('MultiEdit', { file_path: '/repo/README.md', edits: [{ old_string: 'x', new_string: content }] }), 'allow', content);
+    assert.equal(file('NotebookEdit', { notebook_path: '/repo/n.ipynb', new_source: content }), 'allow', content);
+  });
+}
+
+test('the default env is the real process env (spec: env = process.env)', () => {
+  const had = Object.hasOwn(process.env, 'PIPELINE_ADMIN');
+  const prev = process.env.PIPELINE_ADMIN;
+  const noEnv = { home: '/home/u', platform: 'linux', realpath: (p) => p, existsSync: () => false };
+  try {
+    process.env.PIPELINE_ADMIN = '1';
+    assert.equal(evaluateFileTool({ tool_name: 'Write', tool_input: { file_path: '/home/u/.claude/settings.json', content: '{}' }, cwd: '/repo' }, noEnv).decision, 'allow');
+    assert.equal(evaluateBashForFiles('rm -rf ~/.claude/pipeline', { ...noEnv, cwd: '/repo' }).decision, 'allow');
+    delete process.env.PIPELINE_ADMIN;
+    assert.equal(evaluateFileTool({ tool_name: 'Write', tool_input: { file_path: '/home/u/.claude/settings.json', content: '{}' }, cwd: '/repo' }, noEnv).decision, 'deny');
+    assert.equal(evaluateBashForFiles('rm -rf ~/.claude/pipeline', { ...noEnv, cwd: '/repo' }).decision, 'deny');
+  } finally {
+    if (had) process.env.PIPELINE_ADMIN = prev; else delete process.env.PIPELINE_ADMIN;
+  }
+});
+
+test('PIPELINE_ADMIN removed by an edit is fine: only the new text is judged', () => {
+  assert.equal(file('Edit', { file_path: '/repo/run.sh', old_string: 'PIPELINE_ADMIN=1 claude', new_string: 'claude' }), 'allow');
+});
+
 // ---- the hook script itself -----------------------------------------------------------------
 
 function runHook(input, { env = {}, home, hook = HOOK } = {}) {
@@ -499,6 +714,20 @@ test('hook: denies a Bash write to a protected path and allows a read', (t) => {
   const ok = runHook({ tool_name: 'Bash', tool_input: { command: 'cat ~/.claude/skills/ship/SKILL.md' }, cwd: home }, { home });
   assert.equal(ok.status, 0);
   assert.equal(ok.stdout, '');
+});
+
+test('hook: denies an MCP filesystem write to a protected path and allows a read', (t) => {
+  const home = tmpHome(t);
+  const deny = runHook({ tool_name: 'mcp__filesystem__write_file', tool_input: { path: path.join(home, '.claude', 'settings.json'), content: '{}' }, cwd: home }, { home });
+  assert.equal(deny.status, 0);
+  assert.equal(JSON.parse(deny.stdout).hookSpecificOutput.permissionDecision, 'deny');
+  const move = runHook({ tool_name: 'mcp__filesystem__move_file', tool_input: { source: '/tmp/x', destination: '~/.claude/agents/judge.md' }, cwd: home }, { home });
+  assert.equal(JSON.parse(move.stdout).hookSpecificOutput.permissionDecision, 'deny');
+  const read = runHook({ tool_name: 'mcp__filesystem__read_text_file', tool_input: { path: path.join(home, '.claude', 'settings.json') }, cwd: home }, { home });
+  assert.equal(read.status, 0);
+  assert.equal(read.stdout, '');
+  const other = runHook({ tool_name: 'mcp__sentry__update_issue', tool_input: { issueId: 'A-1' }, cwd: home }, { home });
+  assert.equal(other.stdout, '');
 });
 
 test('hook: Bash PIPELINE_ADMIN is denied even though the env var is not set', (t) => {

@@ -122,7 +122,7 @@ function makeCtx(opts) {
   const ci = caseInsensitive(platform);
   return {
     platform, homeNative, homePosix, cwd, api, roots, lexRoots, ci,
-    admin: opts.env?.PIPELINE_ADMIN === '1',
+    admin: (opts.env ?? process.env).PIPELINE_ADMIN === '1',
     hit: (p) => roots.some((r) => isInside(p, r, platform)),
   };
 }
@@ -136,7 +136,20 @@ function unescapeJs(s) {
 }
 
 // PIPELINE_ADMIN is case-sensitive on POSIX; Windows environment variable names are not.
-const hasAdminToken = (text, platform) => (platform === 'win32' ? /PIPELINE_ADMIN/i : /PIPELINE_ADMIN/).test(text);
+// Naming the switch is fine (docs, grep, prose); SETTING it is not: assignment, export, setx, $env:, a JSON/env key.
+// `PIPELINE_ADMIN === '1'` (a comparison) is not an assignment.
+const ADMIN_SET = [
+  /\bPIPELINE_ADMIN\s*=(?![=~])/,
+  /\bexport\s+PIPELINE_ADMIN\b/,
+  /\$env:PIPELINE_ADMIN\b/i,
+  /\bsetx?\s+PIPELINE_ADMIN\b/i,
+  /\bsetenv\s+PIPELINE_ADMIN\b/,
+  /["']PIPELINE_ADMIN["']\s*[:\],]/,
+  /\benv\s+(?:-\S+\s+)*PIPELINE_ADMIN=/,
+  /\bPIPELINE_ADMIN\s*:\s*["']?(?:1|true)\b/i,
+];
+const ADMIN_SET_CI = ADMIN_SET.map((re) => new RegExp(re.source, re.flags.includes('i') ? re.flags : `${re.flags}i`)); // Windows names are case-insensitive
+const setsAdmin = (text, platform) => (platform === 'win32' ? ADMIN_SET_CI : ADMIN_SET).some((re) => re.test(text));
 const hasDisableAll = (text) => text.includes('disableAllHooks');
 const variantsOf = (text) => unique([text, unescapeJs(text)]);
 
@@ -159,29 +172,70 @@ function lexicalTarget(target, ctx) {
   return s.length > 1 && s.endsWith('/') ? s.slice(0, -1) : s;
 }
 
+// MCP servers (a filesystem server, any other server's write tools) reach the same files without Edit/Write. Their
+// tool_input has no fixed shape, so path-like and content-like values are picked out by key name, at any depth.
+const MCP_PATH_KEYS = new Set(['path', 'paths', 'file_path', 'filePath', 'notebook_path', 'source', 'destination', 'target', 'dest', 'from', 'to', 'dir', 'directory']);
+const MCP_CONTENT_KEYS = new Set(['content', 'contents', 'text', 'newText', 'new_string', 'data', 'body']);
+// The spec's verbs plus a few synonyms; a read-only tool (read_*, list_*, get_*, search_*, directory_tree) never matches.
+const MCP_WRITE_VERB = /write|edit|move|rename|create|delete|remove|copy|append|patch|update|set|put|upload|mkdir|chmod|save|replace|insert|truncate|link|touch|overwrite|modify|apply|store|(?:^|_)(?:rm|cp|mv|del|ln|add)(?:_|$)/i;
+
+function collectStrings(v, out, depth = 0) {
+  if (typeof v === 'string') out.push(v);
+  else if (depth < 12 && v && typeof v === 'object') for (const x of Object.values(v).slice(0, 2000)) collectStrings(x, out, depth + 1);
+}
+
+function mcpFields(ti) {
+  const paths = [];
+  const texts = [];
+  const walk = (v, depth) => {
+    if (depth > 12 || v === null || typeof v !== 'object') return;
+    if (Array.isArray(v)) { for (const x of v.slice(0, 2000)) walk(x, depth + 1); return; }
+    for (const [k, x] of Object.entries(v)) {
+      if (MCP_PATH_KEYS.has(k)) collectStrings(x, paths);
+      else if (MCP_CONTENT_KEYS.has(k)) collectStrings(x, texts);
+      else walk(x, depth + 1);
+    }
+  };
+  walk(ti, 0);
+  return { paths: paths.slice(0, 500), texts };
+}
+
 export function evaluateFileTool(input, opts = {}) {
+  const tool = typeof input?.tool_name === 'string' ? input.tool_name : '';
+  const ti = input?.tool_input && typeof input.tool_input === 'object' ? input.tool_input : {};
+  let targets;
+  let texts;
+  if (tool.startsWith('mcp__')) {
+    const f = mcpFields(ti);
+    if (!f.paths.length || !MCP_WRITE_VERB.test(tool.split('__').pop())) return allow(); // not a file write
+    targets = f.paths;
+    texts = f.texts.flatMap(variantsOf);
+  } else {
+    const target = typeof ti.file_path === 'string' && ti.file_path ? ti.file_path : (typeof ti.notebook_path === 'string' ? ti.notebook_path : '');
+    targets = target ? [target] : [];
+    texts = writtenTexts(ti).flatMap(variantsOf);
+  }
   const ctx = makeCtx({ ...opts, cwd: input?.cwd });
   if (ctx.admin) return allow();
-  const ti = input?.tool_input ?? {};
-  const texts = writtenTexts(ti).flatMap(variantsOf);
 
-  const target = typeof ti.file_path === 'string' && ti.file_path ? ti.file_path : (typeof ti.notebook_path === 'string' ? ti.notebook_path : '');
-  if (target) {
-    const lexical = lexicalTarget(target, ctx);
-    const candidates = unique([lexical, realResolve(lexical, ctx.api)]);
-    for (const c of candidates) {
-      if (ctx.hit(c)) return deny(`${target} is a protected pipeline file (skills, agents, ~/.claude/pipeline and ~/.claude/settings.json can only be changed by the owner with PIPELINE_ADMIN=1)`);
-    }
-    if (texts.some(hasDisableAll)) {
+  const resolved = targets.map((t) => {
+    const lexical = lexicalTarget(t, ctx);
+    return { t, candidates: unique([lexical, realResolve(lexical, ctx.api)]) };
+  });
+  for (const { t, candidates } of resolved) {
+    if (candidates.some((c) => ctx.hit(c))) return deny(`${t} is a protected pipeline file (skills, agents, ~/.claude/pipeline and ~/.claude/settings.json can only be changed by the owner with PIPELINE_ADMIN=1)`);
+  }
+  if (texts.some(hasDisableAll)) {
+    for (const { t, candidates } of resolved) {
       for (const c of candidates) {
         const parent = posix.basename(posix.dirname(c));
         const inClaudeDir = ctx.ci ? parent.toLowerCase() === '.claude' : parent === '.claude';
-        if (inClaudeDir && SETTINGS_RE.test(posix.basename(c))) return deny(`writing disableAllHooks into ${target} would switch the pipeline hooks off`);
+        if (inClaudeDir && SETTINGS_RE.test(posix.basename(c))) return deny(`writing disableAllHooks into ${t} would switch the pipeline hooks off`);
       }
     }
   }
-  if (texts.some((t) => hasAdminToken(t, ctx.platform))) {
-    return deny('writing PIPELINE_ADMIN into a file could build a script that switches the guard off; admin mode is for the owner to set when launching Claude Code');
+  if (texts.some((x) => setsAdmin(x, ctx.platform))) {
+    return deny('this write sets PIPELINE_ADMIN (an assignment, export or env key); a script that sets it could switch the guard off, so only the owner does that, when launching Claude Code');
   }
   return allow();
 }
@@ -514,13 +568,13 @@ export function evaluateBashForFiles(command, opts = {}) {
 
   // 1 and 2: the admin switch and the hook switch, however the words are quoted or escaped
   const flat = raw.replace(/['"`\\]/g, '');
-  if (hasAdminToken(raw, ctx.platform) || hasAdminToken(flat, ctx.platform)) return deny('the command mentions PIPELINE_ADMIN; only the owner may set it, when launching Claude Code');
+  if (variantsOf(raw).some((t) => setsAdmin(t, ctx.platform) || setsAdmin(t.replace(/['"`\\]/g, ''), ctx.platform))) return deny('the command sets PIPELINE_ADMIN; only the owner may set it, when launching Claude Code (naming it, e.g. in grep or prose, is fine)');
   if (hasDisableAll(raw) || hasDisableAll(flat)) return deny('the command mentions disableAllHooks, which would switch the pipeline hooks off');
 
   const cmds = simpleCommands(raw);
   for (const c of cmds) {
-    const words = [...c.argv, ...Object.entries(c.env).flatMap(([k, v]) => [k, `${k}=${v}`])].join(' ');
-    if (hasAdminToken(words, ctx.platform)) return deny('the command sets PIPELINE_ADMIN; only the owner may set it, when launching Claude Code');
+    const words = [c.argv.join(' '), ...Object.entries(c.env).map(([k, v]) => `${k}=${v}`)].join(' ');
+    if (setsAdmin(words, ctx.platform)) return deny('the command sets PIPELINE_ADMIN; only the owner may set it, when launching Claude Code');
     if (hasDisableAll(words)) return deny('the command mentions disableAllHooks, which would switch the pipeline hooks off');
   }
   const dirs = collectDirs(cmds, ctx);
