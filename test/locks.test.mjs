@@ -1,7 +1,7 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, rmSync, utimesSync, existsSync, chmodSync } from 'node:fs';
+import fs, { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, utimesSync, existsSync, chmodSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,9 +14,12 @@ import {
   defaultLockDir,
   isPidAlive,
   LockTimeoutError,
+  LockLostError,
+  _tuning,
 } from '../pipeline/lib/locks.mjs';
 
 const FIXTURE = fileURLToPath(new URL('./fixtures/hold-lock.mjs', import.meta.url));
+const RACE_FIXTURE = fileURLToPath(new URL('./fixtures/reclaim-race.mjs', import.meta.url));
 const HOST = os.hostname();
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -72,8 +75,8 @@ function plantLock(dir, name, owner, { ageMs = 0 } = {}) {
 const leftovers = (dir) => readdirSync(dir).filter((n) => n.includes('.stale-') || n.endsWith('.reclaim'));
 
 // Child-process helper: collects stdout, lets a test wait for a given line.
-function launch(args) {
-  const child = spawn(process.execPath, [FIXTURE, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+function launch(args, script = FIXTURE) {
+  const child = spawn(process.execPath, [script, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
   let out = '';
   let err = '';
   let closed = false;
@@ -325,16 +328,28 @@ test('withLock returns fn result, passes the lock, and releases', async () => {
 test('withLock keeps the callback error when release also fails; surfaces release failure otherwise', {
   skip: process.platform === 'win32' || process.getuid?.() === 0,
 }, async () => {
-  // A read-only lock directory makes the release rename fail (EACCES) on POSIX.
+  // Read-only parent AND lock directory: neither the rename nor the unlink fallback can free the lock (EACCES).
   const dir = tmpDir();
+  const lockPath = path.join(dir, 'db.lock');
+  const lockDown = () => {
+    chmodSync(lockPath, 0o555);
+    chmodSync(dir, 0o555);
+  };
+  const unlock = () => {
+    chmodSync(dir, 0o755);
+    if (existsSync(lockPath)) chmodSync(lockPath, 0o755);
+  };
+  const saved = { ..._tuning };
+  _tuning.waitMs = 1;
   const boom = new Error('boom');
   try {
-    await assert.rejects(withLock('db', () => { chmodSync(dir, 0o555); throw boom; }, { dir }), (e) => e === boom);
-    chmodSync(dir, 0o755);
-    rmSync(path.join(dir, 'db.lock'), { recursive: true, force: true });
-    await assert.rejects(withLock('db', () => { chmodSync(dir, 0o555); return 1; }, { dir }), (e) => e.code === 'EACCES');
+    await assert.rejects(withLock('db', () => { lockDown(); throw boom; }, { dir }), (e) => e === boom);
+    unlock();
+    rmSync(lockPath, { recursive: true, force: true });
+    await assert.rejects(withLock('db', () => { lockDown(); return 1; }, { dir }), (e) => e.code === 'EACCES');
   } finally {
-    chmodSync(dir, 0o755);
+    Object.assign(_tuning, saved);
+    unlock();
   }
 });
 
@@ -445,4 +460,384 @@ test('re-checks staleness under the guard: a lock that turned live is not stolen
   assert.ok(existsSync(lockPath));
   assert.equal(inspect('db', { dir }).runId, 'crashed');
   assert.deepEqual(leftovers(dir), []);
+});
+
+// ---- reclaim races, exclusive publish, Windows retries, lost locks ----
+
+const plantGuard = (dir, name, owner, { ageMs = 0, now = Date.now() } = {}) => {
+  const guard = path.join(dir, `${name}.lock.reclaim`);
+  mkdirSync(guard);
+  if (owner) writeFileSync(path.join(guard, 'owner.json'), JSON.stringify(owner));
+  if (ageMs) {
+    const t = new Date(now - ageMs);
+    utimesSync(guard, t, t);
+  }
+  return guard;
+};
+const guardOwner = (over = {}) => ({ pid: process.pid, host: HOST, runId: 'guard-run', createdAt: new Date().toISOString(), ...over });
+const staleLock = (dir, name = 'db') => plantLock(dir, name, ownerRecord(name, { pid: deadPid(), runId: 'crashed' }));
+const readJson = (p) => JSON.parse(readFileSync(p, 'utf8'));
+const asideLitter = (dir) => readdirSync(dir).filter((n) => n.includes('.stale-'));
+const errWith = (code) => Object.assign(new Error(code), { code });
+async function waitForFile(file, ms = 15000) {
+  const end = Date.now() + ms;
+  while (!existsSync(file)) {
+    if (Date.now() > end) throw new Error(`timed out waiting for ${file}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+// Retries in the code under test sleep _tuning.waitMs between attempts; keep tests fast.
+function fastRetries(attempts = 40) {
+  const saved = { ..._tuning };
+  Object.assign(_tuning, { waitMs: 1, attempts });
+  return () => Object.assign(_tuning, saved);
+}
+
+test('14. the reclaim guard carries its owner identity while held', () => {
+  const dir = tmpDir();
+  staleLock(dir);
+  let seen;
+  const r = tryAcquire('db', {
+    dir,
+    runId: 'fresh',
+    hooks: { insideGuard: (guard) => (seen = readJson(path.join(guard, 'owner.json'))) },
+  });
+  assert.equal(r.acquired, true);
+  assert.equal(seen.pid, process.pid);
+  assert.equal(seen.host, HOST);
+  assert.match(seen.runId, /\S/);
+  assert.ok(!Number.isNaN(Date.parse(seen.createdAt)));
+  assert.deepEqual(leftovers(dir), [], 'guard released afterwards');
+});
+
+test('15. a guard whose owner is alive is NEVER broken, however old', () => {
+  const dir = tmpDir();
+  staleLock(dir);
+  const guard = plantGuard(dir, 'db', guardOwner({ runId: 'busy-reclaimer' }), { ageMs: 10 * 60e3 });
+  for (const now of [Date.now(), Date.now() + 10 * DAY]) {
+    const r = tryAcquire('db', { dir, now });
+    assert.equal(r.acquired, false);
+    assert.equal(r.owner.runId, 'crashed');
+  }
+  assert.equal(readJson(path.join(guard, 'owner.json')).runId, 'busy-reclaimer');
+  assert.equal(inspect('db', { dir }).runId, 'crashed');
+});
+
+test('15b. a guard whose owner is dead on this host is broken at once, even when fresh', () => {
+  const dir = tmpDir();
+  staleLock(dir);
+  plantGuard(dir, 'db', guardOwner({ pid: deadPid(), runId: 'dead-reclaimer' }));
+  assert.equal(tryAcquire('db', { dir, runId: 'fresh' }).acquired, true);
+  assert.deepEqual(leftovers(dir), []);
+});
+
+test('15c. a guard owned by another host is never broken', () => {
+  const dir = tmpDir();
+  staleLock(dir);
+  const guard = plantGuard(dir, 'db', guardOwner({ host: 'elsewhere', pid: deadPid() }), { ageMs: DAY });
+  assert.equal(tryAcquire('db', { dir }).acquired, false);
+  assert.ok(existsSync(guard));
+});
+
+test('16. guard without an owner: kept at 29 s, broken at 31 s', () => {
+  const now = Date.now();
+  for (const [ageMs, expected] of [[29e3, false], [31e3, true]]) {
+    const dir = tmpDir();
+    staleLock(dir);
+    const guard = plantGuard(dir, 'db', undefined, { ageMs, now });
+    const r = tryAcquire('db', { dir, now });
+    assert.equal(r.acquired, expected, `guard aged ${ageMs} ms`);
+    if (!expected) assert.ok(existsSync(guard), 'a young guard is left alone');
+  }
+});
+
+test('17. lock without a usable owner: kept at 59 s, reclaimed at 61 s', () => {
+  const now = Date.now();
+  for (const [ageMs, expected] of [[59e3, false], [61e3, true]]) {
+    const dir = tmpDir();
+    const lockPath = plantLock(dir, 'db', undefined);
+    const t = new Date(now - ageMs);
+    utimesSync(lockPath, t, t);
+    assert.equal(tryAcquire('db', { dir, now }).acquired, expected, `lock aged ${ageMs} ms`);
+  }
+});
+
+test('18. a reclaimer that grabbed a DIFFERENT guard than the one it inspected puts it back and gives up', () => {
+  const dir = tmpDir();
+  staleLock(dir);
+  const guard = plantGuard(dir, 'db', undefined, { ageMs: 120e3 }); // abandoned: breakable
+  let swapped = false;
+  const r = tryAcquire('db', {
+    dir,
+    hooks: {
+      beforeBreakGuard: (g) => {
+        // meanwhile another reclaimer broke that guard and created a fresh one of its own
+        fs.renameSync(g, `${g}.gone`);
+        mkdirSync(g);
+        writeFileSync(path.join(g, 'owner.json'), JSON.stringify(guardOwner({ runId: 'C-guard' })));
+        swapped = true;
+      },
+    },
+  });
+  assert.ok(swapped);
+  assert.equal(r.acquired, false);
+  assert.equal(readJson(path.join(guard, 'owner.json')).runId, 'C-guard', 'their live guard was restored');
+  assert.equal(inspect('db', { dir }).runId, 'crashed');
+  assert.deepEqual(asideLitter(dir), []);
+});
+
+test('19. a reclaimer whose guard was taken away does not touch the lock', () => {
+  const dir = tmpDir();
+  staleLock(dir);
+  const r = tryAcquire('db', {
+    dir,
+    hooks: {
+      insideGuard: (g) => {
+        fs.renameSync(g, `${g}.gone`);
+        mkdirSync(g);
+        writeFileSync(path.join(g, 'owner.json'), JSON.stringify(guardOwner({ runId: 'other-guard' })));
+      },
+    },
+  });
+  assert.equal(r.acquired, false);
+  assert.equal(inspect('db', { dir }).runId, 'crashed', 'the lock was not moved aside');
+  assert.equal(readJson(path.join(dir, 'db.lock.reclaim', 'owner.json')).runId, 'other-guard', 'their guard survives our cleanup');
+});
+
+test('20. repro: two reclaimers racing over an abandoned guard never produce two holders', { timeout: 60000 }, async () => {
+  const dir = tmpDir();
+  const gates = tmpDir();
+  staleLock(dir);
+  plantGuard(dir, 'db', undefined, { ageMs: 120e3 }); // the previous reclaimer crashed inside its critical section
+  const gate = (who, kind) => path.join(gates, `${who}.${kind}`);
+  // D sees the abandoned guard and stalls just before moving it aside.
+  const D = launch([dir, 'D', gates], RACE_FIXTURE);
+  await waitForFile(gate('D', 'reached'));
+  // C breaks the same abandoned guard, takes a fresh one and stalls inside its critical section.
+  const C = launch([dir, 'C', gates], RACE_FIXTURE);
+  await waitForFile(gate('C', 'reached'));
+  try {
+    writeFileSync(gate('D', 'go'), ''); // D resumes: its rename now hits C's live guard
+    const d = await D.waitFor(/^D acquired=(true|false)$/m);
+    writeFileSync(gate('C', 'go'), ''); // C resumes inside its critical section
+    const c = await C.waitFor(/^C acquired=(true|false)$/m);
+    assert.deepEqual([d, c], ['false', 'true'], 'exactly one holder');
+    assert.equal(inspect('db', { dir }).runId, 'C');
+  } finally {
+    writeFileSync(path.join(gates, 'done'), '');
+  }
+  assert.equal(await D.exit, 0);
+  assert.equal(await C.exit, 0);
+  assert.equal(inspect('db', { dir }), null, 'C released its own lock');
+});
+
+test('21. owner.json is published exclusively: a competitor that got there first keeps the lock', () => {
+  const dir = tmpDir();
+  const r = tryAcquire('db', {
+    dir,
+    runId: 'me',
+    hooks: {
+      beforeOwnerPublish: (p) =>
+        writeFileSync(path.join(p, 'owner.json'), JSON.stringify(ownerRecord('db', { runId: 'competitor' }))),
+    },
+  });
+  assert.equal(r.acquired, false);
+  assert.equal(r.owner.runId, 'competitor');
+  assert.equal(inspect('db', { dir }).runId, 'competitor');
+  assert.deepEqual(readdirSync(path.join(dir, 'db.lock')), ['owner.json'], 'our tmp file is gone, theirs untouched');
+});
+
+test('21b. after publishing, owner.json is re-read; if it is not ours we back off without deleting theirs', (t) => {
+  const dir = tmpDir();
+  t.mock.method(fs, 'linkSync', () => {
+    throw errWith('ENOTSUP'); // filesystem without hard links: rename fallback, which is not exclusive
+  });
+  const r = tryAcquire('db', {
+    dir,
+    runId: 'me',
+    hooks: {
+      afterOwnerPublish: (p) =>
+        writeFileSync(path.join(p, 'owner.json'), JSON.stringify(ownerRecord('db', { runId: 'competitor' }))),
+    },
+  });
+  assert.equal(r.acquired, false);
+  assert.equal(r.owner.runId, 'competitor');
+  assert.equal(inspect('db', { dir }).runId, 'competitor');
+});
+
+test('21c. no hard links (ENOTSUP/EPERM/EXDEV/EOPNOTSUPP): falls back to rename, retrying a busy rename', (t) => {
+  const restore = fastRetries();
+  try {
+    for (const code of ['ENOTSUP', 'EPERM', 'EXDEV', 'EOPNOTSUPP']) {
+      const dir = tmpDir();
+      const realRename = fs.renameSync;
+      let busy = 1;
+      t.mock.method(fs, 'linkSync', () => {
+        throw errWith(code);
+      });
+      t.mock.method(fs, 'renameSync', (a, b) => {
+        if (busy-- > 0) throw errWith('EBUSY');
+        return realRename(a, b);
+      });
+      const r = tryAcquire('db', { dir, runId: `via-${code}` });
+      assert.equal(r.acquired, true, code);
+      assert.equal(inspect('db', { dir }).runId, `via-${code}`);
+      assert.deepEqual(readdirSync(path.join(dir, 'db.lock')), ['owner.json'], 'tmp file consumed');
+      t.mock.restoreAll();
+    }
+  } finally {
+    restore();
+  }
+});
+
+test('22. a failed owner write cleans its tmp file, frees the lock dir and returns not-acquired (no throw)', (t) => {
+  const dir = tmpDir();
+  t.mock.method(fs, 'linkSync', () => {
+    throw errWith('EIO');
+  });
+  const r = tryAcquire('db', { dir });
+  assert.equal(r.acquired, false);
+  assert.equal(r.error.code, 'EIO');
+  assert.deepEqual(readdirSync(dir), [], 'neither tmp file nor an ownerless lock directory is left behind');
+});
+
+test('22b. the lock directory vanishing while we publish just makes us retry', () => {
+  const dir = tmpDir();
+  let n = 0;
+  const r = tryAcquire('db', {
+    dir,
+    runId: 'me',
+    hooks: {
+      beforeOwnerPublish: (p) => {
+        if (n++ === 0) rmSync(p, { recursive: true }); // e.g. reclaimed by someone while we were stalled
+      },
+    },
+  });
+  assert.equal(r.acquired, true);
+  assert.equal(inspect('db', { dir }).runId, 'me');
+  assert.deepEqual(readdirSync(path.join(dir, 'db.lock')), ['owner.json']);
+});
+
+test('23. release retries a directory rename that is refused while busy (EBUSY twice, then ok)', (t) => {
+  const restore = fastRetries();
+  try {
+    const dir = tmpDir();
+    const { lock } = tryAcquire('db', { dir });
+    const realRename = fs.renameSync;
+    let failures = 2;
+    const m = t.mock.method(fs, 'renameSync', (a, b) => {
+      if (failures-- > 0) throw errWith('EBUSY');
+      return realRename(a, b);
+    });
+    assert.equal(release(lock), true);
+    assert.equal(m.mock.callCount(), 3);
+    assert.equal(inspect('db', { dir }), null);
+  } finally {
+    restore();
+  }
+});
+
+test('23b. reclaim retries a busy rename too', (t) => {
+  const restore = fastRetries();
+  try {
+    const dir = tmpDir();
+    staleLock(dir);
+    const realRename = fs.renameSync;
+    let failures = 3;
+    t.mock.method(fs, 'renameSync', (a, b) => {
+      if (failures-- > 0) throw errWith('EBUSY');
+      return realRename(a, b);
+    });
+    assert.equal(tryAcquire('db', { dir, runId: 'fresh' }).acquired, true);
+    assert.deepEqual(asideLitter(dir), []);
+  } finally {
+    restore();
+  }
+});
+
+test('23c. when the rename keeps failing, release unlinks owner.json and removes the directory instead', (t) => {
+  const restore = fastRetries(3);
+  try {
+    const dir = tmpDir();
+    const { lock } = tryAcquire('db', { dir });
+    const m = t.mock.method(fs, 'renameSync', () => {
+      throw errWith('EPERM');
+    });
+    assert.equal(release(lock), true);
+    assert.equal(m.mock.callCount(), 3, 'retried before giving up');
+    assert.equal(inspect('db', { dir }), null);
+    assert.deepEqual(readdirSync(dir), []);
+  } finally {
+    restore();
+  }
+});
+
+test('24. owner.json unreadable for a reason other than "missing" is rethrown, never treated as reclaimable', (t) => {
+  const dir = tmpDir();
+  const lockPath = plantLock(dir, 'db', ownerRecord('db', { pid: deadPid(), runId: 'crashed' }), { ageMs: DAY });
+  const real = fs.readFileSync;
+  t.mock.method(fs, 'readFileSync', (p, ...rest) => {
+    if (String(p).endsWith('owner.json')) throw errWith('EACCES');
+    return real(p, ...rest);
+  });
+  assert.throws(() => tryAcquire('db', { dir }), (e) => e.code === 'EACCES');
+  assert.throws(() => inspect('db', { dir }), (e) => e.code === 'EACCES');
+  t.mock.restoreAll();
+  assert.equal(readJson(path.join(lockPath, 'owner.json')).runId, 'crashed', 'the lock was left alone');
+});
+
+test('25. acquire() default runIds are unique across calls', async () => {
+  const dir = tmpDir();
+  const ids = [];
+  for (let i = 0; i < 5; i++) {
+    const lock = await acquire('db', { dir });
+    ids.push(lock.runId);
+    release(lock);
+  }
+  assert.equal(new Set(ids).size, 5);
+  for (const id of ids) assert.match(id, new RegExp(`^${process.pid}-[0-9a-f-]{36}$`));
+});
+
+test('26. withLock throws LockLostError when the lock was taken over while fn ran', async () => {
+  const dir = tmpDir();
+  let finished = false;
+  await assert.rejects(
+    withLock('db', () => {
+      // our process looks dead to the thief, which reclaims the lock mid-fn
+      assert.equal(tryAcquire('db', { dir, runId: 'thief' }).acquired, true);
+      finished = true;
+      return 'untrustworthy result';
+    }, { dir, pid: deadPid() }),
+    (e) => e instanceof LockLostError && e.name === 'LockLostError' && /db/.test(e.message),
+  );
+  assert.ok(finished, 'fn ran to completion first');
+  assert.equal(inspect('db', { dir }).runId, 'thief', 'the new owner is left intact');
+});
+
+test('26b. withLock reports the callback error, not LockLostError, when fn throws after losing the lock', async () => {
+  const dir = tmpDir();
+  const boom = new Error('boom');
+  await assert.rejects(
+    withLock('db', () => {
+      tryAcquire('db', { dir, runId: 'thief' });
+      throw boom;
+    }, { dir, pid: deadPid() }),
+    (e) => e === boom,
+  );
+});
+
+test('27. LockTimeoutError names the lock path, the owner and how to clear it by hand', async () => {
+  const dir = tmpDir();
+  const lockPath = path.join(dir, 'db.lock');
+  const held = tryAcquire('db', { dir, runId: 'holder' });
+  await assert.rejects(acquire('db', { dir, waitMs: 0 }), (err) => {
+    assert.ok(err instanceof LockTimeoutError);
+    assert.equal(err.lockPath, lockPath);
+    assert.ok(err.message.includes(lockPath));
+    assert.ok(err.message.includes(`pid ${process.pid}`));
+    assert.ok(err.message.includes(HOST));
+    assert.ok(err.message.includes(held.lock.startedAt));
+    assert.ok(err.message.includes(`remove ${lockPath} if no pipeline process is running`));
+    return true;
+  });
 });

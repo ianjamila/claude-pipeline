@@ -1,9 +1,11 @@
 // Machine-wide named locks. Several Claude sessions (one per git worktree) share one machine, and two things must
 // never overlap: resetting/testing the dedicated local database, and production recovery (rolling back a deploy).
-// A lock is a directory made with mkdirSync (atomic: EEXIST means held) holding owner.json. A crashed holder is
-// reclaimed only when that is provably safe: its PID is dead on this host, or the lock was never finished (no usable
-// owner.json for 60 s). A live PID is never reclaimed however old; another host's lock is never reclaimed at all.
-import { mkdirSync, rmdirSync, rmSync, renameSync, writeFileSync, readFileSync, statSync, unlinkSync } from 'node:fs';
+// A lock is a directory made with mkdirSync (atomic: EEXIST means held) holding owner.json, published exclusively
+// (hard link, so the first writer wins). A crashed holder is reclaimed only when that is provably safe: its PID is
+// dead on this host, or the lock was never finished (no usable owner.json for 60 s). A live PID is never reclaimed
+// however old; another host's lock is never reclaimed at all. Reclaiming is serialized by a guard directory that
+// has an owner of its own and is judged by the same rules, so no two reclaimers can both believe they hold it.
+import fs from 'node:fs'; // default import: calls go through the object so tests can mock.method(fs, ...)
 import os from 'node:os';
 import path from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -11,18 +13,40 @@ import { randomBytes, randomUUID } from 'node:crypto';
 const NAME_RE = /^[A-Za-z0-9._-]+$/;
 // A lock directory with no usable owner.json this old was abandoned between mkdir and the owner write.
 export const INCOMPLETE_STALE_MS = 60_000;
-// The reclaim guard protects a millisecond-long section; one this old means its holder crashed inside it.
-const GUARD_STALE_MS = 30_000;
+// A guard without a readable owner this old was abandoned by a reclaimer that crashed inside its short section.
+export const GUARD_STALE_MS = 30_000;
 const MAX_ATTEMPTS = 5;
-// Windows refuses to rename a directory while another process has a file inside it open; retry briefly.
-const RETRY_CODES = new Set(['EPERM', 'EBUSY', 'EACCES']);
+// Windows refuses to rename/unlink while another process has the file or directory open; retry for a while.
+const BUSY_CODES = new Set(['EPERM', 'EBUSY', 'EACCES']);
+// Filesystems without hard links: fall back to a (non-exclusive) rename, then rely on the re-read after publishing.
+const NO_LINK_CODES = new Set(['EPERM', 'ENOTSUP', 'EXDEV', 'EOPNOTSUPP']);
+// Test seam: retry budget for busy renames/unlinks (40 x 50 ms in production).
+export const _tuning = { attempts: 40, waitMs: 50 };
 
 export class LockTimeoutError extends Error {
-  constructor(lockName, owner, waitedMs) {
-    super(`timed out after ${waitedMs} ms waiting for lock "${lockName}" held by ${describeOwner(owner)}`);
+  constructor(lockName, owner, waitedMs, lockPath, lastError) {
+    super(
+      `timed out after ${waitedMs} ms waiting for lock "${lockName}" at ${lockPath}, held by ${describeOwner(owner)}` +
+        (lastError ? ` (last error: ${lastError.message})` : '') +
+        `. To clear it by hand: remove ${lockPath} if no pipeline process is running.`,
+    );
     this.name = 'LockTimeoutError';
     this.lockName = lockName;
+    this.lockPath = lockPath;
     this.owner = owner;
+  }
+}
+
+// Thrown by withLock when fn finished but the lock had been taken over meanwhile: whatever fn produced was not
+// protected, so the caller must not trust it.
+export class LockLostError extends Error {
+  constructor(lock) {
+    super(
+      `lock "${lock.name}" (run ${lock.runId}) was taken over by another owner while it was held; ` +
+        'results produced under it are not trustworthy',
+    );
+    this.name = 'LockLostError';
+    this.lock = lock;
   }
 }
 
@@ -58,12 +82,23 @@ function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+function retrying(fn) {
+  for (let i = 1; ; i++) {
+    try {
+      return fn();
+    } catch (err) {
+      if (!BUSY_CODES.has(err.code) || i >= _tuning.attempts) throw err;
+      sleepSync(_tuning.waitMs);
+    }
+  }
+}
+
 // Returns the owner record, or null when owner.json is missing, unparseable or does not identify a process.
 // Any other read error (EACCES, EIO...) is rethrown: only "missing/unparseable" may ever make a lock reclaimable.
-function readOwner(lockPath) {
+function readOwner(dirPath) {
   let text;
   try {
-    text = readFileSync(path.join(lockPath, 'owner.json'), 'utf8');
+    text = fs.readFileSync(path.join(dirPath, 'owner.json'), 'utf8');
   } catch (err) {
     if (err.code === 'ENOENT' || err.code === 'ENOTDIR') return null;
     throw err;
@@ -93,7 +128,7 @@ const nameOf = (lockPath) => path.basename(lockPath).replace(/\.lock$/, '');
 function assess(lockPath, { now, host, isAlive }) {
   let st;
   try {
-    st = statSync(lockPath);
+    st = fs.statSync(lockPath);
   } catch (err) {
     if (err.code === 'ENOENT') return { state: 'absent' };
     throw err;
@@ -112,21 +147,18 @@ function assess(lockPath, { now, host, isAlive }) {
 // Atomically take a directory out of the way by renaming it; null if it is already gone.
 function moveAside(p) {
   const target = `${p}.stale-${randomBytes(6).toString('hex')}`;
-  for (let i = 0; ; i++) {
-    try {
-      renameSync(p, target);
-      return target;
-    } catch (err) {
-      if (err.code === 'ENOENT') return null;
-      if (!RETRY_CODES.has(err.code) || i >= 7) throw err;
-      sleepSync(25);
-    }
+  try {
+    retrying(() => fs.renameSync(p, target));
+    return target;
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    throw err;
   }
 }
 
 function removeQuietly(p) {
   try {
-    rmSync(p, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    fs.rmSync(p, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
   } catch {
     /* it is already out of the way; leftover bytes are harmless */
   }
@@ -134,7 +166,7 @@ function removeQuietly(p) {
 
 function tryMkdir(p) {
   try {
-    mkdirSync(p);
+    fs.mkdirSync(p);
     return true;
   } catch (err) {
     if (err.code === 'EEXIST') return false;
@@ -142,65 +174,164 @@ function tryMkdir(p) {
   }
 }
 
-// Remove a lock that assess() judged stale. Two reclaimers must not both do this: the slower one would rename the
-// faster one's brand-new live lock away. So reclaiming is serialized by a short-lived guard directory, and staleness
-// is judged again while holding it. Returns 'busy' (another reclaimer is working) or 'retry' (look again / mkdir).
-function reclaim(lockPath, ctx) {
-  const guard = `${lockPath}.reclaim`;
-  if (!tryMkdir(guard)) {
-    let age = 0;
+// Publish owner.json for a directory we just created (the lock itself, or a reclaim guard). It is written to a tmp
+// file and hard-linked into place, which fails with EEXIST if anyone published first: even a creator that stalled
+// past the 60 s staleness window cannot overwrite the owner that reclaimed its directory. After publishing, owner.json
+// is re-read and must carry our runId. Returns { ok: true } or { ok: false, existing } (someone else owns it; their
+// file is never touched). Other failures clean up the tmp file and an ownerless directory, then throw.
+function publishOwner(dirPath, owner, hooks) {
+  const ownerPath = path.join(dirPath, 'owner.json');
+  const tmp = path.join(dirPath, `owner.json.${randomBytes(4).toString('hex')}.tmp`);
+  const removeTmp = () => {
     try {
-      age = ctx.now - statSync(guard).mtimeMs;
+      retrying(() => fs.unlinkSync(tmp));
     } catch {
-      return 'retry'; // guard vanished meanwhile
+      /* never created, or already renamed into place */
     }
-    if (age <= GUARD_STALE_MS) return 'busy';
-    const moved = moveAside(guard);
-    if (moved) removeQuietly(moved);
-    return 'retry';
-  }
-  let moved = null;
+  };
+  let lostRace = false;
   try {
-    if (assess(lockPath, ctx).state === 'stale') moved = moveAside(lockPath);
-  } finally {
+    fs.writeFileSync(tmp, `${JSON.stringify(owner, null, 2)}\n`, { flag: 'wx' });
+    hooks.beforeOwnerPublish?.(dirPath);
     try {
-      rmdirSync(guard);
-    } catch {
-      /* best effort; an abandoned guard is cleared after GUARD_STALE_MS */
+      fs.linkSync(tmp, ownerPath);
+    } catch (err) {
+      if (err.code === 'EEXIST') lostRace = true;
+      else if (NO_LINK_CODES.has(err.code)) retrying(() => fs.renameSync(tmp, ownerPath));
+      else throw err;
     }
-  }
-  if (moved) removeQuietly(moved);
-  return 'retry';
-}
-
-// Publish owner.json atomically (tmp file + rename) so nobody ever reads a half-written owner.
-function writeOwner(lockPath, owner) {
-  const tmp = path.join(lockPath, `owner.json.${randomBytes(4).toString('hex')}.tmp`);
-  try {
-    writeFileSync(tmp, `${JSON.stringify(owner, null, 2)}\n`, { flag: 'wx' });
-    renameSync(tmp, path.join(lockPath, 'owner.json'));
   } catch (err) {
+    removeTmp();
     try {
-      unlinkSync(tmp);
-    } catch {
-      /* never created */
-    }
-    try {
-      rmdirSync(lockPath); // only succeeds while empty: never remove a lock that has an owner
+      fs.rmdirSync(dirPath); // only succeeds while empty: never remove a directory that has an owner
     } catch {
       /* not ours to remove */
     }
     throw err;
   }
+  removeTmp();
+  if (lostRace) return { ok: false, existing: readOwner(dirPath) };
+  hooks.afterOwnerPublish?.(dirPath);
+  const current = readOwner(dirPath);
+  return current?.runId === owner.runId ? { ok: true } : { ok: false, existing: current };
 }
 
+// Remove a directory (lock or guard) if, and only if, its owner.json carries `runId`. Rename-then-remove, so the
+// path is free the instant the rename lands. If the rename keeps failing (Windows: something holds the directory
+// open), free it by unlinking owner.json and removing the then-empty directory instead.
+function releaseDir(dirPath, runId) {
+  const owner = readOwner(dirPath);
+  if (!owner || owner.runId !== runId) return false;
+  let moved;
+  try {
+    moved = moveAside(dirPath);
+  } catch (err) {
+    if (!BUSY_CODES.has(err.code)) throw err;
+    try {
+      retrying(() => fs.unlinkSync(path.join(dirPath, 'owner.json')));
+    } catch (unlinkErr) {
+      if (unlinkErr.code === 'ENOENT') return false;
+      throw err;
+    }
+    try {
+      retrying(() => fs.rmdirSync(dirPath));
+    } catch {
+      /* an empty leftover directory is reclaimed as "never completed" */
+    }
+    return true;
+  }
+  if (moved === null) return false;
+  removeQuietly(moved);
+  return true;
+}
+
+// Break a reclaim guard that someone else holds, but only when it is provably abandoned: its owner is dead on this
+// host, or it has no readable owner and is older than GUARD_STALE_MS. A guard owned by a live process (or another
+// host) is never broken, however old. The check and the rename are separate steps, so after renaming we confirm we
+// moved the very directory we inspected (same inode, same owner); if another reclaimer replaced it in between we
+// put it back and give up for now. Returns 'busy' (do not proceed) or 'retry' (guard is gone; look again).
+function breakGuard(guard, ctx) {
+  let seen;
+  try {
+    seen = fs.statSync(guard, { bigint: true });
+  } catch (err) {
+    if (err.code === 'ENOENT') return 'retry';
+    throw err;
+  }
+  const owner = readOwner(guard);
+  if (owner) {
+    if (owner.host !== ctx.host || ctx.isAlive(owner.pid)) return 'busy';
+  } else if (ctx.now - Number(seen.mtimeMs) <= GUARD_STALE_MS) {
+    return 'busy';
+  }
+  ctx.hooks.beforeBreakGuard?.(guard);
+  const moved = moveAside(guard);
+  if (moved === null) return 'retry';
+  let sameDir = false;
+  try {
+    const after = fs.statSync(moved, { bigint: true });
+    sameDir = after.ino === seen.ino && (readOwner(moved)?.runId ?? null) === (owner?.runId ?? null);
+  } catch {
+    /* vanished: treat as not what we inspected */
+  }
+  if (!sameDir) {
+    try {
+      retrying(() => fs.renameSync(moved, guard)); // best effort; EEXIST means someone re-created the guard
+    } catch {
+      /* theirs stays aside; they notice the loss before touching the lock */
+    }
+    return 'busy';
+  }
+  removeQuietly(moved);
+  return 'retry';
+}
+
+// Remove a lock that assess() judged stale. Two reclaimers must not both do this: the slower one would rename the
+// faster one's brand-new live lock away. So reclaiming is serialized by a guard directory, staleness is judged again
+// while holding it, and the guard is confirmed to still be ours right before the lock is moved.
+// Returns 'busy' (another reclaimer is active: report not acquired) or 'retry' (look at the lock again).
+function reclaim(lockPath, ctx) {
+  const guard = `${lockPath}.reclaim`;
+  if (!tryMkdir(guard)) return breakGuard(guard, ctx);
+  const me = {
+    pid: process.pid,
+    host: ctx.host,
+    runId: `${process.pid}-${randomUUID()}`,
+    createdAt: new Date(ctx.now).toISOString(),
+  };
+  let moved = null;
+  try {
+    if (!publishOwner(guard, me, ctx.hooks).ok) return 'busy';
+    if (assess(lockPath, ctx).state === 'stale') {
+      ctx.hooks.insideGuard?.(guard, lockPath);
+      if (readOwner(guard)?.runId === me.runId) moved = moveAside(lockPath);
+    }
+  } finally {
+    releaseDir(guard, me.runId);
+  }
+  if (moved) removeQuietly(moved);
+  return 'retry';
+}
+
+// `hooks` ({ beforeBreakGuard, insideGuard, beforeOwnerPublish, afterOwnerPublish }) are test-only seams that let a
+// test interleave another actor at a precise point; production callers never pass them.
+// Returns { acquired: true, lock } or { acquired: false, owner[, error] }. `error` is set when we could not write
+// our owner file (the lock directory is cleaned up so it cannot block anyone).
 export function tryAcquire(
   name,
-  { dir = defaultLockDir(), runId, now = Date.now(), pid = process.pid, host = os.hostname(), isAlive = isPidAlive } = {},
+  {
+    dir = defaultLockDir(),
+    runId,
+    now = Date.now(),
+    pid = process.pid,
+    host = os.hostname(),
+    isAlive = isPidAlive,
+    hooks = {},
+  } = {},
 ) {
   const lockPath = lockPathFor(dir, name);
-  mkdirSync(dir, { recursive: true });
-  const ctx = { now, host, isAlive };
+  fs.mkdirSync(dir, { recursive: true });
+  const ctx = { now, host, isAlive, hooks };
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     if (tryMkdir(lockPath)) {
       const owner = {
@@ -210,7 +341,14 @@ export function tryAcquire(
         host,
         startedAt: new Date(now).toISOString(),
       };
-      writeOwner(lockPath, owner);
+      let published;
+      try {
+        published = publishOwner(lockPath, owner, hooks);
+      } catch (error) {
+        if (error.code === 'ENOENT') continue; // our directory was taken away before we published: start over
+        return { acquired: false, owner: null, error };
+      }
+      if (!published.ok) return { acquired: false, owner: published.existing ?? assess(lockPath, ctx).owner ?? null };
       return { acquired: true, lock: { ...owner, dir, path: lockPath } };
     }
     const seen = assess(lockPath, ctx);
@@ -232,7 +370,9 @@ export async function acquire(name, { waitMs = 30 * 60e3, pollMs = 1000, onWait,
     const result = tryAcquire(name, { ...rest, runId });
     if (result.acquired) return result.lock;
     const waited = performance.now() - started;
-    if (waited >= waitMs) throw new LockTimeoutError(name, result.owner, Math.round(waited));
+    if (waited >= waitMs) {
+      throw new LockTimeoutError(name, result.owner, Math.round(waited), lockPathFor(rest.dir ?? defaultLockDir(), name), result.error);
+    }
     onWait?.(result.owner, Math.round(waited));
     await sleep(Math.min(pollMs, waitMs - waited));
   }
@@ -240,30 +380,24 @@ export async function acquire(name, { waitMs = 30 * 60e3, pollMs = 1000, onWait,
 
 // true when this call released the lock; false when it is gone or now belongs to another run (left untouched).
 export function release(lock) {
-  const lockPath = lockPathFor(lock.dir, lock.name);
-  const owner = readOwner(lockPath);
-  if (!owner || owner.runId !== lock.runId) return false;
-  const moved = moveAside(lockPath);
-  if (moved === null) return false;
-  removeQuietly(moved);
-  return true;
+  return releaseDir(lockPathFor(lock.dir, lock.name), lock.runId);
 }
 
 export async function withLock(name, fn, opts) {
   const lock = await acquire(name, opts);
-  let fnFailed = false;
+  let result;
   try {
-    return await fn(lock);
+    result = await fn(lock);
   } catch (err) {
-    fnFailed = true;
-    throw err;
-  } finally {
     try {
       release(lock);
-    } catch (err) {
-      if (!fnFailed) throw err; // never let a release failure hide the error that actually mattered
+    } catch {
+      /* never let a release failure hide the error that actually mattered */
     }
+    throw err;
   }
+  if (!release(lock)) throw new LockLostError(lock);
+  return result;
 }
 
 // The current owner, or null when there is no lock. A lock directory without a usable owner.json (being created,
@@ -271,7 +405,7 @@ export async function withLock(name, fn, opts) {
 export function inspect(name, { dir = defaultLockDir() } = {}) {
   const lockPath = lockPathFor(dir, name);
   try {
-    statSync(lockPath);
+    fs.statSync(lockPath);
   } catch (err) {
     if (err.code === 'ENOENT') return null;
     throw err;
