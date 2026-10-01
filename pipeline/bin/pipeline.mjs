@@ -36,7 +36,10 @@ export async function main(argv = process.argv.slice(2), ctx = {}) {
     return emit({ exitCode: EXIT.USAGE, output: { ok: false, error: 'usage', message: `unknown command: ${name}` } });
   }
   const mod = await import(pathToFileURL(join(commandsDir, `${name}.mjs`)).href);
-  if (rest.includes('--help') || rest.includes('-h')) {
+  // Only flags BEFORE a `--` ask for help: after it come a command's own arguments (`job start x -- ls -h`), and
+  // answering those with usage + exit 0 would look like a job that started.
+  const own = rest.includes('--') ? rest.slice(0, rest.indexOf('--')) : rest;
+  if (own.includes('--help') || own.includes('-h')) {
     process.stderr.write(`${mod.meta?.usage ?? name}\n`);
     return emit({ exitCode: EXIT.OK, output: { ok: true, usage: mod.meta?.usage ?? name } });
   }
