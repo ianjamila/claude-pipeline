@@ -1,0 +1,59 @@
+# .claude/pipeline.yml — project settings for the global ship/verify pipeline.
+# Validate with: node ~/.claude/pipeline/bin/pipeline.mjs config
+version: 1
+project: my-app
+default_branch: main
+enforcement: github            # github = branch protection must be live; gate = skills only
+worktree_dir: .worktrees       # ship creates agent/<name> worktrees here (must be gitignored)
+
+verify:
+  full: node scripts/verify.mjs          # everything; must pass before a PR and at the final gate
+  quick: node scripts/verify.mjs --quick # fast subset; the Stop hook runs this
+  report: .verify/report.json
+  screenshots: .verify/screenshots
+
+ci:
+  required_checks: ["Test integrity", "Hard-stop scan"]   # + your CI job names
+  e2e_label: null              # label that triggers CI E2E for high-risk PRs, if any
+  draft_while_iterating: false
+
+merge:
+  # {pr} = PR number, {sha} = approved head SHA (the merge must refuse any other head).
+  command: gh pr merge {pr} --squash --auto --delete-branch --match-head-commit {sha}
+  wait_minutes: 15
+
+preview: null
+#  provider: github-deployments
+#  environment: Preview
+#  smoke: node scripts/pipeline/smoke.mjs --base {url}
+
+production: null
+#  url: https://example.com
+#  provider: vercel
+#  environment: Production
+#  deploy_timeout_minutes: 20
+#  smoke: node scripts/pipeline/smoke.mjs --base {url} --production
+#  rollback:
+#    command: vercel rollback {deployment} --yes
+#    notes: After a rollback Vercel stops auto-assigning production domains until you promote a deployment.
+
+smoke_checks: []               # GET-only, unauthenticated: [{path: /, status: [200], contains: ["…"]}]
+
+risk:
+  high_risk_paths: []
+  medium_lines: 150
+  high_lines: 600
+  medium_files: 10
+
+hard_stops:                    # project extras on top of the universal list
+  paths: []
+  patterns: []                 # [{name: ..., regex: ..., paths: ["**/*.ts"]}]
+  auth_calls: []               # authorization helpers whose removal is a hard-stop
+
+review:
+  codex_model: gpt-6-astra
+  effort: {low: medium, medium: medium, high: high, followup: medium}
+  max_rounds: 3
+  light_lane_max_lines: 50
+
+agent_log: docs/agent-log.md
