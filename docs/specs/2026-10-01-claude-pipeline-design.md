@@ -620,3 +620,83 @@ Slack/push notifications, DRMed onboarding (prompt in README).
 7. **Global allowlist.** The installer adds `Bash(node <abs>/.claude/pipeline/bin/pipeline.mjs:*)`
    to `~/.claude/settings.json` `permissions.allow`; project settings allow
    `Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)` as typed by the skills.
+
+## 17. Revision 2 — after Codex Astra-high plan review (2026-10-01)
+
+Codex verdict: "needs revision". All 13 findings accepted; resolutions below supersede earlier
+sections where they conflict.
+
+- **R1 Status contexts vs EagleWatch gate.** EagleWatch's `npm run merge` does not oblige the two
+  status contexts; GitHub protection requires them. The gate already blocks on any failing check
+  or status in `gh pr checks`, so a red `Hard-stop scan`/`Test integrity` still blocks it.
+  `pipeline-guards.yml` is registered in `expected-checks.mjs` as excused ("enforced by branch
+  protection via commit statuses") so `lint:checks` stays green.
+- **R2 Immutable approved head.** `merge.command` gets `{sha}`. EagleWatch:
+  `npm run merge -- {pr} --no-update --expect-head {sha}` (new `--expect-head` flag in
+  `merge-gate.mjs`: refuse if the PR head ≠ sha). Generic: `gh pr merge {pr} --squash --auto
+  --delete-branch --match-head-commit {sha}`. Stale base ⇒ ship updates the branch and re-runs the
+  final gate (fresh verify, CI, preview smoke) — max 2 attempts, then `needs-human`.
+  `pipeline merge` waits until the PR is MERGED; if auto-merge is still queued after the wait it
+  runs `gh pr merge --disable-auto` and fails (no unattended queued merges).
+- **R3 Evidence contract.** `final-gate.json` = `{repo, pr, base, head, tree, patchId, verify:{report
+  sha256, steps, expectedSteps, finishedAt}, review:{patchId, head, clean}, preview:{sha, url, ok},
+  checks[]}`. Verify report carries `expectedSteps` and `mode:'full'|'quick'|'partial'`; `--only`
+  ⇒ `partial` ⇒ rejected. Review validity binds to the PR patch-id (`git diff merge-base..head
+  -- . ':!<agent_log>' | git patch-id --stable`), so a base-only update keeps the review but
+  never the verify/preview evidence. `merge` re-checks live blockers (labels, pause, rollback,
+  head, patch-id) immediately before running the merge command. Negative tests for every mismatch.
+- **R4 Status lifecycle.** The guard job: posts `pending` for both contexts on the event head SHA
+  first; runs both checks capturing exit codes (no early exit); re-reads the PR's current head SHA
+  and labels from the API; if the head moved, posts `error` ("superseded") on the old SHA and
+  exits; otherwise posts `success`/`failure`; an `if: always()` step posts `error` for any context
+  still pending (crash/cancel ⇒ fail closed). Checkout keeps credentials (no PR code ever runs;
+  token is `contents: read`) so `git fetch origin refs/pull/N/head` works; the fetched SHA must
+  equal the event head SHA.
+- **R5 Approval bound to head.** On `synchronize`, the guard job removes `human-approved` and
+  `test-change-approved` (needs `pull-requests: write`) before evaluating, so an approval only ever
+  covers the head it was given on. Test: approve A → push B → label gone → red.
+- **R6 Hooks cover pipeline entry points.** `job start … -- <cmd>` payloads are parsed and
+  evaluated by both hooks, and `jobs.mjs` itself refuses commands the shared evaluator denies.
+  `pipeline protect --apply` requires `PIPELINE_ADMIN=1` in its process env. guard-files denies any
+  Bash command containing `disableAllHooks`. Residual (documented): with one GitHub identity an
+  agent that writes its own API client can still add a label; label approval is protected against
+  accidental and casual misuse only. A bot identity would close it (out of scope by owner choice).
+- **R7 Removals and weakening.** New universal rules: `R2-auth-removed` (removed non-test lines
+  matching `require\w*(Auth|Role|Admin|Scope|Permission|User|Session)\w*\(`,
+  `assert\w*(Auth|Role|Permission)\w*\(`, `checkPermission\(`, `authorize\(`,
+  `auth\.getUser\(`, `getUser\(`, `isAdmin\(`, `hasRole\(` plus project
+  `hard_stops.auth_calls`); `R2-sql-removed` (removed SQL lines with POLICY/GRANT/REVOKE/RLS/
+  SECURITY DEFINER); `R1-migration-edited` (any M/D/R of an existing file under a migrations
+  dir). Path rules test both old and new paths on renames.
+- **R8 Rollback ownership.** Before merging, record the current Production deployment (known
+  good). On smoke failure: take the machine lock `prod-<project>`, read the current Production
+  deployment; if it is not the failed one ⇒ outcome `superseded` (issue, no rollback); else
+  `vercel rollback <known-good> --yes` (flags probed), wait, re-smoke ⇒ `recovered`
+  (`reverted` outcome + revert PR) or `rollback-failed` (urgent `needs-human` issue).
+- **R9 Agent log without extra PRs.** The ship PR itself gets one docs commit appending the line
+  (outcome `merged — prod smoke pending`) right before the final gate's fresh verify. Lines for
+  runs that don't merge, and post-deploy outcomes, go to a queue at
+  `<git-common-dir>/claude-pipeline/agent-log-queue.jsonl` and are flushed into the next ship PR.
+  No docs-only PR path is needed. `checks.yml` drops its `paths-ignore` (a required workflow that
+  doesn't trigger never reports) and short-circuits docs-only diffs with a job-level skip.
+- **R10 Windows.** `.cmd`/`.bat` shims launched via `cmd.exe /d /s /c` with proper quoting;
+  timestamps `YYYYMMDDTHHMMSSZ`; CI steps use `shell: bash`; installer tested under a path with
+  spaces.
+- **R11 Outage resume.** `pipeline review-complete --pr N` removes `awaiting-review` only when
+  state shows a clean review for the current patch-id; e2e test outage → resume → gate.
+- **R12 Local DB isolation.** Verify's db/e2e steps run against a dedicated pipeline Supabase
+  instance (temp workdir copy of `supabase/` with `project_id = "<id>-pipeline"` and a port
+  offset) under a machine-wide lock `supabase-<project>` held for reset → pgTAP → e2e; the e2e
+  smoke uses its own Playwright config/port and env pointing at that instance; verify refuses
+  non-localhost Supabase URLs itself.
+- **R13 Fable proof bound to the ruling.** ship embeds `INPUT-DIGEST: <sha256 of
+  arbiter-input.md>` and `ROUND: N` in the arbiter prompt. `arbiter apply --agent-id ID --round
+  N` locates the transcript, requires: every assistant line Fable + effort high + no error; the
+  first user message contains the digest and round; the final assistant message has
+  `stop_reason: end_turn`; the rulings JSON is **parsed from that final message** (no separate
+  file); ids match the round's arbiter items.
+- **P3s.** Tasks reordered so each passes on its own; installer tests use fixture source trees.
+  Proof 5 uses a change engineered to draw a Codex finding (unbounded cache) plus the disclosed
+  force switch as fallback. Post-build reviews pin immutable base/head SHAs.
+- **Also adopted.** pgTAP RLS tests switch to real session roles (`set local role
+  authenticated` + `request.jwt.claims`), never a privileged connection.
