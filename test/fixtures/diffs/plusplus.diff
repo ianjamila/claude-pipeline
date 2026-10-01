@@ -1,0 +1,16 @@
+diff --git a/patch.txt b/patch.txt
+index ec98bd9..5ea6c87 100644
+--- a/patch.txt
++++ b/patch.txt
+@@ -2 +2 @@ line one
+--- y
++++ x
+@@ -3,0 +4 @@ line three
++++ b/evil.ts
+diff --git a/zz-after.txt b/zz-after.txt
+index 0d0fb04..ef15682 100644
+--- a/zz-after.txt
++++ b/zz-after.txt
+@@ -2 +2 @@ tail 1
+-tail 2
++tail two
