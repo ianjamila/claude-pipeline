@@ -7,6 +7,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+
 // ---------- locating transcripts ----------
 
 // Agent ids are hex-ish; refusing anything else keeps a hostile id from escaping the subagents dir.
@@ -61,22 +64,33 @@ function newest(candidates) {
   return best;
 }
 
+// A file dated further ahead than this is treated as untrustworthy (a stale copy with a bad clock would
+// otherwise always look "newest").
+const FUTURE_SKEW_MS = 60e3;
+
 // By agentId (wins if both are given) or by tag. A tag match returns the sibling .jsonl path without
 // checking it exists: the meta can appear before the transcript, so callers read it inside try/catch.
-export function findSubagentTranscript({
-  agentId,
-  tag,
-  projectsDir = path.join(os.homedir(), '.claude', 'projects'),
-  maxAgeMs = 6 * 3600e3,
-  now = Date.now(),
-} = {}) {
+export function findSubagentTranscript(opts) {
+  if (!isPlainObject(opts)) return null;
+  const {
+    agentId,
+    tag,
+    projectsDir = path.join(os.homedir(), '.claude', 'projects'),
+    maxAgeMs = 6 * 3600e3,
+    now = Date.now(),
+  } = opts;
+  if (typeof projectsDir !== 'string' || projectsDir === '') return null;
+  // NaN would make every age comparison false and silently accept stale or future files.
+  if (!Number.isFinite(maxAgeMs) || !Number.isFinite(now)) return null;
+  const notFuture = (st) => st.mtimeMs <= now + FUTURE_SKEW_MS;
+
   if (agentId !== undefined && agentId !== null) {
     if (typeof agentId !== 'string' || !AGENT_ID_RE.test(agentId)) return null;
     const found = [];
     for (const dir of subagentDirs(projectsDir)) {
       const file = path.join(dir, `agent-${agentId}.jsonl`);
       const st = statOrNull(file);
-      if (st?.isFile()) found.push({ file, mtimeMs: st.mtimeMs });
+      if (st?.isFile() && notFuture(st)) found.push({ file, mtimeMs: st.mtimeMs });
     }
     const best = newest(found);
     if (!best) return null;
@@ -92,7 +106,7 @@ export function findSubagentTranscript({
       if (!name.endsWith('.meta.json')) continue;
       const file = path.join(dir, name);
       const st = statOrNull(file);
-      if (!st?.isFile() || now - st.mtimeMs > maxAgeMs) continue;
+      if (!st?.isFile() || now - st.mtimeMs > maxAgeMs || !notFuture(st)) continue;
       const meta = readMetaObject(file);
       if (meta && meta.description === tag) matches.push({ file, mtimeMs: st.mtimeMs, meta });
     }
@@ -104,9 +118,6 @@ export function findSubagentTranscript({
 
 // ---------- proving the model ----------
 
-const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
-const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
-
 // Text blocks only (thinking / tool_use / tool_result / images carry no prose); a bare string passes through.
 function textBlocks(content) {
   if (typeof content === 'string') return [content];
@@ -114,22 +125,40 @@ function textBlocks(content) {
   return content.filter((b) => isPlainObject(b) && b.type === 'text' && typeof b.text === 'string').map((b) => b.text);
 }
 
+// Counts live in a Map and are copied into a plain object only on return: a model named "__proto__" or
+// "constructor" must not hit Object.prototype.
 function bump(counts, key) {
-  counts[key] = (counts[key] ?? 0) + 1;
+  counts.set(key, (counts.get(key) ?? 0) + 1);
 }
 
-export function proveModel({ jsonlText, metaText, expectModelPrefix, expectEffort, expectMetaModel = null }) {
+// Claude Code adds reminder and hook-context lines as user lines marked isMeta with no origin. They are
+// not input; a line with an origin (another agent's or the coordinator's message) still is.
+const isHarnessNote = (line) => line.isMeta === true && !has(line, 'origin');
+
+// A human prompt turn: a user line holding a string or a text block. tool_result-only lines are not.
+function isPromptTurn(line) {
+  if (isHarnessNote(line)) return false;
+  const content = isPlainObject(line.message) ? line.message.content : undefined;
+  return typeof content === 'string' || (Array.isArray(content) && content.some((b) => isPlainObject(b) && b.type === 'text'));
+}
+
+export function proveModel({ jsonlText, metaText, expectModelPrefix, expectEffort, expectMetaModel = null, expectAgentType = null }) {
   const errors = [];
-  const models = {};
-  const efforts = {};
+  const models = new Map();
+  const efforts = new Map();
   const asst = []; // { line, n } for every assistant line, in file order
   let firstUserText = null;
+  let promptTurns = 0;
 
   // An empty expectation would "prove" anything, so it is itself a failure.
   const prefixOk = typeof expectModelPrefix === 'string' && expectModelPrefix !== '';
   const effortOk = typeof expectEffort === 'string' && expectEffort !== '';
   if (!prefixOk) errors.push('invalid expectation: expectModelPrefix');
   if (!effortOk) errors.push('invalid expectation: expectEffort');
+  const agentTypeGiven = expectAgentType !== null && expectAgentType !== undefined;
+  if (agentTypeGiven && (typeof expectAgentType !== 'string' || expectAgentType === '')) {
+    errors.push('invalid expectation: expectAgentType');
+  }
 
   if (typeof jsonlText !== 'string') {
     errors.push('transcript text missing');
@@ -148,8 +177,10 @@ export function proveModel({ jsonlText, metaText, expectModelPrefix, expectEffor
         errors.push(`unparseable line ${n}`);
         continue;
       }
-      if (line.type === 'user' && firstUserText === null) {
-        firstUserText = textBlocks(line.message?.content).join('\n');
+      if (line.type === 'user') {
+        if (firstUserText === null && !isHarnessNote(line)) firstUserText = textBlocks(line.message?.content).join('\n');
+        if (isPromptTurn(line)) promptTurns++;
+        continue;
       }
       if (line.type !== 'assistant') continue;
 
@@ -161,15 +192,29 @@ export function proveModel({ jsonlText, metaText, expectModelPrefix, expectEffor
       if (prefixOk && !(typeof model === 'string' && model.startsWith(expectModelPrefix))) {
         errors.push(`unexpected model ${String(model)} on line ${n}`);
       }
-      if (line.isApiErrorMessage === true || has(line, 'error')) {
-        errors.push(`API error on line ${n}: ${has(line, 'error') ? String(line.error) : 'unknown'}`);
+      // Anything but an absent or literal-false isApiErrorMessage, any error key, any apiErrorStatus key.
+      const flagged = has(line, 'isApiErrorMessage') && line.isApiErrorMessage !== false;
+      if (flagged || has(line, 'error') || has(line, 'apiErrorStatus')) {
+        const detail = has(line, 'error')
+          ? String(line.error)
+          : has(line, 'apiErrorStatus')
+            ? `apiErrorStatus ${String(line.apiErrorStatus)}`
+            : `isApiErrorMessage ${JSON.stringify(line.isApiErrorMessage)}`;
+        errors.push(`API error on line ${n}: ${detail}`);
       }
       if (effortOk && line.effort !== expectEffort) {
         errors.push(`unexpected effort ${String(line.effort)} on line ${n}`);
       }
+      // null means "no per-turn override"; any real value must agree with the pinned effort too.
+      if (effortOk && has(line, 'perTurnEffort') && line.perTurnEffort !== null && line.perTurnEffort !== expectEffort) {
+        errors.push(`unexpected perTurnEffort ${String(line.perTurnEffort)} on line ${n}`);
+      }
     }
   }
 
+  // A resumed agent (or a message injected mid-run) means the ruling may answer a different input than
+  // the one whose digest the first prompt carries.
+  if (promptTurns > 1) errors.push('multiple prompts (agent was resumed); ruling cannot be bound to one input');
   if (asst.length === 0) errors.push('no assistant messages');
 
   // meta.json carries "model" only when the caller passed a per-call override, which beats the agent
@@ -185,8 +230,13 @@ export function proveModel({ jsonlText, metaText, expectModelPrefix, expectEffor
     }
     if (!isPlainObject(meta)) {
       errors.push('unparseable meta');
-    } else if (has(meta, 'model') && (expectMetaModel === null || meta.model !== expectMetaModel)) {
-      errors.push(`per-call model override present: ${String(meta.model)}`);
+    } else {
+      if (has(meta, 'model') && (expectMetaModel === null || meta.model !== expectMetaModel)) {
+        errors.push(`per-call model override present: ${String(meta.model)}`);
+      }
+      if (agentTypeGiven && typeof expectAgentType === 'string' && expectAgentType !== '' && meta.agentType !== expectAgentType) {
+        errors.push(`unexpected agent type ${String(meta.agentType)}`);
+      }
     }
   }
 
@@ -201,15 +251,19 @@ export function proveModel({ jsonlText, metaText, expectModelPrefix, expectEffor
     const closing = group[group.length - 1].line.message;
     finalStopReason = isPlainObject(closing) && closing.stop_reason !== undefined ? closing.stop_reason : null;
     finalAssistantText = group.flatMap((a) => textBlocks(a.line.message?.content)).join('\n');
-    if (finalStopReason !== 'end_turn') errors.push(`final message incomplete (stop_reason ${String(finalStopReason)})`);
+    if (finalStopReason !== 'end_turn') {
+      errors.push(`final message incomplete (stop_reason ${String(finalStopReason)})`);
+    } else if (finalAssistantText.trim() === '') {
+      errors.push('final message has no text');
+    }
   }
 
   return {
     ok: errors.length === 0,
     errors,
     assistantLines: asst.length,
-    models,
-    efforts,
+    models: Object.fromEntries(models),
+    efforts: Object.fromEntries(efforts),
     firstUserText: firstUserText ?? '',
     finalAssistantText,
     finalStopReason,

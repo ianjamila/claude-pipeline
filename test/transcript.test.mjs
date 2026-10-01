@@ -18,7 +18,7 @@ const prove = (name, extra = {}) =>
   });
 
 // Small in-memory builders for shapes that would clutter the fixture directory.
-const userLine = (content) => JSON.stringify({ type: 'user', message: { role: 'user', content } });
+const userLine = (content, extra = {}) => JSON.stringify({ type: 'user', message: { role: 'user', content }, ...extra });
 const asstLine = ({ id = 'msg_1', model = 'claude-fable-5-1', effort = 'high', stop = 'end_turn', content, ...rest }) =>
   JSON.stringify({ type: 'assistant', effort, message: { model, id, role: 'assistant', stop_reason: stop, content }, ...rest });
 const text = (t) => [{ type: 'text', text: t }];
@@ -51,10 +51,15 @@ test('fable-ok proves Fable at high effort and exposes prompt and ruling text', 
   assert.equal(rulings.rulings[0].ruling, 'REJECT');
 });
 
-test('wrong effort is reported once per offending line', () => {
+test('wrong effort is reported on every offending line, for both effort and perTurnEffort', () => {
   const r = prove('fable-wrong-effort');
   assert.equal(r.ok, false);
-  assert.deepEqual(r.errors, ['unexpected effort medium on line 2', 'unexpected effort medium on line 3']);
+  assert.deepEqual(r.errors, [
+    'unexpected effort medium on line 2',
+    'unexpected perTurnEffort medium on line 2',
+    'unexpected effort medium on line 3',
+    'unexpected perTurnEffort medium on line 3',
+  ]);
   assert.deepEqual(r.efforts, { medium: 2 });
 });
 
@@ -422,4 +427,203 @@ test('extractJsonBlock does not fall through to an earlier block when the last j
 
 test('extractJsonBlock ignores an unclosed fence (truncated output)', () => {
   assert.throws(() => extractJsonBlock('```json\n{"v":1'), /no JSON found/);
+});
+
+// ---------- hardening round ----------
+
+const TOOL_USE = [{ type: 'tool_use', id: 't', name: 'Read', input: {} }];
+const TOOL_RESULT = [{ type: 'tool_result', tool_use_id: 't', content: 'x' }];
+const MULTI = 'multiple prompts (agent was resumed); ruling cannot be bound to one input';
+
+test('a non-Fable MIDDLE assistant line fails even with Fable on the first and last lines', () => {
+  const r = proveText([
+    userLine('p'),
+    asstLine({ id: 'msg_1', stop: 'tool_use', content: TOOL_USE }),
+    userLine(TOOL_RESULT),
+    asstLine({ id: 'msg_2', model: 'claude-opus-5-5', stop: 'tool_use', content: TOOL_USE }),
+    userLine(TOOL_RESULT),
+    asstLine({ id: 'msg_3', content: text('done') }),
+  ]);
+  assert.equal(r.ok, false);
+  assert.deepEqual(r.errors, ['unexpected model claude-opus-5-5 on line 4']);
+  assert.deepEqual(r.models, { 'claude-fable-5-1': 2, 'claude-opus-5-5': 1 });
+});
+
+test('a wrong-effort or API-error MIDDLE assistant line fails too', () => {
+  const mid = (extra) => [
+    userLine('p'),
+    asstLine({ id: 'msg_1', stop: 'tool_use', content: TOOL_USE }),
+    userLine(TOOL_RESULT),
+    asstLine({ id: 'msg_2', stop: 'tool_use', content: TOOL_USE, ...extra }),
+    userLine(TOOL_RESULT),
+    asstLine({ id: 'msg_3', content: text('done') }),
+  ];
+  assert.deepEqual(proveText(mid({ effort: 'medium' })).errors, ['unexpected effort medium on line 4']);
+  assert.deepEqual(proveText(mid({ perTurnEffort: 'low' })).errors, ['unexpected perTurnEffort low on line 4']);
+  assert.deepEqual(proveText(mid({ apiErrorStatus: 529 })).errors, ['API error on line 4: apiErrorStatus 529']);
+});
+
+test('a resumed transcript with two prompt turns cannot be bound to one input', () => {
+  const r = proveText([
+    userLine('first prompt'),
+    asstLine({ id: 'msg_1', content: text('a') }),
+    userLine('second prompt'),
+    asstLine({ id: 'msg_2', content: text('b') }),
+  ]);
+  assert.equal(r.ok, false);
+  assert.deepEqual(r.errors, [MULTI]);
+  assert.equal(r.firstUserText, 'first prompt', 'firstUserText stays the first');
+});
+
+test('tool_result-only user lines are not prompt turns', () => {
+  const r = proveText([
+    userLine('p'),
+    asstLine({ id: 'msg_1', stop: 'tool_use', content: TOOL_USE }),
+    userLine(TOOL_RESULT),
+    asstLine({ id: 'msg_2', stop: 'tool_use', content: TOOL_USE }),
+    userLine(TOOL_RESULT),
+    asstLine({ id: 'msg_3', content: text('done') }),
+  ]);
+  assert.deepEqual(r.errors, []);
+});
+
+test('a second prompt as a text-block array, or text beside a tool_result, also counts', () => {
+  const second = (content) => proveText([userLine('p'), asstLine({ content: text('a') }), userLine(content), asstLine({ id: 'm2', content: text('b') })]);
+  assert.deepEqual(second([{ type: 'text', text: 'again' }]).errors, [MULTI]);
+  assert.deepEqual(second([...TOOL_RESULT, { type: 'text', text: 'and more' }]).errors, [MULTI]);
+  assert.deepEqual(second([{ type: 'image', source: {} }]).errors, [], 'no text block, no prompt');
+});
+
+test('harness-injected isMeta lines without an origin are not prompts; external or unmarked ones are', () => {
+  const second = (extra) => proveText([userLine('p'), asstLine({ content: text('a') }), userLine('<system-reminder>x</system-reminder>', extra), asstLine({ id: 'm2', content: text('b') })]);
+  assert.deepEqual(second({ isMeta: true }).errors, [], 'real transcripts carry many reminder lines like this');
+  assert.deepEqual(second({ isMeta: true, origin: { kind: 'coordinator' } }).errors, [MULTI], 'a message from another agent');
+  assert.deepEqual(second({ isMeta: 'true' }).errors, [MULTI], 'only a literal true is excused');
+  assert.deepEqual(second({ isMeta: false }).errors, [MULTI]);
+});
+
+test('firstUserText skips a leading harness reminder and returns the real prompt', () => {
+  const r = proveText([userLine('<system-reminder>ctx</system-reminder>', { isMeta: true }), userLine('ROUND: 1'), asstLine({ content: text('ok') })]);
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.firstUserText, 'ROUND: 1');
+});
+
+test('expectAgentType must equal meta.agentType when given', () => {
+  const lines = [userLine('p'), asstLine({ content: text('ok') })];
+  assert.deepEqual(proveText(lines, { metaText: '{"agentType":"arbiter"}', expectAgentType: 'arbiter' }).errors, []);
+  assert.deepEqual(proveText(lines, { metaText: '{"agentType":"judge"}', expectAgentType: 'arbiter' }).errors, ['unexpected agent type judge']);
+  assert.deepEqual(proveText(lines, { metaText: '{}', expectAgentType: 'arbiter' }).errors, ['unexpected agent type undefined']);
+  assert.deepEqual(proveText(lines, { metaText: '{"agentType":"judge"}' }).errors, [], 'not checked unless asked');
+  assert.deepEqual(proveText(lines, { metaText: '{"agentType":"arbiter"}', expectAgentType: '' }).errors, ['invalid expectation: expectAgentType']);
+  assert.equal(prove('fable-ok', { expectAgentType: 'arbiter' }).ok, true);
+  assert.deepEqual(prove('fable-ok', { expectAgentType: 'verifier' }).errors, ['unexpected agent type arbiter']);
+});
+
+test('perTurnEffort, when present and non-null, must also equal the expected effort', () => {
+  const one = (extra) => proveText([userLine('p'), asstLine({ content: text('ok'), ...extra })]);
+  assert.deepEqual(one({ perTurnEffort: 'low' }).errors, ['unexpected perTurnEffort low on line 2']);
+  assert.deepEqual(one({ perTurnEffort: 'high' }).errors, []);
+  assert.deepEqual(one({ perTurnEffort: null }).errors, [], 'null is the shape of a turn with no override');
+  assert.deepEqual(one({}).errors, []);
+});
+
+test('API-error markers fail on their own: odd isApiErrorMessage values and any apiErrorStatus', () => {
+  const one = (extra) => proveText([userLine('p'), asstLine({ content: text('ok'), ...extra })]);
+  assert.match(one({ isApiErrorMessage: 'true' }).errors[0], /^API error on line 2: /);
+  assert.match(one({ isApiErrorMessage: 1 }).errors[0], /^API error on line 2: /);
+  assert.match(one({ isApiErrorMessage: null }).errors[0], /^API error on line 2: /);
+  assert.deepEqual(one({ apiErrorStatus: 529 }).errors, ['API error on line 2: apiErrorStatus 529']);
+  assert.equal(one({ apiErrorStatus: null }).ok, false);
+  assert.deepEqual(one({ isApiErrorMessage: false }).errors, [], 'an explicit false is healthy');
+  assert.deepEqual(one({ isApiErrorMessage: true, error: 'overloaded', apiErrorStatus: 529 }).errors, ['API error on line 2: overloaded'], 'one error per line');
+});
+
+test('an end_turn final message with no text is a failure', () => {
+  const thinkingOnly = [{ type: 'thinking', thinking: 'hmm', signature: 's' }];
+  assert.deepEqual(proveText([userLine('p'), asstLine({ content: thinkingOnly })]).errors, ['final message has no text']);
+  assert.deepEqual(proveText([userLine('p'), asstLine({ content: text('  \n\t') })]).errors, ['final message has no text']);
+  assert.deepEqual(proveText([userLine('p'), asstLine({ content: [] })]).errors, ['final message has no text']);
+  assert.deepEqual(proveText([userLine('p'), asstLine({ content: text('x') })]).errors, []);
+  const cut = proveText([userLine('p'), asstLine({ stop: 'max_tokens', content: thinkingOnly })]);
+  assert.deepEqual(cut.errors, ['final message incomplete (stop_reason max_tokens)'], 'no second error for an already-incomplete message');
+});
+
+test('models and efforts counts survive keys that collide with Object.prototype', () => {
+  const lines = [
+    userLine('p'),
+    asstLine({ id: 'm1', model: '__proto__', effort: 'constructor', stop: 'tool_use', content: TOOL_USE }),
+    userLine(TOOL_RESULT),
+    asstLine({ id: 'm2', model: 'constructor', effort: 'constructor', stop: 'tool_use', content: TOOL_USE }),
+    userLine(TOOL_RESULT),
+    asstLine({ id: 'm3', model: 'constructor', effort: 'toString', content: text('x') }),
+  ];
+  const r = proveText(lines);
+  assert.equal(Object.hasOwn(r.models, '__proto__'), true);
+  assert.equal(Object.getOwnPropertyDescriptor(r.models, '__proto__').value, 1);
+  assert.equal(r.models.constructor, 2);
+  assert.equal(r.efforts.constructor, 2);
+  assert.equal(r.efforts.toString, 1);
+  assert.deepEqual(Object.keys(r.models).sort(), ['__proto__', 'constructor']);
+  assert.equal(r.ok, false);
+});
+
+test('equal mtimes tie-break on path, independent of creation order (by agent id)', () => {
+  const now = Date.now();
+  for (const order of [['sess-a', 'sess-b'], ['sess-b', 'sess-a']]) {
+    const root = mkRoot();
+    const made = {};
+    for (const s of order) made[s] = put(root, 'p', s, 'tie10001', { meta: metaFor(s), ageMs: 1000, now });
+    const r = findSubagentTranscript({ agentId: 'tie10001', projectsDir: root, now });
+    assert.equal(r.jsonlPath, made['sess-b'].jsonlPath, `created ${order.join(',')}`);
+  }
+});
+
+test('equal mtimes tie-break on path, independent of creation order (by tag)', () => {
+  const now = Date.now();
+  for (const order of [['sess-a', 'sess-b'], ['sess-b', 'sess-a']]) {
+    const root = mkRoot();
+    const made = {};
+    for (const s of order) made[s] = put(root, 'p', s, `tie2000${s.slice(-1)}`, { meta: metaFor(TAG), ageMs: 1000, now });
+    const r = findSubagentTranscript({ tag: TAG, projectsDir: root, now });
+    assert.equal(r.metaPath, made['sess-b'].metaPath, `created ${order.join(',')}`);
+  }
+});
+
+test('files dated in the future are ignored (beyond a 60 s clock-skew allowance)', () => {
+  const now = Date.now();
+  const root = mkRoot();
+  put(root, 'p', 'future', 'fut10001', { meta: metaFor(TAG), ageMs: -120e3, now });
+  assert.equal(findSubagentTranscript({ tag: TAG, projectsDir: root, now }), null, 'tag: future meta');
+  assert.equal(findSubagentTranscript({ agentId: 'fut10001', projectsDir: root, now }), null, 'agentId: future jsonl');
+  const nearRoot = mkRoot();
+  const near = put(nearRoot, 'p', 'near', 'fut10002', { meta: metaFor(TAG), ageMs: -30e3, now });
+  assert.equal(findSubagentTranscript({ tag: TAG, projectsDir: nearRoot, now }).metaPath, near.metaPath, '30 s skew is tolerated');
+  // A future-dated stale copy must not shadow the legitimate newest one.
+  const root2 = mkRoot();
+  put(root2, 'p', 'future', 'fut10003', { meta: metaFor(TAG), ageMs: -10 * 60e3, now });
+  const ok = put(root2, 'p', 'ok', 'fut10004', { meta: metaFor(TAG), ageMs: 1000, now });
+  assert.equal(findSubagentTranscript({ tag: TAG, projectsDir: root2, now }).metaPath, ok.metaPath);
+});
+
+test('bad call shapes and non-finite numbers return null instead of throwing', () => {
+  const root = mkRoot();
+  const now = Date.now();
+  put(root, 'p', 's', 'bad10001', { meta: metaFor(TAG), now, ageMs: 1000 });
+  for (const bad of [null, undefined, 'x', 42, [], () => {}]) {
+    assert.equal(findSubagentTranscript(bad), null, String(bad));
+  }
+  for (const badNum of [NaN, Infinity, -Infinity, null, '1', {}]) {
+    assert.equal(findSubagentTranscript({ agentId: 'bad10001', projectsDir: root, now: badNum }), null, `agentId now=${String(badNum)}`);
+    assert.equal(findSubagentTranscript({ tag: TAG, projectsDir: root, now: badNum }), null, `tag now=${String(badNum)}`);
+    assert.equal(findSubagentTranscript({ agentId: 'bad10001', projectsDir: root, maxAgeMs: badNum }), null, `agentId maxAgeMs=${String(badNum)}`);
+    assert.equal(findSubagentTranscript({ tag: TAG, projectsDir: root, maxAgeMs: badNum }), null, `tag maxAgeMs=${String(badNum)}`);
+  }
+  for (const badDir of [null, 42, '', {}]) {
+    assert.equal(findSubagentTranscript({ tag: TAG, projectsDir: badDir }), null, `projectsDir=${String(badDir)}`);
+  }
+  for (const badId of [42, {}, [], true]) {
+    assert.equal(findSubagentTranscript({ agentId: badId, projectsDir: root }), null);
+  }
+  assert.equal(findSubagentTranscript({ tag: 42, projectsDir: root }), null);
+  assert.ok(findSubagentTranscript({ tag: TAG, projectsDir: root, now }), 'sanity: valid input still finds it');
 });
