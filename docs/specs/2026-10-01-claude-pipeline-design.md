@@ -591,3 +591,32 @@ runner verified by `model-proof`.
 
 Bot identity (would add notifications + server-side human approval), plugin packaging,
 Slack/push notifications, DRMed onboarding (prompt in README).
+
+## 16. Amendments found while planning (2026-10-01)
+
+1. **Tamper-proof guard jobs.** `pull_request` runs the workflow file from the PR, so a PR could
+   rewrite `Test integrity` / `Hard-stop scan` to pass. `pipeline-guards.yml` therefore uses
+   `pull_request_target` (workflow + scripts + `pipeline.yml` from the **base** branch; never
+   checks out or executes PR code — it only fetches `refs/pull/N/head` and reads the diff), with
+   `permissions: {contents: read, statuses: write, pull-requests: read}`, and posts **commit
+   statuses** with contexts `Test integrity` and `Hard-stop scan` on the PR head SHA (statuses
+   are bound to the head SHA regardless of which ref the run is attached to). Required checks
+   reference those status contexts. Residual risk (adversarial only): a PR-defined workflow could
+   post a fake status with the same context; documented. Workflow reviewed with the
+   `gha-security-review` skill.
+2. **Long-running commands.** Bash tool calls cap at 10 minutes, and subagents cannot rely on
+   background notifications. `pipeline job start <name> -- <cmd>` runs a command detached
+   (log, exit code, timestamps under `.review/jobs/<name>/`); `pipeline job wait <name>
+   --timeout 540` blocks ≤ 9 min and returns `{state: running|done, exitCode, tail}`. Used for
+   full verify, the merge gate (polls up to 30 min), and prod-watch.
+3. **Test seam.** All `gh` calls go through `PIPELINE_GH` (default `gh`) so CLI tests run a fake gh.
+4. **Hook command form.** Use the exec form (`command` + `args`) if Claude Code 2.1.285 honours
+   it (verified in the plan before use); otherwise `node "<abs path>"`.
+5. **Stop hook speed.** Quick verify uses incremental `tsc` (`--incremental`, build info in
+   `.verify/`) and the fast pre-push guard set; hook `timeout: 900`.
+6. **Vendoring.** `pipeline vendor --repo DIR` copies the CI-side libs (config, glob, diff,
+   hardstops, integrity, yaml) into `<repo>/scripts/pipeline/` with a VERSION stamp; the
+   project copy is what CI runs. `pipeline vendor --check` reports drift.
+7. **Global allowlist.** The installer adds `Bash(node <abs>/.claude/pipeline/bin/pipeline.mjs:*)`
+   to `~/.claude/settings.json` `permissions.allow`; project settings allow
+   `Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)` as typed by the skills.
