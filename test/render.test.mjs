@@ -89,13 +89,12 @@ test('triageComment: items still waiting show as pending, and needs-human is fla
   assert.match(rows[2], /\| REJECT \(needs human\) \| arbiter \| low \|/);
 });
 
-test('triageComment: pipes in cells are escaped so a row never gains columns', () => {
+test('triageComment: pipes in cells become &#124; so a row never gains columns', () => {
   const s = stateWith([[item({ id: 'R1-B1', title: 'a | b || c', final: final('REJECT', 'judge', 'x | y') })]]);
   const row = triageComment(s).split('\n').find((l) => l.startsWith('| 1 | R1-B1'));
-  assert.ok(row.includes('a \\| b \\|\\| c'), row);
-  assert.ok(row.includes('x \\| y'), row);
-  const cells = row.slice(1, -1).split(/(?<!\\)\|/);
-  assert.equal(cells.length, 8, row);
+  assert.ok(row.includes('a &#124; b &#124;&#124; c'), row);
+  assert.ok(row.includes('x &#124; y'), row);
+  assert.equal(row.slice(1, -1).split('|').length, 8, 'exactly the 8 delimiters-separated cells, no stray pipe');
 });
 
 test('triageComment: newlines are flattened, Finding is cut at 80 chars and Reason at 120', () => {
@@ -349,7 +348,8 @@ test('blockedComment: renders the verify report as a step table with the failure
   assert.equal(rows.length, 3);
   assert.ok(rows[0].includes('pass') && rows[0].includes('1.5s'));
   assert.ok(rows[1].includes('fail') && rows[1].includes('23.4s'));
-  assert.ok(rows[1].includes('tsc \\| tee x'), 'pipes in commands are escaped');
+  assert.ok(rows[1].includes('tsc &#124; tee x'), 'pipes in commands are escaped');
+  assert.equal(rows[1].slice(1, -1).split('|').length, 4, 'no stray pipe adds a column');
   assert.ok(rows[2].includes('not-run'));
   assert.ok(body.includes('error TS2322'));
   // The excerpt sits in a fence longer than any backtick run inside it.
@@ -383,8 +383,201 @@ test('agentLogLine: exact one-line format', () => {
   );
 });
 
-test('agentLogLine: titles lose newlines and pipes so the log stays one line per run', () => {
+test('agentLogLine: titles lose newlines and keep their pipes (escaped) so the log stays one line per run', () => {
   const line = agentLogLine({ date: '2026-10-01', pr: 5, title: 'Fix a | b\nsecond line\r\nthird', risk: 'high', rounds: 3, arbiterCalls: 0, outcome: 'needs-human' });
   assert.ok(!line.includes('\n') && !line.includes('\r') && !line.includes('|'), line);
-  assert.equal(line, '- 2026-10-01 · #5 · Fix a b second line third · risk high · rounds 3 · arbiter 0 · needs-human');
+  assert.equal(line, '- 2026-10-01 · #5 · Fix a &#124; b second line third · risk high · rounds 3 · arbiter 0 · needs-human');
+});
+
+// ---- review fixes: defusing untrusted text --------------------------------------------------
+
+// Every value that can come from a model, the diff or a report is rendered through one defuse
+// step. For each one we plant a recognisable token inside "<!--", "-->" and "@mention" bait and
+// check (a) the value was really rendered and (b) none of the bait survives in raw form.
+const bait = (t) => `<!-- ${t} --> @${t}`;
+const STATE_MARKER = /<!-- claude-pipeline:state:[A-Za-z0-9+/=]+ -->/g;
+
+function assertDefused(body, token, label) {
+  assert.ok(body.includes(token), `${label}: value was not rendered at all`);
+  const rest = body.replace(/^<!-- claude-pipeline:[a-z-]+ -->/, '').replace(STATE_MARKER, '');
+  assert.ok(!rest.includes('<!--'), `${label}: raw "<!--" survived`);
+  assert.ok(!rest.includes('-->'), `${label}: raw "-->" survived`);
+  assert.ok(!rest.includes('@'), `${label}: raw "@" survived`);
+  assert.equal(body.split('\n')[0].match(/^<!-- claude-pipeline:[a-z-]+ -->$/) !== null, true, `${label}: first line is still the marker`);
+}
+
+// Sets obj.a.b = value; skips (returns false) when the parent object does not exist on this item.
+function setPath(obj, path, value) {
+  const keys = path.split('.');
+  let o = obj;
+  for (const k of keys.slice(0, -1)) {
+    if (o[k] === null || typeof o[k] !== 'object') return false;
+    o = o[k];
+  }
+  o[keys.at(-1)] = value;
+  return true;
+}
+
+test('triageComment: every cell is defused (<!--, -->, @)', () => {
+  const fields = ['id', 'bucket', 'title', 'final.decision', 'final.by', 'final.reason'];
+  for (const f of fields) {
+    const it = item({ id: 'R1-B1', judge: judge('ACCEPT'), arbiter: null, final: final('ACCEPT') });
+    setPath(it, f, bait(`tok${f.replace('.', '')}`));
+    assertDefused(triageComment(stateWith([[it]])), `tok${f.replace('.', '')}`, f);
+  }
+  // Cells that only render while the item is still waiting, or when an arbiter ruling exists.
+  const pending = item({ id: 'R1-B2', judge: { ...judge('ACCEPT'), decision: bait('tokjd'), confidence: bait('tokjc'), reason: bait('tokjr') } });
+  const body = triageComment(stateWith([[pending]]));
+  for (const t of ['tokjd', 'tokjc', 'tokjr']) assertDefused(body, t, t);
+  const ruled = item({ id: 'R1-B3', arbiter: { ruling: 'ACCEPT', confidence: bait('tokac'), reasoning: 'r', transcript: 't' }, final: final('ACCEPT') });
+  assertDefused(triageComment(stateWith([[ruled]])), 'tokac', 'arbiter.confidence');
+  const fileOnly = item({ id: 'R1-B4', title: '', file: bait('tokfile'), final: final('ACCEPT') });
+  assertDefused(triageComment(stateWith([[fileOnly]])), 'tokfile', 'file used as the finding');
+  // The round number comes from the state, which a hand-edited comment can fill with anything.
+  const oddRound = addRound(emptyState({ repo: 'o/r', pr: 1, branch: 'b', risk: 'low', lightLane: false, maxRounds: 3 }), {
+    n: bait('toknround'), fromHead: 'a', toHead: 'b', contentHashAtToHead: 'h', items: [item({ id: 'R1-B5', final: final('ACCEPT') })],
+  });
+  assertDefused(triageComment(oddRound), 'toknround', 'round number');
+});
+
+test('triageComment: a missing decision (invalid judge output) renders without crashing', () => {
+  const it = item({ id: 'R1-B1', final: { decision: null, by: 'judge', needsHuman: true, reason: 'invalid judge output' } });
+  const row = triageComment(stateWith([[it]])).split('\n').find((l) => l.startsWith('| 1 | R1-B1'));
+  assert.match(row, /\| unknown \(needs human\) \| judge \|/);
+  assert.ok(row.includes('invalid judge output'));
+});
+
+test('summaryComment: every item field and option is defused in every section', () => {
+  const itemFields = ['id', 'title', 'file', 'line', 'bucket', 'category', 'codexReasoning', 'judge.decision', 'judge.reason', 'arbiter.ruling', 'arbiter.confidence', 'arbiter.reasoning', 'final.reason', 'final.by', 'final.decision'];
+  for (const f of itemFields) {
+    const token = `tok${f.replace('.', '')}`;
+    // One item that is an arbiter ruling, an implemented fix, and (via a twin) a rejection.
+    const ruled = item({ id: 'R1-B1', fingerprint: 'a', judge: judge('REJECT'), arbiter: { ruling: 'ACCEPT', confidence: 'high', reasoning: 'r', transcript: 't' }, final: final('ACCEPT', 'arbiter', 'why'), implemented: true });
+    const rejected = item({ id: 'R1-S1', bucket: 'SUGGESTION', fingerprint: 'b', judge: judge('REJECT', 'low'), final: final('REJECT', 'judge', 'no') });
+    // A strong disagreement settled by a test: the only place final.decision / final.by are printed.
+    const strong = item({ id: 'R1-B2', bucket: 'BLOCKING', fingerprint: 'c', judge: judge('REJECT'), final: final('REJECT', 'test', 'disproved') });
+    const hit = [ruled, rejected, strong].map((it) => setPath(it, f, bait(token)));
+    assert.ok(hit.some(Boolean), `${f} applies to at least one fixture item`);
+    assertDefused(summaryComment(stateWith([[ruled, rejected, strong]]), { outcome: 'merged', built: 'x' }), token, f);
+  }
+});
+
+test('summaryComment: built, outcome, follow-ups and model proofs are defused', () => {
+  const s = stateWith([[]]);
+  const run = (opts) => summaryComment(s, { outcome: 'merged', built: 'x', ...opts });
+  assertDefused(run({ built: bait('tokbuilt') }), 'tokbuilt', 'built');
+  assertDefused(run({ built: `line one\n${bait('tokbuilt2')}` }), 'tokbuilt2', 'multi-line built');
+  assertDefused(run({ outcome: bait('tokoutcome') }), 'tokoutcome', 'outcome');
+  assertDefused(run({ followups: [bait('tokfustr')] }), 'tokfustr', 'follow-up string');
+  for (const f of ['id', 'title', 'url']) {
+    const fu = { id: 'R1-S1', title: 'T', url: 'https://github.com/o/r/issues/1' };
+    fu[f] = bait(`tokfu${f}`);
+    assertDefused(run({ followups: [fu] }), `tokfu${f}`, `follow-up ${f}`);
+  }
+  // With no title the issue number stands in for it.
+  assertDefused(run({ followups: [{ id: 'R1-S1', url: 'https://github.com/o/r/issues/1', number: bait('tokfunumber') }] }), 'tokfunumber', 'follow-up number');
+  for (const f of ['transcript', 'models', 'effort']) {
+    const p = { transcript: 't', models: 'm', effort: 'high' };
+    p[f] = bait(`tokmp${f}`);
+    assertDefused(run({ modelProofs: [p] }), `tokmp${f}`, `model proof ${f}`);
+  }
+  assertDefused(run({ modelProofs: [{ transcript: 't', models: { [bait('tokmpkey')]: 2 } }] }), 'tokmpkey', 'model proof object key');
+  assertDefused(run({ modelProofs: [{ transcript: 't', models: { m: bait('tokmpcount') } }] }), 'tokmpcount', 'model proof object count');
+  assertDefused(run({ modelProofs: [{ transcript: 't', models: [bait('tokmparr')] }] }), 'tokmparr', 'model proof array');
+  assertDefused(run({ modelProofs: [{ transcript: 't', models: [{ model: bait('tokmpam'), count: 1 }] }] }), 'tokmpam', 'model proof array model');
+  assertDefused(run({ modelProofs: [{ transcript: 't', models: [{ model: 'm', count: bait('tokmpac') }] }] }), 'tokmpac', 'model proof array count');
+  assertDefused(run({ modelProofs: [{ transcript: 't', model: bait('tokmpm'), count: 2 }] }), 'tokmpm', 'model proof model');
+  assertDefused(run({ modelProofs: [{ transcript: 't', model: 'm', count: bait('tokmpc') }] }), 'tokmpc', 'model proof model count');
+  assertDefused(run({ modelProofs: [{ transcript: 't', model: bait('tokmpn') }] }), 'tokmpn', 'model proof model without count');
+  // Follow-up issues recorded on the items.
+  const fromItem = stateWith([[item({ id: 'R1-S1', bucket: 'SUGGESTION', final: final('FOLLOW-UP'), followupIssue: bait('tokfi') })]]);
+  assertDefused(summaryComment(fromItem, { outcome: 'merged', built: 'x' }), 'tokfi', 'followupIssue');
+});
+
+test('summaryComment: follow-ups are links only for https://github.com/ URLs, anything else is plain defused text', () => {
+  const s = stateWith([[]]);
+  const fuSection = (url) => section(summaryComment(s, { outcome: 'merged', built: 'x', followups: [{ id: 'R1-S1', title: 'Later', url }] }), '### Follow-up issues');
+  const link = fuSection('https://github.com/o/r/issues/45');
+  assert.ok(link.includes('[Later](https://github.com/o/r/issues/45)'), link);
+  for (const bad of [
+    'http://github.com/o/r/issues/1',
+    'https://evil.example/o/r/issues/1',
+    'https://github.com.evil.example/x',
+    'https://github.com',
+    'javascript:alert(1)',
+    'https://github.com/o/r/issues/1) [click](http://evil.example',
+    'https://github.com/o/r/issues/1 extra',
+    'https://github.com/@octocat/x',
+    '//github.com/o/r',
+    '',
+  ]) {
+    const out = fuSection(bad);
+    // Outside code spans there must be no link syntax at all; the URL itself is shown inert, inside one.
+    const outsideCode = out.replace(/`[^`\n]*`/g, '');
+    assert.ok(!outsideCode.includes(']('), `no link for ${JSON.stringify(bad)}: ${out}`);
+    assert.ok(!outsideCode.includes('http'), `URL not left bare for ${JSON.stringify(bad)}: ${out}`);
+    if (bad) assert.match(out, /`[^`]+`/, 'shown in a code span');
+    assert.ok(!out.includes('@'), 'plain text is defused too');
+  }
+  // Same rule for the issue recorded on an item and for bare-string follow-ups.
+  const fromItem = stateWith([[item({ id: 'R1-S1', bucket: 'SUGGESTION', title: 'Later', final: final('FOLLOW-UP'), followupIssue: 'http://evil.example/1' })]]);
+  assert.ok(!section(summaryComment(fromItem, { outcome: 'merged', built: 'x' }), '### Follow-up issues').includes(']('));
+  const okItem = stateWith([[item({ id: 'R1-S1', bucket: 'SUGGESTION', title: 'Later', final: final('FOLLOW-UP'), followupIssue: 'https://github.com/o/r/issues/3' })]]);
+  assert.ok(section(summaryComment(okItem, { outcome: 'merged', built: 'x' }), '### Follow-up issues').includes('](https://github.com/o/r/issues/3)'));
+});
+
+test('summaryComment: Suggestions implemented lists only ACCEPT items that are implemented', () => {
+  const done = item({ id: 'R1-S1', bucket: 'SUGGESTION', title: 'Done thing', final: final('ACCEPT'), implemented: true });
+  const notYet = item({ id: 'R1-S2', bucket: 'SUGGESTION', title: 'Not yet thing', final: final('ACCEPT'), implemented: false });
+  const followup = item({ id: 'R1-S3', bucket: 'SUGGESTION', title: 'Later thing', final: final('FOLLOW-UP'), implemented: true });
+  const impl = section(summaryComment(stateWith([[done, notYet, followup]]), { outcome: 'merged', built: 'x' }), '### Suggestions implemented');
+  assert.ok(impl.includes('Done thing') && impl.includes('(round 1)'));
+  assert.ok(!impl.includes('Not yet thing'), impl);
+  assert.ok(!impl.includes('Later thing'), impl);
+  const none = section(summaryComment(stateWith([[notYet]]), { outcome: 'merged', built: 'x' }), '### Suggestions implemented');
+  assert.ok(none.includes('_None_'));
+});
+
+test('needsHumanComment: reasons, hits and the verified/reviewed text are defused', () => {
+  const run = (o) => needsHumanComment({ reasons: ['r'], verified: true, reviewed: true, ...o });
+  assertDefused(run({ reasons: [bait('tokr1'), bait('tokr2')] }), 'tokr2', 'reasons array');
+  assertDefused(run({ reasons: bait('tokrstr') }), 'tokrstr', 'reasons string');
+  assertDefused(run({ hits: [{ rule: bait('tokrule'), file: 'f' }] }), 'tokrule', 'hit rule');
+  assertDefused(run({ hits: [{ rule: 'r', file: bait('tokfile') }] }), 'tokfile', 'hit file');
+  assertDefused(run({ hits: [bait('tokhitstr')] }), 'tokhitstr', 'hit string');
+  assertDefused(run({ verified: bait('tokver') }), 'tokver', 'verified');
+  assertDefused(run({ reviewed: bait('tokrev') }), 'tokrev', 'reviewed');
+  assert.ok(run({}).endsWith('To approve: review, add the `human-approved` label, then merge.'));
+});
+
+test('blockedComment: every report field is defused, including exitCode and the excerpt', () => {
+  const mk = (stepOver, reportOver = {}) => ({
+    mode: 'full', ok: false, git: { head: 'abcdef1' },
+    steps: [{ name: 'unit', status: 'fail', durationMs: 1000, command: 'vitest', exitCode: 1, errorExcerpt: 'boom', ...stepOver }],
+    ...reportOver,
+  });
+  for (const f of ['name', 'status', 'command', 'exitCode', 'errorExcerpt']) {
+    assertDefused(blockedComment(mk({ [f]: bait(`tokb${f}`) })), `tokb${f}`, f);
+  }
+  assertDefused(blockedComment(mk({}, { mode: bait('tokbmode') })), 'tokbmode', 'mode');
+  const head = blockedComment(mk({}, { git: { head: '<!--@hd' } }));
+  assertDefused(head, '&lt;!--', 'head');
+  // An excerpt with several lines and fence-breaking text stays defused on every line.
+  const multi = blockedComment(mk({ errorExcerpt: `first\n${bait('tokbx1')}\n\`\`\`\n${bait('tokbx2')}` }));
+  assertDefused(multi, 'tokbx2', 'multi-line excerpt');
+});
+
+test('awaitingReviewComment: the reason is defused', () => {
+  assertDefused(awaitingReviewComment(bait('tokwait')), 'tokwait', 'reason');
+});
+
+test('agentLogLine: every field is sanitised to a single line without markers or mentions', () => {
+  const base = { date: '2026-10-01', pr: 1, title: 't', risk: 'low', rounds: 1, arbiterCalls: 0, outcome: 'merged' };
+  for (const f of Object.keys(base)) {
+    const token = `toka${f}`;
+    const line = agentLogLine({ ...base, [f]: `${bait(token)}\nsecond\r\nthird` });
+    assert.ok(line.includes(token), `${f} rendered`);
+    assert.ok(!/[\r\n]/.test(line), `${f}: one line`);
+    assert.ok(!line.includes('<!--') && !line.includes('-->') && !line.includes('@'), `${f}: ${line}`);
+  }
 });

@@ -1,9 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readdirSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, writeFileSync, mkdirSync, rmSync, utimesSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
+import { renameSync as realRename } from 'node:fs';
 import {
   emptyState,
   loadState,
@@ -167,7 +168,7 @@ test('decodeFromComment returns null for garbage and never throws', () => {
 
 test('decodeFromComment refuses a decompression bomb instead of exhausting memory', () => {
   // Valid JSON, so only the size cap (not a parse failure) can be what rejects it.
-  const json = `{"pad":"${'a'.repeat(64 * 1024 * 1024)}"}`;
+  const json = `{"pr":1,"rounds":[],"pad":"${'a'.repeat(64 * 1024 * 1024)}"}`;
   const bomb = gzipSync(Buffer.from(json)).toString('base64');
   assert.ok(bomb.length < 200_000, 'the comment itself is small');
   assert.equal(decodeFromComment(`<!-- claude-pipeline:state:${bomb} -->`), null);
@@ -208,4 +209,145 @@ test('updateItems replaces items by id within round n, keeps the rest, and does 
 
 test('updateItems throws for a round that does not exist', () => {
   assert.throws(() => updateItems(sampleState(), 9, []), /round 9/i);
+});
+
+// ---- review fixes: fail-closed state handling ------------------------------------------------
+
+test('addRound requires items to be an array', () => {
+  const s = emptyState({ repo: 'o/r', pr: 1, branch: 'b', risk: 'low', lightLane: false, maxRounds: 3 });
+  const base = { n: 1, fromHead: 'a', toHead: 'b', contentHashAtToHead: 'h' };
+  for (const items of [undefined, null, 'x', {}, 7, { length: 0 }]) {
+    assert.throws(() => addRound(s, { ...base, items }), /items/i, String(items));
+  }
+  assert.equal(addRound(s, { ...base, items: [] }).rounds.length, 1);
+});
+
+test('loadState throws on a file that parses to anything other than a plain object', () => {
+  const dir = tmp();
+  try {
+    mkdirSync(join(dir, '.review'));
+    for (const text of ['[]', 'null', '"a string"', '42', 'true', '[{"rounds":[]}]']) {
+      writeFileSync(join(dir, '.review', 'state.json'), text);
+      assert.throws(() => loadState(dir), /corrupt review state/i, text);
+    }
+    writeFileSync(join(dir, '.review', 'state.json'), '{"rounds":[]}');
+    assert.deepEqual(loadState(dir), { rounds: [] });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('decodeFromComment returns null unless the state has a rounds array and a positive integer pr', () => {
+  const enc = (v) => encodeForComment(v);
+  const good = { pr: 12, rounds: [] };
+  assert.deepEqual(decodeFromComment(enc(good)), good);
+  const bad = [
+    {}, { pr: 12 }, { rounds: [] },
+    { pr: 12, rounds: {} }, { pr: 12, rounds: 'x' }, { pr: 12, rounds: null },
+    { pr: 0, rounds: [] }, { pr: -3, rounds: [] }, { pr: 1.5, rounds: [] },
+    { pr: '12', rounds: [] }, { pr: null, rounds: [] }, { pr: NaN, rounds: [] }, { pr: Infinity, rounds: [] },
+  ];
+  for (const b of bad) assert.equal(decodeFromComment(enc(b)), null, JSON.stringify(b));
+});
+
+test('saveState retries a rename that fails with EPERM, EBUSY or EACCES, waiting 50 ms between tries', () => {
+  for (const code of ['EPERM', 'EBUSY', 'EACCES']) {
+    const dir = tmp();
+    try {
+      const s = sampleState();
+      let calls = 0;
+      const waits = [];
+      const rename = (from, to) => {
+        calls += 1;
+        if (calls <= 3) throw Object.assign(new Error('locked'), { code });
+        return realRename(from, to);
+      };
+      saveState(dir, s, { rename, sleep: (ms) => waits.push(ms) });
+      assert.equal(calls, 4, code);
+      assert.deepEqual(waits, [50, 50, 50], code);
+      assert.deepEqual(loadState(dir), s);
+      assert.deepEqual(readdirSync(join(dir, '.review')), ['state.json']);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test('saveState gives up after 20 retries, throws the rename error and removes its tmp file', () => {
+  const dir = tmp();
+  try {
+    const s = sampleState();
+    saveState(dir, s);
+    let calls = 0;
+    let waits = 0;
+    const rename = () => {
+      calls += 1;
+      throw Object.assign(new Error('still locked'), { code: 'EBUSY' });
+    };
+    assert.throws(() => saveState(dir, addRound(s, { n: 2, fromHead: 'x', toHead: 'y', contentHashAtToHead: 'h', items: [] }), { rename, sleep: () => { waits += 1; } }), /still locked/);
+    assert.equal(calls, 21, 'first try plus 20 retries');
+    assert.equal(waits, 20);
+    assert.deepEqual(readdirSync(join(dir, '.review')), ['state.json']);
+    assert.deepEqual(loadState(dir), s, 'old state intact');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('saveState does not retry an error that is not a transient lock', () => {
+  const dir = tmp();
+  try {
+    let calls = 0;
+    const rename = () => {
+      calls += 1;
+      throw Object.assign(new Error('disk gone'), { code: 'EIO' });
+    };
+    assert.throws(() => saveState(dir, sampleState(), { rename, sleep: () => assert.fail('must not wait') }), /disk gone/);
+    assert.equal(calls, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('loadState removes stray state.json.*.tmp files older than an hour, and only those', () => {
+  const dir = tmp();
+  try {
+    const rd = join(dir, '.review');
+    mkdirSync(rd);
+    const old = new Date(Date.now() - 2 * 3600 * 1000);
+    const recent = new Date(Date.now() - 10 * 60 * 1000);
+    const put = (name, when) => {
+      writeFileSync(join(rd, name), 'x');
+      utimesSync(join(rd, name), when, when);
+    };
+    put('state.json.111.aaaa.tmp', old);
+    put('state.json.222.bbbb.tmp', recent);
+    put('other.tmp', old);
+    put('notes.txt', old);
+    writeFileSync(join(rd, 'state.json'), JSON.stringify({ pr: 1, rounds: [] }));
+    utimesSync(join(rd, 'state.json'), old, old);
+    assert.deepEqual(loadState(dir), { pr: 1, rounds: [] });
+    assert.equal(existsSync(join(rd, 'state.json.111.aaaa.tmp')), false, 'old stray tmp removed');
+    assert.equal(existsSync(join(rd, 'state.json.222.bbbb.tmp')), true, 'recent tmp may be a live write');
+    assert.equal(existsSync(join(rd, 'other.tmp')), true);
+    assert.equal(existsSync(join(rd, 'notes.txt')), true);
+    assert.equal(existsSync(join(rd, 'state.json')), true, 'the state itself is never touched');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('loadState cleans stray tmp files even when there is no state.json yet', () => {
+  const dir = tmp();
+  try {
+    const rd = join(dir, '.review');
+    mkdirSync(rd);
+    writeFileSync(join(rd, 'state.json.9.cccc.tmp'), 'x');
+    const old = new Date(Date.now() - 3 * 3600 * 1000);
+    utimesSync(join(rd, 'state.json.9.cccc.tmp'), old, old);
+    assert.equal(loadState(dir), null);
+    assert.deepEqual(readdirSync(rd), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

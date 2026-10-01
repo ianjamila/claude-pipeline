@@ -1,9 +1,11 @@
 // PR comments rendered from the review state. Pure string builders: no IO, no clock. Each comment
 // starts with an HTML-comment marker so the pipeline can find and update its own comment in place.
 //
-// Anything that came from a model or from the diff (titles, reasons, excerpts) is untrusted text:
-// it is flattened to one line, pipes are escaped in table cells, and "<!--" is defused so a
-// finding can never forge a marker the pipeline would later look for.
+// Anything that came from a model, the diff or a report (titles, reasons, excerpts, URLs, exit codes)
+// is untrusted text. Every such value goes through defuse(): "<!--" and "-->" become entities so a
+// finding can never forge or close a marker the pipeline looks for, and "@" becomes the fullwidth
+// commercial at (U+FF20) so it can never notify anyone (it looks the same, also inside code).
+// Single-line values are flattened, and pipes in table cells become &#124;.
 import { encodeForComment } from './state.mjs';
 
 export const MARKERS = {
@@ -18,7 +20,7 @@ const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
 
 // ---- text hygiene ---------------------------------------------------------------------------
 
-const defuse = (s) => s.replace(/<!--/g, '&lt;!--');
+const defuse = (s) => s.replace(/<!--/g, '&lt;!--').replace(/-->/g, '--&gt;').replace(/@/g, '\uFF20');
 const flat = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
 const clip = (s, max) => {
   const chars = Array.from(s); // by code point, so an emoji is never cut in half
@@ -27,7 +29,7 @@ const clip = (s, max) => {
 // One line of prose for a list item.
 const line = (s, max = Infinity) => defuse(clip(flat(s), max));
 // One markdown table cell.
-const cell = (s, max = Infinity) => line(s, max).replace(/\|/g, '\\|');
+const cell = (s, max = Infinity) => line(s, max).replace(/\|/g, '&#124;');
 
 // ---- triage comment -------------------------------------------------------------------------
 
@@ -36,13 +38,13 @@ const TRIAGE_HEADER = '| Round | ID | Bucket | Finding | Decision | By | Conf. |
 function triageRow(n, item) {
   const { final, judge, arbiter } = item;
   let decision = 'pending';
-  if (final) decision = `${final.decision}${final.needsHuman ? ' (needs human)' : ''}`;
+  if (final) decision = `${final.decision ?? 'unknown'}${final.needsHuman ? ' (needs human)' : ''}`;
   else if (judge) decision = `${judge.decision} (pending)`;
   const by = final?.by ?? '—';
   const conf = arbiter?.confidence ?? judge?.confidence ?? '—';
   const reason = final?.reason ?? judge?.reason ?? '';
   const finding = item.title || item.file || '';
-  return `| ${n} | ${cell(item.id)} | ${cell(item.bucket)} | ${cell(finding, 80)} | ${cell(decision)} | ${cell(by)} | ${cell(conf)} | ${cell(reason, 120)} |`;
+  return `| ${cell(n)} | ${cell(item.id)} | ${cell(item.bucket)} | ${cell(finding, 80)} | ${cell(decision)} | ${cell(by)} | ${cell(conf)} | ${cell(reason, 120)} |`;
 }
 
 export function triageComment(state) {
@@ -74,20 +76,20 @@ function unique(entries) {
 }
 
 function findingLabel(item) {
-  const where = item.file ? ` (\`${line(item.file)}${item.line ? `:${item.line}` : ''}\`)` : '';
+  const where = item.file ? ` (${line(item.file)}${item.line ? `:${line(item.line)}` : ''})` : '';
   return `**${line(item.id)}** ${line(item.title, 100)}${where}`;
 }
 
 const codexView = (item) =>
-  `Codex: ${item.bucket}${item.category ? ` (${line(item.category)})` : ''} — ${line(item.codexReasoning || item.detail, 200)}`;
-const opusView = (item) => (item.judge ? `Opus: ${item.judge.decision} (${line(item.judge.reason)})` : 'Opus: not triaged');
+  `Codex: ${line(item.bucket)}${item.category ? ` (${line(item.category)})` : ''} — ${line(item.codexReasoning || item.detail, 200)}`;
+const opusView = (item) => (item.judge ? `Opus: ${line(item.judge.decision)} (${line(item.judge.reason)})` : 'Opus: not triaged');
 
 function fmtModels(p) {
   const m = p.models;
   if (typeof m === 'string') return line(m);
-  if (Array.isArray(m)) return m.map((x) => (isObject(x) ? `${line(x.model)}×${x.count}` : line(x))).join(', ');
-  if (isObject(m)) return Object.entries(m).map(([model, count]) => `${line(model)}×${count}`).join(', ');
-  if (p.model) return p.count != null ? `${line(p.model)}×${p.count}` : line(p.model);
+  if (Array.isArray(m)) return m.map((x) => (isObject(x) ? `${line(x.model)}×${line(x.count)}` : line(x))).join(', ');
+  if (isObject(m)) return Object.entries(m).map(([model, count]) => `${line(model)}×${line(count)}`).join(', ');
+  if (p.model) return p.count != null ? `${line(p.model)}×${line(p.count)}` : line(p.model);
   return 'unknown';
 }
 
@@ -96,7 +98,7 @@ function outliersSection(entries, modelProofs) {
   const arbitrated = entries.filter(({ item }) => item.arbiter);
   for (const { item } of unique(arbitrated)) {
     const a = item.arbiter;
-    out.push(`- ${findingLabel(item)} · ${codexView(item)} · ${opusView(item)} · Fable: ${a.ruling} (${a.confidence}) — ${line(a.reasoning)}`);
+    out.push(`- ${findingLabel(item)} · ${codexView(item)} · ${opusView(item)} · Fable: ${line(a.ruling)} (${line(a.confidence)}) — ${line(a.reasoning)}`);
   }
   for (const { item } of unique(entries.filter(({ item: i }) => !i.arbiter && i.judge))) {
     const j = item.judge;
@@ -104,7 +106,7 @@ function outliersSection(entries, modelProofs) {
     const strong = item.bucket === 'BLOCKING' && (j.decision === 'REJECT' || j.decision === 'FOLLOW-UP');
     const closeCall = item.final?.by !== 'test' && decision === 'REJECT' && j.confidence === 'low';
     if (!strong && !closeCall) continue;
-    const settled = item.final ? `final: ${item.final.decision} by ${item.final.by}` : 'final: pending';
+    const settled = item.final ? `final: ${line(item.final.decision ?? 'unknown')} by ${line(item.final.by)}` : 'final: pending';
     out.push(`- ${findingLabel(item)} · ${codexView(item)} · ${opusView(item)} · ${settled} _(${strong ? 'strong disagreement' : 'close call'})_`);
   }
   for (const p of modelProofs) {
@@ -113,13 +115,22 @@ function outliersSection(entries, modelProofs) {
   return out.length ? out.join('\n') : '_None_';
 }
 
+// A follow-up becomes a link only when the URL is plainly a github.com one (no spaces, brackets,
+// parentheses, angle brackets or "@" that could end the link early or smuggle in another). Anything
+// else is shown as defused plain text, never as a link.
+const GITHUB_URL = /^https:\/\/github\.com\/[^\s()<>[\]@]*$/;
+
 function followupLine(f, fallbackItem) {
   if (typeof f === 'string') return `- ${line(f)}`;
-  const url = f.url ?? null;
-  const title = f.title ?? fallbackItem?.title ?? (f.number ? `#${f.number}` : url ?? 'follow-up');
+  const rawUrl = f.url ?? null;
+  const url = typeof rawUrl === 'string' && GITHUB_URL.test(rawUrl) ? rawUrl : null;
+  const title = f.title ?? fallbackItem?.title ?? (f.number ? `#${f.number}` : (rawUrl ?? 'follow-up'));
   const label = line(title, 100).replace(/[[\]]/g, '');
   const id = f.id ?? fallbackItem?.id;
-  return `- ${id ? `**${line(id)}** ` : ''}${url ? `[${label}](${url})` : label}`;
+  // Not a link: show it in a code span so it can neither autolink nor carry markdown of its own.
+  const shown = rawUrl ? ` — \`${line(rawUrl).replace(/`/g, "'")}\`` : '';
+  const text = url ? `[${label}](${url})` : `${label}${shown}`;
+  return `- ${id ? `**${line(id)}** ` : ''}${text}`;
 }
 
 function followupsSection(entries, followups) {
@@ -191,8 +202,8 @@ const MAX_EXCERPT_LINES = 60;
 const MAX_EXCERPT_CHARS = 6000;
 
 function excerptOf(step) {
-  const text = defuse(String(step.errorExcerpt ?? '').trimEnd());
-  return text.split('\n').slice(0, MAX_EXCERPT_LINES).join('\n').slice(0, MAX_EXCERPT_CHARS);
+  const raw = String(step.errorExcerpt ?? '').trimEnd();
+  return defuse(raw.split('\n').slice(0, MAX_EXCERPT_LINES).join('\n').slice(0, MAX_EXCERPT_CHARS));
 }
 
 export function blockedComment(report) {
@@ -214,11 +225,11 @@ export function blockedComment(report) {
     for (const s of steps) {
       const ran = s.status !== 'not-run' && Number.isFinite(s.durationMs);
       const duration = ran ? `${(s.durationMs / 1000).toFixed(1)}s` : '—';
-      const command = s.command ? `\`${cell(s.command).replace(/`/g, "'")}\`` : '';
+      const command = s.command ? cell(s.command) : '';
       out.push(`| ${cell(s.name)} | ${cell(s.status)} | ${duration} | ${command} |`);
     }
     for (const s of steps.filter((x) => x.status === 'fail' && excerptOf(x))) {
-      const code = s.exitCode == null ? '' : ` (exit ${s.exitCode})`;
+      const code = s.exitCode == null ? '' : ` (exit ${line(s.exitCode)})`;
       out.push('', `<details><summary>${line(s.name)} output${code}</summary>`, '', fenced(excerptOf(s)), '', '</details>');
     }
   }
@@ -241,7 +252,9 @@ export function awaitingReviewComment(reason) {
 
 // ---- agent log ------------------------------------------------------------------------------
 
+// Every field is sanitised: one line, markers and mentions defused, pipes escaped (the log is read
+// by people and may be pasted into a table).
 export function agentLogLine({ date, pr, title, risk, rounds, arbiterCalls, outcome }) {
-  const cleanTitle = flat(String(title ?? '').replace(/\|/g, ''));
-  return `- ${date} · #${pr} · ${cleanTitle} · risk ${risk} · rounds ${rounds} · arbiter ${arbiterCalls} · ${flat(outcome)}`;
+  const f = (v) => line(v).replace(/\|/g, '&#124;');
+  return `- ${f(date)} · #${f(pr)} · ${f(title)} · risk ${f(risk)} · rounds ${f(rounds)} · arbiter ${f(arbiterCalls)} · ${f(outcome)}`;
 }

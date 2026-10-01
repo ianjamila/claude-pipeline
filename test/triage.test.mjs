@@ -278,8 +278,13 @@ test('finalizeWithoutArbiter: honours light lane and force options', () => {
 
 const ruling = (id, r, confidence = 'high', reasoning = 'because of x') => ({ id, ruling: r, confidence, reasoning });
 
+test('SECURITY_CATEGORIES is exactly the five security-class categories', () => {
+  assert.deepEqual(SECURITY_CATEGORIES, ['security', 'auth', 'permissions', 'data-integrity', 'data-loss']);
+});
+
 test('applyRulings: REJECT high on a BLOCKING security-class item goes to a human', () => {
-  for (const category of SECURITY_CATEGORIES) {
+  // Literal list on purpose: importing the constant here would let a deleted category pass unnoticed.
+  for (const category of ['security', 'auth', 'permissions', 'data-integrity', 'data-loss']) {
     const it = judged('BLOCKING', 'REJECT', 'high', {}, { id: 'R1-B1', category });
     const [out] = applyRulings([it], [ruling('R1-B1', 'REJECT')], { proofOk: true, transcript: 't.jsonl' });
     assert.equal(out.final.needsHuman, true, category);
@@ -546,7 +551,7 @@ test('roundOutcome: clean when every item is settled, nothing accepted, and the 
   ];
   const o = roundOutcome(stateOf([round(1, []), round(2, items)]));
   assert.deepEqual(o, {
-    clean: true, openBlocking: [], newAccepted: [], needsHuman: [], pending: [], reachedMax: false, coverageValid: true,
+    clean: true, openBlocking: [], newAccepted: [], needsHuman: [], pending: [], unimplemented: [], reachedMax: false, coverageValid: true,
   });
 });
 
@@ -615,7 +620,7 @@ test('roundOutcome: coverage mismatch is not clean', () => {
   assert.equal(o.clean, false);
 });
 
-test('roundOutcome: only the last round is considered', () => {
+test('roundOutcome: newAccepted is last-round only, an implemented earlier ACCEPT does not block', () => {
   const messy = [item({ id: 'R1-B1', bucket: 'BLOCKING', final: settled('ACCEPT', 'judge'), implemented: true })];
   const o = roundOutcome(stateOf([round(1, messy, 'h-1'), round(2, [], 'h-final')]));
   assert.equal(o.clean, true);
@@ -676,9 +681,241 @@ test('reviewValidFor: an unimplemented BLOCKING ACCEPT reused from the cache is 
   assert.equal(roundOutcome(stateOf([round(1, [it], 'h-final')])).clean, false, 'agrees with roundOutcome');
 });
 
-test('reviewValidFor: any one qualifying round is enough, whatever the later rounds look like', () => {
+test('reviewValidFor: a later round with an unsettled BLOCKING item invalidates an earlier clean round', () => {
   const good = round(1, [item({ final: settled('REJECT', 'judge') })], 'h-final');
   const later = round(2, [item({ bucket: 'BLOCKING' })], 'h-later');
-  assert.equal(reviewValidFor(stateOf([good, later]), 'h-final'), true);
+  assert.equal(reviewValidFor(stateOf([good, later]), 'h-final'), false);
   assert.equal(reviewValidFor(stateOf([good, later]), 'h-later'), false);
+  // And an earlier round does not need to be the one whose hash matches.
+  const earlierOk = round(1, [item({ final: settled('REJECT', 'judge') })], 'h-1');
+  const laterOk = round(2, [], 'h-final');
+  assert.equal(reviewValidFor(stateOf([earlierOk, laterOk]), 'h-final'), true);
+});
+
+// ---- review fixes: fail-closed rules --------------------------------------------------------
+
+// -- 1. roll-ups across ALL rounds
+
+test('roundOutcome: a needsHuman item in an EARLIER round keeps the outcome unclean', () => {
+  const human = item({ id: 'R1-S1', bucket: 'SUGGESTION', final: settled('REJECT', 'arbiter', { needsHuman: true }) });
+  const s = stateOf([round(1, [human], 'h-1'), round(2, [], 'h-final')]);
+  const o = roundOutcome(s);
+  assert.equal(o.coverageValid, true);
+  assert.deepEqual(o.needsHuman, ['R1-S1']);
+  assert.equal(o.clean, false);
+  assert.equal(reviewValidFor(s, 'h-final'), false);
+  assert.equal(reviewValidFor(s, 'h-1'), false);
+});
+
+test('roundOutcome: a BLOCKING item without a final in an EARLIER round stays open', () => {
+  const s = stateOf([round(1, [item({ id: 'R1-B1', bucket: 'BLOCKING' })], 'h-1'), round(2, [], 'h-final')]);
+  const o = roundOutcome(s);
+  assert.deepEqual(o.openBlocking, ['R1-B1']);
+  assert.equal(o.clean, false);
+  assert.equal(reviewValidFor(s, 'h-final'), false);
+});
+
+test('roundOutcome: an unimplemented ACCEPT of ANY bucket in an earlier round keeps it unclean', () => {
+  for (const bucket of ['BLOCKING', 'SUGGESTION', 'WORTH_CONSIDERING']) {
+    const accepted = item({ id: 'R1-X1', bucket, final: settled('ACCEPT', 'judge') });
+    const s = stateOf([round(1, [accepted], 'h-1'), round(2, [], 'h-final')]);
+    const o = roundOutcome(s);
+    assert.deepEqual(o.unimplemented, ['R1-X1'], bucket);
+    assert.deepEqual(o.newAccepted, [], 'newAccepted stays last-round only');
+    assert.equal(o.clean, false, bucket);
+    assert.equal(reviewValidFor(s, 'h-final'), false, bucket);
+  }
+});
+
+test('roundOutcome: an unimplemented ACCEPT reused from the cache in the last round is not clean', () => {
+  const cached = item({ id: 'R2-S1', bucket: 'SUGGESTION', final: settled('ACCEPT', 'cache') });
+  const s = stateOf([round(2, [cached], 'h-final')]);
+  const o = roundOutcome(s);
+  assert.deepEqual(o.newAccepted, []);
+  assert.deepEqual(o.unimplemented, ['R2-S1']);
+  assert.equal(o.clean, false);
+  assert.equal(reviewValidFor(s, 'h-final'), false);
+});
+
+test('roundOutcome: the normal flow (round 1 accepted and implemented, round 2 reviews the fix) is clean', () => {
+  const fixed = item({ id: 'R1-B1', bucket: 'BLOCKING', final: settled('ACCEPT', 'judge'), implemented: true });
+  const s = stateOf([round(1, [fixed], 'h-1'), round(2, [], 'h-final')]);
+  const o = roundOutcome(s);
+  assert.equal(o.clean, true);
+  assert.deepEqual(o.unimplemented, []);
+  assert.equal(reviewValidFor(s, 'h-final'), true);
+});
+
+test('roundOutcome: a pending item that is not BLOCKING keeps the round unclean on its own', () => {
+  const o = roundOutcome(stateOf([round(1, [item({ id: 'R1-S1', bucket: 'SUGGESTION' })])]));
+  assert.deepEqual(o.pending, ['R1-S1']);
+  assert.deepEqual(o.openBlocking, []);
+  assert.deepEqual(o.needsHuman, []);
+  assert.deepEqual(o.newAccepted, []);
+  assert.equal(o.coverageValid, true);
+  assert.equal(o.clean, false);
+  const w = roundOutcome(stateOf([round(1, [item({ id: 'R1-W1', bucket: 'WORTH_CONSIDERING' })])]));
+  assert.equal(w.clean, false);
+});
+
+test('roundOutcome: a pending non-BLOCKING item in an earlier round keeps it unclean', () => {
+  const s = stateOf([round(1, [item({ id: 'R1-S1', bucket: 'SUGGESTION' })], 'h-1'), round(2, [], 'h-final')]);
+  assert.equal(roundOutcome(s).clean, false);
+  assert.equal(reviewValidFor(s, 'h-final'), false);
+});
+
+test('roundOutcome: each of needsHuman / newAccepted alone makes the round unclean', () => {
+  const human = item({ id: 'R1-S1', bucket: 'SUGGESTION', final: settled('REJECT', 'arbiter', { needsHuman: true }) });
+  const o1 = roundOutcome(stateOf([round(1, [human])]));
+  assert.deepEqual([o1.pending, o1.openBlocking, o1.newAccepted], [[], [], []]);
+  assert.equal(o1.clean, false);
+  const acc = item({ id: 'R1-S2', bucket: 'SUGGESTION', final: settled('ACCEPT', 'judge'), implemented: true });
+  const o2 = roundOutcome(stateOf([round(1, [acc])]));
+  assert.deepEqual([o2.pending, o2.openBlocking, o2.needsHuman, o2.unimplemented], [[], [], [], []]);
+  assert.equal(o2.clean, false);
+});
+
+test('reviewValidFor: undefined content hash never matches a round whose hash is undefined', () => {
+  const noHash = { n: 1, fromHead: 'a', toHead: 'b', items: [] };
+  assert.equal(reviewValidFor({ rounds: [noHash], currentContentHash: undefined }, undefined), false);
+  assert.equal(reviewValidFor({ rounds: [{ ...noHash, contentHashAtToHead: undefined }] }, undefined), false);
+  assert.equal(reviewValidFor({ rounds: [{ ...noHash, contentHashAtToHead: null }] }, null), false);
+  assert.equal(reviewValidFor({ rounds: [{ ...noHash, contentHashAtToHead: '' }] }, ''), false);
+});
+
+// -- 2. fail closed on invalid model output
+
+test('arbiterNeeded: any confidence other than exactly "high" counts as low', () => {
+  for (const confidence of ['HIGH', 'High', 'medium', 'low', '', undefined, null, 1, true]) {
+    // Built explicitly: judged() would turn an undefined confidence back into the 'high' default.
+    const mkItem = (bucket) => item({ bucket, judge: { ...judge('ACCEPT'), confidence } });
+    assert.equal(arbiterNeeded(mkItem('BLOCKING')), true, String(confidence));
+    assert.equal(arbiterNeeded(mkItem('WORTH_CONSIDERING')), true, String(confidence));
+  }
+  assert.equal(arbiterNeeded(judged('BLOCKING', 'ACCEPT', 'high')), false);
+  // Light lane still ignores low confidence for non-disputed items, valid or not.
+  assert.equal(arbiterNeeded(judged('BLOCKING', 'ACCEPT', 'HIGH'), { lightLane: true }), false);
+});
+
+test('applyJudge: a decision outside ACCEPT|FOLLOW-UP|REJECT sends the item to a human', () => {
+  for (const decision of ['accept', 'Accept', 'MAYBE', 'FOLLOWUP', '', undefined, null, 3]) {
+    const a = item({ id: 'R1-B1' });
+    const [out] = applyJudge([a], { items: [{ id: 'R1-B1', decision, confidence: 'high', reason: 'r', disputedBug: false, settleTest: { possible: false, plan: '' } }] });
+    assert.equal(out.final.needsHuman, true, String(decision));
+    assert.equal(out.final.reason, 'invalid judge output');
+    assert.equal(out.final.by, 'judge');
+    assert.ok(!['ACCEPT', 'FOLLOW-UP', 'REJECT'].includes(out.final.decision), 'no decision is invented');
+    assert.equal(roundOutcome({ rounds: [round(1, [out])], maxRounds: 3, currentContentHash: 'h-final' }).clean, false);
+  }
+  // A valid decision still leaves final alone (the arbiter / finalize step decides).
+  const [ok] = applyJudge([item({ id: 'R1-B1' })], goodTriage('R1-B1'));
+  assert.equal(ok.final, null);
+});
+
+test('applyJudge: an invalid judge entry never overwrites a final already set by a test or the cache', () => {
+  const tested = applyTestResult(item({ id: 'R1-B1' }), 'bug-confirmed', 'e');
+  const [out] = applyJudge([tested], { items: [{ id: 'R1-B1', decision: 'nope', confidence: 'high', reason: 'r', disputedBug: false, settleTest: { possible: false, plan: '' } }] });
+  assert.equal(out.final.by, 'test');
+  assert.equal(out.final.needsHuman, false);
+});
+
+test('finalizeWithoutArbiter: an invalid judge decision that skipped validation goes to a human', () => {
+  const it = item({ bucket: 'WORTH_CONSIDERING', judge: { ...judge('ACCEPT'), decision: 'accept' } });
+  const [out] = finalizeWithoutArbiter([it]);
+  assert.equal(out.final.needsHuman, true);
+  assert.equal(out.final.reason, 'invalid judge output');
+});
+
+test('applyRulings: a ruling or confidence outside the enums goes to a human (case-sensitive)', () => {
+  const cases = [
+    ['accept', 'high'], ['Reject', 'high'], ['FOLLOWUP', 'high'], [undefined, 'high'], [null, 'high'], ['', 'high'],
+    ['ACCEPT', 'HIGH'], ['ACCEPT', 'medium'], ['ACCEPT', undefined], ['ACCEPT', null], ['ACCEPT', ''],
+  ];
+  for (const [r, confidence] of cases) {
+    const it = judged('SUGGESTION', 'REJECT', 'high', {}, { id: 'R1-S1' });
+    const [out] = applyRulings([it], [{ id: 'R1-S1', ruling: r, confidence, reasoning: 'x' }], { proofOk: true, transcript: 't' });
+    assert.equal(out.final.needsHuman, true, `${r}/${confidence}`);
+    assert.equal(out.final.reason, 'invalid arbiter output');
+    assert.equal(out.final.by, 'arbiter');
+    assert.equal(out.final.decision, 'REJECT', 'falls back to the judge decision, never the invalid ruling');
+  }
+  // Valid pair is unaffected.
+  const it = judged('SUGGESTION', 'REJECT', 'high', {}, { id: 'R1-S1' });
+  assert.equal(applyRulings([it], [ruling('R1-S1', 'ACCEPT', 'high')], { proofOk: true })[0].final.needsHuman, false);
+});
+
+test('applyRulings: with no usable judge decision an invalid ruling leaves final.decision null, never the invalid text', () => {
+  const [out] = applyRulings([item({ id: 'R1-S1', bucket: 'SUGGESTION' })], [{ id: 'R1-S1', ruling: 'sure', confidence: 'high', reasoning: 'x' }], { proofOk: true });
+  assert.equal(out.final.decision, null);
+  assert.equal(out.final.needsHuman, true);
+});
+
+test('applyRulings: a failed proof never turns an unusable ruling or judge decision into a decision', () => {
+  const bad = { id: 'R1-S1', ruling: 'garbage', confidence: 'high', reasoning: 'x' };
+  const noJudge = item({ id: 'R1-S1', bucket: 'SUGGESTION' });
+  const badJudge = item({ id: 'R1-S1', bucket: 'SUGGESTION', judge: { ...judge('ACCEPT'), decision: 'accept' } });
+  for (const it of [noJudge, badJudge]) {
+    const [out] = applyRulings([it], [bad], { proofOk: false, transcript: 't' });
+    assert.equal(out.final.decision, null);
+    assert.equal(out.final.needsHuman, true);
+    assert.match(out.final.reason, /model-proof/);
+  }
+  // With nothing else to go on, a well-formed (if unproven) ruling is shown to the human as-is.
+  const [shown] = applyRulings([noJudge], [ruling('R1-S1', 'REJECT')], { proofOk: false });
+  assert.equal(shown.final.decision, 'REJECT');
+  assert.equal(shown.final.needsHuman, true);
+});
+
+// -- 3. a test outranks any opinion
+
+test('applyRulings: never overwrites an item a test already settled', () => {
+  const tested = applyTestResult(judged('BLOCKING', 'REJECT', 'high', {}, { id: 'R1-B1', category: 'security' }), 'bug-confirmed', 'fails: x');
+  for (const proofOk of [true, false]) {
+    const [out] = applyRulings([tested], [ruling('R1-B1', 'REJECT', 'high')], { proofOk, transcript: 't' });
+    assert.deepEqual(out, tested, `proofOk=${proofOk}`);
+    assert.equal(out.arbiter, null);
+    assert.equal(out.final.by, 'test');
+  }
+  // A final by anything else IS replaced (a re-run after a failed proof must be able to fix it).
+  const stale = item({ id: 'R1-S1', bucket: 'SUGGESTION', judge: judge('REJECT'), final: settled('REJECT', 'arbiter', { needsHuman: true }) });
+  assert.equal(applyRulings([stale], [ruling('R1-S1', 'ACCEPT')], { proofOk: true })[0].final.needsHuman, false);
+});
+
+// -- 4. light lane
+
+test('ruledCacheFrom: never caches a light-lane auto-rejection, it was not a ruling', () => {
+  const lane = item({ fingerprint: 'lane', bucket: 'WORTH_CONSIDERING', final: settled('REJECT', 'light-lane') });
+  const ruled = item({ fingerprint: 'ruled', final: settled('REJECT', 'arbiter') });
+  assert.deepEqual(Object.keys(ruledCacheFrom([lane, ruled])), ['ruled']);
+});
+
+test('markLightLane: only WORTH_CONSIDERING items with neither a judge nor a final are touched', () => {
+  const untouchedJudged = item({ id: 'R1-W2', bucket: 'WORTH_CONSIDERING', judge: judge('ACCEPT') });
+  const untouchedFinal = item({ id: 'R1-W3', bucket: 'WORTH_CONSIDERING', final: settled('FOLLOW-UP', 'cache') });
+  const blocking = item({ id: 'R1-B1', bucket: 'BLOCKING' });
+  const target = item({ id: 'R1-W1', bucket: 'WORTH_CONSIDERING' });
+  const out = markLightLane([target, untouchedJudged, untouchedFinal, blocking]);
+  assert.equal(out[0].final.by, 'light-lane');
+  assert.equal(out[1].final, null, 'a judged item is the judge\'s to finalise');
+  assert.equal(out[2].final.by, 'cache');
+  assert.equal(out[3].final, null);
+});
+
+// -- 6. evidence cap
+
+test('applyTestResult: evidence is capped at 500 characters with an ellipsis, in test and reason', () => {
+  const long = 'e'.repeat(2000);
+  for (const status of ['bug-confirmed', 'bug-disproved']) {
+    const out = applyTestResult(item(), status, long);
+    assert.equal(out.test.evidence, 'e'.repeat(500) + '…');
+    assert.ok(out.final.reason.endsWith('e'.repeat(500) + '…'));
+    assert.ok(out.final.reason.length < 600);
+  }
+  const exact = 'x'.repeat(500);
+  assert.equal(applyTestResult(item(), 'bug-confirmed', exact).test.evidence, exact);
+  assert.equal(applyTestResult(item(), 'bug-confirmed', 'short').test.evidence, 'short');
+  assert.equal(applyTestResult(item(), 'bug-confirmed', undefined).test.evidence, '');
+  // Capped by code point: an emoji at the boundary is never split.
+  const emoji = '😀'.repeat(600);
+  assert.equal(Array.from(applyTestResult(item(), 'bug-confirmed', emoji).test.evidence).length, 501);
 });
