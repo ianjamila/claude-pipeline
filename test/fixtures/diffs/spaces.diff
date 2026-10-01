@@ -1,0 +1,17 @@
+diff --git a/docs/empty file.md b/docs/empty file.md
+new file mode 100644
+index 0000000..e69de29
+diff --git a/docs/mode only.sh b/docs/mode only.sh
+old mode 100644
+new mode 100755
+diff --git a/docs/my file.md b/docs/my file.md
+index bc24c77..7d306cb 100644
+--- a/docs/my file.md	
++++ b/docs/my file.md	
+@@ -3 +3 @@ doc line 2
+-doc line 3
++doc line THREE
+diff --git a/docs/old name.md b/docs/new name.md
+similarity index 100%
+rename from docs/old name.md
+rename to docs/new name.md
