@@ -200,6 +200,7 @@ export function validateConfig(obj) {
   if (verify) {
     if (!isStr(verify.full)) errors.push('verify.full is required (the full verify command)');
     if (!isStr(verify.quick)) errors.push('verify.quick is required (the quick verify command)');
+    for (const k of ['report', 'screenshots']) if (!isStr(verify[k])) errors.push(`verify.${k} must be a non-empty string`);
   }
 
   const mergeSec = section(config, 'merge', errors);
@@ -251,7 +252,11 @@ export function validateConfig(obj) {
   if (integrity) checkStrArray(integrity.test_globs, 'integrity.test_globs', errors);
 
   const ci = section(config, 'ci', errors);
-  if (ci) checkStrArray(ci.required_checks, 'ci.required_checks', errors);
+  if (ci) {
+    checkStrArray(ci.required_checks, 'ci.required_checks', errors);
+    if (ci.e2e_label !== null && typeof ci.e2e_label !== 'string') errors.push('ci.e2e_label must be a string or null');
+    if (typeof ci.draft_while_iterating !== 'boolean') errors.push('ci.draft_while_iterating must be a boolean');
+  }
 
   if (config.preview !== null) checkPreview(config.preview, errors);
   if (config.production !== null) checkProduction(config.production, errors);
@@ -283,11 +288,11 @@ export async function loadConfig(repoDir, { readFile = fs.promises.readFile } = 
  * Replace {name} with vars[name] (stringified) for names present in vars; unknown {x} stay untouched.
  * strict: throw instead if any placeholder in the template has no value (missing, undefined, null or blank) -
  * use it whenever the result becomes a shell command, so a missing {sha} can never silently become a bad command.
- * Note strict treats every {identifier} as a placeholder, including the braces of a shell ${VAR}.
+ * A {name} immediately preceded by $ is a shell ${VAR}, not a placeholder: it is left untouched and never counted as missing.
  */
 export function fill(template, vars, { strict = false } = {}) {
   const text = String(template);
-  const re = /\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
+  const re = /(?<!\$)\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
   if (strict) {
     const missing = new Set();
     for (const [, name] of text.matchAll(re)) {

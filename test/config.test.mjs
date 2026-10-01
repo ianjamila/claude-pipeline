@@ -459,3 +459,40 @@ test('fill strict: throws on missing, undefined, null or empty values for placeh
   assert.equal(fill('{url}/login', {}), '{url}/login');
   assert.equal(fill('{url}/login', {}, { strict: false }), '{url}/login');
 });
+
+// ---- shell ${VAR} is not a placeholder; remaining type checks ----
+
+test('fill leaves shell ${VAR} untouched in both modes', () => {
+  const tpl = 'deploy --token ${PREVIEW_TOKEN} --pr {pr} --sha {sha}';
+  const want = 'deploy --token ${PREVIEW_TOKEN} --pr 12 --sha abc';
+  assert.equal(fill(tpl, { pr: 12, sha: 'abc' }), want);
+  assert.equal(fill(tpl, { pr: 12, sha: 'abc' }, { strict: true }), want);
+  // even when vars happens to hold the same name, ${name} is shell syntax and is not substituted
+  assert.equal(fill('echo ${pr} {pr}', { pr: 7 }), 'echo ${pr} 7');
+  assert.equal(fill('echo ${pr} {pr}', { pr: 7 }, { strict: true }), 'echo ${pr} 7');
+  // strict does not count ${VAR} as missing, but still throws for a real missing placeholder
+  assert.equal(fill('--token ${PREVIEW_TOKEN}', {}, { strict: true }), '--token ${PREVIEW_TOKEN}');
+  assert.throws(() => fill('--token ${PREVIEW_TOKEN} {sha}', {}, { strict: true }), (e) => /sha/.test(e.message) && !/PREVIEW_TOKEN/.test(e.message));
+});
+
+test('verify.report / verify.screenshots must be non-empty strings', () => {
+  for (const key of ['report', 'screenshots']) {
+    for (const bad of ['', '   ', 5, null, ['x']]) {
+      const r = validateConfig({ ...minimal(), verify: { full: 'f', quick: 'q', [key]: bad } });
+      assert.ok(has(r, `verify.${key}`), `${key}=${JSON.stringify(bad)}: ${r.errors.join(' | ')}`);
+    }
+  }
+  assert.equal(validateConfig({ ...minimal(), verify: { full: 'f', quick: 'q', report: 'r.json', screenshots: 'shots' } }).ok, true);
+});
+
+test('ci.e2e_label must be a string or null; ci.draft_while_iterating must be a boolean', () => {
+  for (const bad of [5, true, ['x'], {}]) {
+    assert.ok(has(validateConfig({ ...minimal(), ci: { e2e_label: bad } }), 'ci.e2e_label'), JSON.stringify(bad));
+  }
+  assert.equal(validateConfig({ ...minimal(), ci: { e2e_label: 'run-e2e' } }).ok, true);
+  assert.equal(validateConfig({ ...minimal(), ci: { e2e_label: null } }).ok, true);
+  for (const bad of ['yes', 1, 0, null, []]) {
+    assert.ok(has(validateConfig({ ...minimal(), ci: { draft_while_iterating: bad } }), 'ci.draft_while_iterating'), JSON.stringify(bad));
+  }
+  assert.equal(validateConfig({ ...minimal(), ci: { draft_while_iterating: true } }).ok, true);
+});
