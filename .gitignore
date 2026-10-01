@@ -1,0 +1,5 @@
+node_modules/
+.verify/
+.review/
+*.log
+.DS_Store

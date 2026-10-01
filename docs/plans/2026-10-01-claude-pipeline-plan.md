@@ -12,7 +12,7 @@
 
 ## Conventions for every task
 
-- Repo: `~/Claude/claude-pipeline` (abbrev. `$CP`). Run tests with `node --test test/` from `$CP`.
+- Repo: `~/Claude/claude-pipeline` (abbrev. `$CP`). Run tests with `node scripts/test.mjs [name-filter]` from `$CP` (Node 20 lacks --test globbing; the runner lists `test/*.test.mjs`). Fixtures live under `test/fixtures/` and `test/helpers/` and are never named `*.test.mjs`.
 - Pure logic lives in `pipeline/lib/*.mjs` and takes injected IO (`run`, `readFile`, `now`) so it is unit-testable; CLI commands in `pipeline/commands/*.mjs` wire real IO.
 - Every `gh` invocation goes through `pipeline/lib/proc.mjs#gh()` which honours `PIPELINE_GH` (a command string, e.g. `node /abs/fake-gh.mjs`).
 - No npm dependencies. Only vendored file: `pipeline/vendor/js-yaml.mjs`.
@@ -83,7 +83,7 @@ $CP/
 ```json
 { "name": "claude-pipeline", "private": true, "type": "module",
   "engines": { "node": ">=20" },
-  "scripts": { "test": "node --test test/" } }
+  "scripts": { "test": "node scripts/test.mjs" } }
 ```
 `.gitignore`: `node_modules/`, `.verify/`, `.review/`, `*.log`. `VERSION`: `0.1.0`.
 - [ ] **Step 2:** Vendor js-yaml: `cd /tmp && npm pack js-yaml@latest && tar xzf js-yaml-*.tgz`. Use `package/dist/js-yaml.mjs` if present; if the latest major has no single-file ESM dist, use the newest 4.x that does (`npm pack js-yaml@4`). Copy to `pipeline/vendor/js-yaml.mjs`, prepend the LICENSE text as a block comment, record version + sha256 in `pipeline/vendor/README.md`.
@@ -99,7 +99,7 @@ test('throws a readable error with line number on bad yaml', () => {
   assert.throws(() => parseYaml('a: [1,\n'), /line/i);
 });
 ```
-- [ ] **Step 4:** `pipeline/lib/yaml.mjs`: `export function parseYaml(text) { return yaml.load(text, { schema: yaml.JSON_SCHEMA }) }` (import default/namespace per the vendored build). Run `node --test test/yaml.test.mjs` → PASS. Commit `chore: scaffold + vendored js-yaml`.
+- [ ] **Step 4:** `pipeline/lib/yaml.mjs`: `export function parseYaml(text) { return yaml.load(text, { schema: yaml.JSON_SCHEMA }) }` (import default/namespace per the vendored build). Run `node scripts/test.mjsyaml.test.mjs` → PASS. Commit `chore: scaffold + vendored js-yaml`.
 
 ### Task 0.2: proc + paths helpers
 
@@ -510,10 +510,10 @@ Tests: `templates.test.mjs` — `verify.mjs` `runSteps` on a tmp dir with fake s
 ### Task 6.1: repo CI + self pipeline.yml + README
 
 **Files:** Create `.github/workflows/ci.yml`, `.claude/pipeline.yml`, `README.md`
-- `ci.yml`: `on: [pull_request, push: {branches:[main]}]`; jobs `test-ubuntu` (name: `test (ubuntu)`, node 20 and 24 via two steps with `actions/setup-node`) and `test-windows` (name: `test (windows)`, node 20); each runs `node --test test/` and `node install.mjs --claude-home "$RUNNER_TEMP/claude-home" --skip-file-guard` then `--check`.
-- `.claude/pipeline.yml`: `project: claude-pipeline`, verify full/quick `node --test test/`, `merge.command: gh pr merge {pr} --squash --auto --delete-branch`, `ci.required_checks: ["test (ubuntu)", "test (windows)"]`, `hard_stops.paths: ["**"]`, `preview: null`, `production: null`.
+- `ci.yml`: `on: [pull_request, push: {branches:[main]}]`; jobs `test-ubuntu` (name: `test (ubuntu)`, node 20 and 24 via two steps with `actions/setup-node`) and `test-windows` (name: `test (windows)`, node 20); each runs `node scripts/test.mjs` and `node install.mjs --claude-home "$RUNNER_TEMP/claude-home" --skip-file-guard` then `--check`.
+- `.claude/pipeline.yml`: `project: claude-pipeline`, verify full/quick `node scripts/test.mjs`, `merge.command: gh pr merge {pr} --squash --auto --delete-branch`, `ci.required_checks: ["test (ubuntu)", "test (windows)"]`, `hard_stops.paths: ["**"]`, `preview: null`, `production: null`.
 - README: what it is; install/update (`git pull && ./install.sh` / `.\install.ps1`, run in a terminal or launch Claude with `PIPELINE_ADMIN=1`); uninstall; one-line prompts; opt-out; enforcement matrix (spec §13); limits; troubleshooting (Codex quota → resume; model-proof failures).
-- [ ] Run `node --test test/` → all PASS. Commit `chore: CI, self pipeline config, README`.
+- [ ] Run `node scripts/test.mjs` → all PASS. Commit `chore: CI, self pipeline config, README`.
 
 ### Task 6.2: publish
 - [ ] `gh repo create ianjamila/claude-pipeline --private --source ~/Claude/claude-pipeline --remote origin --push` (initial push to main is allowed: no guard installed yet, no protection yet).
