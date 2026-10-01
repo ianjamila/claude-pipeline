@@ -18,7 +18,7 @@ export const meta = {
 };
 
 const LIBS = ['proc', 'paths', 'yaml', 'config', 'glob', 'diff', 'git', 'hardstops', 'risk', 'integrity'];
-const ENTRIES = ['ci-guard', 'stop-verify', 'smoke'];
+const ENTRIES = ['ci-guard', 'ci-guards-run', 'stop-verify', 'smoke'];
 const DEST = ['scripts', 'pipeline'];
 const VERSION_FILE = 'VERSION';
 

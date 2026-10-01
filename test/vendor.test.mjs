@@ -8,7 +8,7 @@ import { run as vendor, meta } from '../pipeline/commands/vendor.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const LIBS = ['proc', 'paths', 'yaml', 'config', 'glob', 'diff', 'git', 'hardstops', 'risk', 'integrity'];
-const ENTRIES = ['ci-guard', 'stop-verify', 'smoke'];
+const ENTRIES = ['ci-guard', 'ci-guards-run', 'stop-verify', 'smoke'];
 
 const vendorInto = (dir, extra = []) => vendor(['--repo', dir, ...extra], { cwd: dir, env: process.env });
 const sp = (dir) => join(dir, 'scripts', 'pipeline');
