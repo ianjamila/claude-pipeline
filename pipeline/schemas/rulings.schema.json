@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Arbiter rulings output",
+  "description": "What the arbiter agent returns: one ruling per disputed item, exactly once. Documentation for the arbiter prompt; validateRulings() in pipeline/lib/triage.mjs enforces it (including that every expected id appears once and no unknown id does).",
+  "type": "object",
+  "required": ["rulings"],
+  "properties": {
+    "rulings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "ruling", "confidence", "reasoning"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1, "description": "Codex finding id the ruling is about." },
+          "ruling": { "enum": ["ACCEPT", "FOLLOW-UP", "REJECT"], "description": "ACCEPT: fix in this PR. FOLLOW-UP: real but out of scope. REJECT: not a real problem or not worth doing." },
+          "confidence": { "enum": ["high", "low"], "description": "low sends the item to a human." },
+          "reasoning": { "type": "string", "description": "At most three sentences, citing file:line." }
+        }
+      }
+    }
+  }
+}
