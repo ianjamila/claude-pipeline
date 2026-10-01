@@ -1,0 +1,82 @@
+version: 1
+project: eaglewatch
+enforcement: github
+default_branch: main
+worktree_dir: .worktrees
+
+verify:
+  full: npm run verify
+  quick: npm run verify:quick
+
+ci:
+  required_checks:
+    - lint
+    - typecheck
+    - unit
+    - build
+    - e2e
+  e2e_label: run-e2e
+  draft_while_iterating: true
+
+merge:
+  command: "npm run merge -- {pr} --no-update --expect-head {sha}"
+  wait_minutes: 20
+
+preview:
+  environment: Preview
+  smoke: "node scripts/pipeline/smoke.mjs --base {url}"
+
+production:
+  url: https://ewiapp.eaglewatch.ph
+  provider: vercel
+  environment: Production
+  smoke: "node scripts/pipeline/smoke.mjs --base {url} --production"
+  deploy_timeout_minutes: 20
+  rollback:
+    command: "vercel rollback --yes"
+    notes: Roll back first, then investigate; migrations are forward-only.
+
+smoke_checks:
+  - path: /login
+    status: [200]
+    contains: ["Sign in"]
+  - path: /
+    status: [302, 307, 308]
+    location_contains: /login
+
+risk:
+  high_risk_paths:
+    - supabase/migrations/**
+    - app/api/payroll/**
+  medium_lines: 150
+  high_lines: 600
+  medium_files: 10
+
+hard_stops:
+  paths:
+    - supabase/migrations/**
+    - .github/workflows/**
+    - middleware.ts
+  patterns:
+    - name: facial-recognition
+      regex: "face(api|[-_]?recog)|liveness|rekognition"
+  auth_calls:
+    - requireSAScope
+    - getAccessibleDetachmentIds
+
+integrity:
+  test_globs:
+    - "**/*.test.*"
+    - e2e/**
+
+review:
+  codex_model: gpt-6-astra
+  effort:
+    low: medium
+    medium: medium
+    high: xhigh
+    followup: medium
+  max_rounds: 3
+  light_lane_max_lines: 50
+
+agent_log: docs/agent-log.md

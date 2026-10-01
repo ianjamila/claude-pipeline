@@ -1,0 +1,5 @@
+version: 1
+project: demo-app
+verify:
+  full: npm run verify
+  quick: npm run verify:quick
