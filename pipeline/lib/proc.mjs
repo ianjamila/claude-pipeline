@@ -158,14 +158,14 @@ function killTree(pid) {
   }
 }
 
-// Async runShell whose timeout takes the whole process tree down, so no orphan keeps working (or
-// holding the pipes) after the caller has moved on. Resolves; never rejects.
-export function runShellAsync(command, { cwd, env, input, timeoutMs } = {}) {
+// Shared by runShellAsync and runAsync: a spawn whose timeout takes the whole process tree down, so no orphan keeps
+// working (or holding the pipes) after the caller has moved on. Resolves; never rejects.
+function spawnAsync(file, args, extra, { cwd, env, input, timeoutMs } = {}) {
   return new Promise((resolve) => {
-    const child = spawn(command, {
+    const child = spawn(file, args, {
       cwd,
       env: env ? { ...process.env, ...env } : undefined,
-      shell: true,
+      ...extra,
       detached: process.platform !== 'win32',
       windowsHide: true,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -207,6 +207,23 @@ export function runShellAsync(command, { cwd, env, input, timeoutMs } = {}) {
       }, timeoutMs);
     }
   });
+}
+
+// Async runShell whose timeout takes the whole process tree down. Resolves; never rejects.
+export function runShellAsync(command, opts = {}) {
+  return spawnAsync(command, [], { shell: true }, opts);
+}
+
+// Async `run` (no shell, Windows shims handled like `run`) with the same tree-killing timeout as runShellAsync. A
+// command that cannot be started resolves with a non-zero code and the spawn error ("spawn <cmd> ENOENT") on stderr.
+export function runAsync(cmd, args = [], opts = {}) {
+  let plan;
+  try {
+    plan = planSpawn(cmd, args);
+  } catch (err) {
+    return Promise.resolve({ code: 1, stdout: '', stderr: err.message, timedOut: false });
+  }
+  return spawnAsync(plan.file, plan.args, { windowsVerbatimArguments: plan.windowsVerbatimArguments }, opts);
 }
 
 // Minimal quote-aware splitter for the PIPELINE_GH / PIPELINE_CODEX override strings.

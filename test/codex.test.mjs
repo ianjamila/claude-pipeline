@@ -189,6 +189,15 @@ test('validateFindings type-checks summary and names it in the error', () => {
   }
 });
 
+test('validateFindings rejects an empty or whitespace-only summary', () => {
+  for (const summary of ['', ' ', '\n\t  ']) {
+    const r = validateFindings(sample({ summary }));
+    assert.equal(r.ok, false, JSON.stringify(summary));
+    assert.ok(r.errors.some((e) => /^summary: must not be empty/.test(e)), r.errors.join('\n'));
+  }
+  assert.equal(validateFindings(sample({ summary: 'x' })).ok, true);
+});
+
 test('validateFindings names the offending field for category, testable and a non-object finding', () => {
   const cat = validateFindings(sample({ blocking: [finding({ category: 'style' })] }));
   assert.ok(cat.errors.some((e) => e.includes('blocking[0].category')), cat.errors.join('\n'));

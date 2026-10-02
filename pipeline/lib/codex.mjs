@@ -154,7 +154,11 @@ export function validateFindings(json) {
   const errors = [];
   if (!isObject(json)) return { ok: false, errors: ['root: expected an object'] };
   checkKeys(json, ['summary', 'blocking', 'suggestions', 'worth_considering'], 'root', errors);
-  if (Object.hasOwn(json, 'summary') && typeof json.summary !== 'string') errors.push('summary: expected a string');
+  if (Object.hasOwn(json, 'summary')) {
+    if (typeof json.summary !== 'string') errors.push('summary: expected a string');
+    // An answer with no summary is not a review a person can read; it is also what a truncated run looks like.
+    else if (json.summary.trim() === '') errors.push('summary: must not be empty');
+  }
   for (const { key } of BUCKETS) {
     if (!Object.hasOwn(json, key)) continue;
     if (!Array.isArray(json[key])) {
