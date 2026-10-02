@@ -15,9 +15,12 @@ import {
   isPidAlive,
   LockTimeoutError,
   LockLostError,
+  machineId,
   _tuning,
 } from '../pipeline/lib/locks.mjs';
 
+// Never create ~/.claude/pipeline-state/machine-id from a test run (scripts/test.mjs sets this too).
+process.env.PIPELINE_MACHINE_ID ||= 'test-machine-id';
 const FIXTURE = fileURLToPath(new URL('./fixtures/hold-lock.mjs', import.meta.url));
 const RACE_FIXTURE = fileURLToPath(new URL('./fixtures/reclaim-race.mjs', import.meta.url));
 const HOST = os.hostname();
@@ -840,4 +843,52 @@ test('27. LockTimeoutError names the lock path, the owner and how to clear it by
     assert.ok(err.message.includes(`remove ${lockPath} if no pipeline process is running`));
     return true;
   });
+});
+
+// ---- machine identity: a renamed host must not strand a dead owner's lock ------------------------------------------------
+
+test('17a. a lock from an OLD hostname but the same machine id, with a dead owner, is reclaimed', () => {
+  const dir = tmpDir();
+  plantLock(dir, 'db', ownerRecord('db', { host: 'old-name.local', machineId: 'machine-aaaaaaaa', pid: deadPid(), runId: 'renamed' }), { ageMs: 3 * DAY });
+  const r = tryAcquire('db', { dir, machineId: 'machine-aaaaaaaa', runId: 'new' });
+  assert.equal(r.acquired, true);
+  assert.equal(inspect('db', { dir }).runId, 'new');
+  assert.equal(inspect('db', { dir }).machineId, 'machine-aaaaaaaa', 'the new owner records the machine id too');
+});
+
+test('17b. R12-prime holds across a rename: the same machine id with a LIVE owner pid is never reclaimed', () => {
+  const dir = tmpDir();
+  plantLock(dir, 'db', ownerRecord('db', { host: 'old-name.local', machineId: 'machine-aaaaaaaa', pid: process.pid, runId: 'alive' }), { ageMs: 3 * DAY });
+  const r = tryAcquire('db', { dir, machineId: 'machine-aaaaaaaa', now: Date.now() + 30 * DAY });
+  assert.equal(r.acquired, false);
+  assert.equal(inspect('db', { dir }).runId, 'alive');
+});
+
+test('17c. a different machine id (or none) on a different host is still never reclaimed', () => {
+  const dir = tmpDir();
+  plantLock(dir, 'a', ownerRecord('a', { host: 'elsewhere', machineId: 'machine-bbbbbbbb', pid: deadPid(), runId: 'other' }), { ageMs: 3 * DAY });
+  assert.equal(tryAcquire('a', { dir, machineId: 'machine-aaaaaaaa' }).acquired, false);
+  plantLock(dir, 'b', ownerRecord('b', { host: 'elsewhere', pid: deadPid(), runId: 'legacy' }), { ageMs: 3 * DAY });
+  assert.equal(tryAcquire('b', { dir, machineId: 'machine-aaaaaaaa' }).acquired, false, 'an old lock without a machine id is judged by hostname only');
+  assert.equal(tryAcquire('b', { dir, machineId: null }).acquired, false);
+});
+
+test('17d. a reclaim guard from a renamed host with the same machine id and a dead owner is broken', () => {
+  const dir = tmpDir();
+  staleLock(dir);
+  plantGuard(dir, 'db', guardOwner({ host: 'old-name.local', machineId: 'machine-aaaaaaaa', pid: deadPid(), runId: 'dead-reclaimer' }));
+  assert.equal(tryAcquire('db', { dir, machineId: 'machine-aaaaaaaa', runId: 'fresh' }).acquired, true);
+});
+
+test('17e. machineId(): env override, persisted random id created once, unwritable state dir gives null', () => {
+  assert.equal(machineId({ env: { PIPELINE_MACHINE_ID: 'abc12345-xyz' } }), 'abc12345-xyz');
+  assert.equal(machineId({ env: { PIPELINE_MACHINE_ID: 'bad id!' } }), null);
+  const stateDir = path.join(tmpDir(), 'state');
+  const first = machineId({ env: {}, stateDir });
+  assert.match(first, /^[0-9a-f-]{36}$/);
+  assert.equal(machineId({ env: {}, stateDir }), first, 'stable on the next call');
+  assert.equal(readFileSync(path.join(stateDir, 'machine-id'), 'utf8').trim(), first);
+  const blocker = path.join(tmpDir(), 'file');
+  writeFileSync(blocker, 'x');
+  assert.equal(machineId({ env: {}, stateDir: path.join(blocker, 'sub') }), null);
 });
