@@ -1,24 +1,25 @@
 // `pipeline merge --pr N`: the ONLY sanctioned agent merge path. It trusts nothing it did not just re-read: the gate
-// file must vouch for this exact head and patch and be fresh, the live PR must still be clean, and only then does it
-// run the project's merge command with the approved head SHA (so a head that moved can never merge). It then waits
-// for GitHub to say MERGED; anything else ends with auto-merge disabled, because an unattended queued merge could
-// land later on a base nobody verified against.
+// file only names the head and patch that were approved (and must still match, and be fresh); everything else is
+// re-proved LIVE, by running the whole final gate again immediately before the merge command, because a gate file is
+// just JSON on disk and anyone can write one. Only then does it run the project's merge command with the approved head
+// SHA (so a head that moved can never merge). It then waits for GitHub to say MERGED, re-checking the blockers on every
+// poll; anything else ends with auto-merge disabled, because an unattended queued merge could land later on a base nobody
+// verified against.
 import { EXIT, parseCommandArgs, intOption } from '../lib/cli.mjs';
 import { fill } from '../lib/config.mjs';
 import { guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { headSha } from '../lib/git.mjs';
-import { runPreflight } from '../lib/preflight.mjs';
 import { currentProduction } from '../lib/deploy.mjs';
 import { runShellAsync } from '../lib/proc.mjs';
 import {
-  GATE_FILE, PR_FIELDS, blockingLabelsOf, disableAutoMerge, gateRefusals, localContentHash, mergeTiming,
-  readReviewJson, tailLines, waitForMerge, writeReviewJson,
+  GATE_FILE, PR_FIELDS, abandonMerge, evaluateGate, gateRefusals, localContentHash, mergeTiming, readReviewJson, tailLines,
+  waitBlockers, waitForMerge, writeReviewJson,
 } from '../lib/finalgate.mjs';
 
 export const meta = {
-  summary: 'merge the PR if (and only if) the fresh final gate still holds; waits for MERGED',
-  usage: 'pipeline merge --pr N [--repo DIR]   -> {ok, merged, mergeSha, prodBefore} ; exit 0 merged, 1 not merged / refused (run final-gate again), 3 GitHub unavailable',
+  summary: 'merge the PR if (and only if) the final gate passes again, live; waits for MERGED',
+  usage: 'pipeline merge --pr N [--repo DIR]   -> {ok, merged, mergeSha, prodBefore} ; exit 0 merged, 1 not merged / refused (run final-gate again), 3 GitHub unavailable or no known-good production deployment',
 };
 
 const refuse = (error, reasons, extra = {}) => ({
@@ -34,41 +35,46 @@ export const run = guarded(async (argv, ctx) => {
   const gh = createGitHub({ cwd: root, env: ctx.env });
 
   return guardGh(async () => {
-    // 1. The gate file must vouch for this head, this patch, right now.
+    // 1. The gate file must name this head and this patch, in this repo, and be fresh. It is only a binding: it proves nothing by itself.
     const gate = readReviewJson(root, GATE_FILE);
     const head = headSha({ cwd: root });
-    const live = () => gh.prView(pr, [...PR_FIELDS]);
     let hash = '';
     try {
       hash = localContentHash(root, config);
     } catch { /* gateRefusals reports the mismatch */ }
-    const refusals = gateRefusals({ gate, pr, head, prHead: live().headRefOid, hash });
+    const refusals = gateRefusals({
+      gate, pr, head, prHead: gh.prView(pr, [...PR_FIELDS]).headRefOid, hash, repo: gh.repo().slug, previewConfigured: config.preview !== null,
+    });
     if (refusals.length > 0) return refuse('gate', refusals);
-    if (typeof gate.repo === 'string' && gate.repo !== gh.repo().slug) return refuse('gate', [`the gate is for ${gate.repo}, not ${gh.repo().slug}`]);
 
-    // 2. Live re-check, right before the merge: nothing may have appeared since the gate ran.
-    const problems = [];
-    const preflight = await runPreflight({ cwd: root, env: ctx.env, gh });
-    if (!preflight.canMerge) problems.push(`preflight: ${preflight.reasons.join('; ') || 'the pipeline may not merge'}`);
-    const now = live();
-    if (now.state !== 'OPEN') problems.push(`PR state is ${now.state}`);
-    if (now.isDraft !== false) problems.push('PR is a draft');
-    if (now.headRefOid !== gate.head) problems.push(`PR head moved to ${String(now.headRefOid).slice(0, 8)} since the gate`);
-    const blocking = blockingLabelsOf(now.labels);
-    if (blocking.length > 0) problems.push(`blocking label(s): ${blocking.join(', ')}`);
-    if (problems.length > 0) return refuse('live-check', problems);
-
-    // 3. The known-good production deployment, recorded BEFORE the merge: it is what a rollback restores.
+    // 2. The known-good production deployment: it is what a rollback restores, so without it nothing may merge.
+    // Read now, written only once the live gate has passed (a refused attempt must not overwrite an earlier merge's record).
     let prodBefore = null;
     if (config.production) {
       const found = await currentProduction({ gh, environment: config.production.environment });
-      prodBefore = found ?? null;
+      if (!found) {
+        return {
+          exitCode: EXIT.UNAVAILABLE,
+          output: {
+            ok: false, merged: false, error: 'production-unknown',
+            reason: `known-good production deployment not found in ${config.production.environment}: a rollback would have no target, so nothing is merged`,
+          },
+        };
+      }
+      prodBefore = found;
+    }
+
+    // 3. The live gate, immediately before the merge: every check re-evaluated against GitHub and the worktree as they are NOW.
+    const fresh = await evaluateGate({ root, config, pr, gh, env: ctx.env });
+    const failed = fresh.checks.filter((c) => !c.ok);
+    if (failed.length > 0) return refuse('live-check', failed.map((c) => `${c.name}: ${c.detail}`));
+    if (fresh.head !== gate.head || fresh.contentHash !== gate.contentHash) {
+      return refuse('live-check', ['the live gate is for a different head or patch than final-gate.json approved']);
+    }
+
+    if (prodBefore) {
       writeReviewJson(root, 'prod-before.json', {
-        environment: config.production.environment,
-        id: found?.id ?? null,
-        sha: found?.sha ?? null,
-        url: found?.url ?? null,
-        at: new Date().toISOString(),
+        environment: config.production.environment, id: prodBefore.id, sha: prodBefore.sha, url: prodBefore.url, at: new Date().toISOString(),
       });
     }
 
@@ -78,15 +84,25 @@ export const run = guarded(async (argv, ctx) => {
     const ran = await runShellAsync(command, { cwd: root, env: ctx.env, timeoutMs: (config.merge.wait_minutes + 5) * 60_000 });
     const commandOutput = tailLines(`${ran.stdout}${ran.stderr ? `\n${ran.stderr}` : ''}`, 30);
 
-    // 5. Wait for MERGED. If the command failed it may still have merged (a branch-delete error after a merge exits
-    // non-zero), so look once before calling it a failure.
-    const outcome = await waitForMerge({ gh, pr, waitMs: ran.code === 0 ? waitMs : 0, pollMs });
+    const merged = (mergeSha, extra = {}) => (mergeSha
+      ? { exitCode: EXIT.OK, output: { ok: true, merged: true, mergeSha, prodBefore, ...extra } }
+      : {
+        exitCode: EXIT.FAILED,
+        output: { ok: false, merged: true, mergeSha: null, prodBefore, reason: 'the PR is MERGED but GitHub did not report its merge commit after re-reading: find it by hand before anything depends on it', ...extra },
+      });
+
+    // 5. Wait for MERGED, re-checking the blockers on every poll. If the command failed it may still have merged (a
+    // branch-delete error after a merge exits non-zero), so look once before calling it a failure.
+    const outcome = await waitForMerge({ gh, pr, waitMs: ran.code === 0 ? waitMs : 0, pollMs, blockers: waitBlockers(gh) });
     if (outcome.state === 'merged') {
-      const note = ran.code === 0 ? {} : { commandExitCode: ran.code, note: 'the merge command exited non-zero but the PR is MERGED' };
-      return { exitCode: EXIT.OK, output: { ok: true, merged: true, mergeSha: outcome.mergeSha, prodBefore, ...note } };
+      return merged(outcome.mergeSha, ran.code === 0 ? {} : { commandExitCode: ran.code, note: 'the merge command exited non-zero but the PR is MERGED' });
     }
 
-    const autoMergeDisabled = disableAutoMerge({ pr, cwd: root, env: ctx.env });
+    // Not merged: disarm auto-merge, then look again (it may have fired a moment before the disable).
+    const abandoned = await abandonMerge({ gh, pr, cwd: root, env: ctx.env, pollMs });
+    if (abandoned.merged) return merged(abandoned.mergeSha, { note: 'the PR merged while auto-merge was being disabled', autoMergeDisabled: abandoned.autoMergeDisabled });
+
+    const { autoMergeDisabled } = abandoned;
     const failure = { merged: false, autoMergeDisabled, commandExitCode: ran.code, commandOutput, prodBefore };
     if (ran.code !== 0) {
       return { exitCode: EXIT.FAILED, output: { ok: false, reason: `merge command failed (exit ${ran.code}${ran.timedOut ? ', timed out' : ''}) and the PR is not merged`, ...failure } };
@@ -95,6 +111,7 @@ export const run = guarded(async (argv, ctx) => {
       timeout: 'not merged in time',
       closed: 'the PR was closed without merging',
       error: `could not read the PR state while waiting (${outcome.error})`,
+      blocked: `a blocker appeared while waiting: ${(outcome.problems ?? []).join('; ')}`,
     }[outcome.state];
     const tail = autoMergeDisabled ? 'auto-merge disabled' : 'could not confirm auto-merge is disabled: check the PR by hand';
     return { exitCode: EXIT.FAILED, output: { ok: false, reason: `${base} — ${tail}`, ...failure } };

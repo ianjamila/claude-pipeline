@@ -106,11 +106,24 @@ function logRepo() {
   repo.write('README.md', '# demo\n');
   repo.commit('init');
   repo.branch('agent/feature');
-  const fake = createFakeGh([{ match: '^pr view 12 --json title', stdoutJson: { title: 'Add widget' } }]);
+  const fake = createFakeGh([]);
+  // The PR as GitHub sees it: on the branch the worktree is on, at the commit the worktree is at (unless a test says otherwise).
+  const prFor = (over = {}) => ({ headRefName: repo.git(['symbolic-ref', '-q', '--short', 'HEAD']).trim(), headRefOid: repo.git(['rev-parse', 'HEAD']).trim(), ...over });
+  const script = (pr) => [
+    { match: '^pr view 12 --json title', stdoutJson: { title: 'Add widget' } },
+    { match: '^pr view 12 --json headRefName,headRefOid', stdoutJson: pr },
+  ];
   const q = (line) => cli(['agent-log', 'queue', '--line', line], { dir: repo.dir, fake });
-  const stage = (...args) => cli(['agent-log', 'stage', '--pr', String(PR), ...args], { dir: repo.dir, fake });
+  const stage = (...args) => {
+    fake.setScript(script(prFor()));
+    return cli(['agent-log', 'stage', '--pr', String(PR), ...args], { dir: repo.dir, fake });
+  };
+  const stageAgainst = (pr, ...args) => {
+    fake.setScript(script(pr));
+    return cli(['agent-log', 'stage', '--pr', String(PR), ...args], { dir: repo.dir, fake });
+  };
   const queueFile = () => join(repo.dir, '.git', 'claude-pipeline', 'agent-log-queue.jsonl');
-  return { repo, fake, q, stage, queueFile };
+  return { repo, fake, q, stage, stageAgainst, prFor, queueFile };
 }
 
 test('agent-log queue: appends {line, at} to the queue file under the git common dir', () => {
@@ -228,3 +241,70 @@ test('agent-log: the queue is shared across worktrees of one repo (lines queued 
   }
 });
 
+
+// ---- agent-log stage: which branch it may commit to (reviewer finding 5) -----------------------------
+
+test('agent-log stage: refuses on the default branch (reviewer repro D) and on master/main, committing and queueing nothing', () => {
+  const t = logRepo();
+  t.repo.git(['checkout', '-q', 'main']);
+  t.q('- queued');
+  const head = t.repo.git(['rev-parse', 'HEAD']).trim();
+  const r = t.stage('--line', '- x');
+  assert.equal(r.code, 2, `${r.stderr}\n${r.stdout}`);
+  assert.equal(r.json.ok, false);
+  assert.equal(r.json.error, 'branch');
+  assert.match(r.json.message, /default branch/);
+  assert.equal(t.repo.git(['rev-parse', 'HEAD']).trim(), head, 'no commit landed on main');
+  assert.equal(existsSync(join(t.repo.dir, AGENT_LOG)), false);
+  assert.match(readFileSync(t.queueFile(), 'utf8'), /queued/, 'the queue was not consumed');
+
+  // main/master are refused even when config names another default branch
+  const other = createTmpRepo();
+  other.write('.claude/pipeline.yml', `${pipelineYml()}default_branch: trunk\n`);
+  other.write('.gitignore', '.review/\n');
+  other.commit('init');
+  for (const name of ['master', 'main', 'trunk']) {
+    other.git(['checkout', '-q', '-B', name]);
+    const refused = cli(['agent-log', 'stage', '--pr', '12', '--line', '- x'], { dir: other.dir, fake: t.fake });
+    assert.equal(refused.code, 2, name);
+    assert.equal(refused.json.error, 'branch', name);
+  }
+});
+
+test('agent-log stage: refuses on a detached HEAD', () => {
+  const t = logRepo();
+  t.repo.git(['checkout', '-q', '--detach']);
+  const head = t.repo.git(['rev-parse', 'HEAD']).trim();
+  const r = cli(['agent-log', 'stage', '--pr', '12', '--line', '- x'], { dir: t.repo.dir, fake: t.fake });
+  assert.equal(r.code, 2);
+  assert.equal(r.json.error, 'branch');
+  assert.match(r.json.message, /detached/);
+  assert.equal(t.repo.git(['rev-parse', 'HEAD']).trim(), head);
+});
+
+test('agent-log stage: the PR must be this branch at this commit, even when --line is given', () => {
+  const t = logRepo();
+  const head = t.repo.git(['rev-parse', 'HEAD']).trim();
+  const wrongBranch = t.stageAgainst(t.prFor({ headRefName: 'agent/other' }), '--line', '- x');
+  assert.equal(wrongBranch.code, 2, `${wrongBranch.stderr}\n${wrongBranch.stdout}`);
+  assert.equal(wrongBranch.json.error, 'pr-mismatch');
+  assert.match(wrongBranch.json.message, /agent\/other/);
+  const wrongHead = t.stageAgainst(t.prFor({ headRefOid: 'd'.repeat(40) }), '--line', '- x');
+  assert.equal(wrongHead.code, 2);
+  assert.equal(wrongHead.json.error, 'pr-mismatch');
+  assert.match(wrongHead.json.message, /dddddddd/);
+  const noFields = t.stageAgainst({}, '--line', '- x');
+  assert.equal(noFields.code, 2, 'a PR reply without the fields proves nothing');
+  assert.equal(t.repo.git(['rev-parse', 'HEAD']).trim(), head, 'nothing was committed');
+  assert.equal(existsSync(join(t.repo.dir, AGENT_LOG)), false);
+  assert.ok(t.fake.lines().some((l) => l === 'pr view 12 --json headRefName,headRefOid'), 'the PR is fetched even with --line');
+});
+
+test('agent-log stage: an unreachable GitHub is exit 3 and commits nothing', () => {
+  const t = logRepo();
+  t.fake.setScript([{ match: '.', code: 1, stderr: 'HTTP 401' }]);
+  const head = t.repo.git(['rev-parse', 'HEAD']).trim();
+  const r = cli(['agent-log', 'stage', '--pr', '12', '--line', '- x'], { dir: t.repo.dir, fake: t.fake });
+  assert.equal(r.code, 3);
+  assert.equal(t.repo.git(['rev-parse', 'HEAD']).trim(), head);
+});

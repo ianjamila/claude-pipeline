@@ -4,7 +4,7 @@
 import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
-import { isClean } from '../lib/git.mjs';
+import { currentBranch, headSha, isClean } from '../lib/git.mjs';
 import { loadState } from '../lib/state.mjs';
 import { LockTimeoutError } from '../lib/locks.mjs';
 import { inlineOptionValues } from '../lib/finalgate.mjs';
@@ -17,7 +17,8 @@ export const meta = {
   usage: [
     'pipeline agent-log queue --line "<line>" [--repo DIR]   -> {ok, queued, file}',
     'pipeline agent-log stage --pr N [--line "<line>"] [--repo DIR]   -> {ok, committed, lines, file}; run in the PR worktree;',
-    '  default line = the PR\'s agent-log line with outcome "merged — prod smoke pending"; exit 2 when the worktree has other uncommitted changes',
+    '  default line = the PR\'s agent-log line with outcome "merged — prod smoke pending"; exit 2 when the worktree has other uncommitted changes,',
+    '  is on the default branch or a detached HEAD, or is not the PR\'s head branch at the PR\'s head commit; exit 3 when GitHub cannot say',
   ].join('\n'),
 };
 
@@ -54,6 +55,24 @@ async function stage(rest, ctx) {
   } catch (err) {
     throw new Fail(EXIT.USAGE, { ok: false, error: 'config', message: err.message });
   }
+  // Never commit on the default branch or a detached HEAD, and only on the PR's own head: --line must not bypass this,
+  // so the PR is always looked up (the title is only fetched when the default line needs it).
+  const branch = currentBranch({ cwd: root });
+  if (branch === 'HEAD') {
+    throw new Fail(EXIT.USAGE, { ok: false, error: 'branch', message: 'HEAD is detached: check out the PR branch before staging the agent log' });
+  }
+  if ([config.default_branch, 'main', 'master'].includes(branch)) {
+    throw new Fail(EXIT.USAGE, { ok: false, error: 'branch', message: `refusing to commit the agent log on the default branch (${branch}): run this in the PR's worktree` });
+  }
+  const local = headSha({ cwd: root });
+  const gh = createGitHub({ cwd: root, env: ctx.env });
+  const info = await guardGh(() => gh.prView(pr, ['headRefName', 'headRefOid']));
+  if (info?.headRefName !== branch) {
+    throw new Fail(EXIT.USAGE, { ok: false, error: 'pr-mismatch', message: `PR #${pr} is for branch ${JSON.stringify(info?.headRefName)}, this worktree is on ${JSON.stringify(branch)}` });
+  }
+  if (info.headRefOid !== local) {
+    throw new Fail(EXIT.USAGE, { ok: false, error: 'pr-mismatch', message: `PR #${pr} head is ${String(info.headRefOid).slice(0, 8)}, this worktree is at ${local.slice(0, 8)}: push or pull first` });
+  }
   // Staging commits ONLY the log: anything else uncommitted would be swept into that commit or left in a confusing state.
   if (!isClean({ cwd: root })) {
     throw new Fail(EXIT.USAGE, { ok: false, error: 'dirty', message: 'the worktree has uncommitted changes besides the agent log; commit or stash them first' });
@@ -61,7 +80,7 @@ async function stage(rest, ctx) {
 
   let line = explicit;
   if (line === null) {
-    const title = await guardGh(() => createGitHub({ cwd: root, env: ctx.env }).prView(pr, ['title']).title);
+    const title = await guardGh(() => gh.prView(pr, ['title']).title);
     let state = null;
     try {
       state = loadState(root);

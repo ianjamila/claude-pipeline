@@ -108,3 +108,41 @@ test('final-gate: a log edit that removes or rewrites a line is not log-only, an
   });
   assert.equal(named(appendOnly.gate().json, 'review').detail, 'log-only');
 });
+
+test('final-gate: a partial verify report is rejected however it says so (reviewer repro H)', () => {
+  const one = (r) => { r.steps = r.steps.slice(0, 1); r.expectedSteps = r.expectedSteps.slice(0, 1); };
+  const cases = [
+    ['partial: true on a one-step run', (r) => { r.partial = true; one(r); }, /partial/],
+    ['partial: true on a complete run', (r) => { r.partial = true; }, /partial/],
+    ['partial as a string', (r) => { r.partial = 'false'; }, /partial/],
+    ['partial: null', (r) => { r.partial = null; }, /partial/],
+    ['partial: 0', (r) => { r.partial = 0; }, /partial/],
+    ['mode missing', (r) => { delete r.mode; }, /not "full"/],
+    ['mode missing and partial missing', (r) => { delete r.mode; delete r.partial; }, /not "full"/],
+  ];
+  for (const [label, mutate, detail] of cases) {
+    const r = scenario({ report: mutate }).gate();
+    assert.equal(r.code, 1, label);
+    assert.deepEqual(r.json.failed, ['verify-report'], label);
+    assert.match(named(r.json, 'verify-report').detail, detail, label);
+  }
+});
+
+test('final-gate: a full report passes with partial === false, and with the field absent (the verify template does not write it)', () => {
+  assert.equal(scenario({ report: (r) => { r.partial = false; } }).gate().code, 0);
+  assert.equal(scenario().gate().code, 0);
+});
+
+test('final-gate: a review state whose pr is missing, zero, a string or another PR fails review (reviewer finding 8)', () => {
+  for (const [label, pr] of [['missing', undefined], ['zero', 0], ['negative', -3], ['a string', '12'], ['a float', 12.5], ['null', null]]) {
+    const s = scenario();
+    const state = reviewState(s.hash);
+    if (pr === undefined) delete state.pr;
+    else state.pr = pr;
+    saveState(s.repo.dir, state);
+    const r = s.gate();
+    assert.equal(r.code, 1, label);
+    assert.deepEqual(r.json.failed, ['review'], label);
+    assert.match(named(r.json, 'review').detail, /review state is for PR|records no valid PR/, label);
+  }
+});

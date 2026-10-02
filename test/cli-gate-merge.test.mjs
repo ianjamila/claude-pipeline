@@ -1,9 +1,18 @@
 // merge: the gate file must vouch for this head and patch, the live PR must still be clean, and only an observed MERGED counts.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { cli, scenario, ghEntries, PR, MERGE_SHA } from './helpers/gate-env.mjs';
+import { CANONICAL_CHECKS } from '../pipeline/lib/finalgate.mjs';
+
+const failing = (name) => ({ name, state: 'FAILURE', bucket: 'fail' });
+// What the gh fake answers from the moment the merge command has run (see FAKE_MERGE_SWAP in helpers/gate-env.mjs).
+const swapTo = (s, entries) => {
+  const file = join(s.repo.dir, '.review', 'swap.json');
+  writeFileSync(file, JSON.stringify(entries));
+  return { FAKE_MERGE_SWAP: file };
+};
 
 // ---- merge ----------------------------------------------------------------------------------------
 
@@ -195,12 +204,16 @@ test('merge: with production configured the known-good deployment is recorded BE
   assert.ok(Date.parse(rec.at) <= Date.now());
 });
 
-test('merge: production with no successful deployment yet records nulls; an unreachable deployments API refuses the merge', () => {
+test('merge: production configured but no known-good deployment found refuses (exit 3); an unreachable deployments API refuses too', () => {
   const none = scenario({ production: true, gh: { extra: [{ match: 'deployments\\?', stdoutJson: [] }] } });
   assert.equal(none.gate().code, 0);
-  const ok = none.merge();
-  assert.equal(ok.code, 0);
-  assert.deepEqual(JSON.parse(readFileSync(join(none.repo.dir, '.review', 'prod-before.json'), 'utf8')).id, null);
+  const refused = none.merge();
+  assert.equal(refused.code, 3, 'no rollback target means no merge');
+  assert.equal(refused.json.ok, false);
+  assert.equal(refused.json.merged, false);
+  assert.match(refused.json.reason, /known-good production deployment not found/);
+  assert.deepEqual(none.mergeCalls(), []);
+  assert.equal(existsSync(join(none.repo.dir, '.review', 'prod-before.json')), false);
 
   const down = scenario({ production: true, gh: { extra: [{ match: 'deployments\\?', code: 1, stderr: 'HTTP 500' }] } });
   assert.equal(down.gate().code, 0);
@@ -209,3 +222,144 @@ test('merge: production with no successful deployment yet records nulls; an unre
   assert.deepEqual(down.mergeCalls(), []);
 });
 
+
+// ---- merge re-runs the whole gate live (reviewer finding 1) ----------------------------------------
+
+test('merge: CI turning red after a passing gate refuses the merge (reviewer repro A)', () => {
+  const s = scenario();
+  assert.equal(s.gate().code, 0);
+  s.fake.setScript(ghEntries({ prHead: s.head, ci: [failing('ci')] }));
+  const r = s.merge();
+  assert.equal(r.code, 1, `${r.stderr}\n${r.stdout}`);
+  assert.equal(r.json.merged, false);
+  assert.equal(r.json.error, 'live-check');
+  assert.match(r.json.reasons.join(), /ci:.*ci=fail/);
+  assert.deepEqual(s.mergeCalls(), [], 'the merge command must not run');
+});
+
+test('merge: a forged final-gate.json cannot merge a PR that fails the live gate (reviewer repro B)', () => {
+  const s = scenario({ report: null, state: null, gh: { ci: [{ name: 'ci', state: 'PENDING', bucket: 'pending' }] } });
+  assert.equal(s.gate().code, 1);
+  const forged = { ok: true, repo: 'acme/widgets', pr: PR, head: s.head, contentHash: s.hash, checks: CANONICAL_CHECKS.map((name) => ({ name, ok: true, detail: '' })), at: new Date().toISOString() };
+  writeFileSync(join(s.repo.dir, '.review', 'final-gate.json'), JSON.stringify(forged));
+  const r = s.merge();
+  assert.equal(r.code, 1);
+  assert.equal(r.json.error, 'live-check');
+  const text = r.json.reasons.join('\n');
+  assert.match(text, /verify-report:/);
+  assert.match(text, /review:/);
+  assert.match(text, /ci:/);
+  assert.deepEqual(s.mergeCalls(), []);
+});
+
+test('merge: a gate that lacks any canonical check, or carries an unknown one, is refused before anything runs', () => {
+  const s = scenario();
+  assert.equal(s.gate().code, 0);
+  const attempt = (label, edit, expected) => {
+    s.editGate(edit);
+    const r = s.merge();
+    assert.equal(r.code, 1, label);
+    assert.equal(r.json.error, 'gate', label);
+    assert.match(r.json.reasons.join(), expected, label);
+    assert.deepEqual(s.mergeCalls(), [], label);
+    assert.equal(s.gate().code, 0);
+  };
+  attempt('only one check', (g) => { g.checks = [{ name: 'x', ok: true, detail: '' }]; }, /missing canonical check\(s\): pr-open, labels/);
+  attempt('ci dropped', (g) => { g.checks = g.checks.filter((c) => c.name !== 'ci'); }, /missing canonical check\(s\): ci/);
+  attempt('review dropped', (g) => { g.checks = g.checks.filter((c) => c.name !== 'review'); }, /missing canonical check\(s\): review/);
+  attempt('an extra check', (g) => { g.checks.push({ name: 'bonus', ok: true, detail: '' }); }, /unexpected check\(s\): bonus/);
+  attempt('a duplicated check', (g) => { g.checks.push({ ...g.checks[0] }); }, /more than once/);
+});
+
+test('merge: with preview configured the gate must carry a preview check', () => {
+  const s = scenario({ preview: true, previewSmoke: (head) => ({ ok: true, sha: head, url: 'https://pr-12.example.test' }) });
+  assert.equal(s.gate().code, 0);
+  s.editGate((g) => { g.checks = g.checks.filter((c) => c.name !== 'preview'); });
+  const r = s.merge();
+  assert.equal(r.code, 1);
+  assert.match(r.json.reasons.join(), /missing canonical check\(s\): preview/);
+  assert.deepEqual(s.mergeCalls(), []);
+});
+
+test('merge: a gate with no repo, or another repo, is refused', () => {
+  const s = scenario();
+  assert.equal(s.gate().code, 0);
+  s.editGate((g) => { delete g.repo; });
+  const missing = s.merge();
+  assert.equal(missing.code, 1);
+  assert.match(missing.json.reasons.join(), /records no repo/);
+  s.editGate((g) => { g.repo = null; });
+  assert.match(s.merge().json.reasons.join(), /records no repo/);
+  assert.deepEqual(s.mergeCalls(), []);
+});
+
+test('merge: the live gate runs AFTER the production lookup and right before the merge command', () => {
+  const deployments = [
+    { match: 'deployments/7/statuses', stdoutJson: [{ state: 'success', environment_url: 'https://prod-7.example.test' }] },
+    { match: 'deployments\\?.*environment=Production', stdoutJson: [{ id: 7, sha: 'b'.repeat(40), created_at: '2026-10-01T00:00:00Z' }] },
+  ];
+  const s = scenario({ production: true, gh: { extra: deployments } });
+  assert.equal(s.gate().code, 0);
+  const before = s.fake.lines().length;
+  assert.equal(s.merge().code, 0);
+  const lines = s.fake.lines().slice(before);
+  const lookup = lines.findIndex((l) => /deployments\?/.test(l));
+  const lastCiRead = lines.map((l, i) => (l.startsWith('pr checks 12') ? i : -1)).filter((i) => i >= 0).at(-1);
+  assert.ok(lookup >= 0 && lastCiRead > lookup, `production lookup at ${lookup}, last CI read at ${lastCiRead}`);
+});
+
+// ---- the wait: blockers that appear while auto-merge is queued (reviewer finding 6) ----------------
+
+test('merge: a blocking label that appears while waiting disables auto-merge and exits 1', () => {
+  const s = scenario({ gh: { mergeView: { state: 'OPEN', mergeCommit: null } } });
+  assert.equal(s.gate().code, 0);
+  const swap = swapTo(s, ghEntries({ prHead: s.head, mergeView: { state: 'OPEN', mergeCommit: null, labels: [{ name: 'needs-human' }] } }));
+  const r = s.merge({ ...swap, PIPELINE_MERGE_WAIT_MS: '5000', PIPELINE_MERGE_POLL_MS: '50' });
+  assert.equal(r.code, 1, `${r.stderr}\n${r.stdout}`);
+  assert.equal(r.json.ok, false);
+  assert.equal(r.json.merged, false);
+  assert.equal(r.json.autoMergeDisabled, true);
+  assert.match(r.json.reason, /needs-human/);
+  assert.match(r.json.reason, /auto-merge disabled/);
+  assert.ok(s.fake.lines().includes('pr merge 12 --disable-auto'));
+});
+
+test('merge: a pause or rollback issue that opens while waiting disables auto-merge and exits 1', () => {
+  for (const [label, extra, expected] of [
+    ['pause', { pause: [{ number: 5, title: 'pause', url: 'u' }] }, /pipeline-pause issue #5/],
+    ['rollback', { rollback: [{ number: 6, title: 'rb', url: 'u' }] }, /pipeline-rollback issue #6/],
+  ]) {
+    const s = scenario({ gh: { mergeView: { state: 'OPEN', mergeCommit: null } } });
+    assert.equal(s.gate().code, 0, label);
+    const swap = swapTo(s, ghEntries({ prHead: s.head, mergeView: { state: 'OPEN', mergeCommit: null }, ...extra }));
+    const r = s.merge({ ...swap, PIPELINE_MERGE_WAIT_MS: '5000', PIPELINE_MERGE_POLL_MS: '50' });
+    assert.equal(r.code, 1, label);
+    assert.equal(r.json.merged, false, label);
+    assert.match(r.json.reason, expected, label);
+    assert.ok(s.fake.lines().includes('pr merge 12 --disable-auto'), label);
+  }
+});
+
+test('merge: a PR that reports labels as something other than a list is treated as blocked while waiting', () => {
+  const s = scenario({ gh: { mergeView: { state: 'OPEN', mergeCommit: null } } });
+  assert.equal(s.gate().code, 0);
+  const swap = swapTo(s, ghEntries({ prHead: s.head, mergeView: { state: 'OPEN', mergeCommit: null, labels: null } }));
+  const r = s.merge({ ...swap, PIPELINE_MERGE_WAIT_MS: '5000', PIPELINE_MERGE_POLL_MS: '50' });
+  assert.equal(r.code, 1);
+  assert.match(r.json.reason, /labels/);
+  assert.ok(s.fake.lines().includes('pr merge 12 --disable-auto'));
+});
+
+// ---- the merge commit (reviewer finding 10) --------------------------------------------------------
+
+test('merge: MERGED but no merge commit is re-read three times, then fails with a reason', () => {
+  const s = scenario({ gh: { mergeView: { state: 'MERGED', mergeCommit: null } } });
+  assert.equal(s.gate().code, 0);
+  const r = s.merge({ PIPELINE_MERGE_POLL_MS: '10' });
+  assert.equal(r.code, 1, `${r.stderr}\n${r.stdout}`);
+  assert.equal(r.json.ok, false);
+  assert.equal(r.json.mergeSha, null);
+  assert.match(r.json.reason, /merge commit/);
+  const reads = s.fake.lines().filter((l) => l.startsWith('pr view 12 --json state,mergeCommit'));
+  assert.equal(reads.length, 4, 'one read plus three re-reads');
+});

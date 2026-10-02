@@ -4,7 +4,7 @@
 // split over several files only so node runs them in parallel: each CLI call costs about a second.
 import { strict as assert } from 'node:assert';
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './tmprepo.mjs';
@@ -23,7 +23,8 @@ export const REPO = { match: '^repo view', stdoutJson: REPO_VIEW };
 // Spawns the real CLI inside `dir` against a fake gh. PIPELINE_* switches of the caller are scrubbed so a developer
 // running this inside a pipeline session cannot change the outcome.
 export function cli(args, { dir, fake, env = {} }) {
-  const base = { ...process.env, ...(fake?.env ?? {}), ...createFakeCodex().env, ...env };
+  // PIPELINE_MERGEABLE_PAUSE_MS shortens the 2 s wait between `mergeable: UNKNOWN` re-reads (it can never lengthen it).
+  const base = { ...process.env, PIPELINE_MERGEABLE_PAUSE_MS: '1', ...(fake?.env ?? {}), ...createFakeCodex().env, ...env };
   for (const k of ['PIPELINE_OFF', 'PIPELINE_ADMIN', 'PIPELINE_MERGE_WAIT_MS', 'PIPELINE_MERGE_POLL_MS']) if (!(k in env)) delete base[k];
   const r = spawnSync(process.execPath, [bin, ...args], { cwd: dir, env: base, encoding: 'utf8', timeout: 120_000 });
   let json = null;
@@ -36,9 +37,10 @@ export function cli(args, { dir, fake, env = {} }) {
 // ---- scenario: a PR branch with a full evidence trail ---------------------------------------------
 
 const FAKE_MERGE = [
-  "import { appendFileSync, mkdirSync } from 'node:fs';",
+  "import { appendFileSync, copyFileSync, mkdirSync } from 'node:fs';",
   "mkdirSync('.review', { recursive: true });",
   "appendFileSync('.review/merge-calls.log', `${process.argv.slice(2).join(' ')}\\n`);",
+  "if (process.env.FAKE_MERGE_SWAP) copyFileSync(process.env.FAKE_MERGE_SWAP, process.env.PIPELINE_FAKE_GH_SCRIPT);",
   "if (process.env.FAKE_MERGE_EXIT) { process.stderr.write('merge gate refused: base moved\\n'); process.exit(Number(process.env.FAKE_MERGE_EXIT)); }",
   '',
 ].join('\n');
@@ -70,16 +72,34 @@ export function reviewState(hash, { pending = false } = {}) {
   return s;
 }
 
+export const PREVIEW_URL = 'https://pr-12.example.test';
+
+// GitHub deployments for the PR head in the Preview environment. `previewDeploy`: undefined = no entries (the gh fake
+// then errors on the lookup), null = GitHub reports no deployment, object = {url, sha?, state?, id?}.
+function previewDeployEntries(o) {
+  if (o.previewDeploy === undefined) return [];
+  if (o.previewDeploy === null) return [{ match: 'deployments\\?.*sha=', stdoutJson: [] }];
+  const d = o.previewDeploy;
+  return [
+    { match: 'deployments/901/statuses', stdoutJson: [{ state: d.state ?? 'success', environment_url: d.url }] },
+    { match: 'deployments\\?.*sha=', stdoutJson: [{ id: 901, sha: d.sha ?? o.prHead, environment: 'Preview', created_at: '2026-10-01T00:00:00Z' }] },
+  ];
+}
+
 export function ghEntries(o) {
   const pr = {
     state: o.state ?? 'OPEN', headRefOid: o.prHead, baseRefName: o.base ?? 'main', isDraft: o.isDraft ?? false,
-    labels: (o.labels ?? []).map((name) => ({ name })), mergeable: o.mergeable ?? 'MERGEABLE',
+    labels: 'rawLabels' in o ? o.rawLabels : (o.labels ?? []).map((name) => ({ name })), mergeable: o.mergeable ?? 'MERGEABLE',
   };
+  if (o.noLabels) delete pr.labels; // `labels` absent from the reply entirely
+  if (o.noMergeable) delete pr.mergeable;
+
   const ci = o.ci ?? [{ name: 'ci', state: 'SUCCESS', bucket: 'pass' }];
   return [
     ...(o.extra ?? []),
+    ...previewDeployEntries(o),
     { match: '^pr view 12 --json state,headRefOid', stdoutJson: pr },
-    { match: '^pr view 12 --json state,mergeCommit', stdoutJson: o.mergeView ?? { state: 'MERGED', mergeCommit: { oid: MERGE_SHA } } },
+    { match: '^pr view 12 --json state,mergeCommit', stdoutJson: { labels: [], ...(o.mergeView ?? { state: 'MERGED', mergeCommit: { oid: MERGE_SHA } }) } },
     { match: '^pr merge 12 --disable-auto', code: o.disableAutoCode ?? 0 },
     o.requiredCi === 'error'
       ? { match: '^pr checks 12 .*--required$', code: 1, stderr: "no required checks reported on the 'main' branch" }
@@ -128,7 +148,7 @@ export function scenario(opts = {}) {
   opts.afterReport?.(repo);
   if (opts.previewSmoke !== undefined) repo.write('.review/preview-smoke.json', JSON.stringify(opts.previewSmoke(head)));
 
-  const fake = createFakeGh(ghEntries({ prHead: head, ...opts.gh }));
+  const fake = createFakeGh(ghEntries({ prHead: head, ...(opts.preview ? { previewDeploy: { url: PREVIEW_URL } } : {}), ...opts.gh }));
   const env = opts.env ?? {};
   const s = {
     repo, fake, head, hash, env,

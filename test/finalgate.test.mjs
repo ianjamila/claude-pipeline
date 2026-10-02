@@ -6,8 +6,8 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  BLOCKING_LABELS, GATE_MAX_AGE_MS, blockingLabelsOf, gateRefusals, inlineOptionValues, isDocsOnly, isLogOnly, labelNames, mergeTiming,
-  readReviewJson, tailLines, waitForMerge, writeReviewJson,
+  BLOCKING_LABELS, CANONICAL_CHECKS, GATE_MAX_AGE_MS, abandonMerge, blockingLabelsOf, expectedCheckNames, gateRefusals, inlineOptionValues,
+  isDocsOnly, isLogOnly, labelNames, labelsCheck, mergeTiming, readPrSettled, readReviewJson, tailLines, waitForMerge, writeReviewJson,
 } from '../pipeline/lib/finalgate.mjs';
 import {
   AGENT_LOG_HEADER, appendLines, assertSingleLine, buildAgentLogLine, countArbiterCalls, resolveLogPath,
@@ -18,17 +18,37 @@ const SHA = 'a'.repeat(40);
 
 // ---- classifiers ---------------------------------------------------------------------------------
 
-test('isDocsOnly: markdown anywhere or anything under docs/ counts; one code file spoils it; empty is not docs-only', () => {
-  assert.equal(isDocsOnly([f('README.md'), f('docs/a/b.png'), f('packages/x/NOTES.md')]), true);
+test('isDocsOnly: only .md/.mdx/.txt text files count; one code file spoils it; empty is not docs-only', () => {
+  assert.equal(isDocsOnly([f('README.md'), f('docs/a/b.mdx'), f('packages/x/NOTES.md'), f('docs/notes.txt')]), true);
   assert.equal(isDocsOnly([f('README.md'), f('src/app.js')]), false);
   assert.equal(isDocsOnly([]), false);
   assert.equal(isDocsOnly(null), false);
+});
+
+test('isDocsOnly: files under docs/ that are not text docs are NOT docs-only (reviewer repro E)', () => {
+  assert.equal(isDocsOnly([f('docs/deploy.sh')]), false);
+  assert.equal(isDocsOnly([f('docs/x.png', { binary: true })]), false);
+  assert.equal(isDocsOnly([f('docs/x.md', { binary: true })]), false, 'binary content never counts, whatever the name');
+  assert.equal(isDocsOnly([f('docs/build.mjs')]), false);
+  assert.equal(isDocsOnly([f('docs/a/b.png')]), false);
+  assert.equal(isDocsOnly([f('docsx/a.js')]), false);
+  assert.equal(isDocsOnly([f('README.MD')]), true, 'extensions are case-insensitive');
+});
+
+test('isDocsOnly: instruction, hook, workflow and pipeline directories are never docs, markdown or not', () => {
+  for (const p of ['.claude/skills/a.md', '.claude/commands/x.md', '.github/pull_request_template.md', '.githooks/README.md', 'skills/ship/SKILL.md',
+    'agents/reviewer.md', 'pipeline/README.md', 'scripts/NOTES.txt', 'packages/x/skills/a.md', 'docs/pipeline/design.md']) {
+    assert.equal(isDocsOnly([f('README.md'), f(p)]), false, p);
+  }
+  assert.equal(isDocsOnly([f('docs/pipelines.md'), f('my-scripts/readme.md')]), true, 'only whole directory names are excluded');
+  assert.equal(isDocsOnly([{ path: 'docs/a.md', status: 'A' }]), true, 'a file record without oldPath/newPath still works');
 });
 
 test('isDocsOnly: a rename counts by BOTH paths (moving code into docs/ is not a docs change)', () => {
   const moved = { path: 'docs/app.md', oldPath: 'src/app.js', newPath: 'docs/app.md', status: 'R', binary: false, added: [], removed: [] };
   assert.equal(isDocsOnly([moved]), false);
   assert.equal(isDocsOnly([{ ...moved, oldPath: 'docs/old.md' }]), true);
+  assert.equal(isDocsOnly([{ ...moved, oldPath: 'docs/old.sh' }]), false);
 });
 
 test('isLogOnly: only additions to the configured log file qualify', () => {
@@ -44,11 +64,38 @@ test('isLogOnly: only additions to the configured log file qualify', () => {
   assert.equal(isLogOnly([f('docs/other.md')], log), false);
 });
 
+test('isLogOnly: a file record without `removed` counts as no removals; unexpected shapes fail closed (reviewer finding 11)', () => {
+  const log = 'docs/agent-log.md';
+  const bare = { path: log, status: 'A', binary: false };
+  assert.equal(isLogOnly([bare], log), true);
+  assert.equal(isLogOnly([{ ...bare, removed: undefined }], log), true);
+  assert.equal(isLogOnly([{ ...bare, removed: null }], log), false);
+  assert.equal(isLogOnly([{ ...bare, removed: 'x' }], log), false);
+  assert.equal(isLogOnly([{ ...bare, removed: { length: 0 } }], log), false);
+  assert.equal(isLogOnly([null], log), false);
+  assert.equal(isLogOnly(['docs/agent-log.md'], log), false);
+  assert.equal(isLogOnly([{ ...bare, status: undefined }], log), false);
+  assert.equal(isLogOnly([{ ...bare, removed: [{ line: 1, text: 'x' }] }], log), false);
+  assert.equal(isLogOnly({ path: log }, log), false);
+});
+
 test('blocking labels: objects or strings, matched case-insensitively', () => {
   assert.deepEqual(labelNames([{ name: 'a' }, 'b', null, {}]), ['a', 'b']);
   assert.deepEqual(blockingLabelsOf([{ name: 'Needs-Human' }, { name: 'bug' }, 'pipeline-blocked']), ['Needs-Human', 'pipeline-blocked']);
   assert.deepEqual(blockingLabelsOf(undefined), []);
   assert.deepEqual([...BLOCKING_LABELS], ['needs-human', 'awaiting-review', 'pipeline-blocked']);
+});
+
+test('labelsCheck: labels must be a list of objects with string names; anything else fails closed (reviewer finding 7)', () => {
+  assert.equal(labelsCheck({ labels: [] }).ok, true);
+  assert.equal(labelsCheck({ labels: [{ name: 'bug' }] }).ok, true);
+  assert.equal(labelsCheck({ labels: [{ name: 'needs-human' }] }).ok, false);
+  for (const labels of [undefined, null, 'needs-human', {}, [{}], [null], [{ name: 7 }], [{ name: 'bug' }, {}], ['bug'], [[]]]) {
+    const c = labelsCheck({ labels });
+    assert.equal(c.ok, false, JSON.stringify(labels));
+    assert.match(c.detail, /labels/, JSON.stringify(labels));
+  }
+  assert.equal(labelsCheck(undefined).ok, false);
 });
 
 test('tailLines: last N lines, colours stripped, long lines clipped, trailing blanks dropped', () => {
@@ -73,10 +120,11 @@ test('inlineOptionValues: folds \`--name value\` into \`--name=value\` so dash-l
 // ---- gateRefusals --------------------------------------------------------------------------------
 
 const NOW = Date.parse('2026-10-01T12:00:00Z');
+const checksOf = (names = CANONICAL_CHECKS) => names.map((name) => ({ name, ok: true, detail: '' }));
 const goodGate = (over = {}) => ({
-  ok: true, repo: 'acme/widgets', pr: 12, head: SHA, contentHash: 'h1', at: '2026-10-01T11:50:00Z', checks: [{ name: 'x', ok: true, detail: '' }], ...over,
+  ok: true, repo: 'acme/widgets', pr: 12, head: SHA, contentHash: 'h1', at: '2026-10-01T11:50:00Z', checks: checksOf(), ...over,
 });
-const refusals = (gate, over = {}) => gateRefusals({ gate, pr: 12, head: SHA, prHead: SHA, hash: 'h1', now: NOW, ...over });
+const refusals = (gate, over = {}) => gateRefusals({ gate, pr: 12, head: SHA, prHead: SHA, hash: 'h1', repo: 'acme/widgets', now: NOW, ...over });
 
 test('gateRefusals: a matching, fresh gate has no refusals', () => {
   assert.deepEqual(refusals(goodGate()), []);
@@ -86,7 +134,7 @@ test('gateRefusals: every mismatch is refused, each with its own reason', () => 
   const other = 'b'.repeat(40);
   assert.match(refusals(null)[0], /no final-gate\.json/);
   assert.match(refusals(goodGate({ ok: false })).join(), /did not pass/);
-  assert.match(refusals(goodGate({ checks: [{ name: 'x', ok: false }] })).join(), /failing or missing checks/);
+  assert.match(refusals(goodGate({ checks: [{ name: 'pr-open', ok: false }, ...checksOf().slice(1)] })).join(), /failing or missing checks/);
   assert.match(refusals(goodGate({ checks: [] })).join(), /failing or missing checks/);
   assert.match(refusals(goodGate({ pr: 13 })).join(), /PR #13, not #12/);
   assert.match(refusals(goodGate({ head: 'short' })).join(), /no valid head SHA/);
@@ -95,6 +143,29 @@ test('gateRefusals: every mismatch is refused, each with its own reason', () => 
   assert.match(refusals(goodGate({ contentHash: 'h2' })).join(), /content hash differs/);
   assert.match(refusals(goodGate({ contentHash: '' }), { hash: '' }).join(), /content hash differs/, 'an empty hash never matches an empty hash');
   assert.match(refusals(goodGate(), { hash: '' }).join(), /content hash differs/);
+});
+
+test('gateRefusals: the check-name set is pinned: every canonical check, once, and nothing else', () => {
+  assert.deepEqual([...CANONICAL_CHECKS], ['pr-open', 'labels', 'preflight', 'verify-report', 'hardstops', 'integrity', 'review', 'ci']);
+  assert.deepEqual(expectedCheckNames(false), [...CANONICAL_CHECKS]);
+  assert.deepEqual(expectedCheckNames(true), [...CANONICAL_CHECKS, 'preview']);
+  assert.deepEqual(refusals(goodGate({ checks: checksOf(expectedCheckNames(true)) }), { previewConfigured: true }), []);
+  assert.match(refusals(goodGate({ checks: [{ name: 'x', ok: true }] })).join(), /missing canonical check\(s\): pr-open, labels, preflight, verify-report, hardstops, integrity, review, ci/);
+  assert.match(refusals(goodGate({ checks: checksOf().filter((c) => c.name !== 'ci') })).join(), /missing canonical check\(s\): ci$/);
+  assert.match(refusals(goodGate({ checks: checksOf(CANONICAL_CHECKS.filter((n) => n !== 'review')) })).join(), /missing canonical check\(s\): review/);
+  assert.match(refusals(goodGate(), { previewConfigured: true }).join(), /missing canonical check\(s\): preview/);
+  assert.match(refusals(goodGate({ checks: checksOf(expectedCheckNames(true)) })).join(), /unexpected check\(s\): preview/);
+  assert.match(refusals(goodGate({ checks: [...checksOf(), { name: 'bonus', ok: true }] })).join(), /unexpected check\(s\): bonus/);
+  assert.match(refusals(goodGate({ checks: [...checksOf(), { name: 'ci', ok: true }] })).join(), /more than once/);
+  assert.match(refusals(goodGate({ checks: [...checksOf().slice(0, 7), null] })).join(), /failing or missing checks/);
+});
+
+test('gateRefusals: the gate must name the repo it is being merged in', () => {
+  assert.match(refusals(goodGate({ repo: undefined })).join(), /records no repo/);
+  assert.match(refusals(goodGate({ repo: '' })).join(), /records no repo/);
+  assert.match(refusals(goodGate({ repo: 7 })).join(), /records no repo/);
+  assert.match(refusals(goodGate({ repo: 'someone/else' })).join(), /someone\/else, not acme\/widgets/);
+  assert.match(refusals(goodGate(), { repo: undefined }).join(), /could not determine the repo/);
 });
 
 test('gateRefusals: age limit is 30 minutes; a missing, bad or future timestamp is refused', () => {
@@ -152,6 +223,68 @@ test('waitForMerge: zero wait looks exactly once; transient errors are tolerated
   const r = await waitForMerge({ gh: dead, pr: 12, waitMs: 60_000, pollMs: 1, ...clock() });
   assert.equal(r.state, 'error');
   assert.match(r.error, /c/);
+});
+
+test('waitForMerge: a blocker found on an OPEN poll ends the wait at once; MERGED is never second-guessed', async () => {
+  const gh = fakeGh([{ state: 'OPEN', labels: [] }, { state: 'OPEN', labels: [{ name: 'needs-human' }] }, { state: 'MERGED', mergeCommit: { oid: 'abc' } }]);
+  const seen = [];
+  const blockers = async (view) => {
+    seen.push(view.labels.length);
+    return view.labels.length ? ['blocking label(s): needs-human'] : [];
+  };
+  const r = await waitForMerge({ gh, pr: 12, waitMs: 60_000, pollMs: 10, blockers, ...clock() });
+  assert.deepEqual(r, { state: 'blocked', problems: ['blocking label(s): needs-human'] });
+  assert.deepEqual(seen, [0, 1]);
+  assert.deepEqual(gh.calls[0].fields, ['state', 'mergeCommit', 'labels']);
+
+  const merged = fakeGh([{ state: 'MERGED', mergeCommit: { oid: 'abc' }, labels: [{ name: 'needs-human' }] }]);
+  const never = async () => { throw new Error('blockers must not run for a merged PR'); };
+  assert.deepEqual(await waitForMerge({ gh: merged, pr: 12, waitMs: 1000, pollMs: 10, blockers: never, ...clock() }), { state: 'merged', mergeSha: 'abc' });
+});
+
+test('waitForMerge: MERGED without a merge commit is re-read three times before giving up', async () => {
+  const gh = fakeGh([{ state: 'MERGED', mergeCommit: null }, { state: 'MERGED' }, { state: 'MERGED', mergeCommit: { oid: 'late' } }]);
+  assert.deepEqual(await waitForMerge({ gh, pr: 12, waitMs: 1000, pollMs: 10, ...clock() }), { state: 'merged', mergeSha: 'late' });
+  const never = fakeGh([{ state: 'MERGED', mergeCommit: null }, { state: 'MERGED', mergeCommit: null }, { state: 'MERGED', mergeCommit: null }, { state: 'MERGED', mergeCommit: null }, { state: 'MERGED', mergeCommit: { oid: 'too-late' } }]);
+  assert.deepEqual(await waitForMerge({ gh: never, pr: 12, waitMs: 1000, pollMs: 10, ...clock() }), { state: 'merged', mergeSha: null });
+  assert.equal(never.calls.length, 4, 'one read plus three re-reads');
+});
+
+test('abandonMerge: disables auto-merge, then re-reads the PR; a PR that merged in the meantime is reported merged', async () => {
+  const order = [];
+  const gh = { prView: (pr, fields) => { order.push('read'); return { state: 'MERGED', mergeCommit: { oid: 'ff' } }; } };
+  const r = await abandonMerge({ gh, pr: 12, disable: () => { order.push('disable'); return true; }, pollMs: 1, ...clock() });
+  assert.deepEqual(order, ['disable', 'read']);
+  assert.deepEqual(r, { autoMergeDisabled: true, merged: true, mergeSha: 'ff' });
+
+  const open = await abandonMerge({ gh: { prView: () => ({ state: 'OPEN' }) }, pr: 12, disable: () => true, pollMs: 1, ...clock() });
+  assert.deepEqual(open, { autoMergeDisabled: true, merged: false, mergeSha: null });
+
+  // merged but the commit is not readable yet: still merged (the caller decides what a missing sha means)
+  const noSha = await abandonMerge({ gh: { prView: () => ({ state: 'MERGED', mergeCommit: null }) }, pr: 12, disable: () => false, pollMs: 1, ...clock() });
+  assert.deepEqual(noSha, { autoMergeDisabled: false, merged: true, mergeSha: null });
+
+  const down = await abandonMerge({ gh: { prView: () => { throw new Error('HTTP 502'); } }, pr: 12, disable: () => true, pollMs: 1, ...clock() });
+  assert.equal(down.merged, false);
+  assert.equal(down.autoMergeDisabled, true);
+  assert.match(down.readError, /502/);
+});
+
+test('readPrSettled: mergeable UNKNOWN is re-read up to three times with a pause, then returned as is (reviewer finding 9)', async () => {
+  const gh = fakeGh([{ mergeable: 'UNKNOWN' }, { mergeable: 'UNKNOWN' }, { mergeable: 'MERGEABLE', n: 3 }]);
+  const slept = [];
+  const view = await readPrSettled({ gh, pr: 12, fields: ['mergeable'], sleep: async (ms) => { slept.push(ms); } });
+  assert.deepEqual(view, { mergeable: 'MERGEABLE', n: 3 });
+  assert.deepEqual(slept, [2000, 2000], 'the default pause is 2 s');
+
+  const stuck = fakeGh(Array.from({ length: 10 }, () => ({ mergeable: 'UNKNOWN' })));
+  const last = await readPrSettled({ gh: stuck, pr: 12, fields: ['mergeable'], sleep: async () => {}, pauseMs: 5 });
+  assert.equal(last.mergeable, 'UNKNOWN');
+  assert.equal(stuck.calls.length, 4);
+
+  const settled = fakeGh([{ mergeable: 'CONFLICTING' }]);
+  await readPrSettled({ gh: settled, pr: 12, fields: ['mergeable'], sleep: async () => { throw new Error('no pause needed'); } });
+  assert.equal(settled.calls.length, 1);
 });
 
 test('mergeTiming: the wait can only be shortened by the test hook, never stretched', () => {

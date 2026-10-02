@@ -63,8 +63,14 @@ test('final-gate: a draft, a closed or conflicting PR and a non-default base eac
   assertOnlyFails(scenario({ gh: { state: 'MERGED' } }).gate(), 'pr-open', /MERGED/);
   assertOnlyFails(scenario({ gh: { mergeable: 'CONFLICTING' } }).gate(), 'pr-open', /conflicts/);
   assertOnlyFails(scenario({ gh: { base: 'release' } }).gate(), 'pr-open', /base/);
-  const unknown = scenario({ gh: { mergeable: 'UNKNOWN' } }).gate();
-  assert.equal(unknown.code, 0, 'UNKNOWN means GitHub is still computing it, which is not a conflict');
+});
+
+test('final-gate: mergeable UNKNOWN fails pr-open after the read was retried three times (GitHub computes it lazily)', () => {
+  const s = scenario({ gh: { mergeable: 'UNKNOWN' } });
+  assertOnlyFails(s.gate(), 'pr-open', /mergeable.*UNKNOWN/);
+  const reads = s.fake.lines().filter((l) => l.startsWith('pr view 12 --json state,headRefOid'));
+  assert.equal(reads.length, 4, 'one read plus three retries');
+  assertOnlyFails(scenario({ gh: { noMergeable: true } }).gate(), 'pr-open', /mergeable/);
 });
 
 // ---- final-gate: labels, preflight ----------------------------------------------------------------
@@ -105,3 +111,15 @@ test('final-gate: the spec spelling git.treeHash is accepted for the tree bindin
   assert.equal(s.gate().code, 0);
 });
 
+
+test('final-gate: labels that are missing or malformed fail the labels check instead of reading as "no blocking labels"', () => {
+  assertOnlyFails(scenario({ gh: { noLabels: true } }).gate(), 'labels', /labels/);
+  assertOnlyFails(scenario({ gh: { rawLabels: null } }).gate(), 'labels', /labels/);
+  assertOnlyFails(scenario({ gh: { rawLabels: 'needs-human' } }).gate(), 'labels', /labels/);
+  assertOnlyFails(scenario({ gh: { rawLabels: [{}] } }).gate(), 'labels', /labels/);
+  assertOnlyFails(scenario({ gh: { rawLabels: [null] } }).gate(), 'labels', /labels/);
+  assertOnlyFails(scenario({ gh: { rawLabels: [{ name: 7 }] } }).gate(), 'labels', /labels/);
+  assertOnlyFails(scenario({ gh: { rawLabels: [{ name: 'bug' }, { color: 'red' }] } }).gate(), 'labels', /labels/);
+  assert.equal(scenario({ gh: { rawLabels: [] } }).gate().code, 0, 'an empty list is a real answer');
+  assert.equal(scenario({ gh: { rawLabels: [{ name: 'bug' }] } }).gate().code, 0);
+});

@@ -13,9 +13,10 @@ import { gh as ghRun } from './proc.mjs';
 import { collectHardStops } from './hardstops.mjs';
 import { checkIntegrity } from './integrity.mjs';
 import { runPreflight } from './preflight.mjs';
-import { matchAny } from './glob.mjs';
+import { findDeployment } from './deploy.mjs';
 import { toPosix } from './paths.mjs';
 import { loadState } from './state.mjs';
+import { parseYaml } from './yaml.mjs';
 import { reviewValidFor } from './triage.mjs';
 import { commitTime, contentHash, diffFiles, headSha, mergeBase, revParse, treeFingerprint } from './git.mjs';
 
@@ -25,7 +26,18 @@ export const BLOCKING_LABELS = Object.freeze(['needs-human', 'awaiting-review', 
 export const GATE_MAX_AGE_MS = 30 * 60_000;
 export const PR_FIELDS = Object.freeze(['state', 'headRefOid', 'baseRefName', 'isDraft', 'labels', 'mergeable']);
 
-const DOCS_GLOBS = ['**/*.md', 'docs/**'];
+// What a gate must contain: exactly these checks (plus `preview` when config.preview is set), each once and passing.
+// `merge` refuses a gate file that lacks any of them, so a hand-written or truncated file cannot vouch for a merge.
+export const CANONICAL_CHECKS = Object.freeze(['pr-open', 'labels', 'preflight', 'verify-report', 'hardstops', 'integrity', 'review', 'ci']);
+export const expectedCheckNames = (previewConfigured) => (previewConfigured ? [...CANONICAL_CHECKS, 'preview'] : [...CANONICAL_CHECKS]);
+
+// `gh pr view` computes `mergeable` lazily: UNKNOWN right after a push. Re-read this many times, this far apart.
+export const MERGEABLE_RETRIES = 3;
+export const MERGEABLE_PAUSE_MS = 2000;
+const MERGE_SHA_RETRIES = 3;
+const DOC_EXTENSIONS = /\.(md|mdx|txt)$/i;
+// Instructions, hooks, workflows and the pipeline itself: text files here change what agents or CI do, so they are code.
+const NEVER_DOCS_DIRS = new Set(['.claude', '.github', '.githooks', 'skills', 'agents', 'pipeline', 'scripts']);
 const FULL_SHA = /^[0-9a-f]{40}$/;
 const TAIL_LINES = 30;
 const MAX_LINE = 400;
@@ -101,16 +113,53 @@ export function blockingLabelsOf(labels) {
 
 const pathsOf = (f) => [f.oldPath, f.newPath, f.path].filter((p) => typeof p === 'string');
 
-// Every changed file is markdown or under docs/ (a rename counts by BOTH its paths: moving code into docs/ is not docs-only).
+function isDocPath(p) {
+  const parts = toPosix(p).replace(/^\.\//, '').split('/');
+  return DOC_EXTENSIONS.test(parts.at(-1)) && !parts.slice(0, -1).some((d) => NEVER_DOCS_DIRS.has(d.toLowerCase()));
+}
+
+// Every changed file is a non-binary .md/.mdx/.txt file outside the instruction/hook/workflow/pipeline directories (a
+// rename counts by BOTH its paths: moving code into docs/ is not docs-only). Living under docs/ is not enough: a
+// script or an image there is not documentation. Only this rule lets a `skipping` CI check pass.
 export function isDocsOnly(files) {
-  return Array.isArray(files) && files.length > 0 && files.every((f) => pathsOf(f).length > 0 && pathsOf(f).every((p) => matchAny(p, DOCS_GLOBS)));
+  return Array.isArray(files) && files.length > 0
+    && files.every((f) => isObject(f) && f.binary !== true && pathsOf(f).length > 0 && pathsOf(f).every(isDocPath));
 }
 
 // The diff touches only the agent log, and only by adding lines to it (no edits or deletions of history).
 export function isLogOnly(files, agentLog) {
   if (!Array.isArray(files) || files.length === 0 || typeof agentLog !== 'string') return false;
   const log = toPosix(agentLog).replace(/^\.\//, '');
-  return files.every((f) => f.path === log && (f.status === 'A' || f.status === 'M') && f.binary !== true && f.removed.length === 0);
+  // A record without `removed` removes nothing; any other shape of it is unexpected, and unexpected means not log-only.
+  const noRemovals = (f) => f.removed === undefined || (Array.isArray(f.removed) && f.removed.length === 0);
+  return files.every((f) => isObject(f) && f.path === log && (f.status === 'A' || f.status === 'M') && f.binary !== true && noRemovals(f));
+}
+
+// `gh pr view` right after a push often says mergeable UNKNOWN; re-read a few times before judging it.
+export async function readPrSettled({ gh, pr, fields, sleep = defaultSleep, pauseMs = MERGEABLE_PAUSE_MS, retries = MERGEABLE_RETRIES }) {
+  let view = gh.prView(pr, fields);
+  for (let i = 0; i < retries && view?.mergeable === 'UNKNOWN'; i++) {
+    await sleep(pauseMs);
+    view = gh.prView(pr, fields);
+  }
+  return view;
+}
+
+// Test hook: PIPELINE_MERGEABLE_PAUSE_MS can only SHORTEN the pause between UNKNOWN re-reads, never stretch it.
+export function mergeablePause(env = {}) {
+  const n = Number(env?.PIPELINE_MERGEABLE_PAUSE_MS);
+  return Number.isInteger(n) && n >= 0 && n < MERGEABLE_PAUSE_MS ? n : MERGEABLE_PAUSE_MS;
+}
+
+// Did the owner write `ci.required_checks: []` (as opposed to never mentioning it, which also reads as [])?
+function ciExplicitlyEmpty(root) {
+  try {
+    const parsed = parseYaml(readFileSync(join(root, '.claude', 'pipeline.yml'), 'utf8'));
+    const list = parsed?.ci?.required_checks;
+    return Array.isArray(list) && list.length === 0;
+  } catch {
+    return false;
+  }
 }
 
 // ---- refs, hashes -------------------------------------------------------------------------------
@@ -156,13 +205,18 @@ function prOpenCheck({ info, head, config }) {
   if (info.state !== 'OPEN') problems.push(`PR state is ${info.state}`);
   if (info.isDraft !== false) problems.push('PR is a draft');
   if (info.mergeable === 'CONFLICTING') problems.push('PR has merge conflicts');
+  else if (info.mergeable !== 'MERGEABLE') problems.push(`PR mergeable state is ${JSON.stringify(info.mergeable)}, not MERGEABLE (GitHub has not finished computing it, or it did not say)`);
   if (info.headRefOid !== head) problems.push(`PR head ${short(info.headRefOid)} is not the local HEAD ${short(head)}`);
   // The hard-stop, integrity and review diffs are taken against the default branch; any other base would be judged on the wrong diff.
   if (info.baseRefName !== config.default_branch) problems.push(`PR base is ${JSON.stringify(info.baseRefName)}, not ${config.default_branch}`);
   return problems.length ? check('pr-open', false, problems.join('; ')) : check('pr-open', true, `open at ${short(head)}`);
 }
 
-function labelsCheck(info) {
+export const validLabels = (labels) => Array.isArray(labels) && labels.every((l) => isObject(l) && typeof l.name === 'string');
+
+// A reply that does not carry a proper label list is not "no blocking labels": it is no answer.
+export function labelsCheck(info) {
+  if (!validLabels(info?.labels)) return check('labels', false, 'PR labels could not be read (labels is missing or malformed)');
   const blocking = blockingLabelsOf(info.labels);
   return blocking.length ? check('labels', false, `blocking label(s): ${blocking.join(', ')}`) : check('labels', true, 'no blocking labels');
 }
@@ -184,6 +238,9 @@ function verifyReportCheck({ root, config, head, tree, o }) {
   const problems = [];
   if (report.ok !== true) problems.push('report.ok is not true');
   if (report.mode !== 'full') problems.push(`mode is ${JSON.stringify(report.mode)}, not "full"`);
+  // The verify template marks `--only` runs with mode "partial" and does not write a `partial` field at all, so absence is
+  // fine for a full report; but when the field is there it must be exactly false (true, "false", null, 0 are all refusals).
+  if (Object.hasOwn(report, 'partial') && report.partial !== false) problems.push(`report is partial (partial=${JSON.stringify(report.partial)})`);
 
   const steps = Array.isArray(report.steps) ? report.steps : null;
   const expected = Array.isArray(report.expectedSteps) ? report.expectedSteps : null;
@@ -234,7 +291,8 @@ function reviewCheck({ root, config, pr, diff, hash, hashError }) {
   if (isLogOnly(d.files, config.agent_log)) return check('review', true, 'log-only');
   const state = loadState(root); // a corrupt state throws: caught by the caller as a failed check
   if (!state) return check('review', false, 'no review state at .review/state.json');
-  if (Number.isInteger(state.pr) && state.pr > 0 && state.pr !== pr) return check('review', false, `review state is for PR #${state.pr}, not #${pr}`);
+  if (!(Number.isInteger(state.pr) && state.pr > 0)) return check('review', false, `review state records no valid PR number (${JSON.stringify(state.pr)}), expected #${pr}`);
+  if (state.pr !== pr) return check('review', false, `review state is for PR #${state.pr}, not #${pr}`);
   if (!hash) return check('review', false, `cannot compute the content hash: ${hashError}`);
   if (!reviewValidFor(state, hash)) {
     return check('review', false, `no clean review round covers the current content (${short(hash)}), or findings are unresolved`);
@@ -242,32 +300,75 @@ function reviewCheck({ root, config, pr, diff, hash, hashError }) {
   return check('review', true, `review valid for content ${short(hash)}`);
 }
 
-function ciCheck({ gh, pr, diff }) {
-  let rows = null;
-  let source = 'required';
+// CI evidence. Judged: the checks GitHub itself requires (`gh pr checks --required`), or every reported check when it
+// requires none. On top of that every check NAMED in config.ci.required_checks must be reported and passing, so a
+// required check that never ran (renamed, workflow deleted, path-filtered away) cannot be mistaken for a green PR.
+// `skipping` only passes for a trusted docs-only diff. Nothing configured and nothing required by GitHub fails closed,
+// unless the owner wrote `ci.required_checks: []` explicitly (then every reported check must pass).
+function ciCheck({ gh, pr, diff, config, explicitEmpty }) {
+  const named = config.ci?.required_checks ?? [];
+  let requiredRows = [];
   try {
-    rows = gh.checks(pr, { required: true });
+    const rows = gh.checks(pr, { required: true });
+    requiredRows = Array.isArray(rows) ? rows : [];
   } catch {
-    rows = null; // gh says "no required checks reported" on stdout-less exit 1: fall through to all checks
+    requiredRows = []; // gh says "no required checks reported" on stdout-less exit 1
   }
-  if (!rows || rows.length === 0) {
-    source = 'all';
-    rows = gh.checks(pr);
+  if (named.length === 0 && requiredRows.length === 0 && !explicitEmpty) {
+    return check('ci', false, 'no required checks are configured (ci.required_checks) and GitHub reports none as required: there is no CI evidence');
   }
-  if (rows.length === 0) return check('ci', false, 'no CI checks reported');
+  let allRows = null;
+  const all = () => (allRows ??= gh.checks(pr));
+
+  const source = requiredRows.length > 0 ? 'required' : 'all';
+  const examined = requiredRows.length > 0 ? requiredRows : all();
+  if (examined.length === 0) return check('ci', false, 'no CI checks reported');
   const d = diff();
   const docsOnly = d.ok && isDocsOnly(d.files);
-  const bad = rows.filter((r) => !(r.bucket === 'pass' || (docsOnly && r.bucket === 'skipping')));
-  if (bad.length) return check('ci', false, `${bad.length} ${source} check(s) not passing: ${bad.map((r) => `${r.name}=${r.bucket ?? r.state}`).join(', ')}`);
-  return check('ci', true, `${rows.length} ${source} check(s) passing${docsOnly ? ' (docs-only: skipped checks accepted)' : ''}`);
+  const passing = (r) => r?.bucket === 'pass' || (docsOnly && r?.bucket === 'skipping');
+
+  const bad = examined.filter((r) => !passing(r));
+  const missing = [];
+  for (const name of named) {
+    let rows = requiredRows.filter((r) => r?.name === name);
+    if (rows.length === 0) rows = all().filter((r) => r?.name === name);
+    if (rows.length === 0) missing.push(name);
+    for (const r of rows) if (!passing(r) && !bad.includes(r)) bad.push(r);
+  }
+  const problems = [];
+  if (missing.length) problems.push(`required check(s) missing: ${missing.join(', ')}`);
+  if (bad.length) problems.push(`${bad.length} ${source} check(s) not passing: ${bad.map((r) => `${r?.name}=${r?.bucket ?? r?.state}`).join(', ')}`);
+  if (problems.length) return check('ci', false, problems.join('; '));
+  return check('ci', true, `${examined.length} ${source} check(s) passing${named.length ? ` (all ${named.length} named in config present)` : ''}${docsOnly ? ' (docs-only: skipped checks accepted)' : ''}`);
 }
 
-function previewCheck({ root, head }) {
+// The smoke record is the agent's own claim (--sha and --url are arguments), so it is only believed when GitHub's
+// deployments agree: a successful deployment of exactly this head in the configured environment, at the same origin the
+// smoke ran against.
+async function previewCheck({ root, head, config, gh }) {
   const smoke = readReviewJson(root, 'preview-smoke.json');
   if (!smoke) return check('preview', false, 'no preview smoke evidence at .review/preview-smoke.json');
   if (smoke.ok !== true) return check('preview', false, 'preview smoke did not pass');
   if (smoke.sha !== head) return check('preview', false, `preview smoke is for ${short(smoke.sha)}, HEAD is ${short(head)}`);
-  return check('preview', true, `preview smoke passed at ${short(head)}`);
+  const originOf = (u) => {
+    try {
+      const url = new URL(u);
+      return /^https?:$/.test(url.protocol) ? url.origin : null;
+    } catch {
+      return null;
+    }
+  };
+  const smokeOrigin = originOf(smoke.url);
+  if (!smokeOrigin) return check('preview', false, 'preview smoke record has no usable url (an http(s) URL is required)');
+  const environment = config.preview.environment;
+  const found = await findDeployment({ gh, sha: head, environment, timeoutMs: 0 });
+  if (found.state !== 'success') return check('preview', false, `no successful ${environment} deployment of ${short(head)} on GitHub (${found.state})`);
+  if (found.sha !== head) return check('preview', false, `the ${environment} deployment is for ${short(found.sha)}, not HEAD ${short(head)}`);
+  const deployedOrigin = originOf(found.url);
+  if (deployedOrigin !== smokeOrigin) {
+    return check('preview', false, `preview smoke ran against ${smokeOrigin}, but the ${environment} deployment of ${short(head)} is at ${deployedOrigin ?? 'an unknown URL'} (origin mismatch)`);
+  }
+  return check('preview', true, `preview smoke passed at ${short(head)} against the GitHub ${environment} deployment ${deployedOrigin}`);
 }
 
 // A check that throws is a failed check: it must show up in the report instead of aborting the whole gate.
@@ -283,10 +384,10 @@ async function safely(name, fn) {
 
 // Runs every check (no short-circuit, so one run reports every problem). A gh failure on the PR lookup itself throws:
 // the caller maps it to exit 3, because without the PR there is nothing to judge.
-export async function evaluateGate({ root, config, pr, gh, env }) {
+export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultSleep }) {
   const o = { cwd: root };
   const head = headSha(o);
-  const info = gh.prView(pr, [...PR_FIELDS]);
+  const info = await readPrSettled({ gh, pr, fields: [...PR_FIELDS], sleep, pauseMs: mergeablePause(env) });
   const diff = lazyDiff(root, config);
 
   let hash = '';
@@ -313,9 +414,9 @@ export async function evaluateGate({ root, config, pr, gh, env }) {
     await safely('hardstops', () => hardstopsCheck({ root, config, diff })),
     await safely('integrity', () => integrityCheck({ config, diff })),
     await safely('review', () => reviewCheck({ root, config, pr, diff, hash, hashError })),
-    await safely('ci', () => ciCheck({ gh, pr, diff })),
+    await safely('ci', () => ciCheck({ gh, pr, diff, config, explicitEmpty: ciExplicitlyEmpty(root) })),
   ];
-  if (config.preview !== null) checks.push(await safely('preview', () => previewCheck({ root, head })));
+  if (config.preview !== null) checks.push(await safely('preview', () => previewCheck({ root, head, config, gh })));
 
   const d = diff();
   const ok = checks.every((c) => c.ok);
@@ -337,11 +438,22 @@ export async function evaluateGate({ root, config, pr, gh, env }) {
 // ---- merge --------------------------------------------------------------------------------------
 
 // Why a gate file does not vouch for merging `pr` at `head` right now. Empty list = it does.
-export function gateRefusals({ gate, pr, head, prHead, hash, now = Date.now() }) {
+export function gateRefusals({ gate, pr, head, prHead, hash, repo, previewConfigured = false, now = Date.now() }) {
   if (!isObject(gate)) return ['no final-gate.json (or it is unreadable)'];
   const out = [];
   if (gate.ok !== true) out.push('the gate did not pass');
   if (!Array.isArray(gate.checks) || gate.checks.length === 0 || !gate.checks.every((c) => c?.ok === true)) out.push('the gate has failing or missing checks');
+  const names = Array.isArray(gate.checks) ? gate.checks.map((c) => (isObject(c) ? c.name : undefined)) : [];
+  const expected = expectedCheckNames(previewConfigured === true);
+  const missing = expected.filter((n) => !names.includes(n));
+  if (missing.length) out.push(`the gate is missing canonical check(s): ${missing.join(', ')}`);
+  const unexpected = [...new Set(names.filter((n) => typeof n === 'string' && !expected.includes(n)))];
+  if (unexpected.length) out.push(`the gate carries unexpected check(s): ${unexpected.join(', ')}`);
+  const repeated = expected.filter((n) => names.filter((x) => x === n).length > 1);
+  if (repeated.length) out.push(`the gate lists check(s) more than once: ${repeated.join(', ')}`);
+  if (typeof gate.repo !== 'string' || gate.repo === '') out.push('the gate records no repo (run final-gate again)');
+  else if (typeof repo !== 'string' || repo === '') out.push('could not determine the repo to compare the gate against');
+  else if (gate.repo !== repo) out.push(`the gate is for ${gate.repo}, not ${repo}`);
   if (gate.pr !== pr) out.push(`the gate is for PR #${gate.pr}, not #${pr}`);
   if (typeof gate.head !== 'string' || !FULL_SHA.test(gate.head)) out.push('the gate records no valid head SHA');
   if (gate.head !== head) out.push(`the gate is for head ${short(gate.head)}, the worktree is at ${short(head)}`);
@@ -357,17 +469,60 @@ export function gateRefusals({ gate, pr, head, prHead, hash, now = Date.now() })
 const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const MAX_CONSECUTIVE_ERRORS = 3;
 
+// The merge commit of a MERGED PR is sometimes not readable in the same instant: look again a few times.
+async function readMergeSha({ gh, pr, first, sleep, pollMs }) {
+  let sha = first ?? null;
+  for (let i = 0; i < MERGE_SHA_RETRIES && !sha; i++) {
+    await sleep(Math.min(pollMs, 2000));
+    try {
+      sha = gh.prView(pr, ['state', 'mergeCommit'])?.mergeCommit?.oid ?? null;
+    } catch { /* still unreadable: counts as another miss */ }
+  }
+  return sha;
+}
+
+// What can stop a queued merge while we wait: a blocking label, or an open pause/rollback issue. Anything unreadable
+// counts as a blocker (the safe direction here is "disable auto-merge").
+export function waitBlockers(gh) {
+  return async (view) => {
+    const problems = [];
+    if (!validLabels(view?.labels)) problems.push('PR labels could not be read (labels is missing or malformed)');
+    else if (blockingLabelsOf(view.labels).length > 0) problems.push(`blocking label(s): ${blockingLabelsOf(view.labels).join(', ')}`);
+    for (const label of ['pipeline-pause', 'pipeline-rollback']) {
+      try {
+        const issues = gh.listIssues({ label });
+        if (!Array.isArray(issues)) throw new Error('issue list was not an array');
+        if (issues.length > 0) problems.push(`open ${label} issue #${issues[0]?.number}`);
+      } catch (err) {
+        problems.push(`could not read the ${label} issues: ${String(err?.message ?? err)}`);
+      }
+    }
+    return problems;
+  };
+}
+
 // Polls until the PR is MERGED, CLOSED, or the deadline passes. Transient gh errors are tolerated (a flaky call must
-// not lose a 15-minute wait) but three in a row surface as 'error'.
-export async function waitForMerge({ gh, pr, waitMs, pollMs, now = Date.now, sleep = defaultSleep }) {
+// not lose a 15-minute wait) but three in a row surface as 'error'. With `blockers`, every poll of a still-OPEN PR asks
+// it for problems and a non-empty answer ends the wait as 'blocked' (the caller disables auto-merge).
+export async function waitForMerge({ gh, pr, waitMs, pollMs, now = Date.now, sleep = defaultSleep, blockers = null }) {
   const deadline = now() + waitMs;
+  const fields = ['state', 'mergeCommit', ...(blockers ? ['labels'] : [])];
   let errors = 0;
   for (;;) {
     try {
-      const view = gh.prView(pr, ['state', 'mergeCommit']);
+      const view = gh.prView(pr, fields);
       errors = 0;
-      if (view.state === 'MERGED') return { state: 'merged', mergeSha: view.mergeCommit?.oid ?? null };
+      if (view.state === 'MERGED') return { state: 'merged', mergeSha: await readMergeSha({ gh, pr, first: view.mergeCommit?.oid, sleep, pollMs }) };
       if (view.state === 'CLOSED') return { state: 'closed' };
+      if (blockers) {
+        let problems;
+        try {
+          problems = await blockers(view);
+        } catch (err) {
+          problems = [`could not check for blockers: ${String(err?.message ?? err)}`];
+        }
+        if (problems.length > 0) return { state: 'blocked', problems };
+      }
     } catch (err) {
       errors += 1;
       if (errors >= MAX_CONSECUTIVE_ERRORS) return { state: 'error', error: String(err?.message ?? err) };
@@ -383,6 +538,24 @@ export async function waitForMerge({ gh, pr, waitMs, pollMs, now = Date.now, sle
 export function disableAutoMerge({ pr, cwd, env }) {
   const r = ghRun(['pr', 'merge', String(pr), '--disable-auto'], { cwd, env, timeoutMs: 60_000 });
   return r.code === 0 && !r.timedOut;
+}
+
+// After a failed, blocked or timed-out wait: disarm auto-merge, then LOOK AT THE PR AGAIN. Auto-merge may have fired
+// between the last poll and the disable call; a PR that is MERGED must be reported as merged (so prod-watch and the
+// summary still run), not as a failure that leaves the caller believing nothing shipped.
+export async function abandonMerge({ gh, pr, cwd, env, disable = disableAutoMerge, sleep = defaultSleep, pollMs = 10_000 }) {
+  const autoMergeDisabled = disable({ pr, cwd, env });
+  let view = null;
+  let readError = null;
+  try {
+    view = gh.prView(pr, ['state', 'mergeCommit']);
+  } catch (err) {
+    readError = String(err?.message ?? err);
+  }
+  if (view?.state === 'MERGED') {
+    return { autoMergeDisabled, merged: true, mergeSha: await readMergeSha({ gh, pr, first: view.mergeCommit?.oid, sleep, pollMs }) };
+  }
+  return { autoMergeDisabled, merged: false, mergeSha: null, ...(readError ? { readError } : {}) };
 }
 
 // Test hook: PIPELINE_MERGE_WAIT_MS / PIPELINE_MERGE_POLL_MS. The wait can only be SHORTENED (a shorter wait ends in
