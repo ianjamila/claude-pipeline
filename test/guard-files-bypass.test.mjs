@@ -790,3 +790,91 @@ table('prose exemption does not cover real paths or writes', [
   'gh pr create --body "x" --body-file ~/.claude/settings.json && rm ~/.claude/settings.json',
   'npx vitest run -t "x" && rm ~/.claude/settings.json',
 ], 'deny');
+
+// ---- 14. CLAUDECODE, quote-split installer names, test seams (review findings 8a and 13) ---------------------
+
+const CHECKOUT_DIR = '/home/u/Claude/claude-pipeline';
+const IN_CHECKOUT = { existsSync: (p) => p === `${CHECKOUT_DIR}/pipeline/hooks/guard-files.mjs` };
+
+table('unsetting or overriding CLAUDECODE', [
+  'env -u CLAUDECODE node install.mjs',
+  'env -uCLAUDECODE true',
+  'env --unset=CLAUDECODE true',
+  'env --unset CLAUDECODE true',
+  'env -u CLAU""DECODE true',
+  "env -u 'CLAUDECODE' true",
+  'unset CLAUDECODE',
+  'unset -v CLAUDECODE && node x.mjs',
+  'CLAUDECODE= node x.mjs',
+  'CLAUDECODE=0 node x.mjs',
+  'export CLAUDECODE=',
+  'export CLAUDECODE=0; node x.mjs',
+  'env CLAUDECODE=0 node x.mjs',
+  'env -i node x.mjs',
+  'env -i PATH=$PATH node x.mjs',
+  'env --ignore-environment node x.mjs',
+  'env - node x.mjs',
+  'bash -c "unset CLAUDECODE; node x.mjs"',
+  'Remove-Item Env:CLAUDECODE',
+  'Remove-Item Env:\\CLAUDECODE',
+  'ri env:claudecode',
+  "$env:CLAUDECODE=''",
+  '$env:CLAUDECODE = $null',
+  "[Environment]::SetEnvironmentVariable('CLAUDECODE', $null)",
+  'node -e "delete process.env.CLAUDECODE; run()"',
+  'python3 -c "import os; os.environ.pop(\'CLAUDECODE\')"',
+], 'deny');
+
+table('naming CLAUDECODE without changing it', [
+  'echo $CLAUDECODE',
+  '[ -n "$CLAUDECODE" ] && echo yes',
+  'env | grep CLAUDECODE',
+  'printenv CLAUDECODE',
+  'grep -n CLAUDECODE install.mjs',
+  'git commit -m "installer: unset CLAUDECODE is not enough"',
+  'env FOO=1 node x.mjs',
+  'env -u FOO node x.mjs',
+  'Get-ChildItem Env:CLAUDECODE',
+], 'allow');
+
+test('installer names survive quote-splitting and escapes', () => {
+  const inside = (c) => bash(c, CHECKOUT_DIR, IN_CHECKOUT).decision;
+  for (const c of ['node ins""tall.mjs', "node 'install'.mjs", 'node install.m\\js', 'sh ./inst""all.sh', './ins\\tall.sh', 'bash ins""tall.sh --force', 'pwsh ./install."ps1"', `cd ${CHECKOUT_DIR} && node i''nstall.mjs`]) {
+    assert.equal(inside(c), 'deny', c);
+  }
+  for (const c of ['node install.mjs --check', 'node ins""tall.mjs --check', 'cat install.sh', 'git log -- ins""tall.mjs']) assert.equal(inside(c), 'allow', c);
+  assert.equal(bash('node ins""tall.mjs', '/home/u/other').decision, 'allow', 'outside a checkout nothing is protected by name');
+});
+
+const SEAMS = ['PIPELINE_GH', 'PIPELINE_CODEX', 'PIPELINE_VERCEL', 'PIPELINE_TEST_MODE'];
+
+test('test seams: setting PIPELINE_GH / CODEX / VERCEL / TEST_MODE on a command that runs pipeline.mjs is denied', () => {
+  const P = 'node ~/.claude/pipeline/bin/pipeline.mjs merge 12';
+  for (const v of SEAMS) {
+    for (const c of [
+      `${v}=/tmp/fake ${P}`,
+      `env ${v}=/tmp/fake ${P}`,
+      `export ${v}=/tmp/fake; ${P}`,
+      `${v}=1; export ${v}; ${P}`,
+      `$env:${v}='x'; ${P}`,
+      `bash -c "${v}=/tmp/fake ${P}"`,
+      `${v}=/tmp/fake pipeline merge 12`,
+      `${v}=x node ~/.claude/pipeline/bin/pipeline.mjs job start c -- ${P}`,
+      `${v}=x sudo ${P}`,
+    ]) assert.equal(bash(c).decision, 'deny', c);
+  }
+  for (const c of [
+    P,
+    'PIPELINE_GH=gh node scripts/other.mjs',
+    'export PIPELINE_GH=/tmp/fake',
+    'echo PIPELINE_GH',
+    'grep -rn PIPELINE_GH pipeline/lib',
+    'PIPELINE_OFF=1 node ~/.claude/pipeline/bin/pipeline.mjs preflight',
+    'PIPELINE_LOCK_DIR=/tmp/l node ~/.claude/pipeline/bin/pipeline.mjs merge 12',
+  ]) assert.equal(bash(c).decision, 'allow', c);
+});
+
+test('test seams: a script file that sets one for pipeline.mjs is caught too', () => {
+  const files = { '/home/u/proj/go.sh': 'PIPELINE_GH=/tmp/fake node ~/.claude/pipeline/bin/pipeline.mjs merge 1' };
+  assert.equal(bash('bash go.sh', PROJ, { existsSync: (p) => p in files, readText: (p) => files[p] ?? null }).decision, 'deny');
+});

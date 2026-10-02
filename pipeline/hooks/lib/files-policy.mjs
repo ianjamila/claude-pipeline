@@ -11,8 +11,9 @@
 //  - `export $(echo PIPELINE_ADMIN)=1`, a name assembled by a command substitution (a plain `N=PIPELINE_ADMIN; export $N=1` IS caught).
 //  - printf-assembled keys such as `printf '{"disable%sHooks":true}' All > .claude/settings.local.json` (and settings.local.json
 //    is not a protected file in any case).
-//  - an installer whose name is built at run time (`sh "inst""all.sh"`, `$(echo install).sh`).
-// Backstop for installer runs: the installer itself refuses to run inside a Claude Code process (CLAUDECODE set).
+//  - an installer whose name is built at run time (`$(echo install).sh`, a glob such as `ins*.mjs`); quote-split spellings (`ins""tall.mjs`) ARE caught.
+// Backstop for installer runs: the installer itself refuses to run inside a Claude Code process (CLAUDECODE set, or a Claude Code
+// ancestor process); commands that unset or override CLAUDECODE are denied here.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -865,6 +866,9 @@ function scriptsReferenceInstaller(name, scripts, depth, seen) {
   return false;
 }
 
+// `ins""tall.mjs`, `'install'.mjs`, `inst\all.sh`: the shell reads them all as install.mjs, so look at the unquoted spelling too.
+const namesInstaller = (t) => INSTALLER_WORD.test(` ${t}`) || INSTALLER_WORD.test(` ${t.replace(/['"`\\]/g, '')}`);
+
 function findInstaller(cmds, raw, dirs, ctx, opts) {
   const text = expandRefs(raw, ctx);
   const msg = (what) => `${what} installs the pipeline into ~/.claude; only the owner may run it, from a terminal or with PIPELINE_ADMIN=1 (node install.mjs --check and reading the file are allowed)`;
@@ -890,11 +894,11 @@ function findInstaller(cmds, raw, dirs, ctx, opts) {
     }
   }
 
-  if (!INSTALLER_WORD.test(text) && !INSTALLER_WORD.test(` ${text}`)) return null;
+  if (!namesInstaller(text) && !namesInstaller(raw)) return null;
   // is the cwd (or a cd target) inside a checkout, or does a named installer path resolve into one?
   let inCheckout = roots.length > 0;
   if (!inCheckout) {
-    for (const m of (` ${text}`).matchAll(INSTALLER_PATH)) {
+    for (const m of (` ${text.replace(/['"`\\]/g, '')}`).matchAll(INSTALLER_PATH)) {
       const p = m[1] ?? '';
       const bases = isAbs(p) ? [''] : dirs;
       for (const d of bases) if (checkoutRootOf(isAbs(p) ? posix.normalize(p || '/') : posix.join(d, p || '.'), ctx)) inCheckout = true;
@@ -902,7 +906,7 @@ function findInstaller(cmds, raw, dirs, ctx, opts) {
   }
   if (!inCheckout) return null;
   if (cmds.truncated || cmds.dynamic) return msg('a command line too complex to check that names the installer, which');
-  const naming = cmds.filter((c) => INSTALLER_WORD.test(` ${expandRefs(c.raw, ctx)}`));
+  const naming = cmds.filter((c) => namesInstaller(expandRefs(c.raw, ctx)) || namesInstaller(c.raw));
   const unsafe = naming.find((c) => !installerNamingIsSafe(c));
   if (unsafe) return msg(`${unsafe.argv.length ? baseOf(unsafe.argv[0]) : 'a command'} naming the installer`);
   if (!naming.length) return msg('a command naming the installer'); // inside a heredoc or program text the parser cut up
@@ -979,6 +983,47 @@ function judgeScriptFile(sf, dirs, ctx, opts) {
   return null;
 }
 
+// ---- environment: CLAUDECODE and the test seams ---------------------------------------------------------
+
+const ASSIGNERS = new Set(['export', 'declare', 'typeset', 'readonly', 'set', 'setx', 'setenv']);
+const PS_ENV_CHANGERS = /^(?:remove-item|ri|rm|del|erase|set-item|si|clear-item|ci|new-item|ni|set-content|sc|remove-variable)$/;
+const CLAUDECODE_UNSET = [
+  /(?:^|[\s;&|(])env\s+(?:-\S+\s+)*?(?:-[A-Za-z]*u\s*|--unset[=\s]\s*)CLAUDECODE\b/i,
+  /(?:^|[\s;&|(])env\s+(?:-\S+\s+)*?(?:-[A-Za-z]*i[A-Za-z]*|--ignore-environment|-)(?=\s|$)/,
+  /\bunset\b[^;&|\n]*\bCLAUDECODE\b/i,
+  /\bSetEnvironmentVariable\s*\(\s*CLAUDECODE\b/i,
+  /\b(?:Remove-Item|ri|Remove-Variable)\b[^;&|\n]*\benv:\\?CLAUDECODE\b/i,
+  /delete\s+process\.env\.CLAUDECODE\b|process\.env\.CLAUDECODE\s*=(?!=)|environ\.pop\(\s*CLAUDECODE\b|del\s+os\.environ\[\s*CLAUDECODE\s*\]|\bputenv\(\s*CLAUDECODE\b|ENV\.delete\(\s*CLAUDECODE\b/i,
+];
+
+// The installer's backstop is CLAUDECODE=1 (and a Claude Code ancestor process); a command that unsets or overrides it
+// first would defeat the backstop, so it is refused outright.
+function changesClaudeCode(cmds, scanRaw) {
+  for (const c of cmds) {
+    if (Object.keys(c.env ?? {}).some((k) => k.toUpperCase() === 'CLAUDECODE')) return true;
+    const name = baseOf(c.argv[0] ?? '');
+    if ((ASSIGNERS.has(name) || name === 'unset') && c.argv.slice(1).some((a) => /^CLAUDECODE(?:=|$)/i.test(a))) return true;
+    if (PS_ENV_CHANGERS.test(name) && c.argv.some((a) => /^env:\\?CLAUDECODE$/i.test(a))) return true;
+  }
+  const flat = scanRaw.replace(/['"`\\]/g, '');
+  return CLAUDECODE_UNSET.some((re) => re.test(flat));
+}
+
+// Test seams that swap the real gh / codex / vercel for a fake, or lift the model pins: handing one to the pipeline CLI
+// would let a fake satisfy the merge gate. (The installed CLI also ignores them; this is the hook side.)
+const SEAM_VARS = /^PIPELINE_(?:GH|CODEX|VERCEL|TEST_MODE)$/i;
+const RUNTIMES = new Set(['node', 'nodejs', 'bun', 'deno', 'npx', 'tsx']);
+
+function setsSeamForPipeline(cmds) {
+  const seam = cmds.some((c) => Object.keys(c.env ?? {}).some((k) => SEAM_VARS.test(k))
+    || (ASSIGNERS.has(baseOf(c.argv[0] ?? '')) && c.argv.slice(1).some((a) => SEAM_VARS.test(a.split('=')[0]))));
+  if (!seam) return false;
+  return cmds.some((c) => {
+    const name = baseOf(c.argv[0] ?? '');
+    return PIPELINE_BIN_NAMES.has(name) || (RUNTIMES.has(name) && c.argv.slice(1, 8).some((a) => PIPELINE_BIN_NAMES.has(baseOf(a))));
+  });
+}
+
 // `ln -s ~ /tmp/h`: a second name for home (or a protected root, or a directory above one) lets later commands reach
 // the protected files through a path that names none of them. Judged by what is LINKED TO, never by the link name.
 function linkTargets(argv) {
@@ -1033,11 +1078,19 @@ export function evaluateBashForFiles(command, opts = {}) {
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (500 `true;` then
   // `e''cho x > ~/.cl""aude/settings.json` must not slip through on a text match).
   if (cmds.truncated) return deny('the command line is too complex to check (the parser gave up); split it into simpler commands');
+  // prose flags: what a commit message, PR body or test name says is not a reference (the values come out of every scan)
+  const prose = new Map(cmds.map((c) => [c, proseWords(c.argv)]));
+  const proseValues = [...prose.values()].flatMap((p) => p.values);
+  const scanRaw = proseValues.length ? maskProse(raw, proseValues) : raw;
+  const rawOfCmd = (c) => maskProse(c.raw, prose.get(c).values);
+  const wordsOf = (c) => { const d = prose.get(c).drop; return d.size ? c.argv.filter((_, i) => !d.has(i)) : c.argv; };
   for (const c of cmds) {
     const words = [c.argv.join(' '), ...Object.entries(c.env).map(([k, v]) => `${k}=${v}`)].join(' ');
     if (setsAdmin(words, ctx.platform)) return deny('the command sets PIPELINE_ADMIN; only the owner may set it, when launching Claude Code');
     if (hasDisableAll(words)) return deny('the command mentions disableAllHooks, which would switch the pipeline hooks off');
   }
+  if (changesClaudeCode(cmds, scanRaw)) return deny('the command unsets or overrides CLAUDECODE, the marker the installer uses to refuse to run inside Claude Code; only the owner may change it, from a terminal');
+  if (setsSeamForPipeline(cmds)) return deny('the command sets a pipeline test seam (PIPELINE_GH, PIPELINE_CODEX, PIPELINE_VERCEL, PIPELINE_TEST_MODE) for the pipeline CLI; a fake gh/codex/vercel could satisfy the merge gate, so only the owner does that, from a terminal');
   ctx.vars = collectVars(cmds, ctx);
   // a name held in a variable (N=PIPELINE_ADMIN; env $N=1 claude)
   if (Object.keys(ctx.vars).length && setsAdmin(substVars(flat, ctx.vars), ctx.platform)) return deny('the command sets PIPELINE_ADMIN through a variable; only the owner may set it, when launching Claude Code');
@@ -1078,12 +1131,6 @@ export function evaluateBashForFiles(command, opts = {}) {
   const tooMany = totalWords > 5000; // per-token scans are skipped; the raw-text scans still run
   if (tooMany) ctx.dynamic = true;
   const insideRoot = dirs.some((d) => ctx.hit(d) || ctx.hitAncestor(d)); // cwd or a `cd` target is a protected dir (or its parent): relative words and bare commands reach it
-  // prose flags: what a commit message, PR body or test name says is not a reference (the values come out of every scan)
-  const prose = new Map(cmds.map((c) => [c, proseWords(c.argv)]));
-  const proseValues = [...prose.values()].flatMap((p) => p.values);
-  const scanRaw = proseValues.length ? maskProse(raw, proseValues) : raw;
-  const rawOfCmd = (c) => maskProse(c.raw, prose.get(c).values);
-  const wordsOf = (c) => { const d = prose.get(c).drop; return d.size ? c.argv.filter((_, i) => !d.has(i)) : c.argv; };
   const protectedInRaw = m.rawHit(scanRaw, dirs);
 
   // Output redirections write wherever they point, whatever the command: resolve every target (against the cwd and
