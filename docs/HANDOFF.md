@@ -30,6 +30,20 @@ INTERRUPTED (stopped mid-work; uncommitted changes left in the worktree — insp
 - t2.3 review-loop commands (9 dirty, fresh build — spec in the dispatch prompt summary below).
 - t2.4a final-gate/merge/smoke/summary/agent-log (14 dirty, fresh build).
 
+## Status 2026-10-02 (supersedes the lists above and items 1–3 below)
+
+- Steps 1–2 DONE. Integration branch `int/final` in `~/Claude/cp-wt/int3` (all task branches
+  merged, stage C landed, suite green 2883). `a45ba1f` = repo CI + `.claude/pipeline.yml` +
+  `scripts/verify.mjs` (+ `test/self-verify.test.mjs`) + README (plan Task 6.1).
+- Step 3 whole-repo review (Task 7.1) DONE: 4 Sonnet reviewers (hooks, gate, runtime, skills),
+  ~50 verified findings. Fixes IN FLIGHT on three worktrees off `a45ba1f`, disjoint files:
+  `~/Claude/cp-wt/fix-hooks` (fix/hooks), `fix-gate` (fix/gate), `fix-runtime` (fix/runtime).
+  Then: merge the three into int/final, then a skills/docs batch (ship/review-loop/pipeline-setup
+  text, templates/settings.json allowlist + Stop hook cwd, README matcher/flag updates) that
+  reflects their interface changes, full suite, then step 4 (publish).
+- If a session dies: `git -C ~/Claude/cp-wt/fix-<x> log int/final..` shows what landed per batch;
+  each implementer commits per item.
+
 ## Remaining work (in order)
 
 1. Finish the 4 interrupted tasks (Sonnet implementers; verify dirty work first).
