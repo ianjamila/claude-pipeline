@@ -3,7 +3,8 @@
 // pipeline files (skills, agents, ~/.claude/pipeline, ~/.claude/settings.json), delete or overwrite the dirs
 // that hold them (~/.claude, ~/.claude/skills, ~/.claude/agents), switch hooks off (`disableAllHooks`) or set
 // the admin switch (`PIPELINE_ADMIN`). Only a Claude Code process launched with PIPELINE_ADMIN=1 bypasses it.
-// Bash is judged on text, so the checks lean towards denying (`echo ~/.claude/pipeline` is denied); the hook
+// Bash is judged on text, so the checks lean towards denying (`rm ~/.claude/pipeline`, `cp x ~/.claude/pipeline`); echo/printf are
+// read-only (their redirects are still judged) and the value of a message flag (git -m, gh --body, a test runner's -t) is prose; the hook
 // stops accidents and casual circumvention, not an adversary who builds the path out of pieces at run time.
 //
 // RESIDUALS (known, documented, not closed): names that only exist at run time defeat a text scan.
@@ -583,7 +584,7 @@ function makeMatchers(ctx) {
 
 // ---- Bash: command classification -----------------------------------------------------------------
 
-const READ_ONLY = new Set(['cat', 'head', 'tail', 'less', 'more', 'ls', 'stat', 'wc', 'grep', 'rg', 'diff', 'cmp', 'shasum', 'sha256sum', 'sha1sum', 'md5', 'md5sum', 'file', 'readlink', 'realpath', 'test', '[', 'cut', 'du', 'hexdump', 'bat']);
+const READ_ONLY = new Set(['echo', 'printf', 'cat', 'head', 'tail', 'less', 'more', 'ls', 'stat', 'wc', 'grep', 'rg', 'diff', 'cmp', 'shasum', 'sha256sum', 'sha1sum', 'md5', 'md5sum', 'file', 'readlink', 'realpath', 'test', '[', 'cut', 'du', 'hexdump', 'bat']);
 const PS_READ_ONLY = new Set(['get-content', 'get-childitem', 'gc', 'gci']);
 const GIT_READ_ONLY = new Set(['log', 'show', 'diff', 'status', 'ls-files', 'blame']);
 const CD_CMDS = new Set(['cd', 'pushd', 'popd', 'set-location', 'sl']);
@@ -773,6 +774,47 @@ function baseDirsOf(argv) {
   else if (name === 'rsync') { const pos = args.filter((a) => !a.startsWith('-')); if (pos.length >= 2) out.push(pos[pos.length - 1]); }
   return out;
 }
+
+// ---- prose flags -------------------------------------------------------------------------------------
+
+// A commit message, PR body or test name that quotes a protected path is prose, not a reference. Only for the tools
+// that take such flags: `-t` is a message-ish pattern for a test runner but a directory for cp / mv / install / tar.
+const PROSE_FLAGS = {
+  git: { short: 'm', long: ['message', 'grep'] },
+  gh: { short: 'bt', long: ['body', 'title', 'notes', 'message', 'description'] },
+};
+const TEST_RUNNERS = new Set(['vitest', 'jest', 'mocha', 'pytest', 'ava', 'tap', 'playwright', 'cypress', 'npm', 'pnpm', 'yarn', 'bun', 'node', 'deno']);
+const TEST_FLAGS = { short: 't', long: ['grep', 'testNamePattern', 'test-name-pattern', 'title'] };
+
+// The words of `argv` that are the value of a prose flag: { values: [text], drop: Set(index of words to ignore) }.
+function proseWords(argv) {
+  const name = baseOf(argv[0] ?? '');
+  const spec = PROSE_FLAGS[name] ?? (TEST_RUNNERS.has(name) ? TEST_FLAGS : null);
+  const out = { values: [], drop: new Set() };
+  if (!spec) return out;
+  const isShort = (a) => a.length >= 2 && a[0] === '-' && a[1] !== '-' && spec.short.includes(a[1]);
+  for (let i = 1; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--') { if (spec === TEST_FLAGS) continue; break; } // after `--` a test runner still takes its own flags; for git it is paths
+    if (a.startsWith('--')) {
+      const eq = a.indexOf('=');
+      const flag = a.slice(2, eq < 0 ? undefined : eq);
+      if (!spec.long.includes(flag)) continue;
+      if (eq >= 0) { out.values.push(a.slice(eq + 1)); out.drop.add(i); } else if (argv[i + 1] !== undefined) { out.values.push(argv[i + 1]); out.drop.add(i + 1); i++; }
+    } else if (isShort(a)) {
+      // -m TEXT, -mTEXT, and a cluster ending in the flag (-am TEXT)
+      const k = [...a.slice(1)].findIndex((ch) => spec.short.includes(ch));
+      const rest = a.slice(k + 2);
+      if (rest) { out.values.push(rest.replace(/^=/, '')); out.drop.add(i); } else if (argv[i + 1] !== undefined) { out.values.push(argv[i + 1]); out.drop.add(i + 1); i++; }
+    } else if (/^-[A-Za-z]+$/.test(a) && name === 'git') {
+      // a cluster like -am: the message flag is its last letter
+      if (a.endsWith('m') && argv[i + 1] !== undefined) { out.values.push(argv[i + 1]); out.drop.add(i + 1); i++; }
+    }
+  }
+  return out;
+}
+
+const maskProse = (text, values) => values.reduce((t, v) => (v.length >= 2 ? t.split(v).join(' ') : t), String(text));
 
 // ---- Bash: rule 3 and 4 helpers ------------------------------------------------------------------
 
@@ -1036,7 +1078,13 @@ export function evaluateBashForFiles(command, opts = {}) {
   const tooMany = totalWords > 5000; // per-token scans are skipped; the raw-text scans still run
   if (tooMany) ctx.dynamic = true;
   const insideRoot = dirs.some((d) => ctx.hit(d) || ctx.hitAncestor(d)); // cwd or a `cd` target is a protected dir (or its parent): relative words and bare commands reach it
-  const protectedInRaw = m.rawHit(raw, dirs);
+  // prose flags: what a commit message, PR body or test name says is not a reference (the values come out of every scan)
+  const prose = new Map(cmds.map((c) => [c, proseWords(c.argv)]));
+  const proseValues = [...prose.values()].flatMap((p) => p.values);
+  const scanRaw = proseValues.length ? maskProse(raw, proseValues) : raw;
+  const rawOfCmd = (c) => maskProse(c.raw, prose.get(c).values);
+  const wordsOf = (c) => { const d = prose.get(c).drop; return d.size ? c.argv.filter((_, i) => !d.has(i)) : c.argv; };
+  const protectedInRaw = m.rawHit(scanRaw, dirs);
 
   // Output redirections write wherever they point, whatever the command: resolve every target (against the cwd and
   // every cd target, with ~ and variables expanded) and deny on a protected one. A symlink already pointing into
@@ -1056,19 +1104,19 @@ export function evaluateBashForFiles(command, opts = {}) {
   // when the raw text names a protected file at all.
   if ((cmds.dynamic || ctx.dynamic) && protectedInRaw) return deny('the command line is too complex or too dynamic to check and refers to a protected pipeline file');
 
-  const winAncestor = (c) => c.raw.includes('\\') && m.ancestorRaw(c.raw);
+  const winAncestor = (c) => c.raw.includes('\\') && m.ancestorRaw(rawOfCmd(c));
   const tokenHit = (t) => m.rawHit(t, dirs) || m.pathHit(t, dirs, true);
   // does the command name a protected file anywhere (source or destination)?
   const names = (c) => insideRoot
-    || m.rawHit(c.raw, dirs) || winAncestor(c)
+    || m.rawHit(rawOfCmd(c), dirs) || winAncestor(c)
     || Object.values(c.env).some((v) => m.rawHit(v, dirs))
-    || (!tooMany && c.argv.some(tokenHit));
+    || (!tooMany && wordsOf(c).some(tokenHit));
   // does it WRITE one? cp / rsync / install only write their destination
   const mentions = (c) => {
     const name = baseOf(c.argv[0] ?? '');
     if (insideRoot) return true;
-    if (DEST_ONLY.has(name)) return destsOf(c.argv, name).some(tokenHit);
-    return names(c) || (MOVERS.has(name) && destsOf(c.argv, name).some(tokenHit));
+    if (DEST_ONLY.has(name)) return destsOf(wordsOf(c), name).some(tokenHit);
+    return names(c) || (MOVERS.has(name) && destsOf(wordsOf(c), name).some(tokenHit));
   };
   const mentioning = cmds.filter(mentions);
   // A reference no single command names lives in a heredoc body or in program text the shell parser cut into

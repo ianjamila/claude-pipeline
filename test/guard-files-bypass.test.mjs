@@ -753,3 +753,40 @@ table('bare cd / links / base dirs: allowed', [
   'cp -t ~/work /tmp/x',
   'cp -t ~ /tmp/x',
 ], 'allow');
+
+// ---- 13. false positives: prose that names a protected path (review finding 9) ---------------------------
+
+table('prose that merely names a protected path', [
+  'git commit -m "docs: installer writes ~/.claude/settings.json"',
+  'git commit -am "fix ~/.claude/pipeline/hooks docs"',
+  'git commit --message="see ~/.claude/skills/ship"',
+  'git commit -m"mention ~/.claude/settings.json"',
+  'git tag -a v1 -m "touches ~/.claude/agents/judge.md"',
+  'gh pr create --body "Edits ~/.claude/pipeline/hooks" --title "t"',
+  'gh pr create --title "Protect ~/.claude/settings.json" --body x',
+  'gh pr comment 3 --body "see ~/.claude/settings.json"',
+  'gh pr comment 3 -b "see ~/.claude/settings.json"',
+  'gh release create v1 --notes "rewrites ~/.claude/pipeline"',
+  'echo "see ~/.claude/pipeline" >> notes.md',
+  'echo ~/.claude/settings.json',
+  'printf "%s\\n" ~/.claude/pipeline/VERSION > /tmp/out.txt',
+  'npx vitest run -t "protects ~/.claude/settings.json"',
+  'npm test -- --grep "guards ~/.claude/pipeline"',
+  'npx jest -t "does not edit ~/.claude/skills/ship"',
+  `git commit -m "$(cat <<'EOF'\nfix: note that ~/.claude/settings.json is protected\nEOF\n)"`,
+], 'allow');
+
+table('prose exemption does not cover real paths or writes', [
+  'git commit -m "x" ~/.claude/settings.json',
+  'git commit -m "x" -- ~/.claude/pipeline/VERSION',
+  'git add ~/.claude/pipeline/hooks/x.mjs',
+  'echo "see ~/.claude/pipeline" > ~/.claude/settings.json',
+  'echo x >> ~/.claude/pipeline/VERSION',
+  'echo x | tee ~/.claude/settings.json',
+  'echo ~/.claude/pipeline | xargs rm -rf',
+  'echo "rm -rf ~/.claude/pipeline" | sh',
+  'cp -t ~/.claude/pipeline /tmp/x',
+  'tar -t -f x.tar ~/.claude/pipeline/hooks && rm ~/.claude/pipeline/VERSION',
+  'gh pr create --body "x" --body-file ~/.claude/settings.json && rm ~/.claude/settings.json',
+  'npx vitest run -t "x" && rm ~/.claude/settings.json',
+], 'deny');
