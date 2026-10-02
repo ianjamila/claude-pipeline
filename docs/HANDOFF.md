@@ -35,13 +35,14 @@ INTERRUPTED (stopped mid-work; uncommitted changes left in the worktree — insp
 - Steps 1–2 DONE. Integration branch `int/final` in `~/Claude/cp-wt/int3` (all task branches
   merged, stage C landed, suite green 2883). `a45ba1f` = repo CI + `.claude/pipeline.yml` +
   `scripts/verify.mjs` (+ `test/self-verify.test.mjs`) + README (plan Task 6.1).
-- Step 3 whole-repo review (Task 7.1) DONE: 4 Sonnet reviewers (hooks, gate, runtime, skills),
-  ~50 verified findings. fix/hooks, fix/runtime, fix/gate all DONE and merged into int/final
-  (667be07; suite green 3116 before the gate merge). Skills/docs batch IN FLIGHT on
-  `~/Claude/cp-wt/fix-skills` (fix/skills): skill/agent text, README, templates/settings.json +
-  pipeline.yml, prod-watch resolving a null merge SHA. Then merge, full suite, step 4 (publish).
-- If a session dies: `git -C ~/Claude/cp-wt/fix-<x> log int/final..` shows what landed per batch;
-  each implementer commits per item.
+- Step 3 DONE (2026-10-02): whole-repo review (Task 7.1) by 4 Sonnet reviewers, ~50 verified
+  findings, all fixed in four batches (hooks, gate, runtime, skills/docs) + a test-only-fix gap in
+  `state mark-implemented`; merged at `02c74b6`. Suite 3175 pass / 0 fail / 1 skipped; `node
+  scripts/verify.mjs` full PASS. Installer round trip now refuses inside a Claude session by design
+  (ancestor-process check) — CI proves it.
+- NEXT = step 4: owner OK, then `gh repo create ianjamila/claude-pipeline --private`, push
+  int/final as main, watch CI (Windows proves .cmd quoting + installer). Fix CI on main directly
+  only until protection is applied (plan 6.2).
 
 ## Remaining work (in order)
 
