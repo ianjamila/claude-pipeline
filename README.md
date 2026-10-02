@@ -20,8 +20,8 @@ Into `~/.claude` (or `$CLAUDE_CONFIG_DIR`):
 | skills `ship`, `verify`, `pipeline-setup` | the process: ship runs the flow, verify proves a change works, pipeline-setup onboards a repo |
 | agents `implementer`, `verifier` (Sonnet), `judge` (Opus), `arbiter` (Fable) | the judgment; models are pinned in the agent files and proven from transcripts |
 | `pipeline/bin/pipeline.mjs` | one zero-dependency Node CLI that makes every deterministic decision (hard-stops, final gate, merge, rollback) |
-| hook `guard-git` (`Bash\|PowerShell`) | blocks pushes/force-pushes to `main`, admin merges, protection edits, approval-label changes |
-| hook `guard-files` | blocks agents editing the pipeline's own files and settings — **installed last**, after the proofs |
+| hook `guard-git` (matcher `Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks pushes/force-pushes to `main`, admin merges, protection edits, approval-label changes, whether typed in a shell, a `Monitor` command, a script file or an MCP tool call |
+| hook `guard-files` (matcher `Edit\|Write\|MultiEdit\|NotebookEdit\|Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks agents editing the pipeline's own files and settings — **installed last**, after the proofs |
 | settings allow entries | `Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)` so pipeline calls don't prompt |
 
 A manifest (`~/.claude/pipeline/INSTALLED.json`: version, git SHA, file hashes) lets the installer
@@ -31,8 +31,9 @@ that deploy there.
 
 ## Install, update, uninstall
 
-The installer refuses to run inside a Claude Code session (an agent must not be able to rewrite
-its own rules). Run it **in your own terminal**, or start Claude with `PIPELINE_ADMIN=1 claude`.
+The installer refuses to run when it was started from a Claude Code session (it checks the process
+ancestry: an agent must not be able to rewrite its own rules). Run it **in your own terminal**, or start
+Claude with `PIPELINE_ADMIN=1 claude`.
 
 ```sh
 git clone https://github.com/ianjamila/claude-pipeline ~/Claude/claude-pipeline   # private repo
@@ -109,10 +110,18 @@ The label-based approvals rely on the local hook because the agents use your Git
 
 - **One identity.** Agents act as your GitHub account: their comments don't notify you, and
   `CODEOWNERS` documents ownership but cannot gate (you can't approve your own PR). The approval
-  labels are protected by the local hook, not by GitHub.
+  labels are protected by the local hook, not by GitHub; in CI only labels applied by the repo owner
+  (or the logins in `ci.approvers`, which an organization-owned repo MUST list) count.
 - **Hooks stop accidents, not adversaries.** guard-git and guard-files catch direct and casually
   disguised attempts (subshells, `bash -c`, `eval`, env prefixes, the `pipeline job` wrapper), not
   a determined adversary with encoded payloads. GitHub branch protection is the hard boundary.
+  Coverage: Bash and PowerShell, `Monitor` commands, MCP tool calls and shell script files that contain
+  a guarded command. They also deny a command line too long to be read in full (when it contains a
+  guarded word), a push to a dynamic destination (only `$(git branch --show-current)`,
+  `$(git rev-parse --abbrev-ref HEAD)` or a variable assigned a literal in the same command are
+  understood; ship pushes `git push -u origin agent/<slug>`), `unset CLAUDECODE`, and setting
+  `PIPELINE_GH`, `PIPELINE_CODEX`, `PIPELINE_VERCEL` or `PIPELINE_TEST_MODE` on a `pipeline.mjs` command;
+  the installed CLI ignores those four seam variables altogether (they exist for the test suite).
 - **Branch protection needs GitHub Pro** for private repos. Without it a repo runs in `gate`
   mode (skills and CLI only) and preflight says so.
 - **Local verify, lean CI.** The full verify runs on your machine; CI keeps the repo's existing
@@ -123,6 +132,27 @@ The label-based approvals rely on the local hook because the agents use your Git
   reports `superseded`, `recovered` or `rollback-failed`; a deploy from a merge outside the run
   can still race it, but is always detected, never silent. After a Vercel rollback, Vercel stops
   auto-assigning production domains until a deployment is promoted.
+
+## Project settings and environment
+
+`.claude/pipeline.yml` is documented in its template (`pipeline/templates/pipeline.yml`). Two keys deserve a
+mention: `ci.guard_checks` (default `true`: the `Test integrity` and `Hard-stop scan` statuses are always
+required on top of `ci.required_checks`; `false` only for a repo that does not run `pipeline-guards.yml`)
+and `ci.approvers` (logins whose approval labels count; required for org-owned repos, otherwise approvals
+fail closed with `org-repo-needs-ci.approvers`). `pipeline config` prints `warnings` for config that is valid
+but suspicious.
+
+| Variable | Meaning |
+|---|---|
+| `PIPELINE_OFF=1` | ship, verify and the Stop hook stand down for the session |
+| `PIPELINE_ADMIN=1` | allows the installer and `protect --apply` from a Claude session |
+| `PIPELINE_MACHINE_ID` | stable id for this machine in the lock files (default: one generated once) |
+| `PIPELINE_SMOKE_PORT` | the e2e smoke server's port; printed by `supabase-local env`, read by `playwright.smoke.config.ts` |
+| `PIPELINE_TEST_COMMIT_AS_IS`, `PIPELINE_TEST_FORCE_ARBITER`, `PIPELINE_ARBITER_MODEL_OVERRIDE` | proof switches: see `skills/ship/reference/proof-switches.md` |
+
+`pipeline vendor` also writes `.gitattributes` lines (`scripts/pipeline/** -text`, `scripts/verify text
+eol=lf`) so a Windows checkout cannot change the vendored bytes; the `scripts/verify` shim must stay
+executable.
 
 ## Troubleshooting
 
