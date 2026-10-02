@@ -10,7 +10,7 @@
 // a step's env) point anywhere but localhost, because the db steps reset the database. Consecutive steps with the same
 // lockGroup hold ONE machine-wide lock "<group>-<project>" so two worktrees never reset the same database at once.
 // Libraries come straight from this repo's pipeline/lib (nothing is vendored here).
-import { mkdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -38,8 +38,15 @@ const STEPS = [
 ];
 // ---- end of the project-specific part ---------------------------------------------------------------------------------
 
-export const DB_URL_VARS = ['NEXT_PUBLIC_SUPABASE_URL', 'SUPABASE_URL', 'DATABASE_URL'];
-const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
+export const DB_URL_VARS = [
+  'NEXT_PUBLIC_SUPABASE_URL', 'SUPABASE_URL', 'DATABASE_URL', 'POSTGRES_URL', 'POSTGRES_URL_NON_POOLING', 'POSTGRES_PRISMA_URL',
+  'DIRECT_URL', 'SUPABASE_DB_URL', 'PGHOST', 'PGHOSTADDR',
+];
+const HOST_ONLY_VARS = new Set(['PGHOST', 'PGHOSTADDR']); // bare host names (libpq environment variables), not URLs
+// The files a framework (Next.js, dotenv-flow, ...) loads from the repo root. verify scans them as well as the process
+// environment: a remote URL there reaches the db steps even when the shell never exported it.
+export const ENV_FILES = ['.env', '.env.local', '.env.development', '.env.development.local', '.env.test', '.env.test.local'];
+const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
 const STEP_TIMEOUT_MS = 30 * 60_000;
 const EXCERPT_LINES = 40;
 const NAME_RE = /^[A-Za-z0-9._-]+$/;
@@ -62,6 +69,32 @@ export function excerpt(text, n = EXCERPT_LINES) {
   return clean.slice(-n).join('\n');
 }
 
+// libpq lets a connection string carry `host=` / `hostaddr=` (query parameters, or key=value pairs) that OVERRIDE the host
+// in the URL, and a comma-separated list of hosts; a value starting with "/" is a unix-socket directory (local).
+const splitHosts = (v) => String(v).split(',').map((h) => h.trim()).filter(Boolean).map((h) => (h.startsWith('/') ? 'localhost' : h.toLowerCase()));
+
+// Every host a guarded value can connect to, or null when it cannot be read (cannot prove it is local).
+function hostsOf(name, raw) {
+  const value = String(raw).trim();
+  if (HOST_ONLY_VARS.has(name)) return splitHosts(value);
+  if (value.includes('://')) {
+    let url;
+    try { url = new URL(value); } catch { return null; }
+    const hosts = splitHosts(url.hostname);
+    for (const key of ['host', 'hostaddr']) {
+      const v = url.searchParams.get(key);
+      if (v) hosts.push(...splitHosts(v));
+    }
+    return hosts;
+  }
+  if (value.includes('=')) { // key=value connection string
+    const hosts = [];
+    for (const m of value.matchAll(/(?:^|\s)(?:host|hostaddr)\s*=\s*('(?:[^'\\]|\\.)*'|\S+)/g)) hosts.push(...splitHosts(m[1].replace(/^'|'$/g, '')));
+    return hosts;
+  }
+  return null;
+}
+
 // Which of the guarded variables point somewhere other than this machine. Reports names and hosts only: a DATABASE_URL
 // carries a password and must never be echoed.
 export function nonLocalDb(env) {
@@ -69,14 +102,55 @@ export function nonLocalDb(env) {
   for (const name of DB_URL_VARS) {
     const raw = env?.[name];
     if (raw === undefined || raw === null || String(raw).trim() === '') continue;
-    let host = null;
-    try { host = new URL(String(raw).trim()).hostname.toLowerCase(); } catch { /* unparseable: cannot prove it is local */ }
-    if (host === null || !LOCAL_HOSTS.has(host)) bad.push({ name, host: host === null ? 'unparseable value' : host });
+    const hosts = hostsOf(name, raw);
+    if (hosts === null) bad.push({ name, host: 'unparseable value' });
+    else {
+      const remote = hosts.find((h) => !LOCAL_HOSTS.has(h));
+      if (remote !== undefined) bad.push({ name, host: remote });
+    }
   }
   return bad;
 }
 
-const refusal = (bad, where) => `refusing to run: ${bad.map((b) => `${b.name} points at non-local host "${b.host}"`).join('; ')} (in ${where}). verify resets the database; use the dedicated local Supabase.`;
+// The guarded variables the repo's .env files define: [{ file, name, value }]. A missing file is normal; any other read
+// error propagates (verify then stops with exit 2) rather than letting an unreadable file pass as clean.
+export function readEnvFiles(root) {
+  const defs = [];
+  for (const file of ENV_FILES) {
+    let text;
+    try {
+      text = readFileSync(join(root, file), 'utf8');
+    } catch (e) {
+      if (e?.code === 'ENOENT' || e?.code === 'ENOTDIR') continue;
+      throw e;
+    }
+    for (const line of text.split(/\r?\n/)) {
+      const m = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(line);
+      if (!m || !DB_URL_VARS.includes(m[1])) continue;
+      let value = m[2].trim();
+      const quote = value[0];
+      if ((quote === '"' || quote === "'") && value.lastIndexOf(quote) > 0) value = value.slice(1, value.lastIndexOf(quote));
+      else value = value.replace(/\s+#.*$/, '');
+      defs.push({ file, name: m[1], value });
+    }
+  }
+  return defs;
+}
+
+// Non-local values in the .env files, except for variables the process environment (or the step's env) sets itself:
+// those win over a file (dotenv never overrides an existing variable), and are checked on their own.
+export function nonLocalEnvFiles(defs, shadow) {
+  const bad = [];
+  for (const d of defs) {
+    const set = shadow?.[d.name];
+    if (set !== undefined && set !== null && String(set).trim() !== '') continue;
+    const [hit] = nonLocalDb({ [d.name]: d.value });
+    if (hit) bad.push({ ...hit, file: d.file });
+  }
+  return bad;
+}
+
+const refusal = (bad, where) => `refusing to run: ${bad.map((b) => `${b.name} points at non-local host "${b.host}" (in ${b.file ?? where})`).join('; ')}. verify resets the database; use the dedicated local Supabase${bad.some((b) => b.file) ? ' (remove the value from the .env file, or set it to the local one in the environment)' : ''}.`;
 
 function validateSteps(steps) {
   const seen = new Set();
@@ -195,14 +269,16 @@ export async function runVerify(opts = {}) {
       warn(`verify: ${refusal(bad, 'the environment')}`);
       return finish(2, refusal(bad, 'the environment'));
     }
+    const fileDefs = readEnvFiles(cwd);
     for (const s of selected) {
       if (typeof s.env === 'function') continue; // resolved (and checked) when the step starts
-      const badStep = nonLocalDb(s.env ?? {});
+      const badStep = [...nonLocalDb(s.env ?? {}), ...nonLocalEnvFiles(fileDefs, { ...env, ...s.env })];
       if (badStep.length > 0) {
         warn(`verify: ${refusal(badStep, `step ${s.name}'s env`)}`);
         return finish(2, refusal(badStep, `step ${s.name}'s env`));
       }
     }
+    // Also at the point of use (below): an env function can shadow a file value, so its steps are judged once it has run.
 
     mkdirSync(logsDir, { recursive: true });
     for (const s of selected) rmSync(join(logsDir, `${s.name}.log`), { force: true }); // a stale log must not pass for this run's
@@ -211,7 +287,7 @@ export async function runVerify(opts = {}) {
     async function runStep(s) {
       const r = row(s);
       const stepEnv = typeof s.env === 'function' ? await s.env() : (s.env ?? {});
-      const badNow = nonLocalDb({ ...env, ...stepEnv });
+      const badNow = [...nonLocalDb({ ...env, ...stepEnv }), ...nonLocalEnvFiles(fileDefs, { ...env, ...stepEnv })];
       if (badNow.length > 0) throw new Refused(refusal(badNow, `step ${s.name}'s env`));
       say(`[run ] ${s.name}: ${r.command}`);
       const t0 = Date.now();
