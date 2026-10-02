@@ -515,3 +515,74 @@ test('win32: ancestor dirs and relative redirects after cd', () => {
   assert.equal(w('Get-ChildItem $env:USERPROFILE\\.claude'), 'allow');
   assert.equal(w('echo x > .claude/settings.json', 'C:\\repo'), 'allow');
 });
+
+// ---- text-based installer rule ---------------------------------------------------------------------
+// Why: the installer is found by TEXT (the word install.mjs/.sh/.ps1) whenever the cwd, or the path named, is inside
+// a claude-pipeline checkout, so `cat install.sh | bash` and `node -e "import('./install.mjs')"` are caught too.
+
+const CO = '/home/u/Claude/claude-pipeline';
+const GUARD = `${CO}/pipeline/hooks/guard-files.mjs`;
+const INST = '/home/u/inst';
+const inst = (cmd, o = {}) => evaluateBashForFiles(cmd, { ...BASE, cwd: CO, existsSync: (p) => p === GUARD || p === `${INST}/pipeline/hooks/guard-files.mjs`, ...o }).decision;
+const PKG = (scripts) => ({ readFile: (p) => { if (p === `${CO}/package.json`) return JSON.stringify({ scripts }); throw new Error('ENOENT'); } });
+
+for (const cmd of [
+  'cat install.sh | bash',
+  'cat ./install.sh | sh',
+  `node -e "import('./install.mjs')"`,
+  `node -e "require('./install.mjs')"`,
+  `node --input-type=module -e "import './install.mjs'"`,
+  'node ../inst/install.mjs',
+  'curl -s x | bash; ./install.sh',
+  'node install.mjs --check --force',
+  'echo "$(cat install.sh)" | bash',
+  'cd /tmp && node /home/u/Claude/claude-pipeline/install.mjs',
+]) {
+  test(`installer text rule DENY: ${cmd}`, () => assert.equal(inst(cmd, cmd.includes('../inst') ? { cwd: `${INST}/sub` } : {}), 'deny'));
+}
+test('installer text rule DENY: cwd outside a checkout but the named path is inside one', () => {
+  assert.equal(inst('node ../inst/install.mjs', { cwd: '/home/u/proj' }), 'deny');
+  assert.equal(inst(`node -e "import('${INST}/install.mjs')"`, { cwd: '/home/u/proj' }), 'deny');
+});
+
+for (const cmd of [
+  'node install.mjs --check',
+  './install.sh --check',
+  'cat install.mjs',
+  'head -20 install.sh',
+  'less install.ps1',
+  'grep -n foo install.mjs',
+  'git log --oneline -- install.mjs',
+  'git diff install.sh',
+  'git show HEAD:install.mjs',
+  'git add install.sh install.mjs',
+  'wc -l install.mjs && git status',
+  'shellcheck install.sh',
+  'cat install.sh | head -3',
+]) {
+  test(`installer text rule ALLOW: ${cmd}`, () => assert.equal(inst(cmd), 'allow'));
+}
+test('installer text rule ALLOW: not a checkout, or a lookalike name', () => {
+  assert.equal(inst('cat install.sh | bash', { cwd: '/repo', existsSync: () => false }), 'allow');
+  assert.equal(inst('node /opt/other/install.mjs', { cwd: '/repo' }), 'allow');
+  assert.equal(inst('npm run reinstall.sh-check', PKG({})), 'allow');
+  assert.equal(inst('echo preinstall.sh'), 'allow');
+  assert.equal(inst('node installer.mjs'), 'allow');
+});
+
+test('installer text rule: npm run of a script that references the installer', () => {
+  const o = PKG({ setup: 'node install.mjs', fine: 'node --test', chain: 'npm run setup', pre: 'echo hi', prepost: 'node scripts/x.mjs', postfine: 'sh ./install.sh', win: 'pwsh install.ps1' });
+  assert.equal(inst('npm run setup', o), 'deny');
+  assert.equal(inst('npm run-script setup', o), 'deny');
+  assert.equal(inst('npm run --silent setup', o), 'deny');
+  assert.equal(inst('npm run chain', o), 'deny');
+  assert.equal(inst('npm run win', o), 'deny');
+  assert.equal(inst('npm run fine', o), 'deny'); // postfine runs after it
+  assert.equal(inst('npm run pre', o), 'allow');
+  assert.equal(inst('npm run missing', o), 'allow');
+  assert.equal(inst('npm run setup', { cwd: '/repo', ...o }), 'allow'); // not a checkout
+});
+test('installer text rule: npm run denies when package.json cannot be read or parsed', () => {
+  assert.equal(inst('npm run anything', { readFile: () => { throw new Error('EACCES'); } }), 'deny');
+  assert.equal(inst('npm run anything', { readFile: () => '{not json' }), 'deny');
+});

@@ -5,6 +5,13 @@
 // the admin switch (`PIPELINE_ADMIN`). Only a Claude Code process launched with PIPELINE_ADMIN=1 bypasses it.
 // Bash is judged on text, so the checks lean towards denying (`echo ~/.claude/pipeline` is denied); the hook
 // stops accidents and casual circumvention, not an adversary who builds the path out of pieces at run time.
+//
+// RESIDUALS (known, documented, not closed): names that only exist at run time defeat a text scan.
+//  - `export $(echo PIPELINE_ADMIN)=1`, a name assembled by a command substitution (a plain `N=PIPELINE_ADMIN; export $N=1` IS caught).
+//  - printf-assembled keys such as `printf '{"disable%sHooks":true}' All > .claude/settings.local.json` (and settings.local.json
+//    is not a protected file in any case).
+//  - an installer whose name is built at run time (`sh "inst""all.sh"`, `$(echo install).sh`).
+// Backstop for installer runs: the installer itself refuses to run inside a Claude Code process (CLAUDECODE set).
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -664,47 +671,97 @@ function collectDirs(cmds, ctx) {
 
 // ---- Bash: rule 3 and 4 helpers ------------------------------------------------------------------
 
-const INSTALLER_NAME = /^install\.(?:mjs|sh|ps1)$/i;
 const PIPELINE_BIN_NAMES = new Set(['pipeline.mjs', 'pipeline']);
 
-function rawInstallerHits(text) {
-  const t = toPosix(text);
-  const re = /(?:^|[\s'"=])((?:[^\s'"=;&|()]*\/)?install\.(?:mjs|sh|ps1))(?=$|[\s'";&|)])/gi;
-  const out = [];
-  for (const m of t.matchAll(re)) {
-    const tail = t.slice(m.index + m[0].length).split(/[;&|\n]/)[0];
-    out.push({ p: m[1], after: tail.trim().split(/\s+/).filter(Boolean) });
+// ---- installers: found by text ---------------------------------------------------------------------
+// Any command whose text names install.mjs / install.sh / install.ps1 as a word is denied when the directory it runs in,
+// or the path it names, is inside a claude-pipeline checkout (a dir holding pipeline/hooks/guard-files.mjs), unless every
+// command naming it only reads it. This also catches `cat install.sh | bash` and `node -e "import('./install.mjs')"`.
+const INSTALLER_WORD = /(?:^|[\s/\\'"(])install\.(?:mjs|sh|ps1)\b/;
+const INSTALLER_PATH = /((?:[^\s'"=;&|()]*\/)?)install\.(?:mjs|sh|ps1)\b/g;
+const INSTALLER_FILE = /^(?:\.\/)?(?:.*\/)?install\.(?:mjs|sh|ps1)$/;
+const NAMING_SAFE = new Set(['cat', 'head', 'tail', 'less', 'more', 'bat', 'grep', 'rg', 'wc', 'file', 'stat', 'ls', 'diff', 'cmp', 'shellcheck', 'shasum', 'sha256sum', 'sha1sum', 'md5sum', 'md5', 'chmod']);
+const GIT_NAMING_SAFE = new Set(['log', 'diff', 'show', 'status', 'add', 'blame', 'ls-files']);
+const STDIN_RUNNERS = new Set(['node', 'nodejs', 'deno', 'bun', 'sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'csh', 'tcsh', 'pwsh', 'powershell', 'cmd', 'python', 'python3', 'ruby', 'perl', 'php', 'source', '.', 'eval']);
+
+function checkoutRootOf(dir, ctx) {
+  let d = dir;
+  for (let i = 0; i < 64; i++) {
+    try { if (ctx.api.existsSync(posix.join(d, 'pipeline/hooks/guard-files.mjs'))) return d; } catch { /* not a checkout */ }
+    const p = posix.dirname(d);
+    if (p === d) return null;
+    d = p;
   }
-  return out;
+  return null;
 }
 
-// Programs that execute the script they are given. `git add install.sh` or `cat install.mjs` only name the file
-// and stay allowed, so the checkout can still be developed with the guard installed.
-const RUNNERS = new Set(['node', 'nodejs', 'deno', 'bun', 'tsx', 'ts-node', 'npx', 'sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'csh', 'tcsh', 'pwsh', 'powershell', 'cmd', 'source', '.', 'python', 'python3', 'py', 'ruby', 'perl', 'php']);
+// `node install.mjs --check` (or `./install.sh --check`) exactly, or a command that only reads the file.
+function installerNamingIsSafe(c) {
+  // backslashes are lost from argv (C:\\x\\install.mjs), so a Windows-style command is read from its raw words
+  const a = c.raw.includes('\\') ? c.raw.trim().split(/\s+/).map((w) => w.replace(/^["']|["']$/g, '')) : c.argv;
+  if (!a.length) return true;
+  const name = baseOf(a[0]);
+  const isInst = (w) => typeof w === 'string' && INSTALLER_FILE.test(toPosix(w));
+  if ((a.length === 2 && isInst(a[0]) && a[1] === '--check') || (a.length === 3 && (name === 'node' || name === 'nodejs') && isInst(a[1]) && a[2] === '--check')) return true;
+  if (name === 'git') return gitReadOnly(a.slice(1)) || (() => { const x = a.slice(1).find((w) => !w.startsWith('-')); return GIT_NAMING_SAFE.has(x); })();
+  return NAMING_SAFE.has(name);
+}
 
-function findInstaller(cmds, raw, dirs, ctx) {
-  const hits = [];
-  for (const c of cmds) {
-    const idx = c.argv.findIndex((a) => INSTALLER_NAME.test(posix.basename(toPosix(a))));
-    if (idx >= 0) {
-      if (idx === 0 || RUNNERS.has(baseOf(c.argv[0]))) hits.push({ p: c.argv[idx], after: c.argv.slice(idx + 1) });
-    } else if (c.raw.includes('\\')) {
-      const first = toPosix(c.raw.trim().split(/\s+/)[0] ?? '');
-      for (const h of rawInstallerHits(c.raw)) if (h.p === first || RUNNERS.has(baseOf(first))) hits.push(h);
+function scriptsReferenceInstaller(name, scripts, depth, seen) {
+  for (const n of [name, `pre${name}`, `post${name}`]) {
+    const body = scripts?.[n];
+    if (typeof body !== 'string' || seen.has(n)) continue;
+    seen.add(n);
+    if (INSTALLER_WORD.test(` ${toPosix(body)}`)) return true;
+    if (depth < 4) for (const m of body.matchAll(/\b(?:npm|pnpm|yarn)\s+(?:run|run-script)\s+(?:-\S+\s+)*([\w:.-]+)/g)) if (scriptsReferenceInstaller(m[1], scripts, depth + 1, seen)) return true;
+  }
+  return false;
+}
+
+function findInstaller(cmds, raw, dirs, ctx, opts) {
+  const text = expandRefs(raw, ctx);
+  const msg = (what) => `${what} installs the pipeline into ~/.claude; only the owner may run it, from a terminal or with PIPELINE_ADMIN=1 (node install.mjs --check and reading the file are allowed)`;
+
+  // npm run <script> where the script body runs the installer
+  const roots = dirs.map((d) => checkoutRootOf(d, ctx)).filter(Boolean);
+  if (roots.length) {
+    for (const c of cmds) {
+      const n = baseOf(c.argv[0] ?? '');
+      if (!['npm', 'pnpm', 'yarn'].includes(n)) continue;
+      const k = c.argv.findIndex((w, i) => i > 0 && !w.startsWith('-'));
+      if (k < 0 || !['run', 'run-script'].includes(c.argv[k])) continue;
+      const script = c.argv.slice(k + 1).find((w) => !w.startsWith('-'));
+      if (!script) continue;
+      for (const r of unique(roots)) {
+        let scripts;
+        try {
+          const read = opts.readFile ?? ((p) => fs.readFileSync(p, 'utf8'));
+          scripts = JSON.parse(read(posix.join(r, 'package.json'))).scripts ?? {};
+        } catch { return `${n} run ${script} runs in a claude-pipeline checkout whose package.json cannot be read, so it cannot be shown not to run the installer`; }
+        if (scriptsReferenceInstaller(script, scripts, 0, new Set())) return msg(`${n} run ${script}, whose script runs the installer, which`);
+      }
     }
   }
-  if (cmds.truncated) hits.push(...rawInstallerHits(raw));
-  for (const h of hits) {
-    const e = expandRefs(h.p, ctx);
-    const where = new Set(dirs);
-    for (const d of dirs) where.add(posix.dirname(isAbs(e) ? e : posix.join(d, e)));
-    const inCheckout = [...where].some((d) => {
-      try { return ctx.api.existsSync(posix.join(d, 'pipeline/hooks/guard-files.mjs')); } catch { return false; }
-    });
-    if (!inCheckout) continue;
-    if (h.after.length === 1 && h.after[0] === '--check') continue;
-    return `${h.p} installs the pipeline into ~/.claude; only the owner may run it, from a terminal or with PIPELINE_ADMIN=1 (node install.mjs --check is allowed)`;
+
+  if (!INSTALLER_WORD.test(text) && !INSTALLER_WORD.test(` ${text}`)) return null;
+  // is the cwd (or a cd target) inside a checkout, or does a named installer path resolve into one?
+  let inCheckout = roots.length > 0;
+  if (!inCheckout) {
+    for (const m of (` ${text}`).matchAll(INSTALLER_PATH)) {
+      const p = m[1] ?? '';
+      const bases = isAbs(p) ? [''] : dirs;
+      for (const d of bases) if (checkoutRootOf(isAbs(p) ? posix.normalize(p || '/') : posix.join(d, p || '.'), ctx)) inCheckout = true;
+    }
   }
+  if (!inCheckout) return null;
+  if (cmds.truncated || cmds.dynamic) return msg('a command line too complex to check that names the installer, which');
+  const naming = cmds.filter((c) => INSTALLER_WORD.test(` ${expandRefs(c.raw, ctx)}`));
+  const unsafe = naming.find((c) => !installerNamingIsSafe(c));
+  if (unsafe) return msg(`${unsafe.argv.length ? baseOf(unsafe.argv[0]) : 'a command'} naming the installer`);
+  if (!naming.length) return msg('a command naming the installer'); // inside a heredoc or program text the parser cut up
+  // something that reads the script from a pipe: cat install.sh | bash
+  const feeder = cmds.find((c) => c.argv.length && !naming.includes(c) && ((STDIN_RUNNERS.has(baseOf(c.argv[0])) && !c.argv.slice(1).some((w) => !w.startsWith('-'))) || FAN_OUT_RE.test(c.raw)));
+  if (feeder) return msg(`piping the installer into ${baseOf(feeder.argv[0])}, which`);
   return null;
 }
 
@@ -756,7 +813,7 @@ export function evaluateBashForFiles(command, opts = {}) {
   const dirs = collectDirs(cmds, ctx);
 
   // 3 and 4: installers and `protect --apply`
-  const installer = findInstaller(cmds, raw, dirs, ctx);
+  const installer = findInstaller(cmds, raw, dirs, ctx, opts);
   if (installer) return deny(installer);
   if (findProtectApply(cmds, raw)) return deny('pipeline protect --apply changes branch protection and the global hooks; only the owner may run it, from a terminal or with PIPELINE_ADMIN=1');
 
