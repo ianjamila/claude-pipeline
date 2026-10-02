@@ -201,12 +201,13 @@ Branch protection must require `ci.required_checks` AND, unless `ci.guard_checks
 verify the production deployment of a merge; roll back safely, open an issue and a revert PR if it fails.
 
 ```
-pipeline prod-watch --sha MERGE_SHA [--pr N] [--expect-text T] [--retry-wait SEC=60] [--repo DIR]   -> {ok, outcome: merged|deploy-failed|deploy-not-observed|not-live|superseded|recovered|rollback-failed|changed-during-recovery|rollback-skipped|no-production, ...}
+pipeline prod-watch (--sha MERGE_SHA [--pr N] | --pr N) [--expect-text T] [--retry-wait SEC=60] [--repo DIR]   -> {ok, outcome: merged|deploy-failed|deploy-not-observed|not-live|superseded|recovered|rollback-failed|changed-during-recovery|rollback-skipped|no-production, ...}
+  with only --pr N (merge printed mergeSha:null) the merge commit is read from the merged PR (up to 6 looks); exit 1 {error:not-merged} when the PR is not MERGED, exit 3 {error:merge-sha-unresolved} when GitHub never names it
 ```
 
 `--expect-text` applies only to this merge's own deployment: smokes of the rolled-back or superseded (other) deployment run without it. `not-live` also covers a merge whose deployment succeeded but was never promoted while production still serves the known-good deployment (nothing is rolled back).
 
-Exit: 0 outcome `merged` (or no production configured) · 1 any other outcome (recovered, rollback-failed, ...) · 3 deployment not observed / GitHub unavailable.
+Exit: 0 outcome `merged` (or no production configured) · 1 any other outcome (recovered, rollback-failed, ...), or with --pr only: the PR is not MERGED · 3 deployment not observed / GitHub unavailable / the merge commit could not be read.
 
 ## protect
 

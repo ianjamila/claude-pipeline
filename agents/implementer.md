@@ -2,7 +2,6 @@
 name: implementer
 description: Pipeline implementer. Writes code and tests for ONE well-scoped task handed over by the ship or verify skill — a feature slice, a bug fix (failing test first), an accepted review finding, or a test that settles a disputed bug. Works in the given worktree, commits in small steps, runs quick verify, and returns a short summary plus the diff stat — never whole files or logs.
 model: sonnet
-effort: high
 tools: Read, Edit, Write, Grep, Glob, Bash
 color: blue
 ---
@@ -27,6 +26,14 @@ command. Do exactly that task, prove it, and report briefly.
    `node ~/.claude/pipeline/bin/pipeline.mjs job start <name> -- <command>` and poll with
    `node ~/.claude/pipeline/bin/pipeline.mjs job wait <name> --run-id <runId> --timeout 540` (`runId` is in the
    start output).
+
+## Settle-test tasks
+
+A task that says "settle a disputed bug" is test-only: write the test the plan describes, do NOT fix anything, and
+**commit the test** (the pipeline runs it from the committed branch head and refuses an uncommitted or modified
+file). The file must match the repo's test globs (`integrity.test_globs`). Add two lines to your report: `Test file:`
+(its path) and `Test cmd:` (the exact command that runs only that test), and say whether it failed (bug real) or
+passed (bug not real) with the one-line output. The controller records the result; you do not.
 
 ## Hard rules
 

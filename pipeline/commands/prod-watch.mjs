@@ -3,18 +3,18 @@
 // issue and a revert PR. All the decisions live in lib/prodwatch.mjs; this file wires the real GitHub, Vercel, git,
 // smoke command and lock into it. Exit 0 merged (or no production configured), 1 any other outcome, 3 deployment not
 // observed or GitHub unavailable.
-import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
+import { EXIT, UsageError, intOption, parseCommandArgs } from '../lib/cli.mjs';
 import { guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { findDeployment } from '../lib/deploy.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { withLock } from '../lib/locks.mjs';
 import { GhError, gh as ghRun } from '../lib/proc.mjs';
-import { createGitOps, createSmoke, exitCodeFor, runProdWatch } from '../lib/prodwatch.mjs';
+import { createGitOps, createSmoke, exitCodeFor, resolveMergeSha, runProdWatch } from '../lib/prodwatch.mjs';
 import { inspectAlias, linkedProjectDir, rollback } from '../lib/vercel.mjs';
 
 export const meta = {
   summary: 'verify the production deployment of a merge; roll back safely, open an issue and a revert PR if it fails',
-  usage: 'pipeline prod-watch --sha MERGE_SHA [--pr N] [--expect-text T] [--retry-wait SEC=60] [--repo DIR]   -> {ok, outcome: merged|deploy-failed|deploy-not-observed|not-live|superseded|recovered|rollback-failed|changed-during-recovery|rollback-skipped|no-production, ...}',
+  usage: 'pipeline prod-watch (--sha MERGE_SHA [--pr N] | --pr N) [--expect-text T] [--retry-wait SEC=60] [--repo DIR]   -> {ok, outcome: merged|deploy-failed|deploy-not-observed|not-live|superseded|recovered|rollback-failed|changed-during-recovery|rollback-skipped|no-production, ...}\n  with only --pr N (merge printed mergeSha:null) the merge commit is read from the merged PR (up to 6 looks); exit 1 {error:not-merged} when the PR is not MERGED, exit 3 {error:merge-sha-unresolved} when GitHub never names it',
 };
 
 const LOCK_WAIT_MS = 10 * 60_000;
@@ -41,10 +41,11 @@ export const run = guarded(async (argv, ctx) => {
     repo: { type: 'string' },
   });
   if (positionals.length) throw new UsageError(`unexpected argument: ${positionals[0]}`);
-  const sha = requireOption(values, 'sha').toLowerCase();
-  // The deployments API matches the stored SHA exactly; an abbreviation would only wait out the whole timeout.
-  if (!/^[0-9a-f]{40}$/.test(sha)) throw new UsageError('--sha must be the full 40-character commit SHA');
   const pr = intOption(values, 'pr', { min: 1 });
+  let sha = values.sha?.toLowerCase() ?? null;
+  if (sha === null && pr === undefined) throw new UsageError('missing --sha MERGE_SHA (or --pr N, to read the merge commit from the merged PR)');
+  // The deployments API matches the stored SHA exactly; an abbreviation would only wait out the whole timeout.
+  if (sha !== null && !/^[0-9a-f]{40}$/.test(sha)) throw new UsageError('--sha must be the full 40-character commit SHA');
   const retryWait = intOption(values, 'retry-wait', { min: 0 }) ?? 60;
   const expectText = values['expect-text'] || null;
 
@@ -74,6 +75,21 @@ export const run = guarded(async (argv, ctx) => {
   };
 
   return guardGh(async () => {
+    if (sha === null) {
+      // `merge` printed mergeSha:null: the PR is MERGED but GitHub had not named the merge commit yet. Look again here.
+      const found = await resolveMergeSha({ prView: (fields) => gh.prView(pr, fields), pauseMs: Math.min(retryWait * 1000, 5000) });
+      if (found.state !== 'merged') {
+        const unresolved = found.state === 'unresolved';
+        return {
+          exitCode: unresolved ? EXIT.UNAVAILABLE : EXIT.FAILED,
+          output: {
+            ok: false, error: unresolved ? 'merge-sha-unresolved' : 'not-merged', pr,
+            reason: unresolved ? `PR #${pr} is MERGED but GitHub did not name its merge commit: find the SHA by hand and pass --sha` : `PR #${pr} is ${found.prState}, not MERGED`,
+          },
+        };
+      }
+      sha = found.sha;
+    }
     const output = await runProdWatch({ config, sha, pr, expectText, root, retryWaitMs: retryWait * 1000 }, deps);
     return { exitCode: exitCodeFor(output.outcome), output };
   });

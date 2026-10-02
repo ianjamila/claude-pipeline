@@ -13,7 +13,7 @@ import { run as procRun } from '../pipeline/lib/proc.mjs';
 import { GitError, git as gitRunReal } from '../pipeline/lib/git.mjs';
 import { fill } from '../pipeline/lib/config.mjs';
 import {
-  runProdWatch, exitCodeFor, hostOf, readKnownGood, createGitOps, createSmoke, issueTitle,
+  runProdWatch, exitCodeFor, hostOf, readKnownGood, createGitOps, createSmoke, issueTitle, resolveMergeSha,
 } from '../pipeline/lib/prodwatch.mjs';
 import { inspectAlias, rollback, vercelCommand, linkedProjectDir, VercelError, tail } from '../pipeline/lib/vercel.mjs';
 
@@ -884,7 +884,7 @@ test('CLI: no production configured is exit 0 {outcome: no-production}', () => {
 
 test('CLI usage errors exit 2: missing/short sha, bad --pr, unknown flag, stray argument', () => {
   const w = cliWorld({ healthy: [] });
-  assert.equal(w.cli([]).code, 2);
+  assert.equal(w.cli([]).code, 2); // neither --sha nor --pr
   assert.equal(w.cli(['--sha', 'abc123']).code, 2);
   assert.equal(w.cli(['--sha', w.merge, '--pr', '0']).code, 2);
   assert.equal(w.cli(['--sha', w.merge, '--bogus']).code, 2);
@@ -893,4 +893,51 @@ test('CLI usage errors exit 2: missing/short sha, bad --pr, unknown flag, stray 
 
 test('fill is strict for the production smoke template', () => {
   assert.equal(fill('smoke --base {url}', { url: 'https://a.b' }, { strict: true }), 'smoke --base https://a.b');
+});
+
+// ---- merge printed mergeSha:null: prod-watch resolves the merge commit from the PR itself --------------------------------
+
+test('resolveMergeSha: retries a MERGED PR that has no merge commit yet, then returns it', async () => {
+  const views = seq([{ state: 'MERGED', mergeCommit: null }, new Error('gh blew up'), { state: 'MERGED', mergeCommit: { oid: SHA.toUpperCase() } }]);
+  const slept = [];
+  const out = await resolveMergeSha({ prView: views, pauseMs: 7, sleep: async (ms) => { slept.push(ms); } });
+  assert.deepEqual(out, { state: 'merged', sha: SHA });
+  assert.deepEqual(slept, [7, 7]);
+  assert.deepEqual(views.calls[0], [['state', 'mergeCommit']]);
+});
+
+test('resolveMergeSha: an OPEN or CLOSED PR is not-merged at once; a MERGED PR that never names the commit is unresolved', async () => {
+  assert.deepEqual(await resolveMergeSha({ prView: seq([{ state: 'OPEN' }]), sleep: async () => {} }), { state: 'not-merged', prState: 'OPEN' });
+  assert.deepEqual(await resolveMergeSha({ prView: seq([{ state: 'CLOSED' }]), sleep: async () => {} }), { state: 'not-merged', prState: 'CLOSED' });
+  const never = seq([{ state: 'MERGED', mergeCommit: null }]);
+  assert.deepEqual(await resolveMergeSha({ prView: never, looks: 4, sleep: async () => {} }), { state: 'unresolved', prState: 'MERGED' });
+  assert.equal(never.calls.length, 4);
+  const bad = seq([{ state: 'MERGED', mergeCommit: { oid: 'abc123' } }]);
+  assert.equal((await resolveMergeSha({ prView: bad, looks: 2, sleep: async () => {} })).state, 'unresolved', 'an abbreviated oid is not a merge sha');
+});
+
+test('CLI with only --pr: the merge commit is read from the merged PR and the watch proceeds (merged, exit 0)', () => {
+  const w = cliWorld({ healthy: [NEW_HOST] });
+  w.gh.setScript([
+    { match: '^pr view 12 --json state,mergeCommit', stdoutJson: { state: 'MERGED', mergeCommit: { oid: w.merge } } },
+    ...JSON.parse(readFileSync(w.gh.env.PIPELINE_FAKE_GH_SCRIPT, 'utf8')),
+  ]);
+  const r = w.cli(['--pr', '12', '--retry-wait', '0']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.json.outcome, 'merged');
+  assert.equal(r.json.mergeSha, w.merge);
+});
+
+test('CLI with only --pr: a PR that is not MERGED is exit 1 not-merged; a merge commit GitHub never names is exit 3', () => {
+  const w = cliWorld({ healthy: [NEW_HOST] });
+  const base = JSON.parse(readFileSync(w.gh.env.PIPELINE_FAKE_GH_SCRIPT, 'utf8'));
+  w.gh.setScript([{ match: '^pr view 12 --json state,mergeCommit', stdoutJson: { state: 'OPEN', mergeCommit: null } }, ...base]);
+  const open = w.cli(['--pr', '12', '--retry-wait', '0']);
+  assert.equal(open.code, 1, open.stderr);
+  assert.equal(open.json.error, 'not-merged');
+  w.gh.setScript([{ match: '^pr view 12 --json state,mergeCommit', stdoutJson: { state: 'MERGED', mergeCommit: null } }, ...base]);
+  const unnamed = w.cli(['--pr', '12', '--retry-wait', '0']);
+  assert.equal(unnamed.code, 3, unnamed.stderr);
+  assert.equal(unnamed.json.error, 'merge-sha-unresolved');
+  assert.ok(!w.vercel.calls().some((c) => c[0] === 'rollback'));
 });

@@ -30,6 +30,24 @@ export function exitCodeFor(outcome) {
   return 1;
 }
 
+// The merge commit of a MERGED PR, for when `merge` could not name it (mergeSha:null). Reads the PR up to `looks` times, `pauseMs`
+// apart: {state:'merged', sha} | {state:'not-merged', prState} (OPEN/CLOSED: nothing to watch) | {state:'unresolved'} (MERGED but
+// GitHub never named the commit, or could not be read).
+export async function resolveMergeSha({ prView, looks = 6, pauseMs = 5000, sleep = defaultSleep }) {
+  let prState = null;
+  for (let i = 0; i < looks; i++) {
+    if (i > 0) await sleep(pauseMs);
+    try {
+      const view = await prView(['state', 'mergeCommit']);
+      prState = view?.state ?? null;
+      const oid = typeof view?.mergeCommit?.oid === 'string' ? view.mergeCommit.oid.toLowerCase() : '';
+      if (prState === 'MERGED' && /^[0-9a-f]{40}$/.test(oid)) return { state: 'merged', sha: oid };
+      if (prState === 'OPEN' || prState === 'CLOSED') return { state: 'not-merged', prState };
+    } catch { /* a flaky read counts as another miss */ }
+  }
+  return { state: 'unresolved', prState };
+}
+
 // "https://App.example.com/x" and "app.example.com" are the same host; anything unparseable is compared as-is.
 export function hostOf(value) {
   const s = String(value ?? '').trim();

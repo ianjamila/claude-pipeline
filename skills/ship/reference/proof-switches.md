@@ -1,7 +1,8 @@
 # Proof switches (testing the pipeline itself)
 
-These environment variables exist only to prove the pipeline's failure paths. When one is set,
-say so in the PR body ("Proof switch: …") and in the summary. Never set them for real work.
+These environment variables exist only to prove the pipeline's failure paths. ship checks them at
+Step 0 (`echo $PIPELINE_TEST_COMMIT_AS_IS $PIPELINE_TEST_FORCE_ARBITER $PIPELINE_ARBITER_MODEL_OVERRIDE`);
+when one is set, say so in the PR body ("Proof switch: …") and in the summary. Never set them for real work.
 
 | Variable | Effect |
 |---|---|

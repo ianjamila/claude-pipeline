@@ -12,9 +12,11 @@ Each recipe lists `STEPS` for `scripts/verify.mjs` (`quick: true` marks steps th
 | lint | the repo's lint/static-guard scripts (the same list CI runs; add a test asserting verify ⊇ CI list) | yes (fast subset) |
 | unit | `npx vitest run` | no |
 | unit-related | `npx vitest related <changed files> --run` (skip when no changed source) | yes (quick only) |
-| db | dedicated local Supabase (`--workdir` temp copy, project id `<id>-pipeline`, ports +1000) under lock: start if needed → `supabase db reset` → `supabase test db` | no |
-| build | `npm run build` (local env pointing at the dedicated instance) | no |
-| e2e | `npx playwright test -c playwright.smoke.config.ts` (own port; screenshots to `.verify/screenshots/`) | no |
+| db | `node scripts/pipeline/supabase-local.mjs reset-and-test --project <id>` (vendored template: temp `.verify/supabase-workdir` copy, project id `<id>-pipeline`, own port offset) under the `db` lock: start if needed → `supabase db reset` → `supabase test db`; pgTAP starter: `templates/pgtap/rls_example.test.sql` | no |
+| build | `npm run build` with the dedicated instance's env (`supabase-local.mjs env --project <id>`; the `verify.mjs` template's `supabaseEnv()` does this) | no |
+| e2e | `npx playwright test -c playwright.smoke.config.ts --project=smoke` (templates `e2e/playwright.smoke.config.ts` + `e2e/smoke.spec.ts`; its port comes from `PIPELINE_SMOKE_PORT`, which `supabase-local env` prints; screenshots to `.verify/screenshots/`) | no |
+
+Set `verify.expected_steps` in `pipeline.yml` to these step names, in order (only the steps the repo really has).
 
 Preview: GitHub deployments environment `Preview`; production: provider `vercel`. On a failed production
 smoke `pipeline prod-watch` itself runs the Vercel CLI (`vercel rollback <known-good> --yes --timeout 3m`, where
