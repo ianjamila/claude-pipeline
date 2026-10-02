@@ -3,6 +3,9 @@
 // positives, 8 performance. Home is /home/u (user "u"); the filesystem is faked unless a test says otherwise.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { simpleCommands } from '../pipeline/hooks/lib/shell-parse.mjs';
 import { evaluateFileTool, evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 
@@ -643,4 +646,36 @@ test('script files: the pipeline CLI and node_modules programs are not scanned',
   };
   assert.equal(bash('node ~/.claude/pipeline/bin/pipeline.mjs preflight', PROJ, fsOf(files)).decision, 'allow');
   assert.equal(bash('./node_modules/.bin/tool', PROJ, fsOf(files)).decision, 'allow');
+});
+
+// ---- 10. macOS firmlink spelling and inode identity (review finding 5) ----------------------------------
+
+const DARWIN = { platform: 'darwin' };
+
+test('firmlink: /System/Volumes/Data/<path> names the same file on macOS, in file tools, MCP and Bash', () => {
+  const p = '/System/Volumes/Data/home/u/.claude/settings.json';
+  assert.equal(evaluateFileTool({ tool_name: 'Write', tool_input: { file_path: p, content: '{}' }, cwd: PROJ }, { ...BASE, ...DARWIN }).decision, 'deny');
+  assert.equal(evaluateFileTool({ tool_name: 'Edit', tool_input: { file_path: '/System/Volumes/Data/home/u/.claude/skills/ship/SKILL.md', old_string: 'a', new_string: 'b' }, cwd: PROJ }, { ...BASE, ...DARWIN }).decision, 'deny');
+  assert.equal(mcp('mcp__filesystem__write_file', { path: p, content: 'x' }, PROJ, DARWIN).decision, 'deny');
+  assert.equal(bash(`echo {} > ${p}`, PROJ, DARWIN).decision, 'deny');
+  assert.equal(bash('rm -rf /System/Volumes/Data/home/u/.claude/pipeline', PROJ, DARWIN).decision, 'deny');
+  assert.equal(bash('cd /System/Volumes/Data/home/u/.claude && echo x > settings.json', PROJ, DARWIN).decision, 'deny');
+  // reading is fine, other platforms do not have the alias, and unrelated files under /System/Volumes/Data stay allowed
+  assert.equal(bash(`cat ${p}`, PROJ, DARWIN).decision, 'allow');
+  assert.equal(evaluateFileTool({ tool_name: 'Write', tool_input: { file_path: '/System/Volumes/Data/home/u/notes.md', content: 'x' }, cwd: PROJ }, { ...BASE, ...DARWIN }).decision, 'allow');
+});
+
+test('inode identity: a path that is the same file as a protected root (hard link, alias) is protected', (t) => {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'gf-ino-')));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(home, '.claude', 'pipeline', 'hooks'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.claude', 'settings.json'), '{}');
+  fs.mkdirSync(path.join(home, 'elsewhere'));
+  fs.linkSync(path.join(home, '.claude', 'settings.json'), path.join(home, 'elsewhere', 'alias.json'));
+  const real = { home, env: {}, platform: process.platform === 'win32' ? 'linux' : process.platform };
+  const w = (file_path) => evaluateFileTool({ tool_name: 'Write', tool_input: { file_path, content: 'x' }, cwd: home }, real).decision;
+  if (process.platform !== 'win32') assert.equal(w(path.join(home, 'elsewhere', 'alias.json')), 'deny', 'hard link to settings.json');
+  assert.equal(w(path.join(home, 'elsewhere', 'other.json')), 'allow');
+  assert.equal(w(path.join(home, '.claude', 'pipeline', 'hooks', 'new.mjs')), 'deny', 'a new file inside a protected dir');
+  assert.equal(w(path.join(home, '.claude', 'notes.md')), 'allow');
 });

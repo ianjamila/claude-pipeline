@@ -119,6 +119,19 @@ function readLinkIfAny(p) {
   return st?.isSymbolicLink() ? fs.readlinkSync(p) : null;
 }
 
+// macOS spells every path on the boot volume a second way: /System/Volumes/Data/Users/u == /Users/u (a firmlink, not a
+// symlink, so realpath keeps the prefix).
+const FIRMLINK = /\/System\/Volumes\/Data(?=\/|$)/gi;
+
+function realStatId(p) {
+  try {
+    const st = fs.statSync(p);
+    return st.ino ? `${st.dev}:${st.ino}` : null; // an fs that reports no inode (ino 0) cannot be compared
+  } catch {
+    return null;
+  }
+}
+
 function defaultReadText(file) {
   try {
     const st = fs.statSync(file);
@@ -139,13 +152,18 @@ function makeCtx(opts) {
     realpath: opts.realpath ?? fs.realpathSync.native,
     existsSync: opts.existsSync ?? fs.existsSync,
     readlink: opts.readlink ?? (opts.existsSync ? () => null : readLinkIfAny),
+    // dev:ino of a path (null when missing); a caller that fakes the filesystem gets no inode comparison
+    statId: opts.statId ?? (opts.existsSync || platform === 'win32' ? () => null : realStatId),
   };
+  const darwin = platform === 'darwin';
+  const unFirm = (p) => (darwin ? p.replace(FIRMLINK, '') : p);
   const base = homePosix === '/' ? '' : homePosix;
   const lexRoots = protectedRoots(homePosix);
   const lexAncestors = ANCESTOR_REL.map((r) => `${base}/${r}`);
   const roots = unique([...withWindowsAliases(lexRoots, homePosix, platform), ...lexRoots.map((r) => realResolve(r, api))]);
   const ancestors = unique([...withWindowsAliases(lexAncestors, homePosix, platform), ...lexAncestors.map((r) => realResolve(r, api))]);
   const ci = caseInsensitive(platform);
+  let rootIds = null;
   return {
     platform, homeNative, homePosix, cwd, api, roots, lexRoots, ancestors, lexAncestors, ci,
     user: opts.user ?? posix.basename(homePosix),
@@ -153,8 +171,24 @@ function makeCtx(opts) {
     dynamic: false, // set when a scan had to be skipped for size; callers fail closed
     readText: opts.readText ?? defaultReadText,
     admin: (opts.env ?? process.env).PIPELINE_ADMIN === '1',
-    hit: (p) => roots.some((r) => isInside(p, r, platform)),
-    hitAncestor: (p) => ancestors.some((a) => samePath(p, a, platform)),
+    hit: (p) => { const q = unFirm(p); return roots.some((r) => isInside(q, r, platform)); },
+    hitAncestor: (p) => { const q = unFirm(p); return ancestors.some((a) => samePath(q, a, platform)); },
+    unFirm,
+    // Is `p`, or the nearest existing directory above it, the very same file or directory (same device and inode) as a
+    // protected root? Catches hard links and any other spelling of the path that realpath does not unify.
+    hitInode: (p) => {
+      if (rootIds === null) rootIds = new Set(roots.map((r) => api.statId(r)).filter(Boolean));
+      if (rootIds.size === 0) return false;
+      let cur = p;
+      for (let i = 0; i < 64; i++) {
+        const id = api.statId(cur);
+        if (id !== null && rootIds.has(id)) return true;
+        const parent = posix.dirname(cur);
+        if (parent === cur) return false;
+        cur = parent;
+      }
+      return false;
+    },
   };
 }
 
@@ -199,7 +233,7 @@ const SETTINGS_RE = /^settings(\.[\w-]+)?\.json$/i;
 function lexicalTarget(target, ctx) {
   let s = toPosix(expandHome(target, ctx.homeNative)).replace(DEVICE_PREFIX, '');
   if (!isAbs(s)) s = posix.join(ctx.cwd, s);
-  s = posix.normalize(s);
+  s = ctx.unFirm(posix.normalize(s));
   return s.length > 1 && s.endsWith('/') ? s.slice(0, -1) : s;
 }
 
@@ -259,7 +293,7 @@ function evaluateMcp(tool, ti, input, opts) {
   // 1. a file write: the path keys name the targets (an exact ancestor dir counts too)
   const targets = writeVerb ? f.paths.map((t) => ({ t, candidates: resolve(t) })) : [];
   for (const { t, candidates } of targets) {
-    if (candidates.some((c) => ctx.hit(c) || ctx.hitAncestor(c))) return deny(`${t} is a protected pipeline file or the directory that holds it (${PROTECTED_MSG})`);
+    if (candidates.some((c) => ctx.hit(c) || ctx.hitAncestor(c) || ctx.hitInode(c))) return deny(`${t} is a protected pipeline file or the directory that holds it (${PROTECTED_MSG})`);
   }
   if (targets.length) {
     const texts = f.contents.flatMap(variantsOf);
@@ -306,7 +340,7 @@ export function evaluateFileTool(input, opts = {}) {
     return { t, candidates: unique([lexical, realResolve(lexical, ctx.api)]) };
   });
   for (const { t, candidates } of resolved) {
-    if (candidates.some((c) => ctx.hit(c))) return deny(`${t} is a protected pipeline file (${PROTECTED_MSG})`);
+    if (candidates.some((c) => ctx.hit(c) || ctx.hitInode(c))) return deny(`${t} is a protected pipeline file (${PROTECTED_MSG})`);
   }
   if (texts.some(hasDisableAll)) {
     for (const { t, candidates } of resolved) {
@@ -376,7 +410,7 @@ function substVars(text, vars) {
 // Slash-normalised copy of `text` with the user name, same-line variables and every home spelling replaced.
 function expandRefs(text, ctx) {
   const t = toPosix(text).replace(USER_RE, ctx.user);
-  return expandHomeRefs(substVars(t, ctx.vars), ctx.homePosix);
+  return ctx.unFirm(expandHomeRefs(substVars(t, ctx.vars), ctx.homePosix));
 }
 
 // Expands the first `{a,b}` groups of each word so `~/.claude/{pipeline,settings.json}` shows both paths.
@@ -919,7 +953,7 @@ export function evaluateBashForFiles(command, opts = {}) {
       const target = r.target;
       const e = expandRefs(target, ctx);
       const abs = isAbs(e) ? [posix.normalize(e)] : dirs.map((d) => posix.join(d, e));
-      const viaLink = abs.some((p) => !/[*?[]/.test(p) && ctx.hit(realResolve(p, ctx.api)));
+      const viaLink = abs.some((p) => !/[*?[]/.test(p) && (ctx.hit(realResolve(p, ctx.api)) || ctx.hitInode(p)));
       if (m.rawHit(target, dirs) || m.pathHit(target, dirs, true) || viaLink) return deny(`the command redirects output to ${target}, which is a protected pipeline file or the directory that holds it (${PROTECTED_MSG})`);
     }
   }
