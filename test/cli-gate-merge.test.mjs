@@ -352,14 +352,15 @@ test('merge: a PR that reports labels as something other than a list is treated 
 
 // ---- the merge commit (reviewer finding 10) --------------------------------------------------------
 
-test('merge: MERGED but no merge commit is re-read three times, then fails with a reason', () => {
+test('merge: MERGED but no merge commit is re-read three times, then exits 0 with mergeSha null and a warning', () => {
   const s = scenario({ gh: { mergeView: { state: 'MERGED', mergeCommit: null } } });
   assert.equal(s.gate().code, 0);
   const r = s.merge({ PIPELINE_MERGE_POLL_MS: '10' });
-  assert.equal(r.code, 1, `${r.stderr}\n${r.stdout}`);
-  assert.equal(r.json.ok, false);
+  assert.equal(r.code, 0, `${r.stderr}\n${r.stdout}`);
+  assert.equal(r.json.ok, true);
+  assert.equal(r.json.merged, true);
   assert.equal(r.json.mergeSha, null);
-  assert.match(r.json.reason, /merge commit/);
+  assert.match(r.json.warning, /merge commit/);
   const reads = s.fake.lines().filter((l) => l.startsWith('pr view 12 --json state,mergeCommit'));
   assert.equal(reads.length, 4, 'one read plus three re-reads');
 });

@@ -18,13 +18,13 @@ import { toPosix } from './paths.mjs';
 import { loadState } from './state.mjs';
 import { parseYaml } from './yaml.mjs';
 import { reviewValidFor } from './triage.mjs';
-import { commitTime, diffFiles, headSha, mergeBase, reviewBaseRef, reviewContentHash, treeFingerprint } from './git.mjs';
+import { commitTime, diffFiles, headSha, mergeBase, revParse, reviewBaseRef, reviewContentHash, treeFingerprint } from './git.mjs';
 
 export const GATE_FILE = 'final-gate.json';
 export const BLOCKING_LABELS = Object.freeze(['needs-human', 'awaiting-review', 'pipeline-blocked']);
 // A gate older than this is evidence about a world that may be gone (base moved, a pause issue opened).
 export const GATE_MAX_AGE_MS = 30 * 60_000;
-export const PR_FIELDS = Object.freeze(['state', 'headRefOid', 'baseRefName', 'isDraft', 'labels', 'mergeable']);
+export const PR_FIELDS = Object.freeze(['state', 'headRefOid', 'baseRefName', 'isDraft', 'labels', 'mergeable', 'mergeStateStatus']);
 
 // What a gate must contain: exactly these checks (plus `preview` when config.preview is set), each once and passing.
 // `merge` refuses a gate file that lacks any of them, so a hand-written or truncated file cannot vouch for a merge.
@@ -35,7 +35,12 @@ export const expectedCheckNames = (previewConfigured) => (previewConfigured ? [.
 export const MERGEABLE_RETRIES = 3;
 export const MERGEABLE_PAUSE_MS = 2000;
 const MERGE_SHA_RETRIES = 3;
-const DOC_EXTENSIONS = /\.(md|mdx|txt)$/i;
+// Docs-only is deliberately narrow: markdown anywhere (not .mdx, which can hold executable JSX), text/reStructuredText/AsciiDoc
+// under the root docs/ directory, and the LICENSE / CHANGELOG files. A .txt anywhere else (requirements.txt, CMakeLists.txt, a
+// prompt file) is code.
+const MARKDOWN = /\.(?:md|markdown)$/i;
+const DOCS_DIR_TEXT = /\.(?:md|markdown|txt|rst|adoc)$/i;
+const DOC_NAMES = /^(?:license|licence|changelog)(?:\.(?:md|markdown|txt))?$/i;
 // Agent instruction files steer what an agent does next, so they are code wherever they sit (docs/ included).
 const AGENT_INSTRUCTION_FILES = new Set(['claude.md', 'agents.md', 'gemini.md', '.cursorrules', 'copilot-instructions.md']);
 // Instructions, hooks, workflows and the pipeline itself: text files here change what agents or CI do, so they are code.
@@ -117,11 +122,13 @@ const pathsOf = (f) => [f.oldPath, f.newPath, f.path].filter((p) => typeof p ===
 
 function isDocPath(p) {
   const parts = toPosix(p).replace(/^\.\//, '').split('/');
-  return DOC_EXTENSIONS.test(parts.at(-1)) && !AGENT_INSTRUCTION_FILES.has(parts.at(-1).toLowerCase())
-    && !parts.slice(0, -1).some((d) => NEVER_DOCS_DIRS.has(d.toLowerCase()));
+  const name = parts.at(-1);
+  if (AGENT_INSTRUCTION_FILES.has(name.toLowerCase()) || parts.slice(0, -1).some((d) => NEVER_DOCS_DIRS.has(d.toLowerCase()))) return false;
+  if (MARKDOWN.test(name) || DOC_NAMES.test(name)) return true;
+  return parts.length > 1 && parts[0].toLowerCase() === 'docs' && DOCS_DIR_TEXT.test(name);
 }
 
-// Every changed file is a non-binary .md/.mdx/.txt file outside the instruction/hook/workflow/pipeline directories (a
+// Every changed file is a non-binary doc (see isDocPath) outside the instruction/hook/workflow/pipeline directories (a
 // rename counts by BOTH its paths: moving code into docs/ is not docs-only). Living under docs/ is not enough: a
 // script or an image there is not documentation. Only this rule lets a `skipping` CI check pass.
 export function isDocsOnly(files) {
@@ -192,16 +199,34 @@ function lazyDiff(root, config) {
 
 // ---- the checks ---------------------------------------------------------------------------------
 
-function prOpenCheck({ info, head, config }) {
+function prOpenCheck({ info, head, config, behind = null }) {
   const problems = [];
   if (info.state !== 'OPEN') problems.push(`PR state is ${info.state}`);
   if (info.isDraft !== false) problems.push('PR is a draft');
   if (info.mergeable === 'CONFLICTING') problems.push('PR has merge conflicts');
   else if (info.mergeable !== 'MERGEABLE') problems.push(`PR mergeable state is ${JSON.stringify(info.mergeable)}, not MERGEABLE (GitHub has not finished computing it, or it did not say)`);
   if (info.headRefOid !== head) problems.push(`PR head ${short(info.headRefOid)} is not the local HEAD ${short(head)}`);
+  // Branch protection is not strict (spec 6.6), so GitHub will merge a PR that is behind its base: that would land code on a
+  // base nobody verified it against. The branch must be updated (and re-verified) first.
+  if (behind) problems.push(`behind-base: ${behind}; update the branch from ${config.default_branch} and re-verify before merging`);
   // The hard-stop, integrity and review diffs are taken against the default branch; any other base would be judged on the wrong diff.
   if (info.baseRefName !== config.default_branch) problems.push(`PR base is ${JSON.stringify(info.baseRefName)}, not ${config.default_branch}`);
   return problems.length ? check('pr-open', false, problems.join('; ')) : check('pr-open', true, `open at ${short(head)}`);
+}
+
+// Why this PR is behind its base, or null: GitHub says BEHIND, or the base tip is not an ancestor of HEAD (the merge base
+// with the base ref is not the base ref's own commit). The local ref can be stale, which only makes this check lenient;
+// GitHub's own mergeStateStatus is the authority.
+function behindBase({ info, diff, root, config }) {
+  if (info?.mergeStateStatus === 'BEHIND') return 'GitHub reports the PR is BEHIND its base (mergeStateStatus BEHIND)';
+  const d = diff();
+  if (!d.ok) return null; // the checks that need the diff report it themselves
+  try {
+    const ref = baseRefFor(root, config);
+    const tip = revParse(`${ref}^{commit}`, { cwd: root });
+    if (tip !== d.mb) return `the base (${ref} at ${short(tip)}) is not an ancestor of HEAD; the branch forked from ${short(d.mb)}`;
+  } catch { /* an unreadable ref was already reported by the diff */ }
+  return null;
 }
 
 export const validLabels = (labels) => Array.isArray(labels) && labels.every((l) => isObject(l) && typeof l.name === 'string');
@@ -403,7 +428,7 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
   } catch { /* recorded as null */ }
 
   const checks = [
-    await safely('pr-open', () => prOpenCheck({ info, head, config })),
+    await safely('pr-open', () => prOpenCheck({ info, head, config, behind: behindBase({ info, diff, root, config }) })),
     await safely('labels', () => labelsCheck(info)),
     await safely('preflight', () => preflightCheck({ root, env, gh })),
     await safely('verify-report', () => verifyReportCheck({ root, config, head, tree, o })),
@@ -475,6 +500,24 @@ async function readMergeSha({ gh, pr, first, sleep, pollMs }) {
     } catch { /* still unreadable: counts as another miss */ }
   }
   return sha;
+}
+
+// The last look before the merge command: GitHub as it is NOW. The live gate read the PR and ran slow probes (Codex, CI,
+// preview) after that read, so a label, a pause issue or a new push can have landed since. Returns the reasons the merge
+// must not run (empty = go). An unreadable PR is a reason.
+export async function preMergeProblems({ gh, pr, head }) {
+  let view;
+  try {
+    view = gh.prView(pr, ['state', 'headRefOid', 'labels', 'isDraft']);
+  } catch (err) {
+    return [`could not re-read the PR before merging: ${String(err?.message ?? err)}`];
+  }
+  const problems = [];
+  if (view?.state !== 'OPEN') problems.push(`PR state is ${view?.state}`);
+  if (view?.isDraft !== false) problems.push('PR is a draft');
+  if (view?.headRefOid !== head) problems.push(`PR head is now ${short(view?.headRefOid)}, the gate approved ${short(head)}`);
+  problems.push(...(await waitBlockers(gh)(view)));
+  return problems;
 }
 
 // What can stop a queued merge while we wait: a blocking label, or an open pause/rollback issue. Anything unreadable

@@ -96,7 +96,7 @@ Exit: 0 deployed · 1 the deployment failed · 3 nothing finished in time (or Gi
 prove this PR head is verified, reviewed, CI-green and smoked; writes .review/final-gate.json.
 
 ```
-pipeline final-gate --pr N [--repo DIR]   -> {ok, repo, pr, base, head, tree, contentHash, checks[{name,ok,detail}], failed[], at}; exit 0 all checks pass, 1 any fails, 3 GitHub unavailable
+pipeline final-gate --pr N [--repo DIR]   -> {ok, repo, pr, base, head, tree, contentHash, checks[{name,ok,detail}], failed[], at}; exit 0 all checks pass, 1 any fails (pr-open detail starts "behind-base:" when the PR is behind its base: update the branch and re-verify), 3 GitHub unavailable
 ```
 
 Exit: 0 every check passes (writes .review/final-gate.json) · 1 any check fails · 3 GitHub (`gh`) unavailable.
@@ -166,10 +166,10 @@ Exit: 0 · 3 GitHub (`gh`) unavailable.
 merge the PR if (and only if) the final gate passes again, live; waits for MERGED.
 
 ```
-pipeline merge --pr N [--repo DIR]   -> {ok, merged, mergeSha, prodBefore} ; exit 0 merged, 1 not merged / refused (run final-gate again), 3 GitHub unavailable or no known-good production deployment
+pipeline merge --pr N [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|live-check|pre-merge; run final-gate again), 3 GitHub unavailable or no known-good production deployment
 ```
 
-Exit: 0 merged · 1 not merged / refused by the live gate (run final-gate again) · 3 GitHub unavailable, or no known-good production deployment.
+Exit: 0 merged (a merge commit GitHub cannot name yet is `mergeSha: null` plus a `warning`; prod-watch resolves it) · 1 not merged / refused by the live gate or by the last pre-merge look at GitHub (run final-gate again) · 3 GitHub unavailable, or no known-good production deployment.
 
 ## model-proof
 

@@ -91,6 +91,7 @@ export function ghEntries(o) {
     state: o.state ?? 'OPEN', headRefOid: o.prHead, baseRefName: o.base ?? 'main', isDraft: o.isDraft ?? false,
     labels: 'rawLabels' in o ? o.rawLabels : (o.labels ?? []).map((name) => ({ name })), mergeable: o.mergeable ?? 'MERGEABLE',
   };
+  if (o.mergeStateStatus) pr.mergeStateStatus = o.mergeStateStatus;
   if (o.noLabels) delete pr.labels; // `labels` absent from the reply entirely
   if (o.noMergeable) delete pr.mergeable;
 
