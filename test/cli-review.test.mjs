@@ -1558,6 +1558,25 @@ test('codex-review: a later round whose content is unchanged since the last roun
   assert.equal(w.codex(2, findingsOf(), { from: w.head, to: head3 }).code, 0);
 });
 
+test('mark-implemented: a commit that only adds or edits tests is not a fix; a source change is', (t) => {
+  const w = world(t);
+  assert.equal(w.codex(1, findingsOf([finding()])).code, 0);
+  assert.equal(w.judge(1, { 'R1-B1': ['ACCEPT'] }).code, 0);
+  w.repo.write('src/a.test.js', "test('null x', () => {});\n");
+  w.repo.git(['add', 'src/a.test.js']); // just the test: the untracked .review/ state stays out
+  w.repo.git(['commit', '-q', '-m', 'test only']);
+  const testOnly = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assert.equal(testOnly.code, 2, testOnly.stdout);
+  assert.equal(testOnly.json.error, 'no-code-change');
+  assert.match(testOnly.json.message, /only test files/);
+  assert.ok(!w.item('R1-B1').implemented);
+
+  w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
+  w.repo.commit('fix');
+  assert.equal(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']).code, 0);
+  assert.ok(w.item('R1-B1').implemented);
+});
+
 test('codex-review: with nothing accepted, a later round over an unchanged tree is still allowed', (t) => {
   const w = world(t);
   assert.equal(w.codex(1, findingsOf([finding()])).code, 0);

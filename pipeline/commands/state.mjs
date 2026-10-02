@@ -3,7 +3,9 @@
 // only memory of the review loop, so a lost local copy is rebuilt from the PR's triage comment, which embeds it.
 import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
+import { git } from '../lib/git.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
+import { matchAny } from '../lib/glob.mjs';
 import { MARKERS } from '../lib/render.mjs';
 import { decodeFromComment, loadState, saveState, updateItems } from '../lib/state.mjs';
 import { roundOutcome } from '../lib/triage.mjs';
@@ -123,6 +125,15 @@ async function markImplemented(rest, ctx) {
         throw new Fail(EXIT.USAGE, {
           ok: false, error: 'no-code-change',
           message: `${item.id} cannot be marked implemented: the branch content is identical to what round ${round.n} reviewed (no fix has been committed)`,
+        });
+      }
+      // A settle-by-test commit changes the hash too, so also require a non-test file to have changed since then.
+      const changed = git(['diff', '--name-only', '--no-renames', `${round.toHead}..HEAD`], { cwd: root }).split('\n').filter(Boolean);
+      const code = changed.filter((f) => f !== config.agent_log && !matchAny(f, config.integrity.test_globs));
+      if (code.length === 0) {
+        throw new Fail(EXIT.USAGE, {
+          ok: false, error: 'no-code-change',
+          message: `${item.id} cannot be marked implemented: since round ${round.n} only test files changed (${changed.join(', ') || 'nothing'}); commit the fix itself`,
         });
       }
     }
