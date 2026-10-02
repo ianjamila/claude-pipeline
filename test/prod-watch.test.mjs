@@ -316,6 +316,34 @@ test('a newer deployment that is ALSO failing does not protect ours: recovery co
   assert.match(h.issueCreate.calls[0][0].body, /also fails the smoke/);
 });
 
+test('post-rollback and superseded smokes do NOT carry the new build\'s --expect-text (the old build cannot contain it)', async () => {
+  const h = harness({ smoke: [FAIL, FAIL, PASS], inspect: [OURS, OURS, OLDER] });
+  const r = await h.go({ expectText: 'New heading' });
+  assert.equal(r.outcome, 'recovered', 'a healthy old deployment must not read as rollback-failed');
+  assert.deepEqual(h.smoke.calls.map((c) => c[0].expectText), ['New heading', 'New heading', null]);
+  assert.equal(h.revertBranch.calls.length, 1);
+
+  const s = harness({ smoke: [FAIL, FAIL, PASS], inspect: [NEWER] });
+  assert.equal((await s.go({ expectText: 'New heading' })).outcome, 'superseded');
+  assert.equal(s.smoke.calls[2][0].expectText, null);
+});
+
+test('not-live: the merge\'s deployment succeeded but production still serves the known-good one (no promotion after a manual rollback): nothing is rolled back', async () => {
+  // Same host as the recorded known-good.
+  const h = harness({ smoke: [FAIL, FAIL, PASS], inspect: [OLDER] });
+  const r = await h.go({ expectText: 'New heading' });
+  assert.equal(r.outcome, 'not-live');
+  assert.equal(h.rollbackFn.calls.length, 0);
+  assert.equal(h.revertBranch.calls.length, 0);
+  assert.match(r.reason, /known-good/);
+  assert.deepEqual(h.issueCreate.calls[0][0].labels, ['needs-human']);
+  assert.match(h.issueCreate.calls[0][0].title, /not-live/);
+  // By id, when only an id was recorded.
+  const byId = harness({ smoke: [FAIL, FAIL, PASS], inspect: [OLDER], readKnownGood: () => ({ ok: true, id: 'dpl_old', url: '', sha: null }) });
+  assert.equal((await byId.go()).outcome, 'not-live');
+  assert.equal(byId.rollbackFn.calls.length, 0);
+});
+
 test('changed-during-recovery: the live deployment moved between the check and the rollback, so NOTHING is rolled back', async () => {
   const h = harness({ smoke: [FAIL, FAIL], inspect: [OURS, NEWER] });
   const r = await h.go();

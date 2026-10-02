@@ -133,7 +133,7 @@ export const issueTitle = (outcome, { pr, sha }) => `[pipeline] production ${out
 const HEADLINE = {
   'deploy-failed': 'The Production deployment of this merge FAILED. Production was never switched to it, so the previous deployment is still serving; nothing was rolled back.',
   'deploy-not-observed': 'No successful Production deployment of this merge was reported in time. It is unknown whether it is live; nothing was rolled back.',
-  'not-live': 'Production smoke passed, but production kept serving an OLDER deployment than this merge, so the merge never went live. Nothing was rolled back.',
+  'not-live': 'Production kept serving an OLDER deployment than this merge (the smoke passed against it, or it is the known-good deployment), so the merge never went live. Nothing was rolled back.',
   superseded: 'This merge\'s deployment failed the production smoke, but a DIFFERENT deployment is now live and passes it. Nothing was rolled back (that would have removed someone else\'s healthy deploy).',
   recovered: 'The production smoke FAILED after this merge. Production was rolled back to the last known-good deployment and passes the smoke again.',
   'rollback-failed': 'The production smoke FAILED after this merge and the automatic rollback did NOT restore a healthy production.',
@@ -237,10 +237,12 @@ export async function runProdWatch(opts, deps) {
   };
   let rollbackTried = false;
 
-  const smokeOnce = async () => {
+  // `expect` defaults to the new build's text. A deployment that is NOT this merge's (the rolled-back one, a newer one)
+  // cannot contain that text, so those smokes pass null and only judge health.
+  const smokeOnce = async (expect = expectText) => {
     let r;
     try {
-      r = await smoke({ url: prod.url, expectText });
+      r = await smoke({ url: prod.url, expectText: expect });
     } catch (err) {
       r = { ok: false, tail: `smoke could not run: ${err?.message ?? err}` };
     }
@@ -250,12 +252,12 @@ export async function runProdWatch(opts, deps) {
     return ev.smoke;
   };
   // A fresh deploy can need a minute to reach every edge, so one failure alone proves nothing.
-  const smokeWithRetry = async () => {
-    const first = await smokeOnce();
+  const smokeWithRetry = async (expect = expectText) => {
+    const first = await smokeOnce(expect);
     if (first.ok) return first;
     note(`production smoke failed; retrying in ${Math.round(retryWaitMs / 1000)}s`);
     await sleep(retryWaitMs);
-    return smokeOnce();
+    return smokeOnce(expect);
   };
 
   // Is the deployment `live` ours (same host, or built from our commit), newer than ours, or older/unknown?
@@ -381,9 +383,19 @@ export async function runProdWatch(opts, deps) {
     }
     ev.live = ev.liveBefore = before;
     if ((await relate(before)) !== 'ours') {
+      // Vercel stops auto-assigning production after a rollback, so this merge's deployment may simply never have been
+      // promoted: production still serves the known-good deployment. Rolling back to what is already live is a no-op
+      // that would read as a failed rollback, so say "not live" instead.
+      const early = await readKnown();
+      if (early?.ok && ((early.url && hostOf(early.url) === hostOf(before.url)) || (early.id && before.id && early.id === String(before.id)))) {
+        ev.knownGood = { id: early.id, sha: early.sha, url: early.url };
+        ev.reason = `production still serves the known-good deployment ${describe(before)}: this merge's deployment was never promoted (Vercel stops auto-assigning production after a rollback), so there is nothing to roll back`;
+        return 'not-live';
+      }
       // The live deployment is not the one that failed; it may be a newer, healthy deploy that must not be rolled back.
+      // It is not this merge's build, so the new build's expect-text does not apply.
       note('the live deployment is not this merge\'s; smoking it once more');
-      if ((await smokeOnce()).ok) return 'superseded';
+      if ((await smokeOnce(null)).ok) return 'superseded';
       ev.notes.push('A different deployment is live and also fails the smoke, so recovery continued.');
     }
 
@@ -423,7 +435,8 @@ export async function runProdWatch(opts, deps) {
     ev.live = ev.liveAfter = after;
     const landed = known.url ? hostOf(after.url) === hostOf(known.url) : after.id === known.id;
     if (!landed) return skip(`rollback ran but production serves ${describe(after)}, not the known-good deployment`, 'rollback-failed');
-    if (!(await smokeWithRetry()).ok) return skip('production still fails the smoke after rollback', 'rollback-failed');
+    // The rolled-back deployment is the OLD build: the new build's expect-text cannot be on it.
+    if (!(await smokeWithRetry(null)).ok) return skip('production still fails the smoke after rollback', 'rollback-failed');
     return 'recovered';
   }
 
