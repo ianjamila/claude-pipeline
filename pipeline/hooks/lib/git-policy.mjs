@@ -14,7 +14,8 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { commandName, simpleCommands, splitArgs } from './shell-parse.mjs';
+import { commandName, simpleCommands, splitArgs, scriptFileOf } from './shell-parse.mjs';
+import { catchAllReason, guardedCommandText } from './guarded-text.mjs';
 
 const PROTECTED_BRANCHES = ['main', 'master'];
 const APPROVAL_LABELS = ['human-approved', 'test-change-approved'];
@@ -693,6 +694,46 @@ function jobStartCommands(argv, vars) {
   return [...new Set([cmd.map(shellQuote).join(' '), cmd.join(' ')])].filter((s) => s.trim());
 }
 
+// ---- script files and strings the parser cannot unwrap ----------------------------------------------------
+
+const SHEBANG_PROGRAM = /^#!\s*(?:\S*\/)?(?:env\s+(?:-\S+\s+)*)?(\S+)/;
+const isNodeModulesOrPipelineHome = (p) => /[\\/]node_modules[\\/]/.test(p) || /[\\/]\.claude[\\/]pipeline[\\/]/.test(p);
+
+// `bash push.sh`, `source f`, `./f`, `node f.mjs`: read the file (up to 1 MB) from the directory the command runs in and judge
+// it like the same text typed on the line. A shell script that exists but cannot be read is denied (what runs is
+// unknown); one that does not exist runs nothing. Programs run by path and interpreter files are only scanned when
+// readable (a binary, a huge generated file or a package under node_modules is not ours to judge).
+function checkScriptFile(sf, dir, ctx, level) {
+  const file = expandVars(sf.file, ctx.vars);
+  if (/^\$\{?HOME\}?(?=\/|$)/.test(file)) return checkScriptFile({ ...sf, file: ctx.home + file.replace(/^\$\{?HOME\}?/, '') }, dir, ctx, level);
+  if (DYNAMIC.test(file)) {
+    return sf.kind !== 'exec' && GUARDED_WORDS.test(ctx.fullText)
+      ? deny(`the script "${sf.file}" is named at run time and the line mentions a guarded operation, so what it runs cannot be verified. Name the file.`)
+      : null;
+  }
+  const home = file === '~' || file.startsWith('~/') ? ctx.home + file.slice(1) : file;
+  const abs = path.resolve(dir ?? ctx.cwd, home);
+  const text = ctx.readText(abs);
+  if (typeof text !== 'string') {
+    if (sf.kind === 'shell' && ctx.pathExists(abs)) return deny(`cannot read the script ${sf.file} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified.`);
+    return null; // missing: nothing will run
+  }
+  let kind = sf.kind;
+  if (kind === 'exec') {
+    if (text.slice(0, 4096).includes('\u0000')) return null; // a binary
+    const prog = SHEBANG_PROGRAM.exec(text)?.[1] ?? '';
+    kind = /^(?:node|nodejs|deno|bun|tsx|ts-node|python[\d.]*|ruby|perl|php)$/.test(prog.split('/').pop()) ? 'interp' : 'shell';
+  }
+  if (kind === 'interp') {
+    if (isNodeModulesOrPipelineHome(abs)) return null;
+    const why = guardedCommandText(text);
+    return why ? deny(`the program ${sf.file} contains a guarded command (${why}); it cannot be verified by the guard. Run the operation directly.`) : null;
+  }
+  if (level >= MAX_NESTING) return deny(`the script ${sf.file} is nested too deeply (scripts running scripts) to verify.`);
+  const v = text.length > MAX_LINE_CHARS ? judgeLongText(text) : evalString(text, dir, ctx, level + 1);
+  return v.decision === 'deny' ? deny(`the script ${sf.file} would run a blocked command: ${v.reason}`) : null;
+}
+
 // ---- entry point ----------------------------------------------------------------------------------------
 
 function evalString(str, startDir, ctx, level) {
@@ -723,10 +764,22 @@ function evalString(str, startDir, ctx, level) {
         const v = evalString(inner, dir, ctx, level + 1);
         if (v.decision === 'deny') { verdict = v; break; }
       }
+      if (!verdict) {
+        // a string or program text the parser cannot unwrap (node -e, osascript, make CMD=...) that carries a guarded command
+        const why = catchAllReason(argv);
+        if (why) verdict = deny(`${name} was given a string that contains a guarded command (${why}). Run the operation directly so it can be checked.`);
+      }
+      const sf = verdict ? null : scriptFileOf(argv);
+      if (sf) verdict = checkScriptFile(sf, dir, ctx, level);
     }
     if (verdict && verdict.decision === 'deny') return verdict;
   }
   return allowed();
+}
+
+// Text too long to parse inside the time budget is judged by what it mentions once quotes and escapes are removed.
+function judgeLongText(text) {
+  return GUARDED_WORDS.test(text.replace(/['"`\\]/g, '')) ? deny('this text is too long to verify and mentions a guarded operation. Split it into simpler commands.') : allowed();
 }
 
 export function evaluateGitCommand(command, {
@@ -739,10 +792,7 @@ export function evaluateGitCommand(command, {
   pathExists = existsSync,
 } = {}) {
   const text = typeof command === 'string' ? command : String(command ?? '');
-  if (text.length > MAX_LINE_CHARS) {
-    // too long to parse in the time budget: judged by what it mentions once quotes and escapes are removed
-    return GUARDED_WORDS.test(text.replace(/['"`\\]/g, '')) ? deny('this command line is too long to verify and mentions a guarded operation. Split it into simpler commands.') : allowed();
-  }
+  if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   const base = cwd || process.cwd();
   const ctx = {
     cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, fullText: text,

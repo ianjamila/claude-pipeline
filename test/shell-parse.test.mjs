@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { splitArgs, simpleCommands, commandName, allRedirects } from '../pipeline/hooks/lib/shell-parse.mjs';
+import { splitArgs, simpleCommands, commandName, allRedirects, scriptFileOf } from '../pipeline/hooks/lib/shell-parse.mjs';
 
 const argvs = (s, o) => simpleCommands(s, o).map((c) => c.argv.join(' '));
 const sorted = (a) => [...a].sort();
@@ -893,4 +893,79 @@ test('brace expansion has a total work budget: many small expansions stop being 
   const many = simpleCommands(`echo ${Array.from({ length: 12_000 }, () => '{a,b,c}').join(' ')}; git push -f`);
   assert.equal(many.truncated, true);
   assert.ok(many.some((c) => c.argv.join(' ') === 'git push -f'));
+});
+
+// ---- string-running wrappers (review finding 11) -----------------------------------------------------------
+
+const WRAPPED = [
+  ['unbuffer', 'unbuffer git push origin main'],
+  ['taskset mask', 'taskset 0x1 git push origin main'],
+  ['taskset -c', 'taskset -c 0,1 git push origin main'],
+  ['sandbox-exec -f', 'sandbox-exec -f profile.sb git push origin main'],
+  ['sandbox-exec -p', "sandbox-exec -p '(version 1)(allow default)' git push origin main"],
+  ['ssh host string', "ssh host 'git push origin main'"],
+  ['ssh with options', "ssh -p 22 -i key -o StrictHostKeyChecking=no user@host 'git push origin main'"],
+  ['ssh with several words', 'ssh host git push origin main'],
+  ['script -c', "script -c 'git push origin main' /dev/null"],
+  ['script (BSD) command', 'script -q /dev/null git push origin main'],
+  ['screen', 'screen -dmS job git push origin main'],
+  ['screen -X stuff', "screen -S job -X stuff 'git push origin main\\n'"],
+  ['parallel template', "parallel 'git push origin HEAD:{}' ::: main"],
+  ['parallel args', 'parallel -j2 git push origin ::: main'],
+  ['wsl', "wsl -d Ubuntu -e git push origin main"],
+  ['wsl string', "wsl bash -c 'git push origin main'"],
+  ['npx -c', "npx -c 'git push origin main'"],
+  ['npx cmd', 'npx -y git push origin main'],
+  ['npm exec -c', "npm exec -c 'git push origin main'"],
+  ['npm exec --', 'npm exec -- git push origin main'],
+  ['yarn exec', 'yarn exec git push origin main'],
+  ['pnpm exec', 'pnpm exec git push origin main'],
+  ['pnpm dlx', 'pnpm dlx git push origin main'],
+  ['bunx', 'bunx git push origin main'],
+];
+for (const [name, line] of WRAPPED) {
+  test(`wrapper unwrapped: ${name}`, () => {
+    assert.ok(argvs(line).includes('git push origin main') || argvs(line).includes('git push origin HEAD:main'), `${line} -> ${JSON.stringify(argvs(line))}`);
+  });
+}
+
+test('wrappers that run nothing of ours are left alone', () => {
+  assert.deepEqual(argvs('npm install'), ['npm install']);
+  assert.deepEqual(argvs('npm run build'), ['npm run build']);
+  assert.deepEqual(argvs('npx vitest run'), ['vitest run']);
+  assert.deepEqual(argvs('ssh host'), ['ssh host']);
+  assert.deepEqual(argvs('taskset -p 1234'), ['taskset -p 1234']);
+});
+
+// ---- script files (review finding 2) ------------------------------------------------------------------------
+
+test('scriptFileOf names the file a shell, source, interpreter or path invocation will run', () => {
+  const f = (s) => scriptFileOf(s.split(' '));
+  assert.deepEqual(f('bash push.sh'), { kind: 'shell', file: 'push.sh' });
+  assert.deepEqual(f('sh -e ./push.sh a b'), { kind: 'shell', file: './push.sh' });
+  assert.deepEqual(f('zsh -x push.sh'), { kind: 'shell', file: 'push.sh' });
+  assert.deepEqual(f('source push.sh'), { kind: 'shell', file: 'push.sh' });
+  assert.deepEqual(f('. ./push.sh'), { kind: 'shell', file: './push.sh' });
+  assert.deepEqual(f('./push.sh --flag'), { kind: 'exec', file: './push.sh' });
+  assert.deepEqual(f('scripts/push.sh'), { kind: 'exec', file: 'scripts/push.sh' });
+  assert.deepEqual(f('node push.mjs'), { kind: 'interp', file: 'push.mjs' });
+  assert.deepEqual(f('node --no-warnings -r ./x.js push.mjs'), { kind: 'interp', file: 'push.mjs' });
+  assert.deepEqual(f('python3 -u push.py'), { kind: 'interp', file: 'push.py' });
+  assert.deepEqual(f('ruby push.rb'), { kind: 'interp', file: 'push.rb' });
+  assert.deepEqual(f('perl push.pl'), { kind: 'interp', file: 'push.pl' });
+  assert.deepEqual(f('tsx push.ts'), { kind: 'interp', file: 'push.ts' });
+  assert.deepEqual(f('deno run -A push.ts'), { kind: 'interp', file: 'push.ts' });
+  assert.equal(f('bash -c "git status"'), null);
+  assert.equal(f('bash'), null);
+  assert.equal(f('bash -s'), null);
+  assert.equal(f('bash <(echo x)'), null);
+  assert.equal(f('source /dev/stdin'), null);
+  assert.equal(f('node -e x'), null);
+  assert.equal(f('node --test test/a.test.mjs'), null);
+  assert.equal(f('python3 -m json.tool'), null);
+  assert.equal(f('python3 -c x'), null);
+  assert.equal(f('git push'), null);
+  assert.equal(f('ls -la'), null);
+  assert.equal(f('/usr/bin/git status'), null);
+  assert.equal(f('/usr/local/bin/node'), null);
 });

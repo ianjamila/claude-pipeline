@@ -804,3 +804,13 @@ test('hook: the Monitor tool is judged like Bash', (t) => {
   const ok = runHook({ tool_name: 'Monitor', tool_input: { command: 'tail -f /tmp/x.log' }, cwd: home }, { home });
   assert.equal(ok.stdout, '');
 });
+
+test('hook: a script file in the real working directory is read by the hook', (t) => {
+  const home = tmpHome(t);
+  fs.mkdirSync(path.join(home, 'proj'));
+  fs.writeFileSync(path.join(home, 'proj', 'w.sh'), 'echo {} > ~/.claude/settings.json\n');
+  fs.writeFileSync(path.join(home, 'proj', 'ok.sh'), 'ls\n');
+  const run = (command) => runHook({ tool_name: 'Bash', tool_input: { command }, cwd: path.join(home, 'proj') }, { home });
+  for (const c of ['bash w.sh', './w.sh', 'source w.sh', 'env bash w.sh']) assert.equal(JSON.parse(run(c).stdout).hookSpecificOutput.permissionDecision, 'deny', c);
+  assert.equal(run('bash ok.sh').stdout, '');
+});

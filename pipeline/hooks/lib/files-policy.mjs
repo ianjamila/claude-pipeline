@@ -16,9 +16,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
-import { simpleCommands, commandName } from './shell-parse.mjs';
+import { simpleCommands, commandName, scriptFileOf } from './shell-parse.mjs';
 
 const posix = path.posix;
+const MAX_SCRIPT_BYTES = 1_000_000;
 const MAX_LINE_CHARS = 200_000; // a longer command line is not parsed (the hook has a 15 s budget)
 // What an unparsed or truncated line is judged by: any word that names a protected file, a switch or an installer.
 const SENSITIVE_WORDS = /\.claude|PIPELINE_ADMIN|disableAllHooks|CLAUDECODE|install\.|\bprotect\b/i;
@@ -118,6 +119,15 @@ function readLinkIfAny(p) {
   return st?.isSymbolicLink() ? fs.readlinkSync(p) : null;
 }
 
+function defaultReadText(file) {
+  try {
+    const st = fs.statSync(file);
+    return st.isFile() && st.size <= MAX_SCRIPT_BYTES ? fs.readFileSync(file, 'utf8') : null;
+  } catch {
+    return null;
+  }
+}
+
 function makeCtx(opts) {
   const platform = opts.platform ?? process.platform;
   const homeNative = opts.home || os.homedir();
@@ -141,6 +151,7 @@ function makeCtx(opts) {
     user: opts.user ?? posix.basename(homePosix),
     vars: {}, // same-line shell assignments (D=$HOME/.claude), filled in once the line is parsed
     dynamic: false, // set when a scan had to be skipped for size; callers fail closed
+    readText: opts.readText ?? defaultReadText,
     admin: (opts.env ?? process.env).PIPELINE_ADMIN === '1',
     hit: (p) => roots.some((r) => isInside(p, r, platform)),
     hitAncestor: (p) => ancestors.some((a) => samePath(p, a, platform)),
@@ -791,6 +802,50 @@ function jobInner(cmd) {
   return inner.length ? inner.map(shellQuote).join(' ') : null;
 }
 
+// ---- script files ------------------------------------------------------------------------------------
+
+const SHEBANG_PROGRAM = /^#!\s*(?:\S*\/)?(?:env\s+(?:-\S+\s+)*)?(\S+)/;
+const INTERP_PROGRAM = /^(?:node|nodejs|deno|bun|tsx|ts-node|python[\d.]*|ruby|perl|php)$/;
+// Program text that names a protected path next to something that writes, moves or deletes.
+const WRITE_HINT = /write|append|unlink|\brm\b|rmSync|rmdir|rename|copy|\bcp\b|\bmv\b|\bln\b|mkdir|truncate|symlink|chmod|open\s*\(|>>?\s*['"\w$~/.]|\btee\b|shutil|os\.remove|move|dump|save|replace|\bsed\b|install/i;
+
+// `bash f.sh`, `source f`, `./f`, `node f.mjs`, `python f.py`: the file is read (up to 1 MB) and judged like the same text
+// typed on the line. A shell script that exists but cannot be read is denied; a missing file runs nothing; a
+// program run by path, an interpreter file that cannot be read, a node_modules package and the pipeline's own
+// installed files are not judged (the installed CLI legitimately names its own settings).
+function judgeScriptFile(sf, dirs, ctx, opts) {
+  const e = expandRefs(sf.file, ctx);
+  if (/[$`]/.test(e)) return null; // named at run time: the textual rules on the whole line still apply
+  const found = [];
+  for (const d of isAbs(e) ? [''] : dirs) {
+    const abs = isAbs(e) ? posix.normalize(e) : posix.join(d, e);
+    let exists = false;
+    try { exists = ctx.api.existsSync(abs); } catch { /* treated as missing */ }
+    if (exists) { found.push({ abs, dir: d || ctx.cwd }); break; }
+  }
+  if (!found.length) return null;
+  const { abs, dir } = found[0];
+  if (ctx.hit(abs) || ctx.hit(realResolve(abs, ctx.api)) || /\/node_modules\//.test(abs)) return null;
+  const text = ctx.readText(abs);
+  if (typeof text !== 'string') {
+    return sf.kind === 'shell' ? deny(`cannot read the script ${sf.file} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified`) : null;
+  }
+  let kind = sf.kind;
+  if (kind === 'exec') {
+    if (text.slice(0, 4096).includes('\u0000')) return null; // a binary
+    kind = INTERP_PROGRAM.test((SHEBANG_PROGRAM.exec(text)?.[1] ?? '').split('/').pop()) ? 'interp' : 'shell';
+  }
+  if (kind === 'shell') {
+    const r = evaluateBashForFiles(text, { ...opts, cwd: dir, _depth: (opts._depth ?? 0) + 1 });
+    return r.decision === 'deny' ? deny(`the script ${sf.file} would run: ${r.reason}`) : null;
+  }
+  // program text in another language: the admin switch, the hook switch, or a write next to a protected path
+  if (variantsOf(text).some((t) => setsAdmin(t, ctx.platform) || hasDisableAll(t))) return deny(`the program ${sf.file} sets PIPELINE_ADMIN or mentions disableAllHooks; only the owner may switch the pipeline guard off`);
+  const m = makeMatchers(ctx);
+  if (text.length <= MAX_SCRIPT_BYTES && m.rawHit(text, [dir]) && WRITE_HINT.test(text)) return deny(`the program ${sf.file} refers to a protected pipeline file and writes (${PROTECTED_MSG})`);
+  return null;
+}
+
 // ---- Bash --------------------------------------------------------------------------------------------
 
 export function evaluateBashForFiles(command, opts = {}) {
@@ -836,6 +891,16 @@ export function evaluateBashForFiles(command, opts = {}) {
       if (r.decision === 'deny') return deny(`job start would run: ${r.reason}`);
     }
   }
+
+  // 7: a script file (bash f.sh, source f, ./f, node f.mjs) runs whatever is in it
+  if ((opts._depth ?? 0) < 4) {
+    for (const c of cmds) {
+      const sf = scriptFileOf(c.argv);
+      if (!sf) continue;
+      const v = judgeScriptFile(sf, dirs, ctx, opts);
+      if (v) return v;
+    }
+  } else if (cmds.some((c) => scriptFileOf(c.argv))) return deny('scripts run scripts too deeply to check');
 
   // 5: protected-path references must be read-only
   const m = makeMatchers(ctx);

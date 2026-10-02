@@ -599,3 +599,48 @@ test('size cap: an oversized command line is not scanned; it is denied only when
   assert.equal(bash(`echo ${spam}; export PIPELINE_""ADMIN=1`).decision, 'deny');
   assert.ok(Date.now() - t0 < 3000);
 });
+
+// ---- 9. script files hide commands (review finding 2) ----------------------------------------------------
+
+// A fake file system keyed by absolute path.
+const fsOf = (files) => ({ existsSync: (p) => p in files, readText: (p) => (typeof files[p] === 'string' ? files[p] : null) });
+
+test('script files: the file a shell, source, interpreter or path invocation runs is read and judged', () => {
+  const files = {
+    '/home/u/proj/w.sh': 'echo x > ~/.claude/settings.json',
+    '/home/u/proj/rm.sh': '#!/bin/bash\nrm -rf ~/.claude/skills/ship',
+    '/home/u/proj/admin.sh': 'export PIPELINE_ADMIN=1\nclaude',
+    '/home/u/proj/nested.sh': 'bash w.sh',
+    '/home/u/proj/ok.sh': 'ls ~/.claude/pipeline\ncat ~/.claude/settings.json\necho hi > notes.txt',
+    '/home/u/proj/w.mjs': "import fs from 'node:fs';\nfs.writeFileSync(`${process.env.HOME}/.claude/settings.json`, '{}');",
+    '/home/u/proj/w.py': "import os\nopen(os.path.expanduser('~/.claude/pipeline/x'), 'w').write('x')",
+    '/home/u/proj/admin.mjs': "process.env.PIPELINE_ADMIN = '1';",
+    '/home/u/proj/read.mjs': "console.log(require('fs').readFileSync(process.env.HOME + '/.claude/settings.json', 'utf8'))",
+    '/home/u/proj/plain.mjs': "console.log('hi')",
+    '/home/u/proj/sub/w.sh': 'rm ~/.claude/pipeline/VERSION',
+  };
+  const run = (c) => bash(c, PROJ, fsOf(files)).decision;
+  for (const c of [
+    'bash w.sh', 'sh ./w.sh', './w.sh', 'source w.sh', '. w.sh', 'env bash w.sh', 'bash rm.sh', 'bash admin.sh', 'bash nested.sh',
+    'node w.mjs', 'python3 w.py', 'node admin.mjs', 'cd sub && bash w.sh', 'node ~/proj/w.mjs', 'bash /home/u/proj/w.sh',
+    'node ~/.claude/pipeline/bin/pipeline.mjs job start c -- bash w.sh',
+  ]) assert.equal(run(c), 'deny', c);
+  for (const c of ['bash ok.sh', './ok.sh', 'node plain.mjs', 'node read.mjs', 'bash missing.sh', 'source missing.sh']) assert.equal(run(c), 'allow', c);
+});
+
+test('script files: a shell script that exists but cannot be read is denied, a missing one is not', () => {
+  const unreadable = { existsSync: () => true, readText: () => null };
+  assert.equal(bash('bash big.sh', PROJ, unreadable).decision, 'deny');
+  assert.equal(bash('./tool', PROJ, unreadable).decision, 'allow');
+  assert.equal(bash('node big.mjs', PROJ, unreadable).decision, 'allow');
+  assert.equal(bash('bash big.sh', PROJ, { existsSync: () => false }).decision, 'allow');
+});
+
+test('script files: the pipeline CLI and node_modules programs are not scanned', () => {
+  const files = {
+    '/home/u/.claude/pipeline/bin/pipeline.mjs': "writeFileSync(join(home, '.claude', 'settings.json'), x); process.env.PIPELINE_ADMIN = '1'",
+    '/home/u/proj/node_modules/.bin/tool': "#!/usr/bin/env node\nfs.writeFileSync(os.homedir() + '/.claude/settings.json', '')",
+  };
+  assert.equal(bash('node ~/.claude/pipeline/bin/pipeline.mjs preflight', PROJ, fsOf(files)).decision, 'allow');
+  assert.equal(bash('./node_modules/.bin/tool', PROJ, fsOf(files)).decision, 'allow');
+});
