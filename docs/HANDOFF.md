@@ -36,11 +36,10 @@ INTERRUPTED (stopped mid-work; uncommitted changes left in the worktree — insp
   merged, stage C landed, suite green 2883). `a45ba1f` = repo CI + `.claude/pipeline.yml` +
   `scripts/verify.mjs` (+ `test/self-verify.test.mjs`) + README (plan Task 6.1).
 - Step 3 whole-repo review (Task 7.1) DONE: 4 Sonnet reviewers (hooks, gate, runtime, skills),
-  ~50 verified findings. Fixes IN FLIGHT on three worktrees off `a45ba1f`, disjoint files:
-  `~/Claude/cp-wt/fix-hooks` (fix/hooks), `fix-gate` (fix/gate), `fix-runtime` (fix/runtime).
-  Then: merge the three into int/final, then a skills/docs batch (ship/review-loop/pipeline-setup
-  text, templates/settings.json allowlist + Stop hook cwd, README matcher/flag updates) that
-  reflects their interface changes, full suite, then step 4 (publish).
+  ~50 verified findings. fix/hooks, fix/runtime, fix/gate all DONE and merged into int/final
+  (667be07; suite green 3116 before the gate merge). Skills/docs batch IN FLIGHT on
+  `~/Claude/cp-wt/fix-skills` (fix/skills): skill/agent text, README, templates/settings.json +
+  pipeline.yml, prod-watch resolving a null merge SHA. Then merge, full suite, step 4 (publish).
 - If a session dies: `git -C ~/Claude/cp-wt/fix-<x> log int/final..` shows what landed per batch;
   each implementer commits per item.
 
