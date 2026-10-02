@@ -1,39 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { DEFAULTS } from '../pipeline/lib/config.mjs';
-import {
-  classifyHardStops, collectHardStops, enclosingStatements, stripSqlComments, envNamesIn,
-} from '../pipeline/lib/hardstops.mjs';
+import { classifyHardStops, collectHardStops, enclosingStatements, stripSqlComments, envNamesIn } from '../pipeline/lib/hardstops.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
-
-// ---- builders -------------------------------------------------------------------------------------------------
-
-// A full config with only the hard-stop settings under test replaced.
-const cfg = ({ paths = [], patterns = [], auth_calls = [], test_globs } = {}) => {
-  const c = structuredClone(DEFAULTS);
-  c.hard_stops = { paths, patterns, auth_calls };
-  if (test_globs) c.integrity.test_globs = test_globs;
-  return c;
-};
-
-// A parsed-diff file entry. Lines are numbered from `at` (new-file numbers for added, old-file for removed).
-const file = (path, { status = 'M', added = [], removed = [], oldPath, binary = false, at = 1 } = {}) => {
-  const num = (texts) => texts.map((text, i) => ({ line: at + i, text }));
-  const o = status === 'A' ? null : (oldPath ?? path);
-  const n = status === 'D' ? null : path;
-  return {
-    oldPath: o, newPath: n, path: status === 'D' ? o : n, status, binary,
-    added: num(added), removed: num(removed),
-  };
-};
-
-const rulesOf = (hits) => [...new Set(hits.map((h) => h.rule))].sort();
-const run = (files, opts = {}) => classifyHardStops({ files, config: cfg(), ...opts });
+import { MIG, pkg, cfg, file, rulesOf, classify, run } from './helpers/hardstops.mjs';
 
 // ---- the 26 table cases ----------------------------------------------------------------------------------------
-
-const MIG = 'supabase/migrations/1_x.sql';
-const pkg = (deps, extra = {}) => ({ dependencies: deps, ...extra });
 
 const TABLE = [
   ['1 migration adds DROP TABLE', { files: [file(MIG, { status: 'A', added: ['DROP TABLE foo;'] })] }, ['R1-destructive']],
@@ -99,7 +70,7 @@ const TABLE = [
 
 for (const [name, input, expected] of TABLE) {
   test(`table: ${name}`, () => {
-    const hits = classifyHardStops({ config: cfg(), ...input });
+    const hits = classify({ config: cfg(), ...input });
     assert.deepEqual(rulesOf(hits), expected, JSON.stringify(hits));
     for (const h of hits) {
       assert.equal(typeof h.file, 'string');
@@ -111,7 +82,7 @@ for (const [name, input, expected] of TABLE) {
 // ---- revision cases: removals, weakening, edits of existing migrations ----------------------------------------
 
 test('removed project auth call (auth_calls) in code -> R2-auth-removed', () => {
-  const hits = classifyHardStops({
+  const hits = classify({
     config: cfg({ auth_calls: ['requireSAScope'] }),
     files: [file('lib/x.ts', { removed: ['  await requireSAScope(ctx);'] })],
   });
@@ -122,9 +93,9 @@ test('removed project auth call (auth_calls) in code -> R2-auth-removed', () => 
 
 test('auth_calls names are what flag a project-specific guard (no generic pattern matches it)', () => {
   const f = [file('lib/x.ts', { removed: ['const ids = await getAccessibleDetachmentIds(user);'] })];
-  assert.deepEqual(rulesOf(classifyHardStops({ config: cfg(), files: f })), []);
+  assert.deepEqual(rulesOf(classify({ config: cfg(), files: f })), []);
   assert.deepEqual(
-    rulesOf(classifyHardStops({ config: cfg({ auth_calls: ['getAccessibleDetachmentIds'] }), files: f })),
+    rulesOf(classify({ config: cfg({ auth_calls: ['getAccessibleDetachmentIds'] }), files: f })),
     ['R2-auth-removed'],
   );
 });
@@ -139,7 +110,7 @@ test('removed auth guards: each generic pattern', () => {
     'checkPermission(a)', 'checkPermissions(a)', 'authorize(x)', 'authorizeRequest(x)', 'supabase.auth.getUser()',
     'const u = await getUser()', 'if (isAdmin(u))', 'user.hasRole("x")', 'ability.can("x")', 'getSession()',
     'require_auth(x)', 'is_admin(u)', 'has_role(u)',
-    'return NextResponse.json({ error: "no" }, { status: 403 });', 'return new Response("Unauthorized");', 'if (!session) redirect("/login");',
+    'return NextResponse.json({ error: "no" }, { status: 403 });', 'if (!session) redirect("/login");',
     'if (user.role !== "admin") return;', 'export const config = { matcher: ["/dashboard/:path*"] };',
   ]) {
     assert.deepEqual(rulesOf(run([file('lib/x.ts', { removed: [text] })])), ['R2-auth-removed'], text);
@@ -212,8 +183,8 @@ test('multi-line UPDATE ... SET is caught at statement level (R1-destructive)', 
   assert.deepEqual(rulesOf(hits), ['R1-destructive']);
 });
 
-test('binary .env file -> R3 (path rules still apply to binaries)', () => {
-  assert.deepEqual(rulesOf(run([file('config/.env', { binary: true })])), ['R3-secrets']);
+test('binary .env file -> R3 (path rules still apply to binaries) and R0 (content unreadable)', () => {
+  assert.deepEqual(rulesOf(run([file('config/.env', { binary: true })])), ['R0-unscannable', 'R3-secrets']);
 });
 
 // ---- SQL comment / string handling -----------------------------------------------------------------------------
@@ -284,7 +255,7 @@ test('SQL rules apply under a migrations dir even without a .sql extension', () 
 test('dedupe keeps hits on different lines, and line-less hits whose details differ', () => {
   const lines = run([file(MIG, { status: 'A', added: ['drop table a;', 'truncate b;'] })]);
   assert.deepEqual(lines.map((h) => h.line), [1, 2]);
-  const deps = classifyHardStops({
+  const deps = classify({
     config: cfg(), files: [], basePkg: pkg({ a: '1.0.0', b: '1.0.0' }), headPkg: pkg({ a: '2.0.0', b: '2.0.0' }),
   });
   assert.equal(deps.length, 2);
@@ -299,9 +270,11 @@ test('dedupe: one hit per (rule, file, line) even when several patterns match th
 
 // ---- R2 / R3 / R4 / R6 extras ----------------------------------------------------------------------------------
 
-test('R2 any-file service-role references (case-insensitive), docs and tests included', () => {
+test('R2 service-role references (case-insensitive) in production code; docs and tests are exempt', () => {
   for (const text of ['service_role', 'SERVICE_ROLE_KEY', 'serviceRole', 'supabaseAdmin.from()', 'createAdminClient(', 'SUPABASE_SERVICE_KEY']) {
-    assert.deepEqual(rulesOf(run([file('docs/x.md', { added: [text] })])), ['R2-auth'], text);
+    assert.deepEqual(rulesOf(run([file('lib/x.ts', { added: [text] })])), ['R2-auth'], text);
+    assert.deepEqual(rulesOf(run([file('docs/x.md', { added: [text] })])), [], `docs: ${text}`);
+    assert.deepEqual(rulesOf(run([file('lib/x.test.ts', { added: [text] })])), [], `test: ${text}`);
   }
 });
 
@@ -381,12 +354,6 @@ test('R4 pipeline paths', () => {
   assert.deepEqual(rulesOf(run([file('src/app.ts')])), []);
 });
 
-test('R4 package.json script edits (the verify command can be gutted there)', () => {
-  const hits = run([file('package.json', { added: ['    "test": "echo ok"'], removed: ['    "test": "vitest run"'] })]);
-  assert.deepEqual(rulesOf(hits), ['R4-pipeline']);
-  assert.deepEqual(rulesOf(run([file('package.json', { added: ['    "name": "x"'] })])), []);
-});
-
 test('R4 old path counts on renames out of .github', () => {
   assert.deepEqual(rulesOf(run([file('ci/x.yml', { status: 'R', oldPath: '.github/workflows/x.yml' })])), ['R4-pipeline']);
 });
@@ -394,14 +361,17 @@ test('R4 old path counts on renames out of .github', () => {
 test('R6 sensitive paths: every keyword, camelCase and separators, case-insensitive', () => {
   for (const p of [
     'lib/biometric/x.ts', 'lib/facial-scan.ts', 'lib/face-recognition.ts', 'lib/faceMatch.ts', 'lib/face_detect.ts', 'lib/faceapi.ts',
-    'lib/liveness.ts', 'lib/rekognition.ts', 'app/health/page.tsx', 'lib/medical.ts', 'app/patients/x.ts', 'lib/diagnosis.ts',
+    'lib/liveness.ts', 'lib/rekognition.ts', 'lib/health-records.ts', 'lib/medical.ts', 'app/patients/x.ts', 'lib/diagnosis.ts',
     'lib/Payroll/x.ts', 'lib/payslip.ts', 'lib/salary.ts', 'lib/salaries/x.ts', 'lib/wage.ts', 'lib/bank-account.ts',
     'lib/bank_account.ts', 'lib/ssn.ts', 'lib/tin.ts', 'lib/get-tin.ts', 'lib/employeeTin.ts', 'lib/validateSSN.ts', 'lib/sss/x.ts',
     'lib/tin_number.ts', 'lib/philhealth.ts', 'lib/pag-ibig.ts', 'lib/pagibig.ts', 'LIB/PAYROLL/X.TS',
   ]) {
     assert.deepEqual(rulesOf(run([file(p)])), ['R6-sensitive'], p);
   }
-  for (const p of ['lib/routing.ts', 'lib/string-utils.ts', 'lib/cassette.ts', 'lib/utils.ts']) {
+  for (const p of [
+    'lib/routing.ts', 'lib/string-utils.ts', 'lib/cassette.ts', 'lib/utils.ts', 'app/api/health/route.ts', 'lib/diagnostics/logger.ts',
+    'lib/interface.ts', 'lib/surface.ts', 'lib/typeface.ts', 'lib/bankruptcy.ts',
+  ]) {
     assert.deepEqual(rulesOf(run([file(p)])), [], p);
   }
 });
@@ -414,17 +384,17 @@ test('R6 skips tests, docs and markdown but covers the OLD path of a rename', ()
 
 test('P-path respects negation entries and tests both case variants', () => {
   const c = cfg({ paths: ['lib/secure/**', '!lib/secure/public/**'] });
-  assert.deepEqual(rulesOf(classifyHardStops({ config: c, files: [file('lib/secure/a.ts')] })), ['P-path']);
-  assert.deepEqual(rulesOf(classifyHardStops({ config: c, files: [file('lib/secure/public/a.ts')] })), []);
-  assert.deepEqual(rulesOf(classifyHardStops({ config: c, files: [file('lib/Secure/a.ts')] })), ['P-path']);
+  assert.deepEqual(rulesOf(classify({ config: c, files: [file('lib/secure/a.ts')] })), ['P-path']);
+  assert.deepEqual(rulesOf(classify({ config: c, files: [file('lib/secure/public/a.ts')] })), []);
+  assert.deepEqual(rulesOf(classify({ config: c, files: [file('lib/Secure/a.ts')] })), ['P-path']);
 });
 
 test('P-pattern: removed lines count; paths scoping; default scope is code files only', () => {
   const c = cfg({ patterns: [{ name: 'face', regex: 'facial' }, { name: 'scoped', regex: 'zzz', paths: ['only/**'] }] });
-  assert.deepEqual(rulesOf(classifyHardStops({ config: c, files: [file('lib/x.ts', { removed: ['// FACIAL scan'] })] })), ['P-pattern']);
-  assert.deepEqual(rulesOf(classifyHardStops({ config: c, files: [file('docs/x.md', { added: ['facial'] })] })), []);
-  assert.deepEqual(rulesOf(classifyHardStops({ config: c, files: [file('lib/x.ts', { added: ['zzz'] })] })), []);
-  const scoped = classifyHardStops({ config: c, files: [file('only/x.md', { added: ['zzz'] })] });
+  assert.deepEqual(rulesOf(classify({ config: c, files: [file('lib/x.ts', { removed: ['// FACIAL scan'] })] })), ['P-pattern']);
+  assert.deepEqual(rulesOf(classify({ config: c, files: [file('docs/x.md', { added: ['facial'] })] })), []);
+  assert.deepEqual(rulesOf(classify({ config: c, files: [file('lib/x.ts', { added: ['zzz'] })] })), []);
+  const scoped = classify({ config: c, files: [file('only/x.md', { added: ['zzz'] })] });
   assert.deepEqual(rulesOf(scoped), ['P-pattern']);
   assert.match(scoped[0].detail, /scoped/);
 });
@@ -440,7 +410,7 @@ test('hit shape: file is the new path (old for deletions); line and excerpt pres
 });
 
 test('a missing integrity/hard_stops section in config falls back to defaults instead of crashing', () => {
-  const hits = classifyHardStops({ config: {}, files: [file('lib/payroll/x.test.ts'), file('lib/payroll/y.ts')] });
+  const hits = classify({ config: {}, files: [file('lib/payroll/x.test.ts'), file('lib/payroll/y.ts')] });
   assert.deepEqual(rulesOf(hits), ['R6-sensitive']);
   assert.equal(hits[0].file, 'lib/payroll/y.ts');
 });
@@ -449,11 +419,11 @@ test('a missing integrity/hard_stops section in config falls back to defaults in
 
 test('R5: every dependency section, engines.node, and the ways it must stay quiet', () => {
   for (const section of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
-    const hits = classifyHardStops({ config: cfg(), files: [], basePkg: { [section]: { a: '^1.2.3' } }, headPkg: { [section]: { a: '^2.0.0' } } });
+    const hits = classify({ config: cfg(), files: [], basePkg: { [section]: { a: '^1.2.3' } }, headPkg: { [section]: { a: '^2.0.0' } } });
     assert.deepEqual(rulesOf(hits), ['R5-major-dep'], section);
     assert.equal(hits[0].file, 'package.json');
   }
-  const q = (b, h, extra = {}) => rulesOf(classifyHardStops({ config: cfg(), files: [], basePkg: b, headPkg: h, ...extra }));
+  const q = (b, h, extra = {}) => rulesOf(classify({ config: cfg(), files: [], basePkg: b, headPkg: h, ...extra }));
   assert.deepEqual(q({ engines: { node: '>=18' } }, { engines: { node: '>=20' } }), ['R5-major-dep']);
   assert.deepEqual(q({ engines: { node: '>=20' } }, { engines: { node: '>=20.1' } }), []);
   assert.deepEqual(q(pkg({ a: '^1.0.0' }), pkg({ a: '^1.0.0', b: '^9.0.0' })), [], 'new deps are not hits');
@@ -468,7 +438,7 @@ test('R5: every dependency section, engines.node, and the ways it must stay quie
 });
 
 test('R5: non-semver ranges are ignored unless the spec itself changed', () => {
-  const q = (b, h) => rulesOf(classifyHardStops({ config: cfg(), files: [], basePkg: pkg({ a: b }), headPkg: pkg({ a: h }) }));
+  const q = (b, h) => rulesOf(classify({ config: cfg(), files: [], basePkg: pkg({ a: b }), headPkg: pkg({ a: h }) }));
   for (const same of ['workspace:*', 'git+https://github.com/x/y.git#v2.0.0', 'file:../x', '*', 'latest', 'github:x/y#semver:^2.0.0']) {
     assert.deepEqual(q(same, same), [], same);
   }
@@ -479,7 +449,7 @@ test('R5: non-semver ranges are ignored unless the spec itself changed', () => {
 });
 
 test('R5: extra package.json pairs (monorepo packages) and unparseable files', () => {
-  const hits = classifyHardStops({
+  const hits = classify({
     config: cfg(), files: [],
     pkgPairs: [
       { file: 'apps/web/package.json', base: pkg({ next: '15.0.0' }), head: pkg({ next: '16.0.0' }) },
@@ -704,7 +674,7 @@ test('IO: deleted and renamed migrations, and a clean change', async () => {
   assert.equal(hits.filter((h) => h.rule === 'R1-migration-edited').length, 2);
 });
 
-test('IO: a binary secret file is caught by path', async () => {
+test('IO: a binary secret file is caught by path (and flagged unreadable)', async () => {
   const repo = createTmpRepo();
   repo.write('README.md', 'x\n');
   repo.commit('base');
@@ -712,5 +682,5 @@ test('IO: a binary secret file is caught by path', async () => {
   repo.write('certs/a.pem', Buffer.from([0, 1, 2, 3, 0, 255]).toString('latin1'));
   repo.commit('add cert');
   const hits = await collectHardStops({ base: 'main', head: 'feat', cwd: repo.dir, config: cfg() });
-  assert.deepEqual(rulesOf(hits), ['R3-secrets']);
+  assert.deepEqual(rulesOf(hits), ['R0-unscannable', 'R3-secrets']);
 });

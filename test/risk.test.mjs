@@ -107,3 +107,52 @@ test('config thresholds are honoured, and a config without a risk section uses t
   assert.equal(assessRisk({ files: [file('lib/a.ts', 200)], hits: [], config: {} }).level, 'medium');
   assert.equal(assessRisk({ files: [file('lib/a.ts', 700)], hits: [], config: {} }).level, 'high');
 });
+
+// ---- hardening: bad inputs must fail loudly, never quietly downgrade a PR -------------------------------------------
+
+test('assessRisk throws TypeError unless hits and files are arrays', () => {
+  for (const hits of [Promise.resolve([]), {}, undefined, null, 'x', 3]) {
+    assert.throws(() => assessRisk({ files: [], hits, config: config() }), TypeError, String(hits));
+  }
+  assert.throws(() => assessRisk({ files: undefined, hits: [], config: config() }), TypeError);
+  assert.throws(() => assessRisk({ files: {}, hits: [], config: config() }), TypeError);
+});
+
+test('assessRisk throws TypeError when a threshold is not a finite number (a string compares wrongly, NaN never trips)', () => {
+  for (const [key, bad] of [['medium_lines', '150'], ['high_lines', NaN], ['medium_files', Infinity], ['high_lines', null], ['medium_lines', {}]]) {
+    assert.throws(() => assessRisk({ files: [file('lib/a.ts', 2)], hits: [], config: config({ [key]: bad }) }), TypeError, `${key}=${String(bad)}`);
+  }
+  // A missing threshold falls back to the default instead of throwing.
+  const c = config();
+  delete c.risk.medium_lines;
+  assert.equal(assessRisk({ files: [file('lib/a.ts', 200)], hits: [], config: c }).level, 'medium');
+});
+
+test('assessRisk throws TypeError when high_risk_paths is not a list of strings', () => {
+  assert.throws(() => assessRisk({ files: [file('lib/a.ts', 2)], hits: [], config: config({ high_risk_paths: 'supabase/**' }) }), TypeError);
+  assert.throws(() => assessRisk({ files: [file('lib/a.ts', 2)], hits: [], config: config({ high_risk_paths: [1] }) }), TypeError);
+});
+
+test('isLightLane throws TypeError on bad inputs instead of answering true', () => {
+  const ok = { level: 'low', changedLines: 1, hits: [], config: config() };
+  assert.equal(isLightLane(ok), true);
+  for (const bad of [{ hits: Promise.resolve([]) }, { hits: undefined }, { changedLines: '1' }, { changedLines: NaN }, { changedLines: undefined }, { level: 'LOW' }, { level: undefined }]) {
+    assert.throws(() => isLightLane({ ...ok, ...bad }), TypeError, JSON.stringify(bad));
+  }
+  assert.throws(() => isLightLane({ ...ok, config: { review: { light_lane_max_lines: '50' } } }), TypeError);
+  assert.throws(() => isLightLane({ ...ok, config: { review: { light_lane_max_lines: NaN } } }), TypeError);
+});
+
+test('high_risk_paths are matched case-insensitively (glob nocase) on old and new paths', () => {
+  assert.equal(assessRisk({ files: [file('SUPABASE/MIGRATIONS/1.sql', 2)], hits: [], config: config() }).level, 'high');
+  assert.equal(assessRisk({ files: [file('lib/x.ts', 2, { status: 'R', oldPath: 'App/Api/Payroll/route.ts' })], hits: [], config: config() }).level, 'high');
+});
+
+test('a hard-stop hit keeps a many-file change high (the file-count rule never downgrades)', () => {
+  const files = Array.from({ length: 11 }, (_, i) => file(`lib/f${i}.ts`, 2));
+  const r = assessRisk({ files, hits: [hit('R4-pipeline')], config: config() });
+  assert.equal(r.level, 'high');
+  assert.equal(r.reasons[0], 'hard-stop: R4-pipeline');
+  assert.match(r.reasons.join('|'), /11 files > 10/);
+  assert.equal(isLightLane({ level: r.level, changedLines: r.changedLines, hits: [hit()], config: config() }), false);
+});
