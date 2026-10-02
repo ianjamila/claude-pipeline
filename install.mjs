@@ -2,7 +2,8 @@
 // Why: one installer for macOS and Windows that copies the pipeline's skills, agents and CLI into ~/.claude and
 // registers its two safety hooks in settings.json without disturbing anything else the owner has there.
 // It is idempotent, refuses to overwrite files it did not install, and refuses to run inside a Claude Code
-// session (an agent must not be able to reinstall or remove its own guards) unless PIPELINE_ADMIN=1.
+// session (an agent must not be able to reinstall or remove its own guards) unless PIPELINE_ADMIN=1. "Inside" means
+// CLAUDECODE=1 in the environment OR a Claude Code ancestor process (the variable can be stripped, the parent cannot).
 // All decisions live in pipeline/lib/installer.mjs; this file does the disk work, the report and the exit code.
 // PIPELINE_INSTALL_NO_PROBES=1 skips the claude/codex/gh version probes (tests and CI).
 import fs from 'node:fs';
@@ -13,6 +14,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { run } from './pipeline/lib/proc.mjs';
 import { expandHome, isInside, safeTimestamp } from './pipeline/lib/paths.mjs';
 import * as I from './pipeline/lib/installer.mjs';
+import { hasClaudeCodeAncestor } from './pipeline/lib/claude-ancestry.mjs';
 
 class InstallError extends Error {
   constructor(message, exitCode = 1) {
@@ -409,9 +411,15 @@ function main(argv, env) {
   if (help) { process.stdout.write(`${I.usageText()}\n`); return 0; }
   if (error) { process.stderr.write(`install.mjs: ${error}\n\n${I.usageText()}\n`); return 2; }
 
-  if (env.CLAUDECODE === '1' && env.PIPELINE_ADMIN !== '1' && !opts.check) {
-    process.stderr.write('install.mjs refuses to run inside a Claude Code session (CLAUDECODE=1): run this in your own terminal, or start Claude with PIPELINE_ADMIN=1.\n');
-    return 2;
+  if (env.PIPELINE_ADMIN !== '1' && !opts.check) {
+    if (env.CLAUDECODE === '1') {
+      process.stderr.write('install.mjs refuses to run inside a Claude Code session (CLAUDECODE=1): run this in your own terminal, or start Claude with PIPELINE_ADMIN=1.\n');
+      return 2;
+    }
+    if (hasClaudeCodeAncestor()) {
+      process.stderr.write('install.mjs refuses to run inside a Claude Code session (a Claude Code process is an ancestor of this one, whatever CLAUDECODE says): run this in your own terminal, or start Claude with PIPELINE_ADMIN=1.\n');
+      return 2;
+    }
   }
 
   const home = path.resolve(expandHome(opts.claudeHome || env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude')));

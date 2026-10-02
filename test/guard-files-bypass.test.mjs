@@ -3,6 +3,9 @@
 // positives, 8 performance. Home is /home/u (user "u"); the filesystem is faked unless a test says otherwise.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { simpleCommands } from '../pipeline/hooks/lib/shell-parse.mjs';
 import { evaluateFileTool, evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 
@@ -374,7 +377,8 @@ test('caps: a truncated parse with a protected reference is denied before any ea
   assert.equal(bash(`cat ${DEEP}; echo x > ~/.claude/settings.json`).decision, 'deny', 'reference after the cut-off');
   assert.equal(bash(`echo ${DEEP} && node -e "fs.writeFileSync(os.homedir()+'/.claude/settings.json','x')"`).decision, 'deny', 'suffix scan after the cut-off');
   assert.equal(bash(`python3 - <<'PY'\nimport os\nopen(os.path.expanduser('~/.claude/settings.json'),'w')\nPY\n${DEEP}`).decision, 'deny', 'reference only inside a heredoc');
-  assert.equal(bash(`echo ${DEEP}`).decision, 'allow', 'no reference: truncation alone is not a reason to deny');
+  assert.equal(bash(`echo ${DEEP}`).decision, 'deny', 'a truncated parse cannot prove anything harmless');
+  assert.equal(bash(`${'true; '.repeat(600)}e''cho x > ~/.cl""aude/settings.json`).decision, 'deny', 'quote-split names after the command cap');
 });
 
 test('caps: a command only known at run time is denied when a protected reference exists (parser dynamic flag)', () => {
@@ -585,4 +589,292 @@ test('installer text rule: npm run of a script that references the installer', (
 test('installer text rule: npm run denies when package.json cannot be read or parsed', () => {
   assert.equal(inst('npm run anything', { readFile: () => { throw new Error('EACCES'); } }), 'deny');
   assert.equal(inst('npm run anything', { readFile: () => '{not json' }), 'deny');
+});
+
+// ---- 8b. time budget (review finding 12) ---------------------------------------------------------------
+
+test('size cap: an oversized command line is not scanned; it is denied only when it mentions a sensitive word', () => {
+  const spam = '{a,b}'.repeat(60_000);
+  const t0 = Date.now();
+  assert.equal(bash(`echo ${spam}`).decision, 'allow');
+  assert.equal(bash(`echo ${spam}; echo x > ~/.cl""aude/settings.json`).decision, 'deny');
+  assert.equal(bash(`echo ${spam}; node ins""tall.mjs`).decision, 'deny');
+  assert.equal(bash(`echo ${spam}; export PIPELINE_""ADMIN=1`).decision, 'deny');
+  assert.ok(Date.now() - t0 < 3000);
+});
+
+// ---- 9. script files hide commands (review finding 2) ----------------------------------------------------
+
+// A fake file system keyed by absolute path.
+const fsOf = (files) => ({ existsSync: (p) => p in files, readText: (p) => (typeof files[p] === 'string' ? files[p] : null) });
+
+test('script files: the file a shell, source, interpreter or path invocation runs is read and judged', () => {
+  const files = {
+    '/home/u/proj/w.sh': 'echo x > ~/.claude/settings.json',
+    '/home/u/proj/rm.sh': '#!/bin/bash\nrm -rf ~/.claude/skills/ship',
+    '/home/u/proj/admin.sh': 'export PIPELINE_ADMIN=1\nclaude',
+    '/home/u/proj/nested.sh': 'bash w.sh',
+    '/home/u/proj/ok.sh': 'ls ~/.claude/pipeline\ncat ~/.claude/settings.json\necho hi > notes.txt',
+    '/home/u/proj/w.mjs': "import fs from 'node:fs';\nfs.writeFileSync(`${process.env.HOME}/.claude/settings.json`, '{}');",
+    '/home/u/proj/w.py': "import os\nopen(os.path.expanduser('~/.claude/pipeline/x'), 'w').write('x')",
+    '/home/u/proj/admin.mjs': "process.env.PIPELINE_ADMIN = '1';",
+    '/home/u/proj/read.mjs': "console.log(require('fs').readFileSync(process.env.HOME + '/.claude/settings.json', 'utf8'))",
+    '/home/u/proj/plain.mjs': "console.log('hi')",
+    '/home/u/proj/sub/w.sh': 'rm ~/.claude/pipeline/VERSION',
+  };
+  const run = (c) => bash(c, PROJ, fsOf(files)).decision;
+  for (const c of [
+    'bash w.sh', 'sh ./w.sh', './w.sh', 'source w.sh', '. w.sh', 'env bash w.sh', 'bash rm.sh', 'bash admin.sh', 'bash nested.sh',
+    'node w.mjs', 'python3 w.py', 'node admin.mjs', 'cd sub && bash w.sh', 'node ~/proj/w.mjs', 'bash /home/u/proj/w.sh',
+    'node ~/.claude/pipeline/bin/pipeline.mjs job start c -- bash w.sh',
+  ]) assert.equal(run(c), 'deny', c);
+  for (const c of ['bash ok.sh', './ok.sh', 'node plain.mjs', 'node read.mjs', 'bash missing.sh', 'source missing.sh']) assert.equal(run(c), 'allow', c);
+});
+
+test('script files: a shell script that exists but cannot be read is denied, a missing one is not', () => {
+  const unreadable = { existsSync: () => true, readText: () => null };
+  assert.equal(bash('bash big.sh', PROJ, unreadable).decision, 'deny');
+  assert.equal(bash('./tool', PROJ, unreadable).decision, 'allow');
+  assert.equal(bash('node big.mjs', PROJ, unreadable).decision, 'allow');
+  assert.equal(bash('bash big.sh', PROJ, { existsSync: () => false }).decision, 'allow');
+});
+
+test('script files: the pipeline CLI and node_modules programs are not scanned', () => {
+  const files = {
+    '/home/u/.claude/pipeline/bin/pipeline.mjs': "writeFileSync(join(home, '.claude', 'settings.json'), x); process.env.PIPELINE_ADMIN = '1'",
+    '/home/u/proj/node_modules/.bin/tool': "#!/usr/bin/env node\nfs.writeFileSync(os.homedir() + '/.claude/settings.json', '')",
+  };
+  assert.equal(bash('node ~/.claude/pipeline/bin/pipeline.mjs preflight', PROJ, fsOf(files)).decision, 'allow');
+  assert.equal(bash('./node_modules/.bin/tool', PROJ, fsOf(files)).decision, 'allow');
+});
+
+// ---- 10. macOS firmlink spelling and inode identity (review finding 5) ----------------------------------
+
+const DARWIN = { platform: 'darwin' };
+
+test('firmlink: /System/Volumes/Data/<path> names the same file on macOS, in file tools, MCP and Bash', () => {
+  const p = '/System/Volumes/Data/home/u/.claude/settings.json';
+  assert.equal(evaluateFileTool({ tool_name: 'Write', tool_input: { file_path: p, content: '{}' }, cwd: PROJ }, { ...BASE, ...DARWIN }).decision, 'deny');
+  assert.equal(evaluateFileTool({ tool_name: 'Edit', tool_input: { file_path: '/System/Volumes/Data/home/u/.claude/skills/ship/SKILL.md', old_string: 'a', new_string: 'b' }, cwd: PROJ }, { ...BASE, ...DARWIN }).decision, 'deny');
+  assert.equal(mcp('mcp__filesystem__write_file', { path: p, content: 'x' }, PROJ, DARWIN).decision, 'deny');
+  assert.equal(bash(`echo {} > ${p}`, PROJ, DARWIN).decision, 'deny');
+  assert.equal(bash('rm -rf /System/Volumes/Data/home/u/.claude/pipeline', PROJ, DARWIN).decision, 'deny');
+  assert.equal(bash('cd /System/Volumes/Data/home/u/.claude && echo x > settings.json', PROJ, DARWIN).decision, 'deny');
+  // reading is fine, other platforms do not have the alias, and unrelated files under /System/Volumes/Data stay allowed
+  assert.equal(bash(`cat ${p}`, PROJ, DARWIN).decision, 'allow');
+  assert.equal(evaluateFileTool({ tool_name: 'Write', tool_input: { file_path: '/System/Volumes/Data/home/u/notes.md', content: 'x' }, cwd: PROJ }, { ...BASE, ...DARWIN }).decision, 'allow');
+});
+
+test('inode identity: a path that is the same file as a protected root (hard link, alias) is protected', (t) => {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'gf-ino-')));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(home, '.claude', 'pipeline', 'hooks'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.claude', 'settings.json'), '{}');
+  fs.mkdirSync(path.join(home, 'elsewhere'));
+  fs.linkSync(path.join(home, '.claude', 'settings.json'), path.join(home, 'elsewhere', 'alias.json'));
+  const real = { home, env: {}, platform: process.platform === 'win32' ? 'linux' : process.platform };
+  const w = (file_path) => evaluateFileTool({ tool_name: 'Write', tool_input: { file_path, content: 'x' }, cwd: home }, real).decision;
+  if (process.platform !== 'win32') assert.equal(w(path.join(home, 'elsewhere', 'alias.json')), 'deny', 'hard link to settings.json');
+  assert.equal(w(path.join(home, 'elsewhere', 'other.json')), 'allow');
+  assert.equal(w(path.join(home, '.claude', 'pipeline', 'hooks', 'new.mjs')), 'deny', 'a new file inside a protected dir');
+  assert.equal(w(path.join(home, '.claude', 'notes.md')), 'allow');
+});
+
+// ---- 11. globs over protected subtrees (review finding 6) --------------------------------------------------
+
+table('glob over a protected subtree', [
+  "sed -i '' s/a/b/ ~/.claude/skills/*/SKILL.md",
+  'sed -i s/a/b/ ~/.claude/skills/ship/*.md',
+  'echo x >> ~/.clau?e/pipeline/hooks/guard-git.mjs',
+  'echo x >> ~/.c*/pipeline/hooks/guard-git.mjs',
+  'cd ~/.clau?e/skills/ship && echo evil >> SKILL.md',
+  'cd ~/.c*/pipeline && rm -rf hooks',
+  'rm ~/.claude/agents/*.md',
+  'rm ~/.claude/skills/ship*',
+  'rm -rf ~/.claude/skills/*',
+  'rm -rf ~/.cla*',
+  'rm -rf ~/.claude/*',
+  'echo x > ~/.claude/settings.js?n',
+  'echo x > ~/.claude/settings.[j]son',
+  'truncate -s 0 /home/u/.claude/pipeline/**/*.mjs',
+  'rm /h*/u/.claude/pipeline/VERSION',
+  'echo x > ~/.claude/p*/hooks/guard-files.mjs',
+], 'deny');
+
+table('glob that cannot reach a protected root', [
+  'rm ~/.claude/projects/-x/memory/*.md',
+  'rm ~/.claude/skills/shipping*',
+  'rm ~/.claude/skills/other-*/x.md',
+  'rm ~/.claude/agents/other*.md',
+  'echo x > ~/.claude/CLAUDE.m?',
+  'rm -rf ~/work/*',
+  'cat ~/.claude/skills/*/SKILL.md',
+  'ls ~/.clau?e/pipeline/hooks/*.mjs',
+  'sha256sum ~/.claude/pipeline/hooks/*.mjs',
+  'rm /home/*/scratch',
+], 'allow');
+
+// ---- 12. bare cd, links to home, -C style bases (review finding 7) -------------------------------------
+
+table('bare cd / links / base dirs', [
+  'cd && echo x > .claude/settings.json',
+  'pushd && sed -i s/a/b/ .claude/settings.json',
+  'cd ~ && echo x > .claude/settings.json',
+  'ln -s ~ /tmp/h && echo x > /tmp/h/.claude/settings.json',
+  'ln -s ~/.claude /tmp/c',
+  'ln -s $HOME /tmp/h',
+  'ln -sf / /tmp/root',
+  'ln -s ~/.. /tmp/up',
+  'ln -s ~/.claude/pipeline /tmp/p',
+  'ln -t /tmp ~',
+  'git -C ~ checkout -- .claude/settings.json',
+  'git -C ~ restore .claude/skills/ship/SKILL.md',
+  'git -C ~/.claude restore settings.json',
+  'tar -C ~ -xf /tmp/a.tar .claude/settings.json',
+  'tar --directory ~ -xf /tmp/a.tar .claude/pipeline',
+  'tar -xf /tmp/a.tar -C ~/.claude pipeline',
+  'unzip -d ~ /tmp/a.zip .claude/settings.json',
+  'unzip /tmp/a.zip .claude/settings.json -d ~',
+  'rsync -a /tmp/x/.claude/settings.json ~/.claude/',
+  'cp -t ~/.claude/pipeline /tmp/x',
+], 'deny');
+
+table('bare cd / links / base dirs: allowed', [
+  'cd && ls .claude/settings.json',
+  'cd && cat .claude/settings.json',
+  'cd ~ && echo x > notes.txt',
+  'ln -s /tmp/x ./x',
+  'ln -s ../shared ./shared',
+  'ln -s ~/work/app /tmp/app',
+  'git -C ~ status',
+  'git -C ~/work/app checkout -- src/a.ts',
+  'tar -C ~/work -xf /tmp/a.tar src',
+  'unzip -d ~/work /tmp/a.zip',
+  'cp -t ~/work /tmp/x',
+  'cp -t ~ /tmp/x',
+], 'allow');
+
+// ---- 13. false positives: prose that names a protected path (review finding 9) ---------------------------
+
+table('prose that merely names a protected path', [
+  'git commit -m "docs: installer writes ~/.claude/settings.json"',
+  'git commit -am "fix ~/.claude/pipeline/hooks docs"',
+  'git commit --message="see ~/.claude/skills/ship"',
+  'git commit -m"mention ~/.claude/settings.json"',
+  'git tag -a v1 -m "touches ~/.claude/agents/judge.md"',
+  'gh pr create --body "Edits ~/.claude/pipeline/hooks" --title "t"',
+  'gh pr create --title "Protect ~/.claude/settings.json" --body x',
+  'gh pr comment 3 --body "see ~/.claude/settings.json"',
+  'gh pr comment 3 -b "see ~/.claude/settings.json"',
+  'gh release create v1 --notes "rewrites ~/.claude/pipeline"',
+  'echo "see ~/.claude/pipeline" >> notes.md',
+  'echo ~/.claude/settings.json',
+  'printf "%s\\n" ~/.claude/pipeline/VERSION > /tmp/out.txt',
+  'npx vitest run -t "protects ~/.claude/settings.json"',
+  'npm test -- --grep "guards ~/.claude/pipeline"',
+  'npx jest -t "does not edit ~/.claude/skills/ship"',
+  `git commit -m "$(cat <<'EOF'\nfix: note that ~/.claude/settings.json is protected\nEOF\n)"`,
+], 'allow');
+
+table('prose exemption does not cover real paths or writes', [
+  'git commit -m "x" ~/.claude/settings.json',
+  'git commit -m "x" -- ~/.claude/pipeline/VERSION',
+  'git add ~/.claude/pipeline/hooks/x.mjs',
+  'echo "see ~/.claude/pipeline" > ~/.claude/settings.json',
+  'echo x >> ~/.claude/pipeline/VERSION',
+  'echo x | tee ~/.claude/settings.json',
+  'echo ~/.claude/pipeline | xargs rm -rf',
+  'echo "rm -rf ~/.claude/pipeline" | sh',
+  'cp -t ~/.claude/pipeline /tmp/x',
+  'tar -t -f x.tar ~/.claude/pipeline/hooks && rm ~/.claude/pipeline/VERSION',
+  'gh pr create --body "x" --body-file ~/.claude/settings.json && rm ~/.claude/settings.json',
+  'npx vitest run -t "x" && rm ~/.claude/settings.json',
+], 'deny');
+
+// ---- 14. CLAUDECODE, quote-split installer names, test seams (review findings 8a and 13) ---------------------
+
+const CHECKOUT_DIR = '/home/u/Claude/claude-pipeline';
+const IN_CHECKOUT = { existsSync: (p) => p === `${CHECKOUT_DIR}/pipeline/hooks/guard-files.mjs` };
+
+table('unsetting or overriding CLAUDECODE', [
+  'env -u CLAUDECODE node install.mjs',
+  'env -uCLAUDECODE true',
+  'env --unset=CLAUDECODE true',
+  'env --unset CLAUDECODE true',
+  'env -u CLAU""DECODE true',
+  "env -u 'CLAUDECODE' true",
+  'unset CLAUDECODE',
+  'unset -v CLAUDECODE && node x.mjs',
+  'CLAUDECODE= node x.mjs',
+  'CLAUDECODE=0 node x.mjs',
+  'export CLAUDECODE=',
+  'export CLAUDECODE=0; node x.mjs',
+  'env CLAUDECODE=0 node x.mjs',
+  'env -i node x.mjs',
+  'env -i PATH=$PATH node x.mjs',
+  'env --ignore-environment node x.mjs',
+  'env - node x.mjs',
+  'bash -c "unset CLAUDECODE; node x.mjs"',
+  'Remove-Item Env:CLAUDECODE',
+  'Remove-Item Env:\\CLAUDECODE',
+  'ri env:claudecode',
+  "$env:CLAUDECODE=''",
+  '$env:CLAUDECODE = $null',
+  "[Environment]::SetEnvironmentVariable('CLAUDECODE', $null)",
+  'node -e "delete process.env.CLAUDECODE; run()"',
+  'python3 -c "import os; os.environ.pop(\'CLAUDECODE\')"',
+], 'deny');
+
+table('naming CLAUDECODE without changing it', [
+  'echo $CLAUDECODE',
+  '[ -n "$CLAUDECODE" ] && echo yes',
+  'env | grep CLAUDECODE',
+  'printenv CLAUDECODE',
+  'grep -n CLAUDECODE install.mjs',
+  'git commit -m "installer: unset CLAUDECODE is not enough"',
+  'env FOO=1 node x.mjs',
+  'env -u FOO node x.mjs',
+  'Get-ChildItem Env:CLAUDECODE',
+], 'allow');
+
+test('installer names survive quote-splitting and escapes', () => {
+  const inside = (c) => bash(c, CHECKOUT_DIR, IN_CHECKOUT).decision;
+  for (const c of ['node ins""tall.mjs', "node 'install'.mjs", 'node install.m\\js', 'sh ./inst""all.sh', './ins\\tall.sh', 'bash ins""tall.sh --force', 'pwsh ./install."ps1"', `cd ${CHECKOUT_DIR} && node i''nstall.mjs`]) {
+    assert.equal(inside(c), 'deny', c);
+  }
+  for (const c of ['node install.mjs --check', 'node ins""tall.mjs --check', 'cat install.sh', 'git log -- ins""tall.mjs']) assert.equal(inside(c), 'allow', c);
+  assert.equal(bash('node ins""tall.mjs', '/home/u/other').decision, 'allow', 'outside a checkout nothing is protected by name');
+});
+
+const SEAMS = ['PIPELINE_GH', 'PIPELINE_CODEX', 'PIPELINE_VERCEL', 'PIPELINE_TEST_MODE'];
+
+test('test seams: setting PIPELINE_GH / CODEX / VERCEL / TEST_MODE on a command that runs pipeline.mjs is denied', () => {
+  const P = 'node ~/.claude/pipeline/bin/pipeline.mjs merge 12';
+  for (const v of SEAMS) {
+    for (const c of [
+      `${v}=/tmp/fake ${P}`,
+      `env ${v}=/tmp/fake ${P}`,
+      `export ${v}=/tmp/fake; ${P}`,
+      `${v}=1; export ${v}; ${P}`,
+      `$env:${v}='x'; ${P}`,
+      `bash -c "${v}=/tmp/fake ${P}"`,
+      `${v}=/tmp/fake pipeline merge 12`,
+      `${v}=x node ~/.claude/pipeline/bin/pipeline.mjs job start c -- ${P}`,
+      `${v}=x sudo ${P}`,
+    ]) assert.equal(bash(c).decision, 'deny', c);
+  }
+  for (const c of [
+    P,
+    'PIPELINE_GH=gh node scripts/other.mjs',
+    'export PIPELINE_GH=/tmp/fake',
+    'echo PIPELINE_GH',
+    'grep -rn PIPELINE_GH pipeline/lib',
+    'PIPELINE_OFF=1 node ~/.claude/pipeline/bin/pipeline.mjs preflight',
+    'PIPELINE_LOCK_DIR=/tmp/l node ~/.claude/pipeline/bin/pipeline.mjs merge 12',
+  ]) assert.equal(bash(c).decision, 'allow', c);
+});
+
+test('test seams: a script file that sets one for pipeline.mjs is caught too', () => {
+  const files = { '/home/u/proj/go.sh': 'PIPELINE_GH=/tmp/fake node ~/.claude/pipeline/bin/pipeline.mjs merge 1' };
+  assert.equal(bash('bash go.sh', PROJ, { existsSync: (p) => p in files, readText: (p) => files[p] ?? null }).decision, 'deny');
 });

@@ -13,6 +13,7 @@ const HARD_MAX_DEPTH = 50;
 const ASSIGN_RE = /^([A-Za-z_][A-Za-z0-9_]*)\+?=/;
 const KEYWORDS = new Set(['if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', 'until', '!', 'esac', 'coproc']);
 const PS_ENV_RE = /^\$env:([A-Za-z_][A-Za-z0-9_]*)(=?)([\s\S]*)$/i;
+const MAX_BRACE_WORK = 20_000; // brace-expansion results across one line; beyond it words stay unexpanded and the parse is flagged truncated
 const BRACE_CAP = 64; // results of one brace expression; beyond it we keep the first ones and set `truncated`
 const SHELLS = new Set(['bash', 'sh', 'zsh', 'dash', 'ash', 'ksh', 'ksh93', 'mksh', 'pdksh', 'yash', 'rbash', 'fish', 'csh', 'tcsh']);
 const TMUX_RUNNERS = new Set(['new-session', 'new', 'new-window', 'neww', 'split-window', 'splitw', 'respawn-pane', 'respawnp', 'respawn-window', 'respawnw', 'run-shell', 'run', 'pipe-pane', 'pipep', 'display-popup', 'popup', 'if-shell', 'if']);
@@ -304,8 +305,90 @@ function unwrapArch(argv) {
   return rest(argv, i);
 }
 
+// ssh [opts] host cmd...: the words after the host are a command line the remote shell runs.
+function unwrapSsh(argv) {
+  const i = skipOpts(argv, 1, 'bcDEeFIiJLlmOopQRSWw');
+  const words = argv.slice(i + 1); // argv[i] is the host
+  return i < argv.length && words.length ? shellCmd(words.join(' ')) : null;
+}
+
+// taskset [-c LIST | MASK] cmd... (-p only changes a running process)
+function unwrapTaskset(argv) {
+  const seen = new Set();
+  let i = skipOpts(argv, 1, 'c', ['--cpu-list'], seen);
+  if (seen.has('p') || seen.has('--pid')) return null;
+  if (!seen.has('c') && !seen.has('--cpu-list')) i++;
+  return rest(argv, i);
+}
+
+// script -c 'string' [file]  (util-linux)  /  script [-q] file cmd...  (BSD, macOS)
+function unwrapScript(argv) {
+  for (let i = 1; i < argv.length; i++) {
+    const t = argv[i];
+    if (t === '--command') return argv[i + 1] === undefined ? null : shellCmd(argv[i + 1]);
+    if (t.startsWith('--command=')) return shellCmd(t.slice('--command='.length));
+    if (/^-[A-Za-z]*c$/.test(t)) return argv[i + 1] === undefined ? null : shellCmd(argv[i + 1]);
+  }
+  return rest(argv, skipOpts(argv, 1, 't') + 1); // + the typescript file
+}
+
+// screen [opts] cmd args  /  screen -X stuff 'string'
+function unwrapScreen(argv) {
+  const seen = new Set();
+  const i = skipOpts(argv, 1, 'ScsTtpeh', ['--sessionname'], seen);
+  if (seen.has('X')) {
+    const k = argv.indexOf('stuff', i);
+    return k >= 0 && argv[k + 1] !== undefined ? shellCmd(argv[k + 1].replace(/\\[nr]/g, ' ')) : null;
+  }
+  return rest(argv, i);
+}
+
+// GNU parallel [opts] template ::: args  — the template is a shell command line; {} stands for an argument
+function unwrapParallel(argv) {
+  const i = skipOpts(argv, 1, 'jNnSaIdLmsTEUCwoteqXr', ['--jobs', '--sshlogin', '--arg-file', '--delimiter', '--max-args', '--header', '--colsep']);
+  const sep = argv.findIndex((w, k) => k >= i && /^::::?$/.test(w));
+  const template = argv.slice(i, sep < 0 ? argv.length : sep);
+  if (!template.length) return null;
+  const args = sep < 0 ? [] : argv.slice(sep + 1);
+  const text = template.join(' ');
+  const hasSlot = /\{[^{}\s]*\}/.test(text);
+  return shellCmd(!args.length ? text : hasSlot ? text.replace(/\{[^{}\s]*\}/g, args[0]) : `${text} ${args.join(' ')}`);
+}
+
+// wsl [-d distro] [-u user] [--cd dir] [-e] cmd...
+function unwrapWsl(argv) {
+  const i = skipOpts(argv, 1, 'du', ['--distribution', '--user', '--cd', '--exec']);
+  if (i >= argv.length) return null;
+  return argv.length - i === 1 && /\s/.test(argv[i]) ? shellCmd(argv[i]) : rest(argv, i); // one string goes through the shell
+}
+
+// npx / bunx / pnpx [opts] cmd args, `-c 'string'`; npm|pnpm|yarn exec|dlx|x [opts] cmd args
+function unwrapPackageRunner(argv, fromIndex) {
+  for (let k = fromIndex; k < argv.length; k++) {
+    const t = argv[k];
+    if (t === '--call' || t === '-c') return argv[k + 1] === undefined ? null : shellCmd(argv[k + 1]);
+    if (t.startsWith('--call=')) return shellCmd(t.slice('--call='.length));
+  }
+  return rest(argv, skipOpts(argv, fromIndex, 'p', ['--package', '--prefix', '--workspace', '--registry', '--cache']));
+}
+const runnerAt = (subs) => (argv) => (subs.includes(argv[1]) ? unwrapPackageRunner(argv, 2) : null);
+
 const WRAPPERS = {
   env: unwrapEnv,
+  unbuffer: plain('', []),
+  taskset: unwrapTaskset,
+  'sandbox-exec': plain('fpnD'),
+  ssh: unwrapSsh,
+  script: unwrapScript,
+  screen: unwrapScreen,
+  parallel: unwrapParallel,
+  wsl: unwrapWsl,
+  npx: (argv) => unwrapPackageRunner(argv, 1),
+  bunx: (argv) => unwrapPackageRunner(argv, 1),
+  pnpx: (argv) => unwrapPackageRunner(argv, 1),
+  npm: runnerAt(['exec', 'x']),
+  pnpm: runnerAt(['exec', 'dlx']),
+  yarn: runnerAt(['exec', 'dlx']),
   command: unwrapCommand,
   builtin: plain(),
   exec: plain('a'),
@@ -353,6 +436,49 @@ function shellInvocation(argv) {
   if (i < argv.length) return STDIN_FILES.has(argv[i]) ? { kind: 'stdin' } : { kind: 'file', text: argv[i] };
   return { kind: 'stdin' };
 }
+
+// ---- script files -------------------------------------------------------------------------------
+
+const INTERPRETER = /^(?:node|nodejs|deno|bun|tsx|ts-node|python\d*(?:\.\d+)*|ruby|perl|php)$/;
+const SCRIPT_EXT = /\.(?:m?[jt]s|cjs|jsx|tsx|py|rb|pl|php|sh|bash|zsh)$/i;
+const SYSTEM_BIN = /^(?:\/usr)?(?:\/local)?\/(?:s?bin|libexec)\/|^\/opt\/homebrew\/s?bin\//;
+// Flags that make an interpreter run inline code, a module or a test runner instead of a file.
+const INLINE_FLAGS = new Set(['-e', '-E', '-p', '-c', '-m', '--eval', '--print', '--check', '--test', '--input-type']);
+const INTERP_VALUE_FLAGS = new Set(['-r', '--require', '--import', '--loader', '--experimental-loader', '-C', '--conditions', '-W', '-X', '-I', '-x', '--env-file', '--title', '--max-old-space-size']);
+
+// The file a command will read and run: `bash f`, `source f`, `. f`, `node f.mjs`, `python f.py`, `./f`.
+// {kind:'shell'} is run as a shell script (the caller judges its commands), {kind:'interp'} is program text in
+// another language (the caller scans it), {kind:'exec'} is a program run by path (shell or interpreter, from its
+// shebang). Null when the command runs no file (`bash -c`, stdin, process substitution, `node -e`, a test runner).
+export function scriptFileOf(argv) {
+  if (!argv.length) return null;
+  const name = base(argv[0]);
+  if (SHELLS.has(name)) {
+    const r = shellInvocation(argv);
+    return r.kind === 'file' && !r.text.startsWith('<(') ? { kind: 'shell', file: r.text } : null;
+  }
+  if (name === 'source' || name === '.') {
+    const op = argv[1];
+    return op === undefined || STDIN_FILES.has(op) || op.startsWith('<(') ? null : { kind: 'shell', file: op };
+  }
+  if (INTERPRETER.test(name)) {
+    let i = 1;
+    if ((name === 'deno' || name === 'bun') && argv[1] === 'run') i = 2;
+    for (; i < argv.length; i++) {
+      const t = argv[i];
+      if (t === '--') { i++; break; }
+      if (INLINE_FLAGS.has(t.split('=')[0]) || (/^-[A-Za-z]*[ecEmp]$/.test(t) && !t.startsWith('--') && name !== 'node')) return null;
+      if (t.length > 1 && t[0] === '-') { if (INTERP_VALUE_FLAGS.has(t)) i++; continue; }
+      break;
+    }
+    const file = argv[i];
+    if (file === undefined || (name !== 'node' && !INTERPRETER_NO_EXT.has(name) && !SCRIPT_EXT.test(file))) return null;
+    return STDIN_FILES.has(file) ? null : { kind: 'interp', file };
+  }
+  if (/[/]/.test(argv[0]) && !argv[0].includes('\\') && !SYSTEM_BIN.test(argv[0])) return { kind: 'exec', file: argv[0] };
+  return null;
+}
+const INTERPRETER_NO_EXT = new Set(['python', 'ruby', 'perl', 'php']);
 
 const PWSH_VALUE_FLAGS = ['executionpolicy', 'windowstyle', 'workingdirectory', 'inputformat', 'outputformat', 'version', 'configurationname', 'settingsfile', 'custompipename'];
 const PWSH_VALUE_ALIASES = ['ep', 'w', 'wd', 'if', 'of', 'o', 'v', 'config'];
@@ -921,11 +1047,15 @@ class Parser {
     // brace expansion: {a,b} in an unquoted word becomes several words (assignment words before the command are exempt)
     const argv = [];
     for (const w of words.slice(i)) {
-      if (w.bm.length >= 3) {
+      if (w.bm.length >= 3 && this.ctx.braceWork <= MAX_BRACE_WORK) {
         const r = expandBraces(w.text, w.bm);
         if (r.over) this.ctx.truncated = true;
+        this.ctx.braceWork += r.list.length + w.bm.length;
         argv.push(...r.list);
-      } else argv.push(w.text);
+      } else {
+        if (w.bm.length >= 3) this.ctx.truncated = true; // budget spent: left as written
+        argv.push(w.text);
+      }
     }
     return this.process(argv, env, seg, false);
   }
@@ -1083,7 +1213,7 @@ class Parser {
 
 export function simpleCommands(str, opts) {
   const requested = Number.isFinite(opts?.maxDepth) ? Math.trunc(opts.maxDepth) : 5;
-  const ctx = { out: [], maxDepth: Math.min(Math.max(requested, 0), HARD_MAX_DEPTH), truncated: false, dynamic: false, stopped: false, muted: 0, nest: 0, work: 0 };
+  const ctx = { out: [], maxDepth: Math.min(Math.max(requested, 0), HARD_MAX_DEPTH), truncated: false, dynamic: false, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0 };
   let parser = null;
   try {
     parser = new Parser(ctx, String(str ?? ''));

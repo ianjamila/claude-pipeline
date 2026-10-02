@@ -316,7 +316,6 @@ const MORE_ALLOW = [
   ['DIR=/other; cd $DIR && git push', { byDir: { '/other': 'agent/y', '/work/repo': 'main' } }],
   ['B=agent/x; git push origin $B'],
   ['git push -u origin "$(git branch --show-current)"', { branch: 'agent/x' }],
-  ['git push origin HEAD:$X', { branch: 'agent/x' }],
   ['git branch -d main'],
   ['git fetch origin main:agent/x'],
   ['git remote add origin git@github.com:o/r.git'],
@@ -440,14 +439,16 @@ test('a lookup that returns garbage or HEAD is treated as unknown', () => {
   assert.equal(evaluateGitCommand('git push', { cwd: '/x', currentBranch: () => 'refs/heads/main' }).decision, 'deny');
 });
 
-test('a command the parser gives up on is denied when it mentions git/gh/pipeline, allowed otherwise', () => {
+test('a command the parser gives up on is denied outright, even when git is spelled with quotes', () => {
   const long = 'true; '.repeat(600);
   const v = evaluate(`${long}git status`);
   assert.equal(v.decision, 'deny');
   assert.match(v.reason, /too complex/);
   assert.equal(evaluate(`${long}gh pr view 1`).decision, 'deny');
   assert.equal(evaluate(`${long}node pipeline.mjs job start x -- ls`).decision, 'deny');
-  assert.equal(evaluate(`${long}ls`).decision, 'allow');
+  assert.equal(evaluate(`${long}ls`).decision, 'deny', 'a truncated parse cannot prove anything harmless');
+  assert.equal(evaluate(`${long}g''it push origin main`).decision, 'deny');
+  assert.equal(evaluate(`${long}\\g\\h pr merge 1 --admin`).decision, 'deny');
 });
 
 test('job runner nesting is bounded and still fails closed', () => {
@@ -946,3 +947,261 @@ test('spawn: label rules need no gh at all', () => {
 
 function readLines(file) { return readFileSync(file, 'utf8').split('\n').filter(Boolean); }
 function readFirstLine(file) { return readLines(file)[0]; }
+
+// ---- Monitor and MCP command tools (review finding 1) ---------------------------------------------------
+
+const toolInput = (tool_name, tool_input, cwd = TMP) => ({ session_id: 's', cwd, hook_event_name: 'PreToolUse', tool_name, tool_input });
+const denied = (r) => r.status === 0 && r.stdout !== '' && JSON.parse(r.stdout).hookSpecificOutput.permissionDecision === 'deny';
+
+test('spawn: the Monitor tool is judged like Bash', () => {
+  assert.ok(denied(hook(toolInput('Monitor', { command: 'git push origin main' }))));
+  assert.ok(denied(hook(toolInput('Monitor', { command: 'gh pr merge 1 --admin' }))));
+  const ok = hook(toolInput('Monitor', { command: 'git push -u origin agent/x' }));
+  assert.equal(ok.stdout, '');
+});
+
+test('spawn: an MCP tool string field named command / cmd / script is judged like a Bash command', () => {
+  assert.ok(denied(hook(toolInput('mcp__shell__run', { command: 'git push origin main' }))));
+  assert.ok(denied(hook(toolInput('mcp__shell__run', { options: { cmd: 'git push -f' } }))));
+  assert.ok(denied(hook(toolInput('mcp__ide__exec', { script: 'gh pr edit 1 --add-label human-approved' }))));
+  assert.equal(hook(toolInput('mcp__shell__run', { command: 'git status' })).stdout, '');
+  // text that merely sits in a differently named field (a Notion page body) is not a command
+  assert.equal(hook(toolInput('mcp__notion__create_page', { body: 'git push origin main' })).stdout, '');
+});
+
+test('the installed matchers cover Monitor and MCP tools for guard-git', async () => {
+  const { GUARD_GIT_MATCHER, GUARD_FILES_MATCHER } = await import('../pipeline/lib/installer.mjs');
+  for (const m of [GUARD_GIT_MATCHER, GUARD_FILES_MATCHER]) {
+    const re = new RegExp(`^(?:${m})$`);
+    for (const tool of ['Bash', 'PowerShell', 'Monitor', 'mcp__x__run']) assert.ok(re.test(tool), `${m} must match ${tool}`);
+  }
+});
+
+// ---- time budget (review finding 12) ----------------------------------------------------------------------
+
+test('an oversized command line is not parsed: denied when it mentions a guarded word (quotes stripped), allowed otherwise', () => {
+  const spam = '{a,b}'.repeat(60_000); // 300 KB
+  const t0 = Date.now();
+  assert.equal(evaluate(`echo ${spam}`).decision, 'allow');
+  assert.equal(evaluate(`echo ${spam}; git push origin main`).decision, 'deny');
+  assert.equal(evaluate(`echo ${spam}; g''it pu"sh" origin main`).decision, 'deny');
+  assert.equal(evaluate(`echo ${spam}; gh pr edit 1 --add-label human-""approved`).decision, 'deny');
+  assert.ok(Date.now() - t0 < 3000, 'the size cap must keep the hook far below its 15 s timeout');
+});
+
+test('brace spam just under the size cap is cut off by the expansion budget, not by the clock', () => {
+  const spam = Array.from({ length: 12_000 }, () => '{a,b,c}').join(' ');
+  const t0 = Date.now();
+  evaluate(`echo ${spam}`);
+  assert.ok(Date.now() - t0 < 3000);
+});
+
+// ---- dynamic push destinations and env-supplied git config (review findings 3 and 4) -------------------
+
+test('a push destination built at run time is allowed only for the current-branch idioms or a literal variable', () => {
+  const dynamicDeny = [
+    'git push origin HEAD:${B:-main}',
+    'for b in main; do git push origin HEAD:$b; done',
+    'f(){ git push origin HEAD:$1; }; f main',
+    'git push origin HEAD:$(cat .branch)',
+    'git push origin HEAD:m${x}ain',
+    'git push origin HEAD:"$(echo bWFpbg== | base64 -d)"',
+    'git push origin HEAD:`cat .branch`',
+    'git push origin "$BRANCH"',
+    'git push origin HEAD:agent/$(date +%s)',
+    'git push origin HEAD:"$(git branch --show-current)-main"',
+    'git push origin HEAD:"$(git -C /other branch --show-current)"',
+    'B=main; git push origin HEAD:$B',
+    'B=$(cat .branch); git push origin HEAD:$B',
+  ];
+  for (const c of dynamicDeny) assert.equal(evaluate(c).decision, 'deny', c);
+  const ok = [
+    'git push origin HEAD:$(git branch --show-current)',
+    'git push origin "$(git branch --show-current)"',
+    'git push origin HEAD:"$(git rev-parse --abbrev-ref HEAD)"',
+    'git push origin HEAD:`git branch --show-current`',
+    'git push origin `git rev-parse --abbrev-ref HEAD`',
+    'git push -u origin "$(git  branch   --show-current)"',
+    'B=agent/y; git push origin HEAD:$B',
+    'B=agent/y && git push origin HEAD:${B}',
+    'export B=agent/y; git push -u origin $B',
+    'B=$(git branch --show-current); git push origin HEAD:$B',
+  ];
+  for (const c of ok) assert.equal(evaluate(c, { branch: 'agent/x' }).decision, 'allow', c);
+  // the idiom still resolves to the current branch, so on main it is a push to main
+  assert.equal(evaluate('git push origin HEAD:$(git branch --show-current)', { branch: 'main' }).decision, 'deny');
+  assert.equal(evaluate('git push origin HEAD:$(git branch --show-current)', { branch: null }).decision, 'deny');
+});
+
+test('git config supplied through the environment counts as changed push configuration for a bare push', () => {
+  const envDeny = [
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=HEAD:main git push',
+    'GIT_CONFIG_PARAMETERS="\'remote.origin.push=HEAD:main\'" git push',
+    'env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=HEAD:main git push',
+    'export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=HEAD:main; git push',
+    'GIT_CONFIG_COUNT=1; GIT_CONFIG_KEY_0=push.default; GIT_CONFIG_VALUE_0=upstream; git push',
+    'GIT_CONFIG_GLOBAL=/tmp/evil.gitconfig git push',
+    'GIT_CONFIG_SYSTEM=/tmp/evil.gitconfig git push origin',
+    '$env:GIT_CONFIG_COUNT=1; git push',
+  ];
+  for (const c of envDeny) assert.equal(evaluate(c, { branch: 'agent/x' }).decision, 'deny', c);
+  // an explicit refspec is not redirected by config
+  assert.equal(evaluate('GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.editor GIT_CONFIG_VALUE_0=true git push origin HEAD:agent/x', { branch: 'agent/x' }).decision, 'allow');
+  assert.equal(evaluate('GIT_AUTHOR_NAME=x git push', { branch: 'agent/x' }).decision, 'allow');
+});
+
+// ---- script files and string-running wrappers (review findings 2 and 11) ------------------------------------
+
+// A fake file system: { 'push.sh': 'git push origin main' } relative to the cwd (/work/repo).
+const withFiles = (files, o = {}) => {
+  const abs = Object.fromEntries(Object.entries(files).map(([k, v]) => [resolve(o.cwd ?? '/work/repo', k), v]));
+  return { ...o, readText: (p) => (typeof abs[p] === 'string' ? abs[p] : null), pathExists: (p) => p in abs };
+};
+
+test('a script file is read and judged by what it runs', () => {
+  const files = {
+    'push.sh': 'echo hi\ngit push origin main\n',
+    'merge.sh': '#!/bin/bash\ngh pr merge 1 --admin\n',
+    'label.sh': 'gh pr edit 1 --add-label human-approved',
+    'ok.sh': 'git status\ngit push -u origin agent/x\n',
+    'nested.sh': 'bash push.sh',
+    'deep.sh': 'git push \\\n  origin \\\n  main',
+    'ok.mjs': "console.log('hello')",
+    'push.mjs': "import { execSync } from 'node:child_process';\nexecSync('git push origin main');",
+    'push.py': 'import subprocess\nsubprocess.run(["git", "push", "origin", "main"])',
+    'force.rb': '`git push --force origin agent/x`',
+  };
+  const ev = (c) => evaluate(c, withFiles(files));
+  for (const c of [
+    'bash push.sh', 'sh ./push.sh', './push.sh', 'source push.sh', '. push.sh', '. ./push.sh', 'env bash push.sh', 'zsh -x push.sh',
+    'bash merge.sh', 'bash label.sh', 'bash nested.sh', 'bash deep.sh', 'cd /work/repo && bash push.sh',
+    'node push.mjs', 'python3 push.py', 'ruby force.rb', 'pipeline job start c -- bash push.sh',
+    'node /x/pipeline.mjs job start c -- bash push.sh', 'time bash push.sh', 'sudo bash push.sh', 'bash -x -e push.sh a b',
+  ]) assert.equal(ev(c).decision, 'deny', c);
+  for (const c of ['bash ok.sh', './ok.sh', 'source ok.sh', 'node ok.mjs', 'bash missing.sh', 'node missing.mjs', './missing.sh', 'pipeline job start c -- bash ok.sh']) {
+    assert.equal(ev(c).decision, 'allow', c);
+  }
+  // the file is resolved against the directory the command runs in
+  const dirFiles = { sub: null, '/work/repo/sub/push.sh': 'git push origin main' };
+  const v = evaluate('cd sub && bash push.sh', { readText: (p) => dirFiles[p] ?? null, pathExists: (p) => p in dirFiles });
+  assert.equal(v.decision, 'deny');
+});
+
+test('a shell script that exists but cannot be read is denied; one that does not exist is not', () => {
+  const unreadable = { readText: () => null, pathExists: () => true };
+  assert.equal(evaluate('bash big.sh', unreadable).decision, 'deny');
+  assert.equal(evaluate('source big.sh', unreadable).decision, 'deny');
+  assert.match(evaluate('bash big.sh', unreadable).reason, /cannot read/);
+  // a program run by path may just be a binary or a huge generated file: not judged
+  assert.equal(evaluate('./tool', unreadable).decision, 'allow');
+  assert.equal(evaluate('node big.mjs', unreadable).decision, 'allow');
+  assert.equal(evaluate('bash big.sh', { readText: () => null, pathExists: () => false }).decision, 'allow');
+});
+
+test('a script whose name is only known at run time is denied only when the line mentions a guarded operation', () => {
+  assert.equal(evaluate('bash "$SCRIPT"').decision, 'allow');
+  assert.equal(evaluate('bash "$SCRIPT" && git push origin x').decision, 'deny');
+  assert.equal(evaluate('F=push.sh; bash $F', withFiles({ 'push.sh': 'git push origin main' })).decision, 'deny');
+});
+
+test('script content is judged with the same rules, including truncation and size', () => {
+  const huge = `${'true; '.repeat(600)}ls`;
+  assert.equal(evaluate('bash t.sh', withFiles({ 't.sh': huge })).decision, 'deny');
+  const big = `# ${'x'.repeat(250_000)}\ngit push origin main`;
+  assert.equal(evaluate('bash t.sh', withFiles({ 't.sh': big })).decision, 'deny');
+  assert.equal(evaluate('bash t.sh', withFiles({ 't.sh': `# ${'x'.repeat(250_000)}\nls` })).decision, 'allow');
+  assert.equal(evaluate('bash a.sh', withFiles({ 'a.sh': 'bash a.sh' })).decision, 'deny', 'a script that runs itself is cut off by the nesting limit, fail closed');
+});
+
+test('a program run by path is read: a shebang picks shell or program text; binaries and node_modules are skipped', () => {
+  const files = {
+    'go.sh': '#!/bin/sh\ngit push origin main',
+    'go.js': "#!/usr/bin/env node\nrequire('child_process').execSync('git push origin main')",
+    'plain': 'git push origin main',
+    'bin': 'MZ\u0000\u0000git push origin main',
+    'node_modules/.bin/tool': "#!/usr/bin/env node\nexecSync('git push origin main')",
+  };
+  const ev = (c) => evaluate(c, withFiles(files)).decision;
+  assert.equal(ev('./go.sh'), 'deny');
+  assert.equal(ev('./go.js'), 'deny');
+  assert.equal(ev('./plain'), 'deny');
+  assert.equal(ev('./bin'), 'allow');
+  assert.equal(ev('./node_modules/.bin/tool'), 'allow');
+  assert.equal(ev('/usr/bin/true'), 'allow');
+});
+
+test('string-running wrappers are unwrapped or scanned', () => {
+  const deny = [
+    'unbuffer git push origin main',
+    'taskset -c 0 git push origin main',
+    'sandbox-exec -f p.sb git push origin main',
+    "ssh host 'git push origin main'",
+    "script -c 'git push origin main' /dev/null",
+    'screen -dmS j git push origin main',
+    "parallel 'git push origin HEAD:{}' ::: main",
+    "wsl bash -c 'git push origin main'",
+    "npx -c 'git push origin main'",
+    "npm exec -c 'git push origin main'",
+    'pnpm exec git push origin main',
+    'bunx git push origin main',
+    "node -e \"require('child_process').execSync('git push origin main')\"",
+    "python3 -c 'import os; os.system(\"git push -f origin x\")'",
+    "perl -e 'system(\"git push --force origin x\")'",
+    "ruby -e 'system(\"gh pr merge 1 --admin\")'",
+    "osascript -e 'do shell script \"git push origin main\"'",
+    "node -e \"spawnSync('git',['push','origin','main'])\"",
+    "node -e \"x('gh pr edit 1 --add-label human-approved')\"",
+    "node -e \"x('gh pr edit 1 --remove-label needs-human')\"",
+    "node -e \"x('pipeline protect --apply')\"",
+    'make release CMD="git push origin main"',
+  ];
+  for (const c of deny) assert.equal(evaluate(c).decision, 'deny', c);
+  const allow = [
+    "ssh host 'git status'",
+    "node -e \"console.log('hi')\"",
+    "python3 -c 'print(1)'",
+    'npx vitest run -t "git push origin main is denied"',
+    'npm test -- --grep "git push origin main"',
+    'echo "git push origin main"',
+    "grep -rn 'git push origin main' docs",
+    'cat docs/guide.md',
+    'node ~/.claude/pipeline/bin/pipeline.mjs preflight',
+    'node ~/.claude/pipeline/bin/pipeline.mjs job start v -- node scripts/verify.mjs',
+    'ssh host',
+    'npm install',
+    'taskset -p 1234',
+  ];
+  for (const c of allow) assert.equal(evaluate(c, { branch: 'agent/x' }).decision, 'allow', c);
+});
+
+test('spawn: a script file in the real working directory is read by the hook', () => {
+  const dir = join(TMP, 'scripts');
+  execFileSync('mkdir', ['-p', dir]);
+  writeFileSync(join(dir, 'push.sh'), 'git push origin main\n');
+  writeFileSync(join(dir, 'ok.sh'), 'ls\n');
+  assert.ok(denied(hook(bashInput('bash push.sh', dir))));
+  assert.ok(denied(hook(bashInput('./push.sh', dir))));
+  assert.ok(denied(hook(bashInput('source push.sh', dir))));
+  assert.ok(denied(hook(bashInput('env bash push.sh', dir))));
+  assert.equal(hook(bashInput('bash ok.sh', dir)).stdout, '');
+});
+
+test('everyday flows stay allowed after the script, wrapper and destination rules', () => {
+  const commit = "git commit -m \"$(cat <<'EOF'\nfix: handle git push origin main in docs\n\nBody mentioning gh pr merge 1 --admin\nEOF\n)\"";
+  const flows = [
+    commit,
+    'git push -u origin agent/x',
+    'git push origin HEAD:agent/x',
+    'git push',
+    'node ~/.claude/pipeline/bin/pipeline.mjs preflight',
+    'node ~/.claude/pipeline/bin/pipeline.mjs merge 12',
+    'node ~/.claude/pipeline/bin/pipeline.mjs job start v -- node ~/.claude/pipeline/bin/pipeline.mjs merge 12',
+    'gh pr create --title "x" --body "never git push origin main"',
+    'gh pr comment 3 --body "gh pr merge 1 --admin is blocked"',
+    'npm test && npm run build',
+    'cat ~/.claude/settings.json',
+    'bash -c "git status && git push -u origin agent/x"',
+    'ls ~/.claude/skills',
+  ];
+  for (const c of flows) assert.equal(evaluate(c, { branch: 'agent/x' }).decision, 'allow', c);
+});

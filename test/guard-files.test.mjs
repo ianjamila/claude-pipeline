@@ -356,12 +356,12 @@ test('bash: a cwd inside a protected root only allows read-only commands', () =>
   assert.equal(bash('npm install', o), 'deny');
 });
 
-test('bash: a command line too complex to parse fully is denied when it refers to a protected path', () => {
+test('bash: a command line too complex to parse fully is denied', () => {
   const deep = `cat ~/.claude/pipeline/VERSION ${'$('.repeat(250)}x${')'.repeat(250)}`;
   assert.equal(simpleCommands(deep).truncated, true, 'the fixture must actually truncate');
   assert.equal(bash(deep), 'deny');
   const deepPlain = `cat /repo/a.txt ${'$('.repeat(250)}x${')'.repeat(250)}`;
-  assert.equal(bash(deepPlain), 'allow', 'no protected reference: truncation alone does not deny');
+  assert.equal(bash(deepPlain), 'deny', 'a truncated parse cannot prove anything harmless');
 });
 
 test('bash: a bare command with a cwd inside a protected root is denied, and a read-only one is not', () => {
@@ -779,6 +779,10 @@ test('hook: if the policy module cannot be loaded, the keyword rule decides', (t
   const risky = runHook({ tool_name: 'Edit', tool_input: { file_path: path.join(dir, '.claude', 'x.md'), old_string: 'a', new_string: 'b' } }, { home: dir, hook: lone });
   assert.equal(JSON.parse(risky.stdout).hookSpecificOutput.permissionDecision, 'deny');
   assert.match(JSON.parse(risky.stdout).hookSpecificOutput.permissionDecisionReason, /internal error/);
+  for (const command of ['env -u CLAUDECODE node x.mjs', 'PIPELINE_GH=/tmp/g node pipeline.mjs merge 1']) {
+    const sw = runHook({ tool_name: 'Bash', tool_input: { command } }, { home: dir, hook: lone });
+    assert.equal(JSON.parse(sw.stdout).hookSpecificOutput.permissionDecision, 'deny', command);
+  }
   const plain = runHook({ tool_name: 'Edit', tool_input: { file_path: path.join(dir, 'src', 'a.ts'), old_string: 'a', new_string: 'b' } }, { home: dir, hook: lone });
   assert.equal(plain.status, 0);
   assert.equal(plain.stdout, '');
@@ -793,4 +797,24 @@ test('hook: unrelated tools and shapes are allowed', (t) => {
     assert.equal(r.status, 0, JSON.stringify(input));
     assert.equal(r.stdout, '', JSON.stringify(input));
   }
+});
+
+// ---- Monitor (review finding 1) ----------------------------------------------------------------------
+
+test('hook: the Monitor tool is judged like Bash', (t) => {
+  const home = tmpHome(t);
+  const deny = runHook({ tool_name: 'Monitor', tool_input: { command: 'echo {} > ~/.claude/settings.json' }, cwd: home }, { home });
+  assert.equal(JSON.parse(deny.stdout).hookSpecificOutput.permissionDecision, 'deny');
+  const ok = runHook({ tool_name: 'Monitor', tool_input: { command: 'tail -f /tmp/x.log' }, cwd: home }, { home });
+  assert.equal(ok.stdout, '');
+});
+
+test('hook: a script file in the real working directory is read by the hook', (t) => {
+  const home = tmpHome(t);
+  fs.mkdirSync(path.join(home, 'proj'));
+  fs.writeFileSync(path.join(home, 'proj', 'w.sh'), 'echo {} > ~/.claude/settings.json\n');
+  fs.writeFileSync(path.join(home, 'proj', 'ok.sh'), 'ls\n');
+  const run = (command) => runHook({ tool_name: 'Bash', tool_input: { command }, cwd: path.join(home, 'proj') }, { home });
+  for (const c of ['bash w.sh', './w.sh', 'source w.sh', 'env bash w.sh']) assert.equal(JSON.parse(run(c).stdout).hookSpecificOutput.permissionDecision, 'deny', c);
+  assert.equal(run('bash ok.sh').stdout, '');
 });

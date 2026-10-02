@@ -3,22 +3,28 @@
 // pipeline files (skills, agents, ~/.claude/pipeline, ~/.claude/settings.json), delete or overwrite the dirs
 // that hold them (~/.claude, ~/.claude/skills, ~/.claude/agents), switch hooks off (`disableAllHooks`) or set
 // the admin switch (`PIPELINE_ADMIN`). Only a Claude Code process launched with PIPELINE_ADMIN=1 bypasses it.
-// Bash is judged on text, so the checks lean towards denying (`echo ~/.claude/pipeline` is denied); the hook
+// Bash is judged on text, so the checks lean towards denying (`rm ~/.claude/pipeline`, `cp x ~/.claude/pipeline`); echo/printf are
+// read-only (their redirects are still judged) and the value of a message flag (git -m, gh --body, a test runner's -t) is prose; the hook
 // stops accidents and casual circumvention, not an adversary who builds the path out of pieces at run time.
 //
 // RESIDUALS (known, documented, not closed): names that only exist at run time defeat a text scan.
 //  - `export $(echo PIPELINE_ADMIN)=1`, a name assembled by a command substitution (a plain `N=PIPELINE_ADMIN; export $N=1` IS caught).
 //  - printf-assembled keys such as `printf '{"disable%sHooks":true}' All > .claude/settings.local.json` (and settings.local.json
 //    is not a protected file in any case).
-//  - an installer whose name is built at run time (`sh "inst""all.sh"`, `$(echo install).sh`).
-// Backstop for installer runs: the installer itself refuses to run inside a Claude Code process (CLAUDECODE set).
+//  - an installer whose name is built at run time (`$(echo install).sh`, a glob such as `ins*.mjs`); quote-split spellings (`ins""tall.mjs`) ARE caught.
+// Backstop for installer runs: the installer itself refuses to run inside a Claude Code process (CLAUDECODE set, or a Claude Code
+// ancestor process); commands that unset or override CLAUDECODE are denied here.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
-import { simpleCommands, commandName } from './shell-parse.mjs';
+import { simpleCommands, commandName, scriptFileOf } from './shell-parse.mjs';
 
 const posix = path.posix;
+const MAX_SCRIPT_BYTES = 1_000_000;
+const MAX_LINE_CHARS = 200_000; // a longer command line is not parsed (the hook has a 15 s budget)
+// What an unparsed or truncated line is judged by: any word that names a protected file, a switch or an installer.
+const SENSITIVE_WORDS = /\.claude|PIPELINE_ADMIN|disableAllHooks|CLAUDECODE|install\.|\bprotect\b/i;
 
 // ---- the protected set ------------------------------------------------------------------------
 
@@ -115,6 +121,28 @@ function readLinkIfAny(p) {
   return st?.isSymbolicLink() ? fs.readlinkSync(p) : null;
 }
 
+// macOS spells every path on the boot volume a second way: /System/Volumes/Data/Users/u == /Users/u (a firmlink, not a
+// symlink, so realpath keeps the prefix).
+const FIRMLINK = /\/System\/Volumes\/Data(?=\/|$)/gi;
+
+function realStatId(p) {
+  try {
+    const st = fs.statSync(p);
+    return st.ino ? `${st.dev}:${st.ino}` : null; // an fs that reports no inode (ino 0) cannot be compared
+  } catch {
+    return null;
+  }
+}
+
+function defaultReadText(file) {
+  try {
+    const st = fs.statSync(file);
+    return st.isFile() && st.size <= MAX_SCRIPT_BYTES ? fs.readFileSync(file, 'utf8') : null;
+  } catch {
+    return null;
+  }
+}
+
 function makeCtx(opts) {
   const platform = opts.platform ?? process.platform;
   const homeNative = opts.home || os.homedir();
@@ -126,21 +154,43 @@ function makeCtx(opts) {
     realpath: opts.realpath ?? fs.realpathSync.native,
     existsSync: opts.existsSync ?? fs.existsSync,
     readlink: opts.readlink ?? (opts.existsSync ? () => null : readLinkIfAny),
+    // dev:ino of a path (null when missing); a caller that fakes the filesystem gets no inode comparison
+    statId: opts.statId ?? (opts.existsSync || platform === 'win32' ? () => null : realStatId),
   };
+  const darwin = platform === 'darwin';
+  const unFirm = (p) => (darwin ? p.replace(FIRMLINK, '') : p);
   const base = homePosix === '/' ? '' : homePosix;
   const lexRoots = protectedRoots(homePosix);
   const lexAncestors = ANCESTOR_REL.map((r) => `${base}/${r}`);
   const roots = unique([...withWindowsAliases(lexRoots, homePosix, platform), ...lexRoots.map((r) => realResolve(r, api))]);
   const ancestors = unique([...withWindowsAliases(lexAncestors, homePosix, platform), ...lexAncestors.map((r) => realResolve(r, api))]);
   const ci = caseInsensitive(platform);
+  let rootIds = null;
   return {
     platform, homeNative, homePosix, cwd, api, roots, lexRoots, ancestors, lexAncestors, ci,
     user: opts.user ?? posix.basename(homePosix),
     vars: {}, // same-line shell assignments (D=$HOME/.claude), filled in once the line is parsed
     dynamic: false, // set when a scan had to be skipped for size; callers fail closed
+    readText: opts.readText ?? defaultReadText,
     admin: (opts.env ?? process.env).PIPELINE_ADMIN === '1',
-    hit: (p) => roots.some((r) => isInside(p, r, platform)),
-    hitAncestor: (p) => ancestors.some((a) => samePath(p, a, platform)),
+    hit: (p) => { const q = unFirm(p); return roots.some((r) => isInside(q, r, platform)); },
+    hitAncestor: (p) => { const q = unFirm(p); return ancestors.some((a) => samePath(q, a, platform)); },
+    unFirm,
+    // Is `p`, or the nearest existing directory above it, the very same file or directory (same device and inode) as a
+    // protected root? Catches hard links and any other spelling of the path that realpath does not unify.
+    hitInode: (p) => {
+      if (rootIds === null) rootIds = new Set(roots.map((r) => api.statId(r)).filter(Boolean));
+      if (rootIds.size === 0) return false;
+      let cur = p;
+      for (let i = 0; i < 64; i++) {
+        const id = api.statId(cur);
+        if (id !== null && rootIds.has(id)) return true;
+        const parent = posix.dirname(cur);
+        if (parent === cur) return false;
+        cur = parent;
+      }
+      return false;
+    },
   };
 }
 
@@ -185,7 +235,7 @@ const SETTINGS_RE = /^settings(\.[\w-]+)?\.json$/i;
 function lexicalTarget(target, ctx) {
   let s = toPosix(expandHome(target, ctx.homeNative)).replace(DEVICE_PREFIX, '');
   if (!isAbs(s)) s = posix.join(ctx.cwd, s);
-  s = posix.normalize(s);
+  s = ctx.unFirm(posix.normalize(s));
   return s.length > 1 && s.endsWith('/') ? s.slice(0, -1) : s;
 }
 
@@ -245,7 +295,7 @@ function evaluateMcp(tool, ti, input, opts) {
   // 1. a file write: the path keys name the targets (an exact ancestor dir counts too)
   const targets = writeVerb ? f.paths.map((t) => ({ t, candidates: resolve(t) })) : [];
   for (const { t, candidates } of targets) {
-    if (candidates.some((c) => ctx.hit(c) || ctx.hitAncestor(c))) return deny(`${t} is a protected pipeline file or the directory that holds it (${PROTECTED_MSG})`);
+    if (candidates.some((c) => ctx.hit(c) || ctx.hitAncestor(c) || ctx.hitInode(c))) return deny(`${t} is a protected pipeline file or the directory that holds it (${PROTECTED_MSG})`);
   }
   if (targets.length) {
     const texts = f.contents.flatMap(variantsOf);
@@ -292,7 +342,7 @@ export function evaluateFileTool(input, opts = {}) {
     return { t, candidates: unique([lexical, realResolve(lexical, ctx.api)]) };
   });
   for (const { t, candidates } of resolved) {
-    if (candidates.some((c) => ctx.hit(c))) return deny(`${t} is a protected pipeline file (${PROTECTED_MSG})`);
+    if (candidates.some((c) => ctx.hit(c) || ctx.hitInode(c))) return deny(`${t} is a protected pipeline file (${PROTECTED_MSG})`);
   }
   if (texts.some(hasDisableAll)) {
     for (const { t, candidates } of resolved) {
@@ -362,7 +412,7 @@ function substVars(text, vars) {
 // Slash-normalised copy of `text` with the user name, same-line variables and every home spelling replaced.
 function expandRefs(text, ctx) {
   const t = toPosix(text).replace(USER_RE, ctx.user);
-  return expandHomeRefs(substVars(t, ctx.vars), ctx.homePosix);
+  return ctx.unFirm(expandHomeRefs(substVars(t, ctx.vars), ctx.homePosix));
 }
 
 // Expands the first `{a,b}` groups of each word so `~/.claude/{pipeline,settings.json}` shows both paths.
@@ -426,6 +476,28 @@ function suffixRegexes(ci) {
   };
 }
 
+// One path segment of a glob as a regexp (`*` and `?` stay inside the segment); null when it cannot be compiled.
+function segmentRe(seg, ci) {
+  const re = globToRe(seg.replace(/\*\*/g, '*'), ci);
+  return re;
+}
+
+// Could glob `g` (an absolute, normalised path with wildcards) match `root` or something inside it? Segment by segment:
+// the first root.length segments of the glob must match the root's, and anything may follow. `**` matches any depth.
+function globReaches(g, root, ci) {
+  const gs = g.split('/');
+  const rs = root.split('/');
+  for (let i = 0; i < rs.length; i++) {
+    if (i >= gs.length) return false; // shorter than the root: it can only match a directory above it (checked separately)
+    if (gs[i] === '**') return true;
+    if (gs[i] === rs[i]) continue;
+    if (!/[*?[]/.test(gs[i])) { if (ci ? gs[i].toLowerCase() !== rs[i].toLowerCase() : true) return false; continue; }
+    const re = segmentRe(gs[i], ci);
+    if (!re || !re.test(rs[i])) return false;
+  }
+  return true;
+}
+
 function globToRe(g, ci) {
   let re = '';
   for (let i = 0; i < g.length; i++) {
@@ -481,6 +553,9 @@ function makeMatchers(ctx) {
     const star = g.search(/[*?[]/);
     const lit = g.slice(0, g.lastIndexOf('/', star) + 1) || '/';
     if (ctx.hit(lit)) return true;
+    // a glob that can match a protected root or anything inside one (~/.claude/skills/*/SKILL.md, ~/.c*/pipeline/x) ...
+    if (ctx.roots.some((r) => globReaches(g, r, ctx.ci))) return true;
+    // ... or a directory that holds them (~/.cla*, ~/.claude/*)
     const re = globToRe(g, ctx.ci);
     return !!re && ancestors.some((a) => re.test(a));
   };
@@ -510,7 +585,7 @@ function makeMatchers(ctx) {
 
 // ---- Bash: command classification -----------------------------------------------------------------
 
-const READ_ONLY = new Set(['cat', 'head', 'tail', 'less', 'more', 'ls', 'stat', 'wc', 'grep', 'rg', 'diff', 'cmp', 'shasum', 'sha256sum', 'sha1sum', 'md5', 'md5sum', 'file', 'readlink', 'realpath', 'test', '[', 'cut', 'du', 'hexdump', 'bat']);
+const READ_ONLY = new Set(['echo', 'printf', 'cat', 'head', 'tail', 'less', 'more', 'ls', 'stat', 'wc', 'grep', 'rg', 'diff', 'cmp', 'shasum', 'sha256sum', 'sha1sum', 'md5', 'md5sum', 'file', 'readlink', 'realpath', 'test', '[', 'cut', 'du', 'hexdump', 'bat']);
 const PS_READ_ONLY = new Set(['get-content', 'get-childitem', 'gc', 'gci']);
 const GIT_READ_ONLY = new Set(['log', 'show', 'diff', 'status', 'ls-files', 'blame']);
 const CD_CMDS = new Set(['cd', 'pushd', 'popd', 'set-location', 'sl']);
@@ -652,22 +727,95 @@ function collectVars(cmds, ctx) {
 // Directories the command line may be operating in: the hook's cwd plus every `cd` target (chained ones too).
 function collectDirs(cmds, ctx) {
   const dirs = [ctx.cwd];
+  const addDir = (e) => {
+    for (const d of [...dirs]) {
+      const nd = isAbs(e) ? posix.normalize(e) : posix.join(d, e);
+      if (!dirs.includes(nd) && dirs.length < 32) dirs.push(nd);
+    }
+  };
   for (const c of cmds) {
-    if (!CD_CMDS.has(baseOf(c.argv[0] ?? ''))) continue;
+    // commands that run relative to another directory: git -C DIR, tar -C DIR, unzip -d DIR, make -C DIR, cp -t DIR
+    for (const b of baseDirsOf(c.argv)) addDir(expandRefs(b, ctx));
+    const cdName = baseOf(c.argv[0] ?? '');
+    if (!CD_CMDS.has(cdName)) continue;
     let t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
+    if (!t && (cdName === 'cd' || cdName === 'pushd')) t = '~'; // a bare `cd` goes home
     if (c.raw.includes('\\')) {
       const m = /^\s*(?:cd|pushd|set-location|sl)\s+(?:\/d\s+)?["']?([^"';&|\n]+)/i.exec(c.raw);
       if (m) t = m[1].trim();
     }
     if (!t) continue;
-    const e = expandRefs(t, ctx);
-    for (const d of [...dirs]) {
-      const nd = isAbs(e) ? posix.normalize(e) : posix.join(d, e);
-      if (!dirs.includes(nd) && dirs.length < 32) dirs.push(nd);
-    }
+    addDir(expandRefs(t, ctx));
   }
   return dirs;
 }
+
+// The directory words of commands whose other arguments are read relative to them.
+function baseDirsOf(argv) {
+  const name = baseOf(argv[0] ?? '');
+  const args = argv.slice(1);
+  const out = [];
+  const flagValue = (short, long) => {
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (a === '--') break;
+      if (a === `-${short}` || a === `--${long}`) { if (args[i + 1] !== undefined) out.push(args[i + 1]); i++; }
+      else if (a.startsWith(`--${long}=`)) out.push(a.slice(long.length + 3));
+      else if (!a.startsWith('--') && a.startsWith(`-${short}`) && a.length > 2) out.push(a.slice(a[2] === '=' ? 3 : 2));
+    }
+  };
+  if (name === 'git') {
+    for (let i = 0; i < args.length && args[i].startsWith('-'); i++) {
+      if (args[i] === '-C' && args[i + 1] !== undefined) { out.push(args[i + 1]); i++; } else if (args[i] === '-c' || args[i] === '--git-dir' || args[i] === '--work-tree') i++;
+    }
+  } else if (name === 'tar' || name === 'bsdtar' || name === 'gtar') flagValue('C', 'directory');
+  else if (name === 'unzip') flagValue('d', 'directory');
+  else if (name === 'make' || name === 'gmake') flagValue('C', 'directory');
+  else if (name === 'cp' || name === 'mv' || name === 'install' || name === 'ln') flagValue('t', 'target-directory');
+  else if (name === 'rsync') { const pos = args.filter((a) => !a.startsWith('-')); if (pos.length >= 2) out.push(pos[pos.length - 1]); }
+  return out;
+}
+
+// ---- prose flags -------------------------------------------------------------------------------------
+
+// A commit message, PR body or test name that quotes a protected path is prose, not a reference. Only for the tools
+// that take such flags: `-t` is a message-ish pattern for a test runner but a directory for cp / mv / install / tar.
+const PROSE_FLAGS = {
+  git: { short: 'm', long: ['message', 'grep'] },
+  gh: { short: 'bt', long: ['body', 'title', 'notes', 'message', 'description'] },
+};
+const TEST_RUNNERS = new Set(['vitest', 'jest', 'mocha', 'pytest', 'ava', 'tap', 'playwright', 'cypress', 'npm', 'pnpm', 'yarn', 'bun', 'node', 'deno']);
+const TEST_FLAGS = { short: 't', long: ['grep', 'testNamePattern', 'test-name-pattern', 'title'] };
+
+// The words of `argv` that are the value of a prose flag: { values: [text], drop: Set(index of words to ignore) }.
+function proseWords(argv) {
+  const name = baseOf(argv[0] ?? '');
+  const spec = PROSE_FLAGS[name] ?? (TEST_RUNNERS.has(name) ? TEST_FLAGS : null);
+  const out = { values: [], drop: new Set() };
+  if (!spec) return out;
+  const isShort = (a) => a.length >= 2 && a[0] === '-' && a[1] !== '-' && spec.short.includes(a[1]);
+  for (let i = 1; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--') { if (spec === TEST_FLAGS) continue; break; } // after `--` a test runner still takes its own flags; for git it is paths
+    if (a.startsWith('--')) {
+      const eq = a.indexOf('=');
+      const flag = a.slice(2, eq < 0 ? undefined : eq);
+      if (!spec.long.includes(flag)) continue;
+      if (eq >= 0) { out.values.push(a.slice(eq + 1)); out.drop.add(i); } else if (argv[i + 1] !== undefined) { out.values.push(argv[i + 1]); out.drop.add(i + 1); i++; }
+    } else if (isShort(a)) {
+      // -m TEXT, -mTEXT, and a cluster ending in the flag (-am TEXT)
+      const k = [...a.slice(1)].findIndex((ch) => spec.short.includes(ch));
+      const rest = a.slice(k + 2);
+      if (rest) { out.values.push(rest.replace(/^=/, '')); out.drop.add(i); } else if (argv[i + 1] !== undefined) { out.values.push(argv[i + 1]); out.drop.add(i + 1); i++; }
+    } else if (/^-[A-Za-z]+$/.test(a) && name === 'git') {
+      // a cluster like -am: the message flag is its last letter
+      if (a.endsWith('m') && argv[i + 1] !== undefined) { out.values.push(argv[i + 1]); out.drop.add(i + 1); i++; }
+    }
+  }
+  return out;
+}
+
+const maskProse = (text, values) => values.reduce((t, v) => (v.length >= 2 ? t.split(v).join(' ') : t), String(text));
 
 // ---- Bash: rule 3 and 4 helpers ------------------------------------------------------------------
 
@@ -718,6 +866,9 @@ function scriptsReferenceInstaller(name, scripts, depth, seen) {
   return false;
 }
 
+// `ins""tall.mjs`, `'install'.mjs`, `inst\all.sh`: the shell reads them all as install.mjs, so look at the unquoted spelling too.
+const namesInstaller = (t) => INSTALLER_WORD.test(` ${t}`) || INSTALLER_WORD.test(` ${t.replace(/['"`\\]/g, '')}`);
+
 function findInstaller(cmds, raw, dirs, ctx, opts) {
   const text = expandRefs(raw, ctx);
   const msg = (what) => `${what} installs the pipeline into ~/.claude; only the owner may run it, from a terminal or with PIPELINE_ADMIN=1 (node install.mjs --check and reading the file are allowed)`;
@@ -743,11 +894,11 @@ function findInstaller(cmds, raw, dirs, ctx, opts) {
     }
   }
 
-  if (!INSTALLER_WORD.test(text) && !INSTALLER_WORD.test(` ${text}`)) return null;
+  if (!namesInstaller(text) && !namesInstaller(raw)) return null;
   // is the cwd (or a cd target) inside a checkout, or does a named installer path resolve into one?
   let inCheckout = roots.length > 0;
   if (!inCheckout) {
-    for (const m of (` ${text}`).matchAll(INSTALLER_PATH)) {
+    for (const m of (` ${text.replace(/['"`\\]/g, '')}`).matchAll(INSTALLER_PATH)) {
       const p = m[1] ?? '';
       const bases = isAbs(p) ? [''] : dirs;
       for (const d of bases) if (checkoutRootOf(isAbs(p) ? posix.normalize(p || '/') : posix.join(d, p || '.'), ctx)) inCheckout = true;
@@ -755,7 +906,7 @@ function findInstaller(cmds, raw, dirs, ctx, opts) {
   }
   if (!inCheckout) return null;
   if (cmds.truncated || cmds.dynamic) return msg('a command line too complex to check that names the installer, which');
-  const naming = cmds.filter((c) => INSTALLER_WORD.test(` ${expandRefs(c.raw, ctx)}`));
+  const naming = cmds.filter((c) => namesInstaller(expandRefs(c.raw, ctx)) || namesInstaller(c.raw));
   const unsafe = naming.find((c) => !installerNamingIsSafe(c));
   if (unsafe) return msg(`${unsafe.argv.length ? baseOf(unsafe.argv[0]) : 'a command'} naming the installer`);
   if (!naming.length) return msg('a command naming the installer'); // inside a heredoc or program text the parser cut up
@@ -788,6 +939,124 @@ function jobInner(cmd) {
   return inner.length ? inner.map(shellQuote).join(' ') : null;
 }
 
+// ---- script files ------------------------------------------------------------------------------------
+
+const SHEBANG_PROGRAM = /^#!\s*(?:\S*\/)?(?:env\s+(?:-\S+\s+)*)?(\S+)/;
+const INTERP_PROGRAM = /^(?:node|nodejs|deno|bun|tsx|ts-node|python[\d.]*|ruby|perl|php)$/;
+// Program text that names a protected path next to something that writes, moves or deletes.
+const WRITE_HINT = /write|append|unlink|\brm\b|rmSync|rmdir|rename|copy|\bcp\b|\bmv\b|\bln\b|mkdir|truncate|symlink|chmod|open\s*\(|>>?\s*['"\w$~/.]|\btee\b|shutil|os\.remove|move|dump|save|replace|\bsed\b|install/i;
+
+// `bash f.sh`, `source f`, `./f`, `node f.mjs`, `python f.py`: the file is read (up to 1 MB) and judged like the same text
+// typed on the line. A shell script that exists but cannot be read is denied; a missing file runs nothing; a
+// program run by path, an interpreter file that cannot be read, a node_modules package and the pipeline's own
+// installed files are not judged (the installed CLI legitimately names its own settings).
+function judgeScriptFile(sf, dirs, ctx, opts) {
+  const e = expandRefs(sf.file, ctx);
+  if (/[$`]/.test(e)) return null; // named at run time: the textual rules on the whole line still apply
+  const found = [];
+  for (const d of isAbs(e) ? [''] : dirs) {
+    const abs = isAbs(e) ? posix.normalize(e) : posix.join(d, e);
+    let exists = false;
+    try { exists = ctx.api.existsSync(abs); } catch { /* treated as missing */ }
+    if (exists) { found.push({ abs, dir: d || ctx.cwd }); break; }
+  }
+  if (!found.length) return null;
+  const { abs, dir } = found[0];
+  if (ctx.hit(abs) || ctx.hit(realResolve(abs, ctx.api)) || /\/node_modules\//.test(abs)) return null;
+  const text = ctx.readText(abs);
+  if (typeof text !== 'string') {
+    return sf.kind === 'shell' ? deny(`cannot read the script ${sf.file} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified`) : null;
+  }
+  let kind = sf.kind;
+  if (kind === 'exec') {
+    if (text.slice(0, 4096).includes('\u0000')) return null; // a binary
+    kind = INTERP_PROGRAM.test((SHEBANG_PROGRAM.exec(text)?.[1] ?? '').split('/').pop()) ? 'interp' : 'shell';
+  }
+  if (kind === 'shell') {
+    const r = evaluateBashForFiles(text, { ...opts, cwd: dir, _depth: (opts._depth ?? 0) + 1 });
+    return r.decision === 'deny' ? deny(`the script ${sf.file} would run: ${r.reason}`) : null;
+  }
+  // program text in another language: the admin switch, the hook switch, or a write next to a protected path
+  if (variantsOf(text).some((t) => setsAdmin(t, ctx.platform) || hasDisableAll(t))) return deny(`the program ${sf.file} sets PIPELINE_ADMIN or mentions disableAllHooks; only the owner may switch the pipeline guard off`);
+  const m = makeMatchers(ctx);
+  if (text.length <= MAX_SCRIPT_BYTES && m.rawHit(text, [dir]) && WRITE_HINT.test(text)) return deny(`the program ${sf.file} refers to a protected pipeline file and writes (${PROTECTED_MSG})`);
+  return null;
+}
+
+// ---- environment: CLAUDECODE and the test seams ---------------------------------------------------------
+
+const ASSIGNERS = new Set(['export', 'declare', 'typeset', 'readonly', 'set', 'setx', 'setenv']);
+const PS_ENV_CHANGERS = /^(?:remove-item|ri|rm|del|erase|set-item|si|clear-item|ci|new-item|ni|set-content|sc|remove-variable)$/;
+const CLAUDECODE_UNSET = [
+  /(?:^|[\s;&|(])env\s+(?:-\S+\s+)*?(?:-[A-Za-z]*u\s*|--unset[=\s]\s*)CLAUDECODE\b/i,
+  /(?:^|[\s;&|(])env\s+(?:-\S+\s+)*?(?:-[A-Za-z]*i[A-Za-z]*|--ignore-environment|-)(?=\s|$)/,
+  /\bunset\b[^;&|\n]*\bCLAUDECODE\b/i,
+  /\bSetEnvironmentVariable\s*\(\s*CLAUDECODE\b/i,
+  /\b(?:Remove-Item|ri|Remove-Variable)\b[^;&|\n]*\benv:\\?CLAUDECODE\b/i,
+  /delete\s+process\.env\.CLAUDECODE\b|process\.env\.CLAUDECODE\s*=(?!=)|environ\.pop\(\s*CLAUDECODE\b|del\s+os\.environ\[\s*CLAUDECODE\s*\]|\bputenv\(\s*CLAUDECODE\b|ENV\.delete\(\s*CLAUDECODE\b/i,
+];
+
+// The installer's backstop is CLAUDECODE=1 (and a Claude Code ancestor process); a command that unsets or overrides it
+// first would defeat the backstop, so it is refused outright.
+function changesClaudeCode(cmds, scanRaw) {
+  for (const c of cmds) {
+    if (Object.keys(c.env ?? {}).some((k) => k.toUpperCase() === 'CLAUDECODE')) return true;
+    const name = baseOf(c.argv[0] ?? '');
+    if ((ASSIGNERS.has(name) || name === 'unset') && c.argv.slice(1).some((a) => /^CLAUDECODE(?:=|$)/i.test(a))) return true;
+    if (PS_ENV_CHANGERS.test(name) && c.argv.some((a) => /^env:\\?CLAUDECODE$/i.test(a))) return true;
+  }
+  const flat = scanRaw.replace(/['"`\\]/g, '');
+  return CLAUDECODE_UNSET.some((re) => re.test(flat));
+}
+
+// Test seams that swap the real gh / codex / vercel for a fake, or lift the model pins: handing one to the pipeline CLI
+// would let a fake satisfy the merge gate. (The installed CLI also ignores them; this is the hook side.)
+const SEAM_VARS = /^PIPELINE_(?:GH|CODEX|VERCEL|TEST_MODE)$/i;
+const RUNTIMES = new Set(['node', 'nodejs', 'bun', 'deno', 'npx', 'tsx']);
+
+function setsSeamForPipeline(cmds) {
+  const seam = cmds.some((c) => Object.keys(c.env ?? {}).some((k) => SEAM_VARS.test(k))
+    || (ASSIGNERS.has(baseOf(c.argv[0] ?? '')) && c.argv.slice(1).some((a) => SEAM_VARS.test(a.split('=')[0]))));
+  if (!seam) return false;
+  return cmds.some((c) => {
+    const name = baseOf(c.argv[0] ?? '');
+    return PIPELINE_BIN_NAMES.has(name) || (RUNTIMES.has(name) && c.argv.slice(1, 8).some((a) => PIPELINE_BIN_NAMES.has(baseOf(a))));
+  });
+}
+
+// `ln -s ~ /tmp/h`: a second name for home (or a protected root, or a directory above one) lets later commands reach
+// the protected files through a path that names none of them. Judged by what is LINKED TO, never by the link name.
+function linkTargets(argv) {
+  const pos = [];
+  let dirMode = false;
+  for (let i = 1; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--') { pos.push(...argv.slice(i + 1)); break; }
+    if (a === '-t' || a === '--target-directory') { dirMode = true; i++; continue; }
+    if (a.startsWith('--target-directory=') || (/^-t./.test(a) && !a.startsWith('--'))) { dirMode = true; continue; }
+    if (a.length > 1 && a.startsWith('-')) continue;
+    pos.push(a);
+  }
+  return dirMode || pos.length < 2 ? pos : pos.slice(0, -1);
+}
+
+function linkReachesProtected(cmds, dirs, ctx) {
+  for (const c of cmds) {
+    if (baseOf(c.argv[0] ?? '') !== 'ln') continue;
+    for (const t of linkTargets(c.argv)) {
+      const e = expandRefs(t, ctx);
+      if (/[*?[]/.test(e)) continue; // a glob target is judged by the glob rules
+      for (const d of isAbs(e) ? [''] : dirs) {
+        const full = posix.normalize(isAbs(e) ? e : posix.join(d, e));
+        for (const p of unique([full, realResolve(full, ctx.api)])) {
+          if (ctx.hit(p) || ctx.hitAncestor(p) || ctx.roots.some((r) => isInside(r, p, ctx.platform))) return t;
+        }
+      }
+    }
+  }
+  return null;
+}
+
 // ---- Bash --------------------------------------------------------------------------------------------
 
 export function evaluateBashForFiles(command, opts = {}) {
@@ -795,6 +1064,10 @@ export function evaluateBashForFiles(command, opts = {}) {
   if (ctx.admin) return allow();
   const raw = typeof command === 'string' ? command : '';
   if (!raw.trim()) return allow();
+  if (raw.length > MAX_LINE_CHARS) {
+    // too long to scan in the time budget: judged by what it mentions once quotes and escapes are removed
+    return SENSITIVE_WORDS.test(raw.replace(/['"`\\]/g, '')) ? deny('the command line is too long to check and mentions a protected pipeline file or switch; split it into simpler commands') : allow();
+  }
 
   // 1 and 2: the admin switch and the hook switch, however the words are quoted or escaped
   const flat = raw.replace(/['"`]\s*\+\s*['"`]/g, '').replace(/['"`\\]/g, ''); // 'PIPELINE_'+'ADMIN' reads as one word
@@ -802,11 +1075,22 @@ export function evaluateBashForFiles(command, opts = {}) {
   if (hasDisableAll(raw) || hasDisableAll(flat)) return deny('the command mentions disableAllHooks, which would switch the pipeline hooks off');
 
   const cmds = simpleCommands(raw);
+  // Truncated means part of the line was never looked at, so nothing on it can be called harmless (500 `true;` then
+  // `e''cho x > ~/.cl""aude/settings.json` must not slip through on a text match).
+  if (cmds.truncated) return deny('the command line is too complex to check (the parser gave up); split it into simpler commands');
+  // prose flags: what a commit message, PR body or test name says is not a reference (the values come out of every scan)
+  const prose = new Map(cmds.map((c) => [c, proseWords(c.argv)]));
+  const proseValues = [...prose.values()].flatMap((p) => p.values);
+  const scanRaw = proseValues.length ? maskProse(raw, proseValues) : raw;
+  const rawOfCmd = (c) => maskProse(c.raw, prose.get(c).values);
+  const wordsOf = (c) => { const d = prose.get(c).drop; return d.size ? c.argv.filter((_, i) => !d.has(i)) : c.argv; };
   for (const c of cmds) {
     const words = [c.argv.join(' '), ...Object.entries(c.env).map(([k, v]) => `${k}=${v}`)].join(' ');
     if (setsAdmin(words, ctx.platform)) return deny('the command sets PIPELINE_ADMIN; only the owner may set it, when launching Claude Code');
     if (hasDisableAll(words)) return deny('the command mentions disableAllHooks, which would switch the pipeline hooks off');
   }
+  if (changesClaudeCode(cmds, scanRaw)) return deny('the command unsets or overrides CLAUDECODE, the marker the installer uses to refuse to run inside Claude Code; only the owner may change it, from a terminal');
+  if (setsSeamForPipeline(cmds)) return deny('the command sets a pipeline test seam (PIPELINE_GH, PIPELINE_CODEX, PIPELINE_VERCEL, PIPELINE_TEST_MODE) for the pipeline CLI; a fake gh/codex/vercel could satisfy the merge gate, so only the owner does that, from a terminal');
   ctx.vars = collectVars(cmds, ctx);
   // a name held in a variable (N=PIPELINE_ADMIN; env $N=1 claude)
   if (Object.keys(ctx.vars).length && setsAdmin(substVars(flat, ctx.vars), ctx.platform)) return deny('the command sets PIPELINE_ADMIN through a variable; only the owner may set it, when launching Claude Code');
@@ -827,13 +1111,27 @@ export function evaluateBashForFiles(command, opts = {}) {
     }
   }
 
+  // 8: links to home, to a protected root or to a directory above one
+  const linked = linkReachesProtected(cmds, dirs, ctx);
+  if (linked) return deny(`ln links to ${linked}, which is (or holds) protected pipeline files; a link would let later commands reach them under another name (${PROTECTED_MSG})`);
+
+  // 7: a script file (bash f.sh, source f, ./f, node f.mjs) runs whatever is in it
+  if ((opts._depth ?? 0) < 4) {
+    for (const c of cmds) {
+      const sf = scriptFileOf(c.argv);
+      if (!sf) continue;
+      const v = judgeScriptFile(sf, dirs, ctx, opts);
+      if (v) return v;
+    }
+  } else if (cmds.some((c) => scriptFileOf(c.argv))) return deny('scripts run scripts too deeply to check');
+
   // 5: protected-path references must be read-only
   const m = makeMatchers(ctx);
   const totalWords = cmds.reduce((n, c) => n + c.argv.length, 0);
   const tooMany = totalWords > 5000; // per-token scans are skipped; the raw-text scans still run
   if (tooMany) ctx.dynamic = true;
   const insideRoot = dirs.some((d) => ctx.hit(d) || ctx.hitAncestor(d)); // cwd or a `cd` target is a protected dir (or its parent): relative words and bare commands reach it
-  const protectedInRaw = m.rawHit(raw, dirs);
+  const protectedInRaw = m.rawHit(scanRaw, dirs);
 
   // Output redirections write wherever they point, whatever the command: resolve every target (against the cwd and
   // every cd target, with ~ and variables expanded) and deny on a protected one. A symlink already pointing into
@@ -844,28 +1142,28 @@ export function evaluateBashForFiles(command, opts = {}) {
       const target = r.target;
       const e = expandRefs(target, ctx);
       const abs = isAbs(e) ? [posix.normalize(e)] : dirs.map((d) => posix.join(d, e));
-      const viaLink = abs.some((p) => !/[*?[]/.test(p) && ctx.hit(realResolve(p, ctx.api)));
+      const viaLink = abs.some((p) => !/[*?[]/.test(p) && (ctx.hit(realResolve(p, ctx.api)) || ctx.hitInode(p)));
       if (m.rawHit(target, dirs) || m.pathHit(target, dirs, true) || viaLink) return deny(`the command redirects output to ${target}, which is a protected pipeline file or the directory that holds it (${PROTECTED_MSG})`);
     }
   }
 
   // A scan that was cut short (parse caps, dynamic commands, sizes) cannot prove a command harmless: fail closed
   // when the raw text names a protected file at all.
-  if ((cmds.truncated || cmds.dynamic || ctx.dynamic) && protectedInRaw) return deny('the command line is too complex or too dynamic to check and refers to a protected pipeline file');
+  if ((cmds.dynamic || ctx.dynamic) && protectedInRaw) return deny('the command line is too complex or too dynamic to check and refers to a protected pipeline file');
 
-  const winAncestor = (c) => c.raw.includes('\\') && m.ancestorRaw(c.raw);
+  const winAncestor = (c) => c.raw.includes('\\') && m.ancestorRaw(rawOfCmd(c));
   const tokenHit = (t) => m.rawHit(t, dirs) || m.pathHit(t, dirs, true);
   // does the command name a protected file anywhere (source or destination)?
   const names = (c) => insideRoot
-    || m.rawHit(c.raw, dirs) || winAncestor(c)
+    || m.rawHit(rawOfCmd(c), dirs) || winAncestor(c)
     || Object.values(c.env).some((v) => m.rawHit(v, dirs))
-    || (!tooMany && c.argv.some(tokenHit));
+    || (!tooMany && wordsOf(c).some(tokenHit));
   // does it WRITE one? cp / rsync / install only write their destination
   const mentions = (c) => {
     const name = baseOf(c.argv[0] ?? '');
     if (insideRoot) return true;
-    if (DEST_ONLY.has(name)) return destsOf(c.argv, name).some(tokenHit);
-    return names(c) || (MOVERS.has(name) && destsOf(c.argv, name).some(tokenHit));
+    if (DEST_ONLY.has(name)) return destsOf(wordsOf(c), name).some(tokenHit);
+    return names(c) || (MOVERS.has(name) && destsOf(wordsOf(c), name).some(tokenHit));
   };
   const mentioning = cmds.filter(mentions);
   // A reference no single command names lives in a heredoc body or in program text the shell parser cut into

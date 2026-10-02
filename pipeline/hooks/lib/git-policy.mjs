@@ -14,7 +14,8 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { commandName, simpleCommands, splitArgs } from './shell-parse.mjs';
+import { commandName, simpleCommands, splitArgs, scriptFileOf } from './shell-parse.mjs';
+import { catchAllReason, guardedCommandText } from './guarded-text.mjs';
 
 const PROTECTED_BRANCHES = ['main', 'master'];
 const APPROVAL_LABELS = ['human-approved', 'test-change-approved'];
@@ -23,6 +24,7 @@ const HOLD_LABELS = ['pipeline-pause', 'pipeline-rollback'];
 const ALL_LABELS = [...APPROVAL_LABELS, ...GUARD_LABELS];
 const MAX_NESTING = 5;
 const MAX_INPUT_BYTES = 1_000_000;
+const MAX_LINE_CHARS = 200_000; // a longer command line is not parsed (the hook has a 15 s budget)
 const OWNER_ONLY = 'This is reserved for the repository owner.';
 
 // The only graphql mutations an agent may run (comments, PR lifecycle, review threads). Everything else is denied.
@@ -35,7 +37,10 @@ const GIT_GLOBAL_VALUE = ['--git-dir', '--work-tree', '--namespace', '--super-pr
 const API_LONG_VALUE = ['method', 'field', 'raw-field', 'header', 'input', 'jq', 'template', 'preview', 'hostname', 'cache'];
 const VAR_BUILTINS = ['export', 'declare', 'typeset', 'local', 'readonly'];
 const DYNAMIC = /[$`]/;
-const NAMES_PROTECTED = /(^|[^A-Za-z0-9_-])(main|master)([^A-Za-z0-9_-]|$)/i;
+// The only run-time destinations a push may use: "whatever branch I am on" (the branch itself is then checked).
+const CURRENT_BRANCH_IDIOM = /^(?:\$\(|`)\s*git\s+(?:branch\s+--show-current|rev-parse\s+--abbrev-ref\s+HEAD|symbolic-ref\s+--short\s+HEAD)\s*(?:\)|`)$/;
+// Config the environment can inject into git (GIT_CONFIG_COUNT/KEY_n/VALUE_n, GIT_CONFIG_PARAMETERS, GIT_CONFIG_GLOBAL/SYSTEM).
+const GIT_ENV_CONFIG = /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+|PARAMETERS|GLOBAL|SYSTEM)$/i;
 // Config that can redirect a bare `git push` somewhere the branch name does not suggest.
 const RISKY_CONFIG = (key, value) => /^remote\..*\.push$/.test(key) || /^branch\./.test(key)
   || (key === 'push.default' && /^(upstream|tracking|matching)$/i.test(value));
@@ -188,14 +193,16 @@ function checkRefspec(spec, dir, gitDir, ctx) {
   const colon = spec.indexOf(':');
   const src = colon < 0 ? spec : spec.slice(0, colon);
   let dst = colon < 0 ? spec : spec.slice(colon + 1);
+  dst = expandVars(dst, ctx.vars); // `B=agent/x; git push origin HEAD:$B`
   if (colon >= 0 && src === '' && dst === '') return deny('`git push <remote> :` pushes every matching branch, including main. Name your branch explicitly.');
   if (dst === '') dst = src; // `src:` is not a destination git accepts; judge it by the source name
   dst = stripHeads(dst);
   if (DYNAMIC.test(dst)) {
-    // `git push origin "$(git branch --show-current)"` is common and means the current branch: accept it only when
-    // that branch is known and not protected, and the text does not itself name main/master.
+    // `git push origin "$(git branch --show-current)"` is common and means the current branch: accept exactly that
+    // spelling (a variable that holds a literal has already been expanded above), and only when the branch is known
+    // and not protected. Any other run-time text (${B:-main}, $(cat f), m${x}ain, a loop variable) can be main.
     const { branch: b } = effectiveBranch(dir, gitDir, ctx);
-    if (b === null || isProtectedBranch(b) || NAMES_PROTECTED.test(dst)) {
+    if (!CURRENT_BRANCH_IDIOM.test(dst.replace(/\s+/g, ' ')) || b === null || isProtectedBranch(b)) {
       return deny(`the destination "${dst}" cannot be resolved here, so it cannot be verified. Write the branch name out: git push -u origin agent/<slug>.`);
     }
     return null;
@@ -231,7 +238,7 @@ function checkPush(args, dir, gitDir, ctx, configs) {
   else refspecs = positionals.slice(1);
   if (refspecs.length === 0) {
     if (dir === null) return deny('cannot tell which directory this `git push` runs in (unresolved cd / -C), so the current branch cannot be verified.');
-    if (ctx.cfgDirty || configs.some((c) => RISKY_CONFIG(c.key, c.value))) {
+    if (ctx.cfgDirty || ctx.envCfgDirty || configs.some((c) => RISKY_CONFIG(c.key, c.value))) {
       return deny('this line changes upstream/push configuration (git config, branch -u, -c push.default/remote.*.push), so where a bare `git push` goes cannot be verified. Push explicitly: git push -u origin HEAD:agent/<slug>.');
     }
     const { branch: b, overridden, trackMain } = effectiveBranch(dir, gitDir, ctx);
@@ -366,6 +373,8 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
 
   if (sub === 'push' || sub === 'send-pack') { // send-pack is push without the remote configuration
     if (/\bxargs\b/.test(raw)) return deny('`xargs git push` takes its refspecs from stdin, so it cannot be verified. Push the branch by name.');
+    // config handed in through the environment (this command's prefix / `env`, or an earlier assignment or export on the line)
+    ctx.envCfgDirty = [...Object.keys(env), ...Object.keys(ctx.vars)].some((k) => GIT_ENV_CONFIG.test(k));
     return checkPush(args, g.d, g.gitDir, ctx, g.configs);
   }
   trackGit(sub, args, g, ctx);
@@ -685,14 +694,54 @@ function jobStartCommands(argv, vars) {
   return [...new Set([cmd.map(shellQuote).join(' '), cmd.join(' ')])].filter((s) => s.trim());
 }
 
+// ---- script files and strings the parser cannot unwrap ----------------------------------------------------
+
+const SHEBANG_PROGRAM = /^#!\s*(?:\S*\/)?(?:env\s+(?:-\S+\s+)*)?(\S+)/;
+const isNodeModulesOrPipelineHome = (p) => /[\\/]node_modules[\\/]/.test(p) || /[\\/]\.claude[\\/]pipeline[\\/]/.test(p);
+
+// `bash push.sh`, `source f`, `./f`, `node f.mjs`: read the file (up to 1 MB) from the directory the command runs in and judge
+// it like the same text typed on the line. A shell script that exists but cannot be read is denied (what runs is
+// unknown); one that does not exist runs nothing. Programs run by path and interpreter files are only scanned when
+// readable (a binary, a huge generated file or a package under node_modules is not ours to judge).
+function checkScriptFile(sf, dir, ctx, level) {
+  const file = expandVars(sf.file, ctx.vars);
+  if (/^\$\{?HOME\}?(?=\/|$)/.test(file)) return checkScriptFile({ ...sf, file: ctx.home + file.replace(/^\$\{?HOME\}?/, '') }, dir, ctx, level);
+  if (DYNAMIC.test(file)) {
+    return sf.kind !== 'exec' && GUARDED_WORDS.test(ctx.fullText)
+      ? deny(`the script "${sf.file}" is named at run time and the line mentions a guarded operation, so what it runs cannot be verified. Name the file.`)
+      : null;
+  }
+  const home = file === '~' || file.startsWith('~/') ? ctx.home + file.slice(1) : file;
+  const abs = path.resolve(dir ?? ctx.cwd, home);
+  const text = ctx.readText(abs);
+  if (typeof text !== 'string') {
+    if (sf.kind === 'shell' && ctx.pathExists(abs)) return deny(`cannot read the script ${sf.file} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified.`);
+    return null; // missing: nothing will run
+  }
+  let kind = sf.kind;
+  if (kind === 'exec') {
+    if (text.slice(0, 4096).includes('\u0000')) return null; // a binary
+    const prog = SHEBANG_PROGRAM.exec(text)?.[1] ?? '';
+    kind = /^(?:node|nodejs|deno|bun|tsx|ts-node|python[\d.]*|ruby|perl|php)$/.test(prog.split('/').pop()) ? 'interp' : 'shell';
+  }
+  if (kind === 'interp') {
+    if (isNodeModulesOrPipelineHome(abs)) return null;
+    const why = guardedCommandText(text);
+    return why ? deny(`the program ${sf.file} contains a guarded command (${why}); it cannot be verified by the guard. Run the operation directly.`) : null;
+  }
+  if (level >= MAX_NESTING) return deny(`the script ${sf.file} is nested too deeply (scripts running scripts) to verify.`);
+  const v = text.length > MAX_LINE_CHARS ? judgeLongText(text) : evalString(text, dir, ctx, level + 1);
+  return v.decision === 'deny' ? deny(`the script ${sf.file} would run a blocked command: ${v.reason}`) : null;
+}
+
 // ---- entry point ----------------------------------------------------------------------------------------
 
 function evalString(str, startDir, ctx, level) {
   if (level > MAX_NESTING) return deny('pipeline job start / alias is nested too deeply to verify.');
   const cmds = simpleCommands(str);
-  if (cmds.truncated && /\b(git|gh|pipeline)\b/i.test(str)) {
-    return deny('command too complex to verify (the parser gave up). Split it into simpler commands.');
-  }
+  // Truncated means part of the line was never looked at, so nothing on it can be called harmless (`g''it push` after
+  // 500 `true;` must not slip through on a word match).
+  if (cmds.truncated) return deny('command too complex to verify (the parser gave up). Split it into simpler commands.');
   if (cmds.dynamic && GUARDED_WORDS.test(str)) {
     return deny('the command that runs is only known at run time ($VAR / $(...) / piped into a shell) and the line mentions a guarded operation, so it cannot be verified. Write the command out literally.');
   }
@@ -715,10 +764,22 @@ function evalString(str, startDir, ctx, level) {
         const v = evalString(inner, dir, ctx, level + 1);
         if (v.decision === 'deny') { verdict = v; break; }
       }
+      if (!verdict) {
+        // a string or program text the parser cannot unwrap (node -e, osascript, make CMD=...) that carries a guarded command
+        const why = catchAllReason(argv);
+        if (why) verdict = deny(`${name} was given a string that contains a guarded command (${why}). Run the operation directly so it can be checked.`);
+      }
+      const sf = verdict ? null : scriptFileOf(argv);
+      if (sf) verdict = checkScriptFile(sf, dir, ctx, level);
     }
     if (verdict && verdict.decision === 'deny') return verdict;
   }
   return allowed();
+}
+
+// Text too long to parse inside the time budget is judged by what it mentions once quotes and escapes are removed.
+function judgeLongText(text) {
+  return GUARDED_WORDS.test(text.replace(/['"`\\]/g, '')) ? deny('this text is too long to verify and mentions a guarded operation. Split it into simpler commands.') : allowed();
 }
 
 export function evaluateGitCommand(command, {
@@ -731,11 +792,12 @@ export function evaluateGitCommand(command, {
   pathExists = existsSync,
 } = {}) {
   const text = typeof command === 'string' ? command : String(command ?? '');
+  if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   const base = cwd || process.cwd();
   const ctx = {
     cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, fullText: text,
     vars: Object.create(null), gitAliases: Object.create(null), ghAliases: Object.create(null),
-    branches: new Map(), cfgDirty: false,
+    branches: new Map(), cfgDirty: false, envCfgDirty: false,
   };
   return evalString(text, path.resolve(base), ctx, 0);
 }
