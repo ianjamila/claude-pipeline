@@ -376,7 +376,41 @@ test('removed keys stay unknown: review.exempt_docs_only and top-level labels', 
   assert.ok(has(r, 'unknown key: labels'));
 });
 
-test('numeric fields must be non-negative integers', () => {
+test('numeric fields must be finite positive integers, and the error names the key', () => {
+  const keys = [
+    ['review', 'light_lane_max_lines'], ['review', 'max_rounds'], ['risk', 'medium_lines'], ['risk', 'high_lines'],
+    ['risk', 'medium_files'], ['production', 'deploy_timeout_minutes'],
+  ];
+  const withValue = (section, key, v) => {
+    const base = minimal();
+    if (section === 'production') base.production = { url: 'https://x.example.com', environment: 'Production', smoke: 'curl {url}', rollback: { command: 'undo' } };
+    return validateConfig({ ...base, [section]: { ...(base[section] ?? {}), [key]: v } });
+  };
+  for (const [section, key] of keys) {
+    for (const bad of [0, -1, 1.5, Infinity, -Infinity, NaN, '10', null, true, [], {}]) {
+      const r = withValue(section, key, bad);
+      assert.equal(r.ok, false, `${section}.${key} = ${String(bad)}`);
+      assert.ok(has(r, `${section}.${key}`), `${section}.${key} = ${String(bad)}: ${r.errors.join(' | ')}`);
+    }
+  }
+  // the defaults and an ordinary value still validate
+  assert.equal(validateConfig(minimal()).ok, true);
+  assert.equal(withValue('risk', 'medium_files', 1).ok, true);
+});
+
+test('verify.expected_steps: optional non-empty list of unique step names', () => {
+  const ok = validateConfig({ ...minimal(), verify: { ...minimal().verify, expected_steps: ['install', 'lint'] } });
+  assert.equal(ok.ok, true, ok.errors.join('|'));
+  assert.deepEqual(ok.config.verify.expected_steps, ['install', 'lint']);
+  assert.equal(validateConfig(minimal()).config.verify.expected_steps, undefined, 'absent by default');
+  for (const bad of [[], 'install', ['a', 'a'], ['a', ''], ['a', 3], null, {}]) {
+    const r = validateConfig({ ...minimal(), verify: { ...minimal().verify, expected_steps: bad } });
+    assert.equal(r.ok, false, JSON.stringify(bad));
+    assert.ok(has(r, 'verify.expected_steps'), r.errors.join('|'));
+  }
+});
+
+test('numeric fields reject negatives, fractions, strings, null and booleans', () => {
   const cases = [
     [{ risk: { medium_lines: -1 } }, 'risk.medium_lines'],
     [{ risk: { medium_lines: 1.5 } }, 'risk.medium_lines'],
@@ -393,7 +427,6 @@ test('numeric fields must be non-negative integers', () => {
     assert.equal(r.ok, false, JSON.stringify(patch));
     assert.ok(has(r, expected), `${expected}: ${r.errors.join(' | ')}`);
   }
-  assert.equal(validateConfig({ ...minimal(), risk: { medium_lines: 0, high_lines: 0, medium_files: 0 }, review: { light_lane_max_lines: 0 } }).ok, true);
 });
 
 test('merge.wait_minutes must be an integer 1..120', () => {

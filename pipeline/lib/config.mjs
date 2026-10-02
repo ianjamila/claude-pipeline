@@ -51,7 +51,7 @@ const PROVIDERS = ['vercel', 'github-deployments', 'other'];
 // Allowed keys per mapping. Anything else is a typo (or a removed option) and is rejected.
 const KEYS = {
   top: [...Object.keys(DEFAULTS), 'project'],
-  verify: ['full', 'quick', 'report', 'screenshots'],
+  verify: ['full', 'quick', 'report', 'screenshots', 'expected_steps'],
   ci: ['required_checks', 'e2e_label', 'draft_while_iterating'],
   merge: ['command', 'wait_minutes'],
   preview: ['environment', 'smoke', 'provider'],
@@ -107,8 +107,10 @@ function checkStrArray(value, name, errors) {
   if (!isStrArray(value)) errors.push(`${name} must be an array of strings`);
 }
 
-function checkNonNegInt(value, name, errors) {
-  if (!isInt(value) || value < 0) errors.push(`${name} must be a non-negative integer`);
+// Finite (Number.isInteger rules out NaN and Infinity) and > 0: a threshold of 0, a negative one or a fractional one is a
+// typo or a way to make a check vacuous, never a setting anyone means.
+function checkPosInt(value, name, errors) {
+  if (!isInt(value) || value < 1) errors.push(`${name} must be a positive integer`);
 }
 
 function checkUrlTemplate(value, name, errors) {
@@ -204,6 +206,16 @@ export function validateConfig(obj) {
     if (!isStr(verify.full)) errors.push('verify.full is required (the full verify command)');
     if (!isStr(verify.quick)) errors.push('verify.quick is required (the quick verify command)');
     for (const k of ['report', 'screenshots']) if (!isStr(verify[k])) errors.push(`verify.${k} must be a non-empty string`);
+    // Optional. When set, final-gate requires the verify report's step names to equal this list exactly, in order,
+    // instead of trusting the list the report declares about itself.
+    if (verify.expected_steps !== undefined) {
+      const steps = verify.expected_steps;
+      if (!Array.isArray(steps) || steps.length === 0 || !steps.every(isStr)) {
+        errors.push('verify.expected_steps must be a non-empty array of non-empty step names');
+      } else if (new Set(steps).size !== steps.length) {
+        errors.push('verify.expected_steps must not repeat a step name');
+      }
+    }
   }
 
   const mergeSec = section(config, 'merge', errors);
@@ -221,7 +233,7 @@ export function validateConfig(obj) {
   const review = section(config, 'review', errors);
   if (review) {
     if (!inRange(review.max_rounds, 1, 5)) errors.push('review.max_rounds must be an integer 1..5');
-    checkNonNegInt(review.light_lane_max_lines, 'review.light_lane_max_lines', errors);
+    checkPosInt(review.light_lane_max_lines, 'review.light_lane_max_lines', errors);
     if (!isObj(review.effort)) errors.push('review.effort must be a mapping');
     else {
       for (const lane of Object.keys(review.effort)) {
@@ -234,12 +246,12 @@ export function validateConfig(obj) {
   const risk = section(config, 'risk', errors);
   if (risk) {
     checkStrArray(risk.high_risk_paths, 'risk.high_risk_paths', errors);
-    for (const k of ['medium_lines', 'high_lines', 'medium_files']) checkNonNegInt(risk[k], `risk.${k}`, errors);
-    const nonNeg = (v) => isInt(v) && v >= 0;
-    if (nonNeg(risk.medium_lines) && nonNeg(risk.high_lines) && risk.medium_lines > risk.high_lines) {
+    for (const k of ['medium_lines', 'high_lines', 'medium_files']) checkPosInt(risk[k], `risk.${k}`, errors);
+    const pos = (v) => isInt(v) && v >= 1;
+    if (pos(risk.medium_lines) && pos(risk.high_lines) && risk.medium_lines > risk.high_lines) {
       errors.push('risk.medium_lines must be <= risk.high_lines');
     }
-    if (review && nonNeg(risk.medium_lines) && nonNeg(review.light_lane_max_lines) && review.light_lane_max_lines > risk.medium_lines) {
+    if (review && pos(risk.medium_lines) && pos(review.light_lane_max_lines) && review.light_lane_max_lines > risk.medium_lines) {
       errors.push('review.light_lane_max_lines must be <= risk.medium_lines');
     }
   }

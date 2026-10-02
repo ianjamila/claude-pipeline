@@ -11,6 +11,8 @@ verify:
   quick: node scripts/verify.mjs --quick # fast subset; the Stop hook runs this
   report: .verify/report.json
   screenshots: .verify/screenshots
+  # expected_steps: [install, typecheck, lint, unit, build]   # optional: final-gate then requires the report's steps to
+  #                                # equal this list exactly (in order), not the list the report declares for itself
 
 ci:
   required_checks: ["Test integrity", "Hard-stop scan"]   # + your CI job names

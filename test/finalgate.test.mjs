@@ -25,6 +25,17 @@ test('isDocsOnly: only .md/.mdx/.txt text files count; one code file spoils it; 
   assert.equal(isDocsOnly(null), false);
 });
 
+test('isDocsOnly: agent instruction files are never docs, at any depth, in any case', () => {
+  for (const name of ['CLAUDE.md', 'AGENTS.md', 'GEMINI.md', '.cursorrules', 'copilot-instructions.md']) {
+    assert.equal(isDocsOnly([f(name)]), false, name);
+    assert.equal(isDocsOnly([f(`docs/deep/er/${name}`)]), false, `docs/deep/er/${name}`);
+    assert.equal(isDocsOnly([f('README.md'), f(`packages/x/${name}`)]), false, `packages/x/${name}`);
+    assert.equal(isDocsOnly([f(`sub/${name.toUpperCase()}`)]), false, 'upper case');
+    assert.equal(isDocsOnly([{ oldPath: `docs/${name}`, newPath: 'docs/renamed.md', status: 'R' }]), false, 'a rename out of an instruction file');
+  }
+  assert.equal(isDocsOnly([f('docs/claude-notes.md'), f('docs/agents-overview.md')]), true, 'similar names are still docs');
+});
+
 test('isDocsOnly: files under docs/ that are not text docs are NOT docs-only (reviewer repro E)', () => {
   assert.equal(isDocsOnly([f('docs/deploy.sh')]), false);
   assert.equal(isDocsOnly([f('docs/x.png', { binary: true })]), false);

@@ -5,7 +5,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { saveState } from '../pipeline/lib/state.mjs';
 import { treeFingerprint } from '../pipeline/lib/git.mjs';
-import { cli, scenario, ghEntries, reviewState, named, assertOnlyFails, bump, PR, AGENT_LOG } from './helpers/gate-env.mjs';
+import { cli, scenario, ghEntries, reviewState, named, assertOnlyFails, bump, ymlFor, STEPS, PR, AGENT_LOG } from './helpers/gate-env.mjs';
 
 test('final-gate: each way the verify report can be wrong fails verify-report', () => {
   const cases = [
@@ -31,6 +31,29 @@ test('final-gate: each way the verify report can be wrong fails verify-report', 
     assert.deepEqual(r.json.failed, ['verify-report'], label);
     assert.match(named(r.json, 'verify-report').detail, detail, label);
   }
+});
+
+test('final-gate: verify.expected_steps in the config overrides the report\'s own expectedSteps', () => {
+  const configured = (names) => ({ yml: ymlFor().replace('  quick: npm run verify:quick\n', `  quick: npm run verify:quick\n  expected_steps: [${names.join(', ')}]\n`) });
+  // exact match, and the report need not even carry expectedSteps
+  const pass = scenario({ ...configured(STEPS), report: (r) => { delete r.expectedSteps; } }).gate();
+  assert.equal(pass.code, 0, pass.stderr + pass.stdout);
+  assert.match(named(pass.json, 'verify-report').detail, /full verify passed/);
+
+  const cases = [
+    ['the report dropped a step and shrank its own expectedSteps to match', (r) => { r.steps.pop(); r.expectedSteps.pop(); }],
+    ['steps reordered along with the report\'s expectedSteps', (r) => { r.steps.reverse(); r.expectedSteps.reverse(); }],
+    ['an extra step the config does not list, mirrored in expectedSteps', (r) => { r.steps.push({ name: 'extra', status: 'pass' }); r.expectedSteps.push('extra'); }],
+  ];
+  for (const [label, mutate] of cases) {
+    const r = scenario({ ...configured(STEPS), report: mutate }).gate();
+    assert.equal(r.code, 1, label);
+    assert.deepEqual(r.json.failed, ['verify-report'], label);
+    assert.match(named(r.json, 'verify-report').detail, /verify\.expected_steps/, label);
+  }
+  // without the config key the report's own expectedSteps is still what decides (the old behaviour)
+  const legacy = scenario({ report: (r) => { r.steps.pop(); r.expectedSteps.pop(); } }).gate();
+  assert.equal(legacy.code, 0, legacy.stderr + legacy.stdout);
 });
 
 // ---- final-gate: hardstops, integrity -------------------------------------------------------------

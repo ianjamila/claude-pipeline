@@ -36,6 +36,8 @@ export const MERGEABLE_RETRIES = 3;
 export const MERGEABLE_PAUSE_MS = 2000;
 const MERGE_SHA_RETRIES = 3;
 const DOC_EXTENSIONS = /\.(md|mdx|txt)$/i;
+// Agent instruction files steer what an agent does next, so they are code wherever they sit (docs/ included).
+const AGENT_INSTRUCTION_FILES = new Set(['claude.md', 'agents.md', 'gemini.md', '.cursorrules', 'copilot-instructions.md']);
 // Instructions, hooks, workflows and the pipeline itself: text files here change what agents or CI do, so they are code.
 const NEVER_DOCS_DIRS = new Set(['.claude', '.github', '.githooks', 'skills', 'agents', 'pipeline', 'scripts']);
 const FULL_SHA = /^[0-9a-f]{40}$/;
@@ -115,7 +117,8 @@ const pathsOf = (f) => [f.oldPath, f.newPath, f.path].filter((p) => typeof p ===
 
 function isDocPath(p) {
   const parts = toPosix(p).replace(/^\.\//, '').split('/');
-  return DOC_EXTENSIONS.test(parts.at(-1)) && !parts.slice(0, -1).some((d) => NEVER_DOCS_DIRS.has(d.toLowerCase()));
+  return DOC_EXTENSIONS.test(parts.at(-1)) && !AGENT_INSTRUCTION_FILES.has(parts.at(-1).toLowerCase())
+    && !parts.slice(0, -1).some((d) => NEVER_DOCS_DIRS.has(d.toLowerCase()));
 }
 
 // Every changed file is a non-binary .md/.mdx/.txt file outside the instruction/hook/workflow/pipeline directories (a
@@ -232,11 +235,15 @@ function verifyReportCheck({ root, config, head, tree, o }) {
   if (Object.hasOwn(report, 'partial') && report.partial !== false) problems.push(`report is partial (partial=${JSON.stringify(report.partial)})`);
 
   const steps = Array.isArray(report.steps) ? report.steps : null;
-  const expected = Array.isArray(report.expectedSteps) ? report.expectedSteps : null;
+  // verify.expected_steps in pipeline.yml is the owner's list: a report that declares a shorter expectedSteps for itself
+  // (and runs only those) must not be able to dodge a step. Without it, the report's own list is all there is.
+  const pinned = Array.isArray(config.verify.expected_steps) ? config.verify.expected_steps : null;
+  const expected = pinned ?? (Array.isArray(report.expectedSteps) ? report.expectedSteps : null);
+  const source = pinned ? 'verify.expected_steps' : 'expectedSteps';
   if (!expected || expected.length === 0) problems.push('report has no expectedSteps');
   if (!steps || steps.length === 0) problems.push('report has no steps');
   if (steps && expected && JSON.stringify(steps.map((s) => s?.name)) !== JSON.stringify(expected)) {
-    problems.push(`steps [${steps.map((s) => s?.name).join(', ')}] do not match expectedSteps [${expected.join(', ')}]`);
+    problems.push(`steps [${steps.map((s) => s?.name).join(', ')}] do not match ${source} [${expected.join(', ')}]`);
   }
   const notPassed = (steps ?? []).filter((s) => s?.status !== 'pass').map((s) => `${s?.name}=${s?.status}`);
   if (notPassed.length) problems.push(`steps not passing: ${notPassed.join(', ')}`);
