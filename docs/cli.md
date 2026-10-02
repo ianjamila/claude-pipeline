@@ -200,6 +200,8 @@ verify the production deployment of a merge; roll back safely, open an issue and
 pipeline prod-watch --sha MERGE_SHA [--pr N] [--expect-text T] [--retry-wait SEC=60] [--repo DIR]   -> {ok, outcome: merged|deploy-failed|deploy-not-observed|not-live|superseded|recovered|rollback-failed|changed-during-recovery|rollback-skipped|no-production, ...}
 ```
 
+`--expect-text` applies only to this merge's own deployment: smokes of the rolled-back or superseded (other) deployment run without it. `not-live` also covers a merge whose deployment succeeded but was never promoted while production still serves the known-good deployment (nothing is rolled back).
+
 Exit: 0 outcome `merged` (or no production configured) · 1 any other outcome (recovered, rollback-failed, ...) · 3 deployment not observed / GitHub unavailable.
 
 ## protect
@@ -301,6 +303,8 @@ pipeline vendor --repo DIR [--check]
 ```
 
 Exit: 0 copied / no drift · 1 drift found (`--check`) · 2 usage.
+
+Vendoring also appends `scripts/pipeline/** -text` and `scripts/verify text eol=lf` to the project's `.gitattributes` (idempotent; output `gitattributes` lists what was added), so a Windows autocrlf checkout cannot make the byte comparison drift. `--check` warns when the entries are missing.
 
 ## version
 

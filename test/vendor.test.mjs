@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync, rmSync, existsSync, readdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, rmSync, existsSync, readdirSync, statSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
@@ -170,4 +171,37 @@ test('every vendored module actually loads from the project layout', async () =>
     const mod = await import(pathToFileURL(join(sp(repo.dir), `${n}.mjs`)).href);
     assert.ok(Object.keys(mod).length > 0, `${n} exports something`);
   }
+});
+
+test('vendor pins the vendored files in .gitattributes (-text, shim eol=lf): appended once, idempotent, keeps existing lines', async () => {
+  const repo = createTmpRepo();
+  repo.write('.gitattributes', '*.png binary');
+  const r = await vendorInto(repo.dir);
+  assert.deepEqual(r.output.gitattributes, ['scripts/pipeline/** -text', 'scripts/verify text eol=lf']);
+  const text = readFileSync(join(repo.dir, '.gitattributes'), 'utf8');
+  assert.match(text, /^\*\.png binary\n/);
+  assert.equal(text.split('\n').filter((l) => l === 'scripts/pipeline/** -text').length, 1);
+  const again = await vendorInto(repo.dir);
+  assert.deepEqual(again.output.gitattributes, []);
+  assert.equal(readFileSync(join(repo.dir, '.gitattributes'), 'utf8'), text);
+  // --check: no warning once pinned; a warning (not drift) when the entry is missing
+  assert.equal((await vendorInto(repo.dir, ['--check'])).output.warnings, undefined);
+  writeFileSync(join(repo.dir, '.gitattributes'), '*.png binary\n');
+  const c = await vendorInto(repo.dir, ['--check']);
+  assert.equal(c.exitCode, 0);
+  assert.match(c.output.warnings[0], /scripts\/pipeline\/\*\* -text/);
+});
+
+test('vendor creates .gitattributes when the project has none', async () => {
+  const repo = createTmpRepo();
+  await vendorInto(repo.dir);
+  assert.match(readFileSync(join(repo.dir, '.gitattributes'), 'utf8'), /^# claude-pipeline: .*\nscripts\/pipeline\/\*\* -text\nscripts\/verify text eol=lf\n$/);
+});
+
+test('the POSIX verify shim template is executable in git (mode 100755) and pinned to LF', { skip: process.platform === 'win32' }, () => {
+  const r = spawnSync('git', ['ls-files', '-s', 'pipeline/templates/scripts/verify'], { cwd: root, encoding: 'utf8' });
+  if (r.status !== 0 || !r.stdout) return; // not a git checkout (a packaged copy): nothing to assert
+  assert.match(r.stdout, /^100755 /);
+  assert.ok(statSync(join(root, 'pipeline', 'templates', 'scripts', 'verify')).mode & 0o111, 'executable on disk too');
+  assert.match(readFileSync(join(root, '.gitattributes'), 'utf8'), /^pipeline\/templates\/scripts\/verify text eol=lf$/m);
 });
