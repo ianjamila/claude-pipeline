@@ -287,8 +287,10 @@ apply the judge triage, settle disputed bugs with test results, close the light 
 ```
 pipeline triage validate --round R (--from-tag TAG | --file F) [--projects-dir DIR] [--max-age-ms N] [--repo DIR]
   -> {ok, round, counts:{ACCEPT,FOLLOW-UP,REJECT}, settled, unsettled, judgeProof}; exit 1 + errors when the judge output is invalid (state untouched)
-pipeline triage settle --id ID --result bug-confirmed|bug-disproved --evidence TEXT [--repo DIR]
+pipeline triage settle --id ID --result bug-confirmed|bug-disproved --test-cmd CMD --test-file FILE [--repo DIR]
+  -> the CLI runs CMD in the repo itself (free-text evidence is not accepted): bug-disproved needs exit 0, bug-confirmed needs a failing exit; FILE must be a committed, clean test file at HEAD named in CMD
   -> only for a disputed bug with a possible settle test and no test result yet; exit 1 for an item that needs a human, was ruled by the arbiter or is implemented
+  -> a bug-disproved result on a security/auth/permissions/data item is still needsHuman
 pipeline triage light-lane --round R [--repo DIR]
 ```
 

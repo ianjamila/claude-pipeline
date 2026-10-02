@@ -100,8 +100,11 @@ export function applyJudge(items, triage) {
   });
 }
 
-// A test outranks every opinion: it is evidence, and it settles the item without the arbiter.
-export function applyTestResult(item, status, evidence = '') {
+// A test outranks every opinion: it is evidence, and it settles the item without the arbiter. `proof` ({cmd, file,
+// exitCode, head}) is what the PIPELINE ran to get it (see `triage settle`). A test that DISMISSES a security / auth /
+// permissions / data item (bug-disproved) still goes to a human, exactly like an arbiter dismissal: a passing test only
+// shows the behaviour the test author chose to assert.
+export function applyTestResult(item, status, evidence = '', proof = null) {
   if (status !== 'bug-confirmed' && status !== 'bug-disproved') {
     throw new Error(`test status must be bug-confirmed or bug-disproved, got ${JSON.stringify(status)}`);
   }
@@ -109,11 +112,14 @@ export function applyTestResult(item, status, evidence = '') {
   const chars = Array.from(String(evidence ?? ''));
   evidence = chars.length > EVIDENCE_MAX ? `${chars.slice(0, EVIDENCE_MAX).join('')}…` : chars.join('');
   const next = structuredClone(item);
-  next.test = { status, evidence };
-  next.final =
-    status === 'bug-confirmed'
-      ? { decision: 'ACCEPT', by: 'test', needsHuman: false, reason: `test confirmed: ${evidence}` }
-      : { decision: 'REJECT', by: 'test', needsHuman: false, reason: `test disproved: ${evidence}` };
+  next.test = { status, evidence, ...(proof ? { cmd: proof.cmd, file: proof.file, exitCode: proof.exitCode, head: proof.head } : {}) };
+  if (status === 'bug-confirmed') {
+    next.final = { decision: 'ACCEPT', by: 'test', needsHuman: false, reason: `test confirmed: ${evidence}` };
+  } else if (SECURITY_CATEGORIES.includes(item.category)) {
+    next.final = { decision: 'REJECT', by: 'test', needsHuman: true, reason: `test disproved, but it would dismiss a security/data item: ${evidence}` };
+  } else {
+    next.final = { decision: 'REJECT', by: 'test', needsHuman: false, reason: `test disproved: ${evidence}` };
+  }
   return next;
 }
 
