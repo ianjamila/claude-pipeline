@@ -2,7 +2,7 @@
 // Entry point for every deterministic pipeline decision. Subcommands live one per file in
 // ../commands/<name>.mjs and export `meta` ({summary, usage}) and `run(argv, ctx)`.
 // Loading by file name lets commands be added without touching this dispatcher.
-import { readdirSync } from 'node:fs';
+import { readdirSync, realpathSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { emit, errorResult, EXIT } from '../lib/cli.mjs';
@@ -61,6 +61,15 @@ export async function main(argv = process.argv.slice(2), ctx = {}) {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// Node realpaths import.meta.url but not argv[1], so compare real paths (a symlinked ~/.claude, macOS /tmp).
+function isMain() {
+  try {
+    return Boolean(process.argv[1]) && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return Boolean(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1]).href;
+  }
+}
+
+if (isMain()) {
   main().then((code) => { process.exitCode = code; });
 }
