@@ -231,3 +231,34 @@ test('injected gh and codex are used instead of the real ones', async () => {
   assert.equal(r.enforcement.branch, 'trunk');
   assert.equal(r.canMerge, true);
 });
+
+test('guard contexts are always required: a repo that lists no checks is NOT github mode until protection has them', async () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml('github', [], { guardChecks: true }));
+  repo.commit('init');
+  // Protection exists but requires nothing at all (the old false "healthy").
+  const bare = await runPreflight({ cwd: repo.dir, env: world([{ match: 'branches/main/protection', stdoutJson: fullProtection([]) }]).env });
+  assert.deepEqual(bare.enforcement.missing, ['required_check:Test integrity', 'required_check:Hard-stop scan']);
+  assert.equal(bare.enforcement.mode, 'gate');
+  assert.equal(bare.canMerge, false);
+  assert.ok(bare.reasons.some((x) => /required_check:Test integrity/.test(x)), bare.reasons.join('|'));
+
+  const guarded = await runPreflight({ cwd: repo.dir, env: world([{ match: 'branches/main/protection', stdoutJson: fullProtection(['Test integrity', 'Hard-stop scan']) }]).env });
+  assert.equal(guarded.enforcement.mode, 'github');
+  assert.equal(guarded.canMerge, true);
+});
+
+test('configured checks are required IN ADDITION to the guard contexts; ci.guard_checks: false drops only the guards', async () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml('github', ['ci'], { guardChecks: true }));
+  repo.commit('init');
+  const onlyCi = await runPreflight({ cwd: repo.dir, env: world([{ match: 'branches/main/protection', stdoutJson: fullProtection(['ci']) }]).env });
+  assert.deepEqual(onlyCi.enforcement.missing, ['required_check:Test integrity', 'required_check:Hard-stop scan']);
+
+  const off = createTmpRepo();
+  off.write('.claude/pipeline.yml', pipelineYml('github', ['ci'], { guardChecks: false }));
+  off.commit('init');
+  const r = await runPreflight({ cwd: off.dir, env: world([{ match: 'branches/main/protection', stdoutJson: fullProtection(['ci']) }]).env });
+  assert.equal(r.enforcement.mode, 'github');
+  assert.equal(r.canMerge, true);
+});

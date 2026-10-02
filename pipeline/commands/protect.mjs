@@ -5,7 +5,7 @@
 // session must never be able to loosen or tighten the repo's protection on its own.
 import { EXIT, UsageError, parseCommandArgs } from '../lib/cli.mjs';
 import { GhError } from '../lib/proc.mjs';
-import { loadConfig } from '../lib/config.mjs';
+import { loadConfig, requiredChecks } from '../lib/config.mjs';
 import { createGitHub, classifyApiError, encodePath, commandCwd, guardGh, requireRepoRoot } from '../lib/github.mjs';
 import { protectionMissing } from '../lib/preflight.mjs';
 
@@ -61,7 +61,8 @@ async function resolveChecks(values, root) {
   if (values.checks !== undefined) return parseChecks(values.checks);
   const cfg = await loadConfig(root);
   if (!cfg.ok) throw new UsageError(`cannot read the required checks from the config (${cfg.errors.join('; ')}); pass --checks a,b`);
-  return cfg.config.ci.required_checks;
+  // Same list preflight demands, so what --apply sets is exactly what preflight later reads back as complete.
+  return requiredChecks(cfg.config.ci);
 }
 
 const PLAN_MESSAGE = 'GitHub Pro required for private repos: branch protection is not available on this plan. Upgrade (or make the repo public), then run this again.';
@@ -80,7 +81,7 @@ export async function run(argv, ctx) {
   const root = requireRepoRoot(cwd);
   const checks = await resolveChecks(values, root);
   if (checks.length === 0) {
-    throw new UsageError('no required checks: pass --checks a,b or set ci.required_checks in .claude/pipeline.yml (protection without required checks would let anything merge)');
+    throw new UsageError('no required checks: pass --checks a,b or set ci.required_checks in .claude/pipeline.yml (the guard contexts are added unless ci.guard_checks is false; protection without required checks would let anything merge)');
   }
   const gh = createGitHub({ cwd, env: ctx.env });
 

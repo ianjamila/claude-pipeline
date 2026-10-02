@@ -56,6 +56,15 @@ test('config: a valid repo prints the filled-in config, exit 0', (t) => {
   assert.equal(r.json.path, join(repo.dir, '.claude', 'pipeline.yml'));
 });
 
+test('config: required_checks that omit the guard contexts print a warning but still exit 0', (t) => {
+  const repo = project();
+  t.after(() => repo.cleanup());
+  const r = cli(repo.dir, ['config']);
+  assert.equal(r.code, 0);
+  assert.match(r.json.warnings.join('\n'), /Test integrity/);
+  assert.equal(r.json.config.ci.guard_checks, true);
+});
+
 test('config: missing pipeline.yml is exit 2 with error "config"', (t) => {
   const repo = createTmpRepo();
   t.after(() => repo.cleanup());

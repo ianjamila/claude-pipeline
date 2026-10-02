@@ -11,6 +11,6 @@ export const meta = {
 export const run = guarded(async (argv, ctx) => {
   const { values } = parseCommandArgs(argv, { repo: { type: 'string' } }, { allowPositionals: false });
   const root = resolveRepo(values, ctx);
-  const { path, config } = await requireConfig(root);
-  return { exitCode: EXIT.OK, output: { ok: true, path, config } };
+  const { path, config, warnings = [] } = await requireConfig(root);
+  return { exitCode: EXIT.OK, output: { ok: true, path, config, ...(warnings.length ? { warnings } : {}) } };
 });

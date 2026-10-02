@@ -386,6 +386,22 @@ test('protect: checks default to ci.required_checks; none at all is a usage erro
   assert.equal(cli(['protect', '--checks', ' , '], { repo: repoWith(), fake }).code, 2);
 });
 
+test('protect: the guard contexts are added to the config list (and are enough on their own) unless ci.guard_checks is false', () => {
+  const fake = createFakeGh([REPO]);
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml('github', ['ci'], { guardChecks: true }));
+  repo.commit('init');
+  const r = cli(['protect'], { repo, fake });
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual(r.json.requests[0].body.required_status_checks.checks.map((c) => c.context), ['ci', 'Test integrity', 'Hard-stop scan']);
+  const bare = createTmpRepo();
+  bare.write('.claude/pipeline.yml', pipelineYml('github', [], { guardChecks: true }));
+  bare.commit('init');
+  assert.deepEqual(cli(['protect'], { repo: bare, fake }).json.checks, ['Test integrity', 'Hard-stop scan']);
+  // an explicit --checks is taken exactly as given
+  assert.deepEqual(cli(['protect', '--checks', 'x'], { repo, fake }).json.checks, ['x']);
+});
+
 const writeEntries = [
   { match: '^api -X PUT repos/acme/widgets/branches/main/protection ', stdoutJson: {} },
   { match: '^api -X PATCH repos/acme/widgets ', stdoutJson: {} },
