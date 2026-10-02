@@ -3,7 +3,11 @@
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "node", "args": ["scripts/pipeline/stop-verify.mjs"], "timeout": 900 }
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PROJECT_DIR:-.}/scripts/pipeline/stop-verify.mjs\"",
+            "timeout": 900
+          }
         ]
       }
     ]
@@ -19,11 +23,24 @@
       "Bash(gh pr list:*)",
       "Bash(gh pr create:*)",
       "Bash(gh pr ready:*)",
+      "Bash(gh pr edit:*)",
+      "Bash(gh pr update-branch:*)",
       "Bash(gh issue list:*)",
       "Bash(gh issue view:*)",
       "Bash(git worktree add:*)",
       "Bash(git worktree list:*)",
+      "Bash(git worktree remove:*)",
       "Bash(git fetch:*)",
+      "Bash(git pull:*)",
+      "Bash(git push:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git status:*)",
+      "Bash(shasum:*)",
+      "Bash(sha256sum:*)",
       "Bash(npx playwright test:*)"
     ]
   }

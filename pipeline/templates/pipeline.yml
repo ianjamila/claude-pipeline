@@ -18,6 +18,12 @@ ci:
   required_checks: ["Test integrity", "Hard-stop scan"]   # + your CI job names
   e2e_label: null              # label that triggers CI E2E for high-risk PRs, if any
   draft_while_iterating: false
+  # guard_checks: true         # default true: preflight and `protect` ALWAYS require the "Test integrity" and "Hard-stop scan"
+  #                            # statuses on top of required_checks. Set false only for a repo that does not run
+  #                            # pipeline-guards.yml (then list its real checks in required_checks).
+  # approvers: [your-login]    # GitHub logins whose `human-approved` / `test-change-approved` labels count. Empty = the repo
+  #                            # owner of a USER-owned repo. REQUIRED when the repo belongs to an organization: without it
+  #                            # every approval fails closed (reason org-repo-needs-ci.approvers).
 
 merge:
   # {pr} = PR number, {sha} = approved head SHA (the merge must refuse any other head).
