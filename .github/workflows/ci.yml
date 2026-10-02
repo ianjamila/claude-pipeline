@@ -1,0 +1,73 @@
+# Repo CI for claude-pipeline itself. The two job names are this repo's required checks
+# (.claude/pipeline.yml ci.required_checks): renaming a job breaks branch protection.
+#
+# Every step runs under bash (Git Bash on Windows) so one script serves both runners. The
+# installer runs into a throwaway Claude home whose path contains a space, then --check must
+# report no drift, a second install must be a no-op, and --uninstall must leave no pipeline files.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test-ubuntu:
+    name: test (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Tests (Node 20)
+        run: node scripts/test.mjs
+      - name: Installer round trip (Node 20)
+        run: ./.github/scripts/installer-round-trip.sh "$RUNNER_TEMP/claude home 20"
+
+      - name: Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Tests (Node 24)
+        run: node scripts/test.mjs
+      - name: Installer round trip (Node 24)
+        run: ./.github/scripts/installer-round-trip.sh "$RUNNER_TEMP/claude home 24"
+
+  test-windows:
+    name: test (windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      # Keep LF endings: .gitattributes pins *.mjs/*.sh to LF and fixtures to -text, and the
+      # byte-exact fixture tests (diffs, .cmd quoting) depend on that.
+      - name: Disable autocrlf
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Tests (Node 20)
+        run: node scripts/test.mjs
+      - name: Installer round trip (Node 20)
+        run: ./.github/scripts/installer-round-trip.sh "$RUNNER_TEMP/claude home 20"
