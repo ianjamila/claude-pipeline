@@ -290,3 +290,14 @@ test('a relative --dir is resolved from where the command was run', () => {
   assert.deepEqual(w.tree(), ['pr-9/rel.png']);
   assert.ok(readFileSync(join(w.repo.dir, 'shots', 'rel.png')).equals(PNG));
 });
+
+test('every remote-touching git call (ls-remote, fetch, push) carries a timeout; local ones do not', () => {
+  const w = world();
+  w.put('a.png');
+  const seen = [];
+  const gitFn = (args, o) => { seen.push({ args, timeoutMs: o.timeoutMs }); return gitRun(args, o); };
+  publishArtifacts({ root: w.repo.dir, pr: 7, files: selectImages(w.images).files, gitFn, tmpBase: tmp('cp-tmpbase-') });
+  const network = seen.filter((c) => ['ls-remote', 'fetch', 'push'].includes(c.args[0]));
+  assert.ok(network.some((c) => c.args[0] === 'push') && network.some((c) => c.args[0] === 'ls-remote'));
+  for (const c of network) assert.ok(c.timeoutMs > 0, `${c.args[0]} needs a timeout`);
+});

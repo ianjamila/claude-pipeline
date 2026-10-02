@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { guarded, resolveRepo } from '../lib/cmd-common.mjs';
-import { git as gitRun, GitError } from '../lib/git.mjs';
+import { git as gitRun, GitError, NETWORK_TIMEOUT_MS } from '../lib/git.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 
 export const meta = {
@@ -58,7 +58,7 @@ const isRaceFailure = (err) => err instanceof GitError && /rejected|non-fast-for
 
 // Commits `files` under pr-<pr>/ on the artifacts branch and pushes it. `gitFn` is injectable for tests.
 export function publishArtifacts({ root, pr, files, gitFn = gitRun, tmpBase = tmpdir() }) {
-  const g = (args, cwd = root) => gitFn(args, { cwd });
+  const g = (args, cwd = root, timeoutMs) => gitFn(args, { cwd, ...(timeoutMs ? { timeoutMs } : {}) });
   let lastErr;
   for (let attempt = 1; attempt <= ATTEMPTS; attempt += 1) {
     const holder = mkdtempSync(join(tmpBase, 'cp-artifacts-'));
@@ -69,13 +69,13 @@ export function publishArtifacts({ root, pr, files, gitFn = gitRun, tmpBase = tm
     try {
       let exists = true;
       try {
-        g(['ls-remote', '--exit-code', '--heads', REMOTE, `refs/heads/${ARTIFACTS_BRANCH}`]);
+        g(['ls-remote', '--exit-code', '--heads', REMOTE, `refs/heads/${ARTIFACTS_BRANCH}`], root, NETWORK_TIMEOUT_MS);
       } catch (err) {
         if (!(err instanceof GitError && err.code === 2)) throw err; // 2 = no such branch; anything else is a real failure
         exists = false;
       }
       if (exists) {
-        g(['fetch', REMOTE, `+refs/heads/${ARTIFACTS_BRANCH}:refs/remotes/${REMOTE}/${ARTIFACTS_BRANCH}`]);
+        g(['fetch', REMOTE, `+refs/heads/${ARTIFACTS_BRANCH}:refs/remotes/${REMOTE}/${ARTIFACTS_BRANCH}`], root, NETWORK_TIMEOUT_MS);
         g(['worktree', 'add', '--detach', wt, `${REMOTE}/${ARTIFACTS_BRANCH}`]);
       } else {
         g(['worktree', 'add', '--no-checkout', '--detach', wt]);
@@ -96,7 +96,7 @@ export function publishArtifacts({ root, pr, files, gitFn = gitRun, tmpBase = tm
       const commit = g(['rev-parse', 'HEAD'], wt).trim();
       const pushArgs = ['push', '--no-verify', REMOTE, `HEAD:refs/heads/${ARTIFACTS_BRANCH}`];
       assertSafeTarget(pushArgs.at(-1).split(':').pop());
-      g(pushArgs, wt);
+      g(pushArgs, wt, NETWORK_TIMEOUT_MS);
       return { commit, pushed: true };
     } catch (err) {
       lastErr = err;

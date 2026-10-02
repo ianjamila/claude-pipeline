@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { run as procRun } from '../pipeline/lib/proc.mjs';
-import { GitError } from '../pipeline/lib/git.mjs';
+import { GitError, git as gitRunReal } from '../pipeline/lib/git.mjs';
 import { fill } from '../pipeline/lib/config.mjs';
 import {
   runProdWatch, exitCodeFor, hostOf, readKnownGood, createGitOps, createSmoke, issueTitle,
@@ -622,6 +622,20 @@ test('createGitOps: reverts a squash merge in a temp worktree, pushes agent/reve
   assert.equal(repo.git(['worktree', 'list', '--porcelain']).match(/^worktree /gm).length, 1, 'the temp worktree is gone');
   assert.equal(existsSync(join(repo.dir, '.worktrees', 'revert-12')), false);
   assert.equal(repo.git(['config', '--get', 'branch.agent/revert-12.merge']).trim(), 'refs/heads/agent/revert-12', 'pushed with -u');
+});
+
+test('createGitOps: fetch and push (which run inside the production lock) carry a timeout', async () => {
+  const { repo } = repoWithOrigin();
+  repo.write('app.txt', 'v2\n');
+  const merge = repo.commit('Add widget (#12)');
+  repo.git(['push', '-q', 'origin', 'main']);
+  const seen = [];
+  const ops = createGitOps({ root: repo.dir, gitFn: (args, o) => { seen.push({ args, timeoutMs: o.timeoutMs }); return gitRunReal(args, o); } });
+  await ops.revertBranch({ sha: merge, branch: 'agent/revert-12', base: 'main', dirName: 'revert-12', worktreeDir: join(repo.dir, '.worktrees') });
+  for (const verb of ['fetch', 'push']) {
+    const c = seen.find((x) => x.args[0] === verb);
+    assert.ok(c?.timeoutMs > 0, `${verb} needs a timeout`);
+  }
 });
 
 test('createGitOps: a true merge commit is reverted with -m 1 (keeping the first-parent side)', async () => {

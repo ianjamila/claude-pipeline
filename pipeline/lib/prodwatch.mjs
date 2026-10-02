@@ -7,7 +7,7 @@
 import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fill } from './config.mjs';
-import { git as gitRun } from './git.mjs';
+import { git as gitRun, NETWORK_TIMEOUT_MS } from './git.mjs';
 import { runShellAsync } from './proc.mjs';
 import { tail } from './vercel.mjs';
 
@@ -96,8 +96,9 @@ export function createGitOps({ root, gitFn = gitRun, remote = 'origin' } = {}) {
     async revertBranch({ sha, branch, base, worktreeDir, dirName }) {
       // Never push anywhere but a fresh agent/revert-* branch: the default branch is not ours to write.
       if (!REVERT_BRANCH.test(branch) || branch === base) throw new Error(`refusing to push revert to ${JSON.stringify(branch)}`);
-      const g = (args, cwd = root) => gitFn(args, { cwd });
-      g(['fetch', remote, `+refs/heads/${base}:refs/remotes/${remote}/${base}`]);
+      const g = (args, cwd = root, timeoutMs) => gitFn(args, { cwd, ...(timeoutMs ? { timeoutMs } : {}) });
+      // fetch and push run inside the production lock: a hung network call must time out, not hold it forever.
+      g(['fetch', remote, `+refs/heads/${base}:refs/remotes/${remote}/${base}`], root, NETWORK_TIMEOUT_MS);
       const dir = join(worktreeDir, dirName);
       g(['worktree', 'add', '--no-track', '-b', branch, dir, `${remote}/${base}`]);
       try {
@@ -110,7 +111,7 @@ export function createGitOps({ root, gitFn = gitRun, remote = 'origin' } = {}) {
           try { g(['revert', '--abort'], dir); } catch { /* nothing in progress */ }
           throw err;
         }
-        g(['push', '-u', remote, `HEAD:refs/heads/${branch}`], dir);
+        g(['push', '-u', remote, `HEAD:refs/heads/${branch}`], dir, NETWORK_TIMEOUT_MS);
         return { branch, subject };
       } finally {
         try { g(['worktree', 'remove', '--force', dir]); } catch { /* best effort: a leftover temp worktree is harmless */ }
