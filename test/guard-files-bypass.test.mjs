@@ -679,3 +679,77 @@ test('inode identity: a path that is the same file as a protected root (hard lin
   assert.equal(w(path.join(home, '.claude', 'pipeline', 'hooks', 'new.mjs')), 'deny', 'a new file inside a protected dir');
   assert.equal(w(path.join(home, '.claude', 'notes.md')), 'allow');
 });
+
+// ---- 11. globs over protected subtrees (review finding 6) --------------------------------------------------
+
+table('glob over a protected subtree', [
+  "sed -i '' s/a/b/ ~/.claude/skills/*/SKILL.md",
+  'sed -i s/a/b/ ~/.claude/skills/ship/*.md',
+  'echo x >> ~/.clau?e/pipeline/hooks/guard-git.mjs',
+  'echo x >> ~/.c*/pipeline/hooks/guard-git.mjs',
+  'cd ~/.clau?e/skills/ship && echo evil >> SKILL.md',
+  'cd ~/.c*/pipeline && rm -rf hooks',
+  'rm ~/.claude/agents/*.md',
+  'rm ~/.claude/skills/ship*',
+  'rm -rf ~/.claude/skills/*',
+  'rm -rf ~/.cla*',
+  'rm -rf ~/.claude/*',
+  'echo x > ~/.claude/settings.js?n',
+  'echo x > ~/.claude/settings.[j]son',
+  'truncate -s 0 /home/u/.claude/pipeline/**/*.mjs',
+  'rm /h*/u/.claude/pipeline/VERSION',
+  'echo x > ~/.claude/p*/hooks/guard-files.mjs',
+], 'deny');
+
+table('glob that cannot reach a protected root', [
+  'rm ~/.claude/projects/-x/memory/*.md',
+  'rm ~/.claude/skills/shipping*',
+  'rm ~/.claude/skills/other-*/x.md',
+  'rm ~/.claude/agents/other*.md',
+  'echo x > ~/.claude/CLAUDE.m?',
+  'rm -rf ~/work/*',
+  'cat ~/.claude/skills/*/SKILL.md',
+  'ls ~/.clau?e/pipeline/hooks/*.mjs',
+  'sha256sum ~/.claude/pipeline/hooks/*.mjs',
+  'rm /home/*/scratch',
+], 'allow');
+
+// ---- 12. bare cd, links to home, -C style bases (review finding 7) -------------------------------------
+
+table('bare cd / links / base dirs', [
+  'cd && echo x > .claude/settings.json',
+  'pushd && sed -i s/a/b/ .claude/settings.json',
+  'cd ~ && echo x > .claude/settings.json',
+  'ln -s ~ /tmp/h && echo x > /tmp/h/.claude/settings.json',
+  'ln -s ~/.claude /tmp/c',
+  'ln -s $HOME /tmp/h',
+  'ln -sf / /tmp/root',
+  'ln -s ~/.. /tmp/up',
+  'ln -s ~/.claude/pipeline /tmp/p',
+  'ln -t /tmp ~',
+  'git -C ~ checkout -- .claude/settings.json',
+  'git -C ~ restore .claude/skills/ship/SKILL.md',
+  'git -C ~/.claude restore settings.json',
+  'tar -C ~ -xf /tmp/a.tar .claude/settings.json',
+  'tar --directory ~ -xf /tmp/a.tar .claude/pipeline',
+  'tar -xf /tmp/a.tar -C ~/.claude pipeline',
+  'unzip -d ~ /tmp/a.zip .claude/settings.json',
+  'unzip /tmp/a.zip .claude/settings.json -d ~',
+  'rsync -a /tmp/x/.claude/settings.json ~/.claude/',
+  'cp -t ~/.claude/pipeline /tmp/x',
+], 'deny');
+
+table('bare cd / links / base dirs: allowed', [
+  'cd && ls .claude/settings.json',
+  'cd && cat .claude/settings.json',
+  'cd ~ && echo x > notes.txt',
+  'ln -s /tmp/x ./x',
+  'ln -s ../shared ./shared',
+  'ln -s ~/work/app /tmp/app',
+  'git -C ~ status',
+  'git -C ~/work/app checkout -- src/a.ts',
+  'tar -C ~/work -xf /tmp/a.tar src',
+  'unzip -d ~/work /tmp/a.zip',
+  'cp -t ~/work /tmp/x',
+  'cp -t ~ /tmp/x',
+], 'allow');

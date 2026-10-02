@@ -474,6 +474,28 @@ function suffixRegexes(ci) {
   };
 }
 
+// One path segment of a glob as a regexp (`*` and `?` stay inside the segment); null when it cannot be compiled.
+function segmentRe(seg, ci) {
+  const re = globToRe(seg.replace(/\*\*/g, '*'), ci);
+  return re;
+}
+
+// Could glob `g` (an absolute, normalised path with wildcards) match `root` or something inside it? Segment by segment:
+// the first root.length segments of the glob must match the root's, and anything may follow. `**` matches any depth.
+function globReaches(g, root, ci) {
+  const gs = g.split('/');
+  const rs = root.split('/');
+  for (let i = 0; i < rs.length; i++) {
+    if (i >= gs.length) return false; // shorter than the root: it can only match a directory above it (checked separately)
+    if (gs[i] === '**') return true;
+    if (gs[i] === rs[i]) continue;
+    if (!/[*?[]/.test(gs[i])) { if (ci ? gs[i].toLowerCase() !== rs[i].toLowerCase() : true) return false; continue; }
+    const re = segmentRe(gs[i], ci);
+    if (!re || !re.test(rs[i])) return false;
+  }
+  return true;
+}
+
 function globToRe(g, ci) {
   let re = '';
   for (let i = 0; i < g.length; i++) {
@@ -529,6 +551,9 @@ function makeMatchers(ctx) {
     const star = g.search(/[*?[]/);
     const lit = g.slice(0, g.lastIndexOf('/', star) + 1) || '/';
     if (ctx.hit(lit)) return true;
+    // a glob that can match a protected root or anything inside one (~/.claude/skills/*/SKILL.md, ~/.c*/pipeline/x) ...
+    if (ctx.roots.some((r) => globReaches(g, r, ctx.ci))) return true;
+    // ... or a directory that holds them (~/.cla*, ~/.claude/*)
     const re = globToRe(g, ctx.ci);
     return !!re && ancestors.some((a) => re.test(a));
   };
@@ -700,21 +725,53 @@ function collectVars(cmds, ctx) {
 // Directories the command line may be operating in: the hook's cwd plus every `cd` target (chained ones too).
 function collectDirs(cmds, ctx) {
   const dirs = [ctx.cwd];
+  const addDir = (e) => {
+    for (const d of [...dirs]) {
+      const nd = isAbs(e) ? posix.normalize(e) : posix.join(d, e);
+      if (!dirs.includes(nd) && dirs.length < 32) dirs.push(nd);
+    }
+  };
   for (const c of cmds) {
-    if (!CD_CMDS.has(baseOf(c.argv[0] ?? ''))) continue;
+    // commands that run relative to another directory: git -C DIR, tar -C DIR, unzip -d DIR, make -C DIR, cp -t DIR
+    for (const b of baseDirsOf(c.argv)) addDir(expandRefs(b, ctx));
+    const cdName = baseOf(c.argv[0] ?? '');
+    if (!CD_CMDS.has(cdName)) continue;
     let t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
+    if (!t && (cdName === 'cd' || cdName === 'pushd')) t = '~'; // a bare `cd` goes home
     if (c.raw.includes('\\')) {
       const m = /^\s*(?:cd|pushd|set-location|sl)\s+(?:\/d\s+)?["']?([^"';&|\n]+)/i.exec(c.raw);
       if (m) t = m[1].trim();
     }
     if (!t) continue;
-    const e = expandRefs(t, ctx);
-    for (const d of [...dirs]) {
-      const nd = isAbs(e) ? posix.normalize(e) : posix.join(d, e);
-      if (!dirs.includes(nd) && dirs.length < 32) dirs.push(nd);
-    }
+    addDir(expandRefs(t, ctx));
   }
   return dirs;
+}
+
+// The directory words of commands whose other arguments are read relative to them.
+function baseDirsOf(argv) {
+  const name = baseOf(argv[0] ?? '');
+  const args = argv.slice(1);
+  const out = [];
+  const flagValue = (short, long) => {
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (a === '--') break;
+      if (a === `-${short}` || a === `--${long}`) { if (args[i + 1] !== undefined) out.push(args[i + 1]); i++; }
+      else if (a.startsWith(`--${long}=`)) out.push(a.slice(long.length + 3));
+      else if (!a.startsWith('--') && a.startsWith(`-${short}`) && a.length > 2) out.push(a.slice(a[2] === '=' ? 3 : 2));
+    }
+  };
+  if (name === 'git') {
+    for (let i = 0; i < args.length && args[i].startsWith('-'); i++) {
+      if (args[i] === '-C' && args[i + 1] !== undefined) { out.push(args[i + 1]); i++; } else if (args[i] === '-c' || args[i] === '--git-dir' || args[i] === '--work-tree') i++;
+    }
+  } else if (name === 'tar' || name === 'bsdtar' || name === 'gtar') flagValue('C', 'directory');
+  else if (name === 'unzip') flagValue('d', 'directory');
+  else if (name === 'make' || name === 'gmake') flagValue('C', 'directory');
+  else if (name === 'cp' || name === 'mv' || name === 'install' || name === 'ln') flagValue('t', 'target-directory');
+  else if (name === 'rsync') { const pos = args.filter((a) => !a.startsWith('-')); if (pos.length >= 2) out.push(pos[pos.length - 1]); }
+  return out;
 }
 
 // ---- Bash: rule 3 and 4 helpers ------------------------------------------------------------------
@@ -880,6 +937,39 @@ function judgeScriptFile(sf, dirs, ctx, opts) {
   return null;
 }
 
+// `ln -s ~ /tmp/h`: a second name for home (or a protected root, or a directory above one) lets later commands reach
+// the protected files through a path that names none of them. Judged by what is LINKED TO, never by the link name.
+function linkTargets(argv) {
+  const pos = [];
+  let dirMode = false;
+  for (let i = 1; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--') { pos.push(...argv.slice(i + 1)); break; }
+    if (a === '-t' || a === '--target-directory') { dirMode = true; i++; continue; }
+    if (a.startsWith('--target-directory=') || (/^-t./.test(a) && !a.startsWith('--'))) { dirMode = true; continue; }
+    if (a.length > 1 && a.startsWith('-')) continue;
+    pos.push(a);
+  }
+  return dirMode || pos.length < 2 ? pos : pos.slice(0, -1);
+}
+
+function linkReachesProtected(cmds, dirs, ctx) {
+  for (const c of cmds) {
+    if (baseOf(c.argv[0] ?? '') !== 'ln') continue;
+    for (const t of linkTargets(c.argv)) {
+      const e = expandRefs(t, ctx);
+      if (/[*?[]/.test(e)) continue; // a glob target is judged by the glob rules
+      for (const d of isAbs(e) ? [''] : dirs) {
+        const full = posix.normalize(isAbs(e) ? e : posix.join(d, e));
+        for (const p of unique([full, realResolve(full, ctx.api)])) {
+          if (ctx.hit(p) || ctx.hitAncestor(p) || ctx.roots.some((r) => isInside(r, p, ctx.platform))) return t;
+        }
+      }
+    }
+  }
+  return null;
+}
+
 // ---- Bash --------------------------------------------------------------------------------------------
 
 export function evaluateBashForFiles(command, opts = {}) {
@@ -925,6 +1015,10 @@ export function evaluateBashForFiles(command, opts = {}) {
       if (r.decision === 'deny') return deny(`job start would run: ${r.reason}`);
     }
   }
+
+  // 8: links to home, to a protected root or to a directory above one
+  const linked = linkReachesProtected(cmds, dirs, ctx);
+  if (linked) return deny(`ln links to ${linked}, which is (or holds) protected pipeline files; a link would let later commands reach them under another name (${PROTECTED_MSG})`);
 
   // 7: a script file (bash f.sh, source f, ./f, node f.mjs) runs whatever is in it
   if ((opts._depth ?? 0) < 4) {
