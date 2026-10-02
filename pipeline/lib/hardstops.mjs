@@ -43,8 +43,21 @@ const NON_CODE_GLOBS = ['**/*.md', 'docs/**'];
 const isMigrationPath = (p) => !/\.md$/.test(p) && inc(p, MIGRATION_GLOBS);
 // "SQL file": `**/*.sql` or anything under a migrations dir.
 const isSqlPath = (p) => inc(p, ['**/*.sql']) || isMigrationPath(p);
-// "Code file": not markdown, not under docs/, not a test file. An EXCLUSION test, so it matches the path as written.
-const isCodeFile = (p, testGlobs) => !matchAny(p, NON_CODE_GLOBS) && !matchAny(p, testGlobs);
+// "Code file": not markdown, not under docs/, not a GENUINE test file. An EXCLUSION test, so it matches the path as written.
+// A test glob never hides code that really runs: a migration (the Supabase CLI applies `<n>_<name>.sql` whatever the name
+// says), any .sql outside supabase/tests/, a route handler / server entry, or a Next page under a directory that happens
+// to be called `test`. Only a file NAMED *.test.* / *.spec.* or one in a plain test directory is exempt.
+const PGTAP_DIR = ['**/supabase/tests/**'];
+const TEST_NAME = /\.(?:test|spec)\.[^/]+$/i;
+const NEXT_ENTRY_GLOBS = ['**/app/**/{page,layout,route,default,template,error,not-found,loading,actions,middleware,proxy}.*'];
+const isTestFile = (p, testGlobs) => {
+  if (!matchAny(p, testGlobs)) return false;
+  if (isMigrationPath(p)) return false;
+  if (/\.sql$/i.test(p)) return matchAny(p, PGTAP_DIR);
+  if (TEST_NAME.test(p)) return true;
+  return !inc(p, SERVER_ENTRY_GLOBS) && !inc(p, NEXT_ENTRY_GLOBS);
+};
+const isCodeFile = (p, testGlobs) => !matchAny(p, NON_CODE_GLOBS) && !isTestFile(p, testGlobs);
 
 // Binary changes we accept without reading: assets nobody can hide logic in.
 const BINARY_ASSET = /\.(?:png|jpe?g|gif|webp|avif|ico|svg|pdf|zip|gz|tgz|woff2?|ttf|otf|eot|mp4|mov|mp3|wav|wasm|bin|snap)$/i;
@@ -76,7 +89,11 @@ const R3_PATH_GLOBS = [
   '**/credentials*.json', '**/*service-account*.json',
 ];
 const R4_PATH_GLOBS = [
-  '**/.github/**', '**/.claude/**', '**/.githooks/**', '**/CODEOWNERS', '**/scripts/verify*', '**/scripts/verify*/**',
+  '**/.github/**', '**/.claude/**', '**/.githooks/**', '**/CODEOWNERS',
+  // Agent-instruction files steer the agents that review and write code; a PR must not rewrite its own rules.
+  '**/CLAUDE.md', '**/AGENTS.md', '**/.cursorrules', '**/.github/copilot-instructions.md',
+  // A submodule add repoints the checkout at code nobody reviewed here.
+  '**/.gitmodules', '**/scripts/verify*', '**/scripts/verify*/**',
   '**/scripts/pipeline/**', '**/pipeline.yml', '**/vitest.config.*', '**/vitest.workspace.*', '**/jest.config.*',
   '**/playwright*.config.*', '**/.nycrc*', '**/codecov.y*ml', '**/.husky/**',
   // Beyond the spec: other places the verify gate or the build can be loosened.
@@ -766,7 +783,7 @@ function describe(f, cx) {
   const paths = [...new Set([f.oldPath, f.newPath, f.path].filter(Boolean))];
   const file = f.path ?? f.newPath ?? f.oldPath;
   return {
-    file, paths, status: f.status, binary: Boolean(f.binary),
+    file, paths, status: f.status, binary: Boolean(f.binary), gitlink: Boolean(f.gitlink),
     oldPath: f.oldPath ?? null, newPath: f.newPath ?? null,
     added: f.added ?? [], removed: f.removed ?? [],
     sql: paths.some(isSqlPath),
@@ -783,6 +800,9 @@ function pathRules(d, cx, sink) {
   if (d.binary && !d.paths.every((p) => BINARY_ASSET.test(p))) {
     sink.add('R0-unscannable', d.file, "binary diff; content can't be checked");
   }
+
+  // A submodule (gitlink) entry points the repo at code this diff does not contain.
+  if (d.gitlink) sink.add('R4-pipeline', d.file, 'submodule (gitlink) entry added, changed or removed');
 
   // R1: existing migrations are immutable; deleting one (or moving it out of the migrations dir) is destructive.
   const inMigrations = d.paths.some(isMigrationPath);
