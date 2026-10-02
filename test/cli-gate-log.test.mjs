@@ -87,6 +87,48 @@ test('summary: edits the existing summary comment in place (marker + same author
   assert.equal(cli(['summary', '--pr', String(PR)], { dir: repo.dir, fake }).code, 2, '--outcome is required');
 });
 
+// The two early-stop paths (verify red 3x, Codex out in round 1) have no state.json; they still need a comment and a log line.
+test('summary: --outcome blocked / awaiting-review render without state.json (empty rounds, verify failure named) and print the agent-log line', () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml());
+  repo.write('.gitignore', '.review/\n.verify/\n');
+  repo.commit('init');
+  repo.write('.verify/report.json', JSON.stringify({ version: 1, mode: 'full', ok: false, steps: [{ name: 'install', status: 'pass' }, { name: 'lint', status: 'fail' }, { name: 'unit', status: 'not-run' }] }));
+
+  const fake = summaryGh();
+  const blocked = cli(['summary', '--pr', String(PR), '--outcome', 'blocked'], { dir: repo.dir, fake });
+  assert.equal(blocked.code, 0, `${blocked.stderr}\n${blocked.stdout}`);
+  assert.match(blocked.json.agentLogLine, /^- \d{4}-\d{2}-\d{2} · #12 · Add widget · risk unknown · rounds 0 · arbiter 0 · blocked$/);
+  const body = JSON.parse(fake.calls().find((c) => c.argv.includes('POST')).stdin).body;
+  assert.ok(body.startsWith(MARKERS.summary));
+  assert.match(body, /\*\*blocked — verify failed at step lint \(full\)\*\*/);
+  assert.match(body, /### Suggestions implemented\n\n_None_/);
+
+  const fake2 = summaryGh();
+  const awaiting = cli(['summary', '--pr', String(PR), '--outcome', 'awaiting-review', '--built', 'A widget.'], { dir: repo.dir, fake: fake2 });
+  assert.equal(awaiting.code, 0, `${awaiting.stderr}\n${awaiting.stdout}`);
+  assert.match(awaiting.json.agentLogLine, /· rounds 0 · arbiter 0 · awaiting-review$/);
+  const body2 = JSON.parse(fake2.calls().find((c) => c.argv.includes('POST')).stdin).body;
+  assert.match(body2, /\*\*awaiting-review\*\*/, 'only a blocked outcome gets the verify detail');
+  assert.match(body2, /A widget\./);
+});
+
+test('summary: blocked without a verify report still renders; every other outcome without state stays exit 2', () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml());
+  repo.write('.gitignore', '.review/\n');
+  repo.commit('init');
+  const fake = summaryGh();
+  const r = cli(['summary', '--pr', String(PR), '--outcome', 'blocked'], { dir: repo.dir, fake });
+  assert.equal(r.code, 0, `${r.stderr}\n${r.stdout}`);
+  assert.match(JSON.parse(fake.calls().find((c) => c.argv.includes('POST')).stdin).body, /\*\*blocked\*\*/);
+  for (const outcome of ['merged', 'needs-human', 'reverted']) {
+    const none = cli(['summary', '--pr', String(PR), '--outcome', outcome], { dir: repo.dir, fake: summaryGh() });
+    assert.equal(none.code, 2, outcome);
+    assert.match(none.json.message, /only --outcome blocked\|awaiting-review/);
+  }
+});
+
 test('summary: an unreachable GitHub is exit 3', () => {
   const repo = createTmpRepo();
   repo.write('.claude/pipeline.yml', pipelineYml());

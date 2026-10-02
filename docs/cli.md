@@ -283,6 +283,8 @@ pipeline summary --pr N --outcome O [--built TEXT] [--repo DIR]   -> {ok, url, a
 
 Exit: 0 · 2 usage / no state · 3 GitHub (`gh`) unavailable.
 
+Without `.review/state.json` only `--outcome blocked` and `--outcome awaiting-review` are accepted (the two early-stop paths: verify red three times, Codex out in round 1): the comment is rendered with no rounds (a `blocked` one names the failing step from the verify report) and `agentLogLine` is still printed. Any other outcome without state is exit 2.
+
 ## triage
 
 apply the judge triage, settle disputed bugs with test results, close the light lane.

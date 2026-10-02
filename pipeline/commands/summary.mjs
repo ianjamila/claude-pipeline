@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
-import { loadState } from '../lib/state.mjs';
+import { emptyState, loadState } from '../lib/state.mjs';
+import { loadConfig } from '../lib/config.mjs';
 import { MARKERS, summaryComment } from '../lib/render.mjs';
 import { buildAgentLogLine } from '../lib/agentlog.mjs';
 import { inlineOptionValues } from '../lib/finalgate.mjs';
@@ -14,6 +15,25 @@ export const meta = {
   summary: 'upsert the PR summary comment and print the agent-log line',
   usage: 'pipeline summary --pr N --outcome O [--built TEXT] [--repo DIR]   -> {ok, url, agentLogLine}',
 };
+
+// The two early-stop paths never reach a review round (verify red three times, or Codex out in round 1), so there is no
+// state.json to render from. They still get a comment and a log line: rounds are empty, the verify report (if any) names
+// where it stopped.
+const NO_STATE_OUTCOMES = new Set(['blocked', 'awaiting-review']);
+
+async function verifyDetail(root) {
+  let file = join(root, '.verify', 'report.json');
+  try {
+    const loaded = await loadConfig(root);
+    if (loaded.ok) file = join(root, loaded.config.verify.report);
+  } catch { /* the default location will do */ }
+  try {
+    const report = JSON.parse(readFileSync(file, 'utf8'));
+    const failed = (report?.steps ?? []).find((s) => s?.status === 'fail');
+    if (failed?.name) return `verify failed at step ${String(failed.name).slice(0, 60)}${report.mode ? ` (${String(report.mode).slice(0, 20)})` : ''}`;
+  } catch { /* no usable report */ }
+  return null;
+}
 
 // One entry per round whose Fable model proof passed; a round without (or with a failed) proof adds nothing.
 function readModelProofs(root) {
@@ -62,12 +82,19 @@ export const run = guarded(async (argv, ctx) => {
   } catch (err) {
     throw new UsageError(err.message);
   }
-  if (!state) throw new UsageError(`no review state at ${join(root, '.review', 'state.json')}: the summary comment is rendered from it`);
+  let detail = null;
+  if (!state) {
+    if (!NO_STATE_OUTCOMES.has(outcome)) {
+      throw new UsageError(`no review state at ${join(root, '.review', 'state.json')}: the summary comment is rendered from it (only --outcome ${[...NO_STATE_OUTCOMES].join('|')} can be summarised without one)`);
+    }
+    state = emptyState({ repo: '', pr, branch: '', risk: null });
+    detail = outcome === 'blocked' ? await verifyDetail(root) : null;
+  }
 
   const gh = createGitHub({ cwd: root, env: ctx.env });
   return guardGh(() => {
     const { title } = gh.prView(pr, ['title']);
-    const body = summaryComment(state, { outcome, built: values.built, followups: followupsOf(state), modelProofs: readModelProofs(root) });
+    const body = summaryComment(state, { outcome: detail ? `${outcome} — ${detail}` : outcome, built: values.built, followups: followupsOf(state), modelProofs: readModelProofs(root) });
     const posted = gh.upsertComment(pr, MARKERS.summary, body);
     const agentLogLine = buildAgentLogLine({ state, pr, title, outcome });
     return { exitCode: EXIT.OK, output: { ok: true, url: posted.url, action: posted.action, agentLogLine } };
