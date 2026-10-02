@@ -187,6 +187,26 @@ export function contentHash(base, head, { exclude = [], ...o } = {}) {
   return createHash('sha256').update(normaliseDiff(text)).digest('hex');
 }
 
+// `origin/<branch>` is what a PR will be merged into; a repo without that remote ref (a fresh clone of a local fixture,
+// a test) falls back to the local branch. Any other git failure is not swallowed.
+export function reviewBaseRef(branch, o) {
+  const remote = `origin/${branch}`;
+  try {
+    revParse(remote, o);
+    return remote;
+  } catch (err) {
+    if (err instanceof GitError) return branch;
+    throw err;
+  }
+}
+
+// THE content hash of "the code that was reviewed": what HEAD changes relative to where it forked from the PR base,
+// minus the agent log the pipeline itself appends to. The review loop (round coverage, review-complete) and the final
+// gate / merge both call this, so they cannot disagree about whether a review is current.
+export function reviewContentHash({ branch, agentLog } = {}, o) {
+  return contentHash(reviewBaseRef(branch, o), 'HEAD', { ...o, exclude: agentLog ? [agentLog] : [] });
+}
+
 // Streams the file so a large untracked artifact does not have to fit in memory.
 function sha256OfFile(abs) {
   const h = createHash('sha256');

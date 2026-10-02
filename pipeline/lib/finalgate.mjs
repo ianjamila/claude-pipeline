@@ -18,7 +18,7 @@ import { toPosix } from './paths.mjs';
 import { loadState } from './state.mjs';
 import { parseYaml } from './yaml.mjs';
 import { reviewValidFor } from './triage.mjs';
-import { commitTime, contentHash, diffFiles, headSha, mergeBase, revParse, treeFingerprint } from './git.mjs';
+import { commitTime, diffFiles, headSha, mergeBase, reviewBaseRef, reviewContentHash, treeFingerprint } from './git.mjs';
 
 export const GATE_FILE = 'final-gate.json';
 export const BLOCKING_LABELS = Object.freeze(['needs-human', 'awaiting-review', 'pipeline-blocked']);
@@ -165,23 +165,12 @@ function ciExplicitlyEmpty(root) {
 // ---- refs, hashes -------------------------------------------------------------------------------
 
 // `origin/<default>` when the remote ref exists (the PR's real base), else the local default branch.
-export function baseRefFor(root, config) {
-  const remote = `origin/${config.default_branch}`;
-  try {
-    revParse(remote, { cwd: root });
-    return remote;
-  } catch {
-    return config.default_branch;
-  }
-}
+export const baseRefFor = (root, config) => reviewBaseRef(config.default_branch, { cwd: root });
 
 // The review's content hash for HEAD: the patch against the merge-base, minus the agent log the pipeline appends to.
-// (Same formula as the review loop's own helper; kept private here so the gate does not depend on its file.)
-export function localContentHash(root, config) {
-  const o = { cwd: root };
-  const mb = mergeBase(baseRefFor(root, config), 'HEAD', o);
-  return contentHash(mb, 'HEAD', { ...o, exclude: [config.agent_log] });
-}
+// Literally the review loop's hash: both call git.mjs#reviewContentHash.
+export const localContentHash = (root, config) =>
+  reviewContentHash({ branch: config.default_branch, agentLog: config.agent_log }, { cwd: root });
 
 function lazyDiff(root, config) {
   let cached = null;

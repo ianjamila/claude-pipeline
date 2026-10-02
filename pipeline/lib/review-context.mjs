@@ -1,13 +1,13 @@
 // Plumbing shared by the review-loop commands (codex-review, triage, arbiter, state, review-complete, followups).
 // Why one module: they all read and write the same .review/ tree and must agree on what "the content that was
 // reviewed" means. In particular `currentContentHash` is the single definition of the hash that round coverage and
-// the merge gate compare, so a command that hashed differently would let a stale review look current.
+// the merge gate compare, so a command that hashed differently would let a stale review look current. (The formula itself lives in git.mjs.)
 import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { EXIT } from './cli.mjs';
 import { Fail } from './cmd-common.mjs';
-import { GitError, contentHash, revParse } from './git.mjs';
+import { reviewBaseRef as gitReviewBaseRef, reviewContentHash } from './git.mjs';
 import { LockTimeoutError, withLock } from './locks.mjs';
 import { loadState } from './state.mjs';
 
@@ -18,27 +18,14 @@ export const oneLine = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
 
 // ---- content hash ---------------------------------------------------------------------------
 
-// `origin/<branch>` is what the PR will be merged into (the default branch unless the PR names its own base); a repo
-// without that remote ref (a fresh clone of a local fixture, a test) falls back to the local branch. Any other git
-// failure is not swallowed.
-export function reviewBaseRef(root, config, branch = config.default_branch) {
-  const remote = `origin/${branch}`;
-  try {
-    revParse(remote, { cwd: root });
-    return remote;
-  } catch (err) {
-    if (err instanceof GitError) return branch;
-    throw err;
-  }
-}
+// `origin/<branch>` is what the PR will be merged into (the default branch unless the PR names its own base); see
+// git.mjs#reviewBaseRef for the fallback.
+export const reviewBaseRef = (root, config, branch = config.default_branch) => gitReviewBaseRef(branch, { cwd: root });
 
-// What the branch changes relative to where it forked, minus the agent log the pipeline itself appends to.
-export function currentContentHash(root, config) {
-  return contentHash(reviewBaseRef(root, config), 'HEAD', {
-    cwd: root,
-    exclude: config.agent_log ? [config.agent_log] : [],
-  });
-}
+// What the branch changes relative to where it forked, minus the agent log. One definition, in git.mjs, shared with the
+// final gate (finalgate.mjs#localContentHash).
+export const currentContentHash = (root, config) =>
+  reviewContentHash({ branch: config.default_branch, agentLog: config.agent_log }, { cwd: root });
 
 // ---- .review/ layout ------------------------------------------------------------------------
 
