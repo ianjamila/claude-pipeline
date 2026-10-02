@@ -63,11 +63,11 @@ function writeSettings(home, obj) {
 }
 
 const guardGit = (home) => ({
-  matcher: 'Bash|PowerShell',
+  matcher: 'Bash|PowerShell|Monitor|mcp__.*',
   hooks: [{ type: 'command', command: 'node', args: [join(home, 'pipeline', 'hooks', 'guard-git.mjs')], timeout: 15 }],
 });
 const guardFiles = (home) => ({
-  matcher: 'Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|mcp__.*',
+  matcher: 'Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|Monitor|mcp__.*',
   hooks: [{ type: 'command', command: 'node', args: [join(home, 'pipeline', 'hooks', 'guard-files.mjs')], timeout: 15 }],
 });
 const allowEntries = (home) => [
@@ -659,7 +659,7 @@ test('mergeSettings on an empty object builds the minimal structure; skipFileGua
   assert.deepEqual(full.permissions.allow, ['Bash(node /h/.claude/pipeline/bin/pipeline.mjs:*)', 'Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)']);
   const partial = mergeSettings({}, { home: '/h/.claude', skipFileGuard: true });
   assert.equal(partial.hooks.PreToolUse.length, 1);
-  assert.equal(partial.hooks.PreToolUse[0].matcher, 'Bash|PowerShell');
+  assert.equal(partial.hooks.PreToolUse[0].matcher, 'Bash|PowerShell|Monitor|mcp__.*');
 });
 
 test('mergeSettings writes native Windows paths in args and a posix path in the allow entry', () => {
@@ -837,12 +837,12 @@ test('shellRcPaths: POSIX rc files everywhere, PowerShell profiles on win32', ()
 
 // ---- review findings (task 4.1 fixes) ------------------------------------------------------------------------
 
-test('guard-git matches Bash and PowerShell, guard-files stays last with its wider matcher; both come from constants', () => {
-  assert.equal(GUARD_GIT_MATCHER, 'Bash|PowerShell');
+test('guard-git matches Bash, PowerShell, Monitor and MCP tools, guard-files stays last with its wider matcher; both come from constants', () => {
+  assert.equal(GUARD_GIT_MATCHER, 'Bash|PowerShell|Monitor|mcp__.*');
   const out = mergeSettings({}, { home: '/h/.claude' });
-  assert.deepEqual(out.hooks.PreToolUse.map((g) => g.matcher), ['Bash|PowerShell', GUARD_FILES_MATCHER]);
+  assert.deepEqual(out.hooks.PreToolUse.map((g) => g.matcher), ['Bash|PowerShell|Monitor|mcp__.*', GUARD_FILES_MATCHER]);
   const skip = mergeSettings({}, { home: '/h/.claude', skipFileGuard: true });
-  assert.deepEqual(skip.hooks.PreToolUse.map((g) => g.matcher), ['Bash|PowerShell']);
+  assert.deepEqual(skip.hooks.PreToolUse.map((g) => g.matcher), ['Bash|PowerShell|Monitor|mcp__.*']);
 
   // --check treats the old Bash-only matcher as drift (the hook would never fire on PowerShell)
   const home = newHome();

@@ -201,7 +201,7 @@ Ship invokes judge/arbiter **without** a `model` parameter. Proof switch for tes
 
 ### 5.5 Global hooks (`~/.claude/settings.json`, PreToolUse)
 
-**guard-git** (matcher `Bash|PowerShell`): deny when any simple command (after splitting on `; && || | &`,
+**guard-git** (matcher `Bash|PowerShell|Monitor|mcp__.*`): deny when any simple command (after splitting on `; && || | &`,
 newlines, `$(…)`, backticks, and recursing into `bash|sh|zsh -c`, `eval`) is:
 - `git push` targeting `main`/`master` (explicit refspec dest incl. `HEAD:main`,
   `refs/heads/main`, `:main`, `--delete main`), or with no refspec while the checkout's current
@@ -218,7 +218,7 @@ newlines, `$(…)`, backticks, and recursing into `bash|sh|zsh -c`, `eval`) is:
 Internal error → deny only if the command mentions `push`, `merge`, `protection`, `ruleset`,
 or a guarded label; otherwise allow.
 
-**guard-files** (matcher `Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|mcp__.*`), bypassed only when the
+**guard-files** (matcher `Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|Monitor|mcp__.*`), bypassed only when the
 Claude Code **process** env has `PIPELINE_ADMIN=1`:
 - deny file tools whose resolved target (realpath of nearest existing ancestor, case-insensitive
   on macOS/Windows) is inside: `~/.claude/skills/{pipeline-setup,verify,ship}/`,

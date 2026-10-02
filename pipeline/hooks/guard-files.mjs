@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Why: Claude Code PreToolUse hook (matcher Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|mcp__.*) that keeps agents from
+// Why: Claude Code PreToolUse hook (matcher Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|Monitor|mcp__.*) that keeps agents from
 // editing their own rules: the globally installed pipeline files, the global settings that load the hooks, and
 // the hook off-switches. Only a Claude Code process launched with PIPELINE_ADMIN=1 bypasses it. The decision
 // logic is in lib/files-policy.mjs; this file only does stdin/stdout and must never crash, because a crashing
@@ -8,7 +8,7 @@
 import os from 'node:os';
 
 const FILE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
-const SHELL_TOOLS = new Set(['Bash', 'PowerShell']);
+const SHELL_TOOLS = new Set(['Bash', 'PowerShell', 'Monitor']);
 // An internal error denies only when the raw input could be about the pipeline's own switches.
 const SENSITIVE = /\.claude|PIPELINE_ADMIN|disableAllHooks|install\./;
 

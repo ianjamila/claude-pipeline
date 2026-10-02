@@ -14,8 +14,8 @@ export const EXCLUDED_NAMES = new Set(['node_modules', '.DS_Store']);
 // Skipped only directly under the walked root (pipeline/, skills/<name>/): a nested reference/test/ is content.
 export const EXCLUDED_TOP_LEVEL = new Set(['test']);
 export const MANIFEST_REL = 'pipeline/INSTALLED.json';
-export const GUARD_GIT_MATCHER = 'Bash|PowerShell';
-export const GUARD_FILES_MATCHER = 'Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|mcp__.*';
+export const GUARD_GIT_MATCHER = 'Bash|PowerShell|Monitor|mcp__.*';
+export const GUARD_FILES_MATCHER = 'Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|Monitor|mcp__.*';
 export const HOOK_TIMEOUT_S = 15;
 export const STAGING_REL = 'backups/.staging';
 export const TILDE_ALLOW_ENTRY = 'Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)';

@@ -946,3 +946,32 @@ test('spawn: label rules need no gh at all', () => {
 
 function readLines(file) { return readFileSync(file, 'utf8').split('\n').filter(Boolean); }
 function readFirstLine(file) { return readLines(file)[0]; }
+
+// ---- Monitor and MCP command tools (review finding 1) ---------------------------------------------------
+
+const toolInput = (tool_name, tool_input, cwd = TMP) => ({ session_id: 's', cwd, hook_event_name: 'PreToolUse', tool_name, tool_input });
+const denied = (r) => r.status === 0 && r.stdout !== '' && JSON.parse(r.stdout).hookSpecificOutput.permissionDecision === 'deny';
+
+test('spawn: the Monitor tool is judged like Bash', () => {
+  assert.ok(denied(hook(toolInput('Monitor', { command: 'git push origin main' }))));
+  assert.ok(denied(hook(toolInput('Monitor', { command: 'gh pr merge 1 --admin' }))));
+  const ok = hook(toolInput('Monitor', { command: 'git push -u origin agent/x' }));
+  assert.equal(ok.stdout, '');
+});
+
+test('spawn: an MCP tool string field named command / cmd / script is judged like a Bash command', () => {
+  assert.ok(denied(hook(toolInput('mcp__shell__run', { command: 'git push origin main' }))));
+  assert.ok(denied(hook(toolInput('mcp__shell__run', { options: { cmd: 'git push -f' } }))));
+  assert.ok(denied(hook(toolInput('mcp__ide__exec', { script: 'gh pr edit 1 --add-label human-approved' }))));
+  assert.equal(hook(toolInput('mcp__shell__run', { command: 'git status' })).stdout, '');
+  // text that merely sits in a differently named field (a Notion page body) is not a command
+  assert.equal(hook(toolInput('mcp__notion__create_page', { body: 'git push origin main' })).stdout, '');
+});
+
+test('the installed matchers cover Monitor and MCP tools for guard-git', async () => {
+  const { GUARD_GIT_MATCHER, GUARD_FILES_MATCHER } = await import('../pipeline/lib/installer.mjs');
+  for (const m of [GUARD_GIT_MATCHER, GUARD_FILES_MATCHER]) {
+    const re = new RegExp(`^(?:${m})$`);
+    for (const tool of ['Bash', 'PowerShell', 'Monitor', 'mcp__x__run']) assert.ok(re.test(tool), `${m} must match ${tool}`);
+  }
+});

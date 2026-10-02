@@ -794,3 +794,13 @@ test('hook: unrelated tools and shapes are allowed', (t) => {
     assert.equal(r.stdout, '', JSON.stringify(input));
   }
 });
+
+// ---- Monitor (review finding 1) ----------------------------------------------------------------------
+
+test('hook: the Monitor tool is judged like Bash', (t) => {
+  const home = tmpHome(t);
+  const deny = runHook({ tool_name: 'Monitor', tool_input: { command: 'echo {} > ~/.claude/settings.json' }, cwd: home }, { home });
+  assert.equal(JSON.parse(deny.stdout).hookSpecificOutput.permissionDecision, 'deny');
+  const ok = runHook({ tool_name: 'Monitor', tool_input: { command: 'tail -f /tmp/x.log' }, cwd: home }, { home });
+  assert.equal(ok.stdout, '');
+});

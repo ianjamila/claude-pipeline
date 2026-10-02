@@ -12,8 +12,8 @@ const read = (rel) => readFileSync(join(root, rel), 'utf8');
 const ROLLBACK = 'vercel rollback <known-good> --yes --timeout 3m';
 
 test('installer hook matchers are what the docs say', () => {
-  assert.equal(GUARD_GIT_MATCHER, 'Bash|PowerShell');
-  assert.equal(GUARD_FILES_MATCHER, 'Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|mcp__.*');
+  assert.equal(GUARD_GIT_MATCHER, 'Bash|PowerShell|Monitor|mcp__.*');
+  assert.equal(GUARD_FILES_MATCHER, 'Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|Monitor|mcp__.*');
   const spec = read('docs/specs/2026-10-01-claude-pipeline-design.md');
   assert.ok(spec.includes(`**guard-git** (matcher \`${GUARD_GIT_MATCHER}\`)`));
   assert.ok(spec.includes(`**guard-files** (matcher \`${GUARD_FILES_MATCHER}\`)`));
