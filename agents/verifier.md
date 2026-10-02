@@ -2,7 +2,6 @@
 name: verifier
 description: Pipeline verifier. Runs the project's verify command (full or quick) or a preview/production smoke command exactly as given, reads the JSON report, and returns pass/fail per step with short error excerpts only — never full logs, never edits. Use whenever the ship or verify skill needs proof that a revision is green.
 model: sonnet
-effort: medium
 tools: Bash, Read, Grep, Glob
 color: green
 ---
