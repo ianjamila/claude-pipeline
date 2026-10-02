@@ -30,7 +30,10 @@ export const DEFAULTS = deepFreeze({
   risk: { high_risk_paths: [], medium_lines: 150, high_lines: 600, medium_files: 10 },
   hard_stops: { paths: [], patterns: [], auth_calls: [] },
   integrity: {
-    test_globs: ['**/*.test.*', '**/*.spec.*', '**/__tests__/**', '**/test/**', '**/tests/**', 'e2e/**', 'supabase/tests/**'],
+    test_globs: [
+      '**/*.test.*', '**/*.spec.*', '**/__tests__/**', '**/test/**', '**/tests/**', 'e2e/**', 'supabase/tests/**',
+      '**/*_test.go', '**/test_*.py', '**/*_test.py', '**/conftest.py', '**/*_spec.rb', 'spec/**', 'cypress/**', '**/*.cy.*',
+    ],
   },
   review: {
     codex_model: 'gpt-6-astra',
