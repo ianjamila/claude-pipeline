@@ -15,7 +15,8 @@ queue a line for the agent log, or stage queued lines + this PR's line as a comm
 
 ```
 pipeline agent-log queue --line "<line>" [--repo DIR]   -> {ok, queued, file}
-pipeline agent-log stage --pr N [--line "<line>"] [--repo DIR]   -> {ok, committed, lines, file}; run in the PR worktree;
+pipeline agent-log stage --pr N [--line "<line>"] [--repo DIR]   -> {ok, committed, lines, file, staged, dropped}; run in the PR worktree;
+  staged lines stay queued ("staged in PR N") until origin/<default> contains them, and are re-staged if that PR closes unmerged;
   default line = the PR's agent-log line with outcome "merged — prod smoke pending"; exit 2 when the worktree has other uncommitted changes,
   is on the default branch or a detached HEAD, or is not the PR's head branch at the PR's head commit; exit 3 when GitHub cannot say
 ```

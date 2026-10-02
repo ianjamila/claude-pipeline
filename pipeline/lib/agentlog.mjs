@@ -4,7 +4,7 @@
 // guarded by a named lock so a `queue` and a `stage` in two worktrees never lose or duplicate a line.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
-import { git } from './git.mjs';
+import { git, showFile, NETWORK_TIMEOUT_MS } from './git.mjs';
 import { pipelineStateDir } from './repo.mjs';
 import { withLock } from './locks.mjs';
 import { agentLogLine } from './render.mjs';
@@ -29,7 +29,9 @@ export const queuePath = (cwd) => join(pipelineStateDir(cwd), QUEUE_FILE);
 export const withQueueLock = (cwd, fn) =>
   withLock(LOCK_NAME, fn, { dir: join(pipelineStateDir(cwd), 'locks'), waitMs: LOCK_WAIT_MS });
 
-// Every entry is `{line, at}`; a line that is not valid JSON or has no string `line` is dropped rather than trusted.
+// Every entry is `{line, at}` plus, once `stage` committed it into a PR branch, `staged: {pr, at}`: such an entry stays queued
+// until the line is seen on origin/<default> (a PR that never merges would otherwise lose it). A line that is not valid
+// JSON or has no string `line` is dropped rather than trusted.
 export function readQueue(cwd) {
   let text;
   try {
@@ -43,13 +45,17 @@ export function readQueue(cwd) {
     if (!raw.trim()) continue;
     try {
       const e = JSON.parse(raw);
-      if (e && typeof e.line === 'string' && e.line !== '') entries.push({ line: e.line, at: e.at ?? null });
+      if (e && typeof e.line === 'string' && e.line !== '') {
+        const entry = { line: e.line, at: e.at ?? null };
+        if (Number.isInteger(e.staged?.pr) && e.staged.pr > 0) entry.staged = { pr: e.staged.pr, at: e.staged.at ?? null };
+        entries.push(entry);
+      }
     } catch { /* a torn or hand-edited line: skip it */ }
   }
   return entries;
 }
 
-function writeQueue(cwd, entries) {
+export function writeQueue(cwd, entries) {
   const file = queuePath(cwd);
   if (entries.length === 0) {
     rmSync(file, { force: true });
@@ -142,6 +148,25 @@ export function commitLines({ root, file, lines, pr }) {
     throw err;
   }
   return { sha: git(['rev-parse', 'HEAD'], o).trim(), fresh };
+}
+
+// The log lines already on origin/<default>: what a queued line must reach to stop being queued. null when the default
+// branch (or the log file there) cannot be read, which keeps every entry queued. `fetch` refreshes origin/<default> first
+// (best effort, bounded): without it a merge we have not fetched yet just keeps the line queued a little longer.
+export function landedLines(root, { logFile, defaultBranch, fetch = false }) {
+  const o = { cwd: root };
+  try {
+    if (fetch) {
+      try {
+        git(['fetch', '--no-tags', 'origin', `+refs/heads/${defaultBranch}:refs/remotes/origin/${defaultBranch}`], { ...o, timeoutMs: NETWORK_TIMEOUT_MS });
+      } catch { /* offline, or no origin: judge by the ref we already have */ }
+    }
+    const rel = relative(root, logFile).split('\\').join('/');
+    const text = showFile(`origin/${defaultBranch}`, rel, o);
+    return text === null ? new Set() : new Set(text.split('\n').map((l) => l.replace(/\r$/, '')));
+  } catch {
+    return null;
+  }
 }
 
 // Rewrite the queue without the entries that were just written (matched one-for-one, so an identical line queued

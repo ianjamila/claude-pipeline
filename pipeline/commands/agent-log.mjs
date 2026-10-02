@@ -9,14 +9,16 @@ import { loadState } from '../lib/state.mjs';
 import { LockTimeoutError } from '../lib/locks.mjs';
 import { inlineOptionValues } from '../lib/finalgate.mjs';
 import {
-  appendToQueue, assertSingleLine, buildAgentLogLine, clearWritten, commitLines, queuePath, readQueue, resolveLogPath, withQueueLock,
+  appendToQueue, assertSingleLine, buildAgentLogLine, commitLines, landedLines, queuePath, readQueue, resolveLogPath, withQueueLock, writeQueue,
 } from '../lib/agentlog.mjs';
+import { loadConfig } from '../lib/config.mjs';
 
 export const meta = {
   summary: 'queue a line for the agent log, or stage queued lines + this PR\'s line as a commit in the worktree',
   usage: [
     'pipeline agent-log queue --line "<line>" [--repo DIR]   -> {ok, queued, file}',
-    'pipeline agent-log stage --pr N [--line "<line>"] [--repo DIR]   -> {ok, committed, lines, file}; run in the PR worktree;',
+    'pipeline agent-log stage --pr N [--line "<line>"] [--repo DIR]   -> {ok, committed, lines, file, staged, dropped}; run in the PR worktree;',
+    '  staged lines stay queued ("staged in PR N") until origin/<default> contains them, and are re-staged if that PR closes unmerged;',
     '  default line = the PR\'s agent-log line with outcome "merged — prod smoke pending"; exit 2 when the worktree has other uncommitted changes,',
     '  is on the default branch or a detached HEAD, or is not the PR\'s head branch at the PR\'s head commit; exit 3 when GitHub cannot say',
   ].join('\n'),
@@ -32,12 +34,30 @@ function singleLine(raw) {
   }
 }
 
+// Drops queued lines that origin/<default> already contains (a staged PR merged). Best effort: no config, no origin or an
+// unreadable file keeps everything queued. Caller holds the queue lock. Returns how many entries were dropped.
+async function dropLanded(root, fetch) {
+  try {
+    const loaded = await loadConfig(root);
+    if (!loaded.ok) return 0;
+    const landed = landedLines(root, { logFile: resolveLogPath(root, loaded.config.agent_log), defaultBranch: loaded.config.default_branch, fetch });
+    if (!landed) return 0;
+    const entries = readQueue(root);
+    const keep = entries.filter((e) => !landed.has(e.line));
+    if (keep.length !== entries.length) writeQueue(root, keep);
+    return entries.length - keep.length;
+  } catch {
+    return 0;
+  }
+}
+
 async function queue(rest, ctx) {
   const { values } = parseCommandArgs(inlineOptionValues(rest, ['--line']), { line: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
   const line = singleLine(requireOption(values, 'line'));
   const root = resolveRepo(values, ctx);
-  const queued = await withQueueLock(root, () => {
+  const queued = await withQueueLock(root, async () => {
     appendToQueue(root, line);
+    await dropLanded(root, false);
     return readQueue(root).length;
   });
   return { exitCode: EXIT.OK, output: { ok: true, queued, file: queuePath(root) } };
@@ -90,11 +110,37 @@ async function stage(rest, ctx) {
 
   try {
     return await withQueueLock(root, () => {
-      const queued = readQueue(root);
-      const lines = [...queued.map((e) => e.line), line];
-      const { sha, fresh } = commitLines({ root, file, lines, pr });
-      clearWritten(root, queued);
-      return { exitCode: EXIT.OK, output: { ok: true, committed: sha, lines: fresh, file: config.agent_log } };
+      // 1. Lines origin/<default> already has are done (a staged PR merged); everything else stays queued.
+      const landed = landedLines(root, { logFile: file, defaultBranch: config.default_branch, fetch: true });
+      let entries = readQueue(root);
+      let dropped = 0;
+      if (landed) {
+        const keep = entries.filter((e) => !landed.has(e.line));
+        dropped = entries.length - keep.length;
+        entries = keep;
+      }
+      // 2. A line staged in ANOTHER pull request is that PR's to carry: re-staging it here would collide when both merge.
+      //    Only when that PR was closed without merging is the line set loose again and re-staged.
+      const prState = new Map();
+      const stateOf = (n) => {
+        if (!prState.has(n)) {
+          let state = null;
+          try { state = String(gh.prView(n, ['state']).state ?? '').toUpperCase() || null; } catch { /* unknown: keep it staged */ }
+          prState.set(n, state);
+        }
+        return prState.get(n);
+      };
+      const carry = [];
+      for (const e of entries) {
+        if (e.staged && e.staged.pr !== pr && stateOf(e.staged.pr) === 'CLOSED') delete e.staged;
+        if (!e.staged || e.staged.pr === pr) carry.push(e);
+      }
+      // 3. Write + commit them with this PR's line, then mark them staged here instead of removing them.
+      const { sha, fresh } = commitLines({ root, file, lines: [...carry.map((e) => e.line), line], pr });
+      const at = new Date().toISOString();
+      for (const e of carry) e.staged = { pr, at };
+      writeQueue(root, entries);
+      return { exitCode: EXIT.OK, output: { ok: true, committed: sha, lines: fresh, file: config.agent_log, staged: carry.length, dropped } };
     });
   } catch (err) {
     if (err instanceof LockTimeoutError) throw new Fail(EXIT.UNAVAILABLE, { ok: false, error: 'locked', message: err.message });
