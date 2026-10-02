@@ -161,7 +161,7 @@ export const run = guarded(async (argv, ctx) => {
     id: item.id, title: item.title, ruling: `${cache[fp].decision ?? 'unknown'}: ${cache[fp].reason ?? ''}`,
   }));
   const prompt = buildReviewPrompt({
-    pr, title: view.title, body: view.body, base, head, risk: level, round, lightLane, priorRulings,
+    pr, title: view.title, body: view.body, base, head, risk: level, round, lightLane, priorRulings, rulesRef: forkPoint,
   });
 
   const hashAtHead = currentContentHash(root, config);
@@ -221,7 +221,7 @@ export const run = guarded(async (argv, ctx) => {
       throw new Fail(EXIT.USAGE, { ok: false, error: 'state-changed', message: '.review/state.json disappeared while Codex was reviewing; run the round again' });
     }
     const base0 = fresh ?? emptyState({ repo: slug, pr, branch: view.headRefName ?? 'HEAD', risk: level, lightLane, maxRounds: config.review.max_rounds });
-    const ruled = reuseRuled(assignIds(findings, round, excerptFor), ruledCacheFrom(allItems(base0)));
+    const ruled = reuseRuled(assignIds(findings, round, excerptFor, { contentHash: hashAtHead }), ruledCacheFrom(allItems(base0)));
     const next = addRound({ ...base0, risk: level, lightLane, currentContentHash: hashAtHead }, {
       n: round, fromHead: base, toHead: head, contentHashAtToHead: hashAtHead, items: ruled,
     });
