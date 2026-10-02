@@ -54,6 +54,7 @@ run one Codex review round over base..head and record its findings.
 pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium|high|xhigh [--model M] [--repo DIR]
   -> {ok, round, counts:{blocking, suggestions, worth_considering}, preRuled, lightLane, path}
   --base must be the PR's merge base for round 1 and the previous round's toHead after that, else exit 2 {error:base-mismatch}
+  exit 2 {error:empty-range} when earlier rounds accepted items and the branch content is unchanged since the last round (base == head)
   exit 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|malformed|github} when Codex or GitHub could not deliver
   env: PIPELINE_CODEX_TIMEOUT_MS overrides the 30 minute Codex timeout (tests)
 ```
@@ -262,6 +263,7 @@ pipeline state show [--round R] [--accepted] [--disputed] [--needs-human] [--pr 
   -> {ok, recovered, count, items}; with --pr and no local state, rebuilds it from the PR triage comment
 pipeline state outcome [--repo DIR]   -> roundOutcome + {clean}; exit 0 whether or not clean
 pipeline state mark-implemented --ids a,b [--repo DIR]
+  -> exit 2 {error:no-code-change} unless the branch content differs from what the accepting round reviewed
 pipeline state record-followup --id ID --url URL [--repo DIR]
 pipeline state set-outcome --outcome TEXT [--repo DIR]
 ```

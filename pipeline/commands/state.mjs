@@ -18,6 +18,7 @@ export const meta = {
     '  -> {ok, recovered, count, items}; with --pr and no local state, rebuilds it from the PR triage comment',
     'pipeline state outcome [--repo DIR]   -> roundOutcome + {clean}; exit 0 whether or not clean',
     'pipeline state mark-implemented --ids a,b [--repo DIR]',
+    '  -> exit 2 {error:no-code-change} unless the branch content differs from what the accepting round reviewed',
     'pipeline state record-followup --id ID --url URL [--repo DIR]',
     'pipeline state set-outcome --outcome TEXT [--repo DIR]',
   ].join('\n'),
@@ -99,11 +100,12 @@ async function outcome(rest, ctx) {
 
 // ---- small updates --------------------------------------------------------------------------
 
-function markImplemented(rest, ctx) {
+async function markImplemented(rest, ctx) {
   const { values } = parseCommandArgs(rest, { ids: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
   const ids = [...new Set(requireOption(values, 'ids').split(',').map((s) => s.trim()).filter(Boolean))];
   if (ids.length === 0) throw new UsageError('--ids must list at least one item id');
   const root = resolveRepo(values, ctx);
+  const { config } = await requireConfig(root);
   return withStateLock(root, ctx, () => {
     let state = requireState(root);
     // Resolve every id first so a typo cannot leave the state half-updated.
@@ -111,6 +113,17 @@ function markImplemented(rest, ctx) {
     for (const { item } of found) {
       if (item.final?.decision !== 'ACCEPT') {
         throw new Fail(EXIT.USAGE, { ok: false, error: 'not-accepted', message: `${item.id} is not an accepted item, so it cannot be marked implemented` });
+      }
+    }
+    // An accepted item is only "implemented" by a change to the code: the branch content must differ from what the
+    // round that accepted it reviewed. Otherwise an empty fix and an empty review round would clear a BLOCKING finding.
+    const hash = currentContentHash(root, config);
+    for (const { round, item } of found) {
+      if (hash === round.contentHashAtToHead) {
+        throw new Fail(EXIT.USAGE, {
+          ok: false, error: 'no-code-change',
+          message: `${item.id} cannot be marked implemented: the branch content is identical to what round ${round.n} reviewed (no fix has been committed)`,
+        });
       }
     }
     for (const { round, item } of found) state = updateItems(state, round.n, [{ ...item, implemented: true }]);

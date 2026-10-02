@@ -846,6 +846,9 @@ test('state show: filters by round, accepted, disputed and needs-human; mark-imp
   assert.deepEqual(w.cli(['state', 'show', '--disputed']).json.items, []);
   assert.deepEqual(w.cli(['state', 'show', '--accepted']).json.items.map((i) => i.id), ['R1-B1', 'R1-S1']);
 
+  assert.equal(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1,R1-S1']).json.error, 'no-code-change', 'nothing was committed yet');
+  w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
+  w.repo.commit('fix');
   const marked = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1,R1-S1']);
   assert.equal(marked.code, 0, marked.stderr);
   assert.deepEqual(w.cli(['state', 'show', '--accepted']).json.items, []);
@@ -1344,10 +1347,10 @@ test('review-complete: a clean first round does not count once a later round acc
   w.prHead(head2);
   assert.equal(w.codex(2, findingsOf([finding({ title: 'late bug', file: 'src/c.js', line: 1 })]), { from: head1, to: head2 }).code, 0);
   assert.equal(w.judge(2, { 'R2-B1': ['ACCEPT'] }).code, 0);
-  assert.equal(w.cli(['state', 'mark-implemented', '--ids', 'R2-B1']).code, 0);
   // the "fix" removes the file again: the branch now has exactly the content round 1 reviewed, and nothing is unresolved
   w.repo.rm('src/c.js');
   const head3 = w.repo.commit('drop it');
+  assert.equal(w.cli(['state', 'mark-implemented', '--ids', 'R2-B1']).code, 0);
   w.prHead(head3);
   const outcome = w.cli(['state', 'outcome']).json;
   assert.deepEqual([outcome.pending, outcome.needsHuman, outcome.unimplemented], [[], [], []]);
@@ -1442,7 +1445,9 @@ test('every command that changes the review state waits for the per-PR lock (and
       assert.equal(w.stateText(), before, `${args.join(' ')} changed the state while the lock was held`);
     }
     const calls = w.captured().length;
-    const cr = w.cli(['codex-review', '--pr', '7', '--round', '2', '--base', w.head, '--head', w.head, '--effort', 'high'], { ...env, FAKE_CODEX_OUTPUT: w.file('r2.json', findingsOf()) });
+    w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
+    const head2 = w.repo.commit('fix');
+    const cr = w.cli(['codex-review', '--pr', '7', '--round', '2', '--base', w.head, '--head', head2, '--effort', 'high'], { ...env, FAKE_CODEX_OUTPUT: w.file('r2.json', findingsOf()) });
     assert.equal(cr.code, 2, cr.stdout);
     assert.equal(cr.json.error, 'lock-timeout');
     assert.equal(w.captured().length, calls + 1, 'Codex ran without the lock; only recording the round needs it');
@@ -1505,4 +1510,49 @@ test('arbiter apply: PIPELINE_ARBITER_MODEL_OVERRIDE never relaxes the proof, no
   const r = arbiterRun(w, { meta: { model: 'claude-fable-5-1' }, env: { PIPELINE_ARBITER_MODEL_OVERRIDE: 'claude-fable-5-1' } });
   assertAllNeedHuman(w, r, /per-call model override present: claude-fable-5-1/);
   assert.match(w.item('R1-S1').final.reason, /model-proof/);
+});
+
+// -- an accepted BLOCKING item cannot be "resolved" without a code change
+
+test('an accepted BLOCKING item cannot be marked implemented with no code change, nor cleared by an empty review round', (t) => {
+  const w = world(t);
+  assert.equal(w.codex(1, findingsOf([finding()])).code, 0);
+  assert.equal(w.judge(1, { 'R1-B1': ['ACCEPT'] }).code, 0);
+
+  const marked = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assert.equal(marked.code, 2, marked.stdout);
+  assert.equal(marked.json.error, 'no-code-change');
+  assert.ok(!w.item('R1-B1').implemented);
+
+  // Even if it were marked, a round over the empty range would review nothing.
+  const empty = w.codex(2, findingsOf(), { from: w.head, to: w.head });
+  assert.equal(empty.code, 2, empty.stdout);
+  assert.equal(empty.json.error, 'empty-range');
+  assert.equal(w.state().rounds.length, 1, 'no round was recorded');
+  assert.equal(w.captured().length, 1, 'Codex was not even run for the empty range');
+  assert.equal(w.cli(['state', 'outcome']).json.clean, false);
+});
+
+test('codex-review: a later round whose content is unchanged since the last round is refused when items were accepted; a real fix passes', (t) => {
+  const w = world(t);
+  assert.equal(w.codex(1, findingsOf([finding()])).code, 0);
+  assert.equal(w.judge(1, { 'R1-B1': ['ACCEPT'] }).code, 0);
+  // An empty commit moves HEAD but not the content.
+  w.repo.git(['commit', '-q', '--allow-empty', '-m', 'nothing']);
+  const head2 = w.repo.git(['rev-parse', 'HEAD']).trim();
+  const r = w.codex(2, findingsOf(), { from: w.head, to: head2 });
+  assert.equal(r.code, 2, r.stdout);
+  assert.equal(r.json.error, 'empty-range');
+
+  w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
+  const head3 = w.repo.commit('fix');
+  assert.equal(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']).code, 0);
+  assert.equal(w.codex(2, findingsOf(), { from: w.head, to: head3 }).code, 0);
+});
+
+test('codex-review: with nothing accepted, a later round over an unchanged tree is still allowed', (t) => {
+  const w = world(t);
+  assert.equal(w.codex(1, findingsOf([finding()])).code, 0);
+  assert.equal(w.judge(1, { 'R1-B1': ['REJECT'] }).code, 0);
+  assert.equal(w.codex(2, findingsOf(), { from: w.head, to: w.head }).code, 0);
 });
