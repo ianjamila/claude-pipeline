@@ -222,7 +222,7 @@ function applyLocked({ n, agentId, givenTag, expectModelPrefix, expectEffort, ma
   const dir = ensureRoundDir(root, n);
   writeJson(path.join(dir, 'rulings.json'), { proofOk, rulings: applied.rulings, ...(!proofOk && rulings ? { unverified: rulings.rulings } : {}) });
   writeJson(path.join(dir, 'model-proof.json'), {
-    ok: proofOk, transcript: found.jsonlPath, models: proof.models, efforts: proof.efforts, errors, tag, round: n,
+    ok: proofOk, transcript: found.jsonlPath, models: proof.models, efforts: proof.efforts, stopReasonMissing: proof.stopReasonMissing, errors, tag, round: n,
   });
   saveState(root, patchRound(updateItems(state, n, items), n, { arbiter: { ...stored, proofOk, transcript: found.jsonlPath } }));
 
@@ -234,6 +234,7 @@ function applyLocked({ n, agentId, givenTag, expectModelPrefix, expectEffort, ma
       round: n,
       tag,
       transcript: found.jsonlPath,
+      stopReasonMissing: proof.stopReasonMissing,
       errors,
       ...(ignoredExpectations ? { note: '--expect-model / --expect-effort ignored: the proof is pinned to claude-fable- at effort high' } : {}),
       items: stored.items.map((id) => ({

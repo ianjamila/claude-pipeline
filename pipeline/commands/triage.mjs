@@ -60,7 +60,7 @@ function judgeOutput(values, ctx) {
   });
   return {
     text: proof.finalAssistantText,
-    judgeProof: { ok: proof.ok, transcript: found.jsonlPath, models: proof.models, efforts: proof.efforts, errors: proof.errors },
+    judgeProof: { ok: proof.ok, transcript: found.jsonlPath, models: proof.models, efforts: proof.efforts, stopReasonMissing: proof.stopReasonMissing, errors: proof.errors },
   };
 }
 

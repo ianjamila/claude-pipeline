@@ -4,12 +4,13 @@
 // transcript itself. The transcript format is undocumented and unstable, so every unknown shape
 // FAILS CLOSED: it adds an error and ok stays false.
 //
-// Completeness caveat: interactive (entrypoint "cli") transcripts keep the streaming snapshot, so a
-// finished final message still shows stop_reason null; only headless runs record "end_turn". The proof
-// therefore accepts null/absent but rejects any other explicit stop_reason (max_tokens, refusal, ...)
-// and requires the final line to hold a text block. It cannot see truncation itself: callers MUST also
-// require extractJsonBlock() to parse the final text AND the rulings to validate against every
-// expected id, which is what catches a message cut off mid-answer.
+// Completeness: spec R13 wants stop_reason end_turn on the final message. Interactive (entrypoint "cli")
+// transcripts keep the streaming snapshot, so a finished final message often still shows stop_reason null;
+// only headless runs record "end_turn". So: an explicit stop_reason must be end_turn (max_tokens, refusal, ...
+// are failures); a null/absent one is accepted ONLY when the final message is the last line of the
+// transcript and carries a parseable JSON answer (the one thing a truncated message cannot do), and the proof
+// then reports stopReasonMissing: true. The final line must also hold a text block. Callers still require the
+// rulings to validate against every expected id.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -154,6 +155,7 @@ export function proveModel({ jsonlText, metaText, expectModelPrefix, expectEffor
   const models = new Map();
   const efforts = new Map();
   const asst = []; // { line, n } for every assistant line, in file order
+  let lastLineN = 0; // 1-based number of the last non-blank line of the transcript
   let firstUserText = null;
   let promptTurns = 0;
 
@@ -174,6 +176,7 @@ export function proveModel({ jsonlText, metaText, expectModelPrefix, expectEffor
     for (let i = 0; i < rows.length; i++) {
       const n = i + 1;
       if (rows[i].trim() === '') continue;
+      lastLineN = n;
       let line;
       try {
         line = JSON.parse(rows[i]);
@@ -251,6 +254,7 @@ export function proveModel({ jsonlText, metaText, expectModelPrefix, expectEffor
   // its last line is the one judged. A line with no id cannot be grouped, so it stands alone.
   let finalAssistantText = '';
   let finalStopReason = null;
+  let stopReasonMissing = false;
   if (asst.length > 0) {
     const last = asst[asst.length - 1];
     const id = isPlainObject(last.line.message) ? last.line.message.id : undefined;
@@ -268,6 +272,17 @@ export function proveModel({ jsonlText, metaText, expectModelPrefix, expectEffor
     } else if (finalAssistantText.trim() === '') {
       errors.push('final message has no text');
     }
+    // No stop_reason: nothing says the message finished, so it must at least be the end of the transcript and hold a
+    // complete JSON answer.
+    if (finalStopReason === null) {
+      stopReasonMissing = true;
+      if (group[group.length - 1].n !== lastLineN) errors.push('final message has no stop_reason and is not the last line of the transcript');
+      let answer = null;
+      try {
+        answer = extractJsonBlock(finalAssistantText);
+      } catch { /* reported below */ }
+      if (!isPlainObject(answer)) errors.push('final message has no stop_reason and carries no complete JSON answer (a truncated message cannot be ruled out)');
+    }
   }
 
   return {
@@ -279,6 +294,7 @@ export function proveModel({ jsonlText, metaText, expectModelPrefix, expectEffor
     firstUserText: firstUserText ?? '',
     finalAssistantText,
     finalStopReason,
+    stopReasonMissing,
   };
 }
 

@@ -80,6 +80,7 @@ export const run = guarded(async (argv) => {
       efforts: proof.efforts,
       errors: proof.errors,
       finalAssistantText: proof.finalAssistantText,
+      stopReasonMissing: proof.stopReasonMissing,
     },
   };
 });
