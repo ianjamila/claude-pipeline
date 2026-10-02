@@ -19,6 +19,9 @@ import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
 import { simpleCommands, commandName } from './shell-parse.mjs';
 
 const posix = path.posix;
+const MAX_LINE_CHARS = 200_000; // a longer command line is not parsed (the hook has a 15 s budget)
+// What an unparsed or truncated line is judged by: any word that names a protected file, a switch or an installer.
+const SENSITIVE_WORDS = /\.claude|PIPELINE_ADMIN|disableAllHooks|CLAUDECODE|install\.|\bprotect\b/i;
 
 // ---- the protected set ------------------------------------------------------------------------
 
@@ -795,6 +798,10 @@ export function evaluateBashForFiles(command, opts = {}) {
   if (ctx.admin) return allow();
   const raw = typeof command === 'string' ? command : '';
   if (!raw.trim()) return allow();
+  if (raw.length > MAX_LINE_CHARS) {
+    // too long to scan in the time budget: judged by what it mentions once quotes and escapes are removed
+    return SENSITIVE_WORDS.test(raw.replace(/['"`\\]/g, '')) ? deny('the command line is too long to check and mentions a protected pipeline file or switch; split it into simpler commands') : allow();
+  }
 
   // 1 and 2: the admin switch and the hook switch, however the words are quoted or escaped
   const flat = raw.replace(/['"`]\s*\+\s*['"`]/g, '').replace(/['"`\\]/g, ''); // 'PIPELINE_'+'ADMIN' reads as one word
@@ -802,6 +809,9 @@ export function evaluateBashForFiles(command, opts = {}) {
   if (hasDisableAll(raw) || hasDisableAll(flat)) return deny('the command mentions disableAllHooks, which would switch the pipeline hooks off');
 
   const cmds = simpleCommands(raw);
+  // Truncated means part of the line was never looked at, so nothing on it can be called harmless (500 `true;` then
+  // `e''cho x > ~/.cl""aude/settings.json` must not slip through on a text match).
+  if (cmds.truncated) return deny('the command line is too complex to check (the parser gave up); split it into simpler commands');
   for (const c of cmds) {
     const words = [c.argv.join(' '), ...Object.entries(c.env).map(([k, v]) => `${k}=${v}`)].join(' ');
     if (setsAdmin(words, ctx.platform)) return deny('the command sets PIPELINE_ADMIN; only the owner may set it, when launching Claude Code');
@@ -851,7 +861,7 @@ export function evaluateBashForFiles(command, opts = {}) {
 
   // A scan that was cut short (parse caps, dynamic commands, sizes) cannot prove a command harmless: fail closed
   // when the raw text names a protected file at all.
-  if ((cmds.truncated || cmds.dynamic || ctx.dynamic) && protectedInRaw) return deny('the command line is too complex or too dynamic to check and refers to a protected pipeline file');
+  if ((cmds.dynamic || ctx.dynamic) && protectedInRaw) return deny('the command line is too complex or too dynamic to check and refers to a protected pipeline file');
 
   const winAncestor = (c) => c.raw.includes('\\') && m.ancestorRaw(c.raw);
   const tokenHit = (t) => m.rawHit(t, dirs) || m.pathHit(t, dirs, true);

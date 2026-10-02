@@ -440,14 +440,16 @@ test('a lookup that returns garbage or HEAD is treated as unknown', () => {
   assert.equal(evaluateGitCommand('git push', { cwd: '/x', currentBranch: () => 'refs/heads/main' }).decision, 'deny');
 });
 
-test('a command the parser gives up on is denied when it mentions git/gh/pipeline, allowed otherwise', () => {
+test('a command the parser gives up on is denied outright, even when git is spelled with quotes', () => {
   const long = 'true; '.repeat(600);
   const v = evaluate(`${long}git status`);
   assert.equal(v.decision, 'deny');
   assert.match(v.reason, /too complex/);
   assert.equal(evaluate(`${long}gh pr view 1`).decision, 'deny');
   assert.equal(evaluate(`${long}node pipeline.mjs job start x -- ls`).decision, 'deny');
-  assert.equal(evaluate(`${long}ls`).decision, 'allow');
+  assert.equal(evaluate(`${long}ls`).decision, 'deny', 'a truncated parse cannot prove anything harmless');
+  assert.equal(evaluate(`${long}g''it push origin main`).decision, 'deny');
+  assert.equal(evaluate(`${long}\\g\\h pr merge 1 --admin`).decision, 'deny');
 });
 
 test('job runner nesting is bounded and still fails closed', () => {
@@ -974,4 +976,23 @@ test('the installed matchers cover Monitor and MCP tools for guard-git', async (
     const re = new RegExp(`^(?:${m})$`);
     for (const tool of ['Bash', 'PowerShell', 'Monitor', 'mcp__x__run']) assert.ok(re.test(tool), `${m} must match ${tool}`);
   }
+});
+
+// ---- time budget (review finding 12) ----------------------------------------------------------------------
+
+test('an oversized command line is not parsed: denied when it mentions a guarded word (quotes stripped), allowed otherwise', () => {
+  const spam = '{a,b}'.repeat(60_000); // 300 KB
+  const t0 = Date.now();
+  assert.equal(evaluate(`echo ${spam}`).decision, 'allow');
+  assert.equal(evaluate(`echo ${spam}; git push origin main`).decision, 'deny');
+  assert.equal(evaluate(`echo ${spam}; g''it pu"sh" origin main`).decision, 'deny');
+  assert.equal(evaluate(`echo ${spam}; gh pr edit 1 --add-label human-""approved`).decision, 'deny');
+  assert.ok(Date.now() - t0 < 3000, 'the size cap must keep the hook far below its 15 s timeout');
+});
+
+test('brace spam just under the size cap is cut off by the expansion budget, not by the clock', () => {
+  const spam = Array.from({ length: 12_000 }, () => '{a,b,c}').join(' ');
+  const t0 = Date.now();
+  evaluate(`echo ${spam}`);
+  assert.ok(Date.now() - t0 < 3000);
 });

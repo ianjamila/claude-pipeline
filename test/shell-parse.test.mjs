@@ -885,3 +885,12 @@ test('a huge brace expression is flagged, the command and the ones after it stil
   assert.ok(cmds.some((c) => c.argv.join(' ') === 'git push -f'));
   assert.ok(cmds.some((c) => c.argv[0] === 'echo'));
 });
+
+test('brace expansion has a total work budget: many small expansions stop being expanded and flag the parse truncated', () => {
+  const few = simpleCommands(`echo ${Array.from({ length: 100 }, () => '{a,b,c}').join(' ')}`);
+  assert.equal(few.truncated, false);
+  assert.equal(few[0].argv.length, 301);
+  const many = simpleCommands(`echo ${Array.from({ length: 12_000 }, () => '{a,b,c}').join(' ')}; git push -f`);
+  assert.equal(many.truncated, true);
+  assert.ok(many.some((c) => c.argv.join(' ') === 'git push -f'));
+});

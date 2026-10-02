@@ -13,6 +13,7 @@ const HARD_MAX_DEPTH = 50;
 const ASSIGN_RE = /^([A-Za-z_][A-Za-z0-9_]*)\+?=/;
 const KEYWORDS = new Set(['if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', 'until', '!', 'esac', 'coproc']);
 const PS_ENV_RE = /^\$env:([A-Za-z_][A-Za-z0-9_]*)(=?)([\s\S]*)$/i;
+const MAX_BRACE_WORK = 20_000; // brace-expansion results across one line; beyond it words stay unexpanded and the parse is flagged truncated
 const BRACE_CAP = 64; // results of one brace expression; beyond it we keep the first ones and set `truncated`
 const SHELLS = new Set(['bash', 'sh', 'zsh', 'dash', 'ash', 'ksh', 'ksh93', 'mksh', 'pdksh', 'yash', 'rbash', 'fish', 'csh', 'tcsh']);
 const TMUX_RUNNERS = new Set(['new-session', 'new', 'new-window', 'neww', 'split-window', 'splitw', 'respawn-pane', 'respawnp', 'respawn-window', 'respawnw', 'run-shell', 'run', 'pipe-pane', 'pipep', 'display-popup', 'popup', 'if-shell', 'if']);
@@ -921,11 +922,15 @@ class Parser {
     // brace expansion: {a,b} in an unquoted word becomes several words (assignment words before the command are exempt)
     const argv = [];
     for (const w of words.slice(i)) {
-      if (w.bm.length >= 3) {
+      if (w.bm.length >= 3 && this.ctx.braceWork <= MAX_BRACE_WORK) {
         const r = expandBraces(w.text, w.bm);
         if (r.over) this.ctx.truncated = true;
+        this.ctx.braceWork += r.list.length + w.bm.length;
         argv.push(...r.list);
-      } else argv.push(w.text);
+      } else {
+        if (w.bm.length >= 3) this.ctx.truncated = true; // budget spent: left as written
+        argv.push(w.text);
+      }
     }
     return this.process(argv, env, seg, false);
   }
@@ -1083,7 +1088,7 @@ class Parser {
 
 export function simpleCommands(str, opts) {
   const requested = Number.isFinite(opts?.maxDepth) ? Math.trunc(opts.maxDepth) : 5;
-  const ctx = { out: [], maxDepth: Math.min(Math.max(requested, 0), HARD_MAX_DEPTH), truncated: false, dynamic: false, stopped: false, muted: 0, nest: 0, work: 0 };
+  const ctx = { out: [], maxDepth: Math.min(Math.max(requested, 0), HARD_MAX_DEPTH), truncated: false, dynamic: false, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0 };
   let parser = null;
   try {
     parser = new Parser(ctx, String(str ?? ''));

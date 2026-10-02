@@ -374,7 +374,8 @@ test('caps: a truncated parse with a protected reference is denied before any ea
   assert.equal(bash(`cat ${DEEP}; echo x > ~/.claude/settings.json`).decision, 'deny', 'reference after the cut-off');
   assert.equal(bash(`echo ${DEEP} && node -e "fs.writeFileSync(os.homedir()+'/.claude/settings.json','x')"`).decision, 'deny', 'suffix scan after the cut-off');
   assert.equal(bash(`python3 - <<'PY'\nimport os\nopen(os.path.expanduser('~/.claude/settings.json'),'w')\nPY\n${DEEP}`).decision, 'deny', 'reference only inside a heredoc');
-  assert.equal(bash(`echo ${DEEP}`).decision, 'allow', 'no reference: truncation alone is not a reason to deny');
+  assert.equal(bash(`echo ${DEEP}`).decision, 'deny', 'a truncated parse cannot prove anything harmless');
+  assert.equal(bash(`${'true; '.repeat(600)}e''cho x > ~/.cl""aude/settings.json`).decision, 'deny', 'quote-split names after the command cap');
 });
 
 test('caps: a command only known at run time is denied when a protected reference exists (parser dynamic flag)', () => {
@@ -585,4 +586,16 @@ test('installer text rule: npm run of a script that references the installer', (
 test('installer text rule: npm run denies when package.json cannot be read or parsed', () => {
   assert.equal(inst('npm run anything', { readFile: () => { throw new Error('EACCES'); } }), 'deny');
   assert.equal(inst('npm run anything', { readFile: () => '{not json' }), 'deny');
+});
+
+// ---- 8b. time budget (review finding 12) ---------------------------------------------------------------
+
+test('size cap: an oversized command line is not scanned; it is denied only when it mentions a sensitive word', () => {
+  const spam = '{a,b}'.repeat(60_000);
+  const t0 = Date.now();
+  assert.equal(bash(`echo ${spam}`).decision, 'allow');
+  assert.equal(bash(`echo ${spam}; echo x > ~/.cl""aude/settings.json`).decision, 'deny');
+  assert.equal(bash(`echo ${spam}; node ins""tall.mjs`).decision, 'deny');
+  assert.equal(bash(`echo ${spam}; export PIPELINE_""ADMIN=1`).decision, 'deny');
+  assert.ok(Date.now() - t0 < 3000);
 });

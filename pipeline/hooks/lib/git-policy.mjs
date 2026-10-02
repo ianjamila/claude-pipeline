@@ -23,6 +23,7 @@ const HOLD_LABELS = ['pipeline-pause', 'pipeline-rollback'];
 const ALL_LABELS = [...APPROVAL_LABELS, ...GUARD_LABELS];
 const MAX_NESTING = 5;
 const MAX_INPUT_BYTES = 1_000_000;
+const MAX_LINE_CHARS = 200_000; // a longer command line is not parsed (the hook has a 15 s budget)
 const OWNER_ONLY = 'This is reserved for the repository owner.';
 
 // The only graphql mutations an agent may run (comments, PR lifecycle, review threads). Everything else is denied.
@@ -690,9 +691,9 @@ function jobStartCommands(argv, vars) {
 function evalString(str, startDir, ctx, level) {
   if (level > MAX_NESTING) return deny('pipeline job start / alias is nested too deeply to verify.');
   const cmds = simpleCommands(str);
-  if (cmds.truncated && /\b(git|gh|pipeline)\b/i.test(str)) {
-    return deny('command too complex to verify (the parser gave up). Split it into simpler commands.');
-  }
+  // Truncated means part of the line was never looked at, so nothing on it can be called harmless (`g''it push` after
+  // 500 `true;` must not slip through on a word match).
+  if (cmds.truncated) return deny('command too complex to verify (the parser gave up). Split it into simpler commands.');
   if (cmds.dynamic && GUARDED_WORDS.test(str)) {
     return deny('the command that runs is only known at run time ($VAR / $(...) / piped into a shell) and the line mentions a guarded operation, so it cannot be verified. Write the command out literally.');
   }
@@ -731,6 +732,10 @@ export function evaluateGitCommand(command, {
   pathExists = existsSync,
 } = {}) {
   const text = typeof command === 'string' ? command : String(command ?? '');
+  if (text.length > MAX_LINE_CHARS) {
+    // too long to parse in the time budget: judged by what it mentions once quotes and escapes are removed
+    return GUARDED_WORDS.test(text.replace(/['"`\\]/g, '')) ? deny('this command line is too long to verify and mentions a guarded operation. Split it into simpler commands.') : allowed();
+  }
   const base = cwd || process.cwd();
   const ctx = {
     cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, fullText: text,

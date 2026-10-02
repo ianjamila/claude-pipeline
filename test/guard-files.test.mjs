@@ -356,12 +356,12 @@ test('bash: a cwd inside a protected root only allows read-only commands', () =>
   assert.equal(bash('npm install', o), 'deny');
 });
 
-test('bash: a command line too complex to parse fully is denied when it refers to a protected path', () => {
+test('bash: a command line too complex to parse fully is denied', () => {
   const deep = `cat ~/.claude/pipeline/VERSION ${'$('.repeat(250)}x${')'.repeat(250)}`;
   assert.equal(simpleCommands(deep).truncated, true, 'the fixture must actually truncate');
   assert.equal(bash(deep), 'deny');
   const deepPlain = `cat /repo/a.txt ${'$('.repeat(250)}x${')'.repeat(250)}`;
-  assert.equal(bash(deepPlain), 'allow', 'no protected reference: truncation alone does not deny');
+  assert.equal(bash(deepPlain), 'deny', 'a truncated parse cannot prove anything harmless');
 });
 
 test('bash: a bare command with a cwd inside a protected root is denied, and a read-only one is not', () => {
