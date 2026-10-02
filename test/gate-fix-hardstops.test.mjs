@@ -86,3 +86,57 @@ test('9 the diff parser marks mode-160000 entries as gitlinks and nothing else',
   const plain = 'diff --git a/a.txt b/a.txt\nnew file mode 100644\nindex 0000000..e69de29\n--- /dev/null\n+++ b/a.txt\n@@ -0,0 +1 @@\n+x\n';
   assert.equal(Object.hasOwn(parseUnifiedDiff(plain)[0], 'gitlink'), false);
 });
+
+// ---- 5. a guard disabled by a block comment --------------------------------------------------------------------------
+
+// A repo whose base file has `body`, and a branch where `edited` replaces it. Returns the hits.
+async function hitsFor(path, body, edited, config = cfg()) {
+  const repo = createTmpRepo();
+  repo.write(path, body);
+  repo.commit('base');
+  repo.branch('feat');
+  repo.write(path, edited);
+  repo.commit('edit');
+  return collectHardStops({ base: 'main', head: 'feat', cwd: repo.dir, config });
+}
+
+test('5 wrapping requireAuth() in a block comment (only /* and */ lines added) is R2-auth-removed', async () => {
+  const hits = await hitsFor('lib/handler.ts',
+    'export async function h(req) {\n  await requireAuth();\n  return ok();\n}\n',
+    'export async function h(req) {\n  /*\n  await requireAuth();\n  */\n  return ok();\n}\n');
+  assert.ok(rulesOf(hits).includes('R2-auth-removed'), JSON.stringify(hits));
+});
+
+test('5 a // comment, a same-line block comment and an HTML/python-style wrap are all caught too', async () => {
+  for (const [path, body, edited] of [
+    ['lib/a.ts', 'x();\nrequireRole(u);\ny();\n', 'x();\n// requireRole(u);\ny();\n'],
+    ['lib/b.ts', 'x();\nrequireRole(u);\ny();\n', 'x();\n/* requireRole(u); */\ny();\n'],
+    ['lib/c.py', 'x()\nrequire_auth()\ny()\n', 'x()\n"""\nrequire_auth()\n"""\ny()\n'],
+  ]) {
+    const hits = await hitsFor(path, body, edited, cfg({ auth_calls: ['require_auth'] }));
+    assert.ok(rulesOf(hits).includes('R2-auth-removed'), `${path}: ${JSON.stringify(hits)}`);
+  }
+});
+
+test('5 a docblock added around unrelated code does not flag, and a guard that stays live does not flag', async () => {
+  const hits = await hitsFor('lib/h.ts',
+    'export async function h() {\n  await requireAuth();\n  return 1;\n}\n',
+    '/**\n * Handler.\n */\nexport async function h() {\n  await requireAuth();\n  return 1;\n}\n');
+  assert.ok(!rulesOf(hits).includes('R2-auth-removed'), JSON.stringify(hits));
+});
+
+test('5 wrapping enable row level security / create policy in a SQL file is R2-sql-removed', async () => {
+  const base = 'create table t(id int);\nalter table t enable row level security;\ncreate policy p on t for select using (true);\ncreate index i on t(id);\n';
+  const wrapped = 'create table t(id int);\n/*\nalter table t enable row level security;\ncreate policy p on t for select using (true);\n*/\ncreate index i on t(id);\n';
+  const hits = await hitsFor('supabase/schema.sql', base, wrapped);
+  const gone = hits.filter((h) => h.rule === 'R2-sql-removed');
+  assert.ok(gone.some((h) => /row level security/i.test(h.detail)), JSON.stringify(hits));
+  assert.ok(gone.some((h) => /policy/i.test(h.detail)), JSON.stringify(hits));
+});
+
+test('5 SQL: statements that are all still live do not report a loss', async () => {
+  const base = 'alter table t enable row level security;\ncreate policy p on t for select using (true);\n';
+  const moved = `${base}/* a note */\n-- note\n`;
+  const hits = await hitsFor('supabase/schema.sql', base, moved);
+  assert.deepEqual(hits.filter((h) => h.rule === 'R2-sql-removed'), [], JSON.stringify(hits));
+});

@@ -948,9 +948,10 @@ const needs = (cond, msg) => {
 //   sqlStatements [{file, text}]: whole statements around changed lines of .sql files, from base and head
 //   envFiles      Set of changed files that mention process.env / z.object / createEnv (default: judged from the diff lines)
 //   envImportFiles  Set of changed files that import an env object, so `env.NAME` is a read (default: judged from the diff lines)
+//   guardLosses   [{file, kind:'code'|'sql', detail}] guards that vanished from the whole file without a removed line (commented out)
 // Throws TypeError when the diff touches SQL or package.json and sqlStatements / pkgPairs (or basePkg+headPkg) are missing.
 // Returns hits `{ rule, file, line?, excerpt?, detail }`.
-export function classifyHardStops({ files, config, baseEnvNames = new Set(), basePkg, headPkg, pkgPairs, sqlStatements, envFiles, envImportFiles }) {
+export function classifyHardStops({ files, config, baseEnvNames = new Set(), basePkg, headPkg, pkgPairs, sqlStatements, envFiles, envImportFiles, guardLosses = [] }) {
   const cx = settings(config);
   const sink = makeSink();
   const known = new Set(baseEnvNames);
@@ -996,7 +997,68 @@ export function classifyHardStops({ files, config, baseEnvNames = new Set(), bas
     if (r1) sink.add('R1-destructive', s.file, `destructive statement (${r1}): ${oneLine(text).slice(0, 120)}`);
   }
 
+  for (const g of guardLosses) sink.add(g.kind === 'sql' ? 'R2-sql-removed' : 'R2-auth-removed', g.file, g.detail);
+
   return sink.list();
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Guards switched off without a removed line (IO-free helpers; collectHardStops feeds them whole files)
+// ---------------------------------------------------------------------------------------------------------------
+
+// A diff that only ADDS `/*` and `*/` lines around a guard removes no line, so the removed-line rules never see it. So
+// when a changed file adds comment delimiters, the whole base and head files are comment-stripped and compared.
+// Comment forms: /* */, <!-- -->, python triple quotes, ruby =begin/=end, lua --[[ ]], and // to end of line. The stripper
+// is deliberately not string-aware: a delimiter inside a string can only make code look commented out on BOTH sides
+// (equal counts) or on one side (a flagged difference), never hide a loss.
+const COMMENT_DELIM = /\/\*|\*\/|<!--|-->|"""|'''|^=begin|^=end|--\[\[|\]\]/m;
+const END = String.raw`(?![\s\S])`;
+const CODE_COMMENT = new RegExp(
+  [
+    String.raw`\/\*[\s\S]*?(?:\*\/|${END})`, String.raw`<!--[\s\S]*?(?:-->|${END})`, `"""[\\s\\S]*?(?:"""|${END})`, `'''[\\s\\S]*?(?:'''|${END})`,
+    String.raw`^=begin[\s\S]*?(?:^=end|${END})`, String.raw`--\[\[[\s\S]*?(?:\]\]|${END})`, String.raw`\/\/[^\n]*`,
+  ].join('|'),
+  'gm',
+);
+export const addsCommentDelimiter = (lines) => lines.some((l) => l.text.length <= MAX_LINE && COMMENT_DELIM.test(l.text));
+export const stripCodeComments = (text) => text.replace(CODE_COMMENT, (m) => m.replace(/[^\n]/g, ' '));
+
+// Per auth-guard rule: how many lines of the (comment-stripped) text carry it.
+function guardCounts(text, rules) {
+  const counts = new Map();
+  for (const line of stripCodeComments(text).split('\n')) {
+    if (STRING_ONLY_LINE.test(line)) continue;
+    const rule = firstRule(rules, line);
+    if (rule) counts.set(rule, (counts.get(rule) ?? 0) + 1);
+  }
+  return counts;
+}
+
+// Guard rules that match fewer live lines in the head file than in the base file.
+export function lostCodeGuards(baseText, headText, rules) {
+  const before = guardCounts(baseText, rules);
+  const after = guardCounts(headText, rules);
+  return [...before].filter(([rule, n]) => n > (after.get(rule) ?? 0)).map(([rule]) => rule);
+}
+
+const SQL_GUARD_LABELS = new Set(['POLICY', 'ROW LEVEL SECURITY', 'GRANT', 'REVOKE']);
+const SQL_GUARD_RULES = R2_SQL.filter(([label]) => SQL_GUARD_LABELS.has(label));
+
+// RLS / policy / grant statements of a SQL file, comment-stripped and whitespace-normalised: normalised text -> label.
+export function sqlGuardStatements(text) {
+  const lines = text.split('\n').map((_, i) => i + 1);
+  const out = new Map();
+  for (const stmt of enclosingStatements(text, lines)) {
+    const label = firstSql(SQL_GUARD_RULES, stmt, false);
+    if (label) out.set(oneLine(stmt).toLowerCase(), { label, text: oneLine(stmt) });
+  }
+  return out;
+}
+
+// RLS / policy / grant statements present in the base file but not live in the head file.
+export function lostSqlGuards(baseText, headText) {
+  const head = sqlGuardStatements(headText);
+  return [...sqlGuardStatements(baseText)].filter(([key]) => !head.has(key)).map(([, v]) => v);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1149,5 +1211,25 @@ export async function collectHardStops({ base, head, cwd, config }) {
     }
   }
 
-  return classifyHardStops({ files, config, baseEnvNames, pkgPairs, sqlStatements, envFiles, envImportFiles });
+  // Guards commented out by wrapping them (only delimiter lines added): compare the whole base and head files.
+  const guardLosses = [];
+  for (const [i, d] of ds.entries()) {
+    const f = files[i];
+    if (f.binary || !f.oldPath || !f.newPath || !d.addedIsCode || !d.removedIsCode) continue;
+    if (!d.sql && !addsCommentDelimiter(f.added)) continue;
+    const before = showFile(mb, f.oldPath, o);
+    const after = showFile(head, f.newPath, o);
+    if (before === null || after === null) continue;
+    if (d.sql) {
+      for (const g of lostSqlGuards(before, after)) {
+        guardLosses.push({ file: d.file, kind: 'sql', detail: `auth/RLS statement no longer live (commented out or removed): ${g.label}: ${g.text.slice(0, 120)}` });
+      }
+    } else {
+      for (const rule of lostCodeGuards(before, after, cx.authRemoved)) {
+        guardLosses.push({ file: d.file, kind: 'code', detail: `removed auth guard (commented out): ${rule}` });
+      }
+    }
+  }
+
+  return classifyHardStops({ files, config, baseEnvNames, pkgPairs, sqlStatements, envFiles, envImportFiles, guardLosses });
 }
