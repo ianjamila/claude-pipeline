@@ -333,3 +333,15 @@ test('the --jq filters work on GitHub-shaped payloads', { skip: !hasJq && 'jq no
     { label: 'x', actor: null, at: T('10:07') },
   ]);
 });
+
+test('pipeline-guards.yml re-evaluates a PR whose base changed (edited), but ignores title/body edits without cancelling real runs', () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+  const yml = readFileSync(join(root, 'pipeline', 'templates', 'workflows', 'pipeline-guards.yml'), 'utf8');
+  const types = /types: \[([^\]]*)\]/.exec(yml)[1].split(',').map((x) => x.trim());
+  for (const t of ['opened', 'synchronize', 'reopened', 'ready_for_review', 'labeled', 'unlabeled', 'edited']) assert.ok(types.includes(t), t);
+  assert.match(yml, /^    if: github\.event\.action != 'edited' \|\| github\.event\.changes\.base$/m);
+  assert.match(yml, /group: pipeline-guards-\$\{\{ github\.event\.pull_request\.number \}\}\$\{\{ github\.event\.action == 'edited' && !github\.event\.changes\.base && '-noop' \|\| '' \}\}/);
+  // The orchestrator takes the base from the event payload, which after a retarget holds the NEW base.
+  assert.match(yml, /BASE_SHA: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
+  assert.match(yml, /ref: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
+});

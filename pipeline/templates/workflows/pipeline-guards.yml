@@ -10,7 +10,8 @@ name: Pipeline guards
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+    # edited: a PR retargeted with `gh pr edit --base` must be judged against its NEW base, or its old statuses stay green.
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, edited]
 
 permissions:
   contents: read        # read base + fetch the PR head as data
@@ -20,12 +21,16 @@ permissions:
   checks: read          # check-suite timestamps (when the head commit appeared)
 
 concurrency:
-  group: pipeline-guards-${{ github.event.pull_request.number }}
+  # An edit that does not change the base (title, body) is a no-op below; it gets its own group so it can never cancel a
+  # real evaluation that is still running for the same PR.
+  group: pipeline-guards-${{ github.event.pull_request.number }}${{ github.event.action == 'edited' && !github.event.changes.base && '-noop' || '' }}
   cancel-in-progress: true
 
 jobs:
   guards:
     name: pipeline-guards
+    # `edited` also fires for title/body edits: only a base-branch change needs a new verdict.
+    if: github.event.action != 'edited' || github.event.changes.base
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
