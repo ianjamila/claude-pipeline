@@ -75,7 +75,9 @@ function toResult(r) {
   const timedOut = r.error?.code === 'ETIMEDOUT';
   let stderr = r.stderr ?? '';
   if (r.error && !timedOut && !stderr) stderr = r.error.message; // e.g. ENOENT: surface why nothing ran
-  return { code: r.status ?? 1, stdout: r.stdout ?? '', stderr, timedOut };
+  // `signal` is how a caller tells "killed" from a plain `exit 1`: a signalled child has no exit status, so `code`
+  // falls back to 1 and stderr is empty, which is exactly what git's "no match" answer looks like.
+  return { code: r.status ?? 1, stdout: r.stdout ?? '', stderr, timedOut, signal: r.signal ?? null };
 }
 
 function baseOptions({ cwd, env, timeoutMs } = {}) {
