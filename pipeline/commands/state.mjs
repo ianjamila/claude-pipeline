@@ -7,7 +7,9 @@ import { createGitHub, guardGh } from '../lib/github.mjs';
 import { MARKERS } from '../lib/render.mjs';
 import { decodeFromComment, loadState, saveState, updateItems } from '../lib/state.mjs';
 import { roundOutcome } from '../lib/triage.mjs';
-import { allItems, currentContentHash, findItem, findRound, requireState } from '../lib/review-context.mjs';
+import {
+  allItems, currentContentHash, findItem, findRound, requireState, withStateLock,
+} from '../lib/review-context.mjs';
 
 export const meta = {
   summary: 'show or update the review loop state (.review/state.json)',
@@ -49,7 +51,11 @@ async function show(rest, ctx) {
   const n = intOption(values, 'round', { min: 1 });
   const pr = intOption(values, 'pr', { min: 1 });
   const root = resolveRepo(values, ctx);
+  // `show` may rebuild the state file, so it takes the lock like the commands that change it.
+  return withStateLock(root, ctx, () => showLocked(values, n, pr, root, ctx), pr);
+}
 
+async function showLocked(values, n, pr, root, ctx) {
   let state;
   try {
     state = loadState(root);
@@ -98,17 +104,19 @@ function markImplemented(rest, ctx) {
   const ids = [...new Set(requireOption(values, 'ids').split(',').map((s) => s.trim()).filter(Boolean))];
   if (ids.length === 0) throw new UsageError('--ids must list at least one item id');
   const root = resolveRepo(values, ctx);
-  let state = requireState(root);
-  // Resolve every id first so a typo cannot leave the state half-updated.
-  const found = ids.map((id) => findItem(state, id));
-  for (const { item } of found) {
-    if (item.final?.decision !== 'ACCEPT') {
-      throw new Fail(EXIT.USAGE, { ok: false, error: 'not-accepted', message: `${item.id} is not an accepted item, so it cannot be marked implemented` });
+  return withStateLock(root, ctx, () => {
+    let state = requireState(root);
+    // Resolve every id first so a typo cannot leave the state half-updated.
+    const found = ids.map((id) => findItem(state, id));
+    for (const { item } of found) {
+      if (item.final?.decision !== 'ACCEPT') {
+        throw new Fail(EXIT.USAGE, { ok: false, error: 'not-accepted', message: `${item.id} is not an accepted item, so it cannot be marked implemented` });
+      }
     }
-  }
-  for (const { round, item } of found) state = updateItems(state, round.n, [{ ...item, implemented: true }]);
-  saveState(root, state);
-  return { exitCode: EXIT.OK, output: { ok: true, marked: ids } };
+    for (const { round, item } of found) state = updateItems(state, round.n, [{ ...item, implemented: true }]);
+    saveState(root, state);
+    return { exitCode: EXIT.OK, output: { ok: true, marked: ids } };
+  });
 }
 
 function recordFollowup(rest, ctx) {
@@ -117,10 +125,12 @@ function recordFollowup(rest, ctx) {
   const url = requireOption(values, 'url');
   if (!/^https?:\/\/\S+$/.test(url)) throw new UsageError('--url must be an http(s) URL');
   const root = resolveRepo(values, ctx);
-  const state = requireState(root);
-  const { round, item } = findItem(state, id);
-  saveState(root, updateItems(state, round.n, [{ ...item, followupIssue: url }]));
-  return { exitCode: EXIT.OK, output: { ok: true, id, url } };
+  return withStateLock(root, ctx, () => {
+    const state = requireState(root);
+    const { round, item } = findItem(state, id);
+    saveState(root, updateItems(state, round.n, [{ ...item, followupIssue: url }]));
+    return { exitCode: EXIT.OK, output: { ok: true, id, url } };
+  });
 }
 
 function setOutcome(rest, ctx) {
@@ -128,9 +138,11 @@ function setOutcome(rest, ctx) {
   const text = requireOption(values, 'outcome').replace(/\s+/g, ' ').trim();
   if (text === '' || text.length > 200) throw new UsageError('--outcome must be 1-200 characters of plain text');
   const root = resolveRepo(values, ctx);
-  const state = requireState(root);
-  saveState(root, { ...state, outcome: text });
-  return { exitCode: EXIT.OK, output: { ok: true, outcome: text } };
+  return withStateLock(root, ctx, () => {
+    const state = requireState(root);
+    saveState(root, { ...state, outcome: text });
+    return { exitCode: EXIT.OK, output: { ok: true, outcome: text } };
+  });
 }
 
 const SUBCOMMANDS = {

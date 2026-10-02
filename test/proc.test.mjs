@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  run, runShell, runShellAsync, splitCommand, escapeArgument, escapeCommand, quoteForCmd, planSpawn,
+  run, runAsync, runShell, runShellAsync, splitCommand, escapeArgument, escapeCommand, quoteForCmd, planSpawn,
   cmdExe, createResolver, toResult,
   gh, ghJson, GhError, codexCommand,
 } from '../pipeline/lib/proc.mjs';
@@ -390,6 +390,33 @@ test('runShellAsync SIGKILLs a command that traps SIGTERM', async () => {
 test('runShellAsync timeout kills the whole process tree, not just the direct child', async () => {
   const pidFile = join(scratch(), 'grandchild.pid');
   const r = await runShellAsync(`node "${spawnSleeper}" "${pidFile}"`, { timeoutMs: 1500 });
+  assert.equal(r.timedOut, true);
+  assert.notEqual(r.code, 0);
+  const pid = Number(readFileSync(pidFile, 'utf8'));
+  assert.ok(pid > 0);
+  assert.equal(await waitUntilDead(pid), true, `grandchild ${pid} survived the timeout`);
+});
+
+test('runAsync passes args verbatim (no shell), env, cwd and input', async () => {
+  const dir = realpathSync(scratch());
+  const r = await runAsync(process.execPath, ['-e', 'process.stdout.write(process.argv[1] + "|" + process.env.CP_A + "|" + process.cwd())', 'a b;"c"'], {
+    env: { CP_A: 'x' }, cwd: dir,
+  });
+  assert.deepEqual(r, { code: 0, stdout: `a b;"c"|x|${dir}`, stderr: '', timedOut: false });
+  assert.equal((await runAsync(process.execPath, ['-e', 'process.stdin.pipe(process.stdout)'], { input: 'piped' })).stdout, 'piped');
+  assert.equal((await runAsync(process.execPath, ['-e', 'process.exit(4)'])).code, 4);
+});
+
+test('runAsync: a missing binary resolves with a non-zero code and the spawn error, it never rejects', async () => {
+  const r = await runAsync(join(scratch(), 'no-such-binary'), ['x']);
+  assert.notEqual(r.code, 0);
+  assert.match(r.stderr, /ENOENT/);
+  assert.equal(r.timedOut, false);
+});
+
+test('runAsync timeout kills the whole process tree, not just the direct child', async () => {
+  const pidFile = join(scratch(), 'grandchild-async.pid');
+  const r = await runAsync(process.execPath, [spawnSleeper, pidFile], { timeoutMs: 1500 });
   assert.equal(r.timedOut, true);
   assert.notEqual(r.code, 0);
   const pid = Number(readFileSync(pidFile, 'utf8'));

@@ -4,7 +4,12 @@
 //   FAKE_CODEX_EXIT=<n>        exit n (with FAKE_CODEX_STDERR on stderr) without writing any output
 //   FAKE_CODEX_NO_WRITE=1      exit 0 without writing the output file (a run that "succeeded" but produced nothing)
 //   FAKE_CODEX_OUTPUT=<file>   copy that file's bytes to the `-o` path (a findings JSON, or garbage for a malformed run)
-import { appendFileSync, copyFileSync } from 'node:fs';
+//   FAKE_CODEX_DURING=<cmd>    run this shell command (synchronously) before answering: lets a test change the world
+//                              while "Codex is thinking"
+//   FAKE_CODEX_HANG=<pidfile>  start a helper (its pid goes to <pidfile>, its pipes are closed) that writes the `-o`
+//                              file after 2 s, then never answer: a hung Codex that left a helper behind
+import { appendFileSync, copyFileSync, writeFileSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
 
 const argv = process.argv.slice(2);
 
@@ -14,6 +19,20 @@ for await (const chunk of process.stdin) stdin += chunk;
 
 if (process.env.FAKE_CODEX_CAPTURE) {
   appendFileSync(process.env.FAKE_CODEX_CAPTURE, `${JSON.stringify({ argv, stdin })}\n`);
+}
+
+if (process.env.FAKE_CODEX_DURING) {
+  spawnSync(process.env.FAKE_CODEX_DURING, { shell: true, stdio: 'ignore', env: { ...process.env, FAKE_CODEX_DURING: '' } });
+}
+
+if (process.env.FAKE_CODEX_HANG) {
+  const out = argv[argv.indexOf('-o') + 1];
+  const helper = spawn(process.execPath, ['-e', `setTimeout(() => require('fs').copyFileSync(process.env.FAKE_CODEX_OUTPUT, process.argv[1]), 2000)`, out], {
+    stdio: 'ignore',
+  });
+  writeFileSync(process.env.FAKE_CODEX_HANG, String(helper.pid));
+  setInterval(() => {}, 1000);
+  await new Promise(() => {});
 }
 
 const exit = Number(process.env.FAKE_CODEX_EXIT ?? 0);

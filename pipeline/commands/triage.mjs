@@ -11,7 +11,7 @@ import {
   applyJudge, applyTestResult, finalizeWithoutArbiter, markLightLane, validateTriage,
 } from '../lib/triage.mjs';
 import {
-  ensureRoundDir, findItem, findRound, readFileOrFail, requireState, writeJson,
+  ensureRoundDir, findItem, findRound, readFileOrFail, requireState, withStateLock, writeJson,
 } from '../lib/review-context.mjs';
 
 export const meta = {
@@ -20,6 +20,7 @@ export const meta = {
     'pipeline triage validate --round R (--from-tag TAG | --file F) [--projects-dir DIR] [--max-age-ms N] [--repo DIR]',
     '  -> {ok, round, counts:{ACCEPT,FOLLOW-UP,REJECT}, settled, unsettled, judgeProof}; exit 1 + errors when the judge output is invalid (state untouched)',
     'pipeline triage settle --id ID --result bug-confirmed|bug-disproved --evidence TEXT [--repo DIR]',
+    '  -> only for a disputed bug with a possible settle test and no test result yet; exit 1 for an item that needs a human, was ruled by the arbiter or is implemented',
     'pipeline triage light-lane --round R [--repo DIR]',
   ].join('\n'),
 };
@@ -66,6 +67,10 @@ function validate(rest, ctx) {
   const n = intOption(values, 'round', { required: true, min: 1 });
   if ((values['from-tag'] === undefined) === (values.file === undefined)) throw new UsageError('give exactly one of --from-tag or --file');
   const root = resolveRepo(values, ctx);
+  return withStateLock(root, ctx, () => validateLocked(values, n, root, ctx));
+}
+
+function validateLocked(values, n, root, ctx) {
   const state = requireState(root);
   const round = findRound(state, n);
 
@@ -118,17 +123,33 @@ function settle(rest, ctx) {
   // A test result with no output behind it is an assertion, not evidence.
   const evidence = requireOption(values, 'evidence');
   const root = resolveRepo(values, ctx);
-  const state = requireState(root);
-  const { round, item } = findItem(state, id);
-  const settled = applyTestResult(item, result, evidence);
-  saveState(root, updateItems(state, round.n, [settled]));
-  return { exitCode: EXIT.OK, output: { ok: true, id, round: round.n, test: settled.test, final: settled.final } };
+  return withStateLock(root, ctx, () => {
+    const state = requireState(root);
+    const { round, item } = findItem(state, id);
+    // A test settles a DISPUTE: the judge called the item a bug in dispute and said a test could decide it. It must not
+    // become a way to overrule a human's call, the arbiter, or something already built.
+    const refuse = (reason) => ({ exitCode: EXIT.FAILED, output: { ok: false, id, round: round.n, reason } });
+    if (item.final?.needsHuman === true) return refuse(`${id} needs a human decision; a test result cannot settle it`);
+    if (item.final?.by === 'arbiter') return refuse(`${id} was already ruled by the arbiter`);
+    if (item.implemented === true) return refuse(`${id} is already implemented`);
+    if ((item.test?.status ?? 'none') !== 'none') return refuse(`${id} already has a test result`);
+    if (!(item.judge?.disputedBug === true && item.judge.settleTest?.possible === true)) {
+      return refuse(`${id} is not a disputed bug with a possible settle test`);
+    }
+    const settled = applyTestResult(item, result, evidence);
+    saveState(root, updateItems(state, round.n, [settled]));
+    return { exitCode: EXIT.OK, output: { ok: true, id, round: round.n, test: settled.test, final: settled.final } };
+  });
 }
 
 function lightLane(rest, ctx) {
   const { values } = parseCommandArgs(rest, { round: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
   const n = intOption(values, 'round', { required: true, min: 1 });
   const root = resolveRepo(values, ctx);
+  return withStateLock(root, ctx, () => lightLaneLocked(n, root));
+}
+
+function lightLaneLocked(n, root) {
   const state = requireState(root);
   const round = findRound(state, n);
   // The shortcut skips triage of the WORTH CONSIDERING items, which is only acceptable for a small low-risk change.

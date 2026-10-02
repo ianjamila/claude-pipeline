@@ -374,12 +374,43 @@ test('applyRulings: stores the arbiter record with the transcript and does not m
 
 // ---- cache ----------------------------------------------------------------------------------
 
-test('reuseRuled: a matching fingerprint reuses the earlier final, marked by cache', () => {
+test('reuseRuled: a matching fingerprint, bucket and category reuses the earlier final, marked by cache', () => {
   const earlier = settled('REJECT', 'arbiter', { reason: 'not a bug' });
-  const it = item({ fingerprint: 'same-fp' });
-  const [out] = reuseRuled([it], { 'same-fp': earlier });
-  assert.deepEqual(out.final, { ...earlier, by: 'cache' });
+  const it = item({ fingerprint: 'same-fp' }); // BLOCKING, logic
+  const [out] = reuseRuled([it], { 'same-fp': { ...earlier, bucket: 'BLOCKING', category: 'logic' } });
+  assert.deepEqual(out.final, { ...earlier, by: 'cache' }, 'the bucket and category of the entry are not part of the final');
   assert.equal(it.final, null, 'input not mutated');
+});
+
+test('reuseRuled: a ruling is reused only for the same bucket AND category', () => {
+  const entry = { ...settled('REJECT', 'arbiter'), bucket: 'WORTH_CONSIDERING', category: 'performance' };
+  const cache = { fp: entry };
+  const reused = (over) => reuseRuled([item({ fingerprint: 'fp', ...over })], cache)[0].final;
+  assert.equal(reused({ bucket: 'WORTH_CONSIDERING', category: 'performance' }).by, 'cache');
+  assert.equal(reused({ bucket: 'BLOCKING', category: 'performance' }), null, 'higher severity bucket');
+  assert.equal(reused({ bucket: 'SUGGESTION', category: 'performance' }), null, 'other bucket');
+  assert.equal(reused({ bucket: 'WORTH_CONSIDERING', category: 'bug' }), null, 'other category');
+  assert.equal(reuseRuled([item({ fingerprint: 'fp', bucket: 'WORTH_CONSIDERING', category: 'performance' })], { fp: settled('REJECT', 'arbiter') })[0].final, null, 'an entry that does not say what it was ruled for');
+});
+
+test('reuseRuled: a dismissal of a security, auth, permissions or data category is never reused, an acceptance is', () => {
+  for (const category of SECURITY_CATEGORIES) {
+    for (const decision of ['REJECT', 'FOLLOW-UP']) {
+      const cache = { fp: { ...settled(decision, 'arbiter'), bucket: 'BLOCKING', category } };
+      assert.equal(reuseRuled([item({ fingerprint: 'fp', bucket: 'BLOCKING', category })], cache)[0].final, null, `${decision} ${category}`);
+    }
+    const accepted = { fp: { ...settled('ACCEPT', 'arbiter'), bucket: 'BLOCKING', category } };
+    assert.equal(reuseRuled([item({ fingerprint: 'fp', bucket: 'BLOCKING', category })], accepted)[0].final.by, 'cache', `ACCEPT ${category}`);
+  }
+});
+
+test('reuseRuled: the follow-up issue filed for the earlier item comes with the cached ruling', () => {
+  const entry = { ...settled('FOLLOW-UP', 'judge'), bucket: 'BLOCKING', category: 'logic', followupIssue: 'https://x/1' };
+  const [out] = reuseRuled([item({ fingerprint: 'fp' })], { fp: entry });
+  assert.equal(out.followupIssue, 'https://x/1');
+  assert.ok(!('followupIssue' in out.final) && !('bucket' in out.final));
+  const [kept] = reuseRuled([item({ fingerprint: 'fp', followupIssue: 'https://x/own' })], { fp: entry });
+  assert.equal(kept.followupIssue, 'https://x/own', 'an issue the item already has is not replaced');
 });
 
 test('reuseRuled: a different fingerprint (the code changed) is not reused', () => {
@@ -405,9 +436,17 @@ test('ruledCacheFrom: keeps settled finals, drops pending and needs-human ones',
   const cache = ruledCacheFrom([ok, human, pending]);
   assert.deepEqual(Object.keys(cache), ['a']);
   assert.equal(cache.a.decision, 'REJECT');
+  assert.deepEqual([cache.a.bucket, cache.a.category], [ok.bucket, ok.category], 'the entry remembers what it was ruled for');
   // Round trip: a cache built from round N pre-fills the same item in round N+1.
   const [again] = reuseRuled([item({ fingerprint: 'a' })], cache);
   assert.equal(again.final.by, 'cache');
+});
+
+test('ruledCacheFrom: the follow-up issue of an item (or of an earlier item with the same fingerprint) is kept', () => {
+  const filed = item({ fingerprint: 'fp', final: settled('FOLLOW-UP', 'judge'), followupIssue: 'https://x/9' });
+  const again = item({ fingerprint: 'fp', final: settled('FOLLOW-UP', 'cache') });
+  assert.equal(ruledCacheFrom([filed, again]).fp.followupIssue, 'https://x/9');
+  assert.equal(ruledCacheFrom([item({ fingerprint: 'z', final: settled('REJECT', 'judge') })]).z.followupIssue, undefined);
 });
 
 test('markLightLane: untriaged WORTH_CONSIDERING items are rejected by the light lane', () => {
@@ -690,6 +729,18 @@ test('reviewValidFor: a later round with an unsettled BLOCKING item invalidates 
   const earlierOk = round(1, [item({ final: settled('REJECT', 'judge') })], 'h-1');
   const laterOk = round(2, [], 'h-final');
   assert.equal(reviewValidFor(stateOf([earlierOk, laterOk]), 'h-final'), true);
+});
+
+test('reviewValidFor: only the MOST RECENT clean round counts: a later round that accepted something invalidates an earlier clean match (R3\')', () => {
+  const clean = round(1, [item({ final: settled('REJECT', 'judge') })], 'h-final');
+  const accepting = round(2, [item({ bucket: 'SUGGESTION', final: settled('ACCEPT', 'judge'), implemented: true })], 'h-other');
+  // everything is resolved and implemented, but round 2 was not clean and round 1's content is the current one again
+  assert.equal(reviewValidFor(stateOf([clean, accepting]), 'h-final'), false);
+  assert.equal(reviewValidFor(stateOf([clean, accepting]), 'h-other'), false);
+  // once a clean round 3 reviews the fix, that round decides
+  const third = round(3, [], 'h-third');
+  assert.equal(reviewValidFor(stateOf([clean, accepting, third]), 'h-third'), true);
+  assert.equal(reviewValidFor(stateOf([clean, accepting, third]), 'h-final'), false, 'an older clean round no longer vouches');
 });
 
 // ---- review fixes: fail-closed rules --------------------------------------------------------

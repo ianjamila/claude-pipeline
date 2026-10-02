@@ -12,7 +12,7 @@ import { extractJsonBlock, findSubagentTranscript, proveModel } from '../lib/tra
 import { applyRulings, arbiterNeeded, finalizeWithoutArbiter, validateRulings } from '../lib/triage.mjs';
 import {
   ensureRoundDir, excerptWindow, findRound, oneLine, patchRound, readFileOrFail, requireState, roundDir, sha256,
-  writeFileAtomic, writeJson,
+  withStateLock, writeFileAtomic, writeJson,
 } from '../lib/review-context.mjs';
 
 export const meta = {
@@ -20,8 +20,8 @@ export const meta = {
   usage: [
     'pipeline arbiter needed --round R [--force] [--repo DIR]',
     '  -> {needed:false, items:[]} | {needed:true, items, inputPath, digest, digest8, tag}',
-    'pipeline arbiter apply --round R [--tag TAG | --agent-id ID] [--expect-model claude-fable-] [--expect-effort high]',
-    '                       [--projects-dir DIR] [--max-age-ms N] [--repo DIR]',
+    'pipeline arbiter apply --round R [--tag TAG | --agent-id ID] [--projects-dir DIR] [--max-age-ms N] [--repo DIR]',
+    '  the proof is pinned to claude-fable- at effort high; --expect-model / --expect-effort are honoured only with PIPELINE_TEST_MODE=1',
     '  -> {ok, round, tag, transcript, errors, items}; exit 0 proven + applied, 1 unproven (every arbitrated item needsHuman), 2 no transcript',
   ].join('\n'),
 };
@@ -30,6 +30,8 @@ export const DEFAULT_EXPECT_MODEL = 'claude-fable-';
 export const DEFAULT_EXPECT_EFFORT = 'high';
 
 const forceArbiter = (env) => (env ?? process.env).PIPELINE_TEST_FORCE_ARBITER === '1';
+// Only the test suite may point the proof at another model or effort; a normal run is always pinned (spec R13).
+const testMode = (env) => (env ?? process.env).PIPELINE_TEST_MODE === '1';
 
 function nonEmpty(values, name) {
   if (values[name] === '') throw new UsageError(`--${name} must not be empty`);
@@ -97,6 +99,10 @@ function needed(rest, ctx) {
   }, { allowPositionals: false });
   const n = intOption(values, 'round', { required: true, min: 1 });
   const root = resolveRepo(values, ctx);
+  return withStateLock(root, ctx, () => neededLocked(values, n, root, ctx));
+}
+
+function neededLocked(values, n, root, ctx) {
   const state = requireState(root);
   const round = findRound(state, n);
 
@@ -147,13 +153,23 @@ function apply(rest, ctx) {
   const agentId = nonEmpty(values, 'agent-id');
   const givenTag = nonEmpty(values, 'tag');
   if (agentId !== undefined && givenTag !== undefined) throw new UsageError('give at most one of --tag or --agent-id');
-  const expectModelPrefix = nonEmpty(values, 'expect-model') ?? DEFAULT_EXPECT_MODEL;
-  const expectEffort = nonEmpty(values, 'expect-effort') ?? DEFAULT_EXPECT_EFFORT;
+  const asked = { model: nonEmpty(values, 'expect-model'), effort: nonEmpty(values, 'expect-effort') };
+  const env = ctx.env ?? process.env;
+  // The expectation is the whole point of the proof: a flag (or an env var) that could change it would let a ruling
+  // from any model count. Only the test suite (PIPELINE_TEST_MODE=1) may; otherwise the flags are ignored.
+  const expectModelPrefix = (testMode(env) ? asked.model : undefined) ?? DEFAULT_EXPECT_MODEL;
+  const expectEffort = (testMode(env) ? asked.effort : undefined) ?? DEFAULT_EXPECT_EFFORT;
   const maxAgeMs = intOption(values, 'max-age-ms', { min: 0 });
   const projectsDir = nonEmpty(values, 'projects-dir');
-  const env = ctx.env ?? process.env;
 
   const root = resolveRepo(values, ctx);
+  return withStateLock(root, ctx, () => applyLocked({
+    n, agentId, givenTag, expectModelPrefix, expectEffort, maxAgeMs, projectsDir, env, root,
+    ignoredExpectations: !testMode(env) && (asked.model !== undefined || asked.effort !== undefined),
+  }));
+}
+
+function applyLocked({ n, agentId, givenTag, expectModelPrefix, expectEffort, maxAgeMs, projectsDir, env, root, ignoredExpectations }) {
   const state = requireState(root);
   const round = findRound(state, n);
   const stored = round.arbiter;
@@ -171,9 +187,10 @@ function apply(rest, ctx) {
   }
   const jsonlText = readFileOrFail(found.jsonlPath, 'transcript');
   const metaText = found.metaPath === null ? undefined : readFileOrFail(found.metaPath, 'meta');
-  // Only the proof switch may name a per-call model override; with it unset, any override in the meta is an error.
-  const expectMetaModel = env.PIPELINE_ARBITER_MODEL_OVERRIDE || null;
-  const proof = proveModel({ jsonlText, metaText, expectModelPrefix, expectEffort, expectMetaModel, expectAgentType: 'arbiter' });
+  // The arbiter is invoked without a per-call model, so ANY override in the meta is an error. That holds even when
+  // PIPELINE_ARBITER_MODEL_OVERRIDE is set: that switch only lets the proof-6 test start an agent on a bad model, and
+  // the proof must fail for it (the ruling goes to a human), never be relaxed to accept it.
+  const proof = proveModel({ jsonlText, metaText, expectModelPrefix, expectEffort, expectMetaModel: null, expectAgentType: 'arbiter' });
 
   const errors = [...proof.errors];
   const asksRound = new RegExp(`^ROUND: ${n}[ \\t]*$`, 'm');
@@ -216,6 +233,7 @@ function apply(rest, ctx) {
       tag,
       transcript: found.jsonlPath,
       errors,
+      ...(ignoredExpectations ? { note: '--expect-model / --expect-effort ignored: the proof is pinned to claude-fable- at effort high' } : {}),
       items: stored.items.map((id) => ({
         id, ruling: byId.get(id)?.final?.decision ?? null, needsHuman: byId.get(id)?.final?.needsHuman ?? null,
       })),

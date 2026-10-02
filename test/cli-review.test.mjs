@@ -80,16 +80,26 @@ function world(t, { gh = GH, light = false } = {}) {
   const head = repo.commit('feature');
   const scratch = realpathSync(mkdtempSync(join(tmpdir(), 'cp-review-')));
   t.after(() => rmSync(scratch, { recursive: true, force: true }));
-  const fake = createFakeGh(gh);
+  // The PR as GitHub reports it: its base branch and the head commit it holds (what review-complete compares to).
+  const withPr = (sha) => gh.map((e) => (e.match === '^pr view 7' ? { ...e, stdoutJson: { baseRefName: 'main', headRefOid: sha, ...e.stdoutJson } } : e));
+  const fake = createFakeGh(withPr(head));
   const capture = join(scratch, 'codex-capture.jsonl');
+  const lockDir = join(scratch, 'locks');
 
   const w = {
-    repo, base, head, scratch, fake, capture,
+    repo, base, head, scratch, fake, capture, lockDir,
+    // Tell the fake GitHub the PR's head moved (after a new commit).
+    prHead: (sha) => fake.setScript(withPr(sha)),
     cli(args, env = {}) {
       const merged = {
-        ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, FAKE_CODEX_CAPTURE: capture, ...env,
+        ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, FAKE_CODEX_CAPTURE: capture,
+        PIPELINE_LOCK_DIR: lockDir, ...env,
       };
-      for (const k of ['PIPELINE_TEST_FORCE_ARBITER', 'PIPELINE_ARBITER_MODEL_OVERRIDE', 'FAKE_CODEX_EXIT', 'FAKE_CODEX_STDERR', 'FAKE_CODEX_NO_WRITE', 'FAKE_CODEX_OUTPUT']) {
+      for (const k of [
+        'PIPELINE_TEST_FORCE_ARBITER', 'PIPELINE_ARBITER_MODEL_OVERRIDE', 'PIPELINE_TEST_MODE', 'PIPELINE_CODEX_TIMEOUT_MS',
+        'PIPELINE_LOCK_WAIT_MS', 'FAKE_CODEX_EXIT', 'FAKE_CODEX_STDERR', 'FAKE_CODEX_NO_WRITE', 'FAKE_CODEX_OUTPUT',
+        'FAKE_CODEX_HANG', 'FAKE_CODEX_DURING',
+      ]) {
         if (!(k in env)) delete merged[k];
       }
       const r = spawnSync(process.execPath, [bin, ...args], { cwd: repo.dir, env: merged, encoding: 'utf8' });
@@ -340,6 +350,7 @@ test('codex-review: GitHub being unreachable is exit 3 with unavailable:true, re
 test('codex-review: rulings from earlier rounds go into the next prompt and pre-rule an unchanged finding (cache)', (t) => {
   const w = world(t);
   assert.equal(w.codex(1, standardFindings()).code, 0);
+  assert.equal(w.judge(1, { ...STANDARD_JUDGE, 'R1-B1': ['REJECT', 'high', DISPUTED] }).code, 0, 'the judge disputes the bug and a test can decide');
   const settled = w.cli(['triage', 'settle', '--id', 'R1-B1', '--result', 'bug-disproved', '--evidence', 'src/a.test.js: compute(undefined) returns 0']);
   assert.equal(settled.code, 0, settled.stderr);
 
@@ -367,6 +378,7 @@ test('codex-review: rulings from earlier rounds go into the next prompt and pre-
 test('codex-review: when the code around a ruled finding changed, the ruling is not reused', (t) => {
   const w = world(t);
   assert.equal(w.codex(1, findingsOf([finding()])).code, 0);
+  assert.equal(w.judge(1, { 'R1-B1': ['REJECT', 'high', DISPUTED] }).code, 0);
   assert.equal(w.cli(['triage', 'settle', '--id', 'R1-B1', '--result', 'bug-disproved', '--evidence', 'passes']).code, 0);
   w.repo.write('src/a.js', aFile(true).replace('v13 = 13', 'v13 = 13 + 1'));
   const head2 = w.repo.commit('touch the excerpt');
@@ -459,7 +471,7 @@ test('triage validate: usage and environment errors (no locator, both locators, 
 test('triage validate: items already ruled (cache, test) are not the judge\'s to decide', (t) => {
   const w = world(t);
   assert.equal(w.codex(1, findingsOf([finding()], [finding({ title: 'Rename helper', file: 'src/b.js', line: 3 })])).code, 0);
-  assert.equal(w.cli(['triage', 'settle', '--id', 'R1-B1', '--result', 'bug-confirmed', '--evidence', 'a.test.js fails']).code, 0);
+  editState(w, (st) => { st.rounds[0].items[0].final = { decision: 'ACCEPT', by: 'test', needsHuman: false, reason: 'test confirmed: a.test.js fails' }; });
   const wholeRound = w.judge(1, { 'R1-B1': ['REJECT'], 'R1-S1': ['ACCEPT'] });
   assert.equal(wholeRound.code, 1, 'R1-B1 already has a final, so judging it is an unknown id');
   const ok = w.judge(1, { 'R1-S1': ['ACCEPT'] });
@@ -482,7 +494,8 @@ test('triage validate: PIPELINE_TEST_FORCE_ARBITER=1 keeps every judged item for
 test('triage settle: a test result settles the item and outranks the judge; bad input is exit 2', (t) => {
   const w = world(t);
   assert.equal(w.codex(1, standardFindings()).code, 0);
-  assert.equal(w.judge(1, STANDARD_JUDGE).code, 0);
+  // S1 and S2 are the judge's REJECTs that a test can decide: disputed bugs with a possible settle test
+  assert.equal(w.judge(1, { ...STANDARD_JUDGE, 'R1-S1': ['REJECT', 'high', DISPUTED], 'R1-S2': ['REJECT', 'low', DISPUTED] }).code, 0);
 
   const r = w.cli(['triage', 'settle', '--id', 'R1-S1', '--result', 'bug-confirmed', '--evidence', 'b.test.js: expected 3 got 4']);
   assert.equal(r.code, 0, r.stderr);
@@ -493,6 +506,7 @@ test('triage settle: a test result settles the item and outranks the judge; bad 
 
   assert.equal(w.cli(['triage', 'settle', '--id', 'R1-S2', '--result', 'bug-disproved', '--evidence', 'passes']).json.final.decision, 'REJECT');
   assert.equal(w.cli(['triage', 'settle', '--id', 'R1-S2', '--result', 'maybe', '--evidence', 'x']).code, 2);
+  assert.equal(w.cli(['triage', 'settle', '--id', 'R1-B1', '--result', 'bug-confirmed', '--evidence', 'x']).code, 1, 'not a disputed bug');
   assert.equal(w.cli(['triage', 'settle', '--id', 'R9-B1', '--result', 'bug-confirmed', '--evidence', 'x']).code, 2);
   assert.equal(w.cli(['triage', 'settle', '--id', 'R1-S2', '--result', 'bug-confirmed']).code, 2, 'a result needs evidence');
   assert.equal(w.cli(['triage', 'settle', '--result', 'bug-confirmed', '--evidence', 'x']).code, 2);
@@ -517,10 +531,10 @@ test('triage light-lane: closes untriaged WORTH CONSIDERING items; refused unles
 
 // ---- arbiter needed / apply -------------------------------------------------------------------
 
-function readyForArbiter(t, opts) {
+function readyForArbiter(t, opts, decisions = STANDARD_JUDGE) {
   const w = world(t, opts);
   assert.equal(w.codex(1, standardFindings()).code, 0);
-  assert.equal(w.judge(1, STANDARD_JUDGE).code, 0);
+  assert.equal(w.judge(1, decisions).code, 0);
   return w;
 }
 
@@ -752,7 +766,7 @@ test('arbiter apply: rulings that do not cover exactly the needed ids, or are no
   assert.equal(unverified.rulings[0].reasoning, 'unverified');
 });
 
-test('arbiter apply: a per-call model override is only tolerated when PIPELINE_ARBITER_MODEL_OVERRIDE names it, and a bad model still fails', (t) => {
+test('arbiter apply: a per-call model override fails the proof (proof 6), with or without PIPELINE_ARBITER_MODEL_OVERRIDE', (t) => {
   // proof switch #6: the override model does not exist; the agent errors; nothing may be trusted
   const synthetic = (digest) => readFileSync(join(here, 'fixtures', 'transcripts', 'synthetic-error.jsonl'), 'utf8')
     .replace('abc123def456abc123def456abc123def456abc123def456abc123def456abcd', digest);
@@ -763,7 +777,7 @@ test('arbiter apply: a per-call model override is only tolerated when PIPELINE_A
     jsonl: synthetic(needed.digest), meta: { model: 'claude-nonexistent-0' }, env: { PIPELINE_ARBITER_MODEL_OVERRIDE: 'claude-nonexistent-0' },
   });
   assertAllNeedHuman(w, withEnv, /unexpected model <synthetic>/);
-  assert.ok(!withEnv.json.errors.some((e) => /per-call model override present/.test(e)), 'the switch names this override, so it is not itself an error');
+  assert.ok(withEnv.json.errors.some((e) => /per-call model override present/.test(e)), 'the switch never excuses an override: the proof fails for it as well');
 
   const w2 = readyForArbiter(t);
   const n2 = w2.cli(['arbiter', 'needed', '--round', '1']).json;
@@ -788,7 +802,7 @@ test('arbiter apply: no transcript is exit 2 and leaves the state untouched; no 
 });
 
 test('arbiter apply: an arbiter that wants a human (low confidence) is final but needsHuman, and a test result is never overridden', (t) => {
-  const w = readyForArbiter(t);
+  const w = readyForArbiter(t, undefined, { ...STANDARD_JUDGE, 'R1-S1': ['REJECT', 'high', DISPUTED] });
   w.cli(['arbiter', 'needed', '--round', '1']);
   assert.equal(w.cli(['triage', 'settle', '--id', 'R1-S1', '--result', 'bug-confirmed', '--evidence', 'b.test.js fails']).code, 0);
   const text = fenced({
@@ -951,7 +965,7 @@ test('review-complete: removes awaiting-review only when the review is valid for
   // the branch moved on after the review: the label stays
   const calls = w.fake.lines().filter((l) => l.startsWith('pr edit')).length;
   w.repo.write('src/b.js', `${bFile}export const extra = 1;\n`);
-  w.repo.commit('unreviewed change');
+  w.prHead(w.repo.commit('unreviewed change'));
   const stale = w.cli(['review-complete', '--pr', '7']);
   assert.equal(stale.code, 1);
   assert.equal(stale.json.ok, false);
@@ -1063,6 +1077,7 @@ test('a full round: codex -> judge -> arbiter -> implement -> follow-ups -> clea
   w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
   w.repo.write('src/b.js', bFile.replace('w5 = 5', 'FIVE = 5'));
   const head2 = w.repo.commit('implement accepted items');
+  w.prHead(head2);
   assert.equal(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1,R1-S2']).code, 0);
   assert.equal(w.cli(['followups', 'create', '--round', '1']).json.created[0].id, 'R1-W1');
   assert.equal(w.cli(['state', 'outcome']).json.clean, false, 'round 1 accepted things: a later round must review the fixes');
@@ -1087,4 +1102,391 @@ test('a full round: codex -> judge -> arbiter -> implement -> follow-ups -> clea
   assert.ok(summary.startsWith(MARKERS.summary));
   assert.match(summary, /Fable proof: .*agent-a1\.jsonl, models claude-fable-5-1×1, effort high/);
   assert.ok(summary.includes(url), 'the follow-up issue recorded by followups create is listed');
+});
+
+// ---- review fixes: bind the range, guard cache reuse and settle, lock the state ----------------
+
+// Add `edit(fn)` to a world: change the state file the way an earlier (hypothetical) step would have left it.
+const editState = (w, fn) => {
+  const s = w.state();
+  fn(s);
+  writeFileSync(join(w.repo.dir, '.review', 'state.json'), JSON.stringify(s, null, 2));
+};
+const noState = (w) => !existsSync(join(w.repo.dir, '.review', 'state.json'));
+const DISPUTED = { disputedBug: true, settleTest: { possible: true, plan: 'write a failing test' } };
+
+test('codex-review: round 1 must review exactly mergeBase..head; base == head, or any other base, is exit 2 and Codex never runs', (t) => {
+  // Reviewer repro R1: --base == --head recorded an EMPTY review as full coverage (lightLane forced on, hard stops
+  // hidden), and review-complete then removed awaiting-review.
+  const w = world(t);
+  const same = w.codex(1, findingsOf(), { from: w.head, to: w.head });
+  assert.equal(same.code, 2, same.stdout);
+  assert.equal(same.json.error, 'base-mismatch');
+  assert.match(same.json.message, new RegExp(w.base));
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  const head2 = w.repo.commit('more');
+  const narrow = w.codex(1, findingsOf(), { from: w.head, to: head2 });
+  assert.equal(narrow.code, 2);
+  assert.equal(narrow.json.error, 'base-mismatch');
+  assert.equal(w.captured().length, 0, 'Codex is not even started');
+  assert.ok(noState(w), 'nothing recorded');
+  assert.equal(w.cli(['review-complete', '--pr', '7']).code, 1);
+
+  // the real merge base is accepted, by SHA or by an abbreviation of it
+  const ok = w.codex(1, findingsOf(), { from: w.base.slice(0, 12), to: head2 });
+  assert.equal(ok.code, 0, ok.stderr + ok.stdout);
+  assert.equal(w.state().rounds[0].fromHead, w.base);
+});
+
+test('codex-review: round N > 1 must start at the previous round\'s toHead; any other base is exit 2', (t) => {
+  const w = world(t);
+  assert.equal(w.codex(1, findingsOf()).code, 0);
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  const head2 = w.repo.commit('fix');
+  for (const from of [w.base, head2]) {
+    const r = w.codex(2, findingsOf(), { from, to: head2 });
+    assert.equal(r.code, 2, `base ${from}`);
+    assert.equal(r.json.error, 'base-mismatch');
+    assert.match(r.json.message, new RegExp(w.head));
+  }
+  assert.equal(w.captured().length, 1);
+  assert.equal(w.codex(2, findingsOf(), { from: w.head, to: head2 }).code, 0);
+});
+
+test('codex-review: risk and light lane come from the whole PR on every round, and a growing PR leaves the light lane', (t) => {
+  const w = world(t, { light: true });
+  assert.equal(w.codex(1, findingsOf()).json.lightLane, true);
+  assert.equal(w.state().lightLane, true);
+  w.repo.write('src/big.js', Array.from({ length: 80 }, (_, i) => `export const big${i} = ${i};`).join('\n') + '\n');
+  const head2 = w.repo.commit('grow');
+  // round 2 reviews only the 80-line commit, but the PR as a whole is now over the cap; a fix round can never
+  // turn the light lane on, and a PR that outgrew it must stop using it
+  const r = w.codex(2, findingsOf(), { from: w.head, to: head2 });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.json.lightLane, false);
+  assert.equal(w.state().lightLane, false);
+  assert.ok(/Risk level: (low|medium|high)/.test(w.captured()[1].stdin));
+});
+
+test('codex-review: a hard-stop file anywhere in the PR makes the risk high (computed from mergeBase..head, not --base)', (t) => {
+  const w = world(t);
+  w.repo.write('.github/workflows/ci.yml', 'name: x\n');
+  const head2 = w.repo.commit('workflow');
+  const r = w.codex(1, findingsOf(), { from: w.base, to: head2 });
+  assert.equal(r.code, 0, r.stderr + r.stdout);
+  assert.equal(w.state().risk, 'high');
+  assert.equal(r.json.lightLane, false);
+});
+
+test('codex-review: a finding path that tries to leave the repository reads nothing outside the git tree (reviewer repro R3)', (t) => {
+  const w = world(t);
+  const f = (file) => finding({ title: `T ${file}`, file });
+  assert.equal(w.codex(1, findingsOf([f('../../../../../../etc/passwd'), f('/etc/passwd'), f(':/src/a.js'), f('src/../src/a.js')])).code, 0);
+  const needed = w.cli(['arbiter', 'needed', '--round', '1', '--force']);
+  assert.equal(needed.code, 0, needed.stderr);
+  const input = readFileSync(needed.json.inputPath, 'utf8');
+  assert.ok(!input.includes('root:') && !input.includes('/bin/'), 'no file outside the repository is quoted');
+  assert.equal((input.match(/does not exist at HEAD/g) ?? []).length >= 2, true);
+});
+
+// -- the ruled cache
+
+test('codex-review cache: a dismissal is never reused for a finding that came back higher-severity or as a security category', (t) => {
+  // Reviewer repro 2: a WORTH CONSIDERING performance FOLLOW-UP was reused for the same text escalated to a
+  // BLOCKING security finding, which then looked "ruled" and let the review go clean.
+  const w = world(t);
+  const idea = (over = {}) => finding({ title: 'Cache grows', file: 'src/a.js', line: 20, category: 'performance', testable: false, ...over });
+  assert.equal(w.codex(1, findingsOf([], [], [idea()])).code, 0);
+  assert.equal(w.judge(1, { 'R1-W1': ['FOLLOW-UP'] }).code, 0);
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  const head2 = w.repo.commit('more');
+
+  const escalated = w.codex(2, findingsOf([idea({ category: 'security' })]), { from: w.head, to: head2 });
+  assert.equal(escalated.code, 0, escalated.stderr + escalated.stdout);
+  assert.equal(escalated.json.preRuled, 0);
+  assert.equal(w.item('R2-B1').final ?? null, null, 'still pending: it must be triaged like a new finding');
+  assert.equal(w.cli(['state', 'outcome']).json.clean, false);
+  assert.equal(w.cli(['state', 'outcome']).json.openBlocking[0], 'R2-B1');
+});
+
+test('codex-review cache: same fingerprint but another bucket or category is reopened; the same bucket and category is reused', (t) => {
+  const w = world(t);
+  const idea = (over = {}) => finding({ title: 'Cache grows', file: 'src/a.js', line: 20, category: 'performance', testable: false, ...over });
+  assert.equal(w.codex(1, findingsOf([], [], [idea()])).code, 0);
+  assert.equal(w.judge(1, { 'R1-W1': ['REJECT'] }).code, 0);
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  const head2 = w.repo.commit('more');
+
+  const r = w.codex(2, findingsOf([], [idea({ category: 'design' }), idea({ title: 'Cache grows' })], [idea()]), { from: w.head, to: head2 });
+  assert.equal(r.code, 0, r.stderr + r.stdout);
+  assert.equal(w.item('R2-S1').final ?? null, null, 'other category');
+  assert.equal(w.item('R2-S2').final ?? null, null, 'other bucket (SUGGESTION, was WORTH CONSIDERING)');
+  assert.equal(w.item('R2-W1').final.by, 'cache', 'identical bucket and category');
+});
+
+// -- triage settle
+
+test('triage settle: a needsHuman item stays with the human (reviewer repro R2: a settle used to override it)', (t) => {
+  const w = world(t);
+  assert.equal(w.codex(1, findingsOf([finding({ title: 'sec', category: 'security', file: 'src/a.js' })])).code, 0);
+  editState(w, (s) => {
+    s.rounds[0].items[0].judge = { decision: 'REJECT', confidence: 'high', reason: 'r', ...DISPUTED };
+    s.rounds[0].items[0].final = { decision: 'REJECT', by: 'arbiter', needsHuman: true, reason: 'would dismiss a blocking security/data item' };
+  });
+  const before = w.stateText();
+  const s = w.cli(['triage', 'settle', '--id', 'R1-B1', '--result', 'bug-disproved', '--evidence', 'trust me']);
+  assert.equal(s.code, 1, s.stdout);
+  assert.equal(s.json.ok, false);
+  assert.match(s.json.reason, /needs a human/);
+  assert.equal(w.stateText(), before, 'state untouched');
+  assert.equal(w.cli(['state', 'outcome']).json.needsHuman[0], 'R1-B1');
+});
+
+test('triage settle: only a disputed bug with a possible settle test and no test result yet can be settled', (t) => {
+  const w = world(t);
+  assert.equal(w.codex(1, findingsOf([finding(), finding({ title: 'Second' }), finding({ title: 'Third' }), finding({ title: 'Fourth' }), finding({ title: 'Fifth' })])).code, 0);
+  const judged = (id, extra) => ({ id, decision: 'REJECT', confidence: 'high', reason: 'no', disputedBug: false, settleTest: { possible: false, plan: '' }, ...extra });
+  const j = w.file('j.json', { items: [
+    judged('R1-B1', DISPUTED), judged('R1-B2', {}), judged('R1-B3', { disputedBug: true }), judged('R1-B4', DISPUTED), judged('R1-B5', DISPUTED),
+  ] });
+  assert.equal(w.cli(['triage', 'validate', '--round', '1', '--file', j]).code, 0);
+  const settle = (id) => w.cli(['triage', 'settle', '--id', id, '--result', 'bug-confirmed', '--evidence', 'test output']);
+
+  assert.equal(settle('R1-B2').code, 1, 'the judge did not dispute it as a bug');
+  assert.equal(settle('R1-B3').code, 1, 'disputed, but no settle test is possible');
+  editState(w, (s) => { s.rounds[0].items[3].final = { decision: 'ACCEPT', by: 'arbiter', needsHuman: false, reason: 'x' }; });
+  assert.equal(settle('R1-B4').code, 1, 'the arbiter already ruled');
+  editState(w, (s) => { s.rounds[0].items[4].final = { decision: 'ACCEPT', by: 'judge', needsHuman: false, reason: 'x' }; s.rounds[0].items[4].implemented = true; });
+  assert.equal(settle('R1-B5').code, 1, 'already implemented');
+  for (const id of ['R1-B2', 'R1-B3', 'R1-B4', 'R1-B5']) assert.equal(w.item(id).test?.status ?? 'none', 'none', id);
+
+  const ok = settle('R1-B1');
+  assert.equal(ok.code, 0, ok.stdout);
+  assert.equal(w.item('R1-B1').final.by, 'test');
+  assert.equal(settle('R1-B1').code, 1, 'a second result for an item that already has one');
+});
+
+// -- follow-ups
+
+test('followups create: a finding already filed (any round, cache reuse or not) is never filed again; needsHuman items wait', (t) => {
+  const url = 'https://github.com/acme/widgets/issues/31';
+  const w = world(t, { gh: [...GH, { match: '^api -X POST repos/acme/widgets/issues ', stdoutJson: { number: 31, html_url: url } }] });
+  const posts = () => w.fake.calls().filter((c) => c.argv.join(' ').startsWith('api -X POST repos/acme/widgets/issues ')).length;
+  const idea = (over = {}) => finding({ title: 'Cache grows', file: 'src/a.js', line: 20, category: 'performance', testable: false, ...over });
+  assert.equal(w.codex(1, findingsOf([], [], [idea()])).code, 0);
+  assert.equal(w.judge(1, { 'R1-W1': ['FOLLOW-UP'] }).code, 0);
+  assert.equal(w.cli(['followups', 'create', '--round', '1']).json.created.length, 1);
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  const head2 = w.repo.commit('more');
+
+  // round 2 raises it again: once as the identical finding (cache), once under another category that the judge also
+  // sends to a follow-up (so its ruling does not come from the cache)
+  assert.equal(w.codex(2, findingsOf([], [], [idea({ category: 'design' }), idea()]), { from: w.head, to: head2 }).code, 0);
+  assert.equal(w.item('R2-W2').final.by, 'cache');
+  assert.equal(w.item('R2-W2').followupIssue, url, 'the issue number travels with the cached ruling');
+  assert.equal(w.judge(2, { 'R2-W1': ['FOLLOW-UP', 'high'] }).code, 0);
+  const r = w.cli(['followups', 'create', '--round', '2']);
+  assert.equal(r.code, 0, r.stderr + r.stdout);
+  assert.deepEqual(r.json.created, []);
+  assert.deepEqual([...r.json.skipped].sort(), ['R2-W1', 'R2-W2']);
+  assert.equal(posts(), 1, 'one issue for one fingerprint, across the whole review');
+  assert.equal(w.item('R2-W1').followupIssue, url, 'the existing issue is recorded on the item');
+
+  // a follow-up that needs a human is not filed
+  editState(w, (s) => {
+    s.rounds[1].items.push({ ...s.rounds[1].items[0], id: 'R2-W9', fingerprint: 'other-fp', followupIssue: null, final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, reason: 'low confidence' } });
+  });
+  const held = w.cli(['followups', 'create', '--round', '2']);
+  assert.equal(held.code, 0);
+  assert.deepEqual(held.json.created, []);
+  assert.deepEqual(held.json.held, ['R2-W9']);
+  assert.equal(posts(), 1);
+  assert.equal(w.item('R2-W9').followupIssue ?? null, null);
+});
+
+// -- review-complete
+
+test('review-complete: refuses when the local HEAD is not the head GitHub holds for the PR', (t) => {
+  const w = world(t, { gh: [...GH, REMOVE_LABEL] });
+  assert.equal(w.codex(1, findingsOf()).code, 0);
+  w.prHead('0'.repeat(40));
+  const r = w.cli(['review-complete', '--pr', '7']);
+  assert.equal(r.code, 1, r.stdout);
+  assert.equal(r.json.ok, false);
+  assert.match(r.json.reason, /HEAD .* is not the head of PR #7/);
+  assert.ok(!w.fake.lines().some((l) => l.startsWith('pr edit')), 'no label call');
+  w.prHead(w.head);
+  assert.equal(w.cli(['review-complete', '--pr', '7']).code, 0);
+});
+
+test('review-complete: reads the labels back and exits 3 when awaiting-review is still on the PR', (t) => {
+  const w = world(t, { gh: [{ match: '^pr view 7 --json labels', stdoutJson: { labels: [{ name: 'awaiting-review' }, { name: 'agent-build' }] } }, ...GH, REMOVE_LABEL] });
+  assert.equal(w.codex(1, findingsOf()).code, 0);
+  const r = w.cli(['review-complete', '--pr', '7']);
+  assert.equal(r.code, 3, r.stdout);
+  assert.equal(r.json.ok, false);
+  assert.equal(r.json.unavailable, true);
+  assert.match(r.json.message ?? r.json.reason, /awaiting-review is still/);
+  assert.ok(w.fake.lines().includes('pr edit 7 --remove-label awaiting-review'));
+});
+
+test('review-complete: a clean first round does not count once a later round accepted something (R3\')', (t) => {
+  const w = world(t, { gh: [...GH, REMOVE_LABEL] });
+  w.repo.write('.gitignore', '.review/\n'); // keep the state files out of the commits below, so the content hash is only the code
+  const head1 = w.repo.commit('ignore the review directory');
+  w.prHead(head1);
+  assert.equal(w.codex(1, findingsOf(), { to: head1 }).code, 0);
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  const head2 = w.repo.commit('more');
+  w.prHead(head2);
+  assert.equal(w.codex(2, findingsOf([finding({ title: 'late bug', file: 'src/c.js', line: 1 })]), { from: head1, to: head2 }).code, 0);
+  assert.equal(w.judge(2, { 'R2-B1': ['ACCEPT'] }).code, 0);
+  assert.equal(w.cli(['state', 'mark-implemented', '--ids', 'R2-B1']).code, 0);
+  // the "fix" removes the file again: the branch now has exactly the content round 1 reviewed, and nothing is unresolved
+  w.repo.rm('src/c.js');
+  const head3 = w.repo.commit('drop it');
+  w.prHead(head3);
+  const outcome = w.cli(['state', 'outcome']).json;
+  assert.deepEqual([outcome.pending, outcome.needsHuman, outcome.unimplemented], [[], [], []]);
+  assert.equal(outcome.currentContentHash, w.state().rounds[0].contentHashAtToHead, 'same content as round 1');
+  const r = w.cli(['review-complete', '--pr', '7']);
+  assert.equal(r.code, 1, r.stdout);
+  assert.ok(!w.fake.lines().some((l) => l.startsWith('pr edit')));
+});
+
+// -- Codex run: timeout, late writes, empty answers
+
+test('codex-review: a timeout kills Codex AND what it started; a late write from that run is never read', async (t) => {
+  const w = world(t);
+  const pidFile = join(w.scratch, 'helper.pid');
+  const r = w.cli(
+    ['codex-review', '--pr', '7', '--round', '1', '--base', w.base, '--head', w.head, '--effort', 'high'],
+    { PIPELINE_CODEX_TIMEOUT_MS: '700', FAKE_CODEX_HANG: pidFile, FAKE_CODEX_OUTPUT: w.file('late.json', findingsOf([finding()])) },
+  );
+  assert.equal(r.code, 3, r.stdout);
+  assert.equal(r.json.unavailable, true);
+  assert.equal(r.json.timedOut, true);
+  assert.equal(r.json.reason, 'unavailable');
+  const pid = Number(readFileSync(pidFile, 'utf8'));
+  await new Promise((resolve) => setTimeout(resolve, 3000)); // the helper would have written its answer at 2 s
+  assert.throws(() => process.kill(pid, 0), (e) => e.code === 'ESRCH', 'the helper process is gone');
+  assert.ok(!existsSync(w.roundFile(1, 'codex-raw.json')), 'nothing was written after the timeout');
+  assert.ok(noState(w));
+});
+
+test('codex-review: an answer whose summary is empty or whitespace is exit 3 malformed', (t) => {
+  const w = world(t);
+  for (const summary of ['', '   \n\t']) {
+    const r = w.codex(1, { summary, blocking: [], suggestions: [], worth_considering: [] });
+    assert.equal(r.code, 3, JSON.stringify(summary));
+    assert.equal(r.json.reason, 'malformed');
+    assert.ok(r.json.errors.some((e) => /summary/.test(e)));
+  }
+  assert.ok(noState(w));
+});
+
+// -- concurrency
+
+test('codex-review: a round recorded while Codex was running is not overwritten (exit 2, the recorded round stays)', (t) => {
+  const w = world(t);
+  const mine = w.file('mine.json', findingsOf());
+  const theirs = w.file('theirs.json', findingsOf([finding()]));
+  const during = `FAKE_CODEX_OUTPUT="${theirs}" node "${bin}" codex-review --pr 7 --round 1 --base ${w.base} --head ${w.head} --effort high`;
+  const r = w.cli(
+    ['codex-review', '--pr', '7', '--round', '1', '--base', w.base, '--head', w.head, '--effort', 'high'],
+    { FAKE_CODEX_OUTPUT: mine, FAKE_CODEX_DURING: during },
+  );
+  assert.equal(r.code, 2, r.stdout);
+  assert.equal(r.json.error, 'round-order');
+  assert.match(r.json.message, /already exists/);
+  assert.equal(w.state().rounds.length, 1);
+  assert.deepEqual(w.state().rounds[0].items.map((i) => i.id), ['R1-B1'], 'the round that got there first is intact');
+});
+
+test('every command that changes the review state waits for the per-PR lock (and gives up with exit 2 lock-timeout)', async (t) => {
+  const w = world(t, { gh: [...GH, REMOVE_LABEL] });
+  assert.equal(w.codex(1, standardFindings()).code, 0);
+  assert.equal(w.judge(1, STANDARD_JUDGE).code, 0);
+  assert.equal(w.cli(['arbiter', 'needed', '--round', '1']).json.needed, true);
+  const judgeFile = w.file('j2.json', { items: [] });
+  const { tryAcquire, release } = await import('../pipeline/lib/locks.mjs');
+  const { repoRoot } = await import('../pipeline/lib/repo.mjs');
+  const { reviewLockName } = await import('../pipeline/lib/review-context.mjs');
+  const name = reviewLockName(repoRoot(w.repo.dir), 7);
+  assert.match(name, /^review-[0-9a-f]{12}-pr7$/);
+  const held = tryAcquire(name, { dir: w.lockDir });
+  assert.equal(held.acquired, true);
+  const before = w.stateText();
+  const env = { PIPELINE_LOCK_WAIT_MS: '250' };
+  const mutating = [
+    ['triage', 'validate', '--round', '1', '--file', judgeFile],
+    ['triage', 'settle', '--id', 'R1-B1', '--result', 'bug-confirmed', '--evidence', 'x'],
+    ['triage', 'light-lane', '--round', '1'],
+    ['arbiter', 'needed', '--round', '1'],
+    ['arbiter', 'apply', '--round', '1', '--tag', 'whatever'],
+    ['state', 'show'],
+    ['state', 'mark-implemented', '--ids', 'R1-B1'],
+    ['state', 'record-followup', '--id', 'R1-W1', '--url', 'https://example.com/1'],
+    ['state', 'set-outcome', '--outcome', 'x'],
+    ['followups', 'create', '--round', '1'],
+    ['review-complete', '--pr', '7'],
+  ];
+  try {
+    for (const args of mutating) {
+      const r = w.cli(args, env);
+      assert.equal(r.code, 2, `${args.join(' ')}: ${r.stdout}`);
+      assert.equal(r.json.error, 'lock-timeout', args.join(' '));
+      assert.equal(w.stateText(), before, `${args.join(' ')} changed the state while the lock was held`);
+    }
+    const calls = w.captured().length;
+    const cr = w.cli(['codex-review', '--pr', '7', '--round', '2', '--base', w.head, '--head', w.head, '--effort', 'high'], { ...env, FAKE_CODEX_OUTPUT: w.file('r2.json', findingsOf()) });
+    assert.equal(cr.code, 2, cr.stdout);
+    assert.equal(cr.json.error, 'lock-timeout');
+    assert.equal(w.captured().length, calls + 1, 'Codex ran without the lock; only recording the round needs it');
+    const readOnly = w.cli(['state', 'outcome'], env);
+    assert.equal(readOnly.code, 0, 'a read-only command does not need the lock');
+  } finally {
+    release(held.lock);
+  }
+  assert.equal(w.cli(['state', 'set-outcome', '--outcome', 'done']).code, 0, 'free again once released');
+});
+
+test('codex-review: takes the lock only AFTER Codex answered, and gives up with lock-timeout when it is held then', async (t) => {
+  const w = world(t);
+  const { tryAcquire, release } = await import('../pipeline/lib/locks.mjs');
+  const { repoRoot } = await import('../pipeline/lib/repo.mjs');
+  const { reviewLockName } = await import('../pipeline/lib/review-context.mjs');
+  const held = tryAcquire(reviewLockName(repoRoot(w.repo.dir), 7), { dir: w.lockDir });
+  try {
+    const r = w.codex(1, findingsOf(), { env: { PIPELINE_LOCK_WAIT_MS: '250' } });
+    assert.equal(w.captured().length, 1, 'Codex ran without waiting for the lock');
+    assert.equal(r.code, 2, r.stdout);
+    assert.equal(r.json.error, 'lock-timeout');
+    assert.ok(noState(w));
+  } finally {
+    release(held.lock);
+  }
+});
+
+// -- the arbiter proof stays pinned
+
+test('arbiter apply: --expect-model / --expect-effort are test switches; a normal run is always pinned to claude-fable- at effort high', (t) => {
+  const w = readyForArbiter(t);
+  w.cli(['arbiter', 'needed', '--round', '1']);
+  const asked = ['--expect-model', 'claude-opus-', '--expect-effort', 'low'];
+  assertAllNeedHuman(w, arbiterRun(w, { model: 'claude-opus-5-1', effort: 'low', extraArgs: asked }), /unexpected model claude-opus-5-1/);
+
+  const w2 = readyForArbiter(t);
+  w2.cli(['arbiter', 'needed', '--round', '1']);
+  const honoured = arbiterRun(w2, { model: 'claude-opus-5-1', effort: 'low', extraArgs: asked, env: { PIPELINE_TEST_MODE: '1' } });
+  assert.equal(honoured.code, 0, honoured.stdout);
+  assert.equal(honoured.json.ok, true);
+});
+
+test('arbiter apply: PIPELINE_ARBITER_MODEL_OVERRIDE never relaxes the proof, not even for a model that looks right', (t) => {
+  const w = readyForArbiter(t);
+  w.cli(['arbiter', 'needed', '--round', '1']);
+  const r = arbiterRun(w, { meta: { model: 'claude-fable-5-1' }, env: { PIPELINE_ARBITER_MODEL_OVERRIDE: 'claude-fable-5-1' } });
+  assertAllNeedHuman(w, r, /per-call model override present: claude-fable-5-1/);
+  assert.match(w.item('R1-S1').final.reason, /model-proof/);
 });

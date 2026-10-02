@@ -8,6 +8,7 @@ import path from 'node:path';
 import { EXIT } from './cli.mjs';
 import { Fail } from './cmd-common.mjs';
 import { GitError, contentHash, revParse } from './git.mjs';
+import { LockTimeoutError, withLock } from './locks.mjs';
 import { loadState } from './state.mjs';
 
 export const EXCERPT_RADIUS = 20;
@@ -17,15 +18,16 @@ export const oneLine = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
 
 // ---- content hash ---------------------------------------------------------------------------
 
-// `origin/<default>` is what the PR will be merged into; a repo without that remote ref (a fresh clone of a local
-// fixture, a test) falls back to the local default branch. Any other git failure is not swallowed.
-export function reviewBaseRef(root, config) {
-  const remote = `origin/${config.default_branch}`;
+// `origin/<branch>` is what the PR will be merged into (the default branch unless the PR names its own base); a repo
+// without that remote ref (a fresh clone of a local fixture, a test) falls back to the local branch. Any other git
+// failure is not swallowed.
+export function reviewBaseRef(root, config, branch = config.default_branch) {
+  const remote = `origin/${branch}`;
   try {
     revParse(remote, { cwd: root });
     return remote;
   } catch (err) {
-    if (err instanceof GitError) return config.default_branch;
+    if (err instanceof GitError) return branch;
     throw err;
   }
 }
@@ -64,6 +66,41 @@ export function readFileOrFail(file, what) {
   } catch (err) {
     throw new Fail(EXIT.USAGE, { ok: false, error: 'read', message: `cannot read ${what} ${file}: ${err.code ?? err.message}` });
   }
+}
+
+// ---- locking --------------------------------------------------------------------------------
+
+// Every command that reads-modifies-writes .review/state.json holds this lock for the whole read-modify-write, so two
+// sessions (a ship loop and a person with a terminal, two ship loops on one PR) cannot lose each other's update.
+// One lock per repository checkout and PR. The lock directory is ~/.claude/pipeline-state/locks unless
+// PIPELINE_LOCK_DIR says otherwise (tests); PIPELINE_LOCK_WAIT_MS shortens the wait (tests).
+export const LOCK_WAIT_MS = 2 * 60 * 1000;
+
+export const reviewLockName = (root, pr) => `review-${sha256(root).slice(0, 12)}-pr${pr}`;
+
+export async function withReviewLock(root, pr, ctx, fn) {
+  const env = ctx?.env ?? process.env;
+  const wait = Number(env.PIPELINE_LOCK_WAIT_MS);
+  try {
+    return await withLock(reviewLockName(root, pr), fn, { dir: env.PIPELINE_LOCK_DIR || undefined, waitMs: wait > 0 ? wait : LOCK_WAIT_MS });
+  } catch (err) {
+    if (err instanceof LockTimeoutError) throw new Fail(EXIT.USAGE, { ok: false, error: 'lock-timeout', message: err.message });
+    throw err;
+  }
+}
+
+// For commands that do not know the PR up front: the state on disk names it. No readable state means the command
+// fails on its own (requireState) before it changes anything, so it runs unlocked rather than under a made-up name.
+export function withStateLock(root, ctx, fn, pr) {
+  let n = pr;
+  if (n === undefined) {
+    try {
+      n = loadState(root)?.pr;
+    } catch {
+      n = undefined;
+    }
+  }
+  return n === undefined ? fn() : withReviewLock(root, n, ctx, fn);
 }
 
 // ---- state access ---------------------------------------------------------------------------
