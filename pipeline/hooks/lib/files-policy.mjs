@@ -1,15 +1,22 @@
 // Why: the owner's rule is that agents must not edit their own rules. This is the pure decision logic of the
-// global guard-files hook: it denies file tools and Bash commands that would change the installed pipeline
-// files (skills, agents, ~/.claude/pipeline, ~/.claude/settings.json), switch hooks off (`disableAllHooks`) or
-// write the admin switch (`PIPELINE_ADMIN`) into a script. Only a Claude Code process that was launched with
-// PIPELINE_ADMIN=1 bypasses it. Bash is judged on text, so every check is deliberately over-eager (a harmless
-// `echo ~/.claude/pipeline` is denied) rather than under-eager; the hook stops accidents and casual
-// circumvention, not an adversary who builds the path at run time.
+// global guard-files hook: it denies file tools, MCP tools and Bash commands that would change the installed
+// pipeline files (skills, agents, ~/.claude/pipeline, ~/.claude/settings.json), delete or overwrite the dirs
+// that hold them (~/.claude, ~/.claude/skills, ~/.claude/agents), switch hooks off (`disableAllHooks`) or set
+// the admin switch (`PIPELINE_ADMIN`). Only a Claude Code process launched with PIPELINE_ADMIN=1 bypasses it.
+// Bash is judged on text, so the checks lean towards denying (`echo ~/.claude/pipeline` is denied); the hook
+// stops accidents and casual circumvention, not an adversary who builds the path out of pieces at run time.
+//
+// RESIDUALS (known, documented, not closed): names that only exist at run time defeat a text scan.
+//  - `export $(echo PIPELINE_ADMIN)=1`, a name assembled by a command substitution (a plain `N=PIPELINE_ADMIN; export $N=1` IS caught).
+//  - printf-assembled keys such as `printf '{"disable%sHooks":true}' All > .claude/settings.local.json` (and settings.local.json
+//    is not a protected file in any case).
+//  - an installer whose name is built at run time (`sh "inst""all.sh"`, `$(echo install).sh`).
+// Backstop for installer runs: the installer itself refuses to run inside a Claude Code process (CLAUDECODE set).
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
-import { simpleCommands } from './shell-parse.mjs';
+import { simpleCommands, commandName } from './shell-parse.mjs';
 
 const posix = path.posix;
 
@@ -27,13 +34,18 @@ const PROTECTED_REL = [
   '.claude/settings.json',
 ];
 
+// The directories that hold them. Writing INTO them is fine (history, projects, CLAUDE.md, other skills), but
+// replacing, deleting, moving or running a repo command in them reaches the protected files, so for a
+// non-read-only command a word that IS one of these (exactly, not a child) counts as a protected reference.
+const ANCESTOR_REL = ['.claude', '.claude/skills', '.claude/agents'];
+
 const DEVICE_PREFIX = /^\/\/[?.]\/(?=[A-Za-z]:\/)/; // \\?\C:\ and \\.\C:\ forms
 
 const isAbs = (s) => s.startsWith('/') || /^[A-Za-z]:\//.test(s);
 const caseInsensitive = (platform) => platform === 'win32' || platform === 'darwin';
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
 const unique = (a) => [...new Set(a)];
-const baseOf = (w) => String(w).split(/[\\/]/).pop().toLowerCase().replace(/\.(exe|cmd|bat|com)$/, '');
+const baseOf = commandName;
 const deny = (reason) => ({ decision: 'deny', reason });
 const allow = () => ({ decision: 'allow', reason: '' });
 
@@ -51,18 +63,17 @@ export function protectedRoots(home) {
 }
 
 // Git-bash, WSL and Cygwin spell C:\Users\u as /c/Users/u, /mnt/c/Users/u and /cygdrive/c/Users/u.
-function rootAliases(home, platform) {
-  const roots = protectedRoots(home);
-  if (platform !== 'win32') return roots;
+function withWindowsAliases(paths, home, platform) {
+  if (platform !== 'win32') return paths;
   const m = /^([A-Za-z]):(\/.*)?$/.exec(posixHome(home));
-  if (!m) return roots;
+  if (!m) return paths;
   const d = m[1].toLowerCase();
   const extra = [];
-  for (const r of roots) {
+  for (const r of paths) {
     const rest = r.slice(2);
     extra.push(`/${d}${rest}`, `/mnt/${d}${rest}`, `/cygdrive/${d}${rest}`);
   }
-  return [...roots, ...extra];
+  return [...paths, ...extra];
 }
 
 // ---- path resolution (symlinks) -----------------------------------------------------------------
@@ -116,14 +127,20 @@ function makeCtx(opts) {
     existsSync: opts.existsSync ?? fs.existsSync,
     readlink: opts.readlink ?? (opts.existsSync ? () => null : readLinkIfAny),
   };
+  const base = homePosix === '/' ? '' : homePosix;
   const lexRoots = protectedRoots(homePosix);
-  const realRoots = lexRoots.map((r) => realResolve(r, api));
-  const roots = unique([...rootAliases(homePosix, platform), ...realRoots]);
+  const lexAncestors = ANCESTOR_REL.map((r) => `${base}/${r}`);
+  const roots = unique([...withWindowsAliases(lexRoots, homePosix, platform), ...lexRoots.map((r) => realResolve(r, api))]);
+  const ancestors = unique([...withWindowsAliases(lexAncestors, homePosix, platform), ...lexAncestors.map((r) => realResolve(r, api))]);
   const ci = caseInsensitive(platform);
   return {
-    platform, homeNative, homePosix, cwd, api, roots, lexRoots, ci,
-    admin: opts.env?.PIPELINE_ADMIN === '1',
+    platform, homeNative, homePosix, cwd, api, roots, lexRoots, ancestors, lexAncestors, ci,
+    user: opts.user ?? posix.basename(homePosix),
+    vars: {}, // same-line shell assignments (D=$HOME/.claude), filled in once the line is parsed
+    dynamic: false, // set when a scan had to be skipped for size; callers fail closed
+    admin: (opts.env ?? process.env).PIPELINE_ADMIN === '1',
     hit: (p) => roots.some((r) => isInside(p, r, platform)),
+    hitAncestor: (p) => ancestors.some((a) => samePath(p, a, platform)),
   };
 }
 
@@ -135,8 +152,21 @@ function unescapeJs(s) {
   });
 }
 
+// Naming the switch is fine (docs, grep, prose); SETTING it is not: assignment, export, setx, $env:, a JSON/env key.
+// A read (`$PIPELINE_ADMIN = 1` inside [ ]) or a comparison (`=== '1'`, `==`, `=~`) is not an assignment.
 // PIPELINE_ADMIN is case-sensitive on POSIX; Windows environment variable names are not.
-const hasAdminToken = (text, platform) => (platform === 'win32' ? /PIPELINE_ADMIN/i : /PIPELINE_ADMIN/).test(text);
+const ADMIN_SET = [
+  /(?<!\$)\bPIPELINE_ADMIN\s*=(?![=~])/,
+  /\bexport\s+PIPELINE_ADMIN\b/,
+  /\$env:PIPELINE_ADMIN\b/i,
+  /\bsetx?\s+PIPELINE_ADMIN\b/i,
+  /\bsetenv\s+PIPELINE_ADMIN\b/,
+  /["']PIPELINE_ADMIN["']\s*[:\],]/,
+  /\benv\s+(?:-\S+\s+)*PIPELINE_ADMIN=/,
+  /\bPIPELINE_ADMIN\s*:\s*["']?(?:1|true)\b/i,
+];
+const ADMIN_SET_CI = ADMIN_SET.map((re) => new RegExp(re.source, re.flags.includes('i') ? re.flags : `${re.flags}i`));
+const setsAdmin = (text, platform) => (platform === 'win32' ? ADMIN_SET_CI : ADMIN_SET).some((re) => re.test(text));
 const hasDisableAll = (text) => text.includes('disableAllHooks');
 const variantsOf = (text) => unique([text, unescapeJs(text)]);
 
@@ -159,45 +189,141 @@ function lexicalTarget(target, ctx) {
   return s.length > 1 && s.endsWith('/') ? s.slice(0, -1) : s;
 }
 
-export function evaluateFileTool(input, opts = {}) {
+const PROTECTED_MSG = 'skills, agents, ~/.claude/pipeline and ~/.claude/settings.json can only be changed by the owner with PIPELINE_ADMIN=1';
+
+// MCP servers (a filesystem server, any other server's write tools, a browser or IDE that runs code) reach the
+// same files without Edit/Write. Their tool_input has no fixed shape, so values are picked out by key name.
+const MCP_PATH_KEYS = new Set([
+  'path', 'paths', 'file_path', 'filePath', 'notebook_path', 'source', 'destination', 'target', 'dest', 'from', 'to', 'dir', 'directory',
+  'filepath', 'file', 'filename', 'file_name', 'uri', 'old_path', 'new_path', 'oldPath', 'newPath', 'src', 'dst', 'sourcePath', 'targetPath',
+  'relative_path', 'output_path', 'outputPath',
+]);
+const MCP_CONTENT_KEYS = new Set(['content', 'contents', 'text', 'newText', 'new_string', 'data', 'body']);
+// File content and prose are not scanned for protected references (a Notion page may mention ~/.claude/pipeline).
+const MCP_PROSE_KEYS = new Set([...MCP_CONTENT_KEYS, 'message', 'description', 'title', 'comment', 'summary', 'notes', 'markdown', 'html', 'prompt', 'subject', 'caption', 'label']);
+// Values of these keys are shell or program text: judged like a Bash command.
+const MCP_COMMAND_KEYS = new Set(['command', 'cmd', 'code', 'script', 'source_code', 'shell']);
+const MCP_WRITE_VERB = /write|edit|move|rename|create|delete|remove|copy|append|patch|update|set|put|upload|mkdir|chmod|make|download|snapshot|screenshot|export|save|replace|insert|truncate|link|touch|overwrite|modify|apply|store|(?:^|_)(?:rm|cp|mv|del|ln|add)(?:_|$)/i;
+// A tool that clearly only looks. Anything else is scanned for protected paths in ANY string value.
+const MCP_READ_ONLY = /^(?:read|list|get|search|find|view|query|describe|status|info|directory_tree|tree|stat|exists|show|diff|compare|hash|checksum|count|check|inspect|lookup)/i;
+
+function mcpFields(ti) {
+  const paths = [];
+  const contents = [];
+  const values = []; // [key, string] for every string that is not file content or prose
+  const take = (v, key, bucket, depth = 0) => {
+    if (typeof v === 'string') bucket.push(v);
+    else if (depth < 12 && v && typeof v === 'object') for (const x of Object.values(v).slice(0, 2000)) take(x, key, bucket, depth + 1);
+  };
+  const walk = (v, key, depth) => {
+    if (typeof v === 'string') { values.push([key, v]); return; }
+    if (depth > 12 || v === null || typeof v !== 'object') return;
+    for (const [k, x] of (Array.isArray(v) ? v.slice(0, 2000).map((e) => [key, e]) : Object.entries(v))) {
+      if (MCP_PATH_KEYS.has(k)) { take(x, k, paths); walk(x, k, depth + 1); } else if (MCP_CONTENT_KEYS.has(k)) take(x, k, contents);
+      else if (MCP_PROSE_KEYS.has(k)) continue;
+      else walk(x, k, depth + 1);
+    }
+  };
+  walk(ti, '', 0);
+  return { paths: paths.slice(0, 500), contents, values: values.slice(0, 2000) };
+}
+
+function evaluateMcp(tool, ti, input, opts) {
+  const last = tool.split('__').pop();
+  if ((opts.env ?? process.env).PIPELINE_ADMIN === '1') return allow();
+  if (MCP_READ_ONLY.test(last)) return allow();
+  const f = mcpFields(ti);
+  if (!f.paths.length && !f.values.length) return allow();
   const ctx = makeCtx({ ...opts, cwd: input?.cwd });
   if (ctx.admin) return allow();
-  const ti = input?.tool_input ?? {};
+
+  const writeVerb = MCP_WRITE_VERB.test(last);
+  const resolve = (t) => {
+    const lexical = lexicalTarget(t, ctx);
+    return unique([lexical, realResolve(lexical, ctx.api)]);
+  };
+  // 1. a file write: the path keys name the targets (an exact ancestor dir counts too)
+  const targets = writeVerb ? f.paths.map((t) => ({ t, candidates: resolve(t) })) : [];
+  for (const { t, candidates } of targets) {
+    if (candidates.some((c) => ctx.hit(c) || ctx.hitAncestor(c))) return deny(`${t} is a protected pipeline file or the directory that holds it (${PROTECTED_MSG})`);
+  }
+  if (targets.length) {
+    const texts = f.contents.flatMap(variantsOf);
+    if (texts.some(hasDisableAll)) {
+      for (const { t, candidates } of targets) {
+        for (const c of candidates) {
+          const parent = posix.basename(posix.dirname(c));
+          if ((ctx.ci ? parent.toLowerCase() === '.claude' : parent === '.claude') && SETTINGS_RE.test(posix.basename(c))) return deny(`writing disableAllHooks into ${t} would switch the pipeline hooks off`);
+        }
+      }
+    }
+    if (texts.some((x) => setsAdmin(x, ctx.platform))) return deny('this write sets PIPELINE_ADMIN; only the owner does that, when launching Claude Code');
+  }
+  // 2. anything else a tool that is not clearly read-only was given: a path anywhere, or code that builds one
+  const matchers = makeMatchers(ctx);
+  const dirs = [ctx.cwd];
+  for (const [key, s] of f.values) {
+    if (typeof s !== 'string' || !s) continue;
+    if (MCP_COMMAND_KEYS.has(key)) {
+      const r = evaluateBashForFiles(s, { ...opts, cwd: input?.cwd });
+      if (r.decision === 'deny') return deny(`${tool} would run: ${r.reason}`);
+      continue; // the Bash rules are the whole verdict for a command (a read of a protected file is fine)
+    }
+    const pathLike = s.length <= 1024 && !/\s/.test(s) && (/[\\/]/.test(s) || /^[.~]/.test(s));
+    if ((pathLike && matchers.pathHit(s, dirs, false)) || matchers.rawHit(s, dirs)) return deny(`${tool} refers to a protected pipeline file (${PROTECTED_MSG})`);
+    if (pathLike && resolve(s).some((c) => ctx.hit(c))) return deny(`${tool} refers to a protected pipeline file (${PROTECTED_MSG})`);
+  }
+  return allow();
+}
+
+export function evaluateFileTool(input, opts = {}) {
+  const tool = typeof input?.tool_name === 'string' ? input.tool_name : '';
+  const ti = input?.tool_input && typeof input.tool_input === 'object' ? input.tool_input : {};
+  if (tool.startsWith('mcp__')) return evaluateMcp(tool, ti, input, opts);
+
+  const ctx = makeCtx({ ...opts, cwd: input?.cwd });
+  if (ctx.admin) return allow();
+  const target = typeof ti.file_path === 'string' && ti.file_path ? ti.file_path : (typeof ti.notebook_path === 'string' ? ti.notebook_path : '');
+  const targets = target ? [target] : [];
   const texts = writtenTexts(ti).flatMap(variantsOf);
 
-  const target = typeof ti.file_path === 'string' && ti.file_path ? ti.file_path : (typeof ti.notebook_path === 'string' ? ti.notebook_path : '');
-  if (target) {
-    const lexical = lexicalTarget(target, ctx);
-    const candidates = unique([lexical, realResolve(lexical, ctx.api)]);
-    for (const c of candidates) {
-      if (ctx.hit(c)) return deny(`${target} is a protected pipeline file (skills, agents, ~/.claude/pipeline and ~/.claude/settings.json can only be changed by the owner with PIPELINE_ADMIN=1)`);
-    }
-    if (texts.some(hasDisableAll)) {
+  const resolved = targets.map((t) => {
+    const lexical = lexicalTarget(t, ctx);
+    return { t, candidates: unique([lexical, realResolve(lexical, ctx.api)]) };
+  });
+  for (const { t, candidates } of resolved) {
+    if (candidates.some((c) => ctx.hit(c))) return deny(`${t} is a protected pipeline file (${PROTECTED_MSG})`);
+  }
+  if (texts.some(hasDisableAll)) {
+    for (const { t, candidates } of resolved) {
       for (const c of candidates) {
         const parent = posix.basename(posix.dirname(c));
         const inClaudeDir = ctx.ci ? parent.toLowerCase() === '.claude' : parent === '.claude';
-        if (inClaudeDir && SETTINGS_RE.test(posix.basename(c))) return deny(`writing disableAllHooks into ${target} would switch the pipeline hooks off`);
+        if (inClaudeDir && SETTINGS_RE.test(posix.basename(c))) return deny(`writing disableAllHooks into ${t} would switch the pipeline hooks off`);
       }
     }
   }
-  if (texts.some((t) => hasAdminToken(t, ctx.platform))) {
-    return deny('writing PIPELINE_ADMIN into a file could build a script that switches the guard off; admin mode is for the owner to set when launching Claude Code');
+  if (texts.some((x) => setsAdmin(x, ctx.platform))) {
+    return deny('this write sets PIPELINE_ADMIN (an assignment, export or env key); a script that sets it could switch the guard off, so only the owner does that, when launching Claude Code');
   }
   return allow();
 }
 
 // ---- Bash: text normalisation ---------------------------------------------------------------------
 
-// Every way the home directory is spelled in a shell line or a one-liner script. A trailing `+ '` or `, '`
-// (string concatenation / path.join) is swallowed so `process.env.HOME+'/.claude/x'` reads as one path.
+const MARK = '\u0001';
+
+// Every way the home directory is spelled in a shell line or a one-liner script. A trailing `+ '`, `, '` or
+// `.joinpath('` (string concatenation / path.join) is swallowed so `process.env.HOME+'/.claude/x'` reads as one path.
 const HOME_RE = new RegExp(
   '(?:'
   + [
     'process\\.env\\.(?:HOME|USERPROFILE)\\b',
     'process\\.env\\[\\s*[\'"](?:HOME|USERPROFILE)[\'"]\\s*\\]',
-    '\\bos\\.homedir\\(\\s*\\)',
-    '\\bhomedir\\(\\s*\\)',
-    '\\bPath\\.home\\(\\s*\\)',
+    'require\\(\\s*[\'"](?:node:)?os[\'"]\\s*\\)\\s*\\.\\s*homedir\\(\\s*\\)',
+    '(?<![\\w$])(?:os\\s*\\.\\s*)?homedir\\(\\s*\\)',
+    '(?:pathlib\\s*\\.\\s*)?\\bPath\\s*\\.\\s*home\\(\\s*\\)',
+    '\\bDir\\.home\\b(?:\\(\\s*\\))?',
     'os\\.environ(?:\\.get\\(|\\[)\\s*[\'"](?:HOME|USERPROFILE)[\'"]\\s*[)\\]]',
     'os\\.path\\.expanduser\\(\\s*[\'"]~[\'"]\\s*\\)',
     '\\$env:(?:USERPROFILE|HOME)\\b',
@@ -205,21 +331,45 @@ const HOME_RE = new RegExp(
     '%HOMEDRIVE%%HOMEPATH%',
     '\\$\\{(?:HOME|USERPROFILE)\\}',
     '\\$(?:HOME|USERPROFILE)(?![A-Za-z0-9_])',
+    '\\$\\(\\s*(?:eval\\s+)?echo\\s+(?:~|\\$HOME|\\$\\{HOME\\})\\s*\\)',
+    '`\\s*(?:eval\\s+)?echo\\s+(?:~|\\$HOME)\\s*`',
   ].join('|')
-  + ')(\\s*[+,]\\s*[\'"`])?',
+  + ')(\\s*[+,]\\s*[\'"`]|\\s*\\.\\s*joinpath\\s*\\(\\s*[\'"`]?)?',
   'gi',
 );
 const TILDE_RE = /(^|[\s'"`=:(,[{;|&<>+])~(?=\/|$|[\s'"`)\]};|&<>,+])/g;
+const USER_RE = /\$(?:USER|LOGNAME|USERNAME)(?![A-Za-z0-9_])|\$\{(?:USER|LOGNAME|USERNAME)\}|\$\(\s*(?:whoami|logname|id\s+-un)\s*\)|`\s*(?:whoami|logname|id\s+-un)\s*`|%USERNAME%|\$env:USERNAME\b/gi;
+const MARK_STRIP = new RegExp(`${MARK}['"\`)}\\]]*`, 'g');
 
 function expandHomeRefs(text, home) {
   return text
-    .replace(HOME_RE, (_m, glue) => home + (glue ? (glue.includes('+') ? '' : '/') : ''))
-    .replace(TILDE_RE, (_m, pre) => pre + home);
+    .replace(HOME_RE, (_m, glue) => home + MARK + (glue ? (glue.includes('+') ? '' : '/') : ''))
+    .replace(TILDE_RE, (_m, pre) => `${pre}${home}${MARK}`)
+    .replace(MARK_STRIP, '');
+}
+
+// $NAME / ${NAME} for variables assigned earlier on the same line (D=$HOME/.claude; echo x > $D/settings.json).
+function substVars(text, vars) {
+  let t = text;
+  for (let pass = 0; pass < 4 && t.includes('$'); pass++) {
+    const next = t.replace(/\$\{(\w+)\}|\$(\w+)/g, (m, a, b) => (Object.hasOwn(vars, a ?? b) ? vars[a ?? b] : m));
+    if (next === t) break;
+    t = next;
+  }
+  return t;
+}
+
+// Slash-normalised copy of `text` with the user name, same-line variables and every home spelling replaced.
+function expandRefs(text, ctx) {
+  const t = toPosix(text).replace(USER_RE, ctx.user);
+  return expandHomeRefs(substVars(t, ctx.vars), ctx.homePosix);
 }
 
 // Expands the first `{a,b}` groups of each word so `~/.claude/{pipeline,settings.json}` shows both paths.
-function braceExpand(s) {
-  if (s.length > 50_000 || !s.includes('{') || !s.includes(',')) return s;
+// Above 5,000 characters the expansion is skipped and the scan is marked dynamic (callers fail closed).
+function braceExpand(s, ctx) {
+  if (!s.includes('{') || !s.includes(',')) return s;
+  if (s.length > 5000) { ctx.dynamic = true; return s; }
   let cur = s;
   for (let round = 0; round < 4; round++) {
     let changed = false;
@@ -227,22 +377,53 @@ function braceExpand(s) {
       changed = true;
       return body.split(',').map((x) => pre + x + post).join(' ');
     });
-    if (!changed || cur.length > 200_000) break;
+    if (!changed || cur.length > 50_000) break;
   }
   return cur;
 }
 
-// Slash-normalised, home-expanded copies of `text` (several readings of string glue) to look for protected paths in.
+// Several readings of `text` to look for protected paths in: as is, with string glue squashed ('+', ',' and '/'
+// between quotes, quotes next to a slash), and brace-expanded.
 function refVariants(text, ctx) {
-  const v0 = expandHomeRefs(toPosix(text), ctx.homePosix);
-  const v1 = v0.replace(/['"`]\s*\+\s*['"`]/g, '').replace(/['"`]\s*,\s*['"`]/g, '/');
-  return unique([v0, v1, braceExpand(v0)]);
+  const v0 = expandRefs(text, ctx);
+  const v1 = v0
+    .replace(/['"`]\s*\+\s*['"`]/g, '')
+    .replace(/['"`]\s*[,/]\s*['"`]/g, '/')
+    .replace(/\s*\/\s*(?=['"`])/g, '/')
+    .replace(/\/['"`]+/g, '/')
+    .replace(/['"`]+\//g, '/');
+  return unique([v0, v1, braceExpand(v0, ctx)]);
 }
 
 // A root counts only on a path-segment boundary: `/ship` must not match `/shipping`. The preceding-character
 // test lets `-C/path` (a flag with an attached value) through but not `/mnt/home/u/...`.
 function rootRegexes(ctx) {
   return ctx.roots.map((r) => new RegExp(`(?:(?<![\\w.~])|(?<=\\s-[A-Za-z]))${escapeRe(r)}(?![\\w.\\-])`, ctx.ci ? 'i' : ''));
+}
+
+// An exact ancestor dir (`~/.claude`, `~/.claude/skills`, with or without a trailing slash), not a child of it.
+function ancestorRegexes(ctx) {
+  return ctx.ancestors.map((a) => new RegExp(`(?:(?<![\\w.~])|(?<=\\s-[A-Za-z]))${escapeRe(a)}/*(?![\\w.\\-/])`, ctx.ci ? 'i' : ''));
+}
+
+// The protected files named by their tail (`.claude/settings.json`), whatever lies in front of it.
+const SEP = "(?=[ \\t]*[/'\"`,+])[/'\"`,+ \\t]+"; // between pieces of a code-built path: '.claude', 'skills', 'ship'
+function suffixBody(sep) {
+  const end = '(?![\\w.\\-])';
+  return `\\.claude${sep}(?:settings\\.json${end}|pipeline${end}|skills${sep}(?:ship|verify|pipeline-setup)${end}|agents${sep}(?:implementer|verifier|judge|arbiter)\\.md${end})`;
+}
+// ...preceded by something only known at run time: a variable, a command substitution, a template `${...}`, a call
+// result `)`, a `+` or `,` joining pieces, `~user`, `.join(` / `.joinpath(`.
+const NONLIT_PREFIX = "(?:[})\\]]|\\$\\w+|~\\w*|[+,][ \\t]*|join(?:path)?\\([ \\t]*)['\"`/]*";
+// ...or preceded by a plain relative prefix (`.claude/x`, `../.claude/x`, `sub/.claude/x`), resolved against the directories in play.
+const REL_PREFIX = '(?<![\\w$.~/\\\\-])(?:[\\w.\\-]+/+)*';
+
+function suffixRegexes(ci) {
+  const flags = ci ? 'i' : '';
+  return {
+    nonlit: new RegExp(NONLIT_PREFIX + suffixBody(SEP), flags),
+    rel: new RegExp(REL_PREFIX + suffixBody('/+'), `g${flags}`),
+  };
 }
 
 function globToRe(g, ci) {
@@ -273,8 +454,28 @@ function rootsAndAncestors(ctx) {
 
 function makeMatchers(ctx) {
   const rootRes = rootRegexes(ctx);
+  const ancRes = ancestorRegexes(ctx);
+  const suffix = suffixRegexes(ctx.ci);
   const ancestors = rootsAndAncestors(ctx);
-  const rawHit = (text) => !!text && refVariants(String(text), ctx).some((v) => rootRes.some((re) => re.test(v)));
+
+  // Is a protected file named in `text`? By absolute path (in any of its spellings), by a tail with an unknown
+  // prefix, or by a relative tail that lands in a protected root from one of `dirs`.
+  const rawHit = (text, dirs) => {
+    if (!text) return false;
+    for (const v of refVariants(String(text), ctx)) {
+      if (rootRes.some((re) => re.test(v))) return true;
+      if (!(ctx.ci ? v.toLowerCase() : v).includes('.claude')) continue;
+      if (suffix.nonlit.test(v)) return true;
+      if (dirs) {
+        suffix.rel.lastIndex = 0;
+        for (const mm of v.matchAll(suffix.rel)) for (const d of dirs) if (ctx.hit(posix.join(d, mm[0]))) return true;
+      }
+    }
+    return false;
+  };
+
+  // An ancestor dir named exactly in a Windows-style command (backslashes are lost from argv, so read the raw text).
+  const ancestorRaw = (text) => !!text && refVariants(String(text), ctx).some((v) => ancRes.some((re) => re.test(v)));
 
   const globHit = (g) => {
     const star = g.search(/[*?[]/);
@@ -284,9 +485,10 @@ function makeMatchers(ctx) {
     return !!re && ancestors.some((a) => re.test(a));
   };
 
-  // A word that, resolved against any directory the command line has been in, lands inside a protected root.
-  // Catches what the textual scan cannot: `..` segments and relative paths after `cd`.
-  const pathHit = (tok, dirs) => {
+  // A word that, resolved against any directory the command line has been in, lands inside a protected root (or is
+  // exactly an ancestor dir when `withAncestors`). Catches what the textual scan cannot: `..` segments and relative
+  // paths after `cd`.
+  const pathHit = (tok, dirs, withAncestors = true) => {
     let parts = [tok];
     if (tok.startsWith('-')) {
       const eq = tok.indexOf('=');
@@ -294,27 +496,30 @@ function makeMatchers(ctx) {
     }
     for (const part of parts) {
       if (!part) continue;
-      const e = expandHomeRefs(toPosix(part), ctx.homePosix);
+      const e = expandRefs(part, ctx);
       const bases = isAbs(e) ? [''] : dirs;
       for (const d of bases) {
         const full = isAbs(e) ? posix.normalize(e) : posix.join(d, e);
-        if (/[*?[]/.test(full) ? globHit(full) : ctx.hit(full)) return true;
+        if (/[*?[]/.test(full) ? globHit(full) : (ctx.hit(full) || (withAncestors && ctx.hitAncestor(full)))) return true;
       }
     }
     return false;
   };
-  return { rawHit, pathHit };
+  return { rawHit, pathHit, ancestorRaw };
 }
 
 // ---- Bash: command classification -----------------------------------------------------------------
 
-const READ_ONLY = new Set(['cat', 'head', 'tail', 'less', 'more', 'ls', 'stat', 'wc', 'grep', 'rg', 'diff', 'cmp', 'shasum', 'sha256sum', 'sha1sum', 'md5', 'md5sum', 'file', 'readlink', 'realpath', 'test', '[']);
+const READ_ONLY = new Set(['cat', 'head', 'tail', 'less', 'more', 'ls', 'stat', 'wc', 'grep', 'rg', 'diff', 'cmp', 'shasum', 'sha256sum', 'sha1sum', 'md5', 'md5sum', 'file', 'readlink', 'realpath', 'test', '[', 'cut', 'du', 'hexdump', 'bat']);
 const PS_READ_ONLY = new Set(['get-content', 'get-childitem', 'gc', 'gci']);
 const GIT_READ_ONLY = new Set(['log', 'show', 'diff', 'status', 'ls-files', 'blame']);
 const CD_CMDS = new Set(['cd', 'pushd', 'popd', 'set-location', 'sl']);
 const FIND_UNSAFE = /^-(?:delete|exec|execdir|ok|okdir|fprint0?|fprintf|fls)$/;
-const IN_PLACE = new Set(['sed', 'gsed', 'perl', 'ruby']);
 const SHELL_NAMES = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'csh', 'tcsh', 'pwsh', 'powershell', 'cmd']);
+// For these only the destination (last word, or -t DIR) can change a protected file; reading one into /tmp is fine.
+const DEST_ONLY = new Set(['cp', 'rsync', 'install']);
+const MOVERS = new Set(['mv', 'ln', 'ditto']); // any named protected path counts, and so does DEST/basename(SRC)
+const WRITE_OPS = new Set(['>', '>>', '>|', '>&', '&>', '&>>', '<>']);
 // xargs is unwrapped by the parser, so its name only survives in the raw text.
 const FAN_OUT_RE = /(?:^|[\s;&|(`])(?:xargs|parallel)(?=\s|$)/;
 
@@ -322,6 +527,17 @@ const shellQuote = (w) => (/^[\w@%+=:,./~-]+$/.test(w) ? w : `'${w.replace(/'/g,
 
 // `-i`, `-i.bak`, `-pi`, `-ni`, `--in-place`
 const inPlaceFlag = (a) => /^-[A-Za-z]*i/.test(a) || a === '--in-place' || a.startsWith('--in-place=');
+const positional = (args) => args.filter((a) => !a.startsWith('-') && !/^\d+$/.test(a));
+
+// A sed script with a `w FILE` / `W FILE` command or flag, or an `e` command or flag, writes or runs something.
+const SED_UNSAFE = /(?:^|[;{}\s\d$/])[wWe](?:\s|$)|\/[gpiIm0-9]*[we](?=\s|$|;|\})/;
+function sedReadOnly(args) {
+  return !args.some((a) => (a.startsWith('-') ? inPlaceFlag(a) || a === '-f' || a === '--file' || a.startsWith('--file=') : SED_UNSAFE.test(a)));
+}
+
+function awkReadOnly(args) {
+  return !args.some((a) => (a.startsWith('-') ? /^-[A-Za-z]*[ifE]/.test(a) || /^--(?:include|file|exec|load)/.test(a) : /[>|]|\bsystem\s*\(/.test(a)));
+}
 
 function gitReadOnly(args) {
   let i = 0;
@@ -336,43 +552,9 @@ function gitReadOnly(args) {
   return !args.slice(i + 1).some((a) => a === '--output' || a.startsWith('--output=') || a === '--ext-diff');
 }
 
-// Targets of every unquoted output redirection in `text`; `/dev/null` and fd duplication (2>&1) are harmless.
-function redirectTargets(text) {
-  const out = [];
-  const n = text.length;
-  let q = null;
-  let i = 0;
-  while (i < n) {
-    const c = text[i];
-    if (q === "'") { if (c === "'") q = null; i++; continue; }
-    if (q === '"') {
-      if (c === '\\') { i += 2; continue; }
-      if (c === '"') q = null;
-      i++;
-      continue;
-    }
-    if (c === '\\') { i += 2; continue; }
-    if (c === "'" || c === '"') { q = c; i++; continue; }
-    if (c !== '>') { i++; continue; }
-    let j = i + 1;
-    if (text[j] === '>') j++;
-    if (text[j] === '|') j++;
-    let dup = false;
-    if (text[j] === '&') { dup = true; j++; }
-    while (text[j] === ' ' || text[j] === '\t') j++;
-    if (text[j] === '(') { out.push('('); i = j + 1; continue; }
-    let k = j;
-    while (k < n && !/[\s;&|)<>]/.test(text[k])) k++;
-    const target = text.slice(j, k).replace(/^["']|["']$/g, '');
-    if (!((dup && /^(\d+|-)$/.test(target)) || target === '/dev/null')) out.push(target || '?');
-    i = Math.max(k, i + 1);
-  }
-  return out;
-}
-
 function isPipelineTool(arg, ctx) {
   if (typeof arg !== 'string') return false;
-  const e = expandHomeRefs(toPosix(arg), ctx.homePosix);
+  const e = expandRefs(arg, ctx);
   if (!isAbs(e)) return false;
   return samePath(e, `${ctx.homePosix}/.claude/pipeline/bin/pipeline.mjs`, ctx.platform)
     || isInside(e, `${ctx.homePosix}/.claude/pipeline/hooks`, ctx.platform);
@@ -380,7 +562,7 @@ function isPipelineTool(arg, ctx) {
 
 // A Windows `node C:\...\pipeline.mjs` loses its backslashes in argv, so look at the raw text too.
 function pipelineToolInRaw(raw, ctx) {
-  const t = expandHomeRefs(toPosix(raw), ctx.homePosix);
+  const t = expandRefs(raw, ctx);
   const root = escapeRe(`${ctx.homePosix}/.claude/pipeline`);
   return new RegExp(`^\\s*(?:\\S*/)?node(?:\\.exe)?\\s+["']?${root}/(?:bin/pipeline\\.mjs|hooks/[^\\s'"]*)(?:["']?\\s|["']?$)`, ctx.ci ? 'i' : '').test(t);
 }
@@ -395,7 +577,7 @@ function pwshReadOnly(argv) {
   }
   if (text === null) return false;
   const inner = simpleCommands(text);
-  if (inner.truncated) return false;
+  if (inner.truncated || inner.dynamic) return false;
   return inner.every((c) => c.argv.length === 0 || PS_READ_ONLY.has(baseOf(c.argv[0])));
 }
 
@@ -409,10 +591,62 @@ function isReadOnly(cmd, ctx) {
   if (name === 'find') return !args.some((a) => FIND_UNSAFE.test(a));
   if (name === 'git') return gitReadOnly(args);
   if (name === 'jq') return !args.some((a) => /^-[A-Za-z]*i/.test(a) || a === '--in-place');
+  if (name === 'sed' || name === 'gsed') return sedReadOnly(args);
+  if (name === 'awk' || name === 'gawk' || name === 'mawk' || name === 'nawk') return awkReadOnly(args);
+  if (name === 'sort') return !args.some((a) => /^-[A-Za-z]*o/.test(a) || a.startsWith('--output') || a.startsWith('--compress-program'));
+  if (name === 'tree') return !args.some((a) => /^-[A-Za-z]*o/.test(a) || a.startsWith('--output'));
+  if (name === 'xxd') return !args.includes('-r') && positional(args).length <= 1;
+  if (name === 'openssl') return args[0] === 'dgst' && !args.some((a) => a === '-out' || a === '-sign' || a === '-prverify');
+  if ((name === 'python' || name === 'python3') && args[0] === '-m' && args[1] === 'json.tool') return positional(args.slice(2)).length <= 1;
   if (isPipelineTool(argv[0], ctx)) return true;
   if (name === 'node') return isPipelineTool(argv[1], ctx) || (cmd.raw.includes('\\') && pipelineToolInRaw(cmd.raw, ctx));
   if (name === 'pwsh' || name === 'powershell') return pwshReadOnly(argv);
   return PS_READ_ONLY.has(name);
+}
+
+// The words of cp / rsync / install that name what is written: -t DIR, else the last word (`install -d`: all of them).
+// `sources` are the other words; copying SRC into a directory writes DIR/basename(SRC), which matters when that
+// lands on a protected path (cp -a /tmp/backup/.claude ~/).
+function destsOf(argv, name) {
+  const args = argv.slice(1);
+  const pos = [];
+  let target = null;
+  const dirMode = name === 'install' && args.some((a) => a === '-d' || a === '--directory');
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--') { pos.push(...args.slice(i + 1)); break; }
+    if (a === '-t' || a === '--target-directory') { target = args[++i]; continue; }
+    if (a.startsWith('--target-directory=')) { target = a.slice('--target-directory='.length); continue; }
+    if (/^-t.+/.test(a) && !a.startsWith('--')) { target = a.slice(2); continue; }
+    if (a.length > 1 && a.startsWith('-')) continue;
+    pos.push(a);
+  }
+  let dests;
+  let sources;
+  if (target) { dests = [target]; sources = pos; } else if (dirMode) { dests = pos; sources = []; } else if (pos.length >= 2) { dests = [pos[pos.length - 1]]; sources = pos.slice(0, -1); } else { dests = []; sources = []; }
+  const written = [...dests];
+  for (const d of dests) for (const src of sources) {
+    const b = posix.basename(toPosix(src).replace(/\/+$/, ''));
+    if (b && b !== '.' && b !== '..' && !/[*?[]/.test(b)) written.push(`${d.replace(/\/+$/, '')}/${b}`);
+  }
+  return written;
+}
+
+// $NAME values assigned on the line: `D=x cmd`, a bare `D=x`, `export D=x`, `declare -x D=x`.
+function collectVars(cmds, ctx) {
+  const vars = {};
+  const SKIP = new Set(['HOME', 'USER', 'LOGNAME', 'USERPROFILE', 'USERNAME']); // these always mean the real ones
+  const set = (k, v) => { if (!SKIP.has(k)) vars[k] = expandHomeRefs(substVars(toPosix(String(v)).replace(USER_RE, ctx.user), vars), ctx.homePosix); };
+  for (const c of cmds) {
+    for (const [k, v] of Object.entries(c.env ?? {})) set(k, v);
+    if (['export', 'declare', 'typeset', 'local', 'readonly'].includes(baseOf(c.argv[0] ?? ''))) {
+      for (const w of c.argv.slice(1)) {
+        const m = /^([A-Za-z_]\w*)=([\s\S]*)$/.exec(w);
+        if (m) set(m[1], m[2]);
+      }
+    }
+  }
+  return vars;
 }
 
 // Directories the command line may be operating in: the hook's cwd plus every `cd` target (chained ones too).
@@ -426,7 +660,7 @@ function collectDirs(cmds, ctx) {
       if (m) t = m[1].trim();
     }
     if (!t) continue;
-    const e = expandHomeRefs(toPosix(t), ctx.homePosix);
+    const e = expandRefs(t, ctx);
     for (const d of [...dirs]) {
       const nd = isAbs(e) ? posix.normalize(e) : posix.join(d, e);
       if (!dirs.includes(nd) && dirs.length < 32) dirs.push(nd);
@@ -437,47 +671,97 @@ function collectDirs(cmds, ctx) {
 
 // ---- Bash: rule 3 and 4 helpers ------------------------------------------------------------------
 
-const INSTALLER_NAME = /^install\.(?:mjs|sh|ps1)$/i;
 const PIPELINE_BIN_NAMES = new Set(['pipeline.mjs', 'pipeline']);
 
-function rawInstallerHits(text) {
-  const t = toPosix(text);
-  const re = /(?:^|[\s'"=])((?:[^\s'"=;&|()]*\/)?install\.(?:mjs|sh|ps1))(?=$|[\s'";&|)])/gi;
-  const out = [];
-  for (const m of t.matchAll(re)) {
-    const tail = t.slice(m.index + m[0].length).split(/[;&|\n]/)[0];
-    out.push({ p: m[1], after: tail.trim().split(/\s+/).filter(Boolean) });
+// ---- installers: found by text ---------------------------------------------------------------------
+// Any command whose text names install.mjs / install.sh / install.ps1 as a word is denied when the directory it runs in,
+// or the path it names, is inside a claude-pipeline checkout (a dir holding pipeline/hooks/guard-files.mjs), unless every
+// command naming it only reads it. This also catches `cat install.sh | bash` and `node -e "import('./install.mjs')"`.
+const INSTALLER_WORD = /(?:^|[\s/\\'"(])install\.(?:mjs|sh|ps1)\b/;
+const INSTALLER_PATH = /((?:[^\s'"=;&|()]*\/)?)install\.(?:mjs|sh|ps1)\b/g;
+const INSTALLER_FILE = /^(?:\.\/)?(?:.*\/)?install\.(?:mjs|sh|ps1)$/;
+const NAMING_SAFE = new Set(['cat', 'head', 'tail', 'less', 'more', 'bat', 'grep', 'rg', 'wc', 'file', 'stat', 'ls', 'diff', 'cmp', 'shellcheck', 'shasum', 'sha256sum', 'sha1sum', 'md5sum', 'md5', 'chmod']);
+const GIT_NAMING_SAFE = new Set(['log', 'diff', 'show', 'status', 'add', 'blame', 'ls-files']);
+const STDIN_RUNNERS = new Set(['node', 'nodejs', 'deno', 'bun', 'sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'csh', 'tcsh', 'pwsh', 'powershell', 'cmd', 'python', 'python3', 'ruby', 'perl', 'php', 'source', '.', 'eval']);
+
+function checkoutRootOf(dir, ctx) {
+  let d = dir;
+  for (let i = 0; i < 64; i++) {
+    try { if (ctx.api.existsSync(posix.join(d, 'pipeline/hooks/guard-files.mjs'))) return d; } catch { /* not a checkout */ }
+    const p = posix.dirname(d);
+    if (p === d) return null;
+    d = p;
   }
-  return out;
+  return null;
 }
 
-// Programs that execute the script they are given. `git add install.sh` or `cat install.mjs` only name the file
-// and stay allowed, so the checkout can still be developed with the guard installed.
-const RUNNERS = new Set(['node', 'nodejs', 'deno', 'bun', 'tsx', 'ts-node', 'npx', 'sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'csh', 'tcsh', 'pwsh', 'powershell', 'cmd', 'source', '.', 'python', 'python3', 'py', 'ruby', 'perl', 'php']);
+// `node install.mjs --check` (or `./install.sh --check`) exactly, or a command that only reads the file.
+function installerNamingIsSafe(c) {
+  // backslashes are lost from argv (C:\\x\\install.mjs), so a Windows-style command is read from its raw words
+  const a = c.raw.includes('\\') ? c.raw.trim().split(/\s+/).map((w) => w.replace(/^["']|["']$/g, '')) : c.argv;
+  if (!a.length) return true;
+  const name = baseOf(a[0]);
+  const isInst = (w) => typeof w === 'string' && INSTALLER_FILE.test(toPosix(w));
+  if ((a.length === 2 && isInst(a[0]) && a[1] === '--check') || (a.length === 3 && (name === 'node' || name === 'nodejs') && isInst(a[1]) && a[2] === '--check')) return true;
+  if (name === 'git') return gitReadOnly(a.slice(1)) || (() => { const x = a.slice(1).find((w) => !w.startsWith('-')); return GIT_NAMING_SAFE.has(x); })();
+  return NAMING_SAFE.has(name);
+}
 
-function findInstaller(cmds, raw, dirs, ctx) {
-  const hits = [];
-  for (const c of cmds) {
-    const idx = c.argv.findIndex((a) => INSTALLER_NAME.test(posix.basename(toPosix(a))));
-    if (idx >= 0) {
-      if (idx === 0 || RUNNERS.has(baseOf(c.argv[0]))) hits.push({ p: c.argv[idx], after: c.argv.slice(idx + 1) });
-    } else if (c.raw.includes('\\')) {
-      const first = toPosix(c.raw.trim().split(/\s+/)[0] ?? '');
-      for (const h of rawInstallerHits(c.raw)) if (h.p === first || RUNNERS.has(baseOf(first))) hits.push(h);
+function scriptsReferenceInstaller(name, scripts, depth, seen) {
+  for (const n of [name, `pre${name}`, `post${name}`]) {
+    const body = scripts?.[n];
+    if (typeof body !== 'string' || seen.has(n)) continue;
+    seen.add(n);
+    if (INSTALLER_WORD.test(` ${toPosix(body)}`)) return true;
+    if (depth < 4) for (const m of body.matchAll(/\b(?:npm|pnpm|yarn)\s+(?:run|run-script)\s+(?:-\S+\s+)*([\w:.-]+)/g)) if (scriptsReferenceInstaller(m[1], scripts, depth + 1, seen)) return true;
+  }
+  return false;
+}
+
+function findInstaller(cmds, raw, dirs, ctx, opts) {
+  const text = expandRefs(raw, ctx);
+  const msg = (what) => `${what} installs the pipeline into ~/.claude; only the owner may run it, from a terminal or with PIPELINE_ADMIN=1 (node install.mjs --check and reading the file are allowed)`;
+
+  // npm run <script> where the script body runs the installer
+  const roots = dirs.map((d) => checkoutRootOf(d, ctx)).filter(Boolean);
+  if (roots.length) {
+    for (const c of cmds) {
+      const n = baseOf(c.argv[0] ?? '');
+      if (!['npm', 'pnpm', 'yarn'].includes(n)) continue;
+      const k = c.argv.findIndex((w, i) => i > 0 && !w.startsWith('-'));
+      if (k < 0 || !['run', 'run-script'].includes(c.argv[k])) continue;
+      const script = c.argv.slice(k + 1).find((w) => !w.startsWith('-'));
+      if (!script) continue;
+      for (const r of unique(roots)) {
+        let scripts;
+        try {
+          const read = opts.readFile ?? ((p) => fs.readFileSync(p, 'utf8'));
+          scripts = JSON.parse(read(posix.join(r, 'package.json'))).scripts ?? {};
+        } catch { return `${n} run ${script} runs in a claude-pipeline checkout whose package.json cannot be read, so it cannot be shown not to run the installer`; }
+        if (scriptsReferenceInstaller(script, scripts, 0, new Set())) return msg(`${n} run ${script}, whose script runs the installer, which`);
+      }
     }
   }
-  if (cmds.truncated) hits.push(...rawInstallerHits(raw));
-  for (const h of hits) {
-    const e = expandHomeRefs(toPosix(h.p), ctx.homePosix);
-    const where = new Set(dirs);
-    for (const d of dirs) where.add(posix.dirname(isAbs(e) ? e : posix.join(d, e)));
-    const inCheckout = [...where].some((d) => {
-      try { return ctx.api.existsSync(posix.join(d, 'pipeline/hooks/guard-files.mjs')); } catch { return false; }
-    });
-    if (!inCheckout) continue;
-    if (h.after.length === 1 && h.after[0] === '--check') continue;
-    return `${h.p} installs the pipeline into ~/.claude; only the owner may run it, from a terminal or with PIPELINE_ADMIN=1 (node install.mjs --check is allowed)`;
+
+  if (!INSTALLER_WORD.test(text) && !INSTALLER_WORD.test(` ${text}`)) return null;
+  // is the cwd (or a cd target) inside a checkout, or does a named installer path resolve into one?
+  let inCheckout = roots.length > 0;
+  if (!inCheckout) {
+    for (const m of (` ${text}`).matchAll(INSTALLER_PATH)) {
+      const p = m[1] ?? '';
+      const bases = isAbs(p) ? [''] : dirs;
+      for (const d of bases) if (checkoutRootOf(isAbs(p) ? posix.normalize(p || '/') : posix.join(d, p || '.'), ctx)) inCheckout = true;
+    }
   }
+  if (!inCheckout) return null;
+  if (cmds.truncated || cmds.dynamic) return msg('a command line too complex to check that names the installer, which');
+  const naming = cmds.filter((c) => INSTALLER_WORD.test(` ${expandRefs(c.raw, ctx)}`));
+  const unsafe = naming.find((c) => !installerNamingIsSafe(c));
+  if (unsafe) return msg(`${unsafe.argv.length ? baseOf(unsafe.argv[0]) : 'a command'} naming the installer`);
+  if (!naming.length) return msg('a command naming the installer'); // inside a heredoc or program text the parser cut up
+  // something that reads the script from a pipe: cat install.sh | bash
+  const feeder = cmds.find((c) => c.argv.length && !naming.includes(c) && ((STDIN_RUNNERS.has(baseOf(c.argv[0])) && !c.argv.slice(1).some((w) => !w.startsWith('-'))) || FAN_OUT_RE.test(c.raw)));
+  if (feeder) return msg(`piping the installer into ${baseOf(feeder.argv[0])}, which`);
   return null;
 }
 
@@ -513,20 +797,23 @@ export function evaluateBashForFiles(command, opts = {}) {
   if (!raw.trim()) return allow();
 
   // 1 and 2: the admin switch and the hook switch, however the words are quoted or escaped
-  const flat = raw.replace(/['"`\\]/g, '');
-  if (hasAdminToken(raw, ctx.platform) || hasAdminToken(flat, ctx.platform)) return deny('the command mentions PIPELINE_ADMIN; only the owner may set it, when launching Claude Code');
+  const flat = raw.replace(/['"`]\s*\+\s*['"`]/g, '').replace(/['"`\\]/g, ''); // 'PIPELINE_'+'ADMIN' reads as one word
+  if (variantsOf(raw).some((t) => setsAdmin(t, ctx.platform) || setsAdmin(t.replace(/['"`]\s*\+\s*['"`]/g, '').replace(/['"`\\]/g, ''), ctx.platform))) return deny('the command sets PIPELINE_ADMIN; only the owner may set it, when launching Claude Code (naming it, e.g. in grep or prose, is fine)');
   if (hasDisableAll(raw) || hasDisableAll(flat)) return deny('the command mentions disableAllHooks, which would switch the pipeline hooks off');
 
   const cmds = simpleCommands(raw);
   for (const c of cmds) {
-    const words = [...c.argv, ...Object.entries(c.env).flatMap(([k, v]) => [k, `${k}=${v}`])].join(' ');
-    if (hasAdminToken(words, ctx.platform)) return deny('the command sets PIPELINE_ADMIN; only the owner may set it, when launching Claude Code');
+    const words = [c.argv.join(' '), ...Object.entries(c.env).map(([k, v]) => `${k}=${v}`)].join(' ');
+    if (setsAdmin(words, ctx.platform)) return deny('the command sets PIPELINE_ADMIN; only the owner may set it, when launching Claude Code');
     if (hasDisableAll(words)) return deny('the command mentions disableAllHooks, which would switch the pipeline hooks off');
   }
+  ctx.vars = collectVars(cmds, ctx);
+  // a name held in a variable (N=PIPELINE_ADMIN; env $N=1 claude)
+  if (Object.keys(ctx.vars).length && setsAdmin(substVars(flat, ctx.vars), ctx.platform)) return deny('the command sets PIPELINE_ADMIN through a variable; only the owner may set it, when launching Claude Code');
   const dirs = collectDirs(cmds, ctx);
 
   // 3 and 4: installers and `protect --apply`
-  const installer = findInstaller(cmds, raw, dirs, ctx);
+  const installer = findInstaller(cmds, raw, dirs, ctx, opts);
   if (installer) return deny(installer);
   if (findProtectApply(cmds, raw)) return deny('pipeline protect --apply changes branch protection and the global hooks; only the owner may run it, from a terminal or with PIPELINE_ADMIN=1');
 
@@ -542,31 +829,58 @@ export function evaluateBashForFiles(command, opts = {}) {
 
   // 5: protected-path references must be read-only
   const m = makeMatchers(ctx);
-  const insideRoot = dirs.some((d) => ctx.hit(d)); // cwd or a `cd` target is a protected dir: relative words can reach it
-  const mentions = (c) => insideRoot
-    || m.rawHit(c.raw)
-    || Object.values(c.env).some((v) => m.rawHit(v))
-    || c.argv.some((t, i) => m.rawHit(t) || ((i > 0 || t.includes('/')) && m.pathHit(t, dirs)));
+  const totalWords = cmds.reduce((n, c) => n + c.argv.length, 0);
+  const tooMany = totalWords > 5000; // per-token scans are skipped; the raw-text scans still run
+  if (tooMany) ctx.dynamic = true;
+  const insideRoot = dirs.some((d) => ctx.hit(d) || ctx.hitAncestor(d)); // cwd or a `cd` target is a protected dir (or its parent): relative words and bare commands reach it
+  const protectedInRaw = m.rawHit(raw, dirs);
+
+  // Output redirections write wherever they point, whatever the command: resolve every target (against the cwd and
+  // every cd target, with ~ and variables expanded) and deny on a protected one. A symlink already pointing into
+  // a protected root counts too.
+  for (const c of cmds) {
+    for (const r of c.redirects ?? []) {
+      if (!WRITE_OPS.has(r.op) || typeof r.target !== 'string' || !r.target || r.target.startsWith('&') || r.target === '/dev/null') continue;
+      const target = r.target;
+      const e = expandRefs(target, ctx);
+      const abs = isAbs(e) ? [posix.normalize(e)] : dirs.map((d) => posix.join(d, e));
+      const viaLink = abs.some((p) => !/[*?[]/.test(p) && ctx.hit(realResolve(p, ctx.api)));
+      if (m.rawHit(target, dirs) || m.pathHit(target, dirs, true) || viaLink) return deny(`the command redirects output to ${target}, which is a protected pipeline file or the directory that holds it (${PROTECTED_MSG})`);
+    }
+  }
+
+  // A scan that was cut short (parse caps, dynamic commands, sizes) cannot prove a command harmless: fail closed
+  // when the raw text names a protected file at all.
+  if ((cmds.truncated || cmds.dynamic || ctx.dynamic) && protectedInRaw) return deny('the command line is too complex or too dynamic to check and refers to a protected pipeline file');
+
+  const winAncestor = (c) => c.raw.includes('\\') && m.ancestorRaw(c.raw);
+  const tokenHit = (t) => m.rawHit(t, dirs) || m.pathHit(t, dirs, true);
+  // does the command name a protected file anywhere (source or destination)?
+  const names = (c) => insideRoot
+    || m.rawHit(c.raw, dirs) || winAncestor(c)
+    || Object.values(c.env).some((v) => m.rawHit(v, dirs))
+    || (!tooMany && c.argv.some(tokenHit));
+  // does it WRITE one? cp / rsync / install only write their destination
+  const mentions = (c) => {
+    const name = baseOf(c.argv[0] ?? '');
+    if (insideRoot) return true;
+    if (DEST_ONLY.has(name)) return destsOf(c.argv, name).some(tokenHit);
+    return names(c) || (MOVERS.has(name) && destsOf(c.argv, name).some(tokenHit));
+  };
   const mentioning = cmds.filter(mentions);
-  // A reference no command mentions can only live in a comment or in a heredoc body; a body may be a script.
-  if (!mentioning.length && !(raw.includes('<<') && m.rawHit(raw))) return allow();
-
-  if (cmds.truncated) return deny('the command line is too complex to check and refers to a protected pipeline file');
-
-  const sources = [raw, ...cmds.map((c) => c.raw)];
-  const redirect = unique(sources.flatMap(redirectTargets));
-  if (redirect.length) return deny(`the command refers to a protected pipeline file and redirects output to ${redirect[0]}`);
-  if (cmds.some((c) => baseOf(c.argv[0] ?? '') === 'tee')) return deny('the command refers to a protected pipeline file and uses tee');
-  if (cmds.some((c) => IN_PLACE.has(baseOf(c.argv[0] ?? '')) && c.argv.slice(1).some(inPlaceFlag))) return deny('the command refers to a protected pipeline file and edits files in place');
+  // A reference no single command names lives in a heredoc body or in program text the shell parser cut into
+  // pieces (a Python or JS one-liner): then every command on the line must be read-only.
+  const unaccounted = protectedInRaw && !cmds.some(names);
+  if (!mentioning.length && !unaccounted) return allow();
 
   // A read-only command can still feed a writer further down the pipe (find ... | xargs rm, ls ... | sh).
   if (cmds.some((c) => FAN_OUT_RE.test(c.raw) || (SHELL_NAMES.has(baseOf(c.argv[0] ?? '')) && !isReadOnly(c, ctx)))) return deny('the command refers to a protected pipeline file and hands work to xargs or a shell, which could modify it');
 
-  const pool = mentioning.length ? mentioning : cmds.filter((c) => c.argv.length);
+  const pool = unaccounted ? cmds.filter((c) => c.argv.length) : mentioning;
   const bad = pool.find((c) => !isReadOnly(c, ctx));
   if (bad) {
     const name = bad.argv.length ? baseOf(bad.argv[0]) : '(assignment)';
-    return deny(`${name} refers to a protected pipeline file and is not a read-only command (skills, agents, ~/.claude/pipeline and ~/.claude/settings.json can only be changed by the owner with PIPELINE_ADMIN=1)`);
+    return deny(`${name} refers to a protected pipeline file (or the directory that holds it) and is not a read-only command (${PROTECTED_MSG})`);
   }
   return allow();
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Why: Claude Code PreToolUse hook (matcher Edit|Write|MultiEdit|NotebookEdit|Bash) that keeps agents from
+// Why: Claude Code PreToolUse hook (matcher Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|mcp__.*) that keeps agents from
 // editing their own rules: the globally installed pipeline files, the global settings that load the hooks, and
 // the hook off-switches. Only a Claude Code process launched with PIPELINE_ADMIN=1 bypasses it. The decision
 // logic is in lib/files-policy.mjs; this file only does stdin/stdout and must never crash, because a crashing
@@ -38,7 +38,7 @@ async function main() {
     const input = JSON.parse(raw);
     const tool = input && typeof input === 'object' ? input.tool_name : undefined;
     const isShell = SHELL_TOOLS.has(tool);
-    if (!isShell && !FILE_TOOLS.has(tool)) return; // not ours
+    if (!isShell && !FILE_TOOLS.has(tool) && !(typeof tool === 'string' && tool.startsWith('mcp__'))) return; // not ours (MCP write tools are judged by evaluateFileTool)
     const { evaluateFileTool, evaluateBashForFiles } = await import('./lib/files-policy.mjs');
     const cwd = typeof input.cwd === 'string' && input.cwd ? input.cwd : process.cwd();
     const opts = { home: os.homedir(), env: process.env, platform: process.platform };
