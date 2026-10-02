@@ -17,6 +17,7 @@ verify:
 
 ci:
   required_checks: ["test (ubuntu)", "test (windows)"]
+  guard_checks: false          # no pipeline-guards.yml here: every path is a hard-stop, the owner merges by hand
   e2e_label: null
   draft_while_iterating: false
 
