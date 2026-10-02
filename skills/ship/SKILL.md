@@ -30,8 +30,10 @@ permission allowlist matches). Every `P` command prints one JSON object; exit co
 6. Keep your own context lean: work from `P` JSON, subagent summaries, and file paths. Don't
    read whole logs, diffs, or reports into this session — hand paths to subagents.
 7. Commands that can exceed 9 minutes (full verify, merge gate, prod watch, Codex review) run
-   via `P job start <name> -- <command>` and `P job wait <name> --timeout 540` (repeat until
-   `done`). No `sleep` loops.
+   via `P job start <name> -- <command>` and `P job wait <name> --run-id <runId> --timeout 540`
+   (repeat until `done`). `job start` prints `runId` and `tag` (default: the HEAD sha): keep the
+   `runId` and pass it to every `wait`/`read`; `state: replaced` (exit 1) means another start reused the
+   name, so the result you are waiting for is gone — start again. No `sleep` loops.
 
 ## Step 0 — opt-out, preflight
 
@@ -102,7 +104,7 @@ awaiting-review`, summary (`awaiting-review`), stop.
 3. Verifier: fresh `verify.full` on the current head (must be clean, full mode).
 4. High risk ⇒ `gh pr edit N --add-label <ci.e2e_label>` (if configured).
 5. Draft ⇒ `gh pr ready N`. Wait for CI on this head: `P job start ci -- gh pr checks N
-   --watch --required` / `P job wait ci`.
+   --watch --required` → `P job wait ci --run-id <runId> --timeout 540`.
 6. Preview: `P deploy url --sha <head> --environment <preview.environment>` →
    `P smoke --target preview --url <url> --sha <head>` (UI-text changes: add
    `--expect-text "<new text>"`).
@@ -112,9 +114,9 @@ awaiting-review`, summary (`awaiting-review`), stop.
 ## Step 6 — merge and production
 
 1. `P job start merge -- node ~/.claude/pipeline/bin/pipeline.mjs merge --pr N` → `P job wait
-   merge`. Exit 1 because the base moved ⇒ back to Step 5.2 (max 2 times, then `needs-human`).
+   merge --run-id <runId> --timeout 540`. Exit 1 because the base moved ⇒ back to Step 5.2 (max 2 times, then `needs-human`).
 2. Merged ⇒ `P job start prod -- node ~/.claude/pipeline/bin/pipeline.mjs prod-watch --sha
-   <merge sha> --pr N [--expect-text …]` → `P job wait prod`. Outcomes: `merged` (smoke ok),
+   <merge sha> --pr N [--expect-text …]` → `P job wait prod --run-id <runId> --timeout 540`. Outcomes: `merged` (smoke ok),
    `superseded`, `recovered` (rolled back + revert PR opened), `rollback-failed` (urgent). Report
    any non-`merged` outcome to the user immediately.
 

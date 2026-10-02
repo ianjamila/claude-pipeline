@@ -6,6 +6,7 @@
 import os from 'node:os';
 import { EXIT, UsageError, intOption, parseCommandArgs } from '../lib/cli.mjs';
 import { guarded, resolveRepo } from '../lib/cmd-common.mjs';
+import { headSha } from '../lib/git.mjs';
 import { startJob, waitJob, readJob } from '../lib/jobs.mjs';
 import { escapeArgument } from '../lib/proc.mjs';
 import { evaluateBashForFiles } from '../hooks/lib/files-policy.mjs';
@@ -15,10 +16,12 @@ import { realGitWiring } from '../hooks/lib/git-wiring.mjs';
 export const meta = {
   summary: 'run a long command detached (start), poll it (wait), or read its state (read)',
   usage: [
-    'pipeline job start [--repo DIR] NAME -- CMD...   -> {ok, name, jobDir, pid}; exit 1 {ok:false, refused:true, reason} when a guard denies CMD',
-    'pipeline job wait  [--repo DIR] NAME [--timeout SEC]   (default 540, max 570) -> {ok, name, state, exitCode?, tail}',
-    'pipeline job read  [--repo DIR] NAME   -> same shape, without waiting',
-    '  exit 0: running, or done with exit code 0 · exit 1: done non-zero, lost, refused, name already running · exit 2: no such job / usage',
+    'pipeline job start [--repo DIR] [--tag TAG] NAME -- CMD...   -> {ok, name, jobDir, pid, runId, tag}; exit 1 {ok:false, refused:true, reason} when a guard denies CMD',
+    '  --tag TAG: what the job is about (default: the repo HEAD sha); keep the returned runId and hand it to wait/read as --run-id',
+    'pipeline job wait  [--repo DIR] [--run-id ID] NAME [--timeout SEC]   (default 540, max 570) -> {ok, name, state, tag, runId, exitCode?, tail}',
+    'pipeline job read  [--repo DIR] [--run-id ID] NAME   -> same shape, without waiting',
+    '  --run-id ID: the runId start returned; if the job name was started again since, state is "replaced" ({ok:false}, exit 1)',
+    '  exit 0: running, or done with exit code 0 · exit 1: done non-zero, lost, replaced, refused, name already running · exit 2: no such job / usage',
     '  CMD is the argument list after "--"; arguments with spaces, quotes or shell metacharacters are quoted for the shell',
     '  that runs the job (POSIX single quotes; on Windows double quotes), so each stays ONE argument. For pipes, &&, or',
     '  redirects pass a shell explicitly: job start NAME -- bash -c "a && b".',
@@ -66,11 +69,21 @@ function jobError(err) {
   return { exitCode: EXIT.USAGE, output: { ok: false, error: 'job', message } };
 }
 
+// The default tag. A repo with no commit yet has no HEAD; the tag is a label, not evidence, so that is "untagged".
+function headOrNull(root) {
+  try {
+    return headSha({ cwd: root });
+  } catch {
+    return undefined;
+  }
+}
+
 async function start(rest, ctx) {
   const dd = rest.indexOf('--');
   if (dd < 0) throw new UsageError('job start needs "--" before the command: pipeline job start NAME -- CMD...');
-  const { values, positionals } = parseCommandArgs(rest.slice(0, dd), { repo: { type: 'string' } });
+  const { values, positionals } = parseCommandArgs(rest.slice(0, dd), { repo: { type: 'string' }, tag: { type: 'string' } });
   if (positionals.length !== 1) throw new UsageError('job start takes exactly one NAME before "--"');
+  if (values.tag !== undefined && values.tag.trim() === '') throw new UsageError('--tag must not be empty');
   const [name] = positionals;
   const args = rest.slice(dd + 1);
   if (args.length === 0 || args[0].trim() === '') throw new UsageError('job start needs a command after "--"');
@@ -93,7 +106,7 @@ async function start(rest, ctx) {
   };
 
   try {
-    const started = startJob(name, quoteCommand(args, platform), { cwd: root, policy });
+    const started = startJob(name, quoteCommand(args, platform), { cwd: root, policy, tag: values.tag ?? headOrNull(root) });
     return { exitCode: EXIT.OK, output: { ok: true, ...started } };
   } catch (err) {
     if (refusal !== null) return { exitCode: EXIT.FAILED, output: { ok: false, refused: true, reason: refusal } };
@@ -118,15 +131,17 @@ function nameOf(positionals, sub) {
 }
 
 async function inspect(sub, rest, ctx) {
-  const options = { repo: { type: 'string' }, ...(sub === 'wait' ? { timeout: { type: 'string' } } : {}) };
+  const options = { repo: { type: 'string' }, 'run-id': { type: 'string' }, ...(sub === 'wait' ? { timeout: { type: 'string' } } : {}) };
   const { values, positionals } = parseCommandArgs(rest, options);
   const name = nameOf(positionals, sub);
   const timeoutSec = sub === 'wait' ? intOption(values, 'timeout', { min: 0, max: MAX_WAIT_SECONDS }) ?? DEFAULT_WAIT_SECONDS : 0;
   const root = resolveRepo(values, ctx);
+  const expectRunId = values['run-id'];
+  if (expectRunId !== undefined && expectRunId.trim() === '') throw new UsageError('--run-id must not be empty');
   try {
     const snap = sub === 'wait'
-      ? await waitJob(name, { cwd: root, timeoutMs: timeoutSec * 1000, pollMs: POLL_MS })
-      : readJob(name, { cwd: root });
+      ? await waitJob(name, { cwd: root, timeoutMs: timeoutSec * 1000, pollMs: POLL_MS, expectRunId })
+      : readJob(name, { cwd: root, expectRunId });
     return jobResult(name, snap);
   } catch (err) {
     const mapped = jobError(err);
@@ -139,5 +154,5 @@ export const run = guarded(async (argv, ctx) => {
   const [sub, ...rest] = argv;
   if (sub === 'start') return start(rest, ctx);
   if (sub === 'wait' || sub === 'read') return inspect(sub, rest, ctx);
-  throw new UsageError('usage: pipeline job (start NAME -- CMD... | wait NAME [--timeout SEC] | read NAME)');
+  throw new UsageError('usage: pipeline job (start [--tag TAG] NAME -- CMD... | wait [--run-id ID] NAME [--timeout SEC] | read [--run-id ID] NAME)');
 });

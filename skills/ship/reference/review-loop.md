@@ -12,8 +12,8 @@ Codex pass + triage + (maybe) arbitration + implementation. Max `review.max_roun
 - Effort: round 1 = `review.effort[<risk>]` (light lane ⇒ `medium`); rounds ≥ 2 =
   `review.effort.followup`.
 - `P job start codex-rN -- node ~/.claude/pipeline/bin/pipeline.mjs codex-review --pr <N>
-  --round <N> --base <base> --head <head> --effort <effort>` → `P job wait codex-rN --timeout 540`
-  until done.
+  --round <N> --base <base> --head <head> --effort <effort>` → `P job wait codex-rN --run-id <runId> --timeout 540`
+  until done (`runId` is in the `job start` output; `replaced` ⇒ start the job again).
 - Exit 3 (quota / auth / unavailable / malformed output) ⇒ `gh pr edit <N> --add-label
   awaiting-review`, `P comment --pr <N> --kind awaiting-review`, `P summary --pr <N> --outcome
   awaiting-review`, stop. Never treat a failed Codex run as "no findings".

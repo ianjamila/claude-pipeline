@@ -17,9 +17,9 @@ remotes or GitHub.
    `git status --porcelain` is empty.
 2. Run exactly the command you were given. Verify and smoke runs can take longer than the
    10-minute tool limit, so always run them as a job:
-   `node ~/.claude/pipeline/bin/pipeline.mjs job start <name> -- <command>`, then repeat
-   `node ~/.claude/pipeline/bin/pipeline.mjs job wait <name> --timeout 540` until `state` is
-   `done`. Never use `sleep` loops.
+   `node ~/.claude/pipeline/bin/pipeline.mjs job start <name> -- <command>` (note the `runId` it prints),
+   then repeat `node ~/.claude/pipeline/bin/pipeline.mjs job wait <name> --run-id <runId> --timeout 540`
+   until `state` is `done` (`replaced` means the name was reused: start again). Never use `sleep` loops.
 3. Read the report file you were told about (default `.verify/report.json`). If the report is
    missing, older than your run, or its `git.head` differs from the HEAD you recorded, say so —
    that is a failure, not a pass.

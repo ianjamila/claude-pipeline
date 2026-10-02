@@ -25,7 +25,8 @@ command. Do exactly that task, prove it, and report briefly.
 5. Run the quick-verify command you were given. If it fails, fix and rerun until it passes. If a
    command can run longer than 9 minutes, start it with
    `node ~/.claude/pipeline/bin/pipeline.mjs job start <name> -- <command>` and poll with
-   `node ~/.claude/pipeline/bin/pipeline.mjs job wait <name> --timeout 540`.
+   `node ~/.claude/pipeline/bin/pipeline.mjs job wait <name> --run-id <runId> --timeout 540` (`runId` is in the
+   start output).
 
 ## Hard rules
 

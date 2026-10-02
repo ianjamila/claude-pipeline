@@ -28,8 +28,9 @@ no pipeline; I can't certify it end-to-end. Want me to run pipeline-setup?"
 ## 2. Run → read → fix → rerun
 
 1. Full verify can exceed the 10-minute tool limit. Run it as a job:
-   `node ~/.claude/pipeline/bin/pipeline.mjs job start verify -- <verify.full>` then
-   `node ~/.claude/pipeline/bin/pipeline.mjs job wait verify --timeout 540` until `done`.
+   `node ~/.claude/pipeline/bin/pipeline.mjs job start verify -- <verify.full>` (note the `runId` it prints),
+   then `node ~/.claude/pipeline/bin/pipeline.mjs job wait verify --run-id <runId> --timeout 540` until `done`
+   (`replaced` means the name was reused: start again).
    (In ship, the verifier subagent does this.)
 2. Read the report, not the scrollback: `ok`, `mode`, `git.head`, each step's `status` and
    `errorExcerpt`. A report whose `git.head` isn't your HEAD, or with `dirty: true`, proves

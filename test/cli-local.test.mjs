@@ -419,6 +419,44 @@ test('job: start then wait reports done with exit code 0 and the output tail', (
   assert.equal(read.json.state, 'done');
 });
 
+test('job: start returns runId and a tag (default: the repo HEAD sha, or --tag)', (t) => {
+  const repo = project();
+  t.after(() => repo.cleanup());
+  const head = repo.git(['rev-parse', 'HEAD']).trim();
+  const a = cli(repo.dir, ['job', 'start', 'tagged', '--', 'node', '-e', '0']);
+  assert.equal(a.code, 0, a.stdout);
+  assert.equal(a.json.tag, head);
+  assert.match(a.json.runId, /^[0-9a-f-]{36}$/);
+  const w = cli(repo.dir, ['job', 'wait', 'tagged', '--timeout', '30', '--run-id', a.json.runId]);
+  assert.equal(w.code, 0, w.stdout);
+  assert.equal(w.json.state, 'done');
+  assert.equal(w.json.tag, head);
+  assert.equal(w.json.runId, a.json.runId);
+  const b = cli(repo.dir, ['job', 'start', 'tagged', '--tag', 'tree-abc', '--', 'node', '-e', '0']);
+  assert.equal(b.code, 0, b.stdout);
+  assert.equal(b.json.tag, 'tree-abc');
+  assert.notEqual(b.json.runId, a.json.runId);
+  assert.equal(cli(repo.dir, ['job', 'read', 'tagged', '--run-id', b.json.runId]).json.tag, 'tree-abc');
+});
+
+test('job: wait/read with the runId of a replaced run exit 1 with state replaced', (t) => {
+  const repo = project();
+  t.after(() => repo.cleanup());
+  const first = cli(repo.dir, ['job', 'start', 'again', '--', 'node', '-e', '0']);
+  assert.equal(cli(repo.dir, ['job', 'wait', 'again', '--timeout', '30']).code, 0);
+  const second = cli(repo.dir, ['job', 'start', 'again', '--', 'node', '-e', '0']);
+  assert.notEqual(second.json.runId, first.json.runId);
+  for (const sub of ['wait', 'read']) {
+    const r = cli(repo.dir, ['job', sub, 'again', '--run-id', first.json.runId, ...(sub === 'wait' ? ['--timeout', '5'] : [])]);
+    assert.equal(r.code, 1, r.stdout);
+    assert.equal(r.json.ok, false);
+    assert.equal(r.json.state, 'replaced');
+  }
+  const mine = cli(repo.dir, ['job', 'wait', 'again', '--run-id', second.json.runId, '--timeout', '30']);
+  assert.equal(mine.code, 0);
+  assert.equal(mine.json.state, 'done');
+});
+
 test('job: a failing command is done with its exit code and CLI exit 1', (t) => {
   const repo = project();
   t.after(() => repo.cleanup());
