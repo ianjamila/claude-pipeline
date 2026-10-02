@@ -686,7 +686,7 @@ sections where they conflict.
   state shows a clean review for the current patch-id; e2e test outage → resume → gate.
 - **R12 Local DB isolation.** Verify's db/e2e steps run against a dedicated pipeline Supabase
   instance (temp workdir copy of `supabase/` with `project_id = "<id>-pipeline"` and a port
-  offset) under a machine-wide lock `supabase-<project>` held for reset → pgTAP → e2e; the e2e
+  offset) under a machine-wide lock `db-<project>` held for reset → pgTAP → e2e; the e2e
   smoke uses its own Playwright config/port and env pointing at that instance; verify refuses
   non-localhost Supabase URLs itself.
 - **R13 Fable proof bound to the ruling.** ship embeds `INPUT-DIGEST: <sha256 of

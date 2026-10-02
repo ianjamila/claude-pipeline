@@ -7,7 +7,7 @@ import { spawnSync } from 'node:child_process';
 import {
   mkdtempSync, mkdirSync, writeFileSync, copyFileSync, existsSync, rmSync, realpathSync, readFileSync, utimesSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
@@ -549,7 +549,7 @@ test('job: a command that touches the protected pipeline files is refused', (t) 
   assert.equal(r.code, 1, r.stdout);
   assert.equal(r.json.refused, true);
   assert.equal(existsSync(join(jobsDir(repo), 'y')), false);
-  const abs = cli(repo.dir, ['job', 'start', 'y2', '--', 'rm', '-rf', join(process.env.HOME ?? '', '.claude', 'pipeline')]);
+  const abs = cli(repo.dir, ['job', 'start', 'y2', '--', 'rm', '-rf', join(homedir(), '.claude', 'pipeline')]);
   assert.equal(abs.code, 1);
   assert.equal(abs.json.refused, true);
   assert.equal(existsSync(join(jobsDir(repo), 'y2')), false);
