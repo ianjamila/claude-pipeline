@@ -15,7 +15,7 @@ import { checkIntegrity } from './lib/integrity.mjs';
 export const INTEGRITY_LABEL = 'test-change-approved';
 export const HARDSTOP_LABEL = 'human-approved';
 const MAX_TABLE_ROWS = 50;
-const MAX_DESCRIPTION = 140; // GitHub commit-status descriptions are capped at 140 characters
+export const MAX_DESCRIPTION = 140; // GitHub commit-status descriptions are capped at 140 characters
 
 class GuardUsageError extends Error {}
 
@@ -23,7 +23,7 @@ function parseLabels(raw) {
   return String(raw ?? '').split(',').map((s) => s.trim()).filter(Boolean);
 }
 
-function clip(text, max) {
+export function clip(text, max) {
   const s = String(text).replace(/\s+/g, ' ').trim();
   return s.length <= max ? s : `${s.slice(0, max - 3).trimEnd()}...`;
 }
@@ -70,8 +70,39 @@ export function renderSummary(check, result) {
   return `${lines.join('\n')}\n`;
 }
 
-// Returns { exitCode, output, description, summary }. IO (git, config) is injectable so tests need no real repo for
-// the argument and config failure paths.
+// Evaluates one check against a base..head range. Used by the CLI below and by ci-guards-run.mjs (the workflow
+// orchestrator). Never throws: any problem becomes exitCode 2 (fail closed).
+// Returns { exitCode, output, description, summary }. IO (git, config) is injectable for tests.
+export async function runCheck({ check, base, head, labels = [], cwd = process.cwd(), deps = {} }) {
+  const ctx = { check };
+  try {
+    if (check !== 'integrity' && check !== 'hardstops') throw new GuardUsageError('--check must be integrity or hardstops');
+    if (!base) throw new GuardUsageError('missing --base');
+    if (!head) throw new GuardUsageError('missing --head');
+
+    const loaded = await (deps.loadConfig ?? loadConfig)(cwd);
+    if (!loaded.ok) {
+      return fail(new Error(`invalid or missing .claude/pipeline.yml: ${loaded.errors.join('; ')}`), ctx, 'config');
+    }
+    const config = loaded.config;
+
+    let result;
+    if (check === 'integrity') {
+      const files = (deps.diffFiles ?? diffFiles)(base, head, { cwd });
+      const r = checkIntegrity({ files, config, labels });
+      result = { check, ok: r.ok, overridden: r.overridden, violations: r.violations, base, head };
+    } else {
+      const hits = await (deps.collectHardStops ?? collectHardStops)({ base, head, cwd, config });
+      const approved = labels.includes(HARDSTOP_LABEL);
+      result = { check, ok: hits.length === 0 || approved, approved, hits, base, head };
+    }
+    return { exitCode: result.ok ? 0 : 1, output: result, description: describe(check, result), summary: renderSummary(check, result) };
+  } catch (err) {
+    return fail(err, ctx);
+  }
+}
+
+// CLI: parses argv, then delegates to runCheck.
 export async function runGuard(argv, { cwd = process.cwd(), deps = {} } = {}) {
   let values;
   try {
@@ -87,39 +118,8 @@ export async function runGuard(argv, { cwd = process.cwd(), deps = {} } = {}) {
   } catch (err) {
     return fail(new GuardUsageError(err.message), {});
   }
-  const ctx = { check: values.check, base: values.base, head: values.head, descriptionFile: values['description-file'] };
-  try {
-    if (values.check !== 'integrity' && values.check !== 'hardstops') throw new GuardUsageError('--check must be integrity or hardstops');
-    if (!values.base) throw new GuardUsageError('missing --base');
-    if (!values.head) throw new GuardUsageError('missing --head');
-    const labels = parseLabels(values.labels);
-
-    const loaded = await (deps.loadConfig ?? loadConfig)(cwd);
-    if (!loaded.ok) {
-      return fail(new Error(`invalid or missing .claude/pipeline.yml: ${loaded.errors.join('; ')}`), ctx, 'config');
-    }
-    const config = loaded.config;
-
-    let result;
-    if (values.check === 'integrity') {
-      const files = (deps.diffFiles ?? diffFiles)(values.base, values.head, { cwd });
-      const r = checkIntegrity({ files, config, labels });
-      result = { check: 'integrity', ok: r.ok, overridden: r.overridden, violations: r.violations, base: values.base, head: values.head };
-    } else {
-      const hits = await (deps.collectHardStops ?? collectHardStops)({ base: values.base, head: values.head, cwd, config });
-      const approved = labels.includes(HARDSTOP_LABEL);
-      result = { check: 'hardstops', ok: hits.length === 0 || approved, approved, hits, base: values.base, head: values.head };
-    }
-    return {
-      exitCode: result.ok ? 0 : 1,
-      output: result,
-      description: describe(values.check, result),
-      summary: renderSummary(values.check, result),
-      descriptionFile: ctx.descriptionFile,
-    };
-  } catch (err) {
-    return fail(err, ctx);
-  }
+  const r = await runCheck({ check: values.check, base: values.base, head: values.head, labels: parseLabels(values.labels), cwd, deps });
+  return { ...r, descriptionFile: values['description-file'] };
 }
 
 function fail(err, ctx, error = err instanceof GuardUsageError ? 'usage' : 'guard-error') {
@@ -129,7 +129,6 @@ function fail(err, ctx, error = err instanceof GuardUsageError ? 'usage' : 'guar
     output: { ok: false, error, ...(ctx.check ? { check: ctx.check } : {}), message },
     description: clip(`Guard error: ${message}`, MAX_DESCRIPTION),
     summary: `## ${ctx.check === 'hardstops' ? 'Hard-stop scan' : 'Test integrity'}\n\nGuard error (fails closed): ${cell(message)}\n`,
-    descriptionFile: ctx.descriptionFile,
   };
 }
 

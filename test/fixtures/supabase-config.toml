@@ -1,0 +1,51 @@
+# A Supabase project configuration file (trimmed from `supabase init`, CLI 2.118).
+project_id = "drmed"   # trailing comment survives
+
+[api]
+enabled = true
+# Port to use for the API URL.
+port = 54321
+schemas = ["public", "graphql_public"]
+
+[db]
+# Port to use for the local database URL.
+port = 54322
+# Port used by db diff command to initialize the shadow database.
+shadow_port = 54320
+major_version = 17
+
+[db.pooler]
+enabled = false
+# Port to use for the local connection pooler.
+port = 54329 # pooler
+default_pool_size = 20
+
+[studio]
+enabled = true
+port = 54323
+api_url = "http://127.0.0.1"
+
+[inbucket]
+enabled = true
+port = 54324
+# Uncomment to expose additional ports for testing user applications that send emails.
+# smtp_port = 54325
+pop3_port = 54326
+
+[edge_runtime]
+enabled = true
+inspector_port = 8083
+
+[analytics]
+enabled = false
+port = 54327
+# port = 9999
+
+[auth]
+site_url = "http://127.0.0.1:3000"
+additional_redirect_urls = ["https://127.0.0.1:3000"]
+
+[auth.email.smtp]
+host = "smtp.sendgrid.net"
+port = 587
+user = "apikey"

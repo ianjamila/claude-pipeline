@@ -17,8 +17,8 @@ export const meta = {
   usage: 'pipeline vendor --repo DIR [--check]',
 };
 
-const LIBS = ['proc', 'paths', 'yaml', 'config', 'glob', 'diff', 'git', 'hardstops', 'risk', 'integrity'];
-const ENTRIES = ['ci-guard', 'stop-verify', 'smoke'];
+const LIBS = ['proc', 'paths', 'yaml', 'config', 'glob', 'diff', 'git', 'hardstops', 'risk', 'integrity', 'locks'];
+const ENTRIES = ['ci-guard', 'ci-guards-run', 'stop-verify', 'smoke', 'supabase-local'];
 const DEST = ['scripts', 'pipeline'];
 const VERSION_FILE = 'VERSION';
 
