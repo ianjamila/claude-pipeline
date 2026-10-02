@@ -53,7 +53,7 @@ export function runNode(args, { cwd, env = {}, input } = {}) {
 
 const scratch = [];
 export function scratchDir() {
-  const d = realpathSync(mkdtempSync(join(tmpdir(), 'cp-tpl-')));
+  const d = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-tpl-')));
   scratch.push(d);
   return d;
 }

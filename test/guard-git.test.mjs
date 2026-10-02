@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync, realpathSync, readFileSync, cpSync } from 'node:fs';
-import { tmpdir, devNull } from 'node:os';
+import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
@@ -706,7 +706,7 @@ function makeRepo(name, branch) {
   const dir = join(TMP, name);
   execFileSync('git', ['init', '-q', dir]);
   execFileSync('git', ['-C', dir, 'symbolic-ref', 'HEAD', `refs/heads/${branch}`]);
-  return realpathSync(dir);
+  return realpathSync.native(dir);
 }
 
 test('spawn: git push origin main prints a deny JSON and exits 0', () => {
@@ -764,11 +764,11 @@ test('spawn: bare git push in a real repo on main is denied, on an agent branch 
 test('spawn: git -C and cd resolve the repo they actually push from', () => {
   const onMain = makeRepo('c-main', 'main');
   const onAgent = makeRepo('c-agent', 'agent/y');
-  const viaC = hook(bashInput(`git -C ${onMain} push`, onAgent));
+  const viaC = hook(bashInput(`git -C '${onMain}' push`, onAgent)); // quoted: Windows paths carry backslashes
   assert.equal(JSON.parse(viaC.stdout).hookSpecificOutput.permissionDecision, 'deny');
-  const viaCd = hook(bashInput(`cd ${onMain} && git push -u origin HEAD`, onAgent));
+  const viaCd = hook(bashInput(`cd '${onMain}' && git push -u origin HEAD`, onAgent));
   assert.equal(JSON.parse(viaCd.stdout).hookSpecificOutput.permissionDecision, 'deny');
-  const fine = hook(bashInput(`git -C ${onAgent} push`, onMain));
+  const fine = hook(bashInput(`git -C '${onAgent}' push`, onMain));
   assert.equal(fine.stdout, '');
 });
 
@@ -783,7 +783,10 @@ test('spawn: bare git push with a detached HEAD is denied', () => {
 
 // A working clone on main with a bare "origin", so @{push} resolves exactly as it does for a real checkout.
 // Global/system git config is neutralised for both the setup commands and the spawned hook.
-const GIT_ENV = { GIT_CONFIG_GLOBAL: devNull, GIT_CONFIG_SYSTEM: devNull, GIT_CONFIG_NOSYSTEM: '1' };
+// An empty file, not os.devNull: Git for Windows cannot open \\.\nul as a config file.
+const NO_CONFIG = join(TMP, 'empty.gitconfig');
+writeFileSync(NO_CONFIG, '');
+const GIT_ENV = { GIT_CONFIG_GLOBAL: NO_CONFIG, GIT_CONFIG_SYSTEM: NO_CONFIG, GIT_CONFIG_NOSYSTEM: '1' };
 function makeClone(name) {
   const bare = join(TMP, name + '-origin.git');
   const work = join(TMP, name);
@@ -795,7 +798,7 @@ function makeClone(name) {
   git('remote', 'add', 'origin', bare);
   git('push', '-q', 'origin', 'main');
   git('fetch', '-q', 'origin');
-  return { dir: realpathSync(work), git };
+  return { dir: realpathSync.native(work), git };
 }
 const verdictOf = (r) => (r.stdout ? JSON.parse(r.stdout).hookSpecificOutput : null);
 
@@ -1082,7 +1085,7 @@ test('a script file is read and judged by what it runs', () => {
     assert.equal(ev(c).decision, 'allow', c);
   }
   // the file is resolved against the directory the command runs in
-  const dirFiles = { sub: null, '/work/repo/sub/push.sh': 'git push origin main' };
+  const dirFiles = { sub: null, [resolve('/work/repo/sub/push.sh')]: 'git push origin main' }; // D:\\work\\... on Windows
   const v = evaluate('cd sub && bash push.sh', { readText: (p) => dirFiles[p] ?? null, pathExists: (p) => p in dirFiles });
   assert.equal(v.decision, 'deny');
 });

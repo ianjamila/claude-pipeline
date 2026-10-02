@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, REPO_VIEW } from './helpers/fakegh-env.mjs';
@@ -265,7 +265,7 @@ test('recovered: failing smoke on our live deployment rolls back to the known-go
   const issue = h.issueCreate.calls[0][0];
   assert.equal(issue.title, '[pipeline] production recovered after #12 (aaaaaaa)');
   assert.deepEqual(issue.labels, ['pipeline-rollback']);
-  assert.deepEqual(h.revertBranch.calls[0][0], { sha: SHA, branch: 'agent/revert-12', base: 'main', dirName: 'revert-12', worktreeDir: '/repo/.worktrees' });
+  assert.deepEqual(h.revertBranch.calls[0][0], { sha: SHA, branch: 'agent/revert-12', base: 'main', dirName: 'revert-12', worktreeDir: resolve('/repo/.worktrees') });
   const pr = h.prCreate.calls[0][0];
   assert.equal(pr.title, 'Revert #12: Add widget');
   assert.equal(pr.head, 'agent/revert-12');

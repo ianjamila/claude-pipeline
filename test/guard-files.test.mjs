@@ -419,7 +419,7 @@ test('file tool: an Edit through a real symlink into a protected skill dir is de
 });
 
 test('file tool: a symlinked home still guards the real path (e.g. /var -> /private/var)', (t) => {
-  const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'gf-home-')));
+  const tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'gf-home-')));
   t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
   const realHome = path.join(tmp, 'real-home');
   fs.mkdirSync(path.join(realHome, '.claude', 'pipeline'), { recursive: true });
@@ -435,7 +435,7 @@ test('file tool: a symlinked home still guards the real path (e.g. /var -> /priv
 });
 
 test('file tool: a dangling symlink pointing into a protected root is denied', (t) => {
-  const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'gf-dangle-')));
+  const tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'gf-dangle-')));
   t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
   const home = path.join(tmp, 'home');
   fs.mkdirSync(path.join(home, '.claude', 'agents'), { recursive: true });
@@ -681,7 +681,7 @@ function runHook(input, { env = {}, home, hook = HOOK } = {}) {
 }
 
 function tmpHome(t) {
-  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'gf-spawn-')));
+  const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'gf-spawn-')));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   return dir;
 }

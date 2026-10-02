@@ -316,7 +316,7 @@ test('the --jq filters work on GitHub-shaped payloads', { skip: !hasJq && 'jq no
   const s = await setup(addDrop);
   const r = await exec(s, { labels: ['human-approved'], events: [owner(T('10:05'))] });
   const filter = (suffix) => r.api(suffix)[0].argv[r.api(suffix)[0].argv.indexOf('--jq') + 1];
-  const jq = (expr, payload) => spawnSync('jq', ['-r', expr], { input: JSON.stringify(payload), encoding: 'utf8' }).stdout;
+  const jq = (expr, payload) => spawnSync('jq', ['-r', expr], { input: JSON.stringify(payload), encoding: 'utf8' }).stdout.replace(/\r\n/g, '\n'); // Windows jq writes CRLF; gh --jq does not
 
   assert.equal(jq(filter(`/pulls/${PR}`), { number: 7, head: { sha: s.head } }).trim(), s.head);
   assert.equal(jq(filter('/labels'), [{ name: 'a' }, { name: 'human-approved' }]), 'a\nhuman-approved\n');

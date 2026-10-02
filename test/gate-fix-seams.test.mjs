@@ -42,16 +42,18 @@ test('a root with INSTALLED.json ignores every seam and warns once per variable'
 });
 
 test('a real installed copy: gh / codex / vercel / test-mode seams are ignored end to end', (t) => {
-  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'cp-installed-')));
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-installed-')));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const installed = join(dir, 'pipeline');
   cpSync(join(here, '..', 'pipeline'), installed, { recursive: true });
   writeFileSync(join(installed, 'INSTALLED.json'), '{}');
-  const probe = `
-    const p = await import(${JSON.stringify(pathToFileURL(join(installed, 'lib', 'proc.mjs')).href)});
-    const v = await import(${JSON.stringify(pathToFileURL(join(installed, 'lib', 'vercel.mjs')).href)});
+  // Built per root: the probe holds file:// URLs, so a string replace of a Windows path would never match.
+  const probeFor = (root) => `
+    const p = await import(${JSON.stringify(pathToFileURL(join(root, 'lib', 'proc.mjs')).href)});
+    const v = await import(${JSON.stringify(pathToFileURL(join(root, 'lib', 'vercel.mjs')).href)});
     console.log(JSON.stringify({ codex: p.codexCommand(), vercel: v.vercelCommand(), mode: p.seamFlag('PIPELINE_TEST_MODE'), installed: p.isInstalledCopy() }));
   `;
+  const probe = probeFor(installed);
   const r = spawnSync(process.execPath, ['--input-type=module', '-e', probe], {
     encoding: 'utf8',
     env: { ...process.env, PIPELINE_GH: 'node x', PIPELINE_CODEX: 'node fake-codex.mjs', PIPELINE_VERCEL: 'node fake-vercel.mjs', PIPELINE_TEST_MODE: '1' },
@@ -61,7 +63,7 @@ test('a real installed copy: gh / codex / vercel / test-mode seams are ignored e
   for (const name of ['PIPELINE_CODEX', 'PIPELINE_VERCEL', 'PIPELINE_TEST_MODE']) assert.match(r.stderr, new RegExp(`ignoring ${name}`));
 
   // The same probe against the checkout honours them.
-  const probe2 = probe.replaceAll(installed, join(here, '..', 'pipeline'));
+  const probe2 = probeFor(join(here, '..', 'pipeline'));
   const ok = spawnSync(process.execPath, ['--input-type=module', '-e', probe2], {
     encoding: 'utf8', env: { ...process.env, PIPELINE_CODEX: 'node fake-codex.mjs', PIPELINE_VERCEL: 'fv', PIPELINE_TEST_MODE: '1' },
   });

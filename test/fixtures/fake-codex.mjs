@@ -6,6 +6,7 @@
 //   FAKE_CODEX_OUTPUT=<file>   copy that file's bytes to the `-o` path (a findings JSON, or garbage for a malformed run)
 //   FAKE_CODEX_DURING=<cmd>    run this shell command (synchronously) before answering: lets a test change the world
 //                              while "Codex is thinking"
+//   FAKE_CODEX_DURING_OUTPUT=<file>  FAKE_CODEX_OUTPUT for that command (cmd.exe has no `VAR=x cmd` prefix)
 //   FAKE_CODEX_HANG=<pidfile>  start a helper (its pid goes to <pidfile>, its pipes are closed) that writes the `-o`
 //                              file after 2 s, then never answer: a hung Codex that left a helper behind
 import { appendFileSync, copyFileSync, writeFileSync } from 'node:fs';
@@ -22,7 +23,7 @@ if (process.env.FAKE_CODEX_CAPTURE) {
 }
 
 if (process.env.FAKE_CODEX_DURING) {
-  spawnSync(process.env.FAKE_CODEX_DURING, { shell: true, stdio: 'ignore', env: { ...process.env, FAKE_CODEX_DURING: '' } });
+  spawnSync(process.env.FAKE_CODEX_DURING, { shell: true, stdio: 'ignore', env: { ...process.env, FAKE_CODEX_DURING: '', FAKE_CODEX_OUTPUT: process.env.FAKE_CODEX_DURING_OUTPUT || process.env.FAKE_CODEX_OUTPUT } });
 }
 
 if (process.env.FAKE_CODEX_HANG) {

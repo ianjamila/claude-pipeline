@@ -214,7 +214,7 @@ export async function main(argv = process.argv.slice(2), { env = process.env, cw
     if (!values.project) throw new Error(`missing --project\n${USAGE}`);
     const portOffset = values['port-offset'] === undefined ? portOffsetFor(values.project) : Number(values['port-offset']);
     if (!Number.isInteger(portOffset)) throw new Error('--port-offset must be an integer');
-    const repoRoot = values.repo ? resolve(cwd, values.repo) : git(['rev-parse', '--show-toplevel'], { cwd }).trim();
+    const repoRoot = values.repo ? resolve(cwd, values.repo) : resolve(git(['rev-parse', '--show-toplevel'], { cwd }).trim());
     const supabaseBin = env.PIPELINE_SUPABASE?.trim() || 'supabase';
 
     const info = ensureDedicatedInstance({ repoRoot, project: values.project, portOffset, supabaseBin });

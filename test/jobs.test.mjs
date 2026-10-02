@@ -150,7 +150,7 @@ test('the command runs in the given cwd with the extra env', async (t) => {
   });
   const r = await waitJob('where', { cwd, timeoutMs: 15_000, ...FAST });
   assert.equal(r.state, 'done');
-  assert.ok(r.tail.split('\n').map((l) => l.trim()).includes(realpathSync(cwd)) || r.tail.includes(cwd));
+  assert.ok(r.tail.split('\n').map((l) => l.trim()).includes(realpathSync.native(cwd)) || r.tail.includes(cwd));
   assert.match(r.tail, /X=xyz/);
 });
 

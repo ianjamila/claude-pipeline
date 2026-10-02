@@ -26,7 +26,7 @@ process.on('exit', () => {
 // Returns { dir, write(rel, content), rm(rel), commit(msg) -> sha, branch(name), checkout(ref), git(args), cleanup() }.
 // branch(name) creates AND switches to the branch. git(args) returns raw stdout and throws on a non-zero exit.
 export function createTmpRepo() {
-  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'cp-git-')));
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-git-')));
   made.add(dir);
 
   const git = (args, { input } = {}) => {
@@ -41,6 +41,7 @@ export function createTmpRepo() {
   git(['config', 'commit.gpgsign', 'false']);
   git(['config', 'tag.gpgsign', 'false']);
   git(['config', 'core.autocrlf', 'false']);
+  git(['config', 'core.longpaths', 'true']); // Windows: paths past 260 chars
   git(['config', 'core.hooksPath', join(dir, '.git', 'no-hooks')]); // a global pre-commit hook must not run here
 
   return {

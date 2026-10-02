@@ -94,7 +94,7 @@ test('config: resolves the repo root from a subdirectory and from --repo', (t) =
   const fromSub = cli(join(repo.dir, 'src'), ['config']);
   assert.equal(fromSub.code, 0);
   assert.equal(fromSub.json.path, join(repo.dir, '.claude', 'pipeline.yml'));
-  const elsewhere = realpathSync(mkdtempSync(join(tmpdir(), 'cp-elsewhere-')));
+  const elsewhere = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-elsewhere-')));
   t.after(() => rmSync(elsewhere, { recursive: true, force: true }));
   const viaFlag = cli(elsewhere, ['config', '--repo', repo.dir]);
   assert.equal(viaFlag.code, 0);
@@ -102,7 +102,7 @@ test('config: resolves the repo root from a subdirectory and from --repo', (t) =
 });
 
 test('config: a directory that is not a git repository is exit 2, not a stack trace', (t) => {
-  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'cp-norepo-')));
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-norepo-')));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const r = cli(dir, ['config']);
   assert.equal(r.code, 2);
@@ -298,7 +298,7 @@ const TAG = 'pipeline-arbiter R1 abcd1234';
 
 // <tmp>/p/<encoded-cwd>/<session>/subagents/agent-<id>.{jsonl,meta.json}: the layout Claude Code writes.
 function projectsDir(t, { jsonl = 'fable-ok.jsonl', meta = {}, agentId = 'a1' } = {}) {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), 'cp-proof-')));
+  const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-proof-')));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const dir = join(root, 'p', '-tmp-work', 'session-1', 'subagents');
   mkdirSync(dir, { recursive: true });
@@ -613,7 +613,7 @@ test('job: usage errors are exit 2', (t) => {
 test('job: --repo selects the repository whose .review/jobs holds the job', (t) => {
   const repo = project();
   t.after(() => repo.cleanup());
-  const elsewhere = realpathSync(mkdtempSync(join(tmpdir(), 'cp-elsewhere-')));
+  const elsewhere = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-elsewhere-')));
   t.after(() => rmSync(elsewhere, { recursive: true, force: true }));
   const started = cli(elsewhere, ['job', 'start', '--repo', repo.dir, 'r', '--', 'node', '-e', '0']);
   assert.equal(started.code, 0, started.stdout);

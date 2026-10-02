@@ -141,8 +141,15 @@ export function run(cmd, args = [], { cwd, env, input, timeoutMs } = {}) {
 // For project-configured command lines (e.g. `npm run merge -- 12`): POSIX sh, or cmd.exe on Windows.
 // Sync, so on timeout it only kills the direct shell: a grandchild that keeps the output pipes open
 // can leave this call waiting. Use runShellAsync for anything that may spawn long-lived children.
+// cmd.exe reports an unknown command as exit 1 plus this (English) message where POSIX shells exit 127. Shell runs map it
+// to 127 so "could not run" never reads as "ran and failed" (triage would take a missing runner as a failing test).
+const CMD_NOT_FOUND = /is not recognized as an internal or external command/;
+export function shellResult(r, platform = process.platform) {
+  return platform === 'win32' && r.code === 1 && CMD_NOT_FOUND.test(r.stderr) ? { ...r, code: 127 } : r;
+}
+
 export function runShell(command, { cwd, env, input, timeoutMs } = {}) {
-  return toResult(spawnSync(command, { ...baseOptions({ cwd, env, timeoutMs }), input, shell: true }));
+  return shellResult(toResult(spawnSync(command, { ...baseOptions({ cwd, env, timeoutMs }), input, shell: true })));
 }
 
 // Kill a process and everything it started: POSIX signals the process group (the child is spawned
@@ -213,7 +220,7 @@ function spawnAsync(file, args, extra, { cwd, env, input, timeoutMs } = {}) {
 
 // Async runShell whose timeout takes the whole process tree down. Resolves; never rejects.
 export function runShellAsync(command, opts = {}) {
-  return spawnAsync(command, [], { shell: true }, opts);
+  return spawnAsync(command, [], { shell: true }, opts).then((r) => shellResult(r));
 }
 
 // Async `run` (no shell, Windows shims handled like `run`) with the same tree-killing timeout as runShellAsync. A

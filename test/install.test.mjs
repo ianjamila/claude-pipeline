@@ -26,7 +26,7 @@ const posix = (p) => String(p).replace(/\\/g, '/');
 const made = [];
 process.on('exit', () => { for (const d of made) rmSync(d, { recursive: true, force: true }); });
 function scratch(label = 'cp-install') {
-  const d = realpathSync(mkdtempSync(join(tmpdir(), `${label}-`)));
+  const d = realpathSync.native(mkdtempSync(join(tmpdir(), `${label}-`)));
   made.push(d);
   return d;
 }

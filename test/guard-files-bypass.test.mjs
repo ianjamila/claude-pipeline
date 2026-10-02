@@ -666,7 +666,7 @@ test('firmlink: /System/Volumes/Data/<path> names the same file on macOS, in fil
 });
 
 test('inode identity: a path that is the same file as a protected root (hard link, alias) is protected', (t) => {
-  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'gf-ino-')));
+  const home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'gf-ino-')));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   fs.mkdirSync(path.join(home, '.claude', 'pipeline', 'hooks'), { recursive: true });
   fs.writeFileSync(path.join(home, '.claude', 'settings.json'), '{}');

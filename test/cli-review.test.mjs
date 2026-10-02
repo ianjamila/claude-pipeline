@@ -86,7 +86,7 @@ function world(t, { gh = GH, light = false } = {}) {
   repo.write('src/a.js', aFile(true));
   if (!light) repo.write('src/big.js', Array.from({ length: 60 }, (_, i) => `export const big${i} = ${i};`).join('\n') + '\n');
   const head = repo.commit('feature');
-  const scratch = realpathSync(mkdtempSync(join(tmpdir(), 'cp-review-')));
+  const scratch = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-review-')));
   t.after(() => rmSync(scratch, { recursive: true, force: true }));
   // The PR as GitHub reports it: its base branch and the head commit it holds (what review-complete compares to).
   const withPr = (sha) => gh.map((e) => (e.match === '^pr view 7' ? { ...e, stdoutJson: { baseRefName: 'main', headRefOid: sha, ...e.stdoutJson } } : e));
@@ -106,7 +106,7 @@ function world(t, { gh = GH, light = false } = {}) {
       for (const k of [
         'PIPELINE_TEST_FORCE_ARBITER', 'PIPELINE_ARBITER_MODEL_OVERRIDE', 'PIPELINE_TEST_MODE', 'PIPELINE_CODEX_TIMEOUT_MS',
         'PIPELINE_LOCK_WAIT_MS', 'FAKE_CODEX_EXIT', 'FAKE_CODEX_STDERR', 'FAKE_CODEX_NO_WRITE', 'FAKE_CODEX_OUTPUT',
-        'FAKE_CODEX_HANG', 'FAKE_CODEX_DURING',
+        'FAKE_CODEX_HANG', 'FAKE_CODEX_DURING', 'FAKE_CODEX_DURING_OUTPUT',
       ]) {
         if (!(k in env)) delete merged[k];
       }
@@ -1405,10 +1405,10 @@ test('codex-review: a round recorded while Codex was running is not overwritten 
   const w = world(t);
   const mine = w.file('mine.json', findingsOf());
   const theirs = w.file('theirs.json', findingsOf([finding()]));
-  const during = `FAKE_CODEX_OUTPUT="${theirs}" node "${bin}" codex-review --pr 7 --round 1 --base ${w.base} --head ${w.head} --effort high`;
+  const during = `node "${bin}" codex-review --pr 7 --round 1 --base ${w.base} --head ${w.head} --effort high`;
   const r = w.cli(
     ['codex-review', '--pr', '7', '--round', '1', '--base', w.base, '--head', w.head, '--effort', 'high'],
-    { FAKE_CODEX_OUTPUT: mine, FAKE_CODEX_DURING: during },
+    { FAKE_CODEX_OUTPUT: mine, FAKE_CODEX_DURING: during, FAKE_CODEX_DURING_OUTPUT: theirs },
   );
   assert.equal(r.code, 2, r.stdout);
   assert.equal(r.json.error, 'round-order');
@@ -1500,7 +1500,7 @@ test('arbiter apply: --expect-model / --expect-effort are test switches; a norma
 });
 
 test('arbiter apply: an installed copy ignores PIPELINE_TEST_MODE (with a warning); the proof stays pinned', (t) => {
-  const installed = join(realpathSync(mkdtempSync(join(tmpdir(), 'cp-installed-'))), 'pipeline');
+  const installed = join(realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-installed-'))), 'pipeline');
   t.after(() => rmSync(join(installed, '..'), { recursive: true, force: true }));
   cpSync(join(here, '..', 'pipeline'), installed, { recursive: true });
   writeFileSync(join(installed, 'INSTALLED.json'), '{}');

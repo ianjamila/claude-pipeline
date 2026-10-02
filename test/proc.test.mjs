@@ -6,7 +6,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   run, runAsync, runShell, runShellAsync, splitCommand, escapeArgument, escapeCommand, quoteForCmd, planSpawn,
-  cmdExe, createResolver, toResult,
+  cmdExe, createResolver, toResult, shellResult,
   gh, ghJson, GhError, codexCommand,
 } from '../pipeline/lib/proc.mjs';
 
@@ -62,7 +62,7 @@ test('run pipes input to stdin', () => {
 });
 
 test('run merges env over process.env and honours cwd', () => {
-  const dir = realpathSync(scratch());
+  const dir = realpathSync.native(scratch());
   const r = run('node', ['-e', 'process.stdout.write(process.env.CP_FOO + "|" + process.cwd())'], {
     env: { CP_FOO: 'bar' }, cwd: dir,
   });
@@ -82,6 +82,14 @@ test('runShell runs a shell command line', () => {
   assert.match(r.stdout, /hi/);
 });
 
+test('shellResult maps cmd.exe "not recognized" (exit 1) to 127 on Windows only', () => {
+  const miss = { code: 1, stdout: '', stderr: "'nope' is not recognized as an internal or external command,\r\noperable program or batch file.\r\n", timedOut: false };
+  assert.equal(shellResult(miss, 'win32').code, 127);
+  assert.equal(shellResult(miss, 'linux').code, 1);
+  assert.equal(shellResult({ ...miss, code: 2 }, 'win32').code, 2);
+  assert.equal(shellResult({ ...miss, stderr: 'assertion failed' }, 'win32').code, 1);
+});
+
 test('runShell reports exit code, env and timeout', () => {
   assert.equal(runShell('exit 3').code, 3);
   const e = runShell('node -e "process.stdout.write(process.env.CP_BAR)"', { env: { CP_BAR: 'baz' } });
@@ -99,7 +107,8 @@ test('splitCommand splits on whitespace and double quotes', () => {
 
 test('splitCommand handles single quotes, escapes and empty args', () => {
   assert.deepEqual(splitCommand("node '/a b/x.mjs' 'it\\s'"), ['node', '/a b/x.mjs', 'it\\s']);
-  assert.deepEqual(splitCommand('a\\ b c'), ['a b', 'c']);
+  assert.deepEqual(splitCommand('a\\ b c', 'linux'), ['a b', 'c']);
+  assert.deepEqual(splitCommand('a\\ b c', 'win32'), ['a\\', 'b', 'c']); // a Windows backslash is a path separator
   assert.deepEqual(splitCommand('say "he said \\"hi\\""'), ['say', 'he said "hi"']);
   assert.deepEqual(splitCommand("say 'it\"s'"), ['say', 'it"s']);
   assert.deepEqual(splitCommand('a "" b'), ['a', '', 'b']);
@@ -375,7 +384,7 @@ test('runShell honours input', () => {
 });
 
 test('runShellAsync captures output, exit code, env, cwd and input', async () => {
-  const dir = realpathSync(scratch());
+  const dir = realpathSync.native(scratch());
   const ok = await runShellAsync('node -e "process.stdout.write(process.env.CP_A + \'|\' + process.cwd())"', {
     env: { CP_A: 'x' }, cwd: dir,
   });
@@ -406,7 +415,7 @@ test('runShellAsync timeout kills the whole process tree, not just the direct ch
 });
 
 test('runAsync passes args verbatim (no shell), env, cwd and input', async () => {
-  const dir = realpathSync(scratch());
+  const dir = realpathSync.native(scratch());
   const r = await runAsync(process.execPath, ['-e', 'process.stdout.write(process.argv[1] + "|" + process.env.CP_A + "|" + process.cwd())', 'a b;"c"'], {
     env: { CP_A: 'x' }, cwd: dir,
   });

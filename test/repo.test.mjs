@@ -9,10 +9,10 @@ test('repoRoot and gitCommonDir resolve for a repo and its worktree', () => {
   const r = createTmpRepo();
   try {
     r.write('a.txt', 'a\n'); r.commit('init');
-    assert.equal(realpathSync(repoRoot(r.dir)), realpathSync(r.dir));
+    assert.equal(realpathSync.native(repoRoot(r.dir)), realpathSync.native(r.dir));
     const wt = join(r.dir, '..', `${r.dir.split(/[\\/]/).pop()}-wt`);
     r.git(['worktree', 'add', '-q', '-b', 'side', wt]);
-    assert.equal(realpathSync(gitCommonDir(wt)), realpathSync(join(r.dir, '.git')));
+    assert.equal(realpathSync.native(gitCommonDir(wt)), realpathSync.native(join(r.dir, '.git')));
     assert.equal(pipelineStateDir(wt), join(gitCommonDir(wt), 'claude-pipeline'));
     r.git(['worktree', 'remove', '--force', wt]);
   } finally { r.cleanup(); }

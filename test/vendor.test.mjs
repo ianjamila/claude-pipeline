@@ -123,7 +123,7 @@ test('missing --repo and a non-git directory are usage errors', async () => {
   await assert.rejects(() => vendor([], { cwd: root, env: process.env }), /missing --repo/);
   const { mkdtempSync, realpathSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
-  const plain = realpathSync(mkdtempSync(join(tmpdir(), 'cp-plain-')));
+  const plain = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-plain-')));
   try {
     await assert.rejects(() => vendor(['--repo', plain], { cwd: plain, env: process.env }), /not a git repository/);
   } finally {

@@ -11,7 +11,7 @@ import { spawnSync } from 'node:child_process';
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 test('pipeline.mjs runs when invoked through a symlinked directory', { skip: process.platform === 'win32' }, (t) => {
-  const tmp = realpathSync(mkdtempSync(join(tmpdir(), 'cp-symlink-')));
+  const tmp = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-symlink-')));
   t.after(() => rmSync(tmp, { recursive: true, force: true }));
   symlinkSync(join(root, 'pipeline'), join(tmp, 'linked'), 'dir');
   const r = spawnSync(process.execPath, [join(tmp, 'linked', 'bin', 'pipeline.mjs'), 'version'], { encoding: 'utf8' });

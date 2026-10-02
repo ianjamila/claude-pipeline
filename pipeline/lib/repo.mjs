@@ -4,8 +4,9 @@ import { join, resolve } from 'node:path';
 import { git } from './git.mjs';
 import { ghJson } from './proc.mjs';
 
+// resolve(): git prints C:/forward/slashes on Windows; callers join() and compare native paths.
 export function repoRoot(cwd = process.cwd()) {
-  return git(['rev-parse', '--show-toplevel'], { cwd }).trim();
+  return resolve(git(['rev-parse', '--show-toplevel'], { cwd }).trim());
 }
 
 // The common git dir is shared by all worktrees of a repo: right place for per-repo,

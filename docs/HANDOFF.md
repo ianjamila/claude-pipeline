@@ -43,6 +43,16 @@ INTERRUPTED (stopped mid-work; uncommitted changes left in the worktree — insp
 - NEXT = step 4: owner OK, then `gh repo create ianjamila/claude-pipeline --private`, push
   int/final as main, watch CI (Windows proves .cmd quoting + installer). Fix CI on main directly
   only until protection is applied (plan 6.2).
+- Step 4 IN PROGRESS (2026-10-02): repo created (private), int/final pushed as main. First CI run 36978331536 failed
+  (ubuntu 1, windows 26). Direct-to-main CI fix #1 (plan 6.2 log):
+  - product: stop-verify report freshness compares the report mtime before/after the run (Linux coarse mtime trailed
+    Date.now()); git --show-toplevel is resolve()d in repoRoot/stop-verify/supabase-local (C:/ slashes on Windows);
+    runShell/runShellAsync map cmd.exe "is not recognized" (exit 1) to 127 so triage never reads a missing runner as a
+    failing test.
+  - tests: realpathSync.native (RUNNER~1 short names), core.longpaths in tmprepo, empty gitconfig file instead of
+    os.devNull, quoted Windows paths in guard-git commands, resolve() for POSIX-literal paths, platform-pinned
+    splitCommand escapes, CRLF-normalised jq, backslash-free node -e snippet, probe built per root, cmd.exe-safe
+    FAKE_CODEX_DURING_OUTPUT. Windows job timeout 45 -> 60 min (Node 20 suite alone ~36 min).
 
 ## Remaining work (in order)
 

@@ -398,7 +398,8 @@ test('step env (object or function) reaches the step', async () => {
 
 test('errorExcerpt is the last 40 lines with ANSI codes and progress redraws removed', async () => {
   const repo = await setup();
-  const js = "for(let i=1;i<=100;i++)console.log('\\\\x1b[31mline '+i+'\\\\x1b[0m');process.stdout.write('10%\\\\r50%\\\\r100% done\\\\n');process.stderr.write('\\\\x1b[1;31mFATAL\\\\x1b[0m\\\\n');process.exit(1)";
+  // No backslashes in the snippet: bash turns \\ into \ inside double quotes but cmd.exe passes both through to node.
+  const js = "const E=String.fromCharCode(27),R=String.fromCharCode(13),N=String.fromCharCode(10);for(let i=1;i<=100;i++)console.log(E+'[31mline '+i+E+'[0m');process.stdout.write('10%'+R+'50%'+R+'100% done'+N);process.stderr.write(E+'[1;31mFATAL'+E+'[0m'+N);process.exit(1)";
   await verify(repo, [], [{ name: 'noisy', cmd: nodeCmd(js), quick: false }]);
   const ex = reportOf(repo).steps[0].errorExcerpt;
   assert.doesNotMatch(ex, /\x1b|\[31m|\[0m/);

@@ -53,7 +53,8 @@ jobs:
   test-windows:
     name: test (windows)
     runs-on: windows-latest
-    timeout-minutes: 45
+    # The Node 20 suite alone takes ~36 min on windows-latest (first run, 2026-10-02).
+    timeout-minutes: 60
     steps:
       # Keep LF endings: .gitattributes pins *.mjs/*.sh to LF and fixtures to -text, and the
       # byte-exact fixture tests (diffs, .cmd quoting) depend on that.

@@ -82,11 +82,22 @@ function writeCache(file, value) {
   writeFileSync(file, `${JSON.stringify(value)}\n`);
 }
 
+// The report file's mtime before the run, or null when there is none. Freshness compares stamps rather than mtime
+// against Date.now(): Linux stamps files from a coarse clock that can trail Date.now() by a tick, so a report this
+// run wrote could look older than the run itself.
+function reportStamp(root, config) {
+  try {
+    return statSync(resolve(root, config.verify.report)).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
 // The failing step from the verify report, but only if this very run wrote it (a stale report would blame old work).
-function readReport(root, config, startedMs) {
+function readReport(root, config, stampBefore) {
   try {
     const file = resolve(root, config.verify.report);
-    if (statSync(file).mtimeMs < startedMs) return null;
+    if (stampBefore !== null && statSync(file).mtimeMs === stampBefore) return null;
     const report = JSON.parse(readFileSync(file, 'utf8'));
     const step = Array.isArray(report?.steps) ? report.steps.find((s) => s?.status === 'fail') : null;
     return step ? { step: String(step.name ?? 'unknown step'), excerpt: String(step.errorExcerpt ?? '') } : null;
@@ -98,10 +109,10 @@ function readReport(root, config, startedMs) {
 /**
  * Decide whether Claude may stop. Returns { decision: 'allow'|'block', output } where output is the JSON object to print
  * on stdout (or null for a silent allow).
- * deps (all optional, for tests): env, run (runShellAsync shape), now, timeoutMs, cacheFile, loadConfig, fingerprint.
+ * deps (all optional, for tests): env, run (runShellAsync shape), timeoutMs, cacheFile, loadConfig, fingerprint.
  */
 export async function decide(input = {}, deps = {}) {
-  const d = { env: process.env, run: runShellAsync, now: Date.now, timeoutMs: RUN_TIMEOUT_MS, ...deps };
+  const d = { env: process.env, run: runShellAsync, timeoutMs: RUN_TIMEOUT_MS, ...deps };
   try {
     return await evaluate(input ?? {}, d);
   } catch (err) {
@@ -114,7 +125,7 @@ async function evaluate(input, d) {
 
   let root;
   try {
-    root = git(['rev-parse', '--show-toplevel'], { cwd: resolve(input.cwd || process.cwd()) }).trim();
+    root = resolve(git(['rev-parse', '--show-toplevel'], { cwd: resolve(input.cwd || process.cwd()) }).trim()); // native separators on Windows
     git(['rev-parse', '--verify', '-q', 'HEAD'], { cwd: root }); // a repo with no commits has nothing to verify
   } catch {
     return allow();
@@ -132,7 +143,7 @@ async function evaluate(input, d) {
   const cached = readCache(cacheFile);
   if (cached && cached.result === 'pass' && cached.fingerprint === fingerprint) return allow();
 
-  const startedMs = d.now();
+  const stampBefore = reportStamp(root, config);
   const r = await d.run(config.verify.quick, { cwd: root, env: { PIPELINE_STOP_HOOK: '1' }, timeoutMs: d.timeoutMs });
   if (r.code === 0 && !r.timedOut) {
     writeCache(cacheFile, { fingerprint, result: 'pass', blocks: 0 });
@@ -146,7 +157,7 @@ async function evaluate(input, d) {
   try { after = (d.fingerprint ?? treeFingerprint)({ cwd: root }); } catch { /* keep the pre-run fingerprint */ }
   writeCache(cacheFile, { fingerprint: after, result: 'fail', blocks });
 
-  const report = readReport(root, config, startedMs);
+  const report = readReport(root, config, stampBefore);
   // stderr last: a crash message lands at the end, which is where the tail looks.
   const output = `${r.stdout ?? ''}\n${r.stderr ?? ''}`;
   const why = r.timedOut ? `timed out after ${Math.round(d.timeoutMs / 60_000)} min` : `exit ${r.code}`;
