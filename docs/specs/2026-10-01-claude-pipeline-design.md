@@ -231,7 +231,16 @@ Claude Code **process** env has `PIPELINE_ADMIN=1`:
   claude-pipeline `install.(mjs|sh|ps1)`, and any file-tool write whose content contains
   `PIPELINE_ADMIN`.
 - Installed **last** (after proofs and reviews). The installer itself refuses to run when
-  `CLAUDECODE=1` unless `PIPELINE_ADMIN=1` is in its process env.
+  `CLAUDECODE=1` **or any ancestor process is Claude Code** (parent-PID walk; a failed lookup falls back to the
+  env check) unless `PIPELINE_ADMIN=1` is in its process env. guard-files also denies commands that unset or
+  override `CLAUDECODE` (`env -u`, `env -i`, `unset`, assignments, `Remove-Item Env:`), that name `install.*` under
+  quote-splitting, and that set the test seams `PIPELINE_GH`/`PIPELINE_CODEX`/`PIPELINE_VERCEL`/`PIPELINE_TEST_MODE`
+  while running `pipeline.mjs`.
+
+Both hooks also judge `Monitor` and MCP tool string fields named `command`/`cmd`/`script` like Bash, read script files
+(`bash f.sh`, `source f`, `./f`, `node f.mjs`, up to 1 MB) and judge their content, unwrap string-running wrappers
+(`ssh`, `parallel`, `npx -c`, …), deny any truncated parse, and skip parsing (deny only if a guarded word appears) for
+command lines over 200 KB. Run-time push destinations are allowed only as the current-branch idioms or a literal variable.
 
 Limits stated plainly: these hooks stop accidents and casual circumvention, not a determined
 adversary (e.g. encoded payloads). GitHub branch protection is the hard boundary for `main`.

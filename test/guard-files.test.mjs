@@ -779,6 +779,10 @@ test('hook: if the policy module cannot be loaded, the keyword rule decides', (t
   const risky = runHook({ tool_name: 'Edit', tool_input: { file_path: path.join(dir, '.claude', 'x.md'), old_string: 'a', new_string: 'b' } }, { home: dir, hook: lone });
   assert.equal(JSON.parse(risky.stdout).hookSpecificOutput.permissionDecision, 'deny');
   assert.match(JSON.parse(risky.stdout).hookSpecificOutput.permissionDecisionReason, /internal error/);
+  for (const command of ['env -u CLAUDECODE node x.mjs', 'PIPELINE_GH=/tmp/g node pipeline.mjs merge 1']) {
+    const sw = runHook({ tool_name: 'Bash', tool_input: { command } }, { home: dir, hook: lone });
+    assert.equal(JSON.parse(sw.stdout).hookSpecificOutput.permissionDecision, 'deny', command);
+  }
   const plain = runHook({ tool_name: 'Edit', tool_input: { file_path: path.join(dir, 'src', 'a.ts'), old_string: 'a', new_string: 'b' } }, { home: dir, hook: lone });
   assert.equal(plain.status, 0);
   assert.equal(plain.stdout, '');

@@ -10,7 +10,7 @@ import os from 'node:os';
 const FILE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
 const SHELL_TOOLS = new Set(['Bash', 'PowerShell', 'Monitor']);
 // An internal error denies only when the raw input could be about the pipeline's own switches.
-const SENSITIVE = /\.claude|PIPELINE_ADMIN|disableAllHooks|install\./;
+const SENSITIVE = /\.claude|PIPELINE_ADMIN|disableAllHooks|install\.|CLAUDECODE|PIPELINE_(?:GH|CODEX|VERCEL|TEST_MODE)/;
 
 async function readStdin() {
   const chunks = [];

@@ -40,17 +40,41 @@ function copyFixture() {
   return dir;
 }
 
+// The installer also walks its ancestor processes with `ps`. The tests may themselves run inside Claude Code, so every
+// child gets a fake `ps` first on PATH that answers from FAKE_PS_TABLE (pid -> {ppid, comm, args}); a pid it does not
+// know is a plain shell whose parent is init, i.e. no Claude Code ancestor. (Windows asks PowerShell instead: not faked.)
+const FAKE_PS_DIR = (() => {
+  if (process.platform === 'win32') return null;
+  const dir = scratch('cp-fakeps');
+  const file = join(dir, 'ps');
+  writeFileSync(file, [
+    '#!/usr/bin/env node',
+    "const args = process.argv.slice(2);",
+    "if (process.env.FAKE_PS_FAIL) process.exit(1);",
+    "const table = JSON.parse(process.env.FAKE_PS_TABLE || '{}');",
+    "const pid = args[args.length - 1];",
+    "const row = table[pid] ?? { ppid: 1, comm: 'zsh', args: 'zsh' };",
+    "console.log(args.includes('args=') ? row.args ?? row.comm : `${row.ppid} ${row.comm}`);",
+  ].join('\n'));
+  chmodSync(file, 0o755);
+  return dir;
+})();
+
 // The child must not inherit CLAUDECODE (the tests may themselves run inside Claude Code), nor the real HOME.
-function run(args, { env = {}, script = INSTALL, command = process.execPath, lead = [] } = {}) {
+function run(args, { env = {}, script = INSTALL, command = process.execPath, lead = [], psTable } = {}) {
   const userHome = scratch('cp-userhome');
   const childEnv = { ...process.env, HOME: userHome, USERPROFILE: userHome, PIPELINE_INSTALL_NO_PROBES: '1' };
-  for (const k of ['CLAUDECODE', 'PIPELINE_ADMIN', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_SUBAGENT_MODEL']) delete childEnv[k];
+  for (const k of ['CLAUDECODE', 'PIPELINE_ADMIN', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_SUBAGENT_MODEL', 'FAKE_PS_TABLE', 'FAKE_PS_FAIL']) delete childEnv[k];
+  if (FAKE_PS_DIR) {
+    childEnv.PATH = `${FAKE_PS_DIR}${delimiter}${childEnv.PATH ?? process.env.PATH}`;
+    if (psTable) childEnv.FAKE_PS_TABLE = JSON.stringify(psTable);
+  }
   Object.assign(childEnv, env);
   const r = spawnSync(command, [...lead, script, ...args], { encoding: 'utf8', env: childEnv, timeout: 60000 });
   return { status: r.status, stdout: r.stdout, stderr: r.stderr, userHome };
 }
-function install(home, extra = [], { source = FIXTURE, env } = {}) {
-  return run(['--claude-home', home, '--source', source, ...extra], { env });
+function install(home, extra = [], { source = FIXTURE, env, psTable } = {}) {
+  return run(['--claude-home', home, '--source', source, ...extra], { env, psTable });
 }
 const readJson = (p) => JSON.parse(readFileSync(p, 'utf8'));
 const settingsPath = (home) => join(home, 'settings.json');
@@ -309,6 +333,36 @@ test('inside Claude Code (CLAUDECODE=1) the installer refuses unless PIPELINE_AD
 
   const check = install(home, ['--check'], { env: { CLAUDECODE: '1' } });
   assert.equal(check.status, 0, check.stdout + check.stderr);
+});
+
+test('inside Claude Code means CLAUDECODE or a Claude Code ancestor process: stripping the variable does not help', { skip: process.platform === 'win32' }, () => {
+  const home = newHome();
+  // the child's parent is this test process; put Claude Code three hops above it
+  const withClaude = { [process.pid]: { ppid: 7001, comm: 'node' }, 7001: { ppid: 7002, comm: '/bin/zsh' }, 7002: { ppid: 7003, comm: '/Users/u/.local/bin/claude' }, 7003: { ppid: 1, comm: 'login' } };
+  const blocked = install(home, [], { psTable: withClaude });
+  assert.equal(blocked.status, 2, blocked.stderr);
+  assert.match(blocked.stderr, /ancestor/);
+  assert.match(blocked.stderr, /PIPELINE_ADMIN=1/);
+  assert.equal(existsSync(home), false, 'nothing written');
+  assert.equal(install(home, ['--uninstall'], { psTable: withClaude }).status, 2);
+
+  // Claude Code as a node script
+  const viaNode = { [process.pid]: { ppid: 7001, comm: '/usr/bin/node', args: 'node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js' }, 7001: { ppid: 1, comm: 'sh' } };
+  assert.equal(install(home, [], { psTable: { [process.pid]: { ppid: 7001, comm: 'zsh' }, 7001: viaNode[process.pid] } }).status, 2);
+
+  // the owner's switch and --check still work
+  assert.equal(install(home, ['--check'], { psTable: withClaude }).status, 1, '--check is allowed (nothing installed is drift)');
+  const ok = install(home, [], { psTable: withClaude, env: { PIPELINE_ADMIN: '1' } });
+  assert.equal(ok.status, 0, ok.stderr);
+});
+
+test('the ancestor check falls back to the environment check when the process lookup fails, and ignores a plain terminal', { skip: process.platform === 'win32' }, () => {
+  const lookupFails = install(newHome(), [], { env: { FAKE_PS_FAIL: '1' } });
+  assert.equal(lookupFails.status, 0, lookupFails.stderr);
+  const stillEnvBlocked = install(newHome(), [], { env: { FAKE_PS_FAIL: '1', CLAUDECODE: '1' } });
+  assert.equal(stillEnvBlocked.status, 2);
+  const terminal = { [process.pid]: { ppid: 7001, comm: 'zsh' }, 7001: { ppid: 7002, comm: 'Terminal' }, 7002: { ppid: 1, comm: 'launchd' } };
+  assert.equal(install(newHome(), [], { psTable: terminal }).status, 0);
 });
 
 // 8
@@ -588,7 +642,7 @@ test('tool versions are probed with a timeout and reported; a missing tool never
   writeFileSync(join(bin, 'gh'), '#!/bin/sh\nexit 127\n');
   chmodSync(join(bin, 'gh'), 0o755);
   const home = newHome();
-  const r = install(home, ['--json'], { env: { PIPELINE_INSTALL_NO_PROBES: '', PATH: `${bin}${delimiter}${process.env.PATH}` } });
+  const r = install(home, ['--json'], { env: { PIPELINE_INSTALL_NO_PROBES: '', PATH: `${bin}${delimiter}${FAKE_PS_DIR}${delimiter}${process.env.PATH}` } });
   assert.equal(r.status, 0, r.stderr);
   const v = JSON.parse(r.stdout).diagnostics.versions;
   assert.match(v.claude, /2\.1\.285/);
