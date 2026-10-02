@@ -29,12 +29,12 @@ If `P risk` said `lightLane: true` and Codex returned no BLOCKING and no SUGGEST
 ### 3. Judge
 
 Compute a digest: `shasum -a 256 .review/round-N/codex.json` (first 8 chars = `<d8>`). Invoke the
-`judge` agent — **no `model` parameter** — with `description: "pipeline-judge RN <d8>"` and a
+`judge` agent — **no `model` parameter** — with `description: "pipeline-judge R<N> <d8>"` (e.g. `pipeline-judge R2 1a2b3c4d`) and a
 prompt containing: absolute worktree path; paths `.review/round-N/codex.json` and
 `.review/round-N/diff.patch`; PR title + 3-line summary; risk level; "items marked as ruled in
 codex.json are not yours to decide". Then:
-`P triage validate --round N --from-tag "pipeline-judge RN <d8>"` — parses the judge's JSON from
-its transcript, validates every id, applies decisions. Invalid ⇒ re-invoke the judge once with
+`P triage validate --round N --from-tag "pipeline-judge R<N> <d8>"` — finds the judge's transcript by
+that Agent description, parses its JSON, validates every id, applies decisions. Invalid ⇒ re-invoke the judge once with
 the validation errors; invalid again ⇒ `needs-human`.
 
 ### 4. Settle disputed bugs with tests
@@ -48,9 +48,10 @@ A failing test makes the item ACCEPT (fix it in step 6, keeping the test).
 
 ### 5. Arbiter (at most one call per round)
 
-`P arbiter needed --round N` → `{needed, items, inputPath, digest}`.
+`P arbiter needed --round N` → `{needed, items, inputPath, digest, digest8, tag}`; `tag` is
+`pipeline-arbiter R<N> <digest8>`.
 If `needed`: invoke the `arbiter` agent — **no `model` parameter** — with
-`description: "pipeline-arbiter RN <digest8>"` and a prompt whose first lines are exactly
+`description: <the tag from arbiter needed>` (`pipeline-arbiter R<N> <digest8>`) and a prompt whose first lines are exactly
 ```
 ROUND: N
 INPUT-DIGEST: <digest>
@@ -58,8 +59,8 @@ Read <absolute path to .review/round-N/arbiter-input.md> and rule on every item 
 ```
 (Proof switch: if `PIPELINE_ARBITER_MODEL_OVERRIDE` is set, pass that value as `model` and say
 so in the PR body — see `proof-switches.md`.)
-Then `P arbiter apply --round N --tag "pipeline-arbiter RN <digest8>"`. It locates the
-transcript, proves every assistant message is `claude-fable-*` at effort `high` with no API
+Then `P arbiter apply --round N --tag "pipeline-arbiter R<N> <digest8>"` (the same tag). It locates the
+subagent transcript by that Agent description, proves every assistant message is `claude-fable-*` at effort `high` with no API
 error, checks ROUND/digest, parses the rulings from the final message, and applies them. Exit 1
 ⇒ the round's arbitrated items are already marked `needsHuman` (reason `model-proof`); continue
 to the end of the round, then stop with `needs-human`.
@@ -75,10 +76,12 @@ permissions / data-integrity / data-loss item ⇒ `needsHuman` (the CLI applies 
 - FOLLOW-UP: `P followups create --round N` (one issue each, label `agent-suggestion`).
 - REJECT: nothing (listed in the summary with the reason).
 - `P comment --pr <N> --kind triage` (one comment, updated in place each round).
+- Clean exit: `P review-complete --pr <N>` is only for the resume path (it removes `awaiting-review` after a
+  valid review); the normal loop ends at step 7.
 
 ### 7. Exit check
 
-`P state outcome` →
+`P state outcome` (exit 0 whether or not clean; read `clean`) →
 - `clean` (no open BLOCKING, no new ACCEPTED this round, nothing `needsHuman`, and review
   coverage matches the current content hash) ⇒ leave the loop.
 - `needsHuman` non-empty ⇒ label `needs-human`, summary, stop.

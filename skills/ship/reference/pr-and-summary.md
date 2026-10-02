@@ -29,7 +29,7 @@ Hard-stops: <none | list of rule + file>
 
 ## Screenshots
 
-`P artifacts push --pr-branch agent/<slug> --dir .verify/screenshots` commits the images to the
+`P artifacts push --pr <N> --dir .verify/screenshots` (so the PR must already exist) commits the images to the
 orphan branch `pipeline-artifacts` under `pr-<N>/` (never `main`) and returns markdown
 image links (`https://github.com/<o>/<r>/blob/pipeline-artifacts/pr-<N>/<file>?raw=true`),
 which render for anyone who can see the private repo.
@@ -60,4 +60,5 @@ superseded|awaiting-review> --built "<2–3 sentences>"` renders, in this order:
 - Final gate start: `P agent-log stage --pr <N>` appends this run's line (outcome `merged —
   prod smoke pending`) plus any queued lines to `docs/agent-log.md` in the PR branch and commits.
 - Runs that don't merge and post-deploy outcomes: `P agent-log queue --line "<line>"` (stored in
-  the git common dir, flushed into the next ship PR).
+  the git common dir). There is no separate flush: the next `P agent-log stage` writes every queued
+  line into that PR's log together with its own and clears the queue.

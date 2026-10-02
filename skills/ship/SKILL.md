@@ -74,8 +74,9 @@ comes from `P risk` on the real diff; the higher wins).
 
 1. `git push -u origin agent/<slug>`.
 2. `P risk --base origin/<default_branch> --head HEAD` and `P hardstops --base … --head HEAD`.
-3. UI change ⇒ `P artifacts push --pr-branch agent/<slug> --dir .verify/screenshots` (returns
-   markdown image links) after the PR exists, then edit the body.
+3. UI change ⇒ after the PR exists (you need its number): `P artifacts push --pr N --dir
+   .verify/screenshots` (pushes the images to the `pipeline-artifacts` branch, never your worktree;
+   returns markdown image links), then edit the PR body.
 4. `gh pr create` (add `--draft` if `ci.draft_while_iterating`) with the body from
    `reference/pr-and-summary.md`: what & why, verify summary (step table + head sha), tests added,
    screenshots, risk level + reasons, hard-stop hits.
@@ -87,10 +88,13 @@ comes from `P risk` on the real diff; the higher wins).
 ## Step 4 — review loop
 
 Follow `reference/review-loop.md` exactly. In short, per round N (max `review.max_rounds`):
-Codex (`P codex-review` as a job) → judge (`judge` agent, no model param) → settle disputed bugs
+Codex (`P codex-review --pr N --round R …` as a job; light lane with nothing but WORTH CONSIDERING items ⇒
+`P triage light-lane --round R` and skip the judge) → judge (`judge` agent, no model param; `P triage validate
+--round R --from-tag "pipeline-judge R<N> <d8>"`) → settle disputed bugs
 with tests (implementer) → arbiter if `P arbiter needed` says so (`arbiter` agent, no model
-param, one batched call) → `P arbiter apply` (proves Fable from the transcript) → implement
-ACCEPTED items (implementer + verifier full verify) → `P followups create` for FOLLOW-UP →
+param, one batched call) → `P arbiter apply --round R --tag "pipeline-arbiter R<N> <digest8>"` (proves Fable from the subagent
+transcript; the tag is the Agent call's description) → implement
+ACCEPTED items (implementer + verifier full verify) → `P followups create --round N` for FOLLOW-UP →
 `P comment --pr N --kind triage`. Exit when `P state outcome` says `clean`. Not clean after the
 last round, or any item `needsHuman` ⇒ label `needs-human`, summary, stop.
 Codex exit 3 at any point ⇒ `gh pr edit N --add-label awaiting-review`, `P comment --pr N --kind
@@ -132,7 +136,7 @@ the worktree when the PR is merged or closed (`git worktree remove`).
 `P resume list` → for each PR (or the one given): check out its branch in a worktree, `P
 preflight`, rebuild state (`P state show --pr N` recovers it from the triage comment if
 `.review/` is gone), continue at Step 4 from the first incomplete round. After a clean review,
-`P review-complete --pr N` removes `awaiting-review`; then Steps 5–7.
+`P review-complete --pr N` removes `awaiting-review` (exit 1 ⇒ the review is not valid for this head: run another round); then Steps 5–7.
 
 ## Promoting suggestions
 
