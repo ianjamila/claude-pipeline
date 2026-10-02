@@ -23,7 +23,9 @@ export const DEFAULTS = deepFreeze({
   verify: { report: '.verify/report.json', screenshots: '.verify/screenshots' },
   // guard_checks: the tamper-proof "Test integrity" and "Hard-stop scan" statuses are always required on top of
   // required_checks. false only for a repo that does not run the pipeline-guards workflow (e.g. this one).
-  ci: { required_checks: [], e2e_label: null, draft_while_iterating: false, guard_checks: true },
+  // approvers: GitHub logins whose approval labels (human-approved, test-change-approved) count. Empty = the repo owner,
+  // which only exists for user-owned repos: an org-owned repo MUST list its approvers.
+  ci: { required_checks: [], e2e_label: null, draft_while_iterating: false, guard_checks: true, approvers: [] },
   // {sha} is required: the approved head is passed to the merge so a head that moved after review can never merge.
   merge: { command: 'gh pr merge {pr} --squash --auto --delete-branch --match-head-commit {sha}', wait_minutes: 15 },
   preview: null,
@@ -65,7 +67,7 @@ const PROVIDERS = ['vercel', 'github-deployments', 'other'];
 const KEYS = {
   top: [...Object.keys(DEFAULTS), 'project'],
   verify: ['full', 'quick', 'report', 'screenshots', 'expected_steps'],
-  ci: ['required_checks', 'e2e_label', 'draft_while_iterating', 'guard_checks'],
+  ci: ['required_checks', 'e2e_label', 'draft_while_iterating', 'guard_checks', 'approvers'],
   merge: ['command', 'wait_minutes'],
   preview: ['environment', 'smoke', 'provider'],
   production: ['url', 'provider', 'environment', 'smoke', 'deploy_timeout_minutes', 'rollback'],
@@ -285,6 +287,9 @@ export function validateConfig(obj) {
     checkStrArray(ci.required_checks, 'ci.required_checks', errors);
     if (ci.e2e_label !== null && typeof ci.e2e_label !== 'string') errors.push('ci.e2e_label must be a string or null');
     if (typeof ci.draft_while_iterating !== 'boolean') errors.push('ci.draft_while_iterating must be a boolean');
+    if (!Array.isArray(ci.approvers) || !ci.approvers.every((l) => typeof l === 'string' && /^[A-Za-z0-9][A-Za-z0-9-]*(\[bot\])?$/.test(l))) {
+      errors.push('ci.approvers must be an array of GitHub logins');
+    }
     if (typeof ci.guard_checks !== 'boolean') errors.push('ci.guard_checks must be a boolean');
     else if (ci.guard_checks && isStrArray(ci.required_checks)) {
       const missing = GUARD_CHECKS.filter((g) => !ci.required_checks.includes(g));

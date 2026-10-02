@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { run as procRun } from '../pipeline/lib/proc.mjs';
-import { project, runNode, scratchDir } from './helpers/project.mjs';
+import { CONFIG, project, runNode, scratchDir } from './helpers/project.mjs';
 
 const fakeGh = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'fake-gh-seq.mjs');
 const REPO = 'acme/app';
@@ -344,4 +344,46 @@ test('pipeline-guards.yml re-evaluates a PR whose base changed (edited), but ign
   // The orchestrator takes the base from the event payload, which after a retarget holds the NEW base.
   assert.match(yml, /BASE_SHA: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
   assert.match(yml, /ref: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
+});
+
+// ---- who may approve: ci.approvers, the owner of a user repo, never an org name -----------------------------------------
+
+const APPROVERS = { config: CONFIG(undefined, 'ci:\n  approvers: [alice, "Bob"]\n') };
+
+test('ci.approvers: a listed login (any case) approves; the repo owner does NOT when the list exists; others are ignored', async () => {
+  const s = await setup(addDrop, APPROVERS);
+  const alice = await exec(s, { labels: ['human-approved'], events: [owner(T('10:05'), 'human-approved', 'Alice')] }, { OWNER_TYPE: 'Organization' });
+  assert.equal(alice.byContext('Hard-stop scan').state, 'success');
+  assert.deepEqual(alice.json.approvals.valid, ['human-approved']);
+  const bob = await exec(s, { labels: ['human-approved'], events: [owner(T('10:05'), 'human-approved', 'bob')] }, { OWNER_TYPE: 'Organization' });
+  assert.equal(bob.byContext('Hard-stop scan').state, 'success');
+  const ownerOnly = await exec(s, { labels: ['human-approved'], events: [owner(T('10:05'))] }, { OWNER_TYPE: 'User' });
+  assert.equal(ownerOnly.byContext('Hard-stop scan').state, 'failure');
+  assert.match(ownerOnly.byContext('Hard-stop scan').description, /not applied by a login listed in ci\.approvers/);
+  assert.equal(ownerOnly.json.approvals.ignored[0].reason, 'not-approver');
+});
+
+test('org-owned repo with no ci.approvers fails closed with a clear reason, even if the actor is called like the org', async () => {
+  const s = await setup(addDrop);
+  const r = await exec(s, { labels: ['human-approved'], events: [owner(T('10:05'))] }, { OWNER_TYPE: 'Organization' });
+  assert.equal(r.byContext('Hard-stop scan').state, 'failure');
+  assert.match(r.byContext('Hard-stop scan').description, /org-repo-needs-ci\.approvers/);
+  assert.equal(r.json.approvals.ignored[0].reason, 'org-repo-needs-ci.approvers');
+  assert.equal(r.deletes.length, 1);
+});
+
+test('user-owned repo with no list keeps the owner rule (OWNER_TYPE User, or unset for old workflows)', async () => {
+  const s = await setup(addDrop);
+  for (const env of [{ OWNER_TYPE: 'User' }, {}]) {
+    const r = await exec(s, { labels: ['human-approved'], events: [owner(T('10:05'))] }, env);
+    assert.equal(r.byContext('Hard-stop scan').state, 'success', JSON.stringify(env));
+  }
+});
+
+test('an unreadable config with an approval label present is an internal error (statuses are left for the fail-closed step)', async () => {
+  const s = await setup(addDrop);
+  s.repo.write('.claude/pipeline.yml', 'version: 1\n');
+  const r = await exec(s, { labels: ['human-approved'], events: [owner(T('10:05'))] });
+  assert.notEqual(r.code, 0);
+  assert.equal(r.posts.length, 0);
 });

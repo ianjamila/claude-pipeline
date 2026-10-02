@@ -6,11 +6,16 @@
 // Everything is re-derived from the GitHub API on every run, so it does not depend on which event woke the workflow.
 // The verdict lives in the statuses: exit 0 after publishing (even for "failure"), exit 1 only on an internal error
 // (the workflow's `if: failure()` step then marks anything still pending as `error`).
-// Env: GH_TOKEN, REPO (owner/name), PR_NUMBER, EVENT_HEAD, BASE_SHA, RUN_URL, GITHUB_STEP_SUMMARY.
+// Who may approve: the logins in .claude/pipeline.yml ci.approvers; with no list, the repo owner of a USER-owned repo. An
+// org-owned repo with no list fails closed (every approval ignored, reason org-repo-needs-ci.approvers), because an org
+// name is never the login of whoever applies a label.
+// Env: GH_TOKEN, REPO (owner/name), PR_NUMBER, EVENT_HEAD, BASE_SHA, RUN_URL, GITHUB_STEP_SUMMARY, OWNER_TYPE (optional:
+// github.event.repository.owner.type, "User" | "Organization"; unset keeps the owner-login rule).
 // Vendored into projects by `pipeline vendor` (imports ./lib/* and ./ci-guard.mjs).
 import { appendFileSync, realpathSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { HARDSTOP_LABEL, INTEGRITY_LABEL, MAX_DESCRIPTION, clip, runCheck } from './ci-guard.mjs';
+import { loadConfig } from './lib/config.mjs';
 import { git, revParse } from './lib/git.mjs';
 import { gh as defaultGh, GhError } from './lib/proc.mjs';
 
@@ -20,6 +25,8 @@ const APPROVAL_CHECK = { [INTEGRITY_LABEL]: 'integrity', [HARDSTOP_LABEL]: 'hard
 const NOTES = {
   predates: 'approval predates the latest commit — re-apply',
   'not-owner': 'approval ignored: label not applied by the repo owner',
+  'not-approver': 'approval ignored: label not applied by a login listed in ci.approvers',
+  'org-repo-needs-ci.approvers': 'approval ignored: org-owned repo, list the approvers in ci.approvers (org-repo-needs-ci.approvers)',
   'no-event': 'approval ignored: no labeling event found',
   'no-head-time': 'approval ignored: cannot tell when the commit appeared',
 };
@@ -44,7 +51,8 @@ function readEnv(env) {
   if (!/^[1-9][0-9]*$/.test(pr)) throw new Error(`PR_NUMBER is not a number: ${pr}`);
   if (!/^[0-9a-f]{40}$/.test(head)) throw new Error(`EVENT_HEAD is not a full commit sha: ${head}`);
   if (!/^[0-9a-f]{40}$/.test(base)) throw new Error(`BASE_SHA is not a full commit sha: ${base}`);
-  return { repo, pr, head, base, runUrl: env.RUN_URL ? String(env.RUN_URL).trim() : '', owner: repo.split('/')[0].toLowerCase() };
+  const ownerType = env.OWNER_TYPE ? String(env.OWNER_TYPE).trim() : '';
+  return { repo, pr, head, base, runUrl: env.RUN_URL ? String(env.RUN_URL).trim() : '', owner: repo.split('/')[0].toLowerCase(), ownerType };
 }
 
 /**
@@ -52,7 +60,7 @@ function readEnv(env) {
  * deps (tests): gh (proc.gh shape), check (passed to ci-guard runCheck).
  */
 export async function runOrchestrator({ env = process.env, cwd = process.cwd(), deps = {} } = {}) {
-  const { repo, pr, head, base, runUrl, owner } = readEnv(env);
+  const { repo, pr, head, base, runUrl, owner, ownerType } = readEnv(env);
   const ghFn = deps.gh ?? defaultGh;
 
   const api = (args) => {
@@ -86,6 +94,11 @@ export async function runOrchestrator({ env = process.env, cwd = process.cwd(), 
   async function resolveApprovals(labels) {
     const present = Object.keys(APPROVAL_CHECK).filter((l) => labels.includes(l));
     if (present.length === 0) return { valid: [], invalid: [], headSeenAt: null };
+    // Only read when an approval label is actually present. An unreadable config is an internal error (fail closed).
+    const loaded = await (deps.loadConfig ?? loadConfig)(cwd);
+    if (!loaded.ok) throw new Error(`invalid or missing .claude/pipeline.yml: ${loaded.errors.join('; ')}`);
+    const approvers = (loaded.config.ci?.approvers ?? []).map((l) => l.toLowerCase());
+    const orgWithoutList = approvers.length === 0 && ownerType !== '' && ownerType !== 'User';
     const stamps = [
       ...lines(api([`repos/${repo}/commits/${head}/check-suites`, '--paginate', '--jq', '.check_suites[].created_at'])),
       ...lines(api([`repos/${repo}/commits/${head}/statuses`, '--paginate', '--jq', '.[].created_at'])),
@@ -103,9 +116,11 @@ export async function runOrchestrator({ env = process.env, cwd = process.cwd(), 
         .filter((e) => e.label === label && Number.isFinite(Date.parse(e.at)))
         .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0];
       let reason = null;
-      if (headSeenAt === null) reason = 'no-head-time';
+      const actor = String(latest?.actor ?? '').toLowerCase();
+      if (orgWithoutList) reason = 'org-repo-needs-ci.approvers';
+      else if (headSeenAt === null) reason = 'no-head-time';
       else if (!latest) reason = 'no-event';
-      else if (String(latest.actor ?? '').toLowerCase() !== owner) reason = 'not-owner';
+      else if (approvers.length > 0 ? !approvers.includes(actor) : actor !== owner) reason = approvers.length > 0 ? 'not-approver' : 'not-owner';
       else if (!(Date.parse(latest.at) > headSeenAt)) reason = 'predates';
       if (reason) invalid.push({ label, reason });
       else valid.push(label);

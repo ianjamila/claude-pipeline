@@ -552,3 +552,12 @@ test('required_checks that omit the guard contexts WARN (not fail); guard_checks
   assert.deepEqual(validateConfig({ ...minimal(), ci: { required_checks: ['build'], guard_checks: false } }).warnings, []);
   assert.match(validateConfig({ ...minimal(), ci: { required_checks: ['Test integrity'] } }).warnings[0], /"Hard-stop scan"/);
 });
+
+test('ci.approvers: defaults to [], accepts GitHub logins (incl. bots), rejects anything else', () => {
+  assert.deepEqual(validateConfig(minimal()).config.ci.approvers, []);
+  assert.equal(validateConfig({ ...minimal(), ci: { approvers: ['alice', 'Bob-2', 'dependabot[bot]'] } }).ok, true);
+  for (const bad of ['alice', [''], ['a b'], [1], ['-x'], ['a/b']]) {
+    const r = validateConfig({ ...minimal(), ci: { approvers: bad } });
+    assert.ok(has(r, 'ci.approvers must be an array of GitHub logins'), JSON.stringify(bad));
+  }
+});

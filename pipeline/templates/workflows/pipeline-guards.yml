@@ -36,6 +36,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
+      OWNER_TYPE: ${{ github.event.repository.owner.type }}   # User | Organization: who may approve (ci.approvers)
       PR_NUMBER: ${{ github.event.pull_request.number }}
       EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
       BASE_SHA: ${{ github.event.pull_request.base.sha }}
