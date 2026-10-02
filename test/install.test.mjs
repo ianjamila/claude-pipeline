@@ -15,7 +15,7 @@ import { join, dirname, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   mergeSettings, removeOurSettings, isOurHandler, ourAllowEntries, renameWithRetry, collectDiagnostics,
-  shellRcPaths, parseArgs, buildPlan, walkFiles, safeManifestKey, GUARD_FILES_MATCHER,
+  shellRcPaths, parseArgs, buildPlan, walkFiles, safeManifestKey, GUARD_FILES_MATCHER, GUARD_GIT_MATCHER,
 } from '../pipeline/lib/installer.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -63,7 +63,7 @@ function writeSettings(home, obj) {
 }
 
 const guardGit = (home) => ({
-  matcher: 'Bash',
+  matcher: 'Bash|PowerShell',
   hooks: [{ type: 'command', command: 'node', args: [join(home, 'pipeline', 'hooks', 'guard-git.mjs')], timeout: 15 }],
 });
 const guardFiles = (home) => ({
@@ -72,6 +72,7 @@ const guardFiles = (home) => ({
 });
 const allowEntries = (home) => [
   `Bash(node ${posix(home)}/pipeline/bin/pipeline.mjs:*)`,
+  ...(/\s/.test(home) ? [`Bash(node "${posix(home)}/pipeline/bin/pipeline.mjs":*)`] : []),
   'Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)',
 ];
 
@@ -193,7 +194,7 @@ test('a second install changes nothing: settings, manifest files and hooks are i
   assert.deepEqual(readSettings(home), JSON.parse(s1));
   assert.deepEqual(readManifest(home).files, m1.files);
   const s = readSettings(home);
-  assert.equal(s.hooks.PreToolUse.filter((g) => g.hooks.some(isOurHandler)).length, 2);
+  assert.equal(s.hooks.PreToolUse.filter((g) => g.hooks.some((h) => isOurHandler(h, home))).length, 2);
   for (const e of allowEntries(home)) assert.equal(s.permissions.allow.filter((x) => x === e).length, 1);
   const report = JSON.parse(r2.stdout);
   assert.equal(report.files.copied, 0, 'identical units are not rewritten');
@@ -419,7 +420,7 @@ test('--uninstall removes our files, hooks and allow entries, keeps everything e
   assert.deepEqual(readSettings(home), before, 'settings are back to exactly the owner\'s original');
   assert.equal(readdirSync(join(home, 'backups')).length, backupsAfterInstall + 1, 'uninstall backed up settings first');
   const last = readdirSync(join(home, 'backups')).sort().at(-1);
-  assert.ok(readJson(join(home, 'backups', last)).hooks.PreToolUse.some((g) => g.hooks.some(isOurHandler)), 'the backup holds the pre-uninstall settings');
+  assert.ok(readJson(join(home, 'backups', last)).hooks.PreToolUse.some((g) => g.hooks.some((h) => isOurHandler(h, home))), 'the backup holds the pre-uninstall settings');
 
   assert.equal(install(home, ['--check']).status, 1, 'no longer installed');
   assert.equal(install(home, ['--uninstall']).status, 0, 'uninstalling twice is harmless');
@@ -539,7 +540,7 @@ test('a settings.json that is a symlink stays a symlink and its target is update
   symlinkSync(real, settingsPath(home));
   assert.equal(install(home).status, 0);
   assert.ok(lstatSync(settingsPath(home)).isSymbolicLink());
-  assert.ok(readJson(real).hooks.PreToolUse.some((g) => g.hooks.some(isOurHandler)));
+  assert.ok(readJson(real).hooks.PreToolUse.some((g) => g.hooks.some((h) => isOurHandler(h, home))));
 });
 
 test('an existing settings.json keeps its file mode', { skip: process.platform === 'win32' }, () => {
@@ -658,7 +659,7 @@ test('mergeSettings on an empty object builds the minimal structure; skipFileGua
   assert.deepEqual(full.permissions.allow, ['Bash(node /h/.claude/pipeline/bin/pipeline.mjs:*)', 'Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)']);
   const partial = mergeSettings({}, { home: '/h/.claude', skipFileGuard: true });
   assert.equal(partial.hooks.PreToolUse.length, 1);
-  assert.equal(partial.hooks.PreToolUse[0].matcher, 'Bash');
+  assert.equal(partial.hooks.PreToolUse[0].matcher, 'Bash|PowerShell');
 });
 
 test('mergeSettings writes native Windows paths in args and a posix path in the allow entry', () => {
@@ -675,8 +676,9 @@ test('mergeSettings writes native Windows paths in args and a posix path in the 
 test('isOurHandler matches the pipeline hooks dir in command or args, either slash direction', () => {
   assert.equal(isOurHandler({ command: 'node /a/.claude/pipeline/hooks/guard-git.mjs' }), true);
   assert.equal(isOurHandler({ command: 'node "C:\\Users\\u\\.claude\\pipeline\\hooks\\guard-files.mjs"' }), true);
-  assert.equal(isOurHandler({ command: 'node', args: ['/custom home/pipeline/hooks/guard-git.mjs'] }), true);
-  assert.equal(isOurHandler({ command: 'node', args: ['D:\\x y\\pipeline\\hooks\\guard-files.mjs'] }), true);
+  assert.equal(isOurHandler({ command: 'node', args: ['/custom home/pipeline/hooks/guard-git.mjs'] }, '/custom home'), true);
+  assert.equal(isOurHandler({ command: 'node', args: ['D:\\x y\\pipeline\\hooks\\guard-files.mjs'] }, 'D:\\x y'), true);
+  assert.equal(isOurHandler({ command: 'node "/custom home/pipeline/hooks/guard-git.mjs"' }, '/custom home/'), true);
   assert.equal(isOurHandler({ command: 'node /opt/memory-guard.js' }), false);
   assert.equal(isOurHandler({ command: 'echo pipeline hooks' }), false);
   assert.equal(isOurHandler(null), false);
@@ -831,4 +833,145 @@ test('shellRcPaths: POSIX rc files everywhere, PowerShell profiles on win32', ()
   const d = collectDiagnostics({ settings: {}, env: {}, home, platform: 'win32', runFn: null });
   assert.equal(d.subagentModel.shellFiles.length, 1);
   assert.equal(d.subagentModel.shellFiles[0].line, 1);
+});
+
+// ---- review findings (task 4.1 fixes) ------------------------------------------------------------------------
+
+test('guard-git matches Bash and PowerShell, guard-files stays last with its wider matcher; both come from constants', () => {
+  assert.equal(GUARD_GIT_MATCHER, 'Bash|PowerShell');
+  const out = mergeSettings({}, { home: '/h/.claude' });
+  assert.deepEqual(out.hooks.PreToolUse.map((g) => g.matcher), ['Bash|PowerShell', GUARD_FILES_MATCHER]);
+  const skip = mergeSettings({}, { home: '/h/.claude', skipFileGuard: true });
+  assert.deepEqual(skip.hooks.PreToolUse.map((g) => g.matcher), ['Bash|PowerShell']);
+
+  // --check treats the old Bash-only matcher as drift (the hook would never fire on PowerShell)
+  const home = newHome();
+  assert.equal(install(home).status, 0);
+  assert.equal(run(['--check', '--claude-home', home, '--source', FIXTURE]).status, 0);
+  const s = readSettings(home);
+  s.hooks.PreToolUse[0].matcher = 'Bash';
+  writeSettings(home, s);
+  const r = run(['--check', '--claude-home', home, '--source', FIXTURE]);
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /guard-git entry is not what install writes/);
+});
+
+test('a user hook under some other /pipeline/hooks/guard-*.mjs survives install and uninstall', () => {
+  const home = newHome();
+  const userGroup = { matcher: 'Bash', hooks: [{ type: 'command', command: 'node /proj/pipeline/hooks/guard-secrets.mjs' }] };
+  const userGroup2 = { matcher: 'Bash', hooks: [{ type: 'command', command: 'node', args: ['/work/app/pipeline/hooks/guard-git.mjs'] }] };
+  const before = { hooks: { PreToolUse: [userGroup, userGroup2] } };
+  assert.equal(isOurHandler(userGroup.hooks[0], home), false);
+  assert.equal(isOurHandler(userGroup2.hooks[0], home), false);
+  writeSettings(home, before);
+  assert.equal(install(home).status, 0);
+  assert.deepEqual(readSettings(home).hooks.PreToolUse, [userGroup, userGroup2, guardGit(home), guardFiles(home)]);
+  assert.equal(install(home).status, 0);
+  assert.equal(readSettings(home).hooks.PreToolUse.length, 4, 'a second install does not add or drop anything');
+  assert.equal(run(['--uninstall', '--claude-home', home]).status, 0);
+  assert.deepEqual(readSettings(home), before);
+});
+
+test('reinstall keeps a user-edited skill (modified file plus an extra one) in backups/<name>.<timestamp>', () => {
+  const home = newHome();
+  assert.equal(install(home).status, 0);
+  writeFileSync(join(home, 'skills', 'ship', 'SKILL.md'), 'my tuned skill\n');
+  writeFileSync(join(home, 'skills', 'ship', 'extra.md'), 'my notes\n');
+  writeFileSync(join(home, 'agents', 'judge.md'), 'my judge\n');
+  const r = install(home, ['--json']);
+  assert.equal(r.status, 0, r.stderr);
+  const report = JSON.parse(r.stdout);
+  assert.equal(report.editBackups.length, 2);
+  const backups = readdirSync(join(home, 'backups'));
+  const shipBackup = backups.find((n) => /^ship\.\d{8}T\d{6}Z/.test(n));
+  const judgeBackup = backups.find((n) => /^judge\.md\.\d{8}T\d{6}Z/.test(n));
+  assert.ok(shipBackup && judgeBackup, backups.join(', '));
+  assert.equal(readFileSync(join(home, 'backups', shipBackup, 'SKILL.md'), 'utf8'), 'my tuned skill\n');
+  assert.equal(readFileSync(join(home, 'backups', shipBackup, 'extra.md'), 'utf8'), 'my notes\n');
+  assert.equal(readFileSync(join(home, 'backups', judgeBackup), 'utf8'), 'my judge\n');
+  assert.ok(report.editBackups.every((b) => b.backup.startsWith(join(home, 'backups'))));
+  // the install itself is repaired, and the human report names the backup
+  assert.equal(readFileSync(join(home, 'skills', 'ship', 'SKILL.md'), 'utf8'), readFileSync(join(FIXTURE, 'skills', 'ship', 'SKILL.md'), 'utf8'));
+  assert.equal(existsSync(join(home, 'skills', 'ship', 'extra.md')), false);
+  writeFileSync(join(home, 'skills', 'verify', 'SKILL.md'), 'again\n');
+  assert.match(install(home).stdout, /your edits in skills\/verify were replaced; the old copy is at .*verify\./);
+});
+
+test('a plain source update (installed files untouched by the user) is not backed up', () => {
+  const home = newHome();
+  const src = copyFixture();
+  assert.equal(install(home, [], { source: src }).status, 0);
+  writeFileSync(join(src, 'skills', 'ship', 'SKILL.md'), 'new upstream text\n');
+  const r = install(home, [], { source: src });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(existsSync(join(home, 'backups')), false);
+  assert.equal(readFileSync(join(home, 'skills', 'ship', 'SKILL.md'), 'utf8'), 'new upstream text\n');
+});
+
+test('a home path with whitespace gets the plain and a quoted allow entry; uninstall removes both; idempotent', () => {
+  const home = newHome({ space: true });
+  const p = `${posix(home)}/pipeline/bin/pipeline.mjs`;
+  assert.deepEqual(ourAllowEntries(home), [`Bash(node ${p}:*)`, `Bash(node "${p}":*)`, 'Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)']);
+  assert.equal(ourAllowEntries('/h/.claude').length, 2, 'no quoted variant without whitespace');
+  writeSettings(home, { permissions: { allow: ['Bash(ls:*)'] } });
+  assert.equal(install(home).status, 0);
+  const allow = readSettings(home).permissions.allow;
+  assert.deepEqual(allow, ['Bash(ls:*)', ...ourAllowEntries(home)]);
+  assert.equal(install(home).status, 0);
+  assert.deepEqual(readSettings(home).permissions.allow, allow);
+  assert.equal(run(['--check', '--claude-home', home, '--source', FIXTURE]).status, 0);
+  assert.equal(run(['--uninstall', '--claude-home', home]).status, 0);
+  assert.deepEqual(readSettings(home), { permissions: { allow: ['Bash(ls:*)'] } });
+});
+
+test('a second no-op install leaves settings.json and INSTALLED.json byte-identical', async () => {
+  const home = newHome();
+  writeSettings(home, ownersSettings());
+  assert.equal(install(home).status, 0);
+  const files = [settingsPath(home), join(home, 'pipeline', 'INSTALLED.json')];
+  const before = files.map((f) => readFileSync(f, 'utf8'));
+  const mtimes = files.map((f) => statSync(f).mtimeMs);
+  await new Promise((r) => setTimeout(r, 1100)); // a rewrite would carry a new installedAt
+  assert.equal(install(home).status, 0);
+  assert.deepEqual(files.map((f) => readFileSync(f, 'utf8')), before);
+  assert.deepEqual(files.map((f) => statSync(f).mtimeMs), mtimes, 'not even rewritten');
+  // a real change (new source version) still refreshes the manifest
+  const src = copyFixture();
+  writeFileSync(join(src, 'VERSION'), '9.9.10\n');
+  assert.equal(install(home, [], { source: src }).status, 0);
+  assert.equal(readManifest(home).version, '9.9.10');
+});
+
+test('the top-level test/ exclusion does not hide a nested reference/test/ directory', () => {
+  const src = copyFixture();
+  mkdirSync(join(src, 'skills', 'ship', 'test'), { recursive: true });
+  writeFileSync(join(src, 'skills', 'ship', 'test', 'top.md'), 'x');
+  mkdirSync(join(src, 'skills', 'ship', 'reference', 'test'), { recursive: true });
+  writeFileSync(join(src, 'skills', 'ship', 'reference', 'test', 'keep.md'), 'keep');
+  mkdirSync(join(src, 'pipeline', 'lib', 'test'), { recursive: true });
+  writeFileSync(join(src, 'pipeline', 'lib', 'test', 'keep.mjs'), 'keep');
+  const plan = buildPlan(src);
+  assert.ok(plan.files.has('skills/ship/reference/test/keep.md'));
+  assert.ok(plan.files.has('pipeline/lib/test/keep.mjs'));
+  assert.ok(!plan.files.has('skills/ship/test/top.md'));
+  const home = newHome();
+  assert.equal(install(home, [], { source: src }).status, 0);
+  assert.equal(readFileSync(join(home, 'skills', 'ship', 'reference', 'test', 'keep.md'), 'utf8'), 'keep');
+  assert.equal(existsSync(join(home, 'skills', 'ship', 'test')), false);
+});
+
+test('stage and rollback copies live under backups/.staging, never inside skills/ or agents/', () => {
+  const home = newHome();
+  // If staging were beside the targets, this blocker would not matter; under backups/.staging it stops the install.
+  mkdirSync(join(home, 'backups'), { recursive: true });
+  writeFileSync(join(home, 'backups', '.staging'), 'in the way');
+  const r = install(home);
+  assert.notEqual(r.status, 0, 'the install had to stage under backups/.staging');
+  assert.equal(existsSync(join(home, 'skills')), false);
+  assert.equal(existsSync(join(home, 'agents')), false);
+  rmSync(join(home, 'backups', '.staging'));
+  assert.equal(install(home).status, 0);
+  assert.ok(readdirSync(join(home, 'skills')).every((n) => !/\.(new|old)-/.test(n)));
+  assert.ok(readdirSync(join(home, 'agents')).every((n) => !/\.(new|old)-/.test(n)));
+  assert.equal(existsSync(join(home, 'backups', '.staging')), false, 'the staging dir is removed when empty');
 });

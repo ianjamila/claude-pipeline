@@ -10,10 +10,14 @@ import { toPosix } from './paths.mjs';
 
 export const SKILLS = ['ship', 'verify', 'pipeline-setup'];
 export const AGENTS = ['implementer', 'verifier', 'judge', 'arbiter'];
-export const EXCLUDED_NAMES = new Set(['node_modules', '.DS_Store', 'test']);
+export const EXCLUDED_NAMES = new Set(['node_modules', '.DS_Store']);
+// Skipped only directly under the walked root (pipeline/, skills/<name>/): a nested reference/test/ is content.
+export const EXCLUDED_TOP_LEVEL = new Set(['test']);
 export const MANIFEST_REL = 'pipeline/INSTALLED.json';
+export const GUARD_GIT_MATCHER = 'Bash|PowerShell';
 export const GUARD_FILES_MATCHER = 'Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|mcp__.*';
 export const HOOK_TIMEOUT_S = 15;
+export const STAGING_REL = 'backups/.staging';
 export const TILDE_ALLOW_ENTRY = 'Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)';
 export const SUBAGENT_NOTE = 'Pinned agent models (judge=opus, arbiter=fable) still win over this env var — verified on Claude Code 2.1.285; unpinned subagents use it.';
 const MODEL_VAR = 'CLAUDE_CODE_SUBAGENT_MODEL';
@@ -67,15 +71,15 @@ export function sha256File(file) {
   return createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 }
 
-// Relative POSIX paths of the regular files under root, skipping excluded names at any depth. Symlinked
-// directories are not followed; a symlink to a file counts as that file.
-export function walkFiles(root, { exclude = EXCLUDED_NAMES } = {}) {
+// Relative POSIX paths of the regular files under root, skipping excluded names at any depth and topLevel
+// names only directly under root. Symlinked directories are not followed; a symlink to a file counts as that file.
+export function walkFiles(root, { exclude = EXCLUDED_NAMES, topLevel = EXCLUDED_TOP_LEVEL } = {}) {
   const out = [];
   const visit = (abs, rel) => {
     let entries;
     try { entries = fs.readdirSync(abs, { withFileTypes: true }); } catch { return; }
     for (const e of entries) {
-      if (exclude.has(e.name)) continue;
+      if (exclude.has(e.name) || (rel === '' && topLevel.has(e.name))) continue;
       const childAbs = path.join(abs, e.name);
       const childRel = rel ? `${rel}/${e.name}` : e.name;
       let isDir = e.isDirectory();
@@ -190,6 +194,20 @@ export function unitState(home, unit) {
   return 'same';
 }
 
+// Home-relative paths of files in an installed unit that the user changed since install: a file whose hash
+// differs from the manifest, or one the manifest does not list. A symlinked target counts as edited. Empty
+// when the unit is absent or there is no manifest (nothing says what we installed).
+export function userEditedFiles(home, unit, manifest) {
+  if (!manifest) return [];
+  const target = unitTarget(home, unit);
+  let st;
+  try { st = fs.lstatSync(target); } catch { return []; }
+  if (st.isSymbolicLink()) return [unit.rel];
+  const edited = [];
+  for (const [rel, hash] of scanUnitDisk(home, unit)) if (manifest.files[rel] !== hash) edited.push(rel);
+  return edited;
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // Manifest
 
@@ -202,6 +220,9 @@ export function safeManifestKey(key) {
   if (parts.length < 2 || !SAFE_ROOTS.has(parts[0])) return false;
   return parts.every((p) => p !== '' && p !== '.' && p !== '..');
 }
+
+// The same manifest, minus the one field that changes on every run.
+export const manifestWithoutTime = ({ installedAt, ...rest }) => rest;
 
 export function buildManifest({ plan, sourceSha, skipFileGuard, now = new Date() }) {
   const files = {};
@@ -277,18 +298,41 @@ export function joinNative(home, ...parts) {
   return (windows ? path.win32 : path.posix).join(home, ...parts);
 }
 
-const OURS = /\/\.claude\/pipeline\/hooks\/|\/pipeline\/hooks\/guard-/i;
-
-// A hook handler is ours when its command or any arg points into the pipeline hooks dir (either slash
-// direction), which also catches handlers written by earlier installs in the string command form.
-export function isOurHandler(handler) {
-  if (!isPlainObject(handler)) return false;
-  const strings = [handler.command, ...(Array.isArray(handler.args) ? handler.args : [])];
-  return strings.some((s) => typeof s === 'string' && OURS.test(toPosix(s)));
+const CLAUDE_HOOKS_DIR = '/.claude/pipeline/hooks/';
+const foldCase = (s) => (process.platform === 'win32' || process.platform === 'darwin' ? s.toLowerCase() : s);
+const hooksDirOf = (home) => `${toPosix(home).replace(/\/+$/, '')}/pipeline/hooks/`;
+// anchored: the directory must start a word, so /x/home/pipeline/hooks/ does not match inside /y/x/home/...
+function pointsInto(text, dir, anchored) {
+  const hay = foldCase(text);
+  const needle = foldCase(dir);
+  for (let at = hay.indexOf(needle); at >= 0; at = hay.indexOf(needle, at + 1)) {
+    if (!anchored || at === 0 || /[\s"'=]/.test(hay[at - 1])) return true;
+  }
+  return false;
 }
 
+// A hook handler is ours when its command or any arg points into the exact hooks dir this installer writes to
+// (<claude-home>/pipeline/hooks/) or into the literal /.claude/pipeline/hooks/ (earlier installs, other machines
+// sharing a synced settings file). Either slash direction. Any other pipeline/hooks/ path belongs to the user.
+export function isOurHandler(handler, home) {
+  if (!isPlainObject(handler)) return false;
+  const homeDir = typeof home === 'string' && home !== '' ? hooksDirOf(home) : null;
+  const strings = [handler.command, ...(Array.isArray(handler.args) ? handler.args : [])];
+  return strings.some((s) => {
+    if (typeof s !== 'string') return false;
+    const posix = toPosix(s);
+    return pointsInto(posix, CLAUDE_HOOKS_DIR, false) || (homeDir !== null && pointsInto(posix, homeDir, true));
+  });
+}
+
+// The allow entries for our CLI. A home path with whitespace gets a second, quoted entry as well, because
+// Claude Code matches the command text the shell sees and a quoted path is what the user's agent will type.
 export function ourAllowEntries(home) {
-  return [`Bash(node ${toPosix(home).replace(/\/+$/, '')}/pipeline/bin/pipeline.mjs:*)`, TILDE_ALLOW_ENTRY];
+  const bin = `${toPosix(home).replace(/\/+$/, '')}/pipeline/bin/pipeline.mjs`;
+  const entries = [`Bash(node ${bin}:*)`];
+  if (/\s/.test(bin)) entries.push(`Bash(node "${bin}":*)`);
+  entries.push(TILDE_ALLOW_ENTRY);
+  return entries;
 }
 
 const handlerFor = (home, name) => ({
@@ -299,7 +343,7 @@ const handlerFor = (home, name) => ({
 });
 
 export function ourHookGroups(home, { skipFileGuard = false } = {}) {
-  const groups = [{ matcher: 'Bash', hooks: [handlerFor(home, 'guard-git')] }];
+  const groups = [{ matcher: GUARD_GIT_MATCHER, hooks: [handlerFor(home, 'guard-git')] }];
   if (!skipFileGuard) groups.push({ matcher: GUARD_FILES_MATCHER, hooks: [handlerFor(home, 'guard-files')] });
   return groups;
 }
@@ -317,13 +361,13 @@ function assertShape(settings) {
 }
 
 // Removes our handlers from hooks.PreToolUse in place; drops groups that this leaves empty. Returns the count.
-function stripOurHandlers(settings) {
+function stripOurHandlers(settings, home) {
   const groups = settings.hooks?.PreToolUse;
   if (!Array.isArray(groups)) return 0;
   let removed = 0;
   settings.hooks.PreToolUse = groups.filter((group) => {
     if (!isPlainObject(group) || !Array.isArray(group.hooks) || group.hooks.length === 0) return true;
-    const kept = group.hooks.filter((h) => !isOurHandler(h));
+    const kept = group.hooks.filter((h) => !isOurHandler(h, home));
     removed += group.hooks.length - kept.length;
     if (kept.length === group.hooks.length) return true;
     group.hooks = kept;
@@ -337,7 +381,7 @@ function stripOurHandlers(settings) {
 export function mergeSettings(settings, { home, skipFileGuard = false }) {
   assertShape(settings);
   const out = structuredClone(settings);
-  stripOurHandlers(out);
+  stripOurHandlers(out, home);
   out.hooks ??= {};
   out.hooks.PreToolUse ??= [];
   out.hooks.PreToolUse.push(...ourHookGroups(home, { skipFileGuard }));
@@ -352,7 +396,7 @@ export function mergeSettings(settings, { home, skipFileGuard = false }) {
 export function removeOurSettings(settings, { home }) {
   assertShape(settings);
   const out = structuredClone(settings);
-  if (stripOurHandlers(out) > 0 && out.hooks.PreToolUse.length === 0) {
+  if (stripOurHandlers(out, home) > 0 && out.hooks.PreToolUse.length === 0) {
     delete out.hooks.PreToolUse;
     if (Object.keys(out.hooks).length === 0) delete out.hooks;
   }
@@ -383,11 +427,11 @@ export function inspectHooks(settings, home) {
   const out = { 'guard-git': [], 'guard-files': [], unknown: [] };
   const groups = settings?.hooks?.PreToolUse;
   if (!Array.isArray(groups)) return out;
-  const matcherFor = { 'guard-git': 'Bash', 'guard-files': GUARD_FILES_MATCHER };
+  const matcherFor = { 'guard-git': GUARD_GIT_MATCHER, 'guard-files': GUARD_FILES_MATCHER };
   for (const group of groups) {
     if (!isPlainObject(group) || !Array.isArray(group.hooks)) continue;
     for (const handler of group.hooks) {
-      if (!isOurHandler(handler)) continue;
+      if (!isOurHandler(handler, home)) continue;
       const script = scriptOf(handler);
       if (!script) { out.unknown.push({ matcher: group.matcher, handler }); continue; }
       out[script].push({

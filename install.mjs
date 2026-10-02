@@ -93,11 +93,17 @@ function copyChecked(file, dest) {
   if (I.sha256File(dest) !== file.sha256) throw new InstallError(`the copy of ${file.rel} does not match the source (did the source change while installing?)`);
 }
 
-// Copies a unit next to its target as <target>.new-<ts>. For the pipeline dir the new manifest goes in too,
+// Stage and rollback copies live in <home>/backups/.staging/, never beside the targets: Claude Code scans
+// skills/ and agents/, and a half-copied or leftover *.new-<ts> dir there would be loaded as a skill or agent.
+const stagingRoot = (home) => I.fromRel(home, I.STAGING_REL);
+const stagingName = (home, unit, kind, ts) => path.join(stagingRoot(home), `${unit.rel.replace(/\//g, '--')}.${kind}-${ts}`);
+
+// Copies a unit into the staging dir as <rel>.new-<ts>. For the pipeline dir the new manifest goes in too,
 // so the manifest and the files it describes switch over in the same rename.
 function stageUnit(home, unit, ts, manifestText) {
   const target = I.unitTarget(home, unit);
-  const staging = `${target}.new-${ts}`;
+  const staging = stagingName(home, unit, 'new', ts);
+  fs.mkdirSync(stagingRoot(home), { recursive: true });
   rm(staging);
   fs.mkdirSync(path.dirname(target), { recursive: true });
   try {
@@ -122,8 +128,9 @@ function uniquePath(base) {
 }
 
 // Puts the staged copy in place. Directories: rename old aside, rename new in, drop old (rolled back if the
-// second rename fails). A foreign target (--force) is kept under backups/ instead of being deleted.
-function swapIn(home, unit, staging, { foreign, ts, warnings }) {
+// second rename fails). With keepOld (a foreign target under --force, or one holding the user's edits) the old
+// copy is kept under backups/<name>.<ts> instead of being deleted.
+function swapIn(home, unit, staging, { keepOld, ts, warnings }) {
   const target = I.unitTarget(home, unit);
   let backup = null;
   const foreignBackupPath = () => {
@@ -135,11 +142,11 @@ function swapIn(home, unit, staging, { foreign, ts, warnings }) {
     return backup;
   }
   if (unit.kind === 'agent') {
-    if (foreign) { backup = foreignBackupPath(); fs.copyFileSync(target, backup); }
+    if (keepOld) { backup = foreignBackupPath(); fs.copyFileSync(target, backup); }
     I.renameWithRetry(staging, target); // replaces the file in one step
     return backup;
   }
-  const old = `${target}.old-${ts}`;
+  const old = stagingName(home, unit, 'old', ts);
   rm(old);
   I.renameWithRetry(target, old);
   try {
@@ -148,7 +155,7 @@ function swapIn(home, unit, staging, { foreign, ts, warnings }) {
     try { I.renameWithRetry(old, target); } catch { /* the original error is the one that matters */ }
     throw err;
   }
-  if (foreign) {
+  if (keepOld) {
     backup = foreignBackupPath();
     I.renameWithRetry(old, backup);
   } else {
@@ -212,6 +219,7 @@ function doInstall(ctx) {
   if (conflicts.length > 0 && !opts.force) {
     throw new InstallError(conflicts.map((rel) => `refusing to overwrite ${rel}: it exists in ${home} and was not installed by claude-pipeline (it is not listed in ${I.MANIFEST_REL}). Move it away, or re-run with --force (the old copy is kept in backups/).`).join('\n'));
   }
+  const backupsExisted = I.lexists(path.join(home, 'backups'));
   const staleRels = Object.keys(manifest?.files ?? {}).filter((rel) => !plan.files.has(rel) && I.lexists(I.fromRel(home, rel)));
 
   const settingsChanged = !current.exists || !isDeepStrictEqual(merged, current.settings);
@@ -224,21 +232,33 @@ function doInstall(ctx) {
   let copied = 0;
   let unchanged = 0;
   const foreignBackups = [];
-  for (const unit of plan.units) {
-    if (states.get(unit.rel) === 'same') {
-      unchanged += unit.files.length;
-      if (unit.kind === 'pipeline') writeFileAtomic(I.fromRel(home, I.MANIFEST_REL), manifestText, I.lexists(I.fromRel(home, I.MANIFEST_REL)));
-      continue;
+  const editBackups = [];
+  try {
+    for (const unit of plan.units) {
+      if (states.get(unit.rel) === 'same') {
+        unchanged += unit.files.length;
+        // Only the install time would differ on a no-op run; leave the file byte-identical then.
+        const manifestSame = manifest && isDeepStrictEqual(I.manifestWithoutTime(manifest), I.manifestWithoutTime(manifestObj));
+        if (unit.kind === 'pipeline' && !manifestSame) writeFileAtomic(I.fromRel(home, I.MANIFEST_REL), manifestText, I.lexists(I.fromRel(home, I.MANIFEST_REL)));
+        continue;
+      }
+      const foreign = conflicts.includes(unit.rel);
+      const edited = !foreign && I.userEditedFiles(home, unit, manifest).length > 0;
+      const staging = stageUnit(home, unit, ts, manifestText);
+      try {
+        const kept = swapIn(home, unit, staging, { keepOld: foreign || edited, ts, warnings });
+        if (kept && foreign) foreignBackups.push(kept);
+        else if (kept) editBackups.push({ rel: unit.rel, backup: kept });
+      } catch (err) {
+        rm(staging);
+        throw err;
+      }
+      copied += unit.files.length;
     }
-    const staging = stageUnit(home, unit, ts, manifestText);
-    try {
-      const kept = swapIn(home, unit, staging, { foreign: conflicts.includes(unit.rel), ts, warnings });
-      if (kept) foreignBackups.push(kept);
-    } catch (err) {
-      rm(staging);
-      throw err;
-    }
-    copied += unit.files.length;
+  } finally {
+    // The staging dir is empty after a clean run; drop it (and backups/ if this run made it and nothing went in).
+    try { fs.rmdirSync(stagingRoot(home)); } catch { /* not empty or absent */ }
+    if (!backupsExisted) { try { fs.rmdirSync(path.join(home, 'backups')); } catch { /* has backups in it */ } }
   }
   const removed = [];
   for (const rel of staleRels) {
@@ -261,6 +281,7 @@ function doInstall(ctx) {
     settings: { path: current.file, created: !current.exists, changed: settingsChanged, backup },
     allow: { added: I.ourAllowEntries(home).filter((e) => !allowBefore.has(e)) },
     foreignBackups,
+    editBackups,
     warnings,
     diagnostics: diagnostics(ctx, merged),
   };
@@ -361,6 +382,7 @@ function formatReport(r) {
     lines.push(`  backup:    ${r.settings.backup ?? 'none (settings.json was not changed or did not exist)'}`);
     lines.push(`  allow:     ${r.allow.added.length === 0 ? 'entries already present' : `added ${r.allow.added.join(', ')}`}`);
     for (const b of r.foreignBackups) lines.push(`  replaced a file that was not ours; the old copy is at ${b}`);
+    for (const b of r.editBackups) lines.push(`  your edits in ${b.rel} were replaced; the old copy is at ${b.backup}`);
     lines.push(...formatDiagnostics(r.diagnostics));
   } else if (r.mode === 'uninstall') {
     lines.push(`claude-pipeline uninstalled from ${r.home}`);
