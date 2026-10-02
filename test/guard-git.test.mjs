@@ -316,7 +316,6 @@ const MORE_ALLOW = [
   ['DIR=/other; cd $DIR && git push', { byDir: { '/other': 'agent/y', '/work/repo': 'main' } }],
   ['B=agent/x; git push origin $B'],
   ['git push -u origin "$(git branch --show-current)"', { branch: 'agent/x' }],
-  ['git push origin HEAD:$X', { branch: 'agent/x' }],
   ['git branch -d main'],
   ['git fetch origin main:agent/x'],
   ['git remote add origin git@github.com:o/r.git'],
@@ -995,4 +994,58 @@ test('brace spam just under the size cap is cut off by the expansion budget, not
   const t0 = Date.now();
   evaluate(`echo ${spam}`);
   assert.ok(Date.now() - t0 < 3000);
+});
+
+// ---- dynamic push destinations and env-supplied git config (review findings 3 and 4) -------------------
+
+test('a push destination built at run time is allowed only for the current-branch idioms or a literal variable', () => {
+  const dynamicDeny = [
+    'git push origin HEAD:${B:-main}',
+    'for b in main; do git push origin HEAD:$b; done',
+    'f(){ git push origin HEAD:$1; }; f main',
+    'git push origin HEAD:$(cat .branch)',
+    'git push origin HEAD:m${x}ain',
+    'git push origin HEAD:"$(echo bWFpbg== | base64 -d)"',
+    'git push origin HEAD:`cat .branch`',
+    'git push origin "$BRANCH"',
+    'git push origin HEAD:agent/$(date +%s)',
+    'git push origin HEAD:"$(git branch --show-current)-main"',
+    'git push origin HEAD:"$(git -C /other branch --show-current)"',
+    'B=main; git push origin HEAD:$B',
+    'B=$(cat .branch); git push origin HEAD:$B',
+  ];
+  for (const c of dynamicDeny) assert.equal(evaluate(c).decision, 'deny', c);
+  const ok = [
+    'git push origin HEAD:$(git branch --show-current)',
+    'git push origin "$(git branch --show-current)"',
+    'git push origin HEAD:"$(git rev-parse --abbrev-ref HEAD)"',
+    'git push origin HEAD:`git branch --show-current`',
+    'git push origin `git rev-parse --abbrev-ref HEAD`',
+    'git push -u origin "$(git  branch   --show-current)"',
+    'B=agent/y; git push origin HEAD:$B',
+    'B=agent/y && git push origin HEAD:${B}',
+    'export B=agent/y; git push -u origin $B',
+    'B=$(git branch --show-current); git push origin HEAD:$B',
+  ];
+  for (const c of ok) assert.equal(evaluate(c, { branch: 'agent/x' }).decision, 'allow', c);
+  // the idiom still resolves to the current branch, so on main it is a push to main
+  assert.equal(evaluate('git push origin HEAD:$(git branch --show-current)', { branch: 'main' }).decision, 'deny');
+  assert.equal(evaluate('git push origin HEAD:$(git branch --show-current)', { branch: null }).decision, 'deny');
+});
+
+test('git config supplied through the environment counts as changed push configuration for a bare push', () => {
+  const envDeny = [
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=HEAD:main git push',
+    'GIT_CONFIG_PARAMETERS="\'remote.origin.push=HEAD:main\'" git push',
+    'env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=HEAD:main git push',
+    'export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=HEAD:main; git push',
+    'GIT_CONFIG_COUNT=1; GIT_CONFIG_KEY_0=push.default; GIT_CONFIG_VALUE_0=upstream; git push',
+    'GIT_CONFIG_GLOBAL=/tmp/evil.gitconfig git push',
+    'GIT_CONFIG_SYSTEM=/tmp/evil.gitconfig git push origin',
+    '$env:GIT_CONFIG_COUNT=1; git push',
+  ];
+  for (const c of envDeny) assert.equal(evaluate(c, { branch: 'agent/x' }).decision, 'deny', c);
+  // an explicit refspec is not redirected by config
+  assert.equal(evaluate('GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.editor GIT_CONFIG_VALUE_0=true git push origin HEAD:agent/x', { branch: 'agent/x' }).decision, 'allow');
+  assert.equal(evaluate('GIT_AUTHOR_NAME=x git push', { branch: 'agent/x' }).decision, 'allow');
 });

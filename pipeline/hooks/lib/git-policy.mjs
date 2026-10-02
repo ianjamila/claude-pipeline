@@ -36,7 +36,10 @@ const GIT_GLOBAL_VALUE = ['--git-dir', '--work-tree', '--namespace', '--super-pr
 const API_LONG_VALUE = ['method', 'field', 'raw-field', 'header', 'input', 'jq', 'template', 'preview', 'hostname', 'cache'];
 const VAR_BUILTINS = ['export', 'declare', 'typeset', 'local', 'readonly'];
 const DYNAMIC = /[$`]/;
-const NAMES_PROTECTED = /(^|[^A-Za-z0-9_-])(main|master)([^A-Za-z0-9_-]|$)/i;
+// The only run-time destinations a push may use: "whatever branch I am on" (the branch itself is then checked).
+const CURRENT_BRANCH_IDIOM = /^(?:\$\(|`)\s*git\s+(?:branch\s+--show-current|rev-parse\s+--abbrev-ref\s+HEAD|symbolic-ref\s+--short\s+HEAD)\s*(?:\)|`)$/;
+// Config the environment can inject into git (GIT_CONFIG_COUNT/KEY_n/VALUE_n, GIT_CONFIG_PARAMETERS, GIT_CONFIG_GLOBAL/SYSTEM).
+const GIT_ENV_CONFIG = /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+|PARAMETERS|GLOBAL|SYSTEM)$/i;
 // Config that can redirect a bare `git push` somewhere the branch name does not suggest.
 const RISKY_CONFIG = (key, value) => /^remote\..*\.push$/.test(key) || /^branch\./.test(key)
   || (key === 'push.default' && /^(upstream|tracking|matching)$/i.test(value));
@@ -189,14 +192,16 @@ function checkRefspec(spec, dir, gitDir, ctx) {
   const colon = spec.indexOf(':');
   const src = colon < 0 ? spec : spec.slice(0, colon);
   let dst = colon < 0 ? spec : spec.slice(colon + 1);
+  dst = expandVars(dst, ctx.vars); // `B=agent/x; git push origin HEAD:$B`
   if (colon >= 0 && src === '' && dst === '') return deny('`git push <remote> :` pushes every matching branch, including main. Name your branch explicitly.');
   if (dst === '') dst = src; // `src:` is not a destination git accepts; judge it by the source name
   dst = stripHeads(dst);
   if (DYNAMIC.test(dst)) {
-    // `git push origin "$(git branch --show-current)"` is common and means the current branch: accept it only when
-    // that branch is known and not protected, and the text does not itself name main/master.
+    // `git push origin "$(git branch --show-current)"` is common and means the current branch: accept exactly that
+    // spelling (a variable that holds a literal has already been expanded above), and only when the branch is known
+    // and not protected. Any other run-time text (${B:-main}, $(cat f), m${x}ain, a loop variable) can be main.
     const { branch: b } = effectiveBranch(dir, gitDir, ctx);
-    if (b === null || isProtectedBranch(b) || NAMES_PROTECTED.test(dst)) {
+    if (!CURRENT_BRANCH_IDIOM.test(dst.replace(/\s+/g, ' ')) || b === null || isProtectedBranch(b)) {
       return deny(`the destination "${dst}" cannot be resolved here, so it cannot be verified. Write the branch name out: git push -u origin agent/<slug>.`);
     }
     return null;
@@ -232,7 +237,7 @@ function checkPush(args, dir, gitDir, ctx, configs) {
   else refspecs = positionals.slice(1);
   if (refspecs.length === 0) {
     if (dir === null) return deny('cannot tell which directory this `git push` runs in (unresolved cd / -C), so the current branch cannot be verified.');
-    if (ctx.cfgDirty || configs.some((c) => RISKY_CONFIG(c.key, c.value))) {
+    if (ctx.cfgDirty || ctx.envCfgDirty || configs.some((c) => RISKY_CONFIG(c.key, c.value))) {
       return deny('this line changes upstream/push configuration (git config, branch -u, -c push.default/remote.*.push), so where a bare `git push` goes cannot be verified. Push explicitly: git push -u origin HEAD:agent/<slug>.');
     }
     const { branch: b, overridden, trackMain } = effectiveBranch(dir, gitDir, ctx);
@@ -367,6 +372,8 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
 
   if (sub === 'push' || sub === 'send-pack') { // send-pack is push without the remote configuration
     if (/\bxargs\b/.test(raw)) return deny('`xargs git push` takes its refspecs from stdin, so it cannot be verified. Push the branch by name.');
+    // config handed in through the environment (this command's prefix / `env`, or an earlier assignment or export on the line)
+    ctx.envCfgDirty = [...Object.keys(env), ...Object.keys(ctx.vars)].some((k) => GIT_ENV_CONFIG.test(k));
     return checkPush(args, g.d, g.gitDir, ctx, g.configs);
   }
   trackGit(sub, args, g, ctx);
@@ -740,7 +747,7 @@ export function evaluateGitCommand(command, {
   const ctx = {
     cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, fullText: text,
     vars: Object.create(null), gitAliases: Object.create(null), ghAliases: Object.create(null),
-    branches: new Map(), cfgDirty: false,
+    branches: new Map(), cfgDirty: false, envCfgDirty: false,
   };
   return evalString(text, path.resolve(base), ctx, 0);
 }
