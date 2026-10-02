@@ -159,7 +159,7 @@ All subcommands print one JSON object to stdout (human text to stderr), and use 
 | `triage-comment --pr N` | Upsert the single PR comment marked `<!-- claude-pipeline:triage -->`. |
 | `preview-url --sha SHA [--timeout S]` | Vercel/any provider using GitHub deployments (env from config) → `{url}`; or run `preview.url_command`. |
 | `smoke --target preview\|production --url URL [--expect-text T]` | Runs the configured smoke command with `{url}` substituted. |
-| `prod-watch --sha MERGE_SHA [--expect-text T]` | Wait for Production deployment success for the merge SHA → production smoke → on failure: rollback command, issue `pipeline-rollback` with evidence, revert PR (needs-human). |
+| `prod-watch --sha MERGE_SHA [--expect-text T]` | Wait for Production deployment success for the merge SHA → production smoke → on failure: `vercel rollback <known-good> --yes --timeout 3m` (run by prod-watch itself, not `production.rollback.command`), issue `pipeline-rollback` with evidence, revert PR (needs-human). |
 | `summary --pr N --outcome merged\|blocked\|needs-human\|reverted\|awaiting-review` | Render §10 summary → upsert comment `<!-- claude-pipeline:summary -->`; print the agent-log line. |
 | `agent-log --line "…"` | Commit the line to `docs/agent-log.md` via a docs-only branch + PR (§10.3). |
 | `final-gate --pr N` | Assert: fresh full verify report bound to PR head SHA & tree, no blocking labels, no open pause/rollback issue, hard-stop recheck clean, review state exit-clean. Writes `.review/final-gate.json`. |
@@ -201,7 +201,7 @@ Ship invokes judge/arbiter **without** a `model` parameter. Proof switch for tes
 
 ### 5.5 Global hooks (`~/.claude/settings.json`, PreToolUse)
 
-**guard-git** (matcher `Bash`): deny when any simple command (after splitting on `; && || | &`,
+**guard-git** (matcher `Bash|PowerShell`): deny when any simple command (after splitting on `; && || | &`,
 newlines, `$(…)`, backticks, and recursing into `bash|sh|zsh -c`, `eval`) is:
 - `git push` targeting `main`/`master` (explicit refspec dest incl. `HEAD:main`,
   `refs/heads/main`, `:main`, `--delete main`), or with no refspec while the checkout's current
@@ -218,7 +218,7 @@ newlines, `$(…)`, backticks, and recursing into `bash|sh|zsh -c`, `eval`) is:
 Internal error → deny only if the command mentions `push`, `merge`, `protection`, `ruleset`,
 or a guarded label; otherwise allow.
 
-**guard-files** (matcher `Edit|Write|MultiEdit|NotebookEdit|Bash`), bypassed only when the
+**guard-files** (matcher `Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|mcp__.*`), bypassed only when the
 Claude Code **process** env has `PIPELINE_ADMIN=1`:
 - deny file tools whose resolved target (realpath of nearest existing ancestor, case-insensitive
   on macOS/Windows) is inside: `~/.claude/skills/{pipeline-setup,verify,ship}/`,
@@ -491,7 +491,7 @@ label and from removing `needs-human`.
 ### 10.1 Production watch
 Wait (≤ `deploy_timeout_minutes`) for a Production deployment status `success` for the merge
 SHA → production smoke (read-only, unauthenticated; never `smoke:hydration`) → pass ⇒ outcome
-`merged`. Fail ⇒ `rollback.command` → issue `pipeline-rollback` (evidence: smoke output,
+`merged`. Fail ⇒ `vercel rollback <known-good> --yes --timeout 3m` (run directly by prod-watch; `rollback.command` is documentation only) → issue `pipeline-rollback` (evidence: smoke output,
 deployment URL, merge SHA, rollback output, the Vercel auto-assign note) → revert PR
 (`git revert <merge sha>`) labelled `needs-human` → outcome `reverted`. While a
 `pipeline-rollback` issue is open, ship never merges.

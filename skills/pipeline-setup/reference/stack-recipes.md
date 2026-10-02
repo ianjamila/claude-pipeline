@@ -16,9 +16,12 @@ Each recipe lists `STEPS` for `scripts/verify.mjs` (`quick: true` marks steps th
 | build | `npm run build` (local env pointing at the dedicated instance) | no |
 | e2e | `npx playwright test -c playwright.smoke.config.ts` (own port; screenshots to `.verify/screenshots/`) | no |
 
-Preview: GitHub deployments environment `Preview`; production: provider `vercel`, rollback
-`vercel rollback <known-good> --yes` (after a rollback Vercel stops auto-assigning production
-domains until a deployment is promoted).
+Preview: GitHub deployments environment `Preview`; production: provider `vercel`. On a failed production
+smoke `pipeline prod-watch` itself runs the Vercel CLI (`vercel rollback <known-good> --yes --timeout 3m`, where
+`<known-good>` is the deployment production served before the merge); it never executes
+`production.rollback.command`. That key is still required by validation: write the equivalent manual command
+(`vercel rollback <known-good> --yes`) as documentation for humans. After a rollback Vercel stops auto-assigning
+production domains until a deployment is promoted.
 
 ## Plain Node / TypeScript library
 

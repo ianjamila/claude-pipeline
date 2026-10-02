@@ -121,7 +121,8 @@ awaiting-review`, summary (`awaiting-review`), stop.
    merge --run-id <runId> --timeout 540`. Exit 1 because the base moved ⇒ back to Step 5.2 (max 2 times, then `needs-human`).
 2. Merged ⇒ `P job start prod -- node ~/.claude/pipeline/bin/pipeline.mjs prod-watch --sha
    <merge sha> --pr N [--expect-text …]` → `P job wait prod --run-id <runId> --timeout 540`. Outcomes: `merged` (smoke ok),
-   `superseded`, `recovered` (rolled back + revert PR opened), `rollback-failed` (urgent). Report
+   `superseded`, `recovered` (prod-watch ran `vercel rollback <known-good> --yes --timeout 3m` itself, not
+   `production.rollback.command`; revert PR opened), `rollback-failed` (urgent). Report
    any non-`merged` outcome to the user immediately.
 
 ## Step 7 — summary

@@ -33,9 +33,13 @@ production: null
 #  environment: Production
 #  deploy_timeout_minutes: 20
 #  smoke: node scripts/pipeline/smoke.mjs --base {url} --production
-#  rollback:
-#    command: vercel rollback {deployment} --yes
+#  rollback:                    # required by validation, but `command` is documentation for humans only:
+#    command: vercel rollback <known-good-deployment> --yes   # what prod-watch runs for provider "vercel": see below
 #    notes: After a rollback Vercel stops auto-assigning production domains until you promote a deployment.
+#  # prod-watch never executes rollback.command. For provider "vercel" it runs the Vercel CLI itself, from the
+#  # linked project checkout: `vercel rollback <known-good> --yes --timeout 3m`, where <known-good> is the deployment
+#  # production served just before the merge (`pipeline merge` records it in .review/prod-before.json). For provider
+#  # "other" nothing is automatic: it opens a needs-human issue and prints rollback.command for a person to run.
 
 smoke_checks: []               # GET-only, unauthenticated: [{path: /, status: [200], contains: ["…"]}]
 

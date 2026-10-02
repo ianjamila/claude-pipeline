@@ -58,8 +58,8 @@ Use implementer subagents for the file work; give each the exact template path +
 From `templates/pipeline.yml`: verify commands; `merge.command` (must contain `{pr}` and
 `{sha}`; reuse an existing merge gate if the repo has one, with flags that refuse branch
 updates and pin the head); `ci.required_checks`; preview (environment name in GitHub
-deployments + smoke command); production (URL, provider, read-only smoke, rollback command +
-notes); `smoke_checks` (GET-only, unauthenticated); `risk.high_risk_paths`; `hard_stops.paths` /
+deployments + smoke command); production (URL, provider, read-only smoke, rollback command (documentation only: prod-watch runs
+`vercel rollback <known-good> --yes --timeout 3m` itself for provider `vercel`) + notes); `smoke_checks` (GET-only, unauthenticated); `risk.high_risk_paths`; `hard_stops.paths` /
 `patterns` / `auth_calls` (project extras on top of the universal list); review settings.
 Validate: `P config`.
 
