@@ -30,7 +30,7 @@ decide which items need the arbiter, then prove and apply its rulings.
 pipeline arbiter needed --round R [--force] [--repo DIR]
   -> {needed:false, items:[]} | {needed:true, items, inputPath, digest, digest8, tag}
 pipeline arbiter apply --round R [--tag TAG | --agent-id ID] [--projects-dir DIR] [--max-age-ms N] [--repo DIR]
-  the proof is pinned to claude-fable- at effort high; --expect-model / --expect-effort are honoured only with PIPELINE_TEST_MODE=1
+  the proof is pinned to claude-fable- at effort high; --expect-model / --expect-effort are honoured only with PIPELINE_TEST_MODE=1 in a repo checkout (an installed copy ignores it)
   -> {ok, round, tag, transcript, errors, items}; exit 0 proven + applied, 1 unproven (every arbitrated item needsHuman), 2 no transcript
 ```
 

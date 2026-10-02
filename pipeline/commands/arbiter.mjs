@@ -7,6 +7,7 @@ import path from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs } from '../lib/cli.mjs';
 import { Fail, guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { GitError, showFile } from '../lib/git.mjs';
+import { seamFlag } from '../lib/proc.mjs';
 import { saveState, updateItems } from '../lib/state.mjs';
 import { extractJsonBlock, findSubagentTranscript, proveModel } from '../lib/transcript.mjs';
 import { applyRulings, arbiterNeeded, finalizeWithoutArbiter, validateRulings } from '../lib/triage.mjs';
@@ -21,7 +22,7 @@ export const meta = {
     'pipeline arbiter needed --round R [--force] [--repo DIR]',
     '  -> {needed:false, items:[]} | {needed:true, items, inputPath, digest, digest8, tag}',
     'pipeline arbiter apply --round R [--tag TAG | --agent-id ID] [--projects-dir DIR] [--max-age-ms N] [--repo DIR]',
-    '  the proof is pinned to claude-fable- at effort high; --expect-model / --expect-effort are honoured only with PIPELINE_TEST_MODE=1',
+    '  the proof is pinned to claude-fable- at effort high; --expect-model / --expect-effort are honoured only with PIPELINE_TEST_MODE=1 in a repo checkout (an installed copy ignores it)',
     '  -> {ok, round, tag, transcript, errors, items}; exit 0 proven + applied, 1 unproven (every arbitrated item needsHuman), 2 no transcript',
   ].join('\n'),
 };
@@ -31,7 +32,8 @@ export const DEFAULT_EXPECT_EFFORT = 'high';
 
 const forceArbiter = (env) => (env ?? process.env).PIPELINE_TEST_FORCE_ARBITER === '1';
 // Only the test suite may point the proof at another model or effort; a normal run is always pinned (spec R13).
-const testMode = (env) => (env ?? process.env).PIPELINE_TEST_MODE === '1';
+// (and only from the repo checkout: an installed copy ignores it, see proc.mjs#seamValue)
+const testMode = (env) => seamFlag('PIPELINE_TEST_MODE', env);
 
 function nonEmpty(values, name) {
   if (values[name] === '') throw new UsageError(`--${name} must not be empty`);

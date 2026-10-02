@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, utimesSync,
+  cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, utimesSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -102,7 +102,10 @@ function world(t, { gh = GH, light = false } = {}) {
       ]) {
         if (!(k in env)) delete merged[k];
       }
-      const r = spawnSync(process.execPath, [bin, ...args], { cwd: repo.dir, env: merged, encoding: 'utf8' });
+      // TEST_BIN: run another copy of the CLI (an installed one) instead of the checkout.
+      const useBin = merged.TEST_BIN ?? bin;
+      delete merged.TEST_BIN;
+      const r = spawnSync(process.execPath, [useBin, ...args], { cwd: repo.dir, env: merged, encoding: 'utf8' });
       let json = null;
       try { json = r.stdout ? JSON.parse(r.stdout) : null; } catch { /* leave null: the assertion on json will say so */ }
       return { code: r.status, json, stdout: r.stdout, stderr: r.stderr };
@@ -1481,6 +1484,19 @@ test('arbiter apply: --expect-model / --expect-effort are test switches; a norma
   const honoured = arbiterRun(w2, { model: 'claude-opus-5-1', effort: 'low', extraArgs: asked, env: { PIPELINE_TEST_MODE: '1' } });
   assert.equal(honoured.code, 0, honoured.stdout);
   assert.equal(honoured.json.ok, true);
+});
+
+test('arbiter apply: an installed copy ignores PIPELINE_TEST_MODE (with a warning); the proof stays pinned', (t) => {
+  const installed = join(realpathSync(mkdtempSync(join(tmpdir(), 'cp-installed-'))), 'pipeline');
+  t.after(() => rmSync(join(installed, '..'), { recursive: true, force: true }));
+  cpSync(join(here, '..', 'pipeline'), installed, { recursive: true });
+  writeFileSync(join(installed, 'INSTALLED.json'), '{}');
+  const w = readyForArbiter(t);
+  w.cli(['arbiter', 'needed', '--round', '1']);
+  const asked = ['--expect-model', 'claude-opus-', '--expect-effort', 'low'];
+  const r = arbiterRun(w, { model: 'claude-opus-5-1', effort: 'low', extraArgs: asked, env: { PIPELINE_TEST_MODE: '1', TEST_BIN: join(installed, 'bin', 'pipeline.mjs') } });
+  assertAllNeedHuman(w, r, /unexpected model claude-opus-5-1/);
+  assert.match(r.stderr, /ignoring PIPELINE_TEST_MODE/);
 });
 
 test('arbiter apply: PIPELINE_ARBITER_MODEL_OVERRIDE never relaxes the proof, not even for a model that looks right', (t) => {

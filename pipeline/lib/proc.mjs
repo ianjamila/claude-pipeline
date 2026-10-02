@@ -1,8 +1,10 @@
 // Every external process the pipeline starts goes through here, so Windows quirks live in one place:
 // npm/codex/vercel/npx are .cmd shims that spawn cannot run directly, and cmd.exe needs its own quoting.
 import { spawn, spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const MAX_BUFFER = 64 * 1024 * 1024;
 
@@ -270,9 +272,36 @@ export function splitCommand(str, platform = process.platform) {
   return out;
 }
 
-// Look the override up in the call's env first, then process.env.
-export function overrideCommand(name, fallback, env) {
+// ---- test seams are for the repo checkout only --------------------------------------------------------------------
+// PIPELINE_GH / PIPELINE_CODEX / PIPELINE_VERCEL swap the tool the gate trusts for a script, and PIPELINE_TEST_MODE relaxes
+// the arbiter's model proof. They exist so the test suite can run the real CLI against fakes; a production install must
+// never honour them (an environment variable set by anything that can launch the CLI would otherwise decide what the
+// gate sees). An installed copy is recognised by the INSTALLED.json manifest the installer writes into the pipeline root
+// (the directory holding bin/); the repo checkout has none. When installed, a seam is ignored with one warning on stderr.
+export const PIPELINE_ROOT = fileURLToPath(new URL('..', import.meta.url));
+export const SEAM_VARS = ['PIPELINE_GH', 'PIPELINE_CODEX', 'PIPELINE_VERCEL', 'PIPELINE_TEST_MODE'];
+export const isInstalledCopy = (root = PIPELINE_ROOT) => existsSync(path.join(root, 'INSTALLED.json'));
+
+const warned = new Set();
+// The value of a test seam variable (call env first, then process.env), or undefined when unset or not honoured.
+// `root` and `warn` are injectable for tests.
+export function seamValue(name, env, { root = PIPELINE_ROOT, warn = (m) => process.stderr.write(m) } = {}) {
   const raw = env?.[name] ?? process.env[name];
+  if (raw === undefined || raw === '') return undefined;
+  if (!isInstalledCopy(root)) return raw;
+  if (!warned.has(name)) {
+    warned.add(name);
+    warn(`pipeline: ignoring ${name}: test seams are not honoured by an installed copy\n`);
+  }
+  return undefined;
+}
+
+// A seam that is a switch: only the exact value `1` turns it on.
+export const seamFlag = (name, env, opts) => seamValue(name, env, opts) === '1';
+
+// Look the override up in the call's env first, then process.env (only when the seam is honoured).
+export function overrideCommand(name, fallback, env, opts) {
+  const raw = SEAM_VARS.includes(name) ? seamValue(name, env, opts) : (env?.[name] ?? process.env[name]);
   if (!raw || !raw.trim()) return { cmd: fallback, prefixArgs: [] };
   const [cmd, ...prefixArgs] = splitCommand(raw);
   return { cmd, prefixArgs };
