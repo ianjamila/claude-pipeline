@@ -50,11 +50,11 @@ const isCodeFile = (p, testGlobs) => !matchAny(p, NON_CODE_GLOBS) && !matchAny(p
 const BINARY_ASSET = /\.(?:png|jpe?g|gif|webp|avif|ico|svg|pdf|zip|gz|tgz|woff2?|ttf|otf|eot|mp4|mov|mp3|wav|wasm|bin|snap)$/i;
 
 const R2_PATH_GLOBS = [
-  '**/auth/**', '**/middleware.{ts,js,mjs,cjs}', '**/*rbac*/**', '**/*rbac*', '**/roles*', '**/roles*/**',
+  '**/auth/**', '**/middleware.{ts,tsx,js,jsx,mjs,mts,cjs,cts}', '**/*rbac*/**', '**/*rbac*', '**/roles*', '**/roles*/**',
   '**/permissions*', '**/permissions/**', '**/rls/**', '**/*policy*.{ts,js,mjs,sql}',
   // Beyond the spec: Next 16 renamed middleware.ts to proxy.ts; session/JWT modules; the admin-client / service-role
   // module itself; Supabase's auth settings.
-  '**/proxy.{ts,js,mjs,cjs}', '**/middleware/**', '**/authz*', '**/authn*', '**/session*', '**/session*/**', '**/jwt*',
+  '**/proxy.{ts,tsx,js,jsx,mjs,mts,cjs,cts}', '**/middleware/**', '**/authz*', '**/authn*', '**/session*', '**/session*/**', '**/jwt*',
   '**/jwt*/**', '**/supabase/admin.*', '**/*admin-client*', '**/*admin_client*', '**/*adminclient*', '**/*service-role*',
   '**/*service_role*', '**/*servicerole*', '**/supabase/config.toml',
 ];

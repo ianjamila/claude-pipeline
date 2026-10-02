@@ -390,7 +390,7 @@ test('7 SQL: a multi-line INSERT into a roles table with an admin value is caugh
 // ---- 8. auth paths and shapes ------------------------------------------------------------------------------------
 
 test('8 auth path rules: session, jwt, login logic, any auth/oauth/authz segment; not author/authority or pure UI', () => {
-  for (const p of ['lib/session.ts', 'lib/sessions/store.ts', 'lib/jwt.ts', 'lib/jwt/verify.ts', 'app/login/actions.ts', 'app/login/route.ts', 'app/signin/handler.ts', 'lib/oauth.ts', 'lib/authorize.ts', 'lib/useAuth.ts', 'app/(auth)/callback/x.ts', 'lib/authenticated.ts', 'lib/roles-map.ts', 'lib/rolesConfig.ts', 'lib/Roles/x.ts']) {
+  for (const p of ['lib/session.ts', 'lib/sessions/store.ts', 'lib/jwt.ts', 'lib/jwt/verify.ts', 'app/login/actions.ts', 'app/login/route.ts', 'app/signin/handler.ts', 'lib/oauth.ts', 'lib/authorize.ts', 'lib/useAuth.ts', 'app/(auth)/callback/x.ts', 'lib/authenticated.ts', 'lib/roles-map.ts', 'lib/rolesConfig.ts', 'lib/Roles/x.ts', 'middleware.tsx', 'src/middleware.mts', 'middleware.cts', 'middleware.jsx']) {
     assert.deepEqual(flags([file(p)]), ['R2-auth'], p);
   }
   for (const p of ['lib/author.ts', 'lib/authority.ts', 'lib/authors/list.ts', 'app/(public)/login/page.tsx', 'app/login/login-form.tsx', 'app/login/login.css', 'components/Author.tsx']) {
