@@ -13,6 +13,9 @@ import { join } from 'node:path';
 import { run } from './proc.mjs';
 import { parseUnifiedDiff } from './diff.mjs';
 
+// Upper bound for a git call that talks to a remote (fetch, push, ls-remote): a hung one inside a lock cannot be reclaimed.
+export const NETWORK_TIMEOUT_MS = 120_000;
+
 export class GitError extends Error {
   constructor({ args, code, stderr }) {
     super(`git ${args.join(' ')} failed (exit ${code})${stderr && stderr.trim() ? `: ${stderr.trim()}` : ''}`);
@@ -27,9 +30,14 @@ export class GitError extends Error {
 // leaving them to user config would let the same change hash differently on two machines.
 const FORCED_CONFIG = [
   '-c', 'core.quotePath=true', '-c', 'diff.noprefix=false', '-c', 'diff.mnemonicPrefix=false',
-  '-c', 'diff.renames=true', '-c', 'color.ui=false', '-c', 'core.autocrlf=false',
+  '-c', 'diff.renames=true', '-c', 'color.ui=false',
   '-c', 'diff.interHunkContext=0', '-c', 'diff.algorithm=myers', '-c', 'diff.indentHeuristic=true',
 ];
+// core.autocrlf is deliberately NOT forced for status / working-tree reads / `diff HEAD`: with Git for Windows' default
+// (autocrlf=true) a CRLF working file is the same content as its LF blob, and forcing false would make isClean() false
+// and move treeFingerprint after merely touching such a file. Commit-to-commit diffs read blobs only, but pin it there
+// anyway so their bytes cannot depend on a user's setting.
+const STABLE_CONFIG = ['-c', 'core.autocrlf=false'];
 // GIT_OPTIONAL_LOCKS=0: these are reads; they must never fight a concurrent git for the index lock.
 const GIT_ENV = { LC_ALL: 'C', GIT_OPTIONAL_LOCKS: '0' };
 // Variables that make git operate on some other repository than `cwd` (a hook or wrapper leaves them behind).
@@ -41,8 +49,9 @@ const SCRUBBED_ENV = Object.fromEntries([
 
 // Runs git with forced config; returns the raw result unless the process did not finish on its own. `env` is the
 // one way to point git elsewhere on purpose (e.g. GIT_CEILING_DIRECTORIES in a test).
-function exec(args, { cwd, run: runFn = run, input, env } = {}) {
-  const r = runFn('git', [...FORCED_CONFIG, ...args], { cwd, env: { ...SCRUBBED_ENV, ...GIT_ENV, ...env }, input });
+// `timeoutMs` bounds a call that can hang on the network (fetch, push); a timeout is a GitError like any other.
+function exec(args, { cwd, run: runFn = run, input, env, timeoutMs } = {}) {
+  const r = runFn('git', [...FORCED_CONFIG, ...args], { cwd, env: { ...SCRUBBED_ENV, ...GIT_ENV, ...env }, input, ...(timeoutMs ? { timeoutMs } : {}) });
   const abnormal = r.timedOut ? 'timed out' : r.signal ? `terminated by signal ${r.signal}` : null;
   if (abnormal) {
     throw new GitError({ args, code: r.code, stderr: [abnormal, (r.stderr ?? '').trim()].filter(Boolean).join(': ') });
@@ -105,7 +114,7 @@ export const revParse = (ref, o) => git(['rev-parse', '--verify', assertRef(ref,
 export function diffFiles(base, head, o) {
   const mb = mergeBase(base, head, o);
   const text = git([
-    'diff', '-M', '--unified=0', '--no-color', '--no-ext-diff', '--no-textconv', '--text', '--src-prefix=a/', '--dst-prefix=b/',
+    ...STABLE_CONFIG, 'diff', '-M', '--unified=0', '--no-color', '--no-ext-diff', '--no-textconv', '--text', '--src-prefix=a/', '--dst-prefix=b/',
     `${mb}..${assertRef(head, ['diff', head])}`,
   ], o);
   return parseUnifiedDiff(text);
@@ -181,7 +190,7 @@ function normaliseDiff(text) {
 export function contentHash(base, head, { exclude = [], ...o } = {}) {
   const mb = mergeBase(base, head, o);
   const text = git([
-    'diff', '--unified=3', '--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--src-prefix=a/', '--dst-prefix=b/',
+    ...STABLE_CONFIG, 'diff', '--unified=3', '--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--src-prefix=a/', '--dst-prefix=b/',
     `${mb}..${assertRef(head, ['diff', head])}`, '--', ':/', ...exclude.map((p) => `:(top,exclude,literal)${p}`),
   ], o);
   return createHash('sha256').update(normaliseDiff(text)).digest('hex');
