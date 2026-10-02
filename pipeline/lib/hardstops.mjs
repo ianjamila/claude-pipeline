@@ -93,13 +93,15 @@ const SENSITIVE_PATH = new RegExp(
   'biometric|facial|face[-_]?(?:recog|match|detect|api)|liveness|rekognition|fingerprint|selfie|' +
     'health[-_]?(?:record|data|info|card)|medical|patient|diagnos(?:is|es)(?![a-z])|payroll|payslip|salar(?:y|ies)|wage|' +
     'bank[-_]?account|philhealth|pag[-_]?ibig|' +
+    '(?<![a-z0-9])(?:compensations?|withholdings?|gov[-_]?contributions?|bir[-_]?2316)(?![a-z0-9])|(?<![0-9])13th[-_]?month(?![a-z0-9])|' +
     '(?<![a-z0-9])(?:bank(?:ing)?|faces?|pii|ssn|tin|sss)(?![a-z0-9])',
   'i',
 );
 // Terms inside added lines (word-bounded; `_` and camelCase count as separators).
 const SENSITIVE_TEXT = new RegExp(
   '(?<![a-z0-9])(?:payroll|payslip|salar(?:y|ies)|philhealth|pag-?ibig|sss_number|tin_number|biometric|face_embedding|' +
-    'fingerprint_template|bank_account|iban|routing_number|diagnosis|patient_id|medical_record)(?![a-z0-9])',
+    'fingerprint_template|bank_account|iban|routing_number|diagnosis|patient_id|medical_record|' +
+    'compensations?|withholdings?|gov[-_ ]?contributions?|bir[-_ ]?2316)(?![a-z0-9])|(?<![0-9])13th[-_ ]?month(?![a-z0-9])',
   'i',
 );
 // employeeTin.ts / validateSSN.ts / getPayroll() have no separator before the term; test a camelCase-split copy as well.
@@ -112,7 +114,8 @@ const isSensitiveText = (t) => SENSITIVE_TEXT.test(t) || SENSITIVE_TEXT.test(cam
 // ---------------------------------------------------------------------------------------------------------------
 
 const MASK = ''; // stands in for a comment character; same length as the original, so offsets line up.
-const SQL_SPECIAL = /--|\/\*|'|"|\$|;/g;
+// BEGIN ATOMIC / CASE / END are tracked so a `BEGIN ATOMIC ... END` function body is one statement (see scanSql).
+const SQL_SPECIAL = /--|\/\*|'|"|\$|;|\b(?:BEGIN\s+ATOMIC|CASE|END)\b/gi;
 const DOLLAR_TAG = /\$(?:[A-Za-z_\u0080-￿][\w\u0080-￿]*)?\$/y;
 const isIdentChar = (c) => c !== undefined && /[A-Za-z0-9_$\u0080-￿]/.test(c);
 
@@ -135,10 +138,12 @@ function endOfQuoted(text, start, backslash) {
 // (offsets of the statement-ending `;` that sit outside strings, comments and dollar-quoted bodies). Block comments do
 // not nest (Postgres nests them; ignoring that only ever exposes MORE text to the rules). A dollar-quoted body is
 // scanned recursively as code (plpgsql bodies are real code with real comments) but cannot end the outer statement.
+// A SQL-standard `BEGIN ATOMIC ... END` body (its CASE ... END pairs counted) likewise holds its `;`s inside ONE statement.
 function scanSql(text) {
   const out = [];
   const semis = [];
   const blank = (s) => s.replace(/[^\n]/g, MASK);
+  let atomic = 0; // 0 = outside a BEGIN ATOMIC body; else 1 + the number of open CASE
   let i = 0;
   while (i < text.length) {
     SQL_SPECIAL.lastIndex = i;
@@ -183,8 +188,15 @@ function scanSql(text) {
         out.push(tag);
         i = close + tag.length;
       }
+    } else if (tok !== ';') {
+      // A keyword token: only meaningful around a BEGIN ATOMIC body.
+      if (/^BEGIN/i.test(tok)) atomic = atomic === 0 ? 1 : atomic;
+      else if (atomic > 0 && /^CASE$/i.test(tok)) atomic++;
+      else if (atomic > 0 && /^END$/i.test(tok)) atomic--;
+      out.push(tok);
+      i += tok.length;
     } else {
-      semis.push(i);
+      if (atomic === 0) semis.push(i);
       out.push(';');
       i++;
     }
@@ -297,6 +309,9 @@ const R1_SQL = [
   ['EXECUTE (dynamic SQL)', re(String.raw`(?<!\b(?:GRANT|REVOKE)\s+)\bEXECUTE\b(?!\s+(?:FUNCTION|PROCEDURE|ON)\b)`)],
 ];
 
+// psql meta-commands run other files, shell commands or reconnect as someone else: nothing a diff of this line shows.
+const PSQL_META = /^\s*\\(?:(?:i|ir|include|include_relative|copy|connect|c|o|set|gset|g|gexec|lo_import|lo_export)(?![A-Za-z0-9_])|!)/;
+
 const R2_SQL = [
   ['POLICY', re(String.raw`\b(?:CREATE|ALTER|DROP)\s+POLICY\b`), re(String.raw`\b(?:CREATE|ALTER|DROP)\s+POLICY\b`)],
   ['ROW LEVEL SECURITY', re(String.raw`\b(?:ENABLE|DISABLE|FORCE|NO\s+FORCE)\s+ROW\s+LEVEL\s+SECURITY\b`), re(String.raw`\b(?:ENABLE|DISABLE|FORCE|NO\s+FORCE)\s+ROW\s+LEVEL\s+SECURITY\b`)],
@@ -403,6 +418,14 @@ const ENV_ACCESS = [
   new RegExp(String.raw`\benv\(\s*${Q}${NAME}${Q}`, 'g'),
   new RegExp(String.raw`\bENV\[\s*${Q}${NAME}${Q}\s*\]`, 'g'),
 ];
+// A validated env object (t3-env, SvelteKit's $env/*, a local `env` module): `env.NAME` reads count only in files that
+// import one, otherwise `env.FOO` is just a property. `$env/*` named imports are names in any file.
+const ENV_IMPORT = /import\s+(?:type\s+)?\{[^}]*\benv\b[^}]*\}\s*from|\$env\/(?:static|dynamic)\/|@t3-oss\/env|\bcreateEnv\s*\(|\bimport\s+env\s+from|\bconst\s*\{[^}]*\benv\b[^}]*\}\s*=\s*require/;
+const ENV_OBJ_ACCESS = [
+  new RegExp(String.raw`(?<![\w.$])env\.([A-Z][A-Z0-9_]*)(?![A-Za-z0-9_])`, 'g'),
+  new RegExp(String.raw`(?<![\w.$])env\[\s*${Q}([A-Z][A-Z0-9_]*)${Q}\s*\]`, 'g'),
+];
+const ENV_STATIC_IMPORT = /import\s*(?:type\s*)?\{([^}]*)\}\s*from\s*['"]\$env\/(?:static|dynamic)\/\w+['"]/g;
 const ENV_OBJECT = String.raw`(?:process\.env|import\.meta\.env|Bun\.env)\b`;
 const ENV_DESTRUCTURE = new RegExp(String.raw`\{([^{}]*)\}\s*=\s*${ENV_OBJECT}`, 'g');
 const ENV_DESTRUCTURE_TAIL = new RegExp(String.raw`^\s*\}\s*=\s*${ENV_OBJECT}`);
@@ -413,18 +436,34 @@ const ENV_ROOT = /process\.env|import\.meta\.env|Bun\.env|Deno\.env\.toObject|os
 const UNKNOWN_ENV = '(multi-line env destructuring)';
 // In files that already deal with env (a zod/createEnv schema, a destructure), a new `NAME:` / `NAME,` line is a new var.
 const ENV_SHAPE = /^\s*([A-Z][A-Z0-9_]{3,})\s*[:,]/;
-const ENV_MENTION = /process\.env|import\.meta\.env|z\.object|createEnv|Bun\.env|os\.environ/;
+const ENV_MENTION = /process\.env|import\.meta\.env|z\.object|createEnv|Bun\.env|os\.environ|\$env\//;
 
 // What one source line reads from the environment: literal names (plus UNKNOWN_ENV for a multi-line destructure) and
 // whether anything dynamic is left.
-export function scanEnvLine(text) {
+// `envObject`: the file imports an env object, so `env.NAME` / `env['NAME']` are reads too.
+export function scanEnvLine(text, { envObject = false } = {}) {
   const names = new Set();
   let rest = text;
+  rest = rest.replace(ENV_STATIC_IMPORT, (_m, inner) => {
+    for (const item of inner.split(',')) {
+      const id = /^\s*([A-Z][A-Z0-9_]*)\s*(?:as\b|$)/.exec(item);
+      if (id) names.add(id[1]);
+    }
+    return ' ';
+  });
   for (const r of ENV_ACCESS) {
     rest = rest.replace(r, (_m, name) => {
       names.add(name);
       return ' ';
     });
+  }
+  if (envObject) {
+    for (const r of ENV_OBJ_ACCESS) {
+      rest = rest.replace(r, (_m, name) => {
+        names.add(name);
+        return ' ';
+      });
+    }
   }
   rest = rest.replace(ENV_DESTRUCTURE, (_m, inner) => {
     for (const item of inner.split(',')) {
@@ -441,7 +480,7 @@ export function scanEnvLine(text) {
 }
 
 // Names of the environment variables read on one line of source.
-export const envNamesIn = (text) => scanEnvLine(text).names;
+export const envNamesIn = (text, opts) => scanEnvLine(text, opts).names;
 
 // ---------------------------------------------------------------------------------------------------------------
 // Dependencies (R5)
@@ -570,6 +609,88 @@ function flatRules({ file, base, head }, sink) {
   }
 }
 
+// Lockfiles: a direct dependency can jump a major with package.json untouched (an existing `^15` range, or a pin the lock
+// moves). Only DIRECT dependencies are judged (transitive churn is routine), by comparing the highest locked version.
+export const LOCKFILE = /^(?:package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock)$/i;
+const NPM_TOP = /^node_modules\/((?:@[^/]+\/)?[^/]+)$/;
+const add = (map, name, version) => {
+  if (typeof version === 'string' && /^\d/.test(version)) (map[name] ??= []).push(version);
+};
+
+// -> { versions: {name: [version]}, direct: [name] | null (the lockfile does not say) } or null when it cannot be read.
+export function parseLockfile(file, text) {
+  const base = baseName(file).toLowerCase();
+  const versions = Object.create(null);
+  if (base.endsWith('.json')) {
+    let j;
+    try {
+      j = JSON.parse(text);
+    } catch {
+      return null;
+    }
+    if (!isObj(j)) return null;
+    if (isObj(j.packages)) {
+      for (const [key, v] of Object.entries(j.packages)) {
+        const m = NPM_TOP.exec(key);
+        if (m && isObj(v)) add(versions, m[1], v.version);
+      }
+      const root = j.packages[''];
+      const direct = isObj(root) ? DEP_SECTIONS.flatMap((sec) => Object.keys(isObj(root[sec]) ? root[sec] : {})) : null;
+      return { versions, direct };
+    }
+    if (isObj(j.dependencies)) {
+      for (const [name, v] of Object.entries(j.dependencies)) if (isObj(v)) add(versions, name, v.version);
+      return { versions, direct: null };
+    }
+    return null;
+  }
+  const lines = text.split('\n');
+  if (base === 'pnpm-lock.yaml') {
+    if (!/^lockfileVersion\s*:/m.test(text)) return null;
+    for (const line of lines) {
+      const m = /^ {2}['"]?\/?((?:@[^/@\s'"]+\/)?[^@/\s'"]+)@(\d[^(:'"\s]*)/.exec(line) ?? /^ {2}['"]?\/((?:@[^/\s'"]+\/)?[^/\s'"]+)\/(\d[^_(:'"\s/]*)/.exec(line);
+      if (m) add(versions, m[1], m[2]);
+    }
+    return { versions, direct: null };
+  }
+  // yarn.lock (classic `version "1.2.3"`, berry `version: 1.2.3`): header lines name every requested range of one entry.
+  let names = [];
+  let sawEntry = false;
+  for (const line of lines) {
+    if (line.trim() === '' || line.startsWith('#')) continue;
+    if (!/^\s/.test(line)) {
+      names = [];
+      if (!line.trimEnd().endsWith(':') || line.startsWith('__metadata')) continue;
+      sawEntry = true;
+      for (const part of line.trimEnd().slice(0, -1).split(',')) {
+        const spec = part.trim().replace(/^["']|["']$/g, '');
+        const at = spec.indexOf('@', 1);
+        if (at > 0) names.push(spec.slice(0, at));
+      }
+      continue;
+    }
+    const v = /^ {2}version:?\s+["']?([^"'\s]+)/.exec(line);
+    if (v) for (const n of new Set(names)) add(versions, n, v[1]);
+  }
+  const content = lines.some((l) => l.trim() !== '' && !l.startsWith('#') && !l.startsWith('__metadata') && !/^\s/.test(l));
+  if (!sawEntry && content) return null;
+  return { versions, direct: null };
+}
+
+const highest = (list) => list.map((v) => ({ v, ...parseRange(v) })).filter((x) => 'major' in x).sort((a, b) => b.major - a.major || b.minor - a.minor)[0];
+
+// Direct dependencies whose highest locked version moved a major (or a 0.x minor, or down a major).
+function lockRules({ file, base, head, direct }, sink) {
+  for (const name of direct ?? Object.keys(head)) {
+    const a = base[name] && highest(base[name]);
+    const b = head[name] && highest(head[name]);
+    if (!a || !b) continue; // new, removed or unreadable: not a bump
+    if (b.major > a.major || b.major < a.major || (a.major === 0 && b.minor > a.minor)) {
+      sink.add('R5-major-dep', file, `${name} ${a.v} -> ${b.v} (lockfile major bump)`);
+    }
+  }
+}
+
 const PY_NAME = '[A-Za-z0-9][A-Za-z0-9._-]*';
 const PY_SPEC = String.raw`(?:(?:===|==|~=|!=|<=|>=|<|>)\s*[\w.*+!-]+\s*,?\s*)`;
 const normName = (n) => n.toLowerCase().replace(/[_.]+/g, '-');
@@ -691,8 +812,8 @@ function pathRules(d, cx, sink) {
 }
 
 // Everything the env rules say about one added line, shared with the IO wrapper so both agree on what a "candidate" is.
-function envFinding(l, envish) {
-  const { names, dynamic } = scanEnvLine(l.text);
+function envFinding(l, envish, envObject) {
+  const { names, dynamic } = scanEnvLine(l.text, { envObject });
   const shape = envish ? ENV_SHAPE.exec(l.text)?.[1] : undefined;
   return { names, dynamic, possible: shape && !names.includes(shape) ? shape : undefined };
 }
@@ -702,6 +823,7 @@ function addedCodeRules(d, added, cx, env, sink) {
   const isWorkflow = d.paths.some((p) => inc(p, WORKFLOW_GLOBS));
   const isVercel = d.paths.some((p) => baseName(p).toLowerCase() === 'vercel.json');
   const envish = env.envFiles ? env.envFiles.has(d.file) : [...added, ...d.removed].some((l) => ENV_MENTION.test(l.text));
+  const envObject = env.importFiles ? env.importFiles.has(d.file) : ENV_IMPORT.test([...added, ...d.removed].map((l) => l.text).join('\n'));
 
   if (d.sql) {
     for (const l of maskLines(added)) {
@@ -710,6 +832,7 @@ function addedCodeRules(d, added, cx, env, sink) {
       if (r1) sink.add('R1-destructive', d.file, `destructive SQL: ${r1}`, ex);
       const r2 = firstSql(R2_SQL, l.masked, false);
       if (r2) sink.add('R2-auth', d.file, `auth/RLS SQL: ${r2}`, ex);
+      if (PSQL_META.test(l.masked)) sink.add('R1-destructive', d.file, 'psql meta-command (runs other files/programs)', ex);
     }
   }
 
@@ -735,7 +858,7 @@ function addedCodeRules(d, added, cx, env, sink) {
     if (isWorkflow && SECRETS_REF.test(l.text)) sink.add('R3-secrets', d.file, 'workflow reads secrets.*', ex);
     if (isVercel && VERCEL_KEY.test(l.text)) sink.add('R3-secrets', d.file, 'vercel.json env/build/deploy setting changed', ex);
 
-    const found = envFinding(l, envish);
+    const found = envFinding(l, envish, envObject);
     const parts = [];
     const fresh = found.names.filter((n) => !env.known.has(n));
     if (fresh.length > 0) parts.push(`new env var ${fresh.join(', ')}`);
@@ -804,13 +927,14 @@ const needs = (cond, msg) => {
 //                    (name -> specifier map: requirements.txt / pyproject.toml), [{file, error}] (unparseable)
 //   sqlStatements [{file, text}]: whole statements around changed lines of .sql files, from base and head
 //   envFiles      Set of changed files that mention process.env / z.object / createEnv (default: judged from the diff lines)
+//   envImportFiles  Set of changed files that import an env object, so `env.NAME` is a read (default: judged from the diff lines)
 // Throws TypeError when the diff touches SQL or package.json and sqlStatements / pkgPairs (or basePkg+headPkg) are missing.
 // Returns hits `{ rule, file, line?, excerpt?, detail }`.
-export function classifyHardStops({ files, config, baseEnvNames = new Set(), basePkg, headPkg, pkgPairs, sqlStatements, envFiles }) {
+export function classifyHardStops({ files, config, baseEnvNames = new Set(), basePkg, headPkg, pkgPairs, sqlStatements, envFiles, envImportFiles }) {
   const cx = settings(config);
   const sink = makeSink();
   const known = new Set(baseEnvNames);
-  const env = { known, envFiles: envFiles === undefined ? null : new Set(envFiles) };
+  const env = { known, envFiles: envFiles === undefined ? null : new Set(envFiles), importFiles: envImportFiles === undefined ? null : new Set(envImportFiles) };
 
   const pairs = [...(pkgPairs ?? [])];
   if (basePkg !== undefined || headPkg !== undefined) pairs.push({ file: 'package.json', base: basePkg ?? null, head: headPkg ?? null });
@@ -820,6 +944,9 @@ export function classifyHardStops({ files, config, baseEnvNames = new Set(), bas
     if (baseName(d.file).toLowerCase() === 'package.json') {
       needs(pairs.some((p) => p.file === d.file), `the diff touches ${d.file} but no pkgPairs entry (or basePkg/headPkg) was given`);
     }
+    if (LOCKFILE.test(baseName(d.file))) {
+      needs(pairs.some((p) => p.file === d.file), `the diff touches ${d.file} but no pkgPairs entry was given`);
+    }
     if (d.sql && !d.binary && d.added.length + d.removed.length > 0) {
       needs(Array.isArray(sqlStatements), `the diff changes SQL (${d.file}) but sqlStatements was not given`);
     }
@@ -828,7 +955,10 @@ export function classifyHardStops({ files, config, baseEnvNames = new Set(), bas
   }
 
   for (const pair of pairs) {
-    if (pair.error) sink.add('R5-major-dep', pair.file, `${baseName(pair.file)} could not be parsed (${pair.error}); dependency changes unchecked`);
+    if (pair.kind === 'lock') {
+      if (pair.error) sink.add('R0-unscannable', pair.file, `${baseName(pair.file)} could not be parsed (${pair.error}); dependency changes unchecked`);
+      else lockRules(pair, sink);
+    } else if (pair.error) sink.add('R5-major-dep', pair.file, `${baseName(pair.file)} could not be parsed (${pair.error}); dependency changes unchecked`);
     else if (pair.kind === 'flat') flatRules(pair, sink);
     else npmRules(pair, sink);
   }
@@ -871,6 +1001,10 @@ function accessPatterns(name) {
     String.raw`env\([[:space:]]*${q}${name}${q}`,
     String.raw`ENV\[[[:space:]]*${q}${name}${q}[[:space:]]*\]`,
     String.raw`\{([^}]*[^A-Za-z0-9_}])?${name}([^A-Za-z0-9_}][^}]*)?\}[[:space:]]*=[[:space:]]*(process\.env|import\.meta\.env|Bun\.env)`,
+    // An imported env object (`env.NAME`) and SvelteKit's `$env/*` named imports; the leading char keeps `a.env.NAME` out.
+    String.raw`(^|[^A-Za-z0-9_.$])env\.${name}${end}`,
+    String.raw`(^|[^A-Za-z0-9_.$])env\[[[:space:]]*${q}${name}${q}[[:space:]]*\]`,
+    String.raw`import[[:space:]]*(type[[:space:]]+)?\{([^}]*[^A-Za-z0-9_}])?${name}([^A-Za-z0-9_}][^}]*)?\}[[:space:]]*from[[:space:]]*${q}\$env/`,
   ];
 }
 
@@ -888,7 +1022,7 @@ function knownEnvNames(ref, names, o) {
       if (e instanceof GitError && e.code === 1) continue; // git grep: no match
       throw e;
     }
-    for (const line of out.split('\n')) for (const name of envNamesIn(line)) known.add(name);
+    for (const line of out.split('\n')) for (const name of envNamesIn(line, { envObject: true })) known.add(name);
   }
   return known;
 }
@@ -911,6 +1045,7 @@ export async function collectHardStops({ base, head, cwd, config }) {
 
   // Env: which changed files deal with env, and every name an added line reads (or, in those files, looks like it declares).
   const envFiles = new Set();
+  const envImportFiles = new Set();
   const candidates = new Set();
   for (const [i, d] of ds.entries()) {
     if (!d.addedIsCode) continue;
@@ -919,9 +1054,15 @@ export async function collectHardStops({ base, head, cwd, config }) {
       envish = ENV_MENTION.test(showFile(head, d.newPath, o) ?? ''); // the schema may sit outside the changed lines
     }
     if (envish) envFiles.add(d.file);
+    // `env.NAME` counts when the file imports an env object: on a changed line, or on an unchanged one (read the head file).
+    let envObject = ENV_IMPORT.test([...d.added, ...d.removed].filter((l) => l.text.length <= MAX_LINE).map((l) => l.text).join('\n'));
+    if (!envObject && d.newPath && d.added.some((l) => l.text.length <= MAX_LINE && /(?<![\w.$])env[.[]/.test(l.text))) {
+      envObject = ENV_IMPORT.test(showFile(head, d.newPath, o) ?? '');
+    }
+    if (envObject) envImportFiles.add(d.file);
     for (const l of files[i].added) {
       if (l.text.length > MAX_LINE) continue;
-      const f = envFinding(l, envish);
+      const f = envFinding(l, envish, envObject);
       for (const n of [...f.names, f.possible]) if (n) candidates.add(n);
     }
   }
@@ -931,6 +1072,29 @@ export async function collectHardStops({ base, head, cwd, config }) {
   const pkgPairs = [];
   for (const f of files) {
     const names = [f.oldPath, f.newPath].filter(Boolean);
+    if (names.some((p) => LOCKFILE.test(baseName(p)))) {
+      const file = f.path ?? f.newPath ?? f.oldPath;
+      const dir = (f.newPath ?? f.oldPath).includes('/') ? `${(f.newPath ?? f.oldPath).slice(0, (f.newPath ?? f.oldPath).lastIndexOf('/'))}/` : '';
+      const before = f.oldPath ? showFile(mb, f.oldPath, o) : null;
+      const after = f.newPath ? showFile(head, f.newPath, o) : null;
+      const b = before === null ? { versions: {}, direct: [] } : parseLockfile(f.oldPath, before);
+      const h = after === null ? { versions: {}, direct: [] } : parseLockfile(f.newPath, after);
+      if (!b || !h) {
+        pkgPairs.push({ file, kind: 'lock', error: !h && !b ? 'base and head' : !h ? 'head' : 'base' });
+        continue;
+      }
+      // Direct names: package.json beside the lockfile (head and base), plus the lockfile's own root entry; if neither
+      // tells us, every locked package counts as direct.
+      let direct = null;
+      const known = [b.direct, h.direct];
+      for (const text of [showFile(head, `${dir}package.json`, o), showFile(mb, `${dir}package.json`, o)]) {
+        const parsed = text === null ? null : parseJson(text).value;
+        if (isObj(parsed)) known.push(DEP_SECTIONS.flatMap((sec) => Object.keys(isObj(parsed[sec]) ? parsed[sec] : {})));
+      }
+      if (known.some(Array.isArray)) direct = [...new Set(known.filter(Array.isArray).flat())];
+      pkgPairs.push({ file, kind: 'lock', base: b.versions, head: h.versions, direct });
+      continue;
+    }
     const isNpm = names.some((p) => baseName(p) === 'package.json');
     const isPy = names.some((p) => /^requirements[^/]*\.txt$/i.test(baseName(p)) || baseName(p).toLowerCase() === 'pyproject.toml');
     if (!isNpm && !isPy) continue;
@@ -965,5 +1129,5 @@ export async function collectHardStops({ base, head, cwd, config }) {
     }
   }
 
-  return classifyHardStops({ files, config, baseEnvNames, pkgPairs, sqlStatements, envFiles });
+  return classifyHardStops({ files, config, baseEnvNames, pkgPairs, sqlStatements, envFiles, envImportFiles });
 }
