@@ -2,10 +2,11 @@
 // Why: verify resets the database (`supabase db reset`) and runs pgTAP against it. On a shared dev stack that would wipe
 // a developer's data, and two worktrees would fight over the same ports. So the project's supabase/ directory is copied
 // into .verify/supabase-workdir/, its project_id gets a "-pipeline" suffix (own containers) and every port is shifted by
-// a fixed offset (own ports). Nothing here ever touches a remote project: only local commands, never --linked/--db-url.
+// an offset derived from the project name (own ports; see portOffsetFor). Nothing here ever touches a remote project: only local commands, never --linked/--db-url.
 // verify.mjs holds the machine-wide "db-<project>" lock while using this instance, so two verifies never overlap.
 // CLI: node scripts/pipeline/supabase-local.mjs reset-and-test --project X   |   ... env --project X
 // Vendored into projects by `pipeline vendor` (imports ./lib/*).
+import { createHash } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, rmdirSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -14,6 +15,16 @@ import { git } from './lib/git.mjs';
 import { run, splitCommand } from './lib/proc.mjs';
 
 export const DEFAULT_PORT_OFFSET = 1000;
+
+// Two projects verifying at once (the lock is per project) must not share ports. The offset comes from a stable hash of
+// the project name: 1000 + 20 * (0..299) = 1000..6980, so the dedicated stack uses 55320..61309 (a step of 20 keeps each
+// project's ten ports, and the inspector port, apart) and never the developer's own stack (offset 0). The e2e smoke server
+// gets 4310 + (0..499) = 4310..4809 from another slice of the same hash and learns it through PIPELINE_SMOKE_PORT.
+// Two names can still hash alike (1 in 300): pass --port-offset for one of them.
+const hashOf = (project) => createHash('sha256').update(slug(project).toLowerCase()).digest();
+export const portOffsetFor = (project) => DEFAULT_PORT_OFFSET + 20 * (hashOf(project).readUInt32BE(0) % 300);
+export const SMOKE_PORT_BASE = 4310;
+export const smokePortFor = (project) => SMOKE_PORT_BASE + (hashOf(project).readUInt32BE(4) % 500);
 // Services verify never needs. `inbucket` is the old name of `mailpit`; the CLI only accepts the names it knows, so the
 // list is intersected with what `supabase start --help` advertises (see excludeFlag).
 const EXCLUDE_WANTED = ['studio', 'imgproxy', 'edge-runtime', 'logflare', 'vector', 'inbucket', 'mailpit'];
@@ -174,7 +185,8 @@ export function resetAndTest({ workdir, supabaseBin = 'supabase', cwd = dirname(
 }
 
 // KEY=value lines the build / e2e steps run with.
-export function envLines(info) {
+// With `project`, also the e2e smoke port (PIPELINE_SMOKE_PORT, read by playwright.smoke.config.ts).
+export function envLines(info, { project } = {}) {
   const pairs = [
     ['NEXT_PUBLIC_SUPABASE_URL', info.apiUrl],
     ['SUPABASE_URL', info.apiUrl],
@@ -183,10 +195,11 @@ export function envLines(info) {
     ['SUPABASE_SERVICE_ROLE_KEY', info.serviceRoleKey],
     ['DATABASE_URL', info.dbUrl],
   ];
+  if (project !== undefined) pairs.push(['PIPELINE_SMOKE_PORT', String(smokePortFor(project))]);
   return pairs.filter(([, v]) => v).map(([k, v]) => `${k}=${v}`);
 }
 
-const USAGE = 'usage: supabase-local.mjs reset-and-test|env --project NAME [--repo DIR] [--port-offset N]   (PIPELINE_SUPABASE overrides the supabase command)';
+const USAGE = 'usage: supabase-local.mjs reset-and-test|env --project NAME [--repo DIR] [--port-offset N]   (port offset default: derived from the project name; PIPELINE_SUPABASE overrides the supabase command)';
 
 export async function main(argv = process.argv.slice(2), { env = process.env, cwd = process.cwd() } = {}) {
   try {
@@ -199,14 +212,14 @@ export async function main(argv = process.argv.slice(2), { env = process.env, cw
     const [command, ...rest] = positionals;
     if (!['reset-and-test', 'env'].includes(command) || rest.length > 0) throw new Error(USAGE);
     if (!values.project) throw new Error(`missing --project\n${USAGE}`);
-    const portOffset = values['port-offset'] === undefined ? DEFAULT_PORT_OFFSET : Number(values['port-offset']);
+    const portOffset = values['port-offset'] === undefined ? portOffsetFor(values.project) : Number(values['port-offset']);
     if (!Number.isInteger(portOffset)) throw new Error('--port-offset must be an integer');
     const repoRoot = values.repo ? resolve(cwd, values.repo) : git(['rev-parse', '--show-toplevel'], { cwd }).trim();
     const supabaseBin = env.PIPELINE_SUPABASE?.trim() || 'supabase';
 
     const info = ensureDedicatedInstance({ repoRoot, project: values.project, portOffset, supabaseBin });
     if (command === 'env') {
-      process.stdout.write(`${envLines(info).join('\n')}\n`);
+      process.stdout.write(`${envLines(info, { project: values.project }).join('\n')}\n`);
       return 0;
     }
     const r = resetAndTest({ workdir: info.workdir, supabaseBin });

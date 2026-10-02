@@ -74,6 +74,27 @@ function manifest(l) {
 
 const repoRel = (rel) => posix(...DEST, rel);
 
+// What a project's .gitattributes must say so that vendored bytes survive a checkout: with Git for Windows' default
+// autocrlf=true every vendored .mjs would be rewritten to CRLF and `vendor --check` (a byte comparison) would report
+// drift; the POSIX shim must stay LF or `sh` chokes on it.
+const ATTRIBUTES = ['scripts/pipeline/** -text', 'scripts/verify text eol=lf'];
+const ATTRIBUTES_NOTE = '# claude-pipeline: vendored scripts are byte-exact (vendor --check); the POSIX shim must keep LF endings';
+const attributeLines = (text) => new Set(text.split(/\r?\n/).map((l) => l.trim().replace(/\s+/g, ' ')).filter(Boolean));
+
+// Appends whichever ATTRIBUTES lines are missing (idempotent: a second run changes nothing). Returns what it added.
+function ensureAttributes(root) {
+  const file = join(root, '.gitattributes');
+  const have = existsSync(file) ? readFileSync(file, 'utf8') : '';
+  const present = attributeLines(have);
+  const missing = ATTRIBUTES.filter((l) => !present.has(l));
+  if (missing.length === 0) return [];
+  const eol = have.includes('\r\n') ? '\r\n' : '\n';
+  const head = have === '' || have.endsWith('\n') ? '' : eol;
+  const note = present.has(ATTRIBUTES_NOTE) ? [] : [ATTRIBUTES_NOTE];
+  writeFileSync(file, `${have}${head}${[...note, ...missing].join(eol)}${eol}`);
+  return missing;
+}
+
 export async function run(argv) {
   const { values } = parseCommandArgs(argv, { repo: { type: 'string' }, check: { type: 'boolean' } }, { allowPositionals: false });
   const dir = requireOption(values, 'repo');
@@ -108,7 +129,16 @@ export async function run(argv) {
       if (have !== want) drift.push({ file: repoRel(VERSION_FILE), reason: `version ${have} != pipeline ${want}` });
     }
     if (drift.length > 0) return { exitCode: EXIT.FAILED, output: { ok: false, drift } };
-    return { exitCode: EXIT.OK, output: { ok: true, files: allFiles, version: readFileSync(vfile, 'utf8').trim() } };
+    const gaFile = join(root, '.gitattributes');
+    const present = attributeLines(existsSync(gaFile) ? readFileSync(gaFile, 'utf8') : '');
+    const unpinned = ATTRIBUTES.filter((l) => !present.has(l));
+    return {
+      exitCode: EXIT.OK,
+      output: {
+        ok: true, files: allFiles, version: readFileSync(vfile, 'utf8').trim(),
+        ...(unpinned.length ? { warnings: [`.gitattributes lacks ${unpinned.map((l) => JSON.stringify(l)).join(', ')}: with autocrlf a Windows checkout rewrites the vendored files and this check reports drift; run \`pipeline vendor\` to add it`] } : {}),
+      },
+    };
   }
 
   for (const it of items) {
@@ -117,6 +147,7 @@ export async function run(argv) {
     copyFileSync(it.src, dest);
   }
   writeFileSync(join(target, VERSION_FILE), `${version}\n`);
-  return { exitCode: EXIT.OK, output: { ok: true, files: allFiles, version } };
+  const attributesAdded = ensureAttributes(root);
+  return { exitCode: EXIT.OK, output: { ok: true, files: allFiles, version, gitattributes: attributesAdded } };
 }
 

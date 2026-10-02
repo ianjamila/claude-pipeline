@@ -15,5 +15,7 @@ if (files.length === 0) {
   console.error('no test files matched');
   process.exit(2);
 }
-const r = spawnSync(process.execPath, ['--test', ...files], { stdio: 'inherit' });
+// A fixed machine id keeps lock tests from creating ~/.claude/pipeline-state/machine-id on the developer's machine.
+const env = { ...process.env, PIPELINE_MACHINE_ID: process.env.PIPELINE_MACHINE_ID || 'test-machine-id' };
+const r = spawnSync(process.execPath, ['--test', ...files], { stdio: 'inherit', env });
 process.exit(r.status ?? 1);

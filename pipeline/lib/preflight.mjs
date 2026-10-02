@@ -3,7 +3,7 @@
 // Fail closed everywhere: a lookup that errors is never read as "fine" (an unreadable pause list means
 // paused; unreadable protection means no protection). Codex is the one exception, by design: its
 // absence defers the review (awaiting-review) but does not stop the pipeline from running.
-import { loadConfig } from './config.mjs';
+import { loadConfig, requiredChecks } from './config.mjs';
 import { repoRoot } from './repo.mjs';
 import { isClean } from './git.mjs';
 import { run, codexCommand } from './proc.mjs';
@@ -113,7 +113,7 @@ export async function runPreflight({ cwd, env = process.env, gh = createGitHub({
   }
 
   const declared = cfg?.enforcement ?? null;
-  const enforcement = await probeEnforcement(gh, declared, cfg?.ci?.required_checks ?? []);
+  const enforcement = await probeEnforcement(gh, declared, requiredChecks(cfg?.ci));
   const pause = await openIssues(gh, 'pipeline-pause');
   const rollback = await openIssues(gh, 'pipeline-rollback');
 

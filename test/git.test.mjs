@@ -414,7 +414,7 @@ test('git() forces its config and environment through an injected runner, and re
   assert.equal(calls[0].cmd, 'git');
   assert.deepEqual(calls[0].args, [
     '-c', 'core.quotePath=true', '-c', 'diff.noprefix=false', '-c', 'diff.mnemonicPrefix=false',
-    '-c', 'diff.renames=true', '-c', 'color.ui=false', '-c', 'core.autocrlf=false',
+    '-c', 'diff.renames=true', '-c', 'color.ui=false',
     '-c', 'diff.interHunkContext=0', '-c', 'diff.algorithm=myers', '-c', 'diff.indentHeuristic=true', 'status', '--short',
   ]);
   assert.equal(calls[0].opts.cwd, '/somewhere');
@@ -423,6 +423,10 @@ test('git() forces its config and environment through an injected runner, and re
   for (const k of REDIRECTING_ENV) {
     assert.ok(k in calls[0].opts.env && calls[0].opts.env[k] === undefined, `${k} must be scrubbed from the child env`);
   }
+  git(['fetch'], { run: fake, timeoutMs: 5000 });
+  assert.equal(calls.at(-1).opts.timeoutMs, 5000, 'a timeout reaches the runner');
+  assert.equal('timeoutMs' in calls[0].opts, false, 'and is absent when not asked for');
+  calls.pop();
   git(['status'], { run: fake, env: { GIT_DIR: '/explicit' } });
   assert.equal(calls[1].opts.env.GIT_DIR, '/explicit'); // unless the caller asks for it
   assert.equal(calls[1].opts.env.GIT_WORK_TREE, undefined);
@@ -746,4 +750,33 @@ test('contentHash: a mode-only change (chmod +x) changes the hash', () => {
   makeExecutable(repo, 'src/a.js');
   repo.git(['commit', '-q', '-m', 'make a executable']);
   assert.notEqual(contentHash('main', 'mode', o), contentHash('main', 'mode-other', o));
+});
+
+test('autocrlf=true (Git for Windows default): touching a CRLF working file neither dirties isClean nor moves treeFingerprint', () => {
+  const { repo, o } = baseRepo();
+  repo.git(['config', 'core.autocrlf', 'true']);
+  // Re-checkout so the working copy has CRLF endings and a fresh index entry, as a Git for Windows checkout does.
+  repo.rm('src/a.js');
+  repo.git(['checkout', '--', 'src/a.js']);
+  const f0 = treeFingerprint(o);
+  assert.equal(isClean(o), true);
+  // An editor saving the same text again (CRLF) is not a change.
+  repo.write('src/a.js', 'one\r\ntwo\r\nthree\r\n');
+  assert.equal(isClean(o), true, 'a CRLF working copy of an LF blob is not a change under autocrlf=true');
+  assert.equal(treeFingerprint(o), f0, 'and must not change the tree fingerprint');
+  repo.write('src/a.js', 'one\r\ntwo\r\nthree!\r\n');
+  assert.equal(isClean(o), false);
+  assert.notEqual(treeFingerprint(o), f0);
+});
+
+test('contentHash and diffFiles stay byte-stable between commits whatever the user\'s autocrlf', () => {
+  const { repo, o } = baseRepo();
+  repo.branch('feat');
+  repo.write('src/a.js', 'one\r\ntwo\r\nthree\r\nfour\r\n');
+  repo.git(['config', 'core.autocrlf', 'false']);
+  repo.commit('crlf edit');
+  const off = contentHash('main', 'feat', o);
+  repo.git(['config', 'core.autocrlf', 'true']);
+  assert.equal(contentHash('main', 'feat', o), off);
+  assert.deepEqual(diffFiles('main', 'feat', o).map((f) => f.path), ['src/a.js']);
 });

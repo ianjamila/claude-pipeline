@@ -282,12 +282,34 @@ test('envLines prints the variables the build and e2e steps need', async () => {
   assert.deepEqual(envLines({ apiUrl: 'u', dbUrl: 'd', anonKey: null, serviceRoleKey: null }), ['NEXT_PUBLIC_SUPABASE_URL=u', 'SUPABASE_URL=u', 'DATABASE_URL=d']);
 });
 
+test('port offset and smoke port derive from a stable hash of the project name, inside the documented ranges', async () => {
+  const { portOffsetFor, smokePortFor } = await lib();
+  const names = ['drmed', 'eaglewatch', 'claude-pipeline', 'demo', 'My App', 'x'];
+  const offsets = names.map(portOffsetFor);
+  const smoke = names.map(smokePortFor);
+  for (const o of offsets) assert.ok(o >= 1000 && o <= 6980 && (o - 1000) % 20 === 0, String(o));
+  for (const p of smoke) assert.ok(p >= 4310 && p <= 4809, String(p));
+  assert.deepEqual(names.map(portOffsetFor), offsets, 'stable between calls');
+  assert.equal(portOffsetFor('Demo'), portOffsetFor('demo'), 'case-insensitive, like the container name');
+  assert.ok(new Set(offsets).size >= 5, 'different projects get different offsets');
+  assert.ok(new Set(smoke).size >= 5, 'and different smoke ports');
+  assert.notEqual(portOffsetFor('drmed'), portOffsetFor('eaglewatch'));
+  assert.notEqual(smokePortFor('drmed'), smokePortFor('eaglewatch'));
+});
+
+test('envLines without a project does not invent a smoke port, with one it adds PIPELINE_SMOKE_PORT', async () => {
+  const { envLines, smokePortFor } = await lib();
+  assert.ok(!envLines({ apiUrl: 'u', dbUrl: 'd' }).some((l) => l.startsWith('PIPELINE_SMOKE_PORT')));
+  assert.ok(envLines({ apiUrl: 'u', dbUrl: 'd' }, { project: 'p' }).includes(`PIPELINE_SMOKE_PORT=${smokePortFor('p')}`));
+});
+
 // ---- CLI ---------------------------------------------------------------------------------------------------------
 
 const cliRun = (repo, args, extraEnv = {}) =>
   runNode(['scripts/pipeline/supabase-local.mjs', ...args], { cwd: repo.dir, env: { PIPELINE_SUPABASE: fakeBin, ...extraEnv } });
 
 test('CLI env prints KEY=value lines for the dedicated instance', async () => {
+  const { smokePortFor } = await lib();
   const repo = await withSupabase();
   const f = fake();
   const r = await cliRun(repo, ['env', '--project', 'demo'], f.env);
@@ -299,7 +321,17 @@ test('CLI env prints KEY=value lines for the dedicated instance', async () => {
     'SUPABASE_ANON_KEY=anon-key',
     'SUPABASE_SERVICE_ROLE_KEY=service-key',
     'DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55322/postgres',
+    `PIPELINE_SMOKE_PORT=${smokePortFor('demo')}`,
   ]);
+});
+
+test('CLI uses the name-derived port offset unless --port-offset is given', async () => {
+  const { portOffsetFor } = await lib();
+  const repo = await withSupabase();
+  const r = await cliRun(repo, ['env', '--project', 'demo'], fake().env);
+  assert.equal(r.code, 0, r.stderr);
+  const api = 54321 + portOffsetFor('demo');
+  assert.match(readFileSync(join(repo.dir, '.verify', 'supabase-workdir', 'supabase', 'config.toml'), 'utf8'), new RegExp(`^port = ${api}$`, 'm'));
 });
 
 test('CLI reset-and-test exits 0 on success and 1 when reset or tests fail, printing the CLI output', async () => {

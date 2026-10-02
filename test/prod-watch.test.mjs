@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { run as procRun } from '../pipeline/lib/proc.mjs';
-import { GitError } from '../pipeline/lib/git.mjs';
+import { GitError, git as gitRunReal } from '../pipeline/lib/git.mjs';
 import { fill } from '../pipeline/lib/config.mjs';
 import {
   runProdWatch, exitCodeFor, hostOf, readKnownGood, createGitOps, createSmoke, issueTitle,
@@ -316,6 +316,34 @@ test('a newer deployment that is ALSO failing does not protect ours: recovery co
   assert.match(h.issueCreate.calls[0][0].body, /also fails the smoke/);
 });
 
+test('post-rollback and superseded smokes do NOT carry the new build\'s --expect-text (the old build cannot contain it)', async () => {
+  const h = harness({ smoke: [FAIL, FAIL, PASS], inspect: [OURS, OURS, OLDER] });
+  const r = await h.go({ expectText: 'New heading' });
+  assert.equal(r.outcome, 'recovered', 'a healthy old deployment must not read as rollback-failed');
+  assert.deepEqual(h.smoke.calls.map((c) => c[0].expectText), ['New heading', 'New heading', null]);
+  assert.equal(h.revertBranch.calls.length, 1);
+
+  const s = harness({ smoke: [FAIL, FAIL, PASS], inspect: [NEWER] });
+  assert.equal((await s.go({ expectText: 'New heading' })).outcome, 'superseded');
+  assert.equal(s.smoke.calls[2][0].expectText, null);
+});
+
+test('not-live: the merge\'s deployment succeeded but production still serves the known-good one (no promotion after a manual rollback): nothing is rolled back', async () => {
+  // Same host as the recorded known-good.
+  const h = harness({ smoke: [FAIL, FAIL, PASS], inspect: [OLDER] });
+  const r = await h.go({ expectText: 'New heading' });
+  assert.equal(r.outcome, 'not-live');
+  assert.equal(h.rollbackFn.calls.length, 0);
+  assert.equal(h.revertBranch.calls.length, 0);
+  assert.match(r.reason, /known-good/);
+  assert.deepEqual(h.issueCreate.calls[0][0].labels, ['needs-human']);
+  assert.match(h.issueCreate.calls[0][0].title, /not-live/);
+  // By id, when only an id was recorded.
+  const byId = harness({ smoke: [FAIL, FAIL, PASS], inspect: [OLDER], readKnownGood: () => ({ ok: true, id: 'dpl_old', url: '', sha: null }) });
+  assert.equal((await byId.go()).outcome, 'not-live');
+  assert.equal(byId.rollbackFn.calls.length, 0);
+});
+
 test('changed-during-recovery: the live deployment moved between the check and the rollback, so NOTHING is rolled back', async () => {
   const h = harness({ smoke: [FAIL, FAIL], inspect: [OURS, NEWER] });
   const r = await h.go();
@@ -594,6 +622,20 @@ test('createGitOps: reverts a squash merge in a temp worktree, pushes agent/reve
   assert.equal(repo.git(['worktree', 'list', '--porcelain']).match(/^worktree /gm).length, 1, 'the temp worktree is gone');
   assert.equal(existsSync(join(repo.dir, '.worktrees', 'revert-12')), false);
   assert.equal(repo.git(['config', '--get', 'branch.agent/revert-12.merge']).trim(), 'refs/heads/agent/revert-12', 'pushed with -u');
+});
+
+test('createGitOps: fetch and push (which run inside the production lock) carry a timeout', async () => {
+  const { repo } = repoWithOrigin();
+  repo.write('app.txt', 'v2\n');
+  const merge = repo.commit('Add widget (#12)');
+  repo.git(['push', '-q', 'origin', 'main']);
+  const seen = [];
+  const ops = createGitOps({ root: repo.dir, gitFn: (args, o) => { seen.push({ args, timeoutMs: o.timeoutMs }); return gitRunReal(args, o); } });
+  await ops.revertBranch({ sha: merge, branch: 'agent/revert-12', base: 'main', dirName: 'revert-12', worktreeDir: join(repo.dir, '.worktrees') });
+  for (const verb of ['fetch', 'push']) {
+    const c = seen.find((x) => x.args[0] === verb);
+    assert.ok(c?.timeoutMs > 0, `${verb} needs a timeout`);
+  }
 });
 
 test('createGitOps: a true merge commit is reverted with -m 1 (keeping the first-parent side)', async () => {

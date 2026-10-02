@@ -2,6 +2,8 @@
 // developer's dev server or the full E2E suite.
 import { defineConfig, devices } from '@playwright/test';
 
+// verify's supabase-local env step exports PIPELINE_SMOKE_PORT (4310..4809, from a hash of the project name), so two
+// projects verifying at once never share a port; 4310 is only the standalone fallback.
 const PORT = Number(process.env.PIPELINE_SMOKE_PORT || 4310);
 
 export default defineConfig({

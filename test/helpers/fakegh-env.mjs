@@ -62,7 +62,8 @@ export function fullProtection(checks = ['ci']) {
 export const REPO_VIEW = { nameWithOwner: 'acme/widgets', defaultBranchRef: { name: 'main' } };
 
 // A minimal valid .claude/pipeline.yml declaring the given enforcement mode and required checks.
-export const pipelineYml = (enforcement = 'github', checks = ['ci']) => [
+// guardChecks stays false here: most tests are about the configured list, not the always-required guard contexts.
+export const pipelineYml = (enforcement = 'github', checks = ['ci'], { guardChecks = false } = {}) => [
   'version: 1',
   'project: demo',
   `enforcement: ${enforcement}`,
@@ -71,5 +72,6 @@ export const pipelineYml = (enforcement = 'github', checks = ['ci']) => [
   '  quick: npm run verify:quick',
   'ci:',
   `  required_checks: [${checks.join(', ')}]`,
+  `  guard_checks: ${guardChecks}`,
   '',
 ].join('\n');

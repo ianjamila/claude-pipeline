@@ -3,7 +3,9 @@
 // A lock is a directory made with mkdirSync (atomic: EEXIST means held) holding owner.json, published exclusively
 // (hard link, so the first writer wins). A crashed holder is reclaimed only when that is provably safe: its PID is
 // dead on this host, or the lock was never finished (no usable owner.json for 60 s). A live PID is never reclaimed
-// however old; another host's lock is never reclaimed at all. Reclaiming is serialized by a guard directory that
+// however old; another machine's lock is never reclaimed at all. "This machine" means the same hostname OR the same
+// machine id (a random id persisted once under ~/.claude/pipeline-state): macOS hostnames change with the network, and
+// a lock left under the old name must not be stuck forever. Reclaiming is serialized by a guard directory that
 // has an owner of its own and is judged by the same rules, so no two reclaimers can both believe they hold it.
 import fs from 'node:fs'; // default import: calls go through the object so tests can mock.method(fs, ...)
 import os from 'node:os';
@@ -59,6 +61,44 @@ function describeOwner(owner) {
 export function defaultLockDir() {
   return path.join(os.homedir(), '.claude', 'pipeline-state', 'locks');
 }
+
+const MACHINE_ID_RE = /^[A-Za-z0-9._-]{8,80}$/;
+let cachedMachineId;
+
+// A stable id for this machine, independent of its hostname: PIPELINE_MACHINE_ID if set, else a random id created once
+// in ~/.claude/pipeline-state/machine-id (a home directory shared between machines would share it, so keep the state
+// dir local). null when it can be neither read nor created: callers then fall back to comparing hostnames only, which is
+// the old, stricter behaviour (never a wrong reclaim).
+export function machineId({ env = process.env, stateDir = path.join(os.homedir(), '.claude', 'pipeline-state') } = {}) {
+  const fromEnv = String(env.PIPELINE_MACHINE_ID ?? '').trim();
+  if (fromEnv) return MACHINE_ID_RE.test(fromEnv) ? fromEnv : null;
+  if (cachedMachineId !== undefined && stateDir === path.join(os.homedir(), '.claude', 'pipeline-state')) return cachedMachineId;
+  const file = path.join(stateDir, 'machine-id');
+  let id = null;
+  const read = () => {
+    try {
+      const text = fs.readFileSync(file, 'utf8').trim();
+      return MACHINE_ID_RE.test(text) ? text : null;
+    } catch {
+      return null;
+    }
+  };
+  id = read();
+  if (!id) {
+    try {
+      fs.mkdirSync(stateDir, { recursive: true });
+      fs.writeFileSync(file, `${randomUUID()}\n`, { flag: 'wx' });
+    } catch {
+      /* lost a race (EEXIST) or cannot write: read whatever is there now */
+    }
+    id = read();
+  }
+  if (stateDir === path.join(os.homedir(), '.claude', 'pipeline-state')) cachedMachineId = id;
+  return id;
+}
+
+// Is a lock owner's process on THIS machine (so its PID can be checked)? Same hostname, or same machine id.
+const isLocalOwner = (owner, ctx) => owner.host === ctx.host || (Boolean(ctx.machineId) && owner.machineId === ctx.machineId);
 
 // EPERM means the process exists but belongs to someone else: alive. Only ESRCH proves it is gone, and any other
 // surprise also counts as alive because wrongly reclaiming a live lock is the one unforgivable mistake.
@@ -125,7 +165,8 @@ const incompleteOwner = (name) => ({ name, runId: null, pid: null, host: null, s
 const nameOf = (lockPath) => path.basename(lockPath).replace(/\.lock$/, '');
 
 // One look at a lock: absent | held (owner) | stale (owner, reason). Never mutates anything.
-function assess(lockPath, { now, host, isAlive }) {
+function assess(lockPath, ctx) {
+  const { now, isAlive } = ctx;
   let st;
   try {
     st = fs.statSync(lockPath);
@@ -135,7 +176,7 @@ function assess(lockPath, { now, host, isAlive }) {
   }
   const owner = readOwner(lockPath);
   if (owner) {
-    if (owner.host !== host) return { state: 'held', owner };
+    if (!isLocalOwner(owner, ctx)) return { state: 'held', owner };
     if (isAlive(owner.pid)) return { state: 'held', owner };
     return { state: 'stale', owner, reason: 'owner process is dead' };
   }
@@ -260,7 +301,7 @@ function breakGuard(guard, ctx) {
   }
   const owner = readOwner(guard);
   if (owner) {
-    if (owner.host !== ctx.host || ctx.isAlive(owner.pid)) return 'busy';
+    if (!isLocalOwner(owner, ctx) || ctx.isAlive(owner.pid)) return 'busy';
   } else if (ctx.now - Number(seen.mtimeMs) <= GUARD_STALE_MS) {
     return 'busy';
   }
@@ -296,6 +337,7 @@ function reclaim(lockPath, ctx) {
   const me = {
     pid: process.pid,
     host: ctx.host,
+    ...(ctx.machineId ? { machineId: ctx.machineId } : {}),
     runId: `${process.pid}-${randomUUID()}`,
     createdAt: new Date(ctx.now).toISOString(),
   };
@@ -325,13 +367,14 @@ export function tryAcquire(
     now = Date.now(),
     pid = process.pid,
     host = os.hostname(),
+    machineId: machine = machineId(),
     isAlive = isPidAlive,
     hooks = {},
   } = {},
 ) {
   const lockPath = lockPathFor(dir, name);
   fs.mkdirSync(dir, { recursive: true });
-  const ctx = { now, host, isAlive, hooks };
+  const ctx = { now, host, machineId: machine, isAlive, hooks };
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     if (tryMkdir(lockPath)) {
       const owner = {
@@ -339,6 +382,7 @@ export function tryAcquire(
         runId: runId ?? `${pid}-${randomUUID()}`,
         pid,
         host,
+        ...(machine ? { machineId: machine } : {}),
         startedAt: new Date(now).toISOString(),
       };
       let published;

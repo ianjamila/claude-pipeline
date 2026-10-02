@@ -270,6 +270,79 @@ for (const [name, value] of [
   });
 }
 
+// libpq honours host=/hostaddr= over the URL's own host, and every common Postgres variable counts, not just three.
+for (const [name, value] of [
+  ['DATABASE_URL', 'postgresql://localhost/db?host=db.prod.supabase.co'],
+  ['DATABASE_URL', 'postgresql://localhost/db?hostaddr=203.0.113.9'],
+  ['DATABASE_URL', 'postgresql://localhost:5432,db.prod.supabase.co:5432/db'],
+  ['DATABASE_URL', 'host=db.prod.supabase.co dbname=postgres user=u'],
+  ['DATABASE_URL', "hostaddr='203.0.113.9' dbname=postgres"],
+  ['POSTGRES_URL', REMOTE_DB],
+  ['POSTGRES_URL_NON_POOLING', REMOTE_DB],
+  ['POSTGRES_PRISMA_URL', REMOTE_DB],
+  ['DIRECT_URL', REMOTE_DB],
+  ['SUPABASE_DB_URL', REMOTE_DB],
+  ['PGHOST', 'db.prod.supabase.co'],
+  ['PGHOST', 'localhost,db.prod.supabase.co'],
+  ['PGHOSTADDR', '203.0.113.9'],
+]) {
+  test(`refuses ${name}=${value.slice(0, 40)}`, async () => {
+    const repo = await setup();
+    const r = await verify(repo, [], [{ name: 'a', cmd: touch('ran-a'), quick: false }], { env: { ...process.env, [name]: value } });
+    assert.equal(r.exitCode, 2);
+    assert.ok(!existsSync(join(repo.dir, 'ran-a')));
+    assert.match(reportOf(repo).error, new RegExp(`^refusing to run: ${name} points at non-local host`));
+    assert.doesNotMatch(JSON.stringify(reportOf(repo)) + r.err, /s3cr3t-pass/);
+  });
+}
+
+test('local variants of those variables are accepted (socket directories, localhost lists, host= pointing at localhost)', async () => {
+  const repo = await setup();
+  for (const [name, value] of [
+    ['DATABASE_URL', 'postgresql://postgres@localhost/db?host=127.0.0.1'],
+    ['DATABASE_URL', 'postgresql:///db?host=/var/run/postgresql'],
+    ['DATABASE_URL', 'host=localhost dbname=postgres'],
+    ['DATABASE_URL', 'dbname=postgres user=u'],
+    ['PGHOST', 'localhost'],
+    ['PGHOST', '/var/run/postgresql'],
+    ['PGHOST', '127.0.0.1,::1'],
+    ['PGHOSTADDR', '127.0.0.1'],
+    ['POSTGRES_URL', 'postgresql://postgres:postgres@127.0.0.1:55322/postgres'],
+  ]) {
+    const r = await verify(repo, [], [pass('a')], { env: { ...process.env, [name]: value } });
+    assert.equal(r.exitCode, 0, `${name}=${value}: ${r.err}`);
+  }
+});
+
+// The repo's own .env files reach the db steps even when the shell never exported the variable.
+for (const file of ['.env', '.env.local', '.env.test', '.env.development', '.env.test.local', '.env.development.local']) {
+  test(`refuses a remote database URL in ${file} (exit 2, file named, password not echoed)`, async () => {
+    const repo = await setup({ files: { [file]: `# comment\nFOO=bar\nexport DATABASE_URL="${REMOTE_DB}"\n` } });
+    const r = await verify(repo, [], [{ name: 'a', cmd: touch('ran-a'), quick: false }], { env: { ...process.env, DATABASE_URL: undefined } });
+    assert.equal(r.exitCode, 2, r.err);
+    assert.ok(!existsSync(join(repo.dir, 'ran-a')));
+    const error = reportOf(repo).error;
+    assert.ok(error.includes(`DATABASE_URL points at non-local host "db.abcdefgh.supabase.co" (in ${file})`), error);
+    assert.doesNotMatch(JSON.stringify(reportOf(repo)) + r.err + r.out, /s3cr3t-pass/);
+  });
+}
+
+test('.env files: local values pass, quotes/comments/export are understood, and a process value (or step env) that sets the variable wins over the file', async () => {
+  const local = await setup({ files: { '.env.local': "DATABASE_URL='postgresql://postgres:postgres@127.0.0.1:55322/postgres' # local\nSUPABASE_URL=http://localhost:55321\n", '.env.test': 'PGHOST=localhost\n' } });
+  assert.equal((await verify(local, [], [pass('a')], { env: { ...process.env, DATABASE_URL: undefined } })).exitCode, 0);
+
+  const remoteFile = await setup({ files: { '.env.local': `DATABASE_URL=${REMOTE_DB}\nPOSTGRES_URL=${REMOTE_DB}\n` } });
+  const shadowed = await verify(remoteFile, [], [pass('a')], {
+    env: { ...process.env, DATABASE_URL: 'postgresql://postgres:postgres@127.0.0.1:55322/postgres', POSTGRES_URL: 'postgresql://postgres:postgres@127.0.0.1:55322/postgres' },
+  });
+  assert.equal(shadowed.exitCode, 0, shadowed.err);
+  const viaStepEnv = await verify(remoteFile, [], [pass('a', { env: () => ({ DATABASE_URL: 'http://127.0.0.1:1', POSTGRES_URL: 'http://127.0.0.1:1' }) })], { env: { ...process.env, DATABASE_URL: undefined, POSTGRES_URL: undefined } });
+  assert.equal(viaStepEnv.exitCode, 0, viaStepEnv.err);
+  const partial = await verify(remoteFile, [], [pass('a')], { env: { ...process.env, DATABASE_URL: 'postgresql://postgres:postgres@127.0.0.1:55322/postgres', POSTGRES_URL: undefined } });
+  assert.equal(partial.exitCode, 2, 'POSTGRES_URL is still only defined by the remote file');
+  assert.match(reportOf(remoteFile).error, /POSTGRES_URL points at non-local host/);
+});
+
 test('local database URLs are accepted', async () => {
   const repo = await setup();
   const env = {
@@ -422,6 +495,9 @@ test('the template ships a documented example STEPS block and vendored imports o
   for (const name of ['install', 'typecheck', 'lint', 'unit', 'db', 'build', 'e2e']) assert.match(text, new RegExp(`name: '${name}'`));
   assert.match(text, /lockGroup: 'db'/);
   assert.match(text, /quickCmd:/);
+  // Playwright only autoloads playwright.config.*: the smoke config has to be named, and its port comes from the env step.
+  assert.match(text, /name: 'e2e', cmd: 'npx playwright test -c playwright\.smoke\.config\.ts --project=smoke'/);
+  assert.match(readFileSync(join(dirname(template), '..', 'e2e', 'playwright.smoke.config.ts'), 'utf8'), /process\.env\.PIPELINE_SMOKE_PORT/);
   for (const m of text.matchAll(/from '(\.[^']+)'/g)) assert.match(m[1], /^\.\/pipeline\/lib\//, `${m[1]} must come from scripts/pipeline/lib`);
 });
 

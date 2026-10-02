@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseYaml } from '../pipeline/lib/yaml.mjs';
-import { DEFAULTS, validateConfig, loadConfig, fill } from '../pipeline/lib/config.mjs';
+import { DEFAULTS, GUARD_CHECKS, requiredChecks, validateConfig, loadConfig, fill } from '../pipeline/lib/config.mjs';
 
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
 const fixture = (name) => parseYaml(fs.readFileSync(path.join(fixtures, name), 'utf8'));
@@ -528,4 +528,36 @@ test('ci.e2e_label must be a string or null; ci.draft_while_iterating must be a 
     assert.ok(has(validateConfig({ ...minimal(), ci: { draft_while_iterating: bad } }), 'ci.draft_while_iterating'), JSON.stringify(bad));
   }
   assert.equal(validateConfig({ ...minimal(), ci: { draft_while_iterating: true } }).ok, true);
+});
+
+test('ci.guard_checks defaults to true, must be a boolean, and requiredChecks adds the two guard contexts', () => {
+  const r = validateConfig(minimal());
+  assert.equal(r.config.ci.guard_checks, true);
+  assert.deepEqual(requiredChecks(r.config.ci), ['Test integrity', 'Hard-stop scan']);
+  assert.deepEqual(requiredChecks({ required_checks: ['build', 'Test integrity'], guard_checks: true }), ['build', 'Test integrity', 'Hard-stop scan']);
+  assert.deepEqual(requiredChecks({ required_checks: ['build'], guard_checks: false }), ['build']);
+  assert.deepEqual([...GUARD_CHECKS], ['Test integrity', 'Hard-stop scan']);
+  const bad = validateConfig({ ...minimal(), ci: { guard_checks: 'no' } });
+  assert.equal(bad.ok, false);
+  assert.ok(has(bad, 'ci.guard_checks must be a boolean'));
+});
+
+test('required_checks that omit the guard contexts WARN (not fail); guard_checks: false or listing them is silent', () => {
+  const omitted = validateConfig({ ...minimal(), ci: { required_checks: ['build'] } });
+  assert.equal(omitted.ok, true);
+  assert.equal(omitted.warnings.length, 1);
+  assert.match(omitted.warnings[0], /"Test integrity" and "Hard-stop scan"/);
+  assert.equal(validateConfig(minimal()).warnings.length, 1, 'the default [] omits them too');
+  assert.deepEqual(validateConfig({ ...minimal(), ci: { required_checks: ['Test integrity', 'Hard-stop scan', 'build'] } }).warnings, []);
+  assert.deepEqual(validateConfig({ ...minimal(), ci: { required_checks: ['build'], guard_checks: false } }).warnings, []);
+  assert.match(validateConfig({ ...minimal(), ci: { required_checks: ['Test integrity'] } }).warnings[0], /"Hard-stop scan"/);
+});
+
+test('ci.approvers: defaults to [], accepts GitHub logins (incl. bots), rejects anything else', () => {
+  assert.deepEqual(validateConfig(minimal()).config.ci.approvers, []);
+  assert.equal(validateConfig({ ...minimal(), ci: { approvers: ['alice', 'Bob-2', 'dependabot[bot]'] } }).ok, true);
+  for (const bad of ['alice', [''], ['a b'], [1], ['-x'], ['a/b']]) {
+    const r = validateConfig({ ...minimal(), ci: { approvers: bad } });
+    assert.ok(has(r, 'ci.approvers must be an array of GitHub logins'), JSON.stringify(bad));
+  }
 });

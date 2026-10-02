@@ -2,3 +2,5 @@
 test/fixtures/** -text
 *.sh text eol=lf
 *.mjs text eol=lf
+# The POSIX verify shim has no extension: pin LF so `sh` never sees CRLF.
+pipeline/templates/scripts/verify text eol=lf

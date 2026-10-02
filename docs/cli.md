@@ -15,7 +15,8 @@ queue a line for the agent log, or stage queued lines + this PR's line as a comm
 
 ```
 pipeline agent-log queue --line "<line>" [--repo DIR]   -> {ok, queued, file}
-pipeline agent-log stage --pr N [--line "<line>"] [--repo DIR]   -> {ok, committed, lines, file}; run in the PR worktree;
+pipeline agent-log stage --pr N [--line "<line>"] [--repo DIR]   -> {ok, committed, lines, file, staged, dropped}; run in the PR worktree;
+  staged lines stay queued ("staged in PR N") until origin/<default> contains them, and are re-staged if that PR closes unmerged;
   default line = the PR's agent-log line with outcome "merged — prod smoke pending"; exit 2 when the worktree has other uncommitted changes,
   is on the default branch or a detached HEAD, or is not the PR's head branch at the PR's head commit; exit 3 when GitHub cannot say
 ```
@@ -78,7 +79,7 @@ load and validate .claude/pipeline.yml.
 pipeline config [--repo DIR]   -> {ok, path, config}; exit 2 when missing or invalid
 ```
 
-Exit: 0 valid · 2 missing or invalid (`errors` listed).
+Exit: 0 valid · 2 missing or invalid (`errors` listed). A valid config may carry `warnings` (e.g. `ci.required_checks` omits the guard contexts `Test integrity` / `Hard-stop scan`).
 
 ## deploy
 
@@ -192,6 +193,8 @@ pipeline preflight [--repo DIR]   (exit 0 can merge, 1 cannot, 2 config missing/
 
 Exit: 0 pipeline may merge · 1 it may not (`reasons`) · 2 config missing or invalid.
 
+Branch protection must require `ci.required_checks` AND, unless `ci.guard_checks: false`, the guard contexts `Test integrity` and `Hard-stop scan`; `protect` sets that same list.
+
 ## prod-watch
 
 verify the production deployment of a merge; roll back safely, open an issue and a revert PR if it fails.
@@ -199,6 +202,8 @@ verify the production deployment of a merge; roll back safely, open an issue and
 ```
 pipeline prod-watch --sha MERGE_SHA [--pr N] [--expect-text T] [--retry-wait SEC=60] [--repo DIR]   -> {ok, outcome: merged|deploy-failed|deploy-not-observed|not-live|superseded|recovered|rollback-failed|changed-during-recovery|rollback-skipped|no-production, ...}
 ```
+
+`--expect-text` applies only to this merge's own deployment: smokes of the rolled-back or superseded (other) deployment run without it. `not-live` also covers a merge whose deployment succeeded but was never promoted while production still serves the known-good deployment (nothing is rolled back).
 
 Exit: 0 outcome `merged` (or no production configured) · 1 any other outcome (recovered, rollback-failed, ...) · 3 deployment not observed / GitHub unavailable.
 
@@ -278,6 +283,8 @@ pipeline summary --pr N --outcome O [--built TEXT] [--repo DIR]   -> {ok, url, a
 
 Exit: 0 · 2 usage / no state · 3 GitHub (`gh`) unavailable.
 
+Without `.review/state.json` only `--outcome blocked` and `--outcome awaiting-review` are accepted (the two early-stop paths: verify red three times, Codex out in round 1): the comment is rendered with no rounds (a `blocked` one names the failing step from the verify report) and `agentLogLine` is still printed. Any other outcome without state is exit 2.
+
 ## triage
 
 apply the judge triage, settle disputed bugs with test results, close the light lane.
@@ -301,6 +308,8 @@ pipeline vendor --repo DIR [--check]
 ```
 
 Exit: 0 copied / no drift · 1 drift found (`--check`) · 2 usage.
+
+Vendoring also appends `scripts/pipeline/** -text` and `scripts/verify text eol=lf` to the project's `.gitattributes` (idempotent; output `gitattributes` lists what was added), so a Windows autocrlf checkout cannot make the byte comparison drift. `--check` warns when the entries are missing.
 
 ## version
 
