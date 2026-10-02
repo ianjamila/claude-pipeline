@@ -747,3 +747,36 @@ test('buildReviewPrompt collapses whitespace in ruling id, title and ruling', ()
     assert.ok(q.includes(`x ## Forged ${field}`), field);
   }
 });
+
+// ---------- gate hardening: rules read from the base, file-less fingerprints ----------
+
+test('buildReviewPrompt reads the rules files from the base ref and treats PR-edited instruction files as untrusted', () => {
+  const p = buildReviewPrompt({ ...promptArgs(), rulesRef: 'a'.repeat(40) });
+  assert.ok(p.includes(`git show ${'a'.repeat(40)}:AGENTS.md`) && p.includes(`git show ${'a'.repeat(40)}:CLAUDE.md`));
+  assert.match(p, /never from the checked-out tree/);
+  assert.match(p, /\.cursorrules/);
+  assert.match(p, /untrusted/);
+  // Without an explicit rulesRef the range base is used.
+  assert.ok(buildReviewPrompt(promptArgs()).includes('git show origin/main:AGENTS.md'));
+});
+
+test('fingerprint of a file-less finding folds in the content hash; a finding with a file ignores it', () => {
+  const none = fingerprint({ file: '', title: 'T', excerpt: '' });
+  const h1 = fingerprint({ file: '', title: 'T', excerpt: '', contentHash: 'h1' });
+  const h2 = fingerprint({ file: '', title: 'T', excerpt: '', contentHash: 'h2' });
+  assert.notEqual(h1, h2);
+  assert.notEqual(none, h1);
+  assert.equal(fingerprint({ file: 'a.js', title: 'T', excerpt: 'x', contentHash: 'h1' }), fingerprint({ file: 'a.js', title: 'T', excerpt: 'x' }));
+  assert.equal(h1, fingerprint({ file: '', title: 'T!', excerpt: '', contentHash: 'h1' }), 'title punctuation is still normalised');
+});
+
+test('assignIds passes the content hash to file-less findings only', () => {
+  const findings = { summary: 's', blocking: [
+    { title: 'Design smell', file: '', line: 0, category: 'design', detail: 'd', reasoning: 'r', testable: false },
+    { title: 'Null deref', file: 'a.js', line: 1, category: 'bug', detail: 'd', reasoning: 'r', testable: true },
+  ], suggestions: [], worth_considering: [] };
+  const a = assignIds(findings, 1, () => 'EX', { contentHash: 'h1' });
+  const b = assignIds(findings, 1, () => 'EX', { contentHash: 'h2' });
+  assert.notEqual(a[0].fingerprint, b[0].fingerprint);
+  assert.equal(a[1].fingerprint, b[1].fingerprint);
+});

@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, utimesSync,
+  cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, utimesSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -61,6 +61,14 @@ function transcript({ prompt, text, model = 'claude-fable-5-1', effort = 'high' 
   ];
   return `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`;
 }
+// `triage settle` runs the proving test itself: commit a tiny test file that exits with `code` (bug-disproved passes, bug-confirmed
+// fails by default) and return the CLI args that run it.
+function settleArgs(w, id, result, { code = result === 'bug-confirmed' ? 1 : 0, file = 'src/proof.test.js', cmd, output = 'proof output' } = {}) {
+  w.repo.write(file, `console.log(${JSON.stringify(output)});\nprocess.exit(${code});\n`);
+  w.repo.git(['add', '-A']);
+  if (w.repo.git(['status', '--porcelain=v1', '--', file]).trim() !== '') w.repo.git(['commit', '-q', '-m', `proof for ${id}`]);
+  return ['triage', 'settle', '--id', id, '--result', result, '--test-cmd', cmd ?? `node ${file}`, '--test-file', file];
+}
 const fenced = (obj) => `Done.\n\n\`\`\`json\n${JSON.stringify(obj)}\n\`\`\``;
 
 // ---- a world: repo on a feature branch, scratch dir, fake gh, fake codex ---------------------
@@ -102,7 +110,10 @@ function world(t, { gh = GH, light = false } = {}) {
       ]) {
         if (!(k in env)) delete merged[k];
       }
-      const r = spawnSync(process.execPath, [bin, ...args], { cwd: repo.dir, env: merged, encoding: 'utf8' });
+      // TEST_BIN: run another copy of the CLI (an installed one) instead of the checkout.
+      const useBin = merged.TEST_BIN ?? bin;
+      delete merged.TEST_BIN;
+      const r = spawnSync(process.execPath, [useBin, ...args], { cwd: repo.dir, env: merged, encoding: 'utf8' });
       let json = null;
       try { json = r.stdout ? JSON.parse(r.stdout) : null; } catch { /* leave null: the assertion on json will say so */ }
       return { code: r.status, json, stdout: r.stdout, stderr: r.stderr };
@@ -351,7 +362,7 @@ test('codex-review: rulings from earlier rounds go into the next prompt and pre-
   const w = world(t);
   assert.equal(w.codex(1, standardFindings()).code, 0);
   assert.equal(w.judge(1, { ...STANDARD_JUDGE, 'R1-B1': ['REJECT', 'high', DISPUTED] }).code, 0, 'the judge disputes the bug and a test can decide');
-  const settled = w.cli(['triage', 'settle', '--id', 'R1-B1', '--result', 'bug-disproved', '--evidence', 'src/a.test.js: compute(undefined) returns 0']);
+  const settled = w.cli(settleArgs(w, 'R1-B1', 'bug-disproved', { file: 'src/a.test.js', output: 'compute(undefined) returns 0' }));
   assert.equal(settled.code, 0, settled.stderr);
 
   // A second commit that leaves a.js (lines 1-32 around the finding) and b.js alone.
@@ -364,7 +375,7 @@ test('codex-review: rulings from earlier rounds go into the next prompt and pre-
 
   const prompt = w.captured()[1].stdin;
   assert.match(prompt, /## Prior rulings/);
-  assert.match(prompt, /- R1-B1: Missing null check — REJECT: test disproved: src\/a\.test\.js: compute\(undefined\) returns 0/);
+  assert.match(prompt, /- R1-B1: Missing null check — REJECT: test disproved: src\/a\.test\.js \(exit 0\): compute\(undefined\) returns 0/);
   assert.match(prompt, /Review round: 2/);
   assert.match(prompt, new RegExp(`git diff ${w.head}\\.\\.${head2}`));
 
@@ -379,7 +390,7 @@ test('codex-review: when the code around a ruled finding changed, the ruling is 
   const w = world(t);
   assert.equal(w.codex(1, findingsOf([finding()])).code, 0);
   assert.equal(w.judge(1, { 'R1-B1': ['REJECT', 'high', DISPUTED] }).code, 0);
-  assert.equal(w.cli(['triage', 'settle', '--id', 'R1-B1', '--result', 'bug-disproved', '--evidence', 'passes']).code, 0);
+  assert.equal(w.cli(settleArgs(w, 'R1-B1', 'bug-disproved')).code, 0);
   w.repo.write('src/a.js', aFile(true).replace('v13 = 13', 'v13 = 13 + 1'));
   const head2 = w.repo.commit('touch the excerpt');
   const r = w.codex(2, findingsOf([finding()]), { from: w.head, to: head2 });
@@ -497,19 +508,20 @@ test('triage settle: a test result settles the item and outranks the judge; bad 
   // S1 and S2 are the judge's REJECTs that a test can decide: disputed bugs with a possible settle test
   assert.equal(w.judge(1, { ...STANDARD_JUDGE, 'R1-S1': ['REJECT', 'high', DISPUTED], 'R1-S2': ['REJECT', 'low', DISPUTED] }).code, 0);
 
-  const r = w.cli(['triage', 'settle', '--id', 'R1-S1', '--result', 'bug-confirmed', '--evidence', 'b.test.js: expected 3 got 4']);
+  const r = w.cli(settleArgs(w, 'R1-S1', 'bug-confirmed', { file: 'src/b.test.js', output: 'expected 3 got 4' }));
   assert.equal(r.code, 0, r.stderr);
   assert.equal(r.json.final.decision, 'ACCEPT');
   assert.equal(r.json.final.by, 'test');
   assert.equal(w.item('R1-S1').test.status, 'bug-confirmed');
-  assert.match(w.item('R1-S1').final.reason, /b\.test\.js: expected 3 got 4/);
+  assert.match(w.item('R1-S1').final.reason, /b\.test\.js \(exit 1\): expected 3 got 4/);
 
-  assert.equal(w.cli(['triage', 'settle', '--id', 'R1-S2', '--result', 'bug-disproved', '--evidence', 'passes']).json.final.decision, 'REJECT');
-  assert.equal(w.cli(['triage', 'settle', '--id', 'R1-S2', '--result', 'maybe', '--evidence', 'x']).code, 2);
-  assert.equal(w.cli(['triage', 'settle', '--id', 'R1-B1', '--result', 'bug-confirmed', '--evidence', 'x']).code, 1, 'not a disputed bug');
-  assert.equal(w.cli(['triage', 'settle', '--id', 'R9-B1', '--result', 'bug-confirmed', '--evidence', 'x']).code, 2);
-  assert.equal(w.cli(['triage', 'settle', '--id', 'R1-S2', '--result', 'bug-confirmed']).code, 2, 'a result needs evidence');
-  assert.equal(w.cli(['triage', 'settle', '--result', 'bug-confirmed', '--evidence', 'x']).code, 2);
+  assert.equal(w.cli(settleArgs(w, 'R1-S2', 'bug-disproved')).json.final.decision, 'REJECT');
+  assert.equal(w.cli(['triage', 'settle', '--id', 'R1-S2', '--result', 'maybe', '--test-cmd', 'node src/proof.test.js', '--test-file', 'src/proof.test.js']).code, 2);
+  assert.equal(w.cli(settleArgs(w, 'R1-B1', 'bug-confirmed')).code, 1, 'not a disputed bug');
+  assert.equal(w.cli(settleArgs(w, 'R9-B1', 'bug-confirmed')).code, 2);
+  assert.equal(w.cli(['triage', 'settle', '--id', 'R1-S2', '--result', 'bug-confirmed']).code, 2, 'a result needs a test to run');
+  assert.equal(w.cli(['triage', 'settle', '--id', 'R1-S2', '--result', 'bug-confirmed', '--evidence', 'trust me']).code, 2, 'free-text evidence is no longer accepted');
+  assert.equal(w.cli(['triage', 'settle', '--result', 'bug-confirmed', '--test-cmd', 'x', '--test-file', 'y']).code, 2);
 });
 
 test('triage light-lane: closes untriaged WORTH CONSIDERING items; refused unless the review is on the light lane', (t) => {
@@ -804,7 +816,7 @@ test('arbiter apply: no transcript is exit 2 and leaves the state untouched; no 
 test('arbiter apply: an arbiter that wants a human (low confidence) is final but needsHuman, and a test result is never overridden', (t) => {
   const w = readyForArbiter(t, undefined, { ...STANDARD_JUDGE, 'R1-S1': ['REJECT', 'high', DISPUTED] });
   w.cli(['arbiter', 'needed', '--round', '1']);
-  assert.equal(w.cli(['triage', 'settle', '--id', 'R1-S1', '--result', 'bug-confirmed', '--evidence', 'b.test.js fails']).code, 0);
+  assert.equal(w.cli(settleArgs(w, 'R1-S1', 'bug-confirmed')).code, 0);
   const text = fenced({
     rulings: [
       { id: 'R1-S1', ruling: 'REJECT', confidence: 'high', reasoning: 'covered' },
@@ -839,10 +851,12 @@ test('state show: filters by round, accepted, disputed and needs-human; mark-imp
   assert.equal(w.cli(['state', 'show', '--round', '2']).code, 2);
 
   // settling the disputed bug removes it from --disputed
-  assert.equal(w.cli(['triage', 'settle', '--id', 'R1-S1', '--result', 'bug-confirmed', '--evidence', 'fails']).code, 0);
+  assert.equal(w.cli(settleArgs(w, 'R1-S1', 'bug-confirmed')).code, 0);
   assert.deepEqual(w.cli(['state', 'show', '--disputed']).json.items, []);
   assert.deepEqual(w.cli(['state', 'show', '--accepted']).json.items.map((i) => i.id), ['R1-B1', 'R1-S1']);
 
+  w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
+  w.repo.commit('fix');
   const marked = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1,R1-S1']);
   assert.equal(marked.code, 0, marked.stderr);
   assert.deepEqual(w.cli(['state', 'show', '--accepted']).json.items, []);
@@ -1234,7 +1248,7 @@ test('triage settle: a needsHuman item stays with the human (reviewer repro R2: 
     s.rounds[0].items[0].final = { decision: 'REJECT', by: 'arbiter', needsHuman: true, reason: 'would dismiss a blocking security/data item' };
   });
   const before = w.stateText();
-  const s = w.cli(['triage', 'settle', '--id', 'R1-B1', '--result', 'bug-disproved', '--evidence', 'trust me']);
+  const s = w.cli(settleArgs(w, 'R1-B1', 'bug-disproved'));
   assert.equal(s.code, 1, s.stdout);
   assert.equal(s.json.ok, false);
   assert.match(s.json.reason, /needs a human/);
@@ -1250,7 +1264,7 @@ test('triage settle: only a disputed bug with a possible settle test and no test
     judged('R1-B1', DISPUTED), judged('R1-B2', {}), judged('R1-B3', { disputedBug: true }), judged('R1-B4', DISPUTED), judged('R1-B5', DISPUTED),
   ] });
   assert.equal(w.cli(['triage', 'validate', '--round', '1', '--file', j]).code, 0);
-  const settle = (id) => w.cli(['triage', 'settle', '--id', id, '--result', 'bug-confirmed', '--evidence', 'test output']);
+  const settle = (id) => w.cli(settleArgs(w, id, 'bug-confirmed'));
 
   assert.equal(settle('R1-B2').code, 1, 'the judge did not dispute it as a bug');
   assert.equal(settle('R1-B3').code, 1, 'disputed, but no settle test is possible');
@@ -1341,10 +1355,10 @@ test('review-complete: a clean first round does not count once a later round acc
   w.prHead(head2);
   assert.equal(w.codex(2, findingsOf([finding({ title: 'late bug', file: 'src/c.js', line: 1 })]), { from: head1, to: head2 }).code, 0);
   assert.equal(w.judge(2, { 'R2-B1': ['ACCEPT'] }).code, 0);
-  assert.equal(w.cli(['state', 'mark-implemented', '--ids', 'R2-B1']).code, 0);
   // the "fix" removes the file again: the branch now has exactly the content round 1 reviewed, and nothing is unresolved
   w.repo.rm('src/c.js');
   const head3 = w.repo.commit('drop it');
+  assert.equal(w.cli(['state', 'mark-implemented', '--ids', 'R2-B1']).code, 0);
   w.prHead(head3);
   const outcome = w.cli(['state', 'outcome']).json;
   assert.deepEqual([outcome.pending, outcome.needsHuman, outcome.unimplemented], [[], [], []]);
@@ -1420,7 +1434,7 @@ test('every command that changes the review state waits for the per-PR lock (and
   const env = { PIPELINE_LOCK_WAIT_MS: '250' };
   const mutating = [
     ['triage', 'validate', '--round', '1', '--file', judgeFile],
-    ['triage', 'settle', '--id', 'R1-B1', '--result', 'bug-confirmed', '--evidence', 'x'],
+    ['triage', 'settle', '--id', 'R1-B1', '--result', 'bug-confirmed', '--test-cmd', 'node src/p.test.js', '--test-file', 'src/p.test.js'],
     ['triage', 'light-lane', '--round', '1'],
     ['arbiter', 'needed', '--round', '1'],
     ['arbiter', 'apply', '--round', '1', '--tag', 'whatever'],
@@ -1439,7 +1453,9 @@ test('every command that changes the review state waits for the per-PR lock (and
       assert.equal(w.stateText(), before, `${args.join(' ')} changed the state while the lock was held`);
     }
     const calls = w.captured().length;
-    const cr = w.cli(['codex-review', '--pr', '7', '--round', '2', '--base', w.head, '--head', w.head, '--effort', 'high'], { ...env, FAKE_CODEX_OUTPUT: w.file('r2.json', findingsOf()) });
+    w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
+    const head2 = w.repo.commit('fix');
+    const cr = w.cli(['codex-review', '--pr', '7', '--round', '2', '--base', w.head, '--head', head2, '--effort', 'high'], { ...env, FAKE_CODEX_OUTPUT: w.file('r2.json', findingsOf()) });
     assert.equal(cr.code, 2, cr.stdout);
     assert.equal(cr.json.error, 'lock-timeout');
     assert.equal(w.captured().length, calls + 1, 'Codex ran without the lock; only recording the round needs it');
@@ -1483,10 +1499,159 @@ test('arbiter apply: --expect-model / --expect-effort are test switches; a norma
   assert.equal(honoured.json.ok, true);
 });
 
+test('arbiter apply: an installed copy ignores PIPELINE_TEST_MODE (with a warning); the proof stays pinned', (t) => {
+  const installed = join(realpathSync(mkdtempSync(join(tmpdir(), 'cp-installed-'))), 'pipeline');
+  t.after(() => rmSync(join(installed, '..'), { recursive: true, force: true }));
+  cpSync(join(here, '..', 'pipeline'), installed, { recursive: true });
+  writeFileSync(join(installed, 'INSTALLED.json'), '{}');
+  const w = readyForArbiter(t);
+  w.cli(['arbiter', 'needed', '--round', '1']);
+  const asked = ['--expect-model', 'claude-opus-', '--expect-effort', 'low'];
+  const r = arbiterRun(w, { model: 'claude-opus-5-1', effort: 'low', extraArgs: asked, env: { PIPELINE_TEST_MODE: '1', TEST_BIN: join(installed, 'bin', 'pipeline.mjs') } });
+  assertAllNeedHuman(w, r, /unexpected model claude-opus-5-1/);
+  assert.match(r.stderr, /ignoring PIPELINE_TEST_MODE/);
+});
+
 test('arbiter apply: PIPELINE_ARBITER_MODEL_OVERRIDE never relaxes the proof, not even for a model that looks right', (t) => {
   const w = readyForArbiter(t);
   w.cli(['arbiter', 'needed', '--round', '1']);
   const r = arbiterRun(w, { meta: { model: 'claude-fable-5-1' }, env: { PIPELINE_ARBITER_MODEL_OVERRIDE: 'claude-fable-5-1' } });
   assertAllNeedHuman(w, r, /per-call model override present: claude-fable-5-1/);
   assert.match(w.item('R1-S1').final.reason, /model-proof/);
+});
+
+// -- an accepted BLOCKING item cannot be "resolved" without a code change
+
+test('an accepted BLOCKING item cannot be marked implemented with no code change, nor cleared by an empty review round', (t) => {
+  const w = world(t);
+  assert.equal(w.codex(1, findingsOf([finding()])).code, 0);
+  assert.equal(w.judge(1, { 'R1-B1': ['ACCEPT'] }).code, 0);
+
+  const marked = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assert.equal(marked.code, 2, marked.stdout);
+  assert.equal(marked.json.error, 'no-code-change');
+  assert.ok(!w.item('R1-B1').implemented);
+
+  // Even if it were marked, a round over the empty range would review nothing.
+  const empty = w.codex(2, findingsOf(), { from: w.head, to: w.head });
+  assert.equal(empty.code, 2, empty.stdout);
+  assert.equal(empty.json.error, 'empty-range');
+  assert.equal(w.state().rounds.length, 1, 'no round was recorded');
+  assert.equal(w.captured().length, 1, 'Codex was not even run for the empty range');
+  assert.equal(w.cli(['state', 'outcome']).json.clean, false);
+});
+
+test('codex-review: a later round whose content is unchanged since the last round is refused when items were accepted; a real fix passes', (t) => {
+  const w = world(t);
+  assert.equal(w.codex(1, findingsOf([finding()])).code, 0);
+  assert.equal(w.judge(1, { 'R1-B1': ['ACCEPT'] }).code, 0);
+  // An empty commit moves HEAD but not the content.
+  w.repo.git(['commit', '-q', '--allow-empty', '-m', 'nothing']);
+  const head2 = w.repo.git(['rev-parse', 'HEAD']).trim();
+  const r = w.codex(2, findingsOf(), { from: w.head, to: head2 });
+  assert.equal(r.code, 2, r.stdout);
+  assert.equal(r.json.error, 'empty-range');
+
+  w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
+  const head3 = w.repo.commit('fix');
+  assert.equal(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']).code, 0);
+  assert.equal(w.codex(2, findingsOf(), { from: w.head, to: head3 }).code, 0);
+});
+
+test('codex-review: with nothing accepted, a later round over an unchanged tree is still allowed', (t) => {
+  const w = world(t);
+  assert.equal(w.codex(1, findingsOf([finding()])).code, 0);
+  assert.equal(w.judge(1, { 'R1-B1': ['REJECT'] }).code, 0);
+  assert.equal(w.codex(2, findingsOf(), { from: w.head, to: w.head }).code, 0);
+});
+
+// -- triage settle: the pipeline runs the proving test itself
+
+// A world whose R1-B1 is a disputed BLOCKING bug (or security item) a test can decide.
+function disputedWorld(t, category = 'bug') {
+  const w = world(t);
+  assert.equal(w.codex(1, findingsOf([finding({ category })])).code, 0);
+  assert.equal(w.judge(1, { 'R1-B1': ['REJECT', 'high', DISPUTED] }).code, 0);
+  return w;
+}
+
+test('triage settle: the CLI runs the test; the command, file, exit code and head are recorded with the output', (t) => {
+  const w = disputedWorld(t);
+  const r = w.cli(settleArgs(w, 'R1-B1', 'bug-disproved', { output: 'compute(undefined) is 0' }));
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  const rec = w.item('R1-B1').test;
+  assert.equal(rec.status, 'bug-disproved');
+  assert.equal(rec.cmd, 'node src/proof.test.js');
+  assert.equal(rec.file, 'src/proof.test.js');
+  assert.equal(rec.exitCode, 0);
+  assert.equal(rec.head, w.repo.git(['rev-parse', 'HEAD']).trim());
+  assert.match(rec.evidence, /compute\(undefined\) is 0/);
+  assert.equal(w.item('R1-B1').final.needsHuman, false, 'a non-security dismissal by test is final');
+});
+
+test('triage settle: a passing test cannot confirm a bug, a failing test cannot disprove one (state untouched)', (t) => {
+  const w = disputedWorld(t);
+  const before = () => w.stateText();
+  const snapshot = before();
+  const disproveFail = w.cli(settleArgs(w, 'R1-B1', 'bug-disproved', { code: 1 }));
+  assert.equal(disproveFail.code, 1, disproveFail.stdout);
+  assert.match(disproveFail.json.reason, /needs the test to pass/);
+  const confirmPass = w.cli(settleArgs(w, 'R1-B1', 'bug-confirmed', { code: 0 }));
+  assert.equal(confirmPass.code, 1, confirmPass.stdout);
+  assert.match(confirmPass.json.reason, /needs the test to fail/);
+  assert.equal(before(), snapshot);
+  assert.equal(w.item('R1-B1').test, undefined);
+});
+
+test('triage settle: a test that cannot be trusted as proof is refused before anything runs', (t) => {
+  const w = disputedWorld(t);
+  const snapshot = w.stateText();
+  const base = ['triage', 'settle', '--id', 'R1-B1', '--result', 'bug-disproved'];
+  // Not in the PR head.
+  w.repo.write('src/x.test.js', 'process.exit(0);\n');
+  const notCommitted = w.cli([...base, '--test-cmd', 'node src/x.test.js', '--test-file', 'src/x.test.js']);
+  assert.equal(notCommitted.code, 1, notCommitted.stdout);
+  assert.match(notCommitted.json.reason, /not in the PR head/);
+  // Committed, then edited: the run would not prove the head.
+  w.repo.commit('add x test');
+  w.repo.write('src/x.test.js', 'process.exit(1);\n');
+  const dirty = w.cli([...base, '--test-cmd', 'node src/x.test.js', '--test-file', 'src/x.test.js']);
+  assert.match(dirty.json.reason, /uncommitted changes/);
+  w.repo.write('src/x.test.js', 'process.exit(0);\n');
+  // Not a test file, command that does not run it, file that does not exist.
+  const notTest = w.cli([...base, '--test-cmd', 'node src/a.js', '--test-file', 'src/a.js']);
+  assert.match(notTest.json.reason, /not a test file/);
+  const notNamed = w.cli([...base, '--test-cmd', 'true', '--test-file', 'src/x.test.js']);
+  assert.match(notNamed.json.reason, /must run --test-file/);
+  const missing = w.cli([...base, '--test-cmd', 'node src/none.test.js', '--test-file', 'src/none.test.js']);
+  assert.match(missing.json.reason, /not in the PR head/);
+  for (const r of [notCommitted, dirty, notTest, notNamed, missing]) assert.equal(r.code, 1);
+  w.repo.rm('src/x.test.js');
+  assert.equal(w.item('R1-B1').test, undefined);
+  assert.equal(w.stateText(), snapshot);
+});
+
+test('triage settle: a command that cannot run (127) is not a failing test and confirms nothing', (t) => {
+  const w = disputedWorld(t);
+  const r = w.cli(settleArgs(w, 'R1-B1', 'bug-confirmed', { cmd: 'definitely-not-a-command-xyz src/proof.test.js' }));
+  assert.equal(r.code, 1, r.stdout);
+  assert.match(r.json.reason, /could not be run/);
+  assert.equal(w.item('R1-B1').test, undefined);
+});
+
+test('triage settle: a passing test that dismisses a security item still goes to a human (needsHuman), never skipping that rule', (t) => {
+  const w = disputedWorld(t, 'security');
+  const r = w.cli(settleArgs(w, 'R1-B1', 'bug-disproved'));
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  const final = w.item('R1-B1').final;
+  assert.equal(final.decision, 'REJECT');
+  assert.equal(final.by, 'test');
+  assert.equal(final.needsHuman, true);
+  assert.deepEqual(w.cli(['state', 'outcome']).json.needsHuman, ['R1-B1']);
+  assert.equal(w.cli(['state', 'outcome']).json.clean, false);
+  // Confirming a security bug by a failing test is the safe direction and stays automatic.
+  const w2 = disputedWorld(t, 'auth');
+  assert.equal(w2.cli(settleArgs(w2, 'R1-B1', 'bug-confirmed')).code, 0);
+  assert.equal(w2.item('R1-B1').final.needsHuman, false);
+  assert.equal(w2.item('R1-B1').final.decision, 'ACCEPT');
 });

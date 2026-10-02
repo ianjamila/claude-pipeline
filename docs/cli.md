@@ -31,7 +31,7 @@ decide which items need the arbiter, then prove and apply its rulings.
 pipeline arbiter needed --round R [--force] [--repo DIR]
   -> {needed:false, items:[]} | {needed:true, items, inputPath, digest, digest8, tag}
 pipeline arbiter apply --round R [--tag TAG | --agent-id ID] [--projects-dir DIR] [--max-age-ms N] [--repo DIR]
-  the proof is pinned to claude-fable- at effort high; --expect-model / --expect-effort are honoured only with PIPELINE_TEST_MODE=1
+  the proof is pinned to claude-fable- at effort high; --expect-model / --expect-effort are honoured only with PIPELINE_TEST_MODE=1 in a repo checkout (an installed copy ignores it)
   -> {ok, round, tag, transcript, errors, items}; exit 0 proven + applied, 1 unproven (every arbitrated item needsHuman), 2 no transcript
 ```
 
@@ -55,6 +55,7 @@ run one Codex review round over base..head and record its findings.
 pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium|high|xhigh [--model M] [--repo DIR]
   -> {ok, round, counts:{blocking, suggestions, worth_considering}, preRuled, lightLane, path}
   --base must be the PR's merge base for round 1 and the previous round's toHead after that, else exit 2 {error:base-mismatch}
+  exit 2 {error:empty-range} when earlier rounds accepted items and the branch content is unchanged since the last round (base == head)
   exit 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|malformed|github} when Codex or GitHub could not deliver
   env: PIPELINE_CODEX_TIMEOUT_MS overrides the 30 minute Codex timeout (tests)
 ```
@@ -96,7 +97,7 @@ Exit: 0 deployed · 1 the deployment failed · 3 nothing finished in time (or Gi
 prove this PR head is verified, reviewed, CI-green and smoked; writes .review/final-gate.json.
 
 ```
-pipeline final-gate --pr N [--repo DIR]   -> {ok, repo, pr, base, head, tree, contentHash, checks[{name,ok,detail}], failed[], at}; exit 0 all checks pass, 1 any fails, 3 GitHub unavailable
+pipeline final-gate --pr N [--repo DIR]   -> {ok, repo, pr, base, head, tree, contentHash, checks[{name,ok,detail}], failed[], at}; exit 0 all checks pass, 1 any fails (pr-open detail starts "behind-base:" when the PR is behind its base: update the branch and re-verify), 3 GitHub unavailable
 ```
 
 Exit: 0 every check passes (writes .review/final-gate.json) · 1 any check fails · 3 GitHub (`gh`) unavailable.
@@ -166,10 +167,10 @@ Exit: 0 · 3 GitHub (`gh`) unavailable.
 merge the PR if (and only if) the final gate passes again, live; waits for MERGED.
 
 ```
-pipeline merge --pr N [--repo DIR]   -> {ok, merged, mergeSha, prodBefore} ; exit 0 merged, 1 not merged / refused (run final-gate again), 3 GitHub unavailable or no known-good production deployment
+pipeline merge --pr N [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|live-check|pre-merge; run final-gate again), 3 GitHub unavailable or no known-good production deployment
 ```
 
-Exit: 0 merged · 1 not merged / refused by the live gate (run final-gate again) · 3 GitHub unavailable, or no known-good production deployment.
+Exit: 0 merged (a merge commit GitHub cannot name yet is `mergeSha: null` plus a `warning`; prod-watch resolves it) · 1 not merged / refused by the live gate or by the last pre-merge look at GitHub (run final-gate again) · 3 GitHub unavailable, or no known-good production deployment.
 
 ## model-proof
 
@@ -267,6 +268,7 @@ pipeline state show [--round R] [--accepted] [--disputed] [--needs-human] [--pr 
   -> {ok, recovered, count, items}; with --pr and no local state, rebuilds it from the PR triage comment
 pipeline state outcome [--repo DIR]   -> roundOutcome + {clean}; exit 0 whether or not clean
 pipeline state mark-implemented --ids a,b [--repo DIR]
+  -> exit 2 {error:no-code-change} unless the branch content differs from what the accepting round reviewed
 pipeline state record-followup --id ID --url URL [--repo DIR]
 pipeline state set-outcome --outcome TEXT [--repo DIR]
 ```
@@ -292,8 +294,10 @@ apply the judge triage, settle disputed bugs with test results, close the light 
 ```
 pipeline triage validate --round R (--from-tag TAG | --file F) [--projects-dir DIR] [--max-age-ms N] [--repo DIR]
   -> {ok, round, counts:{ACCEPT,FOLLOW-UP,REJECT}, settled, unsettled, judgeProof}; exit 1 + errors when the judge output is invalid (state untouched)
-pipeline triage settle --id ID --result bug-confirmed|bug-disproved --evidence TEXT [--repo DIR]
+pipeline triage settle --id ID --result bug-confirmed|bug-disproved --test-cmd CMD --test-file FILE [--repo DIR]
+  -> the CLI runs CMD in the repo itself (free-text evidence is not accepted): bug-disproved needs exit 0, bug-confirmed needs a failing exit; FILE must be a committed, clean test file at HEAD named in CMD
   -> only for a disputed bug with a possible settle test and no test result yet; exit 1 for an item that needs a human, was ruled by the arbiter or is implemented
+  -> a bug-disproved result on a security/auth/permissions/data item is still needsHuman
 pipeline triage light-lane --round R [--repo DIR]
 ```
 

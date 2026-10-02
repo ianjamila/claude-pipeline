@@ -35,6 +35,7 @@ export const meta = {
     'pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium|high|xhigh [--model M] [--repo DIR]',
     '  -> {ok, round, counts:{blocking, suggestions, worth_considering}, preRuled, lightLane, path}',
     '  --base must be the PR\'s merge base for round 1 and the previous round\'s toHead after that, else exit 2 {error:base-mismatch}',
+    '  exit 2 {error:empty-range} when earlier rounds accepted items and the branch content is unchanged since the last round (base == head)',
     '  exit 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|malformed|github} when Codex or GitHub could not deliver',
     '  env: PIPELINE_CODEX_TIMEOUT_MS overrides the 30 minute Codex timeout (tests)',
   ].join('\n'),
@@ -142,6 +143,16 @@ export const run = guarded(async (argv, ctx) => {
   };
   checkBase(state);
 
+  // A later round exists to review the fixes for what earlier rounds accepted. An empty range (or no change in the
+  // branch content since the last round) reviews nothing, and would let an unfixed accepted item look resolved.
+  const hasAccepted = allItems(state ?? { rounds: [] }).some((i) => i.final?.decision === 'ACCEPT');
+  if (state && hasAccepted && (base === head || currentContentHash(root, config) === state.rounds.at(-1)?.contentHashAtToHead)) {
+    throw new Fail(EXIT.USAGE, {
+      ok: false, error: 'empty-range',
+      message: `round ${round} would review nothing: the branch content has not changed since round ${state.rounds.at(-1).n}, and earlier rounds accepted items that need a fix`,
+    });
+  }
+
   // Risk and light lane describe the whole PR (merge base..head), whatever slice this round reviews. A later round can
   // only take a PR off the light lane, never put it on.
   const files = diffFiles(forkPoint, head, o);
@@ -161,7 +172,7 @@ export const run = guarded(async (argv, ctx) => {
     id: item.id, title: item.title, ruling: `${cache[fp].decision ?? 'unknown'}: ${cache[fp].reason ?? ''}`,
   }));
   const prompt = buildReviewPrompt({
-    pr, title: view.title, body: view.body, base, head, risk: level, round, lightLane, priorRulings,
+    pr, title: view.title, body: view.body, base, head, risk: level, round, lightLane, priorRulings, rulesRef: forkPoint,
   });
 
   const hashAtHead = currentContentHash(root, config);
@@ -221,7 +232,7 @@ export const run = guarded(async (argv, ctx) => {
       throw new Fail(EXIT.USAGE, { ok: false, error: 'state-changed', message: '.review/state.json disappeared while Codex was reviewing; run the round again' });
     }
     const base0 = fresh ?? emptyState({ repo: slug, pr, branch: view.headRefName ?? 'HEAD', risk: level, lightLane, maxRounds: config.review.max_rounds });
-    const ruled = reuseRuled(assignIds(findings, round, excerptFor), ruledCacheFrom(allItems(base0)));
+    const ruled = reuseRuled(assignIds(findings, round, excerptFor, { contentHash: hashAtHead }), ruledCacheFrom(allItems(base0)));
     const next = addRound({ ...base0, risk: level, lightLane, currentContentHash: hashAtHead }, {
       n: round, fromHead: base, toHead: head, contentHashAtToHead: hashAtHead, items: ruled,
     });

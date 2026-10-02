@@ -105,7 +105,7 @@ function beginFile(headerLine) {
   const { oldPath, newPath } = splitGitHeader(headerLine.slice('diff --git '.length));
   return {
     headerOld: oldPath, headerNew: newPath, minusPath: null, plusPath: null, renameFrom: null, renameTo: null,
-    minusDevNull: false, plusDevNull: false, hasHunks: false, isNew: false, isDeleted: false, similarity: null, binary: false,
+    minusDevNull: false, plusDevNull: false, hasHunks: false, isNew: false, isDeleted: false, similarity: null, binary: false, gitlink: false,
     added: [], removed: [],
   };
 }
@@ -115,10 +115,12 @@ function finishFile(f) {
   const status = renamed ? 'R' : f.isNew || f.minusDevNull ? 'A' : f.isDeleted || f.plusDevNull ? 'D' : 'M';
   const oldPath = status === 'A' ? null : (f.renameFrom ?? f.minusPath ?? f.headerOld);
   const newPath = status === 'D' ? null : (f.renameTo ?? f.plusPath ?? f.headerNew);
-  return {
+  const out = {
     oldPath, newPath, path: status === 'D' ? oldPath : newPath, status,
     similarity: status === 'R' ? f.similarity : null, binary: f.binary, added: f.added, removed: f.removed,
   };
+  if (f.gitlink) out.gitlink = true; // a submodule (mode 160000) entry; only present when true
+  return out;
 }
 
 // Applies one `---`/`+++` line (outside a hunk) to the current file.
@@ -181,8 +183,14 @@ export function parseUnifiedDiff(text) {
       throw new Error(`malformed diff: hunk line count overflow at line ${i + 1}: ${line}`);
     } else if (line.startsWith('new file mode')) {
       cur.isNew = true;
+      if (/\b160000\s*$/.test(line)) cur.gitlink = true;
     } else if (line.startsWith('deleted file mode')) {
       cur.isDeleted = true;
+      if (/\b160000\s*$/.test(line)) cur.gitlink = true;
+    } else if (line.startsWith('old mode ') || line.startsWith('new mode ')) {
+      if (/\b160000\s*$/.test(line)) cur.gitlink = true;
+    } else if (line.startsWith('index ') && /\b160000\s*$/.test(line)) {
+      cur.gitlink = true;
     } else if (line.startsWith('similarity index ')) {
       cur.similarity = parseInt(line.slice('similarity index '.length), 10);
     } else if (line.startsWith('rename from ')) {

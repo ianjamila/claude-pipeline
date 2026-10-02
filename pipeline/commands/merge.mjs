@@ -13,13 +13,13 @@ import { headSha } from '../lib/git.mjs';
 import { currentProduction } from '../lib/deploy.mjs';
 import { runShellAsync } from '../lib/proc.mjs';
 import {
-  GATE_FILE, PR_FIELDS, abandonMerge, evaluateGate, gateRefusals, localContentHash, mergeTiming, readReviewJson, tailLines,
-  waitBlockers, waitForMerge, writeReviewJson,
+  GATE_FILE, PR_FIELDS, abandonMerge, evaluateGate, gateRefusals, localContentHash, mergeTiming, preMergeProblems, readReviewJson,
+  tailLines, waitBlockers, waitForMerge, writeReviewJson,
 } from '../lib/finalgate.mjs';
 
 export const meta = {
   summary: 'merge the PR if (and only if) the final gate passes again, live; waits for MERGED',
-  usage: 'pipeline merge --pr N [--repo DIR]   -> {ok, merged, mergeSha, prodBefore} ; exit 0 merged, 1 not merged / refused (run final-gate again), 3 GitHub unavailable or no known-good production deployment',
+  usage: 'pipeline merge --pr N [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|live-check|pre-merge; run final-gate again), 3 GitHub unavailable or no known-good production deployment',
 };
 
 const refuse = (error, reasons, extra = {}) => ({
@@ -78,18 +78,28 @@ export const run = guarded(async (argv, ctx) => {
       });
     }
 
+    // 3b. The live gate ran slow probes after it read the PR: look at GitHub once more, right before the merge command.
+    const late = await preMergeProblems({ gh, pr, head: gate.head });
+    if (late.length > 0) return refuse('pre-merge', late);
+
     // 4. Merge with the approved head (fill is strict: a missing {sha} throws instead of merging whatever head exists).
     const { waitMs, pollMs } = mergeTiming(config, ctx.env ?? process.env);
     const command = fill(config.merge.command, { pr: String(pr), sha: gate.head }, { strict: true });
     const ran = await runShellAsync(command, { cwd: root, env: ctx.env, timeoutMs: (config.merge.wait_minutes + 5) * 60_000 });
     const commandOutput = tailLines(`${ran.stdout}${ran.stderr ? `\n${ran.stderr}` : ''}`, 30);
 
-    const merged = (mergeSha, extra = {}) => (mergeSha
-      ? { exitCode: EXIT.OK, output: { ok: true, merged: true, mergeSha, prodBefore, ...extra } }
-      : {
-        exitCode: EXIT.FAILED,
-        output: { ok: false, merged: true, mergeSha: null, prodBefore, reason: 'the PR is MERGED but GitHub did not report its merge commit after re-reading: find it by hand before anything depends on it', ...extra },
-      });
+    // MERGED is MERGED: a merge commit GitHub cannot name yet is a warning, not a refusal (exit 1 means "nothing merged", and
+    // the caller must go on to prod-watch, which resolves the SHA itself).
+    const merged = (mergeSha, extra = {}) => ({
+      exitCode: EXIT.OK,
+      output: mergeSha
+        ? { ok: true, merged: true, mergeSha, prodBefore, ...extra }
+        : {
+          ok: true, merged: true, mergeSha: null, prodBefore,
+          warning: 'the PR is MERGED but GitHub did not report its merge commit after re-reading: resolve the merge SHA (prod-watch does) before anything depends on it',
+          ...extra,
+        },
+    });
 
     // 5. Wait for MERGED, re-checking the blockers on every poll. If the command failed it may still have merged (a
     // branch-delete error after a merge exits non-zero), so look once before calling it a failure.

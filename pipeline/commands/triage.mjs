@@ -4,7 +4,10 @@
 // outranks every opinion. `light-lane` closes out the untriaged WORTH CONSIDERING items of a small low-risk PR.
 import path from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
-import { Fail, guarded, resolveRepo } from '../lib/cmd-common.mjs';
+import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
+import { git, headSha, showFile } from '../lib/git.mjs';
+import { matchAny } from '../lib/glob.mjs';
+import { runShellAsync } from '../lib/proc.mjs';
 import { findSubagentTranscript, proveModel, extractJsonBlock } from '../lib/transcript.mjs';
 import { saveState, updateItems } from '../lib/state.mjs';
 import {
@@ -19,8 +22,10 @@ export const meta = {
   usage: [
     'pipeline triage validate --round R (--from-tag TAG | --file F) [--projects-dir DIR] [--max-age-ms N] [--repo DIR]',
     '  -> {ok, round, counts:{ACCEPT,FOLLOW-UP,REJECT}, settled, unsettled, judgeProof}; exit 1 + errors when the judge output is invalid (state untouched)',
-    'pipeline triage settle --id ID --result bug-confirmed|bug-disproved --evidence TEXT [--repo DIR]',
+    'pipeline triage settle --id ID --result bug-confirmed|bug-disproved --test-cmd CMD --test-file FILE [--repo DIR]',
+    '  -> the CLI runs CMD in the repo itself (free-text evidence is not accepted): bug-disproved needs exit 0, bug-confirmed needs a failing exit; FILE must be a committed, clean test file at HEAD named in CMD',
     '  -> only for a disputed bug with a possible settle test and no test result yet; exit 1 for an item that needs a human, was ruled by the arbiter or is implemented',
+    '  -> a bug-disproved result on a security/auth/permissions/data item is still needsHuman',
     'pipeline triage light-lane --round R [--repo DIR]',
   ].join('\n'),
 };
@@ -55,7 +60,7 @@ function judgeOutput(values, ctx) {
   });
   return {
     text: proof.finalAssistantText,
-    judgeProof: { ok: proof.ok, transcript: found.jsonlPath, models: proof.models, efforts: proof.efforts, errors: proof.errors },
+    judgeProof: { ok: proof.ok, transcript: found.jsonlPath, models: proof.models, efforts: proof.efforts, stopReasonMissing: proof.stopReasonMissing, errors: proof.errors },
   };
 }
 
@@ -113,30 +118,83 @@ function validateLocked(values, n, root, ctx) {
   };
 }
 
-function settle(rest, ctx) {
+// How long the proving test may run before the CLI gives up on it.
+const SETTLE_TEST_TIMEOUT_MS = 10 * 60 * 1000;
+// Last chars of the test output kept as evidence (the state caps it again when it is posted).
+const OUTPUT_TAIL = 300;
+
+const tailOf = (s, n) => {
+  const text = String(s ?? '').replace(/\s+/g, ' ').trim();
+  return text.length > n ? `…${text.slice(-n)}` : text;
+};
+
+// Why a test result may not be recorded for this item, or null. A test settles a DISPUTE: the judge called the item a bug
+// in dispute and said a test could decide it. It must not become a way to overrule a human's call, the arbiter, or
+// something already built.
+function settleRefusal(item, id) {
+  if (item.final?.needsHuman === true) return `${id} needs a human decision; a test result cannot settle it`;
+  if (item.final?.by === 'arbiter') return `${id} was already ruled by the arbiter`;
+  if (item.implemented === true) return `${id} is already implemented`;
+  if ((item.test?.status ?? 'none') !== 'none') return `${id} already has a test result`;
+  if (!(item.judge?.disputedBug === true && item.judge.settleTest?.possible === true)) {
+    return `${id} is not a disputed bug with a possible settle test`;
+  }
+  return null;
+}
+
+// The pipeline runs the proving test itself; nothing the agent types is evidence. Throws Fail (exit 1) when the test
+// cannot be trusted as proof; otherwise returns what was run.
+async function runProvingTest({ root, config, result, cmd, file, id, round, env }) {
+  const o = { cwd: root };
+  const refuse = (reason) => new Fail(EXIT.FAILED, { ok: false, id, round, reason });
+  if (!matchAny(file, config.integrity?.test_globs ?? [])) throw refuse(`--test-file ${file} is not a test file (integrity.test_globs)`);
+  if (!cmd.includes(file)) throw refuse(`--test-cmd must run --test-file: ${JSON.stringify(file)} does not appear in the command`);
+  // The file the command runs must be the one in the PR head, not an uncommitted edit.
+  if (showFile('HEAD', file, o) === null) throw refuse(`--test-file ${file} is not in the PR head (commit the test first)`);
+  if (git(['status', '--porcelain=v1', '-uall', '--', file], o) !== '') throw refuse(`--test-file ${file} has uncommitted changes; commit it so the run proves the PR head`);
+  const head = headSha(o);
+  const r = await runShellAsync(cmd, { cwd: root, env, timeoutMs: SETTLE_TEST_TIMEOUT_MS });
+  if (r.timedOut) throw refuse(`the test command timed out after ${SETTLE_TEST_TIMEOUT_MS / 1000}s`);
+  if (r.code === 126 || r.code === 127) throw refuse(`the test command could not be run (exit ${r.code}): ${tailOf(r.stderr || r.stdout, 200)}`);
+  const passed = r.code === 0;
+  // bug-disproved: the test (asserting correct behaviour) passes. bug-confirmed: that test fails, which is the bug.
+  if (result === 'bug-disproved' && !passed) throw refuse(`bug-disproved needs the test to pass, but it exited ${r.code}: ${tailOf(r.stderr || r.stdout, 200)}`);
+  if (result === 'bug-confirmed' && passed) throw refuse('bug-confirmed needs the test to fail, but it exited 0');
+  const output = tailOf(`${r.stdout}\n${r.stderr}`, OUTPUT_TAIL);
+  return { cmd, file, exitCode: r.code, head, evidence: `${file} (exit ${r.code}): ${output}` };
+}
+
+async function settle(rest, ctx) {
   const { values } = parseCommandArgs(rest, {
-    id: { type: 'string' }, result: { type: 'string' }, evidence: { type: 'string' }, repo: { type: 'string' },
+    id: { type: 'string' }, result: { type: 'string' }, 'test-cmd': { type: 'string' }, 'test-file': { type: 'string' }, repo: { type: 'string' },
   }, { allowPositionals: false });
   const id = requireOption(values, 'id');
   const result = requireOption(values, 'result');
   if (result !== 'bug-confirmed' && result !== 'bug-disproved') throw new UsageError('--result must be bug-confirmed or bug-disproved');
-  // A test result with no output behind it is an assertion, not evidence.
-  const evidence = requireOption(values, 'evidence');
+  // A bare assertion is not evidence: the pipeline runs the test and records what it printed.
+  const cmd = requireOption(values, 'test-cmd');
+  const file = requireOption(values, 'test-file');
+  if (cmd.trim() === '' || file.trim() === '') throw new UsageError('--test-cmd and --test-file must not be empty');
   const root = resolveRepo(values, ctx);
+  const { config } = await requireConfig(root);
+  const env = ctx.env ?? process.env;
+
+  // Check, then run the test WITHOUT the lock (it may take minutes), then check again and record under the lock.
+  const preflight = await withStateLock(root, ctx, () => {
+    const { round, item } = findItem(requireState(root), id);
+    const reason = settleRefusal(item, id);
+    return reason ? { exitCode: EXIT.FAILED, output: { ok: false, id, round: round.n, reason } } : { round: round.n };
+  });
+  if (preflight.exitCode !== undefined) return preflight;
+
+  const proof = await runProvingTest({ root, config, result, cmd, file, id, round: preflight.round, env });
+
   return withStateLock(root, ctx, () => {
     const state = requireState(root);
     const { round, item } = findItem(state, id);
-    // A test settles a DISPUTE: the judge called the item a bug in dispute and said a test could decide it. It must not
-    // become a way to overrule a human's call, the arbiter, or something already built.
-    const refuse = (reason) => ({ exitCode: EXIT.FAILED, output: { ok: false, id, round: round.n, reason } });
-    if (item.final?.needsHuman === true) return refuse(`${id} needs a human decision; a test result cannot settle it`);
-    if (item.final?.by === 'arbiter') return refuse(`${id} was already ruled by the arbiter`);
-    if (item.implemented === true) return refuse(`${id} is already implemented`);
-    if ((item.test?.status ?? 'none') !== 'none') return refuse(`${id} already has a test result`);
-    if (!(item.judge?.disputedBug === true && item.judge.settleTest?.possible === true)) {
-      return refuse(`${id} is not a disputed bug with a possible settle test`);
-    }
-    const settled = applyTestResult(item, result, evidence);
+    const reason = settleRefusal(item, id);
+    if (reason) return { exitCode: EXIT.FAILED, output: { ok: false, id, round: round.n, reason } };
+    const settled = applyTestResult(item, result, proof.evidence, proof);
     saveState(root, updateItems(state, round.n, [settled]));
     return { exitCode: EXIT.OK, output: { ok: true, id, round: round.n, test: settled.test, final: settled.final } };
   });

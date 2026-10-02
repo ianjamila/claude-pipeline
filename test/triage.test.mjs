@@ -149,6 +149,20 @@ test('applyTestResult: bug-disproved is final REJECT by test with the evidence i
   assert.equal(it.test.status, 'none', 'input not mutated');
 });
 
+test('applyTestResult: a bug-disproved test on a security/auth/permissions/data item is needsHuman; a bug-confirmed one is not', () => {
+  for (const category of ['security', 'auth', 'permissions', 'data-integrity', 'data-loss']) {
+    const it = { ...judged('BLOCKING', 'REJECT', 'high', { disputedBug: true, settleTest: { possible: true, plan: 'p' } }), category };
+    const disproved = applyTestResult(it, 'bug-disproved', 'x', { cmd: 'c', file: 'f', exitCode: 0, head: 'h' });
+    assert.equal(disproved.final.needsHuman, true, category);
+    assert.equal(disproved.final.decision, 'REJECT');
+    assert.equal(disproved.final.by, 'test');
+    assert.deepEqual(disproved.test, { status: 'bug-disproved', evidence: 'x', cmd: 'c', file: 'f', exitCode: 0, head: 'h' });
+    assert.equal(applyTestResult(it, 'bug-confirmed', 'x').final.needsHuman, false, category);
+  }
+  const plain = { ...judged('BLOCKING', 'REJECT', 'high', {}), category: 'performance' };
+  assert.equal(applyTestResult(plain, 'bug-disproved', 'x').final.needsHuman, false);
+});
+
 test('applyTestResult: rejects a status that is not a test outcome', () => {
   assert.throws(() => applyTestResult(item(), 'none', ''), /bug-confirmed|bug-disproved/);
   assert.throws(() => applyTestResult(item(), 'maybe', ''), /bug-confirmed|bug-disproved/);

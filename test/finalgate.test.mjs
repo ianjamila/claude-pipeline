@@ -18,8 +18,8 @@ const SHA = 'a'.repeat(40);
 
 // ---- classifiers ---------------------------------------------------------------------------------
 
-test('isDocsOnly: only .md/.mdx/.txt text files count; one code file spoils it; empty is not docs-only', () => {
-  assert.equal(isDocsOnly([f('README.md'), f('docs/a/b.mdx'), f('packages/x/NOTES.md'), f('docs/notes.txt')]), true);
+test('isDocsOnly: only markdown, docs/ text and LICENSE/CHANGELOG count; one code file spoils it; empty is not docs-only', () => {
+  assert.equal(isDocsOnly([f('README.md'), f('docs/a/b.md'), f('packages/x/NOTES.md'), f('docs/notes.txt')]), true);
   assert.equal(isDocsOnly([f('README.md'), f('src/app.js')]), false);
   assert.equal(isDocsOnly([]), false);
   assert.equal(isDocsOnly(null), false);
