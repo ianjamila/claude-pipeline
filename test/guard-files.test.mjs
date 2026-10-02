@@ -332,7 +332,9 @@ test('bash on win32: PowerShell and cmd forms of the home path', () => {
   assert.equal(w('pwsh -NoProfile -Command "Remove-Item $env:USERPROFILE\\.claude\\settings.json"'), 'deny');
   assert.equal(w('Get-Content $env:USERPROFILE\\.claude\\settings.json'), 'allow');
   assert.equal(w('Get-ChildItem $env:USERPROFILE\\.claude\\pipeline'), 'allow');
-  assert.equal(w('pwsh -NoProfile -Command "Get-Content $env:USERPROFILE\\.claude\\settings.json"'), 'allow');
+  assert.equal(w("pwsh -NoProfile -Command 'Get-Content $env:USERPROFILE\\.claude\\settings.json'"), 'allow');
+  // inside bash double quotes $env is a bash variable, so the script is only known at run time: fail closed
+  assert.equal(w('pwsh -NoProfile -Command "Get-Content $env:USERPROFILE\\.claude\\settings.json"'), 'deny');
   assert.equal(w('node C:\\Users\\u\\.claude\\pipeline\\bin\\pipeline.mjs preflight'), 'allow');
   assert.equal(w('node C:/Users/u/.claude/pipeline/bin/pipeline.mjs preflight'), 'allow');
   assert.equal(w('Set-Content C:\\repo\\a.txt x'), 'allow');
@@ -370,11 +372,13 @@ test('bash: a bare command with a cwd inside a protected root is denied, and a r
   assert.equal(bash('make', { cwd: '/repo' }), 'allow');
 });
 
-test('bash: tee and in-place edits anywhere in a line that names a protected path are denied (spec: no output redirection)', () => {
-  assert.equal(bash('cat ~/.claude/settings.json | tee /tmp/copy'), 'deny');
-  assert.equal(bash('cat ~/.claude/settings.json | tee -a /tmp/copy'), 'deny');
-  assert.equal(bash('ls ~/.claude/pipeline; sed -i s/a/b/ notes.txt'), 'deny');
-  assert.equal(bash('cat ~/.claude/pipeline/VERSION; perl -pi -e s/a/b/ notes.txt'), 'deny');
+test('bash: tee, sed -i and perl -pi are judged by the files they name, not by what else is on the line', () => {
+  assert.equal(bash('cat ~/.claude/settings.json | tee /tmp/copy'), 'allow');
+  assert.equal(bash('cat ~/.claude/settings.json | tee -a /tmp/copy'), 'allow');
+  assert.equal(bash('cat ~/.claude/settings.json | tee ~/.claude/settings.json'), 'deny');
+  assert.equal(bash('ls ~/.claude/pipeline; sed -i s/a/b/ notes.txt'), 'allow');
+  assert.equal(bash('cat ~/.claude/pipeline/VERSION; perl -pi -e s/a/b/ notes.txt'), 'allow');
+  assert.equal(bash('ls ~/.claude/pipeline; sed -i s/a/b/ ~/.claude/pipeline/VERSION'), 'deny');
   assert.equal(bash('sed -i s/a/b/ notes.txt'), 'allow', 'no protected reference, so in-place edits elsewhere are fine');
   assert.equal(bash('echo a | tee notes.txt'), 'allow');
 });
@@ -474,6 +478,7 @@ const MCP_DENY = [
   ['chmod verb in an unusual tool name', 'mcp__plugin_x_files__chmod', { path: '/home/u/.claude/pipeline/bin/pipeline.mjs', mode: '000' }],
   ['save_file', 'mcp__files__save_file', { path: '~/.claude/settings.json', text: '{}' }],
   ['replace_in_file', 'mcp__files__replace_in_file', { path: '~/.claude/pipeline/hooks/guard-git.mjs', search: 'a', replace: 'b' }],
+  ['protected path under an unlisted key on a write tool', 'mcp__files__write_file', { name: '/home/u/.claude/settings.json', content: 'x' }],
   ['rm verb on its own word', 'mcp__files__rm', { path: '/home/u/.claude/agents/judge.md' }],
 ];
 
@@ -504,7 +509,6 @@ const MCP_ALLOW = [
   ['write tool with no path keys', 'mcp__notes__create_note', { title: 't', text: 'launch with PIPELINE_ADMIN=1 claude' }],
   ['database tool', 'mcp__plugin_supabase_supabase__apply_migration', { name: 'x', query: 'select 1' }],
   ['issue update with no path keys', 'mcp__sentry__update_issue', { issueId: 'A-1', status: 'resolved' }],
-  ['write verb but only an unrelated string key', 'mcp__files__write_file', { name: '/home/u/.claude/settings.json', content: 'x' }],
   ['no tool_input', 'mcp__filesystem__write_file', undefined],
   ['non-string path values', 'mcp__filesystem__write_file', { path: 7, paths: [null, {}], content: 'x' }],
 ];
