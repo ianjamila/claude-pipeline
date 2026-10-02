@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { readdirSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 
 const bin = join(dirname(fileURLToPath(import.meta.url)), '..', 'pipeline', 'bin', 'pipeline.mjs');
 const cli = (...args) => {
@@ -71,4 +71,14 @@ test('--help and an unknown command both list every command with its summary (st
   }
   assert.equal(cli('nope').json.ok, false);
   assert.match(cli('nope').json.message, /unknown command: nope/);
+});
+
+test('docs/cli.md has a section for every command with its usage verbatim', async () => {
+  const doc = readFileSync(join(commandsDir, '..', '..', 'docs', 'cli.md'), 'utf8');
+  for (const name of commandFiles) {
+    const mod = await import(pathToFileURL(join(commandsDir, `${name}.mjs`)).href);
+    assert.ok(doc.includes(`\n## ${name}\n`), `docs/cli.md has no "## ${name}" section`);
+    assert.ok(doc.includes(mod.meta.usage), `docs/cli.md: the usage of ${name} is out of date (copy meta.usage)`);
+  }
+  assert.equal([...doc.matchAll(/^## (?!Where this differs)(\S+)$/gm)].length, commandFiles.length, 'docs/cli.md documents a command that does not exist');
 });
