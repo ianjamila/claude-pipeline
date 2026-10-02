@@ -254,7 +254,7 @@ export function splitCommand(str, platform = process.platform) {
 }
 
 // Look the override up in the call's env first, then process.env.
-function overrideCommand(name, fallback, env) {
+export function overrideCommand(name, fallback, env) {
   const raw = env?.[name] ?? process.env[name];
   if (!raw || !raw.trim()) return { cmd: fallback, prefixArgs: [] };
   const [cmd, ...prefixArgs] = splitCommand(raw);

@@ -1,0 +1,455 @@
+// After an agent's PR merges, prove the PRODUCTION deployment of that merge is live and healthy, and undo it safely if
+// not. Safe means: roll back only when the deployment that is failing is still the one serving production (a newer,
+// healthy deploy by someone else must never be removed), re-read what is live immediately before acting, verify the
+// rollback actually landed and production passes smoke again, and say so loudly in an issue. Every external effect
+// (GitHub, Vercel, git, the smoke command, the clock, the lock) is injected, so each branch is unit-testable and the
+// command wires the real ones. Fail closed: anything unclear ends in an outcome that asks a human, never a guess.
+import { readFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { fill } from './config.mjs';
+import { git as gitRun } from './git.mjs';
+import { runShellAsync } from './proc.mjs';
+import { tail } from './vercel.mjs';
+
+const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+export const RETRY_WAIT_MS = 60_000; // CDN propagation: one retry after this, and the pause between "is it live yet" looks
+export const NOT_LIVE_CHECKS = 5;
+const SMOKE_TIMEOUT_MS = 5 * 60_000;
+const SCAN_LIMIT = 10;
+const REVERT_BRANCH = /^agent\/revert-[A-Za-z0-9._-]+$/;
+
+// A pause label (pipeline-rollback) stops further agent merges; only outcomes where production state is uncertain or was
+// changed by us carry it. The other outcomes need a human to look, but do not freeze the pipeline.
+const PAUSING = new Set(['recovered', 'rollback-failed', 'changed-during-recovery', 'rollback-skipped']);
+const URGENT = new Set(['rollback-failed', 'changed-during-recovery', 'rollback-skipped']);
+
+export function exitCodeFor(outcome) {
+  if (outcome === 'merged') return 0;
+  if (outcome === 'deploy-not-observed') return 3;
+  return 1;
+}
+
+// "https://App.example.com/x" and "app.example.com" are the same host; anything unparseable is compared as-is.
+export function hostOf(value) {
+  const s = String(value ?? '').trim();
+  if (!s) return '';
+  try {
+    return new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(s) ? s : `https://${s}`).host.toLowerCase();
+  } catch {
+    return s.toLowerCase();
+  }
+}
+
+const created = (d) => Date.parse(d.created_at ?? '') || 0;
+const newestFirst = (list) => [...list].sort((a, b) => created(b) - created(a) || Number(b.id) - Number(a.id));
+const urlOf = (s) => s?.environment_url || s?.target_url || null;
+
+// Which commit produced the deployment served at `host`? GitHub deployments are the only place a sha is recorded (Vercel
+// inspect has none). Best effort: null when nothing matches or GitHub cannot be read.
+async function shaForHost(github, environment, host) {
+  if (!host) return null;
+  try {
+    const recent = newestFirst((await github.deployments({ environment })) ?? []).slice(0, SCAN_LIMIT);
+    for (const d of recent) {
+      const statuses = (await github.deploymentStatuses(d.id)) ?? [];
+      if (statuses.some((s) => s.state === 'success' && hostOf(urlOf(s)) === host)) return d.sha ?? null;
+    }
+  } catch {
+    /* unknown: the caller treats the deployment as "not ours" */
+  }
+  return null;
+}
+
+// The record `merge` writes before merging: the deployment production served at that moment, our rollback target.
+export function readKnownGood(root) {
+  const file = join(root, '.review', 'prod-before.json');
+  let raw;
+  try {
+    raw = JSON.parse(readFileSync(file, 'utf8'));
+  } catch (err) {
+    return { ok: false, reason: err?.code === 'ENOENT' ? 'no .review/prod-before.json: `merge` records the known-good deployment before merging' : `cannot read ${file}: ${err.message}` };
+  }
+  const url = typeof raw?.url === 'string' ? raw.url.trim() : '';
+  const id = typeof raw?.id === 'string' || typeof raw?.id === 'number' ? String(raw.id) : '';
+  const target = url || id;
+  if (!target) return { ok: false, reason: '.review/prod-before.json has neither a url nor an id to roll back to' };
+  if (!/^[^\s-]\S*$/.test(target)) return { ok: false, reason: `.review/prod-before.json holds an unusable rollback target: ${JSON.stringify(target)}` };
+  return { ok: true, id, url, sha: typeof raw.sha === 'string' ? raw.sha : null };
+}
+
+// The production smoke: the project's configured command with {url} (strict: a missing value is an error, never a
+// half-filled command), expect-text passed through the environment. Never rejects; a timeout is a failed smoke.
+export function createSmoke({ production, cwd, env, runShell = runShellAsync }) {
+  return async ({ url, expectText }) => {
+    const command = fill(production.smoke, { url }, { strict: true });
+    // '' (not undefined) so an expect-text exported in the caller's own environment cannot leak into this run.
+    const r = await runShell(command, { cwd, env: { ...env, PIPELINE_SMOKE_EXPECT_TEXT: expectText ?? '' }, timeoutMs: SMOKE_TIMEOUT_MS });
+    return { ok: r.code === 0 && !r.timedOut, code: r.code, tail: tail(`${r.stdout}\n${r.stderr}`, 3000) };
+  };
+}
+
+// Real git for the revert PR. The revert is made in a throwaway worktree on a new branch from origin/<base>, so the
+// caller's checkout, index and branch are never touched, and the worktree is removed whatever happens.
+export function createGitOps({ root, gitFn = gitRun, remote = 'origin' } = {}) {
+  return {
+    async revertBranch({ sha, branch, base, worktreeDir, dirName }) {
+      // Never push anywhere but a fresh agent/revert-* branch: the default branch is not ours to write.
+      if (!REVERT_BRANCH.test(branch) || branch === base) throw new Error(`refusing to push revert to ${JSON.stringify(branch)}`);
+      const g = (args, cwd = root) => gitFn(args, { cwd });
+      g(['fetch', remote, `+refs/heads/${base}:refs/remotes/${remote}/${base}`]);
+      const dir = join(worktreeDir, dirName);
+      g(['worktree', 'add', '--no-track', '-b', branch, dir, `${remote}/${base}`]);
+      try {
+        const subject = g(['log', '-1', '--format=%s', sha], dir).trim();
+        // A squash merge has one parent; a true merge commit needs -m 1 (keep the first parent, i.e. the base side).
+        const parents = g(['rev-list', '--parents', '-n', '1', sha], dir).trim().split(/\s+/).length - 1;
+        try {
+          g(['revert', '--no-edit', ...(parents > 1 ? ['-m', '1'] : []), sha], dir);
+        } catch (err) {
+          try { g(['revert', '--abort'], dir); } catch { /* nothing in progress */ }
+          throw err;
+        }
+        g(['push', '-u', remote, `HEAD:refs/heads/${branch}`], dir);
+        return { branch, subject };
+      } finally {
+        try { g(['worktree', 'remove', '--force', dir]); } catch { /* best effort: a leftover temp worktree is harmless */ }
+      }
+    },
+  };
+}
+
+// ---- issue and PR text ---------------------------------------------------------------------------------------------
+
+const fence = (text) => {
+  const body = String(text ?? '').trim() || '(no output)';
+  const ticks = '`'.repeat(Math.max(3, ...[...body.matchAll(/`+/g)].map((m) => m[0].length + 1)));
+  return `${ticks}\n${body}\n${ticks}`;
+};
+const describe = (d) => (d ? `${d.url ?? 'unknown url'} (id ${d.id ?? 'unknown'})` : 'unknown');
+
+export const issueTitle = (outcome, { pr, sha }) => `[pipeline] production ${outcome} after ${pr ? `#${pr} ` : ''}(${sha.slice(0, 7)})`;
+
+const HEADLINE = {
+  'deploy-failed': 'The Production deployment of this merge FAILED. Production was never switched to it, so the previous deployment is still serving; nothing was rolled back.',
+  'deploy-not-observed': 'No successful Production deployment of this merge was reported in time. It is unknown whether it is live; nothing was rolled back.',
+  'not-live': 'Production smoke passed, but production kept serving an OLDER deployment than this merge, so the merge never went live. Nothing was rolled back.',
+  superseded: 'This merge\'s deployment failed the production smoke, but a DIFFERENT deployment is now live and passes it. Nothing was rolled back (that would have removed someone else\'s healthy deploy).',
+  recovered: 'The production smoke FAILED after this merge. Production was rolled back to the last known-good deployment and passes the smoke again.',
+  'rollback-failed': 'The production smoke FAILED after this merge and the automatic rollback did NOT restore a healthy production.',
+  'changed-during-recovery': 'The production smoke FAILED after this merge, but the live deployment changed while recovery was running, so nothing was rolled back (a rollback could have removed someone else\'s deploy).',
+  'rollback-skipped': 'The production smoke FAILED after this merge and no automatic rollback was attempted.',
+};
+
+const NEXT_STEPS = {
+  'deploy-failed': ['Open the failed deployment (link above) and read its build log.', 'Fix forward on a new PR, or revert the merge.', 'Close this issue when production serves what you expect.'],
+  'deploy-not-observed': ['Check the Vercel dashboard / GitHub deployments for this commit.', 'If it deployed, run the production smoke by hand; if it did not, redeploy.', 'Close this issue when production is verified.'],
+  'not-live': ['Check which deployment the production domain serves (`vercel inspect <domain>`) and whether a newer deploy or a manual rollback pinned it.', 'Promote the merge\'s deployment if it should be live (`vercel promote <url>`).', 'Close this issue when production serves what you expect.'],
+  superseded: ['Confirm the live deployment contains the fix you expect; this merge\'s deployment is no longer serving.', 'Fix forward or revert this merge so main does not carry a failing change.', 'Close this issue when done.'],
+  recovered: ['Review the revert PR (needs-human) and merge it, or fix forward.', 'This issue carries `pipeline-rollback`, which PAUSES further agent merges: close it once production and main are in the state you want.'],
+  'rollback-failed': ['Production may be unhealthy RIGHT NOW: check it and the Vercel dashboard immediately.', 'Roll back or promote a known-good deployment by hand (`vercel rollback <url>`).', 'This issue carries `pipeline-rollback`, which PAUSES further agent merges: close it only when production is healthy.'],
+  'changed-during-recovery': ['Check which deployment is live now and whether it is healthy (run the production smoke).', 'Roll back by hand only if the live deployment is the broken one.', 'This issue carries `pipeline-rollback`, which PAUSES further agent merges: close it when production is verified.'],
+  'rollback-skipped': ['Production may be unhealthy: check it now.', 'Roll back by hand to the last known-good deployment if needed.', 'This issue carries `pipeline-rollback`, which PAUSES further agent merges: close it when production is verified.'],
+};
+
+const VERCEL_NOTE = 'After a rollback Vercel stops auto-assigning production domains to new deployments until one is promoted. A later merge will build but will NOT go live by itself: promote the fixed deployment (`vercel promote <url>` or the dashboard) to resume.';
+
+function issueBody(outcome, ev, prod) {
+  const L = [];
+  if (URGENT.has(outcome)) L.push('**URGENT: production may be unhealthy and needs a human now.**', '');
+  L.push(HEADLINE[outcome] ?? `Outcome: ${outcome}`, '');
+  if (ev.reason) L.push(`Reason: ${ev.reason}`, '');
+  L.push('## Merge', `- Merge commit: \`${ev.sha}\``, `- Pull request: ${ev.pr ? `#${ev.pr}` : 'not given'}`, `- Watched at: ${ev.startedAt}`, '');
+  L.push('## Deployment of this merge', `- ${describe(ev.deployment)}`, `- State: ${ev.deployment?.state ?? 'not observed'}`, '');
+  L.push('## Production smoke');
+  if (!ev.smoke) L.push('Not run.');
+  if (ev.smokeFailure) L.push('First failing run:', fence(ev.smokeFailure.tail));
+  if (ev.smoke && ev.smoke !== ev.smokeFailure && !(!ev.smoke.ok && ev.smoke.tail === ev.smokeFailure?.tail)) {
+    L.push(`Most recent run (${ev.smoke.ok ? 'passed' : 'failed'}):`, fence(ev.smoke.tail));
+  }
+  L.push('');
+  if (ev.liveBefore || ev.liveAfter) {
+    L.push('## Live deployment');
+    L.push(`- Before: ${describe(ev.liveBefore)}${ev.liveBeforeSha ? `, commit ${ev.liveBeforeSha.slice(0, 7)}` : ''}`);
+    if (ev.liveChanged) L.push(`- Seen again just before rollback: ${describe(ev.liveChanged)}`);
+    if (ev.rollback) L.push(`- After rollback: ${describe(ev.liveAfter)}`);
+    L.push('');
+  }
+  if (ev.knownGood) {
+    L.push('## Known-good target', `- ${ev.knownGood.url || ev.knownGood.id}${ev.knownGood.sha ? ` (commit ${ev.knownGood.sha.slice(0, 7)})` : ''}`, '');
+  }
+  if (ev.rollback) {
+    L.push('## Rollback', `Command ${ev.rollback.ok ? 'succeeded' : `FAILED (exit ${ev.rollback.code})`}; output:`, fence(ev.rollback.tail), '');
+  }
+  if (ev.rollback?.ok) {
+    L.push('## Vercel does not auto-assign production now', VERCEL_NOTE);
+    if (prod?.rollback?.notes) L.push('', `Project note: ${prod.rollback.notes}`);
+    L.push('');
+  }
+  if (ev.notes.length) L.push('## Notes', ...ev.notes.map((n) => `- ${n}`), '');
+  L.push('## Next steps', ...(NEXT_STEPS[outcome] ?? ['Investigate.']).map((s, i) => `${i + 1}. ${s}`), '', '_Opened by claude-pipeline `prod-watch`._');
+  return L.join('\n');
+}
+
+function revertBody(ev, issue, subject) {
+  const kg = ev.knownGood?.url || ev.knownGood?.id;
+  return [
+    `Reverts \`${ev.sha.slice(0, 7)}\`${ev.pr ? ` (#${ev.pr})` : ''}${subject ? `: ${subject}` : ''}.`,
+    '',
+    `Why: the production smoke failed after this change merged. Production was rolled back to the last known-good deployment${kg ? ` (${kg})` : ''} and passes the smoke again.${issue ? ` Evidence and next steps: ${issue.url ?? `#${issue.number}`}.` : ''}`,
+    '',
+    'This keeps the default branch in line with what production is serving, so the broken change does not ship again with the next merge. Merge it, or close it and fix forward.',
+    '',
+    `${VERCEL_NOTE}`,
+    '',
+    '_Opened by claude-pipeline `prod-watch`; needs a human._',
+  ].join('\n');
+}
+
+// ---- the watch ------------------------------------------------------------------------------------------------------
+
+/**
+ * opts: { config (validated; config.production required), sha, pr?, expectText?, root, retryWaitMs?, notLiveChecks? }
+ * deps: findDeployment({sha, environment, timeoutMs}) -> {state: success|failure|timeout, id, url, createdAt}
+ *       smoke({url, expectText}) -> {ok, tail}          inspectAlias(domain) -> {id, url, createdAt}  (throws when unknown)
+ *       rollback(target) -> {ok, code, tail}            github: {issueCreate, issueComment?, prCreate, prView?, deployments, deploymentStatuses}
+ *       git: {revertBranch}    lock(name, fn)    sleep(ms)    now()    note(msg)    readKnownGood()
+ * Returns { ok, outcome, mergeSha, deployment, live, issue, revertPr, smoke:{ok, tail}, ... }; exitCodeFor(outcome) is the exit code.
+ */
+export async function runProdWatch(opts, deps) {
+  const { config, sha, pr = null, expectText = null, root } = opts;
+  const prod = config.production;
+  const retryWaitMs = opts.retryWaitMs ?? RETRY_WAIT_MS;
+  const notLiveChecks = opts.notLiveChecks ?? NOT_LIVE_CHECKS;
+  const { findDeployment, smoke, inspectAlias, rollback, github, git, lock } = deps;
+  const sleep = deps.sleep ?? defaultSleep;
+  const now = deps.now ?? Date.now;
+  const note = deps.note ?? (() => {});
+  const readKnown = deps.readKnownGood ?? (() => readKnownGood(root));
+  const domain = hostOf(prod.url);
+  // provider "other" has no Vercel to ask: we can judge the smoke, but cannot prove what is live or roll back safely.
+  const managed = prod.provider !== 'other';
+
+  const ev = {
+    sha, pr, startedAt: new Date(now()).toISOString(), deployment: null, smoke: null, smokeFailure: null, live: null, liveBefore: null,
+    liveBeforeSha: null, liveChanged: null, liveAfter: null, knownGood: null, rollback: null, reason: null, notes: [],
+    warnings: [], issue: null, issueError: null, revertPr: null, revertPrError: null,
+  };
+  let rollbackTried = false;
+
+  const smokeOnce = async () => {
+    let r;
+    try {
+      r = await smoke({ url: prod.url, expectText });
+    } catch (err) {
+      r = { ok: false, tail: `smoke could not run: ${err?.message ?? err}` };
+    }
+    ev.smoke = { ok: r?.ok === true, code: r?.code ?? null, tail: String(r?.tail ?? '') };
+    // Keep the FIRST failure: later runs (after a rollback) can pass and would otherwise erase the evidence.
+    if (!ev.smoke.ok && !ev.smokeFailure) ev.smokeFailure = ev.smoke;
+    return ev.smoke;
+  };
+  // A fresh deploy can need a minute to reach every edge, so one failure alone proves nothing.
+  const smokeWithRetry = async () => {
+    const first = await smokeOnce();
+    if (first.ok) return first;
+    note(`production smoke failed; retrying in ${Math.round(retryWaitMs / 1000)}s`);
+    await sleep(retryWaitMs);
+    return smokeOnce();
+  };
+
+  // Is the deployment `live` ours (same host, or built from our commit), newer than ours, or older/unknown?
+  const relate = async (live) => {
+    if (live.url && hostOf(live.url) === hostOf(ev.deployment?.url)) return 'ours';
+    const liveSha = await shaForHost(github, prod.environment, hostOf(live.url));
+    ev.liveBeforeSha = liveSha;
+    if (liveSha && liveSha === sha) return 'ours';
+    const theirs = Number(live.createdAt);
+    const ours = Date.parse(ev.deployment?.createdAt ?? '');
+    return Number.isFinite(theirs) && Number.isFinite(ours) && theirs > ours ? 'newer' : 'older';
+  };
+
+  const skip = (reason, outcome = 'rollback-skipped') => {
+    ev.reason = reason;
+    return outcome;
+  };
+
+  async function report(outcome) {
+    if (outcome === 'merged') return;
+    const labels = [PAUSING.has(outcome) ? 'pipeline-rollback' : 'needs-human'];
+    try {
+      ev.issue = await github.issueCreate({ title: issueTitle(outcome, { pr, sha }), body: issueBody(outcome, ev, prod), labels });
+    } catch (err) {
+      ev.issueError = String(err?.message ?? err);
+    }
+    if (outcome !== 'recovered') return;
+    const comment = async (body) => {
+      if (!ev.issue || !github.issueComment) return;
+      try { await github.issueComment(ev.issue.number, body); } catch { /* the issue already says what happened */ }
+    };
+    try {
+      const id = pr ? String(pr) : sha.slice(0, 7);
+      const base = config.default_branch;
+      const { branch, subject } = await git.revertBranch({
+        sha, branch: `agent/revert-${id}`, base, dirName: `revert-${id}`, worktreeDir: resolve(root, config.worktree_dir),
+      });
+      let title = subject;
+      if (pr && github.prView) {
+        try { title = (await github.prView(pr, ['title'])).title || subject; } catch { /* the commit subject will do */ }
+      }
+      ev.revertPr = await github.prCreate({
+        title: `Revert ${pr ? `#${pr}` : sha.slice(0, 7)}: ${title}`, body: revertBody(ev, ev.issue, subject), head: branch, base, labels: ['needs-human'],
+      });
+      await comment(`Revert PR opened: ${ev.revertPr?.url ?? `#${ev.revertPr?.number}`}`);
+    } catch (err) {
+      ev.revertPrError = String(err?.message ?? err);
+      await comment(`The revert PR could NOT be created automatically (${ev.revertPrError}). Revert \`${sha}\` by hand.`);
+    }
+  }
+
+  const result = (outcome) => ({
+    ok: outcome === 'merged',
+    outcome,
+    mergeSha: sha,
+    deployment: ev.deployment,
+    live: ev.live,
+    issue: ev.issue,
+    revertPr: ev.revertPr,
+    smoke: ev.smoke ? { ok: ev.smoke.ok, tail: ev.smoke.tail } : null,
+    ...(ev.knownGood || ev.rollback ? {
+      recovery: { knownGood: ev.knownGood, liveBefore: ev.liveBefore, liveAfter: ev.liveAfter, rollback: ev.rollback },
+    } : {}),
+    ...(ev.reason ? { reason: ev.reason } : {}),
+    ...(ev.issueError ? { issueError: ev.issueError } : {}),
+    ...(ev.revertPrError ? { revertPrError: ev.revertPrError } : {}),
+    ...(ev.warnings.length ? { warnings: ev.warnings } : {}),
+  });
+  const finish = async (outcome) => {
+    await report(outcome);
+    return result(outcome);
+  };
+
+  // 1. The Production deployment of THIS merge.
+  const found = await findDeployment({ sha, environment: prod.environment, timeoutMs: prod.deploy_timeout_minutes * 60_000 });
+  if (found?.state !== 'success') {
+    const failed = found?.state === 'failure';
+    ev.deployment = failed ? { id: found.id ?? null, url: found.url ?? null, state: 'failure' } : null;
+    ev.reason = failed ? null : `no successful ${prod.environment} deployment of ${sha.slice(0, 7)} within ${prod.deploy_timeout_minutes} minutes`;
+    return finish(failed ? 'deploy-failed' : 'deploy-not-observed');
+  }
+  ev.deployment = { id: found.id ?? null, url: found.url ?? null, createdAt: found.createdAt ?? null, state: 'success' };
+
+  // 2. Smoke production; a pass only counts once the live deployment is ours (or newer), re-smoked if we had to wait.
+  let smoked = await smokeWithRetry();
+  let smokedAgainstOlder = false;
+  for (let looks = 0; smoked.ok;) {
+    if (!managed) return finish('merged');
+    let live = null;
+    let why = null;
+    try {
+      live = await inspectAlias(domain);
+      ev.live = live;
+      const relation = await relate(live);
+      if (relation === 'ours' || relation === 'newer') {
+        if (!smokedAgainstOlder) return finish('merged');
+        smoked = await smokeOnce(); // the smoke that passed ran against the OLD deployment; test the one that is live now
+        smokedAgainstOlder = false;
+        continue;
+      }
+      why = `production still serves ${describe(live)}, older than this merge`;
+    } catch (err) {
+      why = `could not read the live deployment: ${err?.message ?? err}`;
+    }
+    if (looks >= notLiveChecks) {
+      ev.reason = `${why} after ${notLiveChecks} checks ${Math.round(retryWaitMs / 1000)}s apart`;
+      return finish('not-live');
+    }
+    looks += 1;
+    smokedAgainstOlder = true;
+    note(`${why}; checking again in ${Math.round(retryWaitMs / 1000)}s (${looks}/${notLiveChecks})`);
+    await sleep(retryWaitMs);
+  }
+
+  // 3-8. Smoke failed twice: recover, under the machine-wide production lock.
+  async function recover() {
+    if (!managed) return skip(`production.provider is "other": no Vercel to inspect or roll back. Run production.rollback.command by hand${prod.rollback?.command ? ` (${prod.rollback.command})` : ''}.`);
+    let before;
+    try {
+      before = await inspectAlias(domain);
+    } catch (err) {
+      return skip(`could not read the live deployment, so ownership of production cannot be proven: ${err?.message ?? err}`);
+    }
+    ev.live = ev.liveBefore = before;
+    if ((await relate(before)) !== 'ours') {
+      // The live deployment is not the one that failed; it may be a newer, healthy deploy that must not be rolled back.
+      note('the live deployment is not this merge\'s; smoking it once more');
+      if ((await smokeOnce()).ok) return 'superseded';
+      ev.notes.push('A different deployment is live and also fails the smoke, so recovery continued.');
+    }
+
+    const known = await readKnown();
+    if (!known?.ok) return skip(known?.reason ?? 'no known-good deployment recorded');
+    ev.knownGood = { id: known.id, sha: known.sha, url: known.url };
+    if (known.url && hostOf(known.url) === hostOf(ev.deployment.url)) return skip('the recorded known-good deployment is the failing deployment itself');
+
+    // Immediately before acting: still the same deployment? If not, someone deployed or rolled back meanwhile.
+    let again;
+    try {
+      again = await inspectAlias(domain);
+    } catch (err) {
+      return skip(`could not re-read the live deployment right before rollback: ${err?.message ?? err}`);
+    }
+    if (again.id !== before.id) {
+      ev.live = ev.liveChanged = again;
+      return 'changed-during-recovery';
+    }
+
+    rollbackTried = true;
+    let rb;
+    try {
+      rb = await rollback(known.url || known.id);
+    } catch (err) {
+      rb = { ok: false, code: null, tail: String(err?.message ?? err) };
+    }
+    ev.rollback = { ok: rb?.ok === true, code: rb?.code ?? null, tail: String(rb?.tail ?? '') };
+    if (!ev.rollback.ok) return skip('the rollback command failed', 'rollback-failed');
+
+    let after;
+    try {
+      after = await inspectAlias(domain);
+    } catch (err) {
+      return skip(`rollback ran but the live deployment could not be read back: ${err?.message ?? err}`, 'rollback-failed');
+    }
+    ev.live = ev.liveAfter = after;
+    const landed = known.url ? hostOf(after.url) === hostOf(known.url) : after.id === known.id;
+    if (!landed) return skip(`rollback ran but production serves ${describe(after)}, not the known-good deployment`, 'rollback-failed');
+    if (!(await smokeWithRetry()).ok) return skip('production still fails the smoke after rollback', 'rollback-failed');
+    return 'recovered';
+  }
+
+  const lockName = `prod-${String(config.project).replace(/[^A-Za-z0-9._-]/g, '-')}`;
+  let entered = false;
+  let outcome = null;
+  try {
+    await lock(lockName, async () => {
+      entered = true;
+      try {
+        outcome = await recover();
+      } catch (err) {
+        ev.notes.push(`unexpected error during recovery: ${err?.stack ?? err}`);
+        outcome = skip(`unexpected error during recovery: ${err?.message ?? err}`, rollbackTried ? 'rollback-failed' : 'rollback-skipped');
+      }
+      await report(outcome);
+    });
+  } catch (err) {
+    if (!entered && err?.name === 'LockTimeoutError') {
+      outcome = skip(`could not get the production recovery lock ${lockName}: ${err.message}`);
+      await report(outcome);
+    } else if (entered && outcome && err?.name === 'LockLostError') {
+      ev.warnings.push(err.message); // everything was already done and reported; the caller should just know
+    } else {
+      throw err;
+    }
+  }
+  return result(outcome);
+}
