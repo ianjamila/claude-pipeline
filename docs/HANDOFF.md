@@ -30,7 +30,7 @@ INTERRUPTED (stopped mid-work; uncommitted changes left in the worktree — insp
 - t2.3 review-loop commands (9 dirty, fresh build — spec in the dispatch prompt summary below).
 - t2.4a final-gate/merge/smoke/summary/agent-log (14 dirty, fresh build).
 
-## Status 2026-10-02 (supersedes the lists above and items 1–3 below)
+## Status 2026-10-02, updated 2026-10-05 (supersedes the lists above and items 1–3 below)
 
 - Steps 1–2 DONE. Integration branch `int/final` in `~/Claude/cp-wt/int3` (all task branches
   merged, stage C landed, suite green 2883). `a45ba1f` = repo CI + `.claude/pipeline.yml` +
@@ -53,6 +53,16 @@ INTERRUPTED (stopped mid-work; uncommitted changes left in the worktree — insp
     os.devNull, quoted Windows paths in guard-git commands, resolve() for POSIX-literal paths, platform-pinned
     splitCommand escapes, CRLF-normalised jq, backslash-free node -e snippet, probe built per root, cmd.exe-safe
     FAKE_CODEX_DURING_OUTPUT. Windows job timeout 45 -> 60 min (Node 20 suite alone ~36 min).
+- Step 4 DONE: private repo `ianjamila/claude-pipeline`, main = `8edf5e5` (CI fix #1). CI run 36983134480
+  green on `test (ubuntu)` + `test (windows)`. After a PC crash the int3 worktree was re-verified clean at
+  `8edf5e5` on 2026-10-05. Branch protection not applied yet (needs GitHub Pro, step 7) — until then fixes may
+  still go to main directly (plan 6.2).
+- NEXT = step 5 (plan Task 7.2), owner terminal only (the installer refuses inside a Claude session):
+  `PIPELINE_ADMIN=1 node ~/Claude/claude-pipeline/install.mjs --skip-file-guard`; check the report (skills /
+  agents / pipeline installed, guard-git present, allowlist entry, `CLAUDE_CODE_SUBAGENT_MODEL` reported).
+  Then the headless smoke (`claude -p --model haiku` lists implementer/verifier/judge/arbiter +
+  ship/verify/pipeline-setup) and the guard-git live check (`git push origin main --dry-run` in a tmp repo is
+  denied by the hook).
 
 ## Remaining work (in order)
 
