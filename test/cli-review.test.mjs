@@ -17,6 +17,7 @@ import { contentHash } from '../pipeline/lib/git.mjs';
 import { loadConfig } from '../pipeline/lib/config.mjs';
 import { currentContentHash, excerptWindow, reviewBaseRef } from '../pipeline/lib/review-context.mjs';
 import { MARKERS, triageComment } from '../pipeline/lib/render.mjs';
+import { assertExit } from './helpers/assert-exit.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const bin = join(here, '..', 'pipeline', 'bin', 'pipeline.mjs');
@@ -197,7 +198,7 @@ test('currentContentHash: hashes against origin/<default> when that ref exists, 
 test('codex-review: a valid findings file becomes round 1 with ids, state, codex.json and codex.md', async (t) => {
   const w = world(t);
   const r = w.codex(1, standardFindings());
-  assert.equal(r.code, 0, r.stderr + r.stdout);
+  assertExit(r, 0, r.stderr + r.stdout);
   assert.equal(r.json.ok, true);
   assert.equal(r.json.round, 1);
   assert.deepEqual(r.json.counts, { blocking: 1, suggestions: 2, worth_considering: 1 });
@@ -243,15 +244,15 @@ test('codex-review: a valid findings file becomes round 1 with ids, state, codex
 test('codex-review: --model overrides the configured model; a bad effort or model is a usage error before anything runs', (t) => {
   const w = world(t);
   const ok = w.codex(1, findingsOf(), { extra: ['--model', 'gpt-test-1'] });
-  assert.equal(ok.code, 0, ok.stderr);
+  assertExit(ok, 0);
   assert.ok(w.captured()[0].argv.includes('model="gpt-test-1"'));
   assert.equal(w.state().rounds[0].items.length, 0, 'an empty review is a valid round with no items');
 
   const w2 = world(t);
   const badEffort = w2.cli(['codex-review', '--pr', '7', '--round', '1', '--base', w2.base, '--head', w2.head, '--effort', 'ultra']);
-  assert.equal(badEffort.code, 2);
+  assertExit(badEffort, 2);
   const badModel = w2.cli(['codex-review', '--pr', '7', '--round', '1', '--base', w2.base, '--head', w2.head, '--effort', 'high', '--model', 'x"; rm']);
-  assert.equal(badModel.code, 2);
+  assertExit(badModel, 2);
   assert.equal(w2.captured().length, 0);
   assert.ok(!existsSync(join(w2.repo.dir, '.review', 'state.json')));
 });
@@ -259,25 +260,25 @@ test('codex-review: --model overrides the configured model; a bad effort or mode
 test('codex-review: quota, auth and a missing binary are exit 3 with unavailable:true and a reason; no state is written', (t) => {
   const w = world(t);
   const quota = w.codex(1, findingsOf(), { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_STDERR: 'ERROR: You hit your usage limit. Try again later.' } });
-  assert.equal(quota.code, 3);
+  assertExit(quota, 3);
   assert.equal(quota.json.ok, false);
   assert.equal(quota.json.unavailable, true);
   assert.equal(quota.json.reason, 'quota');
   assert.match(quota.json.detail, /usage limit/);
 
   const auth = w.codex(1, findingsOf(), { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_STDERR: 'Not logged in. Run codex login.' } });
-  assert.equal(auth.code, 3);
+  assertExit(auth, 3);
   assert.equal(auth.json.reason, 'auth');
 
   const other = w.codex(1, findingsOf(), { env: { FAKE_CODEX_EXIT: '2', FAKE_CODEX_STDERR: 'segfault' } });
-  assert.equal(other.code, 3);
+  assertExit(other, 3);
   assert.equal(other.json.reason, 'error');
 
   const missing = w.cli(
     ['codex-review', '--pr', '7', '--round', '1', '--base', w.base, '--head', w.head, '--effort', 'high'],
     { PIPELINE_CODEX: join(w.scratch, 'no-such-codex-binary') },
   );
-  assert.equal(missing.code, 3);
+  assertExit(missing, 3);
   assert.equal(missing.json.unavailable, true);
   assert.equal(missing.json.reason, 'unavailable');
 
@@ -288,17 +289,17 @@ test('codex-review: output that is not valid findings is exit 3 reason malformed
   const w = world(t);
   const garbage = w.file('garbage.json', 'this is not json {');
   const a = w.cli(['codex-review', '--pr', '7', '--round', '1', '--base', w.base, '--head', w.head, '--effort', 'high'], { FAKE_CODEX_OUTPUT: garbage });
-  assert.equal(a.code, 3);
+  assertExit(a, 3);
   assert.equal(a.json.unavailable, true);
   assert.equal(a.json.reason, 'malformed');
 
   const wrongShape = w.codex(1, { summary: 'ok', blocking: [{ title: 'x' }], suggestions: [], worth_considering: [] });
-  assert.equal(wrongShape.code, 3);
+  assertExit(wrongShape, 3);
   assert.equal(wrongShape.json.reason, 'malformed');
   assert.ok(wrongShape.json.errors.length > 0);
 
   const missingKeys = w.codex(1, { summary: 'ok' });
-  assert.equal(missingKeys.code, 3);
+  assertExit(missingKeys, 3);
   assert.equal(missingKeys.json.reason, 'malformed');
   assert.ok(!existsSync(join(w.repo.dir, '.review', 'state.json')));
 });
@@ -311,7 +312,7 @@ test('codex-review: a leftover raw file from an earlier run is never read as thi
   const old = new Date(Date.now() - 3600e3);
   utimesSync(stale, old, old);
   const r = w.cli(['codex-review', '--pr', '7', '--round', '1', '--base', w.base, '--head', w.head, '--effort', 'high'], { FAKE_CODEX_NO_WRITE: '1' });
-  assert.equal(r.code, 3);
+  assertExit(r, 3);
   assert.equal(r.json.reason, 'malformed');
   assert.ok(!existsSync(join(w.repo.dir, '.review', 'state.json')));
   assert.ok(!existsSync(stale), 'the stale file was removed before Codex ran');
@@ -320,39 +321,39 @@ test('codex-review: a leftover raw file from an earlier run is never read as thi
 test('codex-review: rounds must arrive in order; an existing round, a skipped round and another PR\'s state are exit 2', (t) => {
   const w = world(t);
   const skipped = w.codex(2, findingsOf());
-  assert.equal(skipped.code, 2);
+  assertExit(skipped, 2);
   assert.equal(skipped.json.error, 'round-order');
   assert.equal(w.captured().length, 0, 'Codex is not even started');
   assert.ok(!existsSync(join(w.repo.dir, '.review')), 'a refused round leaves nothing behind');
 
-  assert.equal(w.codex(1, findingsOf()).code, 0);
+  assertExit(w.codex(1, findingsOf()), 0);
   const again = w.codex(1, findingsOf());
-  assert.equal(again.code, 2);
+  assertExit(again, 2);
   assert.match(again.json.message, /already exists/);
-  assert.equal(w.codex(3, findingsOf()).code, 2);
+  assertExit(w.codex(3, findingsOf()), 2);
   assert.equal(w.captured().length, 1);
 
   const otherPr = w.cli(['codex-review', '--pr', '8', '--round', '2', '--base', w.base, '--head', w.head, '--effort', 'high'], { FAKE_CODEX_OUTPUT: w.file('x.json', findingsOf()) });
-  assert.equal(otherPr.code, 2);
+  assertExit(otherPr, 2);
   assert.equal(otherPr.json.error, 'state-pr-mismatch');
 });
 
 test('codex-review: --head must be the checked-out HEAD (the content hash is of HEAD); a moved base ref resolves to full SHAs', (t) => {
   const w = world(t);
   const wrong = w.codex(1, findingsOf(), { to: w.base });
-  assert.equal(wrong.code, 2);
+  assertExit(wrong, 2);
   assert.equal(wrong.json.error, 'head-mismatch');
   assert.equal(w.captured().length, 0);
 
   const short = w.codex(1, findingsOf(), { from: w.base.slice(0, 10), to: w.head.slice(0, 10) });
-  assert.equal(short.code, 0, short.stderr + short.stdout);
+  assertExit(short, 0, short.stderr + short.stdout);
   assert.deepEqual([w.state().rounds[0].fromHead, w.state().rounds[0].toHead], [w.base, w.head]);
 });
 
 test('codex-review: GitHub being unreachable is exit 3 with unavailable:true, reason github', (t) => {
   const w = world(t, { gh: [{ match: '.', code: 1, stderr: 'HTTP 502' }] });
   const r = w.codex(1, findingsOf());
-  assert.equal(r.code, 3);
+  assertExit(r, 3);
   assert.equal(r.json.unavailable, true);
   assert.equal(r.json.reason, 'github');
   assert.equal(w.captured().length, 0);
@@ -360,16 +361,16 @@ test('codex-review: GitHub being unreachable is exit 3 with unavailable:true, re
 
 test('codex-review: rulings from earlier rounds go into the next prompt and pre-rule an unchanged finding (cache)', (t) => {
   const w = world(t);
-  assert.equal(w.codex(1, standardFindings()).code, 0);
-  assert.equal(w.judge(1, { ...STANDARD_JUDGE, 'R1-B1': ['REJECT', 'high', DISPUTED] }).code, 0, 'the judge disputes the bug and a test can decide');
+  assertExit(w.codex(1, standardFindings()), 0);
+  assertExit(w.judge(1, { ...STANDARD_JUDGE, 'R1-B1': ['REJECT', 'high', DISPUTED] }), 0, 'the judge disputes the bug and a test can decide');
   const settled = w.cli(settleArgs(w, 'R1-B1', 'bug-disproved', { file: 'src/a.test.js', output: 'compute(undefined) returns 0' }));
-  assert.equal(settled.code, 0, settled.stderr);
+  assertExit(settled, 0);
 
   // A second commit that leaves a.js (lines 1-32 around the finding) and b.js alone.
   w.repo.write('src/c.js', 'export const c = 1;\n');
   const head2 = w.repo.commit('more');
   const r = w.codex(2, findingsOf([finding(), finding({ title: 'A brand new problem', file: 'src/c.js', line: 1 })]), { from: w.head, to: head2 });
-  assert.equal(r.code, 0, r.stderr + r.stdout);
+  assertExit(r, 0, r.stderr + r.stdout);
   assert.equal(r.json.preRuled, 1);
   assert.deepEqual(r.json.counts, { blocking: 2, suggestions: 0, worth_considering: 0 });
 
@@ -388,13 +389,13 @@ test('codex-review: rulings from earlier rounds go into the next prompt and pre-
 
 test('codex-review: when the code around a ruled finding changed, the ruling is not reused', (t) => {
   const w = world(t);
-  assert.equal(w.codex(1, findingsOf([finding()])).code, 0);
-  assert.equal(w.judge(1, { 'R1-B1': ['REJECT', 'high', DISPUTED] }).code, 0);
-  assert.equal(w.cli(settleArgs(w, 'R1-B1', 'bug-disproved')).code, 0);
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['REJECT', 'high', DISPUTED] }), 0);
+  assertExit(w.cli(settleArgs(w, 'R1-B1', 'bug-disproved')), 0);
   w.repo.write('src/a.js', aFile(true).replace('v13 = 13', 'v13 = 13 + 1'));
   const head2 = w.repo.commit('touch the excerpt');
   const r = w.codex(2, findingsOf([finding()]), { from: w.head, to: head2 });
-  assert.equal(r.code, 0, r.stderr);
+  assertExit(r, 0);
   assert.equal(r.json.preRuled, 0, 'the excerpt changed, so the fingerprint differs and the item is reopened');
 });
 
@@ -417,10 +418,10 @@ const STANDARD_JUDGE = {
 
 test('triage validate --from-tag: the judge JSON is read from the transcript and the decisions are applied', (t) => {
   const w = world(t);
-  assert.equal(w.codex(1, standardFindings()).code, 0);
+  assertExit(w.codex(1, standardFindings()), 0);
   const projects = judgeTranscript(w, STANDARD_JUDGE);
   const r = w.cli(['triage', 'validate', '--round', '1', '--from-tag', JUDGE_TAG, '--projects-dir', projects]);
-  assert.equal(r.code, 0, r.stderr + r.stdout);
+  assertExit(r, 0, r.stderr + r.stdout);
   assert.deepEqual(r.json.counts, { ACCEPT: 1, 'FOLLOW-UP': 1, REJECT: 2 });
   assert.equal(r.json.judgeProof.ok, true, JSON.stringify(r.json.judgeProof));
   assert.deepEqual(r.json.settled.sort(), ['R1-B1', 'R1-W1']);
@@ -436,10 +437,10 @@ test('triage validate --from-tag: the judge JSON is read from the transcript and
 
 test('triage validate: a judge transcript on the wrong model is only a recorded warning, the decisions still apply', (t) => {
   const w = world(t);
-  assert.equal(w.codex(1, standardFindings()).code, 0);
+  assertExit(w.codex(1, standardFindings()), 0);
   const projects = judgeTranscript(w, STANDARD_JUDGE, { model: 'claude-sonnet-5-5' });
   const r = w.cli(['triage', 'validate', '--round', '1', '--from-tag', JUDGE_TAG, '--projects-dir', projects]);
-  assert.equal(r.code, 0, r.stderr);
+  assertExit(r, 0);
   assert.equal(r.json.judgeProof.ok, false);
   assert.ok(r.json.judgeProof.errors.some((e) => /unexpected model claude-sonnet-5-5/.test(e)));
   assert.equal(w.item('R1-B1').final.decision, 'ACCEPT');
@@ -447,10 +448,10 @@ test('triage validate: a judge transcript on the wrong model is only a recorded 
 
 test('triage validate: unknown, duplicate or missing ids are exit 1 with the errors and the state is untouched', (t) => {
   const w = world(t);
-  assert.equal(w.codex(1, standardFindings()).code, 0);
+  assertExit(w.codex(1, standardFindings()), 0);
   const before = w.stateText();
   const bad = w.judge(1, { 'R1-B1': ['ACCEPT'], 'R1-S1': ['REJECT'], 'R1-S2': ['REJECT'], 'R1-W9': ['ACCEPT'] });
-  assert.equal(bad.code, 1);
+  assertExit(bad, 1);
   assert.equal(bad.json.ok, false);
   assert.ok(bad.json.errors.includes('unknown id R1-W9'));
   assert.ok(bad.json.errors.includes('missing id R1-W1'));
@@ -458,85 +459,85 @@ test('triage validate: unknown, duplicate or missing ids are exit 1 with the err
   assert.ok(!existsSync(w.roundFile(1, 'triage.json')));
 
   const notJson = w.cli(['triage', 'validate', '--round', '1', '--file', w.file('nope.txt', 'I think everything is fine.')]);
-  assert.equal(notJson.code, 1);
+  assertExit(notJson, 1);
   assert.match(notJson.json.errors[0], /no JSON found/);
   assert.equal(w.stateText(), before);
 
   const badDecision = w.judge(1, { 'R1-B1': ['MAYBE'], 'R1-S1': ['REJECT'], 'R1-S2': ['REJECT'], 'R1-W1': ['ACCEPT'] });
-  assert.equal(badDecision.code, 1);
+  assertExit(badDecision, 1);
   assert.ok(badDecision.json.errors.some((e) => /R1-B1: decision must be one of/.test(e)));
 });
 
 test('triage validate: usage and environment errors (no locator, both locators, missing round, unknown tag)', (t) => {
   const w = world(t);
-  assert.equal(w.cli(['triage', 'validate', '--round', '1']).code, 2, 'no state yet');
-  assert.equal(w.codex(1, standardFindings()).code, 0);
-  assert.equal(w.cli(['triage', 'validate', '--round', '1']).code, 2);
-  assert.equal(w.cli(['triage', 'validate', '--round', '1', '--file', 'a', '--from-tag', 'b']).code, 2);
-  assert.equal(w.cli(['triage', 'validate', '--round', '5', '--file', w.file('j.json', { items: [] })]).code, 2);
-  assert.equal(w.cli(['triage', 'validate', '--round', '1', '--from-tag', 'pipeline-judge R1 deadbeef', '--projects-dir', join(w.scratch, 'none')]).code, 2);
-  assert.equal(w.cli(['triage', 'bogus']).code, 2);
-  assert.equal(w.cli(['triage']).code, 2);
+  assertExit(w.cli(['triage', 'validate', '--round', '1']), 2, 'no state yet');
+  assertExit(w.codex(1, standardFindings()), 0);
+  assertExit(w.cli(['triage', 'validate', '--round', '1']), 2);
+  assertExit(w.cli(['triage', 'validate', '--round', '1', '--file', 'a', '--from-tag', 'b']), 2);
+  assertExit(w.cli(['triage', 'validate', '--round', '5', '--file', w.file('j.json', { items: [] })]), 2);
+  assertExit(w.cli(['triage', 'validate', '--round', '1', '--from-tag', 'pipeline-judge R1 deadbeef', '--projects-dir', join(w.scratch, 'none')]), 2);
+  assertExit(w.cli(['triage', 'bogus']), 2);
+  assertExit(w.cli(['triage']), 2);
 });
 
 test('triage validate: items already ruled (cache, test) are not the judge\'s to decide', (t) => {
   const w = world(t);
-  assert.equal(w.codex(1, findingsOf([finding()], [finding({ title: 'Rename helper', file: 'src/b.js', line: 3 })])).code, 0);
+  assertExit(w.codex(1, findingsOf([finding()], [finding({ title: 'Rename helper', file: 'src/b.js', line: 3 })])), 0);
   editState(w, (st) => { st.rounds[0].items[0].final = { decision: 'ACCEPT', by: 'test', needsHuman: false, reason: 'test confirmed: a.test.js fails' }; });
   const wholeRound = w.judge(1, { 'R1-B1': ['REJECT'], 'R1-S1': ['ACCEPT'] });
-  assert.equal(wholeRound.code, 1, 'R1-B1 already has a final, so judging it is an unknown id');
+  assertExit(wholeRound, 1, 'R1-B1 already has a final, so judging it is an unknown id');
   const ok = w.judge(1, { 'R1-S1': ['ACCEPT'] });
-  assert.equal(ok.code, 0, ok.stderr);
+  assertExit(ok, 0);
   assert.equal(w.item('R1-B1').final.by, 'test');
 });
 
 test('triage validate: PIPELINE_TEST_FORCE_ARBITER=1 keeps every judged item for the arbiter', (t) => {
   const w = world(t);
-  assert.equal(w.codex(1, standardFindings()).code, 0);
+  assertExit(w.codex(1, standardFindings()), 0);
   const items = Object.entries(STANDARD_JUDGE).map(([id, [decision, confidence = 'high']]) => ({
     id, decision, confidence, reason: 'r', disputedBug: false, settleTest: { possible: false, plan: '' },
   }));
   const r = w.cli(['triage', 'validate', '--round', '1', '--file', w.file('j.json', { items })], { PIPELINE_TEST_FORCE_ARBITER: '1' });
-  assert.equal(r.code, 0, r.stderr);
+  assertExit(r, 0);
   assert.deepEqual(r.json.settled, []);
   assert.deepEqual(r.json.unsettled.sort(), ['R1-B1', 'R1-S1', 'R1-S2', 'R1-W1']);
 });
 
 test('triage settle: a test result settles the item and outranks the judge; bad input is exit 2', (t) => {
   const w = world(t);
-  assert.equal(w.codex(1, standardFindings()).code, 0);
+  assertExit(w.codex(1, standardFindings()), 0);
   // S1 and S2 are the judge's REJECTs that a test can decide: disputed bugs with a possible settle test
-  assert.equal(w.judge(1, { ...STANDARD_JUDGE, 'R1-S1': ['REJECT', 'high', DISPUTED], 'R1-S2': ['REJECT', 'low', DISPUTED] }).code, 0);
+  assertExit(w.judge(1, { ...STANDARD_JUDGE, 'R1-S1': ['REJECT', 'high', DISPUTED], 'R1-S2': ['REJECT', 'low', DISPUTED] }), 0);
 
   const r = w.cli(settleArgs(w, 'R1-S1', 'bug-confirmed', { file: 'src/b.test.js', output: 'expected 3 got 4' }));
-  assert.equal(r.code, 0, r.stderr);
+  assertExit(r, 0);
   assert.equal(r.json.final.decision, 'ACCEPT');
   assert.equal(r.json.final.by, 'test');
   assert.equal(w.item('R1-S1').test.status, 'bug-confirmed');
   assert.match(w.item('R1-S1').final.reason, /b\.test\.js \(exit 1\): expected 3 got 4/);
 
   assert.equal(w.cli(settleArgs(w, 'R1-S2', 'bug-disproved')).json.final.decision, 'REJECT');
-  assert.equal(w.cli(['triage', 'settle', '--id', 'R1-S2', '--result', 'maybe', '--test-cmd', 'node src/proof.test.js', '--test-file', 'src/proof.test.js']).code, 2);
-  assert.equal(w.cli(settleArgs(w, 'R1-B1', 'bug-confirmed')).code, 1, 'not a disputed bug');
-  assert.equal(w.cli(settleArgs(w, 'R9-B1', 'bug-confirmed')).code, 2);
-  assert.equal(w.cli(['triage', 'settle', '--id', 'R1-S2', '--result', 'bug-confirmed']).code, 2, 'a result needs a test to run');
-  assert.equal(w.cli(['triage', 'settle', '--id', 'R1-S2', '--result', 'bug-confirmed', '--evidence', 'trust me']).code, 2, 'free-text evidence is no longer accepted');
-  assert.equal(w.cli(['triage', 'settle', '--result', 'bug-confirmed', '--test-cmd', 'x', '--test-file', 'y']).code, 2);
+  assertExit(w.cli(['triage', 'settle', '--id', 'R1-S2', '--result', 'maybe', '--test-cmd', 'node src/proof.test.js', '--test-file', 'src/proof.test.js']), 2);
+  assertExit(w.cli(settleArgs(w, 'R1-B1', 'bug-confirmed')), 1, 'not a disputed bug');
+  assertExit(w.cli(settleArgs(w, 'R9-B1', 'bug-confirmed')), 2);
+  assertExit(w.cli(['triage', 'settle', '--id', 'R1-S2', '--result', 'bug-confirmed']), 2, 'a result needs a test to run');
+  assertExit(w.cli(['triage', 'settle', '--id', 'R1-S2', '--result', 'bug-confirmed', '--evidence', 'trust me']), 2, 'free-text evidence is no longer accepted');
+  assertExit(w.cli(['triage', 'settle', '--result', 'bug-confirmed', '--test-cmd', 'x', '--test-file', 'y']), 2);
 });
 
 test('triage light-lane: closes untriaged WORTH CONSIDERING items; refused unless the review is on the light lane', (t) => {
   const w = world(t, { light: true });
-  assert.equal(w.codex(1, findingsOf([], [], [finding({ title: 'Idea', category: 'other' })])).code, 0);
+  assertExit(w.codex(1, findingsOf([], [], [finding({ title: 'Idea', category: 'other' })])), 0);
   const r = w.cli(['triage', 'light-lane', '--round', '1']);
-  assert.equal(r.code, 0, r.stderr);
+  assertExit(r, 0);
   assert.deepEqual(r.json.marked, ['R1-W1']);
   assert.deepEqual(w.item('R1-W1').final, { decision: 'REJECT', by: 'light-lane', needsHuman: false, reason: 'light lane — not triaged' });
   assert.equal(w.state().lightLane, true);
 
   const w2 = world(t);
-  assert.equal(w2.codex(1, findingsOf([], [], [finding({ title: 'Idea', category: 'other' })])).code, 0);
+  assertExit(w2.codex(1, findingsOf([], [], [finding({ title: 'Idea', category: 'other' })])), 0);
   const refused = w2.cli(['triage', 'light-lane', '--round', '1']);
-  assert.equal(refused.code, 1);
+  assertExit(refused, 1);
   assert.equal(refused.json.ok, false);
   assert.equal(w2.item('R1-W1').final ?? null, null);
 });
@@ -545,8 +546,8 @@ test('triage light-lane: closes untriaged WORTH CONSIDERING items; refused unles
 
 function readyForArbiter(t, opts, decisions = STANDARD_JUDGE) {
   const w = world(t, opts);
-  assert.equal(w.codex(1, standardFindings()).code, 0);
-  assert.equal(w.judge(1, decisions).code, 0);
+  assertExit(w.codex(1, standardFindings()), 0);
+  assertExit(w.judge(1, decisions), 0);
   return w;
 }
 
@@ -570,15 +571,15 @@ function arbiterRun(w, { text, prompt, model, effort, meta = {}, env = {}, agent
 
 test('arbiter needed: nothing to arbitrate is {needed:false}; otherwise writes the digest-stamped input with excerpts', (t) => {
   const w = world(t);
-  assert.equal(w.codex(1, standardFindings()).code, 0);
+  assertExit(w.codex(1, standardFindings()), 0);
   const untriaged = w.cli(['arbiter', 'needed', '--round', '1']);
-  assert.equal(untriaged.code, 0);
+  assertExit(untriaged, 0);
   assert.deepEqual(untriaged.json, { needed: false, items: [] });
   assert.ok(!existsSync(w.roundFile(1, 'arbiter-input.md')));
 
-  assert.equal(w.judge(1, STANDARD_JUDGE).code, 0);
+  assertExit(w.judge(1, STANDARD_JUDGE), 0);
   const r = w.cli(['arbiter', 'needed', '--round', '1']);
-  assert.equal(r.code, 0, r.stderr + r.stdout);
+  assertExit(r, 0, r.stderr + r.stdout);
   assert.equal(r.json.needed, true);
   assert.deepEqual(r.json.items, ['R1-S1', 'R1-S2']);
   assert.equal(r.json.inputPath, w.roundFile(1, 'arbiter-input.md'));
@@ -608,8 +609,8 @@ test('arbiter needed: the excerpt is +/-20 lines of the file at HEAD, numbered, 
   const w = world(t);
   w.repo.write('src/f.js', Array.from({ length: 60 }, (_, i) => (i === 29 ? '// ``` closes a naive fence' : `const f${i + 1} = ${i + 1};`)).join('\n') + '\n');
   const head2 = w.repo.commit('add f');
-  assert.equal(w.codex(1, findingsOf([finding({ title: 'Look at f', file: 'src/f.js', line: 30 })]), { to: head2 }).code, 0);
-  assert.equal(w.judge(1, { 'R1-B1': ['REJECT'] }).code, 0);
+  assertExit(w.codex(1, findingsOf([finding({ title: 'Look at f', file: 'src/f.js', line: 30 })]), { to: head2 }), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['REJECT'] }), 0);
   const r = w.cli(['arbiter', 'needed', '--round', '1']);
   const text = readFileSync(r.json.inputPath, 'utf8');
   assert.match(text, /Code at HEAD, src\/f\.js lines 10-50:/);
@@ -622,21 +623,21 @@ test('arbiter needed: the excerpt is +/-20 lines of the file at HEAD, numbered, 
 
 test('arbiter needed on the light lane: a dismissed SUGGESTION is settled by the judge, only a dismissed BLOCKING item goes to the arbiter', (t) => {
   const w = world(t, { light: true });
-  assert.equal(w.codex(1, standardFindings()).code, 0);
+  assertExit(w.codex(1, standardFindings()), 0);
   assert.equal(w.state().lightLane, true);
-  assert.equal(w.judge(1, STANDARD_JUDGE).code, 0);
+  assertExit(w.judge(1, STANDARD_JUDGE), 0);
   assert.equal(w.item('R1-S1').final.by, 'judge');
   assert.equal(w.cli(['arbiter', 'needed', '--round', '1']).json.needed, false);
 
   const w2 = world(t, { light: true });
-  assert.equal(w2.codex(1, standardFindings()).code, 0);
-  assert.equal(w2.judge(1, { ...STANDARD_JUDGE, 'R1-B1': ['REJECT'] }).code, 0);
+  assertExit(w2.codex(1, standardFindings()), 0);
+  assertExit(w2.judge(1, { ...STANDARD_JUDGE, 'R1-B1': ['REJECT'] }), 0);
   assert.deepEqual(w2.cli(['arbiter', 'needed', '--round', '1']).json.items, ['R1-B1']);
 });
 
 test('arbiter needed --force (and PIPELINE_TEST_FORCE_ARBITER=1) sends every judged-but-unsettled item', (t) => {
   const w = world(t);
-  assert.equal(w.codex(1, standardFindings()).code, 0);
+  assertExit(w.codex(1, standardFindings()), 0);
   assert.deepEqual(w.cli(['arbiter', 'needed', '--round', '1', '--force']).json.items, ['R1-B1', 'R1-S1', 'R1-S2', 'R1-W1']);
   assert.deepEqual(w.cli(['arbiter', 'needed', '--round', '1'], { PIPELINE_TEST_FORCE_ARBITER: '1' }).json.items, ['R1-B1', 'R1-S1', 'R1-S2', 'R1-W1']);
 });
@@ -645,7 +646,7 @@ test('arbiter apply: a Fable transcript for this round and digest is proven, its
   const w = readyForArbiter(t);
   const needed = w.cli(['arbiter', 'needed', '--round', '1']);
   const r = arbiterRun(w);
-  assert.equal(r.code, 0, r.stderr + JSON.stringify(r.json));
+  assertExit(r, 0, r.stderr + JSON.stringify(r.json));
   assert.equal(r.json.ok, true);
   assert.deepEqual(r.json.errors, []);
   assert.equal(r.json.tag, needed.json.tag);
@@ -684,14 +685,14 @@ test('arbiter apply: the agent id can be given instead of the tag', (t) => {
     meta: { agentType: 'arbiter', description: 'some other description' },
   });
   const r = w.cli(['arbiter', 'apply', '--round', '1', '--agent-id', 'abc123', '--projects-dir', projects]);
-  assert.equal(r.code, 0, r.stderr + JSON.stringify(r.json));
-  assert.equal(w.cli(['arbiter', 'apply', '--round', '1', '--agent-id', 'abc123', '--tag', 'x']).code, 2, 'only one locator');
+  assertExit(r, 0, r.stderr + JSON.stringify(r.json));
+  assertExit(w.cli(['arbiter', 'apply', '--round', '1', '--agent-id', 'abc123', '--tag', 'x']), 2, 'only one locator');
 });
 
 // What the unproven paths must all do: exit 1, every arbitrated item needsHuman, the judge's decision kept as the
 // fallback, model-proof.json recording the failure.
 function assertAllNeedHuman(w, r, errorPattern) {
-  assert.equal(r.code, 1, r.stderr + JSON.stringify(r.json));
+  assertExit(r, 1, r.stderr + JSON.stringify(r.json));
   assert.equal(r.json.ok, false);
   assert.ok(r.json.errors.some((e) => errorPattern.test(e)), `errors ${JSON.stringify(r.json.errors)} should match ${errorPattern}`);
   for (const id of ['R1-S1', 'R1-S2']) {
@@ -804,11 +805,11 @@ test('arbiter apply: a per-call model override fails the proof (proof 6), with o
 
 test('arbiter apply: no transcript is exit 2 and leaves the state untouched; no `arbiter needed` yet is exit 2', (t) => {
   const w = readyForArbiter(t);
-  assert.equal(w.cli(['arbiter', 'apply', '--round', '1']).code, 2, 'needed has not run');
+  assertExit(w.cli(['arbiter', 'apply', '--round', '1']), 2, 'needed has not run');
   w.cli(['arbiter', 'needed', '--round', '1']);
   const before = w.stateText();
   const r = w.cli(['arbiter', 'apply', '--round', '1', '--projects-dir', join(w.scratch, 'none')]);
-  assert.equal(r.code, 2);
+  assertExit(r, 2);
   assert.equal(r.json.error, 'not-found');
   assert.equal(w.stateText(), before);
 });
@@ -816,7 +817,7 @@ test('arbiter apply: no transcript is exit 2 and leaves the state untouched; no 
 test('arbiter apply: an arbiter that wants a human (low confidence) is final but needsHuman, and a test result is never overridden', (t) => {
   const w = readyForArbiter(t, undefined, { ...STANDARD_JUDGE, 'R1-S1': ['REJECT', 'high', DISPUTED] });
   w.cli(['arbiter', 'needed', '--round', '1']);
-  assert.equal(w.cli(settleArgs(w, 'R1-S1', 'bug-confirmed')).code, 0);
+  assertExit(w.cli(settleArgs(w, 'R1-S1', 'bug-confirmed')), 0);
   const text = fenced({
     rulings: [
       { id: 'R1-S1', ruling: 'REJECT', confidence: 'high', reasoning: 'covered' },
@@ -824,7 +825,7 @@ test('arbiter apply: an arbiter that wants a human (low confidence) is final but
     ],
   });
   const r = arbiterRun(w, { text });
-  assert.equal(r.code, 0, r.stderr);
+  assertExit(r, 0);
   assert.equal(w.item('R1-S1').final.by, 'test', 'a test outranks the arbiter');
   assert.equal(w.item('R1-S2').final.needsHuman, true);
   assert.equal(w.item('R1-S2').final.decision, 'ACCEPT');
@@ -834,12 +835,12 @@ test('arbiter apply: an arbiter that wants a human (low confidence) is final but
 
 test('state show: filters by round, accepted, disputed and needs-human; mark-implemented drops an item from accepted', (t) => {
   const w = world(t);
-  assert.equal(w.codex(1, standardFindings()).code, 0);
+  assertExit(w.codex(1, standardFindings()), 0);
   const noState = world(t);
-  assert.equal(noState.cli(['state', 'show']).code, 2);
+  assertExit(noState.cli(['state', 'show']), 2);
 
   const disputed = { disputedBug: true, settleTest: { possible: true, plan: 'a.test.js: expect compute(undefined) to throw' } };
-  assert.equal(w.judge(1, { ...STANDARD_JUDGE, 'R1-S1': ['REJECT', 'high', disputed] }).code, 0);
+  assertExit(w.judge(1, { ...STANDARD_JUDGE, 'R1-S1': ['REJECT', 'high', disputed] }), 0);
   const all = w.cli(['state', 'show']);
   assert.equal(all.json.count, 4);
   assert.equal(all.json.recovered, false);
@@ -848,47 +849,47 @@ test('state show: filters by round, accepted, disputed and needs-human; mark-imp
   assert.deepEqual(w.cli(['state', 'show', '--disputed']).json.items.map((i) => i.id), ['R1-S1']);
   assert.deepEqual(w.cli(['state', 'show', '--needs-human']).json.items, []);
   assert.deepEqual(w.cli(['state', 'show', '--round', '1']).json.items.length, 4);
-  assert.equal(w.cli(['state', 'show', '--round', '2']).code, 2);
+  assertExit(w.cli(['state', 'show', '--round', '2']), 2);
 
   // settling the disputed bug removes it from --disputed
-  assert.equal(w.cli(settleArgs(w, 'R1-S1', 'bug-confirmed')).code, 0);
+  assertExit(w.cli(settleArgs(w, 'R1-S1', 'bug-confirmed')), 0);
   assert.deepEqual(w.cli(['state', 'show', '--disputed']).json.items, []);
   assert.deepEqual(w.cli(['state', 'show', '--accepted']).json.items.map((i) => i.id), ['R1-B1', 'R1-S1']);
 
   w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
   w.repo.commit('fix');
   const marked = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1,R1-S1']);
-  assert.equal(marked.code, 0, marked.stderr);
+  assertExit(marked, 0);
   assert.deepEqual(w.cli(['state', 'show', '--accepted']).json.items, []);
   assert.equal(w.item('R1-B1').implemented, true);
 
   const before = w.stateText();
-  assert.equal(w.cli(['state', 'mark-implemented', '--ids', 'R1-W1']).code, 2, 'only an ACCEPTED item can be implemented');
-  assert.equal(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1,R9-B9']).code, 2);
-  assert.equal(w.cli(['state', 'mark-implemented', '--ids', '']).code, 2);
+  assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R1-W1']), 2, 'only an ACCEPTED item can be implemented');
+  assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1,R9-B9']), 2);
+  assertExit(w.cli(['state', 'mark-implemented', '--ids', '']), 2);
   assert.equal(w.stateText(), before, 'a bad id list changes nothing');
 });
 
 test('state record-followup and set-outcome', (t) => {
   const w = world(t);
-  assert.equal(w.codex(1, standardFindings()).code, 0);
-  assert.equal(w.cli(['state', 'record-followup', '--id', 'R1-W1', '--url', 'https://github.com/acme/widgets/issues/3']).code, 0);
+  assertExit(w.codex(1, standardFindings()), 0);
+  assertExit(w.cli(['state', 'record-followup', '--id', 'R1-W1', '--url', 'https://github.com/acme/widgets/issues/3']), 0);
   assert.equal(w.item('R1-W1').followupIssue, 'https://github.com/acme/widgets/issues/3');
-  assert.equal(w.cli(['state', 'record-followup', '--id', 'R1-W1', '--url', 'not a url']).code, 2);
-  assert.equal(w.cli(['state', 'record-followup', '--id', 'R7-W1', '--url', 'https://x.test/1']).code, 2);
-  assert.equal(w.cli(['state', 'set-outcome', '--outcome', 'needs-human']).code, 0);
+  assertExit(w.cli(['state', 'record-followup', '--id', 'R1-W1', '--url', 'not a url']), 2);
+  assertExit(w.cli(['state', 'record-followup', '--id', 'R7-W1', '--url', 'https://x.test/1']), 2);
+  assertExit(w.cli(['state', 'set-outcome', '--outcome', 'needs-human']), 0);
   assert.equal(w.state().outcome, 'needs-human');
-  assert.equal(w.cli(['state', 'set-outcome', '--outcome', '']).code, 2);
-  assert.equal(w.cli(['state', 'set-outcome']).code, 2);
-  assert.equal(w.cli(['state', 'nope']).code, 2);
+  assertExit(w.cli(['state', 'set-outcome', '--outcome', '']), 2);
+  assertExit(w.cli(['state', 'set-outcome']), 2);
+  assertExit(w.cli(['state', 'nope']), 2);
 });
 
 test('state outcome: a round with nothing to fix is clean; coverage follows the content hash; a new ACCEPT is not clean', (t) => {
   const w = world(t);
-  assert.equal(w.cli(['state', 'outcome']).code, 2, 'no state at all');
-  assert.equal(w.codex(1, findingsOf()).code, 0);
+  assertExit(w.cli(['state', 'outcome']), 2, 'no state at all');
+  assertExit(w.codex(1, findingsOf()), 0);
   const clean = w.cli(['state', 'outcome']);
-  assert.equal(clean.code, 0);
+  assertExit(clean, 0);
   assert.equal(clean.json.clean, true);
   assert.equal(clean.json.coverageValid, true);
   assert.equal(clean.json.currentContentHash, w.state().rounds[0].contentHashAtToHead);
@@ -898,16 +899,16 @@ test('state outcome: a round with nothing to fix is clean; coverage follows the 
   w.repo.write('src/b.js', `${bFile}export const extra = 1;\n`);
   w.repo.commit('after review');
   const stale = w.cli(['state', 'outcome']);
-  assert.equal(stale.code, 0);
+  assertExit(stale, 0);
   assert.equal(stale.json.clean, false);
   assert.equal(stale.json.coverageValid, false);
 
   // a different world: a finding that the judge ACCEPTs
   const w2 = world(t);
-  assert.equal(w2.codex(1, findingsOf([finding()])).code, 0);
-  assert.equal(w2.judge(1, { 'R1-B1': ['ACCEPT'] }).code, 0);
+  assertExit(w2.codex(1, findingsOf([finding()])), 0);
+  assertExit(w2.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
   const accepted = w2.cli(['state', 'outcome']);
-  assert.equal(accepted.code, 0);
+  assertExit(accepted, 0);
   assert.equal(accepted.json.clean, false);
   assert.deepEqual(accepted.json.newAccepted, ['R1-B1']);
   assert.deepEqual(accepted.json.openBlocking, ['R1-B1']);
@@ -915,9 +916,9 @@ test('state outcome: a round with nothing to fix is clean; coverage follows the 
   // fixed and implemented: still not clean until a later round reviews the fix
   w2.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
   const head2 = w2.repo.commit('fix');
-  assert.equal(w2.cli(['state', 'mark-implemented', '--ids', 'R1-B1']).code, 0);
+  assertExit(w2.cli(['state', 'mark-implemented', '--ids', 'R1-B1']), 0);
   assert.equal(w2.cli(['state', 'outcome']).json.clean, false);
-  assert.equal(w2.codex(2, findingsOf(), { from: w2.head, to: head2 }).code, 0);
+  assertExit(w2.codex(2, findingsOf(), { from: w2.head, to: head2 }), 0);
   const round2 = w2.cli(['state', 'outcome']);
   assert.equal(round2.json.clean, true, JSON.stringify(round2.json));
   assert.deepEqual(round2.json.newAccepted, []);
@@ -925,8 +926,8 @@ test('state outcome: a round with nothing to fix is clean; coverage follows the 
 
 test('state show --pr rebuilds a lost state from the newest triage comment of ours', (t) => {
   const w0 = world(t);
-  assert.equal(w0.codex(1, standardFindings()).code, 0);
-  assert.equal(w0.judge(1, STANDARD_JUDGE).code, 0);
+  assertExit(w0.codex(1, standardFindings()), 0);
+  assertExit(w0.judge(1, STANDARD_JUDGE), 0);
   const real = w0.state();
   const forged = { ...real, rounds: [], risk: 'forged' };
   const gh = [
@@ -944,7 +945,7 @@ test('state show --pr rebuilds a lost state from the newest triage comment of ou
   ];
   const w = world(t, { gh });
   const r = w.cli(['state', 'show', '--pr', '7']);
-  assert.equal(r.code, 0, r.stderr + r.stdout);
+  assertExit(r, 0, r.stderr + r.stdout);
   assert.equal(r.json.recovered, true);
   assert.equal(r.json.count, 4);
   assert.deepEqual(w.state(), real, 'the recovered state is saved byte-for-byte as the comment carried it');
@@ -952,14 +953,14 @@ test('state show --pr rebuilds a lost state from the newest triage comment of ou
 
   const wrongPr = world(t, { gh });
   const mismatch = wrongPr.cli(['state', 'show', '--pr', '8']);
-  assert.equal(mismatch.code, 2);
+  assertExit(mismatch, 2);
   assert.ok(!existsSync(join(wrongPr.repo.dir, '.review', 'state.json')));
-  assert.equal(w.cli(['state', 'show', '--pr', '8']).code, 2, 'a local state of another PR is not served');
+  assertExit(w.cli(['state', 'show', '--pr', '8']), 2, 'a local state of another PR is not served');
 
   const noComment = world(t, { gh: [...GH, { match: '^api user', stdout: 'me\n' }, { match: 'issues/7/comments --paginate', stdoutJson: [] }] });
-  assert.equal(noComment.cli(['state', 'show', '--pr', '7']).code, 2);
+  assertExit(noComment.cli(['state', 'show', '--pr', '7']), 2);
   const ghDown = world(t, { gh: [{ match: '.', code: 1, stderr: 'HTTP 502' }] });
-  assert.equal(ghDown.cli(['state', 'show', '--pr', '7']).code, 3);
+  assertExit(ghDown.cli(['state', 'show', '--pr', '7']), 3);
 });
 
 // ---- review-complete --------------------------------------------------------------------------
@@ -968,11 +969,11 @@ const REMOVE_LABEL = { match: '^pr edit 7 --remove-label awaiting-review', code:
 
 test('review-complete: removes awaiting-review only when the review is valid for the current content', (t) => {
   const w = world(t, { gh: [...GH, REMOVE_LABEL] });
-  assert.equal(w.cli(['review-complete', '--pr', '7']).code, 1, 'no state: no review has run');
-  assert.equal(w.codex(1, findingsOf()).code, 0);
+  assertExit(w.cli(['review-complete', '--pr', '7']), 1, 'no state: no review has run');
+  assertExit(w.codex(1, findingsOf()), 0);
 
   const ok = w.cli(['review-complete', '--pr', '7']);
-  assert.equal(ok.code, 0, ok.stderr + ok.stdout);
+  assertExit(ok, 0, ok.stderr + ok.stdout);
   assert.deepEqual([ok.json.ok, ok.json.removed], [true, true]);
   assert.ok(w.fake.lines().includes('pr edit 7 --remove-label awaiting-review'));
 
@@ -981,24 +982,24 @@ test('review-complete: removes awaiting-review only when the review is valid for
   w.repo.write('src/b.js', `${bFile}export const extra = 1;\n`);
   w.prHead(w.repo.commit('unreviewed change'));
   const stale = w.cli(['review-complete', '--pr', '7']);
-  assert.equal(stale.code, 1);
+  assertExit(stale, 1);
   assert.equal(stale.json.ok, false);
   assert.match(stale.json.reason, /no review round covers the current content/);
   assert.equal(w.fake.lines().filter((l) => l.startsWith('pr edit')).length, calls, 'no label call when not valid');
 
-  assert.equal(w.cli(['review-complete', '--pr', '8']).code, 1, 'state of another PR');
+  assertExit(w.cli(['review-complete', '--pr', '8']), 1, 'state of another PR');
 });
 
 test('review-complete: unresolved items or an unimplemented ACCEPT keep the label', (t) => {
   const w = world(t, { gh: [...GH, REMOVE_LABEL] });
-  assert.equal(w.codex(1, findingsOf([finding()])).code, 0);
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
   const pending = w.cli(['review-complete', '--pr', '7']);
-  assert.equal(pending.code, 1);
+  assertExit(pending, 1);
   assert.match(pending.json.reason, /waiting for a decision: R1-B1/);
 
-  assert.equal(w.judge(1, { 'R1-B1': ['ACCEPT'] }).code, 0);
+  assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
   const accepted = w.cli(['review-complete', '--pr', '7']);
-  assert.equal(accepted.code, 1);
+  assertExit(accepted, 1);
   assert.match(accepted.json.reason, /not implemented: R1-B1/);
   assert.ok(!w.fake.lines().some((l) => l.startsWith('pr edit')));
 });
@@ -1006,18 +1007,18 @@ test('review-complete: unresolved items or an unimplemented ACCEPT keep the labe
 test('review-complete: Codex outage then recovery (exit 3, then a clean review, then the label comes off)', (t) => {
   const w = world(t, { gh: [...GH, REMOVE_LABEL] });
   const outage = w.codex(1, findingsOf(), { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_STDERR: 'usage limit reached' } });
-  assert.equal(outage.code, 3);
-  assert.equal(w.cli(['review-complete', '--pr', '7']).code, 1, 'nothing was reviewed yet');
+  assertExit(outage, 3);
+  assertExit(w.cli(['review-complete', '--pr', '7']), 1, 'nothing was reviewed yet');
 
-  assert.equal(w.codex(1, findingsOf()).code, 0, 'Codex is back: the same round can be run again');
-  assert.equal(w.cli(['review-complete', '--pr', '7']).code, 0);
+  assertExit(w.codex(1, findingsOf()), 0, 'Codex is back: the same round can be run again');
+  assertExit(w.cli(['review-complete', '--pr', '7']), 0);
   assert.ok(w.fake.lines().includes('pr edit 7 --remove-label awaiting-review'));
 });
 
 test('review-complete: a gh failure while removing the label is exit 3, not success', (t) => {
   const w = world(t, { gh: [...GH, { match: '^pr edit', code: 1, stderr: 'HTTP 502' }] });
-  assert.equal(w.codex(1, findingsOf()).code, 0);
-  assert.equal(w.cli(['review-complete', '--pr', '7']).code, 3);
+  assertExit(w.codex(1, findingsOf()), 0);
+  assertExit(w.cli(['review-complete', '--pr', '7']), 3);
 });
 
 // ---- followups create -------------------------------------------------------------------------
@@ -1026,15 +1027,15 @@ test('followups create: one agent-suggestion issue per FOLLOW-UP item, URL recor
   const url = 'https://github.com/acme/widgets/issues/11';
   const w = world(t, { gh: [...GH, { match: '^api -X POST repos/acme/widgets/issues ', stdoutJson: { number: 11, html_url: url } }] });
   const longTitle = `Consider caching ${'very '.repeat(40)}hard`;
-  assert.equal(w.codex(1, findingsOf(
+  assertExit(w.codex(1, findingsOf(
     [],
     [finding({ title: 'Rename helper', file: 'src/b.js', line: 3 })],
     [finding({ title: longTitle, file: 'src/a.js', line: 20, detail: 'cache it @someone <!-- x -->', category: 'performance' })],
-  )).code, 0);
-  assert.equal(w.judge(1, { 'R1-S1': ['ACCEPT'], 'R1-W1': ['FOLLOW-UP'] }).code, 0);
+  )), 0);
+  assertExit(w.judge(1, { 'R1-S1': ['ACCEPT'], 'R1-W1': ['FOLLOW-UP'] }), 0);
 
   const r = w.cli(['followups', 'create', '--round', '1']);
-  assert.equal(r.code, 0, r.stderr + r.stdout);
+  assertExit(r, 0, r.stderr + r.stdout);
   assert.deepEqual(r.json.created, [{ id: 'R1-W1', number: 11, url }]);
   assert.deepEqual(r.json.skipped, []);
   const posts = w.fake.calls().filter((c) => c.argv.join(' ').startsWith('api -X POST repos/acme/widgets/issues '));
@@ -1050,20 +1051,20 @@ test('followups create: one agent-suggestion issue per FOLLOW-UP item, URL recor
   assert.equal(w.item('R1-W1').followupIssue, url);
 
   const again = w.cli(['followups', 'create', '--round', '1']);
-  assert.equal(again.code, 0);
+  assertExit(again, 0);
   assert.deepEqual(again.json.created, []);
   assert.deepEqual(again.json.skipped, ['R1-W1']);
   assert.equal(w.fake.calls().filter((c) => c.argv.join(' ').startsWith('api -X POST repos/acme/widgets/issues ')).length, 1);
-  assert.equal(w.cli(['followups', 'create', '--round', '4']).code, 2);
-  assert.equal(w.cli(['followups']).code, 2);
+  assertExit(w.cli(['followups', 'create', '--round', '4']), 2);
+  assertExit(w.cli(['followups']), 2);
 });
 
 test('followups create: a gh failure is exit 3 and nothing is recorded as filed', (t) => {
   const w = world(t, { gh: [...GH, { match: '^api -X POST', code: 1, stderr: 'HTTP 502' }] });
-  assert.equal(w.codex(1, findingsOf([], [], [finding({ title: 'Idea', category: 'other' })])).code, 0);
-  assert.equal(w.judge(1, { 'R1-W1': ['FOLLOW-UP'] }).code, 0);
+  assertExit(w.codex(1, findingsOf([], [], [finding({ title: 'Idea', category: 'other' })])), 0);
+  assertExit(w.judge(1, { 'R1-W1': ['FOLLOW-UP'] }), 0);
   const r = w.cli(['followups', 'create', '--round', '1']);
-  assert.equal(r.code, 3);
+  assertExit(r, 3);
   assert.equal(w.item('R1-W1').followupIssue ?? null, null);
 });
 
@@ -1080,10 +1081,10 @@ test('a full round: codex -> judge -> arbiter -> implement -> follow-ups -> clea
       { match: '^api -X POST repos/acme/widgets/issues/7/comments ', stdoutJson: { id: 5, html_url: 'https://github.com/acme/widgets/pull/7#issuecomment-5' } },
     ],
   });
-  assert.equal(w.codex(1, standardFindings()).code, 0);
-  assert.equal(w.judge(1, STANDARD_JUDGE).code, 0);
+  assertExit(w.codex(1, standardFindings()), 0);
+  assertExit(w.judge(1, STANDARD_JUDGE), 0);
   assert.equal(w.cli(['arbiter', 'needed', '--round', '1']).json.needed, true);
-  assert.equal(arbiterRun(w).code, 0);
+  assertExit(arbiterRun(w), 0);
   assert.equal(w.item('R1-S1').final.decision, 'REJECT');
 
   // implement the accepted items (B1 from the judge, S2 from the arbiter)
@@ -1092,26 +1093,26 @@ test('a full round: codex -> judge -> arbiter -> implement -> follow-ups -> clea
   w.repo.write('src/b.js', bFile.replace('w5 = 5', 'FIVE = 5'));
   const head2 = w.repo.commit('implement accepted items');
   w.prHead(head2);
-  assert.equal(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1,R1-S2']).code, 0);
+  assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1,R1-S2']), 0);
   assert.equal(w.cli(['followups', 'create', '--round', '1']).json.created[0].id, 'R1-W1');
   assert.equal(w.cli(['state', 'outcome']).json.clean, false, 'round 1 accepted things: a later round must review the fixes');
-  assert.equal(w.cli(['review-complete', '--pr', '7']).code, 1);
+  assertExit(w.cli(['review-complete', '--pr', '7']), 1);
 
   // round 2 reviews the fix commit only and finds nothing
   const r2 = w.codex(2, findingsOf(), { from: w.head, to: head2 });
-  assert.equal(r2.code, 0, r2.stderr + r2.stdout);
+  assertExit(r2, 0, r2.stderr + r2.stdout);
   const outcome = w.cli(['state', 'outcome']);
   assert.equal(outcome.json.clean, true, JSON.stringify(outcome.json));
-  assert.equal(w.cli(['state', 'set-outcome', '--outcome', 'merged']).code, 0);
-  assert.equal(w.cli(['review-complete', '--pr', '7']).code, 0);
+  assertExit(w.cli(['state', 'set-outcome', '--outcome', 'merged']), 0);
+  assertExit(w.cli(['review-complete', '--pr', '7']), 0);
 
   // the comments the loop posts are rendered from the files these commands left behind
   const posted = () => w.fake.calls().filter((c) => /^api -X POST repos\/acme\/widgets\/issues\/7\/comments /.test(c.argv.join(' '))).map((c) => JSON.parse(c.stdin).body);
-  assert.equal(w.cli(['comment', '--pr', '7', '--kind', 'triage']).code, 0);
+  assertExit(w.cli(['comment', '--pr', '7', '--kind', 'triage']), 0);
   const triage = posted().at(-1);
   assert.ok(triage.startsWith(MARKERS.triage));
   assert.match(triage, /R1-S1/);
-  assert.equal(w.cli(['comment', '--pr', '7', '--kind', 'summary', '--outcome', 'merged']).code, 0);
+  assertExit(w.cli(['comment', '--pr', '7', '--kind', 'summary', '--outcome', 'merged']), 0);
   const summary = posted().at(-1);
   assert.ok(summary.startsWith(MARKERS.summary));
   assert.match(summary, /Fable proof: .*agent-a1\.jsonl, models claude-fable-5-1×1, effort high/);
@@ -1134,37 +1135,37 @@ test('codex-review: round 1 must review exactly mergeBase..head; base == head, o
   // hidden), and review-complete then removed awaiting-review.
   const w = world(t);
   const same = w.codex(1, findingsOf(), { from: w.head, to: w.head });
-  assert.equal(same.code, 2, same.stdout);
+  assertExit(same, 2, same.stdout);
   assert.equal(same.json.error, 'base-mismatch');
   assert.match(same.json.message, new RegExp(w.base));
   w.repo.write('src/c.js', 'export const c = 1;\n');
   const head2 = w.repo.commit('more');
   const narrow = w.codex(1, findingsOf(), { from: w.head, to: head2 });
-  assert.equal(narrow.code, 2);
+  assertExit(narrow, 2);
   assert.equal(narrow.json.error, 'base-mismatch');
   assert.equal(w.captured().length, 0, 'Codex is not even started');
   assert.ok(noState(w), 'nothing recorded');
-  assert.equal(w.cli(['review-complete', '--pr', '7']).code, 1);
+  assertExit(w.cli(['review-complete', '--pr', '7']), 1);
 
   // the real merge base is accepted, by SHA or by an abbreviation of it
   const ok = w.codex(1, findingsOf(), { from: w.base.slice(0, 12), to: head2 });
-  assert.equal(ok.code, 0, ok.stderr + ok.stdout);
+  assertExit(ok, 0, ok.stderr + ok.stdout);
   assert.equal(w.state().rounds[0].fromHead, w.base);
 });
 
 test('codex-review: round N > 1 must start at the previous round\'s toHead; any other base is exit 2', (t) => {
   const w = world(t);
-  assert.equal(w.codex(1, findingsOf()).code, 0);
+  assertExit(w.codex(1, findingsOf()), 0);
   w.repo.write('src/c.js', 'export const c = 1;\n');
   const head2 = w.repo.commit('fix');
   for (const from of [w.base, head2]) {
     const r = w.codex(2, findingsOf(), { from, to: head2 });
-    assert.equal(r.code, 2, `base ${from}`);
+    assertExit(r, 2, `base ${from}`);
     assert.equal(r.json.error, 'base-mismatch');
     assert.match(r.json.message, new RegExp(w.head));
   }
   assert.equal(w.captured().length, 1);
-  assert.equal(w.codex(2, findingsOf(), { from: w.head, to: head2 }).code, 0);
+  assertExit(w.codex(2, findingsOf(), { from: w.head, to: head2 }), 0);
 });
 
 test('codex-review: risk and light lane come from the whole PR on every round, and a growing PR leaves the light lane', (t) => {
@@ -1176,7 +1177,7 @@ test('codex-review: risk and light lane come from the whole PR on every round, a
   // round 2 reviews only the 80-line commit, but the PR as a whole is now over the cap; a fix round can never
   // turn the light lane on, and a PR that outgrew it must stop using it
   const r = w.codex(2, findingsOf(), { from: w.head, to: head2 });
-  assert.equal(r.code, 0, r.stderr);
+  assertExit(r, 0);
   assert.equal(r.json.lightLane, false);
   assert.equal(w.state().lightLane, false);
   assert.ok(/Risk level: (low|medium|high)/.test(w.captured()[1].stdin));
@@ -1187,7 +1188,7 @@ test('codex-review: a hard-stop file anywhere in the PR makes the risk high (com
   w.repo.write('.github/workflows/ci.yml', 'name: x\n');
   const head2 = w.repo.commit('workflow');
   const r = w.codex(1, findingsOf(), { from: w.base, to: head2 });
-  assert.equal(r.code, 0, r.stderr + r.stdout);
+  assertExit(r, 0, r.stderr + r.stdout);
   assert.equal(w.state().risk, 'high');
   assert.equal(r.json.lightLane, false);
 });
@@ -1195,9 +1196,9 @@ test('codex-review: a hard-stop file anywhere in the PR makes the risk high (com
 test('codex-review: a finding path that tries to leave the repository reads nothing outside the git tree (reviewer repro R3)', (t) => {
   const w = world(t);
   const f = (file) => finding({ title: `T ${file}`, file });
-  assert.equal(w.codex(1, findingsOf([f('../../../../../../etc/passwd'), f('/etc/passwd'), f(':/src/a.js'), f('src/../src/a.js')])).code, 0);
+  assertExit(w.codex(1, findingsOf([f('../../../../../../etc/passwd'), f('/etc/passwd'), f(':/src/a.js'), f('src/../src/a.js')])), 0);
   const needed = w.cli(['arbiter', 'needed', '--round', '1', '--force']);
-  assert.equal(needed.code, 0, needed.stderr);
+  assertExit(needed, 0);
   const input = readFileSync(needed.json.inputPath, 'utf8');
   assert.ok(!input.includes('root:') && !input.includes('/bin/'), 'no file outside the repository is quoted');
   assert.equal((input.match(/does not exist at HEAD/g) ?? []).length >= 2, true);
@@ -1210,13 +1211,13 @@ test('codex-review cache: a dismissal is never reused for a finding that came ba
   // BLOCKING security finding, which then looked "ruled" and let the review go clean.
   const w = world(t);
   const idea = (over = {}) => finding({ title: 'Cache grows', file: 'src/a.js', line: 20, category: 'performance', testable: false, ...over });
-  assert.equal(w.codex(1, findingsOf([], [], [idea()])).code, 0);
-  assert.equal(w.judge(1, { 'R1-W1': ['FOLLOW-UP'] }).code, 0);
+  assertExit(w.codex(1, findingsOf([], [], [idea()])), 0);
+  assertExit(w.judge(1, { 'R1-W1': ['FOLLOW-UP'] }), 0);
   w.repo.write('src/c.js', 'export const c = 1;\n');
   const head2 = w.repo.commit('more');
 
   const escalated = w.codex(2, findingsOf([idea({ category: 'security' })]), { from: w.head, to: head2 });
-  assert.equal(escalated.code, 0, escalated.stderr + escalated.stdout);
+  assertExit(escalated, 0, escalated.stderr + escalated.stdout);
   assert.equal(escalated.json.preRuled, 0);
   assert.equal(w.item('R2-B1').final ?? null, null, 'still pending: it must be triaged like a new finding');
   assert.equal(w.cli(['state', 'outcome']).json.clean, false);
@@ -1226,13 +1227,13 @@ test('codex-review cache: a dismissal is never reused for a finding that came ba
 test('codex-review cache: same fingerprint but another bucket or category is reopened; the same bucket and category is reused', (t) => {
   const w = world(t);
   const idea = (over = {}) => finding({ title: 'Cache grows', file: 'src/a.js', line: 20, category: 'performance', testable: false, ...over });
-  assert.equal(w.codex(1, findingsOf([], [], [idea()])).code, 0);
-  assert.equal(w.judge(1, { 'R1-W1': ['REJECT'] }).code, 0);
+  assertExit(w.codex(1, findingsOf([], [], [idea()])), 0);
+  assertExit(w.judge(1, { 'R1-W1': ['REJECT'] }), 0);
   w.repo.write('src/c.js', 'export const c = 1;\n');
   const head2 = w.repo.commit('more');
 
   const r = w.codex(2, findingsOf([], [idea({ category: 'design' }), idea({ title: 'Cache grows' })], [idea()]), { from: w.head, to: head2 });
-  assert.equal(r.code, 0, r.stderr + r.stdout);
+  assertExit(r, 0, r.stderr + r.stdout);
   assert.equal(w.item('R2-S1').final ?? null, null, 'other category');
   assert.equal(w.item('R2-S2').final ?? null, null, 'other bucket (SUGGESTION, was WORTH CONSIDERING)');
   assert.equal(w.item('R2-W1').final.by, 'cache', 'identical bucket and category');
@@ -1242,14 +1243,14 @@ test('codex-review cache: same fingerprint but another bucket or category is reo
 
 test('triage settle: a needsHuman item stays with the human (reviewer repro R2: a settle used to override it)', (t) => {
   const w = world(t);
-  assert.equal(w.codex(1, findingsOf([finding({ title: 'sec', category: 'security', file: 'src/a.js' })])).code, 0);
+  assertExit(w.codex(1, findingsOf([finding({ title: 'sec', category: 'security', file: 'src/a.js' })])), 0);
   editState(w, (s) => {
     s.rounds[0].items[0].judge = { decision: 'REJECT', confidence: 'high', reason: 'r', ...DISPUTED };
     s.rounds[0].items[0].final = { decision: 'REJECT', by: 'arbiter', needsHuman: true, reason: 'would dismiss a blocking security/data item' };
   });
   const before = w.stateText();
   const s = w.cli(settleArgs(w, 'R1-B1', 'bug-disproved'));
-  assert.equal(s.code, 1, s.stdout);
+  assertExit(s, 1, s.stdout);
   assert.equal(s.json.ok, false);
   assert.match(s.json.reason, /needs a human/);
   assert.equal(w.stateText(), before, 'state untouched');
@@ -1258,26 +1259,26 @@ test('triage settle: a needsHuman item stays with the human (reviewer repro R2: 
 
 test('triage settle: only a disputed bug with a possible settle test and no test result yet can be settled', (t) => {
   const w = world(t);
-  assert.equal(w.codex(1, findingsOf([finding(), finding({ title: 'Second' }), finding({ title: 'Third' }), finding({ title: 'Fourth' }), finding({ title: 'Fifth' })])).code, 0);
+  assertExit(w.codex(1, findingsOf([finding(), finding({ title: 'Second' }), finding({ title: 'Third' }), finding({ title: 'Fourth' }), finding({ title: 'Fifth' })])), 0);
   const judged = (id, extra) => ({ id, decision: 'REJECT', confidence: 'high', reason: 'no', disputedBug: false, settleTest: { possible: false, plan: '' }, ...extra });
   const j = w.file('j.json', { items: [
     judged('R1-B1', DISPUTED), judged('R1-B2', {}), judged('R1-B3', { disputedBug: true }), judged('R1-B4', DISPUTED), judged('R1-B5', DISPUTED),
   ] });
-  assert.equal(w.cli(['triage', 'validate', '--round', '1', '--file', j]).code, 0);
+  assertExit(w.cli(['triage', 'validate', '--round', '1', '--file', j]), 0);
   const settle = (id) => w.cli(settleArgs(w, id, 'bug-confirmed'));
 
-  assert.equal(settle('R1-B2').code, 1, 'the judge did not dispute it as a bug');
-  assert.equal(settle('R1-B3').code, 1, 'disputed, but no settle test is possible');
+  assertExit(settle('R1-B2'), 1, 'the judge did not dispute it as a bug');
+  assertExit(settle('R1-B3'), 1, 'disputed, but no settle test is possible');
   editState(w, (s) => { s.rounds[0].items[3].final = { decision: 'ACCEPT', by: 'arbiter', needsHuman: false, reason: 'x' }; });
-  assert.equal(settle('R1-B4').code, 1, 'the arbiter already ruled');
+  assertExit(settle('R1-B4'), 1, 'the arbiter already ruled');
   editState(w, (s) => { s.rounds[0].items[4].final = { decision: 'ACCEPT', by: 'judge', needsHuman: false, reason: 'x' }; s.rounds[0].items[4].implemented = true; });
-  assert.equal(settle('R1-B5').code, 1, 'already implemented');
+  assertExit(settle('R1-B5'), 1, 'already implemented');
   for (const id of ['R1-B2', 'R1-B3', 'R1-B4', 'R1-B5']) assert.equal(w.item(id).test?.status ?? 'none', 'none', id);
 
   const ok = settle('R1-B1');
-  assert.equal(ok.code, 0, ok.stdout);
+  assertExit(ok, 0, ok.stdout);
   assert.equal(w.item('R1-B1').final.by, 'test');
-  assert.equal(settle('R1-B1').code, 1, 'a second result for an item that already has one');
+  assertExit(settle('R1-B1'), 1, 'a second result for an item that already has one');
 });
 
 // -- follow-ups
@@ -1287,20 +1288,20 @@ test('followups create: a finding already filed (any round, cache reuse or not) 
   const w = world(t, { gh: [...GH, { match: '^api -X POST repos/acme/widgets/issues ', stdoutJson: { number: 31, html_url: url } }] });
   const posts = () => w.fake.calls().filter((c) => c.argv.join(' ').startsWith('api -X POST repos/acme/widgets/issues ')).length;
   const idea = (over = {}) => finding({ title: 'Cache grows', file: 'src/a.js', line: 20, category: 'performance', testable: false, ...over });
-  assert.equal(w.codex(1, findingsOf([], [], [idea()])).code, 0);
-  assert.equal(w.judge(1, { 'R1-W1': ['FOLLOW-UP'] }).code, 0);
+  assertExit(w.codex(1, findingsOf([], [], [idea()])), 0);
+  assertExit(w.judge(1, { 'R1-W1': ['FOLLOW-UP'] }), 0);
   assert.equal(w.cli(['followups', 'create', '--round', '1']).json.created.length, 1);
   w.repo.write('src/c.js', 'export const c = 1;\n');
   const head2 = w.repo.commit('more');
 
   // round 2 raises it again: once as the identical finding (cache), once under another category that the judge also
   // sends to a follow-up (so its ruling does not come from the cache)
-  assert.equal(w.codex(2, findingsOf([], [], [idea({ category: 'design' }), idea()]), { from: w.head, to: head2 }).code, 0);
+  assertExit(w.codex(2, findingsOf([], [], [idea({ category: 'design' }), idea()]), { from: w.head, to: head2 }), 0);
   assert.equal(w.item('R2-W2').final.by, 'cache');
   assert.equal(w.item('R2-W2').followupIssue, url, 'the issue number travels with the cached ruling');
-  assert.equal(w.judge(2, { 'R2-W1': ['FOLLOW-UP', 'high'] }).code, 0);
+  assertExit(w.judge(2, { 'R2-W1': ['FOLLOW-UP', 'high'] }), 0);
   const r = w.cli(['followups', 'create', '--round', '2']);
-  assert.equal(r.code, 0, r.stderr + r.stdout);
+  assertExit(r, 0, r.stderr + r.stdout);
   assert.deepEqual(r.json.created, []);
   assert.deepEqual([...r.json.skipped].sort(), ['R2-W1', 'R2-W2']);
   assert.equal(posts(), 1, 'one issue for one fingerprint, across the whole review');
@@ -1311,7 +1312,7 @@ test('followups create: a finding already filed (any round, cache reuse or not) 
     s.rounds[1].items.push({ ...s.rounds[1].items[0], id: 'R2-W9', fingerprint: 'other-fp', followupIssue: null, final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, reason: 'low confidence' } });
   });
   const held = w.cli(['followups', 'create', '--round', '2']);
-  assert.equal(held.code, 0);
+  assertExit(held, 0);
   assert.deepEqual(held.json.created, []);
   assert.deepEqual(held.json.held, ['R2-W9']);
   assert.equal(posts(), 1);
@@ -1322,22 +1323,22 @@ test('followups create: a finding already filed (any round, cache reuse or not) 
 
 test('review-complete: refuses when the local HEAD is not the head GitHub holds for the PR', (t) => {
   const w = world(t, { gh: [...GH, REMOVE_LABEL] });
-  assert.equal(w.codex(1, findingsOf()).code, 0);
+  assertExit(w.codex(1, findingsOf()), 0);
   w.prHead('0'.repeat(40));
   const r = w.cli(['review-complete', '--pr', '7']);
-  assert.equal(r.code, 1, r.stdout);
+  assertExit(r, 1, r.stdout);
   assert.equal(r.json.ok, false);
   assert.match(r.json.reason, /HEAD .* is not the head of PR #7/);
   assert.ok(!w.fake.lines().some((l) => l.startsWith('pr edit')), 'no label call');
   w.prHead(w.head);
-  assert.equal(w.cli(['review-complete', '--pr', '7']).code, 0);
+  assertExit(w.cli(['review-complete', '--pr', '7']), 0);
 });
 
 test('review-complete: reads the labels back and exits 3 when awaiting-review is still on the PR', (t) => {
   const w = world(t, { gh: [{ match: '^pr view 7 --json labels', stdoutJson: { labels: [{ name: 'awaiting-review' }, { name: 'agent-build' }] } }, ...GH, REMOVE_LABEL] });
-  assert.equal(w.codex(1, findingsOf()).code, 0);
+  assertExit(w.codex(1, findingsOf()), 0);
   const r = w.cli(['review-complete', '--pr', '7']);
-  assert.equal(r.code, 3, r.stdout);
+  assertExit(r, 3, r.stdout);
   assert.equal(r.json.ok, false);
   assert.equal(r.json.unavailable, true);
   assert.match(r.json.message ?? r.json.reason, /awaiting-review is still/);
@@ -1349,22 +1350,22 @@ test('review-complete: a clean first round does not count once a later round acc
   w.repo.write('.gitignore', '.review/\n'); // keep the state files out of the commits below, so the content hash is only the code
   const head1 = w.repo.commit('ignore the review directory');
   w.prHead(head1);
-  assert.equal(w.codex(1, findingsOf(), { to: head1 }).code, 0);
+  assertExit(w.codex(1, findingsOf(), { to: head1 }), 0);
   w.repo.write('src/c.js', 'export const c = 1;\n');
   const head2 = w.repo.commit('more');
   w.prHead(head2);
-  assert.equal(w.codex(2, findingsOf([finding({ title: 'late bug', file: 'src/c.js', line: 1 })]), { from: head1, to: head2 }).code, 0);
-  assert.equal(w.judge(2, { 'R2-B1': ['ACCEPT'] }).code, 0);
+  assertExit(w.codex(2, findingsOf([finding({ title: 'late bug', file: 'src/c.js', line: 1 })]), { from: head1, to: head2 }), 0);
+  assertExit(w.judge(2, { 'R2-B1': ['ACCEPT'] }), 0);
   // the "fix" removes the file again: the branch now has exactly the content round 1 reviewed, and nothing is unresolved
   w.repo.rm('src/c.js');
   const head3 = w.repo.commit('drop it');
-  assert.equal(w.cli(['state', 'mark-implemented', '--ids', 'R2-B1']).code, 0);
+  assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R2-B1']), 0);
   w.prHead(head3);
   const outcome = w.cli(['state', 'outcome']).json;
   assert.deepEqual([outcome.pending, outcome.needsHuman, outcome.unimplemented], [[], [], []]);
   assert.equal(outcome.currentContentHash, w.state().rounds[0].contentHashAtToHead, 'same content as round 1');
   const r = w.cli(['review-complete', '--pr', '7']);
-  assert.equal(r.code, 1, r.stdout);
+  assertExit(r, 1, r.stdout);
   assert.ok(!w.fake.lines().some((l) => l.startsWith('pr edit')));
 });
 
@@ -1377,7 +1378,7 @@ test('codex-review: a timeout kills Codex AND what it started; a late write from
     ['codex-review', '--pr', '7', '--round', '1', '--base', w.base, '--head', w.head, '--effort', 'high'],
     { PIPELINE_CODEX_TIMEOUT_MS: '700', FAKE_CODEX_HANG: pidFile, FAKE_CODEX_OUTPUT: w.file('late.json', findingsOf([finding()])) },
   );
-  assert.equal(r.code, 3, r.stdout);
+  assertExit(r, 3, r.stdout);
   assert.equal(r.json.unavailable, true);
   assert.equal(r.json.timedOut, true);
   assert.equal(r.json.reason, 'unavailable');
@@ -1392,7 +1393,7 @@ test('codex-review: an answer whose summary is empty or whitespace is exit 3 mal
   const w = world(t);
   for (const summary of ['', '   \n\t']) {
     const r = w.codex(1, { summary, blocking: [], suggestions: [], worth_considering: [] });
-    assert.equal(r.code, 3, JSON.stringify(summary));
+    assertExit(r, 3, JSON.stringify(summary));
     assert.equal(r.json.reason, 'malformed');
     assert.ok(r.json.errors.some((e) => /summary/.test(e)));
   }
@@ -1410,7 +1411,7 @@ test('codex-review: a round recorded while Codex was running is not overwritten 
     ['codex-review', '--pr', '7', '--round', '1', '--base', w.base, '--head', w.head, '--effort', 'high'],
     { FAKE_CODEX_OUTPUT: mine, FAKE_CODEX_DURING: during, FAKE_CODEX_DURING_OUTPUT: theirs },
   );
-  assert.equal(r.code, 2, r.stdout);
+  assertExit(r, 2, r.stdout);
   assert.equal(r.json.error, 'round-order');
   assert.match(r.json.message, /already exists/);
   assert.equal(w.state().rounds.length, 1);
@@ -1419,8 +1420,8 @@ test('codex-review: a round recorded while Codex was running is not overwritten 
 
 test('every command that changes the review state waits for the per-PR lock (and gives up with exit 2 lock-timeout)', async (t) => {
   const w = world(t, { gh: [...GH, REMOVE_LABEL] });
-  assert.equal(w.codex(1, standardFindings()).code, 0);
-  assert.equal(w.judge(1, STANDARD_JUDGE).code, 0);
+  assertExit(w.codex(1, standardFindings()), 0);
+  assertExit(w.judge(1, STANDARD_JUDGE), 0);
   assert.equal(w.cli(['arbiter', 'needed', '--round', '1']).json.needed, true);
   const judgeFile = w.file('j2.json', { items: [] });
   const { tryAcquire, release } = await import('../pipeline/lib/locks.mjs');
@@ -1448,7 +1449,7 @@ test('every command that changes the review state waits for the per-PR lock (and
   try {
     for (const args of mutating) {
       const r = w.cli(args, env);
-      assert.equal(r.code, 2, `${args.join(' ')}: ${r.stdout}`);
+      assertExit(r, 2, `${args.join(' ')}: ${r.stdout}`);
       assert.equal(r.json.error, 'lock-timeout', args.join(' '));
       assert.equal(w.stateText(), before, `${args.join(' ')} changed the state while the lock was held`);
     }
@@ -1456,15 +1457,15 @@ test('every command that changes the review state waits for the per-PR lock (and
     w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
     const head2 = w.repo.commit('fix');
     const cr = w.cli(['codex-review', '--pr', '7', '--round', '2', '--base', w.head, '--head', head2, '--effort', 'high'], { ...env, FAKE_CODEX_OUTPUT: w.file('r2.json', findingsOf()) });
-    assert.equal(cr.code, 2, cr.stdout);
+    assertExit(cr, 2, cr.stdout);
     assert.equal(cr.json.error, 'lock-timeout');
     assert.equal(w.captured().length, calls + 1, 'Codex ran without the lock; only recording the round needs it');
     const readOnly = w.cli(['state', 'outcome'], env);
-    assert.equal(readOnly.code, 0, 'a read-only command does not need the lock');
+    assertExit(readOnly, 0, 'a read-only command does not need the lock');
   } finally {
     release(held.lock);
   }
-  assert.equal(w.cli(['state', 'set-outcome', '--outcome', 'done']).code, 0, 'free again once released');
+  assertExit(w.cli(['state', 'set-outcome', '--outcome', 'done']), 0, 'free again once released');
 });
 
 test('codex-review: takes the lock only AFTER Codex answered, and gives up with lock-timeout when it is held then', async (t) => {
@@ -1476,7 +1477,7 @@ test('codex-review: takes the lock only AFTER Codex answered, and gives up with 
   try {
     const r = w.codex(1, findingsOf(), { env: { PIPELINE_LOCK_WAIT_MS: '250' } });
     assert.equal(w.captured().length, 1, 'Codex ran without waiting for the lock');
-    assert.equal(r.code, 2, r.stdout);
+    assertExit(r, 2, r.stdout);
     assert.equal(r.json.error, 'lock-timeout');
     assert.ok(noState(w));
   } finally {
@@ -1495,7 +1496,7 @@ test('arbiter apply: --expect-model / --expect-effort are test switches; a norma
   const w2 = readyForArbiter(t);
   w2.cli(['arbiter', 'needed', '--round', '1']);
   const honoured = arbiterRun(w2, { model: 'claude-opus-5-1', effort: 'low', extraArgs: asked, env: { PIPELINE_TEST_MODE: '1' } });
-  assert.equal(honoured.code, 0, honoured.stdout);
+  assertExit(honoured, 0, honoured.stdout);
   assert.equal(honoured.json.ok, true);
 });
 
@@ -1524,17 +1525,17 @@ test('arbiter apply: PIPELINE_ARBITER_MODEL_OVERRIDE never relaxes the proof, no
 
 test('an accepted BLOCKING item cannot be marked implemented with no code change, nor cleared by an empty review round', (t) => {
   const w = world(t);
-  assert.equal(w.codex(1, findingsOf([finding()])).code, 0);
-  assert.equal(w.judge(1, { 'R1-B1': ['ACCEPT'] }).code, 0);
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
 
   const marked = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
-  assert.equal(marked.code, 2, marked.stdout);
+  assertExit(marked, 2, marked.stdout);
   assert.equal(marked.json.error, 'no-code-change');
   assert.ok(!w.item('R1-B1').implemented);
 
   // Even if it were marked, a round over the empty range would review nothing.
   const empty = w.codex(2, findingsOf(), { from: w.head, to: w.head });
-  assert.equal(empty.code, 2, empty.stdout);
+  assertExit(empty, 2, empty.stdout);
   assert.equal(empty.json.error, 'empty-range');
   assert.equal(w.state().rounds.length, 1, 'no round was recorded');
   assert.equal(w.captured().length, 1, 'Codex was not even run for the empty range');
@@ -1543,45 +1544,45 @@ test('an accepted BLOCKING item cannot be marked implemented with no code change
 
 test('codex-review: a later round whose content is unchanged since the last round is refused when items were accepted; a real fix passes', (t) => {
   const w = world(t);
-  assert.equal(w.codex(1, findingsOf([finding()])).code, 0);
-  assert.equal(w.judge(1, { 'R1-B1': ['ACCEPT'] }).code, 0);
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
   // An empty commit moves HEAD but not the content.
   w.repo.git(['commit', '-q', '--allow-empty', '-m', 'nothing']);
   const head2 = w.repo.git(['rev-parse', 'HEAD']).trim();
   const r = w.codex(2, findingsOf(), { from: w.head, to: head2 });
-  assert.equal(r.code, 2, r.stdout);
+  assertExit(r, 2, r.stdout);
   assert.equal(r.json.error, 'empty-range');
 
   w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
   const head3 = w.repo.commit('fix');
-  assert.equal(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']).code, 0);
-  assert.equal(w.codex(2, findingsOf(), { from: w.head, to: head3 }).code, 0);
+  assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']), 0);
+  assertExit(w.codex(2, findingsOf(), { from: w.head, to: head3 }), 0);
 });
 
 test('mark-implemented: a commit that only adds or edits tests is not a fix; a source change is', (t) => {
   const w = world(t);
-  assert.equal(w.codex(1, findingsOf([finding()])).code, 0);
-  assert.equal(w.judge(1, { 'R1-B1': ['ACCEPT'] }).code, 0);
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
   w.repo.write('src/a.test.js', "test('null x', () => {});\n");
   w.repo.git(['add', 'src/a.test.js']); // just the test: the untracked .review/ state stays out
   w.repo.git(['commit', '-q', '-m', 'test only']);
   const testOnly = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
-  assert.equal(testOnly.code, 2, testOnly.stdout);
+  assertExit(testOnly, 2, testOnly.stdout);
   assert.equal(testOnly.json.error, 'no-code-change');
   assert.match(testOnly.json.message, /only test files/);
   assert.ok(!w.item('R1-B1').implemented);
 
   w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
   w.repo.commit('fix');
-  assert.equal(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']).code, 0);
+  assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']), 0);
   assert.ok(w.item('R1-B1').implemented);
 });
 
 test('codex-review: with nothing accepted, a later round over an unchanged tree is still allowed', (t) => {
   const w = world(t);
-  assert.equal(w.codex(1, findingsOf([finding()])).code, 0);
-  assert.equal(w.judge(1, { 'R1-B1': ['REJECT'] }).code, 0);
-  assert.equal(w.codex(2, findingsOf(), { from: w.head, to: w.head }).code, 0);
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['REJECT'] }), 0);
+  assertExit(w.codex(2, findingsOf(), { from: w.head, to: w.head }), 0);
 });
 
 // -- triage settle: the pipeline runs the proving test itself
@@ -1589,15 +1590,15 @@ test('codex-review: with nothing accepted, a later round over an unchanged tree 
 // A world whose R1-B1 is a disputed BLOCKING bug (or security item) a test can decide.
 function disputedWorld(t, category = 'bug') {
   const w = world(t);
-  assert.equal(w.codex(1, findingsOf([finding({ category })])).code, 0);
-  assert.equal(w.judge(1, { 'R1-B1': ['REJECT', 'high', DISPUTED] }).code, 0);
+  assertExit(w.codex(1, findingsOf([finding({ category })])), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['REJECT', 'high', DISPUTED] }), 0);
   return w;
 }
 
 test('triage settle: the CLI runs the test; the command, file, exit code and head are recorded with the output', (t) => {
   const w = disputedWorld(t);
   const r = w.cli(settleArgs(w, 'R1-B1', 'bug-disproved', { output: 'compute(undefined) is 0' }));
-  assert.equal(r.code, 0, r.stdout + r.stderr);
+  assertExit(r, 0, r.stdout + r.stderr);
   const rec = w.item('R1-B1').test;
   assert.equal(rec.status, 'bug-disproved');
   assert.equal(rec.cmd, 'node src/proof.test.js');
@@ -1613,10 +1614,10 @@ test('triage settle: a passing test cannot confirm a bug, a failing test cannot 
   const before = () => w.stateText();
   const snapshot = before();
   const disproveFail = w.cli(settleArgs(w, 'R1-B1', 'bug-disproved', { code: 1 }));
-  assert.equal(disproveFail.code, 1, disproveFail.stdout);
+  assertExit(disproveFail, 1, disproveFail.stdout);
   assert.match(disproveFail.json.reason, /needs the test to pass/);
   const confirmPass = w.cli(settleArgs(w, 'R1-B1', 'bug-confirmed', { code: 0 }));
-  assert.equal(confirmPass.code, 1, confirmPass.stdout);
+  assertExit(confirmPass, 1, confirmPass.stdout);
   assert.match(confirmPass.json.reason, /needs the test to fail/);
   assert.equal(before(), snapshot);
   assert.equal(w.item('R1-B1').test, undefined);
@@ -1629,7 +1630,7 @@ test('triage settle: a test that cannot be trusted as proof is refused before an
   // Not in the PR head.
   w.repo.write('src/x.test.js', 'process.exit(0);\n');
   const notCommitted = w.cli([...base, '--test-cmd', 'node src/x.test.js', '--test-file', 'src/x.test.js']);
-  assert.equal(notCommitted.code, 1, notCommitted.stdout);
+  assertExit(notCommitted, 1, notCommitted.stdout);
   assert.match(notCommitted.json.reason, /not in the PR head/);
   // Committed, then edited: the run would not prove the head.
   w.repo.commit('add x test');
@@ -1644,7 +1645,7 @@ test('triage settle: a test that cannot be trusted as proof is refused before an
   assert.match(notNamed.json.reason, /must run --test-file/);
   const missing = w.cli([...base, '--test-cmd', 'node src/none.test.js', '--test-file', 'src/none.test.js']);
   assert.match(missing.json.reason, /not in the PR head/);
-  for (const r of [notCommitted, dirty, notTest, notNamed, missing]) assert.equal(r.code, 1);
+  for (const r of [notCommitted, dirty, notTest, notNamed, missing]) assertExit(r, 1);
   w.repo.rm('src/x.test.js');
   assert.equal(w.item('R1-B1').test, undefined);
   assert.equal(w.stateText(), snapshot);
@@ -1653,7 +1654,7 @@ test('triage settle: a test that cannot be trusted as proof is refused before an
 test('triage settle: a command that cannot run (127) is not a failing test and confirms nothing', (t) => {
   const w = disputedWorld(t);
   const r = w.cli(settleArgs(w, 'R1-B1', 'bug-confirmed', { cmd: 'definitely-not-a-command-xyz src/proof.test.js' }));
-  assert.equal(r.code, 1, r.stdout);
+  assertExit(r, 1, r.stdout);
   assert.match(r.json.reason, /could not be run/);
   assert.equal(w.item('R1-B1').test, undefined);
 });
@@ -1661,7 +1662,7 @@ test('triage settle: a command that cannot run (127) is not a failing test and c
 test('triage settle: a passing test that dismisses a security item still goes to a human (needsHuman), never skipping that rule', (t) => {
   const w = disputedWorld(t, 'security');
   const r = w.cli(settleArgs(w, 'R1-B1', 'bug-disproved'));
-  assert.equal(r.code, 0, r.stdout + r.stderr);
+  assertExit(r, 0, r.stdout + r.stderr);
   const final = w.item('R1-B1').final;
   assert.equal(final.decision, 'REJECT');
   assert.equal(final.by, 'test');
@@ -1670,7 +1671,7 @@ test('triage settle: a passing test that dismisses a security item still goes to
   assert.equal(w.cli(['state', 'outcome']).json.clean, false);
   // Confirming a security bug by a failing test is the safe direction and stays automatic.
   const w2 = disputedWorld(t, 'auth');
-  assert.equal(w2.cli(settleArgs(w2, 'R1-B1', 'bug-confirmed')).code, 0);
+  assertExit(w2.cli(settleArgs(w2, 'R1-B1', 'bug-confirmed')), 0);
   assert.equal(w2.item('R1-B1').final.needsHuman, false);
   assert.equal(w2.item('R1-B1').final.decision, 'ACCEPT');
 });
