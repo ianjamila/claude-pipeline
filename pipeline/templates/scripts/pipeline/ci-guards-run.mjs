@@ -1,34 +1,57 @@
 // Orchestrator the pipeline-guards workflow runs on a BASE checkout (never PR code): fetches the PR head as data,
 // decides which human approval labels still count, runs both guards and publishes the two required commit statuses.
-// Why approvals are computed here instead of read from the event: an approval must be bound to the commit it was given
-// for. A label only counts if the repo owner applied it AFTER the head commit appeared (earliest check suite / status
-// for that sha), so a push after approval silently invalidates it, and a collaborator or a stale label never passes.
-// Everything is re-derived from the GitHub API on every run, so it does not depend on which event woke the workflow.
+// Why approvals are bound by a RECEIPT: an approval must cover exactly the commit the owner reviewed. When a `labeled`
+// event for an approval label (human-approved, test-change-approved) arrives from an allowed approver and the event's
+// head is still the PR's head, the FIRST thing this run does is post a commit status `pipeline-approval: <label>` on
+// that head sha (the receipt). A label then counts for head H only if (a) it is present, (b) its latest `labeled`
+// event was by an allowed approver, (c) a receipt for it exists ON H, created by github-actions[bot] (a status posted
+// with a human's or agent's token does not count), (d) the receipt is not older than that latest `labeled` event
+// (it was posted in response to that very labeling), and (e) the receipt's target_url is a run of the pipeline-guards
+// workflow, triggered by pull_request_target, from a commit on the default branch, listing THIS PR at THIS head with the
+// default branch as base, and running when the receipt was posted (lib/guard-provenance.mjs), and (f) its description
+// names the label and the approver of the latest labeling, which happened inside that run's window. (e) matters
+// because pull_request_target reads the workflow from the PR's BASE branch: an agent can push branch x with an edited
+// workflow and open a PR into x on the same head sha, and that run posts bot statuses on the shared head. Statuses are per sha, so an approval on A can never cover a
+// descendant B, however early B appeared elsewhere (another branch, a fork PR): the old "label is later than the
+// earliest check suite of the head" rule was bypassable that way and is gone. A remove + re-add is a new labeled event,
+// hence a new receipt. If the labeled run is cancelled before the receipt is posted (a newer event for the same PR
+// cancels it) the approval simply does not count and the label is removed with the note "re-apply the label" (fail
+// closed). Residual: the workflow token is the trust anchor - anything that can post a status as github-actions[bot]
+// (for instance a workflow of a same-repo PR that declares statuses: write) could also post the two required statuses
+// directly; and an approver whose browser tab is stale can label a head they did not review (the receipt records the
+// head the event named). Everything is re-derived from the GitHub API on every run, so it does not depend on which
+// event woke the workflow, except that only the labeled event itself can create a receipt.
 // The verdict lives in the statuses: exit 0 after publishing (even for "failure"), exit 1 only on an internal error
 // (the workflow's `if: failure()` step then marks anything still pending as `error`).
 // Who may approve: the logins in .claude/pipeline.yml ci.approvers; with no list, the repo owner of a USER-owned repo. An
 // org-owned repo with no list fails closed (every approval ignored, reason org-repo-needs-ci.approvers), because an org
 // name is never the login of whoever applies a label.
 // Env: GH_TOKEN, REPO (owner/name), PR_NUMBER, EVENT_HEAD, BASE_SHA, RUN_URL, GITHUB_STEP_SUMMARY, OWNER_TYPE (optional:
-// github.event.repository.owner.type, "User" | "Organization"; unset keeps the owner-login rule).
+// github.event.repository.owner.type, "User" | "Organization"; unset keeps the owner-login rule), and for receipts
+// EVENT_ACTION / EVENT_LABEL / EVENT_SENDER (github.event.action, .label.name, .sender.login; empty for other events).
 // Vendored into projects by `pipeline vendor` (imports ./lib/* and ./ci-guard.mjs).
 import { appendFileSync, realpathSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { HARDSTOP_LABEL, INTEGRITY_LABEL, MAX_DESCRIPTION, clip, runCheck } from './ci-guard.mjs';
 import { loadConfig } from './lib/config.mjs';
+import { checkRunProvenance, withinRunWindow } from './lib/guard-provenance.mjs';
 import { git, revParse } from './lib/git.mjs';
 import { gh as defaultGh, GhError } from './lib/proc.mjs';
 
 export const CONTEXTS = { integrity: 'Test integrity', hardstops: 'Hard-stop scan' };
 // Which check each approval label can override.
 const APPROVAL_CHECK = { [INTEGRITY_LABEL]: 'integrity', [HARDSTOP_LABEL]: 'hardstops' };
+// The receipt status context for an approval label: "pipeline-approval: human-approved".
+export const receiptContext = (label) => `pipeline-approval: ${label}`;
+// The receipt names the label and the approver, so it can be matched to the labeling event it answers.
+export const receiptDescription = (label, login) => `${label} approved by ${login}`;
+const RECEIPT_CREATOR = 'github-actions[bot]';
 const NOTES = {
-  predates: 'approval predates the latest commit — re-apply',
+  'no-receipt': 'approval not recorded for this commit — re-apply the label',
   'not-owner': 'approval ignored: label not applied by the repo owner',
   'not-approver': 'approval ignored: label not applied by a login listed in ci.approvers',
   'org-repo-needs-ci.approvers': 'approval ignored: org-owned repo, list the approvers in ci.approvers (org-repo-needs-ci.approvers)',
   'no-event': 'approval ignored: no labeling event found',
-  'no-head-time': 'approval ignored: cannot tell when the commit appeared',
 };
 
 const lines = (text) => String(text).split('\n').map((l) => l.trim()).filter(Boolean);
@@ -52,7 +75,13 @@ function readEnv(env) {
   if (!/^[0-9a-f]{40}$/.test(head)) throw new Error(`EVENT_HEAD is not a full commit sha: ${head}`);
   if (!/^[0-9a-f]{40}$/.test(base)) throw new Error(`BASE_SHA is not a full commit sha: ${base}`);
   const ownerType = env.OWNER_TYPE ? String(env.OWNER_TYPE).trim() : '';
-  return { repo, pr, head, base, runUrl: env.RUN_URL ? String(env.RUN_URL).trim() : '', owner: repo.split('/')[0].toLowerCase(), ownerType };
+  // The labeling event (empty for every other event). The label name is only ever compared to the two known labels.
+  const action = env.EVENT_ACTION ? String(env.EVENT_ACTION).trim() : '';
+  const label = env.EVENT_LABEL ? String(env.EVENT_LABEL).trim().slice(0, 200) : '';
+  const sender = env.EVENT_SENDER ? String(env.EVENT_SENDER).trim() : '';
+  if (action && !/^[a-z_]{1,40}$/.test(action)) throw new Error(`EVENT_ACTION is not an action name: ${action}`);
+  if (sender && !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})?(?:\[bot\])?$/.test(sender)) throw new Error(`EVENT_SENDER is not a login: ${sender}`);
+  return { repo, pr, head, base, action, label, sender, runUrl: env.RUN_URL ? String(env.RUN_URL).trim() : '', owner: repo.split('/')[0].toLowerCase(), ownerType };
 }
 
 /**
@@ -60,7 +89,7 @@ function readEnv(env) {
  * deps (tests): gh (proc.gh shape), check (passed to ci-guard runCheck).
  */
 export async function runOrchestrator({ env = process.env, cwd = process.cwd(), deps = {} } = {}) {
-  const { repo, pr, head, base, runUrl, owner, ownerType } = readEnv(env);
+  const { repo, pr, head, base, action, label: eventLabel, sender, runUrl, owner, ownerType } = readEnv(env);
   const ghFn = deps.gh ?? defaultGh;
 
   const api = (args) => {
@@ -90,20 +119,48 @@ export async function runOrchestrator({ env = process.env, cwd = process.cwd(), 
   const fetched = revParse('refs/remotes/pr/head', { cwd }).toLowerCase();
   if (fetched !== head || currentHead() !== head) return superseded();
 
-  // 2. Which approval labels still count.
-  async function resolveApprovals(labels) {
-    const present = Object.keys(APPROVAL_CHECK).filter((l) => labels.includes(l));
-    if (present.length === 0) return { valid: [], invalid: [], headSeenAt: null };
-    // Only read when an approval label is actually present. An unreadable config is an internal error (fail closed).
+  // Who may approve. An unreadable config is an internal error (fail closed). Only read when it is needed.
+  async function approverPolicy() {
     const loaded = await (deps.loadConfig ?? loadConfig)(cwd);
     if (!loaded.ok) throw new Error(`invalid or missing .claude/pipeline.yml: ${loaded.errors.join('; ')}`);
     const approvers = (loaded.config.ci?.approvers ?? []).map((l) => l.toLowerCase());
     const orgWithoutList = approvers.length === 0 && ownerType !== '' && ownerType !== 'User';
-    const stamps = [
-      ...lines(api([`repos/${repo}/commits/${head}/check-suites`, '--paginate', '--jq', '.check_suites[].created_at'])),
-      ...lines(api([`repos/${repo}/commits/${head}/statuses`, '--paginate', '--jq', '.[].created_at'])),
-    ].map((s) => Date.parse(s)).filter(Number.isFinite);
-    const headSeenAt = stamps.length > 0 ? Math.min(...stamps) : null;
+    const allowed = (login) => !orgWithoutList && (approvers.length > 0 ? approvers.includes(login) : login === owner);
+    return { approvers, orgWithoutList, allowed };
+  }
+
+  // 2a. The receipt: record, on THIS head, that an allowed approver applied this approval label to it. Posted before
+  // anything is evaluated, so a later cancellation cannot leave a half-recorded approval (it leaves none).
+  if (action === 'labeled' && Object.hasOwn(APPROVAL_CHECK, eventLabel) && sender) {
+    const policy = await approverPolicy();
+    if (policy.allowed(sender.toLowerCase())) {
+      // The run URL is the receipt's provenance: a receipt without one could never be verified, so it is not posted.
+      if (!runUrl) throw new Error('RUN_URL is required to post an approval receipt');
+      post('success', receiptContext(eventLabel), receiptDescription(eventLabel, sender));
+    }
+  }
+
+  // 2b. Which approval labels still count.
+  async function resolveApprovals(labels) {
+    const present = Object.keys(APPROVAL_CHECK).filter((l) => labels.includes(l));
+    if (present.length === 0) return { valid: [], invalid: [] };
+    const { approvers, orgWithoutList } = await approverPolicy();
+    const receipts = lines(api([
+      `repos/${repo}/commits/${head}/statuses`, '--paginate', '--jq',
+      '.[] | select((.context | startswith("pipeline-approval: ")) and .state == "success") | {context: .context, by: .creator.login, at: .created_at, url: .target_url, description: .description} | @json',
+    ])).map((l) => JSON.parse(l));
+    const provenanceCache = new Map();
+    const read = (path, jq) => api([path, '--jq', jq]);
+    // (e) The receipt's run is verified AND bound to this PR/head/time; (f) the receipt names this label and the approver of
+    // the latest labeling, and that labeling happened while the run was going (so the run answers that very event).
+    const receiptOk = (r, label, latest) => {
+      const note = (why) => { process.stderr.write(`ignoring receipt ${r.context} (${r.at}): ${why}\n`); return false; };
+      const verdict = checkRunProvenance({ read, repo, url: r.url, bind: { prNumber: pr, headSha: head, createdAt: r.at }, cache: provenanceCache });
+      if (!verdict.ok) return note(verdict.reason);
+      if (String(r.description ?? '').toLowerCase() !== receiptDescription(label, latest.actor).toLowerCase()) return note('its description does not name this label and the approver of the latest labeling');
+      if (!withinRunWindow(verdict.window, latest.at)) return note('the labeling happened outside the window of the run that posted it');
+      return true;
+    };
     const events = lines(api([
       `repos/${repo}/issues/${pr}/events`, '--paginate', '--jq',
       '.[] | select(.event == "labeled") | {label: .label.name, actor: .actor.login, at: .created_at} | @json',
@@ -118,14 +175,13 @@ export async function runOrchestrator({ env = process.env, cwd = process.cwd(), 
       let reason = null;
       const actor = String(latest?.actor ?? '').toLowerCase();
       if (orgWithoutList) reason = 'org-repo-needs-ci.approvers';
-      else if (headSeenAt === null) reason = 'no-head-time';
       else if (!latest) reason = 'no-event';
       else if (approvers.length > 0 ? !approvers.includes(actor) : actor !== owner) reason = approvers.length > 0 ? 'not-approver' : 'not-owner';
-      else if (!(Date.parse(latest.at) > headSeenAt)) reason = 'predates';
+      else if (!receipts.some((r) => r.context === receiptContext(label) && r.by === RECEIPT_CREATOR && Date.parse(r.at) >= Date.parse(latest.at) && receiptOk(r, label, latest))) reason = 'no-receipt';
       if (reason) invalid.push({ label, reason });
       else valid.push(label);
     }
-    return { valid, invalid, headSeenAt };
+    return { valid, invalid };
   }
 
   // 3. Both guards, with ONLY the valid approvals visible to them.
@@ -189,7 +245,7 @@ export async function runOrchestrator({ env = process.env, cwd = process.cwd(), 
       head,
       base,
       results: published,
-      approvals: { valid: pass.approvals.valid, ignored: pass.approvals.invalid, removed, headSeenAt: pass.approvals.headSeenAt === null ? null : new Date(pass.approvals.headSeenAt).toISOString() },
+      approvals: { valid: pass.approvals.valid, ignored: pass.approvals.invalid, removed },
     },
   };
 }

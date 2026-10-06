@@ -40,6 +40,63 @@ test('final-gate: `skipping` is accepted for a docs-only diff and refused for a 
   assertOnlyFails(scenario({ gh: { ci: skipped } }).gate(), 'ci', /e2e=skipping/);
 });
 
+// ---- final-gate: guard statuses need provenance -------------------------------------------------
+
+const GUARD_LINK = 'https://github.com/acme/widgets/actions/runs/55';
+const BOT = 'github-actions[bot]';
+// One guard status as GitHub reports it: the latest status of the context on the head, the run it points at, the default branch.
+// The final gate reads the status itself (not the row's link), so a status can be wrong in any of these ways.
+const guardScenario = ({ run = {}, prs, compare = 'ahead', link = GUARD_LINK, by = BOT, state = 'success', at = '2026-10-01T10:05:00Z', runFails = false, noStatus = false } = {}) => scenario({
+  gh: {
+    ci: [{ name: 'ci', state: 'SUCCESS', bucket: 'pass' }, { name: 'Hard-stop scan', state: 'SUCCESS', bucket: 'pass', link: GUARD_LINK }],
+    extra: (o) => [
+      { match: '^api repos/acme/widgets/commits/[0-9a-f]{40}/statuses', stdout: noStatus ? 'null\n' : `${JSON.stringify({ state, by, at, url: link })}\n` },
+      runFails ? { match: '^api repos/acme/widgets/actions/runs/55 ', code: 1, stderr: 'HTTP 404' } : {
+        match: '^api repos/acme/widgets/actions/runs/55 ',
+        stdout: `${JSON.stringify({
+          path: '.github/workflows/pipeline-guards.yml@refs/heads/main', event: 'pull_request_target', head_sha: 'a'.repeat(40),
+          run_started_at: '2026-10-01T10:00:00Z', updated_at: '2026-10-01T10:12:00Z',
+          pull_requests: prs ? prs(o.prHead) : [{ number: 12, head: { sha: o.prHead }, base: { ref: 'main' } }], ...run,
+        })}\n`,
+      },
+      { match: '^api repos/acme/widgets --jq \\.default_branch', stdout: 'main\n' },
+      { match: '^api repos/acme/widgets/compare/', stdout: `${compare}\n` },
+    ],
+  },
+});
+
+test('final-gate: a passing guard status posted by the real workflow for THIS PR and head is accepted', () => {
+  const r = guardScenario().gate();
+  assert.equal(r.code, 0, JSON.stringify(r.json?.checks.filter((c) => !c.ok)));
+});
+
+test('final-gate: a guard status from another workflow, event, branch commit, PR, base branch, window, creator, or an unreadable run fails ci', () => {
+  const bad = [
+    guardScenario({ run: { path: '.github/workflows/evil.yml@refs/heads/x' } }),
+    guardScenario({ run: { event: 'pull_request' } }),
+    guardScenario({ compare: 'diverged' }),
+    guardScenario({ link: '' }),
+    guardScenario({ link: 'https://github.com/evil/widgets/actions/runs/55' }),
+    guardScenario({ runFails: true }),
+    guardScenario({ by: 'mallory' }),
+    guardScenario({ state: 'failure' }),
+    guardScenario({ noStatus: true }),
+    guardScenario({ at: '2026-10-01T11:00:00Z' }),
+    guardScenario({ run: { run_started_at: '2026-10-01T09:00:00Z', updated_at: '2026-10-01T09:01:00Z' } }),
+    guardScenario({ prs: () => [] }),
+    guardScenario({ prs: (head) => [{ number: 99, head: { sha: head }, base: { ref: 'main' } }] }),
+    guardScenario({ prs: () => [{ number: 12, head: { sha: 'e'.repeat(40) }, base: { ref: 'main' } }] }),
+    // downgrade: a side branch cut from an old main commit is an ancestor of main but is not main
+    guardScenario({ prs: (head) => [{ number: 12, head: { sha: head }, base: { ref: 'old-main-copy' } }] }),
+  ];
+  for (const s of bad) assertOnlyFails(s.gate(), 'ci', /guard status not posted by the pipeline-guards workflow: Hard-stop scan/);
+});
+
+test('final-gate: non-guard checks need no provenance (their rows are never looked up)', () => {
+  const r = scenario({ gh: { ci: [{ name: 'ci', state: 'SUCCESS', bucket: 'pass', link: 'https://example.test/x' }] } }).gate();
+  assert.equal(r.code, 0, JSON.stringify(r.json?.checks.filter((c) => !c.ok)));
+});
+
 // ---- final-gate: preview --------------------------------------------------------------------------
 
 test('final-gate: with preview configured, a missing, failed or other-sha preview smoke fails preview', () => {

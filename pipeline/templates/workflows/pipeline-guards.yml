@@ -5,6 +5,16 @@
 # judged. The PR's code is fetched as git data and diffed — it is never checked out or executed.
 # Results are published as commit statuses on the PR head SHA (what branch protection requires).
 #
+# Provenance: pull_request_target reads THIS file from the PR's base branch, so a PR into a branch whose copy of the file was
+# edited would also post statuses as github-actions[bot]. Receipts and the final gate therefore verify that a status's
+# target_url is a run of this workflow, event pull_request_target, from a commit on the default branch
+# (scripts/pipeline/lib/guard-provenance.mjs). There is deliberately no `branches:` filter: a template cannot know the
+# default branch, and a filter in this file protects nothing against a PR into a branch that carries its own copy.
+#
+# Approvals: a `labeled` run by an allowed approver first posts a receipt status (`pipeline-approval: <label>`) on the
+# exact head sha; an approval label only counts for a head that carries a fresh receipt from github-actions[bot], so an
+# approval can never carry over to a later commit. The label name and the sender reach the job only through env:.
+#
 # Do not add steps that run code from the PR (npm install, its scripts, its actions).
 name: Pipeline guards
 
@@ -15,10 +25,9 @@ on:
 
 permissions:
   contents: read        # read base + fetch the PR head as data
-  pull-requests: write  # only to remove an approval label that predates the latest commit
+  pull-requests: write  # only to remove an approval label that has no receipt for the current head
   issues: read          # label timeline (who approved, when)
-  statuses: write       # publish the two required statuses
-  checks: read          # check-suite timestamps (when the head commit appeared)
+  statuses: write       # publish the two required statuses and the approval receipts
 
 concurrency:
   # An edit that does not change the base (title, body) is a no-op below; it gets its own group so it can never cancel a
@@ -40,6 +49,10 @@ jobs:
       PR_NUMBER: ${{ github.event.pull_request.number }}
       EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
       BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      # The labeling event, for the approval receipt (empty for other events). Read only by ci-guards-run.mjs.
+      EVENT_ACTION: ${{ github.event.action }}
+      EVENT_LABEL: ${{ github.event.label.name }}
+      EVENT_SENDER: ${{ github.event.sender.login }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - name: Mark pending
@@ -60,7 +73,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: 24
 
       - name: Evaluate and publish statuses
         run: node scripts/pipeline/ci-guards-run.mjs

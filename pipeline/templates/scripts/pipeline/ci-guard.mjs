@@ -70,6 +70,8 @@ export function renderSummary(check, result) {
   return `${lines.join('\n')}\n`;
 }
 
+// `labels` are the approval labels that STILL COUNT for `head`: ci-guards-run.mjs passes only labels that carry a valid
+// receipt for exactly this head sha (see its header); this function never decides who may approve or when.
 // Evaluates one check against a base..head range. Used by the CLI below and by ci-guards-run.mjs (the workflow
 // orchestrator). Never throws: any problem becomes exitCode 2 (fail closed).
 // Returns { exitCode, output, description, summary }. IO (git, config) is injectable for tests.

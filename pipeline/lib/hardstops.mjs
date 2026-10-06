@@ -14,8 +14,15 @@
 // Principles that matter for safety:
 //  * A file whose content we cannot read (binary diff of a non-asset, a line over 20,000 chars) is itself a hit
 //    (R0-unscannable): git marks a text file "binary" on a single NUL byte, and nothing else would look at it.
-//  * Content rules (SQL, auth, secrets, env, sensitive terms) judge PRODUCTION code only: not tests, not docs/markdown.
+//  * Content rules (SQL, auth, secrets, env, sensitive terms) judge PRODUCTION code only: not tests, not documentation.
+//    "Documentation" is a file that cannot execute (markdown, text, images, pdf); under docs/ a .ts/.js/.sql module is
+//    still code, because production code can import it. Test files are exempt from every content rule EXCEPT key-shaped
+//    secret literals (a real key committed in a fixture leaks all the same), and production code that imports a test
+//    module is flagged (R0-unscannable), since an exempt file wired into production would never be judged.
 //    Path rules and the R1 migration rules judge every file.
+//  * Content that MOVES is judged too: a rename from an exempt path (test, docs) into production code carries lines the
+//    diff does not show (R0-unscannable), and a symlink (mode 120000) can make a production path serve a file from an
+//    exempt one (R4-pipeline).
 //  * SQL keyword rules run on comment-stripped text; the stripper is string-aware and only carries a block comment across
 //    CONSECUTIVE added lines (a gap means we cannot know the state, so we assume code). In non-SQL code, SQL lives in
 //    strings, so only multi-word forms are matched there (no bare "grant" or "truncate").
@@ -37,7 +44,16 @@ const MAX_LINE = 20_000;
 const inc = (p, globs) => matchAny(p, globs, { nocase: true });
 
 const MIGRATION_GLOBS = ['**/migrations/**'];
-const NON_CODE_GLOBS = ['**/*.md', 'docs/**'];
+// Documentation = content that cannot execute. Anything else under docs/ (a .ts, .mjs, .sql, .json, extensionless file...)
+// is code: `import x from '@/docs/evil'` resolves from the repo root in a typical Next app. .mdx is executable (JSX, imports),
+// so it is code everywhere; a .md under a Next route dir (app/, pages/) is a page when pageExtensions include md.
+const DOC_EXT = /\.(?:md|txt|rst|adoc|png|jpe?g|gif|webp|avif|ico|pdf)$/i;
+const MD_ROUTE_GLOBS = ['**/app/**', '**/pages/**'];
+const isNonCode = (p) => {
+  if (/\.mdx$/i.test(p)) return false;
+  if (matchAny(p, ['docs/**'])) return DOC_EXT.test(p);
+  return /\.md$/i.test(p) && !matchAny(p, MD_ROUTE_GLOBS);
+};
 
 // `docs/migrations/notes.md` documents migrations; it is not one.
 const isMigrationPath = (p) => !/\.md$/.test(p) && inc(p, MIGRATION_GLOBS);
@@ -57,10 +73,11 @@ const isTestFile = (p, testGlobs) => {
   if (TEST_NAME.test(p)) return true;
   return !inc(p, SERVER_ENTRY_GLOBS) && !inc(p, NEXT_ENTRY_GLOBS);
 };
-const isCodeFile = (p, testGlobs) => !matchAny(p, NON_CODE_GLOBS) && !isTestFile(p, testGlobs);
+const isCodeFile = (p, testGlobs) => !isNonCode(p) && !isTestFile(p, testGlobs);
 
 // Binary changes we accept without reading: assets nobody can hide logic in.
-const BINARY_ASSET = /\.(?:png|jpe?g|gif|webp|avif|ico|svg|pdf|zip|gz|tgz|woff2?|ttf|otf|eot|mp4|mov|mp3|wav|wasm|bin|snap)$/i;
+// (wasm is NOT one: replacing an existing module changes what runs with no source line in the diff.)
+const BINARY_ASSET = /\.(?:png|jpe?g|gif|webp|avif|ico|svg|pdf|zip|gz|tgz|woff2?|ttf|otf|eot|mp4|mov|mp3|wav|bin|snap)$/i;
 
 const R2_PATH_GLOBS = [
   '**/auth/**', '**/middleware.{ts,tsx,js,jsx,mjs,mts,cjs,cts}', '**/*rbac*/**', '**/*rbac*', '**/roles*', '**/roles*/**',
@@ -415,6 +432,12 @@ const SECRET_LITERALS = [
   ['Google API key', /AIza[0-9A-Za-z_-]{35}/],
   ['Vault secret', /vault\.create_secret\s*\(/i],
 ];
+// Test files: key-shaped literals only (no JWT: local Supabase demo keys are JWTs and live in every e2e setup; no Vault),
+// and not when the line says it is fake. A real key pasted into a fixture is still a leaked key.
+const TEST_SECRET_LITERALS = SECRET_LITERALS.filter(([name]) => name !== 'JWT' && name !== 'Vault secret');
+const FAKE_MARKER = /example|fake|dummy|placeholder|not[-_ ]?real|redacted|x{6,}|0{8,}/i;
+// An import/require whose specifier names a test module or a test directory: exempt code wired into production.
+const TEST_IMPORT = /(?:\bfrom|\bimport|\brequire)\s*\(?\s*['"`](?=[^'"`]*[./])[^'"`]*(?:\.(?:test|spec)(?:[./'"`]|$)|\/(?:__tests__|__mocks__|__fixtures__|tests?|e2e|fixtures)\/)/i;
 const SECRETS_REF = /\bsecrets\s*[.[]/i;
 // Beyond the spec's env/build: install/ignore commands run code at deploy; crons, rewrites, redirects, headers and
 // functions change what the deployment exposes or runs.
@@ -788,7 +811,9 @@ function describe(f, cx) {
     added: f.added ?? [], removed: f.removed ?? [],
     sql: paths.some(isSqlPath),
     // Added lines live in the new path, removed lines in the old one.
+    symlink: Boolean(f.symlink),
     addedIsCode: isCodeFile(f.newPath ?? file, cx.testGlobs),
+    addedIsTest: isTestFile(f.newPath ?? file, cx.testGlobs),
     removedIsCode: isCodeFile(f.oldPath ?? file, cx.testGlobs),
   };
 }
@@ -803,6 +828,12 @@ function pathRules(d, cx, sink) {
 
   // A submodule (gitlink) entry points the repo at code this diff does not contain.
   if (d.gitlink) sink.add('R4-pipeline', d.file, 'submodule (gitlink) entry added, changed or removed');
+  // A symlink's diff is only its target path; the file it serves can live in an exempt location (tests/, docs/).
+  if (d.symlink) sink.add('R4-pipeline', d.file, 'symlink (mode 120000) added, changed or removed: the file it points to is not judged');
+  // Moving a file out of an exempt path into production: its lines were never judged and a 100% rename shows none.
+  if (d.status === 'R' && d.oldPath && d.newPath && !isCodeFile(d.oldPath, cx.testGlobs) && isCodeFile(d.newPath, cx.testGlobs)) {
+    sink.add('R0-unscannable', d.file, `moved from a test/docs path (${d.oldPath}) into production code; its content was never judged`);
+  }
 
   // R1: existing migrations are immutable; deleting one (or moving it out of the migrations dir) is destructive.
   const inMigrations = d.paths.some(isMigrationPath);
@@ -875,6 +906,7 @@ function addedCodeRules(d, added, cx, env, sink) {
 
     const secret = SECRET_LITERALS.find(([, r]) => r.test(l.text));
     if (secret) sink.add('R3-secrets', d.file, `secret-like literal (${secret[0]})`, { line: l.line }); // no excerpt: it IS the secret
+    if (live(l) && TEST_IMPORT.test(l.text)) sink.add('R0-unscannable', d.file, 'imports a test/fixture module into production code; test files are not judged', ex);
     if (isWorkflow && SECRETS_REF.test(l.text)) sink.add('R3-secrets', d.file, 'workflow reads secrets.*', ex);
     if (isVercel && VERCEL_KEY.test(l.text)) sink.add('R3-secrets', d.file, 'vercel.json env/build/deploy setting changed', ex);
 
@@ -887,6 +919,14 @@ function addedCodeRules(d, added, cx, env, sink) {
     if (parts.length > 0) sink.add('R3-secrets', d.file, parts.join('; '), ex);
 
     if (live(l) && isSensitiveText(l.text)) sink.add('R6-sensitive', d.file, 'sensitive-data term in added code', ex);
+  }
+}
+
+// The one content rule test files keep: a key-shaped literal that does not announce itself as fake.
+function testSecretRules(d, added, sink) {
+  for (const l of added) {
+    const secret = TEST_SECRET_LITERALS.find(([, r]) => r.test(l.text));
+    if (secret && !FAKE_MARKER.test(l.text)) sink.add('R3-secrets', d.file, `secret-like literal in a test file (${secret[0]})`, { line: l.line });
   }
 }
 
@@ -933,6 +973,7 @@ function lineRules(d, cx, env, sink) {
   const removed = d.removed.filter(fit);
   // Content rules judge production code only: not tests, not docs/markdown.
   if (d.addedIsCode) addedCodeRules(d, added, cx, env, sink);
+  else if (d.addedIsTest) testSecretRules(d, added, sink);
   if (d.removedIsCode) removedCodeRules(d, removed, cx, sink);
   patternRules(d, added, removed, cx, sink);
 }

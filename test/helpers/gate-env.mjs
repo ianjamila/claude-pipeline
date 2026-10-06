@@ -97,7 +97,7 @@ export function ghEntries(o) {
 
   const ci = o.ci ?? [{ name: 'ci', state: 'SUCCESS', bucket: 'pass' }];
   return [
-    ...(o.extra ?? []),
+    ...(typeof o.extra === 'function' ? o.extra(o) : (o.extra ?? [])),
     ...previewDeployEntries(o),
     { match: '^pr view 12 --json state,headRefOid', stdoutJson: pr },
     { match: '^pr view 12 --json state,mergeCommit', stdoutJson: { labels: [], ...(o.mergeView ?? { state: 'MERGED', mergeCommit: { oid: MERGE_SHA } }) } },

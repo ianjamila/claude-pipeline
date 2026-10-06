@@ -33,7 +33,7 @@ test('1 binary diff of a non-asset file -> R0-unscannable (a single NUL byte mak
 });
 
 test('1 binary assets are accepted without reading (case-insensitive)', () => {
-  for (const ext of ['png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'ico', 'svg', 'pdf', 'zip', 'gz', 'tgz', 'woff', 'woff2', 'ttf', 'otf', 'eot', 'mp4', 'mov', 'mp3', 'wav', 'wasm', 'bin', 'snap', 'PNG']) {
+  for (const ext of ['png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'ico', 'svg', 'pdf', 'zip', 'gz', 'tgz', 'woff', 'woff2', 'ttf', 'otf', 'eot', 'mp4', 'mov', 'mp3', 'wav', 'bin', 'snap', 'PNG']) {
     assert.deepEqual(flags([file(`public/x.${ext}`, { status: 'A', binary: true })]), [], ext);
   }
 });
@@ -249,7 +249,7 @@ test('5 secret-shaped literals are R3 in production code, and the hit never repe
 test('5 secret literals in SQL and workflows too; tests and docs are exempt; normal text is not a secret', () => {
   assert.ok(flags([A('supabase/migrations/5_a.sql', `select vault.create_secret('${SECRETS['Stripe live key']}', 'x');`)]).includes('R3-secrets'));
   assert.ok(flags([file('.github/workflows/x.yml', { added: [`  KEY: ${SECRETS['AWS access key id']}`] })]).includes('R3-secrets'));
-  assert.deepEqual(flags([file('lib/pay.test.ts', { added: [SECRETS['Stripe live key']] })]), []);
+  // Tests keep ONE content rule (key-shaped secrets); see test/hardstops-exemptions.test.mjs. Docs are fully exempt.
   assert.deepEqual(flags([file('docs/pay.md', { added: [SECRETS['Stripe live key']] })]), []);
   assert.deepEqual(flags([file('lib/a.ts', { added: ['const a = "sk_live_"; const b = "AKIA"; // eyJ.eyJ.x'] })]), []);
 });
@@ -474,8 +474,9 @@ test('10 pgTAP tests: deleting or moving one is R4; editing one is not (content 
 test('11 docs, markdown and test files are exempt from every content rule', () => {
   const lines = [
     'service_role', 'createAdminClient()', 'DROP TABLE users;', 'GRANT ALL ON t TO anon;', 'process.env.BRAND_NEW', 'payroll', 'httpOnly: false',
-    "role: 'admin'", "'use server'", SECRETS['AWS access key id'], 'supabase.auth.admin.deleteUser(1)', "sb.from('t').delete()",
+    "role: 'admin'", "'use server'", 'supabase.auth.admin.deleteUser(1)', "sb.from('t').delete()",
   ];
+  assert.deepEqual(flags([file('docs/setup.md', { added: [SECRETS['AWS access key id']] })]), []);
   for (const p of ['docs/setup.md', 'README.md', 'lib/x.test.ts', 'lib/x.spec.tsx', 'e2e/a.spec.ts', 'supabase/tests/rls.test.sql', 'lib/__tests__/a.ts']) {
     assert.deepEqual(flags([file(p, { added: lines })]), [], p);
   }

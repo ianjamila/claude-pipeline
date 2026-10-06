@@ -577,6 +577,11 @@ function checkApi(rest, env, dir, ctx) {
     }
   }
 
+  // -- commit statuses and check runs: an agent posting its own `Hard-stop scan` / `Test integrity` / `pipeline-approval: *` status
+  //    would forge the guard's verdict or an approval receipt. Only the pipeline-guards workflow writes them.
+  if (/^repos\/[^/]+\/[^/]+\/statuses\/[^/]+$/i.test(ep)) return deny(`${method} to the commit statuses API is blocked: the guard statuses and approval receipts are written only by the pipeline-guards workflow. ${OWNER_ONLY}`);
+  if (/^repos\/[^/]+\/[^/]+\/check-(runs|suites)(\/|$)/i.test(ep)) return deny(`${method} to the checks API is blocked: check results are written only by CI. ${OWNER_ONLY}`);
+
   // -- merging or moving main without going through the merge gate
   if (method === 'PUT' && /^repos\/[^/]+\/[^/]+\/pulls\/\d+\/merge$/i.test(ep)) return deny(`merging through the API bypasses the merge gate, like --admin. ${OWNER_ONLY}`);
   if (method === 'POST' && /\/merges$/i.test(p)) return deny(`merging branches through the API can move main without a PR. ${OWNER_ONLY}`);
