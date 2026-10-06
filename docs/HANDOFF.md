@@ -57,12 +57,31 @@ INTERRUPTED (stopped mid-work; uncommitted changes left in the worktree — insp
   green on `test (ubuntu)` + `test (windows)`. After a PC crash the int3 worktree was re-verified clean at
   `8edf5e5` on 2026-10-05. Branch protection not applied yet (needs GitHub Pro, step 7) — until then fixes may
   still go to main directly (plan 6.2).
-- NEXT = step 5 (plan Task 7.2), owner terminal only (the installer refuses inside a Claude session):
-  `PIPELINE_ADMIN=1 node ~/Claude/claude-pipeline/install.mjs --skip-file-guard`; check the report (skills /
-  agents / pipeline installed, guard-git present, allowlist entry, `CLAUDE_CODE_SUBAGENT_MODEL` reported).
-  Then the headless smoke (`claude -p --model haiku` lists implementer/verifier/judge/arbiter +
-  ship/verify/pipeline-setup) and the guard-git live check (`git push origin main --dry-run` in a tmp repo is
-  denied by the hook).
+- CI on `f36f922` (the 10-05 handoff note): run 37270398040 failed on `test (windows)` only, 3162 pass / 1 fail —
+  `test/cli-review.test.mjs:1584` (`triage validate` exit 3). No code path in `triage validate` returns 3; on
+  Windows 3 is a native `abort()` of node, the commit was docs-only and the same code passed on `8edf5e5` →
+  runner flake. Re-run of the failed job (2026-10-06): `test (windows)` success — flake
+  confirmed; `main` = `f36f922` green on both jobs.
+- Step 5 DONE (2026-10-06, plan Task 7.2):
+  - `~/Claude/claude-pipeline` was still on the old `build/initial` (no install.mjs) → switched to `main`
+    tracking origin/main at `f36f922`. The install is a copy: to update later, `git pull` there and re-run the
+    installer from the owner terminal.
+  - Owner ran `PIPELINE_ADMIN=1 node install.mjs --skip-file-guard` (target `~/.claude`).
+    `node install.mjs --check --skip-file-guard --claude-home ~/.claude` → "No drift". From a session started
+    with `CLAUDE_CONFIG_DIR` set, `--check` without `--claude-home` inspects that other dir and reports
+    everything missing — expected.
+  - Second account: `~/.claude-eaglewatch` already symlinks skills/settings/hooks to `~/.claude`; added
+    `~/.claude-eaglewatch/agents -> ~/.claude/agents` so its sessions see the four agents. Skills and the hook
+    use absolute `~/.claude/pipeline` paths, so nothing else is needed there.
+  - Headless smoke from `eaglewatch/.worktrees/foundation`, both accounts: the reply lists implementer,
+    verifier, judge, arbiter, ship, verify, pipeline-setup.
+  - Guard-git live check, both accounts, in a tmp repo whose origin is a local bare repo: the hook denied the
+    dry-run push to main; the bare remote has no `main`. `--allowedTools` is variadic and swallows a trailing
+    prompt, so the prompt goes on stdin (plan 7.2 corrected). The hook is live in already-running sessions too:
+    it also refuses a `node -e` script whose text contains a push-to-main command (edit such docs with an
+    editor, not a script).
+- NEXT = step 6: onboard EagleWatch with the pipeline-setup skill (plan Phase 8, Task 8.1). Owner prerequisite:
+  GitHub Pro (needed for protection in 8.2; setup can proceed meanwhile).
 
 ## Remaining work (in order)
 
@@ -77,7 +96,7 @@ INTERRUPTED (stopped mid-work; uncommitted changes left in the worktree — insp
    windows, `shell: bash`) + `.claude/pipeline.yml` (all paths hard-stop) + README.
 4. `gh repo create ianjamila/claude-pipeline --private`, push, CI green (Windows proves the
    .cmd quoting / installer).
-5. Install locally `PIPELINE_ADMIN=1 node install.mjs --skip-file-guard` (owner terminal).
+5. DONE 2026-10-06 — install locally `PIPELINE_ADMIN=1 node install.mjs --skip-file-guard` (owner terminal).
 6. Onboard EagleWatch with the pipeline-setup skill (plan Phase 8; merge-gate `--expect-head`,
    KNOWN_NON_GATES registration, checks.yml drop `paths:` filter, pgTAP, smoke specs, Stop hook).
    Owner merges the onboarding PR.

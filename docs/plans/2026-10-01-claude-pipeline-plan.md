@@ -532,9 +532,9 @@ Tests: `templates.test.mjs` — `verify.mjs` `runSteps` on a tmp dir with fake s
 - [ ] Dispatch a Sonnet `superpowers:code-reviewer` over `$CP` against the spec; fix confirmed findings (implementer). Commit.
 
 ### Task 7.2: local install (file guard deferred)
-- [ ] From a terminal context: `PIPELINE_ADMIN=1 node ~/Claude/claude-pipeline/install.mjs --skip-file-guard`. Check report: skills/agents/pipeline installed; guard-git present; allowlist entry; `CLAUDE_CODE_SUBAGENT_MODEL` reported.
-- [ ] Headless smoke (fresh session picks up skills/agents): `claude -p --model haiku "List the agent types you can spawn and the skills named ship, verify, pipeline-setup. Reply as JSON."` from `~/Claude/eaglewatch/.worktrees/foundation` → includes implementer, verifier, judge, arbiter, ship, verify, pipeline-setup.
-- [ ] Guard-git live check: `claude -p --model haiku --allowedTools Bash "Run: git push origin main --dry-run"` in a tmp repo → reply shows the hook denial.
+- [x] From a terminal context: `PIPELINE_ADMIN=1 node ~/Claude/claude-pipeline/install.mjs --skip-file-guard`. Check report: skills/agents/pipeline installed; guard-git present; allowlist entry; `CLAUDE_CODE_SUBAGENT_MODEL` reported.
+- [x] Headless smoke (fresh session picks up skills/agents): `claude -p --model haiku "List the agent types you can spawn and the skills named ship, verify, pipeline-setup. Reply as JSON."` from `~/Claude/eaglewatch/.worktrees/foundation` → includes implementer, verifier, judge, arbiter, ship, verify, pipeline-setup.
+- [x] Guard-git live check: `echo "Run: git push origin main --dry-run" | claude -p --model haiku --allowedTools Bash` (prompt on stdin: `--allowedTools` is variadic and swallows a trailing prompt) in a tmp repo whose origin is a local bare repo → reply shows the hook denial.
 
 ---
 
