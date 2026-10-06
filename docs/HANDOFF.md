@@ -80,6 +80,12 @@ INTERRUPTED (stopped mid-work; uncommitted changes left in the worktree — insp
     prompt, so the prompt goes on stdin (plan 7.2 corrected). The hook is live in already-running sessions too:
     it also refuses a `node -e` script whose text contains a push-to-main command (edit such docs with an
     editor, not a script).
+- CI on `97a99b9` (PR #1 merge): run 37436877083 green on both jobs (ubuntu 11 min, windows 38 min).
+- 2026-10-06: the 24 merged task worktrees in `~/Claude/cp-wt` (int, int2, t0.2–t4.1) were removed with owner
+  approval (branches kept); local `build/initial` and remote `docs/step5-install` deleted.
+- Updating the install after any merged change: README → "Install, update, uninstall" (`git pull` in
+  `~/Claude/claude-pipeline`, re-run the installer with `--skip-file-guard` from the owner terminal, then
+  `--check --skip-file-guard --claude-home ~/.claude`).
 - NEXT = step 6: onboard EagleWatch with the pipeline-setup skill (plan Phase 8, Task 8.1). Owner prerequisite:
   GitHub Pro (needed for protection in 8.2; setup can proceed meanwhile).
 
