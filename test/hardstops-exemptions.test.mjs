@@ -4,7 +4,6 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseUnifiedDiff } from '../pipeline/lib/diff.mjs';
 import { cfg, file, rulesOf, run } from './helpers/hardstops.mjs';
-import { declaredPackages } from '../pipeline/lib/hardstops.mjs';
 
 const A = (path, ...added) => file(path, { status: 'A', added });
 const rules = (files, opts) => rulesOf(run(files, opts));
@@ -569,41 +568,15 @@ test('the reverse check finds importers whatever the case of their extension (He
   }
 });
 
-test('a scoped specifier is an npm package only when package.json declares it (not via a local file: spec); otherwise an alias', async () => {
-  const pkgs = { npmPackages: ['@playwright/test', '@acme/pkg'] };
-  assert.deepEqual(rules([file('scripts/parity.mjs', { added: ["import { chromium, webkit } from '@playwright/test'"] })], pkgs), []);
-  assert.deepEqual(rules([file('scripts/parity.mjs', { added: ["import r from '@playwright/test/reporter'"] })], pkgs), []);
-  assert.deepEqual(rules([file('lib/a.ts', { added: ["import h from '@acme/pkg/tests/helper'"] })], pkgs), ['R0-unscannable']);
-  // undeclared: a path alias, judged in full (over-matching): `@shared/tests`, `@tests/helper`, even `@playwright/test`
-  assert.deepEqual(rules([file('lib/a.ts', { added: ["import h from '@shared/tests'"] })], pkgs), ['R0-unscannable']);
-  assert.deepEqual(rules([file('lib/a.ts', { added: ["import h from '@tests/helper'"] })], pkgs), ['R0-unscannable']);
+test('a scoped specifier is always judged in full: a diff can redirect any @scope/name, so no package exemption exists', () => {
+  // aliases and packages alike: `@shared/tests`, `@tests/helper`, a deep test path under a package
+  for (const spec of ['@shared/tests', '@tests/helper', '@acme/pkg/tests/helper', '@app/fixtures/x']) {
+    assert.deepEqual(rules([file('lib/a.ts', { added: [`import h from '${spec}'`] })]), ['R0-unscannable'], spec);
+  }
+  // accepted false positive, documented: production code importing a test framework
   assert.deepEqual(rules([file('scripts/parity.mjs', { added: ["import { webkit } from '@playwright/test'"] })]), ['R0-unscannable']);
-  // a local spec never makes a package
-  assert.deepEqual([...declaredPackages(JSON.stringify({ dependencies: { '@shared/tests': 'file:./tests', '@x/y': '^1.0.0', '@w/z': 'workspace:*' }, devDependencies: { '@playwright/test': '1.50.0', l: '../l' } }))].sort(), ['@playwright/test', '@x/y']);
-  // end to end: collectHardStops reads the head package.json
-  const repo = await reverseRepo({ 'package.json': JSON.stringify({ devDependencies: { '@playwright/test': '1.50.0' } }), 'scripts/p.mjs': 'export {};\n' });
-  repo.write('scripts/p.mjs', "import { webkit } from '@playwright/test';\n");
-  repo.commit('use playwright');
-  assert.deepEqual((await collectWith(repo)).filter((h) => h.rule === 'R0-unscannable'), []);
-  // a dependency declared only in THIS diff (head, not the merge base) never turns an alias into a package
-  const sneaky = await reverseRepo({ 'package.json': JSON.stringify({ dependencies: {} }), 'lib/pay.ts': 'export {};\n' });
-  sneaky.write('package.json', JSON.stringify({ dependencies: { '@shared/tests': '^1.0.0' } }));
-  sneaky.write('lib/pay.ts', "import h from '@shared/tests';\n");
-  sneaky.commit('declare and import');
-  assert.ok((await collectWith(sneaky)).some((h) => h.rule === 'R0-unscannable' && h.file === 'lib/pay.ts'));
-  // base already declares it, but the diff redirects the name (workspaces + tests/package.json): no exemption for this diff
-  const redirect = await reverseRepo({ 'package.json': JSON.stringify({ dependencies: { '@shared/tests': '^1.0.0' } }), 'lib/pay.ts': 'export {};\n' });
-  redirect.write('package.json', JSON.stringify({ workspaces: ['tests'], dependencies: { '@shared/tests': '^1.0.0' } }));
-  redirect.write('tests/package.json', JSON.stringify({ name: '@shared/tests', version: '1.0.0' }));
-  redirect.write('lib/pay.ts', "import h from '@shared/tests';\n");
-  redirect.commit('redirect through a workspace');
-  assert.ok((await collectWith(redirect)).some((h) => h.rule === 'R0-unscannable' && h.file === 'lib/pay.ts'));
-  // the same for a tsconfig change alone
-  const alias = await reverseRepo({ 'package.json': JSON.stringify({ dependencies: { '@shared/tests': '^1.0.0' } }), 'lib/pay.ts': 'export {};\n' });
-  alias.write('tsconfig.json', JSON.stringify({ compilerOptions: { paths: { '@shared/tests': ['./tests'] } } }));
-  alias.write('lib/pay.ts', "import h from '@shared/tests';\n");
-  alias.commit('alias through tsconfig');
-  assert.ok((await collectWith(alias)).some((h) => h.rule === 'R0-unscannable' && h.file === 'lib/pay.ts'));
+  // scoped packages with no test-like segment stay quiet
+  assert.deepEqual(rules([file('lib/a.ts', { added: ["import { createClient } from '@supabase/supabase-js'"] })]), []);
 });
 
 test('production code importing a test runner config is flagged (a config is not a bridge); only exact config names count', () => {
