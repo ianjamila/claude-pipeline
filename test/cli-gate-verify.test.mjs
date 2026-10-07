@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { saveState } from '../pipeline/lib/state.mjs';
 import { treeFingerprint } from '../pipeline/lib/git.mjs';
 import { cli, scenario, ghEntries, reviewState, named, assertOnlyFails, bump, ymlFor, STEPS, PR, AGENT_LOG } from './helpers/gate-env.mjs';
+import { assertExit } from './helpers/assert-exit.mjs';
 
 test('final-gate: each way the verify report can be wrong fails verify-report', () => {
   const cases = [
@@ -27,7 +28,7 @@ test('final-gate: each way the verify report can be wrong fails verify-report', 
   ];
   for (const [label, mutate, detail] of cases) {
     const r = scenario({ report: mutate }).gate();
-    assert.equal(r.code, 1, label);
+    assertExit(r, 1, label);
     assert.deepEqual(r.json.failed, ['verify-report'], label);
     assert.match(named(r.json, 'verify-report').detail, detail, label);
   }
@@ -37,7 +38,7 @@ test('final-gate: verify.expected_steps in the config overrides the report\'s ow
   const configured = (names) => ({ yml: ymlFor().replace('  quick: npm run verify:quick\n', `  quick: npm run verify:quick\n  expected_steps: [${names.join(', ')}]\n`) });
   // exact match, and the report need not even carry expectedSteps
   const pass = scenario({ ...configured(STEPS), report: (r) => { delete r.expectedSteps; } }).gate();
-  assert.equal(pass.code, 0, pass.stderr + pass.stdout);
+  assertExit(pass, 0, pass.stderr + pass.stdout);
   assert.match(named(pass.json, 'verify-report').detail, /full verify passed/);
 
   const cases = [
@@ -47,13 +48,13 @@ test('final-gate: verify.expected_steps in the config overrides the report\'s ow
   ];
   for (const [label, mutate] of cases) {
     const r = scenario({ ...configured(STEPS), report: mutate }).gate();
-    assert.equal(r.code, 1, label);
+    assertExit(r, 1, label);
     assert.deepEqual(r.json.failed, ['verify-report'], label);
     assert.match(named(r.json, 'verify-report').detail, /verify\.expected_steps/, label);
   }
   // without the config key the report's own expectedSteps is still what decides (the old behaviour)
   const legacy = scenario({ report: (r) => { r.steps.pop(); r.expectedSteps.pop(); } }).gate();
-  assert.equal(legacy.code, 0, legacy.stderr + legacy.stdout);
+  assertExit(legacy, 0, legacy.stderr + legacy.stdout);
 });
 
 // ---- final-gate: hardstops, integrity -------------------------------------------------------------
@@ -109,7 +110,7 @@ test('final-gate: a corrupt review state fails review instead of crashing the ga
 test('final-gate: a log-only diff passes review without any review state', () => {
   const s = scenario({ state: null, change: (r) => r.write(AGENT_LOG, '# Agent log\n\n- 2026-10-01 · #1 · x\n') });
   const r = s.gate();
-  assert.equal(r.code, 0, `${JSON.stringify(r.json?.checks.filter((c) => !c.ok))}`);
+  assertExit(r, 0, JSON.stringify(r.json?.checks.filter((c) => !c.ok)));
   assert.equal(named(r.json, 'review').detail, 'log-only');
 });
 
@@ -145,15 +146,15 @@ test('final-gate: a partial verify report is rejected however it says so (review
   ];
   for (const [label, mutate, detail] of cases) {
     const r = scenario({ report: mutate }).gate();
-    assert.equal(r.code, 1, label);
+    assertExit(r, 1, label);
     assert.deepEqual(r.json.failed, ['verify-report'], label);
     assert.match(named(r.json, 'verify-report').detail, detail, label);
   }
 });
 
 test('final-gate: a full report passes with partial === false, and with the field absent (the verify template does not write it)', () => {
-  assert.equal(scenario({ report: (r) => { r.partial = false; } }).gate().code, 0);
-  assert.equal(scenario().gate().code, 0);
+  assertExit(scenario({ report: (r) => { r.partial = false; } }).gate(), 0);
+  assertExit(scenario().gate(), 0);
 });
 
 test('final-gate: a review state whose pr is missing, zero, a string or another PR fails review (reviewer finding 8)', () => {
@@ -164,7 +165,7 @@ test('final-gate: a review state whose pr is missing, zero, a string or another 
     else state.pr = pr;
     saveState(s.repo.dir, state);
     const r = s.gate();
-    assert.equal(r.code, 1, label);
+    assertExit(r, 1, label);
     assert.deepEqual(r.json.failed, ['review'], label);
     assert.match(named(r.json, 'review').detail, /review state is for PR|records no valid PR/, label);
   }

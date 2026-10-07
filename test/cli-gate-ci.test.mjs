@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { cli, scenario, named, assertOnlyFails, ymlFor, MERGE_SHA, PREVIEW_URL } from './helpers/gate-env.mjs';
 import { pipelineYml } from './helpers/fakegh-env.mjs';
 import { verdictArtifactName } from '../pipeline/lib/guard-provenance.mjs';
+import { assertExit } from './helpers/assert-exit.mjs';
 
 // ---- final-gate: ci -------------------------------------------------------------------------------
 
@@ -26,7 +27,7 @@ test('final-gate: with no required checks it falls back to ALL checks; no checks
 
   const noRequiredReported = scenario({ gh: { requiredCi: 'error' } });
   const ok = noRequiredReported.gate();
-  assert.equal(ok.code, 0, JSON.stringify(ok.json?.checks.filter((c) => !c.ok)));
+  assertExit(ok, 0, JSON.stringify(ok.json?.checks.filter((c) => !c.ok)));
   assert.match(named(ok.json, 'ci').detail, /all check/);
 
   assertOnlyFails(scenario({ gh: { requiredCi: [], ci: [] } }).gate(), 'ci', /no CI checks reported/);
@@ -36,7 +37,7 @@ test('final-gate: `skipping` is accepted for a docs-only diff and refused for a 
   const skipped = [{ name: 'ci', state: 'SUCCESS', bucket: 'pass' }, { name: 'e2e', state: 'SKIPPED', bucket: 'skipping' }];
   const docs = scenario({ change: (r) => r.write('docs/guide.md', '# Guide v2\n'), gh: { ci: skipped } });
   const r = docs.gate();
-  assert.equal(r.code, 0, JSON.stringify(r.json?.checks.filter((c) => !c.ok)));
+  assertExit(r, 0, JSON.stringify(r.json?.checks.filter((c) => !c.ok)));
   assert.match(named(r.json, 'ci').detail, /docs-only/);
   assertOnlyFails(scenario({ gh: { ci: skipped } }).gate(), 'ci', /e2e=skipping/);
 });
@@ -159,7 +160,7 @@ test('final-gate: with preview configured, a missing, failed or other-sha previe
   assertOnlyFails(scenario({ preview: true, previewSmoke: (head) => ({ ok: false, sha: head, url: PREVIEW_URL }) }).gate(), 'preview', /did not pass/);
   assertOnlyFails(scenario({ preview: true, previewSmoke: () => ({ ok: true, sha: 'f'.repeat(40), url: PREVIEW_URL }) }).gate(), 'preview', /preview smoke is for/);
   const good = scenario({ preview: true, previewSmoke: (head) => ({ ok: true, sha: head, url: PREVIEW_URL }) }).gate();
-  assert.equal(good.code, 0, JSON.stringify(good.json?.checks.filter((c) => !c.ok)));
+  assertExit(good, 0, JSON.stringify(good.json?.checks.filter((c) => !c.ok)));
   assert.equal(good.json.checks.at(-1).name, 'preview');
 });
 
@@ -170,10 +171,10 @@ test('final-gate: without preview configured there is no preview check at all', 
 test('smoke then final-gate: the evidence smoke records is exactly what the preview check accepts', () => {
   const s = scenario({ preview: true });
   const sm = cli(['smoke', '--target', 'preview', '--url', 'https://pr-12.example.test', '--sha', s.head], { dir: s.repo.dir, fake: s.fake });
-  assert.equal(sm.code, 0, sm.stderr);
-  assert.equal(s.gate().code, 0);
+  assertExit(sm, 0);
+  assertExit(s.gate(), 0);
   const wrong = cli(['smoke', '--target', 'preview', '--url', 'https://pr-12.example.test', '--sha', 'a'.repeat(40)], { dir: s.repo.dir, fake: s.fake });
-  assert.equal(wrong.code, 0);
+  assertExit(wrong, 0);
   assertOnlyFails(s.gate(), 'preview', /preview smoke is for/);
   const noSha = cli(['smoke', '--target', 'preview', '--url', 'https://pr-12.example.test'], { dir: s.repo.dir, fake: s.fake });
   assert.equal(noSha.json.sha, null);
@@ -185,7 +186,7 @@ test('smoke then final-gate: the evidence smoke records is exactly what the prev
 test('smoke: runs the configured command with {url}, passes the expect text in the env, records the result', () => {
   const s = scenario({ preview: true });
   const r = cli(['smoke', '--target', 'preview', '--url', 'https://pr-12.example.test/', '--expect-text', 'Welcome', '--sha', s.head], { dir: s.repo.dir, fake: s.fake });
-  assert.equal(r.code, 0, r.stderr);
+  assertExit(r, 0);
   assert.equal(r.json.ok, true);
   assert.equal(r.json.target, 'preview');
   assert.equal(r.json.url, 'https://pr-12.example.test/');
@@ -201,7 +202,7 @@ test('smoke: no --expect-text means the variable is not set; the exit code mirro
   const ok = cli(['smoke', '--target', 'preview', '--url', 'https://ok.example.test'], { dir: s.repo.dir, fake: s.fake, env: { PIPELINE_SMOKE_EXPECT_TEXT: undefined } });
   assert.match(ok.json.tail, /expect=\(none\)/);
   const bad = cli(['smoke', '--target', 'preview', '--url', 'https://bad.example.test', '--sha', s.head], { dir: s.repo.dir, fake: s.fake });
-  assert.equal(bad.code, 1);
+  assertExit(bad, 1);
   assert.equal(bad.json.ok, false);
   assert.equal(bad.json.exitCode, 1);
   assert.equal(JSON.parse(readFileSync(join(s.repo.dir, '.review', 'preview-smoke.json'), 'utf8')).ok, false, 'a failed run overwrites an earlier pass');
@@ -210,7 +211,7 @@ test('smoke: no --expect-text means the variable is not set; the exit code mirro
 test('smoke: the production target uses config.production.smoke and its own file', () => {
   const s = scenario({ production: true });
   const r = cli(['smoke', '--target', 'production', '--url', 'https://example.com', '--sha', MERGE_SHA], { dir: s.repo.dir, fake: s.fake });
-  assert.equal(r.code, 0, r.stderr);
+  assertExit(r, 0);
   assert.equal(r.json.target, 'production');
   assert.ok(existsSync(join(s.repo.dir, '.review', 'production-smoke.json')));
   assert.ok(!existsSync(join(s.repo.dir, '.review', 'preview-smoke.json')));
@@ -228,23 +229,23 @@ test('smoke: only the last 30 lines of output are kept', () => {
 test('smoke: a target with no configured smoke command, bad usage, an unsafe URL or an unfilled placeholder exit 2 and run nothing', () => {
   const none = scenario();
   const a = cli(['smoke', '--target', 'preview', '--url', 'https://x.test'], { dir: none.repo.dir, fake: none.fake });
-  assert.equal(a.code, 2);
+  assertExit(a, 2);
   assert.equal(a.json.error, 'not-configured');
   assert.equal(existsSync(join(none.repo.dir, '.review', 'preview-smoke.json')), false);
 
   const s = scenario({ preview: true });
   const run = (args) => cli(['smoke', ...args], { dir: s.repo.dir, fake: s.fake });
-  assert.equal(run(['--target', 'staging', '--url', 'https://x.test']).code, 2);
-  assert.equal(run(['--target', 'preview']).code, 2);
-  assert.equal(run(['--url', 'https://x.test']).code, 2);
+  assertExit(run(['--target', 'staging', '--url', 'https://x.test']), 2);
+  assertExit(run(['--target', 'preview']), 2);
+  assertExit(run(['--url', 'https://x.test']), 2);
   for (const url of ['https://x.test/a;touch pwned', 'https://x.test/$(id)', 'https://x.test/`id`', 'ftp://x.test', 'https://x.test/a b', "https://x.test/'", 'https://x.test/?a=1&b=2']) {
-    assert.equal(run(['--target', 'preview', '--url', url]).code, 2, url);
+    assertExit(run(['--target', 'preview', '--url', url]), 2, url);
   }
   assert.equal(existsSync(join(s.repo.dir, '.review', 'preview-smoke.json')), false);
 
   const strict = scenario({ yml: ymlFor({ preview: true, smokeCommand: 'node scripts/fake-smoke.mjs {url} {sha}' }) });
   const r = cli(['smoke', '--target', 'preview', '--url', 'https://x.test'], { dir: strict.repo.dir, fake: strict.fake });
-  assert.equal(r.code, 2, 'strict fill refuses a placeholder with no value');
+  assertExit(r, 2, 'strict fill refuses a placeholder with no value');
   assert.match(r.json.message, /\{sha\}/);
   assert.equal(existsSync(join(strict.repo.dir, '.review', 'preview-smoke.json')), false);
 });
@@ -266,7 +267,7 @@ test('final-gate: every named required check must be `pass`; `skipping` only und
   const dup = [{ name: 'ci', state: 'SUCCESS', bucket: 'pass' }, { name: 'ci', state: 'FAILURE', bucket: 'fail' }];
   assertOnlyFails(scenario({ gh: { requiredCi: dup, ci: dup } }).gate(), 'ci', /ci=fail/);
   const docs = scenario({ change: (r) => r.write('docs/guide.md', '# v2\n'), gh: { requiredCi: skipped, ci: skipped } }).gate();
-  assert.equal(docs.code, 0, JSON.stringify(docs.json?.checks.filter((c) => !c.ok)));
+  assertExit(docs, 0, JSON.stringify(docs.json?.checks.filter((c) => !c.ok)));
 });
 
 test('final-gate: no configured required checks and none reported by branch protection fails closed; an explicit empty list may fall back to all checks', () => {
@@ -276,10 +277,10 @@ test('final-gate: no configured required checks and none reported by branch prot
   assertOnlyFails(closed, 'ci', /no required checks are configured/);
   // ... but when protection DOES report required checks, those are judged even though the config names none.
   const reported = scenario({ yml: unconfigured, gh: { requiredCi: [{ name: 'ci', state: 'SUCCESS', bucket: 'pass' }] } }).gate();
-  assert.equal(reported.code, 0, JSON.stringify(reported.json?.checks.filter((c) => !c.ok)));
+  assertExit(reported, 0, JSON.stringify(reported.json?.checks.filter((c) => !c.ok)));
   // An explicit `required_checks: []` is the owner saying "judge every reported check": the all-checks fallback applies.
   const explicit = scenario({ yml: pipelineYml('gate', []), gh: { requiredCi: 'error' } }).gate();
-  assert.equal(explicit.code, 0, JSON.stringify(explicit.json?.checks.filter((c) => !c.ok)));
+  assertExit(explicit, 0, JSON.stringify(explicit.json?.checks.filter((c) => !c.ok)));
   assert.match(named(explicit.json, 'ci').detail, /all check/);
   assertOnlyFails(scenario({ yml: pipelineYml('gate', []), gh: { requiredCi: 'error', ci: [] } }).gate(), 'ci', /no CI checks reported/);
 });
@@ -303,7 +304,7 @@ test('final-gate: a self-attested preview smoke is not enough without a successf
 test('final-gate: the preview deployment is matched by origin (path and query may differ) in the configured environment', () => {
   const s = scenario({ preview: true, previewSmoke: (head) => ({ ok: true, sha: head, url: `${PREVIEW_URL}/some/page?x=1` }) });
   const r = s.gate();
-  assert.equal(r.code, 0, JSON.stringify(r.json?.checks.filter((c) => !c.ok)));
+  assertExit(r, 0, JSON.stringify(r.json?.checks.filter((c) => !c.ok)));
   assert.ok(s.fake.lines().some((l) => /deployments\?sha=[0-9a-f]{40}&environment=Preview/.test(l)), s.fake.lines().join('\n'));
   // a look-alike host is a different origin
   const evil = scenario({ preview: true, previewSmoke: (head) => ({ ok: true, sha: head, url: 'https://pr-12.example.test.evil.example/' }) });

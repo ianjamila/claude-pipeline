@@ -42,9 +42,22 @@ cd ~/Claude/claude-pipeline
 ./install.sh --check               # drift report only; exit 1 if anything differs; never writes
 ```
 
-- **Update:** `git pull && ./install.sh` (Windows: `git pull; .\install.ps1`). Re-running is
-  idempotent; `settings.json` is backed up to `~/.claude/backups/settings.json.<UTC timestamp>`
+- **Update:** the install is a copy, so a merged change reaches your sessions only after you
+  re-install. In your own terminal (not a Claude session):
+  ```sh
+  cd ~/Claude/claude-pipeline && git pull           # the checkout must be on main
+  ./install.sh --skip-file-guard                    # same flags as the original install
+  ./install.sh --check --skip-file-guard --claude-home ~/.claude   # expect "No drift"
+  ```
+  (Windows: `git pull; .\install.ps1 …`.) Repeat `--skip-file-guard` on every update until you
+  have deliberately installed the file guard: an update without it installs the guard. Re-running
+  is idempotent; `settings.json` is backed up to `~/.claude/backups/settings.json.<UTC timestamp>`
   before every change, and hook entries from other tools are never touched.
+- **Check from inside a Claude session:** pass `--claude-home` explicitly. A session started with
+  `CLAUDE_CONFIG_DIR` set (a second account) makes a bare `--check` inspect that directory instead,
+  and it reports everything as missing. A second account that symlinks `skills/`, `hooks/` and
+  `settings.json` to `~/.claude` also needs `agents -> ~/.claude/agents` once; updates then reach
+  it automatically.
 - **File guard:** leave `--skip-file-guard` on until the pipeline has been proven on a real repo,
   then run `./install.sh` without it.
 - **Uninstall:** `./install.sh --uninstall` removes the files in the manifest, our hook entries
