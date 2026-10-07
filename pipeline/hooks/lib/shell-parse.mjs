@@ -416,9 +416,10 @@ function unwrap(argv) {
 
 // ---- interpreter invocations --------------------------------------------------------------------
 
-// A word whose value is only known at run time: `$VAR`, `$(..)`, backticks, or a glob. It may become no word, one
-// word or several, so it hides which of the words after it is the script.
-const EXPANDS = /[$`*?[]/;
+// A word whose value is only known at run time: `$VAR`, `$(..)`, backticks, or a glob (also zsh extendedglob operators
+// `^`, `#`, a non-leading `~`, which only act when the user's zshrc sets extendedglob; `~1`, a trailing `~` and `=~` are
+// ordinary). It may become no word, one word or several, so it hides which of the words after it is the script.
+const EXPANDS = /[$`*?[^#]|[^=]~(?!\d|$)/;
 const hasExpansion = (w) => EXPANDS.test(w);
 
 // bash -c "script" / bash -lc ... / bash script.sh / bash (reads stdin)
@@ -459,7 +460,36 @@ const INTERP_VALUE_FLAGS = new Set(['-r', '--require', '--import', '--loader', '
 // `ambiguous: true` (shells, source, interpreters): a word from argv[1] up to the operand expands at run time (`$X f.sh`,
 // `$(..)`, a glob), so `file` is only a guess; `words` (argv[1..]) are the candidates, `needExt` says an interpreter
 // only runs a file with a script extension. The caller expands what it can and judges every candidate.
-export function scriptFileOf(argv) {
+// `raw` (optional) is the command's own text and `line` the whole line it came from. The parser turns zsh/ksh pattern syntax
+// into other words and cuts the command there (`bash f<1-2>.sh` has a redirect, `bash *(N)` and `bash +(a|b).sh` have
+// subshells), so if the text from the command's start to the end of the operand's word holds such a pattern the result is
+// ambiguous AND `unresolvable`: no candidate list can be built, the caller must refuse.
+// The parser reports no offsets, so the command is located by its text; when that text (or the operand inside it) occurs
+// more than once, EVERY occurrence is checked and any pattern refuses (a harmless decoy copy must not hide the real one).
+export function scriptFileOf(argv, raw = '', line = raw) {
+  const sf = scriptFileOfArgv(argv);
+  if (!sf || sf.kind === 'exec' || sf.unresolvable || typeof raw !== 'string' || !raw || sf.file === undefined) return sf;
+  let starts = [];
+  if (typeof line === 'string') for (let i = line.indexOf(raw); i >= 0 && starts.length <= MAX_OCCURRENCES; i = line.indexOf(raw, i + 1)) starts.push(i);
+  const text = starts.length ? line : raw; // not a substring of the line (nested script text): the command's own text
+  if (!starts.length) starts = [0];
+  const ats = [];
+  for (let i = raw.indexOf(sf.file); i >= 0 && ats.length <= MAX_OCCURRENCES; i = raw.indexOf(sf.file, i + 1)) ats.push(i);
+  let pattern = starts.length > MAX_OCCURRENCES || ats.length > MAX_OCCURRENCES; // too many places to check: refuse
+  for (const st of starts) {
+    for (const at of ats) {
+      let end = st + at + sf.file.length;
+      while (end < text.length && !/\s/.test(text[end])) end++;
+      if (PATTERN_SYNTAX.test(text.slice(st, end))) pattern = true;
+    }
+  }
+  return pattern ? { kind: sf.kind, file: sf.file, ambiguous: true, unresolvable: true, words: argv.slice(1), ...(sf.needExt === undefined ? {} : { needExt: sf.needExt }) } : sf;
+}
+const MAX_OCCURRENCES = 32;
+// ksh/bash extglob (`*(`, `?(`, `+(`, `@(`, `!(`), zsh `(#i)` and `<1-2>` numeric ranges attached to a word
+const PATTERN_SYNTAX = /[*?+@!\]]\(|\(#|[^\s<>&|;(]<\d*-\d*>/;
+
+function scriptFileOfArgv(argv) {
   if (!argv.length) return null;
   const name = base(argv[0]);
   if (SHELLS.has(name)) {
@@ -470,7 +500,8 @@ export function scriptFileOf(argv) {
   if (name === 'source' || name === '.') {
     const op = argv[1];
     if (op === undefined || STDIN_FILES.has(op) || op.startsWith('<(')) return null;
-    return hasExpansion(op) ? { kind: 'shell', file: op, ambiguous: true, words: argv.slice(1) } : { kind: 'shell', file: op };
+    // `source -p PATH file` (bash 5.3): an option shifts the operand, so any word may be the file
+    return hasExpansion(op) || op.startsWith('-') ? { kind: 'shell', file: op, ambiguous: true, words: argv.slice(1) } : { kind: 'shell', file: op };
   }
   if (INTERPRETER.test(name)) {
     let i = 1;

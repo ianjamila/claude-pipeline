@@ -8,14 +8,22 @@ import { readdirSync } from 'node:fs';
 import { SCRIPT_EXT } from './shell-parse.mjs';
 
 export const MAX_CANDIDATES = 32; // more words than this are refused, not judged
+// Candidate scripts judged across one whole evaluation (each may be ambiguous itself, so the work multiplies with every
+// nesting level; a hook that runs out of time is allowed through, so the guard must give up first and deny).
+export const MAX_CANDIDATE_JUDGMENTS = 64;
 const MAX_GLOB_WORK = 5000; // directory entries looked at across one command
 const GLOB_CHARS = /[*?[]/;
+// Syntax we do not resolve: ksh/zsh operators in a glob (`*(a|b)`, `<1-3>`), POSIX classes (`[[:alpha:]]`), and zsh
+// extendedglob operators (`^`, `#`, a non-leading `~` that is not `~1`/trailing/`=~`) even without a glob character.
+const UNSUPPORTED_GLOB = /[()|]|<\d*-\d*>|\[[:=.]/;
+const EXTENDED_GLOB = /[\^#]|[^=]~(?!\d|$)/;
 
 export const defaultReadDir = (dir) => {
   try { return readdirSync(dir); } catch { return null; }
 };
 
-// Names matching one glob segment (`*`, `?`, `[a-z]`, `[!x]`). A leading dot needs a literal dot in the pattern.
+// Names matching one glob segment (`*`, `?`, `[a-z]`, `[!x]`). Case-insensitive and dotfiles included whatever the
+// shell's nocaseglob / dotglob / GLOB_DOTS settings: a candidate too many only costs a judgment.
 function segmentRegExp(seg) {
   let re = '';
   for (let k = 0; k < seg.length; k++) {
@@ -30,7 +38,7 @@ function segmentRegExp(seg) {
       k = q;
     } else re += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
   }
-  return new RegExp(`^${re}$`);
+  return new RegExp(`^${re}$`, 'i');
 }
 
 // Existing paths `pattern` matches, written the way the pattern was (`sub/*.sh` -> `sub/a.sh`), relative to `dir`.
@@ -53,31 +61,41 @@ function globMatches(pattern, dir, readDir, joinPath, budget) {
     try { re = segmentRegExp(seg); } catch { budget.over = true; return; } // a bracket expression JS rejects
     for (const n of names) {
       if (++budget.work > MAX_GLOB_WORK) { budget.over = true; return; }
-      if (re.test(n) && (!n.startsWith('.') || seg.startsWith('.'))) walk(i + 1, add(pre, n));
+      if (re.test(n)) walk(i + 1, add(pre, n));
     }
   };
   walk(0, abs ? '/' : '');
   return out;
 }
 
-// sf: the {ambiguous, words, needExt} object scriptFileOf returned.
+// sf: the {ambiguous, words, needExt, unresolvable} object scriptFileOf returned.
 // expand(word): the word with known variables, $HOME and ~ replaced (anything unknown stays as written).
 // dirs: the directories the command may run in; joinPath(dir, rel): resolves rel against dir for readDir.
+// ifs: the value of IFS when the text assigned it (a string; unknown if it holds `$`/backtick), else undefined. A
+// known IFS adds its characters to the whitespace a variable's value is split on; an unknown one makes every word
+// with a `$` unjudgeable.
 // Returns { files, dynamic, over }: the candidate paths to judge; whether a word still holds `$` or a backtick (so
-// the script is only known at run time); whether there were too many candidates (or a glob too big) to judge.
-export function scriptCandidates(sf, { expand, dirs, joinPath, readDir }) {
+// the script is only known at run time); whether there were too many candidates (or a glob too big, or syntax we do not
+// resolve) to judge.
+export function scriptCandidates(sf, { expand, dirs, joinPath, readDir, ifs }) {
   const files = new Set();
   const budget = { work: 0, over: false };
   let dynamic = false;
+  if (sf.unresolvable) return { files: [], dynamic, over: true };
+  const ifsUnknown = typeof ifs === 'string' && /[$`]/.test(ifs);
+  const splitter = new RegExp(`[\\s${typeof ifs === 'string' && !ifsUnknown ? ifs.replace(/[\]\\^-]/g, '\\$&') : ''}]+`);
   const add = (c) => { if (!sf.needExt || SCRIPT_EXT.test(c)) files.add(c); };
   for (const w of sf.words) {
     const e = expand(w);
-    const readings = e !== w && w.includes('$') ? [e, ...e.split(/\s+/)] : [e];
+    const readings = e !== w && w.includes('$') ? [e, ...e.split(splitter)] : [e];
+    if (ifsUnknown && w.includes('$')) dynamic = true;
     for (const r of new Set(readings)) {
       if (r === '') continue; // an empty word runs nothing
       if (/[$`]/.test(r)) { dynamic = true; continue; }
-      if (!GLOB_CHARS.test(r)) { add(r); continue; }
-      for (const d of dirs) for (const m of globMatches(r, d, readDir, joinPath, budget)) add(m);
+      const glob = GLOB_CHARS.test(r);
+      if (EXTENDED_GLOB.test(r) || (glob && UNSUPPORTED_GLOB.test(r))) { add(r); budget.over = true; continue; }
+      add(r); // an unmatched glob stays a literal word, and a quoted name may merely look like a glob
+      if (glob) for (const d of dirs) for (const m of globMatches(r, d, readDir, joinPath, budget)) add(m);
     }
     if (budget.over || files.size > MAX_CANDIDATES) return { files: [], dynamic, over: true };
   }

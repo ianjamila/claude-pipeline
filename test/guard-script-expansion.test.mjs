@@ -90,9 +90,8 @@ test('guard-git: a glob in the script position is resolved against the directory
     assert.equal(git(c).decision, 'deny', c);
   const clean = gitFs({ 'f.sh': 'git status', 'sub/f.sh': 'git status', 'f.mjs': 'x', 'unreadable.sh': 'git status' });
   for (const c of ['bash *.sh', 'bash sub/*.sh', 'bash nomatch*.sh', 'bash sub/*/x.sh', 'bash .*.sh']) assert.equal(git(c, clean).decision, 'allow', c);
-  // a dotfile is not matched by a bare *
-  assert.equal(git('bash *', gitFs({ '.hidden.sh': 'git push origin main' }, [])).decision, 'deny'); // f.sh is still matched
-  assert.equal(git('bash *', fakeFs(GIT_ROOT, { '.hidden.sh': 'git push origin main', 'ok.sh': 'git status' })).decision, 'allow');
+  // dotfiles are matched too (bash dotglob / zsh GLOB_DOTS may be on): extra candidates only cost judging
+  assert.equal(git('bash *', fakeFs(GIT_ROOT, { '.hidden.sh': 'git push origin main', 'ok.sh': 'git status' })).decision, 'deny');
   // ** needs a recursive walk we do not do: refuse rather than guess
   assert.equal(git('bash **/f.sh').decision, 'deny');
   // a glob that matches a lot is refused outright
@@ -318,6 +317,135 @@ test('guard-files: nesting is still limited and a nested script is judged', () =
   assert.match(files('bash loop.sh', loop).reason, /too deeply/);
 });
 
+// ---- round 2: parser differentials (controller review) ----------------------------------------------------------------
+// One table drives both guards: [guard-git bad text, guard-files bad text] are the contents of the fixture that must be
+// judged; every row is a command that must be denied for BOTH, so the pairs below carry both spellings of the fixture.
+
+const BAD_GIT = 'git push origin main';
+const BAD_FILES = 'echo x > ~/.claude/settings.json';
+// Builds both fake file systems from { name: 'bad' | 'ok' | null } and runs a command through each guard.
+function both(command, spec = {}, extra = {}) {
+  const mk = (bad, ok) => Object.fromEntries(Object.entries(spec).map(([k, v]) => [k, v === 'bad' ? bad : v === 'ok' ? ok : v]));
+  const gfs = fakeFs(GIT_ROOT, mk(BAD_GIT, 'git status'), ['sub', ...(extra.dirs ?? [])]);
+  const ffs = fakeFs(PROJ, mk(BAD_FILES, 'echo hi'), ['sub', ...(extra.dirs ?? [])]);
+  return { git: git(command, gfs, extra.gitOpts), files: files(command, ffs, extra.filesOpts) };
+}
+const denyBoth = (command, spec, extra) => {
+  const r = both(command, spec, extra);
+  assert.equal(r.git.decision, 'deny', `git: ${command} -> ${r.git.reason}`);
+  assert.equal(r.files.decision, 'deny', `files: ${command} -> ${r.files.reason}`);
+  return r;
+};
+const allowBoth = (command, spec, extra) => {
+  const r = both(command, spec, extra);
+  assert.equal(r.git.decision, 'allow', `git: ${command} -> ${r.git.reason}`);
+  assert.equal(r.files.decision, 'allow', `files: ${command} -> ${r.files.reason}`);
+};
+
+test('A: an unmatched glob (or a quoted name that looks like one) still runs the literal word, which is judged', () => {
+  const spec = { 'f[1].sh': 'bad', 'f[1].mjs': 'bad', 'ok.sh': 'ok' };
+  for (const c of ["bash 'f[1].sh'", 'bash f[1].sh', "X='f[1].sh'; bash $X", "source 'f[1].sh'", "node 'f[1].mjs'", 'node f[1].mjs', "bash $X 'f[1].sh'"]) denyBoth(c, spec);
+  allowBoth("bash 'g[1].sh'", spec);
+  // when the glob does match, both the matches and the literal are judged
+  denyBoth('bash f[1].sh', { 'f1.sh': 'ok', 'f[1].sh': 'bad' });
+  denyBoth('bash f[1].sh', { 'f1.sh': 'bad', 'f[1].sh': 'ok' });
+});
+
+test('B: glob syntax we cannot resolve is refused, not matched against nothing', () => {
+  const spec = { 'fa.sh': 'ok', 'f.sh': 'ok' };
+  for (const c of [
+    'bash f[[:alpha:]].sh', 'bash f[[=a=]].sh', 'bash f[[.a.]].sh', "bash 'f*(a).sh'", "bash 'f?(a).sh'", "bash 'a|b*.sh'", "bash 'f(a)*.sh'",
+    "bash '@(f|fa).sh'", "bash '!(x).sh'", 'bash ^foo.sh', "bash 'a#b.sh'", 'bash f#.sh', "bash 'a~b'", "bash '*.sh~f.sh'", "bash -x ^foo.sh",
+    "source '^foo.sh'", 'node ^foo.mjs', 'X=1; bash ^f.sh $X',
+  ]) {
+    const r = denyBoth(c, spec);
+    assert.match(r.git.reason, /name the file|Name the (?:script )?file|literally/i, c);
+  }
+  // what the shell parser turns into redirects and subshells: the raw text is what shows the pattern
+  for (const c of ['bash f<1-2>.sh', 'bash *(N)', 'bash +(f|fa).sh', 'bash @(f|fa).sh', 'bash ?(f).sh', 'bash a(#i)f.sh', 'node f<1-2>.mjs']) denyBoth(c, spec);
+  // not patterns: Windows 8.3 names, trailing ~, a = before ~, characters after the operand, plain parens in quotes
+  allowBoth('node C:/PROGRA~1/x.mjs', spec);
+  allowBoth('bash ok.sh~', spec);
+  allowBoth('bash --rcfile=~/x ok.sh', spec);
+  allowBoth('bash ok.sh "x*(y)" ^z', spec);
+  allowBoth('python3 x.py "f(x)" "a#b"', spec);
+  allowBoth("bash 'a(b).sh'", spec);
+  allowBoth('echo hi | bash', spec);
+});
+
+test('H: a harmless copy of the command text earlier on the line does not hide the real one', () => {
+  const spec = { 'f.sh': 'ok', 'a.sh': 'ok' };
+  for (const c of ["echo 'bash *'; bash *(N)", "echo 'bash f<1-2>'; bash f<1-2>.sh", 'echo bash +; bash +(f|a).sh', "echo 'node f'; node f<1-2>.mjs"]) denyBoth(c, spec);
+  allowBoth("echo 'bash ok.sh'; bash ok.sh", { 'ok.sh': 'ok' });
+  // unresolvable syntax inside a variable's value is refused by the glob rules, not by the text rules
+  denyBoth("X='f<1-2>*.sh'; bash $X", spec);
+});
+
+test('C: globs match case-insensitively and always include dotfiles', () => {
+  denyBoth('bash F*.SH', { 'f.sh': 'bad' });
+  denyBoth('bash f[A].sh', { 'fa.sh': 'bad' });
+  denyBoth('bash ?hidden.sh', { '.hidden.sh': 'bad' });
+  denyBoth('bash *hidden.sh', { '.hidden.sh': 'bad' });
+  denyBoth('bash sub/*', { 'sub/.x.sh': 'bad' });
+  allowBoth('bash F*.SH', { 'g.sh': 'bad', 'f.txt': 'bad' });
+});
+
+test('D: IFS assigned on the line widens how a known variable is split', () => {
+  const spec = { 'f.sh': 'bad', 'ok.sh': 'ok' };
+  for (const c of ['IFS=,; X=+n,f.sh; bash $X', 'IFS=,; X=ok.sh,f.sh; source $X', 'IFS=:; X=ok.sh:f.sh; . $X', 'export IFS=,; X=-x,f.sh; bash $X', 'IFS=", "; X="ok.sh f.sh"; bash $X'])
+    denyBoth(c, spec);
+  denyBoth('IFS=,; X=-x,f.mjs; node $X', { 'f.mjs': 'bad' });
+  allowBoth('IFS=,; X=ok.sh,a.sh; bash $X', spec);
+  // an IFS we cannot read makes every expanding word unknown: judged like $UNSET
+  assert.equal(git('IFS=$Z; X=ok.sh; bash $X && git push origin agent/x').decision, 'deny');
+  assert.equal(git('X=ok.sh; bash $X && git push origin agent/x').decision, 'allow');
+  assert.equal(files('IFS=$Z; X=a.sh; node $X; cat ~/.claude/settings.json').decision, 'deny');
+  assert.equal(files('X=a.mjs; node $X; cat ~/.claude/settings.json').decision, 'allow');
+  // the assignment inside the script being judged counts too
+  denyBoth('bash setup.sh', { 'setup.sh': 'IFS=,; X=+n,f.sh; bash $X', 'f.sh': 'bad' });
+});
+
+test('E: source -p PATH file (bash 5.3): every word is a candidate', () => {
+  const spec = { 'f.sh': 'bad', 'ok.sh': 'ok' };
+  for (const c of ['source -p /x f.sh', '. -p /x f.sh', 'source -p /x ok.sh f.sh', 'source --foo f.sh']) denyBoth(c, spec);
+  allowBoth('source -p /x ok.sh', spec);
+  allowBoth('source ok.sh -p f.sh', spec); // after the operand: arguments to the sourced file
+  allowBoth('source - < /dev/null', spec);
+});
+
+test('F: a total budget of candidate-script judgments stops nested fan-out', () => {
+  const tree = (width, levels, bad) => {
+    const spec = {};
+    const names = (k) => Array.from({ length: width }, (_, j) => `l${k}_${j}.sh`);
+    for (let k = 0; k < levels; k++) for (const n of names(k)) spec[n] = k === levels - 1 ? 'ok' : { text: `bash $X ${names(k + 1).join(' ')}` };
+    if (bad) spec[`l${levels - 1}_0.sh`] = 'bad';
+    return { spec, top: names(0).join(' ') };
+  };
+  const make = (width, levels, bad) => {
+    const t = tree(width, levels, bad);
+    const mk = (b, ok) => Object.fromEntries(Object.entries(t.spec).map(([k, v]) => [k, v === 'bad' ? b : v === 'ok' ? ok : v.text]));
+    return { top: t.top, gfs: fakeFs(GIT_ROOT, mk(BAD_GIT, 'git status')), ffs: fakeFs(PROJ, mk(BAD_FILES, 'echo hi')) };
+  };
+  // 10 + 100 + 1000 judgments would be needed
+  const big = make(10, 3, false);
+  const g = git(`bash $X ${big.top}`, big.gfs);
+  const f = files(`bash $X ${big.top}`, big.ffs);
+  assert.equal(g.decision, 'deny');
+  assert.equal(f.decision, 'deny');
+  assert.match(g.reason, /too many/);
+  assert.match(f.reason, /too many/);
+  // a modest tree is judged to the bottom (the bad leaf is found at depth 3)
+  const small = make(3, 3, true);
+  assert.equal(git(`bash $X ${small.top}`, small.gfs).decision, 'deny');
+  assert.equal(files(`bash $X ${small.top}`, small.ffs).decision, 'deny');
+  const smallOk = make(3, 3, false);
+  assert.equal(git(`bash $X ${smallOk.top}`, smallOk.gfs).decision, 'allow');
+  assert.equal(files(`bash $X ${smallOk.top}`, smallOk.ffs).decision, 'allow');
+  // the budget is per evaluation: the same fixture twice in a row behaves the same
+  assert.equal(git(`bash $X ${smallOk.top}`, smallOk.gfs).decision, 'allow');
+  assert.equal(files(`bash $X ${smallOk.top}`, smallOk.ffs).decision, 'allow');
+});
+
 // ---- scriptFileOf stays pure ----------------------------------------------------------------------------------------
 
 test('scriptFileOf reports an expansion among the words it scanned instead of guessing the operand', () => {
@@ -332,4 +460,28 @@ test('scriptFileOf reports an expansion among the words it scanned instead of gu
   assert.equal(scriptFileOf(['bash', '-c', '$X']), null);
   assert.equal(scriptFileOf(['bash']), null);
   assert.equal(scriptFileOf(['node', '-e', 'a*b']), null);
+});
+
+test('scriptFileOf: round 2 shapes (source options, zsh operators, pattern syntax cut out by the parser)', () => {
+  assert.deepEqual(scriptFileOf(['source', '-p', '/x', 'f.sh']), { kind: 'shell', file: '-p', ambiguous: true, words: ['-p', '/x', 'f.sh'] });
+  assert.deepEqual(scriptFileOf(['bash', '^f.sh']), { kind: 'shell', file: '^f.sh', ambiguous: true, words: ['^f.sh'] });
+  assert.deepEqual(scriptFileOf(['bash', 'a#b']), { kind: 'shell', file: 'a#b', ambiguous: true, words: ['a#b'] });
+  assert.deepEqual(scriptFileOf(['bash', 'a~b']), { kind: 'shell', file: 'a~b', ambiguous: true, words: ['a~b'] });
+  for (const w of ['PROGRA~1', 'a.sh~', 'x=~/y', '~/a.sh']) assert.deepEqual(scriptFileOf(['bash', w]), { kind: 'shell', file: w }, w);
+  // the parser cut the word at `<1-2>` / `(`: the text of the line shows what was there
+  assert.deepEqual(scriptFileOf(['bash', 'f'], 'bash f', 'bash f<1-2>.sh'), { kind: 'shell', file: 'f', ambiguous: true, unresolvable: true, words: ['f'] });
+  assert.deepEqual(scriptFileOf(['bash', 'f'], 'bash f<1-2>.sh'), { kind: 'shell', file: 'f', ambiguous: true, unresolvable: true, words: ['f'] });
+  assert.equal(scriptFileOf(['bash', '+'], 'bash +', 'bash +(a|b).sh').unresolvable, true);
+  assert.equal(scriptFileOf(['bash', '*'], 'bash *', 'bash *(N)').unresolvable, true);
+  assert.equal(scriptFileOf(['node', 'a'], 'node a', 'node a(#i)b.mjs').unresolvable, true);
+  assert.equal(scriptFileOf(['bash', 'ok.sh'], 'bash ok.sh', 'bash ok.sh; echo "x*(y)"').unresolvable, undefined);
+  assert.equal(scriptFileOf(['bash', 'ok.sh', '*(N)'], 'bash ok.sh', 'bash ok.sh *(N)').unresolvable, undefined); // after the operand
+  assert.deepEqual(scriptFileOf(['./f'], './f', './f<1-2>'), { kind: 'exec', file: './f' });
+  // H: the command is located by its text, so every occurrence is checked, never just the first or last
+  assert.equal(scriptFileOf(['bash', 'x'], 'bash x', 'echo bash x; bash x(#i)y').unresolvable, true); // decoy first
+  assert.equal(scriptFileOf(['bash', 'x'], 'bash x', 'bash x(#i)y; echo bash x').unresolvable, true); // decoy last
+  assert.equal(scriptFileOf(['bash', 'a'], 'bash a', 'bash a(#i)b').unresolvable, true); // the operand text also sits inside "bash"
+  assert.equal(scriptFileOf(['bash', 'x'], 'bash x', 'echo bash x; bash x').unresolvable, undefined);
+  assert.equal(scriptFileOf(['bash', 'a'], 'bash a', 'bash a;'.repeat(40)).unresolvable, true); // too many places to check: refuse
+  assert.equal(scriptFileOf(['bash', 'a'], 'bash a', 'bash a;'.repeat(5)).unresolvable, undefined);
 });

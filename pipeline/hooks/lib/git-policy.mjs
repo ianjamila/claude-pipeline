@@ -17,7 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { commandName, simpleCommands, splitArgs, scriptFileOf } from './shell-parse.mjs';
 import { catchAllReason, guardedCommandText } from './guarded-text.mjs';
-import { scriptCandidates, defaultReadDir } from './script-candidates.mjs';
+import { scriptCandidates, defaultReadDir, MAX_CANDIDATE_JUDGMENTS } from './script-candidates.mjs';
 
 const PROTECTED_BRANCHES = ['main', 'master'];
 const APPROVAL_LABELS = ['human-approved', 'test-change-approved'];
@@ -738,6 +738,7 @@ function checkScriptFile(sf, dir, ctx, level) {
     if (sf.kind === 'shell' && ctx.pathExists(abs)) return deny(`cannot read the script ${sf.file} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified.`);
     return null; // missing: nothing will run
   }
+  if (sf.candidate && --ctx.judgeBudget < 0) return deny('too many script files to judge (candidate scripts that run candidate scripts), so what they run cannot be verified. Name the script file.');
   let kind = sf.kind;
   if (kind === 'exec') {
     if (text.slice(0, 4096).includes('\u0000')) return null; // a binary
@@ -765,8 +766,8 @@ function checkCandidateScripts(sf, dir, ctx, level) {
     if (e === '~' || e.startsWith('~/')) e = ctx.home + e.slice(1);
     return e;
   };
-  const c = scriptCandidates(sf, { expand, dirs: [here], joinPath: (d, r) => path.resolve(d, r), readDir: ctx.readDir });
-  if (c.over) return deny('too many words (or a glob matching too many files) could be the script this command runs, so it cannot be verified. Name the script file.');
+  const c = scriptCandidates(sf, { expand, dirs: [here], joinPath: (d, r) => path.resolve(d, r), readDir: ctx.readDir, ifs: ctx.vars.IFS });
+  if (c.over) return deny('too many words, a glob matching too many files, or glob syntax that cannot be resolved could be the script this command runs, so it cannot be verified. Name the script file.');
   if (c.dynamic && GUARDED_WORDS.test(ctx.fullText)) {
     return deny('which word is the script this command runs is only known at run time ($VAR / $(...) / a glob) and the line mentions a guarded operation, so it cannot be verified. Name the file and write the options literally.');
   }
@@ -812,7 +813,7 @@ function evalString(str, startDir, ctx, level) {
         const why = catchAllReason(argv);
         if (why) verdict = deny(`${name} was given a string that contains a guarded command (${why}). Run the operation directly so it can be checked.`);
       }
-      const sf = verdict ? null : scriptFileOf(argv);
+      const sf = verdict ? null : scriptFileOf(argv, c.raw, str);
       if (sf) verdict = checkScriptFile(sf, dir, ctx, level);
     }
     if (verdict && verdict.decision === 'deny') return verdict;
@@ -839,7 +840,7 @@ export function evaluateGitCommand(command, {
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   const base = cwd || process.cwd();
   const ctx = {
-    cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, readDir, fullText: text,
+    cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, readDir, judgeBudget: MAX_CANDIDATE_JUDGMENTS, fullText: text,
     vars: Object.create(null), gitAliases: Object.create(null), ghAliases: Object.create(null),
     branches: new Map(), cfgDirty: false, envCfgDirty: false,
   };

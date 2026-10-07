@@ -19,7 +19,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
 import { simpleCommands, commandName, scriptFileOf } from './shell-parse.mjs';
-import { scriptCandidates, defaultReadDir } from './script-candidates.mjs';
+import { scriptCandidates, defaultReadDir, MAX_CANDIDATE_JUDGMENTS } from './script-candidates.mjs';
 
 const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
@@ -971,6 +971,7 @@ function judgeScriptFile(sf, dirs, ctx, opts, scanRaw = '') {
     if (sf.candidate && ctx.readDir(abs)) return null; // a shell cannot run a directory
     return sf.kind === 'shell' ? deny(`cannot read the script ${sf.file} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified`) : null;
   }
+  if (sf.candidate && --opts._budget.left < 0) return deny('too many script files to judge (candidate scripts that run candidate scripts), so what they run cannot be checked; name the script file');
   let kind = sf.kind;
   if (kind === 'exec') {
     if (text.slice(0, 4096).includes('\u0000')) return null; // a binary
@@ -993,8 +994,8 @@ function judgeScriptFile(sf, dirs, ctx, opts, scanRaw = '') {
 // names a protected pipeline file.
 function judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw) {
   const joinPath = (d, r) => (isAbs(r) ? posix.normalize(r) : posix.join(d, r));
-  const c = scriptCandidates(sf, { expand: (w) => expandRefs(w, ctx), dirs, joinPath, readDir: ctx.readDir });
-  if (c.over) return deny('too many words (or a glob matching too many files) could be the script this command runs, so it cannot be checked; name the script file');
+  const c = scriptCandidates(sf, { expand: (w) => expandRefs(w, ctx), dirs, joinPath, readDir: ctx.readDir, ifs: ctx.vars.IFS });
+  if (c.over) return deny('too many words, a glob matching too many files, or glob syntax that cannot be resolved could be the script this command runs, so it cannot be checked; name the script file');
   if (c.dynamic && makeMatchers(ctx).rawHit(scanRaw, dirs)) return deny('which word is the script this command runs is only known at run time ($VAR / $(...) / a glob) and the line refers to a protected pipeline file; name the file and write the options literally');
   for (const file of c.files) {
     const v = judgeScriptFile({ kind: sf.kind, file, candidate: true }, dirs, ctx, opts);
@@ -1080,6 +1081,7 @@ function linkReachesProtected(cmds, dirs, ctx) {
 // ---- Bash --------------------------------------------------------------------------------------------
 
 export function evaluateBashForFiles(command, opts = {}) {
+  if (!opts._budget) opts = { ...opts, _budget: { left: MAX_CANDIDATE_JUDGMENTS } }; // one budget for this evaluation and every script it reads
   const ctx = makeCtx(opts);
   if (ctx.admin) return allow();
   const raw = typeof command === 'string' ? command : '';
@@ -1138,7 +1140,7 @@ export function evaluateBashForFiles(command, opts = {}) {
   // 7: a script file (bash f.sh, source f, ./f, node f.mjs) runs whatever is in it
   if ((opts._depth ?? 0) < 4) {
     for (const c of cmds) {
-      const sf = scriptFileOf(c.argv);
+      const sf = scriptFileOf(c.argv, c.raw, raw);
       if (!sf) continue;
       const v = judgeScriptFile(sf, dirs, ctx, opts, scanRaw);
       if (v) return v;
