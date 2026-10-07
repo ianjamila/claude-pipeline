@@ -309,7 +309,9 @@ test('deploy url: a still-pending deployment is polled again and then times out 
     { match: 'deployments\\?sha=', stdoutJson: [{ id: 7, sha: SHA }] },
     { match: 'deployments/7/statuses', stdoutJson: [{ state: 'in_progress' }] },
   ]);
-  const r = cli(['deploy', 'url', '--sha', SHA, '--environment', 'Preview', '--timeout', '1', '--poll', '1'], { repo: repoWith(), fake });
+  // A 6 s budget with a 1 s poll: each loop spawns the fake gh twice, and under machine load one loop alone can take over a
+  // second, so `--timeout 1` timed out before a second poll could happen (flake, not a product bug).
+  const r = cli(['deploy', 'url', '--sha', SHA, '--environment', 'Preview', '--timeout', '6', '--poll', '1'], { repo: repoWith(), fake });
   assertExit(r, 3);
   assert.ok(fake.lines().filter((l) => l.includes('/statuses')).length >= 2);
 });
