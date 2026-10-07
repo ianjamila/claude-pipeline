@@ -9,7 +9,7 @@
 //   FAKE_CODEX_DURING_OUTPUT=<file>  FAKE_CODEX_OUTPUT for that command (cmd.exe has no `VAR=x cmd` prefix)
 //   FAKE_CODEX_HANG=<pidfile>  start a helper (its pid goes to <pidfile>, its pipes are closed) that writes the `-o`
 //                              file after 2 s, then never answer: a hung Codex that left a helper behind
-import { appendFileSync, copyFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 
 const argv = process.argv.slice(2);
@@ -28,7 +28,7 @@ if (process.env.FAKE_CODEX_DURING) {
 
 if (process.env.FAKE_CODEX_HANG) {
   const out = argv[argv.indexOf('-o') + 1];
-  const helper = spawn(process.execPath, ['-e', `setTimeout(() => require('fs').copyFileSync(process.env.FAKE_CODEX_OUTPUT, process.argv[1]), 2000)`, out], {
+  const helper = spawn(process.execPath, ['-e', `setTimeout(() => { const fs = require('fs'); fs.writeFileSync(process.argv[1], fs.readFileSync(process.env.FAKE_CODEX_OUTPUT)); }, 2000)`, out], {
     stdio: 'ignore',
   });
   writeFileSync(process.env.FAKE_CODEX_HANG, String(helper.pid));
@@ -52,5 +52,8 @@ if (process.env.FAKE_CODEX_NO_WRITE !== '1') {
     process.stderr.write('fake-codex: FAKE_CODEX_OUTPUT is not set');
     process.exit(98);
   }
-  copyFileSync(process.env.FAKE_CODEX_OUTPUT, argv[at + 1]);
+  // Write the bytes, never copyFileSync: on Windows a copy keeps the SOURCE's mtime, so a findings file the test
+  // wrote before a slow CLI start looked like a stale answer ("codex output file predates this run"). Real Codex
+  // writes a new file, so a fresh mtime is what the freshness check expects.
+  writeFileSync(argv[at + 1], readFileSync(process.env.FAKE_CODEX_OUTPUT));
 }

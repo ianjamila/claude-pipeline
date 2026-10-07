@@ -6,13 +6,14 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { treeFingerprint } from '../pipeline/lib/git.mjs';
 import { cli, scenario, ghEntries, assertOnlyFails, PR } from './helpers/gate-env.mjs';
+import { assertExit } from './helpers/assert-exit.mjs';
 
 // ---- final-gate: happy path ----------------------------------------------------------------------
 
 test('final-gate: a fully evidenced PR passes every check and writes the gate file', () => {
   const s = scenario();
   const r = s.gate();
-  assert.equal(r.code, 0, `${r.stderr}\n${r.stdout}`);
+  assertExit(r, 0);
   assert.equal(r.json.ok, true);
   assert.deepEqual(r.json.checks.map((c) => c.name), ['pr-open', 'labels', 'preflight', 'verify-report', 'hardstops', 'integrity', 'review', 'ci']);
   assert.ok(r.json.checks.every((c) => c.ok), JSON.stringify(r.json.checks));
@@ -30,24 +31,24 @@ test('final-gate: a fully evidenced PR passes every check and writes the gate fi
 
 test('final-gate: usage errors and a bad config exit 2; a stale gate file is removed before anything else', () => {
   const s = scenario();
-  assert.equal(cli(['final-gate'], { dir: s.repo.dir, fake: s.fake }).code, 2);
-  assert.equal(cli(['final-gate', '--pr', 'abc'], { dir: s.repo.dir, fake: s.fake }).code, 2);
+  assertExit(cli(['final-gate'], { dir: s.repo.dir, fake: s.fake }), 2);
+  assertExit(cli(['final-gate', '--pr', 'abc'], { dir: s.repo.dir, fake: s.fake }), 2);
   const broken = scenario({ yml: 'version: 2\n' });
-  assert.equal(broken.gate().code, 2);
+  assertExit(broken.gate(), 2);
 });
 
 test('final-gate: a failing run overwrites an earlier passing gate file; an unreachable GitHub (exit 3) deletes it', () => {
   const s = scenario();
-  assert.equal(s.gate().code, 0);
+  assertExit(s.gate(), 0);
   assert.equal(s.gateFile().ok, true);
   s.fake.setScript(ghEntries({ prHead: s.head, labels: ['needs-human'] }));
-  assert.equal(s.gate().code, 1);
+  assertExit(s.gate(), 1);
   assert.equal(s.gateFile().ok, false, 'the old passing evidence is gone');
 
-  assert.equal(s.gate().code, 1);
+  assertExit(s.gate(), 1);
   s.fake.setScript([{ match: '.', code: 1, stderr: 'HTTP 401' }]);
   const down = s.gate();
-  assert.equal(down.code, 3);
+  assertExit(down, 3);
   assert.equal(existsSync(join(s.repo.dir, '.review', 'final-gate.json')), false, 'no gate file survives a run that could not judge');
 });
 
@@ -108,7 +109,7 @@ test('final-gate: a tree that changed after verify ran fails verify-report', () 
 
 test('final-gate: the spec spelling git.treeHash is accepted for the tree binding', () => {
   const s = scenario({ report: (r) => { r.git.treeHash = r.git.tree; delete r.git.tree; } });
-  assert.equal(s.gate().code, 0);
+  assertExit(s.gate(), 0);
 });
 
 
@@ -120,6 +121,6 @@ test('final-gate: labels that are missing or malformed fail the labels check ins
   assertOnlyFails(scenario({ gh: { rawLabels: [null] } }).gate(), 'labels', /labels/);
   assertOnlyFails(scenario({ gh: { rawLabels: [{ name: 7 }] } }).gate(), 'labels', /labels/);
   assertOnlyFails(scenario({ gh: { rawLabels: [{ name: 'bug' }, { color: 'red' }] } }).gate(), 'labels', /labels/);
-  assert.equal(scenario({ gh: { rawLabels: [] } }).gate().code, 0, 'an empty list is a real answer');
-  assert.equal(scenario({ gh: { rawLabels: [{ name: 'bug' }] } }).gate().code, 0);
+  assertExit(scenario({ gh: { rawLabels: [] } }).gate(), 0, 'an empty list is a real answer');
+  assertExit(scenario({ gh: { rawLabels: [{ name: 'bug' }] } }).gate(), 0);
 });
