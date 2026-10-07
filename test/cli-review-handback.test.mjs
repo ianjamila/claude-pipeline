@@ -8,6 +8,7 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSy
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { assertExit } from './helpers/assert-exit.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 
@@ -134,13 +135,13 @@ const judgeMeta = { agentType: 'judge', description: JUDGE_TAG };
 
 test('triage validate --from-tag: a judge that reports through SubagentHandback is proven and its decisions applied', (t) => {
   const w = world(t);
-  assert.equal(w.codex(1, standardFindings()).code, 0);
+  assertExit(w.codex(1, standardFindings()), 0);
   const projects = installTranscript(w, {
     jsonl: handbackTranscript({ prompt: 'Triage round 1.', message: fenced(decisionsOf(STANDARD_JUDGE)), model: 'claude-opus-5-1' }),
     meta: judgeMeta,
   });
   const r = w.cli(['triage', 'validate', '--round', '1', '--from-tag', JUDGE_TAG, '--projects-dir', projects]);
-  assert.equal(r.code, 0, r.stderr + r.stdout);
+  assertExit(r, 0);
   assert.equal(r.json.judgeProof.ok, true, JSON.stringify(r.json.judgeProof));
   assert.equal(r.json.judgeProof.finalVia, 'handback');
   assert.equal(r.json.judgeProof.stopReasonMissing, true);
@@ -151,7 +152,7 @@ test('triage validate --from-tag: a judge that reports through SubagentHandback 
 
 test('triage validate --from-tag: a hand-back that was never acknowledged is a recorded proof failure', (t) => {
   const w = world(t);
-  assert.equal(w.codex(1, standardFindings()).code, 0);
+  assertExit(w.codex(1, standardFindings()), 0);
   const projects = installTranscript(w, {
     jsonl: handbackTranscript({ prompt: 'Triage round 1.', message: fenced(decisionsOf(STANDARD_JUDGE)), model: 'claude-opus-5-1', ack: false }),
     meta: judgeMeta,
@@ -164,16 +165,16 @@ test('triage validate --from-tag: a hand-back that was never acknowledged is a r
 
 test('arbiter apply: an arbiter that reports through SubagentHandback is proven and its rulings applied', (t) => {
   const w = world(t);
-  assert.equal(w.codex(1, standardFindings()).code, 0);
-  assert.equal(w.judge(1, STANDARD_JUDGE).code, 0);
+  assertExit(w.codex(1, standardFindings()), 0);
+  assertExit(w.judge(1, STANDARD_JUDGE), 0);
   const needed = w.cli(['arbiter', 'needed', '--round', '1']);
-  assert.equal(needed.code, 0, needed.stderr);
+  assertExit(needed, 0);
   const projects = installTranscript(w, {
     jsonl: handbackTranscript({ prompt: promptFor(needed.json.digest), message: fenced(SORT_RULINGS), model: 'claude-fable-5-1' }),
     meta: { agentType: 'arbiter', description: needed.json.tag },
   });
   const r = w.cli(['arbiter', 'apply', '--round', '1', '--projects-dir', projects]);
-  assert.equal(r.code, 0, r.stderr + JSON.stringify(r.json));
+  assertExit(r, 0);
   assert.equal(r.json.ok, true);
   assert.deepEqual(r.json.errors, []);
   assert.equal(r.json.finalVia, 'handback');
@@ -186,15 +187,15 @@ test('arbiter apply: an arbiter that reports through SubagentHandback is proven 
 
 test('arbiter apply: an unacknowledged hand-back is exit 1 and every arbitrated item goes to a human', (t) => {
   const w = world(t);
-  assert.equal(w.codex(1, standardFindings()).code, 0);
-  assert.equal(w.judge(1, STANDARD_JUDGE).code, 0);
+  assertExit(w.codex(1, standardFindings()), 0);
+  assertExit(w.judge(1, STANDARD_JUDGE), 0);
   const needed = w.cli(['arbiter', 'needed', '--round', '1']);
   const projects = installTranscript(w, {
     jsonl: handbackTranscript({ prompt: promptFor(needed.json.digest), message: fenced(SORT_RULINGS), model: 'claude-fable-5-1', ack: false }),
     meta: { agentType: 'arbiter', description: needed.json.tag },
   });
   const r = w.cli(['arbiter', 'apply', '--round', '1', '--projects-dir', projects]);
-  assert.equal(r.code, 1);
+  assertExit(r, 1);
   assert.equal(r.json.ok, false);
   assert.ok(r.json.errors.includes('hand-back not acknowledged'), r.json.errors.join('|'));
   assert.equal(w.item('R1-S1').final.needsHuman, true);
@@ -207,7 +208,7 @@ test('model-proof: reports finalVia handback with the delivered message', (t) =>
     meta: { agentType: 'arbiter', description: 'tag-x' },
   });
   const r = w.cli(['model-proof', '--tag', 'tag-x', '--projects-dir', projects]);
-  assert.equal(r.code, 0, r.stderr + r.stdout);
+  assertExit(r, 0);
   assert.equal(r.json.ok, true, JSON.stringify(r.json.errors));
   assert.equal(r.json.finalVia, 'handback');
   assert.equal(r.json.finalAssistantText, fenced(SORT_RULINGS));
