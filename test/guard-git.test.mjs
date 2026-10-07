@@ -1107,6 +1107,22 @@ test('a script whose name is only known at run time is denied only when the line
   assert.equal(evaluate('F=push.sh; bash $F', withFiles({ 'push.sh': 'git push origin main' })).decision, 'deny');
 });
 
+test('a read-only git merge-base is not a guarded "merge", even in a script with a run-time command name', () => {
+  // the shape that was wrongly denied: a review-diff helper that runs `"${BASH:-bash}" ./x.sh` and `git merge-base`
+  const files = {
+    'review.sh': '#!/bin/bash\nWS=$("${BASH:-bash}" ./ws.sh)\nBASE=$(git merge-base origin/main HEAD)\ngit diff "$BASE"..HEAD > "$WS/r.diff"\n',
+    'ws.sh': 'echo /tmp/ws',
+    'sneaky.sh': '#!/bin/bash\ngit merge-base a b\n"${BASH:-bash}" ./ws.sh\ngh pr merge 5 --admin\n',
+  };
+  assert.equal(evaluate('bash review.sh', withFiles(files)).decision, 'allow');
+  assert.equal(evaluate('g=git; $g merge-base HEAD origin/main').decision, 'allow');
+  // still guarded: a real merge beside merge-base, a run-time merge, a run-time gh merge
+  assert.equal(evaluate('bash sneaky.sh', withFiles(files)).decision, 'deny');
+  assert.equal(evaluate('g=git; $g merge feature').decision, 'deny');
+  assert.equal(evaluate('g=git; $g merge-base a b && $g merge feature').decision, 'deny');
+  assert.equal(evaluate('$GH pr merge 5 --admin').decision, 'deny');
+});
+
 test('script content is judged with the same rules, including truncation and size', () => {
   const huge = `${'true; '.repeat(600)}ls`;
   assert.equal(evaluate('bash t.sh', withFiles({ 't.sh': huge })).decision, 'deny');

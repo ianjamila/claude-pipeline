@@ -51,7 +51,9 @@ const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 // lowercase basename without .exe/.cmd/.bat/.com; handles /usr/bin/git and C:\Git\bin\GIT.EXE alike
 const baseName = (w) => commandName(w);
 // A command the parser could only partly resolve (`$g push`, `bash -c "$X"`, `curl … | sh`) is judged by what it mentions.
-const GUARDED_WORDS = /push|merge|human-approved|test-change-approved|needs-human|pipeline-pause|pipeline-rollback|pipeline-blocked|awaiting-review|protection|ruleset|issue\s+close/i;
+// `merge-base` is read-only (it names a commit); without the lookahead, any script with a
+// run-time command name that also computed a merge base for a diff was denied.
+const GUARDED_WORDS = /push|merge(?!-base)|human-approved|test-change-approved|needs-human|pipeline-pause|pipeline-rollback|pipeline-blocked|awaiting-review|protection|ruleset|issue\s+close/i;
 const isProtectedBranch = (b) => PROTECTED_BRANCHES.includes(String(b).toLowerCase());
 const isPrefixOf = (name, full, min = 1) => name.length >= min && full.startsWith(name);
 // Label names are case-insensitive on GitHub; a name only counts when it is not part of a longer one.
