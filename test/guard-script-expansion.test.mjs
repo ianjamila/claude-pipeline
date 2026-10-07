@@ -64,6 +64,12 @@ test('guard-git: an unknown variable, a substitution or backticks before the scr
   for (const c of ['bash $X ok.sh', 'bash $(echo -x) ok.sh', 'bash `echo -x` ok.sh', 'bash $X']) assert.equal(git(c).decision, 'allow', c);
 });
 
+test('guard-git: a quoted variable holding a path with a space is judged whole as well as split', () => {
+  const sp = gitFs({ 'sp ace.sh': 'git push origin main' });
+  assert.equal(git('X="sp ace.sh"; bash "$X"', sp).decision, 'deny');
+  assert.equal(git('X="sp ace.sh"; source $X', sp).decision, 'deny');
+});
+
 test('guard-git: source and . judge every word when the operand is a variable', () => {
   // the split matters: "ok.sh f.sh" as ONE word is a missing file
   for (const c of ['X="ok.sh f.sh"; source $X', 'X="ok.sh f.sh"; . $X', 'X="a.sh f.sh"; source $X', 'source $X f.sh', 'source $(echo ok.sh) f.sh'])
@@ -93,6 +99,22 @@ test('guard-git: a glob in the script position is resolved against the directory
   const many = Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`m${i}.sh`, 'git status']));
   assert.equal(git('bash m*.sh', gitFs(many)).decision, 'deny');
   assert.match(git('bash m*.sh', gitFs(many)).reason, /too many|matches/);
+});
+
+test('guard-git: globs honour ~, ** and the directory the line changed to', () => {
+  const home = fakeFs(GIT_ROOT, { '/home/u/h.sh': 'git push origin main' }, ['/home/u']);
+  assert.equal(git('bash ~/*.sh', home).decision, 'deny');
+  assert.equal(git('bash ~/h.sh', home).decision, 'deny');
+  const deep = fakeFs(GIT_ROOT, { 'deep/x/ok.sh': 'git status', 'only.sh': 'git status', 'sub/bad.sh': 'git push origin main' }, ['deep', 'deep/x', 'sub']);
+  assert.equal(git('bash **/ok.sh', deep).decision, 'deny'); // refused, not guessed
+  assert.equal(git('cd sub && bash *.sh', deep).decision, 'deny');
+  assert.equal(git('bash *.sh', deep).decision, 'allow');
+});
+
+test('guard-git: a glob over a directory too big to scan is refused', () => {
+  const big = gitFs(Object.fromEntries(Array.from({ length: 5100 }, (_, i) => [`n${i}.txt`, 'x'])));
+  assert.equal(git('bash zz*.sh', big).decision, 'deny');
+  assert.match(git('bash zz*.sh', big).reason, /too many/);
 });
 
 test('guard-git: a word that is still unknown is denied when the line mentions a guarded operation', () => {
@@ -198,6 +220,12 @@ test('guard-files: an unknown variable, a substitution or backticks before the s
   for (const c of ['bash $X ok.sh', 'bash $(echo -x) ok.sh', 'bash `echo -x` ok.sh', 'bash $X']) assert.equal(files(c).decision, 'allow', c);
 });
 
+test('guard-files: a quoted variable holding a path with a space is judged whole as well as split', () => {
+  const sp = filesFs({ 'sp ace.sh': 'echo x > ~/.claude/settings.json' });
+  assert.equal(files('X="sp ace.sh"; bash "$X"', sp).decision, 'deny');
+  assert.equal(files('X="sp ace.sh"; source $X', sp).decision, 'deny');
+});
+
 test('guard-files: source and . judge every word when the operand is a variable', () => {
   for (const c of ['X="ok.sh w.sh"; source $X', 'X="a.sh w.sh"; . $X', 'source $X w.sh', 'source $(echo a.sh) w.sh']) assert.equal(files(c).decision, 'deny', c);
   for (const c of ['X=a.sh; source $X', 'X="ok.sh a.sh"; source $X', 'X=missing.sh; source $X', 'source $X']) assert.equal(files(c).decision, 'allow', c);
@@ -218,6 +246,21 @@ test('guard-files: a glob in the script position is resolved against the directo
   const many = Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`m${i}.sh`, 'echo hi']));
   assert.equal(files('bash m*.sh', filesFs(many)).decision, 'deny');
   assert.match(files('bash m*.sh', filesFs(many)).reason, /too many|matches/);
+});
+
+test('guard-files: globs honour ~, ** and the directory the line changed to', () => {
+  const home = fakeFs(PROJ, { '/home/u/h.sh': 'echo x > ~/.claude/settings.json' }, ['/home/u']);
+  assert.equal(files('bash ~/*.sh', home).decision, 'deny');
+  assert.equal(files('bash ~/h.sh', home).decision, 'deny');
+  const deep = fakeFs(PROJ, { 'deep/x/ok.sh': 'echo hi', 'only.sh': 'echo hi', 'sub/bad.sh': 'rm ~/.claude/pipeline/VERSION' }, ['deep', 'deep/x', 'sub']);
+  assert.equal(files('bash **/ok.sh', deep).decision, 'deny'); // refused, not guessed
+  assert.equal(files('cd sub && bash *.sh', deep).decision, 'deny');
+  assert.equal(files('bash *.sh', deep).decision, 'allow');
+});
+
+test('guard-files: a glob over a directory too big to scan is refused', () => {
+  const big = filesFs(Object.fromEntries(Array.from({ length: 5100 }, (_, i) => [`n${i}.txt`, 'x'])));
+  assert.equal(files('bash zz*.sh', big).decision, 'deny');
 });
 
 test('guard-files: a word that is still unknown is denied when the line names a protected pipeline file', () => {

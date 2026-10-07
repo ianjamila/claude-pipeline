@@ -54,7 +54,6 @@ function globMatches(pattern, dir, readDir, joinPath, budget) {
     for (const n of names) {
       if (++budget.work > MAX_GLOB_WORK) { budget.over = true; return; }
       if (re.test(n) && (!n.startsWith('.') || seg.startsWith('.'))) walk(i + 1, add(pre, n));
-      if (out.length > MAX_CANDIDATES) { budget.over = true; return; }
     }
   };
   walk(0, abs ? '/' : '');
