@@ -16,7 +16,9 @@
 // text at the end of such a session is NOT delivered. So the final answer is the call's input.message, and it
 // counts only when the transcript proves delivery: the call is the only block of the closing line (any other
 // tool name, extra block or extra input key is refused), its input matches the wire copy when one is logged,
-// and the very next and LAST line is the tool_result acknowledgment (success, toolEndsTurn, same tool_use id).
+// and the LAST line is the tool_result acknowledgment (success, toolEndsTurn, same tool_use id). Only results of
+// parallel tool calls made in that same message (each once) may sit between the call and the acknowledgment, and the
+// wire copy of the input may show \uXXXX escapes where the parsed input holds the character (seen in real transcripts).
 // Text in earlier blocks of that message was never delivered and is ignored. A hand-back's stop_reason is null
 // or tool_use; with null the message must still hold a complete JSON answer. The proof reports finalVia:
 // 'text' | 'handback' (null when the final message is not proven).
@@ -178,10 +180,51 @@ function ackProblem(line, id) {
   return null;
 }
 
+// A user line made only of tool_result blocks for still-unanswered parallel call ids (the ids are consumed).
+function takesParallelResult(line, ids) {
+  if (line === null || line.type !== 'user' || line.isMeta === true) return false;
+  const content = isPlainObject(line.message) ? line.message.content : undefined;
+  if (!Array.isArray(content) || content.length === 0) return false;
+  const mine = new Set();
+  for (const b of content) {
+    if (!isPlainObject(b) || b.type !== 'tool_result' || typeof b.tool_use_id !== 'string' || !ids.has(b.tool_use_id) || mine.has(b.tool_use_id)) return false;
+    mine.add(b.tool_use_id);
+  }
+  for (const id of mine) ids.delete(id);
+  return true;
+}
+
+// Claude Code's wire copy of a tool input can hold \uXXXX escape text where the parsed input holds the character
+// itself (seen for U+00A0, U+202F, n-tilde). Exactly that and nothing else may differ: walk both strings, and at a
+// difference the wire must show \uXXXX decoding to the input's character.
+function sameWireMessage(wire, input) {
+  let i = 0;
+  let j = 0;
+  while (i < input.length && j < wire.length) {
+    const esc = /^\\u([0-9a-fA-F]{4})/.exec(wire.slice(j, j + 6));
+    if (esc && String.fromCharCode(parseInt(esc[1], 16)) === input[i]) {
+      i++;
+      j += 6;
+    } else if (input[i] === wire[j]) {
+      i++;
+      j++;
+    } else {
+      return false;
+    }
+  }
+  return i === input.length && j === wire.length;
+}
+
+function sameWireInput(wire, input) {
+  if (isDeepStrictEqual(wire, input)) return true;
+  return isPlainObject(wire) && isPlainObject(input) && Object.keys(wire).length === 1 && has(wire, 'message')
+    && typeof wire.message === 'string' && typeof input.message === 'string' && sameWireMessage(wire.message, input.message);
+}
+
 // Judges the closing line of a final message that holds a SubagentHandback call. Pushes an error for every
 // broken rule (see the header) and returns the delivered message when the call and its acknowledgment are
 // structurally proven, else null. stop_reason and JSON completeness are the caller's.
-function checkHandback({ closingEntry, closing, parsed, lastLineN, errors }) {
+function checkHandback({ closingEntry, closing, group, parsed, errors }) {
   const content = isPlainObject(closing) ? closing.content : undefined;
   if (!Array.isArray(content) || content.length !== 1 || !isHandbackCall(content[0])) {
     errors.push('hand-back must be the only content block of the final line');
@@ -197,15 +240,25 @@ function checkHandback({ closingEntry, closing, parsed, lastLineN, errors }) {
   const wire = closingEntry.line.wireToolInputs;
   if (has(closingEntry.line, 'wireToolInputs')) {
     if (!isPlainObject(wire)) fail('hand-back wireToolInputs is not an object');
-    else if (typeof call.id === 'string' && has(wire, call.id) && !isDeepStrictEqual(wire[call.id], input)) fail('hand-back input differs from its wire input');
+    else if (typeof call.id === 'string' && has(wire, call.id) && !sameWireInput(wire[call.id], input)) fail('hand-back input differs from its wire input');
+  }
+  // Tool calls made in parallel in this very message: their results arrive before the acknowledgment, unseen by the
+  // model (its run is over). Only those, each once, may precede it.
+  const parallelIds = new Set();
+  for (const a of group) {
+    for (const b of blocksOf(a.line.message?.content)) {
+      if (isPlainObject(b) && b.type === 'tool_use' && typeof b.id === 'string' && b.id !== call.id) parallelIds.add(b.id);
+    }
   }
   const after = parsed.filter((p) => p.n > closingEntry.n);
-  if (after.length === 0) {
+  let k = 0;
+  while (k < after.length && takesParallelResult(after[k].line, parallelIds)) k++;
+  if (k === after.length) {
     fail('hand-back not acknowledged');
   } else {
-    const problem = ackProblem(after[0].line, call.id);
+    const problem = ackProblem(after[k].line, call.id);
     if (problem !== null) fail(`hand-back acknowledgment invalid: ${problem}`);
-    if (after.length > 1 || after[after.length - 1].n !== lastLineN) fail('extra lines after the hand-back acknowledgment');
+    if (k < after.length - 1) fail('extra lines after the hand-back acknowledgment');
   }
   return ok ? input.message : null;
 }
@@ -331,7 +384,7 @@ export function proveModel({ jsonlText, metaText, expectModelPrefix, expectEffor
     const isHandbackAttempt = group.some((a) => blocksOf(a.line.message?.content).some(isHandbackCall));
 
     if (isHandbackAttempt) {
-      const delivered = checkHandback({ closingEntry, closing, parsed, lastLineN, errors });
+      const delivered = checkHandback({ closingEntry, closing, group, parsed, errors });
       // tool_use is the ordinary stop_reason of a tool-call message; null is a streaming snapshot (see header).
       if (finalStopReason !== null && finalStopReason !== 'tool_use') {
         errors.push(`final message incomplete (stop_reason ${String(finalStopReason)})`);

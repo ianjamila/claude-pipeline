@@ -873,3 +873,74 @@ test('hand-back: finalAssistantText is the hand-back message only, never text fr
   assert.equal(r.finalVia, 'handback');
   assert.equal(r.finalAssistantText, HB_MESSAGE);
 });
+
+// ---------- hand-back: parallel tool calls and the wire copy's \uXXXX escapes (both seen in real transcripts) ----------
+
+// A tool call made in the same assistant message as the hand-back (one line per content block, same message.id).
+const parallelCall = (toolId, id = 'msg_hb') => asstLine({ id, stop: null, content: [{ type: 'tool_use', id: toolId, name: 'Bash', input: { command: 'true' } }] });
+const resultLine = (...toolIds) =>
+  JSON.stringify({ type: 'user', toolUseResult: { stdout: '' }, message: { role: 'user', content: toolIds.map((id) => ({ tool_use_id: id, type: 'tool_result', content: 'ok' })) } });
+
+test('hand-back: results of parallel tool calls from the same message may sit between the hand-back and its acknowledgment', () => {
+  const head = [userLine('p'), thinkingLine(), parallelCall('toolu_p1'), parallelCall('toolu_p2'), hbLine()];
+  const one = proveText([...head, resultLine('toolu_p1'), resultLine('toolu_p2'), ackLine()]);
+  assert.deepEqual(one.errors, []);
+  assert.equal(one.finalVia, 'handback');
+  assert.equal(one.finalAssistantText, HB_MESSAGE);
+  // One user line may carry several results, in any order.
+  assert.deepEqual(proveText([...head, resultLine('toolu_p2', 'toolu_p1'), ackLine()]).errors, []);
+  // A result for only some of the parallel calls is fine too (the others never answered).
+  assert.deepEqual(proveText([...head, resultLine('toolu_p2'), ackLine()]).errors, []);
+});
+
+test('hand-back: anything but a first-time result for a same-message parallel call between the hand-back and the ack is refused', () => {
+  const head = [userLine('p'), thinkingLine(), parallelCall('toolu_p1'), hbLine()];
+  // A result for an id outside the final message group (even one that exists in an earlier message).
+  refused([userLine('p'), parallelCall('toolu_old', 'msg_old'), thinkingLine(), hbLine(), resultLine('toolu_old'), ackLine()], /hand-back acknowledgment invalid: tool_result is not for this call/);
+  refused([...head, resultLine('toolu_unknown'), ackLine()], /hand-back acknowledgment invalid: tool_result is not for this call/);
+  // The same id twice, across lines or inside one line.
+  refused([...head, resultLine('toolu_p1'), resultLine('toolu_p1'), ackLine()], /hand-back acknowledgment invalid: tool_result is not for this call/);
+  refused([...head, resultLine('toolu_p1', 'toolu_p1'), ackLine()], /hand-back acknowledgment invalid: message.content is not one tool_result block/);
+  // Prompt text, a text block beside a result, or a harness note.
+  refused([...head, userLine('another prompt'), ackLine()], /hand-back acknowledgment invalid: message.content is not one tool_result block/);
+  refused([...head, userLine([{ type: 'tool_result', tool_use_id: 'toolu_p1', content: 'ok' }, { type: 'text', text: 'hi' }]), ackLine()], /hand-back acknowledgment invalid/);
+  refused([...head, userLine([{ type: 'tool_result', tool_use_id: 'toolu_p1', content: 'ok' }], { isMeta: true }), ackLine()], /hand-back acknowledgment invalid/);
+  // Only user lines count: a non-user line shaped like a result, an empty user line, a non-tool_result block carrying an id.
+  const asResult = (extra) => JSON.stringify({ message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_p1', content: 'ok' }] }, ...extra });
+  refused([...head, asResult({ type: 'system' }), ackLine()], /hand-back acknowledgment invalid: not a user line/);
+  refused([...head, userLine([]), ackLine()], /hand-back acknowledgment invalid: message.content is not one tool_result block/);
+  refused([...head, userLine([{ type: 'text', tool_use_id: 'toolu_p1', text: 'hi' }]), ackLine()], /hand-back acknowledgment invalid: message.content is not one tool_result block/);
+  // A second line closing the hand-back itself, or any parallel result AFTER the ack: the ack must be the last line.
+  refused([...head, ackLine(), ackLine()], /extra lines after the hand-back acknowledgment/);
+  refused([...head, ackLine(), resultLine('toolu_p1')], /extra lines after the hand-back acknowledgment/);
+  // The hand-back call's own id is never a parallel result.
+  refused([...head, resultLine(HB_ID), ackLine()], /extra lines after the hand-back acknowledgment/);
+  // Without the final ack the parallel results do not acknowledge anything.
+  refused([...head, resultLine('toolu_p1')], /hand-back not acknowledged/);
+});
+
+test('hand-back rule 3: the wire copy may hold \\uXXXX escapes for characters the input holds directly, and nothing else may differ', () => {
+  const message = '```json\n{"note":"a\u00a0b \u00f1 \u2013 \u202f"}\n```';
+  const wireOf = (m) => m.replace(/[\u0080-\uffff]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
+  const withWire = (wireMessage, input = { message }) => [userLine('p'), hbLine({ input, wireToolInputs: { [HB_ID]: { message: wireMessage } } }), ackLine()];
+  const ok = proveText(withWire(wireOf(message)));
+  assert.deepEqual(ok.errors, []);
+  assert.equal(ok.finalAssistantText, message, 'the delivered text is the decoded input, not the wire copy');
+  // Only some characters escaped (including an ASCII one), and upper-case hex digits.
+  assert.deepEqual(proveText(withWire(message.replace('\u00a0', '\\u00a0').replace('\u00f1', '\\u00F1').replace('{"note"', '{"\\u006eote"'))).errors, []);
+  // Literal backslash-u text that the input holds as text, too, is not an escape.
+  const literal = '```json\n{"note":"write \\u00a0 for nbsp"}\n```';
+  assert.deepEqual(proveText(withWire(literal, { message: literal })).errors, []);
+  // Any real difference is still refused: an escape for another character, a changed word, a malformed escape, a missing escape char.
+  const E = /hand-back input differs from its wire input/;
+  refused(withWire(message.replace('\u00a0', '\\u00a1')), E);
+  refused(withWire(wireOf(message).replace('note', 'nope')), E);
+  refused(withWire(message.replace('\u00a0', '\\u00a')), E);
+  refused(withWire(message.replace('\u00a0', '')), E);
+  // An escape needs exactly four hex digits: \\u00a (three) is not U+000A.
+  const nl = 'x\ny';
+  refused(withWire('x\\u00ayy', { message: nl }), E);
+  assert.deepEqual(proveText(withWire('x\\u000ay', { message: nl })).errors.filter((e) => E.test(e)), []);
+  refused(withWire(wireOf(message) + 'x'), E);
+  refused(withWire(wireOf(literal).replace('\\u00a0', '\u00a0'), { message: literal }), E);
+});
