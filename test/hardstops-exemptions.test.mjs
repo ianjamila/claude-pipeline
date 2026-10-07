@@ -189,3 +189,33 @@ test('IO: the exemption holes through real git: docs module, test-to-prod rename
   assert.deepEqual(byFile('lib/evil.ts'), ['R0-unscannable']);
   assert.ok(byFile('lib/old.ts').includes('R4-pipeline'), 'the symlink that replaced a production file');
 });
+
+// A 100% rename prints only similarity/rename headers (no mode line), so the diff parser cannot see a symlink or submodule
+// that merely MOVES; collectHardStops reads the tree modes from `git diff --raw` instead.
+test('IO: a 100% rename of an existing symlink (or gitlink) is still a symlink (R4); a plain 100% rename is not', async () => {
+  const { createTmpRepo } = await import('./helpers/tmprepo.mjs');
+  const { collectHardStops } = await import('../pipeline/lib/hardstops.mjs');
+  const repo = createTmpRepo();
+  repo.write('README.md', 'x\n');
+  repo.write('assets/plain.js', 'export const plain = 1;\nexport const more = 2;\nexport const evenMore = 3;\n');
+  repo.commit('base');
+  // Index-only entries: no dependence on the platform's symlink support in the working tree.
+  const blob = repo.git(['hash-object', '-w', '--stdin'], { input: '../tests/helpers/evil.js' }).trim();
+  repo.git(['update-index', '--add', '--cacheinfo', `120000,${blob},assets/helper.js`]);
+  repo.git(['update-index', '--add', '--cacheinfo', '160000,1234567890123456789012345678901234567890,vendor/sub']);
+  repo.git(['commit', '-q', '-m', 'add symlink and gitlink']);
+  repo.branch('feat');
+  repo.git(['update-index', '--force-remove', 'assets/helper.js']);
+  repo.git(['update-index', '--add', '--cacheinfo', `120000,${blob},src/helper.js`]);
+  repo.git(['update-index', '--force-remove', 'vendor/sub']);
+  repo.git(['update-index', '--add', '--cacheinfo', '160000,1234567890123456789012345678901234567890,deps/sub']);
+  repo.git(['update-index', '--force-remove', 'assets/plain.js']);
+  const plain = repo.git(['hash-object', '-w', 'assets/plain.js']).trim();
+  repo.git(['update-index', '--add', '--cacheinfo', `100644,${plain},src/plain.js`]);
+  repo.git(['commit', '-q', '-m', 'move them']);
+  const hits = await collectHardStops({ base: 'main', head: 'feat', cwd: repo.dir, config: cfg() });
+  const byFile = (p) => hits.filter((h) => h.file === p);
+  assert.ok(byFile('src/helper.js').some((h) => h.rule === 'R4-pipeline' && /symlink/.test(h.detail)), 'moved symlink');
+  assert.ok(byFile('deps/sub').some((h) => h.rule === 'R4-pipeline' && /submodule/.test(h.detail)), 'moved gitlink');
+  assert.deepEqual(rulesOf(byFile('src/plain.js')), [], 'an ordinary 100% rename stays clean');
+});

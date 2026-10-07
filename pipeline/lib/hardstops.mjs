@@ -31,7 +31,7 @@
 //  * Path rules test the old AND the new path, case-insensitively. Exclusions (docs, tests) match the path as written.
 import { matchAny } from './glob.mjs';
 import { DEFAULTS } from './config.mjs';
-import { diffFiles, mergeBase, showFile, git, GitError } from './git.mjs';
+import { diffFiles, diffModes, mergeBase, showFile, git, GitError } from './git.mjs';
 
 // ---------------------------------------------------------------------------------------------------------------
 // Paths
@@ -1180,10 +1180,28 @@ function parseJson(text) {
   }
 }
 
+// symlink / gitlink from the tree modes (see diffModes): the unified diff misses them on a 100% rename. A path touched by any
+// entry that has a 120000 / 160000 mode on either side counts, so a retyped file is covered too.
+function applyTreeModes(files, modes) {
+  const symlinks = new Set();
+  const gitlinks = new Set();
+  for (const m of modes) {
+    for (const [set, mode] of [[symlinks, '120000'], [gitlinks, '160000']]) {
+      if (m.oldMode === mode || m.newMode === mode) for (const p of [m.oldPath, m.newPath]) if (p) set.add(p);
+    }
+  }
+  for (const f of files) {
+    const own = [f.oldPath, f.newPath].filter(Boolean);
+    if (own.some((p) => symlinks.has(p))) f.symlink = true;
+    if (own.some((p) => gitlinks.has(p))) f.gitlink = true;
+  }
+}
+
 export async function collectHardStops({ base, head, cwd, config }) {
   const o = { cwd };
   const files = diffFiles(base, head, o);
   const mb = mergeBase(base, head, o);
+  applyTreeModes(files, diffModes(base, head, o));
   const cx = settings(config);
   const ds = files.map((f) => describe(f, cx));
 
