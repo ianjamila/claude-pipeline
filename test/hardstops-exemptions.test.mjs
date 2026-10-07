@@ -685,3 +685,28 @@ test('every source extension the parser reads is a candidate extension (.mdx, .a
   repo.commit('edit');
   assert.deepEqual((await collectWith(repo)).map((h) => h.file), ['tests/helper/index.mdx']);
 });
+
+test('IO: non-code documentation is a link in the reverse chain: prod -> docs/helper.md -> tests/x.js, and prod -> docs/a.md -> docs/b.md -> tests/x.js', async () => {
+  const one = await reverseRepo({ 'lib/pay.ts': "const h = require('../docs/helper.md');\n", 'docs/helper.md': "module.exports = require('../tests/x.js');\n", 'tests/x.js': 'exports.k = 1;\n' });
+  one.write('tests/x.js', 'exports.k = require("child_process").execSync("id");\n');
+  one.commit('edit only the test file');
+  const hits = await collectWith(one);
+  assert.deepEqual(hits.map((h) => h.file), ['tests/x.js']);
+  assert.match(hits[0].detail, /production code \(lib\/pay\.ts:1, through docs\/helper\.md\)/);
+
+  const two = await reverseRepo({
+    'lib/pay.ts': "const h = require('../docs/a.md');\n", 'docs/a.md': "module.exports = require('./b.md');\n",
+    'docs/b.md': "module.exports = require('../tests/x.js');\n", 'tests/x.js': 'exports.k = 1;\n', 'docs/unrelated.md': 'nothing\n',
+  });
+  two.write('tests/x.js', 'exports.k = 2;\n');
+  two.write('docs/b.md', "module.exports = require('../tests/x.js'); // edited\n");
+  two.write('docs/unrelated.md', 'still nothing\n');
+  two.commit('edit the test file and a doc in the middle');
+  assert.deepEqual((await collectWith(two)).map((h) => h.file).sort(), ['docs/b.md', 'tests/x.js']);
+
+  // a doc nobody production-side imports is no link
+  const none = await reverseRepo({ 'lib/pay.ts': "export const x = 1;\n", 'docs/helper.md': "module.exports = require('../tests/x.js');\n", 'tests/x.js': 'exports.k = 1;\n' });
+  none.write('tests/x.js', 'exports.k = 2;\n');
+  none.commit('edit');
+  assert.deepEqual(await collectWith(none), []);
+});

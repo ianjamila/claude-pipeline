@@ -1548,7 +1548,7 @@ function parseJson(text) {
   }
 }
 
-// Reverse check. A test file is exempt from content rules, so when production code ALREADY imports one (directly, or through
+// Reverse check. A test file (or non-code documentation) is exempt from content rules, so when production code ALREADY imports one (directly, or through
 // other test files: prod -> tests/a.ts -> tests/b.ts), editing that file changes what production runs and nothing judges the
 // new content. For the changed (added, modified, renamed-into) test files: one grep of the head tree for files mentioning
 // their basenames (just the names, so an import split over lines is still found), the importers read whole at head and run
@@ -1558,7 +1558,9 @@ function parseJson(text) {
 // Every file the import parser reads (JS_FAMILY / PY_FILE / RB_FILE; a plain pathspec's `*` also matches `/`, so `*Gemfile` is
 // any directory's Gemfile). Keep in step with those three tests: a language missing here is a blind spot for the reverse check.
 const CODE_PATHSPECS = ['*.js', '*.mjs', '*.cjs', '*.jsx', '*.ts', '*.tsx', '*.mts', '*.cts', '*.vue', '*.svelte', '*.astro', '*.mdx',
-  '*.py', '*.pyi', '*.rb', '*.rake', '*.gemspec', '*.ru', '*Rakefile', '*Gemfile'];
+  '*.py', '*.pyi', '*.rb', '*.rake', '*.gemspec', '*.ru', '*Rakefile', '*Gemfile',
+  // Documentation is reachable code (`require('./x.md')` loads it as JavaScript), so it can be a link in an import chain.
+  '*.md', '*.txt', '*.rst', '*.adoc'];
 const MAX_CHAIN_ROUNDS = 5;
 const MAX_CHAIN_FILES = 300;
 const READ_BATCH = 200;
@@ -1652,8 +1654,8 @@ function reverseImportHits(ds, head, o, cx, maxFiles) {
     }
     const next = new Set();
     for (const [file, lines] of texts) {
-      const isTest = isTestFile(file, cx.testGlobs);
-      if (!isTest && !isCodeFile(file, cx.testGlobs)) continue;
+      // Every exempt file (a test OR non-code documentation) is a LINK that extends the walk; only real code is a production endpoint.
+      const exempt = !isCodeFile(file, cx.testGlobs);
       const reached = new Map(); // frontier file -> line of the first import that reaches it
       for (const m of scanImports(lines, file)) {
         for (const c of importCandidates(m.spec, file, { python: m.py, ruby: m.rb })) {
@@ -1662,7 +1664,7 @@ function reverseImportHits(ds, head, o, cx, maxFiles) {
         }
       }
       for (const [t, line] of reached) {
-        if (!isTest) {
+        if (!exempt) {
           for (const r of rootsOf.get(t)) if (!found.has(r)) found.set(r, `${file}:${line}${r === t ? '' : `, through ${t}`}`);
           continue;
         }
