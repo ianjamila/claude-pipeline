@@ -550,11 +550,18 @@ test('13 a line stuffed with import specifiers stays fast (and is flagged as unr
 });
 
 test('13 the whole-file import scan stays linear on a ~1.5 MB file of adversarial shapes', () => {
-  const shapes = [[';from a import '.repeat(100_000), 'a.py'], ['from' + ' '.repeat(1_500_000), 'a.ts'], ['require("'.repeat(190_000), 'a.ts'], [';import a, '.repeat(100_000), 'a.py'], ['"""\n'.repeat(250_000), 'a.py'],
-    ['from a import (\n'.repeat(90_000), 'a.py'], ['import a, \\\n'.repeat(120_000), 'a.py']];
-  for (const [text, name] of shapes) {
-    const { ms } = cpuMs(() => run([file(`lib/${name}`, { added: ['x = 1'] })], { headFiles: new Map([[`lib/${name}`, text]]) }));
-    assert.ok(ms < 1500, `${text.slice(0, 20)}... took ${Math.round(ms)}ms of CPU`);
+  // Linearity, not raw speed: CI's Node 20 runs these ~3x slower than a laptop, so an absolute budget flaked (2.1 s for the
+  // backslash chain on ubuntu-latest). Doubling the input may at most ~double the CPU (ratio < 3; a quadratic shape gives ~4),
+  // and a generous absolute ceiling still catches a pathological constant.
+  const shapes = [[';from a import ', 100_000, 'a.py'], ['from' + ' ', 1_500_000, 'a.ts', true], ['require("', 190_000, 'a.ts'], [';import a, ', 100_000, 'a.py'], ['"""\n', 250_000, 'a.py'],
+    ['from a import (\n', 90_000, 'a.py'], ['import a, \\\n', 120_000, 'a.py']];
+  const cpu = (text, name) => cpuMs(() => run([file(`lib/${name}`, { added: ['x = 1'] })], { headFiles: new Map([[`lib/${name}`, text]]) })).ms;
+  for (const [unit, n, name, padOnly] of shapes) {
+    const make = (k) => (padOnly ? `from${' '.repeat(k)}` : unit.repeat(k));
+    const half = Math.max(cpu(make(n / 2), name), 1);
+    const full = cpu(make(n), name);
+    assert.ok(full / half < 3, `${unit.slice(0, 16)}... ${Math.round(half)}ms at n/2 -> ${Math.round(full)}ms at n: not linear`);
+    assert.ok(full < 8000, `${unit.slice(0, 16)}... took ${Math.round(full)}ms of CPU`);
   }
 });
 
