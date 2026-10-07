@@ -100,6 +100,13 @@ const DENY = [
   ['gh ${G:-pr} merge 5 --admin'],
   ['X=pu; git ${X}${Y:-sh} origin main'],
   ['git "$(printf push)" origin main'],
+  ['X=push; git $X origin main'], // a variable known on the line is still not a literal subcommand
+  ['X=diff; git $X HEAD~1'],
+  ['X=merge; true || X=view; gh pr $X 5 --admin'],
+  // a variable assigned twice is unknown: which assignment ran depends on control flow
+  ['B=main; false && B=agent/x; git push origin $B'],
+  ['L=human-approved; false && L=ok; gh pr edit 1 --add-label $L'],
+  ['X=push; X=diff git $X origin main'],
 ];
 
 const ALLOW = [
@@ -133,7 +140,7 @@ const ALLOW = [
   ['gh -R $REPO pr view 5'],
   ['git diff "$BASE"..HEAD'],
   ['git -C "$DIR" log --oneline -3'],
-  ['X=diff; git $X HEAD~1'],
+  ['B=agent/x; git push origin $B'], // assigned once on the line: still known
 ];
 
 const label = (command, o) => (o ? `${command}  ${JSON.stringify(o, (k, v) => (v instanceof Error ? `Error(${v.message})` : v))}` : command);

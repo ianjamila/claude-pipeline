@@ -113,7 +113,12 @@ function expandVars(text, vars) {
   return String(text).replace(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g, (m, a, b) => vars[a ?? b] ?? m);
 }
 
-const recordVars = (env, ctx) => { for (const k of Object.keys(env)) ctx.vars[k] = env[k]; };
+// A variable assigned more than once in what is judged (`B=main; false && B=agent/x`) is unknown from then on: which
+// assignment ran depends on control flow the parser does not model, so its value is left as `$B` (dynamic).
+function setVar(ctx, k, v) {
+  if (k in ctx.vars || ctx.unsureVars.has(k)) { delete ctx.vars[k]; ctx.unsureVars.add(k); } else ctx.vars[k] = v;
+}
+const recordVars = (env, ctx) => { for (const k of Object.keys(env)) setVar(ctx, k, env[k]); };
 
 // Resolves `target` against `dir`. Returns null when the result cannot be known statically ($VAR, $(..), `cd -`).
 function joinDir(dir, target, ctx) {
@@ -360,8 +365,9 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
   const g = parseGitGlobal(argv, dir, env, ctx);
   const { sub, args } = g;
   if (sub === undefined) return null;
-  // `git "$(printf push)" origin main` / `git ${X}${Y:-sh}`: the subcommand is only known at run time
-  if (DYNAMIC.test(expandVars(sub, ctx.vars))) return deny(RUN_TIME_SUBCOMMAND);
+  // The subcommand must be written literally: `git $X origin main` (even with X=push on the line), `git "$(printf push)"`,
+  // `git ${X}${Y:-sh}` — what git does is decided by a value the checks below would never see.
+  if (DYNAMIC.test(sub)) return deny(RUN_TIME_SUBCOMMAND);
 
   // aliases defined on this very line (`git config alias.p push && git p …`, `git -c alias.p=push p …`)
   const aliasConfig = g.configs.find((c) => c.key === `alias.${sub.toLowerCase()}`);
@@ -591,11 +597,13 @@ function checkApi(rest, env, dir, ctx) {
 }
 
 function checkGh(argv, env, dir, ctx, raw, level = 0) {
+  // The group and verb must be written literally (`gh pr $X`, `gh pr ${X%-base}`, `gh pr "$(printf merge)"`): a variable's
+  // value on the line is not proof — `X=merge; true || X=view; gh pr $X` runs merge.
+  const written = splitGh(argv.slice(1));
+  if ((written.group !== undefined && DYNAMIC.test(written.group)) || (written.verb !== undefined && DYNAMIC.test(written.verb))) return deny(RUN_TIME_SUBCOMMAND);
   const args = argv.slice(1).map((a) => expandVars(a, ctx.vars));
   const { group, verb, rest } = splitGh(args);
   if (!group) return null;
-  // `gh pr ${X%-base}` / `gh pr "$(printf merge)"`: what gh will do is only known at run time
-  if (DYNAMIC.test(group) || (verb !== undefined && DYNAMIC.test(verb))) return deny(RUN_TIME_SUBCOMMAND);
 
   // aliases: `gh alias set NAME EXPANSION` is checked as if it ran, and a name defined on this line is expanded
   if (group === 'alias' && verb === 'set') {
@@ -759,7 +767,7 @@ function evalString(str, startDir, ctx, level) {
     if (VAR_BUILTINS.includes(name)) {
       for (const a of argv.slice(1)) {
         const m = /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/.exec(a);
-        if (m) ctx.vars[m[1]] = m[2];
+        if (m) setVar(ctx, m[1], m[2]);
       }
     } else if (name === 'cd' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name, argv, ctx);
     else if (name === 'git') verdict = checkGit(argv, c.env, dir, ctx, c.raw ?? '');
@@ -801,7 +809,7 @@ export function evaluateGitCommand(command, {
   const base = cwd || process.cwd();
   const ctx = {
     cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, fullText: text,
-    vars: Object.create(null), gitAliases: Object.create(null), ghAliases: Object.create(null),
+    vars: Object.create(null), unsureVars: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
     branches: new Map(), cfgDirty: false, envCfgDirty: false,
   };
   return evalString(text, path.resolve(base), ctx, 0);
