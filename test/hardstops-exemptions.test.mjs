@@ -544,6 +544,35 @@ test('Python brackets are counted outside strings and comments: a quoted bracket
   assert.deepEqual(rules([file('app/views.py', { added: ['    views,'], at: 3 })], { headFiles: new Map([['app/views.py', clean.join('\n')]]) }), []);
 });
 
+test('whole-file import reading covers every language the parser reads (.mdx, Ruby Gemfile): only the specifier line changed', async () => {
+  const cases = [
+    ['docs-site/page.mdx', 'import {\n  helper\n} from\n  \'./ok\'\n', 'import {\n  helper\n} from\n  \'../tests/helper\'\n'],
+    ['Gemfile', 'require\n  \'./ok\'\n', 'require\n  \'./spec/support/x\'\n'],
+  ];
+  for (const [name, before, after] of cases) {
+    const repo = await reverseRepo({ [name]: before });
+    repo.write(name, after);
+    repo.commit(`edit ${name}`);
+    const hits = await collectWith(repo);
+    assert.ok(hits.some((h) => h.rule === 'R0-unscannable' && h.file === name), `${name}: ${JSON.stringify(hits.map((h) => [h.rule, h.file]))}`);
+  }
+});
+
+test('the string-blind Python fallback reads heads anywhere on a line and ignores brackets in comments', () => {
+  const desync = 'v = f"{d["("]}"';
+  const cases = [
+    [desync, 'x = 1; from app import (', '    tests,', ')'],
+    [desync, 'if c: from app import (', '    tests,', ')'],
+    [desync, 'from app import (  # see foo()', '    tests,', ')'],
+    [desync, 'from app import (', '    views,  # x)', '    tests,', ')'],
+  ];
+  for (const lines of cases) {
+    const at = lines.findIndex((l) => l.includes('tests')) + 1;
+    const hits = run([file('app/views.py', { added: [lines[at - 1]], at })], { headFiles: new Map([['app/views.py', lines.join('\n')]]) });
+    assert.deepEqual(rulesOf(hits), ['R0-unscannable'], lines.join(' / '));
+  }
+});
+
 test('a large file the import parser does not read (data, lockfile) is not unscannable for its size', async () => {
   const repo = await reverseRepo({ 'README.md': 'x\n' });
   repo.write('data/catalog.csv', 'a,b\n'.repeat(700_000));
