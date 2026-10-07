@@ -591,6 +591,19 @@ test('a scoped specifier is an npm package only when package.json declares it (n
   sneaky.write('lib/pay.ts', "import h from '@shared/tests';\n");
   sneaky.commit('declare and import');
   assert.ok((await collectWith(sneaky)).some((h) => h.rule === 'R0-unscannable' && h.file === 'lib/pay.ts'));
+  // base already declares it, but the diff redirects the name (workspaces + tests/package.json): no exemption for this diff
+  const redirect = await reverseRepo({ 'package.json': JSON.stringify({ dependencies: { '@shared/tests': '^1.0.0' } }), 'lib/pay.ts': 'export {};\n' });
+  redirect.write('package.json', JSON.stringify({ workspaces: ['tests'], dependencies: { '@shared/tests': '^1.0.0' } }));
+  redirect.write('tests/package.json', JSON.stringify({ name: '@shared/tests', version: '1.0.0' }));
+  redirect.write('lib/pay.ts', "import h from '@shared/tests';\n");
+  redirect.commit('redirect through a workspace');
+  assert.ok((await collectWith(redirect)).some((h) => h.rule === 'R0-unscannable' && h.file === 'lib/pay.ts'));
+  // the same for a tsconfig change alone
+  const alias = await reverseRepo({ 'package.json': JSON.stringify({ dependencies: { '@shared/tests': '^1.0.0' } }), 'lib/pay.ts': 'export {};\n' });
+  alias.write('tsconfig.json', JSON.stringify({ compilerOptions: { paths: { '@shared/tests': ['./tests'] } } }));
+  alias.write('lib/pay.ts', "import h from '@shared/tests';\n");
+  alias.commit('alias through tsconfig');
+  assert.ok((await collectWith(alias)).some((h) => h.rule === 'R0-unscannable' && h.file === 'lib/pay.ts'));
 });
 
 test('production code importing a test runner config is flagged (a config is not a bridge); only exact config names count', () => {
