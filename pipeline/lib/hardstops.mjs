@@ -17,12 +17,28 @@
 //  * Content rules (SQL, auth, secrets, env, sensitive terms) judge PRODUCTION code only: not tests, not documentation.
 //    "Documentation" is a file that cannot execute (markdown, text, images, pdf); under docs/ a .ts/.js/.sql module is
 //    still code, because production code can import it. Test files are exempt from every content rule EXCEPT key-shaped
-//    secret literals (a real key committed in a fixture leaks all the same), and production code that imports a test
-//    module is flagged (R0-unscannable), since an exempt file wired into production would never be judged.
+//    secret literals (a real key committed in a fixture leaks all the same; a "fake" marker counts only when it sits in the
+//    credential token itself, never in a comment or a neighbouring name on the line).
 //    Path rules and the R1 migration rules judge every file.
+//  * An exempt file wired into production would never be judged, so BOTH directions are flagged (R0-unscannable):
+//      - forward: an added live line in production code imports one. Each import specifier on the line (JS/TS `from`,
+//        `import`, `import()`, `require()`; Python `from a.b import` / `import a.b`; Ruby `require` / `require_relative`
+//        / `load`) is turned into every repo path it could name (relative: resolved against the importing file; otherwise
+//        from the root, with `@/` `~/` `#/` `@@/` stripped and every path-segment suffix; Python dotted -> slash path; each
+//        with source extensions and `/index`, `/__init__`) and flagged when ANY of them passes the SAME test-file predicate the
+//        exemption uses, so no spelling of a path can reach an exempt location unseen. Over-matching is the safe direction.
+//      - reverse: the PR edits an exempt test file that production code at head ALREADY imports (the importing line is not in
+//        the diff, so the forward check never sees it): one grep of the head tree finds import lines naming the changed
+//        files, the same resolver says which really reach them. A grep that fails or returns too much flags every changed test file.
 //  * Content that MOVES is judged too: a rename from an exempt path (test, docs) into production code carries lines the
-//    diff does not show (R0-unscannable), and a symlink (mode 120000) can make a production path serve a file from an
-//    exempt one (R4-pipeline).
+//    diff does not show (R0-unscannable), and a symlink (mode 120000) or submodule (160000) can make a production path serve
+//    a file from an exempt one or point at unreviewed code (R4-pipeline). A 100% rename has no mode line in the unified
+//    diff, so symlink / gitlink are read from the old and new tree modes (`git diff --raw`), not from diff headers.
+//  * Binary assets (images, fonts, media, pdf, svg, snapshots) are accepted unread. Archives and blobs (.zip .gz .tgz .bin)
+//    and .wasm are not: code that extracts or loads an existing one runs whatever replaces it, with no source line to read.
+//    An archive is accepted only as a test fixture (every path of the change a test file); anything else is R0-unscannable.
+//  * A pure mode change (chmod) is NOT a finding: it adds no unjudged content, since the file's content was judged when it
+//    was added (and a change to or from a symlink or submodule mode is caught above).
 //  * SQL keyword rules run on comment-stripped text; the stripper is string-aware and only carries a block comment across
 //    CONSECUTIVE added lines (a gap means we cannot know the state, so we assume code). In non-SQL code, SQL lives in
 //    strings, so only multi-word forms are matched there (no bare "grant" or "truncate").

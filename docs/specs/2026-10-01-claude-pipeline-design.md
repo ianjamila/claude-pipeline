@@ -796,6 +796,11 @@ Recheck: resolved 1, 2, 6, 11, 13, P3-order; partial 3, 4, 5, 7, 8, 9, 10, 12; t
   approver did not review. Regression: approve A, B already had check suites from before the approval -> B red.
 - **R7″ Exemptions are judged by what can run.** `docs/**` exempts only non-executable documentation (md, txt, rst, adoc,
   images, pdf); a module under docs/ is code (importable via a root alias), `.mdx` is code everywhere, a `.md` under
-  `app/` or `pages/` is a page. Test files keep one content rule: key-shaped secret literals not marked fake (no JWT
-  or Vault: local-stack fixtures). Production code that imports a test module, a rename from an exempt path into
-  production code (a 100% rename shows no lines), a symlink (mode 120000) and a `.wasm` binary are hits.
+  `app/` or `pages/` is a page. Test files keep one content rule: key-shaped secret literals not marked fake IN the
+  credential token itself (a comment or neighbouring name on the line does not count; no JWT or Vault: local-stack
+  fixtures). Production code that imports a test module (every import specifier is resolved to the repo paths it could
+  name and judged by the same test-file predicate, for JS/TS, Python and Ruby), an edit to an exempt file that production
+  at head already imports (a reverse search; fails closed), a rename from an exempt path into production code (a 100%
+  rename shows no lines), a symlink or submodule entry (read from tree modes, so a 100% rename cannot hide one), and a
+  `.wasm` or archive (`.zip .gz .tgz .bin`, accepted only as a test fixture) binary are hits. A pure mode change
+  (chmod) is not: it adds no content that was not judged when the file was added.
