@@ -606,3 +606,82 @@ test('a code file over ~2 MB is unscannable for imports (fails closed), forward 
   assert.deepEqual(hits2.map((h) => [h.rule, h.file]), [['R0-unscannable', 'tests/helper.ts']]);
   assert.match(hits2[0].detail, /could not be checked \(the search failed: .*larger than/);
 });
+
+// ---- review round 5: comments between tokens, docs as code, Python package initializers, require_relative, more extensions ----
+
+const COMMENT_BETWEEN = [
+  "import { wipe } from /* annotation */ '../tests/helper.js'", "const m = await import(/* webpackMode: 'eager' */ '../tests/helper.js')",
+  "const h = require(/* x */ '../spec/x')", "const h = require(/* a", " b */ '../spec/x')",
+];
+test('a block comment between the tokens of an import leaves the specifier readable: forward and reverse', async () => {
+  for (const line of COMMENT_BETWEEN.slice(0, 3)) assert.deepEqual(rules([file('lib/pay.ts', { added: [line] })]), ['R0-unscannable'], line);
+  assert.deepEqual(rules([file('lib/pay.ts', { added: COMMENT_BETWEEN.slice(3) })]), ['R0-unscannable'], 'multi-line comment');
+  const { importSpecifiers } = await import('../pipeline/lib/hardstops.mjs');
+  assert.deepEqual(importSpecifiers(COMMENT_BETWEEN[0], 'lib/pay.ts').map((x) => x.spec), ['../tests/helper.js']);
+  const repo = await reverseRepo({ 'tests/helper.ts': 'export const wipe = 1;\n', 'lib/pay.ts': COMMENT_BETWEEN[1] + '\n' });
+  repo.write('tests/helper.ts', EVIL_BODY);
+  repo.commit('edit');
+  assert.deepEqual((await collectWith(repo)).map((h) => h.file), ['tests/helper.ts']);
+  // an unclosed comment opener is left alone and cannot hide a later import
+  assert.deepEqual(rules([file('lib/pay.ts', { added: ["// see /* here", "import x from '../tests/h'"] })]), ['R0-unscannable']);
+});
+
+test('non-code documentation is reachable code (require loads .md/.txt as JavaScript): importing it is flagged forward, and editing one production already imports is flagged in reverse', async () => {
+  for (const line of ["const h = require('../docs/helper.md')", "import x from './docs/note.txt'", "const r = require('../README.md')", "import x from '@/docs/guide.rst'"]) {
+    assert.deepEqual(rules([file('lib/pay.ts', { added: [line] })]), ['R0-unscannable'], line);
+  }
+  assert.deepEqual(rules([file('lib/pay.ts', { added: ["import x from './docs/note'", "import y from '../lib/docs-helper'"] })]), []);
+  const repo = await reverseRepo({
+    'docs/helper.md': 'module.exports = 1;\n', 'docs/guide.md': 'guide\n', 'README.md': 'read me\n',
+    'lib/pay.ts': "const h = require('../docs/helper.md');\nconst r = require('../README.md');\n",
+  });
+  repo.write('docs/helper.md', 'module.exports = require("child_process").execSync("id");\n');
+  repo.write('docs/guide.md', 'a changed guide nobody imports\n');
+  repo.write('README.md', 'changed readme\n');
+  repo.commit('edit docs');
+  const hits = await collectWith(repo);
+  assert.deepEqual(hits.map((h) => h.file).sort(), ['README.md', 'docs/helper.md']);
+  assert.match(hits[0].detail, /production code \(lib\/pay\.ts:\d\) already imports this test\/docs file/);
+});
+
+test('importing a Python module runs every package initializer on its path: forward and reverse', async () => {
+  const config = cfg({ test_globs: ['tests/__init__.py'] });
+  assert.deepEqual(rulesOf(run([file('app/views.py', { added: ['from tests.helper import wipe'] })], { config })), ['R0-unscannable']);
+  assert.deepEqual(rulesOf(run([file('app/views.py', { added: ['import tests.helper.deep'] })], { config })), ['R0-unscannable']);
+  assert.deepEqual(rulesOf(run([file('app/views.py', { added: ['from other.helper import wipe'] })], { config })), []);
+  const repo = await reverseRepo({ 'pkg/tests/__init__.py': 'x = 1\n', 'pkg/tests/helper/deep.py': 'x = 1\n', 'app/views.py': 'from pkg.tests.helper.deep import wipe\n' });
+  repo.write('pkg/tests/__init__.py', 'import os; os.system("id")\n');
+  repo.commit('edit the package initializer only');
+  assert.deepEqual((await collectWith(repo)).map((h) => h.file), ['pkg/tests/__init__.py']);
+  const rel = await reverseRepo({ 'tests/__init__.py': 'x = 1\n', 'app/views.py': 'from ..tests.helper import wipe\n' });
+  rel.write('tests/__init__.py', 'import os; os.system("id")\n');
+  rel.commit('edit');
+  assert.deepEqual((await collectWith(rel)).map((h) => h.file), ['tests/__init__.py']);
+});
+
+test('Ruby require_relative resolves against the requiring file (lib/), require against the load path', async () => {
+  const repo = await reverseRepo({ 'lib/helper_spec.rb': 'x = 1\n', 'other/helper_spec.rb': 'x = 1\n', 'lib/main.rb': "require_relative 'helper_spec'\n" });
+  repo.write('lib/helper_spec.rb', 'system("id")\n');
+  repo.write('other/helper_spec.rb', 'system("id")\n');
+  repo.commit('edit both');
+  assert.deepEqual((await collectWith(repo)).map((h) => h.file), ['lib/helper_spec.rb']); // not other/: it is not next to lib/main.rb
+  const req = await reverseRepo({ 'lib/helper_spec.rb': 'x = 1\n', 'lib/main.rb': "require 'helper_spec'\n" });
+  req.write('lib/helper_spec.rb', 'system("id")\n');
+  req.commit('edit');
+  assert.deepEqual((await collectWith(req)).map((h) => h.file), ['lib/helper_spec.rb']);
+  const { importCandidates } = await import('../pipeline/lib/hardstops.mjs');
+  assert.ok(importCandidates('helper_spec', 'lib/main.rb', { ruby: 'rel' }).some((c) => c.path === 'lib/helper_spec.rb' && c.mode === 'exact'));
+});
+
+test('every source extension the parser reads is a candidate extension (.mdx, .astro, .vue, .svelte): editing tests/helper.mdx that production imports as ../tests/helper is flagged', async () => {
+  for (const ext of ['mdx', 'astro', 'vue', 'svelte', 'pyi', 'rake']) {
+    const repo = await reverseRepo({ [`tests/helper.${ext}`]: 'x\n', 'lib/pay.ts': "import h from '../tests/helper';\n" });
+    repo.write(`tests/helper.${ext}`, 'changed\n');
+    repo.commit('edit');
+    assert.deepEqual((await collectWith(repo)).map((h) => h.file), [`tests/helper.${ext}`], ext);
+  }
+  const repo = await reverseRepo({ 'tests/helper/index.mdx': 'x\n', 'lib/pay.ts': "import h from '../tests/helper';\n" });
+  repo.write('tests/helper/index.mdx', 'changed\n');
+  repo.commit('edit');
+  assert.deepEqual((await collectWith(repo)).map((h) => h.file), ['tests/helper/index.mdx']);
+});
