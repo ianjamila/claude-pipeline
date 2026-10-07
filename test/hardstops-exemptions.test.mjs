@@ -508,6 +508,23 @@ test('a bracketed Python import stays one statement however many blank or commen
   assert.deepEqual((await collectWith(repo)).map((h) => h.file), ['app/tests/__init__.py']);
 });
 
+test('a string syntax the tokenizer does not model (PEP 701 f-strings) cannot hide a bracketed or continued Python import (string-blind fallback)', () => {
+  const cases = [
+    ['v = f"{d["("]}"', 'from app import (', '    tests,', ')'],
+    ['v = f"{"\'\'\'"}"', 'from app import (', '    tests,', ')'],
+    ['v = f"{"\'\'\'"}"', 'import os, \\', '    tests.helper'],
+  ];
+  for (const lines of cases) {
+    const at = lines.findIndex((l) => l.includes('tests')) + 1;
+    const hits = run([file('app/views.py', { added: [lines[at - 1]], at })], { headFiles: new Map([['app/views.py', lines.join('\n')]]) });
+    assert.deepEqual(rulesOf(hits), ['R0-unscannable'], lines.join(' / '));
+  }
+  // an edit to the head line alone still reaches the names below it
+  const headOnly = ['v = f"{d["("]}"', 'from app import (', '    tests,', ')'];
+  const hits = run([file('app/views.py', { added: [headOnly[1]], at: 2 })], { headFiles: new Map([['app/views.py', headOnly.join('\n')]]) });
+  assert.deepEqual(rulesOf(hits), ['R0-unscannable']);
+});
+
 test('Python brackets are counted outside strings and comments: a quoted bracket or an open docstring cannot desync the statement', () => {
   const cases = [
     ['x = "("', 'from app import (', '    tests,', ')'],
@@ -525,6 +542,14 @@ test('Python brackets are counted outside strings and comments: a quoted bracket
   // clean statements around strings stay clean
   const clean = ['x = "("', 'from app import (', '    views,', ')'];
   assert.deepEqual(rules([file('app/views.py', { added: ['    views,'], at: 3 })], { headFiles: new Map([['app/views.py', clean.join('\n')]]) }), []);
+});
+
+test('a large file the import parser does not read (data, lockfile) is not unscannable for its size', async () => {
+  const repo = await reverseRepo({ 'README.md': 'x\n' });
+  repo.write('data/catalog.csv', 'a,b\n'.repeat(700_000));
+  repo.commit('add a large data file');
+  const hits = await collectWith(repo);
+  assert.ok(!hits.some((h) => /larger than/.test(h.detail ?? '')), JSON.stringify(hits.map((h) => [h.rule, h.file, h.detail])));
 });
 
 test('a code file over ~2 MB is unscannable for imports (fails closed), forward and reverse', async () => {

@@ -629,6 +629,44 @@ function pythonStatements(lines) {
   return segs;
 }
 
+// A string-BLIND fallback for Python: every `from X import (` runs to the first line containing `)`, and every line ending in a
+// backslash is joined with the next, ignoring string state entirely. The tokenizer above can be desynced by string syntax it does
+// not model (PEP 701 f-strings reuse their own quote inside `{...}`: `f"{d["("]}"`); this reading cannot, because it reads no
+// strings. Over-joining here only ever adds candidates. One linear pass: the head of the open statement (`from X import` or
+// `import`) is carried, and each continuation line becomes its own short `<head> <names>` segment, so no file shape can make it
+// quadratic and no padding (blank or comment lines) can separate a name from its head.
+const PY_BRACKET_FROM = /^\s*(from\s+\.*[\w.]*\s+import)\s*\(/;
+const PY_HEAD = /^\s*(from\s+\.*[\w.]*\s+import|import)\s/;
+function pythonImportFallback(lines) {
+  const segs = [];
+  let head = null; // the head of the statement still open on this line
+  let bracket = false; // open through `(` (until a `)`) rather than through a trailing backslash
+  let headLine = 0; // 1-based line of the head: each segment spans head..this line, so an edit to the head alone counts too
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const names = line.replace(/#.*$/, '').replace(/\\\s*$/, '');
+    if (head !== null) {
+      segs.push({ text: `${head} ${names.replace(/[()]/g, ' ').trim()}`, from: headLine, to: i + 1 });
+      if (bracket ? line.includes(')') : !/\\\s*$/.test(line)) head = null;
+      continue;
+    }
+    const b = PY_BRACKET_FROM.exec(line);
+    if (b && !line.slice(line.indexOf('(')).includes(')')) {
+      head = b[1];
+      bracket = true;
+      headLine = i + 1;
+    } else if (/\\\s*$/.test(line)) {
+      const h = PY_HEAD.exec(line);
+      if (h) {
+        head = h[1];
+        bracket = false;
+        headLine = i + 1;
+      }
+    }
+  }
+  return segs;
+}
+
 // Every import in an array of source lines, with the line range it spans. Three readings, unioned: the lines joined (an import
 // split over lines is one import), each line alone (nothing earlier can swallow it), and for Python the logical statements.
 function scanImports(lines, file) {
@@ -641,7 +679,10 @@ function scanImports(lines, file) {
   };
   take(scanSegments(one, file));
   for (const g of one) if (g.text !== '') take(scanSegments([g], file));
-  if (PY_FILE.test(file)) take(scanSegments(pythonStatements(lines), file));
+  if (PY_FILE.test(file)) {
+    take(scanSegments(pythonStatements(lines), file));
+    for (const g of pythonImportFallback(lines)) take(scanSegments([g], file));
+  }
   return [...found.values()];
 }
 
@@ -1476,6 +1517,8 @@ const MAX_CHAIN_ROUNDS = 5;
 const MAX_CHAIN_FILES = 300;
 const READ_BATCH = 200;
 const MAX_HEAD_TEXT = 2_000_000;
+// The same source languages as CODE_PATHSPECS, as a path test (whole-file import reading applies only to these).
+const IMPORT_SOURCE = new RegExp(`\\.(?:${CODE_PATHSPECS.map((s) => s.slice(2)).join('|')})$`, 'i');
 const stem = (p) => {
   const b = baseName(p);
   const dot = b.lastIndexOf('.');
@@ -1735,6 +1778,9 @@ export async function collectHardStops({ base, head, cwd, config, maxImporterHit
   const tooBig = [];
   for (const d of ds) {
     if (!d.addedIsCode || d.binary || d.symlink || d.gitlink || !d.newPath || d.added.length === 0) continue;
+    // Only languages the import parser reads: a 3 MB lockfile or data file must not turn every dependency PR into R0.
+    // Other files keep the per-added-line import pass.
+    if (!IMPORT_SOURCE.test(d.newPath)) continue;
     const text = showFile(head, d.newPath, o);
     if (text === null) continue;
     if (text.length <= MAX_HEAD_TEXT) headFiles.set(d.file, text);
