@@ -776,23 +776,38 @@ Recheck: resolved 1, 2, 6, 11, 13, P3-order; partial 3, 4, 5, 7, 8, 9, 10, 12; t
   workflow ran from) is on the default branch (`compare/<head_sha>...<default>` is `identical` or `ahead`). Because
   the poster of a status chooses its `target_url`, the run must also be ABOUT this verdict: `pull_requests` lists this
   PR number at the status's sha with `base.ref` = the default branch (an empty list is untrusted, fail closed), and the
-  status was created within the run's `[run_started_at, updated_at]` window (10 s slack). `base.ref` is mandatory: "ancestor
+  status was created within the run's `[created_at, updated_at]` window (10 s slack; the lower bound is the run's creation, i.e. the event time, because a queued run can start long after the labeling it answers) and the run is `run_attempt` 1 (a re-run can execute an OLDER guard revision from an old main tip and post a fresh success over a newer failure, so re-runs never count: push a commit or close and reopen the PR to run the guards again). `base.ref` is mandatory: "ancestor
   of main" alone allows a DOWNGRADE, since a side branch cut from an old main commit runs an old, weaker guard yet is an
   ancestor of main, whereas a `pull_request_target` run for a PR INTO main always runs main's tip at event time. For a
   receipt the description must name the label and the approver of the latest `labeled` event (`<label> approved by
   <login>`) and that event must fall inside the run's window (the run API does not expose the action). Run reads are
-  cached per run id. Anything unreadable fails closed (`lib/guard-provenance.mjs`). **Remaining race (issue #3,
-  https://github.com/ianjamila/claude-pipeline/issues/3, a verdict artifact bound to the run):** a spoofing run from a side
-  base branch can still post, while a genuine run for the same PR and head is in progress, a status pointing at that
-  genuine run, because nothing ties a status to the run that wrote it except the run's URL; not built here. The final gate reads the latest status itself (not the row link) and applies the same check to a passing
-  `Test integrity` / `Hard-stop scan` row. The template has no `branches:` filter: it cannot know the default branch,
+  cached per run id. Anything unreadable fails closed (`lib/guard-provenance.mjs`). **Verdict artifact (closes the race of
+  issue #3, https://github.com/ianjamila/claude-pipeline/issues/3):** all of the above is data a spoofing run (a PR into a
+  side branch with an edited workflow, same head sha) can satisfy by pointing its status at a genuine run of the same PR
+  and head that is still in progress, and the agent can open that window on demand (`gh run rerun`, close/reopen,
+  ready/draft). So the guard job is split in two phases around an upload: `Evaluate` (`ci-guards-run.mjs`) posts the
+  receipt (if any), judges, and writes `verdict.json` plus the step output `artifact` = `pipeline-verdict_v1_<head>_<integrity>_<hardstops>`
+  (plus `_<label>_<login>` when this run posted a receipt; states success|failure|error); `Upload verdict`
+  (`actions/upload-artifact`, pinned by SHA, `overwrite: false`, 90 days) attaches it to THIS run; `Publish`
+  (`ci-guards-run.mjs --publish`) re-checks that the PR head is still the verdict's (else the superseded error statuses),
+  posts the two statuses, and only then removes invalid approval labels. A status counts only if the run it points at carries a verdict
+  artifact for that head whose state for that check is `success`; a receipt of another run counts only if that run's artifact
+  names the label and the approver of the latest labeling. A spoofing run cannot add an artifact to somebody else's run, so it
+  can only point at a run whose own verdict is the one it claims; a run with no artifact (in progress, cancelled before
+  the upload) fails closed. The current run's own receipt has no artifact yet, so it is trusted in-process from a record of
+  what this process posted, and an API-read receipt whose url is the current run is never accepted. The final gate
+  reads the latest status itself (not the row link) and applies the same check, plus the artifact, to a passing
+  `Test integrity` / `Hard-stop scan` row; it collects those rows from every requirement source (GitHub-required, named in
+  `ci.required_checks`, examined), so a guard row GitHub does not require but the config names is verified too. The workflow
+  needs `actions: read` to read runs and artifacts in a private repo. The template has no `branches:` filter: it cannot know the default branch,
   and a filter in the base copy protects nothing against a branch that carries its own copy of the file. Stacked PRs
   (base = a non-default branch) therefore never get a verifiable approval; they fail closed. `guard-git` also denies
   writes to `repos/*/statuses/*` and the checks API so an agent cannot post such statuses itself (GraphQL mutations
   were already allowlisted). If a newer event cancels the labeled run
-  before the receipt is posted, the approval simply does not count (fail closed). Residuals: the workflow token is the
+  before the receipt is posted, the approval simply does not count (fail closed). Residuals: the code of the genuine job is the
   trust anchor (code that can post statuses as `github-actions[bot]`, e.g. a same-repo PR's own workflow with
-  `statuses: write`, could equally post the required statuses directly); a stale browser tab can label a head the
+  `statuses: write`, could equally post the required statuses directly, but then lacks the artifact the gate demands; a
+  workflow with `actions: write` can delete a genuine artifact, which only fails closed); a stale browser tab can label a head the
   approver did not review. Regression: approve A, B already had check suites from before the approval -> B red.
 - **R7″ Exemptions are judged by what can run.** `docs/**` exempts only non-executable documentation (md, txt, rst, adoc,
   images, pdf); a module under docs/ is code (importable via a root alias), `.mdx` is code everywhere, a `.md` under

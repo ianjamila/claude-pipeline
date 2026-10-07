@@ -111,13 +111,15 @@ that `labeled` event first posts a receipt on the PR's head commit (a commit sta
 created by `github-actions[bot]`, description "approved by <you>", target_url = the guard run, bound to this PR, head and moment). The label only counts for
 a commit that carries a receipt that is not older than the label's latest `labeled` event, whose labeler is an allowed
 approver, and whose run is verified: a `pipeline-guards.yml` run triggered by `pull_request_target` from a commit that
-is on the default branch (so a branch with its own edited copy of the workflow cannot mint receipts; the final gate checks
-the two guard statuses the same way). Agents cannot post statuses or check runs themselves (`guard-git`). Commit
+is on the default branch, is a first attempt (a re-run can execute an older guard revision, so re-runs never count), and
+carries a verdict artifact that says the same (so a branch with its own edited copy of the workflow cannot mint receipts, nor
+point a status at a genuine run that is still in progress; the final gate checks the two guard statuses the same way). Agents cannot post statuses or check runs themselves (`guard-git`). Commit
 statuses belong to one sha, so an approval on A never covers a later commit B, however early B appeared elsewhere (another
 branch, a fork PR). A label without a receipt for the current head (a push after approval, or the labeling run was
 cancelled by a newer event before it could post) is ignored with "approval not recorded for this commit — re-apply the
-label" and removed so you can re-add it. Residuals: the workflow token is the trust anchor (anything that can post
-statuses as `github-actions[bot]` can already post the two required statuses itself), and a stale browser tab can label a
+label" and removed so you can re-add it. Residuals: the code of the genuine job is the trust anchor (anything that can post
+statuses as `github-actions[bot]` can already post the two required statuses itself, but cannot give them the artifact the
+gate demands; deleting an artifact only fails closed), and a stale browser tab can label a
 head you did not review (the receipt names the head the event carried).
 
 ## Limits (stated plainly)
