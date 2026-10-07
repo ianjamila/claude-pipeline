@@ -22,8 +22,9 @@
 //    Path rules and the R1 migration rules judge every file.
 //  * An exempt file wired into production would never be judged, so BOTH directions are flagged (R0-unscannable):
 //      - forward: production code adds an import of one. Specifiers are read over the whole new file (an import split over
-//        lines is one import) and count when a line they span was added; comments are skipped, but code after a closed
-//        `/* ... */` is code. Each import specifier (JS/TS `from`,
+//        lines, or a Python bracketed / backslash statement, is one import) and count when a line they span was added; only
+//        line comments (`//`, `#`, `-- `) are skipped, block-comment syntax is not interpreted (code after `*/` or on a line
+//        starting with `*` is code; an import written inside a block comment is flagged too). Each import specifier (JS/TS `from`,
 //        `import`, `import()`, `require()`; Python `from a.b import` / `import a.b`; Ruby `require` / `require_relative`
 //        / `load`) is turned into every repo path it could name (relative: resolved against the importing file; otherwise
 //        from the root, with `@/` `~/` `#/` `@@/` stripped and every path-segment suffix; Python dotted -> slash path; each
@@ -438,6 +439,7 @@ const AUTH_REMOVED = [
   ['middleware matcher', /\bmatcher\s*:/],
 ];
 // A removed comment or a bare string literal ("Forbidden: ask your admin") is not a removed guard.
+const LINE_COMMENT = /^\s*(?:\/\/|--(?:\s|$)|#(?![A-Za-z_$]))/;
 const COMMENT_LINE = /^\s*(?:\/\/|\/\*|--(?:\s|$)|#(?![A-Za-z_$])|\*(?:\s|\/|$))/;
 const STRING_ONLY_LINE = /^\s*(['"`]).*\1[,;]?\s*$/;
 
@@ -492,33 +494,25 @@ const LEGACY_TEST_DIR = /(?:^|\/)(?:__mocks__|__fixtures__|fixtures)\//i;
 const JS_FAMILY = /\.(?:[cm]?[jt]sx?|vue|svelte|astro|mdx)$/i;
 const PY_FILE = /\.pyi?$/i;
 const RB_FILE = /\.(?:rb|rake|gemspec|ru)$|(?:^|\/)(?:Rakefile|Gemfile)$/i;
-const Qs = '[\'"`]';
+// A specifier: a quote, 1..N characters of ANY kind but that quote and a line break, the SAME quote. It cannot swallow a line break
+// or an unclosed quote from earlier text, so an import split over lines, or after a stray `require("` in a comment, still reads.
+const SPEC_Q = String.raw`(['"\`])((?:(?!\1)[^\n\r]){1,${MAX_SPECIFIER}})\1`;
 const JS_IMPORT_FORMS = [
-  new RegExp(String.raw`\bfrom\s*${Qs}([^'"\`]{1,${MAX_SPECIFIER}})${Qs}`, 'g'), // import x from '..' / export * from '..'
-  new RegExp(String.raw`\bimport\s*${Qs}([^'"\`]{1,${MAX_SPECIFIER}})${Qs}`, 'g'), // import '..'
-  new RegExp(String.raw`\b(?:require|import)(?:\.resolve|Actual|Mock)?\s*\(\s*${Qs}([^'"\`]{1,${MAX_SPECIFIER}})${Qs}`, 'g'), // require('..') import('..')
+  new RegExp(String.raw`\bfrom\s*${SPEC_Q}`, 'g'), // import x from '..' / export * from '..'
+  new RegExp(String.raw`\bimport\s*${SPEC_Q}`, 'g'), // import '..'
+  new RegExp(String.raw`\b(?:require|import)(?:\.resolve|Actual|Mock)?\s*\(\s*${SPEC_Q}`, 'g'), // require('..') import('..')
 ];
-const RB_IMPORT_FORM = new RegExp(String.raw`\b(?:require_relative|require|load)\s*\(?\s*${Qs}([^'"\`]{1,${MAX_SPECIFIER}})${Qs}`, 'g');
+const RB_IMPORT_FORM = new RegExp(String.raw`\b(?:require_relative|require|load)\s*\(?\s*${SPEC_Q}`, 'g');
 const PY_FROM = /(?:^|;)\s*from\s+(\.*[A-Za-z_][\w.]*|\.+)\s+import\s+([^#\n]{0,1000})/gm;
 const PY_IMPORT = /(?:^|;)\s*import\s+([^#\n;]{1,1000})/gm;
-const PY_DYNAMIC = new RegExp(String.raw`\b(?:import_module|__import__)\s*\(\s*${Qs}([^'"\`]{1,${MAX_SPECIFIER}})${Qs}`, 'g');
+const PY_DYNAMIC = new RegExp(String.raw`\b(?:import_module|__import__)\s*\(\s*${SPEC_Q}`, 'g');
 
-// What a line says once leading comments are gone, so `/* eslint-disable */ import x from '..'` and `*/ require('..')` are NOT
-// skipped as comments: closed block comments (and the tail of an open one, `*/`) are stripped from the front, and only a line
-// that is nothing but a comment (`// `, `# `, `-- `, an unclosed `/*`, a ` * ` continuation) comes back empty. Over-matching is fine.
+// What a line says once a line comment is gone: `//`, `#` and `-- ` lines read as blank, everything else is read RAW. Block-comment
+// syntax is deliberately not interpreted (`/* eslint-disable */ import x from '..'`, `*/ require('..')` and a generator's
+// `*gen() { return require('..') }` are all code, and a stray `*/` can hide nothing); the price is that an import written inside a
+// block comment is flagged too. Over-matching is the safe direction.
 export function codeOfLine(text) {
-  let i = 0;
-  for (;;) {
-    while (i < text.length && /\s/.test(text[i])) i++;
-    if (text.startsWith('/*', i) || text[i] === '*') {
-      const e = text.indexOf('*/', text[i] === '*' ? i : i + 2);
-      if (e === -1) return '';
-      i = e + 2;
-    } else {
-      const rest = text.slice(i);
-      return COMMENT_LINE.test(rest) ? '' : rest;
-    }
-  }
+  return LINE_COMMENT.test(text) ? '' : text;
 }
 
 // Every module specifier in `text` (any number of lines): [{ spec, py, start, end }] with the match's offsets (py: a dotted
@@ -546,11 +540,11 @@ export function importSpecifiers(text, file) {
   };
   if (isPy) {
     python(text, 0);
-    for (const m of text.matchAll(PY_DYNAMIC)) add(m[1], true, m.index, m[0].length);
+    for (const m of text.matchAll(PY_DYNAMIC)) add(m[2], true, m.index, m[0].length);
     return out;
   }
-  for (const r of JS_IMPORT_FORMS) for (const m of text.matchAll(r)) add(m[1], false, m.index, m[0].length);
-  if (!isJs) for (const m of text.matchAll(RB_IMPORT_FORM)) add(m[1], false, m.index, m[0].length);
+  for (const r of JS_IMPORT_FORMS) for (const m of text.matchAll(r)) add(m[2], false, m.index, m[0].length);
+  if (!isJs) for (const m of text.matchAll(RB_IMPORT_FORM)) add(m[2], false, m.index, m[0].length);
   // A Python import has no quotes; skipping lines that have them keeps `import test from 'node:test'` out of the Python reading.
   let base = 0;
   for (const line of text.split('\n')) {
@@ -560,19 +554,16 @@ export function importSpecifiers(text, file) {
   return out;
 }
 
-// importSpecifiers over an array of source lines (comment-only lines and lines over MAX_LINE read as blank), each result also
-// carrying the 1-based line range it spans: { spec, py, from, to }.
-function scanImports(lines, file) {
+// importSpecifiers over `segments` ([{ text, from, to }]: a piece of source and the 1-based lines it covers), each result
+// carrying the line range of the segments it spans: { spec, py, from, to }.
+function scanSegments(segments, file) {
   const starts = [];
-  const parts = [];
   let pos = 0;
-  for (const l of lines) {
-    const c = l.length > MAX_LINE ? '' : codeOfLine(l);
+  for (const g of segments) {
     starts.push(pos);
-    parts.push(c);
-    pos += c.length + 1;
+    pos += g.text.length + 1;
   }
-  const lineOf = (idx) => {
+  const segOf = (idx) => {
     let lo = 0;
     let hi = starts.length - 1;
     while (lo < hi) {
@@ -580,9 +571,47 @@ function scanImports(lines, file) {
       if (starts[mid] <= idx) lo = mid;
       else hi = mid - 1;
     }
-    return lo + 1;
+    return segments[lo];
   };
-  return importSpecifiers(parts.join('\n'), file).map((m) => ({ spec: m.spec, py: m.py, from: lineOf(m.start), to: lineOf(Math.max(m.start, m.end - 1)) }));
+  return importSpecifiers(segments.map((g) => g.text).join('\n'), file).map((m) => ({
+    spec: m.spec, py: m.py, from: segOf(m.start).from, to: segOf(Math.max(m.start, m.end - 1)).to,
+  }));
+}
+
+// Python statements that span lines (an open bracket, a trailing backslash) as one segment each, so `from pkg import (\n a,\n tests,\n)`
+// is one import whichever of its lines was touched. Over-joining (a bracket inside a string) is covered by the per-line pass.
+const MAX_STATEMENT_LINES = 60;
+function pythonStatements(lines) {
+  const segs = [];
+  for (let i = 0; i < lines.length; ) {
+    const start = i;
+    let text = '';
+    let depth = 0;
+    for (;;) {
+      const raw = lines[i].length > MAX_LINE ? '' : lines[i].replace(/(?:^|\s)#.*$/, '');
+      const cont = /\\\s*$/.test(raw);
+      text += `${text === '' ? '' : ' '}${raw.replace(/\\\s*$/, '')}`;
+      for (const c of raw) depth += c === '(' || c === '[' || c === '{' ? 1 : c === ')' || c === ']' || c === '}' ? -1 : 0;
+      i++;
+      if (i >= lines.length || i - start >= MAX_STATEMENT_LINES || !(depth > 0 || cont)) break;
+    }
+    segs.push({ text, from: start + 1, to: i });
+  }
+  return segs;
+}
+
+// Every import in an array of source lines, with the line range it spans. Three readings, unioned: the lines joined (an import
+// split over lines is one import), each line alone (nothing earlier can swallow it), and for Python the logical statements.
+function scanImports(lines, file) {
+  const one = lines.map((l, i) => ({ text: l.length > MAX_LINE ? '' : codeOfLine(l), from: i + 1, to: i + 1 }));
+  const found = new Map();
+  const take = (list) => {
+    for (const m of list) found.set(`${m.from}\0${m.to}\0${m.py}\0${m.spec}`, m);
+  };
+  take(scanSegments(one, file));
+  for (const g of one) if (g.text !== '') take(scanSegments([g], file));
+  if (PY_FILE.test(file)) take(scanSegments(pythonStatements(one.map((g) => g.text)), file));
+  return [...found.values()];
 }
 
 // The JS extensions a TypeScript-ESM import writes for a file that is really the TS one (`./x.js` -> x.ts).

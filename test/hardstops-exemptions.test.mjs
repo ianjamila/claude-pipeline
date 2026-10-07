@@ -404,10 +404,12 @@ const AFTER_COMMENT = [
   "/* eslint-disable */ import { wipe } from '../tests/helper';", "*/ const h = require('../spec/x')", "/* a */ /* b */ import h from '../tests/h'",
   "/** doc */ const m = await import('../cypress/x')", " * end of a comment */ import h from '../tests/h'",
 ];
-const REAL_COMMENTS = ["/* import h from '../tests/helper' */", " * import h from '../tests/helper'", "// import h from '../tests/helper'", "/*", "# from tests.helper import x", "*/"];
+// Block-comment syntax is not interpreted (an import inside one is flagged too: over-matching is the safe direction); line comments are.
+const REAL_COMMENTS = ["// import h from '../tests/helper'", "/*", "# from tests.helper import x", "*/", "-- import h from '../tests/helper'", "  // require('../spec/x')"];
 test('an import after a closed block comment is code, not a comment: forward and reverse; real comment lines stay quiet', async () => {
   for (const line of AFTER_COMMENT) assert.deepEqual(rules([file('lib/pay.ts', { added: [line] })]), ['R0-unscannable'], line);
   for (const line of REAL_COMMENTS) assert.deepEqual(rules([file('lib/pay.ts', { added: [line] })]), [], line);
+  for (const line of ["/* import h from '../tests/helper' */", " * import h from '../tests/helper'"]) assert.deepEqual(rules([file('lib/pay.ts', { added: [line] })]), ['R0-unscannable'], line);
   assert.deepEqual(rules([file('app/views.py', { added: ['# from tests.helper import x'] })]), []);
   for (const line of AFTER_COMMENT.slice(0, 2)) {
     const repo = await reverseRepo({ 'tests/helper.ts': 'export const wipe = 1;\n', 'spec/x.ts': 'export const a = 1;\n', 'lib/pay.ts': line + '\n' });
@@ -416,4 +418,54 @@ test('an import after a closed block comment is code, not a comment: forward and
     repo.commit('edit');
     assert.deepEqual((await collectWith(repo)).map((h) => h.file), [target], line);
   }
+});
+
+// ---- review round 3: leading `*`, unclosed quotes, Python statements over several lines ----------------------------------------
+
+const STAR_CODE = [
+  "*gen() { return require('../tests/helper') }", "  *require('../tests/x').k", "**(await import('../spec/x')).v", "*gen() { return require('../tests/helper') } /* done */",
+  "a = b */ require('../tests/x'); /* c", "*/ x = 1; /* a */ const h = require('../spec/x')",
+];
+test('a line that merely starts with `*` (generator, multiplication, spread of a call) is code; a later `*/` does not hide what comes before it', async () => {
+  for (const line of STAR_CODE) assert.deepEqual(rules([file('lib/pay.ts', { added: [line] })]), ['R0-unscannable'], line);
+  const repo = await reverseRepo({ 'tests/helper.ts': 'export const wipe = 1;\n', 'lib/pay.ts': STAR_CODE[0] + '\n' });
+  repo.write('tests/helper.ts', EVIL_BODY);
+  repo.commit('edit');
+  assert.deepEqual((await collectWith(repo)).map((h) => h.file), ['tests/helper.ts']);
+});
+
+test('an unclosed quote earlier in the text does not swallow a real import: forward (whole file and added lines) and reverse', async () => {
+  const lines = ['doThing(); // see require("', "const h = require('../tests/helper');", 'const s = "from \'";', "import x from '../spec/x';"];
+  assert.deepEqual(rules([file('lib/pay.ts', { added: lines })]), ['R0-unscannable']);
+  const hits = run([file('lib/pay.ts', { added: [lines[1]], at: 2 })], { headFiles: new Map([['lib/pay.ts', lines.join('\n')]]) });
+  assert.deepEqual(rulesOf(hits), ['R0-unscannable']);
+  assert.equal(hits[0].line, 2);
+  const repo = await reverseRepo({ 'tests/helper.ts': 'export const wipe = 1;\n', 'lib/pay.ts': lines.slice(0, 2).join('\n') + '\n' });
+  repo.write('tests/helper.ts', EVIL_BODY);
+  repo.commit('edit');
+  assert.deepEqual((await collectWith(repo)).map((h) => h.file), ['tests/helper.ts']);
+  // the specifier itself is read cleanly (the resolver's tail matching alone would also flag the garbage a swallowing match yields)
+  const { importSpecifiers } = await import('../pipeline/lib/hardstops.mjs');
+  assert.deepEqual(importSpecifiers(lines.join('\n'), 'lib/pay.ts').map((x) => x.spec).sort(), ['../spec/x', '../tests/helper']);
+  // a specifier never spans a line break, and its closing quote must match its opening one
+  assert.deepEqual(rules([file('lib/pay.ts', { added: ["const t = from('", "tests/helper');"] })]), []);
+});
+
+test('Python imports split over lines (brackets, backslashes) are one statement: forward by whichever line was added, and reverse', async () => {
+  const paren = ['from pkg import (', '    models,', '    tests,', ')'];
+  const slash = ['import os, \\', '    tests.helper'];
+  assert.deepEqual(rules([file('app/views.py', { added: paren })]), ['R0-unscannable']);
+  assert.deepEqual(rules([file('app/views.py', { added: slash })]), ['R0-unscannable']);
+  // only one line inside an existing block was added
+  for (const [lines, at] of [[paren, 3], [slash, 2], [['from pkg import (', '    models,', '    tests,', ')'], 3]]) {
+    const hits = run([file('app/views.py', { added: [lines[at - 1]], at })], { headFiles: new Map([['app/views.py', lines.join('\n')]]) });
+    assert.deepEqual(rulesOf(hits), ['R0-unscannable'], lines.join(' / '));
+  }
+  // an unrelated added line in the same file stays quiet, and a clean statement over lines stays quiet
+  assert.deepEqual(rules([file('app/views.py', { added: ['x = 1'], at: 6 })], { headFiles: new Map([['app/views.py', [...paren, '', '', 'x = 1'].join('\n')]]) }), []);
+  assert.deepEqual(rules([file('app/views.py', { added: ['from pkg import (', '    models,', '    views,', ')'] })]), []);
+  const repo = await reverseRepo({ 'tests/helper.py': 'def wipe(): pass\n', 'app/views.py': slash.join('\n') + '\n' });
+  repo.write('tests/helper.py', 'def wipe(): delete_everything()\n');
+  repo.commit('edit');
+  assert.deepEqual((await collectWith(repo)).map((h) => h.file), ['tests/helper.py']);
 });
