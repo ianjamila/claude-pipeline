@@ -722,3 +722,143 @@ test('a cli transcript cut off mid-answer fails the proof itself (no stop_reason
   assert.match(cut.errors.join(), /no complete JSON answer/);
   assert.throws(() => extractJsonBlock(cut.finalAssistantText), /no JSON found/);
 });
+
+// ---------- hand-back finals: the report is delivered by a SubagentHandback tool call, not a text message ----------
+
+const HB_ID = 'toolu_hb';
+const HB_MESSAGE = '```json\n{"rulings":[{"id":"R1-S1"}]}\n```\n\nFree prose after the fence.';
+const hbBlock = ({ id = HB_ID, name = 'SubagentHandback', input = { message: HB_MESSAGE } } = {}) => [{ type: 'tool_use', id, name, input }];
+const hbLine = ({ id = 'msg_hb', stop = null, toolId = HB_ID, name, input, content, ...rest } = {}) =>
+  asstLine({ id, stop, content: content ?? hbBlock({ id: toolId, name, input }), ...rest });
+const ackLine = ({ toolUseId = HB_ID, isError, toolUseResult = { success: true, message: 'Report delivered to your caller.' }, toolEndsTurn = true, content } = {}) =>
+  JSON.stringify({
+    type: 'user',
+    ...(toolEndsTurn === undefined ? {} : { toolEndsTurn }),
+    ...(toolUseResult === undefined ? {} : { toolUseResult }),
+    message: {
+      role: 'user',
+      content: content ?? [{ tool_use_id: toolUseId, type: 'tool_result', ...(isError === undefined ? {} : { is_error: isError }), content: [{ type: 'text', text: '{"success":true}' }] }],
+    },
+  });
+const thinkingLine = (id = 'msg_hb') => asstLine({ id, stop: null, content: THINKING });
+const handback = (over = {}) => [userLine('p'), thinkingLine(), hbLine(over)];
+
+test('a hand-back final answer (thinking line, SubagentHandback call, acknowledgment) proves ok and delivers the message', () => {
+  const r = proveText([...handback(), ackLine()]);
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.ok, true);
+  assert.equal(r.finalVia, 'handback');
+  assert.equal(r.finalAssistantText, HB_MESSAGE);
+  assert.equal(r.finalStopReason, null);
+  assert.equal(r.stopReasonMissing, true);
+  const rulings = extractJsonBlock(r.finalAssistantText);
+  assert.equal(rulings.rulings[0].id, 'R1-S1', 'JSON is found even with prose after the fence');
+});
+
+test('a hand-back needs no JSON answer-check when stop_reason is tool_use, and a matching wireToolInputs entry is fine', () => {
+  const message = 'plain prose, no JSON';
+  const r = proveText([userLine('p'), hbLine({ stop: 'tool_use', input: { message }, wireToolInputs: { [HB_ID]: { message } } }), ackLine()]);
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.finalVia, 'handback');
+  assert.equal(r.finalAssistantText, message);
+  assert.equal(r.stopReasonMissing, false);
+  // Blank lines around the acknowledgment do not count as lines.
+  assert.deepEqual(proveText([...handback(), '', ackLine(), '  ']).errors, []);
+  // An entry for some other tool id says nothing about this call.
+  assert.deepEqual(proveText([...handback({ wireToolInputs: { other: { message: 'x' } } }), ackLine()]).errors, []);
+});
+
+test('plain text finals report finalVia text; no final message reports null', () => {
+  assert.equal(proveText([userLine('p'), asstLine({ content: text('answer') })]).finalVia, 'text');
+  assert.equal(proveText([userLine('p'), asstLine({ stop: null, content: text(ANSWER) })]).finalVia, 'text');
+  assert.equal(proveText([userLine('p'), asstLine({ stop: 'max_tokens', content: text('answer') })]).finalVia, null);
+  assert.equal(proveText([userLine('p')]).finalVia, null);
+  assert.equal(proveText([userLine('p'), asstLine({ stop: null, content: text('no json') })]).finalVia, null);
+});
+
+function refused(lines, pattern, extra) {
+  const r = proveText(lines, extra);
+  assert.equal(r.ok, false, `expected refusal for ${pattern}`);
+  assert.equal(r.finalVia, null);
+  assert.ok(r.errors.some((e) => pattern.test(e)), `${pattern} not in: ${r.errors.join(' | ')}`);
+  return r;
+}
+
+test('hand-back rule 1: the closing line must be exactly one SubagentHandback tool_use block', () => {
+  const wrongName = refused([userLine('p'), hbLine({ name: 'SendMessage' }), ackLine()], /not a text answer/);
+  assert.equal(wrongName.finalAssistantText, '');
+  refused([userLine('p'), hbLine({ content: [{ type: 'text', text: ANSWER }, ...hbBlock()] }), ackLine()], /hand-back must be the only content block/);
+  refused([userLine('p'), hbLine({ content: [...hbBlock(), { type: 'text', text: ANSWER }] }), ackLine()], /hand-back must be the only content block/);
+  refused([userLine('p'), hbLine({ content: [...hbBlock(), ...hbBlock({ id: 'toolu_2' })] }), ackLine()], /hand-back must be the only content block/);
+  refused([userLine('p'), hbLine({ toolId: '' }), ackLine({ toolUseId: '' })], /hand-back tool_use has no id/);
+  // The call in an earlier line of the same message, followed by a thinking line, is not a closing hand-back.
+  refused([userLine('p'), hbLine(), thinkingLine(), ackLine()], /hand-back must be the only content block/);
+});
+
+test('hand-back rule 2: input is exactly {message: non-empty string}', () => {
+  const E = /hand-back input must be/;
+  refused([userLine('p'), hbLine({ input: { message: HB_MESSAGE, extra: 1 } }), ackLine()], E);
+  refused([userLine('p'), hbLine({ input: { message: '   \n' } }), ackLine()], E);
+  refused([userLine('p'), hbLine({ input: { message: '' } }), ackLine()], E);
+  refused([userLine('p'), hbLine({ input: { message: 42 } }), ackLine()], E);
+  refused([userLine('p'), hbLine({ input: {} }), ackLine()], E);
+  refused([userLine('p'), hbLine({ input: [HB_MESSAGE] }), ackLine()], E);
+  refused([userLine('p'), hbLine({ input: HB_MESSAGE }), ackLine()], E);
+  refused([userLine('p'), hbLine({ input: null }), ackLine()], E);
+  const r = refused([userLine('p'), hbLine({ input: { message: HB_MESSAGE, extra: 1 } }), ackLine()], E);
+  assert.equal(r.finalAssistantText, '', 'an invalid hand-back delivers nothing');
+});
+
+test('hand-back rule 3: a wireToolInputs entry for the call must equal its input', () => {
+  const E = /hand-back input differs from its wire input/;
+  refused([userLine('p'), hbLine({ wireToolInputs: { [HB_ID]: { message: HB_MESSAGE + ' tampered' } } }), ackLine()], E);
+  refused([userLine('p'), hbLine({ wireToolInputs: { [HB_ID]: { message: HB_MESSAGE, extra: true } } }), ackLine()], E);
+  refused([userLine('p'), hbLine({ wireToolInputs: { [HB_ID]: 'x' } }), ackLine()], E);
+  refused([userLine('p'), hbLine({ wireToolInputs: 'nope' }), ackLine()], /hand-back wireToolInputs is not an object/);
+});
+
+test('hand-back rule 4: stop_reason must be null/absent or tool_use', () => {
+  for (const stop of ['max_tokens', 'end_turn', 'refusal', '', 0, false]) {
+    refused([userLine('p'), hbLine({ stop }), ackLine()], new RegExp(`final message incomplete \\(stop_reason ${String(stop)}\\)`));
+  }
+  const absent = JSON.stringify({ type: 'assistant', effort: 'high', message: { model: 'claude-fable-5-1', id: 'msg_hb', role: 'assistant', content: hbBlock() } });
+  assert.deepEqual(proveText([userLine('p'), absent, ackLine()]).errors, []);
+});
+
+test('hand-back rule 5: exactly one acknowledgment line, the last, closing this very call', () => {
+  refused([...handback()], /hand-back not acknowledged/);
+  refused([...handback(), ackLine({ toolUseId: 'toolu_other' })], /hand-back acknowledgment invalid: tool_result is not for this call/);
+  refused([...handback(), ackLine({ isError: true })], /hand-back acknowledgment invalid: tool_result is an error/);
+  refused([...handback(), ackLine({ toolUseResult: { success: false, message: 'no' } })], /hand-back acknowledgment invalid: toolUseResult.success is not true/);
+  refused([...handback(), ackLine({ toolUseResult: undefined })], /hand-back acknowledgment invalid: toolUseResult.success is not true/);
+  refused([...handback(), ackLine({ toolUseResult: 'ok' })], /hand-back acknowledgment invalid: toolUseResult.success is not true/);
+  refused([...handback(), ackLine({ toolEndsTurn: false })], /hand-back acknowledgment invalid: toolEndsTurn is not true/);
+  refused([...handback(), ackLine({ toolEndsTurn: undefined })], /hand-back acknowledgment invalid: toolEndsTurn is not true/);
+  refused([...handback(), ackLine({ content: 'delivered' })], /hand-back acknowledgment invalid: message.content is not one tool_result block/);
+  refused([...handback(), ackLine({ content: [{ type: 'text', text: 'delivered' }] })], /hand-back acknowledgment invalid: message.content is not one tool_result block/);
+  refused([...handback(), ackLine({ content: [{ tool_use_id: HB_ID, type: 'tool_result' }, { tool_use_id: HB_ID, type: 'tool_result' }] })], /message.content is not one tool_result block/);
+  refused([...handback(), JSON.stringify({ type: 'system', subtype: 'note' })], /hand-back acknowledgment invalid: not a user line/);
+  refused([...handback(), asstLine({ id: 'msg_after', content: text('more') })], /hand-back acknowledgment invalid: not a user line/);
+  refused([...handback(), ackLine(), JSON.stringify({ type: 'system', subtype: 'note' })], /extra lines after the hand-back acknowledgment/);
+  refused([...handback(), ackLine(), ackLine()], /extra lines after the hand-back acknowledgment/);
+  refused([...handback(), ackLine(), 'not json'], /extra lines after the hand-back acknowledgment/);
+  refused([...handback(), 'not json'], /hand-back acknowledgment invalid: not a user line/);
+});
+
+test('hand-back rule 6: with a null stop_reason the message itself must carry a complete JSON answer', () => {
+  const E = /final message has no stop_reason and carries no complete JSON answer/;
+  const prose = refused([userLine('p'), hbLine({ input: { message: 'all done, no json' } }), ackLine()], E);
+  assert.equal(prose.finalAssistantText, 'all done, no json', 'the delivered message is still reported, as for a plain-text final');
+  refused([userLine('p'), hbLine({ input: { message: '```json\n{"rulings":[{"id":"R1-S1"' } }), ackLine()], E);
+  refused([userLine('p'), hbLine({ input: { message: '[1,2]' } }), ackLine()], E);
+  // Text that sat in an earlier block of the final message was never delivered, so it cannot supply the JSON.
+  refused([userLine('p'), asstLine({ id: 'msg_hb', stop: null, content: text(ANSWER) }), hbLine({ input: { message: 'see above' } }), ackLine()], E);
+});
+
+test('hand-back: the usual model/effort checks still apply to the hand-back line', () => {
+  const r = proveText([userLine('p'), hbLine({ model: 'claude-opus-5-5' }), ackLine()]);
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.includes('unexpected model claude-opus-5-5 on line 2'));
+  assert.equal(r.finalVia, 'handback');
+  assert.equal(r.finalAssistantText, HB_MESSAGE);
+});
