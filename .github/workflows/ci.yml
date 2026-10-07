@@ -4,6 +4,14 @@
 # Every step runs under bash (Git Bash on Windows) so one script serves both runners. The
 # installer runs into a throwaway Claude home whose path contains a space, then --check must
 # report no drift, a second install must be a no-op, and --uninstall must leave no pipeline files.
+#
+# Push to main skips a job's steps when that exact tree already passed the SAME job on the merged PR
+# (.github/scripts/tested-tree.mjs): identical tree (git tree sha of the pushed commit == tree of the PR head), the PR
+# head contains the previous main (so the PR run's merge checkout was that same tree), and a completed pull_request run
+# of this workflow on that head has this job green. That makes the main run redundant, so a squash merge of an
+# up-to-date PR costs no second ~40 minutes. If the PR branch was NOT up to date at merge, the trees differ and the job
+# runs: that is the intended fail-open. Any API or git error also means run. The job itself still starts and reports
+# success (skipped steps), so the required check names are unchanged. pull_request runs never skip.
 name: CI
 
 on:
@@ -13,6 +21,9 @@ on:
 
 permissions:
   contents: read
+  # actions + pull-requests: read-only, for the tested-tree skip step (finds the merged PR and its passed CI jobs).
+  actions: read
+  pull-requests: read
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -32,22 +43,40 @@ jobs:
         with:
           persist-credentials: false
 
+      # Push to main only: skip this job when the exact tree already passed this same job on the merged PR.
+      - name: Already tested on the PR?
+        id: tested
+        if: github.event_name == 'push'
+        continue-on-error: true
+        run: node .github/scripts/tested-tree.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          JOB_NAME: test (ubuntu)
+
       - name: Node 20
+        if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 20
       - name: Tests (Node 20)
+        if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
         run: node scripts/test.mjs
       - name: Installer round trip (Node 20)
+        if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
         run: ./.github/scripts/installer-round-trip.sh "$RUNNER_TEMP/claude home 20"
 
       - name: Node 24
+        if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
       - name: Tests (Node 24)
+        if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
         run: node scripts/test.mjs
       - name: Installer round trip (Node 24)
+        if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
         run: ./.github/scripts/installer-round-trip.sh "$RUNNER_TEMP/claude home 24"
 
   test-windows:
@@ -64,11 +93,26 @@ jobs:
         with:
           persist-credentials: false
 
+      # Push to main only: skip this job when the exact tree already passed this same job on the merged PR.
+      - name: Already tested on the PR?
+        id: tested
+        if: github.event_name == 'push'
+        continue-on-error: true
+        run: node .github/scripts/tested-tree.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          JOB_NAME: test (windows)
+
       - name: Node 20
+        if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 20
       - name: Tests (Node 20)
+        if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
         run: node scripts/test.mjs
       - name: Installer round trip (Node 20)
+        if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
         run: ./.github/scripts/installer-round-trip.sh "$RUNNER_TEMP/claude home 20"
