@@ -951,6 +951,16 @@ test('scriptFileOf: a noexec shell invocation (bash -n f) runs no file, unless n
   }
 });
 
+test('scriptFileOf: a noexec shell invocation with a word the shell expands first (\$X, `..`, {a,b}, globs) still runs the file', () => {
+  const f = (s) => scriptFileOf(s.split(' '));
+  for (const c of [
+    'bash -n $X f.sh', 'bash -n ${A} f.sh', 'bash -n $@', 'bash -n$X f.sh', 'bash -n `echo +n` f.sh', 'bash -n $(printf +n) f.sh',
+    'bash -n {+n,f.sh}', 'bash -n *', 'bash -n +[n] f.sh', 'bash -n ?n f.sh', 'bash -O $X -n f.sh', 'bash -n f*.sh',
+  ]) assert.equal(f(c)?.kind, 'shell', c);
+  // a run-time word AFTER the operand is only an argument to the script
+  assert.equal(f('bash -n f.sh $X'), null);
+});
+
 test('scriptFileOf names the file a shell, source, interpreter or path invocation will run', () => {
   const f = (s) => scriptFileOf(s.split(' '));
   assert.deepEqual(f('bash push.sh'), { kind: 'shell', file: 'push.sh' });
