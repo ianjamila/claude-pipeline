@@ -568,6 +568,33 @@ test('the reverse check finds importers whatever the case of their extension (He
   }
 });
 
+test('a scoped npm package is not a repo path (@playwright/test), but its subpath and a test-named scope still are', () => {
+  assert.deepEqual(rules([file('scripts/parity.mjs', { added: ["import { chromium, webkit } from '@playwright/test'"] })]), []);
+  assert.deepEqual(rules([file('scripts/parity.mjs', { added: ["import r from '@playwright/test/reporter'"] })]), []);
+  assert.deepEqual(rules([file('lib/a.ts', { added: ["import h from '@acme/pkg/tests/helper'"] })]), ['R0-unscannable']);
+  assert.deepEqual(rules([file('lib/a.ts', { added: ["import h from '@tests/helper'"] })]), ['R0-unscannable']);
+});
+
+test('a test runner config wiring in test files is not production importing them (forward and reverse)', async () => {
+  // (the config itself is still a pipeline/verify file: R4 stays; only the import rule is about production)
+  assert.deepEqual(rules([file('playwright.config.ts', { added: ["import setup from './e2e/fixtures/global-setup'"] })]).filter((r) => r === 'R0-unscannable'), []);
+  const repo = await reverseRepo({ 'e2e/fixtures/global-setup.ts': 'export default () => {};\n', 'playwright.config.ts': "import setup from './e2e/fixtures/global-setup';\n" });
+  repo.write('e2e/fixtures/global-setup.ts', EVIL_BODY);
+  repo.commit('edit global setup');
+  assert.deepEqual((await collectWith(repo)).filter((h) => h.rule === 'R0-unscannable').map((h) => h.file), []);
+  // production code importing the same fixture is still caught
+  assert.deepEqual(rules([file('lib/a.ts', { added: ["import setup from '../e2e/fixtures/global-setup'"] })]), ['R0-unscannable']);
+});
+
+test('every exempt doc type is searched as a reverse-chain link (prod -> docs/a.png as text -> tests/x.js)', async () => {
+  const repo = await reverseRepo({
+    'tests/x.js': 'module.exports = 1;\n', 'docs/a.png': "module.exports = require('../tests/x.js');\n", 'lib/pay.ts': "const a = require('../docs/a.png');\n",
+  });
+  repo.write('tests/x.js', EVIL_BODY);
+  repo.commit('edit x');
+  assert.ok((await collectWith(repo)).some((h) => h.rule === 'R0-unscannable' && h.file === 'tests/x.js'));
+});
+
 test('the string-blind Python fallback reads heads anywhere on a line and ignores brackets in comments', () => {
   const desync = 'v = f"{d["("]}"';
   const cases = [

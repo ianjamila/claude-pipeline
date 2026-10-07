@@ -75,7 +75,10 @@ const MIGRATION_GLOBS = ['**/migrations/**'];
 // Documentation = content that cannot execute. Anything else under docs/ (a .ts, .mjs, .sql, .json, extensionless file...)
 // is code: `import x from '@/docs/evil'` resolves from the repo root in a typical Next app. .mdx is executable (JSX, imports),
 // so it is code everywhere; a .md under a Next route dir (app/, pages/) is a page when pageExtensions include md.
-const DOC_EXT = /\.(?:md|txt|rst|adoc|png|jpe?g|gif|webp|avif|ico|pdf)$/i;
+// One list drives both the exemption (DOC_EXT) and the reverse check's search for doc links (CODE_PATHSPECS), so a doc type
+// can never be exempt yet unsearched. HTML is NOT here: it can run scripts wherever docs/ is published.
+const DOC_EXTS = ['md', 'txt', 'rst', 'adoc', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'ico', 'pdf'];
+const DOC_EXT = new RegExp(`\\.(?:${DOC_EXTS.join('|')})$`, 'i');
 const MD_ROUTE_GLOBS = ['**/app/**', '**/pages/**'];
 const isNonCode = (p) => {
   if (/\.mdx$/i.test(p)) return false;
@@ -732,6 +735,9 @@ const TS_SWAP = { '.js': ['.ts', '.tsx'], '.mjs': ['.mts'], '.cjs': ['.cts'], '.
 // and every path-segment suffix (`@acme/x/tests/h` also tries `x/tests/h` and `tests/h`). Python dotted -> slash path. Each path also
 // with every source extension, `/index.<ext>` / `/__init__.py`, and (TypeScript ESM) the `.ts` file a written `.js` stands for.
 // Over-matching is the safe direction.
+const TEST_SCOPE = /^(?:tests?|specs?|e2e|__tests__|__mocks__|__fixtures__|fixtures?|cypress|mocks?)$/i;
+// Test-runner configs: they wire test files in by design and production never loads them (their own content is still judged).
+const isRunnerConfig = (p) => /(?:^|\/)(?:playwright|vitest|vite\.test|jest|cypress|karma|ava|mocha|wdio)\.config\.[^/]+$|(?:^|\/)\.mocharc\.[^/]+$/i.test(p);
 export function importCandidates(spec, fromFile, { python = false, ruby = null } = {}) {
   const out = [];
   const seen = new Set();
@@ -777,8 +783,17 @@ export function importCandidates(spec, fromFile, { python = false, ruby = null }
     return out;
   }
   const root = (python ? s.replaceAll('.', '/') : s).replace(/^\/+/, '');
+  // A scoped npm package (`@playwright/test`, `@vitest/runner/x`) is not a repo path: only what follows `@scope/name` can name one.
+  // A scope that is itself a test-directory name (`@tests/x`, `@spec/x`: a tsconfig alias, not a package) keeps the full treatment.
+  const scoped = !python && !ruby && /^@([A-Za-z0-9][\w.-]*)\/[\w.-]+(?:\/|$)/.exec(root);
+  if (scoped && !TEST_SCOPE.test(scoped[1])) {
+    const sub = root.split('/').slice(2).join('/');
+    if (sub !== '') withSuffixes(sub, 'loose', 'loose');
+    return out;
+  }
   const forms = new Set([root]);
   if (!python && ALIAS_PREFIX.test(root)) forms.add(root.replace(ALIAS_PREFIX, ''));
+  if (scoped) forms.add(root.slice(1)); // `@tests/x`: a tsconfig alias such as `@tests/*` -> `tests/*`
   for (const form of forms) withSuffixes(form, !python && !ruby && !form.includes('/') ? 'exact' : 'loose', 'loose');
   return out;
 }
@@ -1272,7 +1287,8 @@ function addedCodeRules(d, added, cx, env, sink) {
     }
   }
 
-  for (const l of addedImportLines(d, added, cx.headFiles?.get(d.file), cx.testGlobs)) {
+  // A test runner's own config (playwright.config.ts importing e2e/fixtures/global-setup) is test-side wiring, not production.
+  for (const l of isRunnerConfig(d.file) ? [] : addedImportLines(d, added, cx.headFiles?.get(d.file), cx.testGlobs)) {
     sink.add('R0-unscannable', d.file, 'imports a test/fixture module into production code; test files are not judged', { line: l.line, excerpt: excerpt(l.text) });
   }
 
@@ -1559,8 +1575,9 @@ function parseJson(text) {
 // any directory's Gemfile). Keep in step with those three tests: a language missing here is a blind spot for the reverse check.
 const CODE_PATHSPECS = ['*.js', '*.mjs', '*.cjs', '*.jsx', '*.ts', '*.tsx', '*.mts', '*.cts', '*.vue', '*.svelte', '*.astro', '*.mdx',
   '*.py', '*.pyi', '*.rb', '*.rake', '*.gemspec', '*.ru', '*Rakefile', '*Gemfile',
-  // Documentation is reachable code (`require('./x.md')` loads it as JavaScript), so it can be a link in an import chain.
-  '*.md', '*.txt', '*.rst', '*.adoc'];
+  // Documentation is reachable code (`require('./x.md')` loads it as JavaScript), so it can be a link in an import chain: every
+  // exempt doc type (DOC_EXTS; `-I` still skips real binaries).
+  ...DOC_EXTS.map((e) => `*.${e}`)];
 const MAX_CHAIN_ROUNDS = 5;
 const MAX_CHAIN_FILES = 300;
 const READ_BATCH = 200;
@@ -1655,7 +1672,8 @@ function reverseImportHits(ds, head, o, cx, maxFiles) {
     const next = new Set();
     for (const [file, lines] of texts) {
       // Every exempt file (a test OR non-code documentation) is a LINK that extends the walk; only real code is a production endpoint.
-      const exempt = !isCodeFile(file, cx.testGlobs);
+      // A test runner's config is a link too: it loads test files, nothing in production loads it.
+      const exempt = !isCodeFile(file, cx.testGlobs) || isRunnerConfig(file);
       const reached = new Map(); // frontier file -> line of the first import that reaches it
       for (const m of scanImports(lines, file)) {
         for (const c of importCandidates(m.spec, file, { python: m.py, ruby: m.rb })) {
