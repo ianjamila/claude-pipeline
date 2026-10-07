@@ -939,6 +939,18 @@ test('wrappers that run nothing of ours are left alone', () => {
 
 // ---- script files (review finding 2) ------------------------------------------------------------------------
 
+test('scriptFileOf: a noexec shell invocation (bash -n f) runs no file, unless noexec is switched off again', () => {
+  const f = (s) => scriptFileOf(s.split(' '));
+  for (const c of [
+    'bash -n f.sh', '/bin/bash -n f.sh', 'bash -xn f.sh', 'bash -nx f.sh', 'sh -n f.sh', 'zsh -n f.sh',
+    'bash -o noexec f.sh', 'fish --no-execute f.fish', 'bash +n -n f.sh',
+  ]) assert.equal(f(c), null, c);
+  const file = (s) => (s.startsWith('fish') ? 'f.fish' : 'f.sh');
+  for (const c of ['bash -n +n f.sh', 'bash -n -i f.sh', 'bash -in f.sh', 'bash -o noexec +o noexec f.sh', 'bash f.sh -n', 'bash f.sh']) {
+    assert.deepEqual(f(c), { kind: 'shell', file: file(c) }, c);
+  }
+});
+
 test('scriptFileOf names the file a shell, source, interpreter or path invocation will run', () => {
   const f = (s) => scriptFileOf(s.split(' '));
   assert.deepEqual(f('bash push.sh'), { kind: 'shell', file: 'push.sh' });

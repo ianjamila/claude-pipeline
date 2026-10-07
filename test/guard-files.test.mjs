@@ -817,4 +817,7 @@ test('hook: a script file in the real working directory is read by the hook', (t
   const run = (command) => runHook({ tool_name: 'Bash', tool_input: { command }, cwd: path.join(home, 'proj') }, { home });
   for (const c of ['bash w.sh', './w.sh', 'source w.sh', 'env bash w.sh']) assert.equal(JSON.parse(run(c).stdout).hookSpecificOutput.permissionDecision, 'deny', c);
   assert.equal(run('bash ok.sh').stdout, '');
+  // a syntax-only run (bash -n) runs nothing; a later +n turns the check back into a real run
+  assert.equal(run('bash -n w.sh').stdout, '');
+  assert.equal(JSON.parse(run('bash -n +n w.sh').stdout).hookSpecificOutput.permissionDecision, 'deny');
 });

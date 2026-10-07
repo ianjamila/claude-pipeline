@@ -418,23 +418,35 @@ function unwrap(argv) {
 
 // bash -c "script" / bash -lc ... / bash script.sh / bash (reads stdin)
 // -s, `-`, /dev/stdin and /dev/fd/0 all mean "read the script from stdin".
+// `noexec` is true when the options leave noexec (-n, -o noexec, fish --no-execute) on at the operand: a later
+// `+n` / `+o noexec` turns it off again, and an interactive shell (-i) is never treated as noexec.
 function shellInvocation(argv) {
   let i = 1;
   let sawC = false;
   let sawS = false;
+  let noexec = false;
+  let interactive = false;
   while (i < argv.length) {
     const t = argv[i];
     if (t === '--') { i++; break; }
     if (t.length < 2 || (t[0] !== '-' && t[0] !== '+')) break;
-    if (t.startsWith('--')) { i += t === '--rcfile' || t === '--init-file' ? 2 : 1; continue; }
+    if (t.startsWith('--')) {
+      if (t === '--no-execute') noexec = true;
+      i += t === '--rcfile' || t === '--init-file' ? 2 : 1;
+      continue;
+    }
     if (t[0] === '-' && t.includes('c')) sawC = true;
     if (t[0] === '-' && t.includes('s')) sawS = true;
+    if (t.includes('i')) interactive = true;
+    if (t.includes('n')) noexec = t[0] === '-';
+    if (/o$/.test(t) && argv[i + 1] === 'noexec') noexec = t[0] === '-';
     i += /[oO]$/.test(t) ? 2 : 1; // -o / -O take an option name
   }
-  if (sawC) return i < argv.length ? { kind: 'script', text: argv[i] } : { kind: 'none' };
-  if (sawS) return { kind: 'stdin' };
-  if (i < argv.length) return STDIN_FILES.has(argv[i]) ? { kind: 'stdin' } : { kind: 'file', text: argv[i] };
-  return { kind: 'stdin' };
+  noexec = noexec && !interactive;
+  if (sawC) return i < argv.length ? { kind: 'script', text: argv[i], noexec } : { kind: 'none', noexec };
+  if (sawS) return { kind: 'stdin', noexec };
+  if (i < argv.length) return STDIN_FILES.has(argv[i]) ? { kind: 'stdin', noexec } : { kind: 'file', text: argv[i], noexec };
+  return { kind: 'stdin', noexec };
 }
 
 // ---- script files -------------------------------------------------------------------------------
@@ -455,6 +467,7 @@ export function scriptFileOf(argv) {
   const name = base(argv[0]);
   if (SHELLS.has(name)) {
     const r = shellInvocation(argv);
+    if (r.kind === 'file' && r.noexec) return null; // `bash -n f.sh` only checks syntax: no file runs
     return r.kind === 'file' && !r.text.startsWith('<(') ? { kind: 'shell', file: r.text } : null;
   }
   if (name === 'source' || name === '.') {

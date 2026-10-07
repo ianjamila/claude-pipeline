@@ -1090,6 +1090,16 @@ test('a script file is read and judged by what it runs', () => {
   assert.equal(v.decision, 'deny');
 });
 
+test('a noexec shell invocation of a script file (bash -n) is not running it; -c, +n and -i still are judged', () => {
+  const ev = (c) => evaluate(c, withFiles({ 'push.sh': 'echo hi\ngit push origin main\n' })).decision;
+  assert.equal(ev('bash push.sh'), 'deny');
+  assert.equal(ev('bash -n push.sh'), 'allow');
+  assert.equal(ev('/bin/bash -n push.sh'), 'allow');
+  assert.equal(ev('bash -n +n push.sh'), 'deny');
+  assert.equal(ev('bash -n -i push.sh'), 'deny');
+  assert.equal(ev("bash -n -c 'git push origin main'"), 'deny');
+});
+
 test('a shell script that exists but cannot be read is denied; one that does not exist is not', () => {
   const unreadable = { readText: () => null, pathExists: () => true };
   assert.equal(evaluate('bash big.sh', unreadable).decision, 'deny');
