@@ -10,7 +10,7 @@
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { gh as ghRun } from './proc.mjs';
-import { checkRunProvenance } from './guard-provenance.mjs';
+import { checkGuardVerdict, GUARD_CONTEXT_CHECKS } from './guard-provenance.mjs';
 import { GUARD_CHECKS } from './config.mjs';
 import { collectHardStops } from './hardstops.mjs';
 import { checkIntegrity } from './integrity.mjs';
@@ -352,17 +352,23 @@ function ciCheck({ gh, pr, head, diff, config, explicitEmpty }) {
 
   const bad = examined.filter((r) => !passing(r));
   const missing = [];
+  // Every row that satisfies ANY requirement source (what GitHub requires, what the config names, what is examined). A
+  // guard row counts as satisfied however it got here, so each one needs provenance: GitHub may require only `ci` while the
+  // config also names `Hard-stop scan`, and that row is then found in all(), not in requiredRows.
+  const used = [...examined];
   for (const name of named) {
     let rows = requiredRows.filter((r) => r?.name === name);
     if (rows.length === 0) rows = all().filter((r) => r?.name === name);
     if (rows.length === 0) missing.push(name);
+    used.push(...rows);
     for (const r of rows) if (!passing(r) && !bad.includes(r)) bad.push(r);
   }
-  // A guard status is only believed when the pipeline-guards workflow from the default branch posted it (guard-provenance).
-  // The row's link is not trusted (anyone posting a status picks it): the latest status of that context on the head is read
-  // directly and bound to this PR, this head and its own creation time.
+  // A guard status is only believed when the pipeline-guards workflow from the default branch posted it, and that run's own
+  // verdict artifact says success for it (guard-provenance). The row's link is not trusted (anyone posting a status picks
+  // it): the latest status of that context on the head is read directly and bound to this PR, this head and its own
+  // creation time.
   const guardNames = new Set();
-  for (const r of [...examined, ...named.flatMap((n) => requiredRows.filter((x) => x?.name === n))]) {
+  for (const r of used) {
     if (r && GUARD_CHECKS.includes(r.name) && passing(r)) guardNames.add(r.name);
   }
   const forged = [];
@@ -376,7 +382,7 @@ function ciCheck({ gh, pr, head, diff, config, explicitEmpty }) {
         `[.[] | select(.context == "${name}")][0] | {state: .state, by: .creator.login, at: .created_at, url: .target_url}`));
       if (!latest || latest.state !== 'success') verdict = { ok: false, reason: 'its latest status is not a success' };
       else if (latest.by !== 'github-actions[bot]') verdict = { ok: false, reason: `posted by ${latest.by ?? 'an unknown creator'}, not github-actions[bot]` };
-      else verdict = checkRunProvenance({ read, repo: slug, url: latest.url, bind: { prNumber: pr, headSha: head, createdAt: latest.at }, cache: provenanceCache });
+      else verdict = checkGuardVerdict({ read, repo: slug, url: latest.url, bind: { prNumber: pr, headSha: head, createdAt: latest.at }, expect: { check: GUARD_CONTEXT_CHECKS[name] }, cache: provenanceCache });
     } catch (err) {
       verdict = { ok: false, reason: String(err?.message ?? err).split('\n')[0] };
     }
