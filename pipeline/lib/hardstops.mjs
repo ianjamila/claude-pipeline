@@ -736,6 +736,13 @@ const TS_SWAP = { '.js': ['.ts', '.tsx'], '.mjs': ['.mts'], '.cjs': ['.cts'], '.
 // with every source extension, `/index.<ext>` / `/__init__.py`, and (TypeScript ESM) the `.ts` file a written `.js` stands for.
 // Over-matching is the safe direction.
 const NO_PACKAGES = new Set();
+// Files that can change what an import specifier resolves to. A diff touching any of them gets no npm-package exemption.
+const RESOLUTION_GLOBS = [
+  '**/package.json', '**/package-lock.json', '**/npm-shrinkwrap.json', '**/yarn.lock', '**/pnpm-lock.yaml', '**/bun.lock*',
+  '**/pnpm-workspace.yaml', '**/.npmrc', '**/.yarnrc', '**/.yarnrc.yml', '**/.pnpmfile.cjs', '**/.yarn/**',
+  '**/tsconfig*.json', '**/jsconfig*.json', '**/.babelrc*', '**/babel.config.*', '**/.swcrc',
+  '**/{vite,vitest,webpack,rollup,rspack,next,nuxt,astro,svelte,remix,esbuild,tsup,turbo}.config.*', '**/import_map.json', '**/deno.json*',
+];
 /**
  * Dependency names declared in a package.json text (all four dependency maps); a parse failure declares none. A LOCAL spec
  * (`file:`, `link:`, `workspace:`, `portal:`, a relative or absolute path) does not count: `"@shared/tests": "file:./tests"`
@@ -1878,7 +1885,11 @@ export async function collectHardStops({ base, head, cwd, config, maxImporterHit
   // Scoped names declared as registry packages in BOTH the merge base and the head root package.json: the author of this diff
   // controls head, so a dependency added in the same PR (new deps are not hits) can never turn an alias into a "package".
   // Unreadable or absent = none, which keeps every `@x/y` on the over-matching path.
-  const baseDeclared = declaredPackages(showFile(mb, 'package.json', o));
+  // And only when the diff changes NOTHING that steers module resolution (any package.json, workspaces, overrides, lockfiles,
+  // package-manager config, tsconfig/jsconfig paths, bundler aliases): otherwise head could redirect a declared name to a local
+  // directory, so every scoped specifier falls back to over-matching for this diff.
+  const steersResolution = ds.some((d) => d.paths.some((p) => inc(p, RESOLUTION_GLOBS)));
+  const baseDeclared = steersResolution ? new Set() : declaredPackages(showFile(mb, 'package.json', o));
   const npmPackages = new Set([...declaredPackages(showFile(head, 'package.json', o))].filter((n) => baseDeclared.has(n)));
   const hits = classifyHardStops({ files, config, baseEnvNames, pkgPairs, sqlStatements, envFiles, envImportFiles, guardLosses, headFiles, npmPackages });
   return [...hits, ...tooBig, ...reverseImportHits(ds, head, o, { ...cx, npmPackages }, maxImporterHits)];
