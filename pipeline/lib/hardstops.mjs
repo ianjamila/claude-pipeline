@@ -36,6 +36,11 @@
 //        a grep of the head tree finds the files that mention the changed basenames, they are read whole and the same
 //        resolver says which really import them; test importers join the chain for a bounded number of rounds. A grep that
 //        fails, or a result or chain over its cap, flags the changed test files concerned.
+//      - Exempt also means non-code documentation (docs/*.md, *.txt ...): Node's require loads those as JavaScript, so importing
+//        one is flagged forward and editing one production already imports is flagged in reverse (a plain `import x from './a.md'`
+//        is an accepted false positive). Candidates also cover every package `__init__.py` on a dotted Python path, every source
+//        extension the parser reads, text with `/* ... */` blanked (a comment between the tokens of an import), and Ruby
+//        `require_relative` resolved against the requiring file.
 //  * Content that MOVES is judged too: a rename from an exempt path (test, docs) into production code carries lines the
 //    diff does not show (R0-unscannable), and a symlink (mode 120000) or submodule (160000) can make a production path serve
 //    a file from an exempt one or point at unreviewed code (R4-pipeline). A 100% rename has no mode line in the unified
@@ -484,7 +489,8 @@ function realLookingSecret(text) {
 // Imports: which repo paths does an added `import` line reach? (Exempt test files wired into production are never judged.)
 // ---------------------------------------------------------------------------------------------------------------
 
-const IMPORT_EXTS = ['.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.mts', '.cts', '.vue', '.svelte', '.py', '.rb'];
+// Every extension the parser treats as source (JS_FAMILY / PY_FILE / RB_FILE), so `./x` may name any of them.
+const IMPORT_EXTS = ['.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.mts', '.cts', '.vue', '.svelte', '.astro', '.mdx', '.py', '.pyi', '.rb', '.rake'];
 const ALIAS_PREFIX = /^(?:@@|@|~|#)\//;
 const MAX_SPECIFIER = 500;
 const MAX_SEGMENTS = 24;
@@ -502,11 +508,29 @@ const JS_IMPORT_FORMS = [
   new RegExp(String.raw`\bimport\s*${SPEC_Q}`, 'g'), // import '..'
   new RegExp(String.raw`\b(?:require|import)(?:\.resolve|Actual|Mock)?\s*\(\s*${SPEC_Q}`, 'g'), // require('..') import('..')
 ];
-const RB_IMPORT_FORM = new RegExp(String.raw`\b(?:require_relative|require|load)\s*\(?\s*${SPEC_Q}`, 'g');
+// `require_relative` resolves against the requiring file; `require` / `load` against the load path (the repo, a lib/ dir...).
+const RB_REL_FORM = new RegExp(String.raw`\brequire_relative\s*\(?\s*${SPEC_Q}`, 'g');
+const RB_REQ_FORM = new RegExp(String.raw`\b(?:require|load)\s*\(?\s*${SPEC_Q}`, 'g');
 // The names of a `from X import a, b` list end at a `;`, a `#` or the end of the text, however long the list is.
 const PY_FROM = /(?:^|;)\s*from\s+(\.*[A-Za-z_][\w.]*|\.+)\s+import\s+([^#\n;]*)/gm;
 const PY_IMPORT = /(?:^|;)\s*import\s+([^#\n;]+)/gm;
 const PY_DYNAMIC = new RegExp(String.raw`\b(?:import_module|__import__)\s*\(\s*${SPEC_Q}`, 'g');
+
+// `text` with every closed `/* ... */` replaced by spaces (newlines kept), so offsets and line numbers still line up. An unclosed
+// `/*` is left alone. Linear: one pass over the text.
+function blankBlockComments(text) {
+  let out = '';
+  let i = 0;
+  for (;;) {
+    const a = text.indexOf('/*', i);
+    if (a === -1) break;
+    const b = text.indexOf('*/', a + 2);
+    if (b === -1) break;
+    out += text.slice(i, a) + text.slice(a, b + 2).replace(/[^\n]/g, ' ');
+    i = b + 2;
+  }
+  return out + text.slice(i);
+}
 
 // Every module specifier in `text` (any number of lines): [{ spec, py, start, end }] with the match's offsets (py: a dotted
 // Python module, else a path-like string). Generous on purpose: an extra specifier can only add a false positive. Reading
@@ -515,7 +539,7 @@ export function importSpecifiers(text, file) {
   const out = [];
   const isPy = PY_FILE.test(file);
   const isJs = JS_FAMILY.test(file);
-  const add = (spec, py, index, length) => out.push({ spec, py, start: index, end: index + length });
+  const add = (spec, py, index, length, rb = null) => out.push({ spec, py, rb, start: index, end: index + length });
   const python = (src, base) => {
     for (const m of src.matchAll(PY_FROM)) {
       add(m[1], true, base + m.index, m[0].length);
@@ -536,8 +560,15 @@ export function importSpecifiers(text, file) {
     for (const m of text.matchAll(PY_DYNAMIC)) add(m[2], true, m.index, m[0].length);
     return out;
   }
-  for (const r of JS_IMPORT_FORMS) for (const m of text.matchAll(r)) add(m[2], false, m.index, m[0].length);
-  if (!isJs) for (const m of text.matchAll(RB_IMPORT_FORM)) add(m[2], false, m.index, m[0].length);
+  // Read the raw text AND the text with `/* ... */` blanked (same length, same newlines): a comment between the tokens of an import
+  // (`from /* x */ '../a'`, `import(/* webpackMode: 'eager' */ '../a')`) leaves no specifier in the raw text.
+  for (const src of text.includes('/*') ? [text, blankBlockComments(text)] : [text]) {
+    for (const r of JS_IMPORT_FORMS) for (const m of src.matchAll(r)) add(m[2], false, m.index, m[0].length);
+    if (!isJs) {
+      for (const m of src.matchAll(RB_REL_FORM)) add(m[2], false, m.index, m[0].length, 'rel');
+      for (const m of src.matchAll(RB_REQ_FORM)) add(m[2], false, m.index, m[0].length, 'req');
+    }
+  }
   // A Python import has no quotes; skipping lines that have them keeps `import test from 'node:test'` out of the Python reading.
   let base = 0;
   for (const line of text.split('\n')) {
@@ -567,7 +598,7 @@ function scanSegments(segments, file) {
     return segments[lo];
   };
   return importSpecifiers(segments.map((g) => g.text).join('\n'), file).map((m) => ({
-    spec: m.spec, py: m.py, from: segOf(m.start).from, to: segOf(Math.max(m.start, m.end - 1)).to,
+    spec: m.spec, py: m.py, rb: m.rb, from: segOf(m.start).from, to: segOf(Math.max(m.start, m.end - 1)).to,
   }));
 }
 
@@ -679,7 +710,7 @@ function scanImports(lines, file) {
   const one = lines.map((l, i) => ({ text: l, from: i + 1, to: i + 1 }));
   const found = new Map();
   const take = (list) => {
-    for (const m of list) found.set(`${m.from}\0${m.to}\0${m.py}\0${m.spec}`, m);
+    for (const m of list) found.set(`${m.from}\0${m.to}\0${m.py}\0${m.rb}\0${m.spec}`, m);
   };
   take(scanSegments(one, file));
   for (const g of one) if (g.text !== '') take(scanSegments([g], file));
@@ -701,22 +732,28 @@ const TS_SWAP = { '.js': ['.ts', '.tsx'], '.mjs': ['.mts'], '.cjs': ['.cts'], '.
 // and every path-segment suffix (`@acme/x/tests/h` also tries `x/tests/h` and `tests/h`). Python dotted -> slash path. Each path also
 // with every source extension, `/index.<ext>` / `/__init__.py`, and (TypeScript ESM) the `.ts` file a written `.js` stands for.
 // Over-matching is the safe direction.
-export function importCandidates(spec, fromFile, { python = false } = {}) {
+export function importCandidates(spec, fromFile, { python = false, ruby = null } = {}) {
   const out = [];
   const seen = new Set();
+  const add = (v, mode) => {
+    const key = `${mode}\0${v}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push({ path: v, mode });
+    }
+  };
   const push = (p, mode) => {
     const clean = p.replace(/^(?:\.{1,2}\/)+/, '').replace(/^\/+/, '').replace(/\/{2,}/g, '/').replace(/\/$/, '');
     if (clean === '' || clean === '.' || clean === '..') return;
+    // Importing `a.b.c` runs the package initializer of EVERY prefix: a/__init__.py and a/b/__init__.py.
+    if (python) {
+      const segs = clean.split('/');
+      for (let k = 1; k < segs.length; k++) add(`${segs.slice(0, k).join('/')}/__init__.py`, mode);
+    }
     const lower = clean.toLowerCase();
     const swapped = Object.entries(TS_SWAP).flatMap(([from, tos]) => (lower.endsWith(from) ? tos.map((to) => clean.slice(0, -from.length) + to) : []));
     for (const b of [clean, ...swapped]) {
-      for (const v of [b, ...IMPORT_EXTS.flatMap((e) => [`${b}${e}`, `${b}/index${e}`]), `${b}/__init__.py`]) {
-        const key = `${mode}\0${v}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          out.push({ path: v, mode });
-        }
-      }
+      for (const v of [b, ...IMPORT_EXTS.flatMap((e) => [`${b}${e}`, `${b}/index${e}`]), `${b}/__init__.py`]) add(v, mode);
     }
   };
   // `whole`: the mode of the path as written; its multi-segment suffixes take `multi`, a single trailing segment is always 'fwd'.
@@ -731,7 +768,7 @@ export function importCandidates(spec, fromFile, { python = false } = {}) {
   s = s.slice(s.lastIndexOf('!') + 1).replace(/\?.*$/, '').replaceAll('\\', '/'); // webpack loaders, query strings
   const dir = fromFile.includes('/') ? fromFile.slice(0, fromFile.lastIndexOf('/')) : '';
   const dots = python ? /^\.*/.exec(s)[0].length : 0;
-  const rel = python ? dots > 0 : /^\.{1,2}(?:\/|$)/.test(s);
+  const rel = python ? dots > 0 : ruby === 'rel' || /^\.{1,2}(?:\/|$)/.test(s); // require_relative is relative to the requiring file
   if (rel) {
     const rest = python ? s.slice(dots).replaceAll('.', '/') : s;
     const up = python ? '../'.repeat(dots - 1) : '';
@@ -742,15 +779,17 @@ export function importCandidates(spec, fromFile, { python = false } = {}) {
   const root = (python ? s.replaceAll('.', '/') : s).replace(/^\/+/, '');
   const forms = new Set([root]);
   if (!python && ALIAS_PREFIX.test(root)) forms.add(root.replace(ALIAS_PREFIX, ''));
-  for (const form of forms) withSuffixes(form, !python && !form.includes('/') ? 'exact' : 'loose', 'loose');
+  for (const form of forms) withSuffixes(form, !python && !ruby && !form.includes('/') ? 'exact' : 'loose', 'loose');
   return out;
 }
 
-// Does any of `specs` reach a test file (or a legacy test dir)? -> the first such specifier, or null.
+// Does any of `specs` reach a file exempt from the content rules: a test file (or a legacy test dir), or non-code documentation
+// (Node's require loads `docs/x.md` / `.txt` as JavaScript)? -> the first such specifier, or null. A production `import x from './post.md'`
+// is flagged too: accepted.
 function reachesTestModule(specs, file, testGlobs) {
-  for (const { spec, py } of specs) {
-    for (const c of importCandidates(spec, file, { python: py })) {
-      if (isTestFile(c.path, testGlobs) || LEGACY_TEST_DIR.test(c.path)) return spec;
+  for (const { spec, py, rb } of specs) {
+    for (const c of importCandidates(spec, file, { python: py, ruby: rb })) {
+      if (isTestFile(c.path, testGlobs) || LEGACY_TEST_DIR.test(c.path) || isNonCode(c.path)) return spec;
     }
   }
   return null;
@@ -775,8 +814,8 @@ function addedImportLines(d, added, headText, testGlobs) {
   for (const m of scanImports(lines, file)) {
     let first = null;
     for (let n = m.from; n <= m.to && first === null; n++) if (addedAt.has(n)) first = n;
-    const key = `${m.py}\0${m.spec}`;
-    if (first !== null && !touched.has(key)) touched.set(key, { spec: m.spec, py: m.py, line: first });
+    const key = `${m.py}\0${m.rb}\0${m.spec}`;
+    if (first !== null && !touched.has(key)) touched.set(key, { spec: m.spec, py: m.py, rb: m.rb, line: first });
   }
   if (touched.size > MAX_SPECIFIERS_PER_FILE) return [addedAt.get([...touched.values()][0].line)];
   const out = [];
@@ -1509,7 +1548,7 @@ function parseJson(text) {
   }
 }
 
-// Reverse check. A test file is exempt from content rules, so when production code ALREADY imports one (directly, or through
+// Reverse check. A test file (or non-code documentation) is exempt from content rules, so when production code ALREADY imports one (directly, or through
 // other test files: prod -> tests/a.ts -> tests/b.ts), editing that file changes what production runs and nothing judges the
 // new content. For the changed (added, modified, renamed-into) test files: one grep of the head tree for files mentioning
 // their basenames (just the names, so an import split over lines is still found), the importers read whole at head and run
@@ -1519,7 +1558,9 @@ function parseJson(text) {
 // Every file the import parser reads (JS_FAMILY / PY_FILE / RB_FILE; a plain pathspec's `*` also matches `/`, so `*Gemfile` is
 // any directory's Gemfile). Keep in step with those three tests: a language missing here is a blind spot for the reverse check.
 const CODE_PATHSPECS = ['*.js', '*.mjs', '*.cjs', '*.jsx', '*.ts', '*.tsx', '*.mts', '*.cts', '*.vue', '*.svelte', '*.astro', '*.mdx',
-  '*.py', '*.pyi', '*.rb', '*.rake', '*.gemspec', '*.ru', '*Rakefile', '*Gemfile'];
+  '*.py', '*.pyi', '*.rb', '*.rake', '*.gemspec', '*.ru', '*Rakefile', '*Gemfile',
+  // Documentation is reachable code (`require('./x.md')` loads it as JavaScript), so it can be a link in an import chain.
+  '*.md', '*.txt', '*.rst', '*.adoc'];
 const MAX_CHAIN_ROUNDS = 5;
 const MAX_CHAIN_FILES = 300;
 const READ_BATCH = 200;
@@ -1576,9 +1617,9 @@ function readLines(ref, files, o) {
 }
 
 function reverseImportHits(ds, head, o, cx, maxFiles) {
-  const changed = [...new Set(ds.filter((d) => d.status !== 'D' && d.newPath && d.addedIsTest).map((d) => d.newPath))];
+  const changed = [...new Set(ds.filter((d) => d.status !== 'D' && d.newPath && !d.addedIsCode).map((d) => d.newPath))]; // test files AND non-code docs
   if (changed.length === 0) return [];
-  const unchecked = (why, files = changed) => files.map((file) => ({ rule: 'R0-unscannable', file, detail: `test file changed; production code importing it could not be checked (${why})` }));
+  const unchecked = (why, files = changed) => files.map((file) => ({ rule: 'R0-unscannable', file, detail: `test/docs file changed; production code importing it could not be checked (${why})` }));
   const rootsOf = new Map(changed.map((p) => [p, new Set([p])])); // test file in the chain -> changed files it leads to
   const found = new Map(); // changed file -> where production reaches it
   let frontier = [...changed];
@@ -1613,17 +1654,17 @@ function reverseImportHits(ds, head, o, cx, maxFiles) {
     }
     const next = new Set();
     for (const [file, lines] of texts) {
-      const isTest = isTestFile(file, cx.testGlobs);
-      if (!isTest && !isCodeFile(file, cx.testGlobs)) continue;
+      // Every exempt file (a test OR non-code documentation) is a LINK that extends the walk; only real code is a production endpoint.
+      const exempt = !isCodeFile(file, cx.testGlobs);
       const reached = new Map(); // frontier file -> line of the first import that reaches it
       for (const m of scanImports(lines, file)) {
-        for (const c of importCandidates(m.spec, file, { python: m.py })) {
+        for (const c of importCandidates(m.spec, file, { python: m.py, ruby: m.rb })) {
           if (c.mode === 'fwd') continue;
           for (const t of tails.get(c.path) ?? []) if ((c.mode !== 'exact' || t === c.path) && t !== file && !reached.has(t)) reached.set(t, m.from);
         }
       }
       for (const [t, line] of reached) {
-        if (!isTest) {
+        if (!exempt) {
           for (const r of rootsOf.get(t)) if (!found.has(r)) found.set(r, `${file}:${line}${r === t ? '' : `, through ${t}`}`);
           continue;
         }
@@ -1646,7 +1687,7 @@ function reverseImportHits(ds, head, o, cx, maxFiles) {
   }
   return [...found].map(([file, by]) => ({
     rule: 'R0-unscannable', file,
-    detail: `production code (${by}) already imports this test file; its new content is never judged`,
+    detail: `production code (${by}) already imports this test/docs file; its new content is never judged`,
   }));
 }
 
