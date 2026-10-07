@@ -741,13 +741,15 @@ const NO_PACKAGES = new Set();
  * (`file:`, `link:`, `workspace:`, `portal:`, a relative or absolute path) does not count: `"@shared/tests": "file:./tests"`
  * would make a repo test directory look like a package.
  */
-const LOCAL_SPEC = /^\s*(?:file:|link:|workspace:|portal:|\.{1,2}(?:\/|$)|\/|~\/)/i;
+// POSITIVE test, never a denylist of local forms: a registry semver range (`^1.2.0`, `>=2 <3`, `1.x`, `*`), a dist-tag
+// (`latest`), or an `npm:` alias. Paths, tarballs, git/file/link/workspace URLs, drive letters and backslashes all fail it.
+const REGISTRY_SPEC = /^\s*(?:npm:[^\s\\]+|[a-z][a-z0-9-]*|(?:[\^~]|[<>]=?|=)?\s*v?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,2}(?:-[0-9A-Za-z.-]+)?(?:\s*(?:\|\||\s|-)\s*(?:[\^~]|[<>]=?|=)?\s*v?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,2}(?:-[0-9A-Za-z.-]+)?)*)\s*$/;
 export function declaredPackages(text) {
   try {
     const j = JSON.parse(text ?? '');
     return new Set(['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']
       .flatMap((k) => (j && typeof j[k] === 'object' && j[k] !== null ? Object.entries(j[k]) : []))
-      .filter(([, v]) => typeof v === 'string' && !LOCAL_SPEC.test(v))
+      .filter(([, v]) => typeof v === 'string' && REGISTRY_SPEC.test(v))
       .map(([name]) => name));
   } catch {
     return new Set();
@@ -1873,9 +1875,11 @@ export async function collectHardStops({ base, head, cwd, config, maxImporterHit
     if (text.length <= MAX_HEAD_TEXT) headFiles.set(d.file, text);
     else tooBig.push({ rule: 'R0-unscannable', file: d.file, detail: `file is larger than ${MAX_HEAD_TEXT} characters; its imports cannot be checked` });
   }
-  // The dependency names the head's root package.json declares: only those scoped specifiers are npm packages (unreadable or
-  // absent = none, which keeps every `@x/y` on the over-matching path).
-  const npmPackages = declaredPackages(showFile(head, 'package.json', o));
+  // Scoped names declared as registry packages in BOTH the merge base and the head root package.json: the author of this diff
+  // controls head, so a dependency added in the same PR (new deps are not hits) can never turn an alias into a "package".
+  // Unreadable or absent = none, which keeps every `@x/y` on the over-matching path.
+  const baseDeclared = declaredPackages(showFile(mb, 'package.json', o));
+  const npmPackages = new Set([...declaredPackages(showFile(head, 'package.json', o))].filter((n) => baseDeclared.has(n)));
   const hits = classifyHardStops({ files, config, baseEnvNames, pkgPairs, sqlStatements, envFiles, envImportFiles, guardLosses, headFiles, npmPackages });
   return [...hits, ...tooBig, ...reverseImportHits(ds, head, o, { ...cx, npmPackages }, maxImporterHits)];
 }
