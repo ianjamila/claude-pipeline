@@ -730,11 +730,12 @@ const HB_MESSAGE = '```json\n{"rulings":[{"id":"R1-S1"}]}\n```\n\nFree prose aft
 const hbBlock = ({ id = HB_ID, name = 'SubagentHandback', input = { message: HB_MESSAGE } } = {}) => [{ type: 'tool_use', id, name, input }];
 const hbLine = ({ id = 'msg_hb', stop = null, toolId = HB_ID, name, input, content, ...rest } = {}) =>
   asstLine({ id, stop, content: content ?? hbBlock({ id: toolId, name, input }), ...rest });
+const OMIT = Symbol('omit'); // a default parameter would swallow undefined
 const ackLine = ({ toolUseId = HB_ID, isError, toolUseResult = { success: true, message: 'Report delivered to your caller.' }, toolEndsTurn = true, content } = {}) =>
   JSON.stringify({
     type: 'user',
-    ...(toolEndsTurn === undefined ? {} : { toolEndsTurn }),
-    ...(toolUseResult === undefined ? {} : { toolUseResult }),
+    ...(toolEndsTurn === OMIT ? {} : { toolEndsTurn }),
+    ...(toolUseResult === OMIT ? {} : { toolUseResult }),
     message: {
       role: 'user',
       content: content ?? [{ tool_use_id: toolUseId, type: 'tool_result', ...(isError === undefined ? {} : { is_error: isError }), content: [{ type: 'text', text: '{"success":true}' }] }],
@@ -830,15 +831,18 @@ test('hand-back rule 5: exactly one acknowledgment line, the last, closing this 
   refused([...handback(), ackLine({ toolUseId: 'toolu_other' })], /hand-back acknowledgment invalid: tool_result is not for this call/);
   refused([...handback(), ackLine({ isError: true })], /hand-back acknowledgment invalid: tool_result is an error/);
   refused([...handback(), ackLine({ toolUseResult: { success: false, message: 'no' } })], /hand-back acknowledgment invalid: toolUseResult.success is not true/);
-  refused([...handback(), ackLine({ toolUseResult: undefined })], /hand-back acknowledgment invalid: toolUseResult.success is not true/);
+  refused([...handback(), ackLine({ toolUseResult: OMIT })], /hand-back acknowledgment invalid: toolUseResult.success is not true/);
   refused([...handback(), ackLine({ toolUseResult: 'ok' })], /hand-back acknowledgment invalid: toolUseResult.success is not true/);
   refused([...handback(), ackLine({ toolEndsTurn: false })], /hand-back acknowledgment invalid: toolEndsTurn is not true/);
-  refused([...handback(), ackLine({ toolEndsTurn: undefined })], /hand-back acknowledgment invalid: toolEndsTurn is not true/);
+  refused([...handback(), ackLine({ toolEndsTurn: OMIT })], /hand-back acknowledgment invalid: toolEndsTurn is not true/);
   refused([...handback(), ackLine({ content: 'delivered' })], /hand-back acknowledgment invalid: message.content is not one tool_result block/);
   refused([...handback(), ackLine({ content: [{ type: 'text', text: 'delivered' }] })], /hand-back acknowledgment invalid: message.content is not one tool_result block/);
   refused([...handback(), ackLine({ content: [{ tool_use_id: HB_ID, type: 'tool_result' }, { tool_use_id: HB_ID, type: 'tool_result' }] })], /message.content is not one tool_result block/);
   refused([...handback(), JSON.stringify({ type: 'system', subtype: 'note' })], /hand-back acknowledgment invalid: not a user line/);
-  refused([...handback(), asstLine({ id: 'msg_after', content: text('more') })], /hand-back acknowledgment invalid: not a user line/);
+  // A later, separate assistant message is simply the new final message (judged as plain text), not an acknowledgment.
+  const later = proveText([...handback(), ackLine(), asstLine({ id: 'msg_after', content: text('more') })]);
+  assert.equal(later.finalVia, 'text');
+  assert.equal(later.finalAssistantText, 'more');
   refused([...handback(), ackLine(), JSON.stringify({ type: 'system', subtype: 'note' })], /extra lines after the hand-back acknowledgment/);
   refused([...handback(), ackLine(), ackLine()], /extra lines after the hand-back acknowledgment/);
   refused([...handback(), ackLine(), 'not json'], /extra lines after the hand-back acknowledgment/);

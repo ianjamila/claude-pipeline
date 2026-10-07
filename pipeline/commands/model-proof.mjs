@@ -81,6 +81,7 @@ export const run = guarded(async (argv) => {
       errors: proof.errors,
       finalAssistantText: proof.finalAssistantText,
       stopReasonMissing: proof.stopReasonMissing,
+      finalVia: proof.finalVia,
     },
   };
 });

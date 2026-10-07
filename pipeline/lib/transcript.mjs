@@ -11,9 +11,19 @@
 // transcript and carries a parseable JSON answer (the one thing a truncated message cannot do), and the proof
 // then reports stopReasonMissing: true. The final line must also hold a text block. Callers still require the
 // rulings to validate against every expected id.
+//
+// Hand-back finals: a background subagent delivers its report through a SubagentHandback tool call, and plain
+// text at the end of such a session is NOT delivered. So the final answer is the call's input.message, and it
+// counts only when the transcript proves delivery: the call is the only block of the closing line (any other
+// tool name, extra block or extra input key is refused), its input matches the wire copy when one is logged,
+// and the very next and LAST line is the tool_result acknowledgment (success, toolEndsTurn, same tool_use id).
+// Text in earlier blocks of that message was never delivered and is ignored. A hand-back's stop_reason is null
+// or tool_use; with null the message must still hold a complete JSON answer. The proof reports finalVia:
+// 'text' | 'handback' (null when the final message is not proven).
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
@@ -150,11 +160,62 @@ function isPromptTurn(line) {
   return typeof content === 'string' || (Array.isArray(content) && content.some((b) => isPlainObject(b) && b.type === 'text'));
 }
 
+const HANDBACK_TOOL = 'SubagentHandback';
+const blocksOf = (content) => (Array.isArray(content) ? content : []);
+const isHandbackCall = (b) => isPlainObject(b) && b.type === 'tool_use' && b.name === HANDBACK_TOOL;
+
+// Why the user line that should acknowledge the hand-back call `id` does not, or null when it does.
+function ackProblem(line, id) {
+  if (line === null || line.type !== 'user') return 'not a user line';
+  const content = isPlainObject(line.message) ? line.message.content : undefined;
+  if (!Array.isArray(content) || content.length !== 1 || !isPlainObject(content[0]) || content[0].type !== 'tool_result') {
+    return 'message.content is not one tool_result block';
+  }
+  if (content[0].tool_use_id !== id) return 'tool_result is not for this call';
+  if (content[0].is_error === true) return 'tool_result is an error';
+  if (!isPlainObject(line.toolUseResult) || line.toolUseResult.success !== true) return 'toolUseResult.success is not true';
+  if (line.toolEndsTurn !== true) return 'toolEndsTurn is not true';
+  return null;
+}
+
+// Judges the closing line of a final message that holds a SubagentHandback call. Pushes an error for every
+// broken rule (see the header) and returns the delivered message when the call and its acknowledgment are
+// structurally proven, else null. stop_reason and JSON completeness are the caller's.
+function checkHandback({ closingEntry, closing, parsed, lastLineN, errors }) {
+  const content = isPlainObject(closing) ? closing.content : undefined;
+  if (!Array.isArray(content) || content.length !== 1 || !isHandbackCall(content[0])) {
+    errors.push('hand-back must be the only content block of the final line');
+    return null;
+  }
+  const call = content[0];
+  let ok = true;
+  const fail = (msg) => { errors.push(msg); ok = false; };
+  if (typeof call.id !== 'string' || call.id === '') fail('hand-back tool_use has no id');
+  const input = call.input;
+  const inputOk = isPlainObject(input) && Object.keys(input).length === 1 && has(input, 'message') && typeof input.message === 'string' && input.message.trim() !== '';
+  if (!inputOk) fail('hand-back input must be {message: <non-empty string>}');
+  const wire = closingEntry.line.wireToolInputs;
+  if (has(closingEntry.line, 'wireToolInputs')) {
+    if (!isPlainObject(wire)) fail('hand-back wireToolInputs is not an object');
+    else if (typeof call.id === 'string' && has(wire, call.id) && !isDeepStrictEqual(wire[call.id], input)) fail('hand-back input differs from its wire input');
+  }
+  const after = parsed.filter((p) => p.n > closingEntry.n);
+  if (after.length === 0) {
+    fail('hand-back not acknowledged');
+  } else {
+    const problem = ackProblem(after[0].line, call.id);
+    if (problem !== null) fail(`hand-back acknowledgment invalid: ${problem}`);
+    if (after.length > 1 || after[after.length - 1].n !== lastLineN) fail('extra lines after the hand-back acknowledgment');
+  }
+  return ok ? input.message : null;
+}
+
 export function proveModel({ jsonlText, metaText, expectModelPrefix, expectEffort, expectMetaModel = null, expectAgentType = null }) {
   const errors = [];
   const models = new Map();
   const efforts = new Map();
   const asst = []; // { line, n } for every assistant line, in file order
+  const parsed = []; // { line, n } for every non-blank line (line is null when unparseable), in file order
   let lastLineN = 0; // 1-based number of the last non-blank line of the transcript
   let firstUserText = null;
   let promptTurns = 0;
@@ -183,6 +244,7 @@ export function proveModel({ jsonlText, metaText, expectModelPrefix, expectEffor
       } catch {
         line = undefined;
       }
+      parsed.push({ line: isPlainObject(line) ? line : null, n });
       if (!isPlainObject(line)) {
         errors.push(`unparseable line ${n}`);
         continue;
@@ -255,33 +317,61 @@ export function proveModel({ jsonlText, metaText, expectModelPrefix, expectEffor
   let finalAssistantText = '';
   let finalStopReason = null;
   let stopReasonMissing = false;
+  let finalVia = null;
   if (asst.length > 0) {
     const last = asst[asst.length - 1];
     const id = isPlainObject(last.line.message) ? last.line.message.id : undefined;
     const group = typeof id === 'string' && id !== '' ? asst.filter((a) => a.line.message?.id === id) : [last];
-    const closing = group[group.length - 1].line.message;
+    const closingEntry = group[group.length - 1];
+    const closing = closingEntry.line.message;
     finalStopReason = isPlainObject(closing) && closing.stop_reason !== undefined ? closing.stop_reason : null;
-    finalAssistantText = group.flatMap((a) => textBlocks(a.line.message?.content)).join('\n');
-    // null/absent is a streaming snapshot (see header); any other explicit value is a real non-answer.
-    if (finalStopReason !== null && finalStopReason !== 'end_turn') {
-      errors.push(`final message incomplete (stop_reason ${String(finalStopReason)})`);
-    }
-    // The last line must itself carry text: a group ending in tool_use or thinking has not answered yet.
-    if (textBlocks(closing?.content).length === 0) {
-      errors.push('final message is not a text answer');
-    } else if (finalAssistantText.trim() === '') {
-      errors.push('final message has no text');
-    }
-    // No stop_reason: nothing says the message finished, so it must at least be the end of the transcript and hold a
-    // complete JSON answer.
-    if (finalStopReason === null) {
-      stopReasonMissing = true;
-      if (group[group.length - 1].n !== lastLineN) errors.push('final message has no stop_reason and is not the last line of the transcript');
-      let answer = null;
-      try {
-        answer = extractJsonBlock(finalAssistantText);
-      } catch { /* reported below */ }
-      if (!isPlainObject(answer)) errors.push('final message has no stop_reason and carries no complete JSON answer (a truncated message cannot be ruled out)');
+    const errorsBefore = errors.length;
+    // Any SubagentHandback call in the final message makes it a hand-back attempt: it is then judged as one (and
+    // fails closed), never as a plain-text answer that happens to sit beside the call.
+    const isHandbackAttempt = group.some((a) => blocksOf(a.line.message?.content).some(isHandbackCall));
+
+    if (isHandbackAttempt) {
+      const delivered = checkHandback({ closingEntry, closing, parsed, lastLineN, errors });
+      // tool_use is the ordinary stop_reason of a tool-call message; null is a streaming snapshot (see header).
+      if (finalStopReason !== null && finalStopReason !== 'tool_use') {
+        errors.push(`final message incomplete (stop_reason ${String(finalStopReason)})`);
+      }
+      if (delivered !== null) {
+        finalAssistantText = delivered;
+        if (finalStopReason === null) {
+          stopReasonMissing = true;
+          let answer = null;
+          try {
+            answer = extractJsonBlock(delivered);
+          } catch { /* reported below */ }
+          if (!isPlainObject(answer)) errors.push('final message has no stop_reason and carries no complete JSON answer (a truncated message cannot be ruled out)');
+        }
+      }
+      if (errors.length === errorsBefore) finalVia = 'handback';
+    } else {
+      finalAssistantText = group.flatMap((a) => textBlocks(a.line.message?.content)).join('\n');
+      // null/absent is a streaming snapshot (see header); any other explicit value is a real non-answer.
+      if (finalStopReason !== null && finalStopReason !== 'end_turn') {
+        errors.push(`final message incomplete (stop_reason ${String(finalStopReason)})`);
+      }
+      // The last line must itself carry text: a group ending in tool_use or thinking has not answered yet.
+      if (textBlocks(closing?.content).length === 0) {
+        errors.push('final message is not a text answer');
+      } else if (finalAssistantText.trim() === '') {
+        errors.push('final message has no text');
+      }
+      // No stop_reason: nothing says the message finished, so it must at least be the end of the transcript and hold a
+      // complete JSON answer.
+      if (finalStopReason === null) {
+        stopReasonMissing = true;
+        if (closingEntry.n !== lastLineN) errors.push('final message has no stop_reason and is not the last line of the transcript');
+        let answer = null;
+        try {
+          answer = extractJsonBlock(finalAssistantText);
+        } catch { /* reported below */ }
+        if (!isPlainObject(answer)) errors.push('final message has no stop_reason and carries no complete JSON answer (a truncated message cannot be ruled out)');
+      }
+      if (errors.length === errorsBefore) finalVia = 'text';
     }
   }
 
@@ -295,6 +385,7 @@ export function proveModel({ jsonlText, metaText, expectModelPrefix, expectEffor
     finalAssistantText,
     finalStopReason,
     stopReasonMissing,
+    finalVia,
   };
 }
 

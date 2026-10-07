@@ -99,7 +99,9 @@ final message, and applies them.
 - Exit 1 ⇒ the round's arbitrated items are already marked `needsHuman` (reason `model-proof`);
   continue to the end of the round, then stop with `needs-human`.
 - `stopReasonMissing: true` in the output is informational: an interactive transcript did not record
-  `stop_reason`, and the proof accepted it because the answer was a complete JSON block.
+  `stop_reason`, and the proof accepted it because the answer was a complete JSON block. `finalVia` says
+  where the answer came from: `text` (final message) or `handback` (the subagent's `SubagentHandback` report,
+  accepted only when its acknowledgment is the transcript's last line).
 Rulings are final except: low confidence, or dismissing a BLOCKING security / auth /
 permissions / data-integrity / data-loss item ⇒ `needsHuman` (the CLI applies this).
 
