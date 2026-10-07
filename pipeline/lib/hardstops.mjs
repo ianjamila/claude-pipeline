@@ -635,8 +635,10 @@ function pythonStatements(lines) {
 // strings. Over-joining here only ever adds candidates. One linear pass: the head of the open statement (`from X import` or
 // `import`) is carried, and each continuation line becomes its own short `<head> <names>` segment, so no file shape can make it
 // quadratic and no padding (blank or comment lines) can separate a name from its head.
-const PY_BRACKET_FROM = /^\s*(from\s+\.*[\w.]*\s+import)\s*\(/;
-const PY_HEAD = /^\s*(from\s+\.*[\w.]*\s+import|import)\s/;
+// Heads are found anywhere on the line (`x = 1; from app import (`, `if c: import os, \`), and the LAST one on a line opens.
+const PY_BRACKET_FROM = /(?:^|[;:])\s*(from\s+\.*[\w.]*\s+import)\s*\(/g;
+const PY_HEAD = /(?:^|[;:])\s*(from\s+\.*[\w.]*\s+import|import)\s/g;
+const lastMatch = (re, s) => { let m = null; for (const x of s.matchAll(re)) m = x; return m; };
 function pythonImportFallback(lines) {
   const segs = [];
   let head = null; // the head of the statement still open on this line
@@ -644,19 +646,21 @@ function pythonImportFallback(lines) {
   let headLine = 0; // 1-based line of the head: each segment spans head..this line, so an edit to the head alone counts too
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    const names = line.replace(/#.*$/, '').replace(/\\\s*$/, '');
+    // Brackets and continuations are judged on the comment-stripped text: a `)` in a comment neither closes nor blocks a statement.
+    const code = line.replace(/#.*$/, '');
+    const names = code.replace(/\\\s*$/, '');
     if (head !== null) {
       segs.push({ text: `${head} ${names.replace(/[()]/g, ' ').trim()}`, from: headLine, to: i + 1 });
-      if (bracket ? line.includes(')') : !/\\\s*$/.test(line)) head = null;
+      if (bracket ? code.includes(')') : !/\\\s*$/.test(code)) head = null;
       continue;
     }
-    const b = PY_BRACKET_FROM.exec(line);
-    if (b && !line.slice(line.indexOf('(')).includes(')')) {
+    const b = lastMatch(PY_BRACKET_FROM, code);
+    if (b && !code.slice(b.index + b[0].length).includes(')')) {
       head = b[1];
       bracket = true;
       headLine = i + 1;
-    } else if (/\\\s*$/.test(line)) {
-      const h = PY_HEAD.exec(line);
+    } else if (/\\\s*$/.test(code)) {
+      const h = lastMatch(PY_HEAD, code);
       if (h) {
         head = h[1];
         bracket = false;
@@ -1512,13 +1516,16 @@ function parseJson(text) {
 // through the import resolver; an importer that is a test file joins the chain and the next round looks for ITS importers.
 // Fails closed (every changed test file concerned is flagged) when a git call fails, a round finds more than `maxFiles` files,
 // the chain grows past MAX_CHAIN_FILES or MAX_CHAIN_ROUNDS, or a name cannot be searched for.
-const CODE_PATHSPECS = ['*.js', '*.mjs', '*.cjs', '*.jsx', '*.ts', '*.tsx', '*.mts', '*.cts', '*.vue', '*.svelte', '*.astro', '*.py', '*.pyi', '*.rb', '*.rake'];
+// Every file the import parser reads (JS_FAMILY / PY_FILE / RB_FILE; a plain pathspec's `*` also matches `/`, so `*Gemfile` is
+// any directory's Gemfile). Keep in step with those three tests: a language missing here is a blind spot for the reverse check.
+const CODE_PATHSPECS = ['*.js', '*.mjs', '*.cjs', '*.jsx', '*.ts', '*.tsx', '*.mts', '*.cts', '*.vue', '*.svelte', '*.astro', '*.mdx',
+  '*.py', '*.pyi', '*.rb', '*.rake', '*.gemspec', '*.ru', '*Rakefile', '*Gemfile'];
 const MAX_CHAIN_ROUNDS = 5;
 const MAX_CHAIN_FILES = 300;
 const READ_BATCH = 200;
 const MAX_HEAD_TEXT = 2_000_000;
-// The same source languages as CODE_PATHSPECS, as a path test (whole-file import reading applies only to these).
-const IMPORT_SOURCE = new RegExp(`\\.(?:${CODE_PATHSPECS.map((s) => s.slice(2)).join('|')})$`, 'i');
+// Whole-file import reading applies to exactly the files the parser reads (the same three tests importSpecifiers uses).
+const IMPORT_SOURCE = { test: (p) => JS_FAMILY.test(p) || PY_FILE.test(p) || RB_FILE.test(p) };
 const stem = (p) => {
   const b = baseName(p);
   const dot = b.lastIndexOf('.');
