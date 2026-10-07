@@ -866,3 +866,10 @@ test('hand-back: the usual model/effort checks still apply to the hand-back line
   assert.equal(r.finalVia, 'handback');
   assert.equal(r.finalAssistantText, HB_MESSAGE);
 });
+
+test('hand-back: finalAssistantText is the hand-back message only, never text from earlier blocks of the same message', () => {
+  const r = proveText([userLine('p'), asstLine({ id: 'msg_hb', stop: null, content: text('Draft that was never delivered.') }), hbLine(), ackLine()]);
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.finalVia, 'handback');
+  assert.equal(r.finalAssistantText, HB_MESSAGE);
+});
