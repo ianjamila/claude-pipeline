@@ -18,7 +18,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
-import { simpleCommands, commandName, scriptFileOf } from './shell-parse.mjs';
+import { simpleCommands, commandName, scriptFileOf, noexecShadowRisk, isTrustedShellPath } from './shell-parse.mjs';
 
 const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
@@ -950,7 +950,10 @@ const WRITE_HINT = /write|append|unlink|\brm\b|rmSync|rmdir|rename|copy|\bcp\b|\
 // typed on the line. A shell script that exists but cannot be read is denied; a missing file runs nothing; a
 // program run by path, an interpreter file that cannot be read, a node_modules package and the pipeline's own
 // installed files are not judged (the installed CLI legitimately names its own settings).
-function judgeScriptFile(sf, dirs, ctx, opts) {
+function judgeScriptFile(sf, argv, dirs, ctx, opts) {
+  // `bash -n f.sh` only checks syntax - when `bash` is the real shell. A function, alias, PATH change or non-system
+  // program may have replaced it (seen anywhere in the line or in a script read so far), so then the file is judged.
+  if (sf.noexec && isTrustedShellPath(argv[0]) && !opts._seen.risk) return null;
   const e = expandRefs(sf.file, ctx);
   if (/[$`]/.test(e)) return null; // named at run time: the textual rules on the whole line still apply
   const found = [];
@@ -1060,9 +1063,12 @@ function linkReachesProtected(cmds, dirs, ctx) {
 // ---- Bash --------------------------------------------------------------------------------------------
 
 export function evaluateBashForFiles(command, opts = {}) {
+  const raw = typeof command === 'string' ? command : '';
+  // one flag shared by the line and every script it reads (opts is copied down the nesting): see judgeScriptFile
+  if (!opts._seen) opts = { ...opts, _seen: { risk: false } };
+  if (!opts._seen.risk && noexecShadowRisk(raw)) opts._seen.risk = true;
   const ctx = makeCtx(opts);
   if (ctx.admin) return allow();
-  const raw = typeof command === 'string' ? command : '';
   if (!raw.trim()) return allow();
   if (raw.length > MAX_LINE_CHARS) {
     // too long to scan in the time budget: judged by what it mentions once quotes and escapes are removed
@@ -1120,7 +1126,7 @@ export function evaluateBashForFiles(command, opts = {}) {
     for (const c of cmds) {
       const sf = scriptFileOf(c.argv);
       if (!sf) continue;
-      const v = judgeScriptFile(sf, dirs, ctx, opts);
+      const v = judgeScriptFile(sf, c.argv, dirs, ctx, opts);
       if (v) return v;
     }
   } else if (cmds.some((c) => scriptFileOf(c.argv))) return deny('scripts run scripts too deeply to check');

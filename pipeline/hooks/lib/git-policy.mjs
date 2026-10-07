@@ -14,7 +14,7 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { commandName, simpleCommands, splitArgs, scriptFileOf } from './shell-parse.mjs';
+import { commandName, simpleCommands, splitArgs, scriptFileOf, noexecShadowRisk, isTrustedShellPath } from './shell-parse.mjs';
 import { catchAllReason, guardedCommandText } from './guarded-text.mjs';
 
 const PROTECTED_BRANCHES = ['main', 'master'];
@@ -703,9 +703,12 @@ const isNodeModulesOrPipelineHome = (p) => /[\\/]node_modules[\\/]/.test(p) || /
 // it like the same text typed on the line. A shell script that exists but cannot be read is denied (what runs is
 // unknown); one that does not exist runs nothing. Programs run by path and interpreter files are only scanned when
 // readable (a binary, a huge generated file or a package under node_modules is not ours to judge).
-function checkScriptFile(sf, dir, ctx, level) {
+function checkScriptFile(sf, dir, ctx, level, argv) {
+  // `bash -n f.sh` only checks syntax - when `bash` is the real shell. A function, alias, PATH change or non-system
+  // program may have replaced it (seen anywhere in the line or in a script read so far), so then the file is judged.
+  if (sf.noexec && isTrustedShellPath(argv[0]) && !ctx.shadowRisk) return null;
   const file = expandVars(sf.file, ctx.vars);
-  if (/^\$\{?HOME\}?(?=\/|$)/.test(file)) return checkScriptFile({ ...sf, file: ctx.home + file.replace(/^\$\{?HOME\}?/, '') }, dir, ctx, level);
+  if (/^\$\{?HOME\}?(?=\/|$)/.test(file)) return checkScriptFile({ ...sf, file: ctx.home + file.replace(/^\$\{?HOME\}?/, '') }, dir, ctx, level, argv);
   if (DYNAMIC.test(file)) {
     return sf.kind !== 'exec' && GUARDED_WORDS.test(ctx.fullText)
       ? deny(`the script "${sf.file}" is named at run time and the line mentions a guarded operation, so what it runs cannot be verified. Name the file.`)
@@ -730,13 +733,20 @@ function checkScriptFile(sf, dir, ctx, level) {
     return why ? deny(`the program ${sf.file} contains a guarded command (${why}); it cannot be verified by the guard. Run the operation directly.`) : null;
   }
   if (level >= MAX_NESTING) return deny(`the script ${sf.file} is nested too deeply (scripts running scripts) to verify.`);
-  const v = text.length > MAX_LINE_CHARS ? judgeLongText(text) : evalString(text, dir, ctx, level + 1);
+  const v = text.length > MAX_LINE_CHARS ? (noteText(ctx, text), judgeLongText(text)) : evalString(text, dir, ctx, level + 1);
   return v.decision === 'deny' ? deny(`the script ${sf.file} would run a blocked command: ${v.reason}`) : null;
 }
 
 // ---- entry point ----------------------------------------------------------------------------------------
 
+// Every text looked at (the line, each nested script, -c string) is scanned for something that could replace a shell
+// name; the flag is sticky, so a definition in an enclosing script or an earlier sourced file is seen by what follows.
+function noteText(ctx, text) {
+  if (!ctx.shadowRisk && noexecShadowRisk(text)) ctx.shadowRisk = true;
+}
+
 function evalString(str, startDir, ctx, level) {
+  noteText(ctx, str);
   if (level > MAX_NESTING) return deny('pipeline job start / alias is nested too deeply to verify.');
   const cmds = simpleCommands(str);
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (`g''it push` after
@@ -770,7 +780,7 @@ function evalString(str, startDir, ctx, level) {
         if (why) verdict = deny(`${name} was given a string that contains a guarded command (${why}). Run the operation directly so it can be checked.`);
       }
       const sf = verdict ? null : scriptFileOf(argv);
-      if (sf) verdict = checkScriptFile(sf, dir, ctx, level);
+      if (sf) verdict = checkScriptFile(sf, dir, ctx, level, argv);
     }
     if (verdict && verdict.decision === 'deny') return verdict;
   }
@@ -797,7 +807,7 @@ export function evaluateGitCommand(command, {
   const ctx = {
     cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, fullText: text,
     vars: Object.create(null), gitAliases: Object.create(null), ghAliases: Object.create(null),
-    branches: new Map(), cfgDirty: false, envCfgDirty: false,
+    branches: new Map(), cfgDirty: false, envCfgDirty: false, shadowRisk: false,
   };
   return evalString(text, path.resolve(base), ctx, 0);
 }

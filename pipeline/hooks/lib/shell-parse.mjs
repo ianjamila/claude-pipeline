@@ -475,13 +475,16 @@ const INTERP_VALUE_FLAGS = new Set(['-r', '--require', '--import', '--loader', '
 // {kind:'shell'} is run as a shell script (the caller judges its commands), {kind:'interp'} is program text in
 // another language (the caller scans it), {kind:'exec'} is a program run by path (shell or interpreter, from its
 // shebang). Null when the command runs no file (`bash -c`, stdin, process substitution, `node -e`, a test runner).
+// A shell file run with only syntax-check options is marked `noexec: true`: it runs nothing IF the shell name still
+// means the real shell, which only the caller can know (see isTrustedShellPath and noexecShadowRisk below).
 export function scriptFileOf(argv) {
   if (!argv.length) return null;
   const name = base(argv[0]);
   if (SHELLS.has(name)) {
     const r = shellInvocation(argv);
-    if (r.kind === 'file' && r.noexec) return null; // `bash -n f.sh` only checks syntax: no file runs
-    return r.kind === 'file' && !r.text.startsWith('<(') ? { kind: 'shell', file: r.text } : null;
+    if (r.kind !== 'file' || r.text.startsWith('<(')) return null;
+    // `bash -n f.sh` only checks syntax, but only if `bash` is the real shell: the caller decides (isTrustedShellPath, noexecShadowRisk)
+    return r.noexec ? { kind: 'shell', file: r.text, noexec: true } : { kind: 'shell', file: r.text };
   }
   if (name === 'source' || name === '.') {
     const op = argv[1];
@@ -504,6 +507,36 @@ export function scriptFileOf(argv) {
   if (/[/]/.test(argv[0]) && !argv[0].includes('\\') && !SYSTEM_BIN.test(argv[0])) return { kind: 'exec', file: argv[0] };
   return null;
 }
+
+// A program run as `bash` is the real shell when it is a bare name (looked up on PATH, which noexecShadowRisk
+// watches) or sits directly in a system bin directory. `./bash`, `/tmp/x/bash` or `bin/bash` may be anything.
+const TRUSTED_SHELL_PATH = /^(?:\/bin|\/usr\/bin|\/usr\/local\/bin|\/opt\/homebrew\/bin)\/[^/\\]+$/;
+export function isTrustedShellPath(argv0) {
+  if (typeof argv0 !== 'string' || !argv0) return false;
+  if (!/[/\\]/.test(argv0)) return true;
+  return TRUSTED_SHELL_PATH.test(argv0);
+}
+
+// Could this text change what a shell name runs? A function, alias or hash entry named like a shell, a PATH change,
+// or code that is not in the text (source, eval, `.`). A `bash -n f.sh` is only a syntax check when it is not true.
+// Over-matching is fine: the file is then judged as if it ran. Bounded quantifiers keep long lines linear.
+const SHELL_NAMES = [...SHELLS].join('|');
+const SHADOW_PATTERNS = [
+  new RegExp(`\\b(?:${SHELL_NAMES})['"]?\\s*\\(\\s*\\)`), // bash(){ ... }  'bash'()  bash ( )
+  new RegExp(`\\bfunction\\s+['"]?(?:${SHELL_NAMES})\\b`), // function bash { ... }
+  /[\w'"\\]{0,100}['"\\][\w'"\\]{0,100}\s*\(\s*\)/, // a quoted or escaped function name (b""ash(){ ... })
+  /\b(?:functions|aliases|galiases|commands)\s*\[/, // zsh tables that hold function and command names
+  /\b(?:alias|hash|enable|command_not_found_handle|source|eval)\b/,
+  /(?:^|[;&|({\n]|\b(?:then|do|else|elif|if|while|until)\b)\s*\.(?=\s|$)/, // `. file` as a command
+  /\b(?:PATH|path)\s*(?:\+?=|\[)/, // PATH=  PATH+=  path=(...)  path+=(...)
+  /\b(?:export|typeset|declare|readonly|local|read)\b[^;&|\n]{0,200}\b(?:PATH|path)\b/,
+  /\bprintf\s+-v\s+(?:PATH|path)\b/,
+];
+export function noexecShadowRisk(text) {
+  const t = typeof text === 'string' ? text : '';
+  return SHADOW_PATTERNS.some((re) => re.test(t));
+}
+
 const INTERPRETER_NO_EXT = new Set(['python', 'ruby', 'perl', 'php']);
 
 const PWSH_VALUE_FLAGS = ['executionpolicy', 'windowstyle', 'workingdirectory', 'inputformat', 'outputformat', 'version', 'configurationname', 'settingsfile', 'custompipename'];

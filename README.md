@@ -130,7 +130,7 @@ The label-based approvals rely on the local hook because the agents use your Git
   a determined adversary with encoded payloads. GitHub branch protection is the hard boundary.
   Coverage: Bash and PowerShell, `Monitor` commands, MCP tool calls and shell script files that contain
   a guarded command (a syntax-only run such as `bash -n f.sh`, `sh -n`, `zsh -n` or `-o noexec` is not
-  treated as running the file only when it uses just `-n`/`-x`/`-v`/`-e`/`-u`, `-o noexec` or `--no-execute`; any other option, `bash -n -c '…'`, stdin and `<(…)` stay judged). They also deny a command line too long to be read in full (when it contains a
+  treated as running the file only when it uses just `-n`/`-x`/`-v`/`-e`/`-u`, `-o noexec` or `--no-execute` AND the shell is a system shell (a bare name or a path in /bin, /usr/bin, /usr/local/bin or /opt/homebrew/bin) with no function, alias, hash, `source`/`eval` or PATH change anywhere on the line or in a script read so far; any other option, `bash -n -c '…'`, stdin and `<(…)` stay judged). They also deny a command line too long to be read in full (when it contains a
   guarded word), a push to a dynamic destination (only `$(git branch --show-current)`,
   `$(git rev-parse --abbrev-ref HEAD)` or a variable assigned a literal in the same command are
   understood; ship pushes `git push -u origin agent/<slug>`), `unset CLAUDECODE`, and setting
