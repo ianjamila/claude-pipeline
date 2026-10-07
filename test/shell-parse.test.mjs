@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { splitArgs, simpleCommands, commandName, allRedirects, scriptFileOf } from '../pipeline/hooks/lib/shell-parse.mjs';
+import { splitArgs, simpleCommands, commandName, allRedirects, scriptFileOf, noexecShadowRisk, isTrustedShellPath } from '../pipeline/hooks/lib/shell-parse.mjs';
 
 const argvs = (s, o) => simpleCommands(s, o).map((c) => c.argv.join(' '));
 const sorted = (a) => [...a].sort();
@@ -939,12 +939,12 @@ test('wrappers that run nothing of ours are left alone', () => {
 
 // ---- script files (review finding 2) ------------------------------------------------------------------------
 
-test('scriptFileOf: a noexec shell invocation (bash -n f) runs no file, unless noexec is switched off again', () => {
+test('scriptFileOf: a noexec shell invocation (bash -n f) is marked noexec (the caller decides), unless noexec is switched off again', () => {
   const f = (s) => scriptFileOf(s.split(' '));
   for (const c of [
     'bash -n f.sh', '/bin/bash -n f.sh', 'bash -xn f.sh', 'bash -nx f.sh', 'sh -n f.sh', 'zsh -n f.sh',
     'bash -o noexec f.sh', 'fish --no-execute f.fish', 'bash -nv f.sh', 'bash -eu -n f.sh', 'bash -n -- f.sh',
-  ]) assert.equal(f(c), null, c);
+  ]) assert.deepEqual(f(c), { kind: 'shell', file: c.startsWith('fish') ? 'f.fish' : 'f.sh', noexec: true }, c);
   const file = (s) => (s.startsWith('fish') ? 'f.fish' : 'f.sh');
   for (const c of ['bash -n +n f.sh', 'bash +n -n f.sh', 'bash -n -i f.sh', 'bash -in f.sh', 'bash -o noexec +o noexec f.sh', 'bash f.sh -n', 'bash f.sh']) {
     assert.deepEqual(f(c), { kind: 'shell', file: file(c) }, c);
@@ -966,7 +966,7 @@ test('scriptFileOf: a noexec shell invocation with a word the shell expands firs
     'bash -n {+n,f.sh}', 'bash -n *', 'bash -n +[n] f.sh', 'bash -n ?n f.sh', 'bash -O $X -n f.sh', 'bash -n f*.sh',
   ]) assert.equal(f(c)?.kind, 'shell', c);
   // a run-time word AFTER the operand is only an argument to the script
-  assert.equal(f('bash -n f.sh $X'), null);
+  assert.deepEqual(f('bash -n f.sh $X'), { kind: 'shell', file: 'f.sh', noexec: true });
 });
 
 test('scriptFileOf names the file a shell, source, interpreter or path invocation will run', () => {
@@ -998,4 +998,24 @@ test('scriptFileOf names the file a shell, source, interpreter or path invocatio
   assert.equal(f('ls -la'), null);
   assert.equal(f('/usr/bin/git status'), null);
   assert.equal(f('/usr/local/bin/node'), null);
+});
+
+test('noexecShadowRisk: text that can change what a shell name runs (function, alias, PATH, source, eval, ...)', () => {
+  for (const t of [
+    'bash(){ command bash "${@:2}"; }', 'bash () { :; }', 'sh(){ :; }', 'zsh ( ) { :; }', 'function bash { :; }', 'function  dash() { :; }', "'bash'() { :; }",
+    'b""ash() { :; }', 'functions[bash]=x', 'aliases[bash]=x', 'alias bash=x', 'hash -p /tmp/x bash', 'enable -n x', 'command_not_found_handle() { :; }',
+    'source f', 'eval x', '. f', 'echo hi; . f', 'a && . f', '(. f)', '{ . f; }', 'if x; then . f; fi', 'echo hi\n. f',
+    'PATH=/tmp/x:$PATH bash', 'PATH+=:/x', 'path=(/x $path)', 'path+=(/x)', 'export PATH=/x', 'export -n PATH', 'typeset -x PATH', 'declare -g path', 'readonly PATH', 'local PATH=x',
+  ]) assert.equal(noexecShadowRisk(t), true, t);
+  for (const t of [
+    '', 'bash -n push.sh', '/bin/bash -n push.sh', 'cd sub && bash -n push.sh', 'echo $PATH', 'ls ./f', 'echo hi; ls .', 'git status', 'export FOO=1', 'MYPATH=x bash -n f',
+    'echo bashful() ', 'ls ../x', 'echo "a . b"', 'echo a.b',
+  ]) assert.equal(noexecShadowRisk(t), false, t);
+});
+
+test('isTrustedShellPath: a bare name or an absolute path in a system bin directory', () => {
+  for (const p of ['bash', 'sh', 'zsh', '/bin/bash', '/usr/bin/bash', '/usr/local/bin/zsh', '/opt/homebrew/bin/bash']) assert.equal(isTrustedShellPath(p), true, p);
+  for (const p of ['./bash', '../bash', '/tmp/x/bash', 'bin/bash', 'x/bash', '/bin/x/bash', '/usr/sbin/bash', '/opt/homebrew/sbin/bash', '~/bin/bash', '$HOME/bash', 'C:\\x\\bash', 'a\\bash', '/binx/bash', '/bin/../tmp/bash', '']) {
+    assert.equal(isTrustedShellPath(p), false, p);
+  }
 });

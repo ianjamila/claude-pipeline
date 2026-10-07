@@ -1118,6 +1118,33 @@ test('bash -n with a word the shell expands first (the parser cannot know it is 
   assert.equal(ev('/bin/bash -n push.sh'), 'allow');
 });
 
+test('bash -n is only a syntax check when nothing can have replaced bash: functions, aliases, PATH, a non-system program, source/eval all keep the file judged', () => {
+  const files = {
+    'push.sh': 'echo hi\ngit push origin main\n',
+    'outer.sh': 'bash() { command bash "${@:2}"; }\nbash -n push.sh\n',
+    'outer2.sh': 'echo start\nbash -n push.sh\n',
+  };
+  const ev = (c) => evaluate(c, withFiles(files)).decision;
+  for (const c of [
+    'bash(){ command bash "${@:2}"; }; bash -n push.sh',
+    'bash () { command bash "${@:2}"; }; bash -n push.sh',
+    'function bash { command bash "${@:2}"; }; bash -n push.sh',
+    'sh(){ command sh "${@:2}"; }; sh -n push.sh',
+    './bash -n push.sh', '/tmp/x/bash -n push.sh', 'bin/bash -n push.sh',
+    'PATH=/tmp/x:$PATH bash -n push.sh', 'export PATH=/tmp/x:$PATH; bash -n push.sh', 'path=(/tmp/x $path); bash -n push.sh',
+    "alias bash='bash -c :'; bash -n push.sh", 'source defs.sh; bash -n push.sh', '. defs.sh; bash -n push.sh', 'eval x; bash -n push.sh',
+    'bash outer.sh',
+  ]) assert.equal(ev(c), 'deny', c);
+  for (const c of ['bash -n push.sh', '/bin/bash -n push.sh', '/usr/bin/bash -n push.sh', '/opt/homebrew/bin/bash -n push.sh', '/usr/bin/env bash -n push.sh', 'bash -n outer2.sh', 'echo hi; bash -n push.sh']) {
+    assert.equal(ev(c), 'allow', c);
+  }
+  // the directory a command runs in still applies to an exempt file
+  const dirFiles = { sub: null, [resolve('/work/repo/sub/push.sh')]: 'git push origin main' };
+  const sub = { readText: (p) => dirFiles[p] ?? null, pathExists: (p) => p in dirFiles };
+  assert.equal(evaluate('cd sub && bash -n push.sh', sub).decision, 'allow');
+  assert.equal(evaluate('cd sub && bash push.sh', sub).decision, 'deny');
+});
+
 test('a shell script that exists but cannot be read is denied; one that does not exist is not', () => {
   const unreadable = { readText: () => null, pathExists: () => true };
   assert.equal(evaluate('bash big.sh', unreadable).decision, 'deny');

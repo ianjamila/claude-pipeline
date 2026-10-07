@@ -820,4 +820,10 @@ test('hook: a script file in the real working directory is read by the hook', (t
   // a syntax-only run (bash -n) runs nothing; a later +n turns the check back into a real run
   assert.equal(run('bash -n w.sh').stdout, '');
   assert.equal(JSON.parse(run('bash -n +n w.sh').stdout).hookSpecificOutput.permissionDecision, 'deny');
+  // ... but only while nothing can have replaced bash (a function, PATH, a non-system program)
+  fs.writeFileSync(path.join(home, 'proj', 'outer.sh'), 'bash() { command bash "${@:2}"; }\nbash -n w.sh\n');
+  for (const c of ['bash(){ command bash "${@:2}"; }; bash -n w.sh', 'PATH=/tmp/x:$PATH bash -n w.sh', './bash -n w.sh', 'bash outer.sh']) {
+    assert.equal(JSON.parse(run(c).stdout).hookSpecificOutput.permissionDecision, 'deny', c);
+  }
+  assert.equal(run('/bin/bash -n w.sh').stdout, '');
 });
