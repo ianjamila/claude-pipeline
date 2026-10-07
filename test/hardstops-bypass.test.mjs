@@ -549,6 +549,14 @@ test('13 a line stuffed with import specifiers stays fast (and is flagged as unr
   }
 });
 
+test('13 the whole-file import scan stays linear on a ~1.5 MB file of adversarial shapes', () => {
+  const shapes = [[';from a import '.repeat(100_000), 'a.py'], ['from' + ' '.repeat(1_500_000), 'a.ts'], ['require("'.repeat(190_000), 'a.ts'], [';import a, '.repeat(100_000), 'a.py'], ['"""\n'.repeat(250_000), 'a.py']];
+  for (const [text, name] of shapes) {
+    const { ms } = cpuMs(() => run([file(`lib/${name}`, { added: ['x = 1'] })], { headFiles: new Map([[`lib/${name}`, text]]) }));
+    assert.ok(ms < 1500, `${text.slice(0, 20)}... took ${Math.round(ms)}ms of CPU`);
+  }
+});
+
 test('13 an oversized SQL statement is unscannable instead of regex-scanned', () => {
   const { value: hits, ms } = cpuMs(() => classify({ files: [], config: cfg(), sqlStatements: [{ file: MIG, text: 'alter table x '.repeat(75_000) }] }));
   assert.ok(ms < 1000, `took ${Math.round(ms)}ms of CPU`);
