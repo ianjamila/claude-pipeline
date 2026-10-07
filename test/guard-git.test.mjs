@@ -93,6 +93,13 @@ const DENY = [
   ['node ~/.claude/pipeline/bin/pipeline.mjs job start x -- gh pr edit 1 --add-label human-approved'],
   ['node /h/.claude/pipeline/bin/pipeline.mjs job start x -- git push origin main'],
   ['gh label delete needs-human --yes'],
+  // a gh / git subcommand still holding a run-time expansion after known variables are substituted
+  ['X=merge-base; gh pr ${X%-base} 5 --admin'],
+  ['gh pr "$(printf merge)" 5 --admin'],
+  ['gh pr \`echo merge\` 5 --admin'],
+  ['gh ${G:-pr} merge 5 --admin'],
+  ['X=pu; git ${X}${Y:-sh} origin main'],
+  ['git "$(printf push)" origin main'],
 ];
 
 const ALLOW = [
@@ -121,6 +128,12 @@ const ALLOW = [
   ['gh api repos/o/r/rulesets'],
   ['gh label create human-approved --color 0e8a16'],
   ['node ~/.claude/pipeline/bin/pipeline.mjs job start v -- node scripts/verify.mjs'],
+  // run-time ARGUMENTS stay fine; only the subcommand position must be literal (or a variable assigned on the line)
+  ['gh pr view $N --json title'],
+  ['gh -R $REPO pr view 5'],
+  ['git diff "$BASE"..HEAD'],
+  ['git -C "$DIR" log --oneline -3'],
+  ['X=diff; git $X HEAD~1'],
 ];
 
 const label = (command, o) => (o ? `${command}  ${JSON.stringify(o, (k, v) => (v instanceof Error ? `Error(${v.message})` : v))}` : command);

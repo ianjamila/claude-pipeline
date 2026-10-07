@@ -37,6 +37,7 @@ const GIT_GLOBAL_VALUE = ['--git-dir', '--work-tree', '--namespace', '--super-pr
 const API_LONG_VALUE = ['method', 'field', 'raw-field', 'header', 'input', 'jq', 'template', 'preview', 'hostname', 'cache'];
 const VAR_BUILTINS = ['export', 'declare', 'typeset', 'local', 'readonly'];
 const DYNAMIC = /[$`]/;
+const RUN_TIME_SUBCOMMAND = 'the git / gh subcommand is only known at run time ($VAR expansion, ${...}, $(...) or backticks), so what it does cannot be verified. Write the subcommand out literally.';
 // The only run-time destinations a push may use: "whatever branch I am on" (the branch itself is then checked).
 const CURRENT_BRANCH_IDIOM = /^(?:\$\(|`)\s*git\s+(?:branch\s+--show-current|rev-parse\s+--abbrev-ref\s+HEAD|symbolic-ref\s+--short\s+HEAD)\s*(?:\)|`)$/;
 // Config the environment can inject into git (GIT_CONFIG_COUNT/KEY_n/VALUE_n, GIT_CONFIG_PARAMETERS, GIT_CONFIG_GLOBAL/SYSTEM).
@@ -359,6 +360,8 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
   const g = parseGitGlobal(argv, dir, env, ctx);
   const { sub, args } = g;
   if (sub === undefined) return null;
+  // `git "$(printf push)" origin main` / `git ${X}${Y:-sh}`: the subcommand is only known at run time
+  if (DYNAMIC.test(expandVars(sub, ctx.vars))) return deny(RUN_TIME_SUBCOMMAND);
 
   // aliases defined on this very line (`git config alias.p push && git p …`, `git -c alias.p=push p …`)
   const aliasConfig = g.configs.find((c) => c.key === `alias.${sub.toLowerCase()}`);
@@ -591,6 +594,8 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
   const args = argv.slice(1).map((a) => expandVars(a, ctx.vars));
   const { group, verb, rest } = splitGh(args);
   if (!group) return null;
+  // `gh pr ${X%-base}` / `gh pr "$(printf merge)"`: what gh will do is only known at run time
+  if (DYNAMIC.test(group) || (verb !== undefined && DYNAMIC.test(verb))) return deny(RUN_TIME_SUBCOMMAND);
 
   // aliases: `gh alias set NAME EXPANSION` is checked as if it ran, and a name defined on this line is expanded
   if (group === 'alias' && verb === 'set') {
