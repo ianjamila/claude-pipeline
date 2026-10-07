@@ -8,6 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { run as procRun } from '../pipeline/lib/proc.mjs';
+import { verdictArtifactName } from '../pipeline/lib/guard-provenance.mjs';
 import { CONFIG, project, runNode, scratchDir } from './helpers/project.mjs';
 
 const fakeGh = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'fake-gh-seq.mjs');
@@ -15,6 +16,8 @@ const REPO = 'acme/app';
 const PR = 7;
 const OTHER_SHA = 'f'.repeat(40);
 const T = (hhmm) => `2026-10-01T${hhmm}:00Z`;
+// The run the orchestrator under test IS (RUN_URL). Receipts of OTHER runs point at run 1 (a genuine run) unless a test says otherwise.
+const CURRENT_RUN = 'https://github.example/acme/app/actions/runs/99';
 const ctxName = { integrity: 'Test integrity', hardstops: 'Hard-stop scan' };
 
 const deleteTest = (repo) => repo.rm('test/app.test.js');
@@ -39,9 +42,21 @@ async function setup(change, projectOpts) {
 
 // The scripted GitHub. labelSeq/pullSeq: per-call replies (the last one repeats).
 // receipts: statuses of the head (any creator), as the jq filter in ci-guards-run.mjs shapes them.
-// runs: Actions runs by id as GitHub reports them (path/event/head_sha); compare: the default branch vs each run's head_sha.
-const GOOD_RUN = { path: '.github/workflows/pipeline-guards.yml@refs/heads/main', event: 'pull_request_target', head_sha: 'a'.repeat(40), run_started_at: T('10:00'), updated_at: T('10:12') };
-function script({ head, pullHeads = [head], labels = [], labelSeq, suites = [T('10:00')], receipts = [], events = [], failOn = [], runs = {}, compare = 'ahead' }) {
+// runs: Actions runs by id as GitHub reports them (path/event/head_sha/run_attempt/created_at); compare: the default branch vs each run's head_sha.
+// artifacts: artifact names of a run by id; by default a run carries what a genuine run would have uploaded for the receipts that point at it
+// (the approver being the actor of the label's latest labeling event), or a bare success/success verdict when none does.
+// statusReply: what GitHub answers to a status POST (the receipt's created_at is read from it).
+const GOOD_RUN = { path: '.github/workflows/pipeline-guards.yml@refs/heads/main', event: 'pull_request_target', head_sha: 'a'.repeat(40), run_attempt: 1, created_at: T('10:00'), updated_at: T('10:12') };
+function defaultArtifacts(id, head, receipts, events) {
+  const url = `https://github.example/acme/app/actions/runs/${id}`;
+  const mine = receipts.filter((r) => r.url === url).map((r) => r.context.replace('pipeline-approval: ', ''));
+  const names = [...new Set(mine)].map((label) => {
+    const actor = events.filter((e) => e.label === label).sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0]?.actor ?? 'acme';
+    return verdictArtifactName({ head, integrity: 'success', hardstops: 'success', receipt: { label, login: actor } });
+  });
+  return names.length > 0 ? names : [verdictArtifactName({ head, integrity: 'success', hardstops: 'success' })];
+}
+function script({ head, pullHeads = [head], labels = [], labelSeq, suites = [T('10:00')], receipts = [], events = [], failOn = [], runs = {}, artifacts = {}, compare = 'ahead', statusReply = { id: 1 } }) {
   const lines = (a) => (a.length ? `${a.join('\n')}\n` : '');
   return [
     ...failOn.map((match) => ({ match, code: 1, stderr: 'HTTP 500' })),
@@ -50,29 +65,48 @@ function script({ head, pullHeads = [head], labels = [], labelSeq, suites = [T('
     { match: `^api repos/${REPO}/commits/${head}/check-suites`, stdout: lines(suites) },
     { match: `^api repos/${REPO}/commits/${head}/statuses`, stdout: lines(receipts.map((r) => JSON.stringify(r))) },
     ...Object.entries({ 1: GOOD_RUN, ...runs }).map(([id, run]) => ({ match: `^api repos/${REPO}/actions/runs/${id} `, stdout: `${JSON.stringify({ ...GOOD_RUN, pull_requests: [{ number: PR, head: { sha: head }, base: { ref: 'main' } }], ...run })}\n` })),
+    ...Object.keys({ 1: GOOD_RUN, ...runs }).map((id) => ({ match: `^api repos/${REPO}/actions/runs/${id}/artifacts\\?per_page=100 `, stdout: lines(artifacts[id] ?? defaultArtifacts(id, head, receipts, events)) })),
     { match: `^api repos/${REPO} --jq \\.default_branch`, stdout: 'main\n' },
     { match: `^api repos/${REPO}/compare/[0-9a-f]{40}\\.\\.\\.main `, stdout: `${compare}\n` },
     { match: `^api repos/${REPO}/issues/${PR}/events`, stdout: lines(events.map((e) => JSON.stringify(e))) },
     { match: `^api -X DELETE repos/${REPO}/issues/${PR}/labels/`, stdout: '[]' },
-    { match: `^api repos/${REPO}/statuses/${head} `, stdoutJson: { id: 1 } },
+    { match: `^api repos/${REPO}/statuses/${head} `, stdoutJson: statusReply },
   ];
 }
 
-async function exec({ repo, head }, ghOpts = {}, env = {}) {
+// Runs the workflow's Evaluate step and, when it announced an artifact (as the workflow's `if:` requires), the Publish step
+// (--publish); the Upload step in between is GitHub's. The result merges both: `posts` / `calls` span both phases, `json` is
+// phase 1's JSON with phase 2's laid over it, `code` is the first non-zero exit code. `phase1` / `phase2` expose each run;
+// `artifact` is the announced name and `verdict` the parsed verdict.json (null when there was none). { publish: false } stops
+// after phase 1; `publishAgain()` then runs phase 2 (after a test tampered with verdictFile, say) and returns its run.
+async function exec({ repo, head }, ghOpts = {}, env = {}, { publish = true } = {}) {
   const dir = scratchDir();
   const scriptFile = join(dir, 'script.json');
   const log = join(dir, 'log.jsonl');
   const summary = join(dir, 'summary.md');
+  const output = join(dir, 'github-output');
+  const verdictDir = join(dir, 'pipeline-verdict');
   writeFileSync(scriptFile, JSON.stringify(script({ head, ...ghOpts })));
-  const r = await runNode(['scripts/pipeline/ci-guards-run.mjs'], {
-    cwd: repo.dir,
-    env: {
-      GH_TOKEN: 'test-token', REPO, PR_NUMBER: String(PR), EVENT_HEAD: head, BASE_SHA: repo.base,
-      RUN_URL: 'https://github.example/acme/app/actions/runs/1', GITHUB_STEP_SUMMARY: summary,
-      PIPELINE_GH: `node ${fakeGh}`, PIPELINE_FAKE_GH_SCRIPT: scriptFile, PIPELINE_FAKE_GH_LOG: log,
-      ...env,
-    },
-  });
+  const runEnv = {
+    GH_TOKEN: 'test-token', REPO, PR_NUMBER: String(PR), EVENT_HEAD: head, BASE_SHA: repo.base,
+    RUN_URL: CURRENT_RUN, GITHUB_STEP_SUMMARY: summary, GITHUB_OUTPUT: output, PIPELINE_VERDICT_DIR: verdictDir,
+    PIPELINE_GH: `node ${fakeGh}`, PIPELINE_FAKE_GH_SCRIPT: scriptFile, PIPELINE_FAKE_GH_LOG: log,
+    ...env,
+  };
+  const phase1 = await runNode(['scripts/pipeline/ci-guards-run.mjs'], { cwd: repo.dir, env: runEnv });
+  let announced = '';
+  try { announced = readFileSync(output, 'utf8'); } catch { /* nothing announced */ }
+  const artifact = /^artifact=(.+)$/m.exec(announced)?.[1] ?? null;
+  const publishAgain = () => runNode(['scripts/pipeline/ci-guards-run.mjs', '--publish'], { cwd: repo.dir, env: runEnv });
+  const phase2 = publish && artifact && phase1.code === 0 ? await publishAgain() : null;
+  let verdict = null;
+  try { verdict = JSON.parse(readFileSync(join(verdictDir, 'verdict.json'), 'utf8')); } catch { /* none written */ }
+  const r = {
+    code: phase1.code !== 0 ? phase1.code : (phase2?.code ?? 0),
+    stdout: phase1.stdout + (phase2?.stdout ?? ''),
+    stderr: phase1.stderr + (phase2?.stderr ?? ''),
+    json: phase2 ? { ...phase1.json, ...phase2.json, approvals: { ...phase1.json?.approvals, ...phase2.json?.approvals } } : phase1.json,
+  };
   let calls = [];
   try { calls = readFileSync(log, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { /* gh never ran */ }
   const posts = calls.filter((c) => /^repos\/acme\/app\/statuses\/[0-9a-f]{40}$/.test(c.argv[1])).map((c) => ({
@@ -83,7 +117,7 @@ async function exec({ repo, head }, ghOpts = {}, env = {}) {
   let md = '';
   try { md = readFileSync(summary, 'utf8'); } catch { /* none written */ }
   const api = (suffix) => calls.filter((c) => c.argv[0] === 'api' && c.argv[1].endsWith(suffix));
-  return { ...r, calls, posts, deletes, md, api, byContext: (c) => posts.find((p) => p.context === c) };
+  return { ...r, phase1, phase2, publishAgain, logFile: log, verdictFile: join(verdictDir, 'verdict.json'), artifact, verdict, calls, posts, deletes, md, api, byContext: (c) => posts.find((p) => p.context === c) };
 }
 
 const owner = (at, label = 'human-approved', actor = 'acme') => ({ label, actor, at });
@@ -102,7 +136,7 @@ test('a clean PR publishes two success statuses bound to the head sha', async ()
   assert.deepEqual(r.posts.map((p) => [p.context, p.state]), [['Test integrity', 'success'], ['Hard-stop scan', 'success']]);
   for (const p of r.posts) {
     assert.equal(p.sha, s.head);
-    assert.equal(p.target_url, 'https://github.example/acme/app/actions/runs/1');
+    assert.equal(p.target_url, CURRENT_RUN);
     assert.ok(p.description.length > 0 && p.description.length <= 140);
   }
   assert.equal(r.json.ok, true);
@@ -440,7 +474,7 @@ test('a labeled run by an approver posts the receipt on the head FIRST, before r
   assert.equal(r.code, 0, r.stderr);
   const [first] = r.posts;
   assert.deepEqual([first.context, first.state, first.sha, first.description], ['pipeline-approval: human-approved', 'success', s.head, 'human-approved approved by Acme']);
-  assert.equal(first.target_url, 'https://github.example/acme/app/actions/runs/1');
+  assert.equal(first.target_url, CURRENT_RUN);
   const idx = (pred) => r.calls.findIndex(pred);
   const receiptAt = idx((c) => c.argv.includes('context=pipeline-approval: human-approved'));
   assert.ok(receiptAt >= 0 && receiptAt < idx((c) => c.argv[1]?.endsWith('/events')));
@@ -578,7 +612,7 @@ test('provenance: a forged receipt does not block, or stand in for, a genuine on
 test('provenance: the receipt is posted with the run URL as target_url, and not at all without one', async () => {
   const s = await setup(addDrop);
   const r = await exec(s, { labels: ['human-approved'], events: [owner(T('10:05'))], receipts: [receipt(T('10:05'))] }, labeledEnv());
-  assert.equal(receiptPosts(r)[0].target_url, RUN_1);
+  assert.equal(receiptPosts(r)[0].target_url, CURRENT_RUN);
   const t = await setup(addDrop);
   const none = await exec(t, {}, { ...labeledEnv(), RUN_URL: '' });
   assert.equal(none.code, 1);
@@ -617,7 +651,7 @@ test('binding: DOWNGRADE - a run for a PR into a side branch cut from an old mai
 });
 
 test('binding: a receipt posted outside the run window (beyond 10 s) is ignored; within the slack it counts', async () => {
-  const win = { run_started_at: T('10:06'), updated_at: T('10:08') };
+  const win = { created_at: T('10:06'), updated_at: T('10:08') };
   ignoredAsNoReceipt(await approve({ runs: { 1: win }, receipts: [receipt(T('10:20'))], events: [owner('2026-10-01T10:06:05Z')] }));
   ignoredAsNoReceipt(await approve({ runs: { 1: win }, receipts: [receipt('2026-10-01T10:08:11Z')], events: [owner(T('10:06'))] }));
   assert.equal((await approve({ runs: { 1: win }, receipts: [receipt('2026-10-01T10:08:09Z')], events: [owner('2026-10-01T10:06:05Z')] })).byContext('Hard-stop scan').state, 'success');
@@ -626,7 +660,7 @@ test('binding: a receipt posted outside the run window (beyond 10 s) is ignored;
 
 test('binding: the latest labeling must fall inside the window of the run that posted the receipt', async () => {
   // A spoofing run started after the real labeling, pointing at a genuine run that is open NOW: its window does not hold the label event.
-  const win = { run_started_at: T('10:30'), updated_at: T('10:32') };
+  const win = { created_at: T('10:30'), updated_at: T('10:32') };
   ignoredAsNoReceipt(await approve({ runs: { 1: win }, receipts: [receipt(T('10:31'))], events: [owner(T('10:05'))] }));
   assert.equal((await approve({ runs: { 1: win }, receipts: [receipt(T('10:31'))], events: [owner(T('10:30'))] })).byContext('Hard-stop scan').state, 'success');
 });
@@ -652,4 +686,262 @@ test('guard-provenance: parseRunUrl accepts exactly Actions run URLs', async () 
   for (const bad of ['', null, undefined, 'https://github.com/acme/app/actions/runs/', 'https://github.com/acme/app/actions/workflows/x.yml', 'ftp://x/acme/app/actions/runs/1', 'https://github.com/acme/actions/runs/1']) {
     assert.equal(parseRunUrl(bad), null, String(bad));
   }
+});
+
+// ---- verdict artifact: phase 1 records, the workflow uploads, phase 2 publishes ------------------------------------------
+
+const statusPostsIn = (logFile) => readFileSync(logFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
+  .filter((c) => /^repos\/acme\/app\/statuses\/[0-9a-f]{40}$/.test(c.argv[1])).length;
+
+test('phase 1 records the verdict and announces its artifact without posting a final status; --publish then posts both', async () => {
+  const s = await setup(addDrop);
+  const r = await exec(s, { labels: ['human-approved'], events: [owner(T('10:05'))] }, labeledEnv(), { publish: false });
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual(r.posts.map((p) => p.context), ['pipeline-approval: human-approved'], 'only the receipt exists after phase 1');
+  assert.equal(r.artifact, `pipeline-verdict_v1_${s.head}_success_success_human-approved_acme`);
+  assert.equal(r.json.artifact, r.artifact);
+  assert.equal(r.verdict.version, 1);
+  assert.deepEqual([r.verdict.pr, r.verdict.head, r.verdict.base, r.verdict.removeLabels, r.verdict.receipt], [PR, s.head, s.repo.base, [], { label: 'human-approved', login: 'acme' }]);
+  assert.equal(r.verdict.checks.integrity.state, 'success');
+  assert.match(r.verdict.checks.hardstops.description, /approved by label human-approved/);
+  assert.match(r.md, /## Hard-stop scan/, 'the step summary is written in phase 1');
+
+  const after = await r.publishAgain();
+  assert.equal(after.code, 0, after.stderr);
+  assert.equal(statusPostsIn(r.logFile), 3, 'receipt + the two statuses');
+  assert.deepEqual(after.json.results.hardstops.state, 'success');
+});
+
+test('the artifact name carries both states, and the receipt only when this run posted one', async () => {
+  const s = await setup(addDrop);
+  const r = await exec(s, {}, {}, { publish: false });
+  assert.equal(r.artifact, `pipeline-verdict_v1_${s.head}_success_failure`);
+  assert.equal(r.verdict.receipt, null);
+  const t = await setup(deleteTest);
+  assert.equal((await exec(t, {}, {}, { publish: false })).artifact, `pipeline-verdict_v1_${t.head}_failure_success`);
+  // a labeled run that is NOT an allowed approver's mints no receipt, so the name has none either
+  const m = await setup(addDrop);
+  assert.equal((await exec(m, {}, labeledEnv('mallory'), { publish: false })).artifact, `pipeline-verdict_v1_${m.head}_success_failure`);
+});
+
+test('invalid approval labels are removed by --publish, after both statuses, never by phase 1', async () => {
+  const s = await setup(addDrop);
+  const r = await exec(s, { labels: ['human-approved'], events: [owner(T('09:00'))] }, {}, { publish: false });
+  assert.deepEqual(r.verdict.removeLabels, ['human-approved']);
+  assert.deepEqual(r.deletes, [], 'phase 1 removes nothing');
+  assert.equal(r.posts.length, 0);
+  const after = await r.publishAgain();
+  assert.equal(after.code, 0, after.stderr);
+  assert.deepEqual(after.json.approvals.removed, ['human-approved']);
+});
+
+test('--publish: the head moved while the artifact was uploaded => error statuses, no success, no label removal', async () => {
+  const s = await setup(addDrop);
+  // pulls: step 1, the pre-record re-read (phase 1), then the head check of --publish
+  const r = await exec(s, { labels: ['human-approved'], events: [owner(T('09:00'))], pullHeads: [s.head, s.head, OTHER_SHA] });
+  assert.equal(r.code, 0, r.stderr);
+  assert.ok(r.artifact, 'phase 1 did record a verdict');
+  assert.deepEqual(r.posts.map((p) => [p.context, p.state, p.description]), [
+    ['Test integrity', 'error', 'superseded by a newer commit'],
+    ['Hard-stop scan', 'error', 'superseded by a newer commit'],
+  ]);
+  assert.equal(r.json.superseded, true);
+  assert.deepEqual(r.deletes, []);
+});
+
+test('a superseded phase 1 writes no verdict and announces no artifact (so the workflow uploads and publishes nothing)', async () => {
+  const s = await setup(addDrop);
+  const r = await exec(s, { pullHeads: [OTHER_SHA] });
+  assert.equal(r.artifact, null);
+  assert.equal(r.verdict, null);
+  assert.equal(r.phase2, null);
+  assert.equal(r.posts.length, 2);
+});
+
+test('--publish without a usable verdict is an internal error and posts nothing', async () => {
+  const s = await setup(cleanChange);
+  const r = await exec(s, {}, {}, { publish: false });
+  const before = statusPostsIn(r.logFile);
+  writeFileSync(r.verdictFile, JSON.stringify({ ...r.verdict, head: OTHER_SHA }));
+  const wrongHead = await r.publishAgain();
+  assert.equal(wrongHead.code, 1);
+  assert.match(wrongHead.json.message, /does not describe this PR and head/);
+  writeFileSync(r.verdictFile, JSON.stringify({ ...r.verdict, checks: { ...r.verdict.checks, hardstops: { state: 'passed-by-me', description: 'x' } } }));
+  assert.equal((await r.publishAgain()).code, 1);
+  writeFileSync(r.verdictFile, JSON.stringify({ ...r.verdict, removeLabels: ['needs-review'] }));
+  assert.equal((await r.publishAgain()).code, 1, 'only the two approval labels may be removed');
+  writeFileSync(r.verdictFile, 'not json');
+  assert.match((await r.publishAgain()).json.message, /no readable verdict/);
+  assert.equal(statusPostsIn(r.logFile), before, 'nothing was published');
+  const bare = await exec(s, {}, { PIPELINE_VERDICT_DIR: join(scratchDir(), 'empty') }, { publish: false });
+  assert.equal(bare.phase1.code, 0);
+});
+
+test('phase 1 needs somewhere to announce the artifact; the verdict dir defaults to $RUNNER_TEMP/pipeline-verdict', async () => {
+  const s = await setup(cleanChange);
+  const noOutput = await exec(s, {}, { GITHUB_OUTPUT: '' });
+  assert.equal(noOutput.code, 1);
+  assert.match(noOutput.json.message, /GITHUB_OUTPUT/);
+  assert.equal(noOutput.posts.length, 0);
+  const tmp = scratchDir();
+  const r = await exec(s, {}, { PIPELINE_VERDICT_DIR: '', RUNNER_TEMP: tmp }, { publish: false });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(JSON.parse(readFileSync(join(tmp, 'pipeline-verdict', 'verdict.json'), 'utf8')).head, s.head);
+  const none = await exec(s, {}, { PIPELINE_VERDICT_DIR: '', RUNNER_TEMP: '' }, { publish: false });
+  assert.equal(none.code, 1);
+  assert.match(none.json.message, /PIPELINE_VERDICT_DIR/);
+});
+
+// ---- the run's OWN receipt is trusted in-process; nobody else may point at the current run ---------------------------------
+
+test('own receipt: a labeled run by an approver counts its own receipt without reading it back (it has no artifact yet)', async () => {
+  const s = await setup(addDrop);
+  const r = await exec(s, { labels: ['human-approved'], events: [owner(T('10:05'))], receipts: [] }, labeledEnv());
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.byContext('Hard-stop scan').state, 'success');
+  assert.deepEqual(r.json.approvals.valid, ['human-approved']);
+  assert.equal(r.api('/actions/runs/99').length, 0);
+  assert.equal(r.api('/artifacts?per_page=100').length, 0);
+
+  // in-process record only: a different label, or a later labeling by somebody else, is not covered by it
+  const t = await setup(addDrop);
+  const other = await exec(t, { labels: ['human-approved'], events: [owner(T('10:05')), owner(T('10:07'), 'human-approved', 'mallory')], receipts: [] }, labeledEnv());
+  assert.equal(other.byContext('Hard-stop scan').state, 'failure');
+  const u = await setup(deleteTest);
+  const wrongLabel = await exec(u, { labels: ['test-change-approved'], events: [owner(T('10:05'), 'test-change-approved')], receipts: [] }, labeledEnv('acme', 'human-approved'));
+  assert.equal(wrongLabel.byContext('Test integrity').state, 'failure');
+});
+
+test('own receipt: one GitHub says is older than the latest labeling does not count', async () => {
+  const a = await setup(addDrop);
+  const old = await exec(a, { labels: ['human-approved'], events: [owner(T('10:05'))], statusReply: { id: 1, created_at: T('10:04') } }, labeledEnv());
+  assert.equal(old.byContext('Hard-stop scan').state, 'failure');
+  assert.equal(old.json.approvals.ignored[0].reason, 'no-receipt');
+  const b = await setup(addDrop);
+  const same = await exec(b, { labels: ['human-approved'], events: [owner(T('10:05'))], statusReply: { id: 1, created_at: T('10:05') } }, labeledEnv());
+  assert.equal(same.byContext('Hard-stop scan').state, 'success');
+});
+
+test('own receipt: an API-read receipt that points at the CURRENT run is never accepted, however genuine the run looks', async () => {
+  // A spoofing run can post a status whose target_url is the run that is executing right now. Nothing may count it.
+  const variants = [CURRENT_RUN, `${CURRENT_RUN}/job/5`, `${CURRENT_RUN}?check_suite_focus=true`, 'https://github.example/ACME/App/actions/runs/99'];
+  for (const url of variants) {
+    const s = await setup(addDrop);
+    const r = await exec(s, {
+      labels: ['human-approved'], events: [owner(T('10:05'))], receipts: [receipt(T('10:05'), 'human-approved', BOT, url)],
+      runs: { 99: {} }, artifacts: { 99: [verdictArtifactName({ head: s.head, integrity: 'success', hardstops: 'success', receipt: { label: 'human-approved', login: 'acme' } })] },
+    });
+    ignoredAsNoReceipt(r);
+    assert.match(r.stderr, /points at the current run/, url);
+    assert.equal(r.api('/actions/runs/99').length, 0, 'refused before any read');
+  }
+});
+
+test('own receipt: a labeled run whose own receipt does not cover the latest labeling cannot borrow a status pointing at itself', async () => {
+  // alice labeled (this run, own receipt for alice), then bob labeled again: bob's receipt is not in this process, and a spoofed one is.
+  const s = await setup(addDrop, APPROVERS);
+  const r = await exec(s, {
+    labels: ['human-approved'], events: [owner(T('10:05'), 'human-approved', 'alice'), owner(T('10:06'), 'human-approved', 'bob')],
+    receipts: [receipt(T('10:06'), 'human-approved', BOT, CURRENT_RUN, 'bob')], runs: { 99: {} },
+  }, { ...labeledEnv('alice'), OWNER_TYPE: 'Organization' });
+  ignoredAsNoReceipt(r);
+});
+
+// ---- the verdict artifact closes the spoof race (issue #3) ------------------------------------------------------------------
+
+const verdictFor = (head, label = 'human-approved', login = 'acme', states = ['success', 'success']) => verdictArtifactName({ head, integrity: states[0], hardstops: states[1], receipt: label ? { label, login } : null });
+
+test('spoof race: a genuine run of this PR and head that is still in progress cannot vouch for a receipt it never recorded', async () => {
+  // The spoofing run (a PR into a side branch with an edited workflow, same head) posts a receipt pointing at genuine run 1,
+  // inside run 1's window. Run 1 never posted that receipt, so its artifact (or its absence) says otherwise.
+  const cases = [
+    ['no artifact yet', () => []],
+    ['a verdict without a receipt', (h) => [verdictFor(h, null)]],
+    ['another approver', (h) => [verdictFor(h, 'human-approved', 'mallory')]],
+    ['another label', (h) => [verdictFor(h, 'test-change-approved')]],
+    ['another head', () => [verdictFor('e'.repeat(40))]],
+    ['not a verdict artifact', () => ['verify-report', 'pipeline-verdict_v2_' + 'a'.repeat(40) + '_success_success', 'pipeline-verdict_v1_x_success_success_human-approved_acme']],
+  ];
+  for (const [why, make] of cases) {
+    const s = await setup(addDrop);
+    const r = await exec(s, { labels: ['human-approved'], events: [owner(T('10:05'))], receipts: [receipt(T('10:05'))], artifacts: { 1: make(s.head) } });
+    ignoredAsNoReceipt(r);
+    assert.match(r.stderr, /verdict artifact/, why);
+  }
+  // unreadable artifact list: fail closed
+  ignoredAsNoReceipt(await approve({ failOn: [`^api repos/${REPO}/actions/runs/1/artifacts`] }));
+  // the genuine run's own artifact names this label and approver: accepted (login compared case-insensitively)
+  const ok = await setup(addDrop);
+  const accepted = await exec(ok, { labels: ['human-approved'], events: [owner(T('10:05'))], receipts: [receipt(T('10:05'))], artifacts: { 1: [verdictFor(ok.head, 'human-approved', 'ACME')] } });
+  assert.equal(accepted.byContext('Hard-stop scan').state, 'success');
+});
+
+test('spoof race: the artifact list is read once per run, with the right path', async () => {
+  const r = await approve({ receipts: [receipt(T('10:05')), receipt(T('10:06')), receipt(T('10:07'), 'test-change-approved')] });
+  assert.equal(r.byContext('Hard-stop scan').state, 'success');
+  assert.equal(r.api('/actions/runs/1/artifacts?per_page=100').length, 1);
+});
+
+// ---- run attempt and the window's lower bound ---------------------------------------------------------------------------
+
+test('a re-run (run_attempt != 1) never counts, even for an otherwise genuine run', async () => {
+  for (const run_attempt of [2, 3, '1', null, undefined]) {
+    const r = await approve({ runs: { 1: { run_attempt } } });
+    ignoredAsNoReceipt(r);
+    assert.match(r.stderr, /re-runs never count/, String(run_attempt));
+    assert.match(r.stderr, /push a commit or close and reopen the PR/);
+  }
+  assert.equal((await approve({ runs: { 1: { run_attempt: 1 } } })).byContext('Hard-stop scan').state, 'success');
+});
+
+test('window: a labeling before the run started (queued) still counts when it is after the run was CREATED; before created_at - 10 s it does not', async () => {
+  const queued = { created_at: '2026-10-01T10:00:00Z', run_started_at: '2026-10-01T10:00:40Z', updated_at: '2026-10-01T10:05:00Z' };
+  const at = '2026-10-01T10:01:00Z';
+  const early = await approve({ runs: { 1: queued }, receipts: [receipt(at)], events: [owner('2026-10-01T10:00:05Z')] });
+  assert.equal(early.byContext('Hard-stop scan').state, 'success', 'labeled 35 s before the run started, 5 s after it was created');
+  ignoredAsNoReceipt(await approve({ runs: { 1: queued }, receipts: [receipt(at)], events: [owner('2026-10-01T09:59:40Z')] }));
+  assert.equal((await approve({ runs: { 1: queued }, receipts: [receipt(at)], events: [owner('2026-10-01T09:59:51Z')] })).byContext('Hard-stop scan').state, 'success', 'within the 10 s slack of created_at');
+  ignoredAsNoReceipt(await approve({ runs: { 1: { ...queued, created_at: undefined } } }));
+});
+
+// ---- the workflow template -------------------------------------------------------------------------------------------------
+
+const guardsYml = () => readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'pipeline', 'templates', 'workflows', 'pipeline-guards.yml'), 'utf8');
+const stepNamed = (yml, name) => {
+  const steps = yml.split(/\n(?=      - name: )/);
+  return steps.find((st) => st.startsWith(`      - name: ${name}\n`)) ?? '';
+};
+
+test('pipeline-guards.yml: actions: read, an Evaluate step, an upload pinned by SHA, and a Publish step gated on the announced artifact', () => {
+  const yml = guardsYml();
+  assert.match(yml, /^permissions:\n(?:  .*\n)*  actions: read /m);
+  assert.doesNotMatch(yml, /actions: write/);
+  const evaluate = stepNamed(yml, 'Evaluate');
+  assert.match(evaluate, /^        id: evaluate$/m);
+  assert.match(evaluate, /^        run: node scripts\/pipeline\/ci-guards-run\.mjs$/m);
+  const upload = stepNamed(yml, 'Upload verdict');
+  assert.match(upload, /^        if: steps\.evaluate\.outputs\.artifact != ''$/m);
+  assert.match(upload, /^        uses: actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7\.0\.1$/m);
+  assert.match(upload, /^          name: \$\{\{ steps\.evaluate\.outputs\.artifact \}\}$/m);
+  assert.match(upload, /^          path: \$\{\{ runner\.temp \}\}\/pipeline-verdict\/verdict\.json$/m);
+  assert.match(upload, /^          retention-days: 90$/m);
+  assert.match(upload, /^          if-no-files-found: error$/m);
+  assert.match(upload, /^          overwrite: false$/m);
+  const publish = stepNamed(yml, 'Publish');
+  assert.match(publish, /^        if: steps\.evaluate\.outputs\.artifact != ''$/m);
+  assert.match(publish, /^        run: node scripts\/pipeline\/ci-guards-run\.mjs --publish$/m);
+  // order: evaluate, upload, publish, and the fail-closed step stays last
+  const order = ['Evaluate', 'Upload verdict', 'Publish', 'Fail closed if evaluation did not finish'].map((n) => yml.indexOf(`- name: ${n}\n`));
+  assert.ok(order.every((i, k) => i > 0 && (k === 0 || i > order[k - 1])), order.join());
+  assert.match(stepNamed(yml, 'Fail closed if evaluation did not finish'), /^        if: failure\(\) \|\| cancelled\(\)$/m);
+  assert.doesNotMatch(yml, /re-run the Pipeline guards workflow/);
+  assert.match(yml, /push a commit, or close and reopen the PR/);
+  // nothing that runs PR code: the only actions are pinned by SHA
+  for (const m of yml.matchAll(/^\s+uses: (\S+)/gm)) assert.match(m[1], /@[0-9a-f]{40}$/, m[1]);
+});
+
+test('verify.yml runs on Node 24', () => {
+  const yml = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'pipeline', 'templates', 'workflows', 'verify.yml'), 'utf8');
+  assert.match(yml, /node-version: 24$/m);
+  assert.doesNotMatch(yml, /node-version: 20/);
 });
