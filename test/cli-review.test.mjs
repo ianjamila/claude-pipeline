@@ -318,6 +318,17 @@ test('codex-review: a leftover raw file from an earlier run is never read as thi
   assert.ok(!existsSync(stale), 'the stale file was removed before Codex ran');
 });
 
+test('codex-review: an answer Codex writes during the run is read even when its source bytes are old (fake writes fresh, not a Windows copy)', (t) => {
+  // windows-latest flake: the fake copied a findings file written before a slow CLI start, CopyFileW kept that old
+  // mtime, and the freshness check rejected the run as "codex output file predates this run".
+  const w = world(t);
+  const src = w.file('findings-old.json', findingsOf([finding()]));
+  const old = new Date(Date.now() - 3600e3);
+  utimesSync(src, old, old);
+  const r = w.cli(['codex-review', '--pr', '7', '--round', '1', '--base', w.base, '--head', w.head, '--effort', 'high'], { FAKE_CODEX_OUTPUT: src });
+  assertExit(r, 0);
+});
+
 test('codex-review: rounds must arrive in order; an existing round, a skipped round and another PR\'s state are exit 2', (t) => {
   const w = world(t);
   const skipped = w.codex(2, findingsOf());
