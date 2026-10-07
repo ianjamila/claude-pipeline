@@ -92,6 +92,43 @@ test('production code importing a test module is flagged (R0-unscannable); looka
   for (const line of IMPORT_NO_HITS) assert.deepEqual(rules([file('lib/pay.ts', { added: [line] })]), [], line);
 });
 
+// Import detection resolves each specifier to candidate repo paths and asks the SAME predicate the exemption uses, so no spelling
+// of a path into an exempt location slips past (the old fixed regex missed every row below).
+const IMPORT_FORMS = [
+  // [file, line] in production code, each naming a module the exemption predicate treats as a test file
+  ['lib/pay.ts', "import h from '../spec/helper'"], ['lib/pay.ts', "import h from '@/cypress/helper'"], ['lib/pay.ts', "import h from './helper.cy'"],
+  ['lib/pay.ts', "import h from 'tests/helper'"], ['lib/pay.ts', "import { x } from 'e2e/support/x';"], ['lib/pay.ts', "import '@acme/x/tests/h'"],
+  ['lib/pay.ts', "import h from '~/e2e/x'"], ['lib/pay.ts', "import h from '#/spec/x'"], ['lib/pay.ts', "import h from '@@/tests/x'"],
+  ['lib/a/b/pay.ts', "const h = require('../../../tests/x');"], ['lib/pay.ts', "const h = await import('../spec/x')"], ['lib/pay.ts', "export * from '../cypress/x'"],
+  ['lib/pay.ts', "} from '../tests/x';"], ['lib/pay.ts', "import '../spec/setup';"], ['lib/pay.ts', "const h = require.resolve('./tests/x')"],
+  ['lib/pay.ts', "import h from './conftest.py'"], ['lib/pay.tsx', 'import h from "../e2e/x.js"'], ['lib/pay.mjs', "import h from `../spec/x`"],
+  ['app/views.py', 'from tests.helper import x'], ['app/views.py', 'import tests.helper'], ['app/views.py', 'import os, tests.helper as th'],
+  ['app/views.py', 'from ..tests.helper import x'], ['app/views.py', 'from . import conftest'], ['app/views.py', 'from tests import helper'],
+  ['app/views.py', "m = importlib.import_module('tests.helper')"], ['app/views.py', 'from .test_helpers import x'],
+  ['lib/pay.rb', "require_relative 'spec/x'"], ['lib/pay.rb', "require_relative '../spec/x'"], ['lib/pay.rb', "require 'spec/helper'"], ['lib/pay.rb', 'load "tests/x.rb"'],
+];
+const IMPORT_FORMS_CLEAN = [
+  ['lib/pay.ts', "import test from 'node:test';"], ['lib/pay.ts', "import x from '@/lib/spec-utils'"], ['lib/pay.ts', "import x from 'inspector'"],
+  ['lib/pay.ts', "import x from './helper'"], ['lib/pay.ts', "import x from '../lib/pay'"], ['lib/pay.ts', "const x = require('@acme/x/lib/h')"],
+  ['app/views.py', 'import os, json'], ['app/views.py', 'from collections import abc'], ['app/views.py', 'from . import util'], ['app/views.py', 'from app.models import User'],
+  ['app/views.py', '# from tests.helper import x'], ['lib/pay.rb', "require 'json'"], ['lib/pay.rb', "require_relative 'helpers'"],
+];
+test('every spelling of an import that resolves into an exempt test path is flagged (R0-unscannable); lookalikes are not', () => {
+  for (const [path, line] of IMPORT_FORMS) {
+    const hits = run([file(path, { added: [line] })]);
+    assert.deepEqual(rulesOf(hits), ['R0-unscannable'], `${path}: ${line}`);
+    assert.match(hits[0].detail, /imports a test\/fixture module into production code/);
+  }
+  for (const [path, line] of IMPORT_FORMS_CLEAN) assert.deepEqual(rules([file(path, { added: [line] })]), [], `${path}: ${line}`);
+});
+
+test('an exempt module that deletes users is not judged, and the production file that imports it through a root-level spelling is flagged', () => {
+  const evil = ['await supabase.auth.admin.deleteUser(id);', 'await db.from("patients").delete().eq("id", id);'];
+  const hits = run([A('spec/helper.ts', ...evil), A('lib/pay.ts', "import { wipe } from '../spec/helper';")]);
+  assert.deepEqual(rulesOf(hits), ['R0-unscannable']);
+  assert.equal(hits[0].file, 'lib/pay.ts');
+});
+
 test('test files may import test modules, and so may docs', () => {
   for (const p of ['lib/a.test.ts', 'e2e/a.spec.ts', 'tests/helpers/b.ts', 'docs/a.md']) {
     assert.deepEqual(rules([file(p, { added: ["import h from './pay.test';", "import f from '../fixtures/users'"] })]), [], p);
@@ -218,4 +255,75 @@ test('IO: a 100% rename of an existing symlink (or gitlink) is still a symlink (
   assert.ok(byFile('src/helper.js').some((h) => h.rule === 'R4-pipeline' && /symlink/.test(h.detail)), 'moved symlink');
   assert.ok(byFile('deps/sub').some((h) => h.rule === 'R4-pipeline' && /submodule/.test(h.detail)), 'moved gitlink');
   assert.deepEqual(rulesOf(byFile('src/plain.js')), [], 'an ordinary 100% rename stays clean');
+});
+
+// ---- reverse case: unchanged production code already imports the exempt file this PR edits -------------------------------
+
+async function reverseRepo(base) {
+  const { createTmpRepo } = await import('./helpers/tmprepo.mjs');
+  const repo = createTmpRepo();
+  repo.write('README.md', 'x\n');
+  for (const [p, c] of Object.entries(base)) repo.write(p, c);
+  repo.commit('base');
+  repo.branch('feat');
+  return repo;
+}
+async function collectWith(repo, extra = {}) {
+  const { collectHardStops } = await import('../pipeline/lib/hardstops.mjs');
+  return collectHardStops({ base: 'main', head: 'feat', cwd: repo.dir, config: cfg(), ...extra });
+}
+const EVIL_BODY = 'export const wipe = () => supabase.auth.admin.deleteUser(id);\n';
+
+test('IO: editing an exempt test file that unchanged production code already imports is flagged on the test file, naming the importer', async () => {
+  const cases = [
+    ['tests/helper.ts', 'lib/pay.ts', "import { wipe } from '../tests/helper';\n"],
+    ['tests/helper.ts', 'lib/pay.ts', "import { wipe } from '@/tests/helper';\n"],
+    ['packages/web/tests/helper.ts', 'packages/web/src/pay.ts', "import { wipe } from '../tests/helper';\n"],
+    ['packages/web/tests/helper.ts', 'src/pay.ts', "import { wipe } from '@acme/web/tests/helper';\n"],
+    ['spec/support/seed.ts', 'lib/pay.ts', "const { wipe } = require('../spec/support/seed');\n"],
+    ['tests/helper.py', 'app/views.py', 'from tests.helper import wipe\n'],
+    ['spec/x.rb', 'lib/pay.rb', "require_relative '../spec/x'\n"],
+    ['tests/helpers/index.ts', 'lib/pay.ts', "import { wipe } from '../tests/helpers';\n"],
+    ['lib/pay.test.ts', 'lib/other.ts', "import { wipe } from './pay.test';\n"],
+  ];
+  for (const [testPath, importer, line] of cases) {
+    const repo = await reverseRepo({ [testPath]: 'export const wipe = () => 1;\n', [importer]: line });
+    repo.write(testPath, EVIL_BODY);
+    repo.commit('edit the exempt helper only');
+    const hits = await collectWith(repo);
+    assert.deepEqual(rulesOf(hits), ['R0-unscannable'], testPath);
+    assert.equal(hits[0].file, testPath);
+    assert.match(hits[0].detail, new RegExp(`production code \\(${importer.replace(/[.]/g, '\\.')}:1\\)`), testPath);
+  }
+});
+
+test('IO: a changed test file that no production code imports stays quiet, whatever its basename resembles', async () => {
+  const repo = await reverseRepo({
+    'tests/helper.ts': 'export const a = 1;\n', 'tests/helpers/pay.ts': 'export const b = 1;\n', 'lib/pay.ts': 'export const p = 1;\n',
+    'lib/other.ts': "import { p } from './pay';\nimport x from 'helper';\nimport y from 'lib/pay';\n", // same names, different modules
+    'docs/note.md': "import h from '../tests/helper'\n", // documentation is not code
+  });
+  repo.write('tests/helper.ts', EVIL_BODY);
+  repo.write('tests/helpers/pay.ts', EVIL_BODY);
+  repo.commit('edit unimported helpers');
+  assert.deepEqual(rulesOf(await collectWith(repo)), []);
+});
+
+test('IO: the reverse check fails closed: a file name git cannot search for, or more candidate importers than the cap, flags the test file', async () => {
+  const repo = await reverseRepo({ 'tests/helper.ts': 'export const a = 1;\n', 'lib/pay.ts': "import { a } from '../tests/helper';\n", 'lib/pay2.ts': "import { a } from '../tests/helper';\n" });
+  repo.write('tests/helper.ts', EVIL_BODY);
+  repo.commit('edit');
+  const capped = await collectWith(repo, { maxImporterHits: 1 });
+  assert.deepEqual(rulesOf(capped), ['R0-unscannable']);
+  assert.match(capped[0].detail, /could not be checked \(more than 1 candidate import lines\)/);
+  assert.deepEqual(rulesOf(await collectWith(repo, { maxImporterHits: 2 })), ['R0-unscannable']); // within the cap: found for real
+  assert.doesNotMatch((await collectWith(repo, { maxImporterHits: 2 }))[0].detail, /could not be checked/);
+  if (process.platform !== 'win32') {
+    const odd = await reverseRepo({ 'README.md': 'x\n' });
+    odd.write('tests/a\nb.ts', 'export const a = 1;\n');
+    odd.commit('add a test file whose name has a newline');
+    const hits = await collectWith(odd);
+    assert.deepEqual(rulesOf(hits), ['R0-unscannable']);
+    assert.match(hits[0].detail, /a file name cannot be searched for/);
+  }
 });

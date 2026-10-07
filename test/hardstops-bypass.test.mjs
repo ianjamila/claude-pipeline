@@ -540,6 +540,15 @@ test('13 lines just under the cap with adversarial shapes stay fast for every ru
   }
 });
 
+test('13 a line stuffed with import specifiers stays fast (and is flagged as unreadable import list)', () => {
+  const many = (n, f) => Array.from({ length: n }, (_, i) => f(i)).join(' ');
+  for (const text of [many(1500, (i) => `from 'a${i}'`), many(600, (i) => `import('./x/y/z/w/v/u${i}')`), many(700, (i) => `require('a/b/c/d/e${i}');`)]) {
+    const { value: hits, ms } = cpuMs(() => run([file('lib/a.ts', { added: [text] })]));
+    assert.ok(ms < 500, `${text.slice(0, 20)}... took ${Math.round(ms)}ms of CPU`);
+    assert.ok(rulesOf(hits).includes('R0-unscannable'), text.slice(0, 20));
+  }
+});
+
 test('13 an oversized SQL statement is unscannable instead of regex-scanned', () => {
   const { value: hits, ms } = cpuMs(() => classify({ files: [], config: cfg(), sqlStatements: [{ file: MIG, text: 'alter table x '.repeat(75_000) }] }));
   assert.ok(ms < 1000, `took ${Math.round(ms)}ms of CPU`);
