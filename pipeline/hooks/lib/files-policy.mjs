@@ -19,6 +19,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
 import { simpleCommands, commandName, scriptFileOf } from './shell-parse.mjs';
+import { scriptCandidates, defaultReadDir } from './script-candidates.mjs';
 
 const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
@@ -172,6 +173,7 @@ function makeCtx(opts) {
     vars: {}, // same-line shell assignments (D=$HOME/.claude), filled in once the line is parsed
     dynamic: false, // set when a scan had to be skipped for size; callers fail closed
     readText: opts.readText ?? defaultReadText,
+    readDir: opts.readDir ?? defaultReadDir,
     admin: (opts.env ?? process.env).PIPELINE_ADMIN === '1',
     hit: (p) => { const q = unFirm(p); return roots.some((r) => isInside(q, r, platform)); },
     hitAncestor: (p) => { const q = unFirm(p); return ancestors.some((a) => samePath(q, a, platform)); },
@@ -950,7 +952,8 @@ const WRITE_HINT = /write|append|unlink|\brm\b|rmSync|rmdir|rename|copy|\bcp\b|\
 // typed on the line. A shell script that exists but cannot be read is denied; a missing file runs nothing; a
 // program run by path, an interpreter file that cannot be read, a node_modules package and the pipeline's own
 // installed files are not judged (the installed CLI legitimately names its own settings).
-function judgeScriptFile(sf, dirs, ctx, opts) {
+function judgeScriptFile(sf, dirs, ctx, opts, scanRaw = '') {
+  if (sf.ambiguous) return judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw);
   const e = expandRefs(sf.file, ctx);
   if (/[$`]/.test(e)) return null; // named at run time: the textual rules on the whole line still apply
   const found = [];
@@ -965,6 +968,7 @@ function judgeScriptFile(sf, dirs, ctx, opts) {
   if (ctx.hit(abs) || ctx.hit(realResolve(abs, ctx.api)) || /\/node_modules\//.test(abs)) return null;
   const text = ctx.readText(abs);
   if (typeof text !== 'string') {
+    if (sf.candidate && ctx.readDir(abs)) return null; // a shell cannot run a directory
     return sf.kind === 'shell' ? deny(`cannot read the script ${sf.file} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified`) : null;
   }
   let kind = sf.kind;
@@ -980,6 +984,22 @@ function judgeScriptFile(sf, dirs, ctx, opts) {
   if (variantsOf(text).some((t) => setsAdmin(t, ctx.platform) || hasDisableAll(t))) return deny(`the program ${sf.file} sets PIPELINE_ADMIN or mentions disableAllHooks; only the owner may switch the pipeline guard off`);
   const m = makeMatchers(ctx);
   if (text.length <= MAX_SCRIPT_BYTES && m.rawHit(text, [dir]) && WRITE_HINT.test(text)) return deny(`the program ${sf.file} refers to a protected pipeline file and writes (${PROTECTED_MSG})`);
+  return null;
+}
+
+// A word before the script expands at run time (`X=+n; bash $X w.sh`, `bash $(..) w.sh`, `source $X`, `bash *.sh`), so which
+// word the shell runs is unknown. Judge every word that could be it (see script-candidates.mjs) like a named script. A
+// word that is still unknown (`$UNSET`) cannot be judged: the textual rules still apply, and the line is denied when it
+// names a protected pipeline file.
+function judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw) {
+  const joinPath = (d, r) => (isAbs(r) ? posix.normalize(r) : posix.join(d, r));
+  const c = scriptCandidates(sf, { expand: (w) => expandRefs(w, ctx), dirs, joinPath, readDir: ctx.readDir });
+  if (c.over) return deny('too many words (or a glob matching too many files) could be the script this command runs, so it cannot be checked; name the script file');
+  if (c.dynamic && makeMatchers(ctx).rawHit(scanRaw, dirs)) return deny('which word is the script this command runs is only known at run time ($VAR / $(...) / a glob) and the line refers to a protected pipeline file; name the file and write the options literally');
+  for (const file of c.files) {
+    const v = judgeScriptFile({ kind: sf.kind, file, candidate: true }, dirs, ctx, opts);
+    if (v) return v;
+  }
   return null;
 }
 
@@ -1120,7 +1140,7 @@ export function evaluateBashForFiles(command, opts = {}) {
     for (const c of cmds) {
       const sf = scriptFileOf(c.argv);
       if (!sf) continue;
-      const v = judgeScriptFile(sf, dirs, ctx, opts);
+      const v = judgeScriptFile(sf, dirs, ctx, opts, scanRaw);
       if (v) return v;
     }
   } else if (cmds.some((c) => scriptFileOf(c.argv))) return deny('scripts run scripts too deeply to check');

@@ -17,6 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { commandName, simpleCommands, splitArgs, scriptFileOf } from './shell-parse.mjs';
 import { catchAllReason, guardedCommandText } from './guarded-text.mjs';
+import { scriptCandidates, defaultReadDir } from './script-candidates.mjs';
 
 const PROTECTED_BRANCHES = ['main', 'master'];
 const APPROVAL_LABELS = ['human-approved', 'test-change-approved'];
@@ -721,6 +722,7 @@ const isNodeModulesOrPipelineHome = (p) => /[\\/]node_modules[\\/]/.test(p) || /
 // unknown); one that does not exist runs nothing. Programs run by path and interpreter files are only scanned when
 // readable (a binary, a huge generated file or a package under node_modules is not ours to judge).
 function checkScriptFile(sf, dir, ctx, level) {
+  if (sf.ambiguous) return checkCandidateScripts(sf, dir, ctx, level);
   const file = expandVars(sf.file, ctx.vars);
   if (/^\$\{?HOME\}?(?=\/|$)/.test(file)) return checkScriptFile({ ...sf, file: ctx.home + file.replace(/^\$\{?HOME\}?/, '') }, dir, ctx, level);
   if (DYNAMIC.test(file)) {
@@ -732,6 +734,7 @@ function checkScriptFile(sf, dir, ctx, level) {
   const abs = path.resolve(dir ?? ctx.cwd, home);
   const text = ctx.readText(abs);
   if (typeof text !== 'string') {
+    if (sf.candidate && ctx.readDir(abs)) return null; // a shell cannot run a directory
     if (sf.kind === 'shell' && ctx.pathExists(abs)) return deny(`cannot read the script ${sf.file} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified.`);
     return null; // missing: nothing will run
   }
@@ -749,6 +752,29 @@ function checkScriptFile(sf, dir, ctx, level) {
   if (level >= MAX_NESTING) return deny(`the script ${sf.file} is nested too deeply (scripts running scripts) to verify.`);
   const v = text.length > MAX_LINE_CHARS ? judgeLongText(text) : evalString(text, dir, ctx, level + 1);
   return v.decision === 'deny' ? deny(`the script ${sf.file} would run a blocked command: ${v.reason}`) : null;
+}
+
+// A word before the script expands at run time (`X=+n; bash $X f.sh`, `bash $(..) f.sh`, `source $X`, `bash *.sh`), so which
+// word the shell runs is unknown. Judge every word that could be it (see script-candidates.mjs) like a named script. A
+// word that is still unknown (`$UNSET`) cannot be judged: denied when the line mentions a guarded operation, as for a
+// script named at run time.
+function checkCandidateScripts(sf, dir, ctx, level) {
+  const here = path.resolve(dir ?? ctx.cwd);
+  const expand = (w) => {
+    let e = expandVars(w, ctx.vars).replace(/^\$\{?HOME\}?(?=\/|$)/, ctx.home);
+    if (e === '~' || e.startsWith('~/')) e = ctx.home + e.slice(1);
+    return e;
+  };
+  const c = scriptCandidates(sf, { expand, dirs: [here], joinPath: (d, r) => path.resolve(d, r), readDir: ctx.readDir });
+  if (c.over) return deny('too many words (or a glob matching too many files) could be the script this command runs, so it cannot be verified. Name the script file.');
+  if (c.dynamic && GUARDED_WORDS.test(ctx.fullText)) {
+    return deny('which word is the script this command runs is only known at run time ($VAR / $(...) / a glob) and the line mentions a guarded operation, so it cannot be verified. Name the file and write the options literally.');
+  }
+  for (const file of c.files) {
+    const v = checkScriptFile({ kind: sf.kind, file, candidate: true }, dir, ctx, level);
+    if (v) return v;
+  }
+  return null;
 }
 
 // ---- entry point ----------------------------------------------------------------------------------------
@@ -807,12 +833,13 @@ export function evaluateGitCommand(command, {
   issueLabels = () => { throw new Error('no issue label lookup is available'); },
   readText = defaultReadText,
   pathExists = existsSync,
+  readDir = defaultReadDir,
 } = {}) {
   const text = typeof command === 'string' ? command : String(command ?? '');
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   const base = cwd || process.cwd();
   const ctx = {
-    cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, fullText: text,
+    cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, readDir, fullText: text,
     vars: Object.create(null), gitAliases: Object.create(null), ghAliases: Object.create(null),
     branches: new Map(), cfgDirty: false, envCfgDirty: false,
   };

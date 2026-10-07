@@ -416,8 +416,14 @@ function unwrap(argv) {
 
 // ---- interpreter invocations --------------------------------------------------------------------
 
+// A word whose value is only known at run time: `$VAR`, `$(..)`, backticks, or a glob. It may become no word, one
+// word or several, so it hides which of the words after it is the script.
+const EXPANDS = /[$`*?[]/;
+const hasExpansion = (w) => EXPANDS.test(w);
+
 // bash -c "script" / bash -lc ... / bash script.sh / bash (reads stdin)
 // -s, `-`, /dev/stdin and /dev/fd/0 all mean "read the script from stdin".
+// `amb`: a word up to the operand expands, so the operand found here may not be the one the shell picks.
 function shellInvocation(argv) {
   let i = 1;
   let sawC = false;
@@ -433,14 +439,14 @@ function shellInvocation(argv) {
   }
   if (sawC) return i < argv.length ? { kind: 'script', text: argv[i] } : { kind: 'none' };
   if (sawS) return { kind: 'stdin' };
-  if (i < argv.length) return STDIN_FILES.has(argv[i]) ? { kind: 'stdin' } : { kind: 'file', text: argv[i] };
-  return { kind: 'stdin' };
+  if (i < argv.length) return STDIN_FILES.has(argv[i]) ? { kind: 'stdin' } : { kind: 'file', text: argv[i], amb: argv.slice(1, i + 1).some(hasExpansion) };
+  return { kind: 'stdin', amb: argv.slice(1).some(hasExpansion) }; // `bash -$X` may be `bash -x f.sh`
 }
 
 // ---- script files -------------------------------------------------------------------------------
 
 const INTERPRETER = /^(?:node|nodejs|deno|bun|tsx|ts-node|python\d*(?:\.\d+)*|ruby|perl|php)$/;
-const SCRIPT_EXT = /\.(?:m?[jt]s|cjs|jsx|tsx|py|rb|pl|php|sh|bash|zsh)$/i;
+export const SCRIPT_EXT = /\.(?:m?[jt]s|cjs|jsx|tsx|py|rb|pl|php|sh|bash|zsh)$/i;
 const SYSTEM_BIN = /^(?:\/usr)?(?:\/local)?\/(?:s?bin|libexec)\/|^\/opt\/homebrew\/s?bin\//;
 // Flags that make an interpreter run inline code, a module or a test runner instead of a file.
 const INLINE_FLAGS = new Set(['-e', '-E', '-p', '-c', '-m', '--eval', '--print', '--check', '--test', '--input-type']);
@@ -450,16 +456,21 @@ const INTERP_VALUE_FLAGS = new Set(['-r', '--require', '--import', '--loader', '
 // {kind:'shell'} is run as a shell script (the caller judges its commands), {kind:'interp'} is program text in
 // another language (the caller scans it), {kind:'exec'} is a program run by path (shell or interpreter, from its
 // shebang). Null when the command runs no file (`bash -c`, stdin, process substitution, `node -e`, a test runner).
+// `ambiguous: true` (shells, source, interpreters): a word from argv[1] up to the operand expands at run time (`$X f.sh`,
+// `$(..)`, a glob), so `file` is only a guess; `words` (argv[1..]) are the candidates, `needExt` says an interpreter
+// only runs a file with a script extension. The caller expands what it can and judges every candidate.
 export function scriptFileOf(argv) {
   if (!argv.length) return null;
   const name = base(argv[0]);
   if (SHELLS.has(name)) {
     const r = shellInvocation(argv);
-    return r.kind === 'file' && !r.text.startsWith('<(') ? { kind: 'shell', file: r.text } : null;
+    if (r.kind === 'file' && !r.text.startsWith('<(')) return r.amb ? { kind: 'shell', file: r.text, ambiguous: true, words: argv.slice(1) } : { kind: 'shell', file: r.text };
+    return r.kind === 'stdin' && r.amb ? { kind: 'shell', file: undefined, ambiguous: true, words: argv.slice(1) } : null;
   }
   if (name === 'source' || name === '.') {
     const op = argv[1];
-    return op === undefined || STDIN_FILES.has(op) || op.startsWith('<(') ? null : { kind: 'shell', file: op };
+    if (op === undefined || STDIN_FILES.has(op) || op.startsWith('<(')) return null;
+    return hasExpansion(op) ? { kind: 'shell', file: op, ambiguous: true, words: argv.slice(1) } : { kind: 'shell', file: op };
   }
   if (INTERPRETER.test(name)) {
     let i = 1;
@@ -472,7 +483,9 @@ export function scriptFileOf(argv) {
       break;
     }
     const file = argv[i];
-    if (file === undefined || (name !== 'node' && !INTERPRETER_NO_EXT.has(name) && !SCRIPT_EXT.test(file))) return null;
+    const needExt = name !== 'node' && !INTERPRETER_NO_EXT.has(name);
+    if (argv.slice(1, i + 1).some(hasExpansion)) return { kind: 'interp', file, ambiguous: true, words: argv.slice(1), needExt };
+    if (file === undefined || (needExt && !SCRIPT_EXT.test(file))) return null;
     return STDIN_FILES.has(file) ? null : { kind: 'interp', file };
   }
   if (/[/]/.test(argv[0]) && !argv[0].includes('\\') && !SYSTEM_BIN.test(argv[0])) return { kind: 'exec', file: argv[0] };
