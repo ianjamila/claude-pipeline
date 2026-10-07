@@ -558,6 +558,16 @@ test('whole-file import reading covers every language the parser reads (.mdx, Ru
   }
 });
 
+test('the reverse check finds importers whatever the case of their extension (Helper.TS, page.MDX)', async () => {
+  for (const importer of ['lib/Helper.TS', 'site/page.MDX']) {
+    const repo = await reverseRepo({ 'tests/helper.ts': 'export const a = 1;\n', [importer]: "import { a } from '../tests/helper';\n" });
+    repo.write('tests/helper.ts', EVIL_BODY);
+    repo.commit('edit helper');
+    const hits = await collectWith(repo);
+    assert.ok(hits.some((h) => h.rule === 'R0-unscannable' && h.file === 'tests/helper.ts'), `${importer}: ${JSON.stringify(hits.map((h) => [h.rule, h.file]))}`);
+  }
+});
+
 test('the string-blind Python fallback reads heads anywhere on a line and ignores brackets in comments', () => {
   const desync = 'v = f"{d["("]}"';
   const cases = [
