@@ -7,9 +7,15 @@
 #
 # Provenance: pull_request_target reads THIS file from the PR's base branch, so a PR into a branch whose copy of the file was
 # edited would also post statuses as github-actions[bot]. Receipts and the final gate therefore verify that a status's
-# target_url is a run of this workflow, event pull_request_target, from a commit on the default branch
+# target_url is a first-attempt run of this workflow, event pull_request_target, from a commit on the default branch
 # (scripts/pipeline/lib/guard-provenance.mjs). There is deliberately no `branches:` filter: a template cannot know the
 # default branch, and a filter in this file protects nothing against a PR into a branch that carries its own copy.
+#
+# Verdict artifact: a spoofing run could still point its status at a genuine run of the same PR and head that is in progress.
+# So the job is split: "Evaluate" records the verdict (verdict.json) and names it, "Upload verdict" attaches it to THIS run as
+# the artifact pipeline-verdict_v1_<head>_<integrity>_<hardstops>[_<label>_<login>], and only then "Publish" posts the
+# statuses. A status counts only if the artifact of the run it points at says the same; a spoofing run cannot upload an
+# artifact to somebody else's run. Do not rename the artifact or the steps without changing guard-provenance.mjs.
 #
 # Approvals: a `labeled` run by an allowed approver first posts a receipt status (`pipeline-approval: <label>`) on the
 # exact head sha; an approval label only counts for a head that carries a fresh receipt from github-actions[bot], so an
@@ -28,6 +34,7 @@ permissions:
   pull-requests: write  # only to remove an approval label that has no receipt for the current head
   issues: read          # label timeline (who approved, when)
   statuses: write       # publish the two required statuses and the approval receipts
+  actions: read         # provenance: read workflow runs (actions/runs/{id}) and their artifacts with GITHUB_TOKEN; private repos need it
 
 concurrency:
   # An edit that does not change the base (title, body) is a no-op below; it gets its own group so it can never cancel a
@@ -75,8 +82,27 @@ jobs:
         with:
           node-version: 24
 
-      - name: Evaluate and publish statuses
+      # Phase 1: judge, post the approval receipt if this is an approver's labeling, write the verdict. No final statuses yet.
+      - name: Evaluate
+        id: evaluate
         run: node scripts/pipeline/ci-guards-run.mjs
+
+      # The verdict only this run can attach to itself. Its name (the step output) carries the head, both states and the receipt.
+      # No output (superseded by a newer commit) means nothing to upload and nothing to publish.
+      - name: Upload verdict
+        if: steps.evaluate.outputs.artifact != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.evaluate.outputs.artifact }}
+          path: ${{ runner.temp }}/pipeline-verdict/verdict.json
+          retention-days: 90
+          if-no-files-found: error
+          overwrite: false
+
+      # Phase 2: post the two statuses (unless the head moved meanwhile), then remove approval labels that did not count.
+      - name: Publish
+        if: steps.evaluate.outputs.artifact != ''
+        run: node scripts/pipeline/ci-guards-run.mjs --publish
 
       - name: Fail closed if evaluation did not finish
         if: failure() || cancelled()
@@ -86,7 +112,7 @@ jobs:
               --jq "[.[] | select(.context == \"$ctx\")][0].state" 2>/dev/null || true)
             if [ -z "$cur" ] || [ "$cur" = "pending" ]; then
               gh api "repos/$REPO/statuses/$EVENT_HEAD" -f state=error -f context="$ctx" \
-                -f description="guard did not finish — re-run the Pipeline guards workflow" \
+                -f description="guard did not finish — push a commit, or close and reopen the PR, to run it again" \
                 -f target_url="$RUN_URL" > /dev/null || true
             fi
           done
