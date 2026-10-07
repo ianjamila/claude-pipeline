@@ -585,6 +585,12 @@ test('a scoped specifier is an npm package only when package.json declares it (n
   repo.write('scripts/p.mjs', "import { webkit } from '@playwright/test';\n");
   repo.commit('use playwright');
   assert.deepEqual((await collectWith(repo)).filter((h) => h.rule === 'R0-unscannable'), []);
+  // a dependency declared only in THIS diff (head, not the merge base) never turns an alias into a package
+  const sneaky = await reverseRepo({ 'package.json': JSON.stringify({ dependencies: {} }), 'lib/pay.ts': 'export {};\n' });
+  sneaky.write('package.json', JSON.stringify({ dependencies: { '@shared/tests': '^1.0.0' } }));
+  sneaky.write('lib/pay.ts', "import h from '@shared/tests';\n");
+  sneaky.commit('declare and import');
+  assert.ok((await collectWith(sneaky)).some((h) => h.rule === 'R0-unscannable' && h.file === 'lib/pay.ts'));
 });
 
 test('production code importing a test runner config is flagged (a config is not a bridge); only exact config names count', () => {
