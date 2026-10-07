@@ -315,7 +315,7 @@ test('IO: the reverse check fails closed: a file name git cannot search for, or 
   repo.commit('edit');
   const capped = await collectWith(repo, { maxImporterHits: 1 });
   assert.deepEqual(rulesOf(capped), ['R0-unscannable']);
-  assert.match(capped[0].detail, /could not be checked \(more than 1 candidate import lines\)/);
+  assert.match(capped[0].detail, /could not be checked \(more than 1 files mention it\)/);
   assert.deepEqual(rulesOf(await collectWith(repo, { maxImporterHits: 2 })), ['R0-unscannable']); // within the cap: found for real
   assert.doesNotMatch((await collectWith(repo, { maxImporterHits: 2 }))[0].detail, /could not be checked/);
   if (process.platform !== 'win32') {
@@ -325,5 +325,95 @@ test('IO: the reverse check fails closed: a file name git cannot search for, or 
     const hits = await collectWith(odd);
     assert.deepEqual(rulesOf(hits), ['R0-unscannable']);
     assert.match(hits[0].detail, /a file name cannot be searched for/);
+  }
+});
+
+// ---- review round 2: .js written for .ts, transitive chains, imports split over lines, imports after a block comment ----------
+
+test('a TypeScript-ESM import (`.js` written for a `.ts` file) reaches the test file: forward and reverse', async () => {
+  // forward: the test glob only matches the .ts spelling
+  const config = cfg({ test_globs: ['helpers/**/*.ts'] });
+  assert.deepEqual(rulesOf(run([file('lib/pay.ts', { added: ["import { x } from '../helpers/x.js';"] })], { config })), ['R0-unscannable']);
+  assert.deepEqual(rulesOf(run([file('lib/pay.ts', { added: ["import { x } from '../helpers/x.mjs';"] })], { config: cfg({ test_globs: ['helpers/**/*.mts'] }) })), ['R0-unscannable']);
+  assert.deepEqual(rulesOf(run([file('lib/pay.ts', { added: ["import { x } from '../helpers/y.js';"] })], { config: cfg({ test_globs: ['helpers/x.ts'] }) })), []);
+  // reverse
+  const repo = await reverseRepo({ 'tests/helper.ts': 'export const wipe = () => 1;\n', 'lib/pay.ts': "import { wipe } from '../tests/helper.js';\n" });
+  repo.write('tests/helper.ts', EVIL_BODY);
+  repo.commit('edit');
+  const hits = await collectWith(repo);
+  assert.deepEqual(hits.map((h) => [h.rule, h.file]), [['R0-unscannable', 'tests/helper.ts']]);
+});
+
+test('IO: the reverse check follows test-to-test imports: prod -> tests/a.ts -> tests/b.ts, editing only b is flagged', async () => {
+  const chain = { 'lib/pay.ts': "import { a } from '../tests/a';\n", 'tests/a.ts': "export * from './b';\n", 'tests/b.ts': 'export const b = 1;\n' };
+  const repo = await reverseRepo(chain);
+  repo.write('tests/b.ts', EVIL_BODY);
+  repo.commit('edit b only');
+  const hits = await collectWith(repo);
+  assert.deepEqual(hits.map((h) => [h.rule, h.file]), [['R0-unscannable', 'tests/b.ts']]);
+  assert.match(hits[0].detail, /production code \(lib\/pay\.ts:1, through tests\/a\.ts\)/);
+
+  // three deep, with a cycle; an unrelated test file importing b is not a chain from production
+  const deep = await reverseRepo({
+    'lib/pay.ts': "import { a } from '../tests/a';\n", 'tests/a.ts': "export * from './b';\n", 'tests/b.ts': "export * from './c';\nimport './a';\n",
+    'tests/c.ts': 'export const c = 1;\n', 'tests/d.ts': 'export const d = 1;\n', 'tests/lonely.ts': "import './d';\n",
+  });
+  deep.write('tests/c.ts', EVIL_BODY);
+  deep.write('tests/d.ts', EVIL_BODY);
+  deep.commit('edit c and d');
+  const hits2 = await collectWith(deep);
+  assert.deepEqual(hits2.map((h) => h.file).sort(), ['tests/c.ts']);
+
+  // a chain deeper than the round cap fails closed (every file concerned is flagged)
+  const files = { 'lib/pay.ts': "import '../tests/t0';\n" };
+  for (let i = 0; i < 8; i++) files[`tests/t${i}.ts`] = i < 7 ? `import './t${i + 1}';\n` : 'export const end = 1;\n';
+  const long = await reverseRepo(files);
+  long.write('tests/t7.ts', EVIL_BODY);
+  long.commit('edit the end of a long chain');
+  const hits3 = await collectWith(long);
+  assert.deepEqual(hits3.map((h) => h.file), ['tests/t7.ts']);
+  assert.match(hits3[0].detail, /could not be checked \(test files import each other more than 5 deep\)/);
+});
+
+const SPLIT_IMPORTS = [
+  ["const h = require(", "  '../tests/helper'", ');'], ['const m = await import(', "'../spec/x')"], ['import {', '  wipe,', "} from '../tests/x';"],
+  ['import wipe', "  from '../spec/x'"], ['export {', ' a', "} from '../cypress/x'"],
+];
+test('an import split over several lines is read whole: forward (whatever lines the diff added) and reverse', async () => {
+  for (const lines of SPLIT_IMPORTS) {
+    assert.deepEqual(rules([file('lib/pay.ts', { added: lines })]), ['R0-unscannable'], `added all: ${lines.join(' / ')}`);
+    // only the line that holds the specifier was added; the rest is unchanged context, known from the head text
+    const at = lines.findIndex((l) => /['"]\.\.\//.test(l));
+    const hits = run([file('lib/pay.ts', { added: [lines[at]], at: at + 1 })], { headFiles: new Map([['lib/pay.ts', lines.join('\n') + '\n']]) });
+    assert.deepEqual(rulesOf(hits), ['R0-unscannable'], `context: ${lines.join(' / ')}`);
+    // an edit elsewhere in the file leaves an old split import alone (the reverse check, not this one, owns it)
+    assert.deepEqual(rules([file('lib/pay.ts', { added: ['const x = 1;'], at: 10 })], { headFiles: new Map([['lib/pay.ts', [...lines, '', '', '', '', '', '', '', '', 'const x = 1;'].join('\n')]]) }), []);
+  }
+  for (const lines of SPLIT_IMPORTS.slice(0, 3)) {
+    const repo = await reverseRepo({ 'tests/helper.ts': 'export const wipe = 1;\n', 'tests/x.ts': 'export const wipe = 1;\n', 'spec/x.ts': 'export const wipe = 1;\n', 'cypress/x.ts': 'export const a = 1;\n', 'lib/pay.ts': lines.join('\n') + '\n' });
+    const target = lines.join(' ').match(/(tests\/helper|tests\/x|spec\/x)/)[1] + '.ts';
+    repo.write(target, EVIL_BODY);
+    repo.commit('edit');
+    const hits = await collectWith(repo);
+    assert.deepEqual(hits.map((h) => h.file), [target], lines.join(' / '));
+    assert.match(hits[0].detail, /production code \(lib\/pay\.ts:\d+\)/);
+  }
+});
+
+const AFTER_COMMENT = [
+  "/* eslint-disable */ import { wipe } from '../tests/helper';", "*/ const h = require('../spec/x')", "/* a */ /* b */ import h from '../tests/h'",
+  "/** doc */ const m = await import('../cypress/x')", " * end of a comment */ import h from '../tests/h'",
+];
+const REAL_COMMENTS = ["/* import h from '../tests/helper' */", " * import h from '../tests/helper'", "// import h from '../tests/helper'", "/*", "# from tests.helper import x", "*/"];
+test('an import after a closed block comment is code, not a comment: forward and reverse; real comment lines stay quiet', async () => {
+  for (const line of AFTER_COMMENT) assert.deepEqual(rules([file('lib/pay.ts', { added: [line] })]), ['R0-unscannable'], line);
+  for (const line of REAL_COMMENTS) assert.deepEqual(rules([file('lib/pay.ts', { added: [line] })]), [], line);
+  assert.deepEqual(rules([file('app/views.py', { added: ['# from tests.helper import x'] })]), []);
+  for (const line of AFTER_COMMENT.slice(0, 2)) {
+    const repo = await reverseRepo({ 'tests/helper.ts': 'export const wipe = 1;\n', 'spec/x.ts': 'export const a = 1;\n', 'lib/pay.ts': line + '\n' });
+    const target = line.includes('spec') ? 'spec/x.ts' : 'tests/helper.ts';
+    repo.write(target, EVIL_BODY);
+    repo.commit('edit');
+    assert.deepEqual((await collectWith(repo)).map((h) => h.file), [target], line);
   }
 });

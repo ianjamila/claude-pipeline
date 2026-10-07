@@ -21,15 +21,19 @@
 //    credential token itself, never in a comment or a neighbouring name on the line).
 //    Path rules and the R1 migration rules judge every file.
 //  * An exempt file wired into production would never be judged, so BOTH directions are flagged (R0-unscannable):
-//      - forward: an added live line in production code imports one. Each import specifier on the line (JS/TS `from`,
+//      - forward: production code adds an import of one. Specifiers are read over the whole new file (an import split over
+//        lines is one import) and count when a line they span was added; comments are skipped, but code after a closed
+//        `/* ... */` is code. Each import specifier (JS/TS `from`,
 //        `import`, `import()`, `require()`; Python `from a.b import` / `import a.b`; Ruby `require` / `require_relative`
 //        / `load`) is turned into every repo path it could name (relative: resolved against the importing file; otherwise
 //        from the root, with `@/` `~/` `#/` `@@/` stripped and every path-segment suffix; Python dotted -> slash path; each
-//        with source extensions and `/index`, `/__init__`) and flagged when ANY of them passes the SAME test-file predicate the
+//        with source extensions, `/index`, `/__init__` and, for TypeScript ESM, `.js` standing for `.ts`) and flagged when ANY of them passes the SAME test-file predicate the
 //        exemption uses, so no spelling of a path can reach an exempt location unseen. Over-matching is the safe direction.
 //      - reverse: the PR edits an exempt test file that production code at head ALREADY imports (the importing line is not in
-//        the diff, so the forward check never sees it): one grep of the head tree finds import lines naming the changed
-//        files, the same resolver says which really reach them. A grep that fails or returns too much flags every changed test file.
+//        the diff, so the forward check never sees it), directly or through other test files (prod -> tests/a -> tests/b):
+//        a grep of the head tree finds the files that mention the changed basenames, they are read whole and the same
+//        resolver says which really import them; test importers join the chain for a bounded number of rounds. A grep that
+//        fails, or a result or chain over its cap, flags the changed test files concerned.
 //  * Content that MOVES is judged too: a rename from an exempt path (test, docs) into production code carries lines the
 //    diff does not show (R0-unscannable), and a symlink (mode 120000) or submodule (160000) can make a production path serve
 //    a file from an exempt one or point at unreviewed code (R4-pipeline). A 100% rename has no mode line in the unified
@@ -495,39 +499,94 @@ const JS_IMPORT_FORMS = [
   new RegExp(String.raw`\b(?:require|import)(?:\.resolve|Actual|Mock)?\s*\(\s*${Qs}([^'"\`]{1,${MAX_SPECIFIER}})${Qs}`, 'g'), // require('..') import('..')
 ];
 const RB_IMPORT_FORM = new RegExp(String.raw`\b(?:require_relative|require|load)\s*\(?\s*${Qs}([^'"\`]{1,${MAX_SPECIFIER}})${Qs}`, 'g');
-const PY_FROM = /(?:^|;)\s*from\s+(\.*[A-Za-z_][\w.]*|\.+)\s+import\s+([^#\n]{0,1000})/g;
-const PY_IMPORT = /(?:^|;)\s*import\s+([^#\n;]{1,1000})/g;
+const PY_FROM = /(?:^|;)\s*from\s+(\.*[A-Za-z_][\w.]*|\.+)\s+import\s+([^#\n]{0,1000})/gm;
+const PY_IMPORT = /(?:^|;)\s*import\s+([^#\n;]{1,1000})/gm;
 const PY_DYNAMIC = new RegExp(String.raw`\b(?:import_module|__import__)\s*\(\s*${Qs}([^'"\`]{1,${MAX_SPECIFIER}})${Qs}`, 'g');
 
-// Every module specifier one source line imports: [{ spec, py }] (py: a dotted Python module, else a path-like string).
-// Generous on purpose: an extra specifier can only add a false positive.
+// What a line says once leading comments are gone, so `/* eslint-disable */ import x from '..'` and `*/ require('..')` are NOT
+// skipped as comments: closed block comments (and the tail of an open one, `*/`) are stripped from the front, and only a line
+// that is nothing but a comment (`// `, `# `, `-- `, an unclosed `/*`, a ` * ` continuation) comes back empty. Over-matching is fine.
+export function codeOfLine(text) {
+  let i = 0;
+  for (;;) {
+    while (i < text.length && /\s/.test(text[i])) i++;
+    if (text.startsWith('/*', i) || text[i] === '*') {
+      const e = text.indexOf('*/', text[i] === '*' ? i : i + 2);
+      if (e === -1) return '';
+      i = e + 2;
+    } else {
+      const rest = text.slice(i);
+      return COMMENT_LINE.test(rest) ? '' : rest;
+    }
+  }
+}
+
+// Every module specifier in `text` (any number of lines): [{ spec, py, start, end }] with the match's offsets (py: a dotted
+// Python module, else a path-like string). Generous on purpose: an extra specifier can only add a false positive. Reading
+// whole text means an import split over lines (`require(\n  '../x'\n)`, `import {\n a,\n} from '..'`) is read like any other.
 export function importSpecifiers(text, file) {
   const out = [];
   const isPy = PY_FILE.test(file);
   const isJs = JS_FAMILY.test(file);
-  if (!isPy) {
-    for (const r of JS_IMPORT_FORMS) for (const m of text.matchAll(r)) out.push({ spec: m[1], py: false });
-    if (!isJs) for (const m of text.matchAll(RB_IMPORT_FORM)) out.push({ spec: m[1], py: false });
-  }
-  // A Python import has no quotes; skipping lines that have them keeps `import test from 'node:test'` out of the Python reading.
-  if (isPy || !/['"`{]/.test(text)) {
-    for (const m of text.matchAll(PY_FROM)) {
-      out.push({ spec: m[1], py: true });
+  const add = (spec, py, index, length) => out.push({ spec, py, start: index, end: index + length });
+  const python = (src, base) => {
+    for (const m of src.matchAll(PY_FROM)) {
+      add(m[1], true, base + m.index, m[0].length);
       for (const item of m[2].replace(/[()]/g, ' ').split(',')) {
         const name = /^\s*([A-Za-z_]\w*)/.exec(item)?.[1];
-        if (name) out.push({ spec: m[1].endsWith('.') ? `${m[1]}${name}` : `${m[1]}.${name}`, py: true });
+        if (name) add(m[1].endsWith('.') ? `${m[1]}${name}` : `${m[1]}.${name}`, true, base + m.index, m[0].length);
       }
     }
-    for (const m of text.matchAll(PY_IMPORT)) {
+    for (const m of src.matchAll(PY_IMPORT)) {
       for (const item of m[1].split(',')) {
         const mod = /^\s*([A-Za-z_][\w.]*)/.exec(item)?.[1];
-        if (mod) out.push({ spec: mod, py: true });
+        if (mod) add(mod, true, base + m.index, m[0].length);
       }
     }
+  };
+  if (isPy) {
+    python(text, 0);
+    for (const m of text.matchAll(PY_DYNAMIC)) add(m[1], true, m.index, m[0].length);
+    return out;
   }
-  if (isPy) for (const m of text.matchAll(PY_DYNAMIC)) out.push({ spec: m[1], py: true });
-  return [...new Map(out.map((x) => [`${x.py}\0${x.spec}`, x])).values()];
+  for (const r of JS_IMPORT_FORMS) for (const m of text.matchAll(r)) add(m[1], false, m.index, m[0].length);
+  if (!isJs) for (const m of text.matchAll(RB_IMPORT_FORM)) add(m[1], false, m.index, m[0].length);
+  // A Python import has no quotes; skipping lines that have them keeps `import test from 'node:test'` out of the Python reading.
+  let base = 0;
+  for (const line of text.split('\n')) {
+    if (!/['"`{]/.test(line)) python(line, base);
+    base += line.length + 1;
+  }
+  return out;
 }
+
+// importSpecifiers over an array of source lines (comment-only lines and lines over MAX_LINE read as blank), each result also
+// carrying the 1-based line range it spans: { spec, py, from, to }.
+function scanImports(lines, file) {
+  const starts = [];
+  const parts = [];
+  let pos = 0;
+  for (const l of lines) {
+    const c = l.length > MAX_LINE ? '' : codeOfLine(l);
+    starts.push(pos);
+    parts.push(c);
+    pos += c.length + 1;
+  }
+  const lineOf = (idx) => {
+    let lo = 0;
+    let hi = starts.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (starts[mid] <= idx) lo = mid;
+      else hi = mid - 1;
+    }
+    return lo + 1;
+  };
+  return importSpecifiers(parts.join('\n'), file).map((m) => ({ spec: m.spec, py: m.py, from: lineOf(m.start), to: lineOf(Math.max(m.start, m.end - 1)) }));
+}
+
+// The JS extensions a TypeScript-ESM import writes for a file that is really the TS one (`./x.js` -> x.ts).
+const TS_SWAP = { '.js': ['.ts', '.tsx'], '.mjs': ['.mts'], '.cjs': ['.cts'], '.jsx': ['.tsx'] };
 
 // The repo paths a specifier written in `fromFile` may name, each with how sure we are of the path:
 //   'exact'  the resolved path (relative specifiers; bare JS names)
@@ -535,18 +594,23 @@ export function importSpecifiers(text, file) {
 //   'fwd'    a wild guess (the specifier's tail, a single trailing segment): only ever used to flag an IMPORT, never to match a file
 // Relative -> resolved against the importing file's directory. Non-relative -> as written, with `@/` `~/` `#/` `@@/` stripped,
 // and every path-segment suffix (`@acme/x/tests/h` also tries `x/tests/h` and `tests/h`). Python dotted -> slash path. Each path also
-// with every source extension and `/index.<ext>` / `/__init__.py`. Over-matching is the safe direction.
+// with every source extension, `/index.<ext>` / `/__init__.py`, and (TypeScript ESM) the `.ts` file a written `.js` stands for.
+// Over-matching is the safe direction.
 export function importCandidates(spec, fromFile, { python = false } = {}) {
   const out = [];
   const seen = new Set();
   const push = (p, mode) => {
     const clean = p.replace(/^(?:\.{1,2}\/)+/, '').replace(/^\/+/, '').replace(/\/{2,}/g, '/').replace(/\/$/, '');
     if (clean === '' || clean === '.' || clean === '..') return;
-    for (const v of [clean, ...IMPORT_EXTS.flatMap((e) => [`${clean}${e}`, `${clean}/index${e}`]), `${clean}/__init__.py`]) {
-      const key = `${mode}\0${v}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        out.push({ path: v, mode });
+    const lower = clean.toLowerCase();
+    const swapped = Object.entries(TS_SWAP).flatMap(([from, tos]) => (lower.endsWith(from) ? tos.map((to) => clean.slice(0, -from.length) + to) : []));
+    for (const b of [clean, ...swapped]) {
+      for (const v of [b, ...IMPORT_EXTS.flatMap((e) => [`${b}${e}`, `${b}/index${e}`]), `${b}/__init__.py`]) {
+        const key = `${mode}\0${v}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          out.push({ path: v, mode });
+        }
       }
     }
   };
@@ -577,18 +641,42 @@ export function importCandidates(spec, fromFile, { python = false } = {}) {
   return out;
 }
 
-// The first specifier on `text` (an added live line of `file`) that reaches a test file (or a legacy test dir), or null.
-// More than MAX_SPECIFIERS_PER_LINE distinct specifiers on one line is not a real import list: treated as reaching a test module.
-const MAX_SPECIFIERS_PER_LINE = 100;
-function importedTestModule(text, file, testGlobs) {
-  const specs = importSpecifiers(text, file);
-  if (specs.length > MAX_SPECIFIERS_PER_LINE) return '(too many imports on one line)';
+// Does any of `specs` reach a test file (or a legacy test dir)? -> the first such specifier, or null.
+function reachesTestModule(specs, file, testGlobs) {
   for (const { spec, py } of specs) {
     for (const c of importCandidates(spec, file, { python: py })) {
       if (isTestFile(c.path, testGlobs) || LEGACY_TEST_DIR.test(c.path)) return spec;
     }
   }
   return null;
+}
+
+// More than this many distinct specifiers on the added lines of one file is not a real import list: flagged outright.
+const MAX_SPECIFIERS_PER_FILE = 100;
+// The added lines of production code `d` that import a test module. Specifiers are read over the WHOLE new file when its text
+// is known (`headText`), so an import split across lines is caught whichever of its lines the diff touched; without it, over
+// the added lines only (lines nobody added read as blank). A specifier counts when any line it spans was added.
+function addedImportLines(d, added, headText, testGlobs) {
+  if (added.length === 0) return [];
+  const file = d.newPath ?? d.file;
+  const addedAt = new Map(added.map((l) => [l.line, l]));
+  let lines;
+  if (typeof headText === 'string') lines = headText.split('\n');
+  else {
+    lines = Array.from({ length: added.reduce((m, l) => Math.max(m, l.line), 0) }, () => '');
+    for (const l of added) lines[l.line - 1] = l.text;
+  }
+  const touched = new Map(); // spec -> first added line it spans
+  for (const m of scanImports(lines, file)) {
+    let first = null;
+    for (let n = m.from; n <= m.to && first === null; n++) if (addedAt.has(n)) first = n;
+    const key = `${m.py}\0${m.spec}`;
+    if (first !== null && !touched.has(key)) touched.set(key, { spec: m.spec, py: m.py, line: first });
+  }
+  if (touched.size > MAX_SPECIFIERS_PER_FILE) return [addedAt.get([...touched.values()][0].line)];
+  const out = [];
+  for (const t of touched.values()) if (reachesTestModule([t], file, testGlobs) !== null) out.push(addedAt.get(t.line));
+  return out;
 }
 
 const SECRETS_REF = /\bsecrets\s*[.[]/i;
@@ -1040,6 +1128,10 @@ function addedCodeRules(d, added, cx, env, sink) {
     }
   }
 
+  for (const l of addedImportLines(d, added, cx.headFiles?.get(d.file), cx.testGlobs)) {
+    sink.add('R0-unscannable', d.file, 'imports a test/fixture module into production code; test files are not judged', { line: l.line, excerpt: excerpt(l.text) });
+  }
+
   for (const l of added) {
     const ex = { line: l.line, excerpt: excerpt(l.text) };
 
@@ -1059,7 +1151,6 @@ function addedCodeRules(d, added, cx, env, sink) {
 
     const secret = SECRET_LITERALS.find(([, r]) => r.test(l.text));
     if (secret) sink.add('R3-secrets', d.file, `secret-like literal (${secret[0]})`, { line: l.line }); // no excerpt: it IS the secret
-    if (live(l) && importedTestModule(l.text, d.newPath ?? d.file, cx.testGlobs) !== null) sink.add('R0-unscannable', d.file, 'imports a test/fixture module into production code; test files are not judged', ex);
     if (isWorkflow && SECRETS_REF.test(l.text)) sink.add('R3-secrets', d.file, 'workflow reads secrets.*', ex);
     if (isVercel && VERCEL_KEY.test(l.text)) sink.add('R3-secrets', d.file, 'vercel.json env/build/deploy setting changed', ex);
 
@@ -1142,11 +1233,12 @@ const needs = (cond, msg) => {
 //   sqlStatements [{file, text}]: whole statements around changed lines of .sql files, from base and head
 //   envFiles      Set of changed files that mention process.env / z.object / createEnv (default: judged from the diff lines)
 //   envImportFiles  Set of changed files that import an env object, so `env.NAME` is a read (default: judged from the diff lines)
+//   headFiles     Map file -> whole new content of changed code files (optional): lets the import check read an import split over lines
 //   guardLosses   [{file, kind:'code'|'sql', detail}] guards that vanished from the whole file without a removed line (commented out)
 // Throws TypeError when the diff touches SQL or package.json and sqlStatements / pkgPairs (or basePkg+headPkg) are missing.
 // Returns hits `{ rule, file, line?, excerpt?, detail }`.
-export function classifyHardStops({ files, config, baseEnvNames = new Set(), basePkg, headPkg, pkgPairs, sqlStatements, envFiles, envImportFiles, guardLosses = [] }) {
-  const cx = settings(config);
+export function classifyHardStops({ files, config, baseEnvNames = new Set(), basePkg, headPkg, pkgPairs, sqlStatements, envFiles, envImportFiles, guardLosses = [], headFiles }) {
+  const cx = { ...settings(config), headFiles: new Map(headFiles instanceof Map ? headFiles : Object.entries(headFiles ?? {})) };
   const sink = makeSink();
   const known = new Set(baseEnvNames);
   const env = { known, envFiles: envFiles === undefined ? null : new Set(envFiles), importFiles: envImportFiles === undefined ? null : new Set(envImportFiles) };
@@ -1312,72 +1404,130 @@ function parseJson(text) {
   }
 }
 
-// Reverse check. A test file is exempt from content rules, so when production code ALREADY imports one, editing that file
-// changes what production runs and nothing judges the new content. For every changed (added, modified, renamed-into) test
-// file: ONE grep of the head tree for import-looking lines that mention any of their basenames, then the import resolver on
-// each hit. Fails closed: a grep that errors, or more hits than `maxHits`, flags every changed test file.
+// Reverse check. A test file is exempt from content rules, so when production code ALREADY imports one (directly, or through
+// other test files: prod -> tests/a.ts -> tests/b.ts), editing that file changes what production runs and nothing judges the
+// new content. For the changed (added, modified, renamed-into) test files: one grep of the head tree for files mentioning
+// their basenames (just the names, so an import split over lines is still found), the importers read whole at head and run
+// through the import resolver; an importer that is a test file joins the chain and the next round looks for ITS importers.
+// Fails closed (every changed test file concerned is flagged) when a git call fails, a round finds more than `maxFiles` files,
+// the chain grows past MAX_CHAIN_FILES or MAX_CHAIN_ROUNDS, or a name cannot be searched for.
 const CODE_PATHSPECS = ['*.js', '*.mjs', '*.cjs', '*.jsx', '*.ts', '*.tsx', '*.mts', '*.cts', '*.vue', '*.svelte', '*.astro', '*.py', '*.pyi', '*.rb', '*.rake'];
-const IMPORT_WORDS = ['import', 'require', 'from', 'load'];
+const MAX_CHAIN_ROUNDS = 5;
+const MAX_CHAIN_FILES = 300;
+const READ_BATCH = 200;
+const MAX_HEAD_TEXT = 2_000_000;
 const stem = (p) => {
   const b = baseName(p);
   const dot = b.lastIndexOf('.');
   return dot > 0 ? b.slice(0, dot) : b;
 };
 
-function reverseImportHits(ds, head, o, cx, maxHits) {
-  const tests = [...new Set(ds.filter((d) => d.status !== 'D' && d.newPath && d.addedIsTest).map((d) => d.newPath))];
-  if (tests.length === 0) return [];
-  const unchecked = (why) => tests.map((file) => ({ rule: 'R0-unscannable', file, detail: `test file changed; production code importing it could not be checked (${why})` }));
-  const names = new Set();
-  for (const p of tests) {
-    names.add(stem(p));
-    if (/^(?:index|__init__)$/.test(stem(p)) && p.includes('/')) names.add(baseName(p.slice(0, p.lastIndexOf('/'))));
-  }
-  // git splits a pattern on newlines and ORs the pieces; a name with one cannot be searched for faithfully.
-  if ([...names].some((n) => n === '' || /[\n\0]/.test(n))) return unchecked('a file name cannot be searched for');
-
+// Files of the tree at `ref` (limited to code) that contain any of `names`.
+function filesMentioning(ref, names, o) {
   let out;
   try {
-    out = git([
-      'grep', '-I', '-F', '-n', '-z', '--no-color',
-      '(', ...IMPORT_WORDS.flatMap((w) => ['-e', w]), ')', '--and', '(', ...[...names].flatMap((n) => ['-e', n]), ')',
-      head, '--', ...CODE_PATHSPECS,
-    ], o);
+    out = git(['grep', '-I', '-F', '-l', '-z', '--no-color', ...names.flatMap((n) => ['-e', n]), ref, '--', ...CODE_PATHSPECS], o);
   } catch (e) {
     if (e instanceof GitError && e.code === 1 && (e.stderr ?? '').trim() === '') return []; // git grep: no match
-    return unchecked(`the search failed: ${oneLine(String(e.message)).slice(0, 120)}`);
+    throw e;
   }
+  return out.split('\0').filter(Boolean).map((r) => r.slice(r.indexOf(':') + 1));
+}
 
-  // Parse `<ref>:<path>\0<line>\0<text>\n`. A path never contains NUL; text never contains a newline.
-  const hits = [];
-  for (const rec of out.split('\n')) {
-    if (rec === '') continue;
-    const a = rec.indexOf('\0');
-    const b = a === -1 ? -1 : rec.indexOf('\0', a + 1);
-    if (b === -1) return unchecked('unreadable search output');
-    hits.push({ file: rec.slice(rec.indexOf(':') + 1, a), line: Number(rec.slice(a + 1, b)), text: rec.slice(b + 1) });
-  }
-  if (hits.length > maxHits) return unchecked(`more than ${maxHits} candidate import lines`);
-
-  // suffix -> changed test files it ends: a candidate of mode 'loose' names a file by its tail.
-  const tails = new Map();
-  for (const p of tests) {
-    const segs = p.split('/');
-    for (let i = 0; i < segs.length; i++) {
-      const t = segs.slice(i).join('/');
-      tails.set(t, [...(tails.get(t) ?? []), p]);
+// Whole content (as arrays of lines) of `files` at `ref`: every line matches \`^\`, so one grep prints them all.
+function readLines(ref, files, o) {
+  const texts = new Map();
+  for (let i = 0; i < files.length; i += READ_BATCH) {
+    let out;
+    try {
+      out = git(['grep', '-I', '-n', '-z', '--no-color', '-e', '^', ref, '--', ...files.slice(i, i + READ_BATCH).map((p) => `:(literal)${p}`)], o);
+    } catch (e) {
+      if (e instanceof GitError && e.code === 1 && (e.stderr ?? '').trim() === '') continue;
+      throw e;
+    }
+    for (const rec of out.split('\n')) {
+      if (rec === '') continue;
+      const a = rec.indexOf('\0');
+      const b = a === -1 ? -1 : rec.indexOf('\0', a + 1);
+      if (b === -1) throw new Error('unreadable search output');
+      const file = rec.slice(rec.indexOf(':') + 1, a);
+      const lines = texts.get(file) ?? [];
+      lines[Number(rec.slice(a + 1, b)) - 1] = rec.slice(b + 1);
+      texts.set(file, lines);
     }
   }
-  const found = new Map(); // test file -> first importer
-  for (const h of hits) {
-    if (h.text.length > MAX_LINE || COMMENT_LINE.test(h.text) || !isCodeFile(h.file, cx.testGlobs)) continue;
-    for (const { spec, py } of importSpecifiers(h.text, h.file)) {
-      for (const c of importCandidates(spec, h.file, { python: py })) {
-        if (c.mode === 'fwd') continue;
-        const hit = c.mode === 'exact' ? (tails.get(c.path) ?? []).filter((p) => p === c.path) : (tails.get(c.path) ?? []);
-        for (const p of hit) if (!found.has(p)) found.set(p, `${h.file}:${h.line}`);
+  for (const lines of texts.values()) for (let i = 0; i < lines.length; i++) lines[i] ??= '';
+  return texts;
+}
+
+function reverseImportHits(ds, head, o, cx, maxFiles) {
+  const changed = [...new Set(ds.filter((d) => d.status !== 'D' && d.newPath && d.addedIsTest).map((d) => d.newPath))];
+  if (changed.length === 0) return [];
+  const unchecked = (why, files = changed) => files.map((file) => ({ rule: 'R0-unscannable', file, detail: `test file changed; production code importing it could not be checked (${why})` }));
+  const rootsOf = new Map(changed.map((p) => [p, new Set([p])])); // test file in the chain -> changed files it leads to
+  const found = new Map(); // changed file -> where production reaches it
+  let frontier = [...changed];
+  for (let round = 0; frontier.length > 0; round++) {
+    const concerned = [...new Set(frontier.flatMap((p) => [...rootsOf.get(p)]))];
+    if (round >= MAX_CHAIN_ROUNDS) return unchecked(`test files import each other more than ${MAX_CHAIN_ROUNDS} deep`, concerned);
+    const names = new Set();
+    for (const p of frontier) {
+      names.add(stem(p));
+      if (/^(?:index|__init__)$/.test(stem(p)) && p.includes('/')) names.add(baseName(p.slice(0, p.lastIndexOf('/'))));
+    }
+    // git splits a pattern on newlines and ORs the pieces; a name with one cannot be searched for faithfully.
+    if ([...names].some((n) => n === '' || /[\n\0]/.test(n))) return unchecked('a file name cannot be searched for', concerned);
+
+    let texts;
+    try {
+      const files = filesMentioning(head, [...names], o);
+      if (files.length > maxFiles) return unchecked(`more than ${maxFiles} files mention it`, concerned);
+      texts = readLines(head, files, o);
+    } catch (e) {
+      return unchecked(`the search failed: ${oneLine(String(e.message)).slice(0, 120)}`, concerned);
+    }
+
+    // suffix -> frontier files it ends: a candidate of mode 'loose' names a file by its tail.
+    const tails = new Map();
+    for (const p of frontier) {
+      const segs = p.split('/');
+      for (let i = 0; i < segs.length; i++) {
+        const t = segs.slice(i).join('/');
+        tails.set(t, [...(tails.get(t) ?? []), p]);
       }
     }
+    const next = new Set();
+    for (const [file, lines] of texts) {
+      const isTest = isTestFile(file, cx.testGlobs);
+      if (!isTest && !isCodeFile(file, cx.testGlobs)) continue;
+      const reached = new Map(); // frontier file -> line of the first import that reaches it
+      for (const m of scanImports(lines, file)) {
+        for (const c of importCandidates(m.spec, file, { python: m.py })) {
+          if (c.mode === 'fwd') continue;
+          for (const t of tails.get(c.path) ?? []) if ((c.mode !== 'exact' || t === c.path) && t !== file && !reached.has(t)) reached.set(t, m.from);
+        }
+      }
+      for (const [t, line] of reached) {
+        if (!isTest) {
+          for (const r of rootsOf.get(t)) if (!found.has(r)) found.set(r, `${file}:${line}${r === t ? '' : `, through ${t}`}`);
+          continue;
+        }
+        let mine = rootsOf.get(file);
+        let grew = false;
+        if (!mine) {
+          mine = new Set();
+          rootsOf.set(file, mine);
+          grew = true;
+        }
+        for (const r of rootsOf.get(t)) if (!mine.has(r)) {
+          mine.add(r);
+          grew = true;
+        }
+        if (grew) next.add(file); // new importers of it may exist, and it may now lead to more changed files
+      }
+    }
+    if (rootsOf.size > MAX_CHAIN_FILES) return unchecked(`more than ${MAX_CHAIN_FILES} test files in the import chain`, concerned);
+    frontier = [...next];
   }
   return [...found].map(([file, by]) => ({
     rule: 'R0-unscannable', file,
@@ -1516,6 +1666,13 @@ export async function collectHardStops({ base, head, cwd, config, maxImporterHit
     }
   }
 
-  const hits = classifyHardStops({ files, config, baseEnvNames, pkgPairs, sqlStatements, envFiles, envImportFiles, guardLosses });
+  // Whole new content of changed code files, so the import check reads an import split over several lines as one.
+  const headFiles = new Map();
+  for (const d of ds) {
+    if (!d.addedIsCode || d.binary || d.symlink || d.gitlink || !d.newPath || d.added.length === 0) continue;
+    const text = showFile(head, d.newPath, o);
+    if (text !== null && text.length <= MAX_HEAD_TEXT) headFiles.set(d.file, text);
+  }
+  const hits = classifyHardStops({ files, config, baseEnvNames, pkgPairs, sqlStatements, envFiles, envImportFiles, guardLosses, headFiles });
   return [...hits, ...reverseImportHits(ds, head, o, cx, maxImporterHits)];
 }
