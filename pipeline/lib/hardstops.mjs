@@ -719,7 +719,9 @@ function scanImports(lines, file) {
   for (const g of one) if (g.text !== '') take(scanSegments([g], file));
   if (PY_FILE.test(file)) {
     take(scanSegments(pythonStatements(lines), file));
-    for (const g of pythonImportFallback(lines)) take(scanSegments([g], file));
+    // One pass over all fallback segments (scanSegments maps each match back to its own segment): a call per segment cost
+    // ~2 s of CPU on a 120k-line backslash chain on CI.
+    take(scanSegments(pythonImportFallback(lines), file));
   }
   return [...found.values()];
 }
