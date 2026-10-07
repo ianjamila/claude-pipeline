@@ -9,6 +9,14 @@ import { MIG, pkg, cfg, file, rulesOf, classify, run } from './helpers/hardstops
 const A = (path, ...added) => file(path, { status: 'A', added });
 const flags = (files, opts) => rulesOf(run(files, opts));
 const details = (hits) => hits.map((h) => h.detail);
+// CPU time (user + system) a call burns, in ms. The ReDoS guards below are about work done, not wall-clock: under machine load
+// a wall-clock budget flakes, while CPU time stays put (a quadratic regex still blows it).
+function cpuMs(fn) {
+  const t0 = process.cpuUsage();
+  const value = fn();
+  const d = process.cpuUsage(t0);
+  return { value, ms: (d.user + d.system) / 1000 };
+}
 
 // A repo with `base` files on main and a `feat` branch checked out; `collect(repo)` classifies feat against main.
 function branchRepo(base = {}) {
@@ -33,7 +41,7 @@ test('1 binary diff of a non-asset file -> R0-unscannable (a single NUL byte mak
 });
 
 test('1 binary assets are accepted without reading (case-insensitive)', () => {
-  for (const ext of ['png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'ico', 'svg', 'pdf', 'zip', 'gz', 'tgz', 'woff', 'woff2', 'ttf', 'otf', 'eot', 'mp4', 'mov', 'mp3', 'wav', 'bin', 'snap', 'PNG']) {
+  for (const ext of ['png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'ico', 'svg', 'pdf', 'woff', 'woff2', 'ttf', 'otf', 'eot', 'mp4', 'mov', 'mp3', 'wav', 'snap', 'PNG']) {
     assert.deepEqual(flags([file(`public/x.${ext}`, { status: 'A', binary: true })]), [], ext);
   }
 });
@@ -512,9 +520,8 @@ test('11 R2-auth-removed ignores a deleted comment or bare string, not a deleted
 test('13 a changed line over 20,000 chars skips every regex and flags the file; a 1 MB line is instant', () => {
   const big = 'alter table x '.repeat(75_000); // ~1 MB, no RENAME and no `;`: quadratic for a naive regex
   for (const f of [A(MIG, big), file('lib/a.ts', { removed: ['require'.padEnd(1_000_000, 'Auth')] }), A('public/vendor.min.js', 'function a(b){return b.require(c)}'.repeat(40_000))]) {
-    const t0 = performance.now();
-    const hits = run([f]);
-    assert.ok(performance.now() - t0 < 1000, `took ${Math.round(performance.now() - t0)}ms`);
+    const { value: hits, ms } = cpuMs(() => run([f]));
+    assert.ok(ms < 1000, `took ${Math.round(ms)}ms of CPU`);
     assert.ok(rulesOf(hits).includes('R0-unscannable'), f.path);
   }
 });
@@ -527,26 +534,32 @@ test('13 lines just under the cap with adversarial shapes stay fast for every ru
   ];
   for (const text of shapes) {
     for (const f of [A(MIG, text), file('lib/a.ts', { added: [text], removed: [text] })]) {
-      const t0 = performance.now();
-      run([f]);
-      assert.ok(performance.now() - t0 < 1000, `${text.slice(0, 20)}... took ${Math.round(performance.now() - t0)}ms`);
+      const { ms } = cpuMs(() => run([f]));
+      assert.ok(ms < 1000, `${text.slice(0, 20)}... took ${Math.round(ms)}ms of CPU`);
     }
   }
 });
 
+test('13 a line stuffed with import specifiers stays fast (and is flagged as unreadable import list)', () => {
+  const many = (n, f) => Array.from({ length: n }, (_, i) => f(i)).join(' ');
+  for (const text of [many(1500, (i) => `from 'a${i}'`), many(600, (i) => `import('./x/y/z/w/v/u${i}')`), many(700, (i) => `require('a/b/c/d/e${i}');`)]) {
+    const { value: hits, ms } = cpuMs(() => run([file('lib/a.ts', { added: [text] })]));
+    assert.ok(ms < 500, `${text.slice(0, 20)}... took ${Math.round(ms)}ms of CPU`);
+    assert.ok(rulesOf(hits).includes('R0-unscannable'), text.slice(0, 20));
+  }
+});
+
 test('13 an oversized SQL statement is unscannable instead of regex-scanned', () => {
-  const t0 = performance.now();
-  const hits = classify({ files: [], config: cfg(), sqlStatements: [{ file: MIG, text: 'alter table x '.repeat(75_000) }] });
-  assert.ok(performance.now() - t0 < 1000);
+  const { value: hits, ms } = cpuMs(() => classify({ files: [], config: cfg(), sqlStatements: [{ file: MIG, text: 'alter table x '.repeat(75_000) }] }));
+  assert.ok(ms < 1000, `took ${Math.round(ms)}ms of CPU`);
   assert.deepEqual(rulesOf(hits), ['R0-unscannable']);
 });
 
 test('13 a normal 5000-line diff stays linear', () => {
   const lines = Array.from({ length: 5000 }, (_, i) => `export const v${i} = (a: number) => a + ${i}; // helper ${i}`);
   const sql = Array.from({ length: 5000 }, (_, i) => `insert into public.t${i % 10} (a, b) values (${i}, 'row ${i}');`);
-  const t0 = performance.now();
-  run([A('lib/big.ts', ...lines), A(MIG, ...sql)], { sqlStatements: [] });
-  assert.ok(performance.now() - t0 < 2000, `took ${Math.round(performance.now() - t0)}ms`);
+  const { ms } = cpuMs(() => run([A('lib/big.ts', ...lines), A(MIG, ...sql)], { sqlStatements: [] }));
+  assert.ok(ms < 2000, `took ${Math.round(ms)}ms of CPU`);
 });
 
 // ---- 14. the pure classifier cannot silently lose coverage ----------------------------------------------------
