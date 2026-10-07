@@ -291,6 +291,52 @@ const MORE_DENY = [
   ['gh api repos/{owner}/{repo}/statuses/$(git rev-parse HEAD) -f state=success -f context="Hard-stop scan"'],
   ['gh api repos/o/r/check-runs -f name="Hard-stop scan" -f head_sha=abc -f conclusion=success'],
   ['gh api -X PATCH repos/o/r/check-runs/9 -f conclusion=success'],
+  // GitHub serves every repos/{owner}/{repo}/... resource under repositories/{id}/... too: same rules must apply
+  ['gh api repositories/123/statuses/abc123 -f state=success -f context="Hard-stop scan"'],
+  ['gh api -X POST /repositories/123/statuses/abc123 -f state=success -f context=x'],
+  ['gh api https://api.github.com/repositories/123/statuses/abc123 -f state=success -f context=x'],
+  ['gh api Repositories/123/statuses/abc123 -f state=success -f context=x'],
+  ['gh api repositories/123/statuses/abc123 --input status.json'],
+  ['gh api -X POST repositories/123/check-runs -f name="Hard-stop scan" -f head_sha=abc -f conclusion=success'],
+  ['gh api -X PATCH repositories/123/check-runs/9 -f conclusion=success'],
+  ['gh api -X POST repositories/123/check-suites -f head_sha=abc'],
+  ['gh api -X PATCH repositories/123 -f allow_auto_merge=false'],
+  ['gh api -X PATCH repositories/123 -f default_branch=agent/x'],
+  ['gh api -X PUT repositories/123/pulls/5/merge'],
+  ['gh api -X PUT repositories/123/issues/5/labels -f "labels[]=bug"'],
+  ['gh api -X DELETE repositories/123/issues/5/labels'],
+  ['gh api -X POST repositories/123/issues/5/labels -f "labels[]=human-approved"'],
+  ['gh api -X PATCH repositories/123/issues/5 -f "labels[]=human-approved"'],
+  ['gh api -X PATCH repositories/123/issues/5 -f "labels[]=bug"'],
+  ['gh api -X PATCH repositories/123/issues/7 -f state=closed', { labels: ['pipeline-pause'] }],
+  ['gh api -X PATCH repositories/123/issues/7 -f state=closed', { labels: new Error('boom') }],
+  ['gh api -X DELETE repositories/123/issues/5/labels/needs-human'],
+  ['gh api -X PUT repositories/123/branches/main/protection --input p.json'],
+  ['gh api -X POST repositories/123/rulesets --input r.json'],
+  ['gh api -X POST repositories/123/merges -f base=main -f head=x'],
+  ['gh api -X POST repositories/123/contents/a.txt -f message=m'],
+  // repeated slashes and dot segments must not dodge the anchors
+  ['gh api repos//o/r/statuses/abc123 -f state=success -f context=x'],
+  ['gh api repos/o//r/statuses/abc123 -f state=success -f context=x'],
+  ['gh api repos/o/r//statuses//abc123 -f state=success -f context=x'],
+  ['gh api repos/o/r/x/../statuses/abc123 -f state=success -f context=x'],
+  ['gh api repos/o/r/./statuses/abc123 -f state=success -f context=x'],
+  ['gh api repos/o/r/x/%2e%2e/statuses/abc123 -f state=success -f context=x'],
+  ['gh api repos/o/r/x/..%2fstatuses/abc123 -f state=success -f context=x'],
+  ['gh api repos/o/r/x/%2E%2E/check-runs -f name=x -f head_sha=abc'],
+  ['gh api -X PATCH repos/o/x/../r -f allow_auto_merge=false'],
+  ['gh api -X PATCH repositories//123 -f allow_auto_merge=false'],
+  ['gh api -X PATCH repositories/9/../123 -f allow_auto_merge=false'],
+  ['gh api repositories/123/x/../statuses/abc123 -f state=success -f context=x'],
+  ['gh api -X PUT repos/o/r/pulls/5/x/../merge'],
+  ['gh api -X PUT repos/o/r/issues/5/./labels -f "labels[]=bug"'],
+  ['gh api -X PATCH repos/o/r/issues/7/. -f state=closed', { labels: ['pipeline-pause'] }],
+  ['gh api -X PATCH repos/o/r/x/../issues/5 -f "labels[]=human-approved"'],
+  ['gh api -X PUT repos/o/r/x/../branches/main/protection --input p.json'],
+  // no check-run / status / commit-on-branch graphql mutation is on the allowlist
+  ["gh api graphql -f query='mutation { createCheckRun(input:{repositoryId:\"x\",name:\"Hard-stop scan\",headSha:\"abc\",conclusion:SUCCESS}) { clientMutationId } }'"],
+  ["gh api graphql -f query='mutation { updateCheckRun(input:{repositoryId:\"x\",checkRunId:\"y\",conclusion:SUCCESS}) { clientMutationId } }'"],
+  ["gh api graphql -f query='mutation { createCommitOnBranch(input:{branch:{repositoryNameWithOwner:\"o/r\",branchName:\"main\"},message:{headline:\"x\"},expectedHeadOid:\"abc\"}) { clientMutationId } }'"],
   // job runner nesting and quoting
   ['pipeline job start x -- git push origin main'],
   ['node ~/.claude/pipeline/bin/pipeline.mjs job start x --timeout 5 -- git push -f'],
@@ -380,6 +426,18 @@ const MORE_ALLOW = [
   ['gh api repos/o/r/commits/abc123/status --jq .state'],
   ['gh api repos/o/r/commits/abc123/check-runs'],
   ['gh api -X GET repos/o/r/statuses/abc123'],
+  // the repositories/{id} form: reads and unrelated writes stay allowed
+  ['gh api repositories/123'],
+  ['gh api -X GET repositories/123/statuses/abc123'],
+  ['gh api repositories/123/commits/abc123/statuses'],
+  ['gh api repositories/123/commits/abc123/check-runs'],
+  ['gh api -X POST repositories/123/issues/5/comments -f body=hi'],
+  ['gh api -X POST repositories/123/issues/5/labels -f "labels[]=bug"'],
+  ['gh api -X PATCH repositories/123/issues/5 -f title=new'],
+  ['gh api -X PATCH repositories/123/issues/7 -f state=closed', { labels: ['bug'] }],
+  ['gh api -X POST repos//o/r/issues/5/comments -f body=hi'],
+  ['gh api -X POST repos/o/r/x/../issues/5/comments -f body=hi'],
+  ['gh api repos/o/r/x/../commits/abc123/statuses'],
   ["gh api graphql -f query='mutation { resolveReviewThread(input:{threadId:\"x\"}) { clientMutationId } }'"],
   ['gh api user'],
   ['pipeline job start x -- git push origin agent/x'],
@@ -430,6 +488,9 @@ test('what the evaluator asks its collaborators', () => {
   v = evaluate('gh api -X PATCH repos/o/r/issues/7 -f state=closed', { labels: [] });
   assert.deepEqual(v.calls.labels[0], { n: '7', repoArgs: ['-R', 'o/r'], cwd: resolve('/work/repo') });
   v = evaluate('gh api -X PATCH "repos/{owner}/{repo}/issues/7" -f state=closed', { labels: [] });
+  assert.deepEqual(v.calls.labels[0], { n: '7', repoArgs: [], cwd: resolve('/work/repo') });
+  // a numeric repositories/{id} endpoint has no owner/name to hand to gh: use the current repo, never a bogus -R
+  v = evaluate('gh api -X PATCH repositories/123/issues/7 -f state=closed', { labels: [] });
   assert.deepEqual(v.calls.labels[0], { n: '7', repoArgs: [], cwd: resolve('/work/repo') });
   v = evaluate('git -C /other push', { pushDest: 'origin/agent/y' });
   assert.deepEqual(v.calls.pushDirs, [{ dir: resolve('/other'), gitDir: null }]);
