@@ -735,10 +735,28 @@ const TS_SWAP = { '.js': ['.ts', '.tsx'], '.mjs': ['.mts'], '.cjs': ['.cts'], '.
 // and every path-segment suffix (`@acme/x/tests/h` also tries `x/tests/h` and `tests/h`). Python dotted -> slash path. Each path also
 // with every source extension, `/index.<ext>` / `/__init__.py`, and (TypeScript ESM) the `.ts` file a written `.js` stands for.
 // Over-matching is the safe direction.
-const TEST_SCOPE = /^(?:tests?|specs?|e2e|__tests__|__mocks__|__fixtures__|fixtures?|cypress|mocks?)$/i;
-// Test-runner configs: they wire test files in by design and production never loads them (their own content is still judged).
-const isRunnerConfig = (p) => /(?:^|\/)(?:playwright|vitest|vite\.test|jest|cypress|karma|ava|mocha|wdio)\.config\.[^/]+$|(?:^|\/)\.mocharc\.[^/]+$/i.test(p);
-export function importCandidates(spec, fromFile, { python = false, ruby = null } = {}) {
+const NO_PACKAGES = new Set();
+/**
+ * Dependency names declared in a package.json text (all four dependency maps); a parse failure declares none. A LOCAL spec
+ * (`file:`, `link:`, `workspace:`, `portal:`, a relative or absolute path) does not count: `"@shared/tests": "file:./tests"`
+ * would make a repo test directory look like a package.
+ */
+const LOCAL_SPEC = /^\s*(?:file:|link:|workspace:|portal:|\.{1,2}(?:\/|$)|\/|~\/)/i;
+export function declaredPackages(text) {
+  try {
+    const j = JSON.parse(text ?? '');
+    return new Set(['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']
+      .flatMap((k) => (j && typeof j[k] === 'object' && j[k] !== null ? Object.entries(j[k]) : []))
+      .filter(([, v]) => typeof v === 'string' && !LOCAL_SPEC.test(v))
+      .map(([name]) => name));
+  } catch {
+    return new Set();
+  }
+}
+// Test-runner configs, by their exact file names: they wire test files in by design. They are LINKS, never production endpoints,
+// and production code importing one is flagged like importing a test file (reachesTestModule), so a config cannot be a bridge.
+const isRunnerConfig = (p) => /(?:^|\/)(?:playwright|vitest|jest|cypress|karma|wdio|ava)\.config\.(?:[cm]?[jt]s|json)$|(?:^|\/)\.mocharc\.(?:[cm]?js|json|ya?ml)$/i.test(p);
+export function importCandidates(spec, fromFile, { python = false, ruby = null, packages = NO_PACKAGES } = {}) {
   const out = [];
   const seen = new Set();
   const add = (v, mode) => {
@@ -783,10 +801,11 @@ export function importCandidates(spec, fromFile, { python = false, ruby = null }
     return out;
   }
   const root = (python ? s.replaceAll('.', '/') : s).replace(/^\/+/, '');
-  // A scoped npm package (`@playwright/test`, `@vitest/runner/x`) is not a repo path: only what follows `@scope/name` can name one.
-  // A scope that is itself a test-directory name (`@tests/x`, `@spec/x`: a tsconfig alias, not a package) keeps the full treatment.
-  const scoped = !python && !ruby && /^@([A-Za-z0-9][\w.-]*)\/[\w.-]+(?:\/|$)/.exec(root);
-  if (scoped && !TEST_SCOPE.test(scoped[1])) {
+  // A scoped specifier is an npm package (`@playwright/test`) only when the repo's package.json DECLARES `@scope/name` as a
+  // dependency; then only what follows `@scope/name` can name a repo path. Anything else in that shape is a path alias
+  // (`@shared/tests`, `@tests/x`: tsconfig paths) and keeps the full, over-matching treatment, plus the form without the `@`.
+  const scoped = !python && !ruby && /^(@[A-Za-z0-9][\w.-]*\/[\w.-]+)(?:\/|$)/.exec(root);
+  if (scoped && packages.has(scoped[1])) {
     const sub = root.split('/').slice(2).join('/');
     if (sub !== '') withSuffixes(sub, 'loose', 'loose');
     return out;
@@ -801,10 +820,10 @@ export function importCandidates(spec, fromFile, { python = false, ruby = null }
 // Does any of `specs` reach a file exempt from the content rules: a test file (or a legacy test dir), or non-code documentation
 // (Node's require loads `docs/x.md` / `.txt` as JavaScript)? -> the first such specifier, or null. A production `import x from './post.md'`
 // is flagged too: accepted.
-function reachesTestModule(specs, file, testGlobs) {
+function reachesTestModule(specs, file, testGlobs, packages) {
   for (const { spec, py, rb } of specs) {
-    for (const c of importCandidates(spec, file, { python: py, ruby: rb })) {
-      if (isTestFile(c.path, testGlobs) || LEGACY_TEST_DIR.test(c.path) || isNonCode(c.path)) return spec;
+    for (const c of importCandidates(spec, file, { python: py, ruby: rb, packages })) {
+      if (isTestFile(c.path, testGlobs) || LEGACY_TEST_DIR.test(c.path) || isNonCode(c.path) || isRunnerConfig(c.path)) return spec;
     }
   }
   return null;
@@ -815,7 +834,7 @@ const MAX_SPECIFIERS_PER_FILE = 500;
 // The added lines of production code `d` that import a test module. Specifiers are read over the WHOLE new file when its text
 // is known (`headText`), so an import split across lines is caught whichever of its lines the diff touched; without it, over
 // the added lines only (lines nobody added read as blank). A specifier counts when any line it spans was added.
-function addedImportLines(d, added, headText, testGlobs) {
+function addedImportLines(d, added, headText, testGlobs, packages) {
   if (added.length === 0) return [];
   const file = d.newPath ?? d.file;
   const addedAt = new Map(added.map((l) => [l.line, l]));
@@ -834,7 +853,7 @@ function addedImportLines(d, added, headText, testGlobs) {
   }
   if (touched.size > MAX_SPECIFIERS_PER_FILE) return [addedAt.get([...touched.values()][0].line)];
   const out = [];
-  for (const t of touched.values()) if (reachesTestModule([t], file, testGlobs) !== null) out.push(addedAt.get(t.line));
+  for (const t of touched.values()) if (reachesTestModule([t], file, testGlobs, packages) !== null) out.push(addedAt.get(t.line));
   return out;
 }
 
@@ -1288,7 +1307,7 @@ function addedCodeRules(d, added, cx, env, sink) {
   }
 
   // A test runner's own config (playwright.config.ts importing e2e/fixtures/global-setup) is test-side wiring, not production.
-  for (const l of isRunnerConfig(d.file) ? [] : addedImportLines(d, added, cx.headFiles?.get(d.file), cx.testGlobs)) {
+  for (const l of isRunnerConfig(d.file) ? [] : addedImportLines(d, added, cx.headFiles?.get(d.file), cx.testGlobs, cx.npmPackages)) {
     sink.add('R0-unscannable', d.file, 'imports a test/fixture module into production code; test files are not judged', { line: l.line, excerpt: excerpt(l.text) });
   }
 
@@ -1397,8 +1416,9 @@ const needs = (cond, msg) => {
 //   guardLosses   [{file, kind:'code'|'sql', detail}] guards that vanished from the whole file without a removed line (commented out)
 // Throws TypeError when the diff touches SQL or package.json and sqlStatements / pkgPairs (or basePkg+headPkg) are missing.
 // Returns hits `{ rule, file, line?, excerpt?, detail }`.
-export function classifyHardStops({ files, config, baseEnvNames = new Set(), basePkg, headPkg, pkgPairs, sqlStatements, envFiles, envImportFiles, guardLosses = [], headFiles }) {
-  const cx = { ...settings(config), headFiles: new Map(headFiles instanceof Map ? headFiles : Object.entries(headFiles ?? {})) };
+export function classifyHardStops({ files, config, baseEnvNames = new Set(), basePkg, headPkg, pkgPairs, sqlStatements, envFiles, envImportFiles, guardLosses = [], headFiles, npmPackages }) {
+  // npmPackages: the dependency names the head's root package.json declares (only those scoped names are treated as packages).
+  const cx = { ...settings(config), headFiles: new Map(headFiles instanceof Map ? headFiles : Object.entries(headFiles ?? {})), npmPackages: new Set(npmPackages ?? []) };
   const sink = makeSink();
   const known = new Set(baseEnvNames);
   const env = { known, envFiles: envFiles === undefined ? null : new Set(envFiles), importFiles: envImportFiles === undefined ? null : new Set(envImportFiles) };
@@ -1676,7 +1696,7 @@ function reverseImportHits(ds, head, o, cx, maxFiles) {
       const exempt = !isCodeFile(file, cx.testGlobs) || isRunnerConfig(file);
       const reached = new Map(); // frontier file -> line of the first import that reaches it
       for (const m of scanImports(lines, file)) {
-        for (const c of importCandidates(m.spec, file, { python: m.py, ruby: m.rb })) {
+        for (const c of importCandidates(m.spec, file, { python: m.py, ruby: m.rb, packages: cx.npmPackages })) {
           if (c.mode === 'fwd') continue;
           for (const t of tails.get(c.path) ?? []) if ((c.mode !== 'exact' || t === c.path) && t !== file && !reached.has(t)) reached.set(t, m.from);
         }
@@ -1853,6 +1873,9 @@ export async function collectHardStops({ base, head, cwd, config, maxImporterHit
     if (text.length <= MAX_HEAD_TEXT) headFiles.set(d.file, text);
     else tooBig.push({ rule: 'R0-unscannable', file: d.file, detail: `file is larger than ${MAX_HEAD_TEXT} characters; its imports cannot be checked` });
   }
-  const hits = classifyHardStops({ files, config, baseEnvNames, pkgPairs, sqlStatements, envFiles, envImportFiles, guardLosses, headFiles });
-  return [...hits, ...tooBig, ...reverseImportHits(ds, head, o, cx, maxImporterHits)];
+  // The dependency names the head's root package.json declares: only those scoped specifiers are npm packages (unreadable or
+  // absent = none, which keeps every `@x/y` on the over-matching path).
+  const npmPackages = declaredPackages(showFile(head, 'package.json', o));
+  const hits = classifyHardStops({ files, config, baseEnvNames, pkgPairs, sqlStatements, envFiles, envImportFiles, guardLosses, headFiles, npmPackages });
+  return [...hits, ...tooBig, ...reverseImportHits(ds, head, o, { ...cx, npmPackages }, maxImporterHits)];
 }
