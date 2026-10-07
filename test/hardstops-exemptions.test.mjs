@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseUnifiedDiff } from '../pipeline/lib/diff.mjs';
 import { cfg, file, rulesOf, run } from './helpers/hardstops.mjs';
+import { declaredPackages } from '../pipeline/lib/hardstops.mjs';
 
 const A = (path, ...added) => file(path, { status: 'A', added });
 const rules = (files, opts) => rulesOf(run(files, opts));
@@ -568,11 +569,28 @@ test('the reverse check finds importers whatever the case of their extension (He
   }
 });
 
-test('a scoped npm package is not a repo path (@playwright/test), but its subpath and a test-named scope still are', () => {
-  assert.deepEqual(rules([file('scripts/parity.mjs', { added: ["import { chromium, webkit } from '@playwright/test'"] })]), []);
-  assert.deepEqual(rules([file('scripts/parity.mjs', { added: ["import r from '@playwright/test/reporter'"] })]), []);
-  assert.deepEqual(rules([file('lib/a.ts', { added: ["import h from '@acme/pkg/tests/helper'"] })]), ['R0-unscannable']);
-  assert.deepEqual(rules([file('lib/a.ts', { added: ["import h from '@tests/helper'"] })]), ['R0-unscannable']);
+test('a scoped specifier is an npm package only when package.json declares it (not via a local file: spec); otherwise an alias', async () => {
+  const pkgs = { npmPackages: ['@playwright/test', '@acme/pkg'] };
+  assert.deepEqual(rules([file('scripts/parity.mjs', { added: ["import { chromium, webkit } from '@playwright/test'"] })], pkgs), []);
+  assert.deepEqual(rules([file('scripts/parity.mjs', { added: ["import r from '@playwright/test/reporter'"] })], pkgs), []);
+  assert.deepEqual(rules([file('lib/a.ts', { added: ["import h from '@acme/pkg/tests/helper'"] })], pkgs), ['R0-unscannable']);
+  // undeclared: a path alias, judged in full (over-matching): `@shared/tests`, `@tests/helper`, even `@playwright/test`
+  assert.deepEqual(rules([file('lib/a.ts', { added: ["import h from '@shared/tests'"] })], pkgs), ['R0-unscannable']);
+  assert.deepEqual(rules([file('lib/a.ts', { added: ["import h from '@tests/helper'"] })], pkgs), ['R0-unscannable']);
+  assert.deepEqual(rules([file('scripts/parity.mjs', { added: ["import { webkit } from '@playwright/test'"] })]), ['R0-unscannable']);
+  // a local spec never makes a package
+  assert.deepEqual([...declaredPackages(JSON.stringify({ dependencies: { '@shared/tests': 'file:./tests', '@x/y': '^1.0.0', '@w/z': 'workspace:*' }, devDependencies: { '@playwright/test': '1.50.0', l: '../l' } }))].sort(), ['@playwright/test', '@x/y']);
+  // end to end: collectHardStops reads the head package.json
+  const repo = await reverseRepo({ 'package.json': JSON.stringify({ devDependencies: { '@playwright/test': '1.50.0' } }), 'scripts/p.mjs': 'export {};\n' });
+  repo.write('scripts/p.mjs', "import { webkit } from '@playwright/test';\n");
+  repo.commit('use playwright');
+  assert.deepEqual((await collectWith(repo)).filter((h) => h.rule === 'R0-unscannable'), []);
+});
+
+test('production code importing a test runner config is flagged (a config is not a bridge); only exact config names count', () => {
+  assert.deepEqual(rules([file('lib/pay.ts', { added: ["import cfg from '../vitest.config'"] })]), ['R0-unscannable']);
+  // not a runner config name: its own test import is a production import
+  assert.ok(rules([file('lib/jest.config.payments.ts', { added: ["import evil from '../tests/evil'"] })]).includes('R0-unscannable'));
 });
 
 test('a test runner config wiring in test files is not production importing them (forward and reverse)', async () => {
