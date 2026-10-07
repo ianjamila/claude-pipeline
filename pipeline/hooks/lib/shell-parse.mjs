@@ -442,7 +442,10 @@ function shellInvocation(argv) {
     if (/o$/.test(t) && argv[i + 1] === 'noexec') noexec = t[0] === '-';
     i += /[oO]$/.test(t) ? 2 : 1; // -o / -O take an option name
   }
-  noexec = noexec && !interactive;
+  // The shell expands $var, `cmd`, {a,b} and globs before it reads the options, so such a word may be a `+n` (or
+  // shift the operand): noexec only holds when every word up to and including the operand is fully static.
+  const dynamic = argv.slice(1, i + 1).some((w) => /[$`*?[{]/.test(w));
+  noexec = noexec && !interactive && !dynamic;
   if (sawC) return i < argv.length ? { kind: 'script', text: argv[i], noexec } : { kind: 'none', noexec };
   if (sawS) return { kind: 'stdin', noexec };
   if (i < argv.length) return STDIN_FILES.has(argv[i]) ? { kind: 'stdin', noexec } : { kind: 'file', text: argv[i], noexec };
