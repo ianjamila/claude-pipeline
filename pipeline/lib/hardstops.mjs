@@ -76,8 +76,11 @@ const isTestFile = (p, testGlobs) => {
 const isCodeFile = (p, testGlobs) => !isNonCode(p) && !isTestFile(p, testGlobs);
 
 // Binary changes we accept without reading: assets nobody can hide logic in.
-// (wasm is NOT one: replacing an existing module changes what runs with no source line in the diff.)
-const BINARY_ASSET = /\.(?:png|jpe?g|gif|webp|avif|ico|svg|pdf|zip|gz|tgz|woff2?|ttf|otf|eot|mp4|mov|mp3|wav|bin|snap)$/i;
+// (wasm is NOT one: replacing an existing module changes what runs with no source line in the diff. Neither are archives
+// and blobs: code that extracts or loads an existing .zip / .gz / .tgz / .bin runs whatever the replacement holds.)
+const BINARY_ASSET = /\.(?:png|jpe?g|gif|webp|avif|ico|svg|pdf|woff2?|ttf|otf|eot|mp4|mov|mp3|wav|snap)$/i;
+// Accepted unread ONLY as a test fixture (every path of the change a test file).
+const BINARY_FIXTURE = /\.(?:zip|gz|tgz|bin)$/i;
 
 const R2_PATH_GLOBS = [
   '**/auth/**', '**/middleware.{ts,tsx,js,jsx,mjs,mts,cjs,cts}', '**/*rbac*/**', '**/*rbac*', '**/roles*', '**/roles*/**',
@@ -822,7 +825,7 @@ const STATUS_WORD = { M: 'edited', D: 'deleted', R: 'renamed' };
 
 function pathRules(d, cx, sink) {
   // R0: a binary diff of anything but a plain asset cannot be read, so nothing below can vouch for it.
-  if (d.binary && !d.paths.every((p) => BINARY_ASSET.test(p))) {
+  if (d.binary && !d.paths.every((p) => BINARY_ASSET.test(p) || (BINARY_FIXTURE.test(p) && isTestFile(p, cx.testGlobs)))) {
     sink.add('R0-unscannable', d.file, "binary diff; content can't be checked");
   }
 

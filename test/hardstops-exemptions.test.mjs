@@ -141,6 +141,21 @@ test('a wasm module is not an accepted binary asset (replacing one changes what 
   assert.deepEqual(rules([file('public/logo.png', { status: 'M', binary: true })]), []);
 });
 
+test('archives (.zip .gz .tgz .bin) are not accepted unread: replacing one that code extracts or loads changes what runs; only test fixtures are exempt', () => {
+  for (const ext of ['zip', 'gz', 'tgz', 'bin', 'ZIP']) {
+    for (const status of ['A', 'M']) {
+      assert.ok(rules([file(`src/data.${ext}`, { status, binary: true })]).includes('R0-unscannable'), `src ${ext} ${status}`);
+      assert.deepEqual(rules([file(`tests/fixtures/data.${ext}`, { status, binary: true })]), [], `fixture ${ext} ${status}`);
+    }
+  }
+  // every path must be a test file: moving an archive between production and a fixture dir is not a fixture-only change
+  assert.ok(rules([file('tests/fixtures/data.zip', { status: 'R', oldPath: 'src/data.zip', binary: true })]).includes('R0-unscannable'));
+  assert.ok(rules([file('src/data.zip', { status: 'R', oldPath: 'tests/fixtures/data.zip', binary: true })]).includes('R0-unscannable'));
+  assert.deepEqual(rules([file('tests/fixtures/b.zip', { status: 'R', oldPath: 'tests/fixtures/a.zip', binary: true })]), []);
+  // images, fonts, media, pdf, svg and snapshots stay accepted anywhere
+  for (const p of ['src/logo.png', 'public/a.woff2', 'public/a.mp4', 'docs/a.pdf', 'e2e/__snapshots__/a.snap']) assert.deepEqual(rules([file(p, { status: 'A', binary: true })]), [], p);
+});
+
 test('IO: the exemption holes through real git: docs module, test-to-prod rename, symlink', async () => {
   const { createTmpRepo } = await import('./helpers/tmprepo.mjs');
   const { collectHardStops } = await import('../pipeline/lib/hardstops.mjs');

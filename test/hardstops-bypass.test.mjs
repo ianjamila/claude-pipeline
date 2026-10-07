@@ -41,7 +41,7 @@ test('1 binary diff of a non-asset file -> R0-unscannable (a single NUL byte mak
 });
 
 test('1 binary assets are accepted without reading (case-insensitive)', () => {
-  for (const ext of ['png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'ico', 'svg', 'pdf', 'zip', 'gz', 'tgz', 'woff', 'woff2', 'ttf', 'otf', 'eot', 'mp4', 'mov', 'mp3', 'wav', 'bin', 'snap', 'PNG']) {
+  for (const ext of ['png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'ico', 'svg', 'pdf', 'woff', 'woff2', 'ttf', 'otf', 'eot', 'mp4', 'mov', 'mp3', 'wav', 'snap', 'PNG']) {
     assert.deepEqual(flags([file(`public/x.${ext}`, { status: 'A', binary: true })]), [], ext);
   }
 });
