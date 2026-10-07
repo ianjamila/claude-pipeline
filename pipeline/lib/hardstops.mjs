@@ -1536,7 +1536,8 @@ const stem = (p) => {
 function filesMentioning(ref, names, o) {
   let out;
   try {
-    out = git(['grep', '-I', '-F', '-l', '-z', '--no-color', ...names.flatMap((n) => ['-e', n]), ref, '--', ...CODE_PATHSPECS], o);
+    // `:(icase)`: the parser's language tests are case-insensitive (`Helper.RB`, `page.MDX`, `GEMFILE`), so the search must be too.
+    out = git(['grep', '-I', '-F', '-l', '-z', '--no-color', ...names.flatMap((n) => ['-e', n]), ref, '--', ...CODE_PATHSPECS.map((s) => `:(icase)${s}`)], o);
   } catch (e) {
     if (e instanceof GitError && e.code === 1 && (e.stderr ?? '').trim() === '') return []; // git grep: no match
     throw e;
