@@ -56,7 +56,8 @@ test('test files stay exempt from everything else, and from fake-looking or JWT 
     assert.deepEqual(rules([A(p, ...EVIL, 'payroll', 'DROP TABLE users;')]), [], p);
     assert.deepEqual(rules([A(p, `const jwt = "${JWT}";`)]), [], `${p}: local-stack JWT fixtures are everywhere`);
   }
-  for (const line of [`k = "${AWS.slice(0, 4)}IOSFODNN7EXAMPLE"`, `// fake: ${STRIPE}`, `const k = "${STRIPE}"; // dummy`, `key: "${AWS}" // placeholder`]) {
+  // The fake marker must sit IN the credential token itself (AWS's documented example key does).
+  for (const line of [`k = "${AWS.slice(0, 4)}IOSFODNN7EXAMPLE"`, `k = "${STRIPE}EXAMPLE"`, `k = "sk_live_${'x'.repeat(12)}"`, `k = "${AWS.slice(0, 4)}0000000000000000"`, `k = "fake_${STRIPE}"`]) {
     assert.deepEqual(rules([A('lib/a.test.ts', line)]), [], line);
   }
   assert.deepEqual(rules([A('docs/a.md', STRIPE)]), [], 'documentation is not judged for secrets');
@@ -73,6 +74,15 @@ const IMPORT_NO_HITS = [
   "import x from './protest.ts';", "import { expect } from 'vitest';", "import x from './spec-utils';", "import x from '@testing-library/react';",
   "// import h from './pay.test'", "const s = 'see pay.test.ts';",
 ];
+test('a fake marker elsewhere on the line (comment, neighbouring identifier) does not exempt a real-looking key', () => {
+  for (const line of [
+    `const k = "${STRIPE}"; // example`, `// fake: ${STRIPE}`, `const k = "${STRIPE}"; // dummy`, `key: "${AWS}" // placeholder`,
+    `const fakeUser = { id: 1, key: "${STRIPE}" };`, `const k = "${STRIPE}"; const e = "AKIAIOSFODNN7EXAMPLE";`, `dummy("${AWS}")`,
+  ]) {
+    assert.deepEqual(rules([A('lib/a.test.ts', line)]), ['R3-secrets'], line);
+  }
+});
+
 test('production code importing a test module is flagged (R0-unscannable); lookalikes and comments are not', () => {
   for (const line of IMPORT_HITS) {
     const hits = run([file('lib/pay.ts', { added: [line] })]);

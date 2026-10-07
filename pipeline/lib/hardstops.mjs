@@ -436,9 +436,27 @@ const SECRET_LITERALS = [
   ['Vault secret', /vault\.create_secret\s*\(/i],
 ];
 // Test files: key-shaped literals only (no JWT: local Supabase demo keys are JWTs and live in every e2e setup; no Vault),
-// and not when the line says it is fake. A real key pasted into a fixture is still a leaked key.
+// and not when the KEY ITSELF says it is fake. A real key pasted into a fixture is still a leaked key, and a "// example"
+// comment or a neighbouring `fakeUser` says nothing about it.
 const TEST_SECRET_LITERALS = SECRET_LITERALS.filter(([name]) => name !== 'JWT' && name !== 'Vault secret');
 const FAKE_MARKER = /example|fake|dummy|placeholder|not[-_ ]?real|redacted|x{6,}|0{8,}/i;
+const TEST_SECRET_SCANNERS = TEST_SECRET_LITERALS.map(([name, r]) => [name, new RegExp(r.source, `${r.flags}g`)]);
+const TOKEN_CHAR = /[A-Za-z0-9_\-+/=]/;
+const TOKEN_CHAR_LEFT = /[A-Za-z0-9_-]/; // not `=`, `/`, `+`: `placeholder=<key>` is a key after a label, not a fake key
+// The first key-shaped literal on the line that does not carry a fake marker in the credential token itself: the regex match
+// extended over the adjacent token characters (AWS's documented `AKIAIOSFODNN7EXAMPLE` is exempt through its own tail).
+function realLookingSecret(text) {
+  for (const [name, r] of TEST_SECRET_SCANNERS) {
+    for (const m of text.matchAll(r)) {
+      let a = m.index;
+      let b = m.index + m[0].length;
+      while (a > 0 && TOKEN_CHAR_LEFT.test(text[a - 1])) a--;
+      while (b < text.length && TOKEN_CHAR.test(text[b])) b++;
+      if (!FAKE_MARKER.test(text.slice(a, b))) return name;
+    }
+  }
+  return null;
+}
 // An import/require whose specifier names a test module or a test directory: exempt code wired into production.
 const TEST_IMPORT = /(?:\bfrom|\bimport|\brequire)\s*\(?\s*['"`](?=[^'"`]*[./])[^'"`]*(?:\.(?:test|spec)(?:[./'"`]|$)|\/(?:__tests__|__mocks__|__fixtures__|tests?|e2e|fixtures)\/)/i;
 const SECRETS_REF = /\bsecrets\s*[.[]/i;
@@ -925,11 +943,11 @@ function addedCodeRules(d, added, cx, env, sink) {
   }
 }
 
-// The one content rule test files keep: a key-shaped literal that does not announce itself as fake.
+// The one content rule test files keep: a key-shaped literal that does not itself announce being fake.
 function testSecretRules(d, added, sink) {
   for (const l of added) {
-    const secret = TEST_SECRET_LITERALS.find(([, r]) => r.test(l.text));
-    if (secret && !FAKE_MARKER.test(l.text)) sink.add('R3-secrets', d.file, `secret-like literal in a test file (${secret[0]})`, { line: l.line });
+    const secret = realLookingSecret(l.text);
+    if (secret) sink.add('R3-secrets', d.file, `secret-like literal in a test file (${secret})`, { line: l.line });
   }
 }
 
