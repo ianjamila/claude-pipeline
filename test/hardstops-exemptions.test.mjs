@@ -72,7 +72,7 @@ const IMPORT_HITS = [
 const IMPORT_NO_HITS = [
   "import { it } from 'node:test';", "import request from 'supertest';", "import x from './latest';", "import x from './contest';",
   "import x from './protest.ts';", "import { expect } from 'vitest';", "import x from './spec-utils';", "import x from '@testing-library/react';",
-  "// import h from './pay.test'", "const s = 'see pay.test.ts';",
+  "const s = 'see pay.test.ts';",
 ];
 test('a fake marker elsewhere on the line (comment, neighbouring identifier) does not exempt a real-looking key', () => {
   for (const line of [
@@ -111,7 +111,7 @@ const IMPORT_FORMS_CLEAN = [
   ['lib/pay.ts', "import test from 'node:test';"], ['lib/pay.ts', "import x from '@/lib/spec-utils'"], ['lib/pay.ts', "import x from 'inspector'"],
   ['lib/pay.ts', "import x from './helper'"], ['lib/pay.ts', "import x from '../lib/pay'"], ['lib/pay.ts', "const x = require('@acme/x/lib/h')"],
   ['app/views.py', 'import os, json'], ['app/views.py', 'from collections import abc'], ['app/views.py', 'from . import util'], ['app/views.py', 'from app.models import User'],
-  ['app/views.py', '# from tests.helper import x'], ['lib/pay.rb', "require 'json'"], ['lib/pay.rb', "require_relative 'helpers'"],
+  ['lib/pay.rb', "require 'json'"], ['lib/pay.rb', "require_relative 'helpers'"],
 ];
 test('every spelling of an import that resolves into an exempt test path is flagged (R0-unscannable); lookalikes are not', () => {
   for (const [path, line] of IMPORT_FORMS) {
@@ -404,13 +404,13 @@ const AFTER_COMMENT = [
   "/* eslint-disable */ import { wipe } from '../tests/helper';", "*/ const h = require('../spec/x')", "/* a */ /* b */ import h from '../tests/h'",
   "/** doc */ const m = await import('../cypress/x')", " * end of a comment */ import h from '../tests/h'",
 ];
-// Block-comment syntax is not interpreted (an import inside one is flagged too: over-matching is the safe direction); line comments are.
-const REAL_COMMENTS = ["// import h from '../tests/helper'", "/*", "# from tests.helper import x", "*/", "-- import h from '../tests/helper'", "  // require('../spec/x')"];
-test('an import after a closed block comment is code, not a comment: forward and reverse; real comment lines stay quiet', async () => {
+// Comments are never blanked for the import checks (a comment prefix is not always a comment), so an import written inside one is
+// flagged too: an accepted false positive.
+const COMMENTED_IMPORTS = ["// import h from '../tests/helper'", "-- import h from '../tests/helper'", "  // require('../spec/x')", "// import h from './pay.test'"];
+test('an import after a closed block comment is code, not a comment; a commented-out import is flagged too (accepted); empty comment lines are quiet', async () => {
   for (const line of AFTER_COMMENT) assert.deepEqual(rules([file('lib/pay.ts', { added: [line] })]), ['R0-unscannable'], line);
-  for (const line of REAL_COMMENTS) assert.deepEqual(rules([file('lib/pay.ts', { added: [line] })]), [], line);
-  for (const line of ["/* import h from '../tests/helper' */", " * import h from '../tests/helper'"]) assert.deepEqual(rules([file('lib/pay.ts', { added: [line] })]), ['R0-unscannable'], line);
-  assert.deepEqual(rules([file('app/views.py', { added: ['# from tests.helper import x'] })]), []);
+  for (const line of ['/*', '*/', '// nothing to see', '# a note', '-- a note']) assert.deepEqual(rules([file('lib/pay.ts', { added: [line] })]), [], line);
+  for (const line of [...COMMENTED_IMPORTS, "/* import h from '../tests/helper' */", " * import h from '../tests/helper'"]) assert.deepEqual(rules([file('lib/pay.ts', { added: [line] })]), ['R0-unscannable'], line);
   for (const line of AFTER_COMMENT.slice(0, 2)) {
     const repo = await reverseRepo({ 'tests/helper.ts': 'export const wipe = 1;\n', 'spec/x.ts': 'export const a = 1;\n', 'lib/pay.ts': line + '\n' });
     const target = line.includes('spec') ? 'spec/x.ts' : 'tests/helper.ts';
@@ -468,4 +468,102 @@ test('Python imports split over lines (brackets, backslashes) are one statement:
   repo.write('tests/helper.py', 'def wipe(): delete_everything()\n');
   repo.commit('edit');
   assert.deepEqual((await collectWith(repo)).map((h) => h.file), ['tests/helper.py']);
+});
+
+// ---- review round 4: comments are never blanked; Python tokenizer; no statement cap while a bracket is open -----------------------
+
+const COMMENT_PREFIX_CODE = [
+  ['lib/pay.ts', "-- i; const h = require('../tests/helper')"], ['app/views.py', '-- x; import tests.helper'],
+  ['lib/pay.ts', "// */ require('../tests/helper')"], ['lib/pay.ts', "# x; import('../spec/x')"], ['app/views.py', '# ; from tests.helper import x'],
+];
+test('a comment-looking prefix hides nothing: `-- i; require(..)`, `-- x; import tests.helper`, `// */ require(..)` are all read as imports (forward, reverse)', async () => {
+  for (const [path, line] of COMMENT_PREFIX_CODE) assert.deepEqual(rules([file(path, { added: [line] })]), ['R0-unscannable'], `${path}: ${line}`);
+  for (const [path, line, testPath] of [['lib/pay.ts', COMMENT_PREFIX_CODE[0][1], 'tests/helper.ts'], ['app/views.py', COMMENT_PREFIX_CODE[1][1], 'tests/helper.py'], ['lib/pay.ts', COMMENT_PREFIX_CODE[2][1], 'tests/helper.ts']]) {
+    const repo = await reverseRepo({ [testPath]: 'x = 1\n', [path]: line + '\n' });
+    repo.write(testPath, EVIL_BODY);
+    repo.commit('edit');
+    assert.deepEqual((await collectWith(repo)).map((h) => h.file), [testPath], line);
+  }
+  // and through a chain: prod -> tests/a.ts (the commented-looking import) -> tests/b.ts
+  const repo = await reverseRepo({ 'lib/pay.ts': "import '../tests/a';\n", 'tests/a.ts': "-- i; const h = require('./b')\n", 'tests/b.ts': 'export const b = 1;\n' });
+  repo.write('tests/b.ts', EVIL_BODY);
+  repo.commit('edit b');
+  assert.deepEqual((await collectWith(repo)).map((h) => h.file), ['tests/b.ts']);
+});
+
+const PAD = (n) => Array.from({ length: n }, (_, i) => (i % 2 === 0 ? '' : '    # padding'));
+test('a bracketed Python import stays one statement however many blank or comment lines sit inside it, and a long name list is read to its end', async () => {
+  for (const pad of [61, 500, 5000]) {
+    const lines = ['from app import (', ...PAD(pad), '    tests,', ')'];
+    assert.deepEqual(rules([file('app/views.py', { added: lines })]), ['R0-unscannable'], `pad ${pad}`);
+    // only the line inside the block was added
+    const hits = run([file('app/views.py', { added: ['    tests,'], at: pad + 2 })], { headFiles: new Map([['app/views.py', lines.join('\n')]]) });
+    assert.deepEqual(rulesOf(hits), ['R0-unscannable'], `pad ${pad} context`);
+  }
+  const names = Array.from({ length: 400 }, (_, i) => `name_${i}`).join(', ');
+  assert.deepEqual(rules([file('app/views.py', { added: [`from app import ${names}, tests`] })]), ['R0-unscannable']);
+  const repo = await reverseRepo({ 'tests/__init__.py': 'x = 1\n', 'app/views.py': ['from app import (', ...PAD(200), '    tests,', ')'].join('\n') + '\n' });
+  repo.write('app/tests/__init__.py', EVIL_BODY);
+  repo.commit('edit app/tests');
+  assert.deepEqual((await collectWith(repo)).map((h) => h.file), ['app/tests/__init__.py']);
+});
+
+test('a string syntax the tokenizer does not model (PEP 701 f-strings) cannot hide a bracketed or continued Python import (string-blind fallback)', () => {
+  const cases = [
+    ['v = f"{d["("]}"', 'from app import (', '    tests,', ')'],
+    ['v = f"{"\'\'\'"}"', 'from app import (', '    tests,', ')'],
+    ['v = f"{"\'\'\'"}"', 'import os, \\', '    tests.helper'],
+  ];
+  for (const lines of cases) {
+    const at = lines.findIndex((l) => l.includes('tests')) + 1;
+    const hits = run([file('app/views.py', { added: [lines[at - 1]], at })], { headFiles: new Map([['app/views.py', lines.join('\n')]]) });
+    assert.deepEqual(rulesOf(hits), ['R0-unscannable'], lines.join(' / '));
+  }
+  // an edit to the head line alone still reaches the names below it
+  const headOnly = ['v = f"{d["("]}"', 'from app import (', '    tests,', ')'];
+  const hits = run([file('app/views.py', { added: [headOnly[1]], at: 2 })], { headFiles: new Map([['app/views.py', headOnly.join('\n')]]) });
+  assert.deepEqual(rulesOf(hits), ['R0-unscannable']);
+});
+
+test('Python brackets are counted outside strings and comments: a quoted bracket or an open docstring cannot desync the statement', () => {
+  const cases = [
+    ['x = "("', 'from app import (', '    tests,', ')'],
+    ["x = '(('", 'from app import (', '    tests,', ')'],
+    ['"""Helpers (see below', 'and more ((', '"""', 'from app import (', '    tests,', ')'],
+    ["x = r'\\(' ; y = f'{z}('", 'from app import (', '    tests,', ')'],
+    ['from app import (  # open (', '    tests,  # a ) in a comment', ')'],
+    ['y = """a """ + "("', 'from app import (', '    tests,', ')'],
+  ];
+  for (const lines of cases) {
+    const at = lines.findIndex((l) => l.includes('tests,')) + 1;
+    const hits = run([file('app/views.py', { added: [lines[at - 1]], at })], { headFiles: new Map([['app/views.py', lines.join('\n')]]) });
+    assert.deepEqual(rulesOf(hits), ['R0-unscannable'], lines.join(' / '));
+  }
+  // clean statements around strings stay clean
+  const clean = ['x = "("', 'from app import (', '    views,', ')'];
+  assert.deepEqual(rules([file('app/views.py', { added: ['    views,'], at: 3 })], { headFiles: new Map([['app/views.py', clean.join('\n')]]) }), []);
+});
+
+test('a large file the import parser does not read (data, lockfile) is not unscannable for its size', async () => {
+  const repo = await reverseRepo({ 'README.md': 'x\n' });
+  repo.write('data/catalog.csv', 'a,b\n'.repeat(700_000));
+  repo.commit('add a large data file');
+  const hits = await collectWith(repo);
+  assert.ok(!hits.some((h) => /larger than/.test(h.detail ?? '')), JSON.stringify(hits.map((h) => [h.rule, h.file, h.detail])));
+});
+
+test('a code file over ~2 MB is unscannable for imports (fails closed), forward and reverse', async () => {
+  const big = 'x = 1\n'.repeat(400_000);
+  const repo = await reverseRepo({ 'README.md': 'x\n' });
+  repo.write('lib/huge.ts', big + "// end\n");
+  repo.commit('add a huge code file');
+  const hits = await collectWith(repo);
+  assert.deepEqual(hits.map((h) => [h.rule, h.file]), [['R0-unscannable', 'lib/huge.ts']]);
+  assert.match(hits[0].detail, /larger than .* its imports cannot be checked/);
+  const rev = await reverseRepo({ 'tests/helper.ts': 'export const a = 1;\n', 'lib/huge.ts': `import '../tests/helper';\n${big}` });
+  rev.write('tests/helper.ts', EVIL_BODY);
+  rev.commit('edit helper');
+  const hits2 = await collectWith(rev);
+  assert.deepEqual(hits2.map((h) => [h.rule, h.file]), [['R0-unscannable', 'tests/helper.ts']]);
+  assert.match(hits2[0].detail, /could not be checked \(the search failed: .*larger than/);
 });

@@ -22,9 +22,10 @@
 //    Path rules and the R1 migration rules judge every file.
 //  * An exempt file wired into production would never be judged, so BOTH directions are flagged (R0-unscannable):
 //      - forward: production code adds an import of one. Specifiers are read over the whole new file (an import split over
-//        lines, or a Python bracketed / backslash statement, is one import) and count when a line they span was added; only
-//        line comments (`//`, `#`, `-- `) are skipped, block-comment syntax is not interpreted (code after `*/` or on a line
-//        starting with `*` is code; an import written inside a block comment is flagged too). Each import specifier (JS/TS `from`,
+//        lines, or a Python bracketed / backslash statement, is one import) and count when a line they span was added; comments
+//        are never blanked (a prefix such as `-- i;` or `// */` is not always a comment): every line is read raw, and an import
+//        written inside a comment is flagged too. Python statements are joined by a tokenizer that skips strings and `#`
+//        comments before counting brackets, with no length cap while a bracket is open; a file over ~2 MB is R0-unscannable. Each import specifier (JS/TS `from`,
 //        `import`, `import()`, `require()`; Python `from a.b import` / `import a.b`; Ruby `require` / `require_relative`
 //        / `load`) is turned into every repo path it could name (relative: resolved against the importing file; otherwise
 //        from the root, with `@/` `~/` `#/` `@@/` stripped and every path-segment suffix; Python dotted -> slash path; each
@@ -439,7 +440,6 @@ const AUTH_REMOVED = [
   ['middleware matcher', /\bmatcher\s*:/],
 ];
 // A removed comment or a bare string literal ("Forbidden: ask your admin") is not a removed guard.
-const LINE_COMMENT = /^\s*(?:\/\/|--(?:\s|$)|#(?![A-Za-z_$]))/;
 const COMMENT_LINE = /^\s*(?:\/\/|\/\*|--(?:\s|$)|#(?![A-Za-z_$])|\*(?:\s|\/|$))/;
 const STRING_ONLY_LINE = /^\s*(['"`]).*\1[,;]?\s*$/;
 
@@ -503,17 +503,10 @@ const JS_IMPORT_FORMS = [
   new RegExp(String.raw`\b(?:require|import)(?:\.resolve|Actual|Mock)?\s*\(\s*${SPEC_Q}`, 'g'), // require('..') import('..')
 ];
 const RB_IMPORT_FORM = new RegExp(String.raw`\b(?:require_relative|require|load)\s*\(?\s*${SPEC_Q}`, 'g');
-const PY_FROM = /(?:^|;)\s*from\s+(\.*[A-Za-z_][\w.]*|\.+)\s+import\s+([^#\n]{0,1000})/gm;
-const PY_IMPORT = /(?:^|;)\s*import\s+([^#\n;]{1,1000})/gm;
+// The names of a `from X import a, b` list end at a `;`, a `#` or the end of the text, however long the list is.
+const PY_FROM = /(?:^|;)\s*from\s+(\.*[A-Za-z_][\w.]*|\.+)\s+import\s+([^#\n;]*)/gm;
+const PY_IMPORT = /(?:^|;)\s*import\s+([^#\n;]+)/gm;
 const PY_DYNAMIC = new RegExp(String.raw`\b(?:import_module|__import__)\s*\(\s*${SPEC_Q}`, 'g');
-
-// What a line says once a line comment is gone: `//`, `#` and `-- ` lines read as blank, everything else is read RAW. Block-comment
-// syntax is deliberately not interpreted (`/* eslint-disable */ import x from '..'`, `*/ require('..')` and a generator's
-// `*gen() { return require('..') }` are all code, and a stray `*/` can hide nothing); the price is that an import written inside a
-// block comment is flagged too. Over-matching is the safe direction.
-export function codeOfLine(text) {
-  return LINE_COMMENT.test(text) ? '' : text;
-}
 
 // Every module specifier in `text` (any number of lines): [{ spec, py, start, end }] with the match's offsets (py: a dotted
 // Python module, else a path-like string). Generous on purpose: an extra specifier can only add a false positive. Reading
@@ -578,24 +571,98 @@ function scanSegments(segments, file) {
   }));
 }
 
-// Python statements that span lines (an open bracket, a trailing backslash) as one segment each, so `from pkg import (\n a,\n tests,\n)`
-// is one import whichever of its lines was touched. Over-joining (a bracket inside a string) is covered by the per-line pass.
-const MAX_STATEMENT_LINES = 60;
+// Python statements that span lines (an open bracket, a trailing backslash, an open triple-quoted string) as one segment each, so
+// `from pkg import (\n a,\n tests,\n)` is one import whichever of its lines was touched. Brackets are counted by a small tokenizer
+// that skips string literals (single, double, triple-quoted; a prefix such as r/b/f/u changes nothing about where a literal ends;
+// backslash escapes) and `#` comments first, so `x = "("` or a docstring `"""Helpers (see below` cannot desync the depth. A
+// statement runs until its brackets close (however many blank or comment lines sit inside) or the file ends. The text of a segment
+// has comments removed and its lines joined by a space.
 function pythonStatements(lines) {
   const segs = [];
+  let str = null; // the delimiter of the string literal we are inside (carried across lines for triple quotes)
   for (let i = 0; i < lines.length; ) {
     const start = i;
-    let text = '';
+    const parts = [];
     let depth = 0;
     for (;;) {
-      const raw = lines[i].length > MAX_LINE ? '' : lines[i].replace(/(?:^|\s)#.*$/, '');
-      const cont = /\\\s*$/.test(raw);
-      text += `${text === '' ? '' : ' '}${raw.replace(/\\\s*$/, '')}`;
-      for (const c of raw) depth += c === '(' || c === '[' || c === '{' ? 1 : c === ')' || c === ']' || c === '}' ? -1 : 0;
+      const line = lines[i];
+      let out = '';
+      let escapedEol = false;
+      let j = 0;
+      while (j < line.length) {
+        const c = line[j];
+        if (str !== null) {
+          if (c === '\\') {
+            escapedEol = j + 1 >= line.length;
+            out += line.slice(j, j + 2);
+            j += 2;
+          } else if (line.startsWith(str, j)) {
+            out += str;
+            j += str.length;
+            str = null;
+          } else {
+            out += c;
+            j++;
+          }
+        } else if (c === '#') {
+          break;
+        } else if (c === '"' || c === "'") {
+          str = line.startsWith(c.repeat(3), j) ? c.repeat(3) : c;
+          out += str;
+          j += str.length;
+        } else {
+          if (c === '(' || c === '[' || c === '{') depth++;
+          else if (c === ')' || c === ']' || c === '}') depth = Math.max(0, depth - 1);
+          out += c;
+          j++;
+        }
+      }
+      if (str !== null && str.length === 1 && !escapedEol) str = null; // an unterminated one-line string ends with its line
+      const cont = str === null && /\\\s*$/.test(out);
+      if (cont) out = out.replace(/\\\s*$/, '');
+      if (out.trim() !== '') parts.push(out.trim());
       i++;
-      if (i >= lines.length || i - start >= MAX_STATEMENT_LINES || !(depth > 0 || cont)) break;
+      if (i >= lines.length || !(depth > 0 || cont || str !== null)) break;
     }
-    segs.push({ text, from: start + 1, to: i });
+    segs.push({ text: parts.join(' '), from: start + 1, to: i });
+  }
+  return segs;
+}
+
+// A string-BLIND fallback for Python: every `from X import (` runs to the first line containing `)`, and every line ending in a
+// backslash is joined with the next, ignoring string state entirely. The tokenizer above can be desynced by string syntax it does
+// not model (PEP 701 f-strings reuse their own quote inside `{...}`: `f"{d["("]}"`); this reading cannot, because it reads no
+// strings. Over-joining here only ever adds candidates. One linear pass: the head of the open statement (`from X import` or
+// `import`) is carried, and each continuation line becomes its own short `<head> <names>` segment, so no file shape can make it
+// quadratic and no padding (blank or comment lines) can separate a name from its head.
+const PY_BRACKET_FROM = /^\s*(from\s+\.*[\w.]*\s+import)\s*\(/;
+const PY_HEAD = /^\s*(from\s+\.*[\w.]*\s+import|import)\s/;
+function pythonImportFallback(lines) {
+  const segs = [];
+  let head = null; // the head of the statement still open on this line
+  let bracket = false; // open through `(` (until a `)`) rather than through a trailing backslash
+  let headLine = 0; // 1-based line of the head: each segment spans head..this line, so an edit to the head alone counts too
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const names = line.replace(/#.*$/, '').replace(/\\\s*$/, '');
+    if (head !== null) {
+      segs.push({ text: `${head} ${names.replace(/[()]/g, ' ').trim()}`, from: headLine, to: i + 1 });
+      if (bracket ? line.includes(')') : !/\\\s*$/.test(line)) head = null;
+      continue;
+    }
+    const b = PY_BRACKET_FROM.exec(line);
+    if (b && !line.slice(line.indexOf('(')).includes(')')) {
+      head = b[1];
+      bracket = true;
+      headLine = i + 1;
+    } else if (/\\\s*$/.test(line)) {
+      const h = PY_HEAD.exec(line);
+      if (h) {
+        head = h[1];
+        bracket = false;
+        headLine = i + 1;
+      }
+    }
   }
   return segs;
 }
@@ -603,14 +670,19 @@ function pythonStatements(lines) {
 // Every import in an array of source lines, with the line range it spans. Three readings, unioned: the lines joined (an import
 // split over lines is one import), each line alone (nothing earlier can swallow it), and for Python the logical statements.
 function scanImports(lines, file) {
-  const one = lines.map((l, i) => ({ text: l.length > MAX_LINE ? '' : codeOfLine(l), from: i + 1, to: i + 1 }));
+  // Every line is read RAW, comments and all: an import inside a comment is a false positive we accept (a comment prefix such as
+  // `-- i; require(..)` or `// */ require(..)` is not always a comment).
+  const one = lines.map((l, i) => ({ text: l, from: i + 1, to: i + 1 }));
   const found = new Map();
   const take = (list) => {
     for (const m of list) found.set(`${m.from}\0${m.to}\0${m.py}\0${m.spec}`, m);
   };
   take(scanSegments(one, file));
   for (const g of one) if (g.text !== '') take(scanSegments([g], file));
-  if (PY_FILE.test(file)) take(scanSegments(pythonStatements(one.map((g) => g.text)), file));
+  if (PY_FILE.test(file)) {
+    take(scanSegments(pythonStatements(lines), file));
+    for (const g of pythonImportFallback(lines)) take(scanSegments([g], file));
+  }
   return [...found.values()];
 }
 
@@ -681,7 +753,7 @@ function reachesTestModule(specs, file, testGlobs) {
 }
 
 // More than this many distinct specifiers on the added lines of one file is not a real import list: flagged outright.
-const MAX_SPECIFIERS_PER_FILE = 100;
+const MAX_SPECIFIERS_PER_FILE = 500;
 // The added lines of production code `d` that import a test module. Specifiers are read over the WHOLE new file when its text
 // is known (`headText`), so an import split across lines is caught whichever of its lines the diff touched; without it, over
 // the added lines only (lines nobody added read as blank). A specifier counts when any line it spans was added.
@@ -1445,6 +1517,8 @@ const MAX_CHAIN_ROUNDS = 5;
 const MAX_CHAIN_FILES = 300;
 const READ_BATCH = 200;
 const MAX_HEAD_TEXT = 2_000_000;
+// The same source languages as CODE_PATHSPECS, as a path test (whole-file import reading applies only to these).
+const IMPORT_SOURCE = new RegExp(`\\.(?:${CODE_PATHSPECS.map((s) => s.slice(2)).join('|')})$`, 'i');
 const stem = (p) => {
   const b = baseName(p);
   const dot = b.lastIndexOf('.');
@@ -1485,7 +1559,11 @@ function readLines(ref, files, o) {
       texts.set(file, lines);
     }
   }
-  for (const lines of texts.values()) for (let i = 0; i < lines.length; i++) lines[i] ??= '';
+  for (const [file, lines] of texts) {
+    let size = 0;
+    for (let i = 0; i < lines.length; i++) size += (lines[i] ??= '').length + 1;
+    if (size > MAX_HEAD_TEXT) throw new Error(`${file} is larger than ${MAX_HEAD_TEXT} characters`);
+  }
   return texts;
 }
 
@@ -1697,11 +1775,17 @@ export async function collectHardStops({ base, head, cwd, config, maxImporterHit
 
   // Whole new content of changed code files, so the import check reads an import split over several lines as one.
   const headFiles = new Map();
+  const tooBig = [];
   for (const d of ds) {
     if (!d.addedIsCode || d.binary || d.symlink || d.gitlink || !d.newPath || d.added.length === 0) continue;
+    // Only languages the import parser reads: a 3 MB lockfile or data file must not turn every dependency PR into R0.
+    // Other files keep the per-added-line import pass.
+    if (!IMPORT_SOURCE.test(d.newPath)) continue;
     const text = showFile(head, d.newPath, o);
-    if (text !== null && text.length <= MAX_HEAD_TEXT) headFiles.set(d.file, text);
+    if (text === null) continue;
+    if (text.length <= MAX_HEAD_TEXT) headFiles.set(d.file, text);
+    else tooBig.push({ rule: 'R0-unscannable', file: d.file, detail: `file is larger than ${MAX_HEAD_TEXT} characters; its imports cannot be checked` });
   }
   const hits = classifyHardStops({ files, config, baseEnvNames, pkgPairs, sqlStatements, envFiles, envImportFiles, guardLosses, headFiles });
-  return [...hits, ...reverseImportHits(ds, head, o, cx, maxImporterHits)];
+  return [...hits, ...tooBig, ...reverseImportHits(ds, head, o, cx, maxImporterHits)];
 }
