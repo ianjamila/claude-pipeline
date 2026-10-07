@@ -14,7 +14,7 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { commandName, simpleCommands, splitArgs, scriptFileOf } from './shell-parse.mjs';
+import { commandName, simpleCommands, splitArgs, scriptFileOf, bashUntouched } from './shell-parse.mjs';
 import { catchAllReason, guardedCommandText } from './guarded-text.mjs';
 
 const PROTECTED_BRANCHES = ['main', 'master'];
@@ -51,9 +51,7 @@ const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 // lowercase basename without .exe/.cmd/.bat/.com; handles /usr/bin/git and C:\Git\bin\GIT.EXE alike
 const baseName = (w) => commandName(w);
 // A command the parser could only partly resolve (`$g push`, `bash -c "$X"`, `curl … | sh`) is judged by what it mentions.
-// `merge-base` is read-only (it names a commit); without the lookahead, any script with a
-// run-time command name that also computed a merge base for a diff was denied.
-const GUARDED_WORDS = /push|merge(?!-base)|human-approved|test-change-approved|needs-human|pipeline-pause|pipeline-rollback|pipeline-blocked|awaiting-review|protection|ruleset|issue\s+close/i;
+const GUARDED_WORDS = /push|merge|human-approved|test-change-approved|needs-human|pipeline-pause|pipeline-rollback|pipeline-blocked|awaiting-review|protection|ruleset|issue\s+close/i;
 const isProtectedBranch = (b) => PROTECTED_BRANCHES.includes(String(b).toLowerCase());
 const isPrefixOf = (name, full, min = 1) => name.length >= min && full.startsWith(name);
 // Label names are case-insensitive on GitHub; a name only counts when it is not part of a longer one.
@@ -740,7 +738,9 @@ function checkScriptFile(sf, dir, ctx, level) {
 
 function evalString(str, startDir, ctx, level) {
   if (level > MAX_NESTING) return deny('pipeline job start / alias is nested too deeply to verify.');
-  const cmds = simpleCommands(str);
+  // `"${BASH:-bash}" x.sh` counts as `bash x.sh` only while no text seen so far (line or script) names BASH otherwise
+  if (!bashUntouched(str)) ctx.bashFixed = false;
+  const cmds = simpleCommands(str, { bashFixed: ctx.bashFixed !== false });
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (`g''it push` after
   // 500 `true;` must not slip through on a word match).
   if (cmds.truncated) return deny('command too complex to verify (the parser gave up). Split it into simpler commands.');

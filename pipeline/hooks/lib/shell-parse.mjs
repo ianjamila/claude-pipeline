@@ -15,6 +15,12 @@ const KEYWORDS = new Set(['if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'whi
 const PS_ENV_RE = /^\$env:([A-Za-z_][A-Za-z0-9_]*)(=?)([\s\S]*)$/i;
 const MAX_BRACE_WORK = 20_000; // brace-expansion results across one line; beyond it words stay unexpanded and the parse is flagged truncated
 const BRACE_CAP = 64; // results of one brace expression; beyond it we keep the first ones and set `truncated`
+// `${BASH:-bash}` / `${BASH-sh}` as a whole command word (see Parser.process: resolved only when the caller passes bashFixed)
+const BASH_DEFAULT_RE = /^\$\{BASH:?-([a-z0-9]+)\}$/;
+// True when `BASH` appears in the text only inside such defaults: no assignment, export, read, unset, `${BASH:=…}`, loop var…
+export function bashUntouched(text) {
+  return !/\bBASH\b/.test(String(text ?? '').replace(/\$\{BASH:?-[a-z0-9]+\}/g, ''));
+}
 const SHELLS = new Set(['bash', 'sh', 'zsh', 'dash', 'ash', 'ksh', 'ksh93', 'mksh', 'pdksh', 'yash', 'rbash', 'fish', 'csh', 'tcsh']);
 const TMUX_RUNNERS = new Set(['new-session', 'new', 'new-window', 'neww', 'split-window', 'splitw', 'respawn-pane', 'respawnp', 'respawn-window', 'respawnw', 'run-shell', 'run', 'pipe-pane', 'pipep', 'display-popup', 'popup', 'if-shell', 'if']);
 const TMUX_KEY_RE = /^(Enter|Space|Tab|Escape|BSpace|Up|Down|Left|Right|Home|End|PageUp|PageDown|[CMS]-.+|F[0-9]+|KP.+)$/;
@@ -1075,6 +1081,12 @@ class Parser {
       for (const k of Object.keys(un.env)) setEnv(env, k, un.env[k]);
       a = this.winFix(un.argv, seg);
     }
+    // `"${BASH:-bash}" x.sh` runs a shell: bash sets $BASH to its own path, and the caller vouches (bashFixed) that
+    // nothing in the text assigns or otherwise names BASH. Resolved, the script it runs is read and judged like `bash x.sh`.
+    if (this.ctx.bashFixed && a.length) {
+      const m = BASH_DEFAULT_RE.exec(a[0]);
+      if (m && SHELLS.has(m[1])) a = [m[1], ...a.slice(1)];
+    }
     // a command name that is only known at run time ($g push, $(echo git) push)
     if (a.length && (a[0].startsWith('$') || a[0].includes('$(') || a[0].includes('`'))) this.ctx.dynamic = true;
     const cmd = emit(this.ctx, a, env, seg.raw, seg.depth);
@@ -1213,7 +1225,7 @@ class Parser {
 
 export function simpleCommands(str, opts) {
   const requested = Number.isFinite(opts?.maxDepth) ? Math.trunc(opts.maxDepth) : 5;
-  const ctx = { out: [], maxDepth: Math.min(Math.max(requested, 0), HARD_MAX_DEPTH), truncated: false, dynamic: false, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0 };
+  const ctx = { out: [], maxDepth: Math.min(Math.max(requested, 0), HARD_MAX_DEPTH), truncated: false, dynamic: false, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, bashFixed: opts?.bashFixed === true };
   let parser = null;
   try {
     parser = new Parser(ctx, String(str ?? ''));

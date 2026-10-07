@@ -1107,20 +1107,28 @@ test('a script whose name is only known at run time is denied only when the line
   assert.equal(evaluate('F=push.sh; bash $F', withFiles({ 'push.sh': 'git push origin main' })).decision, 'deny');
 });
 
-test('a read-only git merge-base is not a guarded "merge", even in a script with a run-time command name', () => {
-  // the shape that was wrongly denied: a review-diff helper that runs `"${BASH:-bash}" ./x.sh` and `git merge-base`
+test('"${BASH:-bash}" runs a shell: the script it names is read and judged, unless something on the line names BASH', () => {
+  // the shape that was wrongly denied: a review-diff helper that runs `"${BASH:-bash}" ./ws.sh` and computes `git merge-base`
   const files = {
     'review.sh': '#!/bin/bash\nWS=$("${BASH:-bash}" ./ws.sh)\nBASE=$(git merge-base origin/main HEAD)\ngit diff "$BASE"..HEAD > "$WS/r.diff"\n',
     'ws.sh': 'echo /tmp/ws',
-    'sneaky.sh': '#!/bin/bash\ngit merge-base a b\n"${BASH:-bash}" ./ws.sh\ngh pr merge 5 --admin\n',
+    'evil-review.sh': '#!/bin/bash\n"${BASH:-bash}" ./evil.sh\ngit merge-base a b\n',
+    'evil.sh': 'gh pr merge 5 --admin',
+    'rebind.sh': '#!/bin/bash\nexport BASH=/usr/bin/gh\n"${BASH:-bash}" pr merge 5 --admin\n',
   };
-  assert.equal(evaluate('bash review.sh', withFiles(files)).decision, 'allow');
-  assert.equal(evaluate('g=git; $g merge-base HEAD origin/main').decision, 'allow');
-  // still guarded: a real merge beside merge-base, a run-time merge, a run-time gh merge
-  assert.equal(evaluate('bash sneaky.sh', withFiles(files)).decision, 'deny');
-  assert.equal(evaluate('g=git; $g merge feature').decision, 'deny');
-  assert.equal(evaluate('g=git; $g merge-base a b && $g merge feature').decision, 'deny');
-  assert.equal(evaluate('$GH pr merge 5 --admin').decision, 'deny');
+  const ev = (c) => evaluate(c, withFiles(files));
+  for (const c of ['bash review.sh', '"${BASH:-bash}" ./ws.sh && git merge-base a b', '"${BASH-sh}" ws.sh; git merge-base a b']) {
+    assert.equal(ev(c).decision, 'allow', c);
+  }
+  for (const c of [
+    'bash evil-review.sh', // resolved to bash, so evil.sh is read: the merge inside it is found
+    '"${BASH:-bash}" evil.sh',
+    'bash rebind.sh', // BASH reassigned: what runs is unknown again
+    'BASH=gh; "${BASH:-bash}" pr merge 5 --admin',
+    '"${BASH:-gh}" pr merge 5 --admin', // the default is not a shell
+    '"$BASH" ./ws.sh && git merge-base a b', // a bare $BASH is not vouched for: run-time name + guarded word
+    'for BASH in gh; do "${BASH:-bash}" pr merge 5; done',
+  ]) assert.equal(ev(c).decision, 'deny', c);
 });
 
 test('script content is judged with the same rules, including truncation and size', () => {
