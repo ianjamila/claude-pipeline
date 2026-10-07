@@ -418,34 +418,44 @@ function unwrap(argv) {
 
 // bash -c "script" / bash -lc ... / bash script.sh / bash (reads stdin)
 // -s, `-`, /dev/stdin and /dev/fd/0 all mean "read the script from stdin".
-// `noexec` is true when the options leave noexec (-n, -o noexec, fish --no-execute) on at the operand: a later
-// `+n` / `+o noexec` turns it off again, and an interactive shell (-i) is never treated as noexec.
+// `noexec` (the options only check syntax, so the file is not run) is decided by a strict allowlist and fails
+// CLOSED: shells differ (zsh can switch execution back on with `-o exec`, `--exec`, `+o no_exec`, any case or
+// underscore spelling; `-onoglob` is an attached option value, not a `-n`), so any option word we do not know may
+// re-enable execution. noexec holds only when the words before the operand are ALL of: a short cluster of the
+// letters n x v e u (`-n`, `-xn`, `-nv`, `-eu`) with an `n` among the words, the exact pair `-o noexec`, fish's
+// `--no-execute`, and `--`. Anything else (a `+` cluster, another letter such as i/c/s/l, `-o`/`-O`/`+o` with
+// another name, an attached value, another `--long` option, a dynamic word) makes noexec false for the whole call.
 function shellInvocation(argv) {
   let i = 1;
   let sawC = false;
   let sawS = false;
-  let noexec = false;
-  let interactive = false;
+  let sawN = false;
+  let known = true; // every option word so far is on the noexec allowlist
   while (i < argv.length) {
     const t = argv[i];
     if (t === '--') { i++; break; }
     if (t.length < 2 || (t[0] !== '-' && t[0] !== '+')) break;
     if (t.startsWith('--')) {
-      if (t === '--no-execute') noexec = true;
+      if (t === '--no-execute') sawN = true;
+      else known = false;
       i += t === '--rcfile' || t === '--init-file' ? 2 : 1;
       continue;
     }
     if (t[0] === '-' && t.includes('c')) sawC = true;
     if (t[0] === '-' && t.includes('s')) sawS = true;
-    if (t.includes('i')) interactive = true;
-    if (t.includes('n')) noexec = t[0] === '-';
-    if (/o$/.test(t) && argv[i + 1] === 'noexec') noexec = t[0] === '-';
+    if (/^-[nxveu]+$/.test(t)) {
+      if (t.includes('n')) sawN = true;
+    } else if (t === '-o' && argv[i + 1] === 'noexec') {
+      sawN = true;
+    } else {
+      known = false;
+    }
     i += /[oO]$/.test(t) ? 2 : 1; // -o / -O take an option name
   }
   // The shell expands $var, `cmd`, {a,b} and globs before it reads the options, so such a word may be a `+n` (or
   // shift the operand): noexec only holds when every word up to and including the operand is fully static.
   const dynamic = argv.slice(1, i + 1).some((w) => /[$`*?[{]/.test(w));
-  noexec = noexec && !interactive && !dynamic;
+  const noexec = sawN && known && !dynamic;
   if (sawC) return i < argv.length ? { kind: 'script', text: argv[i], noexec } : { kind: 'none', noexec };
   if (sawS) return { kind: 'stdin', noexec };
   if (i < argv.length) return STDIN_FILES.has(argv[i]) ? { kind: 'stdin', noexec } : { kind: 'file', text: argv[i], noexec };

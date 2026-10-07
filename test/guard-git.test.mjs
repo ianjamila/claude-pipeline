@@ -1100,6 +1100,15 @@ test('a noexec shell invocation of a script file (bash -n) is not running it; -c
   assert.equal(ev("bash -n -c 'git push origin main'"), 'deny');
 });
 
+test('a noexec shell invocation with an option the allowlist does not know (zsh can re-enable exec) is judged as running the file', () => {
+  const ev = (c) => evaluate(c, withFiles({ 'push.sh': 'echo hi\ngit push origin main\n' })).decision;
+  for (const c of ['zsh -n -o exec push.sh', 'zsh -n --exec push.sh', 'zsh -n +o no_exec push.sh', 'zsh -onoglob push.sh']) {
+    assert.equal(ev(c), 'deny', c);
+  }
+  assert.equal(ev('bash -n push.sh'), 'allow');
+  assert.equal(ev('/bin/bash -n push.sh'), 'allow');
+});
+
 test('bash -n with a word the shell expands first (the parser cannot know it is not +n) is judged as running the file', () => {
   const ev = (c) => evaluate(c, withFiles({ 'push.sh': 'echo hi\ngit push origin main\n' })).decision;
   for (const c of ['bash -n $X push.sh', 'bash -n {+n,push.sh}', 'bash -n$X push.sh', 'bash -n $(printf +n) push.sh', 'bash -n +[n] push.sh']) {

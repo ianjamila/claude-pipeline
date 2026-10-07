@@ -943,12 +943,20 @@ test('scriptFileOf: a noexec shell invocation (bash -n f) runs no file, unless n
   const f = (s) => scriptFileOf(s.split(' '));
   for (const c of [
     'bash -n f.sh', '/bin/bash -n f.sh', 'bash -xn f.sh', 'bash -nx f.sh', 'sh -n f.sh', 'zsh -n f.sh',
-    'bash -o noexec f.sh', 'fish --no-execute f.fish', 'bash +n -n f.sh',
+    'bash -o noexec f.sh', 'fish --no-execute f.fish', 'bash -nv f.sh', 'bash -eu -n f.sh', 'bash -n -- f.sh',
   ]) assert.equal(f(c), null, c);
   const file = (s) => (s.startsWith('fish') ? 'f.fish' : 'f.sh');
-  for (const c of ['bash -n +n f.sh', 'bash -n -i f.sh', 'bash -in f.sh', 'bash -o noexec +o noexec f.sh', 'bash f.sh -n', 'bash f.sh']) {
+  for (const c of ['bash -n +n f.sh', 'bash +n -n f.sh', 'bash -n -i f.sh', 'bash -in f.sh', 'bash -o noexec +o noexec f.sh', 'bash f.sh -n', 'bash f.sh']) {
     assert.deepEqual(f(c), { kind: 'shell', file: file(c) }, c);
   }
+});
+
+test('scriptFileOf: noexec only holds for an allowlist of option words (unknown options may re-enable execution)', () => {
+  const f = (s) => scriptFileOf(s.split(' '));
+  for (const c of [
+    'zsh -n -o exec f.sh', 'zsh -n --exec f.sh', 'zsh -n +o no_exec f.sh', 'zsh -n +o NO_EXEC f.sh', 'zsh -n -o NOEXEC f.sh',
+    'zsh -onoglob f.sh', 'bash -n -O extglob f.sh', 'bash -n --rcfile r f.sh', 'bash -n -l f.sh',
+  ]) assert.deepEqual(f(c), { kind: 'shell', file: 'f.sh' }, c);
 });
 
 test('scriptFileOf: a noexec shell invocation with a word the shell expands first (\$X, `..`, {a,b}, globs) still runs the file', () => {
