@@ -605,6 +605,22 @@ test('every exempt doc type is searched as a reverse-chain link (prod -> docs/a.
   assert.ok((await collectWith(repo)).some((h) => h.rule === 'R0-unscannable' && h.file === 'tests/x.js'));
 });
 
+test('blank, comment-only and lone-bracket lines inside a desynced bracketed import never hide a name (fallback segments stay apart)', () => {
+  const desync = 'v = f"{d["("]}"';
+  const cases = [
+    [desync, 'from app import (', '', '    secret,', ')'],
+    [desync, 'from app import (', '    # padding', '    secret,', ')'],
+    [desync, 'from app import', '(', '    secret,', ')'].map((l, i) => (i === 1 ? 'from app import (' : l)),
+    [desync, 'from app import (', '', '    ok,', '', '    secret,', ')'],
+  ];
+  for (const lines of cases) {
+    const at = lines.findIndex((l) => l.includes('secret')) + 1;
+    const testGlobs = [...cfg().integrity.test_globs, 'app/secret*', 'app/secret/**'];
+    const hits = run([file('app/views.py', { added: [lines[at - 1]], at })], { config: { ...cfg(), integrity: { test_globs: testGlobs } }, headFiles: new Map([['app/views.py', lines.join('\n')]]) });
+    assert.deepEqual(rulesOf(hits), ['R0-unscannable'], lines.join(' / '));
+  }
+});
+
 test('the string-blind Python fallback reads heads anywhere on a line and ignores brackets in comments', () => {
   const desync = 'v = f"{d["("]}"';
   const cases = [

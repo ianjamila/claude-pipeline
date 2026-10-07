@@ -684,7 +684,10 @@ function pythonImportFallback(lines) {
     const code = line.replace(/#.*$/, '');
     const names = code.replace(/\\\s*$/, '');
     if (head !== null) {
-      segs.push({ text: `${head} ${names.replace(/[()]/g, ' ').trim()}`, from: headLine, to: i + 1 });
+      // A continuation line with no names (blank, comment-only, a lone `(`) emits nothing: `from app import ` with a trailing
+      // space would let the import regexes' `\s+` cross into the next segment once all segments are scanned in one pass.
+      const listed = names.replace(/[()]/g, ' ').trim();
+      if (listed !== '') segs.push({ text: `${head} ${listed}`, from: headLine, to: i + 1 });
       if (bracket ? code.includes(')') : !/\\\s*$/.test(code)) head = null;
       continue;
     }
