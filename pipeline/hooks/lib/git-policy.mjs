@@ -121,6 +121,20 @@ function setVar(ctx, k, v) {
 }
 const recordVars = (env, ctx) => { for (const k of Object.keys(env)) setVar(ctx, k, env[k]); };
 
+// Every variable name assigned on the line so far, including the ones that became unknown by being assigned twice.
+// Anything that inspects WHICH variables are set (not their values) must use this, never Object.keys(ctx.vars) alone.
+const assignedNames = (ctx) => [...Object.keys(ctx.vars), ...ctx.unsureVars];
+
+// The value a variable has for the command being judged: this command's own prefix (`NAME=v git …`, `env NAME=v git …`),
+// else an earlier assignment or export on the line. `known: false` when it was assigned twice (which value applies
+// depends on control flow); `value` is undefined when it is not set at all.
+function envVar(env, ctx, name) {
+  if (Object.hasOwn(env, name)) return { known: true, value: env[name] };
+  if (name in ctx.vars) return { known: true, value: ctx.vars[name] };
+  if (ctx.unsureVars.has(name)) return { known: false, value: undefined };
+  return { known: true, value: undefined };
+}
+
 // Resolves `target` against `dir`. Returns null when the result cannot be known statically ($VAR, $(..), `cd -`).
 function joinDir(dir, target, ctx) {
   if (typeof target !== 'string') return null;
@@ -270,7 +284,9 @@ function checkPush(args, dir, gitDir, ctx, configs) {
 
 function parseGitGlobal(argv, dir, env, ctx) {
   let d = dir;
-  let gitDir = typeof env.GIT_DIR === 'string' && env.GIT_DIR ? joinDir(d, env.GIT_DIR, ctx) : null;
+  const envGitDir = envVar(env, ctx, 'GIT_DIR');
+  let gitDirUnknown = !envGitDir.known; // exported twice: which repository the command acts on cannot be told
+  let gitDir = typeof envGitDir.value === 'string' && envGitDir.value ? joinDir(d, envGitDir.value, ctx) : null;
   const configs = [];
   let i = 1;
   for (; i < argv.length; i++) {
@@ -282,13 +298,13 @@ function parseGitGlobal(argv, dir, env, ctx) {
       configs.push({ key: (eq < 0 ? kv : kv.slice(0, eq)).toLowerCase(), value: eq < 0 ? '' : kv.slice(eq + 1) });
       continue;
     }
-    if (t.startsWith('--git-dir=')) { gitDir = joinDir(d, t.slice('--git-dir='.length), ctx); continue; }
-    if (t === '--git-dir') { gitDir = joinDir(d, argv[++i], ctx); continue; }
+    if (t.startsWith('--git-dir=')) { gitDir = joinDir(d, t.slice('--git-dir='.length), ctx); gitDirUnknown = false; continue; }
+    if (t === '--git-dir') { gitDir = joinDir(d, argv[++i], ctx); gitDirUnknown = false; continue; }
     if (GIT_GLOBAL_VALUE.includes(t)) { i++; continue; }
     if (t.startsWith('-')) continue; // boolean global option, or --opt=value
     break;
   }
-  return { d, gitDir, configs, sub: argv[i], args: argv.slice(i + 1) };
+  return { d, gitDir, gitDirUnknown, configs, sub: argv[i], args: argv.slice(i + 1) };
 }
 
 // checkout / switch: which branch is the directory on afterwards?
@@ -369,6 +385,10 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
   // The subcommand must be written literally: `git $X origin main` (even with X=push on the line), `git "$(printf push)"`,
   // `git ${X}${Y:-sh}` — what git does is decided by a value the checks below would never see.
   if (DYNAMIC.test(sub)) return deny(RUN_TIME_SUBCOMMAND);
+  // GIT_DIR assigned twice: the branch the checks read could belong to another repository than the one git acts on
+  if (g.gitDirUnknown && (sub === 'push' || sub === 'send-pack' || sub === 'branch')) {
+    return deny('GIT_DIR was assigned more than once on this line, so which repository this command acts on cannot be verified. Assign it once, or use -C / --git-dir.');
+  }
 
   // aliases defined on this very line (`git config alias.p push && git p …`, `git -c alias.p=push p …`)
   const aliasConfig = g.configs.find((c) => c.key === `alias.${sub.toLowerCase()}`);
@@ -384,7 +404,7 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
   if (sub === 'push' || sub === 'send-pack') { // send-pack is push without the remote configuration
     if (/\bxargs\b/.test(raw)) return deny('`xargs git push` takes its refspecs from stdin, so it cannot be verified. Push the branch by name.');
     // config handed in through the environment (this command's prefix / `env`, or an earlier assignment or export on the line)
-    ctx.envCfgDirty = [...Object.keys(env), ...Object.keys(ctx.vars)].some((k) => GIT_ENV_CONFIG.test(k));
+    ctx.envCfgDirty = [...Object.keys(env), ...assignedNames(ctx)].some((k) => GIT_ENV_CONFIG.test(k));
     return checkPush(args, g.d, g.gitDir, ctx, g.configs);
   }
   trackGit(sub, args, g, ctx);
@@ -410,10 +430,13 @@ function splitGh(args) {
   };
 }
 
-const repoArgsOf = (flags, env) => {
+// null when GH_REPO was assigned twice and no -R names the repository: the labels cannot be looked up in the right one.
+const repoArgsOf = (flags, env, ctx) => {
   const [repo] = flagValues(flags, ['repo'], 'R');
   if (repo) return ['-R', repo];
-  return typeof env.GH_REPO === 'string' && env.GH_REPO ? ['-R', env.GH_REPO] : [];
+  const ghRepo = envVar(env, ctx, 'GH_REPO');
+  if (!ghRepo.known) return null;
+  return typeof ghRepo.value === 'string' && ghRepo.value ? ['-R', ghRepo.value] : [];
 };
 
 // Closing/deleting/transferring an issue that carries pipeline-pause or pipeline-rollback is the owner's call.
@@ -682,7 +705,9 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
       return /\bxargs\b/.test(raw) ? deny('`xargs gh issue ' + verb + '` takes the issue number from stdin, so it cannot be checked for pipeline-pause/pipeline-rollback. Name the issue number.') : null; // gh refuses a missing number itself
     }
     for (const n of numbers) {
-      const v = checkIssueHold(n, repoArgsOf(flags, env), dir, ctx, verb);
+      const repoArgs = repoArgsOf(flags, env, ctx);
+      if (repoArgs === null) return deny('GH_REPO was assigned more than once on this line, so the repository this issue belongs to cannot be verified. Pass -R OWNER/REPO.');
+      const v = checkIssueHold(n, repoArgs, dir, ctx, verb);
       if (v) return v;
     }
   }

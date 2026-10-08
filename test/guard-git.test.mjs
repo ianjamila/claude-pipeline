@@ -1161,6 +1161,74 @@ test('git config supplied through the environment counts as changed push configu
   assert.equal(evaluate('GIT_AUTHOR_NAME=x git push', { branch: 'agent/x' }).decision, 'allow');
 });
 
+// PR #7 security-scan findings 1 and 2: a variable assigned twice is "unsure" (not in ctx.vars) but was still assigned,
+// so every check that looks at assigned variable NAMES must see it too.
+test('git config from the environment still counts when the variable was assigned more than once', () => {
+  const exp = 'export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=HEAD:main';
+  const envDeny = [
+    // finding 1: exported twice
+    `${exp}; ${exp}; git push`,
+    `${exp} GIT_CONFIG_COUNT=1; git push`, // twice in one export
+    `${exp}; export GIT_CONFIG_COUNT=1; git push`,
+    // finding 2: plain assignments, twice
+    'GIT_CONFIG_COUNT=1; GIT_CONFIG_COUNT=1; GIT_CONFIG_KEY_0=remote.origin.push; GIT_CONFIG_VALUE_0=HEAD:main; git push',
+    'GIT_CONFIG_COUNT=1; GIT_CONFIG_KEY_0=remote.origin.push; GIT_CONFIG_KEY_0=remote.origin.push; GIT_CONFIG_VALUE_0=HEAD:main; git push',
+    'GIT_CONFIG_PARAMETERS=x; GIT_CONFIG_PARAMETERS="\'remote.origin.push=HEAD:main\'"; git push',
+    'GIT_CONFIG_GLOBAL=/a; GIT_CONFIG_GLOBAL=/tmp/evil.gitconfig; git push',
+    'GIT_CONFIG_SYSTEM=/a; false && GIT_CONFIG_SYSTEM=/b; git push origin',
+    // assigned twice, then git runs through send-pack or an alias defined on the line
+    'GIT_CONFIG_COUNT=1; GIT_CONFIG_COUNT=1; git send-pack',
+    'GIT_CONFIG_COUNT=1; GIT_CONFIG_COUNT=1; git -c alias.p=push p',
+  ];
+  for (const c of envDeny) assert.equal(evaluate(c, { branch: 'agent/x' }).decision, 'deny', c);
+  // unrelated variables assigned twice, and an explicit refspec, stay fine
+  assert.equal(evaluate('A=1; A=2; git push', { branch: 'agent/x' }).decision, 'allow');
+  assert.equal(evaluate('GIT_CONFIG_COUNT=1; GIT_CONFIG_COUNT=1; git push origin HEAD:agent/x', { branch: 'agent/x' }).decision, 'allow');
+});
+
+// PR #7 security-scan finding 3: the subcommand has to be literal before the alias lookup, the push dispatch and
+// branch tracking see it, so a variable that expands to push can never route around checkPush.
+test('a git subcommand built from a variable never reaches the push / alias / tracking dispatch unchecked', () => {
+  const denyCmds = [
+    'X=push; git $X origin main',
+    'X=pu; git ${X}sh -f origin main',
+    'X=push; X=push; git $X origin main',
+    'X=pu; git ${X}sh origin main',
+    'export X=push; git "$X" origin main',
+    'X=send-pack; git $X ../origin.git main',
+    'X=push; git -C /work/repo $X origin main',
+    'X=push; git -c user.name=a $X origin main',
+    'X=p; git config alias.p push; git $X origin main',
+    'X=checkout; git $X main; git push',
+    'X=push; env git $X origin main',
+  ];
+  for (const c of denyCmds) assert.equal(evaluate(c, { branch: 'agent/x' }).decision, 'deny', c);
+});
+
+// Siblings of findings 1 and 2: GIT_DIR and GH_REPO were read from the command's own prefix only, so an earlier
+// assignment or export (once or twice) never reached them.
+test('GIT_DIR and GH_REPO set earlier on the line are honoured, and unknown ones fail closed', () => {
+  let v = evaluate('export GIT_DIR=/e/.git; git push');
+  assert.equal(v.calls.branchDirs[0].gitDir, resolve('/e/.git'));
+  v = evaluate('GIT_DIR=/e/.git; git push');
+  assert.equal(v.calls.branchDirs[0].gitDir, resolve('/e/.git'));
+  assert.equal(evaluate('GIT_DIR=/a/.git; GIT_DIR=/b/.git; git push', { branch: 'agent/x' }).decision, 'deny');
+  assert.equal(evaluate('export GIT_DIR=/a/.git; false && export GIT_DIR=/b/.git; git push', { branch: 'agent/x' }).decision, 'deny');
+  assert.equal(evaluate('GIT_DIR=/a/.git; GIT_DIR=/b/.git; git send-pack', { branch: 'agent/x' }).decision, 'deny');
+  // a prefix on the command itself wins over the earlier assignment
+  v = evaluate('GIT_DIR=/a/.git; GIT_DIR=/b/.git git push');
+  assert.equal(v.calls.branchDirs[0].gitDir, resolve('/b/.git'));
+
+  v = evaluate('export GH_REPO=o/r; gh issue close 9', { labels: [] });
+  assert.deepEqual(v.calls.labels[0].repoArgs, ['-R', 'o/r']);
+  v = evaluate('GH_REPO=o/r; gh issue close 9', { labels: [] });
+  assert.deepEqual(v.calls.labels[0].repoArgs, ['-R', 'o/r']);
+  assert.equal(evaluate('GH_REPO=o/r; GH_REPO=p/q; gh issue close 9', { labels: [] }).decision, 'deny');
+  assert.equal(evaluate('export GH_REPO=o/r; false && export GH_REPO=p/q; gh issue close 9', { labels: [] }).decision, 'deny');
+  // other gh commands do not look at the repository, so the same variable is harmless there
+  assert.equal(evaluate('GH_REPO=o/r; GH_REPO=p/q; gh pr view 9').decision, 'allow');
+});
+
 // ---- script files and string-running wrappers (review findings 2 and 11) ------------------------------------
 
 // A fake file system: { 'push.sh': 'git push origin main' } relative to the cwd (/work/repo).
