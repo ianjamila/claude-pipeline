@@ -28,13 +28,19 @@ export function updateTiming(env = {}) {
   };
 }
 
-// The required checks of the PR's current head, falling back to every reported check when GitHub requires none.
+// gh's own "nothing there yet" answers, which are data. Anything else (auth, 5xx, a timeout) is GitHub being unavailable.
+const NO_CHECKS = /no (?:required )?checks reported/i;
+
+// The required checks of the PR's current head, falling back to every reported check when GitHub requires none. Only the
+// recognised "no checks reported" answer falls through; any other failure propagates (the command maps it to exit 3).
 function readChecks(gh, pr) {
   for (const required of [true, false]) {
     try {
       const rows = gh.checks(pr, { required });
       if (Array.isArray(rows) && rows.length > 0) return rows;
-    } catch { /* "no checks reported" (a gh error): try the next source, then report nothing */ }
+    } catch (err) {
+      if (err?.timedOut === true || !NO_CHECKS.test(`${err?.stderr ?? ''}\n${err?.stdout ?? ''}`)) throw err;
+    }
   }
   return [];
 }
@@ -70,10 +76,13 @@ async function waitForNewHead({ gh, pr, from, waitMs, pollMs, now, sleep }) {
 }
 
 // Runs update cycles until the base tip is part of the PR head. `expectHead` pins the head the caller has verified (the
-// worktree's HEAD): a PR head that differs is `head-moved` before anything is written. With `waitChecks: false` the call
-// returns as soon as the new head exists (merge uses that: it only needs to know the branch was brought up to date).
+// worktree's HEAD): a PR head that differs is `head-moved` before anything is written. The new head is accepted only if it is
+// the merge commit GitHub makes, parents exactly [the pinned head, the base tip captured with the behind count]; any other
+// successor (an external push that raced the update) is `head-moved` and nothing more is written. Waiting for the new head's
+// checks is opt-in (`waitChecks: true`): the ship flow marks the PR ready and labels it AFTER updating, and checks that only
+// start then (draft-skipped workflows, label-gated e2e) would otherwise be waited on forever. Merge needs no check wait either.
 export async function bringUpToDate({
-  gh, pr, expectHead = null, maxCycles = MAX_UPDATE_CYCLES, waitChecks = true,
+  gh, pr, expectHead = null, maxCycles = MAX_UPDATE_CYCLES, waitChecks = false,
   headWaitMs = HEAD_WAIT_MS, checksWaitMs = CHECKS_WAIT_MS, pollMs = POLL_MS, now = Date.now, sleep = defaultSleep,
 }) {
   let cycles = 0;
@@ -99,6 +108,7 @@ export async function bringUpToDate({
       return out('cycle-cap', { head, behindBy: cmp.behindBy, message: `${base} kept moving: still ${cmp.behindBy} commit(s) behind after ${cycles} update(s)` });
     }
 
+    const baseSha = cmp.baseSha;
     const res = gh.updateBranch(pr, head);
     if (res.result === 'conflict') {
       return out('rebase-needed', { head, message: `updating from ${base} conflicts (${res.message}): rebase or merge by hand; nothing was force-pushed` });
@@ -110,6 +120,10 @@ export async function bringUpToDate({
 
     const next = await waitForNewHead({ gh, pr, from: head, waitMs: headWaitMs, pollMs, now, sleep });
     if (next === null) return out('head-timeout', { head, message: `GitHub accepted the update but the PR head did not change within ${Math.round(headWaitMs / 1000)}s` });
+    const parents = gh.commitParents(next);
+    if (parents.length !== 2 || parents[0] !== head || parents[1] !== baseSha) {
+      return out('head-moved', { head: next, message: `the PR head became ${next}, which is not the merge of ${baseSha} into ${head} (parents: ${parents.join(', ') || 'none'}): someone pushed during the update; re-read, nothing more was written` });
+    }
     known = next;
     if (waitChecks) {
       const verdict = await waitForChecks({ gh, pr, waitMs: checksWaitMs, pollMs, now, sleep });

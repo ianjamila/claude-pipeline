@@ -148,13 +148,15 @@ Details and every exit code: `reference/gates-and-exits.md`.
    judges the tree that will land: `P job start update -- node ~/.claude/pipeline/bin/pipeline.mjs
    update-branch --pr N` → `P job wait update --run-id <runId> --timeout 540` (repeat until `done`).
    It asks GitHub to merge the base into the PR branch only when the base tip is not part of the PR
-   head (pinned to the head you just pushed; never a force push), waits for the new head's required
-   checks, and repeats at most 3 times if the base keeps moving. Read `exitCode` and the JSON in
-   `tail`: 0 `up-to-date` ⇒ if `pullNeeded`, `git pull --ff-only` (the gate now names `head`; 5.3 onward
-   re-verifies it). 1 `rebase-needed` (the update conflicts) or `cycle-cap` ⇒ `needs-human` + summary,
-   stop. 1 `head-moved` (someone pushed since you verified; nothing was updated) ⇒ `git fetch`, look at
-   what landed, back to 5.1. 1 `checks-failed` / `checks-timeout` / `head-timeout` ⇒ as a failing CI on
-   that head (fix the cause, or `needs-human`). 1 `not-open` ⇒ stop. 3 ⇒ GitHub unavailable: retry once.
+   head (pinned to the head you just pushed; never a force push) and repeats at most 3 times if the
+   base keeps moving. It does NOT wait for checks (they may not start until the PR is ready or
+   labelled, 5.4-5.5): the CI wait in 5.5 and the gate in 5.7 judge the new head. Read `exitCode` and
+   the JSON in `tail`: 0 `up-to-date` ⇒ if `pullNeeded`, `git pull --ff-only` (the gate now names
+   `head`; 5.3 onward re-verifies it). 1 `rebase-needed` (the update conflicts) or `cycle-cap` ⇒
+   `needs-human` + summary, stop. 1 `head-moved` (someone pushed since you verified, or the new head is
+   not GitHub's merge commit; nothing more was updated) ⇒ `git fetch`, look at what landed, back to 5.1.
+   1 `head-timeout` ⇒ run it once more, then `needs-human`. 1 `not-open` ⇒ stop. 3 ⇒ GitHub unavailable:
+   retry once.
 3. Verifier: fresh `verify.full` on the current head (must be clean, full mode). Then
    `P state outcome`: if `coverageValid` is `false` the PR content changed since the last clean
    review round (an update-branch, a late fix) ⇒ go back to Step 4 for a new round, then return here.

@@ -29,15 +29,18 @@ the matching `checks[].detail`. Exit 3: GitHub unavailable: wait a minute, run i
 
 Run in Step 5.2. It merges the base into the PR branch on GitHub (`PUT pulls/{n}/update-branch` with
 `expected_head_sha`; no local push, never a force push), but only when the base tip is not part of the PR
-head, then waits for the new head's required checks and re-checks; at most 3 updates.
+head and re-checks; at most 3 updates. It never waits for checks (they may only start once the PR is
+marked ready or labelled, Step 5.4-5.5, which is where CI is waited on); `--wait-checks` opts in, adding
+the outcomes below marked *(only with `--wait-checks`)*.
 
 | `exitCode` | JSON `outcome` | meaning → do |
 |---|---|---|
 | 0 | `up-to-date` | the base is part of `head`; `updated: true` = this run merged it in → `git pull --ff-only` (`pullNeeded`), re-verify, gate `head` |
 | 1 | `rebase-needed` | the update conflicts → `needs-human`; a human rebases or merges by hand |
-| 1 | `head-moved` | the PR head is not the one you verified, or GitHub refused `expected_head_sha`: nothing was updated → `git fetch`, look, Step 5.1 |
+| 1 | `head-moved` | the PR head is not the one you verified, GitHub refused `expected_head_sha`, or the new head is not GitHub's merge commit of the base into your head (an external push raced it): nothing more was updated → `git fetch`, look, Step 5.1 |
 | 1 | `cycle-cap` | the base kept moving (3 updates, still behind) → `needs-human` |
-| 1 | `checks-failed`, `checks-timeout`, `head-timeout` | the updated head did not get green required checks (or GitHub never showed the new head) → treat as failing CI on that head |
+| 1 | `head-timeout` | GitHub accepted the update but never showed a new head → run again once, then `needs-human` |
+| 1 | `checks-failed`, `checks-timeout` *(only with `--wait-checks`)* | the updated head did not get green required checks → treat as failing CI on that head |
 | 1 | `not-open` | the PR is closed or merged → stop |
 | 3 | GitHub unavailable | wait a minute, retry once, then stop |
 

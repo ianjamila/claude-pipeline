@@ -306,13 +306,13 @@ Exit: `validate`: 0 applied, 1 judge output invalid (state untouched) · `settle
 
 ## update-branch
 
-bring the PR branch up to date with its base on GitHub (update-branch with expected_head_sha), wait for the new head's required checks.
+bring the PR branch up to date with its base on GitHub (update-branch with expected_head_sha), return the new head (checks are not waited for by default).
 
 ```
-pipeline update-branch --pr N [--expect-head SHA] [--max-cycles N=3] [--repo DIR]   -> {ok, outcome, updated, cycles, base, startHead, head, localHead, pullNeeded, message?}; outcome up-to-date (exit 0; when updated: git pull --ff-only, then re-verify and run the gate on `head`) | rebase-needed | head-moved | cycle-cap | checks-failed | checks-timeout | head-timeout | not-open (exit 1; rebase-needed = the update conflicts, needs-human), 3 GitHub unavailable
+pipeline update-branch --pr N [--expect-head SHA] [--max-cycles N=3] [--wait-checks] [--repo DIR]   -> {ok, outcome, updated, cycles, base, startHead, head, localHead, pullNeeded, message?}; outcome up-to-date (exit 0; when updated: git pull --ff-only, then re-verify and run the gate on `head`; checks are NOT waited for unless --wait-checks) | rebase-needed | head-moved | cycle-cap | head-timeout | not-open | (with --wait-checks) checks-failed | checks-timeout (exit 1; rebase-needed = the update conflicts, needs-human), 3 GitHub unavailable
 ```
 
-Exit: 0 `up-to-date` (the base tip is part of the PR head; `updated` says whether this run merged the base in: then `git pull --ff-only`, re-verify, and gate `head`) · 1 `rebase-needed` (the update conflicts: `needs-human`, never a force push), `head-moved` (someone pushed since the verified head, or GitHub refused `expected_head_sha`: re-read, nothing was updated blindly), `cycle-cap` (the base kept moving), `checks-failed` / `checks-timeout` / `head-timeout` (the updated head did not turn green in time), `not-open` · 3 GitHub (`gh`) unavailable.
+Exit: 0 `up-to-date` (the base tip is part of the PR head; `updated` says whether this run merged the base in: then `git pull --ff-only`, re-verify, and gate `head`) · 1 `rebase-needed` (the update conflicts: `needs-human`, never a force push), `head-moved` (someone pushed since the verified head, GitHub refused `expected_head_sha`, or the new head is not GitHub's merge of the base into the pinned head: nothing more was updated), `cycle-cap` (the base kept moving), `head-timeout` (GitHub never showed the new head), `not-open`; with `--wait-checks` also `checks-failed` / `checks-timeout` · 3 GitHub (`gh`) unavailable, including any unexpected failure reading checks.
 
 ## vendor
 

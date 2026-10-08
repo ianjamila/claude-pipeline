@@ -198,12 +198,28 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     // base tip is already part of head. `per_page=1` keeps the reply small: only the counts are read.
     compare(base, head) {
       const args = ['api', `repos/${self.repo().slug}/compare/${encodePath(base)}...${encodeURIComponent(head)}?per_page=1`,
-        '--jq', '{status: .status, behind_by: .behind_by, ahead_by: .ahead_by}'];
+        '--jq', '{status: .status, behind_by: .behind_by, ahead_by: .ahead_by, base: .base_commit.sha}'];
       const body = parse(ok(args), args);
       if (!Number.isInteger(body?.behind_by) || !Number.isInteger(body?.ahead_by)) {
         throw new GhError({ code: 0, stderr: `compare reply has no behind_by/ahead_by: ${JSON.stringify(body).slice(0, 200)}`, args });
       }
-      return { status: body.status ?? null, behindBy: body.behind_by, aheadBy: body.ahead_by };
+      if (typeof body.base !== 'string' || !/^[0-9a-f]{40}$/.test(body.base)) {
+        throw new GhError({ code: 0, stderr: `compare reply has no base tip: ${JSON.stringify(body).slice(0, 200)}`, args });
+      }
+      return { status: body.status ?? null, behindBy: body.behind_by, aheadBy: body.ahead_by, baseSha: body.base };
+    },
+
+    // The parent SHAs of a commit, in order (for a merge commit: first the branch it was made on, then what was merged in).
+    commitParents(commit) {
+      const text = self.apiText(`repos/${self.repo().slug}/commits/${encodeURIComponent(commit)}`, '[.parents[].sha]');
+      let parents;
+      try {
+        parents = JSON.parse(text);
+      } catch { /* reported below */ }
+      if (!Array.isArray(parents) || !parents.every((p) => typeof p === 'string' && /^[0-9a-f]{40}$/.test(p))) {
+        throw new GhError({ code: 0, stderr: `commit ${commit} has no readable parents: ${String(text).slice(0, 200)}`, args: ['api', 'commits', commit] });
+      }
+      return parents;
     },
 
     // PUT pulls/{n}/update-branch: merge the base into the PR branch on GitHub (a merge commit, never a force push), but only

@@ -17,6 +17,8 @@ export const PR = 12;
 export const AGENT_LOG = 'docs/agent-log.md';
 export const STEPS = ['install', 'typecheck', 'lint', 'unit', 'build'];
 export const MERGE_SHA = 'c'.repeat(40);
+// The base tip GitHub's compare reports (base_commit): update-branch's merge commit must have it as second parent.
+export const BASE_SHA = '9'.repeat(40);
 export const ME = { match: '^api user', stdout: 'me\n' };
 export const REPO = { match: '^repo view', stdoutJson: REPO_VIEW };
 
@@ -112,10 +114,14 @@ export function ghEntries(o) {
     // `behindBy`: how many base commits the PR head lacks (compare); 0 = up to date, which is what merge's update step expects.
     // `update`: what PUT pulls/12/update-branch answers: accepted (default) | conflict | head-moved (the two 422s) | forbidden.
     UPDATE_REPLIES[o.update ?? 'accepted'],
-    { match: 'repos/acme/widgets/compare/', stdoutJson: { status: o.behindBy ? 'diverged' : 'ahead', behind_by: o.behindBy ?? 0, ahead_by: 1 } },
+    { match: 'repos/acme/widgets/compare/', stdoutJson: { status: o.behindBy ? 'diverged' : 'ahead', behind_by: o.behindBy ?? 0, ahead_by: 1, base: BASE_SHA } },
+    // `commitParents`: { <sha>: [parent shas] } for GET commits/<sha> (the update-branch result is bound to its parents).
+    ...Object.entries(o.commitParents ?? {}).map(([commit, parents]) => ({ match: `commits/${commit} --jq`, stdoutJson: parents })),
     o.requiredCi === 'error'
       ? { match: '^pr checks 12 .*--required$', code: 1, stderr: "no required checks reported on the 'main' branch" }
-      : { match: '^pr checks 12 .*--required$', stdoutJson: o.requiredCi ?? ci },
+      : o.requiredCi === 'fail502'
+        ? { match: '^pr checks 12 .*--required$', code: 1, stderr: 'gh: Server Error (HTTP 502)' }
+        : { match: '^pr checks 12 .*--required$', stdoutJson: o.requiredCi ?? ci },
     { match: '^pr checks 12 ', stdoutJson: ci },
     { match: '^auth status', code: 0 },
     ME,

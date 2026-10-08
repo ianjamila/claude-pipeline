@@ -8,7 +8,7 @@ import { GhError } from '../pipeline/lib/proc.mjs';
 import { createGitHub } from '../pipeline/lib/github.mjs';
 import { bringUpToDate, updateTiming } from '../pipeline/lib/updatebranch.mjs';
 import { createFakeGh, REPO_VIEW } from './helpers/fakegh-env.mjs';
-import { cli, scenario, ghEntries, PR } from './helpers/gate-env.mjs';
+import { cli, scenario, ghEntries, PR, BASE_SHA } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 
 const sha = (c) => c.repeat(40);
@@ -20,8 +20,8 @@ const C = sha('c');
 
 // `behind`: how far behind main the head is at each successive head (shifted after every accepted update; 0 once empty).
 // `lag`: prView reads that still show the old head after an update was accepted (the update is asynchronous).
-function world({ head = A, behind = [1], update = null, lag = 0, checks = [[{ name: 'ci', bucket: 'pass' }]], state = 'OPEN', pushAfterUpdate = null } = {}) {
-  const w = { head, behind: [...behind], updates: [], compares: 0, checkReads: 0, pending: null, heads: [B, C, sha('d'), sha('e')] };
+function world({ head = A, behind = [1], update = null, lag = 0, checks = [[{ name: 'ci', bucket: 'pass' }]], state = 'OPEN', pushAfterUpdate = null, race = false, parentsOf = null } = {}) {
+  const w = { head, behind: [...behind], updates: [], compares: 0, checkReads: 0, pending: null, heads: [B, C, sha('d'), sha('e')], base: BASE_SHA, parents: {} };
   w.gh = {
     prView() {
       if (w.pending && w.pending.lag-- <= 0) {
@@ -32,15 +32,24 @@ function world({ head = A, behind = [1], update = null, lag = 0, checks = [[{ na
     },
     compare() {
       w.compares += 1;
-      return { status: 'diverged', behindBy: w.behind[0] ?? 0, aheadBy: 1 };
+      return { status: 'diverged', behindBy: w.behind[0] ?? 0, aheadBy: 1, baseSha: w.base };
     },
     updateBranch(pr, expected) {
       w.updates.push({ pr, expected });
       if (update) return { result: update, message: update === 'conflict' ? 'merge conflict between base and head' : "expected head sha didn't match current head ref." };
       if (expected !== w.head) return { result: 'head-moved', message: "expected head sha didn't match current head ref." };
       w.behind.shift();
-      w.pending = { head: pushAfterUpdate ?? w.heads.shift(), lag };
+      // What GitHub makes: a merge commit [the pinned head, the base tip]. `race`: someone else's push is what the PR head
+      // becomes first (a single-parent commit on the old head); `parentsOf` overrides the shape.
+      const next = pushAfterUpdate ?? (race ? sha('7') : w.heads.shift());
+      w.parents[next] = race ? [expected] : (parentsOf ? parentsOf(expected, w.base) : [expected, w.base]);
+      w.pending = { head: next, lag };
       return { result: 'accepted' };
+    },
+    commitParents(commit) {
+      w.parentReads = (w.parentReads ?? 0) + 1;
+      if (!w.parents[commit]) throw new GhError({ code: 1, stderr: 'not found (HTTP 404)', args: ['api', commit] });
+      return w.parents[commit];
     },
     checks() {
       const rows = checks[Math.min(w.checkReads, checks.length - 1)];
@@ -57,7 +66,7 @@ const clock = () => {
   let t = 0;
   return { now: () => t, sleep: async (ms) => { t += ms; } };
 };
-const run = (w, extra = {}) => bringUpToDate({ gh: w.gh, pr: PR, pollMs: 10, headWaitMs: 100, checksWaitMs: 1000, ...clock(), ...extra });
+const run = (w, extra = {}) => bringUpToDate({ gh: w.gh, pr: PR, pollMs: 10, headWaitMs: 100, checksWaitMs: 1000, waitChecks: true, ...clock(), ...extra });
 
 test('up to date already: no update call, nothing waited for', async () => {
   const w = world({ behind: [0] });
@@ -195,6 +204,63 @@ test('a closed PR is not-open and nothing is written', async () => {
   assert.deepEqual(w.updates, []);
 });
 
+test('checks are opt-in: by default the update returns as soon as the new head exists, reading no checks', async () => {
+  const w = world({ behind: [1, 0], checks: [[{ name: 'ci', bucket: 'pending' }]] });
+  const r = await bringUpToDate({ gh: w.gh, pr: PR, expectHead: A, pollMs: 1, headWaitMs: 100, ...clock() });
+  assert.equal(r.outcome, 'up-to-date');
+  assert.equal(r.head, B);
+  assert.equal(w.checkReads, 0, 'checks that cannot start yet (draft, label) must never be waited on');
+});
+
+test('an unexpected check-API failure is NOT swallowed: it propagates even when the fallback would pass', async () => {
+  const w = world({ behind: [1, 0] });
+  w.gh.checks = (pr, { required }) => {
+    if (required) throw new GhError({ code: 1, stderr: 'gh: Server Error (HTTP 502)', args: ['pr', 'checks'] });
+    return [{ name: 'ci', bucket: 'pass' }];
+  };
+  await assert.rejects(run(w, { expectHead: A }), (err) => err instanceof GhError && /502/.test(err.message));
+  const timedOut = world({ behind: [1, 0] });
+  timedOut.gh.checks = () => { throw new GhError({ code: null, stderr: '', args: ['pr', 'checks'], timedOut: true }); };
+  await assert.rejects(run(timedOut, { expectHead: A }), (err) => err instanceof GhError && err.timedOut === true);
+});
+
+test('only the recognised "no checks reported" answer falls through to the next source', async () => {
+  const w = world({ behind: [1, 0] });
+  const asked = [];
+  w.gh.checks = (pr, { required }) => {
+    asked.push(required);
+    if (required) throw new GhError({ code: 1, stderr: "no required checks reported on the 'main' branch", args: ['pr', 'checks'] });
+    return [{ name: 'ci', bucket: 'pass' }];
+  };
+  const r = await run(w, { expectHead: A });
+  assert.equal(r.outcome, 'up-to-date');
+  assert.ok(asked.includes(true) && asked.includes(false));
+});
+
+test('the new head is bound to [pinned head, captured base]: an external push before the first post-update read is head-moved, with no second PUT', async () => {
+  const w = world({ behind: [1, 1, 1], race: true });
+  const r = await run(w, { expectHead: A });
+  assert.equal(r.outcome, 'head-moved');
+  assert.equal(r.head, sha('7'));
+  assert.equal(w.updates.length, 1, 'never update (or adopt) a head GitHub did not create');
+  assert.equal(w.checkReads, 0);
+});
+
+test('a successor whose parents are not exactly [pinned head, captured base] is head-moved', async () => {
+  for (const [label, parentsOf] of [
+    ['one parent', (head) => [head]],
+    ['swapped parents', (head, base) => [base, head]],
+    ['another base', (head) => [head, sha('1')]],
+    ['a third parent', (head, base) => [head, base, sha('2')]],
+    ['unrelated parents', () => [sha('3'), sha('4')]],
+  ]) {
+    const w = world({ behind: [1, 1], parentsOf });
+    const r = await run(w, { expectHead: A });
+    assert.equal(r.outcome, 'head-moved', label);
+    assert.equal(w.updates.length, 1, label);
+  }
+});
+
 test('updateTiming only shortens the waits', () => {
   const dflt = updateTiming({});
   assert.deepEqual(updateTiming({ PIPELINE_UPDATE_WAIT_MS: '5', PIPELINE_UPDATE_POLL_MS: '1' }), { headWaitMs: 5, checksWaitMs: 5, pollMs: 1 });
@@ -225,7 +291,7 @@ test('updateBranch: the two 422s are answers, told apart by message', () => {
   assert.equal(moved.gh.updateBranch(12, A).result, 'head-moved');
 });
 
-test('updateBranch: an unrecognised 422, a 403, a 5xx and a hung gh all throw (never read as success)', () => {
+test('updateBranch: an unrecognised 422, a 403 and a 5xx all throw (never read as success)', () => {
   for (const reply of [
     { code: 1, stderr: 'gh: something else (HTTP 422)', stdoutJson: { message: 'something else', status: '422' } },
     { code: 1, stderr: 'gh: Forbidden (HTTP 403)', stdoutJson: { message: 'Forbidden', status: '403' } },
@@ -236,12 +302,28 @@ test('updateBranch: an unrecognised 422, a 403, a 5xx and a hung gh all throw (n
   }
 });
 
+test('updateBranch / compare / commitParents / checks: a gh call that times out throws GhError (never read as success or as a conflict)', () => {
+  const hung = createGitHub({ cwd: process.cwd(), env: {}, ghFn: (args) => (args[0] === 'repo' ? { code: 0, stdout: JSON.stringify(REPO_VIEW), stderr: '' } : { code: null, stdout: '', stderr: '', timedOut: true }) });
+  for (const call of [() => hung.updateBranch(12, A), () => hung.compare('main', A), () => hung.commitParents(A), () => hung.checks(12)]) {
+    assert.throws(call, (err) => err instanceof GhError && err.timedOut === true);
+  }
+});
+
+test('commitParents: reads the parent SHAs of a commit; a malformed reply fails closed', () => {
+  const { gh } = mk([{ match: `commits/${B} --jq`, stdoutJson: [A, BASE_SHA] }]);
+  assert.deepEqual(gh.commitParents(B), [A, BASE_SHA]);
+  const bad = mk([{ match: 'commits/', stdoutJson: { parents: [] } }]);
+  assert.throws(() => bad.gh.commitParents(B), GhError);
+});
+
 test('compare: reads behind_by from GitHub for base...head', () => {
-  const { fake, gh } = mk([{ match: 'compare/main\\.\\.\\.', stdoutJson: { status: 'diverged', behind_by: 3, ahead_by: 2 } }]);
-  assert.deepEqual(gh.compare('main', A), { status: 'diverged', behindBy: 3, aheadBy: 2 });
+  const { fake, gh } = mk([{ match: 'compare/main\\.\\.\\.', stdoutJson: { status: 'diverged', behind_by: 3, ahead_by: 2, base: BASE_SHA } }]);
+  assert.deepEqual(gh.compare('main', A), { status: 'diverged', behindBy: 3, aheadBy: 2, baseSha: BASE_SHA });
   assert.match(fake.lines().find((l) => l.includes('compare')), new RegExp(`repos/acme/widgets/compare/main\\.\\.\\.${A}`));
   const bad = mk([{ match: 'compare/', stdoutJson: { status: 'ahead' } }]);
   assert.throws(() => bad.gh.compare('main', A), GhError, 'a reply without counts fails closed');
+  const noBase = mk([{ match: 'compare/', stdoutJson: { status: 'ahead', behind_by: 1, ahead_by: 1 } }]);
+  assert.throws(() => noBase.gh.compare('main', A), GhError, 'a reply without the base tip fails closed');
 });
 
 // ---- the command --------------------------------------------------------------------------------------------------------
@@ -298,6 +380,41 @@ test('update-branch: an accepted update whose head never changes is head-timeout
   assertExit(updateCli(s, ['--max-cycles', '0']), 2);
 });
 
+// The CLI end to end: the update is accepted, the PR head becomes GitHub's merge commit [old head, base tip].
+test('update-branch: by default it only updates and returns the new head: no check is read or waited for (draft / label-gated CI cannot stall it)', () => {
+  const s = scenario({ gh: { behindBy: 2 } });
+  const newHead = 'd'.repeat(40);
+  const swap = swapOnUpdate(s, ghEntries({ prHead: newHead, behindBy: 0, commitParents: { [newHead]: [s.head, BASE_SHA] } }));
+  const r = updateCli(s, [], { PIPELINE_UPDATE_WAIT_MS: '2000', ...swap });
+  assertExit(r, 0, r.stdout);
+  assert.equal(r.json.outcome, 'up-to-date');
+  assert.equal(r.json.updated, true);
+  assert.equal(r.json.startHead, s.head);
+  assert.equal(r.json.head, newHead);
+  assert.equal(r.json.pullNeeded, true, 'the worktree must pull the new head before it is verified and gated');
+  assert.equal(puts(s).length, 1);
+  assert.deepEqual(s.fake.lines().filter((l) => l.startsWith('pr checks')), []);
+});
+
+test('update-branch --wait-checks: an unexpected check-API failure is GitHub unavailable (exit 3), not success and not checks-timeout', () => {
+  const s = scenario({ gh: { behindBy: 2 } });
+  const newHead = 'd'.repeat(40);
+  const swap = swapOnUpdate(s, ghEntries({ prHead: newHead, behindBy: 0, requiredCi: 'fail502', commitParents: { [newHead]: [s.head, BASE_SHA] } }));
+  const r = updateCli(s, ['--wait-checks'], { PIPELINE_UPDATE_WAIT_MS: '2000', ...swap });
+  assertExit(r, 3, r.stdout);
+  assert.equal(r.json.error, 'unavailable');
+});
+
+test('update-branch: an external push becoming the PR head right after the update is head-moved (exit 1), with one PUT only', () => {
+  const s = scenario({ gh: { behindBy: 2 } });
+  const external = 'e'.repeat(40);
+  const swap = swapOnUpdate(s, ghEntries({ prHead: external, behindBy: 2, commitParents: { [external]: [s.head] } }));
+  const r = updateCli(s, [], { PIPELINE_UPDATE_WAIT_MS: '2000', ...swap });
+  assertExit(r, 1, r.stdout);
+  assert.equal(r.json.outcome, 'head-moved');
+  assert.equal(puts(s).length, 1);
+});
+
 // ---- merge --------------------------------------------------------------------------------------------------------------
 
 // A gh that, once the update-branch PUT has been made, switches to the script in swap.json (the PR head is then the new one).
@@ -328,7 +445,7 @@ test('merge: main moved after the gate => the branch is updated (pinned to the a
   assertExit(s.gate(), 0);
   const newHead = 'd'.repeat(40);
   s.fake.setScript(ghEntries({ prHead: s.head, behindBy: 2 }));
-  const r = s.merge({ PIPELINE_UPDATE_WAIT_MS: '2000', PIPELINE_UPDATE_POLL_MS: '1', ...swapOnUpdate(s, ghEntries({ prHead: newHead, behindBy: 0 })) });
+  const r = s.merge({ PIPELINE_UPDATE_WAIT_MS: '2000', PIPELINE_UPDATE_POLL_MS: '1', ...swapOnUpdate(s, ghEntries({ prHead: newHead, behindBy: 0, commitParents: { [newHead]: [s.head, BASE_SHA] } })) });
   assertExit(r, 1, r.stdout);
   assert.equal(r.json.error, 'behind-base');
   assert.equal(r.json.updated, true);
@@ -356,7 +473,7 @@ test('merge: the update step is bounded to one cycle (a head that is still behin
   assertExit(s.gate(), 0);
   s.fake.setScript(ghEntries({ prHead: s.head, behindBy: 1 }));
   const newHead = 'e'.repeat(40);
-  const r = s.merge({ PIPELINE_UPDATE_WAIT_MS: '2000', PIPELINE_UPDATE_POLL_MS: '1', ...swapOnUpdate(s, ghEntries({ prHead: newHead, behindBy: 1 })) });
+  const r = s.merge({ PIPELINE_UPDATE_WAIT_MS: '2000', PIPELINE_UPDATE_POLL_MS: '1', ...swapOnUpdate(s, ghEntries({ prHead: newHead, behindBy: 1, commitParents: { [newHead]: [s.head, BASE_SHA] } })) });
   assertExit(r, 1, r.stdout);
   assert.equal(r.json.error, 'behind-base');
   assert.equal(r.json.outcome, 'cycle-cap');
