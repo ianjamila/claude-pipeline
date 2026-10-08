@@ -144,8 +144,17 @@ Details and every exit code: `reference/gates-and-exits.md`.
    `P hardstops … > .review/hardstops.json` and `P integrity`, as in Step 3.2. A new hard-stop
    hit ⇒ Step 3.5. Then `P agent-log stage --pr N` (commits this run's log line + queued lines into
    the PR branch) and `git push origin agent/<slug>`.
-2. Behind the base? `git fetch origin <default_branch>`; if `git rev-list --count
-   HEAD..origin/<default_branch>` is not 0: `gh pr update-branch N`, then `git pull --ff-only`.
+2. Up to date with the base — docs-only and light-lane PRs too, so the gate (and the CI it waits on)
+   judges the tree that will land: `P job start update -- node ~/.claude/pipeline/bin/pipeline.mjs
+   update-branch --pr N` → `P job wait update --run-id <runId> --timeout 540` (repeat until `done`).
+   It asks GitHub to merge the base into the PR branch only when the base tip is not part of the PR
+   head (pinned to the head you just pushed; never a force push), waits for the new head's required
+   checks, and repeats at most 3 times if the base keeps moving. Read `exitCode` and the JSON in
+   `tail`: 0 `up-to-date` ⇒ if `pullNeeded`, `git pull --ff-only` (the gate now names `head`; 5.3 onward
+   re-verifies it). 1 `rebase-needed` (the update conflicts) or `cycle-cap` ⇒ `needs-human` + summary,
+   stop. 1 `head-moved` (someone pushed since you verified; nothing was updated) ⇒ `git fetch`, look at
+   what landed, back to 5.1. 1 `checks-failed` / `checks-timeout` / `head-timeout` ⇒ as a failing CI on
+   that head (fix the cause, or `needs-human`). 1 `not-open` ⇒ stop. 3 ⇒ GitHub unavailable: retry once.
 3. Verifier: fresh `verify.full` on the current head (must be clean, full mode). Then
    `P state outcome`: if `coverageValid` is `false` the PR content changed since the last clean
    review round (an update-branch, a late fix) ⇒ go back to Step 4 for a new round, then return here.
@@ -165,7 +174,7 @@ Details and every exit code: `reference/gates-and-exits.md`.
    (UI-text changes: add `--expect-text "<new text>"`) → `P job wait smoke …`; read `exitCode`.
 7. `P final-gate --pr N`. Any failed check ⇒ fix the cause (a new commit ⇒ back to 5.1; PR
    content changed ⇒ Step 4 too) or, if it isn't fixable by you, `needs-human` + summary + stop.
-   `behind-base:` in the `pr-open` detail ⇒ Step 5.2, then 5.3 onward.
+   `behind-base:` in the `pr-open` detail (main moved since 5.2) ⇒ Step 5.2, then 5.3 onward.
 
 ## Step 6 — merge and production
 
@@ -173,10 +182,11 @@ Details and every exit code: `reference/gates-and-exits.md`.
    merge --run-id <runId> --timeout 540`; read `exitCode` and the JSON in `tail`:
    - 0 ⇒ merged. `mergeSha` is the merge commit; `null` (with a `warning`) means GitHub did not
      name it yet: still run prod-watch, with `--pr N` alone (2 below). Never skip prod-watch.
-   - 1 ⇒ NOT merged. `error: gate | live-check | pre-merge`, or a `reason` (merge command failed,
+   - 1 ⇒ NOT merged. `error: gate | behind-base | live-check | pre-merge`, or a `reason` (merge command failed,
      not merged in time, PR closed, blocker appeared): act per `reference/gates-and-exits.md`.
-     "Update the branch" cases (`behind-base:`, the base moved) ⇒ back to Step 5.2, re-verify, a new
-     review round if content changed; max 2 such returns, then `needs-human`.
+     "Update the branch" cases (`error: behind-base` — merge already updated the branch itself, or could not
+     (`outcome`: `rebase-needed` ⇒ `needs-human`) — or `behind-base:` in a live check) ⇒ back to Step 5.2,
+     re-verify, a new review round if content changed; max 2 such returns, then `needs-human`.
    - 3 ⇒ `error: production-unknown` (no known-good production deployment recorded) or GitHub
      unavailable: nothing merged; wait a minute and retry once, then stop and tell the user.
 2. Merged ⇒ `P job start prod -- node ~/.claude/pipeline/bin/pipeline.mjs prod-watch --sha
@@ -225,7 +235,7 @@ read the issue, link it in the PR body (`Closes #123`).
 | `P arbiter apply` proof fails | items → `needs-human` (the CLI marks them), stop after summary |
 | `triage validate` / `arbiter apply` exit 2 `not-found` | transcript not written yet: wait ~10 s, retry once, then `needs-human` |
 | final gate fails, can't fix | `needs-human`, stop |
-| `behind-base:` / base moved | `gh pr update-branch N`, re-verify, new round if content changed (max 2 times, then `needs-human`) |
+| `behind-base:` / base moved | `P update-branch --pr N` (Step 5.2), re-verify, new round if content changed (max 2 times, then `needs-human`); `rebase-needed` ⇒ `needs-human` |
 | merge exit 3 `production-unknown` | nothing merged; tell the user, stop |
 | prod smoke fails | prod-watch handles rollback + issue + revert PR; tell the user |
 | pause/rollback issue open | PR stays open, explain |

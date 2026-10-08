@@ -162,8 +162,9 @@ All subcommands print one JSON object to stdout (human text to stderr), and use 
 | `prod-watch --sha MERGE_SHA [--expect-text T]` | Wait for Production deployment success for the merge SHA → production smoke → on failure: `vercel rollback <known-good> --yes --timeout 3m` (run by prod-watch itself, not `production.rollback.command`), issue `pipeline-rollback` with evidence, revert PR (needs-human). |
 | `summary --pr N --outcome merged\|blocked\|needs-human\|reverted\|awaiting-review` | Render §10 summary → upsert comment `<!-- claude-pipeline:summary -->`; print the agent-log line. |
 | `agent-log --line "…"` | Commit the line to `docs/agent-log.md` via a docs-only branch + PR (§10.3). |
+| `update-branch --pr N [--expect-head SHA] [--max-cycles N]` | If the base tip is not an ancestor of the PR head, `PUT pulls/{n}/update-branch` with `expected_head_sha` (no local push, never a force push), wait for the new head's required checks, re-check; at most 3 cycles. Outcomes: `up-to-date`, `rebase-needed` (conflict ⇒ needs-human), `head-moved` (the head is not the verified one, or GitHub refused the pin: stop, re-read), `cycle-cap`, `checks-failed`/`checks-timeout`/`head-timeout`, `not-open`. |
 | `final-gate --pr N` | Assert: fresh full verify report bound to PR head SHA & tree, no blocking labels, no open pause/rollback issue, hard-stop recheck clean, review state exit-clean. Writes `.review/final-gate.json`. |
-| `merge --pr N` | Requires a passing `final-gate.json` for the current head SHA; runs `merge.command`. The only sanctioned agent merge path. |
+| `merge --pr N` | Requires a passing `final-gate.json` for the current head SHA; if the base moved since, updates the branch once (as `update-branch`) and refuses `behind-base` so the new head is verified and gated; runs `merge.command`. The only sanctioned agent merge path. |
 
 ### 5.3 Skills
 
@@ -404,7 +405,7 @@ agents never apply migrations to production; hard-stop PRs wait for the owner's
    hard-stops (if any). Hard-stop → label `needs-human`, one-paragraph summary comment, stop
    (no review loop spend unless the owner asks).
 5. **Review loop** — §7.2.
-6. **Final gate** — verifier runs a **fresh full verify** on the final head; `pipeline risk` +
+6. **Final gate** — first `pipeline update-branch` (docs-only and light-lane PRs too) so the gate and the CI it waits on judge the tree that will land and the head pin names the up-to-date head; verifier runs a **fresh full verify** on the final head; `pipeline risk` +
    hard-stop recheck on the final diff; high risk → apply `ci.e2e_label`; mark ready; wait for
    CI green on the head SHA (project merge command does this for EagleWatch); preview URL for
    the head SHA → preview smoke; `pipeline final-gate`; then `pipeline merge`
@@ -578,6 +579,7 @@ Afterwards: close all test PRs/issues, delete branches; proof 1's change reverte
 | Test weakening blocked | ✅ via required `Test integrity` | ✅ | ✅ label guard | |
 | Linear history / squash | ✅ | | | ✅ |
 | Fresh full verify bound to head | | | | ✅ final-gate |
+| Gate judges the tree that will land (branch up to date with main) | | | ✅ update-branch stays allowed, merge through the API denied | ✅ update-branch, final-gate, merge |
 | Cross-model review happened | | | | ✅ (no review ⇒ no merge) |
 | Arbiter really Fable | | | | ✅ model-proof |
 | Pause switch | | | ✅ cannot close pause issue | ✅ |
