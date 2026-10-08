@@ -811,14 +811,12 @@ function checkScriptFile(sf, dir, ctx, level) {
 // The parser drops compound-command keywords but leaves them at the start of the command's raw text (`while ! gh …`,
 // `do sleep 30`, `then git push`); `for` / `case` / `select` stay as the command name.
 const FLOW_START = /^\s*(?:if|then|elif|else|while|until|for|do|case|select)(?=[\s;&|(){]|$)/;
-// A ( subshell is NOT marked by the parser (depth stays 0), so it is found in the text — with quoted strings removed,
-// so prose in a commit message (`-m "fix (again)"`) does not count.
-const SUBSHELL_PAREN = /(?:^|[\s;&|])\(/;
-const unquoted = (str) => str.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, '""');
 // Index of the first command that may run conditionally or repeatedly because of control flow; every command from
-// there on is treated that way (conservative after the loop / if ends). -1: none. 0: the whole line (a subshell).
-function flowStart(cmds, str) {
-  if (SUBSHELL_PAREN.test(unquoted(str))) return 0;
+// there on is treated that way (conservative after the loop / if ends). -1: none. 0: the whole line: a ( subshell, which
+// the parser reports (it reads quotes, escapes, $'…' and heredocs like a shell, so prose such as `-m "fix (again)"` does
+// not count), or a parse cut short, where a subshell may have gone unseen.
+function flowStart(cmds) {
+  if (cmds.subshell || cmds.truncated) return 0;
   return cmds.findIndex((c) => FLOW_START.test(c.raw ?? '') || ['for', 'case', 'select'].includes(c.argv[0]));
 }
 const inFlow = (from, i) => from >= 0 && i >= from;
@@ -830,10 +828,10 @@ const STATE_GIT = new Set(['checkout', 'switch', 'branch', 'rebase', 'symbolic-r
 
 // Collects every assignment on the line BEFORE any command is judged. A name assigned more than once, or assigned
 // where it may not run (after && / ||, in a pipeline, a subshell, an if / loop / case), is unsure for the whole line.
-function collectAssignments(cmds, str, ctx) {
+function collectAssignments(cmds, ctx) {
   const counts = new Map();
   const bump = (k, n) => counts.set(k, (counts.get(k) ?? (k in ctx.vars || ctx.unsureVars.has(k) ? 1 : 0)) + n);
-  const from = flowStart(cmds, str);
+  const from = flowStart(cmds);
   for (const [i, c] of cmds.entries()) {
     const n = inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) ? 2 : 1;
     // builtins that bind a variable without a NAME=value word: its value is whatever was read / parsed at run time
@@ -942,13 +940,13 @@ function evalString(str, startDir, ctx, level) {
   }
   // A variable whose value is not certain (see collectAssignments) denies the line when it reaches git / gh, a command
   // that runs code, cd / pushd / popd or a command name: the checks below read the expanded text.
-  collectAssignments(cmds, str, ctx);
+  collectAssignments(cmds, ctx);
   if (ctx.unsureVars.size) {
     const unsure = unsureVarReachingCommand(cmds, ctx);
     if (unsure !== null) return deny(`$${unsure} is assigned more than once (or where it may not run) on this line, so its value at run time cannot be verified. Assign it once, unconditionally.`);
   }
   let dir = startDir;
-  const from = flowStart(cmds, str);
+  const from = flowStart(cmds);
   let uncertain = false; // an earlier cd / branch change may not have taken effect for the commands that follow
   const forgetState = () => { dir = null; for (const e of ctx.branches.values()) e.name = null; };
   // sticky: a later `cd /abs` does not make it known again (`alias cd=true; cd /safe`, a DEBUG trap that cds back)

@@ -4,6 +4,8 @@
 // and recurses into every place a shell would execute text. Best effort, never throws; when a safety cap
 // cuts parsing short the returned array carries a non-enumerable `truncated: true`, and when the command that
 // runs is only known at run time (`bash -c "$X"`, `$g push`, `curl … | sh`) it carries `dynamic: true`, so callers can fail closed.
+// It carries `subshell: true` when the line opens a ( subshell at the top level (its commands keep depth 0, so they look
+// like they run in this shell; what they assign or cd is lost).
 // Each command is {argv, env, raw, depth, redirects}; redirections are stripped from argv but recorded in `redirects`.
 
 const MAX_COMMANDS = 500;
@@ -955,6 +957,7 @@ class Parser {
           endSeg(this.i);
           lastSep = ';';
           this.i++;
+          if (depth === 0) this.ctx.subshell = true; // ((...)) arithmetic too: conservative
           const mark0 = this.log.length;
           this.nestParse(depth, { stopAtParen: true, noRedir: noRedir || s[this.i] === '(' }); // ((...)) is arithmetic
           this.lastStage = this.log.slice(mark0);
@@ -1215,7 +1218,7 @@ class Parser {
 
 export function simpleCommands(str, opts) {
   const requested = Number.isFinite(opts?.maxDepth) ? Math.trunc(opts.maxDepth) : 5;
-  const ctx = { out: [], maxDepth: Math.min(Math.max(requested, 0), HARD_MAX_DEPTH), truncated: false, dynamic: false, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0 };
+  const ctx = { out: [], maxDepth: Math.min(Math.max(requested, 0), HARD_MAX_DEPTH), truncated: false, dynamic: false, subshell: false, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0 };
   let parser = null;
   try {
     parser = new Parser(ctx, String(str ?? ''));
@@ -1226,6 +1229,7 @@ export function simpleCommands(str, opts) {
   }
   Object.defineProperty(ctx.out, 'truncated', { value: ctx.truncated, enumerable: false });
   Object.defineProperty(ctx.out, 'dynamic', { value: ctx.dynamic, enumerable: false });
+  Object.defineProperty(ctx.out, 'subshell', { value: ctx.subshell, enumerable: false });
   return ctx.out;
 }
 

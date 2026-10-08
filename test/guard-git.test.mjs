@@ -1679,3 +1679,35 @@ test('state that becomes unknown mid-line stays enforced; control flow counts fr
   ];
   for (const c of allowCmds) assert.equal(evaluate(c, o).decision, 'allow', c);
 });
+
+// Scan finding on ce847fb: the ( subshell check stripped quoted strings with a regex that did not read quotes the way a
+// shell does, so an escaped quote or a $'…' string paired with a later quote and hid a real subshell. The parser now
+// reports the subshell itself. The cd inside ( ) does not change the directory the script runs in.
+test('a ( subshell hidden behind escaped quotes or a $\'…\' string is still found', () => {
+  const files = {
+    '/work/repo/step.sh': 'echo hi\n',
+    '/other/step.sh': 'git push origin main\n',
+  };
+  const o = {
+    byDir: { '/work/repo': 'agent/x', '/other': 'agent/y' },
+    labelsByNum: {},
+    readText: (p) => files[p] ?? null,
+    pathExists: (p) => p in files,
+    cwd: '/other',
+  };
+  const denyCmds = [
+    'echo \\"; (cd /work/repo); bash step.sh; echo "x"',
+    "echo \\'; (cd /work/repo); bash step.sh; echo 'x'",
+    "echo $'it\\'s'; (cd /work/repo); bash step.sh; echo 'x'",
+    'echo a\\"b; (cd /work/repo); bash step.sh; echo "c"',
+    'echo \\" ;(cd /work/repo) ;bash step.sh ;echo "x"',
+  ];
+  for (const c of denyCmds) assert.equal(evaluate(c, o).decision, 'deny', c);
+  const allowCmds = [
+    'cd /work/repo && bash step.sh',
+    'echo "a \\" (b)"; cd /work/repo && bash step.sh',
+    "git commit -m $'fix (again)\\n'; cd /work/repo && bash step.sh",
+    "echo $'it\\'s (fine)'; cd /work/repo && bash step.sh",
+  ];
+  for (const c of allowCmds) assert.equal(evaluate(c, o).decision, 'allow', c);
+});
