@@ -125,14 +125,26 @@ const recordVars = (env, ctx) => { for (const k of Object.keys(env)) setVar(ctx,
 // Anything that inspects WHICH variables are set (not their values) must use this, never Object.keys(ctx.vars) alone.
 const assignedNames = (ctx) => [...Object.keys(ctx.vars), ...ctx.unsureVars];
 
-// The value a variable has for the command being judged: this command's own prefix (`NAME=v git …`, `env NAME=v git …`),
-// else an earlier assignment or export on the line. `known: false` when it was assigned twice (which value applies
-// depends on control flow); `value` is undefined when it is not set at all.
+// A variable that selects the repository (GIT_DIR, GH_REPO). Only this command's own prefix (`NAME=v git …`,
+// `env NAME=v git …`) is certain to reach it. An assignment or export earlier on the line may never run
+// (`false && export GIT_DIR=…`), may not be exported at all, or may be overridden by control flow the parser does not
+// model, so the value is unknown (`known: false`) and the caller must fail closed. `value` is undefined when unset.
 function envVar(env, ctx, name) {
   if (Object.hasOwn(env, name)) return { known: true, value: env[name] };
-  if (name in ctx.vars) return { known: true, value: ctx.vars[name] };
-  if (ctx.unsureVars.has(name)) return { known: false, value: undefined };
+  if (name in ctx.vars || ctx.unsureVars.has(name)) return { known: false, value: undefined };
   return { known: true, value: undefined };
+}
+
+// Expansion leaves `$NAME` in place for a variable assigned more than once (which assignment ran is unknown). A
+// protected argument (API endpoint, label, issue number, branch, directory) written with one cannot be checked, and
+// every pattern below matches the expanded text, so the whole git / gh command fails closed instead.
+const VAR_REF = /\$(?:\{([A-Za-z_][A-Za-z0-9_]*)|([A-Za-z_][A-Za-z0-9_]*))/g;
+function unsureVarUsed(words, ctx) {
+  if (ctx.unsureVars.size === 0) return null;
+  for (const w of words) {
+    for (const m of String(w).matchAll(VAR_REF)) if (ctx.unsureVars.has(m[1] ?? m[2])) return m[1] ?? m[2];
+  }
+  return null;
 }
 
 // Resolves `target` against `dir`. Returns null when the result cannot be known statically ($VAR, $(..), `cd -`).
@@ -168,6 +180,7 @@ function branchOf(dir, gitDir, ctx) {
 // later bare/HEAD push acts on. `name === null` records "switched to something we cannot name".
 function setBranch(ctx, dir, name, trackMain = false) {
   if (dir === null) return;
+  if (name !== null && DYNAMIC.test(name)) name = null; // still holds `$B` / `$(…)` after expansion: unknown, not a name
   ctx.branches.set(dir, { name: name === null ? null : stripHeads(name), trackMain });
 }
 
@@ -812,8 +825,11 @@ function evalString(str, startDir, ctx, level) {
         if (m) setVar(ctx, m[1], m[2]);
       }
     } else if (name === 'cd' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name, argv, ctx);
-    else if (name === 'git') verdict = checkGit(argv, c.env, dir, ctx, c.raw ?? '');
-    else if (name === 'gh') verdict = checkGh(argv, c.env, dir, ctx, c.raw ?? '');
+    else if (name === 'git' || name === 'gh') {
+      const unsure = unsureVarUsed([...argv.slice(1), ...Object.values(c.env)], ctx);
+      if (unsure !== null) verdict = deny(`$${unsure} was assigned more than once on this line, so its value (and what this ${name} command does with it) cannot be verified. Assign it once, or write the value out.`);
+      else verdict = name === 'git' ? checkGit(argv, c.env, dir, ctx, c.raw ?? '') : checkGh(argv, c.env, dir, ctx, c.raw ?? '');
+    }
     else {
       for (const inner of jobStartCommands(argv, ctx.vars) ?? []) {
         const v = evalString(inner, dir, ctx, level + 1);

@@ -1205,28 +1205,96 @@ test('a git subcommand built from a variable never reaches the push / alias / tr
   for (const c of denyCmds) assert.equal(evaluate(c, { branch: 'agent/x' }).decision, 'deny', c);
 });
 
-// Siblings of findings 1 and 2: GIT_DIR and GH_REPO were read from the command's own prefix only, so an earlier
-// assignment or export (once or twice) never reached them.
-test('GIT_DIR and GH_REPO set earlier on the line are honoured, and unknown ones fail closed', () => {
-  let v = evaluate('export GIT_DIR=/e/.git; git push');
-  assert.equal(v.calls.branchDirs[0].gitDir, resolve('/e/.git'));
-  v = evaluate('GIT_DIR=/e/.git; git push');
-  assert.equal(v.calls.branchDirs[0].gitDir, resolve('/e/.git'));
-  assert.equal(evaluate('GIT_DIR=/a/.git; GIT_DIR=/b/.git; git push', { branch: 'agent/x' }).decision, 'deny');
-  assert.equal(evaluate('export GIT_DIR=/a/.git; false && export GIT_DIR=/b/.git; git push', { branch: 'agent/x' }).decision, 'deny');
-  assert.equal(evaluate('GIT_DIR=/a/.git; GIT_DIR=/b/.git; git send-pack', { branch: 'agent/x' }).decision, 'deny');
-  // a prefix on the command itself wins over the earlier assignment
-  v = evaluate('GIT_DIR=/a/.git; GIT_DIR=/b/.git git push');
+// Siblings of findings 1 and 2: GIT_DIR and GH_REPO select the repository. Only the command's own prefix
+// (`GIT_DIR=x git push`) is certain to reach it; an earlier assignment or export may never run (`false && export …`) or
+// may not be exported at all, so the repository is unknown and the protected operation is denied.
+test('GIT_DIR and GH_REPO set before the command are unknown; only a command prefix or an explicit flag is trusted', () => {
+  const gitDeny = [
+    'export GIT_DIR=/e/.git; git push',
+    'GIT_DIR=/e/.git; git push',
+    'false && export GIT_DIR=/safe/.git; git push',
+    'GIT_DIR=/a/.git; GIT_DIR=/b/.git; git push',
+    'export GIT_DIR=/a/.git; false && export GIT_DIR=/b/.git; git push',
+    'GIT_DIR=/a/.git; GIT_DIR=/b/.git; git send-pack',
+    'export GIT_DIR=/e/.git; git branch -m x',
+    'false && export GIT_DIR=/safe/.git; git -c alias.p=push p',
+  ];
+  for (const c of gitDeny) assert.equal(evaluate(c, { branch: 'agent/x' }).decision, 'deny', c);
+  // a prefix on the command itself, or an explicit flag, is certain
+  let v = evaluate('GIT_DIR=/a/.git; GIT_DIR=/b/.git git push');
   assert.equal(v.calls.branchDirs[0].gitDir, resolve('/b/.git'));
+  v = evaluate('false && export GIT_DIR=/safe/.git; git --git-dir=/real/.git push');
+  assert.equal(v.calls.branchDirs[0].gitDir, resolve('/real/.git'));
+  assert.equal(evaluate('export GIT_DIR=/e/.git; git status').decision, 'allow');
 
-  v = evaluate('export GH_REPO=o/r; gh issue close 9', { labels: [] });
+  const ghDeny = [
+    'export GH_REPO=o/r; gh issue close 9',
+    'GH_REPO=o/r; gh issue close 9',
+    'false && export GH_REPO=o/safe; gh issue close 9',
+    'GH_REPO=o/r; GH_REPO=p/q; gh issue close 9',
+    'export GH_REPO=o/r; false && export GH_REPO=p/q; gh issue close 9',
+    'false && export GH_REPO=o/safe; gh issue delete 9',
+    'false && export GH_REPO=o/safe; gh issue transfer 9 o/other',
+  ];
+  for (const c of ghDeny) assert.equal(evaluate(c, { labels: [] }).decision, 'deny', c);
+  v = evaluate('GH_REPO=o/r gh issue close 9', { labels: [] });
   assert.deepEqual(v.calls.labels[0].repoArgs, ['-R', 'o/r']);
-  v = evaluate('GH_REPO=o/r; gh issue close 9', { labels: [] });
-  assert.deepEqual(v.calls.labels[0].repoArgs, ['-R', 'o/r']);
-  assert.equal(evaluate('GH_REPO=o/r; GH_REPO=p/q; gh issue close 9', { labels: [] }).decision, 'deny');
-  assert.equal(evaluate('export GH_REPO=o/r; false && export GH_REPO=p/q; gh issue close 9', { labels: [] }).decision, 'deny');
+  v = evaluate('false && export GH_REPO=o/safe; gh issue close 9 -R o/real', { labels: [] });
+  assert.deepEqual(v.calls.labels[0].repoArgs, ['-R', 'o/real']);
   // other gh commands do not look at the repository, so the same variable is harmless there
   assert.equal(evaluate('GH_REPO=o/r; GH_REPO=p/q; gh pr view 9').decision, 'allow');
+});
+
+// Codex round on PR #7: a variable assigned twice is dropped from the known values, so its $NAME text survives expansion.
+// That must never be recorded as a branch name, nor slip past a pattern that only matches the expanded text.
+test('an unresolved expansion is unknown branch state, never a branch name', () => {
+  const denyCmds = [
+    'B=agent/x; B=main; git switch -C "$B"; git push origin HEAD',
+    'B=agent/x; B=main; git checkout -b "$B"; git push',
+    'B=agent/x; B=main; git checkout -B $B; git push origin HEAD',
+    'B=agent/x; B=main; git branch -m "$B"; git push',
+    'B=agent/x; B=main; git worktree add -b "$B" ../w; git -C ../w push',
+    'B=agent/x; B=main; git worktree add ../w "$B"; git -C ../w push',
+    'B=agent/x; B=main; git rebase origin/x "$B"; git push',
+    'B=agent/x; B=main; git symbolic-ref HEAD "refs/heads/$B"; git push',
+    // never assigned at all: still run-time, still unknown
+    'git switch -C "$NEW"; git push origin HEAD',
+    'git checkout -b "$NEW"; git push',
+    'git branch -m "$NEW"; git push',
+  ];
+  for (const c of denyCmds) assert.equal(evaluate(c, { branch: 'agent/x' }).decision, 'deny', c);
+  assert.equal(evaluate('B=agent/y; git switch -C "$B"; git push origin HEAD', { branch: 'main' }).decision, 'allow');
+});
+
+test('a protected argument built from a variable assigned twice fails closed', () => {
+  const denyCmds = [
+    'E=unused; E=repos/o/r/pulls/5/merge; gh api -X PUT "$E"',
+    'E=unused; E=repos/o/r/pulls/5/merge; gh api "$E" -X PUT',
+    'E=unused; E=repos/o/r/statuses/abc; gh api -X POST "$E" -f state=success',
+    'E=unused; E=repos/o/r/git/refs; gh api -X POST "$E" -f ref=refs/heads/main',
+    'E=unused; E=repos/o/r/issues/3/labels/needs-human; gh api -X DELETE "$E"',
+    'E=unused; E=repos/o/r/rulesets/1; gh api -X DELETE "$E"',
+    'M=GET; M=DELETE; gh api -X "$M" repos/o/r/issues/3/labels/needs-human',
+    'F=x; F=branch=main; gh api -X PUT repos/o/r/contents/f -f message=m -f content=eA== -f "$F"',
+    'L=unused; L=human-approved; gh label delete "$L" --yes',
+    'L=unused; L=human-approved; gh label edit "$L" --name x',
+    'L=unused; L=human-approved; gh pr edit 1 --add-label "$L"',
+    'L=unused; L=needs-human; gh issue edit 1 --remove-label "$L"',
+    'N=1; N=7; gh issue close "$N"',
+    'N=1; N=7; gh pr merge "$N" --admin',
+    'R=o/a; R=o/b; gh issue close 9 -R "$R"',
+    'T=x; T=main; gh repo edit --default-branch "$T"',
+    'B=x; B=main; git push origin "$B"',
+    'B=x; B=main; git push origin HEAD:"$B"',
+    'B=x; B=main; git push origin HEAD:refs/heads/${B}',
+    'D=/a; D=/b; git -C "$D" push',
+    'P=x; P=main; bash -c "git push origin $P"',
+    'P=x; P=main; node ~/.claude/pipeline/bin/pipeline.mjs job start j -- git push origin $P',
+  ];
+  for (const c of denyCmds) assert.equal(evaluate(c, { branch: 'agent/x', labels: [] }).decision, 'deny', c);
+  // a run-time value that was never assigned on the line is still fine in a non-protected position
+  assert.equal(evaluate('gh pr view $N --json title').decision, 'allow');
+  assert.equal(evaluate('A=1; A=2; echo $A; git status').decision, 'allow');
 });
 
 // ---- script files and string-running wrappers (review findings 2 and 11) ------------------------------------
