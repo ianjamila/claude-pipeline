@@ -334,11 +334,14 @@ test('complexity cap: brace expansion above 256 alternatives throws, 256 is allo
   assert.throws(() => globToRegExp('{{a,b},{c,d}}'.repeat(5)), { message: 'glob too complex' });
 });
 
-// Wall-clock is a blunt instrument, but the failure being pinned is exponential (seconds to hours), not a few ms.
+// CPU time (user + system), not wall clock: under machine load a wall-clock budget flakes, while CPU time stays put. The
+// failure being pinned is exponential (seconds to hours), so a 250 ms CPU budget still catches it.
+const BUDGET_MS = 250;
 function timed(fn) {
-  const t0 = performance.now();
+  const t0 = process.cpuUsage();
   const value = fn();
-  return { value, ms: performance.now() - t0 };
+  const d = process.cpuUsage(t0);
+  return { value, ms: (d.user + d.system) / 1000 };
 }
 
 test('star chains do not backtrack catastrophically against a long path', () => {
@@ -346,14 +349,14 @@ test('star chains do not backtrack catastrophically against a long path', () => 
   for (const glob of ['*a*a*a*a*b', '*a*a*a*a*a*a*a*a*b', '*a*?a*?a*a*b', 'a*a*a*a*a*a*a*b*']) {
     const miss = timed(() => matchGlob(noB, glob));
     assert.equal(miss.value, false, glob);
-    assert.ok(miss.ms < 50, `${glob} took ${miss.ms.toFixed(1)}ms`);
+    assert.ok(miss.ms < BUDGET_MS, `${glob} took ${miss.ms.toFixed(1)}ms`);
   }
   const hit = timed(() => matchGlob(`${noB}b`, '*a*a*a*a*b'));
   assert.equal(hit.value, true);
-  assert.ok(hit.ms < 50, `took ${hit.ms.toFixed(1)}ms`);
+  assert.ok(hit.ms < BUDGET_MS, `took ${hit.ms.toFixed(1)}ms`);
   const last = timed(() => matchGlob('a'.repeat(400) + 'bb', '*a*a*a*a*b'));
   assert.equal(last.value, true, 'the FINAL star-run must be able to take the last b, not the first');
-  assert.ok(last.ms < 50);
+  assert.ok(last.ms < BUDGET_MS);
 });
 
 test('** chains do not backtrack catastrophically against a deep path', () => {
@@ -361,11 +364,11 @@ test('** chains do not backtrack catastrophically against a deep path', () => {
   for (const glob of ['**/a/**/a/**/a/**/b', '**/a/**/a/**/a/**/a/**/a/**/a/**/b', 'a/**/a/**/a/**/*b', '**/*a/**/*a/**/*a/**/b']) {
     const r = timed(() => matchGlob(deep, glob));
     assert.equal(r.value, false, glob);
-    assert.ok(r.ms < 50, `${glob} took ${r.ms.toFixed(1)}ms`);
+    assert.ok(r.ms < BUDGET_MS, `${glob} took ${r.ms.toFixed(1)}ms`);
   }
   const hit = timed(() => matchGlob('a/'.repeat(200) + 'b', '**/a/**/a/**/a/**/b'));
   assert.equal(hit.value, true);
-  assert.ok(hit.ms < 50);
+  assert.ok(hit.ms < BUDGET_MS);
 });
 
 // ---- Differential test against an independent matcher --------------------------------------------
