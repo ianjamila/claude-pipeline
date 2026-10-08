@@ -120,6 +120,33 @@ export function diffFiles(base, head, o) {
   return parseUnifiedDiff(text);
 }
 
+// Tree modes of every change diffFiles reports, from `git diff --raw -z` with the SAME options, base and head: a 100% rename
+// has no `mode` line in the unified diff, so a symlink (120000) or submodule (160000) that merely MOVES is invisible there.
+// -> [{ oldMode, newMode, status, oldPath, newPath }] (a path is null on the side that does not exist).
+export function diffModes(base, head, o) {
+  const mb = mergeBase(base, head, o);
+  const text = git([
+    ...STABLE_CONFIG, 'diff', '-M', '--raw', '-z', '--no-abbrev', '--no-color', '--no-ext-diff', '--no-textconv',
+    `${mb}..${assertRef(head, ['diff', head])}`,
+  ], o);
+  const parts = text.split('\0');
+  const out = [];
+  for (let i = 0; i < parts.length; ) {
+    const m = /^:(\d+) (\d+) [0-9a-f]+ [0-9a-f]+ ([A-Z])\d*$/.exec(parts[i]);
+    if (!m) {
+      if (parts[i] === '') { i++; continue; }
+      throw new GitError({ args: ['diff', '--raw', '-z'], code: 0, stderr: `unexpected raw diff entry: ${parts[i]}` });
+    }
+    const two = m[3] === 'R' || m[3] === 'C';
+    const first = parts[i + 1];
+    const second = two ? parts[i + 2] : first;
+    if (first === undefined || second === undefined) throw new GitError({ args: ['diff', '--raw', '-z'], code: 0, stderr: 'truncated raw diff' });
+    out.push({ oldMode: m[1], newMode: m[2], status: m[3], oldPath: m[3] === 'A' ? null : first, newPath: m[3] === 'D' ? null : second });
+    i += two ? 3 : 2;
+  }
+  return out;
+}
+
 const MISSING_PATH = /does not exist|exists on disk, but not in/;
 
 // File content at a ref, or null when the path is not in that tree. A bad ref still throws: treating a typo'd ref as

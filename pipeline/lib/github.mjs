@@ -119,6 +119,9 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
       return login;
     },
 
+    // GET with a jq filter: the filtered stdout text (the caller parses it). Throws GhError on any failure.
+    apiText: (path, jq) => ok(['api', path, '--jq', jq]).stdout,
+
     // Not an error path: preflight reports "not authenticated" as data.
     authStatus() {
       const r = exec(['auth', 'status']);

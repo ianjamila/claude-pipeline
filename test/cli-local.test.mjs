@@ -481,8 +481,13 @@ test('job: a failing command is done with its exit code and CLI exit 1', (t) => 
 
 test('job: a job that is still running is exit 0 state running, then done', async (t) => {
   const repo = project();
-  t.after(() => repo.cleanup());
-  assertExit(cli(repo.dir, ['job', 'start', 'slow', '--', 'node', '-e', 'setTimeout(() => {}, 1500)']), 0);
+  // The job holds until the test drops a release file (or 60 s pass), not for a fixed time: under machine load each CLI
+  // call can take seconds, and a timed job could finish before the "still running" checks below.
+  const release = join(repo.dir, 'release-slow');
+  t.after(() => { writeFileSync(release, ''); repo.cleanup(); });
+  const hold = "const fs = require('fs'); const end = Date.now() + 60000; "
+    + 'const t = setInterval(() => { if (fs.existsSync(process.argv[1]) || Date.now() > end) clearInterval(t); }, 50);';
+  assertExit(cli(repo.dir, ['job', 'start', 'slow', '--', 'node', '-e', hold, release]), 0);
   const early = cli(repo.dir, ['job', 'read', 'slow']);
   assertExit(early, 0);
   assert.equal(early.json.state, 'running');
@@ -494,6 +499,7 @@ test('job: a job that is still running is exit 0 state running, then done', asyn
   assertExit(again, 1); // same name, still running
   assert.equal(again.json.ok, false);
   assert.equal(again.json.error, 'already-running');
+  writeFileSync(release, '');
   const done = cli(repo.dir, ['job', 'wait', 'slow', '--timeout', '30']);
   assertExit(done, 0);
   assert.equal(done.json.state, 'done');

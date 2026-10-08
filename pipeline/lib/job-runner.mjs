@@ -17,6 +17,14 @@ function writeJsonAtomic(file, value) {
 
 let logFd = null;
 let finished = false;
+let child = null;
+
+// Installed before anything else runs, so a signal that arrives while the command is being started is caught and
+// handled once main() returns (when child is set), never the default action that kills this runner on the spot: that
+// left no exit.json (the job read as lost) and the command running on as an orphan, the moment child.json appeared.
+for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
+  process.on(sig, () => { if (!finished && child) child.kill(sig); });
+}
 
 function note(message) {
   try {
@@ -45,7 +53,7 @@ function main() {
   // Both streams share one O_APPEND descriptor, opened before the command exists, so the output is
   // interleaved in order and a fast-failing command cannot lose a line.
   logFd = openSync(path.join(jobDir, 'log'), 'a');
-  const child = spawn(command, {
+  child = spawn(command, {
     shell: true,
     cwd: meta.cwd ?? process.cwd(),
     stdio: ['ignore', logFd, logFd],
@@ -60,10 +68,6 @@ function main() {
 
   if (child.pid) {
     writeJsonAtomic(path.join(jobDir, 'child.json'), { pid: child.pid, startedAt: new Date().toISOString() });
-  }
-
-  for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
-    process.on(sig, () => { if (!finished) child.kill(sig); });
   }
 }
 

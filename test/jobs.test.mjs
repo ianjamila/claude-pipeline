@@ -262,14 +262,46 @@ test('killing the runner and its child with SIGKILL makes the job lost', { skip:
 
 test('SIGTERM to the runner is forwarded to the command', { skip: process.platform === 'win32' }, async (t) => {
   const cwd = scratch(t);
-  const { jobDir, pid } = start('termed', node('setTimeout(()=>{},4000)'), { cwd });
-  await until(() => existsSync(join(jobDir, 'child.json')));
+  // Generous budgets: under machine load the runner can take seconds to spawn the child, and a short-lived command
+  // could exit on its own before the signal lands (exit 0, not 143). The SIGTERM ends it long before 60 s.
+  const { jobDir, pid } = start('termed', node('setTimeout(()=>{},60000)'), { cwd });
+  t.after(() => {
+    const child = existsSync(join(jobDir, 'child.json')) ? readJson(join(jobDir, 'child.json')).pid : null;
+    for (const p of [pid, child].filter(Boolean)) {
+      try { process.kill(p, 'SIGKILL'); } catch { /* already gone */ }
+    }
+  });
+  await until(() => existsSync(join(jobDir, 'child.json')), 20_000);
   process.kill(pid, 'SIGTERM');
-  const r = await waitJob('termed', { cwd, timeoutMs: 3000, ...FAST });
+  const r = await waitJob('termed', { cwd, timeoutMs: 20_000, ...FAST });
   assert.equal(r.state, 'done');
   assert.equal(r.exitCode, 143, 'killed by SIGTERM reports 128 + 15 like a shell');
   assert.equal(r.signal, 'SIGTERM');
   assert.equal(readJson(join(jobDir, 'exit.json')).signal, 'SIGTERM');
+});
+
+// child.json is what tells a caller the job has started. The runner used to write it BEFORE installing its signal
+// handlers, so a SIGTERM sent the instant it appeared hit the default action: the runner died with no exit.json (the
+// job read as lost) and the command ran on as an orphan. Spinning on child.json lands in that window every time.
+test('SIGTERM sent the instant child.json appears is still forwarded, not fatal to the runner', { skip: process.platform === 'win32' }, async (t) => {
+  for (let i = 0; i < 3; i++) {
+    const cwd = scratch(t);
+    const { jobDir, pid } = start(`instant${i}`, node('setTimeout(()=>{},60000)'), { cwd });
+    t.after(() => {
+      const child = existsSync(join(jobDir, 'child.json')) ? readJson(join(jobDir, 'child.json')).pid : null;
+      for (const p of [pid, child].filter(Boolean)) {
+        try { process.kill(p, 'SIGKILL'); } catch { /* already gone */ }
+      }
+    });
+    const end = Date.now() + 20_000;
+    while (!existsSync(join(jobDir, 'child.json'))) {
+      if (Date.now() > end) throw new Error('child.json never appeared');
+    }
+    process.kill(pid, 'SIGTERM');
+    const r = await waitJob(`instant${i}`, { cwd, timeoutMs: 20_000, ...FAST });
+    assert.equal(r.state, 'done', `attempt ${i}`);
+    assert.equal(r.signal, 'SIGTERM');
+  }
 });
 
 test('child.json records the command pid', async (t) => {
