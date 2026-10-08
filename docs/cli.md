@@ -167,10 +167,10 @@ Exit: 0 · 3 GitHub (`gh`) unavailable.
 merge the PR if (and only if) the final gate passes again, live; waits for MERGED.
 
 ```
-pipeline merge --pr N [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|live-check|pre-merge; run final-gate again), 3 GitHub unavailable or no known-good production deployment
+pipeline merge --pr N [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment
 ```
 
-Exit: 0 merged (a merge commit GitHub cannot name yet is `mergeSha: null` plus a `warning`; prod-watch resolves it) · 1 not merged / refused by the live gate or by the last pre-merge look at GitHub (run final-gate again) · 3 GitHub unavailable, or no known-good production deployment.
+Exit: 0 merged (a merge commit GitHub cannot name yet is `mergeSha: null` plus a `warning`; prod-watch resolves it) · 1 not merged / refused by the live gate or by the last pre-merge look at GitHub (run final-gate again; `behind-base`: the base moved, the branch was just updated on GitHub, so pull, re-verify and gate the new head) · 3 GitHub unavailable, or no known-good production deployment.
 
 ## model-proof
 
@@ -303,6 +303,16 @@ pipeline triage light-lane --round R [--repo DIR]
 ```
 
 Exit: `validate`: 0 applied, 1 judge output invalid (state untouched) · `settle`: 0 recorded, 1 refused · `light-lane`: 0 · 2 usage / no state.
+
+## update-branch
+
+bring the PR branch up to date with its base on GitHub (update-branch with expected_head_sha), wait for the new head's required checks.
+
+```
+pipeline update-branch --pr N [--expect-head SHA] [--max-cycles N=3] [--repo DIR]   -> {ok, outcome, updated, cycles, base, startHead, head, localHead, pullNeeded, message?}; outcome up-to-date (exit 0; when updated: git pull --ff-only, then re-verify and run the gate on `head`) | rebase-needed | head-moved | cycle-cap | checks-failed | checks-timeout | head-timeout | not-open (exit 1; rebase-needed = the update conflicts, needs-human), 3 GitHub unavailable
+```
+
+Exit: 0 `up-to-date` (the base tip is part of the PR head; `updated` says whether this run merged the base in: then `git pull --ff-only`, re-verify, and gate `head`) · 1 `rebase-needed` (the update conflicts: `needs-human`, never a force push), `head-moved` (someone pushed since the verified head, or GitHub refused `expected_head_sha`: re-read, nothing was updated blindly), `cycle-cap` (the base kept moving), `checks-failed` / `checks-timeout` / `head-timeout` (the updated head did not turn green in time), `not-open` · 3 GitHub (`gh`) unavailable.
 
 ## vendor
 

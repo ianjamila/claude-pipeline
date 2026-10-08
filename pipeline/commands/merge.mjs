@@ -12,6 +12,7 @@ import { createGitHub, guardGh } from '../lib/github.mjs';
 import { headSha } from '../lib/git.mjs';
 import { currentProduction } from '../lib/deploy.mjs';
 import { runShellAsync } from '../lib/proc.mjs';
+import { bringUpToDate, updateTiming } from '../lib/updatebranch.mjs';
 import {
   GATE_FILE, PR_FIELDS, abandonMerge, evaluateGate, gateRefusals, localContentHash, mergeTiming, preMergeProblems, readReviewJson,
   tailLines, waitBlockers, waitForMerge, writeReviewJson,
@@ -19,7 +20,7 @@ import {
 
 export const meta = {
   summary: 'merge the PR if (and only if) the final gate passes again, live; waits for MERGED',
-  usage: 'pipeline merge --pr N [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|live-check|pre-merge; run final-gate again), 3 GitHub unavailable or no known-good production deployment',
+  usage: 'pipeline merge --pr N [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment',
 };
 
 const refuse = (error, reasons, extra = {}) => ({
@@ -46,6 +47,17 @@ export const run = guarded(async (argv, ctx) => {
       gate, pr, head, prHead: gh.prView(pr, [...PR_FIELDS]).headRefOid, hash, repo: gh.repo().slug, previewConfigured: config.preview !== null,
     });
     if (refusals.length > 0) return refuse('gate', refusals);
+
+    // 1b. Main may have moved since the gate ran: the gate, and the CI it waited on, then judged a tree that is NOT the one that
+    // would land. Bring the branch up to date on GitHub (one update; expected_head_sha = the approved head), then refuse: the new
+    // head needs its own verify + gate, so nothing merges on this attempt. Up to date already => carry on.
+    const synced = await bringUpToDate({ gh, pr, expectHead: gate.head, maxCycles: 1, waitChecks: false, ...updateTiming(ctx.env) });
+    if (!synced.ok) {
+      return refuse('behind-base', [synced.message ?? `could not bring the branch up to date (${synced.outcome})`], { outcome: synced.outcome, updated: synced.updated, head: synced.head ?? null });
+    }
+    if (synced.updated) {
+      return refuse('behind-base', [`the base moved: the branch was updated to ${synced.head}; pull it, re-verify and run final-gate on that head`], { outcome: 'updated', updated: true, head: synced.head });
+    }
 
     // 2. The known-good production deployment: it is what a rollback restores, so without it nothing may merge.
     // Read now, written only once the live gate has passed (a refused attempt must not overwrite an earlier merge's record).

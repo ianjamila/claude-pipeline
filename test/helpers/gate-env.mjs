@@ -86,6 +86,13 @@ function previewDeployEntries(o) {
   ];
 }
 
+const UPDATE_REPLIES = {
+  accepted: { match: 'pulls/12/update-branch', stdoutJson: { message: 'Updating pull request branch.', url: 'https://github.com/acme/widgets/pull/12' } },
+  conflict: { match: 'pulls/12/update-branch', code: 1, stderr: 'gh: merge conflict between base and head (HTTP 422)', stdoutJson: { message: 'merge conflict between base and head', status: '422' } },
+  'head-moved': { match: 'pulls/12/update-branch', code: 1, stderr: "gh: expected head sha didn't match current head ref. (HTTP 422)", stdoutJson: { message: "expected head sha didn't match current head ref.", status: '422' } },
+  forbidden: { match: 'pulls/12/update-branch', code: 1, stderr: 'gh: Resource not accessible by integration (HTTP 403)', stdoutJson: { message: 'Resource not accessible by integration', status: '403' } },
+};
+
 export function ghEntries(o) {
   const pr = {
     state: o.state ?? 'OPEN', headRefOid: o.prHead, baseRefName: o.base ?? 'main', isDraft: o.isDraft ?? false,
@@ -102,6 +109,10 @@ export function ghEntries(o) {
     { match: '^pr view 12 --json state,headRefOid', stdoutJson: pr },
     { match: '^pr view 12 --json state,mergeCommit', stdoutJson: { labels: [], ...(o.mergeView ?? { state: 'MERGED', mergeCommit: { oid: MERGE_SHA } }) } },
     { match: '^pr merge 12 --disable-auto', code: o.disableAutoCode ?? 0 },
+    // `behindBy`: how many base commits the PR head lacks (compare); 0 = up to date, which is what merge's update step expects.
+    // `update`: what PUT pulls/12/update-branch answers: accepted (default) | conflict | head-moved (the two 422s) | forbidden.
+    UPDATE_REPLIES[o.update ?? 'accepted'],
+    { match: 'repos/acme/widgets/compare/', stdoutJson: { status: o.behindBy ? 'diverged' : 'ahead', behind_by: o.behindBy ?? 0, ahead_by: 1 } },
     o.requiredCi === 'error'
       ? { match: '^pr checks 12 .*--required$', code: 1, stderr: "no required checks reported on the 'main' branch" }
       : { match: '^pr checks 12 .*--required$', stdoutJson: o.requiredCi ?? ci },
