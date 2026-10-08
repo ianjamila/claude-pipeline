@@ -60,7 +60,20 @@ test('test files stay exempt from everything else, and from fake-looking or JWT 
   for (const line of [`k = "${AWS.slice(0, 4)}IOSFODNN7EXAMPLE"`, `k = "${STRIPE}EXAMPLE"`, `k = "sk_live_${'x'.repeat(12)}"`, `k = "${AWS.slice(0, 4)}0000000000000000"`, `k = "fake_${STRIPE}"`]) {
     assert.deepEqual(rules([A('lib/a.test.ts', line)]), [], line);
   }
-  assert.deepEqual(rules([A('docs/a.md', STRIPE)]), [], 'documentation is not judged for secrets');
+});
+
+test('exempt documentation keeps the same ONE content rule as test files: a real-looking key is a hit, a fake-marked key, a JWT and sensitive terms are not', () => {
+  for (const p of ['docs/a.md', 'docs/a.txt', 'docs/a.rst', 'docs/a.adoc', 'README.md', 'packages/x/CHANGELOG.md']) {
+    const hits = run([A(p, `token: ${STRIPE}`)]);
+    assert.deepEqual(rulesOf(hits), ['R3-secrets'], p);
+    assert.match(hits[0].detail, /secret-like literal in a documentation file \(Stripe live key\)/);
+    assert.equal(hits[0].excerpt, undefined, 'never echo the secret');
+    assert.ok(!JSON.stringify(hits).includes(STRIPE));
+    assert.deepEqual(rules([A(p, `token: ${STRIPE}EXAMPLE`, `k = "${AWS.slice(0, 4)}IOSFODNN7EXAMPLE"`)]), [], `${p}: fake-marked keys`);
+    assert.deepEqual(rules([A(p, `jwt ${JWT}`)]), [], `${p}: JWT is not a doc secret`);
+    assert.deepEqual(rules([A(p, 'payroll salary SSS number', 'DROP TABLE users;', ...EVIL)]), [], `${p}: terms and SQL are not judged in docs`);
+  }
+  assert.deepEqual(rules([A('docs/a.md', `key ${AWS}`)]), ['R3-secrets']);
 });
 
 const IMPORT_HITS = [
