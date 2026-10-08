@@ -207,7 +207,7 @@ node scripts/verify.mjs           # the pipeline's own verify; writes .verify/re
 node pipeline/bin/pipeline.mjs --help
 ```
 
-CI (`.github/workflows/ci.yml`) runs the suite on Ubuntu (Node 20 and 24) and Windows (Node 20),
+CI (`.github/workflows/ci.yml`) runs the suite on Ubuntu (Node 20 and 24) and Windows (Node 24),
 plus an installer round trip into a throwaway Claude home with a space in its path. Its job names
 `test (ubuntu)` and `test (windows)` are this repo's required checks.
 

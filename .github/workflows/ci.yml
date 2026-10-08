@@ -82,7 +82,8 @@ jobs:
   test-windows:
     name: test (windows)
     runs-on: windows-latest
-    # The Node 20 suite alone takes ~36 min on windows-latest (first run, 2026-10-02).
+    # One Node version on Windows (the suite takes ~30-36 min there): Node 24, the current LTS line and what the
+    # actions themselves run on. Node 20 stays covered on ubuntu.
     timeout-minutes: 60
     steps:
       # Keep LF endings: .gitattributes pins *.mjs/*.sh to LF and fixtures to -text, and the
@@ -105,14 +106,14 @@ jobs:
           SHA: ${{ github.sha }}
           JOB_NAME: test (windows)
 
-      - name: Node 20
+      - name: Node 24
         if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
-      - name: Tests (Node 20)
+          node-version: 24
+      - name: Tests (Node 24)
         if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
         run: node scripts/test.mjs
-      - name: Installer round trip (Node 20)
+      - name: Installer round trip (Node 24)
         if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
-        run: ./.github/scripts/installer-round-trip.sh "$RUNNER_TEMP/claude home 20"
+        run: ./.github/scripts/installer-round-trip.sh "$RUNNER_TEMP/claude home 24"
