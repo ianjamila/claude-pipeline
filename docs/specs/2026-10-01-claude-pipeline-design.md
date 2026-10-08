@@ -750,3 +750,73 @@ Recheck: resolved 1, 2, 6, 11, 13, P3-order; partial 3, 4, 5, 7, 8, 9, 10, 12; t
   owner's release is a no-op.
 - **R1 note.** EagleWatch exemption goes in `KNOWN_NON_GATES` in
   `scripts/lib/expected-checks-matchers.mjs`.
+
+## 19. Revision 4 — approval receipts and exemption holes (2026-10-06)
+
+- **R5″ Approval bound to the sha by a receipt (supersedes the `headSeenAt` rule of R5′).** Attack on R5′: commit B
+  (malicious, a descendant of the approved head A) is pushed EARLIER somewhere else so it already has check suites or
+  statuses at T0 — another branch (Vercel posts a status on every pushed branch), or as the head of a second PR. The
+  owner reviews the PR at A and labels it `human-approved` at T1 > T0; B is then fast-forwarded onto the PR branch.
+  `headSeenAt(B)` = T0 < T1, so the approval counted for code nobody reviewed and both required checks went green.
+  Fix: the guard run for a `labeled` event of an approval label whose sender is an allowed approver (ci.approvers,
+  else the owner of a User repo; an org without a list fails closed) and whose event head is still the PR head FIRST
+  posts a commit status `pipeline-approval: <label>` (success, "approved by <login>") on that head, before evaluating.
+  The event action, label name and sender reach the job only through `env:` (EVENT_ACTION / EVENT_LABEL /
+  EVENT_SENDER, shape-validated). A label counts for head H only if it is present, its latest `labeled` event was by an
+  allowed approver, a receipt for that label exists ON H created by `github-actions[bot]` (a status posted with a
+  human's or agent's token does not count), and the receipt is not older than that latest event (it answers that very
+  labeling; remove + re-add produces a new event and a new receipt). Statuses are per sha, so an approval on A never
+  covers B. The check-suite timestamp logic and the `checks: read` permission are gone. The stale-label removal stays,
+  with the note "approval not recorded for this commit — re-apply the label". **Provenance:** `github-actions[bot]` is
+  not enough, because `pull_request_target` takes the workflow file from the PR's BASE branch: an agent can push
+  branch `x` with an edited `pipeline-guards.yml`, open a PR into `x` with the same head sha, and that run posts
+  bot receipts (and success guard statuses) on the shared head. A receipt therefore also needs a `target_url` that is
+  an Actions run of this repository (always set to the run URL) whose `path` is `.github/workflows/pipeline-guards.yml`
+  (an `@ref` suffix is stripped), whose `event` is `pull_request_target`, and whose `head_sha` (the base tip the
+  workflow ran from) is on the default branch (`compare/<head_sha>...<default>` is `identical` or `ahead`). Because
+  the poster of a status chooses its `target_url`, the run must also be ABOUT this verdict: `pull_requests` lists this
+  PR number at the status's sha with `base.ref` = the default branch (an empty list is untrusted, fail closed), and the
+  status was created within the run's `[created_at, updated_at]` window (10 s slack; the lower bound is the run's creation, i.e. the event time, because a queued run can start long after the labeling it answers) and the run is `run_attempt` 1 (a re-run can execute an OLDER guard revision from an old main tip and post a fresh success over a newer failure, so re-runs never count: push a commit or close and reopen the PR to run the guards again). `base.ref` is mandatory: "ancestor
+  of main" alone allows a DOWNGRADE, since a side branch cut from an old main commit runs an old, weaker guard yet is an
+  ancestor of main, whereas a `pull_request_target` run for a PR INTO main always runs main's tip at event time. For a
+  receipt the description must name the label and the approver of the latest `labeled` event (`<label> approved by
+  <login>`) and that event must fall inside the run's window (the run API does not expose the action). Run reads are
+  cached per run id. Anything unreadable fails closed (`lib/guard-provenance.mjs`). **Verdict artifact (closes the race of
+  issue #3, https://github.com/ianjamila/claude-pipeline/issues/3):** all of the above is data a spoofing run (a PR into a
+  side branch with an edited workflow, same head sha) can satisfy by pointing its status at a genuine run of the same PR
+  and head that is still in progress, and the agent can open that window on demand (`gh run rerun`, close/reopen,
+  ready/draft). So the guard job is split in two phases around an upload: `Evaluate` (`ci-guards-run.mjs`) posts the
+  receipt (if any), judges, and writes `verdict.json` plus the step output `artifact` = `pipeline-verdict_v1_<head>_<integrity>_<hardstops>`
+  (plus `_<label>_<login>` when this run posted a receipt; states success|failure|error); `Upload verdict`
+  (`actions/upload-artifact`, pinned by SHA, `overwrite: false`, 90 days) attaches it to THIS run; `Publish`
+  (`ci-guards-run.mjs --publish`) re-checks that the PR head is still the verdict's (else the superseded error statuses),
+  posts the two statuses, and only then removes invalid approval labels. A status counts only if the run it points at carries a verdict
+  artifact for that head whose state for that check is `success`; a receipt of another run counts only if that run's artifact
+  names the label and the approver of the latest labeling. A spoofing run cannot add an artifact to somebody else's run, so it
+  can only point at a run whose own verdict is the one it claims; a run with no artifact (in progress, cancelled before
+  the upload) fails closed. The current run's own receipt has no artifact yet, so it is trusted in-process from a record of
+  what this process posted, and an API-read receipt whose url is the current run is never accepted. The final gate
+  reads the latest status itself (not the row link) and applies the same check, plus the artifact, to a passing
+  `Test integrity` / `Hard-stop scan` row; it collects those rows from every requirement source (GitHub-required, named in
+  `ci.required_checks`, examined), so a guard row GitHub does not require but the config names is verified too. The workflow
+  needs `actions: read` to read runs and artifacts in a private repo. The template has no `branches:` filter: it cannot know the default branch,
+  and a filter in the base copy protects nothing against a branch that carries its own copy of the file. Stacked PRs
+  (base = a non-default branch) therefore never get a verifiable approval; they fail closed. `guard-git` also denies
+  writes to `repos/*/statuses/*` and the checks API so an agent cannot post such statuses itself (GraphQL mutations
+  were already allowlisted). If a newer event cancels the labeled run
+  before the receipt is posted, the approval simply does not count (fail closed). Residuals: the code of the genuine job is the
+  trust anchor (code that can post statuses as `github-actions[bot]`, e.g. a same-repo PR's own workflow with
+  `statuses: write`, could equally post the required statuses directly, but then lacks the artifact the gate demands; a
+  workflow with `actions: write` can delete a genuine artifact, which only fails closed); a stale browser tab can label a head the
+  approver did not review. Regression: approve A, B already had check suites from before the approval -> B red.
+- **R7″ Exemptions are judged by what can run.** `docs/**` exempts only non-executable documentation (md, txt, rst, adoc,
+  images, pdf); a module under docs/ is code (importable via a root alias), `.mdx` is code everywhere, a `.md` under
+  `app/` or `pages/` is a page. Test files keep one content rule: key-shaped secret literals not marked fake IN the
+  credential token itself (a comment or neighbouring name on the line does not count; no JWT or Vault: local-stack
+  fixtures). Production code that imports a test module (every import specifier is resolved to the repo paths it could
+  name and judged by the same test-file predicate, for JS/TS, Python and Ruby; imports split over lines, Python bracketed
+  statements and imports after a block comment included), an edit to an exempt file that production
+  at head already imports, directly or through other test files (a bounded reverse search; fails closed; non-code docs count as exempt too, since `require` loads `.md`/`.txt` as JavaScript), a rename from an exempt path into production code (a 100%
+  rename shows no lines), a symlink or submodule entry (read from tree modes, so a 100% rename cannot hide one), and a
+  `.wasm` or archive (`.zip .gz .tgz .bin`, accepted only as a test fixture) binary are hits. A pure mode change
+  (chmod) is not: it adds no content that was not judged when the file was added.

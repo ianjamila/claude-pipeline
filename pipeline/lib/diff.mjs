@@ -105,7 +105,7 @@ function beginFile(headerLine) {
   const { oldPath, newPath } = splitGitHeader(headerLine.slice('diff --git '.length));
   return {
     headerOld: oldPath, headerNew: newPath, minusPath: null, plusPath: null, renameFrom: null, renameTo: null,
-    minusDevNull: false, plusDevNull: false, hasHunks: false, isNew: false, isDeleted: false, similarity: null, binary: false, gitlink: false,
+    minusDevNull: false, plusDevNull: false, hasHunks: false, isNew: false, isDeleted: false, similarity: null, binary: false, gitlink: false, symlink: false,
     added: [], removed: [],
   };
 }
@@ -120,6 +120,7 @@ function finishFile(f) {
     similarity: status === 'R' ? f.similarity : null, binary: f.binary, added: f.added, removed: f.removed,
   };
   if (f.gitlink) out.gitlink = true; // a submodule (mode 160000) entry; only present when true
+  if (f.symlink) out.symlink = true; // a symbolic link (mode 120000), added, changed, deleted or retyped; only present when true
   return out;
 }
 
@@ -132,6 +133,12 @@ function applyFileHeader(f, line) {
   } else {
     f[isMinus ? 'minusPath' : 'plusPath'] = stripPrefix(readPath(raw), isMinus ? 'a/' : 'b/');
   }
+}
+
+// 160000 = submodule, 120000 = symlink: the mode is the last word of the header lines that carry one.
+function noteMode(cur, line) {
+  if (/\b160000\s*$/.test(line)) cur.gitlink = true;
+  if (/\b120000\s*$/.test(line)) cur.symlink = true;
 }
 
 export function parseUnifiedDiff(text) {
@@ -183,14 +190,14 @@ export function parseUnifiedDiff(text) {
       throw new Error(`malformed diff: hunk line count overflow at line ${i + 1}: ${line}`);
     } else if (line.startsWith('new file mode')) {
       cur.isNew = true;
-      if (/\b160000\s*$/.test(line)) cur.gitlink = true;
+      noteMode(cur, line);
     } else if (line.startsWith('deleted file mode')) {
       cur.isDeleted = true;
-      if (/\b160000\s*$/.test(line)) cur.gitlink = true;
+      noteMode(cur, line);
     } else if (line.startsWith('old mode ') || line.startsWith('new mode ')) {
-      if (/\b160000\s*$/.test(line)) cur.gitlink = true;
-    } else if (line.startsWith('index ') && /\b160000\s*$/.test(line)) {
-      cur.gitlink = true;
+      noteMode(cur, line);
+    } else if (line.startsWith('index ')) {
+      noteMode(cur, line);
     } else if (line.startsWith('similarity index ')) {
       cur.similarity = parseInt(line.slice('similarity index '.length), 10);
     } else if (line.startsWith('rename from ')) {

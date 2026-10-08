@@ -6,7 +6,8 @@
 // Policy: anything we cannot verify is denied (unknown branch, lookup failure, truncated parse, run-time labels).
 // It also tracks what earlier commands on the SAME line change (checkout/switch/branch -m, upstream and push config,
 // variables, aliases) so `git checkout main && git push` is judged against main, and it covers the same-intent routes
-// (gh api label/issue/merge/contents endpoints, `--label` on create, a graphql mutation allowlist, `--input` bodies)
+// (gh api label/issue/merge/contents/status/check endpoints, also under the numeric `repositories/{id}/...` alias and
+// with repeated slashes or dot segments, `--label` on create, a graphql mutation allowlist, `--input` bodies)
 // because "use the API instead" is the first thing a blocked agent tries.
 // Residual (documented): label approval is protected against accidental and casual misuse, not an agent that writes
 // its own API client or script; aliases defined in git/gh config files, push.default=matching, remote.*.push set in
@@ -526,10 +527,21 @@ function checkGraphql(body) {
 
 // ---- gh api -----------------------------------------------------------------------------------------------
 
+// Canonical form of an endpoint, so every rule anchored on `repos/{owner}/{repo}/...` sees what GitHub would route:
+// URL host, query and fragment dropped; percent-escapes decoded; repeated slashes collapsed; `.` / `..` segments
+// resolved; and the numeric alias `repositories/{id}/...` (GitHub serves the same resources there) rewritten to
+// `repos/{repository-id}/{id}/...`. The `{...}` owner is a placeholder (like gh's own `{owner}`), so callers that
+// need a real owner/name fall back to the current repository instead of passing a bogus `-R`.
 function normaliseEndpoint(raw) {
-  let e = String(raw ?? '').trim().replace(/^https?:\/\/[^/]+\/(?:api\/v3\/)?/i, '');
-  e = e.replace(/[?#].*$/, '').replace(/^\/+/, '').replace(/\/+$/, '');
-  return safeDecode(e);
+  const e = safeDecode(String(raw ?? '').trim().replace(/^https?:\/\/[^/]+\/(?:api\/v3\/)?/i, '').replace(/[?#].*$/, ''));
+  const segs = [];
+  for (const s of e.split('/')) {
+    if (s === '' || s === '.') continue;
+    if (s === '..') segs.pop();
+    else segs.push(s);
+  }
+  if (segs.length >= 2 && segs[0].toLowerCase() === 'repositories') segs.splice(0, 2, 'repos', '{repository-id}', segs[1]);
+  return segs.join('/');
 }
 
 function checkApi(rest, env, dir, ctx) {
@@ -585,6 +597,11 @@ function checkApi(rest, env, dir, ctx) {
       return deny(`${method} to the contents API commits straight to a branch (the default branch unless \`branch=\` names another). Name a non-main branch with -f branch=agent/<slug>, or use git.`);
     }
   }
+
+  // -- commit statuses and check runs: an agent posting its own `Hard-stop scan` / `Test integrity` / `pipeline-approval: *` status
+  //    would forge the guard's verdict or an approval receipt. Only the pipeline-guards workflow writes them.
+  if (/^repos\/[^/]+\/[^/]+\/statuses\/[^/]+$/i.test(ep)) return deny(`${method} to the commit statuses API is blocked: the guard statuses and approval receipts are written only by the pipeline-guards workflow. ${OWNER_ONLY}`);
+  if (/^repos\/[^/]+\/[^/]+\/check-(runs|suites)(\/|$)/i.test(ep)) return deny(`${method} to the checks API is blocked: check results are written only by CI. ${OWNER_ONLY}`);
 
   // -- merging or moving main without going through the merge gate
   if (method === 'PUT' && /^repos\/[^/]+\/[^/]+\/pulls\/\d+\/merge$/i.test(ep)) return deny(`merging through the API bypasses the merge gate, like --admin. ${OWNER_ONLY}`);

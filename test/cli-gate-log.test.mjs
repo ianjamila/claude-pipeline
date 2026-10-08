@@ -9,6 +9,7 @@ import { createFakeGh, pipelineYml } from './helpers/fakegh-env.mjs';
 import { cli, PR, AGENT_LOG, ME, REPO } from './helpers/gate-env.mjs';
 import { addRound, emptyState, saveState } from '../pipeline/lib/state.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
+import { assertExit } from './helpers/assert-exit.mjs';
 
 // ---- summary --------------------------------------------------------------------------------------
 
@@ -51,7 +52,7 @@ test('summary: upserts the marker comment from the state and prints the agent-lo
   const fake = summaryGh();
 
   const r = cli(['summary', '--pr', String(PR), '--outcome', 'merged', '--built', 'A widget.'], { dir: repo.dir, fake });
-  assert.equal(r.code, 0, `${r.stderr}\n${r.stdout}`);
+  assertExit(r, 0);
   assert.equal(r.json.ok, true);
   assert.equal(r.json.url, 'https://github.com/acme/widgets/pull/12#issuecomment-5');
   assert.match(r.json.agentLogLine, /^- \d{4}-\d{2}-\d{2} · #12 · Add widget · risk medium · rounds 2 · arbiter 1 · merged$/);
@@ -75,16 +76,16 @@ test('summary: edits the existing summary comment in place (marker + same author
   repo.commit('init');
   const fake = summaryGh([{ id: 9, body: `${MARKERS.summary}\nold`, user: { login: 'me' } }]);
   const none = cli(['summary', '--pr', String(PR), '--outcome', 'merged'], { dir: repo.dir, fake });
-  assert.equal(none.code, 2, 'no state to render from');
+  assertExit(none, 2, 'no state to render from');
   assert.equal(fake.calls().length, 0, 'and nothing was posted');
 
   saveState(repo.dir, summaryState());
   const r = cli(['summary', '--pr', String(PR), '--outcome', 'merged'], { dir: repo.dir, fake });
-  assert.equal(r.code, 0, `${r.stderr}\n${r.stdout}`);
+  assertExit(r, 0);
   assert.equal(r.json.action, 'updated');
   assert.ok(fake.lines().some((l) => l.startsWith('api -X PATCH repos/acme/widgets/issues/comments/9')));
   assert.ok(!fake.lines().some((l) => l.includes('-X POST')));
-  assert.equal(cli(['summary', '--pr', String(PR)], { dir: repo.dir, fake }).code, 2, '--outcome is required');
+  assertExit(cli(['summary', '--pr', String(PR)], { dir: repo.dir, fake }), 2, '--outcome is required');
 });
 
 // The two early-stop paths (verify red 3x, Codex out in round 1) have no state.json; they still need a comment and a log line.
@@ -97,7 +98,7 @@ test('summary: --outcome blocked / awaiting-review render without state.json (em
 
   const fake = summaryGh();
   const blocked = cli(['summary', '--pr', String(PR), '--outcome', 'blocked'], { dir: repo.dir, fake });
-  assert.equal(blocked.code, 0, `${blocked.stderr}\n${blocked.stdout}`);
+  assertExit(blocked, 0);
   assert.match(blocked.json.agentLogLine, /^- \d{4}-\d{2}-\d{2} · #12 · Add widget · risk unknown · rounds 0 · arbiter 0 · blocked$/);
   const body = JSON.parse(fake.calls().find((c) => c.argv.includes('POST')).stdin).body;
   assert.ok(body.startsWith(MARKERS.summary));
@@ -106,7 +107,7 @@ test('summary: --outcome blocked / awaiting-review render without state.json (em
 
   const fake2 = summaryGh();
   const awaiting = cli(['summary', '--pr', String(PR), '--outcome', 'awaiting-review', '--built', 'A widget.'], { dir: repo.dir, fake: fake2 });
-  assert.equal(awaiting.code, 0, `${awaiting.stderr}\n${awaiting.stdout}`);
+  assertExit(awaiting, 0);
   assert.match(awaiting.json.agentLogLine, /· rounds 0 · arbiter 0 · awaiting-review$/);
   const body2 = JSON.parse(fake2.calls().find((c) => c.argv.includes('POST')).stdin).body;
   assert.match(body2, /\*\*awaiting-review\*\*/, 'only a blocked outcome gets the verify detail');
@@ -120,11 +121,11 @@ test('summary: blocked without a verify report still renders; every other outcom
   repo.commit('init');
   const fake = summaryGh();
   const r = cli(['summary', '--pr', String(PR), '--outcome', 'blocked'], { dir: repo.dir, fake });
-  assert.equal(r.code, 0, `${r.stderr}\n${r.stdout}`);
+  assertExit(r, 0);
   assert.match(JSON.parse(fake.calls().find((c) => c.argv.includes('POST')).stdin).body, /\*\*blocked\*\*/);
   for (const outcome of ['merged', 'needs-human', 'reverted']) {
     const none = cli(['summary', '--pr', String(PR), '--outcome', outcome], { dir: repo.dir, fake: summaryGh() });
-    assert.equal(none.code, 2, outcome);
+    assertExit(none, 2, outcome);
     assert.match(none.json.message, /only --outcome blocked\|awaiting-review/);
   }
 });
@@ -136,7 +137,7 @@ test('summary: an unreachable GitHub is exit 3', () => {
   repo.commit('init');
   saveState(repo.dir, summaryState());
   const r = cli(['summary', '--pr', String(PR), '--outcome', 'merged'], { dir: repo.dir, fake: createFakeGh([{ match: '.', code: 1, stderr: 'HTTP 401' }]) });
-  assert.equal(r.code, 3);
+  assertExit(r, 3);
 });
 
 // ---- agent-log ------------------------------------------------------------------------------------
@@ -171,7 +172,7 @@ function logRepo() {
 test('agent-log queue: appends {line, at} to the queue file under the git common dir', () => {
   const t = logRepo();
   const a = t.q('- 2026-09-30 · #10 · first · risk low · rounds 1 · arbiter 0 · merged');
-  assert.equal(a.code, 0, a.stderr);
+  assertExit(a, 0);
   assert.equal(a.json.queued, 1);
   assert.equal(t.q('- second').json.queued, 2);
   const entries = readFileSync(t.queueFile(), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
@@ -182,11 +183,11 @@ test('agent-log queue: appends {line, at} to the queue file under the git common
 
 test('agent-log queue: a missing, empty or multi-line --line is a usage error and queues nothing', () => {
   const t = logRepo();
-  assert.equal(cli(['agent-log', 'queue'], { dir: t.repo.dir, fake: t.fake }).code, 2);
-  assert.equal(t.q('').code, 2);
-  assert.equal(t.q('- a\n- forged').code, 2);
-  assert.equal(cli(['agent-log'], { dir: t.repo.dir, fake: t.fake }).code, 2);
-  assert.equal(cli(['agent-log', 'flush'], { dir: t.repo.dir, fake: t.fake }).code, 2);
+  assertExit(cli(['agent-log', 'queue'], { dir: t.repo.dir, fake: t.fake }), 2);
+  assertExit(t.q(''), 2);
+  assertExit(t.q('- a\n- forged'), 2);
+  assertExit(cli(['agent-log'], { dir: t.repo.dir, fake: t.fake }), 2);
+  assertExit(cli(['agent-log', 'flush'], { dir: t.repo.dir, fake: t.fake }), 2);
   assert.equal(existsSync(t.queueFile()), false);
 });
 
@@ -196,7 +197,7 @@ test('agent-log stage: writes the header, queued lines oldest first, then this l
   t.q('- queued two');
   const before = t.repo.git(['rev-parse', 'HEAD']).trim();
   const r = t.stage('--line', '- this PR');
-  assert.equal(r.code, 0, `${r.stderr}\n${r.stdout}`);
+  assertExit(r, 0);
   assert.equal(r.json.ok, true);
   assert.deepEqual(r.json.lines, ['- queued one', '- queued two', '- this PR']);
   const after = t.repo.git(['rev-parse', 'HEAD']).trim();
@@ -222,7 +223,7 @@ test('agent-log stage: default line is the PR\'s agent-log line with outcome "me
   t.repo.commit('seed log without a final newline');
   saveState(t.repo.dir, summaryState());
   const r = t.stage();
-  assert.equal(r.code, 0, `${r.stderr}\n${r.stdout}`);
+  assertExit(r, 0);
   assert.equal(r.json.lines.length, 1);
   assert.match(r.json.lines[0], /^- \d{4}-\d{2}-\d{2} · #12 · Add widget · risk medium · rounds 2 · arbiter 1 · merged — prod smoke pending$/);
   const log = readFileSync(join(t.repo.dir, AGENT_LOG), 'utf8');
@@ -238,23 +239,23 @@ test('agent-log stage: refuses (exit 2) when the worktree has other uncommitted 
   t.repo.write('README.md', '# demo edited\n');
   const head = t.repo.git(['rev-parse', 'HEAD']).trim();
   const r = t.stage('--line', '- x');
-  assert.equal(r.code, 2);
+  assertExit(r, 2);
   assert.equal(r.json.error, 'dirty');
   assert.equal(t.repo.git(['rev-parse', 'HEAD']).trim(), head);
   assert.equal(existsSync(join(t.repo.dir, AGENT_LOG)), false);
   assert.match(readFileSync(t.queueFile(), 'utf8'), /queued/);
   t.repo.write('new-untracked.txt', 'x');
   t.repo.git(['checkout', '--', 'README.md']);
-  assert.equal(t.stage('--line', '- x').code, 2, 'an untracked file counts as other changes too');
+  assertExit(t.stage('--line', '- x'), 2, 'an untracked file counts as other changes too');
 });
 
 test('agent-log stage: running it again with a line already in the log writes nothing (idempotent)', () => {
   const t = logRepo();
-  assert.equal(t.stage('--line', '- same').code, 0);
+  assertExit(t.stage('--line', '- same'), 0);
   const head = t.repo.git(['rev-parse', 'HEAD']).trim();
   t.q('- same');
   const again = t.stage('--line', '- same');
-  assert.equal(again.code, 0);
+  assertExit(again, 0);
   assert.equal(again.json.committed, null);
   assert.deepEqual(again.json.lines, []);
   assert.equal(t.repo.git(['rev-parse', 'HEAD']).trim(), head);
@@ -285,13 +286,13 @@ test('agent-log stage: a PR that never merges does not lose the lines it staged:
   const t = logRepoWithOrigin();
   try {
     t.q('- queued a');
-    assert.equal(t.stagePr(12, 'agent/feature', 'OPEN', '--line', '- pr12').code, 0);
+    assertExit(t.stagePr(12, 'agent/feature', 'OPEN', '--line', '- pr12'), 0);
     assert.deepEqual(t.queued().map((e) => [e.line, e.staged?.pr]), [['- queued a', 12]]);
 
     // A second PR (branched from main, which does not have PR 12's commit).
     t.repo.git(['checkout', '-q', '-b', 'agent/other', 'main']);
     const open = t.stagePr(13, 'agent/other', 'OPEN', '--line', '- pr13');
-    assert.equal(open.code, 0, `${open.stderr}\n${open.stdout}`);
+    assertExit(open, 0);
     assert.deepEqual(open.json.lines, ['- pr13'], 'staged in an OPEN PR: not carried a second time (it would collide when both merge)');
     assert.equal(open.json.staged, 0);
     assert.equal(t.queued()[0].staged.pr, 12);
@@ -299,7 +300,7 @@ test('agent-log stage: a PR that never merges does not lose the lines it staged:
     t.repo.write('docs/trigger.txt', 'x');
     t.repo.commit('another change');
     const closed = t.stagePr(13, 'agent/other', 'CLOSED', '--line', '- pr13 again');
-    assert.equal(closed.code, 0, `${closed.stderr}\n${closed.stdout}`);
+    assertExit(closed, 0);
     assert.deepEqual(closed.json.lines, ['- queued a', '- pr13 again'], 'PR 12 closed unmerged: its queued line is re-staged here');
     assert.equal(t.queued()[0].staged.pr, 13);
   } finally {
@@ -312,7 +313,7 @@ test('agent-log: staged lines are dropped from the queue only once origin/<defau
   try {
     t.q('- landed one');
     t.q('- still waiting');
-    assert.equal(t.stagePr(12, 'agent/feature', 'OPEN', '--line', '- pr12').code, 0);
+    assertExit(t.stagePr(12, 'agent/feature', 'OPEN', '--line', '- pr12'), 0);
     assert.equal(t.queued().length, 2);
     // PR 12 "merges": main on origin gets the log with the first line only.
     t.repo.git(['checkout', '-q', 'main']);
@@ -321,7 +322,7 @@ test('agent-log: staged lines are dropped from the queue only once origin/<defau
     t.repo.git(['push', '-q', 'origin', 'main']);
     t.repo.git(['checkout', '-q', 'agent/feature']);
     const q = t.q('- fresh');
-    assert.equal(q.code, 0, q.stderr);
+    assertExit(q, 0);
     assert.deepEqual(t.queued().map((e) => e.line), ['- still waiting', '- fresh'], 'the landed line left the queue on the next queue call');
     assert.equal(q.json.queued, 2);
     // stage prunes too (it fetches origin first): land the second line and stage again.
@@ -332,7 +333,7 @@ test('agent-log: staged lines are dropped from the queue only once origin/<defau
     t.repo.git(['update-ref', '-d', 'refs/remotes/origin/main']); // forget it: stage must fetch
     t.repo.git(['checkout', '-q', 'agent/feature']);
     const s = t.stagePr(12, 'agent/feature', 'OPEN', '--line', '- pr12 again');
-    assert.equal(s.code, 0, `${s.stderr}\n${s.stdout}`);
+    assertExit(s, 0);
     assert.equal(s.json.dropped, 1);
     assert.deepEqual(t.queued().map((e) => e.line), ['- fresh']);
   } finally {
@@ -342,12 +343,12 @@ test('agent-log: staged lines are dropped from the queue only once origin/<defau
 
 test('agent-log stage: --pr is required, and an agent_log path outside the repo is refused', () => {
   const t = logRepo();
-  assert.equal(cli(['agent-log', 'stage'], { dir: t.repo.dir, fake: t.fake }).code, 2);
+  assertExit(cli(['agent-log', 'stage'], { dir: t.repo.dir, fake: t.fake }), 2);
   const escape = createTmpRepo();
   escape.write('.claude/pipeline.yml', `${pipelineYml()}agent_log: ../outside.md\n`);
   escape.commit('init');
   const r = cli(['agent-log', 'stage', '--pr', '12', '--line', '- x'], { dir: escape.dir, fake: t.fake });
-  assert.equal(r.code, 2);
+  assertExit(r, 2);
   assert.match(r.json.message, /inside the repo/);
 });
 
@@ -357,9 +358,9 @@ test('agent-log: the queue is shared across worktrees of one repo (lines queued 
   try {
     t.repo.git(['worktree', 'add', '-q', '-b', 'agent/second', join(other, 'wt')]);
     const wt = join(other, 'wt');
-    assert.equal(cli(['agent-log', 'queue', '--line', '- from the second worktree'], { dir: wt, fake: t.fake }).code, 0);
+    assertExit(cli(['agent-log', 'queue', '--line', '- from the second worktree'], { dir: wt, fake: t.fake }), 0);
     const r = t.stage('--line', '- from the first');
-    assert.equal(r.code, 0, `${r.stderr}\n${r.stdout}`);
+    assertExit(r, 0);
     assert.deepEqual(r.json.lines, ['- from the second worktree', '- from the first']);
   } finally {
     rmSync(other, { recursive: true, force: true });
@@ -375,7 +376,7 @@ test('agent-log stage: refuses on the default branch (reviewer repro D) and on m
   t.q('- queued');
   const head = t.repo.git(['rev-parse', 'HEAD']).trim();
   const r = t.stage('--line', '- x');
-  assert.equal(r.code, 2, `${r.stderr}\n${r.stdout}`);
+  assertExit(r, 2);
   assert.equal(r.json.ok, false);
   assert.equal(r.json.error, 'branch');
   assert.match(r.json.message, /default branch/);
@@ -391,7 +392,7 @@ test('agent-log stage: refuses on the default branch (reviewer repro D) and on m
   for (const name of ['master', 'main', 'trunk']) {
     other.git(['checkout', '-q', '-B', name]);
     const refused = cli(['agent-log', 'stage', '--pr', '12', '--line', '- x'], { dir: other.dir, fake: t.fake });
-    assert.equal(refused.code, 2, name);
+    assertExit(refused, 2, name);
     assert.equal(refused.json.error, 'branch', name);
   }
 });
@@ -401,7 +402,7 @@ test('agent-log stage: refuses on a detached HEAD', () => {
   t.repo.git(['checkout', '-q', '--detach']);
   const head = t.repo.git(['rev-parse', 'HEAD']).trim();
   const r = cli(['agent-log', 'stage', '--pr', '12', '--line', '- x'], { dir: t.repo.dir, fake: t.fake });
-  assert.equal(r.code, 2);
+  assertExit(r, 2);
   assert.equal(r.json.error, 'branch');
   assert.match(r.json.message, /detached/);
   assert.equal(t.repo.git(['rev-parse', 'HEAD']).trim(), head);
@@ -411,15 +412,15 @@ test('agent-log stage: the PR must be this branch at this commit, even when --li
   const t = logRepo();
   const head = t.repo.git(['rev-parse', 'HEAD']).trim();
   const wrongBranch = t.stageAgainst(t.prFor({ headRefName: 'agent/other' }), '--line', '- x');
-  assert.equal(wrongBranch.code, 2, `${wrongBranch.stderr}\n${wrongBranch.stdout}`);
+  assertExit(wrongBranch, 2);
   assert.equal(wrongBranch.json.error, 'pr-mismatch');
   assert.match(wrongBranch.json.message, /agent\/other/);
   const wrongHead = t.stageAgainst(t.prFor({ headRefOid: 'd'.repeat(40) }), '--line', '- x');
-  assert.equal(wrongHead.code, 2);
+  assertExit(wrongHead, 2);
   assert.equal(wrongHead.json.error, 'pr-mismatch');
   assert.match(wrongHead.json.message, /dddddddd/);
   const noFields = t.stageAgainst({}, '--line', '- x');
-  assert.equal(noFields.code, 2, 'a PR reply without the fields proves nothing');
+  assertExit(noFields, 2, 'a PR reply without the fields proves nothing');
   assert.equal(t.repo.git(['rev-parse', 'HEAD']).trim(), head, 'nothing was committed');
   assert.equal(existsSync(join(t.repo.dir, AGENT_LOG)), false);
   assert.ok(t.fake.lines().some((l) => l === 'pr view 12 --json headRefName,headRefOid'), 'the PR is fetched even with --line');
@@ -430,6 +431,6 @@ test('agent-log stage: an unreachable GitHub is exit 3 and commits nothing', () 
   t.fake.setScript([{ match: '.', code: 1, stderr: 'HTTP 401' }]);
   const head = t.repo.git(['rev-parse', 'HEAD']).trim();
   const r = cli(['agent-log', 'stage', '--pr', '12', '--line', '- x'], { dir: t.repo.dir, fake: t.fake });
-  assert.equal(r.code, 3);
+  assertExit(r, 3);
   assert.equal(t.repo.git(['rev-parse', 'HEAD']).trim(), head);
 });

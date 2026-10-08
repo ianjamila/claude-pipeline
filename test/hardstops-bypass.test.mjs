@@ -9,6 +9,14 @@ import { MIG, pkg, cfg, file, rulesOf, classify, run } from './helpers/hardstops
 const A = (path, ...added) => file(path, { status: 'A', added });
 const flags = (files, opts) => rulesOf(run(files, opts));
 const details = (hits) => hits.map((h) => h.detail);
+// CPU time (user + system) a call burns, in ms. The ReDoS guards below are about work done, not wall-clock: under machine load
+// a wall-clock budget flakes, while CPU time stays put (a quadratic regex still blows it).
+function cpuMs(fn) {
+  const t0 = process.cpuUsage();
+  const value = fn();
+  const d = process.cpuUsage(t0);
+  return { value, ms: (d.user + d.system) / 1000 };
+}
 
 // A repo with `base` files on main and a `feat` branch checked out; `collect(repo)` classifies feat against main.
 function branchRepo(base = {}) {
@@ -33,7 +41,7 @@ test('1 binary diff of a non-asset file -> R0-unscannable (a single NUL byte mak
 });
 
 test('1 binary assets are accepted without reading (case-insensitive)', () => {
-  for (const ext of ['png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'ico', 'svg', 'pdf', 'zip', 'gz', 'tgz', 'woff', 'woff2', 'ttf', 'otf', 'eot', 'mp4', 'mov', 'mp3', 'wav', 'wasm', 'bin', 'snap', 'PNG']) {
+  for (const ext of ['png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'ico', 'svg', 'pdf', 'woff', 'woff2', 'ttf', 'otf', 'eot', 'mp4', 'mov', 'mp3', 'wav', 'snap', 'PNG']) {
     assert.deepEqual(flags([file(`public/x.${ext}`, { status: 'A', binary: true })]), [], ext);
   }
 });
@@ -249,7 +257,7 @@ test('5 secret-shaped literals are R3 in production code, and the hit never repe
 test('5 secret literals in SQL and workflows too; tests and docs are exempt; normal text is not a secret', () => {
   assert.ok(flags([A('supabase/migrations/5_a.sql', `select vault.create_secret('${SECRETS['Stripe live key']}', 'x');`)]).includes('R3-secrets'));
   assert.ok(flags([file('.github/workflows/x.yml', { added: [`  KEY: ${SECRETS['AWS access key id']}`] })]).includes('R3-secrets'));
-  assert.deepEqual(flags([file('lib/pay.test.ts', { added: [SECRETS['Stripe live key']] })]), []);
+  // Tests keep ONE content rule (key-shaped secrets); see test/hardstops-exemptions.test.mjs. Docs are fully exempt.
   assert.deepEqual(flags([file('docs/pay.md', { added: [SECRETS['Stripe live key']] })]), []);
   assert.deepEqual(flags([file('lib/a.ts', { added: ['const a = "sk_live_"; const b = "AKIA"; // eyJ.eyJ.x'] })]), []);
 });
@@ -474,8 +482,9 @@ test('10 pgTAP tests: deleting or moving one is R4; editing one is not (content 
 test('11 docs, markdown and test files are exempt from every content rule', () => {
   const lines = [
     'service_role', 'createAdminClient()', 'DROP TABLE users;', 'GRANT ALL ON t TO anon;', 'process.env.BRAND_NEW', 'payroll', 'httpOnly: false',
-    "role: 'admin'", "'use server'", SECRETS['AWS access key id'], 'supabase.auth.admin.deleteUser(1)', "sb.from('t').delete()",
+    "role: 'admin'", "'use server'", 'supabase.auth.admin.deleteUser(1)', "sb.from('t').delete()",
   ];
+  assert.deepEqual(flags([file('docs/setup.md', { added: [SECRETS['AWS access key id']] })]), []);
   for (const p of ['docs/setup.md', 'README.md', 'lib/x.test.ts', 'lib/x.spec.tsx', 'e2e/a.spec.ts', 'supabase/tests/rls.test.sql', 'lib/__tests__/a.ts']) {
     assert.deepEqual(flags([file(p, { added: lines })]), [], p);
   }
@@ -511,9 +520,8 @@ test('11 R2-auth-removed ignores a deleted comment or bare string, not a deleted
 test('13 a changed line over 20,000 chars skips every regex and flags the file; a 1 MB line is instant', () => {
   const big = 'alter table x '.repeat(75_000); // ~1 MB, no RENAME and no `;`: quadratic for a naive regex
   for (const f of [A(MIG, big), file('lib/a.ts', { removed: ['require'.padEnd(1_000_000, 'Auth')] }), A('public/vendor.min.js', 'function a(b){return b.require(c)}'.repeat(40_000))]) {
-    const t0 = performance.now();
-    const hits = run([f]);
-    assert.ok(performance.now() - t0 < 1000, `took ${Math.round(performance.now() - t0)}ms`);
+    const { value: hits, ms } = cpuMs(() => run([f]));
+    assert.ok(ms < 1000, `took ${Math.round(ms)}ms of CPU`);
     assert.ok(rulesOf(hits).includes('R0-unscannable'), f.path);
   }
 });
@@ -526,26 +534,48 @@ test('13 lines just under the cap with adversarial shapes stay fast for every ru
   ];
   for (const text of shapes) {
     for (const f of [A(MIG, text), file('lib/a.ts', { added: [text], removed: [text] })]) {
-      const t0 = performance.now();
-      run([f]);
-      assert.ok(performance.now() - t0 < 1000, `${text.slice(0, 20)}... took ${Math.round(performance.now() - t0)}ms`);
+      const { ms } = cpuMs(() => run([f]));
+      assert.ok(ms < 1000, `${text.slice(0, 20)}... took ${Math.round(ms)}ms of CPU`);
     }
   }
 });
 
+test('13 a line stuffed with import specifiers stays fast (and is flagged as unreadable import list)', () => {
+  const many = (n, f) => Array.from({ length: n }, (_, i) => f(i)).join(' ');
+  for (const text of [many(1500, (i) => `from 'a${i}'`), many(600, (i) => `import('./x/y/z/w/v/u${i}')`), many(700, (i) => `require('a/b/c/d/e${i}');`)]) {
+    const { value: hits, ms } = cpuMs(() => run([file('lib/a.ts', { added: [text] })]));
+    assert.ok(ms < 500, `${text.slice(0, 20)}... took ${Math.round(ms)}ms of CPU`);
+    assert.ok(rulesOf(hits).includes('R0-unscannable'), text.slice(0, 20));
+  }
+});
+
+test('13 the whole-file import scan stays linear on a ~1.5 MB file of adversarial shapes', () => {
+  // Linearity, not raw speed: CI's Node 20 runs these ~3x slower than a laptop, so an absolute budget flaked (2.1 s for the
+  // backslash chain on ubuntu-latest). Doubling the input may at most ~double the CPU (ratio < 3; a quadratic shape gives ~4),
+  // and a generous absolute ceiling still catches a pathological constant.
+  const shapes = [[';from a import ', 100_000, 'a.py'], ['from' + ' ', 1_500_000, 'a.ts', true], ['require("', 190_000, 'a.ts'], [';import a, ', 100_000, 'a.py'], ['"""\n', 250_000, 'a.py'],
+    ['from a import (\n', 90_000, 'a.py'], ['import a, \\\n', 120_000, 'a.py']];
+  const cpu = (text, name) => cpuMs(() => run([file(`lib/${name}`, { added: ['x = 1'] })], { headFiles: new Map([[`lib/${name}`, text]]) })).ms;
+  for (const [unit, n, name, padOnly] of shapes) {
+    const make = (k) => (padOnly ? `from${' '.repeat(k)}` : unit.repeat(k));
+    const half = Math.max(cpu(make(n / 2), name), 1);
+    const full = cpu(make(n), name);
+    assert.ok(full / half < 3, `${unit.slice(0, 16)}... ${Math.round(half)}ms at n/2 -> ${Math.round(full)}ms at n: not linear`);
+    assert.ok(full < 8000, `${unit.slice(0, 16)}... took ${Math.round(full)}ms of CPU`);
+  }
+});
+
 test('13 an oversized SQL statement is unscannable instead of regex-scanned', () => {
-  const t0 = performance.now();
-  const hits = classify({ files: [], config: cfg(), sqlStatements: [{ file: MIG, text: 'alter table x '.repeat(75_000) }] });
-  assert.ok(performance.now() - t0 < 1000);
+  const { value: hits, ms } = cpuMs(() => classify({ files: [], config: cfg(), sqlStatements: [{ file: MIG, text: 'alter table x '.repeat(75_000) }] }));
+  assert.ok(ms < 1000, `took ${Math.round(ms)}ms of CPU`);
   assert.deepEqual(rulesOf(hits), ['R0-unscannable']);
 });
 
 test('13 a normal 5000-line diff stays linear', () => {
   const lines = Array.from({ length: 5000 }, (_, i) => `export const v${i} = (a: number) => a + ${i}; // helper ${i}`);
   const sql = Array.from({ length: 5000 }, (_, i) => `insert into public.t${i % 10} (a, b) values (${i}, 'row ${i}');`);
-  const t0 = performance.now();
-  run([A('lib/big.ts', ...lines), A(MIG, ...sql)], { sqlStatements: [] });
-  assert.ok(performance.now() - t0 < 2000, `took ${Math.round(performance.now() - t0)}ms`);
+  const { ms } = cpuMs(() => run([A('lib/big.ts', ...lines), A(MIG, ...sql)], { sqlStatements: [] }));
+  assert.ok(ms < 2000, `took ${Math.round(ms)}ms of CPU`);
 });
 
 // ---- 14. the pure classifier cannot silently lose coverage ----------------------------------------------------
