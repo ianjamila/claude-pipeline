@@ -194,6 +194,53 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
       throw failure(r, args);
     },
 
+    // How far `head` (a SHA or branch) is behind `base`, from GitHub itself (the local ref can be stale). behindBy 0 = the
+    // base tip is already part of head. `per_page=1` keeps the reply small: only the counts are read.
+    compare(base, head) {
+      const args = ['api', `repos/${self.repo().slug}/compare/${encodePath(base)}...${encodeURIComponent(head)}?per_page=1`,
+        '--jq', '{status: .status, behind_by: .behind_by, ahead_by: .ahead_by, base: .base_commit.sha}'];
+      const body = parse(ok(args), args);
+      if (!Number.isInteger(body?.behind_by) || !Number.isInteger(body?.ahead_by)) {
+        throw new GhError({ code: 0, stderr: `compare reply has no behind_by/ahead_by: ${JSON.stringify(body).slice(0, 200)}`, args });
+      }
+      if (typeof body.base !== 'string' || !/^[0-9a-f]{40}$/.test(body.base)) {
+        throw new GhError({ code: 0, stderr: `compare reply has no base tip: ${JSON.stringify(body).slice(0, 200)}`, args });
+      }
+      return { status: body.status ?? null, behindBy: body.behind_by, aheadBy: body.ahead_by, baseSha: body.base };
+    },
+
+    // The parent SHAs of a commit, in order (for a merge commit: first the branch it was made on, then what was merged in).
+    commitParents(commit) {
+      const text = self.apiText(`repos/${self.repo().slug}/commits/${encodeURIComponent(commit)}`, '[.parents[].sha]');
+      let parents;
+      try {
+        parents = JSON.parse(text);
+      } catch { /* reported below */ }
+      if (!Array.isArray(parents) || !parents.every((p) => typeof p === 'string' && /^[0-9a-f]{40}$/.test(p))) {
+        throw new GhError({ code: 0, stderr: `commit ${commit} has no readable parents: ${String(text).slice(0, 200)}`, args: ['api', 'commits', commit] });
+      }
+      return parents;
+    },
+
+    // PUT pulls/{n}/update-branch: merge the base into the PR branch on GitHub (a merge commit, never a force push), but only
+    // if the head is still `expectedHeadSha`. 202 = accepted (the new head appears a moment later). The two 422s are answers,
+    // told apart by their message; anything else (403, 404, 5xx, an unrecognised 422) throws, so it can never read as success.
+    updateBranch(n, expectedHeadSha) {
+      const args = ['api', '-X', 'PUT', `repos/${self.repo().slug}/pulls/${prNumber(n)}/update-branch`, '--input', '-'];
+      const r = exec(args, { input: JSON.stringify({ expected_head_sha: expectedHeadSha }) });
+      if (r.code === 0 && !r.timedOut) return { result: 'accepted' };
+      let message = '';
+      try {
+        message = String(JSON.parse(r.stdout)?.message ?? '');
+      } catch { /* not JSON: fall back to stderr */ }
+      message ||= String(r.stderr ?? '').trim();
+      if (!r.timedOut && /HTTP 422|"status"\s*:\s*"?422/.test(`${r.stderr}\n${r.stdout}`)) {
+        if (/expected head sha/i.test(message)) return { result: 'head-moved', message };
+        if (/merge conflict/i.test(message)) return { result: 'conflict', message };
+      }
+      throw failure(r, args);
+    },
+
     deployments({ sha, environment } = {}) {
       const q = [];
       if (sha) q.push(`sha=${encodeURIComponent(sha)}`);

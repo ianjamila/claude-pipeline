@@ -111,6 +111,7 @@ Hard-stop PRs still go through the full review loop first, so you always get a r
 | Test weakening blocked | ✅ via required `Test integrity` | ✅ | ✅ label guard | |
 | Linear history / squash | ✅ | | | ✅ |
 | Fresh full verify bound to the head commit | | | | ✅ final-gate |
+| Gate judges the tree that will land (branch up to date with `main`) | | | ✅ `update-branch` stays allowed, merging through the API denied | ✅ `update-branch` before the gate, again in `merge` |
 | Cross-model review happened | | | | ✅ no review ⇒ no merge |
 | Arbiter really ran on Fable | | | | ✅ model-proof |
 | Pause switch | | | ✅ can't close the pause issue | ✅ |

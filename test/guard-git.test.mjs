@@ -247,6 +247,10 @@ const MORE_DENY = [
   ['gh api repos/o/r/actions/permissions -X PUT -F enabled=true'],
   ['gh api orgs/o/rulesets -X POST -f name=x'],
   ['gh api repos/o/r/pulls/12/merge -X PUT'],
+  // update-branch is allowed (below); merging through nearby endpoints still is not
+  ['gh api -X PUT repos/o/r/pulls/12/merge --input -'],
+  ['gh api -X PUT repos/o/r/pulls/12/update-branch/../merge --input -'],
+  ['gh api -X PUT repositories/123/pulls/12/merge --input -'],
   ['gh api repos/o/r/merges -f base=main -f head=x'],
   ['gh api repos/o/r/git/refs/heads/main -X PATCH -F force=true -f sha=abc'],
   ['gh api repos/o/r/git/refs -f ref=refs/heads/master -f sha=abc'],
@@ -414,6 +418,12 @@ const MORE_ALLOW = [
   ['gh api -X PATCH repos/o/r/issues/7 -f title=new'],
   ['gh api -X PATCH repos/o/r/issues/7 -f state=closed', { labels: ['bug'] }],
   ['gh api repos/o/r/pulls/12/merge'],
+  // bringing a PR branch up to date with main is not a merge into main (GitHub also checks expected_head_sha)
+  ['gh api -X PUT repos/o/r/pulls/12/update-branch --input -'],
+  ['gh api -X PUT repos/o/r/pulls/12/update-branch -f expected_head_sha=abc123'],
+  ['gh api --method PUT repos/{owner}/{repo}/pulls/12/update-branch --input -'],
+  ['gh api -X PUT repositories/123/pulls/12/update-branch --input -'],
+  ['gh pr update-branch 12'],
   ['gh api repos/o/r/git/refs/heads/agent/x -X PATCH -f sha=abc'],
   ['gh api "repos/o/r/deployments?sha=abc&environment=prod"'],
   ['gh api repos/o/r/branches/main'],
