@@ -829,9 +829,11 @@ function collectAssignments(cmds, str, ctx) {
     }
     for (const k of Object.keys(c.env)) bump(k, n);
     if (c.argv.length && VAR_BUILTINS.includes(baseName(c.argv[0]))) {
+      // `declare -n X=F` makes X a NAMEREF: $X reads $F at run time, while the text says "F". Unknown, like a binder.
+      const nameref = c.argv.slice(1).some((a) => /^-[A-Za-z]*n[A-Za-z]*$/.test(a));
       for (const a of c.argv.slice(1)) {
-        const m = /^([A-Za-z_][A-Za-z0-9_]*)=/.exec(a);
-        if (m) bump(m[1], n);
+        const m = (nameref ? /^([A-Za-z_][A-Za-z0-9_]*)(?:=|$)/ : /^([A-Za-z_][A-Za-z0-9_]*)=/).exec(a);
+        if (m) bump(m[1], nameref ? 2 : n);
       }
     }
   }
@@ -850,6 +852,24 @@ const UNSURE_OK = new Set([
   ...VAR_BUILTINS, ...VALUE_BINDERS,
 ]);
 const DIR_CHANGERS = ['cd', 'pushd', 'popd'];
+
+// A line that defines a function (its body is parsed as if it ran — `f(){ cd /safe; }; git push` never runs the cd),
+// an alias, a trap (`trap "cd …" DEBUG` runs before every command) or changes shell options / builtins can change
+// where a later command runs in ways the walk below does not model: the directory and branch are unknown for the whole line.
+const STATE_HAZARD_CMDS = new Set([
+  'alias', 'unalias', 'trap', 'enable', 'disable', 'setopt', 'unsetopt', 'shopt', 'hash', 'functions', 'autoload',
+  'zmodload', 'unfunction', 'emulate',
+]);
+// `set` is everywhere (`set -euo pipefail`); only an option outside these (zsh `set -o autocd`, …) is a hazard.
+const SAFE_SET_ARG = /^(?:[-+][euxvfCo]+|pipefail|errexit|nounset|xtrace|verbose|noglob|noclobber|--)$/;
+const isStateHazard = (c) => {
+  if (!c.argv.length) return false;
+  const nm = baseName(c.argv[0]);
+  return STATE_HAZARD_CMDS.has(nm) || (nm === 'set' && c.argv.slice(1).some((a) => !SAFE_SET_ARG.test(a)));
+};
+const FUNCTION_DEF = /(?:^|[\s;&|(){])(?:function\s+[^\s(){};&|<>]+|[A-Za-z_][\w.:-]*\s*\(\s*\))/;
+// `source` / `.` run a file in THIS shell: it may cd, check out a branch or reassign any variable.
+const SOURCING = ['source', '.'];
 
 // An unsure variable (assigned more than once, or where it may not run) that reaches a command whose effect may depend on
 // the value — anything outside UNSURE_OK, a path or dynamic command name, or the command name itself — directly (argv,
@@ -914,13 +934,16 @@ function evalString(str, startDir, ctx, level) {
   let dir = startDir;
   const flow = CONTROL_FLOW.test(str);
   let uncertain = false; // an earlier cd / branch change may not have taken effect for the commands that follow
+  const forgetState = () => { dir = null; for (const e of ctx.branches.values()) e.name = null; };
+  // sticky: a later `cd /abs` does not make it known again (`alias cd=true; cd /safe`, a DEBUG trap that cds back)
+  const hazard = FUNCTION_DEF.test(str) || cmds.some(isStateHazard);
   for (const [i, c] of cmds.entries()) {
     const argv = c.argv;
+    if (hazard) forgetState();
     // Only commands chained with && after it are certain to see the change (`cd d && git push`); anything else may run
     // without it (`false && cd d; git push`, `cd d &`, `(cd d)`, `cd d || git push`), so the state is unknown.
     if (uncertain && c.sep !== '&&') {
-      dir = null;
-      for (const e of ctx.branches.values()) e.name = null;
+      forgetState();
       uncertain = false;
     }
     if (argv.length) {
@@ -956,6 +979,11 @@ function evalString(str, startDir, ctx, level) {
       if (sf) verdict = checkScriptFile(sf, dir, ctx, level);
     }
     if (verdict && verdict.decision === 'deny') return verdict;
+    if (SOURCING.includes(name)) {
+      // what the sourced file did is not modelled: every later command sees an unknown directory, branch and variables
+      forgetState();
+      for (const k of Object.keys(ctx.vars)) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
+    }
   }
   return allowed();
 }

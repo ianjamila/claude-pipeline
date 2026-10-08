@@ -1584,3 +1584,49 @@ test('directory / branch / variable state from a command that may not have run i
   ];
   for (const c of allowCmds) assert.equal(evaluate(c, o).decision, 'allow', c);
 });
+
+// Background-scan finding on 4789b20 (state tracking): constructs that change where a later command runs, or what a
+// variable holds, without anything the walk follows. Each deny below pushes from the `main` checkout in a real shell.
+test('namerefs, function / alias / trap definitions, shell options and sourced files make the state unknown', () => {
+  const files = {
+    '/safe/go.sh': 'cd /work/repo\n',
+    '/safe/vars.sh': 'B=main\n',
+    '/safe/env.sh': 'export NODE_ENV=test\n',
+  };
+  const o = {
+    byDir: { '/work/repo': 'main', '/safe': 'agent/x' },
+    labels: [],
+    readText: (p) => files[p] ?? null,
+    pathExists: (p) => p in files,
+  };
+  const denyCmds = [
+    // a nameref reads ANOTHER variable at run time; the text only names it
+    ['F=main; declare -n X=F; cd /safe && git push origin HEAD:$X', '/work/repo'],
+    ['cd /safe && F=main; typeset -n X=F; git push origin HEAD:$X', '/work/repo'],
+    ['F=main; declare -n X; X=F; cd /safe && git push origin HEAD:$X', '/work/repo'],
+    // a function body is parsed as if it ran; it never does unless called
+    ['f(){ cd /safe; }; git push', '/work/repo'],
+    ['f () { cd /safe; }; git push', '/work/repo'],
+    ['function f { cd /safe; }; git push', '/work/repo'],
+    // aliases, traps and options change what a later `cd` does, or run a cd of their own
+    ['alias cd=true; cd /safe; git push', '/work/repo'],
+    ['trap "cd /work/repo" DEBUG; cd /safe; git push', '/work/repo'],
+    ['setopt autocd; /work/repo; git push', '/safe'],
+    ['set -o autocd; cd /safe && git push', '/work/repo'],
+    ['enable -n cd; cd /safe; git push', '/work/repo'],
+    // a sourced file runs in this shell: it may cd, or reassign a variable the line already set
+    ['source ./go.sh; git push', '/safe'],
+    ['. ./go.sh && git push', '/safe'],
+    ['B=agent/x; source ./vars.sh; git push origin HEAD:$B', '/safe'],
+  ];
+  for (const [c, cwd] of denyCmds) assert.equal(evaluate(c, { ...o, cwd }).decision, 'deny', c);
+  const allowCmds = [
+    ['set -e; cd /safe && git push', '/work/repo'],
+    ['set -euo pipefail; cd /safe && git push', '/work/repo'],
+    ['arr=(); cd /safe && git push', '/work/repo'], // an empty array is not a function definition
+    ['alias ll="ls -l"; ll', '/safe'], // no git / gh on the line
+    ['source ./env.sh && npm test', '/safe'],
+    ['declare -r B=agent/x; git push origin HEAD:$B', '/safe'], // -r is not -n
+  ];
+  for (const [c, cwd] of allowCmds) assert.equal(evaluate(c, { ...o, cwd }).decision, 'allow', c);
+});
