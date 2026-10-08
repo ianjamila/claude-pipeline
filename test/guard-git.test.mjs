@@ -1453,9 +1453,11 @@ test('everyday flows stay allowed after the script, wrapper and destination rule
   for (const c of flows) assert.equal(evaluate(c, { branch: 'agent/x' }).decision, 'allow', c);
 });
 
-// Owner rule (PR #7 round 3): ANY word of ANY command that references a variable assigned more than once, or assigned
-// where it may not run (after && / ||, in a pipeline, subshell, if / loop / case), denies the whole line.
-test('a line that references an unsure variable is denied whatever the command', () => {
+// PR #7 round 3/4: an unsure variable (assigned more than once, or where it may not run: after && / ||, in a pipeline,
+// subshell, if / loop / case) denies the line when it reaches a git / gh command, a command that runs other code or
+// changes what runs (shells, source, eval, env, xargs, interpreters, a path or dynamic command name), cd / pushd /
+// popd, or the command name itself. Variables tainted by an unsure one are unsure too. Plain text tools stay usable.
+test('a line that passes an unsure variable to something that runs code or picks the repository is denied', () => {
   const files = { 'run.sh': 'git push origin main', 'run.js': 'x', 'run.py': 'x' };
   const denyCmds = [
     'F=run.sh; F=run.sh; bash "$F"',
@@ -1471,24 +1473,41 @@ test('a line that references an unsure variable is denied whatever the command',
     'E=a; E=b; env "$E" git status',
     'A=a; A=b; echo x | xargs $A',
     'A=a; A=b; eval "$A"',
-    'A=1; A=2; echo $A',
-    'A=1; A=2; ls ${A}',
-    'A=a; A=b; echo hi > $A',
-    'B=$B; B=x; true',
-    'echo $F; F=a; F=b', // used before the second assignment, same line
-    // assigned where it may not run
-    'false && X=agent/x; git push origin $X',
-    'true || X=a; echo $X',
-    'cd /work/repo && X=agent/x && git push origin $X',
-    'if true; then X=a; fi; echo $X',
-    'for i in 1 2; do X=$i; done; echo $X',
-    'while true; do X=a; done; echo $X',
-    'case a in a) X=1;; esac; echo $X',
-    '(X=a); echo $X',
-    'echo $(X=a); echo $X',
-    'X=a | cat; echo $X',
-    // reaches the script text through a nested evaluation
+    'A=a; A=b; $A status', // the command name itself
     'F=a; F=b; bash -c "echo $F"',
+    // assigned where it may not run, then handed to something that runs code or picks the repository
+    'false && X=agent/x; git push origin $X',
+    'true || X=a; bash $X',
+    'cd /work/repo && X=agent/x && git push origin $X',
+    'if true; then X=a; fi; bash $X',
+    'for i in 1 2; do X=$i; done; node $X',
+    'while true; do X=a; done; python $X',
+    'case a in a) X=1;; esac; source $X',
+    '(X=a); cd $X',
+    'echo $(X=a); sh $X',
+    'X=a | cat; gh pr view $X',
+    // taint: a value built from an unsure variable is unsure itself
+    'F=a; F=b; X=$F; bash "$X"',
+    'F=a; F=b; X=${F}.sh; Y=$X; source "$Y"',
+    'F=a; F=b; export X=$F; git push origin $X',
+    'F=a; F=b; X=$(echo $F); bash "$X"',
+    // command-substitution bodies are commands of their own
+    'D=a; D=b; s=$(git push origin "$D")',
+    'D=a; D=b; echo "$(gh issue close "$D")"',
+    'D=a; D=b; s=`git push origin $D`',
+    'D=a; D=b; r=$(bash "$D"); echo $r',
+    // round 4: anything outside the text-tool ALLOWLIST is sensitive — a list of runners is never complete
+    'F=a; F=b; awk "BEGIN{system(\"$F\")}"', // awk runs commands
+    'F=a; F=b; sed "e $F" x', // so does sed's e command
+    'F=a; F=b; docker run "$F"',
+    'F=a; F=b; cp "$F" run.sh', // the hook reads run.sh as it is NOW
+    'F=a; F=b; /bin/echo $F', // a path names whatever is there, not the builtin
+    // …and the value reaches it through a redirect or a pipe, not only its arguments
+    'F=a; F=b; tee x <<< "$F"',
+    'F=a; F=b; echo "$F" | node',
+    'F=a; F=b; echo "$F" | xargs git push origin',
+    'F=a; F=b; echo "$F" |& sh',
+    'F=a; F=b; printf "%s" "$F" | grep . | python3',
   ];
   for (const c of denyCmds) assert.equal(evaluate(c, withFiles(files, { branch: 'agent/x', labels: [] })).decision, 'deny', c);
   const allowCmds = [
@@ -1498,6 +1517,70 @@ test('a line that references an unsure variable is denied whatever the command',
     'B=agent/y && git push -u origin ${B}',
     'export B=agent/y; echo $B',
     'echo $UNSET_ANYWHERE',
+    // unsure variables that only reach text tools
+    'A=1; A=2; echo $A',
+    'A=1; A=2; ls ${A}',
+    'echo $F; F=a; F=b',
+    'B=$B; B=x; true',
+    'A=a; A=b; echo hi > $A',
+    'if true; then X=a; fi; echo $X',
+    'for i in 1 2; do X=$i; done; echo $X',
+    'X=a | cat; echo $X',
+    'for i in $(seq 1 55); do s=$(gh pr view 15 --json x --jq y); n=$(echo "$s" | grep -c Z); [ "$n" -ge 2 ] && break; sleep 10; done',
+    'for f in a b; do x=$f; echo "$x"; done',
+    'if [ -n "$Y" ]; then Z=1; fi; echo $Z',
+    'r=$(gh pr checks 5); case "$r" in *fail*) echo bad;; esac',
+    'n=1; n=2; printf "%s\\n" "$n" | wc -l; sleep $n; seq 1 $n | tail -1',
+    // round 4: a pipeline of text tools, a here-string into one, and the usual CI polling loops
+    'F=a; F=b; echo "$F" | grep x | wc -l',
+    'F=a; F=b; cat <<< "$F"',
+    'x=1; x=2; echo $x |& cat',
+    'F=a; F=b; printf "%s" "$F" > out.txt',
+    'n=0; while [ $n -lt 3 ]; do n=$((n+1)); sleep 1; done; echo $n',
+    'for i in 1 2 3; do r=$(gh run view 5 --json status --jq .status); [ "$r" = completed ] && break; sleep 30; done; echo "$r"',
+    'until gh pr checks 15; do sleep 60; done',
   ];
   for (const c of allowCmds) assert.equal(evaluate(c, withFiles(files, { branch: 'agent/x', labels: [] })).decision, 'allow', c);
+});
+
+// Background-scan findings on fcb708c: state set by a command that may not have run (after && / ||, in the background,
+// a pipeline stage, a subshell, a substitution) must not be trusted by the commands after it, and builtins that assign
+// variables without a NAME=value word make the variable unsure.
+test('directory / branch / variable state from a command that may not have run is unknown', () => {
+  const o = { byDir: { '/work/repo': 'main', '/safe': 'agent/x' }, labels: [] };
+  const denyCmds = [
+    'false && cd /safe; git push',
+    'cd /safe & git push',
+    'cd /safe &\ngit push',
+    '(cd /safe); git push',
+    'echo $(cd /safe); git push',
+    'cd /safe | cat; git push',
+    'cd /safe || git push',
+    'false && pushd /safe; git push',
+    'false && git checkout agent/y; git push',
+    'git checkout agent/y & git push',
+    '(git checkout agent/y); git push',
+    'git checkout agent/y || true; git push',
+    'echo $(git checkout agent/y); git push',
+    'git checkout agent/y | cat; git push',
+    // a variable bound by a builtin that has no NAME=value word
+    'B=agent/x; read B <<< main; git push origin HEAD:$B',
+    'B=agent/x; printf -v B main; git push origin HEAD:$B',
+    'B=agent/x; unset B; git push origin HEAD:$B',
+    'B=agent/x; let B=5; git push origin HEAD:$B',
+    'B=agent/x; getopts a B -a; git push origin HEAD:$B',
+    'B=agent/x; mapfile B <<< main; git push origin HEAD:$B',
+    'B=agent/x & git push origin HEAD:$B',
+  ];
+  for (const c of denyCmds) assert.equal(evaluate(c, o).decision, 'deny', c);
+  const allowCmds = [
+    'cd /safe && git push',
+    'true && cd /safe && git push',
+    'git checkout agent/y && git push',
+    'cd /safe; git push',
+    'git checkout agent/y; git push',
+    'cd /safe > /dev/null 2>&1 && git push', // redirects and &> are not a background job
+    'cd /safe &>/dev/null; git status',
+  ];
+  for (const c of allowCmds) assert.equal(evaluate(c, o).decision, 'allow', c);
 });

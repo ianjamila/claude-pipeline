@@ -588,7 +588,7 @@ function stdinSource(seg) {
 function emit(ctx, argv, env, raw, depth, redirects = [], sep = ';') {
   if (ctx.out.length >= MAX_COMMANDS) { ctx.truncated = true; ctx.stopped = true; return null; }
   const cmd = { argv, env, raw, depth, redirects };
-  // sep: the operator before it (; && || |), for callers that care whether it surely runs; not enumerable, like `truncated`
+  // sep: the operator before it (; & && || |), for callers that care whether it surely runs; not enumerable, like `truncated`
   Object.defineProperty(cmd, 'sep', { value: sep, enumerable: false });
   ctx.out.push(cmd);
   return cmd;
@@ -916,7 +916,7 @@ class Parser {
           flushWord(); startSeg();
           redir = 'file'; rfd = null;
           if (s[this.i + 2] === '>') { rop = '&>>'; this.i += 3; } else { rop = '&>'; this.i += 2; }
-        } else { endSeg(this.i); lastSep = ';'; this.i++; }
+        } else { endSeg(this.i); lastSep = '&'; this.i++; } // a background job: the command before it ran in a subshell
       } else if (c === '|') {
         const nx = s[this.i + 1];
         endSeg(this.i);

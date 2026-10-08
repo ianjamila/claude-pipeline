@@ -807,6 +807,11 @@ function checkScriptFile(sf, dir, ctx, level) {
 // Shell keywords (and a ( subshell) that make an assignment conditional or repeated; the parser flattens them away.
 const CONTROL_FLOW = /(?:^|[\s;&|(){])(?:if|then|elif|else|for|while|until|do|case|select)(?=[\s;&|(){]|$)|(?:^|[\s;&|])\(/;
 
+// A command followed by | or & ran in a subshell (a pipeline stage / background job): what it assigned or changed is lost.
+const ranInSubshell = (cmds, i) => cmds[i]?.sep === '|' || cmds[i + 1]?.sep === '|' || cmds[i + 1]?.sep === '&';
+const VALUE_BINDERS = new Set(['read', 'mapfile', 'readarray', 'getopts', 'unset', 'let', 'printf', 'select']);
+const STATE_GIT = new Set(['checkout', 'switch', 'branch', 'rebase', 'symbolic-ref', 'worktree', 'config']);
+
 // Collects every assignment on the line BEFORE any command is judged. A name assigned more than once, or assigned
 // where it may not run (after && / ||, in a pipeline, a subshell, an if / loop / case), is unsure for the whole line.
 function collectAssignments(cmds, str, ctx) {
@@ -814,9 +819,14 @@ function collectAssignments(cmds, str, ctx) {
   const bump = (k, n) => counts.set(k, (counts.get(k) ?? (k in ctx.vars || ctx.unsureVars.has(k) ? 1 : 0)) + n);
   const flow = CONTROL_FLOW.test(str);
   for (const [i, c] of cmds.entries()) {
-    // a pipeline stage runs in a subshell, so  assigns nothing for later commands
-    const piped = c.sep === '|' || cmds[i + 1]?.sep === '|';
-    const n = flow || c.depth > 0 || c.sep === '&&' || c.sep === '||' || piped ? 2 : 1;
+    const n = flow || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) ? 2 : 1;
+    // builtins that bind a variable without a NAME=value word: its value is whatever was read / parsed at run time
+    if (c.argv.length && VALUE_BINDERS.has(baseName(c.argv[0]))) {
+      for (const a of c.argv.slice(1)) {
+        const m = /^([A-Za-z_][A-Za-z0-9_]*)/.exec(a);
+        if (m) bump(m[1], 2);
+      }
+    }
     for (const k of Object.keys(c.env)) bump(k, n);
     if (c.argv.length && VAR_BUILTINS.includes(baseName(c.argv[0]))) {
       for (const a of c.argv.slice(1)) {
@@ -828,6 +838,63 @@ function collectAssignments(cmds, str, ctx) {
   for (const [k, n] of counts) if (n > 1) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
 }
 
+// Commands that may be handed an unsure value: they print, compare, count or wait, and run nothing. An ALLOWLIST on purpose
+// — a list of the commands that run code is never complete (awk's system(), sed's `e`, find -exec, tar --to-command,
+// rsync -e, git aliases …). Shell keywords and the variable builtins are here because the parser emits them as commands;
+// what they bind is tracked by collectAssignments and the taint pass below. Anything not listed is sensitive.
+const UNSURE_OK = new Set([
+  'echo', 'printf', 'test', '[', '[[', 'true', 'false', ':', 'sleep', 'seq', 'wc', 'head', 'tail', 'cat', 'sort', 'uniq',
+  'cut', 'tr', 'grep', 'egrep', 'fgrep', 'rg', 'jq', 'date', 'basename', 'dirname', 'expr', 'ls', 'stat', 'pwd',
+  'case', 'for', 'select', 'if', 'then', 'elif', 'else', 'while', 'until', 'do', '!',
+  'break', 'continue', 'return', 'exit', 'shift',
+  ...VAR_BUILTINS, ...VALUE_BINDERS,
+]);
+const DIR_CHANGERS = ['cd', 'pushd', 'popd'];
+
+// An unsure variable (assigned more than once, or where it may not run) that reaches a command whose effect may depend on
+// the value — anything outside UNSURE_OK, a path or dynamic command name, or the command name itself — directly (argv,
+// env prefix, a redirect such as `<<< "$F"`) or through a pipe (`echo "$F" | xargs git push`: every stage of a pipeline
+// with a sensitive stage counts). Returns the variable's name, or null.
+function unsureVarReachingCommand(cmds, ctx) {
+  // taint: a variable assigned from an unsure one is unsure (`X=$F; bash "$X"`), to a fixed point
+  const assigns = [];
+  for (const c of cmds) {
+    if (!c.argv.length) assigns.push(...Object.entries(c.env));
+    else if (VAR_BUILTINS.includes(baseName(c.argv[0]))) {
+      for (const a of c.argv.slice(1)) {
+        const m = /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/.exec(a);
+        if (m) assigns.push([m[1], m[2]]);
+      }
+    }
+  }
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const [k, v] of assigns) {
+      if (!ctx.unsureVars.has(k) && unsureVarUsed([v], ctx) !== null) { delete ctx.vars[k]; ctx.unsureVars.add(k); changed = true; }
+    }
+  }
+  const sensitive = (c) => {
+    const head = c.argv[0];
+    return !UNSURE_OK.has(baseName(head)) || head.includes('/') || DYNAMIC.test(head) || unsureVarUsed([head], ctx) !== null;
+  };
+  const words = (c) => [...c.argv, ...Object.values(c.env), ...(c.redirects ?? []).map((r) => r.target ?? '')];
+  // pipelines: runs of commands joined by | (command-substitution bodies are commands of their own in this list)
+  const groups = [];
+  for (const [i, c] of cmds.entries()) {
+    if (i > 0 && c.sep === '|' && groups.length) groups[groups.length - 1].push(c);
+    else groups.push([c]);
+  }
+  for (const g of groups) {
+    const live = g.filter((c) => c.argv.length);
+    if (!live.some(sensitive)) continue;
+    for (const c of g) {
+      const hit = unsureVarUsed(words(c), ctx);
+      if (hit !== null) return hit;
+    }
+  }
+  return null;
+}
+
 function evalString(str, startDir, ctx, level) {
   if (level > MAX_NESTING) return deny('pipeline job start / alias is nested too deeply to verify.');
   const cmds = simpleCommands(str);
@@ -837,16 +904,30 @@ function evalString(str, startDir, ctx, level) {
   if (cmds.dynamic && GUARDED_WORDS.test(str)) {
     return deny('the command that runs is only known at run time ($VAR / $(...) / piped into a shell) and the line mentions a guarded operation, so it cannot be verified. Write the command out literally.');
   }
-  // Whatever the command (git, gh, bash / source / node running a script, cd, env, xargs, eval, echo …), a word that
-  // references a variable whose value is not certain denies the line: the checks below read the expanded text.
+  // A variable whose value is not certain (see collectAssignments) denies the line when it reaches git / gh, a command
+  // that runs code, cd / pushd / popd or a command name: the checks below read the expanded text.
   collectAssignments(cmds, str, ctx);
   if (ctx.unsureVars.size) {
-    const unsure = unsureVarUsed([str, ...cmds.flatMap((c) => [...c.argv, ...Object.values(c.env)])], ctx);
+    const unsure = unsureVarReachingCommand(cmds, ctx);
     if (unsure !== null) return deny(`$${unsure} is assigned more than once (or where it may not run) on this line, so its value at run time cannot be verified. Assign it once, unconditionally.`);
   }
   let dir = startDir;
-  for (const c of cmds) {
+  const flow = CONTROL_FLOW.test(str);
+  let uncertain = false; // an earlier cd / branch change may not have taken effect for the commands that follow
+  for (const [i, c] of cmds.entries()) {
     const argv = c.argv;
+    // Only commands chained with && after it are certain to see the change (`cd d && git push`); anything else may run
+    // without it (`false && cd d; git push`, `cd d &`, `(cd d)`, `cd d || git push`), so the state is unknown.
+    if (uncertain && c.sep !== '&&') {
+      dir = null;
+      for (const e of ctx.branches.values()) e.name = null;
+      uncertain = false;
+    }
+    if (argv.length) {
+      const nm = baseName(argv[0]);
+      const changesState = DIR_CHANGERS.includes(nm) || (nm === 'git' && argv.some((w) => STATE_GIT.has(w)) && !argv.some((w) => w === '--show-current' || w === '--list' || w === '-l'));
+      if (changesState && (flow || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) || cmds[i + 1]?.sep === '||')) uncertain = true;
+    }
     if (!argv.length) { recordVars(c.env, ctx); continue; } // a bare `NAME=value`
     const name = baseName(argv[0]);
     let verdict = null;
