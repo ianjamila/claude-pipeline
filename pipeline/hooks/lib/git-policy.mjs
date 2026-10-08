@@ -457,6 +457,8 @@ function checkIssueHold(num, repoArgs, dir, ctx, action) {
   if (DYNAMIC.test(num)) return deny(`the issue number "${num}" is built at run time, so whether it carries pipeline-pause or pipeline-rollback cannot be verified. Name the issue number.`);
   let labels;
   try {
+    // no -R / GH_REPO: the repository is the directory's — unknown after a cd that may not have run
+    if (dir === null && !(repoArgs && repoArgs.length)) throw new Error('cannot tell which directory (so which repository) this runs in; name it with -R owner/repo');
     labels = ctx.issueLabels(num, repoArgs, dir ?? ctx.cwd);
     if (!Array.isArray(labels)) throw new Error('unexpected lookup result');
   } catch (err) {
@@ -780,6 +782,8 @@ function checkScriptFile(sf, dir, ctx, level) {
       : null;
   }
   const home = file === '~' || file.startsWith('~/') ? ctx.home + file.slice(1) : file;
+  // a relative script after a cd that may not have run: which file runs is unknown, never the starting directory's
+  if (dir === null && !path.isAbsolute(home)) return deny(`cannot tell which directory this runs in, so which ${sf.file} runs cannot be verified. Use an absolute path, or chain the cd with &&.`);
   const abs = path.resolve(dir ?? ctx.cwd, home);
   const text = ctx.readText(abs);
   if (typeof text !== 'string') {
@@ -804,8 +808,20 @@ function checkScriptFile(sf, dir, ctx, level) {
 
 // ---- entry point ----------------------------------------------------------------------------------------
 
-// Shell keywords (and a ( subshell) that make an assignment conditional or repeated; the parser flattens them away.
-const CONTROL_FLOW = /(?:^|[\s;&|(){])(?:if|then|elif|else|for|while|until|do|case|select)(?=[\s;&|(){]|$)|(?:^|[\s;&|])\(/;
+// The parser drops compound-command keywords but leaves them at the start of the command's raw text (`while ! gh …`,
+// `do sleep 30`, `then git push`); `for` / `case` / `select` stay as the command name.
+const FLOW_START = /^\s*(?:if|then|elif|else|while|until|for|do|case|select)(?=[\s;&|(){]|$)/;
+// A ( subshell is NOT marked by the parser (depth stays 0), so it is found in the text — with quoted strings removed,
+// so prose in a commit message (`-m "fix (again)"`) does not count.
+const SUBSHELL_PAREN = /(?:^|[\s;&|])\(/;
+const unquoted = (str) => str.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, '""');
+// Index of the first command that may run conditionally or repeatedly because of control flow; every command from
+// there on is treated that way (conservative after the loop / if ends). -1: none. 0: the whole line (a subshell).
+function flowStart(cmds, str) {
+  if (SUBSHELL_PAREN.test(unquoted(str))) return 0;
+  return cmds.findIndex((c) => FLOW_START.test(c.raw ?? '') || ['for', 'case', 'select'].includes(c.argv[0]));
+}
+const inFlow = (from, i) => from >= 0 && i >= from;
 
 // A command followed by | or & ran in a subshell (a pipeline stage / background job): what it assigned or changed is lost.
 const ranInSubshell = (cmds, i) => cmds[i]?.sep === '|' || cmds[i + 1]?.sep === '|' || cmds[i + 1]?.sep === '&';
@@ -817,9 +833,9 @@ const STATE_GIT = new Set(['checkout', 'switch', 'branch', 'rebase', 'symbolic-r
 function collectAssignments(cmds, str, ctx) {
   const counts = new Map();
   const bump = (k, n) => counts.set(k, (counts.get(k) ?? (k in ctx.vars || ctx.unsureVars.has(k) ? 1 : 0)) + n);
-  const flow = CONTROL_FLOW.test(str);
+  const from = flowStart(cmds, str);
   for (const [i, c] of cmds.entries()) {
-    const n = flow || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) ? 2 : 1;
+    const n = inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) ? 2 : 1;
     // builtins that bind a variable without a NAME=value word: its value is whatever was read / parsed at run time
     if (c.argv.length && VALUE_BINDERS.has(baseName(c.argv[0]))) {
       for (const a of c.argv.slice(1)) {
@@ -932,7 +948,7 @@ function evalString(str, startDir, ctx, level) {
     if (unsure !== null) return deny(`$${unsure} is assigned more than once (or where it may not run) on this line, so its value at run time cannot be verified. Assign it once, unconditionally.`);
   }
   let dir = startDir;
-  const flow = CONTROL_FLOW.test(str);
+  const from = flowStart(cmds, str);
   let uncertain = false; // an earlier cd / branch change may not have taken effect for the commands that follow
   const forgetState = () => { dir = null; for (const e of ctx.branches.values()) e.name = null; };
   // sticky: a later `cd /abs` does not make it known again (`alias cd=true; cd /safe`, a DEBUG trap that cds back)
@@ -949,7 +965,9 @@ function evalString(str, startDir, ctx, level) {
     if (argv.length) {
       const nm = baseName(argv[0]);
       const changesState = DIR_CHANGERS.includes(nm) || (nm === 'git' && argv.some((w) => STATE_GIT.has(w)) && !argv.some((w) => w === '--show-current' || w === '--list' || w === '-l'));
-      if (changesState && (flow || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) || cmds[i + 1]?.sep === '||')) uncertain = true;
+      // `cd d || exit`: when the cd fails nothing after it runs, so the commands that do run see the change
+      const orExits = cmds[i + 1]?.sep === '||' && ['exit', 'return'].includes(cmds[i + 1].argv[0]) && cmds[i + 2]?.sep !== '|' && cmds[i + 2]?.sep !== '&';
+      if (changesState && (inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) || (cmds[i + 1]?.sep === '||' && !orExits))) uncertain = true;
     }
     if (!argv.length) { recordVars(c.env, ctx); continue; } // a bare `NAME=value`
     const name = baseName(argv[0]);
@@ -983,6 +1001,9 @@ function evalString(str, startDir, ctx, level) {
       // what the sourced file did is not modelled: every later command sees an unknown directory, branch and variables
       forgetState();
       for (const k of Object.keys(ctx.vars)) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
+      // the check above ran before these became unsure: run it again for what follows (`F=run.sh; source env.sh; bash "$F"`)
+      const unsure = unsureVarReachingCommand(cmds.slice(i + 1), ctx);
+      if (unsure !== null) return deny(`$${unsure} may be reassigned by the file ${name === '.' ? '.' : 'source'} runs, so its value at run time cannot be verified. Use it before sourcing, or write the value out.`);
     }
   }
   return allowed();

@@ -1630,3 +1630,52 @@ test('namerefs, function / alias / trap definitions, shell options and sourced f
   ];
   for (const [c, cwd] of allowCmds) assert.equal(evaluate(c, { ...o, cwd }).decision, 'allow', c);
 });
+
+// Codex round 4 on 5730f1f: state that becomes unknown mid-line is enforced for what follows, an unknown directory never
+// falls back to the starting one, and control flow is judged from where it starts (not from a word in a commit message).
+test('state that becomes unknown mid-line stays enforced; control flow counts from where it starts', () => {
+  const files = {
+    '/work/repo/env.sh': 'export NODE_ENV=test\n',
+    '/work/repo/run.sh': 'git push origin main\n',
+    '/other/run.sh': 'git push origin main\n',
+    '/work/repo/ok.sh': 'echo hi\n',
+    // harmless where the line starts, a push to main where the cd may have gone
+    '/work/repo/step.sh': 'echo hi\n',
+    '/other/step.sh': 'git push origin main\n',
+  };
+  const o = {
+    byDir: { '/work/repo': 'agent/x', '/other': 'agent/y' },
+    labelsByNum: {},
+    readText: (p) => files[p] ?? null,
+    pathExists: (p) => p in files,
+  };
+  const denyCmds = [
+    // a variable known when the line was first checked, unknown after `source`
+    'F=run.sh; source env.sh; bash "$F"',
+    'F=run.sh; source env.sh; source "$F"',
+    'F=run.sh; . ./env.sh && node "$F"',
+    // a directory that may have changed: the script that runs is not the starting directory's
+    'true && cd /other; bash step.sh',
+    'false || cd /other; ./step.sh',
+    'cd /other || exit 1 & git push', // `|| exit` does not help a backgrounded cd
+    // a ( subshell is still found in the text
+    '(B=main); git push origin HEAD:$B',
+  ];
+  for (const c of denyCmds) assert.equal(evaluate(c, o).decision, 'deny', c);
+  // the issue lives in the repository of a directory that may have changed: never looked up in the starting one
+  const v = evaluate('true && cd /other; gh issue close 9', { ...o, labels: [] });
+  assert.equal(v.decision, 'deny');
+  assert.match(v.reason, /which directory/);
+  assert.equal(v.calls.labels.length, 0);
+  assert.equal(evaluate('true && cd /other; gh issue close 9 -R o/r', { ...o, labels: [] }).decision, 'allow');
+  const allowCmds = [
+    'PR=7; while ! gh pr checks "$PR"; do sleep 30; done',
+    'B=agent/x; git commit -m "fix for loop"; git push origin "$B"',
+    'git commit -m "fix (again)"; B=agent/x; git push origin HEAD:$B',
+    'cd /other || exit 1; git push',
+    'cd /other || return; git push',
+    'cd /other; bash ok.sh',
+    'source env.sh && npm test',
+  ];
+  for (const c of allowCmds) assert.equal(evaluate(c, o).decision, 'allow', c);
+});
