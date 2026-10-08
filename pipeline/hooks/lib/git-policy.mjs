@@ -804,6 +804,30 @@ function checkScriptFile(sf, dir, ctx, level) {
 
 // ---- entry point ----------------------------------------------------------------------------------------
 
+// Shell keywords (and a ( subshell) that make an assignment conditional or repeated; the parser flattens them away.
+const CONTROL_FLOW = /(?:^|[\s;&|(){])(?:if|then|elif|else|for|while|until|do|case|select)(?=[\s;&|(){]|$)|(?:^|[\s;&|])\(/;
+
+// Collects every assignment on the line BEFORE any command is judged. A name assigned more than once, or assigned
+// where it may not run (after && / ||, in a pipeline, a subshell, an if / loop / case), is unsure for the whole line.
+function collectAssignments(cmds, str, ctx) {
+  const counts = new Map();
+  const bump = (k, n) => counts.set(k, (counts.get(k) ?? (k in ctx.vars || ctx.unsureVars.has(k) ? 1 : 0)) + n);
+  const flow = CONTROL_FLOW.test(str);
+  for (const [i, c] of cmds.entries()) {
+    // a pipeline stage runs in a subshell, so  assigns nothing for later commands
+    const piped = c.sep === '|' || cmds[i + 1]?.sep === '|';
+    const n = flow || c.depth > 0 || c.sep === '&&' || c.sep === '||' || piped ? 2 : 1;
+    for (const k of Object.keys(c.env)) bump(k, n);
+    if (c.argv.length && VAR_BUILTINS.includes(baseName(c.argv[0]))) {
+      for (const a of c.argv.slice(1)) {
+        const m = /^([A-Za-z_][A-Za-z0-9_]*)=/.exec(a);
+        if (m) bump(m[1], n);
+      }
+    }
+  }
+  for (const [k, n] of counts) if (n > 1) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
+}
+
 function evalString(str, startDir, ctx, level) {
   if (level > MAX_NESTING) return deny('pipeline job start / alias is nested too deeply to verify.');
   const cmds = simpleCommands(str);
@@ -812,6 +836,13 @@ function evalString(str, startDir, ctx, level) {
   if (cmds.truncated) return deny('command too complex to verify (the parser gave up). Split it into simpler commands.');
   if (cmds.dynamic && GUARDED_WORDS.test(str)) {
     return deny('the command that runs is only known at run time ($VAR / $(...) / piped into a shell) and the line mentions a guarded operation, so it cannot be verified. Write the command out literally.');
+  }
+  // Whatever the command (git, gh, bash / source / node running a script, cd, env, xargs, eval, echo …), a word that
+  // references a variable whose value is not certain denies the line: the checks below read the expanded text.
+  collectAssignments(cmds, str, ctx);
+  if (ctx.unsureVars.size) {
+    const unsure = unsureVarUsed([str, ...cmds.flatMap((c) => [...c.argv, ...Object.values(c.env)])], ctx);
+    if (unsure !== null) return deny(`$${unsure} is assigned more than once (or where it may not run) on this line, so its value at run time cannot be verified. Assign it once, unconditionally.`);
   }
   let dir = startDir;
   for (const c of cmds) {

@@ -585,9 +585,11 @@ function stdinSource(seg) {
 
 // ---- the parser ---------------------------------------------------------------------------------
 
-function emit(ctx, argv, env, raw, depth, redirects = []) {
+function emit(ctx, argv, env, raw, depth, redirects = [], sep = ';') {
   if (ctx.out.length >= MAX_COMMANDS) { ctx.truncated = true; ctx.stopped = true; return null; }
   const cmd = { argv, env, raw, depth, redirects };
+  // sep: the operator before it (; && || |), for callers that care whether it surely runs; not enumerable, like `truncated`
+  Object.defineProperty(cmd, 'sep', { value: sep, enumerable: false });
   ctx.out.push(cmd);
   return cmd;
 }
@@ -783,7 +785,7 @@ class Parser {
         seg = {
           words: [], heredocs: [], herestrings: [], redirects: [], stdinSubs: [], stdinFile: false, meta: new Map(), win: new Map(),
           start: this.i, depth, pending: 0, muted, raw: '', final: null, groupStage: null,
-          pipedFrom: lastSep === '|' ? this.lastStage : null,
+          pipedFrom: lastSep === '|' ? this.lastStage : null, sep: lastSep,
         };
       }
     };
@@ -1036,14 +1038,14 @@ class Parser {
       if (nextEq) value = nextEq.length > 1 ? nextEq.slice(1) : (words[i + 2]?.text ?? '');
       else if (value === '') value = words[i + 1]?.text ?? '';
       setEnv(env, ps[1], value);
-      return emit(this.ctx, [], env, seg.raw, seg.depth);
+      return emit(this.ctx, [], env, seg.raw, seg.depth, [], seg.sep);
     }
     for (; i < words.length; i++) {
       const a = assignOf(words[i]);
       if (!a) break;
       setEnv(env, a[0], a[1]);
     }
-    if (i >= words.length) return Object.keys(env).length ? emit(this.ctx, [], env, seg.raw, seg.depth) : null;
+    if (i >= words.length) return Object.keys(env).length ? emit(this.ctx, [], env, seg.raw, seg.depth, [], seg.sep) : null;
     // brace expansion: {a,b} in an unquoted word becomes several words (assignment words before the command are exempt)
     const argv = [];
     for (const w of words.slice(i)) {
@@ -1077,7 +1079,7 @@ class Parser {
     }
     // a command name that is only known at run time ($g push, $(echo git) push)
     if (a.length && (a[0].startsWith('$') || a[0].includes('$(') || a[0].includes('`'))) this.ctx.dynamic = true;
-    const cmd = emit(this.ctx, a, env, seg.raw, seg.depth);
+    const cmd = emit(this.ctx, a, env, seg.raw, seg.depth, [], seg.sep);
     if (!isExec) seg.final = { argv: a };
     this.interpret(a, seg);
     return cmd;

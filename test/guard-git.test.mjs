@@ -1294,7 +1294,7 @@ test('a protected argument built from a variable assigned twice fails closed', (
   for (const c of denyCmds) assert.equal(evaluate(c, { branch: 'agent/x', labels: [] }).decision, 'deny', c);
   // a run-time value that was never assigned on the line is still fine in a non-protected position
   assert.equal(evaluate('gh pr view $N --json title').decision, 'allow');
-  assert.equal(evaluate('A=1; A=2; echo $A; git status').decision, 'allow');
+  assert.equal(evaluate('A=1; A=2; git status').decision, 'allow'); // assigned twice but never used
 });
 
 // ---- script files and string-running wrappers (review findings 2 and 11) ------------------------------------
@@ -1451,4 +1451,53 @@ test('everyday flows stay allowed after the script, wrapper and destination rule
     'ls ~/.claude/skills',
   ];
   for (const c of flows) assert.equal(evaluate(c, { branch: 'agent/x' }).decision, 'allow', c);
+});
+
+// Owner rule (PR #7 round 3): ANY word of ANY command that references a variable assigned more than once, or assigned
+// where it may not run (after && / ||, in a pipeline, subshell, if / loop / case), denies the whole line.
+test('a line that references an unsure variable is denied whatever the command', () => {
+  const files = { 'run.sh': 'git push origin main', 'run.js': 'x', 'run.py': 'x' };
+  const denyCmds = [
+    'F=run.sh; F=run.sh; bash "$F"',
+    'F=run.sh; F=run.sh; sh $F',
+    'F=run.sh; F=run.sh; zsh "$F"',
+    'F=run.sh; F=run.sh; source "$F"',
+    'F=run.sh; F=run.sh; . "$F"',
+    'F=run.js; F=run.js; node "$F"',
+    'F=run.py; F=run.py; python3 $F',
+    'F=./run.sh; F=./run.sh; "$F"',
+    'D=/work/repo; D=/other; cd "$D"; gh issue close 9',
+    'D=/work/repo; D=/other; pushd "$D"; gh issue close 9',
+    'E=a; E=b; env "$E" git status',
+    'A=a; A=b; echo x | xargs $A',
+    'A=a; A=b; eval "$A"',
+    'A=1; A=2; echo $A',
+    'A=1; A=2; ls ${A}',
+    'A=a; A=b; echo hi > $A',
+    'B=$B; B=x; true',
+    'echo $F; F=a; F=b', // used before the second assignment, same line
+    // assigned where it may not run
+    'false && X=agent/x; git push origin $X',
+    'true || X=a; echo $X',
+    'cd /work/repo && X=agent/x && git push origin $X',
+    'if true; then X=a; fi; echo $X',
+    'for i in 1 2; do X=$i; done; echo $X',
+    'while true; do X=a; done; echo $X',
+    'case a in a) X=1;; esac; echo $X',
+    '(X=a); echo $X',
+    'echo $(X=a); echo $X',
+    'X=a | cat; echo $X',
+    // reaches the script text through a nested evaluation
+    'F=a; F=b; bash -c "echo $F"',
+  ];
+  for (const c of denyCmds) assert.equal(evaluate(c, withFiles(files, { branch: 'agent/x', labels: [] })).decision, 'deny', c);
+  const allowCmds = [
+    'A=1; A=2; git status', // assigned twice, never referenced
+    'false && X=agent/x; git status',
+    'B=agent/y; git push origin $B', // one assignment, referenced: unchanged
+    'B=agent/y && git push -u origin ${B}',
+    'export B=agent/y; echo $B',
+    'echo $UNSET_ANYWHERE',
+  ];
+  for (const c of allowCmds) assert.equal(evaluate(c, withFiles(files, { branch: 'agent/x', labels: [] })).decision, 'allow', c);
 });
