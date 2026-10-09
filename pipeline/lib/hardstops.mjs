@@ -16,9 +16,9 @@
 //    (R0-unscannable): git marks a text file "binary" on a single NUL byte, and nothing else would look at it.
 //  * Content rules (SQL, auth, secrets, env, sensitive terms) judge PRODUCTION code only: not tests, not documentation.
 //    "Documentation" is a file that cannot execute (markdown, text, images, pdf); under docs/ a .ts/.js/.sql module is
-//    still code, because production code can import it. Test files are exempt from every content rule EXCEPT key-shaped
-//    secret literals (a real key committed in a fixture leaks all the same; a "fake" marker counts only when it sits in the
-//    credential token itself, never in a comment or a neighbouring name on the line).
+//    still code, because production code can import it. Test files AND documentation are exempt from every content rule
+//    EXCEPT key-shaped secret literals (a real key committed in a fixture or pasted into a doc leaks all the same; a "fake"
+//    marker counts only when it sits in the credential token itself, never in a comment or a neighbouring name on the line).
 //    Path rules and the R1 migration rules judge every file.
 //  * An exempt file wired into production would never be judged, so BOTH directions are flagged (R0-unscannable):
 //      - forward: production code adds an import of one. Specifiers are read over the whole new file (an import split over
@@ -75,6 +75,7 @@ const MIGRATION_GLOBS = ['**/migrations/**'];
 // Documentation = content that cannot execute. Anything else under docs/ (a .ts, .mjs, .sql, .json, extensionless file...)
 // is code: `import x from '@/docs/evil'` resolves from the repo root in a typical Next app. .mdx is executable (JSX, imports),
 // so it is code everywhere; a .md under a Next route dir (app/, pages/) is a page when pageExtensions include md.
+// Exempt documentation is not wholly unjudged: like a test file it keeps the key-shaped secret rule (exemptSecretRules).
 // One list drives both the exemption (DOC_EXT) and the reverse check's search for doc links (CODE_PATHSPECS), so a doc type
 // can never be exempt yet unsearched. HTML is NOT here: it can run scripts wherever docs/ is published.
 const DOC_EXTS = ['md', 'txt', 'rst', 'adoc', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'ico', 'pdf'];
@@ -1329,11 +1330,12 @@ function addedCodeRules(d, added, cx, env, sink) {
   }
 }
 
-// The one content rule test files keep: a key-shaped literal that does not itself announce being fake.
-function testSecretRules(d, added, sink) {
+// The one content rule exempt files keep (test files AND non-code documentation): a key-shaped literal that does not itself
+// announce being fake. `what` only words the hit.
+function exemptSecretRules(d, added, sink, what) {
   for (const l of added) {
     const secret = realLookingSecret(l.text);
-    if (secret) sink.add('R3-secrets', d.file, `secret-like literal in a test file (${secret})`, { line: l.line });
+    if (secret) sink.add('R3-secrets', d.file, `secret-like literal in a ${what} (${secret})`, { line: l.line });
   }
 }
 
@@ -1378,9 +1380,9 @@ function lineRules(d, cx, env, sink) {
   const fit = (l) => l.text.length <= MAX_LINE;
   const added = d.added.filter(fit);
   const removed = d.removed.filter(fit);
-  // Content rules judge production code only: not tests, not docs/markdown.
+  // Content rules judge production code only: tests and documentation keep just the key-shaped-secret rule.
   if (d.addedIsCode) addedCodeRules(d, added, cx, env, sink);
-  else if (d.addedIsTest) testSecretRules(d, added, sink);
+  else exemptSecretRules(d, added, sink, d.addedIsTest ? 'test file' : 'documentation file');
   if (d.removedIsCode) removedCodeRules(d, removed, cx, sink);
   patternRules(d, added, removed, cx, sink);
 }

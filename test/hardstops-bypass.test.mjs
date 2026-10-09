@@ -257,8 +257,8 @@ test('5 secret-shaped literals are R3 in production code, and the hit never repe
 test('5 secret literals in SQL and workflows too; tests and docs are exempt; normal text is not a secret', () => {
   assert.ok(flags([A('supabase/migrations/5_a.sql', `select vault.create_secret('${SECRETS['Stripe live key']}', 'x');`)]).includes('R3-secrets'));
   assert.ok(flags([file('.github/workflows/x.yml', { added: [`  KEY: ${SECRETS['AWS access key id']}`] })]).includes('R3-secrets'));
-  // Tests keep ONE content rule (key-shaped secrets); see test/hardstops-exemptions.test.mjs. Docs are fully exempt.
-  assert.deepEqual(flags([file('docs/pay.md', { added: [SECRETS['Stripe live key']] })]), []);
+  // Tests and docs keep ONE content rule (key-shaped secrets); see test/hardstops-exemptions.test.mjs.
+  assert.deepEqual(flags([file('docs/pay.md', { added: [SECRETS['Stripe live key']] })]), ['R3-secrets']);
   assert.deepEqual(flags([file('lib/a.ts', { added: ['const a = "sk_live_"; const b = "AKIA"; // eyJ.eyJ.x'] })]), []);
 });
 
@@ -479,12 +479,12 @@ test('10 pgTAP tests: deleting or moving one is R4; editing one is not (content 
 
 // ---- 11. false positives that were removed -----------------------------------------------------------------------
 
-test('11 docs, markdown and test files are exempt from every content rule', () => {
+test('11 docs, markdown and test files are exempt from every content rule but key-shaped secrets', () => {
   const lines = [
     'service_role', 'createAdminClient()', 'DROP TABLE users;', 'GRANT ALL ON t TO anon;', 'process.env.BRAND_NEW', 'payroll', 'httpOnly: false',
     "role: 'admin'", "'use server'", 'supabase.auth.admin.deleteUser(1)', "sb.from('t').delete()",
   ];
-  assert.deepEqual(flags([file('docs/setup.md', { added: [SECRETS['AWS access key id']] })]), []);
+  assert.deepEqual(flags([file('docs/setup.md', { added: [SECRETS['AWS access key id']] })]), ['R3-secrets']);
   for (const p of ['docs/setup.md', 'README.md', 'lib/x.test.ts', 'lib/x.spec.tsx', 'e2e/a.spec.ts', 'supabase/tests/rls.test.sql', 'lib/__tests__/a.ts']) {
     assert.deepEqual(flags([file(p, { added: lines })]), [], p);
   }

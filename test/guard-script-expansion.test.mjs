@@ -714,18 +714,18 @@ test('R1-B1: variables set inside a judged script do not leak into the line that
   assert.equal(git('F=f.sh; bash $X d.sh; bash $F', gfs()).decision, 'deny'); // d.sh is only a candidate
   assert.equal(git('F=f.sh; sh ./d.sh; bash $F', gfs()).decision, 'deny');
   assert.equal(files('F=f.sh; bash d.sh; bash $F', ffs()).decision, 'deny');
-  // `source` does change the caller's variables: a definite one is believed...
-  assert.equal(git('F=f.sh; source d.sh; bash $F', gfs()).decision, 'allow');
+  // `source` does change the caller's variables; since #7 every variable it may have changed is unknown, even from a definite file
+  assert.equal(git('F=f.sh; source d.sh; bash $F', gfs()).decision, 'deny');
   // ...but a candidate that may or may not be the sourced file only makes the variable uncertain (old value judged, line dynamic)
   assert.equal(git('F=f.sh; source $X d.sh; bash $F', gfs()).decision, 'deny');
-  assert.equal(git('F=ok.sh; source $X d2.sh; bash $F', gfs()).decision, 'allow'); // F untouched by d2.sh
+  assert.equal(git('F=ok.sh; source $X d2.sh; bash $F', gfs()).decision, 'deny'); // #7
   assert.equal(git('X=-q; G=ok.sh; source $X d2.sh; bash $G && git push origin agent/x', gfs()).decision, 'deny'); // G may now be f.sh
   // the old and the new value of G are both judged: d2.sh sets G to the bad script
   assert.equal(git('X=-q; G=ok.sh; source $X d2.sh; bash $G', gfs()).decision, 'deny');
   // only the tainted variable is dynamic on these lines (no $X, no glob): it must still be acted on
   assert.equal(git('G=ok.sh; source -p /x d3.sh; bash $G && git push origin agent/x', gfs()).decision, 'deny');
   assert.equal(git('G=ok.sh; source -p /x d3.sh; bash $G', gfs()).decision, 'deny'); // a tainted variable picking the script is refused outright (round 9)
-  assert.equal(git('G=ok.sh; source -p /x d3.sh; G=ok.sh; bash $G && git push origin agent/x', gfs()).decision, 'allow'); // assigned again: known again
+  assert.equal(git('G=ok.sh; source -p /x d3.sh; G=ok.sh; bash $G && git push origin agent/x', gfs()).decision, 'deny'); // #7
   // a tainted variable is unknown to every other use too: a push destination in it is not resolved to one value
   assert.equal(git('B=agent/x; source -p /x d4.sh; git push origin HEAD:$B', gfs()).decision, 'deny');
 });
@@ -766,7 +766,7 @@ test('R1: repository and global state a speculative candidate may change is unkn
   assert.equal(git('bash p[12].sh && git zz', fs2('git status', 'git config alias.zz status')).decision, 'deny'); // defined by a candidate: unsure
   // config from the environment set inside a sourced candidate counts as dirty even though its variable is unknown afterwards
   assert.equal(git('source p[12].sh; git push', fs2('git status', 'GIT_CONFIG_COUNT=1')).decision, 'deny');
-  assert.equal(git('source p[12].sh; git push', fs2('git status', 'git status')).decision, 'allow');
+  assert.equal(git('source p[12].sh; git push', fs2('git status', 'git status')).decision, 'deny'); // #7
   // a config write is never undone: a candidate that may not run still leaves the config dirty
   assert.equal(git('bash p[12].sh && git push', fs2('git status', 'git branch -u origin/main')).decision, 'deny');
 });
@@ -797,16 +797,55 @@ test('R2-B2/B3: a variable a speculative source may have set stays tainted and n
   assert.equal(git('source p*.sh; bash d.sh; bash $F', sets).decision, 'deny');
   assert.equal(git('source p*.sh; source d.sh; bash $F', sets).decision, 'deny');
   assert.equal(git('source p*.sh; source d.sh; git push origin HEAD:$F', sets).decision, 'deny'); // the sourced value does not resolve it either
-  // only an assignment on the line itself makes the variable known again
-  assert.equal(git('F=ok.sh; source p*.sh; F=ok.sh; bash $F', sets).decision, 'allow');
-  assert.equal(git('F=ok.sh; source p*.sh; export F=ok.sh; bash $F', sets).decision, 'allow');
+  // since #7 a variable a source may have set is refused in every later sensitive command on the line, even once it is
+  // assigned again (as for a definite source: use it before sourcing)
+  assert.equal(git('source p*.sh; F=agent/x; git push origin HEAD:$F', sets).decision, 'deny');
+  assert.equal(git('source p*.sh; git push origin HEAD:agent/x', sets).decision, 'allow');
+  assert.equal(git('F=ok.sh; source p*.sh; F=ok.sh; bash $F', sets).decision, 'deny'); // #7
+  assert.equal(git('F=ok.sh; source p*.sh; export F=ok.sh; bash $F', sets).decision, 'deny'); // #7
   assert.equal(git('F=ok.sh; source p*.sh; F=f.sh; bash $F', sets).decision, 'deny');
   // a variable that is not used to pick the script keeps the old rule: unknown, denied only next to a guarded operation
   assert.equal(git('F=ok.sh; source p*.sh; echo $F', sets).decision, 'allow');
-  assert.equal(git('F=ok.sh; source p*.sh; bash ok.sh $F', sets).decision, 'allow');
+  assert.equal(git('F=ok.sh; source p*.sh; bash ok.sh $F', sets).decision, 'deny'); // #7
   assert.equal(git('F=ok.sh; source p*.sh; git push origin HEAD:$F', sets).decision, 'deny');
   // a child shell never taints the line
   assert.equal(git('bash p1.sh; F=ok.sh; bash $F', sets).decision, 'allow');
   // files-policy computes the variables of the line once, from the line's own text: a script's assignments never reach it
   assert.equal(files('F=a.sh; bash p1.sh; bash $F', filesFs({ 'p1.sh': 'F=w.sh' })).decision, 'allow');
+});
+
+// ---- merge with #7 (a variable assigned twice / after a source is unknown; a cd that may not run makes the directory unknown) ----
+
+test('merge with #7: a variable a speculative source may have set is unknown to every #7 check too', () => {
+  const g = gitFs({
+    'p1.sh': 'git status', 'p2.sh': 'GIT_DIR=/other/.git\nF=/work/repo/bad.sh', 'q1.sh': 'git status', 'q2.sh': 'GIT_CONFIG_COUNT=1',
+    'bad.sh': BAD_GIT, 'k.sh': 'X=$F; bash /work/repo/ok.sh $X',
+  });
+  // the repository a command acts on (GIT_DIR) and push configuration from the environment
+  assert.equal(git('source p[12].sh; git push origin HEAD:agent/x', g).decision, 'deny');
+  assert.equal(git('source q[12].sh; cd /work/repo; git checkout agent/y && git push', g).decision, 'deny');
+  assert.equal(git('source q1.sh; cd /work/repo; git checkout agent/y && git push', g).decision, 'allow');
+  // a tainted value reaching a command that runs code, directly or through another variable, here or in a judged script
+  assert.equal(git('source p[12].sh; cd /work/repo; X=$F; bash $X', g).decision, 'deny');
+  assert.equal(git('source p[12].sh; cd /work/repo; X=$F; bash /work/repo/ok.sh $X', g).decision, 'deny');
+  assert.equal(git('source p[12].sh; bash /work/repo/k.sh', g).decision, 'deny');
+});
+
+test('merge with #7: a child shell takes its unknown variables with it', () => {
+  const g = gitFs({ 'r.sh': 'X=main; X=b' });
+  // r.sh assigns X twice, in its own shell: the line's X is still agent/x
+  assert.equal(git('X=agent/x; bash r.sh; git push origin HEAD:$X', g).decision, 'allow');
+  // a sourced r.sh does reassign it
+  assert.equal(git('X=agent/x; source r.sh; git push origin HEAD:$X', g).decision, 'deny');
+});
+
+test('merge with #7: after a cd that may not have run, a relative candidate is refused, never judged in the starting directory', () => {
+  const g = gitFs({ 'sub/data.txt': 'import os' });
+  // python only judges words with a script extension, so no candidate is left to reach the per-file refusal
+  assert.equal(git('false && cd sub; python3 $X data.txt', g).decision, 'deny');
+  assert.match(git('false && cd sub; python3 $X data.txt', g).reason, /which directory/);
+  assert.equal(git('cd sub && python3 $X data.txt', g).decision, 'allow');
+  // accepted false positive: quoting is lost, so `"$F"` may also be a file literally named $F in the unknown directory
+  assert.equal(git('false && cd sub; F=/work/repo/ok.sh; bash "$F"', g).decision, 'deny');
+  assert.equal(git('F=/work/repo/ok.sh; bash "$F"', g).decision, 'allow');
 });

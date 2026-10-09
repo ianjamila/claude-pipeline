@@ -39,6 +39,7 @@ const GIT_GLOBAL_VALUE = ['--git-dir', '--work-tree', '--namespace', '--super-pr
 const API_LONG_VALUE = ['method', 'field', 'raw-field', 'header', 'input', 'jq', 'template', 'preview', 'hostname', 'cache'];
 const VAR_BUILTINS = ['export', 'declare', 'typeset', 'local', 'readonly'];
 const DYNAMIC = /[$`]/;
+const RUN_TIME_SUBCOMMAND = 'the git / gh subcommand is only known at run time ($VAR expansion, ${...}, $(...) or backticks), so what it does cannot be verified. Write the subcommand out literally.';
 // The only run-time destinations a push may use: "whatever branch I am on" (the branch itself is then checked).
 const CURRENT_BRANCH_IDIOM = /^(?:\$\(|`)\s*git\s+(?:branch\s+--show-current|rev-parse\s+--abbrev-ref\s+HEAD|symbolic-ref\s+--short\s+HEAD)\s*(?:\)|`)$/;
 // Config the environment can inject into git (GIT_CONFIG_COUNT/KEY_n/VALUE_n, GIT_CONFIG_PARAMETERS, GIT_CONFIG_GLOBAL/SYSTEM).
@@ -114,13 +115,45 @@ function expandVars(text, vars) {
   return String(text).replace(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g, (m, a, b) => vars[a ?? b] ?? m);
 }
 
-// Only an assignment on the line itself (level 0) makes a tainted variable known again; one inside a judged script is ignored for it
-const setVar = (ctx, k, v, level) => {
+// A variable assigned more than once in what is judged (`B=main; false && B=agent/x`) is unknown from then on: which
+// assignment ran depends on control flow the parser does not model, so its value is left as `$B` (dynamic).
+// Only an assignment on the line itself (level 0) makes a tainted variable known again; one inside a judged script is ignored for it.
+function setVar(ctx, k, v, level) {
   if (level === 0) ctx.tainted.delete(k);
   else if (ctx.tainted.has(k)) return;
-  ctx.vars[k] = v;
-};
+  if (k in ctx.vars || ctx.unsureVars.has(k)) { delete ctx.vars[k]; ctx.unsureVars.add(k); } else ctx.vars[k] = v;
+}
 const recordVars = (env, ctx, level) => { for (const k of Object.keys(env)) setVar(ctx, k, env[k], level); };
+
+// A variable whose value is unknown: assigned more than once (or where it may not run), or tainted (a script that may
+// or may not be the one sourced earlier on the line may have set it).
+const unsureVar = (ctx, k) => ctx.unsureVars.has(k) || ctx.tainted.has(k);
+
+// Every variable name assigned on the line so far, including the ones that became unknown by being assigned twice or
+// tainted. Anything that inspects WHICH variables are set (not their values) must use this, never Object.keys(ctx.vars) alone.
+const assignedNames = (ctx) => [...Object.keys(ctx.vars), ...ctx.unsureVars, ...ctx.tainted];
+
+// A variable that selects the repository (GIT_DIR, GH_REPO). Only this command's own prefix (`NAME=v git …`,
+// `env NAME=v git …`) is certain to reach it. An assignment or export earlier on the line may never run
+// (`false && export GIT_DIR=…`), may not be exported at all, or may be overridden by control flow the parser does not
+// model, so the value is unknown (`known: false`) and the caller must fail closed. `value` is undefined when unset.
+function envVar(env, ctx, name) {
+  if (Object.hasOwn(env, name)) return { known: true, value: env[name] };
+  if (name in ctx.vars || unsureVar(ctx, name)) return { known: false, value: undefined };
+  return { known: true, value: undefined };
+}
+
+// Expansion leaves `$NAME` in place for a variable assigned more than once (which assignment ran is unknown). A
+// protected argument (API endpoint, label, issue number, branch, directory) written with one cannot be checked, and
+// every pattern below matches the expanded text, so the whole git / gh command fails closed instead.
+const VAR_REF = /\$(?:\{([A-Za-z_][A-Za-z0-9_]*)|([A-Za-z_][A-Za-z0-9_]*))/g;
+function unsureVarUsed(words, ctx) {
+  if (ctx.unsureVars.size === 0 && ctx.tainted.size === 0) return null;
+  for (const w of words) {
+    for (const m of String(w).matchAll(VAR_REF)) if (unsureVar(ctx, m[1] ?? m[2])) return m[1] ?? m[2];
+  }
+  return null;
+}
 
 // Resolves `target` against `dir`. Returns null when the result cannot be known statically ($VAR, $(..), `cd -`).
 function joinDir(dir, target, ctx) {
@@ -155,6 +188,7 @@ function branchOf(dir, gitDir, ctx) {
 // later bare/HEAD push acts on. `name === null` records "switched to something we cannot name".
 function setBranch(ctx, dir, name, trackMain = false) {
   if (dir === null) return;
+  if (name !== null && DYNAMIC.test(name)) name = null; // still holds `$B` / `$(…)` after expansion: unknown, not a name
   ctx.branches.set(dir, { name: name === null ? null : stripHeads(name), trackMain });
 }
 
@@ -271,7 +305,9 @@ function checkPush(args, dir, gitDir, ctx, configs) {
 
 function parseGitGlobal(argv, dir, env, ctx) {
   let d = dir;
-  let gitDir = typeof env.GIT_DIR === 'string' && env.GIT_DIR ? joinDir(d, env.GIT_DIR, ctx) : null;
+  const envGitDir = envVar(env, ctx, 'GIT_DIR');
+  let gitDirUnknown = !envGitDir.known; // exported twice: which repository the command acts on cannot be told
+  let gitDir = typeof envGitDir.value === 'string' && envGitDir.value ? joinDir(d, envGitDir.value, ctx) : null;
   const configs = [];
   let i = 1;
   for (; i < argv.length; i++) {
@@ -283,13 +319,13 @@ function parseGitGlobal(argv, dir, env, ctx) {
       configs.push({ key: (eq < 0 ? kv : kv.slice(0, eq)).toLowerCase(), value: eq < 0 ? '' : kv.slice(eq + 1) });
       continue;
     }
-    if (t.startsWith('--git-dir=')) { gitDir = joinDir(d, t.slice('--git-dir='.length), ctx); continue; }
-    if (t === '--git-dir') { gitDir = joinDir(d, argv[++i], ctx); continue; }
+    if (t.startsWith('--git-dir=')) { gitDir = joinDir(d, t.slice('--git-dir='.length), ctx); gitDirUnknown = false; continue; }
+    if (t === '--git-dir') { gitDir = joinDir(d, argv[++i], ctx); gitDirUnknown = false; continue; }
     if (GIT_GLOBAL_VALUE.includes(t)) { i++; continue; }
     if (t.startsWith('-')) continue; // boolean global option, or --opt=value
     break;
   }
-  return { d, gitDir, configs, sub: argv[i], args: argv.slice(i + 1) };
+  return { d, gitDir, gitDirUnknown, configs, sub: argv[i], args: argv.slice(i + 1) };
 }
 
 // checkout / switch: which branch is the directory on afterwards?
@@ -367,6 +403,13 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
   const g = parseGitGlobal(argv, dir, env, ctx);
   const { sub, args } = g;
   if (sub === undefined) return null;
+  // The subcommand must be written literally: `git $X origin main` (even with X=push on the line), `git "$(printf push)"`,
+  // `git ${X}${Y:-sh}` — what git does is decided by a value the checks below would never see.
+  if (DYNAMIC.test(sub)) return deny(RUN_TIME_SUBCOMMAND);
+  // GIT_DIR assigned twice: the branch the checks read could belong to another repository than the one git acts on
+  if (g.gitDirUnknown && (sub === 'push' || sub === 'send-pack' || sub === 'branch')) {
+    return deny('GIT_DIR was assigned more than once on this line, so which repository this command acts on cannot be verified. Assign it once, or use -C / --git-dir.');
+  }
 
   // aliases defined on this very line (`git config alias.p push && git p …`, `git -c alias.p=push p …`)
   const aliasConfig = g.configs.find((c) => c.key === `alias.${sub.toLowerCase()}`);
@@ -383,7 +426,7 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
   if (sub === 'push' || sub === 'send-pack') { // send-pack is push without the remote configuration
     if (/\bxargs\b/.test(raw)) return deny('`xargs git push` takes its refspecs from stdin, so it cannot be verified. Push the branch by name.');
     // config handed in through the environment (this command's prefix / `env`, or an earlier assignment or export on the line)
-    ctx.envCfgDirty = [...Object.keys(env), ...Object.keys(ctx.vars), ...ctx.tainted].some((k) => GIT_ENV_CONFIG.test(k));
+    ctx.envCfgDirty = [...Object.keys(env), ...assignedNames(ctx)].some((k) => GIT_ENV_CONFIG.test(k));
     return checkPush(args, g.d, g.gitDir, ctx, g.configs);
   }
   trackGit(sub, args, g, ctx);
@@ -409,10 +452,13 @@ function splitGh(args) {
   };
 }
 
-const repoArgsOf = (flags, env) => {
+// null when GH_REPO was assigned twice and no -R names the repository: the labels cannot be looked up in the right one.
+const repoArgsOf = (flags, env, ctx) => {
   const [repo] = flagValues(flags, ['repo'], 'R');
   if (repo) return ['-R', repo];
-  return typeof env.GH_REPO === 'string' && env.GH_REPO ? ['-R', env.GH_REPO] : [];
+  const ghRepo = envVar(env, ctx, 'GH_REPO');
+  if (!ghRepo.known) return null;
+  return typeof ghRepo.value === 'string' && ghRepo.value ? ['-R', ghRepo.value] : [];
 };
 
 // Closing/deleting/transferring an issue that carries pipeline-pause or pipeline-rollback is the owner's call.
@@ -420,6 +466,8 @@ function checkIssueHold(num, repoArgs, dir, ctx, action) {
   if (DYNAMIC.test(num)) return deny(`the issue number "${num}" is built at run time, so whether it carries pipeline-pause or pipeline-rollback cannot be verified. Name the issue number.`);
   let labels;
   try {
+    // no -R / GH_REPO: the repository is the directory's — unknown after a cd that may not have run
+    if (dir === null && !(repoArgs && repoArgs.length)) throw new Error('cannot tell which directory (so which repository) this runs in; name it with -R owner/repo');
     labels = ctx.issueLabels(num, repoArgs, dir ?? ctx.cwd);
     if (!Array.isArray(labels)) throw new Error('unexpected lookup result');
   } catch (err) {
@@ -613,6 +661,10 @@ function checkApi(rest, env, dir, ctx) {
 }
 
 function checkGh(argv, env, dir, ctx, raw, level = 0) {
+  // The group and verb must be written literally (`gh pr $X`, `gh pr ${X%-base}`, `gh pr "$(printf merge)"`): a variable's
+  // value on the line is not proof — `X=merge; true || X=view; gh pr $X` runs merge.
+  const written = splitGh(argv.slice(1));
+  if ((written.group !== undefined && DYNAMIC.test(written.group)) || (written.verb !== undefined && DYNAMIC.test(written.verb))) return deny(RUN_TIME_SUBCOMMAND);
   const args = argv.slice(1).map((a) => expandVars(a, ctx.vars));
   const { group, verb, rest } = splitGh(args);
   if (!group) return null;
@@ -678,7 +730,9 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
       return /\bxargs\b/.test(raw) ? deny('`xargs gh issue ' + verb + '` takes the issue number from stdin, so it cannot be checked for pipeline-pause/pipeline-rollback. Name the issue number.') : null; // gh refuses a missing number itself
     }
     for (const n of numbers) {
-      const v = checkIssueHold(n, repoArgsOf(flags, env), dir, ctx, verb);
+      const repoArgs = repoArgsOf(flags, env, ctx);
+      if (repoArgs === null) return deny('GH_REPO was assigned more than once on this line, so the repository this issue belongs to cannot be verified. Pass -R OWNER/REPO.');
+      const v = checkIssueHold(n, repoArgs, dir, ctx, verb);
       if (v) return v;
     }
   }
@@ -743,6 +797,8 @@ function checkScriptFile(sf, dir, ctx, level) {
       : null;
   }
   const home = !sf.candidate && (file === '~' || file.startsWith('~/')) ? ctx.home + file.slice(1) : file;
+  // a relative script after a cd that may not have run: which file runs is unknown, never the starting directory's
+  if (dir === null && !path.isAbsolute(home)) return deny(`cannot tell which directory this runs in, so which ${sf.file} runs cannot be verified. Use an absolute path, or chain the cd with &&.`);
   const abs = path.resolve(dir ?? ctx.cwd, home);
   const text = ctx.readText(abs);
   if (typeof text !== 'string') {
@@ -771,7 +827,7 @@ function checkScriptFile(sf, dir, ctx, level) {
 // change the caller's variables, which is believed for a named file; a candidate that may or may not be the sourced file
 // puts the line's old values back and marks the variables it set as uncertain (a later use is also unknown at run time).
 // What a script judged here may change, by ctx field:
-//   vars, tainted                 shell-local: die with a child shell (restored), a speculative source taints them (below)
+//   vars, tainted, unsureVars     shell-local: die with a child shell (restored), a speculative source taints them (below)
 //   branches                      repository state: a child really switches the branch, so a definite script's change is kept;
 //                                 a speculative candidate may not run, so what it changed becomes an unknown branch
 //   cfgDirty, envCfgDirty         repository/global config: only ever set, never restored (a candidate that may not run
@@ -784,6 +840,7 @@ function judgeScoped(text, dir, ctx, level, sf) {
   if (sf.sourced && !sf.candidate) return evalString(text, dir, ctx, level + 1);
   const saved = Object.assign(Object.create(null), ctx.vars);
   const savedTaint = new Set(ctx.tainted);
+  const savedUnsure = new Set(ctx.unsureVars);
   const spec = sf.candidate ? { branches: new Map(ctx.branches), git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases } } : null;
   try {
     return evalString(text, dir, ctx, level + 1);
@@ -803,9 +860,11 @@ function judgeScoped(text, dir, ctx, level, sf) {
     for (const k of Object.keys(ctx.vars)) delete ctx.vars[k];
     Object.assign(ctx.vars, saved);
     if (!sf.sourced) {
-      // a child shell takes nothing back up, taint included
+      // a child shell takes nothing back up, taint and unsure variables included
       ctx.tainted.clear();
       for (const k of savedTaint) ctx.tainted.add(k);
+      ctx.unsureVars.clear();
+      for (const k of savedUnsure) ctx.unsureVars.add(k);
     } else {
       // uncertain from here on and only ever more so: unknown to every use ($F stays $F), and a word that picks the script is refused
       for (const k of new Set([...Object.keys(after), ...Object.keys(saved)])) {
@@ -834,6 +893,8 @@ function checkCandidateScripts(sf, dir, ctx, level) {
       if (ctx.tainted.has(m[1] ?? m[2])) return deny(`the script is picked by $${m[1] ?? m[2]}, which a script sourced earlier on the line may have set, so it cannot be verified. Name the file.`);
     }
   }
+  // after a cd that may not have run, a relative word (or a glob over one) names a file in an unknown directory
+  if (dir === null && sf.words.some((w) => !path.isAbsolute(expand(w)))) return deny('cannot tell which directory this runs in, so which script it runs cannot be verified. Use an absolute path, or chain the cd with &&.');
   const c = scriptCandidates(sf, { expand, dirs: [here], joinPath: (d, r) => path.resolve(d, r), readDir: ctx.readDir, ifs: ctx.vars.IFS });
   if (c.over) return deny('too many words, a glob matching too many files, or glob syntax that cannot be resolved could be the script this command runs, so it cannot be verified. Name the script file.');
   if (c.dynamic && GUARDED_WORDS.test(ctx.fullText)) {
@@ -848,6 +909,127 @@ function checkCandidateScripts(sf, dir, ctx, level) {
 
 // ---- entry point ----------------------------------------------------------------------------------------
 
+// The parser drops compound-command keywords but leaves them at the start of the command's raw text (`while ! gh …`,
+// `do sleep 30`, `then git push`); `for` / `case` / `select` stay as the command name.
+const FLOW_START = /^\s*(?:if|then|elif|else|while|until|for|do|case|select)(?=[\s;&|(){]|$)/;
+// Index of the first command that may run conditionally or repeatedly because of control flow; every command from
+// there on is treated that way (conservative after the loop / if ends). -1: none. 0: the whole line: a ( subshell, which
+// the parser reports (it reads quotes, escapes, $'…' and heredocs like a shell, so prose such as `-m "fix (again)"` does
+// not count), or a parse cut short, where a subshell may have gone unseen.
+function flowStart(cmds) {
+  if (cmds.subshell || cmds.truncated) return 0;
+  return cmds.findIndex((c) => FLOW_START.test(c.raw ?? '') || ['for', 'case', 'select'].includes(c.argv[0]));
+}
+const inFlow = (from, i) => from >= 0 && i >= from;
+
+// A command followed by | or & ran in a subshell (a pipeline stage / background job): what it assigned or changed is lost.
+const ranInSubshell = (cmds, i) => cmds[i]?.sep === '|' || cmds[i + 1]?.sep === '|' || cmds[i + 1]?.sep === '&';
+const VALUE_BINDERS = new Set(['read', 'mapfile', 'readarray', 'getopts', 'unset', 'let', 'printf', 'select']);
+const STATE_GIT = new Set(['checkout', 'switch', 'branch', 'rebase', 'symbolic-ref', 'worktree', 'config']);
+
+// Collects every assignment on the line BEFORE any command is judged. A name assigned more than once, or assigned
+// where it may not run (after && / ||, in a pipeline, a subshell, an if / loop / case), is unsure for the whole line.
+function collectAssignments(cmds, ctx) {
+  const counts = new Map();
+  const bump = (k, n) => counts.set(k, (counts.get(k) ?? (k in ctx.vars || ctx.unsureVars.has(k) ? 1 : 0)) + n);
+  const from = flowStart(cmds);
+  for (const [i, c] of cmds.entries()) {
+    const n = inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) ? 2 : 1;
+    // builtins that bind a variable without a NAME=value word: its value is whatever was read / parsed at run time
+    if (c.argv.length && VALUE_BINDERS.has(baseName(c.argv[0]))) {
+      for (const a of c.argv.slice(1)) {
+        const m = /^([A-Za-z_][A-Za-z0-9_]*)/.exec(a);
+        if (m) bump(m[1], 2);
+      }
+    }
+    for (const k of Object.keys(c.env)) bump(k, n);
+    if (c.argv.length && VAR_BUILTINS.includes(baseName(c.argv[0]))) {
+      // `declare -n X=F` makes X a NAMEREF: $X reads $F at run time, while the text says "F". Unknown, like a binder.
+      const nameref = c.argv.slice(1).some((a) => /^-[A-Za-z]*n[A-Za-z]*$/.test(a));
+      for (const a of c.argv.slice(1)) {
+        const m = (nameref ? /^([A-Za-z_][A-Za-z0-9_]*)(?:=|$)/ : /^([A-Za-z_][A-Za-z0-9_]*)=/).exec(a);
+        if (m) bump(m[1], nameref ? 2 : n);
+      }
+    }
+  }
+  for (const [k, n] of counts) if (n > 1) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
+}
+
+// Commands that may be handed an unsure value: they print, compare, count or wait, and run nothing. An ALLOWLIST on purpose
+// — a list of the commands that run code is never complete (awk's system(), sed's `e`, find -exec, tar --to-command,
+// rsync -e, git aliases …). Shell keywords and the variable builtins are here because the parser emits them as commands;
+// what they bind is tracked by collectAssignments and the taint pass below. Anything not listed is sensitive.
+const UNSURE_OK = new Set([
+  'echo', 'printf', 'test', '[', '[[', 'true', 'false', ':', 'sleep', 'seq', 'wc', 'head', 'tail', 'cat', 'sort', 'uniq',
+  'cut', 'tr', 'grep', 'egrep', 'fgrep', 'rg', 'jq', 'date', 'basename', 'dirname', 'expr', 'ls', 'stat', 'pwd',
+  'case', 'for', 'select', 'if', 'then', 'elif', 'else', 'while', 'until', 'do', '!',
+  'break', 'continue', 'return', 'exit', 'shift',
+  ...VAR_BUILTINS, ...VALUE_BINDERS,
+]);
+const DIR_CHANGERS = ['cd', 'pushd', 'popd'];
+
+// A line that defines a function (its body is parsed as if it ran — `f(){ cd /safe; }; git push` never runs the cd),
+// an alias, a trap (`trap "cd …" DEBUG` runs before every command) or changes shell options / builtins can change
+// where a later command runs in ways the walk below does not model: the directory and branch are unknown for the whole line.
+const STATE_HAZARD_CMDS = new Set([
+  'alias', 'unalias', 'trap', 'enable', 'disable', 'setopt', 'unsetopt', 'shopt', 'hash', 'functions', 'autoload',
+  'zmodload', 'unfunction', 'emulate',
+]);
+// `set` is everywhere (`set -euo pipefail`); only an option outside these (zsh `set -o autocd`, …) is a hazard.
+const SAFE_SET_ARG = /^(?:[-+][euxvfCo]+|pipefail|errexit|nounset|xtrace|verbose|noglob|noclobber|--)$/;
+const isStateHazard = (c) => {
+  if (!c.argv.length) return false;
+  const nm = baseName(c.argv[0]);
+  return STATE_HAZARD_CMDS.has(nm) || (nm === 'set' && c.argv.slice(1).some((a) => !SAFE_SET_ARG.test(a)));
+};
+const FUNCTION_DEF = /(?:^|[\s;&|(){])(?:function\s+[^\s(){};&|<>]+|[A-Za-z_][\w.:-]*\s*\(\s*\))/;
+// `source` / `.` run a file in THIS shell: it may cd, check out a branch or reassign any variable.
+const SOURCING = ['source', '.'];
+
+// An unsure variable (assigned more than once, or where it may not run) that reaches a command whose effect may depend on
+// the value — anything outside UNSURE_OK, a path or dynamic command name, or the command name itself — directly (argv,
+// env prefix, a redirect such as `<<< "$F"`) or through a pipe (`echo "$F" | xargs git push`: every stage of a pipeline
+// with a sensitive stage counts). Returns the variable's name, or null.
+function unsureVarReachingCommand(cmds, ctx) {
+  // taint: a variable assigned from an unsure one is unsure (`X=$F; bash "$X"`), to a fixed point
+  const assigns = [];
+  for (const c of cmds) {
+    if (!c.argv.length) assigns.push(...Object.entries(c.env));
+    else if (VAR_BUILTINS.includes(baseName(c.argv[0]))) {
+      for (const a of c.argv.slice(1)) {
+        const m = /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/.exec(a);
+        if (m) assigns.push([m[1], m[2]]);
+      }
+    }
+  }
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const [k, v] of assigns) {
+      if (!ctx.unsureVars.has(k) && unsureVarUsed([v], ctx) !== null) { delete ctx.vars[k]; ctx.unsureVars.add(k); changed = true; }
+    }
+  }
+  const sensitive = (c) => {
+    const head = c.argv[0];
+    return !UNSURE_OK.has(baseName(head)) || head.includes('/') || DYNAMIC.test(head) || unsureVarUsed([head], ctx) !== null;
+  };
+  const words = (c) => [...c.argv, ...Object.values(c.env), ...(c.redirects ?? []).map((r) => r.target ?? '')];
+  // pipelines: runs of commands joined by | (command-substitution bodies are commands of their own in this list)
+  const groups = [];
+  for (const [i, c] of cmds.entries()) {
+    if (i > 0 && c.sep === '|' && groups.length) groups[groups.length - 1].push(c);
+    else groups.push([c]);
+  }
+  for (const g of groups) {
+    const live = g.filter((c) => c.argv.length);
+    if (!live.some(sensitive)) continue;
+    for (const c of g) {
+      const hit = unsureVarUsed(words(c), ctx);
+      if (hit !== null) return hit;
+    }
+  }
+  return null;
+}
+
 function evalString(str, startDir, ctx, level) {
   if (level > MAX_NESTING) return deny('pipeline job start / alias is nested too deeply to verify.');
   const cmds = simpleCommands(str);
@@ -857,9 +1039,35 @@ function evalString(str, startDir, ctx, level) {
   if (cmds.dynamic && GUARDED_WORDS.test(str)) {
     return deny('the command that runs is only known at run time ($VAR / $(...) / piped into a shell) and the line mentions a guarded operation, so it cannot be verified. Write the command out literally.');
   }
+  // A variable whose value is not certain (see collectAssignments) denies the line when it reaches git / gh, a command
+  // that runs code, cd / pushd / popd or a command name: the checks below read the expanded text.
+  collectAssignments(cmds, ctx);
+  if (ctx.unsureVars.size || ctx.tainted.size) {
+    const unsure = unsureVarReachingCommand(cmds, ctx);
+    if (unsure !== null) return deny(`$${unsure} is assigned more than once (or where it may not run) on this line, so its value at run time cannot be verified. Assign it once, unconditionally.`);
+  }
   let dir = startDir;
-  for (const c of cmds) {
+  const from = flowStart(cmds);
+  let uncertain = false; // an earlier cd / branch change may not have taken effect for the commands that follow
+  const forgetState = () => { dir = null; for (const e of ctx.branches.values()) e.name = null; };
+  // sticky: a later `cd /abs` does not make it known again (`alias cd=true; cd /safe`, a DEBUG trap that cds back)
+  const hazard = FUNCTION_DEF.test(str) || cmds.some(isStateHazard);
+  for (const [i, c] of cmds.entries()) {
     const argv = c.argv;
+    if (hazard) forgetState();
+    // Only commands chained with && after it are certain to see the change (`cd d && git push`); anything else may run
+    // without it (`false && cd d; git push`, `cd d &`, `(cd d)`, `cd d || git push`), so the state is unknown.
+    if (uncertain && c.sep !== '&&') {
+      forgetState();
+      uncertain = false;
+    }
+    if (argv.length) {
+      const nm = baseName(argv[0]);
+      const changesState = DIR_CHANGERS.includes(nm) || (nm === 'git' && argv.some((w) => STATE_GIT.has(w)) && !argv.some((w) => w === '--show-current' || w === '--list' || w === '-l'));
+      // `cd d || exit`: when the cd fails nothing after it runs, so the commands that do run see the change
+      const orExits = cmds[i + 1]?.sep === '||' && ['exit', 'return'].includes(cmds[i + 1].argv[0]) && cmds[i + 2]?.sep !== '|' && cmds[i + 2]?.sep !== '&';
+      if (changesState && (inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) || (cmds[i + 1]?.sep === '||' && !orExits))) uncertain = true;
+    }
     if (!argv.length) { recordVars(c.env, ctx, level); continue; } // a bare `NAME=value`
     const name = baseName(argv[0]);
     let verdict = null;
@@ -869,8 +1077,11 @@ function evalString(str, startDir, ctx, level) {
         if (m) setVar(ctx, m[1], m[2], level);
       }
     } else if (name === 'cd' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name, argv, ctx);
-    else if (name === 'git') verdict = checkGit(argv, c.env, dir, ctx, c.raw ?? '');
-    else if (name === 'gh') verdict = checkGh(argv, c.env, dir, ctx, c.raw ?? '');
+    else if (name === 'git' || name === 'gh') {
+      const unsure = unsureVarUsed([...argv.slice(1), ...Object.values(c.env)], ctx);
+      if (unsure !== null) verdict = deny(`$${unsure} was assigned more than once on this line, so its value (and what this ${name} command does with it) cannot be verified. Assign it once, or write the value out.`);
+      else verdict = name === 'git' ? checkGit(argv, c.env, dir, ctx, c.raw ?? '') : checkGh(argv, c.env, dir, ctx, c.raw ?? '');
+    }
     else {
       for (const inner of jobStartCommands(argv, ctx.vars) ?? []) {
         const v = evalString(inner, dir, ctx, level + 1);
@@ -888,6 +1099,14 @@ function evalString(str, startDir, ctx, level) {
       }
     }
     if (verdict && verdict.decision === 'deny') return verdict;
+    if (SOURCING.includes(name)) {
+      // what the sourced file did is not modelled: every later command sees an unknown directory, branch and variables
+      forgetState();
+      for (const k of Object.keys(ctx.vars)) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
+      // the check above ran before these became unsure: run it again for what follows (`F=run.sh; source env.sh; bash "$F"`)
+      const unsure = unsureVarReachingCommand(cmds.slice(i + 1), ctx);
+      if (unsure !== null) return deny(`$${unsure} may be reassigned by the file ${name === '.' ? '.' : 'source'} runs, so its value at run time cannot be verified. Use it before sourcing, or write the value out.`);
+    }
   }
   return allowed();
 }
@@ -912,7 +1131,7 @@ export function evaluateGitCommand(command, {
   const base = cwd || process.cwd();
   const ctx = {
     cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, readDir, judgeBudget: MAX_CANDIDATE_JUDGMENTS, fullText: text,
-    vars: Object.create(null), tainted: new Set(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
+    vars: Object.create(null), unsureVars: new Set(), tainted: new Set(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
     branches: new Map(), cfgDirty: false, envCfgDirty: false,
   };
   return evalString(text, path.resolve(base), ctx, 0);

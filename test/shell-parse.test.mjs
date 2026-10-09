@@ -969,3 +969,30 @@ test('scriptFileOf names the file a shell, source, interpreter or path invocatio
   assert.equal(f('/usr/bin/git status'), null);
   assert.equal(f('/usr/local/bin/node'), null);
 });
+
+// git-policy reads `subshell` to know that what a ( ) group assigns or cds is lost; quotes must hide nothing and invent nothing.
+test('subshell: set for a top-level ( group however the quotes around it are written', () => {
+  const yes = [
+    '(cd x); git push',
+    'echo \\"; (cd x); echo "y"',
+    "echo \\'; (cd x); echo 'y'",
+    "echo $'it\\'s'; (cd x); echo 'y'",
+    'echo a\\"b; (cd x); echo "c"',
+    'a;(b)',
+    '((x=1)); git push', // arithmetic: counted, conservatively
+  ];
+  for (const c of yes) assert.equal(simpleCommands(c).subshell, true, c);
+  const no = [
+    'git commit -m "fix (again)"',
+    "git commit -m $'fix (again)\\n'",
+    "echo 'a (b)'",
+    'echo \\(x\\)',
+    'arr=(a b); echo done',
+    'echo $(git rev-parse HEAD)',
+    'echo $( (cd x; pwd) )', // inside a substitution: those commands already have depth > 0
+    'diff <(ls a) <(ls b)',
+    'echo hi # (comment)',
+    "cat <<'EOF'\n(not a subshell)\nEOF",
+  ];
+  for (const c of no) assert.equal(simpleCommands(c).subshell, false, c);
+});
