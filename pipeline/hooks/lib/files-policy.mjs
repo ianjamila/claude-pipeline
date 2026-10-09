@@ -411,11 +411,15 @@ function expandHomeRefs(text, home) {
     .replace(new RegExp(`${mark}['"\`)}\\]]*`, 'g'), '');
 }
 
-// expandRefs reading every backslash as part of the file name (off Windows it is one), not as a path separator
+// expandRefs reading every backslash as part of the file name (off Windows it is one), not as a path separator: the word's
+// own backslashes and those a variable brings in (`D='x\a'; bash "$D.sh"` runs x\a.sh)
 function expandKeepingBackslash(w, ctx) {
-  const bs = freeMark([w, ctx.homePosix ?? '', ctx.user ?? '', ...Object.values(ctx.vars ?? {})].join('')); // every text expandRefs may put in
-  return expandRefs(w.replace(/\\/g, bs), ctx).split(bs).join('\\');
+  const bs = freeMark([w, ctx.homePosix ?? '', ctx.user ?? '', ...Object.values(ctx.keptVars ?? {})].join('')); // every text expandRefs may put in
+  const vars = Object.fromEntries(Object.entries(ctx.keptVars ?? {}).map(([k, v]) => [k, String(v).replace(/\\/g, bs)]));
+  return expandRefs(w.replace(/\\/g, bs), { ...ctx, vars }).split(bs).join('\\');
 }
+// Could this word expand to a name holding a backslash? (its own, or one in any variable assigned on the line)
+const mayHoldBackslash = (w, ctx) => w.includes('\\') || Object.values(ctx.keptVars ?? {}).some((v) => String(v).includes('\\'));
 
 // $NAME / ${NAME} for variables assigned earlier on the same line (D=$HOME/.claude; echo x > $D/settings.json).
 function substVars(text, vars) {
@@ -727,10 +731,18 @@ function destsOf(argv, name) {
 }
 
 // $NAME values assigned on the line: `D=x cmd`, a bare `D=x`, `export D=x`, `declare -x D=x`.
+// Also fills ctx.keptVars: the same values with every backslash kept as a file name character (toPosix reads it as a
+// separator), for the off-Windows reading of a script name (`D='x\a'; bash "$D.sh"` runs x\a.sh).
 function collectVars(cmds, ctx) {
   const vars = {};
+  const kept = {};
   const SKIP = new Set(['HOME', 'USER', 'LOGNAME', 'USERPROFILE', 'USERNAME']); // these always mean the real ones
-  const set = (k, v) => { if (!SKIP.has(k)) vars[k] = expandHomeRefs(substVars(toPosix(String(v)).replace(USER_RE, ctx.user), vars), ctx.homePosix); };
+  const bs = freeMark([ctx.homePosix ?? '', ctx.user ?? '', ...cmds.flatMap((c) => [...Object.values(c.env ?? {}), ...(c.argv ?? [])])].join(''));
+  const set = (k, v) => {
+    if (SKIP.has(k)) return;
+    vars[k] = expandHomeRefs(substVars(toPosix(String(v)).replace(USER_RE, ctx.user), vars), ctx.homePosix);
+    kept[k] = expandHomeRefs(substVars(toPosix(String(v).replace(/\\/g, bs)).replace(USER_RE, ctx.user), kept), ctx.homePosix).split(bs).join('\\');
+  };
   for (const c of cmds) {
     for (const [k, v] of Object.entries(c.env ?? {})) set(k, v);
     if (['export', 'declare', 'typeset', 'local', 'readonly'].includes(baseOf(c.argv[0] ?? ''))) {
@@ -740,6 +752,7 @@ function collectVars(cmds, ctx) {
       }
     }
   }
+  ctx.keptVars = kept;
   return vars;
 }
 
@@ -972,7 +985,7 @@ const WRITE_HINT = /write|append|unlink|\brm\b|rmSync|rmdir|rename|copy|\bcp\b|\
 function judgeScriptFile(sf, dirs, ctx, opts, scanRaw = '', keepBackslash = false) {
   if (sf.ambiguous) return judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw);
   // expandRefs turns \ into / (Windows paths), but off Windows a backslash is part of the file name: judge that reading too
-  if (!keepBackslash && sf.file.includes('\\')) {
+  if (!keepBackslash && mayHoldBackslash(sf.file, ctx)) {
     const v = judgeScriptFile(sf, dirs, ctx, opts, scanRaw, true);
     if (v) return v;
   }
@@ -1022,7 +1035,7 @@ function judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw) {
   const joinPath = (d, r) => (isAbs(r) ? posix.normalize(r) : posix.join(d, r));
   let c = scriptCandidates(sf, { expand: (w) => expandRefs(w, ctx), dirs, joinPath, readDir: ctx.readDir, ifs: ctx.vars.IFS });
   // a backslash in a word is a file name character off Windows, but expandRefs reads it as a separator: expand (and glob) that reading too
-  if (!c.over && !sf.unresolvable && sf.words.some((w) => w.includes('\\'))) {
+  if (!c.over && !sf.unresolvable && sf.words.some((w) => mayHoldBackslash(w, ctx))) {
     const k = scriptCandidates(sf, { expand: (w) => expandKeepingBackslash(w, ctx), dirs, joinPath, readDir: ctx.readDir, ifs: ctx.vars.IFS });
     c = { files: [...new Set([...c.files, ...k.files])], dynamic: c.dynamic || k.dynamic, over: k.over };
   }

@@ -878,3 +878,10 @@ test('when the text holds every private-use character, the mark is still one the
   assert.equal(files(`bash ~/a${all}b.sh`, fakeFs(PROJ, h)).decision, 'deny');
   assert.equal(files(`echo '${all}'; echo x > ~/.claude/settings.json`, fakeFs(PROJ, {})).decision, 'deny');
 });
+
+test('a backslash that reaches the script name through a variable is a file name character too', { skip: process.platform === 'win32' }, () => {
+  const spec = { 'x\\a.sh': 'bad', 'ok.sh': 'ok' };
+  for (const c of [`D='x\\a'; bash "$D.sh"`, `D='x\\a'; source $D.sh`, `D='x\\a.sh'; bash $D`, `D='x\\'; bash "\${D}a.sh"`, `D='x\\a.sh'; X=-x; bash $X "$D"`, `D='x\\a'; bash $D*.sh`])
+    denyBoth(c, spec);
+  allowBoth(`D='x\\b'; bash "$D.sh"`, spec); // missing: nothing runs
+});
