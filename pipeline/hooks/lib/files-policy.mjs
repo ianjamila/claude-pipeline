@@ -18,7 +18,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
-import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf } from './shell-parse.mjs';
+import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf } from './shell-parse.mjs';
 import { scriptCandidates, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
 
 const posix = path.posix;
@@ -1055,7 +1055,7 @@ function judgeFoundScript(sf, abs, dir, ctx, opts) {
     kind = INTERP_PROGRAM.test((SHEBANG_PROGRAM.exec(text)?.[1] ?? '').split('/').pop()) ? 'interp' : 'shell';
   }
   if (kind === 'shell') {
-    const r = evaluateBashForFiles(text, { ...opts, cwd: dir, _depth: (opts._depth ?? 0) + 1 });
+    const r = evaluateBashForFiles(text, { ...opts, cwd: dir, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup });
     return r.decision === 'deny' ? deny(`the script ${sf.file} would run: ${r.reason}`) : null;
   }
   // program text in another language: the admin switch, the hook switch, or a write next to a protected path
@@ -1201,6 +1201,10 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
   // a name held in a variable (N=PIPELINE_ADMIN; env $N=1 claude)
   if (Object.keys(ctx.vars).length && setsAdmin(substVars(flat, ctx.vars, ctx.budget), ctx.platform)) return deny('the command sets PIPELINE_ADMIN through a variable; only the owner may set it, when launching Claude Code');
   const dirs = collectDirs(cmds, ctx);
+  // BASH_ENV / ENV / ZDOTDIR / HOME values this line (and the scripts that run it) assign: shells started by the scripts it runs see them
+  const startupEnv = opts.env ?? process.env;
+  const inheritedStartup = (n) => opts._startup?.[n] ?? [];
+  ctx.startup = startupVarsOf(cmds, { env: startupEnv, inherited: inheritedStartup });
 
   // 3 and 4: installers and `protect --apply`
   const installer = findInstaller(cmds, raw, dirs, ctx, opts);
@@ -1212,7 +1216,7 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
     for (const c of cmds) {
       const inner = jobInner(c);
       if (!inner) continue;
-      const r = evaluateBashForFiles(inner, { ...opts, _depth: (opts._depth ?? 0) + 1 });
+      const r = evaluateBashForFiles(inner, { ...opts, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup });
       if (r.decision === 'deny') return deny(`job start would run: ${r.reason}`);
     }
   }
@@ -1234,8 +1238,13 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
         const v = judgeScriptFile(fd, dirs, ctx, opts, scanRaw);
         if (v) return v;
       }
+      // a shell runs its startup files (BASH_ENV, ENV, ZDOTDIR/.zshenv ...) before the script it was given: judged like `bash FILE`
+      for (const st of startupFilesOf(c, cmds, { env: startupEnv, inherited: inheritedStartup, exec: sf?.kind === 'exec' })) {
+        const v = judgeScriptFile(st, dirs, ctx, opts, scanRaw);
+        if (v) return v;
+      }
     }
-  } else if (cmds.some((c) => scriptFileOf(c.argv) || scriptFeedsOf(c).length)) return deny('scripts run scripts too deeply to check');
+  } else if (cmds.some((c) => scriptFileOf(c.argv) || scriptFeedsOf(c).length || startupFilesOf(c, cmds, { env: startupEnv, inherited: inheritedStartup }).some((s) => !s.implicit))) return deny('scripts run scripts too deeply to check');
 
   // 5: protected-path references must be read-only
   const m = makeMatchers(ctx);

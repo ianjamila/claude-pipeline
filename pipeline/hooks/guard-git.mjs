@@ -17,6 +17,7 @@ async function evaluate(input) {
 
   const opts = {
     cwd: typeof input.cwd === 'string' && input.cwd ? input.cwd : process.cwd(),
+    env: process.env,
     ...realGitWiring(),
   };
   for (const text of texts) {

@@ -772,6 +772,100 @@ export function scriptFeedsOf(cmd, line = cmd?.raw) {
   return out;
 }
 
+// ---- startup files ------------------------------------------------------------------------------------
+
+// Why: a shell runs files before its script: bash $BASH_ENV (non-interactive), sh/dash/ksh $ENV, zsh $ZDOTDIR/.zshenv (default
+// $HOME) always, .zprofile/.zlogin/.zlogout with -l and .zshrc with -i, bash --rcfile/--init-file when interactive. They are not
+// named on the command, so `BASH_ENV=f.sh bash x.sh` ran f.sh unjudged. Strict on purpose: every POSIX-family shell gets both
+// BASH_ENV and ENV (bash as sh, `--posix`), and an option that expands (`zsh $X -c`) could be -l or -i, so all zsh files count.
+const NO_STARTUP = new Set(['fish', 'csh', 'tcsh']);
+const VAR_DECLS = new Set(['export', 'declare', 'typeset', 'local', 'readonly']);
+
+// The options before the operand: login / interactive flags (zsh), `unknown` when one expands, and the rc files bash is given.
+function startupOptions(argv) {
+  const o = { login: false, interactive: false, unknown: false, rc: [] };
+  for (let i = 1; i < argv.length; i++) {
+    const t = argv[i];
+    if (t === '--') break;
+    if (hasExpansion(t)) o.unknown = true; // `zsh $X -c`: the word may be -l or -i
+    if (t.length < 2 || (t[0] !== '-' && t[0] !== '+')) break;
+    if (t.startsWith('--')) {
+      if (t === '--login') o.login = true;
+      else if (t === '--interactive') o.interactive = true;
+      else if (t === '--rcfile' || t === '--init-file') { if (argv[i + 1] !== undefined) o.rc.push(argv[i + 1]); i++; } else if (/^--(?:rcfile|init-file)=/.test(t)) o.rc.push(t.slice(t.indexOf('=') + 1));
+      continue;
+    }
+    if (t.includes('l')) o.login = true;
+    if (t.includes('i')) o.interactive = true;
+    if (/[oO]$/.test(t)) {
+      const v = argv[++i] ?? '';
+      if (hasExpansion(v)) o.unknown = true;
+      if (/^login$/i.test(v)) o.login = true;
+      if (/^interactive$/i.test(v)) o.interactive = true;
+    }
+  }
+  return o;
+}
+
+// Values a startup variable may have for `cmd`: its own prefix (`BASH_ENV=f.sh bash`, `env BASH_ENV=f.sh bash`) replaces every other
+// source; otherwise every bare or `export`/`declare`/... assignment anywhere on the line (exported or not, before or after,
+// reached or not), `inherited(name)` (the policy's own variable tracking) and the hook's environment. Values are words as written.
+function startupValues(cmd, cmds, name, env, inherited) {
+  const own = cmd.env && Object.hasOwn(cmd.env, name) ? cmd.env[name] : undefined;
+  if (own !== undefined && own !== '') return [own];
+  const out = new Set(inherited(name));
+  for (const c of cmds) {
+    if (!c.argv.length) { if (Object.hasOwn(c.env, name)) out.add(c.env[name]); continue; }
+    if (!VAR_DECLS.has(base(c.argv[0]))) continue;
+    for (const w of c.argv.slice(1)) {
+      const m = ASSIGN_RE.exec(w);
+      if (m && m[1] === name) out.add(w.slice(m[0].length));
+    }
+  }
+  for (const k of Object.keys(env ?? {})) if (k.toUpperCase() === name && typeof env[k] === 'string') out.add(env[k]);
+  out.delete(undefined);
+  out.delete('');
+  return [...out];
+}
+
+// What the line assigns to the startup variables, for the scripts it runs in this shell (`BASH_ENV=f.sh; source outer.sh`): {NAME: [values]}.
+export function startupVarsOf(cmds, { env = {}, inherited = () => [] } = {}) {
+  const out = {};
+  for (const n of ['BASH_ENV', 'ENV', 'ZDOTDIR', 'HOME']) out[n] = startupValues({ env: {} }, cmds, n, env, inherited);
+  return out;
+}
+
+// The startup files the shell `cmd` runs, as script-file records ({kind:'shell'}; a value with `$` / a backtick is ambiguous, so
+// the callers refuse it when the line mentions a guarded operation / protected path, like a script named at run time).
+// `cmds`: the commands of the line (for assignments elsewhere on it); `env`: the hook's environment; `inherited(name)`: values the
+// policy already knows (array; `$NAME` stands for one it cannot know); `exec`: a program run by path, which may be a shell script.
+// `implicit: true` marks the default $HOME/.zshenv, which no word on the line names.
+export function startupFilesOf(cmd, cmds = [], { env = {}, inherited = () => [], exec = false } = {}) {
+  const argv = cmd?.argv;
+  if (!argv?.length) return [];
+  const name = base(argv[0]);
+  const shell = SHELLS.has(name) && !NO_STARTUP.has(name);
+  if (!shell && !exec) return [];
+  const out = [];
+  const add = (file, implicit = false) => {
+    if (file === '' || out.some((o) => o.file === file)) return;
+    const rec = /[$`]/.test(file) ? { kind: 'shell', file, ambiguous: true, words: [file] } : { kind: 'shell', file };
+    out.push(implicit ? { ...rec, implicit: true } : rec);
+  };
+  const values = (n) => startupValues(cmd, cmds, n, env, inherited);
+  for (const n of ['BASH_ENV', 'ENV']) for (const v of values(n)) add(v);
+  const opts = shell ? startupOptions(argv) : { login: false, interactive: false, unknown: false, rc: [] };
+  for (const r of opts.rc) add(r);
+  if (name !== 'zsh' && !exec) return out;
+  const zNames = ['.zshenv'];
+  if (opts.login || opts.unknown) zNames.push('.zprofile', '.zlogin', '.zlogout');
+  if (opts.interactive || opts.unknown) zNames.push('.zshrc');
+  const own = cmd.env && Object.hasOwn(cmd.env, 'ZDOTDIR') && cmd.env.ZDOTDIR !== '' ? [cmd.env.ZDOTDIR] : null;
+  const dirs = own ?? [...values('ZDOTDIR'), ...(exec ? [] : [...values('HOME'), '~'])];
+  for (const d of dirs) for (const z of zNames) add(`${d.replace(/\/+$/, '')}/${z}`, d === '~' && !own);
+  return out;
+}
+
 // ---- the parser ---------------------------------------------------------------------------------
 
 function emit(ctx, argv, env, raw, depth, redirects = [], sep = ';') {
