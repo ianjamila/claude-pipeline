@@ -944,3 +944,32 @@ test('hand-back rule 3: the wire copy may hold \\uXXXX escapes for characters th
   refused(withWire(wireOf(message) + 'x'), E);
   refused(withWire(wireOf(literal).replace('\\u00a0', '\u00a0'), { message: literal }), E);
 });
+
+test('hand-back rule 3: a literal backslash-u text in the input is matched even where the wire escapes a character after it', () => {
+  const E = /hand-back input differs from its wire input/;
+  const withWire = (wireMessage, input) => [userLine('p'), hbLine({ stop: 'tool_use', input: { message: input }, wireToolInputs: { [HB_ID]: { message: wireMessage } } }), ackLine()];
+  // The input holds the six characters backslash-u005c as text; the wire holds them unchanged (a literal backslash there
+  // is also a valid start of an escape for a backslash), and escapes the n-tilde. The comparison must back out of the escape reading.
+  const literal = 'a \\u005c b ñ';
+  const r = proveText(withWire('a \\u005c b \\u00f1', literal));
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.finalVia, 'handback');
+  // The reverse shape: the wire escapes the input's backslash (escape reading needed), followed by the same text.
+  const r2 = proveText(withWire('a \\u005cu005c b', 'a \\u005c b'));
+  assert.deepEqual(r2.errors, []);
+  assert.equal(r2.finalVia, 'handback');
+  // A near miss is still refused: the wire holds a different character where the input has a backslash.
+  refused(withWire('a ]u005c b \\u00f1', literal), E);
+  refused(withWire('a \\u005c b \\u00f2', literal), E);
+  refused(withWire('a \\u005c b \\u00f1 ', literal), E);
+  // A long ambiguous input finishes quickly: 20k backslashes against a wire of alternating escape and literal readings.
+  const n = 20000;
+  const t0 = Date.now();
+  const big = proveText(withWire('\\u005c'.repeat(n) + '\\u005cu005c'.repeat(n) + ']', '\\'.repeat(n) + '\\u005c'.repeat(n) + '\\'));
+  assert.ok(Date.now() - t0 < 1000, `took ${Date.now() - t0} ms`);
+  assert.match(big.errors.join('\n'), E);
+  const t1 = Date.now();
+  const bigOk = proveText(withWire('\\u005c'.repeat(n) + '\\u005cu005c'.repeat(n), '\\'.repeat(n) + '\\u005c'.repeat(n)));
+  assert.ok(Date.now() - t1 < 1000, `took ${Date.now() - t1} ms`);
+  assert.deepEqual(bigOk.errors, []);
+});

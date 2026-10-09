@@ -196,23 +196,29 @@ function takesParallelResult(line, ids) {
 
 // Claude Code's wire copy of a tool input can hold \uXXXX escape text where the parsed input holds the character
 // itself (seen for U+00A0, U+202F, n-tilde). Exactly that and nothing else may differ: walk both strings, and at a
-// difference the wire must show \uXXXX decoding to the input's character.
+// difference the wire must show \uXXXX decoding to the input's character. Where both readings fit (the wire's
+// backslash is also the input's literal backslash, or the start of a \u005c escape for it) either may be the right
+// one, so both are tried: a depth-first walk over (input index, wire index) that remembers the pairs already tried.
 function sameWireMessage(wire, input) {
-  let i = 0;
-  let j = 0;
-  while (i < input.length && j < wire.length) {
-    const esc = /^\\u([0-9a-fA-F]{4})/.exec(wire.slice(j, j + 6));
-    if (esc && String.fromCharCode(parseInt(esc[1], 16)) === input[i]) {
-      i++;
-      j += 6;
-    } else if (input[i] === wire[j]) {
-      i++;
-      j++;
-    } else {
-      return false;
+  const stride = wire.length + 1;
+  const tried = new Set();
+  const stack = [[0, 0]];
+  while (stack.length > 0) {
+    const [i, j] = stack.pop();
+    if (i === input.length || j === wire.length) {
+      if (i === input.length && j === wire.length) return true;
+      continue;
+    }
+    const key = i * stride + j;
+    if (tried.has(key)) continue;
+    tried.add(key);
+    if (input[i] === wire[j]) stack.push([i + 1, j + 1]);
+    if (wire[j] === '\\' && wire[j + 1] === 'u') {
+      const esc = /^\\u([0-9a-fA-F]{4})/.exec(wire.slice(j, j + 6));
+      if (esc && String.fromCharCode(parseInt(esc[1], 16)) === input[i]) stack.push([i + 1, j + 6]);
     }
   }
-  return i === input.length && j === wire.length;
+  return false;
 }
 
 function sameWireInput(wire, input) {
