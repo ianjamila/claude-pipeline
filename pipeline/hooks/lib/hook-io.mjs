@@ -1,15 +1,12 @@
 // Why: a PreToolUse hook that crashes is treated by Claude Code as a non-blocking error and the tool call is
 // ALLOWED, so every hook entry point goes through runHook: it never throws, never exits non-zero by accident,
-// and when something internal breaks it fails closed for input that looks like a guarded git/gh operation
-// (and open for everything else, so an unrelated bug cannot freeze every Bash command).
+// and when ANYTHING internal breaks (the evaluator throws or returns no decision, the input is not a JSON object) it
+// fails closed: it denies the call and names the error. The old rule denied only when the text mentioned a guarded
+// word, which let a bug or a slow evaluation through for every command whose guarded part was spelled another way
+// (`g''it push`, a script file, a variable); the cost of the strict rule is that a broken guard stops every call it
+// is matched to, loudly, until it is fixed.
 
 export const REASON_PREFIX = '[claude-pipeline guard-git] ';
-
-// Substrings (lowercase) that make an unparseable / unevaluable request look guarded.
-export const FAIL_CLOSED_KEYWORDS = [
-  'push', 'merge', 'protection', 'ruleset', 'human-approved', 'test-change-approved', 'needs-human',
-  'pipeline-pause', 'pipeline-rollback', 'pipeline-blocked', 'awaiting-review', 'issue close', 'repo edit',
-];
 
 const withPrefix = (reason) => {
   const text = String(reason ?? '').trim() || 'blocked by the pipeline guard';
@@ -56,9 +53,8 @@ export async function readHookInput(stream = process.stdin) {
 
 // io (tests only): { stdin: string | stream, stdout: { write } }. Resolves to 'deny' or 'allow'.
 export async function runHook(evaluate, io = {}) {
-  let text = '';
   try {
-    text = await readStdinText(io.stdin ?? process.stdin);
+    const text = await readStdinText(io.stdin ?? process.stdin);
     const verdict = await evaluate(parseHookInput(text));
     if (verdict?.decision === 'deny') {
       deny(verdict.reason, io);
@@ -70,18 +66,12 @@ export async function runHook(evaluate, io = {}) {
     }
     throw new TypeError('evaluator returned no decision');
   } catch (err) {
-    const lower = text.toLowerCase();
-    const hit = FAIL_CLOSED_KEYWORDS.find((k) => lower.includes(k));
-    if (hit) {
-      const why = err instanceof Error ? err.message : String(err);
-      try {
-        deny(`internal error while checking this command (${why}); denied because the request mentions "${hit}". Retry, or ask the repository owner.`, io);
-        return 'deny';
-      } catch {
-        return 'allow'; // stdout is gone; nothing more can be done
-      }
+    const why = err instanceof Error ? err.message : String(err);
+    try {
+      deny(`internal error while checking this command (${why}); denied because the guard cannot verify it. Retry, or ask the repository owner.`, io);
+      return 'deny';
+    } catch {
+      return 'allow'; // stdout is gone; nothing more can be done
     }
-    allow();
-    return 'allow';
   }
 }

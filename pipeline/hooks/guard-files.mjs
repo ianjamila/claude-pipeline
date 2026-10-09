@@ -4,13 +4,13 @@
 // the hook off-switches. Only a Claude Code process launched with PIPELINE_ADMIN=1 bypasses it. The decision
 // logic is in lib/files-policy.mjs; this file only does stdin/stdout and must never crash, because a crashing
 // hook counts as "allowed" to Claude Code. It carries its own tiny IO (no hook-io.mjs) so it still runs if
-// that helper is missing.
+// that helper is missing. Fail closed: once the tool is known to be one of ours, ANY internal error (policy module
+// missing, evaluator throws, no verdict) or unreadable input denies with the error in the reason; a tool that is not ours
+// returns silently before anything can throw.
 import os from 'node:os';
 
 const FILE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
 const SHELL_TOOLS = new Set(['Bash', 'PowerShell', 'Monitor']);
-// An internal error denies only when the raw input could be about the pipeline's own switches.
-const SENSITIVE = /\.claude|PIPELINE_ADMIN|disableAllHooks|install\.|CLAUDECODE|PIPELINE_(?:GH|CODEX|VERCEL|TEST_MODE)/;
 
 async function readStdin() {
   const chunks = [];
@@ -30,25 +30,32 @@ function deny(reason) {
 
 async function main() {
   let raw = '';
+  let input;
   try {
     raw = await readStdin();
-  } catch { /* an unreadable stdin is handled like malformed input below */ }
-
+    input = JSON.parse(raw);
+    if (input === null || typeof input !== 'object' || Array.isArray(input)) throw new TypeError('the input is not a JSON object');
+  } catch (err) {
+    // no tool name to judge by: unreadable or malformed input is refused (the admin launch still bypasses)
+    if (process.env.PIPELINE_ADMIN !== '1') deny(`internal error (${String(err?.message ?? err).slice(0, 120)}); denied because the input could not be read`);
+    return;
+  }
+  const tool = input.tool_name;
+  const isShell = SHELL_TOOLS.has(tool);
+  const isMcp = typeof tool === 'string' && tool.startsWith('mcp__');
+  if (!isShell && !FILE_TOOLS.has(tool) && !isMcp) return; // not ours (MCP write tools are judged by evaluateFileTool)
   try {
-    const input = JSON.parse(raw);
-    const tool = input && typeof input === 'object' ? input.tool_name : undefined;
-    const isShell = SHELL_TOOLS.has(tool);
-    if (!isShell && !FILE_TOOLS.has(tool) && !(typeof tool === 'string' && tool.startsWith('mcp__'))) return; // not ours (MCP write tools are judged by evaluateFileTool)
     const { evaluateFileTool, evaluateBashForFiles } = await import('./lib/files-policy.mjs');
     const cwd = typeof input.cwd === 'string' && input.cwd ? input.cwd : process.cwd();
     const opts = { home: os.homedir(), env: process.env, platform: process.platform };
     const verdict = isShell
       ? evaluateBashForFiles(input.tool_input?.command, { ...opts, cwd })
       : evaluateFileTool({ ...input, cwd }, opts);
-    if (verdict.decision === 'deny') deny(verdict.reason);
+    if (verdict?.decision === 'deny') deny(verdict.reason);
+    else if (verdict?.decision !== 'allow') throw new TypeError('the policy returned no decision');
   } catch (err) {
     if (process.env.PIPELINE_ADMIN === '1') return;
-    if (SENSITIVE.test(raw)) deny(`internal error (${String(err?.message ?? err).slice(0, 120)}); denied because the request mentions pipeline files or switches`);
+    deny(`internal error (${String(err?.message ?? err).slice(0, 120)}); denied because the guard cannot verify this call`);
   }
 }
 

@@ -848,16 +848,15 @@ test('spawn: a non-Bash tool is allowed even when its input looks like a push', 
   assert.equal(r.stdout, '');
 });
 
-test('spawn: malformed stdin mentioning push is denied; without keywords it is allowed', () => {
-  const bad = hook('{"tool_name":"Bash","tool_input":{"command":"git push origin main"');
-  assert.equal(bad.status, 0);
-  assert.equal(JSON.parse(bad.stdout).hookSpecificOutput.permissionDecision, 'deny');
-  const harmless = hook('{"tool_name":"Bash","tool_input":{"command":"ls -la"');
-  assert.equal(harmless.status, 0);
-  assert.equal(harmless.stdout, '');
-  const empty = hook('');
-  assert.equal(empty.status, 0);
-  assert.equal(empty.stdout, '');
+// Fail-closed change (#21): the keyword condition is gone, so malformed or empty stdin is refused whatever it mentions.
+test('spawn: malformed or empty stdin is denied, whether or not it mentions a guarded word', () => {
+  for (const raw of ['{"tool_name":"Bash","tool_input":{"command":"git push origin main"', '{"tool_name":"Bash","tool_input":{"command":"ls -la"', '', '[]', 'null']) {
+    const r = hook(raw);
+    assert.equal(r.status, 0, raw);
+    const out = JSON.parse(r.stdout).hookSpecificOutput;
+    assert.equal(out.permissionDecision, 'deny', raw);
+    assert.match(out.permissionDecisionReason, /internal error/, raw);
+  }
 });
 
 test('spawn: a Bash call with no command is allowed', () => {
@@ -1045,7 +1044,7 @@ test('spawn: a missing gh binary makes close fail closed rather than crash', () 
   assert.equal(JSON.parse(r.stdout).hookSpecificOutput.permissionDecision, 'deny');
 });
 
-test('spawn: a policy module that fails to load fails closed for guarded input and open for the rest', () => {
+test('spawn: a policy module that fails to load fails closed for every command it is asked about', () => {
   const root = join(TMP, 'broken-install');
   cpSync(resolve(HERE, '../pipeline/hooks'), join(root, 'pipeline/hooks'), { recursive: true });
   cpSync(resolve(HERE, '../pipeline/lib'), join(root, 'pipeline/lib'), { recursive: true });
@@ -1056,9 +1055,20 @@ test('spawn: a policy module that fails to load fails closed for guarded input a
   assert.equal(guarded.status, 0);
   assert.equal(JSON.parse(guarded.stdout).hookSpecificOutput.permissionDecision, 'deny');
   assert.match(JSON.parse(guarded.stdout).hookSpecificOutput.permissionDecisionReason, /internal error/);
-  const harmless = run('ls -la');
+  const harmless = run('ls -la'); // formerly allowed (no guarded word): the keyword rule is gone
   assert.equal(harmless.status, 0);
-  assert.equal(harmless.stdout, '');
+  assert.equal(JSON.parse(harmless.stdout).hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(JSON.parse(harmless.stdout).hookSpecificOutput.permissionDecisionReason, /internal error/);
+});
+
+test('spawn: when hook-io.mjs itself is missing the hook still denies (a crash would allow)', () => {
+  const root = join(TMP, 'no-hook-io');
+  cpSync(resolve(HERE, '../pipeline/hooks'), join(root, 'pipeline/hooks'), { recursive: true });
+  rmSync(join(root, 'pipeline/hooks/lib/hook-io.mjs'));
+  const r = spawnSync(process.execPath, [join(root, 'pipeline/hooks/guard-git.mjs')], { input: JSON.stringify(bashInput('ls -la', TMP)), encoding: 'utf8' });
+  assert.equal(r.status, 0);
+  assert.equal(JSON.parse(r.stdout).hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(JSON.parse(r.stdout).hookSpecificOutput.permissionDecisionReason, /^\[claude-pipeline guard-git\] internal error/);
 });
 
 test('spawn: label rules need no gh at all', () => {
