@@ -731,3 +731,12 @@ test('R1-B2: a quoted $ or backtick followed by a glob character is still globbe
   for (const c of ["bash 'x$y'*.sh", "bash 'x$y'?.sh", "./'x$y'*.sh", "bash 'k`id`'*.sh", "source 'x$y'[0-9].sh", "bash $Z 'x$y'*.sh"]) denyBoth(c, spec);
   allowBoth("bash 'x$z'*.sh", spec);
 });
+
+test('R1-B3: a quoted word that holds $name is also judged as the literal file when name is a known variable', () => {
+  const spec = { 'x$y.sh': 'bad', 'x1.sh': 'ok', 'ok.sh': 'ok' };
+  for (const c of ["y=1; bash 'x$y.sh'", "y=1; source 'x$y.sh'", "y=1; ./'x$y.sh'", "export y=1; bash x\\$y.sh"]) denyBoth(c, spec);
+  // (quoting is lost, so an unquoted `bash x$y.sh` is judged as the literal file too: a candidate too many, never one too few)
+  // a known variable keeps its meaning (the literal reading is only an extra candidate, not an unknown word)
+  assert.equal(git('H=ok.sh; bash $H && git push origin agent/x').decision, 'allow');
+  assert.equal(git('bash $HOME/ok.sh && git push origin agent/x').decision, 'allow');
+});
