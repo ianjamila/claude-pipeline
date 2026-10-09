@@ -5,7 +5,7 @@
 // for a glob, the existing files it matches. Each policy then judges the files like any other script.
 // Pure apart from the injected `readDir` (fs.readdirSync-like: names; null when the shell would match nothing there
 // either; any other answer means the directory could not be listed and is refused).
-import { readdirSync } from 'node:fs';
+import { readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { SCRIPT_EXT } from './shell-parse.mjs';
 
 export const MAX_CANDIDATES = 32; // more words than this are refused, not judged
@@ -72,6 +72,33 @@ const EXTENDED_GLOB = /[\^#]|[^=]~(?!\d|$)/;
 export const defaultReadDir = (dir) => {
   try { return readdirSync(dir); } catch (e) { return ['ENOENT', 'ENOTDIR', 'EACCES'].includes(e?.code) ? null : false; }
 };
+
+// The first bytes of a file the policies refused to read whole (over the 1 MB cap), enough to see a NUL or a shebang. null
+// when it is not a readable regular file.
+export const HEAD_BYTES = 4096;
+export function defaultReadHead(file) {
+  let fd = null;
+  try {
+    if (!statSync(file).isFile()) return null;
+    fd = openSync(file, 'r');
+    const buf = Buffer.alloc(HEAD_BYTES);
+    return buf.toString('utf8', 0, readSync(fd, buf, 0, HEAD_BYTES, 0));
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) try { closeSync(fd); } catch { /* nothing to close */ }
+  }
+}
+
+// Would the kernel / a shell run a program with this head as a shell script? A binary (NUL) no; an interpreter shebang
+// (node, python ...) no, that text is another language; a shell shebang, any other shebang, or none at all (run as sh) yes.
+const HEAD_SHEBANG = /^#!\s*(?:\S*\/)?(?:env\s+(?:-\S+\s+)*)?(\S+)/;
+const HEAD_INTERPRETER = /^(?:node|nodejs|deno|bun|tsx|ts-node|python[\d.]*|ruby|perl|php)$/;
+export function isShellHead(head) {
+  if (head.includes('\u0000')) return false;
+  const prog = HEAD_SHEBANG.exec(head)?.[1] ?? '';
+  return !HEAD_INTERPRETER.test(prog.split('/').pop());
+}
 
 // Does `name` match one glob segment (`*`, `?`, `[a-z]`, `[!x]`)? Dotfiles are included whatever the shell's dotglob /
 // GLOB_DOTS settings: a candidate too many only costs a judgment. Every reading below can only match MORE names.

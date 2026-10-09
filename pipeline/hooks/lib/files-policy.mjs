@@ -18,8 +18,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
-import { simpleCommands, commandName, scriptFileOf } from './shell-parse.mjs';
-import { scriptCandidates, defaultReadDir, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
+import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf } from './shell-parse.mjs';
+import { scriptCandidates, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
 
 const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
@@ -173,6 +173,7 @@ function makeCtx(opts) {
     vars: {}, // same-line shell assignments (D=$HOME/.claude), filled in once the line is parsed
     dynamic: false, // set when a scan had to be skipped for size; callers fail closed
     readText: opts.readText ?? defaultReadText,
+    readHead: opts.readHead ?? defaultReadHead, // the first bytes of a file readText refused (over the cap)
     budget: opts._budget ?? newEvalBudget(opts.now), // script reads, deadline and expansion allowance of this evaluation (shared with nested calls)
     readDir: opts.readDir ?? defaultReadDir,
     admin: (opts.env ?? process.env).PIPELINE_ADMIN === '1',
@@ -1011,21 +1012,42 @@ function judgeScriptFile(sf, dirs, ctx, opts, scanRaw = '', keepBackslash = fals
     // named at run time: the textual rules on the whole line still apply. Quoting is lost (`'x$y.sh'` reads as `x$y.sh`), so the word as written is judged too if it is a file
     return keepBackslash ? null : judgeScriptFile({ kind: sf.kind, file: sf.file, candidate: true }, dirs, ctx, opts);
   }
-  const found = [];
+  // every directory the command may run in (the cwd and each `cd` target) that holds the file: any of them may be the one that runs
+  const seen = new Set();
   for (const d of isAbs(e) ? [''] : dirs) {
     const abs = isAbs(e) ? posix.normalize(e) : posix.join(d, e);
-    if (ctx.api.existsSync(abs)) { found.push({ abs, dir: d || ctx.cwd }); break; }
+    if (seen.has(abs) || !ctx.api.existsSync(abs)) continue;
+    seen.add(abs);
+    const v = judgeFoundScript(sf, abs, d || ctx.cwd, ctx, opts);
+    if (v) return v;
   }
-  if (!found.length) return null;
-  const { abs, dir } = found[0];
+  return null;
+}
+
+// One existing script file (`abs`, found in directory `dir`).
+function judgeFoundScript(sf, abs, dir, ctx, opts) {
   if (ctx.hit(abs) || ctx.hit(realResolve(abs, ctx.api)) || /\/node_modules\//.test(abs)) return null;
   checkDeadline(ctx.budget);
   const text = ctx.readText(abs);
   if (typeof text !== 'string') {
     if (sf.candidate && ctx.readDir(abs)) return null; // a shell cannot run a directory
-    return sf.kind === 'shell' ? deny(`cannot read the script ${sf.file} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified`) : null;
+    if (sf.kind === 'shell') return deny(`cannot read the script ${sf.file} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified`);
+    // over the read cap: a program run by path is peeked at (a shell script is refused, a binary or an interpreter file is not
+    // ours to judge); text a rewriting command computes from a file we cannot read cannot be scanned
+    if (sf.kind === 'exec' || sf.kind === 'scan') {
+      const head = ctx.readHead(abs);
+      if (typeof head === 'string' && (sf.kind === 'scan' || isShellHead(head))) return deny(`${sf.file} is too large to verify (over 1 MB), so what it runs (or feeds a shell) cannot be known`);
+    }
+    return null;
   }
   countScript(ctx.budget); // every script read and judged counts, named or candidate: the work multiplies with each level
+  if (sf.kind === 'scan') {
+    // text a command rewrites on its way to a shell (sed, awk, base64 ...) is computed at run time: a file that names a protected file or switch is refused
+    if (variantsOf(text).some((t) => setsAdmin(t, ctx.platform) || hasDisableAll(t)) || SENSITIVE_WORDS.test(text) || makeMatchers(ctx).rawHit(text, [dir])) {
+      return deny(`${sf.file} is read by a command that feeds a shell, and refers to a protected pipeline file or switch, so what the shell runs cannot be verified (${PROTECTED_MSG})`);
+    }
+    return null;
+  }
   let kind = sf.kind;
   if (kind === 'exec') {
     if (text.slice(0, 4096).includes('\u0000')) return null; // a binary
@@ -1202,11 +1224,17 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
   if ((opts._depth ?? 0) < 4) {
     for (const c of cmds) {
       const sf = scriptFileOf(c.argv, c.raw, raw);
-      if (!sf) continue;
-      const v = judgeScriptFile(sf, dirs, ctx, opts, scanRaw);
-      if (v) return v;
+      if (sf) {
+        const v = judgeScriptFile(sf, dirs, ctx, opts, scanRaw);
+        if (v) return v;
+      }
+      // script text that reaches a shell without being named (`bash < f.sh`, `cat f.sh | bash`, `eval "$(cat f.sh)"`): its files are judged like `bash f.sh`
+      for (const fd of scriptFeedsOf(c, raw)) {
+        const v = judgeScriptFile(fd, dirs, ctx, opts, scanRaw);
+        if (v) return v;
+      }
     }
-  } else if (cmds.some((c) => scriptFileOf(c.argv))) return deny('scripts run scripts too deeply to check');
+  } else if (cmds.some((c) => scriptFileOf(c.argv) || scriptFeedsOf(c).length)) return deny('scripts run scripts too deeply to check');
 
   // 5: protected-path references must be read-only
   const m = makeMatchers(ctx);

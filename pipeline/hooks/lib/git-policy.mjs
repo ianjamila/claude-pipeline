@@ -15,9 +15,9 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { commandName, simpleCommands, splitArgs, scriptFileOf } from './shell-parse.mjs';
+import { commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf } from './shell-parse.mjs';
 import { catchAllReason, guardedCommandText } from './guarded-text.mjs';
-import { scriptCandidates, defaultReadDir, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
+import { scriptCandidates, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
 
 const PROTECTED_BRANCHES = ['main', 'master'];
 const APPROVAL_LABELS = ['human-approved', 'test-change-approved'];
@@ -801,16 +801,25 @@ function checkScriptFile(sf, dir, ctx, level) {
   }
   const home = !sf.candidate && (file === '~' || file.startsWith('~/')) ? ctx.home + file.slice(1) : file;
   // a relative script after a cd that may not have run: which file runs is unknown, never the starting directory's
-  if (dir === null && !path.isAbsolute(home)) return deny(`cannot tell which directory this runs in, so which ${sf.file} runs cannot be verified. Use an absolute path, or chain the cd with &&.`);
+  // (a scan word is a guess at a file name, not a script: it is looked up in the starting directory instead)
+  if (dir === null && sf.kind !== 'scan' && !path.isAbsolute(home)) return deny(`cannot tell which directory this runs in, so which ${sf.file} runs cannot be verified. Use an absolute path, or chain the cd with &&.`);
   const abs = path.resolve(dir ?? ctx.cwd, home);
   checkDeadline(ctx.budget);
   const text = ctx.readText(abs);
   if (typeof text !== 'string') {
     if (sf.candidate && ctx.readDir(abs)) return null; // a shell cannot run a directory
     if (sf.kind === 'shell' && ctx.pathExists(abs)) return deny(`cannot read the script ${sf.file} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified.`);
+    // over the read cap: a program run by path is peeked at (a shell script is refused, a binary or an interpreter file is not
+    // ours to judge); text a rewriting command computes from a file we cannot read cannot be scanned
+    if (sf.kind === 'exec' || sf.kind === 'scan') {
+      const head = ctx.readHead(abs);
+      if (typeof head === 'string' && (sf.kind === 'scan' || isShellHead(head))) return deny(`${sf.file} is too large to verify (over 1 MB), so what it runs (or feeds a shell) cannot be known.`);
+    }
     return null; // missing: nothing will run
   }
   countScript(ctx.budget); // every script read and judged counts, named or candidate: the work multiplies with each level
+  // text a command rewrites on its way to a shell (sed, awk, base64 ...) is computed at run time: a file holding a guarded word is refused
+  if (sf.kind === 'scan') return GUARDED_WORDS.test(text) ? deny(`${sf.file} is read by a command that feeds a shell, and mentions a guarded operation, so what the shell runs cannot be verified. Write the command out literally.`) : null;
   let kind = sf.kind;
   if (kind === 'exec') {
     if (text.slice(0, 4096).includes('\u0000')) return null; // a binary
@@ -898,7 +907,7 @@ function checkCandidateScripts(sf, dir, ctx, level) {
     }
   }
   // after a cd that may not have run, a relative word (or a glob over one) names a file in an unknown directory
-  if (dir === null && sf.words.some((w) => !path.isAbsolute(expand(w)))) return deny('cannot tell which directory this runs in, so which script it runs cannot be verified. Use an absolute path, or chain the cd with &&.');
+  if (dir === null && sf.kind !== 'scan' && sf.words.some((w) => !path.isAbsolute(expand(w)))) return deny('cannot tell which directory this runs in, so which script it runs cannot be verified. Use an absolute path, or chain the cd with &&.');
   const c = scriptCandidates(sf, { expand, dirs: [here], joinPath: (d, r) => path.resolve(d, r), readDir: ctx.readDir, ifs: ctx.vars.IFS });
   if (c.over) return deny('too many words, a glob matching too many files, or glob syntax that cannot be resolved could be the script this command runs, so it cannot be verified. Name the script file.');
   if (c.dynamic && GUARDED_WORDS.test(ctx.fullText)) {
@@ -1103,6 +1112,8 @@ function evalString(str, startDir, ctx, level) {
         if (name === 'source' || name === '.') sf.sourced = true;
         verdict = checkScriptFile(sf, dir, ctx, level);
       }
+      // script text that reaches a shell without being named (`bash < f.sh`, `cat f.sh | bash`, `eval "$(cat f.sh)"`): its files are judged like `bash f.sh`
+      if (!verdict) for (const fd of scriptFeedsOf(c, str)) { verdict = checkScriptFile(fd, dir, ctx, level); if (verdict) break; }
     }
     if (verdict && verdict.decision === 'deny') return verdict;
     if (SOURCING.includes(name)) {
@@ -1129,6 +1140,7 @@ export function evaluateGitCommand(command, {
   pushDestination = () => null,
   issueLabels = () => { throw new Error('no issue label lookup is available'); },
   readText = defaultReadText,
+  readHead = defaultReadHead,
   pathExists = existsSync,
   readDir = defaultReadDir,
   now = Date.now, // injectable clock (tests)
@@ -1137,7 +1149,7 @@ export function evaluateGitCommand(command, {
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   const base = cwd || process.cwd();
   const ctx = {
-    cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, readDir, budget: newEvalBudget(now), fullText: text,
+    cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, readDir, readHead, budget: newEvalBudget(now), fullText: text,
     vars: Object.create(null), unsureVars: new Set(), tainted: new Set(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
     branches: new Map(), cfgDirty: false, envCfgDirty: false,
   };

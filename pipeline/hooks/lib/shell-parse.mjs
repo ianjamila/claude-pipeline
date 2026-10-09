@@ -7,6 +7,8 @@
 // It carries `subshell: true` when the line opens a ( subshell at the top level (its commands keep depth 0, so they look
 // like they run in this shell; what they assign or cd is lost).
 // Each command is {argv, env, raw, depth, redirects}; redirections are stripped from argv but recorded in `redirects`.
+// A shell / source / eval fed script text from files (`bash < f.sh`, `cat f.sh | bash`, `eval "$(cat f.sh)"`) carries them in a
+// non-enumerable `feeds`; scriptFeedsOf turns it into script-file records for the callers.
 
 const MAX_COMMANDS = 500;
 const MAX_NEST = 200; // in-place nesting of $( ), ( ), <( ) before we give up on the line
@@ -423,10 +425,14 @@ function unwrap(argv) {
 // ordinary). It may become no word, one word or several, so it hides which of the words after it is the script.
 const EXPANDS = /[$`*?[^#]|[^=]~(?!\d|$)/;
 const hasExpansion = (w) => EXPANDS.test(w);
+// A word that is a process substitution: the shell runs a command and reads its output through a /dev/fd path.
+// (zsh's `=(cmd)` is the same thing with a temp file; add it here when the parser knows it)
+const isProcSub = (w) => w.startsWith('<(');
 
 // bash -c "script" / bash -lc ... / bash script.sh / bash (reads stdin)
 // -s, `-`, /dev/stdin and /dev/fd/0 all mean "read the script from stdin".
-// `amb`: a word up to the operand expands, so the operand found here may not be the one the shell picks.
+// `amb`: a word up to the decision point (the operand, or the `-c` / `-s` that made it a string or stdin) expands, so what
+// the shell runs may not be what the words as written say (`bash -o $X -c f.sh`: an empty $X makes -o swallow -c, and f.sh is the script file).
 function shellInvocation(argv) {
   let i = 1;
   let sawC = false;
@@ -440,9 +446,10 @@ function shellInvocation(argv) {
     if (t[0] === '-' && t.includes('s')) sawS = true;
     i += /[oO]$/.test(t) ? 2 : 1; // -o / -O take an option name
   }
-  if (sawC) return i < argv.length ? { kind: 'script', text: argv[i] } : { kind: 'none' };
-  if (sawS) return { kind: 'stdin' };
-  if (i < argv.length) return STDIN_FILES.has(argv[i]) ? { kind: 'stdin' } : { kind: 'file', text: argv[i], amb: argv.slice(1, i + 1).some(hasExpansion) };
+  const before = argv.slice(1, i).some(hasExpansion);
+  if (sawC) return i < argv.length ? { kind: 'script', text: argv[i], amb: before } : { kind: 'none' };
+  if (sawS) return { kind: 'stdin', amb: before };
+  if (i < argv.length) return STDIN_FILES.has(argv[i]) ? { kind: 'stdin', amb: before } : { kind: 'file', text: argv[i], amb: argv.slice(1, i + 1).some(hasExpansion) };
   return { kind: 'stdin', amb: argv.slice(1).some(hasExpansion) }; // `bash -$X` may be `bash -x f.sh`
 }
 
@@ -473,6 +480,11 @@ const INTERP_VALUE_FLAGS = new Set(['-r', '--require', '--import', '--loader', '
 export function scriptFileOf(argv, raw = '', line = raw) {
   const sf = scriptFileOfArgv(argv);
   if (!sf || sf.unresolvable || typeof raw !== 'string' || !raw) return sf;
+  return hasPatternSyntax(raw, line, sf.file) ? { kind: sf.kind, file: sf.file, ambiguous: true, unresolvable: true, words: sf.words ?? argv.slice(1), ...(sf.needExt === undefined ? {} : { needExt: sf.needExt }) } : sf;
+}
+
+// Does the command's text (`raw`, located in `line`) hold pattern syntax the parser cut the command at? `file`: the operand, if any.
+function hasPatternSyntax(raw, line, file) {
   let starts = [];
   if (typeof line === 'string') for (let i = line.indexOf(raw); i >= 0 && starts.length <= MAX_OCCURRENCES; i = line.indexOf(raw, i + 1)) starts.push(i);
   const text = starts.length ? line : raw; // not a substring of the line (nested script text): the command's own text
@@ -481,14 +493,14 @@ export function scriptFileOf(argv, raw = '', line = raw) {
   // the operand's own spelling, searched in the text, only ever ADDS refusals: a quoted operand that spells a pattern
   // (`'@(f|fa).sh'`) has been refused since round 2, and the masked check below would let it through
   const ats = [];
-  if (sf.file !== undefined) for (let i = raw.indexOf(sf.file); i >= 0 && ats.length <= MAX_OCCURRENCES; i = raw.indexOf(sf.file, i + 1)) ats.push(i);
+  if (file !== undefined) for (let i = raw.indexOf(file); i >= 0 && ats.length <= MAX_OCCURRENCES; i = raw.indexOf(file, i + 1)) ats.push(i);
   if (ats.length > MAX_OCCURRENCES) pattern = true;
   const wordEnd = (from) => { let e = from; while (e < text.length && !/\s/.test(text[e])) e++; return e; };
   for (const st of starts) {
     if (PATTERN_SYNTAX.test(maskQuoted(text.slice(st, wordEnd(st + raw.length))))) pattern = true;
-    for (const at of ats) if (PATTERN_SYNTAX.test(text.slice(st, wordEnd(st + at + sf.file.length)))) pattern = true;
+    for (const at of ats) if (PATTERN_SYNTAX.test(text.slice(st, wordEnd(st + at + file.length)))) pattern = true;
   }
-  return pattern ? { kind: sf.kind, file: sf.file, ambiguous: true, unresolvable: true, words: sf.words ?? argv.slice(1), ...(sf.needExt === undefined ? {} : { needExt: sf.needExt }) } : sf;
+  return pattern;
 }
 
 // The command's text with everything the shell does not read as pattern syntax replaced by '_' (same length, so `"a"<1-2>`
@@ -526,12 +538,13 @@ function scriptFileOfArgv(argv) {
   const name = base(argv[0]);
   if (SHELLS.has(name)) {
     const r = shellInvocation(argv);
-    if (r.kind === 'file' && !r.text.startsWith('<(')) return r.amb ? { kind: 'shell', file: r.text, ambiguous: true, words: argv.slice(1) } : { kind: 'shell', file: r.text };
-    return r.kind === 'stdin' && r.amb ? { kind: 'shell', file: undefined, ambiguous: true, words: argv.slice(1) } : null;
+    // a `<(...)` operand is script text, not a file, unless a word before it expands: then it is one more candidate word
+    if (r.kind === 'file' && (r.amb || !isProcSub(r.text))) return r.amb ? { kind: 'shell', file: r.text, ambiguous: true, words: argv.slice(1) } : { kind: 'shell', file: r.text };
+    return r.amb && (r.kind === 'stdin' || r.kind === 'script') ? { kind: 'shell', file: undefined, ambiguous: true, words: argv.slice(1) } : null;
   }
   if (name === 'source' || name === '.') {
     const op = argv[1];
-    if (op === undefined || STDIN_FILES.has(op) || op.startsWith('<(')) return null;
+    if (op === undefined || STDIN_FILES.has(op) || isProcSub(op)) return null;
     // `source -p PATH file` (bash 5.3): an option shifts the operand, so any word may be the file
     return hasExpansion(op) || op.startsWith('-') ? { kind: 'shell', file: op, ambiguous: true, words: argv.slice(1) } : { kind: 'shell', file: op };
   }
@@ -603,25 +616,89 @@ function findExecs(argv) {
   return out;
 }
 
+// Commands that print the files named on their command line as they are (head / tail print part of them: the whole file is
+// judged, a superset). Value: [short options that take a value, long options that take a value].
+const READERS = {
+  cat: ['', []], tac: ['', []], less: ['', []], more: ['', []], bat: ['', []], batcat: ['', []],
+  head: ['nc', ['--lines', '--bytes']], tail: ['nc', ['--lines', '--bytes']],
+};
+const MAX_FEED_FILES = 64; // more files than this feed one command: refused, not judged
+
+// The file operands of a reader: words that are not options, minus the values of options that take one.
+function readerOperands(argv, shortVal, longVal) {
+  const out = [];
+  for (let i = 1; i < argv.length; i++) {
+    const t = argv[i];
+    if (t === '--') { out.push(...argv.slice(i + 1)); break; }
+    if (t.length < 2 || t[0] !== '-') { out.push(t); continue; }
+    if (t[1] === '-') { if (!t.includes('=') && longVal.includes(t)) i++; continue; }
+    for (let k = 1; k < t.length; k++) {
+      if (!shortVal.includes(t[k])) continue;
+      if (k === t.length - 1) i++;
+      break;
+    }
+  }
+  return out;
+}
+
+// Every word of a command that rewrites what it reads (sed, awk, base64, tr, grep ...) that could name a file: all non-option
+// words (option values and sed/awk programs among them), `--file=F` / `if=F` values. Which of them is a file is only known to the caller.
+function looseOperands(argv) {
+  const out = [];
+  for (const w of argv.slice(1)) {
+    if (w === '' || /:\/\//.test(w)) continue; // a URL is not a local file
+    if (w[0] === '-') { const eq = w.indexOf('='); if (eq > 0) out.push(w.slice(eq + 1)); continue; }
+    const kv = /^(?:if|file|input)=(.+)$/.exec(w);
+    out.push(kv ? kv[1] : w);
+  }
+  return out;
+}
+
+const newSt = () => ({ dyn: false, files: [], computed: [], raws: [] });
+
+// What the command `seg` prints, when its output reaches the shell through a file: the files it reads. `exact`: nothing
+// between the command and the shell rewrites its output, so a plain reader's files ARE the script text (`st.files`); otherwise
+// the text is computed at run time and the files are only worth a look (`st.computed`).
+function noteReads(seg, name, argv, st, exact) {
+  if (name === 'echo' || name === 'printf') return; // static text, handled by producedBy
+  const reader = Object.hasOwn(READERS, name);
+  const words = reader ? readerOperands(argv, ...READERS[name]) : looseOperands(argv);
+  words.push(...seg.stdinFiles);
+  const list = exact && (reader || argv.length === 0) ? st.files : st.computed;
+  for (const w of words) if (w !== '' && w !== '-' && !STDIN_FILES.has(w)) list.push(w);
+  if (words.length) st.raws.push(seg.raw);
+}
+
+// producedBy over a substitution's segments: a command whose output is piped on (`$(cat f | tr a b)`) is only exact when it is last.
+function subsProduced(subs, st, hops) {
+  const piped = new Set();
+  for (const s of subs) if (s.pipedFrom) for (const p of s.pipedFrom) piped.add(p);
+  const out = [];
+  for (const s of subs) out.push(...producedBy(s, st, hops, !piped.has(s)));
+  return out;
+}
+
 // Static text a command writes to stdout (or hands a shell on stdin): its heredocs and here-strings, and what
-// echo / printf print. `st.dyn` is set when any of it is only known at run time.
-function producedBy(seg, st, hops = 0) {
+// echo / printf print. `st.dyn` is set when any of it is only known at run time; `st.files` / `st.computed` collect the files
+// it reads (see noteReads).
+function producedBy(seg, st, hops = 0, exact = true) {
   const out = [];
   if (hops > 6) return out;
   for (const h of seg.heredocs) out.push(h.text);
   for (const hs of seg.herestrings) {
     out.push(hs.text);
     if (hs.dyn) st.dyn = true;
-    for (const sub of hs.subs) out.push(...producedBy(sub, st, hops + 1));
+    out.push(...subsProduced(hs.subs, st, hops + 1));
   }
   const pa = seg.final ? seg.final.argv : [];
   const pn = pa.length ? base(pa[0]) : '';
+  noteReads(seg, pn, pa, st, exact);
   if (pn === 'echo' || pn === 'printf') {
     for (const a of pa.slice(1)) {
       const m = seg.meta.get(a);
       if (!m) continue;
       if (m.dyn) st.dyn = true;
-      for (const sub of m.subs) out.push(...producedBy(sub, st, hops + 1));
+      out.push(...subsProduced(m.subs, st, hops + 1));
     }
   }
   if (pn === 'echo') {
@@ -640,21 +717,22 @@ function producedBy(seg, st, hops = 0) {
 // pipeline stages print (`echo "..." | bash`, `{ echo ...; } | sh`, `cat <<EOF | sh`). `unknown` means some of
 // it is only known at run time (`curl ... | sh`, `bash < file`).
 function stdinSource(seg) {
-  const st = { dyn: false };
+  const st = newSt();
   const texts = [];
+  st.files.push(...seg.stdinFiles); // `bash < F`: the script is the file
   for (const h of seg.heredocs) texts.push(h.text);
   let fed = seg.stdinSubs.length > 0 || (seg.pipedFrom !== null && seg.pipedFrom.length > 0);
   let fedTexts = 0;
   for (const hs of seg.herestrings) {
     texts.push(hs.text);
     if (hs.dyn) st.dyn = true;
-    for (const sub of hs.subs) texts.push(...producedBy(sub, st, 1));
+    texts.push(...subsProduced(hs.subs, st, 1));
   }
-  for (const sub of seg.stdinSubs) { const t = producedBy(sub, st, 1); fedTexts += t.length; texts.push(...t); }
+  { const t = subsProduced(seg.stdinSubs, st, 1); fedTexts += t.length; texts.push(...t); }
   const walk = (stage, hops) => {
     if (hops > 8) return;
     for (const p of stage) {
-      const t = producedBy(p, st, 0);
+      const t = producedBy(p, st, 0, hops === 0);
       fedTexts += t.length;
       texts.push(...t);
       if (p.pipedFrom) walk(p.pipedFrom, hops + 1);
@@ -662,7 +740,36 @@ function stdinSource(seg) {
   };
   if (seg.pipedFrom) walk(seg.pipedFrom, 0);
   const unknown = (fed && fedTexts === 0) || seg.stdinFile || st.dyn;
-  return { texts, unknown };
+  return { texts, unknown, st };
+}
+
+// ---- script text fed to a shell from files ---------------------------------------------------------
+
+// `cmd.feeds` (not enumerable, like `sep`) lists the files the text a shell / source / eval runs comes from, when it is not
+// named as a script file: `files` hold the text as it is (a stdin redirect, `cat F |`, `<(cat F)`, `$(<F)`), `computed` are words
+// a command that rewrites its input (sed, awk, base64, tr ...) may read; `raws` are the producers' command texts.
+function addFeeds(cmd, st) {
+  if (!cmd || (!st.files.length && !st.computed.length)) return;
+  if (!cmd.feeds) Object.defineProperty(cmd, 'feeds', { value: { files: [], computed: [], raws: [] }, enumerable: false });
+  cmd.feeds.files.push(...st.files);
+  cmd.feeds.computed.push(...st.computed);
+  cmd.feeds.raws.push(...st.raws);
+}
+
+// The files that feed the text `cmd` runs, as script-file records the callers judge: {kind:'shell'} like `bash F` (the text is
+// the file), {kind:'scan'} for a file a rewriting command read (the text is computed at run time, so the caller refuses the
+// file when it holds a guarded word). A word that expands is ambiguous (the caller lists the candidates); pattern syntax the
+// parser cut the producer at, or too many files, is unresolvable (the caller must refuse). `line` is the whole line `cmd` came from.
+export function scriptFeedsOf(cmd, line = cmd?.raw) {
+  const f = cmd?.feeds;
+  if (!f) return [];
+  const exact = [...new Set(f.files)];
+  const computed = [...new Set(f.computed)].filter((w) => !exact.includes(w));
+  const rec = (kind) => (w) => (hasExpansion(w) ? { kind, file: w, ambiguous: true, words: [w] } : { kind, file: w });
+  const out = [...exact.map(rec('shell')), ...computed.map(rec('scan'))];
+  const raws = [cmd.raw, ...f.raws].filter((r) => typeof r === 'string' && r);
+  if (out.length > MAX_FEED_FILES || raws.some((r) => hasPatternSyntax(r, line))) return [{ kind: 'shell', file: out[0]?.file ?? '', ambiguous: true, unresolvable: true, words: [] }];
+  return out;
 }
 
 // ---- the parser ---------------------------------------------------------------------------------
@@ -688,6 +795,7 @@ class Parser {
     this.braceStack = []; // log positions where standalone { groups opened
     this.subAcc = []; // segments run by substitutions inside the word being lexed
     this.lastDqDyn = false;
+    this.cmd = null; // the command object interpret() is working on
     ctx.work += src.length;
     if (ctx.work > MAX_WORK) { ctx.stopped = true; ctx.truncated = true; }
   }
@@ -865,7 +973,7 @@ class Parser {
       if (!inWord) wstart = this.i;
       if (!seg) {
         seg = {
-          words: [], heredocs: [], herestrings: [], redirects: [], stdinSubs: [], stdinFile: false, meta: new Map(), win: new Map(),
+          words: [], heredocs: [], herestrings: [], redirects: [], stdinSubs: [], stdinFile: false, stdinFiles: [], meta: new Map(), win: new Map(),
           start: this.i, depth, pending: 0, muted, raw: '', final: null, groupStage: null,
           pipedFrom: lastSep === '|' ? this.lastStage : null, sep: lastSep,
         };
@@ -896,9 +1004,11 @@ class Parser {
         const dup = (rop === '>&' || rop === '<&') && /^(?:[0-9]+|-)$/.test(text);
         seg.redirects.push({ op: rop, target: dup ? '&' + text : text, fd: rfd });
         if (rop === '<') {
-          if (subs.length && text.startsWith('<(')) seg.stdinSubs.push(...subs);
+          if (subs.length && isProcSub(text)) seg.stdinSubs.push(...subs);
           else seg.stdinFile = true;
         }
+        // the file a command reads as stdin (`< F`, `<> F`; fd 0 only: `3< F` feeds nothing)
+        if ((rop === '<' || rop === '<>') && (rfd === null || rfd === 0) && !isProcSub(text)) seg.stdinFiles.push(text);
         return;
       }
       if (mode === 'herestring') {
@@ -1161,27 +1271,37 @@ class Parser {
       a = this.winFix(un.argv, seg);
     }
     // a command name that is only known at run time ($g push, $(echo git) push)
-    if (a.length && (a[0].startsWith('$') || a[0].includes('$(') || a[0].includes('`'))) this.ctx.dynamic = true;
+    const headDyn = a.length > 0 && (a[0].startsWith('$') || a[0].includes('$(') || a[0].includes('`'));
+    if (headDyn) this.ctx.dynamic = true;
     const cmd = emit(this.ctx, a, env, seg.raw, seg.depth, [], seg.sep);
     if (!isExec) seg.final = { argv: a };
-    this.interpret(a, seg);
+    if (headDyn && cmd) {
+      // `$(cat f.sh)` as the command: the shell runs whatever the substitution prints
+      const m = seg.meta.get(a[0]);
+      const st = newSt();
+      if (m) subsProduced(m.subs, st, 1);
+      addFeeds(cmd, st);
+    }
+    this.interpret(a, seg, cmd);
     return cmd;
   }
 
   // The words of an interpreter's script: flag the run as dynamic if they hold run-time expansions, and
   // parse whatever a substitution among them prints (eval "$(cat <<'EOF' ... EOF)" runs the heredoc body).
-  noteWords(seg, words, depth) {
+  // `feed`: the words are script text (eval, -c), so the files a substitution among them reads are recorded on the command
+  noteWords(seg, words, depth, feed = false) {
     for (const w of words) {
       const m = seg.meta.get(w);
       if (!m) continue;
       if (m.dyn) this.ctx.dynamic = true;
-      const st = { dyn: false };
-      for (const sub of m.subs) for (const text of producedBy(sub, st, 1)) this.subParse(text, depth);
+      const st = newSt();
+      for (const text of subsProduced(m.subs, st, 1)) this.subParse(text, depth);
+      if (feed) addFeeds(this.cmd, st);
     }
   }
 
   runScript(seg, words, text, depth) {
-    this.noteWords(seg, words, depth);
+    this.noteWords(seg, words, depth, true);
     this.subParse(text, depth);
   }
 
@@ -1189,17 +1309,22 @@ class Parser {
     const src = stdinSource(seg);
     for (const text of src.texts) this.subParse(text, depth);
     if (src.unknown) this.ctx.dynamic = true;
+    addFeeds(this.cmd, src.st);
   }
 
   // bash <(cmd) / source <(cmd): the script is whatever cmd prints
   runProcessSub(seg, word, depth) {
     const m = seg.meta.get(word);
-    const st = { dyn: false };
+    const st = newSt();
     let found = 0;
-    for (const sub of m ? m.subs : []) {
-      for (const text of producedBy(sub, st, 1)) { found++; this.subParse(text, depth); }
-    }
+    for (const text of subsProduced(m ? m.subs : [], st, 1)) { found++; this.subParse(text, depth); }
     if (found === 0 || st.dyn) this.ctx.dynamic = true;
+    addFeeds(this.cmd, st);
+  }
+
+  // `bash $X <(cmd)`: when a word before it expands, a process substitution among the words may be the script the shell runs
+  maybeProcessSubs(seg, argv, depth, skip) {
+    for (const w of argv.slice(1)) if (isProcSub(w) && w !== skip) this.runProcessSub(seg, w, depth);
   }
 
   tmux(argv, seg, depth) {
@@ -1252,7 +1377,14 @@ class Parser {
     if (rest.length > 1) this.process(rest.slice(1), {}, seg, true); // the first word may have been a window title
   }
 
-  interpret(argv, seg) {
+  // `cmd` is the command object emitted for `argv` (what it reads or is fed is recorded on it, see scriptFeedsOf)
+  interpret(argv, seg, cmd = null) {
+    const saved = this.cmd;
+    this.cmd = cmd;
+    try { this.interpretWords(argv, seg); } finally { this.cmd = saved; }
+  }
+
+  interpretWords(argv, seg) {
     if (!argv.length) return;
     const name = base(argv[0]);
     const depth = seg.depth + 1;
@@ -1260,13 +1392,15 @@ class Parser {
       const r = shellInvocation(argv);
       if (r.kind === 'script') this.runScript(seg, [r.text], r.text, depth);
       else if (r.kind === 'stdin') this.runStdin(seg, depth);
-      else if (r.kind === 'file' && r.text.startsWith('<(')) this.runProcessSub(seg, r.text, depth);
+      else if (r.kind === 'file' && isProcSub(r.text)) this.runProcessSub(seg, r.text, depth);
+      if (r.amb) this.maybeProcessSubs(seg, argv, depth, r.kind === 'file' ? r.text : undefined);
     } else if (name === 'source' || name === '.') {
       const op = argv[1];
       if (op === undefined) return;
       if (STDIN_FILES.has(op)) this.runStdin(seg, depth);
-      else if (op.startsWith('<(')) this.runProcessSub(seg, op, depth);
+      else if (isProcSub(op)) this.runProcessSub(seg, op, depth);
       else this.noteWords(seg, [op], depth);
+      if (hasExpansion(op) || op.startsWith('-')) this.maybeProcessSubs(seg, argv, depth, isProcSub(op) ? op : undefined);
     } else if (name === 'eval') {
       if (argv.length > 1) this.runScript(seg, argv.slice(1), argv.slice(1).join(' '), depth);
     } else if (name === 'trap') {
