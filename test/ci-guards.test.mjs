@@ -42,7 +42,7 @@ async function setup(change, projectOpts) {
 
 // The scripted GitHub. labelSeq/pullSeq: per-call replies (the last one repeats).
 // receipts: statuses of the head (any creator), as the jq filter in ci-guards-run.mjs shapes them.
-// runs: Actions runs by id as GitHub reports them (path/event/head_sha/run_attempt/created_at); compare: the default branch vs each run's head_sha.
+// runs: Actions runs by id as GitHub reports them (path/event/head_sha/run_attempt/created_at); compare: the default branch vs the bound PR entry's base.sha (a run's head_sha is the PR head and is never compared).
 // artifacts: artifact names of a run by id; by default a run carries what a genuine run would have uploaded for the receipts that point at it
 // (the approver being the actor of the label's latest labeling event), or a bare success/success verdict when none does.
 // statusReply: what GitHub answers to a status POST (the receipt's created_at is read from it).
@@ -64,7 +64,7 @@ function script({ head, pullHeads = [head], labels = [], labelSeq, suites = [T('
     { match: `^api repos/${REPO}/issues/${PR}/labels --paginate`, sequence: (labelSeq ?? [labels]).map((l) => ({ stdout: lines(l) })) },
     { match: `^api repos/${REPO}/commits/${head}/check-suites`, stdout: lines(suites) },
     { match: `^api repos/${REPO}/commits/${head}/statuses`, stdout: lines(receipts.map((r) => JSON.stringify(r))) },
-    ...Object.entries({ 1: GOOD_RUN, ...runs }).map(([id, run]) => ({ match: `^api repos/${REPO}/actions/runs/${id} `, stdout: `${JSON.stringify({ ...GOOD_RUN, pull_requests: [{ number: PR, head: { sha: head }, base: { ref: 'main' } }], ...run })}\n` })),
+    ...Object.entries({ 1: GOOD_RUN, ...runs }).map(([id, run]) => ({ match: `^api repos/${REPO}/actions/runs/${id} `, stdout: `${JSON.stringify({ ...GOOD_RUN, pull_requests: [{ number: PR, head: { sha: head }, base: { ref: 'main', sha: 'a'.repeat(40) } }], ...run })}\n` })),
     ...Object.keys({ 1: GOOD_RUN, ...runs }).map((id) => ({ match: `^api repos/${REPO}/actions/runs/${id}/artifacts\\?per_page=100 `, stdout: lines(artifacts[id] ?? defaultArtifacts(id, head, receipts, events)) })),
     { match: `^api repos/${REPO} --jq \\.default_branch`, stdout: 'main\n' },
     { match: `^api repos/${REPO}/compare/[0-9a-f]{40}\\.\\.\\.main `, stdout: `${compare}\n` },

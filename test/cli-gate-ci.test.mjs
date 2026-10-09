@@ -65,7 +65,7 @@ const guardScenario = ({ context = 'Hard-stop scan', run = {}, prs, compare = 'a
         stdout: `${JSON.stringify({
           path: '.github/workflows/pipeline-guards.yml@refs/heads/main', event: 'pull_request_target', head_sha: 'a'.repeat(40), run_attempt: 1,
           created_at: '2026-10-01T10:00:00Z', updated_at: '2026-10-01T10:12:00Z',
-          pull_requests: prs ? prs(o.prHead) : [{ number: 12, head: { sha: o.prHead }, base: { ref: 'main' } }], ...run,
+          pull_requests: prs ? prs(o.prHead) : [{ number: 12, head: { sha: o.prHead }, base: { ref: 'main', sha: 'a'.repeat(40) } }], ...run,
         })}\n`,
       },
       { match: '^api repos/acme/widgets --jq \\.default_branch', stdout: 'main\n' },

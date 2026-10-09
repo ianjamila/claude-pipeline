@@ -774,8 +774,10 @@ Recheck: resolved 1, 2, 6, 11, 13, P3-order; partial 3, 4, 5, 7, 8, 9, 10, 12; t
   branch `x` with an edited `pipeline-guards.yml`, open a PR into `x` with the same head sha, and that run posts
   bot receipts (and success guard statuses) on the shared head. A receipt therefore also needs a `target_url` that is
   an Actions run of this repository (always set to the run URL) whose `path` is `.github/workflows/pipeline-guards.yml`
-  (an `@ref` suffix is stripped), whose `event` is `pull_request_target`, and whose `head_sha` (the base tip the
-  workflow ran from) is on the default branch (`compare/<head_sha>...<default>` is `identical` or `ahead`). Because
+  (an `@ref` suffix is stripped), whose `event` is `pull_request_target`, and whose bound PR entry (below) names a
+  `base.sha` on the default branch (`compare/<base.sha>...<default>` is `identical` or `ahead`). NOT the run's `head_sha`:
+  for `pull_request_target` GitHub reports the PR HEAD there (measured: EagleWatch run 37906872583), so checking it
+  refused every PR; `base.sha` may lag (lazy refresh) but is still a main commit, and `base.ref` pins main's tip. Because
   the poster of a status chooses its `target_url`, the run must also be ABOUT this verdict: `pull_requests` lists this
   PR number at the status's sha with `base.ref` = the default branch (an empty list is untrusted, fail closed), and the
   status was created within the run's `[created_at, updated_at]` window (10 s slack; the lower bound is the run's creation, i.e. the event time, because a queued run can start long after the labeling it answers) and the run is `run_attempt` 1 (a re-run can execute an OLDER guard revision from an old main tip and post a fresh success over a newer failure, so re-runs never count: push a commit or close and reopen the PR to run the guards again). `base.ref` is mandatory: "ancestor
