@@ -114,7 +114,7 @@ function expandVars(text, vars) {
   return String(text).replace(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g, (m, a, b) => vars[a ?? b] ?? m);
 }
 
-const recordVars = (env, ctx) => { for (const k of Object.keys(env)) ctx.vars[k] = env[k]; };
+const recordVars = (env, ctx) => { for (const k of Object.keys(env)) { ctx.vars[k] = env[k]; ctx.tainted.delete(k); } };
 
 // Resolves `target` against `dir`. Returns null when the result cannot be known statically ($VAR, $(..), `cd -`).
 function joinDir(dir, target, ctx) {
@@ -772,7 +772,16 @@ function judgeScoped(text, dir, ctx, level, sf) {
     const after = Object.assign(Object.create(null), ctx.vars);
     for (const k of Object.keys(ctx.vars)) delete ctx.vars[k];
     Object.assign(ctx.vars, saved);
-    if (sf.sourced) for (const k of new Set([...Object.keys(after), ...Object.keys(saved)])) if (after[k] !== saved[k]) ctx.tainted.add(k);
+    // uncertain from here on: unknown to every ordinary use ($F stays $F), and judged under each value it may hold as a script
+    if (sf.sourced) {
+      for (const k of new Set([...Object.keys(after), ...Object.keys(saved)])) {
+        if (after[k] === saved[k]) continue;
+        const alts = ctx.tainted.get(k) ?? new Set();
+        for (const v of [saved[k], after[k]]) if (v !== undefined) alts.add(v);
+        ctx.tainted.set(k, alts);
+        delete ctx.vars[k];
+      }
+    }
   }
 }
 
@@ -787,10 +796,19 @@ function checkCandidateScripts(sf, dir, ctx, level) {
     if (e === '~' || e.startsWith('~/')) e = ctx.home + e.slice(1);
     return e;
   };
-  const c = scriptCandidates(sf, { expand, dirs: [here], joinPath: (d, r) => path.resolve(d, r), readDir: ctx.readDir, ifs: ctx.vars.IFS });
+  // a variable a speculative `source` may have changed: every value it may hold is a candidate, and it is unknown at run time
+  let tainted = false;
+  const extra = [];
+  for (const w of sf.words) {
+    for (const m of w.matchAll(/\$(?:\{(\w+)[^}]*\}|(\w+))/g)) {
+      const k = m[1] ?? m[2];
+      if (!ctx.tainted.has(k)) continue;
+      tainted = true;
+      for (const v of ctx.tainted.get(k)) extra.push(w.split(m[0]).join(v));
+    }
+  }
+  const c = scriptCandidates(extra.length ? { ...sf, words: [...sf.words, ...extra] } : sf, { expand, dirs: [here], joinPath: (d, r) => path.resolve(d, r), readDir: ctx.readDir, ifs: ctx.vars.IFS });
   if (c.over) return deny('too many words, a glob matching too many files, or glob syntax that cannot be resolved could be the script this command runs, so it cannot be verified. Name the script file.');
-  // a variable a speculative `source` may have changed: its old value is judged below, its possible new one is unknown
-  const tainted = sf.words.some((w) => [...w.matchAll(/\$\{?(\w+)/g)].some((m) => ctx.tainted.has(m[1])));
   if ((c.dynamic || tainted) && GUARDED_WORDS.test(ctx.fullText)) {
     return deny('which word is the script this command runs is only known at run time ($VAR / $(...) / a glob) and the line mentions a guarded operation, so it cannot be verified. Name the file and write the options literally.');
   }
@@ -821,7 +839,7 @@ function evalString(str, startDir, ctx, level) {
     if (VAR_BUILTINS.includes(name)) {
       for (const a of argv.slice(1)) {
         const m = /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/.exec(a);
-        if (m) ctx.vars[m[1]] = m[2];
+        if (m) { ctx.vars[m[1]] = m[2]; ctx.tainted.delete(m[1]); }
       }
     } else if (name === 'cd' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name, argv, ctx);
     else if (name === 'git') verdict = checkGit(argv, c.env, dir, ctx, c.raw ?? '');
@@ -867,7 +885,7 @@ export function evaluateGitCommand(command, {
   const base = cwd || process.cwd();
   const ctx = {
     cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, readDir, judgeBudget: MAX_CANDIDATE_JUDGMENTS, fullText: text,
-    vars: Object.create(null), tainted: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
+    vars: Object.create(null), tainted: new Map(), gitAliases: Object.create(null), ghAliases: Object.create(null),
     branches: new Map(), cfgDirty: false, envCfgDirty: false,
   };
   return evalString(text, path.resolve(base), ctx, 0);

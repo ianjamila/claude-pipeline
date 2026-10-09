@@ -701,7 +701,7 @@ test('G8: ? and a bracket match a whole multi-byte character, or any of its byte
 // ---- round 8: Codex review of PR #23 -------------------------------------------------------------------------------------
 
 test('R1-B1: variables set inside a judged script do not leak into the line that ran it', () => {
-  const spec = { 'f.sh': 'bad', 'ok.sh': 'ok', 'd.sh': { text: 'F=ok.sh' }, 'd2.sh': { text: 'G=f.sh' } };
+  const spec = { 'f.sh': 'bad', 'ok.sh': 'ok', 'd.sh': { text: 'F=ok.sh' }, 'd2.sh': { text: 'G=f.sh' }, 'd3.sh': { text: 'G=zz.sh' }, 'd4.sh': { text: 'B=main' } };
   const mk = (bad, ok) => Object.fromEntries(Object.entries(spec).map(([k, v]) => [k, v === 'bad' ? bad : v === 'ok' ? ok : v.text]));
   const gfs = () => fakeFs(GIT_ROOT, mk(BAD_GIT, 'git status'), ['sub']);
   const ffs = () => fakeFs(PROJ, mk(BAD_FILES, 'echo hi'), ['sub']);
@@ -716,5 +716,12 @@ test('R1-B1: variables set inside a judged script do not leak into the line that
   assert.equal(git('F=f.sh; source $X d.sh; bash $F', gfs()).decision, 'deny');
   assert.equal(git('F=ok.sh; source $X d2.sh; bash $F', gfs()).decision, 'allow'); // F untouched by d2.sh
   assert.equal(git('X=-q; G=ok.sh; source $X d2.sh; bash $G && git push origin agent/x', gfs()).decision, 'deny'); // G may now be f.sh
-  assert.equal(git('X=-q; G=ok.sh; source $X d2.sh; bash $G', gfs()).decision, 'allow'); // nothing guarded on the line: judged as before
+  // the old and the new value of G are both judged: d2.sh sets G to the bad script
+  assert.equal(git('X=-q; G=ok.sh; source $X d2.sh; bash $G', gfs()).decision, 'deny');
+  // only the tainted variable is dynamic on these lines (no $X, no glob): it must still be acted on
+  assert.equal(git('G=ok.sh; source -p /x d3.sh; bash $G && git push origin agent/x', gfs()).decision, 'deny');
+  assert.equal(git('G=ok.sh; source -p /x d3.sh; bash $G', gfs()).decision, 'allow'); // both values harmless, nothing guarded
+  assert.equal(git('G=ok.sh; source -p /x d3.sh; G=ok.sh; bash $G && git push origin agent/x', gfs()).decision, 'allow'); // assigned again: known again
+  // a tainted variable is unknown to every other use too: a push destination in it is not resolved to one value
+  assert.equal(git('B=agent/x; source -p /x d4.sh; git push origin HEAD:$B', gfs()).decision, 'deny');
 });
