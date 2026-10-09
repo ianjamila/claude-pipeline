@@ -470,7 +470,7 @@ const INTERP_VALUE_FLAGS = new Set(['-r', '--require', '--import', '--loader', '
 // the whole command text is checked, with quoted and escaped characters masked (see maskQuoted).
 export function scriptFileOf(argv, raw = '', line = raw) {
   const sf = scriptFileOfArgv(argv);
-  if (!sf || sf.kind === 'exec' || sf.unresolvable || typeof raw !== 'string' || !raw) return sf;
+  if (!sf || sf.unresolvable || typeof raw !== 'string' || !raw) return sf;
   let starts = [];
   if (typeof line === 'string') for (let i = line.indexOf(raw); i >= 0 && starts.length <= MAX_OCCURRENCES; i = line.indexOf(raw, i + 1)) starts.push(i);
   const text = starts.length ? line : raw; // not a substring of the line (nested script text): the command's own text
@@ -551,9 +551,10 @@ function scriptFileOfArgv(argv) {
   }
   if (/[/]/.test(argv[0]) && !argv[0].includes('\\') && !SYSTEM_BIN.test(argv[0])) {
     // `./ev*.sh` / `$D/x.sh`: the shell runs whatever the word expands to, so it is a candidate list of one word
-    return { kind: 'exec', file: argv[0] };
+    return hasExpansion(argv[0]) ? { kind: 'exec', file: argv[0], ambiguous: true, words: [argv[0]] } : { kind: 'exec', file: argv[0] };
   }
   // `X=./evil.sh; $X`: a program named by a variable has no `/` to show it is a path
+  if (/[$`]/.test(argv[0]) && !argv[0].includes('\\')) return { kind: 'exec', file: argv[0], ambiguous: true, words: [argv[0]] };
   return null;
 }
 const INTERPRETER_NO_EXT = new Set(['python', 'ruby', 'perl', 'php']);

@@ -479,7 +479,7 @@ test('scriptFileOf: round 2 shapes (source options, zsh operators, pattern synta
   assert.equal(scriptFileOf(['node', 'a'], 'node a', 'node a(#i)b.mjs').unresolvable, true);
   assert.equal(scriptFileOf(['bash', 'ok.sh'], 'bash ok.sh', 'bash ok.sh; echo "x*(y)"').unresolvable, undefined);
   assert.equal(scriptFileOf(['bash', 'ok.sh', '*(N)'], 'bash ok.sh', 'bash ok.sh *(N)').unresolvable, undefined); // after the operand
-  assert.deepEqual(scriptFileOf(['./f'], './f', './f<1-2>'), { kind: 'exec', file: './f' });
+  assert.deepEqual(scriptFileOf(['./f'], './f', './f<1-2>'), { kind: 'exec', file: './f', ambiguous: true, unresolvable: true, words: [] }); // a program run by path too (round 3)
   // H: the command is located by its text, so every occurrence is checked, never just the first or last
   assert.equal(scriptFileOf(['bash', 'x'], 'bash x', 'echo bash x; bash x(#i)y').unresolvable, true); // decoy first
   assert.equal(scriptFileOf(['bash', 'x'], 'bash x', 'bash x(#i)y; echo bash x').unresolvable, true); // decoy last
@@ -516,4 +516,43 @@ test('G1: quoted, escaped or later-line text after the script is not a pattern',
   // unquoted pattern syntax anywhere in the command's own text is refused (accepted: it may be a harmless argument)
   denyBoth('bash ok.sh *(N)', spec);
   denyBoth('node x.mjs ?(a)', spec);
+});
+
+test('G2: a program run by path goes through the same pattern check and expands like any other candidate', () => {
+  const spec = { 'evil.sh': 'bad', 'ab1.sh': 'bad', 'ok.sh': 'ok' };
+  for (const c of ['./ev*.sh', './ab<1-2>.sh', './ev?l.sh', './e[v]il.sh', './ev""*.sh', './ev\\*.sh', 'sub/../ev*.sh', './@(evil).sh']) denyBoth(c, spec);
+  // a variable as the program, with or without a path
+  for (const c of ['X=./evil.sh; $X', 'X=./evil.sh; "$X"', 'D=.; $D/evil.sh', 'X=./ev; $X*.sh', 'X=ok.sh; Y=./evil.sh; $Y']) denyBoth(c, spec);
+  denyBoth('X=./ab1.sh; $X --flag', spec);
+  // unchanged: a plain path, a missing file, a clean glob, system programs
+  denyBoth('./evil.sh', spec);
+  denyBoth('./evil.sh --flag "a*(b)"', spec);
+  allowBoth('./ok.sh', spec);
+  allowBoth('./missing.sh', spec);
+  allowBoth('./ok*.sh', spec);
+  allowBoth('./nomatch*.sh', spec);
+  allowBoth('./su*', spec); // matches the directory only: nothing runs
+  allowBoth('/usr/bin/ev*', spec);
+  allowBoth('/bin/ls -la', spec);
+  allowBoth('X=ok.sh; $X', spec);
+  allowBoth('$X', spec);
+  allowBoth('echo $X', spec);
+  assert.deepEqual(scriptFileOf(['./x.sh'], './x.sh'), { kind: 'exec', file: './x.sh' });
+  assert.deepEqual(scriptFileOf(['./ev*.sh'], './ev*.sh'), { kind: 'exec', file: './ev*.sh', ambiguous: true, words: ['./ev*.sh'] });
+  assert.deepEqual(scriptFileOf(['$X'], '$X'), { kind: 'exec', file: '$X', ambiguous: true, words: ['$X'] });
+  assert.equal(scriptFileOf(['./ab'], './ab<1-2>.sh').unresolvable, true);
+  assert.equal(scriptFileOf(['/usr/bin/x*'], '/usr/bin/x*'), null);
+  assert.equal(scriptFileOf(['ls'], 'ls'), null);
+  // a glob that matches a lot is refused, and the judgment budget applies to exec candidates
+  const many = Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`m${i}.sh`, 'ok']));
+  const r = denyBoth('./m*.sh', many);
+  assert.match(r.git.reason, /too many|matches/);
+});
+
+test('G2: a program found by a glob is judged by its shebang like a program named directly', () => {
+  const g = fakeFs(GIT_ROOT, { 'ev.mjs': "#!/usr/bin/env node\nexecSync('git push origin main');", 'ok.mjs': '#!/usr/bin/env node\nconsole.log(1)' });
+  assert.equal(git('./ev*.mjs', g).decision, 'deny');
+  assert.equal(git('./ok*.mjs', g).decision, 'allow');
+  const bin = fakeFs(GIT_ROOT, { 'tool': 'ELF\u0000git push origin main' });
+  assert.equal(git('./to*', bin).decision, 'allow'); // a binary
 });
