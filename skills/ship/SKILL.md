@@ -26,6 +26,9 @@ number, `R` a review round number, `<slug>` the branch slug.
    `ok: false`) means the PR ends in `needs-human`, however harmless it looks. Report-only hits (`advisory`
    array: rules the project downgraded in `hard_stops.report_only_rules` / `report_only_paths`) never stop the
    PR and never need `human-approved`; list them in the PR body.
+   **`owner_approval: chat`** (`P config`): blocking hits come back inside `advisory` with `ownerMerge: true` and
+   `ok` is true, so they do not end in `needs-human`: see **Owner merges in chat** below. `owner_approval: label` (the
+   default) is everything above, unchanged.
 4. No cross-model review ⇒ no merge. Codex unavailable ⇒ `awaiting-review` and stop.
 5. **Never pass a `model` parameter when invoking `judge` or `arbiter`** — a per-call model
    overrides their pinned Opus/Fable (only exception: the proof switch in
@@ -106,7 +109,9 @@ comes from `P risk` on the real diff; the higher wins).
    `P hardstops --base origin/<default_branch> --head HEAD > .review/hardstops.json`,
    `P integrity --base origin/<default_branch> --head HEAD`.
    Test-integrity violations: have an implementer restore the tests; if the change truly needs
-   them gone, treat it like a hard-stop (`needs-human`: only the owner adds `test-change-approved`).
+   them gone, treat it like a hard-stop (`needs-human`: only the owner adds `test-change-approved`). With
+   `owner_approval: chat` they come back as `ok: true` with the violations under `ownerMerge`: restore the tests
+   if you can, else keep them as owner-merge items (see **Owner merges in chat**).
 3. `gh pr create` (add `--draft` if `ci.draft_while_iterating`) with the body from
    `reference/pr-and-summary.md`: what & why, verify summary (step table + head sha), tests added,
    screenshots, risk level + reasons, hard-stop hits (blocking, and report-only under their own heading). It prints the PR URL; `N` is its number.
@@ -117,6 +122,8 @@ comes from `P risk` on the real diff; the higher wins).
    `P comment --pr N --kind needs-human --reason "<one paragraph: why, what was verified, what the owner does>" --hits-file .review/hardstops.json`.
    Then still run the review loop (Step 4) so the owner gets a reviewed PR, but skip Steps 5–6
    (no merge). End with the summary (outcome `needs-human`).
+   `owner_approval: chat`: when `ownerMerge` (from `P hardstops` or `P integrity`) is non-empty instead, do NOT
+   add `needs-human`; list the items in the PR body under "Owner merges in chat" and carry on with Steps 4–5.
 
 ## Step 4 — review loop
 
@@ -182,6 +189,9 @@ Details and every exit code: `reference/gates-and-exits.md`.
 
 ## Step 6 — merge and production
 
+**`owner_approval: chat` and the Step 5.1 `ownerMerge` lists (or the final gate's `ownerMerge`) are non-empty ⇒ do
+not run 1 below yet: go to **Owner merges in chat**.** Otherwise:
+
 1. `P job start merge -- node ~/.claude/pipeline/bin/pipeline.mjs merge --pr N` → `P job wait
    merge --run-id <runId> --timeout 540`; read `exitCode` and the JSON in `tail`:
    - 0 ⇒ merged. `mergeSha` is the merge commit; `null` (with a `warning`) means GitHub did not
@@ -203,6 +213,18 @@ Details and every exit code: `reference/gates-and-exits.md`.
    What each one means and what to do is in `reference/gates-and-exits.md`. On a failed smoke prod-watch rolls back by itself (`vercel rollback <known-good> --yes --timeout 3m`,
    never `production.rollback.command`), opens the issue and a revert PR. Report any outcome other
    than `merged` to the user immediately, in plain words.
+
+## Owner merges in chat (`owner_approval: chat`)
+
+For a PR with owner-merge items (hard-stop hits or test-integrity violations that `label` mode would block):
+review loop and final gate run exactly as usual, then you STOP before the merge.
+1. Post one comment: `gh pr comment N --body "<each item: rule, file, one-line why; the verified head sha; the owner merges by saying \"merge\" in chat>"`.
+2. `P summary --pr N --outcome awaiting-owner-merge --built "…"`, queue the agent-log line (Step 7), and end the run
+   with outcome `awaiting-owner-merge`. Keep the worktree. The reply's LAST line must be exactly:
+   `🔀 Ready to merge #N — say "merge"`
+3. When the owner says "merge" in this session, run Step 6 for that PR at the reviewed head: `P final-gate --pr N`
+   again if the head or base moved since, then `P merge`, prod-watch and the rollback handling as written there. The
+   owner's chat message is the approval; never add an approval label yourself (invariant 2).
 
 ## Step 7 — summary
 
@@ -234,7 +256,7 @@ read the issue, link it in the PR body (`Closes #123`).
 | Situation | Do |
 |---|---|
 | verify red after 3 fix cycles | draft PR + `pipeline-blocked`, `summary --outcome blocked`, stop |
-| blocking hard-stop hit | review loop, then `needs-human`, stop |
+| blocking hard-stop hit | review loop, then `needs-human`, stop (`owner_approval: chat`: review loop, gate, then `awaiting-owner-merge`) |
 | Codex unavailable / quota (`exitCode: 3`) | `awaiting-review`, `summary --outcome awaiting-review`, stop |
 | `P arbiter apply` proof fails | items → `needs-human` (the CLI marks them), stop after summary |
 | `triage validate` / `arbiter apply` exit 2 `not-found` | transcript not written yet: wait ~10 s, retry once, then `needs-human` |

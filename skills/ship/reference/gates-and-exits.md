@@ -19,8 +19,8 @@ the matching `checks[].detail`. Exit 3: GitHub unavailable: wait a minute, run i
 | | `PR head … is not the local HEAD` | `git push origin agent/<slug>` (or `git pull --ff-only`), run again |
 | `labels`, `preflight` | blocking label, pause/rollback issue, protection mismatch | stop: the PR stays open; tell the user which one |
 | `verify-report` | stale head, dirty tree, tree changed, steps mismatch, not `full` | commit or clean the tree, fresh `verify.full` (Step 5.3), run again |
-| `hardstops` | blocking hits (report-only hits pass: the detail says `N report-only`) | Step 3.5 (`needs-human`) |
-| `integrity` | test weakening | implementer restores the tests, or `needs-human` |
+| `hardstops` | blocking hits (report-only hits pass: the detail says `N report-only`; with `owner_approval: chat` it passes and says `N owner-merge`, and the gate output has `ownerMerge` > 0) | Step 3.5 (`needs-human`); chat mode: **Owner merges in chat** in SKILL.md |
+| `integrity` | test weakening (chat mode: passes, `N owner-merge test-integrity violation(s)`, counted in `ownerMerge`) | implementer restores the tests, or `needs-human` (chat mode: **Owner merges in chat**) |
 | `review` | no clean round covers the current content, or open items | Step 4 (a new round), then Step 5 again |
 | `ci` | checks failing / not passing | fix the cause (new commit ⇒ Step 5.1); `required check(s) missing` ⇒ `needs-human` (the CI config is wrong) |
 | `preview` | no/old smoke evidence, deployment mismatch | redo Step 5.6 on the current head |
