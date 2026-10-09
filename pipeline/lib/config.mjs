@@ -18,6 +18,10 @@ function deepFreeze(value) {
 export const DEFAULTS = deepFreeze({
   version: 1,
   enforcement: 'github',
+  // owner_approval: how the owner signs off a PR that trips a blocking hard-stop or a test-integrity rule. 'label' = the
+  // owner adds human-approved / test-change-approved; 'chat' = no label and CI does not fail on those: the ship skill stops
+  // before the merge, asks in chat, and runs the merge when the owner says "merge".
+  owner_approval: 'label',
   default_branch: 'main',
   worktree_dir: '.worktrees',
   verify: { report: '.verify/report.json', screenshots: '.verify/screenshots' },
@@ -61,6 +65,7 @@ export function requiredChecks(ci) {
 
 const EFFORTS = ['low', 'medium', 'high', 'xhigh'];
 const EFFORT_LANES = ['low', 'medium', 'high', 'followup'];
+const OWNER_APPROVALS = ['label', 'chat'];
 const PROVIDERS = ['vercel', 'github-deployments', 'other'];
 
 // Allowed keys per mapping. Anything else is a typo (or a removed option) and is rejected.
@@ -277,6 +282,7 @@ export function validateConfig(obj) {
   if (obj.version !== 1) errors.push('version must be 1');
   if (!isStr(config.project)) errors.push('project is required (a non-empty string)');
   if (!['github', 'gate'].includes(config.enforcement)) errors.push('enforcement must be github|gate');
+  if (!OWNER_APPROVALS.includes(config.owner_approval)) errors.push(`owner_approval must be ${OWNER_APPROVALS.join('|')}`);
 
   const verify = section(config, 'verify', errors);
   if (verify) {

@@ -4,6 +4,9 @@ version: 1
 project: my-app
 default_branch: main
 enforcement: github            # github = branch protection must be live; gate = skills only
+# owner_approval: label        # label (default) = the owner adds `human-approved` / `test-change-approved` to let a blocking hard-stop
+#                              # or test-integrity violation merge. chat = no labels: CI does not fail on those, the ship skill
+#                              # stops before the merge, lists them in a PR comment and merges when the owner says "merge" in chat.
 worktree_dir: .worktrees       # ship creates agent/<name> worktrees here (must be gitignored)
 
 verify:

@@ -166,8 +166,10 @@ head you did not review (the receipt names the head the event carried).
 
 ## Project settings and environment
 
-`.claude/pipeline.yml` is documented in its template (`pipeline/templates/pipeline.yml`). Two keys deserve a
-mention: `ci.guard_checks` (default `true`: the `Test integrity` and `Hard-stop scan` statuses are always
+`.claude/pipeline.yml` is documented in its template (`pipeline/templates/pipeline.yml`). Three keys deserve a
+mention: `owner_approval` (`label` by default; `chat` drops the approval labels: blocking hard-stops and test-integrity
+violations no longer fail CI, the ship skill stops before the merge, lists them in a PR comment and merges when you say
+"merge" in chat; the PR ends as `awaiting-owner-merge`), `ci.guard_checks` (default `true`: the `Test integrity` and `Hard-stop scan` statuses are always
 required on top of `ci.required_checks`; `false` only for a repo that does not run `pipeline-guards.yml`)
 and `ci.approvers` (logins whose approval labels count; required for org-owned repos, otherwise approvals
 fail closed with `org-repo-needs-ci.approvers`). `pipeline config` prints `warnings` for config that is valid
