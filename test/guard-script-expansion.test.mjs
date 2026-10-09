@@ -587,3 +587,13 @@ test('G3: a directory that cannot be listed for another reason than "it is not t
   assert.equal(defaultReadDir(join(tmpdir(), 'x'.repeat(300))), false); // ENAMETOOLONG
   assert.ok(Array.isArray(defaultReadDir(dirname(fileURLToPath(import.meta.url)))));
 });
+
+// ---- round 4: backslash in a program path; a ] that was escaped or quoted inside a bracket --------------------------
+
+test('G4: a backslash is an ordinary file name character: a program path holding one is judged', () => {
+  const spec = { 'a\\b.sh': 'bad', 'ok.sh': 'ok' };
+  for (const c of ["'./a\\b.sh'", './a\\\\b.sh', './a\\\\b.s*', "X=./a; $X'\\b.sh'", "D=.; $D/'a\\b.sh'", "bash 'a\\b.sh'", "source a\\\\b.sh"]) denyBoth(c, spec);
+  allowBoth("'./c\\d.sh'", spec); // missing: nothing runs
+  assert.deepEqual(scriptFileOf(['./a\\b.sh'], "'./a\\b.sh'"), { kind: 'exec', file: './a\\b.sh' });
+  assert.equal(scriptFileOf(['$X\\b.sh'], '$X\\\\b.sh').ambiguous, true);
+});

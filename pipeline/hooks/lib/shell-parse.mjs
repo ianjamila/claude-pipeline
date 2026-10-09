@@ -549,12 +549,13 @@ function scriptFileOfArgv(argv) {
     if (file === undefined || (needExt && !SCRIPT_EXT.test(file))) return null;
     return STDIN_FILES.has(file) ? null : { kind: 'interp', file };
   }
-  if (/[/]/.test(argv[0]) && !argv[0].includes('\\') && !SYSTEM_BIN.test(argv[0])) {
+  // (a backslash is an ordinary file name character off Windows, so a path holding one is judged like any other)
+  if (/[/]/.test(argv[0]) && !SYSTEM_BIN.test(argv[0])) {
     // `./ev*.sh` / `$D/x.sh`: the shell runs whatever the word expands to, so it is a candidate list of one word
     return hasExpansion(argv[0]) ? { kind: 'exec', file: argv[0], ambiguous: true, words: [argv[0]] } : { kind: 'exec', file: argv[0] };
   }
   // `X=./evil.sh; $X`: a program named by a variable has no `/` to show it is a path
-  if (/[$`]/.test(argv[0]) && !argv[0].includes('\\')) return { kind: 'exec', file: argv[0], ambiguous: true, words: [argv[0]] };
+  if (/[$`]/.test(argv[0])) return { kind: 'exec', file: argv[0], ambiguous: true, words: [argv[0]] };
   return null;
 }
 const INTERPRETER_NO_EXT = new Set(['python', 'ruby', 'perl', 'php']);

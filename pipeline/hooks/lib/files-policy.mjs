@@ -363,7 +363,7 @@ export function evaluateFileTool(input, opts = {}) {
 
 // ---- Bash: text normalisation ---------------------------------------------------------------------
 
-const MARK = '\u0001';
+const MARK = '\uE000';
 
 // Every way the home directory is spelled in a shell line or a one-liner script. A trailing `+ '`, `, '` or
 // `.joinpath('` (string concatenation / path.join) is swallowed so `process.env.HOME+'/.claude/x'` reads as one path.
@@ -952,9 +952,14 @@ const WRITE_HINT = /write|append|unlink|\brm\b|rmSync|rmdir|rename|copy|\bcp\b|\
 // typed on the line. A shell script that exists but cannot be read is denied; a missing file runs nothing; a
 // program run by path, an interpreter file that cannot be read, a node_modules package and the pipeline's own
 // installed files are not judged (the installed CLI legitimately names its own settings).
-function judgeScriptFile(sf, dirs, ctx, opts, scanRaw = '') {
+function judgeScriptFile(sf, dirs, ctx, opts, scanRaw = '', keepBackslash = false) {
   if (sf.ambiguous) return judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw);
-  const e = expandRefs(sf.file, ctx);
+  // expandRefs turns \ into / (Windows paths), but off Windows a backslash is part of the file name: judge that reading too
+  if (!keepBackslash && sf.file.includes('\\')) {
+    const v = judgeScriptFile(sf, dirs, ctx, opts, scanRaw, true);
+    if (v) return v;
+  }
+  const e = keepBackslash ? expandRefs(sf.file.replace(/\\/g, '\uE001'), ctx).replace(/\uE001/g, '\\') : expandRefs(sf.file, ctx);
   if (/[$`]/.test(e)) return null; // named at run time: the textual rules on the whole line still apply
   const found = [];
   for (const d of isAbs(e) ? [''] : dirs) {
@@ -994,7 +999,12 @@ function judgeScriptFile(sf, dirs, ctx, opts, scanRaw = '') {
 // names a protected pipeline file.
 function judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw) {
   const joinPath = (d, r) => (isAbs(r) ? posix.normalize(r) : posix.join(d, r));
-  const c = scriptCandidates(sf, { expand: (w) => expandRefs(w, ctx), dirs, joinPath, readDir: ctx.readDir, ifs: ctx.vars.IFS });
+  let c = scriptCandidates(sf, { expand: (w) => expandRefs(w, ctx), dirs, joinPath, readDir: ctx.readDir, ifs: ctx.vars.IFS });
+  // a backslash in a word is a file name character off Windows, but expandRefs reads it as a separator: expand (and glob) that reading too
+  if (!c.over && !sf.unresolvable && sf.words.some((w) => w.includes('\\'))) {
+    const k = scriptCandidates(sf, { expand: (w) => expandRefs(w.replace(/\\/g, '\uE001'), ctx).replace(/\uE001/g, '\\'), dirs, joinPath, readDir: ctx.readDir, ifs: ctx.vars.IFS });
+    c = { files: [...new Set([...c.files, ...k.files])], dynamic: c.dynamic || k.dynamic, over: k.over };
+  }
   if (c.over) return deny('too many words, a glob matching too many files, or glob syntax that cannot be resolved could be the script this command runs, so it cannot be checked; name the script file');
   if (c.dynamic && makeMatchers(ctx).rawHit(scanRaw, dirs)) return deny('which word is the script this command runs is only known at run time ($VAR / $(...) / a glob) and the line refers to a protected pipeline file; name the file and write the options literally');
   for (const file of c.files) {
