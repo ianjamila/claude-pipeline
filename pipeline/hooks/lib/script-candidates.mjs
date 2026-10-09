@@ -137,11 +137,17 @@ function buildCandidates(sf, { expand, dirs, joinPath, readDir, ifs }) {
     if (ifsUnknown && w.includes('$')) dynamic = true;
     for (const r of new Set(readings)) {
       if (r === '') continue; // an empty word runs nothing
-      // still unknown at run time; but quoting is lost (`'x$y.sh'` reads as `x$y.sh`), so the word may be a literal file name too
-      if (/[$`]/.test(r)) { dynamic = true; add(r); continue; }
       const glob = GLOB_CHARS.test(r);
+      // still unknown at run time; but quoting is lost (`'x$y.sh'` reads as `x$y.sh`, `'x$y'*.sh` globs around a literal $),
+      // so the word may be a literal file name or glob too. Its other syntax (`$(..)`, `${X#*/}`) is not ours to resolve.
+      if (/[$`]/.test(r)) {
+        dynamic = true;
+        add(r);
+        if (glob) for (const d of dirs) for (const m of globMatches(r, d, readDir, joinPath, budget)) add(m);
+        continue;
+      }
       if (EXTENDED_GLOB.test(r) || (glob && UNSUPPORTED_GLOB.test(r))) { add(r); budget.over = true; continue; }
-      add(r); // an unmatched glob stays a literal word, and a quoted name may merely look like a glob
+      add(r); // an unmatched glob stays a literal word, and a quoted name may merely look like a glob (`'x$y'*.sh` globs with a literal $)
       if (glob) for (const d of dirs) for (const m of globMatches(r, d, readDir, joinPath, budget)) add(m);
     }
     if (budget.over || files.size > MAX_CANDIDATES) return { files: [], dynamic, over: true };

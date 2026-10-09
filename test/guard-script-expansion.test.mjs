@@ -725,3 +725,9 @@ test('R1-B1: variables set inside a judged script do not leak into the line that
   // a tainted variable is unknown to every other use too: a push destination in it is not resolved to one value
   assert.equal(git('B=agent/x; source -p /x d4.sh; git push origin HEAD:$B', gfs()).decision, 'deny');
 });
+
+test('R1-B2: a quoted $ or backtick followed by a glob character is still globbed', () => {
+  const spec = { 'x$y1.sh': 'bad', 'k`id`1.sh': 'bad', 'ok.sh': 'ok' };
+  for (const c of ["bash 'x$y'*.sh", "bash 'x$y'?.sh", "./'x$y'*.sh", "bash 'k`id`'*.sh", "source 'x$y'[0-9].sh", "bash $Z 'x$y'*.sh"]) denyBoth(c, spec);
+  allowBoth("bash 'x$z'*.sh", spec);
+});
