@@ -813,9 +813,10 @@ Recheck: resolved 1, 2, 6, 11, 13, P3-order; partial 3, 4, 5, 7, 8, 9, 10, 12; t
   approver did not review. Regression: approve A, B already had check suites from before the approval -> B red.
 - **R7″ Exemptions are judged by what can run.** `docs/**` exempts only non-executable documentation (md, txt, rst, adoc,
   images, pdf); a module under docs/ is code (importable via a root alias), `.mdx` is code everywhere, a `.md` under
-  `app/` or `pages/` is a page. Test files keep one content rule: key-shaped secret literals not marked fake IN the
-  credential token itself (a comment or neighbouring name on the line does not count; no JWT or Vault: local-stack
-  fixtures). Production code that imports a test module (every import specifier is resolved to the repo paths it could
+  `app/` or `pages/` is a page. Test files AND exempt documentation keep one content rule: key-shaped secret literals
+  not marked fake IN the credential token itself (a comment or neighbouring name on the line does not count; no JWT or
+  Vault: local-stack fixtures); sensitive terms, SQL and auth rules are not judged in either. Same rule id
+  (`R3-secrets`), worded "in a test file" / "in a documentation file". Production code that imports a test module (every import specifier is resolved to the repo paths it could
   name and judged by the same test-file predicate, for JS/TS, Python and Ruby; imports split over lines, Python bracketed
   statements and imports after a block comment included), an edit to an exempt file that production
   at head already imports, directly or through other test files (a bounded reverse search; fails closed; non-code docs count as exempt too, since `require` loads `.md`/`.txt` as JavaScript), a rename from an exempt path into production code (a 100%

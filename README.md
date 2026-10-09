@@ -171,7 +171,8 @@ mention: `ci.guard_checks` (default `true`: the `Test integrity` and `Hard-stop 
 required on top of `ci.required_checks`; `false` only for a repo that does not run `pipeline-guards.yml`)
 and `ci.approvers` (logins whose approval labels count; required for org-owned repos, otherwise approvals
 fail closed with `org-repo-needs-ci.approvers`). `pipeline config` prints `warnings` for config that is valid
-but suspicious.
+but suspicious. Documentation and test files are exempt from the content rules (sensitive terms, SQL, auth) but keep
+one: a real-looking secret key literal (not marked fake inside the key itself) is still a `needs-human` hit there.
 
 | Variable | Meaning |
 |---|---|
