@@ -197,8 +197,42 @@ test('guard-files: an existsSync that throws is a denial, not "the script is mis
   assert.match(r.reason, /stat exploded/);
 });
 
-test('guard-files: a glob segment that does not compile may match anything, so it can reach a protected directory', () => {
-  // `[z-a]` is an out-of-order range: the pattern used to compile to null and the glob to "reaches nothing"
-  const r = files('rm /home/u/.cl[z-a]ude/pi*', filesFs({}));
-  assert.equal(r.decision, 'deny');
+// ---- regressions found replaying real commands: no false positives from the two new mechanisms ---------------------------------
+
+// A glob word whose bracket expression does not compile (`[z-a]`, `[\w-.]`) matches NOTHING in a shell and stays literal
+// (there is no nullglob), so it is judged as the literal path it is: denied when that literally names a protected path,
+// otherwise left alone. It used to compile to null (nothing reachable) and, in the first version of this file, to "anything".
+test('guard-files: a glob that does not compile is judged as the literal word', () => {
+  const d = (c) => files(c, filesFs({})).decision;
+  assert.equal(d('rm ~/.claude/pipeline/[z-a]x'), 'deny'); // literally inside a protected root
+  assert.equal(d('rm ~/.cl[z-a]ude/pi*'), 'allow'); // the literal word names nothing protected
+  assert.equal(d('rm src/[z-a]/page.tsx'), 'allow');
+  assert.equal(d('mv a.txt out/[z-a].txt'), 'allow');
+});
+
+test('guard-files: everyday words with brackets are not "reaching" a protected root', () => {
+  for (const c of [
+    `node -e "console.log([...new Date(0).toISOString()].join(''))"`,
+    `python3 -c "print([print(c[0]) for c in 'ab'])"`,
+    `python3 -c "import re; print(re.findall(r'[\\w-.]+', 'a-b'))"`,
+    `node -e "console.log('x'.match(/[\\w-.]+/))"`,
+    'rm src/app/[id]/page.tsx',
+    'git add src/app/[id]/page.tsx',
+  ]) assert.equal(files(c, filesFs({})).decision, 'allow', c);
+});
+
+// A judged file can be up to 1 MB. The expansion cap counts text ADDED by expansion, not the size of the text it is applied
+// to, or `node $S/extract.mjs $S/run/index.html` with a 700 KB report beside it was denied as "variables expand ...".
+test('guard-files: a big file judged as program text is not an expansion (PATH=...:$PATH and $S lines stay allowed)', () => {
+  const big = `<html>\n${'<p>some report text for the page, a few words more</p>\n'.repeat(12_000)}<p>$S \${X} $PATH</p></html>`;
+  assert.ok(big.length > 600_000);
+  const f = filesFs({ 's/run2/report/index.html': big, 'ctx/context.md': big, 'wt/plan.md': big, 's/scripts/extract.mjs': "console.log('x')", 'x/review.mjs': "console.log('x')" });
+  const lines = [
+    'export PATH="/opt/bin:$PATH"; S=/home/u/proj/s; mkdir -p $S/run2 && cd $S/run2 && node $S/scripts/extract.mjs $S/run2/report/index.html $S/run2/x >/dev/null && node -e \'console.log(1)\' $S/run2/x/report.json',
+    'export PATH="$HOME/.local/bin:/opt/bin:$PATH"; node "$HOME/x/review.mjs" --worktree "/home/u/proj/wt" --plan-file "/home/u/proj/wt/plan.md" --context-file "/home/u/proj/ctx/context.md" --model m > /home/u/proj/ctx/run.log 2>&1; echo "exit $?" >> /home/u/proj/ctx/run.log',
+  ];
+  for (const c of lines) {
+    const r = files(c, f);
+    assert.equal(r.decision, 'allow', `${r.reason} <- ${c.slice(0, 60)}`);
+  }
 });

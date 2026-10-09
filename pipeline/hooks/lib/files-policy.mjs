@@ -549,8 +549,9 @@ function globToRe(g, ci) {
       else { re += `[${g.slice(i + 1, j).replace(/^!/, '^').replace(/\\/g, '\\\\')}]`; i = j; }
     } else re += escapeRe(c);
   }
-  // a pattern that does not compile (an out-of-order range) may match anything: callers ask "can this glob reach a protected path", so say yes
-  try { return new RegExp(`^${re}$`, ci ? 'i' : ''); } catch { return new RegExp('^[\\s\\S]*$'); }
+  // null when it does not compile (an out-of-order range, `[...x]`): the shell then matches NOTHING and the word stays literal, so
+  // callers judge such a word as the literal path it is (globHit: its literal prefix is checked first), neither as "anything" nor as "nothing"
+  try { return new RegExp(`^${re}$`, ci ? 'i' : ''); } catch { return null; }
 }
 
 // Every protected root plus the directories between it and the home directory, for globs like `~/.claude/*`.

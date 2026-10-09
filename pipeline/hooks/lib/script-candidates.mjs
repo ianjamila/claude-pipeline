@@ -18,7 +18,7 @@ export const MAX_CANDIDATES = 32; // more words than this are refused, not judge
 export const MAX_SCRIPT_JUDGMENTS = 128;
 // Wall-clock limit for one evaluation, measured from the top-level call (nested calls share it): a third of the hook timeout.
 export const EVAL_DEADLINE_MS = 5000;
-// Variable expansion: no expanded text may exceed one command line (the same 200,000 as MAX_LINE_CHARS), and the text
+// Variable expansion: one call may add at most one command line of text (the same 200,000 as MAX_LINE_CHARS), and the text
 // ADDED by expansion across one evaluation is bounded too (`A=<60k chars> ...` used by thousands of words).
 export const MAX_EXPANDED_CHARS = 200_000;
 export const MAX_EXPANDED_TOTAL = 1_000_000;
@@ -42,16 +42,15 @@ export function countScript(budget) {
 }
 
 // `text.replace(re, ...)` where `lookup(match, ...groups)` gives the replacement (or the match itself when nothing is known),
-// counted as it grows: the result may not exceed MAX_EXPANDED_CHARS, nor may the text added across the evaluation exceed
-// MAX_EXPANDED_TOTAL. It throws before the oversized string exists (`A=<100k chars>; ... $A$A$A` x 50k refs is gigabytes).
+// counted as it grows: the text ADDED by one call may not exceed MAX_EXPANDED_CHARS, nor the text added across the evaluation
+// MAX_EXPANDED_TOTAL. Growth is counted, never the length of `text` itself: a program file judged as text can be 1 MB. It throws before the oversized string exists (`A=<100k chars>; ... $A$A$A` x 50k refs is gigabytes).
 export function substitute(budget, text, re, lookup) {
-  let len = text.length;
+  let added = 0;
   return text.replace(re, (m, ...groups) => {
     const v = lookup(m, ...groups);
     if (v === m) return m;
-    len += v.length - m.length;
-    if (v.length > m.length) budget.grown += v.length - m.length;
-    if (len > MAX_EXPANDED_CHARS || budget.grown > MAX_EXPANDED_TOTAL) {
+    if (v.length > m.length) { added += v.length - m.length; budget.grown += v.length - m.length; }
+    if (added > MAX_EXPANDED_CHARS || budget.grown > MAX_EXPANDED_TOTAL) {
       throw new GuardLimit('variables expand to more text than can be checked, so the command cannot be verified. Write the values out or split the command.');
     }
     return v;
