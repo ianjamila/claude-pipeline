@@ -23,6 +23,15 @@ export const EVAL_DEADLINE_MS = 5000;
 export const MAX_EXPANDED_CHARS = 200_000;
 export const MAX_EXPANDED_TOTAL = 1_000_000;
 
+// The command line a program-by-variable word expands to (`T="npx vitest run x"; $T` -> `npx vitest run x`), or null when the word is not one
+// or the value is a single word. The shell runs that line, so the policies judge it as text one level deeper.
+const PLAIN_LINE = /^[A-Za-z0-9_ \t.\/:=@%+,-]*$/;
+export function execLineOf(sf, expand) {
+  if (sf.kind !== 'exec' || sf.words?.length !== 1 || !sf.words[0].includes('$')) return null;
+  const e = expand(sf.words[0]);
+  return e !== sf.words[0] && /\s/.test(e.trim()) && !/\$\(|`/.test(e) ? e : null; // (a value holding a command substitution is unknown: candidates cover it)
+}
+
 // Thrown when a limit above is hit; each policy's entry point turns it into a denial carrying the message.
 export class GuardLimit extends Error {}
 
@@ -206,7 +215,14 @@ function buildCandidates(sf, { expand, dirs, joinPath, readDir, ifs }) {
   const add = (c) => { if (!sf.needExt || SCRIPT_EXT.test(c)) files.add(c); };
   for (const w of sf.words) {
     const e = expand(w);
-    const readings = e !== w && w.includes('$') ? [e, ...e.split(splitter)] : [e];
+    let readings = e !== w && w.includes('$') ? [e, ...e.split(splitter)] : [e];
+    // a program named by a variable (`T="npx vitest run x.test.tsx"; $T`) runs its first word; the rest are its arguments. The policies evaluate the
+    // value as the command line it is (see execLineOf), which judges whatever files that line runs
+    if (sf.kind === 'exec' && sf.words?.length === 1 && e !== w && w.includes('$')) {
+      const parts = e.split(splitter).filter((p) => p !== '');
+      // (only for a plain value: with quotes, `#`, `;` ... the shell splits it differently from how it is lexed, so every part stays a candidate)
+      if (parts.length > 1 && PLAIN_LINE.test(e) && typeof ifs !== 'string') readings = [e, parts[0]]; // (a custom IFS splits the value elsewhere: every part stays)
+    }
     // quoting is lost (`'x$y.sh'` reads as `x$y.sh`): the word as written may be the file's real name, whatever the variable holds
     if (e !== w && w !== '') {
       add(w);

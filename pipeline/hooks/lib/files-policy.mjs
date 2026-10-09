@@ -19,7 +19,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
 import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf } from './shell-parse.mjs';
-import { scriptCandidates, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
+import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
 
 const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
@@ -537,21 +537,26 @@ function globReaches(g, root, ci) {
 }
 
 function globToRe(g, ci) {
-  let re = '';
-  for (let i = 0; i < g.length; i++) {
-    const c = g[i];
-    if (c === '*') {
-      if (g[i + 1] === '*') { re += '.*'; i++; } else re += '[^/]*';
-    } else if (c === '?') re += '[^/]';
-    else if (c === '[') {
-      const j = g.indexOf(']', i + 2);
-      if (j < 0) re += '\\[';
-      else { re += `[${g.slice(i + 1, j).replace(/^!/, '^').replace(/\\/g, '\\\\')}]`; i = j; }
-    } else re += escapeRe(c);
-  }
-  // null when it does not compile (an out-of-order range, `[...x]`): the shell then matches NOTHING and the word stays literal, so
-  // callers judge such a word as the literal path it is (globHit: its literal prefix is checked first), neither as "anything" nor as "nothing"
-  try { return new RegExp(`^${re}$`, ci ? 'i' : ''); } catch { return null; }
+  // anyBracket: every bracket expression stands for any one character
+  const build = (anyBracket) => {
+    let re = '';
+    for (let i = 0; i < g.length; i++) {
+      const c = g[i];
+      if (c === '*') {
+        if (g[i + 1] === '*') { re += '.*'; i++; } else re += '[^/]*';
+      } else if (c === '?') re += '[^/]';
+      else if (c === '[') {
+        const j = g.indexOf(']', i + 2);
+        if (j < 0) re += '\\[';
+        else { re += anyBracket ? '[^/]' : `[${g.slice(i + 1, j).replace(/^!/, '^').replace(/\\/g, '\\\\')}]`; i = j; }
+      } else re += escapeRe(c);
+    }
+    return new RegExp(`^${re}$`, ci ? 'i' : '');
+  };
+  // JS may refuse a bracket the shell accepts (`[\w-.]`, an out-of-order range): a bracket always matches exactly one character, so reading
+  // every bracket as "any one character" is a superset of what the shell matches, and the word still has to line up with a protected path
+  try { return build(false); } catch { /* retry below */ }
+  try { return build(true); } catch { return null; }
 }
 
 // Every protected root plus the directories between it and the home directory, for globs like `~/.claude/*`.
@@ -1071,6 +1076,15 @@ function judgeFoundScript(sf, abs, dir, ctx, opts) {
 // names a protected pipeline file.
 function judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw) {
   const joinPath = (d, r) => (isAbs(r) ? posix.normalize(r) : posix.join(d, r));
+  const line = execLineOf(sf, (w) => expandRefs(w, ctx));
+  if (line !== null) {
+    if ((opts._depth ?? 0) >= 4) return deny('the command line held in a variable is nested too deeply to check');
+    // run in every directory the command may be in, with the line's variables
+    for (const d of dirs) {
+      const r = evaluateBashForFiles(line, { ...opts, cwd: d, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) } });
+      if (r.decision === 'deny') return deny(`the command line ${sf.words[0]} expands to would run: ${r.reason}`);
+    }
+  }
   let c = scriptCandidates(sf, { expand: (w) => expandRefs(w, ctx), dirs, joinPath, readDir: ctx.readDir, ifs: ctx.vars.IFS });
   // a backslash in a word is a file name character off Windows, but expandRefs reads it as a separator: expand (and glob) that reading too
   if (!c.over && !sf.unresolvable && sf.words.some((w) => mayHoldBackslash(w, ctx))) {
@@ -1078,6 +1092,8 @@ function judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw) {
     c = { files: [...new Set([...c.files, ...k.files])], dynamic: c.dynamic || k.dynamic, over: k.over };
   }
   if (c.over) return deny('too many words, a glob matching too many files, or glob syntax that cannot be resolved could be the script this command runs, so it cannot be checked; name the script file');
+  // a variable the line set to a run-time value (`NVM_DIR=$(cmd)`) picks the script: which one is unknown
+  if (opts._unknown?.size && sf.words?.some((w) => [...w.matchAll(/\$\{?(\w+)/g)].some((m) => opts._unknown.has(m[1])))) return deny('the script is picked by a variable the command line sets to a value known only at run time, so it cannot be checked; name the script file');
   if (c.dynamic && makeMatchers(ctx).rawHit(scanRaw, dirs)) return deny('which word is the script this command runs is only known at run time ($VAR / $(...) / a glob) and the line refers to a protected pipeline file; name the file and write the options literally');
   for (const file of c.files) {
     const v = judgeScriptFile({ kind: sf.kind, file, candidate: true }, dirs, ctx, opts);
@@ -1198,6 +1214,7 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
   if (changesClaudeCode(cmds, scanRaw)) return deny('the command unsets or overrides CLAUDECODE, the marker the installer uses to refuse to run inside Claude Code; only the owner may change it, from a terminal');
   if (setsSeamForPipeline(cmds)) return deny('the command sets a pipeline test seam (PIPELINE_GH, PIPELINE_CODEX, PIPELINE_VERCEL, PIPELINE_TEST_MODE) for the pipeline CLI; a fake gh/codex/vercel could satisfy the merge gate, so only the owner does that, from a terminal');
   ctx.vars = collectVars(cmds, ctx);
+  if (opts._vars) { ctx.vars = { ...opts._vars, ...ctx.vars }; ctx.keptVars = { ...(opts._keptVars ?? {}), ...ctx.keptVars }; } // variables the line set before the shell that runs this file started
   // a name held in a variable (N=PIPELINE_ADMIN; env $N=1 claude)
   if (Object.keys(ctx.vars).length && setsAdmin(substVars(flat, ctx.vars, ctx.budget), ctx.platform)) return deny('the command sets PIPELINE_ADMIN through a variable; only the owner may set it, when launching Claude Code');
   const dirs = collectDirs(cmds, ctx);
@@ -1228,6 +1245,29 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
   // A startup file is judged once per evaluation. It is marked first: a startup file that starts shells itself would be judged again and
   // again otherwise (a denial ends the whole evaluation, so marking before the verdict is safe).
   const judgeStartupFile = (st) => {
+    // the real home's file is judged on its own, once per evaluation, from the directory the shell starts in: its verdict depends on neither the
+    // line's text nor its directories, only on the variables the line has set (seeded below; one whose value is unknown refuses a script it picks)
+    if (st.implicit) {
+      const unknown = Object.keys(ctx.vars).filter((k) => /[$`]/.test(ctx.vars[k])).sort();
+      const key = `${st.file}\u0000${JSON.stringify([ctx.vars, ctx.keptVars ?? {}, unknown, dirs])}`;
+      const memo = (ctx.budget.implicitStartup ??= new Map());
+      if (memo.has(key)) return memo.get(key);
+      memo.set(key, null);
+      const seed = { ...opts, _depth: 0, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set(unknown) };
+      let v = null;
+      const abs = expandRefs(st.file, ctx);
+      const text = isAbs(abs) ? ctx.readText(abs) : null;
+      if (typeof text === 'string') {
+        // the shell starts in the directory the command runs in (the cwd or any `cd` target): the file's relative names resolve there
+        countScript(ctx.budget);
+        for (const d of dirs) {
+          const r = evaluateBashForFiles(text, { ...seed, cwd: d });
+          if (r.decision === 'deny') { v = deny(`the script ${st.file} would run: ${r.reason}`); break; }
+        }
+      } else v = judgeScriptFile({ kind: 'shell', file: st.file }, dirs, ctx, seed, '');
+      memo.set(key, v);
+      return v;
+    }
     // reused only for the same file, directories and nesting depth, never for a run-time name (its verdict depends on the line's text)
     if (st.ambiguous) return judgeScriptFile(st, dirs, ctx, opts, scanRaw);
     const key = `${dirs.join('\u0000')}\u0000${opts._depth ?? 0}\u0000${st.file}`;

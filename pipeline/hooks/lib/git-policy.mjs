@@ -17,7 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, startupFilesOf } from './shell-parse.mjs';
 import { catchAllReason, guardedCommandText } from './guarded-text.mjs';
-import { scriptCandidates, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
+import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
 
 const PROTECTED_BRANCHES = ['main', 'master'];
 const APPROVAL_LABELS = ['human-approved', 'test-change-approved'];
@@ -843,6 +843,35 @@ function checkScriptFile(sf, dir, ctx, level) {
   return v.decision === 'deny' ? deny(`the script ${sf.file} would run a blocked command: ${v.reason}`) : null;
 }
 
+// Why: the real home's startup files (~/.bash_profile, ~/.zshenv ...) are not named by any word of the line, and what they run does not
+// depend on it. They are judged as an evaluation of their own (the line's variable state, but the guarded words of the FILE's text,
+// not of the line, decide whether a run-time name in it is refused) and the verdict is kept for the whole evaluation, so a line with
+// many shells reads each file once. An explicit one (BASH_ENV=, ZDOTDIR=, HOME=, --rcfile) is judged in the line's context instead.
+// The variables the line has set before that shell starts (and its own prefix, `NVM_DIR=d bash -l`) are inherited: a file that sources
+// "$NVM_DIR/nvm.sh" runs d/nvm.sh, and a value that is unknown makes that name unknown (refused). The memo is keyed on that state.
+function implicitStartupVerdict(st, ctx, cmd, dir) {
+  const vars = Object.assign(Object.create(null), ctx.vars);
+  const unsure = new Set(ctx.unsureVars);
+  for (const [k, v] of Object.entries({ ...ctx.vars, ...Object.fromEntries(Object.entries(cmd?.env ?? {}).map(([k, w]) => [k, expandVars(w, ctx)])) })) {
+    if (DYNAMIC.test(v)) { delete vars[k]; unsure.add(k); } else { vars[k] = v; unsure.delete(k); }
+  }
+  const rec = { kind: 'shell', file: st.file };
+  const fresh = {
+    ...ctx, fullText: '', vars, unsureVars: unsure, tainted: new Set(ctx.tainted), aliasUnsure: new Set(ctx.aliasUnsure),
+    gitAliases: { ...ctx.gitAliases }, ghAliases: { ...ctx.ghAliases }, branches: new Map(ctx.branches),
+  };
+  // the shell starts where the command runs (`cd sub && NVM_DIR=d bash -l`); an unknown directory (null) makes a relative name in the file unknowable
+  const key = `${st.file}\u0000${stateFingerprint(fresh, dir, 0)}`;
+  const memo = (ctx.budget.implicitStartup ??= new Map());
+  if (memo.has(key)) return memo.get(key);
+  memo.set(key, null); // marked first: a startup file that starts shells itself finds this entry, not itself again
+  const text = ctx.readText(path.resolve(ctx.home, st.file.replace(/^~\/?/, '')));
+  fresh.fullText = typeof text === 'string' ? text : '';
+  const v = checkScriptFile(rec, dir, fresh, 0);
+  memo.set(key, v);
+  return v;
+}
+
 // Variables set inside a script do not leave a child shell (`bash f.sh`, `./f`): the line's own values stay. `source` does
 // change the caller's variables, which is believed for a named file; a candidate that may or may not be the sourced file
 // puts the line's old values back and marks the variables it set as uncertain (a later use is also unknown at run time).
@@ -915,6 +944,12 @@ function checkCandidateScripts(sf, dir, ctx, level) {
   }
   // after a cd that may not have run, a relative word (or a glob over one) names a file in an unknown directory
   if (dir === null && sf.kind !== 'scan' && sf.words.some((w) => !path.isAbsolute(expand(w)))) return deny('cannot tell which directory this runs in, so which script it runs cannot be verified. Use an absolute path, or chain the cd with &&.');
+  const line = execLineOf(sf, expand);
+  if (line !== null) {
+    if (level >= MAX_NESTING) return deny('the command line held in a variable is nested too deeply to verify.');
+    const v = judgeScoped(line, dir, ctx, level, { kind: 'shell' });
+    if (v.decision === 'deny') return deny(`the command line ${sf.words[0]} expands to would run a blocked command: ${v.reason}`);
+  }
   const c = scriptCandidates(sf, { expand, dirs: [here], joinPath: (d, r) => path.resolve(d, r), readDir: ctx.readDir, ifs: ctx.vars.IFS });
   if (c.over) return deny('too many words, a glob matching too many files, or glob syntax that cannot be resolved could be the script this command runs, so it cannot be verified. Name the script file.');
   if (c.dynamic && GUARDED_WORDS.test(ctx.fullText)) {
@@ -1123,6 +1158,12 @@ function evalString(str, startDir, ctx, level) {
       if (!verdict) for (const fd of scriptFeedsOf(c, str)) { verdict = checkScriptFile(fd, dir, ctx, level); if (verdict) break; }
       // a shell runs its startup files (BASH_ENV, ENV, ZDOTDIR/.zshenv ...) before the script it was given: judged like `bash FILE`
       if (!verdict) for (const st of startupFilesOf(c, cmds, { env: ctx.env, inherited: (n) => knownValues(ctx, n), exec: sf?.kind === 'exec' })) {
+        // the real home's file (no word on the line names it) is judged on its own, once: see implicitStartupVerdict
+        if (st.implicit) {
+          verdict = implicitStartupVerdict(st, ctx, c, dir);
+          if (verdict) break;
+          continue;
+        }
         // a clean verdict is reused only in the very same state (it depends on the variables, branches and config the line has set so far), never for a run-time name
         const key = st.ambiguous ? null : `${st.file}\u0000${stateFingerprint(ctx, dir, level)}`;
         if (key !== null) {

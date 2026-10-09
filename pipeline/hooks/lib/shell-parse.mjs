@@ -432,7 +432,8 @@ const EXPANDS = /[$`*?[^#]|[^=]~(?!\d|$)/;
 const hasExpansion = (w) => EXPANDS.test(w);
 // A word that is a process substitution: the shell runs a command and reads its output through a /dev/fd path.
 // (zsh's `=(cmd)` is the same thing with a temp file)
-const isProcSub = (w) => w.startsWith('<(') || w.startsWith('=(');
+// (also `${x:-<(cmd)}`: the default word of a parameter expansion holds one)
+const isProcSub = (w) => w.startsWith('<(') || w.startsWith('=(') || /^\$\{[^}]*[<>=]\(/.test(w);
 
 // bash -c "script" / bash -lc ... / bash script.sh / bash (reads stdin)
 // -s, `-`, /dev/stdin and /dev/fd/0 all mean "read the script from stdin".
@@ -650,27 +651,56 @@ function readerOperands(argv, shortVal, longVal) {
 // words (option values and sed/awk programs among them), `--file=F` / `if=F` values. Which of them is a file is only known to the caller.
 function looseOperands(argv) {
   const out = [];
-  for (const w of argv.slice(1)) {
-    if (w === '' || /:\/\//.test(w)) continue; // a URL is not a local file
-    if (w[0] === '-') { const eq = w.indexOf('='); if (eq > 0) out.push(w.slice(eq + 1)); continue; }
+  argv.forEach((w, idx) => {
+    if (idx === 0 || w === '' || /:\/\//.test(w)) return; // a URL is not a local file
+    if (w[0] === '-') { const eq = w.indexOf('='); if (eq > 0) out.push([w.slice(eq + 1), w, idx]); return; }
     const kv = /^(?:if|file|input)=(.+)$/.exec(w);
-    out.push(kv ? kv[1] : w);
-  }
+    out.push([kv ? kv[1] : w, w, idx]);
+  });
   return out;
 }
 
-const newSt = () => ({ dyn: false, files: [], computed: [], raws: [] });
+// Readers whose first non-option word is a program or pattern TEXT (`grep -E '^(A|B)='`, `sed 's/^/x/'`), not a file: the only word that
+// may be taken as the literal text it spells. Any other operand or option value (`--include='*.sh'`, `-g`, `-name`) may be a pattern the
+// producer expands to real files itself. -e / -f (and the long forms) make every non-option word a file.
+const PROGRAM_READERS = new Set(['sed', 'gsed', 'grep', 'egrep', 'fgrep', 'awk', 'gawk', 'mawk', 'jq']);
+const NO_PROGRAM_FLAG = /^(?:-[A-Za-z]*[ef]|--(?:expression|regexp|file|from-file)(?:=.*)?)$/;
+function programIndex(name, argv) {
+  if (!PROGRAM_READERS.has(name) || argv.slice(1).some((a) => NO_PROGRAM_FLAG.test(a))) return -1;
+  for (let i = 1; i < argv.length; i++) {
+    if (argv[i] === '--') return i + 1;
+    if (argv[i][0] !== '-' || argv[i] === '-') return i;
+    if (/^-[ABCmdD]$/.test(argv[i])) i++;
+  }
+  return -1;
+}
+
+// Producers that read files nobody names: a directory walk or archive listing. What they print could be any file under it.
+function readsUnnamedFiles(name, argv) {
+  if (['find', 'fd', 'fdfind', 'rg', 'ag', 'ack', 'locate', 'xargs', 'tar', 'bsdtar', 'unzip', 'ls', 'dir'].includes(name)) return true;
+  if (name === 'git') return argv.some((a) => ['grep', 'show', 'cat-file', 'archive'].includes(a));
+  return ['grep', 'egrep', 'fgrep'].includes(name) && argv.some((a) => /^-[A-Za-z]*[rR]/.test(a) || /^--(?:recursive|include|exclude|dereference-recursive)/.test(a));
+}
+
+const newSt = () => ({ dyn: false, files: [], computed: [], raws: [], pat: new Set() });
 
 // What the command `seg` prints, when its output reaches the shell through a file: the files it reads. `exact`: nothing
 // between the command and the shell rewrites its output, so a plain reader's files ARE the script text (`st.files`); otherwise
 // the text is computed at run time and the files are only worth a look (`st.computed`).
 function noteReads(seg, name, argv, st, exact) {
   if (name === 'echo' || name === 'printf') return; // static text, handled by producedBy
+  if (readsUnnamedFiles(name, argv)) st.dyn = true; // the files it reads are unknown: the dynamic rules apply (refused when the line names a guarded operation / protected file)
   const reader = Object.hasOwn(READERS, name);
-  const words = reader ? readerOperands(argv, ...READERS[name]) : looseOperands(argv);
-  words.push(...seg.stdinFiles);
+  // [operand, the word it came from]; a word with no unquoted pattern character is a literal name even if it looks like a regex (`'^(A|B)='`)
+  const words = reader ? readerOperands(argv, ...READERS[name]).map((w) => [w, w]) : looseOperands(argv);
+  for (const f of seg.stdinFiles) { words.push([f, f]); st.pat.add(f); }
   const list = exact && (reader || argv.length === 0) ? st.files : st.computed;
-  for (const w of words) if (w !== '' && w !== '-' && !STDIN_FILES.has(w)) list.push(w);
+  const prog = reader ? -1 : programIndex(name, argv);
+  for (const [w, full, idx] of words) {
+    if (w === '' || w === '-' || STDIN_FILES.has(w)) continue;
+    list.push(w);
+    if (seg.pat.has(full) || idx !== prog) st.pat.add(w);
+  }
   if (words.length) st.raws.push(seg.raw);
 }
 
@@ -755,7 +785,8 @@ function stdinSource(seg) {
 // a command that rewrites its input (sed, awk, base64, tr ...) may read; `raws` are the producers' command texts.
 function addFeeds(cmd, st) {
   if (!cmd || (!st.files.length && !st.computed.length)) return;
-  if (!cmd.feeds) Object.defineProperty(cmd, 'feeds', { value: { files: [], computed: [], raws: [] }, enumerable: false });
+  if (!cmd.feeds) Object.defineProperty(cmd, 'feeds', { value: { files: [], computed: [], raws: [], pat: [] }, enumerable: false });
+  cmd.feeds.pat.push(...st.pat);
   cmd.feeds.files.push(...st.files);
   cmd.feeds.computed.push(...st.computed);
   cmd.feeds.raws.push(...st.raws);
@@ -771,7 +802,10 @@ export function scriptFeedsOf(cmd, line = cmd?.raw) {
   const exact = [...new Set(f.files)];
   const computed = [...new Set(f.computed)].filter((w) => !exact.includes(w));
   const rec = (kind) => (w) => (hasExpansion(w) ? { kind, file: w, ambiguous: true, words: [w] } : { kind, file: w });
-  const out = [...exact.map(rec('shell')), ...computed.map(rec('scan'))];
+  // a computed producer's word quoted in the command (`grep '^(A|B)=' F`, `sed 's/^/x/'`) never globs: with no `$` / backtick it is the literal name it spells
+  const pat = new Set(f.pat);
+  const lit = (w) => (hasExpansion(w) && !pat.has(w) && !/[$`]/.test(w) ? { kind: 'scan', file: w } : rec('scan')(w));
+  const out = [...exact.map(rec('shell')), ...computed.map(lit)];
   const raws = [cmd.raw, ...f.raws].filter((r) => typeof r === 'string' && r);
   if (out.length > MAX_FEED_FILES || raws.some((r) => hasPatternSyntax(r, line))) return [{ kind: 'shell', file: out[0]?.file ?? '', ambiguous: true, unresolvable: true, words: [] }];
   return out;
@@ -838,12 +872,15 @@ const NO_STARTUP = new Set(['fish', 'csh', 'tcsh']);
 const VAR_DECLS = new Set(['export', 'declare', 'typeset', 'local', 'readonly']);
 
 // The options before the operand: login / interactive flags (zsh), `unknown` when one expands, and the rc files bash is given.
-function startupOptions(argv) {
+function startupOptions(argv, lit = new Set()) {
   const o = { login: false, interactive: false, unknown: false, rc: [] };
+  let sawC = false;
   for (let i = 1; i < argv.length; i++) {
     const t = argv[i];
     if (t === '--') break;
-    if (hasExpansion(t)) o.unknown = true; // `zsh $X -c`: the word may be -l or -i
+    // `zsh $X -c`, `bash @(-l) -c`, `zsh ^x -c`: a word that expands (or globs) may become -l or -i unless it starts with a plain literal
+    // character. Only script TEXT written out in quotes with no expansion (`sh -c '(cd d; make)'`) is exempt: an unquoted expansion can split into options
+    if (/^[-+]/.test(t) ? hasExpansion(t) : !/^[A-Za-z0-9_.\/~]/.test(t) && !(sawC && lit.has(t))) o.unknown = true;
     if (t.length < 2 || (t[0] !== '-' && t[0] !== '+')) break;
     if (t.startsWith('--')) {
       if (t === '--login') o.login = true;
@@ -853,6 +890,7 @@ function startupOptions(argv) {
     }
     if (t.includes('l')) o.login = true;
     if (t.includes('i')) o.interactive = true;
+    if (t.includes('c')) sawC = true;
     if (/[oO]$/.test(t)) {
       const v = argv[++i] ?? '';
       if (hasExpansion(v)) o.unknown = true;
@@ -910,7 +948,7 @@ export function startupFilesOf(cmd, cmds = [], { env = {}, inherited = () => [],
   };
   const values = (n) => startupValues(cmd, cmds, n, env, inherited);
   for (const n of ['BASH_ENV', 'ENV']) for (const v of values(n)) add(v);
-  const opts = shell ? startupOptions(argv) : { login: false, interactive: false, unknown: false, rc: [] };
+  const opts = shell ? startupOptions(argv, cmd.litWords) : { login: false, interactive: false, unknown: false, rc: [] };
   for (const r of opts.rc) add(r);
   const dirOf = (d) => d.replace(/\/+$/, '');
   const ownHome = cmd.env && Object.hasOwn(cmd.env, 'HOME') && cmd.env.HOME !== '' ? cmd.env.HOME : null;
@@ -1031,6 +1069,37 @@ class Parser {
     return s.slice(start, this.i);
   }
 
+  // End (just past the closing brace) of the plain parameter expansion `${...}` at `from`, or -1 when it holds anything lexed as code
+  // (`$(`, `<(`, `>(`, `=(`, backticks, `$'`, a newline) or never closes: those take the ordinary path. Quotes and `\` inside are skipped; `${` nests.
+  paramSpan(from) {
+    const s = this.src;
+    const n = s.length;
+    let depth = 0;
+    for (let j = from; j < n; j++) {
+      const c = s[j];
+      if (c === '\\') { j++; continue; }
+      if (c === '`' || c === '\n') return -1;
+      if ((c === '<' || c === '>' || c === '=') && s[j + 1] === '(') return -1; // <(cmd) >(cmd) =(cmd) run code in the operand word
+      if (c === '$') {
+        const nx = s[j + 1];
+        if (nx === '(' || nx === "'") return -1;
+        if (nx === '{') { depth++; j++; }
+        continue;
+      }
+      if (c === "'") { j = s.indexOf("'", j + 1); if (j < 0) return -1; continue; }
+      if (c === '"') {
+        for (j++; j < n && s[j] !== '"'; j++) {
+          if (s[j] === '\\') j++;
+          else if (s[j] === '`' || (s[j] === '$' && s[j + 1] === '(')) return -1;
+        }
+        if (j >= n) return -1;
+        continue;
+      }
+      if (c === '}' && --depth === 0) return j + 1;
+    }
+    return -1;
+  }
+
   // Body of a double-quoted string (this.i is just past the opening quote). Substitutions run inside it.
   // Sets this.lastDqDyn when something inside is only known at run time ($VAR, $(...), backticks).
   readDq(depth) {
@@ -1126,6 +1195,7 @@ class Parser {
     let qa = -1; // index in `cur` where quoting first appeared (-1: none)
     let bm = []; // indexes in `cur` of unquoted { , } characters (brace expansion candidates)
     let wdyn = false; // the word contains an expansion that is only known at run time
+    let wpat = false; // the word holds an UNQUOTED glob / pattern character (`*?[^#~`, or a glued group): the shell may expand it to file names
     let wsubs = []; // segments run by substitutions inside the word
     let wstart = 0; // source index where the word began
     let redir = null; // pending redirection whose target word comes next: 'file' | 'heredoc' | 'herestring'
@@ -1144,7 +1214,7 @@ class Parser {
       if (!seg) {
         seg = {
           words: [], heredocs: [], herestrings: [], redirects: [], stdinSubs: [], stdinFile: false, stdinFiles: [], meta: new Map(), win: new Map(),
-          start: this.i, depth, pending: 0, muted, raw: '', final: null, groupStage: null,
+          start: this.i, depth, pending: 0, muted, raw: '', final: null, groupStage: null, pat: new Set(),
           pipedFrom: lastSep === '|' ? this.lastStage : null, sep: lastSep,
         };
       }
@@ -1159,6 +1229,7 @@ class Parser {
       const q = qa;
       const marks = bm;
       const dyn = wdyn;
+      const pat = wpat;
       const subs = wsubs;
       const from = wstart;
       cur = '';
@@ -1166,6 +1237,7 @@ class Parser {
       qa = -1;
       bm = [];
       wdyn = false;
+      wpat = false;
       wsubs = [];
       const mode = redir;
       redir = null;
@@ -1178,7 +1250,7 @@ class Parser {
           else seg.stdinFile = true;
         }
         // the file a command reads as stdin (`< F`, `<> F`; fd 0 only: `3< F` feeds nothing)
-        if ((rop === '<' || rop === '<>') && (rfd === null || rfd === 0) && !isProcSub(text)) seg.stdinFiles.push(text);
+        if ((rop === '<' || rop === '<>') && (rfd === null || rfd === 0) && !isProcSub(text) && text !== '/dev/null') seg.stdinFiles.push(text);
         return;
       }
       if (mode === 'herestring') {
@@ -1201,7 +1273,7 @@ class Parser {
         if (text === '{') this.braceStack.push(this.log.length);
         else if (text === '}' && this.braceStack.length) seg.groupStage = this.log.slice(this.braceStack.pop());
       }
-      seg.words.push({ text, qa: q, bm: marks, dyn, subs, win });
+      seg.words.push({ text, qa: q, bm: marks, dyn, subs, win, pat });
     };
     const endSeg = (idx) => {
       flushWord();
@@ -1262,7 +1334,22 @@ class Parser {
         if (nx === '(') { inWord = true; wdyn = true; cur += this.substitution(depth); takeSubs(); }
         else if (nx === "'") { mark(); const r = readAnsiC(s, this.i + 1); cur += r.text; this.i = r.next; }
         else if (nx === '"') { mark(); this.i += 2; cur += this.readDq(depth); if (this.lastDqDyn) wdyn = true; takeSubs(); }
-        else if (nx === '[') {
+        else if (nx === '{' && this.paramSpan(this.i) > 0) {
+          // `${f%%(*}`, `${x:-a b;c}`: one word; the ( ) ; | & and blanks inside the braces are not shell syntax
+          const end = this.paramSpan(this.i);
+          inWord = true; wdyn = true;
+          const body = s.slice(this.i, end);
+          // `${x:-(bash f.sh)}` is no command, but no body between parentheses is ever dropped: each balanced group is also judged
+          for (let o = body.indexOf('('); o >= 0; o = body.indexOf('(', o + 1)) {
+            let d = 0;
+            for (let k = o; k < body.length; k++) {
+              if (body[k] === '(') d++;
+              else if (body[k] === ')' && --d === 0) { if (body.slice(o + 1, k).trim()) this.subParse(body.slice(o + 1, k), depth + 1); break; }
+            }
+          }
+          cur += body;
+          this.i = end;
+        } else if (nx === '[') {
           // $[ expr ] is old-style arithmetic: its << is a shift, never a heredoc
           inWord = true; wdyn = true;
           let d = 0;
@@ -1298,7 +1385,7 @@ class Parser {
         } else {
           // an all-digit unquoted word glued to the operator is the fd number (2>&1), not an argument
           rfd = null;
-          if (inWord && qa < 0 && /^[0-9]+$/.test(cur)) { rfd = Number(cur); cur = ''; inWord = false; bm = []; wdyn = false; wsubs = []; } else flushWord();
+          if (inWord && qa < 0 && /^[0-9]+$/.test(cur)) { rfd = Number(cur); cur = ''; inWord = false; bm = []; wdyn = false; wpat = false; wsubs = []; } else flushWord();
           startSeg();
           let j = this.i + 1;
           if (c === '>') {
@@ -1325,7 +1412,7 @@ class Parser {
           lit = 1; litGlob = false; cur += '('; this.i++; // NAME=(a b) array literal, not a subshell
         } else if (inWord && s[this.i + 1] !== ')' && !(seg && seg.words.length === 0 && qa < 0 && LEAD_WORDS.has(cur.toLowerCase()))) {
           // `*(e:'cmd':)`, `foo(+f)`, `*.(jpg|png)`: a glob group glued to a word is part of the word (and `f()` is a function definition)
-          lit = 1; litGlob = true; gGlob = /[*?[]/.test(cur); cur += '('; this.i++; gRaw = this.i; gCur = cur.length;
+          lit = 1; litGlob = true; wpat = true; gGlob = /[*?[]/.test(cur); cur += '('; this.i++; gRaw = this.i; gCur = cur.length;
         } else {
           endSeg(this.i);
           lastSep = ';';
@@ -1344,6 +1431,7 @@ class Parser {
         startSeg();
         inWord = true;
         if (((c === '{' && !cur.endsWith('$')) || c === ',' || c === '}') && !(lit > 0 && litGlob)) bm.push(cur.length);
+        if (/[*?[^#~]/.test(c)) wpat = true;
         cur += c;
         this.i++;
       }
@@ -1395,6 +1483,7 @@ class Parser {
     }
     if (group.length) groups.push(group);
     for (const w of seg.words) {
+      if (w.pat) seg.pat.add(w.text);
       if (w.win !== undefined) seg.win.set(w.text, w.win);
       if (w.dyn || w.subs.length) {
         const m = seg.meta.get(w.text) ?? { dyn: false, subs: [] };
@@ -1446,6 +1535,7 @@ class Parser {
         const r = expandBraces(w.text, w.bm);
         if (r.over) this.ctx.truncated = true;
         this.ctx.braceWork += r.list.length + w.bm.length;
+        if (w.pat) for (const x of r.list) seg.pat.add(x);
         argv.push(...r.list);
       } else {
         if (w.bm.length >= 3) this.ctx.truncated = true; // budget spent: left as written
@@ -1474,8 +1564,19 @@ class Parser {
     const headDyn = a.length > 0 && (a[0].startsWith('$') || a[0].includes('$(') || a[0].includes('`'));
     if (headDyn) this.ctx.dynamic = true;
     const cmd = emit(this.ctx, a, env, seg.raw, seg.depth, [], seg.sep);
+    if (cmd) Object.defineProperty(cmd, 'litWords', { value: new Set(a.filter((w) => !seg.meta.get(w)?.dyn && !seg.pat.has(w))), enumerable: false });
     if (!isExec) seg.final = { argv: a };
     if (headDyn && cmd) {
+      // `$X < f.sh`, `cat f.sh | $X`: the program may be a shell reading its script from stdin
+      const saved = this.cmd;
+      this.cmd = cmd;
+      try {
+        // the files it reads, as a scan (refused only when they hold a guarded word: `$PSQL < q.sql` is data, `X="sh -s"; $X < f.sh` is a script); heredoc text is not judged here
+        const st = stdinSource(seg).st;
+        st.computed.push(...st.files);
+        st.files.length = 0;
+        addFeeds(cmd, st);
+      } finally { this.cmd = saved; }
       // `$(cat f.sh)` as the command: the shell runs whatever the substitution prints
       const m = seg.meta.get(a[0]);
       const st = newSt();
@@ -1496,6 +1597,7 @@ class Parser {
       if (m.dyn) this.ctx.dynamic = true;
       const st = newSt();
       for (const text of subsProduced(m.subs, st, 1)) this.subParse(text, depth);
+      if (feed && st.dyn) this.ctx.dynamic = true;
       if (feed) addFeeds(this.cmd, st);
     }
   }

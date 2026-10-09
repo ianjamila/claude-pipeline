@@ -205,7 +205,8 @@ test('guard-files: an existsSync that throws is a denial, not "the script is mis
 test('guard-files: a glob that does not compile is judged as the literal word', () => {
   const d = (c) => files(c, filesFs({})).decision;
   assert.equal(d('rm ~/.claude/pipeline/[z-a]x'), 'deny'); // literally inside a protected root
-  assert.equal(d('rm ~/.cl[z-a]ude/pi*'), 'allow'); // the literal word names nothing protected
+  assert.equal(d('rm ~/.cl[z-a]ude/pi*'), 'deny'); // a bracket always matches ONE character, so the word can still line up with a protected root (a superset of what the shell matches)
+  assert.equal(d('rm ~/.cl[z-a]ude/zzz*'), 'allow'); // ... but only if the rest lines up
   assert.equal(d('rm src/[z-a]/page.tsx'), 'allow');
   assert.equal(d('mv a.txt out/[z-a].txt'), 'allow');
 });
