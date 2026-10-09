@@ -9,9 +9,55 @@ import { readdirSync } from 'node:fs';
 import { SCRIPT_EXT } from './shell-parse.mjs';
 
 export const MAX_CANDIDATES = 32; // more words than this are refused, not judged
-// Candidate scripts judged across one whole evaluation (each may be ambiguous itself, so the work multiplies with every
-// nesting level; a hook that runs out of time is allowed through, so the guard must give up first and deny).
-export const MAX_CANDIDATE_JUDGMENTS = 64;
+// Every limit below exists because a hook that runs out of time (15 s, see HOOK_TIMEOUT_S in lib/installer.mjs) is
+// ALLOWED by Claude Code, so the guard must give up first and deny.
+// Script files read and judged across one whole evaluation: named, candidate and interpreter files alike. A script
+// that runs 500 scripts that each run 500 more makes 500^depth judgments, so the work is counted, not just the depth.
+// 128: a real chain (verify -> lint, tests, build ...) reads a few dozen scripts at most, and 128 reads of the largest
+// judged file (200,000 characters) still finish in a fraction of the deadline below.
+export const MAX_SCRIPT_JUDGMENTS = 128;
+// Wall-clock limit for one evaluation, measured from the top-level call (nested calls share it): a third of the hook timeout.
+export const EVAL_DEADLINE_MS = 5000;
+// Variable expansion: no expanded text may exceed one command line (the same 200,000 as MAX_LINE_CHARS), and the text
+// ADDED by expansion across one evaluation is bounded too (`A=<60k chars> ...` used by thousands of words).
+export const MAX_EXPANDED_CHARS = 200_000;
+export const MAX_EXPANDED_TOTAL = 1_000_000;
+
+// Thrown when a limit above is hit; each policy's entry point turns it into a denial carrying the message.
+export class GuardLimit extends Error {}
+
+// One per top-level evaluation, shared through every nested call. `now` is injectable so tests do not depend on timing.
+export function newEvalBudget(now = Date.now) {
+  return { now, deadline: now() + EVAL_DEADLINE_MS, scripts: MAX_SCRIPT_JUDGMENTS, grown: 0 };
+}
+
+export function checkDeadline(budget) {
+  if (budget.now() > budget.deadline) throw new GuardLimit('the check took too long (a script chain or a command line too large to verify in time), so it cannot be verified. Split it into simpler commands or name the script file.');
+}
+
+// A script file is about to be judged: one unit of the shared budget.
+export function countScript(budget) {
+  checkDeadline(budget);
+  if (--budget.scripts < 0) throw new GuardLimit('too many script files to check (scripts that run scripts that run scripts ...), so what they run cannot be verified. Name the script file.');
+}
+
+// `text.replace(re, ...)` where `lookup(match, ...groups)` gives the replacement (or the match itself when nothing is known),
+// counted as it grows: the result may not exceed MAX_EXPANDED_CHARS, nor may the text added across the evaluation exceed
+// MAX_EXPANDED_TOTAL. It throws before the oversized string exists (`A=<100k chars>; ... $A$A$A` x 50k refs is gigabytes).
+export function substitute(budget, text, re, lookup) {
+  let len = text.length;
+  return text.replace(re, (m, ...groups) => {
+    const v = lookup(m, ...groups);
+    if (v === m) return m;
+    len += v.length - m.length;
+    if (v.length > m.length) budget.grown += v.length - m.length;
+    if (len > MAX_EXPANDED_CHARS || budget.grown > MAX_EXPANDED_TOTAL) {
+      throw new GuardLimit('variables expand to more text than can be checked, so the command cannot be verified. Write the values out or split the command.');
+    }
+    return v;
+  });
+}
+
 const MAX_GLOB_WORK = 5000; // directory entries looked at across one command
 const MAX_GLOB_STEPS = 200_000; // matcher steps across one command (a name against a segment backtracks)
 const MAX_SEGMENT = 256; // a longer glob segment is refused

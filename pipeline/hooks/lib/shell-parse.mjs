@@ -574,7 +574,7 @@ function pwshInvocation(argv) {
     if (name === '') continue;
     if ('command'.startsWith(name)) return argv.slice(i + 1).join(' ');
     if (name === 'ec' || (name[0] === 'e' && 'encodedcommand'.startsWith(name))) {
-      try { return Buffer.from(argv[i + 1] ?? '', 'base64').toString('utf16le'); } catch { return null; }
+      return Buffer.from(argv[i + 1] ?? '', 'base64').toString('utf16le'); // (a throw ends in finalize's truncated, which both policies deny)
     }
     if ('file'.startsWith(name)) return null;
     if (PWSH_VALUE_ALIASES.includes(name) || (name.length >= 2 && PWSH_VALUE_FLAGS.some((v) => v.startsWith(name)))) i++;

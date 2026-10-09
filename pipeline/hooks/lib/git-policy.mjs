@@ -17,7 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { commandName, simpleCommands, splitArgs, scriptFileOf } from './shell-parse.mjs';
 import { catchAllReason, guardedCommandText } from './guarded-text.mjs';
-import { scriptCandidates, defaultReadDir, MAX_CANDIDATE_JUDGMENTS } from './script-candidates.mjs';
+import { scriptCandidates, defaultReadDir, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
 
 const PROTECTED_BRANCHES = ['main', 'master'];
 const APPROVAL_LABELS = ['human-approved', 'test-change-approved'];
@@ -111,8 +111,10 @@ const flagValues = (flags, longNames, shortNames = '') => flags
 // ---- directories, variables, branch state ---------------------------------------------------------------------
 
 // $NAME / ${NAME} that an earlier command on the same line assigned; anything else is left as written.
-function expandVars(text, vars) {
-  return String(text).replace(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g, (m, a, b) => vars[a ?? b] ?? m);
+// A value is substituted as written (never expanded again), but a long value used in many words still multiplies, so the
+// text produced is capped per result and per evaluation (substitute throws GuardLimit, which evaluateGitCommand denies).
+function expandVars(text, ctx) {
+  return substitute(ctx.budget, String(text), /\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g, (m, a, b) => ctx.vars[a ?? b] ?? m);
 }
 
 // A variable assigned more than once in what is judged (`B=main; false && B=agent/x`) is unknown from then on: which
@@ -158,7 +160,7 @@ function unsureVarUsed(words, ctx) {
 // Resolves `target` against `dir`. Returns null when the result cannot be known statically ($VAR, $(..), `cd -`).
 function joinDir(dir, target, ctx) {
   if (typeof target !== 'string') return null;
-  let t = expandVars(target, ctx.vars);
+  let t = expandVars(target, ctx);
   if (DYNAMIC.test(t) || t === '-') return null;
   if (t === '~' || t.startsWith('~/')) t = ctx.home + t.slice(1);
   else if (t.startsWith('~')) return null;
@@ -235,7 +237,7 @@ function checkRefspec(spec, dir, gitDir, ctx) {
   const colon = spec.indexOf(':');
   const src = colon < 0 ? spec : spec.slice(0, colon);
   let dst = colon < 0 ? spec : spec.slice(colon + 1);
-  dst = expandVars(dst, ctx.vars); // `B=agent/x; git push origin HEAD:$B`
+  dst = expandVars(dst, ctx); // `B=agent/x; git push origin HEAD:$B`
   if (colon >= 0 && src === '' && dst === '') return deny('`git push <remote> :` pushes every matching branch, including main. Name your branch explicitly.');
   if (dst === '') dst = src; // `src:` is not a destination git accepts; judge it by the source name
   dst = stripHeads(dst);
@@ -261,7 +263,7 @@ function checkRefspec(spec, dir, gitDir, ctx) {
 
 function checkPush(args, dir, gitDir, ctx, configs) {
   const { flags, positionals: rawPositionals } = parseOpts(args, { longValue: PUSH_LONG_VALUE, shortValue: 'o', abbrev: true });
-  const positionals = rawPositionals.map((p) => expandVars(p, ctx.vars));
+  const positionals = rawPositionals.map((p) => expandVars(p, ctx));
   let repoGiven = false;
   for (const f of flags) {
     if (f.short) {
@@ -340,13 +342,13 @@ function trackSwitch(sub, args, d, ctx) {
   if (create) {
     const start = positionals[0];
     const noTrack = flags.some((f) => !f.short && f.name === 'no-track');
-    setBranch(ctx, d, expandVars(create.value, ctx.vars), !noTrack && start !== undefined && /^[^/]+\/(main|master)$/i.test(start));
+    setBranch(ctx, d, expandVars(create.value, ctx), !noTrack && start !== undefined && /^[^/]+\/(main|master)$/i.test(start));
     return;
   }
   if (flags.some((f) => (f.short ? f.name === 'd' : f.name === 'detach'))) { setBranch(ctx, d, null); return; }
   if (!isSwitch && args.includes('--')) return; // `checkout [<tree-ish>] -- <paths>` restores files only
   if (positionals.length === 0 || (!isSwitch && positionals.length > 1)) return; // paths, or nothing to switch to
-  const x = expandVars(positionals[0], ctx.vars);
+  const x = expandVars(positionals[0], ctx);
   if (x === '-' || /^@\{-\d*\}$/.test(x) || DYNAMIC.test(x)) { setBranch(ctx, d, null); return; }
   if (x === 'HEAD' || x === '@') return;
   if (!isSwitch && d !== null && ctx.pathExists(path.resolve(d, x))) return; // a file on disk: path checkout, or git refuses
@@ -357,9 +359,9 @@ function trackBranch(args, d, gitDir, ctx) {
   const { flags, positionals } = parseOpts(args, { longValue: ['set-upstream-to', 'contains', 'merged', 'no-merged', 'sort', 'format'], shortValue: 'u' });
   if (flags.some((f) => (f.short ? f.name === 'u' : ['set-upstream-to', 'unset-upstream', 'set-upstream'].includes(f.name)))) ctx.cfgDirty = true;
   if (flags.some((f) => (f.short ? 'mM'.includes(f.name) : f.name === 'move'))) {
-    if (positionals.length === 1) setBranch(ctx, d, expandVars(positionals[0], ctx.vars));
+    if (positionals.length === 1) setBranch(ctx, d, expandVars(positionals[0], ctx));
     else if (positionals.length >= 2) {
-      const [from, to] = positionals.map((p) => expandVars(p, ctx.vars));
+      const [from, to] = positionals.map((p) => expandVars(p, ctx));
       const { branch: cur } = effectiveBranch(d, gitDir, ctx);
       if (cur === from) setBranch(ctx, d, to);
     }
@@ -383,7 +385,7 @@ function trackGit(sub, args, g, ctx) {
   else if (sub === 'rebase') {
     // `git rebase <upstream> <branch>` checks <branch> out first
     const { positionals } = parseOpts(args, { longValue: ['onto', 'exec', 'strategy', 'strategy-option', 'whitespace'], shortValue: 'xsXC' });
-    if (positionals.length >= 2) setBranch(ctx, d, DYNAMIC.test(positionals[1]) ? null : expandVars(positionals[1], ctx.vars));
+    if (positionals.length >= 2) setBranch(ctx, d, DYNAMIC.test(positionals[1]) ? null : expandVars(positionals[1], ctx));
   } else if (sub === 'symbolic-ref') {
     const { positionals } = parseOpts(args, { shortValue: 'm' });
     if (positionals.length === 2 && positionals[0] === 'HEAD') setBranch(ctx, d, positionals[1]);
@@ -392,9 +394,9 @@ function trackGit(sub, args, g, ctx) {
     const target = joinDir(d, positionals[0], ctx);
     const named = flags.find((f) => f.short && 'bB'.includes(f.name));
     if (target === null) return;
-    if (named) setBranch(ctx, target, expandVars(named.value, ctx.vars));
+    if (named) setBranch(ctx, target, expandVars(named.value, ctx));
     else if (flags.some((f) => !f.short && f.name === 'detach')) setBranch(ctx, target, null);
-    else if (positionals[1] !== undefined) setBranch(ctx, target, DYNAMIC.test(positionals[1]) ? null : expandVars(positionals[1], ctx.vars));
+    else if (positionals[1] !== undefined) setBranch(ctx, target, DYNAMIC.test(positionals[1]) ? null : expandVars(positionals[1], ctx));
     else setBranch(ctx, target, path.basename(target));
   }
 }
@@ -485,6 +487,7 @@ function gatherBody(flags, dir, ctx) {
   const fields = [];
   const queries = [];
   const fromFile = (p) => {
+    if (dir !== null) countScript(ctx.budget); // a file read like any other (its size is up to 1 MB), so it is counted
     const t = dir === null ? null : ctx.readText(path.resolve(dir, p));
     if (typeof t === 'string') { text += `\n${t}`; return t; }
     unknown = true;
@@ -665,7 +668,7 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
   // value on the line is not proof — `X=merge; true || X=view; gh pr $X` runs merge.
   const written = splitGh(argv.slice(1));
   if ((written.group !== undefined && DYNAMIC.test(written.group)) || (written.verb !== undefined && DYNAMIC.test(written.verb))) return deny(RUN_TIME_SUBCOMMAND);
-  const args = argv.slice(1).map((a) => expandVars(a, ctx.vars));
+  const args = argv.slice(1).map((a) => expandVars(a, ctx));
   const { group, verb, rest } = splitGh(args);
   if (!group) return null;
 
@@ -749,8 +752,8 @@ const shellQuote = (w) => (/^[A-Za-z0-9_@%+=:,./-]+$/.test(w) ? w : `'${String(w
 // word that a shell would split), so both readings are judged and either one can deny.
 // Recognised when argv[0] is the pipeline entry or a JS runtime followed by it (variables expanded first), or
 // when the words contain `job start NAME --` anywhere (an unresolved `$P job start x -- …`).
-function jobStartCommands(argv, vars) {
-  const w = argv.map((a) => expandVars(a, vars));
+function jobStartCommands(argv, ctx) {
+  const w = argv.map((a) => expandVars(a, ctx));
   const first = baseName(w[0]);
   if (first === 'echo' || first === 'printf') return null;
   const isEntry = (x) => /^pipeline(\.mjs)?$/.test(baseName(x));
@@ -786,7 +789,7 @@ const isNodeModulesOrPipelineHome = (p) => /[\\/]node_modules[\\/]/.test(p) || /
 function checkScriptFile(sf, dir, ctx, level) {
   if (sf.ambiguous) return checkCandidateScripts(sf, dir, ctx, level);
   // a candidate is a final path (a glob match, or a word already expanded): the shell never expands it a second time
-  const file = sf.candidate ? sf.file : expandVars(sf.file, ctx.vars);
+  const file = sf.candidate ? sf.file : expandVars(sf.file, ctx);
   if (!sf.candidate && /^\$\{?HOME\}?(?=\/|$)/.test(file)) return checkScriptFile({ ...sf, file: ctx.home + file.replace(/^\$\{?HOME\}?/, '') }, dir, ctx, level);
   if (!sf.candidate && DYNAMIC.test(file)) {
     // quoting is lost (`'x$y.sh'` reads as `x$y.sh`): if the word as written is a file, judge it before the textual rule
@@ -800,13 +803,14 @@ function checkScriptFile(sf, dir, ctx, level) {
   // a relative script after a cd that may not have run: which file runs is unknown, never the starting directory's
   if (dir === null && !path.isAbsolute(home)) return deny(`cannot tell which directory this runs in, so which ${sf.file} runs cannot be verified. Use an absolute path, or chain the cd with &&.`);
   const abs = path.resolve(dir ?? ctx.cwd, home);
+  checkDeadline(ctx.budget);
   const text = ctx.readText(abs);
   if (typeof text !== 'string') {
     if (sf.candidate && ctx.readDir(abs)) return null; // a shell cannot run a directory
     if (sf.kind === 'shell' && ctx.pathExists(abs)) return deny(`cannot read the script ${sf.file} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified.`);
     return null; // missing: nothing will run
   }
-  if (sf.candidate && --ctx.judgeBudget < 0) return deny('too many script files to judge (candidate scripts that run candidate scripts), so what they run cannot be verified. Name the script file.');
+  countScript(ctx.budget); // every script read and judged counts, named or candidate: the work multiplies with each level
   let kind = sf.kind;
   if (kind === 'exec') {
     if (text.slice(0, 4096).includes('\u0000')) return null; // a binary
@@ -833,7 +837,7 @@ function checkScriptFile(sf, dir, ctx, level) {
 //   cfgDirty, envCfgDirty         repository/global config: only ever set, never restored (a candidate that may not run
 //                                 still leaves them dirty); envCfgDirty is recomputed from vars AND tainted names
 //   gitAliases, ghAliases         config on disk: kept; one a speculative candidate (re)defines is also unsure (aliasUnsure)
-//   cwd, home, fullText, readers  constants of the evaluation; judgeBudget is shared on purpose (never restored)
+//   cwd, home, fullText, readers  constants of the evaluation; budget (script reads, deadline, expansion) is shared on purpose (never restored)
 // (a `cd` inside a sourced file is not followed: evalString's directory is local to each call)
 function judgeScoped(text, dir, ctx, level, sf) {
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
@@ -883,7 +887,7 @@ function judgeScoped(text, dir, ctx, level, sf) {
 function checkCandidateScripts(sf, dir, ctx, level) {
   const here = path.resolve(dir ?? ctx.cwd);
   const expand = (w) => {
-    let e = expandVars(w, ctx.vars).replace(/^\$\{?HOME\}?(?=\/|$)/, ctx.home);
+    let e = expandVars(w, ctx).replace(/^\$\{?HOME\}?(?=\/|$)/, ctx.home);
     if (e === '~' || e.startsWith('~/')) e = ctx.home + e.slice(1);
     return e;
   };
@@ -1031,6 +1035,7 @@ function unsureVarReachingCommand(cmds, ctx) {
 }
 
 function evalString(str, startDir, ctx, level) {
+  checkDeadline(ctx.budget);
   if (level > MAX_NESTING) return deny('pipeline job start / alias is nested too deeply to verify.');
   const cmds = simpleCommands(str);
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (`g''it push` after
@@ -1053,6 +1058,7 @@ function evalString(str, startDir, ctx, level) {
   // sticky: a later `cd /abs` does not make it known again (`alias cd=true; cd /safe`, a DEBUG trap that cds back)
   const hazard = FUNCTION_DEF.test(str) || cmds.some(isStateHazard);
   for (const [i, c] of cmds.entries()) {
+    checkDeadline(ctx.budget); // a lookup (branch, labels) can take seconds; the evaluation as a whole may not
     const argv = c.argv;
     if (hazard) forgetState();
     // Only commands chained with && after it are certain to see the change (`cd d && git push`); anything else may run
@@ -1083,7 +1089,7 @@ function evalString(str, startDir, ctx, level) {
       else verdict = name === 'git' ? checkGit(argv, c.env, dir, ctx, c.raw ?? '') : checkGh(argv, c.env, dir, ctx, c.raw ?? '');
     }
     else {
-      for (const inner of jobStartCommands(argv, ctx.vars) ?? []) {
+      for (const inner of jobStartCommands(argv, ctx) ?? []) {
         const v = evalString(inner, dir, ctx, level + 1);
         if (v.decision === 'deny') { verdict = v; break; }
       }
@@ -1125,14 +1131,22 @@ export function evaluateGitCommand(command, {
   readText = defaultReadText,
   pathExists = existsSync,
   readDir = defaultReadDir,
+  now = Date.now, // injectable clock (tests)
 } = {}) {
   const text = typeof command === 'string' ? command : String(command ?? '');
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   const base = cwd || process.cwd();
   const ctx = {
-    cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, readDir, judgeBudget: MAX_CANDIDATE_JUDGMENTS, fullText: text,
+    cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, readDir, budget: newEvalBudget(now), fullText: text,
     vars: Object.create(null), unsureVars: new Set(), tainted: new Set(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
     branches: new Map(), cfgDirty: false, envCfgDirty: false,
   };
-  return evalString(text, path.resolve(base), ctx, 0);
+  // Why: a hook that throws or times out is allowed by Claude Code, so a limit hit (GuardLimit) and ANY other exception (a
+  // readText that throws, a stack overflow) end here as a denial that names the cause.
+  try {
+    return evalString(text, path.resolve(base), ctx, 0);
+  } catch (err) {
+    if (err instanceof GuardLimit) return deny(err.message);
+    return deny(`internal error while checking this command (${err instanceof Error ? err.message : String(err)}), so it cannot be verified.`);
+  }
 }

@@ -19,7 +19,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
 import { simpleCommands, commandName, scriptFileOf } from './shell-parse.mjs';
-import { scriptCandidates, defaultReadDir, MAX_CANDIDATE_JUDGMENTS } from './script-candidates.mjs';
+import { scriptCandidates, defaultReadDir, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
 
 const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
@@ -92,9 +92,9 @@ function realResolve(p, api, depth = 0) {
   let cur = p;
   const tail = [];
   for (let i = 0; i < 256; i++) {
-    let exists = false;
-    try { exists = api.existsSync(cur); } catch { /* treated as missing */ }
-    if (exists) {
+    // (existsSync answers false for anything it cannot stat; one that throws is a broken lookup and is not read as "missing")
+    if (api.existsSync(cur)) {
+      // realpath fails only where the OS refuses the access too (a symlink loop, EACCES, a too-long name): the lexical path is judged
       try { return posix.join(toPosix(api.realpath(cur)).replace(DEVICE_PREFIX, ''), ...tail.slice().reverse()); } catch { return p; }
     }
     if (depth < 8) {
@@ -173,6 +173,7 @@ function makeCtx(opts) {
     vars: {}, // same-line shell assignments (D=$HOME/.claude), filled in once the line is parsed
     dynamic: false, // set when a scan had to be skipped for size; callers fail closed
     readText: opts.readText ?? defaultReadText,
+    budget: opts._budget ?? newEvalBudget(opts.now), // script reads, deadline and expansion allowance of this evaluation (shared with nested calls)
     readDir: opts.readDir ?? defaultReadDir,
     admin: (opts.env ?? process.env).PIPELINE_ADMIN === '1',
     hit: (p) => { const q = unFirm(p); return roots.some((r) => isInside(q, r, platform)); },
@@ -328,7 +329,7 @@ function evaluateMcp(tool, ti, input, opts) {
   return allow();
 }
 
-export const evaluateFileTool = denyUnverifiable(evaluateFileToolUnchecked);
+export const evaluateFileTool = failClosed(evaluateFileToolUnchecked);
 function evaluateFileToolUnchecked(input, opts = {}) {
   const tool = typeof input?.tool_name === 'string' ? input.tool_name : '';
   const ti = input?.tool_input && typeof input.tool_input === 'object' ? input.tool_input : {};
@@ -375,11 +376,16 @@ function freeMark(text) {
   }
   throw new UnverifiableText('the command holds every private-use Unicode character, so it cannot be checked; remove them');
 }
-// The entry points answer deny for text they cannot normalise (a hook that throws lets the command through).
+// Why: a hook that throws or times out is allowed by Claude Code, so the entry points answer deny for text they cannot
+// normalise, for a limit hit (script budget, deadline, expansion: GuardLimit) and for ANY other exception (a readText that
+// throws, a stack overflow), naming the cause.
 // (a declaration: the entry points above are built from it when the module loads)
-function denyUnverifiable(fn) {
+function failClosed(fn) {
   return (...args) => {
-    try { return fn(...args); } catch (e) { if (e instanceof UnverifiableText) return deny(e.message); throw e; }
+    try { return fn(...args); } catch (e) {
+      if (e instanceof UnverifiableText || e instanceof GuardLimit) return deny(e.message);
+      return deny(`internal error while checking this command (${e instanceof Error ? e.message : String(e)}), so it cannot be verified`);
+    }
   };
 }
 
@@ -429,10 +435,11 @@ function expandKeepingBackslash(w, ctx) {
 const mayHoldBackslash = (w, ctx) => w.includes('\\') || Object.values(ctx.keptVars ?? {}).some((v) => String(v).includes('\\'));
 
 // $NAME / ${NAME} for variables assigned earlier on the same line (D=$HOME/.claude; echo x > $D/settings.json).
-function substVars(text, vars) {
+// Values are stored already expanded, and a value used in many words multiplies: the produced text is capped (substitute).
+function substVars(text, vars, budget) {
   let t = text;
   for (let pass = 0; pass < 4 && t.includes('$'); pass++) {
-    const next = t.replace(/\$\{(\w+)\}|\$(\w+)/g, (m, a, b) => (Object.hasOwn(vars, a ?? b) ? vars[a ?? b] : m));
+    const next = substitute(budget, t, /\$\{(\w+)\}|\$(\w+)/g, (m, a, b) => (Object.hasOwn(vars, a ?? b) ? vars[a ?? b] : m));
     if (next === t) break;
     t = next;
   }
@@ -442,7 +449,7 @@ function substVars(text, vars) {
 // Slash-normalised copy of `text` with the user name, same-line variables and every home spelling replaced.
 function expandRefs(text, ctx) {
   const t = toPosix(text).replace(USER_RE, ctx.user);
-  return ctx.unFirm(expandHomeRefs(substVars(t, ctx.vars), ctx.homePosix));
+  return ctx.unFirm(expandHomeRefs(substVars(t, ctx.vars, ctx.budget), ctx.homePosix));
 }
 
 // Expands the first `{a,b}` groups of each word so `~/.claude/{pipeline,settings.json}` shows both paths.
@@ -506,7 +513,7 @@ function suffixRegexes(ci) {
   };
 }
 
-// One path segment of a glob as a regexp (`*` and `?` stay inside the segment); null when it cannot be compiled.
+// One path segment of a glob as a regexp (`*` and `?` stay inside the segment).
 function segmentRe(seg, ci) {
   const re = globToRe(seg.replace(/\*\*/g, '*'), ci);
   return re;
@@ -541,7 +548,8 @@ function globToRe(g, ci) {
       else { re += `[${g.slice(i + 1, j).replace(/^!/, '^').replace(/\\/g, '\\\\')}]`; i = j; }
     } else re += escapeRe(c);
   }
-  try { return new RegExp(`^${re}$`, ci ? 'i' : ''); } catch { return null; }
+  // a pattern that does not compile (an out-of-order range) may match anything: callers ask "can this glob reach a protected path", so say yes
+  try { return new RegExp(`^${re}$`, ci ? 'i' : ''); } catch { return new RegExp('^[\\s\\S]*$'); }
 }
 
 // Every protected root plus the directories between it and the home directory, for globs like `~/.claude/*`.
@@ -747,8 +755,8 @@ function collectVars(cmds, ctx) {
   const bs = freeMark([ctx.homePosix ?? '', ctx.user ?? '', ...cmds.flatMap((c) => [...Object.values(c.env ?? {}), ...(c.argv ?? [])])].join(''));
   const set = (k, v) => {
     if (SKIP.has(k)) return;
-    vars[k] = expandHomeRefs(substVars(toPosix(String(v)).replace(USER_RE, ctx.user), vars), ctx.homePosix);
-    kept[k] = expandHomeRefs(substVars(toPosix(String(v).replace(/\\/g, bs)).replace(USER_RE, ctx.user), kept), ctx.homePosix).split(bs).join('\\');
+    vars[k] = expandHomeRefs(substVars(toPosix(String(v)).replace(USER_RE, ctx.user), vars, ctx.budget), ctx.homePosix);
+    kept[k] = expandHomeRefs(substVars(toPosix(String(v).replace(/\\/g, bs)).replace(USER_RE, ctx.user), kept, ctx.budget), ctx.homePosix).split(bs).join('\\');
   };
   for (const c of cmds) {
     for (const [k, v] of Object.entries(c.env ?? {})) set(k, v);
@@ -874,7 +882,7 @@ const STDIN_RUNNERS = new Set(['node', 'nodejs', 'deno', 'bun', 'sh', 'bash', 'z
 function checkoutRootOf(dir, ctx) {
   let d = dir;
   for (let i = 0; i < 64; i++) {
-    try { if (ctx.api.existsSync(posix.join(d, 'pipeline/hooks/guard-files.mjs'))) return d; } catch { /* not a checkout */ }
+    if (ctx.api.existsSync(posix.join(d, 'pipeline/hooks/guard-files.mjs'))) return d;
     const p = posix.dirname(d);
     if (p === d) return null;
     d = p;
@@ -924,6 +932,7 @@ function findInstaller(cmds, raw, dirs, ctx, opts) {
       if (!script) continue;
       for (const r of unique(roots)) {
         let scripts;
+        countScript(ctx.budget); // a file read like any other, so it is counted
         try {
           const read = opts.readFile ?? ((p) => fs.readFileSync(p, 'utf8'));
           scripts = JSON.parse(read(posix.join(r, 'package.json'))).scripts ?? {};
@@ -1005,19 +1014,18 @@ function judgeScriptFile(sf, dirs, ctx, opts, scanRaw = '', keepBackslash = fals
   const found = [];
   for (const d of isAbs(e) ? [''] : dirs) {
     const abs = isAbs(e) ? posix.normalize(e) : posix.join(d, e);
-    let exists = false;
-    try { exists = ctx.api.existsSync(abs); } catch { /* treated as missing */ }
-    if (exists) { found.push({ abs, dir: d || ctx.cwd }); break; }
+    if (ctx.api.existsSync(abs)) { found.push({ abs, dir: d || ctx.cwd }); break; }
   }
   if (!found.length) return null;
   const { abs, dir } = found[0];
   if (ctx.hit(abs) || ctx.hit(realResolve(abs, ctx.api)) || /\/node_modules\//.test(abs)) return null;
+  checkDeadline(ctx.budget);
   const text = ctx.readText(abs);
   if (typeof text !== 'string') {
     if (sf.candidate && ctx.readDir(abs)) return null; // a shell cannot run a directory
     return sf.kind === 'shell' ? deny(`cannot read the script ${sf.file} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified`) : null;
   }
-  if (sf.candidate && --opts._budget.left < 0) return deny('too many script files to judge (candidate scripts that run candidate scripts), so what they run cannot be checked; name the script file');
+  countScript(ctx.budget); // every script read and judged counts, named or candidate: the work multiplies with each level
   let kind = sf.kind;
   if (kind === 'exec') {
     if (text.slice(0, 4096).includes('\u0000')) return null; // a binary
@@ -1131,9 +1139,10 @@ function linkReachesProtected(cmds, dirs, ctx) {
 
 // ---- Bash --------------------------------------------------------------------------------------------
 
-export const evaluateBashForFiles = denyUnverifiable(evaluateBashForFilesUnchecked);
+export const evaluateBashForFiles = failClosed(evaluateBashForFilesUnchecked);
 function evaluateBashForFilesUnchecked(command, opts = {}) {
-  if (!opts._budget) opts = { ...opts, _budget: { left: MAX_CANDIDATE_JUDGMENTS } }; // one budget for this evaluation and every script it reads
+  if (!opts._budget) opts = { ...opts, _budget: newEvalBudget(opts.now) }; // one budget for this evaluation and every script it reads
+  checkDeadline(opts._budget);
   const ctx = makeCtx(opts);
   if (ctx.admin) return allow();
   const raw = typeof command === 'string' ? command : '';
@@ -1167,7 +1176,7 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
   if (setsSeamForPipeline(cmds)) return deny('the command sets a pipeline test seam (PIPELINE_GH, PIPELINE_CODEX, PIPELINE_VERCEL, PIPELINE_TEST_MODE) for the pipeline CLI; a fake gh/codex/vercel could satisfy the merge gate, so only the owner does that, from a terminal');
   ctx.vars = collectVars(cmds, ctx);
   // a name held in a variable (N=PIPELINE_ADMIN; env $N=1 claude)
-  if (Object.keys(ctx.vars).length && setsAdmin(substVars(flat, ctx.vars), ctx.platform)) return deny('the command sets PIPELINE_ADMIN through a variable; only the owner may set it, when launching Claude Code');
+  if (Object.keys(ctx.vars).length && setsAdmin(substVars(flat, ctx.vars, ctx.budget), ctx.platform)) return deny('the command sets PIPELINE_ADMIN through a variable; only the owner may set it, when launching Claude Code');
   const dirs = collectDirs(cmds, ctx);
 
   // 3 and 4: installers and `protect --apply`
