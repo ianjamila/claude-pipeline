@@ -189,16 +189,18 @@ function checkDisableRules(rules, errors) {
 //   R1-destructive, R1-migration-edited, R2-sql-removed, R2-sql-statement
 //                       the database rules the label exists for (R1-destructive covers raw destructive SQL, SQL in code,
 //                       deleted/moved migrations)
-//   R4-pipeline         the GUARD CORE: files that decide whether a label is needed or which checks CI runs (workflows,
-//                       .claude/, CODEOWNERS, scripts/pipeline, pipeline.yml, test-runner configs, gitlinks, symlinks,
-//                       deleted pgTAP tests, package.json gate blocks): one unattended edit there could otherwise turn the
-//                       database rules report-only too, so it must stay blocking
+//   R4-pipeline         the GUARD CORE: anything that decides whether a label is needed or which checks CI runs (workflows,
+//                       .claude/, CODEOWNERS, scripts/pipeline, pipeline.yml, test-runner configs, scripts/verify*, lint /
+//                       tsconfig / build config, changed or removed package.json scripts, gitlinks, symlinks, deleted pgTAP
+//                       tests, package.json gate blocks): one unattended edit there could otherwise turn the database rules
+//                       report-only too, so it must stay blocking
 //   P-path              a project path rule has its own switch, hard_stops.report_only_paths
 // Eligible by owner decision 2026-10-09:
 //   R1-data-write       app code that deletes or overwrites rows through a client (.from(...).delete/upsert) is routine
 //                       feature code; raw destructive SQL stays R1-destructive
-//   R4-config           CLAUDE.md and other agent-instruction files, the local verify script, package.json scripts, git
-//                       hooks, lint/tsconfig/build config: not the guard core
+//   R4-config           what CI never runs: CLAUDE.md and other agent-instruction files, markdown under .github, local git
+//                       hooks, a newly ADDED plain package.json script (a new
+//                       lifecycle hook like pretest/postinstall runs inside CI, so it stays R4-pipeline)
 // R5-major-dep IS eligible; its fail-closed "package.json could not be parsed" hit is emitted as R0-unscannable so it
 // stays blocking. A rule named here that is outside the list is a config error, not a silent no-op, and classifyHardStops
 // re-checks it (fail closed).

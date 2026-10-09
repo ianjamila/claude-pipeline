@@ -50,7 +50,7 @@ test('1 a binary rename from an asset to a non-asset is unscannable (every path 
   assert.ok(flags([file('lib/a.ts', { status: 'R', oldPath: 'public/a.png', binary: true })]).includes('R0-unscannable'));
 });
 
-test('1 .gitattributes -> R4 (it can switch diff/textconv off for other files)', () => {
+test('1 .gitattributes -> R4-pipeline (it can switch diff/textconv off for other files)', () => {
   assert.deepEqual(flags([file('.gitattributes')]), ['R4-pipeline']);
   assert.deepEqual(flags([file('apps/web/.gitattributes')]), ['R4-pipeline']);
 });
@@ -224,7 +224,7 @@ test('4 auth.admin.* and a Supabase .from(...).delete()/upsert() on one line', (
     assert.deepEqual(rulesOf(hits), ['R2-auth'], text);
   }
   for (const text of ["await sb.from('t').delete().neq('id', 0);", "await sb.from('t').upsert(rows);"]) {
-    assert.deepEqual(flags([file('app/x.ts', { added: [text] })]), ['R1-destructive'], text);
+    assert.deepEqual(flags([file('app/x.ts', { added: [text] })]), ['R1-data-write'], text);
   }
   assert.deepEqual(flags([file('app/x.ts', { added: ['await cache.delete(key);', 'map.delete(k)', "await sb.from('t').select('*')"] })]), []);
 });
@@ -268,11 +268,12 @@ const pk = (over = {}) => ({ name: 'x', scripts: { dev: 'next dev', build: 'next
 const pkgHits = (base, head, extra = {}) => run([file('package.json')], { pkgPairs: [{ file: 'package.json', base, head }], ...extra });
 const pkgRules = (base, head) => rulesOf(pkgHits(base, head));
 
-test('6 package.json gate scripts: any change to a verify/build/install script is R4; unrelated scripts are not', () => {
-  for (const name of ['test', 'verify', 'lint', 'build', 'prepare', 'postinstall', 'preinstall', 'install', 'merge', 'e2e', 'coverage', 'vercel-build', 'pretest', 'test:unit', 'prepublishOnly', 'typecheck']) {
+test('6 package.json gate scripts: any change to a verify/build/install script is R4 (config if new and plain, pipeline if changed, removed or a lifecycle hook); unrelated scripts are not', () => {
+  for (const name of ['test', 'verify', 'lint', 'build', 'prepare', 'postinstall', 'preinstall', 'install', 'merge', 'e2e', 'coverage', 'vercel-build', 'pretest', 'test:unit', 'prepublishOnly', 'typecheck', 'lint:date-math', 'pretest:run', 'dependencies']) {
     const base = pk();
     const head = pk({ scripts: { ...base.scripts, [name]: 'echo ok' } });
-    assert.deepEqual(pkgRules(base, head), ['R4-pipeline'], `add ${name}`);
+    const existed = name in base.scripts;
+    assert.deepEqual(pkgRules(base, head), [existed || /^(?:pre|post)|^(?:install|dependencies)$/.test(name) ? 'R4-pipeline' : 'R4-config'], `add ${name}`);
   }
   assert.deepEqual(pkgRules(pk(), pk({ scripts: { dev: 'next dev -p 3001', build: 'next build', test: 'vitest run' } })), []);
   assert.deepEqual(pkgRules(pk(), pk({ scripts: { dev: 'next dev', build: 'next build', test: 'true' } })), ['R4-pipeline']);

@@ -261,6 +261,21 @@ test('comment needs-human: a P hardstops object lists only its blocking hits, ne
   assert.doesNotMatch(body, /R6-sensitive/);
 });
 
+test('comment needs-human: advisory hits are dropped from a bare array and from a {hits:[...]} object, whatever the format', () => {
+  const blocking = { rule: 'R1-destructive', file: 'supabase/migrations/1.sql' };
+  const advisory = { rule: 'R6-sensitive', file: 'lib/payroll/a.ts', advisory: true };
+  for (const [name, content] of [['array', [blocking, advisory]], ['hits object', { ok: false, hits: [blocking, advisory] }]]) {
+    const repo = stateRepo();
+    const hits = join(repo.dir, 'hits.json');
+    writeFileSync(hits, JSON.stringify(content));
+    const fake = commentWorld();
+    assertExit(cli(['comment', '--pr', '4', '--kind', 'needs-human', '--reason', 'drops a table', '--hits-file', hits], { repo, fake }), 0);
+    const body = JSON.parse(fake.calls().find((c) => c.argv.includes('POST')).stdin).body;
+    assert.match(body, /R1-destructive — supabase\/migrations\/1\.sql/, name);
+    assert.doesNotMatch(body, /R6-sensitive/, name);
+  }
+});
+
 test('comment awaiting-review: carries the reason', () => {
   const repo = repoWith();
   const fake = commentWorld();

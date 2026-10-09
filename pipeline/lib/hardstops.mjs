@@ -6,7 +6,7 @@
 // Rules: R0-unscannable | R1-destructive | R1-migration-edited | R2-auth | R2-auth-removed | R2-sql-removed |
 //        R2-sql-statement | R3-secrets | R4-pipeline | R4-config | R5-major-dep | R6-sensitive | P-path | P-pattern
 //        (R1-data-write: app code that deletes/upserts rows through a client; R4-pipeline: the guard core; R4-config: agent
-//        instructions, local verify script, hooks, lint/build config, package.json scripts)
+//        instructions, local git hooks, a newly added package.json script: nothing CI runs)
 //
 // Blocking vs report-only: every hit blocks by default. A project may downgrade the non-database rule families listed in
 // REPORT_ONLY_HARD_STOP_RULES (and paths in hard_stops.report_only_paths) to report-only: such a hit carries
@@ -148,15 +148,18 @@ const R3_PATH_GLOBS = [
   '**/*.p12', '**/*.pfx', '**/*.jks', '**/*.keystore', '**/id_rsa*', '**/id_ed25519*', '**/.npmrc', '**/.netrc',
   '**/credentials*.json', '**/*service-account*.json',
 ];
-// R4 is two rules. R4-pipeline is the GUARD CORE, the files that decide whether a label is needed or which checks CI runs
-// (workflows, .claude/, CODEOWNERS, the pipeline's own scripts and config, the test runners): it can never be report-only,
-// because one unattended edit there could switch the other rules off. R4-config is everything else that steers the build or
-// the agents (agent-instruction files, the local verify script, git hooks, lint/tsconfig/build config, package.json
-// scripts): a project may downgrade it to report-only. A path in both lists is R4-pipeline (core wins).
+// R4 is two rules. R4-pipeline is the GUARD CORE: anything that decides whether a label is needed or which checks CI runs
+// (workflows, .claude/, CODEOWNERS, the pipeline's own scripts and config, the test runners, and the scripts and config
+// those checks read: scripts/verify*, lint/tsconfig/build config, .gitattributes, package.json scripts that already existed).
+// It can never be report-only, because one unattended edit there could switch the other rules off. R4-config is only what
+// CI never runs: agent-instruction files, markdown under .github, local git hooks, and a NEW plain package.json script (not a lifecycle hook). A project
+// may downgrade it to report-only. A path in both lists is R4-pipeline (core wins).
 const R4_PIPELINE_GLOBS = [
   '**/.github/**', '**/.claude/**', '**/CODEOWNERS',
   // A submodule add repoints the checkout at code nobody reviewed here.
-  '**/.gitmodules', '**/scripts/pipeline/**', '**/pipeline.yml',
+  '**/.gitmodules', '**/scripts/pipeline/**', '**/pipeline.yml', '**/scripts/verify*', '**/scripts/verify*/**',
+  // What the CI check commands (test, typecheck, lint, build) read.
+  '**/eslint.config.*', '**/.eslintrc*', '**/tsconfig*.json', '**/next.config.*', '**/vite.config.*', '**/.gitattributes',
   // Test-runner configs: where a gate can be loosened.
   '**/vitest.config.*', '**/vitest.workspace.*', '**/vitest.setup.*', '**/jest.config.*', '**/jest.setup.*',
   '**/playwright*.config.*', '**/cypress.config.*', '**/.mocharc*', '**/.nycrc*', '**/codecov.y*ml',
@@ -167,8 +170,8 @@ const MARKDOWN_FILE = /\.(?:md|mdx|markdown)$/i;
 const R4_CONFIG_GLOBS = [
   // Agent-instruction files steer the agents that review and write code; a PR must not rewrite its own rules.
   '**/CLAUDE.md', '**/AGENTS.md', '**/.cursorrules',
-  '**/.githooks/**', '**/.husky/**', '**/lefthook*.y*ml', '**/.pre-commit-config.y*ml', '**/scripts/verify*', '**/scripts/verify*/**',
-  '**/eslint.config.*', '**/.eslintrc*', '**/tsconfig*.json', '**/next.config.*', '**/vite.config.*', '**/.gitattributes',
+  // Local git hooks: they run on a developer machine, never in CI.
+  '**/.githooks/**', '**/.husky/**', '**/lefthook*.y*ml', '**/.pre-commit-config.y*ml',
 ];
 const isR4Pipeline = (p) => (inc(p, R4_PIPELINE_GLOBS.filter((g) => !GITHUB_DIR_GLOBS.includes(g))) ||
   (inc(p, GITHUB_DIR_GLOBS) && !MARKDOWN_FILE.test(p)));
@@ -1008,6 +1011,9 @@ const sameJson = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? nul
 
 // package.json scripts that gate verification or run code at install/publish time, and config blocks that decide what
 // the gates check.
+// npm runs these implicitly: any pre<x>/post<x> around another script (pretest:run before `npm run test:run`) and the install-time
+// hooks. A NEW one therefore still executes inside an existing CI step, whatever its name.
+const LIFECYCLE_SCRIPT = /^(?:pre|post)|^(?:install|dependencies)$/i;
 const SCRIPT_NAME = /^(?:pre|post)?(?:test|verify|lint|typecheck|build|prepare|prepack|publish(?:Only)?|install|merge|e2e|coverage|vercel-build|ci|check)(?:[:.-].*)?$/i;
 const GATE_BLOCKS = ['husky', 'lint-staged', 'jest', 'nyc', 'vitest', 'c8', 'mocha', 'ava', 'eslintConfig', 'simple-git-hooks'];
 
@@ -1056,7 +1062,13 @@ function npmRules({ file, base, head }, sink) {
   }
 
   for (const name of new Set([...Object.keys(isObj(base.scripts) ? base.scripts : {}), ...Object.keys(isObj(head.scripts) ? head.scripts : {})])) {
-    if (SCRIPT_NAME.test(name) && base.scripts?.[name] !== head.scripts?.[name]) sink.add('R4-config', file, `package.json scripts.${name} changed`);
+    if (base.scripts?.[name] === head.scripts?.[name]) continue;
+    const addedHook = base.scripts?.[name] === undefined && LIFECYCLE_SCRIPT.test(name);
+    if (!SCRIPT_NAME.test(name) && !addedHook) continue;
+    // A plain script the base did not have is not run by any existing CI step; changing or removing one that existed, or adding
+    // an npm lifecycle hook (pretest:run, postinstall, prepare, ...), can loosen a gate.
+    if (base.scripts?.[name] === undefined && !addedHook) sink.add('R4-config', file, `package.json scripts.${name} added`);
+    else sink.add('R4-pipeline', file, `package.json scripts.${name} ${head.scripts?.[name] === undefined ? 'removed' : base.scripts?.[name] === undefined ? 'added (lifecycle hook)' : 'changed'}`);
   }
   for (const key of GATE_BLOCKS) {
     if (!sameJson(base[key], head[key])) sink.add('R4-pipeline', file, `package.json "${key}" changed`);
