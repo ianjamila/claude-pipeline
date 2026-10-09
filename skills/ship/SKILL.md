@@ -22,8 +22,10 @@ number, `R` a review round number, `<slug>` the branch slug.
    `pipeline-rollback` labels, never close pause/rollback issues. `awaiting-review` comes off only
    through `P review-complete` (Resume mode), never by hand. (Hooks also block these; don't try to
    route around them.) Always push with an explicit name: `git push -u origin agent/<slug>`.
-3. Hard-stops are decided by `P hardstops`, never by your judgment. A hit means the PR ends in
-   `needs-human`, however harmless it looks.
+3. Hard-stops are decided by `P hardstops`, never by your judgment. A BLOCKING hit (`blocking` array, i.e.
+   `ok: false`) means the PR ends in `needs-human`, however harmless it looks. Report-only hits (`advisory`
+   array: rules the project downgraded in `hard_stops.report_only_rules` / `report_only_paths`) never stop the
+   PR and never need `human-approved`; list them in the PR body.
 4. No cross-model review ⇒ no merge. Codex unavailable ⇒ `awaiting-review` and stop.
 5. **Never pass a `model` parameter when invoking `judge` or `arbiter`** — a per-call model
    overrides their pinned Opus/Fable (only exception: the proof switch in
@@ -99,7 +101,7 @@ comes from `P risk` on the real diff; the higher wins).
 
 1. `git push -u origin agent/<slug>`.
 2. Run the deterministic checks on the real diff (`mkdir -p .review` first). Save the hard-stop JSON to a
-   file (exit 1 means hits, which is expected):
+   file (exit 1 means blocking hits, which is expected; exit 0 with a non-empty `advisory` means report-only):
    `P risk --base origin/<default_branch> --head HEAD`,
    `P hardstops --base origin/<default_branch> --head HEAD > .review/hardstops.json`,
    `P integrity --base origin/<default_branch> --head HEAD`.
@@ -107,11 +109,11 @@ comes from `P risk` on the real diff; the higher wins).
    them gone, treat it like a hard-stop (`needs-human`: only the owner adds `test-change-approved`).
 3. `gh pr create` (add `--draft` if `ci.draft_while_iterating`) with the body from
    `reference/pr-and-summary.md`: what & why, verify summary (step table + head sha), tests added,
-   screenshots, risk level + reasons, hard-stop hits. It prints the PR URL; `N` is its number.
+   screenshots, risk level + reasons, hard-stop hits (blocking, and report-only under their own heading). It prints the PR URL; `N` is its number.
 4. UI change ⇒ now that the PR exists: `P artifacts push --pr N --dir .verify/screenshots`
    (pushes the images to the `pipeline-artifacts` branch, never your worktree; returns markdown
    image links), then update the PR body with them (`gh pr edit N --body-file <file>`).
-5. Hard-stop hits ⇒ `gh pr edit N --add-label needs-human` and post
+5. BLOCKING hard-stop hits (`blocking` non-empty; report-only hits alone do not count) ⇒ `gh pr edit N --add-label needs-human` and post
    `P comment --pr N --kind needs-human --reason "<one paragraph: why, what was verified, what the owner does>" --hits-file .review/hardstops.json`.
    Then still run the review loop (Step 4) so the owner gets a reviewed PR, but skip Steps 5–6
    (no merge). End with the summary (outcome `needs-human`).
@@ -141,8 +143,8 @@ review state exists yet), `P agent-log queue --line "<agentLogLine>"`, stop.
 Details and every exit code: `reference/gates-and-exits.md`.
 
 1. Recompute the checks on the head as it is NOW (review fixes may have moved risk): `P risk`,
-   `P hardstops … > .review/hardstops.json` and `P integrity`, as in Step 3.2. A new hard-stop
-   hit ⇒ Step 3.5. Then `P agent-log stage --pr N` (commits this run's log line + queued lines into
+   `P hardstops … > .review/hardstops.json` and `P integrity`, as in Step 3.2. A new blocking
+   hard-stop hit ⇒ Step 3.5. Then `P agent-log stage --pr N` (commits this run's log line + queued lines into
    the PR branch) and `git push origin agent/<slug>`.
 2. Up to date with the base — docs-only and light-lane PRs too, so the gate (and the CI it waits on)
    judges the tree that will land: `P job start update -- node ~/.claude/pipeline/bin/pipeline.mjs
@@ -232,7 +234,7 @@ read the issue, link it in the PR body (`Closes #123`).
 | Situation | Do |
 |---|---|
 | verify red after 3 fix cycles | draft PR + `pipeline-blocked`, `summary --outcome blocked`, stop |
-| hard-stop hit | review loop, then `needs-human`, stop |
+| blocking hard-stop hit | review loop, then `needs-human`, stop |
 | Codex unavailable / quota (`exitCode: 3`) | `awaiting-review`, `summary --outcome awaiting-review`, stop |
 | `P arbiter apply` proof fails | items → `needs-human` (the CLI marks them), stop after summary |
 | `triage validate` / `arbiter apply` exit 2 `not-found` | transcript not written yet: wait ~10 s, retry once, then `needs-human` |

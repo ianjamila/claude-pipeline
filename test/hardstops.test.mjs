@@ -344,12 +344,19 @@ test('R3 env names: a multi-line destructure cannot be checked, so it flags', ()
 
 test('R4 pipeline paths', () => {
   for (const p of [
-    '.githooks/pre-push', '.claude/settings.json', '.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS', 'scripts/verify', 'scripts/verify.mjs',
+    '.claude/settings.json', '.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS', '.github/workflows/ci.yml', '.github/dependabot.yml',
     'scripts/pipeline/ci-guard.mjs', 'x/pipeline.yml', 'apps/web/vitest.config.ts', 'vitest.workspace.ts', 'jest.config.js',
-    'playwright.config.ts', 'playwright.ci.config.ts', '.nycrc', '.nycrc.json', 'codecov.yml', 'codecov.yaml', '.husky/pre-commit',
-    'eslint.config.mjs', '.eslintrc.json', 'cypress.config.ts', 'vitest.setup.ts',
+    'playwright.config.ts', 'playwright.ci.config.ts', '.nycrc', '.nycrc.json', 'codecov.yml', 'codecov.yaml',
+    'cypress.config.ts', 'vitest.setup.ts', '.gitmodules', 'scripts/verify', 'scripts/verify.mjs', 'scripts/verify-sql-arms.mjs', 'eslint.config.mjs',
+    '.eslintrc.json', 'tsconfig.json',
   ]) {
-    assert.ok(rulesOf(run([file(p)])).includes('R4-pipeline'), p);
+    assert.deepEqual(rulesOf(run([file(p)])), ['R4-pipeline'], p);
+  }
+  // The rest of the old R4 list is R4-config (report-only eligible), never nothing.
+  for (const p of [
+    '.githooks/pre-push', '.husky/pre-commit', 'CLAUDE.md', '.github/copilot-instructions.md',
+  ]) {
+    assert.deepEqual(rulesOf(run([file(p)])), ['R4-config'], p);
   }
   assert.deepEqual(rulesOf(run([file('src/app.ts')])), []);
 });
@@ -649,7 +656,7 @@ test('IO: an unparseable package.json at head is flagged rather than silently sk
   repo.write('package.json', '{ "dependencies": { "a": "2.0.0", }');
   repo.commit('break');
   const hits = await collectHardStops({ base: 'main', head: 'feat', cwd: repo.dir, config: cfg() });
-  assert.deepEqual(rulesOf(hits), ['R5-major-dep']);
+  assert.deepEqual(rulesOf(hits), ['R0-unscannable']); // fail-closed: stays blocking even when R5-major-dep is report-only
   assert.match(hits[0].detail, /could not be parsed/);
 });
 

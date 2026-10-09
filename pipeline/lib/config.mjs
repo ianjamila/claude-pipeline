@@ -32,7 +32,7 @@ export const DEFAULTS = deepFreeze({
   production: null,
   smoke_checks: [],
   risk: { high_risk_paths: [], medium_lines: 150, high_lines: 600, medium_files: 10 },
-  hard_stops: { paths: [], patterns: [], auth_calls: [] },
+  hard_stops: { paths: [], patterns: [], auth_calls: [], disable_rules: [], report_only_rules: [], report_only_paths: [] },
   integrity: {
     test_globs: [
       '**/*.test.*', '**/*.spec.*', '**/__tests__/**', '**/test/**', '**/tests/**', 'e2e/**', 'supabase/tests/**',
@@ -73,7 +73,7 @@ const KEYS = {
   production: ['url', 'provider', 'environment', 'smoke', 'deploy_timeout_minutes', 'rollback'],
   rollback: ['command', 'notes'],
   risk: ['high_risk_paths', 'medium_lines', 'high_lines', 'medium_files'],
-  hard_stops: ['paths', 'patterns', 'auth_calls'],
+  hard_stops: ['paths', 'patterns', 'auth_calls', 'disable_rules', 'report_only_rules', 'report_only_paths'],
   pattern: ['name', 'regex', 'paths'],
   integrity: ['test_globs'],
   review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines'],
@@ -160,6 +160,67 @@ function checkProduction(p, errors) {
   else if (!PROVIDERS.includes(p.provider)) errors.push(`production.provider must be one of ${PROVIDERS.join('|')}`);
   if (p.deploy_timeout_minutes === undefined) p.deploy_timeout_minutes = 20;
   else if (!inRange(p.deploy_timeout_minutes, 1, 120)) errors.push('production.deploy_timeout_minutes must be an integer 1..120');
+}
+
+// Built-in hard-stop rule families a project may switch off with hard_stops.disable_rules. Deliberately ONE: R6, whose
+// only triggers are a sensitive-data WORD in a path or an added line, which a domain can make routine (an HR/payroll app
+// mentions payroll everywhere). Before adding a rule here, read every sink.add of it in hardstops.mjs: R5-major-dep is
+// NOT eligible although its name says "major version" — it also carries every overrides/resolutions change (a supply-
+// chain lever), engines.node, and the fail-closed "package.json could not be parsed; dependency changes unchecked".
+// Migrations, destructive SQL, auth paths and removed guards, secrets, pipeline files, dependencies and unscannable
+// input stay on for every project; naming one of them is a config error, not a silent no-op.
+export const DISABLEABLE_HARD_STOP_RULES = Object.freeze(['R6-sensitive']);
+
+function checkDisableRules(rules, errors) {
+  if (rules === undefined) return;
+  if (!Array.isArray(rules)) return errors.push('hard_stops.disable_rules must be an array');
+  rules.forEach((r, i) => {
+    if (!DISABLEABLE_HARD_STOP_RULES.includes(r)) {
+      errors.push(`hard_stops.disable_rules[${i}]: ${JSON.stringify(r)} cannot be disabled (allowed: ${DISABLEABLE_HARD_STOP_RULES.join(', ')})`);
+    }
+  });
+}
+
+// Built-in hard-stop rule families a project may downgrade to REPORT-ONLY with hard_stops.report_only_rules: the hit is
+// still found and listed (job summary, CLI output, PR body) but it never blocks merge and never needs `human-approved`.
+// Owner decision 2026-10-09: the label is for DATABASE changes only, so every rule that is not a database rule may be
+// downgraded, with one exception: the guard core. NOT eligible, each for a stated reason:
+//   R0-unscannable      content nobody could read (a binary, an unparseable lockfile or package.json) vouches for nothing
+//   R1-destructive, R1-migration-edited, R2-sql-removed, R2-sql-statement
+//                       the database rules the label exists for (R1-destructive covers raw destructive SQL, SQL in code,
+//                       deleted/moved migrations)
+//   R4-pipeline         the GUARD CORE: anything that decides whether a label is needed or which checks CI runs (workflows,
+//                       .claude/, CODEOWNERS, scripts/pipeline, pipeline.yml, test-runner configs, scripts/verify*, lint /
+//                       tsconfig / build config, changed or removed package.json scripts, gitlinks, symlinks, deleted pgTAP
+//                       tests, package.json gate blocks): one unattended edit there could otherwise turn the database rules
+//                       report-only too, so it must stay blocking
+//   P-path              a project path rule has its own switch, hard_stops.report_only_paths
+// Eligible by owner decision 2026-10-09:
+//   R1-data-write       APPLICATION code that deletes or overwrites rows through a client (.from(...).delete/upsert) is
+//                       routine feature code; the same call in a script (scripts/, bin/, tools/, ops/, jobs/ ...) writes
+//                       production directly and stays R1-destructive, as does raw destructive SQL. Auth/RLS/grant SQL inside
+//                       code is R2-sql-statement (blocking), never R2-auth
+//   R4-config           what CI never runs: CLAUDE.md and other agent-instruction files, markdown under .github, local git
+//                       hooks (.githooks, .husky; pre-commit / lefthook configs are core: CI often runs them), a newly
+//                       ADDED plain package.json script (a new lifecycle script like pretest/postinstall/publish/pack/version
+//                       runs implicitly, and every packageManager change is core, so those stay R4-pipeline)
+// R5-major-dep IS eligible; its fail-closed "package.json could not be parsed" hit is emitted as R0-unscannable so it
+// stays blocking. A rule named here that is outside the list is a config error, not a silent no-op, and classifyHardStops
+// re-checks it (fail closed).
+export const REPORT_ONLY_HARD_STOP_RULES = Object.freeze([
+  'R1-data-write', 'R2-auth', 'R2-auth-removed', 'R3-secrets', 'R4-config', 'R5-major-dep', 'R6-sensitive', 'P-pattern',
+]);
+
+function checkReportOnlyRules(rules, disabled, errors) {
+  if (rules === undefined) return;
+  if (!Array.isArray(rules)) return errors.push('hard_stops.report_only_rules must be an array');
+  rules.forEach((r, i) => {
+    if (!REPORT_ONLY_HARD_STOP_RULES.includes(r)) {
+      errors.push(`hard_stops.report_only_rules[${i}]: ${JSON.stringify(r)} cannot be report-only (allowed: ${REPORT_ONLY_HARD_STOP_RULES.join(', ')})`);
+    } else if (Array.isArray(disabled) && disabled.includes(r)) {
+      errors.push(`hard_stops.report_only_rules[${i}]: ${JSON.stringify(r)} is also in hard_stops.disable_rules (pick one)`);
+    }
+  });
 }
 
 function checkPatterns(patterns, errors) {
@@ -277,6 +338,9 @@ export function validateConfig(obj) {
     checkStrArray(hardStops.paths, 'hard_stops.paths', errors);
     checkStrArray(hardStops.auth_calls, 'hard_stops.auth_calls', errors);
     checkPatterns(hardStops.patterns, errors);
+    checkDisableRules(hardStops.disable_rules, errors);
+    checkStrArray(hardStops.report_only_paths, 'hard_stops.report_only_paths', errors);
+    checkReportOnlyRules(hardStops.report_only_rules, hardStops.disable_rules, errors);
   }
 
   const integrity = section(config, 'integrity', errors);

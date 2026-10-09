@@ -46,7 +46,7 @@ async function setup(change, projectOpts) {
 // artifacts: artifact names of a run by id; by default a run carries what a genuine run would have uploaded for the receipts that point at it
 // (the approver being the actor of the label's latest labeling event), or a bare success/success verdict when none does.
 // statusReply: what GitHub answers to a status POST (the receipt's created_at is read from it).
-const GOOD_RUN = { path: '.github/workflows/pipeline-guards.yml@refs/heads/main', event: 'pull_request_target', head_sha: 'a'.repeat(40), run_attempt: 1, created_at: T('10:00'), updated_at: T('10:12') };
+const GOOD_RUN = { path: '.github/workflows/pipeline-guards.yml@refs/heads/main', event: 'pull_request_target', run_attempt: 1, created_at: T('10:00'), updated_at: T('10:12') };
 function defaultArtifacts(id, head, receipts, events) {
   const url = `https://github.example/acme/app/actions/runs/${id}`;
   const mine = receipts.filter((r) => r.url === url).map((r) => r.context.replace('pipeline-approval: ', ''));
@@ -64,7 +64,7 @@ function script({ head, pullHeads = [head], labels = [], labelSeq, suites = [T('
     { match: `^api repos/${REPO}/issues/${PR}/labels --paginate`, sequence: (labelSeq ?? [labels]).map((l) => ({ stdout: lines(l) })) },
     { match: `^api repos/${REPO}/commits/${head}/check-suites`, stdout: lines(suites) },
     { match: `^api repos/${REPO}/commits/${head}/statuses`, stdout: lines(receipts.map((r) => JSON.stringify(r))) },
-    ...Object.entries({ 1: GOOD_RUN, ...runs }).map(([id, run]) => ({ match: `^api repos/${REPO}/actions/runs/${id} `, stdout: `${JSON.stringify({ ...GOOD_RUN, pull_requests: [{ number: PR, head: { sha: head }, base: { ref: 'main', sha: 'a'.repeat(40) } }], ...run })}\n` })),
+    ...Object.entries({ 1: GOOD_RUN, ...runs }).map(([id, run]) => ({ match: `^api repos/${REPO}/actions/runs/${id} `, stdout: `${JSON.stringify({ ...GOOD_RUN, head_sha: head, pull_requests: [{ number: PR, head: { sha: head }, base: { ref: 'main', sha: 'a'.repeat(40) } }], ...run, ...(typeof run.pull_requests === 'function' ? { pull_requests: run.pull_requests(head) } : {}) })}\n` })),
     ...Object.keys({ 1: GOOD_RUN, ...runs }).map((id) => ({ match: `^api repos/${REPO}/actions/runs/${id}/artifacts\\?per_page=100 `, stdout: lines(artifacts[id] ?? defaultArtifacts(id, head, receipts, events)) })),
     { match: `^api repos/${REPO} --jq \\.default_branch`, stdout: 'main\n' },
     { match: `^api repos/${REPO}/compare/[0-9a-f]{40}\\.\\.\\.main `, stdout: `${compare}\n` },
@@ -162,6 +162,17 @@ test('a migration DROP fails the Hard-stop scan only', async () => {
   assert.match(r.byContext('Hard-stop scan').description, /^2 hard-stops: R1-destructive supabase\/migrations\//);
   assert.equal(r.json.ok, false);
   assert.match(r.md, /Override: owner adds label `human-approved`/);
+});
+
+test('report-only hard-stops publish success without any label, and the description and summary say so', async () => {
+  const cfgYml = CONFIG(undefined, 'hard_stops:\n  report_only_paths: ["src/legacy/**"]\n');
+  const s = await setup((repo) => repo.write('src/legacy/a.js', 'export const a = 2;\n'), { config: cfgYml });
+  const r = await exec(s);
+  assert.equal(r.byContext('Hard-stop scan').state, 'success');
+  assert.equal(r.byContext('Hard-stop scan').description, 'No blocking hard-stops (1 report-only)');
+  assert.match(r.md, /### Report-only \(no label needed\): 1/);
+  assert.equal(r.json.ok, true);
+  assert.equal(r.api('/events').length, 0, 'no approval label involved');
 });
 
 test('a deleted test fails Test integrity only', async () => {
@@ -387,7 +398,18 @@ test('pipeline-guards.yml re-evaluates a PR whose base changed (edited), but ign
   assert.match(yml, /group: pipeline-guards-\$\{\{ github\.event\.pull_request\.number \}\}\$\{\{ github\.event\.action == 'edited' && !github\.event\.changes\.base && '-noop' \|\| '' \}\}/);
   // The orchestrator takes the base from the event payload, which after a retarget holds the NEW base.
   assert.match(yml, /BASE_SHA: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
-  assert.match(yml, /ref: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
+  // The checkout is the commit this workflow file came from (the base branch tip), never the lazily refreshed
+  // base.sha, which can predate the guard scripts.
+  assert.match(yml, /ref: \$\{\{ github\.sha \}\}/);
+  assert.doesNotMatch(yml, /ref: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
+  // …and the event base, where the diff starts, is fetched by sha when the tip checkout lacks it (force-pushed base),
+  // after the sha is checked to be 40 hex characters, and before anything runs the guards.
+  const ensure = yml.indexOf('- name: Make sure the event base commit is present');
+  assert.ok(ensure > yml.indexOf('ref: ${{ github.sha }}'), 'base-fetch step after the checkout');
+  assert.ok(ensure < yml.indexOf('run: node scripts/pipeline/ci-guards-run.mjs'), 'base-fetch step before the guards run');
+  assert.match(yml, /\*\[!0-9a-f\]\* \| ""\) echo "::error::BASE_SHA is not a commit sha"; exit 1 ;;/);
+  assert.match(yml, /\[ "\$\{#BASE_SHA\}" -eq 40 \]/);
+  assert.match(yml, /git cat-file -e "\$\{BASE_SHA\}\^\{commit\}" 2>\/dev\/null \|\| git fetch --no-tags origin "\$BASE_SHA"/);
 });
 
 test('pipeline-guards.yml hands the labeling event to the job through env only, and runs on a supported Node', () => {
@@ -585,8 +607,28 @@ test('provenance: a receipt from a run triggered by pull_request (or anything bu
   for (const event of ['pull_request', 'push', 'workflow_dispatch', 'schedule']) ignoredAsNoReceipt(await approve({ runs: { 1: { event } } }));
 });
 
-test('provenance: a run whose workflow came from a commit NOT on the default branch is ignored', async () => {
-  // The attack: branch x carries an edited pipeline-guards.yml; a PR into x runs it and posts bot receipts on the shared head.
+test('provenance: GitHub records a pull_request_target run under the PR head, and that run is accepted', async () => {
+  // Measured on EagleWatch 2026-10-09: run.head_sha = the PR's head commit, head_branch = the PR's branch. The old rule
+  // (head_sha must be on the default branch) rejected every genuine run.
+  const r = await approve();
+  assert.equal(r.byContext('Hard-stop scan').state, 'success');
+});
+
+test('provenance: a run that judged another head, or is also about a PR into another branch, is ignored', async () => {
+  // The attack: branch x carries an edited pipeline-guards.yml; a PR into x with the same head runs it and posts bot
+  // receipts on the shared head. GitHub lists every OPEN PR matching the head in the run's pull_requests.
+  const other = await approve({ runs: { 1: { head_sha: 'f'.repeat(40) } } });
+  ignoredAsNoReceipt(other);
+  assert.match(other.stderr, /the run judged fffffff, not/);
+  const r = await approve({ runs: { 1: { pull_requests: (head) => [
+    { number: PR, head: { sha: head }, base: { ref: 'main' } },
+    { number: PR + 1, head: { sha: head }, base: { ref: 'x' } },
+  ] } } });
+  ignoredAsNoReceipt(r);
+  assert.match(r.stderr, /also about PR #8 into x/);
+});
+
+test('provenance: a run whose PR base is NOT on the default branch is ignored', async () => {
   for (const compare of ['diverged', 'behind', '', 'weird']) ignoredAsNoReceipt(await approve({ compare }));
   const r = await approve({ compare: 'diverged' });
   assert.match(r.stderr, /not on the default branch \(diverged\)/);

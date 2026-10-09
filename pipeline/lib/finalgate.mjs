@@ -12,7 +12,7 @@ import { join, resolve } from 'node:path';
 import { gh as ghRun } from './proc.mjs';
 import { checkGuardVerdict, GUARD_CONTEXT_CHECKS } from './guard-provenance.mjs';
 import { GUARD_CHECKS } from './config.mjs';
-import { collectHardStops } from './hardstops.mjs';
+import { blockingHits, collectHardStops } from './hardstops.mjs';
 import { checkIntegrity } from './integrity.mjs';
 import { runPreflight } from './preflight.mjs';
 import { findDeployment } from './deploy.mjs';
@@ -294,8 +294,13 @@ async function hardstopsCheck({ root, config, diff }) {
   if (!d.ok) return check('hardstops', false, `could not diff against the base: ${d.error}`);
   const hits = await collectHardStops({ base: d.mb, head: 'HEAD', cwd: root, config });
   if (hits.length === 0) return check('hardstops', true, 'no hard-stops');
-  const shown = hits.slice(0, 5).map((h) => `${h.rule} ${h.file ?? ''}`.trim()).join('; ');
-  return check('hardstops', false, `${hits.length} hard-stop hit(s): ${shown}${hits.length > 5 ? '; ...' : ''}`);
+  // Report-only (advisory) hits are listed, never failing: only blocking hits stop the merge.
+  const blocking = blockingHits(hits);
+  const advisoryCount = hits.length - blocking.length;
+  if (blocking.length === 0) return check('hardstops', true, `no blocking hard-stops (${advisoryCount} report-only)`);
+  const shown = blocking.slice(0, 5).map((h) => `${h.rule} ${h.file ?? ''}`.trim()).join('; ');
+  const note = advisoryCount > 0 ? ` (+${advisoryCount} report-only)` : '';
+  return check('hardstops', false, `${blocking.length} hard-stop hit(s): ${shown}${blocking.length > 5 ? '; ...' : ''}${note}`);
 }
 
 function integrityCheck({ config, diff }) {

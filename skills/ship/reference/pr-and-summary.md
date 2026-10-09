@@ -20,7 +20,8 @@
 
 ## Risk
 **<low|medium|high>** — <reasons from P risk>. Light lane: <yes|no>.
-Hard-stops: <none | list of rule + file>
+Hard-stops: <none | list of blocking rule + file>
+Report-only hard-stops (no label needed): <none | list of rule + file, from `advisory` in `P hardstops`>
 
 <proof switches used, if any — see proof-switches.md>
 
@@ -42,8 +43,9 @@ rules + files, or unresolved review items, or model-proof failure), what was ver
 and exactly what the owner should do: review, then add `human-approved` and merge (`npm run merge
 -- <N>` or the project's merge command) — or close. For a hard-stop, save the `P hardstops` output
 first (`P hardstops --base origin/<default_branch> --head HEAD > .review/hardstops.json`, after
-`mkdir -p .review`; exit 1 just means hits) and pass it as `--hits-file .review/hardstops.json` (a JSON
-array, or the `{hits}` object itself); leave `--hits-file` out when there are no hits.
+`mkdir -p .review`; exit 1 just means blocking hits) and pass it as `--hits-file .review/hardstops.json` (a JSON
+array, or the `P hardstops` object itself: its `blocking` list is used); leave `--hits-file` out when there are no blocking hits.
+Report-only hits never make a needs-human note; they go in the PR body.
 
 ## Summary comment (Step 7)
 

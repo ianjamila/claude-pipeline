@@ -69,13 +69,27 @@ jobs:
               -f description="evaluating" -f target_url="$RUN_URL" > /dev/null
           done
 
+      # Check out github.sha — for pull_request_target the tip of the PR's base branch, the very commit THIS file was read
+      # from — not pull_request.base.sha. GitHub refreshes base.sha lazily: a PR opened before the guards landed kept a
+      # base without scripts/pipeline/, so every run died with "Cannot find module ci-guards-run.mjs" (EagleWatch, the day
+      # the guards merged). The diff still starts at BASE_SHA, which the full-history checkout contains.
       - name: Check out base branch (trusted code only)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           # Needed to fetch refs/pull/N/head below. Safe: no PR code ever runs in this job.
           persist-credentials: true
+
+      # The diff starts at BASE_SHA (the event's base), which the tip checkout above usually contains. Not after a force-push
+      # of the base branch: the old base is then on no branch, so fetch it by sha (only a 40-hex sha is accepted).
+      - name: Make sure the event base commit is present
+        run: |
+          case "$BASE_SHA" in
+            *[!0-9a-f]* | "") echo "::error::BASE_SHA is not a commit sha"; exit 1 ;;
+          esac
+          [ "${#BASE_SHA}" -eq 40 ] || { echo "::error::BASE_SHA is not a full commit sha"; exit 1; }
+          git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null || git fetch --no-tags origin "$BASE_SHA"
 
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0

@@ -149,6 +149,31 @@ test('checkRunProvenance: a bound PR entry without a full base sha fails closed'
   }
 });
 
+test('checkRunProvenance: the run must have judged THIS head (pull_request_target records the PR head as head_sha)', () => {
+  for (const head_sha of ['e'.repeat(40), '', null, 'E'.repeat(39)]) {
+    const r = prov({ run: { head_sha } });
+    assert.equal(r.ok, false, String(head_sha));
+  }
+  assert.match(prov({ run: { head_sha: 'e'.repeat(40) } }).reason, /the run judged eeeeeee, not /);
+  assert.match(prov({ run: { head_sha: '' } }).reason, /the run has no head_sha/);
+  assert.equal(prov({ run: { head_sha: HEAD.toUpperCase() } }).ok, true);
+});
+
+test('checkRunProvenance: a run that also lists a PR into another branch (same head) is refused: that PR may have triggered it', () => {
+  const pull_requests = [
+    { number: 7, head: { sha: HEAD }, base: { ref: 'main', sha: 'b'.repeat(40) } },
+    { number: 8, head: { sha: HEAD }, base: { ref: 'side', sha: 'c'.repeat(40) } },
+  ];
+  for (const order of [pull_requests, [...pull_requests].reverse()]) {
+    const r = prov({ run: { pull_requests: order } });
+    assert.equal(r.ok, false);
+    assert.match(r.reason, /also about PR #8 into side/);
+  }
+  const noRef = prov({ run: { pull_requests: [pull_requests[0], { number: 9, head: { sha: HEAD }, base: {} }] } });
+  assert.equal(noRef.ok, false);
+  assert.match(noRef.reason, /also about PR #9 into \(unknown\)/);
+});
+
 test('checkRunProvenance: the base.sha comes from the BOUND entry, not another PR the run lists', () => {
   const off = 'd'.repeat(40);
   const r = provSha({ prs: [
@@ -234,7 +259,7 @@ test('the run and artifact jq filters work on GitHub-shaped payloads', { skip: !
     pull_requests: [{ number: 7, id: 99, url: 'x', head: { sha: HEAD, ref: 'f', repo: { id: 1 } }, base: { ref: 'main', sha: 'c'.repeat(40), repo: { id: 1 } } }],
   };
   assert.deepEqual(JSON.parse(jq(filters.run, payload)), {
-    path: payload.path, event: 'pull_request_target', run_attempt: 2, created_at: T('10:00:00'), updated_at: T('10:12:00'),
+    path: payload.path, event: 'pull_request_target', head_sha: HEAD, run_attempt: 2, created_at: T('10:00:00'), updated_at: T('10:12:00'),
     pull_requests: [{ number: 7, head: { sha: HEAD }, base: { ref: 'main', sha: 'c'.repeat(40) } }],
   });
   const listing = { total_count: 2, artifacts: [{ id: 1, name: name('success', 'failure'), expired: false }, { id: 2, name: 'verify-report', expired: false }] };

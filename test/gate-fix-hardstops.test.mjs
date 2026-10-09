@@ -46,9 +46,9 @@ test('1 a configured test glob still exempts a plain test directory but not a se
 
 // ---- 6. agent-instruction files are pipeline files ----------------------------------------------------------------
 
-test('6 edits to CLAUDE.md / AGENTS.md / .cursorrules / copilot-instructions are R4 hard-stops at any depth', () => {
+test('6 edits to CLAUDE.md / AGENTS.md / .cursorrules / copilot-instructions are R4-config hits at any depth', () => {
   for (const p of ['CLAUDE.md', 'AGENTS.md', 'sub/dir/CLAUDE.md', 'pkg/AGENTS.md', '.cursorrules', 'a/.cursorrules', '.github/copilot-instructions.md']) {
-    assert.ok(rulesOf(run([file(p, { added: ['be nice'] })])).includes('R4-pipeline'), p);
+    assert.ok(rulesOf(run([file(p, { added: ['be nice'] })])).includes('R4-config'), p);
   }
 });
 

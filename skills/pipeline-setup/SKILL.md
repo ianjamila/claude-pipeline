@@ -73,7 +73,12 @@ organization, otherwise every approval fails closed with `org-repo-needs-ci.appr
 the logins); preview (environment name in GitHub
 deployments + smoke command); production (URL, provider, read-only smoke, rollback command (documentation only: prod-watch runs
 `vercel rollback <known-good> --yes --timeout 3m` itself for provider `vercel`) + notes); `smoke_checks` (GET-only, unauthenticated); `risk.high_risk_paths`; `hard_stops.paths` /
-`patterns` / `auth_calls` (project extras on top of the universal list); review settings.
+`patterns` / `auth_calls` (project extras on top of the universal list); `hard_stops.disable_rules: [R6-sensitive]` only when
+sensitive-data words are routine for the domain (an HR/payroll/medical app; nothing else can be switched off — ask the owner
+first); `hard_stops.report_only_rules` / `report_only_paths` downgrade non-database rules to report-only (listed, never blocking, no
+`human-approved` needed; allowed: `R1-data-write` (app `.from().delete/upsert`), `R2-auth`, `R2-auth-removed`, `R3-secrets`, `R4-config`
+(CLAUDE.md / AGENTS.md, markdown under `.github`, local git hooks, a new plain package.json script), `R5-major-dep`, `R6-sensitive`,
+`P-pattern`; database rules, raw destructive SQL and `R4-pipeline` (the guard core) always block) — ask the owner which; review settings.
 Validate: `P config` (it prints `warnings`: read them, e.g. a missing guard context).
 
 ### d. CI + branch protection
