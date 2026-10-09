@@ -1144,22 +1144,32 @@ function judgeScriptText(text, sf, abs, dir, ctx, opts) {
 // content that only exists at run time (curl -o, a program's output, a missing script after a command we do not model) is judged like a
 // script named at run time: refused when the line refers to a protected pipeline file or switch.
 function judgeWrittenScript(w, sf, abs, dir, ctx, opts, scanRaw) {
+  // a source or a text judged clean once here is not judged again for the next script it may reach (a write whose target is only known at run time reaches every
+  // script on the line, and the scripts it was copied from are the same files each time)
+  const done = (ctx.budget.writtenOk ??= new Set());
+  const once = (key, judge) => {
+    const k = `${sf.kind}\u0000${dir}\u0000${opts._depth ?? 0}\u0000${key}`;
+    if (done.has(k)) return null;
+    const r = judge();
+    if (!r) done.add(k);
+    return r;
+  };
   for (const text of w.texts) {
     for (const v of new Set([text, substVars(text, ctx.vars, ctx.budget)])) {
-      const r = judgeScriptText(v, sf, abs, dir, ctx, opts);
+      const r = once(`T${v}`, () => judgeScriptText(v, sf, abs, dir, ctx, opts));
       if (r) return r;
     }
   }
   for (const [list, kind] of [[w.files, sf.kind], [w.scans, 'scan']]) {
     for (const file of list) {
-      const r = judgeScriptFile({ kind, file, candidate: true, noWrites: true }, [dir], ctx, opts, scanRaw);
+      const r = once(`F${kind}\u0000${file}`, () => judgeScriptFile({ kind, file, candidate: true, noWrites: true }, [dir], ctx, opts, scanRaw));
       if (r) return r;
     }
   }
   // the whole text several writes build together (appends, cat A B): no piece holds what the file runs
   for (const text of w.joined) {
     for (const v of new Set([text, substVars(text, ctx.vars, ctx.budget)])) {
-      const r = judgeScriptText(v, sf, abs, dir, ctx, opts);
+      const r = once(`T${v}`, () => judgeScriptText(v, sf, abs, dir, ctx, opts));
       if (r) return r;
     }
   }

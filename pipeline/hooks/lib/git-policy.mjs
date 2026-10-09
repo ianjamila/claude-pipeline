@@ -1007,22 +1007,33 @@ function lineHoldsGuardedCommand(ctx) {
 }
 
 function judgeWrittenScript(w, sf, abs, dir, ctx, level) {
+  // a source or a text judged clean once in this state is not judged again for the next script it may reach (a write whose target is only known at run time
+  // reaches every script on the line, and the scripts it was copied from are the same files each time)
+  const state = stateFingerprint(ctx, dir, level);
+  const done = (ctx.budget.writtenOk ??= new Set());
+  const once = (key, judge) => {
+    const k = `${sf.kind}\u0000${key}\u0000${state}`;
+    if (done.has(k)) return null;
+    const r = judge();
+    if (!r) done.add(k);
+    return r;
+  };
   for (const t of w.texts) {
     for (const v of new Set([t, expandVars(t, ctx)])) {
-      const r = judgeScriptText(v, sf, abs, dir, ctx, level);
+      const r = once(`T${v}`, () => judgeScriptText(v, sf, abs, dir, ctx, level));
       if (r) return r;
     }
   }
   for (const [list, kind] of [[w.files, sf.kind], [w.scans, 'scan']]) {
     for (const file of list) {
-      const r = checkScriptFile({ kind, file, candidate: true, sourced: sf.sourced, noWrites: true }, dir, ctx, level);
+      const r = once(`F${kind}\u0000${file}`, () => checkScriptFile({ kind, file, candidate: true, sourced: sf.sourced, noWrites: true }, dir, ctx, level));
       if (r) return r;
     }
   }
   // the whole text several writes build together (appends, cat A B): no piece holds what the file runs
   for (const text of w.joined) {
     for (const v of new Set([text, expandVars(text, ctx)])) {
-      const r = judgeScriptText(v, sf, abs, dir, ctx, level);
+      const r = once(`T${v}`, () => judgeScriptText(v, sf, abs, dir, ctx, level));
       if (r) return r;
     }
   }
