@@ -616,7 +616,9 @@ test('G5: many brackets in one segment stay cheap and fail closed', () => {
   denyBoth(`bash ${seg}.sh`, { [`${'x'.repeat(30)}.sh`]: 'bad' }); // matched through the 30 "one char" readings
   allowBoth(`bash ${seg}.sh`, { 'zz.sh': 'ok', [`${'x'.repeat(31)}.sh`]: 'ok' });
   const names = Object.fromEntries(Array.from({ length: 200 }, (_, i) => [`${'a'.repeat(40)}${i}.sh`, 'ok']));
-  allowBoth(`bash ${'[a]*]'.repeat(30)}z.sh`, names);
+  // (the work cap may refuse this one; what matters is that it is quick and never throws)
+  const r = both(`bash ${'[a]*]'.repeat(30)}z.sh`, names);
+  assert.ok(['allow', 'deny'].includes(r.git.decision) && ['allow', 'deny'].includes(r.files.decision));
   assert.ok(Date.now() - t0 < 3000, `took ${Date.now() - t0} ms`);
 });
 
@@ -640,4 +642,33 @@ test('G6: a quoted or escaped $ / backtick in a file name is also tried as a lit
   assert.equal(files('bash "$X"; cat ~/.claude/settings.json').decision, 'deny');
   // a literal name that is a directory is skipped like any candidate
   allowBoth("bash 'x$d'", { 'x$d/inner.sh': 'bad' }, { dirs: ['x$d'] });
+});
+
+// ---- round 6: the glob matcher has a work cap (a hook that times out or throws lets the command through) ----------------
+
+test('G7: a huge or pathological glob segment is refused quickly, and a directory read that throws is refused', () => {
+  const names = Object.fromEntries(Array.from({ length: 50 }, (_, i) => [`${'a'.repeat(200)}${i}.sh`, 'ok']));
+  const time = (fn) => { const t0 = Date.now(); const r = fn(); return { r, ms: Date.now() - t0 }; };
+  const cmds = [
+    `bash ${'[a]*'.repeat(1250)}.sh`, // 5,000 characters: longer than any real segment
+    `bash ${'*'.repeat(5000)}.sh`,
+    `bash ${'[]'.repeat(2500)}.sh`,
+    `bash ${'*a'.repeat(120)}b.sh`, // short enough to scan, but backtracking over 50 long names blows the step cap
+  ];
+  for (const c of cmds) {
+    const { r, ms } = time(() => both(c, names));
+    assert.equal(r.git.decision, 'deny', `git: ${c.slice(0, 30)}`);
+    assert.equal(r.files.decision, 'deny', `files: ${c.slice(0, 30)}`);
+    assert.ok(ms < 1500, `${c.slice(0, 30)} took ${ms} ms`);
+  }
+  // an ordinary segment is untouched by the caps
+  allowBoth('bash a*b?.sh', { 'ok.sh': 'ok' });
+  denyBoth('bash a*b?.sh', { 'axxb1.sh': 'bad' });
+  // a directory read that throws: refuse, never let the exception reach the hook
+  const boom = { readDir: () => { throw new Error('EIO'); } };
+  for (const c of ['bash *.sh', 'bash sub/*.sh', 'bash $X *.sh']) {
+    const r = both(c, { 'ok.sh': 'ok' }, { gitOpts: boom, filesOpts: boom });
+    assert.equal(r.git.decision, 'deny', `git: ${c}`);
+    assert.equal(r.files.decision, 'deny', `files: ${c}`);
+  }
 });

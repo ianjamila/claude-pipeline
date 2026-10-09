@@ -13,6 +13,8 @@ export const MAX_CANDIDATES = 32; // more words than this are refused, not judge
 // nesting level; a hook that runs out of time is allowed through, so the guard must give up first and deny).
 export const MAX_CANDIDATE_JUDGMENTS = 64;
 const MAX_GLOB_WORK = 5000; // directory entries looked at across one command
+const MAX_GLOB_STEPS = 200_000; // matcher steps across one command (a name against a segment backtracks)
+const MAX_SEGMENT = 256; // a longer glob segment is refused
 const GLOB_CHARS = /[*?[]/;
 // Syntax we do not resolve: ksh/zsh operators in a glob (`*(a|b)`, `<1-3>`), POSIX classes (`[[:alpha:]]`), and zsh
 // extendedglob operators (`^`, `#`, a non-leading `~` that is not `~1`/trailing/`=~`) even without a glob character.
@@ -31,11 +33,12 @@ export const defaultReadDir = (dir) => {
 // dropped the quoting, so `[q\\]x]` and `[q"]"x]` reach us as `[q]x]` and which `]` closes is unknowable (POSIX closes the
 // first one after a leading `]`/`!`/`^`). Every reading can only match more names, never fewer. Memoised on (segment
 // index, name index), so many brackets cost polynomial time, not exponential.
-function segmentMatches(seg, name) {
+function segmentMatches(seg, name, budget) {
   const s = seg.toLowerCase();
   const n = name.toLowerCase();
   const dead = new Set();
   const m = (i, j) => {
+    if (budget.over || ++budget.steps > MAX_GLOB_STEPS) { budget.over = true; return false; }
     if (i === s.length) return j === n.length;
     const key = i * (n.length + 1) + j;
     if (dead.has(key)) return false;
@@ -65,14 +68,14 @@ function globMatches(pattern, dir, readDir, joinPath, budget) {
     if (i === segs.length) { out.push(pre); return; }
     const seg = segs[i];
     if (seg === '') { walk(i + 1, pre); return; }
-    if (seg.includes('**')) { budget.over = true; return; }
+    if (seg.includes('**') || seg.length > MAX_SEGMENT) { budget.over = true; return; }
     if (!GLOB_CHARS.test(seg)) { walk(i + 1, add(pre, seg)); return; }
     const names = readDir(joinPath(dir, pre === '' ? '.' : pre));
     if (names === null) return; // not a directory (or nothing the shell could list): nothing matches
     if (!Array.isArray(names)) { budget.over = true; return; } // could not be listed: refuse
     for (const n of names) {
       if (++budget.work > MAX_GLOB_WORK) { budget.over = true; return; }
-      if (segmentMatches(seg, n)) walk(i + 1, add(pre, n));
+      if (segmentMatches(seg, n, budget)) walk(i + 1, add(pre, n));
     }
   };
   walk(0, abs ? '/' : '');
@@ -88,9 +91,14 @@ function globMatches(pattern, dir, readDir, joinPath, budget) {
 // Returns { files, dynamic, over }: the candidate paths to judge; whether a word still holds `$` or a backtick (so
 // the script is only known at run time); whether there were too many candidates (or a glob too big, or syntax we do not
 // resolve) to judge.
-export function scriptCandidates(sf, { expand, dirs, joinPath, readDir, ifs }) {
+export function scriptCandidates(sf, deps) {
+  // an exception (a directory read that throws, a stack overflow) must not reach the hook: a hook that throws lets the command through
+  try { return buildCandidates(sf, deps); } catch { return { files: [], dynamic: false, over: true }; }
+}
+
+function buildCandidates(sf, { expand, dirs, joinPath, readDir, ifs }) {
   const files = new Set();
-  const budget = { work: 0, over: false };
+  const budget = { work: 0, steps: 0, over: false };
   let dynamic = false;
   if (sf.unresolvable) return { files: [], dynamic, over: true };
   const ifsUnknown = typeof ifs === 'string' && /[$`]/.test(ifs);
