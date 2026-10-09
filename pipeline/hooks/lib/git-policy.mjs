@@ -12,11 +12,12 @@
 // Residual (documented): label approval is protected against accidental and casual misuse, not an agent that writes
 // its own API client or script; aliases defined in git/gh config files, push.default=matching, remote.*.push set in
 // config files, and checkouts that happen inside scripts are not seen.
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, startupFilesOf } from './shell-parse.mjs';
 import { catchAllReason, guardedCommandText } from './guarded-text.mjs';
+import { newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow } from './line-writes.mjs';
 import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
 
 const PROTECTED_BRANCHES = ['main', 'master'];
@@ -118,7 +119,8 @@ function expandVars(text, ctx) {
 }
 
 // Everything a script judged here can depend on: the directory, the nesting level and the line's variable / branch / config / alias state.
-const stateFingerprint = (ctx, dir, level) => JSON.stringify([dir, level, ctx.vars, [...ctx.unsureVars], [...ctx.tainted], [...ctx.branches], ctx.cfgDirty, ctx.envCfgDirty, ctx.gitAliases, ctx.ghAliases, [...ctx.aliasUnsure]]);
+// (and the writes of the line that count for the command: a script the line wrote is judged on what was written)
+const stateFingerprint = (ctx, dir, level) => JSON.stringify([dir, level, ctx.vars, [...ctx.unsureVars], [...ctx.tainted], [...ctx.branches], ctx.cfgDirty, ctx.envCfgDirty, ctx.gitAliases, ctx.ghAliases, [...ctx.aliasUnsure], writeSignature(ctx.writeFrames)]);
 
 // What the policy's own tracking knows about variable `n` for a use the command's prefix does not override: its value, and
 // `$n` when it is unsure or tainted (the callers read that as "run-time value").
@@ -784,6 +786,43 @@ function jobStartCommands(argv, ctx) {
   return [...new Set([cmd.map(shellQuote).join(' '), cmd.join(' ')])].filter((s) => s.trim());
 }
 
+// Every directory a command list may run in: where it starts and each cd / pushd target (chained ones too), like files-policy's collectDirs.
+function cdTargets(cmds, startDir, ctx) {
+  const dirs = [startDir];
+  for (const c of cmds) {
+    const nm = c.argv.length ? baseName(c.argv[0]) : '';
+    if (nm !== 'cd' && nm !== 'pushd') continue;
+    const t = c.argv.slice(1).find((a) => !a.startsWith('-'));
+    const e = t === undefined ? '~' : expandVars(t, ctx).replace(/^\$\{?HOME\}?(?=\/|$)/, ctx.home);
+    if (DYNAMIC.test(e) || e === '-') continue;
+    const target = e === '~' || e.startsWith('~/') ? ctx.home + e.slice(1) : e;
+    for (const d of [...dirs]) {
+      const nd = path.resolve(d, target);
+      if (!dirs.includes(nd) && dirs.length < 32) dirs.push(nd);
+    }
+  }
+  return dirs;
+}
+
+// Where `p` really is: the realpath of its longest existing prefix (symlinks followed) with the missing tail kept; null when the OS refuses
+// (a loop, no permission), which the write model reads as "cannot tell".
+function realLocation(realpath, p) {
+  let cur = p;
+  const tail = [];
+  for (let i = 0; i < 256; i++) {
+    try {
+      return path.join(realpath(cur), ...tail.slice().reverse());
+    } catch (e) {
+      if (!['ENOENT', 'ENOTDIR'].includes(e?.code)) return null;
+      const parent = path.dirname(cur);
+      if (parent === cur) return p;
+      tail.push(path.basename(cur));
+      cur = parent;
+    }
+  }
+  return null;
+}
+
 // ---- script files and strings the parser cannot unwrap ----------------------------------------------------
 
 const SHEBANG_PROGRAM = /^#!\s*(?:\S*\/)?(?:env\s+(?:-\S+\s+)*)?(\S+)/;
@@ -813,6 +852,15 @@ function checkScriptFile(sf, dir, ctx, level) {
   if (dir === null && sf.kind !== 'scan' && !path.isAbsolute(home)) return deny(`cannot tell which directory this runs in, so which ${sf.file} runs cannot be verified. Use an absolute path, or chain the cd with &&.`);
   const abs = path.resolve(dir ?? ctx.cwd, home);
   checkDeadline(ctx.budget);
+  // a script the line itself wrote (or may have written) before this command is judged on every content it may hold, as well as on the file as it is now
+  if (!sf.noWrites) {
+    const w = writtenTo(ctx.writeFrames, abs, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: sf.startup === true || ctx.ignoreUnmodelled === true });
+    if (w) {
+      if (w.viaUnmodelled) ctx.budget.unmodelledSeen = (ctx.budget.unmodelledSeen ?? 0) + 1;
+      const v = judgeWrittenScript(w, sf, abs, dir, ctx, level);
+      if (v) return v;
+    }
+  }
   const text = ctx.readText(abs);
   if (typeof text !== 'string') {
     if (sf.candidate && ctx.readDir(abs)) return null; // a shell cannot run a directory
@@ -825,6 +873,11 @@ function checkScriptFile(sf, dir, ctx, level) {
     }
     return null; // missing: nothing will run
   }
+  return judgeScriptText(text, sf, abs, dir, ctx, level);
+}
+
+// The text of a script file (as read, or as the line writes it), judged by what kind of file it is.
+function judgeScriptText(text, sf, abs, dir, ctx, level) {
   countScript(ctx.budget); // every script read and judged counts, named or candidate: the work multiplies with each level
   // text a command rewrites on its way to a shell (sed, awk, base64 ...) is computed at run time: a file holding a guarded word is refused
   if (sf.kind === 'scan') return GUARDED_WORDS.test(text) ? deny(`${sf.file} is read by a command that feeds a shell, and mentions a guarded operation, so what the shell runs cannot be verified. Write the command out literally.`) : null;
@@ -921,6 +974,39 @@ function isolatedState(ctx, fn) {
   }
 }
 
+// Why: an earlier command on the line wrote (or may have written) the script about to be judged (cp f.sh n.sh; bash n.sh): judge each content it may
+// hold. Static text and the files copied / catted into it are judged like the script; a file a rewriting command computes it from is scanned for
+// guarded words; content that only exists at run time (curl -o, a program's output, a missing script after a command we do not model) is
+// judged like a script named at run time: refused when the line mentions a guarded operation.
+function judgeWrittenScript(w, sf, abs, dir, ctx, level) {
+  for (const t of w.texts) {
+    for (const v of new Set([t, expandVars(t, ctx)])) {
+      const r = judgeScriptText(v, sf, abs, dir, ctx, level);
+      if (r) return r;
+    }
+  }
+  for (const [list, kind] of [[w.files, sf.kind], [w.scans, 'scan']]) {
+    for (const file of list) {
+      const r = checkScriptFile({ kind, file, candidate: true, sourced: sf.sourced, noWrites: true }, dir, ctx, level);
+      if (r) return r;
+    }
+  }
+  // the whole text several writes build together (appends, cat A B): no piece holds what the file runs
+  for (const text of w.joined) {
+    for (const v of new Set([text, expandVars(text, ctx)])) {
+      const r = judgeScriptText(v, sf, abs, dir, ctx, level);
+      if (r) return r;
+    }
+  }
+  if (w.pieces) return deny(`the script ${sf.file} is built from pieces at run time (several writes on the line put its text together, and one of them cannot be read), so what it runs cannot be verified. Write the file out in one piece.`);
+  // (inside a startup file's judgment fullText is the dotfile's text: the line itself counts too)
+  if (w.unknown && (GUARDED_WORDS.test(ctx.fullText) || GUARDED_WORDS.test(ctx.lineText))) {
+    return deny(`the script ${sf.file} may have been written by an earlier command on the line (its content is only known at run time) and the line mentions a guarded operation, so what it runs cannot be verified. Write the file out literally.`);
+  }
+  return null;
+}
+
+// (Inside it a missing file is not "something the line may have created": that verdict does not depend on the line; the line's own WRITES still count.)
 // Why: the real home's startup files (~/.bash_profile, ~/.zshenv ...) are not named by any word of the line, and what they run does not
 // depend on it. They are judged as an evaluation of their own (the line's variable state, but the guarded words of the FILE's text,
 // not of the line, decide whether a run-time name in it is refused) and the verdict is kept for the whole evaluation, so a line with
@@ -933,9 +1019,9 @@ function implicitStartupVerdict(st, ctx, cmd, dir) {
   for (const [k, v] of Object.entries({ ...ctx.vars, ...Object.fromEntries(Object.entries(cmd?.env ?? {}).map(([k, w]) => [k, expandVars(w, ctx)])) })) {
     if (DYNAMIC.test(v)) { delete vars[k]; unsure.add(k); } else { vars[k] = v; unsure.delete(k); }
   }
-  const rec = { kind: 'shell', file: st.file };
+  const rec = { kind: 'shell', file: st.file, startup: true };
   const fresh = {
-    ...ctx, fullText: '', vars, unsureVars: unsure, tainted: new Set(ctx.tainted), aliasUnsure: new Set(ctx.aliasUnsure),
+    ...ctx, ignoreUnmodelled: true, fullText: '', vars, unsureVars: unsure, tainted: new Set(ctx.tainted), aliasUnsure: new Set(ctx.aliasUnsure),
     gitAliases: { ...ctx.gitAliases }, ghAliases: { ...ctx.ghAliases }, branches: new Map(ctx.branches),
   };
   // the shell starts where the command runs (`cd sub && NVM_DIR=d bash -l`); an unknown directory (null) makes a relative name in the file unknowable
@@ -951,13 +1037,20 @@ function implicitStartupVerdict(st, ctx, cmd, dir) {
     for (const n of r.unsure) ctx.aliasUnsure.add(n);
     return r.verdict;
   };
-  if (memo.has(key)) return carry(memo.get(key));
-  const pending = { verdict: null, branches: new Map(), cfgDirty: false, git: {}, gh: {}, unsure: [] };
+  // a verdict that leaned on "a missing script may have been created by a command we do not model" is reused only while that is as true as it was
+  const flag = unmodelledBefore(ctx.writeFrames);
+  const known = memo.get(key);
+  if (known && (!known.sens || known.flag === flag)) return carry(known);
+  const seen0 = ctx.budget.unmodelledSeen ?? 0;
+  const pending = { verdict: null, branches: new Map(), cfgDirty: false, git: {}, gh: {}, unsure: [], sens: false, flag };
   memo.set(key, pending); // marked first: a startup file that starts shells itself finds this entry, not itself again
   const text = ctx.readText(path.resolve(ctx.home, st.file.replace(/^~\/?/, '')));
   fresh.fullText = typeof text === 'string' ? text : '';
   const v = checkScriptFile(rec, dir, fresh, 0);
-  const done = { verdict: v, branches: new Map(fresh.branches), cfgDirty: fresh.cfgDirty, git: { ...fresh.gitAliases }, gh: { ...fresh.ghAliases }, unsure: [...fresh.aliasUnsure] };
+  const done = {
+    verdict: v, branches: new Map(fresh.branches), cfgDirty: fresh.cfgDirty, git: { ...fresh.gitAliases }, gh: { ...fresh.ghAliases }, unsure: [...fresh.aliasUnsure],
+    sens: (ctx.budget.unmodelledSeen ?? 0) !== seen0, flag,
+  };
   memo.set(key, done);
   return carry(done);
 }
@@ -1040,7 +1133,14 @@ function checkCandidateScripts(sf, dir, ctx, level) {
     const v = judgeScoped(line, dir, ctx, level, { kind: 'shell' });
     if (v.decision === 'deny') return deny(`the command line ${sf.words[0]} expands to would run a blocked command: ${v.reason}`);
   }
-  const c = scriptCandidates(sf, { expand, dirs: [here], joinPath: (d, r) => path.resolve(d, r), readDir: ctx.readDir, ifs: ctx.vars.IFS });
+  // a file the line writes before this command is among the names a glob matches (cp f.sh n.sh; bash n*.sh)
+  const readDir = (d) => {
+    const r = ctx.readDir(d);
+    if (!Array.isArray(r)) return r;
+    const extra = writtenNamesIn(ctx.writeFrames, d);
+    return extra.length ? [...r, ...extra] : r;
+  };
+  const c = scriptCandidates(sf, { expand, dirs: [here], joinPath: (d, r) => path.resolve(d, r), readDir, ifs: ctx.vars.IFS });
   if (c.over) return deny('too many words, a glob matching too many files, or glob syntax that cannot be resolved could be the script this command runs, so it cannot be verified. Name the script file.');
   if (c.dynamic && GUARDED_WORDS.test(ctx.fullText)) {
     return deny('which word is the script this command runs is only known at run time ($VAR / $(...) / a glob) and the line mentions a guarded operation, so it cannot be verified. Name the file and write the options literally.');
@@ -1054,18 +1154,7 @@ function checkCandidateScripts(sf, dir, ctx, level) {
 
 // ---- entry point ----------------------------------------------------------------------------------------
 
-// The parser drops compound-command keywords but leaves them at the start of the command's raw text (`while ! gh …`,
-// `do sleep 30`, `then git push`); `for` / `case` / `select` stay as the command name.
-const FLOW_START = /^\s*(?:if|then|elif|else|while|until|for|do|case|select)(?=[\s;&|(){]|$)/;
-// Index of the first command that may run conditionally or repeatedly because of control flow; every command from
-// there on is treated that way (conservative after the loop / if ends). -1: none. 0: the whole line: a ( subshell, which
-// the parser reports (it reads quotes, escapes, $'…' and heredocs like a shell, so prose such as `-m "fix (again)"` does
-// not count), or a parse cut short, where a subshell may have gone unseen.
-function flowStart(cmds) {
-  if (cmds.subshell || cmds.truncated) return 0;
-  return cmds.findIndex((c) => FLOW_START.test(c.raw ?? '') || ['for', 'case', 'select'].includes(c.argv[0]));
-}
-const inFlow = (from, i) => from >= 0 && i >= from;
+// (flowStart / inFlow: the first command that may run conditionally or repeatedly, see line-writes.mjs)
 
 // A command followed by | or & ran in a subshell (a pipeline stage / background job): what it assigned or changed is lost.
 const ranInSubshell = (cmds, i) => cmds[i]?.sep === '|' || cmds[i + 1]?.sep === '|' || cmds[i + 1]?.sep === '&';
@@ -1198,6 +1287,27 @@ function evalString(str, startDir, ctx, level) {
   const forgetState = () => { dir = null; for (const e of ctx.branches.values()) e.name = null; };
   // sticky: a later `cd /abs` does not make it known again (`alias cd=true; cd /safe`, a DEBUG trap that cds back)
   const hazard = FUNCTION_DEF.test(str) || cmds.some(isStateHazard);
+  // the files this command list writes, for every script judged while it runs (see line-writes.mjs); `dirAt`: where each command runs
+  const dirAt = new Map();
+  const cdDirs = cdTargets(cmds, startDir, ctx);
+  const frame = newWriteFrame(cmds, {
+    expand: (w) => {
+      let e = expandVars(w, ctx).replace(/^\$\{?HOME\}?(?=\/|$)/, ctx.home);
+      if (e === '~' || e.startsWith('~/')) e = ctx.home + e.slice(1);
+      return /[$`*?[{]/.test(e) || e.startsWith('~') ? null : e; // ({a,b}: zsh writes both for a redirect, and the parser leaves the word of one unexpanded)
+    },
+    // (a command that has not run yet could be in any directory the line cds to: every one of them, and the bare word)
+    locate: (e, idx) => {
+      if (path.isAbsolute(e)) return [path.resolve(e)];
+      if (!dirAt.has(idx)) return [...cdDirs.map((d) => path.resolve(d, e)), e];
+      const d = dirAt.get(idx);
+      return d ? [path.resolve(d, e)] : [e];
+    },
+    isAbs: path.isAbsolute, p: path, ci: process.platform === 'win32' || process.platform === 'darwin',
+    real: (q) => realLocation(ctx.realpath, q),
+  });
+  ctx.writeFrames.push(frame);
+  try {
   for (const [i, c] of cmds.entries()) {
     checkDeadline(ctx.budget); // a lookup (branch, labels) can take seconds; the evaluation as a whole may not
     const argv = c.argv;
@@ -1215,6 +1325,8 @@ function evalString(str, startDir, ctx, level) {
       const orExits = cmds[i + 1]?.sep === '||' && ['exit', 'return'].includes(cmds[i + 1].argv[0]) && cmds[i + 2]?.sep !== '|' && cmds[i + 2]?.sep !== '&';
       if (changesState && (inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) || (cmds[i + 1]?.sep === '||' && !orExits))) uncertain = true;
     }
+    frame.i = i;
+    dirAt.set(i, dir);
     if (!argv.length) { recordVars(c.env, ctx, level); continue; } // a bare `NAME=value`
     const name = baseName(argv[0]);
     let verdict = null;
@@ -1252,8 +1364,9 @@ function evalString(str, startDir, ctx, level) {
         }
         // the shell sees the command's own prefix variables (`F=f.sh BASH_ENV=rc bash -c :` where rc sources "$F")
         verdict = withPrefixEnv(c, ctx, () => {
-          // a clean verdict is reused only in the very same state (it depends on the variables, branches and config the line has set so far), never for a run-time name
-          const key = st.ambiguous ? null : `${st.file}\u0000${stateFingerprint(ctx, dir, level)}`;
+          // a clean verdict is reused only in the very same state (it depends on the variables, branches and config the line has set so far, and on
+          // what the line may have written), never for a run-time name
+          const key = st.ambiguous ? null : `${st.file}\u0000${unmodelledBefore(ctx.writeFrames)}\u0000${stateFingerprint(ctx, dir, level)}`;
           if (key !== null) {
             if (ctx.budget.startupOk.has(key)) return null;
             ctx.budget.startupOk.add(key); // marked first, so a startup file that starts shells itself is not judged again and again (a denial ends the evaluation)
@@ -1289,6 +1402,12 @@ function evalString(str, startDir, ctx, level) {
     }
   }
   return allowed();
+  } finally {
+    // what the list wrote is still true for the commands after the one that ran it
+    const done = ctx.writeFrames.pop();
+    const caller = ctx.writeFrames[ctx.writeFrames.length - 1];
+    if (caller && done) caller.recs.push(...exportRecords(done, caller.i));
+  }
 }
 
 // Text too long to parse inside the time budget is judged by what it mentions once quotes and escapes are removed.
@@ -1306,6 +1425,7 @@ export function evaluateGitCommand(command, {
   readHead = defaultReadHead,
   pathExists = existsSync,
   readDir = defaultReadDir,
+  realpath = realpathSync.native, // symlinks followed when a write and a script are compared (tests fake it)
   now = Date.now, // injectable clock (tests)
   env = {}, // the hook process's environment (BASH_ENV / ENV / ZDOTDIR name startup files the shells run); {} keeps tests hermetic
 } = {}) {
@@ -1313,9 +1433,9 @@ export function evaluateGitCommand(command, {
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   const base = cwd || process.cwd();
   const ctx = {
-    cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, readDir, readHead, env, budget: newEvalBudget(now), fullText: text,
+    cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, readDir, readHead, realpath, env, budget: newEvalBudget(now), fullText: text, lineText: text,
     vars: Object.create(null), unsureVars: new Set(), tainted: new Set(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
-    branches: new Map(), cfgDirty: false, envCfgDirty: false,
+    branches: new Map(), cfgDirty: false, envCfgDirty: false, writeFrames: [],
   };
   // Why: a hook that throws or times out is allowed by Claude Code, so a limit hit (GuardLimit) and ANY other exception (a
   // readText that throws, a stack overflow) end here as a denial that names the cause.

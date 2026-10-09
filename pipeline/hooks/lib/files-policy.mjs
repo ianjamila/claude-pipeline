@@ -19,6 +19,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
 import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf } from './shell-parse.mjs';
+import { newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets } from './line-writes.mjs';
 import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
 
 const posix = path.posix;
@@ -174,6 +175,8 @@ function makeCtx(opts) {
     dynamic: false, // set when a scan had to be skipped for size; callers fail closed
     readText: opts.readText ?? defaultReadText,
     readHead: opts.readHead ?? defaultReadHead, // the first bytes of a file readText refused (over the cap)
+    ignoreUnmodelled: opts._ignoreUnmodelled === true, // inside a real-home startup file's judgment: see judgeStartupFile
+    frames: opts._frames ?? [], // the files each command list being evaluated writes (see line-writes.mjs), outermost first
     budget: opts._budget ?? newEvalBudget(opts.now), // script reads, deadline and expansion allowance of this evaluation (shared with nested calls)
     readDir: opts.readDir ?? defaultReadDir,
     admin: (opts.env ?? process.env).PIPELINE_ADMIN === '1',
@@ -650,9 +653,9 @@ const inPlaceFlag = (a) => /^-[A-Za-z]*i/.test(a) || a === '--in-place' || a.sta
 const positional = (args) => args.filter((a) => !a.startsWith('-') && !/^\d+$/.test(a));
 
 // A sed script with a `w FILE` / `W FILE` command or flag, or an `e` command or flag, writes or runs something.
-const SED_UNSAFE = /(?:^|[;{}\s\d$/])[wWe](?:\s|$)|\/[gpiIm0-9]*[we](?=\s|$|;|\})/;
+// (a space after w / W / e is not needed: GNU sed takes `wfile`; the program may be attached to an option: -e'...', --expression=...; -f FILE is a script we do not read)
 function sedReadOnly(args) {
-  return !args.some((a) => (a.startsWith('-') ? inPlaceFlag(a) || a === '-f' || a === '--file' || a.startsWith('--file=') : SED_UNSAFE.test(a)));
+  return !args.some((a) => a.startsWith('-') && inPlaceFlag(a)) && !sedArgsUnsafe(args);
 }
 
 function awkReadOnly(args) {
@@ -1023,8 +1026,18 @@ function judgeScriptFile(sf, dirs, ctx, opts, scanRaw = '', keepBackslash = fals
   const seen = new Set();
   for (const d of isAbs(e) ? [''] : dirs) {
     const abs = isAbs(e) ? posix.normalize(e) : posix.join(d, e);
-    if (seen.has(abs) || !ctx.api.existsSync(abs)) continue;
+    if (seen.has(abs)) continue;
     seen.add(abs);
+    // a script the line itself wrote (or may have written) before this command is judged on every content it may hold, as well as on the file as it is now
+    if (!sf.noWrites) {
+      const w = writtenTo(ctx.frames, abs, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: sf.startup === true || ctx.ignoreUnmodelled });
+      if (w) {
+        if (w.viaUnmodelled) ctx.budget.unmodelledSeen = (ctx.budget.unmodelledSeen ?? 0) + 1;
+        const r = judgeWrittenScript(w, sf, abs, d || ctx.cwd, ctx, opts, scanRaw);
+        if (r) return r;
+      }
+    }
+    if (!ctx.api.existsSync(abs)) continue;
     const v = judgeFoundScript(sf, abs, d || ctx.cwd, ctx, opts);
     if (v) return v;
   }
@@ -1097,6 +1110,11 @@ function judgeFoundScript(sf, abs, dir, ctx, opts) {
     }
     return null;
   }
+  return judgeScriptText(text, sf, abs, dir, ctx, opts);
+}
+
+// The text of a script file (as read, or as the line writes it), judged by what kind of file it is.
+function judgeScriptText(text, sf, abs, dir, ctx, opts) {
   countScript(ctx.budget); // every script read and judged counts, named or candidate: the work multiplies with each level
   if (sf.kind === 'scan') {
     // text a command rewrites on its way to a shell (sed, awk, base64 ...) is computed at run time: a file that names a protected file or switch is refused
@@ -1121,6 +1139,37 @@ function judgeFoundScript(sf, abs, dir, ctx, opts) {
   return null;
 }
 
+// Why: an earlier command on the line wrote (or may have written) the script about to be judged (cp f.sh n.sh; bash n.sh): judge each content it may
+// hold. Static text and the files copied / catted into it are judged like the script; a file a rewriting command computes it from is scanned;
+// content that only exists at run time (curl -o, a program's output, a missing script after a command we do not model) is judged like a
+// script named at run time: refused when the line refers to a protected pipeline file or switch.
+function judgeWrittenScript(w, sf, abs, dir, ctx, opts, scanRaw) {
+  for (const text of w.texts) {
+    for (const v of new Set([text, substVars(text, ctx.vars, ctx.budget)])) {
+      const r = judgeScriptText(v, sf, abs, dir, ctx, opts);
+      if (r) return r;
+    }
+  }
+  for (const [list, kind] of [[w.files, sf.kind], [w.scans, 'scan']]) {
+    for (const file of list) {
+      const r = judgeScriptFile({ kind, file, candidate: true, noWrites: true }, [dir], ctx, opts, scanRaw);
+      if (r) return r;
+    }
+  }
+  // the whole text several writes build together (appends, cat A B): no piece holds what the file runs
+  for (const text of w.joined) {
+    for (const v of new Set([text, substVars(text, ctx.vars, ctx.budget)])) {
+      const r = judgeScriptText(v, sf, abs, dir, ctx, opts);
+      if (r) return r;
+    }
+  }
+  if (w.pieces) return deny(`the script ${sf.file} is built from pieces at run time (several writes on the line put its text together, and one of them cannot be read), so what it runs cannot be checked; write the file out in one piece`);
+  if (w.unknown && (makeMatchers(ctx).rawHit(scanRaw, [dir]) || SENSITIVE_WORDS.test(scanRaw))) {
+    return deny(`the script ${sf.file} may have been written by an earlier command on the line (its content is only known at run time) and the line refers to a protected pipeline file or switch, so what it runs cannot be checked; write the file out literally`);
+  }
+  return null;
+}
+
 // A word before the script expands at run time (`X=+n; bash $X w.sh`, `bash $(..) w.sh`, `source $X`, `bash *.sh`), so which
 // word the shell runs is unknown. Judge every word that could be it (see script-candidates.mjs) like a named script. A
 // word that is still unknown (`$UNSET`) cannot be judged: the textual rules still apply, and the line is denied when it
@@ -1136,10 +1185,17 @@ function judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw) {
       if (r.decision === 'deny') return deny(`the command line ${sf.words[0]} expands to would run: ${r.reason}`);
     }
   }
-  let c = scriptCandidates(sf, { expand: (w) => expandRefs(w, ctx), dirs, joinPath, readDir: ctx.readDir, ifs: ctx.vars.IFS });
+  // a file the line writes before this command is among the names a glob matches (cp f.sh n.sh; bash n*.sh)
+  const readDir = (d) => {
+    const r = ctx.readDir(d);
+    if (!Array.isArray(r)) return r;
+    const extra = writtenNamesIn(ctx.frames, d);
+    return extra.length ? [...r, ...extra] : r;
+  };
+  let c = scriptCandidates(sf, { expand: (w) => expandRefs(w, ctx), dirs, joinPath, readDir, ifs: ctx.vars.IFS });
   // a backslash in a word is a file name character off Windows, but expandRefs reads it as a separator: expand (and glob) that reading too
   if (!c.over && !sf.unresolvable && sf.words.some((w) => mayHoldBackslash(w, ctx))) {
-    const k = scriptCandidates(sf, { expand: (w) => expandKeepingBackslash(w, ctx), dirs, joinPath, readDir: ctx.readDir, ifs: ctx.vars.IFS });
+    const k = scriptCandidates(sf, { expand: (w) => expandKeepingBackslash(w, ctx), dirs, joinPath, readDir, ifs: ctx.vars.IFS });
     c = { files: [...new Set([...c.files, ...k.files])], dynamic: c.dynamic || k.dynamic, over: k.over };
   }
   if (c.over) return deny('too many words, a glob matching too many files, or glob syntax that cannot be resolved could be the script this command runs, so it cannot be checked; name the script file');
@@ -1231,6 +1287,19 @@ function linkReachesProtected(cmds, dirs, ctx) {
 
 export const evaluateBashForFiles = failClosed(evaluateBashForFilesUnchecked);
 function evaluateBashForFilesUnchecked(command, opts = {}) {
+  if (!opts._frames) opts = { ...opts, _frames: [] }; // the writes of this line and of the scripts it runs (shared with nested calls, popped on the way out)
+  const depth = opts._frames.length;
+  try {
+    return evaluateBashForFilesFrame(command, opts);
+  } finally {
+    // what the list wrote is still true for the commands after the one that ran it
+    const done = opts._frames[depth];
+    const caller = depth > 0 ? opts._frames[depth - 1] : null;
+    if (caller && done) caller.recs.push(...exportRecords(done, caller.i));
+    opts._frames.length = depth;
+  }
+}
+function evaluateBashForFilesFrame(command, opts) {
   if (!opts._budget) opts = { ...opts, _budget: newEvalBudget(opts.now) }; // one budget for this evaluation and every script it reads
   checkDeadline(opts._budget);
   const ctx = makeCtx(opts);
@@ -1269,6 +1338,16 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
   // a name held in a variable (N=PIPELINE_ADMIN; env $N=1 claude)
   if (Object.keys(ctx.vars).length && setsAdmin(substVars(flat, ctx.vars, ctx.budget), ctx.platform)) return deny('the command sets PIPELINE_ADMIN through a variable; only the owner may set it, when launching Claude Code');
   const dirs = collectDirs(cmds, ctx);
+  const frame = newWriteFrame(cmds, {
+    expand: (w) => {
+      const e = expandRefs(w, ctx);
+      return /[$`*?[{]/.test(e) || (e.startsWith('~') && !isAbs(e)) ? null : e;
+    },
+    locate: (e, idx) => (isAbs(e) ? [posix.normalize(e)] : dirs.map((d) => posix.join(d, e))),
+    isAbs, p: posix, ci: ctx.ci,
+    real: (q) => realResolve(q, ctx.api),
+  });
+  ctx.frames.push(frame);
   // BASH_ENV / ENV / ZDOTDIR / HOME values this line (and the scripts that run it) assign: shells started by the scripts it runs see them
   const startupEnv = opts.env ?? process.env;
   const inheritedStartup = (n) => opts._startup?.[n] ?? [];
@@ -1304,15 +1383,22 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
     // line's text nor its directories, only on the variables the line has set (seeded below; one whose value is unknown refuses a script it picks)
     if (st.implicit) {
       const unknown = Object.keys(ctx.vars).filter((k) => /[$`]/.test(ctx.vars[k])).sort();
-      const key = `${st.file}\u0000${JSON.stringify([ctx.vars, ctx.keptVars ?? {}, unknown, dirs])}`;
+      const key = `${st.file}\u0000${JSON.stringify([ctx.vars, ctx.keptVars ?? {}, unknown, dirs, writeSignature(ctx.frames)])}`;
       const memo = (ctx.budget.implicitStartup ??= new Map());
-      if (memo.has(key)) return memo.get(key);
-      memo.set(key, null);
-      const seed = { ...opts, _depth: 0, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set(unknown) };
+      // a verdict that leaned on "a missing script may have been created by a command we do not model" is reused only while that is as true as it was
+      const flag = unmodelledBefore(ctx.frames);
+      const known = memo.get(key);
+      if (known && (!known.sens || known.flag === flag)) return known.v;
+      const seen0 = ctx.budget.unmodelledSeen ?? 0;
+      memo.set(key, { v: null, sens: false, flag });
+      const seed = { ...opts, _ignoreUnmodelled: true, _depth: 0, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set(unknown) };
       let v = null;
       const abs = expandRefs(st.file, ctx);
       const text = isAbs(abs) ? ctx.readText(abs) : null;
-      if (typeof text === 'string') {
+      // the line may have written the file itself (echo ... > ~/.zshenv; zsh -c :)
+      const w = isAbs(abs) ? writtenTo(ctx.frames, abs, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: true }) : null;
+      if (w) v = judgeWrittenScript(w, { kind: 'shell', file: st.file, startup: true }, abs, ctx.cwd, ctx, seed, scanRaw); // (the line's text decides the run-time rule, not the startup file's)
+      if (v) { /* denied above */ } else if (typeof text === 'string') {
         // the shell starts in the directory the command runs in (the cwd or any `cd` target): the file's relative names resolve there
         countScript(ctx.budget);
         for (const d of dirs) {
@@ -1320,13 +1406,13 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
           if (r.decision === 'deny') { v = deny(`the script ${st.file} would run: ${r.reason}`); break; }
         }
       } else v = judgeScriptFile({ kind: 'shell', file: st.file }, dirs, ctx, seed, '');
-      memo.set(key, v);
+      memo.set(key, { v, sens: (ctx.budget.unmodelledSeen ?? 0) !== seen0, flag });
       return v;
     }
     // reused only for the same file, directories and nesting depth, never for a run-time name (its verdict depends on the line's text)
     // (the shell sees the variables the line gave it, its own prefix included: `F=f.sh BASH_ENV=rc bash -c :` where rc sources "$F")
     if (st.ambiguous) return judgeScriptFile(st, dirs, ctx, withLineVars(opts), scanRaw);
-    const key = `${dirs.join('\u0000')}\u0000${opts._depth ?? 0}\u0000${st.file}\u0000${JSON.stringify([ctx.vars, ctx.keptVars ?? {}])}`;
+    const key = `${dirs.join('\u0000')}\u0000${opts._depth ?? 0}\u0000${st.file}\u0000${JSON.stringify([ctx.vars, ctx.keptVars ?? {}])}\u0000${unmodelledBefore(ctx.frames)}\u0000${writeSignature(ctx.frames)}`;
     if (ctx.budget.startupOk.has(key)) return null;
     ctx.budget.startupOk.add(key);
     return judgeScriptFile(st, dirs, ctx, withLineVars(opts), scanRaw);
@@ -1334,7 +1420,8 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
 
   // 7: a script file (bash f.sh, source f, ./f, node f.mjs) runs whatever is in it
   if ((opts._depth ?? 0) < 4) {
-    for (const c of cmds) {
+    for (const [idx, c] of cmds.entries()) {
+      frame.i = idx;
       const sf = scriptFileOf(c.argv, c.raw, raw);
       // a shell runs its startup files (BASH_ENV, ENV, ZDOTDIR/.zshenv ...) BEFORE the script it was given, so they are judged first, in the
       // order the shell reads them: judged like `bash FILE`
@@ -1384,6 +1471,17 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
       const abs = isAbs(e) ? [posix.normalize(e)] : dirs.map((d) => posix.join(d, e));
       const viaLink = abs.some((p) => !/[*?[]/.test(p) && (ctx.hit(realResolve(p, ctx.api)) || ctx.hitInode(p)));
       if (m.rawHit(target, dirs) || m.pathHit(target, dirs, true) || viaLink) return deny(`the command redirects output to ${target}, which is a protected pipeline file or the directory that holds it (${PROTECTED_MSG})`);
+    }
+  }
+
+  // sed's `w FILE` (and the w flag of s) writes a file too, whatever the program word looks like
+  for (const c of cmds) {
+    if (!['sed', 'gsed'].includes(baseOf(c.argv[0] ?? ''))) continue;
+    for (const target of sedWriteTargets(c.argv.slice(1))) {
+      const e = expandRefs(target, ctx);
+      const abs = isAbs(e) ? [posix.normalize(e)] : dirs.map((d) => posix.join(d, e));
+      const viaLink = abs.some((p) => !/[*?[]/.test(p) && (ctx.hit(realResolve(p, ctx.api)) || ctx.hitInode(p)));
+      if (m.rawHit(target, dirs) || m.pathHit(target, dirs, true) || viaLink) return deny(`sed writes to ${target}, which is a protected pipeline file or the directory that holds it (${PROTECTED_MSG})`);
     }
   }
 

@@ -814,6 +814,20 @@ function stdinSource(seg) {
   return { texts, unknown, st };
 }
 
+// The text a command prints (`out`: its heredocs / here-strings, echo / printf text, the files a reader names) and what it reads on stdin
+// (`stdin`: its own heredoc, `< F`, `<(...)`, the pipe it is fed from). `files` hold text as it is, `computed` are files a rewriting
+// command (sed, base64 ...) reads, `dyn` is set when part of it is only known at run time, `fed` when stdin comes from a pipe or a substitution.
+function streamsOf(seg, argv) {
+  const view = { ...seg, final: { argv } };
+  const o = newSt();
+  const outTexts = producedBy(view, o);
+  const s = stdinSource(view);
+  return {
+    out: { texts: outTexts, files: o.files, computed: o.computed, dyn: o.dyn },
+    stdin: { texts: s.texts, files: s.st.files, computed: s.st.computed, dyn: s.st.dyn, fed: seg.stdinSubs.length > 0 || (seg.pipedFrom !== null && seg.pipedFrom.length > 0) },
+  };
+}
+
 // ---- script text fed to a shell from files ---------------------------------------------------------
 
 // `cmd.feeds` (not enumerable, like `sep`) lists the files the text a shell / source / eval runs comes from, when it is not
@@ -1653,6 +1667,8 @@ class Parser {
     const cmd = emit(this.ctx, a, env, seg.raw, seg.depth, [], seg.sep);
     if (cmd) Object.defineProperty(cmd, 'litWords', { value: new Set(a.filter((w) => !seg.meta.get(w)?.dyn && !seg.pat.has(w))), enumerable: false });
     if (!isExec) seg.final = { argv: a };
+    // what the command prints and what it reads on stdin, for callers that ask which text a write of its output holds (see line-writes.mjs); lazy, most commands never need it
+    if (cmd && !isExec) Object.defineProperty(cmd, 'streams', { value: () => streamsOf(seg, a), enumerable: false });
     if (headDyn && cmd) {
       // `$X < f.sh`, `cat f.sh | $X`: the program may be a shell reading its script from stdin
       const saved = this.cmd;
