@@ -720,7 +720,7 @@ test('R1-B1: variables set inside a judged script do not leak into the line that
   assert.equal(git('X=-q; G=ok.sh; source $X d2.sh; bash $G', gfs()).decision, 'deny');
   // only the tainted variable is dynamic on these lines (no $X, no glob): it must still be acted on
   assert.equal(git('G=ok.sh; source -p /x d3.sh; bash $G && git push origin agent/x', gfs()).decision, 'deny');
-  assert.equal(git('G=ok.sh; source -p /x d3.sh; bash $G', gfs()).decision, 'allow'); // both values harmless, nothing guarded
+  assert.equal(git('G=ok.sh; source -p /x d3.sh; bash $G', gfs()).decision, 'deny'); // a tainted variable picking the script is refused outright (round 9)
   assert.equal(git('G=ok.sh; source -p /x d3.sh; G=ok.sh; bash $G && git push origin agent/x', gfs()).decision, 'allow'); // assigned again: known again
   // a tainted variable is unknown to every other use too: a push destination in it is not resolved to one value
   assert.equal(git('B=agent/x; source -p /x d4.sh; git push origin HEAD:$B', gfs()).decision, 'deny');
@@ -775,4 +775,34 @@ test('R2-B1: the word as written is globbed too when a known variable expands it
   allowBoth("y=1; bash 'x$z'*.sh", spec);
   // a known variable around a glob still expands as before
   denyBoth('y=1; bash x1*.sh', { 'x1a.sh': 'bad' });
+});
+
+test('R2-B2/B3: a variable a speculative source may have set stays tainted and never selects a script', () => {
+  const sets = gitFs({ 'p1.sh': 'F=f.sh', 'p2.sh': 'F=ok.sh', 'd.sh': 'F=ok.sh' });
+  const two = gitFs({ 'p1.sh': 'A=f\nB=.sh', 'p2.sh': 'A=ok\nB=.sh' });
+  // a later candidate (or any later assignment) does not wipe an earlier candidate's value: no enumeration to get wrong
+  assert.equal(git('F=ok.sh; source p*.sh; bash $F', sets).decision, 'deny');
+  assert.equal(git('F=ok.sh; source p*.sh; bash "$F"', sets).decision, 'deny');
+  assert.equal(git('F=ok.sh; source p*.sh; source $F', sets).decision, 'deny');
+  assert.equal(git('F=ok.sh; source p*.sh; $F', sets).decision, 'deny');
+  assert.equal(git('F=ok.sh; source p*.sh; python3 $F', sets).decision, 'deny');
+  // two tainted variables in one word
+  assert.equal(git('source p*.sh; bash ${A}${B}', two).decision, 'deny');
+  assert.equal(git('source p*.sh; bash $A$B', two).decision, 'deny');
+  // an assignment inside a judged script (child or sourced) neither clears the taint nor sets the value
+  assert.equal(git('source p*.sh; bash d.sh; bash $F', sets).decision, 'deny');
+  assert.equal(git('source p*.sh; source d.sh; bash $F', sets).decision, 'deny');
+  assert.equal(git('source p*.sh; source d.sh; git push origin HEAD:$F', sets).decision, 'deny'); // the sourced value does not resolve it either
+  // only an assignment on the line itself makes the variable known again
+  assert.equal(git('F=ok.sh; source p*.sh; F=ok.sh; bash $F', sets).decision, 'allow');
+  assert.equal(git('F=ok.sh; source p*.sh; export F=ok.sh; bash $F', sets).decision, 'allow');
+  assert.equal(git('F=ok.sh; source p*.sh; F=f.sh; bash $F', sets).decision, 'deny');
+  // a variable that is not used to pick the script keeps the old rule: unknown, denied only next to a guarded operation
+  assert.equal(git('F=ok.sh; source p*.sh; echo $F', sets).decision, 'allow');
+  assert.equal(git('F=ok.sh; source p*.sh; bash ok.sh $F', sets).decision, 'allow');
+  assert.equal(git('F=ok.sh; source p*.sh; git push origin HEAD:$F', sets).decision, 'deny');
+  // a child shell never taints the line
+  assert.equal(git('bash p1.sh; F=ok.sh; bash $F', sets).decision, 'allow');
+  // files-policy computes the variables of the line once, from the line's own text: a script's assignments never reach it
+  assert.equal(files('F=a.sh; bash p1.sh; bash $F', filesFs({ 'p1.sh': 'F=w.sh' })).decision, 'allow');
 });

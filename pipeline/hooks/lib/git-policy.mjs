@@ -114,7 +114,13 @@ function expandVars(text, vars) {
   return String(text).replace(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g, (m, a, b) => vars[a ?? b] ?? m);
 }
 
-const recordVars = (env, ctx) => { for (const k of Object.keys(env)) { ctx.vars[k] = env[k]; ctx.tainted.delete(k); } };
+// Only an assignment on the line itself (level 0) makes a tainted variable known again; one inside a judged script is ignored for it
+const setVar = (ctx, k, v, level) => {
+  if (level === 0) ctx.tainted.delete(k);
+  else if (ctx.tainted.has(k)) return;
+  ctx.vars[k] = v;
+};
+const recordVars = (env, ctx, level) => { for (const k of Object.keys(env)) setVar(ctx, k, env[k], level); };
 
 // Resolves `target` against `dir`. Returns null when the result cannot be known statically ($VAR, $(..), `cd -`).
 function joinDir(dir, target, ctx) {
@@ -377,7 +383,7 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
   if (sub === 'push' || sub === 'send-pack') { // send-pack is push without the remote configuration
     if (/\bxargs\b/.test(raw)) return deny('`xargs git push` takes its refspecs from stdin, so it cannot be verified. Push the branch by name.');
     // config handed in through the environment (this command's prefix / `env`, or an earlier assignment or export on the line)
-    ctx.envCfgDirty = [...Object.keys(env), ...Object.keys(ctx.vars), ...ctx.tainted.keys()].some((k) => GIT_ENV_CONFIG.test(k));
+    ctx.envCfgDirty = [...Object.keys(env), ...Object.keys(ctx.vars), ...ctx.tainted].some((k) => GIT_ENV_CONFIG.test(k));
     return checkPush(args, g.d, g.gitDir, ctx, g.configs);
   }
   trackGit(sub, args, g, ctx);
@@ -777,6 +783,7 @@ function judgeScoped(text, dir, ctx, level, sf) {
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   if (sf.sourced && !sf.candidate) return evalString(text, dir, ctx, level + 1);
   const saved = Object.assign(Object.create(null), ctx.vars);
+  const savedTaint = new Set(ctx.tainted);
   const spec = sf.candidate ? { branches: new Map(ctx.branches), git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases } } : null;
   try {
     return evalString(text, dir, ctx, level + 1);
@@ -795,13 +802,15 @@ function judgeScoped(text, dir, ctx, level, sf) {
     const after = Object.assign(Object.create(null), ctx.vars);
     for (const k of Object.keys(ctx.vars)) delete ctx.vars[k];
     Object.assign(ctx.vars, saved);
-    // uncertain from here on: unknown to every ordinary use ($F stays $F), and judged under each value it may hold as a script
-    if (sf.sourced) {
+    if (!sf.sourced) {
+      // a child shell takes nothing back up, taint included
+      ctx.tainted.clear();
+      for (const k of savedTaint) ctx.tainted.add(k);
+    } else {
+      // uncertain from here on and only ever more so: unknown to every use ($F stays $F), and a word that picks the script is refused
       for (const k of new Set([...Object.keys(after), ...Object.keys(saved)])) {
         if (after[k] === saved[k]) continue;
-        const alts = ctx.tainted.get(k) ?? new Set();
-        for (const v of [saved[k], after[k]]) if (v !== undefined) alts.add(v);
-        ctx.tainted.set(k, alts);
+        ctx.tainted.add(k);
         delete ctx.vars[k];
       }
     }
@@ -819,20 +828,15 @@ function checkCandidateScripts(sf, dir, ctx, level) {
     if (e === '~' || e.startsWith('~/')) e = ctx.home + e.slice(1);
     return e;
   };
-  // a variable a speculative `source` may have changed: every value it may hold is a candidate, and it is unknown at run time
-  let tainted = false;
-  const extra = [];
+  // a variable a sourced script may have set picks the script: refused whatever else is on the line
   for (const w of sf.words) {
-    for (const m of w.matchAll(/\$(?:\{(\w+)[^}]*\}|(\w+))/g)) {
-      const k = m[1] ?? m[2];
-      if (!ctx.tainted.has(k)) continue;
-      tainted = true;
-      for (const v of ctx.tainted.get(k)) extra.push(w.split(m[0]).join(v));
+    for (const m of w.matchAll(/\$(?:\{(\w+)|(\w+))/g)) {
+      if (ctx.tainted.has(m[1] ?? m[2])) return deny(`the script is picked by $${m[1] ?? m[2]}, which a script sourced earlier on the line may have set, so it cannot be verified. Name the file.`);
     }
   }
-  const c = scriptCandidates(extra.length ? { ...sf, words: [...sf.words, ...extra] } : sf, { expand, dirs: [here], joinPath: (d, r) => path.resolve(d, r), readDir: ctx.readDir, ifs: ctx.vars.IFS });
+  const c = scriptCandidates(sf, { expand, dirs: [here], joinPath: (d, r) => path.resolve(d, r), readDir: ctx.readDir, ifs: ctx.vars.IFS });
   if (c.over) return deny('too many words, a glob matching too many files, or glob syntax that cannot be resolved could be the script this command runs, so it cannot be verified. Name the script file.');
-  if ((c.dynamic || tainted) && GUARDED_WORDS.test(ctx.fullText)) {
+  if (c.dynamic && GUARDED_WORDS.test(ctx.fullText)) {
     return deny('which word is the script this command runs is only known at run time ($VAR / $(...) / a glob) and the line mentions a guarded operation, so it cannot be verified. Name the file and write the options literally.');
   }
   for (const file of c.files) {
@@ -856,13 +860,13 @@ function evalString(str, startDir, ctx, level) {
   let dir = startDir;
   for (const c of cmds) {
     const argv = c.argv;
-    if (!argv.length) { recordVars(c.env, ctx); continue; } // a bare `NAME=value`
+    if (!argv.length) { recordVars(c.env, ctx, level); continue; } // a bare `NAME=value`
     const name = baseName(argv[0]);
     let verdict = null;
     if (VAR_BUILTINS.includes(name)) {
       for (const a of argv.slice(1)) {
         const m = /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/.exec(a);
-        if (m) { ctx.vars[m[1]] = m[2]; ctx.tainted.delete(m[1]); }
+        if (m) setVar(ctx, m[1], m[2], level);
       }
     } else if (name === 'cd' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name, argv, ctx);
     else if (name === 'git') verdict = checkGit(argv, c.env, dir, ctx, c.raw ?? '');
@@ -908,7 +912,7 @@ export function evaluateGitCommand(command, {
   const base = cwd || process.cwd();
   const ctx = {
     cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, readDir, judgeBudget: MAX_CANDIDATE_JUDGMENTS, fullText: text,
-    vars: Object.create(null), tainted: new Map(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
+    vars: Object.create(null), tainted: new Set(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
     branches: new Map(), cfgDirty: false, envCfgDirty: false,
   };
   return evalString(text, path.resolve(base), ctx, 0);
