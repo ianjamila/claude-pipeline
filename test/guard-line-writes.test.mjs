@@ -265,6 +265,20 @@ test('h: a target known only in part can only name the files its fixed parts all
   allowBoth('cp f.sh out-$E.txt; bash n.sh');
 });
 
+test('h: a command we do not model only matters if no exact write of the whole file came after it', () => {
+  // a script written in full after the unmodelled command: what it holds is what was written
+  allowBoth((_, mid) => `make; ${mid}; printf 'echo hi' > n.sh; bash n.sh`);
+  allowBoth((_, mid) => `git merge origin/main; ${mid}; cat > n.sh <<'EOF'\necho hi\nEOF\nbash n.sh`);
+  allowBoth((_, mid) => `make; ${mid}; cp ok.sh n.sh; bash n.sh`);
+  // ... but not when the program ran after it, or the write only appends (the rest of the file is unknown)
+  denyBoth((_, mid) => `printf 'echo hi' > n.sh; make; ${mid}; bash n.sh`);
+  denyBoth((_, mid) => `make; ${mid}; printf 'echo hi' >> n.sh; bash n.sh`);
+  // the text written is still judged
+  denyBoth((bad) => `make; printf '%s' '${bad}' > n.sh; bash n.sh`);
+  // an inline program that cannot write does not touch the script
+  allowBoth((_, mid) => `node -e "console.log('ok.sh')"; ${mid}; bash ok.sh`);
+});
+
 test('h: a file named ..x.sh inside a copied directory is inside it', () => {
   denyBoth('cp -r src e; bash e/..x.sh');
   denyBoth('cp -r src d; bash d/src/..x.sh');

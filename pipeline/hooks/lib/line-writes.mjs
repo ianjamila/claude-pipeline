@@ -130,6 +130,8 @@ const PURE = new Set([
 // git subcommands that change the working tree in ways we do not follow (the files of a branch switch, a merge, a pull ...) or write named files
 const GIT_TREE = new Set(['checkout', 'switch', 'restore', 'reset', 'merge', 'pull', 'rebase', 'stash', 'apply', 'am', 'cherry-pick', 'revert', 'clean', 'clone', 'worktree', 'submodule', 'checkout-index', 'read-tree', 'sparse-checkout', 'bisect', 'init', 'mv']);
 const GIT_OUTPUT = new Set(['diff', 'log', 'show', 'format-patch', 'archive', 'bundle', 'shortlog', 'whatchanged', 'range-diff', 'diff-tree']);
+// program text that can write a file or start something that does
+const CAN_WRITE = /write|append|rename|copy|\bcp\b|\bmv\b|\bln\b|truncate|symlink|open\s*\(|>>?|\btee\b|shutil|move|dump|save|\bsed\b|spawn|exec|system|subprocess|child_process|popen|Popen|require\(|import /i;
 const WRITER_NAMES = new Set(['cp', 'mv', 'ln', 'install', 'ditto', 'rsync', 'tee', 'dd', 'curl', 'wget', 'sed', 'gsed', 'tar', 'bsdtar', 'gtar', 'unzip', 'git', 'perl', 'ruby']);
 const PS_WRITERS = new Set(['set-content', 'add-content', 'out-file', 'new-item', 'copy-item', 'move-item', 'tee-object', 'export-csv', 'invoke-webrequest', 'invoke-restmethod', 'sc', 'ac', 'ni', 'cpi', 'mi', 'iwr', 'irm']);
 const INLINE_RUNNERS = { node: /^(?:-e|-p|--eval|--print)$/, nodejs: /^(?:-e|-p|--eval|--print)$/, deno: /^eval$/, bun: /^(?:-e|--eval)$/, python: /^-c$/, python3: /^-c$/, perl: /^-[A-Za-z]*e$/, ruby: /^-[A-Za-z]*e$/, php: /^-r$/ };
@@ -636,7 +638,7 @@ const nameOf = (f, s) => f.p.basename(String(s).replace(/[\\/]+$/, ''));
 function match(f, rec, P) {
   const p = f.p;
   const loose = (items) => Object.assign([...items], { loose: true }); // may or may not be the file: its place in the order is unknown
-  if (rec.inline !== undefined) return rec.inline.includes(p.basename(P)) ? loose(UNKNOWN) : null;
+  if (rec.inline !== undefined) return rec.inline.includes(p.basename(P)) && CAN_WRITE.test(rec.inline) ? loose(UNKNOWN) : null;
   if (rec.dest === null) return loose(rec.items);
   const e = f.expand(rec.dest);
   // a target only known at run time may be any file its fixed parts allow (`/work/out-$n.txt` is not /work/cmp.mjs)
@@ -850,7 +852,9 @@ function collect(frames, upto, asOf, P, st, depth, exists) {
       if (!visible(f, at, rec.idx)) continue;
       for (const Pv of names) {
         const items = match(f, rec, Pv);
-        if (items) absorb(frames, fi, f, rec, items, Pv, st, depth, exists);
+        if (!items) continue;
+        absorb(frames, fi, f, rec, items, Pv, st, depth, exists);
+        if (!items.loose && !rec.append) st.lastReplace = [fi, rec.idx]; // an exact write that replaces the file: what came before it no longer matters
       }
     }
     // links we cannot follow (a link made on the line, a path whose real location is unknown): a write that ends in the script's NAME may reach it
@@ -867,8 +871,18 @@ function collect(frames, upto, asOf, P, st, depth, exists) {
         if (written.some((n) => fold(f, n) === base)) { st.unknown = true; absorb(frames, fi, f, rec, rec.items, P, st, depth, exists); }
       }
     }
-    // a script that is missing now may have been created by any command we do not model
-    if (!st.ignoreUnmodelled && !exists(P)) for (const idx of f.unmodelled) if (visible(f, at, idx)) { st.any = true; st.unknown = true; st.viaUnmodelled = true; }
+  }
+  // a script that is missing now may have been created by any command we do not model, unless an exact write put the whole file there after it
+  if (!st.ignoreUnmodelled && !exists(P)) {
+    for (let fi = 0; fi <= upto; fi++) {
+      const f = frames[fi];
+      const at = fi === upto ? asOf : f.i;
+      for (const idx of f.unmodelled) {
+        if (!visible(f, at, idx)) continue;
+        if (st.lastReplace && (fi < st.lastReplace[0] || (fi === st.lastReplace[0] && idx < st.lastReplace[1]))) continue;
+        st.any = true; st.unknown = true; st.viaUnmodelled = true;
+      }
+    }
   }
 }
 
