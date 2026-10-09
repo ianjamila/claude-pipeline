@@ -10,12 +10,17 @@
 //   * is attempt 1: a re-run (`gh run rerun`) can execute an OLDER guard revision (the workflow file of the old main tip)
 //     and post a fresh success over a newer failure, so re-runs never count; push a commit, or close and reopen the PR,
 //     to run the guards again,
-//   * ran from a commit (`head_sha` = the base-branch tip the workflow file was read from) that is an ancestor of, or
-//     equal to, the default branch,
 //   * is ABOUT this verdict: `pull_requests` lists this PR number at the status's sha with base.ref = the default
 //     branch (an empty list is untrusted: fork PRs and runs not tied to a PR cannot be bound). base.ref is what blocks a
 //     DOWNGRADE: a side branch cut from an old main commit passes "ancestor of main" while running an old, weaker guard,
 //     but a pull_request_target run for a PR INTO main always runs main's tip at event time,
+//   * names, in that same PR entry, a base.sha that is an ancestor of, or equal to, the default branch. NOT the run's
+//     `head_sha`: for pull_request_target GitHub reports the PR HEAD there (measured on EagleWatch, run 37906872583:
+//     head_sha = PR head 623be97, pull_requests[0].base.sha = main tip a48c0ff), so checking head_sha refused every PR.
+//     base.sha can lag (GitHub refreshes it lazily). A lagging sha is still a main commit, and base.ref pins the
+//     WORKFLOW FILE to main's tip, but NOT the guard scripts: the workflow checks those out at the event's
+//     pull_request.base.sha, so a lagging base runs older scripts. This check cannot prove freshness; the workflow
+//     closes that by checking out the base branch tip instead (claude-pipeline #26),
 //   * was running when the status was posted: created_at - 10s <= status.created_at <= updated_at + 10s. The lower bound
 //     is the run's creation (the event time), not run_started_at: a queued run can start long after the labeling it answers.
 // and, for the verdict itself (checkGuardVerdict), carries a VERDICT ARTIFACT only the genuine run can upload.
@@ -47,8 +52,8 @@ const LOGIN = '[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})?(?:\\[bot\\])?';
 const LOGIN_RE = new RegExp(`^${LOGIN}$`);
 // Artifact names cannot contain " : < > | * ? \ / or newlines: this format uses none of them.
 const ARTIFACT_RE = new RegExp(`^${ARTIFACT_PREFIX}([0-9a-f]{40})_(${STATE})_(${STATE})(?:_(${APPROVAL_LABELS.join('|')})_(${LOGIN}))?$`);
-const RUN_JQ = '{path: .path, event: .event, head_sha: .head_sha, run_attempt: .run_attempt, created_at: .created_at, updated_at: .updated_at, '
-  + 'pull_requests: [(.pull_requests // [])[] | {number: .number, head: {sha: .head.sha}, base: {ref: .base.ref}}]}';
+const RUN_JQ = '{path: .path, event: .event, run_attempt: .run_attempt, created_at: .created_at, updated_at: .updated_at, '
+  + 'pull_requests: [(.pull_requests // [])[] | {number: .number, head: {sha: .head.sha}, base: {ref: .base.ref, sha: .base.sha}}]}';
 
 /** { repo, runId } from an Actions run URL, or null. */
 export function parseRunUrl(url) {
@@ -118,18 +123,17 @@ export function checkRunProvenance({ read, repo, url, bind = {}, cache = new Map
     if (info.run_attempt !== 1) {
       return { ok: false, reason: `the run is attempt ${info.run_attempt ?? '(unknown)'}: re-runs never count (a re-run can execute an older guard revision); push a commit or close and reopen the PR to run the guards again` };
     }
-    const sha = String(info.head_sha ?? '').toLowerCase();
-    if (!SHA.test(sha)) return { ok: false, reason: 'the run has no head_sha' };
-
     if (!cache.has('default-branch')) cache.set('default-branch', read(`repos/${repo}`, '.default_branch').trim());
     const branch = cache.get('default-branch');
     if (!branch || /\s/.test(branch)) return { ok: false, reason: 'the default branch could not be read' };
 
     const prs = Array.isArray(info.pull_requests) ? info.pull_requests : [];
     if (prs.length === 0) return { ok: false, reason: 'the run lists no pull request (fork PR, or not tied to one), so it cannot be bound to this PR' };
-    if (!prs.some((p) => p?.number === prNumber && String(p?.head?.sha ?? '').toLowerCase() === headSha && p?.base?.ref === branch)) {
-      return { ok: false, reason: `the run is not about PR #${prNumber} at ${headSha.slice(0, 7)} into ${branch}` };
-    }
+    const bound = prs.find((p) => p?.number === prNumber && String(p?.head?.sha ?? '').toLowerCase() === headSha && p?.base?.ref === branch);
+    if (!bound) return { ok: false, reason: `the run is not about PR #${prNumber} at ${headSha.slice(0, 7)} into ${branch}` };
+    // The commit the workflow file was read from: the PR's base, never the run's head_sha (= the PR head; see the header).
+    const sha = String(bound.base?.sha ?? '').toLowerCase();
+    if (!SHA.test(sha)) return { ok: false, reason: `the run's PR #${prNumber} entry has no base sha` };
     const window = { createdAt: info.created_at, updatedAt: info.updated_at };
     if (!withinRunWindow(window, bind.createdAt)) return { ok: false, reason: `the status was posted at ${bind.createdAt}, outside the run's window (${window.createdAt} to ${window.updatedAt})` };
 

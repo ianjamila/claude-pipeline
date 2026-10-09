@@ -72,8 +72,8 @@ test('parseVerdictArtifactName: round-trips every valid name and is strict about
 // ---- run-level provenance: run_attempt and the created_at window -----------------------------------------------------------
 
 const GOOD = {
-  path: '.github/workflows/pipeline-guards.yml@refs/heads/main', event: 'pull_request_target', head_sha: 'b'.repeat(40), run_attempt: 1,
-  created_at: T('10:00:00'), updated_at: T('10:12:00'), pull_requests: [{ number: 7, head: { sha: HEAD }, base: { ref: 'main' } }],
+  path: '.github/workflows/pipeline-guards.yml@refs/heads/main', event: 'pull_request_target', head_sha: HEAD, run_attempt: 1,
+  created_at: T('10:00:00'), updated_at: T('10:12:00'), pull_requests: [{ number: 7, head: { sha: HEAD }, base: { ref: 'main', sha: 'b'.repeat(40) } }],
 };
 const reader = ({ run = {}, artifacts = [], compare = 'ahead', calls = [] } = {}) => (apiPath, jq) => {
   calls.push(apiPath);
@@ -110,6 +110,53 @@ test('checkRunProvenance: the window opens at the run\'s created_at (the event t
   assert.deepEqual(prov(queued, bind({ createdAt: T('10:01:00') })).window, { createdAt: T('10:00:00'), updatedAt: T('10:05:00') });
   assert.equal(withinRunWindow({ createdAt: T('10:00:00'), updatedAt: T('10:05:00') }, T('10:00:00')), true);
   assert.equal(withinRunWindow({ startedAt: T('10:00:00'), updatedAt: T('10:05:00') }, T('10:00:00')), false, 'the old field name is gone');
+});
+
+// ---- run-level provenance: which commit the workflow file came from ---------------------------------------------------------
+
+// GitHub's real shape for pull_request_target (EagleWatch run 37906872583): head_sha is the PR HEAD, which is not on main;
+// the bound PR entry's base.sha is the main commit. compare answers per sha, so checking the wrong one fails.
+const MAIN = 'b'.repeat(40);
+const shaReader = ({ prs, onMain = [MAIN], calls = [] }) => (apiPath) => {
+  calls.push(apiPath);
+  if (apiPath === `repos/${REPO}/actions/runs/1`) return JSON.stringify({ ...GOOD, head_sha: HEAD, pull_requests: prs });
+  if (apiPath === `repos/${REPO}`) return 'main\n';
+  const m = /^repos\/acme\/app\/compare\/([0-9a-f]{40})\.\.\.main$/.exec(apiPath);
+  if (m) return onMain.includes(m[1]) ? 'ahead\n' : 'behind\n';
+  throw new Error(`unexpected read ${apiPath}`);
+};
+const provSha = (opts) => checkRunProvenance({ read: shaReader(opts), repo: REPO, url: URL1, bind: bind() });
+
+test('checkRunProvenance: the source commit is the bound PR\'s base.sha, never the run\'s head_sha (= the PR head)', () => {
+  const calls = [];
+  const r = provSha({ prs: [{ number: 7, head: { sha: HEAD }, base: { ref: 'main', sha: MAIN } }], calls });
+  assert.equal(r.ok, true, r.reason);
+  assert.deepEqual(calls.filter((c) => c.includes('/compare/')), [`repos/${REPO}/compare/${MAIN}...main`]);
+});
+
+test('checkRunProvenance: a base.sha that is not on the default branch fails, naming that sha', () => {
+  const off = 'd'.repeat(40);
+  const r = provSha({ prs: [{ number: 7, head: { sha: HEAD }, base: { ref: 'main', sha: off } }] });
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /the workflow ran from ddddddd, which is not on the default branch \(behind\)/);
+});
+
+test('checkRunProvenance: a bound PR entry without a full base sha fails closed', () => {
+  for (const base of [{ ref: 'main' }, { ref: 'main', sha: '' }, { ref: 'main', sha: 'b'.repeat(39) }, { ref: 'main', sha: 'g'.repeat(40) }, { ref: 'main', sha: null }]) {
+    const r = provSha({ prs: [{ number: 7, head: { sha: HEAD }, base }] });
+    assert.equal(r.ok, false, JSON.stringify(base));
+    assert.match(r.reason, /PR #7 entry has no base sha/);
+  }
+});
+
+test('checkRunProvenance: the base.sha comes from the BOUND entry, not another PR the run lists', () => {
+  const off = 'd'.repeat(40);
+  const r = provSha({ prs: [
+    { number: 8, head: { sha: HEAD }, base: { ref: 'main', sha: MAIN } },
+    { number: 7, head: { sha: HEAD }, base: { ref: 'main', sha: off } },
+  ] });
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /ddddddd, which is not on the default branch/);
 });
 
 // ---- the artifact check ----------------------------------------------------------------------------------------------------
@@ -182,13 +229,13 @@ test('the run and artifact jq filters work on GitHub-shaped payloads', { skip: !
   checkGuardVerdict({ read, repo: REPO, url: URL1, bind: bind(), expect: { check: 'hardstops' } });
   const jq = (expr, payload) => spawnSync('jq', ['-rc', expr], { input: JSON.stringify(payload), encoding: 'utf8' }).stdout.replace(/\r\n/g, '\n');
   const payload = {
-    id: 1, name: 'Pipeline guards', path: '.github/workflows/pipeline-guards.yml@refs/heads/main', event: 'pull_request_target', head_sha: 'b'.repeat(40),
+    id: 1, name: 'Pipeline guards', path: '.github/workflows/pipeline-guards.yml@refs/heads/main', event: 'pull_request_target', head_sha: HEAD,
     run_attempt: 2, run_number: 9, created_at: T('10:00:00'), run_started_at: T('10:00:40'), updated_at: T('10:12:00'), status: 'in_progress',
     pull_requests: [{ number: 7, id: 99, url: 'x', head: { sha: HEAD, ref: 'f', repo: { id: 1 } }, base: { ref: 'main', sha: 'c'.repeat(40), repo: { id: 1 } } }],
   };
   assert.deepEqual(JSON.parse(jq(filters.run, payload)), {
-    path: payload.path, event: 'pull_request_target', head_sha: 'b'.repeat(40), run_attempt: 2, created_at: T('10:00:00'), updated_at: T('10:12:00'),
-    pull_requests: [{ number: 7, head: { sha: HEAD }, base: { ref: 'main' } }],
+    path: payload.path, event: 'pull_request_target', run_attempt: 2, created_at: T('10:00:00'), updated_at: T('10:12:00'),
+    pull_requests: [{ number: 7, head: { sha: HEAD }, base: { ref: 'main', sha: 'c'.repeat(40) } }],
   });
   const listing = { total_count: 2, artifacts: [{ id: 1, name: name('success', 'failure'), expired: false }, { id: 2, name: 'verify-report', expired: false }] };
   assert.equal(jq(filters.artifacts, listing), `${name('success', 'failure')}\nverify-report\n`);
