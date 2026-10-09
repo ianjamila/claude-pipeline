@@ -184,18 +184,26 @@ function checkDisableRules(rules, errors) {
 // Built-in hard-stop rule families a project may downgrade to REPORT-ONLY with hard_stops.report_only_rules: the hit is
 // still found and listed (job summary, CLI output, PR body) but it never blocks merge and never needs `human-approved`.
 // Owner decision 2026-10-09: the label is for DATABASE changes only, so every rule that is not a database rule may be
-// downgraded. NOT eligible, each for a stated reason:
+// downgraded, with one exception: the guard core. NOT eligible, each for a stated reason:
 //   R0-unscannable      content nobody could read (a binary, an unparseable lockfile or package.json) vouches for nothing
 //   R1-destructive, R1-migration-edited, R2-sql-removed, R2-sql-statement
-//                       the database rules the label exists for
-//   R4-pipeline         edits to the pipeline's own files and config: one unattended edit to pipeline.yml could otherwise
-//                       turn the database rules report-only too, so R4 must stay blocking
+//                       the database rules the label exists for (R1-destructive covers raw destructive SQL, SQL in code,
+//                       deleted/moved migrations)
+//   R4-pipeline         the GUARD CORE: files that decide whether a label is needed or which checks CI runs (workflows,
+//                       .claude/, CODEOWNERS, scripts/pipeline, pipeline.yml, test-runner configs, gitlinks, symlinks,
+//                       deleted pgTAP tests, package.json gate blocks): one unattended edit there could otherwise turn the
+//                       database rules report-only too, so it must stay blocking
 //   P-path              a project path rule has its own switch, hard_stops.report_only_paths
+// Eligible by owner decision 2026-10-09:
+//   R1-data-write       app code that deletes or overwrites rows through a client (.from(...).delete/upsert) is routine
+//                       feature code; raw destructive SQL stays R1-destructive
+//   R4-config           CLAUDE.md and other agent-instruction files, the local verify script, package.json scripts, git
+//                       hooks, lint/tsconfig/build config: not the guard core
 // R5-major-dep IS eligible; its fail-closed "package.json could not be parsed" hit is emitted as R0-unscannable so it
 // stays blocking. A rule named here that is outside the list is a config error, not a silent no-op, and classifyHardStops
 // re-checks it (fail closed).
 export const REPORT_ONLY_HARD_STOP_RULES = Object.freeze([
-  'R2-auth', 'R2-auth-removed', 'R3-secrets', 'R5-major-dep', 'R6-sensitive', 'P-pattern',
+  'R1-data-write', 'R2-auth', 'R2-auth-removed', 'R3-secrets', 'R4-config', 'R5-major-dep', 'R6-sensitive', 'P-pattern',
 ]);
 
 function checkReportOnlyRules(rules, disabled, errors) {

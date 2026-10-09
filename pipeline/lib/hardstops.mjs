@@ -4,12 +4,15 @@
 // So every judgement call below errs toward flagging. The same file is vendored into each project and runs in CI.
 //
 // Rules: R0-unscannable | R1-destructive | R1-migration-edited | R2-auth | R2-auth-removed | R2-sql-removed |
-//        R2-sql-statement | R3-secrets | R4-pipeline | R5-major-dep | R6-sensitive | P-path | P-pattern
+//        R2-sql-statement | R3-secrets | R4-pipeline | R4-config | R5-major-dep | R6-sensitive | P-path | P-pattern
+//        (R1-data-write: app code that deletes/upserts rows through a client; R4-pipeline: the guard core; R4-config: agent
+//        instructions, local verify script, hooks, lint/build config, package.json scripts)
 //
 // Blocking vs report-only: every hit blocks by default. A project may downgrade the non-database rule families listed in
 // REPORT_ONLY_HARD_STOP_RULES (and paths in hard_stops.report_only_paths) to report-only: such a hit carries
 // `advisory: true`, is still found and listed everywhere, but is left out of `blockingHits(hits)`, which is what every
-// pass/fail decision counts. Database rules (R0, R1, R2-sql-*), R4-pipeline and unlisted rules can never be advisory.
+// pass/fail decision counts. Database rules (R0, R1-destructive, R1-migration-edited, R2-sql-*), R4-pipeline (the guard core) and unlisted rules can
+// never be advisory.
 //
 // Shape: a pure core (`classifyHardStops` and the helpers exported for tests) plus ONE supported entry point,
 // `collectHardStops`, which gathers what a diff cannot show: env names already on the base, package.json /
@@ -145,19 +148,31 @@ const R3_PATH_GLOBS = [
   '**/*.p12', '**/*.pfx', '**/*.jks', '**/*.keystore', '**/id_rsa*', '**/id_ed25519*', '**/.npmrc', '**/.netrc',
   '**/credentials*.json', '**/*service-account*.json',
 ];
-const R4_PATH_GLOBS = [
-  '**/.github/**', '**/.claude/**', '**/.githooks/**', '**/CODEOWNERS',
-  // Agent-instruction files steer the agents that review and write code; a PR must not rewrite its own rules.
-  '**/CLAUDE.md', '**/AGENTS.md', '**/.cursorrules', '**/.github/copilot-instructions.md',
+// R4 is two rules. R4-pipeline is the GUARD CORE, the files that decide whether a label is needed or which checks CI runs
+// (workflows, .claude/, CODEOWNERS, the pipeline's own scripts and config, the test runners): it can never be report-only,
+// because one unattended edit there could switch the other rules off. R4-config is everything else that steers the build or
+// the agents (agent-instruction files, the local verify script, git hooks, lint/tsconfig/build config, package.json
+// scripts): a project may downgrade it to report-only. A path in both lists is R4-pipeline (core wins).
+const R4_PIPELINE_GLOBS = [
+  '**/.github/**', '**/.claude/**', '**/CODEOWNERS',
   // A submodule add repoints the checkout at code nobody reviewed here.
-  '**/.gitmodules', '**/scripts/verify*', '**/scripts/verify*/**',
-  '**/scripts/pipeline/**', '**/pipeline.yml', '**/vitest.config.*', '**/vitest.workspace.*', '**/jest.config.*',
-  '**/playwright*.config.*', '**/.nycrc*', '**/codecov.y*ml', '**/.husky/**',
-  // Beyond the spec: other places the verify gate or the build can be loosened.
-  '**/vitest.setup.*', '**/jest.setup.*', '**/cypress.config.*', '**/.mocharc*', '**/eslint.config.*', '**/.eslintrc*',
-  '**/lefthook*.y*ml', '**/.pre-commit-config.y*ml', '**/.gitattributes', '**/next.config.*', '**/vite.config.*',
-  '**/tsconfig*.json',
+  '**/.gitmodules', '**/scripts/pipeline/**', '**/pipeline.yml',
+  // Test-runner configs: where a gate can be loosened.
+  '**/vitest.config.*', '**/vitest.workspace.*', '**/vitest.setup.*', '**/jest.config.*', '**/jest.setup.*',
+  '**/playwright*.config.*', '**/cypress.config.*', '**/.mocharc*', '**/.nycrc*', '**/codecov.y*ml',
 ];
+// Markdown under .github (copilot-instructions.md, workflows/README.md) cannot run; it is R4-config, not core.
+const GITHUB_DIR_GLOBS = ['**/.github/**'];
+const MARKDOWN_FILE = /\.(?:md|mdx|markdown)$/i;
+const R4_CONFIG_GLOBS = [
+  // Agent-instruction files steer the agents that review and write code; a PR must not rewrite its own rules.
+  '**/CLAUDE.md', '**/AGENTS.md', '**/.cursorrules',
+  '**/.githooks/**', '**/.husky/**', '**/lefthook*.y*ml', '**/.pre-commit-config.y*ml', '**/scripts/verify*', '**/scripts/verify*/**',
+  '**/eslint.config.*', '**/.eslintrc*', '**/tsconfig*.json', '**/next.config.*', '**/vite.config.*', '**/.gitattributes',
+];
+const isR4Pipeline = (p) => (inc(p, R4_PIPELINE_GLOBS.filter((g) => !GITHUB_DIR_GLOBS.includes(g))) ||
+  (inc(p, GITHUB_DIR_GLOBS) && !MARKDOWN_FILE.test(p)));
+const isR4Config = (p) => inc(p, R4_CONFIG_GLOBS) || (inc(p, GITHUB_DIR_GLOBS) && MARKDOWN_FILE.test(p));
 // pgTAP tests are the RLS safety net: deleting or moving one weakens it (editing one is left to the test-integrity check).
 const TEST_DIR_GLOBS = ['**/supabase/tests/**'];
 const WORKFLOW_GLOBS = ['**/.github/workflows/**'];
@@ -1041,7 +1056,7 @@ function npmRules({ file, base, head }, sink) {
   }
 
   for (const name of new Set([...Object.keys(isObj(base.scripts) ? base.scripts : {}), ...Object.keys(isObj(head.scripts) ? head.scripts : {})])) {
-    if (SCRIPT_NAME.test(name) && base.scripts?.[name] !== head.scripts?.[name]) sink.add('R4-pipeline', file, `package.json scripts.${name} changed`);
+    if (SCRIPT_NAME.test(name) && base.scripts?.[name] !== head.scripts?.[name]) sink.add('R4-config', file, `package.json scripts.${name} changed`);
   }
   for (const key of GATE_BLOCKS) {
     if (!sameJson(base[key], head[key])) sink.add('R4-pipeline', file, `package.json "${key}" changed`);
@@ -1292,8 +1307,10 @@ function pathRules(d, cx, sink) {
 
   const r3 = d.paths.find((p) => inc(p, R3_PATH_GLOBS));
   if (r3) sink.add('R3-secrets', d.file, `secret/credential file: ${r3}`);
-  const r4 = d.paths.find((p) => inc(p, R4_PATH_GLOBS));
+  const r4 = d.paths.find(isR4Pipeline);
+  const r4c = r4 ? undefined : d.paths.find(isR4Config);
   if (r4) sink.add('R4-pipeline', d.file, `pipeline/verify file: ${r4}`);
+  else if (r4c) sink.add('R4-config', d.file, `agent-instruction / build-config file: ${r4c}`);
   if ((d.status === 'D' || d.status === 'R') && d.paths.some((p) => inc(p, TEST_DIR_GLOBS))) {
     sink.add('R4-pipeline', d.file, `pgTAP test ${STATUS_WORD[d.status]}`);
   }
@@ -1344,7 +1361,7 @@ function addedCodeRules(d, added, cx, env, sink) {
       const r2 = firstSql(R2_SQL, l.text, true);
       if (r2) sink.add('R2-auth', d.file, `auth/RLS SQL in code: ${r2}`, ex);
     }
-    if (live(l) && l.text.includes('.from(') && DATA_WRITE.test(l.text)) sink.add('R1-destructive', d.file, 'data write in code (.from(...).delete/upsert)', ex);
+    if (live(l) && l.text.includes('.from(') && DATA_WRITE.test(l.text)) sink.add('R1-data-write', d.file, 'data write in code (.from(...).delete/upsert)', ex);
 
     if (SERVICE_ROLE.test(l.text)) sink.add('R2-auth', d.file, 'service-role / admin-client reference', ex);
     if (AUTH_ADMIN.test(l.text)) sink.add('R2-auth', d.file, 'auth.admin API call', ex);

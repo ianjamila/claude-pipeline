@@ -96,8 +96,10 @@ export async function run(argv, ctx) {
     const hitsFile = values['hits-file'];
     const parsed = hitsFile ? readJson(resolve(cwd, hitsFile), 'hits file') : [];
     // A `P hardstops` object lists blocking hits separately: the needs-human note is about those, not report-only ones.
-    const hits = Array.isArray(parsed) ? parsed : (parsed?.blocking ?? parsed?.hits);
-    if (!Array.isArray(hits)) throw new UsageError('--hits-file must hold a JSON array (or an object with a "hits" array)');
+    const listed = Array.isArray(parsed) ? parsed : (parsed?.blocking ?? parsed?.hits);
+    if (!Array.isArray(listed)) throw new UsageError('--hits-file must hold a JSON array (or an object with a "hits" array)');
+    // Whatever the format, an advisory (report-only) hit never makes a PR need a human: drop it before the note is built.
+    const hits = listed.filter((h) => h?.advisory !== true);
     const state = stateOrNull(root);
     const reportFile = await reportPath(root);
     const report = existsSync(reportFile) ? readJson(reportFile, 'verify report') : null;
