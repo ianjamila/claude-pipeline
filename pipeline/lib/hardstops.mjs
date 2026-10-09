@@ -1535,7 +1535,14 @@ export function classifyHardStops({ files, config, baseEnvNames = new Set(), bas
 
   for (const g of guardLosses) sink.add(g.kind === 'sql' ? 'R2-sql-removed' : 'R2-auth-removed', g.file, g.detail);
 
-  return sink.list().filter((hit) => !cx.disabled.has(hit.rule)).map((hit) => {
+  return settleHits(sink.list(), cx);
+}
+
+// The ONE place a hit's final blocking status is decided: drops disabled rules, marks report-only rules advisory, and in
+// owner_approval: chat marks every other hit advisory + ownerMerge. classifyHardStops applies it to its own hits and
+// collectHardStops to the COMPLETE list (it appends hits the classifier never sees), so no path can skip it. Idempotent.
+function settleHits(hits, cx) {
+  return hits.filter((hit) => !cx.disabled.has(hit.rule)).map((hit) => {
     if (hit.advisory || cx.reportOnly.has(hit.rule)) return { ...hit, advisory: true };
     return cx.ownerChat ? { ...hit, advisory: true, ownerMerge: true } : hit;
   });
@@ -1947,5 +1954,5 @@ export async function collectHardStops({ base, head, cwd, config, maxImporterHit
     else tooBig.push({ rule: 'R0-unscannable', file: d.file, detail: `file is larger than ${MAX_HEAD_TEXT} characters; its imports cannot be checked` });
   }
   const hits = classifyHardStops({ files, config, baseEnvNames, pkgPairs, sqlStatements, envFiles, envImportFiles, guardLosses, headFiles });
-  return [...hits, ...tooBig, ...reverseImportHits(ds, head, o, cx, maxImporterHits)];
+  return settleHits([...hits, ...tooBig, ...reverseImportHits(ds, head, o, cx, maxImporterHits)], cx);
 }

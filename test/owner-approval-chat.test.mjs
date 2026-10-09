@@ -54,6 +54,42 @@ test('label mode (default) is unchanged: the same hit blocks and carries no owne
   assert.deepEqual(classes(run(FILES, { config: { ...config, owner_approval: 'label' } })), classes(hits));
 });
 
+// ---- hits collectHardStops appends after the classifier (oversize file, reverse-import check) ----------------------------
+
+async function appendedRepo() {
+  const { createTmpRepo } = await import('./helpers/tmprepo.mjs');
+  const repo = createTmpRepo();
+  repo.write('README.md', 'x\n');
+  repo.write('tests/helper.ts', 'export const a = 1;\n');
+  repo.write('lib/pay.ts', "import '../tests/helper';\n");
+  repo.commit('base');
+  repo.branch('feat');
+  repo.write('tests/helper.ts', 'export const wipe = () => 1;\n'); // exempt test file that unchanged production code imports
+  repo.write('lib/huge.ts', `${'x = 1\n'.repeat(400_000)}// end\n`); // importable source over the size cap
+  repo.commit('edit helper, add a huge file');
+  return repo;
+}
+const collect = async (repo, config) => (await import('../pipeline/lib/hardstops.mjs')).collectHardStops({ base: 'main', head: 'feat', cwd: repo.dir, config });
+
+test('chat mode: the oversize-file and reverse-import R0 hits collectHardStops appends are advisory + ownerMerge', async () => {
+  const repo = await appendedRepo();
+  const hits = await collect(repo, chatCfg());
+  assert.deepEqual(hits.map((h) => [h.rule, h.file]).sort(), [['R0-unscannable', 'lib/huge.ts'], ['R0-unscannable', 'tests/helper.ts']]);
+  assert.ok(hits.some((h) => /larger than/.test(h.detail)) && hits.some((h) => /production code/.test(h.detail)));
+  assert.ok(hits.every((h) => h.advisory === true && h.ownerMerge === true), JSON.stringify(hits));
+  assert.deepEqual(blockingHits(hits), []);
+});
+
+test('label mode: the same appended R0 hits still block, with no ownerMerge', async () => {
+  const repo = await appendedRepo();
+  for (const config of [cfg(), { ...cfg(), owner_approval: 'label' }]) {
+    const hits = await collect(repo, config);
+    assert.equal(hits.length, 2);
+    assert.ok(hits.every((h) => h.advisory === undefined && h.ownerMerge === undefined), JSON.stringify(hits));
+    assert.equal(blockingHits(hits).length, 2);
+  }
+});
+
 // ---- integrity --------------------------------------------------------------------------------------------------------
 
 const icfg = (over = {}) => ({ integrity: { test_globs: DEFAULTS.integrity.test_globs }, ...over });
