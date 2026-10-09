@@ -328,7 +328,8 @@ function evaluateMcp(tool, ti, input, opts) {
   return allow();
 }
 
-export function evaluateFileTool(input, opts = {}) {
+export const evaluateFileTool = denyUnverifiable(evaluateFileToolUnchecked);
+function evaluateFileToolUnchecked(input, opts = {}) {
   const tool = typeof input?.tool_name === 'string' ? input.tool_name : '';
   const ti = input?.tool_input && typeof input.tool_input === 'object' ? input.tool_input : {};
   if (tool.startsWith('mcp__')) return evaluateMcp(tool, ti, input, opts);
@@ -364,16 +365,22 @@ export function evaluateFileTool(input, opts = {}) {
 // ---- Bash: text normalisation ---------------------------------------------------------------------
 
 // A private-use character the text does not contain, to mark a spot while rewriting it. A fixed one could be a character of a
-// file name (`a<U+E000>b.sh`) and would rewrite that name into another. When the text holds every private-use character,
-// a run of U+E000 longer than any run in the text.
+// file name (`a<U+E000>b.sh`) and would rewrite that name into another. A text holding all 6,400 of them is not judged: no
+// command needs that, and a longer mark could be formed across the joins of the rewrite (or grow without bound).
+class UnverifiableText extends Error {}
 function freeMark(text) {
   for (let c = 0xe000; c <= 0xf8ff; c++) {
     const m = String.fromCharCode(c);
     if (!text.includes(m)) return m;
   }
-  let n = 1;
-  for (const r of text.match(/\uE000+/g) ?? []) n = Math.max(n, r.length + 1);
-  return '\uE000'.repeat(n);
+  throw new UnverifiableText('the command holds every private-use Unicode character, so it cannot be checked; remove them');
+}
+// The entry points answer deny for text they cannot normalise (a hook that throws lets the command through).
+// (a declaration: the entry points above are built from it when the module loads)
+function denyUnverifiable(fn) {
+  return (...args) => {
+    try { return fn(...args); } catch (e) { if (e instanceof UnverifiableText) return deny(e.message); throw e; }
+  };
 }
 
 // Every way the home directory is spelled in a shell line or a one-liner script. A trailing `+ '`, `, '` or
@@ -1124,7 +1131,8 @@ function linkReachesProtected(cmds, dirs, ctx) {
 
 // ---- Bash --------------------------------------------------------------------------------------------
 
-export function evaluateBashForFiles(command, opts = {}) {
+export const evaluateBashForFiles = denyUnverifiable(evaluateBashForFilesUnchecked);
+function evaluateBashForFilesUnchecked(command, opts = {}) {
   if (!opts._budget) opts = { ...opts, _budget: { left: MAX_CANDIDATE_JUDGMENTS } }; // one budget for this evaluation and every script it reads
   const ctx = makeCtx(opts);
   if (ctx.admin) return allow();

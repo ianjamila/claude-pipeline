@@ -871,12 +871,20 @@ test('a backslash file name that also holds the backslash mark character is judg
   }
 });
 
-test('when the text holds every private-use character, the mark is still one the text does not contain', () => {
+test('a text holding every private-use character is refused, never thrown on (a hook that throws lets the command through)', () => {
   const all = Array.from({ length: 0xf8ff - 0xe000 + 1 }, (_, i) => String.fromCharCode(0xe000 + i)).join('');
   // the guard expands word by word, so the characters sit in the script name itself
   const h = { [`/home/u/a${all}b.sh`]: 'echo x > ~/.claude/settings.json' };
   assert.equal(files(`bash ~/a${all}b.sh`, fakeFs(PROJ, h)).decision, 'deny');
   assert.equal(files(`echo '${all}'; echo x > ~/.claude/settings.json`, fakeFs(PROJ, {})).decision, 'deny');
+  // Codex recheck: every character plus a long run of U+E000 once made the mark a regex too large to compile
+  const pad = all + ''.repeat(35000);
+  assert.equal(files(`echo '${pad}'; bash w.sh`).decision, 'deny');
+  // accepted false positive: refused even when nothing else on the line is protected
+  const r = files(`echo '${all}'; bash ok.sh`);
+  assert.equal(r.decision, 'deny');
+  assert.match(r.reason, /private-use/);
+  assert.equal(files(`echo '${all.slice(1)}'; bash ok.sh`).decision, 'allow');
 });
 
 test('a backslash that reaches the script name through a variable is a file name character too', { skip: process.platform === 'win32' }, () => {
