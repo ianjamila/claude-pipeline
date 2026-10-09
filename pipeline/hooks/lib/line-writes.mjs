@@ -702,7 +702,10 @@ function hitsOn(frames, upto, asOf, P) {
       }
     }
   }
-  return out;
+  // a write that may or may not be this file, followed by an exact write that replaces the whole file, changed nothing that matters
+  let lastExact = -1;
+  out.forEach((h, i) => { if (!h.loose && !h.rec.append) lastExact = i; });
+  return out.filter((h, i) => !(h.loose && i < lastExact));
 }
 
 // Every text the file P may hold after the writes before (frames[0..upto], command asOf), or null when it cannot be built (a piece is unknown or
@@ -844,19 +847,14 @@ function collect(frames, upto, asOf, P, st, depth, exists) {
   st.seen.add(key);
   const pairs = linkPairs(frames, upto, asOf);
   const names = pairs.length ? namesOf(pairs, P) : [P];
+  for (const h of hitsOn(frames, upto, asOf, P)) {
+    absorb(frames, h.fi, h.f, h.rec, h.items, h.P, st, depth, exists);
+    if (!h.loose && !h.rec.append) st.lastReplace = [h.fi, h.rec.idx]; // an exact write that replaces the file: what came before it no longer matters
+  }
   if (frames.some((x) => x.unresolved)) pairs.any = true;
   for (let fi = 0; fi <= upto; fi++) {
     const f = frames[fi];
     const at = fi === upto ? asOf : f.i;
-    for (const rec of f.recs) {
-      if (!visible(f, at, rec.idx)) continue;
-      for (const Pv of names) {
-        const items = match(f, rec, Pv);
-        if (!items) continue;
-        absorb(frames, fi, f, rec, items, Pv, st, depth, exists);
-        if (!items.loose && !rec.append) st.lastReplace = [fi, rec.idx]; // an exact write that replaces the file: what came before it no longer matters
-      }
-    }
     // links we cannot follow (a link made on the line, a path whose real location is unknown): a write that ends in the script's NAME may reach it
     if (pairs.any || frames.some((x) => x.unresolved)) {
       for (const rec of f.recs) {

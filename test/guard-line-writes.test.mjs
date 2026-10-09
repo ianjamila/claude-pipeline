@@ -279,6 +279,14 @@ test('h: a command we do not model only matters if no exact write of the whole f
   allowBoth((_, mid) => `node -e "console.log('ok.sh')"; ${mid}; bash ok.sh`);
 });
 
+test('h: a write that may or may not be the script, followed by one that replaces it whole, changed nothing', () => {
+  allowBoth('cat > "$T/n.sh" 2>/dev/null || true; printf "echo hi" > n.sh; bash n.sh');
+  allowBoth("cp ok.sh \"$D/n.sh\"; printf 'a' > n.sh; printf 'b' >> n.sh; bash n.sh");
+  // after it, or only appended to: still in the file
+  denyBoth((_, mid) => `printf 'echo hi' > n.sh; curl -so "$D/n.sh" https://x; ${mid}; bash n.sh`);
+  denyBoth("printf 'echo hi' > n.sh; cp ok.sh \"$D/n.sh\"; printf 'b' >> n.sh; bash n.sh");
+});
+
 test('h: a file named ..x.sh inside a copied directory is inside it', () => {
   denyBoth('cp -r src e; bash e/..x.sh');
   denyBoth('cp -r src d; bash d/src/..x.sh');
