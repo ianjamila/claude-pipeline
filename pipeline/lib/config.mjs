@@ -162,11 +162,14 @@ function checkProduction(p, errors) {
   else if (!inRange(p.deploy_timeout_minutes, 1, 120)) errors.push('production.deploy_timeout_minutes must be an integer 1..120');
 }
 
-// Built-in hard-stop rule families a project may switch off with hard_stops.disable_rules. Deliberately short: only
-// rules whose trigger is a WORD or a version number, which a domain can make routine (an HR/payroll app mentions
-// payroll everywhere). Migrations, destructive SQL, auth paths and removed guards, secrets, pipeline files and
-// unscannable input stay on for every project — naming one of them is a config error, not a silent no-op.
-export const DISABLEABLE_HARD_STOP_RULES = Object.freeze(['R5-major-dep', 'R6-sensitive']);
+// Built-in hard-stop rule families a project may switch off with hard_stops.disable_rules. Deliberately ONE: R6, whose
+// only triggers are a sensitive-data WORD in a path or an added line, which a domain can make routine (an HR/payroll app
+// mentions payroll everywhere). Before adding a rule here, read every sink.add of it in hardstops.mjs: R5-major-dep is
+// NOT eligible although its name says "major version" — it also carries every overrides/resolutions change (a supply-
+// chain lever), engines.node, and the fail-closed "package.json could not be parsed; dependency changes unchecked".
+// Migrations, destructive SQL, auth paths and removed guards, secrets, pipeline files, dependencies and unscannable
+// input stay on for every project; naming one of them is a config error, not a silent no-op.
+export const DISABLEABLE_HARD_STOP_RULES = Object.freeze(['R6-sensitive']);
 
 function checkDisableRules(rules, errors) {
   if (rules === undefined) return;

@@ -61,7 +61,7 @@ hard_stops:                    # project extras on top of the universal list
   paths: []
   patterns: []                 # [{name: ..., regex: ..., paths: ["**/*.ts"]}]
   auth_calls: []               # authorization helpers whose removal is a hard-stop
-  disable_rules: []            # built-in rules to switch off; only R5-major-dep, R6-sensitive (e.g. an HR/payroll app)
+  disable_rules: []            # built-in rules to switch off; only R6-sensitive (e.g. an HR/payroll app)
 
 review:
   codex_model: gpt-6-astra

@@ -391,6 +391,14 @@ test('pipeline-guards.yml re-evaluates a PR whose base changed (edited), but ign
   // base.sha, which can predate the guard scripts.
   assert.match(yml, /ref: \$\{\{ github\.sha \}\}/);
   assert.doesNotMatch(yml, /ref: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
+  // …and the event base, where the diff starts, is fetched by sha when the tip checkout lacks it (force-pushed base),
+  // after the sha is checked to be 40 hex characters, and before anything runs the guards.
+  const ensure = yml.indexOf('- name: Make sure the event base commit is present');
+  assert.ok(ensure > yml.indexOf('ref: ${{ github.sha }}'), 'base-fetch step after the checkout');
+  assert.ok(ensure < yml.indexOf('run: node scripts/pipeline/ci-guards-run.mjs'), 'base-fetch step before the guards run');
+  assert.match(yml, /\*\[!0-9a-f\]\* \| ""\) echo "::error::BASE_SHA is not a commit sha"; exit 1 ;;/);
+  assert.match(yml, /\[ "\$\{#BASE_SHA\}" -eq 40 \]/);
+  assert.match(yml, /git cat-file -e "\$\{BASE_SHA\}\^\{commit\}" 2>\/dev\/null \|\| git fetch --no-tags origin "\$BASE_SHA"/);
 });
 
 test('pipeline-guards.yml hands the labeling event to the job through env only, and runs on a supported Node', () => {

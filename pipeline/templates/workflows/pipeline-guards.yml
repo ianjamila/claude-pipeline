@@ -81,6 +81,16 @@ jobs:
           # Needed to fetch refs/pull/N/head below. Safe: no PR code ever runs in this job.
           persist-credentials: true
 
+      # The diff starts at BASE_SHA (the event's base), which the tip checkout above usually contains. Not after a force-push
+      # of the base branch: the old base is then on no branch, so fetch it by sha (only a 40-hex sha is accepted).
+      - name: Make sure the event base commit is present
+        run: |
+          case "$BASE_SHA" in
+            *[!0-9a-f]* | "") echo "::error::BASE_SHA is not a commit sha"; exit 1 ;;
+          esac
+          [ "${#BASE_SHA}" -eq 40 ] || { echo "::error::BASE_SHA is not a full commit sha"; exit 1; }
+          git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null || git fetch --no-tags origin "$BASE_SHA"
+
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
