@@ -19,7 +19,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
 import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf } from './shell-parse.mjs';
-import { newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets } from './line-writes.mjs';
+import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets } from './line-writes.mjs';
 import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
 
 const posix = path.posix;
@@ -1164,8 +1164,16 @@ function judgeWrittenScript(w, sf, abs, dir, ctx, opts, scanRaw) {
     }
   }
   if (w.pieces) return deny(`the script ${sf.file} is built from pieces at run time (several writes on the line put its text together, and one of them cannot be read), so what it runs cannot be checked; write the file out in one piece`);
-  // (an actual protected path on the line, prose masked: not the bare words .claude / install. / protect)
-  if (w.unknown && makeMatchers(ctx).rawHit(scanRaw, [dir])) {
+  if (w.authored) return deny(`the script ${sf.file} is written by this line with text that cannot be worked out exactly (a printf / echo conversion or escape), so what it runs cannot be checked; write the file out in plain text`);
+  // an inline program that writes the script: judged by its own text (string concatenation joined)
+  for (const prog of w.programs) {
+    const m = makeMatchers(ctx);
+    for (const v of flattenProgram(prog)) {
+      if (setsAdmin(v, ctx.platform) || hasDisableAll(v) || m.rawHit(v, [dir])) return deny(`the script ${sf.file} is written by an inline program that refers to a protected pipeline file or switch, so what it runs cannot be checked; write the file out literally`);
+    }
+  }
+  // the prose-masked line: a protected path, or (strictly) the bare words once quotes and escapes are stripped
+  if (w.unknown && (makeMatchers(ctx).rawHit(scanRaw, [dir]) || SENSITIVE_WORDS.test(scanRaw.replace(/['"`\\]/g, '')))) {
     return deny(`the script ${sf.file} may have been written by an earlier command on the line (its content is only known at run time) and the line refers to a protected pipeline file or switch, so what it runs cannot be checked; write the file out literally`);
   }
   return null;

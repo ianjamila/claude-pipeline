@@ -262,8 +262,8 @@ function stdoutItems(cmd) {
   };
   if (name === 'echo' || name === 'printf') {
     const pt = name === 'echo' ? null : printfText(argv);
-    if (name === 'echo') { const e = echoTexts(argv); items.push(...textItems(e.texts)); if (e.bad) items.push({ unknown: true }); } // (an escape we cannot read exactly: unknown)
-    else if (pt === null) items.push({ unknown: true }); // a conversion or escape we do not read exactly
+    if (name === 'echo') { const e = echoTexts(argv); items.push(...textItems(e.texts)); if (e.bad) items.push({ unknown: true, authored: true }); } // (an escape we cannot read exactly: unknown)
+    else if (pt === null) items.push({ unknown: true, authored: true }); // a conversion or escape we do not read exactly: text the line itself wrote
     else items.push({ text: pt });
     fromStream(s.out); // what a command substitution in the arguments prints
   } else if (['cat', 'tac', 'head', 'tail', 'less', 'more', 'bat', 'batcat'].includes(name)) {
@@ -549,7 +549,10 @@ export function writesOf(cmds) {
     const inline = INLINE_RUNNERS[name];
     if (inline) {
       const at = cmd.argv.findIndex((a, i) => i > 0 && inline.test(a));
-      if (at > 0) recs.push({ idx, dest: null, inline: [...cmd.argv.slice(at + 1), ...Object.values(cmd.env ?? {})].join(' '), items: UNKNOWN, loose: true }); // (the program, its arguments and the variables it is given)
+      if (at > 0) {
+        const program = [...cmd.argv.slice(at + 1), ...Object.values(cmd.env ?? {})].join(' ');
+        recs.push({ idx, dest: null, inline: program, items: [{ program }], loose: true });
+      } // (the program, its arguments and the variables it is given)
     }
     // a program the parser does not unwrap (strace, chroot, nsenter, a wrapper we have never seen) that is handed a writer: the writer's own writes, and a write to
     // any file (the wrapper may have changed the directory or the root) with unknown content
@@ -639,7 +642,7 @@ const nameOf = (f, s) => f.p.basename(String(s).replace(/[\\/]+$/, ''));
 function match(f, rec, P) {
   const p = f.p;
   const loose = (items) => Object.assign([...items], { loose: true }); // may or may not be the file: its place in the order is unknown
-  if (rec.inline !== undefined) return rec.inline.includes(p.basename(P)) && CAN_WRITE.test(rec.inline) ? loose(UNKNOWN) : null;
+  if (rec.inline !== undefined) return rec.inline.includes(p.basename(P)) && CAN_WRITE.test(rec.inline) ? loose(rec.items) : null;
   if (rec.dest === null) return loose(rec.items);
   const e = f.expand(rec.dest);
   // a target only known at run time may be any file its fixed parts allow (`/work/out-$n.txt` is not /work/cmp.mjs)
@@ -800,7 +803,7 @@ const MAX_CHAIN = 6; // a file copied from a file copied from a file ...
 // `pieces`: it is built from pieces and cannot be put together (a piece unknown, computed or too many), so no single piece can be judged for what the file runs.
 export function writtenTo(frames, target, { exists, readText = () => null, ignoreUnmodelled = false }) {
   if (!frames.length || !frames.some((f) => f.recs.length || f.unmodelled.size)) return null;
-  const st = { texts: new Set(), files: new Set(), scans: new Set(), unknown: false, any: false, seen: new Set(), ignoreUnmodelled, viaUnmodelled: false };
+  const st = { texts: new Set(), files: new Set(), scans: new Set(), programs: new Set(), authored: false, unknown: false, any: false, seen: new Set(), ignoreUnmodelled, viaUnmodelled: false };
   const upto = frames.length - 1;
   collect(frames, upto, frames[upto].i, target, st, 0, exists);
   if (!st.any) return null;
@@ -808,7 +811,7 @@ export function writtenTo(frames, target, { exists, readText = () => null, ignor
   const io = { exists, readText, pieces: false };
   const built = contentsOf(frames, upto, frames[upto].i, target, io, 0);
   const joined = (built ?? []).filter((x) => !st.texts.has(x));
-  return { texts: [...st.texts], files: [...st.files], scans: [...st.scans], unknown: st.unknown, viaUnmodelled: st.viaUnmodelled, joined, pieces: io.pieces };
+  return { texts: [...st.texts], files: [...st.files], scans: [...st.scans], programs: [...st.programs], authored: st.authored, unknown: st.unknown, viaUnmodelled: st.viaUnmodelled, joined, pieces: io.pieces };
 }
 
 // The links the line makes before the command: [alias, real, frame] for `ln -s REAL ALIAS` (and a hard link). A directory alias makes
@@ -901,7 +904,8 @@ function absorb(frames, fi, f, rec, items, Pv, st, depth, exists) {
   st.any = true;
   for (const it of items) {
     if (it.text !== undefined) st.texts.add(it.text);
-    else if (it.unknown) st.unknown = true;
+    else if (it.program !== undefined) st.programs.add(it.program);
+    else if (it.unknown) { st.unknown = true; if (it.authored) st.authored = true; }
     else if (it.scan !== undefined) addFiles(f, rec, it.scan, Pv, st, fi, depth, exists, 'scans');
     else if (it.abs !== undefined) addPath(frames, fi, rec, it.abs, st, depth, exists, 'files');
     else if (it.file !== undefined) addFiles(f, rec, it.file, Pv, st, fi, depth, exists, 'files', frames);
@@ -977,4 +981,10 @@ export function exportRecords(f, idx) {
     }
   }
   return out;
+}
+
+// The readings of a program's text to look for a guarded command in: as written, with string concatenation joined ('git pu'+'sh'), with quotes and escapes stripped.
+export function flattenProgram(text) {
+  const joined = String(text).replace(/['"`]\s*\+\s*['"`]/g, '');
+  return [...new Set([String(text), joined, joined.replace(/['"`\\]/g, '')])];
 }

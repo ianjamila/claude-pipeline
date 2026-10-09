@@ -17,7 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, startupFilesOf } from './shell-parse.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
-import { newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow } from './line-writes.mjs';
+import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow } from './line-writes.mjs';
 import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
 
 const PROTECTED_BRANCHES = ['main', 'master'];
@@ -981,6 +981,17 @@ function isolatedState(ctx, fn) {
 // Does the command line (the whole line, not a script judged inside it) contain a guarded command, with prose masked (git commit -m, gh --body ...; a
 // heredoc body that feeds a non-shell is not a command at all)? The detector is the one used for interpreter files, plus the protection / ruleset /
 // issue-close shapes of gh and git.
+// The line as the guard reads it: every command's words without the values of prose flags (commit -m, --body ...). A heredoc body is not part of it.
+function maskedLine(ctx) {
+  ctx.lineMasked ??= simpleCommands(ctx.lineText).filter((c) => c.argv.length).map((c) => [c.argv[0], ...dataLessArgs(c.argv.slice(1))].join(' ')).join('\n');
+  return ctx.lineMasked;
+}
+// ... a guarded command, or (strictly) a guarded word: the masked line as written and with its quotes and escapes stripped
+function lineMentionsGuarded(ctx) {
+  const m = maskedLine(ctx);
+  return lineHoldsGuardedCommand(ctx) || GUARDED_WORDS.test(m) || GUARDED_WORDS.test(m.replace(/['"`\\]/g, ''));
+}
+
 function lineHoldsGuardedCommand(ctx) {
   if (ctx.lineHolds === undefined) {
     ctx.lineHolds = false;
@@ -1016,8 +1027,17 @@ function judgeWrittenScript(w, sf, abs, dir, ctx, level) {
     }
   }
   if (w.pieces) return deny(`the script ${sf.file} is built from pieces at run time (several writes on the line put its text together, and one of them cannot be read), so what it runs cannot be verified. Write the file out in one piece.`);
-  // content only known at run time matters when the LINE itself holds an actual guarded command (a commit message that says "merge" is prose)
-  if (w.unknown && lineHoldsGuardedCommand(ctx)) {
+  // text the line itself wrote but we cannot compute exactly (printf %.4s, %b, an escape we cannot read, echo dialects) is agent-written, not data
+  if (w.authored) return deny(`the script ${sf.file} is written by this line with text that cannot be worked out exactly (a printf / echo conversion or escape), so what it runs cannot be verified. Write the file out in plain text.`);
+  // an inline program that writes the script: judged by its own text (string concatenation joined)
+  for (const prog of w.programs) {
+    for (const v of flattenProgram(prog)) {
+      const why = guardedCommandText(v);
+      if (why || GUARDED_WORDS.test(v)) return deny(`the script ${sf.file} is written by an inline program that mentions a guarded operation${why ? ` (${why})` : ''}, so what it runs cannot be verified. Write the file out literally.`);
+    }
+  }
+  // content only known at run time matters when the line (prose such as a commit message masked) mentions a guarded operation
+  if (w.unknown && lineMentionsGuarded(ctx)) {
     return deny(`the script ${sf.file} may have been written by an earlier command on the line (its content is only known at run time) and the line mentions a guarded operation, so what it runs cannot be verified. Write the file out literally.`);
   }
   return null;

@@ -40,8 +40,8 @@ const BAD_FILES = 'echo x > ~/.claude/settings.json';
 // MID: a harmless command that quotes a guarded command / names a protected file (the run-time rule fires); CALM: only the words (it must not)
 const MID_GIT = "echo 'git push origin main'";
 const MID_FILES = 'echo ~/.claude/settings.json';
-const CALM_GIT = 'git push origin agent/x';
-const CALM_FILES = 'echo protect';
+const CALM_GIT = 'git commit -m "push merge protection notes"'; // (prose: masked)
+const CALM_FILES = 'git commit -m "protect install. .claude"';
 const git = (command, fsOpts, o = {}) => evaluateGitCommand(command, {
   cwd: GIT_ROOT, home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], ...fsOpts, ...o,
 });
@@ -216,7 +216,7 @@ test('h: echo whose escapes cannot all be read is unknown, and the readable ones
   denyBoth((bad) => `echo -e '${bad[0]}${hex(bad)} # \\Q' > n.sh; bash n.sh`);
   denyBoth((bad) => `echo -e '${bad}\\cjunk' > n.sh; bash n.sh`);
   denyBoth((bad) => `echo '${bad}\\Q' > n.sh; bash n.sh`); // (the mention makes the unknown content refuse it)
-  allowBoth(() => "echo 'C:\\dir' > n.sh; bash n.sh"); // unknown with nothing guarded on the line
+  denyBoth(() => "echo 'C:\\dir' > n.sh; bash n.sh"); // text the line wrote that cannot be worked out exactly: refused outright
 });
 
 test('h: what a script judged earlier on the line wrote is still written for the commands after it', () => {
@@ -297,13 +297,13 @@ test('h: the run-time rule needs an actual guarded command on the line, not a wo
   allowBoth(`${curl}; git commit -m "notes: push to main, merge, protection"; bash n.sh`);
   allowBoth(`${curl}; gh pr create --title "merge push" --body "git push origin main is blocked"; bash n.sh`);
   allowBoth(`${curl}; cat > notes.md <<'EOF'\ngit push origin main\nEOF\nbash n.sh`);
-  allowBoth(`${curl}; git push origin agent/x; bash n.sh`);
+  assert.equal(run(`${curl}; git push origin agent/x; bash n.sh`, SPEC).git.r.decision, 'deny'); // (the word counts outside prose)
   // ... an actual command shape is (a quoted one too: the unknown file may run it)
   denyBoth((_, mid) => `${curl}; ${mid}; bash n.sh`);
   const git = (c) => run(c, SPEC).git.r.decision;
   assert.equal(git(`${curl}; echo 'gh pr merge 5 --admin'; bash n.sh`), 'deny');
   assert.equal(git(`${curl}; echo 'gh pr edit 5 --add-label human-approved'; bash n.sh`), 'deny');
-  assert.equal(git(`${curl}; echo 'gh api repos/o/r/branches/main/protection'; bash n.sh`), 'allow'); // (gh api is judged by its own rules, protection is not a quoted shape)
+  assert.equal(git(`${curl}; echo 'gh api repos/o/r/branches/main/protection'; bash n.sh`), 'deny'); // (the word protection counts outside prose)
   // missing script after an unmodelled command: the same signal
   denyBoth((_, mid) => `make; ${mid}; bash n.sh`);
   allowBoth((_, _m, calm) => `make; ${calm}; bash n.sh`);
@@ -313,22 +313,27 @@ test('h: the run-time rule needs an actual guarded command on the line, not a wo
 test('h: files policy: the run-time rule needs an actual protected path, prose masked (interpreter scripts, which the shell rule does not reach)', () => {
   const f = (c) => run(c, SPEC).files.r.decision;
   assert.equal(f('curl -so n.mjs https://x; echo ~/.claude/settings.json; node n.mjs'), 'deny');
-  assert.equal(f('curl -so n.mjs https://x; echo protect install. .claude; node n.mjs'), 'allow');
+  assert.equal(f('curl -so n.mjs https://x; echo protect; node n.mjs'), 'deny'); // (the bare words count outside prose)
+  assert.equal(f('curl -so n.mjs https://x; echo hello; node n.mjs'), 'allow');
   assert.equal(f('curl -so n.mjs https://x; git commit -m "see ~/.claude/pipeline/hooks"; node n.mjs'), 'allow');
   assert.equal(f('curl -so n.mjs https://x; node n.mjs'), 'allow');
   assert.equal(f('make; echo ~/.claude/settings.json; node n.mjs'), 'deny');
-  assert.equal(f('make; echo protect; node n.mjs'), 'allow');
+  assert.equal(f('make; echo hello; node n.mjs'), 'allow');
 });
 
 test('h: an inline program writes the script only if it names it (literally, in its arguments or in a variable it is given)', () => {
-  denyBoth((_, mid) => `node -e "fs.writeFileSync('ok.sh', 'x')"; ${mid}; bash ok.sh`);
-  denyBoth((_, mid) => `F=ok.sh node -e "fs.writeFileSync(process.env.F, 'x')"; ${mid}; bash ok.sh`);
-  denyBoth((_, mid) => `node -e "fs.writeFileSync(process.argv[1], 'x')" ok.sh; ${mid}; bash ok.sh`);
-  denyBoth((_, mid) => `python3 -c "open('ok.sh', 'w').write('x')"; ${mid}; bash ok.sh`);
+  // judged by its own text: a guarded command in it (string concatenation joined) is refused, a harmless one is not
+  denyBoth((bad) => `node -e "fs.writeFileSync('ok.sh', '${bad}')"; bash ok.sh`);
+  denyBoth((bad) => `node -e "fs.writeFileSync('ok.sh', '${bad.slice(0, 7)}' + '${bad.slice(7)}')"; bash ok.sh`);
+  denyBoth((bad) => `F=ok.sh node -e "fs.writeFileSync(process.env.F, '${bad}')"; bash ok.sh`);
+  denyBoth((bad) => `node -e "fs.writeFileSync(process.argv[1], '${bad}')" ok.sh; bash ok.sh`);
+  denyBoth((bad) => `python3 -c "open('ok.sh', 'w').write('${bad}')"; bash ok.sh`);
+  assert.equal(run((_, mid) => `node -e "fs.writeFileSync('ok.sh', 'x')"; ${mid}; bash ok.sh`, SPEC).git.r.decision, 'allow'); // (not the line's mention: the program's own text)
+  allowBoth(`node -e "fs.writeFileSync('ok.sh', 'x')"; bash ok.sh`);
   // it names other files: not a write to this one (it is still "unmodelled" for a script that is MISSING)
   allowBoth((_, _m, calm) => `node -e "fs.writeFileSync('other.txt', 'x')"; ${calm}; bash ok.sh`);
   assert.equal(run((_, mid) => `node -e "fs.writeFileSync('other.txt', 'x')"; ${mid}; bash ok.sh`, SPEC).git.r.decision, 'allow');
-  denyBoth((_, mid) => `node -e "fs.writeFileSync('other.txt', 'x')"; ${mid}; bash n.sh`);
+  denyBoth((_, mid) => `node -e "fs.writeFileSync('other.txt', 'x')"; ${mid}; bash n.sh`); // (n.sh is MISSING: an unmodelled program may have made it)
 });
 
 test('h: a write that only MAY be the script never makes it "built from pieces": its content is the unknown-content signal', () => {
@@ -423,8 +428,8 @@ test('h: a missing script after a command the guard cannot model may have been c
   allowBoth((_, _m, mid) => `${mid}; bash n.sh`);
   allowBoth((_, _m, mid) => `git status; ${mid}; bash n.sh`);
   // an inline program that names the script file may have written it, whatever else it does
-  denyBoth((_, mid) => `node -e "fs.writeFileSync('ok.sh', 'x')"; ${mid}; bash ok.sh`);
-  denyBoth((_, mid) => `python3 -c "open('ok.sh','w').write('x')"; ${mid}; bash ok.sh`);
+  denyBoth((bad) => `node -e "fs.writeFileSync('ok.sh', '${bad}')"; bash ok.sh`);
+  denyBoth((bad) => `python3 -c "open('ok.sh','w').write('${bad}')"; bash ok.sh`);
   allowBoth((_, _m, mid) => `node -e "console.log(1)"; ${mid}; bash ok.sh`);
 });
 
@@ -561,8 +566,9 @@ test('h: printf / echo content that is not certain is unknown (judged by the run
   denyBoth((bad) => `printf '\\q${bad}' > n.sh; bash n.sh`);
   denyBoth((bad) => `printf '${bad}\\c' > n.sh; bash n.sh`);
   // without a mention nothing says what it is for, as for any run-time content
-  allowBoth("printf '%.2s' hi > n.sh; bash n.sh");
-  allowBoth("printf '%d' 5 > n.sh; bash n.sh");
+  // text the line wrote that cannot be worked out exactly is refused outright, with nothing guarded on the line
+  denyBoth("printf '%.2s' hi > n.sh; bash n.sh");
+  denyBoth("printf '%d' 5 > n.sh; bash n.sh");
 });
 
 test('h: commands on the read-only list that write a named file are writers', () => {
