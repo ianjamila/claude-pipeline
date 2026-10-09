@@ -863,6 +863,7 @@ function collect(frames, upto, asOf, P, st, depth, exists) {
   const pairs = linkPairs(frames, upto, asOf);
   const names = pairs.length ? namesOf(pairs, P) : [P];
   for (const h of hitsOn(frames, upto, asOf, P)) {
+    if (h.loose && st.ignoreUnmodelled) continue; // (the real home's startup files: only the line's exact writes reach them, not a target known only at run time)
     absorb(frames, h.fi, h.f, h.rec, h.items, h.P, st, depth, exists);
     if (!h.loose && !h.rec.append) st.lastReplace = [h.fi, h.rec.idx]; // an exact write that replaces the file: what came before it no longer matters
   }
