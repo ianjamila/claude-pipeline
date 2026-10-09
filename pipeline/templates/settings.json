@@ -24,6 +24,7 @@
       "Bash(gh pr create:*)",
       "Bash(gh pr ready:*)",
       "Bash(gh pr edit:*)",
+      "Bash(gh pr comment:*)",
       "Bash(gh pr update-branch:*)",
       "Bash(gh issue list:*)",
       "Bash(gh issue view:*)",
