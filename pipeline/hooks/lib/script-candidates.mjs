@@ -27,16 +27,39 @@ export const defaultReadDir = (dir) => {
   try { return readdirSync(dir); } catch (e) { return ['ENOENT', 'ENOTDIR', 'EACCES'].includes(e?.code) ? null : false; }
 };
 
-// Does `name` match one glob segment (`*`, `?`, `[a-z]`, `[!x]`)? Case-insensitive and dotfiles included whatever the
-// shell's nocaseglob / dotglob / GLOB_DOTS settings: a candidate too many only costs a judgment.
-// A bracket expression is "any one character" and may close at EVERY `]` after it, or be a literal `[`: the parser has
-// dropped the quoting, so `[q\\]x]` and `[q"]"x]` reach us as `[q]x]` and which `]` closes is unknowable (POSIX closes the
-// first one after a leading `]`/`!`/`^`). Every reading can only match more names, never fewer. Memoised on (segment
-// index, name index), so many brackets cost polynomial time, not exponential.
+// Does `name` match one glob segment (`*`, `?`, `[a-z]`, `[!x]`)? Dotfiles are included whatever the shell's dotglob /
+// GLOB_DOTS settings: a candidate too many only costs a judgment. Every reading below can only match MORE names.
+// - Bytes, not UTF-16 units: `?` and a bracket stand for one character (1-4 UTF-8 bytes) or one byte (C locale), so each
+//   consumes any of 1 to 4 bytes; `*` any run of bytes. Letters fold case (ASCII bytes; non-ASCII letters by lower-casing
+//   both sides, which may change a length, which is why units are not compared).
+// - NFC and NFD: macOS lists decomposed names while the typed pattern is usually composed; both are tried, normalised alike.
+// - A bracket may close at EVERY `]` after it, or be a literal `[`: the parser has dropped the quoting, so `[q\\]x]` and
+//   `[q"]"x]` reach us as `[q]x]` and which `]` closes is unknowable (POSIX closes at the first one after a leading
+//   `]`/`!`/`^`).
+// Memoised on (segment index, name index), so many brackets cost polynomial time; every step counts against the shared
+// budget (`budget.over` is set when it runs out).
 function segmentMatches(seg, name, budget) {
-  const s = seg.toLowerCase();
-  const n = name.toLowerCase();
+  const seen = new Set();
+  for (const f of [(x) => x, (x) => x.normalize('NFC'), (x) => x.normalize('NFD')]) {
+    for (const g of [(x) => x, (x) => x.toLowerCase()]) {
+      const pat = g(f(seg));
+      const nm = g(f(name));
+      const key = `${pat}\u0000${nm}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (bytesMatch(Buffer.from(pat, 'utf8'), Buffer.from(nm, 'utf8'), budget)) return true;
+      if (budget.over) return false;
+    }
+  }
+  return false;
+}
+
+const foldByte = (b) => (b >= 0x41 && b <= 0x5a ? b + 32 : b);
+
+function bytesMatch(s, n, budget) {
   const dead = new Set();
+  const closes = [];
+  s.forEach((b, i) => { if (b === 0x5d) closes.push(i); });
   const m = (i, j) => {
     if (budget.over || ++budget.steps > MAX_GLOB_STEPS) { budget.over = true; return false; }
     if (i === s.length) return j === n.length;
@@ -44,12 +67,16 @@ function segmentMatches(seg, name, budget) {
     if (dead.has(key)) return false;
     const c = s[i];
     let ok = false;
-    if (c === '*') { for (let k = j; k <= n.length && !ok; k++) ok = m(i + 1, k); }
-    else if (c === '?') ok = j < n.length && m(i + 1, j + 1);
-    else if (c === '[') {
-      ok = j < n.length && (n[j] === '[' ? m(i + 1, j + 1) : false);
-      for (let q = s.indexOf(']', i + 2); q > 0 && !ok && j < n.length; q = s.indexOf(']', q + 1)) ok = m(q + 1, j + 1);
-    } else ok = j < n.length && n[j] === c && m(i + 1, j + 1);
+    if (c === 0x2a) { for (let k = j; k <= n.length && !ok; k++) ok = m(i + 1, k); } // *
+    else if (c === 0x3f) { for (let w = 1; w <= 4 && j + w <= n.length && !ok; w++) ok = m(i + 1, j + w); } // ?
+    else if (c === 0x5b) { // [
+      ok = j < n.length && n[j] === 0x5b && m(i + 1, j + 1);
+      for (const q of closes) {
+        if (q < i + 2) continue;
+        for (let w = 1; w <= 4 && j + w <= n.length && !ok; w++) ok = m(q + 1, j + w);
+        if (ok) break;
+      }
+    } else ok = j < n.length && foldByte(n[j]) === foldByte(c) && m(i + 1, j + 1);
     if (!ok) dead.add(key);
     return ok;
   };

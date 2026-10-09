@@ -607,7 +607,7 @@ test('G5: a ] that was escaped or quoted inside a bracket reaches the guard as a
   denyBoth('bash [!]x].sh', { 'a.sh': 'bad' });
   denyBoth('bash [!]x]*', { 'a.sh': 'bad' });
   denyBoth('bash [a]x]*.sh', { 'ax]y.sh': 'bad' });
-  allowBoth('bash [q\\]x].sh', { 'ok.sh': 'ok', 'qq.sh': 'bad' }); // no name has the shape of any reading
+  allowBoth('bash [q\\]x].sh', { 'ok.sh': 'ok', 'qqqqq.sh': 'bad' }); // no name has the shape of any reading (a bracket stands for up to 4 bytes)
 });
 
 test('G5: many brackets in one segment stay cheap and fail closed', () => {
@@ -671,4 +671,29 @@ test('G7: a huge or pathological glob segment is refused quickly, and a director
     assert.equal(r.git.decision, 'deny', `git: ${c}`);
     assert.equal(r.files.decision, 'deny', `files: ${c}`);
   }
+});
+
+// ---- round 7: ? and [..] match a character (UTF-8) or a byte (C locale), and names come in NFC or NFD ---------------------
+
+test('G8: ? and a bracket match a whole multi-byte character, or any of its bytes', () => {
+  denyBoth('bash ?.sh', { '😀.sh': 'bad' }); // one character, four bytes, two UTF-16 units
+  denyBoth('bash ????.sh', { '😀.sh': 'bad' }); // the C locale: four bytes
+  denyBoth('bash ??.sh', { '😀.sh': 'bad' });
+  denyBoth('bash ?.sh', { 'İ.sh': 'bad' }); // lower-casing changes its length
+  denyBoth('bash ?.sh', { 'é.sh': 'bad' });
+  denyBoth('bash [!a].sh', { '😀.sh': 'bad' });
+  denyBoth('bash [😀].sh', { '😀.sh': 'bad' });
+  denyBoth('bash x?y.sh', { 'x😀y.sh': 'bad' });
+  denyBoth('bash ./sub/?.sh', { 'sub/😀.sh': 'bad' });
+  denyBoth('bash *.sh', { '😀.sh': 'bad' });
+  // composed and decomposed spellings of the same name (macOS lists NFD names, the typed pattern is NFC)
+  denyBoth('bash é*.sh', { ['éx.sh']: 'bad' });
+  denyBoth('bash é*.sh', { ['éx.sh']: 'bad' });
+  denyBoth('bash café.s?', { ['café.sh']: 'bad' });
+  // non-ASCII letters still fold case, and plain ASCII behaves as before
+  denyBoth('bash É*.SH', { ['éx.sh']: 'bad' });
+  denyBoth('bash Ж*.sh', { ['жx.sh']: 'bad' }); // no decomposition to fold through
+  denyBoth('bash F*.SH', { 'f.sh': 'bad' });
+  allowBoth('bash x?y.sh', { 'xzzzzzy.sh': 'bad', 'other.sh': 'ok' }); // more than four bytes between: no match
+  allowBoth('bash q?.sh', { 'p😀.sh': 'bad' });
 });
