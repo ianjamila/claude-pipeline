@@ -12,7 +12,7 @@ export const meta = {
   usage: [
     'pipeline model-proof (--tag TAG | --agent-id ID) [--expect-model claude-fable-] [--expect-effort high]',
     '                     [--expect-agent-type TYPE] [--expect-meta-model MODEL] [--projects-dir DIR] [--max-age-ms N]',
-    '  -> {ok, transcript, meta, models, efforts, errors, finalAssistantText}; exit 0 proven, 1 mismatch, 2 not found/unreadable',
+    '  -> {ok, transcript, meta, models, efforts, errors, finalAssistantText, stopReasonMissing, finalVia}; exit 0 proven, 1 mismatch, 2 not found/unreadable',
   ].join('\n'),
 };
 
