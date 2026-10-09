@@ -17,6 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { commandName, simpleCommands, splitArgs, scriptFileOf } from './shell-parse.mjs';
 import { catchAllReason, guardedCommandText } from './guarded-text.mjs';
+import { scriptCandidates, defaultReadDir, MAX_CANDIDATE_JUDGMENTS } from './script-candidates.mjs';
 
 const PROTECTED_BRANCHES = ['main', 'master'];
 const APPROVAL_LABELS = ['human-approved', 'test-change-approved'];
@@ -116,14 +117,21 @@ function expandVars(text, vars) {
 
 // A variable assigned more than once in what is judged (`B=main; false && B=agent/x`) is unknown from then on: which
 // assignment ran depends on control flow the parser does not model, so its value is left as `$B` (dynamic).
-function setVar(ctx, k, v) {
+// Only an assignment on the line itself (level 0) makes a tainted variable known again; one inside a judged script is ignored for it.
+function setVar(ctx, k, v, level) {
+  if (level === 0) ctx.tainted.delete(k);
+  else if (ctx.tainted.has(k)) return;
   if (k in ctx.vars || ctx.unsureVars.has(k)) { delete ctx.vars[k]; ctx.unsureVars.add(k); } else ctx.vars[k] = v;
 }
-const recordVars = (env, ctx) => { for (const k of Object.keys(env)) setVar(ctx, k, env[k]); };
+const recordVars = (env, ctx, level) => { for (const k of Object.keys(env)) setVar(ctx, k, env[k], level); };
 
-// Every variable name assigned on the line so far, including the ones that became unknown by being assigned twice.
-// Anything that inspects WHICH variables are set (not their values) must use this, never Object.keys(ctx.vars) alone.
-const assignedNames = (ctx) => [...Object.keys(ctx.vars), ...ctx.unsureVars];
+// A variable whose value is unknown: assigned more than once (or where it may not run), or tainted (a script that may
+// or may not be the one sourced earlier on the line may have set it).
+const unsureVar = (ctx, k) => ctx.unsureVars.has(k) || ctx.tainted.has(k);
+
+// Every variable name assigned on the line so far, including the ones that became unknown by being assigned twice or
+// tainted. Anything that inspects WHICH variables are set (not their values) must use this, never Object.keys(ctx.vars) alone.
+const assignedNames = (ctx) => [...Object.keys(ctx.vars), ...ctx.unsureVars, ...ctx.tainted];
 
 // A variable that selects the repository (GIT_DIR, GH_REPO). Only this command's own prefix (`NAME=v git …`,
 // `env NAME=v git …`) is certain to reach it. An assignment or export earlier on the line may never run
@@ -131,7 +139,7 @@ const assignedNames = (ctx) => [...Object.keys(ctx.vars), ...ctx.unsureVars];
 // model, so the value is unknown (`known: false`) and the caller must fail closed. `value` is undefined when unset.
 function envVar(env, ctx, name) {
   if (Object.hasOwn(env, name)) return { known: true, value: env[name] };
-  if (name in ctx.vars || ctx.unsureVars.has(name)) return { known: false, value: undefined };
+  if (name in ctx.vars || unsureVar(ctx, name)) return { known: false, value: undefined };
   return { known: true, value: undefined };
 }
 
@@ -140,9 +148,9 @@ function envVar(env, ctx, name) {
 // every pattern below matches the expanded text, so the whole git / gh command fails closed instead.
 const VAR_REF = /\$(?:\{([A-Za-z_][A-Za-z0-9_]*)|([A-Za-z_][A-Za-z0-9_]*))/g;
 function unsureVarUsed(words, ctx) {
-  if (ctx.unsureVars.size === 0) return null;
+  if (ctx.unsureVars.size === 0 && ctx.tainted.size === 0) return null;
   for (const w of words) {
-    for (const m of String(w).matchAll(VAR_REF)) if (ctx.unsureVars.has(m[1] ?? m[2])) return m[1] ?? m[2];
+    for (const m of String(w).matchAll(VAR_REF)) if (unsureVar(ctx, m[1] ?? m[2])) return m[1] ?? m[2];
   }
   return null;
 }
@@ -405,6 +413,7 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
 
   // aliases defined on this very line (`git config alias.p push && git p …`, `git -c alias.p=push p …`)
   const aliasConfig = g.configs.find((c) => c.key === `alias.${sub.toLowerCase()}`);
+  if (ctx.aliasUnsure.has(`git:${sub.toLowerCase()}`)) return deny(`the git alias "${sub}" may have been (re)defined by a script that may or may not run, so what it expands to cannot be verified. Write the command out.`);
   const alias = aliasConfig ? aliasConfig.value : ctx.gitAliases[sub.toLowerCase()];
   if (alias !== undefined && level < MAX_NESTING) {
     if (alias.startsWith('!')) {
@@ -672,6 +681,7 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
     }
     return null;
   }
+  if (ctx.aliasUnsure.has(`gh:${group}`)) return deny(`the gh alias "${group}" may have been (re)defined by a script that may or may not run, so what it expands to cannot be verified. Write the command out.`);
   const alias = ctx.ghAliases[group];
   if (alias !== undefined && level < MAX_NESTING) {
     if (alias.shell) {
@@ -774,22 +784,29 @@ const isNodeModulesOrPipelineHome = (p) => /[\\/]node_modules[\\/]/.test(p) || /
 // unknown); one that does not exist runs nothing. Programs run by path and interpreter files are only scanned when
 // readable (a binary, a huge generated file or a package under node_modules is not ours to judge).
 function checkScriptFile(sf, dir, ctx, level) {
-  const file = expandVars(sf.file, ctx.vars);
-  if (/^\$\{?HOME\}?(?=\/|$)/.test(file)) return checkScriptFile({ ...sf, file: ctx.home + file.replace(/^\$\{?HOME\}?/, '') }, dir, ctx, level);
-  if (DYNAMIC.test(file)) {
+  if (sf.ambiguous) return checkCandidateScripts(sf, dir, ctx, level);
+  // a candidate is a final path (a glob match, or a word already expanded): the shell never expands it a second time
+  const file = sf.candidate ? sf.file : expandVars(sf.file, ctx.vars);
+  if (!sf.candidate && /^\$\{?HOME\}?(?=\/|$)/.test(file)) return checkScriptFile({ ...sf, file: ctx.home + file.replace(/^\$\{?HOME\}?/, '') }, dir, ctx, level);
+  if (!sf.candidate && DYNAMIC.test(file)) {
+    // quoting is lost (`'x$y.sh'` reads as `x$y.sh`): if the word as written is a file, judge it before the textual rule
+    const lit = checkScriptFile({ kind: sf.kind, file: sf.file, candidate: true }, dir, ctx, level);
+    if (lit) return lit;
     return sf.kind !== 'exec' && GUARDED_WORDS.test(ctx.fullText)
       ? deny(`the script "${sf.file}" is named at run time and the line mentions a guarded operation, so what it runs cannot be verified. Name the file.`)
       : null;
   }
-  const home = file === '~' || file.startsWith('~/') ? ctx.home + file.slice(1) : file;
+  const home = !sf.candidate && (file === '~' || file.startsWith('~/')) ? ctx.home + file.slice(1) : file;
   // a relative script after a cd that may not have run: which file runs is unknown, never the starting directory's
   if (dir === null && !path.isAbsolute(home)) return deny(`cannot tell which directory this runs in, so which ${sf.file} runs cannot be verified. Use an absolute path, or chain the cd with &&.`);
   const abs = path.resolve(dir ?? ctx.cwd, home);
   const text = ctx.readText(abs);
   if (typeof text !== 'string') {
+    if (sf.candidate && ctx.readDir(abs)) return null; // a shell cannot run a directory
     if (sf.kind === 'shell' && ctx.pathExists(abs)) return deny(`cannot read the script ${sf.file} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified.`);
     return null; // missing: nothing will run
   }
+  if (sf.candidate && --ctx.judgeBudget < 0) return deny('too many script files to judge (candidate scripts that run candidate scripts), so what they run cannot be verified. Name the script file.');
   let kind = sf.kind;
   if (kind === 'exec') {
     if (text.slice(0, 4096).includes('\u0000')) return null; // a binary
@@ -802,8 +819,92 @@ function checkScriptFile(sf, dir, ctx, level) {
     return why ? deny(`the program ${sf.file} contains a guarded command (${why}); it cannot be verified by the guard. Run the operation directly.`) : null;
   }
   if (level >= MAX_NESTING) return deny(`the script ${sf.file} is nested too deeply (scripts running scripts) to verify.`);
-  const v = text.length > MAX_LINE_CHARS ? judgeLongText(text) : evalString(text, dir, ctx, level + 1);
+  const v = judgeScoped(text, dir, ctx, level, sf);
   return v.decision === 'deny' ? deny(`the script ${sf.file} would run a blocked command: ${v.reason}`) : null;
+}
+
+// Variables set inside a script do not leave a child shell (`bash f.sh`, `./f`): the line's own values stay. `source` does
+// change the caller's variables, which is believed for a named file; a candidate that may or may not be the sourced file
+// puts the line's old values back and marks the variables it set as uncertain (a later use is also unknown at run time).
+// What a script judged here may change, by ctx field:
+//   vars, tainted, unsureVars     shell-local: die with a child shell (restored), a speculative source taints them (below)
+//   branches                      repository state: a child really switches the branch, so a definite script's change is kept;
+//                                 a speculative candidate may not run, so what it changed becomes an unknown branch
+//   cfgDirty, envCfgDirty         repository/global config: only ever set, never restored (a candidate that may not run
+//                                 still leaves them dirty); envCfgDirty is recomputed from vars AND tainted names
+//   gitAliases, ghAliases         config on disk: kept; one a speculative candidate (re)defines is also unsure (aliasUnsure)
+//   cwd, home, fullText, readers  constants of the evaluation; judgeBudget is shared on purpose (never restored)
+// (a `cd` inside a sourced file is not followed: evalString's directory is local to each call)
+function judgeScoped(text, dir, ctx, level, sf) {
+  if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
+  if (sf.sourced && !sf.candidate) return evalString(text, dir, ctx, level + 1);
+  const saved = Object.assign(Object.create(null), ctx.vars);
+  const savedTaint = new Set(ctx.tainted);
+  const savedUnsure = new Set(ctx.unsureVars);
+  const spec = sf.candidate ? { branches: new Map(ctx.branches), git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases } } : null;
+  try {
+    return evalString(text, dir, ctx, level + 1);
+  } finally {
+    if (spec) { // anything added, changed or removed: unknown (it may not have run), never the candidate's value nor the old one
+      for (const d of new Set([...spec.branches.keys(), ...ctx.branches.keys()])) {
+        if (spec.branches.get(d) !== ctx.branches.get(d)) ctx.branches.set(d, { name: null, trackMain: false });
+      }
+      for (const n of new Set([...Object.keys(spec.git), ...Object.keys(ctx.gitAliases)])) {
+        if (spec.git[n] !== ctx.gitAliases[n]) ctx.aliasUnsure.add(`git:${n}`);
+      }
+      for (const n of new Set([...Object.keys(spec.gh), ...Object.keys(ctx.ghAliases)])) {
+        if (spec.gh[n] !== ctx.ghAliases[n]) ctx.aliasUnsure.add(`gh:${n}`);
+      }
+    }
+    const after = Object.assign(Object.create(null), ctx.vars);
+    for (const k of Object.keys(ctx.vars)) delete ctx.vars[k];
+    Object.assign(ctx.vars, saved);
+    if (!sf.sourced) {
+      // a child shell takes nothing back up, taint and unsure variables included
+      ctx.tainted.clear();
+      for (const k of savedTaint) ctx.tainted.add(k);
+      ctx.unsureVars.clear();
+      for (const k of savedUnsure) ctx.unsureVars.add(k);
+    } else {
+      // uncertain from here on and only ever more so: unknown to every use ($F stays $F), and a word that picks the script is refused
+      for (const k of new Set([...Object.keys(after), ...Object.keys(saved)])) {
+        if (after[k] === saved[k]) continue;
+        ctx.tainted.add(k);
+        delete ctx.vars[k];
+      }
+    }
+  }
+}
+
+// A word before the script expands at run time (`X=+n; bash $X f.sh`, `bash $(..) f.sh`, `source $X`, `bash *.sh`), so which
+// word the shell runs is unknown. Judge every word that could be it (see script-candidates.mjs) like a named script. A
+// word that is still unknown (`$UNSET`) cannot be judged: denied when the line mentions a guarded operation, as for a
+// script named at run time.
+function checkCandidateScripts(sf, dir, ctx, level) {
+  const here = path.resolve(dir ?? ctx.cwd);
+  const expand = (w) => {
+    let e = expandVars(w, ctx.vars).replace(/^\$\{?HOME\}?(?=\/|$)/, ctx.home);
+    if (e === '~' || e.startsWith('~/')) e = ctx.home + e.slice(1);
+    return e;
+  };
+  // a variable a sourced script may have set picks the script: refused whatever else is on the line
+  for (const w of sf.words) {
+    for (const m of w.matchAll(/\$(?:\{(\w+)|(\w+))/g)) {
+      if (ctx.tainted.has(m[1] ?? m[2])) return deny(`the script is picked by $${m[1] ?? m[2]}, which a script sourced earlier on the line may have set, so it cannot be verified. Name the file.`);
+    }
+  }
+  // after a cd that may not have run, a relative word (or a glob over one) names a file in an unknown directory
+  if (dir === null && sf.words.some((w) => !path.isAbsolute(expand(w)))) return deny('cannot tell which directory this runs in, so which script it runs cannot be verified. Use an absolute path, or chain the cd with &&.');
+  const c = scriptCandidates(sf, { expand, dirs: [here], joinPath: (d, r) => path.resolve(d, r), readDir: ctx.readDir, ifs: ctx.vars.IFS });
+  if (c.over) return deny('too many words, a glob matching too many files, or glob syntax that cannot be resolved could be the script this command runs, so it cannot be verified. Name the script file.');
+  if (c.dynamic && GUARDED_WORDS.test(ctx.fullText)) {
+    return deny('which word is the script this command runs is only known at run time ($VAR / $(...) / a glob) and the line mentions a guarded operation, so it cannot be verified. Name the file and write the options literally.');
+  }
+  for (const file of c.files) {
+    const v = checkScriptFile({ kind: sf.kind, file, candidate: true, sourced: sf.sourced }, dir, ctx, level);
+    if (v) return v;
+  }
+  return null;
 }
 
 // ---- entry point ----------------------------------------------------------------------------------------
@@ -941,7 +1042,7 @@ function evalString(str, startDir, ctx, level) {
   // A variable whose value is not certain (see collectAssignments) denies the line when it reaches git / gh, a command
   // that runs code, cd / pushd / popd or a command name: the checks below read the expanded text.
   collectAssignments(cmds, ctx);
-  if (ctx.unsureVars.size) {
+  if (ctx.unsureVars.size || ctx.tainted.size) {
     const unsure = unsureVarReachingCommand(cmds, ctx);
     if (unsure !== null) return deny(`$${unsure} is assigned more than once (or where it may not run) on this line, so its value at run time cannot be verified. Assign it once, unconditionally.`);
   }
@@ -967,13 +1068,13 @@ function evalString(str, startDir, ctx, level) {
       const orExits = cmds[i + 1]?.sep === '||' && ['exit', 'return'].includes(cmds[i + 1].argv[0]) && cmds[i + 2]?.sep !== '|' && cmds[i + 2]?.sep !== '&';
       if (changesState && (inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) || (cmds[i + 1]?.sep === '||' && !orExits))) uncertain = true;
     }
-    if (!argv.length) { recordVars(c.env, ctx); continue; } // a bare `NAME=value`
+    if (!argv.length) { recordVars(c.env, ctx, level); continue; } // a bare `NAME=value`
     const name = baseName(argv[0]);
     let verdict = null;
     if (VAR_BUILTINS.includes(name)) {
       for (const a of argv.slice(1)) {
         const m = /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/.exec(a);
-        if (m) setVar(ctx, m[1], m[2]);
+        if (m) setVar(ctx, m[1], m[2], level);
       }
     } else if (name === 'cd' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name, argv, ctx);
     else if (name === 'git' || name === 'gh') {
@@ -991,8 +1092,11 @@ function evalString(str, startDir, ctx, level) {
         const why = catchAllReason(argv);
         if (why) verdict = deny(`${name} was given a string that contains a guarded command (${why}). Run the operation directly so it can be checked.`);
       }
-      const sf = verdict ? null : scriptFileOf(argv);
-      if (sf) verdict = checkScriptFile(sf, dir, ctx, level);
+      const sf = verdict ? null : scriptFileOf(argv, c.raw, str);
+      if (sf) {
+        if (name === 'source' || name === '.') sf.sourced = true;
+        verdict = checkScriptFile(sf, dir, ctx, level);
+      }
     }
     if (verdict && verdict.decision === 'deny') return verdict;
     if (SOURCING.includes(name)) {
@@ -1020,13 +1124,14 @@ export function evaluateGitCommand(command, {
   issueLabels = () => { throw new Error('no issue label lookup is available'); },
   readText = defaultReadText,
   pathExists = existsSync,
+  readDir = defaultReadDir,
 } = {}) {
   const text = typeof command === 'string' ? command : String(command ?? '');
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   const base = cwd || process.cwd();
   const ctx = {
-    cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, fullText: text,
-    vars: Object.create(null), unsureVars: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
+    cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, readDir, judgeBudget: MAX_CANDIDATE_JUDGMENTS, fullText: text,
+    vars: Object.create(null), unsureVars: new Set(), tainted: new Set(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
     branches: new Map(), cfgDirty: false, envCfgDirty: false,
   };
   return evalString(text, path.resolve(base), ctx, 0);
