@@ -8,7 +8,7 @@
 // ever lives in fake file contents.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolve, dirname, join } from 'node:path';
+import { resolve, dirname, basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
@@ -18,13 +18,14 @@ import { defaultReadDir } from '../pipeline/hooks/lib/script-candidates.mjs';
 
 // A fake file system. `files`: path -> text (null = exists but cannot be read); `dirs`: directory paths.
 // Paths are relative to `root` unless absolute. readDir answers like fs.readdirSync (null when not a directory).
+// Every key is resolved, absolute ones too: lookups go through resolve(), which on Windows turns `/home/u` into `D:\home\u`.
 function fakeFs(root, files, dirs = []) {
-  const abs = (p) => (p.startsWith('/') ? p : resolve(root, p));
+  const abs = (p) => resolve(root, p);
   const F = Object.fromEntries(Object.entries(files).map(([k, v]) => [abs(k), v]));
   const D = new Set([root, ...dirs.map(abs)].map((p) => resolve(p)));
   const names = (d) => {
     const out = new Set();
-    for (const p of [...Object.keys(F), ...D]) if (p !== d && dirname(p) === d) out.add(p.slice(d.length + (d.endsWith('/') ? 0 : 1)));
+    for (const p of [...Object.keys(F), ...D]) if (p !== d && dirname(p) === d) out.add(basename(p));
     return [...out];
   };
   return {
@@ -584,13 +585,16 @@ test('G3: a directory that cannot be listed for another reason than "it is not t
   // an unreadable directory is no directory: a candidate that is one is read (and denied) as before
   assert.equal(defaultReadDir(join(tmpdir(), 'no-such-dir-g3')), null); // ENOENT
   assert.equal(defaultReadDir(fileURLToPath(import.meta.url)), null); // ENOTDIR
-  assert.equal(defaultReadDir(join(tmpdir(), 'x'.repeat(300))), false); // ENAMETOOLONG
+  assert.equal(defaultReadDir(join(tmpdir(), 'a\0b')), false); // ERR_INVALID_ARG_VALUE, on every platform
+  // Windows reports a too-long name as ENOENT, so ENAMETOOLONG is only provoked elsewhere
+  if (process.platform !== 'win32') assert.equal(defaultReadDir(join(tmpdir(), 'x'.repeat(300))), false); // ENAMETOOLONG
   assert.ok(Array.isArray(defaultReadDir(dirname(fileURLToPath(import.meta.url)))));
 });
 
 // ---- round 4: backslash in a program path; a ] that was escaped or quoted inside a bracket --------------------------
 
-test('G4: a backslash is an ordinary file name character: a program path holding one is judged', () => {
+// Windows has no file name holding a backslash (it is the separator there), so the case cannot arise
+test('G4: a backslash is an ordinary file name character: a program path holding one is judged', { skip: process.platform === 'win32' }, () => {
   const spec = { 'a\\b.sh': 'bad', 'ok.sh': 'ok' };
   for (const c of ["'./a\\b.sh'", './a\\\\b.sh', './a\\\\b.s*', "X=./a; $X'\\b.sh'", "D=.; $D/'a\\b.sh'", "bash 'a\\b.sh'", "source a\\\\b.sh"]) denyBoth(c, spec);
   allowBoth("'./c\\d.sh'", spec); // missing: nothing runs
