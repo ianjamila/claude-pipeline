@@ -25,30 +25,32 @@ export const defaultReadDir = (dir) => {
   try { return readdirSync(dir); } catch (e) { return ['ENOENT', 'ENOTDIR', 'EACCES'].includes(e?.code) ? null : false; }
 };
 
-// Index of the `]` closing the bracket expression that opens at seg[k], or -1 (then the `[` is an ordinary character).
-// POSIX: after `[` (and one optional `!` or `^`) a `]` is a member, not the end: `[!]x]` is "any char but ] or x".
-function bracketEnd(seg, k) {
-  let j = k + 1;
-  if (seg[j] === '!' || seg[j] === '^') j++;
-  if (seg[j] === ']') j++;
-  return seg.indexOf(']', j);
-}
-
-// Names matching one glob segment (`*`, `?`, `[a-z]`, `[!x]`). Case-insensitive and dotfiles included whatever the
-// shell's nocaseglob / dotglob / GLOB_DOTS settings: a candidate too many only costs a judgment. A bracket expression
-// becomes "any one character": its exact members (ranges, classes, negation, locale collation) can never under-match.
-function segmentRegExp(seg) {
-  let re = '';
-  for (let k = 0; k < seg.length; k++) {
-    const c = seg[k];
-    if (c === '*') re += '[^/]*';
-    else if (c === '?') re += '[^/]';
-    else if (c === '[' && bracketEnd(seg, k) > 0) {
-      re += '[^/]';
-      k = bracketEnd(seg, k);
-    } else re += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
-  }
-  return new RegExp(`^${re}$`, 'i');
+// Does `name` match one glob segment (`*`, `?`, `[a-z]`, `[!x]`)? Case-insensitive and dotfiles included whatever the
+// shell's nocaseglob / dotglob / GLOB_DOTS settings: a candidate too many only costs a judgment.
+// A bracket expression is "any one character" and may close at EVERY `]` after it, or be a literal `[`: the parser has
+// dropped the quoting, so `[q\\]x]` and `[q"]"x]` reach us as `[q]x]` and which `]` closes is unknowable (POSIX closes the
+// first one after a leading `]`/`!`/`^`). Every reading can only match more names, never fewer. Memoised on (segment
+// index, name index), so many brackets cost polynomial time, not exponential.
+function segmentMatches(seg, name) {
+  const s = seg.toLowerCase();
+  const n = name.toLowerCase();
+  const dead = new Set();
+  const m = (i, j) => {
+    if (i === s.length) return j === n.length;
+    const key = i * (n.length + 1) + j;
+    if (dead.has(key)) return false;
+    const c = s[i];
+    let ok = false;
+    if (c === '*') { for (let k = j; k <= n.length && !ok; k++) ok = m(i + 1, k); }
+    else if (c === '?') ok = j < n.length && m(i + 1, j + 1);
+    else if (c === '[') {
+      ok = j < n.length && (n[j] === '[' ? m(i + 1, j + 1) : false);
+      for (let q = s.indexOf(']', i + 2); q > 0 && !ok && j < n.length; q = s.indexOf(']', q + 1)) ok = m(q + 1, j + 1);
+    } else ok = j < n.length && n[j] === c && m(i + 1, j + 1);
+    if (!ok) dead.add(key);
+    return ok;
+  };
+  return m(0, 0);
 }
 
 // Existing paths `pattern` matches, written the way the pattern was (`sub/*.sh` -> `sub/a.sh`), relative to `dir`.
@@ -68,11 +70,9 @@ function globMatches(pattern, dir, readDir, joinPath, budget) {
     const names = readDir(joinPath(dir, pre === '' ? '.' : pre));
     if (names === null) return; // not a directory (or nothing the shell could list): nothing matches
     if (!Array.isArray(names)) { budget.over = true; return; } // could not be listed: refuse
-    let re;
-    try { re = segmentRegExp(seg); } catch { budget.over = true; return; } // a bracket expression JS rejects
     for (const n of names) {
       if (++budget.work > MAX_GLOB_WORK) { budget.over = true; return; }
-      if (re.test(n)) walk(i + 1, add(pre, n));
+      if (segmentMatches(seg, n)) walk(i + 1, add(pre, n));
     }
   };
   walk(0, abs ? '/' : '');

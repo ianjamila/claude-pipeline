@@ -597,3 +597,25 @@ test('G4: a backslash is an ordinary file name character: a program path holding
   assert.deepEqual(scriptFileOf(['./a\\b.sh'], "'./a\\b.sh'"), { kind: 'exec', file: './a\\b.sh' });
   assert.equal(scriptFileOf(['$X\\b.sh'], '$X\\\\b.sh').ambiguous, true);
 });
+
+test('G5: a ] that was escaped or quoted inside a bracket reaches the guard as a plain ]: every close is tried', () => {
+  const spec = { 'q.sh': 'bad', 'ok.sh': 'ok' };
+  for (const c of ['bash [q\\]x].sh', 'bash [q"]"x].sh', "bash [q']'x].sh", './[q\\]x].sh', 'source [q\\]x].sh', 'bash sub/../[q\\]x].sh']) denyBoth(c, spec);
+  // the reading with a literal [ (an escaped one) is matched too, and so is the POSIX reading
+  denyBoth('bash \\[q].sh', { '[q].sh': 'bad' });
+  denyBoth('bash \\[q]*.sh', { '[q]x.sh': 'bad' });
+  denyBoth('bash [!]x].sh', { 'a.sh': 'bad' });
+  denyBoth('bash [!]x]*', { 'a.sh': 'bad' });
+  denyBoth('bash [a]x]*.sh', { 'ax]y.sh': 'bad' });
+  allowBoth('bash [q\\]x].sh', { 'ok.sh': 'ok', 'qq.sh': 'bad' }); // no name has the shape of any reading
+});
+
+test('G5: many brackets in one segment stay cheap and fail closed', () => {
+  const seg = '[a]b]'.repeat(30);
+  const t0 = Date.now();
+  denyBoth(`bash ${seg}.sh`, { [`${'x'.repeat(30)}.sh`]: 'bad' }); // matched through the 30 "one char" readings
+  allowBoth(`bash ${seg}.sh`, { 'zz.sh': 'ok', [`${'x'.repeat(31)}.sh`]: 'ok' });
+  const names = Object.fromEntries(Array.from({ length: 200 }, (_, i) => [`${'a'.repeat(40)}${i}.sh`, 'ok']));
+  allowBoth(`bash ${'[a]*]'.repeat(30)}z.sh`, names);
+  assert.ok(Date.now() - t0 < 3000, `took ${Date.now() - t0} ms`);
+});
