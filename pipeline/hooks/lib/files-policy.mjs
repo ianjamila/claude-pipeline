@@ -19,6 +19,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
 import { simpleCommands, commandName, scriptFileOf } from './shell-parse.mjs';
+import { scriptCandidates, defaultReadDir, MAX_CANDIDATE_JUDGMENTS } from './script-candidates.mjs';
 
 const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
@@ -172,6 +173,7 @@ function makeCtx(opts) {
     vars: {}, // same-line shell assignments (D=$HOME/.claude), filled in once the line is parsed
     dynamic: false, // set when a scan had to be skipped for size; callers fail closed
     readText: opts.readText ?? defaultReadText,
+    readDir: opts.readDir ?? defaultReadDir,
     admin: (opts.env ?? process.env).PIPELINE_ADMIN === '1',
     hit: (p) => { const q = unFirm(p); return roots.some((r) => isInside(q, r, platform)); },
     hitAncestor: (p) => { const q = unFirm(p); return ancestors.some((a) => samePath(q, a, platform)); },
@@ -326,7 +328,8 @@ function evaluateMcp(tool, ti, input, opts) {
   return allow();
 }
 
-export function evaluateFileTool(input, opts = {}) {
+export const evaluateFileTool = denyUnverifiable(evaluateFileToolUnchecked);
+function evaluateFileToolUnchecked(input, opts = {}) {
   const tool = typeof input?.tool_name === 'string' ? input.tool_name : '';
   const ti = input?.tool_input && typeof input.tool_input === 'object' ? input.tool_input : {};
   if (tool.startsWith('mcp__')) return evaluateMcp(tool, ti, input, opts);
@@ -361,7 +364,24 @@ export function evaluateFileTool(input, opts = {}) {
 
 // ---- Bash: text normalisation ---------------------------------------------------------------------
 
-const MARK = '\u0001';
+// A private-use character the text does not contain, to mark a spot while rewriting it. A fixed one could be a character of a
+// file name (`a<U+E000>b.sh`) and would rewrite that name into another. A text holding all 6,400 of them is not judged: no
+// command needs that, and a longer mark could be formed across the joins of the rewrite (or grow without bound).
+class UnverifiableText extends Error {}
+function freeMark(text) {
+  for (let c = 0xe000; c <= 0xf8ff; c++) {
+    const m = String.fromCharCode(c);
+    if (!text.includes(m)) return m;
+  }
+  throw new UnverifiableText('the command holds every private-use Unicode character, so it cannot be checked; remove them');
+}
+// The entry points answer deny for text they cannot normalise (a hook that throws lets the command through).
+// (a declaration: the entry points above are built from it when the module loads)
+function denyUnverifiable(fn) {
+  return (...args) => {
+    try { return fn(...args); } catch (e) { if (e instanceof UnverifiableText) return deny(e.message); throw e; }
+  };
+}
 
 // Every way the home directory is spelled in a shell line or a one-liner script. A trailing `+ '`, `, '` or
 // `.joinpath('` (string concatenation / path.join) is swallowed so `process.env.HOME+'/.claude/x'` reads as one path.
@@ -389,14 +409,24 @@ const HOME_RE = new RegExp(
 );
 const TILDE_RE = /(^|[\s'"`=:(,[{;|&<>+])~(?=\/|$|[\s'"`)\]};|&<>,+])/g;
 const USER_RE = /\$(?:USER|LOGNAME|USERNAME)(?![A-Za-z0-9_])|\$\{(?:USER|LOGNAME|USERNAME)\}|\$\(\s*(?:whoami|logname|id\s+-un)\s*\)|`\s*(?:whoami|logname|id\s+-un)\s*`|%USERNAME%|\$env:USERNAME\b/gi;
-const MARK_STRIP = new RegExp(`${MARK}['"\`)}\\]]*`, 'g');
 
 function expandHomeRefs(text, home) {
+  const mark = freeMark(text + home);
   return text
-    .replace(HOME_RE, (_m, glue) => home + MARK + (glue ? (glue.includes('+') ? '' : '/') : ''))
-    .replace(TILDE_RE, (_m, pre) => `${pre}${home}${MARK}`)
-    .replace(MARK_STRIP, '');
+    .replace(HOME_RE, (_m, glue) => home + mark + (glue ? (glue.includes('+') ? '' : '/') : ''))
+    .replace(TILDE_RE, (_m, pre) => `${pre}${home}${mark}`)
+    .replace(new RegExp(`${mark}['"\`)}\\]]*`, 'g'), '');
 }
+
+// expandRefs reading every backslash as part of the file name (off Windows it is one), not as a path separator: the word's
+// own backslashes and those a variable brings in (`D='x\a'; bash "$D.sh"` runs x\a.sh)
+function expandKeepingBackslash(w, ctx) {
+  const bs = freeMark([w, ctx.homePosix ?? '', ctx.user ?? '', ...Object.values(ctx.keptVars ?? {})].join('')); // every text expandRefs may put in
+  const vars = Object.fromEntries(Object.entries(ctx.keptVars ?? {}).map(([k, v]) => [k, String(v).replace(/\\/g, bs)]));
+  return expandRefs(w.replace(/\\/g, bs), { ...ctx, vars }).split(bs).join('\\');
+}
+// Could this word expand to a name holding a backslash? (its own, or one in any variable assigned on the line)
+const mayHoldBackslash = (w, ctx) => w.includes('\\') || Object.values(ctx.keptVars ?? {}).some((v) => String(v).includes('\\'));
 
 // $NAME / ${NAME} for variables assigned earlier on the same line (D=$HOME/.claude; echo x > $D/settings.json).
 function substVars(text, vars) {
@@ -708,10 +738,18 @@ function destsOf(argv, name) {
 }
 
 // $NAME values assigned on the line: `D=x cmd`, a bare `D=x`, `export D=x`, `declare -x D=x`.
+// Also fills ctx.keptVars: the same values with every backslash kept as a file name character (toPosix reads it as a
+// separator), for the off-Windows reading of a script name (`D='x\a'; bash "$D.sh"` runs x\a.sh).
 function collectVars(cmds, ctx) {
   const vars = {};
+  const kept = {};
   const SKIP = new Set(['HOME', 'USER', 'LOGNAME', 'USERPROFILE', 'USERNAME']); // these always mean the real ones
-  const set = (k, v) => { if (!SKIP.has(k)) vars[k] = expandHomeRefs(substVars(toPosix(String(v)).replace(USER_RE, ctx.user), vars), ctx.homePosix); };
+  const bs = freeMark([ctx.homePosix ?? '', ctx.user ?? '', ...cmds.flatMap((c) => [...Object.values(c.env ?? {}), ...(c.argv ?? [])])].join(''));
+  const set = (k, v) => {
+    if (SKIP.has(k)) return;
+    vars[k] = expandHomeRefs(substVars(toPosix(String(v)).replace(USER_RE, ctx.user), vars), ctx.homePosix);
+    kept[k] = expandHomeRefs(substVars(toPosix(String(v).replace(/\\/g, bs)).replace(USER_RE, ctx.user), kept), ctx.homePosix).split(bs).join('\\');
+  };
   for (const c of cmds) {
     for (const [k, v] of Object.entries(c.env ?? {})) set(k, v);
     if (['export', 'declare', 'typeset', 'local', 'readonly'].includes(baseOf(c.argv[0] ?? ''))) {
@@ -721,6 +759,7 @@ function collectVars(cmds, ctx) {
       }
     }
   }
+  ctx.keptVars = kept;
   return vars;
 }
 
@@ -950,9 +989,19 @@ const WRITE_HINT = /write|append|unlink|\brm\b|rmSync|rmdir|rename|copy|\bcp\b|\
 // typed on the line. A shell script that exists but cannot be read is denied; a missing file runs nothing; a
 // program run by path, an interpreter file that cannot be read, a node_modules package and the pipeline's own
 // installed files are not judged (the installed CLI legitimately names its own settings).
-function judgeScriptFile(sf, dirs, ctx, opts) {
-  const e = expandRefs(sf.file, ctx);
-  if (/[$`]/.test(e)) return null; // named at run time: the textual rules on the whole line still apply
+function judgeScriptFile(sf, dirs, ctx, opts, scanRaw = '', keepBackslash = false) {
+  if (sf.ambiguous) return judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw);
+  // expandRefs turns \ into / (Windows paths), but off Windows a backslash is part of the file name: judge that reading too
+  if (!keepBackslash && mayHoldBackslash(sf.file, ctx)) {
+    const v = judgeScriptFile(sf, dirs, ctx, opts, scanRaw, true);
+    if (v) return v;
+  }
+  // a candidate is a final path (a glob match, or a word already expanded): the shell never expands it a second time
+  const e = sf.candidate ? (keepBackslash ? sf.file : toPosix(sf.file)) : keepBackslash ? expandKeepingBackslash(sf.file, ctx) : expandRefs(sf.file, ctx);
+  if (!sf.candidate && /[$`]/.test(e)) {
+    // named at run time: the textual rules on the whole line still apply. Quoting is lost (`'x$y.sh'` reads as `x$y.sh`), so the word as written is judged too if it is a file
+    return keepBackslash ? null : judgeScriptFile({ kind: sf.kind, file: sf.file, candidate: true }, dirs, ctx, opts);
+  }
   const found = [];
   for (const d of isAbs(e) ? [''] : dirs) {
     const abs = isAbs(e) ? posix.normalize(e) : posix.join(d, e);
@@ -965,8 +1014,10 @@ function judgeScriptFile(sf, dirs, ctx, opts) {
   if (ctx.hit(abs) || ctx.hit(realResolve(abs, ctx.api)) || /\/node_modules\//.test(abs)) return null;
   const text = ctx.readText(abs);
   if (typeof text !== 'string') {
+    if (sf.candidate && ctx.readDir(abs)) return null; // a shell cannot run a directory
     return sf.kind === 'shell' ? deny(`cannot read the script ${sf.file} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified`) : null;
   }
+  if (sf.candidate && --opts._budget.left < 0) return deny('too many script files to judge (candidate scripts that run candidate scripts), so what they run cannot be checked; name the script file');
   let kind = sf.kind;
   if (kind === 'exec') {
     if (text.slice(0, 4096).includes('\u0000')) return null; // a binary
@@ -980,6 +1031,27 @@ function judgeScriptFile(sf, dirs, ctx, opts) {
   if (variantsOf(text).some((t) => setsAdmin(t, ctx.platform) || hasDisableAll(t))) return deny(`the program ${sf.file} sets PIPELINE_ADMIN or mentions disableAllHooks; only the owner may switch the pipeline guard off`);
   const m = makeMatchers(ctx);
   if (text.length <= MAX_SCRIPT_BYTES && m.rawHit(text, [dir]) && WRITE_HINT.test(text)) return deny(`the program ${sf.file} refers to a protected pipeline file and writes (${PROTECTED_MSG})`);
+  return null;
+}
+
+// A word before the script expands at run time (`X=+n; bash $X w.sh`, `bash $(..) w.sh`, `source $X`, `bash *.sh`), so which
+// word the shell runs is unknown. Judge every word that could be it (see script-candidates.mjs) like a named script. A
+// word that is still unknown (`$UNSET`) cannot be judged: the textual rules still apply, and the line is denied when it
+// names a protected pipeline file.
+function judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw) {
+  const joinPath = (d, r) => (isAbs(r) ? posix.normalize(r) : posix.join(d, r));
+  let c = scriptCandidates(sf, { expand: (w) => expandRefs(w, ctx), dirs, joinPath, readDir: ctx.readDir, ifs: ctx.vars.IFS });
+  // a backslash in a word is a file name character off Windows, but expandRefs reads it as a separator: expand (and glob) that reading too
+  if (!c.over && !sf.unresolvable && sf.words.some((w) => mayHoldBackslash(w, ctx))) {
+    const k = scriptCandidates(sf, { expand: (w) => expandKeepingBackslash(w, ctx), dirs, joinPath, readDir: ctx.readDir, ifs: ctx.vars.IFS });
+    c = { files: [...new Set([...c.files, ...k.files])], dynamic: c.dynamic || k.dynamic, over: k.over };
+  }
+  if (c.over) return deny('too many words, a glob matching too many files, or glob syntax that cannot be resolved could be the script this command runs, so it cannot be checked; name the script file');
+  if (c.dynamic && makeMatchers(ctx).rawHit(scanRaw, dirs)) return deny('which word is the script this command runs is only known at run time ($VAR / $(...) / a glob) and the line refers to a protected pipeline file; name the file and write the options literally');
+  for (const file of c.files) {
+    const v = judgeScriptFile({ kind: sf.kind, file, candidate: true }, dirs, ctx, opts);
+    if (v) return v;
+  }
   return null;
 }
 
@@ -1059,7 +1131,9 @@ function linkReachesProtected(cmds, dirs, ctx) {
 
 // ---- Bash --------------------------------------------------------------------------------------------
 
-export function evaluateBashForFiles(command, opts = {}) {
+export const evaluateBashForFiles = denyUnverifiable(evaluateBashForFilesUnchecked);
+function evaluateBashForFilesUnchecked(command, opts = {}) {
+  if (!opts._budget) opts = { ...opts, _budget: { left: MAX_CANDIDATE_JUDGMENTS } }; // one budget for this evaluation and every script it reads
   const ctx = makeCtx(opts);
   if (ctx.admin) return allow();
   const raw = typeof command === 'string' ? command : '';
@@ -1118,9 +1192,9 @@ export function evaluateBashForFiles(command, opts = {}) {
   // 7: a script file (bash f.sh, source f, ./f, node f.mjs) runs whatever is in it
   if ((opts._depth ?? 0) < 4) {
     for (const c of cmds) {
-      const sf = scriptFileOf(c.argv);
+      const sf = scriptFileOf(c.argv, c.raw, raw);
       if (!sf) continue;
-      const v = judgeScriptFile(sf, dirs, ctx, opts);
+      const v = judgeScriptFile(sf, dirs, ctx, opts, scanRaw);
       if (v) return v;
     }
   } else if (cmds.some((c) => scriptFileOf(c.argv))) return deny('scripts run scripts too deeply to check');

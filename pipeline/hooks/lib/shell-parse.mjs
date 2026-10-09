@@ -418,8 +418,15 @@ function unwrap(argv) {
 
 // ---- interpreter invocations --------------------------------------------------------------------
 
+// A word whose value is only known at run time: `$VAR`, `$(..)`, backticks, or a glob (also zsh extendedglob operators
+// `^`, `#`, a non-leading `~`, which only act when the user's zshrc sets extendedglob; `~1`, a trailing `~` and `=~` are
+// ordinary). It may become no word, one word or several, so it hides which of the words after it is the script.
+const EXPANDS = /[$`*?[^#]|[^=]~(?!\d|$)/;
+const hasExpansion = (w) => EXPANDS.test(w);
+
 // bash -c "script" / bash -lc ... / bash script.sh / bash (reads stdin)
 // -s, `-`, /dev/stdin and /dev/fd/0 all mean "read the script from stdin".
+// `amb`: a word up to the operand expands, so the operand found here may not be the one the shell picks.
 function shellInvocation(argv) {
   let i = 1;
   let sawC = false;
@@ -435,14 +442,14 @@ function shellInvocation(argv) {
   }
   if (sawC) return i < argv.length ? { kind: 'script', text: argv[i] } : { kind: 'none' };
   if (sawS) return { kind: 'stdin' };
-  if (i < argv.length) return STDIN_FILES.has(argv[i]) ? { kind: 'stdin' } : { kind: 'file', text: argv[i] };
-  return { kind: 'stdin' };
+  if (i < argv.length) return STDIN_FILES.has(argv[i]) ? { kind: 'stdin' } : { kind: 'file', text: argv[i], amb: argv.slice(1, i + 1).some(hasExpansion) };
+  return { kind: 'stdin', amb: argv.slice(1).some(hasExpansion) }; // `bash -$X` may be `bash -x f.sh`
 }
 
 // ---- script files -------------------------------------------------------------------------------
 
 const INTERPRETER = /^(?:node|nodejs|deno|bun|tsx|ts-node|python\d*(?:\.\d+)*|ruby|perl|php)$/;
-const SCRIPT_EXT = /\.(?:m?[jt]s|cjs|jsx|tsx|py|rb|pl|php|sh|bash|zsh)$/i;
+export const SCRIPT_EXT = /\.(?:m?[jt]s|cjs|jsx|tsx|py|rb|pl|php|sh|bash|zsh)$/i;
 const SYSTEM_BIN = /^(?:\/usr)?(?:\/local)?\/(?:s?bin|libexec)\/|^\/opt\/homebrew\/s?bin\//;
 // Flags that make an interpreter run inline code, a module or a test runner instead of a file.
 const INLINE_FLAGS = new Set(['-e', '-E', '-p', '-c', '-m', '--eval', '--print', '--check', '--test', '--input-type']);
@@ -452,16 +459,81 @@ const INTERP_VALUE_FLAGS = new Set(['-r', '--require', '--import', '--loader', '
 // {kind:'shell'} is run as a shell script (the caller judges its commands), {kind:'interp'} is program text in
 // another language (the caller scans it), {kind:'exec'} is a program run by path (shell or interpreter, from its
 // shebang). Null when the command runs no file (`bash -c`, stdin, process substitution, `node -e`, a test runner).
-export function scriptFileOf(argv) {
+// `ambiguous: true` (shells, source, interpreters; a program run by path whose name expands): a word from argv[1] up to the
+// operand expands at run time (`$X f.sh`, `$(..)`, a glob), so `file` is only a guess; `words` (argv[1..]) are the candidates, `needExt` says an interpreter
+// only runs a file with a script extension. The caller expands what it can and judges every candidate.
+// `raw` (optional) is the command's own text and `line` the whole line it came from. The parser turns zsh/ksh pattern syntax
+// into other words and cuts the command there (`bash f<1-2>.sh` has a redirect, `bash *(N)` and `bash +(a|b).sh` have
+// subshells), so if the command's text holds such a pattern the result is ambiguous AND `unresolvable`: no candidate list
+// can be built, the caller must refuse.
+// The parser reports no offsets, so the command is located by its text; when that text occurs more than once, EVERY
+// occurrence is checked and any pattern refuses (a harmless decoy copy must not hide the real one). The operand is NOT
+// located inside the text: it is written differently from its dequoted value (`a""b<1-9>.sh`, `x{y,z}<1-2>.sh`), so
+// the whole command text is checked, with quoted and escaped characters masked (see maskQuoted).
+export function scriptFileOf(argv, raw = '', line = raw) {
+  const sf = scriptFileOfArgv(argv);
+  if (!sf || sf.unresolvable || typeof raw !== 'string' || !raw) return sf;
+  let starts = [];
+  if (typeof line === 'string') for (let i = line.indexOf(raw); i >= 0 && starts.length <= MAX_OCCURRENCES; i = line.indexOf(raw, i + 1)) starts.push(i);
+  const text = starts.length ? line : raw; // not a substring of the line (nested script text): the command's own text
+  if (!starts.length) starts = [0];
+  let pattern = starts.length > MAX_OCCURRENCES; // too many places to check: refuse
+  // the operand's own spelling, searched in the text, only ever ADDS refusals: a quoted operand that spells a pattern
+  // (`'@(f|fa).sh'`) has been refused since round 2, and the masked check below would let it through
+  const ats = [];
+  if (sf.file !== undefined) for (let i = raw.indexOf(sf.file); i >= 0 && ats.length <= MAX_OCCURRENCES; i = raw.indexOf(sf.file, i + 1)) ats.push(i);
+  if (ats.length > MAX_OCCURRENCES) pattern = true;
+  const wordEnd = (from) => { let e = from; while (e < text.length && !/\s/.test(text[e])) e++; return e; };
+  for (const st of starts) {
+    if (PATTERN_SYNTAX.test(maskQuoted(text.slice(st, wordEnd(st + raw.length))))) pattern = true;
+    for (const at of ats) if (PATTERN_SYNTAX.test(text.slice(st, wordEnd(st + at + sf.file.length)))) pattern = true;
+  }
+  return pattern ? { kind: sf.kind, file: sf.file, ambiguous: true, unresolvable: true, words: sf.words ?? argv.slice(1), ...(sf.needExt === undefined ? {} : { needExt: sf.needExt }) } : sf;
+}
+
+// The command's text with everything the shell does not read as pattern syntax replaced by '_' (same length, so `"a"<1-2>`
+// still reads as `___<1-2>`): single quotes, double quotes (backslash escapes), $'..' (backslash escapes) and a backslash
+// with the character it escapes. Cut at the first newline that is not escaped or quoted (a heredoc body is not the command).
+// A double-quoted `$(` or backtick can hold quotes of its own, which this scan does not follow: from there on nothing is masked.
+function maskQuoted(t) {
+  let out = '';
+  for (let i = 0; i < t.length; i++) {
+    const c = t[i];
+    if (c === '\n') break;
+    if (c === '\\') { out += '__'.slice(0, Math.min(2, t.length - i)); i++; continue; }
+    const ansi = c === '$' && t[i + 1] === "'";
+    if (c === "'" || c === '"' || ansi) {
+      const q = ansi ? "'" : c;
+      let j = i + (ansi ? 2 : 1);
+      for (; j < t.length && t[j] !== q; j++) {
+        if (q === '"' && (t[j] === '`' || (t[j] === '$' && t[j + 1] === '('))) return out + '_'.repeat(j - i) + t.slice(j);
+        if (t[j] === '\\' && (q === '"' || ansi)) j++;
+      }
+      out += '_'.repeat(Math.min(j + 1, t.length) - i);
+      i = j;
+      continue;
+    }
+    out += c;
+  }
+  return out;
+}
+const MAX_OCCURRENCES = 32;
+// ksh/bash extglob (`*(`, `?(`, `+(`, `@(`, `!(`), zsh `(#i)` and `<1-2>` numeric ranges attached to a word
+const PATTERN_SYNTAX = /[*?+@!\]]\(|\(#|[^\s<>&|;(]<\d*-\d*>/;
+
+function scriptFileOfArgv(argv) {
   if (!argv.length) return null;
   const name = base(argv[0]);
   if (SHELLS.has(name)) {
     const r = shellInvocation(argv);
-    return r.kind === 'file' && !r.text.startsWith('<(') ? { kind: 'shell', file: r.text } : null;
+    if (r.kind === 'file' && !r.text.startsWith('<(')) return r.amb ? { kind: 'shell', file: r.text, ambiguous: true, words: argv.slice(1) } : { kind: 'shell', file: r.text };
+    return r.kind === 'stdin' && r.amb ? { kind: 'shell', file: undefined, ambiguous: true, words: argv.slice(1) } : null;
   }
   if (name === 'source' || name === '.') {
     const op = argv[1];
-    return op === undefined || STDIN_FILES.has(op) || op.startsWith('<(') ? null : { kind: 'shell', file: op };
+    if (op === undefined || STDIN_FILES.has(op) || op.startsWith('<(')) return null;
+    // `source -p PATH file` (bash 5.3): an option shifts the operand, so any word may be the file
+    return hasExpansion(op) || op.startsWith('-') ? { kind: 'shell', file: op, ambiguous: true, words: argv.slice(1) } : { kind: 'shell', file: op };
   }
   if (INTERPRETER.test(name)) {
     let i = 1;
@@ -474,10 +546,18 @@ export function scriptFileOf(argv) {
       break;
     }
     const file = argv[i];
-    if (file === undefined || (name !== 'node' && !INTERPRETER_NO_EXT.has(name) && !SCRIPT_EXT.test(file))) return null;
+    const needExt = name !== 'node' && !INTERPRETER_NO_EXT.has(name);
+    if (argv.slice(1, i + 1).some(hasExpansion)) return { kind: 'interp', file, ambiguous: true, words: argv.slice(1), needExt };
+    if (file === undefined || (needExt && !SCRIPT_EXT.test(file))) return null;
     return STDIN_FILES.has(file) ? null : { kind: 'interp', file };
   }
-  if (/[/]/.test(argv[0]) && !argv[0].includes('\\') && !SYSTEM_BIN.test(argv[0])) return { kind: 'exec', file: argv[0] };
+  // (a backslash is an ordinary file name character off Windows, so a path holding one is judged like any other)
+  if (/[/]/.test(argv[0]) && !SYSTEM_BIN.test(argv[0])) {
+    // `./ev*.sh` / `$D/x.sh`: the shell runs whatever the word expands to, so it is a candidate list of one word
+    return hasExpansion(argv[0]) ? { kind: 'exec', file: argv[0], ambiguous: true, words: [argv[0]] } : { kind: 'exec', file: argv[0] };
+  }
+  // `X=./evil.sh; $X`: a program named by a variable has no `/` to show it is a path
+  if (/[$`]/.test(argv[0])) return { kind: 'exec', file: argv[0], ambiguous: true, words: [argv[0]] };
   return null;
 }
 const INTERPRETER_NO_EXT = new Set(['python', 'ruby', 'perl', 'php']);
