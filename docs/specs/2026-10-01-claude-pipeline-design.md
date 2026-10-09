@@ -482,10 +482,11 @@ arbiter-input.md, rulings.json, model-proof.json}`, `.review/final-gate.json`,
 4. **Pipeline files**, two rules. `R4-pipeline` (the guard core: anything that decides whether a label is needed or which
    checks CI runs): `.github/**` (except markdown), `.claude/**`, `CODEOWNERS`, `.gitmodules`, `scripts/verify*`,
    `scripts/pipeline/**`, `pipeline.yml`, test-runner config (`vitest.*`, `jest.*`, `playwright*.config.*`, ...),
-   lint / tsconfig / build config, `.gitattributes`, `supabase/tests/**` deletions, gitlinks, symlinks, a changed or
-   removed `package.json` script. `R4-config` (nothing CI runs): `CLAUDE.md` / `AGENTS.md` / `.cursorrules`, markdown
-   under `.github/`, local git hooks (`.githooks/**`, `.husky/**`, lefthook, pre-commit), and a newly added plain
-   `package.json` script (a new npm lifecycle hook such as `pretest:run` or `postinstall` is `R4-pipeline`).
+   lint / tsconfig / build config, `.gitattributes`, pre-commit / lefthook configs (CI often runs them),
+   `supabase/tests/**` deletions, gitlinks, symlinks, any `packageManager` change, a changed or removed `package.json`
+   script. `R4-config` (nothing CI runs): `CLAUDE.md` / `AGENTS.md` / `.cursorrules`, markdown
+   under `.github/`, local git hooks (`.githooks/**`, `.husky/**`), and a newly added plain `package.json` script (a new npm
+   lifecycle script such as `pretest:run`, `postinstall`, `publish`, `pack` or `version` is `R4-pipeline`).
    A path in both is `R4-pipeline`.
 5. **Major dependency upgrades**: `package.json` semver-major bump (or `0.x` minor) of any dep.
 6. **Sensitive personal data**: paths/identifiers matching biometric, face, liveness, health,
@@ -500,7 +501,9 @@ the other families to **report-only** with `hard_stops.report_only_rules` (allow
 Such a hit is still found and listed (job summary, `pipeline hardstops` output, PR body) with `advisory: true`, but it
 never fails `Hard-stop scan`, never fails the final gate and never needs the label. `R1-data-write` is app code that
 deletes or overwrites rows through a client (`.from(...).delete/upsert`): routine feature code, so it may be report-only;
-raw destructive SQL, SQL in code and migrations stay `R1-destructive` (blocking). `R4-config` covers only what CI never
+the same call in a script (`scripts/`, `bin/`, `tools/`, `ops/`, `maintenance/`, `jobs/`) writes production directly
+and stays `R1-destructive`, as do raw destructive SQL, SQL in code and migrations. Auth / RLS / grant SQL inside code is
+`R2-sql-statement` (blocking), never `R2-auth`. `R4-config` covers only what CI never
 runs (see 4 above). `R4-pipeline`, the guard core, stays blocking so that one unattended edit to `pipeline.yml` or to a
 file the CI checks read cannot turn the database rules report-only; `R0-unscannable` (including
 an unparseable `package.json`) and every database rule are refused in config and re-checked when classifying (fail

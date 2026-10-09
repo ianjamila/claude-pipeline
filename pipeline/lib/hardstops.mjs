@@ -163,6 +163,8 @@ const R4_PIPELINE_GLOBS = [
   // Test-runner configs: where a gate can be loosened.
   '**/vitest.config.*', '**/vitest.workspace.*', '**/vitest.setup.*', '**/jest.config.*', '**/jest.setup.*',
   '**/playwright*.config.*', '**/cypress.config.*', '**/.mocharc*', '**/.nycrc*', '**/codecov.y*ml',
+  // Hook runners CI may invoke (`pre-commit run --all-files`, `lefthook run`).
+  '**/lefthook*.y*ml', '**/.pre-commit-config.y*ml',
 ];
 // Markdown under .github (copilot-instructions.md, workflows/README.md) cannot run; it is R4-config, not core.
 const GITHUB_DIR_GLOBS = ['**/.github/**'];
@@ -170,8 +172,8 @@ const MARKDOWN_FILE = /\.(?:md|mdx|markdown)$/i;
 const R4_CONFIG_GLOBS = [
   // Agent-instruction files steer the agents that review and write code; a PR must not rewrite its own rules.
   '**/CLAUDE.md', '**/AGENTS.md', '**/.cursorrules',
-  // Local git hooks: they run on a developer machine, never in CI.
-  '**/.githooks/**', '**/.husky/**', '**/lefthook*.y*ml', '**/.pre-commit-config.y*ml',
+  // Local git hooks: they run on a developer machine, never in CI. (pre-commit / lefthook configs are core: CI often runs them.)
+  '**/.githooks/**', '**/.husky/**',
 ];
 const isR4Pipeline = (p) => (inc(p, R4_PIPELINE_GLOBS.filter((g) => !GITHUB_DIR_GLOBS.includes(g))) ||
   (inc(p, GITHUB_DIR_GLOBS) && !MARKDOWN_FILE.test(p)));
@@ -451,6 +453,8 @@ const COOKIE_INSECURE = /\b(?:httpOnly|secure)\s*:\s*false\b/i;
 const USE_SERVER = /^\s*['"]use server['"]/;
 // R1 in code: a Supabase write that destroys or overwrites rows. Only when `.from(` is on the same line (low noise).
 const DATA_WRITE = /\.(?:delete|upsert)\s*\(/i;
+// Where prod-writing scripts live: a data write there stays R1-destructive (blocking), never R1-data-write.
+const SCRIPT_DIR_GLOBS = ['**/scripts/**', '**/bin/**', '**/tools/**', '**/ops/**', '**/maintenance/**', '**/jobs/**'];
 
 // R2-auth-removed: a guard deleted from non-test code. Beyond the spec: `_?` (snake_case codebases), getSession/getClaims
 // (Supabase's other auth reads), and the guard SHAPES that need no named helper (401/403, login redirect, role compare,
@@ -1013,7 +1017,7 @@ const sameJson = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? nul
 // the gates check.
 // npm runs these implicitly: any pre<x>/post<x> around another script (pretest:run before `npm run test:run`) and the install-time
 // hooks. A NEW one therefore still executes inside an existing CI step, whatever its name.
-const LIFECYCLE_SCRIPT = /^(?:pre|post)|^(?:install|dependencies)$/i;
+const LIFECYCLE_SCRIPT = /^(?:pre|post)|^(?:install|dependencies|publish|pack|version)$/i;
 const SCRIPT_NAME = /^(?:pre|post)?(?:test|verify|lint|typecheck|build|prepare|prepack|publish(?:Only)?|install|merge|e2e|coverage|vercel-build|ci|check)(?:[:.-].*)?$/i;
 const GATE_BLOCKS = ['husky', 'lint-staged', 'jest', 'nyc', 'vitest', 'c8', 'mocha', 'ava', 'eslintConfig', 'simple-git-hooks'];
 
@@ -1047,7 +1051,8 @@ function npmRules({ file, base, head }, sink) {
     const ver = (s) => (typeof s === 'string' ? s.slice(s.indexOf('@') + 1) : undefined);
     const why = rangeChange(ver(base.packageManager), ver(head.packageManager));
     if (why && /major/.test(why)) sink.add('R5-major-dep', file, `packageManager ${base.packageManager} -> ${head.packageManager}`);
-    else sink.add('R4-pipeline', file, `packageManager changed (${base.packageManager} -> ${head.packageManager})`);
+    // Always core as well: CI installs and runs every gate with it, and R5 may be report-only.
+    sink.add('R4-pipeline', file, `packageManager changed (${base.packageManager} -> ${head.packageManager})`);
   }
 
   // overrides / resolutions pin or replace transitive dependencies: any change to them is a supply-chain lever.
@@ -1371,9 +1376,14 @@ function addedCodeRules(d, added, cx, env, sink) {
       const r1 = firstSql(R1_SQL, l.text, true);
       if (r1) sink.add('R1-destructive', d.file, `destructive SQL in code: ${r1}`, ex);
       const r2 = firstSql(R2_SQL, l.text, true);
-      if (r2) sink.add('R2-auth', d.file, `auth/RLS SQL in code: ${r2}`, ex);
+      // A database authorization change (RLS off, grants, policies) is SQL whatever file carries it: never report-only.
+      if (r2) sink.add('R2-sql-statement', d.file, `auth/RLS SQL in code: ${r2}`, ex);
     }
-    if (live(l) && l.text.includes('.from(') && DATA_WRITE.test(l.text)) sink.add('R1-data-write', d.file, 'data write in code (.from(...).delete/upsert)', ex);
+    if (live(l) && l.text.includes('.from(') && DATA_WRITE.test(l.text)) {
+      // Only application code may be report-only (R1-data-write); the same call in a script writes production directly.
+      if (d.paths.some((p) => inc(p, SCRIPT_DIR_GLOBS))) sink.add('R1-destructive', d.file, 'data write in a script (.from(...).delete/upsert)', ex);
+      else sink.add('R1-data-write', d.file, 'data write in code (.from(...).delete/upsert)', ex);
+    }
 
     if (SERVICE_ROLE.test(l.text)) sink.add('R2-auth', d.file, 'service-role / admin-client reference', ex);
     if (AUTH_ADMIN.test(l.text)) sink.add('R2-auth', d.file, 'auth.admin API call', ex);

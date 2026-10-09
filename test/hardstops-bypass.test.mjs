@@ -201,7 +201,8 @@ test('4 destructive / auth SQL inside strings of non-SQL code is caught (ts, py,
     ['lib/db.ts', 'sql`CREATE POLICY p ON t USING (true)`'], ['lib/db.ts', 'sql`REVOKE ALL ON t FROM anon`'],
     ['lib/db.ts', 'sql`CREATE FUNCTION f() RETURNS int SECURITY DEFINER AS $$ select 1 $$`'],
   ];
-  for (const [p, text] of r2) assert.ok(flags([file(p, { added: [text] })]).includes('R2-auth'), `${p}: ${text}`);
+  // A database authorization change is SQL whatever file carries it: R2-sql-statement, which can never be report-only.
+  for (const [p, text] of r2) assert.ok(flags([file(p, { added: [text] })]).includes('R2-sql-statement'), `${p}: ${text}`);
 });
 
 test('4 ordinary prose and identifiers in code do not look like SQL', () => {
@@ -295,8 +296,8 @@ test('6 overrides / resolutions / pnpm.overrides: every added, removed or change
   assert.deepEqual(pkgRules(pk({ overrides: { a: '1' } }), pk({ overrides: { a: '1' } })), []);
 });
 
-test('6 packageManager: a major bump is R5, any other change R4', () => {
-  assert.deepEqual(pkgRules(pk({ packageManager: 'pnpm@9.0.0' }), pk({ packageManager: 'pnpm@10.0.0' })), ['R5-major-dep']);
+test('6 packageManager: every change is R4 (guard core); a major bump is also R5', () => {
+  assert.deepEqual(pkgRules(pk({ packageManager: 'pnpm@9.0.0' }), pk({ packageManager: 'pnpm@10.0.0' })), ['R4-pipeline', 'R5-major-dep']);
   assert.deepEqual(pkgRules(pk({ packageManager: 'pnpm@9.0.0' }), pk({ packageManager: 'pnpm@9.1.0' })), ['R4-pipeline']);
   assert.deepEqual(pkgRules(pk(), pk({ packageManager: 'pnpm@9.0.0' })), ['R4-pipeline']);
   assert.deepEqual(pkgRules(pk({ packageManager: 'pnpm@9.0.0' }), pk({ packageManager: 'pnpm@9.0.0' })), []);

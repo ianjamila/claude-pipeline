@@ -293,11 +293,12 @@ const CORE_EXAMPLES = [
   'scripts/verify', 'scripts/verify.mjs', 'scripts/verify-quick.mjs', 'scripts/verify/index.mjs', 'scripts/verify-all', 'scripts/verify-sql-arms.mjs',
   'eslint.config.mjs', '.eslintrc.json', 'tsconfig.json', 'tsconfig.build.json', 'packages/x/tsconfig.base.json', 'next.config.ts', 'next.config.mjs',
   'NEXT.CONFIG.TS', 'apps/web/vite.config.ts', '.gitattributes', 'apps/web/.gitattributes',
+  // hook runners CI may invoke (`pre-commit run --all-files`, `lefthook run`)
+  'lefthook.yml', 'lefthook-local.yaml', '.pre-commit-config.yaml', '.pre-commit-config.yml',
 ];
 const CONFIG_EXAMPLES = [
   'CLAUDE.md', 'sub/dir/CLAUDE.md', 'AGENTS.md', 'pkg/AGENTS.md', '.cursorrules', 'a/.cursorrules', '.github/copilot-instructions.md',
-  '.github/workflows/README.md', '.github/PULL_REQUEST_TEMPLATE.md', '.githooks/pre-push', '.husky/pre-commit', 'lefthook.yml', 'lefthook-local.yaml',
-  '.pre-commit-config.yaml', '.pre-commit-config.yml',
+  '.github/workflows/README.md', '.github/PULL_REQUEST_TEMPLATE.md', '.githooks/pre-push', '.husky/pre-commit',
 ];
 const r4Of = (p) => classify({ files: [file(p)], config: cfg() }).filter((h) => h.rule.startsWith('R4-'));
 
@@ -347,13 +348,15 @@ test('R4-config report-only: a NEW package.json script is advisory; a changed/re
   const removed = pkgHits({ scripts: {} });
   assert.deepEqual(removed.map((h) => [h.rule, Boolean(h.advisory)]), [['R4-pipeline', false]]);
   assert.match(removed[0].detail, /removed/);
-  for (const name of ['pretest', 'pretest:run', 'posttest', 'prebuild', 'postinstall', 'preinstall', 'install', 'prepare', 'preprepare', 'postprepare', 'prepublish', 'prepublishOnly', 'prepack', 'postpack', 'dependencies', 'pregenerate']) {
+  for (const name of ['pretest', 'pretest:run', 'posttest', 'prebuild', 'postinstall', 'preinstall', 'install', 'prepare', 'preprepare', 'postprepare', 'prepublish', 'prepublishOnly', 'prepack', 'postpack', 'dependencies', 'pregenerate', 'publish', 'pack', 'version']) {
     assert.deepEqual(pkgHits({ scripts: { test: 'vitest run', [name]: 'x' } }).map((h) => [h.rule, Boolean(h.advisory)]), [['R4-pipeline', false]], name);
   }
   for (const head of [{ ...base, husky: { hooks: {} } }, { ...base, packageManager: 'pnpm@9.0.0' }]) {
     const hits = classify({ files: [], pkgPairs: [{ file: 'package.json', base, head }], config: c });
     assert.deepEqual(hits.map((h) => [h.rule, Boolean(h.advisory)]), [['R4-pipeline', false]], JSON.stringify(head));
   }
+  const major = classify({ files: [], pkgPairs: [{ file: 'package.json', base: { ...base, packageManager: 'pnpm@9.0.0' }, head: { ...base, packageManager: 'pnpm@10.0.0' } }], config: ro(['R4-config', 'R5-major-dep']) });
+  assert.deepEqual(major.map((h) => [h.rule, Boolean(h.advisory)]).sort(), [['R4-pipeline', false], ['R5-major-dep', true]], 'major packageManager bump');
   const file2 = (p, o) => ({ ...file(p), ...o });
   for (const f of [file2('deps/sub', { gitlink: true }), file2('src/a.js', { symlink: true }), file('supabase/tests/rls.test.sql', { status: 'D' })]) {
     const hits = classify({ files: [f], config: c });
@@ -374,6 +377,26 @@ test('R1-data-write report-only: .from(...).delete/upsert is advisory; raw destr
   assert.ok(sql.filter((h) => h.rule === 'R1-destructive').length >= 1 && sql.filter((h) => h.rule === 'R1-destructive').every((h) => !h.advisory));
   // default config: the data-write hit blocks and carries the new rule id
   assert.deepEqual(rulesOf(classify({ files: [file('app/x.ts', { added: ["await sb.from('t').delete();"] })], config: cfg() })), ['R1-data-write']);
+});
+
+test('authorization SQL inside app code is a blocking SQL rule, even with every downgradable rule report-only', () => {
+  for (const text of ["await db.query('ALTER TABLE t DISABLE ROW LEVEL SECURITY');", "await db.query('GRANT ALL ON t TO anon');"]) {
+    const hits = classify({ files: [file('app/x.ts', { added: [text] })], config: ro(ALLOWED) });
+    assert.ok(hits.some((h) => h.rule === 'R2-sql-statement' && !h.advisory), `${text}: ${JSON.stringify(hits)}`);
+    assert.ok(!hits.some((h) => h.rule === 'R2-auth' && /SQL in code/.test(h.detail)), text);
+  }
+});
+
+test('a data write in a script stays R1-destructive (prod-writing script); only application code is R1-data-write', () => {
+  const text = "await client.from('records').delete().neq('id', 0);";
+  for (const p of ['scripts/cleanup.mjs', 'apps/web/scripts/fix.ts', 'bin/purge.js', 'tools/x.ts', 'ops/y.mjs', 'maintenance/z.ts', 'jobs/nightly.ts']) {
+    const hits = classify({ files: [file(p, { added: [text] })], config: ro(ALLOWED) });
+    assert.deepEqual(hits.filter((h) => h.rule.startsWith('R1-')).map((h) => [h.rule, Boolean(h.advisory)]), [['R1-destructive', false]], p);
+  }
+  for (const p of ['app/x.ts', 'lib/employees/actions.ts', 'components/y.tsx']) {
+    const hits = classify({ files: [file(p, { added: [text] })], config: ro(ALLOWED) });
+    assert.deepEqual(hits.filter((h) => h.rule.startsWith('R1-')).map((h) => [h.rule, h.advisory]), [['R1-data-write', true]], p);
+  }
 });
 
 test('the guard core can never be named report-only, in validateConfig or in the scanner', () => {

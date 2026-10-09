@@ -196,11 +196,14 @@ function checkDisableRules(rules, errors) {
 //                       report-only too, so it must stay blocking
 //   P-path              a project path rule has its own switch, hard_stops.report_only_paths
 // Eligible by owner decision 2026-10-09:
-//   R1-data-write       app code that deletes or overwrites rows through a client (.from(...).delete/upsert) is routine
-//                       feature code; raw destructive SQL stays R1-destructive
+//   R1-data-write       APPLICATION code that deletes or overwrites rows through a client (.from(...).delete/upsert) is
+//                       routine feature code; the same call in a script (scripts/, bin/, tools/, ops/, jobs/ ...) writes
+//                       production directly and stays R1-destructive, as does raw destructive SQL. Auth/RLS/grant SQL inside
+//                       code is R2-sql-statement (blocking), never R2-auth
 //   R4-config           what CI never runs: CLAUDE.md and other agent-instruction files, markdown under .github, local git
-//                       hooks, a newly ADDED plain package.json script (a new
-//                       lifecycle hook like pretest/postinstall runs inside CI, so it stays R4-pipeline)
+//                       hooks (.githooks, .husky; pre-commit / lefthook configs are core: CI often runs them), a newly
+//                       ADDED plain package.json script (a new lifecycle script like pretest/postinstall/publish/pack/version
+//                       runs implicitly, and every packageManager change is core, so those stay R4-pipeline)
 // R5-major-dep IS eligible; its fail-closed "package.json could not be parsed" hit is emitted as R0-unscannable so it
 // stays blocking. A rule named here that is outside the list is a config error, not a silent no-op, and classifyHardStops
 // re-checks it (fail closed).
