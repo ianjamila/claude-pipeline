@@ -93,6 +93,20 @@ const DENY = [
   ['node ~/.claude/pipeline/bin/pipeline.mjs job start x -- gh pr edit 1 --add-label human-approved'],
   ['node /h/.claude/pipeline/bin/pipeline.mjs job start x -- git push origin main'],
   ['gh label delete needs-human --yes'],
+  // a gh / git subcommand still holding a run-time expansion after known variables are substituted
+  ['X=merge-base; gh pr ${X%-base} 5 --admin'],
+  ['gh pr "$(printf merge)" 5 --admin'],
+  ['gh pr \`echo merge\` 5 --admin'],
+  ['gh ${G:-pr} merge 5 --admin'],
+  ['X=pu; git ${X}${Y:-sh} origin main'],
+  ['git "$(printf push)" origin main'],
+  ['X=push; git $X origin main'], // a variable known on the line is still not a literal subcommand
+  ['X=diff; git $X HEAD~1'],
+  ['X=merge; true || X=view; gh pr $X 5 --admin'],
+  // a variable assigned twice is unknown: which assignment ran depends on control flow
+  ['B=main; false && B=agent/x; git push origin $B'],
+  ['L=human-approved; false && L=ok; gh pr edit 1 --add-label $L'],
+  ['X=push; X=diff git $X origin main'],
 ];
 
 const ALLOW = [
@@ -121,6 +135,12 @@ const ALLOW = [
   ['gh api repos/o/r/rulesets'],
   ['gh label create human-approved --color 0e8a16'],
   ['node ~/.claude/pipeline/bin/pipeline.mjs job start v -- node scripts/verify.mjs'],
+  // run-time ARGUMENTS stay fine; only the subcommand position must be literal (or a variable assigned on the line)
+  ['gh pr view $N --json title'],
+  ['gh -R $REPO pr view 5'],
+  ['git diff "$BASE"..HEAD'],
+  ['git -C "$DIR" log --oneline -3'],
+  ['B=agent/x; git push origin $B'], // assigned once on the line: still known
 ];
 
 const label = (command, o) => (o ? `${command}  ${JSON.stringify(o, (k, v) => (v instanceof Error ? `Error(${v.message})` : v))}` : command);
@@ -1151,6 +1171,142 @@ test('git config supplied through the environment counts as changed push configu
   assert.equal(evaluate('GIT_AUTHOR_NAME=x git push', { branch: 'agent/x' }).decision, 'allow');
 });
 
+// PR #7 security-scan findings 1 and 2: a variable assigned twice is "unsure" (not in ctx.vars) but was still assigned,
+// so every check that looks at assigned variable NAMES must see it too.
+test('git config from the environment still counts when the variable was assigned more than once', () => {
+  const exp = 'export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=HEAD:main';
+  const envDeny = [
+    // finding 1: exported twice
+    `${exp}; ${exp}; git push`,
+    `${exp} GIT_CONFIG_COUNT=1; git push`, // twice in one export
+    `${exp}; export GIT_CONFIG_COUNT=1; git push`,
+    // finding 2: plain assignments, twice
+    'GIT_CONFIG_COUNT=1; GIT_CONFIG_COUNT=1; GIT_CONFIG_KEY_0=remote.origin.push; GIT_CONFIG_VALUE_0=HEAD:main; git push',
+    'GIT_CONFIG_COUNT=1; GIT_CONFIG_KEY_0=remote.origin.push; GIT_CONFIG_KEY_0=remote.origin.push; GIT_CONFIG_VALUE_0=HEAD:main; git push',
+    'GIT_CONFIG_PARAMETERS=x; GIT_CONFIG_PARAMETERS="\'remote.origin.push=HEAD:main\'"; git push',
+    'GIT_CONFIG_GLOBAL=/a; GIT_CONFIG_GLOBAL=/tmp/evil.gitconfig; git push',
+    'GIT_CONFIG_SYSTEM=/a; false && GIT_CONFIG_SYSTEM=/b; git push origin',
+    // assigned twice, then git runs through send-pack or an alias defined on the line
+    'GIT_CONFIG_COUNT=1; GIT_CONFIG_COUNT=1; git send-pack',
+    'GIT_CONFIG_COUNT=1; GIT_CONFIG_COUNT=1; git -c alias.p=push p',
+  ];
+  for (const c of envDeny) assert.equal(evaluate(c, { branch: 'agent/x' }).decision, 'deny', c);
+  // unrelated variables assigned twice, and an explicit refspec, stay fine
+  assert.equal(evaluate('A=1; A=2; git push', { branch: 'agent/x' }).decision, 'allow');
+  assert.equal(evaluate('GIT_CONFIG_COUNT=1; GIT_CONFIG_COUNT=1; git push origin HEAD:agent/x', { branch: 'agent/x' }).decision, 'allow');
+});
+
+// PR #7 security-scan finding 3: the subcommand has to be literal before the alias lookup, the push dispatch and
+// branch tracking see it, so a variable that expands to push can never route around checkPush.
+test('a git subcommand built from a variable never reaches the push / alias / tracking dispatch unchecked', () => {
+  const denyCmds = [
+    'X=push; git $X origin main',
+    'X=pu; git ${X}sh -f origin main',
+    'X=push; X=push; git $X origin main',
+    'X=pu; git ${X}sh origin main',
+    'export X=push; git "$X" origin main',
+    'X=send-pack; git $X ../origin.git main',
+    'X=push; git -C /work/repo $X origin main',
+    'X=push; git -c user.name=a $X origin main',
+    'X=p; git config alias.p push; git $X origin main',
+    'X=checkout; git $X main; git push',
+    'X=push; env git $X origin main',
+  ];
+  for (const c of denyCmds) assert.equal(evaluate(c, { branch: 'agent/x' }).decision, 'deny', c);
+});
+
+// Siblings of findings 1 and 2: GIT_DIR and GH_REPO select the repository. Only the command's own prefix
+// (`GIT_DIR=x git push`) is certain to reach it; an earlier assignment or export may never run (`false && export …`) or
+// may not be exported at all, so the repository is unknown and the protected operation is denied.
+test('GIT_DIR and GH_REPO set before the command are unknown; only a command prefix or an explicit flag is trusted', () => {
+  const gitDeny = [
+    'export GIT_DIR=/e/.git; git push',
+    'GIT_DIR=/e/.git; git push',
+    'false && export GIT_DIR=/safe/.git; git push',
+    'GIT_DIR=/a/.git; GIT_DIR=/b/.git; git push',
+    'export GIT_DIR=/a/.git; false && export GIT_DIR=/b/.git; git push',
+    'GIT_DIR=/a/.git; GIT_DIR=/b/.git; git send-pack',
+    'export GIT_DIR=/e/.git; git branch -m x',
+    'false && export GIT_DIR=/safe/.git; git -c alias.p=push p',
+  ];
+  for (const c of gitDeny) assert.equal(evaluate(c, { branch: 'agent/x' }).decision, 'deny', c);
+  // a prefix on the command itself, or an explicit flag, is certain
+  let v = evaluate('GIT_DIR=/a/.git; GIT_DIR=/b/.git git push');
+  assert.equal(v.calls.branchDirs[0].gitDir, resolve('/b/.git'));
+  v = evaluate('false && export GIT_DIR=/safe/.git; git --git-dir=/real/.git push');
+  assert.equal(v.calls.branchDirs[0].gitDir, resolve('/real/.git'));
+  assert.equal(evaluate('export GIT_DIR=/e/.git; git status').decision, 'allow');
+
+  const ghDeny = [
+    'export GH_REPO=o/r; gh issue close 9',
+    'GH_REPO=o/r; gh issue close 9',
+    'false && export GH_REPO=o/safe; gh issue close 9',
+    'GH_REPO=o/r; GH_REPO=p/q; gh issue close 9',
+    'export GH_REPO=o/r; false && export GH_REPO=p/q; gh issue close 9',
+    'false && export GH_REPO=o/safe; gh issue delete 9',
+    'false && export GH_REPO=o/safe; gh issue transfer 9 o/other',
+  ];
+  for (const c of ghDeny) assert.equal(evaluate(c, { labels: [] }).decision, 'deny', c);
+  v = evaluate('GH_REPO=o/r gh issue close 9', { labels: [] });
+  assert.deepEqual(v.calls.labels[0].repoArgs, ['-R', 'o/r']);
+  v = evaluate('false && export GH_REPO=o/safe; gh issue close 9 -R o/real', { labels: [] });
+  assert.deepEqual(v.calls.labels[0].repoArgs, ['-R', 'o/real']);
+  // other gh commands do not look at the repository, so the same variable is harmless there
+  assert.equal(evaluate('GH_REPO=o/r; GH_REPO=p/q; gh pr view 9').decision, 'allow');
+});
+
+// Codex round on PR #7: a variable assigned twice is dropped from the known values, so its $NAME text survives expansion.
+// That must never be recorded as a branch name, nor slip past a pattern that only matches the expanded text.
+test('an unresolved expansion is unknown branch state, never a branch name', () => {
+  const denyCmds = [
+    'B=agent/x; B=main; git switch -C "$B"; git push origin HEAD',
+    'B=agent/x; B=main; git checkout -b "$B"; git push',
+    'B=agent/x; B=main; git checkout -B $B; git push origin HEAD',
+    'B=agent/x; B=main; git branch -m "$B"; git push',
+    'B=agent/x; B=main; git worktree add -b "$B" ../w; git -C ../w push',
+    'B=agent/x; B=main; git worktree add ../w "$B"; git -C ../w push',
+    'B=agent/x; B=main; git rebase origin/x "$B"; git push',
+    'B=agent/x; B=main; git symbolic-ref HEAD "refs/heads/$B"; git push',
+    // never assigned at all: still run-time, still unknown
+    'git switch -C "$NEW"; git push origin HEAD',
+    'git checkout -b "$NEW"; git push',
+    'git branch -m "$NEW"; git push',
+  ];
+  for (const c of denyCmds) assert.equal(evaluate(c, { branch: 'agent/x' }).decision, 'deny', c);
+  assert.equal(evaluate('B=agent/y; git switch -C "$B"; git push origin HEAD', { branch: 'main' }).decision, 'allow');
+});
+
+test('a protected argument built from a variable assigned twice fails closed', () => {
+  const denyCmds = [
+    'E=unused; E=repos/o/r/pulls/5/merge; gh api -X PUT "$E"',
+    'E=unused; E=repos/o/r/pulls/5/merge; gh api "$E" -X PUT',
+    'E=unused; E=repos/o/r/statuses/abc; gh api -X POST "$E" -f state=success',
+    'E=unused; E=repos/o/r/git/refs; gh api -X POST "$E" -f ref=refs/heads/main',
+    'E=unused; E=repos/o/r/issues/3/labels/needs-human; gh api -X DELETE "$E"',
+    'E=unused; E=repos/o/r/rulesets/1; gh api -X DELETE "$E"',
+    'M=GET; M=DELETE; gh api -X "$M" repos/o/r/issues/3/labels/needs-human',
+    'F=x; F=branch=main; gh api -X PUT repos/o/r/contents/f -f message=m -f content=eA== -f "$F"',
+    'L=unused; L=human-approved; gh label delete "$L" --yes',
+    'L=unused; L=human-approved; gh label edit "$L" --name x',
+    'L=unused; L=human-approved; gh pr edit 1 --add-label "$L"',
+    'L=unused; L=needs-human; gh issue edit 1 --remove-label "$L"',
+    'N=1; N=7; gh issue close "$N"',
+    'N=1; N=7; gh pr merge "$N" --admin',
+    'R=o/a; R=o/b; gh issue close 9 -R "$R"',
+    'T=x; T=main; gh repo edit --default-branch "$T"',
+    'B=x; B=main; git push origin "$B"',
+    'B=x; B=main; git push origin HEAD:"$B"',
+    'B=x; B=main; git push origin HEAD:refs/heads/${B}',
+    'D=/a; D=/b; git -C "$D" push',
+    'P=x; P=main; bash -c "git push origin $P"',
+    'P=x; P=main; node ~/.claude/pipeline/bin/pipeline.mjs job start j -- git push origin $P',
+  ];
+  for (const c of denyCmds) assert.equal(evaluate(c, { branch: 'agent/x', labels: [] }).decision, 'deny', c);
+  // a run-time value that was never assigned on the line is still fine in a non-protected position
+  assert.equal(evaluate('gh pr view $N --json title').decision, 'allow');
+  assert.equal(evaluate('A=1; A=2; git status').decision, 'allow'); // assigned twice but never used
+});
+
 // ---- script files and string-running wrappers (review findings 2 and 11) ------------------------------------
 
 // A fake file system: { 'push.sh': 'git push origin main' } relative to the cwd (/work/repo).
@@ -1305,4 +1461,263 @@ test('everyday flows stay allowed after the script, wrapper and destination rule
     'ls ~/.claude/skills',
   ];
   for (const c of flows) assert.equal(evaluate(c, { branch: 'agent/x' }).decision, 'allow', c);
+});
+
+// PR #7 round 3/4: an unsure variable (assigned more than once, or where it may not run: after && / ||, in a pipeline,
+// subshell, if / loop / case) denies the line when it reaches a git / gh command, a command that runs other code or
+// changes what runs (shells, source, eval, env, xargs, interpreters, a path or dynamic command name), cd / pushd /
+// popd, or the command name itself. Variables tainted by an unsure one are unsure too. Plain text tools stay usable.
+test('a line that passes an unsure variable to something that runs code or picks the repository is denied', () => {
+  const files = { 'run.sh': 'git push origin main', 'run.js': 'x', 'run.py': 'x' };
+  const denyCmds = [
+    'F=run.sh; F=run.sh; bash "$F"',
+    'F=run.sh; F=run.sh; sh $F',
+    'F=run.sh; F=run.sh; zsh "$F"',
+    'F=run.sh; F=run.sh; source "$F"',
+    'F=run.sh; F=run.sh; . "$F"',
+    'F=run.js; F=run.js; node "$F"',
+    'F=run.py; F=run.py; python3 $F',
+    'F=./run.sh; F=./run.sh; "$F"',
+    'D=/work/repo; D=/other; cd "$D"; gh issue close 9',
+    'D=/work/repo; D=/other; pushd "$D"; gh issue close 9',
+    'E=a; E=b; env "$E" git status',
+    'A=a; A=b; echo x | xargs $A',
+    'A=a; A=b; eval "$A"',
+    'A=a; A=b; $A status', // the command name itself
+    'F=a; F=b; bash -c "echo $F"',
+    // assigned where it may not run, then handed to something that runs code or picks the repository
+    'false && X=agent/x; git push origin $X',
+    'true || X=a; bash $X',
+    'cd /work/repo && X=agent/x && git push origin $X',
+    'if true; then X=a; fi; bash $X',
+    'for i in 1 2; do X=$i; done; node $X',
+    'while true; do X=a; done; python $X',
+    'case a in a) X=1;; esac; source $X',
+    '(X=a); cd $X',
+    'echo $(X=a); sh $X',
+    'X=a | cat; gh pr view $X',
+    // taint: a value built from an unsure variable is unsure itself
+    'F=a; F=b; X=$F; bash "$X"',
+    'F=a; F=b; X=${F}.sh; Y=$X; source "$Y"',
+    'F=a; F=b; export X=$F; git push origin $X',
+    'F=a; F=b; X=$(echo $F); bash "$X"',
+    // command-substitution bodies are commands of their own
+    'D=a; D=b; s=$(git push origin "$D")',
+    'D=a; D=b; echo "$(gh issue close "$D")"',
+    'D=a; D=b; s=`git push origin $D`',
+    'D=a; D=b; r=$(bash "$D"); echo $r',
+    // round 4: anything outside the text-tool ALLOWLIST is sensitive — a list of runners is never complete
+    'F=a; F=b; awk "BEGIN{system(\"$F\")}"', // awk runs commands
+    'F=a; F=b; sed "e $F" x', // so does sed's e command
+    'F=a; F=b; docker run "$F"',
+    'F=a; F=b; cp "$F" run.sh', // the hook reads run.sh as it is NOW
+    'F=a; F=b; /bin/echo $F', // a path names whatever is there, not the builtin
+    // …and the value reaches it through a redirect or a pipe, not only its arguments
+    'F=a; F=b; tee x <<< "$F"',
+    'F=a; F=b; echo "$F" | node',
+    'F=a; F=b; echo "$F" | xargs git push origin',
+    'F=a; F=b; echo "$F" |& sh',
+    'F=a; F=b; printf "%s" "$F" | grep . | python3',
+  ];
+  for (const c of denyCmds) assert.equal(evaluate(c, withFiles(files, { branch: 'agent/x', labels: [] })).decision, 'deny', c);
+  const allowCmds = [
+    'A=1; A=2; git status', // assigned twice, never referenced
+    'false && X=agent/x; git status',
+    'B=agent/y; git push origin $B', // one assignment, referenced: unchanged
+    'B=agent/y && git push -u origin ${B}',
+    'export B=agent/y; echo $B',
+    'echo $UNSET_ANYWHERE',
+    // unsure variables that only reach text tools
+    'A=1; A=2; echo $A',
+    'A=1; A=2; ls ${A}',
+    'echo $F; F=a; F=b',
+    'B=$B; B=x; true',
+    'A=a; A=b; echo hi > $A',
+    'if true; then X=a; fi; echo $X',
+    'for i in 1 2; do X=$i; done; echo $X',
+    'X=a | cat; echo $X',
+    'for i in $(seq 1 55); do s=$(gh pr view 15 --json x --jq y); n=$(echo "$s" | grep -c Z); [ "$n" -ge 2 ] && break; sleep 10; done',
+    'for f in a b; do x=$f; echo "$x"; done',
+    'if [ -n "$Y" ]; then Z=1; fi; echo $Z',
+    'r=$(gh pr checks 5); case "$r" in *fail*) echo bad;; esac',
+    'n=1; n=2; printf "%s\\n" "$n" | wc -l; sleep $n; seq 1 $n | tail -1',
+    // round 4: a pipeline of text tools, a here-string into one, and the usual CI polling loops
+    'F=a; F=b; echo "$F" | grep x | wc -l',
+    'F=a; F=b; cat <<< "$F"',
+    'x=1; x=2; echo $x |& cat',
+    'F=a; F=b; printf "%s" "$F" > out.txt',
+    'n=0; while [ $n -lt 3 ]; do n=$((n+1)); sleep 1; done; echo $n',
+    'for i in 1 2 3; do r=$(gh run view 5 --json status --jq .status); [ "$r" = completed ] && break; sleep 30; done; echo "$r"',
+    'until gh pr checks 15; do sleep 60; done',
+  ];
+  for (const c of allowCmds) assert.equal(evaluate(c, withFiles(files, { branch: 'agent/x', labels: [] })).decision, 'allow', c);
+});
+
+// Background-scan findings on fcb708c: state set by a command that may not have run (after && / ||, in the background,
+// a pipeline stage, a subshell, a substitution) must not be trusted by the commands after it, and builtins that assign
+// variables without a NAME=value word make the variable unsure.
+test('directory / branch / variable state from a command that may not have run is unknown', () => {
+  const o = { byDir: { '/work/repo': 'main', '/safe': 'agent/x' }, labels: [] };
+  const denyCmds = [
+    'false && cd /safe; git push',
+    'cd /safe & git push',
+    'cd /safe &\ngit push',
+    '(cd /safe); git push',
+    'echo $(cd /safe); git push',
+    'cd /safe | cat; git push',
+    'cd /safe || git push',
+    'false && pushd /safe; git push',
+    'false && git checkout agent/y; git push',
+    'git checkout agent/y & git push',
+    '(git checkout agent/y); git push',
+    'git checkout agent/y || true; git push',
+    'echo $(git checkout agent/y); git push',
+    'git checkout agent/y | cat; git push',
+    // a variable bound by a builtin that has no NAME=value word
+    'B=agent/x; read B <<< main; git push origin HEAD:$B',
+    'B=agent/x; printf -v B main; git push origin HEAD:$B',
+    'B=agent/x; unset B; git push origin HEAD:$B',
+    'B=agent/x; let B=5; git push origin HEAD:$B',
+    'B=agent/x; getopts a B -a; git push origin HEAD:$B',
+    'B=agent/x; mapfile B <<< main; git push origin HEAD:$B',
+    'B=agent/x & git push origin HEAD:$B',
+  ];
+  for (const c of denyCmds) assert.equal(evaluate(c, o).decision, 'deny', c);
+  const allowCmds = [
+    'cd /safe && git push',
+    'true && cd /safe && git push',
+    'git checkout agent/y && git push',
+    'cd /safe; git push',
+    'git checkout agent/y; git push',
+    'cd /safe > /dev/null 2>&1 && git push', // redirects and &> are not a background job
+    'cd /safe &>/dev/null; git status',
+  ];
+  for (const c of allowCmds) assert.equal(evaluate(c, o).decision, 'allow', c);
+});
+
+// Background-scan finding on 4789b20 (state tracking): constructs that change where a later command runs, or what a
+// variable holds, without anything the walk follows. Each deny below pushes from the `main` checkout in a real shell.
+test('namerefs, function / alias / trap definitions, shell options and sourced files make the state unknown', () => {
+  const files = {
+    '/safe/go.sh': 'cd /work/repo\n',
+    '/safe/vars.sh': 'B=main\n',
+    '/safe/env.sh': 'export NODE_ENV=test\n',
+  };
+  const o = {
+    byDir: { '/work/repo': 'main', '/safe': 'agent/x' },
+    labels: [],
+    readText: (p) => files[p] ?? null,
+    pathExists: (p) => p in files,
+  };
+  const denyCmds = [
+    // a nameref reads ANOTHER variable at run time; the text only names it
+    ['F=main; declare -n X=F; cd /safe && git push origin HEAD:$X', '/work/repo'],
+    ['cd /safe && F=main; typeset -n X=F; git push origin HEAD:$X', '/work/repo'],
+    ['F=main; declare -n X; X=F; cd /safe && git push origin HEAD:$X', '/work/repo'],
+    // a function body is parsed as if it ran; it never does unless called
+    ['f(){ cd /safe; }; git push', '/work/repo'],
+    ['f () { cd /safe; }; git push', '/work/repo'],
+    ['function f { cd /safe; }; git push', '/work/repo'],
+    // aliases, traps and options change what a later `cd` does, or run a cd of their own
+    ['alias cd=true; cd /safe; git push', '/work/repo'],
+    ['trap "cd /work/repo" DEBUG; cd /safe; git push', '/work/repo'],
+    ['setopt autocd; /work/repo; git push', '/safe'],
+    ['set -o autocd; cd /safe && git push', '/work/repo'],
+    ['enable -n cd; cd /safe; git push', '/work/repo'],
+    // a sourced file runs in this shell: it may cd, or reassign a variable the line already set
+    ['source ./go.sh; git push', '/safe'],
+    ['. ./go.sh && git push', '/safe'],
+    ['B=agent/x; source ./vars.sh; git push origin HEAD:$B', '/safe'],
+  ];
+  for (const [c, cwd] of denyCmds) assert.equal(evaluate(c, { ...o, cwd }).decision, 'deny', c);
+  const allowCmds = [
+    ['set -e; cd /safe && git push', '/work/repo'],
+    ['set -euo pipefail; cd /safe && git push', '/work/repo'],
+    ['arr=(); cd /safe && git push', '/work/repo'], // an empty array is not a function definition
+    ['alias ll="ls -l"; ll', '/safe'], // no git / gh on the line
+    ['source ./env.sh && npm test', '/safe'],
+    ['declare -r B=agent/x; git push origin HEAD:$B', '/safe'], // -r is not -n
+  ];
+  for (const [c, cwd] of allowCmds) assert.equal(evaluate(c, { ...o, cwd }).decision, 'allow', c);
+});
+
+// Codex round 4 on 5730f1f: state that becomes unknown mid-line is enforced for what follows, an unknown directory never
+// falls back to the starting one, and control flow is judged from where it starts (not from a word in a commit message).
+test('state that becomes unknown mid-line stays enforced; control flow counts from where it starts', () => {
+  const files = {
+    '/work/repo/env.sh': 'export NODE_ENV=test\n',
+    '/work/repo/run.sh': 'git push origin main\n',
+    '/other/run.sh': 'git push origin main\n',
+    '/work/repo/ok.sh': 'echo hi\n',
+    // harmless where the line starts, a push to main where the cd may have gone
+    '/work/repo/step.sh': 'echo hi\n',
+    '/other/step.sh': 'git push origin main\n',
+  };
+  const o = {
+    byDir: { '/work/repo': 'agent/x', '/other': 'agent/y' },
+    labelsByNum: {},
+    readText: (p) => files[p] ?? null,
+    pathExists: (p) => p in files,
+  };
+  const denyCmds = [
+    // a variable known when the line was first checked, unknown after `source`
+    'F=run.sh; source env.sh; bash "$F"',
+    'F=run.sh; source env.sh; source "$F"',
+    'F=run.sh; . ./env.sh && node "$F"',
+    // a directory that may have changed: the script that runs is not the starting directory's
+    'true && cd /other; bash step.sh',
+    'false || cd /other; ./step.sh',
+    'cd /other || exit 1 & git push', // `|| exit` does not help a backgrounded cd
+    // a ( subshell is still found in the text
+    '(B=main); git push origin HEAD:$B',
+  ];
+  for (const c of denyCmds) assert.equal(evaluate(c, o).decision, 'deny', c);
+  // the issue lives in the repository of a directory that may have changed: never looked up in the starting one
+  const v = evaluate('true && cd /other; gh issue close 9', { ...o, labels: [] });
+  assert.equal(v.decision, 'deny');
+  assert.match(v.reason, /which directory/);
+  assert.equal(v.calls.labels.length, 0);
+  assert.equal(evaluate('true && cd /other; gh issue close 9 -R o/r', { ...o, labels: [] }).decision, 'allow');
+  const allowCmds = [
+    'PR=7; while ! gh pr checks "$PR"; do sleep 30; done',
+    'B=agent/x; git commit -m "fix for loop"; git push origin "$B"',
+    'git commit -m "fix (again)"; B=agent/x; git push origin HEAD:$B',
+    'cd /other || exit 1; git push',
+    'cd /other || return; git push',
+    'cd /other; bash ok.sh',
+    'source env.sh && npm test',
+  ];
+  for (const c of allowCmds) assert.equal(evaluate(c, o).decision, 'allow', c);
+});
+
+// Scan finding on ce847fb: the ( subshell check stripped quoted strings with a regex that did not read quotes the way a
+// shell does, so an escaped quote or a $'…' string paired with a later quote and hid a real subshell. The parser now
+// reports the subshell itself. The cd inside ( ) does not change the directory the script runs in.
+test('a ( subshell hidden behind escaped quotes or a $\'…\' string is still found', () => {
+  const files = {
+    '/work/repo/step.sh': 'echo hi\n',
+    '/other/step.sh': 'git push origin main\n',
+  };
+  const o = {
+    byDir: { '/work/repo': 'agent/x', '/other': 'agent/y' },
+    labelsByNum: {},
+    readText: (p) => files[p] ?? null,
+    pathExists: (p) => p in files,
+    cwd: '/other',
+  };
+  const denyCmds = [
+    'echo \\"; (cd /work/repo); bash step.sh; echo "x"',
+    "echo \\'; (cd /work/repo); bash step.sh; echo 'x'",
+    "echo $'it\\'s'; (cd /work/repo); bash step.sh; echo 'x'",
+    'echo a\\"b; (cd /work/repo); bash step.sh; echo "c"',
+    'echo \\" ;(cd /work/repo) ;bash step.sh ;echo "x"',
+  ];
+  for (const c of denyCmds) assert.equal(evaluate(c, o).decision, 'deny', c);
+  const allowCmds = [
+    'cd /work/repo && bash step.sh',
+    'echo "a \\" (b)"; cd /work/repo && bash step.sh',
+    "git commit -m $'fix (again)\\n'; cd /work/repo && bash step.sh",
+    "echo $'it\\'s (fine)'; cd /work/repo && bash step.sh",
+  ];
+  for (const c of allowCmds) assert.equal(evaluate(c, o).decision, 'allow', c);
 });

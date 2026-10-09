@@ -4,6 +4,8 @@
 // and recurses into every place a shell would execute text. Best effort, never throws; when a safety cap
 // cuts parsing short the returned array carries a non-enumerable `truncated: true`, and when the command that
 // runs is only known at run time (`bash -c "$X"`, `$g push`, `curl … | sh`) it carries `dynamic: true`, so callers can fail closed.
+// It carries `subshell: true` when the line opens a ( subshell at the top level (its commands keep depth 0, so they look
+// like they run in this shell; what they assign or cd is lost).
 // Each command is {argv, env, raw, depth, redirects}; redirections are stripped from argv but recorded in `redirects`.
 
 const MAX_COMMANDS = 500;
@@ -585,9 +587,11 @@ function stdinSource(seg) {
 
 // ---- the parser ---------------------------------------------------------------------------------
 
-function emit(ctx, argv, env, raw, depth, redirects = []) {
+function emit(ctx, argv, env, raw, depth, redirects = [], sep = ';') {
   if (ctx.out.length >= MAX_COMMANDS) { ctx.truncated = true; ctx.stopped = true; return null; }
   const cmd = { argv, env, raw, depth, redirects };
+  // sep: the operator before it (; & && || |), for callers that care whether it surely runs; not enumerable, like `truncated`
+  Object.defineProperty(cmd, 'sep', { value: sep, enumerable: false });
   ctx.out.push(cmd);
   return cmd;
 }
@@ -783,7 +787,7 @@ class Parser {
         seg = {
           words: [], heredocs: [], herestrings: [], redirects: [], stdinSubs: [], stdinFile: false, meta: new Map(), win: new Map(),
           start: this.i, depth, pending: 0, muted, raw: '', final: null, groupStage: null,
-          pipedFrom: lastSep === '|' ? this.lastStage : null,
+          pipedFrom: lastSep === '|' ? this.lastStage : null, sep: lastSep,
         };
       }
     };
@@ -914,7 +918,7 @@ class Parser {
           flushWord(); startSeg();
           redir = 'file'; rfd = null;
           if (s[this.i + 2] === '>') { rop = '&>>'; this.i += 3; } else { rop = '&>'; this.i += 2; }
-        } else { endSeg(this.i); lastSep = ';'; this.i++; }
+        } else { endSeg(this.i); lastSep = '&'; this.i++; } // a background job: the command before it ran in a subshell
       } else if (c === '|') {
         const nx = s[this.i + 1];
         endSeg(this.i);
@@ -953,6 +957,7 @@ class Parser {
           endSeg(this.i);
           lastSep = ';';
           this.i++;
+          if (depth === 0) this.ctx.subshell = true; // ((...)) arithmetic too: conservative
           const mark0 = this.log.length;
           this.nestParse(depth, { stopAtParen: true, noRedir: noRedir || s[this.i] === '(' }); // ((...)) is arithmetic
           this.lastStage = this.log.slice(mark0);
@@ -1036,14 +1041,14 @@ class Parser {
       if (nextEq) value = nextEq.length > 1 ? nextEq.slice(1) : (words[i + 2]?.text ?? '');
       else if (value === '') value = words[i + 1]?.text ?? '';
       setEnv(env, ps[1], value);
-      return emit(this.ctx, [], env, seg.raw, seg.depth);
+      return emit(this.ctx, [], env, seg.raw, seg.depth, [], seg.sep);
     }
     for (; i < words.length; i++) {
       const a = assignOf(words[i]);
       if (!a) break;
       setEnv(env, a[0], a[1]);
     }
-    if (i >= words.length) return Object.keys(env).length ? emit(this.ctx, [], env, seg.raw, seg.depth) : null;
+    if (i >= words.length) return Object.keys(env).length ? emit(this.ctx, [], env, seg.raw, seg.depth, [], seg.sep) : null;
     // brace expansion: {a,b} in an unquoted word becomes several words (assignment words before the command are exempt)
     const argv = [];
     for (const w of words.slice(i)) {
@@ -1077,7 +1082,7 @@ class Parser {
     }
     // a command name that is only known at run time ($g push, $(echo git) push)
     if (a.length && (a[0].startsWith('$') || a[0].includes('$(') || a[0].includes('`'))) this.ctx.dynamic = true;
-    const cmd = emit(this.ctx, a, env, seg.raw, seg.depth);
+    const cmd = emit(this.ctx, a, env, seg.raw, seg.depth, [], seg.sep);
     if (!isExec) seg.final = { argv: a };
     this.interpret(a, seg);
     return cmd;
@@ -1213,7 +1218,7 @@ class Parser {
 
 export function simpleCommands(str, opts) {
   const requested = Number.isFinite(opts?.maxDepth) ? Math.trunc(opts.maxDepth) : 5;
-  const ctx = { out: [], maxDepth: Math.min(Math.max(requested, 0), HARD_MAX_DEPTH), truncated: false, dynamic: false, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0 };
+  const ctx = { out: [], maxDepth: Math.min(Math.max(requested, 0), HARD_MAX_DEPTH), truncated: false, dynamic: false, subshell: false, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0 };
   let parser = null;
   try {
     parser = new Parser(ctx, String(str ?? ''));
@@ -1224,6 +1229,7 @@ export function simpleCommands(str, opts) {
   }
   Object.defineProperty(ctx.out, 'truncated', { value: ctx.truncated, enumerable: false });
   Object.defineProperty(ctx.out, 'dynamic', { value: ctx.dynamic, enumerable: false });
+  Object.defineProperty(ctx.out, 'subshell', { value: ctx.subshell, enumerable: false });
   return ctx.out;
 }
 
