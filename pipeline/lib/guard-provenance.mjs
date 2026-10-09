@@ -17,8 +17,10 @@
 //   * names, in that same PR entry, a base.sha that is an ancestor of, or equal to, the default branch. NOT the run's
 //     `head_sha`: for pull_request_target GitHub reports the PR HEAD there (measured on EagleWatch, run 37906872583:
 //     head_sha = PR head 623be97, pull_requests[0].base.sha = main tip a48c0ff), so checking head_sha refused every PR.
-//     base.sha can lag (GitHub refreshes it lazily); a lagging sha is still a main commit, and base.ref above is what
-//     pins the workflow file to main's tip,
+//     base.sha can lag (GitHub refreshes it lazily). A lagging sha is still a main commit, and base.ref pins the
+//     WORKFLOW FILE to main's tip, but NOT the guard scripts: the workflow checks those out at the event's
+//     pull_request.base.sha, so a lagging base runs older scripts. This check cannot prove freshness; the workflow
+//     closes that by checking out the base branch tip instead (claude-pipeline #26),
 //   * was running when the status was posted: created_at - 10s <= status.created_at <= updated_at + 10s. The lower bound
 //     is the run's creation (the event time), not run_started_at: a queued run can start long after the labeling it answers.
 // and, for the verdict itself (checkGuardVerdict), carries a VERDICT ARTIFACT only the genuine run can upload.
