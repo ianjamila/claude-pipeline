@@ -119,8 +119,10 @@ Exit: 0 · 2 usage / no state · 3 GitHub (`gh`) unavailable.
 list hard-stop hits for a branch diff (exit 1 on blocking hits unless human-approved).
 
 ```
-pipeline hardstops --base REF --head REF [--labels a,b] [--repo DIR]   -> {ok, approved, hits, blocking, advisory}; exit 1 when blocking hits and not approved
+pipeline hardstops --base REF --head REF [--labels a,b] [--repo DIR]   -> {ok, approved, hits, blocking, advisory, ownerMerge}; exit 1 when blocking hits and not approved (ownerMerge = hits the owner merges in chat, owner_approval: chat)
 ```
+
+With `owner_approval: chat` in pipeline.yml every would-be-blocking hit is returned as `advisory` + `ownerMerge` (also listed under `ownerMerge`; the owner merges them by saying "merge" in chat) and the exit is 0.
 
 Exit: 0 no blocking hits (report-only hits, `advisory`, are listed but never block), or blocking hits approved by `human-approved` · 1 unapproved blocking hits · 2 usage / config.
 
@@ -129,8 +131,10 @@ Exit: 0 no blocking hits (report-only hits, `advisory`, are listed but never blo
 check that a branch diff does not weaken tests (exit 1 unless test-change-approved).
 
 ```
-pipeline integrity --base REF --head REF [--labels a,b] [--repo DIR]   -> {ok, overridden, violations, base, head}; exit 1 when not ok
+pipeline integrity --base REF --head REF [--labels a,b] [--repo DIR]   -> {ok, overridden, violations, base, head, ownerMerge?}; exit 1 when not ok (owner_approval: chat: always ok, violations repeated under ownerMerge)
 ```
+
+With `owner_approval: chat` in pipeline.yml violations never fail the check: they are also returned under `ownerMerge` and the owner merges in chat.
 
 Exit: 0 ok or overridden by `test-change-approved` · 1 violations · 2 usage / config.
 

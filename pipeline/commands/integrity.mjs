@@ -1,5 +1,6 @@
 // Test-integrity check for a branch diff: fails when the branch weakens tests (deletes, skips, loosens coverage,
-// edits assertions) instead of fixing code. Only the owner's `test-change-approved` label overrides it. Needs the
+// edits assertions) instead of fixing code. Only the owner's `test-change-approved` label overrides it (with
+// owner_approval: chat nothing fails: the violations come back under `ownerMerge` instead). Needs the
 // config for the project's test globs. Exit 1 = violations and no override.
 import { EXIT, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { guarded, parseLabels, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
@@ -8,7 +9,7 @@ import { checkIntegrity } from '../lib/integrity.mjs';
 
 export const meta = {
   summary: 'check that a branch diff does not weaken tests (exit 1 unless test-change-approved)',
-  usage: 'pipeline integrity --base REF --head REF [--labels a,b] [--repo DIR]   -> {ok, overridden, violations, base, head}; exit 1 when not ok',
+  usage: 'pipeline integrity --base REF --head REF [--labels a,b] [--repo DIR]   -> {ok, overridden, violations, base, head, ownerMerge?}; exit 1 when not ok (owner_approval: chat: always ok, violations repeated under ownerMerge)',
 };
 
 export const run = guarded(async (argv, ctx) => {

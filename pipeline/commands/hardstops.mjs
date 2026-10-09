@@ -4,11 +4,11 @@
 // project opts into per rule, are listed too but never block. Exit 1 = blocked, 0 = clear, advisory-only or approved.
 import { EXIT, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { guarded, parseLabels, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
-import { blockingHits, collectHardStops } from '../lib/hardstops.mjs';
+import { blockingHits, collectHardStops, ownerMergeHits } from '../lib/hardstops.mjs';
 
 export const meta = {
   summary: 'list hard-stop hits for a branch diff (exit 1 on blocking hits unless human-approved)',
-  usage: 'pipeline hardstops --base REF --head REF [--labels a,b] [--repo DIR]   -> {ok, approved, hits, blocking, advisory}; exit 1 when blocking hits and not approved',
+  usage: 'pipeline hardstops --base REF --head REF [--labels a,b] [--repo DIR]   -> {ok, approved, hits, blocking, advisory, ownerMerge}; exit 1 when blocking hits and not approved (ownerMerge = hits the owner merges in chat, owner_approval: chat)',
 };
 
 export const APPROVAL_LABEL = 'human-approved';
@@ -27,5 +27,5 @@ export const run = guarded(async (argv, ctx) => {
   const approved = labels.includes(APPROVAL_LABEL);
   const blocking = blockingHits(hits);
   const ok = blocking.length === 0 || approved;
-  return { exitCode: ok ? EXIT.OK : EXIT.FAILED, output: { ok, approved, hits, blocking, advisory: hits.filter((h) => h.advisory) } };
+  return { exitCode: ok ? EXIT.OK : EXIT.FAILED, output: { ok, approved, hits, blocking, advisory: hits.filter((h) => h.advisory), ownerMerge: ownerMergeHits(hits) } };
 });
