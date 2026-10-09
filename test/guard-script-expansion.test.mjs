@@ -619,3 +619,25 @@ test('G5: many brackets in one segment stay cheap and fail closed', () => {
   allowBoth(`bash ${'[a]*]'.repeat(30)}z.sh`, names);
   assert.ok(Date.now() - t0 < 3000, `took ${Date.now() - t0} ms`);
 });
+
+// ---- round 5: a file whose name holds $ or a backtick ----------------------------------------------------------------
+
+test('G6: a glob result is a final path: a name with $ or a backtick is judged as it is, never expanded again', () => {
+  const spec = { 'x$y.sh': 'bad', 'k`id`.sh': 'bad', 'x$y.mjs': 'bad', 'ok.sh': 'ok' };
+  for (const c of ['bash x*.sh', './x*.sh', 'bash k*.sh', './k*.sh', 'source x*.sh', 'node x*.mjs', 'bash -x x?y.sh', 'X=-x; bash $X x*.sh', 'cd . && bash x*.sh']) denyBoth(c, spec);
+  allowBoth('bash x*.mjs', { 'x$y.mjs': 'ok', 'ok.sh': 'ok' });
+  allowBoth('bash x*.sh', { 'x$y.sh': 'ok', 'ok.sh': 'ok' });
+});
+
+test('G6: a quoted or escaped $ / backtick in a file name is also tried as a literal path', () => {
+  const spec = { 'x$y.sh': 'bad', 'k`id`.sh': 'bad', 'x$y.mjs': 'bad', 'ok.sh': 'ok' };
+  for (const c of ["bash 'x$y.sh'", 'bash x\\$y.sh', "bash 'k`id`.sh'", "'./x$y.sh'", './x\\$y.sh', "source 'x$y.sh'", "node 'x$y.mjs'", "bash $Z 'x$y.sh'", "bash -x 'x$y.sh'"]) denyBoth(c, spec);
+  // the literal is only a guess: a missing file runs nothing, and the textual rule for an unknown name still applies
+  allowBoth("bash 'x$z.sh'", spec);
+  allowBoth('bash $X', spec);
+  allowBoth('bash "$X"', spec);
+  assert.equal(git('bash "$X" && git push origin agent/x').decision, 'deny');
+  assert.equal(files('bash "$X"; cat ~/.claude/settings.json').decision, 'deny');
+  // a literal name that is a directory is skipped like any candidate
+  allowBoth("bash 'x$d'", { 'x$d/inner.sh': 'bad' }, { dirs: ['x$d'] });
+});

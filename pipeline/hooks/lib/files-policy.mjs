@@ -959,8 +959,12 @@ function judgeScriptFile(sf, dirs, ctx, opts, scanRaw = '', keepBackslash = fals
     const v = judgeScriptFile(sf, dirs, ctx, opts, scanRaw, true);
     if (v) return v;
   }
-  const e = keepBackslash ? expandRefs(sf.file.replace(/\\/g, '\uE001'), ctx).replace(/\uE001/g, '\\') : expandRefs(sf.file, ctx);
-  if (/[$`]/.test(e)) return null; // named at run time: the textual rules on the whole line still apply
+  // a candidate is a final path (a glob match, or a word already expanded): the shell never expands it a second time
+  const e = sf.candidate ? (keepBackslash ? sf.file : toPosix(sf.file)) : keepBackslash ? expandRefs(sf.file.replace(/\\/g, '\uE001'), ctx).replace(/\uE001/g, '\\') : expandRefs(sf.file, ctx);
+  if (!sf.candidate && /[$`]/.test(e)) {
+    // named at run time: the textual rules on the whole line still apply. Quoting is lost (`'x$y.sh'` reads as `x$y.sh`), so the word as written is judged too if it is a file
+    return keepBackslash ? null : judgeScriptFile({ kind: sf.kind, file: sf.file, candidate: true }, dirs, ctx, opts);
+  }
   const found = [];
   for (const d of isAbs(e) ? [''] : dirs) {
     const abs = isAbs(e) ? posix.normalize(e) : posix.join(d, e);

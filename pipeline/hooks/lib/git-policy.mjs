@@ -723,14 +723,18 @@ const isNodeModulesOrPipelineHome = (p) => /[\\/]node_modules[\\/]/.test(p) || /
 // readable (a binary, a huge generated file or a package under node_modules is not ours to judge).
 function checkScriptFile(sf, dir, ctx, level) {
   if (sf.ambiguous) return checkCandidateScripts(sf, dir, ctx, level);
-  const file = expandVars(sf.file, ctx.vars);
-  if (/^\$\{?HOME\}?(?=\/|$)/.test(file)) return checkScriptFile({ ...sf, file: ctx.home + file.replace(/^\$\{?HOME\}?/, '') }, dir, ctx, level);
-  if (DYNAMIC.test(file)) {
+  // a candidate is a final path (a glob match, or a word already expanded): the shell never expands it a second time
+  const file = sf.candidate ? sf.file : expandVars(sf.file, ctx.vars);
+  if (!sf.candidate && /^\$\{?HOME\}?(?=\/|$)/.test(file)) return checkScriptFile({ ...sf, file: ctx.home + file.replace(/^\$\{?HOME\}?/, '') }, dir, ctx, level);
+  if (!sf.candidate && DYNAMIC.test(file)) {
+    // quoting is lost (`'x$y.sh'` reads as `x$y.sh`): if the word as written is a file, judge it before the textual rule
+    const lit = checkScriptFile({ kind: sf.kind, file: sf.file, candidate: true }, dir, ctx, level);
+    if (lit) return lit;
     return sf.kind !== 'exec' && GUARDED_WORDS.test(ctx.fullText)
       ? deny(`the script "${sf.file}" is named at run time and the line mentions a guarded operation, so what it runs cannot be verified. Name the file.`)
       : null;
   }
-  const home = file === '~' || file.startsWith('~/') ? ctx.home + file.slice(1) : file;
+  const home = !sf.candidate && (file === '~' || file.startsWith('~/')) ? ctx.home + file.slice(1) : file;
   const abs = path.resolve(dir ?? ctx.cwd, home);
   const text = ctx.readText(abs);
   if (typeof text !== 'string') {

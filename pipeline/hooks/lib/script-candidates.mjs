@@ -102,7 +102,8 @@ export function scriptCandidates(sf, { expand, dirs, joinPath, readDir, ifs }) {
     if (ifsUnknown && w.includes('$')) dynamic = true;
     for (const r of new Set(readings)) {
       if (r === '') continue; // an empty word runs nothing
-      if (/[$`]/.test(r)) { dynamic = true; continue; }
+      // still unknown at run time; but quoting is lost (`'x$y.sh'` reads as `x$y.sh`), so the word may be a literal file name too
+      if (/[$`]/.test(r)) { dynamic = true; add(r); continue; }
       const glob = GLOB_CHARS.test(r);
       if (EXTENDED_GLOB.test(r) || (glob && UNSUPPORTED_GLOB.test(r))) { add(r); budget.over = true; continue; }
       add(r); // an unmatched glob stays a literal word, and a quoted name may merely look like a glob
