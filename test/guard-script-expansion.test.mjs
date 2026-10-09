@@ -697,3 +697,24 @@ test('G8: ? and a bracket match a whole multi-byte character, or any of its byte
   allowBoth('bash x?y.sh', { 'xzzzzzy.sh': 'bad', 'other.sh': 'ok' }); // more than four bytes between: no match
   allowBoth('bash q?.sh', { 'p😀.sh': 'bad' });
 });
+
+// ---- round 8: Codex review of PR #23 -------------------------------------------------------------------------------------
+
+test('R1-B1: variables set inside a judged script do not leak into the line that ran it', () => {
+  const spec = { 'f.sh': 'bad', 'ok.sh': 'ok', 'd.sh': { text: 'F=ok.sh' }, 'd2.sh': { text: 'G=f.sh' } };
+  const mk = (bad, ok) => Object.fromEntries(Object.entries(spec).map(([k, v]) => [k, v === 'bad' ? bad : v === 'ok' ? ok : v.text]));
+  const gfs = () => fakeFs(GIT_ROOT, mk(BAD_GIT, 'git status'), ['sub']);
+  const ffs = () => fakeFs(PROJ, mk(BAD_FILES, 'echo hi'), ['sub']);
+  // a child shell never passes its variables back up
+  assert.equal(git('F=f.sh; bash d.sh; bash $F', gfs()).decision, 'deny');
+  assert.equal(git('F=f.sh; bash $X d.sh; bash $F', gfs()).decision, 'deny'); // d.sh is only a candidate
+  assert.equal(git('F=f.sh; sh ./d.sh; bash $F', gfs()).decision, 'deny');
+  assert.equal(files('F=f.sh; bash d.sh; bash $F', ffs()).decision, 'deny');
+  // `source` does change the caller's variables: a definite one is believed...
+  assert.equal(git('F=f.sh; source d.sh; bash $F', gfs()).decision, 'allow');
+  // ...but a candidate that may or may not be the sourced file only makes the variable uncertain (old value judged, line dynamic)
+  assert.equal(git('F=f.sh; source $X d.sh; bash $F', gfs()).decision, 'deny');
+  assert.equal(git('F=ok.sh; source $X d2.sh; bash $F', gfs()).decision, 'allow'); // F untouched by d2.sh
+  assert.equal(git('X=-q; G=ok.sh; source $X d2.sh; bash $G && git push origin agent/x', gfs()).decision, 'deny'); // G may now be f.sh
+  assert.equal(git('X=-q; G=ok.sh; source $X d2.sh; bash $G', gfs()).decision, 'allow'); // nothing guarded on the line: judged as before
+});

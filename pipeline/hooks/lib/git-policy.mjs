@@ -755,8 +755,25 @@ function checkScriptFile(sf, dir, ctx, level) {
     return why ? deny(`the program ${sf.file} contains a guarded command (${why}); it cannot be verified by the guard. Run the operation directly.`) : null;
   }
   if (level >= MAX_NESTING) return deny(`the script ${sf.file} is nested too deeply (scripts running scripts) to verify.`);
-  const v = text.length > MAX_LINE_CHARS ? judgeLongText(text) : evalString(text, dir, ctx, level + 1);
+  const v = judgeScoped(text, dir, ctx, level, sf);
   return v.decision === 'deny' ? deny(`the script ${sf.file} would run a blocked command: ${v.reason}`) : null;
+}
+
+// Variables set inside a script do not leave a child shell (`bash f.sh`, `./f`): the line's own values stay. `source` does
+// change the caller's variables, which is believed for a named file; a candidate that may or may not be the sourced file
+// puts the line's old values back and marks the variables it set as uncertain (a later use is also unknown at run time).
+function judgeScoped(text, dir, ctx, level, sf) {
+  if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
+  if (sf.sourced && !sf.candidate) return evalString(text, dir, ctx, level + 1);
+  const saved = Object.assign(Object.create(null), ctx.vars);
+  try {
+    return evalString(text, dir, ctx, level + 1);
+  } finally {
+    const after = Object.assign(Object.create(null), ctx.vars);
+    for (const k of Object.keys(ctx.vars)) delete ctx.vars[k];
+    Object.assign(ctx.vars, saved);
+    if (sf.sourced) for (const k of new Set([...Object.keys(after), ...Object.keys(saved)])) if (after[k] !== saved[k]) ctx.tainted.add(k);
+  }
 }
 
 // A word before the script expands at run time (`X=+n; bash $X f.sh`, `bash $(..) f.sh`, `source $X`, `bash *.sh`), so which
@@ -772,11 +789,13 @@ function checkCandidateScripts(sf, dir, ctx, level) {
   };
   const c = scriptCandidates(sf, { expand, dirs: [here], joinPath: (d, r) => path.resolve(d, r), readDir: ctx.readDir, ifs: ctx.vars.IFS });
   if (c.over) return deny('too many words, a glob matching too many files, or glob syntax that cannot be resolved could be the script this command runs, so it cannot be verified. Name the script file.');
-  if (c.dynamic && GUARDED_WORDS.test(ctx.fullText)) {
+  // a variable a speculative `source` may have changed: its old value is judged below, its possible new one is unknown
+  const tainted = sf.words.some((w) => [...w.matchAll(/\$\{?(\w+)/g)].some((m) => ctx.tainted.has(m[1])));
+  if ((c.dynamic || tainted) && GUARDED_WORDS.test(ctx.fullText)) {
     return deny('which word is the script this command runs is only known at run time ($VAR / $(...) / a glob) and the line mentions a guarded operation, so it cannot be verified. Name the file and write the options literally.');
   }
   for (const file of c.files) {
-    const v = checkScriptFile({ kind: sf.kind, file, candidate: true }, dir, ctx, level);
+    const v = checkScriptFile({ kind: sf.kind, file, candidate: true, sourced: sf.sourced }, dir, ctx, level);
     if (v) return v;
   }
   return null;
@@ -818,7 +837,10 @@ function evalString(str, startDir, ctx, level) {
         if (why) verdict = deny(`${name} was given a string that contains a guarded command (${why}). Run the operation directly so it can be checked.`);
       }
       const sf = verdict ? null : scriptFileOf(argv, c.raw, str);
-      if (sf) verdict = checkScriptFile(sf, dir, ctx, level);
+      if (sf) {
+        if (name === 'source' || name === '.') sf.sourced = true;
+        verdict = checkScriptFile(sf, dir, ctx, level);
+      }
     }
     if (verdict && verdict.decision === 'deny') return verdict;
   }
@@ -845,7 +867,7 @@ export function evaluateGitCommand(command, {
   const base = cwd || process.cwd();
   const ctx = {
     cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, readDir, judgeBudget: MAX_CANDIDATE_JUDGMENTS, fullText: text,
-    vars: Object.create(null), gitAliases: Object.create(null), ghAliases: Object.create(null),
+    vars: Object.create(null), tainted: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
     branches: new Map(), cfgDirty: false, envCfgDirty: false,
   };
   return evalString(text, path.resolve(base), ctx, 0);
