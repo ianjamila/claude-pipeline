@@ -58,7 +58,7 @@
 //  * Path rules test the old AND the new path, case-insensitively. Exclusions (docs, tests) match the path as written.
 import { posix } from 'node:path';
 import { matchAny } from './glob.mjs';
-import { DEFAULTS } from './config.mjs';
+import { DEFAULTS, DISABLEABLE_HARD_STOP_RULES } from './config.mjs';
 import { diffFiles, diffModes, mergeBase, showFile, git, GitError } from './git.mjs';
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1203,7 +1203,19 @@ function settings(config) {
     patterns: (hs.patterns ?? []).map(compilePattern),
     testGlobs: config?.integrity?.test_globs ?? DEFAULTS.integrity.test_globs,
     authRemoved: [...AUTH_REMOVED, ...authCalls],
+    disabled: disabledRules(hs.disable_rules),
   };
+}
+
+// hard_stops.disable_rules, re-checked here because classifyHardStops can be handed a config that never went through
+// validateConfig: a rule outside the switchable list stops the run (fail closed) instead of being dropped.
+function disabledRules(rules = []) {
+  for (const r of rules) {
+    if (!DISABLEABLE_HARD_STOP_RULES.includes(r)) {
+      throw new Error(`hard_stops.disable_rules: ${JSON.stringify(r)} cannot be disabled (allowed: ${DISABLEABLE_HARD_STOP_RULES.join(', ')})`);
+    }
+  }
+  return new Set(rules);
 }
 
 function describe(f, cx) {
@@ -1450,7 +1462,7 @@ export function classifyHardStops({ files, config, baseEnvNames = new Set(), bas
 
   for (const g of guardLosses) sink.add(g.kind === 'sql' ? 'R2-sql-removed' : 'R2-auth-removed', g.file, g.detail);
 
-  return sink.list();
+  return sink.list().filter((hit) => !cx.disabled.has(hit.rule));
 }
 
 // ---------------------------------------------------------------------------------------------------------------

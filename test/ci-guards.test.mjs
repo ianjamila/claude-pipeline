@@ -387,7 +387,10 @@ test('pipeline-guards.yml re-evaluates a PR whose base changed (edited), but ign
   assert.match(yml, /group: pipeline-guards-\$\{\{ github\.event\.pull_request\.number \}\}\$\{\{ github\.event\.action == 'edited' && !github\.event\.changes\.base && '-noop' \|\| '' \}\}/);
   // The orchestrator takes the base from the event payload, which after a retarget holds the NEW base.
   assert.match(yml, /BASE_SHA: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
-  assert.match(yml, /ref: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
+  // The checkout is the commit this workflow file came from (the base branch tip), never the lazily refreshed
+  // base.sha, which can predate the guard scripts.
+  assert.match(yml, /ref: \$\{\{ github\.sha \}\}/);
+  assert.doesNotMatch(yml, /ref: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
 });
 
 test('pipeline-guards.yml hands the labeling event to the job through env only, and runs on a supported Node', () => {

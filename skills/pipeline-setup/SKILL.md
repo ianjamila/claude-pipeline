@@ -73,7 +73,9 @@ organization, otherwise every approval fails closed with `org-repo-needs-ci.appr
 the logins); preview (environment name in GitHub
 deployments + smoke command); production (URL, provider, read-only smoke, rollback command (documentation only: prod-watch runs
 `vercel rollback <known-good> --yes --timeout 3m` itself for provider `vercel`) + notes); `smoke_checks` (GET-only, unauthenticated); `risk.high_risk_paths`; `hard_stops.paths` /
-`patterns` / `auth_calls` (project extras on top of the universal list); review settings.
+`patterns` / `auth_calls` (project extras on top of the universal list); `hard_stops.disable_rules` only when a built-in
+word/version rule is routine for the domain (`R6-sensitive` for an HR/payroll/medical app, `R5-major-dep`; nothing else can be
+switched off — ask the owner first); review settings.
 Validate: `P config` (it prints `warnings`: read them, e.g. a missing guard context).
 
 ### d. CI + branch protection

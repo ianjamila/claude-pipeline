@@ -32,7 +32,7 @@ export const DEFAULTS = deepFreeze({
   production: null,
   smoke_checks: [],
   risk: { high_risk_paths: [], medium_lines: 150, high_lines: 600, medium_files: 10 },
-  hard_stops: { paths: [], patterns: [], auth_calls: [] },
+  hard_stops: { paths: [], patterns: [], auth_calls: [], disable_rules: [] },
   integrity: {
     test_globs: [
       '**/*.test.*', '**/*.spec.*', '**/__tests__/**', '**/test/**', '**/tests/**', 'e2e/**', 'supabase/tests/**',
@@ -73,7 +73,7 @@ const KEYS = {
   production: ['url', 'provider', 'environment', 'smoke', 'deploy_timeout_minutes', 'rollback'],
   rollback: ['command', 'notes'],
   risk: ['high_risk_paths', 'medium_lines', 'high_lines', 'medium_files'],
-  hard_stops: ['paths', 'patterns', 'auth_calls'],
+  hard_stops: ['paths', 'patterns', 'auth_calls', 'disable_rules'],
   pattern: ['name', 'regex', 'paths'],
   integrity: ['test_globs'],
   review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines'],
@@ -160,6 +160,22 @@ function checkProduction(p, errors) {
   else if (!PROVIDERS.includes(p.provider)) errors.push(`production.provider must be one of ${PROVIDERS.join('|')}`);
   if (p.deploy_timeout_minutes === undefined) p.deploy_timeout_minutes = 20;
   else if (!inRange(p.deploy_timeout_minutes, 1, 120)) errors.push('production.deploy_timeout_minutes must be an integer 1..120');
+}
+
+// Built-in hard-stop rule families a project may switch off with hard_stops.disable_rules. Deliberately short: only
+// rules whose trigger is a WORD or a version number, which a domain can make routine (an HR/payroll app mentions
+// payroll everywhere). Migrations, destructive SQL, auth paths and removed guards, secrets, pipeline files and
+// unscannable input stay on for every project — naming one of them is a config error, not a silent no-op.
+export const DISABLEABLE_HARD_STOP_RULES = Object.freeze(['R5-major-dep', 'R6-sensitive']);
+
+function checkDisableRules(rules, errors) {
+  if (rules === undefined) return;
+  if (!Array.isArray(rules)) return errors.push('hard_stops.disable_rules must be an array');
+  rules.forEach((r, i) => {
+    if (!DISABLEABLE_HARD_STOP_RULES.includes(r)) {
+      errors.push(`hard_stops.disable_rules[${i}]: ${JSON.stringify(r)} cannot be disabled (allowed: ${DISABLEABLE_HARD_STOP_RULES.join(', ')})`);
+    }
+  });
 }
 
 function checkPatterns(patterns, errors) {
@@ -277,6 +293,7 @@ export function validateConfig(obj) {
     checkStrArray(hardStops.paths, 'hard_stops.paths', errors);
     checkStrArray(hardStops.auth_calls, 'hard_stops.auth_calls', errors);
     checkPatterns(hardStops.patterns, errors);
+    checkDisableRules(hardStops.disable_rules, errors);
   }
 
   const integrity = section(config, 'integrity', errors);
