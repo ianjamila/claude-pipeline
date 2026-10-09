@@ -13,7 +13,7 @@ import { resolve, dirname, basename } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { simpleCommands } from '../pipeline/hooks/lib/shell-parse.mjs';
-import { writesOf, printfText, flowStart } from '../pipeline/hooks/lib/line-writes.mjs';
+import { writesOf, printfText, flowStart, namesFile } from '../pipeline/hooks/lib/line-writes.mjs';
 
 function fakeFs(root, files, dirs = []) {
   const abs = (p) => resolve(root, p);
@@ -330,6 +330,10 @@ test('h: an inline program writes the script only if it names it (literally, in 
   denyBoth((bad) => `python3 -c "open('ok.sh', 'w').write('${bad}')"; bash ok.sh`);
   assert.equal(run((_, mid) => `node -e "fs.writeFileSync('ok.sh', 'x')"; ${mid}; bash ok.sh`, SPEC).git.r.decision, 'allow'); // (not the line's mention: the program's own text)
   allowBoth(`node -e "fs.writeFileSync('ok.sh', 'x')"; bash ok.sh`);
+  // a longer name that ends in the script's name is another file (git: the word merge in the program text)
+  const only = (c) => run(c, { ...SPEC, 'test.mjs': 'ok' }).git.r.decision;
+  assert.equal(only("node -e \"fs.writeFileSync('shell-parse.test.mjs', 'merge')\"; node test.mjs"), 'allow');
+  assert.equal(only("node -e \"fs.writeFileSync('./test.mjs', 'merge')\"; node test.mjs"), 'deny');
   // it names other files: not a write to this one (it is still "unmodelled" for a script that is MISSING)
   allowBoth((_, _m, calm) => `node -e "fs.writeFileSync('other.txt', 'x')"; ${calm}; bash ok.sh`);
   assert.equal(run((_, mid) => `node -e "fs.writeFileSync('other.txt', 'x')"; ${mid}; bash ok.sh`, SPEC).git.r.decision, 'allow');
@@ -344,6 +348,20 @@ test('h: a write that only MAY be the script never makes it "built from pieces":
   allowBoth('cat > "$T/n.sh" 2>/dev/null || true; cat ok.sh > n.sh; bash n.sh');
   // an exact write with a piece that cannot be joined is refused whatever the line says
   denyBoth('printf a > n.sh; curl -s https://x >> n.sh; bash n.sh');
+});
+
+test('line-writes: namesFile matches a file name as a whole word, escaped (a + or . in the name is a character)', () => {
+  assert.equal(namesFile("fs.writeFileSync('ok.sh','x')", 'ok.sh'), true);
+  assert.equal(namesFile('fs.writeFileSync(p, x) ./ok.sh', 'ok.sh'), true);
+  assert.equal(namesFile('x+y.sh', 'x+y.sh'), true);
+  assert.equal(namesFile('xxy.sh', 'x+y.sh'), false);
+  assert.equal(namesFile('okxsh', 'ok.sh'), false);
+  assert.equal(namesFile('shell-parse.test.mjs', 'test.mjs'), false);
+  assert.equal(namesFile('mytest.mjs', 'test.mjs'), false);
+  // through the policy: the program names a script whose name holds a regex character
+  const spec = { ...SPEC, 'x+y.sh': 'ok' };
+  assert.equal(run("node -e \"fs.writeFileSync('x+y.sh', 'merge')\"; bash x+y.sh", spec).git.r.decision, 'deny');
+  assert.equal(run("node -e \"fs.writeFileSync('xxy.sh', 'merge')\"; bash x+y.sh", spec).git.r.decision, 'allow');
 });
 
 test('h: a file named ..x.sh inside a copied directory is inside it', () => {

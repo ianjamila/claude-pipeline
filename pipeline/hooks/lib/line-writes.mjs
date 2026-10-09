@@ -130,6 +130,8 @@ const PURE = new Set([
 // git subcommands that change the working tree in ways we do not follow (the files of a branch switch, a merge, a pull ...) or write named files
 const GIT_TREE = new Set(['checkout', 'switch', 'restore', 'reset', 'merge', 'pull', 'rebase', 'stash', 'apply', 'am', 'cherry-pick', 'revert', 'clean', 'clone', 'worktree', 'submodule', 'checkout-index', 'read-tree', 'sparse-checkout', 'bisect', 'init', 'mv']);
 const GIT_OUTPUT = new Set(['diff', 'log', 'show', 'format-patch', 'archive', 'bundle', 'shortlog', 'whatchanged', 'range-diff', 'diff-tree']);
+// does the program text name this file (not as the tail of a longer name: test.mjs in shell-parse.test.mjs)?
+export const namesFile = (text, base) => new RegExp(`(?<![\\w.-])${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w-])`).test(text);
 // program text that can write a file or start something that does
 const CAN_WRITE = /write|append|rename|copy|\bcp\b|\bmv\b|\bln\b|truncate|symlink|open\s*\(|>>?|\btee\b|shutil|move|dump|save|\bsed\b|spawn|exec|system|subprocess|child_process|popen|Popen|require\(|import /i;
 const WRITER_NAMES = new Set(['cp', 'mv', 'ln', 'install', 'ditto', 'rsync', 'tee', 'dd', 'curl', 'wget', 'sed', 'gsed', 'tar', 'bsdtar', 'gtar', 'unzip', 'git', 'perl', 'ruby']);
@@ -642,7 +644,7 @@ const nameOf = (f, s) => f.p.basename(String(s).replace(/[\\/]+$/, ''));
 function match(f, rec, P) {
   const p = f.p;
   const loose = (items) => Object.assign([...items], { loose: true }); // may or may not be the file: its place in the order is unknown
-  if (rec.inline !== undefined) return rec.inline.includes(p.basename(P)) && CAN_WRITE.test(rec.inline) ? loose(rec.items) : null;
+  if (rec.inline !== undefined) return namesFile(rec.inline, p.basename(P)) && CAN_WRITE.test(rec.inline) ? loose(rec.items) : null;
   if (rec.dest === null) return loose(rec.items);
   const e = f.expand(rec.dest);
   // a target only known at run time may be any file its fixed parts allow (`/work/out-$n.txt` is not /work/cmp.mjs)
