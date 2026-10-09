@@ -3,7 +3,8 @@
 // policies share this list of every word that could be the script: each word from argv[1] on, as written; for a word
 // with a known variable also its expanded value, whole and split on whitespace (an unquoted expansion splits); and
 // for a glob, the existing files it matches. Each policy then judges the files like any other script.
-// Pure apart from the injected `readDir` (fs.readdirSync-like: names, or null when not a directory).
+// Pure apart from the injected `readDir` (fs.readdirSync-like: names; null when the shell would match nothing there
+// either; any other answer means the directory could not be listed and is refused).
 import { readdirSync } from 'node:fs';
 import { SCRIPT_EXT } from './shell-parse.mjs';
 
@@ -18,24 +19,33 @@ const GLOB_CHARS = /[*?[]/;
 const UNSUPPORTED_GLOB = /[()|]|<\d*-\d*>|\[[:=.]/;
 const EXTENDED_GLOB = /[\^#]|[^=]~(?!\d|$)/;
 
+// null: not there, not a directory or not listable by this user (the shell matches nothing there either); false: any
+// other failure (too many links, I/O, ...): the glob cannot be resolved, so it is refused.
 export const defaultReadDir = (dir) => {
-  try { return readdirSync(dir); } catch { return null; }
+  try { return readdirSync(dir); } catch (e) { return ['ENOENT', 'ENOTDIR', 'EACCES'].includes(e?.code) ? null : false; }
 };
 
+// Index of the `]` closing the bracket expression that opens at seg[k], or -1 (then the `[` is an ordinary character).
+// POSIX: after `[` (and one optional `!` or `^`) a `]` is a member, not the end: `[!]x]` is "any char but ] or x".
+function bracketEnd(seg, k) {
+  let j = k + 1;
+  if (seg[j] === '!' || seg[j] === '^') j++;
+  if (seg[j] === ']') j++;
+  return seg.indexOf(']', j);
+}
+
 // Names matching one glob segment (`*`, `?`, `[a-z]`, `[!x]`). Case-insensitive and dotfiles included whatever the
-// shell's nocaseglob / dotglob / GLOB_DOTS settings: a candidate too many only costs a judgment.
+// shell's nocaseglob / dotglob / GLOB_DOTS settings: a candidate too many only costs a judgment. A bracket expression
+// becomes "any one character": its exact members (ranges, classes, negation, locale collation) can never under-match.
 function segmentRegExp(seg) {
   let re = '';
   for (let k = 0; k < seg.length; k++) {
     const c = seg[k];
     if (c === '*') re += '[^/]*';
     else if (c === '?') re += '[^/]';
-    else if (c === '[' && seg.indexOf(']', k + 2) > 0) {
-      const q = seg.indexOf(']', k + 2);
-      let body = seg.slice(k + 1, q).replace(/\\/g, '\\\\');
-      if (body[0] === '!') body = `^${body.slice(1)}`;
-      re += `[${body}]`;
-      k = q;
+    else if (c === '[' && bracketEnd(seg, k) > 0) {
+      re += '[^/]';
+      k = bracketEnd(seg, k);
     } else re += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
   }
   return new RegExp(`^${re}$`, 'i');
@@ -56,7 +66,8 @@ function globMatches(pattern, dir, readDir, joinPath, budget) {
     if (seg.includes('**')) { budget.over = true; return; }
     if (!GLOB_CHARS.test(seg)) { walk(i + 1, add(pre, seg)); return; }
     const names = readDir(joinPath(dir, pre === '' ? '.' : pre));
-    if (!Array.isArray(names)) return;
+    if (names === null) return; // not a directory (or nothing the shell could list): nothing matches
+    if (!Array.isArray(names)) { budget.over = true; return; } // could not be listed: refuse
     let re;
     try { re = segmentRegExp(seg); } catch { budget.over = true; return; } // a bracket expression JS rejects
     for (const n of names) {

@@ -556,3 +556,34 @@ test('G2: a program found by a glob is judged by its shebang like a program name
   const bin = fakeFs(GIT_ROOT, { 'tool': 'ELF\u0000git push origin main' });
   assert.equal(git('./to*', bin).decision, 'allow'); // a binary
 });
+
+test('G3: a ] right after [ or [! / [^ is a member of the bracket expression', () => {
+  const spec = { 'a.sh': 'bad', 'x.sh': 'bad', 'ok.sh': 'ok' };
+  for (const c of ['bash [!]x].sh', 'bash [^]x].sh', 'bash []x].sh', 'bash [!]].sh', 'bash [a-c].sh', 'bash [!x].sh', 'source [!]x].sh', 'node [!]x].mjs']) {
+    if (c.startsWith('node')) denyBoth(c, { 'a.mjs': 'bad' });
+    else denyBoth(c, spec);
+  }
+  // a [ that is never closed is an ordinary character, and a ] is never a member outside a bracket
+  denyBoth('bash f[.sh', { 'f[.sh': 'bad' });
+  denyBoth('bash [!].sh', { '[!].sh': 'bad' });
+  denyBoth('bash a].sh', { 'a].sh': 'bad' });
+  allowBoth('bash [!]x', { 'ok.sh': 'ok' });
+});
+
+test('G3: a directory that cannot be listed for another reason than "it is not there" is refused', () => {
+  const spec = { 'ok.sh': 'ok' };
+  for (const c of ['bash *.sh', 'bash sub/*.sh', 'bash [o]k.sh']) {
+    const r = both(c, spec, { gitOpts: { readDir: () => false }, filesOpts: { readDir: () => false } });
+    assert.equal(r.git.decision, 'deny', `git: ${c}`);
+    assert.equal(r.files.decision, 'deny', `files: ${c}`);
+  }
+  // a missing or unreadable (EACCES) directory matches nothing in the shell either
+  const none = { readDir: () => null };
+  assert.equal(both('bash *.sh', spec, { gitOpts: none, filesOpts: none }).git.decision, 'allow');
+  assert.equal(both('bash *.sh', spec, { gitOpts: none, filesOpts: none }).files.decision, 'allow');
+  // an unreadable directory is no directory: a candidate that is one is read (and denied) as before
+  assert.equal(defaultReadDir(join(tmpdir(), 'no-such-dir-g3')), null); // ENOENT
+  assert.equal(defaultReadDir(fileURLToPath(import.meta.url)), null); // ENOTDIR
+  assert.equal(defaultReadDir(join(tmpdir(), 'x'.repeat(300))), false); // ENAMETOOLONG
+  assert.ok(Array.isArray(defaultReadDir(dirname(fileURLToPath(import.meta.url)))));
+});
