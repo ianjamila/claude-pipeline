@@ -135,7 +135,10 @@ function buildCandidates(sf, { expand, dirs, joinPath, readDir, ifs }) {
     const e = expand(w);
     const readings = e !== w && w.includes('$') ? [e, ...e.split(splitter)] : [e];
     // quoting is lost (`'x$y.sh'` reads as `x$y.sh`): the word as written may be the file's real name, whatever the variable holds
-    if (e !== w && w !== '') add(w);
+    if (e !== w && w !== '') {
+      add(w);
+      if (GLOB_CHARS.test(w)) for (const d of dirs) for (const m of globMatches(w, d, readDir, joinPath, budget)) add(m); // 'x$y'*.sh
+    }
     if (ifsUnknown && w.includes('$')) dynamic = true;
     for (const r of new Set(readings)) {
       if (r === '') continue; // an empty word runs nothing

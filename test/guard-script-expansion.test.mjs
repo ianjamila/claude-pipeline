@@ -766,3 +766,13 @@ test('R1: repository and global state a speculative candidate may change is unkn
   // a config write is never undone: a candidate that may not run still leaves the config dirty
   assert.equal(git('bash p[12].sh && git push', fs2('git status', 'git branch -u origin/main')).decision, 'deny');
 });
+
+// ---- round 9: Codex round 2 ----------------------------------------------------------------------------------------------
+
+test('R2-B1: the word as written is globbed too when a known variable expands it', () => {
+  const spec = { 'x$y1.sh': 'bad', 'ok.sh': 'ok' };
+  for (const c of ["y=1; bash 'x$y'*.sh", "y=1; bash 'x$y'?.sh", "y=1; source 'x$y'[0-9].sh", "y=1; ./'x$y'*.sh"]) denyBoth(c, spec);
+  allowBoth("y=1; bash 'x$z'*.sh", spec);
+  // a known variable around a glob still expands as before
+  denyBoth('y=1; bash x1*.sh', { 'x1a.sh': 'bad' });
+});
