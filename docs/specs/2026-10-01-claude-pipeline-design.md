@@ -479,9 +479,14 @@ arbiter-input.md, rulings.json, model-proof.json}`, `.review/final-gate.json`,
    `middleware.*`, `**/rbac/**`, `**/roles*`, `**/permissions*`.
 3. **Env vars & secrets**: `.env*`, new `process.env.NAME` / `import.meta.env.NAME` names not
    present on base, `secrets.` refs in workflows, `vercel.json` `env`.
-4. **Pipeline files**: `.github/**`, `.claude/**`, `.githooks/**`, `CODEOWNERS`,
-   `scripts/verify*`, `scripts/pipeline/**`, test config (`vitest.config.*`, `jest.config.*`,
-   `playwright.config.*`, `supabase/tests/**` deletions).
+4. **Pipeline files**, two rules. `R4-pipeline` (the guard core: anything that decides whether a label is needed or which
+   checks CI runs): `.github/**` (except markdown), `.claude/**`, `CODEOWNERS`, `.gitmodules`, `scripts/verify*`,
+   `scripts/pipeline/**`, `pipeline.yml`, test-runner config (`vitest.*`, `jest.*`, `playwright*.config.*`, ...),
+   lint / tsconfig / build config, `.gitattributes`, `supabase/tests/**` deletions, gitlinks, symlinks, a changed or
+   removed `package.json` script. `R4-config` (nothing CI runs): `CLAUDE.md` / `AGENTS.md` / `.cursorrules`, markdown
+   under `.github/`, local git hooks (`.githooks/**`, `.husky/**`, lefthook, pre-commit), and a newly added plain
+   `package.json` script (a new npm lifecycle hook such as `pretest:run` or `postinstall` is `R4-pipeline`).
+   A path in both is `R4-pipeline`.
 5. **Major dependency upgrades**: `package.json` semver-major bump (or `0.x` minor) of any dep.
 6. **Sensitive personal data**: paths/identifiers matching biometric, face, liveness, health,
    medical, patient, payroll, salary, wage, payslip, bank, SSN/TIN/SSS/PhilHealth/Pag-IBIG.
@@ -490,11 +495,14 @@ Plus the project's `hard_stops.paths` / `patterns`. Classification errs toward n
 ### 8.1 Report-only hard-stops (owner decision 2026-10-09)
 
 The `human-approved` label is required ONLY for database changes (R0, R1-*, R2-sql-*). A project may downgrade
-the other families to **report-only** with `hard_stops.report_only_rules` (allowed: `R2-auth`, `R2-auth-removed`,
-`R3-secrets`, `R5-major-dep`, `R6-sensitive`, `P-pattern`) and `hard_stops.report_only_paths` (globs like `paths`).
+the other families to **report-only** with `hard_stops.report_only_rules` (allowed: `R1-data-write`, `R2-auth`,
+`R2-auth-removed`, `R3-secrets`, `R4-config`, `R5-major-dep`, `R6-sensitive`, `P-pattern`) and `hard_stops.report_only_paths` (globs like `paths`).
 Such a hit is still found and listed (job summary, `pipeline hardstops` output, PR body) with `advisory: true`, but it
-never fails `Hard-stop scan`, never fails the final gate and never needs the label. `R4-pipeline` stays blocking
-so that one unattended edit to `pipeline.yml` cannot turn the database rules report-only; `R0-unscannable` (including
+never fails `Hard-stop scan`, never fails the final gate and never needs the label. `R1-data-write` is app code that
+deletes or overwrites rows through a client (`.from(...).delete/upsert`): routine feature code, so it may be report-only;
+raw destructive SQL, SQL in code and migrations stay `R1-destructive` (blocking). `R4-config` covers only what CI never
+runs (see 4 above). `R4-pipeline`, the guard core, stays blocking so that one unattended edit to `pipeline.yml` or to a
+file the CI checks read cannot turn the database rules report-only; `R0-unscannable` (including
 an unparseable `package.json`) and every database rule are refused in config and re-checked when classifying (fail
 closed). A file matching both `paths` and `report_only_paths` blocks; a rule in both `disable_rules` and
 `report_only_rules` is a config error. Default (nothing configured): every hit blocks, as before. Report-only hits
