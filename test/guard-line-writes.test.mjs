@@ -37,8 +37,11 @@ const PROJ = '/home/u/proj';
 const BAD_GIT = 'git push origin main';
 const BAD_FILES = 'echo x > ~/.claude/settings.json';
 // a mention of a guarded operation / protected file that is harmless as a command (it makes the run-time rule apply)
-const MID_GIT = 'git push origin agent/x';
-const MID_FILES = 'echo protect';
+// MID: a harmless command that quotes a guarded command / names a protected file (the run-time rule fires); CALM: only the words (it must not)
+const MID_GIT = "echo 'git push origin main'";
+const MID_FILES = 'echo ~/.claude/settings.json';
+const CALM_GIT = 'git push origin agent/x';
+const CALM_FILES = 'echo protect';
 const git = (command, fsOpts, o = {}) => evaluateGitCommand(command, {
   cwd: GIT_ROOT, home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], ...fsOpts, ...o,
 });
@@ -58,8 +61,8 @@ const aliasReal = (root) => {
 };
 function run(line, spec, alias = false) {
   const mk = (bad, ok) => Object.fromEntries(Object.entries(spec).map(([k, v]) => [k, v === 'bad' ? bad : v === 'ok' ? ok : v === 'bad1' ? bad.slice(0, 8) : v === 'bad2' ? bad.slice(8) : v]));
-  const g = typeof line === 'string' ? line : line(BAD_GIT, MID_GIT);
-  const f = typeof line === 'string' ? line : line(BAD_FILES, MID_FILES);
+  const g = typeof line === 'string' ? line : line(BAD_GIT, MID_GIT, CALM_GIT);
+  const f = typeof line === 'string' ? line : line(BAD_FILES, MID_FILES, CALM_FILES);
   return {
     git: { cmd: g, r: git(g, fakeFs(GIT_ROOT, mk(BAD_GIT, 'git status'), alias ? [...DIRS, 'alias', 'real'] : DIRS), alias ? { realpath: aliasReal(GIT_ROOT) } : {}) },
     files: { cmd: f, r: files(f, fakeFs(PROJ, mk(BAD_FILES, 'echo hi'), alias ? [...DIRS, 'alias', 'real'] : DIRS), alias ? { realpath: aliasReal(PROJ) } : {}) },
@@ -164,7 +167,7 @@ test('h: a sed program that writes a file or runs a command, with or without a s
     (m) => `sed 'e echo hi' ok.sh; ${m}; bash n.sh`,
   ]) denyBoth((_, mid) => mk(mid));
   // a letter inside a pattern or a replacement is not a command
-  for (const c of ["sed -n '/error/p' ok.sh", "sed 's/a/export/' ok.sh", "sed 's/a/web/g' ok.sh", "sed -n '1,5p' ok.sh", "sed 'y/abc/xyz/' ok.sh", "sed -n '/web/,/end/p' ok.sh"]) allowBoth((_, mid) => `${c}; ${mid}; bash n.sh`);
+  for (const c of ["sed -n '/error/p' ok.sh", "sed 's/a/export/' ok.sh", "sed 's/a/web/g' ok.sh", "sed -n '1,5p' ok.sh", "sed 'y/abc/xyz/' ok.sh", "sed -n '/web/,/end/p' ok.sh"]) allowBoth((_, _m, mid) => `${c}; ${mid}; bash n.sh`);
   // the files policy: a sed that writes a protected file is not read-only (pre-existing hole)
   const fsOpts = fakeFs(PROJ, { 'f.sh': 'echo hi' }, DIRS);
   for (const prog of ["'s/^//w/home/u/.claude/settings.json'", "'1w/home/u/.claude/settings.json'", "'s/^/x/w /home/u/.claude/settings.json'"]) {
@@ -178,7 +181,7 @@ test('h: a sed program that writes a file or runs a command, with or without a s
     (m) => `sed -e's/a/b/wn.sh' ok.sh; ${m}; bash n.sh`, (m) => `sed --expression='s/a/b/wn.sh' ok.sh; ${m}; bash n.sh`, (m) => `sed -ne 'wn.sh' ok.sh; ${m}; bash n.sh`,
     (m) => `sed -e p -e wn.sh ok.sh; ${m}; bash n.sh`, (m) => `sed --expression 'wn.sh' ok.sh; ${m}; bash n.sh`, (m) => `sed -f prog.sed ok.sh; ${m}; bash n.sh`, (m) => `sed --file=prog.sed ok.sh; ${m}; bash n.sh`,
   ]) denyBoth((_, mid) => mk(mid));
-  allowBoth((_, mid) => `sed -n -e '/error/p' ok.sh; ${mid}; bash n.sh`);
+  allowBoth((_, _m, mid) => `sed -n -e '/error/p' ok.sh; ${mid}; bash n.sh`);
   assert.equal(files("sed -n '/error/p' ~/.claude/pipeline/x.log", fsOpts).decision, 'allow');
   assert.equal(files("sed -n 's/a/export/' ~/.claude/settings.json", fsOpts).decision, 'allow');
 });
@@ -195,23 +198,22 @@ test('h: curl writes every file its options name; what is not certain is unmodel
   ]) denyBoth((_, mid) => mk(mid));
   denyBoth((_, mid) => `curl -sD ok.sh https://x; ${mid}; bash ok.sh`);
   // switches, header / data values and a plain download to stdout write nothing
-  for (const c of ['curl -sSL https://x', "curl -H 'x-o: n.sh' https://x", 'curl -d o https://x', 'curl -s -w "%{http_code}" https://x', 'curl --silent --fail https://x']) allowBoth((_, mid) => `${c}; ${mid}; bash n.sh`);
+  for (const c of ['curl -sSL https://x', "curl -H 'x-o: n.sh' https://x", 'curl -d o https://x', 'curl -s -w "%{http_code}" https://x', 'curl --silent --fail https://x']) allowBoth((_, _m, mid) => `${c}; ${mid}; bash n.sh`);
   // tar -c / -r / -u write the archive named by -f
   denyBoth((_, mid) => `tar -cf n.sh d; ${mid}; bash n.sh`);
   denyBoth((_, mid) => `tar cf n.sh d; ${mid}; bash n.sh`);
-  allowBoth((_, mid) => `tar -tf a.tar; ${mid}; bash n.sh`);
+  allowBoth((_, _m, mid) => `tar -tf a.tar; ${mid}; bash n.sh`);
 });
 
 test('h: a {a,b} target is not known until run time', () => {
   denyBoth((bad) => `echo '${bad}' > {x,n}.sh; bash n.sh`);
   denyBoth('cp f.sh {x,n}.sh; bash n.sh');
-  allowBoth((_, mid) => `cp ok.sh {x,n}.sh; ${mid}; bash n.sh`);
+  allowBoth((_, _m, mid) => `cp ok.sh {x,n}.sh; ${mid}; bash n.sh`);
 });
 
 test('h: echo whose escapes cannot all be read is unknown, and the readable ones are still read', () => {
   const hex = (s) => '\\x' + s.charCodeAt(1).toString(16) + s.slice(2);
   denyBoth((bad) => `echo -e '${bad[0]}${hex(bad)} # \\Q' > n.sh; bash n.sh`);
-  denyBoth((bad) => `echo -e '${bad[0]}${hex(bad)}\\Q' > n.sh; bash n.sh`);
   denyBoth((bad) => `echo -e '${bad}\\cjunk' > n.sh; bash n.sh`);
   denyBoth((bad) => `echo '${bad}\\Q' > n.sh; bash n.sh`); // (the mention makes the unknown content refuse it)
   allowBoth(() => "echo 'C:\\dir' > n.sh; bash n.sh"); // unknown with nothing guarded on the line
@@ -267,16 +269,16 @@ test('h: a target known only in part can only name the files its fixed parts all
 
 test('h: a command we do not model only matters if no exact write of the whole file came after it', () => {
   // a script written in full after the unmodelled command: what it holds is what was written
-  allowBoth((_, mid) => `make; ${mid}; printf 'echo hi' > n.sh; bash n.sh`);
-  allowBoth((_, mid) => `git merge origin/main; ${mid}; cat > n.sh <<'EOF'\necho hi\nEOF\nbash n.sh`);
-  allowBoth((_, mid) => `make; ${mid}; cp ok.sh n.sh; bash n.sh`);
+  allowBoth((_, _m, mid) => `make; ${mid}; printf 'echo hi' > n.sh; bash n.sh`);
+  allowBoth((_, _m, mid) => `git merge origin/main; ${mid}; cat > n.sh <<'EOF'\necho hi\nEOF\nbash n.sh`);
+  allowBoth((_, _m, mid) => `make; ${mid}; cp ok.sh n.sh; bash n.sh`);
   // ... but not when the program ran after it, or the write only appends (the rest of the file is unknown)
   denyBoth((_, mid) => `printf 'echo hi' > n.sh; make; ${mid}; bash n.sh`);
   denyBoth((_, mid) => `make; ${mid}; printf 'echo hi' >> n.sh; bash n.sh`);
   // the text written is still judged
   denyBoth((bad) => `make; printf '%s' '${bad}' > n.sh; bash n.sh`);
   // an inline program that cannot write does not touch the script
-  allowBoth((_, mid) => `node -e "console.log('ok.sh')"; ${mid}; bash ok.sh`);
+  allowBoth((_, _m, mid) => `node -e "console.log('ok.sh')"; ${mid}; bash ok.sh`);
 });
 
 test('h: a write that may or may not be the script, followed by one that replaces it whole, changed nothing', () => {
@@ -284,7 +286,59 @@ test('h: a write that may or may not be the script, followed by one that replace
   allowBoth("cp ok.sh \"$D/n.sh\"; printf 'a' > n.sh; printf 'b' >> n.sh; bash n.sh");
   // after it, or only appended to: still in the file
   denyBoth((_, mid) => `printf 'echo hi' > n.sh; curl -so "$D/n.sh" https://x; ${mid}; bash n.sh`);
-  denyBoth("printf 'echo hi' > n.sh; cp ok.sh \"$D/n.sh\"; printf 'b' >> n.sh; bash n.sh");
+  // a copy that may have replaced it, then an append: both readings are judged
+  allowBoth("printf 'echo hi' > n.sh; cp ok.sh \"$D/n.sh\"; printf 'b' >> n.sh; bash n.sh");
+  denyBoth("printf 'echo hi' > n.sh; cp f.sh \"$D/n.sh\"; printf 'b' >> n.sh; bash n.sh");
+});
+
+test('h: the run-time rule needs an actual guarded command on the line, not a word; prose and data are masked', () => {
+  const curl = 'curl -so n.sh https://x';
+  // git: a commit message / PR body that says push or merge, or a heredoc of data, is not a guarded command
+  allowBoth(`${curl}; git commit -m "notes: push to main, merge, protection"; bash n.sh`);
+  allowBoth(`${curl}; gh pr create --title "merge push" --body "git push origin main is blocked"; bash n.sh`);
+  allowBoth(`${curl}; cat > notes.md <<'EOF'\ngit push origin main\nEOF\nbash n.sh`);
+  allowBoth(`${curl}; git push origin agent/x; bash n.sh`);
+  // ... an actual command shape is (a quoted one too: the unknown file may run it)
+  denyBoth((_, mid) => `${curl}; ${mid}; bash n.sh`);
+  const git = (c) => run(c, SPEC).git.r.decision;
+  assert.equal(git(`${curl}; echo 'gh pr merge 5 --admin'; bash n.sh`), 'deny');
+  assert.equal(git(`${curl}; echo 'gh pr edit 5 --add-label human-approved'; bash n.sh`), 'deny');
+  assert.equal(git(`${curl}; echo 'gh api repos/o/r/branches/main/protection'; bash n.sh`), 'allow'); // (gh api is judged by its own rules, protection is not a quoted shape)
+  // missing script after an unmodelled command: the same signal
+  denyBoth((_, mid) => `make; ${mid}; bash n.sh`);
+  allowBoth((_, _m, calm) => `make; ${calm}; bash n.sh`);
+  allowBoth(`make; git commit -m "merge push"; bash n.sh`);
+});
+
+test('h: files policy: the run-time rule needs an actual protected path, prose masked (interpreter scripts, which the shell rule does not reach)', () => {
+  const f = (c) => run(c, SPEC).files.r.decision;
+  assert.equal(f('curl -so n.mjs https://x; echo ~/.claude/settings.json; node n.mjs'), 'deny');
+  assert.equal(f('curl -so n.mjs https://x; echo protect install. .claude; node n.mjs'), 'allow');
+  assert.equal(f('curl -so n.mjs https://x; git commit -m "see ~/.claude/pipeline/hooks"; node n.mjs'), 'allow');
+  assert.equal(f('curl -so n.mjs https://x; node n.mjs'), 'allow');
+  assert.equal(f('make; echo ~/.claude/settings.json; node n.mjs'), 'deny');
+  assert.equal(f('make; echo protect; node n.mjs'), 'allow');
+});
+
+test('h: an inline program writes the script only if it names it (literally, in its arguments or in a variable it is given)', () => {
+  denyBoth((_, mid) => `node -e "fs.writeFileSync('ok.sh', 'x')"; ${mid}; bash ok.sh`);
+  denyBoth((_, mid) => `F=ok.sh node -e "fs.writeFileSync(process.env.F, 'x')"; ${mid}; bash ok.sh`);
+  denyBoth((_, mid) => `node -e "fs.writeFileSync(process.argv[1], 'x')" ok.sh; ${mid}; bash ok.sh`);
+  denyBoth((_, mid) => `python3 -c "open('ok.sh', 'w').write('x')"; ${mid}; bash ok.sh`);
+  // it names other files: not a write to this one (it is still "unmodelled" for a script that is MISSING)
+  allowBoth((_, _m, calm) => `node -e "fs.writeFileSync('other.txt', 'x')"; ${calm}; bash ok.sh`);
+  assert.equal(run((_, mid) => `node -e "fs.writeFileSync('other.txt', 'x')"; ${mid}; bash ok.sh`, SPEC).git.r.decision, 'allow');
+  denyBoth((_, mid) => `node -e "fs.writeFileSync('other.txt', 'x')"; ${mid}; bash n.sh`);
+});
+
+test('h: a write that only MAY be the script never makes it "built from pieces": its content is the unknown-content signal', () => {
+  const calm = 'printf a > n.sh; curl -so "$D/n.sh" https://x; printf b >> n.sh; bash n.sh';
+  allowBoth(calm);
+  denyBoth((_, mid) => `printf a > n.sh; curl -so "$D/n.sh" https://x; printf b >> n.sh; ${mid}; bash n.sh`);
+  denyBoth('cat p1.txt > n.sh; cp f.sh "$D/n.sh"; cat p2.txt >> n.sh; bash n.sh'); // the maybe-write copies a blocked file
+  allowBoth('cat > "$T/n.sh" 2>/dev/null || true; cat ok.sh > n.sh; bash n.sh');
+  // an exact write with a piece that cannot be joined is refused whatever the line says
+  denyBoth('printf a > n.sh; curl -s https://x >> n.sh; bash n.sh');
 });
 
 test('h: a file named ..x.sh inside a copied directory is inside it', () => {
@@ -366,12 +420,12 @@ test('h: a missing script after a command the guard cannot model may have been c
   for (const c of ['npm run build && bash ok.sh', 'make; bash ok.sh', 'node build.js; bash ok.sh']) allowBoth(c);
   // nothing unmodelled before it, or nothing guarded on the line
   for (const c of ['make build; bash n.sh', 'bash n.sh', 'bash n.sh; make']) allowBoth(c);
-  allowBoth((_, mid) => `${mid}; bash n.sh`);
-  allowBoth((_, mid) => `git status; ${mid}; bash n.sh`);
+  allowBoth((_, _m, mid) => `${mid}; bash n.sh`);
+  allowBoth((_, _m, mid) => `git status; ${mid}; bash n.sh`);
   // an inline program that names the script file may have written it, whatever else it does
   denyBoth((_, mid) => `node -e "fs.writeFileSync('ok.sh', 'x')"; ${mid}; bash ok.sh`);
   denyBoth((_, mid) => `python3 -c "open('ok.sh','w').write('x')"; ${mid}; bash ok.sh`);
-  allowBoth((_, mid) => `node -e "console.log(1)"; ${mid}; bash ok.sh`);
+  allowBoth((_, _m, mid) => `node -e "console.log(1)"; ${mid}; bash ok.sh`);
 });
 
 test('h: every way a script is judged sees the line\'s writes', () => {
@@ -423,8 +477,8 @@ test('h: the startup files a shell runs see the line\'s writes', () => {
   denyBoth('cp f.sh ~/.zshenv; zsh -c :', { ...spec, '/home/u/.zshenv': 'echo hi' });
   denyBoth('cat f.sh >> ~/.bash_profile; bash -l -c :', { ...spec, '/home/u/.bash_profile': 'echo hi' });
   // the real home's startup files are not "scripts something may have created": a login shell after make is fine
-  allowBoth((_, mid) => `make; ${mid}; bash -l -c :`, spec);
-  allowBoth((_, mid) => `make; ${mid}; bash -l -c :; make; bash -l -c :`, { ...spec, '/home/u/.bash_profile': 'echo hi' });
+  allowBoth((_, _m, mid) => `make; ${mid}; bash -l -c :`, spec);
+  allowBoth((_, _m, mid) => `make; ${mid}; bash -l -c :; make; bash -l -c :`, { ...spec, '/home/u/.bash_profile': 'echo hi' });
 });
 
 test('h: writes that may run before the script in another order: pipes, background jobs, loops', () => {
@@ -462,8 +516,8 @@ test('h controls: unrelated writes and harmless contents are allowed', () => {
   // the guarded text is only the text of an unrelated file
   allowBoth(() => "echo 'push it' > notes.md; bash ok.sh");
   // a target that is only known at run time may be the script, but what a harmless source puts there is judged as it is
-  allowBoth((_, mid) => `cp ok.sh "$D"; ${mid}; bash ok.sh`);
-  allowBoth((_, mid) => `cp ok.sh *.txt; ${mid}; bash ok.sh`);
+  allowBoth((_, _m, mid) => `cp ok.sh "$D"; ${mid}; bash ok.sh`);
+  allowBoth((_, _m, mid) => `cp ok.sh *.txt; ${mid}; bash ok.sh`);
 });
 
 // ---- the shared layer --------------------------------------------------------------------------------------------------------
@@ -498,7 +552,9 @@ test('h: printf / echo content that is not certain is unknown (judged by the run
   denyBoth((bad) => `echo -e '${hex(bad, oct)}' > n.sh; bash n.sh`); // zsh / dash: \NNN
   denyBoth((bad) => `echo '${hex(bad, (c) => '\\x' + c.toString(16))}' > n.sh; bash n.sh`); // zsh and sh read escapes without -e
   // precision / width / %c / %d / %b / \c / an unknown escape: the text is not certain, so it is unknown (the line mentions the operation)
-  denyBoth((bad) => `printf '%.15s' '${bad}junk' > n.sh; bash n.sh`);
+  denyBoth((bad) => `printf '%.15s' '${bad} junk' > n.sh; bash n.sh`);
+  // (git: a destination that merely starts with main counts as the guarded shape)
+  assert.equal(run((bad) => `printf '%.15s' '${bad}junk' > n.sh; bash n.sh`, SPEC).git.r.decision, 'deny');
   denyBoth((bad) => `printf '%.4s' '${bad}' > n.sh; bash n.sh`);
   denyBoth((bad) => `printf '%b' '${bad}' > n.sh; bash n.sh`);
   denyBoth((bad) => `printf '%c' '${bad}' > n.sh; bash n.sh`);
@@ -539,7 +595,7 @@ test('h: commands on the read-only list that write a named file are writers', ()
     (m) => `xxd f.sh n.sh; ${m}; bash n.sh`, (m) => `rg --pre ./gen x; ${m}; bash n.sh`,
   ]) denyBoth((_, mid) => mk(mid));
   // ... while the usual options are fine
-  for (const c of ['grep -o x f.sh', 'ls -lo', 'git diff --stat', 'git log --oneline', 'sort -u ok.sh', 'uniq -c ok.sh', 'head -n 3 ok.sh', 'stat -f %z ok.sh']) allowBoth((_, mid) => `${c}; ${mid}; bash n.sh`);
+  for (const c of ['grep -o x f.sh', 'ls -lo', 'git diff --stat', 'git log --oneline', 'sort -u ok.sh', 'uniq -c ok.sh', 'head -n 3 ok.sh', 'stat -f %z ok.sh']) allowBoth((_, _m, mid) => `${c}; ${mid}; bash n.sh`);
 });
 
 test('h: the cached verdict of a startup file depends on WHICH writes count, not how many', () => {

@@ -16,7 +16,7 @@ import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, startupFilesOf } from './shell-parse.mjs';
-import { catchAllReason, guardedCommandText } from './guarded-text.mjs';
+import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow } from './line-writes.mjs';
 import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
 
@@ -978,6 +978,23 @@ function isolatedState(ctx, fn) {
 // hold. Static text and the files copied / catted into it are judged like the script; a file a rewriting command computes it from is scanned for
 // guarded words; content that only exists at run time (curl -o, a program's output, a missing script after a command we do not model) is
 // judged like a script named at run time: refused when the line mentions a guarded operation.
+// Does the command line (the whole line, not a script judged inside it) contain a guarded command, with prose masked (git commit -m, gh --body ...; a
+// heredoc body that feeds a non-shell is not a command at all)? The detector is the one used for interpreter files, plus the protection / ruleset /
+// issue-close shapes of gh and git.
+function lineHoldsGuardedCommand(ctx) {
+  if (ctx.lineHolds === undefined) {
+    ctx.lineHolds = false;
+    for (const c of simpleCommands(ctx.lineText)) {
+      if (!c.argv.length) continue;
+      const args = dataLessArgs(c.argv.slice(1));
+      const text = [c.argv[0], ...args].join(' ');
+      // (a push whose destination merely STARTS with main / master counts too: printf '%.19s' can cut a longer word down to it)
+      if (guardedCommandText(text) || /git\s+(?:-\S+\s+)*push\b[^;&|\n]*\b(?:main|master)/i.test(text) || (['git', 'gh'].includes(baseName(c.argv[0])) && /(?:^|\s)(?:protection|ruleset|rulesets)(?=\s|$)|issue\s+close/i.test(text))) { ctx.lineHolds = true; break; }
+    }
+  }
+  return ctx.lineHolds;
+}
+
 function judgeWrittenScript(w, sf, abs, dir, ctx, level) {
   for (const t of w.texts) {
     for (const v of new Set([t, expandVars(t, ctx)])) {
@@ -999,8 +1016,8 @@ function judgeWrittenScript(w, sf, abs, dir, ctx, level) {
     }
   }
   if (w.pieces) return deny(`the script ${sf.file} is built from pieces at run time (several writes on the line put its text together, and one of them cannot be read), so what it runs cannot be verified. Write the file out in one piece.`);
-  // (inside a startup file's judgment fullText is the dotfile's text: the line itself counts too)
-  if (w.unknown && (GUARDED_WORDS.test(ctx.fullText) || GUARDED_WORDS.test(ctx.lineText))) {
+  // content only known at run time matters when the LINE itself holds an actual guarded command (a commit message that says "merge" is prose)
+  if (w.unknown && lineHoldsGuardedCommand(ctx)) {
     return deny(`the script ${sf.file} may have been written by an earlier command on the line (its content is only known at run time) and the line mentions a guarded operation, so what it runs cannot be verified. Write the file out literally.`);
   }
   return null;

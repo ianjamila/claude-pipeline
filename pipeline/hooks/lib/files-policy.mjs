@@ -1164,7 +1164,8 @@ function judgeWrittenScript(w, sf, abs, dir, ctx, opts, scanRaw) {
     }
   }
   if (w.pieces) return deny(`the script ${sf.file} is built from pieces at run time (several writes on the line put its text together, and one of them cannot be read), so what it runs cannot be checked; write the file out in one piece`);
-  if (w.unknown && (makeMatchers(ctx).rawHit(scanRaw, [dir]) || SENSITIVE_WORDS.test(scanRaw))) {
+  // (an actual protected path on the line, prose masked: not the bare words .claude / install. / protect)
+  if (w.unknown && makeMatchers(ctx).rawHit(scanRaw, [dir])) {
     return deny(`the script ${sf.file} may have been written by an earlier command on the line (its content is only known at run time) and the line refers to a protected pipeline file or switch, so what it runs cannot be checked; write the file out literally`);
   }
   return null;

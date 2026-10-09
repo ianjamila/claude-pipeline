@@ -549,7 +549,7 @@ export function writesOf(cmds) {
     const inline = INLINE_RUNNERS[name];
     if (inline) {
       const at = cmd.argv.findIndex((a, i) => i > 0 && inline.test(a));
-      if (at > 0) recs.push({ idx, dest: null, inline: cmd.argv.slice(at + 1).join(' '), items: UNKNOWN, loose: true });
+      if (at > 0) recs.push({ idx, dest: null, inline: [...cmd.argv.slice(at + 1), ...Object.values(cmd.env ?? {})].join(' '), items: UNKNOWN, loose: true }); // (the program, its arguments and the variables it is given)
     }
     // a program the parser does not unwrap (strace, chroot, nsenter, a wrapper we have never seen) that is handed a writer: the writer's own writes, and a write to
     // any file (the wrapper may have changed the directory or the root) with unknown content
@@ -557,6 +557,7 @@ export function writesOf(cmds) {
       const at = cmd.argv.findIndex((w, i) => i > 0 && WRITER_NAMES.has(commandName(w)));
       if (at > 0) {
         const inner = { ...cmd, argv: cmd.argv.slice(at) };
+        Object.defineProperty(inner, 'streams', { value: cmd.streams, enumerable: false }); // (its stdin is the wrapper's stdin)
         recs.push(...(argRecords(inner, commandName(inner.argv[0]), idx) ?? []), { idx, dest: null, items: UNKNOWN, loose: true });
       }
     }
@@ -713,26 +714,37 @@ function hitsOn(frames, upto, asOf, P) {
 function contentsOf(frames, upto, asOf, P, io, depth) {
   if (depth > 4) { io.pieces = true; return null; }
   const hits = hitsOn(frames, upto, asOf, P);
-  let seq = [{ cur: true }];
-  for (const h of hits) {
-    if (h.loose) { if (hits.length > 1) io.pieces = true; return null; }
-    if (h.rec.append) seq.push(h); else seq = [h];
+  // a write that may or may not be this file is tried both ways (its own content is judged on its own, as unknown content); more than four are left out
+  const loose = hits.filter((h) => h.loose).slice(0, 4);
+  const out = new Set();
+  for (let mask = 0; mask < 1 << loose.length; mask++) {
+    let seq = [{ cur: true }];
+    for (const h of hits) {
+      if (h.loose && !(mask & (1 << loose.indexOf(h)))) continue;
+      if (h.loose && loose.indexOf(h) < 0) continue;
+      if (h.rec.append) seq.push(h); else seq = [h];
+    }
+    // a file put together from several pieces that cannot be built is "built from pieces at run time"; one unknown piece alone is just unknown content.
+    // Only a write to the file itself counts: a piece of a write that merely may hit it is the unknown-content signal, never a refusal
+    const multi = seq.length > 1 || seq.some((el) => (el.rec?.parts?.length ?? 0) > 1);
+    const looseIn = seq.some((el) => el.loose);
+    const fail = () => { if (multi && !looseIn) io.pieces = true; return null; };
+    let acc = [''];
+    let ok = true;
+    for (const el of seq) {
+      let alts;
+      if (el.cur) {
+        if (!io.exists(P)) alts = [''];
+        else { const text = io.readText(P); if (typeof text !== 'string') { fail(); ok = false; break; } alts = [text]; }
+      } else alts = partAlternatives(frames, el, io, depth);
+      if (alts === null) { fail(); ok = false; break; }
+      acc = product(acc, alts);
+      if (acc === null) { fail(); ok = false; break; }
+    }
+    if (ok) for (const x of acc) out.add(x);
+    else if (!looseIn) return null;
   }
-  // a file put together from several pieces that cannot be built is "built from pieces at run time"; one unknown piece alone is just unknown content
-  const multi = seq.length > 1 || seq.some((el) => (el.rec?.parts?.length ?? 0) > 1);
-  const fail = () => { if (multi) io.pieces = true; return null; };
-  let acc = [''];
-  for (const el of seq) {
-    let alts;
-    if (el.cur) {
-      if (!io.exists(P)) alts = [''];
-      else { const text = io.readText(P); if (typeof text !== 'string') return fail(); alts = [text]; }
-    } else alts = partAlternatives(frames, el, io, depth);
-    if (alts === null) return fail();
-    acc = product(acc, alts);
-    if (acc === null) return fail();
-  }
-  return acc;
+  return out.size ? [...out] : null;
 }
 
 function partAlternatives(frames, h, io, depth) {
