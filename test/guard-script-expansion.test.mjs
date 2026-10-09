@@ -849,3 +849,32 @@ test('merge with #7: after a cd that may not have run, a relative candidate is r
   assert.equal(git('false && cd sub; F=/work/repo/ok.sh; bash "$F"', g).decision, 'deny');
   assert.equal(git('F=/work/repo/ok.sh; bash "$F"', g).decision, 'allow');
 });
+
+// ---- Codex review of the merge: a fixed marker character must never rewrite a file name ----------------------------------
+
+test('a file name holding the characters the files guard marks with is judged as written (U+E000 home mark, U+E001 backslash mark)', () => {
+  const pua = ['\uE000', '\uE001', '\uE002'];
+  for (const ch of pua) {
+    const spec = { [`a${ch}b.sh`]: 'bad', 'ok.sh': 'ok' };
+    for (const c of [`bash 'a${ch}b.sh'`, `./a${ch}b.sh`, `source a${ch}b.sh`, `bash $X a${ch}b.sh`, `bash a${ch}*.sh`]) denyBoth(c, spec);
+    // next to a home reference, which the guard expands with a mark
+    const h = { [`/home/u/a${ch}b.sh`]: 'echo x > ~/.claude/settings.json' };
+    for (const c of [`bash ~/a${ch}b.sh`, `bash $HOME/a${ch}b.sh`, `bash "$HOME"/a${ch}b.sh`, `bash $X ~/a${ch}b.sh`])
+      assert.equal(files(c, fakeFs(PROJ, h)).decision, 'deny', JSON.stringify(c));
+  }
+});
+
+test('a backslash file name that also holds the backslash mark character is judged as written', { skip: process.platform === 'win32' }, () => {
+  for (const ch of ['\uE000', '\uE001']) {
+    const spec = { [`x\\a${ch}b.sh`]: 'bad', 'ok.sh': 'ok' };
+    for (const c of [`bash 'x\\a${ch}b.sh'`, `bash $X 'x\\a${ch}b.sh'`, `./'x\\a${ch}b.sh'`]) denyBoth(c, spec);
+  }
+});
+
+test('when the text holds every private-use character, the mark is still one the text does not contain', () => {
+  const all = Array.from({ length: 0xf8ff - 0xe000 + 1 }, (_, i) => String.fromCharCode(0xe000 + i)).join('');
+  // the guard expands word by word, so the characters sit in the script name itself
+  const h = { [`/home/u/a${all}b.sh`]: 'echo x > ~/.claude/settings.json' };
+  assert.equal(files(`bash ~/a${all}b.sh`, fakeFs(PROJ, h)).decision, 'deny');
+  assert.equal(files(`echo '${all}'; echo x > ~/.claude/settings.json`, fakeFs(PROJ, {})).decision, 'deny');
+});

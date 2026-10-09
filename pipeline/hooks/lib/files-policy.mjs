@@ -363,7 +363,18 @@ export function evaluateFileTool(input, opts = {}) {
 
 // ---- Bash: text normalisation ---------------------------------------------------------------------
 
-const MARK = '\uE000';
+// A private-use character the text does not contain, to mark a spot while rewriting it. A fixed one could be a character of a
+// file name (`a<U+E000>b.sh`) and would rewrite that name into another. When the text holds every private-use character,
+// a run of U+E000 longer than any run in the text.
+function freeMark(text) {
+  for (let c = 0xe000; c <= 0xf8ff; c++) {
+    const m = String.fromCharCode(c);
+    if (!text.includes(m)) return m;
+  }
+  let n = 1;
+  for (const r of text.match(/\uE000+/g) ?? []) n = Math.max(n, r.length + 1);
+  return '\uE000'.repeat(n);
+}
 
 // Every way the home directory is spelled in a shell line or a one-liner script. A trailing `+ '`, `, '` or
 // `.joinpath('` (string concatenation / path.join) is swallowed so `process.env.HOME+'/.claude/x'` reads as one path.
@@ -391,13 +402,19 @@ const HOME_RE = new RegExp(
 );
 const TILDE_RE = /(^|[\s'"`=:(,[{;|&<>+])~(?=\/|$|[\s'"`)\]};|&<>,+])/g;
 const USER_RE = /\$(?:USER|LOGNAME|USERNAME)(?![A-Za-z0-9_])|\$\{(?:USER|LOGNAME|USERNAME)\}|\$\(\s*(?:whoami|logname|id\s+-un)\s*\)|`\s*(?:whoami|logname|id\s+-un)\s*`|%USERNAME%|\$env:USERNAME\b/gi;
-const MARK_STRIP = new RegExp(`${MARK}['"\`)}\\]]*`, 'g');
 
 function expandHomeRefs(text, home) {
+  const mark = freeMark(text + home);
   return text
-    .replace(HOME_RE, (_m, glue) => home + MARK + (glue ? (glue.includes('+') ? '' : '/') : ''))
-    .replace(TILDE_RE, (_m, pre) => `${pre}${home}${MARK}`)
-    .replace(MARK_STRIP, '');
+    .replace(HOME_RE, (_m, glue) => home + mark + (glue ? (glue.includes('+') ? '' : '/') : ''))
+    .replace(TILDE_RE, (_m, pre) => `${pre}${home}${mark}`)
+    .replace(new RegExp(`${mark}['"\`)}\\]]*`, 'g'), '');
+}
+
+// expandRefs reading every backslash as part of the file name (off Windows it is one), not as a path separator
+function expandKeepingBackslash(w, ctx) {
+  const bs = freeMark([w, ctx.homePosix ?? '', ctx.user ?? '', ...Object.values(ctx.vars ?? {})].join('')); // every text expandRefs may put in
+  return expandRefs(w.replace(/\\/g, bs), ctx).split(bs).join('\\');
 }
 
 // $NAME / ${NAME} for variables assigned earlier on the same line (D=$HOME/.claude; echo x > $D/settings.json).
@@ -960,7 +977,7 @@ function judgeScriptFile(sf, dirs, ctx, opts, scanRaw = '', keepBackslash = fals
     if (v) return v;
   }
   // a candidate is a final path (a glob match, or a word already expanded): the shell never expands it a second time
-  const e = sf.candidate ? (keepBackslash ? sf.file : toPosix(sf.file)) : keepBackslash ? expandRefs(sf.file.replace(/\\/g, '\uE001'), ctx).replace(/\uE001/g, '\\') : expandRefs(sf.file, ctx);
+  const e = sf.candidate ? (keepBackslash ? sf.file : toPosix(sf.file)) : keepBackslash ? expandKeepingBackslash(sf.file, ctx) : expandRefs(sf.file, ctx);
   if (!sf.candidate && /[$`]/.test(e)) {
     // named at run time: the textual rules on the whole line still apply. Quoting is lost (`'x$y.sh'` reads as `x$y.sh`), so the word as written is judged too if it is a file
     return keepBackslash ? null : judgeScriptFile({ kind: sf.kind, file: sf.file, candidate: true }, dirs, ctx, opts);
@@ -1006,7 +1023,7 @@ function judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw) {
   let c = scriptCandidates(sf, { expand: (w) => expandRefs(w, ctx), dirs, joinPath, readDir: ctx.readDir, ifs: ctx.vars.IFS });
   // a backslash in a word is a file name character off Windows, but expandRefs reads it as a separator: expand (and glob) that reading too
   if (!c.over && !sf.unresolvable && sf.words.some((w) => w.includes('\\'))) {
-    const k = scriptCandidates(sf, { expand: (w) => expandRefs(w.replace(/\\/g, '\uE001'), ctx).replace(/\uE001/g, '\\'), dirs, joinPath, readDir: ctx.readDir, ifs: ctx.vars.IFS });
+    const k = scriptCandidates(sf, { expand: (w) => expandKeepingBackslash(w, ctx), dirs, joinPath, readDir: ctx.readDir, ifs: ctx.vars.IFS });
     c = { files: [...new Set([...c.files, ...k.files])], dynamic: c.dynamic || k.dynamic, over: k.over };
   }
   if (c.over) return deny('too many words, a glob matching too many files, or glob syntax that cannot be resolved could be the script this command runs, so it cannot be checked; name the script file');
