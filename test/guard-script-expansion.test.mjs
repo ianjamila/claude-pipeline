@@ -740,3 +740,29 @@ test('R1-B3: a quoted word that holds $name is also judged as the literal file w
   assert.equal(git('H=ok.sh; bash $H && git push origin agent/x').decision, 'allow');
   assert.equal(git('bash $HOME/ok.sh && git push origin agent/x').decision, 'allow');
 });
+
+test('R1: repository and global state a speculative candidate may change is unknown afterwards, never the old value', () => {
+  // A glob runs only its first match (the rest are arguments), so every match after the first is a candidate that may not
+  // run. A bracket stands for any 1-4 bytes, so each fixture holds only the files the glob should find.
+  const fs2 = (a, b) => gitFs({ 'p1.sh': a, 'p2.sh': b });
+  const onMain = { currentBranch: () => 'main' };
+  // a candidate switches to a safe branch: if it ran we are on agent/y, if not still on main (and the other way round)
+  assert.equal(git('bash p[12].sh && git push', fs2('git status', 'git checkout agent/y'), onMain).decision, 'deny');
+  assert.equal(git('bash p[12].sh && git push', fs2('git status', 'git checkout main')).decision, 'deny');
+  assert.match(git('bash p[12].sh && git push', fs2('git status', 'git checkout agent/y'), onMain).reason, /determine the current branch/);
+  // the first candidate creates the very first branch entry of the evaluation
+  assert.equal(git('bash p1.sh && git push', gitFs({ 'p1.sh': 'git checkout -b agent/z' }), onMain).decision, 'allow'); // a named script really runs: believed
+  assert.equal(git('bash p*.sh && git push', gitFs({ 'p1.sh': 'git checkout -b agent/z' }), onMain).decision, 'deny'); // a glob match is not told apart from the others
+  // candidates that leave the branch alone change nothing
+  assert.equal(git('bash p[12].sh && git push', fs2('git status', 'git status')).decision, 'allow');
+  // an alias redefined by a candidate: either definition may be in force; an untouched one is still believed
+  assert.equal(git('git config alias.p push && bash p[12].sh && git p origin main', fs2('git status', 'git config alias.p status')).decision, 'deny');
+  assert.equal(git('git config alias.p push && bash p[12].sh && git p origin main', fs2('git status', 'git config alias.p push')).decision, 'deny'); // a candidate defines it again: still unsure, still a push to main
+  assert.equal(git('git config alias.q status && bash p[12].sh && git q', fs2('git status', 'git config alias.p push')).decision, 'allow');
+  assert.equal(git('bash p[12].sh && git zz', fs2('git status', 'git config alias.zz status')).decision, 'deny'); // defined by a candidate: unsure
+  // config from the environment set inside a sourced candidate counts as dirty even though its variable is unknown afterwards
+  assert.equal(git('source p[12].sh; git push', fs2('git status', 'GIT_CONFIG_COUNT=1')).decision, 'deny');
+  assert.equal(git('source p[12].sh; git push', fs2('git status', 'git status')).decision, 'allow');
+  // a config write is never undone: a candidate that may not run still leaves the config dirty
+  assert.equal(git('bash p[12].sh && git push', fs2('git status', 'git branch -u origin/main')).decision, 'deny');
+});

@@ -364,6 +364,7 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
 
   // aliases defined on this very line (`git config alias.p push && git p …`, `git -c alias.p=push p …`)
   const aliasConfig = g.configs.find((c) => c.key === `alias.${sub.toLowerCase()}`);
+  if (ctx.aliasUnsure.has(`git:${sub.toLowerCase()}`)) return deny(`the git alias "${sub}" may have been (re)defined by a script that may or may not run, so what it expands to cannot be verified. Write the command out.`);
   const alias = aliasConfig ? aliasConfig.value : ctx.gitAliases[sub.toLowerCase()];
   if (alias !== undefined && level < MAX_NESTING) {
     if (alias.startsWith('!')) {
@@ -376,7 +377,7 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
   if (sub === 'push' || sub === 'send-pack') { // send-pack is push without the remote configuration
     if (/\bxargs\b/.test(raw)) return deny('`xargs git push` takes its refspecs from stdin, so it cannot be verified. Push the branch by name.');
     // config handed in through the environment (this command's prefix / `env`, or an earlier assignment or export on the line)
-    ctx.envCfgDirty = [...Object.keys(env), ...Object.keys(ctx.vars)].some((k) => GIT_ENV_CONFIG.test(k));
+    ctx.envCfgDirty = [...Object.keys(env), ...Object.keys(ctx.vars), ...ctx.tainted.keys()].some((k) => GIT_ENV_CONFIG.test(k));
     return checkPush(args, g.d, g.gitDir, ctx, g.configs);
   }
   trackGit(sub, args, g, ctx);
@@ -622,6 +623,7 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
     }
     return null;
   }
+  if (ctx.aliasUnsure.has(`gh:${group}`)) return deny(`the gh alias "${group}" may have been (re)defined by a script that may or may not run, so what it expands to cannot be verified. Write the command out.`);
   const alias = ctx.ghAliases[group];
   if (alias !== undefined && level < MAX_NESTING) {
     if (alias.shell) {
@@ -762,13 +764,34 @@ function checkScriptFile(sf, dir, ctx, level) {
 // Variables set inside a script do not leave a child shell (`bash f.sh`, `./f`): the line's own values stay. `source` does
 // change the caller's variables, which is believed for a named file; a candidate that may or may not be the sourced file
 // puts the line's old values back and marks the variables it set as uncertain (a later use is also unknown at run time).
+// What a script judged here may change, by ctx field:
+//   vars, tainted                 shell-local: die with a child shell (restored), a speculative source taints them (below)
+//   branches                      repository state: a child really switches the branch, so a definite script's change is kept;
+//                                 a speculative candidate may not run, so what it changed becomes an unknown branch
+//   cfgDirty, envCfgDirty         repository/global config: only ever set, never restored (a candidate that may not run
+//                                 still leaves them dirty); envCfgDirty is recomputed from vars AND tainted names
+//   gitAliases, ghAliases         config on disk: kept; one a speculative candidate (re)defines is also unsure (aliasUnsure)
+//   cwd, home, fullText, readers  constants of the evaluation; judgeBudget is shared on purpose (never restored)
+// (a `cd` inside a sourced file is not followed: evalString's directory is local to each call)
 function judgeScoped(text, dir, ctx, level, sf) {
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   if (sf.sourced && !sf.candidate) return evalString(text, dir, ctx, level + 1);
   const saved = Object.assign(Object.create(null), ctx.vars);
+  const spec = sf.candidate ? { branches: new Map(ctx.branches), git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases } } : null;
   try {
     return evalString(text, dir, ctx, level + 1);
   } finally {
+    if (spec) { // anything added, changed or removed: unknown (it may not have run), never the candidate's value nor the old one
+      for (const d of new Set([...spec.branches.keys(), ...ctx.branches.keys()])) {
+        if (spec.branches.get(d) !== ctx.branches.get(d)) ctx.branches.set(d, { name: null, trackMain: false });
+      }
+      for (const n of new Set([...Object.keys(spec.git), ...Object.keys(ctx.gitAliases)])) {
+        if (spec.git[n] !== ctx.gitAliases[n]) ctx.aliasUnsure.add(`git:${n}`);
+      }
+      for (const n of new Set([...Object.keys(spec.gh), ...Object.keys(ctx.ghAliases)])) {
+        if (spec.gh[n] !== ctx.ghAliases[n]) ctx.aliasUnsure.add(`gh:${n}`);
+      }
+    }
     const after = Object.assign(Object.create(null), ctx.vars);
     for (const k of Object.keys(ctx.vars)) delete ctx.vars[k];
     Object.assign(ctx.vars, saved);
@@ -885,7 +908,7 @@ export function evaluateGitCommand(command, {
   const base = cwd || process.cwd();
   const ctx = {
     cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, readDir, judgeBudget: MAX_CANDIDATE_JUDGMENTS, fullText: text,
-    vars: Object.create(null), tainted: new Map(), gitAliases: Object.create(null), ghAliases: Object.create(null),
+    vars: Object.create(null), tainted: new Map(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
     branches: new Map(), cfgDirty: false, envCfgDirty: false,
   };
   return evalString(text, path.resolve(base), ctx, 0);
