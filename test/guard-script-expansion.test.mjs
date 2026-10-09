@@ -8,10 +8,13 @@
 // ever lives in fake file contents.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolve, dirname } from 'node:path';
+import { resolve, dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { scriptFileOf } from '../pipeline/hooks/lib/shell-parse.mjs';
+import { defaultReadDir } from '../pipeline/hooks/lib/script-candidates.mjs';
 
 // A fake file system. `files`: path -> text (null = exists but cannot be read); `dirs`: directory paths.
 // Paths are relative to `root` unless absolute. readDir answers like fs.readdirSync (null when not a directory).
@@ -484,4 +487,33 @@ test('scriptFileOf: round 2 shapes (source options, zsh operators, pattern synta
   assert.equal(scriptFileOf(['bash', 'x'], 'bash x', 'echo bash x; bash x').unresolvable, undefined);
   assert.equal(scriptFileOf(['bash', 'a'], 'bash a', 'bash a;'.repeat(40)).unresolvable, true); // too many places to check: refuse
   assert.equal(scriptFileOf(['bash', 'a'], 'bash a', 'bash a;'.repeat(5)).unresolvable, undefined);
+});
+
+// ---- round 3: the operand is not located by text; programs run by path; bracket expressions ---------------------------
+// Each shape below was verified in real bash/zsh: the hidden script ran while the guard said allow.
+
+test('G1: a pattern written next to quotes, backslashes or braces is found whatever the operand looks like once dequoted', () => {
+  const spec = { 'ab1.sh': 'bad', 'xy1.sh': 'bad', 'ok.sh': 'ok' };
+  for (const c of ['bash a""b<1-9>.sh', 'bash a\\b<1-9>.sh', 'bash x{y,z}<1-2>.sh', 'bash --rcfile ab a""b<1-9>.sh', "bash a''b<1-9>.sh", 'bash "a"<1-2>.sh', "bash $'a'b<1-9>.sh", 'source a""b<1-9>.sh', 'node a""b<1-9>.mjs']) denyBoth(c, spec);
+  // a decoy that spells the operand out before the real one
+  denyBoth('echo bash ab; bash a""b<1-9>.sh', spec);
+  // the operand is not named at all (bash -$X may be `bash -x f.sh`): the pattern is still in the command's text
+  for (const c of ['bash -$X a""b<1-9>.sh', 'bash -$X *(a)']) denyBoth(c, spec);
+  assert.equal(scriptFileOf(['bash', '-$X'], 'bash -$X', 'bash -$X<1-2>').unresolvable, true);
+  assert.equal(scriptFileOf(['bash', '-$X'], 'bash -$X', 'bash -$X').unresolvable, undefined);
+  assert.equal(scriptFileOf(['bash', 'ab'], 'bash a""b<1-9>.sh').unresolvable, true);
+});
+
+test('G1: quoted, escaped or later-line text after the script is not a pattern', () => {
+  const spec = { 'ok.sh': 'ok', 'x.mjs': 'ok', 'app.js': 'ok' };
+  for (const c of ['node x.mjs --body "[a](b)"', "node x.mjs --body '[a](b)'", 'node x.mjs --body \\[a\\]\\(b\\)', 'node app.js --title "#1"','bash ok.sh "a*(b)" "c<1-2>"', "bash ok.sh $'a*(b)\\'*(c)'", 'bash ok.sh "q \\" *(a)"'])
+    allowBoth(c, spec);
+  // a newline that is not escaped or quoted ends the command: a heredoc body is not part of it
+  assert.equal(scriptFileOf(['bash', 'ok.sh'], 'bash ok.sh\n*(a)').unresolvable, undefined);
+  assert.equal(scriptFileOf(['bash', 'ok.sh'], 'bash ok.sh "a\n" *(b)').unresolvable, true); // newline inside quotes: same command
+  assert.equal(scriptFileOf(['bash', 'ok.sh'], 'bash ok.sh \\\n *(b)').unresolvable, true); // escaped newline: same command
+  assert.equal(scriptFileOf(['bash', 'ok.sh'], 'bash ok.sh "a\n*(b)"').unresolvable, undefined);
+  // unquoted pattern syntax anywhere in the command's own text is refused (accepted: it may be a harmless argument)
+  denyBoth('bash ok.sh *(N)', spec);
+  denyBoth('node x.mjs ?(a)', spec);
 });

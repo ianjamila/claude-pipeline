@@ -457,33 +457,63 @@ const INTERP_VALUE_FLAGS = new Set(['-r', '--require', '--import', '--loader', '
 // {kind:'shell'} is run as a shell script (the caller judges its commands), {kind:'interp'} is program text in
 // another language (the caller scans it), {kind:'exec'} is a program run by path (shell or interpreter, from its
 // shebang). Null when the command runs no file (`bash -c`, stdin, process substitution, `node -e`, a test runner).
-// `ambiguous: true` (shells, source, interpreters): a word from argv[1] up to the operand expands at run time (`$X f.sh`,
-// `$(..)`, a glob), so `file` is only a guess; `words` (argv[1..]) are the candidates, `needExt` says an interpreter
+// `ambiguous: true` (shells, source, interpreters; a program run by path whose name expands): a word from argv[1] up to the
+// operand expands at run time (`$X f.sh`, `$(..)`, a glob), so `file` is only a guess; `words` (argv[1..]) are the candidates, `needExt` says an interpreter
 // only runs a file with a script extension. The caller expands what it can and judges every candidate.
 // `raw` (optional) is the command's own text and `line` the whole line it came from. The parser turns zsh/ksh pattern syntax
 // into other words and cuts the command there (`bash f<1-2>.sh` has a redirect, `bash *(N)` and `bash +(a|b).sh` have
-// subshells), so if the text from the command's start to the end of the operand's word holds such a pattern the result is
-// ambiguous AND `unresolvable`: no candidate list can be built, the caller must refuse.
-// The parser reports no offsets, so the command is located by its text; when that text (or the operand inside it) occurs
-// more than once, EVERY occurrence is checked and any pattern refuses (a harmless decoy copy must not hide the real one).
+// subshells), so if the command's text holds such a pattern the result is ambiguous AND `unresolvable`: no candidate list
+// can be built, the caller must refuse.
+// The parser reports no offsets, so the command is located by its text; when that text occurs more than once, EVERY
+// occurrence is checked and any pattern refuses (a harmless decoy copy must not hide the real one). The operand is NOT
+// located inside the text: it is written differently from its dequoted value (`a""b<1-9>.sh`, `x{y,z}<1-2>.sh`), so
+// the whole command text is checked, with quoted and escaped characters masked (see maskQuoted).
 export function scriptFileOf(argv, raw = '', line = raw) {
   const sf = scriptFileOfArgv(argv);
-  if (!sf || sf.kind === 'exec' || sf.unresolvable || typeof raw !== 'string' || !raw || sf.file === undefined) return sf;
+  if (!sf || sf.kind === 'exec' || sf.unresolvable || typeof raw !== 'string' || !raw) return sf;
   let starts = [];
   if (typeof line === 'string') for (let i = line.indexOf(raw); i >= 0 && starts.length <= MAX_OCCURRENCES; i = line.indexOf(raw, i + 1)) starts.push(i);
   const text = starts.length ? line : raw; // not a substring of the line (nested script text): the command's own text
   if (!starts.length) starts = [0];
+  let pattern = starts.length > MAX_OCCURRENCES; // too many places to check: refuse
+  // the operand's own spelling, searched in the text, only ever ADDS refusals: a quoted operand that spells a pattern
+  // (`'@(f|fa).sh'`) has been refused since round 2, and the masked check below would let it through
   const ats = [];
-  for (let i = raw.indexOf(sf.file); i >= 0 && ats.length <= MAX_OCCURRENCES; i = raw.indexOf(sf.file, i + 1)) ats.push(i);
-  let pattern = starts.length > MAX_OCCURRENCES || ats.length > MAX_OCCURRENCES; // too many places to check: refuse
+  if (sf.file !== undefined) for (let i = raw.indexOf(sf.file); i >= 0 && ats.length <= MAX_OCCURRENCES; i = raw.indexOf(sf.file, i + 1)) ats.push(i);
+  if (ats.length > MAX_OCCURRENCES) pattern = true;
+  const wordEnd = (from) => { let e = from; while (e < text.length && !/\s/.test(text[e])) e++; return e; };
   for (const st of starts) {
-    for (const at of ats) {
-      let end = st + at + sf.file.length;
-      while (end < text.length && !/\s/.test(text[end])) end++;
-      if (PATTERN_SYNTAX.test(text.slice(st, end))) pattern = true;
-    }
+    if (PATTERN_SYNTAX.test(maskQuoted(text.slice(st, wordEnd(st + raw.length))))) pattern = true;
+    for (const at of ats) if (PATTERN_SYNTAX.test(text.slice(st, wordEnd(st + at + sf.file.length)))) pattern = true;
   }
-  return pattern ? { kind: sf.kind, file: sf.file, ambiguous: true, unresolvable: true, words: argv.slice(1), ...(sf.needExt === undefined ? {} : { needExt: sf.needExt }) } : sf;
+  return pattern ? { kind: sf.kind, file: sf.file, ambiguous: true, unresolvable: true, words: sf.words ?? argv.slice(1), ...(sf.needExt === undefined ? {} : { needExt: sf.needExt }) } : sf;
+}
+
+// The command's text with everything the shell does not read as pattern syntax replaced by '_' (same length, so `"a"<1-2>`
+// still reads as `___<1-2>`): single quotes, double quotes (backslash escapes), $'..' (backslash escapes) and a backslash
+// with the character it escapes. Cut at the first newline that is not escaped or quoted (a heredoc body is not the command).
+// A double-quoted `$(` or backtick can hold quotes of its own, which this scan does not follow: from there on nothing is masked.
+function maskQuoted(t) {
+  let out = '';
+  for (let i = 0; i < t.length; i++) {
+    const c = t[i];
+    if (c === '\n') break;
+    if (c === '\\') { out += '__'.slice(0, Math.min(2, t.length - i)); i++; continue; }
+    const ansi = c === '$' && t[i + 1] === "'";
+    if (c === "'" || c === '"' || ansi) {
+      const q = ansi ? "'" : c;
+      let j = i + (ansi ? 2 : 1);
+      for (; j < t.length && t[j] !== q; j++) {
+        if (q === '"' && (t[j] === '`' || (t[j] === '$' && t[j + 1] === '('))) return out + '_'.repeat(j - i) + t.slice(j);
+        if (t[j] === '\\' && (q === '"' || ansi)) j++;
+      }
+      out += '_'.repeat(Math.min(j + 1, t.length) - i);
+      i = j;
+      continue;
+    }
+    out += c;
+  }
+  return out;
 }
 const MAX_OCCURRENCES = 32;
 // ksh/bash extglob (`*(`, `?(`, `+(`, `@(`, `!(`), zsh `(#i)` and `<1-2>` numeric ranges attached to a word
@@ -519,7 +549,11 @@ function scriptFileOfArgv(argv) {
     if (file === undefined || (needExt && !SCRIPT_EXT.test(file))) return null;
     return STDIN_FILES.has(file) ? null : { kind: 'interp', file };
   }
-  if (/[/]/.test(argv[0]) && !argv[0].includes('\\') && !SYSTEM_BIN.test(argv[0])) return { kind: 'exec', file: argv[0] };
+  if (/[/]/.test(argv[0]) && !argv[0].includes('\\') && !SYSTEM_BIN.test(argv[0])) {
+    // `./ev*.sh` / `$D/x.sh`: the shell runs whatever the word expands to, so it is a candidate list of one word
+    return { kind: 'exec', file: argv[0] };
+  }
+  // `X=./evil.sh; $X`: a program named by a variable has no `/` to show it is a path
   return null;
 }
 const INTERPRETER_NO_EXT = new Set(['python', 'ruby', 'perl', 'php']);
