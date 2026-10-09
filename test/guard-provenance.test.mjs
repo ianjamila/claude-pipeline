@@ -72,7 +72,7 @@ test('parseVerdictArtifactName: round-trips every valid name and is strict about
 // ---- run-level provenance: run_attempt and the created_at window -----------------------------------------------------------
 
 const GOOD = {
-  path: '.github/workflows/pipeline-guards.yml@refs/heads/main', event: 'pull_request_target', head_sha: HEAD, run_attempt: 1,
+  path: '.github/workflows/pipeline-guards.yml@refs/heads/main', event: 'pull_request_target', status: 'completed', head_sha: HEAD, run_attempt: 1,
   created_at: T('10:00:00'), updated_at: T('10:12:00'), pull_requests: [{ number: 7, head: { sha: HEAD }, base: { ref: 'main', sha: 'b'.repeat(40) } }],
 };
 const reader = ({ run = {}, artifacts = [], compare = 'ahead', calls = [] } = {}) => (apiPath, jq) => {
@@ -234,6 +234,38 @@ test('checkVerdictArtifact / checkGuardVerdict: the artifact list is read once p
   assert.equal(calls.filter((c) => c === `repos/${REPO}/actions/runs/1`).length, 1);
 });
 
+test('a run read while still in progress is not cached: its own later status and artifact are accepted once it completes', () => {
+  // Measured on EagleWatch #1426: the gate read run 37929234322 at 12:19:11Z (in progress), the job posted its status at
+  // 12:19:29Z and completed at 12:19:33Z; the cached early read discarded that status for the rest of the gate.
+  const live = { run: { status: 'in_progress', updated_at: T('10:01:00') }, artifacts: [] };
+  const calls = [];
+  const read = (apiPath, jq) => reader({ ...live, calls })(apiPath, jq);
+  const cache = new Map();
+  const b = bind({ createdAt: T('10:05:00') });
+  const early = checkGuardVerdict({ read, repo: REPO, url: URL1, bind: b, expect: { check: 'hardstops' }, cache });
+  assert.equal(early.ok, false);
+  assert.match(early.reason, /outside the run's window/);
+  live.run = { status: 'completed', updated_at: T('10:06:00') };
+  live.artifacts = [name('success', 'success')];
+  const later = checkGuardVerdict({ read, repo: REPO, url: URL1, bind: b, expect: { check: 'hardstops' }, cache });
+  assert.equal(later.ok, true, later.reason);
+  assert.equal(later.completed, true);
+  // completed now: read once more, then cached
+  checkGuardVerdict({ read, repo: REPO, url: URL1, bind: b, expect: { check: 'hardstops' }, cache });
+  assert.equal(calls.filter((c) => c === `repos/${REPO}/actions/runs/1`).length, 2);
+  assert.equal(calls.filter((c) => c.includes('/artifacts')).length, 1);
+});
+
+test('an in-progress run with no verdict artifact yet does not cache the empty artifact list', () => {
+  const live = { run: { status: 'in_progress' }, artifacts: [] };
+  const read = (apiPath, jq) => reader(live)(apiPath, jq);
+  const cache = new Map();
+  assert.match(checkGuardVerdict({ read, repo: REPO, url: URL1, bind: bind(), expect: { check: 'integrity' }, cache }).reason, /no verdict artifact/);
+  live.run = { status: 'completed' };
+  live.artifacts = [name('success', 'success')];
+  assert.equal(checkGuardVerdict({ read, repo: REPO, url: URL1, bind: bind(), expect: { check: 'integrity' }, cache }).ok, true);
+});
+
 test('checkGuardVerdict: the run checks come first, and the expectation is mandatory', () => {
   const read = reader({ artifacts: [name('success', 'success')], run: { run_attempt: 2 } });
   assert.match(checkGuardVerdict({ read, repo: REPO, url: URL1, bind: bind(), expect: { check: 'hardstops' } }).reason, /re-runs never count/);
@@ -259,7 +291,7 @@ test('the run and artifact jq filters work on GitHub-shaped payloads', { skip: !
     pull_requests: [{ number: 7, id: 99, url: 'x', head: { sha: HEAD, ref: 'f', repo: { id: 1 } }, base: { ref: 'main', sha: 'c'.repeat(40), repo: { id: 1 } } }],
   };
   assert.deepEqual(JSON.parse(jq(filters.run, payload)), {
-    path: payload.path, event: 'pull_request_target', head_sha: HEAD, run_attempt: 2, created_at: T('10:00:00'), updated_at: T('10:12:00'),
+    path: payload.path, event: 'pull_request_target', status: 'in_progress', head_sha: HEAD, run_attempt: 2, created_at: T('10:00:00'), updated_at: T('10:12:00'),
     pull_requests: [{ number: 7, head: { sha: HEAD }, base: { ref: 'main', sha: 'c'.repeat(40) } }],
   });
   const listing = { total_count: 2, artifacts: [{ id: 1, name: name('success', 'failure'), expired: false }, { id: 2, name: 'verify-report', expired: false }] };

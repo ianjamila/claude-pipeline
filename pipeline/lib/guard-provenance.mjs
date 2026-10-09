@@ -57,7 +57,7 @@ const LOGIN = '[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})?(?:\\[bot\\])?';
 const LOGIN_RE = new RegExp(`^${LOGIN}$`);
 // Artifact names cannot contain " : < > | * ? \ / or newlines: this format uses none of them.
 const ARTIFACT_RE = new RegExp(`^${ARTIFACT_PREFIX}([0-9a-f]{40})_(${STATE})_(${STATE})(?:_(${APPROVAL_LABELS.join('|')})_(${LOGIN}))?$`);
-const RUN_JQ = '{path: .path, event: .event, head_sha: .head_sha, run_attempt: .run_attempt, created_at: .created_at, updated_at: .updated_at, '
+const RUN_JQ = '{path: .path, event: .event, status: .status, head_sha: .head_sha, run_attempt: .run_attempt, created_at: .created_at, updated_at: .updated_at, '
   + 'pull_requests: [(.pull_requests // [])[] | {number: .number, head: {sha: .head.sha}, base: {ref: .base.ref, sha: .base.sha}}]}';
 
 /** { repo, runId } from an Actions run URL, or null. */
@@ -105,7 +105,11 @@ export function parseVerdictArtifactName(name) {
  * bind = { prNumber, headSha, createdAt }: what the status is about (PR, the sha it sits on, when it was posted); all
  * three are mandatory. Returns { ok: true, window: { createdAt, updatedAt } } or { ok: false, reason }.
  * `cache` (a Map) holds the definitive reads (run, default branch, ancestry) so a process reads each once; the
- * verdict itself is recomputed per status because the time binding depends on it.
+ * verdict itself is recomputed per status because the time binding depends on it. A run that has not COMPLETED is never
+ * cached: its updated_at (the window's end) and its artifact list still move. A gate that polls while the guards run reads
+ * the run before the job posts its status, so caching that read froze the window ~20s short and discarded the run's own
+ * status for the rest of the gate (measured: EagleWatch #1426, run 37929234322, status 12:19:29Z vs a cached end of
+ * 12:19:11Z). Returns { ok: true, window, completed } on success.
  * This is the run-level check only; a status that claims a VERDICT goes through checkGuardVerdict (adds the artifact).
  */
 export function checkRunProvenance({ read, repo, url, bind = {}, cache = new Map() }) {
@@ -119,8 +123,12 @@ export function checkRunProvenance({ read, repo, url, bind = {}, cache = new Map
   }
   try {
     const key = `run:${run.runId}`;
-    if (!cache.has(key)) cache.set(key, JSON.parse(read(`repos/${repo}/actions/runs/${run.runId}`, RUN_JQ)));
-    const info = cache.get(key);
+    let info = cache.get(key);
+    if (!info) {
+      info = JSON.parse(read(`repos/${repo}/actions/runs/${run.runId}`, RUN_JQ));
+      if (info?.status === 'completed') cache.set(key, info);
+    }
+    const completed = info?.status === 'completed';
 
     const workflow = String(info?.path ?? '').split('@')[0];
     if (workflow !== GUARD_WORKFLOW_PATH) return { ok: false, reason: `the run is workflow ${workflow || '(unknown)'}, not ${GUARD_WORKFLOW_PATH}` };
@@ -155,7 +163,7 @@ export function checkRunProvenance({ read, repo, url, bind = {}, cache = new Map
     const status = cache.get(ckey);
     // The default branch is `ahead` of (or `identical` to) a commit that is on it; `diverged`/`behind` means it is not.
     if (status !== 'identical' && status !== 'ahead') return { ok: false, reason: `the workflow ran from ${sha.slice(0, 7)}, which is not on the default branch (${status || 'unknown'})` };
-    return { ok: true, window };
+    return { ok: true, window, completed };
   } catch (err) {
     return { ok: false, reason: `the run could not be verified (${String(err?.message ?? err).split('\n')[0].slice(0, 100)})` };
   }
@@ -166,15 +174,20 @@ export function checkRunProvenance({ read, repo, url, bind = {}, cache = new Map
  *   { check: 'integrity' | 'hardstops' }   a guard status: the artifact's state for that check must be `success`
  *                                           (every verdict artifact of that head must agree);
  *   { receipt: { label, login } }          an approval receipt: the artifact must name that label and approver (login case-insensitive).
- * The run's artifact list is read once per run (cache). Unreadable or missing fails closed.
+ * The run's artifact list is read once per run (cache) — but only when `final` (the run has completed): a running job
+ * uploads its verdict at the end, so an early empty list must not stick. Unreadable or missing fails closed.
  */
-export function checkVerdictArtifact({ read, repo, runId, headSha, expect, cache = new Map() }) {
+export function checkVerdictArtifact({ read, repo, runId, headSha, expect, cache = new Map(), final = true }) {
   const head = String(headSha ?? '').toLowerCase();
   if (!SHA.test(head) || !/^[1-9][0-9]{0,18}$/.test(String(runId ?? ''))) return { ok: false, reason: 'no run id and head sha were supplied to find the verdict artifact of' };
   try {
     const key = `artifacts:${runId}`;
-    if (!cache.has(key)) cache.set(key, read(`repos/${repo}/actions/runs/${runId}/artifacts?per_page=100`, '.artifacts[].name'));
-    const verdicts = String(cache.get(key)).split('\n').map((l) => l.trim()).filter(Boolean)
+    let list = cache.get(key);
+    if (list === undefined) {
+      list = read(`repos/${repo}/actions/runs/${runId}/artifacts?per_page=100`, '.artifacts[].name');
+      if (final) cache.set(key, list);
+    }
+    const verdicts = String(list).split('\n').map((l) => l.trim()).filter(Boolean)
       .map(parseVerdictArtifactName).filter((v) => v && v.head === head);
     if (verdicts.length === 0) return { ok: false, reason: `the run carries no verdict artifact for ${head.slice(0, 7)} (still running, cancelled before the upload, or deleted)` };
     if (Object.hasOwn(expect ?? {}, 'check') && ['integrity', 'hardstops'].includes(expect.check)) {
@@ -203,6 +216,6 @@ export function checkVerdictArtifact({ read, repo, runId, headSha, expect, cache
 export function checkGuardVerdict({ read, repo, url, bind = {}, expect, cache = new Map() }) {
   const run = checkRunProvenance({ read, repo, url, bind, cache });
   if (!run.ok) return run;
-  const artifact = checkVerdictArtifact({ read, repo, runId: parseRunUrl(url).runId, headSha: bind.headSha, expect, cache });
+  const artifact = checkVerdictArtifact({ read, repo, runId: parseRunUrl(url).runId, headSha: bind.headSha, expect, cache, final: run.completed });
   return artifact.ok ? run : artifact;
 }
