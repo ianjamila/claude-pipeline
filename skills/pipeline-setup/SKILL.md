@@ -75,7 +75,8 @@ deployments + smoke command); production (URL, provider, read-only smoke, rollba
 `vercel rollback <known-good> --yes --timeout 3m` itself for provider `vercel`) + notes); `smoke_checks` (GET-only, unauthenticated); `risk.high_risk_paths`; `hard_stops.paths` /
 `patterns` / `auth_calls` (project extras on top of the universal list); `hard_stops.disable_rules: [R6-sensitive]` only when
 sensitive-data words are routine for the domain (an HR/payroll/medical app; nothing else can be switched off — ask the owner
-first); review settings.
+first); `hard_stops.report_only_rules` / `report_only_paths` downgrade non-database rules to report-only (listed, never blocking, no
+`human-approved` needed; database rules and `R4-pipeline` always block) — ask the owner which; review settings.
 Validate: `P config` (it prints `warnings`: read them, e.g. a missing guard context).
 
 ### d. CI + branch protection

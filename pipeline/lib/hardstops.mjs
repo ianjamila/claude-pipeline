@@ -6,6 +6,11 @@
 // Rules: R0-unscannable | R1-destructive | R1-migration-edited | R2-auth | R2-auth-removed | R2-sql-removed |
 //        R2-sql-statement | R3-secrets | R4-pipeline | R5-major-dep | R6-sensitive | P-path | P-pattern
 //
+// Blocking vs report-only: every hit blocks by default. A project may downgrade the non-database rule families listed in
+// REPORT_ONLY_HARD_STOP_RULES (and paths in hard_stops.report_only_paths) to report-only: such a hit carries
+// `advisory: true`, is still found and listed everywhere, but is left out of `blockingHits(hits)`, which is what every
+// pass/fail decision counts. Database rules (R0, R1, R2-sql-*), R4-pipeline and unlisted rules can never be advisory.
+//
 // Shape: a pure core (`classifyHardStops` and the helpers exported for tests) plus ONE supported entry point,
 // `collectHardStops`, which gathers what a diff cannot show: env names already on the base, package.json /
 // requirements before and after, and whole SQL statements around changed lines. `classifyHardStops` refuses to run when
@@ -58,7 +63,7 @@
 //  * Path rules test the old AND the new path, case-insensitively. Exclusions (docs, tests) match the path as written.
 import { posix } from 'node:path';
 import { matchAny } from './glob.mjs';
-import { DEFAULTS, DISABLEABLE_HARD_STOP_RULES } from './config.mjs';
+import { DEFAULTS, DISABLEABLE_HARD_STOP_RULES, REPORT_ONLY_HARD_STOP_RULES } from './config.mjs';
 import { diffFiles, diffModes, mergeBase, showFile, git, GitError } from './git.mjs';
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1173,13 +1178,14 @@ const baseName = (p) => p.slice(p.lastIndexOf('/') + 1);
 function makeSink() {
   const seen = new Map();
   return {
-    add(rule, file, detail, { line, excerpt: ex } = {}) {
+    add(rule, file, detail, { line, excerpt: ex, advisory } = {}) {
       const key = `${rule}\0${file}\0${line ?? ''}\0${line === undefined ? detail : ''}`;
       if (seen.has(key)) return;
       const hit = { rule, file };
       if (line !== undefined) hit.line = line;
       if (ex !== undefined) hit.excerpt = ex;
       hit.detail = detail;
+      if (advisory) hit.advisory = true;
       seen.set(key, hit);
     },
     list: () => [...seen.values()],
@@ -1204,8 +1210,26 @@ function settings(config) {
     testGlobs: config?.integrity?.test_globs ?? DEFAULTS.integrity.test_globs,
     authRemoved: [...AUTH_REMOVED, ...authCalls],
     disabled: disabledRules(hs.disable_rules),
+    reportOnly: reportOnlyRules(hs.report_only_rules, hs.disable_rules),
+    reportOnlyPaths: hs.report_only_paths ?? [],
   };
 }
+
+// hard_stops.report_only_rules, re-checked like disabledRules(): a rule outside the downgradable list (R4-pipeline, any
+// database rule, R0) would turn a blocking class advisory, so it stops the run instead. A rule both disabled and
+// report-only is contradictory config and stops the run too.
+function reportOnlyRules(rules = [], disabled = []) {
+  for (const r of rules) {
+    if (!REPORT_ONLY_HARD_STOP_RULES.includes(r)) {
+      throw new Error(`hard_stops.report_only_rules: ${JSON.stringify(r)} cannot be report-only (allowed: ${REPORT_ONLY_HARD_STOP_RULES.join(', ')})`);
+    }
+    if (disabled.includes(r)) throw new Error(`hard_stops.report_only_rules: ${JSON.stringify(r)} is also in hard_stops.disable_rules`);
+  }
+  return new Set(rules);
+}
+
+/** Hits that block merge (everything not report-only). Pass/fail decisions count these; listings show all hits. */
+export const blockingHits = (hits) => hits.filter((h) => !h.advisory);
 
 // hard_stops.disable_rules, re-checked here because classifyHardStops can be handed a config that never went through
 // validateConfig: a rule outside the switchable list stops the run (fail closed) instead of being dropped.
@@ -1274,8 +1298,11 @@ function pathRules(d, cx, sink) {
     sink.add('R4-pipeline', d.file, `pgTAP test ${STATUS_WORD[d.status]}`);
   }
 
+  // A file matching both lists blocks: report_only_paths only softens a path no blocking rule claims.
   const pp = d.paths.find((p) => inc(p, cx.paths));
+  const rp = pp ? undefined : d.paths.find((p) => inc(p, cx.reportOnlyPaths));
   if (pp) sink.add('P-path', d.file, `project hard-stop path: ${pp}`);
+  else if (rp) sink.add('P-path', d.file, `project report-only path: ${rp}`, { advisory: true });
 }
 
 // Everything the env rules say about one added line, shared with the IO wrapper so both agree on what a "candidate" is.
@@ -1413,7 +1440,7 @@ const needs = (cond, msg) => {
 //   headFiles     Map file -> whole new content of changed code files (optional): lets the import check read an import split over lines
 //   guardLosses   [{file, kind:'code'|'sql', detail}] guards that vanished from the whole file without a removed line (commented out)
 // Throws TypeError when the diff touches SQL or package.json and sqlStatements / pkgPairs (or basePkg+headPkg) are missing.
-// Returns hits `{ rule, file, line?, excerpt?, detail }`.
+// Returns hits `{ rule, file, line?, excerpt?, detail, advisory? }`; `advisory: true` = report-only (see blockingHits).
 export function classifyHardStops({ files, config, baseEnvNames = new Set(), basePkg, headPkg, pkgPairs, sqlStatements, envFiles, envImportFiles, guardLosses = [], headFiles }) {
   const cx = { ...settings(config), headFiles: new Map(headFiles instanceof Map ? headFiles : Object.entries(headFiles ?? {})) };
   const sink = makeSink();
@@ -1442,7 +1469,7 @@ export function classifyHardStops({ files, config, baseEnvNames = new Set(), bas
     if (pair.kind === 'lock') {
       if (pair.error) sink.add('R0-unscannable', pair.file, `${baseName(pair.file)} could not be parsed (${pair.error}); dependency changes unchecked`);
       else lockRules(pair, sink);
-    } else if (pair.error) sink.add('R5-major-dep', pair.file, `${baseName(pair.file)} could not be parsed (${pair.error}); dependency changes unchecked`);
+    } else if (pair.error) sink.add('R0-unscannable', pair.file, `${baseName(pair.file)} could not be parsed (${pair.error}); dependency changes unchecked`);
     else if (pair.kind === 'flat') flatRules(pair, sink);
     else npmRules(pair, sink);
   }
@@ -1462,7 +1489,7 @@ export function classifyHardStops({ files, config, baseEnvNames = new Set(), bas
 
   for (const g of guardLosses) sink.add(g.kind === 'sql' ? 'R2-sql-removed' : 'R2-auth-removed', g.file, g.detail);
 
-  return sink.list().filter((hit) => !cx.disabled.has(hit.rule));
+  return sink.list().filter((hit) => !cx.disabled.has(hit.rule)).map((hit) => (cx.reportOnly.has(hit.rule) ? { ...hit, advisory: true } : hit));
 }
 
 // ---------------------------------------------------------------------------------------------------------------

@@ -248,6 +248,19 @@ test('comment needs-human: reason, hard-stop hits from --hits-file, and state', 
   assertExit(cli(['comment', '--pr', '4', '--kind', 'needs-human'], { repo, fake: commentWorld() }), 2);
 });
 
+test('comment needs-human: a P hardstops object lists only its blocking hits, never the report-only ones', () => {
+  const repo = stateRepo();
+  const hits = join(repo.dir, 'hits.json');
+  const blocking = [{ rule: 'R1-destructive', file: 'supabase/migrations/1.sql' }];
+  const advisory = [{ rule: 'R6-sensitive', file: 'lib/payroll/a.ts', advisory: true }];
+  writeFileSync(hits, JSON.stringify({ ok: false, hits: [...blocking, ...advisory], blocking, advisory }));
+  const fake = commentWorld();
+  assertExit(cli(['comment', '--pr', '4', '--kind', 'needs-human', '--reason', 'drops a table', '--hits-file', hits], { repo, fake }), 0);
+  const body = JSON.parse(fake.calls().find((c) => c.argv.includes('POST')).stdin).body;
+  assert.match(body, /R1-destructive — supabase\/migrations\/1\.sql/);
+  assert.doesNotMatch(body, /R6-sensitive/);
+});
+
 test('comment awaiting-review: carries the reason', () => {
   const repo = repoWith();
   const fake = commentWorld();

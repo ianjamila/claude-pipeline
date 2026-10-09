@@ -43,7 +43,7 @@ test('disabling R6 leaves every R5 duty on: a major bump, an overrides swap, an 
   };
   assert.deepEqual(rulesOf(classify({ ...swap, config: r6Off })), ['R5-major-dep']);
   const broken = { files: [], pkgPairs: [{ file: 'package.json', error: 'Unexpected token' }] };
-  assert.deepEqual(rulesOf(classify({ ...broken, config: r6Off })), ['R5-major-dep']);
+  assert.deepEqual(rulesOf(classify({ ...broken, config: r6Off })), ['R0-unscannable']); // a fail-closed unscannable-input hit
 });
 
 test('disabling one rule leaves the others on the same file', () => {

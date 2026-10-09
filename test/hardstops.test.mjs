@@ -649,7 +649,7 @@ test('IO: an unparseable package.json at head is flagged rather than silently sk
   repo.write('package.json', '{ "dependencies": { "a": "2.0.0", }');
   repo.commit('break');
   const hits = await collectHardStops({ base: 'main', head: 'feat', cwd: repo.dir, config: cfg() });
-  assert.deepEqual(rulesOf(hits), ['R5-major-dep']);
+  assert.deepEqual(rulesOf(hits), ['R0-unscannable']); // fail-closed: stays blocking even when R5-major-dep is report-only
   assert.match(hits[0].detail, /could not be parsed/);
 });
 

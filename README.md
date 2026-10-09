@@ -94,7 +94,7 @@ smoke opens a `pipeline-rollback` issue that has the same effect until you close
 
 | Label | Meaning | What you do |
 |---|---|---|
-| `needs-human` | a hard-stop (migration, auth/RLS, secrets, pipeline files, major dependency bump, sensitive personal data, project extras) or something the pipeline couldn't settle | read the PR and its summary comment; to approve add `human-approved` in the GitHub UI (while the PR still shows the commit you reviewed), `Hard-stop scan` re-runs, then merge. A new push drops the approval: re-apply it |
+| `needs-human` | a blocking hard-stop (migration, auth/RLS, secrets, pipeline files, major dependency bump, sensitive personal data, project extras; a project can make the non-database ones report-only via `hard_stops.report_only_rules` / `report_only_paths`: listed, never blocking) or something the pipeline couldn't settle | read the PR and its summary comment; to approve add `human-approved` in the GitHub UI (while the PR still shows the commit you reviewed), `Hard-stop scan` re-runs, then merge. A new push drops the approval: re-apply it |
 | `pipeline-blocked` | verify stayed red after three fix cycles | the draft PR has the failing step and log excerpt |
 | `awaiting-review` | Codex was unavailable | say "resume pipeline reviews" later |
 | `test-change-approved` (you add it) | approves a PR that weakens or deletes tests; like `human-approved` it covers only the commit it was applied to | — |

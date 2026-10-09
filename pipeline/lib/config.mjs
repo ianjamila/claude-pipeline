@@ -32,7 +32,7 @@ export const DEFAULTS = deepFreeze({
   production: null,
   smoke_checks: [],
   risk: { high_risk_paths: [], medium_lines: 150, high_lines: 600, medium_files: 10 },
-  hard_stops: { paths: [], patterns: [], auth_calls: [], disable_rules: [] },
+  hard_stops: { paths: [], patterns: [], auth_calls: [], disable_rules: [], report_only_rules: [], report_only_paths: [] },
   integrity: {
     test_globs: [
       '**/*.test.*', '**/*.spec.*', '**/__tests__/**', '**/test/**', '**/tests/**', 'e2e/**', 'supabase/tests/**',
@@ -73,7 +73,7 @@ const KEYS = {
   production: ['url', 'provider', 'environment', 'smoke', 'deploy_timeout_minutes', 'rollback'],
   rollback: ['command', 'notes'],
   risk: ['high_risk_paths', 'medium_lines', 'high_lines', 'medium_files'],
-  hard_stops: ['paths', 'patterns', 'auth_calls', 'disable_rules'],
+  hard_stops: ['paths', 'patterns', 'auth_calls', 'disable_rules', 'report_only_rules', 'report_only_paths'],
   pattern: ['name', 'regex', 'paths'],
   integrity: ['test_globs'],
   review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines'],
@@ -177,6 +177,35 @@ function checkDisableRules(rules, errors) {
   rules.forEach((r, i) => {
     if (!DISABLEABLE_HARD_STOP_RULES.includes(r)) {
       errors.push(`hard_stops.disable_rules[${i}]: ${JSON.stringify(r)} cannot be disabled (allowed: ${DISABLEABLE_HARD_STOP_RULES.join(', ')})`);
+    }
+  });
+}
+
+// Built-in hard-stop rule families a project may downgrade to REPORT-ONLY with hard_stops.report_only_rules: the hit is
+// still found and listed (job summary, CLI output, PR body) but it never blocks merge and never needs `human-approved`.
+// Owner decision 2026-10-09: the label is for DATABASE changes only, so every rule that is not a database rule may be
+// downgraded. NOT eligible, each for a stated reason:
+//   R0-unscannable      content nobody could read (a binary, an unparseable lockfile or package.json) vouches for nothing
+//   R1-destructive, R1-migration-edited, R2-sql-removed, R2-sql-statement
+//                       the database rules the label exists for
+//   R4-pipeline         edits to the pipeline's own files and config: one unattended edit to pipeline.yml could otherwise
+//                       turn the database rules report-only too, so R4 must stay blocking
+//   P-path              a project path rule has its own switch, hard_stops.report_only_paths
+// R5-major-dep IS eligible; its fail-closed "package.json could not be parsed" hit is emitted as R0-unscannable so it
+// stays blocking. A rule named here that is outside the list is a config error, not a silent no-op, and classifyHardStops
+// re-checks it (fail closed).
+export const REPORT_ONLY_HARD_STOP_RULES = Object.freeze([
+  'R2-auth', 'R2-auth-removed', 'R3-secrets', 'R5-major-dep', 'R6-sensitive', 'P-pattern',
+]);
+
+function checkReportOnlyRules(rules, disabled, errors) {
+  if (rules === undefined) return;
+  if (!Array.isArray(rules)) return errors.push('hard_stops.report_only_rules must be an array');
+  rules.forEach((r, i) => {
+    if (!REPORT_ONLY_HARD_STOP_RULES.includes(r)) {
+      errors.push(`hard_stops.report_only_rules[${i}]: ${JSON.stringify(r)} cannot be report-only (allowed: ${REPORT_ONLY_HARD_STOP_RULES.join(', ')})`);
+    } else if (Array.isArray(disabled) && disabled.includes(r)) {
+      errors.push(`hard_stops.report_only_rules[${i}]: ${JSON.stringify(r)} is also in hard_stops.disable_rules (pick one)`);
     }
   });
 }
@@ -297,6 +326,8 @@ export function validateConfig(obj) {
     checkStrArray(hardStops.auth_calls, 'hard_stops.auth_calls', errors);
     checkPatterns(hardStops.patterns, errors);
     checkDisableRules(hardStops.disable_rules, errors);
+    checkStrArray(hardStops.report_only_paths, 'hard_stops.report_only_paths', errors);
+    checkReportOnlyRules(hardStops.report_only_rules, hardStops.disable_rules, errors);
   }
 
   const integrity = section(config, 'integrity', errors);

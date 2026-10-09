@@ -62,6 +62,9 @@ hard_stops:                    # project extras on top of the universal list
   patterns: []                 # [{name: ..., regex: ..., paths: ["**/*.ts"]}]
   auth_calls: []               # authorization helpers whose removal is a hard-stop
   disable_rules: []            # built-in rules to switch off; only R6-sensitive (e.g. an HR/payroll app)
+  report_only_rules: []        # rules still found + listed but never blocking, no label needed: R2-auth, R2-auth-removed,
+                               # R3-secrets, R5-major-dep, R6-sensitive, P-pattern (database + pipeline rules always block)
+  report_only_paths: []        # globs like `paths` whose match is listed but never blocking (a path in both lists blocks)
 
 review:
   codex_model: gpt-6-astra

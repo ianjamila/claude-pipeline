@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { loadConfig } from './lib/config.mjs';
 import { diffFiles } from './lib/git.mjs';
-import { collectHardStops } from './lib/hardstops.mjs';
+import { blockingHits, collectHardStops } from './lib/hardstops.mjs';
 import { checkIntegrity } from './lib/integrity.mjs';
 
 export const INTEGRITY_LABEL = 'test-change-approved';
@@ -36,21 +36,30 @@ function cell(text) {
 
 const describeItem = (item) => `${item.rule} ${item.file}`;
 
+// Only blocking hits decide pass/fail; report-only (advisory) hits are listed but never need the label. Results built
+// without the split (older callers) count every hit as blocking.
+const blockingOf = (result) => result.blocking ?? blockingHits(result.hits ?? []);
+const advisoryOf = (result) => result.advisory ?? (result.hits ?? []).filter((h) => h.advisory);
+
 // One line for the commit status: the count plus the first offender, capped at 140 characters.
 function describe(check, result) {
-  const items = check === 'integrity' ? result.violations : result.hits;
+  const items = check === 'integrity' ? result.violations : blockingOf(result);
   const noun = check === 'integrity' ? 'violation' : 'hard-stop';
   const plural = items.length === 1 ? noun : `${noun}s`;
   const overrideLabel = check === 'integrity' ? INTEGRITY_LABEL : HARDSTOP_LABEL;
   const overridden = check === 'integrity' ? result.overridden : result.approved;
-  if (items.length === 0) return clip(check === 'integrity' ? 'No test-integrity violations' : 'No hard-stops', MAX_DESCRIPTION);
+  if (items.length === 0) {
+    if (check === 'integrity') return clip('No test-integrity violations', MAX_DESCRIPTION);
+    const n = advisoryOf(result).length;
+    return clip(n > 0 ? `No blocking hard-stops (${n} report-only)` : 'No hard-stops', MAX_DESCRIPTION);
+  }
   if (overridden) return clip(`${items.length} ${plural}, approved by label ${overrideLabel}`, MAX_DESCRIPTION);
   return clip(`${items.length} ${plural}: ${describeItem(items[0])}`, MAX_DESCRIPTION);
 }
 
 export function renderSummary(check, result) {
   const integrity = check === 'integrity';
-  const items = integrity ? result.violations : result.hits;
+  const items = integrity ? result.violations : blockingOf(result);
   const title = integrity ? 'Test integrity' : 'Hard-stop scan';
   const noun = integrity ? 'violation' : 'hard-stop';
   const overridden = integrity ? result.overridden : result.approved;
@@ -66,6 +75,14 @@ export function renderSummary(check, result) {
     }
     if (items.length > MAX_TABLE_ROWS) lines.push('', `...and ${items.length - MAX_TABLE_ROWS} more not shown.`);
     if (!overridden) lines.push('', `Override: owner adds label \`${label}\`.`);
+  }
+  const advisory = integrity ? [] : advisoryOf(result);
+  if (advisory.length > 0) {
+    lines.push('', `### Report-only (no label needed): ${advisory.length}`, '', '| Rule | File | Line | Detail |', '| --- | --- | --- | --- |');
+    for (const it of advisory.slice(0, MAX_TABLE_ROWS)) {
+      lines.push(`| ${cell(it.rule)} | ${cell(it.file)} | ${it.line ?? ''} | ${cell(it.detail ?? it.excerpt)} |`);
+    }
+    if (advisory.length > MAX_TABLE_ROWS) lines.push('', `...and ${advisory.length - MAX_TABLE_ROWS} more not shown.`);
   }
   return `${lines.join('\n')}\n`;
 }
@@ -96,7 +113,8 @@ export async function runCheck({ check, base, head, labels = [], cwd = process.c
     } else {
       const hits = await (deps.collectHardStops ?? collectHardStops)({ base, head, cwd, config });
       const approved = labels.includes(HARDSTOP_LABEL);
-      result = { check, ok: hits.length === 0 || approved, approved, hits, base, head };
+      const blocking = blockingHits(hits);
+      result = { check, ok: blocking.length === 0 || approved, approved, hits, blocking, advisory: hits.filter((h) => h.advisory), base, head };
     }
     return { exitCode: result.ok ? 0 : 1, output: result, description: describe(check, result), summary: renderSummary(check, result) };
   } catch (err) {

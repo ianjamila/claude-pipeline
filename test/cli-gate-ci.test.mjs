@@ -63,9 +63,9 @@ const guardScenario = ({ context = 'Hard-stop scan', run = {}, prs, compare = 'a
       runFails ? { match: '^api repos/acme/widgets/actions/runs/55 ', code: 1, stderr: 'HTTP 404' } : {
         match: '^api repos/acme/widgets/actions/runs/55 ',
         stdout: `${JSON.stringify({
-          path: '.github/workflows/pipeline-guards.yml@refs/heads/main', event: 'pull_request_target', head_sha: 'a'.repeat(40), run_attempt: 1,
+          path: '.github/workflows/pipeline-guards.yml@refs/heads/main', event: 'pull_request_target', head_sha: o.prHead, run_attempt: 1,
           created_at: '2026-10-01T10:00:00Z', updated_at: '2026-10-01T10:12:00Z',
-          pull_requests: prs ? prs(o.prHead) : [{ number: 12, head: { sha: o.prHead }, base: { ref: 'main' } }], ...run,
+          pull_requests: prs ? prs(o.prHead) : [{ number: 12, head: { sha: o.prHead }, base: { ref: 'main', sha: 'a'.repeat(40) } }], ...run,
         })}\n`,
       },
       { match: '^api repos/acme/widgets --jq \\.default_branch', stdout: 'main\n' },
@@ -84,6 +84,10 @@ test('final-gate: a guard status from another workflow, event, branch commit, PR
     guardScenario({ run: { path: '.github/workflows/evil.yml@refs/heads/x' } }),
     guardScenario({ run: { event: 'pull_request' } }),
     guardScenario({ compare: 'diverged' }),
+    // the run judged another head
+    guardScenario({ run: { head_sha: 'e'.repeat(40) } }),
+    // a PR into a side branch with the same head may have triggered the run with that branch's workflow file
+    guardScenario({ prs: (head) => [{ number: 12, head: { sha: head }, base: { ref: 'main', sha: 'a'.repeat(40) } }, { number: 13, head: { sha: head }, base: { ref: 'side', sha: 'b'.repeat(40) } }] }),
     guardScenario({ link: '' }),
     guardScenario({ link: 'https://github.com/evil/widgets/actions/runs/55' }),
     guardScenario({ runFails: true }),

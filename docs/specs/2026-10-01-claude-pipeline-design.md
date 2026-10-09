@@ -487,6 +487,19 @@ arbiter-input.md, rulings.json, model-proof.json}`, `.review/final-gate.json`,
    medical, patient, payroll, salary, wage, payslip, bank, SSN/TIN/SSS/PhilHealth/Pag-IBIG.
 Plus the project's `hard_stops.paths` / `patterns`. Classification errs toward needs-human.
 
+### 8.1 Report-only hard-stops (owner decision 2026-10-09)
+
+The `human-approved` label is required ONLY for database changes (R0, R1-*, R2-sql-*). A project may downgrade
+the other families to **report-only** with `hard_stops.report_only_rules` (allowed: `R2-auth`, `R2-auth-removed`,
+`R3-secrets`, `R5-major-dep`, `R6-sensitive`, `P-pattern`) and `hard_stops.report_only_paths` (globs like `paths`).
+Such a hit is still found and listed (job summary, `pipeline hardstops` output, PR body) with `advisory: true`, but it
+never fails `Hard-stop scan`, never fails the final gate and never needs the label. `R4-pipeline` stays blocking
+so that one unattended edit to `pipeline.yml` cannot turn the database rules report-only; `R0-unscannable` (including
+an unparseable `package.json`) and every database rule are refused in config and re-checked when classifying (fail
+closed). A file matching both `paths` and `report_only_paths` blocks; a rule in both `disable_rules` and
+`report_only_rules` is a config error. Default (nothing configured): every hit blocks, as before. Report-only hits
+still count toward risk (`high`, no light lane): they raise review depth, never block.
+
 Risk level: `high` if any hard-stop, any `risk.high_risk_paths` hit, or changed lines >
 `high_lines`; `medium` if lines > `medium_lines` or > 10 files; else `low`.
 
@@ -774,8 +787,12 @@ Recheck: resolved 1, 2, 6, 11, 13, P3-order; partial 3, 4, 5, 7, 8, 9, 10, 12; t
   branch `x` with an edited `pipeline-guards.yml`, open a PR into `x` with the same head sha, and that run posts
   bot receipts (and success guard statuses) on the shared head. A receipt therefore also needs a `target_url` that is
   an Actions run of this repository (always set to the run URL) whose `path` is `.github/workflows/pipeline-guards.yml`
-  (an `@ref` suffix is stripped), whose `event` is `pull_request_target`, and whose `head_sha` (the base tip the
-  workflow ran from) is on the default branch (`compare/<head_sha>...<default>` is `identical` or `ahead`). Because
+  (an `@ref` suffix is stripped), whose `event` is `pull_request_target`, and whose bound PR entry (below) names a
+  `base.sha` on the default branch (`compare/<base.sha>...<default>` is `identical` or `ahead`). NOT the run's `head_sha`:
+  for `pull_request_target` GitHub reports the PR HEAD there (measured: EagleWatch run 37906872583), so checking it
+  refused every PR; `base.sha` may lag (lazy refresh) but is still a main commit. `base.ref` pins the workflow FILE to
+  main's tip, not the guard scripts it checks out: freshness of those comes from the workflow checking out the base
+  branch tip (#26), not from this check. Because
   the poster of a status chooses its `target_url`, the run must also be ABOUT this verdict: `pull_requests` lists this
   PR number at the status's sha with `base.ref` = the default branch (an empty list is untrusted, fail closed), and the
   status was created within the run's `[created_at, updated_at]` window (10 s slack; the lower bound is the run's creation, i.e. the event time, because a queued run can start long after the labeling it answers) and the run is `run_attempt` 1 (a re-run can execute an OLDER guard revision from an old main tip and post a fresh success over a newer failure, so re-runs never count: push a commit or close and reopen the PR to run the guards again). `base.ref` is mandatory: "ancestor

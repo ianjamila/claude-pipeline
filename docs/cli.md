@@ -116,13 +116,13 @@ Exit: 0 · 2 usage / no state · 3 GitHub (`gh`) unavailable.
 
 ## hardstops
 
-list hard-stop hits for a branch diff (exit 1 unless human-approved).
+list hard-stop hits for a branch diff (exit 1 on blocking hits unless human-approved).
 
 ```
-pipeline hardstops --base REF --head REF [--labels a,b] [--repo DIR]   -> {ok, approved, hits}; exit 1 when hits and not approved
+pipeline hardstops --base REF --head REF [--labels a,b] [--repo DIR]   -> {ok, approved, hits, blocking, advisory}; exit 1 when blocking hits and not approved
 ```
 
-Exit: 0 no hits, or hits all approved by `human-approved` · 1 unapproved hits · 2 usage / config.
+Exit: 0 no blocking hits (report-only hits, `advisory`, are listed but never block), or blocking hits approved by `human-approved` · 1 unapproved blocking hits · 2 usage / config.
 
 ## integrity
 
