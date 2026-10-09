@@ -16,6 +16,11 @@ const MAX_WORK = 8_000_000; // total characters lexed across all recursive parse
 const HARD_MAX_DEPTH = 50;
 const ASSIGN_RE = /^([A-Za-z_][A-Za-z0-9_]*)\+?=/;
 const KEYWORDS = new Set(['if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', 'until', '!', 'esac', 'coproc']);
+// A word right before a ( that opens a subshell, a condition or arithmetic (`if(true)`, `for((i=0;;))`), not a glob qualifier group.
+const LEAD_WORDS = new Set([...KEYWORDS, 'for', 'case', 'select', 'in', 'time', 'function', 'foreach', 'switch', 'catch', 'elseif', 'param', 'trap', 'return', 'exit', 'throw']);
+// A group on a glob word that holds nothing but qualifier characters (`*(.)`, `*(^/)`, `*(om[1,3])`, `*(N)`) is not also read as a subshell.
+const QUALIFIER_ONLY = /^[/.@=*%^,\-[\]\d#qpPrwxARWXsStNDnMTUGEIoOmacLlbY]*$/;
+const MAX_QUALIFIER_CODES = 32; // code strings taken from the groups of one word; more than this and the parse is flagged truncated
 const PS_ENV_RE = /^\$env:([A-Za-z_][A-Za-z0-9_]*)(=?)([\s\S]*)$/i;
 const MAX_BRACE_WORK = 20_000; // brace-expansion results across one line; beyond it words stay unexpanded and the parse is flagged truncated
 const BRACE_CAP = 64; // results of one brace expression; beyond it we keep the first ones and set `truncated`
@@ -426,8 +431,8 @@ function unwrap(argv) {
 const EXPANDS = /[$`*?[^#]|[^=]~(?!\d|$)/;
 const hasExpansion = (w) => EXPANDS.test(w);
 // A word that is a process substitution: the shell runs a command and reads its output through a /dev/fd path.
-// (zsh's `=(cmd)` is the same thing with a temp file; add it here when the parser knows it)
-const isProcSub = (w) => w.startsWith('<(');
+// (zsh's `=(cmd)` is the same thing with a temp file)
+const isProcSub = (w) => w.startsWith('<(') || w.startsWith('=(');
 
 // bash -c "script" / bash -lc ... / bash script.sh / bash (reads stdin)
 // -s, `-`, /dev/stdin and /dev/fd/0 all mean "read the script from stdin".
@@ -440,7 +445,7 @@ function shellInvocation(argv) {
   while (i < argv.length) {
     const t = argv[i];
     if (t === '--') { i++; break; }
-    if (t.length < 2 || (t[0] !== '-' && t[0] !== '+')) break;
+    if (t.length < 2 || (t[0] !== '-' && t[0] !== '+') || (t[0] === '+' && !/^\+[A-Za-z]/.test(t))) break; // (`+(f|fa).sh` is a pattern operand, not an option)
     if (t.startsWith('--')) { i += t === '--rcfile' || t === '--init-file' ? 2 : 1; continue; }
     if (t[0] === '-' && t.includes('c')) sawC = true;
     if (t[0] === '-' && t.includes('s')) sawS = true;
@@ -772,6 +777,57 @@ export function scriptFeedsOf(cmd, line = cmd?.raw) {
   return out;
 }
 
+// ---- zsh glob qualifiers ----------------------------------------------------------------------------------
+
+// Why: in zsh `ls *(e:'cmd':)` runs cmd for every match, `*(e{cmd})` and `*(e'cmd')` too (the first character after the e is the delimiter, a
+// bracket closes with its partner), `*(+name)` runs the function or command name, and `oe` / `o+name` sort by running code. The group is
+// part of the glob word, not a subshell. Whatever the qualifier grammar, the code follows an `e` + delimiter or a `+` + name, so every such
+// place in the text between the parentheses is taken as code (more than zsh would: `(see|git)` yields the commands `git`; a harmless
+// false reading). The delimiter's end is read both ways (the first partner, and the balanced one) and the text both as written and
+// with the quotes removed, since the quoting decides which character the shell sees.
+const BRACKETS = { '{': '}', '[': ']', '<': '>', '(': ')' };
+
+function dequote(str) {
+  let out = '';
+  for (let i = 0; i < str.length; i++) {
+    const c = str[i];
+    if (c === "'") { const j = str.indexOf("'", i + 1); out += str.slice(i + 1, j < 0 ? str.length : j); i = j < 0 ? str.length : j; }
+    else if (c === '"') {
+      for (i++; i < str.length && str[i] !== '"'; i++) {
+        if (str[i] === '\\' && /["\\$`]/.test(str[i + 1] ?? '')) i++;
+        out += str[i];
+      }
+    } else if (c === '$' && str[i + 1] === "'") { const r = readAnsiC(str, i + 1); out += r.text; i = r.next - 1; }
+    else if (c === '\\' && i + 1 < str.length) out += str[++i];
+    else out += c;
+  }
+  return out;
+}
+
+function qualifierCodes(t) {
+  const out = [];
+  for (let p = 0; p < t.length; p++) {
+    if (t[p] === 'e' && p + 1 < t.length && !/[\w\s]/.test(t[p + 1])) {
+      const open = t[p + 1];
+      const close = BRACKETS[open] ?? open;
+      const first = t.indexOf(close, p + 2);
+      out.push(first < 0 ? t.slice(p + 2) : t.slice(p + 2, first));
+      if (close !== open) {
+        let depth = 1;
+        let q = p + 2;
+        for (; q < t.length; q++) { if (t[q] === open) depth++; else if (t[q] === close && --depth === 0) break; }
+        if (q < t.length && q !== first) out.push(t.slice(p + 2, q));
+      }
+    } else if (t[p] === '+' && /[A-Za-z_]/.test(t[p + 1] ?? '')) {
+      const name = /^\w+/.exec(t.slice(p + 1))[0];
+      out.push(name);
+      const long = /^[^\s,)^|~#*?[\]<>'"`$;&(){}]+/.exec(t.slice(p + 1))[0];
+      if (long !== name) out.push(long);
+    }
+  }
+  return out;
+}
+
 // ---- startup files ------------------------------------------------------------------------------------
 
 // Why: a shell runs files before its script: bash $BASH_ENV (non-interactive), sh/dash/ksh $ENV, zsh $ZDOTDIR/.zshenv (default
@@ -856,13 +912,29 @@ export function startupFilesOf(cmd, cmds = [], { env = {}, inherited = () => [],
   for (const n of ['BASH_ENV', 'ENV']) for (const v of values(n)) add(v);
   const opts = shell ? startupOptions(argv) : { login: false, interactive: false, unknown: false, rc: [] };
   for (const r of opts.rc) add(r);
-  if (name !== 'zsh' && !exec) return out;
-  const zNames = ['.zshenv'];
-  if (opts.login || opts.unknown) zNames.push('.zprofile', '.zlogin', '.zlogout');
-  if (opts.interactive || opts.unknown) zNames.push('.zshrc');
-  const own = cmd.env && Object.hasOwn(cmd.env, 'ZDOTDIR') && cmd.env.ZDOTDIR !== '' ? [cmd.env.ZDOTDIR] : null;
-  const dirs = own ?? [...values('ZDOTDIR'), ...(exec ? [] : [...values('HOME'), '~'])];
-  for (const d of dirs) for (const z of zNames) add(`${d.replace(/\/+$/, '')}/${z}`, d === '~' && !own);
+  const dirOf = (d) => d.replace(/\/+$/, '');
+  const ownHome = cmd.env && Object.hasOwn(cmd.env, 'HOME') && cmd.env.HOME !== '' ? cmd.env.HOME : null;
+  // $HOME as the child sees it: its own prefix, else every value the line gives it, else the real home (judged too: an agent may have written it)
+  const homes = ownHome === null ? [...values('HOME'), '~'] : [ownHome];
+  if (exec) {
+    // (the shebang is not read here: a zsh script run by path gets .zshenv from the ZDOTDIR / HOME the line names; the real home is not judged for it)
+    for (const d of [...values('ZDOTDIR'), ...homes.filter((h) => h !== '~')]) add(`${dirOf(d)}/.zshenv`);
+    return out;
+  }
+  if (name === 'zsh') {
+    const zNames = ['.zshenv'];
+    if (opts.login || opts.unknown) zNames.push('.zprofile', '.zlogin', '.zlogout');
+    if (opts.interactive || opts.unknown) zNames.push('.zshrc');
+    const own = cmd.env && Object.hasOwn(cmd.env, 'ZDOTDIR') && cmd.env.ZDOTDIR !== '' ? [cmd.env.ZDOTDIR] : null;
+    for (const d of own ?? [...values('ZDOTDIR'), ...homes]) for (const z of zNames) add(`${dirOf(d)}/${z}`, d === '~' && !own);
+    return out;
+  }
+  // bash and the POSIX shells: a login shell reads the profile files (bash the first of three: all are judged), an interactive one
+  // ~/.bashrc (and $ENV, above); strict: the union for every one of them, since sh may be bash and bash may run as sh
+  const names = [];
+  if (opts.login || opts.unknown) names.push('.bash_profile', '.bash_login', '.profile', '.bash_logout');
+  if (opts.interactive || opts.unknown) names.push('.bashrc');
+  for (const h of homes) for (const n of names) add(`${dirOf(h)}/${n}`, h === '~');
   return out;
 }
 
@@ -1060,7 +1132,11 @@ class Parser {
     let rop = ''; // that redirection's operator
     let rfd = null; // and its explicit fd prefix
     let strip = false;
-    let lit = 0; // inside the (...) of NAME=(...) array literals
+    let lit = 0; // inside the (...) of NAME=(...) array literals, or of a glob group (litGlob)
+    let litGlob = false; // the group is a glob qualifier / pattern group: its | & ; < > are word characters
+    let gRaw = 0; // source index just after the group's opening (
+    let gCur = 0; // index in `cur` just after it
+    let gGlob = false; // the word before the group holds a glob character
     let lastSep = ';';
 
     const startSeg = () => {
@@ -1142,7 +1218,12 @@ class Parser {
     while (this.i < n && !ctx.stopped) {
       const c = s[this.i];
       if (lit > 0 && (isSpace(c) || c === '\n')) { cur += ' '; this.i++; continue; }
-      if (lit > 0 && (c === '(' || c === ')')) { lit += c === '(' ? 1 : -1; cur += c; this.i++; continue; }
+      if (lit > 0 && (c === '(' || c === ')')) {
+        lit += c === '(' ? 1 : -1;
+        if (litGlob && lit === 0) this.qualifierCode(s.slice(gRaw, this.i), cur.slice(gCur), depth, gGlob);
+        cur += c; this.i++; continue;
+      }
+      if (lit > 0 && litGlob && (c === '|' || c === '&' || c === ';' || c === '<' || c === '>')) { cur += c; this.i++; continue; }
 
       if (isSpace(c)) {
         flushWord();
@@ -1234,9 +1315,17 @@ class Parser {
           }
           this.i = j;
         }
+      } else if (c === '=' && !inWord && s[this.i + 1] === '(' && !noRedir) {
+        // zsh `=(cmd)`: process substitution to a temp file, like <(cmd)
+        startSeg(); inWord = true;
+        cur += this.substitution(depth);
+        takeSubs();
       } else if (c === '(') {
         if (inWord && /^[A-Za-z_][A-Za-z0-9_]*\+?=$/.test(cur) && (qa < 0 || qa >= cur.length)) {
-          lit = 1; cur += '('; this.i++; // NAME=(a b) array literal, not a subshell
+          lit = 1; litGlob = false; cur += '('; this.i++; // NAME=(a b) array literal, not a subshell
+        } else if (inWord && s[this.i + 1] !== ')' && !(seg && seg.words.length === 0 && qa < 0 && LEAD_WORDS.has(cur.toLowerCase()))) {
+          // `*(e:'cmd':)`, `foo(+f)`, `*.(jpg|png)`: a glob group glued to a word is part of the word (and `f()` is a function definition)
+          lit = 1; litGlob = true; gGlob = /[*?[]/.test(cur); cur += '('; this.i++; gRaw = this.i; gCur = cur.length;
         } else {
           endSeg(this.i);
           lastSep = ';';
@@ -1254,12 +1343,29 @@ class Parser {
       } else {
         startSeg();
         inWord = true;
-        if ((c === '{' && !cur.endsWith('$')) || c === ',' || c === '}') bm.push(cur.length);
+        if (((c === '{' && !cur.endsWith('$')) || c === ',' || c === '}') && !(lit > 0 && litGlob)) bm.push(cur.length);
         cur += c;
         this.i++;
       }
     }
+    if (lit > 0 && litGlob) { this.ctx.dynamic = true; this.qualifierCode(s.slice(gRaw), cur.slice(gCur), depth, false); } // never closed: cannot be delimited
     endSeg(n);
+  }
+
+  // The code a glob group runs (see qualifierCodes): each string is parsed as commands one level deeper, like a `-c` string.
+  qualifierCode(raw, deq, depth, wordGlob) {
+    // The word may just as well be a subshell glued to a word (`{(bash f.sh); }`, `foo(bash f.sh)`), so the whole body is also parsed as commands:
+    // nothing between the parentheses is ever dropped.
+    if (raw.trim() && !(wordGlob && QUALIFIER_ONLY.test(raw))) this.subParse(raw, depth + 1);
+    const codes = new Set();
+    for (const code of qualifierCodes(raw)) { codes.add(code); codes.add(dequote(code)); }
+    for (const code of qualifierCodes(deq)) codes.add(code);
+    codes.delete('');
+    let n = 0;
+    for (const code of codes) {
+      if (++n > MAX_QUALIFIER_CODES) { this.ctx.truncated = true; break; }
+      this.subParse(code, depth + 1);
+    }
   }
 
   // Interprets one finished simple command: strip keywords/assignments/wrappers, emit it, recurse into interpreters.

@@ -28,7 +28,8 @@ export class GuardLimit extends Error {}
 
 // One per top-level evaluation, shared through every nested call. `now` is injectable so tests do not depend on timing.
 export function newEvalBudget(now = Date.now) {
-  return { now, deadline: now() + EVAL_DEADLINE_MS, scripts: MAX_SCRIPT_JUDGMENTS, grown: 0 };
+  // startupOk: startup files already judged in a given state (see the policies), so a line with many shells reads ~/.zshenv once, not once each
+  return { now, deadline: now() + EVAL_DEADLINE_MS, scripts: MAX_SCRIPT_JUDGMENTS, grown: 0, startupOk: new Set() };
 }
 
 export function checkDeadline(budget) {

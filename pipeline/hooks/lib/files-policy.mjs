@@ -1225,6 +1225,17 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
   const linked = linkReachesProtected(cmds, dirs, ctx);
   if (linked) return deny(`ln links to ${linked}, which is (or holds) protected pipeline files; a link would let later commands reach them under another name (${PROTECTED_MSG})`);
 
+  // A startup file is judged once per evaluation. It is marked first: a startup file that starts shells itself would be judged again and
+  // again otherwise (a denial ends the whole evaluation, so marking before the verdict is safe).
+  const judgeStartupFile = (st) => {
+    // reused only for the same file, directories and nesting depth, never for a run-time name (its verdict depends on the line's text)
+    if (st.ambiguous) return judgeScriptFile(st, dirs, ctx, opts, scanRaw);
+    const key = `${dirs.join('\u0000')}\u0000${opts._depth ?? 0}\u0000${st.file}`;
+    if (ctx.budget.startupOk.has(key)) return null;
+    ctx.budget.startupOk.add(key);
+    return judgeScriptFile(st, dirs, ctx, opts, scanRaw);
+  };
+
   // 7: a script file (bash f.sh, source f, ./f, node f.mjs) runs whatever is in it
   if ((opts._depth ?? 0) < 4) {
     for (const c of cmds) {
@@ -1240,11 +1251,22 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
       }
       // a shell runs its startup files (BASH_ENV, ENV, ZDOTDIR/.zshenv ...) before the script it was given: judged like `bash FILE`
       for (const st of startupFilesOf(c, cmds, { env: startupEnv, inherited: inheritedStartup, exec: sf?.kind === 'exec' })) {
-        const v = judgeScriptFile(st, dirs, ctx, opts, scanRaw);
+        const v = judgeStartupFile(st);
         if (v) return v;
       }
     }
-  } else if (cmds.some((c) => scriptFileOf(c.argv) || scriptFeedsOf(c).length || startupFilesOf(c, cmds, { env: startupEnv, inherited: inheritedStartup }).some((s) => !s.implicit))) return deny('scripts run scripts too deeply to check');
+  } else {
+    // at the depth limit nothing is followed any further: a named script, a fed file or a startup file the line names is refused; the
+    // implicit one (the real home's, which no word names) is judged here, once per evaluation like at the top level
+    for (const c of cmds) {
+      if (scriptFileOf(c.argv) || scriptFeedsOf(c).length) return deny('scripts run scripts too deeply to check');
+      for (const st of startupFilesOf(c, cmds, { env: startupEnv, inherited: inheritedStartup })) {
+        if (!st.implicit) return deny('scripts run scripts too deeply to check');
+        const v = judgeStartupFile(st);
+        if (v) return v;
+      }
+    }
+  }
 
   // 5: protected-path references must be read-only
   const m = makeMatchers(ctx);

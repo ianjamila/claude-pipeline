@@ -117,6 +117,9 @@ function expandVars(text, ctx) {
   return substitute(ctx.budget, String(text), /\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g, (m, a, b) => ctx.vars[a ?? b] ?? m);
 }
 
+// Everything a script judged here can depend on: the directory, the nesting level and the line's variable / branch / config / alias state.
+const stateFingerprint = (ctx, dir, level) => JSON.stringify([dir, level, ctx.vars, [...ctx.unsureVars], [...ctx.tainted], [...ctx.branches], ctx.cfgDirty, ctx.envCfgDirty, ctx.gitAliases, ctx.ghAliases, [...ctx.aliasUnsure]]);
+
 // What the policy's own tracking knows about variable `n` for a use the command's prefix does not override: its value, and
 // `$n` when it is unsure or tainted (the callers read that as "run-time value").
 const knownValues = (ctx, n) => [ctx.vars[n], unsureVar(ctx, n) ? `$${n}` : undefined];
@@ -1119,7 +1122,16 @@ function evalString(str, startDir, ctx, level) {
       // script text that reaches a shell without being named (`bash < f.sh`, `cat f.sh | bash`, `eval "$(cat f.sh)"`): its files are judged like `bash f.sh`
       if (!verdict) for (const fd of scriptFeedsOf(c, str)) { verdict = checkScriptFile(fd, dir, ctx, level); if (verdict) break; }
       // a shell runs its startup files (BASH_ENV, ENV, ZDOTDIR/.zshenv ...) before the script it was given: judged like `bash FILE`
-      if (!verdict) for (const st of startupFilesOf(c, cmds, { env: ctx.env, inherited: (n) => knownValues(ctx, n), exec: sf?.kind === 'exec' })) { verdict = checkScriptFile(st, dir, ctx, level); if (verdict) break; }
+      if (!verdict) for (const st of startupFilesOf(c, cmds, { env: ctx.env, inherited: (n) => knownValues(ctx, n), exec: sf?.kind === 'exec' })) {
+        // a clean verdict is reused only in the very same state (it depends on the variables, branches and config the line has set so far), never for a run-time name
+        const key = st.ambiguous ? null : `${st.file}\u0000${stateFingerprint(ctx, dir, level)}`;
+        if (key !== null) {
+          if (ctx.budget.startupOk.has(key)) continue;
+          ctx.budget.startupOk.add(key); // marked first, so a startup file that starts shells itself is not judged again and again (a denial ends the evaluation)
+        }
+        verdict = checkScriptFile(st, dir, ctx, level);
+        if (verdict) break;
+      }
     }
     if (verdict && verdict.decision === 'deny') return verdict;
     if (SOURCING.includes(name)) {
