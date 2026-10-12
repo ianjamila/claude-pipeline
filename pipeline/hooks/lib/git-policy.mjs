@@ -900,6 +900,27 @@ function withPrefixEnv(cmd, ctx, fn) {
   }
 }
 
+// Judge `fn` on a copy of the line's state and put every field back afterwards, whatever `fn` changed (vars, taint, branches, config, aliases):
+// for a text that is only a FRAGMENT of what the shell reads, so a change it makes is not one the line can rely on or be blamed for.
+// (budget is shared on purpose, as in judgeScoped.)
+function isolatedState(ctx, fn) {
+  const saved = {
+    vars: Object.assign(Object.create(null), ctx.vars), unsureVars: new Set(ctx.unsureVars), tainted: new Set(ctx.tainted), aliasUnsure: new Set(ctx.aliasUnsure),
+    gitAliases: Object.assign(Object.create(null), ctx.gitAliases), ghAliases: Object.assign(Object.create(null), ctx.ghAliases),
+    branches: new Map([...ctx.branches].map(([d, e]) => [d, { ...e }])), cfgDirty: ctx.cfgDirty, envCfgDirty: ctx.envCfgDirty,
+  };
+  try {
+    return fn();
+  } finally {
+    for (const k of ['vars', 'gitAliases', 'ghAliases']) { for (const n of Object.keys(ctx[k])) delete ctx[k][n]; Object.assign(ctx[k], saved[k]); }
+    for (const k of ['unsureVars', 'tainted', 'aliasUnsure']) { ctx[k].clear(); for (const n of saved[k]) ctx[k].add(n); }
+    ctx.branches.clear();
+    for (const [d, e] of saved.branches) ctx.branches.set(d, e);
+    ctx.cfgDirty = saved.cfgDirty;
+    ctx.envCfgDirty = saved.envCfgDirty;
+  }
+}
+
 // Why: the real home's startup files (~/.bash_profile, ~/.zshenv ...) are not named by any word of the line, and what they run does not
 // depend on it. They are judged as an evaluation of their own (the line's variable state, but the guarded words of the FILE's text,
 // not of the line, decide whether a run-time name in it is refused) and the verdict is kept for the whole evaluation, so a line with
@@ -1243,7 +1264,19 @@ function evalString(str, startDir, ctx, level) {
       }
       if (!verdict && sf) verdict = withPrefixEnv(c, ctx, () => checkScriptFile(sf, dir, ctx, level));
       // script text that reaches a shell without being named (`bash < f.sh`, `cat f.sh | bash`, `eval "$(cat f.sh)"`): its files are judged like `bash f.sh`
-      if (!verdict) for (const fd of scriptFeedsOf(c, str)) { verdict = withPrefixEnv(c, ctx, () => checkScriptFile(fd, dir, ctx, level)); if (verdict) break; }
+      // Several files feeding one program (review R2-B2): the JOINED record is the program the shell really reads, so it is judged first, from the
+      // state the line is in, and its changes carry on; each fragment is then judged on an isolated copy (a fragment's branch switch is commented
+      // out or cut in two by its neighbours in the real text, so it must not change what the other fragments are judged against)
+      if (!verdict) {
+        const feeds = scriptFeedsOf(c, str);
+        const joined = feeds.some((fd) => fd.joined);
+        const ordered = joined ? [...feeds.filter((fd) => fd.joined), ...feeds.filter((fd) => !fd.joined)] : feeds;
+        for (const fd of ordered) {
+          const judge = () => withPrefixEnv(c, ctx, () => checkScriptFile(fd, dir, ctx, level));
+          verdict = joined && !fd.joined ? isolatedState(ctx, judge) : judge();
+          if (verdict) break;
+        }
+      }
     }
     if (verdict && verdict.decision === 'deny') return verdict;
     if (SOURCING.includes(name)) {

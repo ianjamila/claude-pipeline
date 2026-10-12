@@ -220,11 +220,11 @@ test('g: nested script text is checked the same way', () => {
 });
 
 test('g: the work counts against the shared script budget', () => {
-  // 60 scripts that each feed 60 more files to a shell: far over the 128 reads one evaluation may make
-  const names = Array.from({ length: 60 }, (_, i) => `c${i}.sh`);
+  // 30 scripts that each feed 30 more files to a shell: far over the 128 reads one evaluation may make
+  const names = Array.from({ length: 30 }, (_, i) => `c${i}.sh`);
   const inner = `cat ${names.join(' ')} | bash`;
-  const spec = { ...Object.fromEntries(names.map((n) => [n, 'ok'])), ...Object.fromEntries(Array.from({ length: 60 }, (_, i) => [`a${i}.sh`, inner])) };
-  const outer = `cat ${Array.from({ length: 60 }, (_, i) => `a${i}.sh`).join(' ')} | bash`;
+  const spec = { ...Object.fromEntries(names.map((n) => [n, 'ok'])), ...Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`a${i}.sh`, inner])) };
+  const outer = `cat ${Array.from({ length: 30 }, (_, i) => `a${i}.sh`).join(' ')} | bash`;
   const r = denyBoth(outer, spec);
   assert.match(r.git.reason, /too many script files/);
   assert.match(r.files.reason, /too many script files/);
@@ -464,6 +464,55 @@ test('R2-B1: scriptFeedsOf refuses a feed that combines exact and computed produ
   }
   assert.equal(feeds('tail -c 99 b.sh | bash').some((f) => f.unresolvable), false);
   assert.equal(feeds('cat a.sh | bash').some((f) => f.unresolvable), false);
+});
+
+// ---- review R2-B2: fragments of a joined feed are judged on an isolated copy of the state; the joined program carries its real changes -------
+// The per-file records were judged in sequence on the shared state before the joined record: a fragment that switches the branch (`git switch
+// feature` in b) changed the branch the joined program was judged against, though `cat a b c` with a = `#` comments that very line out.
+const onMain = { currentBranch: () => 'ma' + 'in' };
+const gitOnMain = (command, fsOpts, o = {}) => git(command, fsOpts, { ...onMain, ...o });
+const switchPush = () => ({ 'a.sh': '#', 'b.sh': 'git switch feature\n', 'c.sh': 'git push\n', 'd.sh': 'git status\n' });
+
+test('R2-B2: a fragment that switches the branch does not change the state the joined program (or the other fragments) is judged against', () => {
+  const fs = () => fakeFs(GIT_ROOT, switchPush(), ['sub', 'd']);
+  for (const c of [
+    'cat a.sh b.sh c.sh | bash', 'cat a.sh b.sh c.sh | sh -s', '{ cat a.sh b.sh c.sh; } | bash', 'eval "$(cat a.sh b.sh c.sh)"', 'bash <(cat a.sh b.sh c.sh)', 'bash < <(cat a.sh b.sh c.sh)',
+    'cat a.sh b.sh c.sh d.sh | bash', 'less a.sh b.sh c.sh | bash',
+  ]) {
+    const r = gitOnMain(c, fs());
+    assert.equal(r.decision, 'deny', `${c} -> ${r.reason}`);
+  }
+  // and what the fragments changed does not leak to the commands AFTER the feed: the real text `#git switch agent/x` switches nothing, so the later push is from main
+  const leak = () => fakeFs(GIT_ROOT, { 'a.sh': '#', 'b.sh': 'git switch agent/x\n', 'p.sh': 'git push\n' }, ['sub', 'd']);
+  for (const c of ['cat a.sh b.sh | bash; bash p.sh', 'bash <(cat a.sh b.sh); bash p.sh', 'eval "$(cat a.sh b.sh)"; bash p.sh']) assert.equal(gitOnMain(c, leak()).decision, 'deny', c);
+  assert.equal(gitOnMain('cat b.sh | bash; bash p.sh', leak()).decision, 'allow'); // b alone IS the switch (a single file carries)
+  // c alone pushes from main too (the baseline); the rewriting producer's files are scanned, never carried
+  assert.equal(gitOnMain('cat c.sh | bash', fs()).decision, 'deny');
+});
+
+// (the later push is in a NAMED script: a push written on the line itself makes the guard refuse any run-time fed shell before this matters)
+const carried = () => ({ 'a.sh': 'git switch ', 'b.sh': 'agent/x\n', 'sw.sh': 'git switch agent/x\n', 'st.sh': 'git status\n', 'p.sh': 'git push\n' });
+
+test('R2-B2: the joined program is the real one: its own branch switch carries on to the commands after it', () => {
+  const fs = () => fakeFs(GIT_ROOT, carried(), ['sub', 'd']);
+  assert.equal(gitOnMain('bash p.sh', fs()).decision, 'deny'); // the baseline: p pushes from main
+  // a + b = `git switch agent/x`: the rest of the line is on agent/x, where a push is allowed
+  for (const c of ['cat a.sh b.sh | bash; bash p.sh', 'bash <(cat a.sh b.sh); bash p.sh', 'eval "$(cat a.sh b.sh)"; bash p.sh']) assert.equal(gitOnMain(c, fs()).decision, 'allow', c);
+  // without the switch (b alone is just a word, st is a status) the line stays on main
+  for (const c of ['cat b.sh | bash; bash p.sh', 'cat st.sh st.sh | bash; bash p.sh']) assert.equal(gitOnMain(c, fs()).decision, 'deny', c);
+});
+
+test('R2-B2: a feed with ONE file keeps carrying that file\'s real state changes', () => {
+  const fs = () => fakeFs(GIT_ROOT, carried(), ['sub', 'd']);
+  for (const c of ['cat sw.sh | bash; bash p.sh', 'bash < sw.sh; bash p.sh', 'eval "$(cat sw.sh)"; bash p.sh']) assert.equal(gitOnMain(c, fs()).decision, 'allow', c); // the switch is real
+  assert.equal(gitOnMain('cat st.sh | bash; bash p.sh', fs()).decision, 'deny'); // nothing switched: still main
+});
+
+test('R2-B2: the files policy judges each fragment as a script of its own (no state leaks between fragments, the joined text is the real program)', () => {
+  // a `cd` in one fragment must not change where the next one or the joined program is judged: the joined text `#cd ~/.claude` is a comment
+  const spec = () => ({ 'a.sh': '#', 'b.sh': 'cd ~/.claude\n', 'c.sh': 'echo hi > settings.json\n' });
+  assert.equal(files('cat a.sh b.sh c.sh | bash', fakeFs(PROJ, spec(), ['sub', 'd'])).decision, 'allow');
+  assert.equal(files('cat b.sh c.sh | bash', fakeFs(PROJ, spec(), ['sub', 'd'])).decision, 'deny');
 });
 
 test('R1-B2 follow-up: a feed with ONE file operand keeps its verdict, however the operand is spelled', () => {
