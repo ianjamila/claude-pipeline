@@ -116,7 +116,7 @@ export function toResult(r) {
   return { code, stdout: r.stdout ?? '', stderr, timedOut, signal: r.signal ?? null };
 }
 
-function baseOptions({ cwd, env, timeoutMs } = {}) {
+function baseOptions({ cwd, env, timeoutMs, maxBuffer = MAX_BUFFER } = {}) {
   return {
     cwd,
     env: env ? { ...process.env, ...env } : undefined,
@@ -124,14 +124,16 @@ function baseOptions({ cwd, env, timeoutMs } = {}) {
     killSignal: 'SIGKILL', // SIGTERM can be trapped; a timeout has to stick
     encoding: 'utf8',
     windowsHide: true,
-    maxBuffer: MAX_BUFFER,
+    maxBuffer,
   };
 }
 
-export function run(cmd, args = [], { cwd, env, input, timeoutMs } = {}) {
+// `maxBuffer` (bytes of stdout / stderr kept) is for the rare caller whose output is legitimately huge; past it the child is
+// killed (spawnSync's own rule), so a limit that is too small is a failure, never a truncated answer.
+export function run(cmd, args = [], { cwd, env, input, timeoutMs, maxBuffer } = {}) {
   const plan = planSpawn(cmd, args);
   const r = spawnSync(plan.file, plan.args, {
-    ...baseOptions({ cwd, env, timeoutMs }),
+    ...baseOptions({ cwd, env, timeoutMs, maxBuffer }),
     input,
     windowsVerbatimArguments: plan.windowsVerbatimArguments,
   });

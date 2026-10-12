@@ -50,8 +50,8 @@ const SCRUBBED_ENV = Object.fromEntries([
 // Runs git with forced config; returns the raw result unless the process did not finish on its own. `env` is the
 // one way to point git elsewhere on purpose (e.g. GIT_CEILING_DIRECTORIES in a test).
 // `timeoutMs` bounds a call that can hang on the network (fetch, push); a timeout is a GitError like any other.
-function exec(args, { cwd, run: runFn = run, input, env, timeoutMs } = {}) {
-  const r = runFn('git', [...FORCED_CONFIG, ...args], { cwd, env: { ...SCRUBBED_ENV, ...GIT_ENV, ...env }, input, ...(timeoutMs ? { timeoutMs } : {}) });
+function exec(args, { cwd, run: runFn = run, input, env, timeoutMs, maxBuffer } = {}) {
+  const r = runFn('git', [...FORCED_CONFIG, ...args], { cwd, env: { ...SCRUBBED_ENV, ...GIT_ENV, ...env }, input, ...(timeoutMs ? { timeoutMs } : {}), ...(maxBuffer ? { maxBuffer } : {}) });
   const abnormal = r.timedOut ? 'timed out' : r.signal ? `terminated by signal ${r.signal}` : null;
   if (abnormal) {
     throw new GitError({ args, code: r.code, stderr: [abnormal, (r.stderr ?? '').trim()].filter(Boolean).join(': ') });
@@ -60,6 +60,7 @@ function exec(args, { cwd, run: runFn = run, input, env, timeoutMs } = {}) {
 }
 
 // Returns stdout untouched (callers trim what they need to); throws GitError on any non-zero exit.
+// `o.maxBuffer` raises the 64 MiB cap on what one call may print (see contentHash).
 export function git(args, o) {
   const r = exec(args, o);
   if (r.code !== 0) throw new GitError({ args, code: r.code, stderr: r.stderr });
@@ -239,12 +240,17 @@ function normaliseDiff(text) {
 // `exclude` paths (e.g. an agent log the pipeline itself appends to) are left out: each is a literal repo-root-relative
 // path (`:(top,exclude,literal)`), so `*.js` is not a glob and `docs/x.md` does not match `sub/docs/x.md`. Pathspecs
 // are anchored at the repo root so cwd cannot narrow what is hashed.
-export function contentHash(base, head, { exclude = [], ...o } = {}) {
+// The diff is read as ONE string, so the cap is what a JS string can hold (V8: 2^29-24 chars, and a char is at least one
+// byte): 512 MiB. The default 64 MiB cap killed git with SIGKILL on a real 174 MB PR diff (a regenerated data file), which
+// made the gate and `P inbox` fail for exactly the PRs that most need a look. Past 512 MiB it fails loudly, never truncates.
+export const DIFF_MAX_BYTES = 512 * 1024 * 1024;
+
+export function contentHash(base, head, { exclude = [], maxBuffer = DIFF_MAX_BYTES, ...o } = {}) {
   const mb = mergeBase(base, head, o);
   const text = git([
     ...STABLE_CONFIG, 'diff', '--unified=3', '--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--src-prefix=a/', '--dst-prefix=b/',
     `${mb}..${assertRef(head, ['diff', head])}`, '--', ':/', ...exclude.map((p) => `:(top,exclude,literal)${p}`),
-  ], o);
+  ], { ...o, maxBuffer });
   return createHash('sha256').update(normaliseDiff(text)).digest('hex');
 }
 

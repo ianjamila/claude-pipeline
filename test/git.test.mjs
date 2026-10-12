@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { symlinkSync, rmSync, cpSync, writeFileSync, mkdtempSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import {
@@ -779,4 +780,22 @@ test('contentHash and diffFiles stay byte-stable between commits whatever the us
   repo.git(['config', 'core.autocrlf', 'true']);
   assert.equal(contentHash('main', 'feat', o), off);
   assert.deepEqual(diffFiles('main', 'feat', o).map((f) => f.path), ['src/a.js']);
+});
+
+// A diff past the old 64 MiB output cap (a real 174 MB PR diff killed git with SIGKILL, which broke the gate and the inbox).
+test('contentHash: a diff larger than 64 MiB still hashes, to exactly the sha256 of the normalised diff text', () => {
+  const { repo, o } = baseRepo();
+  repo.branch('big');
+  const rows = 1_200_000;
+  const lines = Array.from({ length: rows }, (_, i) => `row ${i} ${'x'.repeat(50)}`);
+  const content = `${lines.join('\n')}\n`;
+  assert.ok(Buffer.byteLength(content) > 64 * 1024 * 1024);
+  repo.write('data/big.txt', content);
+  repo.commit('big data file');
+  const expected = createHash('sha256');
+  expected.update(`diff --git a/data/big.txt b/data/big.txt\nnew file mode 100644\n--- /dev/null\n+++ b/data/big.txt\n@@\n`);
+  for (let i = 0; i < rows; i += 100_000) expected.update(`${lines.slice(i, i + 100_000).map((l) => `+${l}\n`).join('')}`);
+  assert.equal(contentHash('main', 'big', o), expected.digest('hex'));
+  // a caller-set limit below the diff fails loudly instead of hashing a truncated diff
+  assert.throws(() => contentHash('main', 'big', { ...o, maxBuffer: 1024 * 1024 }), (err) => err instanceof GitError);
 });
