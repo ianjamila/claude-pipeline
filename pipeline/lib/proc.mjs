@@ -280,13 +280,13 @@ export function splitCommand(str, platform = process.platform) {
 }
 
 // ---- test seams are for the repo checkout only --------------------------------------------------------------------
-// PIPELINE_GH / PIPELINE_CODEX / PIPELINE_VERCEL swap the tool the gate trusts for a script, and PIPELINE_TEST_MODE relaxes
-// the arbiter's model proof. They exist so the test suite can run the real CLI against fakes; a production install must
+// PIPELINE_GH / PIPELINE_CODEX / PIPELINE_VERCEL swap the tool the gate trusts for a script, PIPELINE_TEST_MODE relaxes
+// the arbiter's model proof, and PIPELINE_UPDATE_REMOTE points `pipeline update` at another repository to fetch from. They exist so the test suite can run the real CLI against fakes; a production install must
 // never honour them (an environment variable set by anything that can launch the CLI would otherwise decide what the
 // gate sees). An installed copy is recognised by the INSTALLED.json manifest the installer writes into the pipeline root
 // (the directory holding bin/); the repo checkout has none. When installed, a seam is ignored with one warning on stderr.
 export const PIPELINE_ROOT = fileURLToPath(new URL('..', import.meta.url));
-export const SEAM_VARS = ['PIPELINE_GH', 'PIPELINE_CODEX', 'PIPELINE_VERCEL', 'PIPELINE_TEST_MODE'];
+export const SEAM_VARS = ['PIPELINE_GH', 'PIPELINE_CODEX', 'PIPELINE_VERCEL', 'PIPELINE_TEST_MODE', 'PIPELINE_UPDATE_REMOTE'];
 export const isInstalledCopy = (root = PIPELINE_ROOT) => existsSync(path.join(root, 'INSTALLED.json'));
 
 const warned = new Set();

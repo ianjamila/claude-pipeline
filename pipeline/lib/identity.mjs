@@ -10,10 +10,14 @@ import path from 'node:path';
 import { run } from './proc.mjs';
 import * as I from './installer.mjs';
 
-// A caller's GIT_DIR & co. would point git at some other repo than the one being identified.
-const GIT_SCRUB = Object.fromEntries(
-  ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE']
-    .map((k) => [k, undefined]),
+// A caller's GIT_DIR & co. would point git at some other repo than the one being identified. The second line is what
+// would let the environment rewrite git's configuration or transport rules behind a call's back (upstream.mjs builds
+// its fully isolated git on this same list).
+export const GIT_SCRUB = Object.fromEntries(
+  [
+    'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE',
+    'GIT_TEMPLATE_DIR', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_ALLOW_PROTOCOL', 'GIT_SSL_NO_VERIFY', 'GIT_ASKPASS', 'GIT_PROXY_COMMAND',
+  ].map((k) => [k, undefined]),
 );
 export const gitIn = (root, args, extra = {}) => run('git', ['-C', root, ...args], { env: GIT_SCRUB, timeoutMs: 20000, ...extra });
 

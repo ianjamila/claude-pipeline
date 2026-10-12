@@ -151,8 +151,8 @@ head you did not review (the receipt names the head the event carried).
   guarded word), a push to a dynamic destination (only `$(git branch --show-current)`,
   `$(git rev-parse --abbrev-ref HEAD)` or a variable assigned a literal in the same command are
   understood; ship pushes `git push -u origin agent/<slug>`), `unset CLAUDECODE`, and setting
-  `PIPELINE_GH`, `PIPELINE_CODEX`, `PIPELINE_VERCEL` or `PIPELINE_TEST_MODE` on a `pipeline.mjs` command;
-  the installed CLI ignores those four seam variables altogether (they exist for the test suite).
+  `PIPELINE_GH`, `PIPELINE_CODEX`, `PIPELINE_VERCEL`, `PIPELINE_TEST_MODE` or `PIPELINE_UPDATE_REMOTE` on a `pipeline.mjs` command;
+  the installed CLI ignores those five seam variables altogether (they exist for the test suite).
 - **Branch protection needs GitHub Pro** for private repos. Without it a repo runs in `gate`
   mode (skills and CLI only) and preflight says so.
 - **Local verify, lean CI.** The full verify runs on your machine; CI keeps the repo's existing
