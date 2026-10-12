@@ -323,6 +323,8 @@ test('codexCommand reads process.env by default', () => {
 
 const fixtures = join(dirname(fileURLToPath(import.meta.url)), 'fixtures');
 const trapSigterm = join(fixtures, 'trap-sigterm.mjs');
+// The fixture sleeps 30 s unless killed, so any bound well under that proves the SIGKILL; the old 1.5 s left only 1 s for two process spawns, tight on a loaded Windows runner.
+const KILL_WITHIN_MS = 10_000;
 const spawnSleeper = join(fixtures, 'spawn-sleeper.mjs');
 
 function isAlive(pid) {
@@ -353,7 +355,7 @@ test('run SIGKILLs on timeout: a child that traps SIGTERM and exits 0 still cann
   const r = run('node', [trapSigterm, marker], { timeoutMs: 500 });
   assert.equal(r.timedOut, true);
   assert.notEqual(r.code, 0);
-  assert.ok(Date.now() - t0 < 1500, `took ${Date.now() - t0} ms`);
+  assert.ok(Date.now() - t0 < KILL_WITHIN_MS, `took ${Date.now() - t0} ms`);
   assert.equal(existsSync(marker), false, 'the child was sent SIGTERM, not SIGKILL');
 });
 
@@ -363,7 +365,7 @@ test('runShell SIGKILLs on timeout and never reports exit 0', () => {
   const r = runShell(`node "${trapSigterm}" "${marker}"`, { timeoutMs: 500 });
   assert.equal(r.timedOut, true);
   assert.notEqual(r.code, 0);
-  assert.ok(Date.now() - t0 < 1500, `took ${Date.now() - t0} ms`);
+  assert.ok(Date.now() - t0 < KILL_WITHIN_MS, `took ${Date.now() - t0} ms`);
   assert.equal(existsSync(marker), false, 'the shell command was sent SIGTERM, not SIGKILL');
 });
 
@@ -401,7 +403,7 @@ test('runShellAsync SIGKILLs a command that traps SIGTERM', async () => {
   const r = await runShellAsync(`node "${trapSigterm}"`, { timeoutMs: 500 });
   assert.equal(r.timedOut, true);
   assert.notEqual(r.code, 0);
-  assert.ok(Date.now() - t0 < 1500, `took ${Date.now() - t0} ms`);
+  assert.ok(Date.now() - t0 < KILL_WITHIN_MS, `took ${Date.now() - t0} ms`);
 });
 
 test('runShellAsync timeout kills the whole process tree, not just the direct child', async () => {

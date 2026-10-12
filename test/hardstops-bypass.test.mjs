@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { classifyHardStops, collectHardStops, scanEnvLine, parsePythonDeps, enclosingStatements } from '../pipeline/lib/hardstops.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { MIG, pkg, cfg, file, rulesOf, classify, run } from './helpers/hardstops.mjs';
+import { assertLinear } from './helpers/timing.mjs';
 
 const A = (path, ...added) => file(path, { status: 'A', added });
 const flags = (files, opts) => rulesOf(run(files, opts));
@@ -554,23 +555,22 @@ test('13 a line stuffed with import specifiers stays fast (and is flagged as unr
 test('13 the whole-file import scan stays linear on a ~1.5 MB file of adversarial shapes', () => {
   // Linearity, not raw speed: CI's Node 20 runs these ~3x slower than a laptop, so an absolute budget flaked (2.1 s for the
   // backslash chain on ubuntu-latest). Doubling the input may at most ~double the CPU (ratio < 3; a quadratic shape gives ~4),
-  // and a generous absolute ceiling still catches a pathological constant.
-  // Windows counts process CPU in ~15.6 ms ticks, so a shape that takes ~10 ms read as 1 tick vs 4 (ratio 4) and flaked. Each
-  // size is therefore timed over enough repeats (calibrated on the high-resolution clock) to span ~150 ms, then averaged.
+  // and a generous absolute ceiling still catches a pathological constant. Windows counts process CPU in ~15.6 ms ticks (15 ms ->
+  // 47 ms once failed this test), so each sample repeats the scan enough times (calibrated on the high-resolution clock) to span
+  // ~60 ms (4 ticks), and each size is the best of several samples (timing.mjs).
   const shapes = [[';from a import ', 100_000, 'a.py'], ['from' + ' ', 1_500_000, 'a.ts', true], ['require("', 190_000, 'a.ts'], [';import a, ', 100_000, 'a.py'], ['"""\n', 250_000, 'a.py'],
     ['from a import (\n', 90_000, 'a.py'], ['import a, \\\n', 120_000, 'a.py']];
   const once = (text, name) => run([file(`lib/${name}`, { added: ['x = 1'] })], { headFiles: new Map([[`lib/${name}`, text]]) });
-  const cpu = (text, name, reps) => cpuMs(() => { for (let i = 0; i < reps; i++) once(text, name); }).ms / reps;
+  const cpu = (text, name, reps) => () => cpuMs(() => { for (let i = 0; i < reps; i++) once(text, name); }).ms;
   for (const [unit, n, name, padOnly] of shapes) {
     const make = (k) => (padOnly ? `from${' '.repeat(k)}` : unit.repeat(k));
     const halfText = make(n / 2), fullText = make(n);
     const t0 = performance.now();
     once(halfText, name);
-    const reps = Math.min(50, Math.max(1, Math.ceil(150 / Math.max(performance.now() - t0, 1))));
-    const half = Math.max(cpu(halfText, name, reps), 1);
-    const full = cpu(fullText, name, reps);
-    assert.ok(full / half < 3, `${unit.slice(0, 16)}... ${Math.round(half)}ms at n/2 -> ${Math.round(full)}ms at n: not linear`);
-    assert.ok(full < 8000, `${unit.slice(0, 16)}... took ${Math.round(full)}ms of CPU`);
+    const reps = Math.min(50, Math.max(1, Math.ceil(60 / Math.max(performance.now() - t0, 1))));
+    const label = `${unit.slice(0, 16)}...`;
+    const { hi } = assertLinear(cpu(halfText, name, reps), cpu(fullText, name, reps), { label });
+    assert.ok(hi / reps < 8000, `${label} took ${Math.round(hi / reps)}ms of CPU`);
   }
 });
 

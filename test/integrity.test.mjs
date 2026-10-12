@@ -336,6 +336,12 @@ test('weaker matcher heuristic stays quiet when the subject differs, the strong 
   for (const [removed, added] of quiet) assert.deepEqual(check([modified('lib/a.test.ts', { removed, added })]), CLEAN, removed[0]);
 });
 
+test('binary-test-file: a large binary diffFiles skipped is judged like any binary diff: its deletion is only test-deleted, its addition or edit is flagged', () => {
+  const skipped = (e) => ({ ...e, skippedLargeBinary: true });
+  assert.deepEqual(rules(check([skipped(binary('D', 'tests/fixtures/old.xlsx'))])), ['test-deleted']);
+  for (const status of ['A', 'M']) assert.deepEqual(rules(check([skipped(binary(status, 'tests/fixtures/new.xlsx'))])), ['binary-test-file'], status);
+});
+
 test('binary-test-file: a binary diff in a test-glob file is flagged unless its extension is a known asset type', () => {
   for (const [status, path] of [['M', 'lib/a.test.ts'], ['A', 'e2e/data.xlsx'], ['M', 'tests/fixtures/report.pdf'], ['A', 'supabase/tests/x.test.sql']]) {
     const r = check([binary(status, path)]);
