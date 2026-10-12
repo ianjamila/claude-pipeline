@@ -383,14 +383,17 @@ test('deploy url: usage errors (missing flags, short sha) exit 2', () => {
 
 // ---- resume ---------------------------------------------------------------------------------
 
-test('resume list: open PRs labelled awaiting-review', () => {
-  const fake = createFakeGh([{
-    match: '^pr list --label awaiting-review --state open',
-    stdoutJson: [{ number: 5, title: 'Add widget', headRefName: 'feat/widget', url: 'https://github.com/acme/widgets/pull/5', labels: [] }],
+test('resume list: open PRs labelled awaiting-review, each with a why', () => {
+  const fake = createFakeGh([REPO, ME, {
+    match: 'graphql[\\s\\S]*states: OPEN',
+    stdoutJson: { data: { repository: { pullRequests: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{
+      number: 5, title: 'Add widget', headRefName: 'feat/widget', headRefOid: 'a'.repeat(40), baseRefName: 'main', url: 'https://github.com/acme/widgets/pull/5',
+      labels: { nodes: [{ name: 'awaiting-review' }] }, commits: { nodes: [] },
+    }] } } } },
   }]);
   const r = cli(['resume', 'list'], { repo: repoWith(), fake });
   assertExit(r, 0);
-  assert.deepEqual(r.json, { ok: true, prs: [{ number: 5, title: 'Add widget', headRefName: 'feat/widget', url: 'https://github.com/acme/widgets/pull/5' }] });
+  assert.deepEqual(r.json, { ok: true, prs: [{ number: 5, title: 'Add widget', headRefName: 'feat/widget', url: 'https://github.com/acme/widgets/pull/5', why: 'awaiting a cross-model review (label awaiting-review)' }] });
   assertExit(cli(['resume'], { repo: repoWith(), fake }), 2);
 });
 
