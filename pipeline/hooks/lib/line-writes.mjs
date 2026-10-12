@@ -1103,15 +1103,60 @@ function genericRecord(cmd, name, idx) {
   const list = [...words];
   return { idx, dest: null, generic: list, items: [{ unknown: true }, ...list.map((file) => ({ file }))], loose: true };
 }
+// Why: a program-text file judged as shell makes hundreds of generic records of a few words each, and every script / source asked about is tried against all of them: the words that expand the same way every time (no variable,
+// tilde or %NAME%) are expanded and located once per record (and per place the command runs), and P is compared to their directories by its ancestors, not by one path computation per word.
+// (a word with no variable, tilde or %NAME% expands the same way every time it is asked: remembered; the others as the line's variables stand now)
+const VOLATILE_WORD = /\$[\w{(]|`|%[A-Za-z]|~/;
+function expandWord(f, w) {
+  if (VOLATILE_WORD.test(w)) return f.expand(w);
+  f.expanded ??= new Map();
+  if (!f.expanded.has(w)) f.expanded.set(w, f.expand(w));
+  return f.expanded.get(w);
+}
+// (where a word may be for the command at idx: remembered while that command's directory is as it was, see stamp)
+function locateWord(f, e, idx) {
+  const key = `${idx}\u0000${f.stamp ? f.stamp(idx) : ''}\u0000${e}`; // (the command's own place: the same relative word after a cd is another file)
+  f.located ??= new Map();
+  let r = f.located.get(key);
+  if (r === undefined) { r = f.locate(e, idx); if (f.located.size > 100_000) f.located.clear(); f.located.set(key, r); }
+  return r;
+}
+function classifyWord(f, rec, w, e, t) {
+  if (e === null) { t.dyn.push(w); return; }
+  for (const d of locateWord(f, e, rec.idx)) {
+    if (!f.isAbs(d)) { t.rel.push(d); continue; } // (the directory is unknown: its names in a row)
+    t.abs.add(resolvedFold(f, d));
+    const cd = canon(f, f.p.resolve(d));
+    if (cd !== null) t.real.add(resolvedFold(f, cd));
+  }
+}
+const newTargets = (stamp = '') => ({ stamp, abs: new Set(), real: new Set(), rel: [], dyn: [], vol: [] });
+function genericTargets(f, rec) {
+  const stamp = f.stamp ? f.stamp(rec.idx) : '';
+  f.targets ??= new Map();
+  let t = f.targets.get(rec);
+  if (t && t.stamp === stamp) return t;
+  t = newTargets(stamp);
+  for (const w of rec.generic) { if (VOLATILE_WORD.test(w)) t.vol.push(w); else classifyWord(f, rec, w, expandWord(f, w), t); }
+  f.targets.set(rec, t);
+  return t;
+}
+function targetsName(f, t, P) {
+  const a = ancestorsOf(f, P);
+  for (const x of a.lex) if (t.abs.has(x)) return true;
+  for (const x of a.real) if (t.real.has(x)) return true;
+  for (const d of t.rel) if (mayBeBelow(f, d, P)) return true;
+  for (const w of t.dyn) if (dynamicMayBe(f, w, P)) return true;
+  return false;
+}
 // does any word of the generic record name the script P (as it is, a directory above it, or a pattern that may match it)?
 function namesScript(f, rec, P) {
-  for (const w of rec.generic) {
-    const e = f.expand(w);
-    if (e === null) { if (dynamicMayBe(f, w, P)) return true; continue; }
-    for (const d of f.locate(e, rec.idx)) {
-      if (!f.isAbs(d)) { if (mayBeBelow(f, d, P)) return true; continue; } // (the directory is unknown: its names in a row)
-      if (same(f, d, P) || below(f, P, d) !== null) return true;
-    }
+  tick(f);
+  if (targetsName(f, genericTargets(f, rec), P)) return true;
+  for (const w of genericTargets(f, rec).vol) { // (a word with a variable expands as the line's variables stand now)
+    const t = newTargets();
+    classifyWord(f, rec, w, expandWord(f, w), t);
+    if (targetsName(f, t, P)) return true;
   }
   return false;
 }
@@ -1227,7 +1272,8 @@ function placeOf(f, rec) {
 // - locate(expanded, idx): the paths the word may name for the command at idx: absolute ones, or the word itself when the directory is unknown
 // - isAbs(path), p: the policy's path functions (node:path or node:path.posix), ci: compare names ignoring case
 // - real(path): the path with symlinks followed (a missing tail kept), or null when it cannot be told; omitted: paths are taken as written
-export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, real = null, readText = null, text = null }) {
+// - stamp(idx) (optional): changes whenever locate() would answer differently for the command at idx (the directory it runs in becomes known); tick() (optional): reads the evaluation's clock and throws when it is past its deadline
+export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, real = null, readText = null, text = null, stamp = null, tick = null }) {
   // an awk program file (-f FILE): the text of every place the word may name; null when it cannot be told (a run-time word, a file we cannot read, a place we do not know)
   const readProgram = readText ? (word, idx) => {
     const e = expand(word);
@@ -1243,7 +1289,7 @@ export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, real
   const seps = cmds.filter((c) => c.sep === '&').length;
   const opaque = lone > seps || cmds.some(startsBackground);
   const bgWork = seps > 0 || opaque;
-  return { cmds, recs: w.recs, unmodelled: w.unmodelled, from: flowStart(cmds), i: -1, expand, locate, isAbs, p, ci, real, deferred: hasDeferred(cmds), opaque, bgWork };
+  return { cmds, recs: w.recs, unmodelled: w.unmodelled, from: flowStart(cmds), i: -1, expand, locate, isAbs, p, ci, real, stamp, tick, deferred: hasDeferred(cmds), opaque, bgWork };
 }
 
 // commands that start a job which outlives them (a `&` is read from the text)
@@ -1265,16 +1311,50 @@ function canon(f, p) {
 }
 // P relative to directory d: '' when they are the same path, the relative path when P is below d, else null. Only a first segment of exactly `..` leaves d
 // (a file named `..x.sh` is inside it).
+// (the resolved, case-folded form of a path, remembered: path.resolve is the cost when a line asks about thousands of pairs)
+function resolvedFold(f, a) {
+  f.resolved ??= new Map();
+  let r = f.resolved.get(a);
+  if (r === undefined) { r = fold(f, f.p.resolve(a)); f.resolved.set(a, r); }
+  return r;
+}
+// every directory above P (itself included), resolved and folded, and the same for its real location
+function ancestorsOf(f, P) {
+  f.ancestors ??= new Map();
+  let a = f.ancestors.get(P);
+  if (!a) {
+    const chain = (q) => {
+      const out = [];
+      for (let cur = resolvedFold(f, q); ; ) { out.push(cur); const up = f.p.dirname(cur); if (up === cur) break; cur = up; }
+      return out;
+    };
+    const cp = canon(f, f.p.resolve(P));
+    a = { lex: chain(P), real: cp === null ? [] : chain(cp) };
+    f.ancestors.set(P, a);
+  }
+  return a;
+}
 function relUnder(f, P, d) {
+  const key = `${P}\u0000${d}`;
+  f.relMemo ??= new Map();
+  if (f.relMemo.has(key)) return f.relMemo.get(key);
+  // (both sides resolved and folded: P is below d when it starts with d and a separator; this is what path.relative says, without resolving both paths again each time)
   const lex = (a, b) => {
-    const rel = f.p.relative(fold(f, f.p.resolve(a)), fold(f, f.p.resolve(b)));
-    return rel === '' ? '' : rel.split(/[\\/]/)[0] === '..' || f.p.isAbsolute(rel) ? null : rel;
+    const ra = resolvedFold(f, a);
+    const rb = resolvedFold(f, b);
+    if (ra === rb) return '';
+    const base = ra.endsWith(f.p.sep) ? ra : ra + f.p.sep;
+    return rb.startsWith(base) ? rb.slice(base.length) : null;
   };
-  const r = lex(d, P);
-  if (r !== null) return r;
-  const cd = canon(f, f.p.resolve(d));
-  const cp = canon(f, f.p.resolve(P));
-  return cd === null || cp === null ? null : lex(cd, cp);
+  let out = lex(d, P);
+  if (out === null) {
+    const cd = canon(f, f.p.resolve(d));
+    const cp = canon(f, f.p.resolve(P));
+    out = cd === null || cp === null ? null : lex(cd, cp);
+  }
+  if (f.relMemo.size > 200_000) f.relMemo.clear();
+  f.relMemo.set(key, out);
+  return out;
 }
 const same = (f, a, b) => relUnder(f, b, a) === '';
 // the path of P below directory d, or null
@@ -1300,15 +1380,15 @@ function match(f, rec, P) {
   if (rec.inline !== undefined) return namesFile(rec.inline, p.basename(P)) && (rec.awk || CAN_WRITE.test(rec.inline)) ? loose(rec.items) : null;
   if (rec.generic !== undefined) return namesScript(f, rec, P) ? loose(rec.items) : null;
   if (rec.dest === null) return loose(rec.items);
-  const e = f.expand(rec.dest);
+  const e = expandWord(f, rec.dest);
   // a target only known at run time may be any file its fixed parts allow (`/work/out-$n.txt` is not /work/cmp.mjs)
   if (e === null) return dynamicMayBe(f, rec.dest, P, rec.subtree === true) ? loose(rec.items) : null; // (a subtree: any file below the directory the word may name)
   const out = [];
-  for (const d of f.locate(e, rec.idx)) {
+  for (const d of locateWord(f, e, rec.idx)) {
     if (!f.isAbs(d)) { // the directory is unknown: compare the names
       out.loose = true;
       if (fold(f, p.basename(d)) === fold(f, p.basename(P))) out.push(...rec.items);
-      else if (rec.copy) for (const it of rec.items) { const se = it.file === undefined ? undefined : f.expand(it.file); if (se === null || (se !== undefined && fold(f, nameOf(f, se)) === fold(f, p.basename(P)))) out.push(it); }
+      else if (rec.copy) for (const it of rec.items) { const se = it.file === undefined ? undefined : expandWord(f, it.file); if (se === null || (se !== undefined && fold(f, nameOf(f, se)) === fold(f, p.basename(P)))) out.push(it); }
       // Why: the names say where the files land only if no alias is involved: P is compared by its real path too (a link the line makes is already "a write that ends in the script's name", see collect)
       if (rec.subtree && (!rec.narrow || mayBeBelow(f, d, P) || [canon(f, P)].some((cp) => cp !== null && cp !== P && mayBeBelow(f, d, cp)))) out.push(...rec.items);
       continue;
@@ -1318,7 +1398,7 @@ function match(f, rec, P) {
     if (!rec.copy) continue;
     for (const it of rec.items) {
       if (it.file === undefined) continue;
-      const se = f.expand(it.file);
+      const se = expandWord(f, it.file);
       if (se === null) { // the source is only known at run time: it may be any file that lands in d
         if (below(f, P, d) !== null) out.push({ unknown: true });
         continue;
@@ -1330,7 +1410,7 @@ function match(f, rec, P) {
       for (const root of [d, into]) {
         const rel = root ? below(f, P, root) : null;
         if (rel === null) continue;
-        for (const s of f.locate(se, rec.idx)) out.push({ abs: p.join(s, rel) });
+        for (const s of locateWord(f, se, rec.idx)) out.push({ abs: p.join(s, rel) });
       }
     }
   }
@@ -1348,6 +1428,12 @@ const product = (a, b) => {
   return [...new Set(out)];
 };
 
+// Why: a hook that runs out of time is allowed by Claude Code: the loops that grow with the line (records x names x scripts) read the evaluation's clock every so often (the policy hands it over as frame.tick) and the guard gives up first
+const TICK_EVERY = 64;
+function tick(f, n = 1) {
+  f.work = (f.work ?? 0) + n;
+  if (f.work >= TICK_EVERY) { f.work = 0; f.tick?.(); }
+}
 function hitsOn(allFrames, upto, asOf, P) {
   const frames = allFrames.length === upto + 1 ? allFrames : allFrames.slice(0, upto + 1);
   const pairs = linkPairs(frames, upto, asOf);
@@ -1357,6 +1443,7 @@ function hitsOn(allFrames, upto, asOf, P) {
     const f = frames[fi];
     const at = fi === upto ? asOf : f.i;
     for (const rec of f.recs) {
+      tick(f);
       if (!seen(frames, fi, at, rec.idx)) continue;
       for (const Pv of names) {
         const items = match(f, rec, Pv);
@@ -1365,7 +1452,14 @@ function hitsOn(allFrames, upto, asOf, P) {
     }
   }
   // two writers of this file in one pipeline run at the same time: neither comes first
-  for (const a of out) for (const b of out) if (a.f === b.f && a.rec.idx !== b.rec.idx) { const [lo, hi] = groupOf(a.f.cmds, a.rec.idx); if (b.rec.idx >= lo && b.rec.idx <= hi) a.place.conc = true; }
+  // (grouped by pipeline: pairs of hits would be quadratic when hundreds of generic records name the file)
+  const pipelines = new Map();
+  for (const h of out) {
+    const key = `${h.fi}:${groupOf(h.f.cmds, h.rec.idx)[0]}`;
+    if (!pipelines.has(key)) pipelines.set(key, []);
+    pipelines.get(key).push(h);
+  }
+  for (const group of pipelines.values()) if (new Set(group.map((h) => h.rec.idx)).size > 1) for (const h of group) h.place.conc = true;
   // a write that may or may not be this file, followed by an exact write that replaces the whole file, changed nothing that matters
   let lastExact = -1;
   out.forEach((h, i) => { if (certainReplace(h)) lastExact = i; });
@@ -1390,9 +1484,9 @@ function copyMayFail(frames, h, exists) {
   if (!h.rec.copy) return false;
   for (const it of h.rec.items) {
     if (it.file === undefined) continue;
-    const e = h.f.expand(it.file);
+    const e = expandWord(h.f, it.file);
     if (e === null) continue;
-    for (const x of h.f.locate(e, h.rec.idx).filter((q) => h.f.isAbs(q))) if (!exists(x) && hitsOn(frames, h.fi, h.rec.idx, x).length === 0) return true;
+    for (const x of locateWord(h.f, e, h.rec.idx).filter((q) => h.f.isAbs(q))) if (!exists(x) && hitsOn(frames, h.fi, h.rec.idx, x).length === 0) return true;
   }
   return false;
 }
@@ -1416,6 +1510,7 @@ function contentsIn(frames, upto, asOf, P, io, depth) {
     if (stop) return;
     if (k === free.length) {
       if (++count > MAX_VARIANTS) { io.pieces = true; stop = true; return; }
+      tick(frames[upto], 4);
       if (variant(list) === null) stop = true;
       return;
     }
@@ -1466,9 +1561,9 @@ function partAlternatives(frames, h, io, depth) {
         let paths;
         if (it.abs !== undefined) paths = [it.abs];
         else {
-          const e = f.expand(it.file);
+          const e = expandWord(f, it.file);
           if (e === null) return null;
-          paths = f.locate(e, rec.idx).filter((x) => f.isAbs(x));
+          paths = locateWord(f, e, rec.idx).filter((x) => f.isAbs(x));
           if (rec.link === 'sym' && !f.isAbs(e)) paths.push(f.p.resolve(f.p.dirname(h.P), e));
           if (!paths.length) return null;
         }
@@ -1486,7 +1581,19 @@ function partAlternatives(frames, h, io, depth) {
 }
 
 // Could the word, with its run-time parts ($VAR, $(...), globs, {a,b}) replaced by anything, name P? A relative word may be anywhere (its directory is unknown).
+// (the pattern a word stands for depends on the word alone: true = anything, a RegExp, or null when it cannot be built; built once, not once per name asked)
+const DYNAMIC_PATTERNS = new Map();
 function dynamicMayBe(f, word, P, below = false) {
+  const key = `${f.ci ? 1 : 0}${below ? 1 : 0}${word}`;
+  let pat = DYNAMIC_PATTERNS.get(key);
+  if (pat === undefined) {
+    pat = dynamicPattern(f, word, below);
+    if (DYNAMIC_PATTERNS.size > 20_000) DYNAMIC_PATTERNS.clear();
+    DYNAMIC_PATTERNS.set(key, pat);
+  }
+  return pat === true || pat === null || pat.test(P.replace(/\\/g, '/'));
+}
+function dynamicPattern(f, word, below) {
   // Why: a leading tilde prefix is not a name: ~+ is the command's directory (the rest is then a relative word), ~- the previous directory and ~user a home are unknown (anywhere, absolute)
   let w = String(word);
   let lead = '';
@@ -1504,9 +1611,9 @@ function dynamicMayBe(f, word, P, below = false) {
   const abs = lead !== '' || /^\//.test(parts[0] ?? '') || /^[A-Za-z]:/.test(parts[0] ?? '');
   try {
     const end = below ? '(?:[\\\\/].*)?$' : '$';
-    return new RegExp(abs ? `^(?:[A-Za-z]:)?${re}${end}` : `(?:^|[\\\\/])${re}${end}`, f.ci ? 'is' : 's').test(P.replace(/\\/g, '/'));
+    return new RegExp(abs ? `^(?:[A-Za-z]:)?${re}${end}` : `(?:^|[\\\\/])${re}${end}`, f.ci ? 'is' : 's');
   } catch {
-    return true; // a pattern we cannot build: it may be
+    return null; // a pattern we cannot build: it may be
   }
 }
 
@@ -1543,15 +1650,16 @@ function linkPairs(frames, upto, asOf) {
   view.forEach((f, fi) => {
     const at = fi === upto ? asOf : f.i;
     for (const rec of f.recs) {
+      tick(f);
       if (!rec.link || !seen(view, fi, at, rec.idx)) continue;
       pairs.any = true;
-      const e = f.expand(rec.dest);
+      const e = expandWord(f, rec.dest);
       if (e === null) continue;
-      for (const d of f.locate(e, rec.idx).filter((x) => f.isAbs(x))) {
+      for (const d of locateWord(f, e, rec.idx).filter((x) => f.isAbs(x))) {
         for (const it of rec.items) {
-          const se = it.file === undefined ? null : f.expand(it.file);
+          const se = it.file === undefined ? null : expandWord(f, it.file);
           if (se === null) continue;
-          const srcs = f.locate(se, rec.idx).filter((x) => f.isAbs(x));
+          const srcs = locateWord(f, se, rec.idx).filter((x) => f.isAbs(x));
           if (rec.link === 'sym' && !f.isAbs(se)) srcs.push(f.p.resolve(f.p.dirname(d), se));
           for (const s of srcs) pairs.push([d, s, f], [f.p.join(d, nameOf(f, se)), s, f]);
         }
@@ -1578,6 +1686,7 @@ function namesOf(pairs, P) {
 }
 
 function collect(frames, upto, asOf, P, st, depth, exists) {
+  tick(frames[upto], 8);
   const view = frames.length === upto + 1 ? frames : frames.slice(0, upto + 1);
   const key = `${upto}\u0000${asOf}\u0000${P}`;
   if (st.seen.has(key)) return;
@@ -1599,10 +1708,10 @@ function collect(frames, upto, asOf, P, st, depth, exists) {
         if (!seen(view, fi, at, rec.idx) || rec.inline !== undefined) continue;
         if (rec.subtree) { st.any = true; st.unknown = true; continue; }
         if (rec.dest === null) continue;
-        const e = f.expand(rec.dest);
+        const e = expandWord(f, rec.dest);
         if (e === null) continue;
         const base = fold(f, f.p.basename(P));
-        const written = [nameOf(f, e), ...(rec.copy ? rec.items.map((it) => (it.file === undefined ? null : f.expand(it.file))).filter((s) => s).map((s) => nameOf(f, s)) : [])];
+        const written = [nameOf(f, e), ...(rec.copy ? rec.items.map((it) => (it.file === undefined ? null : expandWord(f, it.file))).filter((s) => s).map((s) => nameOf(f, s)) : [])];
         // (what it copies in is judged as well: the name matches, the place may not be the one we think)
         if (written.some((n) => fold(f, n) === base)) { st.unknown = true; absorb(frames, fi, f, rec, rec.items, P, st, depth, exists); }
       }
@@ -1641,9 +1750,9 @@ function addPath(frames, fi, rec, abs, st, depth, exists, into) {
 }
 
 function addFiles(f, rec, word, P, st, fi, depth, exists, into, frames = null) {
-  const e = f.expand(word);
+  const e = expandWord(f, word);
   if (e === null) { st.unknown = true; return; }
-  const paths = f.locate(e, rec.idx).filter((x) => f.isAbs(x));
+  const paths = locateWord(f, e, rec.idx).filter((x) => f.isAbs(x));
   if (!paths.length) { st.unknown = true; return; } // a relative source in a directory we do not know
   // a symlink's relative source is read from the link's own directory
   if (rec.link === 'sym' && !f.isAbs(e)) paths.push(f.p.resolve(f.p.dirname(P), e));
@@ -1659,12 +1768,12 @@ export function writtenNamesIn(frames, dir) {
   for (const [fi, f] of frames.entries()) {
     for (const rec of f.recs) {
       if (rec.dest === null || rec.inline !== undefined || !seen(frames, fi, f.i, rec.idx)) continue;
-      const e = f.expand(rec.dest);
+      const e = expandWord(f, rec.dest);
       if (e === null) continue;
-      for (const d of f.locate(e, rec.idx)) {
+      for (const d of locateWord(f, e, rec.idx)) {
         if (!f.isAbs(d)) continue;
         if (same(f, f.p.dirname(d), dir)) out.add(f.p.basename(d));
-        if (rec.copy && same(f, d, dir)) for (const it of rec.items) { const se = f.expand(it.file ?? ''); if (se) out.add(nameOf(f, se)); }
+        if (rec.copy && same(f, d, dir)) for (const it of rec.items) { const se = expandWord(f, it.file ?? ''); if (se) out.add(nameOf(f, se)); }
       }
     }
   }
@@ -1688,8 +1797,8 @@ export function exportRecords(f, idx, existing = []) {
   const seen = new Map();
   for (const r of existing) { const k = keyOf(r); if (!seen.has(k) || seen.get(k) > r.idx) seen.set(k, r.idx); }
   const absOf = (word, at) => {
-    const e = f.expand(word);
-    return e === null ? null : f.locate(e, at).filter((x) => f.isAbs(x));
+    const e = expandWord(f, word);
+    return e === null ? null : locateWord(f, e, at).filter((x) => f.isAbs(x));
   };
   for (const rec of f.recs) {
     const place = placeOf(f, rec); // (how it ran inside: a background job or a skippable write stays one when the caller moves on)
@@ -1699,7 +1808,7 @@ export function exportRecords(f, idx, existing = []) {
       const key = it.file !== undefined ? 'file' : 'scan';
       const paths = absOf(it[key], rec.idx);
       if (paths === null || !paths.length) return [{ unknown: true }];
-      const more = key === 'file' && rec.link === 'sym' && d && !f.isAbs(f.expand(it.file) ?? '/') ? [f.p.resolve(f.p.dirname(d), f.expand(it.file))] : []; // a symlink's relative source is read from the link's directory
+      const more = key === 'file' && rec.link === 'sym' && d && !f.isAbs(expandWord(f, it.file) ?? '/') ? [f.p.resolve(f.p.dirname(d), expandWord(f, it.file))] : []; // a symlink's relative source is read from the link's directory
       return [...paths, ...more].map((p) => ({ [key]: p }));
     });
     const dests = rec.dest === null ? [null] : (absOf(rec.dest, rec.idx) ?? [null]);

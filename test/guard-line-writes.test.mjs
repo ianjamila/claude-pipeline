@@ -1382,6 +1382,9 @@ test('L3: generic fallback: a command that is not provably pure and names the sc
   denyBoth((_, mid) => `mytool src; ${mid}; bash src/ok.sh`); // (a directory above it)
   denyBoth((_, mid) => `mytool .; ${mid}; bash src/ok.sh`);
   denyBoth((_, mid) => `cd src; mytool o*; ${mid}; bash ok.sh`);
+  // Why: the same relative word means another file after a cd (a remembered location is per command, never per word)
+  denyBoth((_, mid) => `cd src; mytool ok.sh; cd ..; ${mid}; mytool ok.sh; bash ok.sh`);
+  allowBoth((_, __, calm) => `cd src; mytool ok.sh; cd ..; ${calm}; bash ok.sh`);
   // every OTHER file word is a possible source of the text: it is judged as a script
   denyBoth('mytool f.sh ok.sh; bash ok.sh');
   denyBoth('mytool --src=f.sh ok.sh; bash ok.sh');
@@ -1654,4 +1657,23 @@ test('L4: a git read is not pure when the line may write the repository config (
   assert.equal(un3('git --git-dir=.git status'), 0);
   for (const l of ['echo x > a.txt; git status', 'git config --get x; git status', 'git status', 'git -C sub status', 'echo x > .gitignore; git status']) assert.equal(un3(l), 0, l);
   for (const l of ['rsync -e CMD src d', 'rsync -eCMD src d', 'rsync --rsh=CMD src d', 'rsync --rsh CMD src d', 'rsync --rsync-path=X src d', 'rsync --rs=X src d']) denyBoth((_, mid) => `${l}; ${mid}; bash ok.sh`);
+});
+
+// ---- L5: the loops that grow with the line read the evaluation's clock ---------------------------------------------------------------------
+
+// Why: a hook that runs out of time is allowed by Claude Code; a program text judged as shell is hundreds of generic records whose words are all possible files, and every one of them is asked about every other
+// (minutes of work before the clock was read). The clock here moves 40 ms per read (deadline: 5 s = 125 reads, one read per 64 steps of work), so the count of reads is the work done: no wall-clock in the test.
+const programText = (lines) => Array.from({ length: lines }, (_, i) => `mytool ${'abcdefgh'.split('').map((c) => `w${i}${c}.sh`).join(' ')}`).join('\n');
+test('L5: the write order work reads the evaluation clock (frame.tick), and a tick that throws stops it', () => {
+  const cmds = simpleCommands(`${programText(400)}\nbash w5a.sh`);
+  const frameWith = (tick) => {
+    const f = newWriteFrame(cmds, { expand: (w) => w, locate: (e) => [posix.resolve('/w', e)], isAbs: posix.isAbsolute, p: posix, tick });
+    f.i = cmds.length - 1;
+    return f;
+  };
+  let calls = 0;
+  writtenTo([frameWith(() => { calls++; })], '/w/w5a.sh', { exists: () => false });
+  assert.ok(calls > 20, `${calls} clock reads`);
+  const stop = new Error('past the deadline');
+  assert.throws(() => writtenTo([frameWith(() => { throw stop; })], '/w/w5a.sh', { exists: () => false }), stop);
 });

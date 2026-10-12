@@ -1368,6 +1368,7 @@ function evaluateBashForFilesFrame(command, opts) {
     isAbs, p: posix, ci: ctx.ci,
     real: (q) => realResolve(q, ctx.api),
     readText: (q) => ctx.readText(q), // (an awk program file is read to see what it writes)
+    tick: () => checkDeadline(ctx.budget),
   });
   ctx.frames.push(frame);
   // BASH_ENV / ENV / ZDOTDIR / HOME values this line (and the scripts that run it) assign: shells started by the scripts it runs see them

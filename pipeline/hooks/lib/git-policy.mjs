@@ -1355,6 +1355,8 @@ function evalString(str, startDir, ctx, level) {
     isAbs: path.isAbsolute, p: path, ci: process.platform === 'win32' || process.platform === 'darwin',
     real: (q) => realLocation(ctx.realpath, q),
     readText: (q) => ctx.readText(q), // (an awk program file is read to see what it writes)
+    stamp: (idx) => (dirAt.has(idx) ? `S${dirAt.get(idx)}` : ''), // (locate() answers differently once the command's directory is known)
+    tick: () => checkDeadline(ctx.budget),
   });
   ctx.writeFrames.push(frame);
   try {
