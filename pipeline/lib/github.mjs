@@ -144,6 +144,25 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     listPrs: ({ label, state = 'open' }) =>
       getJson(['pr', 'list', '--label', label, '--state', state, '--json', 'number,title,headRefName,url', '--limit', '100']),
 
+    // Every issue carrying `label`, open AND closed by default, whatever its page: the follow-up dedupe must also see an
+    // issue someone already closed. The REST list returns pull requests too; they are dropped here.
+    listLabelledIssues({ label, state = 'all' }) {
+      const args = ['api', `repos/${self.repo().slug}/issues?labels=${encodeURIComponent(label)}&state=${encodeURIComponent(state)}&per_page=${PER_PAGE}`, '--paginate'];
+      const r = ok(args);
+      let list;
+      try {
+        list = parseConcatenatedJson(r.stdout);
+      } catch (err) {
+        throw new GhError({ code: r.code, stderr: `could not parse issues: ${err.message}`, args });
+      }
+      if (!list.every((i) => i !== null && typeof i === 'object')) {
+        throw new GhError({ code: r.code, stderr: 'issues reply was not a list of objects', args });
+      }
+      return list
+        .filter((i) => i.pull_request === undefined)
+        .map((i) => ({ number: i.number, url: i.html_url, state: i.state, body: typeof i.body === 'string' ? i.body : '', author: i.user?.login ?? null }));
+    },
+
     issueCreate({ title, body, labels = [] }) {
       const r = api('POST', `repos/${self.repo().slug}/issues`, { title, body, labels });
       return { number: r.number, url: r.html_url };

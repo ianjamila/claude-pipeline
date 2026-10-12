@@ -6,14 +6,18 @@ import { defuseMarkdown } from '../lib/codex.mjs';
 import { guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { saveState, updateItems } from '../lib/state.mjs';
+import { createHash } from 'node:crypto';
 import { allItems, findRound, oneLine, requireState, withStateLock } from '../lib/review-context.mjs';
 
 export const meta = {
   summary: 'open an agent-suggestion issue for each FOLLOW-UP item of a round',
   usage: [
     'pipeline followups create --round R [--repo DIR]',
-    '  -> {ok, round, created:[{id, number, url}], skipped:[ids already filed], held:[ids waiting for a human]}',
-    '  one issue per fingerprint across the whole review; a FOLLOW-UP that needs a human is held, not filed',
+    '  -> {ok, round, created:[{id, number, url}], reused:[{id, number, url}], duplicates:[{id, canonical, others:[url]}],',
+    '      skipped:[ids already filed], held:[ids waiting for a human]}',
+    '  one issue per fingerprint across the whole review; a FOLLOW-UP that needs a human is held, not filed.',
+    '  Each issue body starts with <!-- claude-pipeline:followup pr=N fp=FINGERPRINT -->; before creating, an issue of ours',
+    '  (any state) with that marker is REUSED (several: lowest number is canonical, the rest are listed, never closed)',
   ].join('\n'),
 };
 
@@ -23,7 +27,17 @@ const TITLE_MAX = 120;
 
 const clip = (s, max) => (Array.from(s).length > max ? `${Array.from(s).slice(0, max - 1).join('').trimEnd()}…` : s);
 
-// Everything in the issue came from a model that has read untrusted PR text: defuse hidden comments and @mentions.
+// What a reader (a re-run, a resume on another machine) looks for to know this suggestion is already filed. Only the
+// pipeline writes the first line of a body, and only ITS author's issues count, so quoted or forged markers are inert.
+const SAFE_FP = /^[A-Za-z0-9._:-]{1,128}$/;
+export function followupMarker(pr, item) {
+  const raw = String(item.fingerprint || item.id);
+  const fp = SAFE_FP.test(raw) ? raw : createHash('sha256').update(raw).digest('hex');
+  return `<!-- claude-pipeline:followup pr=${pr} fp=${fp} -->`;
+}
+
+// Everything in the issue came from a model that has read untrusted PR text: defuse hidden comments and @mentions
+// (the marker is ours and goes in first, after the defusing).
 export function issueBody(item, pr) {
   const where = item.file ? (item.line > 0 ? `${item.file}:${item.line}` : item.file) : null;
   const decidedBy = item.arbiter && item.final?.by === 'arbiter' ? 'Arbiter' : 'Judge';
@@ -37,7 +51,7 @@ export function issueBody(item, pr) {
   ];
   if (where) lines.push(`Location: \`${oneLine(where)}\``, '');
   lines.push(`From PR #${pr}, item ${item.id}.`, '', 'Promote this by relabelling `agent-suggestion` to `agent-build`.');
-  return defuseMarkdown(lines.join('\n'));
+  return `${followupMarker(pr, item)}\n${defuseMarkdown(lines.join('\n'))}`;
 }
 
 export const run = guarded(async (argv, ctx) => {
@@ -71,6 +85,19 @@ export const run = guarded(async (argv, ctx) => {
     return guardGh(() => {
       const gh = createGitHub({ cwd: root, env: ctx.env });
       const created = [];
+      const reused = [];
+      const duplicates = [];
+      // Issues of ours already carrying a marker for this PR: a previous run (or the other machine) may have filed one
+      // whose URL never reached the state. Read once, and only when something is left to file.
+      let known = null;
+      const findFiled = (item) => {
+        if (known === null) {
+          const me = gh.viewer();
+          known = gh.listLabelledIssues({ label: FOLLOWUP_LABEL, state: 'all' }).filter((i) => i.author === me);
+        }
+        const marker = followupMarker(state.pr, item);
+        return known.filter((i) => i.body.startsWith(marker)).sort((a, b) => a.number - b.number);
+      };
       for (const item of todo) {
         // Two items of this round can share a fingerprint: the first one's issue serves both.
         const existing = item.fingerprint ? filed.get(item.fingerprint) : undefined;
@@ -78,6 +105,16 @@ export const run = guarded(async (argv, ctx) => {
           state = updateItems(state, n, [{ ...item, followupIssue: existing }]);
           saveState(root, state);
           skipped.push(item.id);
+          continue;
+        }
+        const found = findFiled(item);
+        if (found.length > 0) {
+          const [canonical, ...others] = found;
+          state = updateItems(state, n, [{ ...item, followupIssue: canonical.url }]);
+          saveState(root, state);
+          if (item.fingerprint) filed.set(item.fingerprint, canonical.url);
+          reused.push({ id: item.id, number: canonical.number, url: canonical.url });
+          if (others.length > 0) duplicates.push({ id: item.id, canonical: canonical.url, others: others.map((o) => o.url) });
           continue;
         }
         const issue = gh.issueCreate({
@@ -90,7 +127,7 @@ export const run = guarded(async (argv, ctx) => {
         if (item.fingerprint) filed.set(item.fingerprint, issue.url);
         created.push({ id: item.id, number: issue.number, url: issue.url });
       }
-      return { exitCode: EXIT.OK, output: { ok: true, round: n, created, skipped, held } };
+      return { exitCode: EXIT.OK, output: { ok: true, round: n, created, reused, duplicates, skipped, held } };
     });
   });
 });
