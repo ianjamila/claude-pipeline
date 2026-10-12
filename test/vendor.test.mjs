@@ -1,11 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync, rmSync, existsSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, rmSync, existsSync, readdirSync, statSync, cpSync, mkdtempSync, realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
-import { run as vendor, meta } from '../pipeline/commands/vendor.mjs';
+import { run as vendor, meta, vendorDrift } from '../pipeline/commands/vendor.mjs';
+import { MANIFEST_REL, sha256File } from '../pipeline/lib/installer.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const LIBS = ['proc', 'paths', 'yaml', 'config', 'glob', 'diff', 'git', 'hardstops', 'risk', 'integrity', 'locks', 'guard-provenance'];
@@ -47,7 +49,7 @@ test('vendor copies libs, js-yaml, entry scripts byte-for-byte and stamps VERSIO
   const base = readFileSync(join(root, 'VERSION'), 'utf8').trim();
   const stamp = readFileSync(join(sp(repo.dir), 'VERSION'), 'utf8').trim();
   assert.equal(stamp, r.output.version);
-  assert.match(stamp, new RegExp(`^${base.replace(/\./g, '\\.')}\\+([0-9a-f]{7,}|unknown)$`));
+  assert.match(stamp, new RegExp(`^${base.replace(/\./g, '\\.')}\\+([0-9a-f]{7,}|unknown)(\\.[a-z]+)*$`));
 });
 
 test('vendor resolves the repo root from a subdirectory', async () => {
@@ -185,11 +187,13 @@ test('vendor pins the vendored files in .gitattributes (-text, shim eol=lf): app
   assert.deepEqual(again.output.gitattributes, []);
   assert.equal(readFileSync(join(repo.dir, '.gitattributes'), 'utf8'), text);
   // --check: no warning once pinned; a warning (not drift) when the entry is missing
-  assert.equal((await vendorInto(repo.dir, ['--check'])).output.warnings, undefined);
+  // (the stamp warning depends on the checkout running the tests, so only the .gitattributes warnings are counted here)
+  const attributeWarnings = (res) => (res.output.warnings ?? []).filter((w) => w.startsWith('.gitattributes lacks'));
+  assert.deepEqual(attributeWarnings(await vendorInto(repo.dir, ['--check'])), []);
   writeFileSync(join(repo.dir, '.gitattributes'), '*.png binary\n');
   const c = await vendorInto(repo.dir, ['--check']);
   assert.equal(c.exitCode, 0);
-  assert.match(c.output.warnings[0], /scripts\/pipeline\/\*\* -text/);
+  assert.match(attributeWarnings(c)[0], /scripts\/pipeline\/\*\* -text/);
 });
 
 test('vendor creates .gitattributes when the project has none', async () => {
@@ -204,4 +208,117 @@ test('the POSIX verify shim template is executable in git (mode 100755) and pinn
   assert.match(r.stdout, /^100755 /);
   assert.ok(statSync(join(root, 'pipeline', 'templates', 'scripts', 'verify')).mode & 0o111, 'executable on disk too');
   assert.match(readFileSync(join(root, '.gitattributes'), 'utf8'), /^pipeline\/templates\/scripts\/verify text eol=lf$/m);
+});
+
+// ---- identity of where vendor runs; --check stamp warnings; vendorDrift --------------------------------------------
+
+const base = readFileSync(join(root, 'VERSION'), 'utf8').trim();
+const vendorFrom = (pipelineDir, target, extra = []) => {
+  const r = spawnSync(process.execPath, [join(pipelineDir, 'bin', 'pipeline.mjs'), 'vendor', '--repo', target, ...extra], { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr + r.stdout);
+  return JSON.parse(r.stdout);
+};
+const stampOf = (dir) => readFileSync(join(sp(dir), 'VERSION'), 'utf8').trim();
+
+// A copy of this pipeline as its own git checkout, origin/main pointing at HEAD (so a clean one reads as published).
+function pipelineCheckout() {
+  const repo = createTmpRepo();
+  cpSync(join(root, 'pipeline'), join(repo.dir, 'pipeline'), { recursive: true });
+  cpSync(join(root, 'VERSION'), join(repo.dir, 'VERSION'));
+  const sha = repo.commit('pipeline');
+  repo.git(['update-ref', 'refs/remotes/origin/main', sha]);
+  return { repo, sha };
+}
+
+test('vendor from a clean published checkout stamps base+sha7 with no flag', () => {
+  const { repo, sha } = pipelineCheckout();
+  const target = createTmpRepo();
+  vendorFrom(join(repo.dir, 'pipeline'), target.dir);
+  assert.equal(stampOf(target.dir), `${base}+${sha.slice(0, 7)}`);
+});
+
+test('vendor from a checkout stamps .unverified when a vendored source is edited, or HEAD is not on origin/main', () => {
+  const { repo, sha } = pipelineCheckout();
+  const target = createTmpRepo();
+  writeFileSync(join(repo.dir, 'pipeline', 'lib', 'glob.mjs'), `${readFileSync(join(repo.dir, 'pipeline', 'lib', 'glob.mjs'), 'utf8')}\n// local edit\n`);
+  vendorFrom(join(repo.dir, 'pipeline'), target.dir);
+  assert.equal(stampOf(target.dir), `${base}+${sha.slice(0, 7)}.unverified`);
+
+  const { repo: local } = pipelineCheckout();
+  local.git(['update-ref', '-d', 'refs/remotes/origin/main']);
+  const target2 = createTmpRepo();
+  vendorFrom(join(local.dir, 'pipeline'), target2.dir);
+  assert.match(stampOf(target2.dir), /\.unverified$/);
+});
+
+test('vendor from an installed copy stamps the installed identity (.modified when the install was edited)', () => {
+  const home = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-vendor-home-')));
+  try {
+    cpSync(join(root, 'pipeline'), join(home, 'pipeline'), { recursive: true });
+    const files = {};
+    for (const rel of ['pipeline/lib/glob.mjs', 'pipeline/lib/yaml.mjs', 'pipeline/bin/pipeline.mjs']) files[rel] = sha256File(join(home, ...rel.split('/')));
+    const sourceSha = 'abcdef0123456789abcdef0123456789abcdef01';
+    writeFileSync(join(home, ...MANIFEST_REL.split('/')), JSON.stringify({ version: '7.7.7', sourceSha, complete: true, files }));
+    const target = createTmpRepo();
+    vendorFrom(join(home, 'pipeline'), target.dir);
+    assert.equal(stampOf(target.dir), '7.7.7+abcdef0');
+
+    writeFileSync(join(home, 'pipeline', 'lib', 'glob.mjs'), '// hand edit\n');
+    const target2 = createTmpRepo();
+    vendorFrom(join(home, 'pipeline'), target2.dir);
+    assert.equal(stampOf(target2.dir), '7.7.7+abcdef0.modified');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('vendor --check warns when the project stamp has no sha or carries .unverified/.modified/.incomplete; a clean stamp is quiet', async () => {
+  const repo = createTmpRepo();
+  await vendorInto(repo.dir);
+  const stampWarnings = async (stamp) => {
+    writeFileSync(join(sp(repo.dir), 'VERSION'), `${stamp}\n`);
+    const r = await vendorInto(repo.dir, ['--check']);
+    assert.equal(r.exitCode, 0, 'the warning never turns a byte-identical copy into drift');
+    return (r.output.warnings ?? []).filter((w) => w.startsWith('scripts/pipeline/VERSION'));
+  };
+  assert.deepEqual(await stampWarnings(`${base}+abcdef0`), []);
+  assert.match((await stampWarnings(`${base}+unknown`))[0], /no source sha/);
+  assert.match((await stampWarnings(`${base}+abcdef0.unverified`))[0], /\.unverified/);
+  assert.match((await stampWarnings(`${base}+abcdef0.modified`))[0], /\.modified/);
+  assert.match((await stampWarnings(`${base}+abcdef0.incomplete`))[0], /\.incomplete/);
+  assert.match((await stampWarnings(`${base}+unknown.unverified`))[0], /no source sha, \.unverified/);
+});
+
+test('vendor --check still compares bytes and the base version only: a different +sha is not drift', async () => {
+  const repo = createTmpRepo();
+  await vendorInto(repo.dir);
+  writeFileSync(join(sp(repo.dir), 'VERSION'), `${base}+1234567.modified\n`);
+  assert.equal((await vendorInto(repo.dir, ['--check'])).exitCode, 0);
+  writeFileSync(join(sp(repo.dir), 'VERSION'), `0.0.0-other+1234567\n`);
+  const r = await vendorInto(repo.dir, ['--check']);
+  assert.equal(r.exitCode, 1);
+  assert.match(r.output.drift[0].reason, /version 0\.0\.0-other != pipeline/);
+});
+
+test('vendorDrift(root): empty when identical, lists edited and missing files, ignores VERSION, needs no git', async () => {
+  const repo = createTmpRepo();
+  await vendorInto(repo.dir);
+  assert.deepEqual(vendorDrift(repo.dir), []);
+  writeFileSync(join(sp(repo.dir), 'VERSION'), `${base}+0000000.modified\n`);
+  assert.deepEqual(vendorDrift(repo.dir), [], 'only the commit differs: no content drift');
+  writeFileSync(join(sp(repo.dir), 'lib', 'glob.mjs'), '// drifted\n');
+  rmSync(join(sp(repo.dir), 'lib', 'yaml.mjs'));
+  assert.deepEqual(vendorDrift(repo.dir), [
+    { file: 'scripts/pipeline/lib/yaml.mjs', reason: 'missing' },
+    { file: 'scripts/pipeline/lib/glob.mjs', reason: 'differs' },
+  ]);
+  // a plain directory (no .git anywhere): every file is simply missing
+  const plain = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-vendor-plain-')));
+  try {
+    const d = vendorDrift(plain);
+    assert.equal(d.length, ENTRIES.length + LIBS.length + 1);
+    assert.ok(d.every((x) => x.reason === 'missing'));
+  } finally {
+    rmSync(plain, { recursive: true, force: true });
+  }
 });
