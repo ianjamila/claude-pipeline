@@ -110,6 +110,10 @@ export const revParse = (ref, o) => git(['rev-parse', '--verify', assertRef(ref,
 // format from this list. The size alone must not decide: a source file with one NUL byte is "binary" to git too, and
 // skipping it would hide its lines from every check. Matched on the extension (lower case) of every path of the change.
 export const LARGE_BINARY_BYTES = 4 * 1024 * 1024; // the larger blob of the change; diffFiles' option largeBinaryBytes overrides it (tests)
+// Many files each under that limit can still add up past proc.run's buffer. So the listed-format binary changes LEFT in the
+// text diff are also capped in total (bytes git could print for them: old blob + new blob each); beyond it the largest go
+// first. Option largeBinaryTotalBytes overrides it (tests).
+export const LARGE_BINARY_TOTAL_BYTES = 32 * 1024 * 1024;
 const BINARY_FORMAT_EXTENSIONS = new Set([
   'xls', 'xlsx', 'xlsm', 'xlsb', 'ods', 'numbers', 'pdf', 'doc', 'docx', 'ppt', 'pptx',
   'zip', '7z', 'rar', 'gz', 'tgz', 'bz2', 'xz', 'tar',
@@ -126,14 +130,16 @@ const isBinaryFormat = (p) => {
 // A change between plain files only: a symlink or submodule entry is never skipped, whatever it is called.
 const PLAIN_MODES = new Set(['000000', '100644', '100755']);
 
-// Which changes of mb..head to keep OUT of the --text diff, plus git's own order of every change (path -> position) so the
-// result can be put back in that order. Asks git, WITHOUT --text, which changes it calls binary (--numstat -z prints "-\t-"
+// Which changes of from..to to keep OUT of a text diff (--text, or --binary in contentHash / reviewPatch), plus git's own order
+// of every change (path -> position) so the result can be put back in that order. Asks git, WITHOUT --text, which changes it calls binary (--numstat -z prints "-\t-"
 // for them; a rename is "-\t-\t\0old\0new\0"), then keeps those that are big and in a listed document format. A byte-identical
-// move prints no content either way, so it is never skipped. Blob sizes come from one cat-file call. Anything unclear (a blob
+// move prints no content either way, so it is never skipped. Blob sizes come from one cat-file call. Entries come back as
+// rawChanges plus `size` (the larger blob) and `printed` (old + new blob, what the text diff would print for the change). Anything unclear (a blob
 // git cannot size) leaves the change in the diff: today's behaviour, never a hidden file.
-function largeBinaryChanges(mb, range, head, o) {
+function largeBinaryChanges(from, to, o) {
   const numstat = git([
-    ...STABLE_CONFIG, 'diff', '-M', '--numstat', '-z', '--no-color', '--no-ext-diff', '--no-textconv', range,
+    ...STABLE_CONFIG, 'diff', '-M', '--numstat', '-z', '--no-color', '--no-ext-diff', '--no-textconv',
+    `${from}..${assertRef(to, ['diff', to])}`,
   ], o).split('\0');
   const binary = new Set();
   for (let i = 0; i < numstat.length; ) {
@@ -150,7 +156,7 @@ function largeBinaryChanges(mb, range, head, o) {
   }
   if (binary.size === 0) return { skipped: [], order: new Map() };
 
-  const changes = rawChanges(mb, head, o);
+  const changes = rawChanges(from, to, o);
   const order = new Map(changes.map((c, i) => [c.newPath ?? c.oldPath, i]));
   const candidates = changes.filter((c) => binary.has(c.newPath ?? c.oldPath)
     && ['A', 'D', 'M', 'R'].includes(c.status) && PLAIN_MODES.has(c.oldMode) && PLAIN_MODES.has(c.newMode)
@@ -165,9 +171,26 @@ function largeBinaryChanges(mb, range, head, o) {
     if (m) sizes.set(m[1], Number(m[2]));
   }
   const limit = o?.largeBinaryBytes ?? LARGE_BINARY_BYTES;
-  const skipped = candidates.filter((c) => Math.max(sizes.get(c.oldId) ?? 0, sizes.get(c.newId) ?? 0) > limit);
+  const budget = o?.largeBinaryTotalBytes ?? LARGE_BINARY_TOTAL_BYTES;
+  const sized = candidates.map((c) => {
+    const [before, after] = [sizes.get(c.oldId) ?? 0, sizes.get(c.newId) ?? 0];
+    return { ...c, size: Math.max(before, after), printed: before + after };
+  });
+  const skipped = sized.filter((c) => c.size > limit);
+  // What is left may still add up to too much: take the largest out first (name order breaks ties) until it fits.
+  const rest = sized.filter((c) => c.size <= limit).sort((a, b) => b.printed - a.printed || ((a.newPath ?? a.oldPath) < (b.newPath ?? b.oldPath) ? -1 : 1));
+  let total = rest.reduce((n, c) => n + c.printed, 0);
+  for (const c of rest) {
+    if (total <= budget) break;
+    skipped.push(c);
+    total -= c.printed;
+  }
   return { skipped, order };
 }
+
+// Literal, repo-root pathspecs that leave the given changes (old and new path) out of a diff, as in contentHash: a name like
+// "a*.xlsx", or the cwd, cannot change what is excluded.
+const excludeSpecs = (changes) => changes.flatMap((c) => [c.oldPath, c.newPath]).filter(Boolean).map((p) => `:(top,exclude,literal)${p}`);
 
 // What the branch changes relative to where it forked: the diff is taken from the merge-base, not from `base`'s tip,
 // so commits that landed on base after the fork never show up as the branch deleting them.
@@ -183,9 +206,8 @@ function largeBinaryChanges(mb, range, head, o) {
 export function diffFiles(base, head, o) {
   const mb = mergeBase(base, head, o);
   const range = `${mb}..${assertRef(head, ['diff', head])}`;
-  const { skipped, order } = largeBinaryChanges(mb, range, head, o);
-  // Literal, repo-root pathspecs (as in contentHash): a name like "a*.xlsx", or the cwd, cannot change what is excluded.
-  const exclude = skipped.flatMap((c) => [c.oldPath, c.newPath]).filter(Boolean).map((p) => `:(top,exclude,literal)${p}`);
+  const { skipped, order } = largeBinaryChanges(mb, head, o);
+  const exclude = excludeSpecs(skipped);
   const text = git([
     ...STABLE_CONFIG, 'diff', '-M', '--unified=0', '--no-color', '--no-ext-diff', '--no-textconv', '--text', '--src-prefix=a/', '--dst-prefix=b/',
     range, ...(exclude.length > 0 ? ['--', ':/', ...exclude] : []),
@@ -204,13 +226,13 @@ export function diffFiles(base, head, o) {
   return files.sort((a, b) => rank(a) - rank(b));
 }
 
-// One entry per change of `git diff -M --raw -z --no-abbrev` for mb..head, with the SAME options as diffFiles.
+// One entry per change of `git diff -M --raw -z --no-abbrev` for from..to, with the SAME options as diffFiles.
 // -> [{ oldMode, newMode, oldId, newId, status, score, oldPath, newPath }] (a path is null on the side that does not exist;
 // score is a rename's similarity, null for the rest).
-function rawChanges(mb, head, o) {
+function rawChanges(from, to, o) {
   const text = git([
     ...STABLE_CONFIG, 'diff', '-M', '--raw', '-z', '--no-abbrev', '--no-color', '--no-ext-diff', '--no-textconv',
-    `${mb}..${assertRef(head, ['diff', head])}`,
+    `${from}..${assertRef(to, ['diff', to])}`,
   ], o);
   const parts = text.split('\0');
   const out = [];
@@ -305,16 +327,41 @@ function normaliseDiff(text) {
 //     text-looking file (proc.run decodes UTF-8) both go unnoticed.
 // No --text here, unlike diffFiles: --text turns binary files into raw bytes, which the UTF-8 decode would collapse
 // (0xFE and 0xFD both become U+FFFD), whereas --binary alone keeps NUL and `-diff` files byte-exact.
+// The one exception is a large binary document (see diffFiles): --binary would print its whole content again (base85, a
+// quarter bigger) and overflow the buffer, so it is left out of the diff and one line stands in for it, carrying the
+// status, both paths and both blob ids. A blob id IS a hash of the content, so the hash still moves whenever such a file's
+// bytes change. Without any such file the input is exactly the normalised diff, as before.
 // `exclude` paths (e.g. an agent log the pipeline itself appends to) are left out: each is a literal repo-root-relative
 // path (`:(top,exclude,literal)`), so `*.js` is not a glob and `docs/x.md` does not match `sub/docs/x.md`. Pathspecs
 // are anchored at the repo root so cwd cannot narrow what is hashed.
 export function contentHash(base, head, { exclude = [], ...o } = {}) {
   const mb = mergeBase(base, head, o);
+  const { skipped } = largeBinaryChanges(mb, head, o);
   const text = git([
     ...STABLE_CONFIG, 'diff', '--unified=3', '--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--src-prefix=a/', '--dst-prefix=b/',
-    `${mb}..${assertRef(head, ['diff', head])}`, '--', ':/', ...exclude.map((p) => `:(top,exclude,literal)${p}`),
+    `${mb}..${assertRef(head, ['diff', head])}`, '--', ':/', ...exclude.map((p) => `:(top,exclude,literal)${p}`), ...excludeSpecs(skipped),
   ], o);
-  return createHash('sha256').update(normaliseDiff(text)).digest('hex');
+  const diff = normaliseDiff(text);
+  const stoodIn = skipped.filter((c) => !exclude.includes(c.newPath ?? c.oldPath)); // an excluded path never counts
+  if (stoodIn.length === 0) return createHash('sha256').update(diff).digest('hex');
+  // One JSON array per change (a path may hold any character but NUL), sorted. The diff's length prefix and the NUL tag make
+  // this input impossible to mistake for a plain diff (those start with "diff --git"), whatever the diff contains.
+  const lines = stoodIn.map((c) => JSON.stringify([c.status, c.oldPath, c.newPath, c.oldId, c.newId])).sort();
+  return createHash('sha256').update(`large-binary\0${diff.length}\0${diff}\n${lines.join('\n')}\n`).digest('hex');
+}
+
+// The patch a review packet carries: `git diff --binary from..to`, minus the large binary documents (see diffFiles), which
+// would overflow the buffer; the caller names them in the packet instead. -> { patch, skipped: [{ status, oldPath, newPath,
+// size }] } (size = the larger blob, in bytes), sorted by path.
+export function reviewPatch(from, to, o) {
+  const { skipped } = largeBinaryChanges(from, to, o);
+  const patch = git([
+    'diff', '--binary', '--no-color', '--no-ext-diff', `${from}..${assertRef(to, ['diff', to])}`,
+    ...(skipped.length > 0 ? ['--', ':/', ...excludeSpecs(skipped)] : []),
+  ], o);
+  const names = skipped.map(({ status, oldPath, newPath, size }) => ({ status, oldPath, newPath, size }));
+  names.sort((a, b) => ((a.newPath ?? a.oldPath) < (b.newPath ?? b.oldPath) ? -1 : 1));
+  return { patch, skipped: names };
 }
 
 // `origin/<branch>` is what a PR will be merged into; a repo without that remote ref (a fresh clone of a local fixture,

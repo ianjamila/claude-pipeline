@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import {
   git, GitError, mergeBase, headSha, currentBranch, isClean, revParse, diffFiles, showFile, grepAtRef,
-  commitTime, contentHash, treeFingerprint,
+  commitTime, contentHash, treeFingerprint, reviewPatch,
 } from '../pipeline/lib/git.mjs';
 import { run } from '../pipeline/lib/proc.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
@@ -567,7 +567,7 @@ test('diffFiles: a deleted large binary document comes back path-only, flagged, 
   assert.equal(Object.hasOwn(asText, 'skippedLargeBinary'), false);
 });
 
-test('diffFiles: deleting binary documents bigger than the process buffer does not overflow it (no ENOBUFS)', () => {
+test('diffFiles, contentHash and reviewPatch: deleting binary documents bigger than the process buffer does not overflow it (no ENOBUFS)', () => {
   const { repo, o } = baseRepo();
   // 70 MiB > proc.run's 64 MiB buffer; random bytes so git cannot store them small, and the real default threshold applies.
   repo.write('exports/huge.xlsx', randomBytes(70 * 1024 * 1024));
@@ -581,6 +581,12 @@ test('diffFiles: deleting binary documents bigger than the process buffer does n
   assert.equal(by['exports/huge.xlsx'].status, 'D');
   assert.equal(by['exports/huge.xlsx'].skippedLargeBinary, true);
   assert.deepEqual(by['src/a.js'].added, [{ line: 2, text: 'TWO' }]);
+
+  // the other two diffs of the same range (the review hash and the review packet) use --binary, which is bigger still
+  assert.match(contentHash('main', 'feat', o), /^[0-9a-f]{64}$/);
+  const { patch, skipped } = reviewPatch('main', 'feat', o);
+  assert.deepEqual(skipped.map((s) => [s.status, s.oldPath, s.newPath, s.size]), [['D', 'exports/huge.xlsx', null, 70 * 1024 * 1024]]);
+  assert.ok(patch.length < 4000, `patch is ${patch.length} bytes`);
 });
 
 test('diffFiles: a small binary document is still diffed with --text, exactly as before', () => {
@@ -658,6 +664,109 @@ test('diffFiles: a renamed large binary keeps both paths; an identical one is un
   assert.equal(by['new/blob.dat'].oldPath, 'old/blob.xlsx');
   assert.equal(Object.hasOwn(by['new/blob.dat'], 'skippedLargeBinary'), false);
   assert.deepEqual(by['new/blob.dat'].added.map((l) => l.text), ['tail\0']);
+});
+
+test('diffFiles: binary documents that are each under the limit but add up past the total budget lose the largest first', () => {
+  const { repo, o } = baseRepo();
+  // exactly n bytes, with NULs, so git calls it binary (binaryish is only roughly sized)
+  const sized = (n, tag) => binaryish(n * 2, tag).subarray(0, n);
+  const KB = 1024;
+  repo.write('d/a.xlsx', sized(70 * KB, 'a'));
+  repo.write('d/b.xlsx', sized(70 * KB, 'b'));
+  repo.write('d/c.xlsx', sized(50 * KB, 'c1'));
+  repo.write('d/odd.dat', sized(500 * KB, 'o')); // not a listed format: never counted, never skipped
+  repo.write('d/note.js', 'a\nb\n');
+  repo.commit('add');
+  repo.branch('feat');
+  repo.rm('d/a.xlsx');
+  repo.rm('d/b.xlsx');
+  repo.write('d/c.xlsx', sized(50 * KB, 'c2')); // modified: git prints the old AND the new side, 100 KB
+  repo.write('d/odd.dat', sized(500 * KB, 'p'));
+  repo.write('d/note.js', 'a\nB\n');
+  repo.commit('change');
+
+  // 70 + 70 + (50 + 50) = 240 KB of printable bytes against a 200 KB budget: the modified sheet is the largest, so only it goes
+  const diff = (total) => Object.fromEntries(diffFiles('main', 'feat', { ...o, largeBinaryBytes: 100 * KB, largeBinaryTotalBytes: total }).map((f) => [f.path, f]));
+  const skippedIn = (files) => Object.keys(files).filter((p) => files[p].skippedLargeBinary);
+  const files = diff(200 * KB);
+  assert.deepEqual(skippedIn(files), ['d/c.xlsx']);
+  assert.equal(files['d/a.xlsx'].binary, false);
+  assert.ok(files['d/a.xlsx'].removed.length > 100);
+  assert.equal(Object.hasOwn(files['d/odd.dat'], 'skippedLargeBinary'), false);
+  assert.deepEqual(files['d/note.js'].added, [{ line: 2, text: 'B' }]);
+
+  // under a 100 KB budget two go (the modified 100, then one of the equal 70s, by path); a 240 KB budget fits them all
+  assert.deepEqual(skippedIn(diff(100 * KB)), ['d/a.xlsx', 'd/c.xlsx']);
+  assert.deepEqual(skippedIn(diff(240 * KB)), []);
+});
+
+// ---- contentHash and the review patch leave large binaries out too ------------------------------------------------
+
+// What contentHash returned BEFORE large binaries were skipped, for a fixture with no skipped file. Computed with the code at
+// 3f6ea0d; if this moves, every recorded review and gate would be invalidated by an upgrade.
+const GOLDEN_CONTENT_HASH = '59de38c66c062399ea2ff62b89a9a9e05e8d916c2bdcceb918e7e04105d5b21e';
+
+test('contentHash: a diff with no skipped large binary hashes exactly as it did before they were skipped', () => {
+  const { repo, o } = baseRepo();
+  repo.write('data/small.xlsx', 'PK\x03\x04 sheet\nrow 2\0 cell\n');
+  repo.write('img/logo.bin', Buffer.from([0, 1, 2, 0xfe, 0xfd, 0, 0xff]));
+  repo.commit('more base');
+  repo.branch('feat');
+  repo.write('src/a.js', 'one\nTWO\nthree\nfour\n');
+  repo.rm('data/small.xlsx');
+  repo.write('img/logo.bin', Buffer.from([0, 1, 2, 0xfd, 0xfe, 0, 0xff, 9]));
+  repo.git(['mv', 'src/keep.js', 'src/kept.js']);
+  repo.write('fresh.txt', 'new\n');
+  repo.commit('change');
+  assert.equal(contentHash('main', 'feat', o), GOLDEN_CONTENT_HASH);
+});
+
+test('contentHash: a skipped large binary still moves the hash when its bytes, status or path change, and only then', () => {
+  const { repo, o } = baseRepo();
+  const lo = { ...o, largeBinaryBytes: LOW };
+  const sheet = (tail) => Buffer.concat([binaryish(300 * 1024, 'a'), Buffer.from(tail)]);
+  repo.write('data/report.xlsx', sheet(''));
+  repo.commit('add sheet');
+  const variant = (name, change) => {
+    repo.checkout('main');
+    repo.branch(name);
+    change();
+    repo.commit(name);
+    return contentHash('main', name, lo);
+  };
+  const del = variant('del', () => repo.rm('data/report.xlsx'));
+  const edit1 = variant('edit1', () => repo.write('data/report.xlsx', sheet('1\0')));
+  const edit2 = variant('edit2', () => repo.write('data/report.xlsx', sheet('2\0')));
+  const moved = variant('moved', () => { repo.rm('data/report.xlsx'); repo.write('data/report-2.xlsx', sheet('1\0')); });
+  const alsoCode = variant('also-code', () => { repo.write('data/report.xlsx', sheet('1\0')); repo.write('src/a.js', 'one\nTWO\nthree\n'); });
+  assert.equal(new Set([del, edit1, edit2, moved, alsoCode]).size, 5, 'delete, two edits of equal size, a move and a code change all differ');
+  assert.equal(contentHash('main', 'edit1', lo), edit1, 'and the same change hashes the same again');
+  assert.match(edit1, /^[0-9a-f]{64}$/);
+  // an excluded path stands in for nothing
+  assert.equal(contentHash('main', 'edit1', { ...lo, exclude: ['data/report.xlsx'] }), contentHash('main', 'main', lo));
+});
+
+test('reviewPatch: leaves large binary documents out of the patch and reports them; with none it is exactly git diff --binary', () => {
+  const { repo, o } = baseRepo();
+  repo.write('data/report.xlsx', binaryish(300 * 1024));
+  repo.write('img/tiny.png', Buffer.from([0, 1, 2, 3]));
+  repo.commit('add');
+  repo.branch('feat');
+  repo.rm('data/report.xlsx');
+  repo.write('img/tiny.png', Buffer.from([0, 1, 2, 4]));
+  repo.write('src/a.js', 'one\nTWO\nthree\n');
+  repo.commit('change');
+
+  const { patch, skipped } = reviewPatch('main', 'feat', { ...o, largeBinaryBytes: LOW });
+  assert.deepEqual(skipped, [{ status: 'D', oldPath: 'data/report.xlsx', newPath: null, size: binaryish(300 * 1024).length }]);
+  assert.ok(patch.length < 4000, `patch is ${patch.length} bytes`);
+  assert.doesNotMatch(patch, /report\.xlsx/);
+  assert.match(patch, /\+TWO/);
+  assert.match(patch, /img\/tiny\.png/); // small binaries stay, as `git diff --binary` prints them
+
+  const plain = reviewPatch('main', 'feat', o);
+  assert.deepEqual(plain.skipped, []);
+  assert.equal(plain.patch, git(['diff', '--binary', '--no-color', '--no-ext-diff', 'main..feat'], o));
 });
 
 test('contentHash and treeFingerprint stay byte-exact for NUL and -diff files, even for invalid UTF-8 bytes', () => {
