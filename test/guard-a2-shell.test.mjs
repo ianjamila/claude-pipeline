@@ -538,3 +538,140 @@ test('S4b: a relative write to a protected name after a cd into an unknown direc
   // (a known directory keeps relative writes to ordinary and protected-looking names alike, as before)
   for (const c of ['cd sub && echo x > settings.json', 'D=sub; cd $D && cp ok.sh settings.json', 'cd ~ && echo x > notes.txt']) assert.equal(files(c, fs).decision, 'allow', c);
 });
+
+// ---- S4c: one SQL client model (psql, mysql, sqlite3) for the direct path, the variable-named path and the files they read -------------------------------------------
+
+const OK_SQL = { 'q.sql': "-- a comment\nselect 1;\ninsert into t values ('x');\n\\set ON_ERROR_STOP on\n\\timing\n\\x\n.mode csv\n.headers on\n" };
+const EVIL = (line) => ({ 'evil.sql': line, 'ok.sql': 'select 1;' });
+
+test('S4c: a client named by a variable is the same client (files, -c text, options)', () => {
+  const F = { 'x.sql': '\\! {BAD}\nselect 1;', 'm.sql': 'system {BAD}', 's.sql': '.shell {BAD}' };
+  for (const t of [
+    'Q=psql; $Q -f x.sql', 'Q=psql; $Q -qf x.sql', 'Q=psql; $Q --file=x.sql', 'Q=psql; $Q < x.sql', "Q=psql; $Q -c '\\! {BAD}'", "PSQL='psql -h localhost'; $PSQL -f x.sql", "PSQL='psql -h localhost'; $PSQL $DB -c '\\! {BAD}'",
+    'Q=mysql; $Q < m.sql', "Q=mysql; $Q -e 'system {BAD}'", "Q=sqlite3; $Q db '.shell {BAD}'", 'Q=sqlite3; $Q db -init s.sql', "Q=psql; $Q -o '|{BAD}'",
+  ]) sqlBoth(t, F, 'deny');
+  for (const t of ['Q=psql; $Q -f x.sql', "Q=psql; $Q -c '\\! {OK}'", 'Q=mysql; $Q < m.sql', "Q=sqlite3; $Q db '.shell {OK}'", "Q=psql; $Q -o '|{OK}'"]) sqlBoth(t, Object.fromEntries(Object.entries(F).map(([k, v]) => [k, v.replaceAll('{BAD}', '{OK}')])), 'allow');
+  for (const t of ['Q=psql; $Q -f q.sql', 'Q=psql; $Q $DB -q < q.sql', "Q=psql; $Q -c 'select 1'", 'Q=sqlite3; $Q db < q.sql', 'Q=mysql; $Q -e "select 1"']) sqlBoth(t, OK_SQL, 'allow');
+});
+
+test('S4c: includes are judged recursively (psql \\i \\ir, mysql source and \\., sqlite .read)', () => {
+  const F = { 'evil.sql': '\\! {BAD}', 'm.sql': 'system {BAD}', 's.sql': '.shell {BAD}', 'sub/inc.sql': '\\ir p.sql', 'sub/p.sql': '\\! {BAD}', 'sub/mi.sql': 'source p.sql' };
+  for (const t of [
+    "mysql -e 'source m.sql'", "mysql -e '\\. m.sql'", "psql -c '\\i evil.sql'", "sqlite3 db '.read s.sql'", 'sqlite3 db ".rea s.sql"', "psql <<'EOF'\n\\include evil.sql\nEOF", "mysql <<'EOF'\nsource m.sql\nEOF",
+    // (\ir is relative to the directory of the file being read: `psql -f sub/inc.sql` reads sub/p.sql)
+    'psql -f sub/inc.sql', 'psql < sub/inc.sql', 'Q=psql; $Q -f sub/inc.sql', 'cat sub/inc.sql | psql',
+  ]) sqlBoth(t, F, 'deny');
+  // (an include of a harmless file, and one of a missing file, run nothing)
+  sqlBoth("psql -c '\\i evil.sql'", { 'evil.sql': 'select 1;' }, 'allow');
+  sqlBoth("mysql -e 'source nowhere.sql'", {}, 'allow');
+});
+
+test('S4c: a meta-command outside the known-safe set is an unknown shell line (refused with guarded text around)', () => {
+  const F = {
+    'a.sql': '\\gfoo {BAD}', 'b.sql': '\\e {BAD}', 'c.sql': 'pager {BAD}', 'd.sql': '\\P {BAD}', 'e.sql': 'edit {BAD}', 'f.sql': '.load {BAD}', 'g.sql': '.sh {BAD}', 'h.sql': ".sys {BAD}", 'i.sql': '.o |{BAD}',
+    'j.sql': "select load_extension('{BAD}');", 'k.sql': "select edit('{BAD}');", 'l.sql': '\\setenv PAGER {BAD}', 'm.sql': '\\cd {BAD}', 'n.sql': '.excel {BAD}',
+  };
+  for (const [k, c] of Object.entries({ a: 'psql', b: 'psql', c: 'mysql', d: 'mysql', e: 'mysql', f: 'sqlite3', g: 'sqlite3', h: 'sqlite3', i: 'sqlite3', j: 'sqlite3', k: 'sqlite3', l: 'psql', m: 'psql', n: 'sqlite3' })) sqlBoth(`${c} < ${k}.sql`, F, 'deny');
+  // the same files with nothing guarded around, and the known-safe commands, are data
+  const calm = Object.fromEntries(Object.entries(F).map(([k, v]) => [k, v.replaceAll('{BAD}', 'ls')]));
+  for (const [k, c] of Object.entries({ a: 'psql', b: 'psql', c: 'mysql', f: 'sqlite3', n: 'sqlite3' })) sqlBoth(`${c} < ${k}.sql`, calm, 'allow');
+  for (const c of ['psql < q.sql', 'mysql < q.sql', 'sqlite3 db < q.sql', "psql <<'EOF'\n\\x\n\\timing\n\\set a 1\nselect 1;\nEOF", "sqlite3 db <<'EOF'\n.mode csv\n.headers on\nselect 1;\nEOF"]) sqlBoth(c, OK_SQL, 'allow');
+});
+
+test('S4c: the escape text is the rest of the line, unsplit; a stream spanning files is read joined', () => {
+  assert.equal(git("psql -c '\\! git push origin ma\\in'", fakeFs(GIT_ROOT, {}, DIRS)).decision, 'deny');
+  assert.equal(git('psql < w.sql', fakeFs(GIT_ROOT, { 'w.sql': '\\! git push origin ma\\in' }, DIRS)).decision, 'deny');
+  assert.equal(files('psql < w.sql', fakeFs(PROJ, { 'w.sql': '\\! echo x > ~/.cla\\ude/settings.json' }, DIRS)).decision, 'deny');
+  // (a backslash at the end of one file and `! cmd` at the start of the next is one `\\! cmd`)
+  sqlBoth('cat a.sql b.sql | psql', { 'a.sql': 'select 1 \\', 'b.sql': '! {BAD}' }, 'deny');
+  sqlBoth('cat a.sql b.sql | psql', { 'a.sql': 'select 1 \\', 'b.sql': '! {OK}' }, 'allow');
+});
+
+test('S4c: client options by allowlist (bundled short options, abbreviations, pagers and editors leave the client unmodelled)', () => {
+  const F = { 'x.sql': '\\! {BAD}', 'sx.sql': '.shell {BAD}', 'bad.sql': '{BAD}', 'ok.sql': 'select 1;' };
+  for (const t of [
+    'psql -Xf x.sql', 'psql -qXf x.sql', 'psql -f x.sql -d db', 'psql --fil=x.sql', 'psql --file x.sql', "psql --command='\\! {BAD}'", "psql -XqAtc '\\! {BAD}'", "psql --out='|{BAD}'", "mysql -u root -e 'system {BAD}'", "mysql --execute='system {BAD}'",
+    "mysql -uroot -pSECRET -e 'system {BAD}'", 'sqlite3 -batch db -init sx.sql', "sqlite3 -cmd '.shell {BAD}' db", "sqlite3 -csv db '.shell {BAD}'", "psql --fi='\\! {BAD}'",
+    // (outside the allowlist the client may be anything: its stdin is a script, a plain command line in it runs)
+    'PAGER=less psql < bad.sql', 'PSQL_PAGER=less psql < bad.sql', 'EDITOR=vi psql < bad.sql', 'PSQLRC=rc psql < bad.sql', 'psql -P pager=less < bad.sql', 'psql --pset=pager=less < bad.sql', 'psql -v PAGER=less < bad.sql',
+    'mysql --pager=less < bad.sql', 'mysql --init-command=x < bad.sql', 'psql --no-such-option < bad.sql', 'mysql -Q < bad.sql', 'Q=psql; $Q -P pager=less < bad.sql', 'Q=mysql; $Q --pager=less < bad.sql', 'Q=psql; $Q --weird < x.sql', 'psql --weird < x.sql', 'PAGER=less psql < x.sql', 'sqlite3 -weird db < sx.sql',
+  ]) sqlBoth(t, F, 'deny');
+  for (const t of ['psql -Xf ok.sql', 'psql -qAt < ok.sql', 'psql -h localhost -U u -d db < bad.sql', 'mysql -u root -pSECRET db < bad.sql', 'sqlite3 -csv db < bad.sql', 'Q=psql; $Q -q < bad.sql', 'psql -f ok.sql']) sqlBoth(t, F, 'allow');
+});
+
+test('S4c: rc files run before the input (judged like input; -X, -init and --no-defaults skip them)', () => {
+  const home = (name, text) => ({ ['/home/u/' + name]: text, 'ok.sql': 'select 1;' });
+  sqlBoth("psql -c 'select 1'", home('.psqlrc', '\\! {BAD}'), 'deny');
+  sqlBoth('psql -f ok.sql', home('.psqlrc', '\\! {BAD}'), 'deny');
+  sqlBoth("Q=psql; $Q -c 'select 1'", home('.psqlrc', '\\! {BAD}'), 'deny');
+  sqlBoth("psql -X -c 'select 1'", home('.psqlrc', '\\! {BAD}'), 'allow');
+  sqlBoth("psql --no-psqlrc -c 'select 1'", home('.psqlrc', '\\! {BAD}'), 'allow');
+  sqlBoth("psql -c 'select 1'", home('.psqlrc', '\\timing'), 'allow');
+  // (the version-suffixed psqlrc is found by listing the home directory)
+  assert.equal(git("psql -c 'select 1'", fakeFs(GIT_ROOT, { '/home/u/.psqlrc-16.1': '\\! ' + BAD_GIT }, [...DIRS, '/home/u'])).decision, 'deny');
+  assert.equal(files("psql -c 'select 1'", fakeFs(PROJ, { '/home/u/.psqlrc-16.1': '\\! ' + BAD_FILES }, [...DIRS, '/home/u'])).decision, 'deny');
+  sqlBoth("sqlite3 db 'select 1'", home('.sqliterc', '.shell {BAD}'), 'deny');
+  sqlBoth("sqlite3 -init ok.sql db 'select 1'", home('.sqliterc', '.shell {BAD}'), 'allow');
+  sqlBoth("mysql -e 'select 1'", home('.my.cnf', '[client]\npager = {BAD}'), 'deny');
+  sqlBoth("mysql --no-defaults -e 'select 1'", home('.my.cnf', '[client]\npager = {BAD}'), 'allow');
+  sqlBoth("mysql -e 'select 1'", home('.my.cnf', '[client]\nuser = root'), 'allow');
+  // (a variable that moves the rc files makes the client unmodelled)
+  for (const e of ['PGSYSCONFDIR=/x', 'XDG_CONFIG_HOME=/x', 'MYSQL_HOME=/x', 'HOME=/x', 'PGSERVICEFILE=/x']) sqlBoth(`${e} psql < bad.sql`, { 'bad.sql': '{BAD}' }, 'deny');
+});
+
+test('S4c: a client writes files without any escape (files-policy)', () => {
+  const P = '/home/u/.claude/settings.json';
+  const w = (c, file = 'w.sql', text = '') => files(c, fakeFs(PROJ, text ? { [file]: text } : {}, DIRS)).decision;
+  for (const [c, text] of [
+    ['psql < w.sql', `\\o ${P}\nselect 1;`], ['psql < w.sql', `select 1 \\g ${P}`], ['psql < w.sql', `\\w ${P}`], ['psql < w.sql', `\\s ${P}`], ['psql < w.sql', `\\copy t to '${P}'`], ['psql < w.sql', `\\gx ${P}`],
+    ['psql < w.sql', `\\lo_export 1 ${P}`], ['psql < w.sql', `\\out ${P}`], ['psql < w.sql', `\\set f ${P}\n\\o :f`], ['psql < w.sql', `\\set f ${P}\n\\i :f`], ['psql < w.sql', `\\set f ${P}\n\\g :'f'`],
+    ['sqlite3 db < w.sql', `.output ${P}`], ['sqlite3 db < w.sql', `.once ${P}`], ['sqlite3 db < w.sql', `.save ${P}`], ['sqlite3 db < w.sql', `.backup ${P}`], ['sqlite3 db < w.sql', `.log ${P}`], ['sqlite3 db < w.sql', `.open ${P}`],
+    ['sqlite3 db < w.sql', `attach '${P}' as d;`], ['sqlite3 db < w.sql', `vacuum into '${P}';`], ['sqlite3 db < w.sql', `select writefile('${P}', 'x');`], ['sqlite3 db < w.sql', `select writefile('${P.slice(0, 15)}' || '${P.slice(15)}', 'x');`],
+    ['sqlite3 db < w.sql', `attach ('${P}') as d;`], ['sqlite3 db < w.sql', `select writefile('/x' /* c */ || '${P}', 'x');`],
+    ['mysql < w.sql', `tee ${P}`], ['mysql < w.sql', `\\T ${P}`],
+    [`psql -o ${P} < w.sql`, 'select 1;'], [`psql -L ${P} < w.sql`, 'select 1;'], [`psql --output=${P} < w.sql`, 'select 1;'], [`psql --log-file ${P} < w.sql`, 'select 1;'], [`mysql --tee=${P} < w.sql`, 'select 1;'],
+    [`sqlite3 ${P} 'select 1'`, ''], [`sqlite3 db ".output ${P}"`, ''], [`sqlite3 db ".once ${P}"`, ''], [`psql -c '\\o ${P}'`, ''], [`Q=psql; $Q -o ${P} < w.sql`, 'select 1;'], [`Q=sqlite3; $Q ${P} 'select 1'`, ''],
+  ]) assert.equal(w(c, 'w.sql', text), 'deny', `${c} / ${text}`);
+  for (const [c, text] of [
+    ['psql < w.sql', '\\o out.txt\nselect 1;'], ['psql < w.sql', "\\copy t to 'out.csv' csv"], ['psql < w.sql', "\\copy t to stdout"], ['sqlite3 db < w.sql', '.output out.txt'], ['sqlite3 db < w.sql', "select writefile('out.bin', 'x');"],
+    ['psql -o out.txt < w.sql', 'select 1;'], ['mysql < w.sql', 'tee out.txt'], ['sqlite3 db.sqlite < w.sql', 'select 1;'], ['psql < w.sql', '\\o\nselect 1;'], ['psql < w.sql', '\\g\nselect 1;'], ['sqlite3 db < w.sql', '.output stdout'],
+  ]) assert.equal(w(c, 'w.sql', text), 'allow', `${c} / ${text}`);
+});
+
+test('S4c: the client\'s own writes are judged in every directory the command may run in (files-policy)', () => {
+  const fs = fakeFs(PROJ, { 'ok.sql': 'select 1;' }, [...DIRS, '/tmp', '/home/u/.claude']);
+  for (const cd of ['[ -n "$X" ] && cd /home/u/.claude', 'if [ -n "$X" ]; then cd /home/u/.claude; fi', 'cd /home/u/.claude', 'cd /tmp; cd /home/u/.claude', 'cd /tmp || cd /home/u/.claude', 'cd /home/u/.claude || cd /tmp', 'if [ -n "$X" ]; then cd /tmp; else cd /home/u/.claude; fi']) {
+    for (const c of ["psql -o settings.json -c 'select 1'", "sqlite3 db '.output settings.json'", 'Q=psql; $Q -o settings.json -c "select 1"']) assert.equal(files(`${cd}; ${c}`, fs).decision, 'deny', `${cd}; ${c}`);
+  }
+  assert.equal(files("cd sub; psql -o settings.json -c 'select 1'", fs).decision, 'allow');
+});
+
+test('S4c: \\g (options) is skipped before the target; sqlite SQL functions are read per statement, across lines', () => {
+  sqlBoth("psql <<'EOF'\nselect 1 \\g (format=csv) |{BAD}\nEOF", {}, 'deny');
+  sqlBoth("psql <<'EOF'\nselect 1 \\gx (expanded=on) |{BAD}\nEOF", {}, 'deny');
+  sqlBoth("psql <<'EOF'\nselect 1 \\g (format=csv {BAD}\nEOF", {}, 'deny'); // (unbalanced: the whole input is unknown)
+  sqlBoth("psql <<'EOF'\nselect 1 \\g (format=csv) |{OK}\nEOF", {}, 'allow');
+  const P = '/home/u/.claude/settings.json';
+  const w = (text) => files('psql < w.sql', fakeFs(PROJ, { 'w.sql': text }, DIRS)).decision;
+  assert.equal(w(`select 1 \\g (format=csv) ${P}`), 'deny');
+  assert.equal(w('select 1 \\g (format=csv) out.csv'), 'allow');
+  assert.equal(w('select 1 \\g (format=csv)'), 'allow');
+  const s = (text) => files('sqlite3 db < w.sql', fakeFs(PROJ, { 'w.sql': text }, DIRS)).decision;
+  assert.equal(s(`select writefile(\n'${P}',\n 'x');`), 'deny');
+  assert.equal(s(`select writefile( -- c\n'${P}'\n, 'x');`), 'deny');
+  assert.equal(s(`vacuum\ninto\n'${P}';`), 'deny');
+  assert.equal(s(`attach\n'${P}'\nas d;`), 'deny');
+  assert.equal(s(`select writefile(\n'/home/u/.cl' /* c */ ||\n'aude/settings.json', 'x');`), 'deny');
+  assert.equal(s("select writefile(\n'out.bin',\n 'x');"), 'allow');
+});
+
+// Why: a declared attribute (`declare -u D`, `typeset -L4 D`, -i, -n) stays with the name across later plain assignments (they are converted too).
+test('S4c: a declared attribute persists across later plain assignments (files-policy)', () => {
+  const fs = fakeFs(PROJ, { 'dyn.sh': 'F=$(pick)', 'ok.sh': 'echo ok' }, DIRS);
+  for (const c of [
+    'declare -l D; D=/home/u/.CLAUDE; echo x > $D/settings.json', 'declare -l D; D=/HOME/U/.CLAUDE; echo x > $D/settings.json', 'declare -l D; D=/home/u/.CLAUDE; cp ok.sh $D/settings.json',
+    'typeset -L4 B; B=/home/u/.claude; echo x > $B/settings.json', 'declare -i B; B=/home/u/.claude; echo x > $B/settings.json', 'declare -n B; B=ok; echo x > $B/settings.json',
+    'source dyn.sh; declare -l D; D=/home/u/.CLAUDE; echo x > $D/settings.json', 'declare -l D; D=/x; D=/home/u/.CLAUDE; echo x > $D/settings.json',
+  ]) assert.equal(files(c, fs).decision, 'deny', c);
+  for (const c of ['D=/home/u/.claude; echo x > $D/a.txt', 'declare -u D; D=build; echo x > $D/a.txt']) assert.equal(files(c, fs).decision, 'allow', c);
+});

@@ -10,6 +10,7 @@
 // A shell / source / eval fed script text from files (`bash < f.sh`, `cat f.sh | bash`, `eval "$(cat f.sh)"`) carries them in a
 // non-enumerable `feeds`; scriptFeedsOf turns it into script-file records for the callers.
 
+import { sqlShellEscapes, sqlFamilyOf, sqlClientPlan, SQL_CLIENT_NAMES, SQL_RC_MENTION } from './sql-clients.mjs';
 const MAX_COMMANDS = 500;
 const MAX_NEST = 200; // in-place nesting of $( ), ( ), <( ) before we give up on the line
 const MAX_WORK = 8_000_000; // total characters lexed across all recursive parses
@@ -596,7 +597,7 @@ function markStdin(cmd, interp, sql = false) {
   if (!cmd) return;
   Object.defineProperty(cmd, 'stdinShell', { value: true, enumerable: false, configurable: true });
   if (interp) Object.defineProperty(cmd, 'interpStdin', { value: true, enumerable: false, configurable: true });
-  if (sql) Object.defineProperty(cmd, 'sqlStdin', { value: true, enumerable: false, configurable: true });
+  if (sql) Object.defineProperty(cmd, 'sqlStdin', { value: sql, enumerable: false, configurable: true });
 }
 // Why: an interpreter given no script operand (`node`, `python3 -u`, `node -`) reads its program from stdin: `node < f.mjs` runs the file like `node f.mjs`
 function interpReadsStdin(argv) {
@@ -930,10 +931,10 @@ function streamsOf(seg, argv) {
 // a command that rewrites its input (sed, awk, base64, tr ...) may read; `raws` are the producers' command texts.
 // `interp`: the fed text is the program of an interpreter (`node < f.mjs`), not shell script text; 'sql': the input of psql / mysql / sqlite3 (only its shell escapes run).
 function addFeeds(cmd, st, interp = false) {
-  if (!cmd || (!st.files.length && !st.computed.length)) return;
-  if (!cmd.feeds) Object.defineProperty(cmd, 'feeds', { value: { files: [], groups: [], computed: [], raws: [], pat: [], unq: [], ops: [], unordered: false, interp: false, sql: false }, enumerable: false });
+  if (!cmd || (!st.files.length && !st.computed.length && !st.rcOnly)) return;
+  if (!cmd.feeds) Object.defineProperty(cmd, 'feeds', { value: { files: [], groups: [], computed: [], raws: [], pat: [], unq: [], ops: [], rc: [], unordered: false, interp: false, sql: false }, enumerable: false });
   if (st.unordered) cmd.feeds.unordered = true;
-  if (interp === 'sql') cmd.feeds.sql = true;
+  if (typeof interp === 'string') cmd.feeds.sql = interp;
   else if (interp) cmd.feeds.interp = true;
   cmd.feeds.pat.push(...st.pat);
   cmd.feeds.unq.push(...st.unq);
@@ -959,68 +960,67 @@ const opaqueFile = (w, globs) => (globs ? hasExpansion(w) : /[$`]/.test(w)) || B
 // returns without `$` / backtick / whitespace is that one file name and is decided on as such, anything else stays as written.
 // Why: a command whose name is a variable (`$PSQL $DB < q.sql`) may be a shell reading its script from stdin; when the caller knows the value and it is one of
 // these programs, the file is data for it. Not a shell, an interpreter or a wrapper that starts one (env, sudo, xargs ...): an unknown name stays a possible shell.
-const DATA_PROGRAMS = new Set(['psql', 'mysql', 'mariadb', 'sqlite3', 'pg_restore', 'jq', 'yq', 'grep', 'egrep', 'fgrep', 'rg', 'wc', 'sort', 'uniq', 'cut', 'tr', 'head', 'tail', 'cat', 'less', 'more', 'diff', 'cmp', 'column', 'md5sum', 'shasum', 'sha256sum', 'cksum', 'xxd', 'od', 'base64', 'nl', 'fold', 'paste', 'comm']);
+// (the SQL clients are not here: sql-clients.mjs models them, and one outside its option allowlist keeps its stdin as a feed)
+const DATA_PROGRAMS = new Set(['pg_restore', 'jq', 'yq', 'grep', 'egrep', 'fgrep', 'rg', 'wc', 'sort', 'uniq', 'cut', 'tr', 'head', 'tail', 'cat', 'less', 'more', 'diff', 'cmp', 'column', 'md5sum', 'shasum', 'sha256sum', 'cksum', 'xxd', 'od', 'base64', 'nl', 'fold', 'paste', 'comm']);
 export function isDataProgram(value) {
   if (typeof value !== 'string' || /[$`;&|<>()\\"'\n]/.test(value)) return false;
   const first = value.trim().split(/\s+/)[0] ?? '';
   return (!first.includes('/') || first.startsWith('/')) && DATA_PROGRAMS.has(base(first));
 }
-// Why: psql (`\!`, `\o |cmd`, `\g |cmd`, `\copy ... program 'cmd'`, backticks in a meta command), mysql (`\!`, `system`) and sqlite3 (`.shell`, `.system`,
-// `.output |cmd`, `.once |cmd`, `.read |cmd`) run shell commands that sit in the text they read; the rest of the input is data.
-const SQL_SHELL_PROGRAMS = new Set(['psql', 'pgcli', 'mysql', 'mariadb', 'mycli', 'sqlite3', 'usql']);
-export function isSqlShellProgram(value) {
-  if (typeof value !== 'string' || /[$`;&|<>()\\"'\n]/.test(value)) return false;
+// Why: psql / mysql / sqlite3 and their cousins run shell commands, write files and include other files from the text they read: see sql-clients.mjs (one model for
+// the direct path, the variable-named path and the files). A value that names one (`Q=psql`, `PSQL="psql -h x"`) is a client, not a shell.
+export const isSqlShellProgram = (value) => sqlFamilyValue(value) !== null;
+export { sqlShellEscapes };
+// the client family a resolved command value names (`psql -h localhost`), or null
+function sqlFamilyValue(value) {
+  if (typeof value !== 'string' || /[$`;&|<>()\\"'\n]/.test(value)) return null;
   const first = value.trim().split(/\s+/)[0] ?? '';
-  return (!first.includes('/') || first.startsWith('/')) && SQL_SHELL_PROGRAMS.has(base(first));
-}
-// The shell lines such an input holds (one string each). An included file is a line that feeds that file to the program: `\i f` -> `psql < f`.
-export function sqlShellEscapes(text) {
-  const out = [];
-  const t = String(text ?? '');
-  if (!/[\\.]|system/i.test(t)) return out;
-  const include = (prog, w) => {
-    const f = w.replace(/^(['"])(.*)\1$/, '$2');
-    return `${prog} < ${/^[\w.\/~+@%:,=-]+$/.test(f) ? f : '"$SQL_INCLUDE"'}`;
-  };
-  for (const line of t.split(/\r\n|\r|\n/)) {
-    let m;
-    if ((m = /\\!(.*)$/.exec(line))) out.push(m[1]);
-    if (/\\[A-Za-z]/.test(line)) {
-      if ((m = /\|(.*)$/.exec(line))) out.push(m[1]);
-      for (m of line.matchAll(/\bprogram\s+('[^']*'|"[^"]*"|\S+)/gi)) out.push(m[1].replace(/^(['"])(.*)\1$/, '$2'));
-      for (m of line.matchAll(/`([^`]*)`/g)) out.push(m[1]);
-      if ((m = /\\(?:i|ir|include|include_relative)\s+(\S+)/.exec(line))) out.push(include('psql', m[1]));
-    }
-    if ((m = /(?:^|;)\s*system\s+(.*)$/i.exec(line))) out.push(m[1]);
-    if ((m = /(?:^|;)\s*(?:source|\\\.)\s+([^\s;]+)/i.exec(line))) out.push(include('mysql', m[1]));
-    if (/^\s*\.\w/.test(line)) {
-      if ((m = /^\s*\.(?:shell|system)\s+(.*)$/i.exec(line))) out.push(m[1]);
-      else if ((m = /^\s*\.\w+\b[^\n]*?\|(.*)$/.exec(line))) out.push(m[1]);
-      if ((m = /^\s*\.read\s+(\S+)/i.exec(line)) && !m[1].startsWith('|')) out.push(include('sqlite3', m[1]));
-    }
-  }
-  return out.map((x) => x.trim()).filter(Boolean);
+  return !first.includes('/') || first.startsWith('/') ? sqlFamilyOf(base(first)) : null;
 }
 function mergeFeeds(a, b) {
   const out = { ...a, unordered: a.unordered || b.unordered, interp: a.interp || b.interp, sql: a.sql || b.sql };
-  for (const k of ['files', 'groups', 'computed', 'raws', 'pat', 'unq', 'ops']) out[k] = [...(a[k] ?? []), ...(b[k] ?? [])];
+  for (const k of ['files', 'groups', 'computed', 'raws', 'pat', 'unq', 'ops', 'rc']) out[k] = [...(a[k] ?? []), ...(b[k] ?? [])];
   return out;
 }
 
 export function scriptFeedsOf(cmd, line = cmd?.raw, resolve = null) {
   let raw0 = cmd?.feeds;
   let extra = [];
-  if (cmd?.headStdin) {
-    const prog = typeof resolve === 'function' ? resolve(cmd.argv?.[0] ?? '') : null;
-    // (the stdin of a command named by a variable: a known data program leaves it out; psql / mysql / sqlite3 run only the shell escapes in it)
-    if (isSqlShellProgram(prog) && cmd.headStdinSql) extra = feedRecords(cmd, line, resolve, cmd.headStdinSql);
-    else if (!isDataProgram(prog)) raw0 = raw0 ? mergeFeeds(raw0, cmd.headStdin) : cmd.headStdin;
+  if (cmd?.headDyn && typeof resolve === 'function') {
+    // Why: a command named by a variable may be a shell reading its script from stdin; when its value is a database client it is modelled like the same client named
+    // directly (sql-clients.mjs): its stdin and files are SQL input, its options and text are judged, and anything outside the allowlist leaves it a possible shell.
+    const prog = resolve(cmd.argv?.[0] ?? '');
+    const fam = sqlFamilyValue(prog);
+    const plan = fam ? sqlClientPlan(fam, [...prog.trim().split(/\s+/).slice(1), ...cmd.argv.slice(1)], cmd.env ?? {}, resolve) : null;
+    if (plan?.modelled) {
+      if (cmd.headStdinSql) extra.push(...feedRecords(cmd, line, resolve, { ...cmd.headStdinSql, sql: fam }));
+      if (plan.lines.length) extra.push({ kind: 'sqllines', file: 'the SQL text', lines: plan.lines });
+      for (const f of plan.files) extra.push({ kind: 'sql', family: fam, file: f });
+      extra.push(...rcRecords(plan.rc, line));
+    } else {
+      if (cmd.headStdin && (plan || !isDataProgram(prog))) raw0 = raw0 ? mergeFeeds(raw0, cmd.headStdin) : cmd.headStdin;
+      if (plan && cmd.headStdinSql) extra.push(...feedRecords(cmd, line, resolve, { ...cmd.headStdinSql, sql: 'any' }));
+      if (plan) {
+        if (plan.lines.length) extra.push({ kind: 'sqllines', file: 'the SQL text', lines: plan.lines });
+        for (const f of plan.files) extra.push({ kind: 'sql', family: 'any', file: f });
+        extra.push(...rcRecords(plan.rc, line));
+      }
+    }
+  } else if (cmd?.headStdin) {
+    raw0 = raw0 ? mergeFeeds(raw0, cmd.headStdin) : cmd.headStdin;
   }
   return [...feedRecords(cmd, line, resolve, raw0), ...extra];
+}
+// The rc files a client reads before its input; a line that also names one (so may write it) leaves it unknown (a name only known at run time).
+function rcRecords(rc, line) {
+  return (rc ?? []).flatMap((r) => [{ kind: 'sql', family: r.family, file: r.file, rc: true, ...(r.glob ? { ambiguous: true, words: [r.file] } : {}) }, ...(SQL_RC_MENTION.test(String(line)) ? [{ kind: 'sql', family: r.family, file: '$SQL_RC_UNKNOWN', rc: true }] : [])]);
 }
 
 function feedRecords(cmd, line, resolve, raw0) {
   if (!raw0) return [];
+  return [...feedRecords1(cmd, line, resolve, raw0), ...rcRecords(raw0.rc, line)];
+}
+function feedRecords1(cmd, line, resolve, raw0) {
   const R = (w) => {
     if (typeof resolve !== 'function' || !w.includes('$')) return w;
     const e = resolve(w);
@@ -1065,7 +1065,9 @@ function feedRecords(cmd, line, resolve, raw0) {
   const words = f.computed.filter((w) => !hasExpansion(w));
   if (words.length >= 2) out.push({ kind: 'scan', file: words.join(' '), joined: words });
   if (raw0.interp) for (const r of out) if (r.kind === 'shell') r.kind = 'interp';
-  if (raw0.sql) for (const r of out) if (r.kind === 'shell') r.kind = 'sql';
+  if (raw0.sql) for (const r of out) if (r.kind === 'shell') { r.kind = 'sql'; r.family = raw0.sql; }
+  // a client outside the option allowlist may be a shell: its input is judged as a script too
+  if (raw0.both) out.push(...out.filter((r) => r.kind === 'sql').map((r) => ({ ...r, kind: 'shell', family: undefined })));
   return out;
 }
 
@@ -1927,6 +1929,7 @@ class Parser {
     if (cmd && !isExec) Object.defineProperty(cmd, 'streams', { value: () => streamsOf(seg, a), enumerable: false });
     if (fan && cmd && !isExec) this.fanOut(seg, fan, a, cmd);
     if (headDyn && cmd) {
+      Object.defineProperty(cmd, 'headDyn', { value: true, enumerable: false });
       const hv = newSt();
       varFeedsInto(seg, a[0], hv); // `X=$(cat f.sh); $X`
       if (hv.dyn) this.ctx.dynamic = true;
@@ -1949,7 +1952,8 @@ class Parser {
         addFeeds(held, st);
         if (held.feeds) Object.defineProperty(cmd, 'headStdin', { value: held.feeds, enumerable: false });
         const heldSql = {};
-        addFeeds(heldSql, sqlSt, 'sql');
+        addFeeds(heldSql, sqlSt, 'any');
+        Object.defineProperty(cmd, 'headDyn', { value: true, enumerable: false });
         if (heldSql.feeds) Object.defineProperty(cmd, 'headStdinSql', { value: heldSql.feeds, enumerable: false });
       } finally { this.cmd = saved; }
       // `$(cat f.sh)` as the command: the shell runs whatever the substitution prints
@@ -2010,7 +2014,7 @@ class Parser {
     merged.computed = [...new Set(merged.computed)].filter((w) => !w.startsWith('>(') && !merged.files.includes(w));
     for (const t of targets) {
       if (merged.dyn || (src.unknown && !merged.files.length && !merged.computed.length)) this.ctx.dynamic = true;
-      addFeeds(t.cmd, merged, t.cmd.sqlStdin ? 'sql' : !!t.cmd.interpStdin);
+      addFeeds(t.cmd, merged, t.cmd.sqlStdin || !!t.cmd.interpStdin);
     }
   }
 
@@ -2022,25 +2026,31 @@ class Parser {
     addFeeds(this.cmd, src.st, true);
   }
 
-  // `psql < q.sql`, `cat q.sql | sqlite3 db`, `mysql -e '\! cmd'`, `psql -f q.sql`: the shell escapes in the text a database client reads run like a script line.
-  // The files it reads are judged for those escapes only; a text only known at run time (`pg_dump | psql`) is a dynamic feed, refused with guarded text around.
+  // `psql < q.sql`, `cat q.sql | sqlite3 db`, `mysql -e '\! cmd'`, `psql -f q.sql`: the shell commands, writes and includes in the text a database client reads run like a script
+  // line (sql-clients.mjs holds the model, shared with a client named by a variable). The files it reads are judged for those only; a text only known at run time
+  // (`pg_dump | psql`) is a dynamic feed, refused with guarded text around. Outside the option allowlist the client may be anything: its stdin is a script.
   runSql(seg, argv, depth) {
+    const fam = sqlFamilyOf(base(argv[0]));
+    const plan = sqlClientPlan(fam, argv.slice(1), this.cmd?.env ?? {});
     const src = stdinSource(seg);
-    markStdin(this.cmd, false, true);
-    for (const text of src.texts) { const e = sqlShellEscapes(text); if (e.length) this.subParse(e.join('\n'), depth); }
-    const st = src.st;
-    for (let k = 1; k < argv.length; k++) {
-      const w = argv[k];
-      const e = sqlShellEscapes(w);
+    markStdin(this.cmd, false, plan.modelled ? fam : false);
+    for (const text of src.texts) {
+      if (!plan.modelled) this.subParse(text, depth);
+      const e = sqlShellEscapes(text, { family: plan.modelled ? fam : 'any' });
       if (e.length) this.subParse(e.join('\n'), depth);
-      let f = null;
-      if (/^(?:-f|--file|-init|--init)$/.test(w)) f = argv[k + 1] ?? null;
-      else if (/^--(?:file|init)=/.test(w)) f = w.slice(w.indexOf('=') + 1);
-      else if (/^-f./.test(w)) f = w.slice(2);
-      if (f !== null) { st.files.push(f); st.groups.push([f]); }
     }
+    if (plan.lines.length) this.subParse(plan.lines.join('\n'), depth);
+    const st = src.st;
+    for (const f of plan.files) { st.files.push(f); st.groups.push([f]); }
     if (st.dyn || (src.unknown && !st.files.length && !st.computed.length)) this.ctx.dynamic = true;
-    addFeeds(this.cmd, st, 'sql');
+    addFeeds(this.cmd, st, plan.modelled ? fam : 'any');
+    if (!plan.modelled && this.cmd?.feeds) this.cmd.feeds.both = true;
+    // (the rc files it reads first: recorded even with no input at all)
+    if (plan.rc.length && this.cmd) {
+      if (!this.cmd.feeds) addFeeds(this.cmd, { ...newSt(), rcOnly: true }, plan.modelled ? fam : false);
+      if (this.cmd.feeds && plan.modelled && !this.cmd.feeds.sql) this.cmd.feeds.sql = fam;
+      this.cmd.feeds.rc.push(...plan.rc);
+    }
   }
 
   // `bash /dev/fd/3`, `source /dev/fd/3`: the script is whatever the descriptor was opened from
@@ -2173,7 +2183,7 @@ class Parser {
       if (hasExpansion(op) || op.startsWith('-')) this.maybeProcessSubs(seg, argv, depth, isProcSub(op) ? op : undefined);
     } else if (INTERPRETER.test(name) && interpReadsStdin(argv)) {
       this.runInterpStdin(seg);
-    } else if (SQL_SHELL_PROGRAMS.has(name)) {
+    } else if (SQL_CLIENT_NAMES.has(name)) {
       this.runSql(seg, argv, depth);
     } else if (name === 'eval') {
       if (argv.length > 1) this.runScript(seg, argv.slice(1), argv.slice(1).join(' '), depth);

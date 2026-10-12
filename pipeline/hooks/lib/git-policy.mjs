@@ -836,6 +836,7 @@ const isNodeModulesOrPipelineHome = (p) => /[\\/]node_modules[\\/]/.test(p) || /
 // unknown); one that does not exist runs nothing. Programs run by path and interpreter files are only scanned when
 // readable (a binary, a huge generated file or a package under node_modules is not ours to judge).
 function checkScriptFile(sf, dir, ctx, level) {
+  if (sf.kind === 'sqllines') return judgeSqlEscapes(sf.lines, sf, dir, ctx, level);
   if (sf.joined) return checkJoinedScripts(sf, dir, ctx, level);
   if (sf.ambiguous) return checkCandidateScripts(sf, dir, ctx, level);
   // a candidate is a final path (a glob match, or a word already expanded): the shell never expands it a second time
@@ -843,7 +844,7 @@ function checkScriptFile(sf, dir, ctx, level) {
   if (!sf.candidate && /^\$\{?HOME\}?(?=\/|$)/.test(file)) return checkScriptFile({ ...sf, file: ctx.home + file.replace(/^\$\{?HOME\}?/, '') }, dir, ctx, level);
   if (!sf.candidate && DYNAMIC.test(file)) {
     // quoting is lost (`'x$y.sh'` reads as `x$y.sh`): if the word as written is a file, judge it before the textual rule
-    const lit = checkScriptFile({ kind: sf.kind, file: sf.file, candidate: true }, dir, ctx, level);
+    const lit = checkScriptFile({ kind: sf.kind, family: sf.family, file: sf.file, candidate: true }, dir, ctx, level);
     if (lit) return lit;
     return sf.kind !== 'exec' && GUARDED_WORDS.test(ctx.fullText)
       ? deny(`the script "${sf.file}" is named at run time and the line mentions a guarded operation, so what it runs cannot be verified. Name the file.`)
@@ -885,7 +886,7 @@ function judgeScriptText(text, sf, abs, dir, ctx, level) {
   // text a command rewrites on its way to a shell (sed, awk, base64 ...) is computed at run time: a file holding a guarded word is refused
   if (sf.kind === 'scan') return GUARDED_WORDS.test(text) ? deny(`${sf.file} is read by a command that feeds a shell, and mentions a guarded operation, so what the shell runs cannot be verified. Write the command out literally.`) : null;
   // Why: psql / mysql / sqlite3 run only the shell escapes in their input (\! , \g |cmd, .shell ...): those lines are judged like a script
-  if (sf.kind === 'sql') return judgeSqlEscapes(sqlShellEscapes(text), sf, dir, ctx, level);
+  if (sf.kind === 'sql') return judgeSqlEscapes(sqlShellEscapes(text, { family: sf.family, sources: [abs] }), sf, dir, ctx, level);
   let kind = sf.kind;
   if (kind === 'exec') {
     if (text.slice(0, 4096).includes('\u0000')) return null; // a binary
@@ -921,6 +922,7 @@ function judgeSqlEscapes(escapes, sf, dir, ctx, level) {
 // prints from them (in an order we do not know): refused when a guarded word is in the joined text, read in either order.
 function checkJoinedScripts(sf, dir, ctx, level) {
   const texts = [];
+  const srcs = [];
   for (const w of sf.joined) {
     const home = w === '~' || w.startsWith('~/') ? ctx.home + w.slice(1) : w;
     if (dir === null && sf.kind !== 'scan' && !path.isAbsolute(home)) return deny(`cannot tell which directory this runs in, so which ${w} runs cannot be verified. Use an absolute path, or chain the cd with &&.`);
@@ -937,6 +939,7 @@ function checkJoinedScripts(sf, dir, ctx, level) {
     }
     countScript(ctx.budget);
     texts.push(text);
+    srcs.push(abs);
   }
   if (!texts.length) return null;
   if (sf.kind === 'scan') {
@@ -949,7 +952,8 @@ function checkJoinedScripts(sf, dir, ctx, level) {
     const why = guardedCommandText(texts.join(''));
     return why ? deny(`the programs ${sf.file} (fed to an interpreter together) contain a guarded command (${why}); it cannot be verified by the guard. Run the operation directly.`) : null;
   }
-  if (sf.kind === 'sql') return judgeSqlEscapes(texts.flatMap(sqlShellEscapes), sf, dir, ctx, level);
+  // Why: the client reads the files as ONE stream (a meta-command can start in one and end in the next), so the escapes are read from the joined text
+  if (sf.kind === 'sql') return judgeSqlEscapes(sqlShellEscapes(texts.join(''), { family: sf.family, sources: srcs }), sf, dir, ctx, level);
   if (level >= MAX_NESTING) return deny(`the scripts ${sf.file} are nested too deeply (scripts running scripts) to verify.`);
   const v = judgeScoped(texts.join(''), dir, ctx, level, sf);
   return v.decision === 'deny' ? deny(`the scripts ${sf.file} would run a blocked command: ${v.reason}`) : null;
@@ -1265,7 +1269,7 @@ function checkCandidateScripts(sf, dir, ctx, level) {
     return deny('which word is the script this command runs is only known at run time ($VAR / $(...) / a glob) and the line mentions a guarded operation, so it cannot be verified. Name the file and write the options literally.');
   }
   for (const file of c.files) {
-    const v = checkScriptFile({ kind: sf.kind, file, candidate: true, sourced: sf.sourced }, dir, ctx, level);
+    const v = checkScriptFile({ kind: sf.kind, family: sf.family, file, candidate: true, sourced: sf.sourced }, dir, ctx, level);
     if (v) return v;
   }
   return null;

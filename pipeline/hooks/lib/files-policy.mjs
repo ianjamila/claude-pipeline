@@ -818,6 +818,7 @@ function collectVars(cmds, ctx) {
   }
   ctx.keptVars = kept;
   ctx.unknownVars = unknown;
+  ctx.declared = { transform: attrs, unknown: new Set(unknown) }; // (attributes stay with the name: a later plain assignment does not clear them)
   return vars;
 }
 
@@ -1049,6 +1050,7 @@ const WRITE_HINT = /write|append|unlink|\brm\b|rmSync|rmdir|rename|copy|\bcp\b|\
 // program run by path, an interpreter file that cannot be read, a node_modules package and the pipeline's own
 // installed files are not judged (the installed CLI legitimately names its own settings).
 function judgeScriptFile(sf, dirs, ctx, opts, scanRaw = '', keepBackslash = false) {
+  if (sf.kind === 'sqllines') return judgeSqlLines(sf, dirs, ctx, opts);
   if (sf.joined) return judgeJoinedScripts(sf, dirs, ctx, opts);
   if (sf.ambiguous) return judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw);
   // expandRefs turns \ into / (Windows paths), but off Windows a backslash is part of the file name: judge that reading too
@@ -1060,7 +1062,7 @@ function judgeScriptFile(sf, dirs, ctx, opts, scanRaw = '', keepBackslash = fals
   const e = sf.candidate ? (keepBackslash ? sf.file : toPosix(sf.file)) : keepBackslash ? expandKeepingBackslash(sf.file, ctx) : expandRefs(sf.file, ctx);
   if (!sf.candidate && /[$`]/.test(e)) {
     // named at run time: the textual rules on the whole line still apply. Quoting is lost (`'x$y.sh'` reads as `x$y.sh`), so the word as written is judged too if it is a file
-    return keepBackslash ? null : judgeScriptFile({ kind: sf.kind, file: sf.file, candidate: true }, dirs, ctx, opts);
+    return keepBackslash ? null : judgeScriptFile({ kind: sf.kind, family: sf.family, file: sf.file, candidate: true }, dirs, ctx, opts);
   }
   // every directory the command may run in (the cwd and each `cd` target) that holds the file: any of them may be the one that runs
   const seen = new Set();
@@ -1133,11 +1135,23 @@ function judgeJoinedScripts(sf, dirs, ctx, opts) {
         if (r) return r;
         continue;
       }
-      const joinedText = sf.kind === 'sql' ? texts.flatMap(sqlShellEscapes).join('\n') : texts.join('');
+      // (a database client reads the files as ONE stream: the escapes are read from the joined text)
+      const joinedText = sf.kind === 'sql' ? sqlShellEscapes(texts.join(''), { family: sf.family, sources: abss }).join('\n') : texts.join('');
       if (!joinedText) continue;
       const r = evaluateBashForFiles(joinedText, { ...opts, cwd: d || ctx.cwd, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup });
       if (r.decision === 'deny') return deny(`the scripts ${sf.file} would run: ${r.reason}`);
     }
+  }
+  return null;
+}
+
+// Shell lines a database client's options or SQL text run (`-c '\! cmd'`, `-o '|cmd'`, a write): judged like a script of those lines.
+function judgeSqlLines(sf, dirs, ctx, opts) {
+  if (!sf.lines.length) return null;
+  // (every directory the command may run in: a relative write target lands in any of them)
+  for (const d of new Set(dirs.length ? dirs : [""])) {
+    const r = evaluateBashForFiles(sf.lines.join("\n"), { ...opts, cwd: d || ctx.cwd, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup });
+    if (r.decision === "deny") return deny(`the SQL client's input would run: ${r.reason}`);
   }
   return null;
 }
@@ -1173,7 +1187,7 @@ function judgeScriptText(text, sf, abs, dir, ctx, opts) {
   }
   // Why: psql / mysql / sqlite3 run only the shell escapes in their input (\! , \g |cmd, .shell ...): those lines are judged like a script
   if (sf.kind === 'sql') {
-    const esc = sqlShellEscapes(text).join('\n');
+    const esc = sqlShellEscapes(text, { family: sf.family, sources: [abs] }).join('\n');
     if (!esc) return null;
     const r = evaluateBashForFiles(esc, { ...opts, cwd: dir, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup });
     return r.decision === 'deny' ? deny(`the input ${sf.file} would run: ${r.reason}`) : null;
@@ -1286,7 +1300,7 @@ function judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw) {
   if (sf.words?.some((w) => [...w.matchAll(/\$\{?(\w+)/g)].some((m) => ctx.unknownVars.has(m[1]) || ctx.pickUnknown.has(m[1]) || (ctx.unknownAll && !Object.hasOwn(ctx.vars, m[1]))))) return deny('the script is picked by a variable whose value is known only at run time (set to a run-time value, with a width or integer attribute, or by a sourced file that cannot be followed), so it cannot be checked; name the script file');
   if (c.dynamic && makeMatchers(ctx).rawHit(scanRaw, dirs)) return deny('which word is the script this command runs is only known at run time ($VAR / $(...) / a glob) and the line refers to a protected pipeline file; name the file and write the options literally');
   for (const file of c.files) {
-    const v = judgeScriptFile({ kind: sf.kind, file, candidate: true }, dirs, ctx, opts);
+    const v = judgeScriptFile({ kind: sf.kind, family: sf.family, file, candidate: true }, dirs, ctx, opts);
     if (v) return v;
   }
   return null;
@@ -1643,7 +1657,7 @@ function evaluateBashForFilesFrame(command, opts) {
     for (const [idx, c] of cmds.entries()) {
       frame.i = idx;
       if (!c.argv.length && (ctx.unknownVars.size || ctx.pickUnknown.size || ctx.srcTouched.size) && c.sep !== '&&' && c.sep !== '||' && c.depth === 0 && !inFlow(flowStart(cmds), idx)) {
-        for (const k of Object.keys(c.env ?? {})) if ((ctx.unknownVars.has(k) || ctx.pickUnknown.has(k) || ctx.srcTouched.has(k)) && !/[$`]/.test(c.env[k])) { ctx.unknownVars.delete(k); ctx.pickUnknown.delete(k); ctx.srcChanged.delete(k); ctx.vars[k] = expandRefs(c.env[k], ctx); }
+        for (const k of Object.keys(c.env ?? {})) if ((ctx.unknownVars.has(k) || ctx.pickUnknown.has(k) || ctx.srcTouched.has(k)) && !/[$`]/.test(c.env[k]) && !ctx.declared?.unknown.has(k)) { ctx.unknownVars.delete(k); ctx.pickUnknown.delete(k); ctx.srcChanged.delete(k); ctx.vars[k] = applyTransform(expandRefs(c.env[k], ctx), ctx.declared?.transform.get(k) ?? null); }
       }
       const sf = scriptFileOf(c.argv, c.raw, raw);
       const withPath = (rec) => { if (rec.words?.some(isEqualsWord)) rec.pathValues = pathValuesOf(c, cmds, { env: startupEnv, inherited: inheritedStartup }); return rec; }; // (zsh `=tool`: the PATH directories to look in)
