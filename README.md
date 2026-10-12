@@ -126,8 +126,10 @@ Three things tell you where an install stands:
   | `… have diverged, so it cannot be told which is newer` | `update` moves you to `main` |
   | `WARNING: this repo's scripts/pipeline (…) is NEWER than your installed pipeline` | the repo's CI rules are newer than your local CLI, so local checks may pass what CI rejects: `update` before relying on it |
   | `this repo's scripts/pipeline is out of date … a pipeline vendor PR is owed` | run `pipeline vendor` in that repo and open the PR |
-  | `could not check claude-pipeline main (…); your install is <stamp>` | informational: you are offline or GitHub is unreachable, so there is no comparison this session; a machine that is offline sees only this one line |
+  | `could not check claude-pipeline main (<reason>); your install is <stamp>` | informational (the reason is one of `timed out`, `rate limited`, `not found`, `gh unavailable`, `network error`, `unexpected response`, never the raw error text): you are offline or GitHub is unreachable, so there is no comparison this session; a machine that is offline sees only this one line |
+  | `this repo's scripts/pipeline/VERSION is not a version stamp` / `… carries an unrecognised stamp` | informational: the repo's `VERSION` is missing a stamp's shape, is not a plain regular file (a symlink, FIFO, …), or has parts outside the known set; its text is never echoed because the repo is untrusted |
   | `pipeline version check incomplete (timed out)` | informational: the 4-second budget ran out with nothing else to say |
+  Everything read from the session's repo is treated as hostile: `VERSION` is read as a plain regular file (no symlinks, at most 256 bytes), the vendored-file comparison skips symlinks and special files, caps each file at 2 MB and stops at the deadline, and no repo or `gh` text is repeated in a message.
   The hook always exits 0 and is never started through the fail-closed loader: a failing version
   check cannot block a session.
 - **`pipeline update --check`** gives the same comparison on demand, with exit codes (see above).

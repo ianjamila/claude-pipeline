@@ -10,6 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { installedIdentity, parseStamp, stampIsTrusted, gitIn } from './identity.mjs';
 import { mainSha, compare } from './upstream.mjs';
+import { readRegularFile, realpathInside } from './safe-read.mjs';
 
 export const DEADLINE_MS = 4000;
 export const MAIN_TTL_MS = 15 * 60 * 1000;
@@ -18,8 +19,32 @@ export const TIMEOUT_LINE = 'pipeline version check incomplete (timed out)';
 
 const OWN_TERMINAL = `run \`${UPDATE_COMMAND}\` in your own terminal`;
 const short = (sha) => String(sha ?? '').slice(0, 7);
-const firstLine = (text) => String(text ?? '').trim().split(/\r?\n/)[0].slice(0, 160);
 const isTimeout = (r) => Boolean(r && (r.timedOut || /timed out/i.test(String(r.reason ?? ''))));
+
+// Everything this hook prints goes to Claude as context, and some of what it handles is controlled by someone else (the
+// session's repo, whatever gh/git said). So nothing from those sources is ever echoed: a failure reason is reduced to
+// one word from a fixed vocabulary, and a repo's stamp is rebuilt from validated parts or not described at all.
+export function reasonLabel(reason) {
+  const text = String(reason ?? '');
+  if (/timed? ?out/i.test(text)) return 'timed out';
+  if (/rate.?limit|\b(?:403|429)\b/i.test(text)) return 'rate limited';
+  if (/\b404\b|not found|no such (?:file|repo)|could not resolve to/i.test(text) && !/command not found|spawn/i.test(text)) return 'not found';
+  if (/ENOENT|spawn|command not found|not installed|is not recognized/i.test(text)) return 'gh unavailable';
+  if (/network|resolve host|could not resolve|connect|ECONN|ENOTFOUND|EAI_AGAIN|offline|unreachable|dial|tls|ssl/i.test(text)) return 'network error';
+  return 'unexpected response';
+}
+
+const STAMP_BASE = /^\d{1,4}\.\d{1,4}\.\d{1,4}(?:-[0-9A-Za-z-]{1,24})?$/;
+const STAMP_SHA = /^[0-9a-f]{7,64}$/;
+const STAMP_FLAGS = ['modified', 'incomplete', 'unverified'];
+
+// A repo-supplied stamp, described only from parts that passed strict checks - or null when any part did not.
+export function safeStampLabel(parsed) {
+  if (!parsed || typeof parsed.base !== 'string' || !STAMP_BASE.test(parsed.base)) return null;
+  if (parsed.sha !== null && !(typeof parsed.sha === 'string' && STAMP_SHA.test(parsed.sha))) return null;
+  if (!Array.isArray(parsed.flags) || !parsed.flags.every((f) => STAMP_FLAGS.includes(f))) return null;
+  return `${parsed.base}+${parsed.sha ? short(parsed.sha) : 'unknown'}${parsed.flags.map((f) => `.${f}`).join('')}`;
+}
 
 // Does the installed identity need its own warning (case 1)? Returns the states, [] when it is clean.
 export function installedProblems(installed) {
@@ -67,7 +92,7 @@ export function messagesFor(facts) {
   const main = facts.main;
   if (main && main.ok === false) {
     if (isTimeout(main)) timedOut = true;
-    else lines.push(`could not check claude-pipeline main (${firstLine(main.reason)}); your install is ${installed.stamp}`);
+    else lines.push(`could not check claude-pipeline main (${reasonLabel(main.reason)}); your install is ${installed.stamp}`);
   } else if (main && main.ok) {
     const c = facts.installedVsMain;
     if (c?.status === 'ahead') {
@@ -76,7 +101,7 @@ export function messagesFor(facts) {
       lines.push(`your installed pipeline (${inst7}) and claude-pipeline main (${short(main.sha)}) have diverged, so it cannot be told which is newer: ${OWN_TERMINAL} to move to main`);
     } else if (c?.status === 'unresolved') {
       if (isTimeout(c)) timedOut = true;
-      else lines.push(`could not compare your installed pipeline (${inst7}) with claude-pipeline main (${short(main.sha)}): ${firstLine(c.reason)}`);
+      else lines.push(`could not compare your installed pipeline (${inst7}) with claude-pipeline main (${short(main.sha)}): ${reasonLabel(c.reason)}`);
     }
     // identical / behind (the install is newer than published main): nothing to say
   }
@@ -85,9 +110,12 @@ export function messagesFor(facts) {
   if (repo && repo.vendoredStamp !== null) {
     const parsed = parseStamp(repo.vendoredStamp);
     if (!parsed) {
-      lines.push(`this repo's scripts/pipeline/VERSION (${JSON.stringify(firstLine(repo.vendoredStamp))}) is not a version stamp, so it cannot be compared with your install`);
+      lines.push('this repo\'s scripts/pipeline/VERSION is not a version stamp, so it cannot be compared with your install');
     } else if (!stampIsTrusted(parsed)) {
-      lines.push(`this repo's scripts/pipeline is stamped ${repo.vendoredStamp.trim()}, which does not name a published pipeline commit, so it cannot be compared with your install (${inst7})`);
+      const label = safeStampLabel(parsed);
+      lines.push(label
+        ? `this repo's scripts/pipeline is stamped ${label}, which does not name a published pipeline commit, so it cannot be compared with your install (${inst7})`
+        : `this repo's scripts/pipeline carries an unrecognised stamp, which does not name a published pipeline commit, so it cannot be compared with your install (${inst7})`);
     } else {
       const c = facts.vendoredVsInstalled;
       const vend7 = short(parsed.sha);
@@ -103,7 +131,7 @@ export function messagesFor(facts) {
         lines.push(`this repo's scripts/pipeline (${vend7}) and your installed pipeline (${inst7}) have diverged, so it cannot be told which is newer`);
       } else if (c?.status === 'unresolved') {
         if (isTimeout(c)) timedOut = true;
-        else lines.push(`could not compare this repo's scripts/pipeline (${vend7}) with your installed pipeline (${inst7}): ${firstLine(c.reason)}`);
+        else lines.push(`could not compare this repo's scripts/pipeline (${vend7}) with your installed pipeline (${inst7}): ${reasonLabel(c.reason)}`);
       }
     }
   }
@@ -178,14 +206,30 @@ export function createCache(dir, now = Date.now) {
 
 // ---- gathering the facts -----------------------------------------------------------------------------------------
 
-const realVendorDrift = async (root) => (await import('../commands/vendor.mjs')).vendorDrift(root);
+export const STAMP_MAX_BYTES = 256;
+
+// The repo's scripts/pipeline/VERSION, read as hostile input: null when there is no vendored copy (no file, or a
+// scripts/pipeline that resolves outside the repo - ignored as if absent); '' when something is THERE but cannot be
+// safely read (a symlink, FIFO, device, directory, unreadable) - which messagesFor words as "not a version stamp"
+// without echoing a byte; otherwise at most STAMP_MAX_BYTES of the file (a longer file is cut, so it cannot parse).
+export function readVendoredStamp(file, root) {
+  const dir = path.dirname(file);
+  if (!realpathInside(root, dir)) return null;
+  const r = readRegularFile(file, STAMP_MAX_BYTES);
+  if (r.status === 'missing') return null;
+  if (r.status !== 'ok') return '';
+  return r.buffer.toString('utf8');
+}
+
+// Bounded by the hook's deadline; an injected dep may return a plain array (a finished drift) or { drift, timedOut }.
+const realVendorDrift = async (root, { deadlineAt, now }) => (await import('../commands/vendor.mjs')).vendorDriftBounded(root, { deadlineAt, now });
 
 // Collects the facts messagesFor needs, within `deadlineMs` in total. Anything that cannot finish in time is left out and
 // flagged timedOut; any unexpected error is swallowed (a version check must never disturb a session).
 export async function gatherFacts({ home, cwd, env = process.env, now = Date.now, deadlineMs = DEADLINE_MS, deps = {} }) {
   const d = {
     installedIdentity, mainSha, compare, gitIn, vendorDrift: realVendorDrift,
-    readFile: (f) => fs.readFileSync(f, 'utf8'), cache: createCache(cacheDirFor(env), now), ...deps,
+    readFile: readVendoredStamp, cache: createCache(cacheDirFor(env), now), ...deps,
   };
   const end = now() + deadlineMs;
   const left = () => end - now();
@@ -203,7 +247,10 @@ export async function gatherFacts({ home, cwd, env = process.env, now = Date.now
       if (top.code === 0 && top.stdout.trim()) {
         const root = top.stdout.trim();
         let vendoredStamp = null;
-        try { vendoredStamp = d.readFile(path.join(root, 'scripts', 'pipeline', 'VERSION')).trim(); } catch { /* no vendored copy */ }
+        try {
+          const text = d.readFile(path.join(root, 'scripts', 'pipeline', 'VERSION'), root);
+          vendoredStamp = typeof text === 'string' ? text.trim() : null;
+        } catch { /* no vendored copy */ }
         facts.repo = { root, vendoredStamp };
       } else if (top.timedOut) facts.timedOut = true;
     } else if (typeof cwd === 'string' && cwd) facts.timedOut = true;
@@ -232,7 +279,16 @@ export async function gatherFacts({ home, cwd, env = process.env, now = Date.now
     const vendored = facts.repo?.vendoredStamp != null ? parseStamp(facts.repo.vendoredStamp) : null;
     if (vendored && stampIsTrusted(vendored)) {
       facts.vendoredVsInstalled = relate(vendored.sha, inst.sourceSha);
-      if (facts.vendoredVsInstalled?.status === 'ahead') facts.vendorDrift = await d.vendorDrift(facts.repo.root);
+      if (facts.vendoredVsInstalled?.status === 'ahead') {
+        // hashing the repo's files is the one unbounded step, so it runs only with time left and stops at the deadline
+        if (left() <= 0) facts.timedOut = true;
+        else {
+          const r = await d.vendorDrift(facts.repo.root, { deadlineAt: end, now });
+          const drift = Array.isArray(r) ? r : r?.drift;
+          if (!Array.isArray(r) && r?.timedOut) facts.timedOut = true;
+          else if (Array.isArray(drift)) facts.vendorDrift = drift;
+        }
+      }
     }
   } catch {
     // swallowed: whatever was gathered so far is all there is

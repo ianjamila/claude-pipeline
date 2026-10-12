@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { EXIT, UsageError, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { checkoutIdentity, formatStamp, installedIdentity, parseStamp } from '../lib/identity.mjs';
 import { repoRoot } from '../lib/repo.mjs';
+import { readRegularFile } from '../lib/safe-read.mjs';
 
 export const meta = {
   summary: 'copy the CI-side scripts into a project (scripts/pipeline/); --check reports drift',
@@ -80,6 +81,25 @@ export function vendorDrift(root, items = manifest(layout())) {
     else if (sha256(dest) !== sha256(it.src)) drift.push({ file: repoRel(it.rel), reason: 'differs' });
   }
   return drift;
+}
+
+// The same comparison for a caller that must not be held hostage by the repo it inspects (the SessionStart hook): the
+// project's files are untrusted, so a destination that is a symlink or any non-regular file (a FIFO, /dev/zero, a
+// directory) or larger than `maxBytes` counts as 'differs' without being read through, every file is read with a size
+// cap, and the loop stops once `deadlineAt` (ms, compared with `now()`) has passed. Returns { drift, timedOut };
+// when timedOut the drift list is partial and the caller must not report from it.
+export const DRIFT_MAX_FILE_BYTES = 2 * 1024 * 1024;
+export function vendorDriftBounded(root, { deadlineAt = Infinity, now = Date.now, maxBytes = DRIFT_MAX_FILE_BYTES, items = manifest(layout()) } = {}) {
+  const target = join(root, ...DEST);
+  const drift = [];
+  for (const it of items) {
+    if (now() >= deadlineAt) return { drift, timedOut: true };
+    const have = readRegularFile(join(target, it.rel), maxBytes, { rejectLarger: true });
+    if (have.status === 'missing') drift.push({ file: repoRel(it.rel), reason: 'missing' });
+    else if (have.status !== 'ok') drift.push({ file: repoRel(it.rel), reason: 'differs' });
+    else if (!have.buffer.equals(readFileSync(it.src))) drift.push({ file: repoRel(it.rel), reason: 'differs' });
+  }
+  return { drift, timedOut: false };
 }
 
 // Why a project's VERSION stamp proves nothing about the vendored code, or null when it is a clean, sha-bearing one.
