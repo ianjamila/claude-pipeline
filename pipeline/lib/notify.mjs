@@ -662,10 +662,11 @@ async function runNotify(event, deps, { transports, errors, budget, signal, out,
   let url = event.url;
   if (!title && event.pr && !event.test) {
     const lookup = deps.lookup ?? defaultLookup;
-    // The default lookup kills its own process TREE at lookupMs (proc.mjs killTree: taskkill /T /F on Windows). This outer
-    // race is only a net for an injected lookup that hangs, so it waits a little longer: if both fired together the push
-    // would carry on (and the command exit) while the killed gh still held its cwd.
-    const found = await within(Promise.resolve().then(() => lookup(event.pr, { cwd, env, timeoutMs: budget.lookupMs })).catch(() => null), budget.lookupMs + LOOKUP_KILL_SLACK_MS, null);
+    // The lookup as a whole stays within budget.lookupMs. The default lookup kills its own process TREE a little earlier
+    // (proc.mjs killTree: taskkill /T /F on Windows); the outer race is only a net for an injected lookup that hangs. If
+    // both fired together the push would carry on (and the command exit) while the killed gh still held its cwd.
+    const killMs = budget.lookupMs - Math.min(LOOKUP_KILL_SLACK_MS, Math.floor(budget.lookupMs / 5));
+    const found = await within(Promise.resolve().then(() => lookup(event.pr, { cwd, env, timeoutMs: killMs })).catch(() => null), budget.lookupMs, null);
     title = found?.title;
     url ??= found?.url;
   }

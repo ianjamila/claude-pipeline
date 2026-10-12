@@ -13,6 +13,7 @@ import {
 import { run as notifyCommand } from '../pipeline/commands/notify.mjs';
 import { UsageError } from '../pipeline/lib/cli.mjs';
 import { isPidAlive } from '../pipeline/lib/locks.mjs';
+import { killTree } from '../pipeline/lib/proc.mjs';
 
 // Never create ~/.claude/pipeline-state/machine-id from a test run (scripts/test.mjs sets this too).
 process.env.PIPELINE_MACHINE_ID ||= 'test-machine-id';
@@ -561,17 +562,28 @@ test('a hung gh title lookup is killed at the lookup budget and the push still g
   const script = path.join(dir, 'fakegh.mjs');
   writeFileSync(script, `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nsetTimeout(() => {}, 60000);\n`);
   const r = rig({ realLookup: true, env: { PIPELINE_GH: `"${process.execPath}" "${script}"` } });
-  const t0 = Date.now();
-  const res = await notifyEvent({ ...STOP, title: undefined }, { ...r.deps, budget: { lookupMs: 700 } });
-  const took = Date.now() - t0;
-  assert.equal(res.sent, true);
-  assert.ok(took < 6000, `took ${took} ms`);
-  assert.equal(r.fetchCalls[0].body.title, '#12');
-  // The lookup's cwd is the rig dir: the killed process must be gone before the test ends, or Windows cannot delete the dir.
-  if (existsSync(pidFile)) { // absent only when node was killed before it started the script (a slow machine): nothing to wait for
-    const pid = Number(readFileSync(pidFile, 'utf8'));
+  let pid = null;
+  try {
+    const t0 = Date.now();
+    // The lookup's own kill fires at 2000 ms (lookupMs minus the slack); the outer race at 2500 ms.
+    const res = await notifyEvent({ ...STOP, title: undefined }, { ...r.deps, budget: { lookupMs: 2500 } });
+    const took = Date.now() - t0;
+    assert.equal(res.sent, true);
+    assert.ok(took >= 2000 && took < 6000, `took ${took} ms`);
+    assert.equal(r.fetchCalls[0].body.title, '#12');
+    // Positive evidence that the real lookup launched the fixture: the pid file must appear.
+    for (let i = 0; i < 200 && !existsSync(pidFile); i++) await sleep(50);
+    assert.ok(existsSync(pidFile), 'the lookup never started the fake gh');
+    pid = Number(readFileSync(pidFile, 'utf8'));
+    // The lookup's cwd is the rig dir: the killed process must be gone before the test ends, or Windows cannot delete the dir.
     for (let i = 0; i < 100 && isPidAlive(pid); i++) await sleep(50);
     assert.equal(isPidAlive(pid), false, 'the hung gh was killed');
+  } finally {
+    if (pid === null && existsSync(pidFile)) pid = Number(readFileSync(pidFile, 'utf8'));
+    if (pid !== null && isPidAlive(pid)) {
+      killTree(pid);
+      for (let i = 0; i < 100 && isPidAlive(pid); i++) await sleep(50);
+    }
   }
 });
 
