@@ -22,7 +22,7 @@ import {
 
 export const meta = {
   summary: 'merge the PR if (and only if) the final gate passes again, live; waits for MERGED',
-  usage: 'pipeline merge --pr N [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?, warnings?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment. While it runs the run record of the PR shows inFlight {kind: merge} and step merge; a prod-before event comment (the known-good deployment) is posted before the merge command; warnings lists a record or event write that failed (never fatal)',
+  usage: 'pipeline merge --pr N [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?, warnings?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment. While it runs the run record of the PR shows inFlight {kind: merge} and step merge; a prod-before event comment (the known-good deployment) is posted before the merge command, and when that post fails nothing is merged (error pre-merge); warnings lists a run record write that failed (never fatal)',
 };
 
 const refuse = (error, reasons, extra = {}) => ({
@@ -93,29 +93,32 @@ export const run = guarded(async (argv, ctx) => {
     }
 
     // 3a. From here a merge may happen: show it in the run record (inFlight, cleared on EVERY exit below), and leave the
-    // known-good deployment as an append-only event next to the file, so a rollback target outlives a rewritten record.
+    // known-good deployment as an append-only event (3c below), so a rollback target outlives a rewritten record.
     // The record is display, the checks are the safety: a failed write is a warning, never a refusal.
     const recorder = createRunRecorder({ gh, pr });
     recorder.update({
       step: 'merge', outcome: null, head: gate.head,
       inFlight: inFlightSince(recorder, 'merge', 2 * config.merge.wait_minutes + 15),
     }, { initialStep: 'merge' });
-    if (prodBefore) {
-      try {
-        postEvent(gh, pr, 'prod-before', `pr${pr}-${gate.head.slice(0, 12)}`,
-          `Production before merging #${pr}: ${config.production.environment} deployment ${prodBefore.id} at ${String(prodBefore.sha).slice(0, 12)} is the rollback target.`, {
-            repo: gh.repo().slug, environment: config.production.environment, pr, headBeforeMerge: gate.head,
-            deployment: { id: prodBefore.id, sha: prodBefore.sha, url: prodBefore.url },
-          });
-      } catch (err) {
-        recorder.warnings.push(`prod-before event not posted: ${String(err?.message ?? err).slice(0, 200)}`);
-      }
-    }
-
     const attempt = async () => {
       // 3b. The live gate ran slow probes after it read the PR: look at GitHub once more, right before the merge command.
       const late = await preMergeProblems({ gh, pr, head: gate.head });
       if (late.length > 0) return refuse('pre-merge', late);
+
+      // 3c. Fail CLOSED: the prod-before event is the only copy of the rollback target that survives this machine (prod-watch
+      // refuses to roll back when it cannot record its intent, too). Posted after the last look, so a refused merge leaves none.
+      if (prodBefore) {
+        try {
+          postEvent(gh, pr, 'prod-before', `pr${pr}-${gate.head.slice(0, 12)}`,
+            `Production before merging #${pr}: ${config.production.environment} deployment ${prodBefore.id} at ${String(prodBefore.sha).slice(0, 12)} is the rollback target.`, {
+              repo: gh.repo().slug, environment: config.production.environment, pr, headBeforeMerge: gate.head,
+              deployment: { id: prodBefore.id, sha: prodBefore.sha, url: prodBefore.url },
+            });
+        } catch (err) {
+          const reason = 'could not record the rollback target on the PR (prod-before event)';
+          return refuse('pre-merge', [reason], { reason, detail: String(err?.message ?? err).slice(0, 200) });
+        }
+      }
 
       // 4. Merge with the approved head (fill is strict: a missing {sha} throws instead of merging whatever head exists).
       const { waitMs, pollMs } = mergeTiming(config, ctx.env ?? process.env);

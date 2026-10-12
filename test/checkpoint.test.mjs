@@ -390,16 +390,45 @@ test('merge: an exception after inFlight was set still clears it (finally), then
   assert.equal(marker(s), -1, 'the merge command never ran');
 });
 
-test('merge: a record write that fails only warns; the merge still happens and the event is still tried', () => {
-  const s = mergeScenario({ gh: { extra: [{ match: '-X POST repos/acme/widgets/issues/12/comments', code: 1, stderr: 'gh: Server Error (HTTP 500)' }, ...DEPLOYMENTS] } });
+test('merge: a record write that fails only warns; the merge still happens', () => {
+  // Only the summary comment write fails: it is a PATCH/POST of the record, the event is a POST too, so fail by body.
+  const s = mergeScenario({ gh: { extra: [{ match: 'repos/acme/widgets/issues/12/comments --paginate', code: 1, stderr: 'gh: Server Error (HTTP 502)' }, ...DEPLOYMENTS] } });
   assertExit(s.gate(), 0);
   const r = s.merge();
   assertExit(r, 0);
   assert.equal(r.json.merged, true);
-  assert.ok(Array.isArray(r.json.warnings));
   assert.ok(r.json.warnings.some((w) => w.startsWith('run record not updated:')), r.json.warnings.join());
-  assert.ok(r.json.warnings.some((w) => w.startsWith('prod-before event not posted:')), r.json.warnings.join());
+  assert.equal(eventWrites(s.fake).length, 1, 'the prod-before event was still posted');
   assert.ok(marker(s) > 0, 'the merge command ran');
+});
+
+test('merge: fails CLOSED when the prod-before event cannot be posted: pre-merge refusal, merge command never ran, inFlight cleared', () => {
+  const s = mergeScenario({ gh: { extra: [{ match: '-X POST repos/acme/widgets/issues/12/comments', code: 1, stderr: 'gh: Server Error (HTTP 500)' }, ...DEPLOYMENTS] } });
+  assertExit(s.gate(), 0);
+  const r = s.merge();
+  assertExit(r, 1);
+  assert.equal(r.json.merged, false);
+  assert.equal(r.json.error, 'pre-merge');
+  assert.equal(r.json.reason, 'could not record the rollback target on the PR (prod-before event)');
+  assert.deepEqual(r.json.reasons, [r.json.reason]);
+  assert.equal(marker(s), -1, 'the merge command never ran');
+  assert.ok(!s.fake.lines().some((l) => l.startsWith('pr merge')));
+  // the record writes (also POSTs here) failed too, so they only warn; with a readable comment list the clear is attempted
+  assert.ok(r.json.warnings.some((w) => w.startsWith('run record not updated:')));
+});
+
+test('merge: the prod-before failure refusal clears inFlight when the record can be written (PATCH works, the event POST fails)', () => {
+  const s = mergeScenario();
+  withComment(s, existingSummary({ record: baseRecord({ step: 'gate' }) }), [{ match: '-X POST repos/acme/widgets/issues/12/comments', code: 1, stderr: 'gh: Server Error (HTTP 500)' }, ...DEPLOYMENTS]);
+  assertExit(s.gate(), 0);
+  const r = s.merge();
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'pre-merge');
+  assert.equal(marker(s), -1);
+  const writes = recordWrites(s.fake);
+  assert.equal(writes[0].record.inFlight.kind, 'merge');
+  assert.equal(writes.at(-1).record.inFlight, null);
+  assert.equal(writes.at(-1).record.step, 'gate');
 });
 
 // ---- P update-branch: inFlight ---------------------------------------------------------------------------------------
