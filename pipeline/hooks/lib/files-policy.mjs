@@ -803,6 +803,7 @@ function impliesCwdWrite(c) {
   const relOperand = args.some((a) => !a.startsWith('-') && !/^(?:\/|~)/.test(a.replace(/^\w+=/, '')));
   if (['touch', 'mkdir', 'tee', 'truncate', 'rm', 'rmdir', 'mkfifo', 'mknod', 'chmod', 'chown', 'dd'].includes(name)) return relOperand;
   if (['sed', 'gsed'].includes(name) && args.some((a) => inPlaceFlag(a))) return relOperand;
+  if (['perl', 'ruby'].includes(name) && args.some((a) => /^-[A-Za-z]*i/.test(a))) return relOperand; // (in-place edit)
   if (name === 'curl') return args.some((a) => /^-[A-Za-z]*[OoJ]/.test(a) || /^--(?:output|remote-name|remote-header-name)/.test(a));
   if (name === 'git') {
     let i = 0;
@@ -1135,7 +1136,10 @@ function findInstaller(cmds, raw, dirs, ctx, opts) {
         try {
           const read = opts.readFile ?? ((p) => fs.readFileSync(p, 'utf8'));
           scripts = JSON.parse(read(posix.join(r, 'package.json'))).scripts ?? {};
-        } catch { return `${n} run ${script} runs in a claude-pipeline checkout whose package.json cannot be read, so it cannot be shown not to run the installer`; }
+        } catch {
+          if (opts._writesOnly === true) continue; // (a rerun that only assumes the directory: an unreadable package.json there says nothing about the real one)
+          return `${n} run ${script} runs in a claude-pipeline checkout whose package.json cannot be read, so it cannot be shown not to run the installer`;
+        }
         if (scriptsReferenceInstaller(script, scripts, 0, new Set())) return msg(`${n} run ${script}, whose script runs the installer, which`);
       }
     }
@@ -2031,7 +2035,7 @@ function evaluateBashForFilesFrame(command, opts) {
   const names = (c) => insideRoot
     || m.rawHit(rawOfCmd(c), dirs) || winAncestor(c)
     || Object.values(c.env).some((v) => m.rawHit(v, dirs))
-    || (!tooMany && wordsOf(c).some(tokenHit));
+    || (!tooMany && opts._writesOnly !== true && wordsOf(c).some(tokenHit)); // (a rerun that only assumes a directory judges writes: a bare word that resolves into it names nothing)
   // does it WRITE one? cp / rsync / install only write their destination
   const mentions = (c) => {
     const name = baseOf(c.argv[0] ?? '');
