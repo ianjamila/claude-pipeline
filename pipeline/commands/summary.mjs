@@ -1,6 +1,6 @@
 // `pipeline summary --pr N --outcome O [--built TEXT]`: upserts the PR's single summary comment (rendered from the
 // review state, the Fable model proofs and the follow-up issues) and prints the agent-log line for this run.
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
@@ -13,6 +13,7 @@ import { recordForOutcome } from '../lib/run-record.mjs';
 import { readSummaryComment, writeSummaryComment } from '../lib/summary-comment.mjs';
 import { buildAgentLogLine } from '../lib/agentlog.mjs';
 import { inlineOptionValues } from '../lib/finalgate.mjs';
+import { readModelProofs } from '../lib/review-context.mjs';
 
 export const meta = {
   summary: 'upsert the PR summary comment and print the agent-log line',
@@ -36,22 +37,6 @@ async function verifyDetail(root) {
     if (failed?.name) return `verify failed at step ${String(failed.name).slice(0, 60)}${report.mode ? ` (${String(report.mode).slice(0, 20)})` : ''}`;
   } catch { /* no usable report */ }
   return null;
-}
-
-// One entry per round whose Fable model proof passed; a round without (or with a failed) proof adds nothing.
-function readModelProofs(root) {
-  const dir = join(root, '.review');
-  if (!existsSync(dir)) return [];
-  const proofs = [];
-  for (const name of readdirSync(dir).filter((n) => /^round-\d+$/.test(n)).sort((a, b) => Number(a.slice(6)) - Number(b.slice(6)))) {
-    try {
-      const p = JSON.parse(readFileSync(join(dir, name, 'model-proof.json'), 'utf8'));
-      if (p?.ok !== true) continue;
-      const efforts = p.efforts && typeof p.efforts === 'object' ? Object.keys(p.efforts).join(', ') : '';
-      proofs.push({ transcript: p.transcript, models: p.models, ...(efforts ? { effort: efforts } : {}) });
-    } catch { /* no proof for this round */ }
-  }
-  return proofs;
 }
 
 // FOLLOW-UP items that have an issue filed, once per finding (the same fingerprint can come back in a later round).
@@ -97,7 +82,7 @@ export const run = guarded(async (argv, ctx) => {
   const gh = createGitHub({ cwd: root, env: ctx.env });
   return guardGh(() => {
     const view = gh.prView(pr, ['title', 'headRefName', 'baseRefName', 'headRefOid']);
-    const sections = summarySections(state, { outcome: detail ? `${outcome} — ${detail}` : outcome, built: values.built, followups: followupsOf(state), modelProofs: readModelProofs(root) });
+    const sections = summarySections(state, { outcome: detail ? `${outcome} — ${detail}` : outcome, built: values.built, followups: followupsOf(state), modelProofs: readModelProofs(root, state) });
     const agentLogLine = buildAgentLogLine({ state, pr, title: view.title, outcome });
     // The run record rides in the same comment: keep the one a checkpoint wrote, set how the run ended.
     const existing = readSummaryComment(gh, pr);
