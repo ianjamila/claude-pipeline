@@ -1425,8 +1425,8 @@ function absorbSourced(rec, dirs, ctx) {
   }
   for (const [k, v] of merged) {
     ctx.srcTouched.add(k);
-    if (v === null) { delete ctx.vars[k]; delete ctx.keptVars?.[k]; ctx.unknownVars.add(k); continue; }
-    ctx.unknownVars.delete(k);
+    if (v === null) { delete ctx.vars[k]; delete ctx.keptVars?.[k]; ctx.pickUnknown.add(k); continue; }
+    ctx.pickUnknown.delete(k);
     ctx.vars[k] = expandHomeRefs(substVars(toPosix(v).replace(USER_RE, ctx.user), ctx.vars, ctx.budget), ctx.homePosix);
     if (ctx.keptVars) ctx.keptVars[k] = ctx.vars[k];
   }
@@ -1484,8 +1484,8 @@ function evaluateBashForFilesFrame(command, opts) {
   if (setsSeamForPipeline(cmds)) return deny('the command sets a pipeline test seam (PIPELINE_GH, PIPELINE_CODEX, PIPELINE_VERCEL, PIPELINE_TEST_MODE, PIPELINE_UPDATE_REMOTE) for the pipeline CLI; a fake gh/codex/vercel could satisfy the merge gate, and a foreign update remote would install foreign code, so only the owner does that, from a terminal');
   ctx.vars = collectVars(cmds, ctx);
   if (opts._vars) { ctx.vars = { ...opts._vars, ...ctx.vars }; ctx.keptVars = { ...(opts._keptVars ?? {}), ...ctx.keptVars }; } // variables the line set before the shell that runs this file started
-  for (const k of opts._unknown ?? []) ctx.unknownVars.add(k);
-  ctx.pickUnknown = new Set(opts._pickUnknown ?? []);
+  for (const k of opts._unknownW ?? []) ctx.unknownVars.add(k);
+  ctx.pickUnknown = new Set(opts._unknown ?? []); // (a name the line gave a run-time value: only a script it picks is refused; the writer rule is for the names above)
   ctx.srcTouched = new Set(); // names a sourced file set on this line (a later plain assignment of one is the value again)
   ctx.unknownAll = opts._unknownAll === true;
   // a name held in a variable (N=PIPELINE_ADMIN; env $N=1 claude)
@@ -1531,7 +1531,9 @@ function evaluateBashForFilesFrame(command, opts) {
 
   // The variables this line assigns (its commands' prefixes included) are in the environment of the shells it starts: the startup files and
   // scripts they run are judged with them (a name like `. "$F"` in the file is then the file F names, not an unknown).
-  const withLineVars = (o) => ({ ...o, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set(ctx.unknownVars), _pickUnknown: new Set(ctx.pickUnknown), _unknownAll: ctx.unknownAll });
+  // (every name of the line is seeded, exported or not, and wherever it was set: stricter than the shell, which only passes exported ones on; kept on purpose,
+  // a missed name would hide the script a variable picks. The replay found no false block from it.)
+  const withLineVars = (o) => ({ ...o, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set([...ctx.unknownVars, ...ctx.pickUnknown]), _unknownW: new Set(ctx.unknownVars), _unknownAll: ctx.unknownAll });
 
   // A startup file is judged once per evaluation. It is marked first: a startup file that starts shells itself would be judged again and
   // again otherwise (a denial ends the whole evaluation, so marking before the verdict is safe).
@@ -1639,8 +1641,8 @@ function evaluateBashForFilesFrame(command, opts) {
   if (ctx.unknownVars.size) {
     const refs = (w) => [...String(w).matchAll(/\$\{?(\w+)/g)].some((x) => ctx.unknownVars.has(x[1]));
     for (const c of cmds) {
-      if ((c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && refs(r.target ?? '')) || (c.argv.length && !isReadOnly(c, ctx) && (c.argv.some(refs) || Object.values(c.env ?? {}).some(refs)))) {
-        return deny('the command writes through a variable whose value is only known at run time (a width or integer attribute, a sourced file or a run-time value), so the file it reaches cannot be checked; write the path out');
+      if ((c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && refs(r.target ?? '')) || (c.argv.length && !['export', 'declare', 'typeset', 'local', 'readonly'].includes(baseOf(c.argv[0])) && !isReadOnly(c, ctx) && (c.argv.some(refs) || Object.values(c.env ?? {}).some(refs)))) {
+        return deny('the command writes through a variable whose value is only known at run time (a width or integer attribute), so the file it reaches cannot be checked; write the path out');
       }
     }
   }

@@ -343,6 +343,9 @@ test('S3: declare -l / -u transform the value, before or after the assignment (f
     'typeset -L40 D=$HOME/.claude; echo x > $D/settings.json', 'typeset -L4 D=/home/u/.claude; echo x > $D/settings.json',
   ]) assert.equal(files(c, fs).decision, 'deny', c);
   for (const c of ['declare -l D=$HOME/.CLAUDEX; echo x > $D/a.txt', 'declare -l N=ABC; echo $N > a.txt', 'typeset -L4 N=abcdef; echo $N']) assert.equal(files(c, fs).decision, 'allow', c);
+  // a width cut may leave a protected path the text does not show (-R15 keeps the last 15 characters): a writer or redirection that uses the name is refused, a reader is not
+  for (const c of ['typeset -R15 D=/tmp/a/home/u/.claude; echo x > $D/settings.json', 'typeset -R15 D=/tmp/a/home/u/.claude; cp ok.sh $D/settings.json', 'typeset -i D=3; echo x > $D/settings.json']) assert.equal(files(c, fs).decision, 'deny', c);
+  assert.equal(files('typeset -R15 D=/tmp/a/home/u/.claude; cat $D/settings.json', fs).decision, 'allow');
 });
 
 test('S3: local outside a function does not take effect, so the variable is unknown (git-policy)', () => {
@@ -371,6 +374,8 @@ test('S3: variables a sourced file sets are known (or unknown) for the rest of t
     'F=ok.sh; source cond.sh; bash $F', 'F=ok.sh; source dyn.sh; bash $F', 'F=ok.sh; source ev.sh; bash $F', 'F=ok.sh; source rd.sh; bash $F', 'F=ok.sh; source $Z; bash $F',
     'echo F=evil.sh > w.sh; F=ok.sh; source w.sh; bash $F',
   ]) assert.equal(files(c, fs).decision, 'deny', c);
+  // (a name the file sets to a run-time value only refuses a script it picks, like `F=$(cmd)` on the line)
+  assert.equal(files('source dyn.sh; cp ok.sh $F.bak', fs).decision, 'allow');
   for (const c of [
     'F=evil.sh; source okset.sh; bash $F', 'source okset.sh; bash $F', 'source missing.sh; bash ok.sh', 'source cond.sh; echo hi', 'F=ok.sh; source set.sh; F=ok.sh; bash $F',
   ]) assert.equal(files(c, fs).decision, 'allow', c);
