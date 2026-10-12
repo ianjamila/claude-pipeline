@@ -9,11 +9,11 @@
 // The file system is faked (like test/guard-script-expansion.test.mjs); guarded text only lives in fake file contents or in the constants below.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolve, dirname, basename } from 'node:path';
+import { resolve, dirname, basename, posix } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { simpleCommands } from '../pipeline/hooks/lib/shell-parse.mjs';
-import { writesOf, printfText, flowStart, namesFile, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, decodeEscapes, sortArgsPure } from '../pipeline/hooks/lib/line-writes.mjs';
+import { writesOf, newWriteFrame, writtenTo, printfText, flowStart, namesFile, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, decodeEscapes, sortArgsPure } from '../pipeline/hooks/lib/line-writes.mjs';
 
 function fakeFs(root, files, dirs = []) {
   const abs = (p) => resolve(root, p);
@@ -1527,4 +1527,46 @@ test('L4: a write that may fail or be skipped does not replace the file\'s own t
   }
   // the twin: the copy certainly runs and replaces the text
   assert.equal(run((bad) => `cp ok.sh n.sh; printf '${B(bad)}' >> n.sh; bash n.sh`, spec).git.r.decision, 'allow');
+});
+
+test('L4: every cap refuses or marks unknown, never drops input (copy chain, write orders, printf rounds)', () => {
+  // Why: a cap that stops reading leaves the rest of the input unjudged: f.sh is the source of the 12th copy in a chain
+  const chain = (n) => ['cp f.sh a1.sh', ...Array.from({ length: n - 1 }, (_, i) => `cp a${i + 1}.sh a${i + 2}.sh`)].join('; ');
+  denyBoth(`${chain(8)}; bash a8.sh`);
+  denyBoth(`${chain(12)}; bash a12.sh`);
+  denyBoth(`${chain(30)}; bash a30.sh`);
+  // the order combinations of many background writers of one file are capped: refused, not cut
+  const many = (n) => Array.from({ length: n }, () => 'cp ok.sh n.sh &').join(' ');
+  denyBoth(`${many(7)} bash n.sh`);
+  allowBoth(`${many(2)} bash n.sh`);
+  // printf reuses its format for every argument: more than the 1000 rounds is not an exact text
+  assert.equal(printfText(['printf', '%s\n', ...Array.from({ length: 1001 }, (_, i) => `l${i}`)]), null);
+  assert.equal(printfText(['printf', '%s\n', ...Array.from({ length: 999 }, (_, i) => `l${i}`)]).split('\n').length, 1000);
+});
+
+test('L4: the relative-directory narrowing of a clone / worktree add is dropped when a symlink may be involved, and compared case-folded with slashes ignored', () => {
+  // Why: the narrowing compares NAMES; a link the line made (`ln -s /abs/other sub`) or a script reached through an alias makes the name say nothing about where the files land
+  const unknownDir = (tail, mid) => `cd /work/repo && git worktree list | head -3 && ${tail.replace('MID', mid)}`;
+  const gitOnly = (l, alias = false) => run(l, SPEC, alias).git.r.decision;
+  assert.equal(gitOnly(unknownDir('ln -s /work/repo/src sub; git clone https://x/y.git sub; MID; bash /work/repo/src/n.sh', MID_GIT)), 'deny');
+  assert.equal(gitOnly(unknownDir('ln -sfn /work/repo/src sub; git worktree add -q -b x sub origin/main; MID; bash /work/repo/src/n.sh', MID_GIT)), 'deny');
+  assert.equal(gitOnly(unknownDir('git clone https://x/y.git real; MID; bash /work/repo/alias/n.sh', MID_GIT), true), 'deny'); // (alias -> real: the script is reached by the other name)
+  assert.equal(gitOnly(unknownDir('git clone https://x/y.git real/; MID; bash /work/repo/alias/n.sh', MID_GIT), true), 'deny');
+  // the twins: no link, an unrelated script
+  assert.equal(gitOnly(unknownDir('git clone https://x/y.git sub; MID; bash /work/repo/src/ok.sh', MID_GIT)), 'allow');
+  assert.equal(gitOnly(unknownDir('git clone https://x/y.git real; MID; bash /work/repo/ok.sh', MID_GIT), true), 'allow');
+  // `~user` is a home we do not know: anywhere
+  
+  assert.equal(gitOnly(unknownDir('git clone https://x/y.git ~bob/x; MID; bash /work/repo/x/n.sh', MID_GIT)), 'deny');
+  assert.equal(gitOnly(unknownDir('git clone https://x/y.git ~bob/x; MID; bash /work/repo/ok.sh', MID_GIT)), 'allow');
+  // case and slashes (a case-insensitive file system), checked on the frame itself
+  const reaches = (line, script, ci) => {
+    const frame = newWriteFrame(simpleCommands(`${line}; bash x`), { expand: (w) => w, locate: (e) => [e], isAbs: (q) => q.startsWith('/'), p: posix, ci });
+    frame.i = 1;
+    return writtenTo([frame], script, { exists: () => false }) !== null;
+  };
+  assert.equal(reaches('git clone https://x/y.git SUB', '/w/sub/n.sh', true), true);
+  assert.equal(reaches('git clone https://x/y.git SUB', '/w/sub/n.sh', false), false);
+  assert.equal(reaches('git clone https://x/y.git ./sub//', '/w/sub/n.sh', false), true);
+  assert.equal(reaches('git clone https://x/y.git sub/', '/w/sub/n.sh', true), true);
 });

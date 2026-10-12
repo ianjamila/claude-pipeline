@@ -93,6 +93,7 @@ export function printfText(argv) {
       }
     }
     if (consumed === 0 || used >= args.length) break;
+    if (round === 999) return null; // Why: the arguments are not used up after the rounds we read: the text is not exact (never a cut one)
   }
   return out;
 }
@@ -1251,14 +1252,15 @@ function match(f, rec, P) {
   if (rec.dest === null) return loose(rec.items);
   const e = f.expand(rec.dest);
   // a target only known at run time may be any file its fixed parts allow (`/work/out-$n.txt` is not /work/cmp.mjs)
-  if (e === null) return dynamicMayBe(f, rec.dest, P) ? loose(rec.items) : null;
+  if (e === null) return dynamicMayBe(f, rec.dest, P, rec.subtree === true) ? loose(rec.items) : null; // (a subtree: any file below the directory the word may name)
   const out = [];
   for (const d of f.locate(e, rec.idx)) {
     if (!f.isAbs(d)) { // the directory is unknown: compare the names
       out.loose = true;
       if (fold(f, p.basename(d)) === fold(f, p.basename(P))) out.push(...rec.items);
       else if (rec.copy) for (const it of rec.items) { const se = it.file === undefined ? undefined : f.expand(it.file); if (se === null || (se !== undefined && fold(f, nameOf(f, se)) === fold(f, p.basename(P)))) out.push(it); }
-      if (rec.subtree && (!rec.narrow || mayBeBelow(f, d, P))) out.push(...rec.items);
+      // Why: the names say where the files land only if no alias is involved: P is compared by its real path too (a link the line makes is already "a write that ends in the script's name", see collect)
+      if (rec.subtree && (!rec.narrow || mayBeBelow(f, d, P) || [canon(f, P)].some((cp) => cp !== null && cp !== P && mayBeBelow(f, d, cp)))) out.push(...rec.items);
       continue;
     }
     if (same(f, d, P)) { out.push(...rec.items); continue; }
@@ -1428,13 +1430,13 @@ function partAlternatives(frames, h, io, depth) {
       } else return null; // scan / unknown
     }
     acc = product(acc, alts);
-    if (acc === null) return null;
+    if (acc === null) { io.pieces = true; return null; } // (too many combinations: refused, never cut)
   }
   return acc;
 }
 
 // Could the word, with its run-time parts ($VAR, $(...), globs, {a,b}) replaced by anything, name P? A relative word may be anywhere (its directory is unknown).
-function dynamicMayBe(f, word, P) {
+function dynamicMayBe(f, word, P, below = false) {
   // Why: a leading tilde prefix is not a name: ~+ is the command's directory (the rest is then a relative word), ~- the previous directory and ~user a home are unknown (anywhere, absolute)
   let w = String(word);
   let lead = '';
@@ -1451,13 +1453,14 @@ function dynamicMayBe(f, word, P) {
   const re = lead + parts.map((s, i) => (i % 2 ? '.*' : s.replace(/[.+^|()\\]/g, '\\$&').replace(/[\[\]{}$]/g, '\\$&'))).join('');
   const abs = lead !== '' || /^\//.test(parts[0] ?? '') || /^[A-Za-z]:/.test(parts[0] ?? '');
   try {
-    return new RegExp(abs ? `^(?:[A-Za-z]:)?${re}$` : `(?:^|[\\\\/])${re}$`, f.ci ? 'is' : 's').test(P.replace(/\\/g, '/'));
+    const end = below ? '(?:[\\\\/].*)?$' : '$';
+    return new RegExp(abs ? `^(?:[A-Za-z]:)?${re}${end}` : `(?:^|[\\\\/])${re}${end}`, f.ci ? 'is' : 's').test(P.replace(/\\/g, '/'));
   } catch {
     return true; // a pattern we cannot build: it may be
   }
 }
 
-const MAX_CHAIN = 6; // a file copied from a file copied from a file ...
+const MAX_CHAIN = 24; // a file copied from a file copied from a file ... (longer: refused, see `cut`)
 
 // Everything a write before the command being judged may have put in the script file `target`:
 // { texts, files, scans, unknown } or null when no write reaches it. `files` are the sources (and their own sources, in turn): the
@@ -1476,7 +1479,7 @@ export function writtenTo(frames, target, { exists, readText = () => null, ignor
   const io = { exists, readText, pieces: false };
   const built = contentsOf(frames, upto, frames[upto].i, target, io, 0);
   const joined = (built ?? []).filter((x) => !st.texts.has(x));
-  return { texts: [...st.texts], files: [...st.files], scans: [...st.scans], programs: [...st.programs], authored: st.authored, unknown: st.unknown, viaUnmodelled: st.viaUnmodelled, joined, pieces: io.pieces };
+  return { texts: [...st.texts], files: [...st.files], scans: [...st.scans], programs: [...st.programs], authored: st.authored, unknown: st.unknown, viaUnmodelled: st.viaUnmodelled, joined, pieces: io.pieces || st.cut === true };
 }
 
 // The links the line makes before the command: [alias, real, frame] for `ln -s REAL ALIAS` (and a hard link). A directory alias makes
@@ -1584,7 +1587,7 @@ function absorb(frames, fi, f, rec, items, Pv, st, depth, exists) {
 
 function addPath(frames, fi, rec, abs, st, depth, exists, into) {
   st[into].add(abs);
-  if (into === 'files' && depth < MAX_CHAIN) collect(frames, fi, rec.idx, abs, st, depth + 1, exists);
+  if (into === 'files') { if (depth < MAX_CHAIN) collect(frames, fi, rec.idx, abs, st, depth + 1, exists); else st.cut = true; }
 }
 
 function addFiles(f, rec, word, P, st, fi, depth, exists, into, frames = null) {
@@ -1596,7 +1599,7 @@ function addFiles(f, rec, word, P, st, fi, depth, exists, into, frames = null) {
   if (rec.link === 'sym' && !f.isAbs(e)) paths.push(f.p.resolve(f.p.dirname(P), e));
   for (const x of paths) {
     st[into].add(x);
-    if (into === 'files' && frames && depth < MAX_CHAIN) collect(frames, fi, rec.idx, x, st, depth + 1, exists);
+    if (into === 'files' && frames) { if (depth < MAX_CHAIN) collect(frames, fi, rec.idx, x, st, depth + 1, exists); else st.cut = true; }
   }
 }
 
