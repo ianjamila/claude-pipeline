@@ -100,7 +100,9 @@ Validate: `P config` (it prints `warnings`: read them, e.g. a missing guard cont
 (plus `lib/`, `vendor/js-yaml.mjs` and a `VERSION` file) into `scripts/pipeline/`, and appends
 `scripts/pipeline/** -text` and `scripts/verify text eol=lf` to `.gitattributes` so a Windows checkout cannot
 rewrite them (commit that file; `P vendor --repo . --check` reports drift and warns when the lines are
-missing). Copy
+missing). The `VERSION` file holds the stamp of the pipeline that ran `vendor` (`<base>+<sha7>`, with
+`.modified` / `.incomplete` / `.unverified` or `+unknown` when that cannot be proven), so run `vendor` from an
+up-to-date, unedited install (`pipeline update` first); `--check` warns when the stamp proves nothing. Copy
 `templates/workflows/pipeline-guards.yml` (runs on `pull_request_target` from the base branch,
 never executes PR code, posts the `Test integrity` and `Hard-stop scan` commit statuses). If the
 repo has a merge-gate registry of expected checks, register the workflow there as enforced by
