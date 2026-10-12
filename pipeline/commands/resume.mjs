@@ -21,10 +21,11 @@ export const meta = {
     '  -> {ok, prs[{number, title, headRefName, url, why}]}: open PRs labelled awaiting-review, plus open PRs whose run record',
     '     (written by this GitHub user) is readable and has no outcome yet (a run that stopped mid-way)',
     'pipeline resume plan --pr N [--repo DIR]',
-    '  -> {ok, pr, title, url, prState, branch, base, liveHead, enter, reason, adopt, confirm, autoMerge, worktree, recordStatus, record,',
+    '  -> {ok, pr, title, url, prState, branch, base, liveHead, enter, reason, adopt, confirm, autoMerge, worktree, stop, recordStatus, record,',
     '      events, local, mergeSha, notes[], warnings[]}; read-only (its only git writes are fetches: the PR head, the base and origin/<branch>)',
     '     enter: closed | ended | observe-prod | not-resumable | local-work | decision | build | verify | review | followups | gate',
     '     adopt: no run record (the PR was not started by the pipeline); confirm: {host, step, minutesAgo, why} when another run may be live,',
+    '     stop: where a run on a route that can reach Step 5 ends, never at a merge: awaiting-owner-merge (owner_approval chat) | needs-human (label mode); null on the other routes',
     '     autoMerge: {armed, action: disarm} when an unattended auto-merge is queued, worktree: {action: reuse|add-existing-ref|add-from-remote|none, path?, then?}',
     '  exit 2 when the PR does not exist',
   ].join('\n'),
@@ -115,7 +116,7 @@ function recordView(record) {
   if (!record) return null;
   return {
     step: record.step, outcome: record.outcome, next: record.next, detail: record.detail, head: record.head, round: record.round,
-    mergeSha: record.mergeSha ?? null, heartbeat: record.heartbeat ?? null, inFlight: record.inFlight ?? null, verify: record.verify ?? null,
+    mergeSha: record.mergeSha ?? null, heartbeat: record.heartbeat ?? null, inFlight: record.inFlight ?? null, verify: record.verify ?? null, resumed: record.resumed ?? null,
     request: record.request, tasks: (record.tasks ?? []).map(taskView), agentLogLine: record.agentLogLine ?? null,
   };
 }
@@ -157,7 +158,7 @@ async function plan(argv, ctx) {
       autoMergeArmed: view.autoMergeRequest != null, host: hostname(),
       recordStatus: a.recordStatus, record: a.record, triage: a.triage, contentHash: g.contentHash,
       needsHumanReason: a.needsHumanReason, events: a.events, local: g.local,
-    }, { now: Date.now() });
+    }, { now: Date.now(), ownerApproval: config.owner_approval });
 
     return {
       exitCode: EXIT.OK,

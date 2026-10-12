@@ -119,6 +119,18 @@ test('applyCheckpoint: heartbeat, history, no mutation of the input', () => {
   assert.equal(applyCheckpoint(rec, {}, { host: 'h', now: new Date(NOW) }).heartbeat.at, '2026-10-12T08:30:00.000Z');
 });
 
+test('applyCheckpoint: resumed is stamped by a patch, normalised, and never cleared by a later one; it survives the codec', () => {
+  const resumed = { at: '2026-10-12T08:00:00.000Z', host: 'pc-2', head: 'a'.repeat(40) };
+  const a = applyCheckpoint(emptyRecord(ID), { step: 'review', resumed }, CTX);
+  assert.deepEqual(a.resumed, resumed);
+  const b = applyCheckpoint(a, { step: 'gate' }, CTX);
+  assert.deepEqual(b.resumed, resumed);
+  assert.deepEqual(applyCheckpoint(a, { resumed: null }, CTX).resumed, resumed, 'null cannot clear it');
+  assert.throws(() => applyCheckpoint(emptyRecord(ID), { resumed: 'yes' }, CTX), /resumed/);
+  const body = `${MARKERS.summary}\n\n${encodeRecord(b)}`;
+  assert.deepEqual(decodeRecord(body).record.resumed, resumed);
+});
+
 test('applyCheckpoint: history keeps the newest 20', () => {
   let rec = emptyRecord(ID);
   for (let i = 0; i < 25; i += 1) rec = applyCheckpoint(rec, { head: `h${i}` }, { host: 'x', now: NOW + i });

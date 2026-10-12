@@ -8,8 +8,10 @@
 //   contentHash: the live head's review hash | null (unknown), needsHumanReason, events: [{kind, id}],
 //   local: null (unknown / not asked) | { state: none|equal|ahead|behind|diverged|unknown, localRef, unpushed, dirty, worktrees: [{path, dirty}] },
 // }
-// Resume never merges and never rolls production back: every route that reaches `gate` ends at the owner-merge stop, and
-// `observe-prod` only watches.
+// Resume never merges and never rolls production back: every route that can reach Step 5 (build, verify, review, followups,
+// gate, and an adopted PR) carries `stop`, where the run ends: awaiting-owner-merge (owner_approval: chat) or needs-human
+// (label mode, also the default when the mode is unknown). `observe-prod` only watches. `P merge` enforces the same rule
+// from the other side (a record marked `resumed` needs --owner-approved-head).
 
 import { unresolvedRollbacks } from './run-events.mjs';
 
@@ -145,7 +147,9 @@ function planWorktree(enter, facts, notes) {
   return worktree;
 }
 
-export function planResume(facts, { now, heartbeatFreshMinutes = 90 } = {}) {
+const STOPS_AT_OWNER = new Set(['build', 'verify', 'review', 'followups', 'gate']);
+
+export function planResume(facts, { now, heartbeatFreshMinutes = 90, ownerApproval = 'label' } = {}) {
   const f = { ...facts, labels: facts.labels ?? [], events: facts.events ?? [] };
   const nowMs = new Date(now).getTime();
   const record = f.recordStatus === 'ok' ? (f.record ?? null) : null;
@@ -185,5 +189,6 @@ export function planResume(facts, { now, heartbeatFreshMinutes = 90 } = {}) {
   if (autoMerge) notes.push('auto-merge is armed on this PR with no live merge of this run: disarm it and report');
 
   const worktree = planWorktree(enter, f, notes);
-  return { enter, reason: picked.reason, adopt: noRecord, confirm, autoMerge, worktree, notes };
+  const stop = STOPS_AT_OWNER.has(enter) ? (ownerApproval === 'chat' ? 'awaiting-owner-merge' : 'needs-human') : null;
+  return { enter, reason: picked.reason, adopt: noRecord, confirm, autoMerge, worktree, stop, notes };
 }

@@ -322,6 +322,36 @@ test('autoMerge: armed with no live merge is disarmed; a live in-flight merge ke
 
 test('the plan always has the full shape', () => {
   const p = plan({});
-  assert.deepEqual(Object.keys(p).sort(), ['adopt', 'autoMerge', 'confirm', 'enter', 'notes', 'reason', 'worktree']);
+  assert.deepEqual(Object.keys(p).sort(), ['adopt', 'autoMerge', 'confirm', 'enter', 'notes', 'reason', 'stop', 'worktree']);
   assert.ok(Array.isArray(p.notes));
+});
+
+// ---- stop: resume never merges on its own (plan goal 3) ----------------------------------------
+
+const ROUTES = {
+  build: { record: record({ tasks: [{ id: 't1', title: 'one', spec: '', done: false }] }) },
+  verify: { record: record({ step: 'verify', verify: null }) },
+  review: { triage: null },
+  followups: { triage: cleanTriage({ followupsPending: true }) },
+  gate: {},
+  adopt: { recordStatus: 'absent', record: null },
+};
+
+test('stop: every route that can reach Step 5 names the owner stop: awaiting-owner-merge in chat mode, needs-human in label mode', () => {
+  for (const [name, over] of Object.entries(ROUTES)) {
+    const chat = plan(over, { ownerApproval: 'chat' });
+    const label = plan(over, { ownerApproval: 'label' });
+    const unset = plan(over);
+    assert.equal(chat.stop, 'awaiting-owner-merge', name);
+    assert.equal(label.stop, 'needs-human', name);
+    assert.equal(unset.stop, 'needs-human', `${name}: no mode given is the strict one`);
+    if (name !== 'adopt') assert.equal(chat.enter, name);
+    else assert.equal(chat.adopt, true);
+  }
+});
+
+test('stop: routes that never reach Step 5 have none', () => {
+  for (const over of [{ state: 'CLOSED' }, { state: 'MERGED' }, { isCrossRepository: true }, { labels: ['needs-human'], recordStatus: 'absent', record: null }, { local: local({ state: 'diverged', unpushed: 1 }) }]) {
+    assert.equal(plan(over, { ownerApproval: 'chat' }).stop, null, JSON.stringify(Object.keys(over)));
+  }
 });

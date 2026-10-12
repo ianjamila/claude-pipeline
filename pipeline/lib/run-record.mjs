@@ -166,7 +166,7 @@ function normaliseInFlight(v) {
 
 // Returns a NEW record. `patch` keys (all optional): step, outcome, next, detail, head, request, tasks (the full list,
 // done kept for ids it omits `done` for), done (ids to mark done), verify, round, mergeSha, inFlight (object | null),
-// agentLogLine, cliVersion. Every call stamps the heartbeat and appends a history entry (capped, oldest dropped).
+// agentLogLine, cliVersion, resumed ({at, host, head}: a run taken over by `ship resume`; set once, never cleared). Every call stamps the heartbeat and appends a history entry (capped, oldest dropped).
 export function applyCheckpoint(record, patch, { host, now }) {
   const next = structuredClone(record);
   if (patch.step !== undefined) {
@@ -198,6 +198,11 @@ export function applyCheckpoint(record, patch, { host, now }) {
   if (patch.inFlight !== undefined) next.inFlight = normaliseInFlight(patch.inFlight);
   if (patch.agentLogLine !== undefined) next.agentLogLine = patch.agentLogLine;
   if (patch.cliVersion !== undefined) next.cliVersion = patch.cliVersion;
+  // A resumed record stays resumed: `null` / absent never clears it (only a record made fresh can lack it).
+  if (patch.resumed != null) {
+    if (!isPlainObject(patch.resumed)) throw new Error('resumed must be {at, host, head}');
+    next.resumed = { at: String(patch.resumed.at ?? ''), host: String(patch.resumed.host ?? ''), head: String(patch.resumed.head ?? '') };
+  }
 
   const at = new Date(now).toISOString();
   next.heartbeat = { host: String(host ?? ''), at };

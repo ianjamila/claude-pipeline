@@ -474,3 +474,82 @@ test('update-branch: a record write that fails only warns', () => {
   assert.equal(r.json.outcome, 'up-to-date');
   assert.ok(r.json.warnings.some((w) => w.startsWith('run record not updated:')));
 });
+
+// ---- resumed runs: the record flag, and P merge's hard guard --------------------------------------------------------------
+
+const RESUMED = { at: '2026-10-12T08:00:00.000Z', host: 'pc-2', head: 'a'.repeat(40) };
+const mergeWith = (s, args = []) => cli(['merge', '--pr', String(PR), ...args], { dir: s.repo.dir, fake: s.fake, env: s.env });
+const withRecord = (o, record, extra = {}) => {
+  const s = mergeScenario(o);
+  s.fake.setScript(ghEntries({ prHead: s.head, comments: [existingSummary({ record })], extra: [PATCH_77, ...DEPLOYMENTS], ...extra }));
+  return s;
+};
+
+test('checkpoint --resumed: stamps record.resumed {at, host, head}; a later checkpoint without the flag keeps it', () => {
+  const s = scenario();
+  const r = checkpoint(s, ['--step', 'review', '--resumed']);
+  assertExit(r, 0);
+  assert.equal(r.json.record.resumed.host, hostname());
+  assert.equal(r.json.record.resumed.head, s.head);
+  assert.ok(Date.parse(r.json.record.resumed.at) <= Date.now());
+
+  const later = scenario();
+  withComment(later, existingSummary({ record: baseRecord({ resumed: RESUMED }) }));
+  const l = checkpoint(later, ['--step', 'gate']);
+  assertExit(l, 0);
+  assert.deepEqual(l.json.record.resumed, RESUMED, 'a resumed record stays resumed');
+  const plain = scenario();
+  assert.equal(checkpoint(plain, ['--step', 'review']).json.record.resumed, undefined, 'a normal run never carries it');
+});
+
+test('merge: a RESUMED run record refuses to merge without --owner-approved-head (pre-merge, exit 1; nothing posted, nothing merged)', () => {
+  const s = withRecord({}, baseRecord({ step: 'gate', resumed: RESUMED }));
+  assertExit(s.gate(), 0);
+  const r = mergeWith(s);
+  assertExit(r, 1);
+  assert.equal(r.json.merged, false);
+  assert.equal(r.json.error, 'pre-merge');
+  assert.equal(r.json.reason, 'resumed run: the owner must approve this exact head (pass --owner-approved-head <sha>)');
+  assert.equal(marker(s), -1, 'the merge command never ran');
+  assert.deepEqual(eventWrites(s.fake), [], 'no prod-before event');
+  assert.deepEqual(recordWrites(s.fake), [], 'no inFlight');
+  assert.deepEqual(s.mergeCalls(), []);
+});
+
+test('merge: --owner-approved-head must be the full gate head; another sha, or an abbreviation, still refuses', () => {
+  const s = withRecord({}, baseRecord({ step: 'gate', resumed: RESUMED }));
+  assertExit(s.gate(), 0);
+  for (const sha of ['b'.repeat(40), s.head.slice(0, 7), s.head.toUpperCase()]) {
+    const r = mergeWith(s, ['--owner-approved-head', sha]);
+    assertExit(r, 1, sha);
+    assert.equal(r.json.error, 'pre-merge');
+    assert.match(r.json.reason, /^resumed run:/);
+  }
+  assert.equal(marker(s), -1);
+});
+
+test('merge: a resumed run merges once the owner\'s approval names exactly the gate head', () => {
+  const s = withRecord({}, baseRecord({ step: 'gate', resumed: RESUMED }));
+  assertExit(s.gate(), 0);
+  const r = mergeWith(s, ['--owner-approved-head', s.head]);
+  assertExit(r, 0, r.stdout);
+  assert.equal(r.json.merged, true);
+  assert.ok(marker(s) >= 0, 'the merge command ran');
+});
+
+test('merge: a record that is NOT resumed merges as before, with or without the flag', () => {
+  const plain = withRecord({}, baseRecord({ step: 'gate' }));
+  assertExit(plain.gate(), 0);
+  assertExit(mergeWith(plain), 0);
+  const flagged = withRecord({}, baseRecord({ step: 'gate' }));
+  assertExit(flagged.gate(), 0);
+  assertExit(mergeWith(flagged, ['--owner-approved-head', 'b'.repeat(40)]), 0);
+});
+
+test('merge: a record that cannot be read does not block a normal run, but warns', () => {
+  const s = mergeScenario({ gh: { extra: [{ match: 'repos/acme/widgets/issues/12/comments --paginate', code: 1, stderr: 'gh: Server Error (HTTP 500)' }, ...DEPLOYMENTS] } });
+  assertExit(s.gate(), 0);
+  const r = mergeWith(s);
+  assertExit(r, 0, r.stdout);
+  assert.ok(r.json.warnings.some((w) => /could not read the run record/.test(w)), JSON.stringify(r.json.warnings));
+});

@@ -206,13 +206,15 @@ Details and every exit code: `reference/gates-and-exits.md`. First: `P checkpoin
 
 ## Step 6 — merge and production
 
-**Every `P merge` attempt (the first, a retry, one after an update-branch or a new head, one from Resume mode) first
-passes the **Owner-merge approval** rule below.** With `owner_approval: label` that rule is a no-op. `P merge`,
+**Every `P merge` attempt (the first, a retry, one after an update-branch or a new head) first passes the
+**Owner-merge approval** rule below.** With `owner_approval: label` its `ownerMerge` count rule is a no-op, but its
+resumed-run rule is not: a run in Resume mode or on an adopted PR never calls `P merge` without the owner's "merge"
+(`P merge` itself refuses a resumed record without `--owner-approved-head`). `P merge`,
 `P prod-watch --pr N` and `P update-branch` keep the record's in-flight marker themselves (no checkpoint needed around
 them). `P merge` posts the `prod-before` event before merging and refuses (`error: pre-merge`, nothing merged) when it
 cannot: see `reference/gates-and-exits.md`.
 
-1. `P job start merge -- node ~/.claude/pipeline/bin/pipeline.mjs merge --pr N` → `P job wait
+1. `P job start merge -- node ~/.claude/pipeline/bin/pipeline.mjs merge --pr N` (a resumed run adds `--owner-approved-head <sha>`, see below) → `P job wait
    merge --run-id <runId> --timeout 540`; read `exitCode` and the JSON in `tail`:
    - 0 ⇒ merged. `mergeSha` is the merge commit; `null` (with a `warning`) means GitHub did not
      name it yet: still run prod-watch, with `--pr N` alone (2 below). Never skip prod-watch.
@@ -235,6 +237,14 @@ cannot: see `reference/gates-and-exits.md`.
    than `merged` to the user immediately, in plain words.
 
 ## Owner-merge approval (`owner_approval: chat`) — applies to EVERY merge attempt
+
+**Resumed runs, in both modes:** a run in Resume mode or on an adopted PR (its run record carries `resumed`) never calls
+`P merge` without the owner's "merge" for that exact head in this session, whatever `ownerMerge` says and in `label` mode
+too. Without it, STOP: `chat` ⇒ `P checkpoint --pr N --step awaiting-owner-merge`, `P summary --pr N --outcome
+awaiting-owner-merge --built "…"`, and the reply's last two lines below (items may be none); `label` ⇒ add `needs-human`,
+`P comment --pr N --kind needs-human --reason "resumed run: the owner merges"`, `P summary --pr N --outcome needs-human
+--built "…"`. When the owner says "merge" for that head, run `P merge --pr N --owner-approved-head <sha>` (the full 40-character
+head the gate covered; any other head is refused).
 
 Owner-merge items are hard-stop hits or test-integrity violations that `label` mode would block. Immediately before
 each `P merge`, take the `ownerMerge` count of the `P final-gate --pr N` that covers the head you are about to merge:
@@ -297,17 +307,20 @@ the owner's next move.
 3. Worktree per `worktree.action`: `reuse` ⇒ `cd` into `path`; `add-existing-ref` ⇒ `git worktree add <path> <branch>`;
    `add-from-remote` ⇒ `git fetch origin <branch>` then `git worktree add --no-track -b <branch> <path> origin/<branch>`;
    never `-B`. Then `then: ff-only` ⇒ `git merge --ff-only <liveHead>` (the plan's exact `liveHead` sha; `plan` already refreshed `origin/<branch>`, but never trust a tracking ref), `then: push` ⇒ `git push origin <branch>`.
-   `P preflight`.
+   `P preflight`. Then take the run over: `P checkpoint --pr N --step <enter> --resumed` (`followups` ⇒ `--step review`;
+   for `adopt: true` step 5's checkpoint is the take-over and carries `--resumed`). The flag marks the record, so `P merge`
+   will not run without `--owner-approved-head` even after a later session picks the run up. The plan's `stop` is where the run ends.
 4. `P state show --pr N`; read `source`. `quarantined` ⇒ tell the owner the local `.review/` went to `quarantinedTo`
    and the published state was restored. Exit 2 `no-state` is normal when Codex was down in round 1.
 5. `adopt: true` (no run record: the PR was not started by the pipeline) ⇒ Step 3.2 checks on the real diff, then
-   `P checkpoint --pr N --step review --request-file <file with "adopted PR #N">`; review from published state first.
+   `P checkpoint --pr N --step review --resumed --request-file <file with "adopted PR #N">`; review from published state first.
 6. Continue: `build` ⇒ Step 2 with the unfinished tasks from `record.tasks`; `verify` ⇒ Step 2.2; `review` ⇒ Step 4
    from the first incomplete round (`P state discard-round` for an unpublished one); `followups` ⇒ `P followups create
    --round R`, re-post the triage comment, then Step 5; `gate` ⇒ Step 5.
 7. After a clean review, `P review-complete --pr N` removes `awaiting-review` (exit 1 ⇒ the review is not valid for
-   this head: run another round). Every route that reaches Step 5 ends at the owner-merge stop (invariant 9): Step 6
-   runs only after the owner says "merge" for the head the gate covered.
+   this head: run another round). Every route that reaches Step 5 ends at the plan's `stop` (invariant 9):
+   `awaiting-owner-merge` (chat) or `needs-human` (label), see **Owner-merge approval** "Resumed runs". Step 6
+   runs only after the owner says "merge" for the head the gate covered, and then with `--owner-approved-head <sha>`.
 
 ## Promoting suggestions
 

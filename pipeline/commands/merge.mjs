@@ -13,6 +13,7 @@ import { headSha } from '../lib/git.mjs';
 import { currentProduction } from '../lib/deploy.mjs';
 import { runShellAsync } from '../lib/proc.mjs';
 import { postEvent } from '../lib/run-events.mjs';
+import { readSummaryComment } from '../lib/summary-comment.mjs';
 import { createRunRecorder, inFlightSince } from '../lib/run-progress.mjs';
 import { bringUpToDate, updateTiming } from '../lib/updatebranch.mjs';
 import {
@@ -22,7 +23,7 @@ import {
 
 export const meta = {
   summary: 'merge the PR if (and only if) the final gate passes again, live; waits for MERGED',
-  usage: 'pipeline merge --pr N [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?, warnings?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment. While it runs the run record of the PR shows inFlight {kind: merge} and step merge; a prod-before event comment (the known-good deployment) is posted before the merge command, and when that post fails nothing is merged (error pre-merge); warnings lists a run record write that failed (never fatal)',
+  usage: 'pipeline merge --pr N [--owner-approved-head SHA] [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?, warnings?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment. While it runs the run record of the PR shows inFlight {kind: merge} and step merge; a prod-before event comment (the known-good deployment) is posted before the merge command, and when that post fails nothing is merged (error pre-merge); warnings lists a run record write that failed (never fatal). A run record marked resumed (`P checkpoint --resumed`: a run taken over by ship resume) refuses with error pre-merge unless --owner-approved-head names the full gate head: only the owner\'s \"merge\" for that head supplies it',
 };
 
 const refuse = (error, reasons, extra = {}) => ({
@@ -31,7 +32,7 @@ const refuse = (error, reasons, extra = {}) => ({
 });
 
 export const run = guarded(async (argv, ctx) => {
-  const { values } = parseCommandArgs(argv, { pr: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
+  const { values } = parseCommandArgs(argv, { pr: { type: 'string' }, repo: { type: 'string' }, 'owner-approved-head': { type: 'string' } }, { allowPositionals: false });
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
@@ -49,6 +50,24 @@ export const run = guarded(async (argv, ctx) => {
       gate, pr, head, prHead: gh.prView(pr, [...PR_FIELDS]).headRefOid, hash, repo: gh.repo().slug, previewConfigured: config.preview !== null,
     });
     if (refusals.length > 0) return refuse('gate', refusals);
+
+    // 1a. A resumed run never merges on its own: the run record (viewer-authored, so not forgeable by a commenter) says whether this
+    // run was taken over by `ship resume`; if so the owner's approval of THIS exact head must come in as a flag. Read before
+    // anything irreversible. A record that cannot be read does not block a normal run (a warning, not a refusal).
+    const warnings = [];
+    try {
+      const existing = readSummaryComment(gh, pr);
+      if (existing.status === 'ok' && existing.record.resumed) {
+        if (!(values['owner-approved-head'] === gate.head && /^[0-9a-f]{40}$/.test(gate.head))) {
+          const reason = 'resumed run: the owner must approve this exact head (pass --owner-approved-head <sha>)';
+          return refuse('pre-merge', [reason], { reason });
+        }
+      } else if (existing.status === 'invalid' || existing.status === 'unsupported') {
+        warnings.push(`could not read the run record (${existing.status}): the resumed-run guard could not be checked`);
+      }
+    } catch (err) {
+      warnings.push(`could not read the run record: the resumed-run guard could not be checked (${String(err?.message ?? err).slice(0, 200)})`);
+    }
 
     // 1b. Main may have moved since the gate ran: the gate, and the CI it waited on, then judged a tree that is NOT the one that
     // would land. Bring the branch up to date on GitHub (one update; expected_head_sha = the approved head), then refuse: the new
@@ -174,7 +193,8 @@ export const run = guarded(async (argv, ctx) => {
         ? { step: 'prod-watch', mergeSha: out.mergeSha ?? null, inFlight: null }
         : { step: 'gate', inFlight: null });
     }
-    if (recorder.warnings.length > 0) result.output.warnings = recorder.warnings;
+    warnings.push(...recorder.warnings);
+    if (warnings.length > 0) result.output.warnings = warnings;
     return result;
   });
 });

@@ -115,6 +115,7 @@ test('plan: output shape for an open, reviewed PR whose local branch matches (ga
   assert.equal(j.ok, true);
   assert.deepEqual([j.pr, j.branch, j.base, j.liveHead, j.prState], [7, 'agent/pr-7', 'main', sha, 'OPEN']);
   assert.equal(j.enter, 'gate');
+  assert.equal(j.stop, 'needs-human', 'label mode (the default): resume ends at the owner, never at a merge');
   assert.equal(j.adopt, false);
   assert.equal(j.confirm, null);
   assert.equal(j.autoMerge, null);
@@ -374,4 +375,22 @@ test('list: a failing gh is exit 3', () => {
   const w = world();
   const fake = createFakeGh([...BASE_ENTRIES, { match: 'graphql', code: 1, stderr: 'boom' }]);
   assertExit(resume(['list'], { w, fake }), 3);
+});
+
+test('plan: owner_approval chat names awaiting-owner-merge as the stop; the record shows resumed', () => {
+  const w = world();
+  const sha = w.prBranch(7, { 'b.txt': 'b\n' });
+  w.repo.write('.claude/pipeline.yml', `${pipelineYml('github', ['ci'])}owner_approval: chat\n`);
+  const hash = reviewContentHash({ branch: 'main', agentLog: AGENT_LOG, head: sha, baseSha: w.base }, { cwd: w.repo.dir });
+  const resumed = { at: '2026-10-12T08:00:00.000Z', host: 'pc-2', head: sha };
+  const fake = createFakeGh([
+    ...BASE_ENTRIES,
+    { match: VIEW(7), stdoutJson: view(7, sha) },
+    { match: COMMENTS(7), stdoutJson: [recordComment(1, 7, { head: sha, round: 1, resumed, verify: { head: sha, tree: 't', mode: 'full', ok: true, failedStep: null } }), triageStateComment(2, 7, hash)] },
+  ]);
+  const r = resume(['plan', '--pr', '7'], { w, fake });
+  assertExit(r, 0);
+  assert.equal(r.json.enter, 'gate');
+  assert.equal(r.json.stop, 'awaiting-owner-merge');
+  assert.deepEqual(r.json.record.resumed, resumed);
 });
