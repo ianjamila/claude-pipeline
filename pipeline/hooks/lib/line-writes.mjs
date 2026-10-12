@@ -360,12 +360,14 @@ function argRecords(cmd, name, idx) {
     return out;
   }
   if (name === 'sed' || name === 'gsed' || name === 'perl' || name === 'ruby') {
-    const inPlace = args.some((a) => /^-[A-Za-z]*i/.test(a) || a === '--in-place' || a.startsWith('--in-place='));
-    const wfiles = name === 'sed' || name === 'gsed' ? sedWriteTargets(args) : [];
+    const isSed = name === 'sed' || name === 'gsed';
+    const inPlace = args.some((a) => (isSed ? sedInPlaceArg(a) : /^-[A-Za-z]*i/.test(a) || a === '--in-place' || a.startsWith('--in-place='))); // (perl / ruby -I is an include path)
+    const wfiles = isSed ? sedWriteTargets(args) : [];
     if (!inPlace) return wfiles.length ? wfiles.map((d) => unknown(d)) : null; // `w FILE` / `s///w FILE` write a file too
-    const { pos, opts } = getopt(args, name === 'sed' || name === 'gsed' ? 'efl' : 'eIlF', ['expression', 'file', 'line-length']);
+    if (isSed) return [...sedPrograms(args).targets, ...wfiles].map((dest) => unknown(dest)); // (one parser for the programs and the files; an in-place sed may also `w FILE`)
+    const { pos, opts } = getopt(args, 'eIlF', ['expression', 'file', 'line-length']);
     const hasProgram = hasOpt(opts, 'e', 'f', 'expression', 'file');
-    return (name === 'sed' || name === 'gsed' ? (hasProgram ? pos : pos.slice(1)) : (hasProgram ? pos : pos.slice(1))).map((dest) => unknown(dest));
+    return (hasProgram ? pos : pos.slice(1)).map((dest) => unknown(dest));
   }
   if (name === 'tar' || name === 'bsdtar' || name === 'gtar') {
     const first = args[0] ?? '';
@@ -485,30 +487,42 @@ export function sedScan(prog) {
   return { runs, writes: [...new Set(writes.filter(Boolean))] };
 }
 export const sedUnsafe = (prog) => { const r = sedScan(prog); return r.runs || r.writes.length > 0 || /(?:^|[;{}\s\d$!,])[wWe]\s*$/.test(prog); };
-// The sed programs among the arguments: the script words (-e PROG, -ePROG, -ne PROG, --expression=PROG, --expression PROG) and the positional words (the first is the
-// program, the rest files: all are scanned); `file`: a -f / --file script, whose text we do not read here.
+// an in-place option of sed: -i / -I (BSD) in a bundle, or --in-place / any abbreviation of it (GNU takes a unique prefix: --in-pl, --i)
+export const sedInPlaceArg = (a) => /^-[A-Za-z]*[iI]/.test(a) || (a.startsWith('--') && a.length > 2 && 'in-place'.startsWith(a.slice(2).split('=')[0]));
+// The sed programs among the arguments: the script words (-e PROG, -ePROG, -ne PROG, --expression=PROG, --expression PROG; a GNU long option may be abbreviated: --expr) and, when there
+// is none, the first positional word (the rest are files: a file named web.ts / etc/passwd / ~/.claude/pipeline/... is not a `w` / `e` / `s///e` program). BSD `-i ''` takes its suffix before the
+// program, so after a bare -i the second positional word is scanned too. `file`: a -f / --file script, whose text we do not read here. `targets`: the file words.
 export function sedPrograms(args) {
   const progs = [];
+  const pos = [];
+  const early = new Set(); // positional words that come before an option word: BSD / POSIXLY_CORRECT sed stop reading options at the first of them, so it is the program there
   let file = false;
+  let script = false;
+  let bareInPlace = false;
+  const longIs = (nm, full) => nm !== '' && full.startsWith(nm);
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === '--') { progs.push(...args.slice(i + 1)); break; }
+    if (a === '--') { pos.push(...args.slice(i + 1)); break; }
+    if (a.startsWith('-') && a.length > 1) for (const w of pos) early.add(w);
     if (a.startsWith('--')) {
       const eq = a.indexOf('=');
       const nm = eq > 0 ? a.slice(2, eq) : a.slice(2);
-      if (nm === 'expression') progs.push(eq > 0 ? a.slice(eq + 1) : (args[++i] ?? ''));
-      else if (nm === 'file') { file = true; if (eq < 0) i++; } else if (nm === 'line-length' && eq < 0) i++;
+      if (longIs(nm, 'expression')) { script = true; progs.push(eq > 0 ? a.slice(eq + 1) : (args[++i] ?? '')); } else if (longIs(nm, 'file')) { file = true; script = true; if (eq < 0) i++; } else if (longIs(nm, 'line-length') && eq < 0) i++;
     } else if (a.length > 1 && a[0] === '-') {
       for (let k = 1; k < a.length; k++) {
         const rest = a.slice(k + 1);
-        if (a[k] === 'e') { progs.push(rest !== '' ? rest : (args[++i] ?? '')); break; }
-        if (a[k] === 'f') { file = true; if (rest === '') i++; break; }
+        if (a[k] === 'e') { script = true; progs.push(rest !== '' ? rest : (args[++i] ?? '')); break; }
+        if (a[k] === 'f') { file = true; script = true; if (rest === '') i++; break; }
         if (a[k] === 'l') { if (rest === '') i++; break; }
-        if (a[k] === 'i') break; // -i[SUFFIX]
+        if (a[k] === 'i' || a[k] === 'I') { if (rest === '') bareInPlace = true; break; } // -i[SUFFIX] (BSD -I too; BSD takes a bare suffix as the next word)
       }
-    } else progs.push(a);
+    } else pos.push(a);
   }
-  return { progs, file };
+  if (!script) progs.push(...pos.slice(0, bareInPlace ? 2 : 1));
+  progs.push(...[...early].filter((w) => !progs.includes(w)));
+  // the files it edits / reads: every positional word when a script option gave the program, else those after the program (after a bare -i the first word is the program (GNU) or the suffix (BSD): every word is a possible file; so is a word before an option)
+  const targets = [...new Set([...(script || bareInPlace ? pos : pos.slice(1)), ...early])];
+  return { progs, file, targets };
 }
 // does any program of these sed arguments write a file or run a command (or is a script file we cannot read)?
 export function sedArgsUnsafe(args) {
@@ -530,7 +544,7 @@ function isPure(cmd, name) {
     return !GIT_TREE.has(sub) && !args.some((a) => OUTPUT_LONG.test(a) || a === '-o');
   }
   if (name === 'gh') return !args.some((a) => /^(?:download|checkout|clone)$/.test(a) || OUTPUT_LONG.test(a));
-  if (name === 'sed' || name === 'gsed') return !args.some((a) => /^-[A-Za-z]*i/.test(a) || a === '--in-place' || OUTPUT_LONG.test(a) || sedArgsUnsafe(args));
+  if (name === 'sed' || name === 'gsed') return !args.some((a) => sedInPlaceArg(a) || OUTPUT_LONG.test(a)) && !sedArgsUnsafe(args);
   if (['awk', 'gawk', 'mawk', 'nawk'].includes(name)) return !args.some((a) => (a.startsWith('-') ? /^-[A-Za-z]*[ifE]/.test(a) || OUTPUT_LONG.test(a) : /[>|]|\bsystem\s*\(/.test(a)));
   if (name === 'find') return !args.some((a) => /^-(?:delete|exec|execdir|ok|okdir|fprint0?|fprintf|fls)$/.test(a));
   if (name === 'xxd') return !args.includes('-r') && args.filter((a) => !a.startsWith('-')).length <= 1;

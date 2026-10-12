@@ -19,7 +19,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
 import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf } from './shell-parse.mjs';
-import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets } from './line-writes.mjs';
+import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg } from './line-writes.mjs';
 import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
 
 const posix = path.posix;
@@ -649,7 +649,7 @@ const FAN_OUT_RE = /(?:^|[\s;&|(`])(?:xargs|parallel)(?=\s|$)/;
 const shellQuote = (w) => (/^[\w@%+=:,./~-]+$/.test(w) ? w : `'${w.replace(/'/g, `'\\''`)}'`);
 
 // `-i`, `-i.bak`, `-pi`, `-ni`, `--in-place`
-const inPlaceFlag = (a) => /^-[A-Za-z]*i/.test(a) || a === '--in-place' || a.startsWith('--in-place=');
+const inPlaceFlag = sedInPlaceArg;
 const positional = (args) => args.filter((a) => !a.startsWith('-') && !/^\d+$/.test(a));
 
 // A sed script with a `w FILE` / `W FILE` command or flag, or an `e` command or flag, writes or runs something.

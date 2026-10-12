@@ -13,7 +13,7 @@ import { resolve, dirname, basename } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { simpleCommands } from '../pipeline/hooks/lib/shell-parse.mjs';
-import { writesOf, printfText, flowStart, namesFile } from '../pipeline/hooks/lib/line-writes.mjs';
+import { writesOf, printfText, flowStart, namesFile, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg } from '../pipeline/hooks/lib/line-writes.mjs';
 
 function fakeFs(root, files, dirs = []) {
   const abs = (p) => resolve(root, p);
@@ -771,4 +771,42 @@ test('L1b: a source a rewriting command transforms is judged as text fed to a sh
   // a plain copy is the file itself: judged as the program it is
   allowBoth('cp js.mjs n.mjs && node n.mjs', spec);
   allowBoth('cat js.mjs > n.mjs && node n.mjs', spec);
+});
+
+test('L1b: a sed program is the first word (or the -e / -f / --expression words); the files it reads are not programs (web.ts, etc/passwd, ~/.claude/pipeline/...)', () => {
+  // Why: every positional word of a sed was scanned as a program, so `sed -n 1p web.ts` "wrote a file" (`web.ts` = the w command) and `sed -n 1p ~/.claude/pipeline/hooks/x.mjs` "ran a command" (`s/jamila/.claude/pipe`
+  // read as `s///e`): a plain read of a protected file was refused. With -e / -f every positional word is a file; without, only the first is the program (BSD `-i ''` takes the suffix before it).
+  const safe = [['-n', '1p', 'web.ts'], ['-n', '1p', 'etc/passwd'], ['-e', 'p', 'exports.js'], ['-n', '-e', 'p', '-e', '2p', 'e.txt'], ['--expression=p', 'web.ts'], ['-i', '', 's/a/b/', 'web.ts'], ['-n', '1p', '--', 'web.ts'], ['-n', '-s', '1p', 'web.ts'], ['-n', '1p', '/home/u/.claude/pipeline/hooks/x.mjs'], ['--quiet', '1,5p', 'wwv/e']];
+  for (const a of safe) assert.equal(sedArgsUnsafe(a), false, a.join(' '));
+  assert.deepEqual(sedWriteTargets(['-n', '1p', 'web.ts']), []);
+  // the nearest twins: the program is a w / e command wherever it sits, spelled with an abbreviated long option, after the BSD suffix, or a script file we cannot read
+  const unsafe = [['--expr=1e id', 'f'], ['--expr', 'w o', 'f'], ['--exp', 'w o', 'f'], ['--e=w o', 'f'], ['-i', '', 'w o', 'f'], ['-i', 'w o', 'f'], ['-n', '-f', 's.sed', 'f'], ['--f=s.sed', 'f'], ['--file=s.sed', 'f'], ['1p;w o', 'web.ts'],
+    ['-e', '1p', '-e', 'w o', 'f'], ['-s', '-e', 'e id', 'f'], ['--quiet', 'w o', 'f'], ['-ne', 'w o', 'f'], ['-n', '--', 'w o', 'f'], ['-n', '-l', '5', 'w o', 'f'], ['w o', '-e', 'p', 'f'], ['w o', '-n', 'f'], ['1p', 'f', '--expression=w o']];
+  for (const a of unsafe) assert.equal(sedArgsUnsafe(a), true, a.join(' '));
+  assert.deepEqual(sedWriteTargets(['--expr', 'w o', 'f']), ['o']);
+  // both policies: a read of a protected file with sed is read-only, a run / write is not
+  const fsOpts = fakeFs(PROJ, {});
+  for (const l of ["sed -n '1,60p' ~/.claude/pipeline/hooks/guard-git.mjs", 'sed -n 1p ~/.claude/pipeline/etc/web.mjs', "sed 's/a/b/' ~/.claude/pipeline/hooks/x.mjs | head -3"]) assert.equal(files(l, fsOpts).decision, 'allow', l);
+  for (const l of ["sed --expr '1e id' ~/.claude/pipeline/hooks/x.mjs", "sed --expr='1e id' ~/.claude/pipeline/hooks/x.mjs", "sed -n 'w ~/.claude/pipeline/x' f", "sed -i '' 's/a/b/' ~/.claude/pipeline/hooks/x.mjs", "sed -f s.sed ~/.claude/pipeline/hooks/x.mjs"]) assert.equal(files(l, fsOpts).decision, 'deny', l);
+});
+
+test('L1b: BSD sed -I (in place, separate suffix) and an abbreviated --in-place are in-place edits like -i', () => {
+  // Why: only a lowercase -i / the full --in-place were taken for an in-place edit, so `sed -I '' 's/a/b/' <protected file>` was "read-only" and `sed -I '' 'w n.sh' f` read '' as the program
+  assert.equal(sedArgsUnsafe(['-I', '', 'w o', 'f']), true);
+  assert.equal(sedArgsUnsafe(['-I', '', 's/a/b/', 'web.ts']), false);
+  assert.equal(sedArgsUnsafe(['-nI', '', 'w o', 'f']), true);
+  assert.deepEqual(sedWriteTargets(['-I', '', 'w o', 'f']), ['o']);
+  const fsOpts = fakeFs(PROJ, {});
+  for (const l of ["sed -I '' 's/a/b/' ~/.claude/pipeline/hooks/x.mjs", "sed --in-pl 's/a/b/' ~/.claude/pipeline/hooks/x.mjs", "sed --i 's/a/b/' ~/.claude/pipeline/hooks/x.mjs", "sed -I.bak 's/a/b/' ~/.claude/pipeline/hooks/x.mjs", "sed --in-place=.bak 's/a/b/' ~/.claude/pipeline/hooks/x.mjs", "sed --in 's/a/b/' ~/.claude/pipeline/hooks/x.mjs", "sed --in-pl=.bak 's/a/b/' ~/.claude/pipeline/hooks/x.mjs", "sed -ni 's/a/b/' ~/.claude/pipeline/hooks/x.mjs"]) assert.equal(files(l, fsOpts).decision, 'deny', l);
+  for (const a of ['--in-place', '--in-place=.bak', '--in-pl', '--in-pl=.b', '--in', '--i', '-i', '-i.bak', '-ni', '-I', '-nI']) assert.equal(sedInPlaceArg(a), true, a);
+  for (const a of ['--indent', '--quiet', '--in-places', '-n', '-e', '--', '-']) assert.equal(sedInPlaceArg(a), false, a);
+  assert.equal(files("sed --indent 's/a/b/' ~/.claude/pipeline/hooks/x.mjs", fsOpts).decision, 'allow'); // (not an abbreviation of --in-place)
+  // the line's own writes: the edit's result and the file a `w` command writes are unknown content
+  denyBoth((_, mid) => `sed -I '' 's/a/b/' ok.sh; ${mid}; bash ok.sh`);
+  denyBoth((_, mid) => `sed --in-pl 's/a/b/' ok.sh; ${mid}; bash ok.sh`);
+  denyBoth((_, mid) => `sed -i 'w n.sh' ok.sh; ${mid}; bash n.sh`); // (an in-place sed may also write a file with w)
+  assert.equal(run((_, mid) => `perl -I src t.pl ok.sh; ${mid}; bash ok.sh`, SPEC).git.r.decision, 'allow'); // (perl -I is an include path, not an edit in place)
+  // the files an in-place sed edits come from the same parser as its programs: abbreviations and bundles do not make the first file the program
+  for (const l of ["sed --expr='s/a/b/' -i ok.sh", "sed -i --expression='s/a/b/' ok.sh", "sed --fi=s.sed -i ok.sh", "sed -i -ne p ok.sh", "sed -i -e p -e p ok.sh"]) denyBoth((_, mid) => `${l}; ${mid}; bash ok.sh`);
+  denyBoth((_, mid) => `sed -I '' 'w n.sh' ok.sh; ${mid}; bash n.sh`);
 });
