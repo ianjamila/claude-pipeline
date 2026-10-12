@@ -240,6 +240,19 @@ test('config precedence is per field: the environment beats the file independent
   );
 });
 
+test('a blank NTFY_SERVER is present-but-invalid: no send, never the default server (topic and token stay lenient)', () => {
+  const a = rig({ secrets: 'NTFY_TOPIC=good\nNTFY_SERVER=\n' });
+  assert.deepEqual(loadNotifyConfig({ env: {}, secretsFile: a.deps.secretsFile }), { ok: false, reason: 'invalid-config:server' });
+  // A present (blank) env value wins and does not fall through to the valid file value.
+  const b = rig({ secrets: 'NTFY_TOPIC=good\nNTFY_SERVER=https://file.example.com\n' });
+  assert.deepEqual(loadNotifyConfig({ env: { NTFY_SERVER: '' }, secretsFile: b.deps.secretsFile }), { ok: false, reason: 'invalid-config:server' });
+  // Only the server changed: a blank topic is still "no topic", a blank token still sends without a token.
+  const c = rig({ secrets: 'NTFY_TOPIC=\n' });
+  assert.deepEqual(loadNotifyConfig({ env: {}, secretsFile: c.deps.secretsFile }), { ok: false, reason: 'no-topic' });
+  const d = rig({ secrets: 'NTFY_TOPIC=good\nNTFY_TOKEN=\n' });
+  assert.deepEqual(loadNotifyConfig({ env: {}, secretsFile: d.deps.secretsFile }), { ok: true, topic: 'good', server: 'https://ntfy.sh', token: undefined });
+});
+
 test('PIPELINE_SECRETS_FILE overrides the secrets path', () => {
   const r = rig();
   assert.equal(loadNotifyConfig({ env: { PIPELINE_SECRETS_FILE: r.deps.secretsFile } }).topic, TOPIC);

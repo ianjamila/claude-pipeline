@@ -232,7 +232,8 @@ function validServer(value) {
 }
 
 // { ok:true, topic, server, token } | { ok:false, reason }. Per field: the environment first, then the file. A field that
-// is present but invalid stops the send (never a fallback to another server or a looser value).
+// is present but invalid stops the send (never a fallback to another server or a looser value). A blank topic or token
+// counts as unset; a blank server does not (the default applies only when NTFY_SERVER is unset everywhere).
 export function loadNotifyConfig({ env = process.env, secretsFile, readFile = (f) => fs.readFileSync(f, 'utf8') } = {}) {
   if (String(env.PIPELINE_NOTIFY ?? '').toLowerCase() === 'off') return { ok: false, reason: 'disabled' };
   const file = secretsFile ?? env.PIPELINE_SECRETS_FILE ?? DEFAULT_SECRETS_FILE;
@@ -249,7 +250,9 @@ export function loadNotifyConfig({ env = process.env, secretsFile, readFile = (f
     return f === undefined || f === '' ? undefined : f;
   };
   const topic = pick('NTFY_TOPIC');
-  const rawServer = pick('NTFY_SERVER');
+  // The server is the one field where blank is NOT "unset": a present value (even blank) wins and must be valid, so a
+  // typo'd `NTFY_SERVER=` can never silently route the push to the public default.
+  const rawServer = env.NTFY_SERVER !== undefined ? env.NTFY_SERVER : fromFile.get('NTFY_SERVER');
   const token = pick('NTFY_TOKEN');
   if (topic === INVALID || (topic !== undefined && !TOPIC_RE.test(topic))) return { ok: false, reason: 'invalid-config:topic' };
   if (topic === undefined && rawServer === undefined && token === undefined) return { ok: false, reason: 'no-topic' };
