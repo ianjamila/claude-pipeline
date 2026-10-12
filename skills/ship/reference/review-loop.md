@@ -5,6 +5,23 @@ request number, `<round>` the round number (1, 2, 3). One round = one Codex pass
 arbitration + implementation. Max `review.max_rounds` (default 3). Commands run as jobs report their
 real code as `exitCode` in `job wait` (see Invariant 8 in `SKILL.md`).
 
+## Replaying a review (resume, or a second machine)
+
+`P state show --pr <pr>` compares `.review/state.json` with the state in the PR's triage comment, which is
+authoritative. Read `source` in the output:
+- `local`: equal to the published state, or it only EXTENDS it (every published round identical, plus a later
+  round that was never published). Continue from it.
+- `published`: there was no local state; it was rebuilt from the comment (`recovered: true`).
+- `quarantined`: the local state disagreed with the comment (same head/hash is not enough: the decisions must
+  match too). The whole local `.review/` was moved to `quarantinedTo` (`.review/stale-<UTC time>/`, kept, never
+  deleted) and the published state restored. Tell the owner; work from the restored state.
+
+An interrupted round (Codex ran, but the loop stopped before its triage comment) is not part of the published
+state. Discard it before running the same round number again: `P state discard-round --round <round> --pr <pr>`
+removes it from the local state and moves `.review/round-<round>/` aside. It refuses (exit 2) a round the comment
+already holds. A `P state outcome` with `followupsPending: true` means a published FOLLOW-UP has no issue yet: run
+`P followups create --round <round>` (no Codex) and re-post the triage comment before the gate.
+
 ## Round `<round>`
 
 ### 1. Codex
@@ -114,9 +131,14 @@ permissions / data-integrity / data-loss item ⇒ `needsHuman` (the CLI applies 
   `needs-human`. Then `P state mark-implemented --ids <ids>` — exit 2 `no-code-change` means the
   branch content is still what the round reviewed: the fix has not actually changed code, so go back to
   the implementer (marking never substitutes for a fix; a green `verify.full` must show the fix).
-- FOLLOW-UP: `P followups create --round <round>` (one issue each, label `agent-suggestion`).
+- `P comment --pr <pr> --kind triage` (one comment, updated in place each round): post it FIRST, so the decided
+  items are published before any issue exists. A run that dies after this point resumes from that comment.
+- FOLLOW-UP: `P followups create --round <round>` (one issue each, label `agent-suggestion`). Each issue body starts
+  with `<!-- claude-pipeline:followup pr=<pr> fp=<fingerprint> -->`; before creating, the command reuses an existing
+  issue of ours with that marker (open or closed), so a re-run after a crash files only the missing ones. `reused` /
+  `duplicates` in the output are reported to the owner, never closed. Then post `P comment --pr <pr> --kind triage`
+  AGAIN so the comment carries the issue links.
 - REJECT: nothing (listed in the summary with the reason).
-- `P comment --pr <pr> --kind triage` (one comment, updated in place each round).
 - Clean exit: `P review-complete --pr <pr>` is only for the resume path (it removes `awaiting-review`
   after a valid review); the normal loop ends at step 7.
 
