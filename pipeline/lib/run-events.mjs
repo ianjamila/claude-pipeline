@@ -59,6 +59,12 @@ export function unresolvedRollbacks(events, { mergeSha = null } = {}) {
   return (events ?? []).filter((e) => e.kind === 'rollback-intent' && forMerge(e) && !done.has(String(e.id)));
 }
 
+// The `rollback-result` events of THIS merge, oldest first: attempts whose outcome was recorded. A result whose payload
+// cannot be read is left out (it cannot be shown to belong to this merge, nor say how the attempt ended).
+export function resolvedRollbacks(events, { mergeSha = null } = {}) {
+  return (events ?? []).filter((e) => e.kind === 'rollback-result' && e.dataStatus === 'ok' && (!mergeSha || e.data?.mergeSha === mergeSha));
+}
+
 export const readEvents = (gh, pr) => listEvents(gh.listComments(pr), gh.viewer());
 
 // Always a new comment: this never calls upsertComment, so a second event can never rewrite a first one.

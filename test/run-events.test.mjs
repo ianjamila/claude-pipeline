@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createGitHub } from '../pipeline/lib/github.mjs';
-import { EVENT_KINDS, listEvents, parseEvent, postEvent, readEvents, renderEvent, unresolvedRollbacks } from '../pipeline/lib/run-events.mjs';
+import { EVENT_KINDS, listEvents, parseEvent, postEvent, readEvents, renderEvent, resolvedRollbacks, unresolvedRollbacks } from '../pipeline/lib/run-events.mjs';
 import { createFakeGh, REPO_VIEW } from './helpers/fakegh-env.mjs';
 
 const REPO = { match: '^repo view', stdoutJson: REPO_VIEW };
@@ -104,4 +104,16 @@ test('unresolvedRollbacks: mergeSha narrows to one merge; an unreadable payload 
   // the result for a-1 is another merge's, so it does not close a-1 for AAA
   assert.deepEqual(unresolvedRollbacks(events, { mergeSha: 'AAA' }).map((e) => e.id), ['a-1', 'c-1']);
   assert.deepEqual(unresolvedRollbacks(events, { mergeSha: 'BBB' }).map((e) => e.id), ['b-1', 'c-1']);
+});
+
+test('resolvedRollbacks: the rollback-results of this merge (readable payload only), oldest first', () => {
+  const R = (id, mergeSha, extra = {}) => ({ kind: 'rollback-result', id, data: { mergeSha, ...extra }, dataStatus: 'ok' });
+  const events = [
+    { kind: 'rollback-intent', id: 'a-1', data: { mergeSha: 'AAA' }, dataStatus: 'ok' },
+    R('a-1', 'AAA', { ok: false }), R('b-1', 'BBB'), R('a-2', 'AAA', { ok: true, verified: true }),
+    { kind: 'rollback-result', id: 'z-1', data: null, dataStatus: 'invalid' },
+  ];
+  assert.deepEqual(resolvedRollbacks(events, { mergeSha: 'AAA' }).map((e) => e.id), ['a-1', 'a-2']);
+  assert.deepEqual(resolvedRollbacks(events, { mergeSha: 'CCC' }), []);
+  assert.deepEqual(resolvedRollbacks(undefined, { mergeSha: 'AAA' }), []);
 });

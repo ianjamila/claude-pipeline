@@ -1165,6 +1165,58 @@ test('observe-only: an interrupted rollback is reported on every outcome, and an
   assert.match(out.warnings[0], /interrupted rollback: gh api: 500/);
 });
 
+// ---- a rollback that already completed (the original watch died before `P summary`)
+
+const doneRollback = (over = {}, recovered = true) => [
+  eventOf('rollback-intent', 'aaaaaaa-1', { mergeSha: SHA }),
+  eventOf('rollback-result', 'aaaaaaa-1', { mergeSha: SHA, ok: true, verified: true, ...over }),
+  ...(recovered ? [eventOf('recovery-reported', 'aaaaaaa-1', { mergeSha: SHA, issueUrl: 'https://github.com/acme/widgets/issues/50', revertPrUrl: 'https://github.com/acme/widgets/pull/51' })] : []),
+];
+
+test('observe-only: a COMPLETED rollback is reported as recovered without re-smoking, with the issue and revert PR, and the record closes that way', async () => {
+  const h = harness({ smoke: [FAIL], inspect: [OLDER], events: true, record: true, eventList: [PROD_BEFORE, ...doneRollback()] });
+  const r = await h.go({ observeOnly: true, host: 'pc-2' });
+  assert.equal(r.outcome, 'recovered');
+  assert.equal(r.observeOnly, true);
+  assert.equal(r.issue.url, 'https://github.com/acme/widgets/issues/50');
+  assert.equal(r.revertPr.url, 'https://github.com/acme/widgets/pull/51');
+  assert.equal(r.recorded.id, 'aaaaaaa-1');
+  assert.equal(h.smoke.calls.length, 0, 'no smoke: the recorded outcome is the truth');
+  assert.equal(h.findDeployment.calls.length, 0);
+  // read-only (the issue / revert PR in the JSON are the ones the ORIGINAL run recorded, not new ones)
+  assert.deepEqual([h.rollbackFn.calls.length, h.issueCreate.calls.length, h.prCreate.calls.length, h.revertBranch.calls.length, h.posted.length, h.locks.length], [0, 0, 0, 0, 0, 0]);
+  assert.equal(r.rollbackInterrupted, undefined);
+  assert.deepEqual(h.recordCalls.at(-1)?.slice(0, 2), ['finish', 'recovered']);
+});
+
+test('observe-only: a completed rollback that failed or was not verified is rollback-failed', async () => {
+  for (const over of [{ ok: false, verified: false }, { ok: true, verified: false }]) {
+    const h = harness({ smoke: [PASS], inspect: [OURS], events: true, record: true, eventList: doneRollback(over, false) });
+    const r = await h.go({ observeOnly: true });
+    assert.equal(r.outcome, 'rollback-failed', JSON.stringify(over));
+    assert.equal(h.smoke.calls.length, 0);
+    assert.equal(r.issue, null, 'no recovery-reported event, so no issue to surface');
+    assert.deepEqual(h.recordCalls.at(-1)?.slice(0, 2), ['finish', 'rollback-failed']);
+  }
+});
+
+test('observe-only: with no completed attempt on the PR (none, an aborted one, another merge\'s, an unreadable list) it re-derives from scratch', async () => {
+  const aborted = [eventOf('rollback-intent', 'aaaaaaa-1', { mergeSha: SHA }), eventOf('rollback-result', 'aaaaaaa-1', { mergeSha: SHA, ok: false, aborted: true, verified: false })];
+  const foreign = [eventOf('rollback-intent', 'ccccccc-1', { mergeSha: 'c'.repeat(40) }), eventOf('rollback-result', 'ccccccc-1', { mergeSha: 'c'.repeat(40), ok: true, verified: true })];
+  for (const eventList of [[], aborted, foreign]) {
+    const h = harness({ smoke: [PASS], inspect: [OURS], events: true, eventList });
+    assert.equal((await h.go({ observeOnly: true })).outcome, 'merged');
+    assert.ok(h.smoke.calls.length >= 1);
+  }
+  const unreadable = harness({ smoke: [PASS], inspect: [OURS], events: true, eventListError: true });
+  assert.equal((await unreadable.go({ observeOnly: true })).outcome, 'merged');
+});
+
+test('a normal (not observe-only) watch never short-circuits on old rollback events', async () => {
+  const h = harness({ smoke: [PASS], inspect: [OURS], events: true, eventList: doneRollback() });
+  assert.equal((await h.go()).outcome, 'merged');
+});
+
 test('knownGoodFromEvents: the NEWEST prod-before for the environment; unreadable or foreign ones are skipped', () => {
   const older = eventOf('prod-before', '11-1', { environment: 'Production', deployment: { id: 'dpl_older', url: 'https://older.vercel.app' } });
   const staging = eventOf('prod-before', '13-1', { environment: 'Preview', deployment: { id: 'dpl_stg', url: 'https://stg.vercel.app' } });

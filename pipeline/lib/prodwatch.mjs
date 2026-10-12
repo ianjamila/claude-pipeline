@@ -9,7 +9,7 @@ import { join, resolve } from 'node:path';
 import { fill } from './config.mjs';
 import { git as gitRun, NETWORK_TIMEOUT_MS } from './git.mjs';
 import { runShellAsync } from './proc.mjs';
-import { unresolvedRollbacks } from './run-events.mjs';
+import { resolvedRollbacks, unresolvedRollbacks } from './run-events.mjs';
 import { OUTCOME_NEXT, OUTCOME_STEP, applyCheckpoint, bindRecord, emptyRecord } from './run-record.mjs';
 import { readSummaryComment, writeSummaryComment } from './summary-comment.mjs';
 import { tail } from './vercel.mjs';
@@ -478,6 +478,29 @@ async function watch(opts, deps) {
     await report(outcome);
     return result(outcome);
   };
+
+  // 0. Observe-only after a rollback that already finished (the original watch died before `P summary`): production is
+  // not what the merge shipped any more, so a fresh smoke would misreport it. Finish with what the attempt recorded; an
+  // aborted attempt (the rollback never ran) or no attempt at all re-derives from scratch below.
+  if (observe && events) {
+    let recorded = null;
+    try {
+      const list = await events.list();
+      recorded = resolvedRollbacks(list, { mergeSha: sha }).filter((e) => e.data?.aborted !== true).at(-1) ?? null;
+      if (recorded) {
+        const reported = list.filter((e) => e.kind === 'recovery-reported' && e.id === recorded.id && e.dataStatus === 'ok' && e.data?.mergeSha === sha).at(-1);
+        const done = recorded.data.ok === true && recorded.data.verified === true;
+        ev.issue = reported?.data?.issueUrl ? { url: reported.data.issueUrl } : null;
+        ev.revertPr = reported?.data?.revertPrUrl ? { url: reported.data.revertPrUrl } : null;
+        ev.reason = `a rollback already ran for this merge (${recorded.id}): ${done ? 'production was verified healthy on the known-good deployment' : `it ${recorded.data.ok === true ? 'ran but production was NOT verified' : 'FAILED'}`}; not re-checked`;
+        const out = result(done ? 'recovered' : 'rollback-failed');
+        return { ...out, recorded: { id: recorded.id, url: recorded.url ?? null, ok: recorded.data.ok === true, verified: recorded.data.verified === true } };
+      }
+    } catch (err) {
+      // unreadable events: re-derive from scratch (the interrupted-rollback check after the watch warns about the same failure)
+      note(`could not read the PR's rollback events: ${err?.message ?? err}`);
+    }
+  }
 
   // 1. The Production deployment of THIS merge.
   const found = await findDeployment({ sha, environment: prod.environment, timeoutMs: prod.deploy_timeout_minutes * 60_000 });
