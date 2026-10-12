@@ -1,5 +1,6 @@
-// `pipeline agent-log close`: the pure part (markers, authors, shas, newest-by-observed, PHT dating, dedupe) against an
-// injected gh, and the CLI (dry run, --queue + stage, unreadable PR, GitHub unavailable) against the scripted fake gh.
+// `pipeline agent-log close`: the pure part (markers, authors, shas, newest-by-observed, PHT dating, dedupe, the repo-wide scan
+// and which PRs are read on their own) against an injected gh, and the CLI (dry run, --queue + stage, --pr/--all, unreadable PR,
+// GitHub unavailable) against the scripted fake gh. Every age-sensitive pure test passes an explicit `now`: no real clock.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -10,7 +11,7 @@ import { cli, AGENT_LOG, REPO, PR } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { DEFAULT_OUTCOME } from '../pipeline/lib/agentlog.mjs';
 import {
-  BOT_AUTHOR, RESOLVED_SKIP_DAYS, closeLines, formatPht, parseLog, parsePht, parseResultMarkers, resolutionLine,
+  BOT_AUTHOR, RESOLVED_SKIP_DAYS, closeLines, formatPht, parseLog, parsePht, parseResultMarkers, prFromIssueUrl, resolutionLine, scanSince,
 } from '../pipeline/lib/agentlog-close.mjs';
 
 const MERGE_SHA = 'a'.repeat(40);
@@ -28,14 +29,22 @@ function marker(o = {}) {
 }
 const comment = (body, login = BOT_AUTHOR) => ({ user: { login }, body });
 
-function fakeGh(comments, shas = {}) {
-  const calls = { comments: [], sha: [] };
+const issueUrl = (n) => `https://api.github.com/repos/acme/widgets/issues/${n}`;
+
+// `scan` is what the repo-wide read returns (PR -> comments); by default it is every comment, like a window that covers them all.
+function fakeGh(comments, shas = {}, { scan = comments } = {}) {
+  const calls = { comments: [], sha: [], repo: [] };
   return {
     calls,
     mergeSha: async (n) => { calls.sha.push(n); return n in shas ? shas[n] : MERGE_SHA; },
     listComments: async (n) => { calls.comments.push(n); return comments[n] ?? []; },
+    listRepoComments: async (since) => {
+      calls.repo.push(since);
+      return Object.entries(scan).flatMap(([n, list]) => list.map((c) => ({ ...c, issue_url: issueUrl(n) })));
+    },
   };
 }
+const DAY = 24 * 3600 * 1000;
 
 // ---- pure ----------------------------------------------------------------------------------------
 
@@ -99,12 +108,10 @@ test('closeLines: newest result by observed wins, not comment order', async () =
   assert.deepEqual(flipped.lines, lines);
 });
 
-test('closeLines: the same line on two different clock dates (the date comes from observed, not the clock)', async (t) => {
+test('closeLines: the same line on two different clock dates (the date comes from observed, not the clock)', async () => {
   const gh = fakeGh({ 1420: [comment(marker({ observed: '2026-10-12T16:30:00Z' }))] });
-  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-10-12T17:00:00Z') });
-  const a = await closeLines({ logText: pendingLine(1420), gh });
-  t.mock.timers.setTime(Date.parse('2026-11-30T10:00:00Z'));
-  const b = await closeLines({ logText: pendingLine(1420), gh });
+  const a = await closeLines({ logText: pendingLine(1420), gh, now: Date.parse('2026-10-12T17:00:00Z') });
+  const b = await closeLines({ logText: pendingLine(1420), gh, now: Date.parse('2026-11-30T10:00:00Z') });
   assert.deepEqual(b.lines, a.lines);
   assert.ok(a.lines[0].startsWith('- 2026-10-13 · #1420 · '), a.lines[0]);
   assert.ok(a.lines[0].includes('observed 2026-10-13 00:30'));
@@ -147,30 +154,89 @@ test('closeLines: keeps going when one PR cannot be read, and reports it', async
   assert.deepEqual(r.unreadable, [{ pr: '1430', message: 'boom second line' }]);
 });
 
-test('closeLines: a PR whose newest resolution is older than the window is skipped with zero gh calls; an unresolved old PR is still read', async () => {
+const OLD_OBS = '2026-10-12 12:05'; // resolved long before NOW
+const NOW = Date.parse('2026-11-30T00:00:00Z');
+
+test('closeLines: a resolved PR older than the window with no new comment costs zero per-PR gh calls (skipped); an unresolved one is still read', async () => {
   assert.equal(RESOLVED_SKIP_DAYS, 14);
-  const now = Date.parse('2026-11-30T00:00:00Z');
-  const gh = fakeGh({ 1420: [comment(marker({ outcome: 'failed', observed: '2026-11-29T00:00:00Z' }))], 1411: [comment(marker({ observed: '2026-11-29T00:00:00Z' }))] });
-  const text = [pendingLine(1420), resolved(1420, { obs: '2026-10-12 12:05' }), pendingLine(1411)].join('\n');
-  const r = await closeLines({ logText: text, gh, now });
+  const gh = fakeGh({ 1420: [comment(marker({ outcome: 'failed', observed: '2026-11-29T00:00:00Z' }))], 1500: [comment(marker({ observed: '2026-11-29T00:00:00Z' }))] }, {}, { scan: {} });
+  const text = [pendingLine(1420), resolved(1420, { obs: OLD_OBS }), pendingLine(1411), pendingLine(1500)].join('\n');
+  const r = await closeLines({ logText: text, gh, now: NOW });
   assert.deepEqual(r.skipped, ['1420']);
-  assert.deepEqual(gh.calls.sha, ['1411'], '1420 made no gh call; 1411 has no resolution so it is read whatever its age');
-  assert.deepEqual(gh.calls.comments, ['1411']);
-  assert.equal(r.lines.length, 1);
-  assert.ok(r.lines[0].includes('#1411'));
+  assert.deepEqual(gh.calls.sha, ['1411', '1500'], '1420 made no gh call; 1411 has no resolution line and 1500 is the newest pending PR');
+  assert.deepEqual(gh.calls.comments, ['1411', '1500']);
+  assert.equal(gh.calls.repo.length, 1, 'one repo-wide read');
+  assert.equal(gh.calls.repo[0], '2026-11-16T00:00:00Z', 'its window is RESOLVED_SKIP_DAYS back from now');
+  assert.deepEqual(r.lines.map((l) => /#(\d+)/.exec(l)[1]), ['1500']);
 });
 
-test('closeLines: the window is judged by the NEWEST logged resolution, and 14 days exactly is still read', async () => {
-  const obs = '2026-10-12 12:05';
+test('closeLines: a NEW result on an old, long-resolved PR is found through the repo-wide scan (one merge-sha call, no per-PR comment read)', async () => {
+  const fresh = marker({ outcome: 'failed', observed: '2026-11-29T00:00:00Z', run: '777' });
+  const gh = fakeGh({ 1420: [comment(fresh)] }, {}, { scan: { 1420: [comment(fresh)], 999: [comment(marker({ outcome: 'failed' }))] } });
+  const text = [pendingLine(1420), resolved(1420, { obs: OLD_OBS }), pendingLine(1500)].join('\n');
+  const r = await closeLines({ logText: text, gh, now: NOW });
+  assert.deepEqual(r.lines, [resolved(1420, { outcome: 'failed', date: '2026-11-29', obs: '2026-11-29 08:00', run: '777' })]);
+  assert.deepEqual(r.skipped, []);
+  assert.deepEqual(gh.calls.sha, ['1420', '1500']);
+  assert.deepEqual(gh.calls.comments, ['1500'], 'only the newest pending PR is read on its own; 1420 came from the scan');
+});
+
+test('closeLines: a scan hit still obeys the sha filter and the bot-only rule, and an already-logged result emits nothing', async () => {
+  const wrongSha = comment(marker({ sha: OTHER_SHA, observed: '2026-11-29T00:00:00Z' }));
+  const forged = comment(marker({ observed: '2026-11-29T00:00:00Z' }), 'mallory');
+  const same = comment(marker({ observed: '2026-10-12T04:05:00Z' }));
+  const text = [pendingLine(1420), resolved(1420), pendingLine(1430), resolved(1430), pendingLine(1440), resolved(1440), pendingLine(1500)].join('\n');
+  const gh = fakeGh({}, {}, { scan: { 1420: [wrongSha], 1430: [forged], 1440: [same] } });
+  const r = await closeLines({ logText: text, gh, now: Date.parse('2026-10-13T00:00:00Z') });
+  assert.deepEqual(r.lines, []);
+  assert.deepEqual(gh.calls.comments, ['1500']);
+});
+
+test('closeLines: the NEWEST pending PR is always read on its own, even when resolved long ago', async () => {
+  const gh = fakeGh({ 1500: [comment(marker({ outcome: 'failed', observed: '2026-11-29T00:00:00Z' }))] }, {}, { scan: {} });
+  const text = [pendingLine(1500), resolved(1500, { obs: OLD_OBS }), pendingLine(1420), resolved(1420, { obs: OLD_OBS })].join('\n');
+  const r = await closeLines({ logText: text, gh, now: NOW });
+  assert.deepEqual(gh.calls.comments, ['1500'], 'highest-numbered pending PR, not the last in file order');
+  assert.deepEqual(r.skipped, ['1420']);
+  assert.equal(r.lines.length, 1);
+});
+
+test('closeLines: prs names pending PRs to read on their own; all reads every pending PR (and then needs no scan)', async () => {
+  const comments = { 1420: [comment(marker({ observed: '2026-11-29T00:00:00Z' }))], 1430: [], 1500: [] };
+  const text = [pendingLine(1420), resolved(1420, { obs: OLD_OBS }), pendingLine(1430), resolved(1430, { obs: OLD_OBS }), pendingLine(1500)].join('\n');
+  const named = fakeGh(comments, {}, { scan: {} });
+  const a = await closeLines({ logText: text, gh: named, now: NOW, prs: ['1420'] });
+  assert.deepEqual(named.calls.comments, ['1420', '1500']);
+  assert.deepEqual(a.skipped, ['1430']);
+  assert.equal(a.lines.length, 1);
+  const everything = fakeGh(comments, {}, { scan: {} });
+  const b = await closeLines({ logText: text, gh: everything, now: NOW, all: true });
+  assert.deepEqual(everything.calls.comments, ['1420', '1430', '1500']);
+  assert.deepEqual(everything.calls.repo, [], 'every PR is read on its own, so there is nothing for the scan to add');
+  assert.deepEqual(b.skipped, []);
+});
+
+test('closeLines: no resolved PR left to check means no repo-wide read at all', async () => {
+  const gh = fakeGh({ 1420: [] });
+  await closeLines({ logText: pendingLine(1420), gh, now: NOW });
+  assert.deepEqual(gh.calls.repo, []);
+});
+
+test('closeLines: when the repo-wide read fails the unresolved PRs are still processed and scanError says so', async () => {
+  const gh = fakeGh({ 1500: [comment(marker())] }, {}, { scan: {} });
+  gh.listRepoComments = async () => { throw new Error('HTTP 502\nbad gateway'); };
+  const r = await closeLines({ logText: [pendingLine(1420), resolved(1420, { obs: OLD_OBS }), pendingLine(1500)].join('\n'), gh, now: NOW });
+  assert.equal(r.scanError, 'HTTP 502 bad gateway');
+  assert.equal(r.lines.length, 1);
+  assert.deepEqual(r.skipped, ['1420']);
+});
+
+test('scanSince is exactly RESOLVED_SKIP_DAYS before now (second precision); prFromIssueUrl reads the PR number off issue_url', () => {
   const at = parsePht('2026-10-12', '12:05');
-  const day = 24 * 3600 * 1000;
-  const edge = fakeGh({ 1420: [] });
-  assert.deepEqual((await closeLines({ logText: `${pendingLine(1420)}\n${resolved(1420, { obs })}`, gh: edge, now: at + 14 * day })).skipped, []);
-  assert.deepEqual(edge.calls.sha, ['1420']);
-  const stale = fakeGh({ 1420: [] });
-  const old = resolved(1420, { outcome: 'failed', obs: '2026-09-01 10:00', run: '1' });
-  assert.deepEqual((await closeLines({ logText: [pendingLine(1420), resolved(1420, { obs }), old].join('\n'), gh: stale, now: at + 14 * day + 1 })).skipped, ['1420']);
-  assert.deepEqual(stale.calls.sha, []);
+  assert.equal(scanSince(at + 14 * DAY + 123), '2026-10-12T04:05:00Z');
+  assert.equal(prFromIssueUrl(issueUrl(1420)), '1420');
+  assert.equal(prFromIssueUrl('https://api.github.com/repos/acme/widgets/issues/1420/comments'), null);
+  assert.equal(prFromIssueUrl(undefined), null);
 });
 
 // ---- CLI -----------------------------------------------------------------------------------------
@@ -178,6 +244,7 @@ test('closeLines: the window is judged by the NEWEST logged resolution, and 14 d
 const commentsEntry = (n, list) => ({ match: `^api repos/acme/widgets/issues/${n}/comments --paginate`, stdoutJson: list });
 const shaEntry = (n, oid = MERGE_SHA) => ({ match: `^pr view ${n} --json mergeCommit`, stdoutJson: { mergeCommit: oid ? { oid } : null } });
 const AUTH = { match: '^auth status', stdout: 'Logged in' };
+const scanEntry = (list) => ({ match: '^api repos/acme/widgets/issues/comments\\?since=\\d{4}-\\d{2}-\\d{2}T\\d{2}%3A\\d{2}%3A\\d{2}Z&per_page=100 --paginate', stdoutJson: list.map(([n, c]) => ({ ...c, issue_url: issueUrl(n) })) });
 
 function closeRepo(logText, entries) {
   const repo = createTmpRepo();
@@ -269,4 +336,73 @@ test('agent-log close: unknown arguments are a usage error', () => {
   const t = closeRepo(pendingLine(1420), []);
   assertExit(t.close('--bogus'), 2);
   assertExit(t.close('extra'), 2);
+});
+
+// A long-resolved PR (1411, logged long ago) and the newest pending PR (1500, no resolution line yet).
+const OLD_AND_NEW = () => [pendingLine(1411), resolved(1411, { date: '2026-08-01', obs: '2026-08-01 10:00', run: '5' }), pendingLine(1500)].join('\n');
+const apiCalls = (t) => t.fake.lines().filter((l) => l.startsWith('api repos/'));
+
+test('agent-log close: a new result on an old resolved PR comes from the repo-wide read; that PR\'s own comments are never listed', () => {
+  const t = closeRepo(OLD_AND_NEW(), [
+    scanEntry([[1411, comment(marker({ outcome: 'failed', observed: '2026-10-12T04:05:00Z', run: '321' }))], [77, comment(marker())]]),
+    shaEntry(1411), shaEntry(1500), commentsEntry(1500, []),
+  ]);
+  const r = t.close('--queue');
+  assertExit(r, 0);
+  assert.deepEqual(r.json.lines, [resolved(1411, { outcome: 'failed', run: '321' })]);
+  assert.deepEqual(r.json.skipped, []);
+  assert.equal(r.json.queued, 1);
+  assert.deepEqual(readQueueLines(t), [resolved(1411, { outcome: 'failed', run: '321' })]);
+  assert.equal(apiCalls(t).filter((l) => l.includes('/issues/1411/comments')).length, 0);
+  assert.equal(apiCalls(t).filter((l) => l.includes('/issues/1500/comments')).length, 1, 'the newest pending PR is read on its own');
+  assert.equal(apiCalls(t).filter((l) => l.includes('issues/comments?since=')).length, 1, 'one repo-wide read');
+});
+
+test('agent-log close: a long-resolved PR with no new comment is skipped; --pr N and --all read it on their own', () => {
+  const entries = [scanEntry([]), shaEntry(1411), shaEntry(1500), commentsEntry(1500, []), commentsEntry(1411, [comment(marker({ outcome: 'failed', observed: '2026-10-12T04:05:00Z', run: '88' }))])];
+  const quiet = closeRepo(OLD_AND_NEW(), entries);
+  const base = quiet.close();
+  assertExit(base, 0);
+  assert.deepEqual(base.json.skipped, [1411]);
+  assert.deepEqual(base.json.lines, []);
+  assert.equal(apiCalls(quiet).filter((l) => l.includes('/issues/1411/comments')).length, 0);
+
+  const named = closeRepo(OLD_AND_NEW(), entries);
+  const byPr = named.close('--pr', '1411', '--pr=1500');
+  assertExit(byPr, 0);
+  assert.deepEqual(byPr.json.lines, [resolved(1411, { outcome: 'failed', run: '88' })]);
+  assert.deepEqual(byPr.json.skipped, []);
+
+  const everything = closeRepo(OLD_AND_NEW(), entries);
+  const all = everything.close('--all');
+  assertExit(all, 0);
+  assert.deepEqual(all.json.lines, byPr.json.lines);
+  assert.equal(apiCalls(everything).filter((l) => l.includes('issues/comments?since=')).length, 0, '--all reads each PR on its own');
+
+  assertExit(quiet.close('--pr', 'abc'), 2);
+  assertExit(quiet.close('--pr', '0'), 2);
+});
+
+test('agent-log close --queue twice queues the same line once', () => {
+  const t = closeRepo(pendingLine(1420), [shaEntry(1420), commentsEntry(1420, [comment(marker())])]);
+  assert.equal(t.close('--queue').json.queued, 1);
+  const again = t.close('--queue');
+  assertExit(again, 0);
+  assert.deepEqual(again.json.lines, [resolved(1420)]);
+  assert.equal(again.json.queued, 0, 'already queued');
+  assert.deepEqual(readQueueLines(t), [resolved(1420)]);
+});
+
+test('agent-log close: a failed repo-wide read exits 1 with scanError, and the lines for the PRs that were read are still queued', () => {
+  const t = closeRepo(OLD_AND_NEW(), [
+    { match: 'issues/comments\\?since=', stderr: 'HTTP 502', code: 1 },
+    shaEntry(1500), commentsEntry(1500, [comment(marker())]),
+  ]);
+  const r = t.close('--queue');
+  assertExit(r, 1);
+  assert.equal(r.json.ok, false);
+  assert.ok(r.json.scanError);
+  assert.deepEqual(r.json.unreadable, []);
+  assert.deepEqual(r.json.lines, [resolved(1500)]);
+  assert.deepEqual(readQueueLines(t), [resolved(1500)]);
 });

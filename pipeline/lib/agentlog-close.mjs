@@ -17,9 +17,12 @@ const HOST_RE = /^(?=.{1,253}$)[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-
 const SHA_RE = /^[0-9a-f]{40}$/;
 const ID_RE = /^\d{1,18}$/;
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/;
-// A pending PR whose newest logged resolution is older than this is not re-read (bounds the gh calls per run: the log is
-// append-only, so every merged PR stays "pending" forever). The producing workflow reports deployments of the last 7 days
-// unless dispatched by hand, so 14 days leaves margin. A pending PR with NO resolution line is read whatever its age.
+// Bounded AND complete reading. The log is append-only, so every merged PR stays "pending" forever and reading each one
+// every run would not scale. Instead ONE repo-wide read lists the issue comments updated in the last RESOLVED_SKIP_DAYS days
+// (a new result on an old, long-resolved PR shows up there: a manual backfill dispatch, a deployment whose health changed),
+// and per-PR reads are kept for the PRs that need them: pending PRs with no resolution line yet, the newest pending PR,
+// the PRs named by the caller, and everything with `all`. A resolved PR the scan did not mention costs no gh call.
+// The producing workflow reports deployments of the last 7 days unless dispatched by hand, so 14 days leaves margin.
 export const RESOLVED_SKIP_DAYS = 14;
 const PHT_OFFSET_MS = 8 * 3600 * 1000; // Asia/Manila is UTC+8 all year, no DST
 
@@ -105,33 +108,65 @@ export function parseLog(text) {
 // The newest logged resolution by its embedded observed time; on a tie the later line wins.
 const newestLogged = (list) => (list ?? []).reduce((best, r) => (best === null || r.at >= best.at ? r : best), null);
 
+/** The PR number a repo-wide issue comment belongs to, from its `issue_url` (…/issues/<N>); null when it has none. */
+export const prFromIssueUrl = (url) => /\/issues\/(\d+)$/.exec(String(url ?? ''))?.[1] ?? null;
+
+/** ISO instant (second precision) `RESOLVED_SKIP_DAYS` before `now` (ms): the `since` of the repo-wide read. */
+export const scanSince = (now) => new Date(now - RESOLVED_SKIP_DAYS * 24 * 3600 * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+
+const oneLine = (err) => String(err?.message ?? err).replace(/[\r\n]+/g, ' ').slice(0, 200);
+
 /**
- * gh: { mergeSha(pr) -> sha | null, listComments(pr) -> comments[] }. `now` (ms) is only used for the skip window.
- * Returns { lines, pending, skipped, unreadable }. A PR that cannot be read lands in `unreadable` and the rest carry on;
- * a PR resolved longer ago than RESOLVED_SKIP_DAYS lands in `skipped` and costs no gh call.
+ * gh: { mergeSha(pr) -> sha | null, listComments(pr) -> comments[], listRepoComments(sinceIso) -> comments[] (each with
+ * `issue_url`) }. `now` (ms; tests always pass it) sets the repo-wide window. `prs` (strings) are pending PRs to read
+ * per-PR whatever their state; `all` reads every pending PR per-PR.
+ * Returns { lines, pending, skipped, unreadable, scanError }. A PR that cannot be read lands in `unreadable` and the rest
+ * carry on; if the repo-wide read itself fails, `scanError` says so and resolved PRs are left unchecked this run.
  */
-export async function closeLines({ logText, gh, now = Date.now() }) {
+export async function closeLines({ logText, gh, now = Date.now(), prs = [], all = false }) {
   const { pending, resolutions } = parseLog(logText);
   const lines = [];
   const skipped = [];
   const unreadable = [];
+  let scanError = null;
+  const newestPending = pending.reduce((best, pr) => (best === null || Number(pr) > Number(best) ? pr : best), null);
+  const named = new Set(prs.map(String));
+  const readPerPr = (pr) => all || !resolutions.has(pr) || pr === newestPending || named.has(pr);
+
+  // One repo-wide read, only when some resolved PR would otherwise go unchecked.
+  const scanned = new Map();
+  if (pending.some((pr) => !readPerPr(pr))) {
+    try {
+      for (const c of await gh.listRepoComments(scanSince(now))) {
+        const n = prFromIssueUrl(c?.issue_url);
+        if (n === null || !pending.includes(n)) continue;
+        if (!scanned.has(n)) scanned.set(n, []);
+        scanned.get(n).push(c);
+      }
+    } catch (err) {
+      scanError = oneLine(err);
+    }
+  }
+
   for (const pr of pending) {
     const lastLogged = newestLogged(resolutions.get(pr));
-    if (lastLogged && now - lastLogged.at > RESOLVED_SKIP_DAYS * 24 * 3600 * 1000) {
+    const perPr = readPerPr(pr);
+    if (!perPr && !scanned.has(pr)) {
       skipped.push(pr);
       continue;
     }
     try {
       const sha = await gh.mergeSha(pr);
       if (!sha) continue; // not merged (or no merge commit named yet): nothing to close
-      const newest = newestByObserved(resultsFromComments(await gh.listComments(pr), sha));
+      const comments = perPr ? await gh.listComments(pr) : scanned.get(pr);
+      const newest = newestByObserved(resultsFromComments(comments, sha));
       if (!newest) continue;
       const obs = formatPht(Date.parse(newest.observed));
       if (lastLogged && lastLogged.host === newest.vercel && lastLogged.outcome === newest.outcome && lastLogged.observed === `${obs.date} ${obs.time}`) continue;
       lines.push(resolutionLine({ pr, result: newest }));
     } catch (err) {
-      unreadable.push({ pr, message: String(err?.message ?? err).replace(/[\r\n]+/g, ' ').slice(0, 200) });
+      unreadable.push({ pr, message: oneLine(err) });
     }
   }
-  return { lines, pending, skipped, unreadable };
+  return { lines, pending, skipped, unreadable, scanError };
 }

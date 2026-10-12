@@ -152,7 +152,7 @@ Details and every exit code: `reference/gates-and-exits.md`.
 1. Recompute the checks on the head as it is NOW (review fixes may have moved risk): `P risk`,
    `P hardstops … > .review/hardstops.json` and `P integrity`, as in Step 3.2. A new blocking
    hard-stop hit ⇒ Step 3.5. Then, only when `production.watch` is `workflow` (read it from `P config`), `P agent-log close
-   --queue` (queues the production results the workflow posted on earlier merged PRs); then `P agent-log stage --pr N`
+   --queue` (queues the production results the workflow posted on earlier merged PRs; exit 1 = some PRs could not be read: still run `agent-log stage` and name them in the summary; exit 3 = GitHub unavailable: skip the close, still stage); then `P agent-log stage --pr N`
    (commits this run's log line + queued lines into the PR branch) and `git push origin agent/<slug>`.
 2. Up to date with the base — docs-only and light-lane PRs too, so the gate (and the CI it waits on)
    judges the tree that will land: `P job start update -- node ~/.claude/pipeline/bin/pipeline.mjs

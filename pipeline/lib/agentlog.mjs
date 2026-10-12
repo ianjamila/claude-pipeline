@@ -76,8 +76,10 @@ export function assertSingleLine(line) {
   return line.trim();
 }
 
+// Idempotent: a line already in the queue (staged in some open PR or not) is not added again. Caller holds the queue lock.
 export function appendToQueue(cwd, line, at = new Date().toISOString()) {
   const clean = assertSingleLine(line);
+  if (readQueue(cwd).some((e) => e.line === clean)) return clean;
   const file = queuePath(cwd);
   mkdirSync(dirname(file), { recursive: true });
   appendFileSync(file, `${JSON.stringify({ line: clean, at })}\n`);

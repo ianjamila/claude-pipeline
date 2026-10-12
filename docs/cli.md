@@ -14,18 +14,21 @@ blocked · **2** usage or environment error (also: unknown command, unknown flag
 queue a line for the agent log, stage queued lines + this PR's line as a commit in the worktree, or close pending prod-smoke lines.
 
 ```
-pipeline agent-log queue --line "<line>" [--repo DIR]   -> {ok, queued, file}
+pipeline agent-log queue --line "<line>" [--repo DIR]   -> {ok, queued, file}; a line already in the queue (staged in an open PR or not) is not added again
 pipeline agent-log stage --pr N [--line "<line>"] [--repo DIR]   -> {ok, committed, lines, file, staged, dropped}; run in the PR worktree;
   staged lines stay queued ("staged in PR N") until origin/<default> contains them, and are re-staged if that PR closes unmerged;
   default line = the PR's agent-log line with outcome "merged — prod smoke pending"; exit 2 when the worktree has other uncommitted changes,
   is on the default branch or a detached HEAD, or is not the PR's head branch at the PR's head commit; exit 3 when GitHub cannot say
-pipeline agent-log close [--queue] [--repo DIR]   -> {ok, lines, pending, skipped, unreadable, queued?}; for every "prod smoke pending" log line reads the
+pipeline agent-log close [--queue] [--pr N]... [--all] [--repo DIR]   -> {ok, lines, pending, skipped, unreadable, queued?, scanError?}; for every "prod smoke pending" log line reads the
   bot-authored prod-smoke-result comments on that PR (production.watch: workflow) and prints one resolution line per PR whose newest result
-  is not logged yet (a PR whose newest logged result is over 14 days old is skipped without a gh call); a dry run unless --queue (queues each line like `queue`; never commits); exit 1 when a PR could not be read (the
-  others are still processed), 3 when GitHub is unavailable
+  is not logged yet; one repo-wide read of the comments of the last 14 days finds a new result on any PR, even a long-resolved one, and a PR is
+  read on its own only when it has no resolution line, is the newest pending PR, is named by --pr N (repeatable) or --all is given (a resolved PR the scan
+  did not mention is `skipped`, at no cost); a dry run unless --queue (queues each line like `queue`; a line already queued is not added again; never commits);
+  exit 1 when some PRs (or the repo-wide read, `scanError`) could not be read: the lines for the others are still produced and queued, so still run `agent-log stage`
+  and name the unreadable PRs in the summary; exit 3 when GitHub is unavailable: skip the close, still stage
 ```
 
-Exit: 0 ok · 1 a PR could not be read (close; the others are still processed) · 2 usage, or the worktree is not the PR's clean head branch (stage) · 3 GitHub cannot say / queue lock timeout.
+Exit: 0 ok · 1 some PRs could not be read (close; the others are still processed and queued) · 2 usage, or the worktree is not the PR's clean head branch (stage) · 3 GitHub cannot say / queue lock timeout.
 
 ## arbiter
 

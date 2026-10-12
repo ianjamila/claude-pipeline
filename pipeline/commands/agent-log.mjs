@@ -25,10 +25,12 @@ export const meta = {
     '  staged lines stay queued ("staged in PR N") until origin/<default> contains them, and are re-staged if that PR closes unmerged;',
     '  default line = the PR\'s agent-log line with outcome "merged — prod smoke pending"; exit 2 when the worktree has other uncommitted changes,',
     '  is on the default branch or a detached HEAD, or is not the PR\'s head branch at the PR\'s head commit; exit 3 when GitHub cannot say',
-    'pipeline agent-log close [--queue] [--repo DIR]   -> {ok, lines, pending, skipped, unreadable, queued?}; for every "prod smoke pending" log line reads the',
+    'pipeline agent-log close [--queue] [--pr N]... [--all] [--repo DIR]   -> {ok, lines, pending, skipped, unreadable, queued?, scanError?}; for every "prod smoke pending" log line reads the',
     '  bot-authored prod-smoke-result comments on that PR (production.watch: workflow) and prints one resolution line per PR whose newest result',
-    '  is not logged yet (a PR whose newest logged result is over 14 days old is skipped without a gh call); a dry run unless --queue (queues each line like `queue`; never commits); exit 1 when a PR could not be read (the',
-    '  others are still processed), 3 when GitHub is unavailable',
+    '  is not logged yet; one repo-wide read of the comments of the last 14 days finds new results on any PR, and a PR is read on its own only when it has no',
+    '  resolution line, is the newest pending PR, is named by --pr N (repeatable) or --all is given (a resolved PR the scan did not mention is `skipped`,',
+    '  costing no call); a dry run unless --queue (queues each line like `queue`, a line already queued is not added again; never commits); exit 1 when some',
+    '  PRs could not be read (`unreadable`; the lines for the others are still produced and queued), 3 when GitHub is unavailable',
   ].join('\n'),
 };
 
@@ -160,7 +162,11 @@ async function stage(rest, ctx) {
 }
 
 async function close(rest, ctx) {
-  const { values } = parseCommandArgs(rest, { queue: { type: 'boolean' }, repo: { type: 'string' } }, { allowPositionals: false });
+  const { values } = parseCommandArgs(rest, { queue: { type: 'boolean' }, all: { type: 'boolean' }, pr: { type: 'string', multiple: true }, repo: { type: 'string' } }, { allowPositionals: false });
+  const prs = (values.pr ?? []).map((raw) => {
+    if (!/^[1-9]\d{0,8}$/.test(raw)) throw new UsageError('--pr must be a positive PR number');
+    return raw;
+  });
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
   let file;
@@ -179,18 +185,23 @@ async function close(rest, ctx) {
   const github = {
     mergeSha: (n) => gh.prView(n, ['mergeCommit']).mergeCommit?.oid ?? null,
     listComments: (n) => gh.listComments(n),
+    listRepoComments: (since) => gh.listRepoComments(since),
   };
   // Cheap up-front probe so "GitHub is unavailable" (3) is told apart from "this PR could not be read" (1).
   if (parseLog(logText).pending.length > 0 && !gh.authStatus().ok) {
     throw new Fail(EXIT.UNAVAILABLE, { ok: false, error: 'unavailable', message: 'GitHub is unavailable (gh is not authenticated or unreachable)' });
   }
-  const { lines, pending, skipped, unreadable } = await closeLines({ logText, gh: github });
-  const output = { ok: unreadable.length === 0, lines, pending: pending.map(Number), skipped: skipped.map(Number), unreadable: unreadable.map((u) => ({ pr: Number(u.pr), message: u.message })) };
+  const { lines, pending, skipped, unreadable, scanError } = await closeLines({ logText, gh: github, prs, all: values.all === true });
+  const incomplete = unreadable.length > 0 || scanError !== null;
+  const output = { ok: !incomplete, lines, pending: pending.map(Number), skipped: skipped.map(Number), unreadable: unreadable.map((u) => ({ pr: Number(u.pr), message: u.message })) };
+  if (scanError !== null) output.scanError = scanError;
+  // Exit 1 only means some PRs could not be read: the lines for the others are still queued.
   if (values.queue) {
-    output.queued = lines.length;
+    const have = new Set(readQueue(root).map((e) => e.line));
+    output.queued = lines.filter((l) => !have.has(l)).length; // a line already queued is not added again
     if (lines.length) await queueLines(root, lines);
   }
-  return { exitCode: unreadable.length ? EXIT.FAILED : EXIT.OK, output };
+  return { exitCode: incomplete ? EXIT.FAILED : EXIT.OK, output };
 }
 
 export const run = guarded(async (argv, ctx) => {
@@ -198,5 +209,5 @@ export const run = guarded(async (argv, ctx) => {
   if (sub === 'queue') return queue(rest, ctx);
   if (sub === 'stage') return stage(rest, ctx);
   if (sub === 'close') return close(rest, ctx);
-  throw new UsageError('usage: pipeline agent-log (queue --line "<line>" | stage --pr N [--line "<line>"] | close [--queue])');
+  throw new UsageError('usage: pipeline agent-log (queue --line "<line>" | stage --pr N [--line "<line>"] | close [--queue] [--pr N]... [--all])');
 });
