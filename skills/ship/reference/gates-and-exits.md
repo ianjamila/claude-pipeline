@@ -96,5 +96,5 @@ outcome name from the table.
 
 A prod-watch job that exits with no `outcome` in its JSON (`error: merge-sha-unresolved`, `not-merged`, or
 `deploy-check-failed`) has already pushed "Production check unfinished" itself. Write
-`P summary --pr N --outcome deploy-not-observed --cause prod-watch:<error>` (classified, pushes nothing, so the owner
+`P summary --pr N --outcome prod-unknown --cause prod-watch:<error>` (classified, pushes nothing, so the owner
 gets one push, not two), tell the user to check production by hand, and do not rerun prod-watch.

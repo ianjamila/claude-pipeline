@@ -30,6 +30,7 @@ export const OUTCOME_EVENTS = Object.freeze({
   'no-production': null,
   closed: null,
   'merged-externally': null,
+  'prod-unknown': null, // prod-watch exited with no outcome; it already pushed "Production check unfinished"
   superseded: null,
   recovered: null,
   'rollback-failed': null,

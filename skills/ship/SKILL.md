@@ -242,7 +242,7 @@ passes the **Owner-merge approval** rule below.** With `owner_approval: label` t
    `rollback-skipped`, `not-live`, `deploy-failed`, `deploy-not-observed` — ⇒ summary with that same word
    (no push: prod-watch sent it). A prod-watch job that exits with no `outcome` in its JSON (`error`
    `merge-sha-unresolved`, `not-merged`, `deploy-check-failed`) has already pushed "Production check unfinished": write
-   `P summary --pr N --outcome deploy-not-observed --cause prod-watch:<error>` (it pushes nothing) and tell the user to
+   `P summary --pr N --outcome prod-unknown --cause prod-watch:<error>` (it pushes nothing) and tell the user to
    check production by hand; do not rerun it.
    What each one means and what to do is in `reference/gates-and-exits.md`. On a failed smoke prod-watch rolls back by itself (`vercel rollback <known-good> --yes --timeout 3m`,
    never `production.rollback.command`), opens the issue and a revert PR. Report any outcome other

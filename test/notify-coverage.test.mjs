@@ -103,7 +103,7 @@ test('every --outcome word in the ship skill is classified (push or explicit no-
     assert.ok(words.has(w), `the skill never uses --outcome ${w}`);
     assert.notEqual(OUTCOME_EVENTS[w], null, `${w} must push`);
   }
-  for (const w of ['closed', 'merged-externally', 'deploy-not-observed']) {
+  for (const w of ['closed', 'merged-externally', 'prod-unknown']) {
     assert.ok(words.has(w), `the skill never uses --outcome ${w}`);
     assert.equal(OUTCOME_EVENTS[w], null, `${w} must not push`);
   }
