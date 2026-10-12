@@ -2,7 +2,8 @@
 
 `P` = `node ~/.claude/pipeline/bin/pipeline.mjs`. For commands run as jobs (`update-branch`, `merge`, `prod-watch`),
 the codes below are the job's `exitCode`, and the JSON is in the `tail` (or `<jobDir>/log`); see
-Invariant 8 in `SKILL.md`. `P final-gate` runs directly.
+Invariant 8 in `SKILL.md`. `P final-gate` runs directly. `merge`, `prod-watch --pr N` and `update-branch` also show themselves in the PR's run record
+(`inFlight`, cleared on exit) so another machine sees them running; no `P checkpoint` is needed around them.
 
 ## `P final-gate --pr N`
 
@@ -60,6 +61,7 @@ the outcomes below marked *(only with `--wait-checks`)*.
 | 1 | `error: "behind-base"`, `outcome`, `head` | the base moved after the gate: merge already ran `update-branch` once on the approved head and refused (`outcome: updated`, `head` = the new head), so nothing merged on a stale tree → back to Step 5.2 (`git pull --ff-only`), re-verify, `P final-gate`, merge again. `outcome: rebase-needed` (conflict) ⇒ `needs-human`; `head-moved` ⇒ `git fetch`, re-read, Step 5.1; `cycle-cap` / `head-timeout` ⇒ Step 5.2 once more, then `needs-human` |
 | 1 | `error: "live-check"`, `reasons` = `<check>: <detail>` | a check failed live: handle it like the `final-gate` table; `pr-open: behind-base:` ⇒ update the branch, re-verify, back to Step 5.2 |
 | 1 | `error: "pre-merge"`, `reasons` | a label, a pause/rollback issue, a new push or a draft/closed PR appeared in the last seconds: head moved ⇒ back to Step 5; label or pause ⇒ stop and tell the user |
+| 1 | `error: "pre-merge"`, `reasons` = "could not record the rollback target on the PR (prod-before event)" | merge posts the `prod-before` event (the known-good production deployment, the only copy of the rollback target that survives this machine) before it runs the merge command, and refuses to merge without it. Nothing merged: retry once, then stop and tell the user |
 | 1 | no `error`, `reason` "merge command failed (exit …)" | read `commandOutput`; the PR is not merged and `autoMergeDisabled` says auto-merge was switched off: one retry after `P final-gate`, then `needs-human` |
 | 1 | `reason` "not merged in time" / "could not read the PR state" | not merged, auto-merge disabled: the base probably moved or a check is pending → Step 5.2, then retry (max 2), then `needs-human` |
 | 1 | `reason` "closed without merging" / "a blocker appeared while waiting" | stop; tell the user |

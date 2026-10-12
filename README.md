@@ -76,6 +76,8 @@ Onboard a repo once, then just ask for work:
 | "set up the pipeline" / "onboard this repo" | `pipeline-setup` audits the repo, shows a proposal, writes `.claude/pipeline.yml`, `scripts/verify.mjs`, the guard workflow and tests on `agent/pipeline-setup`, and opens a `needs-human` PR for you to merge |
 | "add a CSV export to the reports page" (any build/fix request) | `ship` runs the full flow and reports back with the PR, the review outcome and production status |
 | "resume pipeline reviews" | picks up every open `awaiting-review` PR (Codex was down or out of quota) and continues from the review step |
+| "ship inbox" / "what is each PR waiting on" | read-only: a table of every open PR (waiting on · last activity · next action), merges that were never watched in production, unpushed local work, orphan worktrees, and a merge / resume / close / leave suggestion for each. It closes, merges and removes nothing |
+| "ship resume 123" / "pick up a stalled run" | continues PR #123 from its run record and comments, on this machine or another (after asking whether the other run stopped). It re-runs the final gate and stops for your "merge"; it never merges or rolls production back by itself (a merged run is only observed) |
 | "build #123" or relabel an issue `agent-suggestion` → `agent-build` | builds a follow-up idea the review loop filed |
 | "verify this" / "is it working?" | `verify` runs the repo's verify and shows the evidence |
 
