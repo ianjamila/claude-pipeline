@@ -3,12 +3,15 @@
 // copies are built by hand in a temp claude-home; checkouts are real throwaway git repos.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, realpathSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { cpSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { installedIdentity, checkoutIdentity, parseStamp, formatStamp, stampIsTrusted, fileProvenance } from '../pipeline/lib/identity.mjs';
 import { MANIFEST_REL, sha256File } from '../pipeline/lib/installer.mjs';
+import { versionReport, meta as versionMeta } from '../pipeline/commands/version.mjs';
 
 const made = [];
 process.on('exit', () => { for (const d of made) rmSync(d, { recursive: true, force: true }); });
@@ -211,4 +214,73 @@ test('fileProvenance: states for a clean tree, a dirty one and no git; inherited
   assert.equal(dirty.state, 'dirty');
   assert.deepEqual(dirty.differing, ['pipeline/lib/b.mjs']);
   assert.equal(fileProvenance(scratch(), []).state, 'no-git');
+});
+
+// ---- pipeline version --------------------------------------------------------------------------------------------
+
+const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
+
+// An installed copy: the real pipeline/ dir copied under <home>, vouched for by a hand-written manifest.
+function installedPipelineHome(manifestExtra = {}) {
+  const home = scratch();
+  cpSync(join(REPO, 'pipeline'), join(home, 'pipeline'), { recursive: true });
+  const files = {};
+  for (const rel of ['pipeline/commands/version.mjs', 'pipeline/lib/identity.mjs', 'pipeline/bin/pipeline.mjs']) {
+    files[rel] = sha256File(join(home, ...rel.split('/')));
+  }
+  writeFileSync(join(home, 'pipeline', 'VERSION'), '3.2.1\n');
+  files['pipeline/VERSION'] = sha256File(join(home, 'pipeline', 'VERSION'));
+  writeFileSync(join(home, ...MANIFEST_REL.split('/')), JSON.stringify({ version: '3.2.1', sourceSha: SHA, complete: true, files, ...manifestExtra }));
+  return home;
+}
+const cliVersion = (home) => {
+  const r = spawnSync(process.execPath, [join(home, 'pipeline', 'bin', 'pipeline.mjs'), 'version'], { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  return JSON.parse(r.stdout);
+};
+
+test('pipeline version: usage stays one line naming no flags', () => {
+  assert.equal(versionMeta.usage, 'pipeline version');
+});
+
+test('pipeline version (installed copy, run through the CLI): the manifest stamp with its fields', () => {
+  const home = installedPipelineHome();
+  assert.deepEqual(cliVersion(home), {
+    ok: true, version: '3.2.1+0123456', base: '3.2.1', sourceSha: SHA, complete: true, modified: [], missing: [], kind: 'installed',
+  });
+});
+
+test('pipeline version (installed copy): an edited file and an unfinished install show in the stamp', () => {
+  const home = installedPipelineHome({ complete: false });
+  writeFileSync(join(home, 'pipeline', 'lib', 'identity.mjs'), '// edited\nexport const x = 1;\n');
+  const r = versionReport(join(home, 'pipeline'));
+  assert.equal(r.version, '3.2.1+0123456.modified.incomplete');
+  assert.equal(r.complete, false);
+  assert.deepEqual(r.modified, ['pipeline/lib/identity.mjs']);
+  assert.equal(r.kind, 'installed');
+});
+
+test('pipeline version (installed copy): a corrupt manifest is labelled unverified, not trusted', () => {
+  const home = installedPipelineHome();
+  writeFileSync(join(home, ...MANIFEST_REL.split('/')), '{ nope');
+  const r = versionReport(join(home, 'pipeline'));
+  assert.equal(r.version, '3.2.1+unknown.unverified');
+  assert.equal(r.complete, false);
+});
+
+test('pipeline version (checkout): a clean published HEAD is trusted; an edit is .unverified and listed', () => {
+  const repo = createTmpRepo();
+  repo.write('VERSION', '1.0.0\n');
+  repo.write('pipeline/lib/x.mjs', 'x\n');
+  const sha = repo.commit('init');
+  repo.git(['update-ref', 'refs/remotes/origin/main', sha]);
+  const clean = versionReport(join(repo.dir, 'pipeline'));
+  assert.equal(clean.version, `1.0.0+${sha.slice(0, 7)}`);
+  assert.equal(clean.kind, 'checkout');
+  assert.equal(clean.sourceSha, sha);
+  assert.deepEqual(clean.modified, []);
+  repo.write('pipeline/lib/x.mjs', 'edited\n');
+  const dirty = versionReport(join(repo.dir, 'pipeline'));
+  assert.equal(dirty.version, `1.0.0+${sha.slice(0, 7)}.unverified`);
+  assert.deepEqual(dirty.modified, ['pipeline/lib/x.mjs']);
 });
