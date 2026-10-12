@@ -437,7 +437,7 @@ test('S4: a write through a name a sourced file may have changed is refused what
   ]) assert.equal(files(c, fs).decision, 'deny', c);
   // (a reader, cd, a declaration, a path list's element, and a value the line sets again after the source are not write targets)
   for (const c of [
-    'D=/tmp; source $X; export PATH=$D:$PATH', 'D=/tmp; source $X; cat $D/settings.json', 'D=/tmp; source $X; D=/tmp; echo x > $D/settings.json', 'D=/tmp; source $X; cd $D', 'D=/tmp; source $X; PATH=$D:$PATH ls', 'D=/tmp; source $X; PATH=$D:$PATH npm test',
+    'D=/tmp; source $X; export PATH=$D:$PATH', 'D=/tmp; source $X; cat $D/settings.json', 'D=/tmp; source $X; D=/tmp; echo x > $D/settings.json', 'D=/tmp; source $X; PATH=$D:$PATH ls', 'D=/tmp; source $X; PATH=$D:$PATH npm test',
     'D=/tmp; source $X; echo $D', 'D=/tmp; source $X; W=/tmp; echo x > $W/settings.json', 'source dyn.sh; echo $F', 'D=/tmp; source $X; export OUT=$D/x', 'source $X', 'source "$NVM_DIR/nvm.sh"; nvm use 20',
   ]) assert.equal(files(c, fs).decision, 'allow', c);
 });
@@ -528,8 +528,9 @@ test('S4b: a relative write to a protected name after a cd into an unknown direc
       assert.equal(files(`${cd} && ${w}`, fs).decision, 'deny', `${cd} && ${w}`);
     }
   }
-  for (const cd of ['cd $UNSET', 'cd $(pick)']) {
-    for (const w of ['echo x > notes.txt', 'cp ok.sh build/out.js', 'cat settings.json', 'ls pipeline', 'grep x settings.json', 'git commit -m settings.json', 'cp /tmp/x/notes.txt .', 'cp -r /tmp/x/build .', 'sed -i "s/a.*/b/" notes.txt', 'echo x > notes.{txt,md}', 'echo x > n*.txt', 'git add notes.txt', 'git commit -m x', 'git --git-dir g status', 'npm run $S', 'bash n.sh', "node -e 'console.log(1)'", 'cp /tmp/x/settings.json /tmp/y/', 'tar -tf a.tar', 'unzip -l a.zip', 'git status', 'git log', 'curl -O https://h/x/a.txt']) {
+  for (const cd of ['cd $UNSET']) { // (S4d: a `cd $(pick)` runs `pick` itself, which the rerun cannot tell from a command run in the directory)
+    // (S4d: the rest of the line is judged in each protected directory, so only reads stay allowed; the writes and commands this list once allowed are in the S4d test as refused)
+    for (const w of ['cat settings.json', 'ls pipeline', 'grep x settings.json', 'git --git-dir g status', 'git status', 'git log']) {
       assert.equal(files(`${cd} && ${w}`, fs).decision, 'allow', `${cd} && ${w}`);
     }
   }
@@ -674,4 +675,99 @@ test('S4c: a declared attribute persists across later plain assignments (files-p
     'source dyn.sh; declare -l D; D=/home/u/.CLAUDE; echo x > $D/settings.json', 'declare -l D; D=/x; D=/home/u/.CLAUDE; echo x > $D/settings.json',
   ]) assert.equal(files(c, fs).decision, 'deny', c);
   for (const c of ['D=/home/u/.claude; echo x > $D/a.txt', 'declare -u D; D=build; echo x > $D/a.txt']) assert.equal(files(c, fs).decision, 'allow', c);
+});
+
+// ---- S4d: a cd into an unknown directory is judged as if the cwd were each protected directory (files-policy) ------------------------------------------------
+
+// Why: after `cd $UNSET` the line works in some directory nobody can name: the rest of it is judged with the ordinary write checks as if the cwd were each protected directory and each
+// directory above one (so every writer model applies, not a list of names), and inline interpreter code (names built at run time) is refused.
+test('S4d: the rest of a line after an unknown cd is judged as if the cwd were each protected directory', () => {
+  const fs = fakeFs(PROJ, { 'ok.sh': 'echo ok', 'c.sh': 'cp /tmp/x/notes .', 'cc.sh': 'cd $Q\ncp /tmp/x/notes .' }, DIRS);
+  for (const cd of ['cd $UNSET', 'cd $(pick)']) {
+    for (const w of [
+      // (writers the name lists did not know: the destination is the directory itself)
+      'rsync -a /tmp/x/ .', 'ditto /tmp/x .', 'cp -T /tmp/x/notes .', 'cp -rT /tmp/x .', 'install -m 644 /tmp/x/notes .', 'curl -osettings.json https://h/x', 'curl -o settings.json https://h/x', 'wget -Osettings.json https://h/x',
+      'touch notes.txt', 'echo x > notes.txt', 'mkdir -p build && cp ok.sh build/out.js', 'ln -sf /tmp/x settings.json', 'echo x > $OUT',
+      // (inline interpreter code can build the name at run time)
+      "node -e 1", "node -e'1'", "node --eval=1", "node -pe 1", "python3 -cprint(1)", "python3 -c pass", "perl -E 'say 1'", "perl -Esay", "perl -pi -e s/a/b/ f", "env node -e 1", "node -r x.js -e 1", "perl -I lib -e 1", "python3 -W ignore -c pass", "python3 -X dev -c 1", "node --some-flag x.js", "python3 -W ignore x.py", "node x.js -p 1", "node <<< 1", "python3 -", "awk 'BEGIN{print 1 > \"x\"}'", 'perl -e 1', "ruby -e 1", "php -r 1", "node -e \"require('fs').writeFileSync('sett'+'ings.json','x')\"", "python3 -c \"open('sett'+'ings.json','w')\"",
+      // (child frames inherit the unknown directory)
+      'bash c.sh', 'bash -c "cp /tmp/x/notes ."', 'bash cc.sh',
+      // (what the S4b name heuristics allowed: any relative write or command that is not read-only may land in a protected directory)
+      "echo x > notes.txt", "cp ok.sh build/out.js", "git commit -m settings.json", "cp /tmp/x/notes.txt .", "cp -r /tmp/x/build .", "sed -i \"s/a.*/b/\" notes.txt", "echo x > notes.{txt,md}", "echo x > n*.txt", "git add notes.txt", "git commit -m x", "npm run $S", "bash n.sh", "node -e 'console.log(1)'", "cp /tmp/x/settings.json /tmp/y/", "cp /tmp/x/notes /tmp/y/", "tar -tf a.tar", "unzip -l a.zip", "curl -O https://h/x/a.txt",
+    ]) assert.equal(files(`${cd} && ${w}`, fs).decision, 'deny', `${cd} && ${w}`);
+  }
+  // (reads, absolute targets outside the protected set and a known directory stay allowed)
+  for (const w of ['cat settings.json', 'ls', 'git status', 'git log', 'grep x settings.json', 'echo x > /tmp/out.txt', 'echo hi | cat']) assert.equal(files(`cd $UNSET && ${w}`, fs).decision, 'allow', w);
+  assert.equal(files('cd sub && echo x > notes.txt', fs).decision, 'allow');
+  // (a script named relative to the unknown directory is a file nobody can read)
+  for (const w of ['node scripts/x.mjs', 'bash x.sh', 'source x.sh', './x.sh', 'python3 build/x.py', 'bash ~+/x.sh', 'bash ~-/x.sh', 'bash ~root/x.sh']) assert.match(files(`cd $(git rev-parse --show-toplevel) && ${w}`, fs).reason ?? '', /relative to a directory known only at run time/, w);
+  assert.notEqual(files('cd $UNSET && node /tmp/x.mjs', fs).decision, 'allow'); // (an absolute script path is read and judged; a missing file leaves the line refused by the rerun)
+  // (the reason says why)
+  assert.match(files('cd $UNSET && touch notes.txt', fs).reason, /known only at run time/);
+});
+
+test('S4d: the rerun is bounded (a long line after an unknown cd is judged in time)', () => {
+  const fs = fakeFs(PROJ, {}, DIRS);
+  const long = `cd $UNSET && ${Array.from({ length: 60 }, (_, i) => `echo ${i} > /tmp/o${i}`).join(' && ')}`;
+  const t0 = Date.now();
+  assert.equal(files(long, fs).decision, 'allow');
+  assert.ok(Date.now() - t0 < 5000, `took ${Date.now() - t0} ms`);
+  // (nested unknown cds multiply the reruns: past the budget the line is refused, not slow)
+  const nested = Array.from({ length: 9 }, (_, i) => `cd $U${i}`).join(' && ') + ' && echo x > /tmp/o';
+  const r = files(nested, fs);
+  assert.ok(r.decision === 'allow' || /too many|too long|took too long|run time/.test(r.reason), r.reason);
+});
+
+// ---- S4d: more ways to leave the directory unknown ----------------------------------------------------------------------------------------------------------
+
+test('S4d: cd ~- / ~+ / CDPATH / a changed HOME / a cd inside a sourced file make the directory unknown', () => {
+  const W = 'echo x > settings.json';
+  const sh = { 'set.sh': 'cd $X', 'set2.sh': 'cd -', 'set3.sh': 'cd /tmp/a/b', 'set4.sh': 'cd $(pick)', 'set5.sh': 'cd ~/.cl*', 'set6.sh': 'popd', 'set7.sh': 'pushd', 'set8.sh': 'cd a b', 'set9.sh': 'cd ~-' };
+  const fs = fakeFs(PROJ, sh, DIRS);
+  for (const c of [
+    'cd ~- && W', 'cd ~+/x && W', 'cd ~+ && W', 'cd ~-/x && W', 'cd ~root && W',
+    'CDPATH=/x cd sub && W', 'CDPATH=/x; cd sub && W', 'export CDPATH=/x; cd sub && W', 'declare -x CDPATH=/x; cd sub && W', 'CDPATH=$X; cd sub && W', 
+    'HOME=/x; source $X; cd && W', 'HOME=/x; source $X; cd ~ && W', 'HOME=/x; source $X; cd ~/sub && W', 'HOME=/x; cd && W', 'export HOME=/x; cd && W',
+    '. ./set.sh; W', 'source set.sh && W', '. ./set2.sh; W', '. ./set4.sh; W', '. ./set5.sh; W', '. ./set6.sh; W', '. ./set7.sh; W', '. ./set8.sh; W', '. ./set9.sh; W',
+  ]) assert.equal(files(c.replace('W', W), fs).decision, 'deny', c);
+  // (CDPATH inside a sourced file: set on the line, in the file, in the hook's environment)
+  const cp = fakeFs(PROJ, { 'a.sh': 'cd sub', 'b.sh': 'CDPATH=/x\ncd sub', 'c.sh': 'cd ./sub', 'd.sh': 'export CDPATH=/y; cd sub' }, DIRS);
+  for (const c of ['CDPATH=/x; . ./a.sh; W', 'export CDPATH=/x; source a.sh; W', '. ./b.sh; W', '. ./d.sh; W', 'CDPATH=/x . ./a.sh; W']) assert.equal(files(c.replace('W', W), cp).decision, 'deny', c);
+  assert.equal(files('. ./a.sh; ' + W, cp, { env: { CDPATH: '/x' } }).decision, 'deny');
+  for (const c of ['. ./a.sh; W', 'CDPATH=/x; . ./c.sh; W']) assert.equal(files(c.replace('W', W), cp).decision, 'allow', c);
+  // (CDPATH only matters for a relative name; a name that starts with / ./ ../ is not searched; the environment's CDPATH counts too)
+  assert.equal(files('cd sub && ' + W, fakeFs(PROJ, sh, DIRS), { env: { CDPATH: '/x' } }).decision, 'deny');
+  assert.equal(files('cd ./sub && ' + W, fakeFs(PROJ, sh, DIRS), { env: { CDPATH: '/x' } }).decision, 'allow');
+  assert.equal(files('cd /tmp/sub && ' + W, fakeFs(PROJ, sh, DIRS), { env: { CDPATH: '/x' } }).decision, 'allow');
+  for (const c of ['cd sub && W', 'CDPATH= cd sub && W', 'cd ~ && W', 'cd && W', '. ./set3.sh; W', 'HOME=/x; cd /tmp && W', 'cd ~root2 && echo x > /tmp/o']) assert.equal(files(c.replace('W', W), fs).decision, 'allow', c);
+});
+
+// Why: a redirect target built at run time (a substitution, an unset name) inside a known protected directory can be any file there.
+test('S4d: a run-time redirect target in a known protected directory is refused', () => {
+  const fs = fakeFs(PROJ, {}, DIRS);
+  for (const c of [
+    'cd ~/.claude && echo x > `echo settings.json`', 'cd ~/.claude && echo x > $(pick)', 'cd ~/.claude && echo x > $OUT', 'cd ~/.claude/skills && echo x > $(pick)', 'cd ~/.claude/pipeline && echo x >> "$LOG"',
+    'cd ~/.claude && echo x >& `pick`', 'cd ~/.claude && echo x &> $OUT',
+  ]) assert.equal(files(c, fs).decision, 'deny', c);
+  for (const c of ['cd sub && echo x > $OUT', 'echo x > $OUT', 'cd ~/.claude && echo x > ~/.claude/notes.txt', 'D=out; cd ~ && echo x > $D', 'cd ~/.claude && echo x 2>&1']) assert.equal(files(c, fs).decision, 'allow', c);
+});
+
+// Why: only `&N` / `&-` are descriptor duplications; `>&FILE` (and a target the parser keeps with a leading &) writes the file.
+test('S4d: a redirect target with a leading & is a file unless it is a descriptor', () => {
+  const fs = fakeFs(PROJ, {}, DIRS);
+  for (const c of ['cd ~/.claude && echo x >&settings.json', 'echo x >&~/.claude/settings.json', 'cd ~/.claude && echo x >&"&"settings.json', 'cd ~/.claude && echo x 2>&"&"settings.json', 'cd $U && echo x >&settings.json']) assert.equal(files(c, fs).decision, 'deny', c);
+  for (const c of ['cd ~/.claude && echo x 2>&1', 'cd ~/.claude && echo x >&2', 'cd ~/.claude && echo x >&-', 'cd ~/.claude && echo x 2>&1-', 'echo x >&"&"settings.json', 'cd ~/.claude && echo x <&3']) assert.equal(files(c, fs).decision, 'allow', c);
+});
+
+// Why: a startup file (BASH_ENV / ENV) runs in the CHILD shell: what it sets is the child script's, not the parent line's (only `source` / `.` change the current shell).
+test('S4d: the effects of a startup file apply to the child script only, not to the rest of the parent line', () => {
+  const fs = fakeFs(PROJ, { 'rc': 'D=/tmp', 'rcd': 'cd /tmp', 'x.sh': 'echo hi', 'src.sh': 'D=/tmp' }, DIRS);
+  for (const c of [
+    'D=/home/u/.claude; BASH_ENV=rc bash x.sh; echo y > $D/settings.json',
+    'D=/home/u/.claude; export BASH_ENV=rc; bash x.sh; echo y > $D/settings.json',
+    'cd /home/u/.claude; BASH_ENV=rcd bash x.sh; echo y > settings.json',
+  ]) assert.equal(files(c, fs).decision, 'deny', c);
+  // (a sourced file does change the current shell)
+  assert.equal(files('D=/home/u/.claude; source src.sh; echo y > $D/settings.json', fs).decision, 'allow');
+  assert.equal(files('D=/home/u/.claude; BASH_ENV=rc bash x.sh', fs).decision, 'allow');
 });
