@@ -959,3 +959,28 @@ test('L2: install -T is a switch; a copy writer with too few operands is unmodel
   denyBoth('cp --target-directory=m -t d f.sh; bash d/f.sh');
   denyBoth('cp -t m -t d f.sh; bash m/f.sh');
 });
+
+test('L2: the clone / worktree-add narrowing applies only when the options and operands are read exactly', () => {
+  // Why: `git clone --filter blob:none URL src` was read with a partial option list, so the filter spec became the "repository" and the URL the "directory": the narrowing (only scripts below the
+  // directory) then applied to the wrong one and `bash src/n.sh` was missed. Unknown, ambiguous or extra words: the parse is not trusted, the clone may write anywhere (as before the narrowing).
+  const unknownDir = (tail) => (mid) => `cd /work/repo && git worktree list | head -3 && ${tail.replace('MID', mid)}`;
+  const gitOnly = (tail) => run(unknownDir(tail)(MID_GIT), SPEC).git.r.decision;
+  const U = 'https://x/y.git';
+  for (const o of ['--filter blob:none', '--shallow-since 2020-01-01', '--shallow-exclude v1', '--reference /tmp/r', '--bundle-uri b.bundle', '--server-option x', '--jobs 4', '-j 4', '--depth 1', '--dep 1', '-b main', '--branch=main', '-o up', '--config a=b', '-c a=b', '--template t', '--recurse-submodules=.', '--recurse-submodules', '-n', '--no-checkout', '-q', '--no-tags', '--single-branch', '--no-single-branch', '--origin up', '--separate-git-dir g', '--filter=blob:none', '-bmain']) {
+    assert.equal(gitOnly(`git clone ${o} ${U} sub; MID; bash /work/repo/ok.sh`), 'allow', o); // (read exactly: the narrowing holds)
+    assert.equal(gitOnly(`git clone ${o} ${U} src; MID; bash /work/repo/src/n.sh`), 'deny', o); // (and the script below the REAL directory is reached)
+  }
+  // an option we do not know, an ambiguous abbreviation, a stray operand: not narrowed, the clone may write anywhere
+  for (const o of ['--bogus-opt x', '--bogus', '--no', '--s', '--rec']) assert.equal(gitOnly(`git clone ${o} ${U} sub; MID; bash /work/repo/ok.sh`), 'deny', o);
+  assert.equal(gitOnly(`git clone ${U} sub extra; MID; bash /work/repo/ok.sh`), 'deny');
+  assert.equal(gitOnly('git clone; MID; bash /work/repo/ok.sh'), 'deny');
+  assert.equal(gitOnly(`git clone -- ${U} sub; MID; bash /work/repo/ok.sh`), 'allow');
+  assert.equal(gitOnly(`git clone -- ${U} src; MID; bash /work/repo/src/n.sh`), 'deny');
+  // worktree add
+  assert.equal(gitOnly('git worktree add --guess-remote -b x sub origin/main; MID; bash /work/repo/ok.sh'), 'allow');
+  assert.equal(gitOnly('git worktree add --reason why --lock -b x sub origin/main; MID; bash /work/repo/ok.sh'), 'allow');
+  assert.equal(gitOnly('git worktree add --reason why --lock -b x src origin/main; MID; bash /work/repo/src/n.sh'), 'deny');
+  assert.equal(gitOnly('git worktree add --bogus sub; MID; bash /work/repo/ok.sh'), 'deny');
+  assert.equal(gitOnly('git worktree add -b x sub origin/main extra; MID; bash /work/repo/ok.sh'), 'deny');
+  assert.equal(gitOnly('git worktree add --no sub; MID; bash /work/repo/ok.sh'), 'deny');
+});

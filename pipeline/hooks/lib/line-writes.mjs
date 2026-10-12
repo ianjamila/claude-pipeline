@@ -159,6 +159,17 @@ const WGET_OPTIONS = {
   longOpt: [],
   longSwitch: ['help', 'version', 'background', 'debug', 'quiet', 'verbose', 'force-html', 'retry-connrefused', 'retry-on-host-error', 'continue', 'show-progress', 'timestamping', 'server-response', 'spider', 'random-wait', 'proxy', 'ask-password', 'iri', 'unlink', 'keep-badhash', 'metalink-over-http', 'xattr', 'directories', 'force-directories', 'host-directories', 'protocol-directories', 'cache', 'adjust-extension', 'ignore-length', 'save-headers', 'http-keep-alive', 'cookies', 'keep-session-cookies', 'content-disposition', 'content-on-error', 'auth-no-challenge', 'https-only', 'check-certificate', 'hsts', 'remove-listing', 'glob', 'passive-ftp', 'preserve-permissions', 'retr-symlinks', 'ftps-implicit', 'ftps-resume-ssl', 'ftps-clear-data-connection', 'ftps-fallback-to-ftp', 'warc-cdx', 'warc-compression', 'warc-digests', 'warc-keep-log', 'recursive', 'delete-after', 'convert-file-only', 'convert-links', 'backup-converted', 'mirror', 'page-requisites', 'strict-comments', 'follow-ftp', 'span-hosts', 'relative', 'parent', 'clobber', 'if-modified-since', 'use-server-timestamps', 'dns-cache', 'ignore-case', 'inet4-only', 'inet6-only', 'trust-server-names'],
 };
+// git clone / git worktree add: every option of the subcommand (git takes a unique prefix of a long one, and --no-X negates a boolean X)
+const GIT_CLONE_OPTIONS = {
+  negate: true, shortVal: 'obcuj', shortSwitch: 'lsqvn46',
+  longVal: ['origin', 'branch', 'config', 'upload-pack', 'template', 'depth', 'shallow-since', 'shallow-exclude', 'reference', 'reference-if-able', 'separate-git-dir', 'jobs', 'filter', 'bundle-uri', 'server-option', 'ref-format', 'revision'],
+  longOpt: ['recurse-submodules'],
+  longSwitch: ['local', 'hardlinks', 'shared', 'dissociate', 'quiet', 'verbose', 'progress', 'checkout', 'bare', 'mirror', 'single-branch', 'tags', 'shallow-submodules', 'remote-submodules', 'sparse', 'reject-shallow', 'also-filter-submodules', 'recursive', 'ipv4', 'ipv6', 'no-checkout', 'no-hardlinks', 'help'],
+};
+const GIT_WORKTREE_ADD_OPTIONS = {
+  negate: true, shortVal: 'bB', shortSwitch: 'fdq', longVal: ['reason'], longOpt: [],
+  longSwitch: ['force', 'detach', 'checkout', 'lock', 'orphan', 'quiet', 'track', 'guess-remote', 'relative-paths', 'no-checkout'],
+};
 function curlRecords(args, idx, env = {}) {
   const out = [];
   let anyOutput = Object.keys(env).some((k) => RC_ENV.test(k)); // (a config file: -K / --config / --next / a startup file from CURL_HOME: it can name any output)
@@ -241,6 +252,7 @@ function getoptStrict(args, { shortVal = '', shortSwitch = '', longVal = [], lon
   const all = [...longVal, ...longOpt, ...longSwitch];
   const resolve = (nm) => {
     if (all.includes(nm)) return nm;
+    if (negate && ('no-'.startsWith(nm) || nm.startsWith('no-'))) return null; // (an abbreviation of --no-X may be the negation of any X: ambiguous)
     const m = all.filter((x) => x.startsWith(nm));
     return !exact && nm !== '' && m.length === 1 ? m[0] : null;
   };
@@ -488,9 +500,11 @@ function argRecords(cmd, name, idx) {
       return pos.map((p) => unknown(at(p)));
     }
     if (sub === 'clone') {
-      const { pos } = getopt(rest, 'bcoju', ['branch', 'depth', 'origin', 'config', 'template', 'reference', 'separate-git-dir', 'jobs']);
+      // Why: `narrow` (only scripts below the directory) is right only when the directory is the word git takes: one unlisted value option shifts the operands. Else the clone may write anywhere
+      const { pos, bad } = getoptStrict(rest, GIT_CLONE_OPTIONS);
+      const exact = !bad && pos.length >= 1 && pos.length <= 2;
       const d = pos[1] ?? (pos[0] ? urlBase(pos[0]).replace(/\.git$/, '') : '.');
-      return [unknown(at(d), { subtree: true, narrow: true })];
+      return orAnywhere([unknown(at(d), { subtree: true, narrow: exact })], idx, !exact);
     }
     if (GIT_OUTPUT.has(sub)) { // git diff --output=F, git log --output=F, git archive -o F, git format-patch -o DIR
       const { opts } = getopt(rest, 'o', ['output', 'output-directory']);
@@ -499,8 +513,9 @@ function argRecords(cmd, name, idx) {
       return [unknown(at(out), { subtree: sub === 'format-patch' })];
     }
     if (sub === 'worktree' && rest[0] === 'add') {
-      const { pos } = getopt(rest.slice(1), 'bB', ['reason']);
-      return pos[0] ? [unknown(at(pos[0]), { subtree: true, narrow: true })] : [];
+      const { pos, bad } = getoptStrict(rest.slice(1), GIT_WORKTREE_ADD_OPTIONS);
+      const exact = !bad && pos.length >= 1 && pos.length <= 2; // (<path> [<commit-ish>])
+      return orAnywhere(pos[0] ? [unknown(at(pos[0]), { subtree: true, narrow: exact })] : [], idx, !exact);
     }
     return null;
   }
