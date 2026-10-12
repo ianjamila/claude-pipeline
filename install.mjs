@@ -229,8 +229,12 @@ function doInstall(ctx) {
   const backup = settingsChanged && current.exists ? backupSettings(home, current.file) : null;
 
   const ts = safeTimestamp();
-  const manifestObj = I.buildManifest({ plan, sourceSha: gitHead(source), skipFileGuard: opts.skipFileGuard });
+  // The pipeline unit is staged with "complete": false; only the rewrite at the very end says true, so an install
+  // that dies half way never reads as current.
+  const manifestObj = I.buildManifest({ plan, sourceSha: gitHead(source), skipFileGuard: opts.skipFileGuard, complete: false });
   const manifestText = `${JSON.stringify(manifestObj, null, 2)}\n`;
+  const manifestFile = I.fromRel(home, I.MANIFEST_REL);
+  const anyUnitChanges = plan.units.some((u) => states.get(u.rel) !== 'same');
   let copied = 0;
   let unchanged = 0;
   const foreignBackups = [];
@@ -239,9 +243,8 @@ function doInstall(ctx) {
     for (const unit of plan.units) {
       if (states.get(unit.rel) === 'same') {
         unchanged += unit.files.length;
-        // Only the install time would differ on a no-op run; leave the file byte-identical then.
-        const manifestSame = manifest && isDeepStrictEqual(I.manifestWithoutTime(manifest), I.manifestWithoutTime(manifestObj));
-        if (unit.kind === 'pipeline' && !manifestSame) writeFileAtomic(I.fromRel(home, I.MANIFEST_REL), manifestText, I.lexists(I.fromRel(home, I.MANIFEST_REL)));
+        // The pipeline files stay, but a later unit is about to change: the manifest must say "unfinished" until the end.
+        if (unit.kind === 'pipeline' && anyUnitChanges) writeFileAtomic(manifestFile, manifestText, I.lexists(manifestFile));
         continue;
       }
       const foreign = conflicts.includes(unit.rel);
@@ -269,6 +272,13 @@ function doInstall(ctx) {
   }
 
   if (settingsChanged) writeSettingsFile(current.file, merged, current.exists);
+
+  // Everything is in place: mark the install complete. A byte-identical no-op run keeps its file (only the time differs).
+  const finalObj = { ...manifestObj, complete: true };
+  // (any unit change means the manifest on disk is now the staged, incomplete copy)
+  const alreadyFinal = manifest && !anyUnitChanges && I.manifestComplete(manifest)
+    && isDeepStrictEqual(I.manifestWithoutTime({ ...manifest, complete: true }), I.manifestWithoutTime(finalObj));
+  if (!alreadyFinal) writeFileAtomic(manifestFile, `${JSON.stringify(finalObj, null, 2)}\n`, I.lexists(manifestFile));
 
   const allowBefore = new Set(current.settings.permissions?.allow ?? []);
   return {

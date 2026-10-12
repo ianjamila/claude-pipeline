@@ -1029,3 +1029,62 @@ test('stage and rollback copies live under backups/.staging, never inside skills
   assert.ok(readdirSync(join(home, 'agents')).every((n) => !/\.(new|old)-/.test(n)));
   assert.equal(existsSync(join(home, 'backups', '.staging')), false, 'the staging dir is removed when empty');
 });
+
+// ---- A1: complete-install marker --------------------------------------------------------------------------------
+
+test('a finished install says complete: true; a legacy manifest without the field counts as complete', () => {
+  const home = newHome();
+  assert.equal(install(home).status, 0);
+  assert.equal(readManifest(home).complete, true);
+
+  const m = readManifest(home);
+  delete m.complete;
+  writeFileSync(join(home, 'pipeline', 'INSTALLED.json'), `${JSON.stringify(m, null, 2)}\n`);
+  const check = install(home, ['--check', '--json']);
+  assert.equal(check.status, 0, check.stdout);
+  assert.deepEqual(JSON.parse(check.stdout).drift, []);
+  const before = readFileSync(join(home, 'pipeline', 'INSTALLED.json'), 'utf8');
+  assert.equal(install(home).status, 0);
+  assert.equal(readFileSync(join(home, 'pipeline', 'INSTALLED.json'), 'utf8'), before, 'a legacy-but-current manifest is left byte-identical');
+});
+
+test('an install that dies after the pipeline unit leaves complete: false, --check says incomplete, a re-run repairs it', () => {
+  const home = newHome();
+  mkdirSync(home, { recursive: true });
+  writeFileSync(join(home, 'agents'), 'a file where the agents/ dir has to go\n'); // the agents unit cannot be staged
+  const failed = install(home);
+  assert.equal(failed.status, 1, failed.stdout);
+  assert.equal(readManifest(home).complete, false, 'the pipeline unit landed, the install did not finish');
+
+  const check = install(home, ['--check', '--json']);
+  assert.equal(check.status, 1);
+  const incomplete = JSON.parse(check.stdout).drift.filter((d) => d.kind === 'incomplete');
+  assert.deepEqual(incomplete, [{
+    kind: 'incomplete',
+    path: 'pipeline/INSTALLED.json',
+    message: 'incomplete: a previous install did not finish; re-run the installer',
+  }]);
+  assert.match(install(home, ['--check']).stdout, /incomplete: a previous install did not finish/);
+
+  rmSync(join(home, 'agents'));
+  const repaired = install(home);
+  assert.equal(repaired.status, 0, repaired.stderr);
+  assert.equal(readManifest(home).complete, true);
+  assert.equal(install(home, ['--check']).status, 0);
+});
+
+test('a later unit failing while the pipeline unit is unchanged still marks the install incomplete', () => {
+  const home = newHome();
+  const src = copyFixture();
+  assert.equal(install(home, [], { source: src }).status, 0);
+  writeFileSync(join(src, 'skills', 'ship', 'SKILL.md'), 'newer ship skill\n');
+  rmSync(join(home, 'agents', 'judge.md'));
+  mkdirSync(join(home, 'agents', 'judge.md')); // a directory where the agent file goes: its swap fails
+  writeFileSync(join(home, 'agents', 'judge.md', 'x'), 'x');
+  const failed = install(home, ['--force'], { source: src });
+  assert.equal(failed.status, 1, failed.stdout);
+  assert.equal(readManifest(home).complete, false);
+  rmSync(join(home, 'agents', 'judge.md'), { recursive: true });
+  assert.equal(install(home, [], { source: src }).status, 0);
+  assert.equal(readManifest(home).complete, true);
+});

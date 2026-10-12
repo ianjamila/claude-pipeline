@@ -224,13 +224,19 @@ export function safeManifestKey(key) {
 // The same manifest, minus the one field that changes on every run.
 export const manifestWithoutTime = ({ installedAt, ...rest }) => rest;
 
-export function buildManifest({ plan, sourceSha, skipFileGuard, now = new Date() }) {
+// complete: false is what the pipeline unit carries while the rest of the install is still being swapped in; the
+// final rewrite says true. A manifest without the field (every install before it existed) counts as complete.
+export const manifestComplete = (manifest) => manifest?.complete !== false;
+
+export function buildManifest({ plan, sourceSha, skipFileGuard, complete = false, sourceDirty = false, now = new Date() }) {
   const files = {};
   for (const rel of [...plan.files.keys()].sort(byCodeUnit)) files[rel] = plan.files.get(rel).sha256;
   return {
     version: plan.version,
     sourceSha: sourceSha ?? null,
+    ...(sourceDirty ? { sourceDirty: true } : {}),
     installedAt: now.toISOString(),
+    complete: Boolean(complete),
     files,
     hooks: { guardGit: true, guardFiles: !skipFileGuard },
   };
@@ -454,6 +460,7 @@ export function computeDrift({ home, plan, manifest, settings, settingsProblem, 
   const add = (kind, p, message) => drift.push({ kind, path: p, message });
 
   if (!manifest) add('not-installed', MANIFEST_REL, `${MANIFEST_REL} is missing: claude-pipeline is not installed in ${home}`);
+  else if (!manifestComplete(manifest)) add('incomplete', MANIFEST_REL, 'incomplete: a previous install did not finish; re-run the installer');
   const states = new Map();
   for (const unit of plan.units) states.set(unit.rel, unitState(home, unit));
 
