@@ -4,12 +4,13 @@
 //  - the repository is a constant, never read from the environment or the caller (only the test seam
 //    PIPELINE_UPDATE_REMOTE, which an installed copy ignores, can stand in for the fetch URL);
 //  - every git call runs with the caller's configuration, hooks, templates and credentials out of the picture
-//    (isolatedGit, on an allowlisted environment): update installs a tree it just downloaded into the owner's ~/.claude,
+//    (isolatedGit, on an allowlisted environment and a private config/hooks directory): update installs a tree it just downloaded into the owner's ~/.claude,
 //    so a hostile ~/.gitconfig, GIT_* variable or hook must not be able to change what gets fetched or run;
 //  - nothing here throws or hangs: lookups return an "unresolved" answer with a reason, and every call is bounded by
 //    a timeout that the caller can share across steps.
 import fs from 'node:fs';
 import os from 'node:os';
+import path from 'node:path';
 import { gh, run, seamValue } from './proc.mjs';
 
 export const UPSTREAM_HOST = 'github.com';
@@ -35,14 +36,42 @@ const DEFAULT_TIMEOUT_MS = 15000;
 const GIT_ENV_KEEP = ['PATH', 'HOME', 'LANG', 'LC_ALL'];
 const GIT_ENV_KEEP_WINDOWS = ['SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'PROGRAMDATA'];
 
-// The "no file" path handed to git. os.devNull is `\\.\nul` on Windows, which Git for Windows cannot open as a config
-// file (`fatal: unable to access '\\.\nul': Invalid argument`); it maps the literal `/dev/null` to NUL itself, so that
-// is what it gets there. Everywhere else os.devNull is already `/dev/null`.
-export function gitNullDevice(platform = process.platform) {
-  return platform === 'win32' ? '/dev/null' : os.devNull;
+// Isolation never names a device ("/dev/null", `\\.\nul`, os.devNull): Git for Windows special-cases the literal
+// "/dev/null" only where it opens a file, while core.hooksPath is joined with a hook name ("/dev/null/post-checkout")
+// and stat()ed, which resolves to C:\dev\null\post-checkout on Windows - a directory any local user may create, so a
+// device-name hooksPath is a hook-hijack. Instead every isolated git call is given a PRIVATE directory made by
+// makeIsoDir(): `hooks/` (empty; core.hooksPath) and `empty.gitconfig` (empty; GIT_CONFIG_GLOBAL). Nothing the caller
+// configured, and nothing another local user can plant at a well-known path, can be found there.
+export const ISO_DIR_PREFIX = 'claude-pipeline-git-';
+
+// A fresh private directory (mode 0700 on POSIX) holding an empty hooks directory and an empty global config file.
+// Throws when it cannot be made (the caller treats git as unavailable and never falls back to the caller's config).
+// The caller removes it (removeTree) - or uses withIsolatedGit, which does.
+export function makeIsoDir(parent = os.tmpdir()) {
+  const dir = fs.mkdtempSync(path.join(parent, ISO_DIR_PREFIX));
+  try {
+    if (process.platform !== 'win32') fs.chmodSync(dir, 0o700);
+    fs.mkdirSync(path.join(dir, 'hooks'), { mode: 0o700 });
+    fs.writeFileSync(path.join(dir, 'empty.gitconfig'), '', { mode: 0o600 });
+  } catch (err) {
+    removeTree(dir);
+    throw err;
+  }
+  return dir;
 }
 
-export function isolatedGitEnv({ source = process.env, platform = process.platform } = {}) {
+// The two paths inside an iso directory. Throws unless both exist as made by makeIsoDir, so a caller that forgot the
+// directory (or passed some other path) fails loudly instead of running git against the caller's configuration.
+function isoPaths(isoDir) {
+  if (typeof isoDir !== 'string' || isoDir === '') throw new TypeError('isolated git needs a private isoDir (see makeIsoDir / withIsolatedGit)');
+  const hooks = path.join(isoDir, 'hooks');
+  const config = path.join(isoDir, 'empty.gitconfig');
+  if (!fs.statSync(hooks).isDirectory() || !fs.statSync(config).isFile()) throw new TypeError(`isoDir ${isoDir} is not a directory made by makeIsoDir`);
+  return { hooks, config };
+}
+
+export function isolatedGitEnv({ isoDir, source = process.env, platform = process.platform } = {}) {
+  const { config } = isoPaths(isoDir);
   const env = {};
   const windows = platform === 'win32';
   for (const name of [...GIT_ENV_KEEP, ...(windows ? GIT_ENV_KEEP_WINDOWS : [])]) {
@@ -50,14 +79,15 @@ export function isolatedGitEnv({ source = process.env, platform = process.platfo
     const key = windows ? Object.keys(source).find((k) => k.toUpperCase() === name) : (name in source ? name : undefined);
     if (key !== undefined && source[key] !== undefined) env[name] = source[key];
   }
-  return { ...env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: gitNullDevice(platform), GIT_TERMINAL_PROMPT: '0' };
+  return { ...env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: config, GIT_TERMINAL_PROMPT: '0' };
 }
 
 // Leading `-c` options: no hooks, no fsmonitor, no credential helper, and https as the only transport. `allowFile`
 // additionally opens the file transport; it is only for the test seam (a local bare repo standing in for GitHub).
-export function isolatedGitArgs({ allowFile = false } = {}) {
+export function isolatedGitArgs({ isoDir, allowFile = false } = {}) {
+  const { hooks } = isoPaths(isoDir);
   return [
-    '-c', `core.hooksPath=${gitNullDevice()}`,
+    '-c', `core.hooksPath=${hooks}`,
     '-c', 'core.fsmonitor=false',
     '-c', 'credential.helper=',
     '-c', 'protocol.allow=never',
@@ -66,10 +96,21 @@ export function isolatedGitArgs({ allowFile = false } = {}) {
   ];
 }
 
-// run('git', ...) with the isolation above. `args` may start with `-C <dir>`; `git init` should pass `--template=`
-// (an empty template, so no hook or info/exclude is copied in).
-export function isolatedGit(args, { cwd, timeoutMs = 60000, input, allowFile = false } = {}) {
-  return run('git', [...isolatedGitArgs({ allowFile }), ...args], { cwd, env: isolatedGitEnv(), replaceEnv: true, timeoutMs, input });
+// run('git', ...) with the isolation above. `isoDir` (from makeIsoDir) is required. `args` may start with `-C <dir>`;
+// `git init` should pass `--template=` (an empty template, so no hook or info/exclude is copied in).
+export function isolatedGit(args, { isoDir, cwd, timeoutMs = 60000, input, allowFile = false } = {}) {
+  return run('git', [...isolatedGitArgs({ isoDir, allowFile }), ...args], { cwd, env: isolatedGitEnv({ isoDir }), replaceEnv: true, timeoutMs, input });
+}
+
+// Runs fn(git, isoDir) with a private iso directory that is removed afterwards, whether fn returns or throws. `git` is
+// isolatedGit with that directory already bound: git(args, { cwd, timeoutMs, input, allowFile }).
+export function withIsolatedGit(fn) {
+  const isoDir = makeIsoDir();
+  try {
+    return fn((args, opts = {}) => isolatedGit(args, { ...opts, isoDir }), isoDir);
+  } finally {
+    removeTree(isoDir);
+  }
 }
 
 // Where `update` fetches from: UPSTREAM_URL, or the PIPELINE_UPDATE_REMOTE test seam (a path or URL) when this is not
@@ -111,12 +152,13 @@ export function mainSha({ timeoutMs = DEFAULT_TIMEOUT_MS, env } = {}) {
   if (t.expired()) return { ok: false, reason: reasons.join('; ') };
   try {
     const remote = fetchRemote(env);
-    const r = isolatedGit(['ls-remote', remote.url, 'refs/heads/main'], { cwd: os.tmpdir(), timeoutMs: t.left(), allowFile: remote.local });
+    // A private config/hooks directory per call; if it cannot be made git is unavailable here, never run on the caller's config.
+    const r = withIsolatedGit((git) => git(['ls-remote', remote.url, 'refs/heads/main'], { cwd: os.tmpdir(), timeoutMs: t.left(), allowFile: remote.local }));
     const sha = r.stdout.split(/\s+/)[0] ?? '';
     if (r.code === 0 && !r.timedOut && FULL_SHA.test(sha)) return { ok: true, sha, via: 'git' };
     reasons.push(r.code === 0 && !r.timedOut ? 'git ls-remote did not list refs/heads/main' : failure('git ls-remote', r));
   } catch (err) {
-    reasons.push(`git ls-remote failed: ${firstLine(err?.message)}`);
+    reasons.push(`git unavailable: ${firstLine(err?.message)}`);
   }
   return { ok: false, reason: reasons.join('; ') };
 }

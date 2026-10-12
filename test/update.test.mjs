@@ -7,14 +7,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import {
-  cpSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync,
+  chmodSync, cpSync, copyFileSync, existsSync, lstatSync, statSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { devNull, tmpdir } from 'node:os';
+import { dirname, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createFakeGh } from './helpers/fakegh-env.mjs';
 import { run as update, meta, installerEnv } from '../pipeline/commands/update.mjs';
-import { compare, fetchRemote, gitNullDevice, isolatedGit, isolatedGitArgs, isolatedGitEnv, mainSha, UPSTREAM_HOST, UPSTREAM_REPO, UPSTREAM_URL } from '../pipeline/lib/upstream.mjs';
+import { compare, fetchRemote, ISO_DIR_PREFIX, isolatedGit, isolatedGitArgs, isolatedGitEnv, mainSha, makeIsoDir, withIsolatedGit, UPSTREAM_HOST, UPSTREAM_REPO, UPSTREAM_URL } from '../pipeline/lib/upstream.mjs';
 import { seamValue } from '../pipeline/lib/proc.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -82,12 +82,16 @@ function envFor(fake, extra = {}) {
 const newHome = () => join(scratch('cp-upd-home'), 'claude');
 const readManifest = (home) => JSON.parse(readFileSync(join(home, 'pipeline', 'INSTALLED.json'), 'utf8'));
 
-// Runs `fn` with the temp dir pointed at a private folder and lists update's own scratch directories left in it afterwards.
+// A private isolation directory for a test, made under a scratch folder that the exit hook removes.
+const isoDir = () => makeIsoDir(scratch('cp-upd-isoparent'));
+
+// Runs `fn` with the temp dir pointed at a private folder and lists update's own scratch directories (the download
+// and the private git config/hooks directory) left in it afterwards.
 async function withTmp(fn) {
   const dir = scratch('cp-upd-tmp');
   const saved = { TMPDIR: process.env.TMPDIR, TEMP: process.env.TEMP, TMP: process.env.TMP };
   Object.assign(process.env, { TMPDIR: dir, TEMP: dir, TMP: dir });
-  try { return { result: await fn(), left: readdirSync(dir).filter((n) => n.startsWith('claude-pipeline-update-')) }; } finally {
+  try { return { result: await fn(), left: readdirSync(dir).filter((n) => n.startsWith('claude-pipeline-update-') || n.startsWith(ISO_DIR_PREFIX)) }; } finally {
     for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
   }
 }
@@ -431,40 +435,79 @@ test('compare and mainSha give up when gh hangs past the timeout', () => {
   assert.ok(Date.now() - t0 < 8000, 'the timeouts are real');
 });
 
-test('the isolated git: fixed flags, no system/global config, no prompts', () => {
-  const args = isolatedGitArgs();
-  for (const pair of [`core.hooksPath=${gitNullDevice()}`, 'core.fsmonitor=false', 'credential.helper=', 'protocol.allow=never', 'protocol.https.allow=always']) {
+test('the isolated git: fixed flags, no system/global config, no prompts, all pointing into a private dir', () => {
+  const iso = isoDir();
+  const args = isolatedGitArgs({ isoDir: iso });
+  for (const pair of [`core.hooksPath=${join(iso, 'hooks')}`, 'core.fsmonitor=false', 'credential.helper=', 'protocol.allow=never', 'protocol.https.allow=always']) {
     assert.ok(args.includes(pair), pair);
   }
   assert.equal(args.includes('protocol.file.allow=always'), false);
-  assert.ok(isolatedGitArgs({ allowFile: true }).includes('protocol.file.allow=always'));
-  const env = isolatedGitEnv();
+  assert.ok(isolatedGitArgs({ isoDir: iso, allowFile: true }).includes('protocol.file.allow=always'));
+  const env = isolatedGitEnv({ isoDir: iso });
   assert.equal(env.GIT_CONFIG_NOSYSTEM, '1');
-  assert.equal(env.GIT_CONFIG_GLOBAL, gitNullDevice());
-  // os.devNull is \\.\nul on Windows and Git for Windows cannot open it; it is given /dev/null there (the CI windows job runs git for real).
-  assert.equal(gitNullDevice('win32'), '/dev/null');
-  assert.equal(isolatedGitEnv({ source: {}, platform: 'win32' }).GIT_CONFIG_GLOBAL, '/dev/null');
+  assert.equal(env.GIT_CONFIG_GLOBAL, join(iso, 'empty.gitconfig'));
   assert.equal(env.GIT_TERMINAL_PROMPT, '0');
+  // The hooks path is an existing EMPTY directory and the global config an existing EMPTY file: never a device name,
+  // which Git for Windows resolves differently for a hooks directory (C:\dev\null\post-checkout) than for a file.
+  const hooksPath = args.find((a) => a.startsWith('core.hooksPath=')).slice('core.hooksPath='.length);
+  assert.equal(statSync(hooksPath).isDirectory(), true);
+  assert.deepEqual(readdirSync(hooksPath), []);
+  assert.equal(statSync(env.GIT_CONFIG_GLOBAL).isFile(), true);
+  assert.equal(readFileSync(env.GIT_CONFIG_GLOBAL, 'utf8'), '');
+  for (const text of [...args, ...Object.values(env)]) {
+    assert.equal(text.includes('/dev/null'), false, text);
+    assert.equal(text.includes(devNull), false, text);
+    assert.equal(/\\\\\.\\nul/i.test(text), false, text);
+  }
+  assert.equal(hooksPath.startsWith(iso + sep), true);
+  assert.equal(isolatedGitEnv({ isoDir: iso, source: {}, platform: 'win32' }).GIT_CONFIG_GLOBAL, join(iso, 'empty.gitconfig'));
+});
+
+test('the isolated git cannot be called without a private directory made by makeIsoDir', () => {
+  assert.throws(() => isolatedGitArgs(), /isoDir/);
+  assert.throws(() => isolatedGitEnv(), /isoDir/);
+  assert.throws(() => isolatedGit(['--version']), /isoDir/);
+  assert.throws(() => isolatedGit(['--version'], { isoDir: scratch('cp-upd-notiso') }));
+});
+
+test('makeIsoDir: a fresh private dir (0700 on POSIX) with an empty hooks dir and an empty config file; withIsolatedGit removes it', { skip: process.platform === 'win32' }, () => {
+  const parent = scratch('cp-upd-isomode');
+  const a = makeIsoDir(parent);
+  const b = makeIsoDir(parent);
+  assert.notEqual(a, b);
+  assert.equal(statSync(a).mode & 0o777, 0o700);
+  assert.equal(statSync(join(a, 'hooks')).mode & 0o777, 0o700);
+  assert.equal(statSync(join(a, 'empty.gitconfig')).mode & 0o077, 0, 'the config file is not group/world accessible');
+  assert.equal(a.startsWith(join(parent, ISO_DIR_PREFIX)), true);
+  let seen;
+  const out = withIsolatedGit((git, dir) => { seen = dir; assert.equal(existsSync(dir), true); return git(['--version']); });
+  assert.equal(out.code, 0, out.stderr);
+  assert.equal(existsSync(seen), false, 'removed after success');
+  let thrown;
+  assert.throws(() => withIsolatedGit((git, dir) => { thrown = dir; throw new Error('boom'); }), /boom/);
+  assert.equal(existsSync(thrown), false, 'removed after a throw');
 });
 
 test('the isolated git environment is an allowlist: PATH, HOME, locale and three fixed values, nothing else', () => {
+  const iso = isoDir();
   const hostile = {
     PATH: '/usr/bin', HOME: '/home/u', LANG: 'en_US.UTF-8', LC_ALL: 'C', LC_CTYPE: 'x', TEMP: '/t', COMSPEC: 'cmd', SYSTEMROOT: 'C:\\Windows',
     GIT_EXEC_PATH: '/evil', GIT_SSH: '/evil/ssh', GIT_SSH_COMMAND: 'evil', GIT_CONFIG: '/evil/c', GIT_CONFIG_GLOBAL: '/evil/g', GIT_EXTERNAL_DIFF: 'evil',
     GIT_PROXY_COMMAND: 'evil', GIT_ASKPASS: 'evil', GIT_PAGER: 'evil', GIT_FUTURE_VARIABLE: 'evil', GIT_DIR: '/evil',
     HTTPS_PROXY: 'http://evil', SSL_CERT_FILE: '/evil', CURL_CA_BUNDLE: '/evil', LD_PRELOAD: '/evil.so', NODE_OPTIONS: '--require evil', EDITOR: 'evil',
   };
-  const fixed = { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: gitNullDevice(), GIT_TERMINAL_PROMPT: '0' };
-  assert.deepEqual(isolatedGitEnv({ source: hostile, platform: 'linux' }), { PATH: '/usr/bin', HOME: '/home/u', LANG: 'en_US.UTF-8', LC_ALL: 'C', ...fixed });
+  const fixed = { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(iso, 'empty.gitconfig'), GIT_TERMINAL_PROMPT: '0' };
+  assert.deepEqual(isolatedGitEnv({ isoDir: iso, source: hostile, platform: 'linux' }), { PATH: '/usr/bin', HOME: '/home/u', LANG: 'en_US.UTF-8', LC_ALL: 'C', ...fixed });
   // Windows adds the variables the runtime needs to start, and finds them whatever their case.
-  const win = isolatedGitEnv({ source: { Path: 'C:\\bin', ComSpec: 'C:\\cmd.exe', SystemRoot: 'C:\\Windows', GIT_EXEC_PATH: '/evil', NODE_OPTIONS: 'x' }, platform: 'win32' });
+  const win = isolatedGitEnv({ isoDir: iso, source: { Path: 'C:\\bin', ComSpec: 'C:\\cmd.exe', SystemRoot: 'C:\\Windows', GIT_EXEC_PATH: '/evil', NODE_OPTIONS: 'x' }, platform: 'win32' });
   assert.deepEqual(win, { PATH: 'C:\\bin', COMSPEC: 'C:\\cmd.exe', SYSTEMROOT: 'C:\\Windows', ...fixed });
   // Missing variables are omitted, not passed as undefined or empty.
-  assert.deepEqual(isolatedGitEnv({ source: {}, platform: 'linux' }), fixed);
+  assert.deepEqual(isolatedGitEnv({ isoDir: iso, source: {}, platform: 'linux' }), fixed);
 });
 
 test('the isolated git ignores a hostile environment: GIT_DIR, a template with a hook, an allow-everything protocol list', () => {
   const dir = scratch('cp-upd-iso');
+  const iso = isoDir();
   const template = join(dir, 'template');
   mkdirSync(join(template, 'hooks'), { recursive: true });
   writeFileSync(join(template, 'hooks', 'post-checkout'), '#!/bin/sh\ntouch "$0.ran"\n');
@@ -474,17 +517,111 @@ test('the isolated git ignores a hostile environment: GIT_DIR, a template with a
   });
   try {
     const repo = join(dir, 'repo');
-    const init = isolatedGit(['init', '--quiet', '--template=', repo], { cwd: dir });
+    const init = isolatedGit(['init', '--quiet', '--template=', repo], { isoDir: iso, cwd: dir });
     assert.equal(init.code, 0, init.stderr);
     assert.equal(existsSync(join(repo, '.git')), true, 'GIT_DIR did not redirect the init');
     assert.equal(existsSync(join(repo, '.git', 'hooks', 'post-checkout')), false, 'the empty template copied nothing in');
     // The file transport is closed unless the test seam opens it, whatever GIT_ALLOW_PROTOCOL says.
     const { bare } = remote();
-    assert.notEqual(isolatedGit(['ls-remote', bare], { cwd: dir }).code, 0);
-    assert.equal(isolatedGit(['ls-remote', bare], { cwd: dir, allowFile: true }).code, 0);
+    assert.notEqual(isolatedGit(['ls-remote', bare], { isoDir: iso, cwd: dir }).code, 0);
+    assert.equal(isolatedGit(['ls-remote', bare], { isoDir: iso, cwd: dir, allowFile: true }).code, 0);
   } finally {
     for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
     Object.assign(process.env, saved);
+  }
+});
+
+// A caller whose own git configuration (global config AND ~/.gitconfig) points core.hooksPath at a directory holding a
+// post-checkout hook that writes a marker. Control: plain git runs it. Isolated git must not.
+function plantedHookConfig(dir) {
+  const hooks = join(dir, 'planted-hooks');
+  const marker = join(dir, 'hook-ran');
+  mkdirSync(hooks);
+  writeFileSync(join(hooks, 'post-checkout'), `#!/bin/sh\necho ran >> "${marker}"\n`, { mode: 0o755 });
+  chmodSync(join(hooks, 'post-checkout'), 0o755);
+  const home = join(dir, 'planted-home');
+  mkdirSync(home);
+  const config = `[core]\n\thooksPath = ${hooks.replace(/\\/g, '/')}\n`;
+  writeFileSync(join(home, '.gitconfig'), config);
+  const global = join(dir, 'planted-global.gitconfig');
+  writeFileSync(global, config);
+  return { marker, home, global };
+}
+const CHECKOUT = ['-c', 'advice.detachedHead=false', 'checkout', '--quiet', '--detach', 'FETCH_HEAD'];
+
+test('a post-checkout hook in the CALLER\'s configured hooksPath (global config and ~/.gitconfig) does not run', { skip: process.platform === 'win32' }, () => {
+  const dir = scratch('cp-upd-hook');
+  const { marker, home, global } = plantedHookConfig(dir);
+  const { bare, sha } = remote();
+  const callerEnv = { ...process.env, HOME: home, GIT_CONFIG_GLOBAL: global, GIT_CONFIG_NOSYSTEM: '1' };
+  // Control: with the caller's configuration, the same fetch + checkout DOES run the hook, so the assertions below can fail.
+  const plain = join(dir, 'plain');
+  for (const args of [['init', '--quiet', plain], ['-C', plain, '-c', 'protocol.file.allow=always', 'fetch', '--quiet', '--depth', '1', bare, sha], ['-C', plain, ...CHECKOUT]]) {
+    const r = spawnSync('git', args, { cwd: dir, encoding: 'utf8', env: callerEnv });
+    assert.equal(r.status, 0, r.stderr);
+  }
+  assert.equal(existsSync(marker), true, 'control: the planted hook is a real vector on this git');
+  rmSync(marker);
+
+  const saved = { HOME: process.env.HOME, GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL };
+  Object.assign(process.env, { HOME: home, GIT_CONFIG_GLOBAL: global });
+  try {
+    withIsolatedGit((git) => {
+      const repo = join(dir, 'repo');
+      assert.equal(git(['init', '--quiet', '--template=', repo], { cwd: dir }).code, 0);
+      const fetch = git(['-C', repo, 'fetch', '--quiet', '--depth', '1', '--no-tags', bare, sha], { cwd: dir, allowFile: true });
+      assert.equal(fetch.code, 0, fetch.stderr);
+      const checkout = git(['-C', repo, ...CHECKOUT], { cwd: dir });
+      assert.equal(checkout.code, 0, checkout.stderr);
+      assert.equal(git(['-C', repo, 'rev-parse', 'HEAD']).stdout.trim(), sha);
+    });
+    assert.equal(existsSync(marker), false, 'the caller\'s hook ran');
+  } finally {
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+});
+
+test('update: a hook planted in the caller\'s git configuration does not run, and the private git directory is removed', { skip: process.platform === 'win32' }, async () => {
+  const dir = scratch('cp-upd-hookupd');
+  const { marker, home: plantedHome, global } = plantedHookConfig(dir);
+  const { sha } = remote();
+  const home = newHome();
+  const saved = { HOME: process.env.HOME, GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL };
+  Object.assign(process.env, { HOME: plantedHome, GIT_CONFIG_GLOBAL: global });
+  try {
+    const { result: r, left } = await withTmp(() => update(['--claude-home', home], { env: envFor(ghFor(sha, cmp('identical', sha, sha))) }));
+    assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+    assert.equal(existsSync(marker), false, 'the caller\'s hook ran during update');
+    assert.deepEqual(left, [], 'neither the download nor the private git directory is left');
+  } finally {
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+});
+
+test('mainSha: the git fallback uses a private directory per call and removes it', async () => {
+  const { sha, bare } = remote();
+  const down = createFakeGh([{ match: '.*', stderr: 'HTTP 502', code: 1 }]);
+  const { result, left } = await withTmp(() => [mainSha({ env: envFor(down, { PIPELINE_UPDATE_REMOTE: bare }) }), mainSha({ env: envFor(down, { PIPELINE_UPDATE_REMOTE: bare }) })]);
+  assert.deepEqual(result, [{ ok: true, sha, via: 'git' }, { ok: true, sha, via: 'git' }]);
+  assert.deepEqual(left, []);
+  const failing = await withTmp(() => mainSha({ env: envFor(down, { PIPELINE_UPDATE_REMOTE: join(scratch('cp-upd-void'), 'nope.git') }) }));
+  assert.equal(failing.result.ok, false);
+  assert.deepEqual(failing.left, [], 'removed after a failed lookup too');
+});
+
+test('mainSha: when the private directory cannot be made, the git fallback is unavailable and the caller\'s config is never used', async () => {
+  const { bare } = remote();
+  const down = createFakeGh([{ match: '.*', stderr: 'HTTP 502', code: 1 }]);
+  const saved = { TMPDIR: process.env.TMPDIR, TEMP: process.env.TEMP, TMP: process.env.TMP };
+  const missing = join(scratch('cp-upd-missing'), 'no', 'such', 'tmp');
+  const env = envFor(down, { PIPELINE_UPDATE_REMOTE: bare });
+  Object.assign(process.env, { TMPDIR: missing, TEMP: missing, TMP: missing });
+  try {
+    const m = mainSha({ env });
+    assert.equal(m.ok, false);
+    assert.match(m.reason, /git unavailable/);
+  } finally {
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
   }
 });
 
@@ -498,6 +635,7 @@ test('PIPELINE_UPDATE_REMOTE is a seam: honoured by a checkout, ignored (with th
 
 test('a hostile GIT_EXEC_PATH is not honoured: the program planted there is never run by the isolated fetch', { skip: process.platform === 'win32' }, () => {
   const dir = scratch('cp-upd-exec');
+  const iso = isoDir();
   const planted = join(dir, 'exec');
   const marker = join(dir, 'ran');
   mkdirSync(planted);
@@ -513,12 +651,12 @@ test('a hostile GIT_EXEC_PATH is not honoured: the program planted there is neve
   rmSync(marker);
   process.env.GIT_EXEC_PATH = planted;
   try {
-    const ls = isolatedGit(['ls-remote', bare, 'refs/heads/main'], { cwd: dir, allowFile: true });
+    const ls = isolatedGit(['ls-remote', bare, 'refs/heads/main'], { isoDir: iso, cwd: dir, allowFile: true });
     assert.equal(ls.code, 0, ls.stderr);
     assert.match(ls.stdout, new RegExp(`^${sha}`));
     const repo = join(dir, 'repo');
-    assert.equal(isolatedGit(['init', '--quiet', '--template=', repo], { cwd: dir }).code, 0);
-    const fetch = isolatedGit(['-C', repo, 'fetch', '--quiet', '--depth', '1', '--no-tags', bare, sha], { cwd: dir, allowFile: true });
+    assert.equal(isolatedGit(['init', '--quiet', '--template=', repo], { isoDir: iso, cwd: dir }).code, 0);
+    const fetch = isolatedGit(['-C', repo, 'fetch', '--quiet', '--depth', '1', '--no-tags', bare, sha], { isoDir: iso, cwd: dir, allowFile: true });
     assert.equal(fetch.code, 0, fetch.stderr);
     assert.equal(existsSync(marker), false, 'the planted program ran');
   } finally {
@@ -532,7 +670,7 @@ test('GIT_SSH_COMMAND, GIT_CONFIG, GIT_EXTERNAL_DIFF and proxy variables in the 
   const saved = Object.fromEntries(names.map((n) => [n, process.env[n]]));
   for (const n of names) process.env[n] = probe;
   try {
-    const env = isolatedGitEnv();
+    const env = isolatedGitEnv({ isoDir: isoDir() });
     for (const n of names) assert.equal(n in env, false, n);
   } finally {
     for (const n of names) if (saved[n] === undefined) delete process.env[n]; else process.env[n] = saved[n];

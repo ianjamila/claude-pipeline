@@ -14,7 +14,7 @@ import { installedIdentity } from '../lib/identity.mjs';
 import { readManifest } from '../lib/installer.mjs';
 import { expandHome } from '../lib/paths.mjs';
 import { run as runProcess } from '../lib/proc.mjs';
-import { compare, fetchRemote, isolatedGit, mainSha, removeTree } from '../lib/upstream.mjs';
+import { compare, fetchRemote, isolatedGit, mainSha, makeIsoDir, removeTree } from '../lib/upstream.mjs';
 
 export const meta = {
   summary: 'update the installed pipeline to upstream main (run in your own terminal); --check only reports',
@@ -55,9 +55,9 @@ function relate(id, main, env) {
 
 const clean = (id) => Boolean(id && id.complete && !id.sourceDirty && id.modified.length === 0 && id.missing.length === 0 && (id.extra?.length ?? 0) === 0 && (id.scanError?.length ?? 0) === 0);
 
-// Fetches exactly `sha` into <tmp>/src with an isolated git and checks it out detached. Returns the source directory;
+// Fetches exactly `sha` into <tmp>/src with an isolated git (its private config/hooks directory is `isoDir`) and checks it out detached. Returns the source directory;
 // throws an Error with a plain-language message when any step fails or the checked-out HEAD is not `sha`.
-function fetchSource(tmp, sha, remote) {
+function fetchSource(tmp, isoDir, sha, remote) {
   const src = path.join(tmp, 'src');
   const step = (what, r) => {
     if (r.code !== 0 || r.timedOut) {
@@ -65,7 +65,7 @@ function fetchSource(tmp, sha, remote) {
     }
     return r;
   };
-  const opts = { cwd: tmp, allowFile: remote.local };
+  const opts = { isoDir, cwd: tmp, allowFile: remote.local };
   step('git init', isolatedGit(['init', '--quiet', '--template=', src], { ...opts, timeoutMs: 30000 }));
   step(`git fetch ${sha7(sha)}`, isolatedGit(['-C', src, 'fetch', '--quiet', '--depth', '1', '--no-tags', remote.url, sha], { ...opts, timeoutMs: FETCH_TIMEOUT_MS }));
   step('git checkout', isolatedGit(['-C', src, '-c', 'advice.detachedHead=false', 'checkout', '--quiet', '--detach', 'FETCH_HEAD'], { ...opts, timeoutMs: 120000 }));
@@ -149,12 +149,18 @@ export async function run(argv, ctx = {}) {
   };
 
   let tmp = null;
+  let isoDir = null;
   try {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-pipeline-update-'));
+    try {
+      isoDir = makeIsoDir();
+    } catch (err) {
+      return fail('fetch-failed', `git unavailable: could not create a private directory for it (${String(err?.message ?? err).slice(0, 200)})`);
+    }
     say(`fetching upstream main ${sha7(main.sha)} ...`);
     let src;
     try {
-      src = fetchSource(tmp, main.sha, fetchRemote(env));
+      src = fetchSource(tmp, isoDir, main.sha, fetchRemote(env));
     } catch (err) {
       return fail('fetch-failed', err.message);
     }
@@ -180,6 +186,7 @@ export async function run(argv, ctx = {}) {
       output: { ok: true, ...result, installed: installedSummary(after), changed: result.before !== result.after, downgrade, warnings: install.json?.warnings ?? [] },
     };
   } finally {
+    if (isoDir) removeTree(isoDir);
     if (tmp) removeTree(tmp);
   }
 }
