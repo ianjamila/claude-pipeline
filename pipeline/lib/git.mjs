@@ -239,8 +239,12 @@ export function reviewBaseRef(branch, o) {
 // THE content hash of "the code that was reviewed": what HEAD changes relative to where it forked from the PR base,
 // minus the agent log the pipeline itself appends to. The review loop (round coverage, review-complete) and the final
 // gate / merge both call this, so they cannot disagree about whether a review is current.
-export function reviewContentHash({ branch, agentLog } = {}, o) {
-  return contentHash(reviewBaseRef(branch, o), 'HEAD', { ...o, exclude: agentLog ? [agentLog] : [] });
+//
+// `head` (default 'HEAD') and `baseSha` (default: the resolved review base ref) let a caller hash an arbitrary commit
+// that is only present as objects (a PR head fetched, not checked out) against an explicit base; this stays the one
+// definition, so `ship inbox` / `ship resume` agree byte for byte with the review loop and the final gate.
+export function reviewContentHash({ branch, agentLog, head = 'HEAD', baseSha } = {}, o) {
+  return contentHash(baseSha ?? reviewBaseRef(branch, o), head, { ...o, exclude: agentLog ? [agentLog] : [] });
 }
 
 // Streams the file so a large untracked artifact does not have to fit in memory.

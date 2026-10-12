@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { currentContentHash } from '../pipeline/lib/review-context.mjs';
 import { localContentHash } from '../pipeline/lib/finalgate.mjs';
+import { reviewContentHash } from '../pipeline/lib/git.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 
 const LOG = 'docs/agent-log.md';
@@ -74,4 +75,52 @@ test('a config without an agent_log hashes the whole branch in both', (t) => {
   repo.commit('log');
   assert.equal(currentContentHash(repo.dir, bare), localContentHash(repo.dir, bare));
   assert.notEqual(currentContentHash(repo.dir, bare), currentContentHash(repo.dir, config));
+});
+
+test('an explicit head hashes a commit that is not checked out exactly like checking it out', (t) => {
+  const repo = world(t);
+  const sha1 = repo.git(['rev-parse', 'HEAD']).trim();
+  repo.write('src/a.js', 'one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nTEN \n');
+  const sha2 = repo.commit('trailing space');
+  const args = { branch: 'main', agentLog: LOG };
+  const o = { cwd: repo.dir };
+
+  // HEAD is sha2; ask about sha1 without moving HEAD, then compare with the checked-out path
+  const viaHead = reviewContentHash({ ...args, head: sha1 }, o);
+  assert.notEqual(viaHead, reviewContentHash(args, o), 'the two commits differ, so the test is not vacuous');
+  repo.checkout(sha1);
+  assert.equal(viaHead, currentContentHash(repo.dir, config));
+  assert.equal(viaHead, localContentHash(repo.dir, config));
+  repo.checkout('feat/x');
+  assert.equal(reviewContentHash({ ...args, head: sha2 }, o), currentContentHash(repo.dir, config));
+  assert.equal(reviewContentHash({ ...args, head: 'HEAD' }, o), reviewContentHash(args, o));
+});
+
+test('a commit that only adds a line to the agent log hashes equal to its parent', (t) => {
+  const repo = world(t);
+  const parent = repo.git(['rev-parse', 'HEAD']).trim();
+  repo.write(LOG, '# log\nentry\n');
+  const logOnly = repo.commit('log');
+  const args = { branch: 'main', agentLog: LOG };
+  const o = { cwd: repo.dir };
+  assert.equal(reviewContentHash({ ...args, head: logOnly }, o), reviewContentHash({ ...args, head: parent }, o));
+  // without the exclusion the log line is visible
+  assert.notEqual(
+    reviewContentHash({ branch: 'main', head: logOnly }, o),
+    reviewContentHash({ branch: 'main', head: parent }, o),
+  );
+});
+
+test('an explicit baseSha equals the default when it names the same commit', (t) => {
+  const repo = world(t);
+  const mainSha = repo.git(['rev-parse', 'main']).trim();
+  const args = { branch: 'main', agentLog: LOG };
+  const o = { cwd: repo.dir };
+  const dflt = reviewContentHash(args, o);
+  assert.equal(reviewContentHash({ ...args, baseSha: mainSha }, o), dflt);
+  assert.equal(reviewContentHash({ ...args, head: 'HEAD', baseSha: mainSha }, o), dflt);
+  // a different base gives a different hash
+  repo.write('src/a.js', 'one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nTEN \n');
+  repo.commit('more');
+  assert.notEqual(reviewContentHash({ ...args, baseSha: 'HEAD~1' }, o), reviewContentHash({ ...args, baseSha: mainSha }, o));
 });
