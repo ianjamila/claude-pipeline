@@ -1359,6 +1359,7 @@ function evaluateBashForFilesFrame(command, opts) {
   const dirs = collectDirs(cmds, ctx);
   const frame = newWriteFrame(cmds, {
     expand: (w) => {
+      if (/^~[^/\\]/.test(w)) return null; // Why: ~+ / ~- / ~user are not the home directory (expandRefs would read `~+/n.sh` as /home/u+/n.sh): the place is only known at run time
       const e = expandRefs(w, ctx);
       return /[$`*?[{]/.test(e) || (e.startsWith('~') && !isAbs(e)) ? null : e;
     },

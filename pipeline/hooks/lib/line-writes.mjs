@@ -221,8 +221,9 @@ function curlRecords(args, idx, env = {}) {
     }
     urls.push(a);
   }
-  const inDir = (n) => (outDir && !n.startsWith('/') && !/^[A-Za-z]:/.test(n) ? `${outDir.replace(/\/+$/, '')}/${n}` : n);
-  for (const n of named) out.push(unknown(inDir(n)));
+  // Why: curl puts the name below --output-dir whatever it looks like (`d//abs/n.sh`); a version that leaves an absolute name alone writes it as it is: both are recorded
+  const inDir = (n) => (outDir ? `${outDir.replace(/\/+$/, '')}/${n.replace(/^\/+/, '')}` : n);
+  for (const n of named) { out.push(unknown(inDir(n))); if (outDir && (n.startsWith('/') || /^[A-Za-z]:/.test(n))) out.push(unknown(n)); }
   if (urls.some((u) => /[[{]/.test(u)) && !args.some((a) => a === '-g' || a === '--globoff') || out.some((o) => /#\d/.test(o.dest))) anyOutput = true; // (a globbed URL / a #1 output name makes many files)
   if (remote) {
     for (const u of urls) if (urlBase(u)) out.push(unknown(inDir(urlBase(u))));
@@ -1132,9 +1133,21 @@ function partAlternatives(frames, h, io, depth) {
 
 // Could the word, with its run-time parts ($VAR, $(...), globs, {a,b}) replaced by anything, name P? A relative word may be anywhere (its directory is unknown).
 function dynamicMayBe(f, word, P) {
-  const parts = String(word).split(/(\$\{[^}]*\}|\$\([^)]*\)|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@*#?!$-]|`[^`]*`|\[[^\]]*\]|\{[^}]*\}|[*?])/);
-  const re = parts.map((s, i) => (i % 2 ? '.*' : s.replace(/[.+^|()\\]/g, '\\$&').replace(/[\[\]{}$]/g, '\\$&'))).join('');
-  const abs = /^\//.test(parts[0] ?? '') || /^[A-Za-z]:/.test(parts[0] ?? '');
+  // Why: a leading tilde prefix is not a name: ~+ is the command's directory (the rest is then a relative word), ~- the previous directory and ~user a home are unknown (anywhere, absolute)
+  let w = String(word);
+  let lead = '';
+  const tilde = /^~([^/\\]+)(?=[/\\]|$)/.exec(w);
+  if (tilde) {
+    if (tilde[1] === '+') { w = w.slice(2).replace(/^[/\\]+/, ''); if (w === '') return true; } else { w = w.slice(tilde[0].length); lead = '.*'; }
+  }
+  // `.` segments and repeated slashes change nothing; a `..` that is left may reach any directory, so the word may be the file
+  const segs = w.split(/[\\/]+/).filter((x) => x !== '' && x !== '.');
+  if (segs.includes('..')) return true;
+  w = (/^[\\/]/.test(w) ? '/' : '') + segs.join('/');
+  if (w === '' || w === '/') return true;
+  const parts = w.split(/(\$\{[^}]*\}|\$\([^)]*\)|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@*#?!$-]|`[^`]*`|\[[^\]]*\]|\{[^}]*\}|[*?])/);
+  const re = lead + parts.map((s, i) => (i % 2 ? '.*' : s.replace(/[.+^|()\\]/g, '\\$&').replace(/[\[\]{}$]/g, '\\$&'))).join('');
+  const abs = lead !== '' || /^\//.test(parts[0] ?? '') || /^[A-Za-z]:/.test(parts[0] ?? '');
   try {
     return new RegExp(abs ? `^(?:[A-Za-z]:)?${re}$` : `(?:^|[\\\\/])${re}$`, f.ci ? 'is' : 's').test(P.replace(/\\/g, '/'));
   } catch {
