@@ -279,7 +279,7 @@ function stdoutItems(cmd) {
     const outParts = partsOfStream({ ...s.out, texts: [] });
     return withParts(items.length ? dedupe(items) : [{ text: '' }], [...outParts, ...partsOfStream(s.stdin), ...(stdinUnknown ? [[{ unknown: true }]] : [])]);
   } else if (name === ':' || name === 'true' || name === 'false') items.push({ text: '' });
-  else return [{ unknown: true }, ...s.out.computed.map((scan) => ({ scan }))]; // a program's output: unknown, but the files it reads are worth a scan (base64 -d x.b64)
+  else return [{ unknown: true }, ...s.out.computed.map((scan) => ({ scan })), ...(name === 'sed' || name === 'gsed' ? sedReadFiles(argv.slice(1)).map((scan) => ({ scan })) : [])]; // a program's output: unknown, but the files it reads are worth a scan (base64 -d x.b64; a sed `r FILE`)
   return items.length ? dedupe(items) : [{ text: '' }];
 }
 
@@ -445,49 +445,142 @@ const NO_OUTPUT_OPTIONS = new Set([
 const SHORT_O_OK = new Set(['ls', 'grep', 'egrep', 'fgrep', 'rg', 'stat']);
 const OUTPUT_LONG = /^--[A-Za-z-]*(?:output|log-file|out-file|outfile|to-file|write|save|dump)[A-Za-z-]*(?:=|$)/i;
 
-// What a sed program does besides editing text: { runs, writes }. `w FILE` / `W FILE` / the `w` flag of s write a file (the name runs to the end of the line),
-// `e` / the `e` flag run a command; with or without a space after the letter (GNU sed takes `wn.sh`). The s and y commands and the address regexes are
-// read as such first, so a letter inside a pattern or a replacement (`s/a/export/`, `/error/p`) is not a command. Anything else that looks like a
-// w / W / e at a command position counts, strictly.
-const SED_S = /s([^\sA-Za-z0-9\\])((?:\\.|(?!\1)[^\\])*)\1((?:\\.|(?!\1)[^\\])*)\1([gpiImMe0-9]*)(w?)/g;
-const SED_Y = /y([^\sA-Za-z0-9\\])(?:\\.|(?!\1)[^\\])*\1(?:\\.|(?!\1)[^\\])*\1/g;
-const SED_ADDR = /\/(?:\\.|[^/\\])*\/[IM]*/g;
-const SED_CMD = /(?:^|[;{}\s\d$!,])([wWe])/g;
-export function sedScan(prog) {
+// What a sed program does besides editing text: { runs, writes, reads, unknown }. `w FILE` / `W FILE` / the `w` flag of s write a file (the name runs to the end of the line),
+// `e` / the `e` flag run a command; with or without a space after the letter (GNU sed takes `wn.sh`). `r` / `R` read a file into the output. `unknown`: a part we cannot read (an unknown
+// command letter, an unterminated s / address): strict, like a w.
+// Why: sed is read structurally, like the shell does: addresses (`/re/`, `\cREc`, numbers, `$`, `a,b`, `a,+N`), then the command, with s / y bodies read up to THEIR delimiter (any character, letters too) and a / i / c
+// text, labels and file names read to where they end. A letter inside a pattern, a replacement or an address (`s/a/export/`, `/error/p`, `/as/w f`) is therefore not a command, and a w behind
+// them is not hidden. GNU sed ends a delimited part at the first unescaped delimiter; BSD sed skips a [bracket expression] first: both readings are made and their findings joined.
+const SED_LEGACY = /(?:^|[;{}\s\d$/])[wWe](?:\s|$)|\/[gpiIm0-9]*[we](?=\s|$|;|\})/; // the pre-parser check, kept as a backstop (it reads a w / e at a command position loosely, strictly)
+const SED_LEGACY_S = /s([^\sA-Za-z0-9\\])((?:\\.|(?!\1)[^\\])*)\1((?:\\.|(?!\1)[^\\])*)\1([gpiImMe0-9]*)(w?)/g;
+const SED_LEGACY_Y = /y([^\sA-Za-z0-9\\])(?:\\.|(?!\1)[^\\])*\1(?:\\.|(?!\1)[^\\])*\1/g;
+const SED_LEGACY_ADDR = /\/(?:\\.|[^/\\])*\/[IM]*/g;
+const SED_LEGACY_CMD = /(?:^|[;{}\s\d$!,])([wWe])/g;
+function sedParse(prog, brackets) {
+  const out = { runs: false, writes: [], reads: [], unknown: false };
+  const n = prog.length;
+  let i = 0;
+  const ws = () => { while (i < n && (prog[i] === ' ' || prog[i] === '\t')) i++; };
+  const digits = () => { while (i < n && prog[i] >= '0' && prog[i] <= '9') i++; };
+  const toEol = () => { let e = prog.indexOf('\n', i); if (e < 0) e = n; const t = prog.slice(i, e).trim(); i = e; return t; };
+  // a [bracket expression] at i (BSD): its end, or i + 1 when it never closes
+  const bracketEnd = () => {
+    let j = i + 1;
+    if (prog[j] === '^') j++;
+    if (prog[j] === ']') j++;
+    while (j < n && prog[j] !== ']') {
+      if (prog[j] === '[' && ':.='.includes(prog[j + 1] ?? '')) { const close = prog.indexOf(prog[j + 1] + ']', j + 2); j = close < 0 ? j + 1 : close + 2; } else j++;
+    }
+    return j < n ? j + 1 : i + 1;
+  };
+  // the text up to the next unescaped delimiter d (i is after the opening one); false when there is none
+  const part = (d, regex) => {
+    while (i < n) {
+      const c = prog[i];
+      if (c === '\\') { i += 2; continue; }
+      if (brackets && regex && c === '[') { i = bracketEnd(); continue; }
+      i++;
+      if (c === d) return true;
+    }
+    return false;
+  };
+  const addr = () => {
+    const c = prog[i];
+    if (c >= '0' && c <= '9') { digits(); if (prog[i] === '~') { i++; digits(); } return true; }
+    if (c === '$') { i++; return true; }
+    if (c === '/' || c === '\\') {
+      let d = '/';
+      if (c === '\\') { d = prog[i + 1]; i++; if (d === undefined || d === '\n' || d === '\\') { out.unknown = true; return true; } }
+      i++;
+      if (!part(d, true)) out.unknown = true;
+      while (prog[i] === 'I' || prog[i] === 'M') i++;
+      return true;
+    }
+    return false;
+  };
+  while (i < n) {
+    const c0 = prog[i];
+    if (c0 === ' ' || c0 === '\t' || c0 === '\n' || c0 === ';' || c0 === '\r') { i++; continue; }
+    if (addr()) {
+      ws();
+      while (prog[i] === ',') {
+        i++; ws();
+        if (prog[i] === '+' || prog[i] === '~') { i++; digits(); } else if (!addr()) out.unknown = true;
+        ws();
+      }
+    }
+    while (i < n && (prog[i] === '!' || prog[i] === ' ' || prog[i] === '\t')) i++;
+    if (i >= n) break;
+    const c = prog[i++];
+    if (c === 's') {
+      const d = prog[i];
+      if (d === undefined || d === '\n' || d === '\\') { out.unknown = true; continue; }
+      i++;
+      if (!part(d, true) || !part(d, false)) { out.unknown = true; i = n; continue; }
+      for (;;) { // the flags
+        const f = prog[i];
+        if (f === undefined) break;
+        if ('gpiImM'.includes(f) || (f >= '0' && f <= '9') || f === ' ' || f === '\t') i++;
+        else if (f === 'e') { out.runs = true; i++; } else if (f === 'w') { i++; const t = toEol(); if (t) out.writes.push(t); else out.unknown = true; break; } else break;
+      }
+    } else if (c === 'y') {
+      const d = prog[i];
+      if (d === undefined || d === '\n' || d === '\\') { out.unknown = true; continue; }
+      i++;
+      if (!part(d, false) || !part(d, false)) { out.unknown = true; i = n; }
+    } else if (c === 'a' || c === 'i' || c === 'c') { // the text runs to the end of the line (a backslash continues it)
+      while (i < n && prog[i] !== '\n') i += prog[i] === '\\' ? 2 : 1;
+    } else if (c === 'w' || c === 'W') { const t = toEol(); if (t) out.writes.push(t); else out.unknown = true; } else if (c === 'r' || c === 'R') { const t = toEol(); if (t) out.reads.push(t); } else if (c === 'e') { out.runs = true; toEol(); } else if (c === ':' || c === 'b' || c === 't' || c === 'T' || c === 'v') {
+      ws();
+      while (i < n && !' \t\n;'.includes(prog[i]) && (c === ':' || c === 'v' || prog[i] !== '}')) i++;
+    } else if (c === 'l' || c === 'L' || c === 'q' || c === 'Q') { ws(); digits(); } else if (c === '#') toEol();
+    else if (!'{}=dDgGhHnNpPxzF'.includes(c)) out.unknown = true;
+  }
+  return out;
+}
+// The pre-parser scan: s / y bodies and address regexes cut out with / delimiters, then any w / W / e at a command position.
+function sedLegacyScan(prog) {
   const writes = [];
   let runs = false;
   let out = '';
   let last = 0;
-  SED_S.lastIndex = 0;
-  for (let m = SED_S.exec(prog); m; m = SED_S.exec(prog)) {
+  SED_LEGACY_S.lastIndex = 0;
+  for (let m = SED_LEGACY_S.exec(prog); m; m = SED_LEGACY_S.exec(prog)) {
     if (m[4].includes('e')) runs = true;
     out += prog.slice(last, m.index) + ' ';
-    last = SED_S.lastIndex;
+    last = SED_LEGACY_S.lastIndex;
     if (m[5]) { // the w flag: the file name is the rest of the line
       const eol = prog.indexOf('\n', last);
       const end = eol < 0 ? prog.length : eol;
       writes.push(prog.slice(last, end).trim());
       last = end;
-      SED_S.lastIndex = end;
+      SED_LEGACY_S.lastIndex = end;
     }
   }
   out += prog.slice(last);
-  out = out.replace(SED_Y, ' ');
+  out = out.replace(SED_LEGACY_Y, ' ');
   // w / W: read before the address regexes are cut out (`1w/home/u/x` is not an address) and after (`/re/w file`); e only after (`/error/p`)
-  const noAddr = out.replace(SED_ADDR, ' ');
+  const noAddr = out.replace(SED_LEGACY_ADDR, ' ');
   for (const [text, withE] of [[out, false], [noAddr, true]]) {
-    SED_CMD.lastIndex = 0;
-    for (let m = SED_CMD.exec(text); m; m = SED_CMD.exec(text)) {
+    SED_LEGACY_CMD.lastIndex = 0;
+    for (let m = SED_LEGACY_CMD.exec(text); m; m = SED_LEGACY_CMD.exec(text)) {
       if (m[1] === 'e') { if (withE) runs = true; continue; }
-      const eol = text.indexOf('\n', SED_CMD.lastIndex);
+      const eol = text.indexOf('\n', SED_LEGACY_CMD.lastIndex);
       const end = eol < 0 ? text.length : eol;
-      writes.push(text.slice(SED_CMD.lastIndex, end).trim());
-      SED_CMD.lastIndex = end;
+      writes.push(text.slice(SED_LEGACY_CMD.lastIndex, end).trim());
+      SED_LEGACY_CMD.lastIndex = end;
     }
   }
-  return { runs, writes: [...new Set(writes.filter(Boolean))] };
+  return { runs, writes };
 }
-export const sedUnsafe = (prog) => { const r = sedScan(prog); return r.runs || r.writes.length > 0 || /(?:^|[;{}\s\d$!,])[wWe]\s*$/.test(prog); };
+export function sedScan(prog) {
+  const a = sedParse(prog, false);
+  const b = sedParse(prog, true);
+  const old = sedLegacyScan(prog);
+  // (a program one reading cannot parse is an error to the sed that reads it that way: unknown only when neither reading gets through)
+  return { runs: a.runs || b.runs || old.runs, writes: [...new Set([...a.writes, ...b.writes, ...old.writes].filter(Boolean))], reads: [...new Set([...a.reads, ...b.reads])], unknown: a.unknown && b.unknown };
+}
+export const sedUnsafe = (prog) => { const r = sedScan(prog); return r.runs || r.writes.length > 0 || r.unknown || SED_LEGACY.test(prog) || /(?:^|[;{}\s\d$!,])[wWe]\s*$/.test(prog); };
 // an in-place option of sed: -i / -I (BSD) in a bundle, or --in-place / any abbreviation of it (GNU takes a unique prefix: --in-pl, --i)
 export const sedInPlaceArg = (a) => /^-[A-Za-z]*[iI]/.test(a) || (a.startsWith('--') && a.length > 2 && 'in-place'.startsWith(a.slice(2).split('=')[0]));
 // The sed programs among the arguments: the script words (-e PROG, -ePROG, -ne PROG, --expression=PROG, --expression PROG; a GNU long option may be abbreviated: --expr) and, when there
@@ -500,6 +593,8 @@ export function sedPrograms(args) {
   let file = false;
   let script = false;
   let bareInPlace = false;
+  let dashedSuffix = false; // BSD: the word after a bare -i is its suffix, even a dashed one (`-i -l 'w o' f`)
+  const values = []; // values of the options that take one (-l N, --line-length N, -f / --file): under a dashed suffix they may be the program
   const longIs = (nm, full) => nm !== '' && full.startsWith(nm);
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -508,22 +603,27 @@ export function sedPrograms(args) {
     if (a.startsWith('--')) {
       const eq = a.indexOf('=');
       const nm = eq > 0 ? a.slice(2, eq) : a.slice(2);
-      if (longIs(nm, 'expression')) { script = true; progs.push(eq > 0 ? a.slice(eq + 1) : (args[++i] ?? '')); } else if (longIs(nm, 'file')) { file = true; script = true; if (eq < 0) i++; } else if (longIs(nm, 'line-length') && eq < 0) i++;
+      if (longIs(nm, 'expression')) { script = true; progs.push(eq > 0 ? a.slice(eq + 1) : (args[++i] ?? '')); } else if (longIs(nm, 'file')) { file = true; script = true; values.push(eq > 0 ? a.slice(eq + 1) : (args[i + 1] ?? '')); if (eq < 0) i++; } else if (longIs(nm, 'line-length')) { values.push(eq > 0 ? a.slice(eq + 1) : (args[i + 1] ?? '')); if (eq < 0) i++; }
     } else if (a.length > 1 && a[0] === '-') {
       for (let k = 1; k < a.length; k++) {
         const rest = a.slice(k + 1);
         if (a[k] === 'e') { script = true; progs.push(rest !== '' ? rest : (args[++i] ?? '')); break; }
-        if (a[k] === 'f') { file = true; script = true; if (rest === '') i++; break; }
-        if (a[k] === 'l') { if (rest === '') i++; break; }
-        if (a[k] === 'i' || a[k] === 'I') { if (rest === '') bareInPlace = true; break; } // -i[SUFFIX] (BSD -I too; BSD takes a bare suffix as the next word)
+        if (a[k] === 'f') { file = true; script = true; values.push(rest !== '' ? rest : (args[i + 1] ?? '')); if (rest === '') i++; break; }
+        if (a[k] === 'l') { values.push(rest !== '' ? rest : (args[i + 1] ?? '')); if (rest === '') i++; break; }
+        if (a[k] === 'i' || a[k] === 'I') { if (rest === '') { bareInPlace = true; if ((args[i + 1] ?? '').startsWith('-')) dashedSuffix = true; } break; } // -i[SUFFIX] (BSD -I too; BSD takes a bare suffix as the next word)
       }
     } else pos.push(a);
   }
   if (!script) progs.push(...pos.slice(0, bareInPlace ? 2 : 1));
   progs.push(...[...early].filter((w) => !progs.includes(w)));
+  if (dashedSuffix) progs.push(...[...pos, ...values].filter((w) => !progs.includes(w))); // (strict: the swallowed option may have hidden which word is the program)
   // the files it edits / reads: every positional word when a script option gave the program, else those after the program (after a bare -i the first word is the program (GNU) or the suffix (BSD): every word is a possible file; so is a word before an option)
   const targets = [...new Set([...(script || bareInPlace ? pos : pos.slice(1)), ...early])];
   return { progs, file, targets };
+}
+// The files the sed programs `r` / `R` read into their output (sources of what the sed writes)
+export function sedReadFiles(args) {
+  return [...new Set(sedPrograms(args).progs.flatMap((p) => sedScan(p).reads))];
 }
 // does any program of these sed arguments write a file or run a command (or is a script file we cannot read)?
 export function sedArgsUnsafe(args) {

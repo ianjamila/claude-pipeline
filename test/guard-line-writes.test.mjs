@@ -832,3 +832,43 @@ test('L2: a lone in-place edit of a script the line then runs is "built from pie
   }
 });
 
+test('L2: sed addresses and s / y commands with any delimiter are parsed, so a w / W / e behind them is found', () => {
+  // Why: the s / y matchers assumed `/`; `\cREGEXc` addresses, letter delimiters (`sxaxbx`) and an `s` inside an address regex (`/as/w o`) hid the w / e command that follows, or swallowed it
+  const unsafe = [['\\,x,w o', 'f'], ['\\xaxw o', 'f'], ['\\,x,e id', 'f'], ['sxaxbxw o', 'f'], ['sxaxbxe', 'f'], ['yxaxbx;w o', 'f'], ['s,a,b,;w o', 'f'], ['s|a|b|w o', 'f'], ['/as/w o\n/bs/p', 'f'], ['/as/;/cs/w o', 'f'],
+    ['1,\\,x,W o', 'f'], ['/a/I,+2 w o', 'f'], ['$!{w o\n}', 'f'], ['\;x;w o', 'f'], ['s/a/b/;\\,x,w o', 'f'], ['s,a,b,e', 'f'], ['s/[/]/x/w o', 'f'], ['/[/]/w o', 'f'], ['1!w o', 'f'], ['p;w o', 'f'], ['b end;w o', 'f'], [':a;w o', 'f'], ['y/a/b/;e', 'f'],
+    ['\\', 'f'], ['@', 'f'], ['s/a/b', 'f']];
+  for (const a of unsafe) assert.equal(sedArgsUnsafe(a), true, JSON.stringify(a));
+  assert.deepEqual(sedWriteTargets(['/as/w o\n/bs/p', 'f']), ['o']);
+  assert.deepEqual(sedWriteTargets(['\\,x,w o', 'f']), ['o']);
+  assert.deepEqual(sedWriteTargets(['sxaxbxw o', 'f']), ['o']);
+  assert.deepEqual(sedWriteTargets(['/a/I,+2 w o', 'f']), ['o']);
+  // programs that only edit text are read-only, whatever delimiters they use
+  const safe = [['s/a/export/', 'f'], ['/error/p', 'f'], ['\\,a,p', 'f'], ['\\xaxp', 'f'], ['sxaxbx', 'f'], ['y/abc/xyz/', 'f'], ['/as/p', 'f'], ['1!G;h;$!d', 'f'], [':a;N;$!ba;s/\\n/ /g', 'f'], ['s/[/]/x/', 'f'], ['/x/I p', 'f'], ['s/a/b/gI', 'f'],
+    ['2q5', 'f'], ['1~2d', 'f'], ['/start/,+3d', 'f'], ['s,a\\,b,c,', 'f'], ['s/a/b/;s/c/d/', 'f'], ['/a/,/b/{p;q}', 'f'], ['5i\\text', 'f'], ['$='], ['s/a/b\\\nc/'], ['# a comment'], ['s/e/w/']];
+  for (const a of safe) assert.equal(sedArgsUnsafe(a), false, JSON.stringify(a));
+  // both policies
+  const fsOpts = fakeFs(PROJ, {});
+  for (const l of ["sed '\\,x,w ~/.claude/pipeline/x' f", "sed 'sxaxbxw ~/.claude/pipeline/x' f", "sed '/as/w ~/.claude/pipeline/x\n/bs/p' f", "sed -n '\\,x,e id' ~/.claude/pipeline/hooks/x.mjs"]) assert.equal(files(l, fsOpts).decision, 'deny', l);
+  for (const l of ["sed '\\,a,p' ~/.claude/pipeline/hooks/x.mjs", "sed 'sxaxbx' ~/.claude/pipeline/hooks/x.mjs"]) assert.equal(files(l, fsOpts).decision, 'allow', l);
+  denyBoth((_, mid) => `sed '\\,x,w n.sh' ok.sh; ${mid}; bash n.sh`);
+  denyBoth((_, mid) => `sed 'sxaxbxw n.sh' ok.sh; ${mid}; bash n.sh`);
+  denyBoth((_, mid) => `sed '/as/w n.sh\n/bs/p' ok.sh; ${mid}; bash n.sh`);
+});
+
+test('L2: sed r / R files are sources of what the sed writes', () => {
+  // Why: `sed 'r f.sh' ok.sh > n.sh` puts f.sh's text into n.sh; only the files named as operands were scanned
+  denyBoth("sed 'r f.sh' ok.sh > n.sh; bash n.sh");
+  denyBoth("sed '1R f.sh' ok.sh > n.sh; bash n.sh");
+  denyBoth("sed -e 'p' -e 'r f.sh' ok.sh > n.sh; bash n.sh");
+  allowBoth("sed 'r ok.sh' ok.sh > n.sh; bash n.sh");
+});
+
+test('L2: after a bare BSD -i the next word is its suffix even when it starts with a dash; every positional and option value is a possible program', () => {
+  // Why: BSD `sed -i -l 'w o' f` takes `-l` as the suffix, so `w o` is the program (GNU: the value of -l). Strict: when the word after a bare -i/-I is dashed, everything may be the program or the file
+  for (const a of [['-i', '-l', 'w o', 'f'], ['-i', '-e', 'p', 'w o', 'f'], ['-i', '--line-length', 'e id', 'f'], ['-I', '-s', 'w o', 'f'], ['-ni', '-l', '5', 'w o', 'f'], ['-i', '-n', 'w o', 'f'], ['-i', '-e', 'p', 'e id']]) assert.equal(sedArgsUnsafe(a), true, a.join(' '));
+  assert.deepEqual(sedWriteTargets(['-i', '-l', 'w o', 'f']), ['o']);
+  assert.equal(sedArgsUnsafe(['-i', '-e', 's/a/b/', 'web.ts']), true); // (strict, accepted: under a dashed suffix the file name web.ts may be the program, a w command; an in-place edit is a write anyway)
+  assert.equal(sedArgsUnsafe(['-i', '', 's/a/b/', 'web.ts']), false);
+  denyBoth((_, mid) => `sed -i -l 'w n.sh' ok.sh; ${mid}; bash n.sh`);
+  denyBoth((_, mid) => `sed -i -e p 'w n.sh' ok.sh; ${mid}; bash n.sh`);
+});
