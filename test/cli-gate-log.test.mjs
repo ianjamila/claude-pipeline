@@ -9,6 +9,7 @@ import { createFakeGh, pipelineYml } from './helpers/fakegh-env.mjs';
 import { cli, PR, AGENT_LOG, ME, REPO } from './helpers/gate-env.mjs';
 import { addRound, emptyState, saveState } from '../pipeline/lib/state.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
+import { applyCheckpoint, decodeRecord, emptyRecord, encodeRecord } from '../pipeline/lib/run-record.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 
 // ---- summary --------------------------------------------------------------------------------------
@@ -433,4 +434,34 @@ test('agent-log stage: an unreachable GitHub is exit 3 and commits nothing', () 
   const r = cli(['agent-log', 'stage', '--pr', '12', '--line', '- x'], { dir: t.repo.dir, fake: t.fake });
   assertExit(r, 3);
   assert.equal(t.repo.git(['rev-parse', 'HEAD']).trim(), head);
+});
+
+// ---- summary and the run record ---------------------------------------------------------------------
+
+test('summary: keeps the run record a checkpoint wrote (tasks survive), records how the run ended, edits the one comment', () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml());
+  repo.write('.gitignore', '.review/\n');
+  repo.commit('init');
+  saveState(repo.dir, summaryState());
+  const rec = applyCheckpoint(emptyRecord({ repo: 'acme/widgets', pr: PR, branch: 'agent/feature', baseRef: 'main' }), {
+    step: 'gate', tasks: [{ id: 'T1', title: 'one', spec: 's', done: true }],
+  }, { host: 'mac', now: 0 });
+  const fake = createFakeGh([
+    { match: '^pr view 12 --json', stdoutJson: { title: 'Add widget', headRefName: 'agent/feature', baseRefName: 'main', headRefOid: 'e'.repeat(40) } },
+    ME, REPO,
+    { match: '^api repos/acme/widgets/issues/12/comments --paginate', stdoutJson: [{ id: 9, user: { login: 'me' }, body: `${MARKERS.summary}\n\n${encodeRecord(rec)}` }] },
+    { match: '^api -X PATCH repos/acme/widgets/issues/comments/9', stdoutJson: { id: 9, html_url: 'https://github.com/acme/widgets/pull/12#issuecomment-9' } },
+  ]);
+  const r = cli(['summary', '--pr', String(PR), '--outcome', 'awaiting-owner-merge'], { dir: repo.dir, fake });
+  assertExit(r, 0);
+  assert.deepEqual([r.json.action, r.json.step, r.json.warnings], ['updated', 'awaiting-owner-merge', []]);
+  assert.match(r.json.agentLogLine, /awaiting-owner-merge$/);
+  const body = JSON.parse(fake.calls().find((c) => c.argv.includes('PATCH')).stdin).body;
+  const decoded = decodeRecord(body);
+  assert.equal(decoded.status, 'ok');
+  assert.deepEqual(decoded.record.tasks, rec.tasks);
+  assert.deepEqual([decoded.record.outcome, decoded.record.head, decoded.record.agentLogLine], ['awaiting-owner-merge', 'e'.repeat(40), r.json.agentLogLine]);
+  assert.match(body, /### Outcome/);
+  assert.ok(!fake.lines().some((l) => l.includes('-X POST')));
 });

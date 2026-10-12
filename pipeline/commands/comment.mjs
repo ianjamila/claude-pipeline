@@ -1,11 +1,14 @@
 // `pipeline comment`: renders one of the pipeline's PR comments (render.mjs) and upserts it, so a PR
 // carries ONE comment per kind that is edited in place rather than a new one per round.
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { hostname } from 'node:os';
 import { resolve, join } from 'node:path';
 import { EXIT, UsageError, parseCommandArgs, intOption, requireOption } from '../lib/cli.mjs';
 import { loadConfig, DEFAULTS } from '../lib/config.mjs';
 import { loadState } from '../lib/state.mjs';
-import { MARKERS, triageComment, summaryComment, needsHumanComment, blockedComment, awaitingReviewComment } from '../lib/render.mjs';
+import { MARKERS, triageComment, summarySections, needsHumanComment, blockedComment, awaitingReviewComment } from '../lib/render.mjs';
+import { recordForOutcome } from '../lib/run-record.mjs';
+import { readSummaryComment, writeSummaryComment } from '../lib/summary-comment.mjs';
 import { createGitHub, commandCwd, guardGh, requireRepoRoot } from '../lib/github.mjs';
 
 export const meta = {
@@ -65,6 +68,20 @@ function readModelProofs(root) {
   return proofs;
 }
 
+// The summary comment also carries the run record: write the sections through the one writer, which keeps an existing
+// record (and sets how the run ended on it).
+function summaryKind(gh, pr, sections, outcome) {
+  const view = gh.prView(pr, ['headRefName', 'baseRefName', 'headRefOid']);
+  const existing = readSummaryComment(gh, pr);
+  if (existing.status === 'unsupported') throw new UsageError('the summary comment carries a run record from a newer pipeline version: update the pipeline CLI first');
+  const { record, warnings } = recordForOutcome(existing.status === 'ok' ? existing.record : null, {
+    repo: gh.repo().slug, pr, branch: view.headRefName, baseRef: view.baseRefName, head: view.headRefOid,
+    outcome, host: hostname(), now: Date.now(),
+  });
+  const r = writeSummaryComment(gh, pr, { record, sections, existing });
+  return { exitCode: EXIT.OK, output: { ok: true, kind: 'summary', pr, action: r.action, url: r.url, id: r.id, step: record.step, warnings } };
+}
+
 export async function run(argv, ctx) {
   const { values } = parseCommandArgs(argv, {
     pr: { type: 'string' },
@@ -86,7 +103,7 @@ export async function run(argv, ctx) {
     body = triageComment(requireState(root, kind));
   } else if (kind === 'summary') {
     const outcome = requireOption(values, 'outcome');
-    body = summaryComment(requireState(root, kind), { outcome, built: values.built, modelProofs: readModelProofs(root) });
+    body = summarySections(requireState(root, kind), { outcome, built: values.built, modelProofs: readModelProofs(root) });
   } else if (kind === 'blocked') {
     const file = await reportPath(root);
     if (!existsSync(file)) throw new UsageError(`no verify report at ${file}: the blocked comment is rendered from it`);
@@ -115,6 +132,7 @@ export async function run(argv, ctx) {
 
   const gh = createGitHub({ cwd, env: ctx.env });
   return guardGh(() => {
+    if (kind === 'summary') return summaryKind(gh, pr, body, values.outcome);
     const r = gh.upsertComment(pr, MARKER_OF[kind], body);
     return { exitCode: EXIT.OK, output: { ok: true, kind, pr, action: r.action, url: r.url, id: r.id } };
   });

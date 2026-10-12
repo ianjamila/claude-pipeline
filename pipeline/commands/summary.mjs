@@ -1,13 +1,16 @@
 // `pipeline summary --pr N --outcome O [--built TEXT]`: upserts the PR's single summary comment (rendered from the
 // review state, the Fable model proofs and the follow-up issues) and prints the agent-log line for this run.
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { emptyState, loadState } from '../lib/state.mjs';
 import { loadConfig } from '../lib/config.mjs';
-import { MARKERS, summaryComment } from '../lib/render.mjs';
+import { summarySections } from '../lib/render.mjs';
+import { recordForOutcome } from '../lib/run-record.mjs';
+import { readSummaryComment, writeSummaryComment } from '../lib/summary-comment.mjs';
 import { buildAgentLogLine } from '../lib/agentlog.mjs';
 import { inlineOptionValues } from '../lib/finalgate.mjs';
 
@@ -93,10 +96,17 @@ export const run = guarded(async (argv, ctx) => {
 
   const gh = createGitHub({ cwd: root, env: ctx.env });
   return guardGh(() => {
-    const { title } = gh.prView(pr, ['title']);
-    const body = summaryComment(state, { outcome: detail ? `${outcome} — ${detail}` : outcome, built: values.built, followups: followupsOf(state), modelProofs: readModelProofs(root) });
-    const posted = gh.upsertComment(pr, MARKERS.summary, body);
-    const agentLogLine = buildAgentLogLine({ state, pr, title, outcome });
-    return { exitCode: EXIT.OK, output: { ok: true, url: posted.url, action: posted.action, agentLogLine } };
+    const view = gh.prView(pr, ['title', 'headRefName', 'baseRefName', 'headRefOid']);
+    const sections = summarySections(state, { outcome: detail ? `${outcome} — ${detail}` : outcome, built: values.built, followups: followupsOf(state), modelProofs: readModelProofs(root) });
+    const agentLogLine = buildAgentLogLine({ state, pr, title: view.title, outcome });
+    // The run record rides in the same comment: keep the one a checkpoint wrote, set how the run ended.
+    const existing = readSummaryComment(gh, pr);
+    if (existing.status === 'unsupported') throw new UsageError('the summary comment carries a run record from a newer pipeline version: update the pipeline CLI first');
+    const { record, warnings } = recordForOutcome(existing.status === 'ok' ? existing.record : null, {
+      repo: gh.repo().slug, pr, branch: view.headRefName, baseRef: view.baseRefName, head: view.headRefOid,
+      outcome, detail, agentLogLine, host: hostname(), now: Date.now(),
+    });
+    const posted = writeSummaryComment(gh, pr, { record, sections, existing });
+    return { exitCode: EXIT.OK, output: { ok: true, url: posted.url, action: posted.action, agentLogLine, step: record.step, warnings } };
   });
 });
