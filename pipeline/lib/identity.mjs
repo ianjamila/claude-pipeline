@@ -43,9 +43,10 @@ function isToplevel(root) {
 //   state 'unverifiable' git ran but the comparison could not be made
 //   state 'clean'        every file is HEAD's blob
 //   state 'dirty'        differing = root-relative POSIX paths not in HEAD, with another blob, or deleted (`deleted`)
-// A path in `files` that is gone from disk is deleted. With { scope: 'install' } so is any file HEAD holds that the
-// installer would copy (I.installableSourcePaths) and that is neither in `files` nor on disk: without that a source
-// file deleted from the working tree is never looked at and the remainder passes as HEAD.
+// A path in `files` that is not a regular file on disk (gone, an empty directory, a dangling symlink) is deleted. With
+// { scope: 'install' } so is any file HEAD holds that the installer would copy (I.installableSourcePaths) and that is
+// not in `files`: without that a source file deleted from the working tree is never looked at and the remainder passes
+// as HEAD.
 export function fileProvenance(root, files, { requireToplevel = false, scope = null } = {}) {
   const head = gitHead(root);
   if (!head) return { head: null, state: 'no-git', differing: [], deleted: [] };
@@ -53,8 +54,10 @@ export function fileProvenance(root, files, { requireToplevel = false, scope = n
   const relOf = (abs) => path.relative(root, abs).split(path.sep).join('/');
   const byRel = (a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0);
   const all = files.map((abs) => ({ abs, rel: relOf(abs) })).sort(byRel);
-  const planned = all.filter((f) => I.lexists(f.abs));
-  const deleted = all.filter((f) => !I.lexists(f.abs)).map((f) => f.rel);
+  // A listed path counts only when a regular file (or a symlink to one) sits there - what the installer's walker counts.
+  // An empty directory or a dangling symlink in its place is as gone as a deleted file, and cannot be hashed.
+  const planned = all.filter((f) => I.isFile(f.abs));
+  const deleted = all.filter((f) => !I.isFile(f.abs)).map((f) => f.rel);
   const paths = planned.map((f) => f.rel);
   const tree = gitIn(root, ['ls-tree', '-r', '-z', 'HEAD']);
   if (tree.code !== 0) return { head, state: 'unverifiable', differing: [], deleted };
@@ -62,7 +65,9 @@ export function fileProvenance(root, files, { requireToplevel = false, scope = n
   if (scope === 'install') {
     const have = new Set(all.map((f) => f.rel));
     for (const rel of I.installableSourcePaths(headBlobs.keys())) {
-      if (!have.has(rel) && !I.lexists(path.join(root, ...rel.split('/')))) deleted.push(rel);
+      // Not in the plan = not installed, whatever occupies the path (an empty directory, a dangling symlink, a file the
+      // plan did not walk): the install would not carry HEAD's file.
+      if (!have.has(rel)) deleted.push(rel);
     }
     deleted.sort();
   }
@@ -101,7 +106,8 @@ export const stampIsTrusted = (parsed) => Boolean(parsed && parsed.sha && parsed
 // Identity of what is installed in `home`, from <home>/pipeline/INSTALLED.json and the files on disk. null when
 // nothing usable is installed there. `modified` = manifest files whose bytes differ, `missing` = gone, `extra` = files
 // in the installer's own units (pipeline/, the four agents, the three skills) that the manifest does not list; an
-// added file changes what runs, so it makes the stamp .modified like an edit does.
+// added file changes what runs, so it makes the stamp .modified like an edit does. `scanError` = directories that could
+// not be listed, so extras there are unknown; it makes the stamp .modified too (never clean on an unfinished look).
 export function installedIdentity(home) {
   const { manifest } = I.readManifest(home);
   if (!manifest) return null;
@@ -114,19 +120,24 @@ export function installedIdentity(home) {
     try { actual = I.sha256File(file); } catch { /* unreadable counts as modified */ }
     if (actual !== expected) modified.push(rel);
   }
+  // Extras are only listed, never hashed, so an unreadable file cannot hide the rest. A directory that cannot be listed,
+  // or a scan that throws, leaves what is in it unknown: reported as `scanError` and the stamp is .modified.
   let extra = [];
-  try { extra = I.extraInstalledFiles(home, manifest); } catch { /* unreadable units: nothing more to say than the manifest files */ }
+  let scanError = [];
+  try {
+    ({ extra, unreadable: scanError } = I.scanExtraInstalledFiles(home, manifest));
+  } catch { scanError = ['(installed files could not be scanned)']; }
   const base = String(manifest.version ?? 'unknown');
   const sourceSha = typeof manifest.sourceSha === 'string' && manifest.sourceSha ? manifest.sourceSha : null;
   const complete = I.manifestComplete(manifest);
   const sourceDirty = manifest.sourceDirty === true;
   const flags = [];
-  if (modified.length > 0 || missing.length > 0 || extra.length > 0) flags.push('modified');
+  if (modified.length > 0 || missing.length > 0 || extra.length > 0 || scanError.length > 0) flags.push('modified');
   if (!complete) flags.push('incomplete');
   if (sourceDirty) flags.push('unverified');
   return {
     kind: 'installed', base, sourceSha, sha7: sourceSha ? sourceSha.slice(0, 7) : null,
-    complete, sourceDirty, modified, missing, extra, stamp: formatStamp(base, sourceSha, flags),
+    complete, sourceDirty, modified, missing, extra, scanError, stamp: formatStamp(base, sourceSha, flags),
   };
 }
 
@@ -141,7 +152,7 @@ export function checkoutIdentity(root, files, { scope = null } = {}) {
   let base = 'unknown';
   const versionFile = path.join(root, 'VERSION');
   try { base = fs.readFileSync(versionFile, 'utf8').trim() || 'unknown'; } catch { /* unknown */ }
-  const all = fs.existsSync(versionFile) && !files.includes(versionFile) ? [...files, versionFile] : files;
+  const all = I.lexists(versionFile) && !files.includes(versionFile) ? [...files, versionFile] : files;
   const prov = fileProvenance(root, all, { requireToplevel: true, scope });
   const provenance = prov.state === 'clean';
   const onMain = prov.head ? headOnMain(root) : false;

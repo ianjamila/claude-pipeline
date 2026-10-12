@@ -22,7 +22,7 @@ export function versionReport(pipelineDir) {
   if (existsSync(join(pipelineDir, 'INSTALLED.json'))) {
     const id = installedIdentity(dirname(pipelineDir));
     if (id) {
-      return { ok: true, version: id.stamp, base: id.base, sourceSha: id.sourceSha, complete: id.complete, modified: id.modified, missing: id.missing, extra: id.extra, kind: 'installed' };
+      return { ok: true, version: id.stamp, base: id.base, sourceSha: id.sourceSha, complete: id.complete, modified: id.modified, missing: id.missing, extra: id.extra, ...(id.scanError.length > 0 ? { scanError: id.scanError } : {}), kind: 'installed' };
     }
     // The manifest is there but unusable (corrupt): nothing vouches for the files.
     const base = readText(join(pipelineDir, 'VERSION')) || 'unknown';

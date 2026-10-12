@@ -4,13 +4,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, realpathSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdtempSync, mkdirSync, symlinkSync, writeFileSync, readFileSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { installedIdentity, checkoutIdentity, parseStamp, formatStamp, stampIsTrusted, fileProvenance } from '../pipeline/lib/identity.mjs';
-import { MANIFEST_REL, sha256File, walkFiles } from '../pipeline/lib/installer.mjs';
+import { MANIFEST_REL, buildPlan, sha256File, walkFiles } from '../pipeline/lib/installer.mjs';
 import { versionReport, meta as versionMeta } from '../pipeline/commands/version.mjs';
 
 const made = [];
@@ -378,4 +378,123 @@ test('checkoutIdentity: a deleted installable file (install scope) or a deleted 
   const wid = checkoutIdentity(w.repo.dir, w.planned(w.repo), { scope: 'install' });
   assert.equal(wid.provenance, false);
   assert.match(wid.stamp, /\.unverified$/);
+});
+
+// ---- R2-B1 / R2-B2 -----------------------------------------------------------------------------------------------
+
+// A tracked file whose path now holds something the installer's walker does not count must break provenance exactly
+// like a deleted one: the plan (buildPlan, what install and `version` really pass) omits it.
+function replaceWith(repo, rel, make) {
+  repo.rm(rel);
+  make(join(repo.dir, ...rel.split('/')));
+}
+
+test('a tracked installable file replaced by an empty directory is a provenance failure (plan from buildPlan)', () => {
+  const { repo, sha } = installRepo();
+  // agents/judge.md etc. are what buildPlan finds; make the plan's source realistic
+  repo.write('agents/reviewer.md', 'r\n');
+  repo.write('skills/ship/SKILL.md', 'ship\n');
+  const sha2 = repo.commit('more');
+  repo.git(['update-ref', 'refs/remotes/origin/main', sha2]);
+  assert.notEqual(sha, sha2);
+  const planFiles = () => [...buildPlan(repo.dir).files.values()].map((f) => f.abs);
+  assert.equal(checkoutIdentity(repo.dir, planFiles(), { scope: 'install' }).provenance, true);
+  replaceWith(repo, 'pipeline/lib/b.mjs', (abs) => mkdirSync(abs));
+  const files = planFiles();
+  assert.ok(!files.some((f) => f.endsWith('b.mjs')), 'control: the walker does not count a directory');
+  const p = fileProvenance(repo.dir, files, { scope: 'install' });
+  assert.equal(p.state, 'dirty');
+  assert.deepEqual(p.deleted, ['pipeline/lib/b.mjs']);
+  const id = checkoutIdentity(repo.dir, files, { scope: 'install' });
+  assert.equal(id.provenance, false);
+  assert.deepEqual(id.missing, ['pipeline/lib/b.mjs']);
+  assert.equal(id.stamp, `1.4.0+${sha2.slice(0, 7)}.unverified`);
+});
+
+test('a tracked installable file replaced by a dangling symlink is a provenance failure', { skip: process.platform === 'win32' }, () => {
+  const { repo, sha } = installRepo();
+  replaceWith(repo, 'pipeline/lib/b.mjs', (abs) => symlinkSync(join(repo.dir, 'nowhere'), abs));
+  const files = [...buildPlan(repo.dir).files.values()].map((f) => f.abs);
+  assert.ok(!files.some((f) => f.endsWith('b.mjs')));
+  const id = checkoutIdentity(repo.dir, files, { scope: 'install' });
+  assert.equal(id.provenance, false);
+  assert.deepEqual(id.missing, ['pipeline/lib/b.mjs']);
+  assert.equal(id.stamp, `1.4.0+${sha.slice(0, 7)}.unverified`);
+});
+
+test('checkoutIdentity: an explicitly listed file (vendor) that became a directory or a dangling symlink breaks provenance', () => {
+  const dir = installRepo();
+  const listed = dir.planned(dir.repo);
+  replaceWith(dir.repo, 'pipeline/lib/a.mjs', (abs) => mkdirSync(abs));
+  const d = checkoutIdentity(dir.repo.dir, listed);
+  assert.equal(d.provenance, false);
+  assert.deepEqual(d.missing, ['pipeline/lib/a.mjs']);
+  assert.equal(d.stamp, `1.4.0+${dir.sha.slice(0, 7)}.unverified`);
+
+  if (process.platform === 'win32') return;
+  const link = installRepo();
+  const listed2 = link.planned(link.repo);
+  replaceWith(link.repo, 'pipeline/lib/a.mjs', (abs) => symlinkSync(join(link.repo.dir, 'nowhere'), abs));
+  const l = checkoutIdentity(link.repo.dir, listed2);
+  assert.equal(l.provenance, false);
+  assert.deepEqual(l.missing, ['pipeline/lib/a.mjs']);
+  assert.equal(l.stamp, `1.4.0+${link.sha.slice(0, 7)}.unverified`);
+
+  // VERSION itself turned into a dangling symlink is not skipped as "absent"
+  const v = installRepo();
+  const listed3 = v.planned(v.repo).filter((f) => !f.endsWith('VERSION'));
+  replaceWith(v.repo, 'VERSION', (abs) => symlinkSync(join(v.repo.dir, 'nowhere'), abs));
+  const vid = checkoutIdentity(v.repo.dir, listed3);
+  assert.equal(vid.provenance, false);
+  assert.match(vid.stamp, /\.unverified$/);
+});
+
+const canChmod = process.platform !== 'win32' && process.getuid?.() !== 0;
+
+test('installedIdentity: an unreadable extra file does not hide the other extras', { skip: !canChmod }, () => {
+  const home = installedHome();
+  mkdirSync(join(home, 'pipeline', 'commands'), { recursive: true });
+  const secret = join(home, 'pipeline', 'commands', 'locked.mjs');
+  writeFileSync(secret, 'x\n');
+  writeFileSync(join(home, 'skills', 'ship', 'EXTRA.md'), 'added\n');
+  chmodSync(secret, 0o000);
+  try {
+    const id = installedIdentity(home);
+    assert.deepEqual(id.extra, ['pipeline/commands/locked.mjs', 'skills/ship/EXTRA.md']);
+    assert.equal(id.stamp, '1.4.0+0123456.modified');
+  } finally { chmodSync(secret, 0o644); }
+});
+
+test('installedIdentity: a directory that cannot be listed leaves extras unknown, so the stamp is .modified with a scanError', { skip: !canChmod }, () => {
+  const home = installedHome();
+  const dir = join(home, 'pipeline', 'locked');
+  mkdirSync(dir);
+  writeFileSync(join(dir, 'hidden.mjs'), 'x\n');
+  assert.deepEqual(installedIdentity(home).extra, ['pipeline/locked/hidden.mjs']); // control: listable
+  chmodSync(dir, 0o000);
+  try {
+    const id = installedIdentity(home);
+    assert.deepEqual(id.scanError, ['pipeline/locked']);
+    assert.equal(id.stamp, '1.4.0+0123456.modified');
+    assert.deepEqual(versionReport(join(home, 'pipeline')).scanError, ['pipeline/locked']);
+  } finally { chmodSync(dir, 0o755); }
+});
+
+test('installedIdentity: an unreadable manifest-listed file is .modified, not a throw and not clean', { skip: !canChmod }, () => {
+  const home = installedHome();
+  assert.equal(installedIdentity(home).stamp, '1.4.0+0123456'); // control
+  const f = join(home, 'skills', 'ship', 'SKILL.md');
+  chmodSync(f, 0o000);
+  try {
+    const id = installedIdentity(home);
+    assert.deepEqual(id.modified, ['skills/ship/SKILL.md']);
+    assert.equal(id.stamp, '1.4.0+0123456.modified');
+  } finally { chmodSync(f, 0o644); }
+});
+
+test('the session hook flags a scan error as modified', async () => {
+  const { installedProblems } = await import('../pipeline/lib/session-version.mjs');
+  const problems = installedProblems({ complete: true, modified: [], missing: [], extra: [], scanError: ['pipeline/x'], sourceDirty: false });
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /^modified/);
 });

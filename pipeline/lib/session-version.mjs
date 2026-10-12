@@ -50,7 +50,7 @@ export function safeStampLabel(parsed) {
 export function installedProblems(installed) {
   const states = [];
   if (installed.complete === false) states.push('incomplete (a previous install did not finish)');
-  const changed = (installed.modified?.length ?? 0) + (installed.missing?.length ?? 0) + (installed.extra?.length ?? 0);
+  const changed = (installed.modified?.length ?? 0) + (installed.missing?.length ?? 0) + (installed.extra?.length ?? 0) + (installed.scanError?.length ?? 0);
   if (changed > 0) states.push(`modified (${changed} installed file${changed === 1 ? ' differs' : 's differ'} from what was installed)`);
   if (installed.sourceDirty) states.push('unverified (built from a source tree that was not a clean checkout)');
   return states;

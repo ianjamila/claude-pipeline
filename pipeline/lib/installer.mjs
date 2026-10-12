@@ -76,11 +76,13 @@ export function sha256File(file) {
 
 // Relative POSIX paths of the regular files under root, skipping excluded names at any depth and topLevel
 // names only directly under root. Symlinked directories are not followed; a symlink to a file counts as that file.
-export function walkFiles(root, { exclude = EXCLUDED_NAMES, topLevel = EXCLUDED_TOP_LEVEL } = {}) {
+// A directory that cannot be listed is skipped, but reported to `onError(relDir, error)` when given, so a caller that
+// must not read "nothing found" as "nothing there" can tell.
+export function walkFiles(root, { exclude = EXCLUDED_NAMES, topLevel = EXCLUDED_TOP_LEVEL, onError = null } = {}) {
   const out = [];
   const visit = (abs, rel) => {
     let entries;
-    try { entries = fs.readdirSync(abs, { withFileTypes: true }); } catch { return; }
+    try { entries = fs.readdirSync(abs, { withFileTypes: true }); } catch (err) { if (onError) onError(rel, err); return; }
     for (const e of entries) {
       if (exclude.has(e.name) || (rel === '' && topLevel.has(e.name))) continue;
       const childAbs = path.join(abs, e.name);
@@ -100,7 +102,7 @@ export function walkFiles(root, { exclude = EXCLUDED_NAMES, topLevel = EXCLUDED_
 }
 
 const isDirectory = (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } };
-const isFile = (p) => { try { return fs.statSync(p).isFile(); } catch { return false; } };
+export const isFile = (p) => { try { return fs.statSync(p).isFile(); } catch { return false; } };
 export const lexists = (p) => { try { fs.lstatSync(p); return true; } catch { return false; } };
 export const fromRel = (base, rel) => path.join(base, ...rel.split('/'));
 
@@ -192,13 +194,31 @@ export const installedUnits = () => [
 ];
 
 // Home-relative paths of files sitting in an installer-owned unit that the manifest does not list (something added
-// after the install). Same walker and exclusions as install, so what install ignores is ignored here too.
-export function extraInstalledFiles(home, manifest) {
+// after the install). Same walker and exclusions as install, so what install ignores is ignored here too. Paths are
+// only listed, never read: one unreadable file must not hide the others. Returns { extra, unreadable }; `unreadable`
+// = home-relative directories that could not be listed (what is in them is unknown).
+export function scanExtraInstalledFiles(home, manifest) {
   const extra = [];
+  const unreadable = [];
   for (const unit of installedUnits()) {
-    for (const rel of scanUnitDisk(home, unit).keys()) if (!Object.hasOwn(manifest.files, rel)) extra.push(rel);
+    const target = unitTarget(home, unit);
+    if (unit.kind === 'agent') {
+      if (isFile(target) && !Object.hasOwn(manifest.files, unit.rel)) extra.push(unit.rel);
+      continue;
+    }
+    if (!isDirectory(target)) continue;
+    const onError = (relDir) => unreadable.push(relDir ? `${unit.rel}/${relDir}` : unit.rel);
+    for (const r of walkFiles(target, { onError })) {
+      if (unit.kind === 'pipeline' && r === 'INSTALLED.json') continue;
+      const rel = `${unit.rel}/${r}`;
+      if (!Object.hasOwn(manifest.files, rel)) extra.push(rel);
+    }
   }
-  return extra.sort(byCodeUnit);
+  return { extra: extra.sort(byCodeUnit), unreadable: unreadable.sort(byCodeUnit) };
+}
+
+export function extraInstalledFiles(home, manifest) {
+  return scanExtraInstalledFiles(home, manifest).extra;
 }
 
 // 'missing' (nothing at the target), 'same' (exactly our files, byte for byte) or 'different'.
