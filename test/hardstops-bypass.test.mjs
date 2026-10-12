@@ -555,13 +555,20 @@ test('13 the whole-file import scan stays linear on a ~1.5 MB file of adversaria
   // Linearity, not raw speed: CI's Node 20 runs these ~3x slower than a laptop, so an absolute budget flaked (2.1 s for the
   // backslash chain on ubuntu-latest). Doubling the input may at most ~double the CPU (ratio < 3; a quadratic shape gives ~4),
   // and a generous absolute ceiling still catches a pathological constant.
+  // Windows counts process CPU in ~15.6 ms ticks, so a shape that takes ~10 ms read as 1 tick vs 4 (ratio 4) and flaked. Each
+  // size is therefore timed over enough repeats (calibrated on the high-resolution clock) to span ~150 ms, then averaged.
   const shapes = [[';from a import ', 100_000, 'a.py'], ['from' + ' ', 1_500_000, 'a.ts', true], ['require("', 190_000, 'a.ts'], [';import a, ', 100_000, 'a.py'], ['"""\n', 250_000, 'a.py'],
     ['from a import (\n', 90_000, 'a.py'], ['import a, \\\n', 120_000, 'a.py']];
-  const cpu = (text, name) => cpuMs(() => run([file(`lib/${name}`, { added: ['x = 1'] })], { headFiles: new Map([[`lib/${name}`, text]]) })).ms;
+  const once = (text, name) => run([file(`lib/${name}`, { added: ['x = 1'] })], { headFiles: new Map([[`lib/${name}`, text]]) });
+  const cpu = (text, name, reps) => cpuMs(() => { for (let i = 0; i < reps; i++) once(text, name); }).ms / reps;
   for (const [unit, n, name, padOnly] of shapes) {
     const make = (k) => (padOnly ? `from${' '.repeat(k)}` : unit.repeat(k));
-    const half = Math.max(cpu(make(n / 2), name), 1);
-    const full = cpu(make(n), name);
+    const halfText = make(n / 2), fullText = make(n);
+    const t0 = performance.now();
+    once(halfText, name);
+    const reps = Math.min(50, Math.max(1, Math.ceil(150 / Math.max(performance.now() - t0, 1))));
+    const half = Math.max(cpu(halfText, name, reps), 1);
+    const full = cpu(fullText, name, reps);
     assert.ok(full / half < 3, `${unit.slice(0, 16)}... ${Math.round(half)}ms at n/2 -> ${Math.round(full)}ms at n: not linear`);
     assert.ok(full < 8000, `${unit.slice(0, 16)}... took ${Math.round(full)}ms of CPU`);
   }
