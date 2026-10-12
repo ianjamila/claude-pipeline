@@ -16,6 +16,7 @@ import { expandHome, isInside, safeTimestamp } from './pipeline/lib/paths.mjs';
 import * as I from './pipeline/lib/installer.mjs';
 import { hasClaudeCodeAncestor } from './pipeline/lib/claude-ancestry.mjs';
 import { tryAcquire, release } from './pipeline/lib/locks.mjs';
+import { fileProvenance } from './pipeline/lib/identity.mjs';
 
 class InstallError extends Error {
   constructor(message, exitCode = 1) {
@@ -185,44 +186,19 @@ function removeInstalledFile(home, rel) {
   return true;
 }
 
-// A caller's GIT_DIR & co. would point git at some other repo than the source checkout.
-const GIT_SCRUB = Object.fromEntries(
-  ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE']
-    .map((k) => [k, undefined]),
-);
-const git = (source, args, extra = {}) => run('git', ['-C', source, ...args], { env: GIT_SCRUB, timeoutMs: 20000, ...extra });
-
-function gitHead(source) {
-  const r = run('git', ['-C', source, 'rev-parse', 'HEAD'], { env: GIT_SCRUB, timeoutMs: 10000 });
-  const sha = r.stdout.trim();
-  return r.code === 0 && /^[0-9a-f]{40,64}$/.test(sha) ? sha : null;
-}
-
-// What to record as the source commit. HEAD is only the truth when the files being copied ARE HEAD's files: one
-// `git ls-tree -r HEAD` plus one `git hash-object --stdin-paths` (which applies .gitattributes filters, so a Windows
-// checkout's line endings do not read as edits) over every planned file. Anything not in HEAD or with another blob (an
-// edit, a new file, an ignored extra) means no sha is recorded: { sourceSha: null, sourceDirty: true, warning }.
-// Not a checkout, or git unavailable: { sourceSha: null, sourceDirty: false } as before.
+// What to record as the source commit. HEAD is only the truth when the files being copied ARE HEAD's files
+// (fileProvenance in pipeline/lib/identity.mjs compares every planned file with HEAD's blobs). Anything not in HEAD or
+// with another blob (an edit, a new file, an ignored extra) means no sha is recorded: { sourceSha: null, sourceDirty:
+// true, warning }. Not a checkout, or git unavailable: { sourceSha: null, sourceDirty: false } as before.
 function sourceProvenance(source, plan) {
-  const head = gitHead(source);
-  if (!head) return { sourceSha: null, sourceDirty: false, warning: null };
-  const unverifiable = { sourceSha: null, sourceDirty: true, warning: `could not compare the source with ${head.slice(0, 7)}; recording no source sha` };
-  // (absolute paths on stdin: hash-object resolves relative ones from the repo top, not from -C)
-  const planned = [...plan.files.values()]
-    .map((f) => ({ abs: f.abs, rel: path.relative(source, f.abs).split(path.sep).join('/') }))
-    .sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
-  const paths = planned.map((f) => f.rel);
-  const tree = git(source, ['ls-tree', '-r', '-z', 'HEAD']);
-  if (tree.code !== 0) return unverifiable;
-  const hashed = git(source, ['hash-object', '--stdin-paths'], { input: `${planned.map((f) => f.abs).join('\n')}\n` });
-  const hashes = hashed.stdout.split(/\r?\n/).filter(Boolean);
-  if (hashed.code !== 0 || hashes.length !== paths.length) return unverifiable;
-  const differing = I.pathsDifferingFromHead(paths, I.parseLsTree(tree.stdout), hashes);
-  if (differing.length === 0) return { sourceSha: head, sourceDirty: false, warning: null };
+  const p = fileProvenance(source, [...plan.files.values()].map((f) => f.abs));
+  if (p.state === 'no-git') return { sourceSha: null, sourceDirty: false, warning: null };
+  if (p.state === 'unverifiable') return { sourceSha: null, sourceDirty: true, warning: `could not compare the source with ${p.head.slice(0, 7)}; recording no source sha` };
+  if (p.state === 'clean') return { sourceSha: p.head, sourceDirty: false, warning: null };
   return {
     sourceSha: null,
     sourceDirty: true,
-    warning: `source is not a clean checkout of ${head.slice(0, 7)}: ${differing.slice(0, 3).join(', ')}; recording no source sha`,
+    warning: `source is not a clean checkout of ${p.head.slice(0, 7)}: ${p.differing.slice(0, 3).join(', ')}; recording no source sha`,
   };
 }
 
