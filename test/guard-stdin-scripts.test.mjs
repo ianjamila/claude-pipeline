@@ -380,3 +380,59 @@ test('R1-B2: scriptFeedsOf joins the files of one reader in command-line order, 
   const scan = feeds('sed p a.sh b.sh | bash');
   assert.deepEqual(scan.filter((f) => f.joined), [{ kind: 'scan', file: 'p a.sh b.sh', joined: ['p', 'a.sh', 'b.sh'] }]); // (the program word is a candidate file name too)
 });
+
+// ---- review R1-B2 follow-up: a joined feed that names a word the parser cannot resolve to ONE file is refused -----------------------------
+// The join only covered words without a glob / `$`; `sed p a.sh b*.sh | bash` fell back to judging a.sh alone and the glob's candidates alone,
+// so a guarded word split across them escaped. Several file operands where any of them expands (glob, `$`, command substitution, backtick,
+// brace list, `~user`) cannot be rebuilt in order: the line is refused. One file operand (however it is spelled) keeps its old verdict.
+const EXPANDING = ['b*.sh', 'b?.sh', 'b.s[h]', '"$F"', '$F', '${F}', '$(echo b.sh)', '`echo b.sh`', '~root/b.sh', '~+/b.sh', '@(b).sh', 'b.sh$X'];
+const splitFiles = (bad) => { const [h, t] = parts(bad); return { 'a.sh': h, 'b.sh': t, 'ok.sh': 'echo hi\n' }; };
+
+test('R1-B2 follow-up: exact readers (cat / less) with an operand that expands among several files are refused', () => {
+  for (const w of EXPANDING) {
+    for (const c of [
+      `cat a.sh ${w} | bash`, `cat ${w} a.sh | bash`, `less a.sh ${w} | sh -s`, `eval "$(cat a.sh ${w})"`, `bash <(cat a.sh ${w})`, `bash < <(cat a.sh ${w})`,
+      `bash -c "$(cat a.sh ${w})"`, `{ cat a.sh ${w}; } | bash`, `cat ok.sh ${w} | bash`, `cat a.sh ${w} ok.sh | bash`, `bash <<< "$(cat a.sh ${w})"`,
+    ]) denyBuilt(c, splitFiles);
+  }
+});
+
+test('R1-B2 follow-up: rewriting producers (sed / awk / tail / tr chains) with an operand that expands among several files are refused', () => {
+  for (const w of EXPANDING) {
+    for (const c of [
+      `sed p a.sh ${w} | bash`, `sed p ${w} a.sh | bash`, `awk 1 a.sh ${w} | sh`, `tail -n +1 a.sh ${w} | bash`, `head -n 9 a.sh ${w} | bash`, `tac a.sh ${w} | bash`,
+      `cat a.sh ${w} | tr a b | bash`, `eval "$(sed p a.sh ${w})"`, `bash <(sed p a.sh ${w})`, `bash < <(tail -n +1 a.sh ${w})`, `sed -n p a.sh ${w} | bash`, `sed -e p a.sh ${w} | bash`,
+    ]) denyBuilt(c, splitFiles);
+  }
+});
+
+test('R1-B2 follow-up: every producer and every way the text reaches a shell is covered, brace lists are joined in order or refused', () => {
+  for (const c of [
+    'more a.sh b.sh | bash', 'bat a.sh b.sh | bash', 'batcat a.sh b.sh | bash', 'source <(cat a.sh b.sh)', '. <(cat a.sh b.sh)', '$(cat a.sh b.sh)', 'sh <<< $(cat a.sh b.sh)', 'exec bash < <(cat a.sh b.sh)',
+    'zsh <(cat a.sh b.sh)', 'cat a.sh b.sh | sudo bash', 'cat a.sh b.sh | env bash', 'cat a.sh b.sh | tee /dev/stderr | bash', 'bash < <(cat a.sh b.sh | tr a a)',
+    'base64 a.sh b.sh | bash', 'cut -c1-99 a.sh b.sh | bash', 'sort a.sh b.sh | bash', 'nl a.sh b.sh | bash', 'rev a.sh b.sh | bash', 'jq -r . a.sh b.sh | bash', 'grep -h . a.sh b.sh | bash',
+    'cat a.sh {b,c}.sh | bash', 'cat {a,b}.sh | bash', 'cat a.sh f{1..3}.sh | bash', 'cat a.sh "{b,c}.sh" | bash', 'sed p a.sh {b,c}.sh | bash',
+  ]) denyBuilt(c, splitFiles);
+  for (const c of ['cat {b,c}.sh a.sh | bash', 'cat a.sh {b}.sh | bash']) allowBuilt(c, splitFiles); // (expanded in order by the parser; `{b}` is a plain name)
+});
+
+test('R1-B2 follow-up: scriptFeedsOf refuses a joined feed with an operand that is not one exact file; one operand is unchanged', () => {
+  const feeds = (line) => simpleCommands(line).flatMap((c) => scriptFeedsOf(c, line));
+  for (const line of ['cat a.sh b*.sh | bash', 'cat a.sh "$F" | bash', 'sed p a.sh b*.sh | bash', 'tail -n +1 a.sh "$F" | bash', 'cat a.sh ~root/b.sh | bash', 'sed -e p a.sh b.sh | cat "$F" | bash', '{ cat a.sh; sed p b*.sh; } | bash']) {
+    const r = feeds(line);
+    assert.equal(r.length, 1, line);
+    assert.equal(r[0].unresolvable, true, line);
+  }
+  assert.equal(feeds('sed p b*.sh | bash').some((f) => f.unresolvable), false); // one file operand: the candidates are judged as before
+  assert.equal(feeds('cat b*.sh | bash').some((f) => f.unresolvable), false);
+  assert.equal(feeds('awk \'{print $1}\' a.sh | bash').some((f) => f.unresolvable), false); // `$` in the program text is not a file operand
+  assert.equal(feeds('sed "s/a/$X/" a.sh | bash').some((f) => f.unresolvable), false);
+  assert.equal(feeds('grep -e \'^x\' a.sh b.sh | bash').some((f) => f.unresolvable), false); // a pattern quoted for the producer is not a glob of the shell
+  assert.equal(feeds('grep -e ^x a.sh b.sh | bash')[0].unresolvable, true); // ... unquoted, it is
+  assert.equal(feeds('cat a.sh ~/b.sh | bash').some((f) => f.joined), true); // the user's own home resolves
+});
+
+test('R1-B2 follow-up: a feed with ONE file operand keeps its verdict, however the operand is spelled', () => {
+  const ok = () => ({ 'a.sh': 'echo a', 'b.sh': 'echo b', 'ok.sh': 'echo hi\n' });
+  for (const c of ['cat ok.sh | bash', 'cat o*.sh | bash', 'sed p ok.sh | bash', 'sed p o*.sh | bash', 'awk \'{print $1}\' ok.sh | bash', 'sed "s/a/$X/" ok.sh | bash', 'tail -n +1 ok.sh | bash', 'cat a.sh b.sh | bash']) allowBuilt(c, ok);
+});

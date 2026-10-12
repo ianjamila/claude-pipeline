@@ -685,7 +685,7 @@ function readsUnnamedFiles(name, argv) {
 }
 
 // groups: the exact files, one array per producer in the order it names them (what `st.files` was filled from), so the join can be rebuilt
-const newSt = () => ({ dyn: false, files: [], groups: [], computed: [], raws: [], pat: new Set() });
+const newSt = () => ({ dyn: false, files: [], groups: [], computed: [], raws: [], pat: new Set(), unq: new Set() });
 
 // What the command `seg` prints, when its output reaches the shell through a file: the files it reads. `exact`: nothing
 // between the command and the shell rewrites its output, so a plain reader's files ARE the script text (`st.files`); otherwise
@@ -705,6 +705,7 @@ function noteReads(seg, name, argv, st, exact) {
     list.push(w);
     if (list === st.files) group.push(w);
     if (seg.pat.has(full) || idx !== prog) st.pat.add(w);
+    if (seg.pat.has(full)) st.unq.add(w); // an unquoted pattern: the shell really globs it (`find . -name '*.sh'` does not)
   }
   if (group.length) st.groups.push(group);
   if (words.length) st.raws.push(seg.raw);
@@ -792,13 +793,21 @@ function stdinSource(seg) {
 // a command that rewrites its input (sed, awk, base64, tr ...) may read; `raws` are the producers' command texts.
 function addFeeds(cmd, st) {
   if (!cmd || (!st.files.length && !st.computed.length)) return;
-  if (!cmd.feeds) Object.defineProperty(cmd, 'feeds', { value: { files: [], groups: [], computed: [], raws: [], pat: [] }, enumerable: false });
+  if (!cmd.feeds) Object.defineProperty(cmd, 'feeds', { value: { files: [], groups: [], computed: [], raws: [], pat: [], unq: [] }, enumerable: false });
   cmd.feeds.pat.push(...st.pat);
+  cmd.feeds.unq.push(...st.unq);
   cmd.feeds.files.push(...st.files);
   cmd.feeds.groups.push(...st.groups);
   cmd.feeds.computed.push(...st.computed);
   cmd.feeds.raws.push(...st.raws);
 }
+
+// A file operand that is not one exact file name: it expands (glob, `$`, substitution), lists names (`{a,b}.sh`, `{1..3}`) or names someone
+// else's home / the working directory by tilde (`~root/x`, `~+/x`; `~` and `~/x` are the user's home, which the policies resolve).
+const BRACE_LIST = /\{[^{}]*(?:,|\.\.)[^{}]*\}/;
+// `globs`: whether a pattern character counts (an exact reader's operand: any; a rewriting producer's: only an unquoted one, since
+// `find . -name '*.sh'` or `grep -e '^x' a b` quote their patterns for the producer, not for the shell).
+const opaqueFile = (w, globs) => (globs ? hasExpansion(w) : /[$`]/.test(w)) || BRACE_LIST.test(w) || /^~[^/]/.test(w);
 
 // The files that feed the text `cmd` runs, as script-file records the callers judge: {kind:'shell'} like `bash F` (the text is
 // the file), {kind:'scan'} for a file a rewriting command read (the text is computed at run time, so the caller refuses the
@@ -821,9 +830,16 @@ export function scriptFeedsOf(cmd, line = cmd?.raw) {
   // command-line order, repeats included (`cat a b` with `git pu` in a and `sh origin main` in b); each file is still judged on its own. Only a
   // single reader names them in an order that can be rebuilt: feeds from several producers (or a word that expands) are refused. A rewriting
   // producer's words are scanned joined as well (the order it prints them in is not known, so the caller looks at both orders).
+  // Fail closed (review R1-B2 follow-up): when two or more file operands feed the program and ANY of them cannot be resolved to one exact file
+  // (a glob, `$`, a substitution, a brace list, `~user`), the text the shell reads cannot be rebuilt, so the line is refused instead of
+  // judging each word on its own (a guarded word split across a literal file and a glob / variable file escaped that way). Operands are
+  // counted across the exact readers and the rewriting producers' file-role words (not their program text: `sed 's/$/x/' f`).
+  const rewritten = f.computed.filter((w) => pat.has(w));
+  const unq = new Set(f.unq);
+  if (f.files.length + rewritten.length >= 2 && (f.files.some((w) => opaqueFile(w, true)) || rewritten.some((w) => opaqueFile(w, unq.has(w))))) return [refuse];
   if (f.files.length >= 2) {
     const g = f.groups;
-    if (g.length !== 1 || g[0].length !== f.files.length || g[0].some(hasExpansion)) return [refuse];
+    if (g.length !== 1 || g[0].length !== f.files.length) return [refuse];
     out.push({ kind: 'shell', file: g[0].join(' '), joined: [...g[0]] });
   }
   const words = f.computed.filter((w) => !hasExpansion(w));
