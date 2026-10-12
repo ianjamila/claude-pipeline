@@ -15,7 +15,7 @@
 import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell } from './shell-parse.mjs';
+import { commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform } from './shell-parse.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow } from './line-writes.mjs';
 import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
@@ -132,8 +132,11 @@ const knownValues = (ctx, n) => [ctx.vars[n], unsureVar(ctx, n) ? `$${n}` : unde
 function setVar(ctx, k, v, level) {
   if (level === 0) ctx.tainted.delete(k);
   else if (ctx.tainted.has(k)) return;
+  if (sameValue(ctx, k, v)) return;
   if (k in ctx.vars || ctx.unsureVars.has(k)) { delete ctx.vars[k]; ctx.unsureVars.add(k); } else ctx.vars[k] = v;
 }
+// Why: a name set again to the literal value it already holds (a startup file the nested shell reads again) is still certain; it is not "assigned more than once".
+const sameValue = (ctx, k, v) => !DYNAMIC.test(v) && !ctx.unsureVars.has(k) && !ctx.tainted.has(k) && Object.hasOwn(ctx.vars, k) && ctx.vars[k] === v;
 const recordVars = (env, ctx, level) => { for (const k of Object.keys(env)) setVar(ctx, k, env[k], level); };
 
 // A variable whose value is unknown: assigned more than once (or where it may not run), or tainted (a script that may
@@ -946,6 +949,7 @@ function checkJoinedScripts(sf, dir, ctx, level) {
 // script that shell runs see them. Seeded into ctx for the duration of `fn` and put back after (the line itself does not keep them).
 // A value that is only known at run time makes the variable unknown (refused where it picks a file).
 function withPrefixEnv(cmd, ctx, fn) {
+  if (ctx.prefixFor === cmd) return fn(); // (already in this command's startup scope: what the startup file set must not be put back)
   const entries = Object.entries(cmd?.env ?? {});
   if (!entries.length) return fn();
   const values = entries.map(([k, w]) => [k, expandVars(w, ctx)]);
@@ -962,6 +966,26 @@ function withPrefixEnv(cmd, ctx, fn) {
       if (wasUnsure) ctx.unsureVars.add(k); else ctx.unsureVars.delete(k);
       if (wasTainted) ctx.tainted.add(k); else ctx.tainted.delete(k);
     }
+  }
+}
+
+// The command's own variables, then the startup files the shell it starts reads (their assignments stay), then the script (see the call): everything
+// the command's shell changed in variables is put back when it is done.
+function withStartupScope(cmd, ctx, fn) {
+  const saved = { vars: Object.assign(Object.create(null), ctx.vars), unsure: new Set(ctx.unsureVars), tainted: new Set(ctx.tainted) };
+  try {
+    return withPrefixEnv(cmd, ctx, () => {
+      const outer = ctx.prefixFor;
+      ctx.prefixFor = cmd;
+      try { return fn(); } finally { ctx.prefixFor = outer; }
+    });
+  } finally {
+    for (const k of Object.keys(ctx.vars)) delete ctx.vars[k];
+    Object.assign(ctx.vars, saved.vars);
+    ctx.unsureVars.clear();
+    for (const k of saved.unsure) ctx.unsureVars.add(k);
+    ctx.tainted.clear();
+    for (const k of saved.tainted) ctx.tainted.add(k);
   }
 }
 
@@ -1248,7 +1272,7 @@ const STATE_GIT = new Set(['checkout', 'switch', 'branch', 'rebase', 'symbolic-r
 
 // Collects every assignment on the line BEFORE any command is judged. A name assigned more than once, or assigned
 // where it may not run (after && / ||, in a pipeline, a subshell, an if / loop / case), is unsure for the whole line.
-function collectAssignments(cmds, ctx) {
+function collectAssignments(cmds, ctx, topLevelLocal = false) {
   const counts = new Map();
   const bump = (k, n) => counts.set(k, (counts.get(k) ?? (k in ctx.vars || ctx.unsureVars.has(k) ? 1 : 0)) + n);
   const from = flowStart(cmds);
@@ -1261,14 +1285,17 @@ function collectAssignments(cmds, ctx) {
         if (m) bump(m[1], 2);
       }
     }
-    for (const k of Object.keys(c.env)) bump(k, n);
+    for (const k of Object.keys(c.env)) if (!sameValue(ctx, k, c.env[k])) bump(k, n);
     if (c.argv.length && VAR_BUILTINS.includes(baseName(c.argv[0]))) {
       // `declare -n X=F` makes X a NAMEREF: $X reads $F at run time, while the text says "F". Unknown, like a binder.
-      const nameref = c.argv.slice(1).some((a) => /^-[A-Za-z]*n[A-Za-z]*$/.test(a));
-      for (const a of c.argv.slice(1)) {
-        const m = (nameref ? /^([A-Za-z_][A-Za-z0-9_]*)(?:=|$)/ : /^([A-Za-z_][A-Za-z0-9_]*)=/).exec(a);
-        if (m) bump(m[1], nameref ? 2 : n);
-      }
+      // Why: -L / -R / -Z / -i change the value the text gives (width cut, arithmetic): unknown too. -l / -u are applied where the value is recorded; declared
+      // without a value they apply to what is assigned (or already held) later, which is not followed: unknown. `local` outside a function fails in bash
+      // (the name keeps the value it had, e.g. from the environment), so it assigns nothing we can rely on.
+      const d = declAttrs(c.argv);
+      const odd = d.unknown;
+      const localHere = topLevelLocal && baseName(c.argv[0]) === 'local';
+      for (const [k, v] of d.assigns) if (odd || localHere || !sameValue(ctx, k, applyTransform(v, d.transform))) bump(k, odd || localHere ? 2 : n);
+      for (const k of d.bare) if (odd || d.transform !== null || localHere) bump(k, 2);
     }
   }
   for (const [k, n] of counts) if (n > 1) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
@@ -1361,7 +1388,7 @@ function evalString(str, startDir, ctx, level) {
   }
   // A variable whose value is not certain (see collectAssignments) denies the line when it reaches git / gh, a command
   // that runs code, cd / pushd / popd or a command name: the checks below read the expanded text.
-  collectAssignments(cmds, ctx);
+  collectAssignments(cmds, ctx, !FUNCTION_DEF.test(str));
   if (ctx.unsureVars.size || ctx.tainted.size) {
     const unsure = unsureVarReachingCommand(cmds, ctx);
     if (unsure !== null) return deny(`$${unsure} is assigned more than once (or where it may not run) on this line, so its value at run time cannot be verified. Assign it once, unconditionally.`);
@@ -1420,9 +1447,10 @@ function evalString(str, startDir, ctx, level) {
     const name = baseName(argv[0]);
     let verdict = null;
     if (VAR_BUILTINS.includes(name)) {
-      for (const a of argv.slice(1)) {
-        const m = /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/.exec(a);
-        if (m) setVar(ctx, m[1], m[2], level);
+      const d = declAttrs(argv);
+      for (const [k, v] of d.assigns) {
+        // (a value that still holds a `$` is not worked out: the case change would apply to what it expands to)
+        if (d.transform && DYNAMIC.test(v)) { delete ctx.vars[k]; ctx.unsureVars.add(k); } else setVar(ctx, k, applyTransform(v, d.transform), level);
       }
     } else if (name === 'cd' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name, argv, ctx);
     else if (name === 'git' || name === 'gh') {
@@ -1446,7 +1474,11 @@ function evalString(str, startDir, ctx, level) {
       if (sf) withPath(sf);
       // a shell runs its startup files (BASH_ENV, ENV, ZDOTDIR/.zshenv ...) BEFORE the script it was given, so they are judged first, in the
       // order the shell reads them, and what they change (a branch switch) is what the script and the feeds are then judged against
-      if (!verdict) verdict = judgeStartupList(startupFilesOf(c, cmds, { env: ctx.env, inherited: (n) => knownValues(ctx, n), exec: sf?.kind === 'exec' }), c, dir, ctx, level);
+      const startupList = startupFilesOf(c, cmds, { env: ctx.env, inherited: (n) => knownValues(ctx, n), exec: sf?.kind === 'exec' });
+      // Why: BASH_ENV / ENV are sourced by the shell that then runs the script, so the variables they set are in the script's environment (judged as sourced, inside
+      // withStartupScope: the prefix first, then the file, then the script); the line itself keeps none of it
+      const judgeRest = () => {
+      if (!verdict) verdict = judgeStartupList(startupList.map((st) => (st.implicit ? st : { ...st, sourced: true })), c, dir, ctx, level);
       if (!verdict && sf) {
         // (a program run by path is judged with the command that runs it: its shebang may name a shell, which reads startup files of its own)
         const outer = ctx.execCmd;
@@ -1472,6 +1504,8 @@ function evalString(str, startDir, ctx, level) {
           if (verdict) break;
         }
       }
+      };
+      if (startupList.some((st) => !st.implicit)) withStartupScope(c, ctx, judgeRest); else judgeRest();
     }
     if (verdict && verdict.decision === 'deny') return verdict;
     if (SOURCING.includes(name)) {

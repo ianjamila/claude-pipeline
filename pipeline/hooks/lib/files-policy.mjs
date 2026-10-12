@@ -18,8 +18,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
-import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell } from './shell-parse.mjs';
-import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure } from './line-writes.mjs';
+import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform } from './shell-parse.mjs';
+import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
 import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
 
 const posix = path.posix;
@@ -763,21 +763,33 @@ function collectVars(cmds, ctx) {
   const kept = {};
   const SKIP = new Set(['HOME', 'USER', 'LOGNAME', 'USERPROFILE', 'USERNAME']); // these always mean the real ones
   const bs = freeMark([ctx.homePosix ?? '', ctx.user ?? '', ...cmds.flatMap((c) => [...Object.values(c.env ?? {}), ...(c.argv ?? [])])].join(''));
+  // Why: `declare -l D` / `-u` change the case of what D is given (also of the value it already holds); width and integer attributes (-L -R -Z -i -n) change it in
+  // ways not worked out: such a name keeps the text as written, but is listed in ctx.unknownVars (a script or a writer it picks is refused)
+  const attrs = new Map();
+  const unknown = new Set();
   const set = (k, v) => {
     if (SKIP.has(k)) return;
-    vars[k] = expandHomeRefs(substVars(toPosix(String(v)).replace(USER_RE, ctx.user), vars, ctx.budget), ctx.homePosix);
-    kept[k] = expandHomeRefs(substVars(toPosix(String(v).replace(/\\/g, bs)).replace(USER_RE, ctx.user), kept, ctx.budget), ctx.homePosix).split(bs).join('\\');
+    const t = attrs.get(k) ?? null;
+    vars[k] = applyTransform(expandHomeRefs(substVars(toPosix(String(v)).replace(USER_RE, ctx.user), vars, ctx.budget), ctx.homePosix), t);
+    kept[k] = applyTransform(expandHomeRefs(substVars(toPosix(String(v).replace(/\\/g, bs)).replace(USER_RE, ctx.user), kept, ctx.budget), ctx.homePosix).split(bs).join('\\'), t);
   };
   for (const c of cmds) {
     for (const [k, v] of Object.entries(c.env ?? {})) set(k, v);
     if (['export', 'declare', 'typeset', 'local', 'readonly'].includes(baseOf(c.argv[0] ?? ''))) {
-      for (const w of c.argv.slice(1)) {
-        const m = /^([A-Za-z_]\w*)=([\s\S]*)$/.exec(w);
-        if (m) set(m[1], m[2]);
+      const d = declAttrs(c.argv);
+      for (const k of d.bare) {
+        if (d.transform) { attrs.set(k, d.transform); if (Object.hasOwn(vars, k)) { vars[k] = applyTransform(vars[k], d.transform); kept[k] = applyTransform(kept[k], d.transform); } }
+        if (d.unknown) unknown.add(k);
+      }
+      for (const [k, v] of d.assigns) {
+        if (d.transform) attrs.set(k, d.transform);
+        if (d.unknown) unknown.add(k);
+        set(k, v);
       }
     }
   }
   ctx.keptVars = kept;
+  ctx.unknownVars = unknown;
   return vars;
 }
 
@@ -1234,7 +1246,7 @@ function judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw) {
   }
   if (c.over) return deny('too many words, a glob matching too many files, or glob syntax that cannot be resolved could be the script this command runs, so it cannot be checked; name the script file');
   // a variable the line set to a run-time value (`NVM_DIR=$(cmd)`) picks the script: which one is unknown
-  if (opts._unknown?.size && sf.words?.some((w) => [...w.matchAll(/\$\{?(\w+)/g)].some((m) => opts._unknown.has(m[1])))) return deny('the script is picked by a variable the command line sets to a value known only at run time, so it cannot be checked; name the script file');
+  if (sf.words?.some((w) => [...w.matchAll(/\$\{?(\w+)/g)].some((m) => ctx.unknownVars.has(m[1]) || ctx.pickUnknown.has(m[1]) || (ctx.unknownAll && !Object.hasOwn(ctx.vars, m[1]))))) return deny('the script is picked by a variable whose value is known only at run time (set to a run-time value, with a width or integer attribute, or by a sourced file that cannot be followed), so it cannot be checked; name the script file');
   if (c.dynamic && makeMatchers(ctx).rawHit(scanRaw, dirs)) return deny('which word is the script this command runs is only known at run time ($VAR / $(...) / a glob) and the line refers to a protected pipeline file; name the file and write the options literally');
   for (const file of c.files) {
     const v = judgeScriptFile({ kind: sf.kind, file, candidate: true }, dirs, ctx, opts);
@@ -1317,6 +1329,109 @@ function linkReachesProtected(cmds, dirs, ctx) {
   return null;
 }
 
+// ---- files a shell reads in its own process (sourced files, BASH_ENV / ENV) ------------------------------------
+
+const VAR_COMMANDS = new Set(['export', 'declare', 'typeset', 'local', 'readonly']);
+// builtins that bind a name without a NAME=value word
+const BINDERS = new Set(['read', 'mapfile', 'readarray', 'getopts', 'unset', 'let', 'printf', 'select', 'for', 'shift', 'wait', 'coproc']);
+const RUNS_CODE = new Set(['eval', 'source', '.', 'exec', 'trap', 'alias', 'unalias', 'enable', 'builtin', 'command', 'setopt', 'unsetopt', 'shopt', 'emulate', 'zmodload', 'autoload']);
+const HOME_NAMES = new Set(['HOME', 'USER', 'LOGNAME', 'USERPROFILE', 'USERNAME']);
+
+// What the text of a file run in the current shell leaves behind: { vars: Map(name -> text | null), cds: [word], all }. A name is null (unknown) when it is set
+// where it may not run, more than once, from a command's output, or by a builtin that binds it at run time; `all`: the file can set any name (eval, a nested
+// source, a parse cut short, a command named at run time), so no name is known any more. Only the first-level assignments are followed, not functions called later.
+function sourcedEffects(text, ctx) {
+  const out = { vars: new Map(), cds: [], all: false };
+  const cmds = simpleCommands(text, { expired: () => ctx.budget.now() > ctx.budget.deadline });
+  if (cmds.truncated || cmds.dynamic) out.all = true;
+  const from = flowStart(cmds);
+  const seen = new Map();
+  const local = Object.create(null);
+  const set = (k, v, sure) => {
+    if (HOME_NAMES.has(k)) return;
+    const n = (seen.get(k) ?? 0) + 1;
+    seen.set(k, n);
+    const val = sure && n === 1 && typeof v === 'string' ? substVars(v, local, ctx.budget) : null;
+    if (val === null || /[$`]/.test(val)) { out.vars.set(k, null); delete local[k]; } else { out.vars.set(k, val); local[k] = val; }
+  };
+  for (const [i, c] of cmds.entries()) {
+    const sure = !(inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || c.sep === '|' || cmds[i + 1]?.sep === '|' || cmds[i + 1]?.sep === '&');
+    if (!c.argv.length) { for (const [k, v] of Object.entries(c.env ?? {})) set(k, v, sure); continue; }
+    const name = baseOf(c.argv[0]);
+    if (VAR_COMMANDS.has(name)) {
+      const d = declAttrs(c.argv);
+      for (const [k, v] of d.assigns) set(k, v, sure && !d.unknown && !d.transform && name !== 'local');
+      for (const k of d.bare) if (d.unknown || d.transform) set(k, null, false);
+    } else if (CD_CMDS.has(name)) out.cds.push(c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d') ?? '~');
+    else if (BINDERS.has(name)) for (const a of c.argv.slice(1)) { const m = /^[A-Za-z_]\w*/.exec(a); if (m) set(m[0], null, false); }
+    else if (RUNS_CODE.has(name) || /[$`]/.test(c.argv[0])) out.all = true;
+  }
+  return out;
+}
+
+// The texts of the files a sourced or startup record names (a candidate word is resolved like a script word). unknown: a file that cannot be read, is not
+// one exact name, or is written by this line (so its text is only known at run time).
+function sourcedTexts(rec, dirs, ctx) {
+  const texts = [];
+  let unknown = !!(rec.joined || rec.unresolvable);
+  const consider = (abs) => {
+    const t = ctx.readText(abs);
+    if (typeof t === 'string') { texts.push(t); return; }
+    if (ctx.api.existsSync(abs)) { if (!ctx.readDir(abs)) unknown = true; return; }
+    if (writtenTo(ctx.frames, abs, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: false })) unknown = true;
+  };
+  if (unknown) return { texts, unknown };
+  const joinPath = (d, r) => (isAbs(r) ? posix.normalize(r) : posix.join(d, r));
+  if (rec.ambiguous) {
+    const readDir = (d) => {
+      const r = ctx.readDir(d);
+      if (!Array.isArray(r)) return r;
+      const extra = writtenNamesIn(ctx.frames, d);
+      return extra.length ? [...r, ...extra] : r;
+    };
+    const c = scriptCandidates(rec, { expand: (w) => expandRefs(w, ctx), dirs, joinPath, readDir, ifs: ctx.vars.IFS });
+    if (c.over || c.dynamic) unknown = true;
+    for (const file of c.files) for (const abs of new Set(isAbs(toPosix(file)) ? [posix.normalize(toPosix(file))] : dirs.map((d) => posix.join(d, toPosix(file))))) consider(abs); // (candidates are words: relative ones are looked up in every directory)
+    return { texts, unknown };
+  }
+  const e = rec.candidate ? toPosix(rec.file) : expandRefs(rec.file, ctx);
+  if (/[$`]/.test(e)) return { texts, unknown: true };
+  for (const abs of new Set(isAbs(e) ? [posix.normalize(e)] : dirs.map((d) => posix.join(d, e)))) consider(abs);
+  return { texts, unknown };
+}
+
+// Why: a sourced file (and BASH_ENV / ENV, which the shell reads before the script it runs) assigns variables and cds in the shell that goes on: what it sets is
+// what the rest of the line sees. Known values are recorded; one that cannot be worked out is unknown (a script it picks is refused), and a file that cannot
+// be followed at all makes every name unknown from here on. Its cds join the directories the line may be in.
+function absorbSourced(rec, dirs, ctx) {
+  const { texts, unknown } = sourcedTexts(rec, dirs, ctx);
+  // (a file that can set any name: every name the line has set so far may have been changed, and any other may be set; a script they pick is refused. The values
+  // stay for the paths a writer builds, which is what they were before the file ran)
+  const poison = () => { ctx.unknownAll = true; for (const k of Object.keys(ctx.vars)) ctx.pickUnknown.add(k); };
+  if (unknown) poison();
+  const merged = new Map();
+  for (const t of texts) {
+    const eff = sourcedEffects(t, ctx);
+    if (eff.all) poison();
+    for (const [k, v] of eff.vars) merged.set(k, merged.has(k) && merged.get(k) !== v ? null : v); // (the file may be one of several: a name they set differently is unknown)
+    for (const t2 of eff.cds) {
+      const e = expandRefs(t2, ctx);
+      for (const d of [...dirs]) {
+        const nd = isAbs(e) ? posix.normalize(e) : posix.join(d, e);
+        if (dirs.includes(nd)) continue;
+        if (dirs.length < 32) dirs.push(nd); else ctx.dynamic = true;
+      }
+    }
+  }
+  for (const [k, v] of merged) {
+    ctx.srcTouched.add(k);
+    if (v === null) { delete ctx.vars[k]; delete ctx.keptVars?.[k]; ctx.unknownVars.add(k); continue; }
+    ctx.unknownVars.delete(k);
+    ctx.vars[k] = expandHomeRefs(substVars(toPosix(v).replace(USER_RE, ctx.user), ctx.vars, ctx.budget), ctx.homePosix);
+    if (ctx.keptVars) ctx.keptVars[k] = ctx.vars[k];
+  }
+}
+
 // ---- Bash --------------------------------------------------------------------------------------------
 
 export const evaluateBashForFiles = failClosed(evaluateBashForFilesUnchecked);
@@ -1369,6 +1484,10 @@ function evaluateBashForFilesFrame(command, opts) {
   if (setsSeamForPipeline(cmds)) return deny('the command sets a pipeline test seam (PIPELINE_GH, PIPELINE_CODEX, PIPELINE_VERCEL, PIPELINE_TEST_MODE, PIPELINE_UPDATE_REMOTE) for the pipeline CLI; a fake gh/codex/vercel could satisfy the merge gate, and a foreign update remote would install foreign code, so only the owner does that, from a terminal');
   ctx.vars = collectVars(cmds, ctx);
   if (opts._vars) { ctx.vars = { ...opts._vars, ...ctx.vars }; ctx.keptVars = { ...(opts._keptVars ?? {}), ...ctx.keptVars }; } // variables the line set before the shell that runs this file started
+  for (const k of opts._unknown ?? []) ctx.unknownVars.add(k);
+  ctx.pickUnknown = new Set(opts._pickUnknown ?? []);
+  ctx.srcTouched = new Set(); // names a sourced file set on this line (a later plain assignment of one is the value again)
+  ctx.unknownAll = opts._unknownAll === true;
   // a name held in a variable (N=PIPELINE_ADMIN; env $N=1 claude)
   if (Object.keys(ctx.vars).length && setsAdmin(substVars(flat, ctx.vars, ctx.budget), ctx.platform)) return deny('the command sets PIPELINE_ADMIN through a variable; only the owner may set it, when launching Claude Code');
   const dirs = collectDirs(cmds, ctx);
@@ -1412,7 +1531,7 @@ function evaluateBashForFilesFrame(command, opts) {
 
   // The variables this line assigns (its commands' prefixes included) are in the environment of the shells it starts: the startup files and
   // scripts they run are judged with them (a name like `. "$F"` in the file is then the file F names, not an unknown).
-  const withLineVars = (o) => ({ ...o, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) } });
+  const withLineVars = (o) => ({ ...o, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set(ctx.unknownVars), _pickUnknown: new Set(ctx.pickUnknown), _unknownAll: ctx.unknownAll });
 
   // A startup file is judged once per evaluation. It is marked first: a startup file that starts shells itself would be judged again and
   // again otherwise (a denial ends the whole evaluation, so marking before the verdict is safe).
@@ -1462,6 +1581,9 @@ function evaluateBashForFilesFrame(command, opts) {
   if ((opts._depth ?? 0) < 4) {
     for (const [idx, c] of cmds.entries()) {
       frame.i = idx;
+      if (!c.argv.length && (ctx.unknownVars.size || ctx.pickUnknown.size || ctx.srcTouched.size) && c.sep !== '&&' && c.sep !== '||' && c.depth === 0 && !inFlow(flowStart(cmds), idx)) {
+        for (const k of Object.keys(c.env ?? {})) if ((ctx.unknownVars.has(k) || ctx.pickUnknown.has(k) || ctx.srcTouched.has(k)) && !/[$`]/.test(c.env[k])) { ctx.unknownVars.delete(k); ctx.pickUnknown.delete(k); ctx.vars[k] = expandRefs(c.env[k], ctx); }
+      }
       const sf = scriptFileOf(c.argv, c.raw, raw);
       const withPath = (rec) => { if (rec.words?.some(isEqualsWord)) rec.pathValues = pathValuesOf(c, cmds, { env: startupEnv, inherited: inheritedStartup }); return rec; }; // (zsh `=tool`: the PATH directories to look in)
       if (sf) withPath(sf);
@@ -1470,6 +1592,7 @@ function evaluateBashForFilesFrame(command, opts) {
       for (const st of startupFilesOf(c, cmds, { env: startupEnv, inherited: inheritedStartup, exec: sf?.kind === 'exec' })) {
         const v = judgeStartupFile(st);
         if (v) return v;
+        if (!st.implicit) absorbSourced(st, dirs, ctx); // (the shell that runs the script read it first: its cds and variables are the script's)
       }
       if (sf) {
         // (a program run by path is judged with the command that runs it: its shebang may name a shell, which reads startup files of its own)
@@ -1482,6 +1605,7 @@ function evaluateBashForFilesFrame(command, opts) {
           ctx.execCmd = outer;
         }
         if (v) return v;
+        if (sf.kind === 'shell' && ['source', '.'].includes(baseOf(c.argv[0] ?? ''))) absorbSourced(sf, dirs, ctx); // (a sourced file runs in this shell: what it sets is the line's from here)
       }
       // script text that reaches a shell without being named (`bash < f.sh`, `cat f.sh | bash`, `eval "$(cat f.sh)"`): its files are judged like `bash f.sh`
       for (const fd of scriptFeedsOf(c, raw, (w) => expandRefs(w, ctx))) {
@@ -1510,6 +1634,16 @@ function evaluateBashForFilesFrame(command, opts) {
   if (tooMany) ctx.dynamic = true;
   const insideRoot = dirs.some((d) => ctx.hit(d) || ctx.hitAncestor(d)); // cwd or a `cd` target is a protected dir (or its parent): relative words and bare commands reach it
   const protectedInRaw = m.rawHit(scanRaw, dirs);
+
+  // a path built from a name whose value is only known at run time (typeset -L4 D=...) may be anywhere: a writer or a redirection that uses it is refused
+  if (ctx.unknownVars.size) {
+    const refs = (w) => [...String(w).matchAll(/\$\{?(\w+)/g)].some((x) => ctx.unknownVars.has(x[1]));
+    for (const c of cmds) {
+      if ((c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && refs(r.target ?? '')) || (c.argv.length && !isReadOnly(c, ctx) && (c.argv.some(refs) || Object.values(c.env ?? {}).some(refs)))) {
+        return deny('the command writes through a variable whose value is only known at run time (a width or integer attribute, a sourced file or a run-time value), so the file it reaches cannot be checked; write the path out');
+      }
+    }
+  }
 
   // Output redirections write wherever they point, whatever the command: resolve every target (against the cwd and
   // every cd target, with ~ and variables expanded) and deny on a protected one. A symlink already pointing into

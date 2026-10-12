@@ -955,8 +955,24 @@ const opaqueFile = (w, globs) => (globs ? hasExpansion(w) : /[$`]/.test(w)) || B
 // parser cut the producer at, or too many files, is unresolvable (the caller must refuse). `line` is the whole line `cmd` came from.
 // `resolve` (optional): the caller's value for a word that holds `$` (the variables the line has set: `F=x/y; ... $F/s.sh`); a word it
 // returns without `$` / backtick / whitespace is that one file name and is decided on as such, anything else stays as written.
+// Why: a command whose name is a variable (`$PSQL $DB < q.sql`) may be a shell reading its script from stdin; when the caller knows the value and it is one of
+// these programs, the file is data for it. Not a shell, an interpreter or a wrapper that starts one (env, sudo, xargs ...): an unknown name stays a possible shell.
+const DATA_PROGRAMS = new Set(['psql', 'mysql', 'mariadb', 'sqlite3', 'pg_restore', 'jq', 'yq', 'grep', 'egrep', 'fgrep', 'rg', 'wc', 'sort', 'uniq', 'cut', 'tr', 'head', 'tail', 'cat', 'less', 'more', 'diff', 'cmp', 'column', 'md5sum', 'shasum', 'sha256sum', 'cksum', 'xxd', 'od', 'base64', 'nl', 'fold', 'paste', 'comm']);
+export function isDataProgram(value) {
+  if (typeof value !== 'string' || /[$`;&|<>()\\"'\n]/.test(value)) return false;
+  const first = value.trim().split(/\s+/)[0] ?? '';
+  return (!first.includes('/') || first.startsWith('/')) && DATA_PROGRAMS.has(base(first));
+}
+function mergeFeeds(a, b) {
+  const out = { ...a, unordered: a.unordered || b.unordered, interp: a.interp || b.interp };
+  for (const k of ['files', 'groups', 'computed', 'raws', 'pat', 'unq', 'ops']) out[k] = [...(a[k] ?? []), ...(b[k] ?? [])];
+  return out;
+}
+
 export function scriptFeedsOf(cmd, line = cmd?.raw, resolve = null) {
-  const raw0 = cmd?.feeds;
+  let raw0 = cmd?.feeds;
+  // (the stdin of a command named by a variable: left out when the name is known to be a data program)
+  if (cmd?.headStdin && !(typeof resolve === 'function' && isDataProgram(resolve(cmd.argv?.[0] ?? '')))) raw0 = raw0 ? mergeFeeds(raw0, cmd.headStdin) : cmd.headStdin;
   if (!raw0) return [];
   const R = (w) => {
     if (typeof resolve !== 'function' || !w.includes('$')) return w;
@@ -1064,6 +1080,30 @@ function qualifierCodes(t) {
 // BASH_ENV and ENV (bash as sh, `--posix`), and an option that expands (`zsh $X -c`) could be -l or -i, so all zsh files count.
 const NO_STARTUP = new Set(['fish', 'csh', 'tcsh']);
 const VAR_DECLS = new Set(['export', 'declare', 'typeset', 'local', 'readonly']);
+
+// Why: `declare` / `typeset` / `local` attributes change the value a name holds: -l / -u lower / upper case it, zsh -L / -R / -Z pad or cut it to a width, -i
+// evaluates it as arithmetic, -n makes it a reference. `transform`: 'lower' | 'upper' (applied to an assigned value); `unknown`: a value that cannot be
+// worked out from the text. `bare`: names declared without a value (the attribute then applies to every later assignment, and to the current value).
+export function declAttrs(argv) {
+  const out = { transform: null, unknown: false, assigns: [], bare: [] };
+  let lower = false;
+  let upper = false;
+  let ended = false;
+  for (const a of argv.slice(1)) {
+    if (!ended && a === '--') { ended = true; continue; }
+    if (!ended && /^[-+][A-Za-z0-9]+$/.test(a)) {
+      if (a[0] === '-') for (const ch of a.slice(1)) { if (ch === 'l') lower = true; else if (ch === 'u') upper = true; else if ('LRZin'.includes(ch)) out.unknown = true; }
+      continue;
+    }
+    const m = /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/.exec(a);
+    if (m) out.assigns.push([m[1], m[2]]);
+    else if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(a)) out.bare.push(a);
+  }
+  if (lower && upper) out.unknown = true;
+  else out.transform = lower ? 'lower' : upper ? 'upper' : null;
+  return out;
+}
+export const applyTransform = (value, transform) => (transform === 'lower' ? String(value).toLowerCase() : transform === 'upper' ? String(value).toUpperCase() : value);
 
 // The options before the operand: login / interactive flags (zsh), `unknown` when one expands, and the rc files bash is given.
 function startupOptions(argv, lit = new Set()) {
@@ -1852,7 +1892,10 @@ class Parser {
         st.computed.push(...st.files);
         st.files.length = 0;
         st.groups.length = 0;
-        addFeeds(cmd, st);
+        // Why: kept apart from the other feeds so a caller that knows the command name is a data program (`$PSQL < q.sql`) can leave it out (scriptFeedsOf)
+        const held = {};
+        addFeeds(held, st);
+        if (held.feeds) Object.defineProperty(cmd, 'headStdin', { value: held.feeds, enumerable: false });
       } finally { this.cmd = saved; }
       // `$(cat f.sh)` as the command: the shell runs whatever the substitution prints
       const m = seg.meta.get(a[0]);

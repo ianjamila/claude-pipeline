@@ -313,3 +313,96 @@ test('S2: the joined program text of an interpreter is judged as program text, n
   assert.equal(files('cat p1.js p2.js | node', fakeFs(PROJ, fl, DIRS)).decision, 'deny');
   assert.equal(files('cat p2.js p1.js | node', fakeFs(PROJ, fl, DIRS)).decision, 'allow');
 });
+
+// ---- S3: variables ---------------------------------------------------------------------------------------------------------
+// Why (PR A2, batch S3): the value a variable holds at run time differs from the text assigned to it, or comes from a file the line runs.
+//   1. Attributes transform the value: `declare -l` / `-u` lower / upper case it; zsh `typeset -L4` / `-R4` / `-Z4` pad or cut it to a width; `-i` evaluates it as arithmetic.
+//      The attribute may come before the assignment (`declare -l B; B=MAIN`).
+//   2. `local` outside a function fails in bash: the variable keeps the value it had.
+//   3. A sourced file (and a startup file that runs before a script) sets variables and cds that the rest of the line sees.
+//   4. A command name that is a known data program (`$PSQL < q.sql`) does not read its stdin as a script.
+
+test('S3: a width or integer attribute makes the value unknown (git-policy)', () => {
+  const fs = fakeFs(GIT_ROOT, {}, DIRS);
+  for (const c of [
+    'typeset -L4 B=mainxx; git push origin $B', 'typeset -R4 B=xxmain; git push origin $B', 'typeset -Z4 B=mainx; git push origin $B', 'declare -L4 B=mainxx; git push origin $B',
+    'typeset -L B; B=mainxx; git push origin $B', 'B=agent/x; typeset -L4 B; git push origin $B', 'typeset -i B=main; git push origin $B', 'typeset -L4 B=mainxx; echo x | xargs git push origin $B',
+    'declare -l B; B=agent/x; git push origin $B', 'B=agent/x; declare -u B; git push origin $B',
+  ]) assert.equal(git(c, fs).decision, 'deny', c);
+  // not on the way to a command that runs something
+  for (const c of ['typeset -L4 N=abcdef; echo $N', 'declare -x B=agent/x; git push origin $B', 'declare -l B=AGENT/X; git push origin $B', 'declare -u B=agent/x; git push origin $B', 'typeset -r B=agent/x; git push origin $B']) {
+    assert.equal(git(c, fs).decision, 'allow', c);
+  }
+});
+
+test('S3: declare -l / -u transform the value, before or after the assignment (files-policy)', () => {
+  const fs = fakeFs(PROJ, { 'ok.sh': 'echo hi' }, DIRS);
+  for (const c of [
+    'declare -l D=$HOME/.CLAUDE; echo x > $D/settings.json', 'typeset -l D=$HOME/.CLAUDE; echo x > $D/settings.json', 'declare -l D; D=$HOME/.CLAUDE; echo x > $D/settings.json',
+    'D=$HOME/.CLAUDE; declare -l D; echo x > $D/settings.json',
+    'typeset -L40 D=$HOME/.claude; echo x > $D/settings.json', 'typeset -L4 D=/home/u/.claude; echo x > $D/settings.json',
+  ]) assert.equal(files(c, fs).decision, 'deny', c);
+  for (const c of ['declare -l D=$HOME/.CLAUDEX; echo x > $D/a.txt', 'declare -l N=ABC; echo $N > a.txt', 'typeset -L4 N=abcdef; echo $N']) assert.equal(files(c, fs).decision, 'allow', c);
+});
+
+test('S3: local outside a function does not take effect, so the variable is unknown (git-policy)', () => {
+  // the script is judged at level 1; B may come from the environment of the shell that runs it
+  const fs = fakeFs(GIT_ROOT, { 's.sh': 'local B=agent/x; git push origin $B', 'ok.sh': 'echo hi' }, DIRS);
+  assert.equal(git('bash s.sh', fs).decision, 'deny');
+  assert.equal(git('B=main; bash s.sh', fs).decision, 'deny');
+  assert.equal(git('local B=agent/x; git push origin $B', fs).decision, 'deny');
+  // what it sets is only unknown where it reaches a command that runs something
+  assert.equal(git('local N=3; echo $N', fs).decision, 'allow');
+});
+
+test('S3: arithmetic runs the command substitutions inside it', () => {
+  for (const c of [
+    'echo $((1 + $(bash f.sh)))', 'echo $(( $(cat f.sh) ))', '(( x = $(bash f.sh) ))', 'let x=$(bash f.sh)', 'echo ${a[$(bash f.sh)]}', 'a[$(bash f.sh)]=1', 'echo $[ 1 + $(bash f.sh) ]',
+    'echo $(( 1 + ${a[$(bash f.sh)]} ))', 'for ((i = $(bash f.sh); i < 3; i++)); do :; done', '[[ $(bash f.sh) -gt 1 ]]', 'echo $((`bash f.sh`))',
+  ]) denyBoth(c, SPEC);
+  for (const c of ['echo $((1 + $(bash x.sh)))', 'echo $(( $(cat x.sh) ))', '(( x = $(bash x.sh) ))', 'let x=$(bash ok.sh)', 'echo ${a[$(bash x.sh)]}', 'echo $((1 + 2))']) allowBoth(c, SPEC);
+});
+
+test('S3: variables a sourced file sets are known (or unknown) for the rest of the line (files-policy)', () => {
+  const fs = fakeFs(PROJ, { 'set.sh': 'F=evil.sh', 'evil.sh': BAD_FILES, 'ok.sh': 'echo ok', 'okset.sh': 'F=ok.sh', 'cond.sh': 'true && F=ok.sh', 'dyn.sh': 'F=$(pick)', 'ev.sh': 'eval "$X"', 'rd.sh': 'read F' }, DIRS);
+  for (const c of [
+    'F=ok.sh; source set.sh; bash $F', 'F=ok.sh; . ./set.sh; bash "$F"', 'F=ok.sh; source s*.sh; bash $F', 'source set.sh; bash $F', 'F=ok.sh; source set.sh && bash ${F}',
+    // a file we cannot model: any variable may be set, so one that picks the script is refused
+    'F=ok.sh; source cond.sh; bash $F', 'F=ok.sh; source dyn.sh; bash $F', 'F=ok.sh; source ev.sh; bash $F', 'F=ok.sh; source rd.sh; bash $F', 'F=ok.sh; source $Z; bash $F',
+    'echo F=evil.sh > w.sh; F=ok.sh; source w.sh; bash $F',
+  ]) assert.equal(files(c, fs).decision, 'deny', c);
+  for (const c of [
+    'F=evil.sh; source okset.sh; bash $F', 'source okset.sh; bash $F', 'source missing.sh; bash ok.sh', 'source cond.sh; echo hi', 'F=ok.sh; source set.sh; F=ok.sh; bash $F',
+  ]) assert.equal(files(c, fs).decision, 'allow', c);
+});
+
+test('S3: a sourced or startup file that cds carries the directory to what follows (files-policy)', () => {
+  const fs = fakeFs(PROJ, { 'rc.sh': 'cd ~/.claude', 'rc2.sh': 'cd sub', 'run.sh': 'echo x > settings.json', 'run2.sh': 'echo hi > a.txt', 'sub/t.sh': 'echo hi' }, DIRS);
+  for (const c of [
+    '. ./rc.sh; echo x > settings.json', 'source rc.sh && echo x > settings.json', 'BASH_ENV=rc.sh bash run.sh', 'export BASH_ENV=rc.sh; bash run.sh',
+  ]) assert.equal(files(c, fs).decision, 'deny', c);
+  for (const c of ['. ./rc2.sh; echo x > settings.json', 'BASH_ENV=rc2.sh bash run2.sh', 'source rc2.sh; bash t.sh']) assert.equal(files(c, fs).decision, 'allow', c);
+});
+
+test('S3: variables an explicit startup file exports reach the script judged next (git-policy)', () => {
+  const g = (rc) => fakeFs(GIT_ROOT, { 'rc.sh': rc, 's.sh': 'bash $F', 'f.sh': BAD_GIT, 'ok.sh': 'echo ok' }, DIRS);
+  assert.equal(git('BASH_ENV=rc.sh bash s.sh', g('export F=f.sh')).decision, 'deny');
+  assert.equal(git('BASH_ENV=rc.sh bash s.sh', g('F=f.sh')).decision, 'deny');
+  assert.equal(git('F=ok.sh BASH_ENV=rc.sh bash s.sh', g('export F=f.sh')).decision, 'deny');
+  assert.equal(git('export BASH_ENV=rc.sh; bash s.sh', g('export F=f.sh')).decision, 'deny');
+  assert.equal(git('BASH_ENV=rc.sh bash s.sh', g('export F=ok.sh')).decision, 'allow');
+  // only the shell that reads the startup file sees what it sets
+  assert.equal(git('BASH_ENV=rc.sh bash ok.sh; bash $F', g('export F=f.sh')).decision, 'allow');
+});
+
+test('S3: a known data program fed a file is not a shell reading a script', () => {
+  const sql = '-- push to main, then merge and git push origin main';
+  for (const c of [
+    'Q=psql; $Q < q.sql', 'PSQL="psql -h localhost"; $PSQL $DB -q < q.sql', 'PSQL=/opt/homebrew/opt/libpq/bin/psql; $PSQL $DB -v ON_ERROR_STOP=1 -q < q.sql', 'Q=jq; cat q.sql | $Q .', 'Q=sqlite3; $Q db.sqlite < q.sql',
+  ]) {
+    assert.equal(git(c, fakeFs(GIT_ROOT, { 'q.sql': sql }, DIRS)).decision, 'allow', c);
+    assert.equal(files(c, fakeFs(PROJ, { 'q.sql': '-- ' + BAD_FILES }, DIRS)).decision, 'allow', c);
+  }
+  // unknown, a shell or a wrapper that may start one: still a script feed
+  for (const c of ['$Q < f.sh', 'Q=bash; $Q < f.sh', 'Q="sh -x"; $Q < f.sh', 'Q="env bash"; $Q < f.sh', 'Q=$(pick); $Q < f.sh', 'Q="psql; bash"; $Q < f.sh', 'Q=./psql; $Q < f.sh']) denyBoth(c, SPEC);
+});
