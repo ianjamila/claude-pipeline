@@ -411,3 +411,19 @@ test('S3: a known data program fed a file is not a shell reading a script', () =
   // unknown, a shell or a wrapper that may start one: still a script feed
   for (const c of ['$Q < f.sh', 'Q=bash; $Q < f.sh', 'Q="sh -x"; $Q < f.sh', 'Q="env bash"; $Q < f.sh', 'Q=$(pick); $Q < f.sh', 'Q="psql; bash"; $Q < f.sh', 'Q=./psql; $Q < f.sh']) denyBoth(c, SPEC);
 });
+
+// ---- S4 D: a name an unfollowable sourced file may have changed is unknown for write targets too -----------------------------
+
+test('S4: a write through a name a sourced file may have changed is refused when the rest of the path is a protected one (files-policy)', () => {
+  const fs = fakeFs(PROJ, { 'dyn.sh': 'F=$(pick)', 'ev.sh': 'eval "$X"', 'ok.sh': 'echo ok' }, DIRS);
+  for (const c of [
+    'D=/tmp; source $X; echo x > $D/settings.json', 'D=/tmp; source $X; cp ok.sh $D/settings.json', 'D=/tmp; source ev.sh; echo x > ${D}/settings.json', 'D=/tmp; source $X; tee $D/pipeline/hooks/x < ok.sh',
+    'D=/tmp; source $X; echo x >> "$D/skills/ship/SKILL.md"', 'D=/tmp; . $X; echo x > $D/.claude/settings.json', 'source $X; echo x > $D/settings.json', 'F=a; source dyn.sh; echo x > $F/settings.json',
+    'D=/tmp; source $X; sed -i s/a/b/ $D/agents/judge.md', 'D=/tmp; source $X; mv ok.sh $D/../settings.json',
+  ]) assert.equal(files(c, fs).decision, 'deny', c);
+  // (PATH-only uses, readers, other targets, and a value the line sets again after the source are not writes to a protected path)
+  for (const c of [
+    'D=/tmp; source $X; export PATH=$D:$PATH', 'D=/tmp; source $X; echo x > $D/a.txt', 'D=/tmp; source $X; cat $D/settings.json', 'D=/tmp; source $X; mkdir -p $D/build', 'D=/tmp; source $X; D=/tmp; echo x > $D/settings.json',
+    'D=/tmp; source $X; cp ok.sh $D/src/settings.jsonl', 'source dyn.sh; cp ok.sh $F.bak',
+  ]) assert.equal(files(c, fs).decision, 'allow', c);
+});

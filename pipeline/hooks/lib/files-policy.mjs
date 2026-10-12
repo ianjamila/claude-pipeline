@@ -47,6 +47,15 @@ const PROTECTED_REL = [
 // non-read-only command a word that IS one of these (exactly, not a child) counts as a protected reference.
 const ANCESTOR_REL = ['.claude', '.claude/skills', '.claude/agents'];
 
+// Is the text after an unknown directory prefix (`$D/settings.json`) a protected file, or inside a protected directory, or one of the directories that hold them?
+function tailIsProtected(tail, ci) {
+  let t = String(tail).replace(/^\/+/, '').replace(/^(?:\.\.?\/+)+/, '');
+  if (ci) t = t.toLowerCase();
+  const names = [...PROTECTED_REL, ...PROTECTED_REL.map((r) => r.replace(/^\.claude\//, ''))].map((r) => (ci ? r.toLowerCase() : r));
+  const dirs = [...ANCESTOR_REL, ...ANCESTOR_REL.map((r) => r.replace(/^\.claude\/?/, '')).filter(Boolean)].map((r) => (ci ? r.toLowerCase() : r));
+  return names.some((n) => t === n || t.startsWith(n + '/')) || dirs.includes(t);
+}
+
 const DEVICE_PREFIX = /^\/\/[?.]\/(?=[A-Za-z]:\/)/; // \\?\C:\ and \\.\C:\ forms
 
 const isAbs = (s) => s.startsWith('/') || /^[A-Za-z]:\//.test(s);
@@ -1643,6 +1652,24 @@ function evaluateBashForFilesFrame(command, opts) {
     for (const c of cmds) {
       if ((c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && refs(r.target ?? '')) || (c.argv.length && !['export', 'declare', 'typeset', 'local', 'readonly'].includes(baseOf(c.argv[0])) && !isReadOnly(c, ctx) && (c.argv.some(refs) || Object.values(c.env ?? {}).some(refs)))) {
         return deny('the command writes through a variable whose value is only known at run time (a width or integer attribute), so the file it reaches cannot be checked; write the path out');
+      }
+    }
+  }
+
+  // Why: a name an unfollowable sourced file may have changed (`D=/tmp; source $X; echo x > $D/settings.json`) may hold ~/.claude by now, so a writer or redirection
+  // whose path ends in a protected one after it is refused (a PATH-only use, a reader or any other tail is not: the replay blocked ~/.zprofile with a blanket rule)
+  if (ctx.pickUnknown.size || ctx.unknownAll) {
+    const maybeChanged = (n) => ctx.pickUnknown.has(n) || (ctx.unknownAll && !Object.hasOwn(ctx.vars, n));
+    const reaches = (w) => {
+      const parts = String(w).split(/\$\{?(\w+)\}?/); // [text, name, text, name, ...]
+      const tails = [];
+      for (let k = 1; k < parts.length; k += 2) if (maybeChanged(parts[k])) tails.push(parts.slice(k + 1).filter((_, j) => j % 2 === 0).join('')); // (the text after it, the names between dropped)
+      return tails.some((t) => tailIsProtected(t, ctx.ci));
+    };
+    for (const c of cmds) {
+      const writes = !isReadOnly(c, ctx) && !['export', 'declare', 'typeset', 'local', 'readonly'].includes(baseOf(c.argv[0] ?? ''));
+      if ((c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && reaches(r.target ?? '')) || (c.argv.length && writes && (c.argv.some(reaches) || Object.values(c.env ?? {}).some(reaches)))) {
+        return deny('the command writes through a variable that a sourced file may have changed, and the path ends in a protected pipeline file or directory, so the file it reaches cannot be checked; write the path out');
       }
     }
   }
