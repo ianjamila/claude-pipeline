@@ -706,3 +706,13 @@ test('L1: a worktree / clone / extract into a relative directory whose place is 
   assert.equal(gitOnly(unknownDir('git clone https://x/y.git sub\\\\..\\\\x; MID; bash /work/repo/ok.sh')(null, MID_GIT)), 'deny');
   assert.equal(gitOnly(unknownDir('git clone https://x/y.git $D; MID; bash /work/repo/ok.sh')(null, MID_GIT)), 'deny');
 });
+
+test('L1: an archive extracted into a relative directory of unknown place still reaches every script (members can escape the directory)', () => {
+  // Why: only a worktree add / clone is known to stay inside its directory; tar -P / absolute or `../` members and symlink members write elsewhere
+  const unknownDir = (tail, mid) => `cd /work/repo && git worktree list | head -3 && ${tail.replace('MID', mid)}`;
+  const gitOnly = (l) => run(l, SPEC).git.r.decision;
+  for (const tail of ['tar -xf a.tar -C sub; MID; bash /work/repo/ok.sh', 'tar -xzf a.tgz -C sub; MID; bash /work/repo/ok.sh', 'unzip a.zip -d sub; MID; bash /work/repo/ok.sh', 'bsdtar -xf a.tar -C sub; MID; bash /work/repo/src/ok.sh']) {
+    assert.equal(gitOnly(unknownDir(tail, MID_GIT)), 'deny', tail);
+  }
+  assert.equal(gitOnly(unknownDir('git clone https://x/y.git sub; MID; bash /work/repo/ok.sh', MID_GIT)), 'allow'); // (the narrowing stays for a clone)
+});
