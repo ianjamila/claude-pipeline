@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { symlinkSync, rmSync, cpSync, writeFileSync, mkdtempSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { randomBytes } from 'node:crypto';
 import {
   git, GitError, mergeBase, headSha, currentBranch, isClean, revParse, diffFiles, showFile, grepAtRef,
   commitTime, contentHash, treeFingerprint,
@@ -530,6 +531,133 @@ test('diffFiles still returns lines for files git would call binary (NUL byte, -
     assert.match(by[p].added[0].text, /^it\.skip\("drops", \(\) => \{\}\);/, p);
   }
   assert.ok(by['src/y.test.js'].added[0].text.includes('\0'));
+});
+
+// ---- large binary documents are named, not dumped ---------------------------------------------------------------
+// `diffFiles` reads with --text, which prints every byte of a binary file; a PR deleting a few hundred MB of spreadsheets
+// used to overflow proc.run's buffer (ENOBUFS) and take every check built on the diff down with it.
+
+// Deterministic "binary" content of about `bytes`: NUL-bearing rows, so git calls it binary but --text still parses.
+const binaryish = (bytes, tag = '') => Buffer.from(Array.from({ length: Math.ceil(bytes / 24) }, (_, i) => `${tag}row ${String(i).padStart(6, '0')}\0 cell\n`).join(''));
+const LOW = 100 * 1024; // lowered threshold for tests (the real one is LARGE_BINARY_BYTES)
+
+test('diffFiles: a deleted large binary document comes back path-only, flagged, in git\'s order, and is never dumped as text', () => {
+  const { repo, o } = baseRepo();
+  repo.write('data/report.xlsx', binaryish(300 * 1024));
+  repo.commit('add sheet');
+  repo.branch('feat');
+  repo.rm('data/report.xlsx');
+  repo.write('src/a.js', 'one\nTWO\nthree\n');
+  repo.write('zeta/z.js', 'z\n');
+  repo.commit('delete sheet, edit code');
+
+  const files = diffFiles('main', 'feat', { ...o, largeBinaryBytes: LOW });
+  assert.deepEqual(files.map((f) => f.path), ['data/report.xlsx', 'src/a.js', 'zeta/z.js']);
+  assert.deepEqual(files[0], {
+    oldPath: 'data/report.xlsx', newPath: null, path: 'data/report.xlsx', status: 'D', similarity: null,
+    binary: true, added: [], removed: [], skippedLargeBinary: true,
+  });
+  assert.deepEqual(files[1].removed, [{ line: 2, text: 'two' }]); // the rest of the diff is untouched
+  assert.equal(Object.hasOwn(files[1], 'skippedLargeBinary'), false);
+
+  // the threshold is a size test on the larger blob: the same file under a higher threshold is diffed as text, as before
+  const asText = diffFiles('main', 'feat', { ...o, largeBinaryBytes: 1024 * 1024 }).find((f) => f.path === 'data/report.xlsx');
+  assert.equal(asText.binary, false);
+  assert.ok(asText.removed.length > 1000);
+  assert.equal(Object.hasOwn(asText, 'skippedLargeBinary'), false);
+});
+
+test('diffFiles: deleting binary documents bigger than the process buffer does not overflow it (no ENOBUFS)', () => {
+  const { repo, o } = baseRepo();
+  // 70 MiB > proc.run's 64 MiB buffer; random bytes so git cannot store them small, and the real default threshold applies.
+  repo.write('exports/huge.xlsx', randomBytes(70 * 1024 * 1024));
+  repo.commit('add huge sheet');
+  repo.branch('feat');
+  repo.rm('exports/huge.xlsx');
+  repo.write('src/a.js', 'one\nTWO\nthree\n');
+  repo.commit('delete it');
+
+  const by = Object.fromEntries(diffFiles('main', 'feat', o).map((f) => [f.path, f]));
+  assert.equal(by['exports/huge.xlsx'].status, 'D');
+  assert.equal(by['exports/huge.xlsx'].skippedLargeBinary, true);
+  assert.deepEqual(by['src/a.js'].added, [{ line: 2, text: 'TWO' }]);
+});
+
+test('diffFiles: a small binary document is still diffed with --text, exactly as before', () => {
+  const { repo, o } = baseRepo();
+  repo.write('data/small.xlsx', 'PK\x03\x04 sheet\nrow 2\0 cell\n');
+  repo.commit('add small sheet');
+  repo.branch('feat');
+  repo.write('data/small.xlsx', 'PK\x03\x04 sheet\nrow 2\0 CELL\n');
+  repo.commit('edit it');
+
+  const [f] = diffFiles('main', 'feat', o);
+  assert.equal(f.path, 'data/small.xlsx');
+  assert.equal(f.binary, false);
+  assert.equal(Object.hasOwn(f, 'skippedLargeBinary'), false);
+  assert.deepEqual(f.removed, [{ line: 2, text: 'row 2\0 cell' }]);
+  assert.deepEqual(f.added, [{ line: 2, text: 'row 2\0 CELL' }]);
+});
+
+test('diffFiles: a big source file with a NUL byte is still read as text (only listed document formats are skipped)', () => {
+  const { repo, o } = baseRepo();
+  const rows = (n) => Array.from({ length: n }, (_, i) => `it("case ${i}", () => {});\n`).join('');
+  repo.write('src/big.test.ts', `// note:\0 nul\n${rows(400)}`);
+  repo.commit('big test with a NUL');
+  repo.branch('feat');
+  repo.write('src/big.test.ts', `// note:\0 nul\n${rows(400)}it.skip("drops", () => {});\n`);
+  repo.write('src/new-big.test.ts', `\0\n${rows(400)}it.only("focus", () => {});\n`);
+  repo.commit('skip one, add another');
+
+  // preconditions: git calls both binary, and both are over the (lowered) threshold, so only the extension saves them
+  assert.match(repo.git(['diff', '--numstat', 'main..feat']), /^-\t-\tsrc\/big\.test\.ts$/m);
+  assert.ok(Buffer.byteLength(rows(400)) > 4096);
+
+  const by = Object.fromEntries(diffFiles('main', 'feat', { ...o, largeBinaryBytes: 4096 }).map((f) => [f.path, f]));
+  for (const p of ['src/big.test.ts', 'src/new-big.test.ts']) {
+    assert.equal(by[p].binary, false, p);
+    assert.equal(Object.hasOwn(by[p], 'skippedLargeBinary'), false, p);
+  }
+  assert.deepEqual(by['src/big.test.ts'].added, [{ line: 402, text: 'it.skip("drops", () => {});' }]);
+  assert.ok(by['src/new-big.test.ts'].added.some((l) => l.text === 'it.only("focus", () => {});'));
+});
+
+test('diffFiles: a renamed large binary keeps both paths; an identical one is untouched; a rename to an unlisted extension is read as text', () => {
+  const { repo, o } = baseRepo();
+  repo.write('old/report.xlsx', binaryish(300 * 1024, 'a'));
+  repo.write('old/same.pdf', binaryish(300 * 1024, 'b'));
+  repo.write('old/blob.xlsx', binaryish(8 * 1024, 'c'));
+  repo.commit('add binaries');
+  repo.branch('feat');
+  for (const p of ['old/report.xlsx', 'old/same.pdf', 'old/blob.xlsx']) repo.rm(p);
+  repo.write('new/report-2024.xlsx', Buffer.concat([binaryish(300 * 1024, 'a'), Buffer.from('tail\0\n')]));
+  repo.write('new/same.pdf', binaryish(300 * 1024, 'b'));
+  repo.write('new/blob.dat', Buffer.concat([binaryish(8 * 1024, 'c'), Buffer.from('tail\0\n')]));
+  repo.commit('move them');
+
+  const by = Object.fromEntries(diffFiles('main', 'feat', { ...o, largeBinaryBytes: 4096 }).map((f) => [f.path, f]));
+  assert.deepEqual(Object.keys(by).sort(), ['new/blob.dat', 'new/report-2024.xlsx', 'new/same.pdf']);
+
+  const moved = by['new/report-2024.xlsx'];
+  assert.equal(moved.status, 'R');
+  assert.equal(moved.oldPath, 'old/report.xlsx');
+  assert.equal(moved.newPath, 'new/report-2024.xlsx');
+  assert.equal(moved.skippedLargeBinary, true);
+  assert.equal(moved.binary, true);
+  assert.ok(moved.similarity >= 50 && moved.similarity < 100, `similarity ${moved.similarity}`);
+  assert.deepEqual([moved.added, moved.removed], [[], []]);
+
+  // byte-identical move: git prints no content for it, so there is nothing to skip and the entry is what it always was
+  assert.equal(by['new/same.pdf'].status, 'R');
+  assert.equal(by['new/same.pdf'].similarity, 100);
+  assert.equal(by['new/same.pdf'].binary, false);
+  assert.equal(Object.hasOwn(by['new/same.pdf'], 'skippedLargeBinary'), false);
+
+  // one side is not a listed binary format (.dat): the whole change keeps --text
+  assert.equal(by['new/blob.dat'].status, 'R');
+  assert.equal(by['new/blob.dat'].oldPath, 'old/blob.xlsx');
+  assert.equal(Object.hasOwn(by['new/blob.dat'], 'skippedLargeBinary'), false);
+  assert.deepEqual(by['new/blob.dat'].added.map((l) => l.text), ['tail\0']);
 });
 
 test('contentHash and treeFingerprint stay byte-exact for NUL and -diff files, even for invalid UTF-8 bytes', () => {

@@ -106,25 +106,108 @@ export const isClean = (o) => git(['status', '--porcelain=v1', '-uall'], o) === 
 
 export const revParse = (ref, o) => git(['rev-parse', '--verify', assertRef(ref, ['rev-parse', '--verify', ref])], o).trim();
 
+// A binary change is left out of the --text diff (see diffFiles) only when it is BOTH big and in a document/media/archive
+// format from this list. The size alone must not decide: a source file with one NUL byte is "binary" to git too, and
+// skipping it would hide its lines from every check. Matched on the extension (lower case) of every path of the change.
+export const LARGE_BINARY_BYTES = 4 * 1024 * 1024; // the larger blob of the change; diffFiles' option largeBinaryBytes overrides it (tests)
+const BINARY_FORMAT_EXTENSIONS = new Set([
+  'xls', 'xlsx', 'xlsm', 'xlsb', 'ods', 'numbers', 'pdf', 'doc', 'docx', 'ppt', 'pptx',
+  'zip', '7z', 'rar', 'gz', 'tgz', 'bz2', 'xz', 'tar',
+  'png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'bmp', 'tif', 'tiff', 'heic', 'ico',
+  'mp3', 'mp4', 'm4a', 'mov', 'webm', 'wav', 'ogg', 'avi', 'mkv',
+  'woff', 'woff2', 'ttf', 'otf', 'eot',
+  'sqlite', 'sqlite3', 'db', 'mdb', 'accdb', 'parquet',
+]);
+const isBinaryFormat = (p) => {
+  const name = p.slice(p.lastIndexOf('/') + 1);
+  const dot = name.lastIndexOf('.');
+  return dot > 0 && BINARY_FORMAT_EXTENSIONS.has(name.slice(dot + 1).toLowerCase());
+};
+// A change between plain files only: a symlink or submodule entry is never skipped, whatever it is called.
+const PLAIN_MODES = new Set(['000000', '100644', '100755']);
+
+// Which changes of mb..head to keep OUT of the --text diff, plus git's own order of every change (path -> position) so the
+// result can be put back in that order. Asks git, WITHOUT --text, which changes it calls binary (--numstat -z prints "-\t-"
+// for them; a rename is "-\t-\t\0old\0new\0"), then keeps those that are big and in a listed document format. A byte-identical
+// move prints no content either way, so it is never skipped. Blob sizes come from one cat-file call. Anything unclear (a blob
+// git cannot size) leaves the change in the diff: today's behaviour, never a hidden file.
+function largeBinaryChanges(mb, range, head, o) {
+  const numstat = git([
+    ...STABLE_CONFIG, 'diff', '-M', '--numstat', '-z', '--no-color', '--no-ext-diff', '--no-textconv', range,
+  ], o).split('\0');
+  const binary = new Set();
+  for (let i = 0; i < numstat.length; ) {
+    const m = /^(-|\d+)\t(-|\d+)\t([^]*)$/.exec(numstat[i]);
+    if (!m) {
+      if (numstat[i] === '') { i++; continue; }
+      throw new GitError({ args: ['diff', '--numstat', '-z'], code: 0, stderr: `unexpected numstat entry: ${numstat[i]}` });
+    }
+    const renamed = m[3] === '';
+    const key = renamed ? numstat[i + 2] : m[3]; // where the change lives: the new path for a rename
+    if (key === undefined) throw new GitError({ args: ['diff', '--numstat', '-z'], code: 0, stderr: 'truncated numstat' });
+    if (m[1] === '-' && m[2] === '-') binary.add(key);
+    i += renamed ? 3 : 1;
+  }
+  if (binary.size === 0) return { skipped: [], order: new Map() };
+
+  const changes = rawChanges(mb, head, o);
+  const order = new Map(changes.map((c, i) => [c.newPath ?? c.oldPath, i]));
+  const candidates = changes.filter((c) => binary.has(c.newPath ?? c.oldPath)
+    && ['A', 'D', 'M', 'R'].includes(c.status) && PLAIN_MODES.has(c.oldMode) && PLAIN_MODES.has(c.newMode)
+    && c.oldId !== c.newId
+    && [c.oldPath, c.newPath].filter(Boolean).every(isBinaryFormat));
+  if (candidates.length === 0) return { skipped: [], order };
+
+  const ids = [...new Set(candidates.flatMap((c) => [c.oldId, c.newId]).filter((id) => !/^0+$/.test(id)))];
+  const sizes = new Map();
+  for (const line of git(['cat-file', '--batch-check'], { ...o, input: `${ids.join('\n')}\n` }).split('\n')) {
+    const m = /^([0-9a-f]+) blob (\d+)$/.exec(line);
+    if (m) sizes.set(m[1], Number(m[2]));
+  }
+  const limit = o?.largeBinaryBytes ?? LARGE_BINARY_BYTES;
+  const skipped = candidates.filter((c) => Math.max(sizes.get(c.oldId) ?? 0, sizes.get(c.newId) ?? 0) > limit);
+  return { skipped, order };
+}
+
 // What the branch changes relative to where it forked: the diff is taken from the merge-base, not from `base`'s tip,
 // so commits that landed on base after the fork never show up as the branch deleting them.
 // --text: a NUL byte in a comment, or a `*.ts -diff` line in .gitattributes, makes git print "Binary files differ" and
 // no lines at all, which would hide an added `.skip` or a deleted test from every check built on this. --no-textconv /
 // --no-ext-diff: a repo-configured converter or external diff tool must not rewrite what we parse (or run at all).
+// The price of --text is that a binary file is printed byte for byte: a PR deleting a few hundred MB of spreadsheets made a
+// diff bigger than proc.run's buffer (ENOBUFS) and every check built on it crashed. So a change git calls binary whose
+// larger blob is over LARGE_BINARY_BYTES, and whose paths (both, for a rename) all have a listed binary-format extension,
+// is not printed: it comes back path-only, in the shape parseUnifiedDiff gives a binary change plus `skippedLargeBinary:
+// true`. The path rules still see its paths; there are simply no lines to read. Everything else keeps --text however big it
+// is, so a NUL byte in a source file cannot be used to hide it.
 export function diffFiles(base, head, o) {
   const mb = mergeBase(base, head, o);
+  const range = `${mb}..${assertRef(head, ['diff', head])}`;
+  const { skipped, order } = largeBinaryChanges(mb, range, head, o);
+  // Literal, repo-root pathspecs (as in contentHash): a name like "a*.xlsx", or the cwd, cannot change what is excluded.
+  const exclude = skipped.flatMap((c) => [c.oldPath, c.newPath]).filter(Boolean).map((p) => `:(top,exclude,literal)${p}`);
   const text = git([
     ...STABLE_CONFIG, 'diff', '-M', '--unified=0', '--no-color', '--no-ext-diff', '--no-textconv', '--text', '--src-prefix=a/', '--dst-prefix=b/',
-    `${mb}..${assertRef(head, ['diff', head])}`,
+    range, ...(exclude.length > 0 ? ['--', ':/', ...exclude] : []),
   ], o);
-  return parseUnifiedDiff(text);
+  const files = parseUnifiedDiff(text);
+  if (skipped.length === 0) return files;
+  for (const c of skipped) {
+    files.push({
+      oldPath: c.oldPath, newPath: c.newPath, path: c.status === 'D' ? c.oldPath : c.newPath, status: c.status,
+      similarity: c.status === 'R' ? c.score : null, binary: true, added: [], removed: [], skippedLargeBinary: true,
+    });
+  }
+  // Back into git's own order, so adding the entries never moves the others. A finite rank: a path git did not list sorts
+  // last instead of putting NaN into the comparator.
+  const rank = (f) => order.get(f.path) ?? order.size;
+  return files.sort((a, b) => rank(a) - rank(b));
 }
 
-// Tree modes of every change diffFiles reports, from `git diff --raw -z` with the SAME options, base and head: a 100% rename
-// has no `mode` line in the unified diff, so a symlink (120000) or submodule (160000) that merely MOVES is invisible there.
-// -> [{ oldMode, newMode, status, oldPath, newPath }] (a path is null on the side that does not exist).
-export function diffModes(base, head, o) {
-  const mb = mergeBase(base, head, o);
+// One entry per change of `git diff -M --raw -z --no-abbrev` for mb..head, with the SAME options as diffFiles.
+// -> [{ oldMode, newMode, oldId, newId, status, score, oldPath, newPath }] (a path is null on the side that does not exist;
+// score is a rename's similarity, null for the rest).
+function rawChanges(mb, head, o) {
   const text = git([
     ...STABLE_CONFIG, 'diff', '-M', '--raw', '-z', '--no-abbrev', '--no-color', '--no-ext-diff', '--no-textconv',
     `${mb}..${assertRef(head, ['diff', head])}`,
@@ -132,19 +215,30 @@ export function diffModes(base, head, o) {
   const parts = text.split('\0');
   const out = [];
   for (let i = 0; i < parts.length; ) {
-    const m = /^:(\d+) (\d+) [0-9a-f]+ [0-9a-f]+ ([A-Z])\d*$/.exec(parts[i]);
+    const m = /^:(\d+) (\d+) ([0-9a-f]+) ([0-9a-f]+) ([A-Z])(\d*)$/.exec(parts[i]);
     if (!m) {
       if (parts[i] === '') { i++; continue; }
       throw new GitError({ args: ['diff', '--raw', '-z'], code: 0, stderr: `unexpected raw diff entry: ${parts[i]}` });
     }
-    const two = m[3] === 'R' || m[3] === 'C';
+    const two = m[5] === 'R' || m[5] === 'C';
     const first = parts[i + 1];
     const second = two ? parts[i + 2] : first;
     if (first === undefined || second === undefined) throw new GitError({ args: ['diff', '--raw', '-z'], code: 0, stderr: 'truncated raw diff' });
-    out.push({ oldMode: m[1], newMode: m[2], status: m[3], oldPath: m[3] === 'A' ? null : first, newPath: m[3] === 'D' ? null : second });
+    out.push({
+      oldMode: m[1], newMode: m[2], oldId: m[3], newId: m[4], status: m[5], score: m[6] === '' ? null : Number(m[6]),
+      oldPath: m[5] === 'A' ? null : first, newPath: m[5] === 'D' ? null : second,
+    });
     i += two ? 3 : 2;
   }
   return out;
+}
+
+// Tree modes of every change diffFiles reports, from `git diff --raw -z` with the SAME options, base and head: a 100% rename
+// has no `mode` line in the unified diff, so a symlink (120000) or submodule (160000) that merely MOVES is invisible there.
+// -> [{ oldMode, newMode, status, oldPath, newPath }] (a path is null on the side that does not exist).
+export function diffModes(base, head, o) {
+  const mb = mergeBase(base, head, o);
+  return rawChanges(mb, head, o).map(({ oldMode, newMode, status, oldPath, newPath }) => ({ oldMode, newMode, status, oldPath, newPath }));
 }
 
 const MISSING_PATH = /does not exist|exists on disk, but not in/;
