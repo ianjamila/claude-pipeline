@@ -224,6 +224,24 @@ export function safeManifestKey(key) {
   return parts.every((p) => p !== '' && p !== '.' && p !== '..');
 }
 
+// `git ls-tree -r -z HEAD` output -> Map of path -> blob id (regular files and symlinks; submodule entries are skipped).
+export function parseLsTree(text) {
+  const blobs = new Map();
+  for (const entry of text.split('\0')) {
+    const tab = entry.indexOf('\t');
+    if (tab < 0) continue;
+    const [, type, id] = entry.slice(0, tab).split(' ');
+    if (type === 'blob') blobs.set(entry.slice(tab + 1), id);
+  }
+  return blobs;
+}
+
+// Source-relative paths (POSIX) of planned files that are not exactly what HEAD holds: absent from HEAD, or a different
+// blob. `hashes` is the blob id git computes for each path in the working tree (filters applied), in the same order.
+export function pathsDifferingFromHead(paths, headBlobs, hashes) {
+  return paths.filter((p, i) => headBlobs.get(p) !== hashes[i]);
+}
+
 // The same manifest, minus the one field that changes on every run.
 export const manifestWithoutTime = ({ installedAt, ...rest }) => rest;
 

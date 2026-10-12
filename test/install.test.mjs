@@ -1244,3 +1244,101 @@ test('buildPlan requires pipeline/hooks/session-version.mjs like the two guards'
   assert.ok(buildPlan(src).problems.includes('pipeline/hooks/session-version.mjs is missing'));
   assert.equal(buildPlan(FIXTURE).problems.length, 0);
 });
+
+// ---- A4: honest sourceSha ---------------------------------------------------------------------------------------
+
+function git(cwd, ...args) {
+  const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' };
+  for (const k of Object.keys(env)) if (/^GIT_(DIR|WORK_TREE|INDEX_FILE|COMMON_DIR)$/.test(k)) delete env[k];
+  const r = spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', '-c', 'commit.gpgsign=false', '-c', 'core.autocrlf=false', ...args], { cwd, env, encoding: 'utf8' });
+  assert.equal(r.status, 0, `git ${args.join(' ')}: ${r.stderr}`);
+  return r.stdout.trim();
+}
+// A committed copy of the fixture; returns { dir, head }.
+function committedSource({ attributes } = {}) {
+  const dir = copyFixture();
+  if (attributes) writeFileSync(join(dir, '.gitattributes'), attributes);
+  git(dir, 'init', '-q');
+  git(dir, 'add', '-A');
+  git(dir, 'commit', '-q', '-m', 'fixture');
+  return { dir, head: git(dir, 'rev-parse', 'HEAD') };
+}
+const installReport = (home, source) => JSON.parse(install(home, ['--json'], { source }).stdout);
+
+test('a clean checkout records its HEAD sha and no sourceDirty flag', () => {
+  const { dir, head } = committedSource();
+  const home = newHome();
+  const report = installReport(home, dir);
+  assert.equal(report.sourceSha, head);
+  assert.deepEqual(report.warnings, []);
+  const m = readManifest(home);
+  assert.equal(m.sourceSha, head);
+  assert.equal('sourceDirty' in m, false);
+});
+
+test('an edited tracked file, an untracked file and an ignored extra each make sourceSha null with sourceDirty and a warning', () => {
+  const edited = committedSource();
+  writeFileSync(join(edited.dir, 'skills', 'ship', 'SKILL.md'), 'edited after the commit\n');
+  const home1 = newHome();
+  const r1 = installReport(home1, edited.dir);
+  assert.equal(r1.sourceSha, null);
+  assert.deepEqual(r1.warnings, [`source is not a clean checkout of ${edited.head.slice(0, 7)}: skills/ship/SKILL.md; recording no source sha`]);
+  assert.equal(readManifest(home1).sourceSha, null);
+  assert.equal(readManifest(home1).sourceDirty, true);
+
+  const untracked = committedSource();
+  writeFileSync(join(untracked.dir, 'pipeline', 'lib', 'extra.mjs'), '// not committed\n');
+  const r2 = installReport(newHome(), untracked.dir);
+  assert.equal(r2.sourceSha, null);
+  assert.match(r2.warnings[0], /not a clean checkout of [0-9a-f]{7}: pipeline\/lib\/extra\.mjs; recording no source sha/);
+
+  const ignored = committedSource();
+  writeFileSync(join(ignored.dir, '.gitignore'), 'pipeline/lib/local-only.mjs\n');
+  git(ignored.dir, 'add', '.gitignore');
+  git(ignored.dir, 'commit', '-q', '-m', 'ignore');
+  writeFileSync(join(ignored.dir, 'pipeline', 'lib', 'local-only.mjs'), '// ignored, but copied\n');
+  const home3 = newHome();
+  const r3 = installReport(home3, ignored.dir);
+  assert.equal(r3.sourceSha, null, 'an ignored extra is copied into the install, so HEAD does not describe it');
+  assert.equal(readManifest(home3).sourceDirty, true);
+});
+
+test('only the first three differing paths are named', () => {
+  const { dir } = committedSource();
+  for (const n of ['a', 'b', 'c', 'd']) writeFileSync(join(dir, 'pipeline', 'lib', `${n}.mjs`), '//\n');
+  const r = installReport(newHome(), dir);
+  assert.match(r.warnings[0], /: pipeline\/lib\/a\.mjs, pipeline\/lib\/b\.mjs, pipeline\/lib\/c\.mjs; recording/);
+});
+
+test('a source that is not a git checkout records sourceSha null without a dirty flag or warning', () => {
+  const dir = join(scratch('cp-nogit'), 'src');
+  cpSync(FIXTURE, dir, { recursive: true });
+  const home = newHome();
+  const report = installReport(home, dir);
+  // scratch dirs live under the OS temp dir, outside any repo
+  assert.equal(report.sourceSha, null);
+  assert.deepEqual(report.warnings, []);
+  assert.equal('sourceDirty' in readManifest(home), false);
+});
+
+test('line-ending filters do not make a clean checkout look edited (hash-object applies .gitattributes)', () => {
+  const { dir, head } = committedSource({ attributes: '*.md text\n' });
+  const file = join(dir, 'agents', 'judge.md');
+  writeFileSync(file, readFileSync(file, 'utf8').replace(/\r?\n/g, '\r\n')); // what a Windows checkout with eol=crlf holds
+  const report = installReport(newHome(), dir);
+  assert.equal(report.sourceSha, head);
+  assert.deepEqual(report.warnings, []);
+});
+
+test('a source that is a subdirectory of a repo is compared by its own paths', () => {
+  const outer = scratch('cp-outer');
+  const dir = join(outer, 'vendor', 'src');
+  cpSync(FIXTURE, dir, { recursive: true });
+  git(outer, 'init', '-q');
+  git(outer, 'add', '-A');
+  git(outer, 'commit', '-q', '-m', 'x');
+  const head = git(outer, 'rev-parse', 'HEAD');
+  assert.equal(installReport(newHome(), dir).sourceSha, head);
+  writeFileSync(join(dir, 'VERSION'), '9.9.8\n');
+  assert.equal(installReport(newHome(), dir).sourceSha, null);
+});
