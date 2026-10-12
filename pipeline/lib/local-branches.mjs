@@ -3,16 +3,21 @@
 // Plan: docs/plans/2026-10-12-ship-inbox-resume-plan.md, sections E and F.
 import path from 'node:path';
 import { GitError, git, isAncestor } from './git.mjs';
+import { isInside, samePath } from './paths.mjs';
 
-// -> [{ path, head, branch|null (detached or bare), bare }], main worktree first.
-export function listWorktrees(root) {
-  const out = git(['worktree', 'list', '--porcelain'], { cwd: root });
+// Git prints worktree paths with forward slashes on Windows (`C:/Users/me/repo`) while everything else here (path.join,
+// path.resolve, the paths a test or a caller builds) is native (`C:\\Users\\me\\repo`). This is the one place a path
+// read from git becomes native; POSIX paths pass through unchanged.
+const nativePath = (p, platform) => (platform === 'win32' ? path.win32.resolve(p) : p);
+
+// -> [{ path, head, branch|null (detached or bare), bare }], main worktree first. `platform` is for tests.
+export function parseWorktreePorcelain(out, platform = process.platform) {
   const list = [];
-  for (const block of out.split(/\n\n+/)) {
+  for (const block of out.split(/\r?\n\r?\n+/)) {
     if (!block.trim()) continue;
     const entry = { path: null, head: null, branch: null, bare: false };
-    for (const line of block.split('\n')) {
-      if (line.startsWith('worktree ')) entry.path = line.slice('worktree '.length);
+    for (const line of block.split(/\r?\n/)) {
+      if (line.startsWith('worktree ')) entry.path = nativePath(line.slice('worktree '.length), platform);
       else if (line.startsWith('HEAD ')) entry.head = line.slice('HEAD '.length);
       else if (line.startsWith('branch ')) entry.branch = line.slice('branch '.length).replace(/^refs\/heads\//, '');
       else if (line === 'bare') entry.bare = true;
@@ -20,6 +25,10 @@ export function listWorktrees(root) {
     if (entry.path) list.push(entry);
   }
   return list;
+}
+
+export function listWorktrees(root) {
+  return parseWorktreePorcelain(git(['worktree', 'list', '--porcelain'], { cwd: root }));
 }
 
 // Changed or untracked entries in one worktree (every `git status --porcelain` line is one).
@@ -80,10 +89,9 @@ export function orphanWorktrees(root, openBranches, worktreeDir = '.worktrees', 
   const container = path.resolve(all[0]?.path ?? root, worktreeDir);
   const open = new Set(openBranches);
   return all
-    .filter((w) => !w.bare && w.path !== all[0]?.path)
+    .filter((w) => !w.bare && !samePath(w.path, all[0]?.path ?? root))
     .filter((w) => {
-      const rel = path.relative(container, path.resolve(w.path));
-      return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+      return isInside(w.path, container) && !samePath(w.path, container);
     })
     .filter((w) => w.branch === null || !open.has(w.branch))
     .map((w) => ({ path: w.path, branch: w.branch, head: w.head, dirty: dirtyCount(w.path) }));

@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { join } from 'node:path';
+import path, { join } from 'node:path';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
-import { listWorktrees, localBranchState, orphanWorktrees } from '../pipeline/lib/local-branches.mjs';
+import { listWorktrees, localBranchState, orphanWorktrees, parseWorktreePorcelain } from '../pipeline/lib/local-branches.mjs';
 
 // main with one commit, plus branch `agent/x` at `live`; the main checkout stays on main.
 function setup() {
@@ -112,4 +112,22 @@ test('orphanWorktrees: only worktrees under the container whose branch has no op
   } finally {
     repo.git(['worktree', 'remove', '--force', elsewhere]);
   }
+});
+
+// Windows git prints forward-slash paths (`C:/Users/x/repo`); every path leaving the parser is the platform's native form,
+// so a comparison against path.join / path.resolve output (and a `git -C <path>` call) agrees. Runs on Linux too: the
+// platform is passed in.
+test('parseWorktreePorcelain: Windows forward-slash paths become native backslash paths; POSIX stays as printed', () => {
+  const win = [
+    'worktree C:/Users/me/repo', 'HEAD aaaa', 'branch refs/heads/main', '',
+    'worktree C:/Users/me/repo/.worktrees/x', 'HEAD bbbb', 'branch refs/heads/agent/x', '',
+    'worktree //server/share/repo/.worktrees/y', 'HEAD cccc', 'detached', '',
+  ].join('\n');
+  const list = parseWorktreePorcelain(win, 'win32');
+  assert.deepEqual(list.map((w) => w.path), ['C:\\Users\\me\\repo', 'C:\\Users\\me\\repo\\.worktrees\\x', '\\\\server\\share\\repo\\.worktrees\\y']);
+  assert.equal(list[1].path, path.win32.join('C:\\Users\\me\\repo', '.worktrees', 'x'));
+  assert.equal(list[1].branch, 'agent/x');
+  assert.equal(list[2].branch, null);
+  const posix = parseWorktreePorcelain('worktree /home/me/repo\nHEAD aaaa\nbranch refs/heads/main\n\n', 'linux');
+  assert.equal(posix[0].path, '/home/me/repo');
 });
