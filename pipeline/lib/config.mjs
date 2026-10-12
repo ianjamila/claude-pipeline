@@ -67,6 +67,8 @@ const EFFORTS = ['low', 'medium', 'high', 'xhigh'];
 const EFFORT_LANES = ['low', 'medium', 'high', 'followup'];
 const OWNER_APPROVALS = ['label', 'chat'];
 const PROVIDERS = ['vercel', 'github-deployments', 'other'];
+// Who owns the production smoke: the ship session (prod-watch) or a CI workflow that posts the result on the merged PR.
+const WATCH_MODES = ['session', 'workflow'];
 
 // Allowed keys per mapping. Anything else is a typo (or a removed option) and is rejected.
 const KEYS = {
@@ -75,7 +77,7 @@ const KEYS = {
   ci: ['required_checks', 'e2e_label', 'draft_while_iterating', 'guard_checks', 'approvers'],
   merge: ['command', 'wait_minutes'],
   preview: ['environment', 'smoke', 'provider'],
-  production: ['url', 'provider', 'environment', 'smoke', 'deploy_timeout_minutes', 'rollback'],
+  production: ['url', 'provider', 'environment', 'smoke', 'deploy_timeout_minutes', 'rollback', 'watch'],
   rollback: ['command', 'notes'],
   risk: ['high_risk_paths', 'medium_lines', 'high_lines', 'medium_files'],
   hard_stops: ['paths', 'patterns', 'auth_calls', 'disable_rules', 'report_only_rules', 'report_only_paths'],
@@ -165,6 +167,8 @@ function checkProduction(p, errors) {
   else if (!PROVIDERS.includes(p.provider)) errors.push(`production.provider must be one of ${PROVIDERS.join('|')}`);
   if (p.deploy_timeout_minutes === undefined) p.deploy_timeout_minutes = 20;
   else if (!inRange(p.deploy_timeout_minutes, 1, 120)) errors.push('production.deploy_timeout_minutes must be an integer 1..120');
+  if (p.watch === undefined) p.watch = 'session';
+  else if (!WATCH_MODES.includes(p.watch)) errors.push(`production.watch must be one of ${WATCH_MODES.join('|')}`);
 }
 
 // Built-in hard-stop rule families a project may switch off with hard_stops.disable_rules. Deliberately ONE: R6, whose
