@@ -1131,9 +1131,9 @@ const hasDeferred = (cmds) => cmds.some((c) => FUNCTION_DEF.test(c.raw ?? '') ||
 
 // Can the command at `idx` run before the command at `at`, or while it runs? Anything earlier on the line counts (even a conditional
 // one); a later one counts when they share a pipeline, when `at` is a background job, or when a loop may repeat them.
-function visible(frame, at, idx) {
+function visible(frame, at, idx, late = false) {
   if (idx === at) return false;
-  if (idx < at || frame.deferred) return true;
+  if (idx < at || frame.deferred || late) return true;
   const { cmds, from } = frame;
   if (from >= 0 && at >= from && idx >= from) return true;
   let hi = at;
@@ -1144,12 +1144,39 @@ function visible(frame, at, idx) {
   return cmds[hi + 1]?.sep === '&';
 }
 
+// Is the record of command idx of frames[fi] visible to the command being judged (command `at` of that frame, or the call into the frames above it)? Why: background work started by a script judged
+// inside (a nested frame with a `&`, setsid, screen, tmux, coproc ...) outlives it, so every LATER record of every enclosing frame may land before that job runs; and a frame with a `&` we cannot place
+// (`{ ...; } &`, a trailing `&`) sees all of its own later records.
+function seen(frames, fi, at, idx) {
+  const f = frames[fi];
+  const late = fi === frames.length - 1 ? f.opaque === true : frames.slice(fi + 1).some((x) => x.bgWork);
+  return visible(f, at, idx, late);
+}
+// The pipeline (first, last command index) that holds command i
+function groupOf(cmds, i) {
+  let lo = i;
+  let hi = i;
+  while (hi + 1 < cmds.length && cmds[hi + 1].sep === '|') hi++;
+  while (lo > 0 && cmds[lo].sep === '|') lo--;
+  return [lo, hi];
+}
+// How the record's command runs, as far as the ORDER of its write goes: `bg` a background job (it lands at any time later), `opt` it may be skipped (after && / ||, before ||, in a loop or an if) or fail. The facts of
+// a finished nested frame are stamped on its exported records (exportRecords), so they survive the move to the caller.
+function placeOf(f, rec) {
+  const c = f.cmds;
+  const [lo, hi] = groupOf(c, rec.idx);
+  return {
+    bg: rec.bg === true || f.opaque === true || c[hi + 1]?.sep === '&',
+    opt: rec.opt === true || c[lo]?.sep === '&&' || c[lo]?.sep === '||' || c[hi + 1]?.sep === '||' || inFlow(f.from, rec.idx),
+  };
+}
+
 // One frame per command list being evaluated (the line, then each script text judged inside it). `i` is the command being judged now.
 // - expand(word): the word with variables, ~ and $HOME expanded, or null when it is only known at run time (a `$` left, a glob)
 // - locate(expanded, idx): the paths the word may name for the command at idx: absolute ones, or the word itself when the directory is unknown
 // - isAbs(path), p: the policy's path functions (node:path or node:path.posix), ci: compare names ignoring case
 // - real(path): the path with symlinks followed (a missing tail kept), or null when it cannot be told; omitted: paths are taken as written
-export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, real = null, readText = null }) {
+export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, real = null, readText = null, text = null }) {
   // an awk program file (-f FILE): the text of every place the word may name; null when it cannot be told (a run-time word, a file we cannot read, a place we do not know)
   const readProgram = readText ? (word, idx) => {
     const e = expand(word);
@@ -1160,8 +1187,17 @@ export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, real
     return texts.every((t) => typeof t === 'string') ? texts : null;
   } : null;
   const w = writesOf(cmds, { readProgram });
-  return { cmds, recs: w.recs, unmodelled: w.unmodelled, from: flowStart(cmds), i: -1, expand, locate, isAbs, p, ci, real, deferred: hasDeferred(cmds) };
+  // Why: a `&` the commands do not show (a trailing one, `( ... ) &`, `{ ...; } &`) makes the whole frame's order unknown (opaque); bgWork: this frame starts something that may outlive it
+  const lone = typeof text === 'string' ? (text.match(/(?<![&|<>])&(?![&>])/g) ?? []).length : 0;
+  const seps = cmds.filter((c) => c.sep === '&').length;
+  const opaque = lone > seps || cmds.some(startsBackground);
+  const bgWork = seps > 0 || opaque;
+  return { cmds, recs: w.recs, unmodelled: w.unmodelled, from: flowStart(cmds), i: -1, expand, locate, isAbs, p, ci, real, deferred: hasDeferred(cmds), opaque, bgWork };
 }
+
+// commands that start a job which outlives them (a `&` is read from the text)
+const BACKGROUNDERS = new Set(['setsid', 'disown', 'screen', 'tmux', 'coproc', 'at', 'batch', 'systemd-run', 'daemonize', 'daemon', 'start-stop-daemon', 'launchctl', 'bg']);
+const startsBackground = (c) => [...(c.raw ?? '').trim().split(/\s+/).slice(0, 3), ...c.argv.slice(0, 3).map(commandName)].some((w) => BACKGROUNDERS.has(w));
 
 const fold = (f, s) => (f.ci ? s.toLowerCase() : s);
 // The real location of a path (symlinks followed through the longest existing prefix), or null when it cannot be told. A path is judged
@@ -1260,7 +1296,8 @@ const product = (a, b) => {
   return [...new Set(out)];
 };
 
-function hitsOn(frames, upto, asOf, P) {
+function hitsOn(allFrames, upto, asOf, P) {
+  const frames = allFrames.length === upto + 1 ? allFrames : allFrames.slice(0, upto + 1);
   const pairs = linkPairs(frames, upto, asOf);
   const names = pairs.length ? namesOf(pairs, P) : [P];
   const out = [];
@@ -1268,16 +1305,18 @@ function hitsOn(frames, upto, asOf, P) {
     const f = frames[fi];
     const at = fi === upto ? asOf : f.i;
     for (const rec of f.recs) {
-      if (!visible(f, at, rec.idx)) continue;
+      if (!seen(frames, fi, at, rec.idx)) continue;
       for (const Pv of names) {
         const items = match(f, rec, Pv);
-        if (items) { out.push({ fi, f, rec, items, loose: items.loose === true, P: Pv }); break; }
+        if (items) { out.push({ fi, f, rec, items, loose: items.loose === true, P: Pv, place: placeOf(f, rec) }); break; }
       }
     }
   }
+  // two writers of this file in one pipeline run at the same time: neither comes first
+  for (const a of out) for (const b of out) if (a.f === b.f && a.rec.idx !== b.rec.idx) { const [lo, hi] = groupOf(a.f.cmds, a.rec.idx); if (b.rec.idx >= lo && b.rec.idx <= hi) a.place.conc = true; }
   // a write that may or may not be this file, followed by an exact write that replaces the whole file, changed nothing that matters
   let lastExact = -1;
-  out.forEach((h, i) => { if (!h.loose && !h.rec.append) lastExact = i; });
+  out.forEach((h, i) => { if (certainReplace(h)) lastExact = i; });
   return out.filter((h, i) => !(h.loose && i < lastExact));
 }
 
@@ -1294,39 +1333,74 @@ function contentsOf(frames, upto, asOf, P, io, depth) {
   io.stack.add(key);
   try { return contentsIn(frames, upto, asOf, P, io, depth); } finally { io.stack.delete(key); }
 }
+// Does the copy / move / link of this hit fail because its source is missing now (and no write on the line creates it)? Then the destination keeps its text.
+function copyMayFail(frames, h, exists) {
+  if (!h.rec.copy) return false;
+  for (const it of h.rec.items) {
+    if (it.file === undefined) continue;
+    const e = h.f.expand(it.file);
+    if (e === null) continue;
+    for (const x of h.f.locate(e, h.rec.idx).filter((q) => h.f.isAbs(q))) if (!exists(x) && hitsOn(frames, h.fi, h.rec.idx, x).length === 0) return true;
+  }
+  return false;
+}
+const MAX_VARIANTS = 1024; // the ways the writes before a command can be put in order and in or out
 function contentsIn(frames, upto, asOf, P, io, depth) {
   const hits = hitsOn(frames, upto, asOf, P);
-  // a write that may or may not be this file is tried both ways (its own content is judged on its own, as unknown content); more than four are left out
-  const loose = hits.filter((h) => h.loose).slice(0, 4);
+  // Why: a write that may or may not be this file (loose), may be skipped or fail (opt), runs in the background or beside another writer (bg / conc) is tried both ways, and a background or concurrent
+  // one in every place among the writes that certainly run (it lands when it lands); the combinations are capped, and too many is "built from pieces" (denied), never a silent cut
+  const ordered = hits.filter((h) => !h.place.bg && !h.place.conc);
+  const free = hits.filter((h) => h.place.bg || h.place.conc);
+  const optMemo = new Map(); // (each hit is asked once: expanding its words costs budget)
+  const optional = (h) => { if (!optMemo.has(h)) optMemo.set(h, h.loose || h.place.opt || copyMayFail(frames, h, io.exists)); return optMemo.get(h); };
+  const altMemo = new Map();
+  const altsOf = (h) => { if (!altMemo.has(h)) altMemo.set(h, partAlternatives(frames, h, io, depth)); return altMemo.get(h); };
+  const mayBeAbsent = (h) => h.place.bg || optional(h);
   const out = new Set();
-  for (let mask = 0; mask < 1 << loose.length; mask++) {
-    let seq = [{ cur: true }];
-    for (const h of hits) {
-      if (h.loose && !(mask & (1 << loose.indexOf(h)))) continue;
-      if (h.loose && loose.indexOf(h) < 0) continue;
-      if (h.rec.append) seq.push(h); else seq = [h];
+  let count = 0;
+  let stop = false;
+  // the writes that certainly run keep the text's order (each in or out when it may be skipped); every free one is then put in at every place of the order (an earlier free one included)
+  const place = (list, k) => {
+    if (stop) return;
+    if (k === free.length) {
+      if (++count > MAX_VARIANTS) { io.pieces = true; stop = true; return; }
+      if (variant(list) === null) stop = true;
+      return;
     }
+    const u = free[k];
+    if (mayBeAbsent(u)) place(list, k + 1);
+    for (let at = 0; at <= list.length; at++) place([...list.slice(0, at), u, ...list.slice(at)], k + 1);
+  };
+  const pickOrdered = (k, list) => {
+    if (stop) return;
+    if (k === ordered.length) { place(list, 0); return; }
+    pickOrdered(k + 1, [...list, ordered[k]]);
+    if (optional(ordered[k])) pickOrdered(k + 1, list);
+  };
+  const variant = (seqHits) => {
+    let seq = [{ cur: true }];
+    for (const h of seqHits) { if (h.rec.append) seq.push(h); else seq = [h]; }
     // a file put together from several pieces that cannot be built is "built from pieces at run time"; one unknown piece alone is just unknown content.
     // Only a write to the file itself counts: a piece of a write that merely may hit it is the unknown-content signal, never a refusal
     const multi = seq.length > 1 || seq.some((el) => (el.rec?.parts?.length ?? 0) > 1 || el.rec?.edit); // (an in-place edit is old text + a program: two pieces)
     const looseIn = seq.some((el) => el.loose);
     const fail = () => { if (multi && !looseIn) io.pieces = true; return null; };
     let acc = [''];
-    let ok = true;
     for (const el of seq) {
       let alts;
       if (el.cur) {
         if (!io.exists(P)) alts = [''];
-        else { const text = io.readText(P); if (typeof text !== 'string') { fail(); ok = false; break; } alts = [text]; }
-      } else alts = partAlternatives(frames, el, io, depth);
-      if (alts === null) { fail(); ok = false; break; }
+        else { const text = io.readText(P); if (typeof text !== 'string') { fail(); return looseIn ? true : null; } alts = [text]; }
+      } else alts = altsOf(el);
+      if (alts === null) { fail(); return looseIn ? true : null; }
       acc = product(acc, alts);
-      if (acc === null) { fail(); ok = false; break; }
+      if (acc === null) { io.pieces = true; return looseIn ? true : null; } // (too many combinations: refused, never dropped)
     }
-    if (ok) for (const x of acc) out.add(x);
-    else if (!looseIn) return null;
-  }
-  return out.size ? [...out] : null;
+    for (const x of acc) out.add(x);
+    return true;
+  };
+  pickOrdered(0, []);
+  return stop || !out.size ? null : [...out];
 }
 
 function partAlternatives(frames, h, io, depth) {
@@ -1407,13 +1481,16 @@ export function writtenTo(frames, target, { exists, readText = () => null, ignor
 
 // The links the line makes before the command: [alias, real, frame] for `ln -s REAL ALIAS` (and a hard link). A directory alias makes
 // every path below it a second name for the same file, so a script is also judged under its other names.
+// an exact write that certainly runs, completes before the next command and replaces the whole file
+const certainReplace = (h) => !h.loose && !h.rec.append && !h.place.bg && !h.place.opt && !h.place.conc;
 function linkPairs(frames, upto, asOf) {
   const pairs = [];
   pairs.any = false; // a link is made before the command, whether or not we can place it
-  frames.slice(0, upto + 1).forEach((f, fi) => {
+  const view = frames.slice(0, upto + 1);
+  view.forEach((f, fi) => {
     const at = fi === upto ? asOf : f.i;
     for (const rec of f.recs) {
-      if (!rec.link || !visible(f, at, rec.idx)) continue;
+      if (!rec.link || !seen(view, fi, at, rec.idx)) continue;
       pairs.any = true;
       const e = f.expand(rec.dest);
       if (e === null) continue;
@@ -1448,6 +1525,7 @@ function namesOf(pairs, P) {
 }
 
 function collect(frames, upto, asOf, P, st, depth, exists) {
+  const view = frames.length === upto + 1 ? frames : frames.slice(0, upto + 1);
   const key = `${upto}\u0000${asOf}\u0000${P}`;
   if (st.seen.has(key)) return;
   st.seen.add(key);
@@ -1456,7 +1534,7 @@ function collect(frames, upto, asOf, P, st, depth, exists) {
   for (const h of hitsOn(frames, upto, asOf, P)) {
     if (h.loose && st.ignoreUnmodelled) continue; // (the real home's startup files: only the line's exact writes reach them, not a target known only at run time)
     absorb(frames, h.fi, h.f, h.rec, h.items, h.P, st, depth, exists);
-    if (!h.loose && !h.rec.append) st.lastReplace = [h.fi, h.rec.idx]; // an exact write that replaces the file: what came before it no longer matters
+    if (certainReplace(h) && !copyMayFail(frames, h, exists)) st.lastReplace = [h.fi, h.rec.idx]; // an exact write that replaces the file: what came before it no longer matters
   }
   if (frames.some((x) => x.unresolved)) pairs.any = true;
   for (let fi = 0; fi <= upto; fi++) {
@@ -1465,7 +1543,7 @@ function collect(frames, upto, asOf, P, st, depth, exists) {
     // links we cannot follow (a link made on the line, a path whose real location is unknown): a write that ends in the script's NAME may reach it
     if (pairs.any || frames.some((x) => x.unresolved)) {
       for (const rec of f.recs) {
-        if (!visible(f, at, rec.idx) || rec.inline !== undefined) continue;
+        if (!seen(view, fi, at, rec.idx) || rec.inline !== undefined) continue;
         if (rec.subtree) { st.any = true; st.unknown = true; continue; }
         if (rec.dest === null) continue;
         const e = f.expand(rec.dest);
@@ -1483,7 +1561,7 @@ function collect(frames, upto, asOf, P, st, depth, exists) {
       const f = frames[fi];
       const at = fi === upto ? asOf : f.i;
       for (const idx of f.unmodelled) {
-        if (!visible(f, at, idx)) continue;
+        if (!seen(view, fi, at, idx)) continue;
         if (st.lastReplace && (fi < st.lastReplace[0] || (fi === st.lastReplace[0] && idx < st.lastReplace[1]))) continue;
         st.any = true; st.unknown = true; st.viaUnmodelled = true;
       }
@@ -1525,9 +1603,9 @@ function addFiles(f, rec, word, P, st, fi, depth, exists, into, frames = null) {
 // Names the line's writes put into directory `dir` (so `bash n*.sh` after `cp f.sh n.sh` has n.sh among its glob matches).
 export function writtenNamesIn(frames, dir) {
   const out = new Set();
-  for (const f of frames) {
+  for (const [fi, f] of frames.entries()) {
     for (const rec of f.recs) {
-      if (rec.dest === null || rec.inline !== undefined || !visible(f, f.i, rec.idx)) continue;
+      if (rec.dest === null || rec.inline !== undefined || !seen(frames, fi, f.i, rec.idx)) continue;
       const e = f.expand(rec.dest);
       if (e === null) continue;
       for (const d of f.locate(e, rec.idx)) {
@@ -1543,10 +1621,10 @@ export function writtenNamesIn(frames, dir) {
 // A fingerprint of the writes that count for the command being judged now, for memo keys that must not outlive a change of them: the actual
 // visible records (not their number), so two different write sets never share a cached verdict.
 export function writeSignature(frames) {
-  return JSON.stringify(frames.map((f) => f.recs.filter((r) => visible(f, f.i, r.idx))));
+  return JSON.stringify(frames.map((f, fi) => [f.opaque === true, f.recs.filter((r) => seen(frames, fi, f.i, r.idx)).map((r) => ({ ...r, placed: placeOf(f, r) }))]));
 }
 // Is there a command we do not model before the one being judged? (any number of them make a missing script equally unknown)
-export const unmodelledBefore = (frames) => frames.some((f) => [...f.unmodelled].some((x) => visible(f, f.i, x)));
+export const unmodelledBefore = (frames) => frames.some((f, fi) => [...f.unmodelled].some((x) => seen(frames, fi, f.i, x)));
 
 // The records of a finished frame (a script judged while the caller ran), rewritten with absolute paths and attributed to the calling command `idx`, so the
 // commands that run after the script see what it wrote (`bash mk.sh; bash n.sh` with mk.sh doing `cp f.sh n.sh`).
@@ -1561,7 +1639,8 @@ export function exportRecords(f, idx, existing = []) {
     return e === null ? null : f.locate(e, at).filter((x) => f.isAbs(x));
   };
   for (const rec of f.recs) {
-    if (rec.inline !== undefined) { out.push({ ...rec, idx }); continue; }
+    const place = placeOf(f, rec); // (how it ran inside: a background job or a skippable write stays one when the caller moves on)
+    if (rec.inline !== undefined) { out.push({ ...rec, idx, bg: place.bg, opt: place.opt }); continue; }
     const convert = (items, d) => items.flatMap((it) => {
       if (it.file === undefined && it.scan === undefined) return [it];
       const key = it.file !== undefined ? 'file' : 'scan';
@@ -1573,7 +1652,7 @@ export function exportRecords(f, idx, existing = []) {
     const dests = rec.dest === null ? [null] : (absOf(rec.dest, rec.idx) ?? [null]);
     for (const d of dests.length ? dests : [null]) {
       const items = convert(rec.items, d);
-      out.push({ ...rec, idx, dest: d, items, parts: rec.parts?.map((part) => convert(part, d)), ...(rec.generic ? { generic: rec.generic.flatMap((w) => { const ps = absOf(w, rec.idx); return ps && ps.length ? ps : [w]; }) } : {}) });
+      out.push({ ...rec, idx, bg: place.bg, opt: place.opt, dest: d, items, parts: rec.parts?.map((part) => convert(part, d)), ...(rec.generic ? { generic: rec.generic.flatMap((w) => { const ps = absOf(w, rec.idx); return ps && ps.length ? ps : [w]; }) } : {}) });
     }
   }
   return out.filter((r) => { const k = keyOf(r); if (seen.has(k) && seen.get(k) <= r.idx) return false; seen.set(k, r.idx); return true; });

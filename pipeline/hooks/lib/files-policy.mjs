@@ -1358,6 +1358,7 @@ function evaluateBashForFilesFrame(command, opts) {
   if (Object.keys(ctx.vars).length && setsAdmin(substVars(flat, ctx.vars, ctx.budget), ctx.platform)) return deny('the command sets PIPELINE_ADMIN through a variable; only the owner may set it, when launching Claude Code');
   const dirs = collectDirs(cmds, ctx);
   const frame = newWriteFrame(cmds, {
+    text: raw,
     expand: (w) => {
       if (/^~[^/\\]/.test(w)) return null; // Why: ~+ / ~- / ~user are not the home directory (expandRefs would read `~+/n.sh` as /home/u+/n.sh): the place is only known at run time
       const e = expandRefs(w, ctx);

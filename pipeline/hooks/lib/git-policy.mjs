@@ -1339,6 +1339,7 @@ function evalString(str, startDir, ctx, level) {
   const dirAt = new Map();
   const cdDirs = cdTargets(cmds, startDir, ctx);
   const frame = newWriteFrame(cmds, {
+    text: str,
     expand: (w) => {
       let e = expandVars(w, ctx).replace(/^\$\{?HOME\}?(?=\/|$)/, ctx.home);
       if (e === '~' || e.startsWith('~/')) e = ctx.home + e.slice(1);

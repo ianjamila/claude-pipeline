@@ -1484,3 +1484,47 @@ test('L3: a rewriting command that changes letter case still has its sources sca
   const spec = { ...SPEC, 'up.txt': 'up' };
   for (const l of ['tr A-Z a-z < up.txt > n.sh; bash n.sh', "tr '[:upper:]' '[:lower:]' < up.txt > n.sh; bash n.sh", 'dd conv=lcase if=up.txt of=n.sh; bash n.sh', "sed 's/.*/\\L&/' up.txt > n.sh; bash n.sh", "awk '{print tolower($0)}' up.txt > n.sh; bash n.sh", "perl -pe '$_=lc' up.txt > n.sh; bash n.sh", 'iconv -f ascii -t ascii up.txt > n.sh; bash n.sh']) denyBoth(l, spec);
 });
+
+// ---- L4: ordering, state and caps ------------------------------------------------------------------------------------------
+
+test('L4: background work inside a nested evaluation outlives it: later outer writes are visible to the scripts judged inside', () => {
+  // Why: `bash bg.sh; cp f.sh n.sh` where bg.sh starts `bash n.sh` in the background: the job runs after the outer cp, so it runs f.sh
+  const spec = { ...SPEC, 'bg1.sh': 'sleep 1; bash n.sh &', 'bg2.sh': '(sleep 1; bash n.sh) &', 'bg3.sh': 'sleep 1; setsid -f bash n.sh', 'bg4.sh': 'nohup bash n.sh &', 'bg7.sh': 'bash n.sh &\ndisown', 'bg9.sh': 'bash bg1.sh', 'bg10.sh': '{ sleep 1; bash n.sh; } &', 'bg11.sh': 'sleep 1; bash n.sh | cat &', 'fg.sh': 'sleep 1; bash n.sh' };
+  for (const l of ["bash -c '(sleep 1; bash n.sh) &'; cp f.sh n.sh", "bash -c 'sleep 1; bash n.sh &'; cp f.sh n.sh", "bash -c 'sleep 1; setsid -f bash n.sh'; cp f.sh n.sh", 'bash bg1.sh; cp f.sh n.sh', 'bash bg2.sh; cp f.sh n.sh', 'bash bg3.sh; cp f.sh n.sh', 'bash bg4.sh; cp f.sh n.sh', 'bash bg7.sh; cp f.sh n.sh',
+    'bash bg9.sh; cp f.sh n.sh', 'bash bg10.sh; cp f.sh n.sh', 'bash bg11.sh; cp f.sh n.sh', 'bash bg1.sh; sleep 1; echo hi; cp f.sh n.sh', 'bash bg1.sh && cp f.sh n.sh', 'source bg1.sh; cp f.sh n.sh', 'bash bg1.sh; (cp f.sh n.sh)', 'bash bg1.sh; mv f.sh n.sh', 'bash bg1.sh; ln -s f.sh n.sh']) denyBoth(l, spec);
+  // the same inside a script (two levels): the outer line's later write is still seen
+  denyBoth('bash bg9.sh; cp f.sh n.sh', spec);
+  // the twins: no background work, or nothing writes the script
+  for (const l of ["bash -c 'sleep 1; bash n.sh'; cp f.sh n.sh", 'bash fg.sh; cp f.sh n.sh', 'bash bg1.sh; cp f.sh m.sh', 'bash bg1.sh', 'cp f.sh n.sh; echo hi']) allowBoth(l, spec);
+});
+
+test('L4: a write that runs in the background, or in a pipeline with another writer, may land between the writes that follow it in the text', () => {
+  // Why: \`printf A > n.sh & cp ok.sh n.sh; printf B >> n.sh\` -- the first write may land after the copy, so the file is A + B; a pipeline's stages run at the same time
+  const spec = { ...SPEC, 'bgw.sh': '(sleep 1; cp p1.txt n.sh) &', 'bgw2.sh': 'cp p1.txt n.sh &', 'fgw.sh': 'cp p1.txt n.sh' };
+  const A = (bad) => bad.slice(0, 8);
+  const B = (bad) => bad.slice(8);
+  for (const mk of [(bad) => `printf '${A(bad)}' > n.sh & cp ok.sh n.sh; printf '${B(bad)}' >> n.sh; bash n.sh`, (bad) => `(sleep 1; printf '${A(bad)}' > n.sh) & cp ok.sh n.sh; printf '${B(bad)}' >> n.sh; bash n.sh`, (bad) => `{ printf '${A(bad)}' > n.sh; } & cp ok.sh n.sh; printf '${B(bad)}' >> n.sh; bash n.sh`,
+    (bad) => `printf '${A(bad)}' > n.sh | cp ok.sh n.sh; printf '${B(bad)}' >> n.sh; bash n.sh`, (bad) => `cp ok.sh n.sh | printf '${A(bad)}' > n.sh; printf '${B(bad)}' >> n.sh; bash n.sh`, (bad) => `bash bgw.sh; cp ok.sh n.sh; printf '${B(bad)}' >> n.sh; bash n.sh`, (bad) => `bash bgw2.sh; cp ok.sh n.sh; printf '${B(bad)}' >> n.sh; bash n.sh`,
+    (bad) => `bash -c 'cp p1.txt n.sh &'; cp ok.sh n.sh; printf '${B(bad)}' >> n.sh; bash n.sh`]) denyBoth(mk, spec);
+  // pipelines run at the same time: the reader sees the writer's file whenever the writer gets there
+  for (const l of ['cat n.sh | bash & cp f.sh n.sh', 'bash n.sh | cp f.sh n.sh', 'cat n.sh | bash | cp f.sh n.sh']) denyBoth(l, spec);
+  // the twins: ordered writes (the last one wins), a write to another file, a script that runs in the foreground, a wait
+  for (const mk of [(bad) => `printf '${A(bad)}' > n.sh; cp ok.sh n.sh; printf '${B(bad)}' >> n.sh; bash n.sh`, (bad) => `printf '${A(bad)}' > m.sh & cp ok.sh n.sh; printf '${B(bad)}' >> n.sh; bash n.sh`, (bad) => `printf '${A(bad)}' > m.sh | cp ok.sh n.sh; printf '${B(bad)}' >> n.sh; bash n.sh`,
+    (bad) => `bash fgw.sh; cp ok.sh n.sh; printf '${B(bad)}' >> n.sh; bash n.sh`]) {
+    const x = run(mk, spec);
+    // (collect still judges every source on its own: p1.txt alone is harmless, ok.sh is harmless, the append alone is harmless)
+    assert.equal(x.git.r.decision, 'allow', x.git.cmd); // (guard-files refuses the append piece alone: it names a protected file)
+  }
+});
+
+test('L4: a write that may fail or be skipped does not replace the file\'s own text in the joined judgment', () => {
+  // Why: \`cp missing.sh n.sh; printf B >> n.sh\` -- when the copy fails n.sh keeps its text and the append completes it
+  const spec = { ...SPEC, 'n.sh': 'bad1' };
+  const B = (bad) => bad.slice(8);
+  for (const mk of [(t) => `cp missing.sh n.sh; printf '${t}' >> n.sh; bash n.sh`, (t) => `false && cp ok.sh n.sh; printf '${t}' >> n.sh; bash n.sh`, (t) => `cp ok.sh n.sh || true; printf '${t}' >> n.sh; bash n.sh`, (t) => `mv missing.sh n.sh; printf '${t}' >> n.sh; bash n.sh`,
+    (t) => `true || cp ok.sh n.sh; printf '${t}' >> n.sh; bash n.sh`, (t) => `if false; then cp ok.sh n.sh; fi; printf '${t}' >> n.sh; bash n.sh`, (t) => `[ -f x ] && cp ok.sh n.sh; printf '${t}' >> n.sh; bash n.sh`]) {
+    denyBoth((bad) => mk(B(bad)), spec);
+  }
+  // the twin: the copy certainly runs and replaces the text
+  assert.equal(run((bad) => `cp ok.sh n.sh; printf '${B(bad)}' >> n.sh; bash n.sh`, spec).git.r.decision, 'allow');
+});
