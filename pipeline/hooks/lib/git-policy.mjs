@@ -853,7 +853,8 @@ function checkScriptFile(sf, dir, ctx, level) {
   const home = !sf.candidate && (file === '~' || file.startsWith('~/')) ? ctx.home + file.slice(1) : file;
   // a relative script after a cd that may not have run: which file runs is unknown, never the starting directory's
   // (a scan word is a guess at a file name, not a script: it is looked up in the starting directory instead)
-  if (dir === null && sf.kind !== 'scan' && !path.isAbsolute(home)) return deny(`cannot tell which directory this runs in, so which ${sf.file} runs cannot be verified. Use an absolute path, or chain the cd with &&.`);
+  // Why: a `~/…` word (also the as-written reading of an rc glob such as ~/.psqlrc-*) is the home, whatever directory the line is in
+  if (dir === null && sf.kind !== 'scan' && !path.isAbsolute(home) && !(sf.candidate && /^~(?:\/|$)/.test(sf.file))) return deny(`cannot tell which directory this runs in, so which ${sf.file} runs cannot be verified. Use an absolute path, or chain the cd with &&.`);
   const abs = path.resolve(dir ?? ctx.cwd, home);
   checkDeadline(ctx.budget);
   // a script the line itself wrote (or may have written) before this command is judged on every content it may hold, as well as on the file as it is now
@@ -1345,6 +1346,38 @@ const isStateHazard = (c) => {
 const FUNCTION_DEF = /(?:^|[\s;&|(){])(?:function\s+[^\s(){};&|<>]+|[A-Za-z_][\w.:-]*\s*\(\s*\))/;
 // `source` / `.` run a file in THIS shell: it may cd, check out a branch or reassign any variable.
 const SOURCING = ['source', '.'];
+// Why: only unquoted text defines a function: `create function f(uuid)` in a psql -c, `fn()` in a node -e program or a commit message is data. Quoted text counts again when something on
+// the line runs text as code (eval, a shell, source, trap, a name known only at run time), and when the line has a heredoc (an apostrophe in its body would unbalance the quotes).
+const TEXT_RUNNERS = new Set(['eval', 'source', '.', 'trap', 'alias', 'bash', 'sh', 'zsh', 'dash', 'ksh', 'fish', 'env', 'xargs', 'command', 'builtin', 'exec', 'sudo', 'timeout', 'nohup', 'time', 'nice', 'watch', 'parallel', 'ssh', 'coproc', 'script', 'su', 'doas', 'stdbuf']);
+// (null when the quoting cannot be trusted: a comment (an apostrophe in it opens no quote), `$'..'` (its \' does not close), an unterminated quote: the caller then keeps the hazard)
+function unquotedText(s) {
+  let out = '';
+  for (let i = 0; i < s.length;) {
+    const ch = s[i];
+    if (ch === '\\') { out += s.slice(i, i + 2); i += 2; continue; }
+    if ((ch === '#' && (i === 0 || /[\s;&|(){]/.test(s[i - 1]))) || (ch === '$' && s[i + 1] === "'")) return null;
+    if (ch === "'") {
+      const j = s.indexOf("'", i + 1);
+      if (j < 0) return null;
+      out += "''"; i = j + 1; continue;
+    }
+    if (ch === '"') {
+      let j = i + 1;
+      while (j < s.length && s[j] !== '"') j += s[j] === '\\' ? 2 : 1;
+      if (j >= s.length) return null;
+      const body = s.slice(i, j + 1);
+      out += /\$[({]|`/.test(body) ? body : '""'; i = j + 1; continue;
+    }
+    out += ch; i++;
+  }
+  return out;
+}
+function definesFunction(str, cmds) {
+  if (!FUNCTION_DEF.test(str)) return false;
+  if (/<</.test(str) || cmds.some((c) => c.argv.length && (TEXT_RUNNERS.has(baseName(c.argv[0])) || DYNAMIC.test(c.argv[0])))) return true;
+  const u = unquotedText(str);
+  return u === null || FUNCTION_DEF.test(u);
+}
 
 // An unsure variable (assigned more than once, or where it may not run) that reaches a command whose effect may depend on
 // the value — anything outside UNSURE_OK, a path or dynamic command name, or the command name itself — directly (argv,
@@ -1402,7 +1435,7 @@ function evalString(str, startDir, ctx, level) {
   }
   // A variable whose value is not certain (see collectAssignments) denies the line when it reaches git / gh, a command
   // that runs code, cd / pushd / popd or a command name: the checks below read the expanded text.
-  collectAssignments(cmds, ctx, !FUNCTION_DEF.test(str));
+  collectAssignments(cmds, ctx, !definesFunction(str, cmds));
   if (ctx.unsureVars.size || ctx.tainted.size) {
     const unsure = unsureVarReachingCommand(cmds, ctx);
     if (unsure !== null) return deny(`$${unsure} is assigned more than once (or where it may not run) on this line, so its value at run time cannot be verified. Assign it once, unconditionally.`);
@@ -1412,7 +1445,7 @@ function evalString(str, startDir, ctx, level) {
   let uncertain = false; // an earlier cd / branch change may not have taken effect for the commands that follow
   const forgetState = () => { dir = null; for (const e of ctx.branches.values()) e.name = null; };
   // sticky: a later `cd /abs` does not make it known again (`alias cd=true; cd /safe`, a DEBUG trap that cds back)
-  const hazard = FUNCTION_DEF.test(str) || cmds.some(isStateHazard);
+  const hazard = definesFunction(str, cmds) || cmds.some(isStateHazard);
   // the files this command list writes, for every script judged while it runs (see line-writes.mjs); `dirAt`: where each command runs
   const dirAt = new Map();
   const cdDirs = cdTargets(cmds, startDir, ctx);
