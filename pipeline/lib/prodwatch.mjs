@@ -575,6 +575,24 @@ async function watch(opts, deps) {
       }
     }
 
+    // Posting the intent took GitHub round trips after the check above: look once more, right before acting. If
+    // production moved, abort and close the intent so it is not left open (an intent with no result reads as interrupted).
+    if (events) {
+      let last = null;
+      let readError = null;
+      try {
+        last = await inspectAlias(domain);
+      } catch (err) {
+        readError = err;
+      }
+      if (readError || last.id !== before.id) {
+        if (last) ev.live = ev.liveChanged = last;
+        await postAbortedRollback(last);
+        if (readError) return skip(`could not re-read the live deployment after recording the rollback intent, so nothing was rolled back: ${readError?.message ?? readError}`);
+        return 'changed-during-recovery';
+      }
+    }
+
     rollbackTried = true;
     let rb;
     try {
@@ -621,6 +639,18 @@ async function watch(opts, deps) {
     } catch (err) {
       ev.warnings.push(`could not record the ${kind} event on the PR: ${err?.message ?? err}`);
     }
+  }
+  // The attempt's intent was recorded but the rollback never ran: close it, so the owner is not told it was interrupted.
+  async function postAbortedRollback(live) {
+    if (resultPosted || !eventId) return;
+    resultPosted = true;
+    await postLater('rollback-result', () => 'Rollback ABORTED before it ran: production changed after the intent was recorded, so nothing was rolled back.', () => ({
+      mergeSha: sha,
+      ok: false,
+      aborted: true,
+      liveAfter: live ? { id: live.id ?? null, url: live.url ?? null } : null,
+      verified: false,
+    }));
   }
   async function postRollbackResult(verified) {
     if (resultPosted || !eventId) return;

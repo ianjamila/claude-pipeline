@@ -785,6 +785,8 @@ test('linkedProjectDir: the checkout itself when linked; else the main checkout 
 // ---- run events, the run record and --observe-only ----------------------------------------------------------------------
 
 const RECOVER = { smoke: [FAIL, FAIL, PASS], inspect: [OURS, OURS, OLDER] };
+// With a PR the watch re-reads production once more AFTER recording the rollback intent (before, again, after-intent, read-back).
+const RECOVER_EV = { smoke: [FAIL, FAIL, PASS], inspect: [OURS, OURS, OURS, OLDER] };
 
 // A one-PR stand-in for the bits of createGitHub() the summary comment and the run-record tracker use.
 function fakeSummaryGh(initial) {
@@ -812,7 +814,7 @@ const eventOf = (kind, id, data) => listEvents([{ id: (commentId += 1), user: { 
 const PROD_BEFORE = eventOf('prod-before', '12-1', { environment: 'Production', pr: 12, deployment: { id: 'dpl_old', sha: OLD_SHA, url: 'https://old-xyz-team.vercel.app' } });
 
 test('events: rollback-intent is posted BEFORE the rollback, rollback-result AFTER it and its check, recovery-reported after the issue and revert PR', async () => {
-  const h = harness({ ...RECOVER, events: true });
+  const h = harness({ ...RECOVER_EV, events: true });
   const r = await h.go();
   assert.equal(r.outcome, 'recovered');
   assert.deepEqual(h.posted.map((e) => e.kind), ['rollback-intent', 'rollback-result', 'recovery-reported']);
@@ -836,6 +838,31 @@ test('events: rollback-intent is posted BEFORE the rollback, rollback-result AFT
   for (const e of h.posted) assert.ok(parseEvent(renderEvent(e.kind, e.id, e.sentence, e.data)));
 });
 
+test('events: production changing WHILE the intent is being recorded aborts the rollback and closes the intent with an aborted result', async () => {
+  const h = harness({ smoke: [FAIL, FAIL], inspect: [OURS, OURS, NEWER], events: true });
+  const r = await h.go();
+  assert.equal(r.outcome, 'changed-during-recovery');
+  assert.equal(h.rollbackFn.calls.length, 0);
+  assert.ok(!h.log.includes('rollback'));
+  assert.equal(r.live.id, 'dpl_newer');
+  assert.deepEqual(h.posted.map((e) => e.kind), ['rollback-intent', 'rollback-result']);
+  assert.deepEqual(h.posted[1].data, { mergeSha: SHA, ok: false, aborted: true, liveAfter: { id: 'dpl_newer', url: 'newer-def-team.vercel.app' }, verified: false });
+  assert.equal(h.posted[1].id, h.posted[0].id, 'the result closes the same attempt');
+  assert.ok(h.log.lastIndexOf('inspect') > h.log.indexOf('event:rollback-intent'), 'production was read again after the intent was posted');
+  for (const e of h.posted) assert.ok(parseEvent(renderEvent(e.kind, e.id, e.sentence, e.data)));
+});
+
+test('events: an unreadable live deployment after the intent also aborts (nothing rolled back, intent closed)', async () => {
+  const h = harness({ smoke: [FAIL, FAIL], inspect: [OURS, OURS, new Error('vercel inspect: 500')], events: true });
+  const r = await h.go();
+  assert.equal(r.outcome, 'rollback-skipped');
+  assert.match(r.reason, /after recording the rollback intent.*500/);
+  assert.equal(h.rollbackFn.calls.length, 0);
+  assert.deepEqual(h.posted.map((e) => e.kind), ['rollback-intent', 'rollback-result']);
+  assert.equal(h.posted[1].data.aborted, true);
+  assert.equal(h.posted[1].data.liveAfter, null);
+});
+
 test('events: no events dep (no PR known) rolls back exactly as before', async () => {
   const h = harness(RECOVER);
   assert.equal((await h.go()).outcome, 'recovered');
@@ -845,13 +872,13 @@ test('events: no events dep (no PR known) rolls back exactly as before', async (
 test('events: the event number counts the rollback-intents already on the PR for this merge', async () => {
   const prior = eventOf('rollback-intent', 'aaaaaaa-1', { mergeSha: SHA });
   const otherMerge = eventOf('rollback-intent', 'ccccccc-1', { mergeSha: 'c'.repeat(40) });
-  const h = harness({ ...RECOVER, events: true, eventList: [prior, otherMerge] });
+  const h = harness({ ...RECOVER_EV, events: true, eventList: [prior, otherMerge] });
   await h.go();
   assert.deepEqual(h.posted.map((e) => e.id), ['aaaaaaa-2', 'aaaaaaa-2', 'aaaaaaa-2']);
 });
 
 test('events: if the rollback-intent cannot be recorded NOTHING is rolled back (rollback-skipped, urgent issue, no later events)', async () => {
-  const h = harness({ ...RECOVER, events: true, postFail: ['rollback-intent'] });
+  const h = harness({ ...RECOVER_EV, events: true, postFail: ['rollback-intent'] });
   const r = await h.go();
   assert.equal(r.outcome, 'rollback-skipped');
   assert.equal(r.reason, 'could not record the rollback intent on the PR');
@@ -864,7 +891,7 @@ test('events: if the rollback-intent cannot be recorded NOTHING is rolled back (
 });
 
 test('events: failing to post rollback-result or recovery-reported is a warning, never a different outcome', async () => {
-  const h = harness({ ...RECOVER, events: true, postFail: ['rollback-result', 'recovery-reported'] });
+  const h = harness({ ...RECOVER_EV, events: true, postFail: ['rollback-result', 'recovery-reported'] });
   const r = await h.go();
   assert.equal(r.outcome, 'recovered');
   assert.equal(r.warnings.length, 2);
@@ -873,7 +900,7 @@ test('events: failing to post rollback-result or recovery-reported is a warning,
 });
 
 test('events: a rollback that fails is recorded as ok:false verified:false (and the incident is still reported)', async () => {
-  const h = harness({ ...RECOVER, events: true, rollback: [{ ok: false, code: 1, tail: 'boom' }] });
+  const h = harness({ ...RECOVER_EV, events: true, rollback: [{ ok: false, code: 1, tail: 'boom' }] });
   const r = await h.go();
   assert.equal(r.outcome, 'rollback-failed');
   assert.deepEqual(h.posted.map((e) => e.kind), ['rollback-intent', 'rollback-result', 'recovery-reported']);
@@ -881,7 +908,7 @@ test('events: a rollback that fails is recorded as ok:false verified:false (and 
 });
 
 test('events: a rollback that ran but production still fails the smoke is ok:true verified:false', async () => {
-  const h = harness({ smoke: [FAIL, FAIL, FAIL, FAIL], inspect: [OURS, OURS, OLDER], events: true });
+  const h = harness({ smoke: [FAIL, FAIL, FAIL, FAIL], inspect: [OURS, OURS, OURS, OLDER], events: true });
   const r = await h.go();
   assert.equal(r.outcome, 'rollback-failed');
   assert.deepEqual(h.posted[1].data, { mergeSha: SHA, ok: true, liveAfter: { id: 'dpl_old', url: 'old-xyz-team.vercel.app' }, verified: false });
@@ -890,7 +917,7 @@ test('events: a rollback that ran but production still fails the smoke is ok:tru
 test('events: an unexpected error AFTER the rollback ran still writes a rollback-result (never an intent left open)', async () => {
   // the pause before the post-rollback smoke retry is the 2nd sleep; it blows up
   const h = harness({
-    smoke: [FAIL, FAIL, FAIL], inspect: [OURS, OURS, OLDER], events: true,
+    smoke: [FAIL, FAIL, FAIL], inspect: [OURS, OURS, OURS, OLDER], events: true,
     sleep: (ms, n) => { if (n === 2) throw new Error('clock exploded'); },
   });
   const r = await h.go();
@@ -904,7 +931,7 @@ test('events: an unexpected error AFTER the rollback ran still writes a rollback
 
 test('events: a result that cannot even be built is a warning, not a crash', async () => {
   const exploding = { id: 'dpl_old', get url() { throw new Error('inspect reply was not an object'); } };
-  const h = harness({ smoke: [FAIL, FAIL], inspect: [OURS, OURS, exploding], events: true });
+  const h = harness({ smoke: [FAIL, FAIL], inspect: [OURS, OURS, OURS, exploding], events: true });
   const r = await h.go();
   assert.equal(r.outcome, 'rollback-failed');
   assert.ok(r.warnings.some((w) => /rollback-result event/.test(w)));
@@ -984,7 +1011,7 @@ function assertReadOnly(h, r) {
 }
 
 test('observe-only: a failing smoke on our live deployment is needs-owner with the evidence, and NOTHING is changed', async () => {
-  const h = harness({ ...RECOVER, events: true });
+  const h = harness({ ...RECOVER_EV, events: true });
   const r = await h.go({ observeOnly: true });
   assert.equal(r.outcome, 'needs-owner');
   assert.equal(r.ok, false);
@@ -1082,7 +1109,7 @@ test('observe-only: an intent with a matching result, or an intent for another m
 
 test('observe-only: an interrupted rollback is reported on every outcome, and an unreadable event list is only a warning', async () => {
   const intent = eventOf('rollback-intent', 'aaaaaaa-1', { mergeSha: SHA });
-  const failing = harness({ ...RECOVER, events: true, eventList: [intent] });
+  const failing = harness({ ...RECOVER_EV, events: true, eventList: [intent] });
   const r = await failing.go({ observeOnly: true });
   assert.equal(r.outcome, 'needs-owner');
   assert.equal(r.rollbackInterrupted.intent.id, 'aaaaaaa-1');
