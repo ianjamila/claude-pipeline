@@ -49,13 +49,26 @@ const ANCESTOR_REL = ['.claude', '.claude/skills', '.claude/agents'];
 
 // Why: a name assigned from a changed name is changed too (`X=$D; echo x > $X/s`, `E=$D bash w.sh`): the assignments of the line (a bare `NAME=value`, a declaration's
 // `NAME=value`) and `extra` (the prefix values of the command a child frame is started by) taint the name they set, until nothing new is added.
-function taintClosure(base, cmds, extra = {}) {
+// Fail closed once a source could not be followed (`active`): a nameref (`declare -n R=D`) and the targets of `read` / `printf -v` / `mapfile` / `readarray` are changed whatever their
+// input. (An `eval` text that mentions a changed name is refused where it stands, as a writer.)
+function taintClosure(base, cmds, extra = {}, isNew = () => false, active = false) {
   const set = new Set(base);
-  const refs = (v) => [...String(v).matchAll(/\$\{?(\w+)/g)].some((x) => set.has(x[1]));
+  const refs = (v) => [...String(v).matchAll(/\$\{?(\w+)/g)].some((x) => set.has(x[1]) || isNew(x[1]));
   const sets = [];
+  const always = (n) => { if (/^[A-Za-z_]\w*$/.test(n)) set.add(n); };
   for (const c of cmds) {
+    const cn = commandName(c.argv[0] ?? '');
     if (!c.argv.length) sets.push(...Object.entries(c.env ?? {}));
-    else if (['export', 'declare', 'typeset', 'local', 'readonly'].includes(commandName(c.argv[0]))) for (const a of c.argv.slice(1)) { const m = /^([A-Za-z_]\w*)=([\s\S]*)$/.exec(a); if (m) sets.push([m[1], m[2]]); }
+    else if (['export', 'declare', 'typeset', 'local', 'readonly'].includes(cn)) {
+      const nameref = c.argv.slice(1).some((a) => /^-[A-Za-z]*n/.test(a));
+      for (const a of c.argv.slice(1)) {
+        const m = /^([A-Za-z_]\w*)=([\s\S]*)$/.exec(a);
+        if (m) sets.push([m[1], m[2]]);
+        if (active && nameref && !a.startsWith('-')) always(a.split('=')[0]);
+      }
+    } else if (active && cn === 'read') for (const a of c.argv.slice(1)) always(a);
+    else if (active && (cn === 'mapfile' || cn === 'readarray')) { always('MAPFILE'); for (const a of c.argv.slice(1)) always(a); }
+    else if (active && cn === 'printf') { const i = c.argv.indexOf('-v'); if (i > 0) always(c.argv[i + 1] ?? ''); }
   }
   sets.push(...Object.entries(extra));
   for (let grew = true; grew;) { grew = false; for (const [k, v] of sets) if (!set.has(k) && refs(v)) { set.add(k); grew = true; } }
@@ -1559,7 +1572,9 @@ function evaluateBashForFilesFrame(command, opts) {
   // scripts they run are judged with them (a name like `. "$F"` in the file is then the file F names, not an unknown).
   // (every name of the line is seeded, exported or not, and wherever it was set: stricter than the shell, which only passes exported ones on; kept on purpose,
   // a missed name would hide the script a variable picks. The replay found no false block from it.)
-  const withLineVars = (o, c = null) => ({ ...o, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set([...ctx.unknownVars, ...ctx.pickUnknown]), _unknownW: new Set(ctx.unknownVars), _srcChanged: taintClosure(ctx.srcChanged, cmds, c?.env ?? {}), _unknownAll: ctx.unknownAll });
+  // (a name the line never set, after a source nothing could follow: it may have come from that file)
+  const newName = (n) => ctx.unknownAll && !Object.hasOwn(ctx.vars, n);
+  const withLineVars = (o, c = null) => ({ ...o, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set([...ctx.unknownVars, ...ctx.pickUnknown]), _unknownW: new Set(ctx.unknownVars), _srcChanged: taintClosure(ctx.srcChanged, cmds, c?.env ?? {}, newName, ctx.srcChanged.size > 0 || ctx.unknownAll), _unknownAll: ctx.unknownAll });
 
   // A startup file is judged once per evaluation. It is marked first: a startup file that starts shells itself would be judged again and
   // again otherwise (a denial ends the whole evaluation, so marking before the verdict is safe).
@@ -1677,11 +1692,11 @@ function evaluateBashForFilesFrame(command, opts) {
   // is unknown, so a redirection or a writer that names it is refused, whatever the rest of the path (names are the line's own choice, none is exempt). Not write targets: the
   // operand of a command that runs a script (`source $X`, `bash $F`), a reader, `cd`, a declaration, and an element of a path-list variable's value (`PATH=$D:$PATH`).
   if (ctx.srcChanged.size || ctx.unknownAll) {
-    const taint = taintClosure(ctx.srcChanged, cmds);
-    const maybeChanged = (n) => taint.has(n) || (ctx.unknownAll && !Object.hasOwn(ctx.vars, n));
-    const changed = (w) => [...String(w).matchAll(/\$\{?(\w+)/g)].some((x) => maybeChanged(x[1]));
-    const taintedEnv = (w) => [...String(w).matchAll(/\$\{?(\w+)/g)].some((x) => taint.has(x[1])); // (a prefix value of a command: only a name that is known to be changed, not any unset one)
-    const PATH_LISTS = new Set(['PATH', 'CDPATH', 'MANPATH', 'INFOPATH', 'LD_LIBRARY_PATH', 'DYLD_LIBRARY_PATH', 'NODE_PATH', 'PYTHONPATH', 'GOPATH']);
+    const taint = taintClosure(ctx.srcChanged, cmds, {}, newName, true);
+    const maybeChanged = (n) => taint.has(n) || newName(n);
+    const changed = (w) => /\$\{!/.test(String(w)) || [...String(w).matchAll(/\$\{?(\w+)/g)].some((x) => maybeChanged(x[1])); // (`${!X}` names a variable by the value of X)
+    const taintedEnv = (w) => [...String(w).matchAll(/\$\{?(\w+)/g)].some((x) => taint.has(x[1])); // (a prefix value: only a name known to be changed; an unset one is judged in the child that gets it, `BASH_ENV=$Q bash x.sh` stays allowed)
+    const PATH_LISTS = new Set(['PATH', 'CDPATH', 'MANPATH', 'INFOPATH', 'LD_LIBRARY_PATH', 'DYLD_LIBRARY_PATH', 'NODE_PATH', 'PYTHONPATH']); // (search lists only: go writes under GOPATH)
     for (const c of cmds) {
       const name = baseOf(c.argv[0] ?? '');
       const writes = c.argv.length > 0 && !isReadOnly(c, ctx) && !['export', 'declare', 'typeset', 'local', 'readonly', ...CD_CMDS].includes(name);

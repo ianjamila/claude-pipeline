@@ -488,3 +488,24 @@ test('S4: a reader named by a variable cannot launder a feed to a shell', () => 
   for (const c of ['Q=cat; $Q < f.sh | bash', 'Q=cat; $Q f.sh | bash', 'Q=cat; $Q f.sh | sh -s', 'Q=head; $Q -c 9999 f.sh | bash', 'Q=cat; bash < <($Q f.sh)', 'Q=cat; $Q < f.sh | xargs -I{} sh -c "{}"']) denyBoth(c, SPEC);
   for (const c of ['Q=cat; $Q < x.sh | bash', 'Q=cat; $Q x.sh | bash', 'Q=cat; $Q f.sh | wc -l', 'Q=cat; $Q < f.sh | grep x']) allowBoth(c, SPEC);
 });
+
+// ---- S4b: taint propagation through assignments (files-policy) -------------------------------------------------------------
+
+test('S4b: a name set from a maybe-changed name is changed too (namerefs, read, printf -v, mapfile, eval, indirection, unset names)', () => {
+  const fs = fakeFs(PROJ, { 'dyn.sh': 'F=$(pick)', 'ev.sh': 'eval "$X"', 'w.sh': 'cp ok.sh $E/settings.json', 'w2.sh': 'cp ok.sh $X/a.txt', 'ok.sh': 'echo ok' }, DIRS);
+  for (const c of [
+    // (an assignment from a changed name taints its target for the script the line starts, and a later assignment from an unset name taints a name the line set before)
+    'source dyn.sh; X=$F; bash w2.sh', 'source ev.sh; Y=/tmp; Y=$NEWVAR; echo x > $Y/a.txt', 'source ev.sh; Y=/tmp; Y=$NEWVAR; cp ok.sh $Y',
+    // (an unset name after a source nothing could follow may have come from it: what is set from it is changed)
+    'source ev.sh; Y=$NEWVAR; echo x > $Y/a.txt', 'source ev.sh; E=$NEWVAR bash w.sh', 'source ev.sh; export Y=$NEWVAR; cp ok.sh $Y', 'source ev.sh; Y=$NEWVAR; Z="$Y/x"; cp ok.sh $Z',
+    'source dyn.sh; echo x > ${!F}/a.txt', 'R=a; source dyn.sh; declare -n R=F; echo x > $R/a.txt', 'R=a; source dyn.sh; typeset -n R=F; cp ok.sh $R',
+    'W=a; source dyn.sh; printf -v W %s $F; echo x > $W/a.txt', 'W=a; source dyn.sh; read W <<< "$F"; echo x > $W/a.txt', 'B=a; source dyn.sh; read -r A B <<< "$F"; cp ok.sh $B',
+    'W=a; source dyn.sh; mapfile W <<< "$F"; cp ok.sh $W', 'W=a; source dyn.sh; readarray -t W <<< "$F"; cp ok.sh $W', 'W=a; source dyn.sh; eval "W=\\$F"; echo x > $W/a.txt', 'MAPFILE=a; source dyn.sh; mapfile <<< "$F"; cp ok.sh $MAPFILE',
+    // (a search list is no write target, go writes under GOPATH)
+    'source dyn.sh; GOPATH=$F go install x', 'source dyn.sh; GOBIN=$F go install x',
+  ]) assert.equal(files(c, fs).decision, 'deny', c);
+  for (const c of [
+    'source dyn.sh; PATH=$F:$PATH go install x', 'source dyn.sh; PYTHONPATH=$F python3 -c pass', 'read W; echo x > $W/a.txt', 'printf -v W %s hi; echo x > ./a.txt',
+    'source dyn.sh; W=/tmp; read V; echo x > $W/a.txt',
+  ]) assert.equal(files(c, fs).decision, 'allow', c);
+});
