@@ -184,6 +184,12 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
       return { id: r.id, url: r.html_url, action: existing ? 'updated' : 'created' };
     },
 
+    // Always a NEW comment, never an edit: for append-only evidence (run events) that no later writer may overwrite.
+    createComment(n, body) {
+      const r = api('POST', `repos/${self.repo().slug}/issues/${prNumber(n)}/comments`, { body });
+      return { id: r.id, url: r.html_url };
+    },
+
     // 200 / 403 (plan | permission) / 404 are answers; anything else (5xx, network) throws.
     protection(branch) {
       const args = ['api', `repos/${self.repo().slug}/branches/${encodePath(branch)}/protection`];
