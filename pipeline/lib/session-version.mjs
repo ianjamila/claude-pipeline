@@ -1,0 +1,250 @@
+// Why: the owner runs this pipeline on several machines and two Claude accounts, and nothing used to say when the
+// installed copy had fallen behind, been edited, or was older than the rules a repo's CI already enforces. The
+// SessionStart hook (hooks/session-version.mjs) says so, once, at the top of a session - and says NOTHING when all is
+// well. The decision is a pure function over gathered facts (messagesFor), so every case is a table row in a test; the
+// gathering (gatherFacts) is bounded by ONE deadline shared by every git and network step, takes its collaborators by
+// injection, and never throws. Lookups are cached on disk (main's sha briefly, a definitive compare forever, keyed by
+// the full shas) so most sessions never touch the network; a cache that cannot be read or written is just a miss.
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { installedIdentity, parseStamp, stampIsTrusted, gitIn } from './identity.mjs';
+import { mainSha, compare } from './upstream.mjs';
+
+export const DEADLINE_MS = 4000;
+export const MAIN_TTL_MS = 15 * 60 * 1000;
+export const UPDATE_COMMAND = 'node ~/.claude/pipeline/bin/pipeline.mjs update';
+export const TIMEOUT_LINE = 'pipeline version check incomplete (timed out)';
+
+const OWN_TERMINAL = `run \`${UPDATE_COMMAND}\` in your own terminal`;
+const short = (sha) => String(sha ?? '').slice(0, 7);
+const firstLine = (text) => String(text ?? '').trim().split(/\r?\n/)[0].slice(0, 160);
+const isTimeout = (r) => Boolean(r && (r.timedOut || /timed out/i.test(String(r.reason ?? ''))));
+
+// Does the installed identity need its own warning (case 1)? Returns the states, [] when it is clean.
+export function installedProblems(installed) {
+  const states = [];
+  if (installed.complete === false) states.push('incomplete (a previous install did not finish)');
+  const changed = (installed.modified?.length ?? 0) + (installed.missing?.length ?? 0);
+  if (changed > 0) states.push(`modified (${changed} installed file${changed === 1 ? ' differs' : 's differ'} from what was installed)`);
+  if (installed.sourceDirty) states.push('unverified (built from a source tree that was not a clean checkout)');
+  return states;
+}
+
+// ---- the decision ------------------------------------------------------------------------------------------------
+
+// facts = {
+//   installed:  an installedIdentity() result, or null (nothing readable installed)
+//   repo:       null (no git repo at the session's cwd) | { root, vendoredStamp: string | null }
+//   main:       null (not looked up) | { ok: true, sha } | { ok: false, reason, timedOut? }
+//   installedVsMain:     null | compare(installedSha, mainSha) result      ('ahead' = main has commits the install lacks)
+//   vendoredVsInstalled: null | compare(vendoredSha, installedSha) result  ('behind' = the vendored copy is newer,
+//                                                                          'ahead' = the install is newer)
+//   vendorDrift: null | [{ file, reason }]   (only read when the install is newer than the vendored copy)
+//   timedOut:   true when a step was skipped or cut off by the deadline
+// }
+// Returns the lines to show, [] when everything is fine. "check incomplete (timed out)" is the line of last resort: it
+// appears only when nothing else was worth saying.
+export function messagesFor(facts) {
+  const lines = [];
+  let timedOut = facts.timedOut === true;
+  const { installed, repo } = facts;
+
+  // Case 1: the install itself cannot be trusted. Updating fixes it, so nothing else is worth comparing.
+  if (!installed) {
+    return [`installed pipeline has no readable INSTALLED.json, so its version cannot be told: ${OWN_TERMINAL}`];
+  }
+  const problems = installedProblems(installed);
+  if (problems.length > 0) {
+    return [`installed pipeline is ${problems.join(' and ')} (${installed.stamp}): ${OWN_TERMINAL}`];
+  }
+  if (!installed.sourceSha) {
+    return [`cannot tell whether your installed pipeline (${installed.stamp}) is current, its stamp names no source commit: ${OWN_TERMINAL}`];
+  }
+  const inst7 = short(installed.sourceSha);
+
+  // Cases 2 and 5: the install against upstream's main.
+  const main = facts.main;
+  if (main && main.ok === false) {
+    if (isTimeout(main)) timedOut = true;
+    else lines.push(`could not check claude-pipeline main (${firstLine(main.reason)}); your install is ${installed.stamp}`);
+  } else if (main && main.ok) {
+    const c = facts.installedVsMain;
+    if (c?.status === 'ahead') {
+      lines.push(`claude-pipeline main is ahead of your install (${inst7} → ${short(main.sha)}): ${OWN_TERMINAL}`);
+    } else if (c?.status === 'diverged') {
+      lines.push(`your installed pipeline (${inst7}) and claude-pipeline main (${short(main.sha)}) have diverged, so it cannot be told which is newer: ${OWN_TERMINAL} to move to main`);
+    } else if (c?.status === 'unresolved') {
+      if (isTimeout(c)) timedOut = true;
+      else lines.push(`could not compare your installed pipeline (${inst7}) with claude-pipeline main (${short(main.sha)}): ${firstLine(c.reason)}`);
+    }
+    // identical / behind (the install is newer than published main): nothing to say
+  }
+
+  // Cases 3, 4 and 5: this repo's vendored scripts/pipeline against the install.
+  if (repo && repo.vendoredStamp !== null) {
+    const parsed = parseStamp(repo.vendoredStamp);
+    if (!parsed) {
+      lines.push(`this repo's scripts/pipeline/VERSION (${JSON.stringify(firstLine(repo.vendoredStamp))}) is not a version stamp, so it cannot be compared with your install`);
+    } else if (!stampIsTrusted(parsed)) {
+      lines.push(`this repo's scripts/pipeline is stamped ${repo.vendoredStamp.trim()}, which does not name a published pipeline commit, so it cannot be compared with your install (${inst7})`);
+    } else {
+      const c = facts.vendoredVsInstalled;
+      const vend7 = short(parsed.sha);
+      if (c?.status === 'behind') {
+        lines.push(`WARNING: this repo's scripts/pipeline (${vend7}) is NEWER than your installed pipeline (${inst7}): the repo's CI rules are newer than your local CLI, so local checks may pass what CI rejects. Run \`${UPDATE_COMMAND}\` in your own terminal before relying on it`);
+      } else if (c?.status === 'ahead') {
+        const drift = facts.vendorDrift;
+        if (Array.isArray(drift) && drift.length > 0) {
+          lines.push(`this repo's scripts/pipeline is out of date (${vend7}, your install is ${inst7}) — a \`pipeline vendor\` PR is owed (${drift.length} vendored file${drift.length === 1 ? '' : 's'} differ)`);
+        }
+        // only the commit differs, the vendored content matches: nothing to say
+      } else if (c?.status === 'diverged') {
+        lines.push(`this repo's scripts/pipeline (${vend7}) and your installed pipeline (${inst7}) have diverged, so it cannot be told which is newer`);
+      } else if (c?.status === 'unresolved') {
+        if (isTimeout(c)) timedOut = true;
+        else lines.push(`could not compare this repo's scripts/pipeline (${vend7}) with your installed pipeline (${inst7}): ${firstLine(c.reason)}`);
+      }
+    }
+  }
+
+  if (lines.length === 0 && timedOut) return [TIMEOUT_LINE];
+  return lines;
+}
+
+// The exact stdout of a SessionStart hook with something to say; '' (print nothing) otherwise.
+export function formatOutput(lines) {
+  if (!lines || lines.length === 0) return '';
+  const text = lines.join('\n');
+  return `${JSON.stringify({ systemMessage: text, hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: text } })}\n`;
+}
+
+// ---- the cache ---------------------------------------------------------------------------------------------------
+
+export const cacheDirFor = (env = process.env, home = os.homedir()) => path.join(env.XDG_CACHE_HOME || path.join(home, '.cache'), 'claude-pipeline');
+
+const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const MAX_COMPARES = 200;
+
+function readJson(file) {
+  try { const v = JSON.parse(fs.readFileSync(file, 'utf8')); return v && typeof v === 'object' && !Array.isArray(v) ? v : null; } catch { return null; }
+}
+function writeJson(file, value) {
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, `${JSON.stringify(value)}\n`);
+    fs.renameSync(tmp, file);
+  } catch { /* a cache that cannot be written is just a miss */ }
+}
+
+// main's sha is remembered for MAIN_TTL_MS; a compare is remembered forever, but only a definitive answer between two
+// FULL shas (history never changes), looked up with whatever prefixes the caller holds. Nothing here throws.
+export function createCache(dir, now = Date.now) {
+  const mainFile = path.join(dir, 'main-sha.json');
+  const compareFile = path.join(dir, 'compare.json');
+  return {
+    readMain() {
+      const v = readJson(mainFile);
+      if (!v || !FULL_SHA.test(String(v.sha)) || typeof v.at !== 'number') return null;
+      const age = now() - v.at;
+      return age >= 0 && age < MAIN_TTL_MS ? v.sha : null;
+    },
+    writeMain(sha) {
+      if (FULL_SHA.test(String(sha))) writeJson(mainFile, { sha, at: now() });
+    },
+    lookupCompare(base, head) {
+      const entries = readJson(compareFile)?.entries;
+      if (!entries || typeof entries !== 'object') return null;
+      const b = String(base).toLowerCase();
+      const h = String(head).toLowerCase();
+      for (const [key, status] of Object.entries(entries)) {
+        const [kb, kh] = key.split('...');
+        if (FULL_SHA.test(kb ?? '') && FULL_SHA.test(kh ?? '') && kb.startsWith(b) && kh.startsWith(h)
+          && ['identical', 'ahead', 'behind', 'diverged'].includes(status)) return { status, baseSha: kb, headSha: kh };
+      }
+      return null;
+    },
+    storeCompare(result) {
+      if (!['identical', 'ahead', 'behind', 'diverged'].includes(result?.status) || !FULL_SHA.test(String(result.baseSha)) || !FULL_SHA.test(String(result.headSha))) return;
+      const entries = readJson(compareFile)?.entries ?? {};
+      entries[`${result.baseSha}...${result.headSha}`] = result.status;
+      const keys = Object.keys(entries);
+      for (const k of keys.slice(0, Math.max(0, keys.length - MAX_COMPARES))) delete entries[k];
+      writeJson(compareFile, { entries });
+    },
+  };
+}
+
+// ---- gathering the facts -----------------------------------------------------------------------------------------
+
+const realVendorDrift = async (root) => (await import('../commands/vendor.mjs')).vendorDrift(root);
+
+// Collects the facts messagesFor needs, within `deadlineMs` in total. Anything that cannot finish in time is left out and
+// flagged timedOut; any unexpected error is swallowed (a version check must never disturb a session).
+export async function gatherFacts({ home, cwd, env = process.env, now = Date.now, deadlineMs = DEADLINE_MS, deps = {} }) {
+  const d = {
+    installedIdentity, mainSha, compare, gitIn, vendorDrift: realVendorDrift,
+    readFile: (f) => fs.readFileSync(f, 'utf8'), cache: createCache(cacheDirFor(env), now), ...deps,
+  };
+  const end = now() + deadlineMs;
+  const left = () => end - now();
+  const facts = { installed: null, repo: null, main: null, installedVsMain: null, vendoredVsInstalled: null, vendorDrift: null, timedOut: false };
+  const cut = (r) => { if (r && r.status === 'unresolved' && left() <= 0) r.timedOut = true; return r; };
+  try {
+    try { facts.installed = d.installedIdentity(home); } catch { facts.error = true; return facts; }
+    const inst = facts.installed;
+    // Case 1 and "no source sha" end the story before any git or network step: updating is the whole advice.
+    if (!inst || installedProblems(inst).length > 0 || !inst.sourceSha) return facts;
+
+    // This session's repo and its vendored stamp (local only: one git call, one file).
+    if (typeof cwd === 'string' && cwd && left() > 0) {
+      const top = d.gitIn(cwd, ['rev-parse', '--show-toplevel'], { timeoutMs: Math.max(1, left()) });
+      if (top.code === 0 && top.stdout.trim()) {
+        const root = top.stdout.trim();
+        let vendoredStamp = null;
+        try { vendoredStamp = d.readFile(path.join(root, 'scripts', 'pipeline', 'VERSION')).trim(); } catch { /* no vendored copy */ }
+        facts.repo = { root, vendoredStamp };
+      } else if (top.timedOut) facts.timedOut = true;
+    } else if (typeof cwd === 'string' && cwd) facts.timedOut = true;
+
+    // main, then the install against it.
+    const cachedMain = d.cache.readMain();
+    if (cachedMain) {
+      facts.main = { ok: true, sha: cachedMain };
+    } else if (left() > 0) {
+      const m = d.mainSha({ timeoutMs: Math.max(1, left()), env });
+      facts.main = m.ok ? m : { ...m, timedOut: left() <= 0 };
+      if (m.ok) d.cache.writeMain(m.sha);
+    } else facts.timedOut = true;
+    const relate = (base, head) => {
+      if (head.startsWith(base) || base.startsWith(head)) return { status: 'identical' };
+      const hit = d.cache.lookupCompare(base, head);
+      if (hit) return hit;
+      if (left() <= 0) { facts.timedOut = true; return null; }
+      const r = cut(d.compare(base, head, { timeoutMs: Math.max(1, left()), env }));
+      d.cache.storeCompare(r);
+      return r;
+    };
+    if (facts.main?.ok) facts.installedVsMain = relate(inst.sourceSha, facts.main.sha);
+
+    // The vendored copy against the install - only when its stamp names a commit it can be compared by.
+    const vendored = facts.repo?.vendoredStamp != null ? parseStamp(facts.repo.vendoredStamp) : null;
+    if (vendored && stampIsTrusted(vendored)) {
+      facts.vendoredVsInstalled = relate(vendored.sha, inst.sourceSha);
+      if (facts.vendoredVsInstalled?.status === 'ahead') facts.vendorDrift = await d.vendorDrift(facts.repo.root);
+    }
+  } catch {
+    // swallowed: whatever was gathered so far is all there is
+  }
+  return facts;
+}
+
+// The whole check: facts -> output text ('' when nothing to say). Never throws.
+export async function checkSession(opts) {
+  try {
+    const facts = await gatherFacts(opts);
+    // an identity read that threw is a bug in this check, not a finding about the install
+    return facts.error && !facts.installed ? '' : formatOutput(messagesFor(facts));
+  } catch { return ''; }
+}
