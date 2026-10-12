@@ -25,9 +25,9 @@ export const meta = {
     '  staged lines stay queued ("staged in PR N") until origin/<default> contains them, and are re-staged if that PR closes unmerged;',
     '  default line = the PR\'s agent-log line with outcome "merged — prod smoke pending"; exit 2 when the worktree has other uncommitted changes,',
     '  is on the default branch or a detached HEAD, or is not the PR\'s head branch at the PR\'s head commit; exit 3 when GitHub cannot say',
-    'pipeline agent-log close [--queue] [--repo DIR]   -> {ok, lines, pending, unreadable, queued?}; for every "prod smoke pending" log line reads the',
+    'pipeline agent-log close [--queue] [--repo DIR]   -> {ok, lines, pending, skipped, unreadable, queued?}; for every "prod smoke pending" log line reads the',
     '  bot-authored prod-smoke-result comments on that PR (production.watch: workflow) and prints one resolution line per PR whose newest result',
-    '  is not logged yet; a dry run unless --queue (queues each line like `queue`; never commits); exit 1 when a PR could not be read (the',
+    '  is not logged yet (a PR whose newest logged result is over 14 days old is skipped without a gh call); a dry run unless --queue (queues each line like `queue`; never commits); exit 1 when a PR could not be read (the',
     '  others are still processed), 3 when GitHub is unavailable',
   ].join('\n'),
 };
@@ -184,8 +184,8 @@ async function close(rest, ctx) {
   if (parseLog(logText).pending.length > 0 && !gh.authStatus().ok) {
     throw new Fail(EXIT.UNAVAILABLE, { ok: false, error: 'unavailable', message: 'GitHub is unavailable (gh is not authenticated or unreachable)' });
   }
-  const { lines, pending, unreadable } = await closeLines({ logText, gh: github });
-  const output = { ok: unreadable.length === 0, lines, pending: pending.map(Number), unreadable: unreadable.map((u) => ({ pr: Number(u.pr), message: u.message })) };
+  const { lines, pending, skipped, unreadable } = await closeLines({ logText, gh: github });
+  const output = { ok: unreadable.length === 0, lines, pending: pending.map(Number), skipped: skipped.map(Number), unreadable: unreadable.map((u) => ({ pr: Number(u.pr), message: u.message })) };
   if (values.queue) {
     output.queued = lines.length;
     if (lines.length) await queueLines(root, lines);

@@ -17,6 +17,10 @@ const HOST_RE = /^(?=.{1,253}$)[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-
 const SHA_RE = /^[0-9a-f]{40}$/;
 const ID_RE = /^\d{1,18}$/;
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/;
+// A pending PR whose newest logged resolution is older than this is not re-read (bounds the gh calls per run: the log is
+// append-only, so every merged PR stays "pending" forever). The producing workflow reports deployments of the last 7 days
+// unless dispatched by hand, so 14 days leaves margin. A pending PR with NO resolution line is read whatever its age.
+export const RESOLVED_SKIP_DAYS = 14;
 const PHT_OFFSET_MS = 8 * 3600 * 1000; // Asia/Manila is UTC+8 all year, no DST
 
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -102,26 +106,32 @@ export function parseLog(text) {
 const newestLogged = (list) => (list ?? []).reduce((best, r) => (best === null || r.at >= best.at ? r : best), null);
 
 /**
- * gh: { mergeSha(pr) -> sha | null, listComments(pr) -> comments[] }. Returns { lines, pending, unreadable }.
- * A PR that cannot be read lands in `unreadable` and the rest carry on.
+ * gh: { mergeSha(pr) -> sha | null, listComments(pr) -> comments[] }. `now` (ms) is only used for the skip window.
+ * Returns { lines, pending, skipped, unreadable }. A PR that cannot be read lands in `unreadable` and the rest carry on;
+ * a PR resolved longer ago than RESOLVED_SKIP_DAYS lands in `skipped` and costs no gh call.
  */
-export async function closeLines({ logText, gh }) {
+export async function closeLines({ logText, gh, now = Date.now() }) {
   const { pending, resolutions } = parseLog(logText);
   const lines = [];
+  const skipped = [];
   const unreadable = [];
   for (const pr of pending) {
+    const lastLogged = newestLogged(resolutions.get(pr));
+    if (lastLogged && now - lastLogged.at > RESOLVED_SKIP_DAYS * 24 * 3600 * 1000) {
+      skipped.push(pr);
+      continue;
+    }
     try {
       const sha = await gh.mergeSha(pr);
       if (!sha) continue; // not merged (or no merge commit named yet): nothing to close
       const newest = newestByObserved(resultsFromComments(await gh.listComments(pr), sha));
       if (!newest) continue;
       const obs = formatPht(Date.parse(newest.observed));
-      const logged = newestLogged(resolutions.get(pr));
-      if (logged && logged.host === newest.vercel && logged.outcome === newest.outcome && logged.observed === `${obs.date} ${obs.time}`) continue;
+      if (lastLogged && lastLogged.host === newest.vercel && lastLogged.outcome === newest.outcome && lastLogged.observed === `${obs.date} ${obs.time}`) continue;
       lines.push(resolutionLine({ pr, result: newest }));
     } catch (err) {
       unreadable.push({ pr, message: String(err?.message ?? err).replace(/[\r\n]+/g, ' ').slice(0, 200) });
     }
   }
-  return { lines, pending, unreadable };
+  return { lines, pending, skipped, unreadable };
 }

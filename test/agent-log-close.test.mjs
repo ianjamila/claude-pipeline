@@ -10,7 +10,7 @@ import { cli, AGENT_LOG, REPO, PR } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { DEFAULT_OUTCOME } from '../pipeline/lib/agentlog.mjs';
 import {
-  BOT_AUTHOR, closeLines, formatPht, parseLog, parsePht, parseResultMarkers, resolutionLine,
+  BOT_AUTHOR, RESOLVED_SKIP_DAYS, closeLines, formatPht, parseLog, parsePht, parseResultMarkers, resolutionLine,
 } from '../pipeline/lib/agentlog-close.mjs';
 
 const MERGE_SHA = 'a'.repeat(40);
@@ -76,6 +76,7 @@ test('closeLines: one line for a pending PR with a bot result on its merge sha',
   assert.deepEqual(r.lines, [resolved(1420)]);
   assert.deepEqual(r.pending, ['1420']);
   assert.deepEqual(r.unreadable, []);
+  assert.deepEqual(r.skipped, []);
   assert.deepEqual(gh.calls.sha, ['1420']);
 });
 
@@ -146,6 +147,32 @@ test('closeLines: keeps going when one PR cannot be read, and reports it', async
   assert.deepEqual(r.unreadable, [{ pr: '1430', message: 'boom second line' }]);
 });
 
+test('closeLines: a PR whose newest resolution is older than the window is skipped with zero gh calls; an unresolved old PR is still read', async () => {
+  assert.equal(RESOLVED_SKIP_DAYS, 14);
+  const now = Date.parse('2026-11-30T00:00:00Z');
+  const gh = fakeGh({ 1420: [comment(marker({ outcome: 'failed', observed: '2026-11-29T00:00:00Z' }))], 1411: [comment(marker({ observed: '2026-11-29T00:00:00Z' }))] });
+  const text = [pending(1420), resolved(1420, { obs: '2026-10-12 12:05' }), pending(1411)].join('\n');
+  const r = await closeLines({ logText: text, gh, now });
+  assert.deepEqual(r.skipped, ['1420']);
+  assert.deepEqual(gh.calls.sha, ['1411'], '1420 made no gh call; 1411 has no resolution so it is read whatever its age');
+  assert.deepEqual(gh.calls.comments, ['1411']);
+  assert.equal(r.lines.length, 1);
+  assert.ok(r.lines[0].includes('#1411'));
+});
+
+test('closeLines: the window is judged by the NEWEST logged resolution, and 14 days exactly is still read', async () => {
+  const obs = '2026-10-12 12:05';
+  const at = parsePht('2026-10-12', '12:05');
+  const day = 24 * 3600 * 1000;
+  const edge = fakeGh({ 1420: [] });
+  assert.deepEqual((await closeLines({ logText: `${pending(1420)}\n${resolved(1420, { obs })}`, gh: edge, now: at + 14 * day })).skipped, []);
+  assert.deepEqual(edge.calls.sha, ['1420']);
+  const stale = fakeGh({ 1420: [] });
+  const old = resolved(1420, { outcome: 'failed', obs: '2026-09-01 10:00', run: '1' });
+  assert.deepEqual((await closeLines({ logText: [pending(1420), resolved(1420, { obs }), old].join('\n'), gh: stale, now: at + 14 * day + 1 })).skipped, ['1420']);
+  assert.deepEqual(stale.calls.sha, []);
+});
+
 // ---- CLI -----------------------------------------------------------------------------------------
 
 const commentsEntry = (n, list) => ({ match: `^api repos/acme/widgets/issues/${n}/comments --paginate`, stdoutJson: list });
@@ -174,7 +201,7 @@ test('agent-log close: dry run prints {lines, pending, unreadable} and writes no
   const t = closeRepo(pending(1420), [shaEntry(1420), commentsEntry(1420, [comment(marker())])]);
   const r = t.close();
   assertExit(r, 0);
-  assert.deepEqual(r.json, { ok: true, lines: [resolved(1420)], pending: [1420], unreadable: [] });
+  assert.deepEqual(r.json, { ok: true, lines: [resolved(1420)], pending: [1420], skipped: [], unreadable: [] });
   assert.deepEqual(readQueueLines(t), [], 'a dry run queues nothing');
   assert.equal(t.repo.git(['status', '--porcelain']), '', 'and changes nothing in the worktree');
 });
@@ -234,7 +261,7 @@ test('agent-log close: exit 3 when GitHub is unavailable; no pending lines means
   none.fake.setScript([]);
   const r = none.close();
   assertExit(r, 0);
-  assert.deepEqual(r.json, { ok: true, lines: [], pending: [], unreadable: [] });
+  assert.deepEqual(r.json, { ok: true, lines: [], pending: [], skipped: [], unreadable: [] });
   assert.deepEqual(none.fake.lines(), []);
 });
 
