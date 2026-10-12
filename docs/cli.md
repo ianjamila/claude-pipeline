@@ -223,13 +223,19 @@ Branch protection must require `ci.required_checks` AND, unless `ci.guard_checks
 verify the production deployment of a merge; roll back safely, open an issue and a revert PR if it fails.
 
 ```
-pipeline prod-watch (--sha MERGE_SHA [--pr N] | --pr N) [--expect-text T] [--retry-wait SEC=60] [--repo DIR]   -> {ok, outcome: merged|deploy-failed|deploy-not-observed|not-live|superseded|recovered|rollback-failed|changed-during-recovery|rollback-skipped|no-production, ...}
+pipeline prod-watch (--sha MERGE_SHA [--pr N] | --pr N) [--expect-text T] [--retry-wait SEC=60] [--observe-only] [--repo DIR]   -> {ok, outcome: merged|deploy-failed|deploy-not-observed|not-live|superseded|recovered|rollback-failed|changed-during-recovery|rollback-skipped|needs-owner|no-production, ...}
   with only --pr N (merge printed mergeSha:null) the merge commit is read from the merged PR (up to 6 looks); exit 1 {error:not-merged} when the PR is not MERGED, exit 3 {error:merge-sha-unresolved} when GitHub never names it
+  with --pr N it records rollback-intent / rollback-result / recovery-reported events on the PR and shows the watch as in flight in the run record
+  --observe-only: same smokes and outcomes, but never rolls back, opens an issue or revert PR, or adds a label: what would have rolled back is {outcome: needs-owner, evidence}; a rollback-intent with no rollback-result on the PR is {rollbackInterrupted: {intent, liveNow}}; works from a detached worktree at the merge commit (the known-good target is read from the prod-before event when .review/prod-before.json is absent)
 ```
 
 `--expect-text` applies only to this merge's own deployment: smokes of the rolled-back or superseded (other) deployment run without it. `not-live` also covers a merge whose deployment succeeded but was never promoted while production still serves the known-good deployment (nothing is rolled back).
 
-Exit: 0 outcome `merged` (or no production configured) · 1 any other outcome (recovered, rollback-failed, ...), or with --pr only: the PR is not MERGED · 3 deployment not observed / GitHub unavailable / the merge commit could not be read.
+Events and the run record (with `--pr`): immediately BEFORE the rollback it posts a `rollback-intent` event on the PR (merge sha, failing deployment, rollback target); if that comment cannot be posted nothing is rolled back (`rollback-skipped`, "could not record the rollback intent on the PR"). Right after the rollback and its check it posts `rollback-result` (`ok`, `liveAfter`, `verified`), and after the incident issue / revert PR `recovery-reported`. Each is a NEW comment, never edited (ids `<sha7>-<n>`); failing to post the last two is only a warning. The watch also shows itself in the PR's run record (`inFlight` kind `prod-watch`, max `production.deploy_timeout_minutes` + 30 minutes, step `prod-watch`) and clears that on every exit; a record that cannot be written is a `warnings` entry, never a failure.
+
+`--observe-only` runs the same deployment lookup, smokes and outcome detection, but never rolls back, opens an issue or revert PR, adds a label, posts an event or takes the recovery lock. A failing smoke that a normal watch would have rolled back (or ended in `rollback-skipped` / `changed-during-recovery`) is outcome `needs-owner`: `reason` plus `evidence` {`underlying` (what a normal watch would have ended with), `failingDeployment`, `liveDeployment`, `knownGood`, `smokeFailure`}. It needs no PR branch, so it can run from a detached worktree at the merge commit: the known-good target is `.review/prod-before.json` when present, else the newest `prod-before` event on the PR. If the PR has a `rollback-intent` with no `rollback-result` of the same id, the JSON carries `rollbackInterrupted: {intent, liveNow}` (the live deployment now), whatever the outcome.
+
+Exit: 0 outcome `merged` (or no production configured) · 1 any other outcome (recovered, rollback-failed, needs-owner, ...), or with --pr only: the PR is not MERGED · 3 deployment not observed / GitHub unavailable / the merge commit could not be read.
 
 ## protect
 

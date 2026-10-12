@@ -82,6 +82,14 @@ only in `recovered` / `rollback-failed`.
 | `not-live` (1) | the merge's deployment never went live (production kept serving an older one, e.g. never promoted after an earlier rollback); nothing rolled back | `not-live` |
 | `deploy-failed` (1) | the Production deployment of the merge failed; the previous one still serves | `deploy-failed` |
 | `deploy-not-observed` (3) | no successful deployment seen within `deploy_timeout_minutes`: unknown whether it is live; do NOT rerun (it would open a second issue) | `deploy-not-observed` |
+| `needs-owner` (1) | only with `--observe-only`: the smoke fails on the live deployment and a normal watch would have rolled back (or ended `rollback-skipped` / `changed-during-recovery`). Nothing was changed, no issue, no label; `evidence` has the live deployment, the known-good target and the smoke failure | `needs-owner` |
+
+`--observe-only` is what a resumed run uses after a merge: same smokes, never a rollback, issue, revert PR, label or event, and it
+works from a detached worktree at the merge commit (the rollback target comes from the `prod-before` event when
+`.review/prod-before.json` is missing). If its JSON has `rollbackInterrupted: {intent, liveNow}`, a rollback began (a
+`rollback-intent` event) and nothing recorded how it ended: tell the owner, with the live deployment next to the target. The owner
+decides; resume never rolls back. A normal `prod-watch --pr N` posts `rollback-intent` BEFORE it rolls back (if that comment cannot
+be posted it does not roll back: `rollback-skipped`), then `rollback-result` and `recovery-reported`.
 
 Tell the user at once for every outcome except `merged`/`no-production`: say what is live now, what
 was changed (rolled back or not), and which issue/PR to look at; for URGENT ones say that production
