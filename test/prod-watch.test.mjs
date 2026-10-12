@@ -19,6 +19,7 @@ import {
 import { renderEvent, listEvents, parseEvent } from '../pipeline/lib/run-events.mjs';
 import { decodeRecord, emptyRecord } from '../pipeline/lib/run-record.mjs';
 import { writeSummaryComment } from '../pipeline/lib/summary-comment.mjs';
+import { planResume } from '../pipeline/lib/resume-plan.mjs';
 import { inspectAlias, rollback, vercelCommand, linkedProjectDir, VercelError, tail } from '../pipeline/lib/vercel.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -102,6 +103,7 @@ function harness(over = {}) {
   const runRecord = !over.record ? undefined : {
     set: async (inFlight) => { mark('record:set'); recordCalls.push(['set', inFlight]); if (over.recordFail === 'set') throw new Error('summary comment unreadable'); },
     clear: async () => { mark('record:clear'); recordCalls.push(['clear']); if (over.recordFail === 'clear') throw new Error('gh api: 502'); },
+    finish: async (outcome, detail) => { mark('record:finish'); recordCalls.push(['finish', outcome, detail]); if (over.recordFail === 'finish') throw new Error('gh api: 503'); },
   };
 
   const deps = {
@@ -970,6 +972,49 @@ test('record: inFlight is set before the first look and cleared after the last, 
     assert.deepEqual(h.recordCalls[1], ['clear']);
     assert.equal(h.recordCalls.length, 2);
   }
+});
+
+test('record: observe-only records its own outcome (after clearing inFlight); a normal run never does; deploy-not-observed stays open', async () => {
+  const observed = harness({ ...RECOVER, record: true });
+  const r = await observed.go({ observeOnly: true, host: 'pc-1' });
+  assert.equal(r.outcome, 'needs-owner');
+  assert.deepEqual(observed.log.filter((x) => x.startsWith('record:')), ['record:set', 'record:clear', 'record:finish']);
+  assert.deepEqual(observed.recordCalls.at(-1), ['finish', 'needs-owner', r.reason]);
+
+  const healthy = harness({ smoke: [PASS], inspect: [OURS], record: true });
+  assert.equal((await healthy.go({ observeOnly: true })).outcome, 'merged');
+  assert.deepEqual(healthy.recordCalls.at(-1), ['finish', 'merged', '']);
+
+  const normal = harness({ smoke: [PASS], inspect: [OURS], record: true });
+  await normal.go();
+  assert.ok(!normal.log.includes('record:finish'), 'a normal run is recorded by `P summary`, not by prod-watch');
+
+  const unseen = harness({ findDeployment: [{ state: 'timeout' }], record: true });
+  assert.equal((await unseen.go({ observeOnly: true })).outcome, 'deploy-not-observed');
+  assert.ok(!unseen.log.includes('record:finish'));
+
+  const failing = harness({ smoke: [PASS], inspect: [OURS], record: true, recordFail: 'finish' });
+  const out = await failing.go({ observeOnly: true });
+  assert.equal(out.outcome, 'merged');
+  assert.match(out.warnings[0], /record the observed outcome.*503/);
+});
+
+test('createRunRecordTracker.finish: ends a stranded record with the outcome, keeps the sections, never overwrites an existing outcome, and resume then routes ended', () => {
+  const gh = fakeSummaryGh();
+  writeSummaryComment(gh, 12, { record: { ...emptyRecord({ repo: 'acme/widgets', pr: 12, branch: 'agent/x', baseRef: 'main' }), step: 'prod-watch' }, sections: '## Summary\nDid the thing.' });
+  const tracker = createRunRecordTracker({ gh, pr: 12, host: 'pc-1', now: () => T });
+  tracker.set({ kind: 'prod-watch', host: 'pc-1', startedAt: 'now', maxMinutes: 50 });
+  tracker.clear();
+  assert.equal(tracker.finish('needs-owner', 'smoke fails'), true);
+  const rec = decodeRecord(gh.body()).record;
+  assert.deepEqual([rec.step, rec.outcome, rec.inFlight, rec.detail], ['ended', 'needs-owner', null, 'smoke fails']);
+  assert.match(gh.body(), /Did the thing\./);
+  const facts = { state: 'MERGED', isCrossRepository: false, labels: [], liveHead: 'a'.repeat(40), autoMergeArmed: false, host: 'pc-1', recordStatus: 'ok', record: rec, triage: null, contentHash: null, needsHumanReason: null, events: [], local: null };
+  assert.equal(planResume(facts, { now: T }).enter, 'ended');
+  // a second observation does not rewrite what is already recorded
+  const before = gh.body();
+  assert.equal(tracker.finish('merged'), false);
+  assert.equal(gh.body(), before);
 });
 
 test('record: inFlight is cleared even when the watch throws', async () => {

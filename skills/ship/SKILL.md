@@ -290,7 +290,9 @@ the owner's next move.
    - `local-work` ⇒ report the worktree state (diverged / dirty / unpushed), stop. Never reset or discard it.
    - `observe-prod` ⇒ `git worktree add --detach <worktree_dir>/agent-<slug>-prod <mergeSha>` (fetch `origin/<base>`
      first), run `P job start prod -- node ~/.claude/pipeline/bin/pipeline.mjs prod-watch --observe-only --pr N` from there, report the outcome and any
-     `rollbackInterrupted`. `needs-owner` ⇒ tell the owner at once. Never roll back.
+     `rollbackInterrupted`. prod-watch records the outcome itself (run record `step: ended`, `outcome` set, summary sections kept; a
+     `deploy-not-observed` outcome stays open to watch again), so nothing else needs writing and the next `resume plan` routes `ended`. `needs-owner` ⇒
+     tell the owner at once. Never roll back.
    - `build | verify | review | followups | gate` ⇒ steps 3–5, then the matching step.
 3. Worktree per `worktree.action`: `reuse` ⇒ `cd` into `path`; `add-existing-ref` ⇒ `git worktree add <path> <branch>`;
    `add-from-remote` ⇒ `git fetch origin <branch>` then `git worktree add --no-track -b <branch> <path> origin/<branch>`;

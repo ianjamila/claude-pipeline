@@ -10,7 +10,7 @@ import { fill } from './config.mjs';
 import { git as gitRun, NETWORK_TIMEOUT_MS } from './git.mjs';
 import { runShellAsync } from './proc.mjs';
 import { unresolvedRollbacks } from './run-events.mjs';
-import { applyCheckpoint, bindRecord, emptyRecord } from './run-record.mjs';
+import { OUTCOME_NEXT, OUTCOME_STEP, applyCheckpoint, bindRecord, emptyRecord } from './run-record.mjs';
 import { readSummaryComment, writeSummaryComment } from './summary-comment.mjs';
 import { tail } from './vercel.mjs';
 
@@ -180,6 +180,15 @@ export function createRunRecordTracker({ gh, pr, host, now = Date.now }) {
   return {
     set: (inFlight) => apply({ step: 'prod-watch', inFlight }),
     clear: () => apply({ inFlight: null }),
+    // A resumed observe-only watch is the last thing that happens to a stranded run: record how it ended so resume and
+    // the inbox stop routing here. A record that already has an outcome (a run that ended on its own) is not overwritten.
+    // Summary sections are kept (record-only write); events are not touched, so an open rollback-intent stays open.
+    finish: (outcome, detail = '') => {
+      const { record } = load();
+      if (record.outcome != null || !(outcome in OUTCOME_STEP)) return false;
+      apply({ step: OUTCOME_STEP[outcome], outcome, next: OUTCOME_NEXT[outcome], detail: String(detail ?? ''), inFlight: null });
+      return true;
+    },
   };
 }
 
@@ -307,6 +316,11 @@ export async function runProdWatch(opts, deps) {
   } finally {
     // Every exit path, a thrown error included, takes the watch out of the record.
     if (runRecord) await guardRecord('clear the in-flight marker', () => runRecord.clear());
+  }
+  // Observe-only closes the run record itself (nothing else will: the skill's observe-prod route ends here). It never
+  // rolls back, so it posts no event; `deploy-not-observed` learned nothing, so the run stays open to watch again.
+  if (opts.observeOnly === true && runRecord?.finish && out.outcome !== 'deploy-not-observed') {
+    await guardRecord('record the observed outcome', () => runRecord.finish(out.outcome, out.reason ?? ''));
   }
   if (opts.observeOnly === true && deps.events) {
     try {
