@@ -83,7 +83,7 @@ const SUGGEST = {
 
 const LABEL_FRAGMENT = 'needs-human label present: the run continues but ends at the owner (no merge)';
 
-const RESUMABLE_OUTCOMES = new Set(['awaiting-review', 'blocked', 'awaiting-owner-merge']);
+const RESUMABLE_OUTCOMES = new Set(['awaiting-review', 'blocked', 'awaiting-owner-merge', 'stopped']);
 
 const NEVER_GATED_STEPS = new Set(['build', 'verify', 'pr']);
 

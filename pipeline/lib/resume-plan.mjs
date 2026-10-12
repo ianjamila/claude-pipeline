@@ -13,6 +13,7 @@
 // (label mode, also the default when the mode is unknown). `observe-prod` only watches. `P merge` enforces the same rule
 // from the other side (a record marked `resumed` needs --owner-approved-head).
 
+import { prodStillOpen } from './run-record.mjs';
 import { unresolvedRollbacks } from './run-events.mjs';
 
 const MINUTE = 60000;
@@ -49,7 +50,7 @@ function liveInFlight(record, nowMs, fallbackMinutes) {
 
 function routeMerged(facts, record) {
   const rollbackOpen = unresolvedRollbacks(facts.events).length > 0;
-  const midMerge = facts.recordStatus === 'ok' && record != null && record.outcome == null && (record.step === 'merge' || record.step === 'prod-watch');
+  const midMerge = facts.recordStatus === 'ok' && record != null && prodStillOpen(record) && (record.step === 'merge' || record.step === 'prod-watch');
   if (!rollbackOpen && !midMerge) {
     return { enter: 'ended', reason: record?.outcome ? `already merged; the run ended ${record.outcome}` : 'already merged; nothing left to resume' };
   }
@@ -82,9 +83,9 @@ function routeReview(facts) {
 }
 
 const LABEL_NOTE = 'needs-human label present: the run continues but ends at the owner (no merge)';
-// Outcomes that still have work in front of them (the review was postponed, verify was red, the gate ran) resume even with the
-// label; `needs-human` itself, or anything else that ended an open PR, is the owner's.
-const RESUMABLE_OUTCOMES = new Set(['awaiting-review', 'blocked', 'awaiting-owner-merge']);
+// Outcomes that still have work in front of them (the review was postponed, verify was red, the gate ran, a blocker stopped
+// the gate or merge) resume even with the label; `needs-human` itself, or anything else that ended an open PR, is the owner's.
+const RESUMABLE_OUTCOMES = new Set(['awaiting-review', 'blocked', 'awaiting-owner-merge', 'stopped']);
 const midRunLabel = (facts, record) => facts.labels.includes('needs-human') && record != null && (record.outcome == null || RESUMABLE_OUTCOMES.has(record.outcome));
 
 function route(facts, record) {

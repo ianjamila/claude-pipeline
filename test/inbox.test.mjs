@@ -297,6 +297,9 @@ test('needs-human + a resumable ended outcome: awaiting-review => review, blocke
   assert.equal(gated.suggest, 'resume');
   assert.equal(gated.nextAction, 're-gate: ship resume 7');
   assert.ok(gated.reason.includes(LABEL_FRAGMENT));
+  const stopped = cls({ labels: ['needs-human'], record: midRun({ step: 'ended', outcome: 'stopped' }) });
+  assert.equal(stopped.waitingOn, 'pipeline');
+  assert.equal(stopped.reason, `last run ended stopped; ${LABEL_FRAGMENT}`);
 });
 
 test('needs-human + any other ended outcome on an open PR => owner-decision', () => {
@@ -589,6 +592,10 @@ test('stranded: step prod-watch with no outcome', () => {
   assert.equal(s.number, 5);
   assert.equal(s.nextAction, 'ship resume 5 (observes production; never rolls back)');
   assert.equal(s.mergedAt, ago(2 * DAY));
+});
+
+test('stranded: prod-unknown (prod-watch exited with no result) stays in the prod-watch step', () => {
+  assert.equal(classifyStranded([merged(5, { record: record({ step: 'prod-watch', outcome: 'prod-unknown' }) })], NOW).length, 1);
 });
 
 test('stranded: step merge with no outcome', () => {

@@ -52,6 +52,10 @@ test('merged mid merge / prod-watch with no outcome observes production, from a 
   assert.equal(plan({ state: 'MERGED', record: record({ step: 'gate' }) }).enter, 'ended');
   // a record at prod-watch that already has an outcome is finished
   assert.equal(plan({ state: 'MERGED', record: record({ step: 'prod-watch', outcome: 'recovered' }) }).enter, 'ended');
+  // ...except prod-unknown: the original watch exited without a result, so production is observed again
+  assert.equal(plan({ state: 'MERGED', record: record({ step: 'prod-watch', outcome: 'prod-unknown' }) }).enter, 'observe-prod');
+  // closed / merged-externally end the run
+  assert.equal(plan({ state: 'MERGED', record: record({ step: 'ended', outcome: 'merged-externally' }) }).enter, 'ended');
 });
 
 test('merged: a rollback-intent without a rollback-result observes production and warns, whatever the record says', () => {
@@ -145,6 +149,11 @@ test('needs-human with a resumable ended outcome (awaiting-review, blocked, awai
   assert.equal(gated.enter, 'gate');
   assert.ok(gated.notes.includes(LABEL_NOTE));
   assert.ok(gated.notes.some((n) => /Step 5 ends in needs-human/.test(n)));
+  // stopped (a blocker at the gate or merge): the gate runs again once the blocker is gone
+  const stopped = plan({ labels: ['needs-human'], record: record({ step: 'ended', outcome: 'stopped' }) });
+  assert.equal(stopped.enter, 'gate');
+  assert.ok(stopped.notes.includes(LABEL_NOTE));
+  assert.equal(plan({ record: record({ step: 'ended', outcome: 'stopped' }) }).enter, 'gate');
 });
 
 test('needs-human with any other ended outcome (merged, recovered, ...) on an open PR is the owner\'s', () => {

@@ -10,7 +10,7 @@ import { fill } from './config.mjs';
 import { git as gitRun, NETWORK_TIMEOUT_MS } from './git.mjs';
 import { runShellAsync } from './proc.mjs';
 import { resolvedRollbacks, unresolvedRollbacks } from './run-events.mjs';
-import { OUTCOME_NEXT, OUTCOME_STEP, applyCheckpoint, bindRecord, emptyRecord } from './run-record.mjs';
+import { OUTCOME_NEXT, OUTCOME_STEP, applyCheckpoint, bindRecord, emptyRecord, prodStillOpen } from './run-record.mjs';
 import { readSummaryComment, writeSummaryComment } from './summary-comment.mjs';
 import { tail } from './vercel.mjs';
 
@@ -181,11 +181,12 @@ export function createRunRecordTracker({ gh, pr, host, now = Date.now }) {
     set: (inFlight) => apply({ step: 'prod-watch', inFlight }),
     clear: () => apply({ inFlight: null }),
     // A resumed observe-only watch is the last thing that happens to a stranded run: record how it ended so resume and
-    // the inbox stop routing here. A record that already has an outcome (a run that ended on its own) is not overwritten.
+    // the inbox stop routing here. A record that already has an outcome (a run that ended on its own) is not overwritten,
+    // except `prod-unknown`: that one only says the original watch never learned the result.
     // Summary sections are kept (record-only write); events are not touched, so an open rollback-intent stays open.
     finish: (outcome, detail = '') => {
       const { record } = load();
-      if (record.outcome != null || !(outcome in OUTCOME_STEP)) return false;
+      if (!prodStillOpen(record) || !(outcome in OUTCOME_STEP)) return false;
       apply({ step: OUTCOME_STEP[outcome], outcome, next: OUTCOME_NEXT[outcome], detail: String(detail ?? ''), inFlight: null });
       return true;
     },

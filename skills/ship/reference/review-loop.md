@@ -39,7 +39,8 @@ already holds. A `P state outcome` with `followupsPending: true` means a publish
   - 3 (`unavailable: true`, reason quota / auth / unavailable / error / malformed / github) ⇒
     `gh pr edit <pr> --add-label awaiting-review`, `P comment --pr <pr> --kind awaiting-review
     --reason "<reason>"`, `P summary --pr <pr> --outcome awaiting-review --built "…"` (works with no
-    review state, i.e. in round 1), `P agent-log queue --line "<agentLogLine>"`, stop. Never treat a
+    review state, i.e. in round 1) plus `--cause codex:<reason> --action "Say \"resume pipeline reviews\" when Codex is back"`,
+    `P agent-log queue --line "<agentLogLine>"`, stop. Never treat a
     failed Codex run as "no findings".
   - 2 `error: empty-range`: earlier rounds accepted items but the branch content is unchanged — the
     "fix" did not change code. Go back to step 6 and make the real change.
@@ -71,9 +72,9 @@ not yours"). Then:
 transcript by that Agent description, parses its JSON, requires exactly one valid decision for every
 pending item, applies the decisions.
 - Exit 2 `not-found`: Claude Code has not written the transcript yet: wait a few seconds, retry once;
-  still `not-found` ⇒ `needs-human`.
+  still `not-found` ⇒ **park needs-human** (below) with `--cause judge:not-found`.
 - Exit 1 (invalid output, state untouched): re-invoke the judge once with the validation `errors`;
-  invalid again ⇒ `needs-human`.
+  invalid again ⇒ **park needs-human** with `--cause judge:invalid`.
 
 ### 4. Settle disputed bugs with tests
 
@@ -112,9 +113,9 @@ locates the subagent transcript by that Agent description, proves every assistan
 `claude-fable-*` at effort `high` with no API error, checks ROUND/digest, parses the rulings from the
 final message, and applies them.
 - Exit 2 `not-found` (transcript not written yet): wait a few seconds, retry once; still missing ⇒
-  `needs-human` for the round's arbitrated items.
+  **park needs-human** for the round's arbitrated items (`--cause arbiter:not-found`).
 - Exit 1 ⇒ the round's arbitrated items are already marked `needsHuman` (reason `model-proof`);
-  continue to the end of the round, then stop with `needs-human`.
+  continue to the end of the round, then stop at step 7 with `needs-human` and its summary.
 - `stopReasonMissing: true` in the output is informational: an interactive transcript did not record
   `stop_reason`, and the proof accepted it because the answer was a complete JSON block. Expect it on nearly
   every `handback` final (the closing message is a streaming snapshot); it is not a warning sign. `finalVia` says
@@ -128,7 +129,7 @@ permissions / data-integrity / data-loss item ⇒ `needsHuman` (the CLI applies 
 - ACCEPT (not yet implemented): one implementer dispatch with the list (`P state show --round
   <round> --accepted`): fix each, add/adjust tests where behaviour changes, quick verify, commit,
   `git push origin agent/<slug>`. Then the verifier runs `verify.full`. Red ⇒ fix cycle (max 2), else
-  `needs-human`. Then `P state mark-implemented --ids <ids>` — exit 2 `no-code-change` means the
+  `needs-human` (park it as below, `--cause verify-red`). Then `P state mark-implemented --ids <ids>` — exit 2 `no-code-change` means the
   branch content is still what the round reviewed: the fix has not actually changed code, so go back to
   the implementer (marking never substitutes for a fix; a green `verify.full` must show the fix).
 - `P comment --pr <pr> --kind triage` (one comment, updated in place each round): post it FIRST, so the decided
@@ -147,9 +148,15 @@ permissions / data-integrity / data-loss item ⇒ `needsHuman` (the CLI applies 
 `P state outcome` (exit 0 whether or not clean; read `clean`) →
 - `clean` (no open BLOCKING, no new ACCEPTED this round, nothing `needsHuman`, and review
   coverage matches the current content hash) ⇒ leave the loop.
-- `needsHuman` non-empty ⇒ label `needs-human`, summary, stop.
+- `needsHuman` non-empty ⇒ **park needs-human** (label, comment, `P summary --outcome needs-human`), stop.
 - else if `<round>` < max ⇒ round `<round>`+1 (reviews only the diff since this round's head).
-- else ⇒ `needs-human` with the unresolved list, summary, stop.
+- else ⇒ **park needs-human** with the unresolved list (same label, comment, `P summary`), stop.
+
+**Park needs-human** (every `needs-human` stop in this loop is this exact sequence, never a bare label):
+`gh pr edit <pr> --add-label needs-human`, `P comment --pr <pr> --kind needs-human --reason "…"` (no `--hits-file`),
+`P summary --pr <pr> --outcome needs-human --action "<the one thing the owner does>" --cause review:<reason>`
+(`<reason>`: `unresolved`, `needs-human-items`, `judge:not-found` …), `P agent-log queue --line "<agentLogLine>"`, stop.
+An arbiter ruling that parked an item makes the push an arbiter escalation by itself: summary reads the state.
 
 Any commit after the last clean round that changes PR content (anything except the agent-log
 line) invalidates coverage — `P final-gate` will demand another round.

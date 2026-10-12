@@ -26,7 +26,7 @@ export const REPO = { match: '^repo view', stdoutJson: REPO_VIEW };
 // running this inside a pipeline session cannot change the outcome.
 export function cli(args, { dir, fake, env = {} }) {
   // PIPELINE_MERGEABLE_PAUSE_MS shortens the 2 s wait between `mergeable: UNKNOWN` re-reads (it can never lengthen it).
-  const base = { ...process.env, PIPELINE_MERGEABLE_PAUSE_MS: '1', ...(fake?.env ?? {}), ...createFakeCodex().env, ...env };
+  const base = { ...process.env, PIPELINE_NOTIFY: 'off', PIPELINE_MERGEABLE_PAUSE_MS: '1', ...(fake?.env ?? {}), ...createFakeCodex().env, ...env };
   for (const k of ['PIPELINE_OFF', 'PIPELINE_ADMIN', 'PIPELINE_MERGE_WAIT_MS', 'PIPELINE_MERGE_POLL_MS']) if (!(k in env)) delete base[k];
   const r = spawnSync(process.execPath, [bin, ...args], { cwd: dir, env: base, encoding: 'utf8', timeout: 120_000 });
   let json = null;

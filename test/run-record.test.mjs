@@ -18,7 +18,14 @@ test('every outcome has a step, a next line, and a known step', () => {
   assert.deepEqual(Object.keys(OUTCOME_NEXT).sort(), [...OUTCOMES].sort());
   for (const o of OUTCOMES) assert.ok(STEPS.includes(OUTCOME_STEP[o]), o);
   assert.equal(OUTCOME_STEP['awaiting-owner-merge'], 'awaiting-owner-merge');
-  assert.deepEqual(OUTCOMES.filter((o) => OUTCOME_STEP[o] !== 'ended'), ['awaiting-owner-merge']);
+  // prod-unknown: prod-watch never learned the result, so the merged run stays in its prod-watch step (stranded, resumable).
+  assert.deepEqual(OUTCOMES.filter((o) => OUTCOME_STEP[o] !== 'ended'), ['awaiting-owner-merge', 'prod-unknown']);
+  assert.equal(OUTCOME_STEP['prod-unknown'], 'prod-watch');
+});
+
+test('every `P summary` outcome word the owner push knows is a record outcome too (else the record would stay "running")', async () => {
+  const { OUTCOME_EVENTS } = await import('../pipeline/lib/notify.mjs');
+  for (const w of Object.keys(OUTCOME_EVENTS)) assert.ok(OUTCOMES.includes(w), w);
 });
 
 for (const outcome of [null, ...OUTCOMES]) {

@@ -12,17 +12,24 @@ export const STEPS = Object.freeze(['build', 'verify', 'pr', 'review', 'gate', '
 // null while the run is going; otherwise how it ended: every `P summary` outcome, then every prod-watch outcome.
 export const OUTCOMES = Object.freeze([
   'merged', 'blocked', 'needs-human', 'awaiting-review', 'awaiting-owner-merge',
+  'stopped', 'closed', 'merged-externally', 'prod-unknown',
   'superseded', 'recovered', 'rollback-failed', 'changed-during-recovery', 'rollback-skipped',
   'not-live', 'deploy-failed', 'deploy-not-observed', 'no-production', 'needs-owner',
 ]);
 
-// Exhaustive: an outcome the run stopped at. `awaiting-owner-merge` is a place the run waits, every other outcome ends it.
+// Exhaustive: an outcome the run stopped at. `awaiting-owner-merge` is a place the run waits; `prod-unknown` (prod-watch
+// exited with no outcome) leaves the merged run in its prod-watch step, so the inbox lists it as stranded and resume
+// observes production again; every other outcome ends it.
 export const OUTCOME_STEP = Object.freeze({
   merged: 'ended',
   blocked: 'ended',
   'needs-human': 'ended',
   'awaiting-review': 'ended',
   'awaiting-owner-merge': 'awaiting-owner-merge',
+  stopped: 'ended',
+  closed: 'ended',
+  'merged-externally': 'ended',
+  'prod-unknown': 'prod-watch',
   superseded: 'ended',
   recovered: 'ended',
   'rollback-failed': 'ended',
@@ -42,6 +49,10 @@ export const OUTCOME_NEXT = Object.freeze({
   'needs-human': 'owner review: add `human-approved`, then merge',
   'awaiting-review': 'resume the cross-model review',
   'awaiting-owner-merge': 'owner says "merge" for this head',
+  stopped: 'clear what stopped the run (see the action), then resume',
+  closed: 'nothing: the PR was closed',
+  'merged-externally': 'nothing: merged outside the pipeline',
+  'prod-unknown': 'resume: observe production for this merge (never rolls back)',
   superseded: 'nothing: a newer deploy replaced this one',
   recovered: 'review the incident issue and the revert PR',
   'rollback-failed': 'owner: production may be down, check the incident issue',
@@ -53,6 +64,9 @@ export const OUTCOME_NEXT = Object.freeze({
   'no-production': 'nothing: no production environment',
   'needs-owner': 'owner: production fails the smoke and was left alone, check it and the rollback target',
 });
+
+// A merged run whose production result is still unknown: no outcome yet, or `prod-unknown`.
+export const prodStillOpen = (record) => record?.outcome == null || record.outcome === 'prod-unknown';
 
 export const STATUS_START = '<!-- claude-pipeline:status:start -->';
 export const STATUS_END = '<!-- claude-pipeline:status:end -->';

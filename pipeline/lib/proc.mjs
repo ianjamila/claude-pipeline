@@ -156,7 +156,7 @@ export function runShell(command, { cwd, env, input, timeoutMs } = {}) {
 
 // Kill a process and everything it started: POSIX signals the process group (the child is spawned
 // detached, so it leads its own group); Windows asks taskkill to walk the tree.
-function killTree(pid) {
+export function killTree(pid) {
   if (pid === undefined) return;
   if (process.platform === 'win32') {
     spawnSync('taskkill', ['/T', '/F', '/PID', String(pid)], { cwd: os.tmpdir(), windowsHide: true });
