@@ -757,12 +757,15 @@ test('hook: malformed stdin that mentions PIPELINE_ADMIN, disableAllHooks or ins
   }
 });
 
-test('hook: malformed stdin that mentions nothing sensitive is allowed', (t) => {
+// Fail-closed change (#21): the keyword condition is gone. Input the hook cannot read has no tool name to judge by, so it is
+// refused whatever it mentions; only the owner's PIPELINE_ADMIN launch passes it.
+test('hook: malformed stdin is denied even when it mentions nothing sensitive', (t) => {
   const home = tmpHome(t);
   for (const raw of ['', 'not json at all', '{"tool_name":']) {
     const r = runHook(raw, { home });
     assert.equal(r.status, 0, raw);
-    assert.equal(r.stdout, '', raw);
+    assert.equal(JSON.parse(r.stdout).hookSpecificOutput.permissionDecision, 'deny', raw);
+    assert.match(JSON.parse(r.stdout).hookSpecificOutput.permissionDecisionReason, /internal error/, raw);
   }
 });
 
@@ -772,7 +775,7 @@ test('hook: malformed stdin is allowed in admin mode even when it mentions .clau
   assert.equal(r.stdout, '');
 });
 
-test('hook: if the policy module cannot be loaded, the keyword rule decides', (t) => {
+test('hook: if the policy module cannot be loaded, every call that is the hook\'s own is denied', (t) => {
   const dir = tmpHome(t);
   const lone = path.join(dir, 'guard-files.mjs'); // no lib/ beside it, so the dynamic import fails
   fs.copyFileSync(HOOK, lone);
@@ -783,20 +786,73 @@ test('hook: if the policy module cannot be loaded, the keyword rule decides', (t
     const sw = runHook({ tool_name: 'Bash', tool_input: { command } }, { home: dir, hook: lone });
     assert.equal(JSON.parse(sw.stdout).hookSpecificOutput.permissionDecision, 'deny', command);
   }
-  const plain = runHook({ tool_name: 'Edit', tool_input: { file_path: path.join(dir, 'src', 'a.ts'), old_string: 'a', new_string: 'b' } }, { home: dir, hook: lone });
-  assert.equal(plain.status, 0);
-  assert.equal(plain.stdout, '');
+  // formerly allowed: an edit and a command that mention nothing sensitive (the keyword rule is gone)
+  for (const input of [
+    { tool_name: 'Edit', tool_input: { file_path: path.join(dir, 'src', 'a.ts'), old_string: 'a', new_string: 'b' } },
+    { tool_name: 'Bash', tool_input: { command: 'ls -la' } },
+    { tool_name: 'mcp__files__read_file', tool_input: { path: '/tmp/x' } },
+  ]) {
+    const plain = runHook(input, { home: dir, hook: lone });
+    assert.equal(plain.status, 0);
+    assert.equal(JSON.parse(plain.stdout).hookSpecificOutput.permissionDecision, 'deny', input.tool_name);
+    assert.match(JSON.parse(plain.stdout).hookSpecificOutput.permissionDecisionReason, /internal error/);
+  }
+  // a tool that is not the hook's own is still left alone: that is decided before the module is loaded
+  const notOurs = runHook({ tool_name: 'Read', tool_input: { file_path: path.join(dir, '.claude', 'settings.json') } }, { home: dir, hook: lone });
+  assert.equal(notOurs.status, 0);
+  assert.equal(notOurs.stdout, '');
   const admin = runHook({ tool_name: 'Edit', tool_input: { file_path: path.join(dir, '.claude', 'x.md'), old_string: 'a', new_string: 'b' } }, { home: dir, hook: lone, env: { PIPELINE_ADMIN: '1' } });
   assert.equal(admin.stdout, '');
 });
 
+// A copy of the hook whose policy module is a stub: the evaluator throws, or returns no decision. Both must deny (the
+// hook used to deny an internal error only when the raw input held a sensitive word).
+test('hook: an evaluator that throws, or returns no decision, is denied for a command and a file tool', (t) => {
+  const dir = tmpHome(t);
+  fs.mkdirSync(path.join(dir, 'lib'));
+  const copy = path.join(dir, 'guard-files.mjs');
+  fs.copyFileSync(HOOK, copy);
+  const stub = (body) => fs.writeFileSync(path.join(dir, 'lib', 'files-policy.mjs'), body);
+  const calls = [
+    { tool_name: 'Bash', tool_input: { command: 'ls -la' } },
+    { tool_name: 'Edit', tool_input: { file_path: path.join(dir, 'src', 'a.ts'), old_string: 'a', new_string: 'b' } },
+  ];
+  for (const body of [
+    "export const evaluateBashForFiles = () => { throw new Error('evaluator exploded'); };\nexport const evaluateFileTool = () => { throw new Error('evaluator exploded'); };\n",
+    'export const evaluateBashForFiles = () => undefined;\nexport const evaluateFileTool = () => ({ decision: \'maybe\' });\n',
+  ]) {
+    stub(body);
+    for (const input of calls) {
+      const r = runHook(input, { home: dir, hook: copy });
+      assert.equal(r.status, 0);
+      const out = JSON.parse(r.stdout).hookSpecificOutput;
+      assert.equal(out.permissionDecision, 'deny', input.tool_name);
+      assert.match(out.permissionDecisionReason, /internal error \((evaluator exploded|the policy returned no decision)\)/);
+    }
+    // a tool that is not the hook's own never reaches the evaluator
+    assert.equal(runHook({ tool_name: 'Read', tool_input: { file_path: '/x' } }, { home: dir, hook: copy }).stdout, '');
+    // the owner's PIPELINE_ADMIN launch still bypasses an internal error
+    assert.equal(runHook(calls[0], { home: dir, hook: copy, env: { PIPELINE_ADMIN: '1' } }).stdout, '');
+  }
+});
+
 test('hook: unrelated tools and shapes are allowed', (t) => {
   const home = tmpHome(t);
-  for (const input of [{ tool_name: 'Read', tool_input: { file_path: path.join(home, '.claude', 'settings.json') } }, [], 7, null, { tool_name: 'Bash' }, { tool_name: 'Bash', tool_input: { command: 5 } }]) {
+  for (const input of [{ tool_name: 'Read', tool_input: { file_path: path.join(home, '.claude', 'settings.json') } }, { tool_name: 'Bash' }, { tool_name: 'Bash', tool_input: { command: 5 } }, { tool_name: 'Grep', tool_input: {} }]) {
     const r = runHook(input, { home });
     assert.equal(r.status, 0, JSON.stringify(input));
     assert.equal(r.stdout, '', JSON.stringify(input));
   }
+});
+
+test('hook: input that is valid JSON but not an object is refused like malformed input (fail closed)', (t) => {
+  const home = tmpHome(t);
+  for (const input of [[], 7, null, 'text']) {
+    const r = runHook(input, { home });
+    assert.equal(r.status, 0, JSON.stringify(input));
+    assert.equal(JSON.parse(r.stdout).hookSpecificOutput.permissionDecision, 'deny', JSON.stringify(input));
+  }
+  assert.equal(runHook('[]', { home, env: { PIPELINE_ADMIN: '1' } }).stdout, '');
 });
 
 // ---- Monitor (review finding 1) ----------------------------------------------------------------------

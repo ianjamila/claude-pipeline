@@ -1,0 +1,576 @@
+// Why (issues #20 + item g + a T1 residual): the guards judged a script only when it was NAMED (`bash f.sh`). Script text that
+// reaches a shell without being named was never read: `bash < f.sh`, `cat f.sh | bash`, `bash <(cat f.sh)`, `eval "$(cat f.sh)"`,
+// `$(cat f.sh)` as the command. And a run-time word before `-c` or before a `<(...)` operand (`bash -o $X -c f.sh`,
+// `bash $X <(cat f.sh)`) was not treated as ambiguous, although it decides which word the shell runs.
+// Now the files such text comes from are judged like `bash F` (a reader of named files: cat/less, `< F`,
+// here-strings, process and command substitutions); a producer that REWRITES what it reads (sed, awk, base64, tr, head, tail, tac ...) makes the
+// text unknowable, so a named file that holds a guarded word is refused. A program run by path that is over the read cap
+// is peeked at (`readHead`): a shell script is refused, a binary or an interpreter file keeps its old verdict.
+// The file system is faked (like test/guard-script-expansion.test.mjs); the guarded text only lives in fake file contents.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { resolve, dirname, basename } from 'node:path';
+import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
+import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
+import { scriptFileOf, scriptFeedsOf, simpleCommands } from '../pipeline/hooks/lib/shell-parse.mjs';
+
+// `files`: path -> text (null = exists but cannot be read); `heads`: path -> the first bytes of a file readText cannot read.
+// Every key is resolved, absolute ones too: lookups go through resolve(), which on Windows turns `/home/u` into `D:\home\u`.
+function fakeFs(root, files, dirs = [], heads = {}) {
+  const abs = (p) => resolve(root, p);
+  const F = Object.fromEntries(Object.entries(files).map(([k, v]) => [abs(k), v]));
+  const H = Object.fromEntries(Object.entries(heads).map(([k, v]) => [abs(k), v]));
+  const D = new Set([root, ...dirs.map(abs)].map((p) => resolve(p)));
+  const names = (d) => {
+    const out = new Set();
+    for (const p of [...Object.keys(F), ...D]) if (p !== d && dirname(p) === d) out.add(basename(p));
+    return [...out];
+  };
+  return {
+    readText: (p) => (typeof F[resolve(p)] === 'string' ? F[resolve(p)] : null),
+    readHead: (p) => (typeof H[resolve(p)] === 'string' ? H[resolve(p)] : null),
+    pathExists: (p) => resolve(p) in F || D.has(resolve(p)),
+    readDir: (p) => (D.has(resolve(p)) ? names(resolve(p)) : null),
+  };
+}
+
+const GIT_ROOT = resolve('/work/repo');
+const PROJ = '/home/u/proj';
+const BAD_GIT = 'git push origin main';
+const BAD_FILES = 'echo x > ~/.claude/settings.json';
+// text that is allowed when it is judged as the script it is, but mentions a guarded operation / a protected path
+const MID_GIT = 'git push origin agent/x';
+const MID_FILES = 'ls ~/.claude/pipeline';
+const git = (command, fsOpts, o = {}) => evaluateGitCommand(command, {
+  cwd: GIT_ROOT, home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], ...fsOpts, ...o,
+});
+const files = (command, fsOpts, o = {}) => evaluateBashForFiles(command, {
+  home: '/home/u', env: {}, platform: 'linux', realpath: (p) => p, cwd: PROJ, ...fsOpts, existsSync: fsOpts.pathExists, ...o,
+});
+
+// spec: { name: 'bad' | 'ok' | <text> | null }; heads: the same keys -> head text
+function both(command, spec = {}, heads = {}) {
+  const mk = (bad, ok, mid) => Object.fromEntries(Object.entries(spec).map(([k, v]) => [k, v === 'bad' ? bad : v === 'ok' ? ok : v === 'mid' ? mid : v]));
+  const dirs = ['sub', 'd'];
+  return {
+    git: git(command, fakeFs(GIT_ROOT, mk(BAD_GIT, 'git status', MID_GIT), dirs, heads)),
+    files: files(command, fakeFs(PROJ, mk(BAD_FILES, 'echo hi', MID_FILES), dirs, heads)),
+  };
+}
+const denyBoth = (command, spec, heads) => {
+  const r = both(command, spec, heads);
+  assert.equal(r.git.decision, 'deny', `git: ${command} -> ${r.git.reason}`);
+  assert.equal(r.files.decision, 'deny', `files: ${command} -> ${r.files.reason}`);
+  return r;
+};
+const allowBoth = (command, spec, heads) => {
+  const r = both(command, spec, heads);
+  assert.equal(r.git.decision, 'allow', `git: ${command} -> ${r.git.reason}`);
+  assert.equal(r.files.decision, 'allow', `files: ${command} -> ${r.files.reason}`);
+};
+
+const SPEC = { 'f.sh': 'bad', 'ok.sh': 'ok', 'README.md': 'ok', 'sub/f.sh': 'bad', 'sub/ok.sh': 'ok', 'unreadable.sh': null };
+
+// ---- #20: a run-time word before -c or before a <(...) operand ------------------------------------------------------------
+
+test('#20: a run-time word before -c makes the script operand ambiguous: every word is a candidate file', () => {
+  for (const c of [
+    'bash -o $X -c f.sh', 'bash -$X -c f.sh', 'bash $(echo -o) -c f.sh', 'bash `echo -o` -c f.sh', 'sh -o $X -c f.sh', 'zsh -o $X -c f.sh',
+    'bash -o $X -c "bash f.sh"', 'bash $X -c f.sh', 'bash -$X -s f.sh', 'bash -o $X -s f.sh', 'bash -$X - f.sh',
+  ]) denyBoth(c, SPEC);
+  for (const c of ['bash -o $X -c "echo hi"', 'bash -o $X -c ok.sh', 'bash -$X -c ok.sh']) allowBoth(c, SPEC);
+});
+
+test('#20: a run-time word before a <(...) operand: its output may be the script', () => {
+  for (const c of ['bash $X <(cat f.sh)', 'bash -$X <(cat f.sh)', 'bash $(echo -x) <(cat f.sh)', 'source $X <(cat f.sh)', '. $X <(cat f.sh)', 'bash $X -x <(cat f.sh)'])
+    denyBoth(c, SPEC);
+  for (const c of ['bash $X <(cat ok.sh)', 'source $X <(cat ok.sh)']) allowBoth(c, SPEC);
+});
+
+test('#20: no run-time word, no ambiguity (controls)', () => {
+  for (const c of ["bash -c 'echo hi'", "bash -o pipefail -c 'echo hi'", "bash -lc 'echo hi'", 'bash -c "$X"', "node -e 'console.log(1)'", 'bash ok.sh', "bash -c 'echo $HOME'"]) allowBoth(c, SPEC);
+  assert.equal(scriptFileOf(['bash', '-c', 'echo hi']), null);
+  assert.equal(scriptFileOf(['bash', '-o', 'pipefail', '-c', 'x']), null);
+  assert.equal(scriptFileOf(['bash', '-c', '$X']), null);
+  assert.deepEqual(scriptFileOf(['bash', '-o', '$X', '-c', 'f.sh']), { kind: 'shell', file: undefined, ambiguous: true, words: ['-o', '$X', '-c', 'f.sh'] });
+  assert.deepEqual(scriptFileOf(['bash', '$X', '<(cat f.sh)']), { kind: 'shell', file: '$X', ambiguous: true, words: ['$X', '<(cat f.sh)'] });
+  assert.equal(scriptFileOf(['bash', '<(cat f.sh)']), null);
+  assert.deepEqual(scriptFileOf(['bash', '-$X', '<(cat f.sh)']), { kind: 'shell', file: '<(cat f.sh)', ambiguous: true, words: ['-$X', '<(cat f.sh)'] });
+});
+
+// ---- g: script text fed to a shell from a file ----------------------------------------------------------------------------
+
+test('g: a stdin redirect from a file feeds a shell', () => {
+  for (const c of [
+    'bash < f.sh', 'sh < f.sh', 'bash -s < f.sh', 'zsh < f.sh', 'source /dev/stdin < f.sh', '. /dev/stdin < f.sh', 'bash - < f.sh', 'bash <f.sh',
+    'bash < "f.sh"', 'bash 0< f.sh', 'bash -s -- a b < f.sh', 'sudo bash < f.sh', 'exec bash < f.sh', 'bash < sub/f.sh', 'bash < ./f.sh', 'bash < f.sh | cat',
+    'bash <> f.sh',
+  ]) denyBoth(c, SPEC);
+});
+
+test('g: a reader of named files piped into a shell feeds it', () => {
+  for (const c of [
+    'cat f.sh | bash', 'cat f.sh | zsh -s', 'head -c 999 f.sh | bash', 'head -n 3 f.sh | sh', 'tail -n 3 f.sh | sh', 'tail -n +2 f.sh | bash', 'tac f.sh | bash', 'less f.sh | bash',
+    'cat ok.sh f.sh | bash', 'cat < f.sh | bash', 'cat -- f.sh | bash', 'cat f.sh | sh -s -- x', '{ cat f.sh; } | bash', '(cat f.sh) | bash', 'cat sub/f.sh | bash',
+    'echo x | cat f.sh | bash', 'cat f.sh | source /dev/stdin', 'cat f.sh |& bash',
+  ]) denyBoth(c, SPEC);
+});
+
+test('g: process substitution, here-strings and command substitution feed a shell', () => {
+  for (const c of [
+    'bash < <(cat f.sh)', 'bash <(cat f.sh)', 'bash <<< "$(cat f.sh)"', 'bash <<< `cat f.sh`', 'source <(cat f.sh)', '. <(cat f.sh)', 'bash -x <(cat f.sh)',
+    'bash <(head -n 5 f.sh)', 'bash < <(cat < f.sh)', 'bash <(< f.sh)', 'bash <<< "$(<f.sh)"',
+    'eval "$(cat f.sh)"', 'eval `cat f.sh`', 'eval "$(<f.sh)"', 'eval $(cat f.sh)', 'eval "$(head -c 99 f.sh)"', 'eval "x; $(cat f.sh)"',
+    'echo "$(cat f.sh)" | bash', 'printf %s "$(cat f.sh)" | sh', "bash <<EOF\n$(cat f.sh)\nEOF", '$(cat f.sh)', '`cat f.sh`', '$(<f.sh)', '$(cat f.sh) --flag', 'bash -c "$(cat f.sh)"', 'sh -c "$(tac f.sh)"', 'zsh -c "$(< f.sh)"',
+  ]) denyBoth(c, SPEC);
+});
+
+test('g: a producer that rewrites what it reads: a named file holding a guarded word is refused', () => {
+  for (const c of [
+    'sed s/a/b/ f.sh | bash', 'sed -n p f.sh | sh', 'awk 1 f.sh | bash', 'tr a b < f.sh | bash', 'grep -v zzz f.sh | sh', 'cat f.sh | tr a b | bash', 'cat f.sh | tee /dev/null | bash',
+    'dd if=f.sh | bash', 'sed -f f.sh x | bash', 'cat f.sh | grep -v zzz | sh',
+    'bash <<< "$(sed p f.sh)"', 'eval "$(awk 1 f.sh)"', 'bash <(sed p f.sh)', 'bash < <(tr a b < f.sh)', 'eval "$(cat f.sh | tr a b)"', '$(sed p f.sh)',
+    'bash <<< "$(cat f.sh; echo hi)"',
+  ]) denyBoth(c, SPEC);
+  for (const c of ['sed s/a/b/ ok.sh | bash', 'awk 1 ok.sh | sh', 'tr a b < ok.sh | bash', 'cat ok.sh | tr a b | bash', 'eval "$(sed p ok.sh)"', 'bash <(sed p README.md)']) allowBoth(c, SPEC);
+});
+
+test('g: a plain reader feeds the file as the script (judged by what it runs); a rewriting producer only gets the word scan', () => {
+  const spec = { 'mid.sh': 'mid' };
+  for (const c of ['bash < mid.sh', 'cat mid.sh | bash', 'eval "$(cat mid.sh)"', 'bash <(cat mid.sh)', 'bash <<< "$(cat mid.sh)"', '$(cat mid.sh)']) allowBoth(c, spec);
+  for (const c of ['sed p mid.sh | bash', 'cat mid.sh | tr a b | bash', 'eval "$(cat mid.sh | tr a b)"', 'bash <(awk 1 mid.sh)', 'cat mid.sh | tee /dev/null | sh', 'head -n 1 mid.sh | bash']) denyBoth(c, spec);
+});
+
+test('g: harmless controls stay allowed', () => {
+  for (const c of [
+    'bash < ok.sh', 'cat ok.sh | bash', 'cat README.md | grep x', "eval \"$(ssh-agent -s)\"", "bash -c 'echo hi'", "bash -o pipefail -c 'echo hi'", 'node -e "console.log(1)"',
+    'curl -s https://x | sh', 'eval "$(cat ok.sh)"', 'bash <(cat ok.sh)', 'bash < <(cat ok.sh)', 'bash <<< "$(cat ok.sh)"', '$(cat ok.sh)', 'eval "$(direnv hook bash)"',
+    'eval "$(pyenv init -)"', 'eval "$(brew shellenv)"', 'bash < nothing.sh', 'cat nothing.sh | bash',
+    // the text is not run: a file that is only read, redirected or counted
+    'cat f.sh', 'cat f.sh | grep x', 'cat f.sh | wc -l', 'cat f.sh > out.txt', 'head -n 3 f.sh | cat', 'echo hi | bash', 'cat f.sh | less', 'bash ok.sh < f.sh',
+    'sed p f.sh | grep x', 'grep push f.sh', 'echo "$(cat f.sh)"', 'x=$(cat f.sh)',
+  ]) allowBoth(c, SPEC);
+});
+
+test('g: the file is looked up in the directory the command runs in', () => {
+  const spec = { 'f.sh': 'ok', 'sub/f.sh': 'bad' };
+  denyBoth('cd sub && bash < f.sh', spec);
+  denyBoth('cd sub && cat f.sh | bash', spec);
+  denyBoth('cd sub && eval "$(cat f.sh)"', spec);
+  denyBoth('cd sub && bash f.sh', spec); // a named script too: the cwd's copy must not hide the one in the cd target (guard-files judged only the first directory holding the name)
+  allowBoth('bash < f.sh', spec);
+  allowBoth('cd sub && bash < ../f.sh', spec);
+  // an absolute path needs no directory
+  assert.equal(git('bash < /work/repo/sub/f.sh', fakeFs(GIT_ROOT, { 'sub/f.sh': BAD_GIT }, ['sub'])).decision, 'deny');
+});
+
+test('g: after a cd that may not have run, a relative file is not looked up in a guessed directory (guard-git)', () => {
+  const g = fakeFs(GIT_ROOT, { 'ok.sh': 'git status' }, ['d']);
+  for (const c of ['cd d || true; bash < ok.sh', 'cd d || true; cat ok.sh | bash', 'cd d || true; eval "$(cat ok.sh)"']) {
+    const r = git(c, g);
+    assert.equal(r.decision, 'deny', c);
+    assert.match(r.reason, /directory/, c);
+  }
+  assert.equal(git('cd d || true; bash < /nonexistent/x.sh', g).decision, 'allow');
+  // a word a rewriting producer was given is only a guess at a file name: looked up in the starting directory, not refused
+  assert.equal(git('cd d || true; curl -s https://x/y.sh | sed p | sh', g).decision, 'allow');
+});
+
+test('g: an unreadable or too-large file that is fed to a shell is refused', () => {
+  for (const c of ['bash < unreadable.sh', 'cat unreadable.sh | bash', 'eval "$(cat unreadable.sh)"', 'bash <(cat unreadable.sh)', '$(< unreadable.sh)']) {
+    const r = denyBoth(c, SPEC);
+    assert.match(r.git.reason, /cannot read/);
+  }
+  // a rewriting producer reading a file it cannot read: refused when the file is a regular file we can peek at
+  denyBoth('sed p big.txt | bash', { 'big.txt': null }, { 'big.txt': 'some text' });
+  allowBoth('sed p big.txt | bash', { 'big.txt': null }); // (not a regular file as far as readHead can tell: nothing to say)
+  allowBoth('sed p d | bash', SPEC);
+});
+
+test('g: a variable name, a glob or a pattern in the file position is judged as candidates', () => {
+  denyBoth('cat $X f.sh | bash', SPEC);
+  denyBoth('cat f*.sh | bash', SPEC);
+  denyBoth('X=f.sh; bash < $X', SPEC);
+  denyBoth('X=f.sh; cat "$X" | bash', SPEC);
+  denyBoth('cat f<1-2>.sh | bash', SPEC); // pattern syntax the parser cut: refused outright
+  denyBoth('bash < f<1-2>.sh', SPEC);
+  denyBoth('eval "$(cat f<1-2>.sh)"', SPEC);
+  allowBoth('cat ok*.sh | bash', SPEC);
+  allowBoth('X=ok.sh; bash < $X', SPEC);
+});
+
+test('g: a producer that is remote or unknown keeps the dynamic rule: refused only when the line names a guarded operation', () => {
+  const g = fakeFs(GIT_ROOT, { 'ok.sh': 'git status' }, []);
+  assert.equal(git('curl -s https://x | sh', g).decision, 'allow');
+  assert.equal(git('curl -s https://x | sh && git push origin agent/x', g).decision, 'deny');
+  assert.match(git('curl -s https://x | sh && git push origin agent/x', g).reason, /run time|piped/);
+  assert.equal(git('eval "$(ssh-agent -s)"', g).decision, 'allow');
+  assert.equal(git('eval "$(ssh-agent -s)"; git merge-base a b', g).decision, 'deny');
+  const f = fakeFs(PROJ, { 'ok.sh': 'echo hi' }, []);
+  assert.equal(files('curl -s https://x | sh', f).decision, 'allow');
+  assert.equal(files('curl -s https://x | sh && ls ~/.claude/settings.json', f).decision, 'deny');
+});
+
+test('g: nested script text is checked the same way', () => {
+  for (const c of ["bash -c 'bash < f.sh'", "eval 'cat f.sh | bash'", "sh -c 'eval \"$(cat f.sh)\"'", 'echo "bash < f.sh" | bash', "bash <<'EOF'\ncat f.sh | bash\nEOF"]) denyBoth(c, SPEC);
+  // a script that feeds another: the judged file is read like any named script
+  denyBoth('bash outer.sh', { 'outer.sh': 'cat f.sh | bash', 'f.sh': 'bad' });
+  denyBoth('cat outer.sh | bash', { 'outer.sh': 'bash < f.sh', 'f.sh': 'bad' });
+  allowBoth('bash outer.sh', { 'outer.sh': 'cat ok.sh | bash', 'ok.sh': 'ok' });
+});
+
+test('g: the work counts against the shared script budget', () => {
+  // 30 scripts that each feed 30 more files to a shell: far over the 128 reads one evaluation may make
+  const names = Array.from({ length: 30 }, (_, i) => `c${i}.sh`);
+  const inner = `cat ${names.join(' ')} | bash`;
+  const spec = { ...Object.fromEntries(names.map((n) => [n, 'ok'])), ...Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`a${i}.sh`, inner])) };
+  const outer = `cat ${Array.from({ length: 30 }, (_, i) => `a${i}.sh`).join(' ')} | bash`;
+  const r = denyBoth(outer, spec);
+  assert.match(r.git.reason, /too many script files/);
+  assert.match(r.files.reason, /too many script files/);
+  // more files than a feed list may hold are refused without reading any
+  const many = Array.from({ length: 300 }, (_, i) => `m${i}.sh`).join(' ');
+  denyBoth(`cat ${many} | bash`, { 'ok.sh': 'ok' });
+  denyBoth(`bash <<< "$(cat ${many})"`, { 'ok.sh': 'ok' });
+});
+
+test('g: scriptFeedsOf lists the files that feed a command (pure parser API)', () => {
+  const feeds = (line) => simpleCommands(line).flatMap((c) => scriptFeedsOf(c, line));
+  assert.deepEqual(feeds('bash < f.sh'), [{ kind: 'shell', file: 'f.sh' }]);
+  assert.deepEqual(feeds('cat f.sh | bash'), [{ kind: 'shell', file: 'f.sh' }]);
+  assert.deepEqual(feeds('sed p f.sh | bash').map((f) => [f.kind, f.file]), [['scan', 'p'], ['scan', 'f.sh'], ['scan', 'p f.sh']]); // (the last is the joined scan, review R1-B2)
+  assert.deepEqual(feeds('cat $X | bash'), [{ kind: 'shell', file: '$X', ambiguous: true, words: ['$X'] }]);
+  assert.deepEqual(feeds('cat f.sh'), []);
+  assert.deepEqual(feeds('echo hi | bash'), []);
+  assert.deepEqual(feeds('bash ok.sh < f.sh'), []);
+  assert.deepEqual(feeds('head -n 5 f.sh | bash').map((f) => [f.kind, f.file]), [['scan', 'f.sh']]); // head / tail / tac do not print the file as it is (review R1-B3)
+  assert.equal(feeds('cat f<1-2>.sh | bash')[0].unresolvable, true);
+  // feeds do not show up when the command is printed or compared
+  assert.deepEqual(Object.keys(simpleCommands('bash < f.sh')[0]).sort(), ['argv', 'depth', 'env', 'raw', 'redirects']);
+});
+
+// ---- C: a program run by path that is over the read cap -------------------------------------------------------------------
+
+test('C: a program run by path that is too large to read is judged by its first bytes', () => {
+  const spec = { 'big.sh': null, 'bigplain': null, 'bigbin': null, 'bignode': null, 'bigpy': null, 'bigunread': null, 'ok.sh': 'ok' };
+  const heads = {
+    'big.sh': '#!/bin/bash\necho hi\n', 'bigplain': 'echo hi\n', 'bigbin': '\u007fELF\u0000\u0001\u0001', 'bignode': '#!/usr/bin/env node\nconsole.log(1)\n', 'bigpy': '#!/usr/bin/python3\nprint(1)\n',
+  };
+  for (const c of ['./big.sh', './bigplain', 'cd d && ../big.sh', './big.sh arg']) {
+    const sp = c.startsWith('cd d') ? { 'big.sh': null } : spec;
+    const r = both(c, sp, heads);
+    assert.equal(r.git.decision, 'deny', `git: ${c}`);
+    assert.equal(r.files.decision, 'deny', `files: ${c}`);
+    assert.match(r.git.reason, /too large/);
+    assert.match(r.files.reason, /too large/);
+  }
+  // a binary, an interpreter file and a file readHead cannot tell anything about keep their old verdict
+  for (const c of ['./bigbin', './bignode', './bigpy', './bigunread']) allowBoth(c, spec, heads);
+  // a small readable script is unchanged
+  denyBoth('./f.sh', { 'f.sh': 'bad' });
+  allowBoth('./ok.sh', spec, heads);
+  // `bash big.sh` was already refused
+  assert.match(both('bash big.sh', spec, heads).git.reason, /cannot read/);
+});
+
+test('C: readHead is optional: without it a too-large program keeps its old verdict', () => {
+  const g = fakeFs(GIT_ROOT, { 'big.sh': null });
+  const { readHead: _drop, ...noHead } = g;
+  assert.equal(git('./big.sh', noHead).decision, 'allow');
+});
+
+test('C: a throwing readHead denies instead of letting the command through', () => {
+  const g = { ...fakeFs(GIT_ROOT, { 'big.sh': null }), readHead: () => { throw new Error('boom'); } };
+  const r = git('./big.sh', g);
+  assert.equal(r.decision, 'deny');
+  const f = { ...fakeFs(PROJ, { 'big.sh': null }), readHead: () => { throw new Error('boom'); } };
+  assert.equal(files('./big.sh', f).decision, 'deny');
+});
+
+// ---- review R1-B3: head / tail / tac print PART of a file (or reverse it): the file is not the script ---------------------------------
+// The whole file was parsed as the script, so `tail -n +2 payload | bash` with `echo "` / <push> / `"` in it was allowed: the quotes hide
+// the push from the whole-file parse, but tail drops the first line and the shell runs it. They are rewriting producers now (word scan).
+// Exact modelling of their output is a later step; refusing a guarded word in the file is the fail-closed reading.
+
+// build(bad) -> { file: text } for each policy's own guarded line
+function bothBuilt(command, build) {
+  const dirs = ['sub', 'd'];
+  return {
+    git: git(command, fakeFs(GIT_ROOT, build(BAD_GIT), dirs)),
+    files: files(command, fakeFs(PROJ, build(BAD_FILES), dirs)),
+  };
+}
+const denyBuilt = (command, build) => {
+  const r = bothBuilt(command, build);
+  assert.equal(r.git.decision, 'deny', `git: ${command} -> ${r.git.reason}`);
+  assert.equal(r.files.decision, 'deny', `files: ${command} -> ${r.files.reason}`);
+};
+const allowBuilt = (command, build) => {
+  const r = bothBuilt(command, build);
+  assert.equal(r.git.decision, 'allow', `git: ${command} -> ${r.git.reason}`);
+  assert.equal(r.files.decision, 'allow', `files: ${command} -> ${r.files.reason}`);
+};
+
+test('R1-B3: tail -n +2 hides the first line; the quote pair that hid the guarded line from the whole-file parse is gone', () => {
+  const payload = (bad) => ({ 'payload.sh': `echo "\n${bad}\n"\n` });
+  for (const c of ['tail -n +2 payload.sh | bash', 'tail -n+2 payload.sh | sh', 'tail --lines=+2 payload.sh | bash', 'eval "$(tail -n +2 payload.sh)"', 'bash <(tail -n +2 payload.sh)', 'bash < <(tail -n +2 payload.sh)']) denyBuilt(c, payload);
+});
+
+test('R1-B3: tac reverses the lines; a heredoc body that hid the guarded line in file order does not in reversed order', () => {
+  const payload = (bad) => ({ 'payload.sh': `cat <<EOF\n${bad}\nEOF\n` });
+  for (const c of ['tac payload.sh | bash', 'eval "$(tac payload.sh)"', 'bash <(tac payload.sh)']) denyBuilt(c, payload);
+});
+
+test('R1-B3: head is a producer too: a file the exact reader used to allow (judged as the whole script) is now word-scanned', () => {
+  const mid = { 'mid.sh': 'mid' };
+  for (const c of ['head -n 1 mid.sh | bash', 'head -c 99 mid.sh | sh', 'tail -n 1 mid.sh | bash', 'tac mid.sh | bash', 'eval "$(head -n 1 mid.sh)"']) denyBoth(c, mid);
+  for (const c of ['head -n 3 ok.sh | bash', 'tail -n +2 ok.sh | bash', 'tac ok.sh | sh', 'head -c 10 README.md | bash']) allowBoth(c, { 'ok.sh': 'ok' });
+  // cat / less keep printing the file as it is
+  for (const c of ['cat mid.sh | bash', 'bash < mid.sh']) allowBoth(c, mid);
+});
+
+// ---- review R1-B2: several files feed one shell: their texts are ONE program, in command-line order ------------------------------------
+// Each file used to be judged on its own: `cat a b | bash` with a = `git pu` and b = `sh origin main` was allowed (and so was a protected
+// file name split across two files). The files' texts are joined (repeats included: `cat c c`) and judged as one program; a rewriting
+// producer's files are scanned joined too. Feeds whose order or multiplicity cannot be rebuilt (several producers) are refused.
+const splitAt = (bad) => bad.length - (bad === BAD_GIT ? 14 : 17); // 'git pu' | 'sh origin main'  and  '...~/.cla' | 'ude/settings.json'
+const parts = (bad) => [bad.slice(0, splitAt(bad)), `${bad.slice(splitAt(bad))}\n`];
+
+test('R1-B2: a guarded line split across the files of one reader is judged as the program the shell reads', () => {
+  const split = (bad) => { const [h, t] = parts(bad); return { 'a.sh': h, 'b.sh': t, 'ok.sh': 'echo hi\n' }; };
+  for (const c of [
+    'cat a.sh b.sh | bash', 'cat a.sh b.sh | sh -s', '{ cat a.sh b.sh; } | bash', 'eval "$(cat a.sh b.sh)"', 'bash <(cat a.sh b.sh)', 'bash < <(cat a.sh b.sh)', 'bash <<< "$(cat a.sh b.sh)"',
+    'cat a.sh b.sh ok.sh | bash', 'cat ok.sh a.sh b.sh | bash', 'cat -- a.sh b.sh | bash', 'less a.sh b.sh | bash', 'cd sub/.. && cat a.sh b.sh | bash', 'bash -c "$(cat a.sh b.sh)"',
+  ]) denyBuilt(c, split);
+  // each half alone, the other order and harmless pairs are still fine
+  for (const c of ['cat a.sh | bash', 'cat b.sh | bash', 'cat b.sh a.sh | bash', 'cat a.sh ok.sh b.sh | bash', 'cat ok.sh ok.sh | bash']) allowBuilt(c, split);
+});
+
+test('R1-B2: the same file listed twice is read twice (repeats are kept in the join)', () => {
+  const selfJoin = (bad) => { const [h, t] = parts(bad); return { 'c.sh': `${t}${h}` }; }; // c alone: `sh origin main` then `git pu`; c c: ... `git pu` + `sh origin main` ...
+  denyBuilt('cat c.sh c.sh | bash', selfJoin);
+  allowBuilt('cat c.sh | bash', selfJoin);
+});
+
+test('R1-B2: files read by a rewriting producer are scanned joined (a guarded word split across them is caught)', () => {
+  const split = (bad) => { const [h, t] = parts(bad); return { 'a.sh': h, 'b.sh': t }; };
+  for (const c of ['sed p a.sh b.sh | bash', 'awk 1 a.sh b.sh | sh', 'cat a.sh b.sh | tr a b | bash', 'eval "$(sed p a.sh b.sh)"', 'tail -n 5 a.sh b.sh | bash', 'sed p b.sh a.sh | bash', 'tac b.sh a.sh | bash']) denyBuilt(c, split);
+  allowBuilt('sed p a.sh | bash', split);
+  allowBuilt('sed p b.sh | bash', split);
+});
+
+test('R1-B2: feeds from several producers (order and multiplicity unknown) are refused, even for harmless files', () => {
+  const ok = () => ({ 'a.sh': 'echo a', 'b.sh': 'echo b' });
+  for (const c of ['{ cat a.sh; cat b.sh; } | bash', 'cat a.sh | bash < b.sh']) {
+    const r = bothBuilt(c, ok);
+    assert.equal(r.git.decision, 'deny', `git: ${c}`);
+    assert.equal(r.files.decision, 'deny', `files: ${c}`);
+  }
+});
+
+test('R1-B2: scriptFeedsOf joins the files of one reader in command-line order, repeats included', () => {
+  const feeds = (line) => simpleCommands(line).flatMap((c) => scriptFeedsOf(c, line));
+  const joined = (line) => feeds(line).filter((f) => f.joined); // (each file is still listed on its own as well)
+  assert.deepEqual(joined('cat a.sh b.sh | bash'), [{ kind: 'shell', file: 'a.sh b.sh', joined: ['a.sh', 'b.sh'] }]);
+  assert.deepEqual(joined('cat b.sh a.sh b.sh | bash'), [{ kind: 'shell', file: 'b.sh a.sh b.sh', joined: ['b.sh', 'a.sh', 'b.sh'] }]);
+  assert.deepEqual(feeds('cat a.sh b.sh | bash').filter((f) => !f.joined), [{ kind: 'shell', file: 'a.sh' }, { kind: 'shell', file: 'b.sh' }]);
+  assert.deepEqual(feeds('cat f.sh | bash'), [{ kind: 'shell', file: 'f.sh' }]); // one file: unchanged
+  assert.equal(feeds('{ cat a.sh; cat b.sh; } | bash')[0].unresolvable, true);
+  assert.equal(feeds('cat a.sh *.sh | bash')[0].unresolvable, true); // a glob among several: which files, in what order, is unknown
+  const scan = feeds('sed p a.sh b.sh | bash');
+  assert.deepEqual(scan.filter((f) => f.joined), [{ kind: 'scan', file: 'p a.sh b.sh', joined: ['p', 'a.sh', 'b.sh'] }]); // (the program word is a candidate file name too)
+});
+
+// ---- review R1-B2 follow-up: a joined feed that names a word the parser cannot resolve to ONE file is refused -----------------------------
+// The join only covered words without a glob / `$`; `sed p a.sh b*.sh | bash` fell back to judging a.sh alone and the glob's candidates alone,
+// so a guarded word split across them escaped. Several file operands where any of them expands (glob, `$`, command substitution, backtick,
+// brace list, `~user`) cannot be rebuilt in order: the line is refused. One file operand (however it is spelled) keeps its old verdict.
+const EXPANDING = ['b*.sh', 'b?.sh', 'b.s[h]', '"$F"', '$F', '${F}', '$(echo b.sh)', '`echo b.sh`', '~root/b.sh', '~+/b.sh', '@(b).sh', 'b.sh$X'];
+const splitFiles = (bad) => { const [h, t] = parts(bad); return { 'a.sh': h, 'b.sh': t, 'ok.sh': 'echo hi\n' }; };
+
+test('R1-B2 follow-up: exact readers (cat / less) with an operand that expands among several files are refused', () => {
+  for (const w of EXPANDING) {
+    for (const c of [
+      `cat a.sh ${w} | bash`, `cat ${w} a.sh | bash`, `less a.sh ${w} | sh -s`, `eval "$(cat a.sh ${w})"`, `bash <(cat a.sh ${w})`, `bash < <(cat a.sh ${w})`,
+      `bash -c "$(cat a.sh ${w})"`, `{ cat a.sh ${w}; } | bash`, `cat ok.sh ${w} | bash`, `cat a.sh ${w} ok.sh | bash`, `bash <<< "$(cat a.sh ${w})"`,
+    ]) denyBuilt(c, splitFiles);
+  }
+});
+
+test('R1-B2 follow-up: rewriting producers (sed / awk / tail / tr chains) with an operand that expands among several files are refused', () => {
+  for (const w of EXPANDING) {
+    for (const c of [
+      `sed p a.sh ${w} | bash`, `sed p ${w} a.sh | bash`, `awk 1 a.sh ${w} | sh`, `tail -n +1 a.sh ${w} | bash`, `head -n 9 a.sh ${w} | bash`, `tac a.sh ${w} | bash`,
+      `cat a.sh ${w} | tr a b | bash`, `eval "$(sed p a.sh ${w})"`, `bash <(sed p a.sh ${w})`, `bash < <(tail -n +1 a.sh ${w})`, `sed -n p a.sh ${w} | bash`, `sed -e p a.sh ${w} | bash`,
+    ]) denyBuilt(c, splitFiles);
+  }
+});
+
+test('R1-B2 follow-up: every producer and every way the text reaches a shell is covered, brace lists are joined in order or refused', () => {
+  for (const c of [
+    'more a.sh b.sh | bash', 'bat a.sh b.sh | bash', 'batcat a.sh b.sh | bash', 'source <(cat a.sh b.sh)', '. <(cat a.sh b.sh)', '$(cat a.sh b.sh)', 'sh <<< $(cat a.sh b.sh)', 'exec bash < <(cat a.sh b.sh)',
+    'zsh <(cat a.sh b.sh)', 'cat a.sh b.sh | sudo bash', 'cat a.sh b.sh | env bash', 'cat a.sh b.sh | tee /dev/stderr | bash', 'bash < <(cat a.sh b.sh | tr a a)',
+    'base64 a.sh b.sh | bash', 'cut -c1-99 a.sh b.sh | bash', 'sort a.sh b.sh | bash', 'nl a.sh b.sh | bash', 'rev a.sh b.sh | bash', 'jq -r . a.sh b.sh | bash', 'grep -h . a.sh b.sh | bash',
+    'cat a.sh {b,c}.sh | bash', 'cat {a,b}.sh | bash', 'cat a.sh f{1..3}.sh | bash', 'cat a.sh "{b,c}.sh" | bash', 'sed p a.sh {b,c}.sh | bash',
+  ]) denyBuilt(c, splitFiles);
+  for (const c of ['cat {b,c}.sh a.sh | bash', 'cat a.sh {b}.sh | bash']) allowBuilt(c, splitFiles); // (expanded in order by the parser; `{b}` is a plain name)
+});
+
+test('R1-B2 follow-up: scriptFeedsOf refuses a joined feed with an operand that is not one exact file; one operand is unchanged', () => {
+  const feeds = (line) => simpleCommands(line).flatMap((c) => scriptFeedsOf(c, line));
+  for (const line of ['cat a.sh b*.sh | bash', 'cat a.sh "$F" | bash', 'sed p a.sh b*.sh | bash', 'tail -n +1 a.sh "$F" | bash', 'cat a.sh ~root/b.sh | bash', 'sed -e p a.sh b.sh | cat "$F" | bash', '{ cat a.sh; sed p b*.sh; } | bash']) {
+    const r = feeds(line);
+    assert.equal(r.length, 1, line);
+    assert.equal(r[0].unresolvable, true, line);
+  }
+  assert.equal(feeds('sed p b*.sh | bash').some((f) => f.unresolvable), false); // one file operand: the candidates are judged as before
+  assert.equal(feeds('cat b*.sh | bash').some((f) => f.unresolvable), false);
+  assert.equal(feeds('awk \'{print $1}\' a.sh | bash').some((f) => f.unresolvable), false); // `$` in the program text is not a file operand
+  assert.equal(feeds('sed "s/a/$X/" a.sh | bash').some((f) => f.unresolvable), false);
+  assert.equal(feeds('grep -e \'^x\' a.sh b.sh | bash').some((f) => f.unresolvable), false); // a pattern quoted for the producer is not a glob of the shell
+  assert.equal(feeds('grep -e ^x a.sh b.sh | bash')[0].unresolvable, true); // ... unquoted, it is
+  assert.equal(feeds('cat a.sh ~/b.sh | bash').some((f) => f.joined), true); // the user's own home resolves
+});
+
+// ---- review R2-B1: exact readers and rewriting producers feeding ONE shell are refused (their combined output cannot be rebuilt) ---------
+// Exact files and a rewriting producer's files were joined separately, each only from two operands up: `{ cat a; tail -c 99 b; } | bash` (one of
+// each) was judged as `git pu` and, scanned, `sh origin main`, and neither alone trips a policy. Any feed that combines both kinds is refused.
+test('R2-B1: a guarded line split across an exact reader and a rewriting producer is refused, in every form', () => {
+  for (const c of [
+    '{ cat a.sh; tail -c 99 b.sh; } | bash', '{ cat a.sh; tail -c 99 b.sh; } | sh -s', '{ cat a.sh; sed p b.sh; } | bash', '{ cat a.sh; tr a b < b.sh; } | bash',
+    'bash < <({ cat a.sh; tail -c 99 b.sh; })', 'eval "$({ cat a.sh; tail -c 99 b.sh; })"', 'bash <(cat a.sh; tail -c 99 b.sh)', 'bash -c "$(cat a.sh; tail -c 99 b.sh)"',
+    'cat a.sh <(tail -c 99 b.sh) | bash', 'cat a.sh | bash < <(tail -c 99 b.sh)', 'tail -c 99 a.sh | bash < b.sh',
+    '{ cat a.sh; head -c 99 b.sh; } | bash', '{ cat a.sh; awk 1 b.sh; } | bash', '{ cat a.sh; base64 b.sh; } | bash',
+  ]) denyBuilt(c, splitFiles);
+});
+
+test('R2-B1: the order does not matter (refused, not judged by luck), and harmless mixed feeds are refused too', () => {
+  const ok = () => ({ 'a.sh': 'echo a', 'b.sh': 'echo b' });
+  for (const c of ['{ tail -c 99 b.sh; cat a.sh; } | bash', '{ cat a.sh; tail -c 99 b.sh; } | bash', 'eval "$({ sed p b.sh; cat a.sh; })"']) {
+    const r = bothBuilt(c, ok);
+    assert.equal(r.git.decision, 'deny', `git: ${c}`);
+    assert.equal(r.files.decision, 'deny', `files: ${c}`);
+  }
+  // a single producer of either kind is unchanged
+  for (const c of ['cat a.sh | bash', 'tail -c 99 b.sh | bash', 'sed p a.sh | bash', 'cat a.sh b.sh | bash']) allowBuilt(c, ok);
+});
+
+test('R2-B1: scriptFeedsOf refuses a feed that combines exact and computed producers', () => {
+  const feeds = (line) => simpleCommands(line).flatMap((c) => scriptFeedsOf(c, line));
+  for (const line of ['{ cat a.sh; tail -c 99 b.sh; } | bash', '{ tail -c 99 b.sh; cat a.sh; } | bash', 'cat a.sh | bash < <(sed p b.sh)']) {
+    const r = feeds(line);
+    assert.equal(r.length, 1, line);
+    assert.equal(r[0].unresolvable, true, line);
+  }
+  assert.equal(feeds('tail -c 99 b.sh | bash').some((f) => f.unresolvable), false);
+  assert.equal(feeds('cat a.sh | bash').some((f) => f.unresolvable), false);
+});
+
+// ---- review R2-B2: fragments of a joined feed are judged on an isolated copy of the state; the joined program carries its real changes -------
+// The per-file records were judged in sequence on the shared state before the joined record: a fragment that switches the branch (`git switch
+// feature` in b) changed the branch the joined program was judged against, though `cat a b c` with a = `#` comments that very line out.
+const onMain = { currentBranch: () => 'ma' + 'in' };
+const gitOnMain = (command, fsOpts, o = {}) => git(command, fsOpts, { ...onMain, ...o });
+const switchPush = () => ({ 'a.sh': '#', 'b.sh': 'git switch feature\n', 'c.sh': 'git push\n', 'd.sh': 'git status\n' });
+
+test('R2-B2: a fragment that switches the branch does not change the state the joined program (or the other fragments) is judged against', () => {
+  const fs = () => fakeFs(GIT_ROOT, switchPush(), ['sub', 'd']);
+  for (const c of [
+    'cat a.sh b.sh c.sh | bash', 'cat a.sh b.sh c.sh | sh -s', '{ cat a.sh b.sh c.sh; } | bash', 'eval "$(cat a.sh b.sh c.sh)"', 'bash <(cat a.sh b.sh c.sh)', 'bash < <(cat a.sh b.sh c.sh)',
+    'cat a.sh b.sh c.sh d.sh | bash', 'less a.sh b.sh c.sh | bash',
+  ]) {
+    const r = gitOnMain(c, fs());
+    assert.equal(r.decision, 'deny', `${c} -> ${r.reason}`);
+  }
+  // and what the fragments changed does not leak to the commands AFTER the feed: the real text `#git switch agent/x` switches nothing, so the later push is from main
+  const leak = () => fakeFs(GIT_ROOT, { 'a.sh': '#', 'b.sh': 'git switch agent/x\n', 'p.sh': 'git push\n' }, ['sub', 'd']);
+  for (const c of ['cat a.sh b.sh | bash; bash p.sh', 'bash <(cat a.sh b.sh); bash p.sh', 'eval "$(cat a.sh b.sh)"; bash p.sh']) assert.equal(gitOnMain(c, leak()).decision, 'deny', c);
+  assert.equal(gitOnMain('cat b.sh | bash; bash p.sh', leak()).decision, 'allow'); // b alone IS the switch (a single file carries)
+  // c alone pushes from main too (the baseline); the rewriting producer's files are scanned, never carried
+  assert.equal(gitOnMain('cat c.sh | bash', fs()).decision, 'deny');
+});
+
+// (the later push is in a NAMED script: a push written on the line itself makes the guard refuse any run-time fed shell before this matters)
+const carried = () => ({ 'a.sh': 'git switch ', 'b.sh': 'agent/x\n', 'sw.sh': 'git switch agent/x\n', 'st.sh': 'git status\n', 'p.sh': 'git push\n' });
+
+test('R2-B2: the joined program is the real one: its own branch switch carries on to the commands after it', () => {
+  const fs = () => fakeFs(GIT_ROOT, carried(), ['sub', 'd']);
+  assert.equal(gitOnMain('bash p.sh', fs()).decision, 'deny'); // the baseline: p pushes from main
+  // a + b = `git switch agent/x`: the rest of the line is on agent/x, where a push is allowed
+  for (const c of ['cat a.sh b.sh | bash; bash p.sh', 'bash <(cat a.sh b.sh); bash p.sh', 'eval "$(cat a.sh b.sh)"; bash p.sh']) assert.equal(gitOnMain(c, fs()).decision, 'allow', c);
+  // without the switch (b alone is just a word, st is a status) the line stays on main
+  for (const c of ['cat b.sh | bash; bash p.sh', 'cat st.sh st.sh | bash; bash p.sh']) assert.equal(gitOnMain(c, fs()).decision, 'deny', c);
+});
+
+test('R2-B2: a feed with ONE file keeps carrying that file\'s real state changes', () => {
+  const fs = () => fakeFs(GIT_ROOT, carried(), ['sub', 'd']);
+  for (const c of ['cat sw.sh | bash; bash p.sh', 'bash < sw.sh; bash p.sh', 'eval "$(cat sw.sh)"; bash p.sh']) assert.equal(gitOnMain(c, fs()).decision, 'allow', c); // the switch is real
+  assert.equal(gitOnMain('cat st.sh | bash; bash p.sh', fs()).decision, 'deny'); // nothing switched: still main
+});
+
+test('R2-B2: the files policy judges each fragment as a script of its own (no state leaks between fragments, the joined text is the real program)', () => {
+  // a `cd` in one fragment must not change where the next one or the joined program is judged: the joined text `#cd ~/.claude` is a comment
+  const spec = () => ({ 'a.sh': '#', 'b.sh': 'cd ~/.claude\n', 'c.sh': 'echo hi > settings.json\n' });
+  assert.equal(files('cat a.sh b.sh c.sh | bash', fakeFs(PROJ, spec(), ['sub', 'd'])).decision, 'allow');
+  assert.equal(files('cat b.sh c.sh | bash', fakeFs(PROJ, spec(), ['sub', 'd'])).decision, 'deny');
+});
+
+// ---- replay false positives of the join rule: only FILE operands count, and a variable the line set is resolved ------------------------------
+// `F=x/y; eval "$(bash $F/stack.sh env)"` (`env` is the script's argument) and `echo "$(( $(ps -o rss= -p $pid)/1024 ))MB"` (ps reads no file) were
+// refused as "several operands, one cannot be resolved". Only a producer's real file operands count; a `$` word with a known value is that file.
+test('R2-FP: a script producer\'s arguments, a system query\'s words and variables with a known value are not unresolvable file operands', () => {
+  const ok = () => ({ 'a.sh': 'echo a', 'b.sh': 'echo b', 'x/y/stack.sh': 'echo hi\n' });
+  for (const c of [
+    'F=x/y; eval "$(bash $F/stack.sh env)"', 'eval "$(bash x/y/stack.sh env)"', 'F=x/y; eval "$(bash $F/stack.sh env prod)"', 'F=x/y; bash <(bash $F/stack.sh env)',
+    'echo "$(( $(ps -o rss= -p $pid)/1024 ))MB"', 'eval "$(ps -o rss= -p $pid)"', 'x=$(( $(ps -o rss= -p $pid)/1024 )); echo $x', 'eval "$(sh $F/stack.sh a b c)"',
+    'F=b.sh; cat a.sh $F | bash', 'F=b.sh; cat a.sh "$F" | bash', 'F=b.sh; cat a.sh ${F} | bash', 'D=x/y; cat $D/stack.sh $D/stack.sh | bash',
+  ]) allowBuilt(c, ok);
+  // ... while an unknown word among several file operands is still refused, and a known one is joined with the file before it
+  for (const c of ['F=x; cat a.sh $UNKNOWN | bash', 'F=x; cat a.sh "$UNKNOWN" | bash', 'cat a.sh $F | bash', 'F=$(echo b.sh); cat a.sh $F | bash']) {
+    const r = bothBuilt(c, ok);
+    assert.equal(r.git.decision, 'deny', `git: ${c}`);
+    assert.equal(r.files.decision, 'deny', `files: ${c}`);
+  }
+  for (const c of ['F=b.sh; cat a.sh $F | bash', 'F=b.sh; cat a.sh "$F" | bash', 'F=b.sh; eval "$(cat a.sh ${F})"', 'F=a.sh; cat $F b.sh | bash']) denyBuilt(c, splitFiles);
+});
+
+test('R2-FP: scriptFeedsOf resolves a known variable and counts only file operands', () => {
+  const feeds = (line, resolve) => simpleCommands(line).flatMap((c) => scriptFeedsOf(c, line, resolve));
+  const vars = { F: 'x/y', G: 'b.sh' };
+  const resolve = (w) => w.replace(/\$\{?(\w+)\}?/g, (m, n) => vars[n] ?? m);
+  assert.equal(feeds('eval "$(bash $F/stack.sh env)"').some((f) => f.unresolvable), false); // no resolver needed: `env` is not a file
+  assert.equal(feeds('echo "$(( $(ps -o rss= -p $pid)/1024 ))MB"').some((f) => f.unresolvable), false);
+  assert.equal(feeds('cat a.sh $G | bash')[0].unresolvable, true);
+  assert.deepEqual(feeds('cat a.sh $G | bash', resolve).filter((f) => f.joined), [{ kind: 'shell', file: 'a.sh b.sh', joined: ['a.sh', 'b.sh'] }]);
+  assert.equal(feeds('cat a.sh $UNKNOWN | bash', resolve)[0].unresolvable, true);
+  assert.equal(feeds('cat a.sh $H | bash', () => 'two words')[0].unresolvable, true); // a value that is not one name is no resolution
+});
+
+// A system query's words are no file operands for the join rule, but its output still reaches the shell: it is judged as before, never weaker.
+test('R2-FP: text a system query prints into a shell is still refused when the line names a guarded operation', () => {
+  const lines = (bad) => [`date '+${bad}' | bash`, `eval "$(date '+${bad}')"`, `bash <(date '+${bad}')`, `printenv X | bash; ${bad}`, `eval "$(printenv X)"; ${bad}`, `eval "$(sysctl -n kern.x)"; ${bad}`];
+  // its words stay scan candidates as before the exemption: a file they name that holds a guarded word is refused (the producer is not dropped)
+  for (const c of ['date -f f.sh | bash', 'seq 1 f.sh | bash', 'which f.sh | bash', 'printenv f.sh | bash', 'eval "$(date -f f.sh)"', 'bash <(which f.sh)']) denyBoth(c, SPEC);
+  for (const c of ['date -f ok.sh | bash', 'printenv ok.sh | bash', 'echo "$(( $(ps -o rss= -p $pid)/1024 ))MB"']) allowBoth(c, SPEC);
+  for (const bad of [BAD_GIT]) for (const c of lines(bad)) assert.equal(git(c, fakeFs(GIT_ROOT, {}, ['sub', 'd'])).decision, 'deny', `git: ${c}`);
+  for (const bad of [BAD_FILES]) for (const c of lines(bad)) assert.equal(files(c, fakeFs(PROJ, {}, ['sub', 'd'])).decision, 'deny', `files: ${c}`);
+});
+
+// A script producer's other words are not FILE operands for the join rule, but the script may print a file they name (`ok.sh` = `cat "$1"`):
+// they stay scanned as before the R2-FP narrowing (background security review).
+test('R2-FP: a script producer\'s arguments are still scanned for the text they may feed', () => {
+  for (const c of ['bash ok.sh f.sh | bash', 'eval "$(bash ok.sh f.sh)"', 'bash <(sh ok.sh x f.sh)', 'eval "$(bash ok.sh env f.sh)"', 'bash <(node ok.sh f.sh)']) denyBoth(c, SPEC);
+  for (const c of ['bash ok.sh README.md | bash', 'eval "$(bash ok.sh env)"']) allowBoth(c, SPEC);
+});
+
+// Review R3-B1: a word kept out of the join count must still be a PATTERN when the shell globs it — `bash ok.sh f*.sh` prints f.sh (ok.sh = `cat "$@"`),
+// not a file literally named `f*.sh`. Same for a system query's words (`date -f f*.sh`).
+test('R3-B1: a globbed script argument or system-query word is scanned as the files it matches, not as a literal name', () => {
+  for (const c of ['bash ok.sh f*.sh | bash', 'eval "$(bash ok.sh ?.sh)"', 'bash <(sh ok.sh x f*.sh)', 'bash ok.sh sub/f*.sh | bash', 'date -f f*.sh | bash', 'eval "$(which ?.sh)"']) denyBoth(c, SPEC);
+  for (const c of ['bash ok.sh o*.sh | bash', 'date -f o?.sh | bash']) allowBoth(c, SPEC);
+});
+
+test('R1-B2 follow-up: a feed with ONE file operand keeps its verdict, however the operand is spelled', () => {
+  const ok = () => ({ 'a.sh': 'echo a', 'b.sh': 'echo b', 'ok.sh': 'echo hi\n' });
+  for (const c of ['cat ok.sh | bash', 'cat o*.sh | bash', 'sed p ok.sh | bash', 'sed p o*.sh | bash', 'awk \'{print $1}\' ok.sh | bash', 'sed "s/a/$X/" ok.sh | bash', 'tail -n +1 ok.sh | bash', 'cat a.sh b.sh | bash']) allowBuilt(c, ok);
+});

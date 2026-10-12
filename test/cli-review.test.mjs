@@ -1,6 +1,7 @@
 // End-to-end tests for the review-loop commands (codex-review, triage, arbiter, state, review-complete, followups).
 // They spawn the real CLI against a real throwaway git repo, a scripted fake gh and a scripted fake codex, because the
 // contract the ship skill depends on is the pair (stdout JSON, exit code) plus the .review/ files left behind.
+import { randomBytes } from 'node:crypto';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -245,6 +246,34 @@ test('codex-review: a valid findings file becomes round 1 with ids, state, codex
   assert.match(call.stdin, /Review round: 1/);
   assert.match(call.stdin, /Risk level: low/);
   assert.doesNotMatch(call.stdin, /Prior rulings/);
+});
+
+test('codex-review: a large binary document in the range is left out of diff.patch and named in it and in the prompt', (t) => {
+  const w = world(t, { light: true });
+  const { repo } = w;
+  // the sheet lands on main first, so this PR (merged with main) DELETES it, as the 234 MB spreadsheet PR did
+  repo.checkout('main');
+  repo.write('data/old.xlsx', randomBytes(5 * 1024 * 1024));
+  const fork = repo.commit('the sheet lands on main');
+  repo.checkout('feat/x');
+  repo.git(['merge', '-q', '--no-edit', 'main']);
+  repo.rm('data/old.xlsx');
+  const head = repo.commit('drop the sheet');
+  w.prHead(head);
+
+  const r = w.codex(1, findingsOf(), { from: fork, to: head });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([w.state().rounds[0].fromHead, w.state().rounds[0].toHead], [fork, head]);
+  const patch = readFileSync(w.roundFile(1, 'diff.patch'), 'utf8');
+  assert.ok(patch.length < 20_000, `diff.patch is ${patch.length} bytes`);
+  assert.match(patch, /\+export const v12 = compute\(x\.y\);/, 'the rest of the diff is there');
+  assert.doesNotMatch(patch, /GIT binary patch/);
+  const note = 'data/old.xlsx — large binary (5.0 MiB), deleted, content not shown';
+  assert.ok(patch.includes(note), 'the patch names the skipped file');
+  const [call] = w.captured();
+  assert.match(call.stdin, /## Large binary files/);
+  assert.ok(call.stdin.includes(`- ${note}`), 'and so does the prompt');
+  assert.equal(w.state().rounds[0].contentHashAtToHead, contentHash('main', 'HEAD', { cwd: repo.dir, exclude: ['docs/agent-log.md'] }));
 });
 
 test('codex-review: --model overrides the configured model; a bad effort or model is a usage error before anything runs', (t) => {

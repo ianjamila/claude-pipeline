@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Readable } from 'node:stream';
 import {
-  REASON_PREFIX, FAIL_CLOSED_KEYWORDS, denyPayload, deny, allow, readHookInput, readStdinText, runHook,
+  REASON_PREFIX, denyPayload, deny, allow, readHookInput, readStdinText, runHook,
 } from '../pipeline/hooks/lib/hook-io.mjs';
 
 const sink = () => ({ out: '', write(s) { this.out += s; } });
@@ -69,43 +69,49 @@ test('runHook: the evaluator receives the parsed input', async () => {
   assert.equal(seen.cwd, '/x');
 });
 
-// Fail-closed policy: an internal error denies only when the raw stdin looks guarded.
-for (const kw of FAIL_CLOSED_KEYWORDS) {
-  test(`runHook: evaluator crash + stdin containing "${kw}" denies`, async () => {
-    const { result, out } = await run(() => { throw new Error('boom'); }, `{"tool_input":{"command":"x ${kw} y"}}`);
+// Fail-closed policy (#21): ANY internal error denies, with the error in the reason. It used to deny only when the raw stdin
+// held a guarded keyword ("push", "merge", ...), so a bug or a timeout on a command spelled another way was allowed.
+// Deliberate behaviour change: the keyword tests that asserted the open path now assert the denial.
+const COMMANDS = ['x push y', 'git merge x', 'GIT PUSH origin MAIN', 'gh Issue Close 7', 'ls -la', "g''it status", 'bash f.sh', ''];
+for (const command of COMMANDS) {
+  test(`runHook: evaluator crash denies and names the error (command ${JSON.stringify(command)})`, async () => {
+    const { result, out } = await run(() => { throw new Error('boom'); }, JSON.stringify({ tool_input: { command } }));
     assert.equal(result, 'deny');
-    assert.match(denyJson(out).permissionDecisionReason, /boom/);
+    assert.match(denyJson(out).permissionDecisionReason, /internal error while checking this command \(boom\)/);
   });
-  test(`runHook: malformed stdin containing "${kw}" denies`, async () => {
-    const { result } = await run(() => ({ decision: 'allow' }), `{ not json ${kw}`);
+  test(`runHook: malformed stdin denies (command ${JSON.stringify(command)})`, async () => {
+    const { result } = await run(() => ({ decision: 'allow' }), `{ not json ${command}`);
     assert.equal(result, 'deny');
   });
 }
 
-test('runHook: the keyword match is case-insensitive', async () => {
-  assert.equal((await run(() => { throw new Error('x'); }, '{"command":"GIT PUSH origin MAIN"}')).result, 'deny');
-  assert.equal((await run(() => { throw new Error('x'); }, '{"command":"gh Issue Close 7"}')).result, 'deny');
+test('runHook: empty stdin and non-object JSON deny', async () => {
+  for (const stdin of ['', '   ', 'null', '[]', '42', '"x"']) {
+    const { result, out } = await run(() => ({ decision: 'allow' }), stdin);
+    assert.equal(result, 'deny', JSON.stringify(stdin));
+    assert.match(denyJson(out).permissionDecisionReason, /internal error/, JSON.stringify(stdin));
+  }
 });
 
-test('runHook: evaluator crash on an unrelated command allows silently', async () => {
-  const { result, out } = await run(() => { throw new Error('boom'); }, '{"tool_input":{"command":"ls -la"}}');
-  assert.equal(result, 'allow');
-  assert.equal(out, '');
+test('runHook: an evaluator that returns nothing, or a decision it does not know, is an internal error', async () => {
+  for (const verdict of [undefined, null, {}, { decision: 'maybe' }, 'allow']) {
+    const { result, out } = await run(() => verdict, '{"command":"ls"}');
+    assert.equal(result, 'deny', JSON.stringify(verdict));
+    assert.match(denyJson(out).permissionDecisionReason, /no decision/);
+  }
 });
 
-test('runHook: malformed stdin without keywords allows silently', async () => {
-  const { result, out } = await run(() => ({ decision: 'deny', reason: 'unreachable' }), '{ garbage');
-  assert.equal(result, 'allow');
-  assert.equal(out, '');
+test('runHook: a rejected promise from the evaluator denies', async () => {
+  const { result, out } = await run(async () => { throw new Error('async boom'); }, '{"command":"ls"}');
+  assert.equal(result, 'deny');
+  assert.match(denyJson(out).permissionDecisionReason, /async boom/);
 });
 
-test('runHook: empty stdin allows', async () => {
-  assert.equal((await run(() => ({ decision: 'deny', reason: 'x' }), '')).result, 'allow');
-});
-
-test('runHook: an evaluator that returns nothing is an internal error (fails closed on guarded input)', async () => {
-  assert.equal((await run(() => undefined, '{"command":"git push"}')).result, 'deny');
-  assert.equal((await run(() => ({ decision: 'maybe' }), '{"command":"ls"}')).result, 'allow');
+test('runHook: a thrown non-Error value is named too, and an unwritable stdout cannot make it throw', async () => {
+  const { out } = await run(() => { throw 'plain string'; }, '{"command":"ls"}'); // eslint-disable-line no-throw-literal
+  assert.match(denyJson(out).permissionDecisionReason, /plain string/);
+  const gone = { write() { throw new Error('EPIPE'); } };
+  assert.equal(await runHook(() => { throw new Error('x'); }, { stdin: '{"command":"ls"}', stdout: gone }), 'allow'); // nothing more can be done
 });
 
 test('runHook never rejects even when the evaluator rejects asynchronously', async () => {

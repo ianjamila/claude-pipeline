@@ -3,6 +3,7 @@
 // disagree about "the code that was reviewed", whatever the branch looks like.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
 import { currentContentHash } from '../pipeline/lib/review-context.mjs';
 import { localContentHash } from '../pipeline/lib/finalgate.mjs';
 import { reviewContentHash } from '../pipeline/lib/git.mjs';
@@ -123,4 +124,25 @@ test('an explicit baseSha equals the default when it names the same commit', (t)
   repo.write('src/a.js', 'one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nTEN \n');
   repo.commit('more');
   assert.notEqual(reviewContentHash({ ...args, baseSha: 'HEAD~1' }, o), reviewContentHash({ ...args, baseSha: mainSha }, o));
+});
+
+// Default limits: 5 MiB of random bytes in a listed format is a large binary document, so diffFiles-style skipping applies to
+// both entry points alike, and the hash must still follow the bytes (a blob id stands in for them).
+test('review-loop and final-gate hashes stay identical, and follow the bytes, when the branch holds a large binary document', (t) => {
+  const repo = world(t);
+  const h0 = both(repo);
+
+  repo.write('exports/data.xlsx', randomBytes(5 * 1024 * 1024));
+  repo.commit('add a large sheet');
+  const h1 = both(repo);
+  assert.notEqual(h1, h0, 'an added large binary is covered');
+
+  repo.write('exports/data.xlsx', randomBytes(5 * 1024 * 1024));
+  repo.commit('replace it with other bytes of the same size');
+  const h2 = both(repo);
+  assert.notEqual(h2, h1, 'new bytes move the hash');
+
+  repo.rm('exports/data.xlsx');
+  repo.commit('drop it again');
+  assert.equal(both(repo), h0, 'a skipped file leaves no residue once it is gone from the range');
 });

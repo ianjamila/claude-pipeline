@@ -66,9 +66,20 @@ function fenced(label, text) {
   return [`${fence}${label}`, text, fence];
 }
 
+// One line per large binary change left out of a review packet (git.mjs#reviewPatch): `<path> — large binary (<size>), <status>,
+// content not shown`. A rename names both paths. Paths and sizes are data, shown one per line, never interpreted.
+export function largeBinaryNote(changes = []) {
+  const WORD = { A: 'added', D: 'deleted', M: 'modified' };
+  return changes.map((c) => {
+    const mib = (c.size / (1024 * 1024)).toFixed(1);
+    const status = c.status === 'R' ? `renamed from ${oneLine(c.oldPath)}` : (WORD[c.status] ?? c.status);
+    return `${oneLine(c.newPath ?? c.oldPath)} — large binary (${mib} MiB), ${status}, content not shown`;
+  });
+}
+
 // rulesRef: where the project rules are read from. Defaults to base, but the caller should pass the PR's merge base: a
 // later round's base already contains the PR's own edits.
-export function buildReviewPrompt({ pr, title, body, base, head, risk, round, lightLane, priorRulings = [], rulesRef = base }) {
+export function buildReviewPrompt({ pr, title, body, base, head, risk, round, lightLane, priorRulings = [], rulesRef = base, largeBinaries = [] }) {
   assertRev('base', base);
   assertRev('rulesRef', rulesRef);
   assertRev('head', head);
@@ -108,6 +119,12 @@ export function buildReviewPrompt({ pr, title, body, base, head, risk, round, li
     'Do not pad. Empty buckets are fine, and so is an empty review when you find nothing.',
     'Answer with JSON only, matching the provided output schema (summary, blocking, suggestions, worth_considering).',
   );
+
+  // Binary documents too big to put in diff.patch: named, so a reviewer knows they changed and does not print their bytes.
+  const named = largeBinaryNote(largeBinaries);
+  if (named.length > 0) {
+    lines.push('', '## Large binary files', 'These changed in the range but their content is not shown (`git diff` would print every byte); do not read them, judge them by name and status:', ...named.map((l) => `- ${l}`));
+  }
 
   const rulings = Array.isArray(priorRulings) ? priorRulings : [];
   if (rulings.length > 0) {
