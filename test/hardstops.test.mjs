@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
 import { classifyHardStops, collectHardStops, enclosingStatements, stripSqlComments, envNamesIn } from '../pipeline/lib/hardstops.mjs';
+import { diffFiles } from '../pipeline/lib/git.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { MIG, pkg, cfg, file, rulesOf, classify, run } from './helpers/hardstops.mjs';
 
@@ -690,4 +692,40 @@ test('IO: a binary secret file is caught by path (and flagged unreadable)', asyn
   repo.commit('add cert');
   const hits = await collectHardStops({ base: 'main', head: 'feat', cwd: repo.dir, config: cfg() });
   assert.deepEqual(rulesOf(hits), ['R0-unscannable', 'R3-secrets']);
+});
+
+test('R0-unscannable is not raised for the pure deletion of a large binary diffFiles skipped, but is for adding or editing one', () => {
+  const skipped = (path, status, over = {}) => ({ ...file(path, { status, binary: true, ...over }), skippedLargeBinary: true });
+  assert.deepEqual(rulesOf(run([skipped('data/report.xlsx', 'D')])), []);
+  assert.deepEqual(rulesOf(run([skipped('data/report.xlsx', 'A')])), ['R0-unscannable']);
+  assert.deepEqual(rulesOf(run([skipped('data/report.xlsx', 'M')])), ['R0-unscannable']);
+  assert.deepEqual(rulesOf(run([skipped('data/new.xlsx', 'R', { oldPath: 'data/old.xlsx' })])), ['R0-unscannable']);
+  // the exemption is for the skipped large binary only: any other binary deletion keeps its flag
+  assert.deepEqual(rulesOf(run([file('data/report.xlsx', { status: 'D', binary: true })])), ['R0-unscannable']);
+});
+
+// diffFiles leaves a big binary document out of the --text diff (it would overflow the buffer); its paths must still reach
+// the path rules. Real default threshold (4 MiB), so the files are 5 MiB of random bytes.
+test('IO: a large binary under migrations, deleted or moved out with an edit, is still caught by path (content skipped by diffFiles)', async () => {
+  const [gone, sheet] = [randomBytes(5 * 1024 * 1024), randomBytes(5 * 1024 * 1024)]; // distinct, so git pairs the rename unambiguously
+  const repo = createTmpRepo();
+  repo.write('README.md', 'x\n');
+  repo.write('supabase/migrations/20240101_gone.xlsx', gone);
+  repo.write('supabase/migrations/20240102_moved.xlsx', sheet);
+  repo.commit('base');
+  repo.branch('feat');
+  repo.rm('supabase/migrations/20240101_gone.xlsx');
+  repo.rm('supabase/migrations/20240102_moved.xlsx');
+  repo.write('exports/moved.xlsx', Buffer.concat([sheet, Buffer.from('tail')]));
+  repo.commit('delete one, move and edit the other');
+  // precondition: both really were skipped, so the hits below come from their paths alone
+  assert.deepEqual(diffFiles('main', 'feat', { cwd: repo.dir }).map((f) => f.skippedLargeBinary), [true, true]);
+  const hits = await collectHardStops({ base: 'main', head: 'feat', cwd: repo.dir, config: cfg() });
+  const of = (file) => rulesOf(hits.filter((h) => h.file === file));
+  assert.ok(of('supabase/migrations/20240101_gone.xlsx').includes('R1-destructive'));
+  assert.ok(of('supabase/migrations/20240101_gone.xlsx').includes('R1-migration-edited'));
+  // a pure deletion adds nothing to read, so it is not "unscannable"; the move-with-edit puts new bytes at a new path, so it is
+  assert.ok(!of('supabase/migrations/20240101_gone.xlsx').includes('R0-unscannable'));
+  assert.ok(of('exports/moved.xlsx').includes('R0-unscannable'));
+  assert.ok(hits.some((h) => h.file === 'exports/moved.xlsx' && h.rule === 'R1-destructive' && /moved out of the migrations dir/.test(h.detail)));
 });

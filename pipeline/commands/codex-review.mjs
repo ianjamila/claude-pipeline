@@ -13,11 +13,11 @@ import { existsSync, readFileSync, rmSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import {
-  FINDINGS_SCHEMA_PATH, assignIds, buildCodexArgs, buildReviewPrompt, classifyCodexFailure, renderFindingsMarkdown,
+  FINDINGS_SCHEMA_PATH, assignIds, buildCodexArgs, buildReviewPrompt, classifyCodexFailure, largeBinaryNote, renderFindingsMarkdown,
   validateFindings,
 } from '../lib/codex.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
-import { git, GitError, diffFiles, headSha, mergeBase, revParse, showFile } from '../lib/git.mjs';
+import { GitError, diffFiles, headSha, mergeBase, reviewPatch, revParse, showFile } from '../lib/git.mjs';
 import { collectHardStops } from '../lib/hardstops.mjs';
 import { createGitHub } from '../lib/github.mjs';
 import { GhError, codexCommand, runAsync } from '../lib/proc.mjs';
@@ -162,7 +162,10 @@ export const run = guarded(async (argv, ctx) => {
 
   ensureRoundDir(root, round);
   // What Codex is shown (and what the fix commits are measured against) is exactly this range.
-  writeFileAtomic(path.join(dir, 'diff.patch'), git(['diff', '--binary', '--no-color', '--no-ext-diff', `${base}..${head}`], o));
+  // Large binary documents would overflow the buffer; they are named at the end of the patch and in the prompt instead.
+  const { patch, skipped: largeBinaries } = reviewPatch(base, head, o);
+  const note = largeBinaryNote(largeBinaries);
+  writeFileAtomic(path.join(dir, 'diff.patch'), note.length === 0 ? patch : `${patch}\nLarge binary files (content not shown):\n${note.join('\n')}\n`);
 
   const priorItems = allItems(state ?? { rounds: [] });
   const cache = ruledCacheFrom(priorItems);
@@ -172,7 +175,7 @@ export const run = guarded(async (argv, ctx) => {
     id: item.id, title: item.title, ruling: `${cache[fp].decision ?? 'unknown'}: ${cache[fp].reason ?? ''}`,
   }));
   const prompt = buildReviewPrompt({
-    pr, title: view.title, body: view.body, base, head, risk: level, round, lightLane, priorRulings, rulesRef: forkPoint,
+    pr, title: view.title, body: view.body, base, head, risk: level, round, lightLane, priorRulings, rulesRef: forkPoint, largeBinaries,
   });
 
   const hashAtHead = currentContentHash(root, config);

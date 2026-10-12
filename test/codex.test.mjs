@@ -6,6 +6,7 @@ import {
   FINDINGS_SCHEMA_PATH,
   buildCodexArgs,
   buildReviewPrompt,
+  largeBinaryNote,
   validateFindings,
   classifyCodexFailure,
   normalizeTitle,
@@ -581,6 +582,30 @@ test('buildReviewPrompt states the review scope, range and rules files', () => {
   assert.ok(p.includes('AGENTS.md') && p.includes('CLAUDE.md'));
   for (const cmd of ['git show', 'rg']) assert.ok(p.includes(cmd), cmd);
   assert.match(p, /read-only/i);
+});
+
+test('largeBinaryNote names each large binary with size and status; buildReviewPrompt lists them only when there are some', () => {
+  const MiB = 1024 * 1024;
+  const changes = [
+    { status: 'D', oldPath: 'data/a b.xlsx', newPath: null, size: 5 * MiB },
+    { status: 'A', oldPath: null, newPath: 'data/new.pdf', size: 12.25 * MiB },
+    { status: 'M', oldPath: 'x/y.zip', newPath: 'x/y.zip', size: 4.5 * MiB },
+    { status: 'R', oldPath: 'old/z.xlsx', newPath: 'new/z.xlsx', size: 6 * MiB },
+  ];
+  assert.deepEqual(largeBinaryNote(changes), [
+    'data/a b.xlsx — large binary (5.0 MiB), deleted, content not shown',
+    'data/new.pdf — large binary (12.3 MiB), added, content not shown',
+    'x/y.zip — large binary (4.5 MiB), modified, content not shown',
+    'new/z.xlsx — large binary (6.0 MiB), renamed from old/z.xlsx, content not shown',
+  ]);
+  assert.deepEqual(largeBinaryNote([]), []);
+  assert.deepEqual(largeBinaryNote(), []);
+
+  const p = buildReviewPrompt(promptArgs({ largeBinaries: changes }));
+  assert.match(p, /## Large binary files/);
+  for (const line of largeBinaryNote(changes)) assert.ok(p.includes(`- ${line}`), line);
+  assert.doesNotMatch(buildReviewPrompt(promptArgs()), /Large binary files/);
+  assert.doesNotMatch(buildReviewPrompt(promptArgs({ largeBinaries: [] })), /Large binary files/);
 });
 
 test('buildReviewPrompt carries the three bucket definitions verbatim', () => {
