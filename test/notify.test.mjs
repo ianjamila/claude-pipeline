@@ -8,7 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   OUTCOME_EVENTS, classifyOutcome, defaultAction, prodEvent, prodErrorEvent, parseSecrets, loadNotifyConfig, scrubber, buildTitle,
-  buildMessage, eventKey, parseRemote, notifyEvent, testEvent, detectWsl, TOAST_SCRIPT, TOAST_AUMID, encodeToastScript, LEDGER_NAME,
+  buildMessage, eventKey, parseRemote, notifyEvent, testEvent, detectWsl, TOAST_SCRIPT, TOAST_AUMID, encodeToastScript, LEDGER_NAME, DEFAULT_SECRETS_FILE,
 } from '../pipeline/lib/notify.mjs';
 import { run as notifyCommand } from '../pipeline/commands/notify.mjs';
 import { UsageError } from '../pipeline/lib/cli.mjs';
@@ -258,6 +258,17 @@ test('PIPELINE_SECRETS_FILE overrides the secrets path', () => {
   assert.equal(loadNotifyConfig({ env: { PIPELINE_SECRETS_FILE: r.deps.secretsFile } }).topic, TOPIC);
 });
 
+test('hermetic: the test run points PIPELINE_SECRETS_FILE at a missing path and production honours it, so the real secrets file is never read', () => {
+  const guard = process.env.PIPELINE_SECRETS_FILE;
+  assert.ok(guard, 'PIPELINE_SECRETS_FILE is unset: run the tests through `node scripts/test.mjs` (it sets a non-existent path)');
+  assert.notEqual(path.resolve(guard), path.resolve(DEFAULT_SECRETS_FILE));
+  assert.equal(existsSync(guard), false, 'the guard path must not exist');
+  // With the test env and no injected secretsFile, the file loadNotifyConfig tries to read is the guard path, never the default.
+  const reads = [];
+  loadNotifyConfig({ env: { ...process.env, PIPELINE_NOTIFY: undefined }, readFile: (f) => { reads.push(f); throw new Error('ENOENT'); } });
+  assert.deepEqual(reads, [guard]);
+});
+
 test('an invalid field sends nothing and never falls back to another value', () => {
   const r = rig({ secrets: `NTFY_TOPIC=good\nNTFY_SERVER=http://evil.example.com\n` });
   assert.deepEqual(loadNotifyConfig({ env: {}, secretsFile: r.deps.secretsFile }), { ok: false, reason: 'invalid-config:server' });
@@ -269,7 +280,7 @@ test('an invalid field sends nothing and never falls back to another value', () 
   const u = rig({ secrets: 'NTFY_TOPIC=$(whoami)\n' });
   assert.deepEqual(loadNotifyConfig({ env: {}, secretsFile: u.deps.secretsFile }), { ok: false, reason: 'invalid-config:topic' });
   for (const bad of ['ftp://x.example.com', 'https://user:pw@x.example.com', 'https://x.example.com/?a=1', 'not a url']) {
-    assert.equal(loadNotifyConfig({ env: { NTFY_TOPIC: 't', NTFY_SERVER: bad } }).reason, 'invalid-config:server', bad);
+    assert.equal(loadNotifyConfig({ env: { NTFY_TOPIC: 't', NTFY_SERVER: bad }, secretsFile: path.join(r.dir, 'missing.sh') }).reason, 'invalid-config:server', bad);
   }
 });
 
@@ -675,13 +686,13 @@ test('notify --event stopped --pr N --action TEXT [--cause CODE]: one push, repl
 });
 
 test('notify with PIPELINE_NOTIFY=off reports disabled and exits 0', async () => {
-  const res = await notifyCommand(['--event', 'stopped', '--pr', '1', '--action', 'x'], { cwd: os.tmpdir(), env: { PIPELINE_NOTIFY: 'off' } });
+  const res = await notifyCommand(['--event', 'stopped', '--pr', '1', '--action', 'x'], { cwd: os.tmpdir(), env: { PIPELINE_NOTIFY: 'off', PIPELINE_SECRETS_FILE: path.join(os.tmpdir(), 'pipeline-tests-missing', 'secrets.sh') } });
   assert.equal(res.exitCode, 0);
   assert.equal(res.output.reason, 'disabled');
 });
 
 test('notify usage errors', async () => {
-  const ctx = { cwd: os.tmpdir(), env: { PIPELINE_NOTIFY: 'off' } };
+  const ctx = { cwd: os.tmpdir(), env: { PIPELINE_NOTIFY: 'off', PIPELINE_SECRETS_FILE: path.join(os.tmpdir(), 'pipeline-tests-missing', 'secrets.sh') } };
   await assert.rejects(notifyCommand([], ctx), UsageError);
   await assert.rejects(notifyCommand(['--test', '--event', 'stopped'], ctx), UsageError);
   await assert.rejects(notifyCommand(['--event', 'stopped', '--pr', '1'], ctx), UsageError);
