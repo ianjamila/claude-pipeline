@@ -12,6 +12,62 @@ import { resolve } from 'node:path';
 const CALL_TIMEOUT_MS = 60_000;
 const PER_PAGE = 30;
 
+// ---- GraphQL: the inbox's open / recently merged PR lists --------------------------------------
+// Page size 20: each node carries up to 100 check contexts, and a bigger page trips GitHub's node limit.
+const GRAPHQL_PAGE = 20;
+const MAX_PAGES = 100;
+
+const OPEN_PRS_QUERY = `query($owner: String!, $name: String!, $first: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: OPEN, first: $first, after: $after, orderBy: {field: CREATED_AT, direction: ASC}) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number title url isDraft createdAt baseRefName headRefName headRefOid isCrossRepository mergeable
+        labels(first: 50) { nodes { name } }
+        autoMergeRequest { enabledAt }
+        reviews(last: 1) { nodes { submittedAt } }
+        commits(last: 1) { nodes { commit { committedDate statusCheckRollup { contexts(first: 100) { nodes {
+          __typename
+          ... on CheckRun { name status conclusion }
+          ... on StatusContext { context state }
+        } } } } } }
+      }
+    }
+  }
+}`;
+
+const MERGED_PRS_QUERY = `query($owner: String!, $name: String!, $first: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: MERGED, first: $first, after: $after, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      pageInfo { hasNextPage endCursor }
+      nodes { number title url mergedAt updatedAt baseRefName headRefName headRefOid isCrossRepository }
+    }
+  }
+}`;
+
+const nodesOf = (conn) => (Array.isArray(conn?.nodes) ? conn.nodes.filter((n) => n !== null && typeof n === 'object') : []);
+
+function normaliseOpenPr(n) {
+  const commit = nodesOf(n.commits)[0]?.commit ?? null;
+  return {
+    number: n.number,
+    title: n.title ?? '',
+    url: n.url ?? null,
+    isDraft: n.isDraft === true,
+    createdAt: n.createdAt ?? null,
+    baseRefName: n.baseRefName,
+    headRefName: n.headRefName,
+    headRefOid: n.headRefOid,
+    isCrossRepository: n.isCrossRepository === true,
+    mergeable: n.mergeable ?? 'UNKNOWN',
+    labels: nodesOf(n.labels).map((l) => l.name).filter((x) => typeof x === 'string'),
+    autoMergeEnabledAt: n.autoMergeRequest?.enabledAt ?? null,
+    reviewDates: nodesOf(n.reviews).map((r) => r.submittedAt).filter((x) => typeof x === 'string'),
+    commitDate: commit?.committedDate ?? null,
+    contexts: nodesOf(commit?.statusCheckRollup?.contexts),
+  };
+}
+
 export const encodePath = (p) => String(p).split('/').map(encodeURIComponent).join('/');
 
 function prNumber(n) {
@@ -137,6 +193,75 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     },
     removeLabels(n, labels) {
       if (labels.length) ok(['pr', 'edit', prNumber(n), ...labels.flatMap((l) => ['--remove-label', l])]);
+    },
+
+    // POST a GraphQL query through `gh api graphql`: strings go as -f (never type-coerced, so a repo called "123" stays a
+    // string), numbers and booleans as -F. A reply with `errors` (or without `data`) is a failure, never partial data.
+    graphql(query, variables = {}) {
+      const args = ['api', 'graphql', '-f', `query=${query}`];
+      for (const [k, v] of Object.entries(variables)) {
+        if (v === undefined || v === null) continue;
+        args.push(typeof v === 'string' ? '-f' : '-F', `${k}=${v}`);
+      }
+      const body = parse(ok(args), args);
+      if (Array.isArray(body?.errors) && body.errors.length > 0) {
+        const message = body.errors.map((e) => String(e?.message ?? e)).join('; ').slice(0, 300);
+        throw new GhError({ code: 0, stderr: `GraphQL error: ${message}`, args });
+      }
+      if (body?.data === undefined || body.data === null) {
+        throw new GhError({ code: 0, stderr: 'GraphQL reply has no data', args });
+      }
+      return body.data;
+    },
+
+    // Follows pageInfo until the end. `visit(nodes)` returns true to stop early. A cursor that does not advance is an error
+    // (an endless loop would hang the pipeline), as is a reply without the pull request connection.
+    pagePullRequests(query, visit) {
+      const { owner, name } = self.repo();
+      let after = null;
+      const seen = new Set();
+      for (let page = 0; page < MAX_PAGES; page += 1) {
+        const data = self.graphql(query, { owner, name, first: GRAPHQL_PAGE, after });
+        const conn = data?.repository?.pullRequests;
+        if (!conn || !Array.isArray(conn.nodes)) {
+          throw new GhError({ code: 0, stderr: 'GraphQL reply has no pullRequests connection', args: ['api', 'graphql'] });
+        }
+        if (visit(nodesOf(conn)) === true) return;
+        if (conn.pageInfo?.hasNextPage !== true) return;
+        const next = conn.pageInfo.endCursor;
+        if (typeof next !== 'string' || next === '' || seen.has(next)) {
+          throw new GhError({ code: 0, stderr: 'GraphQL pagination did not advance', args: ['api', 'graphql'] });
+        }
+        seen.add(next);
+        after = next;
+      }
+      throw new GhError({ code: 0, stderr: `more than ${MAX_PAGES} pages of pull requests`, args: ['api', 'graphql'] });
+    },
+
+    // Every open PR (no comment bodies), oldest first, as plain facts: labels are names, contexts the latest commit's
+    // check runs and status contexts.
+    listOpenPrsDetailed() {
+      const out = [];
+      self.pagePullRequests(OPEN_PRS_QUERY, (nodes) => {
+        out.push(...nodes.map(normaliseOpenPr));
+      });
+      return out;
+    },
+
+    // PRs merged at or after `sinceMs`. The list is ordered by updatedAt, and mergedAt <= updatedAt, so the first page whose
+    // newest-to-oldest tail is older than `sinceMs` ends the walk: nothing after it can have merged inside the window.
+    listMergedPrsSince(sinceMs) {
+      const out = [];
+      self.pagePullRequests(MERGED_PRS_QUERY, (nodes) => {
+        for (const n of nodes) {
+          const merged = Date.parse(n.mergedAt);
+          if (!Number.isNaN(merged) && merged >= sinceMs) out.push({ number: n.number, title: n.title ?? '', url: n.url ?? null, mergedAt: n.mergedAt, baseRefName: n.baseRefName, headRefName: n.headRefName, headRefOid: n.headRefOid, isCrossRepository: n.isCrossRepository === true });
+        }
+        const last = nodes.at(-1);
+        const updated = Date.parse(last?.updatedAt);
+        return nodes.length === 0 || (!Number.isNaN(updated) && updated < sinceMs);
+      });
+      return out;
     },
 
     listIssues: ({ label, state = 'open' }) =>
