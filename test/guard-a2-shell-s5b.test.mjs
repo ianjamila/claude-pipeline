@@ -76,12 +76,21 @@ test('S5b: a glob cd that is not exactly one existing directory stays unknown (t
   // (the resolved directory sits at the depth the path says, so a climb out of it lands where the path says)
   assert.equal(files('cd "src/app/(staff)/[id]" && echo x > ../../../../../.claude/settings.json', fs).decision, 'deny', 'cd "src/app/(staff)/[id]" && echo x > ../../../../../.claude/settings.json');
   assert.equal(files('cd "src/app/(staff)/[id]" && echo x > ../../../../notes.txt', fs).decision, 'allow', 'cd "src/app/(staff)/[id]" && echo x > ../../../../notes.txt');
-  // (the widest reading is used, dot names and case included: only .hidden matches under dotglob, and it is not protected; an option command before the cd is a command that is not read-only: unknown)
+  // (an option command before the cd is a command that is not read-only: unknown)
   for (const pre of ['shopt -s dotglob nocaseglob; ', 'setopt globdots; ', 'set -o noglob; ', 'emulate zsh; ']) assert.equal(files(`${pre}cd "src/app/(staff)/[id]" && touch notes.txt`, fs).decision, 'deny', pre);
-  assert.equal(files('cd /home/u/proj/*idden && touch notes.txt', fs).decision, 'allow');
+  // (only the widest reading (dotglob) finds .hidden; by default nothing matches, and with nullglob that cd goes home: the two readings must agree)
+  assert.equal(files('cd /home/u/proj/*idden && touch notes.txt', fs).decision, 'deny', 'dotglob-only match');
+  assert.equal(files('cd /home/u/proj/.hid* && touch notes.txt', fs).decision, 'allow', 'a literal dot matches the dot name in both readings');
   // (the listing is the one now: anything before the cd that may change it makes the directory unknown)
   for (const pre of ['mkdir -p src/app/new; ', 'rm -rf src/app/old; ', 'mv a b; ', 'ln -s /home/u/.claude src/app/link; ', 'cp -r a b; ', 'tar xf a.tar; ', 'git checkout x; ', 'echo x > f; ', 'source ./e.sh; ', 'BASH_ENV=e.sh true; ', 'npm install; ']) assert.equal(files(`${pre}cd "src/app/(staff)/[id]" && touch notes.txt`, fs).decision, 'deny', pre);
   for (const pre of ['ls src; ', 'echo hi; ', 'export A=1; ', 'cd src; ', 'git status; ']) assert.equal(files(`${pre}cd "/home/u/proj/src/app/(staff)/[id]" && touch notes.txt`, fs).decision, 'allow', pre);
   // (the directory does not exist: unknown)
   assert.equal(files('cd "src/app/(staff)/[gone]" && touch notes.txt', fs).decision, 'deny', 'cd "src/app/(staff)/[gone]" && touch notes.txt');
+});
+
+// Why: the listing is read as it is now; what the calling line wrote before it ran a script (a file or directory it made) may change what a glob matches there.
+test('S5b: in a script run by the line, a glob cd is known only when the calling line has written nothing before it', () => {
+  const fs = fakeFs(GIT_ROOT, { 'run.sh': 'cd "/home/u/proj/src/app/(staff)/[id]" && touch notes.txt\n' }, withParents([...DIRS, PROJ, ...ROUTES]));
+  assert.equal(files('bash /work/repo/run.sh', fs).decision, 'allow', 'baseline');
+  for (const pre of ['mkdir -p /home/u/proj/src/app/new; ', 'echo x > /tmp/f; ', 'cp a b; ']) assert.equal(files(`${pre}bash /work/repo/run.sh`, fs).decision, 'deny', pre);
 });

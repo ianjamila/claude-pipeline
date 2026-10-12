@@ -200,6 +200,7 @@ function makeCtx(opts) {
     platform, homeNative, homePosix, cwd, api, roots, lexRoots, ancestors, lexAncestors, ci,
     user: opts.user ?? posix.basename(homePosix),
     selfZero: opts._selfZero ?? null, selfBash: opts._selfBash ?? null, selfAbs: opts._selfAbs === true, // the judged script file's own path (its $0 unless it was sourced; BASH_SOURCE[0])
+    parentFsChanged: opts._fsChanged === true, // (the calling line ran something before this script that may have changed which paths exist)
     vars: {}, // same-line shell assignments (D=$HOME/.claude), filled in once the line is parsed
     dynamic: false, // set when a scan had to be skipped for size; callers fail closed
     readText: opts.readText ?? defaultReadText,
@@ -685,7 +686,7 @@ function assumedCwds(ctx) {
 // groups, POSIX classes, zsh qualifiers / extended patterns, a brace list, `**`): the caller keeps the directory unknown.
 const MAX_GLOB_ENTRIES = 4000;
 const MAX_GLOB_FANOUT = 64;
-function segmentPattern(seg) {
+function segmentPattern(seg, ci) {
   const bracket = (s, i) => {
     let j = i + 1;
     let neg = false;
@@ -725,10 +726,10 @@ function segmentPattern(seg) {
     out += `${pre}(?:${alts.join('|')})`;
     rest = rest.slice(cl + 1);
   }
-  try { return new RegExp(`^${out}$`, 'i'); } catch { return null; }
+  try { return new RegExp(`^${out}$`, ci ? 'i' : ''); } catch { return null; }
 }
 // -> an array of the existing directories `full` (absolute, normalised) leads to, or null when its pattern is not modelled
-function resolveGlobDir(full, ctx) {
+function resolveGlobDir(full, ctx, wide) {
   const isDir = (p) => Array.isArray(ctx.readDir(p));
   let cur = ['/'];
   for (const seg of full.split('/')) {
@@ -738,14 +739,16 @@ function resolveGlobDir(full, ctx) {
     if (!/[*?[(]/.test(seg)) {
       for (const p of cur) if (isDir(posix.join(p, seg))) next.add(posix.join(p, seg));
     } else {
-      const re = segmentPattern(seg);
+      const re = segmentPattern(seg, wide);
       if (re === null) return null;
       for (const p of cur) {
         if (isDir(posix.join(p, seg))) next.add(posix.join(p, seg)); // (quoted: the literal name)
         const names = ctx.readDir(p);
         if (!Array.isArray(names)) continue;
         if (names.length > MAX_GLOB_ENTRIES) return null;
-        for (const n of [...names, '.', '..']) {
+        // (wide: dot names and `.` / `..` match too, as under dotglob; narrow: a leading dot is matched only by a literal dot)
+        for (const n of wide ? [...names, '.', '..'] : names) {
+          if (!wide && n.startsWith('.') && !seg.startsWith('.')) continue;
           const child = n === '.' ? p : n === '..' ? posix.dirname(p) : posix.join(p, n);
           if (re.test(n) && isDir(child)) next.add(child);
         }
@@ -757,16 +760,26 @@ function resolveGlobDir(full, ctx) {
   return cur;
 }
 // The one directory a glob-looking cd target `e` names from any of `bases` (null: none, several, or not modelled).
+// Could a command before `upto` change which paths exist (create, remove, rename, link: anything not read-only, a write redirect, a sourced file, a startup file)?
+function mayChangeListing(cmds, upto, ctx) {
+  return cmds.slice(0, upto).some((c) => (c.redirects ?? []).some((r) => WRITE_OPS.has(r.op)) || Object.keys(c.env ?? {}).some((k) => /^(?:BASH_ENV|ENV|ZDOTDIR)$/.test(k))
+    || (c.argv.length > 0 && !CD_CMDS.has(baseOf(c.argv[0])) && !VAR_COMMANDS.has(baseOf(c.argv[0])) && (!isReadOnly(c, ctx) || ['source', '.', 'eval'].includes(baseOf(c.argv[0])))));
+}
 function resolveGlobCd(e, bases, ctx, cmds, idx) {
   if (/[{`$]|\*\*|[<>^#]|~/.test(e)) return null;
   // (the listing is the one NOW: a command before the cd that may create, remove, rename or link a path, a write redirect, a sourced file or a startup file makes it unknown)
-  if (cmds.slice(0, idx).some((c) => (c.redirects ?? []).some((r) => WRITE_OPS.has(r.op)) || Object.keys(c.env ?? {}).some((k) => /^(?:BASH_ENV|ENV|ZDOTDIR)$/.test(k)) || (c.argv.length > 0 && !CD_CMDS.has(baseOf(c.argv[0])) && !VAR_COMMANDS.has(baseOf(c.argv[0])) && (!isReadOnly(c, ctx) || ["source", ".", "eval"].includes(baseOf(c.argv[0])))))) return null;
+  // (also what the calling line wrote before this script: a record or an unmodelled command in an enclosing frame)
+  if (unmodelledBefore(ctx.frames) || JSON.parse(writeSignature(ctx.frames)).some((a) => a.length > 0)) return null;
+  if (ctx.parentFsChanged || mayChangeListing(cmds, idx, ctx)) return null;
   const found = new Set();
   for (const b of isAbs(e) ? [''] : bases) {
     if (!isAbs(e) && /[*?[(]/.test(b)) continue;
-    const r = resolveGlobDir(isAbs(e) ? posix.normalize(e) : posix.join(b, e), ctx);
-    if (r === null) return null;
-    for (const x of r) found.add(x);
+    const full = isAbs(e) ? posix.normalize(e) : posix.join(b, e);
+    // (known only when the widest reading (nocaseglob, dotglob) and the narrowest (default options) lead to the same single directory: a narrow zero match under an inherited nullglob is a cd home)
+    const wide = resolveGlobDir(full, ctx, true);
+    const narrow = resolveGlobDir(full, ctx, false);
+    if (wide === null || narrow === null || wide.length !== 1 || narrow.length !== 1 || wide[0] !== narrow[0]) return null;
+    found.add(wide[0]);
   }
   if (found.size !== 1) return null;
   const [dir] = [...found];
@@ -1945,6 +1958,7 @@ function evaluateBashForFilesFrame(command, opts) {
   if ((opts._depth ?? 0) < 4) {
     for (const [idx, c] of cmds.entries()) {
       frame.i = idx;
+      opts._fsChanged = ctx.parentFsChanged || mayChangeListing(cmds, idx, ctx); // (a script or -c text this command runs sees the listing after the earlier commands)
       if (!c.argv.length && (ctx.unknownVars.size || ctx.pickUnknown.size || ctx.srcTouched.size) && c.sep !== '&&' && c.sep !== '||' && c.depth === 0 && !inFlow(flowStart(cmds), idx)) {
         for (const k of Object.keys(c.env ?? {})) if ((ctx.unknownVars.has(k) || ctx.pickUnknown.has(k) || ctx.srcTouched.has(k)) && !/[$`]/.test(c.env[k]) && !ctx.declared?.unknown.has(k)) { ctx.unknownVars.delete(k); ctx.pickUnknown.delete(k); ctx.srcChanged.delete(k); ctx.vars[k] = applyTransform(expandRefs(c.env[k], ctx), ctx.declared?.transform.get(k) ?? null); }
       }
