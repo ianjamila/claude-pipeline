@@ -837,6 +837,12 @@ export function scriptFeedsOf(cmd, line = cmd?.raw) {
   const rewritten = f.computed.filter((w) => pat.has(w));
   const unq = new Set(f.unq);
   if (f.files.length + rewritten.length >= 2 && (f.files.some((w) => opaqueFile(w, true)) || rewritten.some((w) => opaqueFile(w, unq.has(w))))) return [refuse];
+  // Fail closed (review R2-B1): exact readers and rewriting producers feeding the SAME program (`{ cat a; tail -c 99 b; } | bash`) are one text
+  // of which only the exact half can be rebuilt, so judging a alone and b scanned lets a guarded line split across them through. Any feed that
+  // combines both kinds is refused, as are several producers of one kind.
+  if (f.files.length >= 1 && f.computed.length >= 1) return [refuse];
+  // a reader's operand that is itself a process substitution (`cat a <(tail -c 99 b) | bash`) is the text ANOTHER producer prints, not a file name
+  if ([...f.files, ...f.computed].some(isProcSub)) return [refuse];
   if (f.files.length >= 2) {
     const g = f.groups;
     if (g.length !== 1 || g[0].length !== f.files.length) return [refuse];

@@ -432,6 +432,40 @@ test('R1-B2 follow-up: scriptFeedsOf refuses a joined feed with an operand that 
   assert.equal(feeds('cat a.sh ~/b.sh | bash').some((f) => f.joined), true); // the user's own home resolves
 });
 
+// ---- review R2-B1: exact readers and rewriting producers feeding ONE shell are refused (their combined output cannot be rebuilt) ---------
+// Exact files and a rewriting producer's files were joined separately, each only from two operands up: `{ cat a; tail -c 99 b; } | bash` (one of
+// each) was judged as `git pu` and, scanned, `sh origin main`, and neither alone trips a policy. Any feed that combines both kinds is refused.
+test('R2-B1: a guarded line split across an exact reader and a rewriting producer is refused, in every form', () => {
+  for (const c of [
+    '{ cat a.sh; tail -c 99 b.sh; } | bash', '{ cat a.sh; tail -c 99 b.sh; } | sh -s', '{ cat a.sh; sed p b.sh; } | bash', '{ cat a.sh; tr a b < b.sh; } | bash',
+    'bash < <({ cat a.sh; tail -c 99 b.sh; })', 'eval "$({ cat a.sh; tail -c 99 b.sh; })"', 'bash <(cat a.sh; tail -c 99 b.sh)', 'bash -c "$(cat a.sh; tail -c 99 b.sh)"',
+    'cat a.sh <(tail -c 99 b.sh) | bash', 'cat a.sh | bash < <(tail -c 99 b.sh)', 'tail -c 99 a.sh | bash < b.sh',
+    '{ cat a.sh; head -c 99 b.sh; } | bash', '{ cat a.sh; awk 1 b.sh; } | bash', '{ cat a.sh; base64 b.sh; } | bash',
+  ]) denyBuilt(c, splitFiles);
+});
+
+test('R2-B1: the order does not matter (refused, not judged by luck), and harmless mixed feeds are refused too', () => {
+  const ok = () => ({ 'a.sh': 'echo a', 'b.sh': 'echo b' });
+  for (const c of ['{ tail -c 99 b.sh; cat a.sh; } | bash', '{ cat a.sh; tail -c 99 b.sh; } | bash', 'eval "$({ sed p b.sh; cat a.sh; })"']) {
+    const r = bothBuilt(c, ok);
+    assert.equal(r.git.decision, 'deny', `git: ${c}`);
+    assert.equal(r.files.decision, 'deny', `files: ${c}`);
+  }
+  // a single producer of either kind is unchanged
+  for (const c of ['cat a.sh | bash', 'tail -c 99 b.sh | bash', 'sed p a.sh | bash', 'cat a.sh b.sh | bash']) allowBuilt(c, ok);
+});
+
+test('R2-B1: scriptFeedsOf refuses a feed that combines exact and computed producers', () => {
+  const feeds = (line) => simpleCommands(line).flatMap((c) => scriptFeedsOf(c, line));
+  for (const line of ['{ cat a.sh; tail -c 99 b.sh; } | bash', '{ tail -c 99 b.sh; cat a.sh; } | bash', 'cat a.sh | bash < <(sed p b.sh)']) {
+    const r = feeds(line);
+    assert.equal(r.length, 1, line);
+    assert.equal(r[0].unresolvable, true, line);
+  }
+  assert.equal(feeds('tail -c 99 b.sh | bash').some((f) => f.unresolvable), false);
+  assert.equal(feeds('cat a.sh | bash').some((f) => f.unresolvable), false);
+});
+
 test('R1-B2 follow-up: a feed with ONE file operand keeps its verdict, however the operand is spelled', () => {
   const ok = () => ({ 'a.sh': 'echo a', 'b.sh': 'echo b', 'ok.sh': 'echo hi\n' });
   for (const c of ['cat ok.sh | bash', 'cat o*.sh | bash', 'sed p ok.sh | bash', 'sed p o*.sh | bash', 'awk \'{print $1}\' ok.sh | bash', 'sed "s/a/$X/" ok.sh | bash', 'tail -n +1 ok.sh | bash', 'cat a.sh b.sh | bash']) allowBuilt(c, ok);
