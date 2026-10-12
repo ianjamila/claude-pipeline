@@ -335,7 +335,7 @@ export function sortArgsPure(args) {
   return !bad && !hasOpt(opts, 'o', 'output', 'compress-program');
 }
 // rsync: long options that name files we do not follow (a batch, a backup / link / compare / copy / partial / temp dir, a log, a daemon or config, a file list), an abbreviation counts
-const RSYNC_FILE_OPTIONS = ['backup', 'backup-dir', 'suffix', 'link-dest', 'copy-dest', 'compare-dest', 'partial-dir', 'temp-dir', 'log-file', 'write-batch', 'only-write-batch', 'read-batch', 'daemon', 'config', 'files-from', 'remove-source-files', 'write-devices', 'sparse'];
+const RSYNC_FILE_OPTIONS = ['backup', 'backup-dir', 'suffix', 'link-dest', 'copy-dest', 'compare-dest', 'partial-dir', 'temp-dir', 'log-file', 'write-batch', 'only-write-batch', 'read-batch', 'daemon', 'config', 'files-from', 'remove-source-files', 'write-devices', 'sparse', 'rsh', 'rsync-path', 'remote-option'];
 const COPY_VALUE = {
   ditto: ['', []], rsync: ['eBMfT', ['rsh', 'exclude', 'include', 'filter', 'exclude-from', 'include-from', 'files-from', 'temp-dir', 'backup-dir', 'suffix']],
 };
@@ -460,7 +460,7 @@ function argRecords(cmd, name, idx, lineEnv = {}, io = {}) {
     let link = name === 'ln' ? (hasOpt(opts, 's', 'symbolic') ? 'sym' : 'hard') : undefined;
     if (name === 'cp') link = hasOpt(opts, 's', 'symbolic-link') ? 'sym' : hasOpt(opts, 'l', 'link') ? 'hard' : undefined; // (cp -s / -l make links, not copies)
     // Why: --exchange swaps the two files and --strip-program runs a program: the files written are not DEST / DEST/basename. rsync takes many more options that name files (a batch, a backup or link dir, a file list ...)
-    const rsyncOdd = name === 'rsync' && opts.some((o) => (o.name.length === 1 ? 'bT'.includes(o.name) : RSYNC_FILE_OPTIONS.some((n) => n.startsWith(o.name))));
+    const rsyncOdd = name === 'rsync' && opts.some((o) => (o.name.length === 1 ? 'bTe'.includes(o.name) : RSYNC_FILE_OPTIONS.some((n) => n.startsWith(o.name))));
     const odd = hasOpt(opts, 'exchange', 'strip-program') || rsyncOdd || (name === 'rsync' && Object.keys({ ...cmd.env, ...lineEnv }).some((k) => /^RSYNC_/.test(k)));
     // Why: cp --parents / rsync -R put each source at DEST/<the path as written> (rsync keeps only what follows a `/./` marker): the source's own path below DEST, as a copy of it. rsync's plain form is kept too (--no-relative may follow)
     const parents = name === 'cp' && hasOpt(opts, 'parents');
@@ -678,6 +678,7 @@ function argRecords(cmd, name, idx, lineEnv = {}, io = {}) {
 // `at`: the index of the subcommand, `dir`: the last -C, `nC`: how many -C, `plain`: only options that cannot change what a subcommand writes or runs (-C aside)
 const GIT_GLOBAL_VALUE = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env', '--attr-source', '--super-prefix']);
 const GIT_GLOBAL_PLAIN = new Set(['--no-pager', '-P', '--no-optional-locks', '--literal-pathspecs', '--glob-pathspecs', '--noglob-pathspecs', '--icase-pathspecs', '--no-replace-objects', '--no-lazy-fetch', '--no-advice', '--bare', '--version']);
+const SAME_GITDIR = /^(?:\.\/)?\.git\/?$/; // (the repository git would find anyway)
 function gitGlobals(args) {
   let i = 0;
   let dir = null;
@@ -686,9 +687,10 @@ function gitGlobals(args) {
   let readOk = true; // only options that merely choose which repository is read (no program, config or pager)
   while (i < args.length && args[i].startsWith('-')) {
     const a = args[i];
-    if (GIT_GLOBAL_VALUE.has(a)) { if (a === '-C') { dir = args[i + 1] ?? null; nC++; } else { plain = false; if (!['--git-dir', '--work-tree', '--namespace'].includes(a)) readOk = false; } i += 2; continue; }
-    // Why: `--git-dir=X` is one word (skipping a second would swallow the subcommand), `--exec-path[=P]` never takes the next word
-    if (!GIT_GLOBAL_PLAIN.has(a)) { plain = false; if (!/^--(?:git-dir|work-tree|namespace)=/.test(a)) readOk = false; }
+    // Why: --git-dir / --work-tree / --namespace make git read ANOTHER repository's config (fsmonitor, diff.external, textconv, pager): not a read we can call pure
+    if (GIT_GLOBAL_VALUE.has(a)) { if (a === '-C') { dir = args[i + 1] ?? null; nC++; } else { plain = false; if (!(a === '--git-dir' && SAME_GITDIR.test(args[i + 1] ?? ''))) readOk = false; } i += 2; continue; }
+    // `--git-dir=X` is one word (skipping a second would swallow the subcommand), `--exec-path[=P]` never takes the next word
+    if (!GIT_GLOBAL_PLAIN.has(a)) { plain = false; if (!(a.startsWith('--git-dir=') && SAME_GITDIR.test(a.slice(10)))) readOk = false; }
     i++;
   }
   return { at: i, dir, nC, plain: plain && nC <= 1, readOk };
@@ -702,13 +704,14 @@ const prefixOfAny = (a, names) => { if (!a.startsWith('--')) return false; const
 const GIT_PLAIN_READ = new Set(['status', 'rev-parse', 'ls-files', 'ls-tree', 'cat-file', 'blame', 'annotate', 'describe', 'merge-base', 'for-each-ref', 'show-ref', 'name-rev', 'rev-list', 'count-objects', 'show-branch', 'check-ignore', 'check-attr', 'var', 'version', 'ls-remote', 'cherry', 'verify-commit', 'verify-tag', 'fsck-objects', 'get-tar-commit-id', 'merge-tree', 'diff-index', 'diff-files']);
 const GIT_DIFFLIKE = new Set(['diff', 'log', 'show', 'shortlog', 'whatchanged', 'diff-tree', 'range-diff']);
 const GIT_ENV_RISK = /^(?:GIT_(?:CONFIG\w*|EXTERNAL_DIFF|PAGER|EXEC_PATH|SSH\w*|PROXY_COMMAND|ASKPASS|EDITOR|SEQUENCE_EDITOR|TEMPLATE_DIR|ALTERNATE_OBJECT_DIRECTORIES|DIR|WORK_TREE|OBJECT_DIRECTORY|INDEX_FILE|TRACE\w*)|PAGER|EDITOR|VISUAL|SSH_ASKPASS)$/;
-function gitPure(args, envKeys = []) {
+function gitPure(args, envKeys = [], cfgWritten = false) {
   if (envKeys.some((k) => GIT_ENV_RISK.test(k))) return false;
   const g = gitGlobals(args);
   if (!g.readOk) return false;
   const sub = args[g.at];
   const rest = args.slice(g.at + 1);
   if (sub === undefined) return true;
+  if (cfgWritten && sub !== 'version') return false; // (the line may have written the config a read runs programs from)
   const dashed = rest.filter((a) => a.startsWith('-'));
   const pos = rest.filter((a) => !a.startsWith('-'));
   // Why: ls-remote -u / --upload-pack / --exec / --receive-pack run a program on the other side; stash show / list and reflog print diffs, so --output / -o / ext-diff / textconv apply to them too
@@ -1032,7 +1035,7 @@ export const awkArgsPure = (args, env = {}, read = null) => !awkScan(args, env, 
 function isPure(cmd, name, lineEnv = {}, io = {}) {
   const args = cmd.argv.slice(1);
   if (!cmd.argv.length) return true; // a bare assignment / redirect
-  if (name === 'git') return gitPure(args, [...Object.keys(cmd.env ?? {}), ...Object.keys(lineEnv)]);
+  if (name === 'git') return gitPure(args, [...Object.keys(cmd.env ?? {}), ...Object.keys(lineEnv)], io.gitCfg === true);
   if (name === 'gh') return ghPure(args, [...Object.keys(cmd.env ?? {}), ...Object.keys(lineEnv)]);
   if (name === 'sed' || name === 'gsed') return !args.some((a) => sedInPlaceArg(a) || OUTPUT_LONG.test(a)) && !sedArgsUnsafe(args);
   if (AWK_NAMES.has(name)) return awkArgsPure(args, { ...cmd.env, ...lineEnv }, io.readProgram);
@@ -1123,11 +1126,20 @@ export function writesOf(cmds, io = {}) {
     for (const k of Object.keys(c.env ?? {})) lineEnv[k] = '';
     if (['export', 'declare', 'typeset', 'readonly', 'local'].includes(commandName(c.argv[0] ?? ''))) for (const a of c.argv.slice(1)) { const m = /^([A-Za-z_]\w*)(?:=|$)/.exec(a); if (m) lineEnv[m[1]] = ''; }
   }
+  // Why: a git read (status, diff, log) runs core.fsmonitor / diff.external / textconv / core.pager from the repository or user config: when the line may write one (a path under .git/, .gitattributes, a git config file, a target
+  // known only at run time, a write to any file) or changes it (git config / init / clone / remote / submodule), no git command on it is a pure read
+  const CFG_PATH = /(?:^|[\\/])\.git(?:[\\/]|$)|(?:^|[\\/])\.git(?:attributes|config|modules)$|(?:^|[\\/])git[\\/](?:config|attributes)$|[$`*?[{]/;
+  const gitCfg = cmds.some((c, idx) => {
+    const n = commandName(c.argv[0] ?? '');
+    if (n === 'git' && ['config', 'init', 'clone', 'remote', 'submodule'].includes(gitSub(c.argv.slice(1))) && !gitPure(c.argv.slice(1))) return true;
+    return [...redirectRecords(c, idx), ...(c.argv.length ? argRecords(c, n, idx, lineEnv, {}) ?? [] : [])].some((r) => r.dest === null || CFG_PATH.test(String(r.dest)));
+  });
+  io = { ...io, gitCfg };
   cmds.forEach((cmd, idx) => {
     recs.push(...redirectRecords(cmd, idx));
     if (!cmd.argv.length) return;
     const name = commandName(cmd.argv[0]);
-    const here = { readProgram: io.readProgram ? (word) => io.readProgram(word, idx) : null }; // (an awk program file is read where this command runs)
+    const here = { readProgram: io.readProgram ? (word) => io.readProgram(word, idx) : null, gitCfg }; // (an awk program file is read where this command runs)
     const mine = argRecords(cmd, name, idx, lineEnv, here);
     if (mine) recs.push(...mine);
     const inline = INLINE_RUNNERS[name];

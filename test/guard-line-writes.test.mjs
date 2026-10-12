@@ -1633,3 +1633,25 @@ test('L4: a single-dash word too long to take apart makes the command a write to
   assert.equal(recs3(`mytool ${long}`).filter((r) => r.dest === null && r.loose).length, 1);
   assert.equal(run((_, mid) => `mytool -o${'x'.repeat(30)}; ${mid}; bash ok.sh`, SPEC).git.r.decision, 'allow');
 });
+
+test('L4: a heredoc writer records every input (stdin redirected too, a second heredoc, cat - f)', () => {
+  // Why: the L1 change that counts a heredoc text once must not drop the other inputs of the same writer
+  const spec = { ...SPEC };
+  for (const mk of [() => 'cat - f.sh > n.sh <<EOF\nhi\nEOF\nbash n.sh', () => 'cat f.sh - > n.sh <<EOF\nhi\nEOF\nbash n.sh', () => 'cat > n.sh < f.sh <<EOF\nhi\nEOF\nbash n.sh', () => 'cat <<EOF f.sh > n.sh\nhi\nEOF\nbash n.sh', () => 'tee n.sh < f.sh <<EOF >/dev/null\nhi\nEOF\nbash n.sh']) denyBoth(mk, spec);
+  denyBoth((bad) => `cat > n.sh <<EOF <<EOF2\nhi\nEOF\n${bad}\nEOF2\nbash n.sh`, spec);
+  denyBoth((bad) => `cat - ok.sh > n.sh <<EOF\n${bad}\nEOF\nbash n.sh`, spec);
+  denyBoth((bad) => `cat ok.sh - > n.sh <<EOF\n${bad}\nEOF\nbash n.sh`, spec);
+  allowBoth('cat - ok.sh > n.sh <<EOF\nhi\nEOF\nbash n.sh', spec);
+});
+
+test('L4: a git read is not pure when the line may write the repository config (.git/, .gitattributes, git config files) or points git elsewhere; rsync -e / --rsh / --rsync-path run a program', () => {
+  // Why: status / diff / log run core.fsmonitor, diff.external, textconv, core.pager from the config; a line that writes any of those first makes the "read" run its program
+  for (const l of ['echo x > .git/config; git status', 'cp f.sh .git/config; git diff', 'echo x >> ~/.gitconfig; git log', 'echo x > .gitattributes; git diff', 'printf x > $D/config; git status', 'tee .git/info/attributes < f.sh; git diff', 'echo x > $XDG_CONFIG_HOME/git/config; git log',
+    'echo x > sub/.git/config; git -C sub status', 'echo x > "$G"; git status', 'git init x; git status', 'git --git-dir=d status', 'git --git-dir d status', 'git --work-tree=w status', 'git --namespace=n log']) {
+    assert.ok(un3(l) >= 1, l);
+  }
+  assert.ok(un3('git config core.fsmonitor cmd; git status') >= 2); // (the status is not a read either)
+  assert.equal(un3('git --git-dir=.git status'), 0);
+  for (const l of ['echo x > a.txt; git status', 'git config --get x; git status', 'git status', 'git -C sub status', 'echo x > .gitignore; git status']) assert.equal(un3(l), 0, l);
+  for (const l of ['rsync -e CMD src d', 'rsync -eCMD src d', 'rsync --rsh=CMD src d', 'rsync --rsh CMD src d', 'rsync --rsync-path=X src d', 'rsync --rs=X src d']) denyBoth((_, mid) => `${l}; ${mid}; bash ok.sh`);
+});
