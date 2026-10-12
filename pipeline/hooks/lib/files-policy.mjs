@@ -1293,6 +1293,10 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
   const linked = linkReachesProtected(cmds, dirs, ctx);
   if (linked) return deny(`ln links to ${linked}, which is (or holds) protected pipeline files; a link would let later commands reach them under another name (${PROTECTED_MSG})`);
 
+  // The variables this line assigns (its commands' prefixes included) are in the environment of the shells it starts: the startup files and
+  // scripts they run are judged with them (a name like `. "$F"` in the file is then the file F names, not an unknown).
+  const withLineVars = (o) => ({ ...o, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) } });
+
   // A startup file is judged once per evaluation. It is marked first: a startup file that starts shells itself would be judged again and
   // again otherwise (a denial ends the whole evaluation, so marking before the verdict is safe).
   const judgeStartupFile = (st) => {
@@ -1320,29 +1324,31 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
       return v;
     }
     // reused only for the same file, directories and nesting depth, never for a run-time name (its verdict depends on the line's text)
-    if (st.ambiguous) return judgeScriptFile(st, dirs, ctx, opts, scanRaw);
-    const key = `${dirs.join('\u0000')}\u0000${opts._depth ?? 0}\u0000${st.file}`;
+    // (the shell sees the variables the line gave it, its own prefix included: `F=f.sh BASH_ENV=rc bash -c :` where rc sources "$F")
+    if (st.ambiguous) return judgeScriptFile(st, dirs, ctx, withLineVars(opts), scanRaw);
+    const key = `${dirs.join('\u0000')}\u0000${opts._depth ?? 0}\u0000${st.file}\u0000${JSON.stringify([ctx.vars, ctx.keptVars ?? {}])}`;
     if (ctx.budget.startupOk.has(key)) return null;
     ctx.budget.startupOk.add(key);
-    return judgeScriptFile(st, dirs, ctx, opts, scanRaw);
+    return judgeScriptFile(st, dirs, ctx, withLineVars(opts), scanRaw);
   };
 
   // 7: a script file (bash f.sh, source f, ./f, node f.mjs) runs whatever is in it
   if ((opts._depth ?? 0) < 4) {
     for (const c of cmds) {
       const sf = scriptFileOf(c.argv, c.raw, raw);
+      // a shell runs its startup files (BASH_ENV, ENV, ZDOTDIR/.zshenv ...) BEFORE the script it was given, so they are judged first, in the
+      // order the shell reads them: judged like `bash FILE`
+      for (const st of startupFilesOf(c, cmds, { env: startupEnv, inherited: inheritedStartup, exec: sf?.kind === 'exec' })) {
+        const v = judgeStartupFile(st);
+        if (v) return v;
+      }
       if (sf) {
-        const v = judgeScriptFile(sf, dirs, ctx, opts, scanRaw);
+        const v = judgeScriptFile(sf, dirs, ctx, withLineVars(opts), scanRaw);
         if (v) return v;
       }
       // script text that reaches a shell without being named (`bash < f.sh`, `cat f.sh | bash`, `eval "$(cat f.sh)"`): its files are judged like `bash f.sh`
       for (const fd of scriptFeedsOf(c, raw)) {
-        const v = judgeScriptFile(fd, dirs, ctx, opts, scanRaw);
-        if (v) return v;
-      }
-      // a shell runs its startup files (BASH_ENV, ENV, ZDOTDIR/.zshenv ...) before the script it was given: judged like `bash FILE`
-      for (const st of startupFilesOf(c, cmds, { env: startupEnv, inherited: inheritedStartup, exec: sf?.kind === 'exec' })) {
-        const v = judgeStartupFile(st);
+        const v = judgeScriptFile(fd, dirs, ctx, withLineVars(opts), scanRaw);
         if (v) return v;
       }
     }
