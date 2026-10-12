@@ -294,7 +294,7 @@ the owner's next move.
    - `build | verify | review | followups | gate` ⇒ steps 3–5, then the matching step.
 3. Worktree per `worktree.action`: `reuse` ⇒ `cd` into `path`; `add-existing-ref` ⇒ `git worktree add <path> <branch>`;
    `add-from-remote` ⇒ `git fetch origin <branch>` then `git worktree add --no-track -b <branch> <path> origin/<branch>`;
-   never `-B`. Then `then: ff-only` ⇒ `git merge --ff-only origin/<branch>`, `then: push` ⇒ `git push origin <branch>`.
+   never `-B`. Then `then: ff-only` ⇒ `git merge --ff-only <liveHead>` (the plan's exact `liveHead` sha; `plan` already refreshed `origin/<branch>`, but never trust a tracking ref), `then: push` ⇒ `git push origin <branch>`.
    `P preflight`.
 4. `P state show --pr N`; read `source`. `quarantined` ⇒ tell the owner the local `.review/` went to `quarantinedTo`
    and the published state was restored. Exit 2 `no-state` is normal when Codex was down in round 1.

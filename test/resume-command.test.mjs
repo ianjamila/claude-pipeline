@@ -43,13 +43,13 @@ function world() {
   repo.git(['push', '-q', 'origin', 'main']);
   return {
     repo, bare, base,
-    // A branch agent/pr-<n> (local ref, checked out nowhere) whose tip is also refs/pull/<n>/head on the origin.
+    // A branch agent/pr-<n> (local ref, checked out nowhere) whose tip is also refs/pull/<n>/head and the branch on the origin.
     prBranch(n, files) {
       repo.checkout('main');
       repo.branch(`agent/pr-${n}`);
       for (const [f, c] of Object.entries(files)) repo.write(f, c);
       const sha = repo.commit(`pr ${n}`);
-      repo.git(['push', '-q', 'origin', `${sha}:refs/pull/${n}/head`]);
+      repo.git(['push', '-q', 'origin', `${sha}:refs/pull/${n}/head`, `${sha}:refs/heads/agent/pr-${n}`]);
       repo.checkout('main');
       return sha;
     },
@@ -219,6 +219,27 @@ test('plan: a branch that exists only on origin is added from the remote; a behi
   assertExit(behind, 0);
   assert.equal(behind.json.local.state, 'behind');
   assert.deepEqual(behind.json.worktree, { action: 'add-existing-ref', then: 'ff-only' });
+});
+
+test('plan: the plan refreshes origin/<branch> too, so the skill\'s fast-forward lands on the live head, not a stale tracking ref', () => {
+  const w = world();
+  const old = w.prBranch(7, { 'b.txt': 'b\n' });
+  // the other machine pushed `newer`; this clone last fetched the branch when it was at `old`
+  w.repo.git(['fetch', '-q', 'origin', '+refs/heads/agent/pr-7:refs/remotes/origin/agent/pr-7']);
+  w.repo.checkout('agent/pr-7');
+  w.repo.write('c.txt', 'c\n');
+  const newer = w.repo.commit('pushed from the other machine');
+  w.repo.git(['push', '-q', 'origin', `${newer}:refs/heads/agent/pr-7`, `${newer}:refs/pull/7/head`]);
+  w.repo.git(['reset', '-q', '--hard', old]);
+  w.repo.git(['update-ref', 'refs/remotes/origin/agent/pr-7', old]); // the push above advanced it; make it stale again
+  w.repo.checkout('main');
+  assert.equal(w.repo.git(['rev-parse', 'refs/remotes/origin/agent/pr-7']).trim(), old, 'precondition: the tracking ref is stale');
+  const fake = createFakeGh([...BASE_ENTRIES, { match: VIEW(7), stdoutJson: view(7, newer) }, { match: COMMENTS(7), stdout: '[]' }]);
+  const r = resume(['plan', '--pr', '7'], { w, fake });
+  assertExit(r, 0);
+  assert.equal(r.json.local.state, 'behind');
+  assert.equal(r.json.liveHead, newer);
+  assert.equal(w.repo.git(['rev-parse', 'refs/remotes/origin/agent/pr-7']).trim(), newer, 'origin/<branch> now equals the live head');
 });
 
 test('plan: another machine\'s fresh heartbeat asks for confirmation', () => {

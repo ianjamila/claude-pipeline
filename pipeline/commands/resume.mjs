@@ -22,7 +22,7 @@ export const meta = {
     '     (written by this GitHub user) is readable and has no outcome yet (a run that stopped mid-way)',
     'pipeline resume plan --pr N [--repo DIR]',
     '  -> {ok, pr, title, url, prState, branch, base, liveHead, enter, reason, adopt, confirm, autoMerge, worktree, recordStatus, record,',
-    '      events, local, mergeSha, notes[], warnings[]}; read-only (its one git write is the fetch of the PR head and base)',
+    '      events, local, mergeSha, notes[], warnings[]}; read-only (its only git writes are fetches: the PR head, the base and origin/<branch>)',
     '     enter: closed | ended | observe-prod | not-resumable | local-work | decision | build | verify | review | followups | gate',
     '     adopt: no run record (the PR was not started by the pipeline); confirm: {host, step, minutesAgo, why} when another run may be live,',
     '     autoMerge: {armed, action: disarm} when an unattended auto-merge is queued, worktree: {action: reuse|add-existing-ref|add-from-remote|none, path?, then?}',
@@ -86,6 +86,13 @@ function gitFacts({ root, config, pr, view, warnings }) {
     baseSha = revParse(`refs/remotes/origin/${view.baseRefName}`, o);
   } catch (err) {
     warnings.push(`git fetch failed (content hash and local comparison may be unavailable): ${describe(err)}`);
+  }
+  // The skill later fast-forwards a behind checkout, and a stale origin/<branch> would answer "already up to date": refresh it
+  // too (same-repo PRs only; the caller never asks for a fork's). The plan's `then` merges the exact liveHead regardless.
+  try {
+    git(['fetch', '--no-tags', 'origin', `+refs/heads/${view.headRefName}:refs/remotes/origin/${view.headRefName}`], { ...o, timeoutMs: NETWORK_TIMEOUT_MS });
+  } catch (err) {
+    warnings.push(`git fetch of origin/${view.headRefName} failed (a fast-forward must use the live head sha): ${describe(err)}`);
   }
   if (baseSha !== null) {
     try {
