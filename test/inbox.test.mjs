@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   ciStatus,
+  ciDetail,
   lastActivity,
   classifyPr,
   classifyStranded,
@@ -247,7 +248,22 @@ test('category failing-check: CI failed', () => {
   const r = cls({ ci: 'failed' });
   assert.equal(r.waitingOn, 'failing-check');
   assert.equal(r.suggest, 'resume');
-  assert.equal(r.nextAction, 'ship resume 7');
+  assert.equal(r.nextAction, 'ship resume 7 (fix the failing check)');
+  const named = cls({ ci: 'failed', ciFailed: ['Test integrity', 'e2e'] });
+  assert.equal(named.reason, 'required checks failed: Test integrity, e2e');
+  assert.equal(named.nextAction, 'ship resume 7 (fix the failing checks: Test integrity, e2e)');
+  assert.equal(cls({ ci: 'failed', ciFailed: ['ci'] }).reason, 'required check failed: ci');
+});
+
+test('failing-check: conflicts name the base and say what to do', () => {
+  const r = cls({ conflicts: true, baseRefName: 'develop' });
+  assert.equal(r.waitingOn, 'failing-check');
+  assert.equal(r.reason, 'conflicts with develop');
+  assert.equal(r.nextAction, 'ship resume 7 (update with develop, resolve conflicts)');
+  const both = cls({ conflicts: true, baseRefName: 'main', ci: 'failed', ciFailed: ['ci'] });
+  assert.equal(both.reason, 'required check failed: ci; conflicts with main');
+  assert.equal(both.nextAction, 'ship resume 7 (fix the failing check: ci; update with main, resolve conflicts)');
+  assert.equal(cls({ conflicts: true }).reason, 'conflicts with the base branch');
 });
 
 test('failing-check: conflicts, pipeline-blocked label, failed verify for this head', () => {
@@ -355,8 +371,27 @@ test('tie: review beats owner-merge', () => {
   assert.equal(cls({ contentHash: 'changed' }).waitingOn, 'review');
 });
 
-test('tie: untracked + stale + failing CI is failing-check, not abandoned', () => {
-  assert.equal(cls({ ...untrackedStale, ci: 'failed' }).waitingOn, 'failing-check');
+test('tie: untracked + stale is abandoned even with failing CI, conflicts, an incomplete CI or a draft', () => {
+  const failed = cls({ ...untrackedStale, ci: 'failed', ciFailed: ['ci'], conflicts: true, baseRefName: 'main' });
+  assert.equal(failed.waitingOn, 'abandoned');
+  assert.equal(failed.suggest, 'close');
+  assert.equal(failed.nextAction, 'close');
+  assert.match(failed.reason, /^no pipeline history, last activity \d{4}-\d{2}-\d{2}; also required check failed: ci; conflicts with main$/);
+  assert.match(cls({ ...untrackedStale, conflicts: true, baseRefName: 'main' }).reason, /; also conflicts with main$/);
+  assert.equal(cls({ ...untrackedStale, ci: 'incomplete' }).waitingOn, 'abandoned');
+  const draft = cls({ ...untrackedStale, isDraft: true });
+  assert.equal(draft.waitingOn, 'abandoned');
+  assert.match(draft.reason, /; also still a draft$/);
+  assert.equal(cls({ ...untrackedStale }).reason.includes('also'), false);
+});
+test('tie: untracked + stale is never review; an untracked ACTIVE PR with a failure is still failing-check', () => {
+  assert.notEqual(cls({ ...untrackedStale, labels: ['awaiting-review'] }).waitingOn, 'review');
+  const active = { record: null, recordStatus: 'absent', triage: null, activity: { commitDate: ago(DAY), createdAt: ago(3 * DAY) } };
+  assert.equal(cls({ ...active, conflicts: true }).waitingOn, 'failing-check');
+});
+test('tie: owner-decision and running still outrank untracked + stale', () => {
+  assert.equal(cls({ ...untrackedStale, labels: ['needs-human'] }).waitingOn, 'owner-decision');
+  assert.equal(cls({ ...untrackedStale, alreadyOnBase: true }).waitingOn, 'nothing-left');
 });
 
 test('owner-merge record with CI incomplete => pipeline re-gate', () => {
@@ -420,7 +455,7 @@ test('local unpushed work prefixes nextAction without changing waitingOn', () =>
 test('local dirty work prefixes nextAction', () => {
   const r = cls({ ci: 'failed', local: { worktree: '/w/x', unpushed: 0, dirty: 3, state: 'equal' } });
   assert.equal(r.waitingOn, 'failing-check');
-  assert.equal(r.nextAction, 'push/commit the local work in /w/x first; then ship resume 7');
+  assert.equal(r.nextAction, 'push/commit the local work in /w/x first; then ship resume 7 (fix the failing check)');
 });
 
 test('local diverged branch: owner decides', () => {
@@ -568,4 +603,14 @@ test('triageGroups: groups by suggest in PR-number order', () => {
 
 test('triageGroups: empty input gives four empty groups', () => {
   assert.deepEqual(triageGroups([]), { merge: [], resume: [], close: [], leave: [] });
+});
+
+test('ciDetail: names the failed and the missing required checks', () => {
+  const d = ciDetail([ok('a'), run('b', 'COMPLETED', 'FAILURE'), run('c', 'IN_PROGRESS')], ['a', 'b', 'c', 'd']);
+  assert.equal(d.status, 'failed');
+  assert.deepEqual(d.failed, ['b']);
+  assert.deepEqual(d.missing, ['c', 'd']);
+  assert.deepEqual(ciDetail([ok('a')], ['a']), { status: 'passed', failed: [], missing: [] });
+  assert.equal(ciDetail([], []).status, 'incomplete');
+  assert.deepEqual(ciDetail([run('x', 'COMPLETED', 'TIMED_OUT')], []).failed, ['x']);
 });

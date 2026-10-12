@@ -383,3 +383,31 @@ test('a GraphQL error is a failure (exit 3), never an empty inbox', () => {
   const r = inbox([], { w, fake });
   assertExit(r, 3);
 });
+
+test('a failed required check is named; an untracked PR quiet past --stale-days is abandoned even with a red check', () => {
+  const w = world();
+  const sha1 = w.prBranch(1, { 'b.txt': 'b\n' });
+  const sha2 = w.prBranch(2, { 'c.txt': 'c\n' });
+  const red = [{ __typename: 'CheckRun', name: 'ci', status: 'COMPLETED', conclusion: 'FAILURE' }];
+  const commits = (date) => ({ nodes: [{ commit: { committedDate: date, statusCheckRollup: { contexts: { nodes: red } } } }] });
+  const fake = createFakeGh([
+    ...BASE_ENTRIES,
+    OPEN_ONLY(page([
+      node(1, sha1, { commits: commits(ago(DAY)) }),
+      node(2, sha2, { createdAt: ago(40 * DAY), commits: commits(ago(30 * DAY)) }),
+    ])),
+    NO_MERGED,
+    { match: '^api repos/.*comments', stdout: '[]' },
+  ]);
+  const r = inbox(['--no-git'], { w, fake });
+  assertExit(r, 0);
+  const [active, stale] = r.json.prs;
+  assert.equal(active.waitingOn, 'failing-check');
+  assert.deepEqual(active.ciFailed, ['ci']);
+  assert.equal(active.reason, 'required check failed: ci');
+  assert.equal(active.nextAction, 'ship resume 1 (fix the failing check: ci)');
+  assert.equal(stale.waitingOn, 'abandoned');
+  assert.equal(stale.suggest, 'close');
+  assert.match(stale.reason, /; also required check failed: ci$/);
+  assert.deepEqual(r.json.triage.close.map((p) => p.number), [2]);
+});

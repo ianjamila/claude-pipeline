@@ -23,7 +23,9 @@ function rowVerdict(row) {
   return 'pending';
 }
 
-export function ciStatus(contexts, requiredNames) {
+// -> { status: 'passed'|'failed'|'incomplete', failed: [names], missing: [names] } over the names that count (the required
+// checks, or every context seen when none are configured). `missing` = no row yet or not finished.
+export function ciDetail(contexts, requiredNames) {
   const latest = new Map();
   for (const row of Array.isArray(contexts) ? contexts : []) {
     const name = row?.name ?? row?.context;
@@ -31,11 +33,16 @@ export function ciStatus(contexts, requiredNames) {
     latest.set(name, rowVerdict(row)); // input is oldest first, so a later row replaces an earlier one
   }
   const required = Array.isArray(requiredNames) ? requiredNames : [];
-  const verdicts = required.length > 0 ? required.map((n) => latest.get(n) ?? 'pending') : [...latest.values()];
-  if (verdicts.length === 0) return 'incomplete';
-  if (verdicts.includes('fail')) return 'failed';
-  return verdicts.every((v) => v === 'pass') ? 'passed' : 'incomplete';
+  const names = required.length > 0 ? required : [...latest.keys()];
+  const verdicts = names.map((n) => [n, latest.get(n) ?? 'pending']);
+  const failed = verdicts.filter(([, v]) => v === 'fail').map(([n]) => n);
+  const missing = verdicts.filter(([, v]) => v === 'pending').map(([n]) => n);
+  if (verdicts.length === 0) return { status: 'incomplete', failed, missing };
+  if (failed.length > 0) return { status: 'failed', failed, missing };
+  return { status: missing.length === 0 ? 'passed' : 'incomplete', failed, missing };
 }
+
+export const ciStatus = (contexts, requiredNames) => ciDetail(contexts, requiredNames).status;
 
 // ---- last activity ----------------------------------------------------------------------------
 
@@ -114,16 +121,24 @@ function reviewReasons(f) {
   return reasons;
 }
 
+// Why a PR cannot go on as it is: [{ text, action }]. `action` says what the resume has to do about it.
 function failingReasons(f) {
-  const reasons = [];
-  if (f.ci === 'failed') reasons.push('a required CI check failed');
-  if (f.conflicts === true) reasons.push('merge conflicts with the base branch');
-  if (f.labels.includes('pipeline-blocked')) reasons.push('pipeline-blocked label set');
+  const base = f.baseRefName || 'the base branch';
+  const out = [];
+  if (f.ci === 'failed') {
+    const names = Array.isArray(f.ciFailed) && f.ciFailed.length > 0 ? f.ciFailed : null;
+    out.push({
+      text: names ? `required check${names.length === 1 ? '' : 's'} failed: ${names.join(', ')}` : 'a required CI check failed',
+      action: names ? `fix the failing check${names.length === 1 ? '' : 's'}: ${names.join(', ')}` : 'fix the failing check',
+    });
+  }
+  if (f.conflicts === true) out.push({ text: `conflicts with ${base}`, action: `update with ${base}, resolve conflicts` });
+  if (f.labels.includes('pipeline-blocked')) out.push({ text: 'pipeline-blocked label set', action: 'see why verify was blocked' });
   const v = f.record?.verify;
   if (v && v.ok === false && v.head === f.headRefOid) {
-    reasons.push(`verify failed for this head${v.failedStep ? ` at ${v.failedStep}` : ''}`);
+    out.push({ text: `verify failed for this head${v.failedStep ? ` at ${v.failedStep}` : ''}`, action: 'fix the verify failure' });
   }
-  return reasons;
+  return out;
 }
 
 export function classifyPr(facts, options) {
@@ -163,10 +178,17 @@ export function classifyPr(facts, options) {
       reason = f.needsHumanReason || 'needs-human label set (no reason recorded)';
       nextAction = `leave: owner decision needed (${reason})`;
     }
+  } else if (untracked && stale) {
+    // Nothing drives it: no record, no review state, quiet for staleDays. Whatever else is wrong with it is context for
+    // the close decision, not a reason to resume it.
+    waitingOn = 'abandoned';
+    const also = [...failing.map((x) => x.text), ...(f.isDraft ? ['still a draft'] : [])];
+    reason = `no pipeline history, last activity ${activity.at ? day(activity.at) : 'unknown'}${also.length ? `; also ${also.join('; ')}` : ''}`;
+    nextAction = 'close';
   } else if (failing.length > 0) {
     waitingOn = 'failing-check';
-    reason = failing.join('; ');
-    nextAction = resume;
+    reason = failing.map((x) => x.text).join('; ');
+    nextAction = `${resume} (${failing.map((x) => x.action).join('; ')})`;
   } else if (reviewing.length > 0) {
     waitingOn = 'review';
     reason = reviewing.join('; ');
@@ -185,10 +207,6 @@ export function classifyPr(facts, options) {
     waitingOn = 'owner-merge';
     reason = 'gated and clean for this head; only the owner\'s "merge" is missing';
     nextAction = `say "merge" (head ${sha7(f.headRefOid)})`;
-  } else if (untracked) {
-    waitingOn = 'abandoned';
-    reason = `no pipeline history, last activity ${activity.at ? day(activity.at) : 'unknown'}`;
-    nextAction = 'close';
   } else {
     waitingOn = 'pipeline';
     if (record?.outcome === 'awaiting-owner-merge') {

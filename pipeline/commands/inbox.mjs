@@ -7,7 +7,7 @@ import { guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { requiredChecks } from '../lib/config.mjs';
 import { NETWORK_TIMEOUT_MS, git, mergeTree, reviewContentHash, revParse, supportsMergeTreeWrite } from '../lib/git.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
-import { classifyPr, classifyStranded, ciStatus, triageGroups } from '../lib/inbox.mjs';
+import { classifyPr, classifyStranded, ciDetail, triageGroups } from '../lib/inbox.mjs';
 import { listWorktrees, localBranchState, orphanWorktrees } from '../lib/local-branches.mjs';
 import { MARKERS, line } from '../lib/render.mjs';
 import { followupsPending } from '../lib/review-context.mjs';
@@ -209,10 +209,11 @@ export const run = guarded(async (argv, ctx) => {
       const a = analyseComments(comments, viewer, { repo, pr: p.number, branch: p.headRefName }, warnings);
       const g = gitPart.facts.get(p.number) ?? { conflicts: null, alreadyOnBase: null, contentHash: null };
       const ls = local.perPr.get(p.number) ?? null;
-      const ci = ciStatus(p.contexts, required);
+      const ciInfo = ciDetail(p.contexts, required);
+      const ci = ciInfo.status;
       const classified = classifyPr({
         number: p.number, title: p.title, isDraft: p.isDraft, labels: p.labels, headRefOid: p.headRefOid,
-        isCrossRepository: p.isCrossRepository, ci, conflicts: g.conflicts, alreadyOnBase: g.alreadyOnBase,
+        isCrossRepository: p.isCrossRepository, baseRefName: p.baseRefName, ci, ciFailed: ciInfo.failed, conflicts: g.conflicts, alreadyOnBase: g.alreadyOnBase,
         record: a.record, recordStatus: a.recordStatus, triage: a.triage, contentHash: g.contentHash,
         needsHumanReason: a.needsHumanReason, needsHumanHardStopOnly: a.needsHumanHardStopOnly,
         activity: { commitDate: p.commitDate, commentUpdatedAts: a.commentUpdatedAts, reviewDates: p.reviewDates, createdAt: p.createdAt },
@@ -227,6 +228,8 @@ export const run = guarded(async (argv, ctx) => {
         branch: p.headRefName,
         head: sha7(p.headRefOid),
         ci,
+        ciFailed: ciInfo.failed,
+        ciMissing: ciInfo.missing,
         mergeable: p.mergeable,
         autoMerge: p.autoMergeEnabledAt !== null,
         conflicts: g.conflicts,
