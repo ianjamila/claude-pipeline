@@ -275,7 +275,7 @@ pipeline resume list [--repo DIR]
      (written by this GitHub user) is readable and has no outcome yet (a run that stopped mid-way)
 pipeline resume plan --pr N [--repo DIR]
   -> {ok, pr, title, url, prState, branch, base, liveHead, enter, reason, adopt, confirm, autoMerge, worktree, recordStatus, record,
-      events, local, mergeSha, notes[], warnings[]}; read-only (its one git write is the fetch of the PR head and base)
+      events, local, mergeSha, notes[], warnings[]}; read-only (its only git writes are fetches: the PR head, the base and origin/<branch>)
      enter: closed | ended | observe-prod | not-resumable | local-work | decision | build | verify | review | followups | gate
      adopt: no run record (the PR was not started by the pipeline); confirm: {host, step, minutesAgo, why} when another run may be live,
      autoMerge: {armed, action: disarm} when an unattended auto-merge is queued, worktree: {action: reuse|add-existing-ref|add-from-remote|none, path?, then?}
