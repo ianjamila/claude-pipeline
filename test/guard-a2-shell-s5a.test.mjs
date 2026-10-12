@@ -66,6 +66,10 @@ test('S5a: quoted text that looks like a function definition does not make the d
     assert.equal(git(c, fsFor('nowhere.sql', 'select 1;')).decision, 'allow', c);
     assert.equal(git(c, fsFor('sub/q.sql', `\\! ${bad}`)).decision, 'deny', `${c} (the file is judged where the cd went)`);
   }
+  // (a builtin that evaluates its words in the current shell reads the quoted definition as code)
+  for (const c of ['mapfile -C \' foo() { :; }\' -c 1 a < /dev/null; cd sub && psql -f q.sql', 'complete -C \' bar() { :; }\' x; cd sub && psql -f q.sql', 'bind -x \'"\\C-x": " baz() { :; }"\'; cd sub && psql -f q.sql', 'PROMPT_COMMAND=\' foo() { :; }\'; cd sub && psql -f q.sql', 'let "a[\' foo() { :; }\']=1"; cd sub && psql -f q.sql', 'export "a[\' foo() { :; }\']=1"; cd sub && psql -f q.sql']) {
+    assert.equal(git(c, fsFor('nowhere.sql', 'select 1;')).decision, 'deny', c);
+  }
   // (quoting that cannot be trusted keeps the hazard: an apostrophe in a comment, \$'..\\'..' and an unterminated quote hide nothing)
   for (const c of ["echo hi # it's\nfoo() { :; }; cd sub && psql -f q.sql\necho 'x'", "echo $'a\\'b'; foo() { :; }; cd sub && psql -f q.sql; echo '", "echo 'a'; foo() { :; }; cd sub && psql -f q.sql; echo \"x"]) {
     assert.equal(git(c, fsFor('nowhere.sql', 'select 1;')).decision, 'deny', c);

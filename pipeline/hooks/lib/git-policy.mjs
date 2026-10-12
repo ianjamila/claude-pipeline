@@ -1346,9 +1346,16 @@ const isStateHazard = (c) => {
 const FUNCTION_DEF = /(?:^|[\s;&|(){])(?:function\s+[^\s(){};&|<>]+|[A-Za-z_][\w.:-]*\s*\(\s*\))/;
 // `source` / `.` run a file in THIS shell: it may cd, check out a branch or reassign any variable.
 const SOURCING = ['source', '.'];
-// Why: only unquoted text defines a function: `create function f(uuid)` in a psql -c, `fn()` in a node -e program or a commit message is data. Quoted text counts again when something on
-// the line runs text as code (eval, a shell, source, trap, a name known only at run time), and when the line has a heredoc (an apostrophe in its body would unbalance the quotes).
-const TEXT_RUNNERS = new Set(['eval', 'source', '.', 'trap', 'alias', 'bash', 'sh', 'zsh', 'dash', 'ksh', 'fish', 'env', 'xargs', 'command', 'builtin', 'exec', 'sudo', 'timeout', 'nohup', 'time', 'nice', 'watch', 'parallel', 'ssh', 'coproc', 'script', 'su', 'doas', 'stdbuf']);
+// Why: only unquoted text defines a function: `create function f(uuid)` in a psql -c, `fn()` in a node -e program or a commit message is data. That holds only when every command on the line is
+// one that never evaluates its words in the current shell (external programs and plain builtins below); anything else (eval, a shell, source, trap, mapfile -C, complete -C, bind -x, fc, let / (( )),
+// export / declare / printf -v with a subscript, a name known only at run time, an assignment to PROMPT_COMMAND ...) reads quoted text as code, and so does a heredoc (an apostrophe in its body would unbalance the quotes).
+const DATA_COMMANDS = new Set(['git', 'gh', 'node', 'nodejs', 'python', 'python3', 'deno', 'bun', 'ruby', 'perl', 'cat', 'echo', 'printf', 'grep', 'egrep', 'fgrep', 'rg', 'sed', 'awk', 'jq', 'psql', 'mysql', 'sqlite3', 'npm', 'npx', 'pnpm', 'yarn', 'supabase', 'curl', 'wget', 'ls', 'head', 'tail', 'wc', 'sort', 'uniq', 'cut', 'tr', 'tee', 'diff', 'mkdir', 'rm', 'cp', 'mv', 'touch', 'find', 'date', 'sleep', 'cd', 'pwd', 'true', 'false', 'rsync', 'tar', 'ln', 'chmod', 'open', 'tsc', 'vitest']);
+const dataOnly = (c) => {
+  if (!c.argv.length) return !Object.keys(c.env ?? {}).some((k) => /^(?:PROMPT_COMMAND|PS[0-4]|BASH_ENV|ENV|IFS|PATH|CDPATH)$/.test(k));
+  const nm = baseName(c.argv[0]);
+  if (nm === 'export') return !c.argv.some((w) => w.includes('['));
+  return DATA_COMMANDS.has(nm) && !(nm === 'printf' && c.argv.some((w) => /^-[a-zA-Z]*v/.test(w)));
+};
 // (null when the quoting cannot be trusted: a comment (an apostrophe in it opens no quote), `$'..'` (its \' does not close), an unterminated quote: the caller then keeps the hazard)
 function unquotedText(s) {
   let out = '';
@@ -1374,7 +1381,7 @@ function unquotedText(s) {
 }
 function definesFunction(str, cmds) {
   if (!FUNCTION_DEF.test(str)) return false;
-  if (/<</.test(str) || cmds.some((c) => c.argv.length && (TEXT_RUNNERS.has(baseName(c.argv[0])) || DYNAMIC.test(c.argv[0])))) return true;
+  if (/<</.test(str) || !cmds.every(dataOnly)) return true;
   const u = unquotedText(str);
   return u === null || FUNCTION_DEF.test(u);
 }
