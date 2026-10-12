@@ -717,18 +717,20 @@ function noteReads(seg, name, argv, st, exact) {
   const reader = Object.hasOwn(READERS, name);
   // a shell / interpreter / program run by path that is given a script (`bash $F/stack.sh env`): the script is the one file it reads, the words after it are the script's own arguments
   const script = reader ? null : producerScript(argv);
-  // [operand, the word it came from]; a word with no unquoted pattern character is a literal name even if it looks like a regex (`'^(A|B)='`)
-  const words = reader ? readerOperands(argv, ...READERS[name]).map((w) => [w, w]) : script !== null ? [[script, script, argv.indexOf(script)]] : looseOperands(argv);
+  // [operand, the word it came from, argv index, argOnly]; a word with no unquoted pattern character is a literal name even if it looks like a regex (`'^(A|B)='`).
+  // The script's other words stay scanned (the script may print a file they name: `s.sh` = `cat "$1"`), but they are not FILE operands for the join rule.
+  const scriptArgs = () => looseOperands(argv).filter(([w]) => w !== script).map(([w, full, idx]) => [w, full, idx, true]);
+  const words = reader ? readerOperands(argv, ...READERS[name]).map((w) => [w, w]) : script !== null ? [[script, script, argv.indexOf(script)], ...scriptArgs()] : looseOperands(argv);
   for (const f of seg.stdinFiles) { words.push([f, f]); st.pat.add(f); }
   const list = exact && (EXACT_READERS.has(name) || argv.length === 0) ? st.files : st.computed;
   const prog = reader ? -1 : programIndex(name, argv);
   const group = [];
-  for (const [w, full, idx] of words) {
+  for (const [w, full, idx, argOnly] of words) {
     if (w === '' || w === '-' || STDIN_FILES.has(w)) continue;
     list.push(w);
     if (list === st.files) group.push(w);
-    if (!noFile && (seg.pat.has(full) || idx !== prog)) st.pat.add(w);
-    if (!noFile && seg.pat.has(full)) st.unq.add(w); // an unquoted pattern: the shell really globs it (`find . -name '*.sh'` does not)
+    if (!noFile && !argOnly && (seg.pat.has(full) || idx !== prog)) st.pat.add(w);
+    if (!noFile && !argOnly && seg.pat.has(full)) st.unq.add(w); // an unquoted pattern: the shell really globs it (`find . -name '*.sh'` does not)
   }
   if (group.length) st.groups.push(group);
   if (words.length) st.raws.push(seg.raw);

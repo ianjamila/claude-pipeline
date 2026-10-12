@@ -556,6 +556,13 @@ test('R2-FP: text a system query prints into a shell is still refused when the l
   for (const bad of [BAD_FILES]) for (const c of lines(bad)) assert.equal(files(c, fakeFs(PROJ, {}, ['sub', 'd'])).decision, 'deny', `files: ${c}`);
 });
 
+// A script producer's other words are not FILE operands for the join rule, but the script may print a file they name (`ok.sh` = `cat "$1"`):
+// they stay scanned as before the R2-FP narrowing (background security review).
+test('R2-FP: a script producer\'s arguments are still scanned for the text they may feed', () => {
+  for (const c of ['bash ok.sh f.sh | bash', 'eval "$(bash ok.sh f.sh)"', 'bash <(sh ok.sh x f.sh)', 'eval "$(bash ok.sh env f.sh)"', 'bash <(node ok.sh f.sh)']) denyBoth(c, SPEC);
+  for (const c of ['bash ok.sh README.md | bash', 'eval "$(bash ok.sh env)"']) allowBoth(c, SPEC);
+});
+
 test('R1-B2 follow-up: a feed with ONE file operand keeps its verdict, however the operand is spelled', () => {
   const ok = () => ({ 'a.sh': 'echo a', 'b.sh': 'echo b', 'ok.sh': 'echo hi\n' });
   for (const c of ['cat ok.sh | bash', 'cat o*.sh | bash', 'sed p ok.sh | bash', 'sed p o*.sh | bash', 'awk \'{print $1}\' ok.sh | bash', 'sed "s/a/$X/" ok.sh | bash', 'tail -n +1 ok.sh | bash', 'cat a.sh b.sh | bash']) allowBuilt(c, ok);
