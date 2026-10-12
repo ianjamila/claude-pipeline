@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import {
-  cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, utimesSync,
+  cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync, utimesSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -45,6 +45,12 @@ const standardFindings = () => findingsOf(
   [finding({ title: 'Rename helper', file: 'src/b.js', line: 3, category: 'maintainability' }), finding({ title: 'Extract constant', file: 'src/b.js', line: 5, category: 'design' })],
   [finding({ title: 'Consider caching', file: 'src/a.js', line: 20, category: 'performance', testable: false })],
 );
+
+// What `followups create` asks before it files anything: who we are and which agent-suggestion issues exist (none).
+const NO_ISSUES = [
+  { match: '^api user', stdout: 'me\n' },
+  { match: '^api repos/acme/widgets/issues\\?labels=agent-suggestion&state=all&per_page=30 --paginate', stdout: '[]' },
+];
 
 const GH = [
   { match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'Adds compute() to a.js', headRefName: 'feat/x' } },
@@ -684,6 +690,7 @@ test('arbiter apply: a Fable transcript for this round and digest is proven, its
   assert.deepEqual(proof.errors, []);
   assert.match(proof.transcript, /agent-a1\.jsonl$/);
   assert.equal(w.state().rounds[0].arbiter.proofOk, true);
+  assert.deepEqual(w.state().rounds[0].modelProof, { transcript: proof.transcript, models: { 'claude-fable-5-1': 1 }, effort: 'high' }, 'the proof summary travels in the state');
 
 });
 
@@ -720,6 +727,7 @@ function assertAllNeedHuman(w, r, errorPattern) {
   assert.equal(proof.ok, false);
   assert.ok(proof.errors.length > 0);
   assert.equal(JSON.parse(readFileSync(w.roundFile(1, 'rulings.json'), 'utf8')).proofOk, false);
+  assert.equal(w.state().rounds[0].modelProof, undefined, 'a failed proof is not recorded as one');
 }
 
 test('arbiter apply: a <synthetic> (API error) transcript is exit 1 and every arbitrated item needsHuman', (t) => {
@@ -1036,7 +1044,7 @@ test('review-complete: a gh failure while removing the label is exit 3, not succ
 
 test('followups create: one agent-suggestion issue per FOLLOW-UP item, URL recorded, never filed twice', (t) => {
   const url = 'https://github.com/acme/widgets/issues/11';
-  const w = world(t, { gh: [...GH, { match: '^api -X POST repos/acme/widgets/issues ', stdoutJson: { number: 11, html_url: url } }] });
+  const w = world(t, { gh: [...GH, ...NO_ISSUES, { match: '^api -X POST repos/acme/widgets/issues ', stdoutJson: { number: 11, html_url: url } }] });
   const longTitle = `Consider caching ${'very '.repeat(40)}hard`;
   assertExit(w.codex(1, findingsOf(
     [],
@@ -1058,7 +1066,9 @@ test('followups create: one agent-suggestion issue per FOLLOW-UP item, URL recor
   for (const needle of ['cache it', 'Codex reasoning:', 'judge: FOLLOW-UP R1-W1', 'From PR #7, item R1-W1', 'src/a.js:20']) {
     assert.ok(body.body.includes(needle), `issue body should include ${needle}: ${body.body}`);
   }
-  assert.ok(!body.body.includes('@someone') && !body.body.includes('<!--'), 'model text is defused');
+  assert.equal(body.body.split('\n')[0], '<!-- claude-pipeline:followup pr=7 fp=' + w.item('R1-W1').fingerprint + ' -->', 'the marker is the first line');
+  const modelText = body.body.split('\n').slice(1).join('\n');
+  assert.ok(!modelText.includes('@someone') && !modelText.includes('<!--'), 'model text is defused');
   assert.equal(w.item('R1-W1').followupIssue, url);
 
   const again = w.cli(['followups', 'create', '--round', '1']);
@@ -1071,7 +1081,7 @@ test('followups create: one agent-suggestion issue per FOLLOW-UP item, URL recor
 });
 
 test('followups create: a gh failure is exit 3 and nothing is recorded as filed', (t) => {
-  const w = world(t, { gh: [...GH, { match: '^api -X POST', code: 1, stderr: 'HTTP 502' }] });
+  const w = world(t, { gh: [...GH, ...NO_ISSUES, { match: '^api -X POST', code: 1, stderr: 'HTTP 502' }] });
   assertExit(w.codex(1, findingsOf([], [], [finding({ title: 'Idea', category: 'other' })])), 0);
   assertExit(w.judge(1, { 'R1-W1': ['FOLLOW-UP'] }), 0);
   const r = w.cli(['followups', 'create', '--round', '1']);
@@ -1087,6 +1097,7 @@ test('a full round: codex -> judge -> arbiter -> implement -> follow-ups -> clea
     gh: [
       ...GH, REMOVE_LABEL,
       { match: '^api -X POST repos/acme/widgets/issues ', stdoutJson: { number: 21, html_url: url } },
+      { match: '^api repos/acme/widgets/issues\\?labels=agent-suggestion&state=all&per_page=30 --paginate', stdout: '[]' },
       { match: '^api user', stdout: 'me\n' },
       { match: 'issues/7/comments --paginate', stdoutJson: [] },
       { match: '^api -X POST repos/acme/widgets/issues/7/comments ', stdoutJson: { id: 5, html_url: 'https://github.com/acme/widgets/pull/7#issuecomment-5' } },
@@ -1296,7 +1307,7 @@ test('triage settle: only a disputed bug with a possible settle test and no test
 
 test('followups create: a finding already filed (any round, cache reuse or not) is never filed again; needsHuman items wait', (t) => {
   const url = 'https://github.com/acme/widgets/issues/31';
-  const w = world(t, { gh: [...GH, { match: '^api -X POST repos/acme/widgets/issues ', stdoutJson: { number: 31, html_url: url } }] });
+  const w = world(t, { gh: [...GH, ...NO_ISSUES, { match: '^api -X POST repos/acme/widgets/issues ', stdoutJson: { number: 31, html_url: url } }] });
   const posts = () => w.fake.calls().filter((c) => c.argv.join(' ').startsWith('api -X POST repos/acme/widgets/issues ')).length;
   const idea = (over = {}) => finding({ title: 'Cache grows', file: 'src/a.js', line: 20, category: 'performance', testable: false, ...over });
   assertExit(w.codex(1, findingsOf([], [], [idea()])), 0);
@@ -1685,4 +1696,317 @@ test('triage settle: a passing test that dismisses a security item still goes to
   assertExit(w2.cli(settleArgs(w2, 'R1-B1', 'bug-confirmed')), 0);
   assert.equal(w2.item('R1-B1').final.needsHuman, false);
   assert.equal(w2.item('R1-B1').final.decision, 'ACCEPT');
+});
+
+// ---- review replay: published state wins (state show --pr, discard-round) ---------------------------------
+
+const ISSUES_URL = '^api repos/acme/widgets/issues\\?labels=agent-suggestion&state=all&per_page=30 --paginate';
+const COMMENTS = (...comments) => [
+  { match: '^api user', stdout: 'me\n' },
+  { match: 'issues/7/comments --paginate', stdoutJson: comments },
+];
+const mine = (state, id = 9) => ({ id, user: { login: 'me' }, body: triageComment(state) });
+
+// A local one-round review (codex + judge) whose triage comment is already on the PR: the fake GitHub is scripted with the
+// state this very world produced, so heads and hashes agree whatever the clock did.
+function publishedWorld(t) {
+  const w = world(t);
+  assertExit(w.codex(1, standardFindings()), 0);
+  assertExit(w.judge(1, STANDARD_JUDGE), 0);
+  const published = w.state();
+  const script = JSON.parse(readFileSync(join(w.fake.dir, 'script.json'), 'utf8'));
+  w.fake.setScript([...script, ...COMMENTS(mine(published))]);
+  return { w, published };
+}
+const staleDirs = (w) => readdirSync(join(w.repo.dir, '.review')).filter((n) => n.startsWith('stale-'));
+
+test('state show --pr: equal local and published state is served from local, nothing moved', (t) => {
+  const { w, published } = publishedWorld(t);
+  assert.deepEqual(w.state(), published, 'precondition: the two worlds produced the same state');
+  const r = w.cli(['state', 'show', '--pr', '7']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.source, r.json.recovered, r.json.quarantinedTo], ['local', false, undefined]);
+  assert.deepEqual(staleDirs(w), []);
+});
+
+test('state show --pr: a lost local state is rebuilt with source published', (t) => {
+  const { w: src, published } = publishedWorld(t);
+  const w = world(t, { gh: [...GH, ...COMMENTS(mine(published))] });
+  assert.ok(src);
+  const r = w.cli(['state', 'show', '--pr', '7']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.source, r.json.recovered], ['published', true]);
+});
+
+test('state show (no --pr) never asks GitHub and reports source local', (t) => {
+  const { w } = publishedWorld(t);
+  const before = w.fake.calls().length;
+  const r = w.cli(['state', 'show']);
+  assertExit(r, 0);
+  assert.equal(r.json.source, 'local');
+  assert.equal(w.fake.calls().length, before);
+});
+
+test('state show --pr: local that strictly extends the published state (an unpublished round 2) is kept', (t) => {
+  const { w, published } = publishedWorld(t);
+  editState(w, (s) => {
+    s.rounds.push({ n: 2, fromHead: s.rounds[0].toHead, toHead: 'f'.repeat(40), contentHashAtToHead: 'h2', items: [] });
+  });
+  const r = w.cli(['state', 'show', '--pr', '7']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.source, 'local');
+  assert.equal(w.state().rounds.length, 2);
+  assert.deepEqual(w.state().rounds[0], published.rounds[0]);
+  assert.deepEqual(staleDirs(w), []);
+});
+
+test('state show --pr: same head and hash but different decisions is quarantined and the published state restored', (t) => {
+  const { w, published } = publishedWorld(t);
+  assert.equal(w.item('R1-W1').final.decision, 'FOLLOW-UP');
+  editState(w, (s) => { s.rounds[0].items.find((i) => i.id === 'R1-W1').final.decision = 'REJECT'; }); // same toHead + contentHash
+  const r = w.cli(['state', 'show', '--pr', '7']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.source, 'quarantined');
+  assert.match(r.json.quarantinedTo, /^\.review\/stale-\d{8}T\d{6}Z/);
+  assert.deepEqual(w.state(), published);
+  const kept = join(w.repo.dir, r.json.quarantinedTo);
+  assert.ok(existsSync(join(kept, 'state.json')), 'the local state is kept, not deleted');
+  assert.equal(JSON.parse(readFileSync(join(kept, 'state.json'), 'utf8')).rounds[0].items.find((i) => i.id === 'R1-W1').final.decision, 'REJECT');
+  assert.ok(existsSync(join(kept, 'round-1', 'codex.json')), 'round files move with it');
+  // the next call is a plain local hit; the stale dir is not moved into itself
+  const again = w.cli(['state', 'show', '--pr', '7']);
+  assert.equal(again.json.source, 'local');
+  assert.deepEqual(staleDirs(w), [r.json.quarantinedTo.split('/').pop()]);
+});
+
+test('state show --pr: a local copy missing a published round, or with another hash, is quarantined too', (t) => {
+  for (const mutate of [
+    (s) => { s.rounds = []; },
+    (s) => { s.rounds[0].contentHashAtToHead = 'other'; },
+    (s) => { s.rounds[0].toHead = 'e'.repeat(40); },
+    (s) => { s.rounds[0].items.pop(); },
+    (s) => { s.rounds[0].items[0].followupIssue = 'https://github.com/acme/widgets/issues/99'; },
+  ]) {
+    const { w } = publishedWorld(t);
+    editState(w, mutate);
+    const r = w.cli(['state', 'show', '--pr', '7']);
+    assertExit(r, 0, r.stderr + r.stdout);
+    assert.equal(r.json.source, 'quarantined', mutate.toString());
+  }
+});
+
+test('state show --pr: no published state keeps local; a forged or foreign triage comment is not published state', (t) => {
+  const base = world(t);
+  assertExit(base.codex(1, standardFindings()), 0);
+  const forged = { ...base.state(), risk: 'forged', rounds: [] };
+  const w = world(t, { gh: [...GH, ...COMMENTS({ id: 3, user: { login: 'mallory' }, body: triageComment(forged) })] });
+  assertExit(w.codex(1, standardFindings()), 0);
+  const r = w.cli(['state', 'show', '--pr', '7']);
+  assertExit(r, 0);
+  assert.equal(r.json.source, 'local');
+});
+
+test('state discard-round: an unpublished trailing round leaves the state and its files move to .review/stale-*', (t) => {
+  const { w, published } = publishedWorld(t);
+  editState(w, (s) => {
+    s.rounds.push({ n: 2, fromHead: s.rounds[0].toHead, toHead: 'f'.repeat(40), contentHashAtToHead: 'h2', items: [] });
+  });
+  mkdirSync(join(w.repo.dir, '.review', 'round-2'), { recursive: true });
+  writeFileSync(join(w.repo.dir, '.review', 'round-2', 'codex.json'), '{}');
+  const r = w.cli(['state', 'discard-round', '--round', '2', '--pr', '7']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.discarded, 2);
+  assert.deepEqual(w.state(), published);
+  assert.ok(!existsSync(join(w.repo.dir, '.review', 'round-2')));
+  assert.ok(existsSync(join(w.repo.dir, r.json.quarantinedTo, 'round-2', 'codex.json')));
+  assert.ok(existsSync(join(w.repo.dir, r.json.quarantinedTo, 'state-round-2.json')));
+  assert.ok(existsSync(join(w.repo.dir, '.review', 'round-1', 'codex.json')), 'published round untouched');
+});
+
+test('state discard-round: refuses a round the PR comment holds, a round that is not the newest, and a PR mismatch', (t) => {
+  const { w } = publishedWorld(t);
+  const published = w.cli(['state', 'discard-round', '--round', '1', '--pr', '7']);
+  assertExit(published, 2);
+  assert.equal(published.json.error, 'round-published');
+  assert.ok(existsSync(join(w.repo.dir, '.review', 'round-1', 'codex.json')));
+  assert.equal(w.state().rounds.length, 1);
+  assert.deepEqual(staleDirs(w), []);
+
+  editState(w, (s) => {
+    s.rounds.push({ n: 2, fromHead: s.rounds[0].toHead, toHead: 'f'.repeat(40), contentHashAtToHead: 'h2', items: [] });
+  });
+  assertExit(w.cli(['state', 'discard-round', '--round', '1', '--pr', '7']), 2);
+  assert.equal(w.cli(['state', 'discard-round', '--round', '9', '--pr', '7']).json.error, 'no-round');
+  assert.equal(w.cli(['state', 'discard-round', '--round', '2', '--pr', '8']).json.error, 'state-pr-mismatch');
+  assertExit(w.cli(['state', 'discard-round']), 2);
+  assert.match(w.cli(['state', 'bogus']).stdout + w.cli(['state', 'bogus']).stderr, /discard-round/);
+});
+
+test('state discard-round: a gh outage is exit 3 and nothing is moved', (t) => {
+  const { w } = publishedWorld(t);
+  editState(w, (s) => {
+    s.rounds.push({ n: 2, fromHead: s.rounds[0].toHead, toHead: 'f'.repeat(40), contentHashAtToHead: 'h2', items: [] });
+  });
+  w.fake.setScript([{ match: '.', code: 1, stderr: 'HTTP 502' }]);
+  assertExit(w.cli(['state', 'discard-round', '--round', '2', '--pr', '7']), 3);
+  assert.equal(w.state().rounds.length, 2);
+  assert.deepEqual(staleDirs(w), []);
+});
+
+// ---- followupsPending (state outcome) ----------------------------------------------------------------------
+
+test('state outcome: followupsPending is true until every ready FOLLOW-UP has an issue; a held one never counts', (t) => {
+  const url = 'https://github.com/acme/widgets/issues/11';
+  const w = world(t, { gh: [...GH, ...NO_ISSUES, { match: '^api -X POST repos/acme/widgets/issues ', stdoutJson: { number: 11, html_url: url } }] });
+  assertExit(w.codex(1, findingsOf([], [], [finding({ title: 'Idea', category: 'other', testable: false })])), 0);
+  assert.equal(w.cli(['state', 'outcome']).json.followupsPending, false, 'undecided is not a pending follow-up');
+  assertExit(w.judge(1, { 'R1-W1': ['FOLLOW-UP'] }), 0);
+  assert.equal(w.cli(['state', 'outcome']).json.followupsPending, true);
+  assertExit(w.cli(['followups', 'create', '--round', '1']), 0);
+  assert.equal(w.cli(['state', 'outcome']).json.followupsPending, false);
+  editState(w, (s) => { s.rounds[0].items[0].followupIssue = null; s.rounds[0].items[0].final.needsHuman = true; });
+  assert.equal(w.cli(['state', 'outcome']).json.followupsPending, false, 'needsHuman follow-ups are held, not pending');
+});
+
+// ---- followups create: marker dedupe ----------------------------------------------------------------------
+
+const FP_ISSUE = (w) => `${'<!-- claude-pipeline:followup pr=7 fp='}${w.item('R1-W1').fingerprint} -->`;
+const issue = (number, body, over = {}) => ({ number, html_url: `https://github.com/acme/widgets/issues/${number}`, state: 'open', body, user: { login: 'me' }, ...over });
+
+function followupWorld(t, issues, { post = { number: 50, html_url: 'https://github.com/acme/widgets/issues/50' } } = {}) {
+  const w = world(t, {
+    gh: [...GH, { match: '^api user', stdout: 'me\n' }, { match: ISSUES_URL, stdoutJson: issues }, { match: '^api -X POST repos/acme/widgets/issues ', stdoutJson: post }],
+  });
+  assertExit(w.codex(1, findingsOf([], [], [finding({ title: 'Idea', category: 'other', testable: false })])), 0);
+  assertExit(w.judge(1, { 'R1-W1': ['FOLLOW-UP'] }), 0);
+  return w;
+}
+const posts = (w) => w.fake.calls().filter((c) => c.argv.join(' ').startsWith('api -X POST repos/acme/widgets/issues '));
+
+test('followups create: no marker issue yet creates one whose body starts with the marker', (t) => {
+  const w = followupWorld(t, [issue(3, 'unrelated suggestion')]);
+  const r = w.cli(['followups', 'create', '--round', '1']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.created.length, 1);
+  assert.deepEqual([r.json.reused, r.json.duplicates], [[], []]);
+  assert.ok(JSON.parse(posts(w)[0].stdin).body.startsWith(`${FP_ISSUE(w)}\n`));
+});
+
+test('followups create: one existing issue of ours with the marker is reused, even when it is closed', (t) => {
+  const w0 = followupWorld(t, []);
+  const marker = FP_ISSUE(w0);
+  for (const state of ['open', 'closed']) {
+    const w = followupWorld(t, [issue(41, `${marker}\nbody`, { state })]);
+    // same fingerprint in a fresh world: the finding text is identical
+    const r = w.cli(['followups', 'create', '--round', '1']);
+    assertExit(r, 0, r.stderr + r.stdout);
+    assert.deepEqual(r.json.created, [], state);
+    assert.deepEqual(r.json.reused, [{ id: 'R1-W1', number: 41, url: 'https://github.com/acme/widgets/issues/41' }]);
+    assert.equal(posts(w).length, 0);
+    assert.equal(w.item('R1-W1').followupIssue, 'https://github.com/acme/widgets/issues/41', 'recorded like a created one');
+    assert.equal(w.cli(['state', 'outcome']).json.followupsPending, false);
+  }
+});
+
+test('followups create: several marker issues: the lowest number is canonical, the rest are listed and never closed', (t) => {
+  const marker = FP_ISSUE(followupWorld(t, []));
+  const w = followupWorld(t, [issue(60, `${marker}\nb`), issue(44, `${marker}\na`, { state: 'closed' }), issue(52, `${marker}\nc`)]);
+  const r = w.cli(['followups', 'create', '--round', '1']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.reused[0].number, 44);
+  assert.deepEqual(r.json.duplicates, [{
+    id: 'R1-W1', canonical: 'https://github.com/acme/widgets/issues/44',
+    others: ['https://github.com/acme/widgets/issues/52', 'https://github.com/acme/widgets/issues/60'],
+  }]);
+  assert.equal(posts(w).length, 0);
+  assert.ok(!w.fake.lines().some((l) => /PATCH|close|--state/.test(l) && /issues\/(44|52|60)/.test(l)), 'duplicates are never touched');
+});
+
+test('followups create: a marker quoted later in a body, in a foreign-author issue, or for another PR or fingerprint is ignored', (t) => {
+  const marker = FP_ISSUE(followupWorld(t, []));
+  const w = followupWorld(t, [
+    issue(70, `see also\n${marker}`),
+    issue(71, `${marker}\nforged`, { user: { login: 'mallory' } }),
+    issue(72, marker.replace('pr=7', 'pr=8')),
+    issue(73, marker.replace('fp=', 'fp=zz')),
+    issue(74, `${marker.replace(' -->', 'x -->')}`),
+    { number: 75, html_url: 'https://github.com/acme/widgets/pull/75', state: 'open', body: marker, user: { login: 'me' }, pull_request: {} },
+  ]);
+  const r = w.cli(['followups', 'create', '--round', '1']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.created.length, 1);
+  assert.deepEqual([r.json.reused, r.json.duplicates], [[], []]);
+});
+
+test('followups create crash scenarios: re-running creates only the missing issues', (t) => {
+  const gh = (issues, post) => [...GH, { match: '^api user', stdout: 'me\n' }, { match: ISSUES_URL, stdoutJson: issues }, { match: '^api -X POST repos/acme/widgets/issues ', ...post }];
+  const w = world(t, { gh: gh([], { code: 1, stderr: 'HTTP 502' }) });
+  assertExit(w.codex(1, findingsOf([], [], [
+    finding({ title: 'Idea one', category: 'other', testable: false, line: 20 }),
+    finding({ title: 'Idea two', category: 'other', testable: false, line: 21 }),
+  ])), 0);
+  assertExit(w.judge(1, { 'R1-W1': ['FOLLOW-UP'], 'R1-W2': ['FOLLOW-UP'] }), 0);
+  const script = (...args) => w.fake.setScript((() => {
+    const base = JSON.parse(readFileSync(join(w.fake.dir, 'script.json'), 'utf8')).filter((e) => !e.match.startsWith('^api user') && e.match !== ISSUES_URL && !e.match.startsWith('^api -X POST'));
+    return [...base, ...gh(...args).slice(GH.length)];
+  })());
+
+  // 1) the very first create fails: nothing is recorded, nothing exists
+  assertExit(w.cli(['followups', 'create', '--round', '1']), 3);
+  assert.equal(w.item('R1-W1').followupIssue ?? null, null);
+
+  // 2) issue 81 was made by a run that died before its URL reached the state: only the marker ties it to R1-W1
+  const marker = `<!-- claude-pipeline:followup pr=7 fp=${w.item('R1-W1').fingerprint} -->`;
+  script([issue(81, `${marker}\nx`)], { stdoutJson: { number: 82, html_url: 'https://github.com/acme/widgets/issues/82' } });
+  const before = posts(w).length;
+  const r = w.cli(['followups', 'create', '--round', '1']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual(r.json.reused.map((x) => x.id), ['R1-W1']);
+  assert.deepEqual(r.json.created.map((x) => x.id), ['R1-W2'], 'only the missing one is created');
+  assert.equal(posts(w).length - before, 1);
+  assert.equal(w.item('R1-W1').followupIssue, 'https://github.com/acme/widgets/issues/81');
+  assert.equal(w.item('R1-W2').followupIssue, 'https://github.com/acme/widgets/issues/82');
+
+  // 3) state published, then the first issue created and the second create dies: the recorded one is not filed twice
+  editState(w, (st) => { st.rounds[0].items.find((i) => i.id === 'R1-W2').followupIssue = null; });
+  script([issue(81, `${marker}\nx`)], { code: 1, stderr: 'HTTP 502' });
+  assertExit(w.cli(['followups', 'create', '--round', '1']), 3);
+  assert.equal(w.item('R1-W1').followupIssue, 'https://github.com/acme/widgets/issues/81', 'the first stays recorded');
+  assert.equal(w.item('R1-W2').followupIssue ?? null, null);
+
+  // 4) everything filed: a further run is a no-op
+  script([], { stdoutJson: { number: 83, html_url: 'https://github.com/acme/widgets/issues/83' } });
+  const done = w.cli(['followups', 'create', '--round', '1']);
+  assert.deepEqual(done.json.created.map((x) => x.id), ['R1-W2']);
+  const again = w.cli(['followups', 'create', '--round', '1']);
+  assert.deepEqual([again.json.created, again.json.reused, again.json.skipped.sort()], [[], [], ['R1-W1', 'R1-W2']]);
+});
+
+test('followups create: an issue-list outage is exit 3 and nothing is filed', (t) => {
+  const w = world(t, { gh: [...GH, { match: '^api user', stdout: 'me\n' }, { match: ISSUES_URL, code: 1, stderr: 'HTTP 502' }, { match: '^api -X POST repos/acme/widgets/issues ', stdoutJson: { number: 1, html_url: 'https://x.test/1' } }] });
+  assertExit(w.codex(1, findingsOf([], [], [finding({ title: 'Idea', category: 'other', testable: false })])), 0);
+  assertExit(w.judge(1, { 'R1-W1': ['FOLLOW-UP'] }), 0);
+  assertExit(w.cli(['followups', 'create', '--round', '1']), 3);
+  assert.equal(posts(w).length, 0, 'never create blind when the duplicate check could not run');
+});
+
+// ---- model proofs travel in the state ---------------------------------------------------------------------
+
+test('summary reads model proofs from the state rounds, the files only as a fallback', (t) => {
+  const url = 'https://github.com/acme/widgets/pull/7#issuecomment-5';
+  const w = world(t, {
+    gh: [...GH, { match: '^api user', stdout: 'me\n' }, { match: 'issues/7/comments --paginate', stdoutJson: [] },
+      { match: '^api -X POST repos/acme/widgets/issues/7/comments ', stdoutJson: { id: 5, html_url: url } }],
+  });
+  assertExit(w.codex(1, findingsOf()), 0);
+  editState(w, (s) => { s.rounds[0].modelProof = { transcript: '/t/from-state.jsonl', models: { 'claude-fable-5-1': 2 }, effort: 'high' }; });
+  const body = () => JSON.parse(w.fake.calls().filter((c) => c.argv.join(' ').includes('/comments ')).at(-1).stdin).body;
+  assertExit(w.cli(['summary', '--pr', '7', '--outcome', 'merged']), 0);
+  assert.ok(body().includes('from-state.jsonl'), 'proof comes from the state although no model-proof.json exists');
+
+  // a state without the proof falls back to the file
+  editState(w, (s) => { delete s.rounds[0].modelProof; });
+  writeFileSync(w.roundFile(1, 'model-proof.json'), JSON.stringify({ ok: true, transcript: '/t/from-file.jsonl', models: { 'claude-fable-5-1': 1 }, efforts: { high: 1 } }));
+  assertExit(w.cli(['summary', '--pr', '7', '--outcome', 'merged']), 0);
+  assert.ok(body().includes('from-file.jsonl'));
 });

@@ -351,3 +351,45 @@ test('loadState cleans stray tmp files even when there is no state.json yet', ()
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---- review replay helpers ------------------------------------------------------------------------
+
+import { decidedItemsKey, followupsPending, stateExtends } from '../pipeline/lib/review-context.mjs';
+
+const fu = (id, over = {}) => it(id, { final: { decision: 'FOLLOW-UP', by: 'judge', needsHuman: false, reason: 'later' }, ...over });
+const withItems = (...items) => addRound(emptyState({ repo: 'x/y', pr: 3, branch: 'b' }), { n: 1, fromHead: 'a', toHead: 'b', contentHashAtToHead: 'h', items });
+
+test('followupsPending: a ready FOLLOW-UP without an issue; not a held, filed, or other decision', () => {
+  assert.equal(followupsPending(withItems(fu('R1-W1'))), true);
+  assert.equal(followupsPending(withItems(fu('R1-W1', { followupIssue: 'https://x.test/1' }))), false);
+  assert.equal(followupsPending(withItems(fu('R1-W1', { final: { decision: 'FOLLOW-UP', needsHuman: true } }))), false);
+  assert.equal(followupsPending(withItems(it('R1-B1', { final: { decision: 'ACCEPT', needsHuman: false } }))), false);
+  assert.equal(followupsPending(withItems(it('R1-B1'))), false, 'undecided');
+  assert.equal(followupsPending(emptyState({ repo: 'x/y', pr: 3, branch: 'b' })), false);
+  const two = addRound(withItems(fu('R1-W1', { followupIssue: 'u' })), { n: 2, fromHead: 'b', toHead: 'c', contentHashAtToHead: 'h2', items: [fu('R2-W1')] });
+  assert.equal(followupsPending(two), true, 'any round counts');
+});
+
+test('stateExtends: equal and extra trailing rounds extend; any change to a published round does not', () => {
+  const pub = withItems(it('R1-B1', { final: { decision: 'ACCEPT', needsHuman: false } }), it('R1-S1'));
+  assert.equal(stateExtends(structuredClone(pub), pub), true);
+  const more = addRound(structuredClone(pub), { n: 2, fromHead: 'b', toHead: 'c', contentHashAtToHead: 'h2', items: [it('R2-B1')] });
+  assert.equal(stateExtends(more, pub), true);
+  assert.equal(stateExtends(pub, more), false, 'local lacking a published round');
+
+  const edit = (fn) => { const s = structuredClone(pub); fn(s.rounds[0]); return s; };
+  for (const fn of [
+    (r) => { r.toHead = 'z'; },
+    (r) => { r.contentHashAtToHead = 'z'; },
+    (r) => { r.items[0].final.decision = 'REJECT'; },
+    (r) => { r.items[0].implemented = true; },
+    (r) => { r.items[1].followupIssue = 'https://x.test/1'; },
+    (r) => { r.items[1].judge = { decision: 'REJECT' }; },
+    (r) => { r.items[1].arbiter = { ruling: 'ACCEPT' }; },
+    (r) => { r.items[1].fingerprint = 'other'; },
+    (r) => { r.items.pop(); },
+  ]) assert.equal(stateExtends(edit(fn), pub), false, fn.toString());
+  // fields outside the decided set (titles, detail) and key order do not matter
+  assert.equal(stateExtends(edit((r) => { r.items[0].title = 'reworded'; r.items[0].final = { reason: undefined, ...r.items[0].final }; }), pub), true);
+  assert.equal(decidedItemsKey({ items: [{ id: 'a', final: { x: 1, y: 2 } }] }), decidedItemsKey({ items: [{ final: { y: 2, x: 1 }, id: 'a' }] }));
+});
