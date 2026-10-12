@@ -1285,7 +1285,7 @@ function describe(f, cx) {
   const paths = [...new Set([f.oldPath, f.newPath, f.path].filter(Boolean))];
   const file = f.path ?? f.newPath ?? f.oldPath;
   return {
-    file, paths, status: f.status, binary: Boolean(f.binary), gitlink: Boolean(f.gitlink),
+    file, paths, status: f.status, binary: Boolean(f.binary), skippedLargeBinary: Boolean(f.skippedLargeBinary), gitlink: Boolean(f.gitlink),
     oldPath: f.oldPath ?? null, newPath: f.newPath ?? null,
     added: f.added ?? [], removed: f.removed ?? [],
     sql: paths.some(isSqlPath),
@@ -1300,8 +1300,9 @@ function describe(f, cx) {
 const STATUS_WORD = { M: 'edited', D: 'deleted', R: 'renamed' };
 
 function pathRules(d, cx, sink) {
-  // R0: a binary diff of anything but a plain asset cannot be read, so nothing below can vouch for it.
-  if (d.binary && !d.paths.every((p) => BINARY_ASSET.test(p) || (BINARY_FIXTURE.test(p) && isTestFile(p, cx.testGlobs)))) {
+  // R0: a binary diff of anything but a plain asset cannot be read, so nothing below can vouch for it. Not a large binary that
+  // was only deleted (diffFiles skips its content): a deletion adds nothing that would need reading.
+  if (d.binary && !(d.skippedLargeBinary && d.status === 'D') && !d.paths.every((p) => BINARY_ASSET.test(p) || (BINARY_FIXTURE.test(p) && isTestFile(p, cx.testGlobs)))) {
     sink.add('R0-unscannable', d.file, "binary diff; content can't be checked");
   }
 

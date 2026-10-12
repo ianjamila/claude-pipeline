@@ -18,8 +18,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
-import { simpleCommands, commandName, scriptFileOf } from './shell-parse.mjs';
-import { scriptCandidates, defaultReadDir, MAX_CANDIDATE_JUDGMENTS } from './script-candidates.mjs';
+import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf } from './shell-parse.mjs';
+import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
 
 const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
@@ -92,9 +92,9 @@ function realResolve(p, api, depth = 0) {
   let cur = p;
   const tail = [];
   for (let i = 0; i < 256; i++) {
-    let exists = false;
-    try { exists = api.existsSync(cur); } catch { /* treated as missing */ }
-    if (exists) {
+    // (existsSync answers false for anything it cannot stat; one that throws is a broken lookup and is not read as "missing")
+    if (api.existsSync(cur)) {
+      // realpath fails only where the OS refuses the access too (a symlink loop, EACCES, a too-long name): the lexical path is judged
       try { return posix.join(toPosix(api.realpath(cur)).replace(DEVICE_PREFIX, ''), ...tail.slice().reverse()); } catch { return p; }
     }
     if (depth < 8) {
@@ -173,6 +173,8 @@ function makeCtx(opts) {
     vars: {}, // same-line shell assignments (D=$HOME/.claude), filled in once the line is parsed
     dynamic: false, // set when a scan had to be skipped for size; callers fail closed
     readText: opts.readText ?? defaultReadText,
+    readHead: opts.readHead ?? defaultReadHead, // the first bytes of a file readText refused (over the cap)
+    budget: opts._budget ?? newEvalBudget(opts.now), // script reads, deadline and expansion allowance of this evaluation (shared with nested calls)
     readDir: opts.readDir ?? defaultReadDir,
     admin: (opts.env ?? process.env).PIPELINE_ADMIN === '1',
     hit: (p) => { const q = unFirm(p); return roots.some((r) => isInside(q, r, platform)); },
@@ -328,7 +330,7 @@ function evaluateMcp(tool, ti, input, opts) {
   return allow();
 }
 
-export const evaluateFileTool = denyUnverifiable(evaluateFileToolUnchecked);
+export const evaluateFileTool = failClosed(evaluateFileToolUnchecked);
 function evaluateFileToolUnchecked(input, opts = {}) {
   const tool = typeof input?.tool_name === 'string' ? input.tool_name : '';
   const ti = input?.tool_input && typeof input.tool_input === 'object' ? input.tool_input : {};
@@ -375,11 +377,16 @@ function freeMark(text) {
   }
   throw new UnverifiableText('the command holds every private-use Unicode character, so it cannot be checked; remove them');
 }
-// The entry points answer deny for text they cannot normalise (a hook that throws lets the command through).
+// Why: a hook that throws or times out is allowed by Claude Code, so the entry points answer deny for text they cannot
+// normalise, for a limit hit (script budget, deadline, expansion: GuardLimit) and for ANY other exception (a readText that
+// throws, a stack overflow), naming the cause.
 // (a declaration: the entry points above are built from it when the module loads)
-function denyUnverifiable(fn) {
+function failClosed(fn) {
   return (...args) => {
-    try { return fn(...args); } catch (e) { if (e instanceof UnverifiableText) return deny(e.message); throw e; }
+    try { return fn(...args); } catch (e) {
+      if (e instanceof UnverifiableText || e instanceof GuardLimit) return deny(e.message);
+      return deny(`internal error while checking this command (${e instanceof Error ? e.message : String(e)}), so it cannot be verified`);
+    }
   };
 }
 
@@ -429,10 +436,11 @@ function expandKeepingBackslash(w, ctx) {
 const mayHoldBackslash = (w, ctx) => w.includes('\\') || Object.values(ctx.keptVars ?? {}).some((v) => String(v).includes('\\'));
 
 // $NAME / ${NAME} for variables assigned earlier on the same line (D=$HOME/.claude; echo x > $D/settings.json).
-function substVars(text, vars) {
+// Values are stored already expanded, and a value used in many words multiplies: the produced text is capped (substitute).
+function substVars(text, vars, budget) {
   let t = text;
   for (let pass = 0; pass < 4 && t.includes('$'); pass++) {
-    const next = t.replace(/\$\{(\w+)\}|\$(\w+)/g, (m, a, b) => (Object.hasOwn(vars, a ?? b) ? vars[a ?? b] : m));
+    const next = substitute(budget, t, /\$\{(\w+)\}|\$(\w+)/g, (m, a, b) => (Object.hasOwn(vars, a ?? b) ? vars[a ?? b] : m));
     if (next === t) break;
     t = next;
   }
@@ -442,7 +450,7 @@ function substVars(text, vars) {
 // Slash-normalised copy of `text` with the user name, same-line variables and every home spelling replaced.
 function expandRefs(text, ctx) {
   const t = toPosix(text).replace(USER_RE, ctx.user);
-  return ctx.unFirm(expandHomeRefs(substVars(t, ctx.vars), ctx.homePosix));
+  return ctx.unFirm(expandHomeRefs(substVars(t, ctx.vars, ctx.budget), ctx.homePosix));
 }
 
 // Expands the first `{a,b}` groups of each word so `~/.claude/{pipeline,settings.json}` shows both paths.
@@ -506,7 +514,7 @@ function suffixRegexes(ci) {
   };
 }
 
-// One path segment of a glob as a regexp (`*` and `?` stay inside the segment); null when it cannot be compiled.
+// One path segment of a glob as a regexp (`*` and `?` stay inside the segment).
 function segmentRe(seg, ci) {
   const re = globToRe(seg.replace(/\*\*/g, '*'), ci);
   return re;
@@ -529,19 +537,26 @@ function globReaches(g, root, ci) {
 }
 
 function globToRe(g, ci) {
-  let re = '';
-  for (let i = 0; i < g.length; i++) {
-    const c = g[i];
-    if (c === '*') {
-      if (g[i + 1] === '*') { re += '.*'; i++; } else re += '[^/]*';
-    } else if (c === '?') re += '[^/]';
-    else if (c === '[') {
-      const j = g.indexOf(']', i + 2);
-      if (j < 0) re += '\\[';
-      else { re += `[${g.slice(i + 1, j).replace(/^!/, '^').replace(/\\/g, '\\\\')}]`; i = j; }
-    } else re += escapeRe(c);
-  }
-  try { return new RegExp(`^${re}$`, ci ? 'i' : ''); } catch { return null; }
+  // anyBracket: every bracket expression stands for any one character
+  const build = (anyBracket) => {
+    let re = '';
+    for (let i = 0; i < g.length; i++) {
+      const c = g[i];
+      if (c === '*') {
+        if (g[i + 1] === '*') { re += '.*'; i++; } else re += '[^/]*';
+      } else if (c === '?') re += '[^/]';
+      else if (c === '[') {
+        const j = g.indexOf(']', i + 2);
+        if (j < 0) re += '\\[';
+        else { re += anyBracket ? '[^/]' : `[${g.slice(i + 1, j).replace(/^!/, '^').replace(/\\/g, '\\\\')}]`; i = j; }
+      } else re += escapeRe(c);
+    }
+    return new RegExp(`^${re}$`, ci ? 'i' : '');
+  };
+  // JS may refuse a bracket the shell accepts (`[\w-.]`, an out-of-order range): a bracket always matches exactly one character, so reading
+  // every bracket as "any one character" is a superset of what the shell matches, and the word still has to line up with a protected path
+  try { return build(false); } catch { /* retry below */ }
+  try { return build(true); } catch { return null; }
 }
 
 // Every protected root plus the directories between it and the home directory, for globs like `~/.claude/*`.
@@ -747,8 +762,8 @@ function collectVars(cmds, ctx) {
   const bs = freeMark([ctx.homePosix ?? '', ctx.user ?? '', ...cmds.flatMap((c) => [...Object.values(c.env ?? {}), ...(c.argv ?? [])])].join(''));
   const set = (k, v) => {
     if (SKIP.has(k)) return;
-    vars[k] = expandHomeRefs(substVars(toPosix(String(v)).replace(USER_RE, ctx.user), vars), ctx.homePosix);
-    kept[k] = expandHomeRefs(substVars(toPosix(String(v).replace(/\\/g, bs)).replace(USER_RE, ctx.user), kept), ctx.homePosix).split(bs).join('\\');
+    vars[k] = expandHomeRefs(substVars(toPosix(String(v)).replace(USER_RE, ctx.user), vars, ctx.budget), ctx.homePosix);
+    kept[k] = expandHomeRefs(substVars(toPosix(String(v).replace(/\\/g, bs)).replace(USER_RE, ctx.user), kept, ctx.budget), ctx.homePosix).split(bs).join('\\');
   };
   for (const c of cmds) {
     for (const [k, v] of Object.entries(c.env ?? {})) set(k, v);
@@ -874,7 +889,7 @@ const STDIN_RUNNERS = new Set(['node', 'nodejs', 'deno', 'bun', 'sh', 'bash', 'z
 function checkoutRootOf(dir, ctx) {
   let d = dir;
   for (let i = 0; i < 64; i++) {
-    try { if (ctx.api.existsSync(posix.join(d, 'pipeline/hooks/guard-files.mjs'))) return d; } catch { /* not a checkout */ }
+    if (ctx.api.existsSync(posix.join(d, 'pipeline/hooks/guard-files.mjs'))) return d;
     const p = posix.dirname(d);
     if (p === d) return null;
     d = p;
@@ -924,6 +939,7 @@ function findInstaller(cmds, raw, dirs, ctx, opts) {
       if (!script) continue;
       for (const r of unique(roots)) {
         let scripts;
+        countScript(ctx.budget); // a file read like any other, so it is counted
         try {
           const read = opts.readFile ?? ((p) => fs.readFileSync(p, 'utf8'));
           scripts = JSON.parse(read(posix.join(r, 'package.json'))).scripts ?? {};
@@ -990,6 +1006,7 @@ const WRITE_HINT = /write|append|unlink|\brm\b|rmSync|rmdir|rename|copy|\bcp\b|\
 // program run by path, an interpreter file that cannot be read, a node_modules package and the pipeline's own
 // installed files are not judged (the installed CLI legitimately names its own settings).
 function judgeScriptFile(sf, dirs, ctx, opts, scanRaw = '', keepBackslash = false) {
+  if (sf.joined) return judgeJoinedScripts(sf, dirs, ctx, opts);
   if (sf.ambiguous) return judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw);
   // expandRefs turns \ into / (Windows paths), but off Windows a backslash is part of the file name: judge that reading too
   if (!keepBackslash && mayHoldBackslash(sf.file, ctx)) {
@@ -1002,29 +1019,99 @@ function judgeScriptFile(sf, dirs, ctx, opts, scanRaw = '', keepBackslash = fals
     // named at run time: the textual rules on the whole line still apply. Quoting is lost (`'x$y.sh'` reads as `x$y.sh`), so the word as written is judged too if it is a file
     return keepBackslash ? null : judgeScriptFile({ kind: sf.kind, file: sf.file, candidate: true }, dirs, ctx, opts);
   }
-  const found = [];
+  // every directory the command may run in (the cwd and each `cd` target) that holds the file: any of them may be the one that runs
+  const seen = new Set();
   for (const d of isAbs(e) ? [''] : dirs) {
     const abs = isAbs(e) ? posix.normalize(e) : posix.join(d, e);
-    let exists = false;
-    try { exists = ctx.api.existsSync(abs); } catch { /* treated as missing */ }
-    if (exists) { found.push({ abs, dir: d || ctx.cwd }); break; }
+    if (seen.has(abs) || !ctx.api.existsSync(abs)) continue;
+    seen.add(abs);
+    const v = judgeFoundScript(sf, abs, d || ctx.cwd, ctx, opts);
+    if (v) return v;
   }
-  if (!found.length) return null;
-  const { abs, dir } = found[0];
+  return null;
+}
+
+// Several files that feed ONE shell (`cat a b | bash`): the shell reads their texts one after the other, so they are judged joined, in the order
+// the command names them, repeats included (a protected name split across them is one name). `scan`: the text a rewriting command prints from
+// them (in an order we do not know): refused when the joined text refers to a protected file or switch, read in either order. Run in every
+// directory the command may be in; a file that is missing there prints nothing, and the pipeline's own installed files are not judged (as above).
+function judgeJoinedScripts(sf, dirs, ctx, opts) {
+  const readings = [false];
+  if (sf.joined.some((w) => mayHoldBackslash(w, ctx))) readings.push(true); // a backslash is a file name character off Windows: judge that reading too
+  const seen = new Set();
+  for (const keepBackslash of readings) {
+    const names = sf.joined.map((w) => {
+      const e = keepBackslash ? expandKeepingBackslash(w, ctx) : expandRefs(w, ctx);
+      return /[$`]/.test(e) ? toPosix(w) : e; // named at run time: the word as written (the textual rules on the whole line still apply)
+    });
+    for (const d of dirs) {
+      const abss = names.map((e) => (isAbs(e) ? posix.normalize(e) : posix.join(d, e)));
+      const key = abss.join('\u0000');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const texts = [];
+      for (const abs of abss) {
+        if (!ctx.api.existsSync(abs)) continue;
+        if (ctx.hit(abs) || ctx.hit(realResolve(abs, ctx.api)) || /\/node_modules\//.test(abs)) continue;
+        checkDeadline(ctx.budget);
+        const text = ctx.readText(abs);
+        if (typeof text !== 'string') {
+          if (sf.kind === 'shell') return deny(`cannot read the script ${abs} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified`);
+          const head = ctx.readHead(abs);
+          if (typeof head === 'string') return deny(`${abs} is too large to verify (over 1 MB), so what it feeds a shell cannot be known`);
+          continue;
+        }
+        countScript(ctx.budget);
+        texts.push(text);
+      }
+      if (!texts.length) continue;
+      if (sf.kind === 'scan') {
+        const m = makeMatchers(ctx);
+        for (const t of [texts.join(''), [...texts].reverse().join('')]) {
+          if (variantsOf(t).some((v) => setsAdmin(v, ctx.platform) || hasDisableAll(v)) || SENSITIVE_WORDS.test(t) || m.rawHit(t, [d || ctx.cwd])) {
+            return deny(`${sf.file} are read by a command that feeds a shell, and refer to a protected pipeline file or switch, so what the shell runs cannot be verified (${PROTECTED_MSG})`);
+          }
+        }
+        continue;
+      }
+      const r = evaluateBashForFiles(texts.join(''), { ...opts, cwd: d || ctx.cwd, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup });
+      if (r.decision === 'deny') return deny(`the scripts ${sf.file} would run: ${r.reason}`);
+    }
+  }
+  return null;
+}
+
+// One existing script file (`abs`, found in directory `dir`).
+function judgeFoundScript(sf, abs, dir, ctx, opts) {
   if (ctx.hit(abs) || ctx.hit(realResolve(abs, ctx.api)) || /\/node_modules\//.test(abs)) return null;
+  checkDeadline(ctx.budget);
   const text = ctx.readText(abs);
   if (typeof text !== 'string') {
     if (sf.candidate && ctx.readDir(abs)) return null; // a shell cannot run a directory
-    return sf.kind === 'shell' ? deny(`cannot read the script ${sf.file} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified`) : null;
+    if (sf.kind === 'shell') return deny(`cannot read the script ${sf.file} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified`);
+    // over the read cap: a program run by path is peeked at (a shell script is refused, a binary or an interpreter file is not
+    // ours to judge); text a rewriting command computes from a file we cannot read cannot be scanned
+    if (sf.kind === 'exec' || sf.kind === 'scan') {
+      const head = ctx.readHead(abs);
+      if (typeof head === 'string' && (sf.kind === 'scan' || isShellHead(head))) return deny(`${sf.file} is too large to verify (over 1 MB), so what it runs (or feeds a shell) cannot be known`);
+    }
+    return null;
   }
-  if (sf.candidate && --opts._budget.left < 0) return deny('too many script files to judge (candidate scripts that run candidate scripts), so what they run cannot be checked; name the script file');
+  countScript(ctx.budget); // every script read and judged counts, named or candidate: the work multiplies with each level
+  if (sf.kind === 'scan') {
+    // text a command rewrites on its way to a shell (sed, awk, base64 ...) is computed at run time: a file that names a protected file or switch is refused
+    if (variantsOf(text).some((t) => setsAdmin(t, ctx.platform) || hasDisableAll(t)) || SENSITIVE_WORDS.test(text) || makeMatchers(ctx).rawHit(text, [dir])) {
+      return deny(`${sf.file} is read by a command that feeds a shell, and refers to a protected pipeline file or switch, so what the shell runs cannot be verified (${PROTECTED_MSG})`);
+    }
+    return null;
+  }
   let kind = sf.kind;
   if (kind === 'exec') {
     if (text.slice(0, 4096).includes('\u0000')) return null; // a binary
     kind = INTERP_PROGRAM.test((SHEBANG_PROGRAM.exec(text)?.[1] ?? '').split('/').pop()) ? 'interp' : 'shell';
   }
   if (kind === 'shell') {
-    const r = evaluateBashForFiles(text, { ...opts, cwd: dir, _depth: (opts._depth ?? 0) + 1 });
+    const r = evaluateBashForFiles(text, { ...opts, cwd: dir, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup });
     return r.decision === 'deny' ? deny(`the script ${sf.file} would run: ${r.reason}`) : null;
   }
   // program text in another language: the admin switch, the hook switch, or a write next to a protected path
@@ -1040,6 +1127,15 @@ function judgeScriptFile(sf, dirs, ctx, opts, scanRaw = '', keepBackslash = fals
 // names a protected pipeline file.
 function judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw) {
   const joinPath = (d, r) => (isAbs(r) ? posix.normalize(r) : posix.join(d, r));
+  const line = execLineOf(sf, (w) => expandRefs(w, ctx));
+  if (line !== null) {
+    if ((opts._depth ?? 0) >= 4) return deny('the command line held in a variable is nested too deeply to check');
+    // run in every directory the command may be in, with the line's variables
+    for (const d of dirs) {
+      const r = evaluateBashForFiles(line, { ...opts, cwd: d, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) } });
+      if (r.decision === 'deny') return deny(`the command line ${sf.words[0]} expands to would run: ${r.reason}`);
+    }
+  }
   let c = scriptCandidates(sf, { expand: (w) => expandRefs(w, ctx), dirs, joinPath, readDir: ctx.readDir, ifs: ctx.vars.IFS });
   // a backslash in a word is a file name character off Windows, but expandRefs reads it as a separator: expand (and glob) that reading too
   if (!c.over && !sf.unresolvable && sf.words.some((w) => mayHoldBackslash(w, ctx))) {
@@ -1047,6 +1143,8 @@ function judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw) {
     c = { files: [...new Set([...c.files, ...k.files])], dynamic: c.dynamic || k.dynamic, over: k.over };
   }
   if (c.over) return deny('too many words, a glob matching too many files, or glob syntax that cannot be resolved could be the script this command runs, so it cannot be checked; name the script file');
+  // a variable the line set to a run-time value (`NVM_DIR=$(cmd)`) picks the script: which one is unknown
+  if (opts._unknown?.size && sf.words?.some((w) => [...w.matchAll(/\$\{?(\w+)/g)].some((m) => opts._unknown.has(m[1])))) return deny('the script is picked by a variable the command line sets to a value known only at run time, so it cannot be checked; name the script file');
   if (c.dynamic && makeMatchers(ctx).rawHit(scanRaw, dirs)) return deny('which word is the script this command runs is only known at run time ($VAR / $(...) / a glob) and the line refers to a protected pipeline file; name the file and write the options literally');
   for (const file of c.files) {
     const v = judgeScriptFile({ kind: sf.kind, file, candidate: true }, dirs, ctx, opts);
@@ -1131,9 +1229,10 @@ function linkReachesProtected(cmds, dirs, ctx) {
 
 // ---- Bash --------------------------------------------------------------------------------------------
 
-export const evaluateBashForFiles = denyUnverifiable(evaluateBashForFilesUnchecked);
+export const evaluateBashForFiles = failClosed(evaluateBashForFilesUnchecked);
 function evaluateBashForFilesUnchecked(command, opts = {}) {
-  if (!opts._budget) opts = { ...opts, _budget: { left: MAX_CANDIDATE_JUDGMENTS } }; // one budget for this evaluation and every script it reads
+  if (!opts._budget) opts = { ...opts, _budget: newEvalBudget(opts.now) }; // one budget for this evaluation and every script it reads
+  checkDeadline(opts._budget);
   const ctx = makeCtx(opts);
   if (ctx.admin) return allow();
   const raw = typeof command === 'string' ? command : '';
@@ -1148,7 +1247,7 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
   if (variantsOf(raw).some((t) => setsAdmin(t, ctx.platform) || setsAdmin(t.replace(/['"`]\s*\+\s*['"`]/g, '').replace(/['"`\\]/g, ''), ctx.platform))) return deny('the command sets PIPELINE_ADMIN; only the owner may set it, when launching Claude Code (naming it, e.g. in grep or prose, is fine)');
   if (hasDisableAll(raw) || hasDisableAll(flat)) return deny('the command mentions disableAllHooks, which would switch the pipeline hooks off');
 
-  const cmds = simpleCommands(raw);
+  const cmds = simpleCommands(raw, { expired: () => opts._budget.now() > opts._budget.deadline }); // a scan that outlasts the deadline gives up: truncated, so denied
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (500 `true;` then
   // `e''cho x > ~/.cl""aude/settings.json` must not slip through on a text match).
   if (cmds.truncated) return deny('the command line is too complex to check (the parser gave up); split it into simpler commands');
@@ -1166,9 +1265,14 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
   if (changesClaudeCode(cmds, scanRaw)) return deny('the command unsets or overrides CLAUDECODE, the marker the installer uses to refuse to run inside Claude Code; only the owner may change it, from a terminal');
   if (setsSeamForPipeline(cmds)) return deny('the command sets a pipeline test seam (PIPELINE_GH, PIPELINE_CODEX, PIPELINE_VERCEL, PIPELINE_TEST_MODE) for the pipeline CLI; a fake gh/codex/vercel could satisfy the merge gate, so only the owner does that, from a terminal');
   ctx.vars = collectVars(cmds, ctx);
+  if (opts._vars) { ctx.vars = { ...opts._vars, ...ctx.vars }; ctx.keptVars = { ...(opts._keptVars ?? {}), ...ctx.keptVars }; } // variables the line set before the shell that runs this file started
   // a name held in a variable (N=PIPELINE_ADMIN; env $N=1 claude)
-  if (Object.keys(ctx.vars).length && setsAdmin(substVars(flat, ctx.vars), ctx.platform)) return deny('the command sets PIPELINE_ADMIN through a variable; only the owner may set it, when launching Claude Code');
+  if (Object.keys(ctx.vars).length && setsAdmin(substVars(flat, ctx.vars, ctx.budget), ctx.platform)) return deny('the command sets PIPELINE_ADMIN through a variable; only the owner may set it, when launching Claude Code');
   const dirs = collectDirs(cmds, ctx);
+  // BASH_ENV / ENV / ZDOTDIR / HOME values this line (and the scripts that run it) assign: shells started by the scripts it runs see them
+  const startupEnv = opts.env ?? process.env;
+  const inheritedStartup = (n) => opts._startup?.[n] ?? [];
+  ctx.startup = startupVarsOf(cmds, { env: startupEnv, inherited: inheritedStartup });
 
   // 3 and 4: installers and `protect --apply`
   const installer = findInstaller(cmds, raw, dirs, ctx, opts);
@@ -1180,7 +1284,7 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
     for (const c of cmds) {
       const inner = jobInner(c);
       if (!inner) continue;
-      const r = evaluateBashForFiles(inner, { ...opts, _depth: (opts._depth ?? 0) + 1 });
+      const r = evaluateBashForFiles(inner, { ...opts, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup });
       if (r.decision === 'deny') return deny(`job start would run: ${r.reason}`);
     }
   }
@@ -1189,15 +1293,77 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
   const linked = linkReachesProtected(cmds, dirs, ctx);
   if (linked) return deny(`ln links to ${linked}, which is (or holds) protected pipeline files; a link would let later commands reach them under another name (${PROTECTED_MSG})`);
 
+  // The variables this line assigns (its commands' prefixes included) are in the environment of the shells it starts: the startup files and
+  // scripts they run are judged with them (a name like `. "$F"` in the file is then the file F names, not an unknown).
+  const withLineVars = (o) => ({ ...o, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) } });
+
+  // A startup file is judged once per evaluation. It is marked first: a startup file that starts shells itself would be judged again and
+  // again otherwise (a denial ends the whole evaluation, so marking before the verdict is safe).
+  const judgeStartupFile = (st) => {
+    // the real home's file is judged on its own, once per evaluation, from the directory the shell starts in: its verdict depends on neither the
+    // line's text nor its directories, only on the variables the line has set (seeded below; one whose value is unknown refuses a script it picks)
+    if (st.implicit) {
+      const unknown = Object.keys(ctx.vars).filter((k) => /[$`]/.test(ctx.vars[k])).sort();
+      const key = `${st.file}\u0000${JSON.stringify([ctx.vars, ctx.keptVars ?? {}, unknown, dirs])}`;
+      const memo = (ctx.budget.implicitStartup ??= new Map());
+      if (memo.has(key)) return memo.get(key);
+      memo.set(key, null);
+      const seed = { ...opts, _depth: 0, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set(unknown) };
+      let v = null;
+      const abs = expandRefs(st.file, ctx);
+      const text = isAbs(abs) ? ctx.readText(abs) : null;
+      if (typeof text === 'string') {
+        // the shell starts in the directory the command runs in (the cwd or any `cd` target): the file's relative names resolve there
+        countScript(ctx.budget);
+        for (const d of dirs) {
+          const r = evaluateBashForFiles(text, { ...seed, cwd: d });
+          if (r.decision === 'deny') { v = deny(`the script ${st.file} would run: ${r.reason}`); break; }
+        }
+      } else v = judgeScriptFile({ kind: 'shell', file: st.file }, dirs, ctx, seed, '');
+      memo.set(key, v);
+      return v;
+    }
+    // reused only for the same file, directories and nesting depth, never for a run-time name (its verdict depends on the line's text)
+    // (the shell sees the variables the line gave it, its own prefix included: `F=f.sh BASH_ENV=rc bash -c :` where rc sources "$F")
+    if (st.ambiguous) return judgeScriptFile(st, dirs, ctx, withLineVars(opts), scanRaw);
+    const key = `${dirs.join('\u0000')}\u0000${opts._depth ?? 0}\u0000${st.file}\u0000${JSON.stringify([ctx.vars, ctx.keptVars ?? {}])}`;
+    if (ctx.budget.startupOk.has(key)) return null;
+    ctx.budget.startupOk.add(key);
+    return judgeScriptFile(st, dirs, ctx, withLineVars(opts), scanRaw);
+  };
+
   // 7: a script file (bash f.sh, source f, ./f, node f.mjs) runs whatever is in it
   if ((opts._depth ?? 0) < 4) {
     for (const c of cmds) {
       const sf = scriptFileOf(c.argv, c.raw, raw);
-      if (!sf) continue;
-      const v = judgeScriptFile(sf, dirs, ctx, opts, scanRaw);
-      if (v) return v;
+      // a shell runs its startup files (BASH_ENV, ENV, ZDOTDIR/.zshenv ...) BEFORE the script it was given, so they are judged first, in the
+      // order the shell reads them: judged like `bash FILE`
+      for (const st of startupFilesOf(c, cmds, { env: startupEnv, inherited: inheritedStartup, exec: sf?.kind === 'exec' })) {
+        const v = judgeStartupFile(st);
+        if (v) return v;
+      }
+      if (sf) {
+        const v = judgeScriptFile(sf, dirs, ctx, withLineVars(opts), scanRaw);
+        if (v) return v;
+      }
+      // script text that reaches a shell without being named (`bash < f.sh`, `cat f.sh | bash`, `eval "$(cat f.sh)"`): its files are judged like `bash f.sh`
+      for (const fd of scriptFeedsOf(c, raw, (w) => expandRefs(w, ctx))) {
+        const v = judgeScriptFile(fd, dirs, ctx, withLineVars(opts), scanRaw);
+        if (v) return v;
+      }
     }
-  } else if (cmds.some((c) => scriptFileOf(c.argv))) return deny('scripts run scripts too deeply to check');
+  } else {
+    // at the depth limit nothing is followed any further: a named script, a fed file or a startup file the line names is refused; the
+    // implicit one (the real home's, which no word names) is judged here, once per evaluation like at the top level
+    for (const c of cmds) {
+      if (scriptFileOf(c.argv) || scriptFeedsOf(c).length) return deny('scripts run scripts too deeply to check');
+      for (const st of startupFilesOf(c, cmds, { env: startupEnv, inherited: inheritedStartup })) {
+        if (!st.implicit) return deny('scripts run scripts too deeply to check');
+        const v = judgeStartupFile(st);
+        if (v) return v;
+      }
+    }
+  }
 
   // 5: protected-path references must be read-only
   const m = makeMatchers(ctx);

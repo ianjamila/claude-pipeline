@@ -15,9 +15,9 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { commandName, simpleCommands, splitArgs, scriptFileOf } from './shell-parse.mjs';
+import { commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, startupFilesOf } from './shell-parse.mjs';
 import { catchAllReason, guardedCommandText } from './guarded-text.mjs';
-import { scriptCandidates, defaultReadDir, MAX_CANDIDATE_JUDGMENTS } from './script-candidates.mjs';
+import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
 
 const PROTECTED_BRANCHES = ['main', 'master'];
 const APPROVAL_LABELS = ['human-approved', 'test-change-approved'];
@@ -111,9 +111,18 @@ const flagValues = (flags, longNames, shortNames = '') => flags
 // ---- directories, variables, branch state ---------------------------------------------------------------------
 
 // $NAME / ${NAME} that an earlier command on the same line assigned; anything else is left as written.
-function expandVars(text, vars) {
-  return String(text).replace(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g, (m, a, b) => vars[a ?? b] ?? m);
+// A value is substituted as written (never expanded again), but a long value used in many words still multiplies, so the
+// text produced is capped per result and per evaluation (substitute throws GuardLimit, which evaluateGitCommand denies).
+function expandVars(text, ctx) {
+  return substitute(ctx.budget, String(text), /\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g, (m, a, b) => ctx.vars[a ?? b] ?? m);
 }
+
+// Everything a script judged here can depend on: the directory, the nesting level and the line's variable / branch / config / alias state.
+const stateFingerprint = (ctx, dir, level) => JSON.stringify([dir, level, ctx.vars, [...ctx.unsureVars], [...ctx.tainted], [...ctx.branches], ctx.cfgDirty, ctx.envCfgDirty, ctx.gitAliases, ctx.ghAliases, [...ctx.aliasUnsure]]);
+
+// What the policy's own tracking knows about variable `n` for a use the command's prefix does not override: its value, and
+// `$n` when it is unsure or tainted (the callers read that as "run-time value").
+const knownValues = (ctx, n) => [ctx.vars[n], unsureVar(ctx, n) ? `$${n}` : undefined];
 
 // A variable assigned more than once in what is judged (`B=main; false && B=agent/x`) is unknown from then on: which
 // assignment ran depends on control flow the parser does not model, so its value is left as `$B` (dynamic).
@@ -158,7 +167,7 @@ function unsureVarUsed(words, ctx) {
 // Resolves `target` against `dir`. Returns null when the result cannot be known statically ($VAR, $(..), `cd -`).
 function joinDir(dir, target, ctx) {
   if (typeof target !== 'string') return null;
-  let t = expandVars(target, ctx.vars);
+  let t = expandVars(target, ctx);
   if (DYNAMIC.test(t) || t === '-') return null;
   if (t === '~' || t.startsWith('~/')) t = ctx.home + t.slice(1);
   else if (t.startsWith('~')) return null;
@@ -235,7 +244,7 @@ function checkRefspec(spec, dir, gitDir, ctx) {
   const colon = spec.indexOf(':');
   const src = colon < 0 ? spec : spec.slice(0, colon);
   let dst = colon < 0 ? spec : spec.slice(colon + 1);
-  dst = expandVars(dst, ctx.vars); // `B=agent/x; git push origin HEAD:$B`
+  dst = expandVars(dst, ctx); // `B=agent/x; git push origin HEAD:$B`
   if (colon >= 0 && src === '' && dst === '') return deny('`git push <remote> :` pushes every matching branch, including main. Name your branch explicitly.');
   if (dst === '') dst = src; // `src:` is not a destination git accepts; judge it by the source name
   dst = stripHeads(dst);
@@ -261,7 +270,7 @@ function checkRefspec(spec, dir, gitDir, ctx) {
 
 function checkPush(args, dir, gitDir, ctx, configs) {
   const { flags, positionals: rawPositionals } = parseOpts(args, { longValue: PUSH_LONG_VALUE, shortValue: 'o', abbrev: true });
-  const positionals = rawPositionals.map((p) => expandVars(p, ctx.vars));
+  const positionals = rawPositionals.map((p) => expandVars(p, ctx));
   let repoGiven = false;
   for (const f of flags) {
     if (f.short) {
@@ -340,13 +349,13 @@ function trackSwitch(sub, args, d, ctx) {
   if (create) {
     const start = positionals[0];
     const noTrack = flags.some((f) => !f.short && f.name === 'no-track');
-    setBranch(ctx, d, expandVars(create.value, ctx.vars), !noTrack && start !== undefined && /^[^/]+\/(main|master)$/i.test(start));
+    setBranch(ctx, d, expandVars(create.value, ctx), !noTrack && start !== undefined && /^[^/]+\/(main|master)$/i.test(start));
     return;
   }
   if (flags.some((f) => (f.short ? f.name === 'd' : f.name === 'detach'))) { setBranch(ctx, d, null); return; }
   if (!isSwitch && args.includes('--')) return; // `checkout [<tree-ish>] -- <paths>` restores files only
   if (positionals.length === 0 || (!isSwitch && positionals.length > 1)) return; // paths, or nothing to switch to
-  const x = expandVars(positionals[0], ctx.vars);
+  const x = expandVars(positionals[0], ctx);
   if (x === '-' || /^@\{-\d*\}$/.test(x) || DYNAMIC.test(x)) { setBranch(ctx, d, null); return; }
   if (x === 'HEAD' || x === '@') return;
   if (!isSwitch && d !== null && ctx.pathExists(path.resolve(d, x))) return; // a file on disk: path checkout, or git refuses
@@ -357,9 +366,9 @@ function trackBranch(args, d, gitDir, ctx) {
   const { flags, positionals } = parseOpts(args, { longValue: ['set-upstream-to', 'contains', 'merged', 'no-merged', 'sort', 'format'], shortValue: 'u' });
   if (flags.some((f) => (f.short ? f.name === 'u' : ['set-upstream-to', 'unset-upstream', 'set-upstream'].includes(f.name)))) ctx.cfgDirty = true;
   if (flags.some((f) => (f.short ? 'mM'.includes(f.name) : f.name === 'move'))) {
-    if (positionals.length === 1) setBranch(ctx, d, expandVars(positionals[0], ctx.vars));
+    if (positionals.length === 1) setBranch(ctx, d, expandVars(positionals[0], ctx));
     else if (positionals.length >= 2) {
-      const [from, to] = positionals.map((p) => expandVars(p, ctx.vars));
+      const [from, to] = positionals.map((p) => expandVars(p, ctx));
       const { branch: cur } = effectiveBranch(d, gitDir, ctx);
       if (cur === from) setBranch(ctx, d, to);
     }
@@ -383,7 +392,7 @@ function trackGit(sub, args, g, ctx) {
   else if (sub === 'rebase') {
     // `git rebase <upstream> <branch>` checks <branch> out first
     const { positionals } = parseOpts(args, { longValue: ['onto', 'exec', 'strategy', 'strategy-option', 'whitespace'], shortValue: 'xsXC' });
-    if (positionals.length >= 2) setBranch(ctx, d, DYNAMIC.test(positionals[1]) ? null : expandVars(positionals[1], ctx.vars));
+    if (positionals.length >= 2) setBranch(ctx, d, DYNAMIC.test(positionals[1]) ? null : expandVars(positionals[1], ctx));
   } else if (sub === 'symbolic-ref') {
     const { positionals } = parseOpts(args, { shortValue: 'm' });
     if (positionals.length === 2 && positionals[0] === 'HEAD') setBranch(ctx, d, positionals[1]);
@@ -392,9 +401,9 @@ function trackGit(sub, args, g, ctx) {
     const target = joinDir(d, positionals[0], ctx);
     const named = flags.find((f) => f.short && 'bB'.includes(f.name));
     if (target === null) return;
-    if (named) setBranch(ctx, target, expandVars(named.value, ctx.vars));
+    if (named) setBranch(ctx, target, expandVars(named.value, ctx));
     else if (flags.some((f) => !f.short && f.name === 'detach')) setBranch(ctx, target, null);
-    else if (positionals[1] !== undefined) setBranch(ctx, target, DYNAMIC.test(positionals[1]) ? null : expandVars(positionals[1], ctx.vars));
+    else if (positionals[1] !== undefined) setBranch(ctx, target, DYNAMIC.test(positionals[1]) ? null : expandVars(positionals[1], ctx));
     else setBranch(ctx, target, path.basename(target));
   }
 }
@@ -485,6 +494,7 @@ function gatherBody(flags, dir, ctx) {
   const fields = [];
   const queries = [];
   const fromFile = (p) => {
+    if (dir !== null) countScript(ctx.budget); // a file read like any other (its size is up to 1 MB), so it is counted
     const t = dir === null ? null : ctx.readText(path.resolve(dir, p));
     if (typeof t === 'string') { text += `\n${t}`; return t; }
     unknown = true;
@@ -665,7 +675,7 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
   // value on the line is not proof — `X=merge; true || X=view; gh pr $X` runs merge.
   const written = splitGh(argv.slice(1));
   if ((written.group !== undefined && DYNAMIC.test(written.group)) || (written.verb !== undefined && DYNAMIC.test(written.verb))) return deny(RUN_TIME_SUBCOMMAND);
-  const args = argv.slice(1).map((a) => expandVars(a, ctx.vars));
+  const args = argv.slice(1).map((a) => expandVars(a, ctx));
   const { group, verb, rest } = splitGh(args);
   if (!group) return null;
 
@@ -749,8 +759,8 @@ const shellQuote = (w) => (/^[A-Za-z0-9_@%+=:,./-]+$/.test(w) ? w : `'${String(w
 // word that a shell would split), so both readings are judged and either one can deny.
 // Recognised when argv[0] is the pipeline entry or a JS runtime followed by it (variables expanded first), or
 // when the words contain `job start NAME --` anywhere (an unresolved `$P job start x -- …`).
-function jobStartCommands(argv, vars) {
-  const w = argv.map((a) => expandVars(a, vars));
+function jobStartCommands(argv, ctx) {
+  const w = argv.map((a) => expandVars(a, ctx));
   const first = baseName(w[0]);
   if (first === 'echo' || first === 'printf') return null;
   const isEntry = (x) => /^pipeline(\.mjs)?$/.test(baseName(x));
@@ -784,9 +794,10 @@ const isNodeModulesOrPipelineHome = (p) => /[\\/]node_modules[\\/]/.test(p) || /
 // unknown); one that does not exist runs nothing. Programs run by path and interpreter files are only scanned when
 // readable (a binary, a huge generated file or a package under node_modules is not ours to judge).
 function checkScriptFile(sf, dir, ctx, level) {
+  if (sf.joined) return checkJoinedScripts(sf, dir, ctx, level);
   if (sf.ambiguous) return checkCandidateScripts(sf, dir, ctx, level);
   // a candidate is a final path (a glob match, or a word already expanded): the shell never expands it a second time
-  const file = sf.candidate ? sf.file : expandVars(sf.file, ctx.vars);
+  const file = sf.candidate ? sf.file : expandVars(sf.file, ctx);
   if (!sf.candidate && /^\$\{?HOME\}?(?=\/|$)/.test(file)) return checkScriptFile({ ...sf, file: ctx.home + file.replace(/^\$\{?HOME\}?/, '') }, dir, ctx, level);
   if (!sf.candidate && DYNAMIC.test(file)) {
     // quoting is lost (`'x$y.sh'` reads as `x$y.sh`): if the word as written is a file, judge it before the textual rule
@@ -798,15 +809,25 @@ function checkScriptFile(sf, dir, ctx, level) {
   }
   const home = !sf.candidate && (file === '~' || file.startsWith('~/')) ? ctx.home + file.slice(1) : file;
   // a relative script after a cd that may not have run: which file runs is unknown, never the starting directory's
-  if (dir === null && !path.isAbsolute(home)) return deny(`cannot tell which directory this runs in, so which ${sf.file} runs cannot be verified. Use an absolute path, or chain the cd with &&.`);
+  // (a scan word is a guess at a file name, not a script: it is looked up in the starting directory instead)
+  if (dir === null && sf.kind !== 'scan' && !path.isAbsolute(home)) return deny(`cannot tell which directory this runs in, so which ${sf.file} runs cannot be verified. Use an absolute path, or chain the cd with &&.`);
   const abs = path.resolve(dir ?? ctx.cwd, home);
+  checkDeadline(ctx.budget);
   const text = ctx.readText(abs);
   if (typeof text !== 'string') {
     if (sf.candidate && ctx.readDir(abs)) return null; // a shell cannot run a directory
     if (sf.kind === 'shell' && ctx.pathExists(abs)) return deny(`cannot read the script ${sf.file} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified.`);
+    // over the read cap: a program run by path is peeked at (a shell script is refused, a binary or an interpreter file is not
+    // ours to judge); text a rewriting command computes from a file we cannot read cannot be scanned
+    if (sf.kind === 'exec' || sf.kind === 'scan') {
+      const head = ctx.readHead(abs);
+      if (typeof head === 'string' && (sf.kind === 'scan' || isShellHead(head))) return deny(`${sf.file} is too large to verify (over 1 MB), so what it runs (or feeds a shell) cannot be known.`);
+    }
     return null; // missing: nothing will run
   }
-  if (sf.candidate && --ctx.judgeBudget < 0) return deny('too many script files to judge (candidate scripts that run candidate scripts), so what they run cannot be verified. Name the script file.');
+  countScript(ctx.budget); // every script read and judged counts, named or candidate: the work multiplies with each level
+  // text a command rewrites on its way to a shell (sed, awk, base64 ...) is computed at run time: a file holding a guarded word is refused
+  if (sf.kind === 'scan') return GUARDED_WORDS.test(text) ? deny(`${sf.file} is read by a command that feeds a shell, and mentions a guarded operation, so what the shell runs cannot be verified. Write the command out literally.`) : null;
   let kind = sf.kind;
   if (kind === 'exec') {
     if (text.slice(0, 4096).includes('\u0000')) return null; // a binary
@@ -823,6 +844,124 @@ function checkScriptFile(sf, dir, ctx, level) {
   return v.decision === 'deny' ? deny(`the script ${sf.file} would run a blocked command: ${v.reason}`) : null;
 }
 
+// Several files that feed ONE shell (`cat a b | bash`): the shell reads their texts one after the other, so they are judged joined, in the
+// order the command names them, repeats included (a guarded command split across them is one command). `scan`: the text a rewriting command
+// prints from them (in an order we do not know): refused when a guarded word is in the joined text, read in either order.
+function checkJoinedScripts(sf, dir, ctx, level) {
+  const texts = [];
+  for (const w of sf.joined) {
+    const home = w === '~' || w.startsWith('~/') ? ctx.home + w.slice(1) : w;
+    if (dir === null && sf.kind !== 'scan' && !path.isAbsolute(home)) return deny(`cannot tell which directory this runs in, so which ${w} runs cannot be verified. Use an absolute path, or chain the cd with &&.`);
+    const abs = path.resolve(dir ?? ctx.cwd, home);
+    checkDeadline(ctx.budget);
+    const text = ctx.readText(abs);
+    if (typeof text !== 'string') {
+      if (sf.kind === 'shell' && ctx.pathExists(abs)) return deny(`cannot read the script ${w} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified.`);
+      if (sf.kind === 'scan') {
+        const head = ctx.readHead(abs);
+        if (typeof head === 'string') return deny(`${w} is too large to verify (over 1 MB), so what it runs (or feeds a shell) cannot be known.`);
+      }
+      continue; // missing: it prints nothing
+    }
+    countScript(ctx.budget);
+    texts.push(text);
+  }
+  if (!texts.length) return null;
+  if (sf.kind === 'scan') {
+    return GUARDED_WORDS.test(texts.join('')) || GUARDED_WORDS.test([...texts].reverse().join(''))
+      ? deny(`${sf.file} are read by a command that feeds a shell, and mention a guarded operation, so what the shell runs cannot be verified. Write the command out literally.`)
+      : null;
+  }
+  if (level >= MAX_NESTING) return deny(`the scripts ${sf.file} are nested too deeply (scripts running scripts) to verify.`);
+  const v = judgeScoped(texts.join(''), dir, ctx, level, sf);
+  return v.decision === 'deny' ? deny(`the scripts ${sf.file} would run a blocked command: ${v.reason}`) : null;
+}
+
+// The command's own prefix assignments (`F=f.sh bash run.sh`) are in the environment of the shell it starts: the startup files and the
+// script that shell runs see them. Seeded into ctx for the duration of `fn` and put back after (the line itself does not keep them).
+// A value that is only known at run time makes the variable unknown (refused where it picks a file).
+function withPrefixEnv(cmd, ctx, fn) {
+  const entries = Object.entries(cmd?.env ?? {});
+  if (!entries.length) return fn();
+  const values = entries.map(([k, w]) => [k, expandVars(w, ctx)]);
+  const saved = values.map(([k]) => [k, Object.hasOwn(ctx.vars, k), ctx.vars[k], ctx.unsureVars.has(k), ctx.tainted.has(k)]);
+  for (const [k, v] of values) {
+    ctx.tainted.delete(k);
+    if (DYNAMIC.test(v)) { delete ctx.vars[k]; ctx.unsureVars.add(k); } else { ctx.vars[k] = v; ctx.unsureVars.delete(k); }
+  }
+  try {
+    return fn();
+  } finally {
+    for (const [k, had, val, wasUnsure, wasTainted] of saved) {
+      if (had) ctx.vars[k] = val; else delete ctx.vars[k];
+      if (wasUnsure) ctx.unsureVars.add(k); else ctx.unsureVars.delete(k);
+      if (wasTainted) ctx.tainted.add(k); else ctx.tainted.delete(k);
+    }
+  }
+}
+
+// Judge `fn` on a copy of the line's state and put every field back afterwards, whatever `fn` changed (vars, taint, branches, config, aliases):
+// for a text that is only a FRAGMENT of what the shell reads, so a change it makes is not one the line can rely on or be blamed for.
+// (budget is shared on purpose, as in judgeScoped.)
+function isolatedState(ctx, fn) {
+  const saved = {
+    vars: Object.assign(Object.create(null), ctx.vars), unsureVars: new Set(ctx.unsureVars), tainted: new Set(ctx.tainted), aliasUnsure: new Set(ctx.aliasUnsure),
+    gitAliases: Object.assign(Object.create(null), ctx.gitAliases), ghAliases: Object.assign(Object.create(null), ctx.ghAliases),
+    branches: new Map([...ctx.branches].map(([d, e]) => [d, { ...e }])), cfgDirty: ctx.cfgDirty, envCfgDirty: ctx.envCfgDirty,
+  };
+  try {
+    return fn();
+  } finally {
+    for (const k of ['vars', 'gitAliases', 'ghAliases']) { for (const n of Object.keys(ctx[k])) delete ctx[k][n]; Object.assign(ctx[k], saved[k]); }
+    for (const k of ['unsureVars', 'tainted', 'aliasUnsure']) { ctx[k].clear(); for (const n of saved[k]) ctx[k].add(n); }
+    ctx.branches.clear();
+    for (const [d, e] of saved.branches) ctx.branches.set(d, e);
+    ctx.cfgDirty = saved.cfgDirty;
+    ctx.envCfgDirty = saved.envCfgDirty;
+  }
+}
+
+// Why: the real home's startup files (~/.bash_profile, ~/.zshenv ...) are not named by any word of the line, and what they run does not
+// depend on it. They are judged as an evaluation of their own (the line's variable state, but the guarded words of the FILE's text,
+// not of the line, decide whether a run-time name in it is refused) and the verdict is kept for the whole evaluation, so a line with
+// many shells reads each file once. An explicit one (BASH_ENV=, ZDOTDIR=, HOME=, --rcfile) is judged in the line's context instead.
+// The variables the line has set before that shell starts (and its own prefix, `NVM_DIR=d bash -l`) are inherited: a file that sources
+// "$NVM_DIR/nvm.sh" runs d/nvm.sh, and a value that is unknown makes that name unknown (refused). The memo is keyed on that state.
+function implicitStartupVerdict(st, ctx, cmd, dir) {
+  const vars = Object.assign(Object.create(null), ctx.vars);
+  const unsure = new Set(ctx.unsureVars);
+  for (const [k, v] of Object.entries({ ...ctx.vars, ...Object.fromEntries(Object.entries(cmd?.env ?? {}).map(([k, w]) => [k, expandVars(w, ctx)])) })) {
+    if (DYNAMIC.test(v)) { delete vars[k]; unsure.add(k); } else { vars[k] = v; unsure.delete(k); }
+  }
+  const rec = { kind: 'shell', file: st.file };
+  const fresh = {
+    ...ctx, fullText: '', vars, unsureVars: unsure, tainted: new Set(ctx.tainted), aliasUnsure: new Set(ctx.aliasUnsure),
+    gitAliases: { ...ctx.gitAliases }, ghAliases: { ...ctx.ghAliases }, branches: new Map(ctx.branches),
+  };
+  // the shell starts where the command runs (`cd sub && NVM_DIR=d bash -l`); an unknown directory (null) makes a relative name in the file unknowable
+  const key = `${st.file}\u0000${stateFingerprint(fresh, dir, 0)}`;
+  const memo = (ctx.budget.implicitStartup ??= new Map());
+  // The file runs in the same repository as the line: a branch it switches, config it changes and aliases it defines are real, so what the
+  // judgement changed in its copy is carried back into the line's state (the memo keeps it with the verdict: same state in, same state out).
+  const carry = (r) => {
+    for (const [d, e] of r.branches) if (ctx.branches.get(d) !== e) ctx.branches.set(d, e);
+    if (r.cfgDirty) ctx.cfgDirty = true;
+    Object.assign(ctx.gitAliases, r.git);
+    Object.assign(ctx.ghAliases, r.gh);
+    for (const n of r.unsure) ctx.aliasUnsure.add(n);
+    return r.verdict;
+  };
+  if (memo.has(key)) return carry(memo.get(key));
+  const pending = { verdict: null, branches: new Map(), cfgDirty: false, git: {}, gh: {}, unsure: [] };
+  memo.set(key, pending); // marked first: a startup file that starts shells itself finds this entry, not itself again
+  const text = ctx.readText(path.resolve(ctx.home, st.file.replace(/^~\/?/, '')));
+  fresh.fullText = typeof text === 'string' ? text : '';
+  const v = checkScriptFile(rec, dir, fresh, 0);
+  const done = { verdict: v, branches: new Map(fresh.branches), cfgDirty: fresh.cfgDirty, git: { ...fresh.gitAliases }, gh: { ...fresh.ghAliases }, unsure: [...fresh.aliasUnsure] };
+  memo.set(key, done);
+  return carry(done);
+}
+
 // Variables set inside a script do not leave a child shell (`bash f.sh`, `./f`): the line's own values stay. `source` does
 // change the caller's variables, which is believed for a named file; a candidate that may or may not be the sourced file
 // puts the line's old values back and marks the variables it set as uncertain (a later use is also unknown at run time).
@@ -833,7 +972,7 @@ function checkScriptFile(sf, dir, ctx, level) {
 //   cfgDirty, envCfgDirty         repository/global config: only ever set, never restored (a candidate that may not run
 //                                 still leaves them dirty); envCfgDirty is recomputed from vars AND tainted names
 //   gitAliases, ghAliases         config on disk: kept; one a speculative candidate (re)defines is also unsure (aliasUnsure)
-//   cwd, home, fullText, readers  constants of the evaluation; judgeBudget is shared on purpose (never restored)
+//   cwd, home, fullText, readers  constants of the evaluation; budget (script reads, deadline, expansion) is shared on purpose (never restored)
 // (a `cd` inside a sourced file is not followed: evalString's directory is local to each call)
 function judgeScoped(text, dir, ctx, level, sf) {
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
@@ -883,7 +1022,7 @@ function judgeScoped(text, dir, ctx, level, sf) {
 function checkCandidateScripts(sf, dir, ctx, level) {
   const here = path.resolve(dir ?? ctx.cwd);
   const expand = (w) => {
-    let e = expandVars(w, ctx.vars).replace(/^\$\{?HOME\}?(?=\/|$)/, ctx.home);
+    let e = expandVars(w, ctx).replace(/^\$\{?HOME\}?(?=\/|$)/, ctx.home);
     if (e === '~' || e.startsWith('~/')) e = ctx.home + e.slice(1);
     return e;
   };
@@ -894,7 +1033,13 @@ function checkCandidateScripts(sf, dir, ctx, level) {
     }
   }
   // after a cd that may not have run, a relative word (or a glob over one) names a file in an unknown directory
-  if (dir === null && sf.words.some((w) => !path.isAbsolute(expand(w)))) return deny('cannot tell which directory this runs in, so which script it runs cannot be verified. Use an absolute path, or chain the cd with &&.');
+  if (dir === null && sf.kind !== 'scan' && sf.words.some((w) => !path.isAbsolute(expand(w)))) return deny('cannot tell which directory this runs in, so which script it runs cannot be verified. Use an absolute path, or chain the cd with &&.');
+  const line = execLineOf(sf, expand);
+  if (line !== null) {
+    if (level >= MAX_NESTING) return deny('the command line held in a variable is nested too deeply to verify.');
+    const v = judgeScoped(line, dir, ctx, level, { kind: 'shell' });
+    if (v.decision === 'deny') return deny(`the command line ${sf.words[0]} expands to would run a blocked command: ${v.reason}`);
+  }
   const c = scriptCandidates(sf, { expand, dirs: [here], joinPath: (d, r) => path.resolve(d, r), readDir: ctx.readDir, ifs: ctx.vars.IFS });
   if (c.over) return deny('too many words, a glob matching too many files, or glob syntax that cannot be resolved could be the script this command runs, so it cannot be verified. Name the script file.');
   if (c.dynamic && GUARDED_WORDS.test(ctx.fullText)) {
@@ -1031,8 +1176,9 @@ function unsureVarReachingCommand(cmds, ctx) {
 }
 
 function evalString(str, startDir, ctx, level) {
+  checkDeadline(ctx.budget);
   if (level > MAX_NESTING) return deny('pipeline job start / alias is nested too deeply to verify.');
-  const cmds = simpleCommands(str);
+  const cmds = simpleCommands(str, { expired: () => ctx.budget.now() > ctx.budget.deadline }); // a scan that outlasts the deadline gives up: truncated, so denied
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (`g''it push` after
   // 500 `true;` must not slip through on a word match).
   if (cmds.truncated) return deny('command too complex to verify (the parser gave up). Split it into simpler commands.');
@@ -1053,6 +1199,7 @@ function evalString(str, startDir, ctx, level) {
   // sticky: a later `cd /abs` does not make it known again (`alias cd=true; cd /safe`, a DEBUG trap that cds back)
   const hazard = FUNCTION_DEF.test(str) || cmds.some(isStateHazard);
   for (const [i, c] of cmds.entries()) {
+    checkDeadline(ctx.budget); // a lookup (branch, labels) can take seconds; the evaluation as a whole may not
     const argv = c.argv;
     if (hazard) forgetState();
     // Only commands chained with && after it are certain to see the change (`cd d && git push`); anything else may run
@@ -1083,7 +1230,7 @@ function evalString(str, startDir, ctx, level) {
       else verdict = name === 'git' ? checkGit(argv, c.env, dir, ctx, c.raw ?? '') : checkGh(argv, c.env, dir, ctx, c.raw ?? '');
     }
     else {
-      for (const inner of jobStartCommands(argv, ctx.vars) ?? []) {
+      for (const inner of jobStartCommands(argv, ctx) ?? []) {
         const v = evalString(inner, dir, ctx, level + 1);
         if (v.decision === 'deny') { verdict = v; break; }
       }
@@ -1093,9 +1240,42 @@ function evalString(str, startDir, ctx, level) {
         if (why) verdict = deny(`${name} was given a string that contains a guarded command (${why}). Run the operation directly so it can be checked.`);
       }
       const sf = verdict ? null : scriptFileOf(argv, c.raw, str);
-      if (sf) {
-        if (name === 'source' || name === '.') sf.sourced = true;
-        verdict = checkScriptFile(sf, dir, ctx, level);
+      if (sf && (name === 'source' || name === '.')) sf.sourced = true;
+      // a shell runs its startup files (BASH_ENV, ENV, ZDOTDIR/.zshenv ...) BEFORE the script it was given, so they are judged first, in the
+      // order the shell reads them, and what they change (a branch switch) is what the script and the feeds are then judged against
+      if (!verdict) for (const st of startupFilesOf(c, cmds, { env: ctx.env, inherited: (n) => knownValues(ctx, n), exec: sf?.kind === 'exec' })) {
+        // the real home's file (no word on the line names it) is judged on its own, once: see implicitStartupVerdict
+        if (st.implicit) {
+          verdict = implicitStartupVerdict(st, ctx, c, dir);
+          if (verdict) break;
+          continue;
+        }
+        // the shell sees the command's own prefix variables (`F=f.sh BASH_ENV=rc bash -c :` where rc sources "$F")
+        verdict = withPrefixEnv(c, ctx, () => {
+          // a clean verdict is reused only in the very same state (it depends on the variables, branches and config the line has set so far), never for a run-time name
+          const key = st.ambiguous ? null : `${st.file}\u0000${stateFingerprint(ctx, dir, level)}`;
+          if (key !== null) {
+            if (ctx.budget.startupOk.has(key)) return null;
+            ctx.budget.startupOk.add(key); // marked first, so a startup file that starts shells itself is not judged again and again (a denial ends the evaluation)
+          }
+          return checkScriptFile(st, dir, ctx, level);
+        });
+        if (verdict) break;
+      }
+      if (!verdict && sf) verdict = withPrefixEnv(c, ctx, () => checkScriptFile(sf, dir, ctx, level));
+      // script text that reaches a shell without being named (`bash < f.sh`, `cat f.sh | bash`, `eval "$(cat f.sh)"`): its files are judged like `bash f.sh`
+      // Several files feeding one program (review R2-B2): the JOINED record is the program the shell really reads, so it is judged first, from the
+      // state the line is in, and its changes carry on; each fragment is then judged on an isolated copy (a fragment's branch switch is commented
+      // out or cut in two by its neighbours in the real text, so it must not change what the other fragments are judged against)
+      if (!verdict) {
+        const feeds = scriptFeedsOf(c, str, (w) => expandVars(w, ctx));
+        const joined = feeds.some((fd) => fd.joined);
+        const ordered = joined ? [...feeds.filter((fd) => fd.joined), ...feeds.filter((fd) => !fd.joined)] : feeds;
+        for (const fd of ordered) {
+          const judge = () => withPrefixEnv(c, ctx, () => checkScriptFile(fd, dir, ctx, level));
+          verdict = joined && !fd.joined ? isolatedState(ctx, judge) : judge();
+          if (verdict) break;
+        }
       }
     }
     if (verdict && verdict.decision === 'deny') return verdict;
@@ -1123,16 +1303,26 @@ export function evaluateGitCommand(command, {
   pushDestination = () => null,
   issueLabels = () => { throw new Error('no issue label lookup is available'); },
   readText = defaultReadText,
+  readHead = defaultReadHead,
   pathExists = existsSync,
   readDir = defaultReadDir,
+  now = Date.now, // injectable clock (tests)
+  env = {}, // the hook process's environment (BASH_ENV / ENV / ZDOTDIR name startup files the shells run); {} keeps tests hermetic
 } = {}) {
   const text = typeof command === 'string' ? command : String(command ?? '');
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   const base = cwd || process.cwd();
   const ctx = {
-    cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, readDir, judgeBudget: MAX_CANDIDATE_JUDGMENTS, fullText: text,
+    cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, readDir, readHead, env, budget: newEvalBudget(now), fullText: text,
     vars: Object.create(null), unsureVars: new Set(), tainted: new Set(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
     branches: new Map(), cfgDirty: false, envCfgDirty: false,
   };
-  return evalString(text, path.resolve(base), ctx, 0);
+  // Why: a hook that throws or times out is allowed by Claude Code, so a limit hit (GuardLimit) and ANY other exception (a
+  // readText that throws, a stack overflow) end here as a denial that names the cause.
+  try {
+    return evalString(text, path.resolve(base), ctx, 0);
+  } catch (err) {
+    if (err instanceof GuardLimit) return deny(err.message);
+    return deny(`internal error while checking this command (${err instanceof Error ? err.message : String(err)}), so it cannot be verified.`);
+  }
 }

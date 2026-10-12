@@ -5,13 +5,68 @@
 // for a glob, the existing files it matches. Each policy then judges the files like any other script.
 // Pure apart from the injected `readDir` (fs.readdirSync-like: names; null when the shell would match nothing there
 // either; any other answer means the directory could not be listed and is refused).
-import { readdirSync } from 'node:fs';
+import { readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { SCRIPT_EXT } from './shell-parse.mjs';
 
 export const MAX_CANDIDATES = 32; // more words than this are refused, not judged
-// Candidate scripts judged across one whole evaluation (each may be ambiguous itself, so the work multiplies with every
-// nesting level; a hook that runs out of time is allowed through, so the guard must give up first and deny).
-export const MAX_CANDIDATE_JUDGMENTS = 64;
+// Every limit below exists because a hook that runs out of time (15 s, see HOOK_TIMEOUT_S in lib/installer.mjs) is
+// ALLOWED by Claude Code, so the guard must give up first and deny.
+// Script files read and judged across one whole evaluation: named, candidate and interpreter files alike. A script
+// that runs 500 scripts that each run 500 more makes 500^depth judgments, so the work is counted, not just the depth.
+// 128: a real chain (verify -> lint, tests, build ...) reads a few dozen scripts at most, and 128 reads of the largest
+// judged file (200,000 characters) still finish in a fraction of the deadline below.
+export const MAX_SCRIPT_JUDGMENTS = 128;
+// Wall-clock limit for one evaluation, measured from the top-level call (nested calls share it): a third of the hook timeout.
+export const EVAL_DEADLINE_MS = 5000;
+// Variable expansion: one call may add at most one command line of text (the same 200,000 as MAX_LINE_CHARS), and the text
+// ADDED by expansion across one evaluation is bounded too (`A=<60k chars> ...` used by thousands of words).
+export const MAX_EXPANDED_CHARS = 200_000;
+export const MAX_EXPANDED_TOTAL = 1_000_000;
+
+// The command line a program-by-variable word expands to (`T="npx vitest run x"; $T` -> `npx vitest run x`), or null when the word is not one
+// or the value is a single word. The shell runs that line, so the policies judge it as text one level deeper.
+const PLAIN_LINE = /^[A-Za-z0-9_ \t.\/:=@%+,-]*$/;
+export function execLineOf(sf, expand) {
+  if (sf.kind !== 'exec' || sf.words?.length !== 1 || !sf.words[0].includes('$')) return null;
+  const e = expand(sf.words[0]);
+  return e !== sf.words[0] && /\s/.test(e.trim()) && !/\$\(|`/.test(e) ? e : null; // (a value holding a command substitution is unknown: candidates cover it)
+}
+
+// Thrown when a limit above is hit; each policy's entry point turns it into a denial carrying the message.
+export class GuardLimit extends Error {}
+
+// One per top-level evaluation, shared through every nested call. `now` is injectable so tests do not depend on timing.
+export function newEvalBudget(now = Date.now) {
+  // startupOk: startup files already judged in a given state (see the policies), so a line with many shells reads ~/.zshenv once, not once each
+  return { now, deadline: now() + EVAL_DEADLINE_MS, scripts: MAX_SCRIPT_JUDGMENTS, grown: 0, startupOk: new Set() };
+}
+
+export function checkDeadline(budget) {
+  if (budget.now() > budget.deadline) throw new GuardLimit('the check took too long (a script chain or a command line too large to verify in time), so it cannot be verified. Split it into simpler commands or name the script file.');
+}
+
+// A script file is about to be judged: one unit of the shared budget.
+export function countScript(budget) {
+  checkDeadline(budget);
+  if (--budget.scripts < 0) throw new GuardLimit('too many script files to check (scripts that run scripts that run scripts ...), so what they run cannot be verified. Name the script file.');
+}
+
+// `text.replace(re, ...)` where `lookup(match, ...groups)` gives the replacement (or the match itself when nothing is known),
+// counted as it grows: the text ADDED by one call may not exceed MAX_EXPANDED_CHARS, nor the text added across the evaluation
+// MAX_EXPANDED_TOTAL. Growth is counted, never the length of `text` itself: a program file judged as text can be 1 MB. It throws before the oversized string exists (`A=<100k chars>; ... $A$A$A` x 50k refs is gigabytes).
+export function substitute(budget, text, re, lookup) {
+  let added = 0;
+  return text.replace(re, (m, ...groups) => {
+    const v = lookup(m, ...groups);
+    if (v === m) return m;
+    if (v.length > m.length) { added += v.length - m.length; budget.grown += v.length - m.length; }
+    if (added > MAX_EXPANDED_CHARS || budget.grown > MAX_EXPANDED_TOTAL) {
+      throw new GuardLimit('variables expand to more text than can be checked, so the command cannot be verified. Write the values out or split the command.');
+    }
+    return v;
+  });
+}
+
 const MAX_GLOB_WORK = 5000; // directory entries looked at across one command
 const MAX_GLOB_STEPS = 200_000; // matcher steps across one command (a name against a segment backtracks)
 const MAX_SEGMENT = 256; // a longer glob segment is refused
@@ -26,6 +81,33 @@ const EXTENDED_GLOB = /[\^#]|[^=]~(?!\d|$)/;
 export const defaultReadDir = (dir) => {
   try { return readdirSync(dir); } catch (e) { return ['ENOENT', 'ENOTDIR', 'EACCES'].includes(e?.code) ? null : false; }
 };
+
+// The first bytes of a file the policies refused to read whole (over the 1 MB cap), enough to see a NUL or a shebang. null
+// when it is not a readable regular file.
+export const HEAD_BYTES = 4096;
+export function defaultReadHead(file) {
+  let fd = null;
+  try {
+    if (!statSync(file).isFile()) return null;
+    fd = openSync(file, 'r');
+    const buf = Buffer.alloc(HEAD_BYTES);
+    return buf.toString('utf8', 0, readSync(fd, buf, 0, HEAD_BYTES, 0));
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) try { closeSync(fd); } catch { /* nothing to close */ }
+  }
+}
+
+// Would the kernel / a shell run a program with this head as a shell script? A binary (NUL) no; an interpreter shebang
+// (node, python ...) no, that text is another language; a shell shebang, any other shebang, or none at all (run as sh) yes.
+const HEAD_SHEBANG = /^#!\s*(?:\S*\/)?(?:env\s+(?:-\S+\s+)*)?(\S+)/;
+const HEAD_INTERPRETER = /^(?:node|nodejs|deno|bun|tsx|ts-node|python[\d.]*|ruby|perl|php)$/;
+export function isShellHead(head) {
+  if (head.includes('\u0000')) return false;
+  const prog = HEAD_SHEBANG.exec(head)?.[1] ?? '';
+  return !HEAD_INTERPRETER.test(prog.split('/').pop());
+}
 
 // Does `name` match one glob segment (`*`, `?`, `[a-z]`, `[!x]`)? Dotfiles are included whatever the shell's dotglob /
 // GLOB_DOTS settings: a candidate too many only costs a judgment. Every reading below can only match MORE names.
@@ -133,7 +215,14 @@ function buildCandidates(sf, { expand, dirs, joinPath, readDir, ifs }) {
   const add = (c) => { if (!sf.needExt || SCRIPT_EXT.test(c)) files.add(c); };
   for (const w of sf.words) {
     const e = expand(w);
-    const readings = e !== w && w.includes('$') ? [e, ...e.split(splitter)] : [e];
+    let readings = e !== w && w.includes('$') ? [e, ...e.split(splitter)] : [e];
+    // a program named by a variable (`T="npx vitest run x.test.tsx"; $T`) runs its first word; the rest are its arguments. The policies evaluate the
+    // value as the command line it is (see execLineOf), which judges whatever files that line runs
+    if (sf.kind === 'exec' && sf.words?.length === 1 && e !== w && w.includes('$')) {
+      const parts = e.split(splitter).filter((p) => p !== '');
+      // (only for a plain value: with quotes, `#`, `;` ... the shell splits it differently from how it is lexed, so every part stays a candidate)
+      if (parts.length > 1 && PLAIN_LINE.test(e) && typeof ifs !== 'string') readings = [e, parts[0]]; // (a custom IFS splits the value elsewhere: every part stays)
+    }
     // quoting is lost (`'x$y.sh'` reads as `x$y.sh`): the word as written may be the file's real name, whatever the variable holds
     if (e !== w && w !== '') {
       add(w);

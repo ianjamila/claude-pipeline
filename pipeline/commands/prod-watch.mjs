@@ -7,6 +7,8 @@ import { EXIT, UsageError, intOption, parseCommandArgs } from '../lib/cli.mjs';
 import { guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { findDeployment } from '../lib/deploy.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
+import { headSha } from '../lib/git.mjs';
+import { notifyEvent, prodErrorEvent, prodEvent } from '../lib/notify.mjs';
 import { withLock } from '../lib/locks.mjs';
 import { GhError, gh as ghRun } from '../lib/proc.mjs';
 import { createGitOps, createSmoke, exitCodeFor, resolveMergeSha, runProdWatch } from '../lib/prodwatch.mjs';
@@ -14,7 +16,7 @@ import { inspectAlias, linkedProjectDir, rollback } from '../lib/vercel.mjs';
 
 export const meta = {
   summary: 'verify the production deployment of a merge; roll back safely, open an issue and a revert PR if it fails',
-  usage: 'pipeline prod-watch (--sha MERGE_SHA [--pr N] | --pr N) [--expect-text T] [--retry-wait SEC=60] [--repo DIR]   -> {ok, outcome: merged|deploy-failed|deploy-not-observed|not-live|superseded|recovered|rollback-failed|changed-during-recovery|rollback-skipped|no-production, ...}\n  with only --pr N (merge printed mergeSha:null) the merge commit is read from the merged PR (up to 6 looks); exit 1 {error:not-merged} when the PR is not MERGED, exit 3 {error:merge-sha-unresolved} when GitHub never names it',
+  usage: 'pipeline prod-watch (--sha MERGE_SHA [--pr N] | --pr N) [--expect-text T] [--retry-wait SEC=60] [--repo DIR]   -> {ok, outcome: merged|deploy-failed|deploy-not-observed|not-live|superseded|recovered|rollback-failed|changed-during-recovery|rollback-skipped|no-production, ..., notify}\n  with only --pr N (merge printed mergeSha:null) the merge commit is read from the merged PR (up to 6 looks); exit 1 {error:not-merged} when the PR is not MERGED, exit 3 {error:merge-sha-unresolved} when GitHub never names it',
 };
 
 const LOCK_WAIT_MS = 10 * 60_000;
@@ -51,7 +53,7 @@ export const run = guarded(async (argv, ctx) => {
 
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
-  if (!config.production) return { exitCode: EXIT.OK, output: { ok: true, outcome: 'no-production', mergeSha: sha } };
+  if (!config.production) return { exitCode: EXIT.OK, output: { ok: true, outcome: 'no-production', mergeSha: sha, notify: { sent: false, reason: 'no-event' } } };
 
   const env = ctx.env;
   const gh = createGitHub({ cwd: root, env });
@@ -72,25 +74,54 @@ export const run = guarded(async (argv, ctx) => {
     git: createGitOps({ root }),
     lock: (name, fn) => withLock(name, fn, { waitMs: LOCK_WAIT_MS }),
     note: (msg) => process.stderr.write(`prod-watch: ${msg}\n`),
+    ...(ctx.prodWatchDeps ?? {}), // test seam: e.g. a findDeployment that fails without the real 15 s polls
   };
 
-  return guardGh(async () => {
-    if (sha === null) {
-      // `merge` printed mergeSha:null: the PR is MERGED but GitHub had not named the merge commit yet. Look again here.
-      const found = await resolveMergeSha({ prView: (fields) => gh.prView(pr, fields), pauseMs: Math.min(retryWait * 1000, 5000) });
-      if (found.state !== 'merged') {
-        const unresolved = found.state === 'unresolved';
-        return {
-          exitCode: unresolved ? EXIT.UNAVAILABLE : EXIT.FAILED,
-          output: {
-            ok: false, error: unresolved ? 'merge-sha-unresolved' : 'not-merged', pr,
-            reason: unresolved ? `PR #${pr} is MERGED but GitHub did not name its merge commit: find the SHA by hand and pass --sha` : `PR #${pr} is ${found.prState}, not MERGED`,
-          },
-        };
+  // The owner's push for the production result. It runs after runProdWatch has returned (its production lock is released)
+  // and never changes the exit code, the output (beyond `notify`) or a thrown error.
+  const push = (event) => notifyEvent(event, { cwd: root, env, ...(ctx.notifyDeps ?? {}) });
+  const localHead = () => {
+    try { return headSha({ cwd: root }); } catch { return undefined; }
+  };
+
+  let result;
+  let failure = null;
+  try {
+    result = await guardGh(async () => {
+      if (sha === null) {
+        // `merge` printed mergeSha:null: the PR is MERGED but GitHub had not named the merge commit yet. Look again here.
+        const found = await resolveMergeSha({ prView: (fields) => gh.prView(pr, fields), pauseMs: Math.min(retryWait * 1000, 5000) });
+        if (found.state !== 'merged') {
+          const unresolved = found.state === 'unresolved';
+          return {
+            exitCode: unresolved ? EXIT.UNAVAILABLE : EXIT.FAILED,
+            output: {
+              ok: false, error: unresolved ? 'merge-sha-unresolved' : 'not-merged', pr,
+              reason: unresolved ? `PR #${pr} is MERGED but GitHub did not name its merge commit: find the SHA by hand and pass --sha` : `PR #${pr} is ${found.prState}, not MERGED`,
+            },
+          };
+        }
+        sha = found.sha;
       }
-      sha = found.sha;
-    }
-    const output = await runProdWatch({ config, sha, pr, expectText, root, retryWaitMs: retryWait * 1000 }, deps);
-    return { exitCode: exitCodeFor(output.outcome), output };
-  });
+      const output = await runProdWatch({ config, sha, pr, expectText, root, retryWaitMs: retryWait * 1000 }, deps);
+      return { exitCode: exitCodeFor(output.outcome), output };
+    });
+  } catch (err) {
+    failure = err;
+  }
+
+  let notify = { sent: false, reason: 'no-event' };
+  if (failure) {
+    // A deploy/API error escaped runProdWatch: no outcome exists, so say the check could not finish.
+    notify = await push(prodErrorEvent({ error: 'deploy-check-failed', reason: failure.message, pr, head: sha ?? localHead() }));
+    throw failure;
+  }
+  const out = result.output;
+  if (typeof out.outcome === 'string') {
+    const event = prodEvent(out, { pr });
+    if (event) notify = await push(event);
+  } else if (typeof out.error === 'string') {
+    notify = await push(prodErrorEvent({ error: out.error, reason: out.reason, pr, head: sha ?? localHead() }));
+  }
+  return { ...result, output: { ...out, notify } };
 });
