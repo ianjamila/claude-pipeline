@@ -97,6 +97,25 @@ test('shape validation: pr, step, outcome, lists', () => {
   }
 });
 
+test('shape validation: a bad task or history entry makes the record invalid, never a throw downstream', () => {
+  const ok = { id: 'T1', title: 't', spec: 's', done: false };
+  for (const bad of [
+    { tasks: [null] }, { tasks: ['x'] }, { tasks: [[]] }, { tasks: [{ title: 'no id' }] }, { tasks: [{ ...ok, id: 7 }] },
+    { tasks: [{ ...ok, id: 'x'.repeat(65) }] }, { tasks: [{ ...ok, id: '' }] }, { tasks: [{ ...ok, done: 'yes' }] },
+    { tasks: [ok, null] }, { history: ['x'] }, { history: [null] }, { history: [[]] },
+  ]) {
+    const rec = { ...emptyRecord(ID), ...bad };
+    const decoded = decodeRecord(`${MARKERS.summary}\n${rawMarker(rec)}`);
+    assert.equal(decoded.status, 'invalid', JSON.stringify(bad));
+    assert.equal(decoded.record, undefined);
+  }
+  // good ones: `done` may be absent, ids may be exactly 64 characters
+  const good = { ...emptyRecord(ID), tasks: [{ id: 'x'.repeat(64), title: 't', spec: 's' }, ok], history: [{ step: 'build', head: null, host: 'h', at: 'now' }] };
+  assert.equal(decodeRecord(`${MARKERS.summary}\n${rawMarker(good)}`).status, 'ok');
+  // a task id the codec would later refuse is refused up front
+  assert.throws(() => applyCheckpoint(emptyRecord(ID), { tasks: [{ id: 'x'.repeat(65), title: 't' }] }, CTX), /task id/);
+});
+
 test('bindRecord: names every mismatch, ignores head and an unspecified live value', () => {
   const rec = { ...emptyRecord(ID), head: 'old' };
   assert.deepEqual(bindRecord(rec, { repo: 'acme/widgets', pr: 7, branch: 'feat/x' }), []);

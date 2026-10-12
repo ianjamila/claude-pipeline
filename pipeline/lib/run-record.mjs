@@ -63,6 +63,7 @@ const MAX_DECODED_BYTES = 1024 * 1024;
 
 export const LIMITS = Object.freeze({ request: 2048, spec: 1024, title: 200, text: 500, history: 20, tasks: 50 });
 
+const MAX_TASK_ID = 64;
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const isStr = (v) => typeof v === 'string';
 
@@ -108,6 +109,9 @@ function shapeProblem(r) {
   if (!STEPS.includes(r.step)) return 'unknown step';
   if (r.outcome !== null && !OUTCOMES.includes(r.outcome)) return 'unknown outcome';
   if (!Array.isArray(r.tasks) || !Array.isArray(r.history)) return 'tasks/history are not lists';
+  // Every reader (status block, checkpoint, resume plan) indexes these entries: one bad entry would throw in all of them.
+  if (!r.tasks.every((t) => isPlainObject(t) && isStr(t.id) && t.id !== '' && t.id.length <= MAX_TASK_ID && (t.done === undefined || typeof t.done === 'boolean'))) return 'bad task';
+  if (!r.history.every(isPlainObject)) return 'bad history entry';
   if (r.inFlight != null && !isPlainObject(r.inFlight)) return 'bad inFlight';
   if (r.heartbeat != null && !isPlainObject(r.heartbeat)) return 'bad heartbeat';
   return null;
@@ -145,6 +149,7 @@ const text = (v, max) => clip(String(v ?? '').trim(), max);
 
 function normaliseTask(t, previous) {
   if (!isPlainObject(t) || t.id === undefined || t.id === null || String(t.id) === '') throw new Error('a task needs an id');
+  if (String(t.id).length > MAX_TASK_ID) throw new Error(`task id ${JSON.stringify(String(t.id).slice(0, 20))}… is longer than ${MAX_TASK_ID} characters`);
   return {
     id: String(t.id),
     title: text(t.title ?? previous?.title, LIMITS.title),
