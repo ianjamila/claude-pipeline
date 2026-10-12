@@ -153,14 +153,16 @@ Classification precedence:
 2. `running` — heartbeat < 90 min or live inFlight ⇒ leave.
 3. `owner-decision` — `needs-human` (reason from our needs-human comment; in `owner_approval: chat` repos a
    hard-stop-only reason ⇒ "label-mode leftover: remove the label, then ship resume N").
-4. `failing-check` — CI `failed`, `conflicts`, `pipeline-blocked`, or record verify failed for this head.
-5. `review` — `awaiting-review`; content hash ≠ last reviewed; outcome not clean; follow-ups pending; or untracked
+4. `abandoned` — untracked (no record, no triage) AND lastActivity older than stale-days ⇒ close ("no pipeline
+   history, last activity <date>"). It sits right after `owner-decision` on purpose: nothing drives such a PR, so a red
+   check, a conflict or a draft is context for the close decision, not a reason to resume it (appended to the reason as
+   "; also …"). Only untracked + stale PRs reach this rung; a tracked PR never does.
+5. `failing-check` — CI `failed`, `conflicts`, `pipeline-blocked`, or record verify failed for this head.
+6. `review` — `awaiting-review`; content hash ≠ last reviewed; outcome not clean; follow-ups pending; or untracked
    and active ⇒ "never reviewed: ship resume N adopts it".
-6. `owner-merge` — record outcome `awaiting-owner-merge`, record.head == headRefOid, not draft, CI `passed`, no
-   conflicts. Otherwise ⇒ `pipeline` "re-gate: ship resume N".
-7. `abandoned` — untracked (no record, no triage) and lastActivity older than stale-days ⇒ close ("no pipeline
-   history, last activity <date>"); otherwise `pipeline` (stalled mid-run ⇒ "stalled on <host> since …: ship resume
-   N"; draft never gated ⇒ "ship resume N").
+7. `owner-merge` — record outcome `awaiting-owner-merge`, record.head == headRefOid, not draft, CI `passed`, no
+   conflicts. Otherwise ⇒ `pipeline` "re-gate: ship resume N" (stalled mid-run ⇒ "stalled on <host> since …: ship
+   resume N"; draft never gated ⇒ "ship resume N").
 `lastActivity` = max(last commit committedDate, every comment's `updated_at`, review submittedAt, createdAt), as
 instants; label events excluded; future clamps to now; boundary inclusive. Local unpushed/dirty work overrides
 `nextAction`. Stranded after merge: merged within `--merged-days`, viewer record with no terminal outcome or a
@@ -221,3 +223,8 @@ line stays in the record and lands when its machine next stages); a scheduled in
 | v2 R8 | adoption ignores triage | D adoption |
 | v2/v3 P3 | legacy wording; consolidate v3 | A `legacy`; this document |
 | v3 note | queued auto-merge binding unproven | E `autoMerge`: disarm when no live in-flight merge |
+| Fable final H1 | "resume never merges" was prose only; the skill's `0 ⇒ merge as usual` let a resumed clean PR merge | Goal 3 in code: `checkpoint --resumed` (record.resumed, never cleared), `P merge` refuses a resumed record without `--owner-approved-head <gate head>`, `resume plan` `stop` on every route to Step 5, skill rule in both modes |
+| Fable final M1 | observe-only re-derived `not-live` over a completed rollback | Goal 4: `resolvedRollbacks`; observe-only finishes with the recorded outcome (recovered / rollback-failed), no re-smoke |
+| Fable final L1 | unreadable event list reused `<sha7>-1` | prod-watch fails closed: `rollback-skipped`, no rollback |
+| Fable final L3 | `tasks: [null]` threw in every record reader | `shapeProblem` validates each task and history entry ⇒ `invalid` |
+| Fable final L2 | inbox classifies an untracked stale PR as `abandoned` before failing-check / review | no code change: §F precedence list now matches the code (`abandoned` right after `owner-decision`, untracked + stale only) |
