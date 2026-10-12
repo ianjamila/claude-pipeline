@@ -694,6 +694,16 @@ test('IO: a binary secret file is caught by path (and flagged unreadable)', asyn
   assert.deepEqual(rulesOf(hits), ['R0-unscannable', 'R3-secrets']);
 });
 
+test('R0-unscannable is not raised for the pure deletion of a large binary diffFiles skipped, but is for adding or editing one', () => {
+  const skipped = (path, status, over = {}) => ({ ...file(path, { status, binary: true, ...over }), skippedLargeBinary: true });
+  assert.deepEqual(rulesOf(run([skipped('data/report.xlsx', 'D')])), []);
+  assert.deepEqual(rulesOf(run([skipped('data/report.xlsx', 'A')])), ['R0-unscannable']);
+  assert.deepEqual(rulesOf(run([skipped('data/report.xlsx', 'M')])), ['R0-unscannable']);
+  assert.deepEqual(rulesOf(run([skipped('data/new.xlsx', 'R', { oldPath: 'data/old.xlsx' })])), ['R0-unscannable']);
+  // the exemption is for the skipped large binary only: any other binary deletion keeps its flag
+  assert.deepEqual(rulesOf(run([file('data/report.xlsx', { status: 'D', binary: true })])), ['R0-unscannable']);
+});
+
 // diffFiles leaves a big binary document out of the --text diff (it would overflow the buffer); its paths must still reach
 // the path rules. Real default threshold (4 MiB), so the files are 5 MiB of random bytes.
 test('IO: a large binary under migrations, deleted or moved out with an edit, is still caught by path (content skipped by diffFiles)', async () => {
@@ -714,5 +724,8 @@ test('IO: a large binary under migrations, deleted or moved out with an edit, is
   const of = (file) => rulesOf(hits.filter((h) => h.file === file));
   assert.ok(of('supabase/migrations/20240101_gone.xlsx').includes('R1-destructive'));
   assert.ok(of('supabase/migrations/20240101_gone.xlsx').includes('R1-migration-edited'));
+  // a pure deletion adds nothing to read, so it is not "unscannable"; the move-with-edit puts new bytes at a new path, so it is
+  assert.ok(!of('supabase/migrations/20240101_gone.xlsx').includes('R0-unscannable'));
+  assert.ok(of('exports/moved.xlsx').includes('R0-unscannable'));
   assert.ok(hits.some((h) => h.file === 'exports/moved.xlsx' && h.rule === 'R1-destructive' && /moved out of the migrations dir/.test(h.detail)));
 });
