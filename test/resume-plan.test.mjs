@@ -96,7 +96,7 @@ test('decision: needs-human shows the first sentence of our reason and does noth
 });
 
 test('decision: needs-human with any other ended outcome is still the owner\'s', () => {
-  assert.equal(plan({ labels: ['needs-human'], record: record({ step: 'ended', outcome: 'blocked' }) }).enter, 'decision');
+  assert.equal(plan({ labels: ['needs-human'], record: record({ step: 'ended', outcome: 'merged' }) }).enter, 'decision');
 });
 
 test('decision: needs-human with no usable record cannot tell, so it stays the owner\'s', () => {
@@ -120,6 +120,26 @@ test('needs-human on a mid-run record (outcome null) does not stop the resume: i
   assert.ok(build.notes.includes(LABEL_NOTE));
   // followups
   assert.equal(plan({ labels: ['needs-human'], triage: cleanTriage({ followupsPending: true }) }).enter, 'followups');
+});
+
+test('needs-human with a resumable ended outcome (awaiting-review, blocked, awaiting-owner-merge) still resumes, with the note', () => {
+  const waiting = plan({ labels: ['needs-human'], record: record({ step: 'ended', outcome: 'awaiting-review' }) });
+  assert.equal(waiting.enter, 'review');
+  assert.ok(waiting.notes.includes(LABEL_NOTE));
+  const v = { head: HEAD, tree: 't', mode: 'full', ok: false, failedStep: 'tests' };
+  const blocked = plan({ labels: ['needs-human'], record: record({ step: 'ended', outcome: 'blocked', verify: v }) });
+  assert.equal(blocked.enter, 'verify');
+  assert.ok(blocked.notes.includes(LABEL_NOTE));
+  const gated = plan({ labels: ['needs-human'], record: record({ step: 'ended', outcome: 'awaiting-owner-merge' }) });
+  assert.equal(gated.enter, 'gate');
+  assert.ok(gated.notes.includes(LABEL_NOTE));
+  assert.ok(gated.notes.some((n) => /Step 5 ends in needs-human/.test(n)));
+});
+
+test('needs-human with any other ended outcome (merged, recovered, ...) on an open PR is the owner\'s', () => {
+  for (const outcome of ['merged', 'recovered', 'rolled-back']) {
+    assert.equal(plan({ labels: ['needs-human'], record: record({ step: 'ended', outcome }) }).enter, 'decision', outcome);
+  }
 });
 
 test('needs-human on a mid-run record, review clean => gate, and the notes say Step 5 ends in needs-human', () => {

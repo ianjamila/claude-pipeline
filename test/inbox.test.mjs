@@ -213,33 +213,36 @@ test('running: a future heartbeat (clock skew) counts as fresh; an unparsable on
   assert.notEqual(cls({ record: record({ heartbeat: { host: 'pc', at: 'garbage' } }) }).waitingOn, 'running');
 });
 
+// the run ended at the owner: only then does the label alone decide the category
+const atOwner = record({ step: 'ended', outcome: 'needs-human' });
+
 test('category owner-decision: needs-human label with the reason', () => {
-  const r = cls({ labels: ['needs-human'], needsHumanReason: 'touches migrations' });
+  const r = cls({ labels: ['needs-human'], record: atOwner, needsHumanReason: 'touches migrations' });
   assert.equal(r.waitingOn, 'owner-decision');
   assert.equal(r.suggest, 'leave');
   assert.match(r.reason, /touches migrations/);
 });
 
 test('owner-decision without a recorded reason still explains itself', () => {
-  const r = cls({ labels: ['needs-human'] });
+  const r = cls({ labels: ['needs-human'], record: atOwner });
   assert.equal(r.waitingOn, 'owner-decision');
   assert.ok(r.reason.length > 0);
 });
 
 test('label-mode leftover: chat repo + hard-stop-only needs-human', () => {
-  const r = cls({ labels: ['needs-human'], needsHumanReason: 'migrations', needsHumanHardStopOnly: true }, { ownerApproval: 'chat' });
+  const r = cls({ labels: ['needs-human'], record: atOwner, needsHumanReason: 'migrations', needsHumanHardStopOnly: true }, { ownerApproval: 'chat' });
   assert.equal(r.waitingOn, 'owner-decision');
   assert.equal(r.reason, 'label-mode leftover: remove the needs-human label, then ship resume 7');
 });
 
 test('label-mode repo keeps hard-stop-only needs-human as a plain owner decision', () => {
-  const r = cls({ labels: ['needs-human'], needsHumanReason: 'migrations', needsHumanHardStopOnly: true }, { ownerApproval: 'label' });
+  const r = cls({ labels: ['needs-human'], record: atOwner, needsHumanReason: 'migrations', needsHumanHardStopOnly: true }, { ownerApproval: 'label' });
   assert.equal(r.waitingOn, 'owner-decision');
   assert.doesNotMatch(r.reason, /label-mode leftover/);
 });
 
 test('chat repo, needs-human NOT hard-stop-only, is a plain owner decision', () => {
-  const r = cls({ labels: ['needs-human'], needsHumanReason: 'judge disagreed', needsHumanHardStopOnly: false }, { ownerApproval: 'chat' });
+  const r = cls({ labels: ['needs-human'], record: atOwner, needsHumanReason: 'judge disagreed', needsHumanHardStopOnly: false }, { ownerApproval: 'chat' });
   assert.doesNotMatch(r.reason, /label-mode leftover/);
   assert.match(r.reason, /judge disagreed/);
 });
@@ -280,6 +283,24 @@ test('needs-human + a mid-run record (outcome null) does not short-circuit: norm
   const live = cls({ labels: ['needs-human'], record: midRun({ heartbeat: { host: 'pc', at: ago(60000) } }) });
   assert.equal(live.waitingOn, 'running');
   assert.ok(!live.reason.includes(LABEL_FRAGMENT));
+});
+
+test('needs-human + a resumable ended outcome: awaiting-review => review, blocked => failing-check, awaiting-owner-merge => re-gate', () => {
+  const review = cls({ labels: ['needs-human'], record: midRun({ step: 'ended', outcome: 'awaiting-review' }) });
+  assert.equal(review.waitingOn, 'review');
+  assert.ok(review.reason.includes(LABEL_FRAGMENT));
+  const blocked = cls({ labels: ['needs-human'], record: midRun({ step: 'ended', outcome: 'blocked' }) });
+  assert.equal(blocked.waitingOn, 'failing-check');
+  assert.ok(blocked.reason.includes(LABEL_FRAGMENT));
+  const gated = cls({ labels: ['needs-human'], record: midRun({ step: 'awaiting-owner-merge', outcome: 'awaiting-owner-merge', head: HEAD }) });
+  assert.equal(gated.waitingOn, 'pipeline');
+  assert.equal(gated.suggest, 'resume');
+  assert.equal(gated.nextAction, 're-gate: ship resume 7');
+  assert.ok(gated.reason.includes(LABEL_FRAGMENT));
+});
+
+test('needs-human + any other ended outcome on an open PR => owner-decision', () => {
+  assert.equal(cls({ labels: ['needs-human'], record: midRun({ step: 'ended', outcome: 'merged' }) }).waitingOn, 'owner-decision');
 });
 
 test('category failing-check: CI failed', () => {
@@ -398,7 +419,7 @@ test('tie: running beats needs-human and failing CI', () => {
 });
 
 test('tie: needs-human beats failing CI', () => {
-  assert.equal(cls({ labels: ['needs-human'], ci: 'failed' }).waitingOn, 'owner-decision');
+  assert.equal(cls({ labels: ['needs-human'], record: atOwner, ci: 'failed' }).waitingOn, 'owner-decision');
 });
 
 test('tie: failing CI beats review', () => {
@@ -528,7 +549,7 @@ test('suggest map covers every waitingOn', () => {
   const samples = {
     'nothing-left': { alreadyOnBase: true },
     running: { record: record({ heartbeat: { host: 'h', at: ago(60000) } }) },
-    'owner-decision': { labels: ['needs-human'] },
+    'owner-decision': { labels: ['needs-human'], record: atOwner },
     'failing-check': { ci: 'failed' },
     review: { contentHash: 'zzz' },
     'owner-merge': {},

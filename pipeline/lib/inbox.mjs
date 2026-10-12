@@ -83,6 +83,8 @@ const SUGGEST = {
 
 const LABEL_FRAGMENT = 'needs-human label present: the run continues but ends at the owner (no merge)';
 
+const RESUMABLE_OUTCOMES = new Set(['awaiting-review', 'blocked', 'awaiting-owner-merge']);
+
 const NEVER_GATED_STEPS = new Set(['build', 'verify', 'pr']);
 
 const day = (iso) => iso.slice(0, 10);
@@ -135,6 +137,7 @@ function failingReasons(f) {
     });
   }
   if (f.conflicts === true) out.push({ text: `conflicts with ${base}`, action: `update with ${base}, resolve conflicts` });
+  if (f.record?.outcome === 'blocked') out.push({ text: 'last run ended blocked (verify)', action: 'see why verify was blocked' });
   if (f.labels.includes('pipeline-blocked')) out.push({ text: 'pipeline-blocked label set', action: 'see why verify was blocked' });
   const v = f.record?.verify;
   if (v && v.ok === false && v.head === f.headRefOid) {
@@ -163,8 +166,9 @@ export function classifyPr(facts, options) {
   const failing = failingReasons(f);
   const reviewing = reviewReasons(f);
   // Step 3.5 labels a hard-stop PR before the review loop: with a usable record that has no outcome the run has not stopped
-  // at the owner yet, so the label does not decide the category (only a finished run, or an unreadable record, does).
-  const midRunLabel = f.labels.includes('needs-human') && f.recordStatus === 'ok' && record != null && record.outcome == null;
+  // at the owner yet (or ended with work left: awaiting-review, blocked, awaiting-owner-merge), so the label does not decide the
+  // category; only a run that ended at the owner, or an unreadable record, does.
+  const midRunLabel = f.labels.includes('needs-human') && f.recordStatus === 'ok' && record != null && (record.outcome == null || RESUMABLE_OUTCOMES.has(record.outcome));
 
   if (f.alreadyOnBase === true) {
     waitingOn = 'nothing-left';
@@ -204,6 +208,7 @@ export function classifyPr(facts, options) {
     nextAction = resume;
   } else if (
     record?.outcome === 'awaiting-owner-merge' &&
+    !midRunLabel && // with the label the gate ends in needs-human, never in an owner-merge
     record.head === f.headRefOid &&
     !f.isDraft &&
     f.ci === 'passed' &&
@@ -219,6 +224,7 @@ export function classifyPr(facts, options) {
       if (record.head !== f.headRefOid) why.push('head changed since the gate');
       if (f.isDraft) why.push('still a draft');
       if (f.ci !== 'passed') why.push(`CI ${f.ci}`);
+      if (midRunLabel) why.push('needs-human label set');
       reason = `owner-merge record no longer holds (${why.join(', ')})`;
       nextAction = `re-gate: ${resume}`;
     } else if (!record) {

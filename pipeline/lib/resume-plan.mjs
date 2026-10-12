@@ -78,7 +78,10 @@ function routeReview(facts) {
 }
 
 const LABEL_NOTE = 'needs-human label present: the run continues but ends at the owner (no merge)';
-const midRunLabel = (facts, record) => facts.labels.includes('needs-human') && record != null && record.outcome == null;
+// Outcomes that still have work in front of them (the review was postponed, verify was red, the gate ran) resume even with the
+// label; `needs-human` itself, or anything else that ended an open PR, is the owner's.
+const RESUMABLE_OUTCOMES = new Set(['awaiting-review', 'blocked', 'awaiting-owner-merge']);
+const midRunLabel = (facts, record) => facts.labels.includes('needs-human') && record != null && (record.outcome == null || RESUMABLE_OUTCOMES.has(record.outcome));
 
 function route(facts, record) {
   if (facts.state === 'CLOSED') return { enter: 'closed', reason: 'the PR is closed without a merge' };
@@ -95,9 +98,9 @@ function route(facts, record) {
         : `uncommitted work in ${where}: commit or stash it first`,
     };
   }
-  // The label means "owner decides now" only once the run has stopped there (it ended) or when we cannot read the run. Step 3.5
-  // adds it as soon as a hard-stop hit lands, BEFORE the review loop: a usable record with no outcome is a run that is still
-  // going (or stalled mid-run), and it resumes normally.
+  // The label means "owner decides now" only once the run has stopped there (outcome needs-human) or when we cannot read the
+  // run. Step 3.5 adds it as soon as a hard-stop hit lands, BEFORE the review loop: a usable record with no outcome (or a
+  // resumable one) is a run that is still going or stalled, and it resumes normally.
   if (facts.labels.includes('needs-human') && !midRunLabel(facts, record)) {
     return { enter: 'decision', reason: firstSentence(facts.needsHumanReason) || 'needs-human label set (no reason recorded)' };
   }

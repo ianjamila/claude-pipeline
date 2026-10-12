@@ -286,7 +286,7 @@ the owner's next move.
    - `autoMerge.action: disarm` ⇒ `gh pr merge N --disable-auto`, tell the owner.
 2. Route on `enter`:
    - `closed` / `ended` / `not-resumable` ⇒ report `reason`, stop.
-   - `decision` ⇒ show the `needs-human` reason, stop (the owner decides).
+   - `decision` ⇒ show the `needs-human` reason, stop (the owner decides). The label alone does not mean this: Step 3.5 adds it before the review loop, so a run whose record is mid-run or ended `awaiting-review` / `blocked` / `awaiting-owner-merge` resumes as usual (the plan's `notes` say the run still ends in `needs-human`, no merge); `decision` is only for an ended `needs-human` outcome or no usable record.
    - `local-work` ⇒ report the worktree state (diverged / dirty / unpushed), stop. Never reset or discard it.
    - `observe-prod` ⇒ `git worktree add --detach <worktree_dir>/agent-<slug>-prod <mergeSha>` (fetch `origin/<base>`
      first), run `P job start prod -- node ~/.claude/pipeline/bin/pipeline.mjs prod-watch --observe-only --pr N` from there, report the outcome and any
