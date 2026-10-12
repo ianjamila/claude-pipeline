@@ -700,8 +700,10 @@ test('S4d: the rest of a line after an unknown cd is judged as if the cwd were e
   for (const w of ['cat settings.json', 'ls', 'git status', 'git log', 'grep x settings.json', 'echo x > /tmp/out.txt', 'echo hi | cat']) assert.equal(files(`cd $UNSET && ${w}`, fs).decision, 'allow', w);
   assert.equal(files('cd sub && echo x > notes.txt', fs).decision, 'allow');
   // (the directory may be below a protected one: a path that climbs with .. can reach it from there)
-  for (const w of ['echo x > ../../../settings.json', 'echo x >> ../x', 'cp /tmp/x ../../settings.json', 'tee ../../s < /tmp/x', 'touch ../a']) assert.match(files(`cd $UNSET && ${w}`, fs).reason ?? '', /with `\.\.`/, w);
+  for (const w of ['D=..; echo x > $D/settings.json', 'echo x > $OUT/settings.json', 'echo x > ../{a,b}', 'X=..; cd $X/.. && echo x > settings.json', 'cd ../.. && echo x > settings.json', 'pushd ../.. && touch settings.json', 'cd .. && cd .. && echo x > settings.json', 'echo x > ../../../settings.json', 'echo x >> ../x', 'cp /tmp/x ../../settings.json', 'tee ../../s < /tmp/x', 'touch ../a']) assert.match(files(`cd $UNSET && ${w}`, fs).reason ?? '', /with `\.\.`/, w);
   assert.equal(files('cd $UNSET && cat ../x', fs).decision, 'allow');
+  // (the same for script text fed in: stdin redirects, readers piped to a shell, SQL files)
+  for (const w of ['bash < x.sh', 'cat x.sh | bash', 'bash -s < x.sh', 'psql -f q.sql', 'sqlite3 db -init i.sql', 'mysql < q.sql', 'cat a.sh b.sh | bash', 'eval "$(cat x.sh)"', 'cat q.sql | psql']) assert.match(files(`cd $UNSET && ${w}`, fs).reason ?? '', /relative to a directory known only at run time/, w);
   // (a script named relative to the unknown directory is a file nobody can read)
   for (const w of ['node scripts/x.mjs', 'bash x.sh', 'source x.sh', './x.sh', 'python3 build/x.py', 'bash ~+/x.sh', 'bash ~-/x.sh', 'bash ~root/x.sh']) assert.match(files(`cd $(git rev-parse --show-toplevel) && ${w}`, fs).reason ?? '', /relative to a directory known only at run time/, w);
   assert.notEqual(files('cd $UNSET && node /tmp/x.mjs', fs).decision, 'allow'); // (an absolute script path is read and judged; a missing file leaves the line refused by the rerun)
@@ -773,4 +775,43 @@ test('S4d: the effects of a startup file apply to the child script only, not to 
   // (a sourced file does change the current shell)
   assert.equal(files('D=/home/u/.claude; source src.sh; echo y > $D/settings.json', fs).decision, 'allow');
   assert.equal(files('D=/home/u/.claude; BASH_ENV=rc bash x.sh', fs).decision, 'allow');
+});
+
+// ---- S4d: psql variable interpolation, quoted write targets, sqlite file: URIs --------------------------------------------------------------------------------
+
+// Why: psql re-lexes the VALUE of an interpolated variable (`\set x '\\! cmd'` then `:x` on any line runs it); a backslash in a value given on the command line leaves the client unmodelled.
+test('S4d: a psql :name outside quotes is unknown input; a backslash in a -v / --set value leaves the client unmodelled', () => {
+  const F = {
+    'a.sql': "\\set x '\\\\! {BAD}'\n:x", 'b.sql': "\\set x '\\\\! {BAD}'\nselect 1\n:x", 'c.sql': "\\set x '\\\\! {BAD}'\nselect :'x';", 'd.sql': "\\set x '\\\\! {BAD}'\nselect :\"x\";", 'e.sql': "\\set x '\\\\! {BAD}'\nselect a[1:n];",
+    // (the value comes from a query result, or is set where no :name is used: only the interpolation, or only the backslash, shows the hazard)
+    'i.sql': "select chr(92) || '! {BAD}' as x \\gset\n:x", 'j.sql': "\\set x '\\\\! {BAD}'",
+    'k.sql': "select chr(92) || '! {BAD}' as x \\gset", 'l.sql': "select chr(92) || '! {BAD}' as x;\nselect :x;", 'm.sql': "select 1; \\set y 2 \\set x '\\\\! {BAD}'", 'f.sql': ":x", 'g.sql': "select now()::text, '12:30', a::int;", 'n.sql': "/* \\set */ select 1 /* :x */;\nselect $$ :x $$, E'\\':x';\nselect chr(92) || '! {BAD}' as x, 'multi\nline :y';", 'h.sql': "select 1::int;\n-- a note\nselect 'it''s :x';",
+  };
+  for (const k of ['a', 'b', 'c', 'd', 'e', 'i', 'j', 'k', 'l', 'm', 'n']) sqlBoth(`psql < ${k}.sql`, F, 'deny');
+  for (const t of ["psql -v 'x=\\! {BAD}' < f.sql", "psql --set='x=\\! {BAD}' < f.sql", "psql --set 'x=\\! {BAD}' -c ':x'", "psql -v x='\\! {BAD}' -f f.sql"]) sqlBoth(t, F, 'deny');
+  // (casts, quoted text and a variable without a backslash are data; the same files with nothing guarded around are data too)
+  for (const t of ['psql < g.sql', 'psql < h.sql', "psql -v x=1 < f.sql", "psql -v 'x=\\! {OK}' < f.sql"]) sqlBoth(t, F, 'allow');
+  for (const k of ['a', 'c', 'i', 'j', 'k', 'l', 'm']) sqlBoth(`psql < ${k}.sql`, Object.fromEntries(Object.entries(F).map(([n, v]) => [n, v.replaceAll('{BAD}', '{OK}')])), 'allow');
+});
+
+// Why: a write or include target that is not a plain word reached the nested evaluation as an opaque "$SQL_TARGET"; now the real path text is judged, shell-quoted.
+test('S4d: a write / include target with spaces or quotes is judged by its real text; sqlite file: URIs name the file', () => {
+  const P = '/home/u/.claude/pipeline/a b.txt';
+  const w = (text, cmd = 'psql < w.sql') => files(cmd, fakeFs(PROJ, { 'w.sql': text }, DIRS)).decision;
+  assert.equal(w(`\\o '${P}'\nselect 1;`), 'deny');
+  assert.equal(w("\\o '/home/u/.claude/pipeline/a b.txt'\nselect 1;"), 'deny');
+  assert.equal(w("\\o 'out dir/a b.txt'\nselect 1;"), 'allow');
+  assert.equal(w("\\i '/home/u/.claude/pipeline/a b.txt'"), 'deny'); // (the include is a read of a protected path by a client that is not read-only)
+  assert.equal(w("\\i 'inc dir/a b.sql'"), 'allow');
+  const F = { 'e.sql': 'echo hi' };
+  const s = (text, cmd = 'sqlite3 db < w.sql') => files(cmd, fakeFs(PROJ, { 'w.sql': text, ...F }, DIRS)).decision;
+  for (const u of ['file:/home/u/.claude/settings.json', 'file:///home/u/.claude/settings.json', 'file://localhost/home/u/.claude/settings.json?mode=rwc', 'file:/home/u/.cl%61ude/settings.json?mode=rwc&cache=shared']) {
+    assert.equal(s(`.open ${u}`), 'deny', u);
+    assert.equal(s(`attach '${u}' as d;`), 'deny', u);
+    assert.equal(s(`select writefile('${u}', 'x');`), 'deny', u);
+    assert.equal(s(`vacuum into '${u}';`), 'deny', u);
+    assert.equal(files(`sqlite3 '${u}' 'select 1'`, fakeFs(PROJ, {}, DIRS)).decision, 'deny', u);
+  }
+  assert.equal(s('.open file:out.db?mode=rwc'), 'allow');
+  assert.equal(s("attach 'file:/tmp/out.db?mode=rwc' as d;"), 'allow');
 });

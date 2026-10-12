@@ -1832,10 +1832,14 @@ function evaluateBashForFilesFrame(command, opts) {
     // (only `~` and `~/x` are the home: `~+/x`, `~-/x` and `~user/x` name a directory of the unknown one or of another user)
     const relative = (w) => typeof w === 'string' && (/^~[^/]/.test(w) || (!/^~(?:\/|$)/.test(w) && !isAbs(toPosix(expandRefs(w, ctx)))));
     const rel = cmds.find((c) => { const sf = scriptFileOf(c.argv, c.raw, raw); return sf && (sf.kind === 'exec' ? relative(sf.file) : sf.ambiguous || relative(sf.file)); });
-    if (rel) return deny('the script is named relative to a directory known only at run time, so its commands cannot be judged; use its absolute path');
+    // (script text fed to a shell, an interpreter or a SQL client, `bash < x.sh`, `cat x.sh | bash`, `psql -f q.sql`, is the same: a relative file of the unknown directory)
+    const relFeed = rel ?? cmds.find((c) => scriptFeedsOf(c, raw, (w) => expandRefs(w, ctx)).some((fd) => relative(fd.file) || (fd.words ?? []).some(relative) || (fd.joined ?? []).some(relative)));
+    if (relFeed) return deny('the script is named relative to a directory known only at run time, so its commands cannot be judged; use its absolute path');
     // (the directory may be BELOW a protected one, which the assumed directories do not cover: a relative write target or writer operand that climbs with `..` can reach it from there)
-    const climbs = (w) => typeof w === 'string' && !isAbs(toPosix(w)) && !w.startsWith('~') && /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(w);
-    const up = cmds.find((c) => (c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && climbs(r.target)) || (c.argv.length > 0 && !CD_CMDS.has(baseOf(c.argv[0])) && !isReadOnly(c, ctx) && c.argv.slice(1).some((w) => climbs(w.replace(/^-{0,2}[\w-]+=/, '')))));
+    // (the expanded word, braces too; one that still holds a run-time value or a brace may climb as well)
+    const climbs = (w, runtime = true) => typeof w === 'string' && braceExpand(expandRefs(w, ctx), ctx).split(/\s+/).some((x) => x && !isAbs(toPosix(x)) && !/^~(?:\/|$)/.test(x) && (/(?:^|[\\/])\.\.(?:[\\/]|$)/.test(x) || (runtime && /[`${]/.test(x))));
+    const up = cmds.find((c) => (c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && climbs(r.target)) || (c.argv.length > 0 && CD_CMDS.has(baseOf(c.argv[0])) && c.argv.slice(1).some((w) => climbs(w, false))) // (a later `cd ../..` climbs into a protected directory)
+      || (c.argv.length > 0 && !CD_CMDS.has(baseOf(c.argv[0])) && !isReadOnly(c, ctx) && c.argv.slice(1).some((w) => climbs(w.replace(/^-{0,2}[\w-]+=/, '')))));
     if (up) return deny('the command writes through a relative path with `..` after a cd into a directory known only at run time; it may start below a protected directory, so the file it reaches cannot be checked; write the directory out');
     const at = ctx.frames.indexOf(frame);
     for (const d of assumedCwds(ctx)) {
