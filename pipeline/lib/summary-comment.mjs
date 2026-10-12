@@ -18,16 +18,18 @@ export function sectionsOf(body) {
 
 // The newest summary comment the viewer wrote that STARTS with the marker: the same one upsertComment edits.
 // -> {status: ok|absent|legacy|unsupported|invalid, record?, sections, url, id}
-export function readSummaryComment(gh, pr) {
-  const me = gh.viewer();
-  const mine = gh.listComments(pr)
-    .filter((c) => typeof c.body === 'string' && c.body.startsWith(MARKERS.summary) && c.user?.login === me)
+// `summaryFromComments` works on a comment list the caller already holds (`P inbox` reads each PR's list once).
+export function summaryFromComments(comments, viewerLogin) {
+  const mine = comments
+    .filter((c) => typeof c.body === 'string' && c.body.startsWith(MARKERS.summary) && c.user?.login === viewerLogin)
     .sort((a, b) => Number(a.id) - Number(b.id));
   const found = mine.at(-1);
   if (!found) return { status: 'absent', sections: '', url: null, id: null };
   const decoded = decodeRecord(found.body);
   return { ...decoded, sections: sectionsOf(found.body), url: found.html_url ?? null, id: found.id };
 }
+
+export const readSummaryComment = (gh, pr) => summaryFromComments(gh.listComments(pr), gh.viewer());
 
 // `record` / `sections` left undefined are kept from the existing comment; pass `existing` (a readSummaryComment result)
 // to avoid reading it twice. An existing record this CLI cannot read (`unsupported`, newer version) is never dropped

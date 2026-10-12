@@ -97,6 +97,27 @@ export function mergeBase(a, b, o) {
 // not know (exit 128) still throws, so a missing object can never read as "no".
 export const isAncestor = (a, b, o) => gitOrNull(['merge-base', '--is-ancestor', assertRef(a, ['merge-base', a, b]), assertRef(b, ['merge-base', a, b])], 1, o) !== null;
 
+// The installed git as [major, minor], or null when it prints something else. `merge-tree --write-tree` needs 2.38.
+export function gitVersion(o) {
+  const m = /^git version (\d+)\.(\d+)/.exec(git(['--version'], o).trim());
+  return m ? [Number(m[1]), Number(m[2])] : null;
+}
+export const supportsMergeTreeWrite = (o) => {
+  const v = gitVersion(o);
+  return v !== null && (v[0] > 2 || (v[0] === 2 && v[1] >= 38));
+};
+
+// A trial merge of `head` into `base` that touches no ref, index or working tree (it only writes tree objects).
+// -> { clean: true, tree } | { clean: false, tree } (exit 1: conflicts). Any other exit (a missing object, an old git) throws.
+export function mergeTree(base, head, o) {
+  const args = ['merge-tree', '--write-tree', assertRef(base, ['merge-tree', base, head]), assertRef(head, ['merge-tree', base, head])];
+  const r = exec(args, o);
+  if (r.code !== 0 && r.code !== 1) throw new GitError({ args, code: r.code, stderr: r.stderr });
+  const tree = String(r.stdout).split('\n')[0].trim();
+  if (!/^[0-9a-f]{40,64}$/.test(tree)) throw new GitError({ args, code: r.code, stderr: `merge-tree printed no tree id: ${String(r.stdout).slice(0, 200)}` });
+  return { clean: r.code === 0, tree };
+}
+
 export const headSha = (o) => git(['rev-parse', 'HEAD'], o).trim();
 
 // `HEAD` when detached. Reads the full ref instead of using --short/--abbrev-ref, which print `heads/x` when a tag
