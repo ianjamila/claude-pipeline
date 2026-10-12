@@ -359,12 +359,19 @@ test('R1-B2: files read by a rewriting producer are scanned joined (a guarded wo
   allowBuilt('sed p b.sh | bash', split);
 });
 
-test('R1-B2: feeds from several producers (order and multiplicity unknown) are refused, even for harmless files', () => {
+// (PR A2 S2, finding 28: producers that run one after the other -- `{ cat a; cat b; }` -- have a known order and are judged joined; a producer whose
+// files cannot be named, or a job in the background (order unknown), is still refused, even for harmless files)
+test('R1-B2: feeds from several producers whose order is unknown are refused, even for harmless files', () => {
   const ok = () => ({ 'a.sh': 'echo a', 'b.sh': 'echo b' });
-  for (const c of ['{ cat a.sh; cat b.sh; } | bash', 'cat a.sh | bash < b.sh']) {
+  for (const c of ['{ cat a.sh & cat b.sh; } | bash', '{ cat a.sh; cat $Z; } | bash', '{ cat a.sh; cat b*.sh; } | bash', '{ cat a.sh; cat b.sh; sed p b.sh; } | bash']) {
     const r = bothBuilt(c, ok);
     assert.equal(r.git.decision, 'deny', `git: ${c}`);
     assert.equal(r.files.decision, 'deny', `files: ${c}`);
+  }
+  for (const c of ['{ cat a.sh; cat b.sh; } | bash', 'cat a.sh | bash < b.sh']) {
+    const r = bothBuilt(c, ok);
+    assert.equal(r.git.decision, 'allow', `git: ${c}`);
+    assert.equal(r.files.decision, 'allow', `files: ${c}`);
   }
 });
 
@@ -375,7 +382,9 @@ test('R1-B2: scriptFeedsOf joins the files of one reader in command-line order, 
   assert.deepEqual(joined('cat b.sh a.sh b.sh | bash'), [{ kind: 'shell', file: 'b.sh a.sh b.sh', joined: ['b.sh', 'a.sh', 'b.sh'] }]);
   assert.deepEqual(feeds('cat a.sh b.sh | bash').filter((f) => !f.joined), [{ kind: 'shell', file: 'a.sh' }, { kind: 'shell', file: 'b.sh' }]);
   assert.deepEqual(feeds('cat f.sh | bash'), [{ kind: 'shell', file: 'f.sh' }]); // one file: unchanged
-  assert.equal(feeds('{ cat a.sh; cat b.sh; } | bash')[0].unresolvable, true);
+  assert.deepEqual(joined('{ cat a.sh; cat b.sh; } | bash'), [{ kind: 'shell', file: 'a.sh b.sh', joined: ['a.sh', 'b.sh'] }]); // (PR A2 S2: producers in sequence)
+  assert.equal(feeds('{ cat a.sh & cat b.sh; } | bash')[0].unresolvable, true); // a job in the background: the order is unknown
+  assert.equal(feeds('{ cat a.sh; cat $Z; } | bash')[0].unresolvable, true);
   assert.equal(feeds('cat a.sh *.sh | bash')[0].unresolvable, true); // a glob among several: which files, in what order, is unknown
   const scan = feeds('sed p a.sh b.sh | bash');
   assert.deepEqual(scan.filter((f) => f.joined), [{ kind: 'scan', file: 'p a.sh b.sh', joined: ['p', 'a.sh', 'b.sh'] }]); // (the program word is a candidate file name too)

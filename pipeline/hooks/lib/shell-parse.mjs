@@ -589,6 +589,29 @@ function scriptFileOfArgv(argv) {
   return null;
 }
 const INTERPRETER_NO_EXT = new Set(['python', 'ruby', 'perl', 'php']);
+// A descriptor path (`/dev/fd/3`): a shell run on it reads whatever the descriptor was opened from
+const FD_PATH = /^\/(?:dev|proc\/self)\/fd\/(?:[3-9]|[1-9]\d+)$|^\/(?:dev|proc\/self)\/fd\/\$/;
+// Marks a command as one that reads its program / script from stdin (an output process substitution's stream reaches those); non-enumerable like `feeds`
+function markStdin(cmd, interp) {
+  if (!cmd) return;
+  Object.defineProperty(cmd, 'stdinShell', { value: true, enumerable: false, configurable: true });
+  if (interp) Object.defineProperty(cmd, 'interpStdin', { value: true, enumerable: false, configurable: true });
+}
+// Why: an interpreter given no script operand (`node`, `python3 -u`, `node -`) reads its program from stdin: `node < f.mjs` runs the file like `node f.mjs`
+function interpReadsStdin(argv) {
+  const name = base(argv[0]);
+  let i = 1;
+  if ((name === 'deno' || name === 'bun') && argv[1] === 'run') i = 2;
+  for (; i < argv.length; i++) {
+    const t = argv[i];
+    if (t === '--') { i++; break; }
+    if (INLINE_FLAGS.has(t.split('=')[0]) || (/^-[A-Za-z]*[ecEmp]$/.test(t) && !t.startsWith('--') && name !== 'node')) return false;
+    if (/^(?:-v|-V|-h|--version|--help|--v8-options)$/.test(t)) return false; // prints and exits
+    if (t.length > 1 && t[0] === '-') { if (INTERP_VALUE_FLAGS.has(t)) i++; continue; }
+    break;
+  }
+  return i >= argv.length || STDIN_FILES.has(argv[i]);
+}
 
 const PWSH_VALUE_FLAGS = ['executionpolicy', 'windowstyle', 'workingdirectory', 'inputformat', 'outputformat', 'version', 'configurationname', 'settingsfile', 'custompipename'];
 const PWSH_VALUE_ALIASES = ['ep', 'w', 'wd', 'if', 'of', 'o', 'v', 'config'];
@@ -638,7 +661,9 @@ const READERS = {
   cat: ['', []], tac: ['', []], less: ['', []], more: ['', []], bat: ['', []], batcat: ['', []],
   head: ['nc', ['--lines', '--bytes']], tail: ['nc', ['--lines', '--bytes']],
 };
-const EXACT_READERS = new Set(['cat', 'less', 'more', 'bat', 'batcat']);
+// Why: only option-less `cat` (and `cat -u`, `--`) prints its files byte for byte. `cat -n/-s/-A` number, squeeze or show characters, `bat` / `less` decorate
+// and page, `head -c` / `tail -c` cut: what reaches the shell is computed from the file, so it is scanned, never rebuilt as the file's own text.
+const exactCopy = (name, argv) => name === 'cat' && argv.slice(1).every((w) => w === '-u' || w === '--' || w === '-' || w[0] !== '-');
 const MAX_FEED_FILES = 64; // more files than this feed one command: refused, not judged
 
 // The file operands of a reader: words that are not options, minus the values of options that take one.
@@ -711,8 +736,60 @@ function producerScript(argv) {
   return sf && !sf.ambiguous && !sf.unresolvable && typeof sf.file === 'string' && sf.file !== '' ? sf.file : null;
 }
 
+// The index of the word that holds the program text of an inline interpreter run (`node -e CODE`, `node --eval=CODE`, `python -c CODE`, `php -r CODE`), or -1.
+function inlineCodeIndex(name, argv) {
+  if (!INTERPRETER.test(name)) return -1;
+  for (let i = 1; i < argv.length; i++) {
+    const t = argv[i];
+    if (t === '--' || t === '-' || t[0] !== '-') return -1;
+    const flag = t.split('=')[0];
+    if (['-e', '-E', '-p', '-c', '-r', '--eval', '--print'].includes(flag) || (name !== 'node' && /^-[A-Za-z]*[ecEpr]$/.test(t))) return t.includes('=') && t[1] === '-' ? i : i + 1;
+    if (INTERP_VALUE_FLAGS.has(t)) i++;
+  }
+  return -1;
+}
+
 // groups: the exact files, one array per producer in the order it names them (what `st.files` was filled from), so the join can be rebuilt
-const newSt = () => ({ dyn: false, files: [], groups: [], computed: [], raws: [], pat: new Set(), unq: new Set(), ops: new Set() });
+const newSt = () => ({ dyn: false, unordered: false, files: [], groups: [], computed: [], raws: [], pat: new Set(), unq: new Set(), ops: new Set() });
+
+// Adds what `b` collected to `a` (a descriptor opened twice, a variable assigned twice: both may be read).
+function mergeSt(a, b) {
+  const out = newSt();
+  for (const x of [a, b]) {
+    out.dyn = out.dyn || x.dyn;
+    out.unordered = out.unordered || x.unordered;
+    out.files.push(...x.files); out.groups.push(...x.groups); out.computed.push(...x.computed); out.raws.push(...x.raws);
+    for (const k of ['pat', 'unq', 'ops']) for (const w of x[k]) out[k].add(w);
+  }
+  return out;
+}
+
+// Why: `X=$(cat f.sh); eval "$X"`: the variable holds the text of a file (the substitution strips trailing newlines and an unquoted use splits it into words,
+// so it is never the file's exact text: scanned, like a rewriting producer's). Assigned once or twice, in a branch or not: every assignment is remembered.
+function noteVarFeeds(ctx, name, subs) {
+  const st = newSt();
+  subsProduced(subs, st, 1);
+  if (!st.files.length && !st.computed.length && !st.dyn) return;
+  const e = newSt();
+  e.dyn = st.dyn;
+  for (const w of [...st.files, ...st.computed]) { e.computed.push(w); e.pat.add(w); e.ops.add(w); }
+  e.raws.push(...st.raws);
+  const prev = ctx.varFeeds.get(name);
+  ctx.varFeeds.set(name, prev ? mergeSt(prev, e) : e);
+}
+
+// The feeds of the variables `text` refers to (`$X`, `${X}`, `"$X"`), added to `st`; `seg.vf` is the line's table of variables that hold file text.
+const VAR_REF = /\$\{?([A-Za-z_][A-Za-z0-9_]*)/g;
+function varFeedsInto(seg, text, st) {
+  if (!seg.vf || !seg.vf.size || typeof text !== 'string' || !text.includes('$')) return;
+  for (const m of text.matchAll(VAR_REF)) {
+    const e = seg.vf.get(m[1]);
+    if (!e) continue;
+    if (e.dyn) st.dyn = true;
+    for (const w of e.computed) { st.computed.push(w); st.pat.add(w); st.ops.add(w); }
+    st.raws.push(...e.raws);
+  }
+}
 
 // What the command `seg` prints, when its output reaches the shell through a file: the files it reads. `exact`: nothing
 // between the command and the shell rewrites its output, so a plain reader's files ARE the script text (`st.files`); otherwise
@@ -729,9 +806,12 @@ function noteReads(seg, name, argv, st, exact) {
   // [operand, the word it came from, argv index, argOnly]; a word with no unquoted pattern character is a literal name even if it looks like a regex (`'^(A|B)='`).
   // The script's other words stay scanned (the script may print a file they name: `s.sh` = `cat "$1"`), but they are not FILE operands for the join rule.
   const scriptArgs = () => looseOperands(argv).filter(([w]) => w !== script).map(([w, full, idx]) => [w, full, idx, true]);
-  const words = reader ? readerOperands(argv, ...READERS[name]).map((w) => [w, w]) : script !== null ? [[script, script, argv.indexOf(script)], ...scriptArgs()] : looseOperands(argv);
+  // Why: `node -e 'code'` / `python -c 'code'`: the code text is a program, not a file name (JS `[0] === 2` or a backtick made it a glob that could not be resolved);
+  // the words after it stay candidates, the program may print a file it is given (`node -e '...readFileSync(process.argv[1])' f.sh`)
+  const code = reader ? -1 : inlineCodeIndex(name, argv);
+  const words = reader ? readerOperands(argv, ...READERS[name]).map((w) => [w, w]) : script !== null ? [[script, script, argv.indexOf(script)], ...scriptArgs()] : looseOperands(argv).filter(([, , idx]) => idx !== code);
   for (const f of seg.stdinFiles) { words.push([f, f]); st.pat.add(f); }
-  const list = exact && (EXACT_READERS.has(name) || argv.length === 0) ? st.files : st.computed;
+  const list = exact && (exactCopy(name, argv) || argv.length === 0) ? st.files : st.computed;
   const prog = reader ? -1 : programIndex(name, argv);
   const group = [];
   for (const [w, full, idx, argOnly] of words) {
@@ -745,6 +825,7 @@ function noteReads(seg, name, argv, st, exact) {
     if (!noFile && !argOnly) st.ops.add(w);
   }
   if (group.length) st.groups.push(group);
+  if (group.length && seg.sep === '&') st.unordered = true; // (a job in the background: the order it prints in, among the others, is not known)
   if (words.length) st.raws.push(seg.raw);
 }
 
@@ -768,12 +849,14 @@ function producedBy(seg, st, hops = 0, exact = true) {
     out.push(hs.text);
     if (hs.dyn) st.dyn = true;
     out.push(...subsProduced(hs.subs, st, hops + 1));
+    varFeedsInto(seg, hs.text, st);
   }
   const pa = seg.final ? seg.final.argv : [];
   const pn = pa.length ? base(pa[0]) : '';
   noteReads(seg, pn, pa, st, exact);
   if (pn === 'echo' || pn === 'printf') {
     for (const a of pa.slice(1)) {
+      varFeedsInto(seg, a, st);
       const m = seg.meta.get(a);
       if (!m) continue;
       if (m.dyn) st.dyn = true;
@@ -800,6 +883,7 @@ function stdinSource(seg) {
   const texts = [];
   st.files.push(...seg.stdinFiles); // `bash < F`: the script is the file
   if (seg.stdinFiles.length) st.groups.push([...seg.stdinFiles]);
+  for (const e of seg.fdFeeds) { st.computed.push(...e.computed); for (const w of e.computed) { st.pat.add(w); st.ops.add(w); } st.raws.push(...e.raws); if (e.dyn) st.dyn = true; }
   for (const h of seg.heredocs) texts.push(h.text);
   let fed = seg.stdinSubs.length > 0 || (seg.pipedFrom !== null && seg.pipedFrom.length > 0);
   let fedTexts = 0;
@@ -807,6 +891,7 @@ function stdinSource(seg) {
     texts.push(hs.text);
     if (hs.dyn) st.dyn = true;
     texts.push(...subsProduced(hs.subs, st, 1));
+    varFeedsInto(seg, hs.text, st);
   }
   { const t = subsProduced(seg.stdinSubs, st, 1); fedTexts += t.length; texts.push(...t); }
   const walk = (stage, hops) => {
@@ -842,9 +927,12 @@ function streamsOf(seg, argv) {
 // `cmd.feeds` (not enumerable, like `sep`) lists the files the text a shell / source / eval runs comes from, when it is not
 // named as a script file: `files` hold the text as it is (a stdin redirect, `cat F |`, `<(cat F)`, `$(<F)`), `computed` are words
 // a command that rewrites its input (sed, awk, base64, tr ...) may read; `raws` are the producers' command texts.
-function addFeeds(cmd, st) {
+// `interp`: the fed text is the program of an interpreter (`node < f.mjs`), not shell script text.
+function addFeeds(cmd, st, interp = false) {
   if (!cmd || (!st.files.length && !st.computed.length)) return;
-  if (!cmd.feeds) Object.defineProperty(cmd, 'feeds', { value: { files: [], groups: [], computed: [], raws: [], pat: [], unq: [], ops: [] }, enumerable: false });
+  if (!cmd.feeds) Object.defineProperty(cmd, 'feeds', { value: { files: [], groups: [], computed: [], raws: [], pat: [], unq: [], ops: [], unordered: false, interp: false }, enumerable: false });
+  if (st.unordered) cmd.feeds.unordered = true;
+  if (interp) cmd.feeds.interp = true;
   cmd.feeds.pat.push(...st.pat);
   cmd.feeds.unq.push(...st.unq);
   cmd.feeds.ops.push(...st.ops);
@@ -905,12 +993,15 @@ export function scriptFeedsOf(cmd, line = cmd?.raw, resolve = null) {
   // a reader's operand that is itself a process substitution (`cat a <(tail -c 99 b) | bash`) is the text ANOTHER producer prints, not a file name
   if ([...f.files, ...f.computed].some(isProcSub)) return [refuse];
   if (f.files.length >= 2) {
-    const g = f.groups;
-    if (g.length !== 1 || g[0].length !== f.files.length) return [refuse];
-    out.push({ kind: 'shell', file: g[0].join(' '), joined: [...g[0]] });
+    // Why: `{ cat a; cat b; } | bash`: the producers run one after the other, so the text is their files in the order the line names them (`cat a b`
+    // is the same program). Refused when a job in the background makes the order unknown, or a file operand cannot be tied to one producer.
+    const names = f.groups.flat();
+    if (names.length !== f.files.length || (f.groups.length > 1 && raw0.unordered)) return [refuse];
+    out.push({ kind: 'shell', file: names.join(' '), joined: names });
   }
   const words = f.computed.filter((w) => !hasExpansion(w));
   if (words.length >= 2) out.push({ kind: 'scan', file: words.join(' '), joined: words });
+  if (raw0.interp) for (const r of out) if (r.kind === 'shell') r.kind = 'interp';
   return out;
 }
 
@@ -1358,7 +1449,7 @@ class Parser {
       if (!inWord) wstart = this.i;
       if (!seg) {
         seg = {
-          words: [], heredocs: [], herestrings: [], redirects: [], stdinSubs: [], stdinFile: false, stdinFiles: [], meta: new Map(), win: new Map(),
+          words: [], heredocs: [], herestrings: [], redirects: [], stdinSubs: [], stdinFile: false, stdinFiles: [], outSubs: [], fdFeeds: [], vf: ctx.varFeeds, cmd: null, meta: new Map(), win: new Map(),
           start: this.i, depth, pending: 0, muted, raw: '', final: null, groupStage: null, pat: new Set(),
           pipedFrom: lastSep === '|' ? this.lastStage : null, sep: lastSep,
         };
@@ -1390,6 +1481,19 @@ class Parser {
         // >&2 / 2>&1 duplicate a descriptor: the target is recorded as &2 / &1 so it is not mistaken for a file name
         const dup = (rop === '>&' || rop === '<&') && /^(?:[0-9]+|-)$/.test(text);
         seg.redirects.push({ op: rop, target: dup ? '&' + text : text, fd: rfd });
+        if (subs.length && text.startsWith('>(')) seg.outSubs.push(subs); // `cat f > >(bash)`: the substitution's commands read what this command writes
+        // Why: `exec 3< f.sh; bash <&3`: a descriptor opened from a file earlier on the line (or a `{fd}<` named one) is read by the shell that gets it as stdin
+        if ((rop === '<' || rop === '<>') && ((rfd !== null && rfd !== 0) || (rfd === null && /^\{[A-Za-z_]\w*\}$/.test(seg.words[seg.words.length - 1]?.text ?? '')))) {
+          const e = newSt();
+          if (subs.length && isProcSub(text)) subsProduced(subs, e, 1); else if (text !== '/dev/null') { e.files.push(text); e.groups.push([text]); }
+          const prev = this.ctx.fdFeeds.get(rfd ?? '{}');
+          this.ctx.fdFeeds.set(rfd ?? '{}', prev ? mergeSt(prev, e) : e);
+        }
+        if (rop === '<&' && (rfd === null || rfd === 0)) {
+          const es = /^[0-9]+$/.test(text) ? [this.ctx.fdFeeds.get(Number(text))] : [...this.ctx.fdFeeds.values()];
+          seg.stdinFile = true; // (a descriptor's contents are never known from this command alone: the dynamic rules apply)
+          for (const e of [...es, this.ctx.fdFeeds.get('{}')]) if (e) { seg.stdinFiles.push(...e.files); seg.fdFeeds.push(e); }
+        }
         if (rop === '<') {
           if (subs.length && isProcSub(text)) seg.stdinSubs.push(...subs);
           else seg.stdinFile = true;
@@ -1651,6 +1755,7 @@ class Parser {
     seg.final = { argv: [] };
     let last = null;
     for (const g of groups) last = this.finalizeGroup(g, seg) ?? last;
+    if (seg.outSubs.length || seg.words.some((w) => w.subs.length && w.text.includes('>('))) this.feedOutSubs(seg);
     // Redirections belong to the command they were written on; a redirect with no command of its own
     // (`> file`, `{ a; } > file`, `(a) > file`) still has to reach the caller.
     if (last) last.redirects = [...seg.redirects];
@@ -1683,6 +1788,12 @@ class Parser {
       if (!a) break;
       setEnv(env, a[0], a[1]);
     }
+    for (let k = 0; k < words.length; k++) {
+      // (the prefix assignments of a command are only in that command's environment, but `X=$(cat f) cmd` alone, `export X=$(cat f)` and `declare X=...` stay)
+      if (k >= i && !(k > i && ['export', 'declare', 'typeset', 'local', 'readonly'].includes(words[i].text))) continue;
+      const a = assignOf(words[k]);
+      if (a && words[k].subs.length && (i >= words.length || k > i)) noteVarFeeds(this.ctx, a[0], words[k].subs);
+    }
     if (i >= words.length) return Object.keys(env).length ? emit(this.ctx, [], env, seg.raw, seg.depth, [], seg.sep) : null;
     // brace expansion: {a,b} in an unquoted word becomes several words (assignment words before the command are exempt)
     const argv = [];
@@ -1710,9 +1821,11 @@ class Parser {
 
   process(argv, env, seg, isExec) {
     let a = this.winFix(argv, seg);
+    let fan = null; // the xargs / parallel that built this command from stdin text
     for (let guard = 0; guard < 32 && a.length; guard++) {
       const un = unwrap(a);
       if (!un) break;
+      if (!fan && (base(a[0]) === 'xargs' || base(a[0]) === 'parallel')) fan = a;
       for (const k of Object.keys(un.env)) setEnv(env, k, un.env[k]);
       a = this.winFix(un.argv, seg);
     }
@@ -1721,10 +1834,15 @@ class Parser {
     if (headDyn) this.ctx.dynamic = true;
     const cmd = emit(this.ctx, a, env, seg.raw, seg.depth, [], seg.sep);
     if (cmd) Object.defineProperty(cmd, 'litWords', { value: new Set(a.filter((w) => !seg.meta.get(w)?.dyn && !seg.pat.has(w))), enumerable: false });
-    if (!isExec) seg.final = { argv: a };
+    if (!isExec) { seg.final = { argv: a }; seg.cmd = cmd; }
     // what the command prints and what it reads on stdin, for callers that ask which text a write of its output holds (see line-writes.mjs); lazy, most commands never need it
     if (cmd && !isExec) Object.defineProperty(cmd, 'streams', { value: () => streamsOf(seg, a), enumerable: false });
+    if (fan && cmd && !isExec) this.fanOut(seg, fan, a, cmd);
     if (headDyn && cmd) {
+      const hv = newSt();
+      varFeedsInto(seg, a[0], hv); // `X=$(cat f.sh); $X`
+      if (hv.dyn) this.ctx.dynamic = true;
+      addFeeds(cmd, hv);
       // `$X < f.sh`, `cat f.sh | $X`: the program may be a shell reading its script from stdin
       const saved = this.cmd;
       this.cmd = cmd;
@@ -1744,6 +1862,75 @@ class Parser {
     }
     this.interpret(a, seg, cmd);
     return cmd;
+  }
+
+  // Why: `xargs -I{} sh -c '{}' < f.sh`, `xargs bash -c < f.sh`, `cat f.sh | xargs -0 sh -c`: xargs puts the text it reads into the command line of the shell, as the
+  // script it runs (no operand after -c: the first word it reads; the replacement string among the script words: each line). Quote handling
+  // and splitting change the text, so the files are scanned. `fan`: the xargs / parallel words, `argv`: the command it starts.
+  fanOut(seg, fan, argv, cmd) {
+    if (!SHELLS.has(base(argv[0]))) return;
+    const r = shellInvocation(argv);
+    const repl = new Set(['{}']);
+    let argFile = null;
+    for (let k = 1; k < fan.length; k++) {
+      const t = fan[k];
+      if ((t === '-I' || t === '-J') && fan[k + 1] !== undefined) repl.add(fan[k + 1]);
+      else if (/^-[IJ]./.test(t) || /^--replace=./.test(t)) repl.add(t.startsWith('--') ? t.slice(10) : t.slice(2));
+      else if (/^-i./.test(t)) repl.add(t.slice(2));
+      if (t === '-a' || t === '--arg-file') argFile = fan[k + 1] ?? null;
+      else if (/^-a./.test(t) && t[1] !== '-') argFile = t.slice(2);
+      else if (t.startsWith('--arg-file=')) argFile = t.slice(11);
+    }
+    const parallel = base(fan[0]) === 'parallel';
+    const fed = r.kind === 'none' || (r.kind === 'script' && (parallel ? /\{[^}]*\}/.test(r.text) : [...repl].some((x) => r.text.includes(x))));
+    if (!fed) return;
+    const src = stdinSource(seg);
+    const st = src.st;
+    for (const text of src.texts) this.subParse(text, seg.depth + 1);
+    st.computed.push(...st.files);
+    st.files.length = 0;
+    st.groups.length = 0;
+    if (argFile !== null) { st.computed.push(argFile); st.pat.add(argFile); st.ops.add(argFile); st.raws.push(seg.raw); }
+    if (st.dyn || (src.unknown && !st.computed.length)) this.ctx.dynamic = true;
+    addFeeds(cmd, st);
+  }
+
+  // Why: `tee >(bash) < f.sh`, `cat f.sh | tee >(bash)`, `cat f.sh > >(bash)`: the commands of an output process substitution read the stream of the command it is an
+  // operand of (what that command reads on stdin, and what it prints). A shell among them gets those files as its script text, in every
+  // position of the substitution's own pipeline (the stream is not rebuilt through its other stages).
+  feedOutSubs(seg) {
+    const subs = [...seg.outSubs.flat()];
+    for (const w of seg.words) if (w.subs.length && w.text.includes('>(')) subs.push(...w.subs);
+    const targets = subs.filter((x) => x.cmd?.stdinShell);
+    if (!targets.length || !seg.final) return;
+    const view = { ...seg, final: { argv: seg.final.argv } };
+    const src = stdinSource(view);
+    const out = newSt();
+    if (base(seg.final.argv[0] ?? '') !== 'tee') producedBy(view, out); // (tee copies its stdin; its operands are the files it writes)
+    const merged = mergeSt(src.st, out);
+    // (a file operand of a producer is also its stdin file: once is enough, and an exact file is not also scanned)
+    merged.computed = [...new Set(merged.computed)].filter((w) => !w.startsWith('>(') && !merged.files.includes(w));
+    for (const t of targets) {
+      if (merged.dyn || (src.unknown && !merged.files.length && !merged.computed.length)) this.ctx.dynamic = true;
+      addFeeds(t.cmd, merged, !!t.cmd.interpStdin);
+    }
+  }
+
+  // `node < f.mjs`, `cat f.sh | python3`: an interpreter with no script operand reads its program from stdin
+  runInterpStdin(seg) {
+    const src = stdinSource(seg);
+    markStdin(this.cmd, true);
+    if (src.st.dyn || (src.unknown && !src.st.files.length && !src.st.computed.length)) this.ctx.dynamic = true;
+    addFeeds(this.cmd, src.st, true);
+  }
+
+  // `bash /dev/fd/3`, `source /dev/fd/3`: the script is whatever the descriptor was opened from
+  runFd(seg, word) {
+    markStdin(this.cmd, false);
+    const n = /^\/(?:dev|proc\/self)\/fd\/(\d+)$/.exec(word)?.[1];
+    const es = n === undefined ? [] : [this.ctx.fdFeeds.get(Number(n)), this.ctx.fdFeeds.get('{}')].filter(Boolean);
+    if (!es.length) { this.ctx.dynamic = true; return; }
+    for (const e of es) { addFeeds(this.cmd, e); if (e.dyn) this.ctx.dynamic = true; }
   }
 
   // The words of an interpreter's script: flag the run as dynamic if they hold run-time expansions, and
@@ -1767,6 +1954,7 @@ class Parser {
   }
 
   runStdin(seg, depth) {
+    markStdin(this.cmd, false);
     const src = stdinSource(seg);
     for (const text of src.texts) this.subParse(text, depth);
     if (src.unknown) this.ctx.dynamic = true;
@@ -1854,14 +2042,18 @@ class Parser {
       if (r.kind === 'script') this.runScript(seg, [r.text], r.text, depth);
       else if (r.kind === 'stdin') this.runStdin(seg, depth);
       else if (r.kind === 'file' && isProcSub(r.text)) this.runProcessSub(seg, r.text, depth);
+      else if (r.kind === 'file' && FD_PATH.test(r.text)) this.runFd(seg, r.text);
       if (r.amb) this.maybeProcessSubs(seg, argv, depth, r.kind === 'file' ? r.text : undefined);
     } else if (name === 'source' || name === '.') {
       const op = argv[1];
       if (op === undefined) return;
       if (STDIN_FILES.has(op)) this.runStdin(seg, depth);
+      else if (FD_PATH.test(op)) this.runFd(seg, op);
       else if (isProcSub(op)) this.runProcessSub(seg, op, depth);
       else this.noteWords(seg, [op], depth);
       if (hasExpansion(op) || op.startsWith('-')) this.maybeProcessSubs(seg, argv, depth, isProcSub(op) ? op : undefined);
+    } else if (INTERPRETER.test(name) && interpReadsStdin(argv)) {
+      this.runInterpStdin(seg);
     } else if (name === 'eval') {
       if (argv.length > 1) this.runScript(seg, argv.slice(1), argv.slice(1).join(' '), depth);
     } else if (name === 'trap') {
@@ -1895,7 +2087,7 @@ export function simpleCommands(str, opts) {
   const requested = Number.isFinite(opts?.maxDepth) ? Math.trunc(opts.maxDepth) : 5;
   // opts.expired: () => true once the evaluation's wall-clock deadline has passed; scans that can run long poll it and give up (truncated)
   const expired = typeof opts?.expired === 'function' ? opts.expired : null;
-  const ctx = { out: [], expired, maxDepth: Math.min(Math.max(requested, 0), HARD_MAX_DEPTH), truncated: false, dynamic: false, subshell: false, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0 };
+  const ctx = { out: [], expired, maxDepth: Math.min(Math.max(requested, 0), HARD_MAX_DEPTH), truncated: false, dynamic: false, subshell: false, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map() };
   let parser = null;
   try {
     parser = new Parser(ctx, String(str ?? ''));

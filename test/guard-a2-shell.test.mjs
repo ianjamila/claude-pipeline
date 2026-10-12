@@ -209,3 +209,107 @@ test('S1: shebangShell reads the shell a script starts (pure parser API)', () =>
   assert.equal(shebangShell(''), null);
   assert.equal(shebangShell('#!/usr/bin/env\n'), null);
 });
+
+// ---- S2: script text fed from a file reaches a program or shell by a route the first feed work did not model -------------------
+
+import { scriptFeedsOf } from '../pipeline/hooks/lib/shell-parse.mjs';
+const FEED = { 'f.sh': 'bad', 'x.sh': 'ok', 'ok.sh': 'ok' };
+const feedsOf = (line) => simpleCommands(line).flatMap((c) => scriptFeedsOf(c, line));
+
+test('S2: an interpreter with no script operand reads its program from stdin: the fed file is judged like `node f.mjs`', () => {
+  for (const c of ['node < f.sh', 'deno < f.sh', 'bun < f.sh', 'python3 < f.sh', 'python < f.sh', 'ruby < f.sh', 'perl < f.sh', 'php < f.sh', 'cat f.sh | node', 'node - < f.sh', 'node /dev/stdin < f.sh', 'tsx < f.sh', 'node --no-warnings < f.sh', 'node < <(cat f.sh)', 'python3 -u < f.sh']) denyBoth(c, FEED);
+  for (const c of ['node < x.sh', 'cat x.sh | node', 'node -e "console.log(1)" < f.sh', 'node x.sh < f.sh', "python3 -c 'print(1)' < f.sh", 'node --version < f.sh']) allowBoth(c, FEED);
+});
+
+test('S2: the fed file of an interpreter is a program, not a shell script (judged as program text)', () => {
+  const kinds = feedsOf('node < f.sh').map((r) => r.kind);
+  assert.deepEqual(kinds, ['interp']);
+  assert.deepEqual(feedsOf('bash < f.sh').map((r) => r.kind), ['shell']);
+});
+
+test('S2: a variable that holds the text of a file, then run as code', () => {
+  for (const c of [
+    'X=$(cat f.sh); eval "$X"', 'X=$(cat f.sh); $X', 'X=$(cat f.sh); bash -c "$X"', 'X=`cat f.sh`; eval $X', 'X=$(<f.sh); eval "$X"', 'export X=$(cat f.sh); eval "$X"',
+    'X=$(cat f.sh); echo "$X" | bash', 'X=$(cat f.sh); bash <<< "$X"', 'X=$(cat f.sh); eval "${X}"', 'X=$(cat f.sh); Y=$X; eval "$X"', 'X=$(cat f.sh); sh -c "$X"',
+    'X=$(cat f.sh); if true; then eval "$X"; fi', 'declare X=$(cat f.sh); eval "$X"', 'X=$(cat f.sh) && eval "$X"',
+  ]) denyBoth(c, FEED);
+  for (const c of [
+    'X=$(cat x.sh); eval "$X"', 'X=$(cat f.sh); echo "$X"', 'X=$(cat f.sh); eval "echo hi"', 'X=$(cat f.sh); Y=ok; eval "$Y"', 'X=$(cat x.sh); bash -c "$X"', 'X=$(cat f.sh); echo $X | wc -c',
+  ]) allowBoth(c, FEED);
+});
+
+test('S2: a file descriptor opened from a file earlier on the line feeds the shell that reads it', () => {
+  for (const c of [
+    'exec 3< f.sh; bash <&3', 'exec 3< f.sh; bash /dev/fd/3', 'exec 3< f.sh; source /dev/fd/3', 'exec 3< f.sh; . /dev/fd/3', 'exec 3< f.sh; cat <&3 | bash', 'bash /dev/fd/3 3< f.sh',
+    'exec 4< f.sh; bash 0<&4', 'exec 3<> f.sh; bash <&3', 'exec 3< f.sh; bash /proc/self/fd/3', 'exec 3< f.sh && bash <&3', 'exec 3< f.sh; node <&3', 'exec 5< ok.sh; exec 3< f.sh; bash <&3',
+  ]) denyBoth(c, FEED);
+  for (const c of ['exec 3< x.sh; bash <&3', 'exec 3< f.sh; echo hi >&3', 'exec 3< f.sh; cat <&3', 'exec 3< x.sh; bash /dev/fd/3', 'exec 3< f.sh; exec 3<&-; bash x.sh']) allowBoth(c, FEED);
+});
+
+test('S2: a process substitution that runs a shell receives the stream of the command it is an operand of', () => {
+  for (const c of [
+    'tee >(bash) < f.sh', 'cat f.sh | tee >(bash)', 'cat f.sh > >(bash)', 'cat f.sh | tee >(sh -s)', 'cat f.sh | tee >(cat | bash)', 'cat f.sh | tee out.txt >(zsh)', 'tee >(bash) >/dev/null < f.sh',
+  ]) denyBoth(c, FEED);
+  for (const c of ['cat x.sh | tee >(bash)', 'cat f.sh | tee >(wc -l)', 'tee >(bash) < x.sh', 'cat f.sh | tee >(cat > out.txt)']) allowBoth(c, FEED);
+});
+
+test('S2: xargs builds shell code from the text it is fed', () => {
+  for (const c of [
+    "xargs -I{} sh -c '{}' < f.sh", 'xargs bash -c < f.sh', 'cat f.sh | xargs -0 sh -c', "xargs -a f.sh -I{} bash -c '{}'", "xargs -I% sh -c '%' < f.sh", "xargs --arg-file=f.sh -I{} sh -c '{}'",
+    "cat f.sh | xargs -L1 sh -c 'echo; {}'", "xargs -I{} bash -lc '{}' < f.sh",
+  ]) denyBoth(c, FEED);
+  for (const c of ["xargs -I{} sh -c '{}' < x.sh", "xargs sh -c 'echo hi' < f.sh", 'xargs -n1 echo < f.sh', 'cat f.sh | xargs echo', 'cat f.sh | xargs wc -l', "xargs -I{} sh -c 'echo {}' < x.sh"]) allowBoth(c, FEED);
+});
+
+test('S2: only option-less cat (and cat -u) is an exact copy of a file: everything else that reads it is scanned', () => {
+  assert.deepEqual(feedsOf('cat f.sh | bash').map((r) => r.kind), ['shell']);
+  assert.deepEqual(feedsOf('cat -u f.sh | bash').map((r) => r.kind), ['shell']);
+  assert.deepEqual(feedsOf('cat -- f.sh | bash').map((r) => r.kind), ['shell']);
+  for (const c of ['cat -n f.sh | bash', 'cat -s f.sh | bash', 'cat -A f.sh | bash', 'cat -b f.sh | bash', 'less f.sh | bash', 'more f.sh | bash', 'bat f.sh | bash', 'batcat f.sh | bash', 'head -c 999 f.sh | bash', 'tail -c 9 f.sh | bash', 'tac f.sh | bash']) {
+    assert.deepEqual(feedsOf(c).map((r) => r.kind), ['scan'], c);
+    denyBoth(c, FEED);
+  }
+  // a scanned file is refused for any guarded word, an exact one only for a command that is really guarded
+  const safe = { 'p.sh': 'git push origin agent/x' };
+  assert.equal(git('cat p.sh | bash', fakeFs(GIT_ROOT, safe, DIRS)).decision, 'allow');
+  assert.equal(git('cat -n p.sh | bash', fakeFs(GIT_ROOT, safe, DIRS)).decision, 'deny');
+  assert.equal(git('bat p.sh | bash', fakeFs(GIT_ROOT, safe, DIRS)).decision, 'deny');
+});
+
+test('S2: several producers of one feed are judged joined when every one of them is a file that can be named', () => {
+  for (const c of ['{ cat f.sh; cat ok.sh; } | bash', '{ cat x.sh; cat f.sh; } | bash', '{ cat x.sh; cat $Z; } | bash', '{ cat x.sh; cat *.sh; } | bash', '{ cat x.sh; tail -c 9 f.sh; } | bash', '{ cat x.sh; cat ~root/a.sh; } | bash']) denyBoth(c, FEED);
+  for (const c of ['{ cat x.sh; cat ok.sh; } | bash', '{ cat x.sh; cat ok.sh; cat x.sh; } | sh', '{ cat x.sh; echo hi; } | bash', '(cat x.sh; cat ok.sh) | bash']) allowBoth(c, FEED);
+  // the texts are one program: a guarded command split between two producers is one command
+  const split = { 'a1.sh': 'git pu', 'a2.sh': 'sh origin main' };
+  assert.equal(git('{ cat a1.sh; cat a2.sh; } | bash', fakeFs(GIT_ROOT, split, DIRS)).decision, 'deny');
+  assert.equal(git('{ cat a2.sh; cat a1.sh; } | bash', fakeFs(GIT_ROOT, split, DIRS)).decision, 'allow');
+});
+
+test('S2: the program text of an inline interpreter run is not a file name', () => {
+  for (const c of [
+    `bash -c "$(node -e 'console.log([1,2].map((x)=>x*2)[0] === 2)')"`, `eval "$(node -e 'console.log(a[0] === 2)')"`, "bash -c \"$(node -e 'a=`x`')\"",
+    `node -e 'console.log(a[0] === 2)' | $PSQL $DB`, `node -e 'console.log(a[0] === 2)' | bash`, `python3 -c 'print(a[0])' | bash`, `bash -c "$(python3 -c 'print([1][0])')"`, `perl -e 'print $a[0]' | sh`,
+    `node --eval='console.log(a[0])' | bash`,
+  ]) allowBoth(c, FEED);
+  // the other words of the run are still files it may print
+  for (const c of [`node -e 'console.log(1)' f.sh | bash`, `bash -c "$(node -e 'x[0]' f.sh)"`, `python3 -c 'print(1)' f.sh | bash`]) denyBoth(c, FEED);
+});
+
+test('S2: several files fed to an interpreter are one program', () => {
+  const split = { 'p1.js': 'git pu', 'p2.js': 'sh origin main' };
+  assert.equal(git('cat p1.js p2.js | node', fakeFs(GIT_ROOT, split, DIRS)).decision, 'deny');
+  assert.equal(git('{ cat p1.js; cat p2.js; } | node', fakeFs(GIT_ROOT, split, DIRS)).decision, 'deny');
+  assert.equal(git('cat p2.js p1.js | node', fakeFs(GIT_ROOT, split, DIRS)).decision, 'allow');
+  const fsplit = { 'p1.js': 'echo x > ~/.cla', 'p2.js': 'ude/settings.json' };
+  assert.equal(files('cat p1.js p2.js | node', fakeFs(PROJ, fsplit, DIRS)).decision, 'deny');
+  assert.equal(files('cat p2.js p1.js | node', fakeFs(PROJ, fsplit, DIRS)).decision, 'allow');
+});
+
+test('S2: the joined program text of an interpreter is judged as program text, not as shell commands', () => {
+  const g = { 'p1.js': "spawnSync('git', ['pu", 'p2.js': "sh', 'origin', 'main'])" };
+  assert.equal(git('cat p1.js p2.js | node', fakeFs(GIT_ROOT, g, DIRS)).decision, 'deny');
+  assert.equal(git('cat p2.js p1.js | node', fakeFs(GIT_ROOT, g, DIRS)).decision, 'allow');
+  const fl = { 'p1.js': "require('fs').writeFileSync('/home/u/.cla", 'p2.js': "ude/settings.json', 'x')" };
+  assert.equal(files('cat p1.js p2.js | node', fakeFs(PROJ, fl, DIRS)).decision, 'deny');
+  assert.equal(files('cat p2.js p1.js | node', fakeFs(PROJ, fl, DIRS)).decision, 'allow');
+});

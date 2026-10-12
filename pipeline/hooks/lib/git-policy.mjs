@@ -932,6 +932,11 @@ function checkJoinedScripts(sf, dir, ctx, level) {
       ? deny(`${sf.file} are read by a command that feeds a shell, and mention a guarded operation, so what the shell runs cannot be verified. Write the command out literally.`)
       : null;
   }
+  // Why: the fed text of an interpreter (`cat a b | node`) is one program, judged as program text like a single `node f.mjs`, not as shell commands
+  if (sf.kind === 'interp') {
+    const why = guardedCommandText(texts.join(''));
+    return why ? deny(`the programs ${sf.file} (fed to an interpreter together) contain a guarded command (${why}); it cannot be verified by the guard. Run the operation directly.`) : null;
+  }
   if (level >= MAX_NESTING) return deny(`the scripts ${sf.file} are nested too deeply (scripts running scripts) to verify.`);
   const v = judgeScoped(texts.join(''), dir, ctx, level, sf);
   return v.decision === 'deny' ? deny(`the scripts ${sf.file} would run a blocked command: ${v.reason}`) : null;

@@ -1087,6 +1087,12 @@ function judgeJoinedScripts(sf, dirs, ctx, opts) {
         }
         continue;
       }
+      // Why: the fed text of an interpreter (`cat a b | node`) is one program, judged as program text like a single `node f.mjs`
+      if (sf.kind === 'interp') {
+        const r = judgeScriptText(texts.join(''), sf, abss.join(' '), d || ctx.cwd, ctx, opts);
+        if (r) return r;
+        continue;
+      }
       const r = evaluateBashForFiles(texts.join(''), { ...opts, cwd: d || ctx.cwd, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup });
       if (r.decision === 'deny') return deny(`the scripts ${sf.file} would run: ${r.reason}`);
     }
