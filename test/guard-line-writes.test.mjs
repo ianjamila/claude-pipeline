@@ -716,3 +716,59 @@ test('L1: an archive extracted into a relative directory of unknown place still 
   }
   assert.equal(gitOnly(unknownDir('git clone https://x/y.git sub; MID; bash /work/repo/ok.sh', MID_GIT)), 'allow'); // (the narrowing stays for a clone)
 });
+
+// ---- L1b: false blocks of the replay, "built from pieces" ---------------------------------------------------------------------
+
+test('L1b: an in-place edit (sed -i / perl -i) of a script that is then appended to stays an unknown piece ("built from pieces")', () => {
+  // Why: the edit's result is not the old text: `sed -i 's/X/sh/' ok.sh` turns `git puX origin main` into a push, and an append after it can complete a command the old text and the replacement
+  // only start. Judging old text + appends misses that, so the edit stays a write of unknown content. Accepted as a false block: `sed -i ...; cat >> s.mjs <<EOF ...; node s.mjs`.
+  const gitFs = fakeFs(GIT_ROOT, { 'ok.sh': 'git puX origin main' }, DIRS);
+  const filesFs = fakeFs(PROJ, { 'ok.sh': 'echo x > ~/.claude/settXings.json' }, DIRS);
+  for (const [prog, tail] of [["sed -i 's/X/sh/'", "echo hi >> ok.sh; bash ok.sh"], ["perl -pi -e 's/X/sh/'", "echo hi >> ok.sh; bash ok.sh"], ["sed -i '' 's/X/sh/'", "cat >> ok.sh <<'EOF'\necho hi\nEOF\nbash ok.sh"]]) {
+    const l = `${prog} ok.sh; ${tail}`;
+    assert.equal(git(l, gitFs).decision, 'deny', l);
+    assert.equal(files(l.replace('X/sh/', 'X//'), filesFs).decision, 'deny', l);
+  }
+  // an edit does not hide the other pieces: a bad appended text, an old text that is bad, a source copied in
+  denyBoth((bad) => `sed -i '$d' ok.sh && echo '${bad}' >> ok.sh && bash ok.sh`);
+  denyBoth("sed -i 's/a/b/' f.sh; echo hi >> f.sh; bash f.sh");
+  denyBoth('cp f.sh n.sh; sed -i "s/a/b/" n.sh; echo hi >> n.sh; bash n.sh');
+  denyBoth((_, mid) => `sed -i 's/a/b/' ok.sh; ${mid}; echo hi >> ok.sh; bash ok.sh`);
+});
+
+test('L1b: a file copied to a backup and back by a function the line calls is its own text (the copy comes round to it again)', () => {
+  // Why: `cp F bak; run(){ node mut F; cp bak F; }; run; run` : inside a function every copy is visible to the others, so F came from bak and bak from F, and the loop was read as "pieces"
+  const fsOpts = fakeFs(PROJ, { 'ok.sh': 'echo hi', 'f.sh': BAD_FILES });
+  for (const l of ['cp ok.sh a.sh; cp a.sh b.sh; run(){ bash a.sh; cp b.sh a.sh; cp a.sh b.sh; }; run; run', 'cp ok.sh bak.sh; run(){ bash ok.sh; cp bak.sh ok.sh; }; run; run', 'cp ok.sh bak.sh; run(){ sed -i "s/a/b/" ok.sh; bash ok.sh; cp bak.sh ok.sh; }; run; run']) {
+    assert.equal(files(l, fsOpts).decision, 'allow', l);
+  }
+  // the same path asked at ANOTHER point of the line is another question: a copy-back chain that puts the guarded half back in the file is judged on that text
+  denyBoth('cp p1.txt a.sh; cp a.sh b.sh; cp ok.sh a.sh; cat b.sh p2.txt > a.sh; bash a.sh');
+  denyBoth('cp p1.txt a.sh; cp a.sh b.sh; cp ok.sh a.sh; cp b.sh a.sh; cat p2.txt >> a.sh; bash a.sh');
+  // a chain that revisits a path at ANOTHER point of the line is not a cycle: harmless copies back and forth stay allowed
+  assert.equal(files('cp ok.sh a.sh; cp a.sh b.sh; cp ok.sh a.sh; cat b.sh ok.sh > a.sh; bash a.sh', fsOpts).decision, 'allow');
+  // the text going round is judged: a bad file copied in, or the file itself being bad, stays blocked
+  for (const l of ['cp f.sh bak.sh; run(){ bash ok.sh; cp bak.sh ok.sh; cp ok.sh bak.sh; }; run; run', 'cp f.sh a.sh; cp a.sh b.sh; run(){ bash a.sh; cp b.sh a.sh; cp a.sh b.sh; }; run; run', 'cp ok.sh bak.sh; run(){ bash f.sh; cp bak.sh f.sh; }; run; run']) {
+    assert.equal(files(l, fsOpts).decision, 'deny', l);
+  }
+});
+
+test('L1b: a source a rewriting command transforms is judged as text fed to a shell, even when node / python runs the result', () => {
+  // Why: a sed / awk program can turn a comment or a string of its source into code (`s#^// ##`), so judging the SOURCE as a program (a guarded command in its code) is not judging what runs.
+  // Only a byte-identical copy (cp, cat) keeps the program kind. Accepted as a false block: `sed -e 's/a/b/' tool.mjs > tool2.mjs && node tool2.mjs` when tool.mjs mentions a guarded word.
+  const spec = { ...SPEC, 'js.mjs': 'const list = []; list.push(1); function merge(a) { return a }\n' };
+  // the guarded command sits in a COMMENT of the source; the sed program uncomments it, then node runs it
+  const gitFs = fakeFs(GIT_ROOT, { 'c.mjs': `// ${BAD_GIT}\n` }, DIRS);
+  const filesFs = fakeFs(PROJ, { 'c.mjs': `// ${BAD_FILES}\n` }, DIRS);
+  for (const l of ["sed 's#^// ##' c.mjs > n.mjs; node n.mjs", "sed 's#^// ##' c.mjs > n.mjs && python3 n.mjs", "awk '{sub(/^\\/\\/ /, \"\")}1' c.mjs > n.mjs; node n.mjs"]) {
+    assert.equal(git(l, gitFs).decision, 'deny', l);
+    assert.equal(files(l, filesFs).decision, 'deny', l);
+  }
+  // guard-files: a protected file named in a comment (no write in the source yet) is refused too
+  assert.equal(files("sed 's#^// ##' c.mjs > n.mjs; node n.mjs", fakeFs(PROJ, { 'c.mjs': '// ~/.claude/settings.json\n' }, DIRS)).decision, 'deny');
+  // (a guarded WORD in the source is enough for guard-git; it has no word for guard-files to refuse)
+  for (const l of ["sed 's/a/b/' js.mjs > n.mjs && node n.mjs", "awk '{print}' js.mjs > n.mjs; node n.mjs"]) assert.equal(run(l, spec).git.r.decision, 'deny', l);
+  // a plain copy is the file itself: judged as the program it is
+  allowBoth('cp js.mjs n.mjs && node n.mjs', spec);
+  allowBoth('cat js.mjs > n.mjs && node n.mjs', spec);
+});

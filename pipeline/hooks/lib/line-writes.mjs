@@ -734,6 +734,16 @@ function hitsOn(frames, upto, asOf, P) {
 // computed, a write's place is unknown, too many combinations). A file nothing writes is its current text.
 function contentsOf(frames, upto, asOf, P, io, depth) {
   if (depth > 4) { io.pieces = true; return null; }
+  // Why: the very same question asked again while it is being answered (`cp F bak` ... `cp bak F` in a function the line calls: every copy is visible to the others, so F came from bak and bak
+  // from F) adds nothing: what goes round is the text the other writes put there, and each source is judged as the file it is. It is no content (null, never the file as it is on disk: the same path
+  // asked at ANOTHER point of the line is a different question)
+  io.stack ??= new Set();
+  const key = `${P}\u0000${upto}\u0000${asOf}`;
+  if (io.stack.has(key)) return null;
+  io.stack.add(key);
+  try { return contentsIn(frames, upto, asOf, P, io, depth); } finally { io.stack.delete(key); }
+}
+function contentsIn(frames, upto, asOf, P, io, depth) {
   const hits = hitsOn(frames, upto, asOf, P);
   // a write that may or may not be this file is tried both ways (its own content is judged on its own, as unknown content); more than four are left out
   const loose = hits.filter((h) => h.loose).slice(0, 4);
