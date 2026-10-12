@@ -509,3 +509,30 @@ test('S4b: a name set from a maybe-changed name is changed too (namerefs, read, 
     'source dyn.sh; W=/tmp; read V; echo x > $W/a.txt',
   ]) assert.equal(files(c, fs).decision, 'allow', c);
 });
+
+// ---- S4b: a cd into a directory only known at run time (files-policy) --------------------------------------------------------
+
+// Why: `cd $D` (D maybe-changed / unset / a substitution) may land in ~/.claude, so a relative write to one of its protected files is refused; other relative names stay allowed.
+test('S4b: a relative write to a protected name after a cd into an unknown directory is refused', () => {
+  const fs = fakeFs(PROJ, { 'dyn.sh': 'F=$(pick)', 'ok.sh': 'echo ok', 'w.sh': 'echo x > settings.json', 'n.sh': 'echo hi' }, DIRS);
+  const cds = ['source $X; cd $D', 'D=/tmp; source $X; cd $D', 'cd $UNSET', 'cd "$UNSET/sub"', 'cd $(pick)', 'cd `pick`', 'cd -', 'source dyn.sh; cd $F', 'pushd $(pick)', 'cd ${!N}'];
+  for (const cd of cds) {
+    for (const w of ['echo x > settings.json', 'echo x >> ./settings.json', 'cp ok.sh settings.json', 'tee settings.json < ok.sh', 'mv ok.sh agents/judge.md', 'echo x > skills/ship/SKILL.md', 'echo x > pipeline/hooks/guard-git.mjs', 'sed -i s/a/b/ settings.json', 'rm -rf pipeline',
+      // (the name comes from the source, the URL or the archive: the written path does not spell it)
+      'cp /tmp/x/settings.json .', 'cp /tmp/x/settings.json ./', 'cp -t . /tmp/x/settings.json', 'cp --target-directory=. /tmp/x/judge.md', 'mv /tmp/x/settings.json .', 'curl -O https://h/x/settings.json', 'tar -xf a.tar', 'tar xzf a.tgz', 'unzip a.zip', 'git checkout main', 'git -C r restore .', 'git stash pop',
+      // (a pattern, a variable or braces that can spell the name; a directory source; git global options with a value; the child frames of the line)
+      'F=settings.json; echo x > $F', 'echo x > settings.{json,x}', 'echo x > set*.json', 'echo x > `echo settings.json`', 'cp ok.sh $OUT', 'rm $NAME', 'cp /tmp/*.json .', 'cp -r /tmp/pipeline .', 'cp -r /tmp/x/.claude .', 'cp -r /tmp/x/. .', 'cp -r /tmp/x/$N .', 'dd if=ok.sh of=settings.json',
+      'git --work-tree . checkout x', 'git --git-dir g --work-tree w checkout x', 'git -c alias.x=!sh x', 'git frobnicate',
+      'bash -c "echo x > settings.json"', 'eval "cp ok.sh settings.json"', 'bash w.sh', 'source w.sh', 'sh < w.sh',
+      "node -e \"require('fs').writeFileSync('settings.json','x')\"", "python3 -c \"open('skills/ship/SKILL.md','w').write('x')\""]) {
+      assert.equal(files(`${cd} && ${w}`, fs).decision, 'deny', `${cd} && ${w}`);
+    }
+  }
+  for (const cd of ['cd $UNSET', 'cd $(pick)']) {
+    for (const w of ['echo x > notes.txt', 'cp ok.sh build/out.js', 'cat settings.json', 'ls pipeline', 'grep x settings.json', 'git commit -m settings.json', 'cp /tmp/x/notes.txt .', 'cp -r /tmp/x/build .', 'sed -i "s/a.*/b/" notes.txt', 'echo x > notes.{txt,md}', 'echo x > n*.txt', 'git add notes.txt', 'git commit -m x', 'git --git-dir g status', 'npm run $S', 'bash n.sh', "node -e 'console.log(1)'", 'cp /tmp/x/settings.json /tmp/y/', 'tar -tf a.tar', 'unzip -l a.zip', 'git status', 'git log', 'curl -O https://h/x/a.txt']) {
+      assert.equal(files(`${cd} && ${w}`, fs).decision, 'allow', `${cd} && ${w}`);
+    }
+  }
+  // (a known directory keeps relative writes to ordinary and protected-looking names alike, as before)
+  for (const c of ['cd sub && echo x > settings.json', 'D=sub; cd $D && cp ok.sh settings.json', 'cd ~ && echo x > notes.txt']) assert.equal(files(c, fs).decision, 'allow', c);
+});

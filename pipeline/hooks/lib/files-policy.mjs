@@ -1574,7 +1574,23 @@ function evaluateBashForFilesFrame(command, opts) {
   // a missed name would hide the script a variable picks. The replay found no false block from it.)
   // (a name the line never set, after a source nothing could follow: it may have come from that file)
   const newName = (n) => ctx.unknownAll && !Object.hasOwn(ctx.vars, n);
-  const withLineVars = (o, c = null) => ({ ...o, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set([...ctx.unknownVars, ...ctx.pickUnknown]), _unknownW: new Set(ctx.unknownVars), _srcChanged: taintClosure(ctx.srcChanged, cmds, c?.env ?? {}, newName, ctx.srcChanged.size > 0 || ctx.unknownAll), _unknownAll: ctx.unknownAll });
+  // Is the directory the line works in only known at run time? (a `cd` into an unset / substituted / maybe-changed name, `cd -`, `popd`; or the frame was started in one)
+  const unknownCwd = () => {
+    if (opts._unknownCwd === true) return true;
+    const live = ctx.srcChanged.size > 0 || ctx.unknownAll;
+    const tainted = live ? taintClosure(ctx.srcChanged, cmds, {}, newName, true) : new Set();
+    const KNOWN = new Set(['HOME', 'USER', 'LOGNAME']);
+    const unknownName = (n) => tainted.has(n) || newName(n) || ctx.unknownVars.has(n) || ctx.pickUnknown.has(n) || (!KNOWN.has(n) && !Object.hasOwn(ctx.vars, n));
+    return cmds.some((c) => {
+      const cn = baseOf(c.argv[0] ?? '');
+      if (!CD_CMDS.has(cn)) return false;
+      const t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
+      if (t === undefined) return cn === 'popd' || cn === 'pushd' || c.argv.slice(1).includes('-'); // (a bare cd goes home; popd / a bare pushd go to a directory the stack holds)
+      if (/[`$(]/.test(expandRefs(t, ctx)) || /\$\{!/.test(t) || /[`]|\$\(/.test(t)) return true;
+      return [...t.matchAll(/\$\{?(\w+)/g)].some((x) => unknownName(x[1]));
+    });
+  };
+  const withLineVars = (o, c = null) => ({ ...o, _unknownCwd: unknownCwd(), _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set([...ctx.unknownVars, ...ctx.pickUnknown]), _unknownW: new Set(ctx.unknownVars), _srcChanged: taintClosure(ctx.srcChanged, cmds, c?.env ?? {}, newName, ctx.srcChanged.size > 0 || ctx.unknownAll), _unknownAll: ctx.unknownAll });
 
   // A startup file is judged once per evaluation. It is marked first: a startup file that starts shells itself would be judged again and
   // again otherwise (a denial ends the whole evaluation, so marking before the verdict is safe).
@@ -1705,6 +1721,78 @@ function evaluateBashForFilesFrame(command, opts) {
       const operands = script === undefined ? c.argv : c.argv.filter((w, i) => w !== script || c.argv.indexOf(w) !== i);
       if ((c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && changed(r.target ?? '')) || (writes && (operands.some(changed) || Object.entries(c.env ?? {}).some(([k, v]) => !PATH_LISTS.has(k) && taintedEnv(v))))) {
         return deny('the command writes through a variable that a sourced file may have changed, so the file it reaches cannot be checked; write the path out');
+      }
+    }
+  }
+
+  // Why: after a `cd` into a directory only known at run time (`cd $UNSET`, `cd $(cmd)`, `cd -`, `cd $D` with D maybe-changed) the directory may be ~/.claude or one of its
+  // protected directories, so a relative write whose path starts like a protected file (`settings.json`, `skills/ship/x`, `pipeline/x`) is refused, wherever on the line the cd is.
+  // (FP: a repo that has a `pipeline/` dir, written to after a cd through a substitution; ordinary names stay allowed.)
+  {
+    const cdUnknown = unknownCwd();
+    if (cdUnknown) {
+      // The paths a relative word may name from ~/.claude or one of its protected directories: every tail of a protected path (`settings.json`, `skills/ship`, `.claude/pipeline`).
+      const TAILS = [...new Set(PROTECTED_REL.flatMap((p) => { const ps = p.split('/'); return ps.map((_, j) => ps.slice(j).join('/')); }))];
+      const eq = (a, b) => (ctx.ci ? a.toLowerCase() === b.toLowerCase() : a === b);
+      const protectedRun = (e) => {
+        const segs = posix.normalize(e.replace(/^(?:\.\/)+/, '')).split('/').filter((x) => x && x !== '..');
+        return PROTECTED_REL.some((p) => { const ps = p.split('/'); for (let j = 0; j < ps.length; j++) { const tail = ps.slice(j); if (segs.length >= tail.length && tail.every((x, i) => eq(x, segs[i]))) return true; } return false; });
+      };
+      // A word that may name a protected path from the unknown directory: its known variables are expanded first; what still holds `$` / a backtick is a run-time value (refused for a redirection target and for the operands of a command that writes its operands),
+      // braces are expanded, and a glob is refused when it can match a protected name (`set*.json`, `*`, `skills/*/SKILL.md`).
+      const maybeProtected = (w, strict) => {
+        const e0 = expandRefs(String(w), ctx);
+        if (strict && /[`$]/.test(e0)) return true;
+        for (const e1 of braceExpand(e0, ctx).split(/\s+/)) {
+          const e = toPosix(e1);
+          if (!e || isAbs(e) || e.startsWith('~') || e.startsWith('-')) continue;
+          if (/[*?[]/.test(e)) {
+            const re = globToRe(posix.normalize(e.replace(/^(?:\.\/)+/, '')), ctx.ci);
+            const last = e.split('/').pop();
+            if (!re || TAILS.some((t) => re.test(t) || re.test(t + '/' + last))) return true;
+          } else if (protectedRun(e)) return true;
+        }
+        return false;
+      };
+      // (a command that puts files into the cwd under names it picks: the name of a source written to `.`, a URL's name, whatever an archive holds or a checkout restores)
+      const NAMES = new Set(TAILS.flatMap((t) => t.split('/')));
+      const OPERAND_WRITERS = new Set([...DEST_ONLY, ...MOVERS, 'tee', 'rm', 'touch', 'mkdir', 'rmdir', 'truncate', 'dd', 'chmod', 'chown', 'sed', 'gsed', 'shred', 'unlink', 'mkfifo', 'install']);
+      const GIT_PLAIN = new Set(['status', 'log', 'diff', 'show', 'rev-parse', 'ls-files', 'blame', 'branch', 'describe', 'config', 'ls-tree', 'cat-file', 'grep', 'remote', 'tag', 'shortlog', 'for-each-ref', 'rev-list', 'name-rev', 'show-ref', 'ls-remote', 'diff-tree', 'diff-index', 'symbolic-ref', 'version', 'help', 'add', 'commit', 'push', 'fetch', 'init']);
+      const INLINE_CODE = new Set(['node', 'nodejs', 'deno', 'bun', 'tsx', 'ts-node', 'python', 'python3', 'ruby', 'perl', 'php', 'awk', 'gawk']);
+      const CODE_NAMES = /settings\.json|implementer\.md|verifier\.md|judge\.md|arbiter\.md|\.claude\b|skills\/(?:ship|verify|pipeline-setup)|(?:^|[^\w.-])pipeline\//i;
+      const GIT_VALUE_OPTS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--config-env', '--super-prefix']);
+      const putsNames = (c) => {
+        const cn = baseOf(c.argv[0] ?? '');
+        const args = c.argv.slice(1);
+        const leaf = (w) => toPosix(expandRefs(String(w), ctx)).replace(/[?#].*$/, '').replace(/\/+$/, '').split('/').pop();
+        const unsure = (w) => /[`$*?[{]/.test(expandRefs(String(w), ctx)); // (a value only known at run time or a pattern: it may be any name)
+        if (DEST_ONLY.has(cn) || MOVERS.has(cn)) {
+          const pos = args.filter((a) => !a.startsWith('-'));
+          const dirOpt = args.some((a) => a === '-t' || a === '--target-directory' || a.startsWith('--target-directory=') || /^-[A-Za-z]*t./.test(a));
+          const dest = dirOpt ? '.' : pos[pos.length - 1] ?? '.';
+          if (isAbs(toPosix(dest)) || dest.startsWith('~')) return false;
+          const srcs = dirOpt ? pos : pos.slice(0, -1);
+          // (a source with a protected name or segment, a `/.` source whose contents land in the cwd, a pattern or a run-time value)
+          return srcs.some((w) => NAMES.has(leaf(w)) || /(?:^|\/)\.$/.test(toPosix(w)) || unsure(w));
+        }
+        // (inline program text of an interpreter: it names the file it writes inside the code)
+        if (INLINE_CODE.has(cn)) return args.some((w) => CODE_NAMES.test(w));
+        if (cn === 'curl' || cn === 'wget') return args.some((w) => NAMES.has(leaf(w)) || unsure(w));
+        if (cn === 'tar' || cn === 'bsdtar' || cn === 'gtar') return args.some((a, i) => /^-[A-Za-z]*x[A-Za-z]*$|^--(?:extract|get)$/.test(a) || (i === 0 && /^[A-Za-z]*x[A-Za-z]*$/.test(a)));
+        if (['unzip', 'unrar', '7z', '7za', 'cpio', 'gunzip', 'unxz', 'bunzip2', 'unar'].includes(cn)) return args.length > 0 && !args.some((a) => /^-(?:l|t|v|Z|p|c)$/.test(a) || /^[lt]$/.test(a));
+        if (cn === 'git') {
+          // (global options with a separate value are skipped; a config override may define an alias that runs anything; a subcommand that is not known to leave the tree alone writes it)
+          let k = 0;
+          while (k < args.length && args[k].startsWith('-')) { if (/^(?:-c|--config-env)$/.test(args[k]) || /^-c./.test(args[k])) return true; k += GIT_VALUE_OPTS.has(args[k]) ? 2 : 1; }
+          return args[k] !== undefined && !GIT_PLAIN.has(args[k]);
+        }
+        return false;
+      };
+      for (const c of cmds) {
+        if (c.argv.length > 0 && !CD_CMDS.has(baseOf(c.argv[0])) && !isReadOnly(c, ctx) && putsNames(c)) return deny('the command puts files into the current directory after a cd into a directory only known at run time, and one may be a protected pipeline file; write the directory out');
+        const hit = (c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && typeof r.target === 'string' && r.target !== '/dev/null' && !r.target.startsWith('&') && maybeProtected(r.target, true))
+          || (c.argv.length > 0 && !CD_CMDS.has(baseOf(c.argv[0])) && !isReadOnly(c, ctx) && (() => { const drop = proseWords(c.argv).drop; return c.argv.slice(1).some((w, i) => !drop.has(i + 1) && maybeProtected(w.replace(/^-{0,2}[\w-]+=/, ''), OPERAND_WRITERS.has(baseOf(c.argv[0])))); })());
+        if (hit) return deny('the command writes a relative path that may be a protected pipeline file after a cd into a directory only known at run time, so the file it reaches cannot be checked; write the directory out');
       }
     }
   }
