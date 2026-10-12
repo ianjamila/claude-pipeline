@@ -273,7 +273,10 @@ function stdoutItems(cmd) {
     fromStream(s.stdin);
     const stdinUnknown = s.stdin.fed && !s.stdin.texts.length && !s.stdin.files.length && !s.stdin.computed.length;
     if (stdinUnknown) items.push({ unknown: true });
-    return withParts(items.length ? dedupe(items) : [{ text: '' }], [...partsOfStream(s.out), ...partsOfStream(s.stdin), ...(stdinUnknown ? [[{ unknown: true }]] : [])]);
+    // Why: for a reader the texts `out` lists (its own heredoc / here-string) ARE what it reads on stdin: the file holds them once. The files it names (cat a - < a) are
+    // pieces of their own, in order, so `cat a - < a` is a twice
+    const outParts = partsOfStream({ ...s.out, texts: [] });
+    return withParts(items.length ? dedupe(items) : [{ text: '' }], [...outParts, ...partsOfStream(s.stdin), ...(stdinUnknown ? [[{ unknown: true }]] : [])]);
   } else if (name === ':' || name === 'true' || name === 'false') items.push({ text: '' });
   else return [{ unknown: true }, ...s.out.computed.map((scan) => ({ scan }))]; // a program's output: unknown, but the files it reads are worth a scan (base64 -d x.b64)
   return items.length ? dedupe(items) : [{ text: '' }];

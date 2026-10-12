@@ -60,7 +60,7 @@ const aliasReal = (root) => {
   };
 };
 function run(line, spec, alias = false) {
-  const mk = (bad, ok) => Object.fromEntries(Object.entries(spec).map(([k, v]) => [k, v === 'bad' ? bad : v === 'ok' ? ok : v === 'bad1' ? bad.slice(0, 8) : v === 'bad2' ? bad.slice(8) : v]));
+  const mk = (bad, ok) => Object.fromEntries(Object.entries(spec).map(([k, v]) => [k, v === 'bad' ? bad : v === 'ok' ? ok : v === 'bad1' ? bad.slice(0, 8) : v === 'bad2' ? bad.slice(8) : v === 'rot' ? bad.slice(8) + '\n' + bad.slice(0, 8) : v]));
   const g = typeof line === 'string' ? line : line(BAD_GIT, MID_GIT, CALM_GIT);
   const f = typeof line === 'string' ? line : line(BAD_FILES, MID_FILES, CALM_FILES);
   return {
@@ -670,4 +670,20 @@ test('line-writes: flowStart finds the first command that may repeat', () => {
   assert.equal(flowStart(simpleCommands('echo a; for i in 1 2; do echo b; done')), 1);
   assert.equal(flowStart(simpleCommands('echo a; echo b')), -1);
   assert.equal(flowStart(simpleCommands('(echo a)')), 0);
+});
+
+// ---- L1: false blocks of the replay (126k real commands) ---------------------------------------------------------------------
+
+test('L1: a script written by a heredoc is the heredoc text once, not twice (a variable it assigns once is not "assigned twice")', () => {
+  // Why: `cat > n.sh <<EOF` lists the heredoc as what cat prints AND as what it reads, so the joined text was the script twice and `B=...` looked reassigned
+  for (const l of ["cat > n.sh <<'EOF'\nB=feature\ngit push origin $B\nEOF\nbash n.sh", "cat > n.sh <<EOF\nB=feature\ngit push origin $B\nEOF\nbash n.sh", "cat <<'EOF' > n.sh\nB=feature\ngit push origin $B\nEOF\nbash n.sh"]) allowBoth(l);
+  const recs = writesOf(simpleCommands("cat > n.sh <<'EOF'\nX=1\nEOF")).recs;
+  assert.deepEqual(recs.map((r) => r.parts), [[[{ text: 'X=1' }]]]);
+  // the pieces are still all there: cat of two files, a file and a heredoc
+  denyBoth('cat p1.txt p2.txt > n.sh; bash n.sh');
+  denyBoth((bad) => `cat > n.sh <<'EOF'\n${bad}\nEOF\nbash n.sh`);
+  assert.equal(writesOf(simpleCommands('cat a.txt a.txt > n.sh')).recs[0].parts.length, 2);
+  // a file read twice (named and as stdin) IS written twice: the doubled text forms a command that neither copy holds (the value is the same, the source is not)
+  denyBoth('cat rot.txt - < rot.txt > n.sh; bash n.sh', { ...SPEC, 'rot.txt': 'rot' });
+  denyBoth('cat rot.txt rot.txt > n.sh; bash n.sh', { ...SPEC, 'rot.txt': 'rot' });
 });
