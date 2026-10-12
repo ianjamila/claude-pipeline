@@ -1590,3 +1590,46 @@ test('L4: a pipe-fed rewriting command scans what its upstream producers read, a
   denyBoth((bad) => `echo '${bad.replace(/a/g, 'Q')}' | tr Q a > n.sh; bash n.sh`, spec); // (the rewrite makes the command: the text alone names nothing)
   for (const l of ['cat up2.txt | tr A-Z a-z > n.sh; bash n.sh', 'cat ok.sh | tr A-Z a-z > n.sh; bash n.sh', 'cat up.txt | tr A-Z a-z > m.sh; bash n.sh']) allowBoth(l, spec);
 });
+
+test('L4: git purity: stash show / list and reflog take the diff-like output check, ls-remote --upload-pack / --exec / -u run a program, git grep -O may be bundled', () => {
+  for (const l of ['git stash show --output=n.sh', 'git stash show -p --out=n.sh', 'git stash list --output=n.sh', 'git reflog --output=n.sh', 'git reflog show --ext-diff', 'git stash show --textconv', 'git stash show -o n.sh', 'git ls-remote --upload-pack=CMD origin', 'git ls-remote --upload-p CMD origin', 'git ls-remote --exec=CMD origin', 'git ls-remote -u CMD origin', 'git ls-remote --receive-pack=CMD origin',
+    'git grep -iO x', 'git grep -nO x', 'git grep -O x', 'git grep --open-files-in-pager=less x']) assert.equal(un3(l), 1, l);
+  for (const l of ['git stash list', 'git stash show', 'git stash show -p', 'git reflog', 'git reflog show HEAD', 'git ls-remote origin', 'git ls-remote --heads origin', 'git grep -in x', 'git grep -n x']) assert.equal(un3(l), 0, l);
+});
+
+test('L4: wget -nc is read from the parsed options only (a bundle such as -anc is -a with a log file named nc)', () => {
+  const dests = (l) => recs3(l).map((r) => r.dest);
+  assert.ok(dests('wget -anc http://h/n.sh').includes('n.sh.[0-9]*'));
+  assert.ok(dests('wget -q -anc http://h/n.sh').includes('n.sh.[0-9]*'));
+  assert.ok(dests('wget -anc http://h/n.sh').includes('nc')); // (the log file)
+  assert.ok(!dests('wget -nc http://h/n.sh').includes('n.sh.[0-9]*'));
+  assert.ok(!dests('wget --no-clobber http://h/n.sh').includes('n.sh.[0-9]*'));
+  denyBoth((_, mid) => `wget -anc http://h/n.sh; ${mid}; bash n.sh.1`);
+});
+
+test('L4: the generic fallback exempts only the script operand of the command\'s own interpreter, skips the values of interpreter options, and reads attached short values', () => {
+  // Why: `mytool node ok.sh` runs mytool, which may write ok.sh; `node -r ok.sh t.mjs` loads ok.sh (it is not the script); `mytool -oN.sh` / `-fok.sh` attach the file to the option
+  const exempt = ['mytool node ok.sh', 'mytool bash ok.sh', 'mytool python3 ok.sh', 'mytool -- node ok.sh', 'node -r ok.sh t.mjs', 'node --require ok.sh t.mjs', 'node --import ok.sh t.mjs', 'bash -o posix ok.sh -x ok.sh', 'mytool -ook.sh', 'mytool -fok.sh', 'mytool -xfok.sh', 'mytool -o=ok.sh', 'python3 -W ok.sh t.py', "node -e 'x' ok.sh", "node -pe 'x' ok.sh", "python3 -c 'x' ok.sh", "python3 -m mod ok.sh", "perl -e 'x' ok.sh", "perl -ne 'x' ok.sh", "ruby -e 'x' ok.sh", "bash -c 'x' ok.sh", "bash -ec 'x' ok.sh", "php -r 'x' ok.sh"];
+  for (const l of exempt) denyBoth((_, mid) => `${l}; ${mid}; bash ok.sh`);
+  // the nearest twins stay allowed: the script operand of the command's own interpreter, through its wrappers
+  for (const l of ['node ok.sh', 'node -r other.js ok.sh', 'node --require=other.js ok.sh', 'timeout 5 bash ok.sh', 'env A=1 node ok.sh', 'nice -n 5 bash ok.sh', 'env -i bash ok.sh', 'python3 -W error ok.sh', 'bash -o posix ok.sh', 'bash -ex ok.sh', 'sh -x ok.sh', 'perl -I lib ok.sh', 'mytool -la other.sh', 'mytool -x 3']) {
+    assert.equal(run((_, mid) => `${l}; ${mid}; bash ok.sh`, SPEC).git.r.decision, 'allow', l);
+  }
+});
+
+test('L4: an awk program file that is not a plain file (-, /dev/stdin, /dev/fd/N, /proc/...) is never read: not pure', () => {
+  // Why: the hook would read the device itself (different text from what awk sees)
+  for (const f of ['-', '/dev/stdin', '/dev/fd/3', '/proc/self/fd/0', '/dev/null']) {
+    assert.equal(awkArgsPure(['-f', f, 'x'], {}, () => ['{ print $1 }']), false, f);
+    assert.equal(awkArgsPure([`--file=${f}`, 'x'], {}, () => ['{ print $1 }']), false, f);
+  }
+  assert.equal(awkArgsPure(['-f', 'p.awk', 'x'], {}, () => ['{ print $1 }']), true);
+  denyBoth((_, mid) => `awk -f /dev/stdin x < r.awk; ${mid}; bash n.sh`, { ...SPEC, 'r.awk': '{ print > "n.sh" }' });
+});
+
+test('L4: a single-dash word too long to take apart makes the command a write to any file (never a cut candidate list)', () => {
+  const long = `-o${'x'.repeat(90)}`;
+  denyBoth((_, mid) => `mytool ${long}; ${mid}; bash ok.sh`);
+  assert.equal(recs3(`mytool ${long}`).filter((r) => r.dest === null && r.loose).length, 1);
+  assert.equal(run((_, mid) => `mytool -o${'x'.repeat(30)}; ${mid}; bash ok.sh`, SPEC).git.r.decision, 'allow');
+});

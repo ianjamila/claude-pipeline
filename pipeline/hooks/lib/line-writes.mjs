@@ -577,7 +577,7 @@ function argRecords(cmd, name, idx, lineEnv = {}, io = {}) {
     if (os.length) for (const o of os) out.push(unknown(o));
     else {
       // Why: a URL names the file by its last path segment (a query stays in the name, %XX is decoded); an empty segment (index.html / --default-page) is not a name we can read; an existing file is kept and the new one is `name.1`, `name.2` ...
-      const clobberSafe = hasOpt(opts, 'nc', 'no-clobber', 'N', 'timestamping') || args.some((a) => /^-[A-Za-z]*nc/.test(a));
+      const clobberSafe = hasOpt(opts, 'N', 'timestamping') || opts.some((o) => o.name === 'clobber' && o.negated) || opts.some((o) => o.name === 'n' && o.value === 'c'); // (-nc is -n with the value c; -anc is -a with the log file nc)
       for (const u of pos) {
         const noFrag = u.replace(/#.*$/, '');
         const last = noFrag.endsWith('/') ? '' : noFrag.split('/').pop();
@@ -711,9 +711,11 @@ function gitPure(args, envKeys = []) {
   if (sub === undefined) return true;
   const dashed = rest.filter((a) => a.startsWith('-'));
   const pos = rest.filter((a) => !a.startsWith('-'));
-  if (GIT_PLAIN_READ.has(sub)) return !rest.some((a) => prefixOfAny(a, ['output', 'output-directory', 'ext-diff', 'textconv']) || (a === '-o' && sub !== 'ls-files'));
+  // Why: ls-remote -u / --upload-pack / --exec / --receive-pack run a program on the other side; stash show / list and reflog print diffs, so --output / -o / ext-diff / textconv apply to them too
+  const outputish = rest.some((a) => prefixOfAny(a, ['output', 'output-directory', 'ext-diff', 'textconv']) || (!a.startsWith('--') && /^-[a-z0-9]*o/.test(a)));
+  if (GIT_PLAIN_READ.has(sub)) return !rest.some((a) => prefixOfAny(a, ['output', 'output-directory', 'ext-diff', 'textconv']) || (a === '-o' && sub !== 'ls-files')) && !(sub === 'ls-remote' && rest.some((a) => prefixOfAny(a, ['upload-pack', 'exec', 'receive-pack']) || (!a.startsWith('--') && /^-[A-Za-z]*u/.test(a))));
   if (GIT_DIFFLIKE.has(sub)) return !rest.some((a) => prefixOfAny(a, ['output', 'output-directory', 'ext-diff', 'textconv']) || /^-[a-z0-9]*o/.test(a));
-  if (sub === 'grep') return !rest.some((a) => /^-O/.test(a) || prefixOfAny(a, ['open-files-in-pager']));
+  if (sub === 'grep') return !rest.some((a) => (!a.startsWith('--') && /^-[A-Za-z0-9]*O/.test(a)) || prefixOfAny(a, ['open-files-in-pager'])); // (-O may be bundled: -iO)
   if (sub === 'branch') {
     if (dashed.some((a) => (!a.startsWith('--') && /[dDmMcCfutT]/.test(a.slice(1))) || /^--(?:delete|move|copy|force|set-upstream|set-upstream-to|unset-upstream|edit-description|track|no-track|create-reflog)/.test(a))) return false;
     return !pos.length || dashed.some((a) => a === '-l' || a === '--list');
@@ -729,8 +731,8 @@ function gitPure(args, envKeys = []) {
   }
   if (sub === 'symbolic-ref') return !dashed.some((a) => /^(?:-d|-m|--delete)$/.test(a)) && pos.length <= 1;
   if (sub === 'worktree') return pos[0] === 'list';
-  if (sub === 'stash') return pos[0] === 'list' || pos[0] === 'show';
-  if (sub === 'reflog') return !pos.length || pos[0] === 'show' || pos[0] === 'exists';
+  if (sub === 'stash') return (pos[0] === 'list' || pos[0] === 'show') && !outputish;
+  if (sub === 'reflog') return (!pos.length || pos[0] === 'show' || pos[0] === 'exists') && !outputish;
   return false;
 }
 
@@ -988,7 +990,8 @@ function awkScan(args, env = {}, read = null) {
     if (AWK_PROGRAM_CODE.test(stripped)) { if (/[>|]|\bsystem\s*\(/.test(stripped)) r.writes = true; bad(); }
   };
   // Why: a program FILE (-f / -E / --file / --exec) is scanned like the program text when it can be read; unreadable (or no reader: the caller cannot place it) = not pure
-  const programFile = (w) => { const texts = read ? read(w) : null; if (texts === null || texts === undefined) bad(); else for (const t of texts) program(t); };
+  // (a device or a pipe -- `-`, /dev/stdin, /dev/fd/N, /proc/... -- is not a file the hook can read: awk would see other text)
+  const programFile = (w) => { const texts = read && !/^(?:-|\/(?:dev|proc|sys)(?:\/|$))/.test(w) ? read(w) : null; if (texts === null || texts === undefined) bad(); else for (const t of texts) program(t); };
   const all = Object.values(AWK_LONG).flat();
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -1049,20 +1052,50 @@ function isPure(cmd, name, lineEnv = {}, io = {}) {
 // is the old residual (`make; bash ok.sh`): only a script that is missing now counts as maybe-created.
 const INTERPRETER = /^(?:bash|sh|zsh|dash|ksh|ash|fish|csh|tcsh|source|\.|node|nodejs|deno|bun|tsx|ts-node|python[\d.]*|ruby|perl|php|pwsh|powershell|exec)$/;
 const READ_ONLY_TOOLS = new Set(['shellcheck', 'od', 'strings', 'nl', 'fold', 'fmt', 'rev', 'comm', 'column', 'expand', 'unexpand', 'pr', 'zcat', 'gzcat', 'xzcat', 'bzcat', 'cksum', 'sum', 'b2sum', 'sha224sum', 'sha384sum', 'sha512sum', 'nm', 'otool', 'ldd', 'objdump']);
+// Why: only the script operand of the command's OWN interpreter (argv[0], through env / timeout / nice ... and their options) is run, not written; `mytool node ok.sh` runs mytool, which may write ok.sh. The values of an
+// interpreter's options (node -r ok.sh, bash -o posix, python -W x) are not the script: they stay named.
+const WRAPPERS = new Set(['env', 'timeout', 'nice', 'nohup', 'time', 'command', 'exec', 'stdbuf', 'setsid', 'ionice', 'sudo', 'doas', 'builtin', 'xcrun', 'caffeinate']);
+// Per interpreter: the option that carries program text (then there is NO script operand: `node -e '...' ok.sh` runs the program, which may write ok.sh) and the options whose value is a module or a setting (skipped)
+const INTERP_CODE = { shell: /^-[A-Za-z]*c$/, node: /^(?:-[A-Za-z]*[ep]|--eval|--print)$/, perl: /^-[A-Za-z]*[eE]$/, python: /^(?:-[A-Za-z]*c|-m)$/, php: /^-[A-Za-z]*r$/ };
+const INTERP_VALUE = { shell: /^(?:-o|-O|--rcfile|--init-file)$/, node: /^(?:-r|--require|--import|--loader|--experimental-loader)$/, perl: /^(?:-I|-M|-m)$/, python: /^(?:-W|-X)$/, php: /^(?:-d|-c)$/ };
+const interpFamily = (n) => (/^(?:bash|sh|zsh|dash|ksh|ash|fish|csh|tcsh|source|\.|exec)$/.test(n) ? 'shell' : /^(?:node|nodejs|deno|bun|tsx|ts-node)$/.test(n) ? 'node' : /^(?:perl|ruby)$/.test(n) ? 'perl' : /^python[\d.]*$/.test(n) ? 'python' : n === 'php' ? 'php' : 'shell');
+// -> { script, code }: the index of the script operand and of the program text (-1: none). With program text there is no script operand.
+function interpreterOperand(argv) {
+  let j = 0;
+  while (j < argv.length) {
+    const w = argv[j];
+    if (INTERPRETER.test(commandName(w))) break;
+    if (!(WRAPPERS.has(commandName(w)) || w.startsWith('-') || /^\w+=/.test(w) || /^\d+(?:\.\d+)?[smhd]?$/.test(w))) return { script: -1, code: -1 }; // (something else comes first: it is the command)
+    j++;
+  }
+  if (j >= argv.length) return { script: -1, code: -1 };
+  const fam = interpFamily(commandName(argv[j]));
+  for (let k = j + 1; k < argv.length; k++) {
+    if (argv[k] === '--') return { script: argv[k + 1] === undefined ? -1 : k + 1, code: -1 };
+    if (INTERP_CODE[fam].test(argv[k])) return { script: -1, code: argv[k + 1] === undefined ? -1 : k + 1 };
+    if (INTERP_VALUE[fam].test(argv[k])) { k++; continue; }
+    if (!argv[k].startsWith('-')) return { script: k, code: -1 };
+  }
+  return { script: -1, code: -1 };
+}
 function genericRecord(cmd, name, idx) {
   if (READ_ONLY_TOOLS.has(name)) return null;
   const exempt = new Set();
-  cmd.argv.forEach((w, j) => { // the first operand after an interpreter is the script it runs, which it does not write
-    if (!INTERPRETER.test(commandName(w))) return;
-    for (let k = j + 1; k < cmd.argv.length; k++) if (!cmd.argv[k].startsWith('-')) { exempt.add(k); break; }
-  });
+  // (the program text itself is judged as text -- unwrapped by the parser or the inline-program record -- it is not a file name)
+  const at = interpreterOperand(cmd.argv);
+  if (at.script > 0) exempt.add(at.script);
+  if (at.code > 0) exempt.add(at.code);
   const words = new Set();
+  let tooLong = false;
   const add = (w) => { if (w !== '' && !w.startsWith('-')) words.add(w); };
   cmd.argv.slice(1).filter((_, k) => !exempt.has(k + 1)).forEach((w) => { // (the arguments only: a prefix assignment such as BASH_ENV=rc is the shell's startup file, judged on its own)
     const eq = w.indexOf('=');
     if (eq > 0) add(w.slice(eq + 1)); // (--out=F, of=F, NAME=F)
     add(w);
+    // Why: -oN.sh / -fok.sh / -o=N.sh / -xfok.sh attach the value to the option letters: every tail of a single-dash word may be the file
+    if (/^-[A-Za-z]/.test(w) && w.length > 2) { if (w.length > 80) tooLong = true; else for (let k = 2; k < w.length; k++) add(w[k] === '=' ? w.slice(k + 1) : w.slice(k)); }
   });
+  if (tooLong) return anywhere(idx); // (a word too long to take apart: the command may write any file, never a cut list)
   if (!words.size) return null;
   const list = [...words];
   return { idx, dest: null, generic: list, items: [{ unknown: true }, ...list.map((file) => ({ file }))], loose: true };
@@ -1108,7 +1141,8 @@ export function writesOf(cmds, io = {}) {
     // a program the parser does not unwrap (strace, chroot, nsenter, a wrapper we have never seen) that is handed a writer: the writer's own writes, and a write to
     // any file (the wrapper may have changed the directory or the root) with unknown content
     if (!mine && !isPure(cmd, name, lineEnv, here)) {
-      if (!INLINE_RUNNERS[name] || cmd.argv.findIndex((a, i) => i > 0 && INLINE_RUNNERS[name].test(a)) <= 0) { const g = genericRecord(cmd, name, idx); if (g) recs.push(g); }
+      const g = genericRecord(cmd, name, idx); // (also for an inline program: its other words may be files it writes)
+      if (g) recs.push(g);
       const at = cmd.argv.findIndex((w, i) => i > 0 && WRITER_NAMES.has(commandName(w)));
       if (at > 0) {
         const inner = { ...cmd, argv: cmd.argv.slice(at) };
@@ -1187,7 +1221,7 @@ export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, real
     const e = expand(word);
     if (e === null) return null;
     const paths = locate(e, idx).filter((x) => isAbs(x)); // (the bare word is only the fallback for a directory we do not know)
-    if (!paths.length) return null;
+    if (!paths.length || paths.some((x) => /^\/(?:dev|proc|sys)(?:\/|$)/.test(String(x).replace(/\\/g, '/')))) return null;
     const texts = paths.map((x) => readText(x));
     return texts.every((t) => typeof t === 'string') ? texts : null;
   } : null;
