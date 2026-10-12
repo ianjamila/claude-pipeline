@@ -1,7 +1,7 @@
 // summary and agent-log: the PR summary comment + log line, and the queue/stage flow for the agent log file.
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
@@ -10,6 +10,9 @@ import { cli, PR, AGENT_LOG, ME, REPO } from './helpers/gate-env.mjs';
 import { addRound, emptyState, saveState } from '../pipeline/lib/state.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
+import { run as summaryRun } from '../pipeline/commands/summary.mjs';
+import { UnavailableError } from '../pipeline/lib/cli.mjs';
+import { LEDGER_NAME } from '../pipeline/lib/notify.mjs';
 
 // ---- summary --------------------------------------------------------------------------------------
 
@@ -138,6 +141,210 @@ test('summary: an unreachable GitHub is exit 3', () => {
   saveState(repo.dir, summaryState());
   const r = cli(['summary', '--pr', String(PR), '--outcome', 'merged'], { dir: repo.dir, fake: createFakeGh([{ match: '.', code: 1, stderr: 'HTTP 401' }]) });
   assertExit(r, 3);
+});
+
+// ---- summary: the owner push ---------------------------------------------------------------------
+// In process, so the notify transports are fakes: nothing here reaches the network or a real home directory.
+
+const TOPIC = 'SUMMARYSENTINELTOPIC';
+const scratchDirs = [];
+after(() => scratchDirs.forEach((d) => rmSync(d, { recursive: true, force: true, maxRetries: 3 })));
+
+function notifyRig() {
+  const dir = mkdtempSync(join(tmpdir(), 'cp-summary-notify-'));
+  scratchDirs.push(dir);
+  const secretsFile = join(dir, 'secrets.sh');
+  writeFileSync(secretsFile, `export NTFY_TOPIC=${TOPIC}\n`);
+  const fetchCalls = [];
+  const deps = {
+    env: {},
+    secretsFile,
+    stateDir: join(dir, 'state'),
+    git: (args) => (args[0] === 'remote' ? 'git@github.com:acme/widgets.git' : ''),
+    isWsl: () => false,
+    lookup: async () => { throw new Error('summary must not look the PR up again when it has the title'); },
+    fetch: async (url, init) => {
+      fetchCalls.push({ url, body: JSON.parse(init.body) });
+      return { ok: true, status: 200 };
+    },
+  };
+  return { deps, fetchCalls, ledger: () => (existsSync(join(dir, 'state', LEDGER_NAME)) ? readFileSync(join(dir, 'state', LEDGER_NAME), 'utf8') : '') };
+}
+
+function pushRepo(state = summaryState()) {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml());
+  repo.write('.gitignore', '.review/\n');
+  repo.commit('init');
+  if (state) saveState(repo.dir, state);
+  return repo;
+}
+
+async function summaryIn(repo, args, { fake = summaryGh(), rig = notifyRig() } = {}) {
+  const stderr = [];
+  const orig = process.stderr.write;
+  process.stderr.write = (c, ...rest) => { stderr.push(String(c)); return true; };
+  try {
+    const argv = ['--pr', String(PR), ...args];
+    const ctx = { cwd: repo.dir, env: { ...process.env, ...fake.env }, notifyDeps: rig.deps };
+    let res;
+    let error;
+    try {
+      res = await summaryRun(argv, ctx);
+    } catch (err) {
+      error = err;
+    }
+    return { res, error, rig, fake, stderr: stderr.join('') };
+  } finally {
+    process.stderr.write = orig;
+  }
+}
+
+function needsHumanState() {
+  let s = emptyState({ repo: 'acme/widgets', pr: PR, branch: 'agent/feature', risk: 'medium' });
+  s = addRound(s, {
+    n: 1, fromHead: 'a', toHead: 'b', contentHashAtToHead: 'h1',
+    items: [
+      { id: 'F1', bucket: 'BLOCKING', title: 'Judge could not parse', fingerprint: 'fp1', final: { decision: null, by: 'judge', needsHuman: true, reason: 'invalid judge output' } },
+      { id: 'F2', bucket: 'BLOCKING', category: 'security', title: 'Arbiter unsure', fingerprint: 'fp2', final: { decision: 'ACCEPT', by: 'arbiter', needsHuman: true, reason: 'arbiter low confidence' } },
+      { id: 'F4', bucket: 'SUGGESTION', title: 'Settled', fingerprint: 'fp4', final: { decision: 'ACCEPT', by: 'arbiter', needsHuman: false, reason: 'ok' } },
+    ],
+  });
+  return addRound(s, {
+    n: 2, fromHead: 'b', toHead: 'c', contentHashAtToHead: 'h2',
+    items: [{ id: 'F3', bucket: 'BLOCKING', title: 'Unproven ruling', fingerprint: 'fp3', final: { decision: 'REJECT', by: 'arbiter', needsHuman: true, reason: 'model-proof failed: ruling not provably from Fable' } }],
+  });
+}
+
+test('summary push: each outcome that needs the owner sends exactly one push with the right event and text', async () => {
+  const cases = [
+    { outcome: 'awaiting-owner-merge', state: summaryState(), label: 'Ready to merge', text: /^Ready to merge: Check the listed items, then say "merge" for head [0-9a-f]{7} \(widgets\)$/ },
+    { outcome: 'needs-human', state: summaryState(), label: 'Needs you', text: /^Needs you: Read the needs-human comment and decide \(widgets\)$/ },
+    { outcome: 'blocked', state: null, label: 'Run stopped', text: /^Run stopped: Verify stays red after 3 fixes: read the blocked comment \(widgets\)$/ },
+    { outcome: 'awaiting-review', state: null, label: 'Run stopped', text: /^Run stopped: Codex review is unavailable: say "resume pipeline reviews" later \(widgets\)$/ },
+    { outcome: 'stopped', state: null, label: 'Run stopped', text: /^Run stopped: Read the PR: the run stopped \(widgets\)$/ },
+  ];
+  for (const c of cases) {
+    const repo = pushRepo(c.state);
+    const t = await summaryIn(repo, ['--outcome', c.outcome]);
+    assert.equal(t.error, undefined, c.outcome);
+    assert.equal(t.res.exitCode, 0, c.outcome);
+    assert.equal(t.rig.fetchCalls.length, 1, `${c.outcome}: one push`);
+    const body = t.rig.fetchCalls[0].body;
+    assert.equal(body.title, '#12 Add widget', c.outcome);
+    assert.match(body.message, c.text, c.outcome);
+    assert.equal(body.priority, 4);
+    assert.equal(body.click, 'https://github.com/acme/widgets/pull/12', 'the click target is the PR, not the comment');
+    assert.equal(t.res.output.notify.sent, true, c.outcome);
+    assert.equal(t.res.output.ok, true);
+    assert.match(t.res.output.agentLogLine, new RegExp(`· ${c.outcome}$`));
+    assert.ok(!t.res.output.notify.errors && !JSON.stringify(t.res.output).includes(TOPIC));
+  }
+});
+
+test('summary push: merged, closed, merged-externally and every prod-watch word never push', async () => {
+  for (const outcome of ['merged', 'closed', 'merged-externally', 'recovered', 'superseded', 'rollback-failed', 'not-live', 'deploy-failed']) {
+    const repo = pushRepo(['closed', 'merged-externally'].includes(outcome) ? null : summaryState());
+    const t = await summaryIn(repo, ['--outcome', outcome]);
+    assert.equal(t.error, undefined, outcome);
+    assert.equal(t.res.exitCode, 0, outcome);
+    assert.deepEqual(t.res.output.notify, { sent: false, reason: 'no-event' }, outcome);
+    assert.equal(t.rig.fetchCalls.length, 0, outcome);
+    assert.equal(t.stderr, '', `${outcome}: no warning for a classified word`);
+  }
+});
+
+test('summary push: an unclassified outcome word sends nothing, says so in the JSON and warns once on stderr', async () => {
+  const repo = pushRepo();
+  const t = await summaryIn(repo, ['--outcome', 'progressing']);
+  assert.equal(t.res.exitCode, 0, 'the comment is still posted');
+  assert.deepEqual(t.res.output.notify, { sent: false, reason: 'unclassified-outcome' });
+  assert.equal(t.rig.fetchCalls.length, 0);
+  assert.equal(t.stderr.trim().split('\n').length, 1);
+  assert.match(t.stderr, /outcome "progressing" is not classified for owner notifications/);
+});
+
+test('summary push: needs-human with an arbiter-parked item becomes an arbiter escalation naming ALL open items, arbiter ones first', async () => {
+  const repo = pushRepo(needsHumanState());
+  const t = await summaryIn(repo, ['--outcome', 'needs-human']);
+  assert.equal(t.res.exitCode, 0);
+  assert.equal(t.rig.fetchCalls.length, 1);
+  const body = t.rig.fetchCalls[0].body;
+  assert.equal(body.message, 'Arbiter escalation: Rule on F2, F3, F1 in the triage comment [items: F2, F3, F1] (widgets)');
+  assert.ok(!body.message.includes('F4'), 'a settled item is not listed');
+  assert.match(t.rig.ledger(), /"event":"arbiter-escalation"/);
+});
+
+test('summary push: needs-human with only judge/test-parked items stays a plain needs-human push that lists them', async () => {
+  let s = emptyState({ repo: 'acme/widgets', pr: PR, branch: 'agent/feature', risk: 'medium' });
+  s = addRound(s, { n: 1, fromHead: 'a', toHead: 'b', contentHashAtToHead: 'h1', items: [
+    { id: 'F1', bucket: 'BLOCKING', title: 'x', fingerprint: 'fp1', final: { decision: 'REJECT', by: 'test', needsHuman: true, reason: 'test disproved, but it would dismiss a security/data item' } },
+  ] });
+  const t = await summaryIn(pushRepo(s), ['--outcome', 'needs-human']);
+  assert.equal(t.rig.fetchCalls[0].body.message, 'Needs you: Read the needs-human comment and decide [items: F1] (widgets)');
+});
+
+test('summary push: --action and --cause flow into the event; --cause is part of the identity, --action is not', async () => {
+  const repo = pushRepo(null);
+  const rig = notifyRig();
+  const a = await summaryIn(repo, ['--outcome', 'stopped', '--action', '- Final gate refused: a blocking label is set', '--cause', 'final-gate:labels'], { rig });
+  assert.equal(a.res.exitCode, 0);
+  assert.equal(rig.fetchCalls[0].body.message, 'Run stopped: - Final gate refused: a blocking label is set (widgets)', 'a value that starts with a dash is accepted');
+  assert.match(rig.ledger(), /"event":"stopped"/);
+  // the same stop, reworded: still one push
+  const b = await summaryIn(repo, ['--outcome', 'stopped', '--action', 'Something else entirely', '--cause', 'final-gate:labels'], { rig, fake: summaryGh() });
+  assert.equal(b.res.output.notify.reason, 'duplicate');
+  assert.equal(rig.fetchCalls.length, 1);
+  // a different cause on the same head is a new push
+  const c = await summaryIn(repo, ['--outcome', 'stopped', '--action', 'Another', '--cause', 'merge:pre-merge'], { rig, fake: summaryGh() });
+  assert.equal(c.res.output.notify.sent, true);
+  assert.equal(rig.fetchCalls.length, 2);
+  // an invalid cause is a usage error before anything is sent
+  await assert.rejects(summaryIn(repo, ['--outcome', 'stopped', '--cause', 'bad cause!'], { rig }).then((r) => { if (r.error) throw r.error; }), /--cause must be a short code/);
+});
+
+test('summary push: `stopped`, `closed` and `merged-externally` work with no review state', async () => {
+  for (const outcome of ['stopped', 'closed', 'merged-externally']) {
+    const t = await summaryIn(pushRepo(null), ['--outcome', outcome]);
+    assert.equal(t.error, undefined, outcome);
+    assert.equal(t.res.exitCode, 0, outcome);
+    assert.match(t.res.output.agentLogLine, new RegExp(`· rounds 0 · arbiter 0 · ${outcome}$`));
+  }
+  // other outcomes without state are still a usage error, and nothing is pushed
+  const none = await summaryIn(pushRepo(null), ['--outcome', 'needs-human']);
+  assert.match(none.error.message, /only --outcome blocked\|awaiting-review\|stopped\|closed\|merged-externally/);
+  assert.equal(none.rig.fetchCalls.length, 0);
+});
+
+test('summary push: the title lookup failing still sends the push (no title), and the exit stays 3', async () => {
+  const fake = createFakeGh([{ match: '^pr view 12 --json title', code: 1, stderr: 'HTTP 502' }]);
+  const rig = notifyRig();
+  rig.deps.lookup = async () => null; // notify's own bounded lookup finds nothing either
+  const t = await summaryIn(pushRepo(), ['--outcome', 'awaiting-owner-merge'], { fake, rig });
+  assert.ok(t.error instanceof UnavailableError, 'the unavailable-GitHub error (exit 3) is unchanged');
+  assert.equal(rig.fetchCalls.length, 1);
+  assert.equal(rig.fetchCalls[0].body.title, '#12');
+  assert.match(rig.fetchCalls[0].body.message, /^Ready to merge: /);
+  assert.equal(rig.fetchCalls[0].body.click, 'https://github.com/acme/widgets/pull/12', 'offline click target comes from the git remote');
+});
+
+test('summary push: the comment upsert failing (exit 3) still sends exactly one push, with the title already fetched', async () => {
+  const fake = createFakeGh([
+    { match: '^pr view 12 --json title', stdoutJson: { title: 'Add widget' } },
+    ME, REPO,
+    { match: '^api repos/acme/widgets/issues/12/comments --paginate', stdoutJson: [] },
+    { match: '^api -X POST repos/acme/widgets/issues/12/comments', code: 1, stderr: 'HTTP 502' },
+  ]);
+  const rig = notifyRig();
+  const repo = pushRepo();
+  const t = await summaryIn(repo, ['--outcome', 'needs-human'], { fake, rig });
+  assert.ok(t.error instanceof UnavailableError);
+  assert.equal(rig.fetchCalls.length, 1);
+  assert.equal(rig.fetchCalls[0].body.title, '#12 Add widget');
+  // the retry after GitHub recovers is the same terminal state: no second push
+  const again = await summaryIn(repo, ['--outcome', 'needs-human'], { rig });
+  assert.equal(again.res.output.notify.reason, 'duplicate');
+  assert.equal(rig.fetchCalls.length, 1);
 });
 
 // ---- agent-log ------------------------------------------------------------------------------------

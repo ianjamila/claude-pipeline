@@ -16,6 +16,10 @@ import {
   runProdWatch, exitCodeFor, hostOf, readKnownGood, createGitOps, createSmoke, issueTitle, resolveMergeSha,
 } from '../pipeline/lib/prodwatch.mjs';
 import { inspectAlias, rollback, vercelCommand, linkedProjectDir, VercelError, tail } from '../pipeline/lib/vercel.mjs';
+import { prodEvent, buildMessage, LEDGER_NAME } from '../pipeline/lib/notify.mjs';
+import { run as prodWatchRun } from '../pipeline/commands/prod-watch.mjs';
+import { GhError } from '../pipeline/lib/proc.mjs';
+import { UnavailableError } from '../pipeline/lib/cli.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const bin = join(here, '..', 'pipeline', 'bin', 'pipeline.mjs');
@@ -447,6 +451,27 @@ test('the revert PR failing does not change the outcome: the issue is told to re
   assert.match(r.revertPrError, /CONFLICT/);
   assert.equal(h.prCreate.calls.length, 0);
   assert.match(h.issueComment.calls[0][1], /could NOT be created automatically/);
+  // the owner's push says to revert by hand and names the issue that exists
+  const push = prodEvent(r, { pr: 12 });
+  assert.equal(push.event, 'prod-recovered');
+  assert.equal(push.action, 'Rolled back, prod healthy. Revert PR could not be opened — revert #12 by hand or fix forward; close issue #50 after.');
+});
+
+test('recovered with the rollback issue missing: the push says it could not be confirmed, never that merges are not paused', async () => {
+  const h = harness({ smoke: [FAIL, FAIL, PASS], inspect: [OURS, OURS, OLDER], issueCreate: [new Error('HTTP 502')] });
+  const r = await h.go();
+  assert.equal(r.outcome, 'recovered');
+  assert.equal(r.issue, null);
+  const push = prodEvent(r, { pr: 12 });
+  assert.match(push.action, /Rollback issue could not be confirmed — check whether merges are paused\./);
+  assert.ok(!/not paused|NOT paused/i.test(push.action));
+});
+
+test('recovered with both artifacts: the push names the revert PR and the issue to close', async () => {
+  const h = harness({ smoke: [FAIL, FAIL, PASS], inspect: [OURS, OURS, OLDER] });
+  const r = await h.go();
+  assert.equal(r.outcome, 'recovered');
+  assert.equal(prodEvent(r, { pr: 12 }).action, `Rolled back, prod healthy. Review revert PR #${r.revertPr.number}; close issue #50 to unpause merges.`);
 });
 
 test('a failing issue API does not hide the outcome', async () => {
@@ -455,6 +480,8 @@ test('a failing issue API does not hide the outcome', async () => {
   assert.equal(r.outcome, 'rollback-skipped');
   assert.equal(r.issue, null);
   assert.match(r.issueError, /502/);
+  assert.match(prodEvent(r, { pr: 12 }).action, /Rollback issue could not be confirmed — check whether merges are paused\./);
+  assert.equal(prodEvent(r, { pr: 12 }).priority, 5);
 });
 
 test('an unexpected error during recovery still ends in an urgent issue, never a crash', async () => {
@@ -806,11 +833,57 @@ function cliWorld({ healthy, ownedByUs = true, aliasCreatedAt = T + 2000 } = {})
   ]);
   const home = tmp('cp-home-');
   const cli = (args) => {
-    const env = { ...process.env, ...gh.env, ...vercel.env, HOME: home, USERPROFILE: home };
+    const env = { ...process.env, ...gh.env, ...vercel.env, HOME: home, USERPROFILE: home, PIPELINE_NOTIFY: 'off' };
     const r = spawnSync(process.execPath, [bin, 'prod-watch', ...args], { cwd: repo.dir, env, encoding: 'utf8' });
     return { code: r.status, json: r.stdout ? JSON.parse(r.stdout) : null, stderr: r.stderr };
   };
-  return { repo, bare, merge, vercel, gh, cli };
+  // The same command in this process with fake push transports (and no real production lock), so the pushes can be read.
+  const inproc = async (args, { findDeployment } = {}) => {
+    const rig = notifyRig();
+    const ctx = {
+      cwd: repo.dir,
+      env: { ...process.env, ...gh.env, ...vercel.env, HOME: home, USERPROFILE: home },
+      notifyDeps: rig.deps,
+      prodWatchDeps: { lock: (_name, fn) => fn(), ...(findDeployment ? { findDeployment } : {}) },
+    };
+    const stderr = [];
+    const orig = process.stderr.write;
+    process.stderr.write = () => true;
+    try {
+      let res;
+      let error;
+      try {
+        res = await prodWatchRun(args, ctx);
+      } catch (err) {
+        error = err;
+      }
+      return { res, error, rig, stderr };
+    } finally {
+      process.stderr.write = orig;
+    }
+  };
+  return { repo, bare, merge, vercel, gh, cli, inproc };
+}
+
+// Fake push transports for the in-process command runs: nothing reaches the network or a real home directory.
+function notifyRig() {
+  const dir = tmp('cp-prodwatch-notify-');
+  const secretsFile = join(dir, 'secrets.sh');
+  writeFileSync(secretsFile, 'export NTFY_TOPIC=PRODSENTINELTOPIC\n');
+  const fetchCalls = [];
+  const deps = {
+    env: {},
+    secretsFile,
+    stateDir: join(dir, 'state'),
+    git: (args) => (args[0] === 'remote' ? 'git@github.com:acme/widgets.git' : ''),
+    isWsl: () => false,
+    lookup: async () => ({ title: 'Add widget', url: 'https://github.com/acme/widgets/pull/12' }),
+    fetch: async (url, init) => {
+      fetchCalls.push({ url, body: JSON.parse(init.body) });
+      return { ok: true, status: 200 };
+    },
+  };
+  return { deps, fetchCalls, ledger: () => (existsSync(join(dir, 'state', LEDGER_NAME)) ? readFileSync(join(dir, 'state', LEDGER_NAME), 'utf8') : '') };
 }
 
 test('CLI merged: fake gh + fake vercel, healthy production serving our deployment (exit 0, no issue)', () => {
@@ -940,4 +1013,134 @@ test('CLI with only --pr: a PR that is not MERGED is exit 1 not-merged; a merge 
   assert.equal(unnamed.code, 3, unnamed.stderr);
   assert.equal(unnamed.json.error, 'merge-sha-unresolved');
   assert.ok(!w.vercel.calls().some((c) => c[0] === 'rollback'));
+});
+
+// ---- the owner push, end to end through the command (fake gh + fake vercel + fake push transports) --------------------
+
+test('push: merged is a quiet priority-3 "nothing to do" with the PR title', async () => {
+  const w = cliWorld({ healthy: [NEW_HOST] });
+  const t = await w.inproc(['--sha', w.merge, '--pr', '12', '--retry-wait', '0']);
+  assert.equal(t.error, undefined);
+  assert.equal(t.res.exitCode, 0);
+  assert.equal(t.res.output.outcome, 'merged');
+  assert.equal(t.res.output.notify.sent, true);
+  assert.equal(t.rig.fetchCalls.length, 1);
+  const b = t.rig.fetchCalls[0].body;
+  assert.equal(b.title, '#12 Add widget');
+  assert.equal(b.message, 'Production OK: Live and healthy — nothing to do. (widgets)');
+  assert.equal(b.priority, 3);
+});
+
+test('push: recovered names the revert PR and the issue to close, and clicks through to the rollback issue', async () => {
+  const w = cliWorld({ healthy: [OLD_HOST] });
+  const t = await w.inproc(['--sha', w.merge, '--pr', '12', '--retry-wait', '0']);
+  assert.equal(t.error, undefined);
+  assert.equal(t.res.exitCode, 1, 'exit code unchanged');
+  assert.equal(t.res.output.outcome, 'recovered');
+  assert.equal(t.rig.fetchCalls.length, 1);
+  const b = t.rig.fetchCalls[0].body;
+  assert.equal(b.message, 'Rolled back: Rolled back, prod healthy. Review revert PR #78; close issue #77 to unpause merges. (widgets)');
+  assert.equal(b.priority, 4);
+  assert.equal(b.click, 'https://github.com/acme/widgets/issues/77');
+});
+
+test('push: not-live and rollback-skipped carry their priority and say what to check', async () => {
+  const live = cliWorld({ healthy: [OLD_HOST], ownedByUs: false, aliasCreatedAt: T - 600_000 });
+  const a = await live.inproc(['--sha', live.merge, '--pr', '12', '--retry-wait', '0']);
+  assert.equal(a.res.exitCode, 1);
+  assert.equal(a.res.output.outcome, 'not-live');
+  assert.match(a.rig.fetchCalls[0].body.message, /^Production not live: #12 is not what production serves/);
+  assert.equal(a.rig.fetchCalls[0].body.priority, 4);
+
+  const skipped = cliWorld({ healthy: [] });
+  rmSync(join(skipped.repo.dir, '.review', 'prod-before.json'));
+  const b = await skipped.inproc(['--sha', skipped.merge, '--pr', '12', '--retry-wait', '0']);
+  assert.equal(b.res.exitCode, 1);
+  assert.equal(b.res.output.outcome, 'rollback-skipped');
+  assert.equal(b.rig.fetchCalls[0].body.priority, 5);
+  assert.match(b.rig.fetchCalls[0].body.message, /^ROLLBACK SKIPPED: Rollback was skipped, production may be unhealthy: check it now\. Issue #77\./);
+});
+
+test('push: a missing rollback issue reads "could not be confirmed — check whether merges are paused" (through the command)', async () => {
+  const w = cliWorld({ healthy: [] });
+  rmSync(join(w.repo.dir, '.review', 'prod-before.json'));
+  const base = JSON.parse(readFileSync(w.gh.env.PIPELINE_FAKE_GH_SCRIPT, 'utf8'));
+  w.gh.setScript([{ match: '^api -X POST repos/acme/widgets/issues(?!/)', code: 1, stderr: 'HTTP 502' }, ...base]);
+  const t = await w.inproc(['--sha', w.merge, '--pr', '12', '--retry-wait', '0']);
+  assert.equal(t.res.output.outcome, 'rollback-skipped');
+  assert.equal(t.res.output.issue, null);
+  assert.match(t.rig.fetchCalls[0].body.message, /Rollback issue could not be confirmed — check whether merges are paused\./);
+});
+
+test('push: no production configured sends nothing and exits 0 as before', async () => {
+  const w = cliWorld({ healthy: [] });
+  w.repo.write('.claude/pipeline.yml', 'version: 1\nproject: demo\nverify:\n  full: a\n  quick: b\n');
+  const t = await w.inproc(['--sha', w.merge, '--pr', '12']);
+  assert.equal(t.res.exitCode, 0);
+  assert.equal(t.res.output.outcome, 'no-production');
+  assert.deepEqual(t.res.output.notify, { sent: false, reason: 'no-event' });
+  assert.equal(t.rig.fetchCalls.length, 0);
+});
+
+test('push: a merge commit GitHub never names is exit 3 as before, plus one prod-unknown push', async () => {
+  const w = cliWorld({ healthy: [NEW_HOST] });
+  const base = JSON.parse(readFileSync(w.gh.env.PIPELINE_FAKE_GH_SCRIPT, 'utf8'));
+  w.gh.setScript([{ match: '^pr view 12 --json state,mergeCommit', stdoutJson: { state: 'MERGED', mergeCommit: null } }, ...base]);
+  const t = await w.inproc(['--pr', '12', '--retry-wait', '0']);
+  assert.equal(t.res.exitCode, 3);
+  assert.equal(t.res.output.ok, false);
+  assert.equal(t.res.output.error, 'merge-sha-unresolved');
+  assert.match(t.res.output.reason, /did not name its merge commit/);
+  assert.equal(t.rig.fetchCalls.length, 1);
+  const b = t.rig.fetchCalls[0].body;
+  assert.equal(b.title, '#12 Add widget');
+  assert.match(b.message, /^Production check unfinished: Production check couldn't finish \(PR #12 is MERGED but GitHub did not name its merge commit/);
+  assert.match(b.message, /check #12's deployment by hand/);
+  assert.equal(b.priority, 4);
+  assert.equal(t.res.output.notify.sent, true);
+  assert.ok(!w.vercel.calls().some((c) => c[0] === 'rollback'));
+});
+
+test('push: a PR that is not MERGED is exit 1 as before, plus one prod-unknown push', async () => {
+  const w = cliWorld({ healthy: [NEW_HOST] });
+  const base = JSON.parse(readFileSync(w.gh.env.PIPELINE_FAKE_GH_SCRIPT, 'utf8'));
+  w.gh.setScript([{ match: '^pr view 12 --json state,mergeCommit', stdoutJson: { state: 'OPEN', mergeCommit: null } }, ...base]);
+  const t = await w.inproc(['--pr', '12', '--retry-wait', '0']);
+  assert.equal(t.res.exitCode, 1);
+  assert.equal(t.res.output.error, 'not-merged');
+  assert.equal(t.rig.fetchCalls.length, 1);
+  assert.match(t.rig.fetchCalls[0].body.message, /PR #12 is OPEN, not MERGED/);
+});
+
+test('push: the deployments API failing for good rejects exactly as before and sends one prod-unknown push', async () => {
+  const w = cliWorld({ healthy: [NEW_HOST] });
+  const findDeployment = async () => { throw new GhError({ code: 1, stderr: 'HTTP 502 Bad Gateway', args: ['api', 'deployments'] }); };
+  const t = await w.inproc(['--sha', w.merge, '--pr', '12', '--retry-wait', '0'], { findDeployment });
+  assert.ok(t.error instanceof UnavailableError, 'the original UnavailableError (exit 3) is re-thrown');
+  assert.equal(t.res, undefined);
+  assert.equal(t.rig.fetchCalls.length, 1);
+  const b = t.rig.fetchCalls[0].body;
+  assert.match(b.message, /^Production check unfinished: Production check couldn't finish \(.*502.*\): check #12's deployment by hand/);
+  assert.equal(b.priority, 4);
+  assert.ok(!w.vercel.calls().some((c) => c[0] === 'rollback'), 'nothing was rolled back');
+  // an unrelated crash is re-thrown unchanged too, and still announced
+  const w2 = cliWorld({ healthy: [NEW_HOST] });
+  const boom = new TypeError('boom');
+  const t2 = await w2.inproc(['--sha', w2.merge, '--pr', '12'], { findDeployment: async () => { throw boom; } });
+  assert.equal(t2.error, boom);
+  assert.equal(t2.rig.fetchCalls.length, 1);
+});
+
+test('push: replaying the same production result sends nothing the second time', async () => {
+  const w = cliWorld({ healthy: [NEW_HOST] });
+  const t = await w.inproc(['--sha', w.merge, '--pr', '12', '--retry-wait', '0']);
+  assert.equal(t.rig.fetchCalls.length, 1);
+  // same rig (same ledger), same result
+  const ctxRig = t.rig;
+  const again = await prodWatchRun(['--sha', w.merge, '--pr', '12', '--retry-wait', '0'], {
+    cwd: w.repo.dir, env: { ...process.env, ...w.gh.env, ...w.vercel.env }, notifyDeps: ctxRig.deps, prodWatchDeps: { lock: (_n, fn) => fn() },
+  });
+  assert.equal(again.exitCode, 0);
+  assert.equal(again.output.notify.reason, 'duplicate');
+  assert.equal(ctxRig.fetchCalls.length, 1);
 });

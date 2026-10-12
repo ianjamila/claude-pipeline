@@ -188,6 +188,22 @@ pipeline model-proof (--tag TAG | --agent-id ID) [--expect-model claude-fable-] 
 
 Exit: 0 proven · 1 mismatch · 2 transcript not found / usage.
 
+## notify
+
+send the owner a push notification (ntfy, plus a Windows toast under WSL2).
+
+```
+pipeline notify --test [--repo DIR]   |   pipeline notify --event owner-merge|needs-human|arbiter-escalation|stopped --pr N --action TEXT [--cause CODE] [--repo DIR]   -> {ok, sent, reason?, transports:{ntfy, toast}}
+```
+
+`--test` sends one real push to every transport and prints the per-transport result (the rollout check; it is never deduplicated). `--event` is the manual route for a stop that cannot be expressed through `pipeline summary`.
+
+Configuration, in this order per field: the environment, then `~/.config/claude-secrets.sh` (`PIPELINE_SECRETS_FILE` overrides the path; the file is parsed as literal `NAME=value` lines, never sourced): `NTFY_TOPIC` (required), `NTFY_SERVER` (default `https://ntfy.sh`), `NTFY_TOKEN` (optional). A field that is present but invalid sends nothing (`reason: invalid-config:<field>`); no topic is a silent `no-topic`; `PIPELINE_NOTIFY=off` disables everything (the test suite sets it). The result never contains the topic, token or server path.
+
+One push per event: a ledger under `~/.claude/pipeline-state/` (`notify-ledger.jsonl`) makes a replay of the same event a no-op (`reason: duplicate`). Identity is repo, PR, event, head, outcome, open needs-human ids and `--cause`, never the action text. The whole call is capped at 15 s.
+
+Exit: `--test` 0 when ntfy accepted the push, 1 when it did not · `--event` 0 whether or not a push went out (read `sent` / `reason`) · 2 usage.
+
 ## preflight
 
 report whether the pipeline may merge (config, gh, protection, pause, Codex).
@@ -205,13 +221,15 @@ Branch protection must require `ci.required_checks` AND, unless `ci.guard_checks
 verify the production deployment of a merge; roll back safely, open an issue and a revert PR if it fails.
 
 ```
-pipeline prod-watch (--sha MERGE_SHA [--pr N] | --pr N) [--expect-text T] [--retry-wait SEC=60] [--repo DIR]   -> {ok, outcome: merged|deploy-failed|deploy-not-observed|not-live|superseded|recovered|rollback-failed|changed-during-recovery|rollback-skipped|no-production, ...}
+pipeline prod-watch (--sha MERGE_SHA [--pr N] | --pr N) [--expect-text T] [--retry-wait SEC=60] [--repo DIR]   -> {ok, outcome: merged|deploy-failed|deploy-not-observed|not-live|superseded|recovered|rollback-failed|changed-during-recovery|rollback-skipped|no-production, ..., notify}
   with only --pr N (merge printed mergeSha:null) the merge commit is read from the merged PR (up to 6 looks); exit 1 {error:not-merged} when the PR is not MERGED, exit 3 {error:merge-sha-unresolved} when GitHub never names it
 ```
 
 `--expect-text` applies only to this merge's own deployment: smokes of the rolled-back or superseded (other) deployment run without it. `not-live` also covers a merge whose deployment succeeded but was never promoted while production still serves the known-good deployment (nothing is rolled back).
 
 Exit: 0 outcome `merged` (or no production configured) · 1 any other outcome (recovered, rollback-failed, ...), or with --pr only: the PR is not MERGED · 3 deployment not observed / GitHub unavailable / the merge commit could not be read.
+
+Owner push: once `runProdWatch` has returned (the production lock is released) the owner gets one push for the outcome (`merged` priority 3, the rest 4, the three unsafe-rollback outcomes 5), worded from the artifacts that exist: a missing rollback issue reads "Rollback issue could not be confirmed — check whether merges are paused", never "merges are not paused". An error exit that has no outcome (`merge-sha-unresolved`, `not-merged`, or a deploy/API error that escapes the watch) sends a "Production check unfinished" push instead; the original exit code, JSON and error are unchanged. The JSON gains `notify` (`{sent, reason?, transports}`; `{sent:false, reason:'no-event'}` for `no-production`). A replay of the same result is a `duplicate` and sends nothing.
 
 ## protect
 
@@ -285,12 +303,14 @@ Exit: 0 · 2 no state / usage (`outcome` is 0 whether or not `clean`).
 upsert the PR summary comment and print the agent-log line.
 
 ```
-pipeline summary --pr N --outcome O [--built TEXT] [--repo DIR]   -> {ok, url, agentLogLine}
+pipeline summary --pr N --outcome O [--built TEXT] [--action TEXT] [--cause CODE] [--repo DIR]   -> {ok, url, agentLogLine, notify}
 ```
 
 Exit: 0 · 2 usage / no state · 3 GitHub (`gh`) unavailable.
 
-Without `.review/state.json` only `--outcome blocked` and `--outcome awaiting-review` are accepted (the two early-stop paths: verify red three times, Codex out in round 1): the comment is rendered with no rounds (a `blocked` one names the failing step from the verify report) and `agentLogLine` is still printed. Any other outcome without state is exit 2.
+Without `.review/state.json` only `--outcome blocked`, `awaiting-review`, `stopped`, `closed` and `merged-externally` are accepted (the early-stop paths: verify red three times, Codex out in round 1, a stop on a gate or merge refusal, the owner closing the PR, a merge made outside the pipeline): the comment is rendered with no rounds (a `blocked` one names the failing step from the verify report) and `agentLogLine` is still printed. Any other outcome without state is exit 2.
+
+Owner push (see `pipeline notify`): the outcome is classified before any GitHub call, and the push is sent after the comment work whether or not GitHub answered (with the PR title when it was fetched; the exit code and JSON are exactly what they would have been, plus `notify`). `awaiting-owner-merge` pushes "ready to merge", `needs-human` pushes "needs you" (or an arbiter escalation when an arbiter ruling parked an item: the push then names ALL open needs-human items, arbiter ones first), and `blocked` / `awaiting-review` / `stopped` push "run stopped". `merged`, `closed`, `merged-externally`, `prod-unknown` (written after a prod-watch exit with no outcome) and every prod-watch outcome word (prod-watch pushed already) send nothing: `notify` is `{sent:false, reason:'no-event'}`. A word that is not classified sends nothing, reports `reason:'unclassified-outcome'` and prints one warning on stderr. `--action TEXT` is the one-line "what to do" the push carries (default per event); `--cause CODE` (letters, digits, `: _ . -`, at most 60) is a short slug such as `final-gate:labels` that is part of the push's identity, so a reworded retry of the same stop does not push twice.
 
 ## triage
 
