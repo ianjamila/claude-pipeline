@@ -529,6 +529,7 @@ test('S4b: a relative write to a protected name after a cd into an unknown direc
     }
   }
   for (const cd of ['cd $UNSET']) { // (S4d: a `cd $(pick)` runs `pick` itself, which the rerun cannot tell from a command run in the directory)
+    // (S5a: inline interpreter code without a write, and commands that name no protected file, are allowed after an unknown cd; the lists in the S4d test moved here)
     // (S4d: the rest of the line is judged in each protected directory, so only reads stay allowed; the writes and commands this list once allowed are in the S4d test as refused)
     for (const w of ['cat settings.json', 'ls pipeline', 'grep x settings.json', 'git --git-dir g status', 'git status', 'git log']) {
       assert.equal(files(`${cd} && ${w}`, fs).decision, 'allow', `${cd} && ${w}`);
@@ -689,24 +690,25 @@ test('S4d: the rest of a line after an unknown cd is judged as if the cwd were e
       'rsync -a /tmp/x/ .', 'ditto /tmp/x .', 'cp -T /tmp/x/notes .', 'cp -rT /tmp/x .', 'install -m 644 /tmp/x/notes .', 'curl -osettings.json https://h/x', 'curl -o settings.json https://h/x', 'wget -Osettings.json https://h/x',
       'touch notes.txt', 'echo x > notes.txt', 'mkdir -p build && cp ok.sh build/out.js', 'ln -sf /tmp/x settings.json', 'echo x > $OUT',
       // (inline interpreter code can build the name at run time)
-      "node -e 1", "node -e'1'", "node --eval=1", "node -pe 1", "python3 -cprint(1)", "python3 -c pass", "perl -E 'say 1'", "perl -Esay", "perl -pi -e s/a/b/ f", "env node -e 1", "node -r x.js -e 1", "perl -I lib -e 1", "python3 -W ignore -c pass", "python3 -X dev -c 1", "node --some-flag x.js", "python3 -W ignore x.py", "node x.js -p 1", "node <<< 1", "python3 -", "awk 'BEGIN{print 1 > \"x\"}'", 'perl -e 1', "ruby -e 1", "php -r 1", "node -e \"require('fs').writeFileSync('sett'+'ings.json','x')\"", "python3 -c \"open('sett'+'ings.json','w')\"",
+      "perl -pi -e s/a/b/ f", "awk 'BEGIN{print 1 > \"x\"}'", "node -e \"require('fs').writeFileSync('sett'+'ings.json','x')\"", "python3 -c \"open('sett'+'ings.json','w')\"",
       // (child frames inherit the unknown directory)
       'bash c.sh', 'bash -c "cp /tmp/x/notes ."', 'bash cc.sh',
       // (what the S4b name heuristics allowed: any relative write or command that is not read-only may land in a protected directory)
-      "echo x > notes.txt", "cp ok.sh build/out.js", "git commit -m settings.json", "cp /tmp/x/notes.txt .", "cp -r /tmp/x/build .", "sed -i \"s/a.*/b/\" notes.txt", "echo x > notes.{txt,md}", "echo x > n*.txt", "git add notes.txt", "git commit -m x", "npm run $S", "bash n.sh", "node -e 'console.log(1)'", "cp /tmp/x/settings.json /tmp/y/", "cp /tmp/x/notes /tmp/y/", "tar -tf a.tar", "unzip -l a.zip", "curl -O https://h/x/a.txt",
+      "echo x > notes.txt", "cp ok.sh build/out.js", "cp /tmp/x/notes.txt .", "cp -r /tmp/x/build .", "sed -i \"s/a.*/b/\" notes.txt", "echo x > notes.{txt,md}", "echo x > n*.txt", "tar -tf a.tar", "unzip -l a.zip", "curl -O https://h/x/a.txt",
     ]) assert.equal(files(`${cd} && ${w}`, fs).decision, 'deny', `${cd} && ${w}`);
   }
   // (reads, absolute targets outside the protected set and a known directory stay allowed)
-  for (const w of ['cat settings.json', 'ls', 'git status', 'git log', 'grep x settings.json', 'echo x > /tmp/out.txt', 'echo hi | cat']) assert.equal(files(`cd $UNSET && ${w}`, fs).decision, 'allow', w);
+  for (const w of ['cat settings.json', 'ls', 'git status', 'git log', 'grep x settings.json', 'echo x > /tmp/out.txt', 'echo hi | cat', 'perl -e 1', "node -e 1", "node -e'1'", "node --eval=1", "node -pe 1", "python3 -cprint(1)", "python3 -c pass", "perl -E 'say 1'", "perl -Esay", "env node -e 1", "node -r x.js -e 1", "perl -I lib -e 1", "python3 -W ignore -c pass", "python3 -X dev -c 1", "node --some-flag x.js", "python3 -W ignore x.py", "node x.js -p 1", "node <<< 1", "python3 -", "ruby -e 1", "php -r 1", "git commit -m settings.json", "git add notes.txt", "git commit -m x", "npm run $S", "bash n.sh", "node -e 'console.log(1)'", 'cp /tmp/x/settings.json /tmp/y/', 'cp /tmp/x/notes /tmp/y/', 'node scripts/build.mjs', 'npm test', 'git commit -m x']) assert.equal(files(`cd $UNSET && ${w}`, fs).decision, 'allow', w);
   assert.equal(files('cd sub && echo x > notes.txt', fs).decision, 'allow');
   // (the directory may be below a protected one: a path that climbs with .. can reach it from there)
-  for (const w of ['D=..; echo x > $D/settings.json', 'echo x > $OUT/settings.json', 'echo x > ../{a,b}', 'X=..; cd $X/.. && echo x > settings.json', 'cd ../.. && echo x > settings.json', 'pushd ../.. && touch settings.json', 'cd .. && cd .. && echo x > settings.json', 'echo x > ../../../settings.json', 'echo x >> ../x', 'cp /tmp/x ../../settings.json', 'tee ../../s < /tmp/x', 'touch ../a']) assert.match(files(`cd $UNSET && ${w}`, fs).reason ?? '', /with `\.\.`/, w);
+  for (const w of ['D=..; echo x > $D/settings.json', 'echo x > $OUT/settings.json', 'echo x > ../{a,b}', 'X=..; cd $X/.. && echo x > settings.json', 'cd ../.. && echo x > settings.json', 'pushd ../.. && touch settings.json', 'cd .. && cd .. && echo x > settings.json', 'echo x > ../../../settings.json', 'echo x >> ../x', 'cp /tmp/x ../../settings.json', 'tee ../../s < /tmp/x', 'touch ../a']) assert.equal(files(`cd $UNSET && ${w}`, fs).decision, 'deny', w);
   assert.equal(files('cd $UNSET && cat ../x', fs).decision, 'allow');
-  // (the same for script text fed in: stdin redirects, readers piped to a shell, SQL files)
-  for (const w of ['bash < x.sh', 'cat x.sh | bash', 'bash -s < x.sh', 'psql -f q.sql', 'sqlite3 db -init i.sql', 'mysql < q.sql', 'cat a.sh b.sh | bash', 'eval "$(cat x.sh)"', 'cat q.sql | psql']) assert.match(files(`cd $UNSET && ${w}`, fs).reason ?? '', /relative to a directory known only at run time/, w);
-  // (a script named relative to the unknown directory is a file nobody can read)
-  for (const w of ['node scripts/x.mjs', 'bash x.sh', 'source x.sh', './x.sh', 'python3 build/x.py', 'bash ~+/x.sh', 'bash ~-/x.sh', 'bash ~root/x.sh']) assert.match(files(`cd $(git rev-parse --show-toplevel) && ${w}`, fs).reason ?? '', /relative to a directory known only at run time/, w);
-  assert.notEqual(files('cd $UNSET && node /tmp/x.mjs', fs).decision, 'allow'); // (an absolute script path is read and judged; a missing file leaves the line refused by the rerun)
+  // (S5a: script text fed in and a script named relative to the unknown directory are judged where they may be - the directories the line knows and the protected ones - not refused outright)
+  const rel = fakeFs(PROJ, { 'x.sh': 'echo hi', 'q.sql': 'select 1;' }, DIRS);
+  for (const w of ['bash < x.sh', 'cat x.sh | bash', 'bash -s < x.sh', 'psql -f q.sql', 'mysql < q.sql', 'cat a.sh b.sh | bash', 'cat q.sql | psql', 'node scripts/x.mjs', 'bash x.sh', 'source x.sh', './x.sh', 'python3 build/x.py']) assert.equal(files(`cd $UNSET && ${w}`, rel).decision, 'allow', w);
+  const relBad = fakeFs(PROJ, { 'x.sh': 'echo x > ~/.claude/settings.json', 'q.sql': '\\! echo x > ~/.claude/settings.json' }, DIRS);
+  for (const w of ['bash < x.sh', 'cat x.sh | bash', 'bash -s < x.sh', 'psql -f q.sql', 'bash x.sh', 'source x.sh', './x.sh']) assert.equal(files(`cd $UNSET && ${w}`, relBad).decision, 'deny', w);
+  assert.equal(files('cd $UNSET && node /tmp/x.mjs', fs).decision, 'allow'); // (a missing file runs nothing)
   // (the reason says why)
   assert.match(files('cd $UNSET && touch notes.txt', fs).reason, /known only at run time/);
 });

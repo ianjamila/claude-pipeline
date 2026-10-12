@@ -70,6 +70,10 @@ test('S5a: quoted text that looks like a function definition does not make the d
   for (const c of ['mapfile -C \' foo() { :; }\' -c 1 a < /dev/null; cd sub && psql -f q.sql', 'complete -C \' bar() { :; }\' x; cd sub && psql -f q.sql', 'bind -x \'"\\C-x": " baz() { :; }"\'; cd sub && psql -f q.sql', 'PROMPT_COMMAND=\' foo() { :; }\'; cd sub && psql -f q.sql', 'let "a[\' foo() { :; }\']=1"; cd sub && psql -f q.sql', 'export "a[\' foo() { :; }\']=1"; cd sub && psql -f q.sql']) {
     assert.equal(git(c, fsFor('nowhere.sql', 'select 1;')).decision, 'deny', c);
   }
+  // (a zsh glob qualifier / ksh pattern list runs quoted text in the current shell, also after a data command)
+  for (const c of ["ls *(e:' foo() { :; }':); cd sub && psql -f q.sql", "cat ?(e:' foo() { :; }':); cd sub && psql -f q.sql", "grep x a[12](e:' foo() { :; }':); cd sub && psql -f q.sql"]) {
+    assert.equal(git(c, fsFor('nowhere.sql', 'select 1;')).decision, 'deny', c);
+  }
   // (quoting that cannot be trusted keeps the hazard: an apostrophe in a comment, \$'..\\'..' and an unterminated quote hide nothing)
   for (const c of ["echo hi # it's\nfoo() { :; }; cd sub && psql -f q.sql\necho 'x'", "echo $'a\\'b'; foo() { :; }; cd sub && psql -f q.sql; echo '", "echo 'a'; foo() { :; }; cd sub && psql -f q.sql; echo \"x"]) {
     assert.equal(git(c, fsFor('nowhere.sql', 'select 1;')).decision, 'deny', c);
@@ -80,4 +84,77 @@ test('S5a: quoted text that looks like a function definition does not make the d
   for (const c of ['function cd() { :; }; cd sub && psql -f q.sql', 'cd() { :; }; cd sub && psql -f q.sql', 'eval "true; function cd { :; }"; cd sub && psql -f q.sql', "bash -c 'cd() { :; }'; cd sub && psql -f q.sql", "cat <<EOF > /dev/null\ndon't\nEOF\nfunction cd() { :; }; echo 'x'; cd sub && psql -f q.sql"]) {
     assert.equal(git(c, fsFor('nowhere.sql', 'select 1;')).decision, 'deny', c);
   }
+});
+
+// ---- 2: the consequence of an unknown cd is a write judgment, not a blanket refusal (files-policy) ----------------------------------------------------------------
+
+const HOOKS = '/home/u/.claude/pipeline/hooks';
+const withRoots = (extra = {}, dirs = []) => fakeFs(PROJ, extra, [...DIRS, '/home/u/.claude', '/home/u/.claude/pipeline', HOOKS, ...dirs]);
+
+test('S5a: after an unknown cd, ordinary commands and read-only inline code pass; writes to protected names stay refused (files-policy)', () => {
+  const fs = withRoots();
+  for (const w of ['node scripts/build.mjs', 'npm test', 'git commit -m x', 'git status', "node -e 'console.log(1)'", 'cat settings.json', 'cp /tmp/x/settings.json /tmp/y/', 'echo x > /tmp/o.txt']) {
+    assert.equal(files(`cd $UNSET && ${w}`, fs).decision, 'allow', w);
+  }
+  for (const w of ['touch settings.json', 'sed -i s/a/b/ settings.json', 'cp /tmp/a settings.json', 'dd if=/tmp/a of=settings.json', 'tar -xf a.tar', 'curl -osettings.json https://h/x', 'git checkout .',
+    'echo x > settings.json', 'echo x > notes.txt', "node -e \"require('fs').writeFileSync('sett'+'ings.json','x')\"", 'touch notes.txt']) {
+    assert.equal(files(`cd $UNSET && ${w}`, fs).decision, 'deny', w);
+  }
+});
+
+test('S5a: a write that climbs with .. is judged from every existing subdirectory of a protected root (files-policy)', () => {
+  const fs = withRoots();
+  for (const w of ['echo x > ../guard.mjs', 'echo x >> ../../settings.json', 'cp /tmp/e ../guard.mjs', 'touch ../a', 'echo x > ../$N', 'cd .. && echo x > guard.mjs', 'echo x > ../../pipeline/guard.mjs', 'mkdir -p a/b; echo x > ../../guard.mjs']) {
+    assert.equal(files(`cd $X; ${w}`, fs).decision, 'deny', w);
+  }
+  assert.equal(files('cd $X; cat ../x', fs).decision, 'allow');
+});
+
+test('S5a: a cd the line computes is known when it is a temp dir, the script own dir, the repo root or the current dir (files-policy)', () => {
+  const fs = withRoots({ '.git/config': '[core]\n', 'scripts/run': 'cd "$(dirname "$0")"\necho x > settings.json\n', 'scripts/mv': 'cd sub\ncd "$(dirname "$0")"\necho x > settings.json\n', 'scripts/up': 'cd "$(dirname "$0")/../.."\necho x > settings.json\n', 'scripts/wrap': 'cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\necho x > out.txt\n' }, ['.git', 'scripts']);
+  const dec = (c, f = fs, o = {}) => files(c, f, o).decision;
+  // mktemp / TMPDIR
+  assert.equal(dec('cd "$(mktemp -d)" && echo x > sub/notes.txt'), 'allow');
+  assert.equal(dec('cd $(mktemp -d) && echo x > out.txt'), 'allow');
+  assert.equal(dec('cd "$TMPDIR/a" && echo x > out.txt', fs, { env: { TMPDIR: '/tmp/t' } }), 'allow');
+  for (const c of ['export TMPDIR=/home/u/.claude; cd "$(mktemp -d)"; echo x > settings.json', 'TMPDIR=/home/u/.claude; cd "$(mktemp -d)"; echo x > settings.json', 'source $X; cd "$(mktemp -d)"; echo x > settings.json',
+    'cd "$(mktemp -d x.XXXX)"; echo x > settings.json', 'cd "$(mktemp -d -p /home/u/.claude)"; echo x > settings.json', 'cd "${TMPDIR:-x}"; echo x > settings.json', 'cd $TMPDIR; echo x > settings.json']) {
+    assert.equal(dec(c), 'deny', c);
+  }
+  // the judged script file's own directory (only a file run as a script has a $0)
+  assert.equal(dec('bash /home/u/proj/scripts/run', fs), 'allow'); // (the script dir is not protected: the write is to its own settings.json)
+  assert.equal(dec('bash /home/u/proj/scripts/wrap', fs), 'allow');
+  assert.equal(dec('bash /home/u/proj/scripts/mv', fs), 'allow'); // (invoked by an absolute path: $0 does not depend on the cwd)
+  assert.equal(dec('cd /home/u/proj && bash scripts/mv', fs), 'deny'); // (relative: read from the cwd the earlier cd moved)
+  for (const body of ['BASH_ARGV0=/home/u/.claude/x\ncd "$(dirname "$0")"', 'source ./other.sh\ncd "$(dirname "$0")"', 'eval "$X"\ncd "$(dirname "$0")"', 'set -- a; 0=/home/u/.claude/x\ncd "$(dirname "$0")"']) {
+    assert.equal(dec('bash /home/u/proj/scripts/chg', withRoots({ 'scripts/chg': `${body}\necho x > settings.json\n`, 'scripts/other.sh': ':' }, ['scripts'])), 'deny', body);
+  }
+  for (const x of ['unzip a.zip', 'gunzip a.gz', 'xz -d a.xz', 'hg update', 'jar xf a.jar', 'unrar x a.rar']) assert.equal(dec(`cd $UNSET && ${x}`, fs), 'deny', x);
+  assert.equal(dec('bash /home/u/proj/scripts/up', fs), 'deny');
+  // (a script named through a variable the line set is the same script)
+  assert.equal(dec('D=/home/u/proj/scripts; bash $D/run', fs), 'allow');
+  assert.equal(dec('D=/home/u/proj/scripts; bash $D/up', fs), 'deny');
+  assert.equal(dec('D=/home/u/proj/scripts; bash $D/mv', fs), 'allow'); // (a suffix with .. is not modelled)
+  assert.equal(dec('bash < /home/u/proj/scripts/run', fs), 'deny'); // (fed on stdin: $0 is bash)
+  assert.equal(dec('source /home/u/proj/scripts/run', fs), 'deny'); // (sourced: $0 is the parent)
+  // the repo root
+  assert.equal(dec('cd "$(git rev-parse --show-toplevel)" && echo x > out.txt'), 'allow');
+  assert.equal(dec('cd "$(git rev-parse --show-toplevel)" && echo x > notes.txt', fakeFs(PROJ, {}, DIRS)), 'deny'); // (no .git found: unknown)
+  for (const c of ['PATH=/x:$PATH; cd "$(git rev-parse --show-toplevel)" && echo x > notes.txt', 'GIT_DIR=/x; cd "$(git rev-parse --show-toplevel)" && echo x > notes.txt', 'cd /tmp && cd "$(git rev-parse --show-toplevel)" && echo x > notes.txt']) {
+    assert.equal(dec(c, withRoots({ '.git/config': '[core]\n' }, ['.git'])), 'deny', c);
+  }
+  assert.equal(dec('cd "$(git rev-parse --show-toplevel)" && echo x > notes.txt', withRoots({ '.git/config': '[core]\n\tworktree = /home/u/.claude\n' }, ['.git'])), 'deny');
+  // (a climbing write on the line: the temp dir is a leaf of an unknown place, so the cd stays unknown)
+  assert.equal(dec('cd "$(mktemp -d)" && echo x > ../../../home/u/.claude/settings.json'), 'deny');
+  // (git config tricks: a worktree key / include anywhere, an earlier git or .git write, GIT_CONFIG_*)
+  const repo = (cfg, extra = {}) => withRoots({ '.git/config': cfg, ...extra }, ['.git']);
+  const top = 'cd "$(git rev-parse --show-toplevel)" && echo x > notes.txt';
+  assert.equal(dec(top, repo('[core]\n')), 'allow');
+  for (const cfg of ['[core]\n\tworktree = /home/u/.claude\n', '[core] worktree = /home/u/.claude\n', '[include]\n\tpath = /tmp/x\n', '[includeIf "gitdir:/"]\n\tpath = /tmp/x\n']) assert.equal(dec(top, repo(cfg)), 'deny', cfg);
+  assert.equal(dec(top, repo('[core]\n', { '/home/u/.gitconfig': '[core]\n\tworktree = /home/u/.claude\n' })), 'deny');
+  assert.equal(dec(top, repo('[core]\n', { '/home/u/.gitconfig': '[user]\n\tname = x\n' })), 'allow');
+  for (const c of ['git config core.worktree /home/u/.claude; ' + top, 'git -c core.worktree=/home/u/.claude status; ' + top, 'git init x; ' + top, 'echo "[core]" > .git/config; ' + top, 'GIT_CONFIG_PARAMETERS="core.worktree=/home/u/.claude"; ' + top, 'export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=/home/u/.claude; ' + top]) assert.equal(dec(c, repo('[core]\n')), 'deny', c);
+  // $PWD / $(pwd)
+  assert.equal(dec('cd "$(pwd)" && echo x > out.txt'), 'allow');
+  assert.equal(dec('cd /home/u/.claude && cd "$(pwd)" && echo x > out.txt'), 'deny');
 });

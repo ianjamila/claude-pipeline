@@ -1362,6 +1362,8 @@ function unquotedText(s) {
   for (let i = 0; i < s.length;) {
     const ch = s[i];
     if (ch === '\\') { out += s.slice(i, i + 2); i += 2; continue; }
+    // (an unquoted `(` that is not at the start of a command is a zsh glob qualifier / ksh pattern list (`ls *(e:'..':)`, `/(e:..:)`, `~(`, `)(`, `'x'(`): it runs quoted text in this shell)
+    if (ch === '(' && i > 0 && !/[\s;&|(){$]/.test(s[i - 1])) return null;
     if ((ch === '#' && (i === 0 || /[\s;&|(){]/.test(s[i - 1]))) || (ch === '$' && s[i + 1] === "'")) return null;
     if (ch === "'") {
       const j = s.indexOf("'", i + 1);
