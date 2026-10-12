@@ -4,14 +4,13 @@
 //  - the repository is a constant, never read from the environment or the caller (only the test seam
 //    PIPELINE_UPDATE_REMOTE, which an installed copy ignores, can stand in for the fetch URL);
 //  - every git call runs with the caller's configuration, hooks, templates and credentials out of the picture
-//    (isolatedGit): update installs a tree it just downloaded into the owner's ~/.claude, so a hostile ~/.gitconfig,
-//    GIT_* variable or hook must not be able to change what gets fetched or run;
+//    (isolatedGit, on an allowlisted environment): update installs a tree it just downloaded into the owner's ~/.claude,
+//    so a hostile ~/.gitconfig, GIT_* variable or hook must not be able to change what gets fetched or run;
 //  - nothing here throws or hangs: lookups return an "unresolved" answer with a reason, and every call is bounded by
 //    a timeout that the caller can share across steps.
 import fs from 'node:fs';
 import os from 'node:os';
 import { gh, run, seamValue } from './proc.mjs';
-import { GIT_SCRUB } from './identity.mjs';
 
 export const UPSTREAM_HOST = 'github.com';
 export const UPSTREAM_REPO = 'ianjamila/claude-pipeline';
@@ -24,11 +23,27 @@ const DEFAULT_TIMEOUT_MS = 15000;
 
 // ---- isolated git ------------------------------------------------------------------------------------------------
 
-// The environment for a git call that must not be influenced by the caller: no system or global config (the
-// GIT_CONFIG_GLOBAL override needs git >= 2.32; older gits ignore it, the -c flags below still apply), no prompts,
-// and none of the GIT_* variables that redirect git to another repository, template, transport or config.
-export function isolatedGitEnv() {
-  return { ...GIT_SCRUB, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull, GIT_TERMINAL_PROMPT: '0' };
+// The environment for a git call that must not be influenced by the caller. It is built from scratch, as an ALLOWLIST:
+// git can be made to run other programs through many variables (GIT_EXEC_PATH is where it loads git-remote-https and
+// git-upload-pack from; GIT_SSH, GIT_SSH_COMMAND, GIT_PROXY_COMMAND, GIT_ASKPASS, GIT_EXTERNAL_DIFF, GIT_PAGER,
+// GIT_CONFIG_*, GIT_DIR, ...) and a denylist misses whichever one it does not know about yet. So only what git needs to
+// find itself and the owner's files is passed on: PATH and HOME (and, on Windows, the handful of variables the runtime
+// needs to start at all), the locale, and three fixed values: no system config, no global config (GIT_CONFIG_GLOBAL needs
+// git >= 2.32; older gits ignore it, the -c flags below still apply) and no prompts. Proxy and CA variables
+// (HTTPS_PROXY, SSL_CERT_FILE, ...) are deliberately NOT passed: each can redirect or intercept the fetch, so a user who
+// needs a proxy cannot use `pipeline update` yet. `source` and `platform` are injectable for tests.
+const GIT_ENV_KEEP = ['PATH', 'HOME', 'LANG', 'LC_ALL'];
+const GIT_ENV_KEEP_WINDOWS = ['SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'PROGRAMDATA'];
+
+export function isolatedGitEnv({ source = process.env, platform = process.platform } = {}) {
+  const env = {};
+  const windows = platform === 'win32';
+  for (const name of [...GIT_ENV_KEEP, ...(windows ? GIT_ENV_KEEP_WINDOWS : [])]) {
+    // Windows variable names are case-insensitive (`Path`, `ComSpec`): find the real key, pass it under the canonical name.
+    const key = windows ? Object.keys(source).find((k) => k.toUpperCase() === name) : (name in source ? name : undefined);
+    if (key !== undefined && source[key] !== undefined) env[name] = source[key];
+  }
+  return { ...env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull, GIT_TERMINAL_PROMPT: '0' };
 }
 
 // Leading `-c` options: no hooks, no fsmonitor, no credential helper, and https as the only transport. `allowFile`
@@ -47,7 +62,7 @@ export function isolatedGitArgs({ allowFile = false } = {}) {
 // run('git', ...) with the isolation above. `args` may start with `-C <dir>`; `git init` should pass `--template=`
 // (an empty template, so no hook or info/exclude is copied in).
 export function isolatedGit(args, { cwd, timeoutMs = 60000, input, allowFile = false } = {}) {
-  return run('git', [...isolatedGitArgs({ allowFile }), ...args], { cwd, env: isolatedGitEnv(), timeoutMs, input });
+  return run('git', [...isolatedGitArgs({ allowFile }), ...args], { cwd, env: isolatedGitEnv(), replaceEnv: true, timeoutMs, input });
 }
 
 // Where `update` fetches from: UPSTREAM_URL, or the PIPELINE_UPDATE_REMOTE test seam (a path or URL) when this is not

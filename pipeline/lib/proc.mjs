@@ -116,10 +116,17 @@ export function toResult(r) {
   return { code, stdout: r.stdout ?? '', stderr, timedOut, signal: r.signal ?? null };
 }
 
-function baseOptions({ cwd, env, timeoutMs } = {}) {
+// `env` is merged over process.env, unless `replaceEnv` is set: then `env` IS the child's whole environment (nothing is
+// inherited), for a call that must not see variables it did not list (isolatedGit, the installer `update` runs).
+function childEnv(env, replaceEnv) {
+  if (!env) return undefined;
+  return replaceEnv ? { ...env } : { ...process.env, ...env };
+}
+
+function baseOptions({ cwd, env, timeoutMs, replaceEnv } = {}) {
   return {
     cwd,
-    env: env ? { ...process.env, ...env } : undefined,
+    env: childEnv(env, replaceEnv),
     timeout: timeoutMs,
     killSignal: 'SIGKILL', // SIGTERM can be trapped; a timeout has to stick
     encoding: 'utf8',
@@ -128,10 +135,10 @@ function baseOptions({ cwd, env, timeoutMs } = {}) {
   };
 }
 
-export function run(cmd, args = [], { cwd, env, input, timeoutMs } = {}) {
+export function run(cmd, args = [], { cwd, env, input, timeoutMs, replaceEnv } = {}) {
   const plan = planSpawn(cmd, args);
   const r = spawnSync(plan.file, plan.args, {
-    ...baseOptions({ cwd, env, timeoutMs }),
+    ...baseOptions({ cwd, env, timeoutMs, replaceEnv }),
     input,
     windowsVerbatimArguments: plan.windowsVerbatimArguments,
   });

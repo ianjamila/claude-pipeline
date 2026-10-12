@@ -74,8 +74,16 @@ function fetchSource(tmp, sha, remote) {
   return src;
 }
 
+// The installer is code that was just downloaded, run as the owner. It gets the caller's environment minus the
+// variables that make Node load other code into it (NODE_OPTIONS `--require` / `--import`, NODE_PATH); the tests'
+// PIPELINE_ADMIN / PIPELINE_INSTALL_NO_PROBES / PIPELINE_LOCK_DIR pass through.
+const NODE_INJECTION_VARS = new Set(['NODE_OPTIONS', 'NODE_PATH']);
+export function installerEnv(env) {
+  return Object.fromEntries(Object.entries(env).filter(([k, v]) => v !== undefined && !NODE_INJECTION_VARS.has(k.toUpperCase())));
+}
+
 function runInstaller(src, args, env) {
-  const r = runProcess(process.execPath, [path.join(src, 'install.mjs'), ...args], { cwd: src, env, timeoutMs: INSTALL_TIMEOUT_MS });
+  const r = runProcess(process.execPath, [path.join(src, 'install.mjs'), ...args], { cwd: src, env: installerEnv(env), replaceEnv: true, timeoutMs: INSTALL_TIMEOUT_MS });
   let json = null;
   try { json = JSON.parse(r.stdout); } catch { /* not JSON: the stderr tail explains */ }
   return { code: r.code, ok: r.code === 0 && !r.timedOut, json, stderr: tail(r.stderr), timedOut: r.timedOut };

@@ -13,7 +13,7 @@ import { devNull, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createFakeGh } from './helpers/fakegh-env.mjs';
-import { run as update, meta } from '../pipeline/commands/update.mjs';
+import { run as update, meta, installerEnv } from '../pipeline/commands/update.mjs';
 import { compare, fetchRemote, isolatedGit, isolatedGitArgs, isolatedGitEnv, mainSha, UPSTREAM_HOST, UPSTREAM_REPO, UPSTREAM_URL } from '../pipeline/lib/upstream.mjs';
 import { seamValue } from '../pipeline/lib/proc.mjs';
 
@@ -431,7 +431,7 @@ test('compare and mainSha give up when gh hangs past the timeout', () => {
   assert.ok(Date.now() - t0 < 8000, 'the timeouts are real');
 });
 
-test('the isolated git: fixed flags, no system/global config, no prompts, GIT_* redirection scrubbed', () => {
+test('the isolated git: fixed flags, no system/global config, no prompts', () => {
   const args = isolatedGitArgs();
   for (const pair of [`core.hooksPath=${devNull}`, 'core.fsmonitor=false', 'credential.helper=', 'protocol.allow=never', 'protocol.https.allow=always']) {
     assert.ok(args.includes(pair), pair);
@@ -442,9 +442,22 @@ test('the isolated git: fixed flags, no system/global config, no prompts, GIT_* 
   assert.equal(env.GIT_CONFIG_NOSYSTEM, '1');
   assert.equal(env.GIT_CONFIG_GLOBAL, devNull);
   assert.equal(env.GIT_TERMINAL_PROMPT, '0');
-  for (const k of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_TEMPLATE_DIR']) {
-    assert.ok(k in env && env[k] === undefined, k);
-  }
+});
+
+test('the isolated git environment is an allowlist: PATH, HOME, locale and three fixed values, nothing else', () => {
+  const hostile = {
+    PATH: '/usr/bin', HOME: '/home/u', LANG: 'en_US.UTF-8', LC_ALL: 'C', LC_CTYPE: 'x', TEMP: '/t', COMSPEC: 'cmd', SYSTEMROOT: 'C:\\Windows',
+    GIT_EXEC_PATH: '/evil', GIT_SSH: '/evil/ssh', GIT_SSH_COMMAND: 'evil', GIT_CONFIG: '/evil/c', GIT_CONFIG_GLOBAL: '/evil/g', GIT_EXTERNAL_DIFF: 'evil',
+    GIT_PROXY_COMMAND: 'evil', GIT_ASKPASS: 'evil', GIT_PAGER: 'evil', GIT_FUTURE_VARIABLE: 'evil', GIT_DIR: '/evil',
+    HTTPS_PROXY: 'http://evil', SSL_CERT_FILE: '/evil', CURL_CA_BUNDLE: '/evil', LD_PRELOAD: '/evil.so', NODE_OPTIONS: '--require evil', EDITOR: 'evil',
+  };
+  const fixed = { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: devNull, GIT_TERMINAL_PROMPT: '0' };
+  assert.deepEqual(isolatedGitEnv({ source: hostile, platform: 'linux' }), { PATH: '/usr/bin', HOME: '/home/u', LANG: 'en_US.UTF-8', LC_ALL: 'C', ...fixed });
+  // Windows adds the variables the runtime needs to start, and finds them whatever their case.
+  const win = isolatedGitEnv({ source: { Path: 'C:\\bin', ComSpec: 'C:\\cmd.exe', SystemRoot: 'C:\\Windows', GIT_EXEC_PATH: '/evil', NODE_OPTIONS: 'x' }, platform: 'win32' });
+  assert.deepEqual(win, { PATH: 'C:\\bin', COMSPEC: 'C:\\cmd.exe', SYSTEMROOT: 'C:\\Windows', ...fixed });
+  // Missing variables are omitted, not passed as undefined or empty.
+  assert.deepEqual(isolatedGitEnv({ source: {}, platform: 'linux' }), fixed);
 });
 
 test('the isolated git ignores a hostile environment: GIT_DIR, a template with a hook, an allow-everything protocol list', () => {
@@ -478,4 +491,71 @@ test('PIPELINE_UPDATE_REMOTE is a seam: honoured by a checkout, ignored (with th
   const root = scratch('cp-upd-installed');
   writeFileSync(join(root, 'INSTALLED.json'), '{}');
   assert.equal(seamValue('PIPELINE_UPDATE_REMOTE', { PIPELINE_UPDATE_REMOTE: '/x' }, { root, warn: () => {} }), undefined);
+});
+
+test('a hostile GIT_EXEC_PATH is not honoured: the program planted there is never run by the isolated fetch', { skip: process.platform === 'win32' }, () => {
+  const dir = scratch('cp-upd-exec');
+  const planted = join(dir, 'exec');
+  const marker = join(dir, 'ran');
+  mkdirSync(planted);
+  // git looks for git-upload-pack / git-remote-* in GIT_EXEC_PATH first; both plant a marker and then do nothing useful.
+  for (const name of ['git-upload-pack', 'git-remote-https', 'git-remote-file']) {
+    writeFileSync(join(planted, name), `#!/bin/sh\necho "${name}" >> "${marker}"\nexit 1\n`, { mode: 0o755 });
+  }
+  const { bare, sha } = remote();
+  const saved = process.env.GIT_EXEC_PATH;
+  // Control: an unisolated git with the same variable DOES run the planted program, so the next assertions can fail.
+  spawnSync('git', ['ls-remote', bare], { cwd: dir, encoding: 'utf8', env: { ...process.env, GIT_EXEC_PATH: planted } });
+  assert.equal(existsSync(marker), true, 'control: the hostile GIT_EXEC_PATH is a real vector on this git');
+  rmSync(marker);
+  process.env.GIT_EXEC_PATH = planted;
+  try {
+    const ls = isolatedGit(['ls-remote', bare, 'refs/heads/main'], { cwd: dir, allowFile: true });
+    assert.equal(ls.code, 0, ls.stderr);
+    assert.match(ls.stdout, new RegExp(`^${sha}`));
+    const repo = join(dir, 'repo');
+    assert.equal(isolatedGit(['init', '--quiet', '--template=', repo], { cwd: dir }).code, 0);
+    const fetch = isolatedGit(['-C', repo, 'fetch', '--quiet', '--depth', '1', '--no-tags', bare, sha], { cwd: dir, allowFile: true });
+    assert.equal(fetch.code, 0, fetch.stderr);
+    assert.equal(existsSync(marker), false, 'the planted program ran');
+  } finally {
+    if (saved === undefined) delete process.env.GIT_EXEC_PATH; else process.env.GIT_EXEC_PATH = saved;
+  }
+});
+
+test('GIT_SSH_COMMAND, GIT_CONFIG, GIT_EXTERNAL_DIFF and proxy variables in the process environment do not reach the isolated git', () => {
+  const probe = '/nonexistent/probe';
+  const names = ['GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_CONFIG', 'GIT_EXTERNAL_DIFF', 'GIT_EXEC_PATH', 'GIT_PROXY_COMMAND', 'HTTPS_PROXY'];
+  const saved = Object.fromEntries(names.map((n) => [n, process.env[n]]));
+  for (const n of names) process.env[n] = probe;
+  try {
+    const env = isolatedGitEnv();
+    for (const n of names) assert.equal(n in env, false, n);
+  } finally {
+    for (const n of names) if (saved[n] === undefined) delete process.env[n]; else process.env[n] = saved[n];
+  }
+});
+
+test('the installer child does not inherit NODE_OPTIONS or NODE_PATH, and keeps the rest of the environment', () => {
+  const env = installerEnv({ NODE_OPTIONS: '--require x', node_path: '/x', NODE_PATH: '/y', PIPELINE_ADMIN: '1', PIPELINE_LOCK_DIR: '/l', PIPELINE_INSTALL_NO_PROBES: '1', PATH: '/p', GONE: undefined });
+  assert.deepEqual(env, { PIPELINE_ADMIN: '1', PIPELINE_LOCK_DIR: '/l', PIPELINE_INSTALL_NO_PROBES: '1', PATH: '/p' });
+});
+
+test('update: NODE_OPTIONS=--require in the caller environment does not run inside the installer', async () => {
+  const dir = scratch('cp-upd-nodeopt');
+  const marker = join(dir, 'loaded');
+  const inject = join(dir, 'inject.cjs');
+  writeFileSync(inject, `require('node:fs').appendFileSync(${JSON.stringify(marker)}, process.argv[1] + '\\n');\n`);
+  // Control: Node itself honours the variable, so a stripped child is what keeps the marker away.
+  const stub = join(dir, 'install.mjs');
+  writeFileSync(stub, '');
+  spawnSync(process.execPath, [stub], { env: { ...process.env, NODE_OPTIONS: `--require ${inject}` } });
+  assert.match(readFileSync(marker, 'utf8'), /install\.mjs/, 'control: NODE_OPTIONS --require runs in a child');
+  rmSync(marker);
+  const { sha } = remote();
+  const home = newHome();
+  const r = await update(['--claude-home', home], { env: envFor(ghFor(sha, cmp('identical', sha, sha)), { NODE_OPTIONS: `--require ${inject}` }) });
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  // The fake gh (a node script `update` itself runs, with the caller's environment) may load it; the installer must not.
+  assert.doesNotMatch(existsSync(marker) ? readFileSync(marker, 'utf8') : '', /install\.mjs/, 'the injected module ran inside the installer');
 });
