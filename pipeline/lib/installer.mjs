@@ -184,6 +184,23 @@ export function scanUnitDisk(home, unit) {
   return out;
 }
 
+// The installer-owned units, by descriptor only (no source needed): the places an install writes under a claude-home.
+export const installedUnits = () => [
+  { kind: 'pipeline', name: 'pipeline', rel: 'pipeline' },
+  ...AGENTS.map((name) => ({ kind: 'agent', name, rel: `agents/${name}.md` })),
+  ...SKILLS.map((name) => ({ kind: 'skill', name, rel: `skills/${name}` })),
+];
+
+// Home-relative paths of files sitting in an installer-owned unit that the manifest does not list (something added
+// after the install). Same walker and exclusions as install, so what install ignores is ignored here too.
+export function extraInstalledFiles(home, manifest) {
+  const extra = [];
+  for (const unit of installedUnits()) {
+    for (const rel of scanUnitDisk(home, unit).keys()) if (!Object.hasOwn(manifest.files, rel)) extra.push(rel);
+  }
+  return extra.sort(byCodeUnit);
+}
+
 // 'missing' (nothing at the target), 'same' (exactly our files, byte for byte) or 'different'.
 export function unitState(home, unit) {
   const target = unitTarget(home, unit);
@@ -236,17 +253,56 @@ export function parseLsTree(text) {
   return blobs;
 }
 
+// Of the paths HEAD holds (source-root-relative, POSIX), the ones an install would copy, named as the plan names the
+// source file: pipeline/** (minus INSTALLED.json, EXCLUDED_NAMES anywhere, EXCLUDED_TOP_LEVEL directly under pipeline/),
+// agents/<name>.md for AGENTS, skills/<name>/** for SKILLS (same exclusions) and the root VERSION, which is what
+// installs as pipeline/VERSION. Lets provenance notice a source file deleted from the working tree.
+export function installableSourcePaths(headPaths) {
+  const out = new Set();
+  const keep = (parts) => parts.length > 0 && !EXCLUDED_TOP_LEVEL.has(parts[0]) && !parts.some((p) => EXCLUDED_NAMES.has(p));
+  for (const p of headPaths) {
+    const parts = p.split('/');
+    if (p === 'VERSION' || p === 'pipeline/VERSION') out.add('VERSION');
+    else if (parts[0] === 'pipeline' && parts.length > 1) {
+      if (p !== 'pipeline/INSTALLED.json' && keep(parts.slice(1))) out.add(p);
+    } else if (parts[0] === 'agents' && parts.length === 2) {
+      if (AGENTS.some((n) => parts[1] === `${n}.md`)) out.add(p);
+    } else if (parts[0] === 'skills' && parts.length > 2 && SKILLS.includes(parts[1])) {
+      if (keep(parts.slice(2))) out.add(p);
+    }
+  }
+  return out;
+}
+
 // Source-relative paths (POSIX) of planned files that are not exactly what HEAD holds: absent from HEAD, or a different
 // blob. `hashes` is the blob id git computes for each path in the working tree (filters applied), in the same order.
 export function pathsDifferingFromHead(paths, headBlobs, hashes) {
   return paths.filter((p, i) => headBlobs.get(p) !== hashes[i]);
 }
 
+// The real location of `p`: symlinks resolved on the deepest ancestor that exists, the not-yet-created rest appended.
+// A claude-home reached through an alias (a symlinked ~/.claude, a second mount point) must name the same lock.
+export function canonicalPath(p) {
+  let cur = path.resolve(p);
+  const rest = [];
+  for (;;) {
+    try { return path.join(fs.realpathSync.native(cur), ...rest); } catch { /* not there yet: try the parent */ }
+    const parent = path.dirname(cur);
+    if (parent === cur) return path.resolve(p);
+    rest.unshift(path.basename(cur));
+    cur = parent;
+  }
+}
+
+// Where the write lock for `home` lives: inside the destination itself, so it is scoped to that home and never to
+// whoever happens to run the installer.
+export const installLockDir = (home) => path.join(canonicalPath(home), 'backups', '.locks');
+
 // Name of the write lock for one claude-home: two installs into the same home exclude each other, installs into
-// different homes do not. The resolved path is case-folded where the filesystem is (Windows, macOS), then hashed so
-// the name is a safe file name whatever the path holds.
+// different homes do not. The canonical (symlink-resolved) path is case-folded where the filesystem is (Windows,
+// macOS), then hashed so the name is a safe file name whatever the path holds.
 export function installLockName(home) {
-  const resolved = path.resolve(home);
+  const resolved = canonicalPath(home);
   return `installer-${createHash('sha256').update(foldCase(resolved)).digest('hex').slice(0, 16)}`;
 }
 

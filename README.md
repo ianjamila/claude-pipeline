@@ -38,7 +38,8 @@ refuse to overwrite skills or agents it didn't install, and lets `--check` repor
   warning all report it as `.incomplete`; re-running the installer (or `pipeline update`) fixes it.
 - **One writer at a time.** Install and uninstall take a per-`claude-home` lock for the whole
   write run, so two of them (two terminals, two machines on a shared home) cannot interleave their
-  swaps. A lock whose owner process is gone is reclaimed; a live one is never touched, and the
+  swaps. The lock sits inside that home (`backups/.locks`) and is named for its real,
+  symlink-resolved path, so reaching the home through an alias does not get around it. A lock whose owner process is gone is reclaimed; a live one is never touched, and the
   second run stops with a message naming the owner.
 Requirements: Node ≥ 20, git, `gh` (authenticated); `codex` for reviews; `vercel` for projects
 that deploy there.

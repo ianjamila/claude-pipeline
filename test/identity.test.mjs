@@ -4,13 +4,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { cpSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, realpathSync } from 'node:fs';
+import { cpSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { installedIdentity, checkoutIdentity, parseStamp, formatStamp, stampIsTrusted, fileProvenance } from '../pipeline/lib/identity.mjs';
-import { MANIFEST_REL, sha256File } from '../pipeline/lib/installer.mjs';
+import { MANIFEST_REL, sha256File, walkFiles } from '../pipeline/lib/installer.mjs';
 import { versionReport, meta as versionMeta } from '../pipeline/commands/version.mjs';
 
 const made = [];
@@ -224,12 +224,10 @@ const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 function installedPipelineHome(manifestExtra = {}) {
   const home = scratch();
   cpSync(join(REPO, 'pipeline'), join(home, 'pipeline'), { recursive: true });
-  const files = {};
-  for (const rel of ['pipeline/commands/version.mjs', 'pipeline/lib/identity.mjs', 'pipeline/bin/pipeline.mjs']) {
-    files[rel] = sha256File(join(home, ...rel.split('/')));
-  }
   writeFileSync(join(home, 'pipeline', 'VERSION'), '3.2.1\n');
-  files['pipeline/VERSION'] = sha256File(join(home, 'pipeline', 'VERSION'));
+  // a real install lists every file it copied (anything else in the unit would read as an added file)
+  const files = {};
+  for (const r of walkFiles(join(home, 'pipeline'))) files[`pipeline/${r}`] = sha256File(join(home, 'pipeline', ...r.split('/')));
   writeFileSync(join(home, ...MANIFEST_REL.split('/')), JSON.stringify({ version: '3.2.1', sourceSha: SHA, complete: true, files, ...manifestExtra }));
   return home;
 }
@@ -246,7 +244,7 @@ test('pipeline version: usage stays one line naming no flags', () => {
 test('pipeline version (installed copy, run through the CLI): the manifest stamp with its fields', () => {
   const home = installedPipelineHome();
   assert.deepEqual(cliVersion(home), {
-    ok: true, version: '3.2.1+0123456', base: '3.2.1', sourceSha: SHA, complete: true, modified: [], missing: [], kind: 'installed',
+    ok: true, version: '3.2.1+0123456', base: '3.2.1', sourceSha: SHA, complete: true, modified: [], missing: [], extra: [], kind: 'installed',
   });
 });
 
@@ -283,4 +281,101 @@ test('pipeline version (checkout): a clean published HEAD is trusted; an edit is
   const dirty = versionReport(join(repo.dir, 'pipeline'));
   assert.equal(dirty.version, `1.0.0+${sha.slice(0, 7)}.unverified`);
   assert.deepEqual(dirty.modified, ['pipeline/lib/x.mjs']);
+});
+
+// ---- R1-B1 / R1-B2 -----------------------------------------------------------------------------------------------
+
+test('installedIdentity: a file added to an installer-owned unit makes the stamp .modified and is listed as extra', () => {
+  const home = installedHome();
+  assert.deepEqual(installedIdentity(home).extra, []);
+  mkdirSync(join(home, 'pipeline', 'commands'), { recursive: true });
+  writeFileSync(join(home, 'pipeline', 'commands', 'extra.mjs'), 'export default 1;\n');
+  writeFileSync(join(home, 'skills', 'ship', 'EXTRA.md'), 'added\n');
+  const id = installedIdentity(home);
+  assert.deepEqual(id.extra, ['pipeline/commands/extra.mjs', 'skills/ship/EXTRA.md']);
+  assert.deepEqual(id.modified, []);
+  assert.deepEqual(id.missing, []);
+  assert.equal(id.stamp, '1.4.0+0123456.modified');
+  assert.equal(versionReport(join(home, 'pipeline')).version, '1.4.0+0123456.modified');
+  assert.deepEqual(versionReport(join(home, 'pipeline')).extra, ['pipeline/commands/extra.mjs', 'skills/ship/EXTRA.md']);
+});
+
+test('installedIdentity: files the installer ignores or does not own are not extra (INSTALLED.json, test/, node_modules, other skills, foreign agents)', () => {
+  const home = installedHome();
+  for (const f of ['pipeline/test/t.mjs', 'pipeline/node_modules/m/i.js', 'pipeline/.DS_Store', 'skills/other/SKILL.md', 'agents/mine.md', 'settings.json']) {
+    mkdirSync(dirname(join(home, ...f.split('/'))), { recursive: true });
+    writeFileSync(join(home, ...f.split('/')), 'x\n');
+  }
+  const id = installedIdentity(home);
+  assert.deepEqual(id.extra, []);
+  assert.equal(id.stamp, '1.4.0+0123456');
+});
+
+test('the session hook and update --check treat an added installed file as modified', async () => {
+  const { installedProblems } = await import('../pipeline/lib/session-version.mjs');
+  const home = installedHome();
+  assert.deepEqual(installedProblems(installedIdentity(home)), []);
+  writeFileSync(join(home, 'pipeline', 'added.mjs'), 'x\n');
+  const problems = installedProblems(installedIdentity(home));
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /^modified \(1 installed file differs/);
+});
+
+function installRepo() {
+  const repo = createTmpRepo();
+  repo.write('VERSION', '1.4.0\n');
+  repo.write('pipeline/lib/a.mjs', 'a\n');
+  repo.write('pipeline/lib/b.mjs', 'b\n');
+  repo.write('pipeline/test/t.mjs', 't\n');
+  repo.write('agents/judge.md', 'judge\n');
+  repo.write('agents/unlisted.md', 'not an installable agent\n');
+  repo.write('skills/ship/SKILL.md', 'ship\n');
+  repo.write('skills/ship/ref/r.md', 'r\n');
+  const sha = repo.commit('init');
+  repo.git(['update-ref', 'refs/remotes/origin/main', sha]);
+  const planned = (repo2) => ['pipeline/lib/a.mjs', 'pipeline/lib/b.mjs', 'agents/judge.md', 'skills/ship/SKILL.md', 'skills/ship/ref/r.md', 'VERSION']
+    .filter((r) => existsSync(join(repo2.dir, ...r.split('/')))).map((r) => join(repo2.dir, ...r.split('/')));
+  return { repo, sha, planned };
+}
+
+test('fileProvenance (install scope): a HEAD file deleted from the working tree is dirty, and sourceSha is not claimed', () => {
+  const { repo, planned } = installRepo();
+  assert.equal(fileProvenance(repo.dir, planned(repo), { scope: 'install' }).state, 'clean');
+  // Controls: files the installer never copies may be absent without effect.
+  repo.rm('pipeline/test/t.mjs');
+  repo.rm('agents/unlisted.md');
+  assert.equal(fileProvenance(repo.dir, planned(repo), { scope: 'install' }).state, 'clean');
+  repo.rm('skills/ship/ref/r.md');
+  const p = fileProvenance(repo.dir, planned(repo), { scope: 'install' });
+  assert.equal(p.state, 'dirty');
+  assert.deepEqual(p.deleted, ['skills/ship/ref/r.md']);
+  assert.deepEqual(p.differing, ['skills/ship/ref/r.md']);
+  // Without the install scope the same call cannot see it: that is the hole being closed.
+  assert.equal(fileProvenance(repo.dir, planned(repo)).state, 'clean');
+});
+
+test('checkoutIdentity: a deleted installable file (install scope) or a deleted listed file breaks provenance -> .unverified, listed as missing', () => {
+  const a = installRepo();
+  a.repo.rm('pipeline/lib/b.mjs');
+  const id = checkoutIdentity(a.repo.dir, a.planned(a.repo), { scope: 'install' });
+  assert.equal(id.provenance, false);
+  assert.deepEqual(id.missing, ['pipeline/lib/b.mjs']);
+  assert.deepEqual(id.modified, []);
+  assert.equal(id.stamp, `1.4.0+${a.sha.slice(0, 7)}.unverified`);
+
+  // vendor passes an explicit list of source files: one of them gone must not claim HEAD either
+  const v = installRepo();
+  const listed = v.planned(v.repo);
+  v.repo.rm('pipeline/lib/a.mjs');
+  const vid = checkoutIdentity(v.repo.dir, listed);
+  assert.equal(vid.provenance, false);
+  assert.deepEqual(vid.missing, ['pipeline/lib/a.mjs']);
+  assert.equal(vid.stamp, `1.4.0+${v.sha.slice(0, 7)}.unverified`);
+
+  // a deleted root VERSION
+  const w = installRepo();
+  w.repo.rm('VERSION');
+  const wid = checkoutIdentity(w.repo.dir, w.planned(w.repo), { scope: 'install' });
+  assert.equal(wid.provenance, false);
+  assert.match(wid.stamp, /\.unverified$/);
 });

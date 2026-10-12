@@ -7,7 +7,7 @@ import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { run as vendor, meta, vendorDrift } from '../pipeline/commands/vendor.mjs';
-import { MANIFEST_REL, sha256File } from '../pipeline/lib/installer.mjs';
+import { MANIFEST_REL, sha256File, walkFiles } from '../pipeline/lib/installer.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const LIBS = ['proc', 'paths', 'yaml', 'config', 'glob', 'diff', 'git', 'hardstops', 'risk', 'integrity', 'locks', 'guard-provenance'];
@@ -256,7 +256,7 @@ test('vendor from an installed copy stamps the installed identity (.modified whe
   try {
     cpSync(join(root, 'pipeline'), join(home, 'pipeline'), { recursive: true });
     const files = {};
-    for (const rel of ['pipeline/lib/glob.mjs', 'pipeline/lib/yaml.mjs', 'pipeline/bin/pipeline.mjs']) files[rel] = sha256File(join(home, ...rel.split('/')));
+    for (const r of walkFiles(join(home, 'pipeline'))) files[`pipeline/${r}`] = sha256File(join(home, 'pipeline', ...r.split('/')));
     const sourceSha = 'abcdef0123456789abcdef0123456789abcdef01';
     writeFileSync(join(home, ...MANIFEST_REL.split('/')), JSON.stringify({ version: '7.7.7', sourceSha, complete: true, files }));
     const target = createTmpRepo();

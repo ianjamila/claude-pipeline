@@ -191,7 +191,7 @@ function removeInstalledFile(home, rel) {
 // with another blob (an edit, a new file, an ignored extra) means no sha is recorded: { sourceSha: null, sourceDirty:
 // true, warning }. Not a checkout, or git unavailable: { sourceSha: null, sourceDirty: false } as before.
 function sourceProvenance(source, plan) {
-  const p = fileProvenance(source, [...plan.files.values()].map((f) => f.abs));
+  const p = fileProvenance(source, [...plan.files.values()].map((f) => f.abs), { scope: 'install' });
   if (p.state === 'no-git') return { sourceSha: null, sourceDirty: false, warning: null };
   if (p.state === 'unverifiable') return { sourceSha: null, sourceDirty: true, warning: `could not compare the source with ${p.head.slice(0, 7)}; recording no source sha` };
   if (p.state === 'clean') return { sourceSha: p.head, sourceDirty: false, warning: null };
@@ -431,12 +431,13 @@ function formatReport(r) {
 
 // Install and uninstall (not --check) hold one lock per claude-home for the whole write run, so two of them can never
 // interleave their swaps. locks.mjs reclaims a lock whose owner process is dead; a live owner (or another machine's)
-// is never touched. PIPELINE_LOCK_DIR moves the lock directory (tests). `pipeline update` runs this installer as a
-// child and takes no lock of its own, so it cannot deadlock against it.
+// is never touched. The lock lives in <home>/backups/.locks, named for the home's canonical (symlink-resolved) path, so
+// an alias of the home cannot dodge it; PIPELINE_LOCK_DIR moves the lock directory (tests). `pipeline update` runs this
+// installer as a child and takes no lock of its own, so it cannot deadlock against it.
 function takeWriteLock(home, env) {
   let got;
   try {
-    got = tryAcquire(I.installLockName(home), { dir: env.PIPELINE_LOCK_DIR || undefined });
+    got = tryAcquire(I.installLockName(home), { dir: env.PIPELINE_LOCK_DIR || I.installLockDir(home) });
   } catch (err) {
     throw new InstallError(`could not take the install lock: ${err?.message ?? err}`);
   }
@@ -444,6 +445,20 @@ function takeWriteLock(home, env) {
   if (got.error) throw new InstallError(`could not take the install lock: ${got.error.message}`);
   const who = got.owner && !got.owner.incomplete ? ` (pid ${got.owner.pid} on ${got.owner.host}, since ${got.owner.startedAt})` : '';
   throw new InstallError(`another install is running in ${home}${who}. Wait for it to finish, then run this again.`);
+}
+
+// The default lock directory is a stranger inside the owner's home. `willCreate` (called before the lock is taken) lists
+// the directories that do not exist yet, deepest first; `prune` takes them away again once no lock is left in them. rmdir
+// only removes an empty directory, so another install's lock (or anything else) keeps it and everything above it.
+function willCreate(home) {
+  const out = [];
+  for (let dir = I.installLockDir(home); !fs.existsSync(dir); dir = path.dirname(dir)) out.push(dir);
+  return out;
+}
+function prune(dirs) {
+  for (const dir of dirs) {
+    try { fs.rmdirSync(dir); } catch { return; }
+  }
 }
 
 // ---- main --------------------------------------------------------------------------------------------------
@@ -468,8 +483,12 @@ function main(argv, env) {
   const source = path.resolve(expandHome(opts.source || path.dirname(fileURLToPath(import.meta.url))));
   const ctx = { opts, home, source, env };
   let lock = null;
+  let created = [];
   try {
-    if (!opts.check) lock = takeWriteLock(home, env);
+    if (!opts.check) {
+      created = env.PIPELINE_LOCK_DIR ? [] : willCreate(home);
+      lock = takeWriteLock(home, env);
+    }
     const report = opts.check ? doCheck(ctx) : opts.uninstall ? doUninstall(ctx) : doInstall(ctx);
     process.stdout.write(opts.json ? `${JSON.stringify(report, null, 2)}\n` : formatReport(report));
     return report.ok ? 0 : 1;
@@ -480,7 +499,10 @@ function main(argv, env) {
     if (opts.json) process.stdout.write(`${JSON.stringify({ ok: false, error: message }, null, 2)}\n`);
     return exitCode;
   } finally {
-    if (lock) { try { release(lock); } catch { /* a stuck lock is reclaimed once this process is gone */ } }
+    if (lock) {
+      try { release(lock); } catch { /* a stuck lock is reclaimed once this process is gone */ }
+      prune(created);
+    }
   }
 }
 

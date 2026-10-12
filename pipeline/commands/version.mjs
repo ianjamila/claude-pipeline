@@ -22,18 +22,18 @@ export function versionReport(pipelineDir) {
   if (existsSync(join(pipelineDir, 'INSTALLED.json'))) {
     const id = installedIdentity(dirname(pipelineDir));
     if (id) {
-      return { ok: true, version: id.stamp, base: id.base, sourceSha: id.sourceSha, complete: id.complete, modified: id.modified, missing: id.missing, kind: 'installed' };
+      return { ok: true, version: id.stamp, base: id.base, sourceSha: id.sourceSha, complete: id.complete, modified: id.modified, missing: id.missing, extra: id.extra, kind: 'installed' };
     }
     // The manifest is there but unusable (corrupt): nothing vouches for the files.
     const base = readText(join(pipelineDir, 'VERSION')) || 'unknown';
-    return { ok: true, version: formatStamp(base, null, ['unverified']), base, sourceSha: null, complete: false, modified: [], missing: [], kind: 'installed' };
+    return { ok: true, version: formatStamp(base, null, ['unverified']), base, sourceSha: null, complete: false, modified: [], missing: [], extra: [], kind: 'installed' };
   }
   const root = dirname(pipelineDir);
   if (!existsSync(join(root, 'VERSION'))) {
-    return { ok: true, version: 'unknown', base: 'unknown', sourceSha: null, complete: true, modified: [], missing: [], kind: 'checkout' };
+    return { ok: true, version: 'unknown', base: 'unknown', sourceSha: null, complete: true, modified: [], missing: [], extra: [], kind: 'checkout' };
   }
-  const id = checkoutIdentity(root, [...buildPlan(root).files.values()].map((f) => f.abs));
-  return { ok: true, version: id.stamp, base: id.base, sourceSha: id.sourceSha, complete: true, modified: id.modified, missing: [], kind: 'checkout' };
+  const id = checkoutIdentity(root, [...buildPlan(root).files.values()].map((f) => f.abs), { scope: 'install' });
+  return { ok: true, version: id.stamp, base: id.base, sourceSha: id.sourceSha, complete: true, modified: id.modified, missing: id.missing, extra: [], kind: 'checkout' };
 }
 
 export async function run(argv) {

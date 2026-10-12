@@ -16,7 +16,7 @@ import { createTmpRepo } from './helpers/tmprepo.mjs';
 import {
   DEADLINE_MS, MAIN_TTL_MS, TIMEOUT_LINE, UPDATE_COMMAND, cacheDirFor, checkSession, createCache, formatOutput, gatherFacts, installedProblems, messagesFor, readVendoredStamp, reasonLabel, safeStampLabel,
 } from '../pipeline/lib/session-version.mjs';
-import { MANIFEST_REL } from '../pipeline/lib/installer.mjs';
+import { MANIFEST_REL, sha256File, walkFiles } from '../pipeline/lib/installer.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 const made = [];
@@ -261,11 +261,14 @@ test('gatherFacts / checkSession never throw', async () => {
 
 // ---- the real hook file, end to end -----------------------------------------------------------------------------
 
-// A claude-home holding a copy of this pipeline and a manifest that vouches for no files (so nothing reads as modified).
+// A claude-home holding a copy of this pipeline and a manifest that vouches for every file in it (so nothing reads as
+// modified, and nothing as added).
 function installedHome(sourceSha = INST) {
   const home = scratch('cp-sv-home');
   cpSync(join(REPO, 'pipeline'), join(home, 'pipeline'), { recursive: true });
-  const manifest = { version: '1.4.0', sourceSha, installedAt: '2026-10-12T00:00:00.000Z', complete: true, files: {}, hooks: { guardGit: true, guardFiles: true } };
+  const files = {};
+  for (const r of walkFiles(join(home, 'pipeline'))) files[`pipeline/${r}`] = sha256File(join(home, 'pipeline', ...r.split('/')));
+  const manifest = { version: '1.4.0', sourceSha, installedAt: '2026-10-12T00:00:00.000Z', complete: true, files, hooks: { guardGit: true, guardFiles: true } };
   writeFileSync(join(home, ...MANIFEST_REL.split('/')), `${JSON.stringify(manifest, null, 2)}\n`);
   return home;
 }

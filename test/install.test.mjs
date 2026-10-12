@@ -1304,6 +1304,31 @@ test('an edited tracked file, an untracked file and an ignored extra each make s
   assert.equal(readManifest(home3).sourceDirty, true);
 });
 
+test('an installable file deleted from the working tree (but still in HEAD) leaves no source sha; excluded files do not count', () => {
+  for (const gone of ['pipeline/lib/answer.mjs', 'skills/ship/reference/notes.md', 'agents/arbiter.md']) {
+    const { dir, head } = committedSource();
+    rmSync(join(dir, ...gone.split('/')));
+    const home = newHome();
+    const r = installReport(home, dir);
+    assert.equal(r.sourceSha, null, gone);
+    assert.deepEqual(r.warnings.filter((w) => w.includes('not a clean checkout')), [`source is not a clean checkout of ${head.slice(0, 7)}: ${gone}; recording no source sha`], gone);
+    assert.equal(readManifest(home).sourceDirty, true, gone);
+  }
+
+  // HEAD holds files the installer never copies (pipeline/test/**, node_modules, a stray INSTALLED.json): deleting them is not a deletion of source.
+  const dir = copyFixture();
+  for (const f of ['pipeline/test/t.mjs', 'pipeline/node_modules/m/i.js', 'pipeline/INSTALLED.json', 'skills/ship/test/t.md']) {
+    mkdirSync(dirname(join(dir, ...f.split('/'))), { recursive: true });
+    writeFileSync(join(dir, ...f.split('/')), 'x\n');
+  }
+  git(dir, 'init', '-q');
+  git(dir, 'add', '-A', '-f');
+  git(dir, 'commit', '-q', '-m', 'fixture');
+  const head = git(dir, 'rev-parse', 'HEAD');
+  for (const f of ['pipeline/test', 'pipeline/node_modules', 'pipeline/INSTALLED.json', 'skills/ship/test']) rmSync(join(dir, ...f.split('/')), { recursive: true });
+  assert.equal(installReport(newHome(), dir).sourceSha, head);
+});
+
 test('only the first three differing paths are named', () => {
   const { dir } = committedSource();
   for (const n of ['a', 'b', 'c', 'd']) writeFileSync(join(dir, 'pipeline', 'lib', `${n}.mjs`), '//\n');
@@ -1363,6 +1388,33 @@ test('the lock name is scoped to the resolved claude-home: same home same name, 
   assert.equal(installLockName(a), installLockName(join(a, '..', 'claude')));
   assert.notEqual(installLockName(a), installLockName(b));
   assert.match(installLockName(newHome({ space: true })), /^installer-[0-9a-f]{16}$/);
+});
+
+test('the lock is scoped to the canonical destination: a symlinked alias names the same lock and a busy install through it is refused', { skip: process.platform === 'win32' }, () => {
+  const real = newHome();
+  mkdirSync(real, { recursive: true });
+  const alias = join(scratch('cp-alias'), 'link');
+  symlinkSync(real, alias, 'dir');
+  assert.equal(installLockName(alias), installLockName(real));
+  // not created yet, reached through an alias of its parent
+  const parentLink = join(scratch('cp-alias2'), 'plink');
+  symlinkSync(dirname(real), parentLink, 'dir');
+  assert.equal(installLockName(join(parentLink, 'claude')), installLockName(real));
+
+  // No PIPELINE_LOCK_DIR: the default lock directory is inside the destination, not in the caller's ~/.claude.
+  const env = { PIPELINE_MACHINE_ID: MACHINE };
+  const locks = join(real, 'backups', '.locks');
+  const lock = holdLock(real, locks);
+  try {
+    const busy = install(alias, [], { env });
+    assert.equal(busy.status, 1, busy.stderr);
+    assert.match(busy.stderr, /another install is running in /);
+    assert.equal(existsSync(join(real, 'pipeline')), false, 'nothing was written');
+    assert.equal(existsSync(join(busy.userHome, '.claude')), false, 'the caller\'s ~/.claude was not used for the lock');
+  } finally {
+    release(lock);
+  }
+  assert.equal(install(alias, [], { env }).status, 0);
 });
 
 test('install and uninstall refuse while another install holds the lock for that home (exit 1, nothing written); --check ignores it', () => {

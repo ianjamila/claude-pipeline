@@ -42,7 +42,7 @@ function installedSummary(id) {
   if (!id) return null;
   return {
     stamp: id.stamp, base: id.base, sourceSha: id.sourceSha, complete: id.complete,
-    sourceDirty: id.sourceDirty, modified: id.modified, missing: id.missing,
+    sourceDirty: id.sourceDirty, modified: id.modified, missing: id.missing, extra: id.extra ?? [],
   };
 }
 
@@ -53,7 +53,7 @@ function relate(id, main, env) {
   return compare(id.sourceSha, main.sha, { timeoutMs: NETWORK_TIMEOUT_MS, env });
 }
 
-const clean = (id) => Boolean(id && id.complete && !id.sourceDirty && id.modified.length === 0 && id.missing.length === 0);
+const clean = (id) => Boolean(id && id.complete && !id.sourceDirty && id.modified.length === 0 && id.missing.length === 0 && (id.extra?.length ?? 0) === 0);
 
 // Fetches exactly `sha` into <tmp>/src with an isolated git and checks it out detached. Returns the source directory;
 // throws an Error with a plain-language message when any step fails or the checked-out HEAD is not `sha`.
