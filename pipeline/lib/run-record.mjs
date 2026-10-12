@@ -13,7 +13,7 @@ export const STEPS = Object.freeze(['build', 'verify', 'pr', 'review', 'gate', '
 export const OUTCOMES = Object.freeze([
   'merged', 'blocked', 'needs-human', 'awaiting-review', 'awaiting-owner-merge',
   'superseded', 'recovered', 'rollback-failed', 'changed-during-recovery', 'rollback-skipped',
-  'not-live', 'deploy-failed', 'deploy-not-observed', 'no-production',
+  'not-live', 'deploy-failed', 'deploy-not-observed', 'no-production', 'needs-owner',
 ]);
 
 // Exhaustive: an outcome the run stopped at. `awaiting-owner-merge` is a place the run waits, every other outcome ends it.
@@ -32,6 +32,7 @@ export const OUTCOME_STEP = Object.freeze({
   'deploy-failed': 'ended',
   'deploy-not-observed': 'ended',
   'no-production': 'ended',
+  'needs-owner': 'ended',
 });
 
 // What a reader should do once the run stopped at this outcome (shown as "Next" in the status block).
@@ -50,6 +51,7 @@ export const OUTCOME_NEXT = Object.freeze({
   'deploy-failed': 'check the failed deployment',
   'deploy-not-observed': 'check production by hand',
   'no-production': 'nothing: no production environment',
+  'needs-owner': 'owner: production fails the smoke and was left alone, check it and the rollback target',
 });
 
 export const STATUS_START = '<!-- claude-pipeline:status:start -->';
