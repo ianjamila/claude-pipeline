@@ -238,7 +238,7 @@ test('g: scriptFeedsOf lists the files that feed a command (pure parser API)', (
   const feeds = (line) => simpleCommands(line).flatMap((c) => scriptFeedsOf(c, line));
   assert.deepEqual(feeds('bash < f.sh'), [{ kind: 'shell', file: 'f.sh' }]);
   assert.deepEqual(feeds('cat f.sh | bash'), [{ kind: 'shell', file: 'f.sh' }]);
-  assert.deepEqual(feeds('sed p f.sh | bash').map((f) => [f.kind, f.file]), [['scan', 'p'], ['scan', 'f.sh']]);
+  assert.deepEqual(feeds('sed p f.sh | bash').map((f) => [f.kind, f.file]), [['scan', 'p'], ['scan', 'f.sh'], ['scan', 'p f.sh']]); // (the last is the joined scan, review R1-B2)
   assert.deepEqual(feeds('cat $X | bash'), [{ kind: 'shell', file: '$X', ambiguous: true, words: ['$X'] }]);
   assert.deepEqual(feeds('cat f.sh'), []);
   assert.deepEqual(feeds('echo hi | bash'), []);
@@ -327,4 +327,56 @@ test('R1-B3: head is a producer too: a file the exact reader used to allow (judg
   for (const c of ['head -n 3 ok.sh | bash', 'tail -n +2 ok.sh | bash', 'tac ok.sh | sh', 'head -c 10 README.md | bash']) allowBoth(c, { 'ok.sh': 'ok' });
   // cat / less keep printing the file as it is
   for (const c of ['cat mid.sh | bash', 'bash < mid.sh']) allowBoth(c, mid);
+});
+
+// ---- review R1-B2: several files feed one shell: their texts are ONE program, in command-line order ------------------------------------
+// Each file used to be judged on its own: `cat a b | bash` with a = `git pu` and b = `sh origin main` was allowed (and so was a protected
+// file name split across two files). The files' texts are joined (repeats included: `cat c c`) and judged as one program; a rewriting
+// producer's files are scanned joined too. Feeds whose order or multiplicity cannot be rebuilt (several producers) are refused.
+const splitAt = (bad) => bad.length - (bad === BAD_GIT ? 14 : 17); // 'git pu' | 'sh origin main'  and  '...~/.cla' | 'ude/settings.json'
+const parts = (bad) => [bad.slice(0, splitAt(bad)), `${bad.slice(splitAt(bad))}\n`];
+
+test('R1-B2: a guarded line split across the files of one reader is judged as the program the shell reads', () => {
+  const split = (bad) => { const [h, t] = parts(bad); return { 'a.sh': h, 'b.sh': t, 'ok.sh': 'echo hi\n' }; };
+  for (const c of [
+    'cat a.sh b.sh | bash', 'cat a.sh b.sh | sh -s', '{ cat a.sh b.sh; } | bash', 'eval "$(cat a.sh b.sh)"', 'bash <(cat a.sh b.sh)', 'bash < <(cat a.sh b.sh)', 'bash <<< "$(cat a.sh b.sh)"',
+    'cat a.sh b.sh ok.sh | bash', 'cat ok.sh a.sh b.sh | bash', 'cat -- a.sh b.sh | bash', 'less a.sh b.sh | bash', 'cd sub/.. && cat a.sh b.sh | bash', 'bash -c "$(cat a.sh b.sh)"',
+  ]) denyBuilt(c, split);
+  // each half alone, the other order and harmless pairs are still fine
+  for (const c of ['cat a.sh | bash', 'cat b.sh | bash', 'cat b.sh a.sh | bash', 'cat a.sh ok.sh b.sh | bash', 'cat ok.sh ok.sh | bash']) allowBuilt(c, split);
+});
+
+test('R1-B2: the same file listed twice is read twice (repeats are kept in the join)', () => {
+  const selfJoin = (bad) => { const [h, t] = parts(bad); return { 'c.sh': `${t}${h}` }; }; // c alone: `sh origin main` then `git pu`; c c: ... `git pu` + `sh origin main` ...
+  denyBuilt('cat c.sh c.sh | bash', selfJoin);
+  allowBuilt('cat c.sh | bash', selfJoin);
+});
+
+test('R1-B2: files read by a rewriting producer are scanned joined (a guarded word split across them is caught)', () => {
+  const split = (bad) => { const [h, t] = parts(bad); return { 'a.sh': h, 'b.sh': t }; };
+  for (const c of ['sed p a.sh b.sh | bash', 'awk 1 a.sh b.sh | sh', 'cat a.sh b.sh | tr a b | bash', 'eval "$(sed p a.sh b.sh)"', 'tail -n 5 a.sh b.sh | bash', 'sed p b.sh a.sh | bash', 'tac b.sh a.sh | bash']) denyBuilt(c, split);
+  allowBuilt('sed p a.sh | bash', split);
+  allowBuilt('sed p b.sh | bash', split);
+});
+
+test('R1-B2: feeds from several producers (order and multiplicity unknown) are refused, even for harmless files', () => {
+  const ok = () => ({ 'a.sh': 'echo a', 'b.sh': 'echo b' });
+  for (const c of ['{ cat a.sh; cat b.sh; } | bash', 'cat a.sh | bash < b.sh']) {
+    const r = bothBuilt(c, ok);
+    assert.equal(r.git.decision, 'deny', `git: ${c}`);
+    assert.equal(r.files.decision, 'deny', `files: ${c}`);
+  }
+});
+
+test('R1-B2: scriptFeedsOf joins the files of one reader in command-line order, repeats included', () => {
+  const feeds = (line) => simpleCommands(line).flatMap((c) => scriptFeedsOf(c, line));
+  const joined = (line) => feeds(line).filter((f) => f.joined); // (each file is still listed on its own as well)
+  assert.deepEqual(joined('cat a.sh b.sh | bash'), [{ kind: 'shell', file: 'a.sh b.sh', joined: ['a.sh', 'b.sh'] }]);
+  assert.deepEqual(joined('cat b.sh a.sh b.sh | bash'), [{ kind: 'shell', file: 'b.sh a.sh b.sh', joined: ['b.sh', 'a.sh', 'b.sh'] }]);
+  assert.deepEqual(feeds('cat a.sh b.sh | bash').filter((f) => !f.joined), [{ kind: 'shell', file: 'a.sh' }, { kind: 'shell', file: 'b.sh' }]);
+  assert.deepEqual(feeds('cat f.sh | bash'), [{ kind: 'shell', file: 'f.sh' }]); // one file: unchanged
+  assert.equal(feeds('{ cat a.sh; cat b.sh; } | bash')[0].unresolvable, true);
+  assert.equal(feeds('cat a.sh *.sh | bash')[0].unresolvable, true); // a glob among several: which files, in what order, is unknown
+  const scan = feeds('sed p a.sh b.sh | bash');
+  assert.deepEqual(scan.filter((f) => f.joined), [{ kind: 'scan', file: 'p a.sh b.sh', joined: ['p', 'a.sh', 'b.sh'] }]); // (the program word is a candidate file name too)
 });

@@ -794,6 +794,7 @@ const isNodeModulesOrPipelineHome = (p) => /[\\/]node_modules[\\/]/.test(p) || /
 // unknown); one that does not exist runs nothing. Programs run by path and interpreter files are only scanned when
 // readable (a binary, a huge generated file or a package under node_modules is not ours to judge).
 function checkScriptFile(sf, dir, ctx, level) {
+  if (sf.joined) return checkJoinedScripts(sf, dir, ctx, level);
   if (sf.ambiguous) return checkCandidateScripts(sf, dir, ctx, level);
   // a candidate is a final path (a glob match, or a word already expanded): the shell never expands it a second time
   const file = sf.candidate ? sf.file : expandVars(sf.file, ctx);
@@ -841,6 +842,39 @@ function checkScriptFile(sf, dir, ctx, level) {
   if (level >= MAX_NESTING) return deny(`the script ${sf.file} is nested too deeply (scripts running scripts) to verify.`);
   const v = judgeScoped(text, dir, ctx, level, sf);
   return v.decision === 'deny' ? deny(`the script ${sf.file} would run a blocked command: ${v.reason}`) : null;
+}
+
+// Several files that feed ONE shell (`cat a b | bash`): the shell reads their texts one after the other, so they are judged joined, in the
+// order the command names them, repeats included (a guarded command split across them is one command). `scan`: the text a rewriting command
+// prints from them (in an order we do not know): refused when a guarded word is in the joined text, read in either order.
+function checkJoinedScripts(sf, dir, ctx, level) {
+  const texts = [];
+  for (const w of sf.joined) {
+    const home = w === '~' || w.startsWith('~/') ? ctx.home + w.slice(1) : w;
+    if (dir === null && sf.kind !== 'scan' && !path.isAbsolute(home)) return deny(`cannot tell which directory this runs in, so which ${w} runs cannot be verified. Use an absolute path, or chain the cd with &&.`);
+    const abs = path.resolve(dir ?? ctx.cwd, home);
+    checkDeadline(ctx.budget);
+    const text = ctx.readText(abs);
+    if (typeof text !== 'string') {
+      if (sf.kind === 'shell' && ctx.pathExists(abs)) return deny(`cannot read the script ${w} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified.`);
+      if (sf.kind === 'scan') {
+        const head = ctx.readHead(abs);
+        if (typeof head === 'string') return deny(`${w} is too large to verify (over 1 MB), so what it runs (or feeds a shell) cannot be known.`);
+      }
+      continue; // missing: it prints nothing
+    }
+    countScript(ctx.budget);
+    texts.push(text);
+  }
+  if (!texts.length) return null;
+  if (sf.kind === 'scan') {
+    return GUARDED_WORDS.test(texts.join('')) || GUARDED_WORDS.test([...texts].reverse().join(''))
+      ? deny(`${sf.file} are read by a command that feeds a shell, and mention a guarded operation, so what the shell runs cannot be verified. Write the command out literally.`)
+      : null;
+  }
+  if (level >= MAX_NESTING) return deny(`the scripts ${sf.file} are nested too deeply (scripts running scripts) to verify.`);
+  const v = judgeScoped(texts.join(''), dir, ctx, level, sf);
+  return v.decision === 'deny' ? deny(`the scripts ${sf.file} would run a blocked command: ${v.reason}`) : null;
 }
 
 // Why: the real home's startup files (~/.bash_profile, ~/.zshenv ...) are not named by any word of the line, and what they run does not

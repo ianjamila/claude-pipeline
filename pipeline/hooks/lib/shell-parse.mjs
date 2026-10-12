@@ -684,7 +684,8 @@ function readsUnnamedFiles(name, argv) {
   return ['grep', 'egrep', 'fgrep'].includes(name) && argv.some((a) => /^-[A-Za-z]*[rR]/.test(a) || /^--(?:recursive|include|exclude|dereference-recursive)/.test(a));
 }
 
-const newSt = () => ({ dyn: false, files: [], computed: [], raws: [], pat: new Set() });
+// groups: the exact files, one array per producer in the order it names them (what `st.files` was filled from), so the join can be rebuilt
+const newSt = () => ({ dyn: false, files: [], groups: [], computed: [], raws: [], pat: new Set() });
 
 // What the command `seg` prints, when its output reaches the shell through a file: the files it reads. `exact`: nothing
 // between the command and the shell rewrites its output, so a plain reader's files ARE the script text (`st.files`); otherwise
@@ -698,11 +699,14 @@ function noteReads(seg, name, argv, st, exact) {
   for (const f of seg.stdinFiles) { words.push([f, f]); st.pat.add(f); }
   const list = exact && (EXACT_READERS.has(name) || argv.length === 0) ? st.files : st.computed;
   const prog = reader ? -1 : programIndex(name, argv);
+  const group = [];
   for (const [w, full, idx] of words) {
     if (w === '' || w === '-' || STDIN_FILES.has(w)) continue;
     list.push(w);
+    if (list === st.files) group.push(w);
     if (seg.pat.has(full) || idx !== prog) st.pat.add(w);
   }
+  if (group.length) st.groups.push(group);
   if (words.length) st.raws.push(seg.raw);
 }
 
@@ -757,6 +761,7 @@ function stdinSource(seg) {
   const st = newSt();
   const texts = [];
   st.files.push(...seg.stdinFiles); // `bash < F`: the script is the file
+  if (seg.stdinFiles.length) st.groups.push([...seg.stdinFiles]);
   for (const h of seg.heredocs) texts.push(h.text);
   let fed = seg.stdinSubs.length > 0 || (seg.pipedFrom !== null && seg.pipedFrom.length > 0);
   let fedTexts = 0;
@@ -787,9 +792,10 @@ function stdinSource(seg) {
 // a command that rewrites its input (sed, awk, base64, tr ...) may read; `raws` are the producers' command texts.
 function addFeeds(cmd, st) {
   if (!cmd || (!st.files.length && !st.computed.length)) return;
-  if (!cmd.feeds) Object.defineProperty(cmd, 'feeds', { value: { files: [], computed: [], raws: [], pat: [] }, enumerable: false });
+  if (!cmd.feeds) Object.defineProperty(cmd, 'feeds', { value: { files: [], groups: [], computed: [], raws: [], pat: [] }, enumerable: false });
   cmd.feeds.pat.push(...st.pat);
   cmd.feeds.files.push(...st.files);
+  cmd.feeds.groups.push(...st.groups);
   cmd.feeds.computed.push(...st.computed);
   cmd.feeds.raws.push(...st.raws);
 }
@@ -809,7 +815,19 @@ export function scriptFeedsOf(cmd, line = cmd?.raw) {
   const lit = (w) => (hasExpansion(w) && !pat.has(w) && !/[$`]/.test(w) ? { kind: 'scan', file: w } : rec('scan')(w));
   const out = [...exact.map(rec('shell')), ...computed.map(lit)];
   const raws = [cmd.raw, ...f.raws].filter((r) => typeof r === 'string' && r);
-  if (out.length > MAX_FEED_FILES || raws.some((r) => hasPatternSyntax(r, line))) return [{ kind: 'shell', file: out[0]?.file ?? '', ambiguous: true, unresolvable: true, words: [] }];
+  const refuse = { kind: 'shell', file: out[0]?.file ?? '', ambiguous: true, unresolvable: true, words: [] };
+  if (out.length > MAX_FEED_FILES || raws.some((r) => hasPatternSyntax(r, line))) return [refuse];
+  // Several files feed ONE program: the shell reads their texts one after the other, so they are ALSO judged joined (a record with `joined`), in
+  // command-line order, repeats included (`cat a b` with `git pu` in a and `sh origin main` in b); each file is still judged on its own. Only a
+  // single reader names them in an order that can be rebuilt: feeds from several producers (or a word that expands) are refused. A rewriting
+  // producer's words are scanned joined as well (the order it prints them in is not known, so the caller looks at both orders).
+  if (f.files.length >= 2) {
+    const g = f.groups;
+    if (g.length !== 1 || g[0].length !== f.files.length || g[0].some(hasExpansion)) return [refuse];
+    out.push({ kind: 'shell', file: g[0].join(' '), joined: [...g[0]] });
+  }
+  const words = f.computed.filter((w) => !hasExpansion(w));
+  if (words.length >= 2) out.push({ kind: 'scan', file: words.join(' '), joined: words });
   return out;
 }
 
@@ -1584,6 +1602,7 @@ class Parser {
         const st = stdinSource(seg).st;
         st.computed.push(...st.files);
         st.files.length = 0;
+        st.groups.length = 0;
         addFeeds(cmd, st);
       } finally { this.cmd = saved; }
       // `$(cat f.sh)` as the command: the shell runs whatever the substitution prints

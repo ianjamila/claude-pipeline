@@ -1006,6 +1006,7 @@ const WRITE_HINT = /write|append|unlink|\brm\b|rmSync|rmdir|rename|copy|\bcp\b|\
 // program run by path, an interpreter file that cannot be read, a node_modules package and the pipeline's own
 // installed files are not judged (the installed CLI legitimately names its own settings).
 function judgeScriptFile(sf, dirs, ctx, opts, scanRaw = '', keepBackslash = false) {
+  if (sf.joined) return judgeJoinedScripts(sf, dirs, ctx, opts);
   if (sf.ambiguous) return judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw);
   // expandRefs turns \ into / (Windows paths), but off Windows a backslash is part of the file name: judge that reading too
   if (!keepBackslash && mayHoldBackslash(sf.file, ctx)) {
@@ -1026,6 +1027,56 @@ function judgeScriptFile(sf, dirs, ctx, opts, scanRaw = '', keepBackslash = fals
     seen.add(abs);
     const v = judgeFoundScript(sf, abs, d || ctx.cwd, ctx, opts);
     if (v) return v;
+  }
+  return null;
+}
+
+// Several files that feed ONE shell (`cat a b | bash`): the shell reads their texts one after the other, so they are judged joined, in the order
+// the command names them, repeats included (a protected name split across them is one name). `scan`: the text a rewriting command prints from
+// them (in an order we do not know): refused when the joined text refers to a protected file or switch, read in either order. Run in every
+// directory the command may be in; a file that is missing there prints nothing, and the pipeline's own installed files are not judged (as above).
+function judgeJoinedScripts(sf, dirs, ctx, opts) {
+  const readings = [false];
+  if (sf.joined.some((w) => mayHoldBackslash(w, ctx))) readings.push(true); // a backslash is a file name character off Windows: judge that reading too
+  const seen = new Set();
+  for (const keepBackslash of readings) {
+    const names = sf.joined.map((w) => {
+      const e = keepBackslash ? expandKeepingBackslash(w, ctx) : expandRefs(w, ctx);
+      return /[$`]/.test(e) ? toPosix(w) : e; // named at run time: the word as written (the textual rules on the whole line still apply)
+    });
+    for (const d of dirs) {
+      const abss = names.map((e) => (isAbs(e) ? posix.normalize(e) : posix.join(d, e)));
+      const key = abss.join('\u0000');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const texts = [];
+      for (const abs of abss) {
+        if (!ctx.api.existsSync(abs)) continue;
+        if (ctx.hit(abs) || ctx.hit(realResolve(abs, ctx.api)) || /\/node_modules\//.test(abs)) continue;
+        checkDeadline(ctx.budget);
+        const text = ctx.readText(abs);
+        if (typeof text !== 'string') {
+          if (sf.kind === 'shell') return deny(`cannot read the script ${abs} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified`);
+          const head = ctx.readHead(abs);
+          if (typeof head === 'string') return deny(`${abs} is too large to verify (over 1 MB), so what it feeds a shell cannot be known`);
+          continue;
+        }
+        countScript(ctx.budget);
+        texts.push(text);
+      }
+      if (!texts.length) continue;
+      if (sf.kind === 'scan') {
+        const m = makeMatchers(ctx);
+        for (const t of [texts.join(''), [...texts].reverse().join('')]) {
+          if (variantsOf(t).some((v) => setsAdmin(v, ctx.platform) || hasDisableAll(v)) || SENSITIVE_WORDS.test(t) || m.rawHit(t, [d || ctx.cwd])) {
+            return deny(`${sf.file} are read by a command that feeds a shell, and refer to a protected pipeline file or switch, so what the shell runs cannot be verified (${PROTECTED_MSG})`);
+          }
+        }
+        continue;
+      }
+      const r = evaluateBashForFiles(texts.join(''), { ...opts, cwd: d || ctx.cwd, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup });
+      if (r.decision === 'deny') return deny(`the scripts ${sf.file} would run: ${r.reason}`);
+    }
   }
   return null;
 }
