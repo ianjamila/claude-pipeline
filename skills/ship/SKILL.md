@@ -151,8 +151,9 @@ Details and every exit code: `reference/gates-and-exits.md`.
 
 1. Recompute the checks on the head as it is NOW (review fixes may have moved risk): `P risk`,
    `P hardstops … > .review/hardstops.json` and `P integrity`, as in Step 3.2. A new blocking
-   hard-stop hit ⇒ Step 3.5. Then `P agent-log stage --pr N` (commits this run's log line + queued lines into
-   the PR branch) and `git push origin agent/<slug>`.
+   hard-stop hit ⇒ Step 3.5. Then, only when `production.watch` is `workflow` (read it from `P config`), `P agent-log close
+   --queue` (queues the production results the workflow posted on earlier merged PRs); then `P agent-log stage --pr N`
+   (commits this run's log line + queued lines into the PR branch) and `git push origin agent/<slug>`.
 2. Up to date with the base — docs-only and light-lane PRs too, so the gate (and the CI it waits on)
    judges the tree that will land: `P job start update -- node ~/.claude/pipeline/bin/pipeline.mjs
    update-branch --pr N` → `P job wait update --run-id <runId> --timeout 540` (repeat until `done`).
@@ -195,7 +196,7 @@ passes the **Owner-merge approval** rule below.** With `owner_approval: label` t
 1. `P job start merge -- node ~/.claude/pipeline/bin/pipeline.mjs merge --pr N` → `P job wait
    merge --run-id <runId> --timeout 540`; read `exitCode` and the JSON in `tail`:
    - 0 ⇒ merged. `mergeSha` is the merge commit; `null` (with a `warning`) means GitHub did not
-     name it yet: still run prod-watch, with `--pr N` alone (2 below). Never skip prod-watch.
+     name it yet: still run prod-watch, with `--pr N` alone (2 below). Never skip prod-watch unless `production.watch` is `workflow` (2 below).
    - 1 ⇒ NOT merged. `error: gate | behind-base | live-check | pre-merge`, or a `reason` (merge command failed,
      not merged in time, PR closed, blocker appeared): act per `reference/gates-and-exits.md`.
      "Update the branch" cases (`error: behind-base` — merge already updated the branch itself, or could not
@@ -203,7 +204,10 @@ passes the **Owner-merge approval** rule below.** With `owner_approval: label` t
      re-verify, a new review round if content changed; max 2 such returns, then `needs-human`.
    - 3 ⇒ `error: production-unknown` (no known-good production deployment recorded) or GitHub
      unavailable: nothing merged; wait a minute and retry once, then stop and tell the user.
-2. Merged ⇒ `P job start prod -- node ~/.claude/pipeline/bin/pipeline.mjs prod-watch --sha
+2. Merged with `production.watch: workflow` (`P config`; the default is `session`) ⇒ do NOT run prod-watch: a CI workflow of
+   the project smokes production and posts the result on the merged PR, and nothing is rolled back. Summary outcome
+   `merged`; tell the user the workflow posts the production result on the PR and never rolls back (a later ship run
+   copies it into the agent log, Step 5.1). Otherwise merged ⇒ `P job start prod -- node ~/.claude/pipeline/bin/pipeline.mjs prod-watch --sha
    <mergeSha> --pr N [--expect-text …]` (no `mergeSha`: `prod-watch --pr N`, it reads the merge
    commit itself) → `P job wait prod --run-id <runId> --timeout 540`. `--expect-text` must be text
    the NEW build shows: smokes of a rolled-back or superseded deployment ignore it. Read the
@@ -270,5 +274,5 @@ read the issue, link it in the PR body (`Closes #123`).
 | final gate fails, can't fix | `needs-human`, stop |
 | `behind-base:` / base moved | `P update-branch --pr N` (Step 5.2), re-verify, new round if content changed (max 2 times, then `needs-human`); `rebase-needed` ⇒ `needs-human` |
 | merge exit 3 `production-unknown` | nothing merged; tell the user, stop |
-| prod smoke fails | prod-watch handles rollback + issue + revert PR; tell the user |
+| prod smoke fails | prod-watch handles rollback + issue + revert PR; tell the user. With `production.watch: workflow` there is no prod-watch: the workflow's PR comment is the record and nothing is rolled back; tell the user |
 | pause/rollback issue open | PR stays open, explain |
