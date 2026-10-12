@@ -208,7 +208,7 @@ function parseValue(raw) {
 export function parseSecrets(text) {
   const out = new Map();
   for (const line of String(text ?? '').split('\n')) {
-    const m = ASSIGN.exec(line);
+    const m = ASSIGN.exec(line.replace(/\r$/, '')); // `.` does not match \r, so a CRLF file needs it gone first
     if (m) out.set(m[1], parseValue(m[2]));
   }
   return out;
