@@ -188,7 +188,7 @@ async function close(rest, ctx) {
   const output = { ok: unreadable.length === 0, lines, pending: pending.map(Number), unreadable: unreadable.map((u) => ({ pr: Number(u.pr), message: u.message })) };
   if (values.queue) {
     output.queued = lines.length;
-    if (lines.length) output.queueLength = await queueLines(root, lines);
+    if (lines.length) await queueLines(root, lines);
   }
   return { exitCode: unreadable.length ? EXIT.FAILED : EXIT.OK, output };
 }
