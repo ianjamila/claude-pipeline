@@ -169,7 +169,7 @@ const oneLine = (err) => String(err?.message ?? err).replace(/[\r\n]+/g, ' ').sl
  * gh: { mergeSha(pr) -> sha | null, listComments(pr) -> comments[], listRepoComments(sinceIso) -> comments[] (each with
  * `issue_url`) }. `now` (ms; tests always pass it) sets the repo-wide window, widened back to `lastScanAt` (ms) when given. `prs` (strings) are pending PRs to read
  * per-PR whatever their state; `all` reads every pending PR per-PR.
- * Returns { lines, pending, skipped, unreadable, scanError, scanned } (`scanned`: the repo-wide read ran and succeeded). A PR that cannot be read lands in `unreadable` and the rest
+ * Returns { lines, pending, skipped, unreadable, scanError, scanned, scanUnreadable } (`scanned`: the repo-wide read ran and succeeded; `scanUnreadable`: the PRs it surfaced that could not be read). A PR that cannot be read lands in `unreadable` and the rest
  * carry on; if the repo-wide read itself fails, `scanError` says so and resolved PRs are left unchecked this run.
  */
 export async function closeLines({ logText, gh, now = Date.now(), prs = [], all = false, lastScanAt = null }) {
@@ -177,6 +177,7 @@ export async function closeLines({ logText, gh, now = Date.now(), prs = [], all 
   const lines = [];
   const skipped = [];
   const unreadable = [];
+  const scanUnreadable = []; // unreadable PRs the repo-wide scan surfaced: their result would fall out of the next window
   let scanError = null;
   let scanOk = false;
   const newestPending = pending.reduce((best, pr) => (best === null || Number(pr) > Number(best) ? pr : best), null);
@@ -217,7 +218,8 @@ export async function closeLines({ logText, gh, now = Date.now(), prs = [], all 
       lines.push(resolutionLine({ pr, result: newest }));
     } catch (err) {
       unreadable.push({ pr, message: oneLine(err) });
+      if (scanned.has(pr)) scanUnreadable.push(pr);
     }
   }
-  return { lines, pending, skipped, unreadable, scanError, scanned: scanOk };
+  return { lines, pending, skipped, unreadable, scanError, scanned: scanOk, scanUnreadable };
 }

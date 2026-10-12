@@ -3,7 +3,7 @@
 // GitHub unavailable) against the scripted fake gh. Every age-sensitive pure test passes an explicit `now`: no real clock.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, pipelineYml } from './helpers/fakegh-env.mjs';
@@ -498,9 +498,22 @@ test('scan window (d): a failed scan, or an unreadable PR, leaves the state unto
   assert.equal(readFileSync(stateFile, 'utf8'), seeded);
   assert.ok(failing.fake.lines().some((l) => l.includes('since=2026-01-04T00%3A00%3A00Z')), 'min(now - 14d, lastScanAt - 2d)');
 
-  const unreadable = closeRepo(ANCIENT_AND_NEW(), [scanEntry([]), shaEntry(1500), { match: '^api repos/acme/widgets/issues/1500/comments', stderr: 'HTTP 500', code: 1 }]);
-  assertExit(unreadable.close('--queue'), 1);
-  assert.equal(stateOf(unreadable), null);
+  // an unresolved PR outside the scan results (re-read every run anyway) does not hold the window back ...
+  const outside = closeRepo(ANCIENT_AND_NEW(), [scanEntry([]), shaEntry(1500), { match: '^api repos/acme/widgets/issues/1500/comments', stderr: 'HTTP 500', code: 1 }]);
+  assertExit(outside.close('--queue'), 1);
+  assert.ok(stateOf(outside), 'state advanced');
+  assert.deepEqual(readdirSync(join(outside.repo.dir, '.git', 'claude-pipeline')).filter((f) => f.endsWith('.tmp')), [], 'no tmp file left behind');
+  // ... but a PR the scan itself surfaced and that cannot be read does
+  const surfaced = closeRepo(ANCIENT_AND_NEW(), [scanEntry([[1411, comment(marker())]]), { match: '^pr view 1411 --json mergeCommit', stderr: 'HTTP 500', code: 1 }, shaEntry(1500), commentsEntry(1500, [])]);
+  assertExit(surfaced.close('--queue'), 1);
+  assert.equal(stateOf(surfaced), null);
+
+  // a failed queue append (here: the queue path is a directory) leaves it alone too
+  const append = closeRepo(ANCIENT_AND_NEW(), [scanEntry([]), shaEntry(1500), commentsEntry(1500, [comment(marker())])]);
+  mkdirSync(append.queueFile, { recursive: true });
+  const failedAppend = append.close('--queue');
+  assert.ok(failedAppend.code !== 0, `queue append failure must not exit 0: ${failedAppend.stderr}`);
+  assert.equal(stateOf(append), null);
 
   const fresh = closeRepo(ANCIENT_AND_NEW(), [scanEntry([]), shaEntry(1500), commentsEntry(1500, [])]);
   assertExit(fresh.close(), 0);

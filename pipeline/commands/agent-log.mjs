@@ -193,9 +193,11 @@ async function close(rest, ctx) {
     throw new Fail(EXIT.UNAVAILABLE, { ok: false, error: 'unavailable', message: 'GitHub is unavailable (gh is not authenticated or unreachable)' });
   }
   // The scan window covers the whole gap since the last successful scan on this machine. The state moves only once this scan's
-  // results are safely queued (--queue), the scan succeeded and every PR it named was readable: otherwise the next run re-covers it.
+  // results are safely queued (--queue: every append succeeded), the scan was complete and every PR it surfaced was readable;
+  // a dry run, a failed scan or a failed append leaves it alone so the next run re-covers the gap. A failing PR outside the scan
+  // results (an unresolved one) is re-read every run anyway and does not hold the window back.
   const now = Date.now();
-  const { lines, pending, skipped, unreadable, scanError, scanned } = await closeLines({
+  const { lines, pending, skipped, unreadable, scanError, scanned, scanUnreadable } = await closeLines({
     logText, gh: github, now, prs, all: values.all === true, lastScanAt: readScanState(root, now),
   });
   const incomplete = unreadable.length > 0 || scanError !== null;
@@ -206,7 +208,7 @@ async function close(rest, ctx) {
     const have = new Set(readQueue(root).map((e) => e.line));
     output.queued = lines.filter((l) => !have.has(l)).length; // a line already queued is not added again
     if (lines.length) await queueLines(root, lines);
-    if (scanned && unreadable.length === 0) writeScanState(root, now);
+    if (scanned && scanUnreadable.length === 0) writeScanState(root, now);
   }
   return { exitCode: incomplete ? EXIT.FAILED : EXIT.OK, output };
 }
