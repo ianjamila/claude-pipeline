@@ -7,7 +7,10 @@
 // The leading date comes from `observed` (never the clock), so one result is always the byte-identical line and the
 // queue/stage verbatim dedupe holds across runs and days. Only github-actions[bot] comments count, only for the PR's merge
 // commit, and the newest result is chosen by its embedded `observed`, never by comment or file order.
+import { readFileSync, renameSync, writeFileSync, mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { DEFAULT_OUTCOME } from './agentlog.mjs';
+import { pipelineStateDir } from './repo.mjs';
 
 export const BOT_AUTHOR = 'github-actions[bot]';
 export const OUTCOMES = Object.freeze(['passed', 'failed', 'superseded', 'not-live', 'build-failed', 'unverified', 'untrusted']);
@@ -23,11 +26,15 @@ const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/;
 // and per-PR reads are kept for the PRs that need them: pending PRs with no resolution line yet, the newest pending PR,
 // the PRs named by the caller, and everything with `all`. A resolved PR the scan did not mention costs no gh call.
 // The producing workflow reports deployments of the last 7 days unless dispatched by hand, so 14 days leaves margin.
+// The window also reaches back over the whole gap since the last SUCCESSFUL scan on this machine (a tiny state file, see
+// readScanState), so a closer that did not run for a month still sees what happened in that month.
 export const RESOLVED_SKIP_DAYS = 14;
+const DAY_MS = 24 * 3600 * 1000;
+const SCAN_STATE_FILE = 'agent-log-close.json';
 const PHT_OFFSET_MS = 8 * 3600 * 1000; // Asia/Manila is UTC+8 all year, no DST
 
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-const PENDING_RE = new RegExp(`^- \\S+ · #(\\d+) · .* · ${escapeRe(DEFAULT_OUTCOME)}$`);
+const PENDING_RE = new RegExp(`^- (\\S+) · #(\\d+) · .* · ${escapeRe(DEFAULT_OUTCOME)}$`);
 const RESOLUTION_RE = /^- \S+ · #(\d+) · prod smoke (\S+) · deploy (\S+) · observed (\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}) · run (\d+)$/;
 
 /** A PHT wall clock for an instant (ms): { date: 'YYYY-MM-DD', time: 'HH:mm' }. Fixed +8h shift, host-zone-proof. */
@@ -85,14 +92,19 @@ export function resolutionLine({ pr, result }) {
   return `- ${obs.date} · #${pr} · prod smoke ${result.outcome} · deploy ${result.vercel} · observed ${obs.date} ${obs.time} · run ${result.run}`;
 }
 
-/** Pending PR numbers (unique, in file order) and every logged resolution per PR. */
+/** Pending PR numbers (unique, in file order), every logged resolution per PR, and the leading date (ms, UTC midnight) of the oldest pending line. */
 export function parseLog(text) {
+  let oldestPendingAt = null;
   const pending = [];
   const resolutions = new Map();
   for (const line of String(text ?? '').split(/\r?\n/)) {
     const p = PENDING_RE.exec(line);
     if (p) {
-      if (!pending.includes(p[1])) pending.push(p[1]);
+      if (!pending.includes(p[2])) pending.push(p[2]);
+      if (/^\d{4}-\d{2}-\d{2}$/.test(p[1])) {
+        const at = Date.parse(`${p[1]}T00:00:00Z`);
+        if (!Number.isNaN(at) && (oldestPendingAt === null || at < oldestPendingAt)) oldestPendingAt = at;
+      }
       continue;
     }
     const r = RESOLUTION_RE.exec(line);
@@ -102,7 +114,7 @@ export function parseLog(text) {
       resolutions.set(r[1], list);
     }
   }
-  return { pending, resolutions };
+  return { pending, resolutions, oldestPendingAt };
 }
 
 // The newest logged resolution by its embedded observed time; on a tie the later line wins.
@@ -111,24 +123,62 @@ const newestLogged = (list) => (list ?? []).reduce((best, r) => (best === null |
 /** The PR number a repo-wide issue comment belongs to, from its `issue_url` (…/issues/<N>); null when it has none. */
 export const prFromIssueUrl = (url) => /\/issues\/(\d+)$/.exec(String(url ?? ''))?.[1] ?? null;
 
-/** ISO instant (second precision) `RESOLVED_SKIP_DAYS` before `now` (ms): the `since` of the repo-wide read. */
-export const scanSince = (now) => new Date(now - RESOLVED_SKIP_DAYS * 24 * 3600 * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+const isoSeconds = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
+
+/**
+ * ISO instant (second precision) the repo-wide read starts from: the older of `RESOLVED_SKIP_DAYS` before `now` and two days
+ * before `lastScanAt` (ms; the last successful scan, so the whole gap since is covered). With no `lastScanAt` (first run, new
+ * machine, unreadable state) it reaches a day before the oldest pending line (`oldestPendingAt`, ms): a one-off full catch-up.
+ */
+export function scanSince(now, { lastScanAt = null, oldestPendingAt = null } = {}) {
+  const floor = now - RESOLVED_SKIP_DAYS * DAY_MS;
+  if (Number.isFinite(lastScanAt)) return isoSeconds(Math.min(floor, lastScanAt - 2 * DAY_MS));
+  if (Number.isFinite(oldestPendingAt)) return isoSeconds(Math.min(floor, oldestPendingAt - DAY_MS));
+  return isoSeconds(floor);
+}
+
+export const scanStatePath = (cwd) => join(pipelineStateDir(cwd), SCAN_STATE_FILE);
+
+/** The last successful repo-wide scan on this machine (ms), or null when the state is missing, corrupt or in the future. */
+export function readScanState(cwd, now = Date.now()) {
+  try {
+    const at = Date.parse(JSON.parse(readFileSync(scanStatePath(cwd), 'utf8'))?.lastScanAt);
+    return Number.isFinite(at) && at <= now ? at : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Records a successful scan's own start time (ms). Atomic tmp+rename, like the queue; never throws (a lost state only widens the next window). */
+export function writeScanState(cwd, startedAt) {
+  try {
+    const file = scanStatePath(cwd);
+    mkdirSync(dirname(file), { recursive: true });
+    const tmp = `${file}.${process.pid}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify({ lastScanAt: new Date(startedAt).toISOString() })}\n`);
+    renameSync(tmp, file);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 const oneLine = (err) => String(err?.message ?? err).replace(/[\r\n]+/g, ' ').slice(0, 200);
 
 /**
  * gh: { mergeSha(pr) -> sha | null, listComments(pr) -> comments[], listRepoComments(sinceIso) -> comments[] (each with
- * `issue_url`) }. `now` (ms; tests always pass it) sets the repo-wide window. `prs` (strings) are pending PRs to read
+ * `issue_url`) }. `now` (ms; tests always pass it) sets the repo-wide window, widened back to `lastScanAt` (ms) when given. `prs` (strings) are pending PRs to read
  * per-PR whatever their state; `all` reads every pending PR per-PR.
- * Returns { lines, pending, skipped, unreadable, scanError }. A PR that cannot be read lands in `unreadable` and the rest
+ * Returns { lines, pending, skipped, unreadable, scanError, scanned } (`scanned`: the repo-wide read ran and succeeded). A PR that cannot be read lands in `unreadable` and the rest
  * carry on; if the repo-wide read itself fails, `scanError` says so and resolved PRs are left unchecked this run.
  */
-export async function closeLines({ logText, gh, now = Date.now(), prs = [], all = false }) {
-  const { pending, resolutions } = parseLog(logText);
+export async function closeLines({ logText, gh, now = Date.now(), prs = [], all = false, lastScanAt = null }) {
+  const { pending, resolutions, oldestPendingAt } = parseLog(logText);
   const lines = [];
   const skipped = [];
   const unreadable = [];
   let scanError = null;
+  let scanOk = false;
   const newestPending = pending.reduce((best, pr) => (best === null || Number(pr) > Number(best) ? pr : best), null);
   const named = new Set(prs.map(String));
   const readPerPr = (pr) => all || !resolutions.has(pr) || pr === newestPending || named.has(pr);
@@ -137,12 +187,13 @@ export async function closeLines({ logText, gh, now = Date.now(), prs = [], all 
   const scanned = new Map();
   if (pending.some((pr) => !readPerPr(pr))) {
     try {
-      for (const c of await gh.listRepoComments(scanSince(now))) {
+      for (const c of await gh.listRepoComments(scanSince(now, { lastScanAt, oldestPendingAt }))) {
         const n = prFromIssueUrl(c?.issue_url);
         if (n === null || !pending.includes(n)) continue;
         if (!scanned.has(n)) scanned.set(n, []);
         scanned.get(n).push(c);
       }
+      scanOk = true;
     } catch (err) {
       scanError = oneLine(err);
     }
@@ -168,5 +219,5 @@ export async function closeLines({ logText, gh, now = Date.now(), prs = [], all 
       unreadable.push({ pr, message: oneLine(err) });
     }
   }
-  return { lines, pending, skipped, unreadable, scanError };
+  return { lines, pending, skipped, unreadable, scanError, scanned: scanOk };
 }

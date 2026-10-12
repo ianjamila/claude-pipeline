@@ -3,7 +3,7 @@
 // GitHub unavailable) against the scripted fake gh. Every age-sensitive pure test passes an explicit `now`: no real clock.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, pipelineYml } from './helpers/fakegh-env.mjs';
@@ -12,12 +12,13 @@ import { assertExit } from './helpers/assert-exit.mjs';
 import { DEFAULT_OUTCOME } from '../pipeline/lib/agentlog.mjs';
 import {
   BOT_AUTHOR, RESOLVED_SKIP_DAYS, closeLines, formatPht, parseLog, parsePht, parseResultMarkers, prFromIssueUrl, resolutionLine, scanSince,
+  readScanState, writeScanState, scanStatePath,
 } from '../pipeline/lib/agentlog-close.mjs';
 
 const MERGE_SHA = 'a'.repeat(40);
 const OTHER_SHA = 'b'.repeat(40);
 const HOST = 'ewiapp-abc-team.vercel.app';
-const pendingLine = (n) => `- 2026-10-09 · #${n} · fix(x): something · risk low · rounds 1 · arbiter 0 · ${DEFAULT_OUTCOME}`;
+const pendingLine = (n, date = '2026-10-09') => `- ${date} · #${n} · fix(x): something · risk low · rounds 1 · arbiter 0 · ${DEFAULT_OUTCOME}`;
 const resolved = (n, { date = '2026-10-12', outcome = 'passed', host = HOST, obs = '2026-10-12 12:05', run = '999' } = {}) =>
   `- ${date} · #${n} · prod smoke ${outcome} · deploy ${host} · observed ${obs} · run ${run}`;
 
@@ -40,7 +41,9 @@ function fakeGh(comments, shas = {}, { scan = comments } = {}) {
     listComments: async (n) => { calls.comments.push(n); return comments[n] ?? []; },
     listRepoComments: async (since) => {
       calls.repo.push(since);
-      return Object.entries(scan).flatMap(([n, list]) => list.map((c) => ({ ...c, issue_url: issueUrl(n) })));
+      // like GitHub: a comment carrying `updated_at` is returned only when it is not older than `since`
+      return Object.entries(scan).flatMap(([n, list]) => list.map((c) => ({ ...c, issue_url: issueUrl(n) })))
+        .filter((c) => c.updated_at === undefined || Date.parse(c.updated_at) >= Date.parse(since));
     },
   };
 }
@@ -161,7 +164,7 @@ test('closeLines: a resolved PR older than the window with no new comment costs 
   assert.equal(RESOLVED_SKIP_DAYS, 14);
   const gh = fakeGh({ 1420: [comment(marker({ outcome: 'failed', observed: '2026-11-29T00:00:00Z' }))], 1500: [comment(marker({ observed: '2026-11-29T00:00:00Z' }))] }, {}, { scan: {} });
   const text = [pendingLine(1420), resolved(1420, { obs: OLD_OBS }), pendingLine(1411), pendingLine(1500)].join('\n');
-  const r = await closeLines({ logText: text, gh, now: NOW });
+  const r = await closeLines({ logText: text, gh, now: NOW, lastScanAt: NOW - DAY });
   assert.deepEqual(r.skipped, ['1420']);
   assert.deepEqual(gh.calls.sha, ['1411', '1500'], '1420 made no gh call; 1411 has no resolution line and 1500 is the newest pending PR');
   assert.deepEqual(gh.calls.comments, ['1411', '1500']);
@@ -237,6 +240,54 @@ test('scanSince is exactly RESOLVED_SKIP_DAYS before now (second precision); prF
   assert.equal(prFromIssueUrl(issueUrl(1420)), '1420');
   assert.equal(prFromIssueUrl('https://api.github.com/repos/acme/widgets/issues/1420/comments'), null);
   assert.equal(prFromIssueUrl(undefined), null);
+});
+
+// ---- scan window: the whole gap since the last successful scan ----
+
+const D0 = Date.parse('2026-09-01T00:00:00Z');
+const GAP_TEXT = () => [pendingLine(1420, '2026-08-30'), resolved(1420, { date: '2026-08-30', obs: '2026-08-30 10:00' }), pendingLine(1500, '2026-08-31')].join('\n');
+const failedOnDay1 = () => ({ ...comment(marker({ outcome: 'failed', observed: '2026-09-02T00:00:00Z', run: '4242' })), updated_at: '2026-09-02T00:00:00Z' });
+
+test('scan window (a): a result seen the day after the last scan on a resolved, non-newest PR is found 16 days later', async () => {
+  const gh = fakeGh({}, {}, { scan: { 1420: [failedOnDay1()] } });
+  const r = await closeLines({ logText: GAP_TEXT(), gh, now: D0 + 16 * DAY, lastScanAt: D0 });
+  assert.equal(gh.calls.repo[0], '2026-08-30T00:00:00Z', 'min(now - 14d, lastScanAt - 2d)');
+  assert.deepEqual(r.lines, [resolved(1420, { outcome: 'failed', date: '2026-09-02', obs: '2026-09-02 08:00', run: '4242' })]);
+  assert.equal(r.scanned, true);
+  // without the state a plain 14-day window (starting 2026-09-03) would have missed it
+  const plain = fakeGh({}, {}, { scan: { 1420: [failedOnDay1()] } });
+  const missed = await closeLines({ logText: [pendingLine(1420, '2026-09-10'), resolved(1420, { obs: '2026-09-10 10:00' }), pendingLine(1500, '2026-09-10')].join('\n'), gh: plain, now: D0 + 16 * DAY });
+  assert.equal(plain.calls.repo[0], '2026-09-03T00:00:00Z');
+  assert.deepEqual(missed.lines, []);
+});
+
+test('scan window (b): a recent last scan leaves the plain 14-day window', () => {
+  const now = D0 + 16 * DAY;
+  assert.equal(scanSince(now, { lastScanAt: D0 + 15 * DAY }), '2026-09-03T00:00:00Z');
+  assert.equal(scanSince(now, { lastScanAt: D0 + 15 * DAY, oldestPendingAt: D0 - 100 * DAY }), '2026-09-03T00:00:00Z', 'the oldest pending line only matters without state');
+  assert.equal(scanSince(now, { lastScanAt: D0 }), '2026-08-30T00:00:00Z');
+});
+
+test('scan window (c): no state reaches the day before the oldest pending line (a one-off full catch-up)', async () => {
+  assert.equal(scanSince(D0 + 16 * DAY, {}), '2026-09-03T00:00:00Z');
+  const gh = fakeGh({}, {}, { scan: {} });
+  await closeLines({ logText: GAP_TEXT(), gh, now: D0 + 16 * DAY });
+  assert.equal(gh.calls.repo[0], '2026-08-29T00:00:00Z', 'oldest pending line is 2026-08-30');
+  assert.equal(parseLog(GAP_TEXT()).oldestPendingAt, Date.parse('2026-08-30T00:00:00Z'));
+  assert.equal(parseLog('# nothing').oldestPendingAt, null);
+});
+
+test('scan window: state read/write round trip, corrupt or future state reads as missing', () => {
+  const t = createTmpRepo();
+  assert.equal(readScanState(t.dir), null, 'no file');
+  assert.equal(writeScanState(t.dir, D0), true);
+  assert.deepEqual(JSON.parse(readFileSync(scanStatePath(t.dir), 'utf8')), { lastScanAt: '2026-09-01T00:00:00.000Z' });
+  assert.equal(readScanState(t.dir, D0 + 1), D0);
+  assert.equal(readScanState(t.dir, D0 - 1), null, 'a clock that went backwards must not shrink the window');
+  writeFileSync(scanStatePath(t.dir), '{not json');
+  assert.equal(readScanState(t.dir), null);
+  writeFileSync(scanStatePath(t.dir), JSON.stringify({ lastScanAt: 'yesterday' }));
+  assert.equal(readScanState(t.dir), null);
 });
 
 // ---- CLI -----------------------------------------------------------------------------------------
@@ -405,4 +456,87 @@ test('agent-log close: a failed repo-wide read exits 1 with scanError, and the l
   assert.deepEqual(r.json.unreadable, []);
   assert.deepEqual(r.json.lines, [resolved(1500)]);
   assert.deepEqual(readQueueLines(t), [resolved(1500)]);
+});
+
+// ---- scan window state, through the CLI (real clock: only compared with before/after) ----
+
+const ANCIENT = '2026-01-05'; // far enough back that the catch-up window is deterministic whatever today is
+const ANCIENT_AND_NEW = () => [pendingLine(1411, ANCIENT), resolved(1411, { date: ANCIENT, obs: `${ANCIENT} 10:00`, run: '5' }), pendingLine(1500, ANCIENT)].join('\n');
+const stateOf = (t) => {
+  try {
+    return JSON.parse(readFileSync(join(t.repo.dir, '.git', 'claude-pipeline', 'agent-log-close.json'), 'utf8'));
+  } catch {
+    return null;
+  }
+};
+
+test('scan window (e): a successful --queue scan records its own start time; a dry run, and no scan at all, record nothing', () => {
+  const dry = closeRepo(ANCIENT_AND_NEW(), [scanEntry([]), shaEntry(1500), commentsEntry(1500, [])]);
+  assertExit(dry.close(), 0);
+  assert.equal(stateOf(dry), null, 'a dry run discards its lines, so it must not move the window');
+
+  const t = closeRepo(ANCIENT_AND_NEW(), [scanEntry([]), shaEntry(1500), commentsEntry(1500, [])]);
+  const before = Date.now();
+  assertExit(t.close('--queue'), 0);
+  const after = Date.now();
+  const at = Date.parse(stateOf(t).lastScanAt);
+  assert.ok(at >= before - 1000 && at <= after, `lastScanAt ${stateOf(t).lastScanAt}`);
+
+  const none = closeRepo(pendingLine(1420, ANCIENT), [shaEntry(1420), commentsEntry(1420, [])]);
+  assertExit(none.close('--queue'), 0);
+  assert.equal(stateOf(none), null, 'only unresolved PRs: no repo-wide scan ran');
+});
+
+test('scan window (d): a failed scan, or an unreadable PR, leaves the state untouched; no state starts at the oldest pending line', () => {
+  const failing = closeRepo(ANCIENT_AND_NEW(), [{ match: 'issues/comments\\?since=', stderr: 'HTTP 502', code: 1 }, shaEntry(1500), commentsEntry(1500, [])]);
+  assert.equal(stateOf(failing), null);
+  const stateFile = join(failing.repo.dir, '.git', 'claude-pipeline', 'agent-log-close.json');
+  mkdirSync(join(failing.repo.dir, '.git', 'claude-pipeline'), { recursive: true });
+  const seeded = `${JSON.stringify({ lastScanAt: '2026-01-06T00:00:00.000Z' })}\n`;
+  writeFileSync(stateFile, seeded);
+  assertExit(failing.close('--queue'), 1);
+  assert.equal(readFileSync(stateFile, 'utf8'), seeded);
+  assert.ok(failing.fake.lines().some((l) => l.includes('since=2026-01-04T00%3A00%3A00Z')), 'min(now - 14d, lastScanAt - 2d)');
+
+  const unreadable = closeRepo(ANCIENT_AND_NEW(), [scanEntry([]), shaEntry(1500), { match: '^api repos/acme/widgets/issues/1500/comments', stderr: 'HTTP 500', code: 1 }]);
+  assertExit(unreadable.close('--queue'), 1);
+  assert.equal(stateOf(unreadable), null);
+
+  const fresh = closeRepo(ANCIENT_AND_NEW(), [scanEntry([]), shaEntry(1500), commentsEntry(1500, [])]);
+  assertExit(fresh.close(), 0);
+  assert.ok(fresh.fake.lines().some((l) => l.includes('since=2026-01-04T00%3A00%3A00Z')), 'a day before the oldest pending line (2026-01-05)');
+});
+
+test('a queued line staged in another open PR stays that PR\'s: close --queue does not re-add it and stage in a second worktree does not carry it', () => {
+  const t = closeRepo(pendingLine(1420), [shaEntry(1420), commentsEntry(1420, [comment(marker())])]);
+  const L = resolved(1420);
+  assertExit(cli(['agent-log', 'queue', '--line', L], { dir: t.repo.dir, fake: t.fake }), 0);
+  const OTHER_PR = 4321;
+  writeFileSync(t.queueFile, `${JSON.stringify({ line: L, at: '2026-10-12T00:00:00.000Z', staged: { pr: OTHER_PR, at: '2026-10-12T01:00:00.000Z' } })}\n`);
+
+  const r = t.close('--queue');
+  assertExit(r, 0);
+  assert.deepEqual(r.json.lines, [L], 'still not in the log, so it is emitted again');
+  assert.equal(r.json.queued, 0);
+  const entries = readFileSync(t.queueFile, 'utf8').trim().split('\n').map((x) => JSON.parse(x));
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].line, L);
+  assert.equal(entries[0].staged.pr, OTHER_PR);
+
+  // PR B's worktree: stage must leave L to PR A (still open)
+  const head = t.repo.git(['rev-parse', 'HEAD']).trim();
+  t.repo.branch('agent/feature');
+  t.fake.setScript([
+    AUTH, REPO,
+    { match: `^pr view ${PR} --json headRefName,headRefOid`, stdoutJson: { headRefName: 'agent/feature', headRefOid: head } },
+    { match: `^pr view ${OTHER_PR} --json state`, stdoutJson: { state: 'OPEN' } },
+  ]);
+  const staged = cli(['agent-log', 'stage', '--pr', String(PR), '--line', '- this PR'], { dir: t.repo.dir, fake: t.fake });
+  assertExit(staged, 0);
+  assert.deepEqual(staged.json.lines, ['- this PR']);
+  assert.equal(staged.json.staged, 0);
+  assert.ok(!readFileSync(join(t.repo.dir, AGENT_LOG), 'utf8').includes(L));
+  const after = readFileSync(t.queueFile, 'utf8').trim().split('\n').map((x) => JSON.parse(x));
+  assert.equal(after.length, 1);
+  assert.equal(after[0].staged.pr, OTHER_PR);
 });
