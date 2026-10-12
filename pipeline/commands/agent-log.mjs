@@ -20,7 +20,7 @@ import { loadConfig } from '../lib/config.mjs';
 export const meta = {
   summary: 'queue a line for the agent log, stage queued lines + this PR\'s line as a commit in the worktree, or close pending prod-smoke lines',
   usage: [
-    'pipeline agent-log queue --line "<line>" [--repo DIR]   -> {ok, queued, file}',
+    'pipeline agent-log queue --line "<line>" [--repo DIR]   -> {ok, queued, file}; a line already in the queue (staged in an open PR or not) is not added again',
     'pipeline agent-log stage --pr N [--line "<line>"] [--repo DIR]   -> {ok, committed, lines, file, staged, dropped}; run in the PR worktree;',
     '  staged lines stay queued ("staged in PR N") until origin/<default> contains them, and are re-staged if that PR closes unmerged;',
     '  default line = the PR\'s agent-log line with outcome "merged — prod smoke pending"; exit 2 when the worktree has other uncommitted changes,',
@@ -30,7 +30,8 @@ export const meta = {
     '  is not logged yet; one repo-wide read of the comments of the last 14 days finds new results on any PR, and a PR is read on its own only when it has no',
     '  resolution line, is the newest pending PR, is named by --pr N (repeatable) or --all is given (a resolved PR the scan did not mention is `skipped`,',
     '  costing no call); a dry run unless --queue (queues each line like `queue`, a line already queued is not added again; never commits); exit 1 when some',
-    '  PRs could not be read (`unreadable`; the lines for the others are still produced and queued), 3 when GitHub is unavailable',
+    '  PRs could not be read (`unreadable`; the lines for the others are still produced and queued: still run `stage` and name them in the summary), 3 when GitHub is',
+    '  unavailable (skip the close, still stage)',
   ].join('\n'),
 };
 

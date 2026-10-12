@@ -21,11 +21,11 @@ pipeline agent-log stage --pr N [--line "<line>"] [--repo DIR]   -> {ok, committ
   is on the default branch or a detached HEAD, or is not the PR's head branch at the PR's head commit; exit 3 when GitHub cannot say
 pipeline agent-log close [--queue] [--pr N]... [--all] [--repo DIR]   -> {ok, lines, pending, skipped, unreadable, queued?, scanError?}; for every "prod smoke pending" log line reads the
   bot-authored prod-smoke-result comments on that PR (production.watch: workflow) and prints one resolution line per PR whose newest result
-  is not logged yet; one repo-wide read of the comments of the last 14 days finds a new result on any PR, even a long-resolved one, and a PR is
-  read on its own only when it has no resolution line, is the newest pending PR, is named by --pr N (repeatable) or --all is given (a resolved PR the scan
-  did not mention is `skipped`, at no cost); a dry run unless --queue (queues each line like `queue`; a line already queued is not added again; never commits);
-  exit 1 when some PRs (or the repo-wide read, `scanError`) could not be read: the lines for the others are still produced and queued, so still run `agent-log stage`
-  and name the unreadable PRs in the summary; exit 3 when GitHub is unavailable: skip the close, still stage
+  is not logged yet; one repo-wide read of the comments of the last 14 days finds new results on any PR, and a PR is read on its own only when it has no
+  resolution line, is the newest pending PR, is named by --pr N (repeatable) or --all is given (a resolved PR the scan did not mention is `skipped`,
+  costing no call); a dry run unless --queue (queues each line like `queue`, a line already queued is not added again; never commits); exit 1 when some
+  PRs could not be read (`unreadable`; the lines for the others are still produced and queued: still run `stage` and name them in the summary), 3 when GitHub is
+  unavailable (skip the close, still stage)
 ```
 
 Exit: 0 ok · 1 some PRs could not be read (close; the others are still processed and queued) · 2 usage, or the worktree is not the PR's clean head branch (stage) · 3 GitHub cannot say / queue lock timeout.
