@@ -29,7 +29,7 @@ number, `R` a review round number, `<slug>` the branch slug.
    **`owner_approval: chat`** (`P config`): blocking hits come back inside `advisory` with `ownerMerge: true` and
    `ok` is true, so they do not end in `needs-human`: see **Owner-merge approval** below. `owner_approval: label` (the
    default) is everything above, unchanged.
-4. No cross-model review ⇒ no merge. Codex unavailable ⇒ `awaiting-review` and stop.
+4. No cross-model review ⇒ no merge. Codex unavailable ⇒ `awaiting-review`, `P summary --outcome awaiting-review`, stop.
 5. **Never pass a `model` parameter when invoking `judge` or `arbiter`** — a per-call model
    overrides their pinned Opus/Fable (only exception: the proof switch in
    `reference/proof-switches.md`). Don't pass one to `implementer` or `verifier` either: their agent
@@ -50,6 +50,24 @@ number, `R` a review round number, `<slug>` the branch slug.
    last 40 lines of its output; if it looks cut off, read the whole log, `<jobDir>/log`). Everywhere
    below, "exit 3" of a job-run command means `exitCode: 3`.
 
+## Ending a run with a PR open
+
+A run that has a PR and ends for any reason except a successful merge ends with exactly one
+`P summary --pr N --outcome <word> --action "<the one thing the owner does>" [--cause <code>]`, then the agent-log
+queue line (Step 7). The summary also pushes the owner's phone; `P prod-watch` pushes the production result itself.
+Notifications are automatic: never send one for progress, and use `P notify --event stopped --pr N --action "…"`
+only for a stop that cannot go through summary. Two shapes, used by name below:
+
+- **needs-human**: `gh pr edit N --add-label needs-human`, `P comment --pr N --kind needs-human --reason "…"`, then
+  `P summary --pr N --outcome needs-human --action "…" --cause <code>`.
+- **stopped**: `P summary --pr N --outcome stopped --action "…" --cause <code>`; `--outcome blocked` /
+  `awaiting-review` / `awaiting-owner-merge` have their own steps. `closed` (the owner closed the PR) and
+  `merged-externally` push nothing.
+
+`--action` is one short line in plain words ("Close the pause issue, then say resume"); `--cause` is a short slug
+(`final-gate:labels`, `codex:quota`, `verify-red`) that keeps a reworded retry from pushing twice. Stops before a PR
+exists (Step 0 preflight and labels ensure) just stop: the owner is at the keyboard, nothing is pushed.
+
 ## Step 0 — opt-out, preflight
 
 - `echo $PIPELINE_OFF` → `1`, or the user said not to use the pipeline: say "pipeline off for this
@@ -61,7 +79,7 @@ number, `R` a review round number, `<slug>` the branch slug.
   - `config` missing/invalid → stop. Offer: "This repo isn't onboarded. Run pipeline-setup?" You
     may still build on a branch and open a PR if the user wants, but **never merge**.
   - `canMerge: false` (enforcement mismatch, `pipeline-pause` issue open, `pipeline-rollback`
-    issue open) → continue, but the run ends with an open PR; say why up front.
+    issue open) → continue, but the run ends with an open PR (the final gate's `preflight` stop, with its summary); say why up front.
   - `codex.available: false` → warn: "Codex is unavailable; the PR will wait in awaiting-review."
   - `clean: false` in the main checkout is fine — you work in a new worktree.
 - `P config` once: note `verify.full`, `verify.quick`, `default_branch`, `worktree_dir`, whether
@@ -95,7 +113,7 @@ comes from `P risk` on the real diff; the higher wins).
    git push -u origin agent/<slug>
    gh pr create --draft --label pipeline-blocked --title "<title>" --body-file <body file>
    P comment --pr N --kind blocked
-   P summary --pr N --outcome blocked --built "<what was attempted and where it stuck>"
+   P summary --pr N --outcome blocked --cause verify-red --action "Read the blocked comment: verify stays red after 3 fixes" --built "<what was attempted and where it stuck>"
    P agent-log queue --line "<agentLogLine from the summary output>"
    ```
    (`blocked` works without review state; the PR body carries the verify report table.) Stop.
@@ -121,7 +139,7 @@ comes from `P risk` on the real diff; the higher wins).
 5. BLOCKING hard-stop hits (`blocking` non-empty; report-only hits alone do not count) ⇒ `gh pr edit N --add-label needs-human` and post
    `P comment --pr N --kind needs-human --reason "<one paragraph: why, what was verified, what the owner does>" --hits-file .review/hardstops.json`.
    Then still run the review loop (Step 4) so the owner gets a reviewed PR, but skip Steps 5–6
-   (no merge). End with the summary (outcome `needs-human`).
+   (no merge). End with `P summary --pr N --outcome needs-human --action "…" --cause hard-stop`.
    `owner_approval: chat`: when `ownerMerge` (from `P hardstops` or `P integrity`) is non-empty instead, do NOT
    add `needs-human`; list the items in the PR body under "Owner merges in chat" and carry on with Steps 4–5; the **Owner-merge approval** rule gates the merge.
 
@@ -138,11 +156,12 @@ Fable from the subagent transcript; the tag is the Agent call's description) →
 items (implementer + verifier full verify) → `P followups create --round R` for FOLLOW-UP →
 `P comment --pr N --kind triage`. Exit when `P state outcome` says `clean`. Not clean after the
 last round, or any item `needsHuman` ⇒ label `needs-human`, post
-`P comment --pr N --kind needs-human --reason "…"` (no `--hits-file`), summary, stop.
+`P comment --pr N --kind needs-human --reason "…"` (no `--hits-file`),
+`P summary --pr N --outcome needs-human --action "…" --cause review:<reason>`, stop.
 
 Codex `exitCode: 3` at any point (Codex unavailable) ⇒ `gh pr edit N --add-label awaiting-review`,
 `P comment --pr N --kind awaiting-review --reason "<reason from the JSON>"`,
-`P summary --pr N --outcome awaiting-review --built "<what is done>"` (works even in round 1, when no
+`P summary --pr N --outcome awaiting-review --cause codex:<reason> --action "Say \"resume pipeline reviews\" when Codex is back" --built "<what is done>"` (works even in round 1, when no
 review state exists yet), `P agent-log queue --line "<agentLogLine>"`, stop.
 
 ## Step 5 — final gate
@@ -160,12 +179,17 @@ Details and every exit code: `reference/gates-and-exits.md`.
    head (pinned to the head you just pushed; never a force push) and repeats at most 3 times if the
    base keeps moving. It does NOT wait for checks (they may not start until the PR is ready or
    labelled, 5.4-5.5): the CI wait in 5.5 and the gate in 5.7 judge the new head. Read `exitCode` and
-   the JSON in `tail`: 0 `up-to-date` ⇒ if `pullNeeded`, `git pull --ff-only` (the gate now names
-   `head`; 5.3 onward re-verifies it). 1 `rebase-needed` (the update conflicts) or `cycle-cap` ⇒
-   `needs-human` + summary, stop. 1 `head-moved` (someone pushed since you verified, or the new head is
-   not GitHub's merge commit; nothing more was updated) ⇒ `git fetch`, look at what landed, back to 5.1.
-   1 `head-timeout` ⇒ run it once more, then `needs-human`. 1 `not-open` ⇒ stop. 3 ⇒ GitHub unavailable:
-   retry once.
+   the JSON in `tail`:
+   - 0 `up-to-date` ⇒ if `pullNeeded`, `git pull --ff-only` (the gate now names `head`; 5.3 onward re-verifies it).
+   - 1 `rebase-needed` (the update conflicts) or `cycle-cap` ⇒ **needs-human** (`--cause update-branch:<outcome>`,
+     `--action "Rebase or merge the base into the branch by hand"`), stop after the summary.
+   - 1 `head-moved` (someone pushed since you verified, or the new head is not GitHub's merge commit; nothing more
+     was updated) ⇒ `git fetch`, look at what landed, back to 5.1.
+   - 1 `head-timeout` ⇒ run it once more, then **needs-human** (`--cause update-branch:head-timeout`).
+   - 1 `not-open` ⇒ PR closed: `P summary --pr N --outcome closed`; PR merged elsewhere: `P summary --pr N --outcome
+     merged-externally`. Neither pushes. Stop.
+   - 3 ⇒ GitHub unavailable: retry once; still 3 ⇒ `P summary --pr N --outcome stopped --cause update-branch:github
+     --action "GitHub was unreachable: re-run ship resume when it is back"`, stop.
 3. Verifier: fresh `verify.full` on the current head (must be clean, full mode). Then
    `P state outcome`: if `coverageValid` is `false` the PR content changed since the last clean
    review round (an update-branch, a late fix) ⇒ go back to Step 4 for a new round, then return here.
@@ -179,12 +203,15 @@ Details and every exit code: `reference/gates-and-exits.md`.
    40-character head sha (`git rev-parse HEAD`; an abbreviation just waits out the timeout):
    `P deploy url --sha <head> --environment <preview.environment> --timeout 480` (its default wait
    is 900 s, longer than the Bash tool allows: keep `--timeout` ≤ 480, or run it as a job). Exit 3
-   ⇒ nothing deployed in time: run it once more, then `needs-human`. Exit 1 ⇒ the deployment failed:
+   ⇒ nothing deployed in time: run it once more, then **needs-human** (`--cause deploy-url`, `--action "Check why the
+   preview did not deploy"`), stop after the summary. Exit 1 ⇒ the deployment failed:
    fix the cause (new commit ⇒ back to 5.1). Then, as a job (it can run 5 minutes):
    `P job start smoke -- node ~/.claude/pipeline/bin/pipeline.mjs smoke --target preview --url <url> --sha <head>`
    (UI-text changes: add `--expect-text "<new text>"`) → `P job wait smoke …`; read `exitCode`.
 7. `P final-gate --pr N`. Any failed check ⇒ fix the cause (a new commit ⇒ back to 5.1; PR
-   content changed ⇒ Step 4 too) or, if it isn't fixable by you, `needs-human` + summary + stop.
+   content changed ⇒ Step 4 too) or, if it isn't fixable by you, stop: **needs-human** (`--cause final-gate:<check>`) after the summary; for the
+   `labels` / `preflight` failures use `P summary --pr N --outcome stopped --cause final-gate:<check> --action "<which
+   label, issue or setting blocks the merge>"` (details in `reference/gates-and-exits.md`).
    `behind-base:` in the `pr-open` detail (main moved since 5.2) ⇒ Step 5.2, then 5.3 onward.
 
 ## Step 6 — merge and production
@@ -199,17 +226,24 @@ passes the **Owner-merge approval** rule below.** With `owner_approval: label` t
    - 1 ⇒ NOT merged. `error: gate | behind-base | live-check | pre-merge`, or a `reason` (merge command failed,
      not merged in time, PR closed, blocker appeared): act per `reference/gates-and-exits.md`.
      "Update the branch" cases (`error: behind-base` — merge already updated the branch itself, or could not
-     (`outcome`: `rebase-needed` ⇒ `needs-human`) — or `behind-base:` in a live check) ⇒ back to Step 5.2,
-     re-verify, a new review round if content changed; max 2 such returns, then `needs-human`.
+     (`outcome`: `rebase-needed` ⇒ **needs-human**, `--cause merge:rebase-needed`) — or `behind-base:` in a live
+     check) ⇒ back to Step 5.2, re-verify, a new review round if content changed; max 2 such returns, then
+     **needs-human** (`--cause merge:behind-base`).
    - 3 ⇒ `error: production-unknown` (no known-good production deployment recorded) or GitHub
-     unavailable: nothing merged; wait a minute and retry once, then stop and tell the user.
+     unavailable: nothing merged; wait a minute and retry once, then
+     `P summary --pr N --outcome stopped --cause merge:production-unknown|merge:github --action "<record a known-good
+     production deployment | re-run ship resume when GitHub is back>"`, stop, and tell the user.
 2. Merged ⇒ `P job start prod -- node ~/.claude/pipeline/bin/pipeline.mjs prod-watch --sha
    <mergeSha> --pr N [--expect-text …]` (no `mergeSha`: `prod-watch --pr N`, it reads the merge
    commit itself) → `P job wait prod --run-id <runId> --timeout 540`. `--expect-text` must be text
    the NEW build shows: smokes of a rolled-back or superseded deployment ignore it. Read the
    `outcome` in the JSON (`exitCode` 0 = `merged`). `merged` / `no-production` ⇒ summary `merged`; every
    other outcome — `superseded`, `recovered`, `rollback-failed`, `changed-during-recovery`,
-   `rollback-skipped`, `not-live`, `deploy-failed`, `deploy-not-observed` — ⇒ summary with that same word.
+   `rollback-skipped`, `not-live`, `deploy-failed`, `deploy-not-observed` — ⇒ summary with that same word
+   (no push: prod-watch sent it). A prod-watch job that exits with no `outcome` in its JSON (`error`
+   `merge-sha-unresolved`, `not-merged`, `deploy-check-failed`) has already pushed "Production check unfinished": write
+   `P summary --pr N --outcome deploy-not-observed --cause prod-watch:<error>` (it pushes nothing) and tell the user to
+   check production by hand; do not rerun it.
    What each one means and what to do is in `reference/gates-and-exits.md`. On a failed smoke prod-watch rolls back by itself (`vercel rollback <known-good> --yes --timeout 3m`,
    never `production.rollback.command`), opens the issue and a revert PR. Report any outcome other
    than `merged` to the user immediately, in plain words.
@@ -224,18 +258,18 @@ each `P merge`, take the `ownerMerge` count of the `P final-gate --pr N` that co
   a retry after a head change (Step 5.2, a `behind-base` return, a refreshed gate) needs a new stop. If there is no such
   approval, STOP:
   1. Post one comment: `gh pr comment N --body "<each item: rule, file, one-line why; head <sha7>; the owner merges by saying \"merge\" in chat>"`.
-  2. `P summary --pr N --outcome awaiting-owner-merge --built "…"`, queue the agent-log line (Step 7), end the run with
+  2. `P summary --pr N --outcome awaiting-owner-merge --action "Check the listed items, then say \"merge\" for head <sha7>" --built "…"`, queue the agent-log line (Step 7), end the run with
      outcome `awaiting-owner-merge`, keep the worktree. The reply's LAST two lines are exactly (7 = the first 7 characters of the head):
      `Head <sha7>`
      `🔀 Ready to merge #N — say "merge"`
 - When the owner then says "merge" and the head and items are unchanged, run Step 6 (final gate again if the base moved,
   `P merge`, prod-watch, rollback handling). If the head changed or new items appeared after they said "merge",
-  show the updated items and the new head and stop again.
+  show the updated items and the new head and stop again, with a new `awaiting-owner-merge` summary for that head.
 The owner's chat message is the approval; never add an approval label yourself (invariant 2).
 
 ## Step 7 — summary
 
-`P summary --pr N --outcome <outcome> --built "<2–3 sentences>"` posts the summary comment
+`P summary --pr N --outcome <outcome> --action "<the one thing the owner does>" --built "<2–3 sentences>"` posts the summary comment
 (outliers first) and prints `agentLogLine`. Queue that line — `P agent-log queue --line
 "<agentLogLine>"` — for every outcome except a clean `merged` (that run's line was staged in
 Step 5.1). Then tell the user, in plain English: what shipped, PR link, outcome, follow-up issues,
@@ -262,13 +296,13 @@ read the issue, link it in the PR body (`Closes #123`).
 
 | Situation | Do |
 |---|---|
-| verify red after 3 fix cycles | draft PR + `pipeline-blocked`, `summary --outcome blocked`, stop |
-| blocking hard-stop hit | review loop, then `needs-human`, stop (`owner_approval: chat`: review loop, gate, then `awaiting-owner-merge`) |
-| Codex unavailable / quota (`exitCode: 3`) | `awaiting-review`, `summary --outcome awaiting-review`, stop |
-| `P arbiter apply` proof fails | items → `needs-human` (the CLI marks them), stop after summary |
-| `triage validate` / `arbiter apply` exit 2 `not-found` | transcript not written yet: wait ~10 s, retry once, then `needs-human` |
-| final gate fails, can't fix | `needs-human`, stop |
-| `behind-base:` / base moved | `P update-branch --pr N` (Step 5.2), re-verify, new round if content changed (max 2 times, then `needs-human`); `rebase-needed` ⇒ `needs-human` |
-| merge exit 3 `production-unknown` | nothing merged; tell the user, stop |
-| prod smoke fails | prod-watch handles rollback + issue + revert PR; tell the user |
-| pause/rollback issue open | PR stays open, explain |
+| verify red after 3 fix cycles | draft PR + `pipeline-blocked`, `summary --outcome blocked --action …`, stop |
+| blocking hard-stop hit | review loop, then `needs-human` + `summary --outcome needs-human --action …`, stop (`owner_approval: chat`: review loop, gate, then `summary --outcome awaiting-owner-merge`) |
+| Codex unavailable / quota (`exitCode: 3`) | `awaiting-review`, `summary --outcome awaiting-review --action …`, stop |
+| `P arbiter apply` proof fails | items → `needs-human` (the CLI marks them), `summary --outcome needs-human --action …`, stop |
+| `triage validate` / `arbiter apply` exit 2 `not-found` | transcript not written yet: wait ~10 s, retry once, then `needs-human` + `summary --outcome needs-human --action …` |
+| final gate fails, can't fix | `needs-human` + `summary --outcome needs-human --action …` (`labels` / `preflight`: `summary --outcome stopped --action …`), stop |
+| `behind-base:` / base moved | `P update-branch --pr N` (Step 5.2), re-verify, new round if content changed (max 2 times, then `needs-human` + `summary --outcome needs-human --action …`); `rebase-needed` ⇒ the same |
+| merge exit 3 `production-unknown` | nothing merged; `summary --outcome stopped --action …`, stop, tell the user |
+| prod smoke fails | prod-watch handles rollback + issue + revert PR and pushes the owner; `summary` with its outcome word; tell the user |
+| pause/rollback issue open | PR stays open: `summary --outcome stopped --cause merge-paused --action "Close the pause/rollback issue"`, explain |
