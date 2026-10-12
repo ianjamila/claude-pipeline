@@ -2,6 +2,8 @@
 // facts only the skill knows (an item was implemented, a follow-up issue exists, how the run ended). The state is the
 // only memory of the review loop, so a lost local copy is rebuilt from the PR's triage comment, which embeds it.
 import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
+import { mkdirSync, existsSync, renameSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { git } from '../lib/git.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
@@ -10,15 +12,22 @@ import { MARKERS } from '../lib/render.mjs';
 import { decodeFromComment, loadState, saveState, updateItems } from '../lib/state.mjs';
 import { roundOutcome } from '../lib/triage.mjs';
 import {
-  allItems, currentContentHash, findItem, findRound, requireState, withStateLock,
+  allItems, currentContentHash, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, requireState, roundDir,
+  stateExtends, withStateLock,
 } from '../lib/review-context.mjs';
 
 export const meta = {
   summary: 'show or update the review loop state (.review/state.json)',
   usage: [
     'pipeline state show [--round R] [--accepted] [--disputed] [--needs-human] [--pr N] [--repo DIR]',
-    '  -> {ok, recovered, count, items}; with --pr and no local state, rebuilds it from the PR triage comment',
-    'pipeline state outcome [--repo DIR]   -> roundOutcome + {clean}; exit 0 whether or not clean',
+    '  -> {ok, recovered, source, count, items}; with --pr and no local state, rebuilds it from the PR triage comment',
+    '  with --pr and a local state: the published (triage comment) state is authoritative. Local is kept (source local) when it',
+    '  equals or strictly EXTENDS the published one; otherwise .review/ moves to .review/stale-<UTC time>/ (source quarantined,',
+    '  quarantinedTo) and the published state is restored. source is local | published | quarantined',
+    'pipeline state discard-round --round R [--pr N] [--repo DIR]',
+    '  -> drop an unpublished, trailing round R from the local state and move .review/round-R/ into .review/stale-<UTC time>/;',
+    '     refused (exit 2) when the PR triage comment already holds round R',
+    'pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, followupsPending}; exit 0 whether or not clean',
     'pipeline state mark-implemented --ids a,b [--repo DIR]',
     '  -> exit 2 {error:no-code-change} unless the branch content differs from what the accepting round reviewed',
     'pipeline state record-followup --id ID --url URL [--repo DIR]',
@@ -66,6 +75,8 @@ async function showLocked(values, n, pr, root, ctx) {
     throw new Fail(EXIT.USAGE, { ok: false, error: 'state', message: err.message });
   }
   let recovered = false;
+  let source = 'local';
+  let quarantinedTo;
   if (!state) {
     if (pr === undefined) {
       throw new Fail(EXIT.USAGE, { ok: false, error: 'no-state', message: 'no review state here: pass --pr N to rebuild it from the PR triage comment' });
@@ -76,13 +87,70 @@ async function showLocked(values, n, pr, root, ctx) {
     }
     saveState(root, state);
     recovered = true;
+    source = 'published';
   } else if (pr !== undefined && state.pr !== pr) {
     throw new Fail(EXIT.USAGE, { ok: false, error: 'state-pr-mismatch', message: `.review/state.json belongs to PR #${state.pr}, not #${pr}` });
+  } else if (pr !== undefined) {
+    // The triage comment is what survives the machine: when the two disagree the published one wins, unless the local
+    // state only goes further (its extra rounds were never published).
+    const published = await recoverState(root, pr, ctx);
+    if (published && !stateExtends(state, published)) {
+      quarantinedTo = path.relative(root, quarantineReviewDir(root)).split(path.sep).join('/');
+      state = published;
+      saveState(root, state);
+      source = 'quarantined';
+    }
   }
 
   const pool = n === undefined ? allItems(state) : findRound(state, n).items;
   const items = pool.filter((i) => (!values.accepted || isAccepted(i)) && (!values.disputed || isDisputed(i)) && (!values['needs-human'] || needsHuman(i)));
-  return { exitCode: EXIT.OK, output: { ok: true, recovered, pr: state.pr, lightLane: state.lightLane, count: items.length, items } };
+  return {
+    exitCode: EXIT.OK,
+    output: { ok: true, recovered, source, ...(quarantinedTo ? { quarantinedTo } : {}), pr: state.pr, lightLane: state.lightLane, count: items.length, items },
+  };
+}
+
+// ---- discard-round --------------------------------------------------------------------------
+
+// An interrupted round (Codex ran, the loop stopped before the triage comment) is thrown away and re-run under the same
+// number. What is moved aside is kept, never deleted; a round the PR comment already holds is history and stays.
+async function discardRound(rest, ctx) {
+  const { values } = parseCommandArgs(rest, { round: { type: 'string' }, pr: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
+  const n = intOption(values, 'round', { required: true, min: 1 });
+  let pr = intOption(values, 'pr', { min: 1 });
+  const root = resolveRepo(values, ctx);
+  const local = requireState(root);
+  pr ??= local.pr;
+  if (local.pr !== pr) {
+    throw new Fail(EXIT.USAGE, { ok: false, error: 'state-pr-mismatch', message: `.review/state.json belongs to PR #${local.pr}, not #${pr}` });
+  }
+  return withStateLock(root, ctx, async () => {
+    const state = requireState(root);
+    const inState = (state.rounds ?? []).some((r) => r.n === n);
+    const dir = roundDir(root, n);
+    if (!inState && !existsSync(dir)) {
+      throw new Fail(EXIT.USAGE, { ok: false, error: 'no-round', message: `round ${n} is neither in the review state nor on disk` });
+    }
+    if (inState && (state.rounds ?? []).some((r) => r.n > n)) {
+      throw new Fail(EXIT.USAGE, { ok: false, error: 'not-trailing', message: `round ${n} is not the newest round: a later round builds on it` });
+    }
+    const published = await recoverState(root, pr, ctx);
+    if ((published?.rounds ?? []).some((r) => r.n === n)) {
+      throw new Fail(EXIT.USAGE, { ok: false, error: 'round-published', message: `round ${n} is in the PR triage comment: it is history, not an interrupted round` });
+    }
+    const stale = newStaleDir(root);
+    const round = (state.rounds ?? []).find((r) => r.n === n);
+    if (round) writeFileSync(path.join(stale, `state-round-${n}.json`), `${JSON.stringify(round, null, 2)}\n`);
+    if (existsSync(dir)) {
+      mkdirSync(stale, { recursive: true });
+      renameSync(dir, path.join(stale, `round-${n}`));
+    }
+    if (inState) saveState(root, { ...state, rounds: state.rounds.filter((r) => r.n !== n) });
+    return {
+      exitCode: EXIT.OK,
+      output: { ok: true, discarded: n, quarantinedTo: path.relative(root, stale).split(path.sep).join('/'), stateRound: inState },
+    };
+  }, pr);
 }
 
 // ---- outcome --------------------------------------------------------------------------------
@@ -96,7 +164,7 @@ async function outcome(rest, ctx) {
   const result = roundOutcome({ ...state, currentContentHash: hash });
   return {
     exitCode: EXIT.OK,
-    output: { ok: true, ...result, currentContentHash: hash, rounds: state.rounds.length, maxRounds: state.maxRounds },
+    output: { ok: true, ...result, followupsPending: followupsPending(state), currentContentHash: hash, rounds: state.rounds.length, maxRounds: state.maxRounds },
   };
 }
 
@@ -170,7 +238,7 @@ function setOutcome(rest, ctx) {
 }
 
 const SUBCOMMANDS = {
-  show, outcome, 'mark-implemented': markImplemented, 'record-followup': recordFollowup, 'set-outcome': setOutcome,
+  show, 'discard-round': discardRound, outcome, 'mark-implemented': markImplemented, 'record-followup': recordFollowup, 'set-outcome': setOutcome,
 };
 
 export const run = guarded(async (argv, ctx) => {
