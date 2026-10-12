@@ -199,7 +199,7 @@ function makeCtx(opts) {
   return {
     platform, homeNative, homePosix, cwd, api, roots, lexRoots, ancestors, lexAncestors, ci,
     user: opts.user ?? posix.basename(homePosix),
-    selfZero: opts._selfZero ?? null, selfBash: opts._selfBash ?? null, selfAbs: opts._selfAbs === true, // the judged script file's own path (its $0 unless it was sourced; BASH_SOURCE[0])
+    selfZero: opts._selfZero ?? null, selfBash: opts._selfBash ?? null, selfAbs: opts._selfAbs === true, selfZsh: opts._selfZsh === true, // the judged script file's own path (its $0 unless it was sourced; BASH_SOURCE[0])
     parentFsChanged: opts._fsChanged === true, // (the calling line ran something before this script that may have changed which paths exist)
     vars: {}, // same-line shell assignments (D=$HOME/.claude), filled in once the line is parsed
     dynamic: false, // set when a scan had to be skipped for size; callers fail closed
@@ -904,6 +904,75 @@ function modelledCd(t, cmds, idx, ctx) {
 }
 // Why: these write into the directory they run in without naming a file (an archive extracts there, curl -O / wget save there, git rewrites the work tree): in a rerun that assumes a protected directory they count as writes.
 const GIT_QUIET = new Set(['status', 'log', 'diff', 'show', 'add', 'commit', 'branch', 'fetch', 'rev-parse', 'rev-list', 'remote', 'ls-files', 'grep', 'blame', 'describe', 'tag', 'push', 'shortlog', 'ls-tree', 'cat-file', 'merge-base', 'symbolic-ref', 'for-each-ref', 'name-rev', 'worktree', 'config', 'version', 'help']);
+// Why: a zsh script finds its own directory with `${0:A:h}` (symlinks resolved), `${0:a:h}`, `${0:h}`, repeated `:h`, or `${${(%):-%x}:A:h}` / `%N`, then `HERE=...; source "$HERE/lib.sh"` or `DIR="${HERE:h}"`.
+// For a file run as a zsh script these are its own directory, as `${0%/*}` is for bash (same conditions as modelledCd); the words are rewritten to that directory before anything reads
+// them, so a sourced sibling can be followed. Positive only: bash reads `${0:A:h}` as a substring, a function body has its own $0 in zsh, and a $0 that may have changed stays a run-time value.
+const ZSH_SELF_RE = /\$\{(?:0|\$\{\(%\):-%[xN]\})((?::[Aah])+)\}/g;
+const ZSH_VAR_RE = /\$\{([A-Za-z_]\w*)((?::[aht])+)\}/g;
+const PLAIN_ABS = /^\/[\w@%+=,./-]*$/;
+function functionRanges(raw) { // [start, end] of every brace-group function body; null when a definition has another shape (a subshell body, a call that looks like one)
+  const ranges = [];
+  const re = /(?:\bfunction\b\s*(?:[\w.:@+-]+\s*)?(?:\(\s*\)\s*)?|(?:[\w.:@+-]+\s*)?\(\s*\)\s*)/g; // (named, `function name`, anonymous `() { }` / `function { }`)
+  for (let m; (m = re.exec(raw)); ) {
+    const start = m.index + m[0].length;
+    if (raw[start] !== '{') return null;
+    let depth = 0;
+    let i = start;
+    for (; i < raw.length; i++) { if (raw[i] === '{') depth++; else if (raw[i] === '}' && --depth === 0) break; }
+    ranges.push([start, i]);
+  }
+  return ranges;
+}
+// Why: a name is believed only when nothing on the line can rebind it: read / mapfile / getopts / printf -v / unset / let / declare-family / for / select / (( )) / `${N:=x}` name it, or code run by source / eval / exec after it was set
+const NAME_BINDERS = new Set(['read', 'mapfile', 'readarray', 'getopts', 'unset', 'let', 'declare', 'typeset', 'local', 'export', 'readonly', 'integer', 'float', 'vared', 'select', 'for', 'foreach', 'coproc', 'wait', 'repeat']);
+function mayRebind(name, cmds, raw) {
+  const mention = new RegExp(`(?:^|[^\\w])${name}(?:[^\\w]|$)`);
+  const asTarget = new RegExp(`^-?${name}(?:[\\[=+]|$)`);
+  if (new RegExp(`\\$\\{!?${name}(?::?[=+]|\\[)|\\b(?:for|select|foreach)\\s+${name}\\b|\\(\\([^)]*\\b${name}\\b`).test(raw)) return true; // (`${N:=x}`, a loop variable, arithmetic)
+  return cmds.some((c) => {
+    const n = baseOf(c.argv[0] ?? '');
+    if (n === 'printf') return c.argv.some((a, i) => (a === '-v' && asTarget.test(c.argv[i + 1] ?? '')) || asTarget.test(a.replace(/^-v/, '')));
+    if (!NAME_BINDERS.has(n)) return false;
+    return n === 'let' || ['declare', 'typeset', 'local', 'export', 'readonly', 'integer', 'float'].includes(n) ? c.argv.slice(1).some((a) => mention.test(a)) : c.argv.slice(1).some((a) => asTarget.test(a));
+  });
+}
+function modelZshSelfDirs(cmds, raw, ctx) {
+  if (!ctx.selfZero || !ctx.selfZsh || !/:[Aaht][:}]/.test(raw)) return;
+  const ranges = functionRanges(raw);
+  if (ranges === null || [...raw.matchAll(ZSH_SELF_RE)].some((m) => ranges.some(([a, b]) => m.index >= a && m.index <= b))) return;
+  if (cmds.some((c) => Object.hasOwn(c.env ?? {}, '0') || Object.hasOwn(c.env ?? {}, 'BASH_ARGV0') || c.argv.some((a) => /^(?:0|BASH_ARGV0)\+?=|^BASH_ARGV0$/.test(a)))) return;
+  const counts = new Map();
+  for (const c of cmds) {
+    for (const k of Object.keys(c.env ?? {})) counts.set(k, (counts.get(k) ?? 0) + 1);
+    for (const a of c.argv) { const m = /^([A-Za-z_]\w*)\+?=/.exec(a); if (m) counts.set(m[1], (counts.get(m[1]) ?? 0) + 2); }
+  }
+  const from = flowStart(cmds);
+  const known = new Map(); // names set once, unconditionally, to a plain absolute path
+  const mods = (p, steps) => {
+    let cur = p;
+    for (const s of steps) cur = s === 'A' ? realResolve(cur, ctx.api) : s === 'a' ? posix.normalize(cur) : s === 't' ? posix.basename(cur) : posix.dirname(cur);
+    return PLAIN_ABS.test(cur) ? cur : null;
+  };
+  for (const [i, c] of cmds.entries()) {
+    // (a relative $0 is read from the cwd at that moment, which an earlier cd has moved; code run by source / . / eval may have assigned $0)
+    const before = cmds.slice(0, i);
+    const stable = (ctx.selfAbs || !before.some((x) => CD_CMDS.has(baseOf(x.argv[0] ?? '')))) && !before.some((x) => ['source', '.', 'eval'].includes(baseOf(x.argv[0] ?? '')));
+    const runsCode = before.some((x) => ['source', '.', 'eval', 'exec'].includes(baseOf(x.argv[0] ?? '')));
+    const fix = (w) => String(w)
+      .replace(ZSH_SELF_RE, (m, ms) => {
+        const steps = ms.slice(1).split(':');
+        return stable && (ctx.selfAbs || steps[0] !== 'h') ? mods(posix.normalize(ctx.selfZero), steps) ?? m : m;
+      })
+      .replace(ZSH_VAR_RE, (m, name, ms) => (known.has(name) && !runsCode ? mods(known.get(name), ms.slice(1).split(':')) ?? m : m));
+    c.argv = c.argv.map(fix);
+    // (a name that something on the script may rebind keeps its text: HERE="${0:A:h}" is not believed after `read HERE`)
+    if (c.env) c.env = Object.fromEntries(Object.entries(c.env).map(([k, v]) => { const f = fix(v); return [k, f !== String(v) && mayRebind(k, cmds, raw) ? v : f]; }));
+    if (c.redirects) for (const r of c.redirects) if (typeof r.target === 'string') r.target = fix(r.target);
+    const sure = !(inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || c.sep === '|' || cmds[i + 1]?.sep === '|' || cmds[i + 1]?.sep === '&');
+    if (!c.argv.length && sure) for (const [k, v] of Object.entries(c.env ?? {})) if (counts.get(k) === 1 && PLAIN_ABS.test(v) && !mayRebind(k, cmds, raw)) known.set(k, v);
+  }
+}
+
 function impliesCwdWrite(c) {
   const name = baseOf(c.argv[0] ?? '');
   const args = c.argv.slice(1);
@@ -1469,7 +1538,7 @@ function judgeScriptText(text, sf, abs, dir, ctx, opts) {
     }
   }
   if (kind === 'shell') {
-    const r = evaluateBashForFiles(text, { ...opts, cwd: dir, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup, ...(sf.runsAsScript ? { _selfBash: abs, _selfZero: abs, _selfAbs: isAbs(expandRefs(String(sf.file), ctx)) } : {}) });
+    const r = evaluateBashForFiles(text, { ...opts, cwd: dir, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup, ...(sf.runsAsScript ? { _selfBash: abs, _selfZero: abs, _selfAbs: isAbs(expandRefs(String(sf.file), ctx)), _selfZsh: sf.kind === 'exec' ? posix.basename(SHEBANG_PROGRAM.exec(text.split('\n', 1)[0])?.[1] ?? '') === 'zsh' : sf.runShell === 'zsh' } : {}) });
     return r.decision === 'deny' ? deny(`the script ${sf.file} would run: ${r.reason}`) : null;
   }
   // program text in another language: the admin switch, the hook switch, or a write next to a protected path
@@ -1794,7 +1863,7 @@ function evaluateBashForFilesFrame(command, opts) {
   if (assumedCwd) opts = { ...opts, _assumedCwd: false };
   checkDeadline(opts._budget);
   const ctx = makeCtx(opts);
-  opts = { ...opts, _selfZero: null, _selfBash: null, _selfAbs: false }; // (only the script file judged right now has a $0; text it runs or reads has none)
+  opts = { ...opts, _selfZero: null, _selfBash: null, _selfAbs: false, _selfZsh: false }; // (only the script file judged right now has a $0; text it runs or reads has none)
   if (ctx.admin) return allow();
   const raw = typeof command === 'string' ? command : '';
   if (!raw.trim()) return allow();
@@ -1825,6 +1894,7 @@ function evaluateBashForFilesFrame(command, opts) {
   }
   if (changesClaudeCode(cmds, scanRaw)) return deny('the command unsets or overrides CLAUDECODE, the marker the installer uses to refuse to run inside Claude Code; only the owner may change it, from a terminal');
   if (setsSeamForPipeline(cmds)) return deny('the command sets a pipeline test seam (PIPELINE_GH, PIPELINE_CODEX, PIPELINE_VERCEL, PIPELINE_TEST_MODE, PIPELINE_UPDATE_REMOTE) for the pipeline CLI; a fake gh/codex/vercel could satisfy the merge gate, and a foreign update remote would install foreign code, so only the owner does that, from a terminal');
+  modelZshSelfDirs(cmds, raw, ctx);
   ctx.vars = collectVars(cmds, ctx);
   if (opts._vars) { ctx.vars = { ...opts._vars, ...ctx.vars }; ctx.keptVars = { ...(opts._keptVars ?? {}), ...ctx.keptVars }; } // variables the line set before the shell that runs this file started
   for (const k of opts._unknownW ?? []) ctx.unknownVars.add(k);
@@ -1980,7 +2050,7 @@ function evaluateBashForFilesFrame(command, opts) {
         ctx.execCmd = sf.kind === 'exec' ? { c, cmds, env: startupEnv, inherited: inheritedStartup } : null;
         // (only a file the command runs as a script has a $0 and BASH_SOURCE of its own path: not a sourced one, a fed one, a glob / candidate record or a -c text; a variable-named first operand is marked for the candidate judgment)
         const runsFile = (sf.kind === 'shell' || sf.kind === 'exec') && !sf.candidate && !sf.joined && !['source', '.', 'eval'].includes(baseOf(c.argv[0] ?? '')) && !c.argv.some((w) => /^-[A-Za-z]*[cs]$/.test(w));
-        if (runsFile) { if (sf.ambiguous) sf.firstOperandRuns = true; else sf.runsAsScript = true; }
+        if (runsFile) { if (sf.ambiguous) sf.firstOperandRuns = true; else { sf.runsAsScript = true; if (c.argv[1] === sf.file) sf.runShell = baseOf(c.argv[0]); } } // (runShell: the shell word of a plain `zsh file`; a program run by path takes its shebang's)
         const sfj = sf;
         let v;
         try {
