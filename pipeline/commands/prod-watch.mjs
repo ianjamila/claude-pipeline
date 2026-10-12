@@ -3,18 +3,22 @@
 // issue and a revert PR. All the decisions live in lib/prodwatch.mjs; this file wires the real GitHub, Vercel, git,
 // smoke command and lock into it. Exit 0 merged (or no production configured), 1 any other outcome, 3 deployment not
 // observed or GitHub unavailable.
+import { hostname } from 'node:os';
 import { EXIT, UsageError, intOption, parseCommandArgs } from '../lib/cli.mjs';
 import { guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { findDeployment } from '../lib/deploy.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { withLock } from '../lib/locks.mjs';
 import { GhError, gh as ghRun } from '../lib/proc.mjs';
-import { createGitOps, createSmoke, exitCodeFor, resolveMergeSha, runProdWatch } from '../lib/prodwatch.mjs';
+import {
+  createGitOps, createRunRecordTracker, createSmoke, exitCodeFor, knownGoodFromEvents, readKnownGood, resolveMergeSha, runProdWatch,
+} from '../lib/prodwatch.mjs';
+import { postEvent, readEvents } from '../lib/run-events.mjs';
 import { inspectAlias, linkedProjectDir, rollback } from '../lib/vercel.mjs';
 
 export const meta = {
   summary: 'verify the production deployment of a merge; roll back safely, open an issue and a revert PR if it fails',
-  usage: 'pipeline prod-watch (--sha MERGE_SHA [--pr N] | --pr N) [--expect-text T] [--retry-wait SEC=60] [--repo DIR]   -> {ok, outcome: merged|deploy-failed|deploy-not-observed|not-live|superseded|recovered|rollback-failed|changed-during-recovery|rollback-skipped|no-production, ...}\n  with only --pr N (merge printed mergeSha:null) the merge commit is read from the merged PR (up to 6 looks); exit 1 {error:not-merged} when the PR is not MERGED, exit 3 {error:merge-sha-unresolved} when GitHub never names it',
+  usage: 'pipeline prod-watch (--sha MERGE_SHA [--pr N] | --pr N) [--expect-text T] [--retry-wait SEC=60] [--observe-only] [--repo DIR]   -> {ok, outcome: merged|deploy-failed|deploy-not-observed|not-live|superseded|recovered|rollback-failed|changed-during-recovery|rollback-skipped|needs-owner|no-production, ...}\n  with only --pr N (merge printed mergeSha:null) the merge commit is read from the merged PR (up to 6 looks); exit 1 {error:not-merged} when the PR is not MERGED, exit 3 {error:merge-sha-unresolved} when GitHub never names it\n  with --pr N it records rollback-intent / rollback-result / recovery-reported events on the PR and shows the watch as in flight in the run record\n  --observe-only: same smokes and outcomes, but never rolls back, opens an issue or revert PR, or adds a label: what would have rolled back is {outcome: needs-owner, evidence}; a rollback-intent with no rollback-result on the PR is {rollbackInterrupted: {intent, liveNow}}; works from a detached worktree at the merge commit (the known-good target is read from the prod-before event when .review/prod-before.json is absent)',
 };
 
 const LOCK_WAIT_MS = 10 * 60_000;
@@ -38,6 +42,7 @@ export const run = guarded(async (argv, ctx) => {
     pr: { type: 'string' },
     'expect-text': { type: 'string' },
     'retry-wait': { type: 'string' },
+    'observe-only': { type: 'boolean' },
     repo: { type: 'string' },
   });
   if (positionals.length) throw new UsageError(`unexpected argument: ${positionals[0]}`);
@@ -48,6 +53,7 @@ export const run = guarded(async (argv, ctx) => {
   if (sha !== null && !/^[0-9a-f]{40}$/.test(sha)) throw new UsageError('--sha must be the full 40-character commit SHA');
   const retryWait = intOption(values, 'retry-wait', { min: 0 }) ?? 60;
   const expectText = values['expect-text'] || null;
+  const observeOnly = values['observe-only'] === true;
 
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
@@ -70,6 +76,11 @@ export const run = guarded(async (argv, ctx) => {
       deploymentStatuses: (id) => gh.deploymentStatuses(id),
     },
     git: createGitOps({ root }),
+    // Events and the run record live on the PR, so they exist only when the PR is known.
+    ...(pr === undefined ? {} : {
+      events: { post: (kind, id, sentence, data) => postEvent(gh, pr, kind, id, sentence, data), list: () => readEvents(gh, pr) },
+      runRecord: createRunRecordTracker({ gh, pr, host: hostname() }),
+    }),
     lock: (name, fn) => withLock(name, fn, { waitMs: LOCK_WAIT_MS }),
     note: (msg) => process.stderr.write(`prod-watch: ${msg}\n`),
   };
@@ -90,7 +101,20 @@ export const run = guarded(async (argv, ctx) => {
       }
       sha = found.sha;
     }
-    const output = await runProdWatch({ config, sha, pr, expectText, root, retryWaitMs: retryWait * 1000 }, deps);
+    // Without .review/prod-before.json (a detached worktree at the merge commit) the target is the PR's prod-before event.
+    if (observeOnly && deps.events) {
+      deps.readKnownGood = async () => {
+        const file = readKnownGood(root);
+        if (file.ok) return file;
+        try {
+          const fromEvent = knownGoodFromEvents(await deps.events.list(), config.production.environment);
+          return fromEvent.ok ? fromEvent : file;
+        } catch {
+          return file;
+        }
+      };
+    }
+    const output = await runProdWatch({ config, sha, pr: pr ?? null, expectText, root, host: hostname(), observeOnly, retryWaitMs: retryWait * 1000 }, deps);
     return { exitCode: exitCodeFor(output.outcome), output };
   });
 });

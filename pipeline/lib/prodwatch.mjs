@@ -9,6 +9,8 @@ import { join, resolve } from 'node:path';
 import { fill } from './config.mjs';
 import { git as gitRun, NETWORK_TIMEOUT_MS } from './git.mjs';
 import { runShellAsync } from './proc.mjs';
+import { applyCheckpoint, bindRecord, emptyRecord } from './run-record.mjs';
+import { readSummaryComment, writeSummaryComment } from './summary-comment.mjs';
 import { tail } from './vercel.mjs';
 
 const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -88,12 +90,27 @@ export function readKnownGood(root) {
   } catch (err) {
     return { ok: false, reason: err?.code === 'ENOENT' ? 'no .review/prod-before.json: `merge` records the known-good deployment before merging' : `cannot read ${file}: ${err.message}` };
   }
+  return knownGoodFrom(raw, '.review/prod-before.json');
+}
+
+// {ok, id, url, sha} from a recorded deployment ({id, url, sha}); `source` names where it came from, for the refusal text.
+function knownGoodFrom(raw, source) {
   const url = typeof raw?.url === 'string' ? raw.url.trim() : '';
   const id = typeof raw?.id === 'string' || typeof raw?.id === 'number' ? String(raw.id) : '';
   const target = url || id;
-  if (!target) return { ok: false, reason: '.review/prod-before.json has neither a url nor an id to roll back to' };
-  if (!/^[^\s-]\S*$/.test(target)) return { ok: false, reason: `.review/prod-before.json holds an unusable rollback target: ${JSON.stringify(target)}` };
+  if (!target) return { ok: false, reason: `${source} has neither a url nor an id to roll back to` };
+  if (!/^[^\s-]\S*$/.test(target)) return { ok: false, reason: `${source} holds an unusable rollback target: ${JSON.stringify(target)}` };
   return { ok: true, id, url, sha: typeof raw.sha === 'string' ? raw.sha : null };
+}
+
+// The known-good deployment from the NEWEST `prod-before` event (the same record `merge` also writes to
+// .review/prod-before.json, kept on the PR so a session without that file still has the rollback target). `events` is
+// listEvents() output. An event for another environment is ignored; one whose payload cannot be read is skipped.
+export function knownGoodFromEvents(events, environment) {
+  const candidates = (events ?? []).filter((e) => e?.kind === 'prod-before' && e.dataStatus === 'ok' && (!e.data?.environment || !environment || e.data.environment === environment));
+  const latest = candidates.at(-1);
+  if (!latest) return { ok: false, reason: 'no .review/prod-before.json and no prod-before event on the PR: `merge` records the known-good deployment before merging' };
+  return knownGoodFrom(latest.data?.deployment, `the prod-before event ${latest.id}`);
 }
 
 // The production smoke: the project's configured command with {url} (strict: a missing value is an error, never a
@@ -135,6 +152,33 @@ export function createGitOps({ root, gitFn = gitRun, remote = 'origin' } = {}) {
         try { g(['worktree', 'remove', '--force', dir]); } catch { /* best effort: a leftover temp worktree is harmless */ }
       }
     },
+  };
+}
+
+// Shows a running watch in the PR's run record (`inFlight` + step prod-watch) and takes it out again. Display only: every
+// call re-reads the summary comment, so it never overwrites what another writer put there since, and it throws on a
+// problem (the watch turns that into a warning, never a failure). `gh` = createGitHub().
+export function createRunRecordTracker({ gh, pr, host, now = Date.now }) {
+  const load = () => {
+    const existing = readSummaryComment(gh, pr);
+    if (existing.status === 'ok') {
+      const mismatch = bindRecord(existing.record, { repo: gh.repo().slug, pr });
+      if (mismatch.length) throw new Error(`the run record does not belong to this PR (${mismatch.join('; ')})`);
+      return { existing, record: existing.record };
+    }
+    if (existing.status === 'unsupported' || existing.status === 'invalid') {
+      throw new Error(`the run record in the summary comment is ${existing.status}: left alone`);
+    }
+    const view = gh.prView(pr, ['headRefName', 'baseRefName']);
+    return { existing, record: emptyRecord({ repo: gh.repo().slug, pr, branch: view?.headRefName, baseRef: view?.baseRefName }) };
+  };
+  const apply = (patch) => {
+    const { existing, record } = load();
+    writeSummaryComment(gh, pr, { record: applyCheckpoint(record, patch, { host, now: now() }), existing });
+  };
+  return {
+    set: (inFlight) => apply({ step: 'prod-watch', inFlight }),
+    clear: () => apply({ inFlight: null }),
   };
 }
 
@@ -233,10 +277,71 @@ function revertBody(ev, issue, subject) {
  *       smoke({url, expectText}) -> {ok, tail}          inspectAlias(domain) -> {id, url, createdAt}  (throws when unknown)
  *       rollback(target) -> {ok, code, tail}            github: {issueCreate, issueComment?, prCreate, prView?, deployments, deploymentStatuses}
  *       git: {revertBranch}    lock(name, fn)    sleep(ms)    now()    note(msg)    readKnownGood()
+ * Optional deps (the command wires them when it knows the PR):
+ *       events: {post(kind, id, sentence, data), list()}   append-only run events on the PR (see run-events.mjs)
+ *       runRecord: {set(inFlight), clear()}                shows the watch in the PR's run record
+ * opts.observeOnly: the same smokes and outcome detection, but NEVER a rollback, an issue, a revert PR, a pause label or an
+ * event: what would have rolled back is outcome `needs-owner` with the evidence, and a rollback-intent with no
+ * rollback-result on the PR is reported as `rollbackInterrupted`.
  * Returns { ok, outcome, mergeSha, deployment, live, issue, revertPr, smoke:{ok, tail}, ... }; exitCodeFor(outcome) is the exit code.
  */
 export async function runProdWatch(opts, deps) {
+  const warnings = [];
+  const { runRecord } = deps;
+  const guardRecord = async (what, fn) => {
+    try {
+      await fn();
+    } catch (err) {
+      warnings.push(`run record: could not ${what}: ${err?.message ?? err}`);
+    }
+  };
+  if (runRecord) {
+    const maxMinutes = opts.config.production.deploy_timeout_minutes + 30;
+    const startedAt = new Date((deps.now ?? Date.now)()).toISOString();
+    await guardRecord('mark the watch in flight', () => runRecord.set({ kind: 'prod-watch', host: opts.host ?? '', startedAt, maxMinutes }));
+  }
+  let out;
+  try {
+    out = await watch(opts, deps);
+  } finally {
+    // Every exit path, a thrown error included, takes the watch out of the record.
+    if (runRecord) await guardRecord('clear the in-flight marker', () => runRecord.clear());
+  }
+  if (opts.observeOnly === true && deps.events) {
+    try {
+      const interrupted = await findInterruptedRollback(opts, deps, out);
+      if (interrupted) out.rollbackInterrupted = interrupted;
+    } catch (err) {
+      warnings.push(`could not check the PR for an interrupted rollback: ${err?.message ?? err}`);
+    }
+  }
+  if (warnings.length) out.warnings = [...(out.warnings ?? []), ...warnings];
+  return out;
+}
+
+// A `rollback-intent` for this merge with no `rollback-result` of the same id: a rollback began and nobody wrote down how
+// it ended. -> {intent: {id, url, ...event data}, liveNow: {id, url} | null} | null. The live deployment is what the
+// watch just read, or one more read of the domain; null when it cannot be read.
+async function findInterruptedRollback(opts, deps, out) {
+  const evts = await deps.events.list();
+  const forThisMerge = (e) => e.dataStatus !== 'ok' || e.data?.mergeSha === opts.sha;
+  const done = new Set(evts.filter((e) => e.kind === 'rollback-result' && forThisMerge(e)).map((e) => e.id));
+  const open = evts.filter((e) => e.kind === 'rollback-intent' && forThisMerge(e) && !done.has(e.id)).at(-1);
+  if (!open) return null;
+  let live = out.live ?? null;
+  if (!live) {
+    try { live = await deps.inspectAlias(hostOf(opts.config.production.url)); } catch { /* reported as unknown */ }
+  }
+  return {
+    intent: { ...(open.dataStatus === 'ok' ? open.data : { unreadable: true }), id: open.id, url: open.url ?? null },
+    liveNow: live ? { id: live.id ?? null, url: live.url ?? null } : null,
+  };
+}
+
+async function watch(opts, deps) {
   const { config, sha, pr = null, expectText = null, root } = opts;
+  const observe = opts.observeOnly === true;
+  const events = deps.events ?? null;
   const prod = config.production;
   const retryWaitMs = opts.retryWaitMs ?? RETRY_WAIT_MS;
   const notLiveChecks = opts.notLiveChecks ?? NOT_LIVE_CHECKS;
@@ -252,9 +357,11 @@ export async function runProdWatch(opts, deps) {
   const ev = {
     sha, pr, startedAt: new Date(now()).toISOString(), deployment: null, smoke: null, smokeFailure: null, live: null, liveBefore: null,
     liveBeforeSha: null, liveChanged: null, liveAfter: null, knownGood: null, rollback: null, reason: null, notes: [],
-    warnings: [], issue: null, issueError: null, revertPr: null, revertPrError: null,
+    warnings: [], issue: null, issueError: null, revertPr: null, revertPrError: null, underlying: null,
   };
   let rollbackTried = false;
+  let eventId = null; // `<sha7>-<n>`: shared by this merge's rollback-intent, rollback-result and recovery-reported
+  let resultPosted = false;
 
   // `expect` defaults to the new build's text. A deployment that is NOT this merge's (the rolled-back one, a newer one)
   // cannot contain that text, so those smokes pass null and only judge health.
@@ -296,7 +403,7 @@ export async function runProdWatch(opts, deps) {
   };
 
   async function report(outcome) {
-    if (outcome === 'merged') return;
+    if (observe || outcome === 'merged') return; // observe-only never opens an issue or a revert PR, nor adds a pause label
     const labels = [PAUSING.has(outcome) ? 'pipeline-rollback' : 'needs-human'];
     try {
       ev.issue = await github.issueCreate({ title: issueTitle(outcome, { pr, sha }), body: issueBody(outcome, ev, prod), labels });
@@ -339,6 +446,16 @@ export async function runProdWatch(opts, deps) {
     smoke: ev.smoke ? { ok: ev.smoke.ok, tail: ev.smoke.tail } : null,
     ...(ev.knownGood || ev.rollback ? {
       recovery: { knownGood: ev.knownGood, liveBefore: ev.liveBefore, liveAfter: ev.liveAfter, rollback: ev.rollback },
+    } : {}),
+    ...(observe ? { observeOnly: true } : {}),
+    ...(outcome === 'needs-owner' ? {
+      evidence: {
+        underlying: ev.underlying,
+        failingDeployment: ev.deployment,
+        liveDeployment: ev.liveBefore ?? ev.live,
+        knownGood: ev.knownGood,
+        smokeFailure: ev.smokeFailure ? { code: ev.smokeFailure.code, tail: ev.smokeFailure.tail } : null,
+      },
     } : {}),
     ...(ev.reason ? { reason: ev.reason } : {}),
     ...(ev.issueError ? { issueError: ev.issueError } : {}),
@@ -435,6 +552,29 @@ export async function runProdWatch(opts, deps) {
       return 'changed-during-recovery';
     }
 
+    // Observe-only stops here: this is exactly the point where a normal run would roll back.
+    if (observe) {
+      return skip(`observe-only: ${describe(again)} fails the production smoke and would be rolled back to ${known.url || known.id}; nothing was changed`, 'needs-owner');
+    }
+
+    // Record the intent on the PR BEFORE touching production: a rollback nobody recorded is exactly what strands a run.
+    // No PR (events not wired) means there is no run to strand, so that case proceeds.
+    if (events) {
+      eventId = await nextEventId();
+      try {
+        await events.post('rollback-intent', eventId, `Rolling production back from ${describe(ev.deployment)} to ${known.url || known.id}.`, {
+          mergeSha: sha,
+          pr,
+          failingDeployment: { id: ev.deployment.id, url: ev.deployment.url },
+          target: { id: known.id, sha: known.sha, url: known.url },
+          liveBefore: { id: before.id ?? null, url: before.url ?? null },
+        });
+      } catch (err) {
+        ev.notes.push(`rollback-intent event failed: ${err?.message ?? err}`);
+        return skip('could not record the rollback intent on the PR');
+      }
+    }
+
     rollbackTried = true;
     let rb;
     try {
@@ -443,8 +583,13 @@ export async function runProdWatch(opts, deps) {
       rb = { ok: false, code: null, tail: String(err?.message ?? err) };
     }
     ev.rollback = { ok: rb?.ok === true, code: rb?.code ?? null, tail: String(rb?.tail ?? '') };
-    if (!ev.rollback.ok) return skip('the rollback command failed', 'rollback-failed');
+    const outcome = ev.rollback.ok ? await verifyRollback(known) : skip('the rollback command failed', 'rollback-failed');
+    await postRollbackResult(outcome === 'recovered');
+    return outcome;
+  }
 
+  // After a rollback command that succeeded: did production really land on the known-good deployment, and does it pass?
+  async function verifyRollback(known) {
     let after;
     try {
       after = await inspectAlias(domain);
@@ -459,23 +604,70 @@ export async function runProdWatch(opts, deps) {
     return 'recovered';
   }
 
+  // Event ids are `<sha7>-<n>`, n = 1 + the rollback-intents already on the PR for this merge (a retry never reuses one).
+  async function nextEventId() {
+    let n = 1;
+    try {
+      n += (await events.list()).filter((e) => e.kind === 'rollback-intent' && e.data?.mergeSha === sha).length;
+    } catch { /* the id only has to be stable for this run */ }
+    return `${sha.slice(0, 7)}-${n}`;
+  }
+
+  // Later events are evidence for the owner, not a gate: a failure to post one is a warning, never a different outcome.
+  async function postLater(kind, sentence, data) {
+    if (!events || !eventId) return;
+    try {
+      await events.post(kind, eventId, sentence(), data());
+    } catch (err) {
+      ev.warnings.push(`could not record the ${kind} event on the PR: ${err?.message ?? err}`);
+    }
+  }
+  async function postRollbackResult(verified) {
+    if (resultPosted || !eventId) return;
+    resultPosted = true;
+    await postLater('rollback-result', () => `Rollback ${ev.rollback?.ok ? 'ran' : 'FAILED'}; production ${verified ? 'verified healthy on the known-good deployment' : 'NOT verified'}.`, () => ({
+      mergeSha: sha,
+      ok: ev.rollback?.ok === true,
+      liveAfter: ev.liveAfter ? { id: ev.liveAfter.id ?? null, url: ev.liveAfter.url ?? null } : null,
+      verified,
+    }));
+  }
+
+  // Observe-only writes nothing and changes nothing, so every outcome that wanted action from the owner (a failing smoke
+  // that was, or would have been, rolled back) is the same thing: `needs-owner`, with what it would have been in evidence.
+  const asObserved = (out) => {
+    if (!observe || !PAUSING.has(out)) return out;
+    ev.underlying = out;
+    ev.reason ??= `observe-only: the production smoke fails (${out})`;
+    return 'needs-owner';
+  };
+
   const lockName = `prod-${String(config.project).replace(/[^A-Za-z0-9._-]/g, '-')}`;
   let entered = false;
   let outcome = null;
+  // Observe-only is read-only, so it neither needs nor waits for the machine-wide recovery lock.
+  const withProdLock = observe ? async (_name, fn) => fn() : lock;
   try {
-    await lock(lockName, async () => {
+    await withProdLock(lockName, async () => {
       entered = true;
       try {
         outcome = await recover();
       } catch (err) {
         ev.notes.push(`unexpected error during recovery: ${err?.stack ?? err}`);
         outcome = skip(`unexpected error during recovery: ${err?.message ?? err}`, rollbackTried ? 'rollback-failed' : 'rollback-skipped');
+        if (rollbackTried) await postRollbackResult(false);
       }
+      outcome = asObserved(outcome);
       await report(outcome);
+      if (rollbackTried) {
+        await postLater('recovery-reported', () => `Rollback recovery reported: incident issue ${ev.issue?.url ?? 'not created'}, revert PR ${ev.revertPr?.url ?? 'not created'}.`, () => ({
+          mergeSha: sha, issueUrl: ev.issue?.url ?? null, revertPrUrl: ev.revertPr?.url ?? null,
+        }));
+      }
     });
   } catch (err) {
     if (!entered && err?.name === 'LockTimeoutError') {
-      outcome = skip(`could not get the production recovery lock ${lockName}: ${err.message}`);
+      outcome = asObserved(skip(`could not get the production recovery lock ${lockName}: ${err.message}`));
       await report(outcome);
     } else if (entered && outcome && err?.name === 'LockLostError') {
       ev.warnings.push(err.message); // everything was already done and reported; the caller should just know
