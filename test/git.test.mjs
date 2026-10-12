@@ -703,6 +703,65 @@ test('diffFiles: binary documents that are each under the limit but add up past 
   assert.deepEqual(skippedIn(diff(240 * KB)), []);
 });
 
+// A literal exclude pathspec also matches everything UNDER that path, so a skipped file that turns into a directory of the same
+// name (or the reverse) would take the files beneath it out of the diff and the hash with it.
+test('a large binary that becomes a directory of the same name (or the reverse) is not skipped: the files under it stay visible', () => {
+  const asFile = (repo) => repo.write('data.xlsx', binaryish(300 * 1024));
+  const lo = (o) => ({ ...o, largeBinaryBytes: LOW });
+
+  // file -> directory: data.xlsx is deleted and data.xlsx/payload.js added
+  const { repo, o } = baseRepo();
+  asFile(repo);
+  repo.commit('add sheet');
+  repo.branch('feat');
+  repo.rm('data.xlsx');
+  repo.write('data.xlsx/payload.js', 'export const x = 1;\n');
+  repo.commit('turn it into a directory');
+  repo.checkout('main');
+  repo.branch('feat2');
+  repo.rm('data.xlsx');
+  repo.write('data.xlsx/payload.js', 'export const x = 2;\n');
+  repo.commit('same, other payload');
+
+  const by = Object.fromEntries(diffFiles('main', 'feat', lo(o)).map((f) => [f.path, f]));
+  assert.deepEqual(by['data.xlsx/payload.js'].added, [{ line: 1, text: 'export const x = 1;' }]);
+  assert.equal(Object.hasOwn(by['data.xlsx'], 'skippedLargeBinary'), false, 'the clashing deletion stays in the text diff');
+  assert.equal(by['data.xlsx'].status, 'D');
+  assert.notEqual(contentHash('main', 'feat', lo(o)), contentHash('main', 'feat2', lo(o)), 'editing payload.js moves the hash');
+  const { patch, skipped } = reviewPatch('main', 'feat', lo(o));
+  assert.deepEqual(skipped, []);
+  assert.match(patch, /data\.xlsx\/payload\.js/);
+
+  // directory -> file: data.xlsx/payload.js is deleted and a big data.xlsx added
+  const rev = baseRepo();
+  rev.repo.write('data.xlsx/payload.js', 'export const x = 1;\n');
+  rev.repo.commit('add directory');
+  rev.repo.branch('feat');
+  rev.repo.rm('data.xlsx');
+  asFile(rev.repo);
+  rev.repo.commit('turn it into a sheet');
+  const back = Object.fromEntries(diffFiles('main', 'feat', lo(rev.o)).map((f) => [f.path, f]));
+  assert.deepEqual(back['data.xlsx/payload.js'].removed, [{ line: 1, text: 'export const x = 1;' }]);
+  assert.equal(Object.hasOwn(back['data.xlsx'], 'skippedLargeBinary'), false);
+});
+
+test('contentHash: a mode change on a skipped large binary moves the hash', () => {
+  const { repo, o } = baseRepo();
+  const lo = { ...o, largeBinaryBytes: LOW };
+  for (const [name, exec] of [['plain', false], ['exec', true]]) {
+    repo.checkout('main');
+    repo.branch(name);
+    repo.write('data/new.xlsx', binaryish(300 * 1024));
+    if (exec) {
+      repo.git(['add', 'data/new.xlsx']);
+      makeExecutable(repo, 'data/new.xlsx');
+    }
+    repo.commit(name);
+  }
+  assert.equal(diffFiles('main', 'exec', lo)[0].skippedLargeBinary, true, 'precondition: the sheet really is skipped');
+  assert.notEqual(contentHash('main', 'plain', lo), contentHash('main', 'exec', lo));
+});
+
 // ---- contentHash and the review patch leave large binaries out too ------------------------------------------------
 
 // What contentHash returned BEFORE large binaries were skipped, for a fixture with no skipped file. Computed with the code at

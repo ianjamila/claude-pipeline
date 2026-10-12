@@ -158,10 +158,15 @@ function largeBinaryChanges(from, to, o) {
 
   const changes = rawChanges(from, to, o);
   const order = new Map(changes.map((c, i) => [c.newPath ?? c.oldPath, i]));
+  // A literal exclude pathspec also matches everything UNDER the path, so a change whose path becomes (or was) a directory of
+  // another change in the range is never skipped: skipping "data.xlsx" would hide "data.xlsx/payload.js" with it.
+  const everyPath = changes.flatMap((c) => [c.oldPath, c.newPath]).filter(Boolean);
+  const hasDescendant = (c) => [c.oldPath, c.newPath].filter(Boolean).some((p) => everyPath.some((q) => q.startsWith(`${p}/`)));
   const candidates = changes.filter((c) => binary.has(c.newPath ?? c.oldPath)
     && ['A', 'D', 'M', 'R'].includes(c.status) && PLAIN_MODES.has(c.oldMode) && PLAIN_MODES.has(c.newMode)
     && c.oldId !== c.newId
-    && [c.oldPath, c.newPath].filter(Boolean).every(isBinaryFormat));
+    && [c.oldPath, c.newPath].filter(Boolean).every(isBinaryFormat)
+    && !hasDescendant(c));
   if (candidates.length === 0) return { skipped: [], order };
 
   const ids = [...new Set(candidates.flatMap((c) => [c.oldId, c.newId]).filter((id) => !/^0+$/.test(id)))];
@@ -329,7 +334,7 @@ function normaliseDiff(text) {
 // (0xFE and 0xFD both become U+FFFD), whereas --binary alone keeps NUL and `-diff` files byte-exact.
 // The one exception is a large binary document (see diffFiles): --binary would print its whole content again (base85, a
 // quarter bigger) and overflow the buffer, so it is left out of the diff and one line stands in for it, carrying the
-// status, both paths and both blob ids. A blob id IS a hash of the content, so the hash still moves whenever such a file's
+// status, both paths, both modes and both blob ids. A blob id IS a hash of the content, so the hash still moves whenever such a file's
 // bytes change. Without any such file the input is exactly the normalised diff, as before.
 // `exclude` paths (e.g. an agent log the pipeline itself appends to) are left out: each is a literal repo-root-relative
 // path (`:(top,exclude,literal)`), so `*.js` is not a glob and `docs/x.md` does not match `sub/docs/x.md`. Pathspecs
@@ -344,9 +349,10 @@ export function contentHash(base, head, { exclude = [], ...o } = {}) {
   const diff = normaliseDiff(text);
   const stoodIn = skipped.filter((c) => !exclude.includes(c.newPath ?? c.oldPath)); // an excluded path never counts
   if (stoodIn.length === 0) return createHash('sha256').update(diff).digest('hex');
-  // One JSON array per change (a path may hold any character but NUL), sorted. The diff's length prefix and the NUL tag make
+  // One JSON array per change (a path may hold any character but NUL), sorted. The modes are in it: a chmod +x alone changes
+  // nothing else about a skipped file. The diff's length prefix and the NUL tag make
   // this input impossible to mistake for a plain diff (those start with "diff --git"), whatever the diff contains.
-  const lines = stoodIn.map((c) => JSON.stringify([c.status, c.oldPath, c.newPath, c.oldId, c.newId])).sort();
+  const lines = stoodIn.map((c) => JSON.stringify([c.status, c.oldPath, c.newPath, c.oldMode, c.newMode, c.oldId, c.newId])).sort();
   return createHash('sha256').update(`large-binary\0${diff.length}\0${diff}\n${lines.join('\n')}\n`).digest('hex');
 }
 
