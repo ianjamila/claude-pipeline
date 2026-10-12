@@ -877,6 +877,29 @@ function checkJoinedScripts(sf, dir, ctx, level) {
   return v.decision === 'deny' ? deny(`the scripts ${sf.file} would run a blocked command: ${v.reason}`) : null;
 }
 
+// The command's own prefix assignments (`F=f.sh bash run.sh`) are in the environment of the shell it starts: the startup files and the
+// script that shell runs see them. Seeded into ctx for the duration of `fn` and put back after (the line itself does not keep them).
+// A value that is only known at run time makes the variable unknown (refused where it picks a file).
+function withPrefixEnv(cmd, ctx, fn) {
+  const entries = Object.entries(cmd?.env ?? {});
+  if (!entries.length) return fn();
+  const values = entries.map(([k, w]) => [k, expandVars(w, ctx)]);
+  const saved = values.map(([k]) => [k, Object.hasOwn(ctx.vars, k), ctx.vars[k], ctx.unsureVars.has(k), ctx.tainted.has(k)]);
+  for (const [k, v] of values) {
+    ctx.tainted.delete(k);
+    if (DYNAMIC.test(v)) { delete ctx.vars[k]; ctx.unsureVars.add(k); } else { ctx.vars[k] = v; ctx.unsureVars.delete(k); }
+  }
+  try {
+    return fn();
+  } finally {
+    for (const [k, had, val, wasUnsure, wasTainted] of saved) {
+      if (had) ctx.vars[k] = val; else delete ctx.vars[k];
+      if (wasUnsure) ctx.unsureVars.add(k); else ctx.unsureVars.delete(k);
+      if (wasTainted) ctx.tainted.add(k); else ctx.tainted.delete(k);
+    }
+  }
+}
+
 // Why: the real home's startup files (~/.bash_profile, ~/.zshenv ...) are not named by any word of the line, and what they run does not
 // depend on it. They are judged as an evaluation of their own (the line's variable state, but the guarded words of the FILE's text,
 // not of the line, decide whether a run-time name in it is refused) and the verdict is kept for the whole evaluation, so a line with
@@ -897,13 +920,25 @@ function implicitStartupVerdict(st, ctx, cmd, dir) {
   // the shell starts where the command runs (`cd sub && NVM_DIR=d bash -l`); an unknown directory (null) makes a relative name in the file unknowable
   const key = `${st.file}\u0000${stateFingerprint(fresh, dir, 0)}`;
   const memo = (ctx.budget.implicitStartup ??= new Map());
-  if (memo.has(key)) return memo.get(key);
-  memo.set(key, null); // marked first: a startup file that starts shells itself finds this entry, not itself again
+  // The file runs in the same repository as the line: a branch it switches, config it changes and aliases it defines are real, so what the
+  // judgement changed in its copy is carried back into the line's state (the memo keeps it with the verdict: same state in, same state out).
+  const carry = (r) => {
+    for (const [d, e] of r.branches) if (ctx.branches.get(d) !== e) ctx.branches.set(d, e);
+    if (r.cfgDirty) ctx.cfgDirty = true;
+    Object.assign(ctx.gitAliases, r.git);
+    Object.assign(ctx.ghAliases, r.gh);
+    for (const n of r.unsure) ctx.aliasUnsure.add(n);
+    return r.verdict;
+  };
+  if (memo.has(key)) return carry(memo.get(key));
+  const pending = { verdict: null, branches: new Map(), cfgDirty: false, git: {}, gh: {}, unsure: [] };
+  memo.set(key, pending); // marked first: a startup file that starts shells itself finds this entry, not itself again
   const text = ctx.readText(path.resolve(ctx.home, st.file.replace(/^~\/?/, '')));
   fresh.fullText = typeof text === 'string' ? text : '';
   const v = checkScriptFile(rec, dir, fresh, 0);
-  memo.set(key, v);
-  return v;
+  const done = { verdict: v, branches: new Map(fresh.branches), cfgDirty: fresh.cfgDirty, git: { ...fresh.gitAliases }, gh: { ...fresh.ghAliases }, unsure: [...fresh.aliasUnsure] };
+  memo.set(key, done);
+  return carry(done);
 }
 
 // Variables set inside a script do not leave a child shell (`bash f.sh`, `./f`): the line's own values stay. `source` does
@@ -1184,13 +1219,9 @@ function evalString(str, startDir, ctx, level) {
         if (why) verdict = deny(`${name} was given a string that contains a guarded command (${why}). Run the operation directly so it can be checked.`);
       }
       const sf = verdict ? null : scriptFileOf(argv, c.raw, str);
-      if (sf) {
-        if (name === 'source' || name === '.') sf.sourced = true;
-        verdict = checkScriptFile(sf, dir, ctx, level);
-      }
-      // script text that reaches a shell without being named (`bash < f.sh`, `cat f.sh | bash`, `eval "$(cat f.sh)"`): its files are judged like `bash f.sh`
-      if (!verdict) for (const fd of scriptFeedsOf(c, str)) { verdict = checkScriptFile(fd, dir, ctx, level); if (verdict) break; }
-      // a shell runs its startup files (BASH_ENV, ENV, ZDOTDIR/.zshenv ...) before the script it was given: judged like `bash FILE`
+      if (sf && (name === 'source' || name === '.')) sf.sourced = true;
+      // a shell runs its startup files (BASH_ENV, ENV, ZDOTDIR/.zshenv ...) BEFORE the script it was given, so they are judged first, in the
+      // order the shell reads them, and what they change (a branch switch) is what the script and the feeds are then judged against
       if (!verdict) for (const st of startupFilesOf(c, cmds, { env: ctx.env, inherited: (n) => knownValues(ctx, n), exec: sf?.kind === 'exec' })) {
         // the real home's file (no word on the line names it) is judged on its own, once: see implicitStartupVerdict
         if (st.implicit) {
@@ -1198,15 +1229,21 @@ function evalString(str, startDir, ctx, level) {
           if (verdict) break;
           continue;
         }
-        // a clean verdict is reused only in the very same state (it depends on the variables, branches and config the line has set so far), never for a run-time name
-        const key = st.ambiguous ? null : `${st.file}\u0000${stateFingerprint(ctx, dir, level)}`;
-        if (key !== null) {
-          if (ctx.budget.startupOk.has(key)) continue;
-          ctx.budget.startupOk.add(key); // marked first, so a startup file that starts shells itself is not judged again and again (a denial ends the evaluation)
-        }
-        verdict = checkScriptFile(st, dir, ctx, level);
+        // the shell sees the command's own prefix variables (`F=f.sh BASH_ENV=rc bash -c :` where rc sources "$F")
+        verdict = withPrefixEnv(c, ctx, () => {
+          // a clean verdict is reused only in the very same state (it depends on the variables, branches and config the line has set so far), never for a run-time name
+          const key = st.ambiguous ? null : `${st.file}\u0000${stateFingerprint(ctx, dir, level)}`;
+          if (key !== null) {
+            if (ctx.budget.startupOk.has(key)) return null;
+            ctx.budget.startupOk.add(key); // marked first, so a startup file that starts shells itself is not judged again and again (a denial ends the evaluation)
+          }
+          return checkScriptFile(st, dir, ctx, level);
+        });
         if (verdict) break;
       }
+      if (!verdict && sf) verdict = withPrefixEnv(c, ctx, () => checkScriptFile(sf, dir, ctx, level));
+      // script text that reaches a shell without being named (`bash < f.sh`, `cat f.sh | bash`, `eval "$(cat f.sh)"`): its files are judged like `bash f.sh`
+      if (!verdict) for (const fd of scriptFeedsOf(c, str)) { verdict = withPrefixEnv(c, ctx, () => checkScriptFile(fd, dir, ctx, level)); if (verdict) break; }
     }
     if (verdict && verdict.decision === 'deny') return verdict;
     if (SOURCING.includes(name)) {

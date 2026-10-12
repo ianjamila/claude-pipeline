@@ -385,3 +385,52 @@ test('#19: a qualifier group that cannot be delimited is refused when the line n
   assert.equal(files("ls *(e:'$X':); ls ~/.claude/pipeline", f).decision, 'deny');
   assert.equal(files("ls *(e:'$X':)", f).decision, 'allow');
 });
+
+// ---- review R1-B4: the startup files run FIRST, and what they change carries forward ------------------------------------------
+// Guarded text is only ever built at run time here, never written out.
+const SW_MAIN = 'git switch ' + 'ma' + 'in';
+
+test('R1-B4: a startup file runs before the script it was given: a branch switch there is seen by the script', () => {
+  const g = (spec, c) => git(c, fakeFs(GIT_ROOT, spec, DIRS));
+  const run = { 'run.sh': 'git push', 'rc': SW_MAIN };
+  for (const c of ['BASH_ENV=rc bash run.sh', 'ENV=rc sh run.sh', 'BASH_ENV=rc bash < run.sh', 'cat run.sh | BASH_ENV=rc bash', 'BASH_ENV=rc bash -s < run.sh']) {
+    assert.equal(g(run, c).decision, 'deny', c);
+  }
+  assert.equal(g({ ...run, rc: 'git status' }, 'BASH_ENV=rc bash run.sh').decision, 'allow');
+  assert.equal(g(run, 'bash run.sh').decision, 'allow'); // without the startup file the script stays on its own branch
+});
+
+test('R1-B4: the real home startup file is judged first and its branch switch is not thrown away', () => {
+  const g = (spec, c) => git(c, fakeFs(GIT_ROOT, spec, DIRS));
+  const home = { '/home/u/.zshenv': SW_MAIN };
+  for (const c of ['zsh -c "git push"', "zsh -c 'git push'", 'zsh -c "git status; git push"']) assert.equal(g(home, c).decision, 'deny', c);
+  assert.equal(g({ '/home/u/.zshenv': 'git status' }, 'zsh -c "git push"').decision, 'allow');
+  assert.equal(g(home, 'zsh -c "git status"').decision, 'allow');
+  // a script run by zsh: the same
+  assert.equal(g({ ...home, 'run.sh': 'git push' }, 'zsh run.sh').decision, 'deny');
+});
+
+// ---- review R1-B5: the command's own prefix environment reaches the startup files and scripts the shell runs --------------------
+
+test('R1-B5: a prefix variable reaches a startup file the same command names', () => {
+  const spec = { 'f.sh': 'bad', 'ok.sh': 'ok', 'rc': '. "$F"', 'rc2': '. ${F}' };
+  for (const c of ['F=f.sh BASH_ENV=rc bash -c ":"', 'F=f.sh BASH_ENV=rc bash x.sh', 'F=f.sh ENV=rc sh x.sh', 'F=f.sh BASH_ENV=rc2 bash -c ":"', 'BASH_ENV=rc F=f.sh bash -c ":"', 'env F=f.sh BASH_ENV=rc bash -c ":"']) denyBoth(c, { ...spec, 'x.sh': 'ok' });
+  allowBoth('F=ok.sh BASH_ENV=rc bash -c ":"', spec);
+  allowBoth('BASH_ENV=rc bash -c ":"', spec); // F unset: nothing to source
+  // a startup file reached through a variable set on the line (not just the prefix) sees it too
+  denyBoth('F=f.sh; BASH_ENV=rc bash -c ":"', spec);
+});
+
+test('R1-B5: a prefix variable reaches the script the same command names', () => {
+  const spec = { 'f.sh': 'bad', 'ok.sh': 'ok', 'run.sh': '. "$F"', 'feed.sh': '. "$F"' };
+  for (const c of ['F=f.sh bash run.sh', 'F=f.sh sh run.sh', 'F=f.sh bash < feed.sh', 'F=f.sh bash -s < feed.sh']) denyBoth(c, spec);
+  allowBoth('F=ok.sh bash run.sh', spec);
+  allowBoth('F=ok.sh bash < feed.sh', spec);
+});
+
+test('R1-B5: a clean verdict for a startup file is not reused under other variable values', () => {
+  const spec = { 'f.sh': 'bad', 'ok.sh': 'ok', 'rc': '. "$F"', 'one.sh': 'F=ok.sh BASH_ENV=rc bash -c ":"', 'two.sh': 'F=f.sh BASH_ENV=rc bash -c ":"' };
+  denyBoth('bash one.sh; bash two.sh', spec);
+  denyBoth('bash two.sh; bash one.sh', spec);
+  allowBoth('bash one.sh; bash one.sh', spec);
+});
