@@ -1833,6 +1833,10 @@ function evaluateBashForFilesFrame(command, opts) {
     const relative = (w) => typeof w === 'string' && (/^~[^/]/.test(w) || (!/^~(?:\/|$)/.test(w) && !isAbs(toPosix(expandRefs(w, ctx)))));
     const rel = cmds.find((c) => { const sf = scriptFileOf(c.argv, c.raw, raw); return sf && (sf.kind === 'exec' ? relative(sf.file) : sf.ambiguous || relative(sf.file)); });
     if (rel) return deny('the script is named relative to a directory known only at run time, so its commands cannot be judged; use its absolute path');
+    // (the directory may be BELOW a protected one, which the assumed directories do not cover: a relative write target or writer operand that climbs with `..` can reach it from there)
+    const climbs = (w) => typeof w === 'string' && !isAbs(toPosix(w)) && !w.startsWith('~') && /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(w);
+    const up = cmds.find((c) => (c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && climbs(r.target)) || (c.argv.length > 0 && !CD_CMDS.has(baseOf(c.argv[0])) && !isReadOnly(c, ctx) && c.argv.slice(1).some((w) => climbs(w.replace(/^-{0,2}[\w-]+=/, '')))));
+    if (up) return deny('the command writes through a relative path with `..` after a cd into a directory known only at run time; it may start below a protected directory, so the file it reaches cannot be checked; write the directory out');
     const at = ctx.frames.indexOf(frame);
     for (const d of assumedCwds(ctx)) {
       countCdRun(ctx.budget);

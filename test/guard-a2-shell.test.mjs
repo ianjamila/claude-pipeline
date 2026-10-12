@@ -699,6 +699,9 @@ test('S4d: the rest of a line after an unknown cd is judged as if the cwd were e
   // (reads, absolute targets outside the protected set and a known directory stay allowed)
   for (const w of ['cat settings.json', 'ls', 'git status', 'git log', 'grep x settings.json', 'echo x > /tmp/out.txt', 'echo hi | cat']) assert.equal(files(`cd $UNSET && ${w}`, fs).decision, 'allow', w);
   assert.equal(files('cd sub && echo x > notes.txt', fs).decision, 'allow');
+  // (the directory may be below a protected one: a path that climbs with .. can reach it from there)
+  for (const w of ['echo x > ../../../settings.json', 'echo x >> ../x', 'cp /tmp/x ../../settings.json', 'tee ../../s < /tmp/x', 'touch ../a']) assert.match(files(`cd $UNSET && ${w}`, fs).reason ?? '', /with `\.\.`/, w);
+  assert.equal(files('cd $UNSET && cat ../x', fs).decision, 'allow');
   // (a script named relative to the unknown directory is a file nobody can read)
   for (const w of ['node scripts/x.mjs', 'bash x.sh', 'source x.sh', './x.sh', 'python3 build/x.py', 'bash ~+/x.sh', 'bash ~-/x.sh', 'bash ~root/x.sh']) assert.match(files(`cd $(git rev-parse --show-toplevel) && ${w}`, fs).reason ?? '', /relative to a directory known only at run time/, w);
   assert.notEqual(files('cd $UNSET && node /tmp/x.mjs', fs).decision, 'allow'); // (an absolute script path is read and judged; a missing file leaves the line refused by the rerun)
