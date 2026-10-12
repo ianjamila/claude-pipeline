@@ -1,7 +1,7 @@
 // Reads and updates .review/state.json for the skills: which items are open, whether the loop may exit, and the few
 // facts only the skill knows (an item was implemented, a follow-up issue exists, how the run ended). The state is the
 // only memory of the review loop, so a lost local copy is rebuilt from the PR's triage comment, which embeds it.
-import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
+import { EXIT, UnavailableError, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { mkdirSync, existsSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
@@ -23,7 +23,8 @@ export const meta = {
     '  -> {ok, recovered, source, count, items}; with --pr and no local state, rebuilds it from the PR triage comment',
     '  with --pr and a local state: the published (triage comment) state is authoritative. Local is kept (source local) when it',
     '  equals or strictly EXTENDS the published one; otherwise .review/ moves to .review/stale-<UTC time>/ (source quarantined,',
-    '  quarantinedTo) and the published state is restored. source is local | published | quarantined',
+    '  quarantinedTo) and the published state is restored. source is local | published | quarantined | local-unverified',
+    '  (GitHub unreachable but a local state exists: served as is with a `warnings` entry, exit 0; with no local state exit 3)',
     'pipeline state discard-round --round R [--pr N] [--repo DIR]',
     '  -> drop an unpublished, trailing round R from the local state and move .review/round-R/ into .review/stale-<UTC time>/;',
     '     refused (exit 2) when the PR triage comment already holds round R',
@@ -76,6 +77,7 @@ async function showLocked(values, n, pr, root, ctx) {
   }
   let recovered = false;
   let source = 'local';
+  const warnings = [];
   let quarantinedTo;
   if (!state) {
     if (pr === undefined) {
@@ -93,7 +95,16 @@ async function showLocked(values, n, pr, root, ctx) {
   } else if (pr !== undefined) {
     // The triage comment is what survives the machine: when the two disagree the published one wins, unless the local
     // state only goes further (its extra rounds were never published).
-    const published = await recoverState(root, pr, ctx);
+    // GitHub unreachable: the local state is all there is. It is served, but flagged: it was NOT compared with the published
+    // triage comment, so the caller must not treat it as proven current.
+    let published;
+    try {
+      published = await recoverState(root, pr, ctx);
+    } catch (err) {
+      if (!(err instanceof UnavailableError)) throw err;
+      warnings.push(`GitHub unavailable: the local review state was not compared with the published triage comment (${String(err.message).split('\n')[0].slice(0, 200)})`);
+      source = 'local-unverified';
+    }
     if (published && !stateExtends(state, published)) {
       quarantinedTo = path.relative(root, quarantineReviewDir(root)).split(path.sep).join('/');
       state = published;
@@ -106,7 +117,7 @@ async function showLocked(values, n, pr, root, ctx) {
   const items = pool.filter((i) => (!values.accepted || isAccepted(i)) && (!values.disputed || isDisputed(i)) && (!values['needs-human'] || needsHuman(i)));
   return {
     exitCode: EXIT.OK,
-    output: { ok: true, recovered, source, ...(quarantinedTo ? { quarantinedTo } : {}), pr: state.pr, lightLane: state.lightLane, count: items.length, items },
+    output: { ok: true, recovered, source, ...(quarantinedTo ? { quarantinedTo } : {}), ...(warnings.length ? { warnings } : {}), pr: state.pr, lightLane: state.lightLane, count: items.length, items },
   };
 }
 

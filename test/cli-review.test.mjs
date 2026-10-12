@@ -1747,6 +1747,25 @@ test('state show (no --pr) never asks GitHub and reports source local', (t) => {
   assert.equal(w.fake.calls().length, before);
 });
 
+test('state show --pr: GitHub unavailable with a local state serves it as local-unverified with a warning; with no local state it stays exit 3', (t) => {
+  const { w, published } = publishedWorld(t);
+  const down = [{ match: '.', code: 1, stderr: 'HTTP 502' }];
+  w.fake.setScript(down);
+  const r = w.cli(['state', 'show', '--pr', '7']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.source, 'local-unverified');
+  assert.equal(r.json.recovered, false);
+  assert.equal(r.json.pr, 7);
+  assert.equal(r.json.count, 4);
+  assert.equal(r.json.warnings.length, 1);
+  assert.match(r.json.warnings[0], /GitHub unavailable/);
+  assert.deepEqual(w.state(), published, 'the local state is served, never rewritten or moved');
+  assert.deepEqual(staleDirs(w), []);
+  // nothing local to fall back to: still unavailable
+  const none = world(t, { gh: down });
+  assertExit(none.cli(['state', 'show', '--pr', '7']), 3);
+});
+
 test('state show --pr: local that strictly extends the published state (an unpublished round 2) is kept', (t) => {
   const { w, published } = publishedWorld(t);
   editState(w, (s) => {
