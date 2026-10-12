@@ -678,6 +678,102 @@ function assumedCwds(ctx) {
   }
   return unique(dirs);
 }
+// Why: a cd into `app/(group)/[id]` (Next.js route directories; the parser has lost the quotes) names a place only the file system can pin down. Each segment is read both ways, as the literal name
+// (quoted) and as a shell pattern (`*` `?` `[..]`, a zsh `(a|b)` group), against the real directory listing, in the WIDEST reading any shell option set could give (case-insensitive: nocaseglob; dot names
+// matched: dotglob / globdots; `.` and `..` too), so the answer does not depend on options the line may set. The cd is known only when that reading leads to exactly one existing directory that is
+// neither protected nor above a protected one; none or several -> unknown (nullglob / failglob make a failed match a cd home or nowhere). null = a pattern this does not model (nested / unbalanced
+// groups, POSIX classes, zsh qualifiers / extended patterns, a brace list, `**`): the caller keeps the directory unknown.
+const MAX_GLOB_ENTRIES = 4000;
+const MAX_GLOB_FANOUT = 64;
+function segmentPattern(seg) {
+  const bracket = (s, i) => {
+    let j = i + 1;
+    let neg = false;
+    if (s[j] === '!' || s[j] === '^') { neg = true; j++; }
+    const from = j;
+    if (s[j] === ']') j++;
+    while (j < s.length && s[j] !== ']') j++;
+    if (j >= s.length) return null; // (unclosed: the shell reads a literal `[`, not modelled)
+    const body = s.slice(from, j);
+    if (/\[[:.=]/.test(body)) return null; // (POSIX classes / collating symbols)
+    return { re: `[${neg ? '^' : ''}${body.replace(/[\\\]^]/g, '\\$&')}]`, end: j };
+  };
+  const translate = (s, inGroup) => {
+    let re = '';
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (c === '*') re += '[^/]*';
+      else if (c === '?') re += '[^/]';
+      else if (c === '[') { const b = bracket(s, i); if (!b) return null; re += b.re; i = b.end; } else if (c === '(' || c === ')') return null; // (a group is cut out by the caller; nesting / strays are not modelled)
+      else if (c === '|' && inGroup) return null;
+      else re += c.replace(/[.+^${}()|\\/]/g, '\\$&');
+    }
+    return re;
+  };
+  // (only one level of group: `(a|b)`; every alternative must itself be dot-free at its start)
+  let out = '';
+  let rest = seg;
+  while (rest) {
+    const o = rest.indexOf('(');
+    const cl = rest.indexOf(')');
+    if (o < 0 && cl < 0) { const t = translate(rest, false); if (t === null) return null; out += t; break; }
+    if (o < 0 || cl < o) return null;
+    const pre = translate(rest.slice(0, o), false);
+    if (pre === null || /[@?*+!]$/.test(rest.slice(0, o)) || (o > 0 && cl === rest.length - 1)) return null; // (`@(..)` / `*(..)` extended patterns; a trailing `(...)` after a name is a zsh glob qualifier)
+    const alts = rest.slice(o + 1, cl).split('|').map((a) => (a.includes('(') ? null : translate(a, true)));
+    if (alts.some((a) => a === null)) return null;
+    out += `${pre}(?:${alts.join('|')})`;
+    rest = rest.slice(cl + 1);
+  }
+  try { return new RegExp(`^${out}$`, 'i'); } catch { return null; }
+}
+// -> an array of the existing directories `full` (absolute, normalised) leads to, or null when its pattern is not modelled
+function resolveGlobDir(full, ctx) {
+  const isDir = (p) => Array.isArray(ctx.readDir(p));
+  let cur = ['/'];
+  for (const seg of full.split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') { cur = unique(cur.map((p) => posix.dirname(p))); continue; }
+    const next = new Set();
+    if (!/[*?[(]/.test(seg)) {
+      for (const p of cur) if (isDir(posix.join(p, seg))) next.add(posix.join(p, seg));
+    } else {
+      const re = segmentPattern(seg);
+      if (re === null) return null;
+      for (const p of cur) {
+        if (isDir(posix.join(p, seg))) next.add(posix.join(p, seg)); // (quoted: the literal name)
+        const names = ctx.readDir(p);
+        if (!Array.isArray(names)) continue;
+        if (names.length > MAX_GLOB_ENTRIES) return null;
+        for (const n of [...names, '.', '..']) {
+          const child = n === '.' ? p : n === '..' ? posix.dirname(p) : posix.join(p, n);
+          if (re.test(n) && isDir(child)) next.add(child);
+        }
+      }
+    }
+    cur = [...next];
+    if (cur.length > MAX_GLOB_FANOUT) return null;
+  }
+  return cur;
+}
+// The one directory a glob-looking cd target `e` names from any of `bases` (null: none, several, or not modelled).
+function resolveGlobCd(e, bases, ctx, cmds, idx) {
+  if (/[{`$]|\*\*|[<>^#]|~/.test(e)) return null;
+  // (the listing is the one NOW: a command before the cd that may create, remove, rename or link a path, a write redirect, a sourced file or a startup file makes it unknown)
+  if (cmds.slice(0, idx).some((c) => (c.redirects ?? []).some((r) => WRITE_OPS.has(r.op)) || Object.keys(c.env ?? {}).some((k) => /^(?:BASH_ENV|ENV|ZDOTDIR)$/.test(k)) || (c.argv.length > 0 && !CD_CMDS.has(baseOf(c.argv[0])) && !VAR_COMMANDS.has(baseOf(c.argv[0])) && (!isReadOnly(c, ctx) || ["source", ".", "eval"].includes(baseOf(c.argv[0])))))) return null;
+  const found = new Set();
+  for (const b of isAbs(e) ? [''] : bases) {
+    if (!isAbs(e) && /[*?[(]/.test(b)) continue;
+    const r = resolveGlobDir(isAbs(e) ? posix.normalize(e) : posix.join(b, e), ctx);
+    if (r === null) return null;
+    for (const x of r) found.add(x);
+  }
+  if (found.size !== 1) return null;
+  const [dir] = [...found];
+  // (the cwd is the real location: a link into a protected directory is that directory; `..` after it is the real parent. A protected directory, or one above: the directory stays unknown)
+  const real = realResolve(dir, ctx.api);
+  return ctx.hit(dir) || ctx.hitAncestor(dir) || ctx.hit(real) || ctx.hitAncestor(real) ? null : real;
+}
 // (one rerun of a line per assumed directory, counted across the evaluation: past the allowance the line is refused rather than slow)
 const MAX_CD_RERUNS = 200;
 const MAKES_DIRS = new Set(['mkdir', 'cp', 'mv', 'tar', 'bsdtar', 'gtar', 'unzip', 'git', 'rsync', 'ditto', 'install', 'ln', 'curl', 'wget']);
@@ -973,9 +1069,10 @@ function collectVars(cmds, ctx) {
 // Directories the command line may be operating in: the hook's cwd plus every `cd` target (chained ones too).
 function collectDirs(cmds, ctx) {
   const dirs = [ctx.cwd];
-  const addDir = (e) => {
+  const addDir = (e, globAt = -1) => {
     for (const d of [...dirs]) {
-      const nd = isAbs(e) ? posix.normalize(e) : posix.join(d, e);
+      // (a cd target with glob-looking parts that leads to exactly one existing directory is that directory)
+      const nd = (globAt >= 0 && /[*?[(]/.test(e) ? resolveGlobCd(e, [d], ctx, cmds, globAt) : null) ?? (isAbs(e) ? posix.normalize(e) : posix.join(d, e));
       if (!dirs.includes(nd) && dirs.length < 32) dirs.push(nd);
     }
   };
@@ -992,7 +1089,7 @@ function collectDirs(cmds, ctx) {
     }
     if (!t) continue;
     const mc = modelledCd(t, cmds, ci, ctx);
-    addDir(mc !== null ? mc : expandRefs(t, ctx));
+    addDir(mc !== null ? mc : expandRefs(t, ctx), mc === null ? ci : -1);
   }
   return dirs;
 }
@@ -1790,8 +1887,8 @@ function evaluateBashForFilesFrame(command, opts) {
       if (t !== undefined && modelledCd(t, cmds, ci, ctx) !== null) return false;
       if (t === undefined || /^~(?:\/|$)|^\$\{?HOME\b/.test(t)) { if (homeMoved) return true; if (t === undefined) return false; } // (a bare cd goes home)
       const e = expandRefs(t, ctx);
-      if (/[*?[{]/.test(e)) return true; // (a glob or a brace list can spell ~/.claude: `cd ~/.cl*`)
-      if (/[`$(]/.test(e) || /\$\{!/.test(t) || /[`]|\$\(/.test(t)) return true;
+      if (/[*?[{(]/.test(e) && resolveGlobCd(e, dirs, ctx, cmds, ci) === null) return true; // (a glob or a brace list can spell ~/.claude: `cd ~/.cl*`)
+      if (/[`$]/.test(e) || /\$\{!/.test(t) || /[`]|\$\(/.test(t)) return true;
       if (cdpathSet && !isAbs(e) && !/^\.\.?(?:\/|$)/.test(e)) return true;
       return [...t.matchAll(/\$\{?(\w+)/g)].some((x) => unknownName(x[1]));
     });
