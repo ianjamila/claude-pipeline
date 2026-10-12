@@ -1216,3 +1216,23 @@ test('L2b: curl: --url is a URL (for -O), --output-dir applies to a relative -o 
   allowBoth("curl -w '%{http_code}' http://h/f; bash ok.sh");
   allowBoth('curl -o d/n.sh http://h/f; bash ok.sh');
 });
+
+test('L2b: <> (open for reading and writing) is always a write of unknown content, also when exec opens it for later commands', () => {
+  // Why: `cmd 1>&0 <> n.sh` and `exec 3<> n.sh` + `echo ... >&3` write n.sh through a descriptor that was "opened for reading"
+  const shape = (l) => writesOf(simpleCommands(l)).recs.map((r) => [r.dest, r.items.map((i) => !!i.unknown)]);
+  assert.deepEqual(shape(': <> n.sh'), [['n.sh', [true]]]);
+  assert.deepEqual(shape('cat 0<> n.sh'), [['n.sh', [true]]]);
+  assert.deepEqual(shape('echo hi 1>&0 <> n.sh'), [['n.sh', [true]]]);
+  assert.deepEqual(shape('exec 3<> n.sh'), [['n.sh', [true]]]);
+  assert.deepEqual(shape('cat < n.sh'), []);
+  assert.deepEqual(shape('cat <> /dev/null'), []);
+  denyBoth((_, mid) => `: <> n.sh; ${mid}; bash n.sh`);
+  denyBoth((_, mid) => `cat 0<> n.sh; ${mid}; bash n.sh`);
+  denyBoth((_, mid) => `echo hi 1>&0 <> n.sh; ${mid}; bash n.sh`);
+  denyBoth((_, mid) => `exec 3<> n.sh; ${mid}; bash n.sh`);
+  denyBoth((bad) => `exec 3<> n.sh; echo '${bad}' >&3; bash n.sh`);
+  denyBoth((_, mid) => `exec 3<> ok.sh; ${mid}; bash ok.sh`);
+  allowBoth('cat < ok.sh; bash ok.sh');
+  allowBoth('exec 3< ok.sh; bash ok.sh');
+  allowBoth((_, _m, calm) => `exec 3<> m.log; ${calm}; bash ok.sh`);
+});

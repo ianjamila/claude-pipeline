@@ -390,9 +390,10 @@ function redirectRecords(cmd, idx) {
   const out = [];
   for (const r of cmd.redirects ?? []) {
     if (!WRITE_OPS.has(r.op) || typeof r.target !== 'string' || !r.target || r.target.startsWith('&') || r.target === '/dev/null') continue;
-    if (r.op === '<>' && (r.fd === null || r.fd === 0)) continue; // opened for reading
     let items;
-    if (r.fd === null || r.fd === 1) items = stdoutItems(cmd);
+    // Why: <> opens for reading AND writing: `cmd 1>&0 <> n.sh`, `exec 3<> n.sh` + `>&3` write the file with text we cannot follow, so it is never skipped as a read
+    if (r.op === '<>' && (r.fd === null || r.fd === 0)) items = UNKNOWN;
+    else if (r.fd === null || r.fd === 1) items = stdoutItems(cmd);
     else if (r.fd === 2) items = [...textItems([cmd.argv.join(' '), ...cmd.argv]), { unknown: true }]; // stderr: messages that quote the arguments
     else items = UNKNOWN;
     // `&>` / `>&` also catch stderr
