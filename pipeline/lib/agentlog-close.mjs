@@ -120,6 +120,28 @@ export function parseLog(text) {
 // The newest logged resolution by its embedded observed time; on a tie the later line wins.
 const newestLogged = (list) => (list ?? []).reduce((best, r) => (best === null || r.at >= best.at ? r : best), null);
 
+const MINUTE_MS = 60_000;
+
+/**
+ * The log the closer reasons over: the union of several copies of it (the worktree's, and origin/<default>'s), lines deduped
+ * verbatim, first copy first. A worktree on an older branch lacks the lines other PRs merged since; origin lacks the ones this
+ * branch has not pushed. A line either copy has is a fact about the project.
+ */
+export function unionLogText(...texts) {
+  const seen = new Set();
+  const out = [];
+  for (const text of texts) {
+    if (!text) continue;
+    for (const raw of String(text).split('\n')) {
+      const line = raw.replace(/\r$/, '');
+      if (seen.has(line)) continue;
+      seen.add(line);
+      out.push(line);
+    }
+  }
+  return out.join('\n');
+}
+
 /** The PR number a repo-wide issue comment belongs to, from its `issue_url` (…/issues/<N>); null when it has none. */
 export const prFromIssueUrl = (url) => /\/issues\/(\d+)$/.exec(String(url ?? ''))?.[1] ?? null;
 
@@ -167,7 +189,9 @@ const oneLine = (err) => String(err?.message ?? err).replace(/[\r\n]+/g, ' ').sl
 
 /**
  * gh: { mergeSha(pr) -> sha | null, listComments(pr) -> comments[], listRepoComments(sinceIso) -> comments[] (each with
- * `issue_url`) }. `now` (ms; tests always pass it) sets the repo-wide window, widened back to `lastScanAt` (ms) when given. `prs` (strings) are pending PRs to read
+ * `issue_url`) }. A repo-wide hit is only a trigger: that PR's whole comment history is read and the newest result is picked
+ * from it, never from the window-limited scan comments. A result is emitted only when its `observed`, truncated to the minute
+ * (the precision of a logged line), is strictly later than the newest logged resolution's: an equal or older one never is. `now` (ms; tests always pass it) sets the repo-wide window, widened back to `lastScanAt` (ms) when given. `prs` (strings) are pending PRs to read
  * per-PR whatever their state; `all` reads every pending PR per-PR.
  * Returns { lines, pending, skipped, unreadable, scanError, scanned, scanUnreadable } (`scanned`: the repo-wide read ran and succeeded; `scanUnreadable`: the PRs it surfaced that could not be read). A PR that cannot be read lands in `unreadable` and the rest
  * carry on; if the repo-wide read itself fails, `scanError` says so and resolved PRs are left unchecked this run.
@@ -185,14 +209,14 @@ export async function closeLines({ logText, gh, now = Date.now(), prs = [], all 
   const readPerPr = (pr) => all || !resolutions.has(pr) || pr === newestPending || named.has(pr);
 
   // One repo-wide read, only when some resolved PR would otherwise go unchecked.
-  const scanned = new Map();
+  const scanned = new Set();
   if (pending.some((pr) => !readPerPr(pr))) {
     try {
       for (const c of await gh.listRepoComments(scanSince(now, { lastScanAt, oldestPendingAt }))) {
         const n = prFromIssueUrl(c?.issue_url);
         if (n === null || !pending.includes(n)) continue;
-        if (!scanned.has(n)) scanned.set(n, []);
-        scanned.get(n).push(c);
+        if (c?.user?.login !== BOT_AUTHOR || parseResultMarkers(c.body).length === 0) continue; // only a bot result can trigger a read
+        scanned.add(n);
       }
       scanOk = true;
     } catch (err) {
@@ -210,11 +234,10 @@ export async function closeLines({ logText, gh, now = Date.now(), prs = [], all 
     try {
       const sha = await gh.mergeSha(pr);
       if (!sha) continue; // not merged (or no merge commit named yet): nothing to close
-      const comments = perPr ? await gh.listComments(pr) : scanned.get(pr);
-      const newest = newestByObserved(resultsFromComments(comments, sha));
+      const newest = newestByObserved(resultsFromComments(await gh.listComments(pr), sha));
       if (!newest) continue;
-      const obs = formatPht(Date.parse(newest.observed));
-      if (lastLogged && lastLogged.host === newest.vercel && lastLogged.outcome === newest.outcome && lastLogged.observed === `${obs.date} ${obs.time}`) continue;
+      const observedAt = Math.floor(Date.parse(newest.observed) / MINUTE_MS) * MINUTE_MS;
+      if (lastLogged && observedAt <= lastLogged.at) continue;
       lines.push(resolutionLine({ pr, result: newest }));
     } catch (err) {
       unreadable.push({ pr, message: oneLine(err) });

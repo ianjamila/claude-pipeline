@@ -14,7 +14,7 @@ import {
   DEFAULT_OUTCOME, appendToQueue, assertSingleLine, buildAgentLogLine, commitLines, landedLines, queuePath, readQueue, resolveLogPath, withQueueLock,
   writeQueue,
 } from '../lib/agentlog.mjs';
-import { closeLines, parseLog, readScanState, writeScanState } from '../lib/agentlog-close.mjs';
+import { closeLines, parseLog, readScanState, unionLogText, writeScanState } from '../lib/agentlog-close.mjs';
 import { loadConfig } from '../lib/config.mjs';
 
 export const meta = {
@@ -27,9 +27,10 @@ export const meta = {
     '  is on the default branch or a detached HEAD, or is not the PR\'s head branch at the PR\'s head commit; exit 3 when GitHub cannot say',
     'pipeline agent-log close [--queue] [--pr N]... [--all] [--repo DIR]   -> {ok, lines, pending, skipped, unreadable, queued?, scanError?}; for every "prod smoke pending" log line reads the',
     '  bot-authored prod-smoke-result comments on that PR (production.watch: workflow) and prints one resolution line per PR whose newest result',
-    '  is not logged yet; one repo-wide read of the comments since the last successful read on this machine (at least 14 days) finds new results on any PR, and a PR is read on its own only when it has no',
+    '  is not logged yet (strictly later than the newest logged one, to the minute); the log read is the worktree log plus the origin/<default> copy; one repo-wide read of the comments since the last successful read on this machine (at least 14 days)',
+    '  finds new results on any PR (a hit only triggers reading the whole comment history of that PR), and a PR is read on its own only when it has no',
     '  resolution line, is the newest pending PR, is named by --pr N (repeatable) or --all is given (a resolved PR the scan did not mention is `skipped`,',
-    '  costing no call); a dry run unless --queue (queues each line like `queue`, a line already queued is not added again; never commits; only --queue advances the scan window); exit 1 when some',
+    '  costing no call); a dry run unless --queue (queues each line like `queue`, a line already queued is not added again; never commits; only --queue advances the scan window, and only when the origin/<default> copy of the log was readable); exit 1 when some',
     '  PRs could not be read (`unreadable`; the lines for the others are still produced and queued: still run `stage` and name them in the summary), 3 when GitHub is',
     '  unavailable (skip the close, still stage)',
   ].join('\n'),
@@ -182,6 +183,12 @@ async function close(rest, ctx) {
   } catch (err) {
     if (err.code !== 'ENOENT') throw err;
   }
+  // The closer reasons over the UNION of this worktree's log and origin/<default>'s copy (fetched best effort): a worktree on an
+  // older branch lacks the lines other PRs merged since. When origin's copy cannot be read the run still closes what it can,
+  // but must not advance the shared scan checkpoint past PRs its own log may lack.
+  const originLines = landedLines(root, { logFile: file, defaultBranch: config.default_branch, fetch: true });
+  const originOk = originLines !== null;
+  if (originOk) logText = unionLogText(logText, [...originLines].join('\n'));
   const gh = createGitHub({ cwd: root, env: ctx.env });
   const github = {
     mergeSha: (n) => gh.prView(n, ['mergeCommit']).mergeCommit?.oid ?? null,
@@ -193,8 +200,8 @@ async function close(rest, ctx) {
     throw new Fail(EXIT.UNAVAILABLE, { ok: false, error: 'unavailable', message: 'GitHub is unavailable (gh is not authenticated or unreachable)' });
   }
   // The scan window covers the whole gap since the last successful scan on this machine. The state moves only once this scan's
-  // results are safely queued (--queue: every append succeeded), the scan was complete and every PR it surfaced was readable;
-  // a dry run, a failed scan or a failed append leaves it alone so the next run re-covers the gap. A failing PR outside the scan
+  // results are safely queued (--queue: every append succeeded), the scan was complete and every PR it surfaced was readable and
+  // origin's copy of the log was readable; a dry run, a failed scan or a failed append leaves it alone so the next run re-covers the gap. A failing PR outside the scan
   // results (an unresolved one) is re-read every run anyway and does not hold the window back.
   const now = Date.now();
   const { lines, pending, skipped, unreadable, scanError, scanned, scanUnreadable } = await closeLines({
@@ -208,7 +215,7 @@ async function close(rest, ctx) {
     const have = new Set(readQueue(root).map((e) => e.line));
     output.queued = lines.filter((l) => !have.has(l)).length; // a line already queued is not added again
     if (lines.length) await queueLines(root, lines);
-    if (scanned && scanUnreadable.length === 0) writeScanState(root, now);
+    if (scanned && scanUnreadable.length === 0 && originOk) writeScanState(root, now);
   }
   return { exitCode: incomplete ? EXIT.FAILED : EXIT.OK, output };
 }
