@@ -234,28 +234,20 @@ export function classifyPr(facts, options) {
 
 // ---- merged PRs whose production watch never finished -----------------------------------------
 
-// Outcomes a prod-watch run ends on. `merged` is NOT one of them: the merge happened, the watch did not finish.
-const TERMINAL_AFTER_MERGE = new Set([
-  'superseded',
-  'recovered',
-  'rollback-failed',
-  'changed-during-recovery',
-  'rollback-skipped',
-  'not-live',
-  'deploy-failed',
-  'deploy-not-observed',
-  'no-production',
-]);
+// Steps that mean the run was inside the merge / production phase when it stopped (outcome is null there).
+// `P summary` writes outcome `merged` only after prod-watch finished, so any ended record, `merged` included,
+// is not stranded; neither is an owner's hand merge from an awaiting-owner-merge record.
+const IN_MERGE_PHASE = new Set(['merge', 'prod-watch']);
 
 export function classifyStranded(merged, now) {
   const out = [];
   for (const m of merged ?? []) {
     const unfinishedRollback = Boolean(m.events?.rollbackIntent) && !m.events?.rollbackResult;
-    const noTerminal = m.record != null && !TERMINAL_AFTER_MERGE.has(m.record.outcome);
-    if (!unfinishedRollback && !noTerminal) continue;
+    const midMerge = m.recordStatus === 'ok' && m.record != null && IN_MERGE_PHASE.has(m.record.step);
+    if (!unfinishedRollback && !midMerge) continue;
     const reason = unfinishedRollback
       ? 'a rollback may have been in progress (rollback-intent without rollback-result)'
-      : `merged, but the production watch never finished (outcome ${m.record.outcome ?? 'none'})`;
+      : `merged, but the run stopped in the ${m.record.step} step before production was confirmed`;
     out.push({
       number: m.number,
       mergedAt: m.mergedAt,

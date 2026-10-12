@@ -490,19 +490,34 @@ const merged = (number, over = {}) => ({
   ...over,
 });
 
-test('stranded: a merged PR whose record has no terminal outcome', () => {
+test('stranded: step prod-watch with no outcome', () => {
   const [s] = classifyStranded([merged(5)], NOW);
   assert.equal(s.number, 5);
   assert.equal(s.nextAction, 'ship resume 5 (observes production; never rolls back)');
   assert.equal(s.mergedAt, ago(2 * DAY));
 });
 
-test('stranded: outcome "merged" is not terminal (prod-watch has not finished)', () => {
-  assert.equal(classifyStranded([merged(5, { record: record({ step: 'merge', outcome: 'merged' }) })], NOW).length, 1);
+test('stranded: step merge with no outcome', () => {
+  assert.equal(classifyStranded([merged(5, { record: record({ step: 'merge', outcome: null }) })], NOW).length, 1);
 });
 
-test('not stranded: every prod-watch outcome is terminal', () => {
-  for (const outcome of ['superseded', 'recovered', 'rollback-failed', 'changed-during-recovery', 'rollback-skipped', 'not-live', 'deploy-failed', 'deploy-not-observed', 'no-production']) {
+test('not stranded: owner merged by hand from an awaiting-owner-merge record', () => {
+  const m = merged(5, { record: record({ step: 'awaiting-owner-merge', outcome: 'awaiting-owner-merge' }) });
+  assert.equal(classifyStranded([m], NOW).length, 0);
+});
+
+test('not stranded: legacy / invalid / unsupported record without a rollback event', () => {
+  for (const recordStatus of ['legacy', 'invalid', 'unsupported']) {
+    assert.equal(classifyStranded([merged(5, { record: null, recordStatus })], NOW).length, 0, recordStatus);
+  }
+});
+
+test('not stranded: a mid-merge record that is not ok (recordStatus gate)', () => {
+  assert.equal(classifyStranded([merged(5, { recordStatus: 'invalid' })], NOW).length, 0);
+});
+
+test('not stranded: merged / ended (prod-watch finished) and every other ended outcome', () => {
+  for (const outcome of ['merged', 'superseded', 'recovered', 'rollback-failed', 'changed-during-recovery', 'rollback-skipped', 'not-live', 'deploy-failed', 'deploy-not-observed', 'no-production']) {
     assert.equal(classifyStranded([merged(5, { record: record({ step: 'ended', outcome }) })], NOW).length, 0, outcome);
   }
 });
