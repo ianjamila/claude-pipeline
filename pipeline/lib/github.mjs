@@ -269,10 +269,11 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     listPrs: ({ label, state = 'open' }) =>
       getJson(['pr', 'list', '--label', label, '--state', state, '--json', 'number,title,headRefName,url', '--limit', '100']),
 
-    // Every issue carrying `label`, open AND closed by default, whatever its page: the follow-up dedupe must also see an
-    // issue someone already closed. The REST list returns pull requests too; they are dropped here.
-    listLabelledIssues({ label, state = 'all' }) {
-      const args = ['api', `repos/${self.repo().slug}/issues?labels=${encodeURIComponent(label)}&state=${encodeURIComponent(state)}&per_page=${PER_PAGE}`, '--paginate'];
+    // Every issue `creator` opened, open AND closed by default, whatever its page and WHATEVER ITS LABELS: the follow-up
+    // dedupe must still see an issue the owner promoted (relabelled agent-suggestion -> agent-build) or closed. This is the
+    // REST list, not the search API, which lags behind a just-created issue. It returns pull requests too; they are dropped.
+    listIssuesByCreator({ creator, state = 'all' }) {
+      const args = ['api', `repos/${self.repo().slug}/issues?creator=${encodeURIComponent(creator)}&state=${encodeURIComponent(state)}&per_page=${PER_PAGE}`, '--paginate'];
       const r = ok(args);
       let list;
       try {

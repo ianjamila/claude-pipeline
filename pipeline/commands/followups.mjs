@@ -93,7 +93,8 @@ export const run = guarded(async (argv, ctx) => {
       const findFiled = (item) => {
         if (known === null) {
           const me = gh.viewer();
-          known = gh.listLabelledIssues({ label: FOLLOWUP_LABEL, state: 'all' }).filter((i) => i.author === me);
+          // By creator, not by label: promoting a suggestion (agent-suggestion -> agent-build) must not hide it from this lookup.
+          known = gh.listIssuesByCreator({ creator: me, state: 'all' }).filter((i) => i.author === me);
         }
         const marker = followupMarker(state.pr, item);
         return known.filter((i) => i.body.startsWith(marker)).sort((a, b) => a.number - b.number);

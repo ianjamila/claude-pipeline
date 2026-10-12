@@ -46,10 +46,10 @@ const standardFindings = () => findingsOf(
   [finding({ title: 'Consider caching', file: 'src/a.js', line: 20, category: 'performance', testable: false })],
 );
 
-// What `followups create` asks before it files anything: who we are and which agent-suggestion issues exist (none).
+// What `followups create` asks before it files anything: who we are and which issues of ours exist (none).
 const NO_ISSUES = [
   { match: '^api user', stdout: 'me\n' },
-  { match: '^api repos/acme/widgets/issues\\?labels=agent-suggestion&state=all&per_page=30 --paginate', stdout: '[]' },
+  { match: '^api repos/acme/widgets/issues\\?creator=me&state=all&per_page=30 --paginate', stdout: '[]' },
 ];
 
 const GH = [
@@ -1097,7 +1097,7 @@ test('a full round: codex -> judge -> arbiter -> implement -> follow-ups -> clea
     gh: [
       ...GH, REMOVE_LABEL,
       { match: '^api -X POST repos/acme/widgets/issues ', stdoutJson: { number: 21, html_url: url } },
-      { match: '^api repos/acme/widgets/issues\\?labels=agent-suggestion&state=all&per_page=30 --paginate', stdout: '[]' },
+      { match: '^api repos/acme/widgets/issues\\?creator=me&state=all&per_page=30 --paginate', stdout: '[]' },
       { match: '^api user', stdout: 'me\n' },
       { match: 'issues/7/comments --paginate', stdoutJson: [] },
       { match: '^api -X POST repos/acme/widgets/issues/7/comments ', stdoutJson: { id: 5, html_url: 'https://github.com/acme/widgets/pull/7#issuecomment-5' } },
@@ -1700,7 +1700,7 @@ test('triage settle: a passing test that dismisses a security item still goes to
 
 // ---- review replay: published state wins (state show --pr, discard-round) ---------------------------------
 
-const ISSUES_URL = '^api repos/acme/widgets/issues\\?labels=agent-suggestion&state=all&per_page=30 --paginate';
+const ISSUES_URL = '^api repos/acme/widgets/issues\\?creator=me&state=all&per_page=30 --paginate';
 const COMMENTS = (...comments) => [
   { match: '^api user', stdout: 'me\n' },
   { match: 'issues/7/comments --paginate', stdoutJson: comments },
@@ -1939,6 +1939,24 @@ test('followups create: several marker issues: the lowest number is canonical, t
   }]);
   assert.equal(posts(w).length, 0);
   assert.ok(!w.fake.lines().some((l) => /PATCH|close|--state/.test(l) && /issues\/(44|52|60)/.test(l)), 'duplicates are never touched');
+});
+
+test('followups create: an issue the owner PROMOTED (agent-suggestion -> agent-build) or relabelled is still found by its marker, never filed twice', (t) => {
+  const marker = FP_ISSUE(followupWorld(t, []));
+  const gh = [...GH, { match: '^api user', stdout: 'me\n' },
+    // GitHub: the label query no longer lists the promoted issue; the creator query does.
+    { match: '^api repos/acme/widgets/issues\\?labels=agent-suggestion&state=all&per_page=30 --paginate', stdoutJson: [] },
+    { match: ISSUES_URL, stdoutJson: [issue(90, `${marker}\nbody`, { labels: [{ name: 'agent-build' }] })] },
+    { match: '^api -X POST repos/acme/widgets/issues ', stdoutJson: { number: 91, html_url: 'https://github.com/acme/widgets/issues/91' } }];
+  const w = world(t, { gh });
+  assertExit(w.codex(1, findingsOf([], [], [finding({ title: 'Idea', category: 'other', testable: false })])), 0);
+  assertExit(w.judge(1, { 'R1-W1': ['FOLLOW-UP'] }), 0);
+  const r = w.cli(['followups', 'create', '--round', '1']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual(r.json.created, []);
+  assert.deepEqual(r.json.reused, [{ id: 'R1-W1', number: 90, url: 'https://github.com/acme/widgets/issues/90' }]);
+  assert.equal(posts(w).length, 0);
+  assert.ok(w.fake.lines().some((l) => /issues\?creator=me/.test(l)));
 });
 
 test('followups create: a marker quoted later in a body, in a foreign-author issue, or for another PR or fingerprint is ignored', (t) => {
