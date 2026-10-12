@@ -154,6 +154,12 @@ const CURL_LONG_VALUE = new Set(['header', 'data', 'data-raw', 'data-binary', 'd
 const CURL_LONG_SWITCH = new Set(['retry-connrefused', 'tlsv1', 'silent', 'show-error', 'location', 'fail', 'insecure', 'head', 'include', 'verbose', 'compressed', 'globoff', 'remote-name', 'remote-name-all', 'remote-header-name', 'create-dirs', 'progress-bar', 'no-progress-meter', 'fail-with-body', 'location-trusted', 'get', 'http1.1', 'http2', 'http3', 'ipv4', 'ipv6', 'no-buffer', 'netrc', 'anyauth', 'basic', 'digest', 'negotiate', 'ntlm', 'tcp-nodelay', 'raw', 'path-as-is', 'show-headers', 'fail-early', 'parallel', 'parallel-immediate', 'no-keepalive', 'junk-session-cookies', 'ssl-reqd', 'ssl', 'tlsv1.2', 'tlsv1.3', 'disable', 'proxy-insecure', 'suppress-connect-headers', 'styled-output', 'xattr', 'remove-on-error', 'skip-existing', 'no-clobber', 'clobber', 'compressed-ssh', 'doh-insecure', 'ignore-content-length']);
 // wget: its options (wget's own table: a boolean takes an optional =VALUE and has a --no- form; a valued one takes the next word). An abbreviation is not resolved: our list may not be the whole of wget's,
 // so an unknown or abbreviated name is unmodelled.
+// the wget options that cannot rename or re-root the file a URL is saved as (the others make it `may write anywhere`)
+const WGET_PLAIN = new Set(['O', 'output-document', 'P', 'directory-prefix', 'o', 'output-file', 'a', 'append-output', 'save-cookies', 'rejected-log', 'hsts-file', 'b', 'background', 'q', 'quiet', 'v', 'verbose', 'c', 'continue', 'S', 'server-response',
+  '4', '6', 'inet4-only', 'inet6-only', 'check-certificate', 'show-progress', 'N', 'timestamping', 'n', 'nc', 'no-clobber', 'clobber', 'T', 'timeout', 't', 'tries', 'w', 'wait', 'waitretry', 'dns-timeout', 'connect-timeout', 'read-timeout', 'limit-rate',
+  'user', 'password', 'http-user', 'http-password', 'header', 'U', 'user-agent', 'referer', 'load-cookies', 'proxy-user', 'proxy-password', 'bind-address', 'secure-protocol', 'certificate', 'certificate-type', 'private-key', 'private-key-type', 'ca-certificate',
+  'ca-directory', 'crl-file', 'ciphers', 'pinnedpubkey', 'max-redirect', 'retry-on-http-error', 'retry-connrefused', 'report-speed', 'progress', 'prefer-family', 'compression', 'post-data', 'post-file', 'method', 'body-data', 'body-file', 'cache', 'cookies', 'keep-session-cookies',
+  'http-keep-alive', 'auth-no-challenge', 'https-only', 'content-on-error', 'dns-cache', 'ignore-length', 'random-wait', 'proxy', 'spider', 'd', 'debug', 'h', 'help', 'V', 'version', 'hsts', 'ask-password', 'directories']);
 const WGET_OPTIONS = {
   exact: true, negate: true, switchEq: true,
   shortVal: 'OPoaetTwQiBlARDIXnUY', shortSwitch: 'bdqvVhrmkKpxLsNcSFEH46',
@@ -206,7 +212,7 @@ function curlRecords(args, idx, env = {}) {
     if (a.length > 1 && a[0] === '-') {
       for (let k = 1; k < a.length; k++) {
         const ch = a[k];
-        if (ch === ':' ) return null;
+        if (ch === ':') { anyOutput = true; continue; } // -: is --next: a new operation group, the output state starts again (any file)
         if (ch === 'O') { remote = true; continue; }
         if (ch === 'J') { remote = true; header = true; continue; }
         if (!CURL_SHORT_VALUE.includes(ch)) continue; // a switch
@@ -327,6 +333,8 @@ export function sortArgsPure(args) {
   const { opts, bad } = getoptStrict(args, SORT_OPTIONS);
   return !bad && !hasOpt(opts, 'o', 'output', 'compress-program');
 }
+// rsync: long options that name files we do not follow (a batch, a backup / link / compare / copy / partial / temp dir, a log, a daemon or config, a file list), an abbreviation counts
+const RSYNC_FILE_OPTIONS = ['backup', 'backup-dir', 'suffix', 'link-dest', 'copy-dest', 'compare-dest', 'partial-dir', 'temp-dir', 'log-file', 'write-batch', 'only-write-batch', 'read-batch', 'daemon', 'config', 'files-from', 'remove-source-files', 'write-devices', 'sparse'];
 const COPY_VALUE = {
   ditto: ['', []], rsync: ['eBMfT', ['rsh', 'exclude', 'include', 'filter', 'exclude-from', 'include-from', 'files-from', 'temp-dir', 'backup-dir', 'suffix']],
 };
@@ -422,7 +430,7 @@ function redirectRecords(cmd, idx) {
 const urlBase = (u) => u.replace(/[?#].*$/, '').replace(/\/+$/, '').split('/').pop();
 
 // The records of the files a command writes by its arguments, or null when it is not a writer we model.
-function argRecords(cmd, name, idx, lineEnv = {}) {
+function argRecords(cmd, name, idx, lineEnv = {}, io = {}) {
   const args = cmd.argv.slice(1);
   const unknown = (dest, extra = {}) => ({ idx, dest, items: UNKNOWN, ...extra });
   if (COPY_STRICT[name] || COPY_VALUE[name] || (name === 'git' && gitSub(args) === 'mv')) {
@@ -437,14 +445,62 @@ function argRecords(cmd, name, idx, lineEnv = {}) {
       const [sv, lv] = mv ? ['', []] : COPY_VALUE[name];
       ({ pos, opts } = getopt(mv ? args.slice(gitSubAt(args) + 1) : args, sv, lv));
     }
+    if (mv) { // git -C d mv a b moves inside d (the words are read there); --work-tree / --git-dir / -c / a repeated -C: not placed
+      const g = gitGlobals(args);
+      if (!g.plain) return orAnywhere([], idx, true);
+      if (g.dir) pos = pos.map((p) => (p.startsWith('/') || p.startsWith('~') ? p : `${g.dir.replace(/\/+$/, '')}/${p}`));
+    }
     if (name === 'install' && hasOpt(opts, 'd', 'directory')) return [];
     const targets = optValues(opts, 't', 'target-directory'); // (a repeated -t: every one)
     let link = name === 'ln' ? (hasOpt(opts, 's', 'symbolic') ? 'sym' : 'hard') : undefined;
     if (name === 'cp') link = hasOpt(opts, 's', 'symbolic-link') ? 'sym' : hasOpt(opts, 'l', 'link') ? 'hard' : undefined; // (cp -s / -l make links, not copies)
-    // Why: --parents puts each source at DEST/<the path as written>, --exchange swaps the two files, --strip-program runs a program: the files written are not DEST / DEST/basename
-    const odd = hasOpt(opts, 'parents', 'exchange', 'strip-program');
-    if (targets.length) return orAnywhere(targets.map((dest) => ({ idx, dest, copy: true, link, items: pos.map((file) => ({ file })) })), idx, odd);
-    if (pos.length >= 2) return orAnywhere([{ idx, dest: pos[pos.length - 1], copy: true, link, items: pos.slice(0, -1).map((file) => ({ file })) }], idx, odd);
+    // Why: --exchange swaps the two files and --strip-program runs a program: the files written are not DEST / DEST/basename. rsync takes many more options that name files (a batch, a backup or link dir, a file list ...)
+    const rsyncOdd = name === 'rsync' && opts.some((o) => (o.name.length === 1 ? 'bT'.includes(o.name) : RSYNC_FILE_OPTIONS.some((n) => n.startsWith(o.name))));
+    const odd = hasOpt(opts, 'exchange', 'strip-program') || rsyncOdd || (name === 'rsync' && Object.keys({ ...cmd.env, ...lineEnv }).some((k) => /^RSYNC_/.test(k)));
+    // Why: cp --parents / rsync -R put each source at DEST/<the path as written> (rsync keeps only what follows a `/./` marker): the source's own path below DEST, as a copy of it. rsync's plain form is kept too (--no-relative may follow)
+    const parents = name === 'cp' && hasOpt(opts, 'parents');
+    const relative = name === 'rsync' && opts.some((o) => o.name === 'R' || (o.name.length >= 3 && 'relative'.startsWith(o.name)));
+    const build = (dest, srcs) => {
+      const out = [];
+      if (!parents) out.push({ idx, dest, copy: true, link, items: srcs.map((file) => ({ file })) });
+      if (parents || relative) {
+        for (const src of srcs) {
+          if (src.includes('/./')) { out.push(anywhere(idx)); out.unmodelled = true; continue; }
+          out.push({ idx, dest: `${dest.replace(/\/+$/, '')}/${src.replace(/^\/+/, '')}`, copy: true, link, items: [{ file: src }] });
+        }
+      }
+      return out;
+    };
+    // Why: -b / --backup[=CONTROL] / -S / --suffix (install -B), or SIMPLE_BACKUP_SUFFIX / VERSION_CONTROL in the command's or the line's environment: the file replaced is first moved / copied to DEST + suffix (`~`, install .old,
+    // numbered `.~N~`) and so holds DEST's OLD text (`cp -b -S .sh ok.txt n; bash n.sh` runs n's old text); a suffix only known at run time may be anything
+    const backups = (dests, srcs) => {
+      if (name === 'rsync' || name === 'ditto') return [];
+      const envOf = (k) => (cmd.env && Object.hasOwn(cmd.env, k) ? cmd.env[k] : Object.hasOwn(lineEnv, k) ? null : undefined); // (undefined: not set, null: set, value not known)
+      const sufEnv = envOf('SIMPLE_BACKUP_SUFFIX');
+      const ctlEnv = envOf('VERSION_CONTROL');
+      if (!hasOpt(opts, 'b', 'backup', 'S', 'suffix', 'B') && sufEnv === undefined && ctlEnv === undefined) return [];
+      const ctlOpt = optValue(opts, 'backup');
+      const control = ctlOpt !== null && ctlOpt !== '' ? ctlOpt : ctlEnv === undefined ? '' : ctlEnv;
+      if (control !== null && /^(?:none|off)$/.test(control)) return [];
+      const numbered = control === null || /^(?:t|numbered|existing|nil|)$/.test(control) || !/^(?:simple|never)$/.test(control);
+      const simple = control === null || !/^(?:t|numbered)$/.test(control);
+      const sufs = [...optValues(opts, 'S', 'suffix', 'B')];
+      if (!sufs.length) { if (sufEnv === null) return [anywhere(idx)]; sufs.push(sufEnv !== undefined ? sufEnv : '~'); if (name === 'install' && sufEnv === undefined) sufs.push('.old'); }
+      if (sufs.some((x) => /[$`*?[{]/.test(x))) return [anywhere(idx)]; // (a suffix only known at run time may be anything: /../ok.sh)
+      const bases = srcs.map((src) => src.replace(/\/+$/, '').split('/').pop());
+      if (bases.some((b) => /[$`*?[{]/.test(b))) return [anywhere(idx)];
+      const out = [];
+      for (const d of dests) {
+        const olds = [d, ...bases.map((b) => `${d.replace(/\/+$/, '')}/${b}`)];
+        for (const old of olds) {
+          if (simple) for (const suf of sufs) out.push({ idx, dest: old + suf, items: [{ file: old }] });
+          if (numbered) out.push({ idx, dest: `${old}.~[0-9]*~`, items: [{ file: old }] });
+        }
+      }
+      return out;
+    };
+    if (targets.length) { const r = targets.flatMap((dest) => build(dest, pos)); r.push(...backups(targets, pos)); return orAnywhere(r, idx, odd); }
+    if (pos.length >= 2) { const r = build(pos[pos.length - 1], pos.slice(0, -1)); r.push(...backups([pos[pos.length - 1]], pos.slice(0, -1))); return orAnywhere(r, idx, odd); }
     if (name === 'ln' && pos.length === 1) return [{ idx, dest: '.', copy: true, link, items: pos.map((file) => ({ file })) }];
     return null; // too few operands to place the copy (a usage error to the shell, but not one we may rely on)
   }
@@ -500,26 +556,42 @@ function argRecords(cmd, name, idx, lineEnv = {}) {
   if (name === 'curl') return curlRecords(args, idx, { ...cmd.env, ...lineEnv });
   if (name === 'wget') {
     const { pos, opts, bad } = getoptStrict(args, WGET_OPTIONS);
-    if (bad) return null; // (an option we do not know, or abbreviate: the output file may be named by it)
+    if (bad) return orAnywhere([], idx, true); // (an option we do not know, or abbreviate: the output file may be named by it)
+    let odd2 = false;
     const out = [];
     const os = optValues(opts, 'O', 'output-document');
     const dir = optValue(opts, 'P', 'directory-prefix') ?? '';
+    // Why: the file is the one the URL says only when every option is one that cannot rename or re-root it (an ALLOWLIST: -e / --config / -i / -B / -E / --content-disposition / --restrict-file-names / --default-page /
+    // --metalink-* / --preferred-location / encodings / iri / a recursive run ... are not on it); a startup file (WGETRC ...) can name anything
     const noDirs = opts.some((o) => (o.name === 'n' && o.value === 'd') || (o.name === 'directories' && o.negated));
     const recursive = hasOpt(opts, 'r', 'recursive', 'm', 'mirror', 'p', 'page-requisites');
-    // Why: a startup file (-e, --config, WGETRC), a name taken from the response / a list / a base (--content-disposition, -i, -B), a renamed (-E, --backups) or re-rooted (-x, --protocol-directories, a
-    // recursive run) file, a WARC archive: the file written is not the one the URL says
-    const odd = hasOpt(opts, 'e', 'execute', 'config', 'warc-file', 'E', 'adjust-extension', 'backups', 'x', 'force-directories', 'protocol-directories', 'B', 'base', 'i', 'input-file', 'input-metalink', 'content-disposition', 'trust-server-names', 'restrict-file-names', 'local-encoding', 'remote-encoding', 'iri')
-      || (recursive && !noDirs) || Object.keys({ ...cmd.env, ...lineEnv }).some((k) => RC_ENV.test(k));
+    const odd = opts.some((o) => !WGET_PLAIN.has(o.name) && !(noDirs && ['r', 'recursive', 'm', 'mirror', 'p', 'page-requisites'].includes(o.name))) || (recursive && !noDirs) || Object.keys({ ...cmd.env, ...lineEnv }).some((k) => RC_ENV.test(k));
     for (const lf of [...optValues(opts, 'o', 'output-file'), ...optValues(opts, 'a', 'append-output'), ...optValues(opts, 'save-cookies'), ...optValues(opts, 'rejected-log'), ...optValues(opts, 'hsts-file')]) if (lf) out.push(unknown(lf));
+    if (hasOpt(opts, 'b', 'background') && !hasOpt(opts, 'o', 'output-file', 'a', 'append-output')) out.push(unknown('wget-log')); // (-b logs to wget-log)
+    const inDir = (n) => (dir ? `${dir.replace(/\/+$/, '')}/${n}` : n);
     if (os.length) for (const o of os) out.push(unknown(o));
-    else for (const u of pos) out.push(unknown(dir ? `${dir.replace(/\/+$/, '')}/${urlBase(u) || 'index.html'}` : urlBase(u) || 'index.html'));
-    if (recursive) out.push(unknown(dir || '.', { subtree: true }));
-    return orAnywhere(out, idx, odd);
+    else {
+      // Why: a URL names the file by its last path segment (a query stays in the name, %XX is decoded); an empty segment (index.html / --default-page) is not a name we can read; an existing file is kept and the new one is `name.1`, `name.2` ...
+      const clobberSafe = hasOpt(opts, 'nc', 'no-clobber', 'N', 'timestamping') || args.some((a) => /^-[A-Za-z]*nc/.test(a));
+      for (const u of pos) {
+        const noFrag = u.replace(/#.*$/, '');
+        const last = noFrag.endsWith('/') ? '' : noFrag.split('/').pop();
+        if (!last || last.startsWith('?')) { out.push(unknown(dir || '.', { subtree: true })); odd2 = true; continue; }
+        const names = new Set([urlBase(u), last]);
+        try { names.add(decodeURIComponent(last)); names.add(decodeURIComponent(urlBase(u))); } catch { names.add(last); }
+        for (const n of names) { if (!n) continue; out.push(unknown(inDir(n))); if (!clobberSafe) out.push(unknown(inDir(`${n}.[0-9]*`))); }
+      }
+    }
+    if (recursive) out.push(unknown(dir || '.', { subtree: true })); // (no directories: every file lands in the one directory)
+    return orAnywhere(out, idx, odd || odd2);
   }
   if (AWK_NAMES.has(name)) { // gawk -i inplace: every file operand is edited in place
-    const r = awkScan(args, { ...cmd.env, ...lineEnv });
-    if (!r.inPlace) return null;
-    return Object.assign(r.files.map((dest) => unknown(dest, { edit: true })), r.other ? { unmodelled: true } : {});
+    const r = awkScan(args, { ...cmd.env, ...lineEnv }, io.readProgram);
+    if (!r.inPlace && !r.writes) return null;
+    const out = r.inPlace ? r.files.map((dest) => unknown(dest, { edit: true })) : [];
+    // Why: a program that writes (> >> | system(...)) is an inline-program writer like node -e: one that names the script is judged by its text; any other may still compute a file name (print > f), so it is a loose write of unknown content too
+    if (r.writes) { const text = [...r.programs, ...args, ...Object.values(cmd.env ?? {})].join(' '); out.push({ idx, dest: null, inline: text, awk: true, items: [{ program: text }], loose: true }, anywhere(idx)); }
+    return Object.assign(out, r.other || r.writes ? { unmodelled: true } : {});
   }
   if (name === 'sed' || name === 'gsed' || name === 'perl' || name === 'ruby') {
     const isSed = name === 'sed' || name === 'gsed';
@@ -553,34 +625,38 @@ function argRecords(cmd, name, idx, lineEnv = {}) {
   }
   if (name === 'git') {
     // global options, then the subcommand
-    let i = 0;
-    let dir = null;
-    while (i < args.length && args[i].startsWith('-')) {
-      if (args[i] === '-C') { dir = args[i + 1] ?? null; i += 2; } else if (['-c', '--git-dir', '--work-tree', '--namespace', '--exec-path'].includes(args[i])) i += 2; else i++;
-    }
-    const sub = args[i];
-    const rest = args.slice(i + 1);
+    const g = gitGlobals(args);
+    const dir = g.dir;
+    const sub = args[g.at];
+    const rest = args.slice(g.at + 1);
     const at = (p) => (dir && !p.startsWith('/') && !p.startsWith('~') ? `${dir.replace(/\/+$/, '')}/${p}` : p);
+    // Why: --work-tree / --git-dir / -c (core.worktree, clone.*) / a repeated -C move where a subcommand writes: only a lone `-C DIR` (read here) or no global option at all leaves the place a name can be compared with
+    const placed = g.plain;
     if (sub === 'checkout' || sub === 'restore' || sub === 'checkout-index') {
       const { pos } = getopt(rest, sub === 'checkout' ? 'bB' : 'sS', ['source', 'orphan', 'conflict', 'pathspec-from-file']);
-      return pos.map((p) => unknown(at(p)));
+      return orAnywhere(pos.map((p) => unknown(at(p))), idx, !placed);
     }
     if (sub === 'clone') {
-      // Why: `narrow` (only scripts below the directory) is right only when the directory is the word git takes: one unlisted value option shifts the operands. Else the clone may write anywhere
+      // Why: `narrow` (only scripts below the directory) is right only when the directory is the word git takes: one unlisted value option shifts the operands, a global option moves the base. Else the clone may write anywhere
       const { pos, bad } = getoptStrict(rest, GIT_CLONE_OPTIONS);
-      const exact = !bad && pos.length >= 1 && pos.length <= 2;
+      const exact = !bad && pos.length >= 1 && pos.length <= 2 && placed;
       const d = pos[1] ?? (pos[0] ? urlBase(pos[0]).replace(/\.git$/, '') : '.');
       return orAnywhere([unknown(at(d), { subtree: true, narrow: exact })], idx, !exact);
     }
-    if (GIT_OUTPUT.has(sub)) { // git diff --output=F, git log --output=F, git archive -o F, git format-patch -o DIR
+    if (GIT_OUTPUT.has(sub)) { // git diff --output=F, git log --output=F (also --out=F: a prefix), git archive -o F, git format-patch -o DIR
       const { opts } = getopt(rest, 'o', ['output', 'output-directory']);
-      const out = optValue(opts, 'o', 'output', 'output-directory');
-      if (out === null) return null;
-      return [unknown(at(out), { subtree: sub === 'format-patch' })];
+      const out = [...optValues(opts, 'o', 'output', 'output-directory')];
+      for (let k = 0; k < rest.length; k++) { // (a long option that is a prefix of --output / --output-directory: git takes a unique one)
+        const a = rest[k];
+        if (!a.startsWith('--') || !prefixOfAny(a, ['output', 'output-directory'])) continue;
+        if (a.includes('=')) out.push(a.slice(a.indexOf('=') + 1)); else if (rest[k + 1] !== undefined) out.push(rest[k + 1]);
+      }
+      if (!out.length) return null;
+      return orAnywhere([...new Set(out)].map((o) => unknown(at(o), { subtree: sub === 'format-patch' })), idx, !placed);
     }
     if (sub === 'worktree' && rest[0] === 'add') {
       const { pos, bad } = getoptStrict(rest.slice(1), GIT_WORKTREE_ADD_OPTIONS);
-      const exact = !bad && pos.length >= 1 && pos.length <= 2; // (<path> [<commit-ish>])
+      const exact = !bad && pos.length >= 1 && pos.length <= 2 && placed; // (<path> [<commit-ish>])
       return orAnywhere(pos[0] ? [unknown(at(pos[0]), { subtree: true, narrow: exact })] : [], idx, !exact);
     }
     return null;
@@ -593,13 +669,90 @@ function argRecords(cmd, name, idx, lineEnv = {}) {
 }
 
 // Is the command read-only as far as creating or replacing a script file goes? (A command that is not may have created ANY file.)
-// The index of the git subcommand among `args` (after the global options and their values)
-function gitSubAt(args) {
+// git's global options, read the way git does: `-C DIR`, `-c K=V`, `--git-dir X` / `--git-dir=X` take a value (the next word only without `=`); the rest are switches.
+// `at`: the index of the subcommand, `dir`: the last -C, `nC`: how many -C, `plain`: only options that cannot change what a subcommand writes or runs (-C aside)
+const GIT_GLOBAL_VALUE = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env', '--attr-source', '--super-prefix']);
+const GIT_GLOBAL_PLAIN = new Set(['--no-pager', '-P', '--no-optional-locks', '--literal-pathspecs', '--glob-pathspecs', '--noglob-pathspecs', '--icase-pathspecs', '--no-replace-objects', '--no-lazy-fetch', '--no-advice', '--bare', '--version']);
+function gitGlobals(args) {
   let i = 0;
-  while (i < args.length && args[i].startsWith('-')) i += ['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path'].includes(args[i]) ? 2 : 1;
-  return i;
+  let dir = null;
+  let nC = 0;
+  let plain = true;
+  let readOk = true; // only options that merely choose which repository is read (no program, config or pager)
+  while (i < args.length && args[i].startsWith('-')) {
+    const a = args[i];
+    if (GIT_GLOBAL_VALUE.has(a)) { if (a === '-C') { dir = args[i + 1] ?? null; nC++; } else { plain = false; if (!['--git-dir', '--work-tree', '--namespace'].includes(a)) readOk = false; } i += 2; continue; }
+    // Why: `--git-dir=X` is one word (skipping a second would swallow the subcommand), `--exec-path[=P]` never takes the next word
+    if (!GIT_GLOBAL_PLAIN.has(a)) { plain = false; if (!/^--(?:git-dir|work-tree|namespace)=/.test(a)) readOk = false; }
+    i++;
+  }
+  return { at: i, dir, nC, plain: plain && nC <= 1, readOk };
 }
+const gitSubAt = (args) => gitGlobals(args).at;
 const gitSub = (args) => args[gitSubAt(args)];
+
+// Purity is an ALLOWLIST of read-only shapes (anything else may write a file, run a pager / hook / alias, or change the tree): `format-patch`, `bundle`, `archive -o`, `worktree add`, `stash push`, `am`,
+// `apply`, `notes`, any `-c` / `--config-env` / `--exec-path` / `-p`, an alias (`git x` for an x that is no builtin) are none of them. A prefix of a long option counts (git takes a unique one: --out=F is --output=F).
+const prefixOfAny = (a, names) => { if (!a.startsWith('--')) return false; const nm = a.slice(2).split('=')[0]; return nm !== '' && names.some((n) => n.startsWith(nm)); };
+const GIT_PLAIN_READ = new Set(['status', 'rev-parse', 'ls-files', 'ls-tree', 'cat-file', 'blame', 'annotate', 'describe', 'merge-base', 'for-each-ref', 'show-ref', 'name-rev', 'rev-list', 'count-objects', 'show-branch', 'check-ignore', 'check-attr', 'var', 'version', 'ls-remote', 'cherry', 'verify-commit', 'verify-tag', 'fsck-objects', 'get-tar-commit-id', 'merge-tree', 'diff-index', 'diff-files']);
+const GIT_DIFFLIKE = new Set(['diff', 'log', 'show', 'shortlog', 'whatchanged', 'diff-tree', 'range-diff']);
+const GIT_ENV_RISK = /^(?:GIT_(?:CONFIG\w*|EXTERNAL_DIFF|PAGER|EXEC_PATH|SSH\w*|PROXY_COMMAND|ASKPASS|EDITOR|SEQUENCE_EDITOR|TEMPLATE_DIR|ALTERNATE_OBJECT_DIRECTORIES|DIR|WORK_TREE|OBJECT_DIRECTORY|INDEX_FILE|TRACE\w*)|PAGER|EDITOR|VISUAL|SSH_ASKPASS)$/;
+function gitPure(args, envKeys = []) {
+  if (envKeys.some((k) => GIT_ENV_RISK.test(k))) return false;
+  const g = gitGlobals(args);
+  if (!g.readOk) return false;
+  const sub = args[g.at];
+  const rest = args.slice(g.at + 1);
+  if (sub === undefined) return true;
+  const dashed = rest.filter((a) => a.startsWith('-'));
+  const pos = rest.filter((a) => !a.startsWith('-'));
+  if (GIT_PLAIN_READ.has(sub)) return !rest.some((a) => prefixOfAny(a, ['output', 'output-directory', 'ext-diff', 'textconv']) || (a === '-o' && sub !== 'ls-files'));
+  if (GIT_DIFFLIKE.has(sub)) return !rest.some((a) => prefixOfAny(a, ['output', 'output-directory', 'ext-diff', 'textconv']) || /^-[a-z0-9]*o/.test(a));
+  if (sub === 'grep') return !rest.some((a) => /^-O/.test(a) || prefixOfAny(a, ['open-files-in-pager']));
+  if (sub === 'branch') {
+    if (dashed.some((a) => (!a.startsWith('--') && /[dDmMcCfutT]/.test(a.slice(1))) || /^--(?:delete|move|copy|force|set-upstream|set-upstream-to|unset-upstream|edit-description|track|no-track|create-reflog)/.test(a))) return false;
+    return !pos.length || dashed.some((a) => a === '-l' || a === '--list');
+  }
+  if (sub === 'tag') {
+    if (dashed.some((a) => /^--(?:delete|annotate|sign|force|file|message|local-user|cleanup|create-reflog|verify)/.test(a) || (!a.startsWith('--') && /[adsfmFuv]/.test(a.slice(1))))) return false;
+    return !pos.length || dashed.some((a) => a === '-l' || a === '--list');
+  }
+  if (sub === 'remote') return (!pos.length && dashed.every((a) => a === '-v' || a === '--verbose')) || ['show', 'get-url'].includes(pos[0]);
+  if (sub === 'config') {
+    if (!dashed.some((a) => ['--get', '--get-all', '--get-regexp', '--get-urlmatch', '--list', '-l'].includes(a))) return false;
+    return dashed.every((a) => /^(?:--get(?:-all|-regexp|-urlmatch)?|--list|-l|--show-origin|--show-scope|--global|--local|--system|--worktree|--null|-z|--name-only|--bool|--int|--path|--bool-or-int|--expiry-date|--includes|--no-includes|--fixed-value|--type=\S*|--default=\S*|--file=\S*|--blob=\S*|--)$/.test(a));
+  }
+  if (sub === 'symbolic-ref') return !dashed.some((a) => /^(?:-d|-m|--delete)$/.test(a)) && pos.length <= 1;
+  if (sub === 'worktree') return pos[0] === 'list';
+  if (sub === 'stash') return pos[0] === 'list' || pos[0] === 'show';
+  if (sub === 'reflog') return !pos.length || pos[0] === 'show' || pos[0] === 'exists';
+  return false;
+}
+
+// gh: read subcommands only. A download / checkout / clone / alias / extension / config / an unknown subcommand (a user alias runs anything) writes files or runs a program; `--web` starts a browser; `api` only as a GET.
+const GH_READ = { pr: ['view', 'list', 'checks', 'diff', 'status'], issue: ['view', 'list', 'status'], run: ['view', 'list', 'watch'], release: ['view', 'list'], repo: ['view', 'list'], workflow: ['view', 'list'], label: ['list'], auth: ['status'], search: ['prs', 'issues', 'repos', 'commits', 'code'], status: [], variable: ['list', 'get'], secret: ['list'], ruleset: ['list', 'view', 'check'], cache: ['list'], gist: ['list', 'view'], project: ['list', 'view'] };
+const GH_ENV_RISK = /^(?:GH_(?:PAGER|BROWSER|EDITOR|CONFIG_DIR|PATH|DEBUG|[A-Z_]*EXTENSION\w*)|PAGER|BROWSER|EDITOR|VISUAL)$/;
+function ghPure(args, envKeys = []) {
+  if (envKeys.some((k) => GH_ENV_RISK.test(k))) return false;
+  let i = 0;
+  while (i < args.length && args[i].startsWith('-')) { if (args[i] !== '--version') return false; i++; }
+  const sub = args[i];
+  const rest = args.slice(i + 1);
+  if (sub === undefined || sub === 'version') return true;
+  if (rest.some((a) => a === '-w' || a === '--web' || /^--(?:web|editor)\b/.test(a))) return false;
+  if (sub === 'api') {
+    for (let k = 0; k < rest.length; k++) {
+      const a = rest[k];
+      if (a === '-X' || a === '--method') { if (!/^get$/i.test(rest[k + 1] ?? '')) return false; k++; } else if (/^-X./.test(a)) { if (!/^-XGET$/i.test(a)) return false; } else if (/^--method=/.test(a)) { if (!/^--method=get$/i.test(a)) return false; } else if (a === '--input' || a.startsWith('--input=') || /^-[a-zA-Z]*[fF]/.test(a) && !a.startsWith('--') || /^--(?:field|raw-field)\b/.test(a)) return false;
+    }
+    return true;
+  }
+  const subs = GH_READ[sub];
+  if (!subs) return false;
+  if (!subs.length) return true;
+  const verb = rest.find((a) => !a.startsWith('-'));
+  return subs.includes(verb);
+}
 
 // Builtins and tools that never write a file by their own arguments (a redirect is a separate write); every other command on PURE is also checked for
 // an output-like option below.
@@ -818,16 +971,19 @@ const AWK_PROGRAM_CODE = /[>|]|\bsystem\s*\(|@(?:include|load|namespace)\b/;
 // line writes): every include is still an in-place edit of the operands, but also code we cannot place (`other`: unmodelled). AWKPATH / AWKLIBPATH set: the same.
 const AWK_INPLACE_INCLUDE = /@include\s*(["'])inplace(?:\.awk)?\1/g;
 const isInplaceLib = (v) => /^inplace(?:\.awk)?$/.test(v);
-function awkScan(args, env = {}) {
-  const r = { impure: false, other: false, inPlace: false, files: [] };
+function awkScan(args, env = {}, read = null) {
+  const r = { impure: false, other: false, inPlace: false, writes: false, programs: [], files: [] };
   const libPath = Object.keys(env ?? {}).some((k) => /^AWK(?:LIB)?PATH$/.test(k));
   const pos = [];
   let progOpt = false;
   const bad = () => { r.impure = true; r.other = true; };
   const program = (t) => {
+    r.programs.push(t);
     const stripped = t.replace(AWK_INPLACE_INCLUDE, () => { r.inPlace = true; bad(); return ''; });
-    if (AWK_PROGRAM_CODE.test(stripped)) bad();
+    if (AWK_PROGRAM_CODE.test(stripped)) { if (/[>|]|\bsystem\s*\(/.test(stripped)) r.writes = true; bad(); }
   };
+  // Why: a program FILE (-f / -E / --file / --exec) is scanned like the program text when it can be read; unreadable (or no reader: the caller cannot place it) = not pure
+  const programFile = (w) => { const texts = read ? read(w) : null; if (texts === null || texts === undefined) bad(); else for (const t of texts) program(t); };
   const all = Object.values(AWK_LONG).flat();
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -839,7 +995,7 @@ function awkScan(args, env = {}) {
       if (full === null) { bad(); continue; }
       const val = () => (eq > 0 ? a.slice(eq + 1) : (args[++i] ?? ''));
       if (AWK_LONG.value.includes(full)) val();
-      else if (full === 'source') { progOpt = true; program(val()); } else if (full === 'include') { if (isInplaceLib(val())) r.inPlace = true; bad(); } else if (AWK_LONG.code.includes(full)) { progOpt = true; val(); bad(); } else if (AWK_LONG.optional.includes(full)) bad();
+      else if (full === 'source') { progOpt = true; program(val()); } else if (full === 'include') { if (isInplaceLib(val())) r.inPlace = true; bad(); } else if (AWK_LONG.code.includes(full)) { progOpt = true; if (full === 'load') { val(); bad(); } else programFile(val()); } else if (AWK_LONG.optional.includes(full)) bad();
       else if (eq > 0 && !['lint', 'optimize'].includes(full)) bad(); // (a switch given a value: not a form we know)
       continue;
     }
@@ -851,7 +1007,7 @@ function awkScan(args, env = {}) {
         if (ch === 'F' || ch === 'v') { val(); break; }
         if (ch === 'e') { progOpt = true; program(val()); break; }
         if (ch === 'i') { if (isInplaceLib(val())) r.inPlace = true; bad(); break; }
-        if (ch === 'f' || ch === 'E') { progOpt = true; val(); bad(); break; }
+        if (ch === 'f' || ch === 'E') { progOpt = true; programFile(val()); break; }
         if ('lW'.includes(ch)) { val(); bad(); break; }
         if (!'bcCMnNOPrsStVh'.includes(ch)) { bad(); break; } // (-d -D -o -p -g -L write or run, and so does anything we do not know)
       }
@@ -863,18 +1019,15 @@ function awkScan(args, env = {}) {
   if (libPath) bad();
   return r;
 }
-export const awkArgsPure = (args, env = {}) => !awkScan(args, env).impure;
+export const awkArgsPure = (args, env = {}, read = null) => !awkScan(args, env, read).impure;
 
-function isPure(cmd, name, lineEnv = {}) {
+function isPure(cmd, name, lineEnv = {}, io = {}) {
   const args = cmd.argv.slice(1);
   if (!cmd.argv.length) return true; // a bare assignment / redirect
-  if (name === 'git') {
-    const sub = gitSub(args);
-    return !GIT_TREE.has(sub) && !args.some((a) => OUTPUT_LONG.test(a) || a === '-o');
-  }
-  if (name === 'gh') return !args.some((a) => /^(?:download|checkout|clone)$/.test(a) || OUTPUT_LONG.test(a));
+  if (name === 'git') return gitPure(args, [...Object.keys(cmd.env ?? {}), ...Object.keys(lineEnv)]);
+  if (name === 'gh') return ghPure(args, [...Object.keys(cmd.env ?? {}), ...Object.keys(lineEnv)]);
   if (name === 'sed' || name === 'gsed') return !args.some((a) => sedInPlaceArg(a) || OUTPUT_LONG.test(a)) && !sedArgsUnsafe(args);
-  if (AWK_NAMES.has(name)) return awkArgsPure(args, { ...cmd.env, ...lineEnv });
+  if (AWK_NAMES.has(name)) return awkArgsPure(args, { ...cmd.env, ...lineEnv }, io.readProgram);
   if (name === 'find') return !args.some((a) => /^-(?:delete|exec|execdir|ok|okdir|fprint0?|fprintf|fls)$/.test(a));
   if (name === 'xxd') return !args.includes('-r') && args.filter((a) => !a.startsWith('-')).length <= 1;
   if (name === 'uniq') { const { pos, bad } = getoptStrict(args, UNIQ_OPTIONS); return !bad && pos.length <= 1; }
@@ -886,8 +1039,44 @@ function isPure(cmd, name, lineEnv = {}) {
   return !args.some((a) => OUTPUT_LONG.test(a) || (!SHORT_O_OK.has(name) && /^-[A-Za-z]*[oO]/.test(a)) || a === '-i' || a === '--in-place');
 }
 
+// A command that is not provably pure and whose arguments name the script (path, basename, a directory above it, a glob / variable that may match it) may have written it: every other word of its arguments that
+// is a file is a possible source of the text, and the text may be anything. Not for: the command's own script operand (`node t.mjs a` runs t.mjs), read-only tools. A command that does not name the script
+// is the old residual (`make; bash ok.sh`): only a script that is missing now counts as maybe-created.
+const INTERPRETER = /^(?:bash|sh|zsh|dash|ksh|ash|fish|csh|tcsh|source|\.|node|nodejs|deno|bun|tsx|ts-node|python[\d.]*|ruby|perl|php|pwsh|powershell|exec)$/;
+const READ_ONLY_TOOLS = new Set(['shellcheck', 'od', 'strings', 'nl', 'fold', 'fmt', 'rev', 'comm', 'column', 'expand', 'unexpand', 'pr', 'zcat', 'gzcat', 'xzcat', 'bzcat', 'cksum', 'sum', 'b2sum', 'sha224sum', 'sha384sum', 'sha512sum', 'nm', 'otool', 'ldd', 'objdump']);
+function genericRecord(cmd, name, idx) {
+  if (READ_ONLY_TOOLS.has(name)) return null;
+  const exempt = new Set();
+  cmd.argv.forEach((w, j) => { // the first operand after an interpreter is the script it runs, which it does not write
+    if (!INTERPRETER.test(commandName(w))) return;
+    for (let k = j + 1; k < cmd.argv.length; k++) if (!cmd.argv[k].startsWith('-')) { exempt.add(k); break; }
+  });
+  const words = new Set();
+  const add = (w) => { if (w !== '' && !w.startsWith('-')) words.add(w); };
+  cmd.argv.slice(1).filter((_, k) => !exempt.has(k + 1)).forEach((w) => { // (the arguments only: a prefix assignment such as BASH_ENV=rc is the shell's startup file, judged on its own)
+    const eq = w.indexOf('=');
+    if (eq > 0) add(w.slice(eq + 1)); // (--out=F, of=F, NAME=F)
+    add(w);
+  });
+  if (!words.size) return null;
+  const list = [...words];
+  return { idx, dest: null, generic: list, items: [{ unknown: true }, ...list.map((file) => ({ file }))], loose: true };
+}
+// does any word of the generic record name the script P (as it is, a directory above it, or a pattern that may match it)?
+function namesScript(f, rec, P) {
+  for (const w of rec.generic) {
+    const e = f.expand(w);
+    if (e === null) { if (dynamicMayBe(f, w, P)) return true; continue; }
+    for (const d of f.locate(e, rec.idx)) {
+      if (!f.isAbs(d)) { if (mayBeBelow(f, d, P)) return true; continue; } // (the directory is unknown: its names in a row)
+      if (same(f, d, P) || below(f, P, d) !== null) return true;
+    }
+  }
+  return false;
+}
+
 // The writes of a line: { recs, unmodelled }. `unmodelled` is the set of command indexes that may have created any file.
-export function writesOf(cmds) {
+export function writesOf(cmds, io = {}) {
   const recs = [];
   const unmodelled = new Set();
   // Why: `export WGETRC=w.rc; wget URL`, `CURL_HOME=d; export CURL_HOME; curl URL`, `declare -x HOME=d; ...`, `export AWKPATH=d; awk -i inplace ...`: a variable set or exported by ANY command of the line may be in a later command's environment
@@ -900,7 +1089,8 @@ export function writesOf(cmds) {
     recs.push(...redirectRecords(cmd, idx));
     if (!cmd.argv.length) return;
     const name = commandName(cmd.argv[0]);
-    const mine = argRecords(cmd, name, idx, lineEnv);
+    const here = { readProgram: io.readProgram ? (word) => io.readProgram(word, idx) : null }; // (an awk program file is read where this command runs)
+    const mine = argRecords(cmd, name, idx, lineEnv, here);
     if (mine) recs.push(...mine);
     const inline = INLINE_RUNNERS[name];
     if (inline) {
@@ -912,7 +1102,8 @@ export function writesOf(cmds) {
     }
     // a program the parser does not unwrap (strace, chroot, nsenter, a wrapper we have never seen) that is handed a writer: the writer's own writes, and a write to
     // any file (the wrapper may have changed the directory or the root) with unknown content
-    if (!mine && !isPure(cmd, name, lineEnv)) {
+    if (!mine && !isPure(cmd, name, lineEnv, here)) {
+      if (!INLINE_RUNNERS[name] || cmd.argv.findIndex((a, i) => i > 0 && INLINE_RUNNERS[name].test(a)) <= 0) { const g = genericRecord(cmd, name, idx); if (g) recs.push(g); }
       const at = cmd.argv.findIndex((w, i) => i > 0 && WRITER_NAMES.has(commandName(w)));
       if (at > 0) {
         const inner = { ...cmd, argv: cmd.argv.slice(at) };
@@ -925,7 +1116,7 @@ export function writesOf(cmds) {
     if ((name === 'sed' || name === 'gsed') && (sedPrograms(cmd.argv.slice(1)).file || sedPrograms(cmd.argv.slice(1)).progs.some((p) => sedScan(p).runs))) unmodelled.add(idx);
     const sub = name === 'git' ? gitSub(cmd.argv.slice(1)) : '';
     const modelled = mine && !mine.unmodelled && !(name === 'git' && GIT_TREE.has(sub) && !['clone', 'worktree', 'mv'].includes(sub));
-    if (!modelled && !isPure(cmd, name, lineEnv)) unmodelled.add(idx);
+    if (!modelled && !isPure(cmd, name, lineEnv, here)) unmodelled.add(idx);
   });
   return { recs, unmodelled };
 }
@@ -958,8 +1149,17 @@ function visible(frame, at, idx) {
 // - locate(expanded, idx): the paths the word may name for the command at idx: absolute ones, or the word itself when the directory is unknown
 // - isAbs(path), p: the policy's path functions (node:path or node:path.posix), ci: compare names ignoring case
 // - real(path): the path with symlinks followed (a missing tail kept), or null when it cannot be told; omitted: paths are taken as written
-export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, real = null }) {
-  const w = writesOf(cmds);
+export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, real = null, readText = null }) {
+  // an awk program file (-f FILE): the text of every place the word may name; null when it cannot be told (a run-time word, a file we cannot read, a place we do not know)
+  const readProgram = readText ? (word, idx) => {
+    const e = expand(word);
+    if (e === null) return null;
+    const paths = locate(e, idx).filter((x) => isAbs(x)); // (the bare word is only the fallback for a directory we do not know)
+    if (!paths.length) return null;
+    const texts = paths.map((x) => readText(x));
+    return texts.every((t) => typeof t === 'string') ? texts : null;
+  } : null;
+  const w = writesOf(cmds, { readProgram });
   return { cmds, recs: w.recs, unmodelled: w.unmodelled, from: flowStart(cmds), i: -1, expand, locate, isAbs, p, ci, real, deferred: hasDeferred(cmds) };
 }
 
@@ -1010,7 +1210,8 @@ function mayBeBelow(f, d, P) {
 function match(f, rec, P) {
   const p = f.p;
   const loose = (items) => Object.assign([...items], { loose: true }); // may or may not be the file: its place in the order is unknown
-  if (rec.inline !== undefined) return namesFile(rec.inline, p.basename(P)) && CAN_WRITE.test(rec.inline) ? loose(rec.items) : null;
+  if (rec.inline !== undefined) return namesFile(rec.inline, p.basename(P)) && (rec.awk || CAN_WRITE.test(rec.inline)) ? loose(rec.items) : null;
+  if (rec.generic !== undefined) return namesScript(f, rec, P) ? loose(rec.items) : null;
   if (rec.dest === null) return loose(rec.items);
   const e = f.expand(rec.dest);
   // a target only known at run time may be any file its fixed parts allow (`/work/out-$n.txt` is not /work/cmp.mjs)
@@ -1349,8 +1550,12 @@ export const unmodelledBefore = (frames) => frames.some((f) => [...f.unmodelled]
 
 // The records of a finished frame (a script judged while the caller ran), rewritten with absolute paths and attributed to the calling command `idx`, so the
 // commands that run after the script see what it wrote (`bash mk.sh; bash n.sh` with mk.sh doing `cp f.sh n.sh`).
-export function exportRecords(f, idx) {
+// `existing`: the caller's records; one that is already there with the same content and an earlier or equal command index is seen in every case the new one would be, so it is not added again (200 shells running one script do not grow the list)
+export function exportRecords(f, idx, existing = []) {
   const out = [];
+  const keyOf = (r) => JSON.stringify({ ...r, idx: 0 });
+  const seen = new Map();
+  for (const r of existing) { const k = keyOf(r); if (!seen.has(k) || seen.get(k) > r.idx) seen.set(k, r.idx); }
   const absOf = (word, at) => {
     const e = f.expand(word);
     return e === null ? null : f.locate(e, at).filter((x) => f.isAbs(x));
@@ -1368,10 +1573,10 @@ export function exportRecords(f, idx) {
     const dests = rec.dest === null ? [null] : (absOf(rec.dest, rec.idx) ?? [null]);
     for (const d of dests.length ? dests : [null]) {
       const items = convert(rec.items, d);
-      out.push({ ...rec, idx, dest: d, items, parts: rec.parts?.map((part) => convert(part, d)) });
+      out.push({ ...rec, idx, dest: d, items, parts: rec.parts?.map((part) => convert(part, d)), ...(rec.generic ? { generic: rec.generic.flatMap((w) => { const ps = absOf(w, rec.idx); return ps && ps.length ? ps : [w]; }) } : {}) });
     }
   }
-  return out;
+  return out.filter((r) => { const k = keyOf(r); if (seen.has(k) && seen.get(k) <= r.idx) return false; seen.set(k, r.idx); return true; });
 }
 
 // The readings of a program's text to look for a guarded command in: as written, with string concatenation joined ('git pu'+'sh'), with quotes and escapes stripped.

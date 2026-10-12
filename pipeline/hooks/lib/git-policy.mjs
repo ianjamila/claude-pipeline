@@ -1353,6 +1353,7 @@ function evalString(str, startDir, ctx, level) {
     },
     isAbs: path.isAbsolute, p: path, ci: process.platform === 'win32' || process.platform === 'darwin',
     real: (q) => realLocation(ctx.realpath, q),
+    readText: (q) => ctx.readText(q), // (an awk program file is read to see what it writes)
   });
   ctx.writeFrames.push(frame);
   try {
@@ -1454,7 +1455,7 @@ function evalString(str, startDir, ctx, level) {
     // what the list wrote is still true for the commands after the one that ran it
     const done = ctx.writeFrames.pop();
     const caller = ctx.writeFrames[ctx.writeFrames.length - 1];
-    if (caller && done) caller.recs.push(...exportRecords(done, caller.i));
+    if (caller && done) caller.recs.push(...exportRecords(done, caller.i, caller.recs));
   }
 }
 

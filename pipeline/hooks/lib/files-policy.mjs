@@ -1314,7 +1314,7 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
     // what the list wrote is still true for the commands after the one that ran it
     const done = opts._frames[depth];
     const caller = depth > 0 ? opts._frames[depth - 1] : null;
-    if (caller && done) caller.recs.push(...exportRecords(done, caller.i));
+    if (caller && done) caller.recs.push(...exportRecords(done, caller.i, caller.recs));
     opts._frames.length = depth;
   }
 }
@@ -1366,6 +1366,7 @@ function evaluateBashForFilesFrame(command, opts) {
     locate: (e, idx) => (isAbs(e) ? [posix.normalize(e)] : dirs.map((d) => posix.join(d, e))),
     isAbs, p: posix, ci: ctx.ci,
     real: (q) => realResolve(q, ctx.api),
+    readText: (q) => ctx.readText(q), // (an awk program file is read to see what it writes)
   });
   ctx.frames.push(frame);
   // BASH_ENV / ENV / ZDOTDIR / HOME values this line (and the scripts that run it) assign: shells started by the scripts it runs see them

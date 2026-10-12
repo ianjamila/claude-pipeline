@@ -60,7 +60,7 @@ const aliasReal = (root) => {
   };
 };
 function run(line, spec, alias = false) {
-  const mk = (bad, ok) => Object.fromEntries(Object.entries(spec).map(([k, v]) => [k, v === 'bad' ? bad : v === 'ok' ? ok : v === 'bad1' ? bad.slice(0, 8) : v === 'bad2' ? bad.slice(8) : v === 'rot' ? bad.slice(8) + '\n' + bad.slice(0, 8) : v === 'badx' ? `${bad}-x` : v === 'tacd' ? `${bad.slice(bad.lastIndexOf(' ') + 1)}\n${bad.slice(0, bad.lastIndexOf(' ') + 1)}\\` : v]));
+  const mk = (bad, ok) => Object.fromEntries(Object.entries(spec).map(([k, v]) => [k, v === 'bad' ? bad : v === 'ok' ? ok : v === 'bad1' ? bad.slice(0, 8) : v === 'bad2' ? bad.slice(8) : v === 'rot' ? bad.slice(8) + '\n' + bad.slice(0, 8) : v === 'up' ? bad.toUpperCase() : v === 'badx' ? `${bad}-x` : v === 'tacd' ? `${bad.slice(bad.lastIndexOf(' ') + 1)}\n${bad.slice(0, bad.lastIndexOf(' ') + 1)}\\` : v]));
   const g = typeof line === 'string' ? line : line(BAD_GIT, MID_GIT, CALM_GIT);
   const f = typeof line === 'string' ? line : line(BAD_FILES, MID_FILES, CALM_FILES);
   return {
@@ -805,7 +805,9 @@ test('L1b: BSD sed -I (in place, separate suffix) and an abbreviated --in-place 
   denyBoth((_, mid) => `sed -I '' 's/a/b/' ok.sh; ${mid}; bash ok.sh`);
   denyBoth((_, mid) => `sed --in-pl 's/a/b/' ok.sh; ${mid}; bash ok.sh`);
   denyBoth((_, mid) => `sed -i 'w n.sh' ok.sh; ${mid}; bash n.sh`); // (an in-place sed may also write a file with w)
-  assert.equal(run((_, mid) => `perl -I src t.pl ok.sh; ${mid}; bash ok.sh`, SPEC).git.r.decision, 'allow'); // (perl -I is an include path, not an edit in place)
+  // (perl -I is an include path, not an edit in place: no edit record. The program that names ok.sh as an argument is the L3 generic case: it may write it)
+  assert.equal(writesOf(simpleCommands('perl -I src t.pl ok.sh')).recs.some((r) => r.edit), false);
+  assert.equal(run((_, mid) => `perl -I src t.pl other.sh; ${mid}; bash ok.sh`, SPEC).git.r.decision, 'allow');
   // the files an in-place sed edits come from the same parser as its programs: abbreviations and bundles do not make the first file the program
   for (const l of ["sed --expr='s/a/b/' -i ok.sh", "sed -i --expression='s/a/b/' ok.sh", "sed --fi=s.sed -i ok.sh", "sed -i -ne p ok.sh", "sed -i -e p -e p ok.sh"]) denyBoth((_, mid) => `${l}; ${mid}; bash ok.sh`);
   denyBoth((_, mid) => `sed -I '' 'w n.sh' ok.sh; ${mid}; bash n.sh`);
@@ -895,9 +897,9 @@ test('L2: GNU long options of cp / mv / ln / install / tee are resolved by uniqu
   allowBoth('echo hi | tee --append --output-error=warn d/log; bash ok.sh');
 });
 
-test('L2: cp --parents, mv --exchange, install --strip-program change which file is written; cp -s / -l make links', () => {
-  // Why: --parents puts the source at DEST/<path as written>, --exchange gives the SOURCE the destination's old text, --strip-program runs a program; a switch is harmless only if it cannot change which file is written or what goes in it
-  for (const l of ['cp --parents src/f.sh d', 'cp --par src/f.sh d', 'cp --parents -t d src/f.sh', 'mv --exchange ok.sh f.sh', 'mv --exc ok.sh f.sh', 'install -s --strip-program=./gen ok.sh d', 'install --strip-program ./gen -s ok.sh d']) {
+test('L2: mv --exchange, install --strip-program change which file is written; cp -s / -l make links (cp --parents: see L3)', () => {
+  // Why: --exchange gives the SOURCE the destination's old text, --strip-program runs a program; a switch is harmless only if it cannot change which file is written or what goes in it
+  for (const l of ['mv --exchange ok.sh f.sh', 'mv --exc ok.sh f.sh', 'install -s --strip-program=./gen ok.sh d', 'install --strip-program ./gen -s ok.sh d']) {
     denyBoth((_, mid) => `${l}; ${mid}; bash ok.sh`);
     denyBoth((_, mid) => `${l}; ${mid}; bash d/src/n.sh`);
   }
@@ -1037,7 +1039,7 @@ test('L2b: gawk -i inplace (--include inplace, @include "inplace") edits every f
       assert.match(files(l, filesFs).reason ?? 'allowed', /pieces/, l);
     }
   }
-  const dests = (l) => writesOf(simpleCommands(l)).recs.map((r) => [r.dest, r.edit === true]);
+  const dests = (l) => writesOf(simpleCommands(l)).recs.filter((r) => r.generic === undefined).map((r) => [r.dest, r.edit === true]);
   assert.deepEqual(dests(`awk -i inplace ${prog} a.sh b.sh`), [['a.sh', true], ['b.sh', true]]);
   assert.deepEqual(dests(`awk -i inplace -f p.awk a.sh`), [['a.sh', true]]);
   assert.deepEqual(dests(`awk -i inplace -e ${prog} a.sh`), [['a.sh', true]]);
@@ -1339,4 +1341,146 @@ test('L2b: a startup-file variable (WGETRC / CURL_HOME / XDG_CONFIG_HOME / HOME)
     denyBoth((_, mid) => `${l}; ${mid}; bash ok.sh`);
   }
   for (const l of ['export FOO=1; wget -O n.sh http://h/f', 'FOO=1; export FOO; curl -o n.sh http://h/f', 'declare -x LANG=C; wget -qO n.sh http://h/f', 'export WGETRC=w.rc; echo hi']) assert.equal(un(l), 0, l);
+});
+
+// ---- L3: purity allowlists (git / gh), the generic fallback, writer coverage ---------------------------------------------------------------
+
+const un3 = (l) => writesOf(simpleCommands(l)).unmodelled.size;
+const recs3 = (l) => writesOf(simpleCommands(l)).recs;
+
+test('L3: git / gh purity is an allowlist of read-only shapes; anything else may have written a file', () => {
+  // Why: format-patch writes NNNN-*.patch, bundle / worktree add / stash push / am / apply / notes write files, -c / --config-env / --exec-path / -p run programs, `git x` may be an alias, an unknown gh subcommand an extension or alias
+  for (const l of ['git format-patch -1', 'git bundle create b.bundle HEAD', 'git worktree prune', 'git stash push', 'git stash', 'git am p.patch', 'git apply p.patch', 'git notes add -m x', 'git -c core.pager=sh log', "git -c alias.x='!sh y' x",
+    'git --config-env=core.pager=PGR log', 'git --exec-path=d status', 'git -p log', 'git --paginate log', 'git x', 'git bogus-subcommand', 'git branch newname', 'git branch -D old', 'git tag v1', 'git tag -d v1', 'git config user.name x', 'git config --unset a.b', 'git remote add o u', 'git symbolic-ref HEAD refs/heads/x',
+    'git reflog expire --all', 'git grep -O sh foo', 'git log --ext-diff', 'git diff --ext', 'git show --textconv x', 'GIT_PAGER=sh git log', 'GIT_EXTERNAL_DIFF=sh git diff', 'GIT_CONFIG_COUNT=1 git status',
+    'gh alias set x y', 'gh extension install o/r', 'gh run download 1', 'gh release download v1', 'gh pr checkout 5', 'gh repo clone o/r', 'gh foo', 'gh config set a b', 'gh pr view --web', 'gh pr view -w 5', 'gh api -X POST repos/o/r', 'gh api repos/o/r --input f', 'gh api repos/o/r -f a=b', 'gh api repos/o/r -F a=@f', 'gh api repos/o/r --method=PUT',
+    'gh pr merge 5', 'gh pr create', 'gh issue close 3', 'GH_PAGER=sh gh pr list', 'GH_BROWSER=sh gh pr view 5']) {
+    assert.equal(un3(l), 1, l);
+    denyBoth((_, mid) => `${l}; ${mid}; bash n.sh`);
+  }
+  for (const l of ['git status', 'git status --porcelain', 'git log --oneline -5', 'git log --format=%h -n3 -- f.sh', 'git diff HEAD~1 --stat', 'git diff --name-only', 'git show HEAD:f.sh', 'git rev-parse --show-toplevel', 'git ls-files', 'git ls-files -o', 'git ls-tree HEAD', 'git cat-file -p HEAD', 'git blame f.sh', 'git branch', 'git branch --list', "git branch -l 'a*'", 'git branch --show-current', 'git branch -a -v',
+    'git tag', 'git tag -l', 'git remote', 'git remote -v', 'git remote show origin', 'git config --get user.name', 'git config --list', 'git config --global --get-all a.b', 'git describe --tags', 'git merge-base HEAD main', 'git for-each-ref', 'git symbolic-ref HEAD', 'git symbolic-ref --short HEAD', 'git worktree list', 'git stash list',
+    'git reflog', 'git shortlog -sn', 'git grep foo', 'git -C sub status', 'git --no-pager log', 'git --git-dir=.git rev-parse HEAD', 'git rev-list --count HEAD',
+    'gh pr view 5', 'gh pr view 5 --json state', 'gh pr list', 'gh pr checks 5', 'gh pr diff 5', 'gh issue view 3', 'gh issue list', 'gh run view 1', 'gh run list', 'gh run watch 1', 'gh api repos/o/r/pulls', 'gh api -X GET repos/o/r', 'gh api repos/o/r --jq .id --paginate', 'gh --version']) {
+    assert.equal(un3(l), 0, l);
+    allowBoth((_, __, calm) => `${l}; ${calm}; bash ok.sh`);
+  }
+  // the global-option reader: --git-dir=X is one word (it used to swallow the subcommand), -C DIR takes the next word
+  assert.equal(un3('git --git-dir=.git status'), 0);
+  denyBoth((_, mid) => `git --git-dir=.git mv f.sh n.sh; ${mid}; bash ok.sh`);
+  denyBoth('git -C sub mv ../f.sh n.sh; bash sub/n.sh');
+  assert.deepEqual(recs3('git log --out=n.sh').map((r) => r.dest), ['n.sh']); // (a unique prefix of --output)
+  assert.deepEqual(recs3('git diff --output-dir=d').map((r) => r.dest), ['d']);
+  denyBoth((_, mid) => `git log --out=n.sh; ${mid}; bash n.sh`);
+});
+
+test('L3: generic fallback: a command that is not provably pure and names the script may have written it', () => {
+  // Why: `make ok.sh` / `mytool ok.sh` / `npm run x -- src` may write the script they name (a path, a basename, a directory above it, a glob or a variable that may match it); with no mention (`make; bash ok.sh`) it stays the documented residual
+  for (const l of ['make ok.sh', 'mytool ok.sh', 'mytool --out=ok.sh', 'mytool out=ok.sh', 'mytool ./ok.sh', 'mytool /work/repo/ok.sh', 'mytool "o*.sh"', 'mytool o*.sh', 'mytool $T', 'mytool "$T/ok.sh"', 'npm run gen -- ok.sh', 'mytool -x 3 ok.sh', 'bash gen.sh ok.sh', 'bash ok.sh ok.sh', 'node gen.mjs ok.sh']) {
+    denyBoth((_, mid) => `${l}; ${mid}; bash ok.sh`);
+  }
+  denyBoth((_, mid) => `mytool src; ${mid}; bash src/ok.sh`); // (a directory above it)
+  denyBoth((_, mid) => `mytool .; ${mid}; bash src/ok.sh`);
+  denyBoth((_, mid) => `cd src; mytool o*; ${mid}; bash ok.sh`);
+  // every OTHER file word is a possible source of the text: it is judged as a script
+  denyBoth('mytool f.sh ok.sh; bash ok.sh');
+  denyBoth('mytool --src=f.sh ok.sh; bash ok.sh');
+  denyBoth('mytool f.sh sub/ok.sh; bash sub/ok.sh', { ...SPEC, 'sub/ok.sh': 'ok' });
+  // the nearest twins stay allowed
+  for (const l of ['make', 'make all', 'npm run build', 'mytool other.sh', 'mytool src/other.sh', 'X=ok.sh mytool', 'BASH_ENV=ok.sh bash x.sh', 'mytool -x 3', 'shellcheck ok.sh', 'shellcheck -x ok.sh', 'cat ok.sh', 'grep x ok.sh', 'bash ok.sh', 'node ok.sh', 'node ok.sh a b', 'timeout 5 bash ok.sh', 'env A=1 bash ok.sh', 'sh -x ok.sh', 'python3 ok.sh']) {
+    allowBoth((_, mid, calm) => `${l}; ${calm}; bash ok.sh`);
+    assert.equal(run((_, mid) => `${l}; ${mid}; bash ok.sh`, SPEC).git.r.decision, 'allow', l); // (guard-files refuses any program next to a protected-file mention: only guard-git tells these apart)
+  }
+  // it is the command's own script operand that is exempt, only the first one after the interpreter
+  assert.deepEqual(recs3('node t.mjs a').flatMap((r) => r.generic ?? []), ['a']);
+  assert.deepEqual(recs3('node t.mjs t.mjs').filter((r) => r.generic !== undefined).map((r) => r.generic), [['t.mjs']]);
+  // a startup file reached from the real home is not a script "named" by a command (ignoreUnmodelled): a loose write does not reach it
+  assert.equal(recs3('mytool ok.sh').filter((r) => r.loose && r.generic).length, 1);
+});
+
+test('L3: cp --parents / rsync -R put each source at DEST/<source as written>; install -D', () => {
+  // Why: `cp --parents src/f.sh d` writes d/src/f.sh, not d or d/f.sh; modelled exactly instead of "may write anywhere"
+  assert.deepEqual(recs3('cp --parents src/f.sh d').map((r) => r.dest), ['d/src/f.sh']);
+  assert.equal(un3('cp --parents src/f.sh d'), 0);
+  for (const l of ['cp --parents src/f.sh d; bash d/src/f.sh', 'cp --par src/f.sh d; bash d/src/f.sh', 'cp --parents -t d src/f.sh; bash d/src/f.sh', 'cp -r --parents src d; bash d/src/f.sh', 'cp -R --parents src/ d; bash d/src/f.sh', 'rsync -R src/f.sh d/; bash d/src/f.sh', 'rsync -aR src/f.sh d; bash d/src/f.sh',
+    'rsync --relative src/f.sh d; bash d/src/f.sh', 'rsync --rel src/f.sh d; bash d/src/f.sh', 'rsync -a --relative src d; bash d/src/f.sh', 'install -D f.sh d/n.sh; bash d/n.sh', 'install -D -t d f.sh; bash d/f.sh', 'install -Dm755 f.sh d/n.sh; bash d/n.sh']) denyBoth(l);
+  for (const l of ['cp --parents src/ok.sh d; bash ok.sh', 'cp --parents src/f.sh d; bash ok.sh', 'rsync -R src/f.sh d; bash ok.sh', 'install -D f.sh d/n.sh; bash ok.sh']) allowBoth(l);
+  // rsync's /./ marker keeps only what follows it, and these options name files we do not follow: anywhere
+  for (const l of ['rsync -R src/./f.sh d', 'rsync --write-batch=b src d', 'rsync --only-write-batch=b src d', 'rsync -b src d', 'rsync --backup-dir=b src d', 'rsync --link-dest=l src d', 'rsync --files-from=l src d', 'rsync --log-file=l src d', 'rsync --temp-dir=t src d', 'rsync -T t src d', 'RSYNC_RSH=x rsync src d']) {
+    denyBoth((_, mid) => `${l}; ${mid}; bash ok.sh`);
+  }
+  allowBoth('rsync -av src/ d; bash ok.sh');
+});
+
+test('L3: -b / --backup / -S / --suffix (and SIMPLE_BACKUP_SUFFIX / VERSION_CONTROL) leave a backup holding the destination\'s OLD text; curl -: is --next', () => {
+  // Why: `cp -b -S .sh ok.txt n; bash n.sh` runs n's old text (a backup n.sh), which the copy itself does not show
+  const spec = { ...SPEC, n: 'bad', 'ok.txt': 'ok' };
+  for (const l of ['cp -b -S .sh ok.txt n; bash n.sh', 'cp --backup --suffix=.sh ok.txt n; bash n.sh', 'cp -b -S.sh ok.txt n; bash n.sh', 'cp --back --suff .sh ok.txt n; bash n.sh', 'mv -b -S .sh ok.txt n; bash n.sh', 'ln -s -b -S .sh ok.txt n; bash n.sh', 'install -b -S .sh ok.txt n; bash n.sh', 'install -b -B .sh ok.txt n; bash n.sh',
+    'cp -b ok.txt n; bash n~', 'cp --backup=simple ok.txt n; bash n~', 'SIMPLE_BACKUP_SUFFIX=.sh cp -b ok.txt n; bash n.sh', 'cp --backup=numbered ok.txt n; bash n.~1~', 'VERSION_CONTROL=t cp -b ok.txt n; bash n.~2~', 'cp -b ok.txt n; bash n.~3~', 'install -b ok.txt n; bash n.old', 'cp -b -t . -S .sh ok.txt; bash ok.txt.sh']) denyBoth(l, l.includes('-t .') ? { ...SPEC, 'ok.txt': 'bad' } : spec);
+  // a suffix or control only known at run time may be anything
+  for (const l of ['export SIMPLE_BACKUP_SUFFIX=.sh; cp -b ok.txt n', 'cp -b -S $S ok.txt n']) denyBoth((_, mid) => `${l}; ${mid}; bash ok.sh`, spec);
+  assert.deepEqual(recs3('cp -b -S .sh ok.txt n').map((r) => r.dest), ['n', 'n.sh', 'n.~[0-9]*~', 'n/ok.txt.sh', 'n/ok.txt.~[0-9]*~']);
+  // the twins: no backup is made
+  for (const l of ['cp ok.txt n; bash n.sh', 'cp --backup=none ok.txt n; bash n.sh', 'VERSION_CONTROL=none cp -b ok.txt n; bash n.sh', 'cp -b ok.txt m; bash n.sh']) allowBoth(l, spec);
+  // curl -: starts a new operation group (--output-dir / -O state starts again): any file
+  for (const l of ['curl -: http://h/f', 'curl -sS: -o n.sh http://h/f', 'curl -o a.sh http://h/f -: -O http://h/n.sh']) {
+    assert.equal(un3(l), 1, l);
+    denyBoth((_, mid) => `${l}; ${mid}; bash ok.sh`);
+  }
+});
+
+test('L3: an awk program that writes is an inline-program writer; a program file (-f / -E) is read', () => {
+  // Why: `awk '{print > "n.sh"}'` was only "unmodelled": a missing script was refused but an existing one judged on its old text; one that names the script is judged by its text, any other writes an unknown file
+  denyBoth((bad) => `awk 'BEGIN { print "${bad}" > "n.sh" }'; bash n.sh`);
+  denyBoth((bad) => `awk 'BEGIN { print "${bad}" >> "ok.sh" }'; bash ok.sh`);
+  denyBoth((bad) => `awk -e 'BEGIN { print "${bad}" > "ok.sh" }'; bash ok.sh`);
+  denyBoth((bad) => `awk --source 'BEGIN { print "${bad}" > "ok.sh" }'; bash ok.sh`);
+  denyBoth((bad) => `gawk 'BEGIN { print "${bad}" | "tee ok.sh" }'; bash ok.sh`);
+  for (const l of ["awk '{ print > $1 }' f.txt", "awk '{ print > (FILENAME \".sh\") }' f.txt", "awk 'BEGIN { system(\"cp f.sh ok.sh\") }'", "awk -v o=ok.sh '{ print > o }' f.txt", "awk '{ print | \"cat\" }' f.txt"]) denyBoth((_, mid) => `${l}; ${mid}; bash ok.sh`);
+  assert.equal(recs3("awk '{ print > $1 }' f.txt").filter((r) => r.dest === null).length, 2); // (the inline record and the loose write of unknown content)
+  for (const l of ["awk '{ print $1 }' ok.sh", "awk -F: '{ print $1 }' ok.sh", "awk 'NR==1' ok.sh | head", 'awk -f r.awk ok.sh']) allowBoth(`${l}; bash ok.sh`, { ...SPEC, 'r.awk': '{ print $1 }', 'w.awk': '{ print > "n.sh" }' });
+  const spec = { ...SPEC, 'r.awk': '{ print $1 }', 'w.awk': '{ print > "ok.sh" }', 'w2.awk': '{ system("cp f.sh ok.sh") }' };
+  for (const l of ['awk -f w.awk f.txt', 'awk -f w2.awk f.txt', 'awk -E w.awk f.txt', 'awk --file=w.awk f.txt', 'awk --file w.awk f.txt', 'awk -fw.awk f.txt', 'awk -f missing.awk ok.sh']) denyBoth((_, mid) => `${l}; ${mid}; bash ok.sh`, spec);
+  assert.equal(awkArgsPure(['-f', 'p.awk', 'f'], {}, () => ['{ print $1 }']), true);
+  assert.equal(awkArgsPure(['-f', 'p.awk', 'f'], {}, () => ['{ print > "x" }']), false);
+  assert.equal(awkArgsPure(['-f', 'p.awk', 'f'], {}, () => null), false); // (unreadable)
+  assert.equal(awkArgsPure(['-f', 'p.awk', 'f']), false); // (no reader: not read here)
+});
+
+test('L3: clone / worktree / checkout narrowing only with no git global option before the subcommand (a lone -C DIR is read)', () => {
+  // Why: --git-dir / --work-tree / -c core.worktree / a repeated -C move where git writes: the destination can no longer be compared with a name
+  for (const l of ['git --git-dir=.git clone https://x/r other', 'git --work-tree=w clone https://x/r other', 'git -c clone.defaultRemoteName=o clone https://x/r other', 'git -C a -C b clone https://x/r other', 'git --git-dir .git worktree add other', 'git -c core.worktree=w worktree add other', 'git --work-tree=d checkout HEAD -- ok.sh']) {
+    denyBoth((_, mid) => `${l}; ${mid}; bash src/ok.sh`);
+  }
+  // a lone -C DIR: the destination is below DIR
+  denyBoth((_, mid) => `git -C sub clone https://x/r other; ${mid}; bash sub/other/n.sh`);
+  assert.deepEqual(recs3('git -C sub clone https://x/r other').map((r) => [r.dest, r.narrow === true]), [['sub/other', true]]);
+  assert.deepEqual(recs3('git clone https://x/r other').map((r) => [r.dest, r.narrow === true]), [['other', true]]);
+  assert.deepEqual(recs3('git --git-dir=.git clone https://x/r other').filter((r) => r.dest === 'other').map((r) => r.narrow === true), [false]);
+  for (const l of ['git clone https://x/r other', 'git -C sub clone https://x/r other']) assert.equal(run((_, mid) => `${l}; ${mid}; bash ok.sh`, SPEC).git.r.decision, 'allow', l); // (guard-files refuses any program next to a protected-file mention)
+});
+
+test('L3: wget naming is an allowlist: a plain -O FILE or a URL with a non-empty last segment and no renaming option', () => {
+  const dests = (l) => recs3(l).map((r) => r.dest);
+  assert.deepEqual(dests('wget -O n.sh http://h/f'), ['n.sh']);
+  assert.deepEqual(dests('wget -nc http://h/n.sh'), ['n.sh']);
+  assert.deepEqual(dests('wget http://h/n.sh'), ['n.sh', 'n.sh.[0-9]*']); // (an existing file is kept: the new one is n.sh.1)
+  assert.ok(dests('wget "http://h/n.sh?v=1"').includes('n.sh?v=1')); // (a query stays in the name)
+  assert.ok(dests('wget http://h/n%2Esh').includes('n.sh')); // (%XX is decoded)
+  assert.ok(dests('wget -P d http://h/n.sh').includes('d/n.sh'));
+  assert.ok(dests('wget -b http://h/n.sh').includes('wget-log'));
+  for (const l of ['wget http://h/n.sh', 'wget -q -T 5 -t 2 -O n.sh http://h/f', 'wget --no-check-certificate -qO n.sh http://h/f', 'wget -nc http://h/n.sh', 'wget --header=A:b -O n.sh http://h/f']) assert.equal(un3(l), 0, l);
+  for (const l of ['wget --default-page=x.sh http://h/', 'wget http://h/', 'wget http://h/a/', 'wget "http://h/?q=1"', 'wget --restrict-file-names=nocontrol http://h/f', 'wget --metalink-index=2 http://h/f', 'wget --preferred-location=x http://h/f', 'wget --local-encoding=x http://h/f', 'wget --remote-encoding=x http://h/f', 'wget --iri http://h/f',
+    'wget --bogus http://h/f', 'wget --metalink-over-http http://h/f', 'wget -k http://h/f', 'wget --convert-links http://h/f', 'wget -x http://h/f', 'wget --default-p=x http://h/', 'wget --no-host-directories http://h/f']) {
+    assert.equal(un3(l), 1, l);
+    denyBoth((_, mid) => `${l}; ${mid}; bash ok.sh`);
+  }
+  denyBoth((_, mid) => `wget http://h/n.sh; ${mid}; bash n.sh.1`);
+  assert.equal(run((_, mid) => `wget -nc http://h/n.sh; ${mid}; bash n.sh.1`, SPEC).git.r.decision, 'allow');
+});
+
+test('L3: a rewriting command that changes letter case still has its sources scanned (guarded words matched case-folded)', () => {
+  // Why: `tr A-Z a-z < up.txt > n.sh` turns upper-case text into a command; the scan of a rewriting command's source is case-insensitive in both policies
+  const spec = { ...SPEC, 'up.txt': 'up' };
+  for (const l of ['tr A-Z a-z < up.txt > n.sh; bash n.sh', "tr '[:upper:]' '[:lower:]' < up.txt > n.sh; bash n.sh", 'dd conv=lcase if=up.txt of=n.sh; bash n.sh', "sed 's/.*/\\L&/' up.txt > n.sh; bash n.sh", "awk '{print tolower($0)}' up.txt > n.sh; bash n.sh", "perl -pe '$_=lc' up.txt > n.sh; bash n.sh", 'iconv -f ascii -t ascii up.txt > n.sh; bash n.sh']) denyBoth(l, spec);
 });
