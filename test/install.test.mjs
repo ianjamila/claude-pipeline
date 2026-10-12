@@ -15,7 +15,7 @@ import { join, dirname, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   mergeSettings, removeOurSettings, isOurHandler, ourAllowEntries, renameWithRetry, collectDiagnostics,
-  shellRcPaths, parseArgs, buildPlan, walkFiles, safeManifestKey, GUARD_FILES_MATCHER, GUARD_GIT_MATCHER,
+  shellRcPaths, parseArgs, buildPlan, walkFiles, safeManifestKey, GUARD_FILES_MATCHER, GUARD_GIT_MATCHER, HOOK_LOADER,
 } from '../pipeline/lib/installer.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -86,13 +86,14 @@ function writeSettings(home, obj) {
   writeFileSync(settingsPath(home), `${JSON.stringify(obj, null, 2)}\n`);
 }
 
-const guardGit = (home) => ({
-  matcher: 'Bash|PowerShell|Monitor|mcp__.*',
-  hooks: [{ type: 'command', command: 'node', args: [join(home, 'pipeline', 'hooks', 'guard-git.mjs')], timeout: 15 }],
+// The guards start through the fail-closed loader (A2): `node --input-type=module -e <loader> <hook file>`.
+const loaded = (home, name) => ({
+  type: 'command', command: 'node', args: ['--input-type=module', '-e', HOOK_LOADER, join(home, 'pipeline', 'hooks', `${name}.mjs`)], timeout: 15,
 });
+const guardGit = (home) => ({ matcher: 'Bash|PowerShell|Monitor|mcp__.*', hooks: [loaded(home, 'guard-git')] });
 const guardFiles = (home) => ({
   matcher: 'Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|Monitor|mcp__.*',
-  hooks: [{ type: 'command', command: 'node', args: [join(home, 'pipeline', 'hooks', 'guard-files.mjs')], timeout: 15 }],
+  hooks: [loaded(home, 'guard-files')],
 });
 const allowEntries = (home) => [
   `Bash(node ${posix(home)}/pipeline/bin/pipeline.mjs:*)`,
@@ -719,8 +720,8 @@ test('mergeSettings on an empty object builds the minimal structure; skipFileGua
 test('mergeSettings writes native Windows paths in args and a posix path in the allow entry', () => {
   const home = 'C:\\Users\\Jo Smith\\.claude';
   const out = mergeSettings({}, { home });
-  assert.deepEqual(out.hooks.PreToolUse[0].hooks[0].args, ['C:\\Users\\Jo Smith\\.claude\\pipeline\\hooks\\guard-git.mjs']);
-  assert.deepEqual(out.hooks.PreToolUse[1].hooks[0].args, ['C:\\Users\\Jo Smith\\.claude\\pipeline\\hooks\\guard-files.mjs']);
+  assert.deepEqual(out.hooks.PreToolUse[0].hooks[0].args, ['--input-type=module', '-e', HOOK_LOADER, 'C:\\Users\\Jo Smith\\.claude\\pipeline\\hooks\\guard-git.mjs']);
+  assert.deepEqual(out.hooks.PreToolUse[1].hooks[0].args, ['--input-type=module', '-e', HOOK_LOADER, 'C:\\Users\\Jo Smith\\.claude\\pipeline\\hooks\\guard-files.mjs']);
   assert.equal(out.permissions.allow[0], 'Bash(node C:/Users/Jo Smith/.claude/pipeline/bin/pipeline.mjs:*)');
   // and an earlier Windows-style entry is recognised as ours and replaced
   const again = mergeSettings(out, { home });
@@ -1087,4 +1088,69 @@ test('a later unit failing while the pipeline unit is unchanged still marks the 
   rmSync(join(home, 'agents', 'judge.md'), { recursive: true });
   assert.equal(install(home, [], { source: src }).status, 0);
   assert.equal(readManifest(home).complete, true);
+});
+
+// ---- A2: fail-closed hook loading -------------------------------------------------------------------------------
+
+function runLoader(hookPath, input) {
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', HOOK_LOADER, hookPath], { encoding: 'utf8', input, timeout: 30000 });
+  return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+}
+function runDirect(hookPath, input) {
+  const r = spawnSync(process.execPath, [hookPath], { encoding: 'utf8', input, timeout: 30000 });
+  return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+}
+
+test('the hook loader blocks (exit 2, one stderr line) when the hook file is missing', () => {
+  const dir = scratch('cp-loader');
+  const r = runLoader(join(dir, 'pipeline', 'hooks', 'guard-git.mjs'), '{}');
+  assert.equal(r.status, 2, r.stderr);
+  assert.equal(r.stdout, '');
+  assert.match(r.stderr, /^claude-pipeline: hook could not be loaded \(ERR_MODULE_NOT_FOUND\); blocking this call\n$/);
+});
+
+test('the hook loader blocks when the hook file exists but its module graph does not load', () => {
+  const dir = scratch('cp-loader');
+  writeFileSync(join(dir, 'broken.mjs'), "import './not-there.mjs';\n");
+  const syntax = join(dir, 'syntax.mjs');
+  writeFileSync(syntax, 'this is ( not javascript\n');
+  assert.equal(runLoader(join(dir, 'broken.mjs'), '{}').status, 2);
+  assert.equal(runLoader(syntax, '{}').status, 2);
+});
+
+test('the hook loader changes nothing for a hook that loads: same stdout and exit code as running it directly', () => {
+  const guard = join(REPO, 'pipeline', 'hooks', 'guard-git.mjs');
+  const cwd = scratch('cp-loader-cwd');
+  for (const command of ['ls -la', 'git push --force origin main']) {
+    const input = JSON.stringify({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command }, cwd });
+    const direct = runDirect(guard, input);
+    const viaLoader = runLoader(guard, input);
+    assert.equal(viaLoader.status, direct.status, command);
+    assert.equal(viaLoader.stdout, direct.stdout, command);
+    assert.equal(viaLoader.stderr, direct.stderr, command);
+  }
+  const allowed = runLoader(guard, JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls -la' }, cwd }));
+  assert.equal(allowed.status, 0, allowed.stderr);
+});
+
+test('the installer writes the loader handler; an old plain-args handler is hook-differs under --check and replaced by a reinstall', () => {
+  const home = newHome();
+  const s = ownersSettings();
+  s.hooks.PreToolUse.push({
+    matcher: 'Bash|PowerShell|Monitor|mcp__.*',
+    hooks: [{ type: 'command', command: 'node', args: [join(home, 'pipeline', 'hooks', 'guard-git.mjs')], timeout: 15 }],
+  });
+  writeSettings(home, s);
+  assert.equal(install(home).status, 0);
+  const after = readSettings(home);
+  const ours = after.hooks.PreToolUse.filter((g) => g.hooks.some((h) => isOurHandler(h, home)));
+  assert.deepEqual(ours, [guardGit(home), guardFiles(home)], 'the old entry was replaced, not duplicated');
+
+  // restore the old shape and see --check call it out
+  after.hooks.PreToolUse = after.hooks.PreToolUse.map((g) => (g.hooks.some((h) => String(h.args?.at(-1)).endsWith('guard-git.mjs'))
+    ? { ...g, hooks: [{ type: 'command', command: 'node', args: [join(home, 'pipeline', 'hooks', 'guard-git.mjs')], timeout: 15 }] } : g));
+  writeSettings(home, after);
+  const check = install(home, ['--check', '--json']);
+  assert.equal(check.status, 1);
+  assert.ok(JSON.parse(check.stdout).drift.some((d) => d.kind === 'hook-differs' && d.path === 'guard-git'), check.stdout);
 });

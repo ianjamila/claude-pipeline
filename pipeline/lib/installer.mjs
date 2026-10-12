@@ -341,10 +341,22 @@ export function ourAllowEntries(home) {
   return entries;
 }
 
+// Why: Claude Code treats a hook that exits 1 (what `node <missing file>` does, e.g. while an install swaps the hooks
+// dir in) as a NON-blocking error, so the tool call is allowed. Exit 2 blocks. The guards are therefore started through
+// this loader: it imports the hook file (process.argv[1], the first argument after `-e`) and, if the import itself
+// fails (file missing, a module that will not load), says so on stderr and exits 2. A hook that loads runs exactly as
+// before: it reads stdin and writes its own JSON; the loader adds nothing to its output or exit code.
+export const HOOK_LOADER = [
+  "import { pathToFileURL } from 'node:url';",
+  'try { await import(pathToFileURL(process.argv[1]).href); } catch (e) {',
+  "process.stderr.write('claude-pipeline: hook could not be loaded (' + ((e && (e.code || e.message)) || e) + '); blocking this call\\n', () => process.exit(2));",
+  '}',
+].join(' ');
+
 const handlerFor = (home, name) => ({
   type: 'command',
   command: 'node',
-  args: [joinNative(home, 'pipeline', 'hooks', `${name}.mjs`)],
+  args: ['--input-type=module', '-e', HOOK_LOADER, joinNative(home, 'pipeline', 'hooks', `${name}.mjs`)],
   timeout: HOOK_TIMEOUT_S,
 });
 
