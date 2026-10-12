@@ -15,7 +15,8 @@ if (files.length === 0) {
   console.error('no test files matched');
   process.exit(2);
 }
+// Owner push notifications are off for the whole suite: no test may ever send a real push.
 // A fixed machine id keeps lock tests from creating ~/.claude/pipeline-state/machine-id on the developer's machine.
-const env = { ...process.env, PIPELINE_MACHINE_ID: process.env.PIPELINE_MACHINE_ID || 'test-machine-id' };
+const env = { ...process.env, PIPELINE_MACHINE_ID: process.env.PIPELINE_MACHINE_ID || 'test-machine-id', PIPELINE_NOTIFY: 'off' };
 const r = spawnSync(process.execPath, ['--test', ...files], { stdio: 'inherit', env });
 process.exit(r.status ?? 1);

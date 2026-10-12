@@ -188,6 +188,22 @@ pipeline model-proof (--tag TAG | --agent-id ID) [--expect-model claude-fable-] 
 
 Exit: 0 proven · 1 mismatch · 2 transcript not found / usage.
 
+## notify
+
+send the owner a push notification (ntfy, plus a Windows toast under WSL2).
+
+```
+pipeline notify --test [--repo DIR]   |   pipeline notify --event owner-merge|needs-human|arbiter-escalation|stopped --pr N --action TEXT [--cause CODE] [--repo DIR]   -> {ok, sent, reason?, transports:{ntfy, toast}}
+```
+
+`--test` sends one real push to every transport and prints the per-transport result (the rollout check; it is never deduplicated). `--event` is the manual route for a stop that cannot be expressed through `pipeline summary`.
+
+Configuration, in this order per field: the environment, then `~/.config/claude-secrets.sh` (`PIPELINE_SECRETS_FILE` overrides the path; the file is parsed as literal `NAME=value` lines, never sourced): `NTFY_TOPIC` (required), `NTFY_SERVER` (default `https://ntfy.sh`), `NTFY_TOKEN` (optional). A field that is present but invalid sends nothing (`reason: invalid-config:<field>`); no topic is a silent `no-topic`; `PIPELINE_NOTIFY=off` disables everything (the test suite sets it). The result never contains the topic, token or server path.
+
+One push per event: a ledger under `~/.claude/pipeline-state/` (`notify-ledger.jsonl`) makes a replay of the same event a no-op (`reason: duplicate`). Identity is repo, PR, event, head, outcome, open needs-human ids and `--cause`, never the action text. The whole call is capped at 15 s.
+
+Exit: `--test` 0 when ntfy accepted the push, 1 when it did not · `--event` 0 whether or not a push went out (read `sent` / `reason`) · 2 usage.
+
 ## preflight
 
 report whether the pipeline may merge (config, gh, protection, pause, Codex).
