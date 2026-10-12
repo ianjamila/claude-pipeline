@@ -124,8 +124,11 @@ open an agent-suggestion issue for each FOLLOW-UP item of a round.
 
 ```
 pipeline followups create --round R [--repo DIR]
-  -> {ok, round, created:[{id, number, url}], skipped:[ids already filed], held:[ids waiting for a human]}
-  one issue per fingerprint across the whole review; a FOLLOW-UP that needs a human is held, not filed
+  -> {ok, round, created:[{id, number, url}], reused:[{id, number, url}], duplicates:[{id, canonical, others:[url]}],
+      skipped:[ids already filed], held:[ids waiting for a human]}
+  one issue per fingerprint across the whole review; a FOLLOW-UP that needs a human is held, not filed.
+  Each issue body starts with <!-- claude-pipeline:followup pr=N fp=FINGERPRINT -->; before creating, an issue of ours
+  (any state) with that marker is REUSED (several: lowest number is canonical, the rest are listed, never closed)
 ```
 
 Exit: 0 · 2 usage / no state · 3 GitHub (`gh`) unavailable.
@@ -294,8 +297,14 @@ show or update the review loop state (.review/state.json).
 
 ```
 pipeline state show [--round R] [--accepted] [--disputed] [--needs-human] [--pr N] [--repo DIR]
-  -> {ok, recovered, count, items}; with --pr and no local state, rebuilds it from the PR triage comment
-pipeline state outcome [--repo DIR]   -> roundOutcome + {clean}; exit 0 whether or not clean
+  -> {ok, recovered, source, count, items}; with --pr and no local state, rebuilds it from the PR triage comment
+  with --pr and a local state: the published (triage comment) state is authoritative. Local is kept (source local) when it
+  equals or strictly EXTENDS the published one; otherwise .review/ moves to .review/stale-<UTC time>/ (source quarantined,
+  quarantinedTo) and the published state is restored. source is local | published | quarantined
+pipeline state discard-round --round R [--pr N] [--repo DIR]
+  -> drop an unpublished, trailing round R from the local state and move .review/round-R/ into .review/stale-<UTC time>/;
+     refused (exit 2) when the PR triage comment already holds round R
+pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, followupsPending}; exit 0 whether or not clean
 pipeline state mark-implemented --ids a,b [--repo DIR]
   -> exit 2 {error:no-code-change} unless the branch content differs from what the accepting round reviewed
 pipeline state record-followup --id ID --url URL [--repo DIR]
