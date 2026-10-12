@@ -563,6 +563,13 @@ test('R2-FP: a script producer\'s arguments are still scanned for the text they 
   for (const c of ['bash ok.sh README.md | bash', 'eval "$(bash ok.sh env)"']) allowBoth(c, SPEC);
 });
 
+// Review R3-B1: a word kept out of the join count must still be a PATTERN when the shell globs it — `bash ok.sh f*.sh` prints f.sh (ok.sh = `cat "$@"`),
+// not a file literally named `f*.sh`. Same for a system query's words (`date -f f*.sh`).
+test('R3-B1: a globbed script argument or system-query word is scanned as the files it matches, not as a literal name', () => {
+  for (const c of ['bash ok.sh f*.sh | bash', 'eval "$(bash ok.sh ?.sh)"', 'bash <(sh ok.sh x f*.sh)', 'bash ok.sh sub/f*.sh | bash', 'date -f f*.sh | bash', 'eval "$(which ?.sh)"']) denyBoth(c, SPEC);
+  for (const c of ['bash ok.sh o*.sh | bash', 'date -f o?.sh | bash']) allowBoth(c, SPEC);
+});
+
 test('R1-B2 follow-up: a feed with ONE file operand keeps its verdict, however the operand is spelled', () => {
   const ok = () => ({ 'a.sh': 'echo a', 'b.sh': 'echo b', 'ok.sh': 'echo hi\n' });
   for (const c of ['cat ok.sh | bash', 'cat o*.sh | bash', 'sed p ok.sh | bash', 'sed p o*.sh | bash', 'awk \'{print $1}\' ok.sh | bash', 'sed "s/a/$X/" ok.sh | bash', 'tail -n +1 ok.sh | bash', 'cat a.sh b.sh | bash']) allowBuilt(c, ok);

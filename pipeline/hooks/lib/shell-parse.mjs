@@ -703,7 +703,7 @@ function producerScript(argv) {
 }
 
 // groups: the exact files, one array per producer in the order it names them (what `st.files` was filled from), so the join can be rebuilt
-const newSt = () => ({ dyn: false, files: [], groups: [], computed: [], raws: [], pat: new Set(), unq: new Set() });
+const newSt = () => ({ dyn: false, files: [], groups: [], computed: [], raws: [], pat: new Set(), unq: new Set(), ops: new Set() });
 
 // What the command `seg` prints, when its output reaches the shell through a file: the files it reads. `exact`: nothing
 // between the command and the shell rewrites its output, so a plain reader's files ARE the script text (`st.files`); otherwise
@@ -729,8 +729,11 @@ function noteReads(seg, name, argv, st, exact) {
     if (w === '' || w === '-' || STDIN_FILES.has(w)) continue;
     list.push(w);
     if (list === st.files) group.push(w);
-    if (!noFile && !argOnly && (seg.pat.has(full) || idx !== prog)) st.pat.add(w);
-    if (!noFile && !argOnly && seg.pat.has(full)) st.unq.add(w); // an unquoted pattern: the shell really globs it (`find . -name '*.sh'` does not)
+    if (seg.pat.has(full) || idx !== prog) st.pat.add(w);
+    if (seg.pat.has(full)) st.unq.add(w); // an unquoted pattern: the shell really globs it (`find . -name '*.sh'` does not)
+    // a FILE operand for the join rule: not a system query's word, not a script's argument. Kept apart from `pat`, which also decides whether a
+    // scanned word is globbed (`bash ok.sh f*.sh`: the shell expands f*.sh, so it must stay a pattern — review R3-B1)
+    if (!noFile && !argOnly) st.ops.add(w);
   }
   if (group.length) st.groups.push(group);
   if (words.length) st.raws.push(seg.raw);
@@ -818,9 +821,10 @@ function stdinSource(seg) {
 // a command that rewrites its input (sed, awk, base64, tr ...) may read; `raws` are the producers' command texts.
 function addFeeds(cmd, st) {
   if (!cmd || (!st.files.length && !st.computed.length)) return;
-  if (!cmd.feeds) Object.defineProperty(cmd, 'feeds', { value: { files: [], groups: [], computed: [], raws: [], pat: [], unq: [] }, enumerable: false });
+  if (!cmd.feeds) Object.defineProperty(cmd, 'feeds', { value: { files: [], groups: [], computed: [], raws: [], pat: [], unq: [], ops: [] }, enumerable: false });
   cmd.feeds.pat.push(...st.pat);
   cmd.feeds.unq.push(...st.unq);
+  cmd.feeds.ops.push(...st.ops);
   cmd.feeds.files.push(...st.files);
   cmd.feeds.groups.push(...st.groups);
   cmd.feeds.computed.push(...st.computed);
@@ -848,7 +852,7 @@ export function scriptFeedsOf(cmd, line = cmd?.raw, resolve = null) {
     const e = resolve(w);
     return typeof e === 'string' && e !== '' && !/[$`\s]/.test(e) ? e : w;
   };
-  const f = { files: raw0.files.map(R), groups: raw0.groups.map((g) => g.map(R)), computed: raw0.computed.map(R), raws: raw0.raws, pat: raw0.pat.map(R), unq: raw0.unq.map(R) };
+  const f = { files: raw0.files.map(R), groups: raw0.groups.map((g) => g.map(R)), computed: raw0.computed.map(R), raws: raw0.raws, pat: raw0.pat.map(R), unq: raw0.unq.map(R), ops: (raw0.ops ?? []).map(R) };
   const exact = [...new Set(f.files)];
   const computed = [...new Set(f.computed)].filter((w) => !exact.includes(w));
   const rec = (kind) => (w) => (hasExpansion(w) ? { kind, file: w, ambiguous: true, words: [w] } : { kind, file: w });
@@ -867,7 +871,8 @@ export function scriptFeedsOf(cmd, line = cmd?.raw, resolve = null) {
   // (a glob, `$`, a substitution, a brace list, `~user`), the text the shell reads cannot be rebuilt, so the line is refused instead of
   // judging each word on its own (a guarded word split across a literal file and a glob / variable file escaped that way). Operands are
   // counted across the exact readers and the rewriting producers' file-role words (not their program text: `sed 's/$/x/' f`).
-  const rewritten = f.computed.filter((w) => pat.has(w));
+  const ops = new Set(f.ops);
+  const rewritten = f.computed.filter((w) => pat.has(w) && ops.has(w));
   const unq = new Set(f.unq);
   if (f.files.length + rewritten.length >= 2 && (f.files.some((w) => opaqueFile(w, true)) || rewritten.some((w) => opaqueFile(w, unq.has(w))))) return [refuse];
   // Fail closed (review R2-B1): exact readers and rewriting producers feeding the SAME program (`{ cat a; tail -c 99 b; } | bash`) are one text
