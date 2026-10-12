@@ -242,6 +242,14 @@ export function pathsDifferingFromHead(paths, headBlobs, hashes) {
   return paths.filter((p, i) => headBlobs.get(p) !== hashes[i]);
 }
 
+// Name of the write lock for one claude-home: two installs into the same home exclude each other, installs into
+// different homes do not. The resolved path is case-folded where the filesystem is (Windows, macOS), then hashed so
+// the name is a safe file name whatever the path holds.
+export function installLockName(home) {
+  const resolved = path.resolve(home);
+  return `installer-${createHash('sha256').update(foldCase(resolved)).digest('hex').slice(0, 16)}`;
+}
+
 // The same manifest, minus the one field that changes on every run.
 export const manifestWithoutTime = ({ installedAt, ...rest }) => rest;
 

@@ -13,9 +13,10 @@ import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join, dirname, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { tryAcquire, release, inspect } from '../pipeline/lib/locks.mjs';
 import {
   mergeSettings, removeOurSettings, isOurHandler, ourAllowEntries, renameWithRetry, collectDiagnostics,
-  shellRcPaths, parseArgs, buildPlan, walkFiles, safeManifestKey, GUARD_FILES_MATCHER, GUARD_GIT_MATCHER, HOOK_LOADER,
+  installLockName, shellRcPaths, parseArgs, buildPlan, walkFiles, safeManifestKey, GUARD_FILES_MATCHER, GUARD_GIT_MATCHER, HOOK_LOADER,
 } from '../pipeline/lib/installer.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -1341,4 +1342,80 @@ test('a source that is a subdirectory of a repo is compared by its own paths', (
   assert.equal(installReport(newHome(), dir).sourceSha, head);
   writeFileSync(join(dir, 'VERSION'), '9.9.8\n');
   assert.equal(installReport(newHome(), dir).sourceSha, null);
+});
+
+// ---- A5: one write lock -----------------------------------------------------------------------------------------
+
+const MACHINE = 'test-machine-id';
+function lockEnv() {
+  const dir = scratch('cp-locks');
+  return { dir, env: { PIPELINE_LOCK_DIR: dir, PIPELINE_MACHINE_ID: MACHINE } };
+}
+const holdLock = (home, dir, extra = {}) => {
+  const got = tryAcquire(installLockName(home), { dir, machineId: MACHINE, ...extra });
+  assert.equal(got.acquired, true);
+  return got.lock;
+};
+
+test('the lock name is scoped to the resolved claude-home: same home same name, another home another name, always a safe file name', () => {
+  const a = newHome();
+  const b = newHome();
+  assert.equal(installLockName(a), installLockName(join(a, '..', 'claude')));
+  assert.notEqual(installLockName(a), installLockName(b));
+  assert.match(installLockName(newHome({ space: true })), /^installer-[0-9a-f]{16}$/);
+});
+
+test('install and uninstall refuse while another install holds the lock for that home (exit 1, nothing written); --check ignores it', () => {
+  const home = newHome();
+  const { dir, env } = lockEnv();
+  assert.equal(install(home, [], { env }).status, 0);
+  const manifestBefore = readFileSync(join(home, 'pipeline', 'INSTALLED.json'), 'utf8');
+  const lock = holdLock(home, dir);
+  try {
+    writeFileSync(join(home, 'skills', 'ship', 'SKILL.md'), 'edited while locked\n');
+    const busy = install(home, [], { env });
+    assert.equal(busy.status, 1);
+    assert.match(busy.stderr, /another install is running in /);
+    assert.ok(busy.stderr.includes(home), busy.stderr);
+    assert.equal(readFileSync(join(home, 'skills', 'ship', 'SKILL.md'), 'utf8'), 'edited while locked\n', 'nothing was repaired');
+    assert.equal(readFileSync(join(home, 'pipeline', 'INSTALLED.json'), 'utf8'), manifestBefore);
+
+    const busyUninstall = install(home, ['--uninstall'], { env });
+    assert.equal(busyUninstall.status, 1);
+    assert.match(busyUninstall.stderr, /another install is running in /);
+    assert.ok(existsSync(join(home, 'pipeline')), 'nothing was removed');
+
+    const json = install(home, ['--json'], { env });
+    assert.equal(json.status, 1);
+    assert.match(JSON.parse(json.stdout).error, /another install is running in /);
+
+    const check = install(home, ['--check'], { env });
+    assert.equal(check.status, 1, 'drift (the edit), not a lock error');
+    assert.match(check.stdout, /modified: skills\/ship\/SKILL\.md/);
+
+    const other = newHome();
+    assert.equal(install(other, [], { env }).status, 0, 'a different claude-home has its own lock');
+  } finally {
+    release(lock);
+  }
+  assert.equal(install(home, [], { env }).status, 0);
+  assert.equal(readFileSync(join(home, 'skills', 'ship', 'SKILL.md'), 'utf8'), readFileSync(join(FIXTURE, 'skills', 'ship', 'SKILL.md'), 'utf8'));
+});
+
+test('a lock left by a dead process is reclaimed; the lock is released after install, uninstall and a failed install', () => {
+  const home = newHome();
+  const { dir, env } = lockEnv();
+  const dead = spawnSync(process.execPath, ['-e', '0']).pid;
+  holdLock(home, dir, { pid: dead });
+  assert.equal(install(home, [], { env }).status, 0, 'owner pid is gone: reclaimed');
+  assert.equal(inspect(installLockName(home), { dir }), null, 'released after install');
+
+  assert.equal(install(home, ['--uninstall'], { env }).status, 0);
+  assert.equal(inspect(installLockName(home), { dir }), null, 'released after uninstall');
+
+  const broken = newHome();
+  mkdirSync(broken, { recursive: true });
+  writeFileSync(join(broken, 'agents'), 'a file where the agents/ dir has to go\n');
+  assert.equal(install(broken, [], { env }).status, 1);
+  assert.equal(inspect(installLockName(broken), { dir }), null, 'released after a failed install');
 });

@@ -15,6 +15,7 @@ import { run } from './pipeline/lib/proc.mjs';
 import { expandHome, isInside, safeTimestamp } from './pipeline/lib/paths.mjs';
 import * as I from './pipeline/lib/installer.mjs';
 import { hasClaudeCodeAncestor } from './pipeline/lib/claude-ancestry.mjs';
+import { tryAcquire, release } from './pipeline/lib/locks.mjs';
 
 class InstallError extends Error {
   constructor(message, exitCode = 1) {
@@ -450,6 +451,25 @@ function formatReport(r) {
   return `${lines.join('\n')}\n`;
 }
 
+// ---- write lock --------------------------------------------------------------------------------------------
+
+// Install and uninstall (not --check) hold one lock per claude-home for the whole write run, so two of them can never
+// interleave their swaps. locks.mjs reclaims a lock whose owner process is dead; a live owner (or another machine's)
+// is never touched. PIPELINE_LOCK_DIR moves the lock directory (tests). `pipeline update` runs this installer as a
+// child and takes no lock of its own, so it cannot deadlock against it.
+function takeWriteLock(home, env) {
+  let got;
+  try {
+    got = tryAcquire(I.installLockName(home), { dir: env.PIPELINE_LOCK_DIR || undefined });
+  } catch (err) {
+    throw new InstallError(`could not take the install lock: ${err?.message ?? err}`);
+  }
+  if (got.acquired) return got.lock;
+  if (got.error) throw new InstallError(`could not take the install lock: ${got.error.message}`);
+  const who = got.owner && !got.owner.incomplete ? ` (pid ${got.owner.pid} on ${got.owner.host}, since ${got.owner.startedAt})` : '';
+  throw new InstallError(`another install is running in ${home}${who}. Wait for it to finish, then run this again.`);
+}
+
 // ---- main --------------------------------------------------------------------------------------------------
 
 function main(argv, env) {
@@ -471,7 +491,9 @@ function main(argv, env) {
   const home = path.resolve(expandHome(opts.claudeHome || env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude')));
   const source = path.resolve(expandHome(opts.source || path.dirname(fileURLToPath(import.meta.url))));
   const ctx = { opts, home, source, env };
+  let lock = null;
   try {
+    if (!opts.check) lock = takeWriteLock(home, env);
     const report = opts.check ? doCheck(ctx) : opts.uninstall ? doUninstall(ctx) : doInstall(ctx);
     process.stdout.write(opts.json ? `${JSON.stringify(report, null, 2)}\n` : formatReport(report));
     return report.ok ? 0 : 1;
@@ -481,6 +503,8 @@ function main(argv, env) {
     process.stderr.write(`install.mjs: ${message}\n`);
     if (opts.json) process.stdout.write(`${JSON.stringify({ ok: false, error: message }, null, 2)}\n`);
     return exitCode;
+  } finally {
+    if (lock) { try { release(lock); } catch { /* a stuck lock is reclaimed once this process is gone */ } }
   }
 }
 
