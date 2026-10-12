@@ -237,3 +237,43 @@ test('guard-files: a big file judged as program text is not an expansion (PATH=.
     assert.equal(r.decision, 'allow', `${r.reason} <- ${c.slice(0, 60)}`);
   }
 });
+
+// ---- review R1-B1: the parameter-expansion scan is one linear pass and obeys the deadline -------------------------------------------
+// `: ${x:-` + 150,000 `(` + `}` used to rescan the rest of the body for every `(` (quadratic: ~21 s, past the hook timeout, which Claude Code
+// reads as allow). The text after it is a push to the protected branch, built at run time so this file holds no guarded text.
+import { assertLinear, cpuTime } from './helpers/timing.mjs';
+
+const parenBomb = (n, tail) => `: \${x:-${'('.repeat(n)}}; ${tail}`;
+const MAIN_PUSH = `git push origin ${'ma'}${'in'}`;
+const PROTECTED_WRITE = `echo x > ~/.claude/${'sett'}${'ings.json'}`; // what guard-files refuses
+
+for (const [name, run] of both) {
+  const decide = (cmd, o) => run(cmd, {}, o);
+  const BAD = name === 'guard-git' ? MAIN_PUSH : PROTECTED_WRITE;
+  test(`${name}: the parenthesis scan inside \${...} is linear (CPU time at 2n vs n)`, () => {
+    const sample = (n) => () => cpuTime(() => decide(parenBomb(n, 'echo hi')));
+    assertLinear(sample(20_000), sample(40_000), { label: `${name} paren scan` });
+  });
+
+  test(`${name}: 150,000 open parentheses in \${...} then a guarded command is denied, and fast`, () => {
+    const { r, ms } = timed(() => decide(parenBomb(150_000, BAD)));
+    assert.equal(r.decision, 'deny');
+    assert.ok(ms < 3000, `took ${ms} ms`);
+  });
+
+  test(`${name}: the parenthesis scan checks the evaluation's deadline (injected clock): past it is a denial, not an allow`, () => {
+    // 400 ms per clock read: the reads before the parse are few (under the 5 s deadline), the scan's periodic reads (one per 1024 characters) push it past
+    const ticking = () => { let t = 1_000_000; return { now: () => (t += 400) }; };
+    const r = decide(parenBomb(40_000, 'echo hi'), ticking());
+    assert.equal(r.decision, 'deny');
+    assert.match(r.reason, /took too long|too complex/);
+    // a clock that stands still allows the same harmless line
+    assert.equal(decide(parenBomb(40_000, 'echo hi'), { now: () => 5 }).decision, 'allow');
+  });
+
+  test(`${name}: balanced groups inside \${...} are still judged (\${x:-(bash f.sh)} runs nothing, but its body is read)`, () => {
+    assert.equal(decide('echo ${x:-(echo hi)}').decision, 'allow');
+    assert.equal(decide(`echo \${x:-(${BAD})}`).decision, 'deny');
+    assert.equal(decide(`echo \${x:-((${BAD}))}`).decision, 'deny');
+  });
+}

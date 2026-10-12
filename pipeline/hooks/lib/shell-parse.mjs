@@ -1340,12 +1340,19 @@ class Parser {
           inWord = true; wdyn = true;
           const body = s.slice(this.i, end);
           // `${x:-(bash f.sh)}` is no command, but no body between parentheses is ever dropped: each balanced group is also judged
-          for (let o = body.indexOf('('); o >= 0; o = body.indexOf('(', o + 1)) {
-            let d = 0;
-            for (let k = o; k < body.length; k++) {
-              if (body[k] === '(') d++;
-              else if (body[k] === ')' && --d === 0) { if (body.slice(o + 1, k).trim()) this.subParse(body.slice(o + 1, k), depth + 1); break; }
-            }
+          // One pass with a stack of open positions (a rescan from every `(` is quadratic: 150,000 of them outlast the hook timeout, which reads as allow);
+          // the evaluation's deadline is read as it goes. The groups are judged in the order of their opening parenthesis.
+          const open = [];
+          const groups = [];
+          for (let k = 0; k < body.length; k++) {
+            if ((k & 1023) === 0 && this.ctx.expired?.()) { this.ctx.stopped = true; this.ctx.truncated = true; break; }
+            if (body[k] === '(') open.push(k);
+            else if (body[k] === ')' && open.length) groups.push([open.pop(), k]);
+          }
+          groups.sort((a, b) => a[0] - b[0]);
+          for (const [o, k] of groups) {
+            if (this.ctx.stopped) break;
+            if (body.slice(o + 1, k).trim()) this.subParse(body.slice(o + 1, k), depth + 1);
           }
           cur += body;
           this.i = end;
@@ -1734,7 +1741,9 @@ class Parser {
 
 export function simpleCommands(str, opts) {
   const requested = Number.isFinite(opts?.maxDepth) ? Math.trunc(opts.maxDepth) : 5;
-  const ctx = { out: [], maxDepth: Math.min(Math.max(requested, 0), HARD_MAX_DEPTH), truncated: false, dynamic: false, subshell: false, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0 };
+  // opts.expired: () => true once the evaluation's wall-clock deadline has passed; scans that can run long poll it and give up (truncated)
+  const expired = typeof opts?.expired === 'function' ? opts.expired : null;
+  const ctx = { out: [], expired, maxDepth: Math.min(Math.max(requested, 0), HARD_MAX_DEPTH), truncated: false, dynamic: false, subshell: false, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0 };
   let parser = null;
   try {
     parser = new Parser(ctx, String(str ?? ''));
