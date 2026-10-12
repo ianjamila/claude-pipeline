@@ -20,16 +20,16 @@ const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
 
 // ---- text hygiene ---------------------------------------------------------------------------
 
-const defuse = (s) => s.replace(/<!--/g, '&lt;!--').replace(/-->/g, '--&gt;').replace(/@/g, '\uFF20');
-const flat = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
-const clip = (s, max) => {
+export const defuse = (s) => s.replace(/<!--/g, '&lt;!--').replace(/-->/g, '--&gt;').replace(/@/g, '\uFF20');
+export const flat = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
+export const clip = (s, max) => {
   const chars = Array.from(s); // by code point, so an emoji is never cut in half
   return chars.length > max ? `${chars.slice(0, max - 1).join('').trimEnd()}…` : s;
 };
 // One line of prose for a list item.
-const line = (s, max = Infinity) => defuse(clip(flat(s), max));
+export const line = (s, max = Infinity) => defuse(clip(flat(s), max));
 // One markdown table cell.
-const cell = (s, max = Infinity) => line(s, max).replace(/\|/g, '&#124;');
+export const cell = (s, max = Infinity) => line(s, max).replace(/\|/g, '&#124;');
 
 // ---- triage comment -------------------------------------------------------------------------
 
@@ -145,7 +145,9 @@ function followupsSection(entries, followups) {
   return [...lines, '', 'Promote one by relabelling `agent-suggestion` → `agent-build`.'].join('\n');
 }
 
-export function summaryComment(state, { outcome, built, followups = [], modelProofs = [] }) {
+// The body of the summary comment without its marker (the run record's writer composes marker + status block + this +
+// record marker; see summary-comment.mjs).
+export function summarySections(state, { outcome, built, followups = [], modelProofs = [] }) {
   const entries = entriesOf(state);
   const implemented = unique(entries.filter(({ item }) => item.final?.decision === 'ACCEPT' && item.implemented)).map(
     ({ item, n }) => `- ${findingLabel(item)} (round ${n})`,
@@ -156,8 +158,6 @@ export function summaryComment(state, { outcome, built, followups = [], modelPro
   });
   const section = (heading, body) => `${heading}\n\n${body}`;
   return [
-    MARKERS.summary,
-    '',
     section('### Outliers', outliersSection(entries, modelProofs)),
     '',
     section('### What was built', built ? defuse(String(built).trim()) : '_Not provided_'),
@@ -170,6 +170,10 @@ export function summaryComment(state, { outcome, built, followups = [], modelPro
     '',
     section('### Outcome', `**${line(outcome)}**`),
   ].join('\n');
+}
+
+export function summaryComment(state, opts) {
+  return [MARKERS.summary, '', summarySections(state, opts)].join('\n');
 }
 
 // ---- needs-human, blocked, awaiting-review --------------------------------------------------
