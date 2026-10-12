@@ -29,7 +29,10 @@ export function summaryFromComments(comments, viewerLogin) {
   return { ...decoded, sections: sectionsOf(found.body), url: found.html_url ?? null, id: found.id };
 }
 
-export const readSummaryComment = (gh, pr) => summaryFromComments(gh.listComments(pr), gh.viewer());
+export function readSummaryComment(gh, pr) {
+  const me = gh.viewer(); // asked first: without a viewer there is nothing to match, so the comments are not even read
+  return summaryFromComments(gh.listComments(pr), me);
+}
 
 // `record` / `sections` left undefined are kept from the existing comment; pass `existing` (a readSummaryComment result)
 // to avoid reading it twice. An existing record this CLI cannot read (`unsupported`, newer version) is never dropped
