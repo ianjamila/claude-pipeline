@@ -118,6 +118,11 @@ function echoTexts(argv) {
 //   inline   program text of node -e / python -c ...: it may write a file whose name it spells
 // items: what the file may hold: { text } | { file: word } | { scan: word } (a file a rewriting command computes the text from) | { unknown: true }
 const UNKNOWN = [{ unknown: true }];
+// A command whose options decide WHICH file it writes (a config file, a response header, a list, --parents ...) in a way we do not follow: it may write ANY file (an existing script too), and a
+// script missing now may have been created by it (`unmodelled`)
+const anywhere = (idx) => ({ idx, dest: null, items: UNKNOWN, loose: true });
+const orAnywhere = (recs, idx, yes) => { if (yes) { recs.push(anywhere(idx)); recs.unmodelled = true; } return recs; };
+const RC_ENV = /^(?:WGETRC|CURL_HOME|XDG_CONFIG_HOME|HOME)$/; // (a startup file of the tool is read from there: it can name outputs)
 const WRITE_OPS = new Set(['>', '>>', '>|', '>&', '&>', '&>>', '<>']);
 
 const PURE = new Set([
@@ -141,12 +146,22 @@ const INLINE_RUNNERS = { node: /^(?:-e|-p|--eval|--print)$/, nodejs: /^(?:-e|-p|
 
 // curl: the short options that take a value (the rest are switches), the long options that name an output file, the long switches and value options we
 // know. Anything else (an unknown long option, a config file -K, `-:` groups) is not certain: null, the command is unmodelled.
-const CURL_SHORT_VALUE = 'AbcCdDeEFHKmoPQrtTuUwXxyYz';
+const CURL_SHORT_VALUE = 'AbcCdDeEFHhKmoPQrtTuUwXxyYz';
 const CURL_LONG_OUT = new Set(['output', 'dump-header', 'cookie-jar', 'trace', 'trace-ascii', 'stderr', 'etag-save', 'hsts', 'alt-svc', 'libcurl', 'output-dir']);
-const CURL_LONG_VALUE = new Set(['header', 'data', 'data-raw', 'data-binary', 'data-urlencode', 'request', 'user-agent', 'user', 'referer', 'max-time', 'connect-timeout', 'retry', 'retry-delay', 'retry-max-time', 'form', 'form-string', 'write-out', 'proxy', 'proxy-user', 'upload-file', 'range', 'cookie', 'cacert', 'cert', 'key', 'url', 'resolve', 'connect-to', 'limit-rate', 'continue-at', 'time-cond', 'oauth2-bearer', 'json', 'variable', 'expand-url', 'aws-sigv4', 'interface', 'dns-servers', 'noproxy', 'proto', 'request-target', 'speed-limit', 'speed-time', 'max-filesize', 'max-redirs', 'tls-max', 'tlsv1', 'ciphers', 'pinnedpubkey', 'quote', 'telnet-option', 'ftp-port', 'unix-socket', 'etag-compare', 'happy-eyeballs-timeout-ms', 'max-redirs', 'keepalive-time', 'local-port', 'parallel-max', 'rate', 'retry-connrefused']);
-const CURL_LONG_SWITCH = new Set(['silent', 'show-error', 'location', 'fail', 'insecure', 'head', 'include', 'verbose', 'compressed', 'globoff', 'remote-name', 'remote-name-all', 'remote-header-name', 'create-dirs', 'progress-bar', 'no-progress-meter', 'fail-with-body', 'location-trusted', 'get', 'http1.1', 'http2', 'http3', 'ipv4', 'ipv6', 'no-buffer', 'netrc', 'anyauth', 'basic', 'digest', 'negotiate', 'ntlm', 'tcp-nodelay', 'raw', 'path-as-is', 'show-headers', 'fail-early', 'parallel', 'parallel-immediate', 'no-keepalive', 'junk-session-cookies', 'ssl-reqd', 'ssl', 'tlsv1.2', 'tlsv1.3', 'disable', 'proxy-insecure', 'suppress-connect-headers', 'styled-output', 'xattr', 'remove-on-error', 'skip-existing', 'no-clobber', 'clobber', 'compressed-ssh', 'doh-insecure', 'ignore-content-length']);
-function curlRecords(args, idx) {
+const CURL_LONG_VALUE = new Set(['header', 'data', 'data-raw', 'data-binary', 'data-urlencode', 'request', 'user-agent', 'user', 'referer', 'max-time', 'connect-timeout', 'retry', 'retry-delay', 'retry-max-time', 'form', 'form-string', 'write-out', 'proxy', 'proxy-user', 'upload-file', 'range', 'cookie', 'cacert', 'cert', 'key', 'url', 'resolve', 'connect-to', 'limit-rate', 'continue-at', 'time-cond', 'oauth2-bearer', 'json', 'variable', 'expand-url', 'aws-sigv4', 'interface', 'dns-servers', 'noproxy', 'proto', 'request-target', 'speed-limit', 'speed-time', 'max-filesize', 'max-redirs', 'tls-max', 'ciphers', 'pinnedpubkey', 'quote', 'telnet-option', 'ftp-port', 'unix-socket', 'etag-compare', 'happy-eyeballs-timeout-ms', 'max-redirs', 'keepalive-time', 'local-port', 'parallel-max', 'rate']);
+const CURL_LONG_SWITCH = new Set(['retry-connrefused', 'tlsv1', 'silent', 'show-error', 'location', 'fail', 'insecure', 'head', 'include', 'verbose', 'compressed', 'globoff', 'remote-name', 'remote-name-all', 'remote-header-name', 'create-dirs', 'progress-bar', 'no-progress-meter', 'fail-with-body', 'location-trusted', 'get', 'http1.1', 'http2', 'http3', 'ipv4', 'ipv6', 'no-buffer', 'netrc', 'anyauth', 'basic', 'digest', 'negotiate', 'ntlm', 'tcp-nodelay', 'raw', 'path-as-is', 'show-headers', 'fail-early', 'parallel', 'parallel-immediate', 'no-keepalive', 'junk-session-cookies', 'ssl-reqd', 'ssl', 'tlsv1.2', 'tlsv1.3', 'disable', 'proxy-insecure', 'suppress-connect-headers', 'styled-output', 'xattr', 'remove-on-error', 'skip-existing', 'no-clobber', 'clobber', 'compressed-ssh', 'doh-insecure', 'ignore-content-length']);
+// wget: its options (wget's own table: a boolean takes an optional =VALUE and has a --no- form; a valued one takes the next word). An abbreviation is not resolved: our list may not be the whole of wget's,
+// so an unknown or abbreviated name is unmodelled.
+const WGET_OPTIONS = {
+  exact: true, negate: true, switchEq: true,
+  shortVal: 'OPoaetTwQiBlARDIXnUY', shortSwitch: 'bdqvVhrmkKpxLsNcSFEH46',
+  longVal: ['execute', 'output-file', 'append-output', 'report-speed', 'input-file', 'input-metalink', 'base', 'config', 'rejected-log', 'tries', 'retry-on-http-error', 'output-document', 'backups', 'start-pos', 'progress', 'timeout', 'dns-timeout', 'connect-timeout', 'read-timeout', 'wait', 'waitretry', 'quota', 'bind-address', 'limit-rate', 'restrict-file-names', 'prefer-family', 'user', 'password', 'use-askpass', 'local-encoding', 'remote-encoding', 'metalink-index', 'preferred-location', 'directory-prefix', 'cut-dirs', 'http-user', 'http-password', 'default-page', 'header', 'compression', 'max-redirect', 'proxy-user', 'proxy-password', 'referer', 'user-agent', 'load-cookies', 'save-cookies', 'post-data', 'post-file', 'method', 'body-data', 'body-file', 'secure-protocol', 'certificate', 'certificate-type', 'private-key', 'private-key-type', 'ca-certificate', 'ca-directory', 'crl-file', 'pinnedpubkey', 'random-file', 'egd-file', 'ciphers', 'hsts-file', 'ftp-user', 'ftp-password', 'warc-file', 'warc-header', 'warc-max-size', 'warc-dedup', 'warc-tempdir', 'level', 'accept', 'reject', 'accept-regex', 'reject-regex', 'regex-type', 'domains', 'exclude-domains', 'follow-tags', 'ignore-tags', 'include-directories', 'exclude-directories', 'bind-dns-address', 'dns-servers'],
+  longOpt: [],
+  longSwitch: ['help', 'version', 'background', 'debug', 'quiet', 'verbose', 'force-html', 'retry-connrefused', 'retry-on-host-error', 'continue', 'show-progress', 'timestamping', 'server-response', 'spider', 'random-wait', 'proxy', 'ask-password', 'iri', 'unlink', 'keep-badhash', 'metalink-over-http', 'xattr', 'directories', 'force-directories', 'host-directories', 'protocol-directories', 'cache', 'adjust-extension', 'ignore-length', 'save-headers', 'http-keep-alive', 'cookies', 'keep-session-cookies', 'content-disposition', 'content-on-error', 'auth-no-challenge', 'https-only', 'check-certificate', 'hsts', 'remove-listing', 'glob', 'passive-ftp', 'preserve-permissions', 'retr-symlinks', 'ftps-implicit', 'ftps-resume-ssl', 'ftps-clear-data-connection', 'ftps-fallback-to-ftp', 'warc-cdx', 'warc-compression', 'warc-digests', 'warc-keep-log', 'recursive', 'delete-after', 'convert-file-only', 'convert-links', 'backup-converted', 'mirror', 'page-requisites', 'strict-comments', 'follow-ftp', 'span-hosts', 'relative', 'parent', 'clobber', 'if-modified-since', 'use-server-timestamps', 'dns-cache', 'ignore-case', 'inet4-only', 'inet6-only', 'trust-server-names'],
+};
+function curlRecords(args, idx, env = {}) {
   const out = [];
+  let anyOutput = Object.keys(env).some((k) => RC_ENV.test(k)); // (a config file: -K / --config / --next / a startup file from CURL_HOME: it can name any output)
   const unknown = (dest, extra = {}) => ({ idx, dest, items: UNKNOWN, ...extra });
   let remote = false;
   let header = false;
@@ -159,7 +174,7 @@ function curlRecords(args, idx) {
       const eq = a.indexOf('=');
       const nm = eq > 0 ? a.slice(2, eq) : a.slice(2);
       const val = eq > 0 ? a.slice(eq + 1) : null;
-      if (nm === 'config' || nm === 'next') return null;
+      if (nm === 'config' || nm === 'next') { anyOutput = true; continue; }
       if (CURL_LONG_OUT.has(nm)) {
         const v = val ?? args[++i] ?? '';
         if (nm === 'output-dir') outDir = v; else if (v !== '-' && v !== '') out.push(unknown(v));
@@ -174,9 +189,9 @@ function curlRecords(args, idx) {
         if (ch === 'O') { remote = true; continue; }
         if (ch === 'J') { remote = true; header = true; continue; }
         if (!CURL_SHORT_VALUE.includes(ch)) continue; // a switch
-        if (ch === 'K') return null;
+        if (ch === 'K') { anyOutput = true; break; }
         const rest = a.slice(k + 1);
-        const v = rest !== '' ? rest.replace(/^=/, '') : (args[++i] ?? '');
+        const v = rest !== '' ? rest : (args[++i] ?? ''); // (attached verbatim: `-o=n.sh` is the file `=n.sh`)
         if (ch === 'o' || ch === 'D' || ch === 'c') { if (v !== '-' && v !== '') out.push(unknown(v)); }
         break;
       }
@@ -184,11 +199,12 @@ function curlRecords(args, idx) {
     }
     urls.push(a);
   }
+  if (urls.some((u) => /[[{]/.test(u)) && !args.some((a) => a === '-g' || a === '--globoff') || out.some((o) => /#\d/.test(o.dest))) anyOutput = true; // (a globbed URL / a #1 output name makes many files)
   if (remote) {
     for (const u of urls) if (urlBase(u)) out.push(unknown(outDir ? `${outDir.replace(/\/+$/, '')}/${urlBase(u)}` : urlBase(u)));
     if (header) out.push(unknown(outDir || '.', { subtree: true })); // the name comes from the response
   }
-  return out;
+  return orAnywhere(out, idx, anyOutput);
 }
 
 // Minimal getopt: `shortVal` / `longVal` name the options that take a value.
@@ -215,12 +231,63 @@ function getopt(args, shortVal = '', longVal = []) {
   }
   return { pos, opts };
 }
+// Strict getopt for a command whose options we know completely (GNU getopt_long): a long option may be written as any unique prefix of a known one (--target-d); `longVal` take a value
+// (next word or =), `longOpt` only with =, `longSwitch` none. `negate`: --no-X negates a known X (git). `bad`: an option we cannot place (unknown, ambiguous, a short option not listed): the
+// operands may be shifted, so the caller treats the command as unmodelled. Opt names are the resolved full names.
+function getoptStrict(args, { shortVal = '', shortSwitch = '', longVal = [], longOpt = [], longSwitch = [], negate = false, exact = false, switchEq = false }) {
+  const pos = [];
+  const opts = [];
+  let bad = false;
+  const all = [...longVal, ...longOpt, ...longSwitch];
+  const resolve = (nm) => {
+    if (all.includes(nm)) return nm;
+    const m = all.filter((x) => x.startsWith(nm));
+    return !exact && nm !== '' && m.length === 1 ? m[0] : null;
+  };
+  for (let i = 0; i < args.length; i++) {
+    const t = args[i];
+    if (t === '--') { pos.push(...args.slice(i + 1)); break; }
+    if (t.startsWith('--')) {
+      const eq = t.indexOf('=');
+      const nm = eq > 0 ? t.slice(2, eq) : t.slice(2);
+      let full = resolve(nm);
+      let negated = false;
+      if (full === null && negate && nm.startsWith('no-')) { full = resolve(nm.slice(3)); negated = full !== null; }
+      if (full === null) { bad = true; continue; }
+      if (negated || longSwitch.includes(full)) { if (eq > 0 && !negated && !switchEq) bad = true; opts.push({ name: full, value: null, negated }); } else if (longOpt.includes(full)) opts.push({ name: full, value: eq > 0 ? t.slice(eq + 1) : null });
+      else opts.push({ name: full, value: eq > 0 ? t.slice(eq + 1) : (args[++i] ?? '') });
+    } else if (t.length > 1 && t[0] === '-') {
+      for (let k = 1; k < t.length; k++) {
+        if (shortVal.includes(t[k])) {
+          let value = t.slice(k + 1); // (verbatim: `-O=n.sh` is the file `=n.sh`)
+          if (value === '') value = args[++i] ?? '';
+          opts.push({ name: t[k], value });
+          break;
+        }
+        if (!shortSwitch.includes(t[k])) bad = true;
+        opts.push({ name: t[k], value: null });
+      }
+    } else pos.push(t);
+  }
+  return { pos, opts, bad };
+}
 const optValue = (opts, ...names) => opts.find((o) => names.includes(o.name) && o.value !== null)?.value ?? null;
 const hasOpt = (opts, ...names) => opts.some((o) => names.includes(o.name));
+const optValues = (opts, ...names) => opts.filter((o) => names.includes(o.name) && o.value !== null).map((o) => o.value); // (every occurrence: a repeated option counts each time)
 
+// cp mv ln install: their options (GNU and BSD), complete, so a long option can be resolved and an unknown one is noticed
+const COPY_STRICT = {
+  cp: { shortVal: 'tS', shortSwitch: 'abcdfHiLlnPpRrsTuvxXZ', longVal: ['target-directory', 'suffix', 'no-preserve', 'sparse'], longOpt: ['backup', 'preserve', 'reflink', 'context'],
+    longSwitch: ['archive', 'attributes-only', 'copy-contents', 'debug', 'dereference', 'force', 'interactive', 'link', 'no-clobber', 'no-dereference', 'no-target-directory', 'one-file-system', 'parents', 'recursive', 'remove-destination', 'strip-trailing-slashes', 'symbolic-link', 'update', 'verbose', 'keep-directory-symlink', 'help', 'version'] },
+  mv: { shortVal: 'tS', shortSwitch: 'bfhinTuvxZ', longVal: ['target-directory', 'suffix'], longOpt: ['backup', 'update', 'context'],
+    longSwitch: ['debug', 'exchange', 'force', 'interactive', 'no-clobber', 'no-copy', 'no-target-directory', 'strip-trailing-slashes', 'verbose', 'help', 'version'] },
+  ln: { shortVal: 'tS', shortSwitch: 'bdFfhiLnPrsTvw', longVal: ['target-directory', 'suffix'], longOpt: ['backup'],
+    longSwitch: ['directory', 'force', 'interactive', 'logical', 'no-dereference', 'physical', 'relative', 'symbolic', 'no-target-directory', 'verbose', 'help', 'version'] },
+  install: { shortVal: 'mogStBfl', shortSwitch: 'bCcdDMpsTUvZ', longVal: ['mode', 'owner', 'group', 'suffix', 'target-directory', 'strip-program'], longOpt: ['backup', 'context'],
+    longSwitch: ['compare', 'directory', 'debug', 'preserve-timestamps', 'preserve-context', 'strip', 'no-target-directory', 'unprivileged', 'verbose', 'create-leading', 'help', 'version'] },
+};
 const COPY_VALUE = {
-  cp: ['tS', ['target-directory', 'suffix']], mv: ['tS', ['target-directory', 'suffix']], install: ['mogStT', ['mode', 'owner', 'group', 'suffix', 'target-directory']],
-  ln: ['tS', ['target-directory', 'suffix']], ditto: ['', []], rsync: ['eBMfT', ['rsh', 'exclude', 'include', 'filter', 'exclude-from', 'include-from', 'files-from', 'temp-dir', 'backup-dir', 'suffix']],
+  ditto: ['', []], rsync: ['eBMfT', ['rsh', 'exclude', 'include', 'filter', 'exclude-from', 'include-from', 'files-from', 'temp-dir', 'backup-dir', 'suffix']],
 };
 
 const dedupe = (items) => [...new Map(items.map((i) => [JSON.stringify(i), i])).values()];
@@ -305,16 +372,28 @@ const urlBase = (u) => u.replace(/[?#].*$/, '').replace(/\/+$/, '').split('/').p
 function argRecords(cmd, name, idx) {
   const args = cmd.argv.slice(1);
   const unknown = (dest, extra = {}) => ({ idx, dest, items: UNKNOWN, ...extra });
-  if (COPY_VALUE[name] || (name === 'git' && gitSub(args) === 'mv')) {
+  if (COPY_STRICT[name] || COPY_VALUE[name] || (name === 'git' && gitSub(args) === 'mv')) {
     const mv = name === 'git'; // git mv SRC DST: the words after the real subcommand
-    const [sv, lv] = mv ? ['', []] : COPY_VALUE[name];
-    const { pos, opts } = getopt(mv ? args.slice(gitSubAt(args) + 1) : args, sv, lv);
+    let pos;
+    let opts;
+    if (COPY_STRICT[name]) {
+      const r = getoptStrict(args, COPY_STRICT[name]);
+      if (r.bad) return null; // (an option we cannot place may have shifted the operands)
+      ({ pos, opts } = r);
+    } else {
+      const [sv, lv] = mv ? ['', []] : COPY_VALUE[name];
+      ({ pos, opts } = getopt(mv ? args.slice(gitSubAt(args) + 1) : args, sv, lv));
+    }
     if (name === 'install' && hasOpt(opts, 'd', 'directory')) return [];
-    const target = optValue(opts, 't', 'target-directory');
-    let dest;
-    let sources;
-    if (target !== null) { dest = target; sources = pos; } else if (pos.length >= 2) { dest = pos[pos.length - 1]; sources = pos.slice(0, -1); } else if (name === 'ln' && pos.length === 1) { dest = '.'; sources = pos; } else return [];
-    return [{ idx, dest, copy: true, link: name === 'ln' ? (hasOpt(opts, 's', 'symbolic') ? 'sym' : 'hard') : undefined, items: sources.map((file) => ({ file })) }];
+    const targets = optValues(opts, 't', 'target-directory'); // (a repeated -t: every one)
+    let link = name === 'ln' ? (hasOpt(opts, 's', 'symbolic') ? 'sym' : 'hard') : undefined;
+    if (name === 'cp') link = hasOpt(opts, 's', 'symbolic-link') ? 'sym' : hasOpt(opts, 'l', 'link') ? 'hard' : undefined; // (cp -s / -l make links, not copies)
+    // Why: --parents puts each source at DEST/<the path as written>, --exchange swaps the two files, --strip-program runs a program: the files written are not DEST / DEST/basename
+    const odd = hasOpt(opts, 'parents', 'exchange', 'strip-program');
+    if (targets.length) return orAnywhere(targets.map((dest) => ({ idx, dest, copy: true, link, items: pos.map((file) => ({ file })) })), idx, odd);
+    if (pos.length >= 2) return orAnywhere([{ idx, dest: pos[pos.length - 1], copy: true, link, items: pos.slice(0, -1).map((file) => ({ file })) }], idx, odd);
+    if (name === 'ln' && pos.length === 1) return [{ idx, dest: '.', copy: true, link, items: pos.map((file) => ({ file })) }];
+    return null; // too few operands to place the copy (a usage error to the shell, but not one we may rely on)
   }
   if (name === 'uniq') { // uniq [OPTION] [INPUT [OUTPUT]]
     const { pos } = getopt(args, 'fsw', ['skip-fields', 'skip-chars', 'check-chars', 'group']);
@@ -335,29 +414,36 @@ function argRecords(cmd, name, idx) {
     return pos.length >= 2 ? [{ idx, dest: pos[1], items: [{ scan: pos[0] }, { unknown: true }] }] : null;
   }
   if (name === 'tee') {
-    const { pos } = getopt(args);
-    const append = hasOpt(getopt(args).opts, 'a', 'append');
+    const { pos, opts, bad } = getoptStrict(args, { shortSwitch: 'aip', longOpt: ['output-error'], longSwitch: ['append', 'ignore-interrupts', 'help', 'version'] });
+    if (bad) return null;
+    const append = hasOpt(opts, 'a', 'append');
     return pos.filter((p) => p !== '-').map((dest) => { const items = stdinItems(cmd); return { idx, dest, items, parts: items.parts, append }; });
   }
   if (name === 'dd') {
-    const of = args.find((a) => a.startsWith('of='))?.slice(3);
-    const inp = args.find((a) => a.startsWith('if='))?.slice(3);
+    const ofs = args.filter((a) => a.startsWith('of=')).map((a) => a.slice(3)); // (a repeated if= / of=: every one counts)
+    const ins = args.filter((a) => a.startsWith('if=')).map((a) => a.slice(3));
     const append = args.some((a) => /^conv=.*notrunc/.test(a) || /^oflag=.*append/.test(a));
-    const items = inp ? [{ file: inp }] : stdinItems(cmd);
-    return of ? [{ idx, dest: of, items, parts: items.parts, append }] : [];
+    const items = ins.length ? ins.map((file) => ({ file })) : stdinItems(cmd);
+    return ofs.map((of) => ({ idx, dest: of, items, parts: items.parts, append }));
   }
-  if (name === 'curl') return curlRecords(args, idx);
+  if (name === 'curl') return curlRecords(args, idx, cmd.env);
   if (name === 'wget') {
-    const { pos, opts } = getopt(args, 'OPoaeUTtwQi', ['output-document', 'directory-prefix', 'output-file', 'append-output', 'save-cookies', 'execute', 'user-agent', 'timeout', 'tries', 'wait', 'input-file']);
+    const { pos, opts, bad } = getoptStrict(args, WGET_OPTIONS);
+    if (bad) return null; // (an option we do not know, or abbreviate: the output file may be named by it)
     const out = [];
-    const o = optValue(opts, 'O', 'output-document');
+    const os = optValues(opts, 'O', 'output-document');
     const dir = optValue(opts, 'P', 'directory-prefix') ?? '';
-    if (hasOpt(opts, 'e', 'execute')) return null; // .wgetrc commands can name any output
-    for (const lf of [optValue(opts, 'o', 'output-file'), optValue(opts, 'a', 'append-output'), optValue(opts, 'save-cookies')]) if (lf) out.push(unknown(lf));
-    if (o !== null) out.push(unknown(o));
+    const noDirs = opts.some((o) => (o.name === 'n' && o.value === 'd') || (o.name === 'directories' && o.negated));
+    const recursive = hasOpt(opts, 'r', 'recursive', 'm', 'mirror', 'p', 'page-requisites');
+    // Why: a startup file (-e, --config, WGETRC), a name taken from the response / a list / a base (--content-disposition, -i, -B), a renamed (-E, --backups) or re-rooted (-x, --protocol-directories, a
+    // recursive run) file, a WARC archive: the file written is not the one the URL says
+    const odd = hasOpt(opts, 'e', 'execute', 'config', 'warc-file', 'E', 'adjust-extension', 'backups', 'x', 'force-directories', 'protocol-directories', 'B', 'base', 'i', 'input-file', 'input-metalink', 'content-disposition', 'trust-server-names')
+      || (recursive && !noDirs) || Object.keys(cmd.env ?? {}).some((k) => RC_ENV.test(k));
+    for (const lf of [...optValues(opts, 'o', 'output-file'), ...optValues(opts, 'a', 'append-output'), ...optValues(opts, 'save-cookies'), ...optValues(opts, 'rejected-log'), ...optValues(opts, 'hsts-file')]) if (lf) out.push(unknown(lf));
+    if (os.length) for (const o of os) out.push(unknown(o));
     else for (const u of pos) out.push(unknown(dir ? `${dir.replace(/\/+$/, '')}/${urlBase(u) || 'index.html'}` : urlBase(u) || 'index.html'));
-    if (hasOpt(opts, 'r', 'recursive', 'm', 'mirror')) out.push(unknown(dir || '.', { subtree: true }));
-    return out;
+    if (recursive) out.push(unknown(dir || '.', { subtree: true }));
+    return orAnywhere(out, idx, odd);
   }
   if (name === 'sed' || name === 'gsed' || name === 'perl' || name === 'ruby') {
     const isSed = name === 'sed' || name === 'gsed';
@@ -689,7 +775,7 @@ export function writesOf(cmds) {
     // subcommands that write named paths: a checkout / merge / pull also changes files we do not follow
     if ((name === 'sed' || name === 'gsed') && (sedPrograms(cmd.argv.slice(1)).file || sedPrograms(cmd.argv.slice(1)).progs.some((p) => sedScan(p).runs))) unmodelled.add(idx);
     const sub = name === 'git' ? gitSub(cmd.argv.slice(1)) : '';
-    const modelled = mine && !(name === 'git' && GIT_TREE.has(sub) && !['clone', 'worktree', 'mv'].includes(sub));
+    const modelled = mine && !mine.unmodelled && !(name === 'git' && GIT_TREE.has(sub) && !['clone', 'worktree', 'mv'].includes(sub));
     if (!modelled && !isPure(cmd, name)) unmodelled.add(idx);
   });
   return { recs, unmodelled };

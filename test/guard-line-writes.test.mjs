@@ -872,3 +872,90 @@ test('L2: after a bare BSD -i the next word is its suffix even when it starts wi
   denyBoth((_, mid) => `sed -i -l 'w n.sh' ok.sh; ${mid}; bash n.sh`);
   denyBoth((_, mid) => `sed -i -e p 'w n.sh' ok.sh; ${mid}; bash n.sh`);
 });
+
+test('L2: GNU long options of cp / mv / ln / install / tee are resolved by unique prefix; an unknown or ambiguous long option is unmodelled, never "no write"', () => {
+  // Why: `cp --target-d d f.sh` took `--target-d` for an unknown switch, so f.sh was the destination and nothing was written below d
+  for (const l of ['cp --target-d d f.sh', 'cp --target-d=d f.sh', 'cp --target=d f.sh', 'cp --t d f.sh', 'cp --target-directory=d f.sh', 'mv --target-d d f.sh', 'mv --targ=d f.sh', 'install --target-d d f.sh', 'install --t=d f.sh', 'install -m755 --target-d=d f.sh', 'cp -rt d f.sh',
+    'ln --force --target-d d f.sh', 'ln --logical --target=d f.sh', 'cp --update --target-d d f.sh', 'cp -- f.sh d']) {
+    denyBoth(`${l}; bash d/f.sh`);
+  }
+  // the copy of a harmless script into the directory is harmless
+  allowBoth('cp --target-d d ok.sh; bash d/ok.sh');
+  allowBoth('install --t=d ok.sh; bash d/ok.sh');
+  // tee --append (abbreviated) appends: the old text and the new one are judged together
+  denyBoth('cat p2.txt | tee --app h1.sh; bash h1.sh');
+  denyBoth('cat p2.txt | tee -a h1.sh; bash h1.sh');
+  denyBoth('cat p2.txt | tee --a h1.sh; bash h1.sh');
+  // an option we do not know, or an abbreviation that is ambiguous, may shift the operands: the command is unmodelled (a missing script after it may have been created by it)
+  for (const l of ['cp --bogus ok.sh n.sh', 'cp --no ok.sh n.sh', 'cp --s ok.sh n.sh', 'mv --bogus=1 ok.sh n.sh', 'ln --b ok.sh n.sh', 'install --bogus ok.sh n.sh', 'install --st ok.sh n.sh', 'echo hi | tee --bogus n.sh', 'wget --output-doc=n.sh http://h/f', 'wget --bogus http://h/f', 'curl --outp n.sh http://h/f']) {
+    denyBoth((_, mid) => `${l}; ${mid}; bash n.sh`);
+  }
+  // known long options of every kind are fine
+  allowBoth('cp --recursive --preserve=mode --backup=numbered --suffix .bak ok.sh d; bash d/ok.sh');
+  allowBoth('echo hi | tee --append --output-error=warn d/log; bash ok.sh');
+});
+
+test('L2: cp --parents, mv --exchange, install --strip-program change which file is written; cp -s / -l make links', () => {
+  // Why: --parents puts the source at DEST/<path as written>, --exchange gives the SOURCE the destination's old text, --strip-program runs a program; a switch is harmless only if it cannot change which file is written or what goes in it
+  for (const l of ['cp --parents src/f.sh d', 'cp --par src/f.sh d', 'cp --parents -t d src/f.sh', 'mv --exchange ok.sh f.sh', 'mv --exc ok.sh f.sh', 'install -s --strip-program=./gen ok.sh d', 'install --strip-program ./gen -s ok.sh d']) {
+    denyBoth((_, mid) => `${l}; ${mid}; bash ok.sh`);
+    denyBoth((_, mid) => `${l}; ${mid}; bash d/src/n.sh`);
+  }
+  allowBoth('cp src/ok.sh d; bash ok.sh');
+  allowBoth('mv ok.sh d; bash d/ok.sh');
+  const link = (l) => writesOf(simpleCommands(l)).recs[0].link;
+  assert.equal(link('cp -s f.sh n.sh'), 'sym');
+  assert.equal(link('cp --symbolic-link f.sh n.sh'), 'sym');
+  assert.equal(link('cp -l f.sh n.sh'), 'hard');
+  assert.equal(link('cp f.sh n.sh'), undefined);
+});
+
+test('L2: install -T is a switch; a copy writer with too few operands is unmodelled; a repeated option counts every time', () => {
+  // Why: install -T took the source as its value and recorded no copy; `cp f.sh` (no destination) was "nothing written"; the first of two `of=` / `-O` was the only one considered
+  denyBoth('install -T f.sh n.sh; bash n.sh');
+  denyBoth('install -m 755 -T f.sh n.sh; bash n.sh');
+  for (const l of ['cp ok.sh', 'mv ok.sh', 'install ok.sh', 'rsync ok.sh', 'ditto ok.sh', 'cp -r', 'cp']) denyBoth((_, mid) => `${l}; ${mid}; bash n.sh`);
+  allowBoth('ln -s ok.sh; bash ok.sh'); // (ln with one operand links it into the current directory: a modelled write)
+  allowBoth('install -d d; bash ok.sh');
+  denyBoth('dd if=f.sh of=m.sh of=n.sh; bash n.sh');
+  denyBoth('dd if=ok.sh if=f.sh of=n.sh; bash n.sh');
+  denyBoth((_, mid) => `wget -O m.sh -O n.sh http://h/f; ${mid}; bash n.sh`);
+  denyBoth((_, mid) => `wget -O m.sh --output-document=n.sh http://h/f; ${mid}; bash n.sh`);
+  denyBoth((_, mid) => `wget --no-proxy -O n.sh http://h/f; ${mid}; bash n.sh`); // (a boolean takes no value: it must not swallow -O)
+  denyBoth((_, mid) => `wget --tries 3 --hsts-file h.txt -O n.sh http://h/f; ${mid}; bash n.sh`); // (a valued option takes the next word)
+  denyBoth((_, mid) => `wget --tries 3 -O n.sh http://h/f; ${mid}; bash n.sh`);
+  denyBoth((_, mid) => `wget --hsts-file n.sh http://h/f; ${mid}; bash n.sh`); // (wget writes its HSTS database there)
+  denyBoth((_, mid) => `wget -O=n.sh http://h/f; ${mid}; bash =n.sh`); // (an attached short value is taken verbatim: the file is =n.sh)
+  denyBoth('cp -t=d f.sh; bash =d/f.sh');
+  denyBoth((_, mid) => `curl --retry-connrefused -o n.sh http://h/f; ${mid}; bash n.sh`); // (curl: --retry-connrefused and --tlsv1 are switches)
+  denyBoth((_, mid) => `curl --tlsv1 -o n.sh http://h/f; ${mid}; bash n.sh`);
+  // exactly the files its options name (a misplaced value would shift the file into the URL list, or make the command unmodelled)
+  const outs = (l) => { const w = writesOf(simpleCommands(l)); return [w.recs.map((r) => r.dest), w.unmodelled.size]; };
+  assert.deepEqual(outs('wget --no-proxy -O n.sh http://h/f'), [['n.sh'], 0]);
+  assert.deepEqual(outs('wget --tries 3 -O n.sh http://h/f'), [['n.sh'], 0]);
+  assert.deepEqual(outs('wget --hsts-file h.txt -O n.sh http://h/f'), [['h.txt', 'n.sh'], 0]);
+  assert.deepEqual(outs('wget -qO n.sh --no-verbose --no-cache http://h/f'), [['n.sh'], 0]);
+  assert.deepEqual(outs('curl --retry-connrefused -o n.sh http://h/f'), [['n.sh'], 0]);
+  assert.deepEqual(outs('curl --tlsv1 -o n.sh http://h/f'), [['n.sh'], 0]);
+  denyBoth((_, mid) => `curl -o=n.sh http://h/f; ${mid}; bash =n.sh`);
+  // wget -e / --config can set any output, an input list or a response name decides the file names, a renamed or re-rooted file, a recursive run, a WARC archive, a startup file from the environment: it may
+  // write ANY file (an existing script too), whatever the URL says
+  for (const l of ['wget -e robots=off http://h/f', 'wget --config w.rc http://h/f', 'wget -i list.txt', 'wget --input-file=list.txt', 'wget -B http://h/ f', 'wget --content-disposition http://h/f', 'wget --trust-server-names http://h/f', 'wget --warc-file=n http://h/f',
+    'wget -E http://h/f', 'wget --adjust-extension http://h/f', 'wget --backups=3 http://h/f', 'wget -x http://h/f', 'wget --force-directories http://h/f', 'wget --protocol-directories http://h/f', 'wget -r http://h/', 'wget -m http://h/', 'wget -p http://h/f',
+    'WGETRC=w.rc wget http://h/f', 'HOME=d wget http://h/f', 'curl -K c.cfg http://h/f', 'curl --config c.cfg http://h/f', 'curl --next http://h/f', 'CURL_HOME=d curl http://h/f', 'curl http://h/f[1-3].sh -o n.sh', "curl 'http://h/{a,b}' -O", 'curl http://h/f -o "n#1.sh"']) {
+    denyBoth((_, mid) => `${l}; ${mid}; bash n.sh`);
+    denyBoth((_, mid) => `${l}; ${mid}; bash ok.sh`);
+    denyBoth((_, mid) => `${l}; ${mid}; bash /tmp/zz/n.sh`); // (a script outside the current directory, missing now)
+    assert.equal(writesOf(simpleCommands(l)).unmodelled.size, 1, l);
+  }
+  allowBoth('wget -r --no-directories http://h/f -P d; bash ok.sh');
+  assert.equal(writesOf(simpleCommands('wget -r --no-directories http://h/f -P d')).unmodelled.size, 0);
+  assert.equal(writesOf(simpleCommands('wget -r -nd http://h/f -P d')).unmodelled.size, 0);
+  allowBoth('wget -r -nd http://h/f -P d; bash ok.sh'); // (without directories the files land in -P; still a subtree write, content unknown: allowed when nothing guarded is on the line)
+  allowBoth('wget -O n.sh http://h/f; bash ok.sh');
+  allowBoth('curl -g http://h/f[1-3].sh -o n.sh; bash ok.sh');
+  assert.equal(writesOf(simpleCommands('wget -qO n.sh http://h/f')).unmodelled.size, 0);
+  assert.equal(writesOf(simpleCommands('curl -o n.sh http://h/f')).unmodelled.size, 0);
+  denyBoth('cp --target-directory=m -t d f.sh; bash d/f.sh');
+  denyBoth('cp -t m -t d f.sh; bash m/f.sh');
+});
