@@ -1570,3 +1570,23 @@ test('L4: the relative-directory narrowing of a clone / worktree add is dropped 
   assert.equal(reaches('git clone https://x/y.git ./sub//', '/w/sub/n.sh', false), true);
   assert.equal(reaches('git clone https://x/y.git sub/', '/w/sub/n.sh', true), true);
 });
+
+test('L4: only >&N and >&- are fd duplications; a >& target that merely starts with & names a file', () => {
+  // Why: `echo X >&"&"n.sh` is the parser's target `&n.sh`, which was skipped as a duplication
+  denyBoth((bad) => `echo '${bad}' >&"&"n.sh; bash n.sh`);
+  denyBoth((bad) => `echo '${bad}' >&\\&n.sh; bash n.sh`);
+  denyBoth((bad) => `echo '${bad}' &>"&"n.sh; bash n.sh`);
+  for (const l of ["echo hi >&2; bash n.sh", 'echo hi >&-; bash n.sh', 'echo hi 2>&1; bash n.sh', 'echo hi >&10; bash n.sh']) allowBoth(l);
+  assert.deepEqual(recs3('echo x >&2').map((r) => r.dest), []);
+  assert.deepEqual(recs3('echo x >&"&"n.sh').map((r) => r.dest).sort(), ['&n.sh', 'n.sh']);
+});
+
+test('L4: a pipe-fed rewriting command scans what its upstream producers read, and its piped-in text is not trusted', () => {
+  // Why: `cat up.txt | tr A-Z a-z > n.sh` recorded no source: only `tr ... < up.txt` did
+  const spec = { ...SPEC, 'up.txt': 'up', 'up2.txt': 'ok' };
+  for (const l of ['cat up.txt | tr A-Z a-z > n.sh; bash n.sh', 'cat up.txt | cat | tr A-Z a-z > n.sh; bash n.sh', 'head -c 999 up.txt | tr A-Z a-z > n.sh; bash n.sh', 'cat up2.txt up.txt | tr A-Z a-z > n.sh; bash n.sh', "cat up.txt | sed 's/x/y/' > n.sh; bash n.sh", 'cat up.txt | tr A-Z a-z | tee n.sh >/dev/null; bash n.sh',
+    'tr A-Z a-z < up.txt | cat > n.sh; bash n.sh', 'cat up.txt | tr A-Z a-z | cat > n.sh; bash n.sh', 'cat up.txt | dd conv=lcase of=n.sh; bash n.sh']) denyBoth(l, spec);
+  denyBoth((bad) => `echo '${bad.toUpperCase()}' | tr A-Z a-z > n.sh; bash n.sh`, spec);
+  denyBoth((bad) => `echo '${bad.replace(/a/g, 'Q')}' | tr Q a > n.sh; bash n.sh`, spec); // (the rewrite makes the command: the text alone names nothing)
+  for (const l of ['cat up2.txt | tr A-Z a-z > n.sh; bash n.sh', 'cat ok.sh | tr A-Z a-z > n.sh; bash n.sh', 'cat up.txt | tr A-Z a-z > m.sh; bash n.sh']) allowBoth(l, spec);
+});

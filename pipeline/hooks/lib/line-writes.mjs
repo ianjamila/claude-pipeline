@@ -407,14 +407,16 @@ function stdoutItems(cmd) {
     const outParts = partsOfStream({ ...s.out, texts: [] });
     return withParts(items.length ? dedupe(items) : [{ text: '' }], [...outParts, ...partsOfStream(s.stdin), ...(stdinUnknown ? [[{ unknown: true }]] : [])]);
   } else if (name === ':' || name === 'true' || name === 'false') items.push({ text: '' });
-  else return [{ unknown: true }, ...s.out.computed.map((scan) => ({ scan })), ...(name === 'sed' || name === 'gsed' ? sedReadFiles(argv.slice(1)).map((scan) => ({ scan })) : [])]; // a program's output: unknown, but the files it reads are worth a scan (base64 -d x.b64; a sed `r FILE`)
+  // a program's output: unknown, but the files it reads are worth a scan (base64 -d x.b64; a sed `r FILE`) -- and so are the files its upstream pipe stages read (`cat up.txt | tr A-Z a-z`); text piped in is rewritten too: text the line itself wrote that we cannot compute
+  else return [{ unknown: true }, ...(s.stdin.texts.length ? [{ unknown: true, authored: true }] : []), ...[...s.out.computed, ...s.stdin.files, ...s.stdin.computed].map((scan) => ({ scan })), ...(name === 'sed' || name === 'gsed' ? sedReadFiles(argv.slice(1)).map((scan) => ({ scan })) : [])];
   return items.length ? dedupe(items) : [{ text: '' }];
 }
 
+const FD_DUP = /^&(?:\d+|-)$/; // (>&2, >&-: the only duplications)
 function redirectRecords(cmd, idx) {
   const out = [];
   for (const r of cmd.redirects ?? []) {
-    if (!WRITE_OPS.has(r.op) || typeof r.target !== 'string' || !r.target || r.target.startsWith('&') || r.target === '/dev/null') continue;
+    if (!WRITE_OPS.has(r.op) || typeof r.target !== 'string' || !r.target || FD_DUP.test(r.target) || r.target === '/dev/null') continue;
     let items;
     // Why: <> opens for reading AND writing: `cmd 1>&0 <> n.sh`, `exec 3<> n.sh` + `>&3` write the file with text we cannot follow, so it is never skipped as a read
     if (r.op === '<>' && (r.fd === null || r.fd === 0)) items = UNKNOWN;
@@ -424,6 +426,8 @@ function redirectRecords(cmd, idx) {
     // `&>` / `>&` also catch stderr
     if ((r.op === '&>' || r.op === '&>>' || r.op === '>&') && !items.some((i) => i.unknown)) items = [...items, ...textItems([cmd.argv.join(' '), ...cmd.argv])];
     out.push({ idx, dest: r.target, items, parts: items.parts, append: r.op === '>>' || r.op === '&>>' });
+    // Why: `>&"&"n.sh` reaches us as the target `&n.sh`: a file named with the & (and the shell may read the & as part of the operator: n.sh)
+    if (r.target.startsWith('&') && r.target.length > 1) out.push({ idx, dest: r.target.slice(1), items, parts: items.parts, append: r.op === '>>' || r.op === '&>>' });
   }
   return out;
 }
