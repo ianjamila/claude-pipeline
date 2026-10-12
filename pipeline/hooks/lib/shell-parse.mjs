@@ -34,7 +34,8 @@ const WIN_PATH_RE = /[^\\]\\[^\\]|^\\\\/; // C:\Git\git.exe, .\git.exe, \\server
 const ANSI_C = { n: '\n', t: '\t', r: '\r', a: '\x07', b: '\b', e: '\x1b', E: '\x1b', f: '\f', v: '\v', '\\': '\\', "'": "'", '"': '"', '?': '?' };
 
 const isSpace = (c) => c === ' ' || c === '\t' || c === '\r';
-const base = (w) => String(w).split(/[\\/]/).pop().toLowerCase().replace(/\.(exe|cmd|bat|com)$/, '');
+// Why: zsh EQUALS expansion: a command word `=git` runs the `git` found on PATH, so it names the same command (`=` alone and `==x` are ordinary words).
+const base = (w) => String(w).split(/[\\/]/).pop().toLowerCase().replace(/\.(exe|cmd|bat|com)$/, '').replace(/^=(?=[^=(~])/, '');
 
 // The name hooks should compare against: basename, lowercased, without .exe/.cmd/.bat/.com.
 // Handles /usr/bin/git, C:\Git\bin\Git.EXE and .\git.exe alike.
@@ -428,7 +429,10 @@ function unwrap(argv) {
 // A word whose value is only known at run time: `$VAR`, `$(..)`, backticks, or a glob (also zsh extendedglob operators
 // `^`, `#`, a non-leading `~`, which only act when the user's zshrc sets extendedglob; `~1`, a trailing `~` and `=~` are
 // ordinary). It may become no word, one word or several, so it hides which of the words after it is the script.
-const EXPANDS = /[$`*?[^#]|[^=]~(?!\d|$)/;
+// (and zsh EQUALS: `=tool` is the PATH lookup of `tool`; `==`, `=(` and `=~` are not)
+const EXPANDS = /[$`*?[^#]|[^=]~(?!\d|$)|^=[^=(~]/;
+const EQUALS_WORD = /^=[^=(~\s]/;
+export const isEqualsWord = (w) => EQUALS_WORD.test(w);
 const hasExpansion = (w) => EXPANDS.test(w);
 // A word that is a process substitution: the shell runs a command and reads its output through a /dev/fd path.
 // (zsh's `=(cmd)` is the same thing with a temp file)
@@ -503,7 +507,8 @@ function hasPatternSyntax(raw, line, file) {
   if (ats.length > MAX_OCCURRENCES) pattern = true;
   const wordEnd = (from) => { let e = from; while (e < text.length && !/\s/.test(text[e])) e++; return e; };
   for (const st of starts) {
-    if (PATTERN_SYNTAX.test(maskQuoted(text.slice(st, wordEnd(st + raw.length))))) pattern = true;
+    const masked = maskQuoted(text.slice(st, wordEnd(st + raw.length)));
+    if (PATTERN_SYNTAX.test(masked) || ZSH_ALTERNATION.test(masked.replace(/'[^']*'/g, (q) => '_'.repeat(q.length)))) pattern = true;
     for (const at of ats) if (PATTERN_SYNTAX.test(text.slice(st, wordEnd(st + at + file.length)))) pattern = true;
   }
   return pattern;
@@ -538,6 +543,9 @@ function maskQuoted(t) {
 const MAX_OCCURRENCES = 32;
 // ksh/bash extglob (`*(`, `?(`, `+(`, `@(`, `!(`), zsh `(#i)` and `<1-2>` numeric ranges attached to a word
 const PATTERN_SYNTAX = /[*?+@!\]]\(|\(#|[^\s<>&|;(]<\d*-\d*>/;
+// zsh alternation `(a|b)`: a `(` that opens no substitution, with a `|` and no blank before the `)`. Only the text with quotes masked is checked (a
+// quoted `'^(A|B)='` is a regex argument, not a glob; maskQuoted stops masking inside a double-quoted `$(`, so single-quoted runs are masked again)
+const ZSH_ALTERNATION = /(?<![$<>=(])\([^\s]*\|[^\s]*\)/;
 
 function scriptFileOfArgv(argv) {
   if (!argv.length) return null;
@@ -575,8 +583,9 @@ function scriptFileOfArgv(argv) {
     // `./ev*.sh` / `$D/x.sh`: the shell runs whatever the word expands to, so it is a candidate list of one word
     return hasExpansion(argv[0]) ? { kind: 'exec', file: argv[0], ambiguous: true, words: [argv[0]] } : { kind: 'exec', file: argv[0] };
   }
+  // `=tool`: zsh runs the file `tool` resolves to on PATH (the candidates are its PATH directories, see script-candidates.mjs)
   // `X=./evil.sh; $X`: a program named by a variable has no `/` to show it is a path
-  if (/[$`]/.test(argv[0])) return { kind: 'exec', file: argv[0], ambiguous: true, words: [argv[0]] };
+  if (/[$`]/.test(argv[0]) || EQUALS_WORD.test(argv[0])) return { kind: 'exec', file: argv[0], ambiguous: true, words: [argv[0]] };
   return null;
 }
 const INTERPRETER_NO_EXT = new Set(['python', 'ruby', 'perl', 'php']);
@@ -1016,6 +1025,34 @@ function startupValues(cmd, cmds, name, env, inherited) {
   return [...out];
 }
 
+// The shell a script run by path starts, from its first line: `#!/bin/bash -l` -> ['/bin/bash', '-l'], `#!/usr/bin/env -S bash -l` ->
+// ['bash', '-l'], `#!/bin/zsh` -> ['/bin/zsh']. Null when it is not a shebang or the program is not a shell. Strict: the kernel hands the
+// shell ONE argument, but every word after the program counts as an option, so a flag in any of them is seen.
+export function shebangShell(text) {
+  if (typeof text !== 'string' || !text.startsWith('#!')) return null;
+  const tokens = text.slice(2).split(/\r?\n/, 1)[0].trim().split(/\s+/).filter(Boolean);
+  let i = 0;
+  if (base(tokens[0] ?? '') === 'env') {
+    i = 1;
+    for (; i < tokens.length; i++) {
+      const t = tokens[i];
+      if (/^-[uC]$|^--(?:unset|chdir)$/.test(t)) i++; // options with a value
+      else if (/^-S./.test(t) && !t.startsWith('--')) { tokens[i] = t.slice(2); break; } // `-Sbash -l`
+      else if (!t.startsWith('-') && !ASSIGN_RE.test(t)) break;
+    }
+  }
+  const prog = tokens[i];
+  return prog !== undefined && SHELLS.has(base(prog)) ? [prog, ...tokens.slice(i + 1)] : null;
+}
+
+// The values PATH may have for `cmd` (words as written), where zsh looks up `=tool`: its own prefix replaces every other source, unless it
+// refers to `$PATH` (`PATH=bin:$PATH cmd`), which stands for them; those are every assignment on the line, what the policy knows and the hook's environment.
+export function pathValuesOf(cmd, cmds = [], { env = {}, inherited = () => [] } = {}) {
+  const own = cmd?.env && Object.hasOwn(cmd.env, 'PATH') && cmd.env.PATH !== '' ? cmd.env.PATH : undefined;
+  if (own !== undefined && !/\$\{?PATH\b/.test(own)) return [own];
+  return [...new Set([...(own === undefined ? [] : [own]), ...startupValues({ env: {} }, cmds, 'PATH', env, inherited)])];
+}
+
 // What the line assigns to the startup variables, for the scripts it runs in this shell (`BASH_ENV=f.sh; source outer.sh`): {NAME: [values]}.
 export function startupVarsOf(cmds, { env = {}, inherited = () => [] } = {}) {
   const out = {};
@@ -1071,6 +1108,20 @@ export function startupFilesOf(cmd, cmds = [], { env = {}, inherited = () => [],
 }
 
 // ---- the parser ---------------------------------------------------------------------------------
+
+// Does the `(` at s[i] open a zsh alternation `(a|b)`: a group with a `|` at some level, no blank, and no substitution, quote or operator inside?
+function zshAlternationAt(s, i) {
+  let depth = 0;
+  let bar = false;
+  for (let j = i; j < s.length; j++) {
+    const c = s[j];
+    if (c === '(') depth++;
+    else if (c === ')') { if (--depth === 0) return bar; }
+    else if (c === '|') bar = true;
+    else if (/[\s;&<>`$'"\\]/.test(c)) return false;
+  }
+  return false;
+}
 
 function emit(ctx, argv, env, raw, depth, redirects = [], sep = ';') {
   if (ctx.out.length >= MAX_COMMANDS) { ctx.truncated = true; ctx.stopped = true; return null; }
@@ -1509,7 +1560,11 @@ class Parser {
         cur += this.substitution(depth);
         takeSubs();
       } else if (c === '(') {
-        if (inWord && /^[A-Za-z_][A-Za-z0-9_]*\+?=$/.test(cur) && (qa < 0 || qa >= cur.length)) {
+        if (!inWord && seg && seg.words.length > 0 && !seg.words.some((w) => w.qa < 0 && ['case', 'select'].includes(w.text)) && !seg.words.every((w) => LEAD_WORDS.has(w.text.toLowerCase())) && zshAlternationAt(s, this.i)) {
+          // zsh `bash (f|x).sh`: after a command's words a `(` opens a glob group (an alternation), not a subshell (bash: a syntax error)
+          startSeg(); inWord = true;
+          lit = 1; litGlob = true; wpat = true; gGlob = false; cur += '('; this.i++; gRaw = this.i; gCur = cur.length;
+        } else if (inWord && /^[A-Za-z_][A-Za-z0-9_]*\+?=$/.test(cur) && (qa < 0 || qa >= cur.length)) {
           lit = 1; litGlob = false; cur += '('; this.i++; // NAME=(a b) array literal, not a subshell
         } else if (inWord && s[this.i + 1] !== ')' && !(seg && seg.words.length === 0 && qa < 0 && LEAD_WORDS.has(cur.toLowerCase()))) {
           // `*(e:'cmd':)`, `foo(+f)`, `*.(jpg|png)`: a glob group glued to a word is part of the word (and `f()` is a function definition)

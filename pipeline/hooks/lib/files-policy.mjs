@@ -18,7 +18,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
-import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf } from './shell-parse.mjs';
+import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure } from './line-writes.mjs';
 import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
 
@@ -1127,6 +1127,15 @@ function judgeScriptText(text, sf, abs, dir, ctx, opts) {
   if (kind === 'exec') {
     if (text.slice(0, 4096).includes('\u0000')) return null; // a binary
     kind = INTERP_PROGRAM.test((SHEBANG_PROGRAM.exec(text)?.[1] ?? '').split('/').pop()) ? 'interp' : 'shell';
+    // Why: the kernel starts the shebang's shell, which reads the startup files its options ask for (`#!/bin/bash -l`, `#!/bin/zsh`): judged like `bash -l f` / `zsh f`
+    const sh = kind === 'shell' && ctx.execCmd ? shebangShell(text) : null;
+    if (sh) {
+      const { c, cmds, env, inherited } = ctx.execCmd;
+      for (const st of startupFilesOf({ ...c, argv: [...sh, abs] }, cmds, { env, inherited })) {
+        const v = ctx.judgeStartupFile(st);
+        if (v) return v;
+      }
+    }
   }
   if (kind === 'shell') {
     const r = evaluateBashForFiles(text, { ...opts, cwd: dir, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup });
@@ -1441,11 +1450,15 @@ function evaluateBashForFilesFrame(command, opts) {
     return judgeScriptFile(st, dirs, ctx, withLineVars(opts), scanRaw);
   };
 
+  ctx.judgeStartupFile = judgeStartupFile;
+
   // 7: a script file (bash f.sh, source f, ./f, node f.mjs) runs whatever is in it
   if ((opts._depth ?? 0) < 4) {
     for (const [idx, c] of cmds.entries()) {
       frame.i = idx;
       const sf = scriptFileOf(c.argv, c.raw, raw);
+      const withPath = (rec) => { if (rec.words?.some(isEqualsWord)) rec.pathValues = pathValuesOf(c, cmds, { env: startupEnv, inherited: inheritedStartup }); return rec; }; // (zsh `=tool`: the PATH directories to look in)
+      if (sf) withPath(sf);
       // a shell runs its startup files (BASH_ENV, ENV, ZDOTDIR/.zshenv ...) BEFORE the script it was given, so they are judged first, in the
       // order the shell reads them: judged like `bash FILE`
       for (const st of startupFilesOf(c, cmds, { env: startupEnv, inherited: inheritedStartup, exec: sf?.kind === 'exec' })) {
@@ -1453,11 +1466,20 @@ function evaluateBashForFilesFrame(command, opts) {
         if (v) return v;
       }
       if (sf) {
-        const v = judgeScriptFile(sf, dirs, ctx, withLineVars(opts), scanRaw);
+        // (a program run by path is judged with the command that runs it: its shebang may name a shell, which reads startup files of its own)
+        const outer = ctx.execCmd;
+        ctx.execCmd = sf.kind === 'exec' ? { c, cmds, env: startupEnv, inherited: inheritedStartup } : null;
+        let v;
+        try {
+          v = judgeScriptFile(sf, dirs, ctx, withLineVars(opts), scanRaw);
+        } finally {
+          ctx.execCmd = outer;
+        }
         if (v) return v;
       }
       // script text that reaches a shell without being named (`bash < f.sh`, `cat f.sh | bash`, `eval "$(cat f.sh)"`): its files are judged like `bash f.sh`
       for (const fd of scriptFeedsOf(c, raw, (w) => expandRefs(w, ctx))) {
+        withPath(fd);
         const v = judgeScriptFile(fd, dirs, ctx, withLineVars(opts), scanRaw);
         if (v) return v;
       }

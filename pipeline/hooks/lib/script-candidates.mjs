@@ -6,7 +6,7 @@
 // Pure apart from the injected `readDir` (fs.readdirSync-like: names; null when the shell would match nothing there
 // either; any other answer means the directory could not be listed and is refused).
 import { readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
-import { SCRIPT_EXT } from './shell-parse.mjs';
+import { SCRIPT_EXT, isEqualsWord } from './shell-parse.mjs';
 
 export const MAX_CANDIDATES = 32; // more words than this are refused, not judged
 // Every limit below exists because a hook that runs out of time (15 s, see HOOK_TIMEOUT_S in lib/installer.mjs) is
@@ -214,6 +214,27 @@ function buildCandidates(sf, { expand, dirs, joinPath, readDir, ifs }) {
   const splitter = new RegExp(`[\\s${typeof ifs === 'string' && !ifsUnknown ? ifs.replace(/[\]\\^-]/g, '\\$&') : ''}]+`);
   const add = (c) => { if (!sf.needExt || SCRIPT_EXT.test(c)) files.add(c); };
   for (const w of sf.words) {
+    // zsh EQUALS: `=tool` is the file `tool` resolves to in a PATH directory (sf.pathValues: the values PATH may have; none given: unknown).
+    // An empty PATH entry is the cwd; a directory known only at run time makes the script unknown.
+    if (isEqualsWord(w)) {
+      const name = expand(w.slice(1));
+      add(w); // (quoting is lost: `'=tool'` is a file of that name)
+      if (/[$`]/.test(name)) dynamic = true;
+      else {
+        add(name);
+        if (!sf.pathValues) dynamic = true;
+        for (const v of sf.pathValues ?? []) {
+          for (const comp of v.split(':')) {
+            if (/^\$\{?PATH\}?$/.test(comp) || comp === '') continue;
+            const dir = expand(comp);
+            if (/[$`]/.test(dir)) dynamic = true;
+            else add(`${dir.replace(/\/+$/, '')}/${name}`);
+          }
+        }
+      }
+      if (files.size > MAX_CANDIDATES) return { files: [], dynamic, over: true };
+      continue;
+    }
     const e = expand(w);
     let readings = e !== w && w.includes('$') ? [e, ...e.split(splitter)] : [e];
     // a program named by a variable (`T="npx vitest run x.test.tsx"; $T`) runs its first word; the rest are its arguments. The policies evaluate the

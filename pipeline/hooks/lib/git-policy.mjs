@@ -15,7 +15,7 @@
 import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, startupFilesOf } from './shell-parse.mjs';
+import { commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell } from './shell-parse.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow } from './line-writes.mjs';
 import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
@@ -886,6 +886,13 @@ function judgeScriptText(text, sf, abs, dir, ctx, level) {
     if (text.slice(0, 4096).includes('\u0000')) return null; // a binary
     const prog = SHEBANG_PROGRAM.exec(text)?.[1] ?? '';
     kind = /^(?:node|nodejs|deno|bun|tsx|ts-node|python[\d.]*|ruby|perl|php)$/.test(prog.split('/').pop()) ? 'interp' : 'shell';
+    // Why: the kernel starts the shebang's shell, which reads the startup files its options ask for (`#!/bin/bash -l`, `#!/bin/zsh`): judged like `bash -l f` / `zsh f`
+    const sh = kind === 'shell' && ctx.execCmd ? shebangShell(text) : null;
+    if (sh) {
+      const { c, cmds } = ctx.execCmd;
+      const v = judgeStartupList(startupFilesOf({ ...c, argv: [...sh, abs] }, cmds, { env: ctx.env, inherited: (n) => knownValues(ctx, n) }), c, dir, ctx, level);
+      if (v) return v;
+    }
   }
   if (kind === 'interp') {
     if (isNodeModulesOrPipelineHome(abs)) return null;
@@ -1061,6 +1068,31 @@ function judgeWrittenScript(w, sf, abs, dir, ctx, level) {
 // many shells reads each file once. An explicit one (BASH_ENV=, ZDOTDIR=, HOME=, --rcfile) is judged in the line's context instead.
 // The variables the line has set before that shell starts (and its own prefix, `NVM_DIR=d bash -l`) are inherited: a file that sources
 // "$NVM_DIR/nvm.sh" runs d/nvm.sh, and a value that is unknown makes that name unknown (refused). The memo is keyed on that state.
+// The startup files a shell reads (startupFilesOf), in the order it reads them: the first denial, else null.
+function judgeStartupList(list, c, dir, ctx, level) {
+  for (const st of list) {
+    // the real home's file (no word on the line names it) is judged on its own, once: see implicitStartupVerdict
+    if (st.implicit) {
+      const v = implicitStartupVerdict(st, ctx, c, dir);
+      if (v) return v;
+      continue;
+    }
+    // the shell sees the command's own prefix variables (`F=f.sh BASH_ENV=rc bash -c :` where rc sources "$F")
+    const v = withPrefixEnv(c, ctx, () => {
+      // a clean verdict is reused only in the very same state (it depends on the variables, branches and config the line has set so far, and on
+      // what the line may have written), never for a run-time name
+      const key = st.ambiguous ? null : `${st.file}\u0000${unmodelledBefore(ctx.writeFrames)}\u0000${stateFingerprint(ctx, dir, level)}`;
+      if (key !== null) {
+        if (ctx.budget.startupOk.has(key)) return null;
+        ctx.budget.startupOk.add(key); // marked first, so a startup file that starts shells itself is not judged again and again (a denial ends the evaluation)
+      }
+      return checkScriptFile(st, dir, ctx, level);
+    });
+    if (v) return v;
+  }
+  return null;
+}
+
 function implicitStartupVerdict(st, ctx, cmd, dir) {
   const vars = Object.assign(Object.create(null), ctx.vars);
   const unsure = new Set(ctx.unsureVars);
@@ -1405,29 +1437,21 @@ function evalString(str, startDir, ctx, level) {
       }
       const sf = verdict ? null : scriptFileOf(argv, c.raw, str);
       if (sf && (name === 'source' || name === '.')) sf.sourced = true;
+      const withPath = (rec) => { if (rec.words?.some(isEqualsWord)) rec.pathValues = pathValuesOf(c, cmds, { env: ctx.env, inherited: (n) => knownValues(ctx, n) }); return rec; }; // (zsh `=tool`: the PATH directories to look in)
+      if (sf) withPath(sf);
       // a shell runs its startup files (BASH_ENV, ENV, ZDOTDIR/.zshenv ...) BEFORE the script it was given, so they are judged first, in the
       // order the shell reads them, and what they change (a branch switch) is what the script and the feeds are then judged against
-      if (!verdict) for (const st of startupFilesOf(c, cmds, { env: ctx.env, inherited: (n) => knownValues(ctx, n), exec: sf?.kind === 'exec' })) {
-        // the real home's file (no word on the line names it) is judged on its own, once: see implicitStartupVerdict
-        if (st.implicit) {
-          verdict = implicitStartupVerdict(st, ctx, c, dir);
-          if (verdict) break;
-          continue;
+      if (!verdict) verdict = judgeStartupList(startupFilesOf(c, cmds, { env: ctx.env, inherited: (n) => knownValues(ctx, n), exec: sf?.kind === 'exec' }), c, dir, ctx, level);
+      if (!verdict && sf) {
+        // (a program run by path is judged with the command that runs it: its shebang may name a shell, which reads startup files of its own)
+        const outer = ctx.execCmd;
+        ctx.execCmd = sf.kind === 'exec' ? { c, cmds } : null;
+        try {
+          verdict = withPrefixEnv(c, ctx, () => checkScriptFile(sf, dir, ctx, level));
+        } finally {
+          ctx.execCmd = outer;
         }
-        // the shell sees the command's own prefix variables (`F=f.sh BASH_ENV=rc bash -c :` where rc sources "$F")
-        verdict = withPrefixEnv(c, ctx, () => {
-          // a clean verdict is reused only in the very same state (it depends on the variables, branches and config the line has set so far, and on
-          // what the line may have written), never for a run-time name
-          const key = st.ambiguous ? null : `${st.file}\u0000${unmodelledBefore(ctx.writeFrames)}\u0000${stateFingerprint(ctx, dir, level)}`;
-          if (key !== null) {
-            if (ctx.budget.startupOk.has(key)) return null;
-            ctx.budget.startupOk.add(key); // marked first, so a startup file that starts shells itself is not judged again and again (a denial ends the evaluation)
-          }
-          return checkScriptFile(st, dir, ctx, level);
-        });
-        if (verdict) break;
       }
-      if (!verdict && sf) verdict = withPrefixEnv(c, ctx, () => checkScriptFile(sf, dir, ctx, level));
       // script text that reaches a shell without being named (`bash < f.sh`, `cat f.sh | bash`, `eval "$(cat f.sh)"`): its files are judged like `bash f.sh`
       // Several files feeding one program (review R2-B2): the JOINED record is the program the shell really reads, so it is judged first, from the
       // state the line is in, and its changes carry on; each fragment is then judged on an isolated copy (a fragment's branch switch is commented
@@ -1437,6 +1461,7 @@ function evalString(str, startDir, ctx, level) {
         const joined = feeds.some((fd) => fd.joined);
         const ordered = joined ? [...feeds.filter((fd) => fd.joined), ...feeds.filter((fd) => !fd.joined)] : feeds;
         for (const fd of ordered) {
+          withPath(fd);
           const judge = () => withPrefixEnv(c, ctx, () => checkScriptFile(fd, dir, ctx, level));
           verdict = joined && !fd.joined ? isolatedState(ctx, judge) : judge();
           if (verdict) break;
