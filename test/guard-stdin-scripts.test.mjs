@@ -2,8 +2,8 @@
 // reaches a shell without being named was never read: `bash < f.sh`, `cat f.sh | bash`, `bash <(cat f.sh)`, `eval "$(cat f.sh)"`,
 // `$(cat f.sh)` as the command. And a run-time word before `-c` or before a `<(...)` operand (`bash -o $X -c f.sh`,
 // `bash $X <(cat f.sh)`) was not treated as ambiguous, although it decides which word the shell runs.
-// Now the files such text comes from are judged like `bash F` (a reader of named files: cat/head/tail/tac/less, `< F`,
-// here-strings, process and command substitutions); a producer that REWRITES what it reads (sed, awk, base64, tr ...) makes the
+// Now the files such text comes from are judged like `bash F` (a reader of named files: cat/less, `< F`,
+// here-strings, process and command substitutions); a producer that REWRITES what it reads (sed, awk, base64, tr, head, tail, tac ...) makes the
 // text unknowable, so a named file that holds a guarded word is refused. A program run by path that is over the read cap
 // is peeked at (`readHead`): a shell script is refused, a binary or an interpreter file keeps its old verdict.
 // The file system is faked (like test/guard-script-expansion.test.mjs); the guarded text only lives in fake file contents.
@@ -137,8 +137,8 @@ test('g: a producer that rewrites what it reads: a named file holding a guarded 
 
 test('g: a plain reader feeds the file as the script (judged by what it runs); a rewriting producer only gets the word scan', () => {
   const spec = { 'mid.sh': 'mid' };
-  for (const c of ['bash < mid.sh', 'cat mid.sh | bash', 'eval "$(cat mid.sh)"', 'bash <(cat mid.sh)', 'bash <<< "$(cat mid.sh)"', '$(cat mid.sh)', 'head -n 1 mid.sh | bash']) allowBoth(c, spec);
-  for (const c of ['sed p mid.sh | bash', 'cat mid.sh | tr a b | bash', 'eval "$(cat mid.sh | tr a b)"', 'bash <(awk 1 mid.sh)', 'cat mid.sh | tee /dev/null | sh']) denyBoth(c, spec);
+  for (const c of ['bash < mid.sh', 'cat mid.sh | bash', 'eval "$(cat mid.sh)"', 'bash <(cat mid.sh)', 'bash <<< "$(cat mid.sh)"', '$(cat mid.sh)']) allowBoth(c, spec);
+  for (const c of ['sed p mid.sh | bash', 'cat mid.sh | tr a b | bash', 'eval "$(cat mid.sh | tr a b)"', 'bash <(awk 1 mid.sh)', 'cat mid.sh | tee /dev/null | sh', 'head -n 1 mid.sh | bash']) denyBoth(c, spec);
 });
 
 test('g: harmless controls stay allowed', () => {
@@ -243,7 +243,7 @@ test('g: scriptFeedsOf lists the files that feed a command (pure parser API)', (
   assert.deepEqual(feeds('cat f.sh'), []);
   assert.deepEqual(feeds('echo hi | bash'), []);
   assert.deepEqual(feeds('bash ok.sh < f.sh'), []);
-  assert.deepEqual(feeds('head -n 5 f.sh | bash'), [{ kind: 'shell', file: 'f.sh' }]);
+  assert.deepEqual(feeds('head -n 5 f.sh | bash').map((f) => [f.kind, f.file]), [['scan', 'f.sh']]); // head / tail / tac do not print the file as it is (review R1-B3)
   assert.equal(feeds('cat f<1-2>.sh | bash')[0].unresolvable, true);
   // feeds do not show up when the command is printed or compared
   assert.deepEqual(Object.keys(simpleCommands('bash < f.sh')[0]).sort(), ['argv', 'depth', 'env', 'raw', 'redirects']);
@@ -285,4 +285,46 @@ test('C: a throwing readHead denies instead of letting the command through', () 
   assert.equal(r.decision, 'deny');
   const f = { ...fakeFs(PROJ, { 'big.sh': null }), readHead: () => { throw new Error('boom'); } };
   assert.equal(files('./big.sh', f).decision, 'deny');
+});
+
+// ---- review R1-B3: head / tail / tac print PART of a file (or reverse it): the file is not the script ---------------------------------
+// The whole file was parsed as the script, so `tail -n +2 payload | bash` with `echo "` / <push> / `"` in it was allowed: the quotes hide
+// the push from the whole-file parse, but tail drops the first line and the shell runs it. They are rewriting producers now (word scan).
+// Exact modelling of their output is a later step; refusing a guarded word in the file is the fail-closed reading.
+
+// build(bad) -> { file: text } for each policy's own guarded line
+function bothBuilt(command, build) {
+  const dirs = ['sub', 'd'];
+  return {
+    git: git(command, fakeFs(GIT_ROOT, build(BAD_GIT), dirs)),
+    files: files(command, fakeFs(PROJ, build(BAD_FILES), dirs)),
+  };
+}
+const denyBuilt = (command, build) => {
+  const r = bothBuilt(command, build);
+  assert.equal(r.git.decision, 'deny', `git: ${command} -> ${r.git.reason}`);
+  assert.equal(r.files.decision, 'deny', `files: ${command} -> ${r.files.reason}`);
+};
+const allowBuilt = (command, build) => {
+  const r = bothBuilt(command, build);
+  assert.equal(r.git.decision, 'allow', `git: ${command} -> ${r.git.reason}`);
+  assert.equal(r.files.decision, 'allow', `files: ${command} -> ${r.files.reason}`);
+};
+
+test('R1-B3: tail -n +2 hides the first line; the quote pair that hid the guarded line from the whole-file parse is gone', () => {
+  const payload = (bad) => ({ 'payload.sh': `echo "\n${bad}\n"\n` });
+  for (const c of ['tail -n +2 payload.sh | bash', 'tail -n+2 payload.sh | sh', 'tail --lines=+2 payload.sh | bash', 'eval "$(tail -n +2 payload.sh)"', 'bash <(tail -n +2 payload.sh)', 'bash < <(tail -n +2 payload.sh)']) denyBuilt(c, payload);
+});
+
+test('R1-B3: tac reverses the lines; a heredoc body that hid the guarded line in file order does not in reversed order', () => {
+  const payload = (bad) => ({ 'payload.sh': `cat <<EOF\n${bad}\nEOF\n` });
+  for (const c of ['tac payload.sh | bash', 'eval "$(tac payload.sh)"', 'bash <(tac payload.sh)']) denyBuilt(c, payload);
+});
+
+test('R1-B3: head is a producer too: a file the exact reader used to allow (judged as the whole script) is now word-scanned', () => {
+  const mid = { 'mid.sh': 'mid' };
+  for (const c of ['head -n 1 mid.sh | bash', 'head -c 99 mid.sh | sh', 'tail -n 1 mid.sh | bash', 'tac mid.sh | bash', 'eval "$(head -n 1 mid.sh)"']) denyBoth(c, mid);
+  for (const c of ['head -n 3 ok.sh | bash', 'tail -n +2 ok.sh | bash', 'tac ok.sh | sh', 'head -c 10 README.md | bash']) allowBoth(c, { 'ok.sh': 'ok' });
+  // cat / less keep printing the file as it is
+  for (const c of ['cat mid.sh | bash', 'bash < mid.sh']) allowBoth(c, mid);
 });

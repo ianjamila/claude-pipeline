@@ -622,12 +622,14 @@ function findExecs(argv) {
   return out;
 }
 
-// Commands that print the files named on their command line as they are (head / tail print part of them: the whole file is
-// judged, a superset). Value: [short options that take a value, long options that take a value].
+// Commands that print the files named on their command line. Value: [short options that take a value, long options that take a value].
+// Only the EXACT ones print them as they are (the file is the text); head / tail print part of a file and tac reverses its lines, so what
+// reaches the shell is not the file (`tail -n +2` drops the line that opened a quote around the rest): they are word-scanned like sed / awk.
 const READERS = {
   cat: ['', []], tac: ['', []], less: ['', []], more: ['', []], bat: ['', []], batcat: ['', []],
   head: ['nc', ['--lines', '--bytes']], tail: ['nc', ['--lines', '--bytes']],
 };
+const EXACT_READERS = new Set(['cat', 'less', 'more', 'bat', 'batcat']);
 const MAX_FEED_FILES = 64; // more files than this feed one command: refused, not judged
 
 // The file operands of a reader: words that are not options, minus the values of options that take one.
@@ -694,7 +696,7 @@ function noteReads(seg, name, argv, st, exact) {
   // [operand, the word it came from]; a word with no unquoted pattern character is a literal name even if it looks like a regex (`'^(A|B)='`)
   const words = reader ? readerOperands(argv, ...READERS[name]).map((w) => [w, w]) : looseOperands(argv);
   for (const f of seg.stdinFiles) { words.push([f, f]); st.pat.add(f); }
-  const list = exact && (reader || argv.length === 0) ? st.files : st.computed;
+  const list = exact && (EXACT_READERS.has(name) || argv.length === 0) ? st.files : st.computed;
   const prog = reader ? -1 : programIndex(name, argv);
   for (const [w, full, idx] of words) {
     if (w === '' || w === '-' || STDIN_FILES.has(w)) continue;
