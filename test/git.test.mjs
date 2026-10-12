@@ -607,12 +607,15 @@ test('diffFiles: a small binary document is still diffed with --text, exactly as
 
 test('diffFiles: a big source file with a NUL byte is still read as text (only listed document formats are skipped)', () => {
   const { repo, o } = baseRepo();
+  // built at runtime so this file's own test-integrity check does not read the planted markers as real ones
+  const SKIP = ['it', 'skip'].join('.');
+  const ONLY = ['it', 'only'].join('.');
   const rows = (n) => Array.from({ length: n }, (_, i) => `it("case ${i}", () => {});\n`).join('');
   repo.write('src/big.test.ts', `// note:\0 nul\n${rows(400)}`);
   repo.commit('big test with a NUL');
   repo.branch('feat');
-  repo.write('src/big.test.ts', `// note:\0 nul\n${rows(400)}it.skip("drops", () => {});\n`);
-  repo.write('src/new-big.test.ts', `\0\n${rows(400)}it.only("focus", () => {});\n`);
+  repo.write('src/big.test.ts', `// note:\0 nul\n${rows(400)}${SKIP}("drops", () => {});\n`);
+  repo.write('src/new-big.test.ts', `\0\n${rows(400)}${ONLY}("focus", () => {});\n`);
   repo.commit('skip one, add another');
 
   // preconditions: git calls both binary, and both are over the (lowered) threshold, so only the extension saves them
@@ -624,8 +627,8 @@ test('diffFiles: a big source file with a NUL byte is still read as text (only l
     assert.equal(by[p].binary, false, p);
     assert.equal(Object.hasOwn(by[p], 'skippedLargeBinary'), false, p);
   }
-  assert.deepEqual(by['src/big.test.ts'].added, [{ line: 402, text: 'it.skip("drops", () => {});' }]);
-  assert.ok(by['src/new-big.test.ts'].added.some((l) => l.text === 'it.only("focus", () => {});'));
+  assert.deepEqual(by['src/big.test.ts'].added, [{ line: 402, text: `${SKIP}("drops", () => {});` }]);
+  assert.ok(by['src/new-big.test.ts'].added.some((l) => l.text === `${ONLY}("focus", () => {});`));
 });
 
 test('diffFiles: a renamed large binary keeps both paths; an identical one is untouched; a rename to an unlisted extension is read as text', () => {
