@@ -515,6 +515,47 @@ test('R2-B2: the files policy judges each fragment as a script of its own (no st
   assert.equal(files('cat b.sh c.sh | bash', fakeFs(PROJ, spec(), ['sub', 'd'])).decision, 'deny');
 });
 
+// ---- replay false positives of the join rule: only FILE operands count, and a variable the line set is resolved ------------------------------
+// `F=x/y; eval "$(bash $F/stack.sh env)"` (`env` is the script's argument) and `echo "$(( $(ps -o rss= -p $pid)/1024 ))MB"` (ps reads no file) were
+// refused as "several operands, one cannot be resolved". Only a producer's real file operands count; a `$` word with a known value is that file.
+test('R2-FP: a script producer\'s arguments, a system query\'s words and variables with a known value are not unresolvable file operands', () => {
+  const ok = () => ({ 'a.sh': 'echo a', 'b.sh': 'echo b', 'x/y/stack.sh': 'echo hi\n' });
+  for (const c of [
+    'F=x/y; eval "$(bash $F/stack.sh env)"', 'eval "$(bash x/y/stack.sh env)"', 'F=x/y; eval "$(bash $F/stack.sh env prod)"', 'F=x/y; bash <(bash $F/stack.sh env)',
+    'echo "$(( $(ps -o rss= -p $pid)/1024 ))MB"', 'eval "$(ps -o rss= -p $pid)"', 'x=$(( $(ps -o rss= -p $pid)/1024 )); echo $x', 'eval "$(sh $F/stack.sh a b c)"',
+    'F=b.sh; cat a.sh $F | bash', 'F=b.sh; cat a.sh "$F" | bash', 'F=b.sh; cat a.sh ${F} | bash', 'D=x/y; cat $D/stack.sh $D/stack.sh | bash',
+  ]) allowBuilt(c, ok);
+  // ... while an unknown word among several file operands is still refused, and a known one is joined with the file before it
+  for (const c of ['F=x; cat a.sh $UNKNOWN | bash', 'F=x; cat a.sh "$UNKNOWN" | bash', 'cat a.sh $F | bash', 'F=$(echo b.sh); cat a.sh $F | bash']) {
+    const r = bothBuilt(c, ok);
+    assert.equal(r.git.decision, 'deny', `git: ${c}`);
+    assert.equal(r.files.decision, 'deny', `files: ${c}`);
+  }
+  for (const c of ['F=b.sh; cat a.sh $F | bash', 'F=b.sh; cat a.sh "$F" | bash', 'F=b.sh; eval "$(cat a.sh ${F})"', 'F=a.sh; cat $F b.sh | bash']) denyBuilt(c, splitFiles);
+});
+
+test('R2-FP: scriptFeedsOf resolves a known variable and counts only file operands', () => {
+  const feeds = (line, resolve) => simpleCommands(line).flatMap((c) => scriptFeedsOf(c, line, resolve));
+  const vars = { F: 'x/y', G: 'b.sh' };
+  const resolve = (w) => w.replace(/\$\{?(\w+)\}?/g, (m, n) => vars[n] ?? m);
+  assert.equal(feeds('eval "$(bash $F/stack.sh env)"').some((f) => f.unresolvable), false); // no resolver needed: `env` is not a file
+  assert.equal(feeds('echo "$(( $(ps -o rss= -p $pid)/1024 ))MB"').some((f) => f.unresolvable), false);
+  assert.equal(feeds('cat a.sh $G | bash')[0].unresolvable, true);
+  assert.deepEqual(feeds('cat a.sh $G | bash', resolve).filter((f) => f.joined), [{ kind: 'shell', file: 'a.sh b.sh', joined: ['a.sh', 'b.sh'] }]);
+  assert.equal(feeds('cat a.sh $UNKNOWN | bash', resolve)[0].unresolvable, true);
+  assert.equal(feeds('cat a.sh $H | bash', () => 'two words')[0].unresolvable, true); // a value that is not one name is no resolution
+});
+
+// A system query's words are no file operands for the join rule, but its output still reaches the shell: it is judged as before, never weaker.
+test('R2-FP: text a system query prints into a shell is still refused when the line names a guarded operation', () => {
+  const lines = (bad) => [`date '+${bad}' | bash`, `eval "$(date '+${bad}')"`, `bash <(date '+${bad}')`, `printenv X | bash; ${bad}`, `eval "$(printenv X)"; ${bad}`, `eval "$(sysctl -n kern.x)"; ${bad}`];
+  // its words stay scan candidates as before the exemption: a file they name that holds a guarded word is refused (the producer is not dropped)
+  for (const c of ['date -f f.sh | bash', 'seq 1 f.sh | bash', 'which f.sh | bash', 'printenv f.sh | bash', 'eval "$(date -f f.sh)"', 'bash <(which f.sh)']) denyBoth(c, SPEC);
+  for (const c of ['date -f ok.sh | bash', 'printenv ok.sh | bash', 'echo "$(( $(ps -o rss= -p $pid)/1024 ))MB"']) allowBoth(c, SPEC);
+  for (const bad of [BAD_GIT]) for (const c of lines(bad)) assert.equal(git(c, fakeFs(GIT_ROOT, {}, ['sub', 'd'])).decision, 'deny', `git: ${c}`);
+  for (const bad of [BAD_FILES]) for (const c of lines(bad)) assert.equal(files(c, fakeFs(PROJ, {}, ['sub', 'd'])).decision, 'deny', `files: ${c}`);
+});
+
 test('R1-B2 follow-up: a feed with ONE file operand keeps its verdict, however the operand is spelled', () => {
   const ok = () => ({ 'a.sh': 'echo a', 'b.sh': 'echo b', 'ok.sh': 'echo hi\n' });
   for (const c of ['cat ok.sh | bash', 'cat o*.sh | bash', 'sed p ok.sh | bash', 'sed p o*.sh | bash', 'awk \'{print $1}\' ok.sh | bash', 'sed "s/a/$X/" ok.sh | bash', 'tail -n +1 ok.sh | bash', 'cat a.sh b.sh | bash']) allowBuilt(c, ok);

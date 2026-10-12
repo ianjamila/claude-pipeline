@@ -1268,7 +1268,7 @@ function evalString(str, startDir, ctx, level) {
       // state the line is in, and its changes carry on; each fragment is then judged on an isolated copy (a fragment's branch switch is commented
       // out or cut in two by its neighbours in the real text, so it must not change what the other fragments are judged against)
       if (!verdict) {
-        const feeds = scriptFeedsOf(c, str);
+        const feeds = scriptFeedsOf(c, str, (w) => expandVars(w, ctx));
         const joined = feeds.some((fd) => fd.joined);
         const ordered = joined ? [...feeds.filter((fd) => fd.joined), ...feeds.filter((fd) => !fd.joined)] : feeds;
         for (const fd of ordered) {

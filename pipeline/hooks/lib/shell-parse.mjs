@@ -677,11 +677,29 @@ function programIndex(name, argv) {
   return -1;
 }
 
+// Commands whose output never is the text of a file they were given (system queries): their words are not file operands of a feed (they still
+// feed the shell text, so they are scanned / judged as every other producer; ENV_PRODUCERS print the environment, which is dynamic).
+const ENV_PRODUCERS = new Set(['printenv', 'sysctl', 'ioreg']);
+const NO_FILE_PRODUCERS = new Set(['ps', 'pgrep', 'pidof', 'date', 'uname', 'whoami', 'id', 'hostname', 'pwd', 'uptime', 'df', 'free', 'sw_vers', 'arch', 'nproc', 'tty', 'seq', 'which', 'printenv', 'vm_stat', 'sysctl', 'ioreg']);
+
 // Producers that read files nobody names: a directory walk or archive listing. What they print could be any file under it.
 function readsUnnamedFiles(name, argv) {
   if (['find', 'fd', 'fdfind', 'rg', 'ag', 'ack', 'locate', 'xargs', 'tar', 'bsdtar', 'unzip', 'ls', 'dir'].includes(name)) return true;
   if (name === 'git') return argv.some((a) => ['grep', 'show', 'cat-file', 'archive'].includes(a));
   return ['grep', 'egrep', 'fgrep'].includes(name) && argv.some((a) => /^-[A-Za-z]*[rR]/.test(a) || /^--(?:recursive|include|exclude|dereference-recursive)/.test(a));
+}
+
+// The one script a shell / interpreter / program run by path reads (`bash $F/stack.sh env`), when no word BEFORE it can shift which word it is.
+// The operand itself may expand (it is then a word for the caller to resolve or refuse); null: no script, or the words before it expand.
+function producerScript(argv) {
+  const name = argv.length ? base(argv[0]) : '';
+  if (SHELLS.has(name)) {
+    const r = shellInvocation(argv);
+    if (r.kind !== 'file' || isProcSub(r.text)) return null;
+    return argv.slice(1, argv.indexOf(r.text, 1)).some(hasExpansion) ? null : r.text;
+  }
+  const sf = scriptFileOfArgv(argv);
+  return sf && !sf.ambiguous && !sf.unresolvable && typeof sf.file === 'string' && sf.file !== '' ? sf.file : null;
 }
 
 // groups: the exact files, one array per producer in the order it names them (what `st.files` was filled from), so the join can be rebuilt
@@ -692,10 +710,15 @@ const newSt = () => ({ dyn: false, files: [], groups: [], computed: [], raws: []
 // the text is computed at run time and the files are only worth a look (`st.computed`).
 function noteReads(seg, name, argv, st, exact) {
   if (name === 'echo' || name === 'printf') return; // static text, handled by producedBy
+  // such a producer's words stay candidates as before, but they are not FILE operands for the join rule (scriptFeedsOf): `ps -o rss= -p $pid` names none
+  const noFile = NO_FILE_PRODUCERS.has(name);
+  if (ENV_PRODUCERS.has(name)) st.dyn = true; // what it prints is the environment's, only known at run time
   if (readsUnnamedFiles(name, argv)) st.dyn = true; // the files it reads are unknown: the dynamic rules apply (refused when the line names a guarded operation / protected file)
   const reader = Object.hasOwn(READERS, name);
+  // a shell / interpreter / program run by path that is given a script (`bash $F/stack.sh env`): the script is the one file it reads, the words after it are the script's own arguments
+  const script = reader ? null : producerScript(argv);
   // [operand, the word it came from]; a word with no unquoted pattern character is a literal name even if it looks like a regex (`'^(A|B)='`)
-  const words = reader ? readerOperands(argv, ...READERS[name]).map((w) => [w, w]) : looseOperands(argv);
+  const words = reader ? readerOperands(argv, ...READERS[name]).map((w) => [w, w]) : script !== null ? [[script, script, argv.indexOf(script)]] : looseOperands(argv);
   for (const f of seg.stdinFiles) { words.push([f, f]); st.pat.add(f); }
   const list = exact && (EXACT_READERS.has(name) || argv.length === 0) ? st.files : st.computed;
   const prog = reader ? -1 : programIndex(name, argv);
@@ -704,8 +727,8 @@ function noteReads(seg, name, argv, st, exact) {
     if (w === '' || w === '-' || STDIN_FILES.has(w)) continue;
     list.push(w);
     if (list === st.files) group.push(w);
-    if (seg.pat.has(full) || idx !== prog) st.pat.add(w);
-    if (seg.pat.has(full)) st.unq.add(w); // an unquoted pattern: the shell really globs it (`find . -name '*.sh'` does not)
+    if (!noFile && (seg.pat.has(full) || idx !== prog)) st.pat.add(w);
+    if (!noFile && seg.pat.has(full)) st.unq.add(w); // an unquoted pattern: the shell really globs it (`find . -name '*.sh'` does not)
   }
   if (group.length) st.groups.push(group);
   if (words.length) st.raws.push(seg.raw);
@@ -813,9 +836,17 @@ const opaqueFile = (w, globs) => (globs ? hasExpansion(w) : /[$`]/.test(w)) || B
 // the file), {kind:'scan'} for a file a rewriting command read (the text is computed at run time, so the caller refuses the
 // file when it holds a guarded word). A word that expands is ambiguous (the caller lists the candidates); pattern syntax the
 // parser cut the producer at, or too many files, is unresolvable (the caller must refuse). `line` is the whole line `cmd` came from.
-export function scriptFeedsOf(cmd, line = cmd?.raw) {
-  const f = cmd?.feeds;
-  if (!f) return [];
+// `resolve` (optional): the caller's value for a word that holds `$` (the variables the line has set: `F=x/y; ... $F/s.sh`); a word it
+// returns without `$` / backtick / whitespace is that one file name and is decided on as such, anything else stays as written.
+export function scriptFeedsOf(cmd, line = cmd?.raw, resolve = null) {
+  const raw0 = cmd?.feeds;
+  if (!raw0) return [];
+  const R = (w) => {
+    if (typeof resolve !== 'function' || !w.includes('$')) return w;
+    const e = resolve(w);
+    return typeof e === 'string' && e !== '' && !/[$`\s]/.test(e) ? e : w;
+  };
+  const f = { files: raw0.files.map(R), groups: raw0.groups.map((g) => g.map(R)), computed: raw0.computed.map(R), raws: raw0.raws, pat: raw0.pat.map(R), unq: raw0.unq.map(R) };
   const exact = [...new Set(f.files)];
   const computed = [...new Set(f.computed)].filter((w) => !exact.includes(w));
   const rec = (kind) => (w) => (hasExpansion(w) ? { kind, file: w, ambiguous: true, words: [w] } : { kind, file: w });

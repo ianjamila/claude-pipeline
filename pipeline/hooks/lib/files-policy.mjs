@@ -1347,7 +1347,7 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
         if (v) return v;
       }
       // script text that reaches a shell without being named (`bash < f.sh`, `cat f.sh | bash`, `eval "$(cat f.sh)"`): its files are judged like `bash f.sh`
-      for (const fd of scriptFeedsOf(c, raw)) {
+      for (const fd of scriptFeedsOf(c, raw, (w) => expandRefs(w, ctx))) {
         const v = judgeScriptFile(fd, dirs, ctx, withLineVars(opts), scanRaw);
         if (v) return v;
       }
