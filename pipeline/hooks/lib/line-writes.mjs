@@ -180,6 +180,12 @@ function curlRecords(args, idx, env = {}) {
   let header = false;
   let outDir = '';
   const urls = [];
+  const named = []; // -o / --output names: --output-dir (before or after) puts a relative one below it
+  // Why: -w / --write-out prints a format; %output{FILE} (>>FILE appends) in it writes FILE, and @FILE reads the format from a file that may say the same
+  const writeOut = (v) => {
+    if (v.startsWith('@')) { anyOutput = true; return; }
+    for (const m of v.matchAll(/%output\{([^}]*)\}?/g)) { if (!m[0].endsWith('}')) anyOutput = true; else if (m[1].replace(/^>>/, '') !== '') out.push(unknown(m[1].replace(/^>>/, ''))); }
+  };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === '--') { urls.push(...args.slice(i + 1)); break; }
@@ -190,8 +196,10 @@ function curlRecords(args, idx, env = {}) {
       if (nm === 'config' || nm === 'next') { anyOutput = true; continue; }
       if (CURL_LONG_OUT.has(nm)) {
         const v = val ?? args[++i] ?? '';
-        if (nm === 'output-dir') outDir = v; else if (v !== '-' && v !== '') out.push(unknown(v));
-      } else if (nm === 'remote-name' || nm === 'remote-name-all') remote = true;
+        if (nm === 'output-dir') outDir = v; else if (nm === 'output') { if (v !== '-' && v !== '') named.push(v); } else if (v !== '-' && v !== '') out.push(unknown(v));
+      } else if (nm === 'url') urls.push(val ?? args[++i] ?? '');
+      else if (nm === 'write-out') writeOut(val ?? args[++i] ?? '');
+      else if (nm === 'remote-name' || nm === 'remote-name-all') remote = true;
       else if (nm === 'remote-header-name') { remote = true; header = true; } else if (CURL_LONG_VALUE.has(nm)) { if (val === null) i++; } else if (!CURL_LONG_SWITCH.has(nm)) return null; // not certain
       continue;
     }
@@ -205,16 +213,19 @@ function curlRecords(args, idx, env = {}) {
         if (ch === 'K') { anyOutput = true; break; }
         const rest = a.slice(k + 1);
         const v = rest !== '' ? rest : (args[++i] ?? ''); // (attached verbatim: `-o=n.sh` is the file `=n.sh`)
-        if (ch === 'o' || ch === 'D' || ch === 'c') { if (v !== '-' && v !== '') out.push(unknown(v)); }
+        if (ch === 'w') writeOut(v);
+        if (ch === 'o') { if (v !== '-' && v !== '') named.push(v); } else if (ch === 'D' || ch === 'c') { if (v !== '-' && v !== '') out.push(unknown(v)); }
         break;
       }
       continue;
     }
     urls.push(a);
   }
+  const inDir = (n) => (outDir && !n.startsWith('/') && !/^[A-Za-z]:/.test(n) ? `${outDir.replace(/\/+$/, '')}/${n}` : n);
+  for (const n of named) out.push(unknown(inDir(n)));
   if (urls.some((u) => /[[{]/.test(u)) && !args.some((a) => a === '-g' || a === '--globoff') || out.some((o) => /#\d/.test(o.dest))) anyOutput = true; // (a globbed URL / a #1 output name makes many files)
   if (remote) {
-    for (const u of urls) if (urlBase(u)) out.push(unknown(outDir ? `${outDir.replace(/\/+$/, '')}/${urlBase(u)}` : urlBase(u)));
+    for (const u of urls) if (urlBase(u)) out.push(unknown(inDir(urlBase(u))));
     if (header) out.push(unknown(outDir || '.', { subtree: true })); // the name comes from the response
   }
   return orAnywhere(out, idx, anyOutput);
