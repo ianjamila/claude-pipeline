@@ -687,3 +687,22 @@ test('L1: a script written by a heredoc is the heredoc text once, not twice (a v
   denyBoth('cat rot.txt - < rot.txt > n.sh; bash n.sh', { ...SPEC, 'rot.txt': 'rot' });
   denyBoth('cat rot.txt rot.txt > n.sh; bash n.sh', { ...SPEC, 'rot.txt': 'rot' });
 });
+
+test('L1: a worktree / clone / extract into a relative directory whose place is unknown reaches only scripts whose path holds that directory', () => {
+  // Why: `cd d && git worktree list | head -3 && git worktree add -q -b x .wt2 origin/main; cd .wt2 && node /abs/other/script.mjs`: the pipeline makes the directory of the
+  // add unknown, and an add into a relative `.wt2` was taken to reach EVERY script, even one outside any directory called .wt2
+  const unknownDir = (tail) => (_b, mid) => `cd /work/repo && git worktree list | head -3 && ${tail.replace('MID', mid)}`;
+  const gitOnly = (l) => run(l, SPEC).git.r.decision;
+  assert.equal(gitOnly(unknownDir('git worktree add -q -b x sub origin/main; MID; node /work/repo/ok.sh')(null, MID_GIT)), 'allow');
+  assert.equal(gitOnly(unknownDir('git clone https://x/y.git sub; MID; bash /work/repo/ok.sh')(null, MID_GIT)), 'allow');
+  assert.equal(gitOnly(unknownDir('git worktree add -q -b x src/zzz origin/main; MID; bash /work/repo/src/ok.sh')(null, MID_GIT)), 'allow'); // (src/ok.sh is not below src/zzz)
+  // the script IS below that directory (or the directory is `.` / `..` / unknown): still refused
+  assert.equal(gitOnly(unknownDir('git worktree add -q -b x sub origin/main; MID; bash /work/repo/sub/n.sh')(null, MID_GIT)), 'deny');
+  assert.equal(gitOnly(unknownDir('git worktree add -q -b x a/b origin/main; MID; bash /work/repo/a/b/c/n.sh')(null, MID_GIT)), 'deny');
+  assert.equal(gitOnly(unknownDir('git clone https://x/y.git .; MID; bash /work/repo/ok.sh')(null, MID_GIT)), 'deny');
+  assert.equal(gitOnly(unknownDir('git clone https://x/y.git ../sub; MID; bash /work/repo/sub/n.sh')(null, MID_GIT)), 'deny');
+  assert.equal(gitOnly(unknownDir('git clone https://x/y.git sub/../; MID; bash /work/repo/ok.sh')(null, MID_GIT)), 'deny'); // (`..` leaves sub)
+  assert.equal(gitOnly(unknownDir('git worktree add -q -b x a/../src origin/main; MID; bash /work/repo/src/n.sh')(null, MID_GIT)), 'deny');
+  assert.equal(gitOnly(unknownDir('git clone https://x/y.git sub\\\\..\\\\x; MID; bash /work/repo/ok.sh')(null, MID_GIT)), 'deny');
+  assert.equal(gitOnly(unknownDir('git clone https://x/y.git $D; MID; bash /work/repo/ok.sh')(null, MID_GIT)), 'deny');
+});

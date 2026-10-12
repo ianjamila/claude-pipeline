@@ -643,6 +643,18 @@ const same = (f, a, b) => relUnder(f, b, a) === '';
 const below = (f, P, d) => relUnder(f, P, d) || null;
 const nameOf = (f, s) => f.p.basename(String(s).replace(/[\\/]+$/, ''));
 
+// A relative directory `d` whose base is unknown: can P be below it? Only if P's path holds d's names in a row (`.wt2`, `a/b`); `.` and an empty name say nothing (a directory made only of those may hold
+// anything) and a `..` anywhere in it leaves the named directory, so that may hold anything too. Why: a worktree add into `.wt2` does not reach a script in /abs/other/.
+function mayBeBelow(f, d, P) {
+  const segs = String(d).replace(/\\/g, '/').split('/');
+  if (segs.includes('..')) return true; // (`a/../b` / `../x` leave the named directory: it may hold anything)
+  const names = segs.filter((s) => s && s !== '.').map((s) => fold(f, s));
+  if (!names.length) return true;
+  const have = String(P).replace(/\\/g, '/').split('/').map((s) => fold(f, s));
+  for (let i = 0; i + names.length <= have.length; i++) if (names.every((n, k) => have[i + k] === n)) return true;
+  return false;
+}
+
 // The items a record puts in P (null: it does not write P).
 function match(f, rec, P) {
   const p = f.p;
@@ -658,7 +670,7 @@ function match(f, rec, P) {
       out.loose = true;
       if (fold(f, p.basename(d)) === fold(f, p.basename(P))) out.push(...rec.items);
       else if (rec.copy) for (const it of rec.items) { const se = it.file === undefined ? undefined : f.expand(it.file); if (se === null || (se !== undefined && fold(f, nameOf(f, se)) === fold(f, p.basename(P)))) out.push(it); }
-      if (rec.subtree) out.push(...rec.items);
+      if (rec.subtree && mayBeBelow(f, d, P)) out.push(...rec.items);
       continue;
     }
     if (same(f, d, P)) { out.push(...rec.items); continue; }
