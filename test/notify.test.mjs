@@ -30,7 +30,7 @@ const tmp = () => {
   return d;
 };
 after(() => {
-  for (const d of roots) rmSync(d, { recursive: true, force: true });
+  for (const d of roots) rmSync(d, { recursive: true, force: true, maxRetries: 3 });
 });
 
 // A fake spawn: the child records the stdin it was given and closes with `code` (or hangs until killed).
