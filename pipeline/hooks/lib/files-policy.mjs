@@ -938,12 +938,14 @@ function onlyNonBinders(cmds) {
   });
 }
 function mayRebind(name, cmds, raw) {
-  const re = (s) => new RegExp(s.replace('NAME', name));
-  if (re('\\$\\{!?NAME(?::?[=+]|\\[)|\\bNAME\\[[^\\]]*\\]\\+?=|\\b(?:for|select|foreach)\\s+NAME\\b|\\(\\([^)]*\\bNAME\\b').test(raw)) return true; // (`${N:=x}`, `N[1]=`, a loop variable, arithmetic)
+  const re = (s) => new RegExp(s.replaceAll('NAME', name));
+  // (a `${...}` that mentions the name and assigns -- `${N:=x}`, `${N::=x}`, `${(flags)N=x}`, `${N+=}`)
+  if (re('\\$\\{[^}]*\\bNAME\\b[^}]*=|\\$\\{!?NAME\\[|\\bNAME\\[[^\\]]*\\]\\+?=|\\b(?:for|select|foreach)\\s+NAME\\b|\\(\\([^)]*\\bNAME\\b').test(raw)) return true; // (`${N:=x}`, `N[1]=`, a loop variable, arithmetic)
   return !onlyNonBinders(cmds);
 }
 function modelZshSelfDirs(cmds, raw, ctx) {
   if (!ctx.selfZero || !ctx.selfZsh || !/:[Aaht][:}]/.test(raw)) return;
+  if (raw.includes('::=') || /\$\{[^}]*(?:\b0\b|BASH_ARGV0)[^}]*=/.test(raw)) return; // (an expansion that assigns $0: not modelled at all)
   const ranges = functionRanges(raw);
   if (ranges === null || [...raw.matchAll(ZSH_SELF_RE)].some((m) => ranges.some(([a, b]) => m.index >= a && m.index <= b))) return;
   if (cmds.some((c) => Object.hasOwn(c.env ?? {}, '0') || Object.hasOwn(c.env ?? {}, 'BASH_ARGV0') || c.argv.some((a) => /^(?:0|BASH_ARGV0)\+?=|^BASH_ARGV0$/.test(a)))) return;

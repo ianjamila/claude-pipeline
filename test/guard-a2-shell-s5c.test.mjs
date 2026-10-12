@@ -150,3 +150,12 @@ test('S5c: only commands that never bind names keep a script-directory name (or 
   for (const pre of ['setopt posix_argzero', 'emulate sh', 'set -o posixargzero', 'myfn', 'zmodload zsh/zutil']) assert.equal(files(run, zero(pre)).decision, 'deny', pre);
   assert.equal(files(run, zero('ls >/dev/null; print -r -- hi')).decision, 'allow');
 });
+
+// Why: expansions that assign (`${N:=x}`, `${N::=x}` always, `${(flags)N=x}`), a loop whose body is only data commands and `(( ))` rebind a name without any command of their own; one that assigns $0 stops the whole model.
+test('S5c: expansions and loops that assign a name keep it unbelieved; one that assigns $0 stops the model', () => {
+  const run = `${CC}/scripts/restart.sh`;
+  const lit = (pre) => ccFs({ 'scripts/restart.sh': `#!/bin/zsh\nHERE=/home/u/cc/scripts\n${pre}\ncd "\${HERE:h}"\necho x > settings.json\n` });
+  for (const pre of [': ${HERE::=/tmp}', ': ${(e)HERE:=/tmp}', ': ${HERE=/tmp}', 'for HERE in a b; do ls; done', ': $(( HERE = 1 ))']) assert.equal(files(run, lit(pre)).decision, 'deny', pre);
+  const zero = (pre) => ccFs({ 'scripts/restart.sh': `#!/bin/zsh\n${pre}\ncd "\${0:A:h}"\necho x > settings.json\n` });
+  for (const pre of [': ${0::=/tmp/x}', ': ${0:=/tmp/x}', ': ${(e)0::=/tmp/x}']) assert.equal(files(run, zero(pre)).decision, 'deny', pre);
+});
