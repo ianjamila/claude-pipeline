@@ -1339,6 +1339,56 @@ test('CLI: no production configured is exit 0 {outcome: no-production}', () => {
   assert.equal(r.json.outcome, 'no-production');
 });
 
+// A summary comment on PR 12 whose record stopped at step prod-watch with no outcome, as `merge` leaves it.
+function noProductionWorld({ patchFails = false } = {}) {
+  const w = cliWorld({ healthy: [] });
+  w.repo.write('.claude/pipeline.yml', 'version: 1\nproject: demo\nverify:\n  full: a\n  quick: b\n');
+  const seed = fakeSummaryGh();
+  writeSummaryComment(seed, 12, { record: { ...emptyRecord({ repo: 'acme/widgets', pr: 12, branch: 'agent/x', baseRef: 'main' }), step: 'prod-watch' }, sections: '## Summary\nDid the thing.' });
+  w.gh.setScript([
+    { match: '^repo view', stdoutJson: REPO_VIEW },
+    { match: '^api user', stdout: 'bot\n' },
+    { match: '^api repos/acme/widgets/issues/12/comments --paginate', stdoutJson: [{ id: 1, user: { login: 'bot' }, body: seed.body() }] },
+    patchFails
+      ? { match: '^api -X PATCH repos/acme/widgets/issues/comments/1', stderr: 'HTTP 500', code: 1 }
+      : { match: '^api -X PATCH repos/acme/widgets/issues/comments/1', stdoutJson: { id: 1, html_url: 'https://github.com/acme/widgets/pull/12#issuecomment-1' } },
+  ]);
+  const patched = () => w.gh.calls().filter((c) => c.argv.join(' ').startsWith('api -X PATCH'));
+  return { ...w, patched };
+}
+
+test('CLI --observe-only --pr with no production configured: closes the stranded run record (step ended, outcome no-production)', () => {
+  const w = noProductionWorld();
+  const r = w.cli(['--sha', w.merge, '--pr', '12', '--observe-only']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.json.outcome, 'no-production');
+  assert.equal(r.json.warnings, undefined);
+  const writes = w.patched();
+  assert.equal(writes.length, 1, 'one record write, no in-flight marker');
+  const rec = decodeRecord(JSON.parse(writes[0].stdin).body).record;
+  assert.equal(rec.step, 'ended');
+  assert.equal(rec.outcome, 'no-production');
+  assert.equal(rec.inFlight, null);
+  assert.match(JSON.parse(writes[0].stdin).body, /Did the thing\./, 'summary sections are kept');
+});
+
+test('CLI --observe-only --pr with no production configured: a failed record write is a warning, the exit is unchanged', () => {
+  const w = noProductionWorld({ patchFails: true });
+  const r = w.cli(['--sha', w.merge, '--pr', '12', '--observe-only']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.json.outcome, 'no-production');
+  assert.equal(r.json.warnings.length, 1);
+  assert.match(r.json.warnings[0], /run record: could not record the observed outcome/);
+});
+
+test('CLI with no production configured and no --observe-only: the run record is not touched (the caller records the outcome)', () => {
+  const w = noProductionWorld();
+  const r = w.cli(['--sha', w.merge, '--pr', '12']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.json.outcome, 'no-production');
+  assert.equal(w.patched().length, 0);
+});
+
 test('CLI usage errors exit 2: missing/short sha, bad --pr, unknown flag, stray argument', () => {
   const w = cliWorld({ healthy: [] });
   assert.equal(w.cli([]).code, 2); // neither --sha nor --pr

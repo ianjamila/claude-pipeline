@@ -57,7 +57,20 @@ export const run = guarded(async (argv, ctx) => {
 
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
-  if (!config.production) return { exitCode: EXIT.OK, output: { ok: true, outcome: 'no-production', mergeSha: sha } };
+  if (!config.production) {
+    const output = { ok: true, outcome: 'no-production', mergeSha: sha };
+    // Nothing else closes the record on this path (runProdWatch never runs), and merge left it at step prod-watch with no
+    // outcome, so a resumed observe-only watch would route here forever. A write that fails is a warning, never a failure.
+    // Without --observe-only the original run records its own outcome (`P summary --outcome merged`).
+    if (observeOnly && pr !== undefined) {
+      try {
+        createRunRecordTracker({ gh: createGitHub({ cwd: root, env: ctx.env }), pr, host: hostname() }).finish('no-production', 'no production environment is configured');
+      } catch (err) {
+        output.warnings = [`run record: could not record the observed outcome: ${err?.message ?? err}`];
+      }
+    }
+    return { exitCode: EXIT.OK, output };
+  }
 
   const env = ctx.env;
   const gh = createGitHub({ cwd: root, env });
