@@ -9,9 +9,11 @@
 //  - nothing here throws or hangs: lookups return an "unresolved" answer with a reason, and every call is bounded by
 //    a timeout that the caller can share across steps.
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
+import { assertPrivateDir, makePrivateTmpDir, removeTree } from './private-tmp.mjs';
 import { gh, run, seamValue } from './proc.mjs';
+
+export { removeTree };
 
 export const UPSTREAM_HOST = 'github.com';
 export const UPSTREAM_REPO = 'ianjamila/claude-pipeline';
@@ -40,17 +42,18 @@ const GIT_ENV_KEEP_WINDOWS = ['SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP',
 // "/dev/null" only where it opens a file, while core.hooksPath is joined with a hook name ("/dev/null/post-checkout")
 // and stat()ed, which resolves to C:\dev\null\post-checkout on Windows - a directory any local user may create, so a
 // device-name hooksPath is a hook-hijack. Instead every isolated git call is given a PRIVATE directory made by
-// makeIsoDir(): `hooks/` (empty; core.hooksPath) and `empty.gitconfig` (empty; GIT_CONFIG_GLOBAL). Nothing the caller
-// configured, and nothing another local user can plant at a well-known path, can be found there.
+// makeIsoDir(home): `hooks/` (empty; core.hooksPath) and `empty.gitconfig` (empty; GIT_CONFIG_GLOBAL). Nothing the
+// caller configured, and nothing another local user can plant at a well-known path, can be found there. The directory
+// is made inside the trusted root under the Claude home (private-tmp.mjs), never under os.tmpdir(): a shared or
+// attacker-writable TEMP would let another account plant hooks/post-checkout or edit the config.
 export const ISO_DIR_PREFIX = 'claude-pipeline-git-';
 
 // A fresh private directory (mode 0700 on POSIX) holding an empty hooks directory and an empty global config file.
-// Throws when it cannot be made (the caller treats git as unavailable and never falls back to the caller's config).
-// The caller removes it (removeTree) - or uses withIsolatedGit, which does.
-export function makeIsoDir(parent = os.tmpdir()) {
-  const dir = fs.mkdtempSync(path.join(parent, ISO_DIR_PREFIX));
+// Throws when it cannot be made or the trusted root fails validation (the caller treats git as unavailable and never
+// falls back to the caller's config or to os.tmpdir()). The caller removes it (removeTree) - or uses withIsolatedGit.
+export function makeIsoDir(home) {
+  const dir = makePrivateTmpDir(home, ISO_DIR_PREFIX);
   try {
-    if (process.platform !== 'win32') fs.chmodSync(dir, 0o700);
     fs.mkdirSync(path.join(dir, 'hooks'), { mode: 0o700 });
     fs.writeFileSync(path.join(dir, 'empty.gitconfig'), '', { mode: 0o600 });
   } catch (err) {
@@ -60,13 +63,20 @@ export function makeIsoDir(parent = os.tmpdir()) {
   return dir;
 }
 
-// The two paths inside an iso directory. Throws unless both exist as made by makeIsoDir, so a caller that forgot the
-// directory (or passed some other path) fails loudly instead of running git against the caller's configuration.
+// The two paths inside an iso directory. Throws unless the directory is a real private one (not a symlink; ours and
+// closed to others on POSIX) holding a real `hooks` directory and a real `empty.gitconfig` file as made by makeIsoDir
+// (lstat: neither may be a symlink), so a caller that forgot the directory - or a swapped-in look-alike - fails loudly
+// instead of running git against another configuration.
 function isoPaths(isoDir) {
   if (typeof isoDir !== 'string' || isoDir === '') throw new TypeError('isolated git needs a private isoDir (see makeIsoDir / withIsolatedGit)');
   const hooks = path.join(isoDir, 'hooks');
   const config = path.join(isoDir, 'empty.gitconfig');
-  if (!fs.statSync(hooks).isDirectory() || !fs.statSync(config).isFile()) throw new TypeError(`isoDir ${isoDir} is not a directory made by makeIsoDir`);
+  try {
+    assertPrivateDir(isoDir, 'isoDir');
+    if (!fs.lstatSync(hooks).isDirectory() || !fs.lstatSync(config).isFile()) throw new Error('hooks or empty.gitconfig is missing');
+  } catch (err) {
+    throw new TypeError(`isoDir ${isoDir} is not a private directory made by makeIsoDir: ${String(err?.message ?? err).slice(0, 160)}`);
+  }
   return { hooks, config };
 }
 
@@ -102,10 +112,11 @@ export function isolatedGit(args, { isoDir, cwd, timeoutMs = 60000, input, allow
   return run('git', [...isolatedGitArgs({ isoDir, allowFile }), ...args], { cwd, env: isolatedGitEnv({ isoDir }), replaceEnv: true, timeoutMs, input });
 }
 
-// Runs fn(git, isoDir) with a private iso directory that is removed afterwards, whether fn returns or throws. `git` is
-// isolatedGit with that directory already bound: git(args, { cwd, timeoutMs, input, allowFile }).
-export function withIsolatedGit(fn) {
-  const isoDir = makeIsoDir();
+// Runs fn(git, isoDir) with a private iso directory (under `home`'s trusted temp root) that is removed afterwards,
+// whether fn returns or throws. `git` is isolatedGit with that directory already bound: git(args, { cwd, timeoutMs,
+// input, allowFile }).
+export function withIsolatedGit(home, fn) {
+  const isoDir = makeIsoDir(home);
   try {
     return fn((args, opts = {}) => isolatedGit(args, { ...opts, isoDir }), isoDir);
   } finally {
@@ -136,9 +147,11 @@ const failure = (what, r) => `${what} ${r.timedOut ? 'timed out' : `failed (exit
 // ---- main's sha --------------------------------------------------------------------------------------------------
 
 // The sha upstream's main points to. `timeoutMs` is ONE budget for the whole lookup (the gh attempt and the git
-// fallback share it). Tries `gh api` first (authenticated, rate-limit friendly), then `git ls-remote`.
+// fallback share it). Tries `gh api` first (authenticated, rate-limit friendly), then `git ls-remote`, which needs
+// `home` (the Claude home) for its private config/hooks directory; without a usable one git is "unavailable" and nothing
+// falls back to os.tmpdir() or the caller's configuration.
 // Returns { ok: true, sha, via: 'gh' | 'git' } or { ok: false, reason } - it never throws.
-export function mainSha({ timeoutMs = DEFAULT_TIMEOUT_MS, env } = {}) {
+export function mainSha({ timeoutMs = DEFAULT_TIMEOUT_MS, env, home } = {}) {
   const t = budget(timeoutMs);
   const reasons = [];
   try {
@@ -152,8 +165,9 @@ export function mainSha({ timeoutMs = DEFAULT_TIMEOUT_MS, env } = {}) {
   if (t.expired()) return { ok: false, reason: reasons.join('; ') };
   try {
     const remote = fetchRemote(env);
-    // A private config/hooks directory per call; if it cannot be made git is unavailable here, never run on the caller's config.
-    const r = withIsolatedGit((git) => git(['ls-remote', remote.url, 'refs/heads/main'], { cwd: os.tmpdir(), timeoutMs: t.left(), allowFile: remote.local }));
+    // A private config/hooks directory per call (also its cwd: git must not discover some other repository); if it
+    // cannot be made git is unavailable here, never run on the caller's config.
+    const r = withIsolatedGit(home, (git, isoDir) => git(['ls-remote', remote.url, 'refs/heads/main'], { cwd: isoDir, timeoutMs: t.left(), allowFile: remote.local }));
     const sha = r.stdout.split(/\s+/)[0] ?? '';
     if (r.code === 0 && !r.timedOut && FULL_SHA.test(sha)) return { ok: true, sha, via: 'git' };
     reasons.push(r.code === 0 && !r.timedOut ? 'git ls-remote did not list refs/heads/main' : failure('git ls-remote', r));
@@ -204,11 +218,4 @@ export function compare(base, head, { timeoutMs = DEFAULT_TIMEOUT_MS, env } = {}
   }
   if (!FULL_SHA.test(headSha) || !headSha.startsWith(h)) return unresolved('compare response does not name the head commit');
   return { status: body.status, baseSha, headSha };
-}
-
-// ---- scratch directory -------------------------------------------------------------------------------------------
-
-// Remove a directory tree, tolerating Windows' brief file locks. Never throws.
-export function removeTree(dir) {
-  try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); } catch { /* best effort */ }
 }

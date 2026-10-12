@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { run } from './pipeline/lib/proc.mjs';
 import { expandHome, isInside, safeTimestamp } from './pipeline/lib/paths.mjs';
+import { TMP_ROOT_REL } from './pipeline/lib/private-tmp.mjs';
 import * as I from './pipeline/lib/installer.mjs';
 import { hasClaudeCodeAncestor } from './pipeline/lib/claude-ancestry.mjs';
 import { tryAcquire, release } from './pipeline/lib/locks.mjs';
@@ -220,7 +221,9 @@ function doInstall(ctx) {
   const warnings = [];
   const plan = loadPlan(source);
   warnings.push(...plan.warnings);
-  if (isInside(source, home)) throw new InstallError(`the source (${source}) is inside the claude-home (${home}); installing would overwrite it`);
+  // `pipeline update` downloads into <home>/pipeline-state/tmp (private-tmp.mjs), a place this installer never writes to
+  // (it only writes skills/, agents/, pipeline/, settings.json and backups/), so a source there cannot be overwritten.
+  if (isInside(source, home) && !isInside(source, path.join(home, TMP_ROOT_REL))) throw new InstallError(`the source (${source}) is inside the claude-home (${home}); installing would overwrite it`);
 
   // Everything that can refuse happens before the first write.
   const current = readSettings(home);

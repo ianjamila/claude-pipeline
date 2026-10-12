@@ -1471,3 +1471,22 @@ test('a lock left by a dead process is reclaimed; the lock is released after ins
   assert.equal(install(broken, [], { env }).status, 1);
   assert.equal(inspect(installLockName(broken), { dir }), null, 'released after a failed install');
 });
+
+// ---- a source inside the claude-home ------------------------------------------------------------------------------
+
+test('a source inside the claude-home is refused, except under pipeline-state/tmp (where `pipeline update` downloads)', () => {
+  const home = newHome();
+  const inside = join(home, 'skills-copy');
+  cpSync(FIXTURE, inside, { recursive: true });
+  const refused = install(home, [], { source: inside });
+  assert.equal(refused.status, 1, refused.stderr);
+  assert.match(refused.stderr, /is inside the claude-home/);
+  assert.equal(existsSync(join(home, 'pipeline')), false, 'nothing was installed');
+
+  const tmpSrc = join(home, 'pipeline-state', 'tmp', 'claude-pipeline-update-abc123', 'src');
+  cpSync(FIXTURE, tmpSrc, { recursive: true });
+  const ok = install(home, [], { source: tmpSrc });
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.equal(existsSync(join(home, 'pipeline', 'INSTALLED.json')), true);
+  assert.equal(existsSync(tmpSrc), true, 'the installer did not touch the source');
+});

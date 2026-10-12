@@ -1,5 +1,5 @@
 // Updates the installed pipeline to upstream's main with one command, run by the owner in their own terminal:
-// resolve main's sha, download exactly that commit into a scratch directory with an isolated git, install from it with
+// resolve main's sha, download exactly that commit into a private scratch directory under the Claude home with an isolated git, install from it with
 // the installer (the same install.mjs a manual install runs), then prove the result with the installer's own --check.
 // `--check` only reports (and is allowed anywhere, including inside Claude Code): installed stamp, main, how they relate.
 // Why it refuses inside Claude Code: an update replaces the guard hooks, which is the one thing an agent must not do to
@@ -14,6 +14,7 @@ import { installedIdentity } from '../lib/identity.mjs';
 import { readManifest } from '../lib/installer.mjs';
 import { expandHome } from '../lib/paths.mjs';
 import { run as runProcess } from '../lib/proc.mjs';
+import { makePrivateTmpDir } from '../lib/private-tmp.mjs';
 import { compare, fetchRemote, isolatedGit, mainSha, makeIsoDir, removeTree } from '../lib/upstream.mjs';
 
 export const meta = {
@@ -110,7 +111,7 @@ export async function run(argv, ctx = {}) {
   }
 
   const home = path.resolve(expandHome(values['claude-home'] || path.join(os.homedir(), '.claude')));
-  const main = mainSha({ timeoutMs: NETWORK_TIMEOUT_MS, env });
+  const main = mainSha({ timeoutMs: NETWORK_TIMEOUT_MS, env, home });
   const before = installedIdentity(home);
 
   if (!main.ok) {
@@ -151,11 +152,14 @@ export async function run(argv, ctx = {}) {
   let tmp = null;
   let isoDir = null;
   try {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-pipeline-update-'));
+    // Both scratch directories (the download the installer is then RUN from, and the git config/hooks one) live in the
+    // trusted private root under `home`, never os.tmpdir(): see private-tmp.mjs. If it cannot be established, stop.
     try {
-      isoDir = makeIsoDir();
+      fs.mkdirSync(home, { recursive: true }); // a first install into a home that does not exist yet; the installer would make it anyway
+      tmp = makePrivateTmpDir(home, 'claude-pipeline-update-');
+      isoDir = makeIsoDir(home);
     } catch (err) {
-      return fail('fetch-failed', `git unavailable: could not create a private directory for it (${String(err?.message ?? err).slice(0, 200)})`);
+      return fail('fetch-failed', `could not create a private scratch directory under ${home} (${String(err?.message ?? err).slice(0, 200)})`);
     }
     say(`fetching upstream main ${sha7(main.sha)} ...`);
     let src;

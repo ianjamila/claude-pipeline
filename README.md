@@ -63,7 +63,9 @@ cd ~/Claude/claude-pipeline
   ```sh
   node ~/.claude/pipeline/bin/pipeline.mjs update
   ```
-  It looks up upstream's `main`, downloads exactly that commit into a scratch directory with an
+  It looks up upstream's `main`, downloads exactly that commit into a private scratch directory
+  under `~/.claude/pipeline-state/tmp` (never the system temp dir, which other accounts may be able
+  to write to; it is created owner-only and refused if it is a symlink or someone else's) with an
   isolated git (no config, hooks, credential helpers or `GIT_*` variables of yours), installs from
   it, runs `install.mjs --check`, and reports success only when the installed stamp is that commit.
   A copy installed with `--skip-file-guard` stays that way. It is idempotent, and

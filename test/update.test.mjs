@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import {
-  chmodSync, cpSync, copyFileSync, existsSync, lstatSync, statSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync,
+  chmodSync, cpSync, copyFileSync, existsSync, lstatSync, statSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { devNull, tmpdir } from 'node:os';
 import { dirname, join, sep } from 'node:path';
@@ -82,16 +82,23 @@ function envFor(fake, extra = {}) {
 const newHome = () => join(scratch('cp-upd-home'), 'claude');
 const readManifest = (home) => JSON.parse(readFileSync(join(home, 'pipeline', 'INSTALLED.json'), 'utf8'));
 
-// A private isolation directory for a test, made under a scratch folder that the exit hook removes.
-const isoDir = () => makeIsoDir(scratch('cp-upd-isoparent'));
+// A private isolation directory for a test, made in the trusted temp root of a scratch Claude home (removed on exit).
+const isoDir = () => makeIsoDir(scratch('cp-upd-isohome'));
+const tmpRootOf = (home) => join(home, 'pipeline-state', 'tmp');
 
-// Runs `fn` with the temp dir pointed at a private folder and lists update's own scratch directories (the download
-// and the private git config/hooks directory) left in it afterwards.
-async function withTmp(fn) {
-  const dir = scratch('cp-upd-tmp');
+// Runs `fn` with the OS temp dir pointed at an empty canary folder, then reports (a) `left`: update's own scratch
+// directories (the download and the private git config/hooks directory) still in the trusted root under `home`, and
+// asserts (b) that nothing at all was created in the OS temp dir: the scratch space is under the Claude home only.
+async function withTmp(home, fn) {
+  const canary = scratch('cp-upd-tmp');
   const saved = { TMPDIR: process.env.TMPDIR, TEMP: process.env.TEMP, TMP: process.env.TMP };
-  Object.assign(process.env, { TMPDIR: dir, TEMP: dir, TMP: dir });
-  try { return { result: await fn(), left: readdirSync(dir).filter((n) => n.startsWith('claude-pipeline-update-') || n.startsWith(ISO_DIR_PREFIX)) }; } finally {
+  Object.assign(process.env, { TMPDIR: canary, TEMP: canary, TMP: canary });
+  try {
+    const result = await fn();
+    assert.deepEqual(readdirSync(canary).filter((n) => n.startsWith('claude-pipeline-')), [], 'update creates nothing under the OS temp dir');
+    const root = tmpRootOf(home);
+    return { result, left: existsSync(root) ? readdirSync(root) : [] };
+  } finally {
     for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
   }
 }
@@ -241,13 +248,15 @@ test('--check: a GitHub error on the compare is reported as unresolved with a re
 test('main cannot be resolved (gh down, remote unreachable): exit 1 with the reasons, nothing fetched or installed', async () => {
   const fake = createFakeGh([{ match: '.*', stderr: 'gh: not logged in', code: 4 }]);
   const home = newHome();
+  mkdirSync(home); // the git fallback needs an existing Claude home for its private directory
   const env = envFor(fake, { PIPELINE_UPDATE_REMOTE: join(scratch('cp-upd-void'), 'nope.git') });
   const r = await update(['--claude-home', home], { env });
   assert.equal(r.exitCode, 1);
   assert.equal(r.output.error, 'upstream-unresolved');
   assert.match(r.output.message, /not logged in/);
   assert.match(r.output.message, /git ls-remote/);
-  assert.equal(existsSync(home), false);
+  assert.equal(existsSync(join(home, 'pipeline')), false);
+  assert.deepEqual(readdirSync(tmpRootOf(home)), [], 'the private git directory is gone');
 });
 
 // ---- update -------------------------------------------------------------------------------------------------------
@@ -256,7 +265,7 @@ test('update installs exactly the commit main points to, verifies it, and leaves
   const { sha, version } = remote();
   const home = newHome();
   const fake = ghFor(sha, cmp('identical', sha, sha));
-  const { result: r, left } = await withTmp(() => update(['--claude-home', home], { env: envFor(fake) }));
+  const { result: r, left } = await withTmp(home, () => update(['--claude-home', home], { env: envFor(fake) }));
   assert.equal(r.exitCode, 0, JSON.stringify(r.output));
   assert.equal(r.output.ok, true);
   assert.equal(r.output.before, null);
@@ -319,7 +328,7 @@ test('update turns the guard-files hook on for a default install (no flag inferr
 test('a fetch that fails reports it, installs nothing, and still removes the scratch directory', async () => {
   const sha = 'a'.repeat(40); // main names a commit the remote does not have
   const home = newHome();
-  const { result: r, left } = await withTmp(() => update(['--claude-home', home], { env: envFor(ghFor(sha)) }));
+  const { result: r, left } = await withTmp(home, () => update(['--claude-home', home], { env: envFor(ghFor(sha)) }));
   assert.equal(r.exitCode, 1);
   assert.equal(r.output.ok, false);
   assert.equal(r.output.error, 'fetch-failed');
@@ -333,7 +342,7 @@ test('an install that fails is reported and the scratch directory is still remov
   const home = newHome();
   mkdirSync(join(home, 'skills', 'ship'), { recursive: true }); // a skill that is not ours: the installer refuses to overwrite it
   writeFileSync(join(home, 'skills', 'ship', 'SKILL.md'), 'mine\n');
-  const { result: r, left } = await withTmp(() => update(['--claude-home', home], { env: envFor(ghFor(sha)) }));
+  const { result: r, left } = await withTmp(home, () => update(['--claude-home', home], { env: envFor(ghFor(sha)) }));
   assert.equal(r.exitCode, 1);
   assert.equal(r.output.error, 'install-failed');
   assert.equal(r.output.install.ok, false);
@@ -359,16 +368,16 @@ test('the upstream constants', () => {
 test('mainSha: gh first (pinned host + repo), then git ls-remote; both failing names both reasons', () => {
   const { sha, bare } = remote();
   const ok = ghFor(sha);
-  assert.deepEqual(mainSha({ env: envFor(ok) }), { ok: true, sha, via: 'gh' });
+  assert.deepEqual(mainSha({ env: envFor(ok), home: scratch('cp-upd-mshome') }), { ok: true, sha, via: 'gh' });
   assert.deepEqual(ok.lines(), [`api --hostname github.com repos/ianjamila/claude-pipeline/commits/main --jq .sha`]);
 
   const down = createFakeGh([{ match: '.*', stderr: 'HTTP 502', code: 1 }]);
-  assert.deepEqual(mainSha({ env: envFor(down, { PIPELINE_UPDATE_REMOTE: bare }) }), { ok: true, sha, via: 'git' });
+  assert.deepEqual(mainSha({ env: envFor(down, { PIPELINE_UPDATE_REMOTE: bare }), home: scratch('cp-upd-mshome') }), { ok: true, sha, via: 'git' });
 
   const junk = createFakeGh([{ match: '.*', stdout: '<html>captive portal</html>' }]);
-  assert.equal(mainSha({ env: envFor(junk, { PIPELINE_UPDATE_REMOTE: bare }) }).via, 'git', 'a gh answer that is not a sha falls through');
+  assert.equal(mainSha({ env: envFor(junk, { PIPELINE_UPDATE_REMOTE: bare }), home: scratch('cp-upd-mshome') }).via, 'git', 'a gh answer that is not a sha falls through');
 
-  const both = mainSha({ env: envFor(down, { PIPELINE_UPDATE_REMOTE: join(scratch('cp-upd-void'), 'nope.git') }) });
+  const both = mainSha({ env: envFor(down, { PIPELINE_UPDATE_REMOTE: join(scratch('cp-upd-void'), 'nope.git') }), home: scratch('cp-upd-mshome') });
   assert.equal(both.ok, false);
   assert.match(both.reason, /HTTP 502/);
   assert.match(both.reason, /git ls-remote/);
@@ -429,7 +438,7 @@ test('compare and mainSha give up when gh hangs past the timeout', () => {
   const c = compare('a'.repeat(40), 'b'.repeat(40), { env, timeoutMs: 400 });
   assert.equal(c.status, 'unresolved');
   assert.match(c.reason, /timed out/);
-  const m = mainSha({ env, timeoutMs: 400 });
+  const m = mainSha({ env, timeoutMs: 400, home: scratch('cp-upd-mshome') });
   assert.equal(m.ok, false);
   assert.match(m.reason, /timed out/);
   assert.ok(Date.now() - t0 < 8000, 'the timeouts are real');
@@ -470,22 +479,35 @@ test('the isolated git cannot be called without a private directory made by make
   assert.throws(() => isolatedGit(['--version'], { isoDir: scratch('cp-upd-notiso') }));
 });
 
-test('makeIsoDir: a fresh private dir (0700 on POSIX) with an empty hooks dir and an empty config file; withIsolatedGit removes it', { skip: process.platform === 'win32' }, () => {
-  const parent = scratch('cp-upd-isomode');
-  const a = makeIsoDir(parent);
-  const b = makeIsoDir(parent);
-  assert.notEqual(a, b);
-  assert.equal(statSync(a).mode & 0o777, 0o700);
-  assert.equal(statSync(join(a, 'hooks')).mode & 0o777, 0o700);
-  assert.equal(statSync(join(a, 'empty.gitconfig')).mode & 0o077, 0, 'the config file is not group/world accessible');
-  assert.equal(a.startsWith(join(parent, ISO_DIR_PREFIX)), true);
-  let seen;
-  const out = withIsolatedGit((git, dir) => { seen = dir; assert.equal(existsSync(dir), true); return git(['--version']); });
-  assert.equal(out.code, 0, out.stderr);
-  assert.equal(existsSync(seen), false, 'removed after success');
-  let thrown;
-  assert.throws(() => withIsolatedGit((git, dir) => { thrown = dir; throw new Error('boom'); }), /boom/);
-  assert.equal(existsSync(thrown), false, 'removed after a throw');
+test('makeIsoDir: a fresh private dir (0700 on POSIX) in the home\'s trusted root, with an empty hooks dir and an empty config file; withIsolatedGit removes it', () => {
+  const home = scratch('cp-upd-isomode');
+  const canary = scratch('cp-upd-isocanary');
+  const saved = { TMPDIR: process.env.TMPDIR, TEMP: process.env.TEMP, TMP: process.env.TMP };
+  Object.assign(process.env, { TMPDIR: canary, TEMP: canary, TMP: canary });
+  try {
+    const a = makeIsoDir(home);
+    const b = makeIsoDir(home);
+    assert.notEqual(a, b);
+    assert.equal(a.startsWith(join(tmpRootOf(home), ISO_DIR_PREFIX)), true, 'inside <home>/pipeline-state/tmp');
+    assert.deepEqual(readdirSync(canary), [], 'not under the OS temp dir');
+    assert.deepEqual(readdirSync(join(a, 'hooks')), []);
+    assert.equal(readFileSync(join(a, 'empty.gitconfig'), 'utf8'), '');
+    if (process.platform !== 'win32') {
+      assert.equal(statSync(a).mode & 0o777, 0o700);
+      assert.equal(statSync(join(a, 'hooks')).mode & 0o777, 0o700);
+      assert.equal(statSync(join(a, 'empty.gitconfig')).mode & 0o077, 0, 'the config file is not group/world accessible');
+    }
+    let seen;
+    const out = withIsolatedGit(home, (git, dir) => { seen = dir; assert.equal(existsSync(dir), true); return git(['--version'], { cwd: dir }); });
+    assert.equal(out.code, 0, out.stderr);
+    assert.equal(existsSync(seen), false, 'removed after success');
+    let thrown;
+    assert.throws(() => withIsolatedGit(home, (git, dir) => { thrown = dir; throw new Error('boom'); }), /boom/);
+    assert.equal(existsSync(thrown), false, 'removed after a throw');
+    assert.throws(() => withIsolatedGit(undefined, () => {}), /Claude home/);
+  } finally {
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
 });
 
 test('the isolated git environment is an allowlist: PATH, HOME, locale and three fixed values, nothing else', () => {
@@ -533,15 +555,19 @@ test('the isolated git ignores a hostile environment: GIT_DIR, a template with a
 
 // A caller whose own git configuration (global config AND ~/.gitconfig) points core.hooksPath at a directory holding a
 // post-checkout hook that writes a marker. Control: plain git runs it. Isolated git must not.
+// Runs on Windows too: Git for Windows executes a `#!/bin/sh` hook through its bundled sh, so the hook (and the paths
+// inside it) are written with forward slashes. The control below fails loudly on any platform where the hook is not a
+// real vector, which keeps the assertions that follow it from passing vacuously.
+const fwd = (p) => p.replace(/\\/g, '/');
 function plantedHookConfig(dir) {
   const hooks = join(dir, 'planted-hooks');
   const marker = join(dir, 'hook-ran');
   mkdirSync(hooks);
-  writeFileSync(join(hooks, 'post-checkout'), `#!/bin/sh\necho ran >> "${marker}"\n`, { mode: 0o755 });
+  writeFileSync(join(hooks, 'post-checkout'), `#!/bin/sh\necho ran >> "${fwd(marker)}"\n`, { mode: 0o755 });
   chmodSync(join(hooks, 'post-checkout'), 0o755);
   const home = join(dir, 'planted-home');
   mkdirSync(home);
-  const config = `[core]\n\thooksPath = ${hooks.replace(/\\/g, '/')}\n`;
+  const config = `[core]\n\thooksPath = ${fwd(hooks)}\n`;
   writeFileSync(join(home, '.gitconfig'), config);
   const global = join(dir, 'planted-global.gitconfig');
   writeFileSync(global, config);
@@ -549,7 +575,7 @@ function plantedHookConfig(dir) {
 }
 const CHECKOUT = ['-c', 'advice.detachedHead=false', 'checkout', '--quiet', '--detach', 'FETCH_HEAD'];
 
-test('a post-checkout hook in the CALLER\'s configured hooksPath (global config and ~/.gitconfig) does not run', { skip: process.platform === 'win32' }, () => {
+test('a post-checkout hook in the CALLER\'s configured hooksPath (global config and ~/.gitconfig) does not run', () => {
   const dir = scratch('cp-upd-hook');
   const { marker, home, global } = plantedHookConfig(dir);
   const { bare, sha } = remote();
@@ -566,7 +592,7 @@ test('a post-checkout hook in the CALLER\'s configured hooksPath (global config 
   const saved = { HOME: process.env.HOME, GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL };
   Object.assign(process.env, { HOME: home, GIT_CONFIG_GLOBAL: global });
   try {
-    withIsolatedGit((git) => {
+    withIsolatedGit(scratch('cp-upd-hookhome'), (git) => {
       const repo = join(dir, 'repo');
       assert.equal(git(['init', '--quiet', '--template=', repo], { cwd: dir }).code, 0);
       const fetch = git(['-C', repo, 'fetch', '--quiet', '--depth', '1', '--no-tags', bare, sha], { cwd: dir, allowFile: true });
@@ -581,7 +607,7 @@ test('a post-checkout hook in the CALLER\'s configured hooksPath (global config 
   }
 });
 
-test('update: a hook planted in the caller\'s git configuration does not run, and the private git directory is removed', { skip: process.platform === 'win32' }, async () => {
+test('update: a hook planted in the caller\'s git configuration does not run, and the private git directory is removed', async () => {
   const dir = scratch('cp-upd-hookupd');
   const { marker, home: plantedHome, global } = plantedHookConfig(dir);
   const { sha } = remote();
@@ -589,7 +615,7 @@ test('update: a hook planted in the caller\'s git configuration does not run, an
   const saved = { HOME: process.env.HOME, GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL };
   Object.assign(process.env, { HOME: plantedHome, GIT_CONFIG_GLOBAL: global });
   try {
-    const { result: r, left } = await withTmp(() => update(['--claude-home', home], { env: envFor(ghFor(sha, cmp('identical', sha, sha))) }));
+    const { result: r, left } = await withTmp(home, () => update(['--claude-home', home], { env: envFor(ghFor(sha, cmp('identical', sha, sha))) }));
     assert.equal(r.exitCode, 0, JSON.stringify(r.output));
     assert.equal(existsSync(marker), false, 'the caller\'s hook ran during update');
     assert.deepEqual(left, [], 'neither the download nor the private git directory is left');
@@ -598,30 +624,90 @@ test('update: a hook planted in the caller\'s git configuration does not run, an
   }
 });
 
-test('mainSha: the git fallback uses a private directory per call and removes it', async () => {
+test('mainSha: the git fallback uses a private directory per call under the home, removes it, and never touches the OS temp dir', async () => {
   const { sha, bare } = remote();
   const down = createFakeGh([{ match: '.*', stderr: 'HTTP 502', code: 1 }]);
-  const { result, left } = await withTmp(() => [mainSha({ env: envFor(down, { PIPELINE_UPDATE_REMOTE: bare }) }), mainSha({ env: envFor(down, { PIPELINE_UPDATE_REMOTE: bare }) })]);
+  const home = scratch('cp-upd-mshome');
+  const { result, left } = await withTmp(home, () => [mainSha({ env: envFor(down, { PIPELINE_UPDATE_REMOTE: bare }), home }), mainSha({ env: envFor(down, { PIPELINE_UPDATE_REMOTE: bare }), home })]);
   assert.deepEqual(result, [{ ok: true, sha, via: 'git' }, { ok: true, sha, via: 'git' }]);
   assert.deepEqual(left, []);
-  const failing = await withTmp(() => mainSha({ env: envFor(down, { PIPELINE_UPDATE_REMOTE: join(scratch('cp-upd-void'), 'nope.git') }) }));
+  const failing = await withTmp(home, () => mainSha({ env: envFor(down, { PIPELINE_UPDATE_REMOTE: join(scratch('cp-upd-void'), 'nope.git') }), home }));
   assert.equal(failing.result.ok, false);
   assert.deepEqual(failing.left, [], 'removed after a failed lookup too');
 });
 
-test('mainSha: when the private directory cannot be made, the git fallback is unavailable and the caller\'s config is never used', async () => {
+test('mainSha: when the trusted private root cannot be established, the git fallback is unavailable (no home, a symlinked root, a blocked state dir) and nothing falls back to os.tmpdir()', async () => {
   const { bare } = remote();
   const down = createFakeGh([{ match: '.*', stderr: 'HTTP 502', code: 1 }]);
-  const saved = { TMPDIR: process.env.TMPDIR, TEMP: process.env.TEMP, TMP: process.env.TMP };
-  const missing = join(scratch('cp-upd-missing'), 'no', 'such', 'tmp');
   const env = envFor(down, { PIPELINE_UPDATE_REMOTE: bare });
-  Object.assign(process.env, { TMPDIR: missing, TEMP: missing, TMP: missing });
+  const unavailable = (m) => { assert.equal(m.ok, false); assert.match(m.reason, /git unavailable/); };
+  const canary = scratch('cp-upd-canary');
+  const saved = { TMPDIR: process.env.TMPDIR, TEMP: process.env.TEMP, TMP: process.env.TMP };
+  Object.assign(process.env, { TMPDIR: canary, TEMP: canary, TMP: canary });
   try {
-    const m = mainSha({ env });
-    assert.equal(m.ok, false);
-    assert.match(m.reason, /git unavailable/);
+    unavailable(mainSha({ env }));
+    const linked = scratch('cp-upd-linkhome');
+    const elsewhere = scratch('cp-upd-elsewhere');
+    mkdirSync(join(linked, 'pipeline-state'));
+    symlinkSync(elsewhere, tmpRootOf(linked), process.platform === 'win32' ? 'junction' : 'dir');
+    unavailable(mainSha({ env, home: linked }));
+    const blocked = scratch('cp-upd-blockhome');
+    writeFileSync(join(blocked, 'pipeline-state'), 'a file where the state directory should be');
+    unavailable(mainSha({ env, home: blocked }));
+    assert.deepEqual(readdirSync(elsewhere), [], 'nothing was made through the symlink');
+    assert.deepEqual(readdirSync(canary).filter((n) => n.startsWith('claude-pipeline-')), [], 'nothing fell back to the OS temp dir');
   } finally {
     for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+});
+
+// The hook test above uses core.hooksPath, which the isolated git ALSO sets on its command line - so it would pass even
+// if the caller's config were loaded. This one is configuration-sensitive: the caller's config rewrites a URL
+// (`url.<real>.insteadOf = <decoy>`), which nothing on the command line overrides. A plain git must follow the rewrite
+// (control); the isolated git must not load that config at all, wherever the caller put it: GIT_CONFIG_GLOBAL, ~/.gitconfig,
+// $XDG_CONFIG_HOME/git/config, or a file pulled in by include.path.
+test('the caller\'s git configuration is not LOADED by the isolated git: a url rewrite in any global location has no effect', () => {
+  const dir = scratch('cp-upd-rewrite');
+  const { bare: real, sha: realSha } = remote();
+  const work = join(dir, 'decoy-work');
+  mkdirSync(work);
+  git(work, ['init', '--quiet']);
+  git(work, ['symbolic-ref', 'HEAD', 'refs/heads/main']);
+  git(work, ['-c', 'commit.gpgsign=false', 'commit', '--quiet', '--allow-empty', '-m', 'decoy']);
+  const decoy = join(dir, 'decoy.git');
+  git(work, ['clone', '--quiet', '--bare', work, decoy]);
+  const decoySha = git(work, ['rev-parse', 'HEAD']);
+  assert.notEqual(decoySha, realSha);
+  const rewrite = `[url "${fwd(real)}"]\n\tinsteadOf = ${fwd(decoy)}\n`;
+
+  const scenarios = {
+    'GIT_CONFIG_GLOBAL': (d) => { const f = join(d, 'g.gitconfig'); writeFileSync(f, rewrite); return { GIT_CONFIG_GLOBAL: f }; },
+    '$HOME/.gitconfig': (d) => { writeFileSync(join(d, '.gitconfig'), rewrite); return {}; },
+    '$XDG_CONFIG_HOME/git/config': (d) => { mkdirSync(join(d, 'xdg', 'git'), { recursive: true }); writeFileSync(join(d, 'xdg', 'git', 'config'), rewrite); return { XDG_CONFIG_HOME: join(d, 'xdg') }; },
+    'include.path from $HOME/.gitconfig': (d) => { writeFileSync(join(d, 'included'), rewrite); writeFileSync(join(d, '.gitconfig'), `[include]\n\tpath = ${fwd(join(d, 'included'))}\n`); return {}; },
+  };
+  for (const [where, plant] of Object.entries(scenarios)) {
+    const d = scratch('cp-upd-rw');
+    const planted = plant(d);
+    const callerEnv = { HOME: d, USERPROFILE: d, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: undefined, XDG_CONFIG_HOME: undefined, ...planted };
+    const names = Object.keys(callerEnv);
+    // Control: a plain git with that config follows the rewrite, so the isolated answer below is a real signal.
+    const plainEnv = Object.fromEntries(Object.entries({ ...process.env, ...callerEnv }).filter(([, v]) => v !== undefined));
+    const control = spawnSync('git', ['ls-remote', decoy, 'refs/heads/main'], { cwd: dir, encoding: 'utf8', env: plainEnv });
+    assert.equal(control.status, 0, `${where}: ${control.stderr}`);
+    assert.match(control.stdout, new RegExp(`^${realSha}`), `control (${where}): the rewrite is a real vector on this git`);
+
+    const saved = Object.fromEntries(names.map((n) => [n, process.env[n]]));
+    for (const n of names) { if (callerEnv[n] === undefined) delete process.env[n]; else process.env[n] = callerEnv[n]; }
+    try {
+      withIsolatedGit(scratch('cp-upd-rwhome'), (g, iso) => {
+        const ls = g(['ls-remote', decoy, 'refs/heads/main'], { cwd: iso, allowFile: true });
+        assert.equal(ls.code, 0, `${where}: ${ls.stderr}`);
+        assert.match(ls.stdout, new RegExp(`^${decoySha}`), `${where}: the isolated git followed the caller's url rewrite (global config was loaded)`);
+      });
+    } finally {
+      for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    }
   }
 });
 

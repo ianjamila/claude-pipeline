@@ -260,7 +260,7 @@ export async function gatherFacts({ home, cwd, env = process.env, now = Date.now
     if (cachedMain) {
       facts.main = { ok: true, sha: cachedMain };
     } else if (left() > 0) {
-      const m = d.mainSha({ timeoutMs: Math.max(1, left()), env });
+      const m = d.mainSha({ timeoutMs: Math.max(1, left()), env, home });
       facts.main = m.ok ? m : { ...m, timedOut: left() <= 0 };
       if (m.ok) d.cache.writeMain(m.sha);
     } else facts.timedOut = true;

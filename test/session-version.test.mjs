@@ -238,6 +238,13 @@ test('gatherFacts: not a repo, or no vendored VERSION, yields no repo comparison
   assert.equal(f.vendoredVsInstalled, null);
 });
 
+test('gatherFacts hands the Claude home to mainSha, so its git fallback uses the trusted private root and never os.tmpdir()', async () => {
+  const seen = [];
+  const g = gatherWith({ mainSha: (o) => { seen.push(o.home); return { ok: true, sha: MAIN, via: 'git' }; } });
+  await g.run();
+  assert.deepEqual(seen, ['/h']);
+});
+
 test('gatherFacts: one deadline - each step gets only what is left, and steps after it are skipped as timed out', async () => {
   let t = 0;
   const budgets = [];
