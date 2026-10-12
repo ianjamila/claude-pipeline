@@ -47,6 +47,21 @@ const PROTECTED_REL = [
 // non-read-only command a word that IS one of these (exactly, not a child) counts as a protected reference.
 const ANCESTOR_REL = ['.claude', '.claude/skills', '.claude/agents'];
 
+// Why: a name assigned from a changed name is changed too (`X=$D; echo x > $X/s`, `E=$D bash w.sh`): the assignments of the line (a bare `NAME=value`, a declaration's
+// `NAME=value`) and `extra` (the prefix values of the command a child frame is started by) taint the name they set, until nothing new is added.
+function taintClosure(base, cmds, extra = {}) {
+  const set = new Set(base);
+  const refs = (v) => [...String(v).matchAll(/\$\{?(\w+)/g)].some((x) => set.has(x[1]));
+  const sets = [];
+  for (const c of cmds) {
+    if (!c.argv.length) sets.push(...Object.entries(c.env ?? {}));
+    else if (['export', 'declare', 'typeset', 'local', 'readonly'].includes(commandName(c.argv[0]))) for (const a of c.argv.slice(1)) { const m = /^([A-Za-z_]\w*)=([\s\S]*)$/.exec(a); if (m) sets.push([m[1], m[2]]); }
+  }
+  sets.push(...Object.entries(extra));
+  for (let grew = true; grew;) { grew = false; for (const [k, v] of sets) if (!set.has(k) && refs(v)) { set.add(k); grew = true; } }
+  return set;
+}
+
 const DEVICE_PREFIX = /^\/\/[?.]\/(?=[A-Za-z]:\/)/; // \\?\C:\ and \\.\C:\ forms
 
 const isAbs = (s) => s.startsWith('/') || /^[A-Za-z]:\//.test(s);
@@ -1544,7 +1559,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // scripts they run are judged with them (a name like `. "$F"` in the file is then the file F names, not an unknown).
   // (every name of the line is seeded, exported or not, and wherever it was set: stricter than the shell, which only passes exported ones on; kept on purpose,
   // a missed name would hide the script a variable picks. The replay found no false block from it.)
-  const withLineVars = (o) => ({ ...o, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set([...ctx.unknownVars, ...ctx.pickUnknown]), _unknownW: new Set(ctx.unknownVars), _srcChanged: new Set(ctx.srcChanged), _unknownAll: ctx.unknownAll });
+  const withLineVars = (o, c = null) => ({ ...o, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set([...ctx.unknownVars, ...ctx.pickUnknown]), _unknownW: new Set(ctx.unknownVars), _srcChanged: taintClosure(ctx.srcChanged, cmds, c?.env ?? {}), _unknownAll: ctx.unknownAll });
 
   // A startup file is judged once per evaluation. It is marked first: a startup file that starts shells itself would be judged again and
   // again otherwise (a denial ends the whole evaluation, so marking before the verdict is safe).
@@ -1613,7 +1628,7 @@ function evaluateBashForFilesFrame(command, opts) {
         ctx.execCmd = sf.kind === 'exec' ? { c, cmds, env: startupEnv, inherited: inheritedStartup } : null;
         let v;
         try {
-          v = judgeScriptFile(sf, dirs, ctx, withLineVars(opts), scanRaw);
+          v = judgeScriptFile(sf, dirs, ctx, withLineVars(opts, c), scanRaw);
         } finally {
           ctx.execCmd = outer;
         }
@@ -1623,7 +1638,7 @@ function evaluateBashForFilesFrame(command, opts) {
       // script text that reaches a shell without being named (`bash < f.sh`, `cat f.sh | bash`, `eval "$(cat f.sh)"`): its files are judged like `bash f.sh`
       for (const fd of scriptFeedsOf(c, raw, (w) => expandRefs(w, ctx))) {
         withPath(fd);
-        const v = judgeScriptFile(fd, dirs, ctx, withLineVars(opts), scanRaw);
+        const v = judgeScriptFile(fd, dirs, ctx, withLineVars(opts, c), scanRaw);
         if (v) return v;
       }
     }
@@ -1662,8 +1677,10 @@ function evaluateBashForFilesFrame(command, opts) {
   // is unknown, so a redirection or a writer that names it is refused, whatever the rest of the path (names are the line's own choice, none is exempt). Not write targets: the
   // operand of a command that runs a script (`source $X`, `bash $F`), a reader, `cd`, a declaration, and an element of a path-list variable's value (`PATH=$D:$PATH`).
   if (ctx.srcChanged.size || ctx.unknownAll) {
-    const maybeChanged = (n) => ctx.srcChanged.has(n) || (ctx.unknownAll && !Object.hasOwn(ctx.vars, n));
+    const taint = taintClosure(ctx.srcChanged, cmds);
+    const maybeChanged = (n) => taint.has(n) || (ctx.unknownAll && !Object.hasOwn(ctx.vars, n));
     const changed = (w) => [...String(w).matchAll(/\$\{?(\w+)/g)].some((x) => maybeChanged(x[1]));
+    const taintedEnv = (w) => [...String(w).matchAll(/\$\{?(\w+)/g)].some((x) => taint.has(x[1])); // (a prefix value of a command: only a name that is known to be changed, not any unset one)
     const PATH_LISTS = new Set(['PATH', 'CDPATH', 'MANPATH', 'INFOPATH', 'LD_LIBRARY_PATH', 'DYLD_LIBRARY_PATH', 'NODE_PATH', 'PYTHONPATH', 'GOPATH']);
     for (const c of cmds) {
       const name = baseOf(c.argv[0] ?? '');
@@ -1671,7 +1688,7 @@ function evaluateBashForFilesFrame(command, opts) {
       // (only the script a shell / interpreter / source runs is exempt: every other word of it can be a write target, `node w.mjs $D/x`, `bash -c 'echo x > $D/x'`)
       const script = scriptFileOf(c.argv)?.file;
       const operands = script === undefined ? c.argv : c.argv.filter((w, i) => w !== script || c.argv.indexOf(w) !== i);
-      if ((c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && changed(r.target ?? '')) || (writes && (operands.some(changed) || (!SHELL_NAMES.has(name) && Object.entries(c.env ?? {}).some(([k, v]) => !PATH_LISTS.has(k) && changed(v)))))) {
+      if ((c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && changed(r.target ?? '')) || (writes && (operands.some(changed) || Object.entries(c.env ?? {}).some(([k, v]) => !PATH_LISTS.has(k) && taintedEnv(v))))) {
         return deny('the command writes through a variable that a sourced file may have changed, so the file it reaches cannot be checked; write the path out');
       }
     }

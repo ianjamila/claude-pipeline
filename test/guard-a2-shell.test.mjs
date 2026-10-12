@@ -415,8 +415,12 @@ test('S3: a known data program fed a file is not a shell reading a script', () =
 // ---- S4 D: a name an unfollowable sourced file may have changed is unknown for write targets too -----------------------------
 
 test('S4: a write through a name a sourced file may have changed is refused whatever the rest of the path (files-policy)', () => {
-  const fs = fakeFs(PROJ, { 'dyn.sh': 'F=$(pick)', 'ev.sh': 'eval "$X"', 'ok.sh': 'echo ok' }, DIRS);
+  const fs = fakeFs(PROJ, { 'dyn.sh': 'F=$(pick)', 'ev.sh': 'eval "$X"', 'ok.sh': 'echo ok', 'w.sh': 'cp ok.sh $E/settings.json' }, DIRS);
   for (const c of [
+    // (a followable file leaves only F unknown: the taint travels from it)
+    'source dyn.sh; W=$F; echo x > $W/settings.json', 'source dyn.sh; export W=$F; cp ok.sh $W', 'source dyn.sh; Y=$F; W="$Y/sub"; cp ok.sh $W', 'source dyn.sh; E=$F bash w.sh', 'source dyn.sh; export E=$F; bash w.sh', 'source dyn.sh; E=$F; export E; bash w.sh', 'source dyn.sh; E="$F/x" bash w.sh',
+    // (the taint travels: an assignment from a changed name, an export, a prefix value that reaches a script)
+    'D=/tmp; source $X; W=$D; echo x > $W/settings.json', 'D=/tmp; source $X; export W=$D; echo x > $W/a.txt', 'D=/tmp; source $X; Y=$D; W="$Y/sub"; cp ok.sh $W', 'D=/tmp; source $X; E=$D bash w.sh', 'D=/tmp; source $X; E="$D" bash w.sh', 'D=/tmp; source $X; FOO=$D/x bash ok.sh',
     'D=/tmp; source $X; echo x > $D/settings.json', 'D=/tmp; source $X; cp ok.sh $D/settings.json', 'D=/tmp; source ev.sh; echo x > ${D}/settings.json', 'D=/tmp; source $X; tee $D/pipeline/hooks/x < ok.sh',
     'D=/tmp; source $X; echo x >> "$D/skills/ship/SKILL.md"', 'D=/tmp; . $X; echo x > $D/.claude/settings.json', 'source $X; echo x > $D/settings.json', 'F=a; source dyn.sh; echo x > $F/settings.json',
     'D=/tmp; source $X; sed -i s/a/b/ $D/agents/judge.md', 'D=/tmp; source $X; mv ok.sh $D/../settings.json',
@@ -434,7 +438,7 @@ test('S4: a write through a name a sourced file may have changed is refused what
   // (a reader, cd, a declaration, a path list's element, and a value the line sets again after the source are not write targets)
   for (const c of [
     'D=/tmp; source $X; export PATH=$D:$PATH', 'D=/tmp; source $X; cat $D/settings.json', 'D=/tmp; source $X; D=/tmp; echo x > $D/settings.json', 'D=/tmp; source $X; cd $D', 'D=/tmp; source $X; PATH=$D:$PATH ls', 'D=/tmp; source $X; PATH=$D:$PATH npm test',
-    'D=/tmp; source $X; echo $D', 'D=/tmp; source $X; FOO=$D/x bash ok.sh', 'source dyn.sh; echo $F', 'D=/tmp; source $X; export OUT=$D/x', 'source $X', 'source "$NVM_DIR/nvm.sh"; nvm use 20',
+    'D=/tmp; source $X; echo $D', 'D=/tmp; source $X; W=/tmp; echo x > $W/settings.json', 'source dyn.sh; echo $F', 'D=/tmp; source $X; export OUT=$D/x', 'source $X', 'source "$NVM_DIR/nvm.sh"; nvm use 20',
   ]) assert.equal(files(c, fs).decision, 'allow', c);
 });
 
