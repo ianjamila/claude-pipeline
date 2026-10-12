@@ -923,18 +923,24 @@ function functionRanges(raw) { // [start, end] of every brace-group function bod
   }
   return ranges;
 }
-// Why: a name is believed only when nothing on the line can rebind it: read / mapfile / getopts / printf -v / unset / let / declare-family / for / select / (( )) / `${N:=x}` name it, or code run by source / eval / exec after it was set
-const NAME_BINDERS = new Set(['read', 'mapfile', 'readarray', 'getopts', 'unset', 'let', 'declare', 'typeset', 'local', 'export', 'readonly', 'integer', 'float', 'vared', 'select', 'for', 'foreach', 'coproc', 'wait', 'repeat']);
-function mayRebind(name, cmds, raw) {
-  const mention = new RegExp(`(?:^|[^\\w])${name}(?:[^\\w]|$)`);
-  const asTarget = new RegExp(`^-?${name}(?:[\\[=+]|$)`);
-  if (new RegExp(`\\$\\{!?${name}(?::?[=+]|\\[)|\\b(?:for|select|foreach)\\s+${name}\\b|\\(\\([^)]*\\b${name}\\b`).test(raw)) return true; // (`${N:=x}`, a loop variable, arithmetic)
-  return cmds.some((c) => {
-    const n = baseOf(c.argv[0] ?? '');
-    if (n === 'printf') return c.argv.some((a, i) => (a === '-v' && asTarget.test(c.argv[i + 1] ?? '')) || asTarget.test(a.replace(/^-v/, '')));
-    if (!NAME_BINDERS.has(n)) return false;
-    return n === 'let' || ['declare', 'typeset', 'local', 'export', 'readonly', 'integer', 'float'].includes(n) ? c.argv.slice(1).some((a) => mention.test(a)) : c.argv.slice(1).some((a) => asTarget.test(a));
+// Why: a name is believed only when every command of the script is one that never binds a shell name (an allowlist: zsh has many binders -- read, mapfile, getopts, print -v, printf -v, zparseopts,
+// strftime -s, zstyle, sysread, zstat -A, vared, unset, let, declare ... -- and a function or an alias may call any of them), and nothing else rebinds it (`${N:=x}`, `N[1]=`, a loop variable, (( ))).
+// A program run by path is another process. source / . are followed by absorbSourced, which knows what the file sets.
+const NAME_SAFE = new Set(['cd', 'pushd', 'popd', 'echo', 'cat', 'ls', 'cp', 'mv', 'rm', 'mkdir', 'rmdir', 'touch', 'test', '[', '[[', 'true', 'false', ':', 'exit', 'node', 'npm', 'npx', 'git', 'grep', 'egrep', 'rg', 'sed', 'awk',
+  'head', 'tail', 'sleep', 'kill', 'pkill', 'pgrep', 'lsof', 'curl', 'open', 'launchctl', 'id', 'du', 'find', 'tr', 'cut', 'wc', 'sort', 'uniq', 'tee', 'chmod', 'date', 'basename', 'dirname', 'pwd', 'jq', 'python3', 'xargs', 'source', '.']);
+const noBindFlag = (c) => !c.argv.slice(1).some((a) => /^-[A-Za-z]*v/.test(a));
+function onlyNonBinders(cmds) {
+  return cmds.every((c) => {
+    if (!c.argv.length) return true; // (plain assignments)
+    const n = baseOf(c.argv[0]);
+    if (n === 'print' || n === 'printf') return noBindFlag(c);
+    return NAME_SAFE.has(n) || c.argv[0].includes('/');
   });
+}
+function mayRebind(name, cmds, raw) {
+  const re = (s) => new RegExp(s.replace('NAME', name));
+  if (re('\\$\\{!?NAME(?::?[=+]|\\[)|\\bNAME\\[[^\\]]*\\]\\+?=|\\b(?:for|select|foreach)\\s+NAME\\b|\\(\\([^)]*\\bNAME\\b').test(raw)) return true; // (`${N:=x}`, `N[1]=`, a loop variable, arithmetic)
+  return !onlyNonBinders(cmds);
 }
 function modelZshSelfDirs(cmds, raw, ctx) {
   if (!ctx.selfZero || !ctx.selfZsh || !/:[Aaht][:}]/.test(raw)) return;
@@ -956,7 +962,7 @@ function modelZshSelfDirs(cmds, raw, ctx) {
   for (const [i, c] of cmds.entries()) {
     // (a relative $0 is read from the cwd at that moment, which an earlier cd has moved; code run by source / . / eval may have assigned $0)
     const before = cmds.slice(0, i);
-    const stable = (ctx.selfAbs || !before.some((x) => CD_CMDS.has(baseOf(x.argv[0] ?? '')))) && !before.some((x) => ['source', '.', 'eval'].includes(baseOf(x.argv[0] ?? '')));
+    const stable = (ctx.selfAbs || !before.some((x) => CD_CMDS.has(baseOf(x.argv[0] ?? '')))) && !before.some((x) => ['source', '.', 'eval'].includes(baseOf(x.argv[0] ?? ''))) && onlyNonBinders(before); // (setopt / emulate / set -o, functions and the like may change what $0 is)
     const runsCode = before.some((x) => ['source', '.', 'eval', 'exec'].includes(baseOf(x.argv[0] ?? '')));
     const fix = (w) => String(w)
       .replace(ZSH_SELF_RE, (m, ms) => {

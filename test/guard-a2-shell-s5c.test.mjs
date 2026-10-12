@@ -136,3 +136,17 @@ test('S5c: $0 rules seen through a cd (assigned $0, code run before, relative :h
   assert.equal(files(run, lit(':')).decision, 'allow');
   for (const pre of ['read HERE', 'for HERE in $X; do :; done']) assert.equal(files(run, lit(pre)).decision, 'deny', pre);
 });
+
+// Why: believing a name needs EVERY command of the script to be one that never binds names (an allowlist); zsh has many binders beyond read / mapfile (print -v, zparseopts, strftime -s, zstyle, sysread,
+// zstat -A, getln, `HERE[1]=`), and a function or alias may call any of them. $0 is trusted only after allowlisted commands too (setopt, emulate, set -o, functions may change it).
+test('S5c: only commands that never bind names keep a script-directory name (or $0) believed', () => {
+  const run = `${CC}/scripts/restart.sh`;
+  const lit = (pre) => ccFs({ 'scripts/restart.sh': `#!/bin/zsh\nHERE=/home/u/cc/scripts\n${pre}\ncd "\${HERE:h}"\necho x > settings.json\n` });
+  for (const pre of ['print -v HERE x', 'zparseopts -D -E -a HERE x', 'strftime -s HERE %Y 0', 'zstyle -s :a b HERE', 'sysread HERE', 'zstat -A HERE /tmp', 'getln HERE', 'HERE[1]=x', 'myfn', 'emulate sh', 'setopt posix_argzero']) {
+    assert.equal(files(run, lit(pre)).decision, 'deny', pre);
+  }
+  assert.equal(files(run, lit('print -r -- hi; printf "%s" x; ls >/dev/null; "$HERE/build.sh"')).decision, 'allow'); // (data commands and a program run by path bind nothing)
+  const zero = (pre) => ccFs({ 'scripts/restart.sh': `#!/bin/zsh\n${pre}\ncd "\${0:A:h}"\necho x > settings.json\n` });
+  for (const pre of ['setopt posix_argzero', 'emulate sh', 'set -o posixargzero', 'myfn', 'zmodload zsh/zutil']) assert.equal(files(run, zero(pre)).decision, 'deny', pre);
+  assert.equal(files(run, zero('ls >/dev/null; print -r -- hi')).decision, 'allow');
+});
