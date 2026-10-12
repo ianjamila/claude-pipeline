@@ -810,3 +810,25 @@ test('L1b: BSD sed -I (in place, separate suffix) and an abbreviated --in-place 
   for (const l of ["sed --expr='s/a/b/' -i ok.sh", "sed -i --expression='s/a/b/' ok.sh", "sed --fi=s.sed -i ok.sh", "sed -i -ne p ok.sh", "sed -i -e p -e p ok.sh"]) denyBoth((_, mid) => `${l}; ${mid}; bash ok.sh`);
   denyBoth((_, mid) => `sed -I '' 'w n.sh' ok.sh; ${mid}; bash n.sh`);
 });
+
+// ---- L2: parsing exactness -------------------------------------------------------------------------------------------------
+
+test('L2: a lone in-place edit of a script the line then runs is "built from pieces" (the edit can complete a command the old text only starts)', () => {
+  // Why: `sed -i 's/X/sh/' ok.sh; bash ok.sh` with ok.sh = `git puX origin main`: the old text is clean, the result is a push, and no guarded word is on the line. The edit's result is not the old text, so it is an
+  // unknown piece. Not even a `-n ... p` / `d` program is exempt: keeping or dropping lines joins backslash-continued lines into a new command. Accepted as a false block: `sed -i 's/a/b/' tool.sh; bash tool.sh`.
+  const gitFs = fakeFs(GIT_ROOT, { 'ok.sh': 'git puX origin main', 'other.sh': 'git status' }, DIRS);
+  const filesFs = fakeFs(PROJ, { 'ok.sh': 'echo x > ~/.claude/settXings.json', 'other.sh': 'echo hi' }, DIRS);
+  for (const prog of ["sed -i 's/X/sh/'", "sed -i.bak 's/X/sh/'", "sed -i '' 's/X/sh/'", "sed -I '' 's/X/sh/'", "sed --in-place 's/X/sh/'", "sed -n -i 'p'", "sed -i '1d'", "perl -pi -e 's/X/sh/'", "perl -i.bak -pe 's/X/sh/'", "ruby -pi -e '$_.sub!(/X/, %q(sh))'"]) {
+    for (const tail of ['bash ok.sh', 'sh ok.sh && echo done', '. ./ok.sh']) {
+      const l = `${prog} ok.sh; ${tail}`;
+      assert.match(git(l, gitFs).reason ?? 'allowed', /pieces/, l);
+      assert.match(files(l.replace('X/sh/', 'X//'), filesFs).reason ?? 'allowed', /pieces/, l);
+    }
+  }
+  // the nearest twins stay allowed: the edit is of another file, the script is not run, or the sed does not edit in place
+  for (const l of ["sed -i 's/X/sh/' other.sh; bash ok.sh", "sed -i 's/X/sh/' ok.sh", "sed 's/X/sh/' ok.sh | cat; bash ok.sh", "sed -n 's/X/sh/p' ok.sh; bash ok.sh", "sed -i 's/X/sh/' ok.sh; bash other.sh", "perl -I src -e 1 ok.sh; bash ok.sh"]) {
+    assert.equal(git(l, gitFs).decision, 'allow', l);
+    assert.equal(files(l.replace('X/sh/', 'X//'), filesFs).decision, 'allow', l);
+  }
+});
+

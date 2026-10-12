@@ -364,10 +364,11 @@ function argRecords(cmd, name, idx) {
     const inPlace = args.some((a) => (isSed ? sedInPlaceArg(a) : /^-[A-Za-z]*i/.test(a) || a === '--in-place' || a.startsWith('--in-place='))); // (perl / ruby -I is an include path)
     const wfiles = isSed ? sedWriteTargets(args) : [];
     if (!inPlace) return wfiles.length ? wfiles.map((d) => unknown(d)) : null; // `w FILE` / `s///w FILE` write a file too
-    if (isSed) return [...sedPrograms(args).targets, ...wfiles].map((dest) => unknown(dest)); // (one parser for the programs and the files; an in-place sed may also `w FILE`)
+    // Why: an in-place edit turns the file's old text into new text (`s/X/sh/` completes `git puX`), so the file is a piece the line cannot see: `edit` (see contentsIn)
+    if (isSed) return [...sedPrograms(args).targets.map((dest) => unknown(dest, { edit: true })), ...wfiles.map((dest) => unknown(dest))]; // (one parser for the programs and the files; an in-place sed may also `w FILE`)
     const { pos, opts } = getopt(args, 'eIlF', ['expression', 'file', 'line-length']);
     const hasProgram = hasOpt(opts, 'e', 'f', 'expression', 'file');
-    return (hasProgram ? pos : pos.slice(1)).map((dest) => unknown(dest));
+    return (hasProgram ? pos : pos.slice(1)).map((dest) => unknown(dest, { edit: true }));
   }
   if (name === 'tar' || name === 'bsdtar' || name === 'gtar') {
     const first = args[0] ?? '';
@@ -771,7 +772,7 @@ function contentsIn(frames, upto, asOf, P, io, depth) {
     }
     // a file put together from several pieces that cannot be built is "built from pieces at run time"; one unknown piece alone is just unknown content.
     // Only a write to the file itself counts: a piece of a write that merely may hit it is the unknown-content signal, never a refusal
-    const multi = seq.length > 1 || seq.some((el) => (el.rec?.parts?.length ?? 0) > 1);
+    const multi = seq.length > 1 || seq.some((el) => (el.rec?.parts?.length ?? 0) > 1 || el.rec?.edit); // (an in-place edit is old text + a program: two pieces)
     const looseIn = seq.some((el) => el.loose);
     const fail = () => { if (multi && !looseIn) io.pieces = true; return null; };
     let acc = [''];
