@@ -12,6 +12,8 @@ import { createGitHub, guardGh } from '../lib/github.mjs';
 import { headSha } from '../lib/git.mjs';
 import { currentProduction } from '../lib/deploy.mjs';
 import { runShellAsync } from '../lib/proc.mjs';
+import { postEvent } from '../lib/run-events.mjs';
+import { createRunRecorder, inFlightSince } from '../lib/run-progress.mjs';
 import { bringUpToDate, updateTiming } from '../lib/updatebranch.mjs';
 import {
   GATE_FILE, PR_FIELDS, abandonMerge, evaluateGate, gateRefusals, localContentHash, mergeTiming, preMergeProblems, readReviewJson,
@@ -20,7 +22,7 @@ import {
 
 export const meta = {
   summary: 'merge the PR if (and only if) the final gate passes again, live; waits for MERGED',
-  usage: 'pipeline merge --pr N [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment',
+  usage: 'pipeline merge --pr N [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?, warnings?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment. While it runs the run record of the PR shows inFlight {kind: merge} and step merge; a prod-before event comment (the known-good deployment) is posted before the merge command; warnings lists a record or event write that failed (never fatal)',
 };
 
 const refuse = (error, reasons, extra = {}) => ({
@@ -90,52 +92,86 @@ export const run = guarded(async (argv, ctx) => {
       });
     }
 
-    // 3b. The live gate ran slow probes after it read the PR: look at GitHub once more, right before the merge command.
-    const late = await preMergeProblems({ gh, pr, head: gate.head });
-    if (late.length > 0) return refuse('pre-merge', late);
-
-    // 4. Merge with the approved head (fill is strict: a missing {sha} throws instead of merging whatever head exists).
-    const { waitMs, pollMs } = mergeTiming(config, ctx.env ?? process.env);
-    const command = fill(config.merge.command, { pr: String(pr), sha: gate.head }, { strict: true });
-    const ran = await runShellAsync(command, { cwd: root, env: ctx.env, timeoutMs: (config.merge.wait_minutes + 5) * 60_000 });
-    const commandOutput = tailLines(`${ran.stdout}${ran.stderr ? `\n${ran.stderr}` : ''}`, 30);
-
-    // MERGED is MERGED: a merge commit GitHub cannot name yet is a warning, not a refusal (exit 1 means "nothing merged", and
-    // the caller must go on to prod-watch, which resolves the SHA itself).
-    const merged = (mergeSha, extra = {}) => ({
-      exitCode: EXIT.OK,
-      output: mergeSha
-        ? { ok: true, merged: true, mergeSha, prodBefore, ...extra }
-        : {
-          ok: true, merged: true, mergeSha: null, prodBefore,
-          warning: 'the PR is MERGED but GitHub did not report its merge commit after re-reading: resolve the merge SHA (prod-watch does) before anything depends on it',
-          ...extra,
-        },
-    });
-
-    // 5. Wait for MERGED, re-checking the blockers on every poll. If the command failed it may still have merged (a
-    // branch-delete error after a merge exits non-zero), so look once before calling it a failure.
-    const outcome = await waitForMerge({ gh, pr, waitMs: ran.code === 0 ? waitMs : 0, pollMs, blockers: waitBlockers(gh) });
-    if (outcome.state === 'merged') {
-      return merged(outcome.mergeSha, ran.code === 0 ? {} : { commandExitCode: ran.code, note: 'the merge command exited non-zero but the PR is MERGED' });
+    // 3a. From here a merge may happen: show it in the run record (inFlight, cleared on EVERY exit below), and leave the
+    // known-good deployment as an append-only event next to the file, so a rollback target outlives a rewritten record.
+    // The record is display, the checks are the safety: a failed write is a warning, never a refusal.
+    const recorder = createRunRecorder({ gh, pr });
+    recorder.update({
+      step: 'merge', outcome: null, head: gate.head,
+      inFlight: inFlightSince(recorder, 'merge', 2 * config.merge.wait_minutes + 15),
+    }, { initialStep: 'merge' });
+    if (prodBefore) {
+      try {
+        postEvent(gh, pr, 'prod-before', `pr${pr}-${gate.head.slice(0, 12)}`,
+          `Production before merging #${pr}: ${config.production.environment} deployment ${prodBefore.id} at ${String(prodBefore.sha).slice(0, 12)} is the rollback target.`, {
+            repo: gh.repo().slug, environment: config.production.environment, pr, headBeforeMerge: gate.head,
+            deployment: { id: prodBefore.id, sha: prodBefore.sha, url: prodBefore.url },
+          });
+      } catch (err) {
+        recorder.warnings.push(`prod-before event not posted: ${String(err?.message ?? err).slice(0, 200)}`);
+      }
     }
 
-    // Not merged: disarm auto-merge, then look again (it may have fired a moment before the disable).
-    const abandoned = await abandonMerge({ gh, pr, cwd: root, env: ctx.env, pollMs });
-    if (abandoned.merged) return merged(abandoned.mergeSha, { note: 'the PR merged while auto-merge was being disabled', autoMergeDisabled: abandoned.autoMergeDisabled });
+    const attempt = async () => {
+      // 3b. The live gate ran slow probes after it read the PR: look at GitHub once more, right before the merge command.
+      const late = await preMergeProblems({ gh, pr, head: gate.head });
+      if (late.length > 0) return refuse('pre-merge', late);
 
-    const { autoMergeDisabled } = abandoned;
-    const failure = { merged: false, autoMergeDisabled, commandExitCode: ran.code, commandOutput, prodBefore };
-    if (ran.code !== 0) {
-      return { exitCode: EXIT.FAILED, output: { ok: false, reason: `merge command failed (exit ${ran.code}${ran.timedOut ? ', timed out' : ''}) and the PR is not merged`, ...failure } };
+      // 4. Merge with the approved head (fill is strict: a missing {sha} throws instead of merging whatever head exists).
+      const { waitMs, pollMs } = mergeTiming(config, ctx.env ?? process.env);
+      const command = fill(config.merge.command, { pr: String(pr), sha: gate.head }, { strict: true });
+      const ran = await runShellAsync(command, { cwd: root, env: ctx.env, timeoutMs: (config.merge.wait_minutes + 5) * 60_000 });
+      const commandOutput = tailLines(`${ran.stdout}${ran.stderr ? `\n${ran.stderr}` : ''}`, 30);
+
+      // MERGED is MERGED: a merge commit GitHub cannot name yet is a warning, not a refusal (exit 1 means "nothing merged", and
+      // the caller must go on to prod-watch, which resolves the SHA itself).
+      const merged = (mergeSha, extra = {}) => ({
+        exitCode: EXIT.OK,
+        output: mergeSha
+          ? { ok: true, merged: true, mergeSha, prodBefore, ...extra }
+          : {
+            ok: true, merged: true, mergeSha: null, prodBefore,
+            warning: 'the PR is MERGED but GitHub did not report its merge commit after re-reading: resolve the merge SHA (prod-watch does) before anything depends on it',
+            ...extra,
+          },
+      });
+
+      // 5. Wait for MERGED, re-checking the blockers on every poll. If the command failed it may still have merged (a
+      // branch-delete error after a merge exits non-zero), so look once before calling it a failure.
+      const outcome = await waitForMerge({ gh, pr, waitMs: ran.code === 0 ? waitMs : 0, pollMs, blockers: waitBlockers(gh) });
+      if (outcome.state === 'merged') {
+        return merged(outcome.mergeSha, ran.code === 0 ? {} : { commandExitCode: ran.code, note: 'the merge command exited non-zero but the PR is MERGED' });
+      }
+
+      // Not merged: disarm auto-merge, then look again (it may have fired a moment before the disable).
+      const abandoned = await abandonMerge({ gh, pr, cwd: root, env: ctx.env, pollMs });
+      if (abandoned.merged) return merged(abandoned.mergeSha, { note: 'the PR merged while auto-merge was being disabled', autoMergeDisabled: abandoned.autoMergeDisabled });
+
+      const { autoMergeDisabled } = abandoned;
+      const failure = { merged: false, autoMergeDisabled, commandExitCode: ran.code, commandOutput, prodBefore };
+      if (ran.code !== 0) {
+        return { exitCode: EXIT.FAILED, output: { ok: false, reason: `merge command failed (exit ${ran.code}${ran.timedOut ? ', timed out' : ''}) and the PR is not merged`, ...failure } };
+      }
+      const base = {
+        timeout: 'not merged in time',
+        closed: 'the PR was closed without merging',
+        error: `could not read the PR state while waiting (${outcome.error})`,
+        blocked: `a blocker appeared while waiting: ${(outcome.problems ?? []).join('; ')}`,
+      }[outcome.state];
+      const tail = autoMergeDisabled ? 'auto-merge disabled' : 'could not confirm auto-merge is disabled: check the PR by hand';
+      return { exitCode: EXIT.FAILED, output: { ok: false, reason: `${base} — ${tail}`, ...failure } };
+    };
+
+    let result;
+    try {
+      result = await attempt();
+    } finally {
+      const out = result?.output;
+      recorder.update(out?.merged === true
+        ? { step: 'prod-watch', mergeSha: out.mergeSha ?? null, inFlight: null }
+        : { step: 'gate', inFlight: null });
     }
-    const base = {
-      timeout: 'not merged in time',
-      closed: 'the PR was closed without merging',
-      error: `could not read the PR state while waiting (${outcome.error})`,
-      blocked: `a blocker appeared while waiting: ${(outcome.problems ?? []).join('; ')}`,
-    }[outcome.state];
-    const tail = autoMergeDisabled ? 'auto-merge disabled' : 'could not confirm auto-merge is disabled: check the PR by hand';
-    return { exitCode: EXIT.FAILED, output: { ok: false, reason: `${base} — ${tail}`, ...failure } };
+    if (recorder.warnings.length > 0) result.output.warnings = recorder.warnings;
+    return result;
   });
 });

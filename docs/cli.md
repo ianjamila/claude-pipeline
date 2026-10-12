@@ -47,6 +47,22 @@ pipeline artifacts push --pr N --dir DIR [--repo DIR]   -> {ok, files:[{name, ma
 
 Exit: 0 pushed (or nothing to push) · 2 environment / git error · 3 GitHub (`gh`) unavailable.
 
+## checkpoint
+
+record where the ship run stands in the PR summary comment (refuses unless local HEAD is the pushed PR head).
+
+```
+pipeline checkpoint --pr N --step build|verify|pr|review|gate|awaiting-owner-merge|merge|prod-watch|ended [--next TEXT] [--detail TEXT]
+                    [--request-file F] [--tasks-file F] [--task-done ID] [--verify-report] [--round R] [--repo DIR]
+  -> {ok, url, action, record, warnings}; exit 1 {error: unpushed | behind | diverged} (local HEAD is not the PR head on GitHub), 2 usage, 3 GitHub unavailable
+  --request-file: the user's request, text, at most 2 KB · --tasks-file: JSON [{id, title, spec}] · --task-done ID: mark one task done (repeatable)
+  --verify-report: copy {head, tree, mode, ok, failedStep} of the verify report, only when its head and tree are this HEAD's (otherwise a warning)
+```
+
+Exit: 0 recorded · 1 `unpushed` (local HEAD is ahead of the PR head on GitHub: push first) / `behind` (the PR has newer commits: pull) / `diverged` (neither is an ancestor of the other, or the PR head is not fetched here: nothing is written) · 2 usage (unknown `--step`, a `--request-file` over 2 KB or not text, a bad `--tasks-file`, a record from a newer pipeline version) · 3 GitHub (`gh`) unavailable.
+
+It sets the heartbeat (`os.hostname()` and the time) and keeps the summary sections already in the comment. `--verify-report` copies the report at `verify.report` only when its head and tree are this HEAD's; otherwise it is ignored and `warnings` says why. A step other than `ended` / `awaiting-owner-merge` clears a previous `outcome` (the run is going again).
+
 ## codex-review
 
 run one Codex review round over base..head and record its findings.
@@ -171,10 +187,12 @@ Exit: 0 · 3 GitHub (`gh`) unavailable.
 merge the PR if (and only if) the final gate passes again, live; waits for MERGED.
 
 ```
-pipeline merge --pr N [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment
+pipeline merge --pr N [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?, warnings?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment. While it runs the run record of the PR shows inFlight {kind: merge} and step merge; a prod-before event comment (the known-good deployment) is posted before the merge command; warnings lists a record or event write that failed (never fatal)
 ```
 
 Exit: 0 merged (a merge commit GitHub cannot name yet is `mergeSha: null` plus a `warning`; prod-watch resolves it) · 1 not merged / refused by the live gate or by the last pre-merge look at GitHub (run final-gate again; `behind-base`: the base moved, the branch was just updated on GitHub, so pull, re-verify and gate the new head) · 3 GitHub unavailable, or no known-good production deployment.
+
+Run record: right after `.review/prod-before.json` is written, and before the merge command, `merge` sets the record's `inFlight` `{kind: merge, host, startedAt, maxMinutes: 2 × merge.wait_minutes + 15}` and `step: merge`, and posts a `prod-before` event (always a NEW comment: repo, environment, pr, `headBeforeMerge` = the approved PR head, `deployment {id, sha, url}`) when a known-good deployment was recorded (no `production` configured: no event). On every exit `inFlight` is cleared: merged → `step: prod-watch` and `mergeSha`; not merged → `step: gate`. The record is display: a failed record or event write is listed in `warnings` and never fails the merge.
 
 ## model-proof
 
@@ -313,10 +331,12 @@ Exit: `validate`: 0 applied, 1 judge output invalid (state untouched) · `settle
 bring the PR branch up to date with its base on GitHub (update-branch with expected_head_sha), return the new head (checks are not waited for by default).
 
 ```
-pipeline update-branch --pr N [--expect-head SHA] [--max-cycles N=3] [--wait-checks] [--repo DIR]   -> {ok, outcome, updated, cycles, base, startHead, head, localHead, pullNeeded, message?}; outcome up-to-date (exit 0; when updated: git pull --ff-only, then re-verify and run the gate on `head`; checks are NOT waited for unless --wait-checks) | rebase-needed | head-moved | cycle-cap | head-timeout | not-open | (with --wait-checks) checks-failed | checks-timeout (exit 1; rebase-needed = the update conflicts, needs-human), 3 GitHub unavailable
+pipeline update-branch --pr N [--expect-head SHA] [--max-cycles N=3] [--wait-checks] [--repo DIR]   -> {ok, outcome, updated, cycles, base, startHead, head, localHead, pullNeeded, message?, warnings?}; outcome up-to-date (exit 0; when updated: git pull --ff-only, then re-verify and run the gate on `head`; checks are NOT waited for unless --wait-checks) | rebase-needed | head-moved | cycle-cap | head-timeout | not-open | (with --wait-checks) checks-failed | checks-timeout (exit 1; rebase-needed = the update conflicts, needs-human), 3 GitHub unavailable. While it runs the run record of the PR shows inFlight {kind: update-branch}; warnings lists a record write that failed (never fatal)
 ```
 
 Exit: 0 `up-to-date` (the base tip is part of the PR head; `updated` says whether this run merged the base in: then `git pull --ff-only`, re-verify, and gate `head`) · 1 `rebase-needed` (the update conflicts: `needs-human`, never a force push), `head-moved` (someone pushed since the verified head, GitHub refused `expected_head_sha`, or the new head is not GitHub's merge of the base into the pinned head: nothing more was updated), `cycle-cap` (the base kept moving), `head-timeout` (GitHub never showed the new head), `not-open`; with `--wait-checks` also `checks-failed` / `checks-timeout` · 3 GitHub (`gh`) unavailable, including any unexpected failure reading checks.
+
+Run record: `inFlight` `{kind: update-branch, maxMinutes: 30}` is set before the update and cleared on every exit; a failed record write is listed in `warnings` and never fails the update.
 
 ## vendor
 

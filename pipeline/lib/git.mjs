@@ -93,6 +93,10 @@ export function mergeBase(a, b, o) {
   return out.trim();
 }
 
+// Is `a` an ancestor of (or equal to) `b`? git's exit 1 (with nothing on stderr) is the answer "no"; a commit git does
+// not know (exit 128) still throws, so a missing object can never read as "no".
+export const isAncestor = (a, b, o) => gitOrNull(['merge-base', '--is-ancestor', assertRef(a, ['merge-base', a, b]), assertRef(b, ['merge-base', a, b])], 1, o) !== null;
+
 export const headSha = (o) => git(['rev-parse', 'HEAD'], o).trim();
 
 // `HEAD` when detached. Reads the full ref instead of using --short/--abbrev-ref, which print `heads/x` when a tag

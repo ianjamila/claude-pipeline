@@ -5,11 +5,12 @@ import { EXIT, parseCommandArgs, intOption } from '../lib/cli.mjs';
 import { guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { headSha } from '../lib/git.mjs';
+import { createRunRecorder, inFlightSince } from '../lib/run-progress.mjs';
 import { MAX_UPDATE_CYCLES, bringUpToDate, updateTiming } from '../lib/updatebranch.mjs';
 
 export const meta = {
   summary: 'bring the PR branch up to date with its base on GitHub (update-branch with expected_head_sha), return the new head (checks are not waited for by default)',
-  usage: 'pipeline update-branch --pr N [--expect-head SHA] [--max-cycles N=3] [--wait-checks] [--repo DIR]   -> {ok, outcome, updated, cycles, base, startHead, head, localHead, pullNeeded, message?}; outcome up-to-date (exit 0; when updated: git pull --ff-only, then re-verify and run the gate on `head`; checks are NOT waited for unless --wait-checks) | rebase-needed | head-moved | cycle-cap | head-timeout | not-open | (with --wait-checks) checks-failed | checks-timeout (exit 1; rebase-needed = the update conflicts, needs-human), 3 GitHub unavailable',
+  usage: 'pipeline update-branch --pr N [--expect-head SHA] [--max-cycles N=3] [--wait-checks] [--repo DIR]   -> {ok, outcome, updated, cycles, base, startHead, head, localHead, pullNeeded, message?, warnings?}; outcome up-to-date (exit 0; when updated: git pull --ff-only, then re-verify and run the gate on `head`; checks are NOT waited for unless --wait-checks) | rebase-needed | head-moved | cycle-cap | head-timeout | not-open | (with --wait-checks) checks-failed | checks-timeout (exit 1; rebase-needed = the update conflicts, needs-human), 3 GitHub unavailable. While it runs the run record of the PR shows inFlight {kind: update-branch}; warnings lists a record write that failed (never fatal)',
 };
 
 export const run = guarded(async (argv, ctx) => {
@@ -26,11 +27,20 @@ export const run = guarded(async (argv, ctx) => {
   const gh = createGitHub({ cwd: root, env: ctx.env });
 
   return guardGh(async () => {
-    const r = await bringUpToDate({ gh, pr, expectHead, maxCycles, waitChecks: values['wait-checks'] === true, ...updateTiming(ctx.env) });
+    // The run record shows the update as in flight (30 min cap), and it is cleared on every exit, a throw included.
+    // The record is display: a failed write is a warning in the output, never a failure of the update.
+    const recorder = createRunRecorder({ gh, pr });
+    recorder.update({ inFlight: inFlightSince(recorder, 'update-branch', 30) }, { initialStep: 'gate' });
+    let r;
+    try {
+      r = await bringUpToDate({ gh, pr, expectHead, maxCycles, waitChecks: values['wait-checks'] === true, ...updateTiming(ctx.env) });
+    } finally {
+      recorder.update({ inFlight: null });
+    }
     const head = r.head ?? null;
     return {
       exitCode: r.ok ? EXIT.OK : EXIT.FAILED,
-      output: { ...r, head, localHead, pullNeeded: head !== null && head !== localHead },
+      output: { ...r, head, localHead, pullNeeded: head !== null && head !== localHead, ...(recorder.warnings.length > 0 ? { warnings: recorder.warnings } : {}) },
     };
   });
 });
