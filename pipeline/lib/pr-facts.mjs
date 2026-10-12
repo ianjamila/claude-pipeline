@@ -1,6 +1,5 @@
 // What one PR's comment list says, read the way every pipeline reader must read it: only comments the viewer wrote that
-// START with our marker count. Shared by `P resume` (list + plan); `P inbox` carries its own copy of the same reading
-// (commands/inbox.mjs) until it is moved onto this module.
+// START with our marker count. Shared by `P inbox` and `P resume` (list + plan): one reading of the PR's comments.
 import { MARKERS, line } from './render.mjs';
 import { followupsPending } from './review-context.mjs';
 import { bindRecord } from './run-record.mjs';
@@ -44,7 +43,7 @@ export function readNeedsHuman(comment) {
   return { reason: m ? line(m[1], 200) : null, hits };
 }
 
-// -> { record (bound to this PR) | null, recordStatus, triage | null, needsHumanReason, events }. Problems go to `warnings`.
+// -> { record (bound to this PR) | null, recordStatus, triage | null, needsHumanReason, needsHumanHardStopOnly, events, commentUpdatedAts }. Problems go to `warnings`.
 export function analyseComments(comments, viewer, { repo, pr, branch }, warnings = []) {
   const summary = summaryFromComments(comments, viewer);
   let recordStatus = summary.status;
@@ -70,11 +69,13 @@ export function analyseComments(comments, viewer, { repo, pr, branch }, warnings
     }
   }
 
+  const triage = state ? triageFacts(state) : null;
   const needsHuman = readNeedsHuman(newestMine(comments, viewer, MARKERS.needsHuman));
   return {
-    record, recordStatus,
-    triage: state ? triageFacts(state) : null,
+    record, recordStatus, triage,
     needsHumanReason: needsHuman?.reason ?? null,
+    needsHumanHardStopOnly: Boolean(needsHuman && needsHuman.hits > 0 && (triage?.needsHumanItems.length ?? 0) === 0),
     events: listEvents(comments, viewer),
+    commentUpdatedAts: comments.map((c) => c.updated_at ?? c.created_at).filter((x) => typeof x === 'string'),
   };
 }

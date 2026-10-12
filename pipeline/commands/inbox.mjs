@@ -9,13 +9,9 @@ import { NETWORK_TIMEOUT_MS, git, mergeTree, reviewContentHash, revParse, suppor
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { classifyPr, classifyStranded, ciDetail, triageGroups } from '../lib/inbox.mjs';
 import { listWorktrees, localBranchState, orphanWorktrees } from '../lib/local-branches.mjs';
-import { MARKERS, line } from '../lib/render.mjs';
-import { followupsPending } from '../lib/review-context.mjs';
-import { bindRecord } from '../lib/run-record.mjs';
+import { analyseComments } from '../lib/pr-facts.mjs';
 import { listEvents } from '../lib/run-events.mjs';
-import { decodeFromComment } from '../lib/state.mjs';
 import { summaryFromComments } from '../lib/summary-comment.mjs';
-import { roundOutcome } from '../lib/triage.mjs';
 
 export const meta = {
   summary: 'read-only triage of every open PR (and recently merged ones): what each waits for and the next action',
@@ -28,77 +24,6 @@ export const meta = {
 const DAY = 86400000;
 const sha7 = (s) => String(s ?? '').slice(0, 7);
 const describe = (err) => String(err?.message ?? err).split('\n')[0].slice(0, 300);
-
-// The newest comment the viewer wrote that STARTS with `marker` (a quoted or foreign marker is not ours).
-function newestMine(comments, viewer, marker) {
-  return comments
-    .filter((c) => typeof c.body === 'string' && c.body.startsWith(marker) && c.user?.login === viewer)
-    .sort((a, b) => Number(a.id) - Number(b.id))
-    .at(-1) ?? null;
-}
-
-// Review facts the classifier needs, from a decoded review state. `clean` is judged on the items alone (the content
-// check is the classifier's own reason, from the live hash), so a PR without git facts is not called "not clean" for it.
-function triageFacts(state) {
-  const last = state.rounds.at(-1);
-  const lastContentHash = typeof last?.contentHashAtToHead === 'string' && last.contentHashAtToHead !== '' ? last.contentHashAtToHead : null;
-  const outcome = roundOutcome({ ...state, currentContentHash: lastContentHash });
-  return {
-    rounds: state.rounds.length,
-    lastRound: last?.n ?? 0,
-    clean: outcome.clean,
-    lastContentHash,
-    followupsPending: followupsPending(state),
-    needsHumanItems: outcome.needsHuman,
-  };
-}
-
-// Our needs-human comment: the stated reason (first sentence) and how many hard-stop hits (`- rule — file` lines) it lists.
-function readNeedsHuman(comment) {
-  if (!comment) return null;
-  const body = comment.body.slice(MARKERS.needsHuman.length);
-  const m = /stopped for a human decision: (.*?)\. Verified:/s.exec(body) ?? /stopped for a human decision: (.*?)(?:\.\s|\n|$)/s.exec(body);
-  const hits = body.split('\n').filter((l) => l.startsWith('- ')).length;
-  return { reason: m ? line(m[1], 200) : null, hits };
-}
-
-// Everything one PR's comment list says: run record, review state, needs-human reason, events, comment dates.
-function analyseComments(comments, viewer, { repo, pr, branch }, warnings) {
-  const summary = summaryFromComments(comments, viewer);
-  let recordStatus = summary.status;
-  let record = summary.status === 'ok' ? summary.record : null;
-  if (record) {
-    const mismatch = bindRecord(record, { repo, pr, branch });
-    if (mismatch.length > 0) {
-      warnings.push(`#${pr}: the run record belongs to another PR or branch (${mismatch[0]}); ignored`);
-      recordStatus = 'mismatch';
-      record = null;
-    }
-  }
-  if (recordStatus === 'unsupported' || recordStatus === 'invalid') warnings.push(`#${pr}: the run record could not be read (${recordStatus})`);
-
-  let state = null;
-  const triageComment = newestMine(comments, viewer, MARKERS.triage);
-  if (triageComment) {
-    state = decodeFromComment(triageComment.body);
-    if (!state || state.pr !== pr) {
-      if (state) warnings.push(`#${pr}: the review state comment belongs to PR ${state.pr}; ignored`);
-      else warnings.push(`#${pr}: the review state comment could not be decoded; treated as no review`);
-      state = null;
-    }
-  }
-  const triage = state ? triageFacts(state) : null;
-
-  const needsHuman = readNeedsHuman(newestMine(comments, viewer, MARKERS.needsHuman));
-  const events = listEvents(comments, viewer);
-  return {
-    record, recordStatus, triage,
-    needsHumanReason: needsHuman?.reason ?? null,
-    needsHumanHardStopOnly: Boolean(needsHuman && needsHuman.hits > 0 && (triage?.needsHumanItems.length ?? 0) === 0),
-    events,
-    commentUpdatedAts: comments.map((c) => c.updated_at ?? c.created_at).filter((x) => typeof x === 'string'),
-  };
-}
 
 // ---- git facts ----------------------------------------------------------------------------------
 
