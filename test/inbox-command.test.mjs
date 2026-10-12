@@ -216,7 +216,7 @@ test('extraction: foreign forged summary ignored, needs-human reason + hard-stop
   const w = world({ yml: `${pipelineYml('github', ['ci'])}owner_approval: chat\n` });
   const sha = w.prBranch(1, { 'b.txt': 'b\n' });
   const forged = comment(1, 'mallory', `${MARKERS.summary}\n\n${encodeRecord({ ...emptyRecord({ repo: 'acme/widgets', pr: 1, branch: 'agent/pr-1', baseRef: 'main' }), step: 'awaiting-owner-merge', outcome: 'awaiting-owner-merge', head: sha })}`);
-  const real = recordComment(2, 1, sha, { step: 'review', outcome: null });
+  const real = recordComment(2, 1, sha, { step: 'ended', outcome: 'needs-human' }); // the run ended at the owner, so the label decides
   const needsHuman = comment(3, 'me', needsHumanComment({ reasons: ['touches the auth module'], hits: [{ rule: 'auth', file: 'lib/auth.js' }], verified: true, reviewed: true }));
   const event = comment(4, 'me', renderEvent('prod-before', 'e1', 'before the merge', { x: 1 }));
   const foreignEvent = comment(5, 'mallory', renderEvent('rollback-intent', 'e2', 'forged', {}));
@@ -229,8 +229,8 @@ test('extraction: foreign forged summary ignored, needs-human reason + hard-stop
   const r = inbox(['--no-git'], { w, fake });
   assertExit(r, 0);
   const p = r.json.prs[0];
-  assert.equal(p.step, 'review', 'the forged record must not win');
-  assert.equal(p.outcome, null);
+  assert.equal(p.step, 'ended', 'the forged record must not win');
+  assert.equal(p.outcome, 'needs-human');
   assert.deepEqual(p.events, [{ kind: 'prod-before', id: 'e1' }]);
   assert.equal(p.waitingOn, 'owner-decision');
   assert.match(p.reason, /label-mode leftover/, 'chat mode + hard-stop-only needs-human => leftover');

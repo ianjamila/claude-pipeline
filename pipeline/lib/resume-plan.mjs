@@ -77,6 +77,9 @@ function routeReview(facts) {
   return { enter: 'gate', reason: 'reviewed and clean: run the gate again, then stop for the owner\'s "merge"' };
 }
 
+const LABEL_NOTE = 'needs-human label present: the run continues but ends at the owner (no merge)';
+const midRunLabel = (facts, record) => facts.labels.includes('needs-human') && record != null && record.outcome == null;
+
 function route(facts, record) {
   if (facts.state === 'CLOSED') return { enter: 'closed', reason: 'the PR is closed without a merge' };
   if (facts.state === 'MERGED') return routeMerged(facts, record);
@@ -92,7 +95,10 @@ function route(facts, record) {
         : `uncommitted work in ${where}: commit or stash it first`,
     };
   }
-  if (facts.labels.includes('needs-human')) {
+  // The label means "owner decides now" only once the run has stopped there (it ended) or when we cannot read the run. Step 3.5
+  // adds it as soon as a hard-stop hit lands, BEFORE the review loop: a usable record with no outcome is a run that is still
+  // going (or stalled mid-run), and it resumes normally.
+  if (facts.labels.includes('needs-human') && !midRunLabel(facts, record)) {
     return { enter: 'decision', reason: firstSentence(facts.needsHumanReason) || 'needs-human label set (no reason recorded)' };
   }
 
@@ -141,6 +147,10 @@ export function planResume(facts, { now, heartbeatFreshMinutes = 90 } = {}) {
   const picked = route({ ...f, record }, record);
   const enter = picked.enter;
   const notes = [...(picked.notes ?? [])];
+  if (!REPORT_ONLY.has(enter) && enter !== 'local-work' && enter !== 'observe-prod' && midRunLabel(f, record)) {
+    notes.push(LABEL_NOTE);
+    if (enter === 'gate') notes.push('Step 5 ends in needs-human (label mode) after the gate: there is no owner-merge stop; report it and do not merge');
+  }
 
   if (f.recordStatus === 'unsupported') notes.push('the run record comes from a newer pipeline version: update the CLI before this run writes one');
   if (f.recordStatus === 'invalid') notes.push('the run record could not be read: treated as no record');

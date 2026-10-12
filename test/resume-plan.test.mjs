@@ -83,12 +83,54 @@ test('local-work: a diverged branch or a dirty worktree stops everything', () =>
   assert.equal(plan({ labels: ['needs-human'], local: local({ dirty: 1 }) }).enter, 'local-work');
 });
 
+const LABEL_NOTE = 'needs-human label present: the run continues but ends at the owner (no merge)';
+
 test('decision: needs-human shows the first sentence of our reason and does nothing', () => {
-  const p = plan({ labels: ['needs-human'], needsHumanReason: 'The change touches auth. A second sentence follows.' });
+  // fixture: the run ended at needs-human (a mid-run record no longer short-circuits, see below)
+  const ended = record({ step: 'ended', outcome: 'needs-human' });
+  const p = plan({ labels: ['needs-human'], record: ended, needsHumanReason: 'The change touches auth. A second sentence follows.' });
   assert.equal(p.enter, 'decision');
   assert.equal(p.reason, 'The change touches auth.');
   assert.deepEqual(p.worktree, { action: 'none' });
-  assert.equal(plan({ labels: ['needs-human'] }).reason, 'needs-human label set (no reason recorded)');
+  assert.equal(plan({ labels: ['needs-human'], record: ended }).reason, 'needs-human label set (no reason recorded)');
+});
+
+test('decision: needs-human with any other ended outcome is still the owner\'s', () => {
+  assert.equal(plan({ labels: ['needs-human'], record: record({ step: 'ended', outcome: 'blocked' }) }).enter, 'decision');
+});
+
+test('decision: needs-human with no usable record cannot tell, so it stays the owner\'s', () => {
+  for (const recordStatus of ['absent', 'legacy', 'invalid', 'unsupported', 'mismatch']) {
+    const p = plan({ labels: ['needs-human'], recordStatus, record: null });
+    assert.equal(p.enter, 'decision', recordStatus);
+  }
+});
+
+test('needs-human on a mid-run record (outcome null) does not stop the resume: it routes normally', () => {
+  // review not yet clean => review, with the label note
+  const review = plan({ labels: ['needs-human'], record: record({ step: 'pr' }), triage: cleanTriage({ clean: false }) });
+  assert.equal(review.enter, 'review');
+  assert.ok(review.notes.includes(LABEL_NOTE));
+  // never reviewed
+  assert.equal(plan({ labels: ['needs-human'], record: record({ step: 'pr' }), triage: null }).enter, 'review');
+  // tasks left => build
+  const tasks = [{ id: '1', title: 'one', spec: 's', done: false }];
+  const build = plan({ labels: ['needs-human'], record: record({ step: 'build', tasks }) });
+  assert.equal(build.enter, 'build');
+  assert.ok(build.notes.includes(LABEL_NOTE));
+  // followups
+  assert.equal(plan({ labels: ['needs-human'], triage: cleanTriage({ followupsPending: true }) }).enter, 'followups');
+});
+
+test('needs-human on a mid-run record, review clean => gate, and the notes say Step 5 ends in needs-human', () => {
+  const p = plan({ labels: ['needs-human'], record: record({ step: 'review' }) });
+  assert.equal(p.enter, 'gate');
+  assert.ok(p.notes.includes(LABEL_NOTE));
+  assert.ok(p.notes.some((n) => /Step 5 ends in needs-human/.test(n) && /no owner-merge stop/.test(n)));
+  // without the label there is neither note
+  const plain = plan({});
+  assert.equal(plain.enter, 'gate');
+  assert.ok(!plain.notes.some((n) => /needs-human/.test(n)));
 });
 
 test('build: tasks left to do', () => {
@@ -225,7 +267,7 @@ test('confirm: report-only routes never ask', () => {
   const hb = record({ heartbeat: { host: 'mac', at: ago(1) } });
   assert.equal(plan({ state: 'CLOSED', record: hb }).confirm, null);
   assert.equal(plan({ state: 'MERGED', record: { ...hb, step: 'ended', outcome: 'merged' } }).confirm, null);
-  assert.equal(plan({ labels: ['needs-human'], record: hb }).confirm, null);
+  assert.equal(plan({ labels: ['needs-human'], record: { ...hb, step: 'ended', outcome: 'needs-human' } }).confirm, null);
   assert.notEqual(plan({ state: 'MERGED', record: { ...hb, step: 'prod-watch' } }).confirm, null, 'observing production is real work');
 });
 

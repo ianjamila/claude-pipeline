@@ -244,6 +244,44 @@ test('chat repo, needs-human NOT hard-stop-only, is a plain owner decision', () 
   assert.match(r.reason, /judge disagreed/);
 });
 
+// A run that stalls mid-review on a hard-stop PR carries the label before it has stopped: only a run that ENDED (or one we
+// cannot read) is waiting on the owner.
+const LABEL_FRAGMENT = 'needs-human label present: the run continues but ends at the owner (no merge)';
+const midRun = (over = {}) => record({ step: 'pr', outcome: null, heartbeat: { host: 'mac', at: ago(3 * DAY) }, ...over });
+
+test('needs-human + a record that ended needs-human => owner-decision', () => {
+  const r = cls({ labels: ['needs-human'], needsHumanReason: 'touches migrations', record: midRun({ step: 'ended', outcome: 'needs-human' }) });
+  assert.equal(r.waitingOn, 'owner-decision');
+  assert.equal(r.suggest, 'leave');
+  assert.match(r.reason, /touches migrations/);
+});
+
+test('needs-human + no usable record => owner-decision', () => {
+  for (const recordStatus of ['absent', 'legacy', 'invalid', 'unsupported', 'mismatch']) {
+    const r = cls({ labels: ['needs-human'], recordStatus, record: null, triage: triage() });
+    assert.equal(r.waitingOn, 'owner-decision', recordStatus);
+  }
+});
+
+test('needs-human + a mid-run record (outcome null) does not short-circuit: normal precedence, plus the label fragment', () => {
+  const stalled = cls({ labels: ['needs-human'], record: midRun() });
+  assert.equal(stalled.waitingOn, 'pipeline');
+  assert.equal(stalled.suggest, 'resume');
+  assert.ok(stalled.reason.includes(LABEL_FRAGMENT));
+  assert.match(stalled.nextAction, /ship resume 7/);
+  const failing = cls({ labels: ['needs-human'], record: midRun(), ci: 'failed' });
+  assert.equal(failing.waitingOn, 'failing-check');
+  assert.ok(failing.reason.includes(LABEL_FRAGMENT));
+  const review = cls({ labels: ['needs-human'], record: midRun(), contentHash: 'changed' });
+  assert.equal(review.waitingOn, 'review');
+  assert.equal(review.suggest, 'resume');
+  assert.ok(review.reason.includes(LABEL_FRAGMENT));
+  // a live run still outranks it, with no fragment
+  const live = cls({ labels: ['needs-human'], record: midRun({ heartbeat: { host: 'pc', at: ago(60000) } }) });
+  assert.equal(live.waitingOn, 'running');
+  assert.ok(!live.reason.includes(LABEL_FRAGMENT));
+});
+
 test('category failing-check: CI failed', () => {
   const r = cls({ ci: 'failed' });
   assert.equal(r.waitingOn, 'failing-check');

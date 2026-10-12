@@ -81,6 +81,8 @@ const SUGGEST = {
   abandoned: 'close',
 };
 
+const LABEL_FRAGMENT = 'needs-human label present: the run continues but ends at the owner (no merge)';
+
 const NEVER_GATED_STEPS = new Set(['build', 'verify', 'pr']);
 
 const day = (iso) => iso.slice(0, 10);
@@ -160,6 +162,9 @@ export function classifyPr(facts, options) {
   const live = liveRun(record, nowMs, heartbeatFreshMinutes);
   const failing = failingReasons(f);
   const reviewing = reviewReasons(f);
+  // Step 3.5 labels a hard-stop PR before the review loop: with a usable record that has no outcome the run has not stopped
+  // at the owner yet, so the label does not decide the category (only a finished run, or an unreadable record, does).
+  const midRunLabel = f.labels.includes('needs-human') && f.recordStatus === 'ok' && record != null && record.outcome == null;
 
   if (f.alreadyOnBase === true) {
     waitingOn = 'nothing-left';
@@ -169,7 +174,7 @@ export function classifyPr(facts, options) {
     waitingOn = 'running';
     reason = `a run is live on ${live.host}`;
     nextAction = `leave: running on ${live.host}, ${minutesAgo(live.at, nowMs)} min ago`;
-  } else if (f.labels.includes('needs-human')) {
+  } else if (f.labels.includes('needs-human') && !midRunLabel) {
     waitingOn = 'owner-decision';
     if (ownerApproval === 'chat' && f.needsHumanHardStopOnly) {
       reason = `label-mode leftover: remove the needs-human label, then ${resume}`;
@@ -231,6 +236,10 @@ export function classifyPr(facts, options) {
       reason = `last run ended ${record.outcome}`;
       nextAction = resume;
     }
+  }
+
+  if (midRunLabel && waitingOn !== 'nothing-left' && waitingOn !== 'running') {
+    reason = `${reason}; ${LABEL_FRAGMENT}`;
   }
 
   let suggest = SUGGEST[waitingOn];
