@@ -79,7 +79,7 @@ test('parseLog: finds pending PRs (unique, file order), ignores other lines, rea
   const text = ['# Agent log', '', pendingLine(1420), '- 2026-10-09 · #1411 · feat · risk high · rounds 1 · arbiter 0 · needs-human', pendingLine(1430), pendingLine(1420), resolved(1420), ''].join('\n');
   const p = parseLog(text);
   assert.deepEqual(p.pending, ['1420', '1430']);
-  assert.deepEqual(p.resolutions.get('1420'), [{ outcome: 'passed', host: HOST, observed: '2026-10-12 12:05', run: '999', at: parsePht('2026-10-12', '12:05') }]);
+  assert.deepEqual(p.resolutions.get('1420'), [{ outcome: 'passed', host: HOST, observed: '2026-10-12 12:05', run: '999', at: parsePht('2026-10-12', '12:05'), line: resolved(1420) }]);
   assert.deepEqual(parseLog(pendingLine(7).replace(/\n/g, '\r\n') + '\r\n').pending, ['7'], 'CRLF logs (Windows) are read too');
 });
 
@@ -337,7 +337,7 @@ test('agent-log close: dry run prints {lines, pending, unreadable} and writes no
   const t = closeRepo(pendingLine(1420), [shaEntry(1420), commentsEntry(1420, [comment(marker())])]);
   const r = t.close();
   assertExit(r, 0);
-  assert.deepEqual(r.json, { ok: true, lines: [resolved(1420)], pending: [1420], skipped: [], unreadable: [], originReadable: true });
+  assert.deepEqual(r.json, { ok: true, lines: [resolved(1420)], pending: [1420], skipped: [], unreadable: [], originReadable: true, originRefreshed: true });
   assert.deepEqual(readQueueLines(t), [], 'a dry run queues nothing');
   assert.equal(t.repo.git(['status', '--porcelain']), '', 'and changes nothing in the worktree');
 });
@@ -397,7 +397,7 @@ test('agent-log close: exit 3 when GitHub is unavailable; no pending lines means
   none.fake.setScript([]);
   const r = none.close();
   assertExit(r, 0);
-  assert.deepEqual(r.json, { ok: true, lines: [], pending: [], skipped: [], unreadable: [], originReadable: true });
+  assert.deepEqual(r.json, { ok: true, lines: [], pending: [], skipped: [], unreadable: [], originReadable: true, originRefreshed: true });
   assert.deepEqual(none.fake.lines(), []);
 });
 
@@ -594,13 +594,30 @@ test('scan hit is a trigger only: a comment that is not a bot result does not co
   assert.deepEqual(gh.calls.comments, ['1500']);
 });
 
-test('monotonic emission: an equal or older result (to the minute) is never emitted, a strictly later one is', async () => {
+test('monotonic emission: an older minute is never emitted, a later one is', async () => {
   const text = [pendingLine(1420), resolved(1420, { obs: '2026-10-12 12:05' })].join('\n'); // 04:05Z
-  const at = (observed, extra = {}) => closeLines({ logText: text, gh: fakeGh({ 1420: [comment(marker({ observed, ...extra }))] }) });
-  assert.deepEqual((await at('2026-10-12T04:05:59Z')).lines, [], 'same minute, later seconds: equal after truncation');
-  assert.deepEqual((await at('2026-10-12T04:05:00Z', { outcome: 'failed', run: '5' })).lines, [], 'same minute, different outcome: still not emitted');
+  const at = (observed, extra = {}) => closeLines({ logText: text, gh: fakeGh({ 1420: [comment(marker({ observed, ...extra }))] }), now: NOW });
   assert.deepEqual((await at('2026-10-12T04:04:59Z')).lines, []);
+  assert.deepEqual((await at('2026-10-12T04:04:59Z', { outcome: 'failed', run: '5' })).lines, [], 'an older minute is never emitted, whatever its outcome');
   assert.deepEqual((await at('2026-10-12T04:06:00Z')).lines, [resolved(1420, { obs: '2026-10-12 12:06' })]);
+});
+
+test('same minute: a differing result (outcome, host or run) is newer and emitted; the exact logged line is not', async () => {
+  // logged 'passed' at 04:05 (from 04:05:01Z); the PR's newest history result is a 'failed' one at 04:05:59Z
+  const text = [pendingLine(1420), resolved(1420, { obs: '2026-10-12 12:05' })].join('\n');
+  const at = (observed, extra = {}) => closeLines({ logText: text, gh: fakeGh({ 1420: [comment(marker({ observed: '2026-10-12T04:05:01Z' })), comment(marker({ observed, ...extra }))] }), now: NOW });
+  assert.deepEqual((await at('2026-10-12T04:05:59Z', { outcome: 'failed', run: '5' })).lines, [resolved(1420, { outcome: 'failed', obs: '2026-10-12 12:05', run: '5' })]);
+  assert.deepEqual((await at('2026-10-12T04:05:59Z', { vercel: 'other-abc.vercel.app' })).lines, [resolved(1420, { host: 'other-abc.vercel.app', obs: '2026-10-12 12:05' })], 'another host');
+  assert.deepEqual((await at('2026-10-12T04:05:59Z', { run: '1000' })).lines, [resolved(1420, { obs: '2026-10-12 12:05', run: '1000' })], 'another run');
+  assert.deepEqual((await at('2026-10-12T04:05:59Z')).lines, [], 'identical to the logged line');
+  assert.deepEqual((await at('2026-10-12T04:04:59Z', { outcome: 'failed', run: '5' })).lines, [], 'an older minute');
+});
+
+test('same minute: a differing line already logged for that PR (an older entry of the minute) is not emitted again', async () => {
+  const failed = resolved(1420, { outcome: 'failed', obs: '2026-10-12 12:05', run: '5' });
+  const text = [pendingLine(1420), failed, resolved(1420, { obs: '2026-10-12 12:05' })].join('\n');
+  const gh = fakeGh({ 1420: [comment(marker({ observed: '2026-10-12T04:05:59Z', outcome: 'failed', run: '5' }))] });
+  assert.deepEqual((await closeLines({ logText: text, gh, now: NOW })).lines, []);
 });
 
 test('unionLogText: lines deduped verbatim, first copy first, CRLF normalised', () => {
@@ -660,4 +677,26 @@ test('agent-log close --queue: origin\'s copy unreadable still closes what it ca
   const good = ok.close('--queue');
   assert.equal(good.json.originReadable, true);
   assert.ok(!good.stderr.includes('unreadable'), good.stderr);
+});
+
+test('agent-log close --queue: origin\'s ref readable but the fetch fails still closes from the union and does not advance the checkpoint', () => {
+  const lastScanAt = '2026-01-06T00:00:00.000Z';
+  const t = closeRepo(ANCIENT_AND_NEW(), [scanEntry([]), shaEntry(1500), commentsEntry(1500, [comment(marker())])]);
+  t.repo.git(['remote', 'set-url', 'origin', join(t.repo.dir, 'no-such-origin')]); // the cached origin/main stays, a refresh cannot work
+  mkdirSync(join(t.repo.dir, '.git', 'claude-pipeline'), { recursive: true });
+  const stateFile = join(t.repo.dir, '.git', 'claude-pipeline', 'agent-log-close.json');
+  writeFileSync(stateFile, `${JSON.stringify({ lastScanAt })}\n`);
+  const r = t.close('--queue');
+  assertExit(r, 0);
+  assert.deepEqual(r.json.lines, [resolved(1500)]);
+  assert.deepEqual(readQueueLines(t), [resolved(1500)]);
+  assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).lastScanAt, lastScanAt);
+  assert.equal(r.json.originReadable, true);
+  assert.equal(r.json.originRefreshed, false);
+  assert.ok(r.stderr.includes('could not refresh origin/main (git fetch failed) — closing from the cached copy; scan checkpoint not advanced'), r.stderr);
+
+  const ok = closeRepo(ANCIENT_AND_NEW(), [scanEntry([]), shaEntry(1500), commentsEntry(1500, [])]);
+  const good = ok.close('--queue');
+  assert.equal(good.json.originRefreshed, true);
+  assert.ok(!good.stderr.includes('refresh'), good.stderr);
 });

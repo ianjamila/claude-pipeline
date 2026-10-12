@@ -110,7 +110,7 @@ export function parseLog(text) {
     const r = RESOLUTION_RE.exec(line);
     if (r) {
       const list = resolutions.get(r[1]) ?? [];
-      list.push({ outcome: r[2], host: r[3], observed: `${r[4]} ${r[5]}`, run: r[6], at: parsePht(r[4], r[5]) });
+      list.push({ outcome: r[2], host: r[3], observed: `${r[4]} ${r[5]}`, run: r[6], at: parsePht(r[4], r[5]), line });
       resolutions.set(r[1], list);
     }
   }
@@ -191,7 +191,8 @@ const oneLine = (err) => String(err?.message ?? err).replace(/[\r\n]+/g, ' ').sl
  * gh: { mergeSha(pr) -> sha | null, listComments(pr) -> comments[], listRepoComments(sinceIso) -> comments[] (each with
  * `issue_url`) }. A repo-wide hit is only a trigger: that PR's whole comment history is read and the newest result is picked
  * from it, never from the window-limited scan comments. A result is emitted only when its `observed`, truncated to the minute
- * (the precision of a logged line), is strictly later than the newest logged resolution's: an equal or older one never is. `now` (ms; tests always pass it) sets the repo-wide window, widened back to `lastScanAt` (ms) when given. `prs` (strings) are pending PRs to read
+ * (the precision of a logged line), is not earlier than the newest logged resolution's, and, in the same minute, differs from every line
+ * logged for that PR: an older one never is, an identical one never is again. `now` (ms; tests always pass it) sets the repo-wide window, widened back to `lastScanAt` (ms) when given. `prs` (strings) are pending PRs to read
  * per-PR whatever their state; `all` reads every pending PR per-PR.
  * Returns { lines, pending, skipped, unreadable, scanError, scanned, scanUnreadable } (`scanned`: the repo-wide read ran and succeeded; `scanUnreadable`: the PRs it surfaced that could not be read). A PR that cannot be read lands in `unreadable` and the rest
  * carry on; if the repo-wide read itself fails, `scanError` says so and resolved PRs are left unchecked this run.
@@ -237,8 +238,11 @@ export async function closeLines({ logText, gh, now = Date.now(), prs = [], all 
       const newest = newestByObserved(resultsFromComments(await gh.listComments(pr), sha));
       if (!newest) continue;
       const observedAt = Math.floor(Date.parse(newest.observed) / MINUTE_MS) * MINUTE_MS;
-      if (lastLogged && observedAt <= lastLogged.at) continue;
-      lines.push(resolutionLine({ pr, result: newest }));
+      const line = resolutionLine({ pr, result: newest });
+      // Never an OLDER minute. The SAME minute is a newer result when it differs (outcome, host or run: a logged line has minute
+      // precision, so two results seconds apart share it); the exact line already logged is not emitted again.
+      if (lastLogged && (observedAt < lastLogged.at || (observedAt === lastLogged.at && (resolutions.get(pr) ?? []).some((r) => r.line === line)))) continue;
+      lines.push(line);
     } catch (err) {
       unreadable.push({ pr, message: oneLine(err) });
       if (scanned.has(pr)) scanUnreadable.push(pr);
