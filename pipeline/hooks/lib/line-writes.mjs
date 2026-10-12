@@ -312,6 +312,21 @@ const COPY_STRICT = {
   install: { shortVal: 'mogStBfl', shortSwitch: 'bCcdDMpsTUvZ', longVal: ['mode', 'owner', 'group', 'suffix', 'target-directory', 'strip-program'], longOpt: ['backup', 'context'],
     longSwitch: ['compare', 'directory', 'debug', 'preserve-timestamps', 'preserve-context', 'strip', 'no-target-directory', 'unprivileged', 'verbose', 'create-leading', 'help', 'version'] },
 };
+// sort / uniq: their options (GNU and BSD), complete, so --out= (a unique prefix of --output) is found and an option we do not know is noticed
+const SORT_OPTIONS = {
+  shortVal: 'kotST', shortSwitch: 'bdfgiMhnRrVcCmsuzHlBp',
+  longVal: ['key', 'field-separator', 'output', 'buffer-size', 'temporary-directory', 'files0-from', 'compress-program', 'parallel', 'batch-size', 'random-source', 'sort'], longOpt: ['check'],
+  longSwitch: ['ignore-leading-blanks', 'dictionary-order', 'ignore-case', 'general-numeric-sort', 'ignore-nonprinting', 'month-sort', 'human-numeric-sort', 'numeric-sort', 'random-sort', 'reverse', 'version-sort', 'merge', 'stable', 'unique', 'zero-terminated', 'debug', 'help', 'version', 'radix-sort', 'mergesort', 'heapsort', 'qsort'],
+};
+const UNIQ_OPTIONS = {
+  shortVal: 'fsw', shortSwitch: 'cdDiuz', longVal: ['skip-fields', 'skip-chars', 'check-chars'], longOpt: ['all-repeated', 'group'],
+  longSwitch: ['count', 'repeated', 'ignore-case', 'unique', 'zero-terminated', 'help', 'version'],
+};
+// sort that only prints: every option read, no -o / --output, no --compress-program (it runs a program)
+export function sortArgsPure(args) {
+  const { opts, bad } = getoptStrict(args, SORT_OPTIONS);
+  return !bad && !hasOpt(opts, 'o', 'output', 'compress-program');
+}
 const COPY_VALUE = {
   ditto: ['', []], rsync: ['eBMfT', ['rsh', 'exclude', 'include', 'filter', 'exclude-from', 'include-from', 'files-from', 'temp-dir', 'backup-dir', 'suffix']],
 };
@@ -433,15 +448,21 @@ function argRecords(cmd, name, idx, lineEnv = {}) {
     if (name === 'ln' && pos.length === 1) return [{ idx, dest: '.', copy: true, link, items: pos.map((file) => ({ file })) }];
     return null; // too few operands to place the copy (a usage error to the shell, but not one we may rely on)
   }
-  if (name === 'uniq') { // uniq [OPTION] [INPUT [OUTPUT]]
-    const { pos } = getopt(args, 'fsw', ['skip-fields', 'skip-chars', 'check-chars', 'group']);
-    return pos.length >= 2 ? [{ idx, dest: pos[1], items: [{ file: pos[0] }] }] : [];
+  if (name === 'uniq') { // uniq [OPTION] [INPUT [OUTPUT]]: OUTPUT holds the lines of INPUT with repeats dropped, not INPUT
+    const { pos, bad } = getoptStrict(args, UNIQ_OPTIONS);
+    if (bad) return orAnywhere([], idx, true);
+    return pos.length >= 2 ? [{ idx, dest: pos[1], items: [{ scan: pos[0] }, { unknown: true }] }] : [];
   }
   if (name === 'sort') { // sort -o OUT / --output=OUT: the lines of its inputs, reordered
-    const { pos, opts } = getopt(args, 'okSTtpC', ['output', 'key', 'field-separator', 'buffer-size', 'temporary-directory', 'files0-from', 'compress-program', 'parallel', 'batch-size', 'random-source']);
-    const out = optValue(opts, 'o', 'output');
-    return out === null ? null : [{ idx, dest: out, items: [...pos.map((scan) => ({ scan })), ...stdinItems(cmd).map((i) => (i.file !== undefined ? { scan: i.file } : i)), { unknown: true }] }];
+    const { pos, opts, bad } = getoptStrict(args, SORT_OPTIONS);
+    if (bad || hasOpt(opts, 'compress-program')) return orAnywhere([], idx, true); // (an option we cannot place may be -o; --compress-program runs a program)
+    const outs = optValues(opts, 'o', 'output'); // (a repeated -o: every one)
+    if (!outs.length) return null;
+    const items = [...pos.map((scan) => ({ scan })), ...stdinItems(cmd).map((i) => (i.file !== undefined ? { scan: i.file } : i)), { unknown: true }];
+    // Why: `sort -o f f` rearranges the lines of the file's own old text (a backslash-continued command can be completed by it): an edit, not a replacement
+    return outs.map((dest) => ({ idx, dest, items, ...(pos.includes(dest) ? { edit: true } : {}) }));
   }
+  if (name === 'split' || name === 'csplit' || name === 'patch') return orAnywhere([], idx, true); // (files named by a prefix, a suffix scheme or the headers of a diff)
   if (name === 'less' || name === 'more') { // the log file of the input that is piped in
     const { opts } = getopt(args, 'oObhjkpPtTxyz', ['log-file', 'LOG-FILE']);
     const out = optValue(opts, 'o', 'O', 'log-file', 'LOG-FILE');
@@ -465,8 +486,9 @@ function argRecords(cmd, name, idx, lineEnv = {}) {
     const plain = args.every((a) => /^(?:if|of|status)=/.test(a) || (/^conv=/.test(a) && valuesOf('conv').every((v) => v === 'notrunc')) || (/^oflag=/.test(a) && valuesOf('oflag').every((v) => v === 'append')));
     const append = valuesOf('oflag').includes('append');
     const notrunc = valuesOf('conv').includes('notrunc');
-    // conv=notrunc without append writes over the start of the old file: new text + the old tail, neither an append nor a replacement
-    const edit = notrunc && !append;
+    // conv=notrunc without append writes over the start of the old file (new text + the old tail), and a seek (seek= / oseek= not 0, oflag=seek_bytes) keeps the old head (GNU dd truncates at the seek offset): neither an append nor a replacement
+    const seeks = [...valuesOf('seek'), ...valuesOf('oseek')].some((v) => !/^0+$/.test(v)) || valuesOf('oflag').includes('seek_bytes');
+    const edit = (notrunc || seeks) && !append;
     const exact = plain && !edit;
     if (exact) {
       const items = ins.length ? ins.map((file) => ({ file })) : stdinItems(cmd);
@@ -475,7 +497,7 @@ function argRecords(cmd, name, idx, lineEnv = {}) {
     const from = ins.length ? ins.map((scan) => ({ scan })) : stdinItems(cmd).flatMap((i) => (i.file !== undefined ? [{ scan: i.file }] : i.scan !== undefined || i.unknown ? [i] : []));
     return ofs.map((of) => ({ idx, dest: of, items: dedupe([...from, { unknown: true }]), append, ...(edit ? { edit: true } : {}) }));
   }
-  if (name === 'curl') return curlRecords(args, idx, cmd.env);
+  if (name === 'curl') return curlRecords(args, idx, { ...cmd.env, ...lineEnv });
   if (name === 'wget') {
     const { pos, opts, bad } = getoptStrict(args, WGET_OPTIONS);
     if (bad) return null; // (an option we do not know, or abbreviate: the output file may be named by it)
@@ -487,7 +509,7 @@ function argRecords(cmd, name, idx, lineEnv = {}) {
     // Why: a startup file (-e, --config, WGETRC), a name taken from the response / a list / a base (--content-disposition, -i, -B), a renamed (-E, --backups) or re-rooted (-x, --protocol-directories, a
     // recursive run) file, a WARC archive: the file written is not the one the URL says
     const odd = hasOpt(opts, 'e', 'execute', 'config', 'warc-file', 'E', 'adjust-extension', 'backups', 'x', 'force-directories', 'protocol-directories', 'B', 'base', 'i', 'input-file', 'input-metalink', 'content-disposition', 'trust-server-names', 'restrict-file-names', 'local-encoding', 'remote-encoding', 'iri')
-      || (recursive && !noDirs) || Object.keys(cmd.env ?? {}).some((k) => RC_ENV.test(k));
+      || (recursive && !noDirs) || Object.keys({ ...cmd.env, ...lineEnv }).some((k) => RC_ENV.test(k));
     for (const lf of [...optValues(opts, 'o', 'output-file'), ...optValues(opts, 'a', 'append-output'), ...optValues(opts, 'save-cookies'), ...optValues(opts, 'rejected-log'), ...optValues(opts, 'hsts-file')]) if (lf) out.push(unknown(lf));
     if (os.length) for (const o of os) out.push(unknown(o));
     else for (const u of pos) out.push(unknown(dir ? `${dir.replace(/\/+$/, '')}/${urlBase(u) || 'index.html'}` : urlBase(u) || 'index.html'));
@@ -855,7 +877,8 @@ function isPure(cmd, name, lineEnv = {}) {
   if (AWK_NAMES.has(name)) return awkArgsPure(args, { ...cmd.env, ...lineEnv });
   if (name === 'find') return !args.some((a) => /^-(?:delete|exec|execdir|ok|okdir|fprint0?|fprintf|fls)$/.test(a));
   if (name === 'xxd') return !args.includes('-r') && args.filter((a) => !a.startsWith('-')).length <= 1;
-  if (name === 'uniq') return args.filter((a) => !a.startsWith('-')).length <= 1;
+  if (name === 'uniq') { const { pos, bad } = getoptStrict(args, UNIQ_OPTIONS); return !bad && pos.length <= 1; }
+  if (name === 'sort') return sortArgsPure(args);
   if (name === 'rg') return !args.some((a) => /^--(?:pre|hostname-bin)(?:=|$)/.test(a)) && !args.some((a) => OUTPUT_LONG.test(a));
   if (!PURE.has(name)) return false;
   if (NO_OUTPUT_OPTIONS.has(name)) return true;
@@ -867,8 +890,12 @@ function isPure(cmd, name, lineEnv = {}) {
 export function writesOf(cmds) {
   const recs = [];
   const unmodelled = new Set();
-  // Why: `export AWKPATH=d; awk -i inplace ...`: a variable set (or exported) by any command of the line may be in awk's environment
-  const lineEnv = cmds.some((c) => Object.keys(c.env ?? {}).some((k) => /^AWK(?:LIB)?PATH$/.test(k)) || c.argv.some((a) => /^AWK(?:LIB)?PATH(?:=|$)/.test(a))) ? { AWKPATH: '' } : {};
+  // Why: `export WGETRC=w.rc; wget URL`, `CURL_HOME=d; export CURL_HOME; curl URL`, `declare -x HOME=d; ...`, `export AWKPATH=d; awk -i inplace ...`: a variable set or exported by ANY command of the line may be in a later command's environment
+  const lineEnv = {};
+  for (const c of cmds) {
+    for (const k of Object.keys(c.env ?? {})) lineEnv[k] = '';
+    if (['export', 'declare', 'typeset', 'readonly', 'local'].includes(commandName(c.argv[0] ?? ''))) for (const a of c.argv.slice(1)) { const m = /^([A-Za-z_]\w*)(?:=|$)/.exec(a); if (m) lineEnv[m[1]] = ''; }
+  }
   cmds.forEach((cmd, idx) => {
     recs.push(...redirectRecords(cmd, idx));
     if (!cmd.argv.length) return;
@@ -890,7 +917,7 @@ export function writesOf(cmds) {
       if (at > 0) {
         const inner = { ...cmd, argv: cmd.argv.slice(at) };
         Object.defineProperty(inner, 'streams', { value: cmd.streams, enumerable: false }); // (its stdin is the wrapper's stdin)
-        recs.push(...(argRecords(inner, commandName(inner.argv[0]), idx) ?? []), { idx, dest: null, items: UNKNOWN, loose: true });
+        recs.push(...(argRecords(inner, commandName(inner.argv[0]), idx, lineEnv) ?? []), { idx, dest: null, items: UNKNOWN, loose: true });
       }
     }
     // a modelled writer (and a read-only command) cannot create a file we did not list; anything else may. git is only modelled for the

@@ -13,7 +13,7 @@ import { resolve, dirname, basename } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { simpleCommands } from '../pipeline/hooks/lib/shell-parse.mjs';
-import { writesOf, printfText, flowStart, namesFile, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, decodeEscapes } from '../pipeline/hooks/lib/line-writes.mjs';
+import { writesOf, printfText, flowStart, namesFile, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, decodeEscapes, sortArgsPure } from '../pipeline/hooks/lib/line-writes.mjs';
 
 function fakeFs(root, files, dirs = []) {
   const abs = (p) => resolve(root, p);
@@ -1006,6 +1006,8 @@ test('L2b: awk long options, -e / -i / -E / -l / -W, @include / @load are not re
   assert.equal(un('awk --exec p.awk f'), 1);
   assert.equal(un("awk '@include \"x\"; {print}' f"), 1);
   assert.equal(un("awk -F: '{print $1}' f"), 0);
+  assert.equal(un("export AWKPATH=d; awk '{print $1}' f"), 1); // (a variable exported earlier on the line is in awk's environment)
+  assert.equal(un("AWKLIBPATH=d; awk '{print $1}' f"), 1);
   denyBoth((_, mid) => `awk --exec p.awk f; ${mid}; bash n.sh`);
   denyBoth((_, mid) => `awk -W exec=p.awk f; ${mid}; bash n.sh`);
   denyBoth((_, mid) => `awk -e '@load "x"' f; ${mid}; bash n.sh`);
@@ -1157,6 +1159,14 @@ test('L2b: dd is an exact copy only with if= / of= / status= / conv=notrunc / of
   assert.equal(writesOf(simpleCommands('printf x | dd of=n.sh conv=notrunc')).recs[0].edit, true);
   assert.equal(writesOf(simpleCommands('printf x | dd of=n.sh conv=notrunc oflag=append')).recs[0].append, true);
   denyBoth((_, mid) => `cp ok.sh n.sh; printf x | dd of=n.sh conv=notrunc; ${mid}; bash n.sh`);
+  // seek= / oseek= (not 0) and oflag=seek_bytes keep the old head of the file (GNU dd truncates only at the seek offset): new text after the old head, an edit
+  const edits = (l) => writesOf(simpleCommands(l)).recs.map((r) => r.edit === true);
+  for (const l of ['dd of=n.sh seek=1', 'dd of=n.sh oseek=2', 'dd of=n.sh seek=$N', 'dd of=n.sh seek=1 oflag=seek_bytes', 'dd of=n.sh oflag=seek_bytes', 'dd if=f.sh of=n.sh bs=1 seek=100', 'dd of=n.sh seek=0 seek=1', 'dd of=n.sh conv=notrunc seek=1']) assert.deepEqual(edits(l), [true], l);
+  for (const l of ['dd of=n.sh seek=0', 'dd of=n.sh oseek=0', 'dd of=n.sh bs=1', 'dd of=n.sh', 'dd of=n.sh seek=1 oflag=append']) assert.deepEqual(edits(l), [false], l);
+  denyBoth('printf x | dd of=ok.sh seek=1; bash ok.sh');
+  denyBoth('printf x | dd of=ok.sh oseek=1; bash ok.sh');
+  denyBoth('printf x | dd of=ok.sh oflag=seek_bytes; bash ok.sh');
+  allowBoth('printf x | dd of=ok.sh seek=0; bash ok.sh');
   allowBoth('cp ok.sh n.sh; printf x | dd of=n.sh conv=notrunc oflag=append; bash n.sh');
 });
 
@@ -1261,4 +1271,72 @@ test('L2b: a leading ~+ / ~- / ~user in a write target is a tilde prefix (the di
   // the twins: another name, and the plain ~ stays the home directory
   allowBoth((_, _m, calm) => `echo hi > ~+/m.sh; ${calm}; bash n.sh`);
   allowBoth('echo hi > ~+/m.sh; bash ok.sh');
+});
+
+test('L2b: sort (options read completely: --out= / --output abbreviations, in place, --compress-program), uniq IN OUT (not a copy), split / csplit / patch are writers', () => {
+  // Why: `sort --out=n.sh f` (GNU takes a unique prefix) was read-only; `uniq IN OUT` drops lines, so OUT is not IN; split / csplit / patch write files named by their input
+  const recs = (l) => writesOf(simpleCommands(l)).recs;
+  const un = (l) => writesOf(simpleCommands(l)).unmodelled.size;
+  for (const o of ['-o n.sh', '-on.sh', '--output n.sh', '--output=n.sh', '--out=n.sh', '--outp n.sh', '-uo n.sh', '-k2 -o n.sh', '-t, -o n.sh', '-S 10M -o n.sh']) {
+    assert.deepEqual(recs(`sort ${o} f.sh`).map((r) => r.dest), ['n.sh'], o);
+    denyBoth((_, mid) => `sort ${o} f.sh; ${mid}; bash n.sh`);
+  }
+  assert.deepEqual(recs('sort -o a.sh -o b.sh f.sh').map((r) => r.dest), ['a.sh', 'b.sh']); // (a repeated -o: every one)
+  assert.deepEqual(recs('sort -o ok.sh ok.sh').map((r) => [r.dest, r.edit === true]), [['ok.sh', true]]); // (in place: the old text rearranged)
+  assert.deepEqual(recs('sort -o n.sh f.sh').map((r) => [r.dest, r.edit === true]), [['n.sh', false]]);
+  // lines reordered by an in-place sort can join a backslash-continued command
+  denyBoth('sort -o tc.sh tc.sh; bash tc.sh', { ...SPEC, 'tc.sh': 'tacd' });
+  for (const l of ['sort --bogus f.sh', 'sort --compress-program=gzip f.sh', 'sort --comp=gzip f.sh', 'sort -Z f.sh', 'sort --s f.sh']) {
+    assert.equal(un(l), 1, l);
+    denyBoth((_, mid) => `${l}; ${mid}; bash ok.sh`);
+  }
+  for (const l of ['sort -u -k2,2 -t, -S 10M ok.sh', 'sort -n -r ok.sh', 'sort --reverse --key=2 ok.sh', 'sort -c ok.sh', 'sort -m ok.sh ok.sh', 'sort --check=quiet ok.sh', 'sort --sort=n ok.sh', 'sort --parallel 2 -T /tmp ok.sh', 'sort ok.sh | uniq -c']) {
+    assert.equal(un(l), 0, l);
+    assert.deepEqual(recs(l), [], l);
+    allowBoth((_, mid, calm) => `${l}; ${calm}; bash ok.sh`);
+  }
+  // uniq IN OUT: the lines of IN, repeats dropped
+  const items = (l) => recs(l).find((r) => r.dest === 'n.sh').items;
+  for (const l of ['uniq f.sh n.sh', 'uniq -c f.sh n.sh', 'uniq -f 1 f.sh n.sh', 'uniq -f1 f.sh n.sh', 'uniq --skip-fields=1 f.sh n.sh', 'uniq --skip-fields 1 f.sh n.sh', 'uniq --group f.sh n.sh', 'uniq -i -u f.sh n.sh']) {
+    assert.equal(items(l).some((i) => i.file !== undefined), false, `${l}: a copy`);
+    assert.equal(items(l).some((i) => i.scan === 'f.sh') && items(l).some((i) => i.unknown), true, l);
+  }
+  const spec = { ...SPEC, 'hc.sh': 'badx' };
+  denyBoth('uniq hc.sh n.sh; bash n.sh', spec);
+  assert.equal(un('uniq --bogus f.sh n.sh'), 1);
+  denyBoth((_, mid) => `uniq --bogus f.sh n.sh; ${mid}; bash ok.sh`);
+  assert.equal(un('uniq -c ok.sh'), 0);
+  assert.equal(un('uniq ok.sh'), 0);
+  assert.equal(un('uniq ok.sh n.sh'), 0);
+  // split / csplit / patch write files whose names we do not follow: they may write anywhere
+  for (const l of ['split -l 1 f.sh p-', 'split f.sh', 'csplit f.sh /x/', 'csplit -f pp f.sh 1', 'patch -p1 < d.diff', 'patch -o n.sh ok.sh d.diff', 'patch ok.sh d.diff', 'patch -i d.diff']) {
+    assert.equal(un(l), 1, l);
+    denyBoth((_, mid) => `${l}; ${mid}; bash ok.sh`);
+  }
+});
+
+test('L2b: sortArgsPure reads sort\'s options completely (also for the files policy)', () => {
+  assert.equal(sortArgsPure(['--out=n.sh', 'f']), false);
+  assert.equal(sortArgsPure(['-o', 'n.sh', 'f']), false);
+  assert.equal(sortArgsPure(['--output=n.sh', 'f']), false);
+  assert.equal(sortArgsPure(['--compress-program=gzip', 'f']), false);
+  assert.equal(sortArgsPure(['--bogus', 'f']), false);
+  assert.equal(sortArgsPure(['-u', '-k2,2', '-t,', 'f']), true);
+  assert.equal(sortArgsPure(['--reverse', '--key=2', 'f']), true);
+  const fs = fakeFs(PROJ, {}, DIRS);
+  const P = '~/.claude/settings.json';
+  for (const c of [`sort --out=${P} f`, `sort -o ${P} f`, `sort --output=${P} f`, `sort --comp=gzip f ${P}`]) assert.equal(files(c, fs).decision, 'deny', c);
+  for (const c of [`sort -r ${P}`, `sort -u -k2 ${P}`]) assert.equal(files(c, fs).decision, 'allow', c);
+});
+
+test('L2b: a startup-file variable (WGETRC / CURL_HOME / XDG_CONFIG_HOME / HOME) exported or assigned earlier on the line counts for wget / curl', () => {
+  // Why: `export WGETRC=w.rc; wget URL` and `CURL_HOME=d; export CURL_HOME; curl URL` read a config file that can name any output, just like `WGETRC=w.rc wget URL`
+  const un = (l) => writesOf(simpleCommands(l)).unmodelled.size;
+  for (const l of ['WGETRC=w.rc; wget http://h/f', 'CURL_HOME=d; curl -o n.sh http://h/f', 'export WGETRC=w.rc; wget http://h/f', 'WGETRC=w.rc; export WGETRC; wget http://h/f', 'declare -x HOME=d; wget http://h/f', 'typeset -x WGETRC=w.rc; wget -O n.sh http://h/f', 'export WGETRC; wget http://h/f',
+    'export CURL_HOME=d; curl http://h/f', 'CURL_HOME=d; export CURL_HOME; curl -o n.sh http://h/f', 'export XDG_CONFIG_HOME=d; curl -O http://h/n.sh', 'declare -x HOME=d; curl http://h/f', 'readonly CURL_HOME=d; curl http://h/f']) {
+    assert.equal(un(l), 1, l);
+    denyBoth((_, mid) => `${l}; ${mid}; bash n.sh`);
+    denyBoth((_, mid) => `${l}; ${mid}; bash ok.sh`);
+  }
+  for (const l of ['export FOO=1; wget -O n.sh http://h/f', 'FOO=1; export FOO; curl -o n.sh http://h/f', 'declare -x LANG=C; wget -qO n.sh http://h/f', 'export WGETRC=w.rc; echo hi']) assert.equal(un(l), 0, l);
 });
