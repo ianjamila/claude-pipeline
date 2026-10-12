@@ -21,7 +21,8 @@
 ## Risk
 **<low|medium|high>** — <reasons from P risk>. Light lane: <yes|no>.
 Hard-stops: <none | list of blocking rule + file>
-Report-only hard-stops (no label needed): <none | list of rule + file, from `advisory` in `P hardstops`>
+Report-only hard-stops (no label needed): <none | list of rule + file, from `advisory` in `P hardstops` without `ownerMerge`>
+Owner merges in chat (`owner_approval: chat` only; the owner says "merge", no label): <none | rule + file, from `ownerMerge` in `P hardstops` / `P integrity`>
 
 <proof switches used, if any — see proof-switches.md>
 
@@ -50,7 +51,7 @@ Report-only hits never make a needs-human note; they go in the PR body.
 ## Summary comment (Step 7)
 
 `P summary --pr <N> --outcome <outcome> --built "<2–3 sentences>"` (outcome: `merged`, `blocked`,
-`needs-human`, `awaiting-review`, or a prod-watch outcome such as `recovered`, `rollback-failed`,
+`needs-human`, `awaiting-review`, `awaiting-owner-merge` (chat mode, stopped before the merge), or a prod-watch outcome such as `recovered`, `rollback-failed`,
 `superseded`, `not-live`, `deploy-failed`) prints `agentLogLine` and renders, in this order. `blocked` and
 `awaiting-review` also work before any review round exists (verify red 3 times, Codex out in round 1):
 the comment then has no rounds, and a `blocked` one names the failing verify step; any other outcome

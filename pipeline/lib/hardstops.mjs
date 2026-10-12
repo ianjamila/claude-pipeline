@@ -13,6 +13,9 @@
 // `advisory: true`, is still found and listed everywhere, but is left out of `blockingHits(hits)`, which is what every
 // pass/fail decision counts. Database rules (R0, R1-destructive, R1-migration-edited, R2-sql-*), R4-pipeline (the guard core) and unlisted rules can
 // never be advisory.
+// Owner-merge mode (`owner_approval: chat`): the owner no longer applies approval labels. Every hit that would otherwise block
+// becomes `advisory: true, ownerMerge: true`: CI passes, nothing needs a label, and `ownerMergeHits(hits)` lists what the ship
+// skill must put in front of the owner in chat before it merges. Report-only hits stay plain advisory (no ownerMerge).
 //
 // Shape: a pure core (`classifyHardStops` and the helpers exported for tests) plus ONE supported entry point,
 // `collectHardStops`, which gathers what a diff cannot show: env names already on the base, package.json /
@@ -1244,6 +1247,7 @@ function settings(config) {
     disabled: disabledRules(hs.disable_rules),
     reportOnly: reportOnlyRules(hs.report_only_rules, hs.disable_rules),
     reportOnlyPaths: hs.report_only_paths ?? [],
+    ownerChat: config?.owner_approval === 'chat',
   };
 }
 
@@ -1262,6 +1266,9 @@ function reportOnlyRules(rules = [], disabled = []) {
 
 /** Hits that block merge (everything not report-only). Pass/fail decisions count these; listings show all hits. */
 export const blockingHits = (hits) => hits.filter((h) => !h.advisory);
+
+/** Hits the owner merges in chat (owner_approval: chat): blocking in label mode, advisory + ownerMerge here. */
+export const ownerMergeHits = (hits) => hits.filter((h) => h.ownerMerge);
 
 // hard_stops.disable_rules, re-checked here because classifyHardStops can be handed a config that never went through
 // validateConfig: a rule outside the switchable list stops the run (fail closed) instead of being dropped.
@@ -1528,7 +1535,17 @@ export function classifyHardStops({ files, config, baseEnvNames = new Set(), bas
 
   for (const g of guardLosses) sink.add(g.kind === 'sql' ? 'R2-sql-removed' : 'R2-auth-removed', g.file, g.detail);
 
-  return sink.list().filter((hit) => !cx.disabled.has(hit.rule)).map((hit) => (cx.reportOnly.has(hit.rule) ? { ...hit, advisory: true } : hit));
+  return settleHits(sink.list(), cx);
+}
+
+// The ONE place a hit's final blocking status is decided: drops disabled rules, marks report-only rules advisory, and in
+// owner_approval: chat marks every other hit advisory + ownerMerge. classifyHardStops applies it to its own hits and
+// collectHardStops to the COMPLETE list (it appends hits the classifier never sees), so no path can skip it. Idempotent.
+function settleHits(hits, cx) {
+  return hits.filter((hit) => !cx.disabled.has(hit.rule)).map((hit) => {
+    if (hit.advisory || cx.reportOnly.has(hit.rule)) return { ...hit, advisory: true };
+    return cx.ownerChat ? { ...hit, advisory: true, ownerMerge: true } : hit;
+  });
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1937,5 +1954,5 @@ export async function collectHardStops({ base, head, cwd, config, maxImporterHit
     else tooBig.push({ rule: 'R0-unscannable', file: d.file, detail: `file is larger than ${MAX_HEAD_TEXT} characters; its imports cannot be checked` });
   }
   const hits = classifyHardStops({ files, config, baseEnvNames, pkgPairs, sqlStatements, envFiles, envImportFiles, guardLosses, headFiles });
-  return [...hits, ...tooBig, ...reverseImportHits(ds, head, o, cx, maxImporterHits)];
+  return settleHits([...hits, ...tooBig, ...reverseImportHits(ds, head, o, cx, maxImporterHits)], cx);
 }

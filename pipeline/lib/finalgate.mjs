@@ -12,7 +12,7 @@ import { join, resolve } from 'node:path';
 import { gh as ghRun } from './proc.mjs';
 import { checkGuardVerdict, GUARD_CONTEXT_CHECKS } from './guard-provenance.mjs';
 import { GUARD_CHECKS } from './config.mjs';
-import { blockingHits, collectHardStops } from './hardstops.mjs';
+import { blockingHits, collectHardStops, ownerMergeHits } from './hardstops.mjs';
 import { checkIntegrity } from './integrity.mjs';
 import { runPreflight } from './preflight.mjs';
 import { findDeployment } from './deploy.mjs';
@@ -53,7 +53,8 @@ const MAX_LINE = 400;
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const short = (sha) => (typeof sha === 'string' && sha ? sha.slice(0, 8) : String(sha));
-const check = (name, ok, detail) => ({ name, ok: ok === true, detail });
+// ownerMerge (owner_approval: chat): how many items of this check the owner merges in chat; only present when > 0.
+const check = (name, ok, detail, ownerMerge = 0) => ({ name, ok: ok === true, detail, ...(ownerMerge > 0 ? { ownerMerge } : {}) });
 
 // ---- review-dir files ---------------------------------------------------------------------------
 
@@ -296,8 +297,13 @@ async function hardstopsCheck({ root, config, diff }) {
   if (hits.length === 0) return check('hardstops', true, 'no hard-stops');
   // Report-only (advisory) hits are listed, never failing: only blocking hits stop the merge.
   const blocking = blockingHits(hits);
-  const advisoryCount = hits.length - blocking.length;
-  if (blocking.length === 0) return check('hardstops', true, `no blocking hard-stops (${advisoryCount} report-only)`);
+  const chat = ownerMergeHits(hits).length;
+  const advisoryCount = hits.length - blocking.length - chat;
+  if (blocking.length === 0) {
+    if (chat === 0) return check('hardstops', true, `no blocking hard-stops (${advisoryCount} report-only)`);
+    // owner_approval: chat: nothing blocks, but the owner must say "merge" for these.
+    return check('hardstops', true, `no blocking hard-stops (${chat} owner-merge, ${advisoryCount} report-only)`, chat);
+  }
   const shown = blocking.slice(0, 5).map((h) => `${h.rule} ${h.file ?? ''}`.trim()).join('; ');
   const note = advisoryCount > 0 ? ` (+${advisoryCount} report-only)` : '';
   return check('hardstops', false, `${blocking.length} hard-stop hit(s): ${shown}${blocking.length > 5 ? '; ...' : ''}${note}`);
@@ -308,7 +314,10 @@ function integrityCheck({ config, diff }) {
   if (!d.ok) return check('integrity', false, `could not diff against the base: ${d.error}`);
   // No labels passed: the override label is deliberately not honoured at the gate.
   const r = checkIntegrity({ files: d.files, config, labels: [] });
-  if (r.ok) return check('integrity', true, 'no test weakening');
+  if (r.ok) {
+    const chat = r.ownerMerge?.length ?? 0;
+    return chat > 0 ? check('integrity', true, `${chat} owner-merge test-integrity violation(s)`, chat) : check('integrity', true, 'no test weakening');
+  }
   const shown = r.violations.slice(0, 5).map((v) => `${v.rule ?? v.type ?? 'violation'} ${v.file ?? ''}`.trim()).join('; ');
   return check('integrity', false, `${r.violations.length} test-integrity violation(s): ${shown}`);
 }
@@ -489,6 +498,8 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
     tree,
     contentHash: hash,
     checks,
+    // owner_approval: chat: items the owner merges in chat (0 = none, merge as usual). The ship skill reads this.
+    ownerMerge: checks.reduce((n, c) => n + (c.ownerMerge ?? 0), 0),
     failed: checks.filter((c) => !c.ok).map((c) => c.name),
     at: new Date().toISOString(),
   };

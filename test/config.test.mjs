@@ -104,6 +104,18 @@ test('bad enforcement is rejected', () => {
   assert.equal(validateConfig({ ...minimal(), enforcement: 'gate' }).ok, true);
 });
 
+test('owner_approval: defaults to label, accepts label|chat, rejects anything else', () => {
+  assert.equal(DEFAULTS.owner_approval, 'label');
+  assert.equal(validateConfig(minimal()).config.owner_approval, 'label');
+  assert.equal(validateConfig({ ...minimal(), owner_approval: 'chat' }).config.owner_approval, 'chat');
+  assert.equal(validateConfig({ ...minimal(), owner_approval: 'label' }).ok, true);
+  for (const bad of ['yolo', 'Chat', '', null, true, ['chat']]) {
+    const r = validateConfig({ ...minimal(), owner_approval: bad });
+    assert.equal(r.ok, false, JSON.stringify(bad));
+    assert.ok(has(r, 'owner_approval must be label|chat'), JSON.stringify(bad));
+  }
+});
+
 test('merge.command without {sha} is rejected (and without {pr})', () => {
   const noSha = validateConfig({ ...minimal(), merge: { command: 'gh pr merge {pr} --squash' } });
   assert.equal(noSha.ok, false);
