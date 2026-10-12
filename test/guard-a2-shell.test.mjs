@@ -515,7 +515,7 @@ test('S4b: a name set from a maybe-changed name is changed too (namerefs, read, 
 // Why: `cd $D` (D maybe-changed / unset / a substitution) may land in ~/.claude, so a relative write to one of its protected files is refused; other relative names stay allowed.
 test('S4b: a relative write to a protected name after a cd into an unknown directory is refused', () => {
   const fs = fakeFs(PROJ, { 'dyn.sh': 'F=$(pick)', 'ok.sh': 'echo ok', 'w.sh': 'echo x > settings.json', 'n.sh': 'echo hi' }, DIRS);
-  const cds = ['source $X; cd $D', 'D=/tmp; source $X; cd $D', 'cd $UNSET', 'cd "$UNSET/sub"', 'cd $(pick)', 'cd `pick`', 'cd -', 'source dyn.sh; cd $F', 'pushd $(pick)', 'cd ${!N}'];
+  const cds = ['source $X; cd $D', 'D=/tmp; source $X; cd $D', 'cd $UNSET', 'cd "$UNSET/sub"', 'cd $(pick)', 'cd `pick`', 'cd -', 'source dyn.sh; cd $F', 'pushd $(pick)', 'cd ${!N}', 'cd ~/.cl*', 'cd ~/.{claude,x}', 'cd ~/.claude/pi?eline'];
   for (const cd of cds) {
     for (const w of ['echo x > settings.json', 'echo x >> ./settings.json', 'cp ok.sh settings.json', 'tee settings.json < ok.sh', 'mv ok.sh agents/judge.md', 'echo x > skills/ship/SKILL.md', 'echo x > pipeline/hooks/guard-git.mjs', 'sed -i s/a/b/ settings.json', 'rm -rf pipeline',
       // (the name comes from the source, the URL or the archive: the written path does not spell it)
@@ -533,6 +533,8 @@ test('S4b: a relative write to a protected name after a cd into an unknown direc
       assert.equal(files(`${cd} && ${w}`, fs).decision, 'allow', `${cd} && ${w}`);
     }
   }
+  // (a brace list in a redirection target is several targets, also in a known protected directory)
+  for (const c of ['cd ~/.claude && echo x > settings.{json,x}', 'echo x > ~/.claude/settings.{json,x}']) assert.equal(files(c, fs).decision, 'deny', c);
   // (a known directory keeps relative writes to ordinary and protected-looking names alike, as before)
   for (const c of ['cd sub && echo x > settings.json', 'D=sub; cd $D && cp ok.sh settings.json', 'cd ~ && echo x > notes.txt']) assert.equal(files(c, fs).decision, 'allow', c);
 });

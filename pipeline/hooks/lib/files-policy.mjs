@@ -1585,7 +1585,9 @@ function evaluateBashForFilesFrame(command, opts) {
       const cn = baseOf(c.argv[0] ?? '');
       if (!CD_CMDS.has(cn)) return false;
       const t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
+      if (cn === 'cd' && c.argv.slice(1).filter((x) => !x.startsWith('-')).length > 1) return true; // (a brace list the parser split, `cd ~/.{claude,x}`; zsh `cd old new` rewrites the directory)
       if (t === undefined) return cn === 'popd' || cn === 'pushd' || c.argv.slice(1).includes('-'); // (a bare cd goes home; popd / a bare pushd go to a directory the stack holds)
+      if (/[*?[{]/.test(expandRefs(t, ctx))) return true; // (a glob or a brace list can spell ~/.claude: `cd ~/.cl*`)
       if (/[`$(]/.test(expandRefs(t, ctx)) || /\$\{!/.test(t) || /[`]|\$\(/.test(t)) return true;
       return [...t.matchAll(/\$\{?(\w+)/g)].some((x) => unknownName(x[1]));
     });
@@ -1803,11 +1805,13 @@ function evaluateBashForFilesFrame(command, opts) {
   for (const c of cmds) {
     for (const r of c.redirects ?? []) {
       if (!WRITE_OPS.has(r.op) || typeof r.target !== 'string' || !r.target || r.target.startsWith('&') || r.target === '/dev/null') continue;
-      const target = r.target;
+      // (a brace list is several targets: `> settings.{json,x}`)
+      for (const target of [r.target, ...braceExpand(expandRefs(r.target, ctx), ctx).split(/\s+/).filter((x) => x && x !== r.target)]) {
       const e = expandRefs(target, ctx);
       const abs = isAbs(e) ? [posix.normalize(e)] : dirs.map((d) => posix.join(d, e));
       const viaLink = abs.some((p) => !/[*?[]/.test(p) && (ctx.hit(realResolve(p, ctx.api)) || ctx.hitInode(p)));
       if (m.rawHit(target, dirs) || m.pathHit(target, dirs, true) || viaLink) return deny(`the command redirects output to ${target}, which is a protected pipeline file or the directory that holds it (${PROTECTED_MSG})`);
+      }
     }
   }
 
