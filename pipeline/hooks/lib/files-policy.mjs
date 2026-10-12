@@ -19,7 +19,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
 import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf } from './shell-parse.mjs';
-import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg } from './line-writes.mjs';
+import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure } from './line-writes.mjs';
 import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
 
 const posix = path.posix;
@@ -658,8 +658,8 @@ function sedReadOnly(args) {
   return !args.some((a) => a.startsWith('-') && inPlaceFlag(a)) && !sedArgsUnsafe(args);
 }
 
-function awkReadOnly(args) {
-  return !args.some((a) => (a.startsWith('-') ? /^-[A-Za-z]*[ifE]/.test(a) || /^--(?:include|file|exec|load)/.test(a) : /[>|]|\bsystem\s*\(/.test(a)));
+function awkReadOnly(args, env) {
+  return awkArgsPure(args, env); // (one reading of awk's options, shared with line-writes)
 }
 
 function gitReadOnly(args) {
@@ -715,7 +715,7 @@ function isReadOnly(cmd, ctx) {
   if (name === 'git') return gitReadOnly(args);
   if (name === 'jq') return !args.some((a) => /^-[A-Za-z]*i/.test(a) || a === '--in-place');
   if (name === 'sed' || name === 'gsed') return sedReadOnly(args);
-  if (name === 'awk' || name === 'gawk' || name === 'mawk' || name === 'nawk') return awkReadOnly(args);
+  if (name === 'awk' || name === 'gawk' || name === 'mawk' || name === 'nawk') return awkReadOnly(args, cmd.env);
   if (name === 'sort') return !args.some((a) => /^-[A-Za-z]*o/.test(a) || a.startsWith('--output') || a.startsWith('--compress-program'));
   if (name === 'tree') return !args.some((a) => /^-[A-Za-z]*o/.test(a) || a.startsWith('--output'));
   if (name === 'xxd') return !args.includes('-r') && positional(args).length <= 1;

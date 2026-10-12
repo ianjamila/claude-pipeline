@@ -32,14 +32,17 @@ export const inFlow = (from, i) => from >= 0 && i >= from;
 const SIMPLE_ESCAPES = { n: '\n', t: '\t', r: '\r', a: '\x07', b: '\b', f: '\f', v: '\v', e: '\x1b', E: '\x1b', '\\': '\\', '"': '"', "'": "'" };
 const cp = (n) => { try { return String.fromCodePoint(n); } catch { return null; } };
 
-// Reads the backslash escapes of printf / echo -e. mode: 'printf' (\NNN octal, 1-3 digits), 'echo' (\0NNN: a 0 and up to 3 digits, the bash / sh form).
+// Reads the backslash escapes of printf / echo -e. mode: 'printf' (\NNN octal, 1-3 digits: `\0120` is `\012` and a 0), 'echo' (\0NNN: a 0 and up to 3 digits, the bash / sh form).
 // Every escape that can be read is read (\c stops the output there); `bad` is set when one cannot be read exactly (an unknown \X is kept or dropped
-// depending on the shell), the text keeps it as written.
-const ESCAPE = /\\(?:x([0-9a-fA-F]{1,2})|u([0-9a-fA-F]{1,4})|U([0-9a-fA-F]{1,8})|(0[0-7]{0,3}|[1-7][0-7]{0,2})|([\s\S]|$))/g;
-function decodeEscapes(s, mode) {
+// depending on the shell), the text keeps it as written. `amb`: a printf \0NNN, which some shells read as \0NNN and bash as \0NN + a digit: the text is the bash reading, not certain.
+const escapeRe = (octal) => new RegExp(`\\\\(?:x([0-9a-fA-F]{1,2})|u([0-9a-fA-F]{1,4})|U([0-9a-fA-F]{1,8})|(${octal})|([\\s\\S]|$))`, 'g');
+const ESCAPES = { printf: escapeRe('[0-7]{1,3}'), echo: escapeRe('0[0-7]{0,3}|[1-7][0-7]{0,2}') };
+export function decodeEscapes(s, mode) {
   let out = '';
   let bad = false;
+  let amb = false;
   let last = 0;
+  const ESCAPE = ESCAPES[mode];
   ESCAPE.lastIndex = 0;
   for (let m = ESCAPE.exec(s); m; m = ESCAPE.exec(s)) {
     out += s.slice(last, m.index);
@@ -50,16 +53,15 @@ function decodeEscapes(s, mode) {
       const ch = cp(parseInt(u ?? U, 16));
       if (ch === null) { bad = true; out += whole; } else out += ch;
     } else if (o !== undefined) {
-      if (mode !== 'echo') out += String.fromCharCode(parseInt(o, 8) & 255);
-      else if (o[0] === '0') out += String.fromCharCode(parseInt(o.slice(1) || '0', 8) & 255);
+      if (mode !== 'echo') { out += String.fromCharCode(parseInt(o, 8) & 255); if (o.length === 3 && o[0] === '0' && /[0-7]/.test(s[ESCAPE.lastIndex] ?? '')) amb = true; } else if (o[0] === '0') out += String.fromCharCode(parseInt(o.slice(1) || '0', 8) & 255);
       else out += whole; // echo -e does not read \NNN: kept as written (the printf reading is judged too)
-    } else if (c === 'c') return { text: out, bad, cut: true }; // stops the output
+    } else if (c === 'c') return { text: out, bad, amb, cut: true }; // stops the output
     else if (c !== undefined && SIMPLE_ESCAPES[c] !== undefined) out += SIMPLE_ESCAPES[c];
     else { bad = true; out += whole; } // an unknown \X, a trailing backslash
   }
-  return { text: out + s.slice(last), bad };
+  return { text: out + s.slice(last), bad, amb };
 }
-const unescapeText = (s, mode) => { const r = decodeEscapes(s, mode); return r.bad || r.cut ? null : r.text; };
+const unescapeText = (s, mode) => { const r = decodeEscapes(s, mode); return r.bad || r.cut || r.amb ? null : r.text; };
 
 // What `printf FORMAT ARG...` prints, when it is certain: only %s and %% conversions (no flag, width or precision: %.4s truncates, %c, %d and %b
 // compute) and escapes read exactly; the format is reused until the arguments are used up. '' for -v (assigns a variable, prints nothing).
@@ -325,6 +327,13 @@ function stdinItems(cmd) {
   return withParts(dedupe(items), [...partsOfStream(x), ...(unknown && !x.computed.length && !x.dyn ? [[{ unknown: true }]] : [])]);
 }
 
+// cat with no option at all (-u is ignored, -- and - are operands) prints its files as they are; every other reader and every other cat option changes the text
+const isExactCat = (name, argv) => {
+  if (name !== 'cat') return false;
+  const dd = argv.indexOf('--', 1);
+  return argv.slice(1, dd < 0 ? undefined : dd).every((a) => a === '-u' || a === '-' || !a.startsWith('-'));
+};
+
 // What a command prints on stdout, for `> F`: known for echo / printf / the readers (cat ...) / `:`; anything else is unknown.
 function stdoutItems(cmd) {
   const argv = cmd.argv;
@@ -334,7 +343,7 @@ function stdoutItems(cmd) {
   if (!s) { // no stream information (never "nothing written"): the text it prints is unknown, and every file it could be reading is a source
     const names = argv.slice(1).filter((a) => !a.startsWith('-') && a !== '');
     const own = name === 'echo' ? textItems(echoTexts(argv).texts) : [];
-    return withRedirectedInput(cmd, [{ unknown: true }, ...own, ...names.map((file) => ({ file }))]);
+    return withRedirectedInput(cmd, [{ unknown: true }, ...own, ...names.map((w) => (isExactCat(name, argv) ? { file: w } : { scan: w }))]);
   }
   const items = [];
   const fromStream = (x) => {
@@ -349,6 +358,10 @@ function stdoutItems(cmd) {
     else items.push({ text: pt });
     fromStream(s.out); // what a command substitution in the arguments prints
   } else if (['cat', 'tac', 'head', 'tail', 'less', 'more', 'bat', 'batcat'].includes(name)) {
+    if (!isExactCat(name, argv)) { // Why: tac reorders, head / tail -c cut ("…main-x" -> "…main"), cat -A / -n add text, less / bat decorate: the file is not the text, so it is scanned and the text is unknown
+      for (const x of [s.out, s.stdin]) items.push(...x.files.map((scan) => ({ scan })), ...x.computed.map((scan) => ({ scan })));
+      return dedupe([{ unknown: true }, ...items]);
+    }
     fromStream(s.out);
     fromStream(s.stdin);
     const stdinUnknown = s.stdin.fed && !s.stdin.texts.length && !s.stdin.files.length && !s.stdin.computed.length;
@@ -381,7 +394,7 @@ function redirectRecords(cmd, idx) {
 const urlBase = (u) => u.replace(/[?#].*$/, '').replace(/\/+$/, '').split('/').pop();
 
 // The records of the files a command writes by its arguments, or null when it is not a writer we model.
-function argRecords(cmd, name, idx) {
+function argRecords(cmd, name, idx, lineEnv = {}) {
   const args = cmd.argv.slice(1);
   const unknown = (dest, extra = {}) => ({ idx, dest, items: UNKNOWN, ...extra });
   if (COPY_STRICT[name] || COPY_VALUE[name] || (name === 'git' && gitSub(args) === 'mv')) {
@@ -434,9 +447,20 @@ function argRecords(cmd, name, idx) {
   if (name === 'dd') {
     const ofs = args.filter((a) => a.startsWith('of=')).map((a) => a.slice(3)); // (a repeated if= / of=: every one counts)
     const ins = args.filter((a) => a.startsWith('if=')).map((a) => a.slice(3));
-    const append = args.some((a) => /^conv=.*notrunc/.test(a) || /^oflag=.*append/.test(a));
-    const items = ins.length ? ins.map((file) => ({ file })) : stdinItems(cmd);
-    return ofs.map((of) => ({ idx, dest: of, items, parts: items.parts, append }));
+    // Why: bs= count= skip= seek= cut the input, conv=lcase / ucase / swab / sync / block change it ("…main-x" with count=1 bs=20 is "…main"): dd is an exact copy only with if= of= status= conv=notrunc oflag=append
+    const valuesOf = (key) => args.filter((a) => a.startsWith(`${key}=`)).flatMap((a) => a.slice(key.length + 1).split(','));
+    const plain = args.every((a) => /^(?:if|of|status)=/.test(a) || (/^conv=/.test(a) && valuesOf('conv').every((v) => v === 'notrunc')) || (/^oflag=/.test(a) && valuesOf('oflag').every((v) => v === 'append')));
+    const append = valuesOf('oflag').includes('append');
+    const notrunc = valuesOf('conv').includes('notrunc');
+    // conv=notrunc without append writes over the start of the old file: new text + the old tail, neither an append nor a replacement
+    const edit = notrunc && !append;
+    const exact = plain && !edit;
+    if (exact) {
+      const items = ins.length ? ins.map((file) => ({ file })) : stdinItems(cmd);
+      return ofs.map((of) => ({ idx, dest: of, items, parts: items.parts, append }));
+    }
+    const from = ins.length ? ins.map((scan) => ({ scan })) : stdinItems(cmd).flatMap((i) => (i.file !== undefined ? [{ scan: i.file }] : i.scan !== undefined || i.unknown ? [i] : []));
+    return ofs.map((of) => ({ idx, dest: of, items: dedupe([...from, { unknown: true }]), append, ...(edit ? { edit: true } : {}) }));
   }
   if (name === 'curl') return curlRecords(args, idx, cmd.env);
   if (name === 'wget') {
@@ -449,13 +473,18 @@ function argRecords(cmd, name, idx) {
     const recursive = hasOpt(opts, 'r', 'recursive', 'm', 'mirror', 'p', 'page-requisites');
     // Why: a startup file (-e, --config, WGETRC), a name taken from the response / a list / a base (--content-disposition, -i, -B), a renamed (-E, --backups) or re-rooted (-x, --protocol-directories, a
     // recursive run) file, a WARC archive: the file written is not the one the URL says
-    const odd = hasOpt(opts, 'e', 'execute', 'config', 'warc-file', 'E', 'adjust-extension', 'backups', 'x', 'force-directories', 'protocol-directories', 'B', 'base', 'i', 'input-file', 'input-metalink', 'content-disposition', 'trust-server-names')
+    const odd = hasOpt(opts, 'e', 'execute', 'config', 'warc-file', 'E', 'adjust-extension', 'backups', 'x', 'force-directories', 'protocol-directories', 'B', 'base', 'i', 'input-file', 'input-metalink', 'content-disposition', 'trust-server-names', 'restrict-file-names', 'local-encoding', 'remote-encoding', 'iri')
       || (recursive && !noDirs) || Object.keys(cmd.env ?? {}).some((k) => RC_ENV.test(k));
     for (const lf of [...optValues(opts, 'o', 'output-file'), ...optValues(opts, 'a', 'append-output'), ...optValues(opts, 'save-cookies'), ...optValues(opts, 'rejected-log'), ...optValues(opts, 'hsts-file')]) if (lf) out.push(unknown(lf));
     if (os.length) for (const o of os) out.push(unknown(o));
     else for (const u of pos) out.push(unknown(dir ? `${dir.replace(/\/+$/, '')}/${urlBase(u) || 'index.html'}` : urlBase(u) || 'index.html'));
     if (recursive) out.push(unknown(dir || '.', { subtree: true }));
     return orAnywhere(out, idx, odd);
+  }
+  if (AWK_NAMES.has(name)) { // gawk -i inplace: every file operand is edited in place
+    const r = awkScan(args, { ...cmd.env, ...lineEnv });
+    if (!r.inPlace) return null;
+    return Object.assign(r.files.map((dest) => unknown(dest, { edit: true })), r.other ? { unmodelled: true } : {});
   }
   if (name === 'sed' || name === 'gsed' || name === 'perl' || name === 'ruby') {
     const isSed = name === 'sed' || name === 'gsed';
@@ -738,7 +767,68 @@ export function sedWriteTargets(args) {
   return [...new Set(out.filter(Boolean))];
 }
 
-function isPure(cmd, name) {
+// awk: its arguments read as gawk's getopt_long does (a long option may be a unique prefix). Pure (read-only) is an allowlist: -F / -v / -e (program text, scanned) / harmless switches. A program (or --source value) that
+// writes, pipes, runs (system) or pulls code in (@include / @load), a program FILE (-f / -E, not read here), -i / --include / -l / --load / -W and every unknown or ambiguous option is not pure.
+// `inPlace`: gawk's inplace library (-i inplace, --include inplace, @include "inplace") rewrites every file operand; `other`: not pure for a reason beyond the edit (any include may be a ./inplace.awk, see below).
+const AWK_NAMES = new Set(['awk', 'gawk', 'mawk', 'nawk']);
+const AWK_LONG = {
+  value: ['assign', 'field-separator'], source: ['source'], include: ['include'], code: ['exec', 'file', 'load'],
+  optional: ['debug', 'dump-variables', 'gen-pot', 'pretty-print', 'profile'],
+  switch: ['bignum', 'characters-as-bytes', 'copyright', 'csv', 'help', 'lint', 'lint-old', 'no-optimize', 'non-decimal-data', 'optimize', 'posix', 're-interval', 'sandbox', 'traditional', 'use-lc-numeric', 'version'],
+};
+const AWK_PROGRAM_CODE = /[>|]|\bsystem\s*\(|@(?:include|load|namespace)\b/;
+// Why: only the bare names `inplace` / `inplace.awk` are gawk's own library; a path (-i /tmp/x/inplace.awk) is anyone's code. gawk's default AWKPATH starts with `.`, so even a bare name may load ./inplace.awk (a file the
+// line writes): every include is still an in-place edit of the operands, but also code we cannot place (`other`: unmodelled). AWKPATH / AWKLIBPATH set: the same.
+const AWK_INPLACE_INCLUDE = /@include\s*(["'])inplace(?:\.awk)?\1/g;
+const isInplaceLib = (v) => /^inplace(?:\.awk)?$/.test(v);
+function awkScan(args, env = {}) {
+  const r = { impure: false, other: false, inPlace: false, files: [] };
+  const libPath = Object.keys(env ?? {}).some((k) => /^AWK(?:LIB)?PATH$/.test(k));
+  const pos = [];
+  let progOpt = false;
+  const bad = () => { r.impure = true; r.other = true; };
+  const program = (t) => {
+    const stripped = t.replace(AWK_INPLACE_INCLUDE, () => { r.inPlace = true; bad(); return ''; });
+    if (AWK_PROGRAM_CODE.test(stripped)) bad();
+  };
+  const all = Object.values(AWK_LONG).flat();
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--') { pos.push(...args.slice(i + 1)); break; }
+    if (a.startsWith('--')) {
+      const eq = a.indexOf('=');
+      const nm = eq > 0 ? a.slice(2, eq) : a.slice(2);
+      const full = all.includes(nm) ? nm : (() => { const m = all.filter((x) => x.startsWith(nm)); return nm !== '' && m.length === 1 ? m[0] : null; })();
+      if (full === null) { bad(); continue; }
+      const val = () => (eq > 0 ? a.slice(eq + 1) : (args[++i] ?? ''));
+      if (AWK_LONG.value.includes(full)) val();
+      else if (full === 'source') { progOpt = true; program(val()); } else if (full === 'include') { if (isInplaceLib(val())) r.inPlace = true; bad(); } else if (AWK_LONG.code.includes(full)) { progOpt = true; val(); bad(); } else if (AWK_LONG.optional.includes(full)) bad();
+      else if (eq > 0 && !['lint', 'optimize'].includes(full)) bad(); // (a switch given a value: not a form we know)
+      continue;
+    }
+    if (a.length > 1 && a[0] === '-') {
+      for (let k = 1; k < a.length; k++) {
+        const ch = a[k];
+        const rest = a.slice(k + 1);
+        const val = () => (rest !== '' ? rest : (args[++i] ?? ''));
+        if (ch === 'F' || ch === 'v') { val(); break; }
+        if (ch === 'e') { progOpt = true; program(val()); break; }
+        if (ch === 'i') { if (isInplaceLib(val())) r.inPlace = true; bad(); break; }
+        if (ch === 'f' || ch === 'E') { progOpt = true; val(); bad(); break; }
+        if ('lW'.includes(ch)) { val(); bad(); break; }
+        if (!'bcCMnNOPrsStVh'.includes(ch)) { bad(); break; } // (-d -D -o -p -g -L write or run, and so does anything we do not know)
+      }
+      continue;
+    }
+    pos.push(a);
+  }
+  if (!progOpt) { if (pos.length) program(pos[0]); r.files = pos.slice(1); } else r.files = pos;
+  if (libPath) bad();
+  return r;
+}
+export const awkArgsPure = (args, env = {}) => !awkScan(args, env).impure;
+
+function isPure(cmd, name, lineEnv = {}) {
   const args = cmd.argv.slice(1);
   if (!cmd.argv.length) return true; // a bare assignment / redirect
   if (name === 'git') {
@@ -747,7 +837,7 @@ function isPure(cmd, name) {
   }
   if (name === 'gh') return !args.some((a) => /^(?:download|checkout|clone)$/.test(a) || OUTPUT_LONG.test(a));
   if (name === 'sed' || name === 'gsed') return !args.some((a) => sedInPlaceArg(a) || OUTPUT_LONG.test(a)) && !sedArgsUnsafe(args);
-  if (['awk', 'gawk', 'mawk', 'nawk'].includes(name)) return !args.some((a) => (a.startsWith('-') ? /^-[A-Za-z]*[ifE]/.test(a) || OUTPUT_LONG.test(a) : /[>|]|\bsystem\s*\(/.test(a)));
+  if (AWK_NAMES.has(name)) return awkArgsPure(args, { ...cmd.env, ...lineEnv });
   if (name === 'find') return !args.some((a) => /^-(?:delete|exec|execdir|ok|okdir|fprint0?|fprintf|fls)$/.test(a));
   if (name === 'xxd') return !args.includes('-r') && args.filter((a) => !a.startsWith('-')).length <= 1;
   if (name === 'uniq') return args.filter((a) => !a.startsWith('-')).length <= 1;
@@ -762,11 +852,13 @@ function isPure(cmd, name) {
 export function writesOf(cmds) {
   const recs = [];
   const unmodelled = new Set();
+  // Why: `export AWKPATH=d; awk -i inplace ...`: a variable set (or exported) by any command of the line may be in awk's environment
+  const lineEnv = cmds.some((c) => Object.keys(c.env ?? {}).some((k) => /^AWK(?:LIB)?PATH$/.test(k)) || c.argv.some((a) => /^AWK(?:LIB)?PATH(?:=|$)/.test(a))) ? { AWKPATH: '' } : {};
   cmds.forEach((cmd, idx) => {
     recs.push(...redirectRecords(cmd, idx));
     if (!cmd.argv.length) return;
     const name = commandName(cmd.argv[0]);
-    const mine = argRecords(cmd, name, idx);
+    const mine = argRecords(cmd, name, idx, lineEnv);
     if (mine) recs.push(...mine);
     const inline = INLINE_RUNNERS[name];
     if (inline) {
@@ -778,7 +870,7 @@ export function writesOf(cmds) {
     }
     // a program the parser does not unwrap (strace, chroot, nsenter, a wrapper we have never seen) that is handed a writer: the writer's own writes, and a write to
     // any file (the wrapper may have changed the directory or the root) with unknown content
-    if (!mine && !isPure(cmd, name)) {
+    if (!mine && !isPure(cmd, name, lineEnv)) {
       const at = cmd.argv.findIndex((w, i) => i > 0 && WRITER_NAMES.has(commandName(w)));
       if (at > 0) {
         const inner = { ...cmd, argv: cmd.argv.slice(at) };
@@ -791,7 +883,7 @@ export function writesOf(cmds) {
     if ((name === 'sed' || name === 'gsed') && (sedPrograms(cmd.argv.slice(1)).file || sedPrograms(cmd.argv.slice(1)).progs.some((p) => sedScan(p).runs))) unmodelled.add(idx);
     const sub = name === 'git' ? gitSub(cmd.argv.slice(1)) : '';
     const modelled = mine && !mine.unmodelled && !(name === 'git' && GIT_TREE.has(sub) && !['clone', 'worktree', 'mv'].includes(sub));
-    if (!modelled && !isPure(cmd, name)) unmodelled.add(idx);
+    if (!modelled && !isPure(cmd, name, lineEnv)) unmodelled.add(idx);
   });
   return { recs, unmodelled };
 }

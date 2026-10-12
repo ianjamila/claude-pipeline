@@ -13,7 +13,7 @@ import { resolve, dirname, basename } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { simpleCommands } from '../pipeline/hooks/lib/shell-parse.mjs';
-import { writesOf, printfText, flowStart, namesFile, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg } from '../pipeline/hooks/lib/line-writes.mjs';
+import { writesOf, printfText, flowStart, namesFile, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, decodeEscapes } from '../pipeline/hooks/lib/line-writes.mjs';
 
 function fakeFs(root, files, dirs = []) {
   const abs = (p) => resolve(root, p);
@@ -60,7 +60,7 @@ const aliasReal = (root) => {
   };
 };
 function run(line, spec, alias = false) {
-  const mk = (bad, ok) => Object.fromEntries(Object.entries(spec).map(([k, v]) => [k, v === 'bad' ? bad : v === 'ok' ? ok : v === 'bad1' ? bad.slice(0, 8) : v === 'bad2' ? bad.slice(8) : v === 'rot' ? bad.slice(8) + '\n' + bad.slice(0, 8) : v]));
+  const mk = (bad, ok) => Object.fromEntries(Object.entries(spec).map(([k, v]) => [k, v === 'bad' ? bad : v === 'ok' ? ok : v === 'bad1' ? bad.slice(0, 8) : v === 'bad2' ? bad.slice(8) : v === 'rot' ? bad.slice(8) + '\n' + bad.slice(0, 8) : v === 'badx' ? `${bad}-x` : v === 'tacd' ? `${bad.slice(bad.lastIndexOf(' ') + 1)}\n${bad.slice(0, bad.lastIndexOf(' ') + 1)}\\` : v]));
   const g = typeof line === 'string' ? line : line(BAD_GIT, MID_GIT, CALM_GIT);
   const f = typeof line === 'string' ? line : line(BAD_FILES, MID_FILES, CALM_FILES);
   return {
@@ -983,4 +983,179 @@ test('L2: the clone / worktree-add narrowing applies only when the options and o
   assert.equal(gitOnly('git worktree add --bogus sub; MID; bash /work/repo/ok.sh'), 'deny');
   assert.equal(gitOnly('git worktree add -b x sub origin/main extra; MID; bash /work/repo/ok.sh'), 'deny');
   assert.equal(gitOnly('git worktree add --no sub; MID; bash /work/repo/ok.sh'), 'deny');
+});
+
+// ---- L2b: parsing exactness ---------------------------------------------------------------------------------------------
+
+test('L2b: awk long options, -e / -i / -E / -l / -W, @include / @load are not read-only; -F / -v / --assign / --field-separator are', () => {
+  // Why: `awk --source '...system(...)...'`, `--exec FILE`, `--include`, `--load`, `-W exec=...` and `@include` run or write things the program scan never saw. Pure = an allowlist of argv shapes; --source / -e values
+  // are scanned like the program; abbreviations of a long option are resolved (gawk takes a unique prefix), an unknown or ambiguous one is not pure.
+  const pure = (l) => { const c = simpleCommands(l)[0]; return awkArgsPure(c.argv.slice(1), c.env); };
+  for (const l of ['awk -F: \'{print $1}\' f', 'awk -F : -v x=1 \'{print x}\' f', 'awk --field-separator=: \'{print}\' f', 'awk --assign x=1 \'{print}\' f', 'awk --assign=x=1 \'{print}\' f', "awk --source '{print $1}' f",
+    "awk -e '{print $1}' f", "awk -vx=1 -F, '{print}' f", "awk --sou '{print}' f", "awk -v 'x=a|b' '{print x}' f", 'awk --posix \'{print}\' f', 'awk --version', "awk -- '{print}' f", "awk -nF: '{print}' f", "awk '{print}' -"]) {
+    assert.equal(pure(l), true, l);
+  }
+  for (const l of ["awk --source 'BEGIN{system(\"x\")}' f", "awk --source='{print > \"n.sh\"}' f", "awk -e 'BEGIN{system(\"x\")}'", "awk -e '{print | \"sh\"}' f", 'awk --exec p.awk f', 'awk --exe p.awk f', 'awk -E p.awk f', 'awk --include lib.awk \'{print}\'', 'awk --include=lib.awk \'{print}\'',
+    "awk -i lib.awk '{print}'", "awk -ilib.awk '{print}'", "awk -i inplace '{print}' f", "awk --load ext '{print}'", "awk -l ext '{print}'", "awk -W exec=p.awk f", "awk -Wexec=p.awk f", "awk -W version", "awk '@include \"x\"; {print}' f", "awk '@load \"filefuncs\"' f",
+    "awk '@namespace \"x\"; {print}' f", "awk -i /tmp/x/inplace.awk '{print}' f", "awk --include=./inplace.awk '{print}' f", "awk --include /tmp/inplace '{print}' f", "awk '@include \"/tmp/x/inplace\"; {print}' f", "awk '@include \"d/inplace.awk\"; {print}' f", "AWKPATH=/tmp/x awk '{print}' f", "AWKLIBPATH=/tmp/x awk -F: '{print}' f", 'awk -f p.awk f', 'awk --file=p.awk f', 'awk --fil p.awk f', 'awk --bogus f', 'awk --l x f', 'awk --profile=p.out \'{print}\' f', 'awk --dump-variables \'{print}\' f', 'awk --pretty-print=p.awk \'{print}\' f', "awk 'BEGIN{system(\"x\")}'"]) {
+    assert.equal(pure(l), false, l);
+  }
+  // end to end: an unmodelled awk is a command that may have created any file
+  const un = (l) => writesOf(simpleCommands(l)).unmodelled.size;
+  assert.equal(un("awk --source 'BEGIN{system(\"x\")}' f"), 1);
+  assert.equal(un('awk --exec p.awk f'), 1);
+  assert.equal(un("awk '@include \"x\"; {print}' f"), 1);
+  assert.equal(un("awk -F: '{print $1}' f"), 0);
+  denyBoth((_, mid) => `awk --exec p.awk f; ${mid}; bash n.sh`);
+  denyBoth((_, mid) => `awk -W exec=p.awk f; ${mid}; bash n.sh`);
+  denyBoth((_, mid) => `awk -e '@load "x"' f; ${mid}; bash n.sh`);
+  allowBoth((_, _m, mid) => `awk -F: '{print $1}' ok.sh; ${mid}; bash n.sh`);
+  allowBoth((_, _m, mid) => `awk --assign x=1 --source '{print x}' ok.sh; ${mid}; bash ok.sh`);
+});
+
+test('L2b: files policy: awk is read-only by the same reading of its options (a long option, an abbreviation or -W hides code from the old regex)', () => {
+  const fs = fakeFs(PROJ, {}, DIRS);
+  const P = '~/.claude/settings.json';
+  for (const c of [`awk --source='BEGIN{system("x")}' ${P}`, `awk --sou='{print > "x"}' ${P}`, `awk -W exec=x.awk ${P}`, `awk --inc=inplace '{print}' ${P}`, `awk -i inplace '{gsub(/a/,"b")}1' ${P}`, `awk --exe x.awk ${P}`, `awk --bogus ${P}`, `AWKPATH=. awk '{print}' ${P}`]) {
+    assert.equal(files(c, fs).decision, 'deny', c);
+  }
+  for (const c of [`awk '{print $1}' ${P}`, `awk --source '{print $1}' ${P}`, `awk -F: -v x=1 '{print x}' ${P}`, `awk --assign x=1 '{print x}' ${P}`]) assert.equal(files(c, fs).decision, 'allow', c);
+});
+
+test('L2b: gawk -i inplace (--include inplace, @include "inplace") edits every file operand in place, like sed -i', () => {
+  // Why: `awk -i inplace '{gsub(/X/,"sh")}1' ok.sh; bash ok.sh` turns clean text into a command; the old file text is no longer the file
+  const gitFs = fakeFs(GIT_ROOT, { 'ok.sh': 'git puX origin main', 'other.sh': 'git status' }, DIRS);
+  const filesFs = fakeFs(PROJ, { 'ok.sh': 'echo x > ~/.claude/settXings.json', 'other.sh': 'echo hi' }, DIRS);
+  const prog = "'{gsub(/X/,\"sh\")}1'";
+  for (const head of [`awk -i inplace ${prog}`, `gawk -i inplace ${prog}`, `awk -iinplace ${prog}`, `awk --include=inplace ${prog}`, `awk --include inplace ${prog}`, `awk -i inplace.awk ${prog}`, `awk -F: -i inplace -v x=1 ${prog}`,
+    `awk -i inplace -e ${prog}`, `awk --inc inplace ${prog}`, `awk '@include "inplace"; {gsub(/X/,"sh")}1'`]) {
+    for (const tail of ['bash ok.sh', 'sh ok.sh && echo done', '. ./ok.sh']) {
+      const l = `${head} ok.sh; ${tail}`;
+      assert.match(git(l, gitFs).reason ?? 'allowed', /pieces/, l);
+      assert.match(files(l, filesFs).reason ?? 'allowed', /pieces/, l);
+    }
+  }
+  const dests = (l) => writesOf(simpleCommands(l)).recs.map((r) => [r.dest, r.edit === true]);
+  assert.deepEqual(dests(`awk -i inplace ${prog} a.sh b.sh`), [['a.sh', true], ['b.sh', true]]);
+  assert.deepEqual(dests(`awk -i inplace -f p.awk a.sh`), [['a.sh', true]]);
+  assert.deepEqual(dests(`awk -i inplace -e ${prog} a.sh`), [['a.sh', true]]);
+  // the nearest twins stay allowed: the edit is of another file, the script is not run, awk does not edit in place, a different include
+  for (const l of [`awk -i inplace ${prog} other.sh; bash ok.sh`, `awk -i inplace ${prog} ok.sh`, `awk ${prog} ok.sh | cat; bash ok.sh`, `awk -i inplace ${prog} ok.sh; bash other.sh`]) {
+    assert.equal(git(l, gitFs).decision, 'allow', l);
+    assert.equal(files(l, filesFs).decision, 'allow', l);
+  }
+  assert.deepEqual(dests(`awk -i lib.awk ${prog} a.sh`), []); // (another include: not an in-place edit, but not read-only either: unmodelled)
+  assert.equal(writesOf(simpleCommands(`awk -i lib.awk ${prog} a.sh`)).unmodelled.size, 1);
+  // Why: gawk's default AWKPATH starts with `.`, so even a bare `-i inplace` may load ./inplace.awk (an attacker file, or one the line writes): the edit records stay, the command is also unmodelled
+  for (const l of [`awk -i inplace ${prog} a.sh`, `awk --include=inplace ${prog} a.sh`, `awk -i inplace.awk ${prog} a.sh`, `awk '@include "inplace"; {gsub(/X/,"sh")}1' a.sh`]) {
+    assert.deepEqual(dests(l), [['a.sh', true]], l);
+    assert.equal(writesOf(simpleCommands(l)).unmodelled.size, 1, l);
+  }
+  denyBoth((_, mid) => `awk -i inplace ${prog} a.sh; ${mid}; bash n.sh`);
+  assert.equal(writesOf(simpleCommands(`awk -i inplace -f p.awk a.sh`)).unmodelled.size, 1); // (a program file we do not read may do more than edit)
+  // Why: only the bare names inplace / inplace.awk are gawk's library; a path is anyone's code, and AWKPATH / AWKLIBPATH decide where a bare name is found
+  for (const l of [`awk -i /tmp/x/inplace.awk ${prog} a.sh`, `awk --include=./inplace ${prog} a.sh`, `awk -i d/inplace.awk ${prog} a.sh`, `awk '@include "/tmp/x/inplace"; {print}' a.sh`]) {
+    assert.deepEqual(dests(l), [], l);
+    assert.equal(writesOf(simpleCommands(l)).unmodelled.size, 1, l);
+    denyBoth((_, mid) => `${l}; ${mid}; bash n.sh`);
+  }
+  for (const l of [`AWKPATH=/tmp/x awk -i inplace ${prog} a.sh`, `AWKLIBPATH=/tmp/x gawk -i inplace.awk ${prog} a.sh`, `export AWKPATH=/tmp/x; awk -i inplace ${prog} a.sh`]) {
+    assert.deepEqual(dests(l), [['a.sh', true]], l); // (still an in-place edit of a.sh ...)
+    assert.equal(writesOf(simpleCommands(l)).unmodelled.size, 1, l); // (... by code we cannot place)
+  }
+});
+
+test('L2b: wget --restrict-file-names / --local-encoding / --remote-encoding / --iri change the names of the files it writes: it may write anywhere', () => {
+  for (const o of ['--restrict-file-names=nocontrol', '--restrict-file-names=lowercase', '--local-encoding=UTF-8', '--remote-encoding=latin1', '--iri', '--no-iri']) {
+    const l = `wget ${o} http://h/f`;
+    assert.equal(writesOf(simpleCommands(l)).unmodelled.size, 1, l);
+    denyBoth((_, mid) => `${l}; ${mid}; bash n.sh`);
+    denyBoth((_, mid) => `${l}; ${mid}; bash ok.sh`);
+  }
+  allowBoth('wget -O n.sh --no-verbose http://h/f; bash ok.sh');
+});
+
+test('L2b: only option-less cat is an exact copy; tac / head / tail / less / more / bat and cat -n / -s / -A / -v / -T / -E print something else', () => {
+  // Why: `head -c N` cuts "…main-x" to "…main", `cat -A` appends $ to every line, `less` / `bat` decorate: the file is not the text. Their redirect target holds scan + unknown content, never the file as a copy.
+  const items = (l) => writesOf(simpleCommands(l)).recs.find((r) => r.dest === 'n.sh').items;
+  for (const l of ['cat f.sh > n.sh', 'cat -u f.sh > n.sh', 'cat -- f.sh > n.sh', 'cat -u -- f.sh > n.sh', 'cat < f.sh > n.sh', 'cat -- -n f.sh > n.sh', 'cat - < f.sh > n.sh']) assert.equal(items(l).some((i) => i.file === 'f.sh') && !items(l).some((i) => i.unknown), true, l);
+  for (const l of ['cat -n f.sh > n.sh', 'cat -s f.sh > n.sh', 'cat -A f.sh > n.sh', 'cat -v f.sh > n.sh', 'cat -T f.sh > n.sh', 'cat -E f.sh > n.sh', 'cat -b f.sh > n.sh', 'cat --number f.sh > n.sh', 'cat -un f.sh > n.sh', 'cat -n -- f.sh > n.sh',
+    'tac f.sh > n.sh', 'head -c 9 f.sh > n.sh', 'head f.sh > n.sh', 'tail -c 9 f.sh > n.sh', 'tail -n 2 f.sh > n.sh', 'less f.sh > n.sh', 'more f.sh > n.sh', 'bat f.sh > n.sh', 'batcat f.sh > n.sh', 'bat -p f.sh > n.sh']) {
+    const x = items(l);
+    assert.equal(x.some((i) => i.file !== undefined), false, `${l}: a copy`);
+    assert.equal(x.some((i) => i.scan === 'f.sh'), true, `${l}: no scan`);
+    assert.equal(x.some((i) => i.unknown), true, `${l}: not unknown`);
+  }
+  // without stream information the files it names are the same: a copy only for option-less cat, else a scan
+  const plain = (l) => simpleCommands(l).map((c) => ({ argv: c.argv, env: c.env, raw: c.raw, depth: c.depth, redirects: c.redirects, sep: c.sep }));
+  const pitems = (l) => writesOf(plain(l)).recs.find((r) => r.dest === 'n.sh').items;
+  assert.equal(pitems('cat f.sh > n.sh').some((i) => i.file === 'f.sh'), true);
+  for (const l of ['cat -n f.sh > n.sh', 'less f.sh > n.sh', 'head -c 9 f.sh > n.sh']) assert.deepEqual([pitems(l).some((i) => i.file === 'f.sh'), pitems(l).some((i) => i.scan === 'f.sh')], [false, true], l);
+  // end to end: hc.sh holds "<bad>-x" (not a guarded command as it is); the first N bytes are the guarded command
+  const spec = { ...SPEC, 'hc.sh': 'badx', 'tc.sh': 'tacd' };
+  allowBoth('cat hc.sh > n.sh; bash n.sh', spec);
+  allowBoth('cat -u hc.sh > n.sh; bash n.sh', spec);
+  allowBoth('cat -- hc.sh > n.sh; bash n.sh', spec);
+  denyBoth((bad) => `head -c ${bad.length} hc.sh > n.sh; bash n.sh`, spec);
+  denyBoth('cat -n hc.sh > n.sh; bash n.sh', spec);
+  denyBoth('cat -s hc.sh > n.sh; bash n.sh', spec);
+  denyBoth('cat -A hc.sh > n.sh; bash n.sh', spec);
+  denyBoth('cat -v hc.sh > n.sh; bash n.sh', spec);
+  denyBoth('less hc.sh > n.sh; bash n.sh', spec);
+  denyBoth('more hc.sh > n.sh; bash n.sh', spec);
+  denyBoth('bat hc.sh > n.sh; bash n.sh', spec);
+  denyBoth('tac tc.sh > n.sh; bash n.sh', spec);
+  denyBoth('tail -c 99 hc.sh > n.sh; bash n.sh', spec);
+});
+
+test('L2b: printf format octal is \\NNN (1-3 digits): "\\0120" is a newline then 0, and a \\0NNN form is ambiguous between shells (unknown); echo -e reads \\0NNN', () => {
+  // Why: `printf '#\0120;<guarded>' > n.sh` was read as '#P;<guarded>' (a comment), but printf prints '#', a newline, '0;<guarded>' : the guarded command runs
+  assert.equal(decodeEscapes('#\\0120;x', 'printf').text, '#\n0;x');
+  assert.equal(decodeEscapes('#\\0120;x', 'printf').amb, true);
+  assert.equal(decodeEscapes('\\012', 'printf').text, '\n');
+  assert.equal(decodeEscapes('\\012', 'printf').amb, false);
+  assert.equal(decodeEscapes('\\12', 'printf').text, '\n');
+  assert.equal(decodeEscapes('\\0', 'printf').text, '\0');
+  assert.equal(decodeEscapes('\\0012', 'printf').amb, true);
+  assert.equal(decodeEscapes('\\0120', 'echo').text, 'P');
+  assert.equal(decodeEscapes('\\012', 'echo').text, '\n');
+  assert.equal(printfText(['printf', '#\\0120;x']), null);
+  assert.equal(printfText(['printf', '#\\012;x']), '#\n;x');
+  assert.equal(printfText(['printf', '\\1011']), 'A1'); // (\NNN: three digits at most)
+  denyBoth((bad) => `printf '#\\0120;${bad}' > n.sh; bash n.sh`);
+  denyBoth((bad) => `printf '#\\012;${bad}' > n.sh; bash n.sh`);
+  denyBoth((bad) => `echo -e '#\\0120;${bad}' > n.sh; bash n.sh`);
+  denyBoth((bad) => `printf '%s\\0120;' '${bad}' > n.sh; bash n.sh`);
+  denyBoth('printf \'#\\0120;hello\' > n.sh; bash n.sh'); // (ambiguous between shells: like any printf text we cannot read exactly, a script written with it is refused)
+  allowBoth("printf 'echo hi\\n' > n.sh; bash n.sh");
+});
+
+test('L2b: dd is an exact copy only with if= / of= / status= / conv=notrunc / oflag=append; any other operand makes the input a scan + unknown content', () => {
+  // Why: bs= / count= / skip= / seek= cut the input, conv=lcase / ucase / swab / sync / block change it: "…main-x" with count=1 bs=20 is "…main"
+  const spec = { ...SPEC, 'hc.sh': 'badx' };
+  const items = (l) => writesOf(simpleCommands(l)).recs.find((r) => r.dest === 'n.sh').items;
+  for (const l of ['dd if=f.sh of=n.sh', 'dd if=f.sh of=n.sh status=none', 'dd status=progress if=f.sh of=n.sh', 'dd if=f.sh of=n.sh oflag=append conv=notrunc', 'dd if=f.sh of=n.sh status=none status=noxfer']) {
+    assert.equal(items(l).some((i) => i.file === 'f.sh') && !items(l).some((i) => i.unknown), true, l);
+  }
+  for (const l of ['dd if=f.sh of=n.sh bs=9 count=1', 'dd if=f.sh of=n.sh count=1', 'dd if=f.sh of=n.sh skip=1', 'dd if=f.sh of=n.sh seek=1', 'dd if=f.sh of=n.sh conv=lcase', 'dd if=f.sh of=n.sh conv=ucase', 'dd if=f.sh of=n.sh conv=swab', 'dd if=f.sh of=n.sh conv=sync', 'dd if=f.sh of=n.sh conv=notrunc,lcase',
+    'dd if=f.sh of=n.sh ibs=1', 'dd if=f.sh of=n.sh obs=1', 'dd if=f.sh of=n.sh cbs=1 conv=block', 'dd if=f.sh of=n.sh iflag=skip_bytes', 'dd if=f.sh of=n.sh oflag=seek_bytes', 'dd if=f.sh of=n.sh bogus=1', 'dd if=f.sh of=n.sh status=none bs=1', 'dd if=f.sh of=n.sh count=1 count=0']) {
+    assert.equal(items(l).some((i) => i.file !== undefined), false, `${l}: a copy`);
+    assert.equal(items(l).some((i) => i.scan === 'f.sh') && items(l).some((i) => i.unknown), true, `${l}: scan + unknown`);
+  }
+  // fed from stdin
+  assert.equal(items('cat f.sh | dd of=n.sh bs=9').some((i) => i.file !== undefined), false);
+  assert.equal(items('dd of=n.sh bs=9 < f.sh').some((i) => i.unknown), true);
+  assert.equal(items('dd of=n.sh < f.sh').some((i) => i.file === 'f.sh'), true);
+  allowBoth('dd if=hc.sh of=n.sh; bash n.sh', spec);
+  allowBoth('dd if=hc.sh of=n.sh status=none; bash n.sh', spec);
+  denyBoth((bad) => `dd if=hc.sh of=n.sh bs=${bad.length} count=1; bash n.sh`, spec);
+  denyBoth((bad) => `dd if=hc.sh of=n.sh count=1 bs=${bad.length}; bash n.sh`, spec);
+  denyBoth((bad) => `dd of=n.sh bs=${bad.length} count=1 < hc.sh; bash n.sh`, spec);
+  denyBoth('dd if=f.sh of=n.sh bs=9 status=none if=ok.sh; bash n.sh', spec); // (a repeated if=: every value counts)
+  denyBoth('dd if=ok.sh of=n.sh bs=9 if=f.sh; bash n.sh', spec);
+  // conv=notrunc alone writes over the start of the old file (new text + the old tail): not an append, not the new text alone
+  assert.equal(writesOf(simpleCommands('printf x | dd of=n.sh conv=notrunc')).recs[0].edit, true);
+  assert.equal(writesOf(simpleCommands('printf x | dd of=n.sh conv=notrunc oflag=append')).recs[0].append, true);
+  denyBoth((_, mid) => `cp ok.sh n.sh; printf x | dd of=n.sh conv=notrunc; ${mid}; bash n.sh`);
+  allowBoth('cp ok.sh n.sh; printf x | dd of=n.sh conv=notrunc oflag=append; bash n.sh');
 });
