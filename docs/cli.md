@@ -267,13 +267,39 @@ Exit: 0 dry run printed, or applied with nothing missing · 1 no admin rights / 
 
 ## resume
 
-list open PRs waiting for a cross-model review.
+find PRs a session can pick up, and plan where a stalled run resumes.
 
 ```
 pipeline resume list [--repo DIR]
+  -> {ok, prs[{number, title, headRefName, url, why}]}: open PRs labelled awaiting-review, plus open PRs whose run record
+     (written by this GitHub user) is readable and has no outcome yet (a run that stopped mid-way)
+pipeline resume plan --pr N [--repo DIR]
+  -> {ok, pr, title, url, prState, branch, base, liveHead, enter, reason, adopt, confirm, autoMerge, worktree, recordStatus, record,
+      events, local, mergeSha, notes[], warnings[]}; read-only (its one git write is the fetch of the PR head and base)
+     enter: closed | ended | observe-prod | not-resumable | local-work | decision | build | verify | review | followups | gate
+     adopt: no run record (the PR was not started by the pipeline); confirm: {host, step, minutesAgo, why} when another run may be live,
+     autoMerge: {armed, action: disarm} when an unattended auto-merge is queued, worktree: {action: reuse|add-existing-ref|add-from-remote|none, path?, then?}
+  exit 2 when the PR does not exist
 ```
 
-Exit: 0 · 3 GitHub (`gh`) unavailable.
+`list` shows what a session can pick up: PRs parked as `awaiting-review` and open PRs whose run record (written by this GitHub user) has no outcome, i.e. a run that stopped mid-way. `plan` reads the PR, its comments (run record, review state, events), the local branch and the worktrees holding it, and routes the resume by the pure rules in `pipeline/lib/resume-plan.mjs`:
+
+| `enter` | When |
+|---|---|
+| `closed` | closed without a merge |
+| `ended` | merged and nothing is left to watch |
+| `observe-prod` | merged, but the run stopped in `merge` / `prod-watch`, or a `rollback-intent` has no `rollback-result`: watch production from a detached worktree of `origin/<base>` at the merge commit; never roll back |
+| `not-resumable` | fork PR |
+| `local-work` | the local branch diverged from the PR, or a worktree holding it is dirty: the owner decides |
+| `decision` | `needs-human`; `reason` is our needs-human comment's first sentence |
+| `build` / `verify` | the record has tasks not done / no passing verify for the live head and the run had only reached build or verify |
+| `review` | no review state, an incomplete round, content changed since the last round, a round that is not clean, or `awaiting-review` |
+| `followups` | published follow-ups without an issue |
+| `gate` | everything else: a fresh gate, then the owner-merge stop (resume never merges) |
+
+No usable run record means `adopt: true`; a published review state is still honoured ("no run record" is not "no review state"). `confirm` is set when the heartbeat is from another host and under 90 minutes old, or a command is in flight inside its time budget: ask the owner before doing anything. `autoMerge` asks the skill to disarm an armed auto-merge that no live merge owns. `worktree.action` is `reuse` (a worktree already holds the branch), `add-existing-ref`, `add-from-remote` or `none`, with `then: ff-only` (local behind) or `push` (local ahead); a branch is never reset with `-B`.
+
+Exit: 0 · 2 usage / PR not found · 3 GitHub (`gh`) unavailable.
 
 ## review-complete
 
@@ -315,7 +341,8 @@ pipeline state show [--round R] [--accepted] [--disputed] [--needs-human] [--pr 
   -> {ok, recovered, source, count, items}; with --pr and no local state, rebuilds it from the PR triage comment
   with --pr and a local state: the published (triage comment) state is authoritative. Local is kept (source local) when it
   equals or strictly EXTENDS the published one; otherwise .review/ moves to .review/stale-<UTC time>/ (source quarantined,
-  quarantinedTo) and the published state is restored. source is local | published | quarantined
+  quarantinedTo) and the published state is restored. source is local | published | quarantined | local-unverified
+  (GitHub unreachable but a local state exists: served as is with a `warnings` entry, exit 0; with no local state exit 3)
 pipeline state discard-round --round R [--pr N] [--repo DIR]
   -> drop an unpublished, trailing round R from the local state and move .review/round-R/ into .review/stale-<UTC time>/;
      refused (exit 2) when the PR triage comment already holds round R
@@ -400,6 +427,6 @@ The spec table was written before the build; the CLI that shipped differs as fol
 | `triage-comment`, `summary` | `comment --kind triage|summary|needs-human|blocked|awaiting-review`; `summary` also posts the summary comment |
 | `preview-url` | `deploy url --sha SHA --environment ENV` (GitHub deployments only; no `preview.url_command`) |
 | `agent-log --line` (docs-only PR) | `agent-log queue --line` and `agent-log stage --pr N` (commit into the PR branch; the queue is flushed by `stage`) |
-| not listed | `artifacts push`, `followups create`, `hardstops`, `integrity`, `job start\|wait\|read`, `protect`, `resume list`, `review-complete`, `state show\|outcome\|mark-implemented\|record-followup\|set-outcome`, `triage settle\|light-lane`, `vendor`, `version` |
+| not listed | `artifacts push`, `followups create`, `hardstops`, `integrity`, `job start\|wait\|read`, `protect`, `resume list\|plan`, `review-complete`, `state show\|outcome\|mark-implemented\|record-followup\|set-outcome`, `triage settle\|light-lane`, `vendor`, `version` |
 | `risk` returns `files[]`, `stats` | `risk` returns `level, reasons, lightLane, changedLines, fileCount, hardStops, base, head, mergeBase` |
 | `prod-watch` rolls back with the rollback command | `prod-watch` runs `vercel rollback <known-good> --yes --timeout 3m` itself; `production.rollback.command` is documentation |
