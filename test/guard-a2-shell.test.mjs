@@ -374,8 +374,8 @@ test('S3: variables a sourced file sets are known (or unknown) for the rest of t
     'F=ok.sh; source cond.sh; bash $F', 'F=ok.sh; source dyn.sh; bash $F', 'F=ok.sh; source ev.sh; bash $F', 'F=ok.sh; source rd.sh; bash $F', 'F=ok.sh; source $Z; bash $F',
     'echo F=evil.sh > w.sh; F=ok.sh; source w.sh; bash $F',
   ]) assert.equal(files(c, fs).decision, 'deny', c);
-  // (a name the file sets to a run-time value only refuses a script it picks, like `F=$(cmd)` on the line)
-  assert.equal(files('source dyn.sh; cp ok.sh $F.bak', fs).decision, 'allow');
+  // (a name the file sets to a run-time value is unknown for a script it picks and for a write target alike, see the S4 test below; a reader may use it)
+  assert.equal(files('source dyn.sh; echo $F', fs).decision, 'allow');
   for (const c of [
     'F=evil.sh; source okset.sh; bash $F', 'source okset.sh; bash $F', 'source missing.sh; bash ok.sh', 'source cond.sh; echo hi', 'F=ok.sh; source set.sh; F=ok.sh; bash $F',
   ]) assert.equal(files(c, fs).decision, 'allow', c);
@@ -414,16 +414,73 @@ test('S3: a known data program fed a file is not a shell reading a script', () =
 
 // ---- S4 D: a name an unfollowable sourced file may have changed is unknown for write targets too -----------------------------
 
-test('S4: a write through a name a sourced file may have changed is refused when the rest of the path is a protected one (files-policy)', () => {
+test('S4: a write through a name a sourced file may have changed is refused whatever the rest of the path (files-policy)', () => {
   const fs = fakeFs(PROJ, { 'dyn.sh': 'F=$(pick)', 'ev.sh': 'eval "$X"', 'ok.sh': 'echo ok' }, DIRS);
   for (const c of [
     'D=/tmp; source $X; echo x > $D/settings.json', 'D=/tmp; source $X; cp ok.sh $D/settings.json', 'D=/tmp; source ev.sh; echo x > ${D}/settings.json', 'D=/tmp; source $X; tee $D/pipeline/hooks/x < ok.sh',
     'D=/tmp; source $X; echo x >> "$D/skills/ship/SKILL.md"', 'D=/tmp; . $X; echo x > $D/.claude/settings.json', 'source $X; echo x > $D/settings.json', 'F=a; source dyn.sh; echo x > $F/settings.json',
     'D=/tmp; source $X; sed -i s/a/b/ $D/agents/judge.md', 'D=/tmp; source $X; mv ok.sh $D/../settings.json',
+    // (the name may hold the protected path itself, its start, or be folded by `..`: no tail is matched, any use as a target is refused)
+    'D=/tmp; source $X; echo x > $D', 'D=/tmp; source $X; echo x > "$D"', 'D=/tmp; source $X; echo x > ${D}tings.json', 'D=/tmp; source $X; echo x > ${D}x', 'D=/tmp; source $X; cp ok.sh $D',
+    'D=/tmp; source $X; echo x > $D/a/../settings.json', 'D=/tmp; source $X; echo x > $D/./settings.json', 'D=/tmp; source $X; tee ${D}eline/hooks/x < ok.sh',
+    // (names are the line's own choice: none is exempt)
+    'MYPATH=/tmp; source $X; echo x > $MYPATH/settings.json', 'PATH2=/tmp; source $X; cp ok.sh $PATH2/settings.json', 'source $X; echo x > $MYPATH/settings.json',
+    'D=/tmp; source $X; echo x > $D/a.txt', 'D=/tmp; source $X; mkdir -p $D/build', 'source dyn.sh; cp ok.sh $F.bak', 'D=/tmp; source $X; FOO=$D/x tool',
+    // (a program or wrapper that writes through its arguments: only the script operand of a shell / interpreter / source is exempt)
+    'D=/tmp; source $X; node w.mjs $D/settings.json', 'D=/tmp; source $X; python3 w.py $D/settings.json', "D=/tmp; source $X; bash -c 'echo x > $D/settings.json'", 'D=/tmp; source $X; eval "echo x > $D/settings.json"',
+    'D=/tmp; source $X; exec cp ok.sh $D/settings.json', 'D=/tmp; source $X; env cp ok.sh $D/settings.json', 'D=/tmp; source $X; nice cp ok.sh $D/settings.json', 'D=/tmp; source $X; command cp ok.sh $D/settings.json',
+    'D=/tmp; source $X; sudo cp ok.sh $D/settings.json', 'D=/tmp; source $X; source ok.sh $D/settings.json', 'D=/tmp; source $X; xargs -I{} cp ok.sh $D/{}', 'D=/tmp; source $X; time cp ok.sh $D/settings.json', 'D=/tmp; source $X; MYPATH=$D/x tool',
   ]) assert.equal(files(c, fs).decision, 'deny', c);
-  // (PATH-only uses, readers, other targets, and a value the line sets again after the source are not writes to a protected path)
+  // (a reader, cd, a declaration, a path list's element, and a value the line sets again after the source are not write targets)
   for (const c of [
-    'D=/tmp; source $X; export PATH=$D:$PATH', 'D=/tmp; source $X; echo x > $D/a.txt', 'D=/tmp; source $X; cat $D/settings.json', 'D=/tmp; source $X; mkdir -p $D/build', 'D=/tmp; source $X; D=/tmp; echo x > $D/settings.json',
-    'D=/tmp; source $X; cp ok.sh $D/src/settings.jsonl', 'source dyn.sh; cp ok.sh $F.bak',
+    'D=/tmp; source $X; export PATH=$D:$PATH', 'D=/tmp; source $X; cat $D/settings.json', 'D=/tmp; source $X; D=/tmp; echo x > $D/settings.json', 'D=/tmp; source $X; cd $D', 'D=/tmp; source $X; PATH=$D:$PATH ls', 'D=/tmp; source $X; PATH=$D:$PATH npm test',
+    'D=/tmp; source $X; echo $D', 'D=/tmp; source $X; FOO=$D/x bash ok.sh', 'source dyn.sh; echo $F', 'D=/tmp; source $X; export OUT=$D/x', 'source $X', 'source "$NVM_DIR/nvm.sh"; nvm use 20',
   ]) assert.equal(files(c, fs).decision, 'allow', c);
+});
+
+// ---- S4 A: data programs that run shell commands from their input ------------------------------------------------------------
+
+// Why: psql (`\!`, `\o |cmd`, `\g |cmd`, `\copy ... program 'cmd'`, backticks), mysql (`\!`, `system`) and sqlite3 (`.shell`, `.system`, `.output |cmd`, `.once |cmd`) run
+// shell commands that sit in the text they read, so a file / heredoc / argument fed to them is judged for those commands like a shell line.
+// `{BAD}` / `{OK}` stand for a guarded / harmless command of each policy; the same template is used for the file contents and the command.
+const sqlBoth = (template, fileTemplates, expect) => {
+  const fill = (s, bad, ok) => s.replaceAll('{BAD}', bad).replaceAll('{OK}', ok);
+  const one = (tag, run, bad, ok, root) => {
+    const fsOf = (b, o) => fakeFs(root, Object.fromEntries(Object.entries(fileTemplates).map(([k, v]) => [k, fill(v, b, o)])), DIRS);
+    const r = run(fill(template, bad, ok), fsOf(bad, ok));
+    assert.equal(r.decision, expect, `${tag}: ${template} -> ${r.reason}`);
+  };
+  one('git', (c, f) => git(c, f), BAD_GIT, 'git status', GIT_ROOT);
+  one('files', (c, f) => files(c, f), BAD_FILES, 'echo hi', PROJ);
+};
+const SQL_FILES = {
+  'p.sql': 'select 1;\n\\! {BAD}\nselect 2;', 'po.sql': 'select 1 \\g |{BAD}', 'pw.sql': '\\o |{BAD}\nselect 1;', 'pc.sql': "\\copy t to program '{BAD}'", 'pb.sql': '\\set x `{BAD}`',
+  'm.sql': 'select 1;\n\\! {BAD}', 'ms.sql': 'system {BAD}', 's.sql': '.mode csv\n.shell {BAD}', 'ss.sql': '.system {BAD}', 'so.sql': '.output |{BAD}', 'sn.sql': '.once |{BAD}',
+  'inc.sql': 'select 1;\n\\i p.sql', 'inc2.sql': '.read s.sql', 'data.sql': "-- git push origin main is a comment\ninsert into t values ('git push origin main');\nselect '\\\\!';",
+};
+test('S4: a data program fed a file that holds a shell escape runs it (psql, mysql, sqlite3)', () => {
+  for (const t of [
+    'psql < p.sql', 'psql -q mydb < po.sql', 'psql < pw.sql', 'psql < pc.sql', 'psql < pb.sql', 'psql -f p.sql', 'psql --file=p.sql', 'cat p.sql | psql', 'mysql < m.sql', 'mariadb db < ms.sql',
+    'sqlite3 < s.sql', 'sqlite3 db.sqlite < ss.sql', 'sqlite3 db < so.sql', 'sqlite3 < sn.sql', 'sqlite3 db -init s.sql', 'psql < inc.sql', 'sqlite3 < inc2.sql',
+    'Q=psql; $Q < p.sql', 'PSQL="psql -h localhost"; $PSQL $DB -q < p.sql', 'Q=sqlite3; $Q db < s.sql', 'Q=/usr/bin/psql; $Q < po.sql', 'cat p.sql p.sql | psql',
+  ]) sqlBoth(t, SQL_FILES, 'deny');
+  // the same shapes with a harmless command, and data that only mentions the words
+  for (const t of ['psql < p.sql', 'psql < po.sql', 'psql < pc.sql', 'mysql < m.sql', 'sqlite3 < s.sql', 'sqlite3 < so.sql', 'psql < inc.sql', 'Q=psql; $Q < p.sql', 'psql < data.sql', 'Q=psql; $Q < data.sql', 'sqlite3 db < data.sql']) {
+    sqlBoth(t, Object.fromEntries(Object.entries(SQL_FILES).map(([k, v]) => [k, v.replaceAll('{BAD}', '{OK}')])), 'allow');
+  }
+  sqlBoth('psql < data.sql', SQL_FILES, 'allow');
+  sqlBoth('Q=psql; $Q < data.sql', SQL_FILES, 'allow');
+});
+
+test('S4: a data program fed a heredoc, a here-string or an argument that holds a shell escape runs it', () => {
+  for (const t of [
+    "psql <<'EOF'\nselect 1;\n\\! {BAD}\nEOF", "psql <<< '\\! {BAD}'", "psql -c '\\! {BAD}'", "psql --command='select 1 \\g |{BAD}'", "mysql -e '\\! {BAD}'", "mysql --execute='system {BAD}'",
+    "sqlite3 db '.shell {BAD}'", "sqlite3 db -cmd '.system {BAD}'", "sqlite3 <<'EOF'\n.shell {BAD}\nEOF", "Q=psql; $Q <<'EOF'\n\\! {BAD}\nEOF", "echo '\\! {BAD}' | psql", "printf '.shell {BAD}\\n' | sqlite3 db",
+  ]) sqlBoth(t, {}, 'deny');
+  for (const t of ["psql <<'EOF'\nselect 1;\n\\! {OK}\nEOF", "psql -c '\\! {OK}'", "sqlite3 db '.shell {OK}'", "mysql -e 'select 1'", "Q=psql; $Q <<'EOF'\n\\! {OK}\nEOF"]) sqlBoth(t, {}, 'allow');
+});
+
+test('S4: a reader named by a variable cannot launder a feed to a shell', () => {
+  for (const c of ['Q=cat; $Q < f.sh | bash', 'Q=cat; $Q f.sh | bash', 'Q=cat; $Q f.sh | sh -s', 'Q=head; $Q -c 9999 f.sh | bash', 'Q=cat; bash < <($Q f.sh)', 'Q=cat; $Q < f.sh | xargs -I{} sh -c "{}"']) denyBoth(c, SPEC);
+  for (const c of ['Q=cat; $Q < x.sh | bash', 'Q=cat; $Q x.sh | bash', 'Q=cat; $Q f.sh | wc -l', 'Q=cat; $Q < f.sh | grep x']) allowBoth(c, SPEC);
 });

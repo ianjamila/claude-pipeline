@@ -15,7 +15,7 @@
 import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform } from './shell-parse.mjs';
+import { commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform } from './shell-parse.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow } from './line-writes.mjs';
 import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
@@ -870,9 +870,9 @@ function checkScriptFile(sf, dir, ctx, level) {
     if (sf.kind === 'shell' && ctx.pathExists(abs)) return deny(`cannot read the script ${sf.file} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified.`);
     // over the read cap: a program run by path is peeked at (a shell script is refused, a binary or an interpreter file is not
     // ours to judge); text a rewriting command computes from a file we cannot read cannot be scanned
-    if (sf.kind === 'exec' || sf.kind === 'scan') {
+    if (sf.kind === 'exec' || sf.kind === 'scan' || sf.kind === 'sql') {
       const head = ctx.readHead(abs);
-      if (typeof head === 'string' && (sf.kind === 'scan' || isShellHead(head))) return deny(`${sf.file} is too large to verify (over 1 MB), so what it runs (or feeds a shell) cannot be known.`);
+      if (typeof head === 'string' && (sf.kind === 'scan' || sf.kind === 'sql' || isShellHead(head))) return deny(`${sf.file} is too large to verify (over 1 MB), so what it runs (or feeds a shell) cannot be known.`);
     }
     return null; // missing: nothing will run
   }
@@ -884,6 +884,8 @@ function judgeScriptText(text, sf, abs, dir, ctx, level) {
   countScript(ctx.budget); // every script read and judged counts, named or candidate: the work multiplies with each level
   // text a command rewrites on its way to a shell (sed, awk, base64 ...) is computed at run time: a file holding a guarded word is refused
   if (sf.kind === 'scan') return GUARDED_WORDS.test(text) ? deny(`${sf.file} is read by a command that feeds a shell, and mentions a guarded operation, so what the shell runs cannot be verified. Write the command out literally.`) : null;
+  // Why: psql / mysql / sqlite3 run only the shell escapes in their input (\! , \g |cmd, .shell ...): those lines are judged like a script
+  if (sf.kind === 'sql') return judgeSqlEscapes(sqlShellEscapes(text), sf, dir, ctx, level);
   let kind = sf.kind;
   if (kind === 'exec') {
     if (text.slice(0, 4096).includes('\u0000')) return null; // a binary
@@ -907,6 +909,13 @@ function judgeScriptText(text, sf, abs, dir, ctx, level) {
   return v.decision === 'deny' ? deny(`the script ${sf.file} would run a blocked command: ${v.reason}`) : null;
 }
 
+function judgeSqlEscapes(escapes, sf, dir, ctx, level) {
+  if (!escapes.length) return null;
+  if (level >= MAX_NESTING) return deny(`the input ${sf.file} is nested too deeply (database clients running files that run clients) to verify.`);
+  const v = judgeScoped(escapes.join('\n'), dir, ctx, level, sf);
+  return v.decision === 'deny' ? deny(`the input ${sf.file} would run a shell command: ${v.reason}`) : null;
+}
+
 // Several files that feed ONE shell (`cat a b | bash`): the shell reads their texts one after the other, so they are judged joined, in the
 // order the command names them, repeats included (a guarded command split across them is one command). `scan`: the text a rewriting command
 // prints from them (in an order we do not know): refused when a guarded word is in the joined text, read in either order.
@@ -920,7 +929,7 @@ function checkJoinedScripts(sf, dir, ctx, level) {
     const text = ctx.readText(abs);
     if (typeof text !== 'string') {
       if (sf.kind === 'shell' && ctx.pathExists(abs)) return deny(`cannot read the script ${w} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified.`);
-      if (sf.kind === 'scan') {
+      if (sf.kind === 'scan' || sf.kind === 'sql') {
         const head = ctx.readHead(abs);
         if (typeof head === 'string') return deny(`${w} is too large to verify (over 1 MB), so what it runs (or feeds a shell) cannot be known.`);
       }
@@ -940,6 +949,7 @@ function checkJoinedScripts(sf, dir, ctx, level) {
     const why = guardedCommandText(texts.join(''));
     return why ? deny(`the programs ${sf.file} (fed to an interpreter together) contain a guarded command (${why}); it cannot be verified by the guard. Run the operation directly.`) : null;
   }
+  if (sf.kind === 'sql') return judgeSqlEscapes(texts.flatMap(sqlShellEscapes), sf, dir, ctx, level);
   if (level >= MAX_NESTING) return deny(`the scripts ${sf.file} are nested too deeply (scripts running scripts) to verify.`);
   const v = judgeScoped(texts.join(''), dir, ctx, level, sf);
   return v.decision === 'deny' ? deny(`the scripts ${sf.file} would run a blocked command: ${v.reason}`) : null;

@@ -18,7 +18,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
-import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform } from './shell-parse.mjs';
+import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
 import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
 
@@ -46,15 +46,6 @@ const PROTECTED_REL = [
 // replacing, deleting, moving or running a repo command in them reaches the protected files, so for a
 // non-read-only command a word that IS one of these (exactly, not a child) counts as a protected reference.
 const ANCESTOR_REL = ['.claude', '.claude/skills', '.claude/agents'];
-
-// Is the text after an unknown directory prefix (`$D/settings.json`) a protected file, or inside a protected directory, or one of the directories that hold them?
-function tailIsProtected(tail, ci) {
-  let t = String(tail).replace(/^\/+/, '').replace(/^(?:\.\.?\/+)+/, '');
-  if (ci) t = t.toLowerCase();
-  const names = [...PROTECTED_REL, ...PROTECTED_REL.map((r) => r.replace(/^\.claude\//, ''))].map((r) => (ci ? r.toLowerCase() : r));
-  const dirs = [...ANCESTOR_REL, ...ANCESTOR_REL.map((r) => r.replace(/^\.claude\/?/, '')).filter(Boolean)].map((r) => (ci ? r.toLowerCase() : r));
-  return names.some((n) => t === n || t.startsWith(n + '/')) || dirs.includes(t);
-}
 
 const DEVICE_PREFIX = /^\/\/[?.]\/(?=[A-Za-z]:\/)/; // \\?\C:\ and \\.\C:\ forms
 
@@ -1114,7 +1105,9 @@ function judgeJoinedScripts(sf, dirs, ctx, opts) {
         if (r) return r;
         continue;
       }
-      const r = evaluateBashForFiles(texts.join(''), { ...opts, cwd: d || ctx.cwd, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup });
+      const joinedText = sf.kind === 'sql' ? texts.flatMap(sqlShellEscapes).join('\n') : texts.join('');
+      if (!joinedText) continue;
+      const r = evaluateBashForFiles(joinedText, { ...opts, cwd: d || ctx.cwd, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup });
       if (r.decision === 'deny') return deny(`the scripts ${sf.file} would run: ${r.reason}`);
     }
   }
@@ -1131,9 +1124,9 @@ function judgeFoundScript(sf, abs, dir, ctx, opts) {
     if (sf.kind === 'shell') return deny(`cannot read the script ${sf.file} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified`);
     // over the read cap: a program run by path is peeked at (a shell script is refused, a binary or an interpreter file is not
     // ours to judge); text a rewriting command computes from a file we cannot read cannot be scanned
-    if (sf.kind === 'exec' || sf.kind === 'scan') {
+    if (sf.kind === 'exec' || sf.kind === 'scan' || sf.kind === 'sql') {
       const head = ctx.readHead(abs);
-      if (typeof head === 'string' && (sf.kind === 'scan' || isShellHead(head))) return deny(`${sf.file} is too large to verify (over 1 MB), so what it runs (or feeds a shell) cannot be known`);
+      if (typeof head === 'string' && (sf.kind === 'scan' || sf.kind === 'sql' || isShellHead(head))) return deny(`${sf.file} is too large to verify (over 1 MB), so what it runs (or feeds a shell) cannot be known`);
     }
     return null;
   }
@@ -1149,6 +1142,13 @@ function judgeScriptText(text, sf, abs, dir, ctx, opts) {
       return deny(`${sf.file} is read by a command that feeds a shell, and refers to a protected pipeline file or switch, so what the shell runs cannot be verified (${PROTECTED_MSG})`);
     }
     return null;
+  }
+  // Why: psql / mysql / sqlite3 run only the shell escapes in their input (\! , \g |cmd, .shell ...): those lines are judged like a script
+  if (sf.kind === 'sql') {
+    const esc = sqlShellEscapes(text).join('\n');
+    if (!esc) return null;
+    const r = evaluateBashForFiles(esc, { ...opts, cwd: dir, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup });
+    return r.decision === 'deny' ? deny(`the input ${sf.file} would run: ${r.reason}`) : null;
   }
   let kind = sf.kind;
   if (kind === 'exec') {
@@ -1416,7 +1416,7 @@ function absorbSourced(rec, dirs, ctx) {
   const { texts, unknown } = sourcedTexts(rec, dirs, ctx);
   // (a file that can set any name: every name the line has set so far may have been changed, and any other may be set; a script they pick is refused. The values
   // stay for the paths a writer builds, which is what they were before the file ran)
-  const poison = () => { ctx.unknownAll = true; for (const k of Object.keys(ctx.vars)) ctx.pickUnknown.add(k); };
+  const poison = () => { ctx.unknownAll = true; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.srcChanged.add(k); } };
   if (unknown) poison();
   const merged = new Map();
   for (const t of texts) {
@@ -1434,8 +1434,9 @@ function absorbSourced(rec, dirs, ctx) {
   }
   for (const [k, v] of merged) {
     ctx.srcTouched.add(k);
-    if (v === null) { delete ctx.vars[k]; delete ctx.keptVars?.[k]; ctx.pickUnknown.add(k); continue; }
+    if (v === null) { delete ctx.vars[k]; delete ctx.keptVars?.[k]; ctx.pickUnknown.add(k); ctx.srcChanged.add(k); continue; }
     ctx.pickUnknown.delete(k);
+    ctx.srcChanged.delete(k);
     ctx.vars[k] = expandHomeRefs(substVars(toPosix(v).replace(USER_RE, ctx.user), ctx.vars, ctx.budget), ctx.homePosix);
     if (ctx.keptVars) ctx.keptVars[k] = ctx.vars[k];
   }
@@ -1497,6 +1498,7 @@ function evaluateBashForFilesFrame(command, opts) {
   ctx.pickUnknown = new Set(opts._unknown ?? []); // (a name the line gave a run-time value: only a script it picks is refused; the writer rule is for the names above)
   ctx.srcTouched = new Set(); // names a sourced file set on this line (a later plain assignment of one is the value again)
   ctx.unknownAll = opts._unknownAll === true;
+  ctx.srcChanged = new Set(opts._srcChanged ?? []); // names an unfollowable sourced file may have changed (a write target that uses one is refused)
   // a name held in a variable (N=PIPELINE_ADMIN; env $N=1 claude)
   if (Object.keys(ctx.vars).length && setsAdmin(substVars(flat, ctx.vars, ctx.budget), ctx.platform)) return deny('the command sets PIPELINE_ADMIN through a variable; only the owner may set it, when launching Claude Code');
   const dirs = collectDirs(cmds, ctx);
@@ -1542,7 +1544,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // scripts they run are judged with them (a name like `. "$F"` in the file is then the file F names, not an unknown).
   // (every name of the line is seeded, exported or not, and wherever it was set: stricter than the shell, which only passes exported ones on; kept on purpose,
   // a missed name would hide the script a variable picks. The replay found no false block from it.)
-  const withLineVars = (o) => ({ ...o, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set([...ctx.unknownVars, ...ctx.pickUnknown]), _unknownW: new Set(ctx.unknownVars), _unknownAll: ctx.unknownAll });
+  const withLineVars = (o) => ({ ...o, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set([...ctx.unknownVars, ...ctx.pickUnknown]), _unknownW: new Set(ctx.unknownVars), _srcChanged: new Set(ctx.srcChanged), _unknownAll: ctx.unknownAll });
 
   // A startup file is judged once per evaluation. It is marked first: a startup file that starts shells itself would be judged again and
   // again otherwise (a denial ends the whole evaluation, so marking before the verdict is safe).
@@ -1593,7 +1595,7 @@ function evaluateBashForFilesFrame(command, opts) {
     for (const [idx, c] of cmds.entries()) {
       frame.i = idx;
       if (!c.argv.length && (ctx.unknownVars.size || ctx.pickUnknown.size || ctx.srcTouched.size) && c.sep !== '&&' && c.sep !== '||' && c.depth === 0 && !inFlow(flowStart(cmds), idx)) {
-        for (const k of Object.keys(c.env ?? {})) if ((ctx.unknownVars.has(k) || ctx.pickUnknown.has(k) || ctx.srcTouched.has(k)) && !/[$`]/.test(c.env[k])) { ctx.unknownVars.delete(k); ctx.pickUnknown.delete(k); ctx.vars[k] = expandRefs(c.env[k], ctx); }
+        for (const k of Object.keys(c.env ?? {})) if ((ctx.unknownVars.has(k) || ctx.pickUnknown.has(k) || ctx.srcTouched.has(k)) && !/[$`]/.test(c.env[k])) { ctx.unknownVars.delete(k); ctx.pickUnknown.delete(k); ctx.srcChanged.delete(k); ctx.vars[k] = expandRefs(c.env[k], ctx); }
       }
       const sf = scriptFileOf(c.argv, c.raw, raw);
       const withPath = (rec) => { if (rec.words?.some(isEqualsWord)) rec.pathValues = pathValuesOf(c, cmds, { env: startupEnv, inherited: inheritedStartup }); return rec; }; // (zsh `=tool`: the PATH directories to look in)
@@ -1656,20 +1658,21 @@ function evaluateBashForFilesFrame(command, opts) {
     }
   }
 
-  // Why: a name an unfollowable sourced file may have changed (`D=/tmp; source $X; echo x > $D/settings.json`) may hold ~/.claude by now, so a writer or redirection
-  // whose path ends in a protected one after it is refused (a PATH-only use, a reader or any other tail is not: the replay blocked ~/.zprofile with a blanket rule)
-  if (ctx.pickUnknown.size || ctx.unknownAll) {
-    const maybeChanged = (n) => ctx.pickUnknown.has(n) || (ctx.unknownAll && !Object.hasOwn(ctx.vars, n));
-    const reaches = (w) => {
-      const parts = String(w).split(/\$\{?(\w+)\}?/); // [text, name, text, name, ...]
-      const tails = [];
-      for (let k = 1; k < parts.length; k += 2) if (maybeChanged(parts[k])) tails.push(parts.slice(k + 1).filter((_, j) => j % 2 === 0).join('')); // (the text after it, the names between dropped)
-      return tails.some((t) => tailIsProtected(t, ctx.ci));
-    };
+  // Why: a name an unfollowable sourced file may have changed (`D=/tmp; source $X; echo x > $D/settings.json`) may hold ~/.claude by now: a write target that uses it
+  // is unknown, so a redirection or a writer that names it is refused, whatever the rest of the path (names are the line's own choice, none is exempt). Not write targets: the
+  // operand of a command that runs a script (`source $X`, `bash $F`), a reader, `cd`, a declaration, and an element of a path-list variable's value (`PATH=$D:$PATH`).
+  if (ctx.srcChanged.size || ctx.unknownAll) {
+    const maybeChanged = (n) => ctx.srcChanged.has(n) || (ctx.unknownAll && !Object.hasOwn(ctx.vars, n));
+    const changed = (w) => [...String(w).matchAll(/\$\{?(\w+)/g)].some((x) => maybeChanged(x[1]));
+    const PATH_LISTS = new Set(['PATH', 'CDPATH', 'MANPATH', 'INFOPATH', 'LD_LIBRARY_PATH', 'DYLD_LIBRARY_PATH', 'NODE_PATH', 'PYTHONPATH', 'GOPATH']);
     for (const c of cmds) {
-      const writes = !isReadOnly(c, ctx) && !['export', 'declare', 'typeset', 'local', 'readonly'].includes(baseOf(c.argv[0] ?? ''));
-      if ((c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && reaches(r.target ?? '')) || (c.argv.length && writes && (c.argv.some(reaches) || Object.values(c.env ?? {}).some(reaches)))) {
-        return deny('the command writes through a variable that a sourced file may have changed, and the path ends in a protected pipeline file or directory, so the file it reaches cannot be checked; write the path out');
+      const name = baseOf(c.argv[0] ?? '');
+      const writes = c.argv.length > 0 && !isReadOnly(c, ctx) && !['export', 'declare', 'typeset', 'local', 'readonly', ...CD_CMDS].includes(name);
+      // (only the script a shell / interpreter / source runs is exempt: every other word of it can be a write target, `node w.mjs $D/x`, `bash -c 'echo x > $D/x'`)
+      const script = scriptFileOf(c.argv)?.file;
+      const operands = script === undefined ? c.argv : c.argv.filter((w, i) => w !== script || c.argv.indexOf(w) !== i);
+      if ((c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && changed(r.target ?? '')) || (writes && (operands.some(changed) || (!SHELL_NAMES.has(name) && Object.entries(c.env ?? {}).some(([k, v]) => !PATH_LISTS.has(k) && changed(v)))))) {
+        return deny('the command writes through a variable that a sourced file may have changed, so the file it reaches cannot be checked; write the path out');
       }
     }
   }
