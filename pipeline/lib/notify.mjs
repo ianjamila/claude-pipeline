@@ -559,6 +559,8 @@ async function sendToast({ push, spawnFn, timeoutMs, signal }) {
 // ---- runner -------------------------------------------------------------------------------------------------------------
 export const BUDGET = Object.freeze({ lookupMs: 3000, lockMs: 1000, ntfyMs: 5000, toastMs: 8000, capMs: 15000 });
 
+const LOOKUP_KILL_SLACK_MS = 500;
+
 async function defaultLookup(pr, { cwd, env, timeoutMs }) {
   const { cmd, prefixArgs } = overrideCommand('PIPELINE_GH', 'gh', env);
   const r = await runAsync(cmd, [...prefixArgs, 'pr', 'view', String(pr), '--json', 'title,url'], { cwd, env, timeoutMs });
@@ -660,7 +662,10 @@ async function runNotify(event, deps, { transports, errors, budget, signal, out,
   let url = event.url;
   if (!title && event.pr && !event.test) {
     const lookup = deps.lookup ?? defaultLookup;
-    const found = await within(Promise.resolve().then(() => lookup(event.pr, { cwd, env, timeoutMs: budget.lookupMs })).catch(() => null), budget.lookupMs, null);
+    // The default lookup kills its own process TREE at lookupMs (proc.mjs killTree: taskkill /T /F on Windows). This outer
+    // race is only a net for an injected lookup that hangs, so it waits a little longer: if both fired together the push
+    // would carry on (and the command exit) while the killed gh still held its cwd.
+    const found = await within(Promise.resolve().then(() => lookup(event.pr, { cwd, env, timeoutMs: budget.lookupMs })).catch(() => null), budget.lookupMs + LOOKUP_KILL_SLACK_MS, null);
     title = found?.title;
     url ??= found?.url;
   }

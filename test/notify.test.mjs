@@ -29,9 +29,18 @@ const tmp = () => {
   roots.push(d);
   return d;
 };
+// Best effort, like test/jobs.test.mjs: a Windows file may still be open for a moment after its process exits.
 after(() => {
-  for (const d of roots) rmSync(d, { recursive: true, force: true, maxRetries: 3 });
+  for (const d of roots) {
+    try { rmSync(d, { recursive: true, force: true, maxRetries: 3 }); } catch { /* Windows may still hold a handle */ }
+  }
 });
+
+// Resolves once a spawned child has exited (immediately if it already has), so no test leaves a live process whose cwd or
+// open files are inside a temp dir: on Windows that makes the directory undeletable (EPERM).
+const exited = (child) => (child.exitCode !== null || child.signalCode !== null
+  ? Promise.resolve()
+  : new Promise((res) => child.once('close', res)));
 
 // A fake spawn: the child records the stdin it was given and closes with `code` (or hangs until killed).
 function fakeSpawn({ code = 0, hang = false } = {}) {
@@ -72,6 +81,9 @@ function rig(over = {}) {
     cwd: dir,
     git: (args) => (args[0] === 'remote' ? 'git@github.com:acme/widgets.git' : 'abc1234def5678'),
     isWsl: () => false,
+    // Never run a real `gh` from a test (on a runner with gh installed it would be a live process with its cwd in the temp
+    // dir); the one test that exercises the real lookup opts in with realLookup.
+    ...(over.realLookup ? {} : { lookup: async () => null }),
     fetch: async (url, init) => {
       fetchCalls.push({ url, init, body: JSON.parse(init.body) });
       return fetchImpl(url, init);
@@ -488,17 +500,25 @@ test('concurrent processes on the same event produce exactly one send', async ()
   const countFile = path.join(r.dir, 'sends.txt');
   const go = path.join(r.dir, 'go');
   const kids = [0, 1, 2].map(() => spawn(process.execPath, [SEND_FIXTURE, r.deps.stateDir, r.deps.secretsFile, countFile, '600', '--go', go], { stdio: ['ignore', 'pipe', 'inherit'] }));
-  const outs = kids.map((k) => {
-    let buf = '';
-    k.stdout.on('data', (c) => { buf += c; });
-    return { done: new Promise((res) => k.on('close', () => res(buf))), buf: () => buf };
-  });
-  while (!outs.every((o) => o.buf().includes('ready'))) await sleep(20);
-  writeFileSync(go, 'go');
-  const results = (await Promise.all(outs.map((o) => o.done))).map((b) => JSON.parse(b.trim().split('\n').pop()));
-  assert.equal(readFileSync(countFile, 'utf8').trim().split('\n').length, 1, 'one ntfy send');
-  assert.equal(results.filter((x) => x.sent).length, 1);
-  assert.equal(results.filter((x) => x.reason === 'duplicate').length, 2);
+  try {
+    const outs = kids.map((k) => {
+      let buf = '';
+      k.stdout.on('data', (c) => { buf += c; });
+      return { done: new Promise((res) => k.on('close', () => res(buf))), buf: () => buf };
+    });
+    while (!outs.every((o) => o.buf().includes('ready'))) await sleep(20);
+    writeFileSync(go, 'go');
+    const results = (await Promise.all(outs.map((o) => o.done))).map((b) => JSON.parse(b.trim().split('\n').pop()));
+    assert.equal(readFileSync(countFile, 'utf8').trim().split('\n').length, 1, 'one ntfy send');
+    assert.equal(results.filter((x) => x.sent).length, 1);
+    assert.equal(results.filter((x) => x.reason === 'duplicate').length, 2);
+  } finally {
+    // The fixture spins until `go` exists: never leave one running if an assertion failed first.
+    writeFileSync(go, 'go');
+    for (const k of kids) k.kill('SIGKILL');
+    await Promise.all(kids.map(exited));
+    for (const k of kids) assert.ok(k.exitCode !== null || k.signalCode !== null, 'the racing child has exited');
+  }
 });
 
 test('a lock held by another process: still sends within the budget, and says the ledger was bypassed', async () => {
@@ -517,7 +537,8 @@ test('a lock held by another process: still sends within the budget, and says th
     assert.equal(r.fetchCalls.length, 1);
   } finally {
     writeFileSync(release, '');
-    await new Promise((res) => holder.on('close', res));
+    await exited(holder);
+    assert.ok(holder.exitCode !== null || holder.signalCode !== null, 'the lock holder has exited');
   }
 });
 
@@ -539,16 +560,19 @@ test('a hung gh title lookup is killed at the lookup budget and the push still g
   const pidFile = path.join(dir, 'gh.pid');
   const script = path.join(dir, 'fakegh.mjs');
   writeFileSync(script, `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nsetTimeout(() => {}, 60000);\n`);
-  const r = rig({ env: { PIPELINE_GH: `"${process.execPath}" "${script}"` } });
+  const r = rig({ realLookup: true, env: { PIPELINE_GH: `"${process.execPath}" "${script}"` } });
   const t0 = Date.now();
   const res = await notifyEvent({ ...STOP, title: undefined }, { ...r.deps, budget: { lookupMs: 700 } });
   const took = Date.now() - t0;
   assert.equal(res.sent, true);
   assert.ok(took < 6000, `took ${took} ms`);
   assert.equal(r.fetchCalls[0].body.title, '#12');
-  const pid = Number(readFileSync(pidFile, 'utf8'));
-  for (let i = 0; i < 40 && isPidAlive(pid); i++) await sleep(50);
-  assert.equal(isPidAlive(pid), false, 'the hung gh was killed');
+  // The lookup's cwd is the rig dir: the killed process must be gone before the test ends, or Windows cannot delete the dir.
+  if (existsSync(pidFile)) { // absent only when node was killed before it started the script (a slow machine): nothing to wait for
+    const pid = Number(readFileSync(pidFile, 'utf8'));
+    for (let i = 0; i < 100 && isPidAlive(pid); i++) await sleep(50);
+    assert.equal(isPidAlive(pid), false, 'the hung gh was killed');
+  }
 });
 
 // ---- toast ----------------------------------------------------------------------------------------------------------------
