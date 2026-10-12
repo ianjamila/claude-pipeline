@@ -21,7 +21,7 @@ const PLAIN = /^(?:[A-Za-z]:)?[\w.\/~+@%,=-]+$/;
 // ---- the text a client reads ------------------------------------------------------------------------------
 
 const PSQL_SAFE = new Set(['set', 'unset', 'timing', 'x', 'echo', 'qecho', 'warn', 'pset', 'a', 't', 'T', 'C', 'H', 'f', 'l', 'list', 'conninfo', 'encoding', 'c', 'connect', 'q', 'quit',
-  'if', 'elif', 'else', 'endif', 'prompt', 'password', 'copyright', 'h', 'help', '?', 'gset', 'gexec', 'gdesc', 'watch', 'crosstabview', 'sf', 'sv', 'z', 'errverbose', 'parse', 'bind', 'bind_named',
+  'if', 'elif', 'else', 'endif', 'prompt', 'password', 'copyright', 'h', 'help', '?', 'gexec', 'gdesc', 'watch', 'crosstabview', 'sf', 'sv', 'z', 'errverbose', 'parse', 'bind', 'bind_named',
   'close', 'flush', 'flushrequest', 'getresults', 'sendpipeline', 'startpipeline', 'syncpipeline', 'endpipeline', 'restrict', 'unrestrict', 'lo_list', 'lo_unlink', 'lo_import', 'drds', ';', '\\']);
 const MYSQL_SAFE = new Set(['g', 'G', 'c', 'p', 'r', 'R', 's', 'u', 'w', 'W', 'n', 't', 'd', 'C', 'q', 'h', '?', '#', 'x', '0', "'", '"', '%', '_', 'b', 'Z', '\\']);
 
@@ -45,7 +45,21 @@ function metaArgs(rest) {
   return { words, ticks };
 }
 
-const targetOf = (f) => (f && PLAIN.test(f) ? f : '"$SQL_TARGET"');
+// Why: the nested evaluation must judge the real path text, so a name that is not a plain word is emitted shell-quoted (single quotes, so nothing in it expands); a sqlite `file:` URI names
+// the file (`file:/p?mode=rwc`, `file:///p`, `file://host/p`, percent-escapes decoded)
+const shq = (x) => `'${String(x).replace(/'/g, "'\\''")}'`;
+function uriPath(f) {
+  if (!/^file:/i.test(f)) return f;
+  let p = f.slice(5).replace(/[?#].*$/s, '').replace(/^\/\/[^/]*(?=\/)/, '');
+  try { p = decodeURIComponent(p); } catch { /* keep the text as written */ }
+  return p || f;
+}
+const targetOf = (f) => { if (!f) return shq(''); const u = uriPath(f); return PLAIN.test(u) ? u : shq(u); };
+// psql interpolation: `:name`, `:'name'`, `:"name"`. Not tracked per quote (block comments, E'' escapes, dollar quotes and multi-line strings all hide a quote from a line scan): any `:` followed by
+// a name character or a quote counts, except the `::` cast.
+function interpolates(text) {
+  return /(?<!:):(?!:)[A-Za-z_'"]/.test(String(text).replace(/::/g, '  '));
+}
 
 /**
  * The shell lines the text of a database client's input runs: escapes (`\! cmd`), writes (`: > FILE` for a file the client writes), includes (`psql < FILE`),
@@ -64,7 +78,7 @@ export function sqlShellEscapes(text, opts = {}) {
   const include = (prog, w, relative) => {
     const f = unq(w);
     const cands = relative && sources.length && !isAbsolute(f) && !f.startsWith('~') ? [...new Set([...sources.map((s) => join(dirname(s), f).replace(/\\/g, '/')), f])] : [f];
-    for (const c of cands) out.push(`${prog} < ${PLAIN.test(c) ? c : '"$SQL_INCLUDE"'}`);
+    for (const c of cands) out.push(`${prog} < ${PLAIN.test(c) ? c : shq(c)}`);
   };
   const run = (cmd) => { if (cmd.trim()) out.push(cmd.trim()); };
   const all = fam === 'any';
@@ -72,6 +86,9 @@ export function sqlShellEscapes(text, opts = {}) {
   // ---- psql: `\word args` anywhere in a line (quotes are not tracked: a backslash in a string is read as a command, fail closed).
   // Why: a shell escape's text is the REST OF THE LINE, unsplit (`\! git push origin ma\in`: the shell reads `ma\in` as main); a later backslash in it also leaves the line unknown.
   const psql = (line) => {
+    // Why: psql re-lexes the value of an interpolated variable (`\set x '\\! cmd'` then `:x` on any line is a backslash command), so any interpolation, or a `\set` value that holds a backslash, is unknown input
+    // (`\gset` fills variables from a query result, whose text is unknown; `\set` anywhere on the line, then a backslash after it)
+    if (interpolates(t) || /\\set\b[\s\S]*\\./.test(line) || /\\gset\b/.test(line)) unknown(t);
     let at = line.indexOf('\\');
     while (at >= 0) {
       const m = /^\\(\\|[A-Za-z0-9_]+|.)/.exec(line.slice(at));
@@ -239,7 +256,7 @@ export function sqlClientArgv(family, words, env = {}) {
     else if (role === 'file') { r.files.push(v); if (family === 'sqlite') r.init = true; }
     else if (role === 'out') { if (/^\s*\|/.test(v)) r.pipes.push(v.replace(/^\s*\|/, '')); else if (v) r.writes.push(v); if (family === 'mysql') bad(); }
     else if (role === 'log') { if (v) r.writes.push(v); }
-    else if (role === 'set') { if (ROLE_ENV.test(String(v).split('=')[0].trim()) || /^(?:PAGER|EDITOR|SHELL)/i.test(v)) bad(); }
+    else if (role === 'set') { if (ROLE_ENV.test(String(v).split('=')[0].trim()) || /^(?:PAGER|EDITOR|SHELL)/i.test(v) || String(v).includes('\\')) bad(); } // (a backslash in a value: psql re-lexes it when interpolated)
     else if (role === 'pset') { if (/^\s*pager/i.test(v)) bad(); }
     else if (role === 'norc') r.noRc = true;
     else if (role === 'bad') bad();
