@@ -892,6 +892,16 @@ test('events: if the rollback-intent cannot be recorded NOTHING is rolled back (
   assert.ok(!h.log.includes('revert'));
 });
 
+test('events: if the existing rollback attempts cannot be read NOTHING is rolled back (an id could be reused): rollback-skipped, nothing posted', async () => {
+  const h = harness({ ...RECOVER_EV, events: true, eventListError: true });
+  const r = await h.go();
+  assert.equal(r.outcome, 'rollback-skipped');
+  assert.equal(r.reason, 'could not read existing rollback attempts on the PR');
+  assert.equal(h.rollbackFn.calls.length, 0);
+  assert.deepEqual(h.posted, []);
+  assert.deepEqual(h.issueCreate.calls[0][0].labels, ['pipeline-rollback']);
+});
+
 test('events: failing to post rollback-result or recovery-reported is a warning, never a different outcome', async () => {
   const h = harness({ ...RECOVER_EV, events: true, postFail: ['rollback-result', 'recovery-reported'] });
   const r = await h.go();
@@ -1334,8 +1344,18 @@ test('CLI merged: fake gh + fake vercel, healthy production serving our deployme
   assert.ok(!w.gh.lines().some((l) => /issues|pr create/.test(l)));
 });
 
+// A rollback with --pr reads the attempts already on the PR first (an unreadable list refuses the rollback): give the fake gh a
+// viewer and an empty comment list, in front of the world's own script.
+const withEmptyPrComments = (w, front = []) => w.gh.setScript([
+  ...front,
+  { match: '^api user', stdout: 'bot\n' },
+  { match: '^api repos/acme/widgets/issues/12/comments --paginate', stdoutJson: [] },
+  ...JSON.parse(readFileSync(w.gh.env.PIPELINE_FAKE_GH_SCRIPT, 'utf8')),
+]);
+
 test('CLI recovered: real rollback via fake vercel, revert pushed to the bare origin, issue + PR created through fake gh', () => {
   const w = cliWorld({ healthy: [OLD_HOST] });
+  withEmptyPrComments(w);
   const r = w.cli(['--sha', w.merge, '--pr', '12', '--retry-wait', '0']);
   assert.equal(r.code, 1, r.stderr);
   assert.equal(r.json.outcome, 'recovered');
@@ -1509,6 +1529,7 @@ const postedBodies = (w) => w.gh.calls()
 
 test('CLI recovered with --pr: rollback-intent, rollback-result and recovery-reported land on the PR as separate new comments, intent first', () => {
   const w = cliWorld({ healthy: [OLD_HOST] });
+  withEmptyPrComments(w, [{ match: '^pr view 12 --json headRefName', code: 1, stderr: 'gh: Server Error (HTTP 500)' }]);
   const r = w.cli(['--sha', w.merge, '--pr', '12', '--retry-wait', '0']);
   assert.equal(r.json.outcome, 'recovered', r.stderr);
   const events = postedBodies(w).map((b) => parseEvent(b)).filter(Boolean);
@@ -1518,7 +1539,7 @@ test('CLI recovered with --pr: rollback-intent, rollback-result and recovery-rep
   assert.equal(events[1].data.verified, true);
   assert.equal(events[2].data.issueUrl, 'https://github.com/acme/widgets/issues/77');
   assert.ok(!w.gh.lines().some((l) => /-X PATCH/.test(l)), 'events are never edited');
-  // The fake gh cannot answer `api user`, so the run record could not be written: that is a warning, not a failure.
+  // The fake gh cannot answer the PR view the run record needs, so the record could not be written: that is a warning, not a failure.
   assert.ok(r.json.warnings.some((x) => /run record/.test(x)));
 });
 

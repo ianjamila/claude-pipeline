@@ -596,6 +596,7 @@ async function watch(opts, deps) {
     // No PR (events not wired) means there is no run to strand, so that case proceeds.
     if (events) {
       eventId = await nextEventId();
+      if (!eventId) return skip('could not read existing rollback attempts on the PR');
       try {
         await events.post('rollback-intent', eventId, `Rolling production back from ${describe(ev.deployment)} to ${known.url || known.id}.`, {
           mergeSha: sha,
@@ -658,12 +659,16 @@ async function watch(opts, deps) {
   }
 
   // Event ids are `<sha7>-<n>`, n = 1 + the rollback-intents already on the PR for this merge (a retry never reuses one).
+  // Fail CLOSED: when the list cannot be read, n would restart at 1 and a second attempt would reuse `<sha7>-1`, defeating the
+  // per-attempt matching of intent and result, so there is no id (null) and the caller does not roll back.
   async function nextEventId() {
-    let n = 1;
     try {
-      n += (await events.list()).filter((e) => e.kind === 'rollback-intent' && e.data?.mergeSha === sha).length;
-    } catch { /* the id only has to be stable for this run */ }
-    return `${sha.slice(0, 7)}-${n}`;
+      const n = 1 + (await events.list()).filter((e) => e.kind === 'rollback-intent' && e.data?.mergeSha === sha).length;
+      return `${sha.slice(0, 7)}-${n}`;
+    } catch (err) {
+      ev.notes.push(`could not read the rollback events on the PR: ${err?.message ?? err}`);
+      return null;
+    }
   }
 
   // Later events are evidence for the owner, not a gate: a failure to post one is a warning, never a different outcome.
