@@ -19,6 +19,9 @@ export const AGENT_LOG_HEADER = [
   '',
 ].join('\n');
 
+// The outcome of the line `stage` writes for a run that merged: the production smoke has not reported yet.
+export const DEFAULT_OUTCOME = 'merged — prod smoke pending';
+
 const QUEUE_FILE = 'agent-log-queue.jsonl';
 const LOCK_NAME = 'agent-log-queue';
 const LOCK_WAIT_MS = 30_000;
