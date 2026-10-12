@@ -504,10 +504,12 @@ function argRecords(cmd, name, idx, lineEnv = {}) {
     if (args.some((a) => /^--(?:to-command|checkpoint-action|use-compress-program|rsh-command)/.test(a) || a === '-I')) return null;
     if (!extract) { // c / r / u write the archive named by -f
       const make = (/^[A-Za-z]/.test(first) && /[cru]/.test(first)) || args.some((a) => /^-[A-Za-z]*[cru]/.test(a) && !a.startsWith('--')) || args.some((a) => /^--(?:create|append|update)$/.test(a));
-      const arc = optValue(opts, 'f', 'file');
-      return make && arc && arc !== '-' ? [unknown(arc)] : [];
+      // Why: tar uses the last -f, but a repeated one is every archive we may be wrong about: each is written
+      return make ? optValues(opts, 'f', 'file').filter((arc) => arc && arc !== '-').map((arc) => unknown(arc)) : [];
     }
-    return [unknown(optValue(opts, 'C', 'directory') ?? '.', { subtree: true })];
+    // Why: each -C applies to the members after it (and relative ones compound): with more than one the members may land anywhere
+    const dirs = optValues(opts, 'C', 'directory');
+    return orAnywhere(dirs.length ? dirs.map((d) => unknown(d, { subtree: true })) : [unknown('.', { subtree: true })], idx, dirs.length > 1);
   }
   if (name === 'unzip') {
     const { opts } = getopt(args, 'dxP', ['exclude']);

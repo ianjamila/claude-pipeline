@@ -1159,3 +1159,21 @@ test('L2b: dd is an exact copy only with if= / of= / status= / conv=notrunc / of
   denyBoth((_, mid) => `cp ok.sh n.sh; printf x | dd of=n.sh conv=notrunc; ${mid}; bash n.sh`);
   allowBoth('cp ok.sh n.sh; printf x | dd of=n.sh conv=notrunc oflag=append; bash n.sh');
 });
+
+test('L2b: tar: a repeated -f is every archive written; a repeated -C may put members anywhere', () => {
+  // Why: GNU tar uses the last -f and applies each -C to the members after it (relative ones compound): the first value is not the answer
+  denyBoth((_, mid) => `tar -cf m.tar -f n.sh d; ${mid}; bash n.sh`);
+  denyBoth((_, mid) => `tar -cf n.sh -f m.tar d; ${mid}; bash n.sh`);
+  denyBoth((_, mid) => `tar cf m.tar --file=n.sh d; ${mid}; bash n.sh`);
+  denyBoth((_, mid) => `tar -cf m.tar -f n.sh --file m2.tar d; ${mid}; bash n.sh`);
+  const dests = (l) => writesOf(simpleCommands(l)).recs.map((r) => r.dest);
+  assert.deepEqual(dests('tar -cf a.tar -f b.tar d'), ['a.tar', 'b.tar']);
+  assert.deepEqual(dests('tar -cf a.tar d'), ['a.tar']);
+  denyBoth((_, mid) => `tar -xf a.tar -C /tmp/zz -C /tmp/yy; ${mid}; bash ok.sh`);
+  denyBoth((_, mid) => `tar -xf a.tar --directory=/tmp/zz -C d; ${mid}; bash ok.sh`);
+  denyBoth((_, mid) => `tar -xf a.tar -C d -C ..; ${mid}; bash ok.sh`);
+  assert.equal(writesOf(simpleCommands('tar -xf a.tar -C /tmp/zz -C /tmp/yy')).unmodelled.size, 1);
+  assert.equal(writesOf(simpleCommands('tar -xf a.tar -C /tmp/zz')).unmodelled.size, 0);
+  assert.equal(run(`tar -xf a.tar -C /tmp/zz; ${MID_GIT}; bash /work/repo/ok.sh`, SPEC).git.r.decision, 'allow'); // (one -C: members stay below it)
+  assert.equal(run(`tar -xf a.tar -C /tmp/zz -C /tmp/yy; ${MID_GIT}; bash /work/repo/ok.sh`, SPEC).git.r.decision, 'deny');
+});
