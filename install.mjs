@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Why: one installer for macOS and Windows that copies the pipeline's skills, agents and CLI into ~/.claude and
-// registers its two safety hooks in settings.json without disturbing anything else the owner has there.
+// registers its two safety hooks (plus a SessionStart version-status hook) in settings.json without disturbing anything else the owner has there.
 // It is idempotent, refuses to overwrite files it did not install, and refuses to run inside a Claude Code
 // session (an agent must not be able to reinstall or remove its own guards) unless PIPELINE_ADMIN=1. "Inside" means
 // CLAUDECODE=1 in the environment OR a Claude Code ancestor process (the variable can be stripped, the parent cannot).
@@ -335,7 +335,7 @@ function doUninstall(ctx) {
   warnings.push(...manifestWarnings);
 
   const found = I.inspectHooks(current.settings, home);
-  const hookCount = found['guard-git'].length + found['guard-files'].length + found.unknown.length;
+  const hookCount = found['guard-git'].length + found['guard-files'].length + found['session-version'].length + found.unknown.length;
   const allowBefore = new Set(current.settings.permissions?.allow ?? []);
   const allowRemoved = I.ourAllowEntries(home).filter((e) => allowBefore.has(e));
   const settingsChanged = current.exists && !isDeepStrictEqual(stripped, current.settings);
@@ -388,7 +388,7 @@ function formatReport(r) {
     lines.push(`claude-pipeline ${r.version} installed in ${r.home}`);
     lines.push(`  files:     ${r.files.copied} copied, ${r.files.unchanged} unchanged, ${r.files.removed.length} removed`);
     for (const rel of r.files.removed) lines.push(`             removed ${rel}`);
-    lines.push(`  hooks:     guard-git yes, guard-files ${r.hooks.guardFiles ? 'yes' : 'no (--skip-file-guard)'}`);
+    lines.push(`  hooks:     guard-git yes, guard-files ${r.hooks.guardFiles ? 'yes' : 'no (--skip-file-guard)'}, session-version (SessionStart) yes`);
     const state = r.settings.created ? 'created' : r.settings.changed ? 'updated' : 'unchanged';
     lines.push(`  settings:  ${r.settings.path} ${state}`);
     lines.push(`  backup:    ${r.settings.backup ?? 'none (settings.json was not changed or did not exist)'}`);

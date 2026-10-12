@@ -17,6 +17,9 @@ export const MANIFEST_REL = 'pipeline/INSTALLED.json';
 export const GUARD_GIT_MATCHER = 'Bash|PowerShell|Monitor|mcp__.*';
 export const GUARD_FILES_MATCHER = 'Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|Monitor|mcp__.*';
 export const HOOK_TIMEOUT_S = 15;
+export const SESSION_HOOK_TIMEOUT_S = 10;
+// The events whose hooks this installer manages: guard hooks on PreToolUse, the version-status hook on SessionStart.
+const HOOK_EVENTS = ['PreToolUse', 'SessionStart'];
 export const STAGING_REL = 'backups/.staging';
 export const TILDE_ALLOW_ENTRY = 'Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)';
 export const SUBAGENT_NOTE = 'Pinned agent models (judge=opus, arbiter=fable) still win over this env var — verified on Claude Code 2.1.285; unpinned subagents use it.';
@@ -131,7 +134,7 @@ export function buildPlan(source) {
     const entries = walkFiles(pipelineDir)
       .filter((r) => r !== 'INSTALLED.json')
       .map((r) => ({ rel: `pipeline/${r}`, abs: path.join(pipelineDir, ...r.split('/')) }));
-    for (const hook of ['guard-git.mjs', 'guard-files.mjs']) {
+    for (const hook of ['guard-git.mjs', 'guard-files.mjs', 'session-version.mjs']) {
       if (!entries.some((e) => e.rel === `pipeline/hooks/${hook}`)) problems.push(`pipeline/hooks/${hook} is missing`);
     }
     if (isFile(path.join(source, 'VERSION'))) {
@@ -360,17 +363,30 @@ const handlerFor = (home, name) => ({
   timeout: HOOK_TIMEOUT_S,
 });
 
+// The status hook is deliberately NOT started through the fail-closed loader: a SessionStart failure must never block anything.
+const sessionHandlerFor = (home) => ({
+  type: 'command',
+  command: 'node',
+  args: [joinNative(home, 'pipeline', 'hooks', 'session-version.mjs')],
+  timeout: SESSION_HOOK_TIMEOUT_S,
+});
+
 export function ourHookGroups(home, { skipFileGuard = false } = {}) {
   const groups = [{ matcher: GUARD_GIT_MATCHER, hooks: [handlerFor(home, 'guard-git')] }];
   if (!skipFileGuard) groups.push({ matcher: GUARD_FILES_MATCHER, hooks: [handlerFor(home, 'guard-files')] });
   return groups;
 }
 
+// Our own group (no matcher: every start source), appended after whatever the owner already has on SessionStart.
+export const ourSessionStartGroups = (home) => [{ hooks: [sessionHandlerFor(home)] }];
+
 function assertShape(settings) {
   if (!isPlainObject(settings)) throw new SettingsShapeError('settings.json must contain a JSON object');
   if ('hooks' in settings && !isPlainObject(settings.hooks)) throw new SettingsShapeError('settings.json: "hooks" is not an object');
-  if (isPlainObject(settings.hooks) && 'PreToolUse' in settings.hooks && !Array.isArray(settings.hooks.PreToolUse)) {
-    throw new SettingsShapeError('settings.json: "hooks.PreToolUse" is not an array');
+  for (const event of HOOK_EVENTS) {
+    if (isPlainObject(settings.hooks) && event in settings.hooks && !Array.isArray(settings.hooks[event])) {
+      throw new SettingsShapeError(`settings.json: "hooks.${event}" is not an array`);
+    }
   }
   if ('permissions' in settings && !isPlainObject(settings.permissions)) throw new SettingsShapeError('settings.json: "permissions" is not an object');
   if (isPlainObject(settings.permissions) && 'allow' in settings.permissions && !Array.isArray(settings.permissions.allow)) {
@@ -378,24 +394,27 @@ function assertShape(settings) {
   }
 }
 
-// Removes our handlers from hooks.PreToolUse in place; drops groups that this leaves empty. Returns the count.
+// Removes our handlers from hooks.PreToolUse and hooks.SessionStart in place; drops groups that this leaves empty.
+// Returns the count removed.
 function stripOurHandlers(settings, home) {
-  const groups = settings.hooks?.PreToolUse;
-  if (!Array.isArray(groups)) return 0;
   let removed = 0;
-  settings.hooks.PreToolUse = groups.filter((group) => {
-    if (!isPlainObject(group) || !Array.isArray(group.hooks) || group.hooks.length === 0) return true;
-    const kept = group.hooks.filter((h) => !isOurHandler(h, home));
-    removed += group.hooks.length - kept.length;
-    if (kept.length === group.hooks.length) return true;
-    group.hooks = kept;
-    return kept.length > 0;
-  });
+  for (const event of HOOK_EVENTS) {
+    const groups = settings.hooks?.[event];
+    if (!Array.isArray(groups)) continue;
+    settings.hooks[event] = groups.filter((group) => {
+      if (!isPlainObject(group) || !Array.isArray(group.hooks) || group.hooks.length === 0) return true;
+      const kept = group.hooks.filter((h) => !isOurHandler(h, home));
+      removed += group.hooks.length - kept.length;
+      if (kept.length === group.hooks.length) return true;
+      group.hooks = kept;
+      return kept.length > 0;
+    });
+  }
   return removed;
 }
 
-// Pure: returns a new settings object with our hook groups appended (guard-files last) and our allow entries
-// added once. Any earlier handlers of ours are replaced; every other key, hook and entry is left as it was.
+// Pure: returns a new settings object with our hook groups appended (guard-files last; the SessionStart status group
+// after the owner's own) and our allow entries added once. Any earlier handlers of ours are replaced; every other key, hook and entry is left as it was.
 export function mergeSettings(settings, { home, skipFileGuard = false }) {
   assertShape(settings);
   const out = structuredClone(settings);
@@ -403,19 +422,21 @@ export function mergeSettings(settings, { home, skipFileGuard = false }) {
   out.hooks ??= {};
   out.hooks.PreToolUse ??= [];
   out.hooks.PreToolUse.push(...ourHookGroups(home, { skipFileGuard }));
+  out.hooks.SessionStart ??= [];
+  out.hooks.SessionStart.push(...ourSessionStartGroups(home));
   out.permissions ??= {};
   out.permissions.allow ??= [];
   for (const entry of ourAllowEntries(home)) if (!out.permissions.allow.includes(entry)) out.permissions.allow.push(entry);
   return out;
 }
 
-// Pure inverse for --uninstall. A container (PreToolUse, hooks, allow, permissions) that our removal leaves
-// empty is dropped, so installing into a settings file that had none of them and uninstalling round-trips.
+// Pure inverse for --uninstall. A container (PreToolUse, SessionStart, hooks, allow, permissions) that our removal
+// leaves empty is dropped, so installing into a settings file that had none of them and uninstalling round-trips.
 export function removeOurSettings(settings, { home }) {
   assertShape(settings);
   const out = structuredClone(settings);
-  if (stripOurHandlers(out, home) > 0 && out.hooks.PreToolUse.length === 0) {
-    delete out.hooks.PreToolUse;
+  if (stripOurHandlers(out, home) > 0) {
+    for (const event of HOOK_EVENTS) if (Array.isArray(out.hooks[event]) && out.hooks[event].length === 0) delete out.hooks[event];
     if (Object.keys(out.hooks).length === 0) delete out.hooks;
   }
   const allow = out.permissions?.allow;
@@ -437,26 +458,34 @@ const scriptOf = (handler) => {
   const text = [handler.command, ...(Array.isArray(handler.args) ? handler.args : [])].filter((s) => typeof s === 'string').map(toPosix).join(' ');
   if (/\/guard-git\.mjs/.test(text)) return 'guard-git';
   if (/\/guard-files\.mjs/.test(text)) return 'guard-files';
+  if (/\/session-version\.mjs/.test(text)) return 'session-version';
   return null;
 };
 
-// Our handlers in hooks.PreToolUse, grouped by script, each flagged exact when it equals what install writes.
+// Our handlers, grouped by script, each flagged exact when it equals what install writes. The guards are read from
+// hooks.PreToolUse, the status hook from hooks.SessionStart; one of ours under the wrong event is `unknown`.
 export function inspectHooks(settings, home) {
-  const out = { 'guard-git': [], 'guard-files': [], unknown: [] };
-  const groups = settings?.hooks?.PreToolUse;
-  if (!Array.isArray(groups)) return out;
-  const matcherFor = { 'guard-git': GUARD_GIT_MATCHER, 'guard-files': GUARD_FILES_MATCHER };
-  for (const group of groups) {
-    if (!isPlainObject(group) || !Array.isArray(group.hooks)) continue;
-    for (const handler of group.hooks) {
-      if (!isOurHandler(handler, home)) continue;
-      const script = scriptOf(handler);
-      if (!script) { out.unknown.push({ matcher: group.matcher, handler }); continue; }
-      out[script].push({
-        matcher: group.matcher,
-        handler,
-        exact: group.matcher === matcherFor[script] && isDeepStrictEqual(handler, handlerFor(home, script)),
-      });
+  const out = { 'guard-git': [], 'guard-files': [], 'session-version': [], unknown: [] };
+  const expected = {
+    'guard-git': { event: 'PreToolUse', matcher: GUARD_GIT_MATCHER, handler: handlerFor(home, 'guard-git') },
+    'guard-files': { event: 'PreToolUse', matcher: GUARD_FILES_MATCHER, handler: handlerFor(home, 'guard-files') },
+    'session-version': { event: 'SessionStart', matcher: undefined, handler: sessionHandlerFor(home) },
+  };
+  for (const event of HOOK_EVENTS) {
+    const groups = settings?.hooks?.[event];
+    if (!Array.isArray(groups)) continue;
+    for (const group of groups) {
+      if (!isPlainObject(group) || !Array.isArray(group.hooks)) continue;
+      for (const handler of group.hooks) {
+        if (!isOurHandler(handler, home)) continue;
+        const script = scriptOf(handler);
+        if (!script || expected[script].event !== event) { out.unknown.push({ matcher: group.matcher, handler }); continue; }
+        out[script].push({
+          matcher: group.matcher,
+          handler,
+          exact: group.matcher === expected[script].matcher && isDeepStrictEqual(handler, expected[script].handler),
+        });
+      }
     }
   }
   return out;
@@ -526,15 +555,16 @@ export function computeDrift({ home, plan, manifest, settings, settingsProblem, 
   }
   const found = inspectHooks(settings, home);
   const before = drift.length;
-  const hookCheck = (script, expected) => {
+  const hookCheck = (script, expected, event = 'PreToolUse') => {
     const list = found[script];
-    if (expected && list.length === 0) add('hook-missing', script, `hook missing: ${script} is not in hooks.PreToolUse`);
-    else if (expected && list.length > 1) add('hook-duplicated', script, `hook duplicated: ${script} appears ${list.length} times in hooks.PreToolUse`);
+    if (expected && list.length === 0) add('hook-missing', script, `hook missing: ${script} is not in hooks.${event}`);
+    else if (expected && list.length > 1) add('hook-duplicated', script, `hook duplicated: ${script} appears ${list.length} times in hooks.${event}`);
     else if (expected && !list[0].exact) add('hook-differs', script, `hook differs: the ${script} entry is not what install writes (path, matcher or timeout)`);
     else if (!expected && list.length > 0) add('hook-unexpected', script, `unexpected hook: ${script} is installed but this install omits it (--skip-file-guard)`);
   };
   hookCheck('guard-git', true);
   hookCheck('guard-files', expectGuardFiles);
+  hookCheck('session-version', true, 'SessionStart');
   for (const u of found.unknown) add('hook-unknown', null, `unrecognised hook entry in the pipeline hooks dir: ${JSON.stringify(u.handler)}`);
 
   const allow = Array.isArray(settings.permissions?.allow) ? settings.permissions.allow : [];
@@ -545,7 +575,8 @@ export function computeDrift({ home, plan, manifest, settings, settingsProblem, 
   if (drift.length === before) {
     let merged = null;
     try { merged = mergeSettings(settings, { home, skipFileGuard: !expectGuardFiles }); } catch { /* shape problems surface at install */ }
-    if (merged && !isDeepStrictEqual(merged, settings)) {
+    // Only PreToolUse is order-sensitive (guard-files must run last); other SessionStart entries may follow ours.
+    if (merged && !isDeepStrictEqual(merged.hooks?.PreToolUse, settings.hooks?.PreToolUse)) {
       add('hook-order', 'settings.json', 'hook order: our hook entries are not the last PreToolUse entries (guard-files must be last); reinstall fixes it');
     }
   }

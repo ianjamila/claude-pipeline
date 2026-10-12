@@ -95,6 +95,10 @@ const guardFiles = (home) => ({
   matcher: 'Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|Monitor|mcp__.*',
   hooks: [loaded(home, 'guard-files')],
 });
+// The SessionStart status hook (A3): plain, not the fail-closed loader, in its own group without a matcher.
+const sessionVersion = (home) => ({
+  hooks: [{ type: 'command', command: 'node', args: [join(home, 'pipeline', 'hooks', 'session-version.mjs')], timeout: 10 }],
+});
 const allowEntries = (home) => [
   `Bash(node ${posix(home)}/pipeline/bin/pipeline.mjs:*)`,
   ...(/\s/.test(home) ? [`Bash(node "${posix(home)}/pipeline/bin/pipeline.mjs":*)`] : []),
@@ -164,6 +168,7 @@ test('fresh install into an empty home (path with a space): files, manifest, hoo
 
   const s = readSettings(home);
   assert.deepEqual(s.hooks.PreToolUse, [guardGit(home), guardFiles(home)]);
+  assert.deepEqual(s.hooks.SessionStart, [sessionVersion(home)]);
   assert.deepEqual(s.permissions.allow, allowEntries(home));
   assert.deepEqual(Object.keys(s).sort(), ['hooks', 'permissions']);
   assert.equal(existsSync(join(home, 'backups')), false, 'no settings existed, so nothing to back up');
@@ -198,6 +203,7 @@ test('existing settings: every other key survives unchanged, ours is appended on
 
   const expected = structuredClone(before);
   expected.hooks.PreToolUse.push(guardGit(home), guardFiles(home));
+  expected.hooks.SessionStart.push(sessionVersion(home));
   expected.permissions.allow.push(...allowEntries(home));
   assert.deepEqual(after, expected);
   assert.deepEqual(Object.keys(after), Object.keys(before), 'top-level key order is preserved');
@@ -271,6 +277,7 @@ test('an older install in the string command form is replaced, not duplicated', 
   const after = readSettings(home);
   const expected = structuredClone(ownersSettings());
   expected.hooks.PreToolUse.push({ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }] }, guardGit(home), guardFiles(home));
+  expected.hooks.SessionStart.push(sessionVersion(home));
   expected.permissions.allow.push(...allowEntries(home));
   assert.deepEqual(after, expected);
 });
@@ -1153,4 +1160,87 @@ test('the installer writes the loader handler; an old plain-args handler is hook
   const check = install(home, ['--check', '--json']);
   assert.equal(check.status, 1);
   assert.ok(JSON.parse(check.stdout).drift.some((d) => d.kind === 'hook-differs' && d.path === 'guard-git'), check.stdout);
+});
+
+// ---- A3: SessionStart status hook -------------------------------------------------------------------------------
+
+test('install appends the session-version group after the owner\'s SessionStart groups, once, and touches none of theirs', () => {
+  const home = newHome();
+  const before = ownersSettings();
+  before.hooks.SessionStart.push({ matcher: 'startup', hooks: [{ type: 'command', command: 'node ~/memory-sync.js' }] });
+  writeSettings(home, before);
+  assert.equal(install(home).status, 0);
+  assert.equal(install(home).status, 0);
+  const s = readSettings(home);
+  assert.deepEqual(s.hooks.SessionStart, [...before.hooks.SessionStart, sessionVersion(home)]);
+  assert.equal(install(home, ['--check']).status, 0, 'a clean install has no drift');
+});
+
+test('--check: a later SessionStart entry after ours is fine; a missing, duplicated or edited session-version hook is reported', () => {
+  const home = newHome();
+  assert.equal(install(home).status, 0);
+  const drift = () => { const r = install(home, ['--check', '--json']); return { status: r.status, items: JSON.parse(r.stdout).drift }; };
+
+  const s = readSettings(home);
+  s.hooks.SessionStart.push({ hooks: [{ type: 'command', command: 'echo plugin added this later' }] });
+  writeSettings(home, s);
+  assert.equal(drift().status, 0, 'order among SessionStart entries is not drift');
+
+  const dup = structuredClone(s);
+  dup.hooks.SessionStart.push(sessionVersion(home));
+  writeSettings(home, dup);
+  assert.ok(drift().items.some((d) => d.kind === 'hook-duplicated' && d.path === 'session-version'));
+
+  const edited = structuredClone(s);
+  edited.hooks.SessionStart[0].hooks[0].timeout = 99;
+  writeSettings(home, edited);
+  assert.ok(drift().items.some((d) => d.kind === 'hook-differs' && d.path === 'session-version'));
+
+  const gone = structuredClone(s);
+  gone.hooks.SessionStart = gone.hooks.SessionStart.filter((g) => !g.hooks.some((h) => isOurHandler(h, home)));
+  writeSettings(home, gone);
+  const missing = drift();
+  assert.equal(missing.status, 1);
+  assert.ok(missing.items.some((d) => d.kind === 'hook-missing' && d.path === 'session-version'));
+  assert.equal(install(home).status, 0);
+  assert.equal(drift().status, 0);
+});
+
+test('an install from before the status hook existed reports it missing until the next install', () => {
+  const home = newHome();
+  assert.equal(install(home).status, 0);
+  const s = readSettings(home);
+  delete s.hooks.SessionStart;
+  writeSettings(home, s);
+  const r = install(home, ['--check', '--json']);
+  assert.deepEqual(JSON.parse(r.stdout).drift.map((d) => d.kind), ['hook-missing']);
+});
+
+test('--uninstall removes the session-version hook only; the owner\'s SessionStart groups stay', () => {
+  const home = newHome();
+  const before = ownersSettings();
+  writeSettings(home, before);
+  assert.equal(install(home).status, 0);
+  assert.equal(install(home, ['--uninstall']).status, 0);
+  assert.deepEqual(readSettings(home).hooks.SessionStart, before.hooks.SessionStart);
+  assert.deepEqual(readSettings(home), before);
+});
+
+test('mergeSettings/removeOurSettings round-trip with SessionStart; our handler is lifted out of a shared SessionStart group', () => {
+  const home = '/h/.claude';
+  assert.deepEqual(removeOurSettings(mergeSettings({}, { home }), { home }), {});
+  const shared = { hooks: { SessionStart: [{ hooks: [
+    { type: 'command', command: 'echo mine' },
+    { type: 'command', command: 'node', args: ['/h/.claude/pipeline/hooks/session-version.mjs'], timeout: 10 },
+  ] }] } };
+  const merged = mergeSettings(shared, { home });
+  assert.deepEqual(merged.hooks.SessionStart, [{ hooks: [{ type: 'command', command: 'echo mine' }] }, sessionVersion(home)]);
+  assert.throws(() => mergeSettings({ hooks: { SessionStart: {} } }, { home }), /hooks\.SessionStart" is not an array/);
+});
+
+test('buildPlan requires pipeline/hooks/session-version.mjs like the two guards', () => {
+  const src = copyFixture();
+  rmSync(join(src, 'pipeline', 'hooks', 'session-version.mjs'));
+  assert.ok(buildPlan(src).problems.includes('pipeline/hooks/session-version.mjs is missing'));
+  assert.equal(buildPlan(FIXTURE).problems.length, 0);
 });
