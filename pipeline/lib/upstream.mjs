@@ -35,6 +35,13 @@ const DEFAULT_TIMEOUT_MS = 15000;
 const GIT_ENV_KEEP = ['PATH', 'HOME', 'LANG', 'LC_ALL'];
 const GIT_ENV_KEEP_WINDOWS = ['SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'PROGRAMDATA'];
 
+// The "no file" path handed to git. os.devNull is `\\.\nul` on Windows, which Git for Windows cannot open as a config
+// file (`fatal: unable to access '\\.\nul': Invalid argument`); it maps the literal `/dev/null` to NUL itself, so that
+// is what it gets there. Everywhere else os.devNull is already `/dev/null`.
+export function gitNullDevice(platform = process.platform) {
+  return platform === 'win32' ? '/dev/null' : os.devNull;
+}
+
 export function isolatedGitEnv({ source = process.env, platform = process.platform } = {}) {
   const env = {};
   const windows = platform === 'win32';
@@ -43,14 +50,14 @@ export function isolatedGitEnv({ source = process.env, platform = process.platfo
     const key = windows ? Object.keys(source).find((k) => k.toUpperCase() === name) : (name in source ? name : undefined);
     if (key !== undefined && source[key] !== undefined) env[name] = source[key];
   }
-  return { ...env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull, GIT_TERMINAL_PROMPT: '0' };
+  return { ...env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: gitNullDevice(platform), GIT_TERMINAL_PROMPT: '0' };
 }
 
 // Leading `-c` options: no hooks, no fsmonitor, no credential helper, and https as the only transport. `allowFile`
 // additionally opens the file transport; it is only for the test seam (a local bare repo standing in for GitHub).
 export function isolatedGitArgs({ allowFile = false } = {}) {
   return [
-    '-c', `core.hooksPath=${os.devNull}`,
+    '-c', `core.hooksPath=${gitNullDevice()}`,
     '-c', 'core.fsmonitor=false',
     '-c', 'credential.helper=',
     '-c', 'protocol.allow=never',

@@ -9,12 +9,12 @@ import { spawnSync } from 'node:child_process';
 import {
   cpSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync,
 } from 'node:fs';
-import { devNull, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createFakeGh } from './helpers/fakegh-env.mjs';
 import { run as update, meta, installerEnv } from '../pipeline/commands/update.mjs';
-import { compare, fetchRemote, isolatedGit, isolatedGitArgs, isolatedGitEnv, mainSha, UPSTREAM_HOST, UPSTREAM_REPO, UPSTREAM_URL } from '../pipeline/lib/upstream.mjs';
+import { compare, fetchRemote, gitNullDevice, isolatedGit, isolatedGitArgs, isolatedGitEnv, mainSha, UPSTREAM_HOST, UPSTREAM_REPO, UPSTREAM_URL } from '../pipeline/lib/upstream.mjs';
 import { seamValue } from '../pipeline/lib/proc.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -433,14 +433,17 @@ test('compare and mainSha give up when gh hangs past the timeout', () => {
 
 test('the isolated git: fixed flags, no system/global config, no prompts', () => {
   const args = isolatedGitArgs();
-  for (const pair of [`core.hooksPath=${devNull}`, 'core.fsmonitor=false', 'credential.helper=', 'protocol.allow=never', 'protocol.https.allow=always']) {
+  for (const pair of [`core.hooksPath=${gitNullDevice()}`, 'core.fsmonitor=false', 'credential.helper=', 'protocol.allow=never', 'protocol.https.allow=always']) {
     assert.ok(args.includes(pair), pair);
   }
   assert.equal(args.includes('protocol.file.allow=always'), false);
   assert.ok(isolatedGitArgs({ allowFile: true }).includes('protocol.file.allow=always'));
   const env = isolatedGitEnv();
   assert.equal(env.GIT_CONFIG_NOSYSTEM, '1');
-  assert.equal(env.GIT_CONFIG_GLOBAL, devNull);
+  assert.equal(env.GIT_CONFIG_GLOBAL, gitNullDevice());
+  // os.devNull is \\.\nul on Windows and Git for Windows cannot open it; it is given /dev/null there (the CI windows job runs git for real).
+  assert.equal(gitNullDevice('win32'), '/dev/null');
+  assert.equal(isolatedGitEnv({ source: {}, platform: 'win32' }).GIT_CONFIG_GLOBAL, '/dev/null');
   assert.equal(env.GIT_TERMINAL_PROMPT, '0');
 });
 
@@ -451,7 +454,7 @@ test('the isolated git environment is an allowlist: PATH, HOME, locale and three
     GIT_PROXY_COMMAND: 'evil', GIT_ASKPASS: 'evil', GIT_PAGER: 'evil', GIT_FUTURE_VARIABLE: 'evil', GIT_DIR: '/evil',
     HTTPS_PROXY: 'http://evil', SSL_CERT_FILE: '/evil', CURL_CA_BUNDLE: '/evil', LD_PRELOAD: '/evil.so', NODE_OPTIONS: '--require evil', EDITOR: 'evil',
   };
-  const fixed = { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: devNull, GIT_TERMINAL_PROMPT: '0' };
+  const fixed = { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: gitNullDevice(), GIT_TERMINAL_PROMPT: '0' };
   assert.deepEqual(isolatedGitEnv({ source: hostile, platform: 'linux' }), { PATH: '/usr/bin', HOME: '/home/u', LANG: 'en_US.UTF-8', LC_ALL: 'C', ...fixed });
   // Windows adds the variables the runtime needs to start, and finds them whatever their case.
   const win = isolatedGitEnv({ source: { Path: 'C:\\bin', ComSpec: 'C:\\cmd.exe', SystemRoot: 'C:\\Windows', GIT_EXEC_PATH: '/evil', NODE_OPTIONS: 'x' }, platform: 'win32' });

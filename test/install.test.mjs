@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { tryAcquire, release, inspect } from '../pipeline/lib/locks.mjs';
 import {
   mergeSettings, removeOurSettings, isOurHandler, ourAllowEntries, renameWithRetry, collectDiagnostics,
-  installLockName, shellRcPaths, parseArgs, buildPlan, walkFiles, safeManifestKey, GUARD_FILES_MATCHER, GUARD_GIT_MATCHER, HOOK_LOADER,
+  installLockName, shellRcPaths, parseArgs, buildPlan, walkFiles, safeManifestKey, GUARD_FILES_MATCHER, GUARD_GIT_MATCHER, HOOK_LOADER, joinNative,
 } from '../pipeline/lib/installer.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -98,7 +98,7 @@ const guardFiles = (home) => ({
 });
 // The SessionStart status hook (A3): plain, not the fail-closed loader, in its own group without a matcher.
 const sessionVersion = (home) => ({
-  hooks: [{ type: 'command', command: 'node', args: [join(home, 'pipeline', 'hooks', 'session-version.mjs')], timeout: 10 }],
+  hooks: [{ type: 'command', command: 'node', args: [joinNative(home, 'pipeline', 'hooks', 'session-version.mjs')], timeout: 10 }],
 });
 const allowEntries = (home) => [
   `Bash(node ${posix(home)}/pipeline/bin/pipeline.mjs:*)`,
