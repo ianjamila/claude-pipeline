@@ -337,7 +337,7 @@ test('agent-log close: dry run prints {lines, pending, unreadable} and writes no
   const t = closeRepo(pendingLine(1420), [shaEntry(1420), commentsEntry(1420, [comment(marker())])]);
   const r = t.close();
   assertExit(r, 0);
-  assert.deepEqual(r.json, { ok: true, lines: [resolved(1420)], pending: [1420], skipped: [], unreadable: [] });
+  assert.deepEqual(r.json, { ok: true, lines: [resolved(1420)], pending: [1420], skipped: [], unreadable: [], originReadable: true });
   assert.deepEqual(readQueueLines(t), [], 'a dry run queues nothing');
   assert.equal(t.repo.git(['status', '--porcelain']), '', 'and changes nothing in the worktree');
 });
@@ -397,7 +397,7 @@ test('agent-log close: exit 3 when GitHub is unavailable; no pending lines means
   none.fake.setScript([]);
   const r = none.close();
   assertExit(r, 0);
-  assert.deepEqual(r.json, { ok: true, lines: [], pending: [], skipped: [], unreadable: [] });
+  assert.deepEqual(r.json, { ok: true, lines: [], pending: [], skipped: [], unreadable: [], originReadable: true });
   assert.deepEqual(none.fake.lines(), []);
 });
 
@@ -653,4 +653,11 @@ test('agent-log close --queue: origin\'s copy unreadable still closes what it ca
   assert.deepEqual(r.json.lines, [resolved(1500)]);
   assert.deepEqual(readQueueLines(t), [resolved(1500)]);
   assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).lastScanAt, lastScanAt);
+  assert.equal(r.json.originReadable, false);
+  assert.ok(r.stderr.includes('origin/main agent log unreadable — closing from the worktree log; scan checkpoint not advanced'), r.stderr);
+
+  const ok = closeRepo(ANCIENT_AND_NEW(), [scanEntry([]), shaEntry(1500), commentsEntry(1500, [])]);
+  const good = ok.close('--queue');
+  assert.equal(good.json.originReadable, true);
+  assert.ok(!good.stderr.includes('unreadable'), good.stderr);
 });
