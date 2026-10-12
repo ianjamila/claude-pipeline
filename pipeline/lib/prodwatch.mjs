@@ -9,6 +9,7 @@ import { join, resolve } from 'node:path';
 import { fill } from './config.mjs';
 import { git as gitRun, NETWORK_TIMEOUT_MS } from './git.mjs';
 import { runShellAsync } from './proc.mjs';
+import { unresolvedRollbacks } from './run-events.mjs';
 import { applyCheckpoint, bindRecord, emptyRecord } from './run-record.mjs';
 import { readSummaryComment, writeSummaryComment } from './summary-comment.mjs';
 import { tail } from './vercel.mjs';
@@ -323,10 +324,7 @@ export async function runProdWatch(opts, deps) {
 // it ended. -> {intent: {id, url, ...event data}, liveNow: {id, url} | null} | null. The live deployment is what the
 // watch just read, or one more read of the domain; null when it cannot be read.
 async function findInterruptedRollback(opts, deps, out) {
-  const evts = await deps.events.list();
-  const forThisMerge = (e) => e.dataStatus !== 'ok' || e.data?.mergeSha === opts.sha;
-  const done = new Set(evts.filter((e) => e.kind === 'rollback-result' && forThisMerge(e)).map((e) => e.id));
-  const open = evts.filter((e) => e.kind === 'rollback-intent' && forThisMerge(e) && !done.has(e.id)).at(-1);
+  const open = unresolvedRollbacks(await deps.events.list(), { mergeSha: opts.sha }).at(-1);
   if (!open) return null;
   let live = out.live ?? null;
   if (!live) {

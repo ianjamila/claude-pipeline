@@ -64,6 +64,17 @@ test('merged: a rollback-intent without a rollback-result observes production an
   assert.equal(plan({ state: 'MERGED', recordStatus: 'absent', record: null, events: [{ kind: 'rollback-intent' }] }).enter, 'observe-prod');
 });
 
+test('merged: results are matched per attempt id, so attempt 1\'s result does not hide an interrupted attempt 2', () => {
+  const events = [
+    { kind: 'rollback-intent', id: 'aaaaaaa-1' }, { kind: 'rollback-result', id: 'aaaaaaa-1' }, { kind: 'rollback-intent', id: 'aaaaaaa-2' },
+  ];
+  const p = plan({ state: 'MERGED', record: record({ step: 'ended', outcome: 'merged' }), events });
+  assert.equal(p.enter, 'observe-prod');
+  assert.ok(p.notes.some((n) => /rollback may have been in progress/.test(n)));
+  // once attempt 2 has its own result it is done
+  assert.equal(plan({ state: 'MERGED', record: record({ step: 'ended', outcome: 'merged' }), events: [...events, { kind: 'rollback-result', id: 'aaaaaaa-2' }] }).enter, 'ended');
+});
+
 test('a fork PR is not resumable', () => {
   const p = plan({ isCrossRepository: true, local: null });
   assert.equal(p.enter, 'not-resumable');

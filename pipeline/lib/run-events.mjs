@@ -50,6 +50,15 @@ export function listEvents(comments, viewerLogin) {
     .map(({ c, event }) => ({ commentId: c.id, url: c.html_url ?? null, ...event }));
 }
 
+// Rollback attempts whose `rollback-intent` has no `rollback-result` OF THE SAME ID (attempts are `<sha7>-<n>`, so an
+// earlier attempt's result never closes a later attempt's intent). Oldest first. `mergeSha` narrows to one merge; an
+// event whose payload cannot be read still counts, because it may be this merge's.
+export function unresolvedRollbacks(events, { mergeSha = null } = {}) {
+  const forMerge = (e) => !mergeSha || e.dataStatus !== 'ok' || e.data?.mergeSha === mergeSha;
+  const done = new Set((events ?? []).filter((e) => e.kind === 'rollback-result' && forMerge(e)).map((e) => String(e.id)));
+  return (events ?? []).filter((e) => e.kind === 'rollback-intent' && forMerge(e) && !done.has(String(e.id)));
+}
+
 export const readEvents = (gh, pr) => listEvents(gh.listComments(pr), gh.viewer());
 
 // Always a new comment: this never calls upsertComment, so a second event can never rewrite a first one.

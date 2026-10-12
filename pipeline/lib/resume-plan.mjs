@@ -5,11 +5,13 @@
 //   state: 'OPEN' | 'CLOSED' | 'MERGED', isCrossRepository, labels[], liveHead, autoMergeArmed, host (this machine),
 //   recordStatus: ok | absent | legacy | unsupported | invalid | mismatch, record (decoded, bound to this PR) | null,
 //   triage: null | { rounds, lastRound, lastRoundComplete, lastContentHash, clean (items only), followupsPending },
-//   contentHash: the live head's review hash | null (unknown), needsHumanReason, events: [{kind}],
+//   contentHash: the live head's review hash | null (unknown), needsHumanReason, events: [{kind, id}],
 //   local: null (unknown / not asked) | { state: none|equal|ahead|behind|diverged|unknown, localRef, unpushed, dirty, worktrees: [{path, dirty}] },
 // }
 // Resume never merges and never rolls production back: every route that reaches `gate` ends at the owner-merge stop, and
 // `observe-prod` only watches.
+
+import { unresolvedRollbacks } from './run-events.mjs';
 
 const MINUTE = 60000;
 
@@ -44,7 +46,7 @@ function liveInFlight(record, nowMs, fallbackMinutes) {
 }
 
 function routeMerged(facts, record) {
-  const rollbackOpen = facts.events.some((e) => e.kind === 'rollback-intent') && !facts.events.some((e) => e.kind === 'rollback-result');
+  const rollbackOpen = unresolvedRollbacks(facts.events).length > 0;
   const midMerge = facts.recordStatus === 'ok' && record != null && record.outcome == null && (record.step === 'merge' || record.step === 'prod-watch');
   if (!rollbackOpen && !midMerge) {
     return { enter: 'ended', reason: record?.outcome ? `already merged; the run ended ${record.outcome}` : 'already merged; nothing left to resume' };

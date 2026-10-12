@@ -10,7 +10,7 @@ import { createGitHub, guardGh } from '../lib/github.mjs';
 import { classifyPr, classifyStranded, ciDetail, triageGroups } from '../lib/inbox.mjs';
 import { listWorktrees, localBranchState, orphanWorktrees } from '../lib/local-branches.mjs';
 import { analyseComments } from '../lib/pr-facts.mjs';
-import { listEvents } from '../lib/run-events.mjs';
+import { listEvents, unresolvedRollbacks } from '../lib/run-events.mjs';
 import { summaryFromComments } from '../lib/summary-comment.mjs';
 
 export const meta = {
@@ -175,7 +175,7 @@ export const run = guarded(async (argv, ctx) => {
       return {
         number: m.number, mergedAt: m.mergedAt,
         recordStatus: summary.status, record: summary.status === 'ok' ? summary.record : null,
-        events: { rollbackIntent: events.some((e) => e.kind === 'rollback-intent'), rollbackResult: events.some((e) => e.kind === 'rollback-result') },
+        events: { unresolvedRollbacks: unresolvedRollbacks(events).length },
       };
     });
 

@@ -275,7 +275,7 @@ const IN_MERGE_PHASE = new Set(['merge', 'prod-watch']);
 export function classifyStranded(merged, now) {
   const out = [];
   for (const m of merged ?? []) {
-    const unfinishedRollback = Boolean(m.events?.rollbackIntent) && !m.events?.rollbackResult;
+    const unfinishedRollback = Number(m.events?.unresolvedRollbacks) > 0;
     const midMerge = m.recordStatus === 'ok' && m.record != null && IN_MERGE_PHASE.has(m.record.step);
     if (!unfinishedRollback && !midMerge) continue;
     const reason = unfinishedRollback

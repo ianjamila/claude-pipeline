@@ -240,6 +240,25 @@ test('plan: another machine\'s fresh heartbeat asks for confirmation', () => {
   assert.equal(resume(['plan', '--pr', '7'], { w, fake: own }).json.confirm, null);
 });
 
+test('plan: merged, ended record, attempt 1 resolved but attempt 2 interrupted -> observe-prod (results are matched per attempt)', () => {
+  const w = world();
+  const sha = w.prBranch(7, { 'b.txt': 'b\n' });
+  const fake = createFakeGh([
+    ...BASE_ENTRIES,
+    { match: VIEW(7), stdoutJson: view(7, sha, { state: 'MERGED', mergeCommit: { oid: 'c'.repeat(40) } }) },
+    { match: COMMENTS(7), stdoutJson: [
+      recordComment(1, 7, { step: 'ended', outcome: 'merged' }),
+      comment(2, ME, renderEvent('rollback-intent', 'ccccccc-1', 'rolling back', {})),
+      comment(3, ME, renderEvent('rollback-result', 'ccccccc-1', 'done', {})),
+      comment(4, ME, renderEvent('rollback-intent', 'ccccccc-2', 'rolling back again', {})),
+    ] },
+  ]);
+  const r = resume(['plan', '--pr', '7'], { w, fake });
+  assertExit(r, 0);
+  assert.equal(r.json.enter, 'observe-prod');
+  assert.deepEqual(r.json.events.unresolvedRollbacks, ['ccccccc-2']);
+});
+
 test('plan: merged mid prod-watch observes production and carries the merge commit; closed is closed', () => {
   const w = world();
   const sha = w.prBranch(7, { 'b.txt': 'b\n' });
@@ -254,6 +273,7 @@ test('plan: merged mid prod-watch observes production and carries the merge comm
   assert.equal(r.json.mergeSha, 'c'.repeat(40));
   assert.equal(r.json.events.rollbackIntent, true);
   assert.equal(r.json.events.rollbackResult, false);
+  assert.deepEqual(r.json.events.unresolvedRollbacks, ['r1']);
   assert.deepEqual(r.json.worktree, { action: 'none' });
   assert.equal(r.json.local, null, 'a merged PR\'s branch is not compared');
   assertReadOnly(fake);

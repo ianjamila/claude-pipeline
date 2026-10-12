@@ -10,6 +10,7 @@ import { localBranchState } from '../lib/local-branches.mjs';
 import { analyseComments } from '../lib/pr-facts.mjs';
 import { GhError } from '../lib/proc.mjs';
 import { planResume } from '../lib/resume-plan.mjs';
+import { unresolvedRollbacks } from '../lib/run-events.mjs';
 import { bindRecord } from '../lib/run-record.mjs';
 import { summaryFromComments } from '../lib/summary-comment.mjs';
 
@@ -112,7 +113,7 @@ function recordView(record) {
   };
 }
 
-// The newest event of each kind (the rollback target lives in `prod-before`), and whether a rollback began without a result.
+// The newest event of each kind (the rollback target lives in `prod-before`), and which rollback attempts began without a result of their own id.
 function eventsView(events) {
   const latest = {};
   for (const e of events) latest[e.kind] = { id: e.id, url: e.url, sentence: e.sentence, data: e.data };
@@ -120,6 +121,7 @@ function eventsView(events) {
     count: events.length,
     rollbackIntent: events.some((e) => e.kind === 'rollback-intent'),
     rollbackResult: events.some((e) => e.kind === 'rollback-result'),
+    unresolvedRollbacks: unresolvedRollbacks(events).map((e) => e.id),
     latest,
   };
 }

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createGitHub } from '../pipeline/lib/github.mjs';
-import { EVENT_KINDS, listEvents, parseEvent, postEvent, readEvents, renderEvent } from '../pipeline/lib/run-events.mjs';
+import { EVENT_KINDS, listEvents, parseEvent, postEvent, readEvents, renderEvent, unresolvedRollbacks } from '../pipeline/lib/run-events.mjs';
 import { createFakeGh, REPO_VIEW } from './helpers/fakegh-env.mjs';
 
 const REPO = { match: '^repo view', stdoutJson: REPO_VIEW };
@@ -84,4 +84,24 @@ test('readEvents pages through every comment page', () => {
   }]);
   const gh = createGitHub({ cwd: process.cwd(), env: fake.env });
   assert.deepEqual(readEvents(gh, 4).map((e) => e.kind), ['prod-before', 'rollback-intent']);
+});
+
+test('unresolvedRollbacks: judged per attempt id, so an earlier attempt\'s result never closes a later intent', () => {
+  const E = (kind, id, data = {}) => ({ kind, id, data, dataStatus: 'ok' });
+  assert.deepEqual(unresolvedRollbacks([]), []);
+  assert.deepEqual(unresolvedRollbacks([E('rollback-intent', 'a-1'), E('rollback-result', 'a-1')]), []);
+  const open = unresolvedRollbacks([E('rollback-intent', 'a-1'), E('rollback-result', 'a-1'), E('rollback-intent', 'a-2')]);
+  assert.deepEqual(open.map((e) => e.id), ['a-2']);
+  // a result for another id does not count; an unrelated kind does not either
+  assert.deepEqual(unresolvedRollbacks([E('rollback-intent', 'a-2'), E('rollback-result', 'a-1'), E('prod-before', 'a-2')]).map((e) => e.id), ['a-2']);
+  // a result posted before its intent (ordering does not matter) still closes it
+  assert.deepEqual(unresolvedRollbacks([E('rollback-result', 'a-3'), E('rollback-intent', 'a-3')]), []);
+});
+
+test('unresolvedRollbacks: mergeSha narrows to one merge; an unreadable payload may be this merge\'s', () => {
+  const E = (kind, id, mergeSha, dataStatus = 'ok') => ({ kind, id, data: dataStatus === 'ok' ? { mergeSha } : null, dataStatus });
+  const events = [E('rollback-intent', 'a-1', 'AAA'), E('rollback-intent', 'b-1', 'BBB'), E('rollback-intent', 'c-1', null, 'invalid'), E('rollback-result', 'a-1', 'BBB')];
+  // the result for a-1 is another merge's, so it does not close a-1 for AAA
+  assert.deepEqual(unresolvedRollbacks(events, { mergeSha: 'AAA' }).map((e) => e.id), ['a-1', 'c-1']);
+  assert.deepEqual(unresolvedRollbacks(events, { mergeSha: 'BBB' }).map((e) => e.id), ['b-1', 'c-1']);
 });

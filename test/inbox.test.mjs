@@ -574,7 +574,7 @@ test('classifyPr is pure: the same facts give the same answer and facts are not 
 
 // ---- classifyStranded -------------------------------------------------------------------------
 
-const ev = (over = {}) => ({ rollbackIntent: false, rollbackResult: false, ...over });
+const ev = (over = {}) => ({ unresolvedRollbacks: 0, ...over });
 const merged = (number, over = {}) => ({
   number,
   mergedAt: ago(2 * DAY),
@@ -617,13 +617,13 @@ test('not stranded: merged / ended (prod-watch finished) and every other ended o
 });
 
 test('stranded: rollback-intent without rollback-result, even on a terminal outcome', () => {
-  const [s] = classifyStranded([merged(5, { record: record({ step: 'ended', outcome: 'recovered' }), events: ev({ rollbackIntent: true }) })], NOW);
+  const [s] = classifyStranded([merged(5, { record: record({ step: 'ended', outcome: 'recovered' }), events: ev({ unresolvedRollbacks: 1 }) })], NOW);
   assert.equal(s.number, 5);
   assert.match(s.reason, /rollback/);
 });
 
 test('not stranded: rollback-intent WITH rollback-result and a terminal outcome', () => {
-  const m = merged(5, { record: record({ step: 'ended', outcome: 'recovered' }), events: ev({ rollbackIntent: true, rollbackResult: true }) });
+  const m = merged(5, { record: record({ step: 'ended', outcome: 'recovered' }), events: ev({ unresolvedRollbacks: 0 }) });
   assert.equal(classifyStranded([m], NOW).length, 0);
 });
 
@@ -632,7 +632,7 @@ test('not stranded: no pipeline record at all (not our run)', () => {
 });
 
 test('stranded: rollback-intent without result and no record at all is still reported', () => {
-  const [s] = classifyStranded([merged(5, { record: null, recordStatus: 'absent', events: ev({ rollbackIntent: true }) })], NOW);
+  const [s] = classifyStranded([merged(5, { record: null, recordStatus: 'absent', events: ev({ unresolvedRollbacks: 1 }) })], NOW);
   assert.equal(s.number, 5);
 });
 

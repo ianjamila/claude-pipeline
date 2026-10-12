@@ -336,6 +336,22 @@ test('stranded after merge: recently merged with a record stuck in prod-watch; o
   assertReadOnly(fake);
 });
 
+test('stranded after merge: attempt 1 resolved but attempt 2 interrupted is still stranded; fully resolved is not', () => {
+  const w = world();
+  const ev = (n, kind, id) => comment(n, 'me', renderEvent(kind, id, kind, {}));
+  const merged = (n, daysAgo = 1) => ({ number: n, title: `M${n}`, url: 'u', mergedAt: ago(daysAgo * DAY), updatedAt: ago(daysAgo * DAY), baseRefName: 'main', headRefName: `agent/pr-${n}`, headRefOid: 'a'.repeat(40), isCrossRepository: false });
+  const fake = createFakeGh([
+    ...BASE_ENTRIES,
+    OPEN_ONLY(page([])),
+    { match: 'graphql[\\s\\S]*states: MERGED', stdoutJson: page([merged(9), merged(8), merged(7, 30)], 'm1') },
+    { match: COMMENTS(9), stdoutJson: [ev(1, 'rollback-intent', 'r-1'), ev(2, 'rollback-result', 'r-1'), ev(3, 'rollback-intent', 'r-2')] },
+    { match: COMMENTS(8), stdoutJson: [ev(4, 'rollback-intent', 'r-1'), ev(5, 'rollback-result', 'r-1')] },
+  ]);
+  const r = inbox(['--merged-days', '7'], { w, fake });
+  assertExit(r, 0);
+  assert.deepEqual(r.json.strandedAfterMerge.map((s) => s.number), [9]);
+});
+
 test('local work: an unpushed commit overrides nextAction and is listed; orphan worktrees are listed, never touched', () => {
   const w = world();
   const sha = w.prBranch(1, { 'b.txt': 'b\n' });
