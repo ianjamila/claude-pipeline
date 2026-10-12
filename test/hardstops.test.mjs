@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { classifyHardStops, collectHardStops, enclosingStatements, stripSqlComments, envNamesIn } from '../pipeline/lib/hardstops.mjs';
+import { diffFiles } from '../pipeline/lib/git.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { MIG, pkg, cfg, file, rulesOf, classify, run } from './helpers/hardstops.mjs';
 
@@ -707,6 +708,8 @@ test('IO: a large binary under migrations, deleted or moved out with an edit, is
   repo.rm('supabase/migrations/20240102_moved.xlsx');
   repo.write('exports/moved.xlsx', Buffer.concat([sheet, Buffer.from('tail')]));
   repo.commit('delete one, move and edit the other');
+  // precondition: both really were skipped, so the hits below come from their paths alone
+  assert.deepEqual(diffFiles('main', 'feat', { cwd: repo.dir }).map((f) => f.skippedLargeBinary), [true, true]);
   const hits = await collectHardStops({ base: 'main', head: 'feat', cwd: repo.dir, config: cfg() });
   const of = (file) => rulesOf(hits.filter((h) => h.file === file));
   assert.ok(of('supabase/migrations/20240101_gone.xlsx').includes('R1-destructive'));
