@@ -1957,15 +1957,28 @@ function evaluateBashForFilesFrame(command, opts) {
   // a missed name would hide the script a variable picks. The replay found no false block from it.)
   // (a name the line never set, after a source nothing could follow: it may have come from that file)
   const newName = (n) => ctx.unknownAll && !Object.hasOwn(ctx.vars, n);
+  const snaps = []; // per command: the names a sourced file may have changed / set at run time as that command runs (the checks after the loop would otherwise see the end state)
   // Is the directory the line works in only known at run time? (a `cd` into an unset / substituted / maybe-changed name, `cd -`, `popd`; or the frame was started in one)
   const unknownCwd = () => {
     if (assumedCwd) return false; // (a rerun that already assumes a directory: the unknown cd is what it stands for)
     if (opts._unknownCwd === true || ctx.sourcedCdUnknown) return true;
-    const live = ctx.srcChanged.size > 0 || ctx.unknownAll;
-    const tainted = live ? taintClosure(ctx.srcChanged, cmds, {}, newName, true) : new Set();
     const KNOWN = new Set(['HOME', 'USER', 'LOGNAME']);
-    const unknownName = (n) => tainted.has(n) || newName(n) || ctx.unknownVars.has(n) || ctx.pickUnknown.has(n) || (!KNOWN.has(n) && !Object.hasOwn(ctx.vars, n));
-    const moved = (n) => tainted.has(n) || ctx.srcChanged.has(n) || ctx.pickUnknown.has(n) || ctx.unknownVars.has(n);
+    const closures = new Map();
+    // (the state when the cd ran, or by the end of the line: a later plain assignment does not clean an earlier cd)
+    const stateAt = (ci) => {
+      const sn = snaps[ci];
+      const base = unique([...ctx.srcChanged, ...(sn?.changed ?? [])]).sort();
+      const live = base.length > 0 || ctx.unknownAll;
+      const key = base.join('\u0000');
+      if (!closures.has(key)) closures.set(key, live ? taintClosure(base, cmds, {}, newName, true) : new Set());
+      const tainted = closures.get(key);
+      const unk = (n) => ctx.unknownVars.has(n) || sn?.unknownV.has(n);
+      return {
+        unknownName: (n) => tainted.has(n) || newName(n) || unk(n) || ctx.pickUnknown.has(n) || (!KNOWN.has(n) && !Object.hasOwn(ctx.vars, n)),
+        moved: (n) => tainted.has(n) || base.includes(n) || ctx.pickUnknown.has(n) || unk(n),
+      };
+    };
+    const moved = (n) => stateAt(-1).moved(n) || Object.keys(snaps).some((ci) => stateAt(Number(ci)).moved(n));
     // Why: HOME is never believed from the line (the guard reads `~` as the real home), so a line that sets it, or a source that may, leaves `cd` / `cd ~` / `cd ~/x` without a known target
     const homeMoved = ctx.unknownAll || moved('HOME') || cmds.some((c) => Object.hasOwn(c.env ?? {}, 'HOME') || c.argv.some((a) => /^HOME(?:=|\[|$)/.test(a)));
     // Why: with CDPATH set a relative `cd sub` goes to the first CDPATH entry that has `sub` (the line's, the environment's, one a source may have set)
@@ -1973,6 +1986,7 @@ function evaluateBashForFilesFrame(command, opts) {
     return cmds.some((c, ci) => {
       const cn = baseOf(c.argv[0] ?? '');
       if (!CD_CMDS.has(cn)) return false;
+      const { unknownName } = stateAt(ci);
       if (cdUnknownShape(c.argv)) return true;
       const t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
       if (t !== undefined && modelledCd(t, cmds, ci, ctx) !== null) return false;
@@ -2036,6 +2050,7 @@ function evaluateBashForFilesFrame(command, opts) {
   if ((opts._depth ?? 0) < 4) {
     for (const [idx, c] of cmds.entries()) {
       frame.i = idx;
+      if (ctx.srcChanged.size || ctx.unknownVars.size) snaps[idx] = { changed: new Set(ctx.srcChanged), unknownV: new Set(ctx.unknownVars) }; // (what is true when this command runs: a later plain assignment must not clean it)
       opts._fsChanged = ctx.parentFsChanged || mayChangeListing(cmds, idx, ctx); // (a script or -c text this command runs sees the listing after the earlier commands)
       if (!c.argv.length && (ctx.unknownVars.size || ctx.pickUnknown.size || ctx.srcTouched.size) && c.sep !== '&&' && c.sep !== '||' && c.depth === 0 && !inFlow(flowStart(cmds), idx)) {
         for (const k of Object.keys(c.env ?? {})) if ((ctx.unknownVars.has(k) || ctx.pickUnknown.has(k) || ctx.srcTouched.has(k)) && !/[$`]/.test(c.env[k]) && !ctx.declared?.unknown.has(k)) { ctx.unknownVars.delete(k); ctx.pickUnknown.delete(k); ctx.srcChanged.delete(k); ctx.vars[k] = applyTransform(expandRefs(c.env[k], ctx), ctx.declared?.transform.get(k) ?? null); }
@@ -2099,9 +2114,9 @@ function evaluateBashForFilesFrame(command, opts) {
   const protectedInRaw = m.rawHit(scanRaw, dirs);
 
   // a path built from a name whose value is only known at run time (typeset -L4 D=...) may be anywhere: a writer or a redirection that uses it is refused
-  if (ctx.unknownVars.size) {
-    const refs = (w) => [...String(w).matchAll(/\$\{?(\w+)/g)].some((x) => ctx.unknownVars.has(x[1]));
-    for (const c of cmds) {
+  if (ctx.unknownVars.size || snaps.some((x) => x?.unknownV.size)) {
+    for (const [ci, c] of cmds.entries()) {
+      const refs = (w) => [...String(w).matchAll(/\$\{?(\w+)/g)].some((x) => ctx.unknownVars.has(x[1]) || snaps[ci]?.unknownV.has(x[1]));
       if ((c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && refs(r.target ?? '')) || (c.argv.length && !['export', 'declare', 'typeset', 'local', 'readonly'].includes(baseOf(c.argv[0])) && !isReadOnly(c, ctx) && (c.argv.some(refs) || Object.values(c.env ?? {}).some(refs)))) {
         return deny('the command writes through a variable whose value is only known at run time (a width or integer attribute), so the file it reaches cannot be checked; write the path out');
       }
@@ -2111,13 +2126,20 @@ function evaluateBashForFilesFrame(command, opts) {
   // Why: a name an unfollowable sourced file may have changed (`D=/tmp; source $X; echo x > $D/settings.json`) may hold ~/.claude by now: a write target that uses it
   // is unknown, so a redirection or a writer that names it is refused, whatever the rest of the path (names are the line's own choice, none is exempt). Not write targets: the
   // operand of a command that runs a script (`source $X`, `bash $F`), a reader, `cd`, a declaration, and an element of a path-list variable's value (`PATH=$D:$PATH`).
-  if (ctx.srcChanged.size || ctx.unknownAll) {
-    const taint = taintClosure(ctx.srcChanged, cmds, {}, newName, true);
-    const maybeChanged = (n) => taint.has(n) || newName(n);
-    const changed = (w) => /\$\{!/.test(String(w)) || [...String(w).matchAll(/\$\{?(\w+)/g)].some((x) => maybeChanged(x[1])); // (`${!X}` names a variable by the value of X)
-    const taintedEnv = (w) => [...String(w).matchAll(/\$\{?(\w+)/g)].some((x) => taint.has(x[1])); // (a prefix value: only a name known to be changed; an unset one is judged in the child that gets it, `BASH_ENV=$Q bash x.sh` stays allowed)
+  if (ctx.srcChanged.size || ctx.unknownAll || snaps.some((x) => x?.changed.size)) {
+    const taints = new Map();
+    const taintFor = (ci) => { // (the names changed when the command ran, or by the end of the line: a later `D=/tmp` does not clean an earlier write; a later source covers a loop)
+      const base = unique([...ctx.srcChanged, ...(snaps[ci]?.changed ?? [])]).sort();
+      const key = base.join('\u0000');
+      if (!taints.has(key)) taints.set(key, taintClosure(base, cmds, {}, newName, true));
+      return taints.get(key);
+    };
     const PATH_LISTS = new Set(['PATH', 'CDPATH', 'MANPATH', 'INFOPATH', 'LD_LIBRARY_PATH', 'DYLD_LIBRARY_PATH', 'NODE_PATH', 'PYTHONPATH']); // (search lists only: go writes under GOPATH)
-    for (const c of cmds) {
+    for (const [ci, c] of cmds.entries()) {
+      const taint = taintFor(ci);
+      const maybeChanged = (n) => taint.has(n) || newName(n);
+      const changed = (w) => /\$\{!/.test(String(w)) || [...String(w).matchAll(/\$\{?(\w+)/g)].some((x) => maybeChanged(x[1])); // (`${!X}` names a variable by the value of X)
+      const taintedEnv = (w) => [...String(w).matchAll(/\$\{?(\w+)/g)].some((x) => taint.has(x[1])); // (a prefix value: only a name known to be changed; an unset one is judged in the child that gets it, `BASH_ENV=$Q bash x.sh` stays allowed)
       const name = baseOf(c.argv[0] ?? '');
       const writes = c.argv.length > 0 && !isReadOnly(c, ctx) && !['export', 'declare', 'typeset', 'local', 'readonly', ...CD_CMDS].includes(name);
       // (only the script a shell / interpreter / source runs is exempt: every other word of it can be a write target, `node w.mjs $D/x`, `bash -c 'echo x > $D/x'`)
