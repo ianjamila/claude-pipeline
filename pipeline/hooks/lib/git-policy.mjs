@@ -176,8 +176,20 @@ function joinDir(dir, target, ctx) {
   if (DYNAMIC.test(t) || t === '-') return null;
   if (t === '~' || t.startsWith('~/')) t = ctx.home + t.slice(1);
   else if (t.startsWith('~')) return null;
-  if (path.isAbsolute(t)) return path.resolve(t);
-  return dir === null ? null : path.resolve(dir, t);
+  const lexical = path.isAbsolute(t) ? path.resolve(t) : dir === null ? null : path.resolve(dir, t);
+  // Why: `cd -P link/..`, `set -P`, zsh chaselinks: a `..` after a symlink goes to the target's parent, not the link's. When the two readings differ the directory is unknown.
+  if (lexical !== null && /[^/]\/\.\.(?:\/|$)/.test(t)) {
+    let cur = path.isAbsolute(t) ? path.parse(t).root : dir;
+    for (const seg of t.split('/')) {
+      if (seg === '' || seg === '.') continue;
+      if (seg !== '..') { cur = path.join(cur, seg); continue; }
+      let real = cur;
+      try { real = ctx.realpath(cur); } catch { /* not there: the lexical parent */ }
+      cur = path.dirname(real);
+    }
+    if (path.resolve(cur) !== lexical) return null;
+  }
+  return lexical;
 }
 
 function nextDir(dir, name, argv, ctx) {

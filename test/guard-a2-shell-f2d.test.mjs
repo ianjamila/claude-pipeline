@@ -104,3 +104,24 @@ test('F2c 51: declare / typeset options end at the first name (the -u after a na
   // an option before the first name does apply (the value is cased: unknown to the path check, not a protected path)
   allows(files, {}, ['declare -u D=/home/u/ok; echo x > $D/out.txt', 'declare P=/home/u -u; echo x > $P/out.txt']);
 });
+
+// Why (item 85): `cd -P link/..` / `set -P` / zsh chaselinks go to the PHYSICAL parent of the link's target while the line's own arithmetic is lexical; the cwd list holds both readings.
+test('F2c 85: a `..` after a symlinked directory also names the target\'s parent', () => {
+  const links = { '/home/u/proj/lnk': '/home/u/.cla' + 'ude/pipeline' };
+  const real = (p) => { const q = resolve(p); for (const [l, t] of Object.entries(links)) if (q === l || q.startsWith(`${l}/`)) return t + q.slice(l.length); return q; };
+  const fs = fakeFs(PROJ, BASE, ['/home/u/.cla' + 'ude/pipeline', '/home/u/proj/lnk']);
+  const run = (c) => evaluateBashForFiles(c, { home: '/home/u', env: {}, platform: 'linux', realpath: real, cwd: PROJ, ...fs, existsSync: fs.pathExists });
+  for (const c of ['cd -P lnk/..; echo x > settings.json', 'set -P; cd lnk/..; echo x > settings.json', 'cd -eP -- lnk/..; echo x > settings.json', 'pushd -P lnk/..; echo x > settings.json', 'cd lnk/../.; echo x > settings.json']) assert.equal(run(c).decision, 'deny', c);
+  for (const c of ['cd lnk2/..; echo x > settings.json', 'cd sub/..; echo x > out.txt', 'cd ..; echo x > out.txt']) assert.equal(run(c).decision, 'allow', c);
+});
+
+test('F2c 85: git-policy does not take the link\'s parent for the directory of `cd -P link/..`', () => {
+  const links = { [resolve('/work/repo/lnk')]: resolve('/work/other/sub') };
+  const real = (p) => { const q = resolve(p); for (const [l, t] of Object.entries(links)) if (q === l || q.startsWith(`${l}/`)) return t + q.slice(l.length); return q; };
+  const fs = fakeFs(GIT_ROOT, BASE, ['/home/u', '/work/other/sub', '/work/repo/lnk']);
+  const run = (c) => evaluateGitCommand(c, { cwd: GIT_ROOT, home: '/home/u', realpath: real, currentBranch: (d) => (resolve(d) === GIT_ROOT ? 'agent/x' : 'main'), pushDestination: () => null, issueLabels: () => [], ...fs });
+  assert.equal(run('cd -P lnk/..; git push origin HEAD').decision, 'deny');
+  assert.equal(run('cd lnk/..; git push origin HEAD').decision, 'deny'); // (also without -P: set -P / chaselinks may be on)
+  assert.equal(run('cd sub/..; git push origin HEAD').decision, 'allow');
+  assert.equal(run('git push origin HEAD').decision, 'allow');
+});

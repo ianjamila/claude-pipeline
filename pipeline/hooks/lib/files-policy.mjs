@@ -1181,6 +1181,15 @@ function collectDirs(cmds, ctx) {
       // (a cd target with glob-looking parts that leads to exactly one existing directory is that directory)
       const nd = (globAt >= 0 && /[*?[(]/.test(e) ? resolveGlobCd(e, [d], ctx, cmds, globAt) : null) ?? (isAbs(e) ? posix.normalize(e) : posix.join(d, e));
       if (!dirs.includes(nd) && dirs.length < 32) dirs.push(nd);
+      // Why: `cd -P link/..`, `set -P`, zsh chaselinks: a `..` after a symlink goes to the target's parent, not the link's: that reading is a directory the line may be in too
+      if (/(?:^|\/)\.\.(?:\/|$)/.test(e) && !/[*?[(]/.test(e)) {
+        let cur = isAbs(e) ? '/' : d;
+        for (const seg of e.split('/')) {
+          if (seg === '' || seg === '.') continue;
+          cur = seg === '..' ? posix.dirname(realResolve(cur, ctx.api)) : posix.join(cur, seg);
+        }
+        if (!dirs.includes(cur) && dirs.length < 32) dirs.push(cur);
+      }
     }
   };
   for (const [ci, c] of cmds.entries()) {
