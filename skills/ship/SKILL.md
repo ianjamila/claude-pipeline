@@ -91,7 +91,7 @@ exists (Step 0 preflight and labels ensure) just stop: the owner is at the keybo
 - `P labels ensure` (idempotent; later steps use `pipeline-blocked`, `needs-human`,
   `awaiting-review`). Exit 3 ⇒ GitHub is unreachable: say so and stop.
 - `P worktrees prune --notify` (skip it for `ship inbox`, which is read-only) removes worktrees whose PR merged ≥ 24h ago
-  (only when `worktrees.mode: on`; otherwise it reports). Read `summary`; never act on `kept` yourself.
+  (only when `worktrees.mode: on`; otherwise it reports). Read `summary` (or `skipped`); never act on `kept` yourself.
 - `inbox` argument ("ship inbox", "what is each PR waiting on") → **Inbox** below (read-only; skip Steps 1–7).
 - `resume <pr>` argument or "resume pipeline reviews" → **Resume mode** below.
 
@@ -107,6 +107,8 @@ comes from `P risk` on the real diff; the higher wins).
 
 Then `P worktrees keep agent-<slug> --reason "ship run agent-<slug>"` so no cleanup removes the worktree while this run uses it.
 The run id in the reason is the worktree's directory name (no PR exists yet); Step 7 and Resume step 3 use the same id.
+`keep` / `unkeep` exiting 2 with `no-such-worktree` (the worktree is not a direct child of `worktree_dir`) is a warning:
+note it in the summary and carry on, never stop the run for it.
 
 ## Step 2 — build and verify
 
@@ -314,8 +316,8 @@ The owner's chat message is the approval; never add an approval label yourself (
 "<agentLogLine>"` — for every outcome except a clean `merged` (that run's line was staged in
 Step 5.1). Then tell the user, in plain English: what shipped, PR link, outcome, follow-up issues,
 anything needing them. Release the worktree's keep lock: `P worktrees unkeep agent-<slug> --run agent-<slug>`, then
-`P worktrees prune --notify`. Prune removes the worktree once its PR has been merged for 24 h and keeps it while the PR
-waits for a human or for Codex; never remove it by hand.
+`P worktrees prune --notify` and read `summary` (or `skipped`). Prune removes the worktree once its PR has been merged
+for 24 h and keeps it while the PR waits for a human or for Codex; never remove it by hand.
 
 ## Inbox ("ship inbox", "what is each PR waiting on") — read-only
 

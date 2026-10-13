@@ -127,8 +127,12 @@ pipeline worktrees holding [--purge] [--json]        # list holding batches + re
    `~/claude-notes` is allowed (removal unlinks only). All paths `realpath`-contained in the worktree; symlinks never
    followed.
 6. **Not in use.** Not locked; no process cwd/fd inside (`/proc/*/cwd`, `/proc/*/fd`); no Claude transcript modified in
-   the last `min_idle_hours` mentions the worktree path or branch (`~/.claude/projects/**/*.jsonl` and
-   `~/.claude-eaglewatch/projects/**/*.jsonl`, de-duplicated by realpath); no non-archived memory note
+   the last `min_idle_hours` shows a session working in the worktree (`~/.claude/projects/**/*.jsonl` and
+   `~/.claude-eaglewatch/projects/**/*.jsonl`, de-duplicated by realpath). A JSONL line counts only when its top-level
+   `cwd` equals or is inside the worktree path, or it carries a `tool_use` content block whose `input` names the path;
+   tool results and user/assistant prose do not (one `git worktree list` or `ship inbox` output names every worktree),
+   and branch names are not searched (they appear in every PR list). Fail-closed: a line that names the path but is
+   not a JSON object counts, and so does a recent transcript that cannot be read. No non-archived memory note
    (`~/claude-memory/*/*.md` excluding `MEMORY-archive.md`, `archive/`) names the slug, branch or notes path together with
    `BUILDING`, `ledger home` or `keep`; no file outside `delete`/`archive` modified in the last `min_idle_hours` (judged
    per file, never by directory mtime).
@@ -140,11 +144,14 @@ pipeline worktrees holding [--purge] [--json]        # list holding batches + re
 
 - **Ship** calls `pipeline worktrees prune --repo <its worktree>` at Step 0 (also the catch-up after the PC was off —
   cron does not fire while WSL is down) and Step 7. Ship takes `pipeline worktrees keep <slug> --reason "ship run <runId>"`
-  at Step 1 (and on resume, step 3) and releases it at Step 7; a pipeline-keep lock older than 7 days is reported as
-  "stale keep — still needed?", never released automatically.
+  at Step 1 (and on resume, step 3) and releases it at Step 7; a pipeline-keep lock older than 7 days (the mtime of the
+  worktree's `locked` file in its admin dir, found through the `.git` file's `gitdir:` line) is reported as
+  "stale keep (<N>d: <reason>) — still needed?", grouped apart in the summary, never released automatically.
 - **Nightly** user crontab at 02:30 in the system time zone. Installed cron (3.0pl1) has no `CRON_TZ`; the installer
   checks the system zone (`/etc/timezone` / `timedatectl`) and warns if it is not Asia/Manila instead of claiming it.
-  Absolute node path (nvm), log `~/.local/state/pipeline/prune-<repo>.log`, last 30 runs kept.
+  Absolute node path (nvm), log `~/.local/state/pipeline/prune-<repo>.log`, last 30 runs kept; every completed run
+  (skipped and off mode included) writes its one line there. The cron line runs `prune --notify --summary-only`, so
+  its own unrotated output file grows by one line per night.
 
 ## 6. Files outside worktrees — all report-only in this version
 
