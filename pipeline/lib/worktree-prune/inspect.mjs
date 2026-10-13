@@ -66,21 +66,29 @@ export function statusEntries(wtPath) {
 }
 
 // Every entry under the worktree, symlinks not followed, the top-level `.git` file skipped. Posix relative paths.
+// A directory that cannot be listed (EACCES/EPERM) is reported as an `unreadable` entry, never as an empty one: what is
+// inside it is unknown, so entriesFor turns it into a blocker. Only an entry that vanished (ENOENT/ENOTDIR) is skipped.
 export function walkTree(wtPath) {
   const out = [];
   const stack = [''];
   while (stack.length) {
     const rel = stack.pop();
     const dir = rel ? path.join(wtPath, ...rel.split('/')) : wtPath;
-    for (const d of tolerant(() => readdirSync(dir, { withFileTypes: true }), [])) {
+    let children;
+    try {
+      children = readdirSync(dir, { withFileTypes: true });
+    } catch (err) {
+      if (err?.code === 'EACCES' || err?.code === 'EPERM') out.push({ path: rel || '.', unreadable: true, isDir: true, isSymlink: false, mtimeMs: Date.now() });
+      else if (err?.code !== 'ENOENT' && err?.code !== 'ENOTDIR') throw err;
+      continue;
+    }
+    for (const d of children) {
       if (!rel && d.name === '.git') continue;
       const childRel = rel ? `${rel}/${d.name}` : d.name;
       const st = tolerant(() => lstatSync(path.join(dir, d.name)), null);
       if (!st) continue;
-      const isSymlink = st.isSymbolicLink();
-      const isDir = st.isDirectory();
-      out.push({ path: childRel, isSymlink, isDir, mtimeMs: st.mtimeMs });
-      if (isDir) stack.push(childRel);
+      out.push({ path: childRel, isSymlink: st.isSymbolicLink(), isDir: st.isDirectory(), mtimeMs: st.mtimeMs });
+      if (st.isDirectory()) stack.push(childRel);
     }
   }
   return out;
@@ -100,6 +108,8 @@ export function entriesFor(wtPath) {
       if (!w.isDir && w.path.startsWith(e.path)) entries.push({ path: w.path, kind: e.kind, isSymlink: w.isSymlink });
     }
   }
+  // 'tracked-change' (not 'ignored') so no delete/archive pattern, even a directory one like `node_modules/`, can allow it.
+  for (const w of walk) if (w.unreadable) entries.push({ path: w.path, kind: 'tracked-change', isSymlink: false });
   return entries;
 }
 
@@ -140,7 +150,9 @@ export function processesInside(dir, { procRoot = '/proc', platform = process.pl
   } catch {
     return { available: false, pids: [] };
   }
-  const inside = (p) => p !== null && isInside(p, dir);
+  // /proc reports resolved paths, so a worktree reached through a symlinked parent must also be matched by its realpath.
+  const roots = [dir, tolerant(() => realpathSync(dir), dir)];
+  const inside = (p) => p !== null && roots.some((r) => isInside(p, r));
   const pids = [];
   for (const name of names.filter((n) => /^\d+$/.test(n))) {
     const proc = path.join(procRoot, name);
@@ -243,9 +255,9 @@ export function memoryMentions({ slug, branch }, { dirs }) {
   return hits;
 }
 
-// Files (not directories) changed at or after sinceMs that match no `ignore` pattern: the delete + archive lists.
+// Files (not directories; an unreadable directory counts as a changed file) changed at or after sinceMs that match no `ignore` pattern: the delete + archive lists.
 export function recentFiles(walk, { sinceMs, ignore }) {
   return walk
-    .filter((w) => !w.isDir && w.mtimeMs >= sinceMs && !ignore.some((p) => matchesPattern(w.path, p)))
+    .filter((w) => (!w.isDir || w.unreadable) && w.mtimeMs >= sinceMs && !ignore.some((p) => matchesPattern(w.path, p)))
     .map((w) => w.path);
 }

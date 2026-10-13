@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync, symlinkSync, utimesSync, mkdtempSync, realpathSync } from 'node:fs';
+import { chmodSync, mkdirSync, writeFileSync, symlinkSync, utimesSync, mkdtempSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
@@ -126,3 +126,30 @@ test('defaultTranscriptDirs: CLAUDE_CONFIG_DIR plus ~/.claude*/projects, existin
   const dirs = defaultTranscriptDirs(home, { CLAUDE_CONFIG_DIR: join(home, '.claude') });
   assert.deepEqual(dirs, [join(home, '.claude', 'projects'), join(home, '.claude-ew', 'projects')]);
 });
+
+test('an unreadable directory is a blocker, never an empty one', () => {
+  const { add } = world();
+  const wt = add('agent-x', 'agent/x');
+  const secret = join(wt, 'node_modules', 'locked');
+  mkdirSync(secret, { recursive: true }); writeFileSync(join(secret, 'hidden.js'), '');
+  chmodSync(secret, 0o000);
+  try {
+    const walk = walkTree(wt);
+    assert.ok(walk.some((w) => w.path === 'node_modules/locked' && w.unreadable === true));
+    const e = entriesFor(wt).find((x) => x.path === 'node_modules/locked');
+    assert.equal(e?.kind, 'tracked-change');
+    assert.deepEqual(recentFiles(walk, { sinceMs: Date.now() - 3600e3, ignore: [] }).filter((p) => p === 'node_modules/locked'), ['node_modules/locked']);
+  } finally {
+    chmodSync(secret, 0o700);
+  }
+}, { skip: (process.platform === 'win32' && 'chmod 000 is not enforced on Windows') || (process.getuid?.() === 0 && 'root can read any directory') });
+
+test('processesInside matches a worktree reached through a symlinked path', () => {
+  const proc = mkdtempSync(join(tmpdir(), 'proc-'));
+  const real = realpathSync(mkdtempSync(join(tmpdir(), 'wt-')));
+  const via = join(mkdtempSync(join(tmpdir(), 'lnk-')), 'wt-link');
+  symlinkSync(real, via);
+  mkdirSync(join(proc, '303', 'fd'), { recursive: true });
+  symlinkSync(real, join(proc, '303', 'cwd'));
+  assert.deepEqual(processesInside(via, { procRoot: proc, platform: 'linux' }), { available: true, pids: [303] });
+}, { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' });
