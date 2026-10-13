@@ -107,3 +107,23 @@ test('F2b-2 84: `source NAME` without a slash is looked up along PATH (line, pre
     allows(run, lib, [`PATH=/home/u/bin:${D}PATH; source ./lib.sh`, `PATH=/home/u/other:${D}PATH; source lib.sh`, 'source lib.sh']);
   }
 });
+
+test('F2b-2 97: the order of binder effects -- an earlier binder reaches later commands, a later one does not taint an earlier one, a loop binder reaches the commands above it', () => {
+  const inHome = { '/home/u/.claude/x.sh': BAD };
+  denies(files, inHome, [
+    `D=/tmp/ok; read D < list.txt; echo x > ${D}D/settings.json`,
+    `F=ok.sh; read "F" < list.txt; bash ${D}F`,
+    `F=ok.sh; read -r 'F' < list.txt; bash ${D}F`,
+    `F=ok.sh; printf -v "F" ev.sh; bash ${D}F`,
+    `F=ok.sh; for i in 1 2; do bash ${D}F; read F < list.txt; done`,
+    `F=ok.sh; { bash ${D}F; read F < list.txt; } &`,
+    // (a later plain assignment does not clean the cd that ran on the bound name)
+    `read D < list.txt; cd ${D}D; D=/tmp/y; bash x.sh`,
+    `F=ev.sh; read F < list.txt; F=ok.sh; bash ${D}F; bash ev.sh`,
+  ]);
+  allows(files, inHome, [
+    `F=ok.sh; bash ${D}F; read G < list.txt`,
+    `read F < list.txt; F=ok.sh; bash ${D}F`,
+    `D=/tmp/ok; echo x > ${D}D/out.txt; read E < list.txt`,
+  ]);
+});
