@@ -91,3 +91,16 @@ test('F2c 95: spliceLines gives the bash reading (split) and the zsh reading (on
   const many = Array.from({ length: 8 }, (_, i) => `${D}{V${i}:-a}`).join(' ');
   assert.equal(spliceLines(`bash ${many}`).over, true);
 });
+
+// Why: item 51's first test spelled the protected path inside the declare, so the declare itself was refused and the option-order fix was never exercised (its mutation survived). The path here is only
+// ever put together from the parts the declare gives, so the verdict depends on whether -u (after the first name) uppercases them.
+test('F2c 51: declare / typeset options end at the first name (the -u after a name changes nothing)', () => {
+  denies(files, {}, [
+    "declare P=/home/u C=.cla''ude -u; echo x > $P/$C/settings.json",
+    "typeset P=/home/u -u; echo x > $P/.cla''ude/settings.json",
+    "declare P=.cla''ude -u; cd /home/u/$P; echo x > settings.json",
+    "declare P=/home/u -l; echo x > $P/.cla''ude/settings.json",
+  ]);
+  // an option before the first name does apply (the value is cased: unknown to the path check, not a protected path)
+  allows(files, {}, ['declare -u D=/home/u/ok; echo x > $D/out.txt', 'declare P=/home/u -u; echo x > $P/out.txt']);
+});
