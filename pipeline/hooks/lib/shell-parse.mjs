@@ -542,6 +542,36 @@ function maskQuoted(t) {
   return out;
 }
 const MAX_OCCURRENCES = 32;
+// `$BASH`, `${BASH}`, `${BASH:-bash}`, `${BASH-sh}`: the shell running the script (or the shell the default names)
+const BASH_WORD = /^\$(?:BASH|\{BASH(?::?-(?:bash|sh))?\})$/;
+const BASH_DEFAULT = /^\$\{BASH:?-bash\}$/; // (the only spelling that names bash whether the shell is bash (it sets BASH) or zsh / sh (BASH unset))
+const BASH_REF = /\$BASH(?![A-Za-z0-9_])|\$\{BASH(?::?-(?:bash|sh))?\}/g;
+// commands that bind a name given as an operand (`read N`, `declare N=v`, `printf -v N`, `let`, zsh `vared` ...): a name that is not a plain word could be BASH
+const BINDERS = /(?<![\w.$/-])(?:read|declare|typeset|local|export|readonly|mapfile|readarray|getopts|unset|let|vared|zparseopts|printf|print|strftime|zstyle|sysread|zstat|getln|integer|float|select|set|autoload|compgen)(?![\w-])([^\n;&|<>]*)/g;
+// Is BASH ever bound by the text? Fail closed: every mention that is not a plain reference counts (also with quotes taken out: `read B""ASH`), a binder
+// whose operand name is not a plain word (`declare "${n}SH=x"`, `read -r "$v"`, `export $n=x`, `read BA{SH,}`), `(( $n = 1 ))`, eval, source / `.` (the sourced
+// file may bind it), an ANSI-C string with an escape. A mention inside a quote or comment only makes this stricter.
+// `(( $n = 1 ))`: a `((`, later a `$`, later an `=` on one line (first occurrences only: linear, a pattern with `[^\n]*` twice is not)
+function arithAssignsByName(line) {
+  const p = line.indexOf('((');
+  const d = p < 0 ? -1 : line.indexOf('$', p);
+  return d >= 0 && line.indexOf('=', d) >= 0;
+}
+function bindsBash(str) {
+  const mentions = (s) => /(?<![A-Za-z0-9_])BASH(?![A-Za-z0-9_])/.test(s.replace(BASH_REF, ''));
+  if (mentions(str) || mentions(str.replace(/['"\\]/g, ''))) return true;
+  if (/(?<![\w./$-])(?:source|eval)(?![\w-])/.test(str)) return true;
+  if (/(?:^|[\n;&|({`!]|\b(?:then|do|else|elif|if|while|until|builtin|command)\b)\s*\.\s+\S/.test(str)) return true;
+  if (/\$'[^']*\\[xuU0-7]/.test(str)) return true;
+  if (str.split('\n').some(arithAssignsByName)) return true;
+  for (const m of str.matchAll(BINDERS)) {
+    const toks = m[1].trim().split(/\s+/).filter(Boolean);
+    const vOpt = /^(?:printf|print)$/.test(m[0].trim().split(/\s/)[0]);
+    const names = vOpt ? toks.filter((x, i) => i > 0 && /^-\w*v$/.test(toks[i - 1])) : toks.filter((x) => !x.startsWith('-'));
+    if (names.some((x) => /[$`{}*?[\\'"(~]/.test(x.split('=')[0]))) return true;
+  }
+  return false;
+}
 // ksh/bash extglob (`*(`, `?(`, `+(`, `@(`, `!(`), zsh `(#i)` and `<1-2>` numeric ranges attached to a word
 const PATTERN_SYNTAX = /[*?+@!\]]\(|\(#|[^\s<>&|;(]<\d*-\d*>/;
 // zsh alternation `(a|b)`: a `(` that opens no substitution, with a `|` and no blank before the `)`. Only the text with quotes masked is checked (a
@@ -1919,10 +1949,18 @@ class Parser {
       for (const k of Object.keys(un.env)) setEnv(env, k, un.env[k]);
       a = this.winFix(un.argv, seg);
     }
+    // Why: bash sets $BASH to its own path (zsh leaves it unset), so `"${BASH:-bash}" f.sh` runs f.sh with bash: read as bash, unless the text (or the environment) can bind
+    // the name. Every other spelling (`$BASH f.sh` vanishes under zsh and runs f.sh itself) keeps its run-time head AND adds the bash / sh readings, so it is judged as strictly as either
+    let bashAlso = null;
+    if (a.length && BASH_WORD.test(a[0])) {
+      if (this.ctx.bashPlain && BASH_DEFAULT.test(a[0])) a = ['bash', ...a.slice(1)];
+      else bashAlso = a.slice(1);
+    }
     // a command name that is only known at run time ($g push, $(echo git) push)
     const headDyn = a.length > 0 && (a[0].startsWith('$') || a[0].includes('$(') || a[0].includes('`'));
     if (headDyn) this.ctx.dynamic = true;
     const cmd = emit(this.ctx, a, env, seg.raw, seg.depth, [], seg.sep);
+    if (bashAlso) for (const sh of ['bash', 'sh']) emit(this.ctx, [sh, ...bashAlso], env, seg.raw, seg.depth, [], seg.sep);
     if (cmd) Object.defineProperty(cmd, 'litWords', { value: new Set(a.filter((w) => !seg.meta.get(w)?.dyn && !seg.pat.has(w))), enumerable: false });
     if (!isExec) { seg.final = { argv: a }; seg.cmd = cmd; }
     // what the command prints and what it reads on stdin, for callers that ask which text a write of its output holds (see line-writes.mjs); lazy, most commands never need it
@@ -2218,10 +2256,11 @@ export function simpleCommands(str, opts) {
   const requested = Number.isFinite(opts?.maxDepth) ? Math.trunc(opts.maxDepth) : 5;
   // opts.expired: () => true once the evaluation's wall-clock deadline has passed; scans that can run long poll it and give up (truncated)
   const expired = typeof opts?.expired === 'function' ? opts.expired : null;
-  const ctx = { out: [], expired, maxDepth: Math.min(Math.max(requested, 0), HARD_MAX_DEPTH), truncated: false, dynamic: false, subshell: false, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map() };
+  const ctx = { out: [], expired, maxDepth: Math.min(Math.max(requested, 0), HARD_MAX_DEPTH), truncated: false, dynamic: false, subshell: false, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false };
   let parser = null;
   try {
     parser = new Parser(ctx, String(str ?? ''));
+    ctx.bashPlain = (opts?.env ?? process.env).BASH === undefined && !bindsBash(parser.src);
     parser.parseTop(0);
   } catch {
     ctx.truncated = true;
