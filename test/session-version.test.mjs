@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { createFakeGh } from './helpers/fakegh-env.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import {
-  DEADLINE_MS, MAIN_TTL_MS, TIMEOUT_LINE, UPDATE_COMMAND, cacheDirFor, checkSession, createCache, formatOutput, gatherFacts, installedProblems, isVendorOwedLine, messagesFor, readVendoredStamp, reasonLabel, safeStampLabel, vendorGuidance, VENDOR_OFFER,
+  DEADLINE_MS, MAIN_TTL_MS, TIMEOUT_LINE, UPDATE_COMMAND, cacheDirFor, checkSession, createCache, formatOutput, gatherFacts, installedProblems, isVendorOwedLine, messagesFor, readVendoredStamp, reasonLabel, safeStampLabel, vendorGuidance, VENDOR_OFFER, VENDOR_PR_TITLE_PREFIX,
 } from '../pipeline/lib/session-version.mjs';
 import { MANIFEST_REL, sha256File, walkFiles } from '../pipeline/lib/installer.mjs';
 
@@ -111,6 +111,14 @@ test('formatOutput: nothing is the empty string; a message is one JSON line with
 const VENDOR_LINE = 'this repo\'s scripts/pipeline is out of date (ccccccc, your install is aaaaaaa) — a `pipeline vendor` PR is owed (2 vendored files differ)';
 const parse = (out) => JSON.parse(out);
 
+test('vendorGuidance: the new PR must be titled with the same prefix the duplicate-PR search uses', () => {
+  assert.equal(VENDOR_PR_TITLE_PREFIX, 'chore(pipeline): vendor');
+  const g = vendorGuidance('aaaaaaa');
+  assert.ok(g.includes(`--search "${VENDOR_PR_TITLE_PREFIX} in:title"`), 'search uses the shared prefix');
+  assert.ok(g.includes(`\`${VENDOR_PR_TITLE_PREFIX} claude-pipeline aaaaaaa\``), 'title instruction uses the shared prefix and the installed sha7');
+  assert.match(g, /title must start with/i);
+});
+
 test('formatOutput: the vendor-owed line ends with the offer in systemMessage; additionalContext carries Claude guidance with the installed sha7 and the existing-PR check', () => {
   const out = parse(formatOutput([VENDOR_LINE], { installed7: 'aaaaaaa' }));
   assert.equal(out.systemMessage, `${VENDOR_LINE}${VENDOR_OFFER}`);
@@ -119,6 +127,7 @@ test('formatOutput: the vendor-owed line ends with the offer in systemMessage; a
   assert.equal(ctx, `${VENDOR_LINE}\n${vendorGuidance('aaaaaaa')}`);
   assert.match(ctx, /offer once, early in the session/i);
   assert.match(ctx, /gh pr list --state open --search "chore\(pipeline\): vendor in:title"/);
+  assert.match(ctx, /title must start with `chore\(pipeline\): vendor`/);
   assert.match(ctx, /ship resume <N>/);
   assert.match(ctx, /claude-pipeline aaaaaaa/);
   assert.match(ctx, /pipeline vendor --repo \./);

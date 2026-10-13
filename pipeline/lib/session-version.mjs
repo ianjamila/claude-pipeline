@@ -146,12 +146,17 @@ export const VENDOR_OFFER = ' — say "open the vendor PR" and Claude opens it';
 const VENDOR_OWED = /a `pipeline vendor` PR is owed \(\d+ vendored files? differ\)$/;
 export const isVendorOwedLine = (line) => typeof line === 'string' && VENDOR_OWED.test(line);
 
+// The duplicate-PR search and the title Claude gives the new PR are built from this ONE prefix, so they cannot drift:
+// ship's PR titles are free-form, and a PR opened without it would be missed by the next session's check.
+export const VENDOR_PR_TITLE_PREFIX = 'chore(pipeline): vendor';
+
 // Claude-only guidance (never in systemMessage). inst7 is the validated short sha of the installed pipeline.
 export function vendorGuidance(inst7) {
   return 'Vendor PR owed: offer once, early in the session, to open the vendor PR for this repo. Never vendor without the owner agreeing. '
-    + 'If the owner agrees, first look for one already open in this repo (`gh pr list --state open --search "chore(pipeline): vendor in:title"`); '
+    + `If the owner agrees, first look for one already open in this repo (\`gh pr list --state open --search "${VENDOR_PR_TITLE_PREFIX} in:title"\`); `
     + 'if one exists, point the owner to it (`ship resume <N>`) instead of opening a second. '
-    + `Otherwise run the ship skill with a request to refresh scripts/pipeline from the installed claude-pipeline ${inst7} with \`pipeline vendor --repo .\` on a new agent/ branch (never on the current branch).`;
+    + `Otherwise run the ship skill with a request to refresh scripts/pipeline from the installed claude-pipeline ${inst7} with \`pipeline vendor --repo .\` on a new agent/ branch (never on the current branch). `
+    + `The new PR's title must start with \`${VENDOR_PR_TITLE_PREFIX}\` (for example \`${VENDOR_PR_TITLE_PREFIX} claude-pipeline ${inst7}\`) so the next session's search finds it.`;
 }
 
 // The exact stdout of a SessionStart hook with something to say; '' (print nothing) otherwise. With opts.installed7 and
