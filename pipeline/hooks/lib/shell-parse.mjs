@@ -468,6 +468,18 @@ const SYSTEM_BIN = /^(?:\/usr)?(?:\/local)?\/(?:s?bin|libexec)\/|^\/opt\/homebre
 const INLINE_FLAGS = new Set(['-e', '-E', '-p', '-c', '-m', '--eval', '--print', '--check', '--test', '--input-type']);
 const INTERP_VALUE_FLAGS = new Set(['-r', '--require', '--import', '--loader', '--experimental-loader', '-C', '--conditions', '-W', '-X', '-I', '-x', '--env-file', '--title', '--max-old-space-size']);
 
+// Why: a command whose OPTIONS can make it run code (a shell's `-c` / `-s`, `source`, an interpreter, find -exec, sed -e / w, awk, make) and that has a word with a default / alternative
+// (`bash ${A:--c ./ev.sh}`): the word may be an option when A is unset, so the policies judge the line again with each reading (see spliceLines).
+const SPLICE_HEADS = new Set(['source', '.', 'eval', 'find', 'awk', 'gawk', 'mawk', 'sed', 'gsed', 'make', 'gmake']);
+const DEFAULTED_WORD = /\$\{[A-Za-z_]\w*:?[-=+]/;
+export function splicesOptions(argv) {
+  if (!argv?.length) return false;
+  const name = base(argv[0]);
+  return (SHELLS.has(name) || INTERPRETER.test(name) || SPLICE_HEADS.has(name)) && argv.slice(1).some((w) => DEFAULTED_WORD.test(w));
+}
+// the command's own text; a record without one is rebuilt from its words (a word with an expansion stays bare so it splits)
+export const spliceText = (c) => (typeof c.raw === 'string' && c.raw ? c.raw : c.argv.map((w) => (DEFAULTED_WORD.test(w) || /^[\w@%+=:,./-]+$/.test(w) ? w : `"${w.replace(/[\\"`$]/g, '\\$&')}"`)).join(' '));
+
 // The file a command will read and run: `bash f`, `source f`, `. f`, `node f.mjs`, `python f.py`, `./f`.
 // {kind:'shell'} is run as a shell script (the caller judges its commands), {kind:'interp'} is program text in
 // another language (the caller scans it), {kind:'exec'} is a program run by path (shell or interpreter, from its

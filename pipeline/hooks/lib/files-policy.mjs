@@ -18,8 +18,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
-import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf } from './shell-parse.mjs';
-import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
+import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, splicesOptions, spliceText } from './shell-parse.mjs';
+import { scriptCandidates, spliceLines, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
 
 const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
@@ -1121,6 +1121,20 @@ function judgeFoundScript(sf, abs, dir, ctx, opts) {
   return null;
 }
 
+// Why: `bash ${A:--c ./ev.sh}`: a default word in an option position of a shell or interpreter is read again as each reading of it (see spliceLines); the line each makes is judged like a literal one
+function judgeSplices(c, dirs, ctx, opts) {
+  const r = spliceLines(spliceText(c));
+  if (r.over) return deny('a default or alternative word (${X:-w}) in this command may be an option, and its readings cannot be worked out exactly (a quote, backslash, backtick or $( ) near it, or too many), so what the command runs cannot be checked; write the options literally');
+  for (const line of r.lines) {
+    if ((opts._depth ?? 0) >= 4) return deny('a default word in an option position is nested too deeply to check');
+    for (const d of dirs) {
+      const v = evaluateBashForFiles(line, { ...opts, cwd: d, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) } });
+      if (v.decision === 'deny') return deny(`a default word in this command may be an option; read as \`${line}\` it would run: ${v.reason}`);
+    }
+  }
+  return null;
+}
+
 // A word before the script expands at run time (`X=+n; bash $X w.sh`, `bash $(..) w.sh`, `source $X`, `bash *.sh`), so which
 // word the shell runs is unknown. Judge every word that could be it (see script-candidates.mjs) like a named script. A
 // word that is still unknown (`$UNSET`) cannot be judged: the textual rules still apply, and the line is denied when it
@@ -1335,6 +1349,7 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
   // 7: a script file (bash f.sh, source f, ./f, node f.mjs) runs whatever is in it
   if ((opts._depth ?? 0) < 4) {
     for (const c of cmds) {
+      if (splicesOptions(c.argv)) { const v = judgeSplices(c, dirs, ctx, withLineVars(opts)); if (v) return v; }
       const sf = scriptFileOf(c.argv, c.raw, raw);
       // a shell runs its startup files (BASH_ENV, ENV, ZDOTDIR/.zshenv ...) BEFORE the script it was given, so they are judged first, in the
       // order the shell reads them: judged like `bash FILE`

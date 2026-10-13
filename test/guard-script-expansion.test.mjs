@@ -893,3 +893,24 @@ test('a backslash that reaches the script name through a variable is a file name
     denyBoth(c, spec);
   allowBoth(`D='x\\b'; bash "$D.sh"`, spec); // missing: nothing runs
 });
+
+// ---- a default / alternative word in a script or option position is judged on every reading --------------------------------
+// `bash ${A:-./ev.sh}` runs ev.sh when A is unset, `bash ${A:--c ./ev.sh}` is `bash -c ./ev.sh`, `bash ${A:--s} < ev.sh` is `bash -s < ev.sh`.
+
+test('guard-git: a default word in a script or option position is judged on every reading', () => {
+  for (const c of [
+    'bash ${A:-./f.sh}', 'bash ${A:-f.sh}', 'bash ${A-./f.sh}', 'bash ${A:=./f.sh}', 'bash ${A:+./f.sh}', 'A=x; bash ${A:+./f.sh}', 'source ${A:-f.sh}', 'bash -x ${A:-./f.sh}',
+    'bash ${A:--c ./f.sh}', 'bash ${A:--c "./f.sh"}', 'sh ${A:--c ./f.sh}', 'bash ${A:--s} < f.sh', 'bash ${A-s} < f.sh', 'bash ${A:--c "bash f.sh"}',
+  ]) assert.equal(git(c).decision, 'deny', c);
+  for (const c of ['bash ${A:-./ok.sh}', 'bash ${A:-ok.sh}', 'bash ${A:--c ./ok.sh}', 'bash ${A:--s} < ok.sh', 'sh ${A:--c ./ok.sh}', 'A=x; bash ${A:+./ok.sh}', 'echo ${A:-./f.sh}'])
+    assert.equal(git(c).decision, 'allow', c);
+});
+
+test('guard-files: a default word in a script or option position is judged on every reading', () => {
+  for (const c of [
+    'bash ${A:-./w.sh}', 'bash ${A:-w.sh}', 'bash ${A-./w.sh}', 'bash ${A:=./w.sh}', 'bash ${A:+./w.sh}', 'A=x; bash ${A:+./w.sh}', 'source ${A:-w.sh}', 'bash -x ${A:-./w.sh}',
+    'bash ${A:--c ./w.sh}', 'bash ${A:--c "./w.sh"}', 'sh ${A:--c ./w.sh}', 'bash ${A:--s} < w.sh', 'bash ${A-s} < w.sh',
+  ]) assert.equal(files(c).decision, 'deny', c);
+  for (const c of ['bash ${A:-./ok.sh}', 'bash ${A:-ok.sh}', 'bash ${A:--c ./ok.sh}', 'bash ${A:--s} < ok.sh', 'sh ${A:--c ./ok.sh}', 'A=x; bash ${A:+./ok.sh}', 'echo ${A:-./w.sh}'])
+    assert.equal(files(c).decision, 'allow', c);
+});

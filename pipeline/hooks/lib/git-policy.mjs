@@ -15,9 +15,9 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, startupFilesOf } from './shell-parse.mjs';
+import { commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, startupFilesOf, splicesOptions, spliceText } from './shell-parse.mjs';
 import { catchAllReason, guardedCommandText } from './guarded-text.mjs';
-import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
+import { scriptCandidates, spliceLines, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
 
 const PROTECTED_BRANCHES = ['main', 'master'];
 const APPROVAL_LABELS = ['human-approved', 'test-change-approved'];
@@ -1085,6 +1085,18 @@ function judgeScoped(text, dir, ctx, level, sf) {
   }
 }
 
+// Why: `bash ${A:--c ./ev.sh}`: a default word in an option position of a shell or interpreter is read again as each reading of it (see spliceLines); the line each makes is judged like a literal one
+function checkSplices(c, dir, ctx, level) {
+  const r = spliceLines(spliceText(c));
+  if (r.over) return deny('a default or alternative word (${X:-w}) in this command may be an option, and its readings cannot be worked out exactly (a quote, backslash, backtick or $( ) near it, or too many), so what the command runs cannot be verified. Write the options literally.');
+  for (const line of r.lines) {
+    if (level >= MAX_NESTING) return deny('a default word in an option position is nested too deeply to verify.');
+    const v = judgeScoped(line, dir, ctx, level, { kind: 'shell' });
+    if (v.decision === 'deny') return deny(`a default word in this command may be an option; read as \`${line}\` it would run a blocked command: ${v.reason}`);
+  }
+  return null;
+}
+
 // A word before the script expands at run time (`X=+n; bash $X f.sh`, `bash $(..) f.sh`, `source $X`, `bash *.sh`), so which
 // word the shell runs is unknown. Judge every word that could be it (see script-candidates.mjs) like a named script. A
 // word that is still unknown (`$UNSET`) cannot be judged: denied when the line mentions a guarded operation, as for a
@@ -1309,6 +1321,7 @@ function evalString(str, startDir, ctx, level) {
         const why = catchAllReason(argv);
         if (why) verdict = deny(`${name} was given a string that contains a guarded command (${why}). Run the operation directly so it can be checked.`);
       }
+      if (!verdict && splicesOptions(argv)) verdict = checkSplices(c, dir, ctx, level);
       const sf = verdict ? null : scriptFileOf(argv, c.raw, str);
       if (sf && (name === 'source' || name === '.')) sf.sourced = true;
       // a shell runs its startup files (BASH_ENV, ENV, ZDOTDIR/.zshenv ...) BEFORE the script it was given, so they are judged first, in the

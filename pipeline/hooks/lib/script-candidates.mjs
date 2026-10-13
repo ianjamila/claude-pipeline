@@ -32,6 +32,81 @@ export function execLineOf(sf, expand) {
   return e !== sf.words[0] && /\s/.test(e.trim()) && !/\$\(|`/.test(e) ? e : null; // (a value holding a command substitution is unknown: candidates cover it)
 }
 
+// Why: `${X:-w}`, `${X-w}`, `${X:=w}`, `${X:+w}` read as the value of X, the word w or nothing, depending on a state the guard does not see: every reading is judged (the value as `${X}`,
+// which a policy expands from the variables of the line). `over`: more readings than MAX_READINGS (the caller refuses).
+const MAX_READINGS = 32;
+const PARAM_OPEN = /\$\{([A-Za-z_]\w*)(:?)([-=+?])/;
+export function paramReadings(word) {
+  let list = [word];
+  let over = false;
+  for (let round = 0; round < 16; round++) {
+    const next = new Set();
+    let changed = false;
+    for (const s of list) {
+      const m = PARAM_OPEN.exec(s);
+      if (!m) { next.add(s); continue; }
+      let depth = 1;
+      let j = m.index + m[0].length;
+      for (; j < s.length && depth; j++) { if (s[j] === '{') depth++; else if (s[j] === '}') depth--; }
+      const body = depth ? '' : s.slice(m.index + m[0].length, j - 1);
+      // Why: a reading is only built when the expansion's extent is certain: the closing brace was found, and the word holds no quote, backslash or half-open $( ) (a brace inside them ends the expansion elsewhere; parentheses on their own are plain characters)
+      if (depth || /['"`\\]/.test(body) || (body.includes('$(') && [...body].reduce((n, ch) => n + (ch === '(' ? 1 : ch === ')' ? -1 : 0), 0) !== 0)) { over = true; next.add(s); continue; }
+      const pre = s.slice(0, m.index);
+      const post = s.slice(j);
+      const alts = m[3] === '+' ? [body, ''] : m[3] === '?' ? [`\${${m[1]}}`] : [`\${${m[1]}}`, body, ''];
+      for (const x of alts) next.add(pre + x + post);
+      changed = true;
+    }
+    list = [...next];
+    if (list.length > MAX_READINGS) { over = true; list = list.slice(0, MAX_READINGS); break; }
+    if (!changed) break;
+    if (round === 15) over = true;
+  }
+  return Object.defineProperty(list, 'over', { value: over, enumerable: false });
+}
+
+// Why: `bash ${A:--c ./ev.sh}` / `bash ${A:--s} < ev.sh`: a default word in an OPTION position makes the shell read `-c ./ev.sh` or `-s` when A is unset, which no candidate word shows. The command is read again
+// with each `${X:-w}` / `${X=w}` / `${X:+w}` replaced by its value (left as `${X}`), w and nothing, as bash does (w split into words) and as zsh does (w one word: wrapped in double quotes), and
+// every such line is judged like a literal one. `over`: a reading that cannot be built exactly (a quote, backslash, backtick or `$(` near an expansion, an unclosed brace, more than MAX_READINGS lines).
+// An occurrence inside single quotes is no expansion and is left alone.
+export function spliceLines(raw) {
+  const text = String(raw ?? '');
+  let over = false;
+  const walk = (s, wrap) => {
+    let acc = [''];
+    let q = '';
+    const lit = (t) => { acc = acc.map((a) => a + t); };
+    for (let i = 0; i < s.length;) {
+      const c = s[i];
+      if (c === '\\' && q !== "'") { lit(s.slice(i, i + 2)); i += 2; continue; }
+      if (q === "'") { if (c === "'") q = ''; lit(c); i++; continue; }
+      if (c === "'") { q = "'"; lit(c); i++; continue; }
+      if (c === '"') { q = q === '"' ? '' : '"'; lit(c); i++; continue; }
+      if (c === '`' || (c === '$' && (s[i + 1] === '(' || s[i + 1] === "'"))) { over = true; lit(c); i++; continue; }
+      const m = c === '$' ? PARAM_OPEN.exec(s.slice(i, i + 80)) : null;
+      if (!m || m.index !== 0) { lit(c); i++; continue; }
+      let depth = 1;
+      let j = i + m[0].length;
+      for (; j < s.length && depth; j++) { if (s[j] === '{') depth++; else if (s[j] === '}') depth--; }
+      const body = depth ? '' : s.slice(i + m[0].length, j - 1);
+      if (depth || /['"`\\]/.test(body) || body.includes('$(')) { over = true; lit(s.slice(i)); break; }
+      const own = `\${${m[1]}}`;
+      const inner = walk(body, false);
+      const alts = m[3] === '+' ? [...inner, ''] : m[3] === '?' ? [own] : [own, ...inner, ''];
+      const words = alts.map((x) => (wrap && q === '' && x !== '' && x !== own ? `"${x}"` : x));
+      const next = [];
+      for (const a of acc) for (const w of words) next.push(a + w);
+      if (next.length > MAX_READINGS) over = true;
+      acc = next.slice(0, MAX_READINGS);
+      i = j;
+    }
+    return acc;
+  };
+  const lines = new Set([...walk(text, false), ...walk(text, true)]);
+  lines.delete(text);
+  return { lines: [...lines], over };
+}
+
 // Thrown when a limit above is hit; each policy's entry point turns it into a denial carrying the message.
 export class GuardLimit extends Error {}
 
@@ -213,7 +288,13 @@ function buildCandidates(sf, { expand, dirs, joinPath, readDir, ifs }) {
   const ifsUnknown = typeof ifs === 'string' && /[$`]/.test(ifs);
   const splitter = new RegExp(`[\\s${typeof ifs === 'string' && !ifsUnknown ? ifs.replace(/[\]\\^-]/g, '\\$&') : ''}]+`);
   const add = (c) => { if (!sf.needExt || SCRIPT_EXT.test(c)) files.add(c); };
-  for (const w of sf.words) {
+  const words = [];
+  for (const w0 of sf.words ?? []) {
+    const rs = paramReadings(w0);
+    if (rs.over) return { files: [], dynamic, over: true };
+    words.push(...rs);
+  }
+  for (const w of words) {
     const e = expand(w);
     let readings = e !== w && w.includes('$') ? [e, ...e.split(splitter)] : [e];
     // a program named by a variable (`T="npx vitest run x.test.tsx"; $T`) runs its first word; the rest are its arguments. The policies evaluate the
