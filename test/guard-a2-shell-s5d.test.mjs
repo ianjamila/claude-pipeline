@@ -166,7 +166,9 @@ test('S5d 1: ... both policies judge the helper of a ${BASH:-bash} head: allowed
 });
 
 test('S5d 1: a head that is a real run-time unknown ($TOOL) in the same script stays refused with HOME / ZDOTDIR in the environment (only the BASH default is believed)', () => {
-  const spec = { 'scripts/task-brief': BRIEF().replace('"${BASH:-bash}"', '"$TOOL"'), 'scripts/sdd-workspace': 'echo hi' };
+  // (TOOL read at run time: a real unknown. An unset TOOL reads as empty from the environment, and a `$(cat file)` as the file; the refusal here once came only
+  // from the later `> "$out"` counting as maybe landing first, which only a loop, a function body or a trap can do: guard-a2-shell-s6.test.mjs)
+  const spec = { 'scripts/task-brief': BRIEF().replace('"${BASH:-bash}"', '"$TOOL"').replace('set -euo pipefail\n', 'set -euo pipefail\nread -r TOOL\n'), 'scripts/sdd-workspace': 'echo hi' };
   const d = filesDecision('bash scripts/task-brief plan.md 1', spec, { env: REAL_ENV });
   assert.equal(d.decision, 'deny', d.reason);
 });

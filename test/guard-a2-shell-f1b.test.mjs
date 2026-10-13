@@ -113,7 +113,8 @@ test('F1b 88: a named descriptor redirection rebinds the script-directory name; 
 
 // main.sh runs n scripts; the first through "${BASH:-bash}" (rewritten), the last one binds BASH (judged after the rewrite, so the verdict is stale and the line is judged again)
 const staleTree = (n, lastBinds) => ({
-  'main.sh': Array.from({ length: n }, (_, i) => (i === 0 ? `"${DYN}" s0.sh` : `bash s${i}.sh`)).join('\n'),
+  // (the binding script is run by `sh`: a script run by plain bash keeps a BASH record of its own, so its binding would make nothing stale: guard-a2-shell-s6b.test.mjs)
+  'main.sh': Array.from({ length: n }, (_, i) => (i === 0 ? `"${DYN}" s0.sh` : `${i === n - 1 && lastBinds ? 'sh' : 'bash'} s${i}.sh`)).join('\n'),
   ...Object.fromEntries(Array.from({ length: n }, (_, i) => [`s${i}.sh`, i === n - 1 && lastBinds ? 'BASH=zsh' : 'echo hi'])),
 });
 const PROJ_FILES = '/home/u/proj';

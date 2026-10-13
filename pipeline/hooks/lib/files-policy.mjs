@@ -19,7 +19,7 @@ import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
-import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText } from './shell-parse.mjs';
+import { simpleCommands, runsAfter, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
 import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit, execLinesOf, paramReadings, assigningDefaults, spliceLines } from './script-candidates.mjs';
 
@@ -1232,6 +1232,7 @@ function collectDirs(cmds, ctx) {
     for (const b of baseDirsOf(c.argv)) addDir(expandRefs(b, ctx));
     const cdName = baseOf(c.argv[0] ?? '');
     if (!CD_CMDS.has(cdName)) continue;
+    if (readsOnlyInSubshell(c, cmds, ctx)) continue; // (`d=$(cd "$(dirname "$0")" && pwd)`: nothing runs in that directory but reads, and the cd ends with the subshell)
     let t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
     if (!t && (cdName === 'cd' || cdName === 'pushd')) t = '~'; // a bare `cd` goes home
     if (c.raw.includes('\\')) {
@@ -1243,6 +1244,27 @@ function collectDirs(cmds, ctx) {
     addDir(mc !== null ? mc : expandRefs(t, ctx), mc === null ? ci : -1);
   }
   return dirs;
+}
+
+// Why: a cd inside a subshell (`d=$(cd "$D" && pwd)`, `(cd "$D"; ls)`) is lost when the subshell ends (shell-parse tags each command with the subshells it runs in: `grp`).
+// When every command in that subshell (nested ones included) only reads and writes nothing, the directory it went to is never written in, wherever it is.
+// (a command the parser could not tag, or a copy that lost the tag, counts as outside every subshell: its cd stays judged)
+const SUBSHELL_READS = new Set(['pwd', 'dirname', 'basename', 'true', 'false', ':', 'exit', 'return']);
+const onlyReads = (c, ctx) => (c.argv.length === 0 || SUBSHELL_READS.has(baseOf(c.argv[0])) || isReadOnly(c, ctx))
+  && !(c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && !FD_DUP.test(r.target ?? '') && r.target !== '/dev/null');
+const insideOf = (cd) => { const g = cd.grp ?? []; return (c) => (c.grp ?? []).length >= g.length && g.every((id, k) => c.grp[k] === id); };
+function readsOnlyInSubshell(cd, cmds, ctx) {
+  if (!(cd.grp ?? []).length) return false;
+  const inside = insideOf(cd);
+  return cmds.every((c) => !inside(c) || onlyReads(c, ctx));
+}
+
+// Why: a cd moves what runs after it, not what ran before: `sdd-workspace` ends with `cd -- "$dir" && pwd`. When every command that may run after it (see
+// runsAfter in shell-parse.mjs: later ones in its subshell or script, and trap actions) only reads, the directory it went to is never written in. Only for a script
+// file run in a process of its own (ctx.selfZero): after the line or a sourced file, the next command (or Bash call) goes on in that directory.
+function nothingWritesAfterCd(ci, cmds, ctx) {
+  const after = runsAfter(cmds, ci);
+  return after !== null && after.every((c) => onlyReads(c, ctx));
 }
 
 // The directory words of commands whose other arguments are read relative to them.
@@ -1607,7 +1629,7 @@ function judgeScriptText(text, sf, abs, dir, ctx, opts) {
     }
   }
   if (kind === 'shell') {
-    const r = evaluateBashForFiles(text, { ...opts, cwd: dir, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup, ...(sf.runsAsScript ? { _selfBash: abs, _selfZero: abs, _selfAbs: isAbs(expandRefs(String(sf.file), ctx)), _selfZsh: sf.kind === 'exec' ? posix.basename(SHEBANG_PROGRAM.exec(text.split('\n', 1)[0])?.[1] ?? '') === 'zsh' : sf.runShell === 'zsh' } : {}) });
+    const r = evaluateBashForFiles(text, { ...opts, cwd: dir, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup, ...(sf.runsAsScript && sf.freshBash ? { _bashState: undefined } : {}), ...(sf.runsAsScript ? { _selfBash: abs, _selfZero: abs, _selfAbs: isAbs(expandRefs(String(sf.file), ctx)), _selfZsh: sf.kind === 'exec' ? posix.basename(SHEBANG_PROGRAM.exec(text.split('\n', 1)[0])?.[1] ?? '') === 'zsh' : sf.runShell === 'zsh' } : {}) });
     return r.decision === 'deny' ? deny(`the script ${sf.file} would run: ${r.reason}`) : null;
   }
   // program text in another language: the admin switch, the hook switch, or a write next to a protected path
@@ -1756,7 +1778,7 @@ function judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw) {
   // Why: `bash $S/review-package ...` with S set on the line runs its first operand: a word made only of names the line set, with no run-time part, glob or space, not an option
   const first = sf.firstOperandRuns && sf.words?.length ? sf.ownPath ?? lineVarWord(sf.words[0], ctx) : null;
   for (const file of sf.ownPath && !c.files.includes(sf.ownPath) ? [...c.files, sf.ownPath] : c.files) {
-    const v = judgeScriptFile({ kind: sf.kind, family: sf.family, file, candidate: true, ...(file === first ? { runsAsScript: true } : {}) }, dirs, ctx, opts);
+    const v = judgeScriptFile({ kind: sf.kind, family: sf.family, file, candidate: true, ...(file === first ? { runsAsScript: true, freshBash: sf.freshBash } : {}) }, dirs, ctx, opts);
     if (v) return v;
   }
   return null;
@@ -2175,6 +2197,7 @@ function evaluateBashForFilesFrame(command, opts) {
     return cmds.some((c, ci) => {
       const cn = baseOf(c.argv[0] ?? '');
       if (!CD_CMDS.has(cn)) return false;
+      if (readsOnlyInSubshell(c, cmds, ctx) || (ctx.selfZero && nothingWritesAfterCd(ci, cmds, ctx))) return false; // (a cd the line or a sourced file ends with: the next command goes on there)
       const { unknownName } = stateAt(ci);
       if (cdUnknownShape(c.argv)) return true;
       const t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
@@ -2274,7 +2297,14 @@ function evaluateBashForFilesFrame(command, opts) {
       // order the shell reads them: judged like `bash FILE`
       // Why: a startup file runs in the CHILD shell, so what it sets is the script's, not the rest of this line's: the effects are taken back once the child is judged (only `source` / `.` change this shell)
       let undo = null;
-      for (const st of startupFilesOf(cs, cmds, { env: startupEnv, inherited: inheritedStartup, exec: sf?.kind === 'exec' })) {
+      const sts = startupFilesOf(cs, cmds, { env: startupEnv, inherited: inheritedStartup, exec: sf?.kind === 'exec' });
+      // Why: bash sets BASH to its own path when it starts, whatever its parent exported (zsh and dash keep the parent's): in a script run by plain bash, only the script
+      // and what it sources can bind BASH, not words elsewhere on this line (`grep "export type X\|..."` once made `"${BASH:-bash}"` in superpowers' task-brief unknown).
+      // Such a script keeps a BASH record of its own (the same two passes as a whole line), unless that bash reads a startup file first (BASH_ENV, a login shell:
+      // it may bind BASH) or the line may change which program `bash` is (PATH).
+      const pathMoved = Object.hasOwn(ctx.vars, 'PATH') || ctx.unknownAll || ctx.srcChanged.has('PATH') || cmds.some((x) => Object.hasOwn(x.env ?? {}, 'PATH') || x.argv.some((a) => /^PATH(?:\+?=|\[)/.test(a)));
+      if (sf && sts.length === 0 && !pathMoved && /^(?:bash|\/(?:usr\/(?:local\/)?)?bin\/bash|\/opt\/homebrew\/bin\/bash)$/.test(cs.argv[0] ?? '')) sf.freshBash = true;
+      for (const st of sts) {
         const v = judgeStartupFile(st);
         if (v) return v;
         if (!st.implicit) { undo ??= snapshotShell(ctx); absorbSourced(st, dirs, ctx); } // (the shell that runs the script read it first: its cds and variables are the script's)

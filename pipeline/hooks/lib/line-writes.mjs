@@ -27,6 +27,10 @@ export function flowStart(cmds) {
   return cmds.findIndex((c) => FLOW_START.test(c.raw ?? '') || ['for', 'case', 'select'].includes(c.argv[0]));
 }
 export const inFlow = (from, i) => from >= 0 && i >= from;
+// Why: with the parser's marks (ctl) a command after an if / case / loop has ended runs as surely as one before it: only one in a branch, a loop, a function body
+// or a trap action may not run, and one in a subshell (`( )`, `$( )`, backticks: grp) does not run in this shell. Without the marks (a parse cut short, an unmarked
+// command): every command from the first construct on, as inFlow.
+export const mayNotRun = (cmds, from, i) => (!cmds.truncated && cmds[i]?.ctl && cmds[i].grp ? Object.values(cmds[i].ctl).some(Boolean) || cmds[i].grp.length > 0 : inFlow(from, i));
 
 // ---- static text ----------------------------------------------------------------------------------------------
 
@@ -1237,7 +1241,14 @@ function visible(frame, at, idx, late = false) {
   if (idx === at) return false;
   if (idx < at || frame.deferred || late) return true;
   const { cmds, from } = frame;
-  if (from >= 0 && at >= from && idx >= from) return true;
+  // Why: only a loop, a function body or a trap action runs a later command before an earlier one (an `if` / `case` runs each at most once, in order). With the
+  // parser's marks (ctl): visible when either is in a function body or a trap action (it runs when called / when the signal fires), or both are in a loop (maybe
+  // the same one); a later write in none of them cannot land first (superpowers' review-package: an `if` at the top, the script it runs early, a
+  // `{ ...; } > "$out"` at the end). Without the marks (a parse cut short, a command the parser did not mark): every later command after the first construct, as before.
+  const a = !cmds.truncated && cmds[at]?.ctl;
+  const w = !cmds.truncated && cmds[idx]?.ctl;
+  if (a && w) { if (a.fn || a.trap || w.fn || w.trap || (a.loop && w.loop)) return true; }
+  else if (from >= 0 && at >= from && idx >= from) return true;
   let hi = at;
   while (hi + 1 < cmds.length && cmds[hi + 1].sep === '|') hi++;
   let lo = at;

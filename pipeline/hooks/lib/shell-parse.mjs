@@ -16,6 +16,10 @@ const MAX_NEST = 200; // in-place nesting of $( ), ( ), <( ) before we give up o
 const MAX_WORK = 8_000_000; // total characters lexed across all recursive parses
 const HARD_MAX_DEPTH = 50;
 const ASSIGN_RE = /^([A-Za-z_][A-Za-z0-9_]*)\+?=/;
+// the counter (ctx.ctl) each construct kind of ctlOpen raises: in a loop, a function body, an if / case branch
+const CTL_COUNTER = { loop: 'loop', fn: 'fn', if: 'cond', case: 'cond' };
+const ctlMarks = (c) => ({ loop: c.loop > 0, fn: c.fn > 0, trap: c.trap > 0, cond: c.cond > 0 });
+const LOOP_WORDS = new Set(['while', 'until', 'for', 'select', 'repeat', 'foreach']);
 const KEYWORDS = new Set(['if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', 'until', '!', 'esac', 'coproc']);
 // A word right before a ( that opens a subshell, a condition or arithmetic (`if(true)`, `for((i=0;;))`), not a glob qualifier group.
 const LEAD_WORDS = new Set([...KEYWORDS, 'for', 'case', 'select', 'in', 'time', 'function', 'foreach', 'switch', 'catch', 'elseif', 'param', 'trap', 'return', 'exit', 'throw']);
@@ -1365,6 +1369,11 @@ function zshAlternationAt(s, i) {
 function emit(ctx, argv, env, raw, depth, redirects = [], sep = ';') {
   if (ctx.out.length >= MAX_COMMANDS) { ctx.truncated = true; ctx.stopped = true; return null; }
   const cmd = { argv, env, raw, depth, redirects };
+  // grp: the subshells (`$( )`, `( )`, backticks, `<( )`) it runs inside, outermost first, as ids: a cd in one is lost when it ends. Not enumerable
+  Object.defineProperty(cmd, 'grp', { value: ctx.grp, enumerable: false });
+  // ctl: it is in a loop (may run again after a later command), a function body or a trap action (runs when called / when the signal fires: maybe after any command),
+  // an if / case branch (cond: may not run; loops, function bodies and traps may not either). Not enumerable
+  Object.defineProperty(cmd, 'ctl', { value: ctlMarks(ctx.ctl), enumerable: false });
   // sep: the operator before it (; & && || |), for callers that care whether it surely runs; not enumerable, like `truncated`
   Object.defineProperty(cmd, 'sep', { value: sep, enumerable: false });
   ctx.out.push(cmd);
@@ -1384,6 +1393,9 @@ class Parser {
     this.subAcc = []; // segments run by substitutions inside the word being lexed
     this.lastDqDyn = false;
     this.cmd = null; // the command object interpret() is working on
+    this.comments = null; // [start, end] of each comment of this text, when asked for (see withoutComments)
+    this.ctlStack = []; // loops / function bodies / { groups open (see ctlOpen), for every nesting level of this text
+    this.ctlBase = 0; // where the current level's entries start
     ctx.work += src.length;
     if (ctx.work > MAX_WORK) { ctx.stopped = true; ctx.truncated = true; }
   }
@@ -1430,7 +1442,7 @@ class Parser {
     const start = this.i;
     const mark = this.log.length;
     this.i += 2;
-    this.nestParse(depth + 1, { stopAtParen: true, noRedir: s[start] === '$' && s[this.i] === '(' });
+    this.inGroup(() => this.nestParse(depth + 1, { stopAtParen: true, noRedir: s[start] === '$' && s[this.i] === '(' }));
     this.subAcc.push(...this.log.slice(mark));
     return s.slice(start, this.i);
   }
@@ -1449,7 +1461,7 @@ class Parser {
       body += c;
       this.i++;
     }
-    this.subAcc.push(...this.subParse(body, depth + 1));
+    this.subAcc.push(...this.inGroup(() => this.subParse(body, depth + 1)));
     return s.slice(start, this.i);
   }
 
@@ -1534,11 +1546,15 @@ class Parser {
       h.seg.heredocs.push({ text, quoted: h.quoted });
       h.seg.pending--;
       if (h.seg.muted) continue;
-      // No terminator: either a malformed command or a `<<` we mistook for a heredoc that then swallowed the rest
-      // of the line. Parsing the body as script costs a false positive at worst, never a miss.
-      if (!found) this.subParse(text, h.seg.depth + 1);
-      // An unquoted heredoc still expands $(...) and backticks, so a body can run commands. Quoted ones are inert data.
-      else if (!h.quoted) this.scanExpansions(text, h.seg.depth);
+      const grp = this.ctx.grp;
+      this.ctx.grp = h.seg.grp; // (the body expands where its command runs: inside the subshells that command was written in)
+      try {
+        // No terminator: either a malformed command or a `<<` we mistook for a heredoc that then swallowed the rest
+        // of the line. Parsing the body as script costs a false positive at worst, never a miss.
+        if (!found) this.subParse(text, h.seg.depth + 1);
+        // An unquoted heredoc still expands $(...) and backticks, so a body can run commands. Quoted ones are inert data.
+        else if (!h.quoted) this.scanExpansions(text, h.seg.depth);
+      } finally { this.ctx.grp = grp; }
     }
     this.hd = [];
     this.i = pos;
@@ -1565,7 +1581,13 @@ class Parser {
     ctx.nest++;
     const saved = this.subAcc;
     this.subAcc = [];
-    try { this.lex(depth, stopAtParen, noRedir); } finally { ctx.nest--; this.subAcc = saved; }
+    const base = this.ctlBase;
+    this.ctlBase = this.ctlStack.length;
+    try { this.lex(depth, stopAtParen, noRedir); } finally {
+      ctx.nest--; this.subAcc = saved;
+      while (this.ctlStack.length > this.ctlBase) { const kind = this.ctlStack.pop(); if (CTL_COUNTER[kind]) ctx.ctl[CTL_COUNTER[kind]]--; } // (left open: ends with the level)
+      this.ctlBase = base;
+    }
   }
 
   lex(depth, stopAtParen, noRedir) {
@@ -1592,13 +1614,17 @@ class Parser {
     let gCur = 0; // index in `cur` just after it
     let gGlob = false; // the word before the group holds a glob character
     let lastSep = ';';
+    // `case` statements open at this level: st 'subj' (its word comes next), 'in', 'pat' (patterns up to `)` come next: no commands),
+    // 'body' (an arm's commands, up to ;; ;& ;;& ;| or esac), 'end' (the esac word comes next). A stack: arms hold nested cases.
+    const cs = [];
+    let fnPending = false; // an empty `()` after names was just read: the next group is a function body
 
     const startSeg = () => {
       if (!inWord) wstart = this.i;
       if (!seg) {
         seg = {
           words: [], heredocs: [], herestrings: [], redirects: [], stdinSubs: [], stdinFile: false, stdinFiles: [], outSubs: [], fdFeeds: [], vf: ctx.varFeeds, cmd: null, meta: new Map(), win: new Map(),
-          start: this.i, depth, pending: 0, muted, raw: '', final: null, groupStage: null, pat: new Set(),
+          start: this.i, depth, pending: 0, muted, raw: '', final: null, groupStage: null, pat: new Set(), grp: ctx.grp, ctl: ctlMarks(ctx.ctl),
           pipedFrom: lastSep === '|' ? this.lastStage : null, sep: lastSep,
         };
       }
@@ -1670,6 +1696,27 @@ class Parser {
         if (text === '{') this.braceStack.push(this.log.length);
         else if (text === '}' && this.braceStack.length) seg.groupStage = this.log.slice(this.braceStack.pop());
       }
+      const top = cs[cs.length - 1];
+      const cmdPos = seg.kwOnly !== false; // every word before this one is an unquoted keyword or `{` (kept as it goes: a rescan per word is quadratic)
+      seg.kwOnly = cmdPos && q < 0 && (KEYWORDS.has(text) || text === '{');
+      if (top?.st === 'subj') top.st = 'in';
+      else if (top?.st === 'in') { if (q < 0 && text === 'in') top.st = 'pat'; else { cs.pop(); this.ctlClose(['case']); } } // `case x {` (zsh) and the like: patterns read as commands (strict)
+      else if (q < 0 && cmdPos && text === 'esac' && (top?.st === 'body' || top?.st === 'end')) { cs.pop(); this.ctlClose(['case']); }
+      else if (q < 0 && cmdPos && text === 'case') { cs.push({ st: 'subj' }); this.ctlOpen('case'); seg.ctl = { ...seg.ctl, cond: true }; }
+      // loops, if / case branches and function bodies (see emit: ctl): `while`/`for`/... open a loop (its own words loop too), `done` closes one; `if`/`fi`, `case`/`esac` likewise; a `{` after `f()` (or
+      // `function f`) opens a function body, any other command-position `{` a plain group; `}` closes the last of those
+      const fnKw = text === '{' && seg.words.length >= 2 && seg.words[0].qa < 0 && seg.words[0].text === 'function';
+      if (q < 0 && cmdPos && LOOP_WORDS.has(text)) { this.ctlOpen('loop'); seg.ctl = { ...seg.ctl, loop: true }; }
+      else if (q < 0 && cmdPos && text === 'if') { this.ctlOpen('if'); seg.ctl = { ...seg.ctl, cond: true }; }
+      else if (q < 0 && cmdPos && text === 'fi') this.ctlClose(['if']);
+      else if (q < 0 && cmdPos && text === 'done') this.ctlClose(['loop']);
+      else if (q < 0 && cmdPos && text === '}') this.ctlClose(['fn', 'brace']);
+      else if (q < 0 && (cmdPos || fnKw) && text === '{') {
+        if (fnKw) for (const w of seg.words.slice(1)) ctx.fns.add(w.text);
+        this.ctlOpen(fnPending || fnKw ? 'fn' : 'brace');
+        if (fnPending || fnKw) seg.ctl = { ...seg.ctl, fn: true }; // (the body's first command is in this segment: `{ echo x > f; }`)
+      }
+      fnPending = false;
       seg.words.push({ text, qa: q, bm: marks, dyn, subs, win, pat });
     };
     const endSeg = (idx) => {
@@ -1685,6 +1732,16 @@ class Parser {
     };
 
     while (this.i < n && !ctx.stopped) {
+      if (cs.length && cs[cs.length - 1].st === 'pat' && !inWord && lit === 0) {
+        endSeg(this.i);
+        lastSep = ';';
+        const top = cs[cs.length - 1];
+        this.caseGap();
+        if (/^esac(?=$|[\s;&|()<>])/.test(s.slice(this.i, this.i + 5))) top.st = 'end'; // (the word itself is lexed as usual)
+        else if (this.casePattern(depth)) top.st = 'body';
+        else { cs.pop(); this.ctlClose(['case']); } // a pattern no shell accepts: what follows is read as commands, as before
+        continue;
+      }
       const c = s[this.i];
       if (lit > 0 && (isSpace(c) || c === '\n')) { cur += ' '; this.i++; continue; }
       if (lit > 0 && (c === '(' || c === ')')) {
@@ -1704,7 +1761,9 @@ class Parser {
         this.i++;
         if (this.hd.length) this.readHeredocs();
       } else if (c === '#' && !inWord) {
+        const from = this.i;
         while (this.i < n && s[this.i] !== '\n') this.i++;
+        if (this.comments) this.comments.push([from, this.i]);
       } else if (c === '\\') {
         const nx = s[this.i + 1];
         if (nx === '\n') this.i += 2;
@@ -1766,7 +1825,13 @@ class Parser {
       } else if (c === ';') {
         endSeg(this.i);
         lastSep = ';';
-        this.i++;
+        const top = cs[cs.length - 1];
+        const nx = s[this.i + 1];
+        if (top?.st === 'body' && (nx === ';' || nx === '&' || nx === '|')) {
+          // ;; ;& ;;& (bash) ;| (zsh) end an arm: patterns come next
+          this.i += nx === ';' && s[this.i + 2] === '&' ? 3 : 2;
+          top.st = 'pat';
+        } else this.i++;
       } else if (c === '&') {
         const nx = s[this.i + 1];
         if (nx === '&') { endSeg(this.i); lastSep = '&&'; this.i += 2; }
@@ -1822,12 +1887,21 @@ class Parser {
           // `*(e:'cmd':)`, `foo(+f)`, `*.(jpg|png)`: a glob group glued to a word is part of the word (and `f()` is a function definition)
           lit = 1; litGlob = true; wpat = true; gGlob = /[*?[]/.test(cur); cur += '('; this.i++; gRaw = this.i; gCur = cur.length;
         } else {
+          flushWord();
+          // `f ()`, `f()`, zsh `f g ()`, `function f ()`: the words before an empty `()` are names of functions, and the next `{ }` or `( )` is their body
+          const head = /^\(\s*\)/.test(s.slice(this.i, this.i + 64)) && seg ? seg.words.filter((w, k) => !(k === 0 && w.qa < 0 && w.text === 'function')).map((w) => w.text) : null;
+          const body = fnPending; // (this group is the body of the function named just before it)
           endSeg(this.i);
           lastSep = ';';
           this.i++;
-          if (depth === 0) this.ctx.subshell = true; // ((...)) arithmetic too: conservative
+          if (depth === 0) this.ctx.subshell = true; // ((...)) arithmetic too: conservative (and the `()` of `f()`: flowStart reads it as "from here on, maybe later")
           const mark0 = this.log.length;
-          this.nestParse(depth, { stopAtParen: true, noRedir: noRedir || s[this.i] === '(' }); // ((...)) is arithmetic
+          if (body) this.ctx.ctl.fn++;
+          try {
+            this.inGroup(() => this.nestParse(depth, { stopAtParen: true, noRedir: noRedir || s[this.i] === '(' })); // ((...)) is arithmetic
+          } finally { if (body) this.ctx.ctl.fn--; }
+          fnPending = false;
+          if (head?.length) { for (const name of head) ctx.fns.add(name); fnPending = true; }
           this.lastStage = this.log.slice(mark0);
         }
       } else if (c === ')') {
@@ -1864,10 +1938,73 @@ class Parser {
     }
   }
 
+  // Blanks, newlines (with the heredoc bodies they start), line continuations and comments before a `case` arm's patterns.
+  caseGap() {
+    const s = this.src;
+    const n = s.length;
+    while (this.i < n) {
+      const c = s[this.i];
+      if (isSpace(c)) this.i++;
+      else if (c === '\n') { this.i++; if (this.hd.length) this.readHeredocs(); }
+      else if (c === '\\' && s[this.i + 1] === '\n') this.i += 2;
+      else if (c === '#') { while (this.i < n && s[this.i] !== '\n') this.i++; }
+      else break;
+    }
+  }
+
+  // Reads one `case` arm's patterns (`a|b)`, `(a)`, `"$r"/*)`) through the closing `)`: true when it did. Patterns are no commands, but the
+  // substitutions in them run (parsed as commands here), and the body of a group (`@(a|b)`, `x(e:...:)`, zsh `=(...)`) is also judged like a glob
+  // qualifier: nothing between parentheses is dropped. False, with this.i back where it was, for text no shell takes as a pattern list (two words
+  // without a `|`, ; & < > or a newline before the `)`, the end of the text): the caller then reads it as commands, as before (strict).
+  // Every scan is charged to the work budget: a failed scan is lexed again, and nested failures must not multiply unseen.
+  casePattern(depth) {
+    const ctx = this.ctx;
+    const s = this.src;
+    const n = s.length;
+    const start = this.i;
+    let i = start;
+    const done = (ok) => {
+      ctx.work += Math.max(i - start, 1);
+      if (ctx.work > MAX_WORK) { ctx.stopped = true; ctx.truncated = true; }
+      this.subAcc.length = 0;
+      this.i = ok ? i : start;
+      return ok;
+    };
+    if (s[i] === '(') i++;
+    let d = 0;
+    let word = false; // the current alternative has begun
+    let gap = false; // a blank ended it: only | or ) may follow
+    let gOpen = 0;
+    while (i < n) {
+      if (ctx.stopped || ((i & 1023) === 0 && ctx.expired?.())) { ctx.stopped = true; ctx.truncated = true; return done(false); }
+      const c = s[i];
+      if (d === 0 && isSpace(c)) { gap = word; i++; continue; }
+      if (d === 0 && c === ')') { i++; return done(true); }
+      if (d === 0 && c === '|') { word = false; gap = false; i++; continue; }
+      if (gap || c === '\n' || c === ';' || c === '&' || c === '<' || c === '>') return done(false);
+      word = true;
+      if (c === '\\') i += 2;
+      else if (c === "'") { const j = s.indexOf("'", i + 1); i = j < 0 ? n : j + 1; }
+      else if (c === '"' || (c === '$' && s[i + 1] === '"')) { this.i = i + (c === '$' ? 2 : 1); this.readDq(depth); i = this.i; }
+      else if (c === '$' && s[i + 1] === '(') { this.i = i; this.substitution(depth); i = this.i; }
+      else if (c === '`') { this.i = i; this.backtick(depth); i = this.i; }
+      else if (c === '$' && s[i + 1] === "'") i = readAnsiC(s, i + 1).next;
+      else if (c === '$' && s[i + 1] === '{' && this.paramSpan(i) > 0) i = this.paramSpan(i);
+      else if (c === '(') { if (d++ === 0) gOpen = i + 1; i++; }
+      else if (c === ')') { if (--d === 0) this.qualifierCode(s.slice(gOpen, i), s.slice(gOpen, i), depth, false); i++; }
+      else i++;
+    }
+    return done(false);
+  }
+
   // Interprets one finished simple command: strip keywords/assignments/wrappers, emit it, recurse into interpreters.
   finalize(seg) {
     if (seg.muted) return;
     this.log.push(seg);
+    const grp = this.ctx.grp;
+    const ctl = this.ctx.ctl;
+    this.ctx.ctl = { loop: +seg.ctl.loop, fn: +seg.ctl.fn, trap: +seg.ctl.trap, cond: +seg.ctl.cond };
+    this.ctx.grp = seg.grp; // (what it runs, `bash -c` text included, is in the subshells it was written in, wherever the queue finishes it)
     try {
       this.finalizeSeg(seg);
     } catch {
@@ -1875,7 +2012,29 @@ class Parser {
       this.ctx.truncated = true;
       const argv = seg.words.map((w) => w.text);
       if (argv.length) emit(this.ctx, argv, {}, seg.raw, seg.depth, [...seg.redirects]);
+    } finally { this.ctx.grp = grp; this.ctx.ctl = ctl; }
+  }
+
+  // A loop / function body / plain `{` group opens at this nesting level (closed by ctlClose, or when the level ends: see parseList).
+  ctlOpen(kind) {
+    this.ctlStack.push(kind);
+    if (CTL_COUNTER[kind]) this.ctx.ctl[CTL_COUNTER[kind]]++;
+  }
+
+  // Closes the last open construct of one of `kinds` at this level, and whatever was opened after it; nothing when there is none.
+  ctlClose(kinds) {
+    for (let k = this.ctlStack.length - 1; k >= this.ctlBase; k--) {
+      if (!kinds.includes(this.ctlStack[k])) continue;
+      while (this.ctlStack.length > k) { const kind = this.ctlStack.pop(); if (CTL_COUNTER[kind]) this.ctx.ctl[CTL_COUNTER[kind]]--; }
+      return;
     }
+  }
+
+  // Runs fn with one more subshell open (see emit: grp).
+  inGroup(fn) {
+    const saved = this.ctx.grp;
+    this.ctx.grp = [...saved, ++this.ctx.grpN];
+    try { return fn(); } finally { this.ctx.grp = saved; }
   }
 
   finalizeSeg(seg) {
@@ -2257,7 +2416,10 @@ class Parser {
       // trap 'script' SIGNAL...: the first word runs as a script when the signal fires
       let k = 1;
       while (k < argv.length && (argv[k] === '-l' || argv[k] === '-p' || argv[k] === '--')) k++;
-      if (argv.length - k >= 2 && argv[k] !== '-') this.runScript(seg, [argv[k]], argv[k], depth);
+      if (argv.length - k >= 2 && argv[k] !== '-') {
+        this.ctx.ctl.trap++;
+        try { this.runScript(seg, [argv[k]], argv[k], depth); } finally { this.ctx.ctl.trap--; }
+      }
     } else if (name === 'watch') {
       const i = skipOpts(argv, 1, 'n', ['--interval']);
       if (i < argv.length) this.runScript(seg, argv.slice(i), argv.slice(i).join(' '), depth); // watch runs its args via sh -c
@@ -2280,18 +2442,38 @@ class Parser {
   }
 }
 
+function newCtx(maxDepth, expired, bashState) {
+  return { out: [], expired, maxDepth, truncated: false, dynamic: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, fns: new Set(), stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState };
+}
+
+// The text with every comment the lexer skips blanked out (newlines kept), from a lexing pass that interprets nothing (muted); null when that pass did not
+// read the whole text (a limit, an error): the caller keeps the text as it is.
+function withoutComments(src, maxDepth, expired) {
+  const ctx = newCtx(Math.min(Math.max(maxDepth, 0), HARD_MAX_DEPTH), expired, null);
+  ctx.muted = 1;
+  const p = new Parser(ctx, src);
+  p.comments = [];
+  try { p.parseTop(0); } catch { return null; }
+  if (ctx.stopped || ctx.truncated) return null;
+  let out = '';
+  let at = 0;
+  for (const [a, b] of p.comments) { out += src.slice(at, a) + ' '.repeat(b - a); at = b; }
+  return out + src.slice(at);
+}
+
 export function simpleCommands(str, opts) {
   const requested = Number.isFinite(opts?.maxDepth) ? Math.trunc(opts.maxDepth) : 5;
   // opts.expired: () => true once the evaluation's wall-clock deadline has passed; scans that can run long poll it and give up (truncated)
   const expired = typeof opts?.expired === 'function' ? opts.expired : null;
   const bashState = opts?.bashState; // the evaluation's shared record of the BASH rewrite (see below)
-  const ctx = { out: [], expired, maxDepth: Math.min(Math.max(requested, 0), HARD_MAX_DEPTH), truncated: false, dynamic: false, subshell: false, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState };
+  const ctx = newCtx(Math.min(Math.max(requested, 0), HARD_MAX_DEPTH), expired, bashState);
   let parser = null;
   try {
     parser = new Parser(ctx, String(str ?? ''));
     // Why: every text of an evaluation (script, startup file, file the line wrote, heredoc body, nested frame) is parsed apart, but another text may bind BASH for the shell that runs this
     // one. The first text that can bind it ends the rewrite for every text after it; a text already rewritten before that is stale, and the policy reruns the evaluation (bashState.bound)
-    const binds = bindsBash(parser.src);
+    // (a word in a comment is no binding: when the text looks like it binds BASH, it is checked again without the comments the lexer sees; any doubt keeps the first answer)
+    const binds = bindsBash(parser.src) && bindsBash(withoutComments(parser.src, requested, expired) ?? parser.src);
     if (binds && bashState) bashState.bound = true;
     ctx.bashPlain = (opts?.env ?? process.env).BASH === undefined && !binds && !bashState?.bound;
     parser.parseTop(0);
@@ -2302,7 +2484,36 @@ export function simpleCommands(str, opts) {
   Object.defineProperty(ctx.out, 'truncated', { value: ctx.truncated, enumerable: false });
   Object.defineProperty(ctx.out, 'dynamic', { value: ctx.dynamic, enumerable: false });
   Object.defineProperty(ctx.out, 'subshell', { value: ctx.subshell, enumerable: false });
+  // fns: every name the text defines as a function (`f()`, `function f`, zsh `f g ()`), wherever it is
+  Object.defineProperty(ctx.out, 'fns', { value: ctx.fns, enumerable: false });
   return ctx.out;
+}
+
+// The commands of `cmds` (one simpleCommands result) that may run after cmds[ci] in the shell that runs it: the later ones in its subshell (nested ones
+// included) and every trap action. Null when that cannot be told: cmds[ci] is in a loop (it runs again before the loop's earlier commands), a function body or a
+// trap action, the parse was cut short or names a command only at run time, cmds[ci] calls a function the text defines, the text defines a hook function (zsh
+// chpwd / TRAPEXIT ..., bash command_not_found_handle: they run on their own), a later command is named like a function the text defines (names compared without
+// case: macOS finds `Pwd` as pwd), or the text can run code it does not hold: a sourced file (its traps, functions, aliases), eval, alias, autoload, enable,
+// hash, `functions[...]=`. (Any other function body only runs when called, and no command returned calls one.)
+const LATER_RUNNERS = new Set(['source', '.', 'alias', 'autoload', 'enable', 'disable', 'hash', 'functions', 'unfunction', 'builtin', 'command', 'eval', 'exec']);
+const HOOK_FUNCTIONS = /^(?:TRAP|chpwd|precmd|preexec|periodic|zshexit|zshaddhistory|zsh_directory_name|command_not_found_handler?)/i;
+export function runsAfter(cmds, ci) {
+  const me = cmds?.[ci];
+  if (!me?.ctl || me.ctl.loop || me.ctl.fn || me.ctl.trap || !cmds.fns || cmds.truncated || cmds.dynamic) return null;
+  const fns = new Set([...cmds.fns].map((n) => base(n)));
+  if ([...cmds.fns].some((n) => HOOK_FUNCTIONS.test(n)) || fns.has(base(me.argv[0] ?? ''))) return null;
+  const g = me.grp ?? [];
+  const inside = (c) => (c.grp ?? []).length >= g.length && g.every((id, k) => c.grp[k] === id);
+  const out = [];
+  for (const [cj, c] of cmds.entries()) {
+    if (!c.ctl) return null;
+    const name = base(c.argv[0] ?? '');
+    if (LATER_RUNNERS.has(name) || c.argv.some((a) => /^functions(?:\[|\+?=)/.test(a)) || Object.keys(c.env ?? {}).some((k) => /^functions$/i.test(k))) return null;
+    if (cj === ci || !inside(c) || (cj < ci && !c.ctl.trap)) continue; // (itself, outside its subshell, or run before it)
+    if (fns.has(name)) return null;
+    out.push(c);
+  }
+  return out;
 }
 
 // Every redirection of every command, in order: [{op, target, fd}]. `target` is the redirect word with quotes
