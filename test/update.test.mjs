@@ -456,6 +456,7 @@ test('the isolated git: fixed flags, no system/global config, no prompts, all po
   assert.equal(env.GIT_CONFIG_NOSYSTEM, '1');
   assert.equal(env.GIT_CONFIG_GLOBAL, join(iso, 'empty.gitconfig'));
   assert.equal(env.GIT_TERMINAL_PROMPT, '0');
+  assert.equal(env.GIT_CEILING_DIRECTORIES, realpathSync.native(dirname(iso)), 'git may not climb out of the trusted scratch root');
   // The hooks path is an existing EMPTY directory and the global config an existing EMPTY file: never a device name,
   // which Git for Windows resolves differently for a hooks directory (C:\dev\null\post-checkout) than for a file.
   const hooksPath = args.find((a) => a.startsWith('core.hooksPath=')).slice('core.hooksPath='.length);
@@ -510,15 +511,15 @@ test('makeIsoDir: a fresh private dir (0700 on POSIX) in the home\'s trusted roo
   }
 });
 
-test('the isolated git environment is an allowlist: PATH, HOME, locale and three fixed values, nothing else', () => {
+test('the isolated git environment is an allowlist: PATH, HOME, locale and four fixed values, nothing else', () => {
   const iso = isoDir();
   const hostile = {
     PATH: '/usr/bin', HOME: '/home/u', LANG: 'en_US.UTF-8', LC_ALL: 'C', LC_CTYPE: 'x', TEMP: '/t', COMSPEC: 'cmd', SYSTEMROOT: 'C:\\Windows',
     GIT_EXEC_PATH: '/evil', GIT_SSH: '/evil/ssh', GIT_SSH_COMMAND: 'evil', GIT_CONFIG: '/evil/c', GIT_CONFIG_GLOBAL: '/evil/g', GIT_EXTERNAL_DIFF: 'evil',
-    GIT_PROXY_COMMAND: 'evil', GIT_ASKPASS: 'evil', GIT_PAGER: 'evil', GIT_FUTURE_VARIABLE: 'evil', GIT_DIR: '/evil',
+    GIT_PROXY_COMMAND: 'evil', GIT_ASKPASS: 'evil', GIT_PAGER: 'evil', GIT_FUTURE_VARIABLE: 'evil', GIT_DIR: '/evil', GIT_WORK_TREE: '/evil', GIT_CEILING_DIRECTORIES: '/evil',
     HTTPS_PROXY: 'http://evil', SSL_CERT_FILE: '/evil', CURL_CA_BUNDLE: '/evil', LD_PRELOAD: '/evil.so', NODE_OPTIONS: '--require evil', EDITOR: 'evil',
   };
-  const fixed = { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(iso, 'empty.gitconfig'), GIT_TERMINAL_PROMPT: '0' };
+  const fixed = { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(iso, 'empty.gitconfig'), GIT_CEILING_DIRECTORIES: realpathSync.native(dirname(iso)), GIT_TERMINAL_PROMPT: '0' };
   assert.deepEqual(isolatedGitEnv({ isoDir: iso, source: hostile, platform: 'linux' }), { PATH: '/usr/bin', HOME: '/home/u', LANG: 'en_US.UTF-8', LC_ALL: 'C', ...fixed });
   // Windows adds the variables the runtime needs to start, and finds them whatever their case.
   const win = isolatedGitEnv({ isoDir: iso, source: { Path: 'C:\\bin', ComSpec: 'C:\\cmd.exe', SystemRoot: 'C:\\Windows', GIT_EXEC_PATH: '/evil', NODE_OPTIONS: 'x' }, platform: 'win32' });
@@ -678,6 +679,8 @@ test('the caller\'s git configuration is not LOADED by the isolated git: a url r
   git(work, ['clone', '--quiet', '--bare', work, decoy]);
   const decoySha = git(work, ['rev-parse', 'HEAD']);
   assert.notEqual(decoySha, realSha);
+  // One spelling everywhere: url rewrites match the prefix literally, so the config and the URLs handed to git (control
+  // and isolated alike) must both use the forward-slash form or, on Windows, the rewrite silently never applies.
   const rewrite = `[url "${fwd(real)}"]\n\tinsteadOf = ${fwd(decoy)}\n`;
 
   const scenarios = {
@@ -693,7 +696,7 @@ test('the caller\'s git configuration is not LOADED by the isolated git: a url r
     const names = Object.keys(callerEnv);
     // Control: a plain git with that config follows the rewrite, so the isolated answer below is a real signal.
     const plainEnv = Object.fromEntries(Object.entries({ ...process.env, ...callerEnv }).filter(([, v]) => v !== undefined));
-    const control = spawnSync('git', ['ls-remote', decoy, 'refs/heads/main'], { cwd: dir, encoding: 'utf8', env: plainEnv });
+    const control = spawnSync('git', ['ls-remote', fwd(decoy), 'refs/heads/main'], { cwd: dir, encoding: 'utf8', env: plainEnv });
     assert.equal(control.status, 0, `${where}: ${control.stderr}`);
     assert.match(control.stdout, new RegExp(`^${realSha}`), `control (${where}): the rewrite is a real vector on this git`);
 
@@ -701,7 +704,7 @@ test('the caller\'s git configuration is not LOADED by the isolated git: a url r
     for (const n of names) { if (callerEnv[n] === undefined) delete process.env[n]; else process.env[n] = callerEnv[n]; }
     try {
       withIsolatedGit(scratch('cp-upd-rwhome'), (g, iso) => {
-        const ls = g(['ls-remote', decoy, 'refs/heads/main'], { cwd: iso, allowFile: true });
+        const ls = g(['ls-remote', fwd(decoy), 'refs/heads/main'], { cwd: iso, allowFile: true });
         assert.equal(ls.code, 0, `${where}: ${ls.stderr}`);
         assert.match(ls.stdout, new RegExp(`^${decoySha}`), `${where}: the isolated git followed the caller's url rewrite (global config was loaded)`);
       });
@@ -709,6 +712,47 @@ test('the caller\'s git configuration is not LOADED by the isolated git: a url r
       for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
     }
   }
+});
+
+// The Claude home may sit INSIDE a git checkout (a ~/.claude symlinked into a dotfiles repo). Git looks for a repository
+// from its working directory upward and loads that repository's LOCAL config, which GIT_CONFIG_NOSYSTEM / GIT_CONFIG_GLOBAL
+// do not suppress - so the isolated calls (whose cwd is under the home) must be stopped from ascending into it
+// (GIT_CEILING_DIRECTORIES). The outer repo's config rewrites the REAL upstream URL to a decoy bare repo.
+function nestedHome() {
+  const dir = scratch('cp-upd-nest');
+  const { bare: real, sha: realSha } = remote();
+  const work = join(dir, 'decoy-work');
+  mkdirSync(work);
+  git(work, ['init', '--quiet']);
+  git(work, ['symbolic-ref', 'HEAD', 'refs/heads/main']);
+  git(work, ['-c', 'commit.gpgsign=false', 'commit', '--quiet', '--allow-empty', '-m', 'decoy']);
+  const decoy = join(dir, 'decoy.git');
+  git(work, ['clone', '--quiet', '--bare', work, decoy]);
+  const decoySha = git(work, ['rev-parse', 'HEAD']);
+  assert.notEqual(decoySha, realSha);
+  const outer = join(dir, 'dotfiles');
+  mkdirSync(outer);
+  git(outer, ['init', '--quiet']);
+  // Written to the repo's own .git/config: the one place neither GIT_CONFIG_GLOBAL nor NOSYSTEM reaches.
+  writeFileSync(join(outer, '.git', 'config'), `[core]\n\trepositoryformatversion = 0\n[url "${fwd(decoy)}"]\n\tinsteadOf = ${fwd(real)}\n`, { flag: 'a' });
+  const home = join(outer, 'claude');
+  mkdirSync(join(home, 'pipeline-state', 'tmp'), { recursive: true });
+  // Control: plain git run from under that home follows the rewrite, so a real answer from the isolated git means something.
+  const control = spawnSync('git', ['ls-remote', fwd(real), 'refs/heads/main'], { cwd: join(home, 'pipeline-state', 'tmp'), encoding: 'utf8', env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1' } });
+  assert.equal(control.status, 0, control.stderr);
+  assert.match(control.stdout, new RegExp(`^${decoySha}`), 'control: the outer repository\'s url rewrite is a real vector on this git');
+  return { home, real, realSha, decoySha };
+}
+
+test('a Claude home nested inside a git checkout: its local config (url rewrite) is not loaded by mainSha or by update', async () => {
+  const { home, real, realSha } = nestedHome();
+  const down = createFakeGh([{ match: '.*', stderr: 'HTTP 502', code: 1 }]);
+  const via = mainSha({ env: envFor(down, { PIPELINE_UPDATE_REMOTE: fwd(real) }), home });
+  assert.deepEqual(via, { ok: true, sha: realSha, via: 'git' }, 'mainSha followed the outer repository\'s rewrite');
+  // fetchSource (init + fetch + checkout, with -C into the download) under the same nesting.
+  const r = await update(['--claude-home', home], { env: envFor(ghFor(realSha, cmp('identical', realSha, realSha)), { PIPELINE_UPDATE_REMOTE: fwd(real) }) });
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.equal(readManifest(home).sourceSha, realSha);
 });
 
 test('PIPELINE_UPDATE_REMOTE is a seam: honoured by a checkout, ignored (with the real URL used) by an installed copy', () => {

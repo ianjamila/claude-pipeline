@@ -31,7 +31,7 @@ const DEFAULT_TIMEOUT_MS = 15000;
 // git-upload-pack from; GIT_SSH, GIT_SSH_COMMAND, GIT_PROXY_COMMAND, GIT_ASKPASS, GIT_EXTERNAL_DIFF, GIT_PAGER,
 // GIT_CONFIG_*, GIT_DIR, ...) and a denylist misses whichever one it does not know about yet. So only what git needs to
 // find itself and the owner's files is passed on: PATH and HOME (and, on Windows, the handful of variables the runtime
-// needs to start at all), the locale, and three fixed values: no system config, no global config (GIT_CONFIG_GLOBAL needs
+// needs to start at all), the locale, and four fixed values: no system config, no global config (GIT_CONFIG_GLOBAL needs
 // git >= 2.32; older gits ignore it, the -c flags below still apply) and no prompts. Proxy and CA variables
 // (HTTPS_PROXY, SSL_CERT_FILE, ...) are deliberately NOT passed: each can redirect or intercept the fetch, so a user who
 // needs a proxy cannot use `pipeline update` yet. `source` and `platform` are injectable for tests.
@@ -80,6 +80,18 @@ function isoPaths(isoDir) {
   return { hooks, config };
 }
 
+// git finds a repository by walking UP from its working directory and then loads THAT repository's local config
+// (url.<x>.insteadOf, include.path, http.*, core.*), which GIT_CONFIG_NOSYSTEM / GIT_CONFIG_GLOBAL do not touch. The
+// Claude home may well sit inside a checkout (~/.claude symlinked into a dotfiles repo), and every isolated call runs
+// with a cwd under it, so discovery is capped: GIT_CEILING_DIRECTORIES names the iso directory's parent (the trusted
+// root all our scratch lives in), and git will not climb into it. The cwd itself is still searched, so the repository a
+// call deliberately works on (`git init <dir>` / `-C <dir>` inside the download) is found. Symlinks are resolved first:
+// git compares the ceiling with its real working directory. Nothing else can set GIT_DIR / GIT_WORK_TREE /
+// GIT_CEILING_DIRECTORIES: the environment is an allowlist.
+function ceilingFor(isoDir) {
+  return fs.realpathSync.native(path.dirname(path.resolve(isoDir)));
+}
+
 export function isolatedGitEnv({ isoDir, source = process.env, platform = process.platform } = {}) {
   const { config } = isoPaths(isoDir);
   const env = {};
@@ -89,7 +101,7 @@ export function isolatedGitEnv({ isoDir, source = process.env, platform = proces
     const key = windows ? Object.keys(source).find((k) => k.toUpperCase() === name) : (name in source ? name : undefined);
     if (key !== undefined && source[key] !== undefined) env[name] = source[key];
   }
-  return { ...env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: config, GIT_TERMINAL_PROMPT: '0' };
+  return { ...env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: config, GIT_CEILING_DIRECTORIES: ceilingFor(isoDir), GIT_TERMINAL_PROMPT: '0' };
 }
 
 // Leading `-c` options: no hooks, no fsmonitor, no credential helper, and https as the only transport. `allowFile`
@@ -108,7 +120,8 @@ export function isolatedGitArgs({ isoDir, allowFile = false } = {}) {
 
 // run('git', ...) with the isolation above. `isoDir` (from makeIsoDir) is required. `args` may start with `-C <dir>`;
 // `git init` should pass `--template=` (an empty template, so no hook or info/exclude is copied in).
-export function isolatedGit(args, { isoDir, cwd, timeoutMs = 60000, input, allowFile = false } = {}) {
+// A call with no `cwd` runs in the iso directory (never the caller's own directory, which may be inside a repository).
+export function isolatedGit(args, { isoDir, cwd = isoDir, timeoutMs = 60000, input, allowFile = false } = {}) {
   return run('git', [...isolatedGitArgs({ isoDir, allowFile }), ...args], { cwd, env: isolatedGitEnv({ isoDir }), replaceEnv: true, timeoutMs, input });
 }
 
