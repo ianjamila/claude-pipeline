@@ -300,8 +300,15 @@ const CURRENT_BRANCH_WORD = new RegExp(`(^|:)${CURRENT_BRANCH_IDIOM.source.slice
 // Every word of a push is read as written: an option or remote built at run time (`--${F:-mirror}`, `-${F:-f}`, `"$R"`) can be
 // any option, and a variable with a known value that holds blanks or glob characters splits into several words when it is
 // unquoted (`R="x HEAD:main"; git push origin $R`; zsh does not split, so both readings are denied).
+// Can the shell split on something other than blanks? IFS written anywhere in the text judged (assignment, `read`, `local`,
+// `unset`), set in the environment, or a sourced script that may have set variables.
+const ifsMayBeSet = (ctx) => /IFS/.test(ctx.fullText ?? '') || assignedNames(ctx).includes('IFS') || Object.hasOwn(ctx.env ?? {}, 'IFS') || ctx.tainted.size > 0;
+
 function unverifiableWord(raw, ctx) {
   const x = expandVars(raw, ctx);
+  // an unquoted empty value drops the word (`E=; git push origin $E` is a push with no refspec), shifting every later argument
+  if (x === '' && raw !== '') return `the word "${raw}" expands to nothing, which removes it from the push's arguments, so the push cannot be verified. Write the arguments out.`;
+  if (x !== raw && ifsMayBeSet(ctx)) return `the word "${raw}" holds a variable and IFS may be set here, so where the shell splits its value cannot be verified. Write the arguments out.`;
   const w = x.replace(CURRENT_BRANCH_WORD, '$1X');
   if (x !== raw && /[\s*?[]/.test(w)) return `the word "${raw}" expands to text with blanks or glob characters, which the shell may split into several arguments, so it cannot be verified. Write the arguments out.`;
   if (DYNAMIC.test(w)) return `the argument "${x}" is built at run time (an option, remote or refspec can hide in it), so it cannot be verified. Write the push out: git push -u origin agent/<slug>.`;

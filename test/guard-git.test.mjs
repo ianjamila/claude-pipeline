@@ -155,6 +155,17 @@ const DENY = [
   ['R=--mirror; git push origin $R'],
   ['R=-f; git push origin $R agent/x'],
   ['R=+HEAD:agent/x; git push origin $R'],
+  // word splitting follows IFS, not only blanks; an empty unquoted value drops the word
+  ['IFS=,; R="x,HEAD:main"; git push origin $R'],
+  ['IFS=,; R="agent/x,main"; git push origin $R'],
+  ['IFS=,; R="agent/x"; git push origin $R'],
+  ['export IFS=:; R=agent/x; git push origin $R'],
+  ['read IFS <<< ","; R="x,HEAD:main"; git push origin $R'],
+  ['IFS=; R=agent/x; git push origin $R'],
+  ['IFS=x git push origin agent/x; R=agent/x; IFS=a; git push origin $R'],
+  ['E=; git push origin $E'],
+  ['E=""; git push origin "$E"'],
+  ['E=; git push $E agent/x'],
   // a config key / push.default value built at run time can be remote.*.push or upstream
   ['git -c $K=HEAD:agent/x push'],
   ['K=remote.origin.push; git -c $K=HEAD:agent/x push'],
