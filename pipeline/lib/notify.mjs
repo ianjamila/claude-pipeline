@@ -11,6 +11,7 @@
 // - Everything is bounded (hard cap 15 s) and every effect (fetch, spawn, gh, git, clock, fs dirs) is injectable.
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn as nodeSpawn } from 'node:child_process';
@@ -461,11 +462,32 @@ function within(promise, ms, fallback) {
   return Promise.race([Promise.resolve(promise), t]).finally(() => clearTimeout(timer));
 }
 
-async function sendNtfy({ cfg, push, fetchFn, timeoutMs, signal }) {
+// Node's happy-eyeballs gives each resolved address only 250 ms (net.getDefaultAutoSelectFamilyAttemptTimeout()). Measured on
+// the owner's WSL2 PC (Node 24.21) that failed ~4 of 5 real publishes with ETIMEDOUT after ~282 ms; 2500 ms succeeded 5/5.
+// The pipeline CLI is a short-lived process, so raising the process-wide default is acceptable. It only ever raises, and is a
+// no-op on a Node without the API (engines >=20). get/set are injectable for the test.
+export const MIN_ATTEMPT_TIMEOUT_MS = 2500;
+export function raiseAutoSelectFamilyTimeout({ get = net.getDefaultAutoSelectFamilyAttemptTimeout, set = net.setDefaultAutoSelectFamilyAttemptTimeout, minMs = MIN_ATTEMPT_TIMEOUT_MS } = {}) {
+  if (typeof get !== 'function' || typeof set !== 'function') return false;
+  try {
+    const cur = get();
+    if (typeof cur === 'number' && cur >= minMs) return false;
+    set(minMs);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// One retry on a network-level failure (fetch rejected) when at least this much of the ntfy budget remains.
+const RETRY_MIN_REMAINING_MS = 1000;
+
+async function sendNtfy({ cfg, push, fetchFn, timeoutMs, signal, nowFn = () => Date.now() }) {
   const controller = new AbortController();
   const onCap = () => controller.abort();
   signal?.addEventListener('abort', onCap, { once: true });
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const startedAt = nowFn();
   const body = {
     topic: cfg.topic,
     title: push.title,
@@ -477,16 +499,25 @@ async function sendNtfy({ cfg, push, fetchFn, timeoutMs, signal }) {
   const headers = { 'Content-Type': 'application/json' };
   if (cfg.token) headers.Authorization = `Bearer ${cfg.token}`;
   try {
-    const res = await within(
-      fetchFn(cfg.server, { method: 'POST', headers, body: JSON.stringify(body), signal: controller.signal }),
-      timeoutMs,
-      'timeout',
-    );
-    if (res === 'timeout') return { status: 'failed', detail: 'timed out' };
-    if (!res?.ok) return { status: 'failed', detail: `HTTP ${res?.status ?? '?'}` };
-    return { status: 'sent' };
-  } catch (err) {
-    return { status: 'failed', detail: String(err?.message ?? err) };
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const remaining = Math.max(1, timeoutMs - (nowFn() - startedAt));
+        const res = await within(
+          fetchFn(cfg.server, { method: 'POST', headers, body: JSON.stringify(body), signal: controller.signal }),
+          remaining,
+          'timeout',
+        );
+        if (res === 'timeout') return { status: 'failed', detail: 'timed out' };
+        // Any HTTP response is final: a 4xx/5xx is never retried.
+        if (!res?.ok) return { status: 'failed', detail: `HTTP ${res?.status ?? '?'}` };
+        return { status: 'sent' };
+      } catch (err) {
+        const left = timeoutMs - (nowFn() - startedAt);
+        if (attempt >= 2 || controller.signal.aborted || left < RETRY_MIN_REMAINING_MS) {
+          return { status: 'failed', detail: String(err?.message ?? err) };
+        }
+      }
+    }
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener('abort', onCap);
@@ -632,6 +663,8 @@ async function runNotify(event, deps, { transports, errors, budget, signal, out,
   const env = deps.env ?? process.env;
   const now = deps.now ?? (() => Date.now());
   const cwd = deps.cwd ?? process.cwd();
+  // Only the real transport needs the slow-network tolerance; a test that injects fetch never touches the process default.
+  if (!deps.fetch) raiseAutoSelectFamilyTimeout();
   const fetchFn = deps.fetch ?? globalThis.fetch;
   const spawnFn = deps.spawn ?? nodeSpawn;
   const git = deps.git ?? defaultGit;
@@ -705,7 +738,7 @@ async function runNotify(event, deps, { transports, errors, budget, signal, out,
   const hasPs = wsl && (deps.hasPowershell ? deps.hasPowershell() : Boolean(findOnPath('powershell.exe', env)));
   const jobs = [
     (async () => {
-      const r = await sendNtfy({ cfg, push, fetchFn, timeoutMs: budget.ntfyMs, signal });
+      const r = await sendNtfy({ cfg, push, fetchFn, timeoutMs: budget.ntfyMs, signal, nowFn: now });
       transports.ntfy = r.status;
       if (r.detail) errors.ntfy = scrub(r.detail).slice(0, 200);
       await record('ntfy', r.status);

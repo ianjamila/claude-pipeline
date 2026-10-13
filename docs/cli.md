@@ -249,6 +249,8 @@ Configuration, in this order per field: the environment, then `~/.config/claude-
 
 Every push title starts with the machine it came from, `[Mac]` (macOS), `[PC]` (WSL or Windows) or `[<hostname>]` elsewhere, e.g. `[Mac] #33 Fix the thing` (the whole title is still cut at 80 characters, never the label); an optional `NTFY_MACHINE` (letters, digits, space, `_ . -`, at most 20; environment first, then the secrets file) overrides it, and an invalid value is ignored (default label, result `machineLabel: 'default (invalid NTFY_MACHINE)'`) rather than blocking the push. The label is not part of the identity.
 
+The real ntfy publish tolerates slow networks: it raises Node's per-address connect timeout (default 250 ms, which failed ~4 of 5 publishes on a WSL2 PC) to at least 2500 ms for the CLI process, and retries once on a network-level failure (never after an HTTP response, and only while the 5 s ntfy budget has at least 1 s left).
+
 One push per event: a ledger under `~/.claude/pipeline-state/` (`notify-ledger.jsonl`) makes a replay of the same event a no-op (`reason: duplicate`). Identity is repo, PR, event, head, outcome, open needs-human ids and `--cause`, never the action text. The whole call is capped at 15 s.
 
 Exit: `--test` 0 when ntfy accepted the push, 1 when it did not · `--event` 0 whether or not a push went out (read `sent` / `reason`) · 2 usage.

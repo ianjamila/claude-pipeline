@@ -8,7 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   OUTCOME_EVENTS, classifyOutcome, defaultAction, prodEvent, prodErrorEvent, parseSecrets, loadNotifyConfig, scrubber, buildTitle, machineLabel,
-  buildMessage, eventKey, parseRemote, notifyEvent, testEvent, detectWsl, TOAST_SCRIPT, TOAST_AUMID, encodeToastScript, LEDGER_NAME, DEFAULT_SECRETS_FILE,
+  buildMessage, eventKey, parseRemote, notifyEvent, testEvent, detectWsl, raiseAutoSelectFamilyTimeout, TOAST_SCRIPT, TOAST_AUMID, encodeToastScript, LEDGER_NAME, DEFAULT_SECRETS_FILE,
 } from '../pipeline/lib/notify.mjs';
 import { run as notifyCommand } from '../pipeline/commands/notify.mjs';
 import { UsageError } from '../pipeline/lib/cli.mjs';
@@ -633,6 +633,71 @@ test('a lock held by another process: still sends within the budget, and says th
     await exited(holder);
     assert.ok(holder.exitCode !== null || holder.signalCode !== null, 'the lock holder has exited');
   }
+});
+
+// ---- slow-network tolerance: one retry, raised happy-eyeballs timeout ------------------------------------------------------
+
+const netFail = () => new TypeError('fetch failed', { cause: { code: 'ETIMEDOUT' } });
+
+test('ntfy: a network-level failure is retried once inside the budget; the ledger records one outcome', async () => {
+  let n = 0;
+  const r = rig({ fetch: async () => { if (++n === 1) throw netFail(); return { ok: true, status: 200 }; } });
+  const res = await notifyEvent(STOP, r.deps);
+  assert.equal(res.sent, true);
+  assert.equal(res.transports.ntfy, 'sent');
+  assert.equal(r.fetchCalls.length, 2);
+  assert.equal(ledgerRecords(r.deps.stateDir).filter((x) => x.kind === 'ntfy').length, 1);
+});
+
+test('ntfy: two network failures in a row fail after exactly two attempts', async () => {
+  const r = rig({ fetch: async () => { throw netFail(); } });
+  const res = await notifyEvent(STOP, r.deps);
+  assert.equal(res.transports.ntfy, 'failed');
+  assert.equal(res.errors.ntfy, 'fetch failed');
+  assert.equal(r.fetchCalls.length, 2);
+});
+
+test('ntfy: an HTTP error response is final, never retried', async () => {
+  const r = rig({ fetch: async () => ({ ok: false, status: 500 }) });
+  const res = await notifyEvent(STOP, r.deps);
+  assert.equal(res.errors.ntfy, 'HTTP 500');
+  assert.equal(r.fetchCalls.length, 1);
+});
+
+test('ntfy: no retry when too little of the budget is left', async () => {
+  const r = rig({ fetch: async () => { throw netFail(); } });
+  const res = await notifyEvent(STOP, { ...r.deps, budget: { ntfyMs: 500 } });
+  assert.equal(res.transports.ntfy, 'failed');
+  assert.equal(r.fetchCalls.length, 1);
+});
+
+test('ntfy: a hung fetch is aborted at the budget and not attempted again', async () => {
+  const r = rig({ fetch: () => new Promise(() => {}) });
+  const res = await notifyEvent(STOP, { ...r.deps, budget: { ntfyMs: 1500 } });
+  assert.equal(res.errors.ntfy, 'timed out');
+  assert.equal(r.fetchCalls.length, 1);
+});
+
+test('ntfy: a failure that comes after the budget aborted the request is not retried', async () => {
+  const r = rig({ fetch: (url, init) => new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(new Error('aborted')))) });
+  const res = await notifyEvent(STOP, { ...r.deps, budget: { ntfyMs: 1500 } });
+  assert.equal(res.transports.ntfy, 'failed');
+  assert.equal(r.fetchCalls.length, 1);
+});
+
+test('raiseAutoSelectFamilyTimeout: raises a lower value, leaves a higher one alone, no-ops without the API', () => {
+  let cur = 250;
+  const set = (v) => { cur = v; };
+  assert.equal(raiseAutoSelectFamilyTimeout({ get: () => cur, set }), true);
+  assert.equal(cur, 2500);
+  cur = 4000;
+  assert.equal(raiseAutoSelectFamilyTimeout({ get: () => cur, set }), false);
+  assert.equal(cur, 4000);
+  cur = 2500;
+  assert.equal(raiseAutoSelectFamilyTimeout({ get: () => cur, set }), false);
+  assert.equal(raiseAutoSelectFamilyTimeout({ get: null, set }), false);
+  assert.equal(raiseAutoSelectFamilyTimeout({ get: () => cur, set: null }), false);
+  assert.equal(cur, 2500);
 });
 
 // ---- budget ---------------------------------------------------------------------------------------------------------------
