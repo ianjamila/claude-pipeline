@@ -717,7 +717,12 @@ const READERS = {
 };
 // Why: only option-less `cat` (and `cat -u`, `--`) prints its files byte for byte. `cat -n/-s/-A` number, squeeze or show characters, `bat` / `less` decorate
 // and page, `head -c` / `tail -c` cut: what reaches the shell is computed from the file, so it is scanned, never rebuilt as the file's own text.
-const exactCopy = (name, argv) => name === 'cat' && argv.slice(1).every((w) => w === '-u' || w === '--' || w === '-' || w[0] !== '-');
+// (the words after a `--` are file operands, even `-n`: the same reading as line-writes' isExactCat)
+const exactCopy = (name, argv) => {
+  if (name !== 'cat') return false;
+  const dd = argv.indexOf('--', 1);
+  return argv.slice(1, dd < 0 ? undefined : dd).every((w) => w === '-u' || w === '-' || w[0] !== '-');
+};
 const MAX_FEED_FILES = 64; // more files than this feed one command: refused, not judged
 
 // The file operands of a reader: words that are not options, minus the values of options that take one.
