@@ -1976,6 +1976,15 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
   return out;
 }
 
+// Why: an agent writes a file it wants through code it controls (`node -e`, `python -c`, a script an interpreter runs, npx / npm / make recipes) or names the file: on such a
+// line the real home's startup file is taken to be rewritable by any program the guard does not model, as for every other file (see sourcedTexts)
+const STEERABLE = /^(?:node|nodejs|deno|bun|bunx|tsx|ts-node|python\d*(?:\.\d+)*|pypy\d*|ruby|perl|php|lua|Rscript|osascript|npx|npm|pnpm|pnpx|yarn|make|gmake|just|task|go|cargo|java|dotnet|swift|xargs|parallel|env|sudo|doas|nohup|timeout|nice|time|command|builtin|exec|eval|source|\.)$/;
+function steersWrites(ctx, abs) {
+  const name = posix.basename(abs);
+  // (the command as written too: npx / env / sudo ... are unwrapped to what they run)
+  return ctx.frames.some((f) => (f.cmds ?? []).some((c) => STEERABLE.test(baseOf(c.argv[0] ?? '')) || STEERABLE.test(baseOf(((c.raw ?? '').trim().split(/\s+/).find((w) => !/^[A-Za-z_]\w*=/.test(w)) ?? '').replace(/^['"]|['"]$/g, ''))) || runsInlineCode(c, ctx) || (c.raw ?? '').includes(name) || /[$`]/.test(c.argv[0] ?? '')));
+}
+
 // The texts of the files a sourced or startup record names (a candidate word is resolved like a script word). unknown: a file that cannot be read, is not
 // one exact name, or is written by this line (so its text is only known at run time).
 function sourcedTexts(rec, dirs, ctx) {
@@ -1985,7 +1994,7 @@ function sourcedTexts(rec, dirs, ctx) {
     // Why: a file the line writes earlier (`echo D=/tmp > rc; . ./rc`) is what those writes put there, not what is on disk now; a write may also fail or be skipped, so the disk text stays a case too
     // (the real home's startup file named through ZDOTDIR / HOME, rec.home, is followed like any other, but a program the guard does not model is not taken to have
     // rewritten it, as for the implicit home file: `supabase --version; zsh -c ...` with ZDOTDIR in the hook's environment)
-    const w = writtenTo(ctx.frames, abs, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: rec.home === true });
+    const w = writtenTo(ctx.frames, abs, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: rec.home === true && !steersWrites(ctx, abs) });
     if (w) {
       if (w.unknown || w.pieces || w.authored || w.files.length || w.scans.length || w.programs.length) unknown = true;
       texts.push(...w.texts, ...w.joined);
@@ -2533,12 +2542,14 @@ function evaluateBashForFilesFrame(command, opts) {
       const e = t === undefined ? null : expandRefs(t, ctx);
       if (e === null || /[`$*?[{(\\]/.test(e) || !isAbs(e)) return false;
       const abs = posix.normalize(e);
-      return !ctx.hitTree(abs) && Array.isArray(ctx.readDir(abs));
+      return !ctx.hitTree(abs) && !ctx.hitTree(realResolve(abs, ctx.api)) && Array.isArray(ctx.readDir(abs)); // (a symlink into the tree is the tree)
     };
     const j = cmds.findIndex((c) => CD_CMDS.has(baseOf(c.argv[0] ?? '')));
     if (j < 0 || !outside(cmds[j])) return -1;
     // (it surely runs, in this shell: not after && / ||, not in a pipeline or a background job; and nothing after it runs only when something failed: `cd X || cmd`)
     if (!['', ';'].includes(cmds[j].sep ?? '') || ['|', '&'].includes(cmds[j + 1]?.sep) || cmds.some((c, k) => k > j && c.sep === '||')) return -1;
+    // (nothing before it may change the file system: what the target is when judged is what it is when the cd runs -- no `rm -rf X; ln -s ~/.claude/hooks X; cd X`)
+    if (cmds.some((c, k) => k < j && !((c.argv.length === 0 || NOT_WRITERS.has(baseOf(c.argv[0])) || onlyReads(c, ctx)) && !(c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && !FD_DUP.test(r.target ?? '') && r.target !== '/dev/null')))) return -1;
     return cmds.every((c, k) => k <= j || !CD_CMDS.has(baseOf(c.argv[0] ?? '')) || outside(c)) ? j : -1;
   })();
   const atStart = (c, i) => leaveAt < 0 || i < leaveAt || !c.ctl; // (a function body or trap action written after the cd also runs after it)
