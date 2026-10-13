@@ -52,6 +52,19 @@ test('classifyEntries: caches deleted, evidence archived, anything else blocks',
   assert.deepEqual(r.blockers.sort(), ['.env.local', '.superpowers/plan.md', 'HANDOFF-x.md', 'notes.txt', 'src/a.ts', 'src/new.ts'].sort());
 });
 
+test('classifyEntries: a nested .env* blocks even under a delete or archive pattern', () => {
+  const cfg = { delete: ['node_modules/', '.vercel/'], archive: ['.review/'] };
+  const r = classifyEntries([
+    { path: 'node_modules/.env.x', kind: 'ignored' },
+    { path: '.vercel/.env.local', kind: 'ignored' },
+    { path: '.review/.env', kind: 'ignored' },
+    { path: 'node_modules/dotenv/index.js', kind: 'ignored' },
+  ], cfg);
+  assert.deepEqual(r.blockers.sort(), ['.review/.env', '.vercel/.env.local', 'node_modules/.env.x']);
+  assert.deepEqual(r.del, ['node_modules/dotenv/index.js']);
+  assert.deepEqual(r.arch, []);
+});
+
 const H = 3600e3;
 const now = Date.parse('2026-10-13T00:00:00Z');
 const pr = (o) => ({ number: 1, state: 'MERGED', createdAt: '2026-10-01T00:00:00Z', mergedAt: new Date(now - 30 * H).toISOString(), headRefOid: 'a'.repeat(40), isCrossRepository: false, ...o });

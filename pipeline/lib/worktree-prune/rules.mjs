@@ -28,7 +28,7 @@ export function matchesPattern(rel, pattern) {
   return rel === pattern;
 }
 
-export const ALWAYS_BLOCK = Object.freeze([/^\.env/, /(^|\/)HANDOFF[^/]*\.md$/i, /\.patch$/]);
+export const ALWAYS_BLOCK = Object.freeze([/(^|\/)\.env/, /(^|\/)HANDOFF[^/]*\.md$/i, /\.patch$/]);
 
 // entries: [{ path (posix, relative), kind, isSymlink }]. A `.superpowers` symlink is allowed (removal unlinks it only);
 // anything under a real `.superpowers/` directory blocks.
