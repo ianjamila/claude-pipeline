@@ -245,28 +245,6 @@ test('S6b files: the real home\'s .zshenv named through ZDOTDIR is not taken to 
   assert.equal(F('mytool --version; zsh -ic \'echo hi > "$OUT"\'', { '/home/u/zd/.zshenv': 'export EDITOR=vi' }, { env: { HOME: '/home/u', ZDOTDIR: '/home/u/zd' } }), 'deny');
 });
 
-test('S6b files: a line run from inside ~/.claude that first cds to an existing directory outside it is judged there; each way it may still run inside keeps the refusal', () => {
-  const o = { cwd: '/home/u/.claude/hooks' };
-  const spec = { '/home/u/.claude/hooks/x.sh': 'echo hi' };
-  assert.equal(F('cd /home/u/proj && cp "$A" b.txt', spec, o), 'allow');
-  assert.equal(F('cd ~/proj; cp "$A" b.txt', spec, o), 'allow');
-  for (const c of [
-    'cp "$A" b.txt', // no cd
-    'cp "$A" b.txt; cd /home/u/proj', // before it
-    'cd /home/u/proj || cp "$A" b.txt', // runs only when the cd failed
-    'cd /home/u/proj && true || cp "$A" b.txt',
-    'true && cd /home/u/proj; cp "$A" b.txt', // the cd may not run
-    'cd /home/u/proj | true; cp "$A" b.txt', // in a pipeline: a subshell
-    '(cd /home/u/proj); cp "$A" b.txt', // in a subshell
-    'cd /home/u/gone && cp "$A" b.txt', // no such directory: the cd fails
-    'cd /home/u/proj; cd /home/u/.claude/hooks; cp "$A" b.txt', // back inside
-    'cd /home/u/proj; popd; cp "$A" b.txt',
-    'cd "$D"; cp "$A" b.txt', // a run-time target
-    'f() { cp "$A" b.txt; }; cd /home/u/proj; f', // a function body may run at any time
-    'HOME=/tmp; cd ~/proj; cp "$A" b.txt', // ~ is not the real home here
-  ]) assert.equal(F(c, spec, o), 'deny', c);
-});
-
 test('S6b files: a file a script sources may source another by a literal name: its effects are followed; a run-time name, a relative one, arguments, a cycle or a binder in it are not', () => {
   const base = (envSh, fix = 'export Y=2') => ({ 's.sh': 'source /home/u/proj/env.sh\necho hi > "$1"\n', 'env.sh': envSh, 'fix.sh': fix });
   assert.equal(F('bash s.sh out.txt', base('set -a\n. /home/u/proj/fix.sh\nexport X=1\n')), 'allow');
@@ -285,20 +263,6 @@ test('S6b files: a file a script sources may source another by a literal name: i
     ['. /home/u/proj/missing.sh\n', 'export Y=2'],
     ['. /home/u/proj/fix.sh\nexport X=1\n', 'export Y=2\nset -- /home/u/.claude/settings.json'],
   ]) assert.equal(F('bash s.sh out.txt', base(envSh, fix)), 'deny', JSON.stringify(envSh + ' | ' + fix));
-});
-
-test('S6b files (review): the first cd out of ~/.claude counts only when nothing before it can change what it reaches, and a symlink into the tree is the tree', () => {
-  const o = { cwd: '/home/u/.claude/hooks' };
-  const spec = { '/home/u/.claude/hooks/x.sh': 'echo hi', '/home/u/link/x': 'x' };
-  for (const c of [
-    'rm -rf /home/u/proj; cd /home/u/proj; cp "$A" b.txt', // the target is gone when the cd runs: the cp runs in the tree
-    'mv /home/u/proj /home/u/p2 && ln -s /home/u/.claude/hooks /home/u/proj; cd /home/u/proj && cp "$A" b.txt',
-    'node -e "1"; cd /home/u/proj && cp "$A" b.txt', // code that may do the same
-    'echo x > /home/u/proj/f; cd /home/u/proj && cp "$A" b.txt', // (a write: kept strict)
-  ]) assert.equal(F(c, spec, o), 'deny', c);
-  assert.equal(F('export X=1; echo hi; cd /home/u/proj && cp "$A" b.txt', spec, o), 'allow', '(reads and assignments before it change nothing)');
-  const link = { ...o, realpath: (p) => (p === '/home/u/link' || p.startsWith('/home/u/link/') ? p.replace('/home/u/link', '/home/u/.claude/hooks') : p) };
-  assert.equal(F('cd /home/u/link && cp "$A" b.txt', spec, link), 'deny');
 });
 
 test('S6b files (review): on a line that runs code an agent steers, or names the file, the home .zshenv may have been rewritten by any program, as before', () => {

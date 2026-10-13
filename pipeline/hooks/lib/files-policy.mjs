@@ -2530,31 +2530,8 @@ function evaluateBashForFilesFrame(command, opts) {
   const mentioning = cmds.filter(mentions);
   // Why: below ~/.claude (projects/, skills/other) nothing is protected by name, yet a destination built at run time (`cp x "$V"`, `tee $(echo ../settings.json)`) can climb back to a protected file:
   // refused for every command that is not read-only (FP: a command with a run-time word, run from inside ~/.claude/**)
-  // Why: a line that starts in the tree but first cds out to an existing directory outside it (`cd ~/Claude/x && node -e ...` from ~/.claude/hooks) runs what comes after
-  // that cd outside: when the start is the only directory in the tree, only the commands written before that cd count (a function body or trap action written before it
-  // counts wherever it runs). The cd: on the line itself (no subshell, loop, branch, function), a literal target (~ the real home: not when the line sets HOME), and no later cd / pushd /
-  // popd that could lead back (a later known cd outside the tree is fine: it is among the directories above).
-  const leaveAt = (() => {
-    if (!dirs.every((d) => d === ctx.cwd || !ctx.hitTree(d)) || cmds.some((c) => Object.hasOwn(c.env ?? {}, 'HOME') || c.argv.some((a) => /^HOME(?:=|\[)/.test(a)))) return -1;
-    const outside = (c) => {
-      if (!c.ctl || !c.grp || c.grp.length || c.depth !== 0 || Object.values(c.ctl).some(Boolean) || cdUnknownShape(c.argv)) return false;
-      const t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
-      const e = t === undefined ? null : expandRefs(t, ctx);
-      if (e === null || /[`$*?[{(\\]/.test(e) || !isAbs(e)) return false;
-      const abs = posix.normalize(e);
-      return !ctx.hitTree(abs) && !ctx.hitTree(realResolve(abs, ctx.api)) && Array.isArray(ctx.readDir(abs)); // (a symlink into the tree is the tree)
-    };
-    const j = cmds.findIndex((c) => CD_CMDS.has(baseOf(c.argv[0] ?? '')));
-    if (j < 0 || !outside(cmds[j])) return -1;
-    // (it surely runs, in this shell: not after && / ||, not in a pipeline or a background job; and nothing after it runs only when something failed: `cd X || cmd`)
-    if (!['', ';'].includes(cmds[j].sep ?? '') || ['|', '&'].includes(cmds[j + 1]?.sep) || cmds.some((c, k) => k > j && c.sep === '||')) return -1;
-    // (nothing before it may change the file system: what the target is when judged is what it is when the cd runs -- no `rm -rf X; ln -s ~/.claude/hooks X; cd X`)
-    if (cmds.some((c, k) => k < j && !((c.argv.length === 0 || NOT_WRITERS.has(baseOf(c.argv[0])) || onlyReads(c, ctx)) && !(c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && !FD_DUP.test(r.target ?? '') && r.target !== '/dev/null')))) return -1;
-    return cmds.every((c, k) => k <= j || !CD_CMDS.has(baseOf(c.argv[0] ?? '')) || outside(c)) ? j : -1;
-  })();
-  const atStart = (c, i) => leaveAt < 0 || i < leaveAt || !c.ctl; // (a function body or trap action written after the cd also runs after it)
   if (!insideRoot && opts._writesOnly !== true && dirs.some((d) => ctx.hitTree(d))) {
-    const w = cmds.find((c, i) => c.argv.length && atStart(c, i) && !NOT_WRITERS.has(baseOf(c.argv[0])) && !isReadOnly(c, ctx) && c.argv.slice(1).some((a) => /[`$]/.test(expandRefs(a, ctx))));
+    const w = cmds.find((c) => c.argv.length && !NOT_WRITERS.has(baseOf(c.argv[0])) && !isReadOnly(c, ctx) && c.argv.slice(1).some((a) => /[`$]/.test(expandRefs(a, ctx))));
     if (w) return deny(`${baseOf(w.argv[0])} is given a name only known at run time inside the protected pipeline tree, so the file it reaches cannot be checked; write the path out (${PROTECTED_MSG})`);
   }
   // A reference no single command names lives in a heredoc body or in program text the shell parser cut into
