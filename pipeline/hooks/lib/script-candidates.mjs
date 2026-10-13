@@ -32,6 +32,55 @@ export function execLineOf(sf, expand) {
   return e !== sf.words[0] && /\s/.test(e.trim()) && !/\$\(|`/.test(e) ? e : null; // (a value holding a command substitution is unknown: candidates cover it)
 }
 
+// Why: `${X:-w}`, `${X-w}`, `${X:=w}`, `${X:+w}` read as the value of X, the word w or nothing, depending on a state the guard does not see: every reading is judged (the value as `${X}`,
+// which a policy expands from the variables of the line). `over`: more readings than MAX_READINGS (the caller refuses).
+const MAX_READINGS = 32;
+const PARAM_OPEN = /\$\{([A-Za-z_]\w*)(:?)([-=+?])/;
+export function paramReadings(word) {
+  let list = [word];
+  let over = false;
+  for (let round = 0; round < 16; round++) {
+    const next = new Set();
+    let changed = false;
+    for (const s of list) {
+      const m = PARAM_OPEN.exec(s);
+      if (!m) { next.add(s); continue; }
+      let depth = 1;
+      let j = m.index + m[0].length;
+      for (; j < s.length && depth; j++) { if (s[j] === '{') depth++; else if (s[j] === '}') depth--; }
+      if (depth) { next.add(s); continue; } // no closing brace: left as written
+      const body = s.slice(m.index + m[0].length, j - 1);
+      const pre = s.slice(0, m.index);
+      const post = s.slice(j);
+      const alts = m[3] === '+' ? [body, ''] : m[3] === '?' ? [`\${${m[1]}}`] : [`\${${m[1]}}`, body, ''];
+      for (const x of alts) next.add(pre + x + post);
+      changed = true;
+    }
+    list = [...next];
+    if (list.length > MAX_READINGS) { over = true; list = list.slice(0, MAX_READINGS); break; }
+    if (!changed) break;
+    if (round === 15) over = true;
+  }
+  return Object.defineProperty(list, 'over', { value: over, enumerable: false });
+}
+
+// The command lines a program named by a variable or a default word may run, with its arguments (`G=bash; $G ev.sh`, `"${X:-bash}" ev.sh`): the policies judge each as text one level
+// deeper. A single-word reading holding a `/` is a path: the candidate list judges the file as a script.
+const quoteWord = (w) => (/^[\w@%+=:,./-]+$/.test(w) ? w : `"${w.replace(/[\\"`]/g, '\\$&')}"`);
+export function execLinesOf(sf, expand) {
+  if (sf.kind !== 'exec' || sf.words?.length !== 1 || !sf.words[0].includes('$')) return [];
+  const w0 = sf.words[0];
+  const out = [];
+  for (const r of paramReadings(w0)) {
+    const e = expand(r).trim();
+    if (e === '' || e === w0 || /\$\(|`/.test(e)) continue;
+    const multi = /\s/.test(e);
+    if (!multi && (e.includes('/') || e.startsWith('$'))) continue; // a path (candidates), or still unknown
+    out.push([e, ...(sf.args ?? []).map(quoteWord)].join(' '));
+  }
+  return [...new Set(out)];
+}
+
 // Thrown when a limit above is hit; each policy's entry point turns it into a denial carrying the message.
 export class GuardLimit extends Error {}
 
@@ -213,7 +262,13 @@ function buildCandidates(sf, { expand, dirs, joinPath, readDir, ifs }) {
   const ifsUnknown = typeof ifs === 'string' && /[$`]/.test(ifs);
   const splitter = new RegExp(`[\\s${typeof ifs === 'string' && !ifsUnknown ? ifs.replace(/[\]\\^-]/g, '\\$&') : ''}]+`);
   const add = (c) => { if (!sf.needExt || SCRIPT_EXT.test(c)) files.add(c); };
-  for (const w of sf.words) {
+  const words = [];
+  for (const w0 of sf.words ?? []) {
+    const rs = paramReadings(w0);
+    if (rs.over) return { files: [], dynamic, over: true };
+    words.push(...rs);
+  }
+  for (const w of words) {
     // zsh EQUALS: `=tool` is the file `tool` resolves to in a PATH directory (sf.pathValues: the values PATH may have; none given: unknown).
     // An empty PATH entry is the cwd; a directory known only at run time makes the script unknown.
     if (isEqualsWord(w)) {

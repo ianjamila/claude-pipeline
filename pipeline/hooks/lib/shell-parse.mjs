@@ -579,6 +579,8 @@ const PATTERN_SYNTAX = /[*?+@!\]]\(|\(#|[^\s<>&|;(]<\d*-\d*>/;
 // quoted `'^(A|B)='` is a regex argument, not a glob; maskQuoted stops masking inside a double-quoted `$(`, so single-quoted runs are masked again)
 const ZSH_ALTERNATION = /(?<![$<>=(])\([^\s]*\|[^\s]*\)/;
 
+// (the arguments of a program named by a variable, for the policies that judge the command line it expands to; not part of the record's shape)
+const withArgs = (sf, argv) => Object.defineProperty(sf, 'args', { value: argv.slice(1), enumerable: false });
 function scriptFileOfArgv(argv) {
   if (!argv.length) return null;
   const name = base(argv[0]);
@@ -613,11 +615,11 @@ function scriptFileOfArgv(argv) {
   // (a backslash is an ordinary file name character off Windows, so a path holding one is judged like any other)
   if (/[/]/.test(argv[0]) && !SYSTEM_BIN.test(argv[0])) {
     // `./ev*.sh` / `$D/x.sh`: the shell runs whatever the word expands to, so it is a candidate list of one word
-    return hasExpansion(argv[0]) ? { kind: 'exec', file: argv[0], ambiguous: true, words: [argv[0]] } : { kind: 'exec', file: argv[0] };
+    return hasExpansion(argv[0]) ? withArgs({ kind: 'exec', file: argv[0], ambiguous: true, words: [argv[0]] }, argv) : { kind: 'exec', file: argv[0] };
   }
   // `=tool`: zsh runs the file `tool` resolves to on PATH (the candidates are its PATH directories, see script-candidates.mjs)
   // `X=./evil.sh; $X`: a program named by a variable has no `/` to show it is a path
-  if (/[$`]/.test(argv[0]) || EQUALS_WORD.test(argv[0])) return { kind: 'exec', file: argv[0], ambiguous: true, words: [argv[0]] };
+  if (/[$`]/.test(argv[0]) || EQUALS_WORD.test(argv[0])) return withArgs({ kind: 'exec', file: argv[0], ambiguous: true, words: [argv[0]] }, argv);
   return null;
 }
 const INTERPRETER_NO_EXT = new Set(['python', 'ruby', 'perl', 'php']);
