@@ -163,6 +163,8 @@ function notifyRig() {
     stateDir: join(dir, 'state'),
     git: (args) => (args[0] === 'remote' ? 'git@github.com:acme/widgets.git' : ''),
     isWsl: () => false,
+    platform: 'linux',
+    hostname: () => 'testbox',
     lookup: async () => { throw new Error('summary must not look the PR up again when it has the title'); },
     fetch: async (url, init) => {
       fetchCalls.push({ url, body: JSON.parse(init.body) });
@@ -232,7 +234,7 @@ test('summary push: each outcome that needs the owner sends exactly one push wit
     assert.equal(t.res.exitCode, 0, c.outcome);
     assert.equal(t.rig.fetchCalls.length, 1, `${c.outcome}: one push`);
     const body = t.rig.fetchCalls[0].body;
-    assert.equal(body.title, '#12 Add widget', c.outcome);
+    assert.equal(body.title, '[testbox] #12 Add widget', c.outcome);
     assert.match(body.message, c.text, c.outcome);
     assert.equal(body.priority, 4);
     assert.equal(body.click, 'https://github.com/acme/widgets/pull/12', 'the click target is the PR, not the comment');
@@ -324,7 +326,7 @@ test('summary push: the title lookup failing still sends the push (no title), an
   const t = await summaryIn(pushRepo(), ['--outcome', 'awaiting-owner-merge'], { fake, rig });
   assert.ok(t.error instanceof UnavailableError, 'the unavailable-GitHub error (exit 3) is unchanged');
   assert.equal(rig.fetchCalls.length, 1);
-  assert.equal(rig.fetchCalls[0].body.title, '#12');
+  assert.equal(rig.fetchCalls[0].body.title, '[testbox] #12');
   assert.match(rig.fetchCalls[0].body.message, /^Ready to merge: /);
   assert.equal(rig.fetchCalls[0].body.click, 'https://github.com/acme/widgets/pull/12', 'offline click target comes from the git remote');
 });
@@ -341,7 +343,7 @@ test('summary push: the comment upsert failing (exit 3) still sends exactly one 
   const t = await summaryIn(repo, ['--outcome', 'needs-human'], { fake, rig });
   assert.ok(t.error instanceof UnavailableError);
   assert.equal(rig.fetchCalls.length, 1);
-  assert.equal(rig.fetchCalls[0].body.title, '#12 Add widget');
+  assert.equal(rig.fetchCalls[0].body.title, '[testbox] #12 Add widget');
   // the retry after GitHub recovers is the same terminal state: no second push
   const again = await summaryIn(repo, ['--outcome', 'needs-human'], { rig });
   assert.equal(again.res.output.notify.reason, 'duplicate');
