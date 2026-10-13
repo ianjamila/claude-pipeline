@@ -851,7 +851,7 @@ function modelledCd(t, cmds, idx, ctx) {
   const sub = (x) => x ?? '';
   const earlierMove = cmds.slice(0, idx).some((c) => c.depth === 0 && c.argv.length && (CD_CMDS.has(baseOf(c.argv[0])) || ['source', '.'].includes(baseOf(c.argv[0]))));
   const touched = (names) => ctx.unknownAll || names.some((n) => Object.hasOwn(ctx.vars, n) || ctx.unknownVars.has(n) || ctx.pickUnknown.has(n) || ctx.srcChanged.has(n)
-    || cmds.some((c) => Object.hasOwn(c.env ?? {}, n) || c.argv.some((a) => a === n || a.startsWith(`${n}=`) || a.startsWith(`${n}+=`))));
+    || cmds.some((c) => Object.hasOwn(c.env ?? {}, n) || c.argv.some((a) => a === n || a.startsWith(`${n}=`) || a.startsWith(`${n}+=`) || a.startsWith(`${n}[`))));
   for (const [ri, re] of SELF_RES.entries()) {
     const m = re.exec(t);
     if (!m) continue;
@@ -863,7 +863,7 @@ function modelledCd(t, cmds, idx, ctx) {
     // (something earlier in the script may have changed $0: BASH_ARGV0 / `0=` assigned, or code run by source / . / eval)
     if (touched(['BASH_ARGV0']) || cmds.some((c) => Object.hasOwn(c.env ?? {}, '0') || c.argv.some((a) => /^0\+?=/.test(a))) || cmds.slice(0, idx).some((c) => ['source', '.', 'eval'].includes(baseOf(c.argv[0] ?? '')))) return null;
     // (a relative $0 gives a relative dirname (`scripts/run` -> `scripts`), which `cd` looks up along CDPATH first: the line's, the environment's, one a source may have set)
-    if (!ctx.selfAbs && ((ctx.env?.CDPATH ?? '') !== '' || touched(['CDPATH']))) return null;
+    if (!ctx.selfAbs && ((ctx.env?.CDPATH ?? '') !== '' || touched(CDPATH_NAMES))) return null;
     return posix.normalize(posix.join(posix.dirname(self), sub(m[m.length - 1])));
   }
   let m = /^\$\(\s*git\s+rev-parse\s+--show-toplevel\s*\)(\/[\w./-]*)?$/.exec(t);
@@ -1024,6 +1024,8 @@ const SHELL_NAMES = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'csh', 
 // For these only the destination (last word, or -t DIR) can change a protected file; reading one into /tmp is fine.
 const DEST_ONLY = new Set(['cp', 'rsync', 'install']);
 const MOVERS = new Set(['mv', 'ln', 'ditto']); // any named protected path counts, and so does DEST/basename(SRC)
+// (zsh's lowercase `cdpath` array is tied to CDPATH: setting either sets both)
+const CDPATH_NAMES = ['CDPATH', 'cdpath'];
 const NOT_WRITERS = new Set(['cd', 'pushd', 'popd', 'export', 'declare', 'typeset', 'local', 'readonly', 'unset', 'set', 'shift', 'read', 'wait', 'true', 'false', ':', 'exit', 'return', 'test', '[', '[[', 'source', '.']);
 const WRITE_OPS = new Set(['>', '>>', '>|', '>&', '&>', '&>>', '<>']);
 const FD_DUP = /^&(?:\d+|-)$/; // (the only redirect targets that are descriptors)
@@ -1845,7 +1847,7 @@ function sourcedEffects(text, ctx) {
       // line's, the hook's environment's, one this file set earlier or may have changed -- a relative name is searched along it)
       const t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
       const v = t === undefined ? t : substVars(t, local, ctx.budget);
-      const cdpath = (ctx.env?.CDPATH ?? '') !== '' || (ctx.vars.CDPATH ?? '') !== '' || out.vars.has('CDPATH') || ctx.pickUnknown.has('CDPATH') || ctx.srcChanged.has('CDPATH') || (c.env?.CDPATH ?? '') !== '';
+      const cdpath = (ctx.env?.CDPATH ?? '') !== '' || CDPATH_NAMES.some((n) => (ctx.vars[n] ?? '') !== '' || out.vars.has(n) || ctx.pickUnknown.has(n) || ctx.srcChanged.has(n) || (c.env?.[n] ?? '') !== '' || cmds.some((x) => x.argv.some((a) => a.startsWith(`${n}[`))));
       if (cdUnknownShape(c.argv) || (v !== undefined && /[`$*?[{]/.test(v)) || (cdpath && v !== undefined && !isAbs(toPosix(v)) && !/^(?:\.\.?(?:[\\/]|$)|~)/.test(v))) out.unknownCd = true;
       else out.cds.push(t ?? '~');
       set('PWD', null, false); set('OLDPWD', null, false); // (cd rebinds both)
@@ -2104,7 +2106,7 @@ function evaluateBashForFilesFrame(command, opts) {
     // Why: HOME is never believed from the line (the guard reads `~` as the real home), so a line that sets it, or a source that may, leaves `cd` / `cd ~` / `cd ~/x` without a known target
     const homeMoved = ctx.unknownAll || ctx.homeSourced === true || moved('HOME') || cmds.some((c) => Object.hasOwn(c.env ?? {}, 'HOME') || c.argv.some((a) => /^HOME(?:=|\[|$)/.test(a)));
     // Why: with CDPATH set a relative `cd sub` goes to the first CDPATH entry that has `sub` (the line's, the environment's, one a source may have set)
-    const cdpathSet = (startupEnv.CDPATH ?? '') !== '' || (Object.hasOwn(ctx.vars, 'CDPATH') && ctx.vars.CDPATH !== '') || moved('CDPATH') || cmds.some((c) => (c.env?.CDPATH ?? '') !== '');
+    const cdpathSet = (startupEnv.CDPATH ?? '') !== '' || CDPATH_NAMES.some((n) => (Object.hasOwn(ctx.vars, n) && ctx.vars[n] !== '') || moved(n) || cmds.some((c) => (c.env?.[n] ?? '') !== '' || c.argv.some((a) => a.startsWith(`${n}[`))));
     return cmds.some((c, ci) => {
       const cn = baseOf(c.argv[0] ?? '');
       if (!CD_CMDS.has(cn)) return false;

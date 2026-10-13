@@ -192,12 +192,21 @@ function joinDir(dir, target, ctx) {
   return lexical;
 }
 
-function nextDir(dir, name, argv, ctx) {
+// Why: with CDPATH set (zsh's lowercase `cdpath` array is the same list) a relative `cd sub` goes to the first entry that holds `sub`, not to <cwd>/sub; the hook's environment, an assignment
+// anywhere on the line (also `NAME[1]=`, `export CDPATH`, `typeset -T CDPATH cdpath`) or a name that is not sure counts. A name that starts with / ./ ../ or ~ is not searched.
+function cdpathMaybe(cmds, ctx) {
+  const is = (n) => n === 'CDPATH' || n === 'cdpath';
+  return (ctx.env?.CDPATH ?? '') !== '' || Object.keys(ctx.vars).some((n) => is(n) && ctx.vars[n] !== '') || [...ctx.unsureVars, ...ctx.tainted].some(is)
+    || cmds.some((c) => Object.keys(c.env ?? {}).some((n) => is(n) && c.env[n] !== '') || c.argv.some((a) => /^(?:CDPATH|cdpath)(?:\+?=|\[)/.test(a) || (is(a) && c.argv.length > 1 && VAR_BUILTINS.includes(baseName(c.argv[0])))));
+}
+
+function nextDir(dir, name, argv, ctx, cdpath = false) {
   if (name === 'popd') return null;
   const args = argv.slice(1);
   const k = args.indexOf('--');
   const operands = k >= 0 ? args.slice(k + 1) : args.filter((a) => !(a.length > 1 && a[0] === '-'));
   if (operands.length === 0) return name === 'cd' ? ctx.home : null;
+  if (cdpath && !path.isAbsolute(operands[0]) && !/^(?:\.\.?(?:\/|$)|~)/.test(operands[0])) return null;
   return joinDir(dir, operands[0], ctx);
 }
 
@@ -1497,6 +1506,7 @@ function evalString(str, startDir, ctx, level) {
     if (unsure !== null) return deny(`$${unsure} is assigned more than once (or where it may not run) on this line, so its value at run time cannot be verified. Assign it once, unconditionally.`);
   }
   let dir = startDir;
+  const cdp = cdpathMaybe(cmds, ctx);
   const from = flowStart(cmds);
   let uncertain = false; // an earlier cd / branch change may not have taken effect for the commands that follow
   const forgetState = () => { dir = null; for (const e of ctx.branches.values()) e.name = null; };
@@ -1555,7 +1565,7 @@ function evalString(str, startDir, ctx, level) {
         // (a value that still holds a `$` is not worked out: the case change would apply to what it expands to)
         if (d.transform && DYNAMIC.test(v)) { delete ctx.vars[k]; ctx.unsureVars.add(k); } else setVar(ctx, k, applyTransform(v, d.transform), level);
       }
-    } else if (name === 'cd' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name, argv, ctx);
+    } else if (name === 'cd' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name, argv, ctx, cdp);
     else if (name === 'git' || name === 'gh') {
       const unsure = unsureVarUsed([...argv.slice(1), ...Object.values(c.env)], ctx);
       if (unsure !== null) verdict = deny(`$${unsure} was assigned more than once on this line, so its value (and what this ${name} command does with it) cannot be verified. Assign it once, or write the value out.`);

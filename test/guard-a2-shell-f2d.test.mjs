@@ -170,3 +170,30 @@ test('F2d 40: a run-time write target is refused anywhere under the protected di
   ]);
   assert.equal(inTree('echo x > notes.txt').decision, 'allow');
 });
+
+// Why (item 99): zsh's lowercase `cdpath` array is tied to CDPATH, so every CDPATH check also sees it.
+test('F2d 99: cdpath (zsh) is CDPATH for the directory of a relative cd and of a relative $0', () => {
+  const W = 'echo x > settings.json';
+  const S = { 'b.sh': 'cdpath=(/x)\ncd sub', 'c.sh': 'cd ./sub', 'scripts/run': 'cd "$(dirname "$0")"\n' + W + '\n' };
+  const fs = fakeFs(PROJ, { ...BASE, ...S }, ['/home/u/.cla' + 'ude/scripts']);
+  const run = (c, env = {}) => evaluateBashForFiles(c, { home: '/home/u', env, platform: 'linux', realpath: (p) => p, cwd: PROJ, ...fs, existsSync: fs.pathExists });
+  for (const c of [
+    `cdpath=(/x); cd sub && ${W}`, `cdpath+=(/x); cd sub && ${W}`, `cdpath=(/x) cd sub && ${W}`, `cdpath[1]=/x; cd sub && ${W}`, `cdpath=(/x); pushd sub && ${W}`, `typeset -T CDPATH cdpath; cdpath=(/x); cd sub && ${W}`,
+    `cdpath=(/x); export CDPATH; cd sub && ${W}`, `export cdpath=(/x); cd sub && ${W}`, `typeset -T CDPATH cdpath=(/x); cd sub && ${W}`, `typeset -T CDPATH=/x cdpath; cd sub && ${W}`, `declare -x cdpath=(/x); cd sub && ${W}`, `. ./b.sh; ${W}`, `cdpath=(/x); bash scripts/run`, `cdpath+=(/x); bash scripts/run`,
+  ]) assert.equal(run(c).decision, 'deny', c);
+  for (const c of [`cdpath=(/x); cd ./sub && ${W}`, `cdpath=(/x); cd /tmp/sub && ${W}`, `cd sub && ${W}`, `cdpath=(); cd ./sub && ${W}`, '. ./c.sh; ' + W, 'bash scripts/run', `cdpath=(/x); bash /home/u/proj/scripts/run`]) assert.equal(run(c).decision, 'allow', c);
+});
+
+// Why (item 99): git-policy never looked at CDPATH, so `cd sub` was taken as <cwd>/sub while the shell goes to the first CDPATH entry holding `sub`.
+test('F2d 99: git-policy takes a relative cd as unknown while CDPATH / cdpath may be set', () => {
+  const run = (c, env = {}) => evaluateGitCommand(c, { cwd: GIT_ROOT, home: '/home/u', env, currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], ...fakeFs(GIT_ROOT, { ...BASE, 'b.sh': 'cdpath=(/x)\ncd sub\n' }, ['/home/u', '/work/repo/sub']) });
+  const P = 'git push origin HEAD';
+  for (const c of [
+    `CDPATH=/o cd sub && ${P}`, `CDPATH=/o; cd sub && ${P}`, `export CDPATH=/o; cd sub && ${P}`, `cdpath=(/o); cd sub && ${P}`, `cdpath+=(/o); cd sub && ${P}`, `cdpath[1]=/o; cd sub && ${P}`, `cdpath=(/o) cd sub && ${P}`,
+    `typeset -T CDPATH cdpath; cd sub && ${P}`, `cdpath=(/o); pushd sub && ${P}`, `cdpath=(/o); export CDPATH; cd sub && ${P}`, `CDPATH=$X; cd sub && ${P}`,
+  ]) assert.equal(run(c).decision, 'deny', c);
+  assert.equal(run(`cd sub && ${P}`, { CDPATH: '/o' }).decision, 'deny');
+  for (const c of [`cd sub && ${P}`, `cd ./sub && ${P}`, `cdpath=(/o); cd ./sub && ${P}`, `CDPATH=/o; cd ../repo && ${P}`, `CDPATH=/o; cd /work/repo/sub && ${P}`, `CDPATH=/o; cd ~ ; ${P.replace('git', 'git -C /work/repo')}`, `CDPATH= cd sub && ${P}`, P]) assert.equal(run(c).decision, 'allow', c);
+  assert.equal(run(`cd ./sub && ${P}`, { CDPATH: '/o' }).decision, 'allow');
+  assert.equal(run(`cd sub && ${P}`, { CDPATH: '' }).decision, 'allow');
+});
