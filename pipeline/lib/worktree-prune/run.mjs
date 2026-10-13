@@ -1,0 +1,343 @@
+// The `pipeline worktrees prune` run (spec docs/specs/2026-10-13-worktree-prune-design.md §2–§7), composed from rules.mjs
+// (decisions), prs.mjs (GitHub), inspect.mjs (facts) and act.mjs (the only mutations). Every mutation asks the mode table
+// first, so `off` / `report` / `--dry-run` leave the repo and the holding folder exactly as they were. Also the repo
+// context the other `worktrees` subcommands share (canonical root, its config, the origin-derived repo slug).
+import { lstatSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { EXIT, UnavailableError } from '../cli.mjs';
+import { Fail, requireConfig } from '../cmd-common.mjs';
+import { GitError, git } from '../git.mjs';
+import { createGitHub, guardGh } from '../github.mjs';
+import { listWorktrees } from '../local-branches.mjs';
+import { LockTimeoutError, withLock } from '../locks.mjs';
+import { notifyEvent, parseRemote } from '../notify.mjs';
+import { samePath } from '../paths.mjs';
+import { QUARANTINE_DIR, holdingRoot, listHolding, purgeHolding, removeWorktree, restoreLeftovers } from './act.mjs';
+import {
+  checkAncestry, defaultTranscriptDirs, entriesFor, listCandidates, memoryMentions, processesInside, recentFiles,
+  resolveCanonicalRoot, transcriptMentions, walkTree,
+} from './inspect.mjs';
+import { checkRepoIdentity, fetchBranchPrs } from './prs.mjs';
+import { classifyEntries, inUseReasons, lockNameFor, modeAllows, selectLifecycle } from './rules.mjs';
+
+const HOUR_MS = 3600e3;
+const LOG_LINES = 30;
+const SETTLE_MS = 5000; // spec §2 step 3
+const MEASURE_CAP = 20000; // entries walked per outside item before its size is reported as partial
+const safeName = (s) => String(s).replace(/[^A-Za-z0-9._-]/g, '_');
+const oneLine = (err) => String(err?.message ?? err).replace(/\s*\n\s*/g, ' ').trim().slice(0, 200);
+
+// The configured origin URL (not `remote get-url`, which expands url.<x>.insteadOf): it is what names the repository.
+function configuredOrigin(root) {
+  try {
+    return git(['config', '--get', 'remote.origin.url'], { cwd: root }).trim();
+  } catch (err) {
+    if (err instanceof GitError) return '';
+    throw err;
+  }
+}
+
+// Canonical root (the main worktree, whichever checkout --repo names), its config and the repo's identity.
+export async function loadRepo(values, ctx) {
+  const dir = path.resolve(ctx?.cwd ?? process.cwd(), values.repo ?? '.');
+  let canonical;
+  try {
+    canonical = resolveCanonicalRoot(dir);
+  } catch (err) {
+    if (err instanceof GitError) throw new Fail(EXIT.USAGE, { ok: false, error: 'repo', message: `not a git repository: ${dir}` });
+    throw err;
+  }
+  const { root, commonDir } = canonical;
+  const { config } = await requireConfig(root);
+  const originUrl = configuredOrigin(root);
+  return {
+    root, commonDir, config, w: config.worktrees, worktreeDir: config.worktree_dir, originUrl,
+    slug: parseRemote(originUrl)?.slug ?? path.basename(root),
+    name: config.project || path.basename(root),
+  };
+}
+
+// One run per repository at a time; a second one answers "already running" instead of waiting.
+async function withRunLock(commonDir, env, fn) {
+  try {
+    return await withLock(lockNameFor(commonDir), fn, { dir: env.PIPELINE_LOCK_DIR || undefined, waitMs: 0 });
+  } catch (err) {
+    if (err instanceof LockTimeoutError) return { exitCode: EXIT.OK, output: { ok: true, skipped: 'already running' } };
+    throw err;
+  }
+}
+
+// spec §4 rule 7: an index.lock in the common dir (or any worktree's admin dir) means git is busy right now.
+function gitBusy(commonDir) {
+  const exists = (p) => {
+    try {
+      lstatSync(p);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (exists(path.join(commonDir, 'index.lock'))) return true;
+  let names = [];
+  try {
+    names = readdirSync(path.join(commonDir, 'worktrees'));
+  } catch { /* no linked worktrees */ }
+  return names.some((n) => exists(path.join(commonDir, 'worktrees', n, 'index.lock')));
+}
+
+// --dry-run: what restoreLeftovers would move back, without moving anything.
+function pendingLeftovers(root, worktreeDir) {
+  const qDir = path.join(root, worktreeDir, QUARANTINE_DIR);
+  let names;
+  try {
+    names = readdirSync(qDir).sort();
+  } catch {
+    return [];
+  }
+  return names.map((name) => {
+    const dot = name.lastIndexOf('.');
+    const to = dot > 0 ? path.join(root, worktreeDir, name.slice(0, dot)) : null;
+    return { from: path.join(qDir, name), to, restored: false, reason: 'dry run: would move back' };
+  });
+}
+
+function treeBytes(wtPath, walk) {
+  let bytes = 0;
+  for (const w of walk) {
+    if (w.isDir) continue;
+    try {
+      bytes += lstatSync(path.join(wtPath, ...w.path.split('/'))).size;
+    } catch { /* vanished */ }
+  }
+  return bytes;
+}
+
+// spec §4 rules 2–6 for one candidate. -> { ok: true, pr, bytes } | { reason }. The first failing rule is the reason.
+function evaluate(c, { root, gh, w, nowMs, transcriptDirs }) {
+  const found = fetchBranchPrs(gh, c.branch);
+  if (!found.ok) return { reason: found.reason };
+  const life = selectLifecycle(found.prs, { nowMs, minMergedHours: w.min_merged_hours });
+  if (!life.ok) return { reason: life.reason };
+  const pr = life.pr.number;
+  const ancestry = checkAncestry(root, { head: c.head, pr: life.pr });
+  if (!ancestry.ok) return { reason: ancestry.reason, pr };
+  const walk = walkTree(c.path);
+  const { blockers } = classifyEntries(entriesFor(c.path), w);
+  if (blockers.length) return { reason: `files that exist only here (${blockers.slice(0, 3).join(', ')})`, pr };
+  const sinceMs = nowMs - w.min_idle_hours * HOUR_MS;
+  const busy = inUseReasons({
+    locked: null,
+    processes: processesInside(c.path),
+    transcripts: transcriptMentions([c.path, c.branch], { dirs: transcriptDirs, sinceMs }),
+    memoryNotes: memoryMentions({ slug: c.slug, branch: c.branch }, { dirs: w.memory_dirs }),
+    recentFiles: recentFiles(walk, { sinceMs, ignore: [...w.delete, ...w.archive] }),
+  });
+  if (busy.length) return { reason: busy.join('; '), pr };
+  return { ok: true, pr, bytes: treeBytes(c.path, walk) };
+}
+
+// Right before removal: the worktree must still be where, what and as unlocked as it was when it was evaluated.
+function unchangedSince(root, c) {
+  const now = listWorktrees(root).find((e) => samePath(e.path, c.path));
+  return Boolean(now) && now.locked === null && now.head === c.head && now.branch === c.branch;
+}
+
+function settleMs(env) {
+  const n = Number(env.PIPELINE_PRUNE_SETTLE_MS);
+  return env.PIPELINE_PRUNE_SETTLE_MS !== undefined && Number.isInteger(n) && n >= 0 ? n : SETTLE_MS;
+}
+
+async function evaluateCandidates(repo, { gh, mode, dryRun, env, runId, runStartMs }) {
+  const { root, w, worktreeDir } = repo;
+  const { candidates, skipped } = listCandidates(root, { worktreeDir, protect: w.protect });
+  const kept = skipped.map(({ slug, reason }) => ({ slug, reason }));
+  const removed = [];
+  const wouldRemove = [];
+  const facts = { root, gh, w, nowMs: runStartMs, transcriptDirs: defaultTranscriptDirs(os.homedir(), env) };
+  const holdingDir = holdingRoot(repo.slug, env);
+  for (const c of candidates) {
+    let v;
+    try {
+      v = evaluate(c, facts);
+    } catch (err) {
+      v = { reason: `could not inspect: ${oneLine(err)}` };
+    }
+    if (!v.ok) {
+      kept.push({ slug: c.slug, reason: v.reason, ...(v.pr ? { pr: v.pr } : {}) });
+      continue;
+    }
+    const item = { slug: c.slug, branch: c.branch, pr: v.pr, bytes: v.bytes };
+    if (!modeAllows(mode, 'remove', { dryRun })) {
+      wouldRemove.push(item);
+      continue;
+    }
+    if (!unchangedSince(root, c)) {
+      kept.push({ slug: c.slug, reason: 'changed during the run', pr: v.pr });
+      continue;
+    }
+    const res = await removeWorktree({ root, wt: c, cfg: w, pr: v.pr, holdingDir, runId, runStartMs, settleMs: settleMs(env) });
+    const archived = (res.archived ?? []).map((a) => a.stored);
+    if (res.removed) removed.push({ ...item, archived, deleted: res.deleted });
+    else kept.push({ slug: c.slug, reason: res.reason, pr: v.pr, ...(archived.length ? { archived } : {}) });
+  }
+  return { removed, wouldRemove, kept };
+}
+
+// Size and newest mtime of a path, symlinks never followed, at most MEASURE_CAP entries (then `partial: true`).
+function measure(p) {
+  let bytes = 0;
+  let newestMs = 0;
+  let seen = 0;
+  const stack = [p];
+  while (stack.length && seen < MEASURE_CAP) {
+    const cur = stack.pop();
+    let st;
+    try {
+      st = lstatSync(cur);
+    } catch {
+      continue;
+    }
+    seen += 1;
+    newestMs = Math.max(newestMs, st.mtimeMs);
+    if (st.isDirectory()) {
+      try {
+        for (const n of readdirSync(cur)) stack.push(path.join(cur, n));
+      } catch { /* unreadable: counted as itself */ }
+    } else bytes += st.size;
+  }
+  return { path: p, bytes, newestMs: Math.round(newestMs), ...(stack.length ? { partial: true } : {}) };
+}
+
+const listDir = (dir) => {
+  try {
+    return readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+};
+
+// spec §6: things outside worktrees that only get REPORTED (read-only): container-root scratch and evidence, the
+// screenshots folder, and Claude's per-session scratch (/tmp/claude-<uid>/<project>/<session>, POSIX only).
+export function outsideReport(root, env) {
+  const items = [];
+  for (const e of listDir(path.join(root, '.claude'))) {
+    const p = path.join(root, '.claude', e.name);
+    if (e.isFile() && (e.name.includes('brief') || e.name.endsWith('.patch'))) items.push(measure(p));
+    else if (e.isDirectory() && e.name.endsWith('-ledgers')) items.push(measure(p));
+  }
+  for (const e of listDir(root)) {
+    if (e.isDirectory() && (e.name === '.review' || e.name === '.verify')) items.push(measure(path.join(root, e.name)));
+    else if (e.name === 'screenshots from mac') items.push({ path: path.join(root, e.name), bytes: null, newestMs: null });
+  }
+  const scratch = env.PIPELINE_SCRATCH_DIR || (typeof process.getuid === 'function' ? `/tmp/claude-${process.getuid()}` : null);
+  if (scratch) {
+    for (const project of listDir(scratch).filter((e) => e.isDirectory())) {
+      for (const session of listDir(path.join(scratch, project.name)).filter((e) => e.isDirectory())) {
+        items.push(measure(path.join(scratch, project.name, session.name)));
+      }
+    }
+  }
+  return items;
+}
+
+export function formatBytes(n) {
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let v = n;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return i === 0 ? `${v} B` : `${v.toFixed(1)} ${units[i]}`;
+}
+
+// "open PR #2 on this branch" -> "open PR on this branch"; "PR data incomplete: HTTP 502" -> "PR data incomplete".
+const reasonGroup = (reason) => String(reason).split(/[:(;]/)[0].replace(/\s*#\d+/g, '').trim() || 'other';
+
+// spec §7: the one-line report (also the push text and the log line).
+export function summaryLine({ name, mode, dryRun, removed, wouldRemove, kept, restored, outside, holding }) {
+  const list = (xs) => xs.map((x) => `${x.slug}${x.pr ? ` #${x.pr}` : ''}`).join(', ');
+  const total = (xs) => formatBytes(xs.reduce((s, x) => s + (x.bytes ?? 0), 0));
+  const parts = [];
+  if (removed.length) parts.push(`removed ${removed.length} (${total(removed)}): ${list(removed)}`);
+  if (wouldRemove.length || !removed.length) parts.push(`would remove ${wouldRemove.length}${wouldRemove.length ? ` (${total(wouldRemove)}): ${list(wouldRemove)}` : ''}`);
+  const groups = new Map();
+  for (const k of kept) groups.set(reasonGroup(k.reason), (groups.get(reasonGroup(k.reason)) ?? 0) + 1);
+  const grouped = [...groups].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).map(([g, n]) => `${n} ${g}`).join(', ');
+  parts.push(`kept ${kept.length}${grouped ? `: ${grouped}` : ''}`);
+  const back = restored.filter((r) => r.restored).length;
+  if (restored.length) parts.push(`restored ${back} of ${restored.length} leftover quarantine${restored.length === 1 ? '' : 's'}`);
+  parts.push(`outside worktrees: ${outside.length} item${outside.length === 1 ? '' : 's'} (report only)`);
+  parts.push(`holding: ${holding.batches.length} batch${holding.batches.length === 1 ? '' : 'es'}${holding.purged.length ? `, purged ${holding.purged.length}` : ''}`);
+  return `worktrees prune (${name}, ${mode} mode${dryRun ? ', dry run' : ''}): ${parts.join(' · ')}`;
+}
+
+// <PIPELINE_PRUNE_LOG_DIR or ~/.local/state/pipeline>/prune-<slug>.log, the last LOG_LINES runs. -> the file, or null.
+function appendLog(env, slug, line) {
+  const dir = env.PIPELINE_PRUNE_LOG_DIR || path.join(os.homedir(), '.local', 'state', 'pipeline');
+  const file = path.join(dir, `prune-${safeName(slug)}.log`);
+  mkdirSync(dir, { recursive: true });
+  let lines = [];
+  try {
+    lines = readFileSync(file, 'utf8').split('\n').filter(Boolean);
+  } catch (err) {
+    if (err?.code !== 'ENOENT') throw err;
+  }
+  lines.push(line);
+  writeFileSync(file, `${lines.slice(-LOG_LINES).join('\n')}\n`);
+  return file;
+}
+
+async function pruneLocked(repo, { mode, dryRun, notify, ctx, env }) {
+  const { root, commonDir, worktreeDir } = repo;
+  const runStartMs = Date.now();
+  const runId = `${runStartMs.toString(36)}-${process.pid}`;
+  if (gitBusy(commonDir)) return { exitCode: EXIT.OK, output: { ok: true, mode, dryRun, skipped: 'git operation in progress' } };
+
+  const restored = modeAllows(mode, 'restore-leftover', { dryRun }) ? restoreLeftovers(root, worktreeDir) : pendingLeftovers(root, worktreeDir);
+
+  const { removed, wouldRemove, kept } = await guardGh(async () => {
+    const gh = createGitHub({ cwd: root, env });
+    const identity = checkRepoIdentity(gh, repo.originUrl);
+    if (!identity.ok) {
+      if (identity.unavailable) throw new UnavailableError(identity.reason);
+      throw new Fail(EXIT.USAGE, { ok: false, error: 'repo-mismatch', message: identity.reason });
+    }
+    return evaluateCandidates(repo, { gh, mode, dryRun, env, runId, runStartMs });
+  });
+
+  const outside = outsideReport(root, env);
+  const holdingDir = holdingRoot(repo.slug, env);
+  const purged = modeAllows(mode, 'purge', { dryRun }) ? purgeHolding(holdingDir, { nowMs: Date.now() }).purged : [];
+  const holding = { batches: listHolding(holdingDir), purged };
+  const summary = summaryLine({ name: repo.name, mode, dryRun, removed, wouldRemove, kept, restored, outside, holding });
+  const output = { ok: true, mode, dryRun, removed, wouldRemove, kept, restored, outside, holding, summary };
+
+  try {
+    output.log = appendLog(env, repo.slug, `${new Date().toISOString()} ${summary}`);
+  } catch (err) {
+    output.logError = oneLine(err);
+  }
+  if (notify && (removed.length || restored.some((r) => r.restored))) {
+    output.notify = await notifyEvent(
+      { event: 'worktrees', pr: null, action: summary, ids: removed.map((r) => r.slug) },
+      { cwd: root, env, ...(ctx?.notifyDeps ?? {}) },
+    );
+  }
+  return { exitCode: EXIT.OK, output };
+}
+
+export async function prune(values, ctx) {
+  const env = ctx?.env ?? process.env;
+  const repo = await loadRepo(values, ctx);
+  const mode = repo.w.mode;
+  const dryRun = values['dry-run'] === true;
+  return withRunLock(repo.commonDir, env, async () => {
+    // off: no evaluation at all; only a dead run's quarantine is undone (that is allowed in every mode).
+    if (!modeAllows(mode, 'evaluate', { dryRun })) {
+      return { exitCode: EXIT.OK, output: { ok: true, mode, dryRun, disabled: true, restored: restoreLeftovers(repo.root, repo.worktreeDir) } };
+    }
+    return pruneLocked(repo, { mode, dryRun, notify: values.notify === true, ctx, env });
+  });
+}

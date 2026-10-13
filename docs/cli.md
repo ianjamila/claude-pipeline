@@ -472,6 +472,37 @@ pipeline version
 
 Exit: 0.
 
+## worktrees
+
+remove finished worktrees (prune), keep one with a lock (keep / unkeep), list or purge the holding folder.
+
+```
+pipeline worktrees prune [--repo DIR] [--dry-run] [--notify]   -> {ok, mode, removed:[...], wouldRemove:[...], kept:[...], restored:[...], outside:[...], holding:{batches, purged}}
+pipeline worktrees keep NAME [--reason TEXT] [--repo DIR]   -> {ok, slug, locked}
+pipeline worktrees unkeep NAME [--run ID] [--repo DIR]   -> {ok, slug, unlocked}
+pipeline worktrees holding [--purge] [--repo DIR]   -> {ok, batches:[...], purged:[...]}
+```
+
+Design: [docs/specs/2026-10-13-worktree-prune-design.md](specs/2026-10-13-worktree-prune-design.md). `--repo` may name the
+container, a linked worktree or a subdirectory: candidates, config (the main worktree's `.claude/pipeline.yml`) and the
+run lock all come from the main worktree. A worktree is removed only when its newest same-repo PR merged at least
+`min_merged_hours` ago, every local commit is in that PR, nothing but `delete` / `archive` files is left in it, and
+nothing uses it (lock, process, recent Claude transcript, memory note, recently changed file); removal goes through a
+quarantine move and a final re-inspection, and the `archive` files wait 30 days in the holding folder. `worktrees.mode`
+governs every mutation:
+
+| action | off | report (default) | on | `--dry-run` |
+|---|---|---|---|---|
+| evaluate and report worktrees | no (`disabled: true`) | yes | yes | yes |
+| remove a worktree, delete caches, archive evidence | no | no | yes | no |
+| move back a quarantine left by a killed run | yes | yes | yes | report only |
+| purge holding batches older than 30 days | no | no | yes | no |
+| `keep` / `unkeep` locks | yes | yes | yes | n/a |
+
+`unkeep` releases only a `pipeline-keep:` lock, and with `--run ID` only the one whose reason carries `ship run ID`.
+Exit: 0 completed (also `skipped: "already running"` / `"git operation in progress"`) · 2 usage, repo, config, or the
+`gh` repository does not match `origin` · 3 GitHub unavailable.
+
 ## Where this differs from spec section 5.2
 
 The spec table was written before the build; the CLI that shipped differs as follows (the CLI is authoritative).
