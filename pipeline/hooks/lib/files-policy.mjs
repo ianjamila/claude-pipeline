@@ -1780,10 +1780,16 @@ function sourcedTexts(rec, dirs, ctx) {
   const texts = [];
   let unknown = !!(rec.joined || rec.unresolvable);
   const consider = (abs) => {
+    // Why: a file the line writes earlier (`echo D=/tmp > rc; . ./rc`) is what those writes put there, not what is on disk now; a write may also fail or be skipped, so the disk text stays a case too
+    const w = writtenTo(ctx.frames, abs, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: false });
+    if (w) {
+      if (w.unknown || w.pieces || w.authored || w.files.length || w.scans.length || w.programs.length) unknown = true;
+      texts.push(...w.texts, ...w.joined);
+    }
     const t = ctx.readText(abs);
     if (typeof t === 'string') { texts.push(t); return; }
     if (ctx.api.existsSync(abs)) { if (!ctx.readDir(abs)) unknown = true; return; }
-    if (writtenTo(ctx.frames, abs, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: false })) unknown = true;
+    if (w) { if (!w.texts.length && !w.joined.length) unknown = true; }
   };
   if (unknown) return { texts, unknown };
   const joinPath = (d, r) => (isAbs(r) ? posix.normalize(r) : posix.join(d, r));

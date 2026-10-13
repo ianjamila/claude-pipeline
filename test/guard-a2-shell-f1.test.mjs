@@ -71,3 +71,22 @@ test('F1/57: a name a sourced file may have changed stays unknown for the comman
     'D=/tmp; source $X; D=/tmp; echo y > $D/settings.json', 'D=/tmp; source $X; D=/tmp; cp ok.sh $D/a.txt; D=/tmp', 'D=/tmp; echo y > $D/a.txt; D=/tmp', 'D=/tmp; source $X; echo $D; D=/tmp',
   ], 'allow');
 });
+
+// ---- 81: a sourced file the line writes first is what the writes put there ----------------------------------------------------------
+
+test('F1/81: a file the line writes and then sources is modelled from what is written, with the disk text as another case (files)', () => {
+  const spec = { 'rc': 'D=/tmp', 'ok.sh': 'echo ok' };
+  filesOnly([
+    // (the disk file sets a harmless D; what the line writes sets the protected one)
+    "echo 'D=/home/u/.claude' > rc; . ./rc; echo x > $D/settings.json", "echo 'D=/home/u/.claude' > rc; source rc; cp ok.sh $D/settings.json", "printf 'D=/home/u/.claude\\n' > rc; . ./rc; echo x > $D/settings.json",
+    // (a write the guard cannot read: unknown content)
+    'echo "D=$(pick)" > rc; . ./rc; echo x > $D/settings.json',
+  ], 'deny', spec);
+  // a missing file the line writes is modelled too, instead of poisoning every name
+  filesOnly([
+    "echo 'D=/home/u/.claude' > new.rc; . ./new.rc; echo x > $D/settings.json",
+  ], 'deny', { 'ok.sh': 'echo ok' });
+  filesOnly([
+    "echo 'D=/tmp/x' > new.rc; . ./new.rc; echo x > $D/a.txt", "echo 'D=/tmp/x' > rc; . ./rc; echo x > $D/a.txt",
+  ], 'allow', { 'ok.sh': 'echo ok' });
+});
