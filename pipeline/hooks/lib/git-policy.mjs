@@ -1615,7 +1615,7 @@ export function evaluateGitCommand(command, opts = {}) {
   const state = { bound: false, rewrote: false };
   const first = evaluateGitOnce(command, opts, state);
   if (first.decision === 'deny' || !(state.bound && state.rewrote)) return first;
-  return evaluateGitOnce(command, opts, { bound: true, rewrote: false });
+  return evaluateGitOnce(command, opts, { bound: true, rewrote: false, carry: state.budget }); // (the second pass spends what the first left: every cap still ends in a denial; only the startup-file memo starts empty)
 }
 function evaluateGitOnce(command, {
   cwd,
@@ -1635,10 +1635,11 @@ function evaluateGitOnce(command, {
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   const base = cwd || process.cwd();
   const ctx = {
-    cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, readDir, readHead, realpath, env, budget: newEvalBudget(now), fullText: text, lineText: text,
+    cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, readDir, readHead, realpath, env, budget: bashState?.carry ? { ...bashState.carry, startupOk: new Set(), startupFx: undefined } : newEvalBudget(now), fullText: text, lineText: text,
     vars: Object.create(null), unsureVars: new Set(), tainted: new Set(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
     branches: new Map(), cfgDirty: false, envCfgDirty: false, writeFrames: [], bashState,
   };
+  if (bashState) bashState.budget = ctx.budget;
   // Why: a hook that throws or times out is allowed by Claude Code, so a limit hit (GuardLimit) and ANY other exception (a
   // readText that throws, a stack overflow) end here as a denial that names the cause.
   try {

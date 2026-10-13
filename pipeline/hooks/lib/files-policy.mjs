@@ -941,7 +941,7 @@ function onlyNonBinders(cmds) {
 function mayRebind(name, cmds, raw) {
   const re = (s) => new RegExp(s.replaceAll('NAME', name));
   // (a `${...}` that mentions the name and assigns -- `${N:=x}`, `${N::=x}`, `${(flags)N=x}`, `${N+=}`)
-  if (re('\\$\\{[^}]*\\bNAME\\b[^}]*=|\\$\\{!?NAME\\[|\\bNAME\\[[^\\]]*\\]\\+?=|\\b(?:for|select|foreach)\\s+NAME\\b|\\(\\([^)]*\\bNAME\\b').test(raw)) return true; // (`${N:=x}`, `N[1]=`, a loop variable, arithmetic)
+  if (re('\\$\\{[^}]*\\bNAME\\b[^}]*=|\\$\\{!?NAME\\[|\\bNAME\\[[^\\]]*\\]\\+?=|\\b(?:for|select|foreach)\\s+NAME\\b|\\(\\([^)]*\\bNAME\\b|\\{NAME\\}\\s*(?:[<>]|&>)|\\bNAME\\+=').test(raw)) return true; // (`${N:=x}`, `N[1]=`, a loop variable, arithmetic)
   return !onlyNonBinders(cmds);
 }
 function modelZshSelfDirs(cmds, raw, ctx) {
@@ -1745,6 +1745,8 @@ function sourcedEffects(text, ctx) {
   const from = flowStart(cmds);
   const seen = new Map();
   const local = Object.create(null);
+  // (a function the file defines is vetted through its own body, whose commands are in the list; the definition itself shows up as a command named like the function)
+  const fns = new Set([...text.matchAll(/(?:^|[\n;&|({])\s*function\s+([^\s(){;'"$`]+)/g), ...text.matchAll(/(?:^|[\n;&|({])\s*([^\s(){;'"$`=]+)\s*\(\s*\)/g)].map((m) => m[1]));
   const set = (k, v, sure) => {
     if (HOME_NAMES.has(k)) return;
     const n = (seen.get(k) ?? 0) + 1;
@@ -1769,9 +1771,18 @@ function sourcedEffects(text, ctx) {
       if (cdUnknownShape(c.argv) || (v !== undefined && /[`$*?[{]/.test(v)) || (cdpath && v !== undefined && !isAbs(toPosix(v)) && !/^(?:\.\.?(?:[\\/]|$)|~)/.test(v))) out.unknownCd = true;
       else out.cds.push(t ?? '~');
     }
-    else if (BINDERS.has(name)) for (const a of c.argv.slice(1)) { const m = /^[A-Za-z_]\w*/.exec(a); if (m) set(m[0], null, false); }
-    else if (RUNS_CODE.has(name) || /[$`]/.test(c.argv[0])) out.all = true;
+    else if (BINDERS.has(name)) {
+      // (a name that is not a plain word -- `read "$1"`, `unset $n`, `getopts ab "$v"` -- may be any)
+      for (const a of c.argv.slice(1)) { const m = /^[A-Za-z_]\w*/.exec(a); if (m) set(m[0], null, false); else if (/[$`*?[{\\'"(~]/.test(a)) out.all = true; }
+    }
+    // (an allowlist, as for the script-directory names: a command outside it -- a zsh binder, a function the file defines, anything unknown -- may bind any name)
+    else if (RUNS_CODE.has(name) || /[$`]/.test(c.argv[0]) || !(fns.has(name) || onlyNonBinders([c]) || (name === 'set' && !c.argv.slice(1).some((a) => /^[-+][A-Za-z]*A/.test(a))))) out.all = true;
   }
+  // (no command of their own: an expansion that assigns, `(( N = 1 ))`, a named descriptor `{N}>file`)
+  const bind = (names) => { for (const k of names) set(k, null, false); };
+  for (const m of text.matchAll(/\$\{([^}]*)\}/g)) if (m[1].includes('=')) bind(m[1].match(/[A-Za-z_]\w*/g) ?? []);
+  for (const m of text.matchAll(/\(\(([^)]*)\)\)/g)) if (/(?<![=!<>])=(?!=)/.test(m[1])) bind(m[1].match(/[A-Za-z_]\w*/g) ?? []);
+  for (const m of text.matchAll(/\{([A-Za-z_]\w*)\}\s*(?:[<>]|&>)/g)) bind([m[1]]);
   return out;
 }
 
@@ -1863,9 +1874,11 @@ export const evaluateBashForFiles = failClosed(evaluateBashForFilesUnchecked);
 function evaluateBashForFilesUnchecked(command, opts = {}) {
   if (!opts._bashState) {
     const state = { bound: false, rewrote: false };
-    const first = evaluateBashForFilesUnchecked(command, { ...opts, _bashState: state });
+    const budget = opts._budget ?? newEvalBudget(opts.now);
+    const first = evaluateBashForFilesUnchecked(command, { ...opts, _budget: budget, _bashState: state });
     if (first.decision === 'deny' || !(state.bound && state.rewrote)) return first;
-    return evaluateBashForFilesUnchecked(command, { ...opts, _bashState: { bound: true, rewrote: false } });
+    // (the second pass spends what the first left, so every cap still ends in a denial; only the startup-file memo starts empty)
+    return evaluateBashForFilesUnchecked(command, { ...opts, _budget: { ...budget, startupOk: new Set() }, _bashState: { bound: true, rewrote: false } });
   }
   if (!opts._frames) opts = { ...opts, _frames: [] }; // the writes of this line and of the scripts it runs (shared with nested calls, popped on the way out)
   const depth = opts._frames.length;
