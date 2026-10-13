@@ -2,10 +2,14 @@
 
 ## PR body template
 
-The PR is created as a draft right after the first task commits (Step 2), with a short body: the request and the task
-list. Step 3 replaces it with the full body below (`gh pr edit N --body-file <file>`).
+The PR is created as a draft right after the first task commits (Step 2), with a short body: the `## In plain English`
+section, the request and the task list. Step 3 replaces it with the full body below (`gh pr edit N --body-file <file>`).
 
 ```
+## In plain English
+<2–4 sentences for a non-developer owner: what changes for the people who use the app (or the team), and why.
+No file paths, function names or jargon. Always first, so the owner can decide on "merge" from this section alone.>
+
 ## What & why
 <2–4 sentences: the change and the reason; link the request/issue (Closes #…)>
 
