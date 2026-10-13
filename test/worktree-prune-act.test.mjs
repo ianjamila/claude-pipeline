@@ -42,7 +42,7 @@ test('archive -> manifest -> list -> collision suffix', () => {
   const r2 = archivePaths({ wtPath: wt, rels: ['.review/state.json'], holdingDir: h, slug: 'agent-x', pr: 9, nowMs: T });
   assert.notEqual(r2.items[0].stored, m.items[0].stored);
   const l = listHolding(h);
-  assert.equal(l.length, 1); assert.equal(l[0].items, 2); assert.match(l[0].restore[0], /^mv /);
+  assert.equal(l.length, 1); assert.equal(l[0].items, 2); assert.match(l[0].restore[0], /^mkdir -p '.*' && mv '.*' '.*'$/);
 });
 
 test('purge: only batches whose every item is > 30 days old; bad/future timestamps keep', () => {
@@ -113,7 +113,7 @@ test('list: restore commands quote paths with spaces; an unreadable manifest sti
   const l = listHolding(h);
   const good = l.find((b) => b.batch === '2026-10-13');
   assert.equal(good.bytes, 3); assert.equal(good.archivedAt, '2026-10-13T00:00:00.000Z');
-  assert.match(good.restore[0], /^mv '.*my file\.txt' '.* dir-.*my file\.txt'$/);
+  assert.match(good.restore[0], /^mkdir -p '.* dir-[^']*' && mv '.*my file\.txt' '.* dir-.*my file\.txt'$/);
   const bad = l.find((b) => b.batch === 'broken');
   assert.equal(bad.items, 0); assert.deepEqual(bad.restore, []);
   assert.deepEqual(listHolding(join(h, 'does-not-exist')), []);
@@ -212,6 +212,30 @@ for (const [label, file, content] of [['untracked', 'new.ts', 'draft'], ['ignore
     assert.equal(r.archived.length, 1, 'the report still says what went to holding');
   });
 }
+
+test('removeWorktree: an evidence file written just before remove => moved back with it intact (never deleted unarchived)', async () => {
+  const { repo, add } = world();
+  const wt = add('agent-x', 'agent/x');
+  mkdirSync(join(wt, '.review')); writeFileSync(join(wt, '.review', 's.json'), '{}');
+  const r = await removeWorktree({ root: repo.dir, wt: { slug: 'agent-x', path: wt }, cfg: { delete: [], archive: ['.review/'] }, pr: 9, holdingDir: mkdtempSync(join(tmpdir(), 'h-')), runId: 'rl', runStartMs: Date.now() + 5000, settleMs: 0,
+    procOpts: noProcs(), hooks: { beforeRemove: (q) => { mkdirSync(join(q, '.review'), { recursive: true }); writeFileSync(join(q, '.review', 'late.json'), '{"late":1}'); } } });
+  assert.deepEqual([r.removed, r.restored], [false, true]);
+  assert.equal(r.reason, 'write detected during removal (.review/late.json)');
+  assert.equal(readFileSync(join(wt, '.review', 'late.json'), 'utf8'), '{"late":1}');
+});
+
+test('removeWorktree: the manifest records each file at its original worktree path, not in the quarantine', async () => {
+  const { repo, add } = world();
+  const wt = add('agent-x', 'agent/x');
+  mkdirSync(join(wt, '.review')); writeFileSync(join(wt, '.review', 's.json'), '{"s":1}');
+  const h = mkdtempSync(join(tmpdir(), 'hold-'));
+  const r = await removeWorktree({ root: repo.dir, wt: { slug: 'agent-x', path: wt }, cfg: { delete: [], archive: ['.review/'] }, pr: 9, holdingDir: h, runId: 'ro', runStartMs: Date.now() + 5000, settleMs: 0, procOpts: noProcs() });
+  assert.equal(r.removed, true, r.reason);
+  assert.equal(r.archived[0].original, join(wt, '.review', 's.json'));
+  assert.doesNotMatch(r.archived[0].original, /\.prune-quarantine/);
+  const [batch] = listHolding(h);
+  assert.equal(batch.restore[0], `mkdir -p '${join(wt, '.review')}' && mv '${r.archived[0].stored}' '${join(wt, '.review', 's.json')}'`);
+});
 
 test('removeWorktree: git refusing the remove => moved back intact (restored), archive reported', async () => {
   const { repo, add } = world();

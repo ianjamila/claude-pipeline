@@ -77,9 +77,9 @@ test('processesInside: fake /proc tree; non-linux is unavailable', () => {
   symlinkSync(target, join(proc, '101', 'cwd'));
   symlinkSync(tmpdir(), join(proc, '202', 'cwd'));
   symlinkSync(join(target, 'x.log'), join(proc, '202', 'fd', '3'));
-  assert.deepEqual(processesInside(target, { procRoot: proc, platform: 'linux' }), { available: true, pids: [101, 202] });
-  assert.deepEqual(processesInside(target, { procRoot: proc, platform: 'win32' }), { available: false, pids: [] });
-  assert.deepEqual(processesInside(target, { procRoot: join(proc, 'missing'), platform: 'linux' }), { available: false, pids: [] });
+  assert.deepEqual(processesInside(target, { procRoot: proc, platform: 'linux' }), { available: true, pids: [101, 202], hidden: 0 });
+  assert.deepEqual(processesInside(target, { procRoot: proc, platform: 'win32' }), { available: false, pids: [], hidden: 0 });
+  assert.deepEqual(processesInside(target, { procRoot: join(proc, 'missing'), platform: 'linux' }), { available: false, pids: [], hidden: 0 });
 }, { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' });
 
 test('transcriptMentions / memoryMentions / recentFiles', () => {
@@ -151,7 +151,7 @@ test('processesInside matches a worktree reached through a symlinked path', () =
   symlinkSync(real, via);
   mkdirSync(join(proc, '303', 'fd'), { recursive: true });
   symlinkSync(real, join(proc, '303', 'cwd'));
-  assert.deepEqual(processesInside(via, { procRoot: proc, platform: 'linux' }), { available: true, pids: [303] });
+  assert.deepEqual(processesInside(via, { procRoot: proc, platform: 'linux' }), { available: true, pids: [303], hidden: 0 });
 }, { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' });
 
 test('processesInside ignores non-path fd targets (socket:[N], anon_inode:…) even with cwd inside the worktree', () => {
@@ -166,7 +166,7 @@ test('processesInside ignores non-path fd targets (socket:[N], anon_inode:…) e
   const before = process.cwd();
   try {
     process.chdir(target);
-    assert.deepEqual(processesInside(target, { procRoot: proc, platform: 'linux' }), { available: true, pids: [505] });
+    assert.deepEqual(processesInside(target, { procRoot: proc, platform: 'linux' }), { available: true, pids: [505], hidden: 0 });
   } finally {
     process.chdir(before);
   }
@@ -185,3 +185,19 @@ test('transcriptMentions counts an unreadable recent transcript as a hit (fail-c
     chmodSync(locked, 0o600); chmodSync(join(t, 'proj', 'old-locked.jsonl'), 0o600);
   }
 }, { skip: (process.platform === 'win32' && 'chmod 000 is not enforced on Windows') || (process.getuid?.() === 0 && 'root can read any file') });
+
+// Another user's process: its /proc/<pid> links cannot be read (EACCES). It is counted as hidden, never as "inside",
+// and never makes process inspection unavailable (every non-root user sees root daemons this way).
+test('processesInside counts an unreadable process as hidden; a vanished one is just gone', () => {
+  const proc = mkdtempSync(join(tmpdir(), 'proc-'));
+  const target = realpathSync(mkdtempSync(join(tmpdir(), 'wt-')));
+  mkdirSync(join(proc, '606', 'fd'), { recursive: true });
+  symlinkSync(target, join(proc, '606', 'cwd'));
+  chmodSync(join(proc, '606'), 0o000);
+  mkdirSync(join(proc, '707')); // exited between the listing and the read: no cwd, no fd (ENOENT)
+  try {
+    assert.deepEqual(processesInside(target, { procRoot: proc, platform: 'linux' }), { available: true, pids: [], hidden: 1 });
+  } finally {
+    chmodSync(join(proc, '606'), 0o700);
+  }
+}, { skip: (process.platform === 'win32' && 'chmod 000 is not enforced on Windows') || (process.getuid?.() === 0 && 'root can read any directory') });

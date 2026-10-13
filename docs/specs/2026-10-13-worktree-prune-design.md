@@ -34,7 +34,16 @@ path away before the final inspection**:
 3. Wait 5 s, then **re-inspect the quarantined tree**: full walk (no symlink following) — any path not in the allowlist,
    any file with mtime ≥ run start, any `git status` change, or any process whose cwd/fd points inside ⇒ **move it back**
    to the original path and keep it (reported as "write detected during removal").
-4. Otherwise archive evidence, delete caches, `git worktree remove` (never `--force`).
+4. Otherwise archive evidence, delete caches, then look once more: anything left in the tree at all (a blocker, or a
+   new evidence/cache file written while archiving) ⇒ move it back. Only an empty-of-ignored tree reaches
+   `git worktree remove` (never `--force`), which would otherwise delete late evidence unarchived.
+
+**Other users' processes are not visible.** `/proc/<pid>/cwd` and `fd/` of a process owned by another user (a root
+daemon, a container, anything started through sudo) cannot be read without privileges, so step 3 cannot see whether
+such a process sits inside the tree. They are counted and reported ("N processes could not be inspected"), never a
+keep reason: every non-root user sees every root daemon that way, so it would keep everything. What protects the tree
+from such a process is the quarantine re-inspection itself: any write it makes after the run starts shows up as an
+mtime ≥ run start or a new blocker/evidence file, and the tree is moved back.
 
 The only writers that can still reach the quarantined tree are processes holding a cwd/fd opened before the move; step 3
 detects those (and their writes) after the move, so there is no unobserved window left except the sub-second gap between
@@ -71,6 +80,8 @@ pipeline worktrees holding [--purge] [--json]        # list holding batches + re
     delete: [node_modules/, .next/, supabase/.temp/, test-results/, playwright-report/, next-env.d.ts, public/sw.js, tsconfig.tsbuildinfo, "*.log"]
     archive: [.review/, .verify/]
   ```
+  A path matching both lists is **archived** (archive wins): `.verify/logs/tests.log` is evidence even though `*.log`
+  would delete it.
 - **Mode policy — one switch for every mutation:**
 
   | action | off | report | on | `--dry-run` (any mode) |
@@ -146,8 +157,9 @@ B/C/D/root files move only when a later spec defines completion and ownership fo
 to `.git/info/exclude` is a one-time manual step outside this command.)
 
 **Holding folder** `~/.local/share/pipeline/holding/<repo>/<YYYY-MM-DD>/`: per batch `MANIFEST.json` (original absolute
-path, size, sha256, archived-at); name collisions get a numeric suffix; `holding` lists batches with the exact restore
-command. `holding --purge` (nightly, `mode: on` only) deletes batches whose **archive time** is > 30 days old; an
+path, size, sha256, archived-at); `original` is the worktree's real path, never the quarantine it was archived from
+(the quarantine no longer exists afterwards); name collisions get a numeric suffix; `holding` lists batches with the
+exact restore command (`mkdir -p '<dir>' && mv '<stored>' '<original>'`). `holding --purge` (nightly, `mode: on` only) deletes batches whose **archive time** is > 30 days old; an
 invalid or future timestamp ⇒ kept.
 
 ## 7. Reporting
@@ -192,7 +204,9 @@ including expired holding batches); invalid/future archive timestamps.
 
 ## 10. Runtime validation still owed (cannot be settled by review)
 
-Process visibility of `/proc/*/fd` for other users' or sandboxed processes on WSL2; cron execution with WSL idle/asleep;
+Process visibility of `/proc/*/fd` for other users' or sandboxed processes on WSL2 (by design they are not visible to
+a non-root prune: they are counted as `hiddenProcesses` and left to the quarantine re-inspection — mtime + blockers —
+to catch their writes, §2); cron execution with WSL idle/asleep;
 `git worktree move` behaviour with a process cwd inside on WSL2's ext4. All three are exercised by the integration tests
 on this PC before `mode: on`.
 

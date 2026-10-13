@@ -114,7 +114,8 @@ function treeBytes(wtPath, walk) {
 }
 
 // spec §4 rules 2–6 for one candidate. -> { ok: true, pr, bytes } | { reason }. The first failing rule is the reason.
-function evaluate(c, { root, gh, w, nowMs, transcriptDirs }) {
+// `hiddenProcesses`: processes that could not be inspected (other users'); reported by the run, never a keep reason.
+function evaluate(c, { root, gh, w, nowMs, transcriptDirs, procs = processesInside }) {
   const found = fetchBranchPrs(gh, c.branch);
   if (!found.ok) return { reason: found.reason };
   const life = selectLifecycle(found.prs, { nowMs, minMergedHours: w.min_merged_hours });
@@ -126,15 +127,16 @@ function evaluate(c, { root, gh, w, nowMs, transcriptDirs }) {
   const { blockers } = classifyEntries(entriesFor(c.path), w);
   if (blockers.length) return { reason: `files that exist only here (${blockers.slice(0, 3).join(', ')})`, pr };
   const sinceMs = nowMs - w.min_idle_hours * HOUR_MS;
+  const processes = procs(c.path);
   const busy = inUseReasons({
     locked: null,
-    processes: processesInside(c.path),
+    processes,
     transcripts: transcriptMentions([c.path, c.branch], { dirs: transcriptDirs, sinceMs }),
     memoryNotes: memoryMentions({ slug: c.slug, branch: c.branch }, { dirs: w.memory_dirs }),
     recentFiles: recentFiles(walk, { sinceMs, ignore: [...w.delete, ...w.archive] }),
   });
-  if (busy.length) return { reason: busy.join('; '), pr };
-  return { ok: true, pr, bytes: treeBytes(c.path, walk) };
+  if (busy.length) return { reason: busy.join('; '), pr, hiddenProcesses: processes.hidden };
+  return { ok: true, pr, bytes: treeBytes(c.path, walk), hiddenProcesses: processes.hidden };
 }
 
 // Right before removal: the worktree must still be where, what and as unlocked as it was when it was evaluated.
@@ -155,7 +157,11 @@ async function evaluateCandidates(repo, { gh, mode, dryRun, env, runId, runStart
   const kept = skipped.map(({ slug, reason }) => ({ slug, reason }));
   const removed = [];
   const wouldRemove = [];
-  const facts = { root, gh, w, nowMs: runStartMs, transcriptDirs: defaultTranscriptDirs(os.homedir(), env) };
+  // Other users' processes that could not be inspected: one /proc scan per worktree sees the same ones, so the run
+  // reports the largest count once (a per-worktree copy would only repeat a number that changes from second to second).
+  let hiddenProcesses = 0;
+  // deps.processesInside is a test seam (ctx.pruneDeps.processesInside), like deps.listWorktrees below.
+  const facts = { root, gh, w, nowMs: runStartMs, transcriptDirs: defaultTranscriptDirs(os.homedir(), env), procs: deps.processesInside };
   const holdingDir = holdingRoot(repo.slug, env);
   for (const c of candidates) {
     let v;
@@ -164,6 +170,7 @@ async function evaluateCandidates(repo, { gh, mode, dryRun, env, runId, runStart
     } catch (err) {
       v = { reason: `could not inspect: ${oneLine(err)}` };
     }
+    hiddenProcesses = Math.max(hiddenProcesses, v.hiddenProcesses ?? 0);
     if (!v.ok) {
       kept.push({ slug: c.slug, reason: v.reason, ...(v.pr ? { pr: v.pr } : {}) });
       continue;
@@ -193,7 +200,7 @@ async function evaluateCandidates(repo, { gh, mode, dryRun, env, runId, runStart
     if (res.removed) removed.push({ ...item, archived, deleted: res.deleted });
     else kept.push({ slug: c.slug, reason: res.reason, pr: v.pr, ...(archived.length ? { archived } : {}) });
   }
-  return { removed, wouldRemove, kept };
+  return { removed, wouldRemove, kept, hiddenProcesses };
 }
 
 // Size and newest mtime of a path, symlinks never followed, at most MEASURE_CAP entries (then `partial: true`).
@@ -268,7 +275,7 @@ export function formatBytes(n) {
 const reasonGroup = (reason) => String(reason).split(/[:(;]/)[0].replace(/\s*#\d+/g, '').trim() || 'other';
 
 // spec §7: the one-line report (also the push text and the log line).
-export function summaryLine({ name, mode, dryRun, removed, wouldRemove, kept, restored, outside, holding }) {
+export function summaryLine({ name, mode, dryRun, removed, wouldRemove, kept, hiddenProcesses = 0, restored, outside, holding }) {
   const list = (xs) => xs.map((x) => `${x.slug}${x.pr ? ` #${x.pr}` : ''}`).join(', ');
   const total = (xs) => formatBytes(xs.reduce((s, x) => s + (x.bytes ?? 0), 0));
   const parts = [];
@@ -278,6 +285,7 @@ export function summaryLine({ name, mode, dryRun, removed, wouldRemove, kept, re
   for (const k of kept) groups.set(reasonGroup(k.reason), (groups.get(reasonGroup(k.reason)) ?? 0) + 1);
   const grouped = [...groups].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).map(([g, n]) => `${n} ${g}`).join(', ');
   parts.push(`kept ${kept.length}${grouped ? `: ${grouped}` : ''}`);
+  if (hiddenProcesses) parts.push(`${hiddenProcesses} process${hiddenProcesses === 1 ? '' : 'es'} could not be inspected (other users)`);
   const back = restored.filter((r) => r.restored).length;
   if (restored.length) parts.push(`restored ${back} of ${restored.length} leftover quarantine${restored.length === 1 ? '' : 's'}`);
   parts.push(`outside worktrees: ${outside.length} item${outside.length === 1 ? '' : 's'} (report only)`);
@@ -309,7 +317,7 @@ async function pruneLocked(repo, { mode, dryRun, notify, ctx, env }) {
   const runId = `${runStartMs.toString(36)}-${process.pid}`;
   const restored = modeAllows(mode, 'restore-leftover', { dryRun }) ? restoreLeftovers(root, worktreeDir) : pendingLeftovers(root, worktreeDir);
 
-  const { removed, wouldRemove, kept } = await guardGh(async () => {
+  const { removed, wouldRemove, kept, hiddenProcesses } = await guardGh(async () => {
     const gh = createGitHub({ cwd: root, env });
     const identity = checkRepoIdentity(gh, repo.originUrl);
     if (!identity.ok) {
@@ -333,9 +341,9 @@ async function pruneLocked(repo, { mode, dryRun, notify, ctx, env }) {
   const holdingDir = holdingRoot(repo.slug, env);
   const purged = modeAllows(mode, 'purge', { dryRun }) ? await step('purge', () => purgeHolding(holdingDir, { nowMs: Date.now() }).purged, []) : [];
   const holding = { batches: await step('holding', () => listHolding(holdingDir), []), purged };
-  const summary = summaryLine({ name: repo.name, mode, dryRun, removed, wouldRemove, kept, restored, outside, holding })
+  const summary = summaryLine({ name: repo.name, mode, dryRun, removed, wouldRemove, kept, hiddenProcesses, restored, outside, holding })
     + (errors.length ? ` · errors: ${errors.map((e) => e.step).join(', ')}` : '');
-  const output = { ok: true, mode, dryRun, removed, wouldRemove, kept, restored, outside, holding, summary, errors };
+  const output = { ok: true, mode, dryRun, removed, wouldRemove, kept, hiddenProcesses, restored, outside, holding, summary, errors };
 
   const log = await step('log', () => appendLog(env, repo.slug, `${new Date().toISOString()} ${summary}`), null);
   if (log) output.log = log;

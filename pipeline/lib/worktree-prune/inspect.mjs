@@ -142,13 +142,15 @@ export function checkAncestry(root, { head, pr }) {
 }
 
 // Linux only: processes whose cwd or any open fd lies inside `dir`. Elsewhere the answer is "unavailable" (callers keep).
+// A process whose links cannot be read (EACCES/EPERM: another user's, e.g. a root daemon) is counted in `hidden`, not
+// guessed at; one that exited mid-scan (ENOENT/ESRCH/ENOTDIR) is simply gone. -> { available, pids, hidden }
 export function processesInside(dir, { procRoot = '/proc', platform = process.platform } = {}) {
-  if (platform !== 'linux') return { available: false, pids: [] };
+  if (platform !== 'linux') return { available: false, pids: [], hidden: 0 };
   let names;
   try {
     names = readdirSync(procRoot);
   } catch {
-    return { available: false, pids: [] };
+    return { available: false, pids: [], hidden: 0 };
   }
   // /proc reports resolved paths, so a worktree reached through a symlinked parent must also be matched by its realpath.
   const roots = [dir, tolerant(() => realpathSync(dir), dir)];
@@ -160,15 +162,27 @@ export function processesInside(dir, { procRoot = '/proc', platform = process.pl
     return path.isAbsolute(p) && roots.some((r) => isInside(p, r));
   };
   const pids = [];
+  let hidden = 0;
   for (const name of names.filter((n) => /^\d+$/.test(n))) {
     const proc = path.join(procRoot, name);
-    const links = [tolerant(() => readlinkSync(path.join(proc, 'cwd')), null)];
-    for (const fd of tolerant(() => readdirSync(path.join(proc, 'fd')), [])) {
-      links.push(tolerant(() => readlinkSync(path.join(proc, 'fd', fd)), null));
+    let denied = false;
+    const read = (fn, fallback) => {
+      try {
+        return fn();
+      } catch (err) {
+        if (err?.code === 'EACCES' || err?.code === 'EPERM') denied = true;
+        else if (err?.code !== 'ENOENT' && err?.code !== 'ESRCH' && err?.code !== 'ENOTDIR') throw err;
+        return fallback;
+      }
+    };
+    const links = [read(() => readlinkSync(path.join(proc, 'cwd')), null)];
+    for (const fd of read(() => readdirSync(path.join(proc, 'fd')), [])) {
+      links.push(read(() => readlinkSync(path.join(proc, 'fd', fd)), null));
     }
     if (links.some(inside)) pids.push(Number(name));
+    else if (denied) hidden += 1;
   }
-  return { available: true, pids: pids.sort((a, b) => a - b) };
+  return { available: true, pids: pids.sort((a, b) => a - b), hidden };
 }
 
 // *.jsonl files two levels down: <dir>/<project>/*.jsonl and <dir>/<project>/<session>/subagents/*.jsonl.

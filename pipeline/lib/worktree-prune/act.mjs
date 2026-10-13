@@ -151,8 +151,10 @@ function freeName(target) {
 
 // `rels` are FILES inside the worktree (a symlink, or a symlinked directory on the way, is refused). Each is moved to
 // <holdingDir>/<YYYY-MM-DD>/<slug>/<rel>; the manifest in the dated dir is appended to (not replaced) when the same day
-// archives again. No directory between holdingDir and the stored file may be a symlink either.
-export function archivePaths({ wtPath, rels, holdingDir, slug, pr, nowMs }) {
+// archives again. No directory between holdingDir and the stored file may be a symlink either. `originalRoot` is where
+// the files really live when `wtPath` is a temporary location (the quarantine): the manifest's `original` (and so the
+// restore command) points there, never at a path that stops existing after the run.
+export function archivePaths({ wtPath, originalRoot = wtPath, rels, holdingDir, slug, pr, nowMs }) {
   const day = new Date(nowMs).toISOString().slice(0, 10);
   const archivedAt = new Date(nowMs).toISOString();
   const sources = rels.map((rel) => {
@@ -174,7 +176,7 @@ export function archivePaths({ wtPath, rels, holdingDir, slug, pr, nowMs }) {
     const stored = freeName(path.join(destDir, relParts[relParts.length - 1]));
     moveFile(abs, stored);
     const item = {
-      original: abs, stored, size: data.length, sha256: createHash('sha256').update(data).digest('hex'),
+      original: path.join(originalRoot, ...relParts), stored, size: data.length, sha256: createHash('sha256').update(data).digest('hex'),
       archivedAt, slug, pr: pr ?? null,
     };
     items.push(item);
@@ -185,7 +187,8 @@ export function archivePaths({ wtPath, rels, holdingDir, slug, pr, nowMs }) {
   return { batchDir, items };
 }
 
-const shellQuote = (p) => (/[^A-Za-z0-9_\-./:\\]/.test(p) ? `'${p.replaceAll("'", "'\\''")}'` : p);
+// Always single-quoted (POSIX sh): a quote inside becomes '\'' and nothing else in the path is special.
+const shellQuote = (p) => `'${String(p).replaceAll("'", "'\\''")}'`;
 
 function batchDirs(holdingDir) {
   let names;
@@ -214,7 +217,8 @@ export function listHolding(holdingDir) {
       archivedAt: stamps.length ? stamps[stamps.length - 1] : null,
       items: items.length,
       bytes: items.reduce((sum, i) => sum + (Number.isFinite(i?.size) ? i.size : 0), 0),
-      restore: items.filter((i) => i?.stored && i?.original).map((i) => `mv ${shellQuote(i.stored)} ${shellQuote(i.original)}`),
+      restore: items.filter((i) => i?.stored && i?.original)
+        .map((i) => `mkdir -p ${shellQuote(path.dirname(i.original))} && mv ${shellQuote(i.stored)} ${shellQuote(i.original)}`),
     };
   });
 }
@@ -357,7 +361,7 @@ export async function removeWorktree({ root, wt, cfg, pr, holdingDir, runId, run
   try {
     const nowMs = Date.now();
     for (const rel of verdict.arch) {
-      archived.push(...archivePaths({ wtPath: q, rels: [rel], holdingDir, slug: wt.slug, pr, nowMs }).items);
+      archived.push(...archivePaths({ wtPath: q, originalRoot: wt.path, rels: [rel], holdingDir, slug: wt.slug, pr, nowMs }).items);
     }
     for (const rel of verdict.del) deleteInside(q, rel);
   } catch (err) {
@@ -365,10 +369,12 @@ export async function removeWorktree({ root, wt, cfg, pr, holdingDir, runId, run
     return moveBack(why, { archived });
   }
 
-  // Archive + delete took time, and `git worktree remove` deletes ignored files without --force: look once more.
+  // Archive + delete took time, and `git worktree remove` deletes ignored files without --force: look once more. Every
+  // archive and delete match was handled above, so anything left at all (evidence or cache included) is a new write.
   try {
     await hooks.beforeRemove?.(q);
-    const late = classifyEntries(entriesFor(q), cfg).blockers;
+    const c = classifyEntries(entriesFor(q), cfg);
+    const late = [...c.blockers, ...c.arch, ...c.del];
     if (late.length) return moveBack(`write detected during removal (${late[0]})`, { archived });
     await hooks.beforeGitRemove?.(q);
   } catch (err) {

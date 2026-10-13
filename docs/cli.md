@@ -477,7 +477,7 @@ Exit: 0.
 remove finished worktrees (prune), keep one with a lock (keep / unkeep), list or purge the holding folder.
 
 ```
-pipeline worktrees prune [--repo DIR] [--dry-run] [--notify]   -> {ok, mode, removed:[...], wouldRemove:[...], kept:[...], restored:[...], outside:[...], holding:{batches, purged}}
+pipeline worktrees prune [--repo DIR] [--dry-run] [--notify]   -> {ok, mode, removed:[...], wouldRemove:[...], kept:[...], hiddenProcesses, restored:[...], outside:[...], holding:{batches, purged}}
 pipeline worktrees keep NAME [--reason TEXT] [--repo DIR]   -> {ok, slug, locked}
 pipeline worktrees unkeep NAME [--run ID] [--repo DIR]   -> {ok, slug, unlocked}
 pipeline worktrees holding [--purge] [--repo DIR]   -> {ok, batches:[...], purged:[...]}

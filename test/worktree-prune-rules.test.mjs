@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { modeAllows, lockNameFor, matchesPattern, classifyEntries, selectLifecycle, isProtectedName, inUseReasons } from '../pipeline/lib/worktree-prune/rules.mjs';
+import { DEFAULTS } from '../pipeline/lib/config.mjs';
 
 test('mode table (spec §3)', () => {
   const t = (mode, action, dryRun = false) => modeAllows(mode, action, { dryRun });
@@ -63,6 +64,18 @@ test('classifyEntries: a nested .env* blocks even under a delete or archive patt
   assert.deepEqual(r.blockers.sort(), ['.review/.env', '.vercel/.env.local', 'node_modules/.env.x']);
   assert.deepEqual(r.del, ['node_modules/dotenv/index.js']);
   assert.deepEqual(r.arch, []);
+});
+
+test('classifyEntries: an archive pattern wins over a delete pattern (default *.log never deletes .verify/.review evidence)', () => {
+  const r = classifyEntries([
+    { path: '.verify/logs/tests.log', kind: 'ignored' },
+    { path: '.review/reviewer.log', kind: 'ignored' },
+    { path: 'npm-debug.log', kind: 'ignored' },
+    { path: 'node_modules/.review/x.js', kind: 'ignored' },
+  ], DEFAULTS.worktrees);
+  assert.deepEqual(r.arch.sort(), ['.review/reviewer.log', '.verify/logs/tests.log']);
+  assert.deepEqual(r.del.sort(), ['node_modules/.review/x.js', 'npm-debug.log']);
+  assert.deepEqual(r.blockers, []);
 });
 
 const H = 3600e3;

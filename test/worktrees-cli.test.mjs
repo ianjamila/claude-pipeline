@@ -403,6 +403,23 @@ test('the pre-removal re-read throwing keeps that worktree ("changed during the 
   assert.ok(r.output.log && readFileSync(r.output.log, 'utf8').includes(r.output.summary), 'the run is logged');
 });
 
+test('processes that cannot be inspected are reported once per run (output + summary), never a keep reason', async () => {
+  const w = world();
+  const { run: runCli } = await import('../pipeline/commands/worktrees.mjs');
+  const homeBefore = process.env.HOME;
+  process.env.HOME = w.dirs.home; // in-process: transcript and memory lookups must not read the real home
+  let r;
+  try {
+    r = await runCli(['prune'], { cwd: w.repo.dir, env: w.env, pruneDeps: { processesInside: () => ({ available: true, pids: [], hidden: 3 }) } });
+  } finally {
+    process.env.HOME = homeBefore;
+  }
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.deepEqual(slugs(r.output.wouldRemove), ['done'], JSON.stringify(r.output.kept));
+  assert.equal(r.output.hiddenProcesses, 3);
+  assert.match(r.output.summary, / · 3 processes could not be inspected \(other users\) · /);
+});
+
 test('a quarantine left by a killed run is moved back, even in off mode', () => {
   const w = world();
   w.setMode('off');

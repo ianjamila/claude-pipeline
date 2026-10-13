@@ -31,7 +31,8 @@ export function matchesPattern(rel, pattern) {
 export const ALWAYS_BLOCK = Object.freeze([/(^|\/)\.env/, /(^|\/)HANDOFF[^/]*\.md$/i, /\.patch$/]);
 
 // entries: [{ path (posix, relative), kind, isSymlink }]. A `.superpowers` symlink is allowed (removal unlinks it only);
-// anything under a real `.superpowers/` directory blocks.
+// anything under a real `.superpowers/` directory blocks. An archive pattern wins over a delete pattern: evidence is
+// never deleted, so `.verify/logs/tests.log` is archived even though the default `*.log` would delete it.
 export function classifyEntries(entries, { delete: del, archive }) {
   const out = { del: [], arch: [], blockers: [] };
   for (const e of entries) {
@@ -39,8 +40,8 @@ export function classifyEntries(entries, { delete: del, archive }) {
     if (p === '.superpowers' && e.isSymlink) continue;
     if (e.kind === 'tracked-change' || e.kind === 'untracked') { out.blockers.push(p); continue; }
     if (ALWAYS_BLOCK.some((re) => re.test(p))) { out.blockers.push(p); continue; }
-    if (del.some((pat) => matchesPattern(p, pat))) out.del.push(p);
-    else if (archive.some((pat) => matchesPattern(p, pat))) out.arch.push(p);
+    if (archive.some((pat) => matchesPattern(p, pat))) out.arch.push(p);
+    else if (del.some((pat) => matchesPattern(p, pat))) out.del.push(p);
     else out.blockers.push(p);
   }
   return out;
@@ -68,7 +69,9 @@ export function selectLifecycle(prs, { nowMs, minMergedHours }) {
 const glob = (pat) => new RegExp(`^${pat.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')}$`);
 export const isProtectedName = (slug, protect) => protect.some((p) => glob(p).test(slug));
 
-// signals: { locked: string|null, processes: {available, pids}, transcripts: string[], memoryNotes: string[], recentFiles: string[] }
+// signals: { locked: string|null, processes: {available, pids, hidden}, transcripts: string[], memoryNotes: string[], recentFiles: string[] }
+// `processes.hidden` (other users' processes we may not inspect) is reported, never a keep reason: every non-root user
+// sees root daemons that way, so it would keep everything. The quarantine re-inspection catches their writes (spec §2).
 export function inUseReasons(s) {
   const r = [];
   if (s.locked !== null && s.locked !== undefined) r.push(`locked (${s.locked || 'no reason given'})`);
