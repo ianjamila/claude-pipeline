@@ -140,11 +140,29 @@ export function messagesFor(facts) {
   return lines;
 }
 
-// The exact stdout of a SessionStart hook with something to say; '' (print nothing) otherwise.
-export function formatOutput(lines) {
+// The vendor-owed finding (case 4) is the one the owner can act on by just saying yes. messagesFor still returns the
+// plain finding; formatOutput adds the offer to what the owner reads and, to Claude's context only, how to act on it.
+export const VENDOR_OFFER = ' — say "open the vendor PR" and Claude opens it';
+const VENDOR_OWED = /a `pipeline vendor` PR is owed \(\d+ vendored files? differ\)$/;
+export const isVendorOwedLine = (line) => typeof line === 'string' && VENDOR_OWED.test(line);
+
+// Claude-only guidance (never in systemMessage). inst7 is the validated short sha of the installed pipeline.
+export function vendorGuidance(inst7) {
+  return 'Vendor PR owed: offer once, early in the session, to open the vendor PR for this repo. Never vendor without the owner agreeing. '
+    + 'If the owner agrees, first look for one already open in this repo (`gh pr list --state open --search "chore(pipeline): vendor in:title"`); '
+    + 'if one exists, point the owner to it (`ship resume <N>`) instead of opening a second. '
+    + `Otherwise run the ship skill with a request to refresh scripts/pipeline from the installed claude-pipeline ${inst7} with \`pipeline vendor --repo .\` on a new agent/ branch (never on the current branch).`;
+}
+
+// The exact stdout of a SessionStart hook with something to say; '' (print nothing) otherwise. With opts.installed7 and
+// a vendor-owed line among the lines, the owner's message ends with the offer and Claude's context gets the guidance.
+export function formatOutput(lines, opts = {}) {
   if (!lines || lines.length === 0) return '';
-  const text = lines.join('\n');
-  return `${JSON.stringify({ systemMessage: text, hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: text } })}\n`;
+  const context = lines.join('\n');
+  const offer = typeof opts?.installed7 === 'string' && opts.installed7 !== '' && lines.some(isVendorOwedLine);
+  const text = offer ? lines.map((l) => (isVendorOwedLine(l) ? `${l}${VENDOR_OFFER}` : l)).join('\n') : context;
+  const additionalContext = offer ? `${context}\n${vendorGuidance(opts.installed7)}` : context;
+  return `${JSON.stringify({ systemMessage: text, hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext } })}\n`;
 }
 
 // ---- the cache ---------------------------------------------------------------------------------------------------
@@ -301,6 +319,6 @@ export async function checkSession(opts) {
   try {
     const facts = await gatherFacts(opts);
     // an identity read that threw is a bug in this check, not a finding about the install
-    return facts.error && !facts.installed ? '' : formatOutput(messagesFor(facts));
+    return facts.error && !facts.installed ? '' : formatOutput(messagesFor(facts), { installed7: short(facts.installed?.sourceSha) });
   } catch { return ''; }
 }
