@@ -608,6 +608,16 @@ function rootsAndAncestors(ctx) {
   return [...out];
 }
 
+// A program word with its unmatched `${` openers made literal (a JS template split at a space: `${o?.pid`, which the shell model cannot end); a balanced `${…}` keeps its readings
+function balancedOpeners(w) {
+  const open = [];
+  for (let i = 0; i < w.length; i++) {
+    if (w[i] === '$' && w[i + 1] === '{') { open.push(i); i++; } else if (w[i] === '}') open.pop();
+  }
+  let out = w;
+  for (const i of open.reverse()) out = out.slice(0, i) + out.slice(i + 1);
+  return out;
+}
 function makeMatchers(ctx) {
   const rootRes = rootRegexes(ctx);
   const ancRes = ancestorRegexes(ctx);
@@ -616,12 +626,21 @@ function makeMatchers(ctx) {
 
   // Is a protected file named in `text`? By absolute path (in any of its spellings), by a tail with an unknown
   // prefix, or by a relative tail that lands in a protected root from one of `dirs`.
-  // (program: the text of a program in another language, where `${…}` is no shell default: readings that overflow leave the text itself to be judged)
+  // (program: the text of a program in another language, where most `${…}` are no shell defaults (JS template literals overflow the readings of the whole text):
+  // then each whitespace-free word is read on its own, as a path cannot span a space; a word whose readings overflow is still a hit)
   const rawHit = (text, dirs, program = false) => {
     if (!text) return false;
     // Why: `${V:-~/.claude}/settings.json` is the protected file whenever V is unset or empty, so every reading of a default / alternative word is judged
     const rs = paramReadings(String(text));
-    if (rs.over) return program ? rawHitOne(text, dirs) : true;
+    if (rs.over) {
+      if (!program) return true;
+      for (const w of String(text).split(/\s+/)) {
+        if (!w.includes('${')) continue;
+        const wr = paramReadings(balancedOpeners(w));
+        if (wr.over || wr.some((r) => rawHitOne(r, dirs))) return true;
+      }
+      return rawHitOne(text, dirs);
+    }
     return rawHitOne(text, dirs) || rs.some((r) => rawHitOne(r, dirs));
   };
   const rawHitOne = (text, dirs) => {

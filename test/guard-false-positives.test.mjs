@@ -405,7 +405,12 @@ test('L: a program whose template literals overflow the default readings is judg
   const JSPROG = "const ok = true;\nsay(`verify (${mode}): ${ok ? 'PASS' : `FAIL at ${failed?.name ?? '?'}`} - ${a.filter((s) => s.x === 'pass').length}/${a.length}`);\nwarn(`lock ${lockName(g)} held by ${o?.pid ?? '?'} on ${o?.host ?? '?'}`);\nfs.writeFileSync('.verify/report.json', '{}');\n";
   const run = (prog) => files('node scripts/verify.mjs --quick', fakeFs(PROJ, { 'scripts/verify.mjs': prog }, ['scripts']));
   assert.equal(run(JSPROG).decision, 'allow');
-  for (const bad of ["fs.writeFileSync('/home/u/.claude/settings.json', x)", 'fs.writeFileSync(`${HOME}/.claude/settings.json`, x)', "fs.writeFileSync(os.homedir() + '/.claude/pipeline/x', x)"]) {
+  // (one word whose own readings overflow is still a hit)
+  const many = Array.from({ length: 20 }, (_, i) => `\${V${i}:-x}`).join('');
+  assert.equal(run(`${JSPROG}execSync('cp a ${many}/home/u/.cla\${Z:-ude}/settings.json')\n`).decision, 'deny');
+  for (const bad of ["fs.writeFileSync('/home/u/.claude/settings.json', x)", 'fs.writeFileSync(`${HOME}/.claude/settings.json`, x)', "fs.writeFileSync(os.homedir() + '/.claude/pipeline/x', x)",
+    // (a shell default inside one word of a command the program runs: its readings are still judged, word by word)
+    "execSync('cat x > ${X:-/home/u/.cla}ude/settings.json')", "execSync(`cp a ${A:-~/.c}${B:-laude}/settings.json`)", "execSync('cat x > ${X:-/home/u/.cla}ude/settings.json${')"]) {
     assert.equal(run(`${JSPROG}${bad}\n`).decision, 'deny', bad);
   }
 });
