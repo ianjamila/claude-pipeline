@@ -308,10 +308,39 @@ function recentTranscriptMentions(file, paths) {
   }
 }
 
-// Paths of Claude transcripts (*.jsonl) modified at or after sinceMs with a line showing a session working in one of
-// `paths` (lineShowsWork), or that cannot be read. Paths only: a branch name also appears in every PR list.
+// Every spelling of a path a session may have logged: the path itself, its realpath, and the realpath reached through a
+// symlink sitting in one of its ancestor directories (this PC: ~/Claude -> ~/projects; git records the real path, a
+// session started under the alias logs the alias). One alias level; any entry that cannot be read is simply skipped.
+export function pathSpellings(p) {
+  const out = [p];
+  let real;
+  try {
+    real = realpathSync(p);
+  } catch {
+    return out;
+  }
+  out.push(real);
+  for (let dir = path.dirname(real); ; dir = path.dirname(dir)) {
+    let entries = [];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true }).filter((e) => e.isSymbolicLink());
+    } catch { /* unreadable: no alias from here */ }
+    for (const e of entries) {
+      try {
+        const target = realpathSync(path.join(dir, e.name));
+        if (target !== real && isInside(real, target)) out.push(path.join(dir, e.name, path.relative(target, real)));
+      } catch { /* dangling or looping link */ }
+    }
+    if (path.dirname(dir) === dir) break;
+  }
+  return [...new Set(out)];
+}
+
+// Paths of Claude transcripts (*.jsonl) modified at or after sinceMs with a line showing a session working in `paths`,
+// under any of their spellings (lineShowsWork, pathSpellings), or that cannot be read. Paths only: a branch name also appears
+// in every PR list.
 export function transcriptMentions(paths, { dirs, sinceMs }) {
-  const wanted = paths.filter(Boolean);
+  const wanted = [...new Set(paths.filter(Boolean).flatMap(pathSpellings))];
   if (!wanted.length) return [];
   const hits = [];
   for (const dir of dirs) {

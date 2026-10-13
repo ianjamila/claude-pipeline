@@ -258,3 +258,25 @@ test('transcriptMentions judges a JSON line that spans the 1 MiB chunk seam as o
   writeFileSync(join(t, 'proj', 'res.jsonl'), `${pad}\n${res}\n`);
   assert.deepEqual(transcriptMentions([p], { dirs: [t], sinceMs: 0 }), [join(t, 'proj', 'use.jsonl')]);
 });
+
+// A path has more than one spelling when a symlink leads into it (this PC: ~/Claude -> ~/projects). git records a worktree
+// by its real path, and a session started under the alias logs the alias spelling; either way it is the same worktree.
+test('transcriptMentions matches every spelling of the path: its realpath, and an alias through a symlinked ancestor', () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'spell-')));
+  mkdirSync(join(base, 'projects', 'repo', '.worktrees', 'agent-x'), { recursive: true });
+  symlinkSync(join(base, 'projects'), join(base, 'Claude'));
+  const real = join(base, 'projects', 'repo', '.worktrees', 'agent-x');
+  const alias = join(base, 'Claude', 'repo', '.worktrees', 'agent-x');
+  const t = mkdtempSync(join(tmpdir(), 'tr-'));
+  mkdirSync(join(t, 'proj'));
+  const file = (name, obj) => { writeFileSync(join(t, 'proj', name), `${JSON.stringify(obj)}\n`); return join(t, 'proj', name); };
+  const realCwd = file('real-cwd.jsonl', { type: 'user', cwd: join(real, 'src') });
+  const aliasUse = file('alias-use.jsonl', { type: 'assistant', cwd: base, message: { content: [{ type: 'tool_use', input: { command: `cd ${alias} && ls` } }] } });
+  const aliasCwd = file('alias-cwd.jsonl', { type: 'user', cwd: alias });
+  const listing = file('alias-result.jsonl', { type: 'user', cwd: base, message: { content: [{ type: 'tool_result', content: alias }] } });
+  const since = Date.now() - 3600e3;
+  const expected = [aliasCwd, aliasUse, realCwd].sort();
+  assert.deepEqual(transcriptMentions([real], { dirs: [t], sinceMs: since }).sort(), expected, 'registered by its real path');
+  assert.deepEqual(transcriptMentions([alias], { dirs: [t], sinceMs: since }).sort(), expected, 'registered through the alias');
+  assert.ok(!transcriptMentions([real], { dirs: [t], sinceMs: since }).includes(listing));
+}, { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' });

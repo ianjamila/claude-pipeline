@@ -129,7 +129,8 @@ pipeline worktrees holding [--purge] [--json]        # list holding batches + re
 6. **Not in use.** Not locked; no process cwd/fd inside (`/proc/*/cwd`, `/proc/*/fd`); no Claude transcript modified in
    the last `min_idle_hours` shows a session working in the worktree (`~/.claude/projects/**/*.jsonl` and
    `~/.claude-eaglewatch/projects/**/*.jsonl`, de-duplicated by realpath). A JSONL line counts only when its top-level
-   `cwd` equals or is inside the worktree path, or it carries a `tool_use` content block whose `input` names the path;
+   `cwd` equals or is inside the worktree path, or it carries a `tool_use` content block whose `input` names the path
+   (under any spelling: the path, its realpath, or an alias through a symlinked ancestor such as `~/Claude`);
    tool results and user/assistant prose do not (one `git worktree list` or `ship inbox` output names every worktree),
    and branch names are not searched (they appear in every PR list). Fail-closed: a line that names the path but is
    not a JSON object counts, and so does a recent transcript that cannot be read. No non-archived memory note
