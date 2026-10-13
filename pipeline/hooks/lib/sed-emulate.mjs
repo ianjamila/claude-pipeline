@@ -6,6 +6,11 @@
 // and a top-level alternation of literals. Refused: quantified groups, back-references in patterns, \U \L \E \u \l, the empty regex, other commands, `$name` and backticks.
 const MAX_TEXT = 256 * 1024; // (bigger files are refused: the regex work grows with them)
 const MAX_UNBOUNDED = 3; // (`.*.*.*.*x` backtracks polynomially: refused past this many unbounded quantifiers)
+// Why: a JS regex cannot be stopped once it runs, and a hook that outlasts its timeout is allowed: `s/.*a.*b.*c/x/` took 11 s on ONE line of 1,000 characters. Each
+// application of a regex is charged its worst case before it runs, L * (L+1)^u * b for a line of L characters (u: unbounded quantifiers, b: the choices the bounded
+// ones and an alternation add), and an edit whose charges pass MAX_WORK is not computed (null). Measured worst: ~3 ns per unit, so MAX_WORK is ~0.3 s.
+const MAX_WORK = 1e8;
+class TooMuchWork extends Error {}
 const MAX_INTERVAL = 255;
 const NL = '\n';
 const NON_ASCII = /[^\x00-\x7f]/;
@@ -59,10 +64,11 @@ function translate(src, ere) {
   let groups = 0;
   let depth = 0;
   let unbounded = 0;
+  let choices = 1; // (the bounded quantifiers' and the alternation's: the work factor besides the unbounded ones)
   let sens = false; // Why: what `.`, a negated bracket, a class, \w \s \b, an empty match and the I flag stand for depends on the locale (bytes or multibyte characters), JS reads UTF-16: not the same on non-ASCII text
   let atom = 'start'; // start (of a branch) | single (a quantifier may follow) | group | quant | bol | assert
   const put = (s, ch) => { js += s; atom = 'single'; if (ch === undefined) branchLiteral = false; else raw += ch; };
-  const quant = (q, isUnbounded) => { if (atom !== 'single') return false; js += q; atom = 'quant'; branchLiteral = false; if (isUnbounded) unbounded++; return true; };
+  const quant = (q, isUnbounded) => { if (atom !== 'single') return false; js += q; atom = 'quant'; branchLiteral = false; if (isUnbounded) unbounded++; if (q === '?') choices *= 2; return true; };
   const alt = () => {
     if (depth > 0 || !branchLiteral || raw === '' || groups > 0) return false;
     branches.push({ js, raw });
@@ -79,6 +85,7 @@ function translate(src, ere) {
     js += `{${lo}${m[2] ? ',' : ''}${m[2] && hi !== Infinity ? hi : ''}}`;
     atom = 'quant'; branchLiteral = false;
     if (hi === Infinity) unbounded++;
+    else choices *= hi - lo + 1;
     void open;
     return end + close.length;
   };
@@ -123,8 +130,9 @@ function translate(src, ere) {
     if (!branchLiteral || raw === '') return null;
     branches.push({ js, raw });
     js = branches.sort((a, b) => b.raw.length - a.raw.length).map((b) => b.js).join('|'); // (POSIX takes the longest of the alternatives at a place: literals, longest first)
+    choices *= branches.length;
   }
-  return { js, groups, sens };
+  return { js, groups, sens, cost: { u: unbounded, b: choices } };
 }
 
 // ---- the program ----------------------------------------------------------------------------------------------------
@@ -272,7 +280,7 @@ function compile(cmds, ere) {
     const t = translate(a.src, ere);
     if (t?.invalid) return INVALID;
     if (t !== null && (t.sens || a.icase)) sensitive = true;
-    return t === null ? false : { type: 're', re: new RegExp(t.js, a.icase ? 'i' : '') };
+    return t === null ? false : { type: 're', re: new RegExp(t.js, a.icase ? 'i' : ''), cost: t.cost };
   };
   for (const c of cmds) {
     const a1 = addr(c.a1);
@@ -292,7 +300,7 @@ function compile(cmds, ere) {
       if (gnu === null || bsd === null) return null;
       if (JSON.stringify(gnu) !== JSON.stringify(bsd)) dialectSensitive = true;
       if (t.sens || c.flags.icase || manyEmpty(t.js)) sensitive = true;
-      Object.assign(k, { re: new RegExp(t.js, c.flags.icase ? 'gi' : 'g'), repl: { gnu, bsd }, flags: c.flags });
+      Object.assign(k, { re: new RegExp(t.js, c.flags.icase ? 'gi' : 'g'), repl: { gnu, bsd }, flags: c.flags, cost: t.cost });
     }
     out.push(k);
   }
@@ -301,22 +309,28 @@ function compile(cmds, ere) {
 
 // ---- run ------------------------------------------------------------------------------------------------------------
 
-const test = (a, ps, ln, last) => (a.type === 'line' ? ln === a.n : a.type === 'last' ? last : a.re.test(ps));
-function selected(c, st, ps, ln, last) {
+// one application of a regex to a line of `len` characters: its worst case is added to `work` first, and past MAX_WORK it does not run
+function charge(work, cost, len) {
+  work.n += 1 + len * (len + 1) ** cost.u * cost.b;
+  if (work.n > MAX_WORK) throw new TooMuchWork();
+}
+const test = (a, ps, ln, last, work) => (a.type === 'line' ? ln === a.n : a.type === 'last' ? last : (charge(work, a.cost, ps.length), a.re.test(ps)));
+function selected(c, st, ps, ln, last, work) {
   let m;
   if (!c.a1) m = true;
-  else if (!c.a2) m = test(c.a1, ps, ln, last);
+  else if (!c.a2) m = test(c.a1, ps, ln, last, work);
   else if (!st.active) {
-    m = test(c.a1, ps, ln, last);
+    m = test(c.a1, ps, ln, last, work);
     if (m) st.active = c.a2.type === 'line' ? c.a2.n > ln : c.a2.type === 'last' ? !last : true; // (a number at or before this line: just this line)
   } else {
     m = true;
-    if (c.a2.type === 'line' ? ln >= c.a2.n : c.a2.type === 'last' ? last : test(c.a2, ps, ln, last)) st.active = false;
+    if (c.a2.type === 'line' ? ln >= c.a2.n : c.a2.type === 'last' ? last : test(c.a2, ps, ln, last, work)) st.active = false;
   }
   return c.neg ? !m : m;
 }
 // s///: GNU's rules for an empty match (not right after the previous match) and for the Nth / Nth-and-later matches; null: nothing replaced
-function substitute(ps, c, dialect) {
+function substitute(ps, c, dialect, work) {
+  charge(work, c.cost, ps.length); // (the searches of one line together scan it once)
   const { re, flags } = c;
   const parts = c.repl[dialect];
   let out = '';
@@ -344,7 +358,16 @@ function substitute(ps, c, dialect) {
   }
   return did ? out + ps.slice(copied) : null;
 }
-function execute(r, quiet, text, dialect, qFull) {
+// the lines the program leaves, or null when its regex work would pass MAX_WORK (`work`: { n }, shared by every run of one edit)
+function execute(r, quiet, text, dialect, qFull, work) {
+  try {
+    return run(r, quiet, text, dialect, qFull, work);
+  } catch (e) {
+    if (e instanceof TooMuchWork) return null;
+    throw e;
+  }
+}
+function run(r, quiet, text, dialect, qFull, work) {
   const lines = text === '' ? [] : text.split(NL);
   if (text.endsWith(NL)) lines.pop();
   const out = [];
@@ -355,11 +378,11 @@ function execute(r, quiet, text, dialect, qFull) {
     const last = ln === lines.length;
     let del = false;
     for (const [k, c] of r.cmds.entries()) {
-      if (!selected(c, states[k], ps, ln, last)) continue;
+      if (!selected(c, states[k], ps, ln, last, work)) continue;
       if (c.cmd === 'd') { del = true; break; }
       if (c.cmd === 'q') { quit = true; break; }
       if (c.cmd === 'p') out.push(ps);
-      else { const res = substitute(ps, c, dialect); if (res !== null) { ps = res; if (c.flags.p) out.push(ps); } }
+      else { const res = substitute(ps, c, dialect, work); if (res !== null) { ps = res; if (c.flags.p) out.push(ps); } }
     }
     if (!del && !quiet) out.push(ps);
     if (quit && qFull) out.push(...lines.slice(ln)); // (GNU -i cuts the file at q; the rest may be kept)
@@ -530,6 +553,7 @@ export function applySed({ args, word, vars = [], posix = false }, text) {
   const readings = prepare(args, new Set(vars));
   if (readings === null) return null;
   const outs = new Set();
+  const work = { n: 0 };
   for (const r of readings) {
     // a reading in which this sed does not edit in place (its -i is an -e value, or an operand) leaves the text as it is
     if (!r.inPlace) { outs.add(text); continue; }
@@ -550,8 +574,9 @@ export function applySed({ args, word, vars = [], posix = false }, text) {
     if (NON_ASCII.test(r.prog) && r.prog.includes('[')) return null;
     for (const dialect of c.dialectSensitive ? ['gnu', 'bsd'] : ['gnu']) {
       for (const qFull of c.hasQ ? [false, true] : [false]) {
-        const lines = execute(c, r.quiet, text, dialect, qFull);
-        if (many) { const again = execute(c, r.quiet, lines.length ? `${lines.join(NL)}${NL}` : '', dialect, qFull); outs.add(again.length ? `${again.join(NL)}${NL}` : ''); } // (an alias of the file among the operands)
+        const lines = execute(c, r.quiet, text, dialect, qFull, work);
+        if (lines === null) return null;
+        if (many) { const again = execute(c, r.quiet, lines.length ? `${lines.join(NL)}${NL}` : '', dialect, qFull, work); if (again === null) return null; outs.add(again.length ? `${again.join(NL)}${NL}` : ''); } // (an alias of the file among the operands)
         const body = lines.length ? lines.join(NL) : '';
         outs.add(lines.length ? `${body}${NL}` : '');
         if (lines.length && text !== '' && !text.endsWith(NL)) outs.add(body); // (the last line had no newline: GNU keeps it so, BSD adds one)

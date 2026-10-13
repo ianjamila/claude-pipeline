@@ -15,7 +15,7 @@ import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { simpleCommands } from '../pipeline/hooks/lib/shell-parse.mjs';
 import { applySed, sedReadings } from '../pipeline/hooks/lib/sed-emulate.mjs';
 import { sedPrograms } from '../pipeline/hooks/lib/line-writes.mjs';
-import { writesOf, newWriteFrame, writtenTo, printfText, flowStart, namesFile, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, decodeEscapes, sortArgsPure } from '../pipeline/hooks/lib/line-writes.mjs';
+import { piecesMatch, writesOf, newWriteFrame, writtenTo, printfText, flowStart, namesFile, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, decodeEscapes, sortArgsPure } from '../pipeline/hooks/lib/line-writes.mjs';
 
 function fakeFs(root, files, dirs = []) {
   const abs = (p) => resolve(root, p);
@@ -2055,4 +2055,51 @@ test('L5f: applySed computes only the allowlisted argv shapes; every other spell
   const gitFs = fakeFs(GIT_ROOT, { 'ok.sh': 'echo hi' }, DIRS);
   for (const l of ["POSIXLY_CORRECT=1 sed -i 's/a/b/' ok.sh; bash ok.sh", "export POSIXLY_CORRECT=1; sed -i 's/a/b/' ok.sh; bash ok.sh"]) assert.equal(git(l, gitFs).decision, 'deny', l);
   assert.equal(git("sed -i 's/a/b/' ok.sh; bash ok.sh", gitFs).decision, 'allow');
+});
+
+// ---- time: the guard's own matching never outlasts the hook ------------------------------------------------------------------
+// Why: a hook that runs past its timeout is ALLOWED by Claude Code, and a running regex cannot be stopped by the evaluation's deadline.
+
+test('time: a word with many run-time parts is matched against a path in linear steps (14 bracket globs used to backtrack for minutes)', () => {
+  // (the line from the replay that hung: the sed program, a word starting with `/`, is a path pattern with one part per bracket)
+  const classes = '[Cc][Rr][Ee][Aa][Tt][Ee] [Oo][Rr] [Rr][Ee][Pp][Ll][Aa][Cc][Ee] [Ff][Uu][Nn][Cc][Tt][Ii][Oo][Nn] public.x';
+  const line = `git grep -l x -- d | sort | xargs -I{} sh -c 'grep -l -i "create or replace function public.x" {} >/dev/null && echo {}'; sed -n '/${classes}/,/\\$\\$;/p' $f | head -30`;
+  const t = Date.now();
+  const r = git(line, fakeFs(GIT_ROOT, { 'ok.sh': 'echo hi' }, DIRS));
+  assert.ok(Date.now() - t < 2000, `took ${Date.now() - t} ms`);
+  assert.equal(r.decision, 'allow', r.reason);
+  const long = `/${'a'.repeat(3000)}`;
+  const t2 = Date.now();
+  assert.equal(piecesMatch(['/', ...Array(40).fill('a'), 'b'], long, { abs: true }), false);
+  assert.ok(Date.now() - t2 < 500, `took ${Date.now() - t2} ms`);
+});
+
+test('time: piecesMatch answers as the regex it replaces did (anything between pieces; start of the path / of a name; end of the path / of a directory)', () => {
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const ref = (pieces, P, { anyLead = false, abs = true, below = false }) => {
+    const re = (anyLead ? '.*' : '') + pieces.map(esc).join('.*');
+    const end = below ? '(?:/.*)?$' : '$';
+    return new RegExp(abs || anyLead ? `^(?:[A-Za-z]:)?${re}${end}` : `(?:^|/)${re}${end}`, 's').test(P);
+  };
+  let seed = 7;
+  const rnd = (n) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
+  const ALPHA = ['a', 'b', '/', 'ab', '/a', 'C:', '.', ''];
+  const word = (k) => Array.from({ length: k }, () => ALPHA[rnd(ALPHA.length)]).join('');
+  for (let i = 0; i < 20000; i++) {
+    const pieces = Array.from({ length: 1 + rnd(4) }, () => word(rnd(3)));
+    const P = word(rnd(7));
+    const o = { anyLead: rnd(4) === 0, abs: rnd(2) === 0, below: rnd(2) === 0 };
+    assert.equal(piecesMatch(pieces, P, o), ref(pieces, P, o), `${JSON.stringify(pieces)} ${JSON.stringify(P)} ${JSON.stringify(o)}`);
+  }
+});
+
+test('time: applySed refuses (null) a program whose regex work on the text could outlast the hook; ordinary edits are still computed', () => {
+  const line = `${'ab'.repeat(500)}\n`;
+  for (const prog of ['s/.*a.*b.*c/x/', '/.*a.*b.*c/d', 's/[ab]*[ab]*[ab]*c/x/', 's/[ab]\\{0,255\\}[ab]\\{0,255\\}c/x/']) {
+    const t = Date.now();
+    assert.equal(applySed({ args: ['-i', prog, 'f'], word: 'f' }, line.repeat(4)), null, prog);
+    assert.ok(Date.now() - t < 500, `${prog} took ${Date.now() - t} ms`);
+  }
+  const file = Array.from({ length: 2000 }, (_, i) => `const v${i} = foo(${i}); // ${'x'.repeat(40)} bar`).join('\n') + '\n';
+  for (const prog of ['s/foo.*bar/x/', 's/foo/x/g', '/v1[0-9]*/d', 's/^const //']) assert.notEqual(applySed({ args: ['-i', prog, 'f'], word: 'f' }, file), null, prog);
 });

@@ -1599,7 +1599,7 @@ function partAlternatives(frames, h, io, depth) {
 }
 
 // Could the word, with its run-time parts ($VAR, $(...), globs, {a,b}) replaced by anything, name P? A relative word may be anywhere (its directory is unknown).
-// (the pattern a word stands for depends on the word alone: true = anything, a RegExp, or null when it cannot be built; built once, not once per name asked)
+// (the pattern a word stands for depends on the word alone: true = anything, or a matcher ({ test(P) }); built once, not once per name asked)
 const DYNAMIC_PATTERNS = new Map();
 function dynamicMayBe(f, word, P, below = false) {
   const key = `${f.ci ? 1 : 0}${below ? 1 : 0}${word}`;
@@ -1609,7 +1609,7 @@ function dynamicMayBe(f, word, P, below = false) {
     if (DYNAMIC_PATTERNS.size > 20_000) DYNAMIC_PATTERNS.clear();
     DYNAMIC_PATTERNS.set(key, pat);
   }
-  return pat === true || pat === null || pat.test(P.replace(/\\/g, '/'));
+  return pat === true || pat.test(P.replace(/\\/g, '/'));
 }
 function dynamicPattern(f, word, below) {
   // Why: a leading tilde prefix is not a name: ~+ is the command's directory (the rest is then a relative word), ~- the previous directory and ~user a home are unknown (anywhere, absolute)
@@ -1625,14 +1625,37 @@ function dynamicPattern(f, word, below) {
   w = (/^[\\/]/.test(w) ? '/' : '') + segs.join('/');
   if (w === '' || w === '/') return true;
   const parts = w.split(/(\$\{[^}]*\}|\$\([^)]*\)|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@*#?!$-]|`[^`]*`|\[[^\]]*\]|\{[^}]*\}|[*?])/);
-  const re = lead + parts.map((s, i) => (i % 2 ? '.*' : s.replace(/[.+^|()\\]/g, '\\$&').replace(/[\[\]{}$]/g, '\\$&'))).join('');
   const abs = lead !== '' || /^\//.test(parts[0] ?? '') || /^[A-Za-z]:/.test(parts[0] ?? '');
-  try {
-    const end = below ? '(?:[\\\\/].*)?$' : '$';
-    return new RegExp(abs ? `^(?:[A-Za-z]:)?${re}${end}` : `(?:^|[\\\\/])${re}${end}`, f.ci ? 'is' : 's');
-  } catch {
-    return null; // a pattern we cannot build: it may be
+  // the literal pieces, with anything at all between two of them (and before the first after a `~user`)
+  const fold = (s) => (f.ci ? s.toLowerCase() : s);
+  const pieces = parts.filter((_, i) => i % 2 === 0).map(fold);
+  return { test: (P) => piecesMatch(pieces, fold(P), { anyLead: lead !== '', abs, below }) };
+}
+
+// Why: as a regex (`^/x.*.*.* .*.*public\.x$`, one `.*` per run-time part) a word with many parts backtracked for minutes against a path that did not match (a sed
+// program of `[Cc][Rr]...` classes on a line with a guarded word): past the hook's timeout, which Claude Code allows. The same question in linear steps: the
+// pieces are found left to right, each at its first place after the one before (the earliest place leaves the most room for the rest), the last one where
+// the path ends (or a directory of it does, `below`). P uses `/` only.
+// anyLead: anything may come before the first piece; abs: the first piece starts the path (after a drive `C:`); else it starts the path or a name in it.
+export function piecesMatch(pieces, P, { anyLead = false, abs = true, below = false }) {
+  const first = pieces[0];
+  const last = pieces[pieces.length - 1];
+  const startsAt = (s) => P.startsWith(first, s) && (anyLead || (abs ? s === 0 || (s === 2 && /^[A-Za-z]:/.test(P)) : s === 0 || P[s - 1] === '/'));
+  const endsAt = (e) => e === P.length || (below && P[e] === '/');
+  if (pieces.length === 1) {
+    for (let s = 0; s + first.length <= P.length; s++) if (startsAt(s) && endsAt(s + first.length)) return true;
+    return false;
   }
+  let pos = -1;
+  for (let s = 0; s + first.length <= P.length; s++) if (startsAt(s)) { pos = s + first.length; break; }
+  if (pos < 0) return false;
+  for (let k = 1; k < pieces.length - 1; k++) {
+    const at = P.indexOf(pieces[k], pos);
+    if (at < 0) return false;
+    pos = at + pieces[k].length;
+  }
+  for (let at = P.indexOf(last, pos); at >= 0; at = P.indexOf(last, at + 1)) if (endsAt(at + last.length)) return true;
+  return false;
 }
 
 const MAX_CHAIN = 24; // a file copied from a file copied from a file ... (longer: refused, see `cut`)
