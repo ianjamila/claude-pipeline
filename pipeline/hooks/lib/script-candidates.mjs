@@ -65,6 +65,48 @@ export function paramReadings(word) {
   return Object.defineProperty(list, 'over', { value: over, enumerable: false });
 }
 
+// Why: `bash ${A:--c ./ev.sh}` / `bash ${A:--s} < ev.sh`: a default word in an OPTION position makes the shell read `-c ./ev.sh` or `-s` when A is unset, which no candidate word shows. The command is read again
+// with each `${X:-w}` / `${X=w}` / `${X:+w}` replaced by its value (left as `${X}`), w and nothing, as bash does (w split into words) and as zsh does (w one word: wrapped in double quotes), and
+// every such line is judged like a literal one. `over`: a reading that cannot be built exactly (a quote, backslash, backtick or `$(` near an expansion, an unclosed brace, more than MAX_READINGS lines).
+// An occurrence inside single quotes is no expansion and is left alone.
+export function spliceLines(raw) {
+  const text = String(raw ?? '');
+  let over = false;
+  const walk = (s, wrap) => {
+    let acc = [''];
+    let q = '';
+    const lit = (t) => { acc = acc.map((a) => a + t); };
+    for (let i = 0; i < s.length;) {
+      const c = s[i];
+      if (c === '\\' && q !== "'") { lit(s.slice(i, i + 2)); i += 2; continue; }
+      if (q === "'") { if (c === "'") q = ''; lit(c); i++; continue; }
+      if (c === "'") { q = "'"; lit(c); i++; continue; }
+      if (c === '"') { q = q === '"' ? '' : '"'; lit(c); i++; continue; }
+      if (c === '`' || (c === '$' && (s[i + 1] === '(' || s[i + 1] === "'"))) { over = true; lit(c); i++; continue; }
+      const m = c === '$' ? PARAM_OPEN.exec(s.slice(i, i + 80)) : null;
+      if (!m || m.index !== 0) { lit(c); i++; continue; }
+      let depth = 1;
+      let j = i + m[0].length;
+      for (; j < s.length && depth; j++) { if (s[j] === '{') depth++; else if (s[j] === '}') depth--; }
+      const body = depth ? '' : s.slice(i + m[0].length, j - 1);
+      if (depth || /['"`\\]/.test(body) || body.includes('$(')) { over = true; lit(s.slice(i)); break; }
+      const own = `\${${m[1]}}`;
+      const inner = walk(body, false);
+      const alts = m[3] === '+' ? [...inner, ''] : m[3] === '?' ? [own] : [own, ...inner, ''];
+      const words = alts.map((x) => (wrap && q === '' && x !== '' && x !== own ? `"${x}"` : x));
+      const next = [];
+      for (const a of acc) for (const w of words) next.push(a + w);
+      if (next.length > MAX_READINGS) over = true;
+      acc = next.slice(0, MAX_READINGS);
+      i = j;
+    }
+    return acc;
+  };
+  const lines = new Set([...walk(text, false), ...walk(text, true)]);
+  lines.delete(text);
+  return { lines: [...lines], over };
+}
+
 // The command lines a program named by a variable or a default word may run, with its arguments (`G=bash; $G ev.sh`, `"${X:-bash}" ev.sh`): the policies judge each as text one level
 // deeper. A single-word reading holding a `/` is a path: the candidate list judges the file as a script.
 const quoteWord = (w) => (/^[\w@%+=:,./-]+$/.test(w) ? w : `"${w.replace(/[\\"`]/g, '\\$&')}"`);

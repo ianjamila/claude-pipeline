@@ -18,9 +18,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
-import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch } from './shell-parse.mjs';
+import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
-import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit, execLinesOf, paramReadings, assigningDefaults } from './script-candidates.mjs';
+import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit, execLinesOf, paramReadings, assigningDefaults, spliceLines } from './script-candidates.mjs';
 
 const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
@@ -1623,6 +1623,20 @@ function judgeWrittenScript(w, sf, abs, dir, ctx, opts, scanRaw) {
   return null;
 }
 
+// Why: `bash ${A:--c ./ev.sh}`: a default word in an option position of a shell or interpreter is read again as each reading of it (see spliceLines); the line each makes is judged like a literal one
+function judgeSplices(c, dirs, ctx, opts) {
+  const r = spliceLines(spliceText(c));
+  if (r.over) return deny('a default or alternative word (${X:-w}) in this command may be an option, and its readings cannot be worked out exactly (a quote, backslash, backtick or $( ) near it, or too many), so what the command runs cannot be checked; write the options literally');
+  for (const line of r.lines) {
+    if ((opts._depth ?? 0) >= 4) return deny('a default word in an option position is nested too deeply to check');
+    for (const d of dirs) {
+      const v = evaluateBashForFiles(line, { ...opts, cwd: d, _assigned: ctx.assigned, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) } });
+      if (v.decision === 'deny') return deny(`a default word in this command may be an option; read as \`${line}\` it would run: ${v.reason}`);
+    }
+  }
+  return null;
+}
+
 // A word before the script expands at run time (`X=+n; bash $X w.sh`, `bash $(..) w.sh`, `source $X`, `bash *.sh`), so which
 // word the shell runs is unknown. Judge every word that could be it (see script-candidates.mjs) like a named script. A
 // word that is still unknown (`$UNSET`) cannot be judged: the textual rules still apply, and the line is denied when it
@@ -2158,6 +2172,7 @@ function evaluateBashForFilesFrame(command, opts) {
         for (const k of Object.keys(c.env ?? {})) if ((ctx.unknownVars.has(k) || ctx.pickUnknown.has(k) || ctx.srcTouched.has(k)) && !/[$`]/.test(c.env[k]) && !ctx.declared?.unknown.has(k)) { ctx.unknownVars.delete(k); ctx.pickUnknown.delete(k); ctx.srcChanged.delete(k); ctx.vars[k] = applyTransform(expandRefs(c.env[k], ctx), ctx.declared?.transform.get(k) ?? null); }
       }
       markBound(c);
+      if (splicesOptions(c.argv)) { const v = judgeSplices(c, sdirsNow(), ctx, withLineVars(opts, c)); if (v) return v; }
       const sf = scriptFileOf(c.argv, c.raw, raw);
       const withPath = (rec) => { if (sourcePathSearch(rec, c.argv, cmds)) { rec.ambiguous = true; rec.words ??= [rec.file]; rec.pathSearch = true; } if (rec.words?.some(isEqualsWord) || rec.pathSearch) rec.pathValues = pathValuesOf(c, cmds, { env: startupEnv, inherited: inheritedStartup }); return rec; }; // (zsh `=tool`: the PATH directories to look in)
       if (sf) withPath(sf);
