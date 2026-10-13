@@ -884,9 +884,10 @@ function modelledCd(t, cmds, idx, ctx) {
         // (a worktree key anywhere, or an include of another file, anywhere in the repo's, the user's or the XDG config: the root may be elsewhere)
         const xdg = ctx.env.XDG_CONFIG_HOME && isAbs(toPosix(ctx.env.XDG_CONFIG_HOME)) ? toPosix(ctx.env.XDG_CONFIG_HOME) : posix.join(ctx.homePosix, '.config');
         const users = [posix.join(ctx.homePosix, '.gitconfig'), posix.join(xdg, 'git/config')];
-        const texts = configs.map((q) => ctx.readText(q));
+        // (the per-worktree file `config.worktree` is read when extensions.worktreeConfig is on: its core.worktree moves the root too)
+        const texts = [...configs, posix.join(gitdir, 'config.worktree')].filter((q, qi) => qi < configs.length || ctx.api.existsSync(q)).map((q) => ctx.readText(q));
         for (const q of users) if (ctx.api.existsSync(q)) texts.push(ctx.readText(q));
-        if (texts.some((x) => typeof x !== 'string') || texts.some((x) => /worktree\s*=/i.test(x) || /^\s*\[\s*include/mi.test(x))) return null;
+        if (texts.some((x) => typeof x !== 'string') || texts.some((x) => /worktree/i.test(x) || /^\s*\[\s*include/mi.test(x))) return null;
         return posix.normalize(posix.join(d, sub(m[1])));
       }
       const up = posix.dirname(d);

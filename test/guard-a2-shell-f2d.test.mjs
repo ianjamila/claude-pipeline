@@ -136,3 +136,16 @@ test('F2c 77: the script\'s own directory (a relative dirname) is unknown while 
   assert.equal(run('bash scripts/run').decision, 'allow');
   assert.equal(run(`${cp} bash /home/u/proj/scripts/run`).decision, 'allow'); // (an absolute $0 has an absolute dirname: no CDPATH lookup)
 });
+
+// Why (item 78): the repo root `git rev-parse --show-toplevel` prints can move with core.worktree, also from `$GIT_DIR/config.worktree` (extensions.worktreeConfig) and in any spelling of the key.
+test('F2c 78: the repo root is unknown when any git config the walk reads mentions a worktree', () => {
+  const root = (extra) => fakeFs(PROJ, { ...BASE, '.git/config': '[core]\n\trepositoryformatversion = 1\n', ...extra }, ['.git']);
+  const run = (fs, c) => evaluateBashForFiles(c, { home: '/home/u', env: {}, platform: 'linux', realpath: (p) => p, cwd: PROJ, ...fs, existsSync: fs.pathExists });
+  const c = 'cd "$(git rev-parse --show-toplevel)"; echo x > settings.json';
+  // the root is the project itself (settings.json there is not protected): known
+  assert.equal(run(root({}), c).decision, 'allow');
+  // core.worktree in the shared config, in config.worktree, and the key spelled with a space or in a section form: the root is elsewhere
+  for (const extra of [{ '.git/config': '[core]\n\tworktree = /home/u/.cla' + 'ude\n' }, { '.git/config.worktree': '[core]\n\tworktree = /home/u/.cla' + 'ude\n' }, { '.git/config': '[core "x"]\n\tWorkTree=/home/u/.cla' + 'ude\n' }, { '.git/config': '[extensions]\n\tworktreeConfig = true\n' }]) {
+    assert.equal(run(root(extra), c).decision, 'deny', JSON.stringify(extra));
+  }
+});
