@@ -58,12 +58,12 @@ export async function loadRepo(values, ctx) {
   };
 }
 
-// One run per repository at a time; a second one answers "already running" instead of waiting.
-async function withRunLock(commonDir, env, fn) {
+// One run per repository at a time; a second one answers `busy()` ("already running") instead of waiting.
+async function withRunLock(commonDir, env, fn, busy) {
   try {
     return await withLock(lockNameFor(commonDir), fn, { dir: env.PIPELINE_LOCK_DIR || undefined, waitMs: 0 });
   } catch (err) {
-    if (err instanceof LockTimeoutError) return { exitCode: EXIT.OK, output: { ok: true, skipped: 'already running' } };
+    if (err instanceof LockTimeoutError) return busy();
     throw err;
   }
 }
@@ -131,7 +131,7 @@ function evaluate(c, { root, gh, w, nowMs, transcriptDirs, procs = processesInsi
   const busy = inUseReasons({
     locked: null,
     processes,
-    transcripts: transcriptMentions([c.path, c.branch], { dirs: transcriptDirs, sinceMs }),
+    transcripts: transcriptMentions([c.path], { dirs: transcriptDirs, sinceMs }),
     memoryNotes: memoryMentions({ slug: c.slug, branch: c.branch }, { dirs: w.memory_dirs }),
     recentFiles: recentFiles(walk, { sinceMs, ignore: [...w.delete, ...w.archive] }),
   });
@@ -153,7 +153,7 @@ function settleMs(env) {
 
 async function evaluateCandidates(repo, { gh, mode, dryRun, env, runId, runStartMs, deps = {} }) {
   const { root, w, worktreeDir } = repo;
-  const { candidates, skipped } = listCandidates(root, { worktreeDir, protect: w.protect });
+  const { candidates, skipped } = listCandidates(root, { worktreeDir, protect: w.protect, nowMs: runStartMs });
   const kept = skipped.map(({ slug, reason }) => ({ slug, reason }));
   const removed = [];
   const wouldRemove = [];
@@ -274,6 +274,9 @@ export function formatBytes(n) {
 // "open PR #2 on this branch" -> "open PR on this branch"; "PR data incomplete: HTTP 502" -> "PR data incomplete".
 const reasonGroup = (reason) => String(reason).split(/[:(;]/)[0].replace(/\s*#\d+/g, '').trim() || 'other';
 
+const summaryHead = ({ name, mode, dryRun }) => `worktrees prune (${name}, ${mode} mode${dryRun ? ', dry run' : ''})`;
+const restoredPart = (restored) => `restored ${restored.filter((r) => r.restored).length} of ${restored.length} leftover quarantine${restored.length === 1 ? '' : 's'}`;
+
 // spec §7: the one-line report (also the push text and the log line).
 export function summaryLine({ name, mode, dryRun, removed, wouldRemove, kept, hiddenProcesses = 0, restored, outside, holding }) {
   const list = (xs) => xs.map((x) => `${x.slug}${x.pr ? ` #${x.pr}` : ''}`).join(', ');
@@ -286,11 +289,16 @@ export function summaryLine({ name, mode, dryRun, removed, wouldRemove, kept, hi
   const grouped = [...groups].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).map(([g, n]) => `${n} ${g}`).join(', ');
   parts.push(`kept ${kept.length}${grouped ? `: ${grouped}` : ''}`);
   if (hiddenProcesses) parts.push(`${hiddenProcesses} process${hiddenProcesses === 1 ? '' : 'es'} could not be inspected (other users)`);
-  const back = restored.filter((r) => r.restored).length;
-  if (restored.length) parts.push(`restored ${back} of ${restored.length} leftover quarantine${restored.length === 1 ? '' : 's'}`);
+  if (restored.length) parts.push(restoredPart(restored));
   parts.push(`outside worktrees: ${outside.length} item${outside.length === 1 ? '' : 's'} (report only)`);
   parts.push(`holding: ${holding.batches.length} batch${holding.batches.length === 1 ? '' : 'es'}${holding.purged.length ? `, purged ${holding.purged.length}` : ''}`);
-  return `worktrees prune (${name}, ${mode} mode${dryRun ? ', dry run' : ''}): ${parts.join(' · ')}`;
+  return `${summaryHead({ name, mode, dryRun })}: ${parts.join(' · ')}`;
+}
+
+// The one line for a run that evaluated nothing: skipped (already running, git busy) or disabled (off mode).
+export function shortSummary({ name, mode, dryRun, skipped, restored = [] }) {
+  const what = skipped ? `skipped — ${skipped}` : 'disabled';
+  return `${summaryHead({ name, mode, dryRun })}: ${what}${restored.length ? ` · ${restoredPart(restored)}` : ''}`;
 }
 
 // <PIPELINE_PRUNE_LOG_DIR or ~/.local/state/pipeline>/prune-<slug>.log, the last LOG_LINES runs. -> the file, or null.
@@ -309,6 +317,17 @@ function appendLog(env, slug, line) {
   lines.push(line);
   writeFileSync(file, `${lines.slice(-LOG_LINES).join('\n')}\n`);
   return file;
+}
+
+// A run that evaluated nothing still leaves its one log line; a failing log write is an `errors` entry, never a failure.
+function finishShort(repo, env, output) {
+  output.summary = shortSummary({ name: repo.name, ...output });
+  try {
+    output.log = appendLog(env, repo.slug, `${new Date().toISOString()} ${output.summary}`);
+  } catch (err) {
+    output.errors = [{ step: 'log', error: oneLine(err) }];
+  }
+  return { exitCode: EXIT.OK, output };
 }
 
 async function pruneLocked(repo, { mode, dryRun, notify, ctx, env }) {
@@ -361,13 +380,22 @@ export async function prune(values, ctx) {
   const repo = await loadRepo(values, ctx);
   const mode = repo.w.mode;
   const dryRun = values['dry-run'] === true;
+  // Every completed invocation logs one line: the skips and off mode here, a full run in pruneLocked.
   return withRunLock(repo.commonDir, env, async () => {
     // spec §4 rule 7: git is busy => no evaluation and no move at all, not even restoring a leftover quarantine.
-    if (gitBusy(repo.commonDir)) return { exitCode: EXIT.OK, output: { ok: true, mode, dryRun, skipped: 'git operation in progress' } };
+    if (gitBusy(repo.commonDir)) return finishShort(repo, env, { ok: true, mode, dryRun, skipped: 'git operation in progress' });
     // off: no evaluation at all; only a dead run's quarantine is undone (that is allowed in every mode).
     if (!modeAllows(mode, 'evaluate', { dryRun })) {
-      return { exitCode: EXIT.OK, output: { ok: true, mode, dryRun, disabled: true, restored: restoreLeftovers(repo.root, repo.worktreeDir) } };
+      return finishShort(repo, env, { ok: true, mode, dryRun, disabled: true, restored: restoreLeftovers(repo.root, repo.worktreeDir) });
     }
     return pruneLocked(repo, { mode, dryRun, notify: values.notify === true, ctx, env });
-  });
+  }, () => finishShort(repo, env, { ok: true, mode, dryRun, skipped: 'already running' }));
+}
+
+// --summary-only (the cron line): just `ok` and the one-line `summary`, plus `errors` when a step failed; a run that
+// failed before it had a summary keeps its error output as it is. Printed compact (`compact: true`), so the unrotated
+// cron log grows by one line per run.
+export function summaryOnly({ exitCode, output }) {
+  if (output.summary === undefined) return { exitCode, output, compact: true };
+  return { exitCode, output: { ok: output.ok, summary: output.summary, ...(output.errors?.length ? { errors: output.errors } : {}) }, compact: true };
 }

@@ -1,14 +1,14 @@
 // Fact gathering for `pipeline worktrees` (spec docs/specs/2026-10-13-worktree-prune-design.md §4): which worktrees are
 // candidates, what is inside them, whether their commits are in the merged PR, and every "someone is using this" signal.
 // Reads only (git status / fetch of a temporary ref / fs / /proc); the decisions live in rules.mjs and the mutations in act.mjs.
-import { closeSync, lstatSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync } from 'node:fs';
+import { closeSync, lstatSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { GitError, NETWORK_TIMEOUT_MS, git, isAncestor, revParse } from '../git.mjs';
 import { listWorktrees } from '../local-branches.mjs';
 import { expandHome, isInside, samePath } from '../paths.mjs';
 import { gitCommonDir, repoRoot } from '../repo.mjs';
-import { isProtectedName, matchesPattern } from './rules.mjs';
+import { KEEP_PREFIX, STALE_KEEP_DAYS, isProtectedName, matchesPattern } from './rules.mjs';
 
 // Errors that mean "that entry is not readable / not there (any more)": other users' processes, a process that exited.
 const SKIPPABLE = new Set(['EACCES', 'EPERM', 'ENOENT', 'ENOTDIR', 'ESRCH']);
@@ -29,9 +29,35 @@ export function resolveCanonicalRoot(dir) {
   return { root, commonDir };
 }
 
+const DAY_MS = 86400e3;
+
+// The worktree's admin dir (<commonDir>/worktrees/<id>), read from the `gitdir:` line of its `.git` file: the id is not
+// always the slug (git suffixes it when two worktrees share a basename). null when the file cannot be read or parsed.
+function adminDirOf(wtPath) {
+  const text = tolerant(() => readFileSync(path.join(wtPath, '.git'), 'utf8'), null);
+  const m = text === null ? null : /^gitdir:[ \t]*(.+?)\s*$/m.exec(text);
+  return m ? path.resolve(wtPath, m[1]) : null;
+}
+
+// spec §5: a pipeline-keep lock whose `locked` file is older than STALE_KEEP_DAYS -> "stale keep (<N>d: <reason>) — still
+// needed?". Anything else (another owner's lock, a fresh keep, an age that cannot be read) -> "locked (<reason>)". Never
+// releases a lock.
+function lockedReason(entry, nowMs) {
+  const plain = `locked (${entry.locked || 'no reason given'})`;
+  if (!entry.locked.startsWith(KEEP_PREFIX)) return plain;
+  const admin = adminDirOf(entry.path);
+  const st = admin === null ? null : tolerant(() => statSync(path.join(admin, 'locked')), null);
+  if (!st) return plain;
+  const ageMs = nowMs - st.mtimeMs;
+  if (ageMs <= STALE_KEEP_DAYS * DAY_MS) return plain;
+  const days = Math.floor(ageMs / DAY_MS);
+  const why = entry.locked.slice(KEEP_PREFIX.length).trim() || 'no reason given';
+  return `stale keep (${days}d: ${why}) — still needed?`;
+}
+
 // Direct children of <root>/<worktreeDir> only. Dot-named children (the quarantine dir, dotfiles) are ignored silently;
 // every other worktree that is not a candidate is reported with the reason it was skipped.
-export function listCandidates(root, { worktreeDir, protect }) {
+export function listCandidates(root, { worktreeDir, protect, nowMs = Date.now() }) {
   const wtDir = path.join(root, worktreeDir);
   const candidates = [];
   const skipped = [];
@@ -43,7 +69,7 @@ export function listCandidates(root, { worktreeDir, protect }) {
     if (isProtectedName(slug, protect)) skip('protected');
     else if (entry.prunable) skip('prunable (directory missing)');
     else if (entry.detached || !entry.branch) skip('detached HEAD');
-    else if (entry.locked !== null) skip(`locked (${entry.locked || 'no reason given'})`);
+    else if (entry.locked !== null) skip(lockedReason(entry, nowMs));
     else candidates.push({ slug, path: entry.path, branch: entry.branch, head: entry.head, locked: null });
   }
   return { candidates, skipped };
@@ -202,19 +228,68 @@ function transcriptFiles(dir) {
   return files;
 }
 
-// 1 MiB chunks; the last (longest needle - 1) bytes of each chunk are prepended to the next so a needle cannot hide on a seam.
-function fileContainsAny(file, needles) {
+// Does one transcript line show a session working in a worktree? Its top-level `cwd` equals or is inside one of `paths`, or
+// it carries a `tool_use` content block whose input names one. Tool results, user and assistant prose do not count: one
+// `git worktree list` or `ship inbox` output names every worktree. A line that is not a JSON object counts (fail-closed).
+export function lineShowsWork(text, paths) {
+  let obj;
+  try {
+    obj = JSON.parse(text);
+  } catch {
+    return true;
+  }
+  if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) return true;
+  if (typeof obj.cwd === 'string' && paths.some((p) => isInside(obj.cwd, p))) return true;
+  // JSON.stringify escapes a backslash, so a Windows path is looked for in its escaped form.
+  const escaped = paths.map((p) => JSON.stringify(p).slice(1, -1));
+  const blocks = [obj.message?.content, obj.content].filter(Array.isArray).flat();
+  return blocks.some((b) => b?.type === 'tool_use' && escaped.some((e) => (JSON.stringify(b.input ?? null) ?? '').includes(e)));
+}
+
+const CHUNK = 1 << 20;
+const LINE_CAP = 64 << 20; // a longer line that holds a needle is not parsed: it counts (fail-closed)
+
+// Reads the file in 1 MiB chunks and parses only the lines that contain a needle (a path, raw or JSON-escaped). A line is
+// gathered across chunks, and the last (longest needle - 1) bytes of the line so far are searched again with the next
+// piece, so a needle cannot hide on a chunk seam.
+function fileShowsWork(file, paths) {
+  const needles = [...new Set(paths.flatMap((p) => [p, JSON.stringify(p).slice(1, -1)]))].map((n) => Buffer.from(n));
   const keep = Math.max(...needles.map((n) => n.length)) - 1;
   const fd = openSync(file, 'r');
   try {
-    const chunk = Buffer.alloc(1 << 20);
+    let parts = [];
+    let size = 0;
+    let hit = false;
     let tail = Buffer.alloc(0);
+    const lineDone = () => {
+      const works = hit && (size > LINE_CAP || lineShowsWork(Buffer.concat(parts).toString('utf8'), paths));
+      parts = [];
+      size = 0;
+      hit = false;
+      tail = Buffer.alloc(0);
+      return works;
+    };
     for (;;) {
-      const n = readSync(fd, chunk, 0, chunk.length, null);
-      if (n === 0) return false;
-      const buf = Buffer.concat([tail, chunk.subarray(0, n)]);
-      if (needles.some((needle) => buf.includes(needle))) return true;
-      tail = buf.subarray(Math.max(0, buf.length - keep));
+      const chunk = Buffer.allocUnsafe(CHUNK); // fresh each time: `parts` keeps slices of it
+      const n = readSync(fd, chunk, 0, CHUNK, null);
+      if (n === 0) return lineDone();
+      const data = chunk.subarray(0, n);
+      let start = 0;
+      while (start < n) {
+        const nl = data.indexOf(10, start);
+        const end = nl === -1 ? n : nl;
+        const piece = data.subarray(start, end);
+        if (!hit) {
+          const seam = Buffer.concat([tail, piece.subarray(0, keep)]);
+          hit = needles.some((nd) => piece.includes(nd) || seam.includes(nd));
+          tail = piece.length >= keep ? piece.subarray(piece.length - keep) : Buffer.concat([tail, piece]).subarray(-keep);
+        }
+        size += piece.length;
+        if (size <= LINE_CAP) parts.push(piece);
+        if (end === n) break;
+        if (lineDone()) return true;
+        start = end + 1;
+      }
     }
   } finally {
     closeSync(fd);
@@ -223,9 +298,9 @@ function fileContainsAny(file, needles) {
 
 // A recent transcript that cannot be read (EACCES/EPERM) might mention the worktree, so it counts as a mention
 // (fail-closed); one that vanished since the listing does not.
-function recentTranscriptMentions(file, wanted) {
+function recentTranscriptMentions(file, paths) {
   try {
-    return fileContainsAny(file, wanted);
+    return fileShowsWork(file, paths);
   } catch (err) {
     if (err?.code === 'EACCES' || err?.code === 'EPERM') return true;
     if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') return false;
@@ -233,9 +308,10 @@ function recentTranscriptMentions(file, wanted) {
   }
 }
 
-// Paths of Claude transcripts (*.jsonl) modified at or after sinceMs that mention any needle (or cannot be read).
-export function transcriptMentions(needles, { dirs, sinceMs }) {
-  const wanted = needles.filter(Boolean).map((n) => Buffer.from(n));
+// Paths of Claude transcripts (*.jsonl) modified at or after sinceMs with a line showing a session working in one of
+// `paths` (lineShowsWork), or that cannot be read. Paths only: a branch name also appears in every PR list.
+export function transcriptMentions(paths, { dirs, sinceMs }) {
+  const wanted = paths.filter(Boolean);
   if (!wanted.length) return [];
   const hits = [];
   for (const dir of dirs) {

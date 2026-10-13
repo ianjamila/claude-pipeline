@@ -3,24 +3,24 @@
 // docs/specs/2026-10-13-worktree-prune-design.md. One `worktrees.mode` setting governs every mutation: `report` (the
 // default) and `off` change nothing, `--dry-run` never changes anything; keep-locks only protect, so they work in every
 // mode. The prune flow lives in lib/worktree-prune/run.mjs. Exit 0 completed (skips are normal), 2 usage / repo / config,
-// 3 GitHub unavailable. `schedule` adds, removes or reports one nightly cron line that runs `prune --notify` (Linux only).
+// 3 GitHub unavailable. `schedule` adds, removes or reports one nightly cron line that runs `prune --notify --summary-only` (Linux only).
 import { accessSync, constants, mkdirSync, readFileSync, readlinkSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { EXIT, UsageError, parseCommandArgs } from '../lib/cli.mjs';
+import { EXIT, UsageError, errorResult, parseCommandArgs } from '../lib/cli.mjs';
 import { Fail, guarded } from '../lib/cmd-common.mjs';
 import { git } from '../lib/git.mjs';
 import { listWorktrees } from '../lib/local-branches.mjs';
 import { samePath } from '../lib/paths.mjs';
 import { run as runProc } from '../lib/proc.mjs';
 import { holdingRoot, listHolding, purgeHolding } from '../lib/worktree-prune/act.mjs';
-import { lockNameFor, modeAllows } from '../lib/worktree-prune/rules.mjs';
-import { loadRepo, prune, pruneLogDir } from '../lib/worktree-prune/run.mjs';
+import { KEEP_PREFIX, lockNameFor, modeAllows } from '../lib/worktree-prune/rules.mjs';
+import { loadRepo, prune, pruneLogDir, summaryOnly } from '../lib/worktree-prune/run.mjs';
 
 export const meta = {
   summary: 'remove finished worktrees (prune), keep one with a lock (keep / unkeep), list or purge the holding folder',
   usage: [
-    'pipeline worktrees prune [--repo DIR] [--dry-run] [--notify]   -> {ok, mode, removed:[...], wouldRemove:[...], kept:[...], hiddenProcesses, restored:[...], outside:[...], holding:{batches, purged}}',
+    'pipeline worktrees prune [--repo DIR] [--dry-run] [--notify] [--summary-only]   -> {ok, mode, removed:[...], wouldRemove:[...], kept:[...], hiddenProcesses, restored:[...], outside:[...], holding:{batches, purged}, summary, log} | --summary-only: one line {ok, summary, errors?}',
     'pipeline worktrees keep NAME [--reason TEXT] [--repo DIR]   -> {ok, slug, locked}',
     'pipeline worktrees unkeep NAME [--run ID] [--repo DIR]   -> {ok, slug, unlocked}',
     'pipeline worktrees holding [--purge] [--repo DIR]   -> {ok, batches:[...], purged:[...]}',
@@ -28,8 +28,8 @@ export const meta = {
   ].join('\n'),
 };
 
-export const KEEP_PREFIX = 'pipeline-keep:';
-const SUBS = 'prune [--dry-run] [--notify] | keep NAME [--reason TEXT] | unkeep NAME [--run ID] | holding [--purge] | schedule (--install [--at HH:MM] | --remove | --status)';
+export { KEEP_PREFIX };
+const SUBS = 'prune [--dry-run] [--notify] [--summary-only] | keep NAME [--reason TEXT] | unkeep NAME [--run ID] | holding [--purge] | schedule (--install [--at HH:MM] | --remove | --status)';
 
 // NAME is a direct child of <root>/<worktree_dir>: no separators, no dot-names (the quarantine), no control characters.
 function findWorktree(repo, positionals, sub) {
@@ -123,7 +123,7 @@ export function scheduleLine({ nodePath, binPath, root, at, lockName, pathDirs, 
   if (!m) throw new UsageError(`--at must be HH:MM (00-23:00-59), got ${JSON.stringify(at)}`);
   if ([nodePath, binPath, root, logFile, ...pathDirs].some((p) => /[\r\n]/.test(p))) throw new UsageError('schedule: a path contains a newline, which a crontab line cannot hold');
   const searchPath = [...new Set([...pathDirs, ...CRON_PATH])].join(':');
-  const command = `cd ${shellQuote(root)} && PATH=${shellQuote(searchPath)} ${bareOrQuoted(nodePath)} ${bareOrQuoted(binPath)} worktrees prune --notify >>${shellQuote(logFile)} 2>&1`;
+  const command = `cd ${shellQuote(root)} && PATH=${shellQuote(searchPath)} ${bareOrQuoted(nodePath)} ${bareOrQuoted(binPath)} worktrees prune --notify --summary-only >>${shellQuote(logFile)} 2>&1`;
   return `${m[2]} ${m[1]} * * * ${command.replace(/%/g, '\\%')} ${scheduleMarker(lockName)}`;
 }
 
@@ -261,9 +261,18 @@ async function schedule(rest, ctx) {
 export const run = guarded(async (argv, ctx) => {
   const [sub, ...rest] = argv;
   if (sub === 'prune') {
-    const { values, positionals } = parseCommandArgs(rest, { repo: { type: 'string' }, 'dry-run': { type: 'boolean' }, notify: { type: 'boolean' } });
+    const { values, positionals } = parseCommandArgs(rest, {
+      repo: { type: 'string' }, 'dry-run': { type: 'boolean' }, notify: { type: 'boolean' }, 'summary-only': { type: 'boolean' },
+    });
     if (positionals.length) throw new UsageError('worktrees prune takes no NAME');
-    return prune(values, ctx);
+    if (!values['summary-only']) return prune(values, ctx);
+    let result;
+    try {
+      result = await guarded(prune)(values, ctx);
+    } catch (err) {
+      result = errorResult(err); // GitHub unavailable (exit 3) and the like: one compact line too
+    }
+    return summaryOnly(result);
   }
   if (sub === 'keep') return keep(rest, ctx);
   if (sub === 'unkeep') return unkeep(rest, ctx);

@@ -19,6 +19,10 @@ export function modeAllows(mode, action, { dryRun = false } = {}) {
   return row[mode] === true;
 }
 
+// The reason prefix of a keep lock (`pipeline worktrees keep`); spec §5: one older than STALE_KEEP_DAYS is reported as stale.
+export const KEEP_PREFIX = 'pipeline-keep:';
+export const STALE_KEEP_DAYS = 7;
+
 export const lockNameFor = (commonDir) => `worktrees-prune-${createHash('sha256').update(commonDir).digest('hex').slice(0, 12)}`;
 
 const base = (p) => p.slice(p.lastIndexOf('/') + 1);

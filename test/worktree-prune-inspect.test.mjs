@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, writeFileSync, symlinkSync, utimesSync, mkdtempSync, realpathSync } from 'node:fs';
-import { join } from 'node:path';
+import { chmodSync, mkdirSync, readFileSync, writeFileSync, symlinkSync, utimesSync, mkdtempSync, realpathSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { resolveCanonicalRoot, listCandidates, entriesFor, walkTree, defaultTranscriptDirs, checkAncestry, processesInside, transcriptMentions, memoryMentions, recentFiles } from '../pipeline/lib/worktree-prune/inspect.mjs';
@@ -201,3 +201,60 @@ test('processesInside counts an unreadable process as hidden; a vanished one is 
     chmodSync(join(proc, '606'), 0o700);
   }
 }, { skip: (process.platform === 'win32' && 'chmod 000 is not enforced on Windows') || (process.getuid?.() === 0 && 'root can read any directory') });
+
+// spec §5: a pipeline-keep lock older than 7 days is reported as a stale keep ("still needed?"), never released. Its age
+// is the mtime of the worktree's own `locked` file, found through the `.git` file's gitdir line: a second worktree with
+// the same basename makes git suffix the admin dir's id, so guessing <commonDir>/worktrees/<slug> would read the wrong one.
+test('listCandidates: a pipeline-keep lock older than 7 days is a stale keep; a fresh one and an owner lock stay plain locked', () => {
+  const { repo, add } = world();
+  mkdirSync(join(repo.dir, 'elsewhere'));
+  repo.git(['worktree', 'add', '-q', '-b', 'decoy', join('elsewhere', 'old'), 'main']);
+  const fresh = add('fresh', 'fr');
+  const old = add('old', 'ol');
+  const owner = add('owner-old', 'oo');
+  repo.git(['worktree', 'lock', '--reason', 'pipeline-keep: ship run a', fresh]);
+  repo.git(['worktree', 'lock', '--reason', 'pipeline-keep: ship run b', old]);
+  repo.git(['worktree', 'lock', '--reason', 'owner', owner]);
+  const adminDir = (wt) => resolve(wt, /^gitdir: (.*)$/m.exec(readFileSync(join(wt, '.git'), 'utf8'))[1].trim());
+  assert.notEqual(adminDir(old), join(realpathSync(join(repo.dir, '.git')), 'worktrees', 'old'), 'the decoy took the plain id');
+  const past = (Date.now() - 8 * 86400e3) / 1000;
+  utimesSync(join(adminDir(old), 'locked'), past, past);
+  utimesSync(join(adminDir(owner), 'locked'), past, past);
+  const { skipped } = listCandidates(repo.dir, { worktreeDir: '.worktrees', protect: [] });
+  assert.deepEqual(Object.fromEntries(skipped.map((s) => [s.slug, s.reason])), {
+    fresh: 'locked (pipeline-keep: ship run a)',
+    old: 'stale keep (8d: ship run b) — still needed?',
+    'owner-old': 'locked (owner)',
+  });
+  assert.match(repo.git(['worktree', 'list', '--porcelain']), /locked pipeline-keep: ship run b/, 'never released');
+});
+
+// spec §4 rule 6: only a session WORKING in the worktree counts (its cwd, or a tool call naming the path), never a
+// listing that merely prints it (`git worktree list`, `ship inbox`) or prose about it.
+test('transcriptMentions: cwd inside or a tool_use input naming the path count; tool results and prose do not', () => {
+  const p = '/r/.worktrees/agent-x';
+  const t = mkdtempSync(join(tmpdir(), 'tr-'));
+  mkdirSync(join(t, 'proj'));
+  const file = (name, lines) => { writeFileSync(join(t, 'proj', name), lines.map((l) => (typeof l === 'string' ? l : JSON.stringify(l))).join('\n') + '\n'); return join(t, 'proj', name); };
+  const result = file('result.jsonl', [{ type: 'user', cwd: '/r', message: { content: [{ type: 'tool_result', tool_use_id: 'x', content: `${p}  abc1234 [agent/x]\n/r/.worktrees/other` }] } }]);
+  const prose = file('prose.jsonl', [{ type: 'assistant', cwd: '/r', message: { content: [{ type: 'text', text: `I will look at ${p} later` }] } }, { type: 'user', cwd: '/r', message: { content: `clean up ${p}` } }]);
+  const sibling = file('sibling.jsonl', [{ type: 'user', cwd: `${p}2`, message: { content: 'hi' } }]);
+  const toolUse = file('tool-use.jsonl', [{ type: 'user', cwd: '/r' }, { type: 'assistant', cwd: '/r', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: `cd ${p} && npm test` } }] } }]);
+  const cwd = file('cwd.jsonl', [{ type: 'user', cwd: `${p}/src`, message: { content: 'hi' } }]);
+  const garbage = file('garbage.jsonl', [{ type: 'user', cwd: '/r' }, `{"truncated": "${p}`]);
+  const hits = transcriptMentions([p], { dirs: [t], sinceMs: Date.now() - 3600e3 }).sort();
+  assert.deepEqual(hits, [cwd, garbage, toolUse].sort());
+  assert.ok(![result, prose, sibling].some((f) => hits.includes(f)));
+});
+
+test('transcriptMentions judges a JSON line that spans the 1 MiB chunk seam as one line', () => {
+  const p = '/r/.worktrees/agent-x';
+  const t = mkdtempSync(join(tmpdir(), 'tr-'));
+  mkdirSync(join(t, 'proj'));
+  const pad = JSON.stringify({ type: 'user', cwd: '/r', message: { content: 'a'.repeat((1 << 20) - 60) } });
+  const use = JSON.stringify({ type: 'assistant', cwd: '/r', message: { content: [{ type: 'tool_use', input: { command: `ls ${p}` } }] } });
+  const res = JSON.stringify({ type: 'user', cwd: '/r', message: { content: [{ type: 'tool_result', content: `ls ${p}` }] } });
+  writeFileSync(join(t, 'proj', 'use.jsonl'), `${pad}\n${use}\n`);
+  writeFileSync(join(t, 'proj', 'res.jsonl'), `${pad}\n${res}\n`);
+  assert.deepEqual(transcriptMentions([p], { dirs: [t], sinceMs: 0 }), [join(t, 'proj', 'use.jsonl')]);
+});

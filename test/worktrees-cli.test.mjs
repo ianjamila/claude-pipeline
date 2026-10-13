@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, REPO_VIEW, pipelineYml } from './helpers/fakegh-env.mjs';
 import { lockNameFor } from '../pipeline/lib/worktree-prune/rules.mjs';
+import { summaryLine } from '../pipeline/lib/worktree-prune/run.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const bin = join(here, '..', 'pipeline', 'bin', 'pipeline.mjs');
@@ -136,7 +137,7 @@ function world() {
   });
   const cli = (args, { cwd = repo.dir, extraEnv = {} } = {}) => {
     const r = spawnSync(process.execPath, [bin, 'worktrees', ...args], { cwd, env: { ...env, ...extraEnv }, encoding: 'utf8' });
-    return { code: r.status, json: r.stdout ? JSON.parse(r.stdout) : null, stderr: r.stderr };
+    return { code: r.status, json: r.stdout ? JSON.parse(r.stdout) : null, stdout: r.stdout, stderr: r.stderr };
   };
   const setMode = (mode) => repo.write('.claude/pipeline.yml', `${pipelineYml()}worktrees:\n  mode: ${mode}\n`);
   const snapshot = () => ({
@@ -283,6 +284,8 @@ test('a second concurrent run is skipped: "already running"', async () => {
     assert.equal(r.code, 0, r.stderr);
     assert.equal(r.json.skipped, 'already running');
     assert.equal(w.fake.calls().length, 0);
+    assert.equal(r.json.summary, 'worktrees prune (demo, report mode): skipped — already running');
+    assert.match(readFileSync(r.json.log, 'utf8'), / worktrees prune \(demo, report mode\): skipped — already running\n$/, 'a skip is logged too');
   } finally {
     writeFileSync(releaseFile, '');
     await new Promise((resolve) => (child.exitCode === null ? child.on('exit', resolve) : resolve()));
@@ -356,6 +359,60 @@ test('git busy (index.lock) skips the run before anything moves, off mode and it
   assert.equal(r.json.skipped, 'git operation in progress');
   assert.deepEqual(w.snapshot(), before);
   assert.ok(existsSync(join(qDir, 'open.deadrun')), 'the leftover stays put while git is busy');
+});
+
+test('summaryLine groups a stale keep apart from an ordinary lock', () => {
+  const line = summaryLine({
+    name: 'demo', mode: 'report', dryRun: false, removed: [], wouldRemove: [], restored: [], outside: [], holding: { batches: [], purged: [] },
+    kept: [
+      { slug: 'a', reason: 'stale keep (8d: ship run a) — still needed?' },
+      { slug: 'b', reason: 'locked (pipeline-keep: ship run b)' },
+      { slug: 'c', reason: 'locked (owner)' },
+    ],
+  });
+  assert.match(line, / · kept 3: 2 locked, 1 stale keep · /);
+});
+
+// Every completed invocation leaves one log line, so the nightly log shows the runs that did nothing as well.
+test('off mode and a git-busy skip are logged like any other run: one line each, with a summary', () => {
+  const w = world();
+  const logFile = join(w.dirs.logs, 'prune-acme_widgets.log');
+  w.setMode('off');
+  const off = w.cli(['prune']);
+  assert.equal(off.code, 0, off.stderr);
+  assert.equal(off.json.summary, 'worktrees prune (demo, off mode): disabled');
+  assert.equal(off.json.log, logFile);
+  w.setMode('report');
+  writeFileSync(join(w.repo.dir, '.git', 'index.lock'), '');
+  const busy = w.cli(['prune', '--dry-run']);
+  assert.equal(busy.code, 0, busy.stderr);
+  assert.equal(busy.json.summary, 'worktrees prune (demo, report mode, dry run): skipped — git operation in progress');
+  const log = readFileSync(logFile, 'utf8').trim().split('\n');
+  assert.equal(log.length, 2, log.join('\n'));
+  assert.match(log[0], /^\S+ worktrees prune \(demo, off mode\): disabled$/);
+  assert.match(log[1], /^\S+ worktrees prune \(demo, report mode, dry run\): skipped — git operation in progress$/);
+});
+
+// The cron line appends stdout to an unrotated file: --summary-only keeps that to one line per night.
+test('--summary-only prints one compact line: ok + summary, errors only when a step failed; a failure is one line too', () => {
+  const w = world();
+  const plain = w.cli(['prune', '--summary-only']);
+  assert.equal(plain.code, 0, plain.stderr);
+  assert.equal(plain.stdout.split('\n').length, 2, plain.stdout);
+  assert.deepEqual(Object.keys(plain.json), ['ok', 'summary']);
+  assert.match(plain.json.summary, /^worktrees prune \(demo, report mode\): /);
+  writeFileSync(join(w.dirs.home, 'not-a-dir'), '');
+  const failedLog = w.cli(['prune', '--summary-only'], { extraEnv: { PIPELINE_PRUNE_LOG_DIR: join(w.dirs.home, 'not-a-dir') } });
+  assert.equal(failedLog.code, 0, failedLog.stderr);
+  assert.equal(failedLog.stdout.split('\n').length, 2, failedLog.stdout);
+  assert.deepEqual(Object.keys(failedLog.json), ['ok', 'summary', 'errors']);
+  assert.deepEqual(failedLog.json.errors.map((e) => e.step), ['log']);
+  w.fake.setScript([{ match: '^repo view', code: 1, stderr: 'API rate limit exceeded' }]);
+  const down = w.cli(['prune', '--summary-only']);
+  assert.equal(down.code, 3, down.stdout);
+  assert.equal(down.stdout.split('\n').length, 2, down.stdout);
+  assert.equal(down.json.ok, false);
+  assert.equal(down.json.error, 'unavailable');
 });
 
 test('a failing step after removal (purge, log) is reported in errors; the removal record, log attempt and exit 0 survive', {
@@ -482,7 +539,7 @@ function fakeCrontab(initial = '') {
 test('scheduleLine: minute hour, cd into the root, node + bin, notify, marker last', () => {
   assert.equal(
     scheduleLine(LINE_ARGS),
-    `30 02 * * * cd '/home/u/proj' && PATH='/home/u/.nvm/bin:/usr/bin:/bin' /usr/bin/node /opt/p/pipeline/bin/pipeline.mjs worktrees prune --notify >>'/home/u/.local/state/pipeline/cron-worktrees-prune-0123456789ab.log' 2>&1 ${MARKER}`,
+    `30 02 * * * cd '/home/u/proj' && PATH='/home/u/.nvm/bin:/usr/bin:/bin' /usr/bin/node /opt/p/pipeline/bin/pipeline.mjs worktrees prune --notify --summary-only >>'/home/u/.local/state/pipeline/cron-worktrees-prune-0123456789ab.log' 2>&1 ${MARKER}`,
   );
   assert.match(scheduleLine({ ...LINE_ARGS, at: '23:05' }), /^05 23 \* \* \* /);
 });
@@ -601,7 +658,7 @@ test('schedule --install: writes the repo-keyed line (default 02:30); --status a
   assert.equal(r.exitCode, 0);
   assert.equal(r.output.ok, true);
   assert.equal(r.output.installed, true);
-  assert.equal(r.output.line, `30 02 * * * cd '${w.repo.dir}' && PATH='/usr/bin:/opt/git/bin:/opt/gh/bin:/bin' /usr/bin/node /opt/p/pipeline/bin/pipeline.mjs worktrees prune --notify >>'${join(w.logDir, `cron-${lockName}.log`)}' 2>&1 # claude-pipeline worktrees-prune ${lockName}`);
+  assert.equal(r.output.line, `30 02 * * * cd '${w.repo.dir}' && PATH='/usr/bin:/opt/git/bin:/opt/gh/bin:/bin' /usr/bin/node /opt/p/pipeline/bin/pipeline.mjs worktrees prune --notify --summary-only >>'${join(w.logDir, `cron-${lockName}.log`)}' 2>&1 # claude-pipeline worktrees-prune ${lockName}`);
   assert.equal(w.ct.box.text, `${OTHER_LINES}${r.output.line}\n`);
   const st = await w.run(['--status']);
   assert.deepEqual([st.exitCode, st.output.installed, st.output.line], [0, true, r.output.line]);
@@ -720,7 +777,7 @@ test('schedule through the CLI uses the system crontab: no crontab yet, then ins
   assert.equal(inst.json.installed, true);
   assert.equal(readFileSync(store, 'utf8'), `${inst.json.line}\n`);
   assert.ok(inst.json.line.includes(`cd '${w.repo.dir}' && PATH=`) && inst.json.line.includes(`' ${process.execPath} `), inst.json.line);
-  assert.ok(inst.json.line.includes(`${bin} worktrees prune --notify >>'${logs}/cron-`), inst.json.line);
+  assert.ok(inst.json.line.includes(`${bin} worktrees prune --notify --summary-only >>'${logs}/cron-`), inst.json.line);
   assert.ok(inst.json.line.match(/PATH='([^']*)'/)[1].split(':').includes(bin2), inst.json.line); // the stub dir is where gh (and crontab) were found
   assert.equal(cli('--status').json.installed, true);
   assert.equal(cli('--remove').json.removed, true);
