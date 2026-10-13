@@ -377,7 +377,7 @@ const LONG = ['quiet', 'silent', 'regexp-extended', 'in-place', 'expression', 's
 // run-time word where the program or an option goes): the caller treats the sed as possibly editing anything; `bad`: no program (sed stops with a usage error).
 export function readSedArgs(args, dialect) {
   const bsd = dialect === 'bsd';
-  const r = { dialect, inPlace: false, suffixes: [], scripts: [], scriptFiles: [], files: [], values: [], consumed: new Set(), opts: [], quiet: false, ere: false, stream: false, exotic: false, unknown: false, bad: false };
+  const r = { dialect, inPlace: false, suffixes: [], scripts: [], scriptFiles: [], files: [], values: [], consumed: new Set(), opts: [], quiet: false, ere: false, follow: false, stream: false, exotic: false, unknown: false, bad: false };
   const pos = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -388,11 +388,13 @@ export function readSedArgs(args, dialect) {
       const hits = LONG.filter((x) => nm !== '' && x.startsWith(nm));
       const full = LONG.includes(nm) ? nm : hits.length === 1 ? hits[0] : null;
       // Why: a --name no sed has stops with a usage error and edits nothing (not emulated); an ambiguous abbreviation (--s, --f) may be any candidate
-      if (full === null) { if (hits.length > 1) r.unknown = true; else r.exotic = true; continue; }
+      // (a long option the shell has not finished, `--$O`, may be --in-place=.sh)
+      if (full === null) { if (hits.length > 1 || dynamic(a)) r.unknown = true; else r.exotic = true; continue; }
       r.opts.push(a);
       const val = () => (eq > 0 ? a.slice(eq + 1) : (args[++i] ?? ''));
       if (full === 'quiet' || full === 'silent') r.quiet = true;
       else if (full === 'regexp-extended') r.ere = true;
+      else if (full === 'follow-symlinks') r.follow = true; // (the edit and its backup go to the link's target)
       else if (full === 'in-place') { r.inPlace = true; r.suffixes.push({ value: eq > 0 ? a.slice(eq + 1) : '', word: false }); } // (optional argument: attached only)
       else if (full === 'expression') { r.scripts.push(val()); r.consumed.add(r.scripts[r.scripts.length - 1]); }
       else if (full === 'file') { r.scriptFiles.push(val()); r.values.push(r.scriptFiles[r.scriptFiles.length - 1]); r.exotic = true; } else if (full === 'line-length') { r.values.push(val()); r.exotic = true; } else if (['posix', 'null-data', 'zero-terminated', 'help', 'version'].includes(full)) r.exotic = true;
@@ -429,8 +431,8 @@ export function readSedArgs(args, dialect) {
         else r.exotic = true; // (an option no sed has: a usage error)
       }
     } else {
-      // Why: the word that would be the program may be an option instead when the shell fills it in
-      if (!r.scripts.length && !r.scriptFiles.length && pos.length === 0 && /^[`$]/.test(a) && dynamic(a)) r.unknown = true;
+      // Why: a word the shell fills in (`$O`) may be an option (`-i`) wherever options are still read: the first operand for every reading (also after -e), any operand for GNU, which permutes
+      if (/^[`$]/.test(a) && dynamic(a)) r.unknown = true;
       if (bsd || dialect === 'posix') { pos.push(...args.slice(i)); break; }
       pos.push(a);
     }

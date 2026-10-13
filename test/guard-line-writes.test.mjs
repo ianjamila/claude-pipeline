@@ -1931,7 +1931,7 @@ test('L5d: sedReadings reads the options once per sed (GNU permuting, GNU stoppi
   assert.deepEqual(pick(['-i.a', '-i', 'p', 'g']).gnu.sufs, ['.a', '']);
   // an option that is not known, an ambiguous abbreviation, a run-time word where the program or an option goes: unknown
   for (const a of [['--s', 'p', 'g'], ['$O', 'p', 'g'], ['-n', '`echo -i`', 'p', 'g']]) for (const d of ['gnu', 'posix', 'bsd']) assert.equal(pick(a)[d].unknown, true, `${a.join(' ')} ${d}`);
-  for (const a of [['$d', 'g'], ['-n', '$p', 'g'], ['-i', '$d', 'g'], ['-e', 'p', '$F']]) for (const d of ['gnu', 'posix', 'bsd']) assert.equal(pick(a)[d].unknown, undefined, `${a.join(' ')} ${d}`);
+  for (const a of [['$d', 'g'], ['-n', '$p', 'g'], ['-i', '$d', 'g']]) for (const d of ['gnu', 'posix', 'bsd']) assert.equal(pick(a)[d].unknown, undefined, `${a.join(' ')} ${d}`);
 });
 
 test('L5d: the backup name of an in-place sed is found whichever reading makes it (-l is a BSD switch, `--` after a BSD -i SUF, a run-time BSD suffix)', () => {
@@ -1973,4 +1973,55 @@ test('L5d: the files an in-place sed edits are found whichever reading places th
   assert.equal(sedArgsUnsafe(['--indent', 'p', 'f']), false); // (no sed has it: a usage error)
   // the emulation takes the reading in which the file is not edited (-i is an -e value) as an unchanged text
   assert.deepEqual(applySed({ args: ['-e', '-i', 'f'], word: 'f' }, 'abc\n'), ['abc\n']);
+});
+
+// ---- L5e: run-time words in option position, BSD suffix with a slash, backups through links -----------------------------------
+
+test('L5e: a run-time word where an option may go (any operand for GNU, the first operand for the others, a long option) may be -i', () => {
+  // Why: `sed -n p $O f` with O=-i is an in-place edit (GNU permutes: an option may follow the program; BSD / POSIXLY_CORRECT: the first operand is where options end); `--$O` may be --in-place=.sh
+  const gitFs = fakeFs(GIT_ROOT, { 'ok.sh': 'git puX origin main', 'other.sh': 'git status' }, DIRS);
+  const filesFs = fakeFs(PROJ, { 'ok.sh': 'echo x > ~/.claude/settXings.json', 'other.sh': 'echo hi' }, DIRS);
+  for (const l of [
+    "sed -n 's/X/sh/' $O ok.sh; echo 'git push origin main'; bash ok.sh", "sed -e 's/X/sh/' $O ok.sh; echo 'git push origin main'; bash ok.sh", "sed 's/X/sh/' ok.sh $O; echo 'git push origin main'; bash ok.sh",
+    "sed --$O 's/X/sh/' ok.sh; echo 'git push origin main'; bash ok.sh", "sed --in-pl$O 's/X/sh/' ok.sh; echo 'git push origin main'; bash ok.sh", "sed -n 's/X/sh/' \"$O\" ok.sh; echo 'git push origin main'; bash ok.sh",
+    "sed -n 's/X/sh/' `echo -i` ok.sh; echo 'git push origin main'; bash ok.sh",
+  ]) {
+    assert.equal(git(l, gitFs).decision, 'deny', l);
+    assert.equal(files(l.replace('X/sh/', 'X//').replace("'git push origin main'", "~/.claude/settings.json"), filesFs).decision, 'deny', l);
+  }
+  for (const d of ['gnu', 'posix', 'bsd']) {
+    const rd = (args) => sedReadings(args).find((x) => x.dialect === d);
+    assert.equal(rd(['-e', 'p', '$F', 'f']).unknown, true, `-e p $F ${d}`);
+    assert.equal(rd(['--$O', 'p', 'f']).unknown, true, `--$O ${d}`);
+  }
+  // GNU only: a run-time word after the first operand is a file for the readings that end the options there
+  for (const d of ['posix', 'bsd']) assert.equal(sedReadings(['p', '$F', 'f']).find((x) => x.dialect === d).unknown, false, `p $F ${d}`);
+  assert.equal(sedReadings(['p', '$F', 'f']).find((x) => x.dialect === 'gnu').unknown, true);
+  // the sed's own $ addresses and a long option with a run-time VALUE are not options
+  assert.equal(sedArgsUnsafe(['-n', '$p', 'f']), false);
+  assert.equal(sedReadings(['--expression=s/$a/b/', 'f'])[0].unknown, false);
+  // twins: plain options and operands stay what they were
+  for (const l of ["sed -n 's/X/sh/p' other.sh; bash ok.sh", "sed -n '1p' other.sh ok.sh; bash ok.sh"]) {
+    assert.equal(git(l, gitFs).decision, 'allow', l);
+    assert.equal(files(l.replace('X/sh/', 'X//'), filesFs).decision, 'allow', l);
+  }
+});
+
+test('L5e: BSD -i SUF with a / in the suffix is still a backup name (file + SUF) when the other readings have the word as a file', () => {
+  // Why: `sed -i 'x/y' -e p g` is GNU: files x/y and g, no backup; BSD: backup `gx/y` (made when the directory gx exists) holding g's old text
+  const spec = { ...SPEC, g: 'bad' };
+  for (const l of ["sed -i 'x/y' -e 's/a/b/' g; bash gx/y", "sed -i 's/a/b/' p g; bash gs/a/b/", "sed -I 'x/y' -e 's/a/b/' g; bash gx/y", "sed -i 'x/y' -e 's/a/b/' g && bash gx/y"]) denyBoth(l, spec);
+  // the nearest twins: a bare -i with a lone program (BSD has no program then: nothing is edited), a backup nobody runs
+  for (const l of ["sed -i 's/x/y/' ok.sh; bash ok.sh", "sed -i 's/a/b/' -n; bash ok.sh"]) allowBoth(l, { ...SPEC });
+});
+
+test('L5e: --follow-symlinks puts the backup beside the link\'s TARGET (any abbreviation), so its place is not known', () => {
+  // Why: GNU --follow-symlinks edits the file a link names and keeps its backup as TARGET + SUF, not LINK + SUF
+  const spec = { ...SPEC, 'real/g': 'bad' };
+  for (const l of [
+    (_, mid) => `sed --follow-symlinks -i.sh 's/x/y/' link; ${mid}; bash real/g.sh`, (_, mid) => `sed --follow -i.sh 's/x/y/' link; ${mid}; bash real/g.sh`, (_, mid) => `sed --foll --in-place=.sh 's/x/y/' link; ${mid}; bash real/g.sh`,
+    (_, mid) => `ln -s real/g link; sed --follow-symlinks -i.sh 's/x/y/' link; ${mid}; bash real/g.sh`,
+  ]) denyBoth(l, spec);
+  // twins: no backup suffix, or no --follow-symlinks (the backup is LINK + SUF, which is recorded)
+  for (const l of ["sed --follow-symlinks -i 's/x/y/' ok.sh; bash ok.sh.sh", "sed --follow-symlinks -i '' 's/x/y/' ok.sh; bash ok.sh.sh"]) allowBoth(l, { ...SPEC });
 });

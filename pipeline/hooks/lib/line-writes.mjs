@@ -925,7 +925,7 @@ export const sedUnsafe = (prog) => { const r = sedScan(prog); return r.runs || r
 export const sedInPlaceArg = (a) => /^-[A-Za-z]*[iI]/.test(a) || (a.startsWith('--') && a.length > 2 && 'in-place'.startsWith(a.slice(2).split('=')[0]));
 // The backup suffixes an in-place sed may use, as { sufs, odd }, from every reading of its options (sedReadings): GNU -i[SUF] / --in-place[=SUF] (attached only), BSD -i SUF / -I SUF (the next word, whatever it is).
 // sed uses the last -i of a reading, every one is kept here. odd: a suffix that is a pattern (a * is the base name, a / names another directory) or only known at run time, or a sed no reading can place:
-// the backup may land anywhere. A BSD suffix word with a / cannot name a backup (the file name + it runs through a file), and a reading with no file operand edits nothing
+// the backup may land anywhere (--follow-symlinks too: TARGET + SUF). A BSD suffix word is file + word whatever it holds (`gx/y` when the directory gx exists), and a reading with no file operand edits nothing
 const PLAIN_SUFFIX = /^[\w.~+@%=,:-]+$/;
 export function sedBackupSuffixes(args) {
   const sufs = new Set();
@@ -935,8 +935,10 @@ export function sedBackupSuffixes(args) {
     if (!r.inPlace || r.files.length === 0) continue;
     for (const { value, word } of r.suffixes) {
       if (value === '') continue;
+      // Why: --follow-symlinks keeps the backup beside the link's TARGET (TARGET + SUF), a place the line's names do not show
+      if (r.follow) odd = true;
       if (dynamic(value)) odd = true;
-      else if (word) { if (!value.includes('/')) sufs.add(value); } else if (PLAIN_SUFFIX.test(value)) sufs.add(value);
+      else if (word || PLAIN_SUFFIX.test(value)) sufs.add(value);
       else odd = true;
     }
   }
