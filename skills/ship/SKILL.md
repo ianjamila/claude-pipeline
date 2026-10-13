@@ -145,7 +145,7 @@ comes from `P risk` on the real diff; the higher wins).
    `owner_approval: chat` they come back as `ok: true` with the violations under `ownerMerge`: restore the tests
    if you can, else keep them as owner-merge items (see **Owner-merge approval**).
 3. `gh pr edit N --body-file <file>` with the body from
-   `reference/pr-and-summary.md`: what & why, verify summary (step table + head sha), tests added,
+   `reference/pr-and-summary.md`: in plain English (first), what & why, verify summary (step table + head sha), tests added,
    screenshots, risk level + reasons, hard-stop hits (blocking, and report-only under their own heading). Keep it
    a draft (Step 5.5 readies it). End the step with `P checkpoint --pr N --step pr`.
 4. UI change ⇒ `P artifacts push --pr N --dir .verify/screenshots`

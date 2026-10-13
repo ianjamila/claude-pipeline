@@ -1,12 +1,15 @@
 # .claude/pipeline.yml — claude-pipeline onboarded to itself.
 # Every path is a hard-stop (hard_stops.paths: ["**"]): a change to the pipeline's own rules never
-# auto-merges. ship still builds, verifies and runs the review loop, then ends in needs-human for the
-# owner to approve and merge. Validate with: node pipeline/bin/pipeline.mjs config
+# auto-merges. ship still builds, verifies and runs the review loop, then stops before the merge and
+# merges only when the owner says "merge" in chat for that exact head (owner_approval: chat).
+# Validate with: node pipeline/bin/pipeline.mjs config
 version: 1
 project: claude-pipeline
 default_branch: main
 enforcement: github
 worktree_dir: .worktrees
+owner_approval: chat           # owner rule 2026-10-12: no approval labels (as in eaglewatch). Hard-stop hits become owner-merge
+                               # items; ship stops before EVERY merge and merges when the owner says "merge" for that head.
 
 verify:
   full: node scripts/verify.mjs
@@ -17,7 +20,7 @@ verify:
 
 ci:
   required_checks: ["test (ubuntu)", "test (windows)"]
-  guard_checks: false          # no pipeline-guards.yml here: every path is a hard-stop, the owner merges by hand
+  guard_checks: false          # no pipeline-guards.yml here: every path is a hard-stop; the owner's chat "merge" is the approval
   e2e_label: null
   draft_while_iterating: false
 
