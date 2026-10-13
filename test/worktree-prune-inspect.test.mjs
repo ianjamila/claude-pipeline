@@ -153,3 +153,35 @@ test('processesInside matches a worktree reached through a symlinked path', () =
   symlinkSync(real, join(proc, '303', 'cwd'));
   assert.deepEqual(processesInside(via, { procRoot: proc, platform: 'linux' }), { available: true, pids: [303] });
 }, { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' });
+
+test('processesInside ignores non-path fd targets (socket:[N], anon_inode:…) even with cwd inside the worktree', () => {
+  const proc = mkdtempSync(join(tmpdir(), 'proc-'));
+  const target = realpathSync(mkdtempSync(join(tmpdir(), 'wt-')));
+  mkdirSync(join(proc, '404', 'fd'), { recursive: true });
+  mkdirSync(join(proc, '505', 'fd'), { recursive: true });
+  symlinkSync('socket:[1]', join(proc, '404', 'fd', '3'));
+  symlinkSync('anon_inode:[eventfd]', join(proc, '404', 'fd', '4'));
+  symlinkSync('pipe:[7]', join(proc, '404', 'fd', '5'));
+  symlinkSync(`${target} (deleted)`, join(proc, '505', 'cwd'));
+  const before = process.cwd();
+  try {
+    process.chdir(target);
+    assert.deepEqual(processesInside(target, { procRoot: proc, platform: 'linux' }), { available: true, pids: [505] });
+  } finally {
+    process.chdir(before);
+  }
+}, { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' });
+
+test('transcriptMentions counts an unreadable recent transcript as a hit (fail-closed)', () => {
+  const t = mkdtempSync(join(tmpdir(), 'tr-'));
+  mkdirSync(join(t, 'proj'));
+  const locked = join(t, 'proj', 'locked.jsonl');
+  writeFileSync(locked, 'nothing relevant\n');
+  writeFileSync(join(t, 'proj', 'old-locked.jsonl'), ''); utimesSync(join(t, 'proj', 'old-locked.jsonl'), 1, 1);
+  chmodSync(locked, 0o000); chmodSync(join(t, 'proj', 'old-locked.jsonl'), 0o000);
+  try {
+    assert.deepEqual(transcriptMentions(['/r/.worktrees/agent-x'], { dirs: [t], sinceMs: Date.now() - 3600e3 }), [locked]);
+  } finally {
+    chmodSync(locked, 0o600); chmodSync(join(t, 'proj', 'old-locked.jsonl'), 0o600);
+  }
+}, { skip: (process.platform === 'win32' && 'chmod 000 is not enforced on Windows') || (process.getuid?.() === 0 && 'root can read any file') });

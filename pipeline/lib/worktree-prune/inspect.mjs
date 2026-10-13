@@ -152,7 +152,13 @@ export function processesInside(dir, { procRoot = '/proc', platform = process.pl
   }
   // /proc reports resolved paths, so a worktree reached through a symlinked parent must also be matched by its realpath.
   const roots = [dir, tolerant(() => realpathSync(dir), dir)];
-  const inside = (p) => p !== null && roots.some((r) => isInside(p, r));
+  // fd links that are not paths (socket:[N], pipe:[N], anon_inode:[eventfd]) are skipped: isInside would resolve them
+  // against our own cwd. A deleted file or directory reads back as "<path> (deleted)".
+  const inside = (link) => {
+    if (link === null) return false;
+    const p = link.replace(/ \(deleted\)$/, '');
+    return path.isAbsolute(p) && roots.some((r) => isInside(p, r));
+  };
   const pids = [];
   for (const name of names.filter((n) => /^\d+$/.test(n))) {
     const proc = path.join(procRoot, name);
@@ -201,7 +207,19 @@ function fileContainsAny(file, needles) {
   }
 }
 
-// Paths of Claude transcripts (*.jsonl) modified at or after sinceMs that mention any needle.
+// A recent transcript that cannot be read (EACCES/EPERM) might mention the worktree, so it counts as a mention
+// (fail-closed); one that vanished since the listing does not.
+function recentTranscriptMentions(file, wanted) {
+  try {
+    return fileContainsAny(file, wanted);
+  } catch (err) {
+    if (err?.code === 'EACCES' || err?.code === 'EPERM') return true;
+    if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') return false;
+    throw err;
+  }
+}
+
+// Paths of Claude transcripts (*.jsonl) modified at or after sinceMs that mention any needle (or cannot be read).
 export function transcriptMentions(needles, { dirs, sinceMs }) {
   const wanted = needles.filter(Boolean).map((n) => Buffer.from(n));
   if (!wanted.length) return [];
@@ -209,7 +227,7 @@ export function transcriptMentions(needles, { dirs, sinceMs }) {
   for (const dir of dirs) {
     for (const file of transcriptFiles(dir)) {
       const st = tolerant(() => lstatSync(file), null);
-      if (st && st.mtimeMs >= sinceMs && tolerant(() => fileContainsAny(file, wanted), false)) hits.push(file);
+      if (st && st.mtimeMs >= sinceMs && recentTranscriptMentions(file, wanted)) hits.push(file);
     }
   }
   return hits;
