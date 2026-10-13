@@ -179,6 +179,21 @@ const DENY = [
   ['IFS=, git push origin agent/x; R=agent/x,main; git push origin $R'],
   ['R="agent/x,main"; git push origin ${=R}'],
   ['setopt shwordsplit; R="agent/x main"; git push origin $R'],
+  // quote removal hides whether '$O' was a literal name or a variable: a push is judged under both readings
+  ['O=-o; git push origin \'$O\' HEAD:main'],
+  ['O=--push-option; git push origin \'$O\' HEAD:main'],
+  ['O=--repo; git push origin \'$O\' HEAD:main'],
+  ['O=--receive-pack; git push origin \'$O\' HEAD:main'],
+  ['O=--exec; git push origin \'$O\' HEAD:main'],
+  ['O=-o; git branch \'$O\'; git push origin \'$O\' HEAD:main'],
+  // IFS named through an attached binder option with a quoted name
+  ['printf -vI""FS ,; R=agent/x,main; git push origin $R'],
+  ['read -aI""FS <<< x; R=agent/x,main; git push origin $R'],
+  // a -c word that is (or may be) several git arguments
+  ['KV="user.name=x -C /other"; git -c $KV push origin agent/x'],
+  ['git -c $KV push origin agent/x'],
+  ['git -c user.name=$N push origin agent/x'],
+  ['git -c core.pager=${P:-cat} push origin agent/x'],
   // a config key / push.default value built at run time can be remote.*.push or upstream
   ['git -c $K=HEAD:agent/x push'],
   ['K=remote.origin.push; git -c $K=HEAD:agent/x push'],
@@ -223,11 +238,9 @@ const ALLOW = [
   ['B=agent/x; git push origin $B'], // assigned once on the line: still known
   ['git push origin HEAD:$(git branch --show-current)'],
   ['git push origin HEAD:agent/x'], // a literal source with a literal destination is unchanged
-  ['git -c user.name=$N push origin agent/x'],
   ['export B=agent/x; git push origin $B'],
   ['B=agent/x; git push origin ${B}'],
   ['git -c alias.p=\'!V=agent/y; git push origin $V\' p'], // the value is judged as written, in the alias's own shell
-  ['git -c core.pager=${P:-cat} push origin agent/x'],
 ];
 
 const label = (command, o) => (o ? `${command}  ${JSON.stringify(o, (k, v) => (v instanceof Error ? `Error(${v.message})` : v))}` : command);

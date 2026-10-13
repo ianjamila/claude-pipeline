@@ -260,21 +260,22 @@ function globMatchesProtected(pattern) {
   return PROTECTED_BRANCHES.some((b) => re.test(b));
 }
 
-function checkRefspec(spec, dir, gitDir, ctx) {
+// `literal`: judge the word with every `$` as the character it is (the reading where it was single-quoted); see checkPush.
+function checkRefspec(spec, dir, gitDir, ctx, literal = false) {
   if (spec.startsWith('+')) return deny(FORCE_REASON);
   const colon = splitIndex(spec, ':');
   const src = colon < 0 ? spec : spec.slice(0, colon);
   // A run-time source can carry a `+` (force) prefix or word-split into more refspecs (`${B:-${C:-+HEAD}}:agent/x`), so a
   // source that is not literal text cannot be verified either, not only the destination.
-  if (colon >= 0 && DYNAMIC.test(src)) {
+  if (!literal && colon >= 0 && DYNAMIC.test(src)) {
     return deny(`the refspec source "${src}" is built at run time, so what is pushed (a force prefix, extra refspecs) cannot be verified. Write the refspec out: git push -u origin HEAD:agent/<slug>.`);
   }
   let dst = colon < 0 ? spec : spec.slice(colon + 1);
-  dst = expandVars(dst, ctx); // `B=agent/x; git push origin HEAD:$B`
+  if (!literal) dst = expandVars(dst, ctx); // `B=agent/x; git push origin HEAD:$B`
   if (colon >= 0 && src === '' && dst === '') return deny('`git push <remote> :` pushes every matching branch, including main. Name your branch explicitly.');
   if (dst === '') dst = src; // `src:` is not a destination git accepts; judge it by the source name
   dst = stripHeads(dst);
-  if (DYNAMIC.test(dst)) {
+  if (!literal && DYNAMIC.test(dst)) {
     // `git push origin "$(git branch --show-current)"` is common and means the current branch: accept exactly that
     // spelling (a variable that holds a literal has already been expanded above), and only when the branch is known
     // and not protected. Any other run-time text (${B:-main}, $(cat f), m${x}ain, a loop variable) can be main.
@@ -304,8 +305,9 @@ const CURRENT_BRANCH_WORD = new RegExp(`(^|:)${CURRENT_BRANCH_IDIOM.source.slice
 // `unset`), set in the environment, or a sourced script that may have set variables.
 // A name can be written without the letters IFS in a row (`eval "I""FS=,"`, `read $N`, `printf -v $N`, `declare I""FS=,`, `N=IFS; export $N`),
 // so the commands that assign a variable by a computed or split-up name count as well.
-const SETS_BY_NAME = /\b(?:eval|read|mapfile|readarray|getopts|source|printf\s+-v)\b|(?:^|[\s;&|(])\.\s|\b(?:export|unset|declare|typeset|local|readonly)\b[^;&|\n]*[$`'"]/;
-const ifsMayBeSet = (ctx) => /IFS/.test(ctx.fullText ?? '') || SETS_BY_NAME.test(ctx.fullText ?? '') || assignedNames(ctx).includes('IFS') || Object.hasOwn(ctx.env ?? {}, 'IFS') || ctx.tainted.size > 0;
+const SETS_BY_NAME = /\b(?:eval|read|mapfile|readarray|getopts|source)\b|\bprintf\s+-[A-Za-z]*v|(?:^|[\s;&|(])\.\s|\b(?:export|unset|declare|typeset|local|readonly)\b[^;&|\n]*[$`'"]/;
+// Both the text as written and with its quotes and backslashes removed (`printf -vI""FS ,` spells the name only once they are gone).
+const ifsMayBeSet = (ctx) => [ctx.fullText ?? '', String(ctx.fullText ?? '').replace(/['"\\]/g, '')].some((t) => /IFS/.test(t) || SETS_BY_NAME.test(t)) || assignedNames(ctx).includes('IFS') || Object.hasOwn(ctx.env ?? {}, 'IFS') || ctx.tainted.size > 0;
 
 function unverifiableWord(raw, ctx) {
   const x = expandVars(raw, ctx);
@@ -318,14 +320,20 @@ function unverifiableWord(raw, ctx) {
   return null;
 }
 
+// The policy sees words after quote removal, so `'$O'` (a literal branch name) and `$O` (an option) look the same. A push is
+// judged under BOTH readings, every `$` word as the variable it names and as the plain text it spells, and denied if either denies.
 function checkPush(args, dir, gitDir, ctx, configs) {
   for (const a of args) {
     const why = unverifiableWord(a, ctx);
     if (why) return deny(why);
   }
-  args = args.map((a) => expandVars(a, ctx)); // an option held in a variable (`F=--mirror; git push origin $F`) is an option
+  return pushReading(args.map((a) => expandVars(a, ctx)), dir, gitDir, ctx, configs, false) // an option held in a variable (`F=--mirror; git push origin $F`) is an option
+    ?? (args.some((a) => DYNAMIC.test(a)) ? pushReading(args, dir, gitDir, ctx, configs, true) : null);
+}
+
+function pushReading(args, dir, gitDir, ctx, configs, literal) {
   const { flags, positionals: rawPositionals } = parseOpts(args, { longValue: PUSH_LONG_VALUE, shortValue: 'o', abbrev: true });
-  const positionals = rawPositionals.map((p) => expandVars(p, ctx));
+  const positionals = literal ? rawPositionals : rawPositionals.map((p) => expandVars(p, ctx));
   let repoGiven = false;
   for (const f of flags) {
     if (f.short) {
@@ -359,7 +367,7 @@ function checkPush(args, dir, gitDir, ctx, configs) {
     return null;
   }
   for (const spec of refspecs) {
-    const v = checkRefspec(spec, dir, gitDir, ctx);
+    const v = checkRefspec(spec, dir, gitDir, ctx, literal);
     if (v) return v;
   }
   return null;
@@ -382,7 +390,7 @@ function parseGitGlobal(argv, dir, env, ctx) {
       // runs in its own shell, where the line's variables are not the ones it sees.
       const kv = argv[++i] ?? '';
       const eq = splitIndex(kv, '=');
-      configs.push({ key: expandVars(eq < 0 ? kv : kv.slice(0, eq), ctx).toLowerCase(), value: eq < 0 ? '' : kv.slice(eq + 1) });
+      configs.push({ raw: kv, key: expandVars(eq < 0 ? kv : kv.slice(0, eq), ctx).toLowerCase(), value: eq < 0 ? '' : kv.slice(eq + 1) });
       continue;
     }
     if (t.startsWith('--git-dir=')) { gitDir = joinDir(d, t.slice('--git-dir='.length), ctx); gitDirUnknown = false; continue; }
@@ -492,6 +500,11 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
   if (sub === 'push' || sub === 'send-pack') { // send-pack is push without the remote configuration
     if (/\bxargs\b/.test(raw)) return deny('`xargs git push` takes its refspecs from stdin, so it cannot be verified. Push the branch by name.');
     // config handed in through the environment (this command's prefix / `env`, or an earlier assignment or export on the line)
+    // a `-c` word that expands to blanks / glob characters (or may) splits into more git arguments (`-c $KV push …`, `-c k=$V`)
+    for (const c of g.configs) {
+      const why = unverifiableWord(c.raw, ctx);
+      if (why) return deny(why);
+    }
     ctx.envCfgDirty = [...Object.keys(env), ...assignedNames(ctx)].some((k) => GIT_ENV_CONFIG.test(k));
     return checkPush(args, g.d, g.gitDir, ctx, g.configs);
   }
