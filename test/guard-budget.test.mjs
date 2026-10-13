@@ -277,3 +277,46 @@ for (const [name, run] of both) {
     assert.equal(decide(`echo \${x:-((${BAD}))}`).decision, 'deny');
   });
 }
+
+// ---- the glob-qualifier scan is bounded in time and size ------------------------------------------------------------
+// Work in the qualifier scan (`*(e{...})`) used to grow with the square of the group's length and ignore the evaluation deadline, so
+// one long line could outlast the hook timeout (which Claude Code reads as allow). The scan is one pass, polls the deadline, stops
+// collecting past MAX_QUALIFIER_CODES, and the parse is then `truncated`, which both policies deny when a guarded operation is named.
+import { simpleCommands } from '../pipeline/hooks/lib/shell-parse.mjs';
+
+const nestedQualifier = (n) => `echo *(${'e{'.repeat(n)}x${'}'.repeat(n)})`;
+
+for (const [name, run] of both) {
+  const BAD = name === 'guard-git' ? MAIN_PUSH : PROTECTED_WRITE;
+  test(`${name}: a guarded command followed by a 120,000-character nested qualifier group is denied, and fast`, () => {
+    const { r, ms } = timed(() => run(`${BAD}\n${nestedQualifier(40_000)}`, {}));
+    assert.equal(r.decision, 'deny');
+    assert.ok(ms < 2000, `took ${ms} ms`);
+  });
+}
+
+test('qualifier scan: a deeply nested group is parsed fast and the parse is truncated', () => {
+  const { r, ms } = timed(() => simpleCommands(nestedQualifier(40_000)));
+  assert.equal(r.truncated, true);
+  assert.ok(ms < 2000, `took ${ms} ms`);
+});
+
+test('qualifier scan: the scan is linear (CPU time at 2n vs n)', () => {
+  const sample = (n) => () => cpuTime(() => simpleCommands(`echo *(${'e{'.repeat(n)}x${'}'.repeat(n)})`, { maxDepth: 1 }));
+  assertLinear(sample(20_000), sample(40_000), { label: 'qualifier scan' });
+});
+
+test('qualifier scan: more than MAX_QUALIFIER_CODES distinct codes is truncated, 32 or fewer is not', () => {
+  const group = (n) => `ls *(${Array.from({ length: n }, (_, i) => `e{echo c${i}}`).join('')})`;
+  assert.equal(simpleCommands(group(40)).truncated, true);
+  assert.equal(simpleCommands(group(5)).truncated, false);
+});
+
+test('qualifier scan: an expired deadline mid-scan stops it and marks the parse truncated', () => {
+  const line = `ls *(${Array.from({ length: 5000 }, () => 'e{echo hi}').join('')})`;
+  let polls = 0;
+  const r = simpleCommands(line, { expired: () => ++polls > 3 });
+  assert.equal(r.truncated, true);
+  assert.ok(polls < 100, `${polls} polls`);
+  assert.equal(simpleCommands(line, { expired: () => false }).truncated, false);
+});
