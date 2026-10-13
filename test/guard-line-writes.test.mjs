@@ -1840,3 +1840,60 @@ test('L5b: an in-place sed may fail or be skipped, so the text the file holds no
   allowBoth("sed -i.bak 's/git/echo/' ok.sh; bash ok.sh");
   allowBoth("sed -i.bak '1d' ok.sh; sed -i.bak 's/a/b/' ok.sh; bash ok.sh");
 });
+
+// ---- L5c: aliased operands and backup files of an in-place sed ----------------------------------------------------------------
+
+test('L5c: an in-place sed with more than one file operand is not emulated (an alias is edited twice, once per name)', () => {
+  // Why: `sed -i 's/X//' ok.sh l.sh` edits ok.sh twice when l.sh is a link to it (--follow-symlinks, or an `ln -s` earlier on the line): the text that runs is the program applied TWICE. Names that look different
+  // (./f, /abs/f, d/../f, F on a case-insensitive file system, a glob or brace) are told apart by the line-writes layer (one edit per name, applied to the file each name reaches), not here: applySed refuses what it cannot tell
+  const ed = (...ops) => applySed({ args: ['-i', 's/X//', ...ops], word: 'f' }, 'puXXsh\n');
+  assert.ok(ed('f').includes('puXsh\n'));
+  for (const ops of [['f', 'f'], ['f', './f'], ['./f', 'f'], ['f', '/work/repo/f'], ['f', 'dir/../f'], ['F', 'f'], ['f', 'f*'], ['f', 'f?'], ['f', '{f,g}'], ['f', '$G'], ['f', '~/f']]) {
+    assert.equal(ed(...ops), null, ops.join(' '));
+  }
+  // different plain names are computed (the line-writes layer applies one edit per name to the file each name reaches, links included)
+  assert.ok(applySed({ args: ['-i', 's/X//', 'f', 'g'], word: 'f' }, 'puXXsh\n').includes('puXsh\n'));
+  // a glob or a variable in the operand itself is whatever the shell makes of it
+  for (const w of ['f*', 'f?', '[f]', '{f,g}', '$G', '~/f']) assert.equal(applySed({ args: ['-i', 's/X//', w], word: w }, 'puXXsh\n'), null, w);
+  // end to end: the file is edited once or twice depending on the names, and either text may run
+  const G = 'echo hi\ngit puXXsh origin main\n';
+  const F = 'echo hi\necho x > ~/.claude/settXXings.json\n';
+  const gitFs = fakeFs(GIT_ROOT, { 'ok.sh': G, 'l.sh': G }, DIRS);
+  const filesFs = fakeFs(PROJ, { 'ok.sh': F, 'l.sh': F }, DIRS);
+  // a link on disk (the fake real path of l.sh is ok.sh) and a link the line makes
+  const linkOnDisk = (root) => (q) => String(q).replace(/\\/g, '/').endsWith('/l.sh') ? `${root}/ok.sh` : q;
+  assert.equal(git("sed -i --follow-symlinks 's/X//' ok.sh l.sh; bash ok.sh", gitFs, { realpath: linkOnDisk('/work/repo') }).decision, 'deny');
+  assert.equal(files("sed -i --follow-symlinks 's/X//' ok.sh l.sh; bash ok.sh", filesFs, { realpath: linkOnDisk('/home/u/proj') }).decision, 'deny');
+  for (const tail of [
+    "ln -s ok.sh l.sh; sed -i --follow-symlinks 's/X//' ok.sh l.sh; bash ok.sh", "ln -s ok.sh l.sh && sed -i 's/X//' l.sh ok.sh; bash ok.sh", "ln ok.sh l.sh; sed -i 's/X//' ok.sh l.sh; bash ok.sh",
+    "sed -i 's/X//' ok.sh ./ok.sh; bash ok.sh", "sed -i 's/X//' ok.sh sub/../ok.sh; bash ok.sh", "sed -i 's/X//' ok.sh ok.s?; bash ok.sh", "sed -i 's/X//' ok.sh ok.{sh,sh}; bash ok.sh",
+    "sed -i 's/X//' ok.sh ok.sh; bash ok.sh", "sed -i 's/X//' OK.sh ok.sh; bash ok.sh", "sed -i 's/X//' ok.* ok.sh; bash ok.sh",
+  ]) {
+    assert.equal(git(tail, gitFs).decision, 'deny', tail);
+    assert.equal(files(tail, filesFs).decision, 'deny', tail);
+  }
+  assert.equal(git("sed -i 's/X//' ok.sh /work/repo/ok.sh; bash ok.sh", gitFs).decision, 'deny');
+  assert.equal(files("sed -i 's/X//' ok.sh /home/u/proj/ok.sh; bash ok.sh", filesFs).decision, 'deny');
+  // a lone operand is still exact (one edit: puXsh is no push)
+  assert.equal(git("sed -i 's/X//' ok.sh; bash ok.sh", gitFs).decision, 'allow');
+  assert.equal(files("sed -i 's/X//' ok.sh; bash ok.sh", filesFs).decision, 'allow');
+});
+
+test('L5c: the backup file of an in-place sed holds the text before the edit (or content nobody can read)', () => {
+  // Why: `sed -i.sh 's/x/y/' g` copies g's ORIGINAL text to g.sh first; `bash g.sh` then runs what g held before the edit, which the edit's own text never shows.
+  const spec = { ...SPEC, g: 'bad' };
+  for (const l of [
+    "sed -i.sh 's/x/y/' g; bash g.sh", "sed --in-place=.sh 's/x/y/' g; bash g.sh", "sed --in-pl=.sh 's/x/y/' g; bash g.sh", "sed -I.sh 's/x/y/' g; bash g.sh", "sed -ni.sh 's/x/y/p' g; bash g.sh",
+    "sed -i .sh 's/x/y/' g; bash g.sh", "sed -I .sh 's/x/y/' g; bash g.sh", "sed -i -e 's/x/y/' -i.sh g; bash g.sh", "sed -i.sh -e 's/x/y/' g && bash g.sh", "sed -s -i.sh 's/x/y/' g; bash g.sh",
+    "sed -i.bak 's/x/y/' g; bash g.bak", "sed -i.sh 's/x/y/' g; cp g.sh n.sh; bash n.sh",
+    // the backup name is built from the file name ('*' is the base name) or lies in another directory: the file the backup lands in is not known
+    (_, mid) => `sed -i'*.sh' 's/x/y/' g; ${mid}; bash g.sh`, (_, mid) => `sed -i'd/*' 's/x/y/' g; ${mid}; bash d/g`, (_, mid) => `sed -i'bak/' 's/x/y/' g; ${mid}; bash bak/g`, (_, mid) => `sed -i$S 's/x/y/' g; ${mid}; bash g.sh`,
+    (_, mid) => `sed --in-place='*.sh' 's/x/y/' g; ${mid}; bash g.sh`, (_, mid) => `sed -i'.sh$S' 's/x/y/' g; ${mid}; bash g.sh`,
+  ]) denyBoth(l, spec);
+  // sed fails on a missing file and makes no backup: the backup name keeps the text it holds now
+  denyBoth("sed -i.sh 's/x/y/' missing; bash missing.sh", { ...SPEC, 'missing.sh': 'bad' });
+  // the backup name is dest + suffix in the file's own directory
+  denyBoth("sed -i.sh 's/x/y/' src/f.sh; bash src/f.sh.sh", spec);
+  // the nearest twins: no suffix, an empty one, or a backup nobody runs
+  for (const l of ["sed -i 's/x/y/' ok.sh; bash g.sh.sh", "sed -i '' 's/x/y/' ok.sh; bash ok.sh", "sed -i.bak 's/x/y/' ok.sh; bash ok.sh.bak", "sed -i.bak 's/x/y/' ok.sh; bash ok.sh"]) allowBoth(l, { ...SPEC });
+});

@@ -480,8 +480,8 @@ export function applySed({ args, word, vars = [] }, text) {
     // Why: the same file twice (`f f`, `f ./f`, a link) is edited twice: operands must be plain, different names, and the edit is also tried applied a second time
     // (an empty program, GNU's reading of `-i '' 's/a/b/' f`, edits nothing however many names there are)
     const many = r.nfiles > 1;
-    // Why: an option or another operand with a $, a glob, a brace or a tilde is whatever the shell makes of it (more words, another option, the same file again): not computed
-    if (c.cmds.length > 0 && [...r.opts, ...r.operands.filter((x) => x !== word)].some((x) => /^~|[`$*?[\]{}]/.test(x))) return null;
+    // Why: an option or an operand (this one too: `f*` also reaches a backup file another edit of the same sed made) with a $, a glob, a brace or a tilde is whatever the shell makes of it (more words, another option, the same file again): not computed
+    if (c.cmds.length > 0 && [...r.opts, ...r.operands].some((x) => /^~|[`$*?[\]{}]/.test(x))) return null;
     if (many && c.cmds.length > 0 && (r.nfiles !== r.files.size || [...r.files].some((x) => /[/\\]|^\.\.?$/.test(x)) || new Set([...r.files].map((x) => x.toLowerCase())).size !== r.files.size)) return null;
     if (c.sensitive && (NON_ASCII.test(text) || NON_ASCII.test(r.prog))) return null;
     if (NON_ASCII.test(r.prog) && r.prog.includes('[')) return null;

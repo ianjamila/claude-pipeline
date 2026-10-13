@@ -605,7 +605,15 @@ function argRecords(cmd, name, idx, lineEnv = {}, io = {}) {
     const wfiles = isSed ? sedWriteTargets(args) : [];
     if (!inPlace) return wfiles.length ? wfiles.map((d) => unknown(d)) : null; // `w FILE` / `s///w FILE` write a file too
     // Why: an in-place edit turns the file's old text into new text (`s/X/sh/` completes `git puX`), so the file is a piece the line cannot see: `edit` (see contentsIn)
-    if (isSed) return [...sedPrograms(args).targets.map((dest) => unknown(dest, { edit: true, sed: { args, word: dest } })), ...wfiles.map((dest) => unknown(dest))]; // (one parser for the programs and the files; an in-place sed may also `w FILE`)
+    if (isSed) {
+      // (one parser for the programs and the files; an in-place sed may also `w FILE`)
+      const targets = sedPrograms(args).targets;
+      const bk = sedBackupSuffixes(args);
+      // Why: -i.SUF / --in-place=SUF / BSD -i SUF first copies the file's ORIGINAL text to FILE+SUF (`sed -i.sh 's/x/y/' f; bash f.sh` runs f's old text): a record that holds the pre-edit text. A suffix with a * (the base name), a / (another directory)
+      // or only known at run time puts the copy where we cannot tell: it may be anywhere
+      const copies = targets.flatMap((dest) => bk.sufs.map((suf) => ({ idx, dest: dest + suf, backup: true, items: [{ file: dest }] })));
+      return orAnywhere([...targets.map((dest) => unknown(dest, { edit: true, sed: { args, word: dest } })), ...wfiles.map((dest) => unknown(dest)), ...copies], idx, bk.odd);
+    }
     const { pos, opts } = getopt(args, 'eIlF', ['expression', 'file', 'line-length']);
     const hasProgram = hasOpt(opts, 'e', 'f', 'expression', 'file');
     return (hasProgram ? pos : pos.slice(1)).map((dest) => unknown(dest, { edit: true }));
@@ -914,6 +922,35 @@ export function sedScan(prog) {
 export const sedUnsafe = (prog) => { const r = sedScan(prog); return r.runs || r.writes.length > 0 || r.unknown || SED_LEGACY.test(prog) || /(?:^|[;{}\s\d$!,])[wWe]\s*$/.test(prog); };
 // an in-place option of sed: -i / -I (BSD) in a bundle, or --in-place / any abbreviation of it (GNU takes a unique prefix: --in-pl, --i)
 export const sedInPlaceArg = (a) => /^-[A-Za-z]*[iI]/.test(a) || (a.startsWith('--') && a.length > 2 && 'in-place'.startsWith(a.slice(2).split('=')[0]));
+// The backup suffixes an in-place sed may use: GNU -i[SUF] / --in-place[=SUF] (attached only) and BSD -i SUF / -I SUF (the next word, whatever it is), as { sufs, odd }; odd: a suffix that is a
+// pattern (a * is the base name, a / names another directory) or only known at run time, so the backup may land anywhere. Every word is scanned wherever it stands (a superset of what either sed reads as an option)
+const PLAIN_SUFFIX = /^[\w.~+@%=,:-]+$/;
+export function sedBackupSuffixes(args) {
+  const sufs = new Set();
+  let odd = false;
+  const attached = (v) => { if (v === '') return; if (PLAIN_SUFFIX.test(v)) sufs.add(v); else odd = true; };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--') break;
+    if (a.startsWith('--')) {
+      const eq = a.indexOf('=');
+      const nm = eq > 0 ? a.slice(2, eq) : a.slice(2);
+      if (nm !== '' && 'in-place'.startsWith(nm)) { if (eq > 0) attached(a.slice(eq + 1)); } else if (eq < 0 && nm !== '' && ['expression', 'file', 'line-length'].some((x) => x.startsWith(nm))) i++;
+    } else if (a.length > 1 && a[0] === '-') {
+      for (let k = 1; k < a.length; k++) {
+        const ch = a[k];
+        const rest = a.slice(k + 1);
+        if (ch === 'e' || ch === 'f' || ch === 'l') { if (rest === '') i++; break; }
+        if (ch === 'i' || ch === 'I') {
+          if (rest !== '') attached(rest);
+          else if (i + 1 < args.length && PLAIN_SUFFIX.test(args[i + 1])) sufs.add(args[i + 1]); // (BSD: the next word; one with a / or a $ cannot be a suffix in practice, and a program such as s/a/b/ is the usual GNU form)
+          break;
+        }
+      }
+    }
+  }
+  return { sufs: [...sufs], odd };
+}
 // The sed programs among the arguments: the script words (-e PROG, -ePROG, -ne PROG, --expression=PROG, --expression PROG; a GNU long option may be abbreviated: --expr) and, when there
 // is none, the first positional word (the rest are files: a file named web.ts / etc/passwd / ~/.claude/pipeline/... is not a `w` / `e` / `s///e` program). BSD `-i ''` takes its suffix before the
 // program, so after a bare -i the second positional word is scanned too. `file`: a -f / --file script, whose text we do not read here. `targets`: the file words.
