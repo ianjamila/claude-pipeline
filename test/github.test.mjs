@@ -389,3 +389,19 @@ test('pagePullRequests: extra variables reach gh api graphql as -f name=value', 
   const at = gql.indexOf('branch=feat/x');
   assert.ok(at > 0 && gql[at - 1] === '-f');
 });
+
+test('pagePullRequests: extra variables cannot override owner, name, first or after', () => {
+  const calls = [];
+  const ghFn = (args) => {
+    calls.push(args);
+    if (args[0] === 'repo') return { code: 0, stdout: JSON.stringify(REPO_VIEW), stderr: '', timedOut: false };
+    const data = { repository: { pullRequests: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } };
+    return { code: 0, stdout: JSON.stringify({ data }), stderr: '', timedOut: false };
+  };
+  const gh = createGitHub({ cwd, ghFn });
+  gh.pagePullRequests('query { x }', () => {}, { branch: 'feat/x', owner: 'evil', name: 'evil', first: 1, after: 'evil' });
+  const gql = calls.find((a) => a[0] === 'api');
+  assert.ok(gql.includes('owner=acme') && gql.includes('name=widgets'), gql.join(' '));
+  assert.ok(gql.includes('branch=feat/x'));
+  assert.deepEqual(gql.filter((a) => /=evil$|^first=1$|^after=/.test(a)), [], gql.join(' '));
+});

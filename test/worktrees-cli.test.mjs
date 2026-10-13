@@ -250,7 +250,7 @@ test('--repo pointing at a linked worktree sees the same candidates, config and 
 
 test('a GraphQL failure for one branch keeps that worktree and still evaluates the others', () => {
   const w = world();
-  w.fake.setScript(w.script([{ match: 'branch=feat/open$', code: 1, stderr: 'HTTP 502: bad gateway' }]));
+  w.fake.setScript(w.script([{ match: 'branch=feat/open( |$)', code: 1, stderr: 'HTTP 502: bad gateway' }]));
   const r = w.cli(['prune']);
   assert.equal(r.code, 0, r.stderr);
   assert.match(w.keptReason(r.json, 'open'), /^PR data incomplete/);

@@ -235,7 +235,7 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
       let after = null;
       const seen = new Set();
       for (let page = 0; page < MAX_PAGES; page += 1) {
-        const data = self.graphql(query, { owner, name, first: GRAPHQL_PAGE, after, ...extraVars });
+        const data = self.graphql(query, { ...extraVars, owner, name, first: GRAPHQL_PAGE, after });
         const conn = data?.repository?.pullRequests;
         if (!conn || !Array.isArray(conn.nodes)) {
           throw new GhError({ code: 0, stderr: 'GraphQL reply has no pullRequests connection', args: ['api', 'graphql'] });
