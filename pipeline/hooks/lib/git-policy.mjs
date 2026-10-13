@@ -915,8 +915,9 @@ function jobStartCommands(argv, ctx) {
 }
 
 // Every directory a command list may run in: where it starts and each cd / pushd target (chained ones too), like files-policy's collectDirs.
+// (startDir null: where the list starts is unknown — a script judged after the line lost its directory — so no place is named; the bare word stays the fallback, see locate)
 function cdTargets(cmds, startDir, ctx) {
-  const dirs = [startDir];
+  const dirs = startDir === null ? [] : [startDir];
   for (const c of cmds) {
     const nm = c.argv.length ? baseName(c.argv[0]) : '';
     if (nm !== 'cd' && nm !== 'pushd') continue;
