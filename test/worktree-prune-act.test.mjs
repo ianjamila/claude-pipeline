@@ -87,6 +87,24 @@ test('archive: a second archive the same day appends to the manifest; a rel esca
   assert.throws(() => archivePaths({ wtPath: wt, rels: ['../evil.txt'], holdingDir: h, slug: 's3', pr: 3, nowMs: T }), /outside/);
 });
 
+test('archive: an unparseable same-day manifest is set aside (first free .corrupt-<n>), never overwritten; purge keeps that batch', () => {
+  const wt = mkdtempSync(join(tmpdir(), 'wt-')); const h = mkdtempSync(join(tmpdir(), 'hold-'));
+  const batch = join(h, '2026-10-13'); mkdirSync(batch);
+  writeFileSync(join(batch, 'MANIFEST.json'), '{nope');
+  writeFileSync(join(wt, 'a.txt'), 'a'); writeFileSync(join(wt, 'b.txt'), 'b');
+  archivePaths({ wtPath: wt, rels: ['a.txt'], holdingDir: h, slug: 's1', pr: 1, nowMs: T });
+  assert.equal(readFileSync(join(batch, 'MANIFEST.json.corrupt-1'), 'utf8'), '{nope');
+  assert.deepEqual(JSON.parse(readFileSync(join(batch, 'MANIFEST.json'), 'utf8')).items.map((i) => i.slug), ['s1']);
+  writeFileSync(join(batch, 'MANIFEST.json'), '{"items": "not a list"}');
+  archivePaths({ wtPath: wt, rels: ['b.txt'], holdingDir: h, slug: 's2', pr: 2, nowMs: T });
+  assert.equal(readFileSync(join(batch, 'MANIFEST.json.corrupt-1'), 'utf8'), '{nope');
+  assert.equal(readFileSync(join(batch, 'MANIFEST.json.corrupt-2'), 'utf8'), '{"items": "not a list"}');
+  assert.deepEqual(JSON.parse(readFileSync(join(batch, 'MANIFEST.json'), 'utf8')).items.map((i) => i.slug), ['s2']);
+  const r = purgeHolding(h, { nowMs: T + 90 * day });
+  assert.deepEqual(r.purged, []);
+  assert.match(r.kept.find((k) => k.batch === '2026-10-13').reason, /MANIFEST\.json\.corrupt-1/);
+});
+
 test('list: restore commands quote paths with spaces; an unreadable manifest still lists', () => {
   const wt = mkdtempSync(join(tmpdir(), 'wt dir-')); const h = mkdtempSync(join(tmpdir(), 'hold-'));
   writeFileSync(join(wt, 'my file.txt'), 'abc');

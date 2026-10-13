@@ -82,6 +82,35 @@ function readManifest(dir) {
   }
 }
 
+const CORRUPT_PREFIX = `${MANIFEST}.corrupt-`;
+
+// The batch's manifest to append to. One that exists but cannot be read or parsed is renamed aside to the first free
+// MANIFEST.json.corrupt-<n> (never overwritten: it may be the only record of where earlier files came from).
+function manifestToAppend(dir) {
+  const fresh = { version: 1, items: [] };
+  const m = readManifest(dir);
+  if (m) return m;
+  const file = path.join(dir, MANIFEST);
+  let st;
+  try {
+    st = lstatSync(file);
+  } catch (err) {
+    if (err?.code === 'ENOENT') return fresh;
+    throw err;
+  }
+  if (!st.isFile()) return fresh; // a symlink: the atomic write replaces the link itself, never its target
+  for (let n = 1; ; n++) {
+    const aside = path.join(dir, `${CORRUPT_PREFIX}${n}`);
+    try {
+      lstatSync(aside);
+    } catch (err) {
+      if (err?.code !== 'ENOENT') throw err;
+      renameSync(file, aside);
+      return fresh;
+    }
+  }
+}
+
 // Temp file + rename, so a crash never leaves a half-written manifest next to the files it describes.
 function writeManifestAtomic(dir, manifest) {
   const tmp = path.join(dir, `${MANIFEST}.tmp-${process.pid}`);
@@ -135,7 +164,7 @@ export function archivePaths({ wtPath, rels, holdingDir, slug, pr, nowMs }) {
   mkdirSync(holdingDir, { recursive: true });
   const batchDir = ensureRealDirs(holdingDir, [day]);
   ensureRealDirs(batchDir, [safeName(slug)]);
-  const manifest = readManifest(batchDir) ?? { version: 1, items: [] };
+  const manifest = manifestToAppend(batchDir);
   const items = [];
   for (const { rel, abs } of sources) {
     assertNoSymlinkBetween(wtPath, abs); // again, right before the move
@@ -198,6 +227,17 @@ export function purgeHolding(holdingDir, { nowMs, days = 30 }) {
     const dir = path.resolve(holdingDir, batch);
     if (!isInside(dir, holdingDir) || samePath(dir, holdingDir)) {
       kept.push({ batch, reason: 'outside holding folder' });
+      continue;
+    }
+    let asideManifest;
+    try {
+      asideManifest = readdirSync(dir).find((n) => n.startsWith(CORRUPT_PREFIX));
+    } catch {
+      kept.push({ batch, reason: 'unreadable batch folder' });
+      continue;
+    }
+    if (asideManifest) {
+      kept.push({ batch, reason: `holds an unreadable earlier manifest (${asideManifest})` });
       continue;
     }
     const manifest = readManifest(dir);
