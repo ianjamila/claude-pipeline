@@ -229,7 +229,8 @@ export function purgeHolding(holdingDir, { nowMs, days = 30 }) {
 export const QUARANTINE_DIR = '.prune-quarantine';
 const RUN_ID = /^[A-Za-z0-9_-]+$/; // no dot: restoreLeftovers splits <slug>.<runId> on the LAST dot
 
-const gitMessage = (err) => (err instanceof GitError ? err.message : String(err?.message ?? err));
+// One line: these reasons go into a one-line-per-worktree report, and git's stderr carries hint lines.
+const gitMessage = (err) => String(err instanceof GitError ? err.message : err?.message ?? err).replace(/\s*\n\s*/g, ' ').trim();
 
 // Final inspection of the quarantined tree (spec §2 step 3). -> null when it may go, else the reason to keep it.
 function reinspect(q, cfg, runStartMs, procOpts) {
@@ -291,12 +292,13 @@ export async function removeWorktree({ root, wt, cfg, pr, holdingDir, runId, run
     return { removed: false, reason: `move refused: ${gitMessage(err)}`, restored: false };
   }
 
-  const moveBack = (reason) => {
+  // `extra` carries what already happened (e.g. `archived`) so a kept worktree's report still says what went to holding.
+  const moveBack = (reason, extra = {}) => {
     try {
       git(['worktree', 'move', q, wt.path], { cwd: root });
-      return { removed: false, reason, restored: true };
+      return { removed: false, reason, restored: true, ...extra };
     } catch (err) {
-      return { removed: false, reason: `${reason}; moving it back failed, it is at ${q}: ${gitMessage(err)}`, restored: false };
+      return { removed: false, reason: `${reason}; moving it back failed (${gitMessage(err)}); it is at ${q}`, restored: false, ...extra };
     }
   };
 
@@ -310,21 +312,33 @@ export async function removeWorktree({ root, wt, cfg, pr, holdingDir, runId, run
   }
   if (verdict.reason) return moveBack(verdict.reason);
 
-  let archived = [];
+  // One file at a time, so a failure part-way still reports exactly what reached holding.
+  const archived = [];
   try {
-    if (verdict.arch.length) {
-      archived = archivePaths({ wtPath: q, rels: verdict.arch, holdingDir, slug: wt.slug, pr, nowMs: Date.now() }).items;
+    const nowMs = Date.now();
+    for (const rel of verdict.arch) {
+      archived.push(...archivePaths({ wtPath: q, rels: [rel], holdingDir, slug: wt.slug, pr, nowMs }).items);
     }
     for (const rel of verdict.del) deleteInside(q, rel);
   } catch (err) {
     const why = err instanceof SymlinkInPathError ? `symlink in path (${err.message})` : `cleanup failed during removal: ${err.message}`;
-    return moveBack(why);
+    return moveBack(why, { archived });
+  }
+
+  // Archive + delete took time, and `git worktree remove` deletes ignored files without --force: look once more.
+  try {
+    await hooks.beforeRemove?.(q);
+    const late = classifyEntries(entriesFor(q), cfg).blockers;
+    if (late.length) return moveBack(`write detected during removal (${late[0]})`, { archived });
+    await hooks.beforeGitRemove?.(q);
+  } catch (err) {
+    return moveBack(`could not re-inspect during removal: ${gitMessage(err)}`, { archived });
   }
 
   try {
     git(['worktree', 'remove', q], { cwd: root });
   } catch (err) {
-    return { removed: false, reason: `git refused removal: ${gitMessage(err)}`, restored: false };
+    return moveBack(`git refused removal: ${gitMessage(err)}`, { archived });
   }
   return { removed: true, archived, deleted: verdict.del };
 }

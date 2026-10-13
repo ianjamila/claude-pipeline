@@ -170,6 +170,56 @@ test('removeWorktree: eligible tree is archived, cleaned and removed; branch kep
   assert.equal(listHolding(h)[0].items, 1);
 });
 
+test('removeWorktree: a real run start (runStartMs = now) lets a clean tree with old files go', async () => {
+  const { repo, add } = world();
+  const wt = add('agent-x', 'agent/x');
+  mkdirSync(join(wt, 'node_modules')); writeFileSync(join(wt, 'node_modules', 'i.js'), '');
+  const old = new Date(Date.now() - 86400e3);
+  for (const f of ['a.txt', '.gitignore', join('node_modules', 'i.js')]) utimesSync(join(wt, f), old, old);
+  const r = await removeWorktree({ root: repo.dir, wt: { slug: 'agent-x', path: wt }, cfg: { delete: ['node_modules/'], archive: [] }, pr: 9, holdingDir: mkdtempSync(join(tmpdir(), 'h-')), runId: 'r1b', runStartMs: Date.now(), settleMs: 0, procOpts: noProcs() });
+  assert.equal(r.removed, true, r.reason);
+  assert.equal(existsSync(wt), false);
+});
+
+for (const [label, file, content] of [['untracked', 'new.ts', 'draft'], ['ignored', '.env.local', 'SECRET=1']]) {
+  test(`removeWorktree: an ${label} file written after archive/delete, just before remove => moved back, archive reported`, async () => {
+    const { repo, add } = world();
+    const wt = add('agent-x', 'agent/x');
+    mkdirSync(join(wt, '.review')); writeFileSync(join(wt, '.review', 's.json'), '{}');
+    const r = await removeWorktree({ root: repo.dir, wt: { slug: 'agent-x', path: wt }, cfg: { delete: [], archive: ['.review/'] }, pr: 9, holdingDir: mkdtempSync(join(tmpdir(), 'h-')), runId: 'rb', runStartMs: Date.now() + 5000, settleMs: 0,
+      procOpts: noProcs(), hooks: { beforeRemove: (q) => writeFileSync(join(q, file), content) } });
+    assert.deepEqual([r.removed, r.restored], [false, true]);
+    assert.equal(r.reason, `write detected during removal (${file})`);
+    assert.equal(readFileSync(join(wt, file), 'utf8'), content);
+    assert.equal(r.archived.length, 1, 'the report still says what went to holding');
+  });
+}
+
+test('removeWorktree: git refusing the remove => moved back intact (restored), archive reported', async () => {
+  const { repo, add } = world();
+  const wt = add('agent-x', 'agent/x');
+  mkdirSync(join(wt, '.review')); writeFileSync(join(wt, '.review', 's.json'), '{}');
+  const r = await removeWorktree({ root: repo.dir, wt: { slug: 'agent-x', path: wt }, cfg: { delete: [], archive: ['.review/'] }, pr: 9, holdingDir: mkdtempSync(join(tmpdir(), 'h-')), runId: 'rg', runStartMs: Date.now() + 5000, settleMs: 0,
+    procOpts: noProcs(), hooks: { beforeGitRemove: (q) => writeFileSync(join(q, 'late.ts'), 'late') } }); // after the last look: only git sees it
+  assert.deepEqual([r.removed, r.restored], [false, true]);
+  assert.match(r.reason, /^git refused removal: /);
+  assert.equal(readFileSync(join(wt, 'late.ts'), 'utf8'), 'late');
+  assert.equal(r.archived.length, 1);
+});
+
+test('removeWorktree: git refusing the remove AND the move back => left in quarantine, reason says where', async () => {
+  const { repo, add } = world();
+  const wt = add('agent-x', 'agent/x');
+  let q;
+  const r = await removeWorktree({ root: repo.dir, wt: { slug: 'agent-x', path: wt }, cfg: { delete: [], archive: [] }, pr: 9, holdingDir: mkdtempSync(join(tmpdir(), 'h-')), runId: 'rl', runStartMs: Date.now() + 5000, settleMs: 0,
+    procOpts: noProcs(), hooks: { beforeGitRemove: (p) => { q = p; repo.git(['worktree', 'lock', '--reason', 'owner', p]); } } }); // a lock blocks remove and move
+  assert.deepEqual([r.removed, r.restored], [false, false]);
+  assert.match(r.reason, /^git refused removal: .*; it is at /);
+  assert.ok(r.reason.endsWith(`it is at ${q}`));
+  assert.equal(existsSync(join(q, 'a.txt')), true);
+  assert.deepEqual(r.archived, []);
+});
+
 test('removeWorktree: a file written after the move => moved back intact, kept', async () => {
   const { repo, add } = world();
   const wt = add('agent-x', 'agent/x');
