@@ -394,6 +394,8 @@ test('K: no login files are skipped on a value assigned later or alongside; a va
     assert.equal(run(cmd, {}, env).decision, 'deny', cmd);
   }
   assert.equal(run('S=/home/u/proj/scripts; bash $S/ok.sh', {}).decision, 'allow');
+  // (an assignment that may not run leaves the inherited value or nothing: still no option, so still no login files)
+  for (const cmd of ['cd sub && S=/home/u/proj/scripts && bash $S/ok.sh', 'cd sub && S=/home/u/proj/scripts; bash $S/ok.sh', 'true || S=/home/u/proj/scripts; bash ${S}/ok.sh']) assert.equal(run(cmd, {}).decision, 'allow', cmd);
   for (const cmd of ['source "$(echo x)"; bash $SQL_UNKNOWN_SHELL_LINE', 'source "$(echo x)"; $SQL_UNKNOWN_SHELL_LINE', 'eval "$(cat x)"; bash "$SQL_UNKNOWN_SHELL_LINE"']) {
     assert.equal(run(cmd, { x: 'SQL_UNKNOWN_SHELL_LINE=/home/u/proj/evil.sh', 'evil.sh': BAD_FILES }).decision, 'deny', cmd);
   }

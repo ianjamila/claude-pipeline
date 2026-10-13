@@ -1692,23 +1692,37 @@ function lineVarWord(w, ctx) {
   const names = [...w.matchAll(/\$\{?(\w+)/g)].map((x) => x[1]);
   return names.length && e0 && !/[\s$`*?[{~(]|^-/.test(e0) && names.every((n) => Object.hasOwn(ctx.vars, n) && !ctx.unknownVars.has(n) && !ctx.pickUnknown.has(n) && !ctx.srcChanged.has(n) && !ctx.srcTouched.has(n)) ? e0 : null;
 }
-// lineVarWord for the command at idx, where the value must be the one the word has WHEN that command runs (ctx.vars holds the line's last value of each name, a prefix
-// `X=v cmd` included): every name has exactly one assignment on the line, a bare one before idx that surely runs first, and is bound nowhere else (read / for / printf -v /
-// ${X:=w} / unset / an arithmetic name: the name stands as a word of its own). Anything else: null.
+// The word the command at idx is given, only to tell that it is no option (a login shell reads other startup files). ctx.vars cannot say (it holds the line's LAST value of each
+// name, a prefix `X=v cmd` included), so every value a name may have WHEN that command runs is tried: its one bare assignment before idx, plus the environment's value (or
+// nothing) when that assignment may not run first (after && / ||, piped or backgrounded, in a loop or branch). Each reading must be a word with no space, glob character,
+// $ or leading - / + (a value built from other names keeps its $). Null when a name is assigned elsewhere or more than once, bound another way (read / for / printf -v /
+// ${X:=w} / unset / an arithmetic name: the name stands as a word of its own), or the word holds more than plain $NAME / ${NAME} references.
 function lineVarWordAt(w, ctx, cmds, idx, raw) {
+  if (!/^(?:[^$`\\]|\$\w+|\$\{\w+\})+$/.test(w)) return null;
   const from = flowStart(cmds);
-  const once = (n) => {
+  const values = (n) => {
     const sites = [];
     for (const [j, c] of cmds.entries()) if (Object.hasOwn(c.env ?? {}, n)) sites.push(j);
-    if (sites.length !== 1) return false;
+    if (sites.length !== 1) return null;
     const j = sites[0];
     const c = cmds[j];
-    if (j >= idx || c.argv.length || c.depth !== 0 || c.sep === '&&' || c.sep === '||' || ['|', '&'].includes(cmds[j + 1]?.sep) || inFlow(from, j)) return false;
-    if (new RegExp(`\\$\\{${n}:?[=?+-]`).test(raw)) return false;
-    return (String(raw).match(new RegExp(`(?<![\\w$])(?<!\\$\\{)${n}(?!\\w)`, 'g')) ?? []).length === 1;
+    if (j >= idx || c.argv.length) return null;
+    if (new RegExp(`\\$\\{${n}:?[=?+-]`).test(raw)) return null;
+    if ((String(raw).match(new RegExp(`(?<![\\w$])(?<!\\$\\{)${n}(?!\\w)`, 'g')) ?? []).length !== 1) return null;
+    const v = String(c.env[n]).replace(/^(?:~|\$HOME|\$\{HOME\})(?=\/|$)/, ctx.homePosix ?? '');
+    const sure = c.depth === 0 && c.sep !== '&&' && c.sep !== '||' && !['|', '&'].includes(cmds[j + 1]?.sep) && !inFlow(from, j);
+    return sure ? [v] : [v, typeof ctx.env?.[n] === 'string' ? ctx.env[n] : ''];
   };
-  const names = [...w.matchAll(/\$\{?(\w+)/g)].map((x) => x[1]);
-  return names.length && names.every(once) ? lineVarWord(w, ctx) : null;
+  const names = [...new Set([...w.matchAll(/\$\{?(\w+)/g)].map((x) => x[1]))];
+  if (!names.length) return null;
+  let readings = [w];
+  for (const n of names) {
+    const vs = values(n);
+    if (!vs) return null;
+    readings = readings.flatMap((r) => vs.map((v) => r.replace(new RegExp(`\\$\\{${n}\\}|\\$${n}(?!\\w)`, 'g'), () => v)));
+    if (readings.length > 16) return null;
+  }
+  return readings.every((r) => r && !/[\s*?[\]{}$`\\]|^[-+]/.test(r)) ? readings[0] : null;
 }
 function judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw) {
   const joinPath = (d, r) => (isAbs(r) ? posix.normalize(r) : posix.join(d, r));
