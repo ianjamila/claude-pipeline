@@ -928,3 +928,17 @@ test('guard-files: a ${X:=w} on the line may have set the $X a later script word
     assert.equal(files(c).decision, 'deny', c);
   for (const c of [': ${X:=./ok.sh}; bash $X', 'echo ${X:=ok.sh}; bash $X', 'echo ${X:=./w.sh}; echo $X']) assert.equal(files(c).decision, 'allow', c);
 });
+
+test('guard-git/files: a reading set that is too big or too deep is refused, never judged in part', () => {
+  const nest = (n, leaf) => '${A:-'.repeat(n) + leaf + '}'.repeat(n);
+  const many = (n) => `${Array.from({ length: n }, (_, i) => `: \${X:=w${i}.sh}`).join('; ')}; bash $X`;
+  for (const c of [`bash ${nest(20, './ok.sh')}`, `bash ${nest(40, '-c ./ok.sh')}`, `bash ${nest(1500, './ok.sh')}`, many(60), many(300)]) {
+    assert.equal(git(c).decision, 'deny', `git ${c.slice(0, 40)}`);
+    assert.equal(files(c).decision, 'deny', `files ${c.slice(0, 40)}`);
+  }
+  // a small nest is still judged exactly
+  for (const c of ['bash ${A:-${B:-${C:-./ok.sh}}}', ': ${X:=./ok.sh}; : ${X:=ok.sh}; bash $X']) {
+    assert.equal(git(c).decision, 'allow', c);
+    assert.equal(files(c).decision, 'allow', c);
+  }
+});

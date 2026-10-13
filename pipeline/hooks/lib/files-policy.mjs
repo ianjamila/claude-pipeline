@@ -1253,7 +1253,7 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
   if (!raw.trim()) return allow();
   // the words a `${X:=w}` on the line (or the line this text came from) may have assigned: a later $X may be any of them
   ctx.assigned = new Map([...(opts._assigned ?? [])].map(([n, ws]) => [n, [...ws]]));
-  for (const [n, ws] of assigningDefaults(raw)) ctx.assigned.set(n, [...(ctx.assigned.get(n) ?? []), ...ws]);
+  for (const [n, ws] of assigningDefaults(raw)) ctx.assigned.set(n, [...new Set([...(ctx.assigned.get(n) ?? []), ...ws])]);
   if (raw.length > MAX_LINE_CHARS) {
     // too long to scan in the time budget: judged by what it mentions once quotes and escapes are removed
     return SENSITIVE_WORDS.test(raw.replace(/['"`\\]/g, '')) ? deny('the command line is too long to check and mentions a protected pipeline file or switch; split it into simpler commands') : allow();

@@ -1104,7 +1104,7 @@ function checkSplices(c, dir, ctx, level) {
 // the words a `${X:=w}` / `${X=w}` anywhere on the line (this text, or the line it came from) may have assigned: a later $X may be any of them
 const assignedOf = (ctx) => {
   const out = new Map(ctx.lineAssigned ?? []);
-  for (const [n, ws] of assigningDefaults(ctx.fullText ?? '')) out.set(n, [...(out.get(n) ?? []), ...ws]);
+  for (const [n, ws] of assigningDefaults(ctx.fullText ?? '')) out.set(n, [...new Set([...(out.get(n) ?? []), ...ws])]);
   return out;
 };
 

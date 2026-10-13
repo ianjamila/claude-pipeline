@@ -112,7 +112,11 @@ export function spliceLines(raw) {
 const ASSIGNING = /\$\{([A-Za-z_]\w*):?=([^}]*)\}/g;
 export function assigningDefaults(text) {
   const out = new Map();
-  for (const m of String(text ?? '').matchAll(ASSIGNING)) out.set(m[1], [...(out.get(m[1]) ?? []), m[2]]);
+  for (const m of String(text ?? '').matchAll(ASSIGNING)) {
+    const ws = out.get(m[1]) ?? [];
+    if (!ws.includes(m[2])) ws.push(m[2]);
+    out.set(m[1], ws);
+  }
   return out;
 }
 // the readings of a word, plus those with a name an assigning expansion may have set replaced by the words it assigns
@@ -120,9 +124,11 @@ export function readingsOf(word, assigned) {
   const rs = paramReadings(word);
   if (!assigned?.size) return rs;
   const out = new Set(rs);
-  for (const r of rs) for (const [n, ws] of assigned) if (new RegExp(`\\$(?:\\{${n}\\}|${n}(?![A-Za-z0-9_]))`).test(r)) for (const w of ws) out.add(r.replace(new RegExp(`\\$(?:\\{${n}\\}|${n}(?![A-Za-z0-9_]))`, 'g'), () => w));
+  let over = rs.over;
+  // (a cap that is hit refuses: `over` makes every caller deny, it never drops readings quietly)
+  for (const r of rs) for (const [n, ws] of assigned) if (new RegExp(`\\$(?:\\{${n}\\}|${n}(?![A-Za-z0-9_]))`).test(r)) for (const w of ws) { out.add(r.replace(new RegExp(`\\$(?:\\{${n}\\}|${n}(?![A-Za-z0-9_]))`, 'g'), () => w)); if (out.size > MAX_READINGS) { over = true; break; } }
   const list = [...out].slice(0, MAX_READINGS);
-  return Object.defineProperty(list, 'over', { value: rs.over || out.size > MAX_READINGS, enumerable: false });
+  return Object.defineProperty(list, 'over', { value: over || out.size > MAX_READINGS, enumerable: false });
 }
 // Thrown when a limit above is hit; each policy's entry point turns it into a denial carrying the message.
 export class GuardLimit extends Error {}
