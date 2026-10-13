@@ -13,7 +13,8 @@ import { resolve, dirname, basename, posix } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { simpleCommands } from '../pipeline/hooks/lib/shell-parse.mjs';
-import { applySed } from '../pipeline/hooks/lib/sed-emulate.mjs';
+import { applySed, sedReadings } from '../pipeline/hooks/lib/sed-emulate.mjs';
+import { sedPrograms } from '../pipeline/hooks/lib/line-writes.mjs';
 import { writesOf, newWriteFrame, writtenTo, printfText, flowStart, namesFile, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, decodeEscapes, sortArgsPure } from '../pipeline/hooks/lib/line-writes.mjs';
 
 function fakeFs(root, files, dirs = []) {
@@ -1896,4 +1897,80 @@ test('L5c: the backup file of an in-place sed holds the text before the edit (or
   denyBoth("sed -i.sh 's/x/y/' src/f.sh; bash src/f.sh.sh", spec);
   // the nearest twins: no suffix, an empty one, or a backup nobody runs
   for (const l of ["sed -i 's/x/y/' ok.sh; bash g.sh.sh", "sed -i '' 's/x/y/' ok.sh; bash ok.sh", "sed -i.bak 's/x/y/' ok.sh; bash ok.sh.bak", "sed -i.bak 's/x/y/' ok.sh; bash ok.sh"]) allowBoth(l, { ...SPEC });
+});
+
+// ---- L5d: one reader of sed's options (GNU, GNU with POSIXLY_CORRECT, BSD) ------------------------------------------------------
+
+test('L5d: sedReadings reads the options once per sed (GNU permuting, GNU stopping at the first operand, BSD): in-place flag, suffixes, programs, files', () => {
+  // Why: the programs, the files, the in-place flag and the backup suffix were read by four parsers that disagreed about which words are options (BSD -l is a switch, GNU -l takes a value; BSD -i SUF swallows
+  // a dashed word, `--` after it does not end the options; GNU permutes). Every reading is judged; a word no reading can place is `unknown`.
+  const pick = (args) => Object.fromEntries(['gnu', 'posix', 'bsd'].map((d) => {
+    const r = sedReadings(args).find((x) => x.dialect === d);
+    return [d, { inPlace: r.inPlace, sufs: r.suffixes.map((s) => s.value), scripts: r.scripts, files: r.files, ...(r.unknown ? { unknown: true } : {}), ...(r.exotic ? { exotic: true } : {}) }];
+  }));
+  const same = (v) => ({ gnu: v, posix: v, bsd: v });
+  const eq = (args, want) => assert.deepEqual(pick(args), want, args.join(' '));
+  eq(['-i.sh', 's/x/y/', 'g'], same({ inPlace: true, sufs: ['.sh'], scripts: ['s/x/y/'], files: ['g'] }));
+  eq(['-nEi.sh', 'p', 'g'], same({ inPlace: true, sufs: ['.sh'], scripts: ['p'], files: ['g'] }));
+  eq(['-si', 'p', 'g'].slice(0, 1).concat(['-e', 'p', 'g']), { gnu: { inPlace: true, sufs: [''], scripts: ['p'], files: ['g'] }, posix: { inPlace: true, sufs: [''], scripts: ['p'], files: ['g'] }, bsd: { inPlace: true, sufs: ['-e'], scripts: ['p'], files: ['g'] } });
+  eq(['--in-pl=.sh', 'p', 'g'], same({ inPlace: true, sufs: ['.sh'], scripts: ['p'], files: ['g'] }));
+  eq(['--expression=-i.sh', 'g'], same({ inPlace: false, sufs: [], scripts: ['-i.sh'], files: ['g'] }));
+  eq(['-e', '-i', 'g'], same({ inPlace: false, sufs: [], scripts: ['-i'], files: ['g'] }));
+  // a bare -i: GNU takes no suffix, BSD takes the next word (so the program is the one after it)
+  eq(['-i', '.sh', 's/x/y/', 'g'], { gnu: { inPlace: true, sufs: [''], scripts: ['.sh'], files: ['s/x/y/', 'g'] }, posix: { inPlace: true, sufs: [''], scripts: ['.sh'], files: ['s/x/y/', 'g'] }, bsd: { inPlace: true, sufs: ['.sh'], scripts: ['s/x/y/'], files: ['g'] } });
+  // -l: GNU takes a value, BSD is a switch (and exotic: not emulated)
+  eq(['-li.sh', 's/x/y/', 'g'], { gnu: { inPlace: false, sufs: [], scripts: ['s/x/y/'], files: ['g'], exotic: true }, posix: { inPlace: false, sufs: [], scripts: ['s/x/y/'], files: ['g'], exotic: true }, bsd: { inPlace: true, sufs: ['.sh'], scripts: ['s/x/y/'], files: ['g'], exotic: true } });
+  assert.deepEqual(pick(['-l', '-i.sh', 'p', 'g']).bsd, { inPlace: true, sufs: ['.sh'], scripts: ['p'], files: ['g'], exotic: true });
+  assert.deepEqual(pick(['-nli.sh', 'p', 'g']).bsd.sufs, ['.sh']);
+  // BSD -i swallows `--`, which then does not end the options
+  assert.deepEqual(pick(['-i', '--', '-i.sh', 'p', 'g']).bsd, { inPlace: true, sufs: ['--', '.sh'], scripts: ['p'], files: ['g'] });
+  assert.deepEqual(pick(['-i', '--', '-i.sh', 'p', 'g']).gnu, { inPlace: true, sufs: [''], scripts: ['-i.sh'], files: ['p', 'g'] });
+  // GNU permutes (an option after the operands), the others stop at the first operand
+  eq(['p', 'g', '-i.sh'], { gnu: { inPlace: true, sufs: ['.sh'], scripts: ['p'], files: ['g'] }, posix: { inPlace: false, sufs: [], scripts: ['p'], files: ['g', '-i.sh'] }, bsd: { inPlace: false, sufs: [], scripts: ['p'], files: ['g', '-i.sh'] } });
+  // -i given twice: every suffix is kept (the last wins in sed, the reader keeps both)
+  assert.deepEqual(pick(['-i.a', '-i', 'p', 'g']).gnu.sufs, ['.a', '']);
+  // an option that is not known, an ambiguous abbreviation, a run-time word where the program or an option goes: unknown
+  for (const a of [['--s', 'p', 'g'], ['$O', 'p', 'g'], ['-n', '`echo -i`', 'p', 'g']]) for (const d of ['gnu', 'posix', 'bsd']) assert.equal(pick(a)[d].unknown, true, `${a.join(' ')} ${d}`);
+  for (const a of [['$d', 'g'], ['-n', '$p', 'g'], ['-i', '$d', 'g'], ['-e', 'p', '$F']]) for (const d of ['gnu', 'posix', 'bsd']) assert.equal(pick(a)[d].unknown, undefined, `${a.join(' ')} ${d}`);
+});
+
+test('L5d: the backup name of an in-place sed is found whichever reading makes it (-l is a BSD switch, `--` after a BSD -i SUF, a run-time BSD suffix)', () => {
+  const spec = { ...SPEC, g: 'bad' };
+  for (const l of [
+    "sed -li.sh 's/x/y/' g; bash g.sh", "sed -l -i.sh 's/x/y/' g; bash g.sh", "sed -nli.sh 's/x/y/' g; bash g.sh", "sed -i -- -i.sh 's/x/y/' g; bash g.sh", "sed -i -s -i.sh 's/x/y/' g; bash g.sh",
+    "sed 's/x/y/' g -i.sh; bash g.sh", "sed -i.a -i.sh 's/x/y/' g; bash g.sh", "sed -E -i.sh 's/x/y/' g; bash g.sh", "sed -r -i.sh 's/x/y/' g; bash g.sh", "sed -z -i.sh 's/x/y/' g; bash g.sh", "sed -u -i.sh 's/x/y/' g; bash g.sh",
+    "sed --posix -i.sh 's/x/y/' g; bash g.sh", "sed --debug -i.sh 's/x/y/' g; bash g.sh", "sed --sandbox -i.sh 's/x/y/' g; bash g.sh", "sed --follow-symlinks -i.sh 's/x/y/' g; bash g.sh", "sed --null-data -i.sh 's/x/y/' g; bash g.sh",
+    "sed --separate -i.sh 's/x/y/' g; bash g.sh", "sed --line-length 5 -i.sh 's/x/y/' g; bash g.sh", "sed -l5 -i.sh 's/x/y/' g; bash g.sh", "sed -nE -i.sh 's/x/y/' g; bash g.sh", "sed -e p -i.sh -e 's/x/y/' g; bash g.sh",
+    "sed --in-place=.sh -- 's/x/y/' g; bash g.sh", "sed --expression=p -I.sh g; bash g.sh", "sed -i .sh -e 's/x/y/' g; bash g.sh", "sed -i -n -i.sh p g; bash g.sh",
+    (_, mid) => `sed -i $S 's/x/y/' g; ${mid}; bash g.sh`, (_, mid) => `sed -i "$S" 's/x/y/' g; ${mid}; bash g.sh`, (_, mid) => `sed -i$S 's/x/y/' g; ${mid}; bash g.sh`, (_, mid) => `sed -i -- $S 's/x/y/' g; ${mid}; bash g.sh`, (_, mid) => `sed -e 's/x/y/' -i $S g; ${mid}; bash g.sh`, (_, mid) => `sed -e 's/x/y/' -i "$S" g; ${mid}; bash g.sh`,
+  ]) denyBoth(l, spec);
+  // the nearest twins: the suffix is a program, an -e value, a value of -l, or lies after the end of options; a lone program with a bare -i
+  for (const l of ["sed -i 's/x/y/' ok.sh; bash ok.sh.sh", "sed -e -i.sh ok.sh; bash ok.sh.sh", "sed --expression=-i.sh ok.sh; bash ok.sh.sh", "sed -l -i.sh ok.sh; bash ok.sh.sh", "sed -n -- p -i.sh ok.sh; bash ok.sh.sh", "sed -i 's/x/y/' ok.sh g; bash ok.sh.sh", "sed -i '$d' ok.sh g; bash ok.sh.sh"]) allowBoth(l, { ...SPEC, 'ok.sh.sh': 'ok' });
+});
+
+test('L5d: the files an in-place sed edits are found whichever reading places them (-l is a BSD switch; a run-time word where an option may go)', () => {
+  const gitFs = fakeFs(GIT_ROOT, { 'ok.sh': 'git puX origin main', 'other.sh': 'git status' }, DIRS);
+  const filesFs = fakeFs(PROJ, { 'ok.sh': 'echo x > ~/.claude/settXings.json', 'other.sh': 'echo hi' }, DIRS);
+  for (const l of [
+    "sed -i.b -l 's/X/sh/' ok.sh; bash ok.sh", "sed -nli.b 's/X/sh/' ok.sh; bash ok.sh", "sed -i.b -l 's/X/sh/' ok.sh && bash ok.sh", "sed $O 's/X/sh/' ok.sh; echo 'git push origin main'; bash ok.sh", "sed ${O}i 's/X/sh/' ok.sh; echo 'git push origin main'; bash ok.sh",
+    "sed -$O 's/X/sh/' ok.sh; echo 'git push origin main'; bash ok.sh", "sed -n$O 's/X/sh/' ok.sh; echo 'git push origin main'; bash ok.sh",
+    "sed -n -- $O ok.sh; echo 'git push origin main'; bash ok.sh",
+  ]) {
+    assert.equal(git(l, gitFs).decision, 'deny', l);
+    assert.equal(files(l.replace('X/sh/', 'X//').replace("'git push origin main'", "~/.claude/settings.json"), filesFs).decision, 'deny', l);
+  }
+  // the sed that is not run-time dependent stays what it was
+  for (const l of ["sed -n '1p' ok.sh; bash ok.sh", "sed -n '$p' ok.sh; bash ok.sh", "sed -i 's/X/sh/' other.sh; bash ok.sh"]) {
+    assert.equal(git(l, gitFs).decision, 'allow', l);
+    assert.equal(files(l.replace('X/sh/', 'X//'), filesFs).decision, 'allow', l);
+  }
+  // a run-time word where the program or an option goes is not a read-only sed (it may be -i); a $d / $p address is the sed's own
+  assert.equal(sedArgsUnsafe(['$O', 'p', 'f']), true);
+  assert.equal(sedArgsUnsafe(['-n', '$p', 'f']), false);
+  assert.equal(sedArgsUnsafe(['-n', '$d', 'f']), false);
+  assert.deepEqual(sedPrograms(['-i.sh', '-l', 's/X/sh/', 'ok.sh']).targets, ['ok.sh']); // (BSD: -l is a switch, ok.sh is edited)
+  assert.equal(sedArgsUnsafe(['--s', 'p', 'f']), true); // (ambiguous: --separate / --silent / --sandbox)
+  assert.equal(sedArgsUnsafe(['--indent', 'p', 'f']), false); // (no sed has it: a usage error)
+  // the emulation takes the reading in which the file is not edited (-i is an -e value) as an unchanged text
+  assert.deepEqual(applySed({ args: ['-e', '-i', 'f'], word: 'f' }, 'abc\n'), ['abc\n']);
 });

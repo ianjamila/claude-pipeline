@@ -11,7 +11,7 @@
 //   pipeline, races with a background job, or may repeat before it (a loop).
 // Pure: the policies supply how to expand a word and where a command runs (see newWriteFrame).
 import { commandName } from './shell-parse.mjs';
-import { applySed } from './sed-emulate.mjs';
+import { applySed, sedReadings, dynamic } from './sed-emulate.mjs';
 
 // ---- control flow -------------------------------------------------------------------------------------------
 
@@ -601,7 +601,8 @@ function argRecords(cmd, name, idx, lineEnv = {}, io = {}) {
   }
   if (name === 'sed' || name === 'gsed' || name === 'perl' || name === 'ruby') {
     const isSed = name === 'sed' || name === 'gsed';
-    const inPlace = args.some((a) => (isSed ? sedInPlaceArg(a) : /^-[A-Za-z]*i/.test(a) || a === '--in-place' || a.startsWith('--in-place='))); // (perl / ruby -I is an include path)
+    // (sed: any word that looks like -i, or a reading of the options that is in place or cannot be read; perl / ruby -I is an include path)
+    const inPlace = args.some((a) => (isSed ? sedInPlaceArg(a) : /^-[A-Za-z]*i/.test(a) || a === '--in-place' || a.startsWith('--in-place='))) || (isSed && sedReadings(args).some((r) => r.inPlace || r.unknown));
     const wfiles = isSed ? sedWriteTargets(args) : [];
     if (!inPlace) return wfiles.length ? wfiles.map((d) => unknown(d)) : null; // `w FILE` / `s///w FILE` write a file too
     // Why: an in-place edit turns the file's old text into new text (`s/X/sh/` completes `git puX`), so the file is a piece the line cannot see: `edit` (see contentsIn)
@@ -922,72 +923,37 @@ export function sedScan(prog) {
 export const sedUnsafe = (prog) => { const r = sedScan(prog); return r.runs || r.writes.length > 0 || r.unknown || SED_LEGACY.test(prog) || /(?:^|[;{}\s\d$!,])[wWe]\s*$/.test(prog); };
 // an in-place option of sed: -i / -I (BSD) in a bundle, or --in-place / any abbreviation of it (GNU takes a unique prefix: --in-pl, --i)
 export const sedInPlaceArg = (a) => /^-[A-Za-z]*[iI]/.test(a) || (a.startsWith('--') && a.length > 2 && 'in-place'.startsWith(a.slice(2).split('=')[0]));
-// The backup suffixes an in-place sed may use: GNU -i[SUF] / --in-place[=SUF] (attached only) and BSD -i SUF / -I SUF (the next word, whatever it is), as { sufs, odd }; odd: a suffix that is a
-// pattern (a * is the base name, a / names another directory) or only known at run time, so the backup may land anywhere. Every word is scanned wherever it stands (a superset of what either sed reads as an option)
+// The backup suffixes an in-place sed may use, as { sufs, odd }, from every reading of its options (sedReadings): GNU -i[SUF] / --in-place[=SUF] (attached only), BSD -i SUF / -I SUF (the next word, whatever it is).
+// sed uses the last -i of a reading, every one is kept here. odd: a suffix that is a pattern (a * is the base name, a / names another directory) or only known at run time, or a sed no reading can place:
+// the backup may land anywhere. A BSD suffix word with a / cannot name a backup (the file name + it runs through a file), and a reading with no file operand edits nothing
 const PLAIN_SUFFIX = /^[\w.~+@%=,:-]+$/;
 export function sedBackupSuffixes(args) {
   const sufs = new Set();
   let odd = false;
-  const attached = (v) => { if (v === '') return; if (PLAIN_SUFFIX.test(v)) sufs.add(v); else odd = true; };
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a === '--') break;
-    if (a.startsWith('--')) {
-      const eq = a.indexOf('=');
-      const nm = eq > 0 ? a.slice(2, eq) : a.slice(2);
-      if (nm !== '' && 'in-place'.startsWith(nm)) { if (eq > 0) attached(a.slice(eq + 1)); } else if (eq < 0 && nm !== '' && ['expression', 'file', 'line-length'].some((x) => x.startsWith(nm))) i++;
-    } else if (a.length > 1 && a[0] === '-') {
-      for (let k = 1; k < a.length; k++) {
-        const ch = a[k];
-        const rest = a.slice(k + 1);
-        if (ch === 'e' || ch === 'f' || ch === 'l') { if (rest === '') i++; break; }
-        if (ch === 'i' || ch === 'I') {
-          if (rest !== '') attached(rest);
-          else if (i + 1 < args.length && PLAIN_SUFFIX.test(args[i + 1])) sufs.add(args[i + 1]); // (BSD: the next word; one with a / or a $ cannot be a suffix in practice, and a program such as s/a/b/ is the usual GNU form)
-          break;
-        }
-      }
+  for (const r of sedReadings(args)) {
+    if (r.unknown) { odd = true; continue; }
+    if (!r.inPlace || r.files.length === 0) continue;
+    for (const { value, word } of r.suffixes) {
+      if (value === '') continue;
+      if (dynamic(value)) odd = true;
+      else if (word) { if (!value.includes('/')) sufs.add(value); } else if (PLAIN_SUFFIX.test(value)) sufs.add(value);
+      else odd = true;
     }
   }
   return { sufs: [...sufs], odd };
 }
-// The sed programs among the arguments: the script words (-e PROG, -ePROG, -ne PROG, --expression=PROG, --expression PROG; a GNU long option may be abbreviated: --expr) and, when there
-// is none, the first positional word (the rest are files: a file named web.ts / etc/passwd / ~/.claude/pipeline/... is not a `w` / `e` / `s///e` program). BSD `-i ''` takes its suffix before the
-// program, so after a bare -i the second positional word is scanned too. `file`: a -f / --file script, whose text we do not read here. `targets`: the file words.
+// The sed programs among the arguments (the -e / --expression words, or the first operand when there is none; the rest are files: a file named web.ts / etc/passwd / ~/.claude/pipeline/... is not a `w` /
+// `e` / `s///e` program), `file`: a -f / --file script (whose text we do not read here) or a word no reading can place, `targets`: the file words. All come from the readings of the options
+// (sedReadings: GNU, GNU stopping at the first operand, BSD), so a word that one of them takes for the program, a suffix or a file is judged as that
 export function sedPrograms(args) {
-  const progs = [];
-  const pos = [];
-  const early = new Set(); // positional words that come before an option word: BSD / POSIXLY_CORRECT sed stop reading options at the first of them, so it is the program there
-  let file = false;
-  let script = false;
-  let bareInPlace = false;
-  let dashedSuffix = false; // BSD: the word after a bare -i is its suffix, even a dashed one (`-i -l 'w o' f`)
-  const values = []; // values of the options that take one (-l N, --line-length N, -f / --file): under a dashed suffix they may be the program
-  const longIs = (nm, full) => nm !== '' && full.startsWith(nm);
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a === '--') { pos.push(...args.slice(i + 1)); break; }
-    if (a.startsWith('-') && a.length > 1) for (const w of pos) early.add(w);
-    if (a.startsWith('--')) {
-      const eq = a.indexOf('=');
-      const nm = eq > 0 ? a.slice(2, eq) : a.slice(2);
-      if (longIs(nm, 'expression')) { script = true; progs.push(eq > 0 ? a.slice(eq + 1) : (args[++i] ?? '')); } else if (longIs(nm, 'file')) { file = true; script = true; values.push(eq > 0 ? a.slice(eq + 1) : (args[i + 1] ?? '')); if (eq < 0) i++; } else if (longIs(nm, 'line-length')) { values.push(eq > 0 ? a.slice(eq + 1) : (args[i + 1] ?? '')); if (eq < 0) i++; }
-    } else if (a.length > 1 && a[0] === '-') {
-      for (let k = 1; k < a.length; k++) {
-        const rest = a.slice(k + 1);
-        if (a[k] === 'e') { script = true; progs.push(rest !== '' ? rest : (args[++i] ?? '')); break; }
-        if (a[k] === 'f') { file = true; script = true; values.push(rest !== '' ? rest : (args[i + 1] ?? '')); if (rest === '') i++; break; }
-        if (a[k] === 'l') { values.push(rest !== '' ? rest : (args[i + 1] ?? '')); if (rest === '') { progs.push(args[i + 1] ?? ''); i++; } break; } // (-l takes a value in GNU, is a switch in BSD: that word is a program in one reading)
-        if (a[k] === 'i' || a[k] === 'I') { if (rest === '') { bareInPlace = true; if ((args[i + 1] ?? '').startsWith('-')) dashedSuffix = true; } break; } // -i[SUFFIX] (BSD -I too; BSD takes a bare suffix as the next word)
-      }
-    } else pos.push(a);
-  }
-  if (!script) progs.push(...pos.slice(0, bareInPlace ? 2 : 1));
-  progs.push(...[...early].filter((w) => !progs.includes(w)));
-  if (dashedSuffix) progs.push(...[...pos, ...values].filter((w) => !progs.includes(w))); // (strict: the swallowed option may have hidden which word is the program)
-  // the files it edits / reads: every positional word when a script option gave the program, else those after the program (after a bare -i the first word is the program (GNU) or the suffix (BSD): every word is a possible file; so is a word before an option)
-  const targets = [...new Set([...(script || bareInPlace ? pos : pos.slice(1)), ...early])];
-  return { progs, file, targets };
+  const rs = sedReadings(args);
+  // (strict: after a BSD -i that swallowed a dashed word, the swallowed option may have hidden which word is the program: every operand and option value may be one)
+  const dashed = rs.some((r) => r.suffixes.some((x) => x.word && x.value.startsWith('-')));
+  return {
+    progs: [...new Set(rs.flatMap((r) => [...r.scripts, ...(dashed ? [...r.files, ...r.values] : [])]))],
+    file: rs.some((r) => r.scriptFiles.length > 0 || r.unknown),
+    targets: [...new Set(rs.flatMap((r) => r.files))],
+  };
 }
 // The files the sed programs `r` / `R` read into their output (sources of what the sed writes)
 export function sedReadFiles(args) {

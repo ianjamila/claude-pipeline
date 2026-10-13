@@ -370,10 +370,14 @@ function execute(r, quiet, text, dialect, qFull) {
 // ---- the arguments ----------------------------------------------------------------------------------------------------
 
 const LONG = ['quiet', 'silent', 'regexp-extended', 'in-place', 'expression', 'separate', 'unbuffered', 'posix', 'debug', 'follow-symlinks', 'sandbox', 'binary', 'line-length', 'file', 'null-data', 'zero-terminated', 'help', 'version'];
-// one reading of the arguments: GNU (options anywhere, -i takes an attached suffix only) or BSD (options end at the first operand, a bare -i takes the next word as its suffix)
-function readArgs(args, bsd) {
-  const r = { quiet: false, ere: false, files: [], prog: null, stream: false, consumed: new Set(), opts: [] };
-  const scripts = [];
+// The one reader of sed's arguments (the programs, the files, the in-place flag and the backup suffix all come from it). `dialect` is the sed reading them: 'gnu' (options anywhere, -i takes an attached suffix
+// only), 'posix' (GNU options, but they end at the first operand: POSIXLY_CORRECT) or 'bsd' (options end at the first operand, a bare -i / -I takes the next word as its suffix, -l is a switch, a `--` swallowed as a
+// suffix does not end the options). Returns { inPlace, suffixes: [{ value, word }], scripts, scriptFiles, files, values, consumed, opts, quiet, ere, stream, exotic, unknown, bad }:
+// `exotic`: an option the emulation does not model (-f -l -z -b -a --posix ...) or that no sed has (a usage error: nothing is edited); `unknown`: a word this reading cannot place (an ambiguous --abbreviation, a
+// run-time word where the program or an option goes): the caller treats the sed as possibly editing anything; `bad`: no program (sed stops with a usage error).
+export function readSedArgs(args, dialect) {
+  const bsd = dialect === 'bsd';
+  const r = { dialect, inPlace: false, suffixes: [], scripts: [], scriptFiles: [], files: [], values: [], consumed: new Set(), opts: [], quiet: false, ere: false, stream: false, exotic: false, unknown: false, bad: false };
   const pos = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -381,13 +385,17 @@ function readArgs(args, bsd) {
     if (a.startsWith('--')) {
       const eq = a.indexOf('=');
       const nm = eq > 0 ? a.slice(2, eq) : a.slice(2);
-      const full = LONG.includes(nm) ? nm : LONG.filter((x) => nm !== '' && x.startsWith(nm)).length === 1 ? LONG.find((x) => x.startsWith(nm)) : null;
-      if (full === null) return null;
+      const hits = LONG.filter((x) => nm !== '' && x.startsWith(nm));
+      const full = LONG.includes(nm) ? nm : hits.length === 1 ? hits[0] : null;
+      // Why: a --name no sed has stops with a usage error and edits nothing (not emulated); an ambiguous abbreviation (--s, --f) may be any candidate
+      if (full === null) { if (hits.length > 1) r.unknown = true; else r.exotic = true; continue; }
       r.opts.push(a);
+      const val = () => (eq > 0 ? a.slice(eq + 1) : (args[++i] ?? ''));
       if (full === 'quiet' || full === 'silent') r.quiet = true;
       else if (full === 'regexp-extended') r.ere = true;
-      else if (full === 'expression') { scripts.push(eq > 0 ? a.slice(eq + 1) : (args[++i] ?? '')); r.consumed.add(scripts[scripts.length - 1]); }
-      else if (['line-length', 'posix', 'file', 'null-data', 'zero-terminated', 'help', 'version'].includes(full)) return null;
+      else if (full === 'in-place') { r.inPlace = true; r.suffixes.push({ value: eq > 0 ? a.slice(eq + 1) : '', word: false }); } // (optional argument: attached only)
+      else if (full === 'expression') { r.scripts.push(val()); r.consumed.add(r.scripts[r.scripts.length - 1]); }
+      else if (full === 'file') { r.scriptFiles.push(val()); r.values.push(r.scriptFiles[r.scriptFiles.length - 1]); r.exotic = true; } else if (full === 'line-length') { r.values.push(val()); r.exotic = true; } else if (['posix', 'null-data', 'zero-terminated', 'help', 'version'].includes(full)) r.exotic = true;
     } else if (a.length > 1 && a[0] === '-') {
       r.opts.push(a);
       for (let k = 1; k < a.length; k++) {
@@ -397,28 +405,48 @@ function readArgs(args, bsd) {
         else if (ch === 'E' || ch === 'r') r.ere = true;
         else if (ch === 's' || ch === 'u') continue;
         else if (ch === 'i' || ch === 'I') {
+          r.inPlace = true;
           if (ch === 'I') r.stream = true; // (BSD -I: the files are one input stream)
-          if (rest === '' && bsd) { i++; r.consumed.add(args[i] ?? ''); } // (BSD: the next word is the suffix, whatever it looks like)
+          if (rest !== '') r.suffixes.push({ value: rest, word: false });
+          else if (bsd) { // (BSD: the next word is the suffix, whatever it looks like)
+            if (i + 1 >= args.length) r.bad = true; else { i++; r.suffixes.push({ value: args[i], word: true }); r.consumed.add(args[i]); }
+          } else r.suffixes.push({ value: '', word: false });
           break;
         } else if (ch === 'e') {
-          scripts.push(rest !== '' ? rest : (args[++i] ?? ''));
-          r.consumed.add(scripts[scripts.length - 1]);
+          r.scripts.push(rest !== '' ? rest : (args[++i] ?? ''));
+          r.consumed.add(r.scripts[r.scripts.length - 1]);
           break;
-        } else return null; // (-f -z -l --posix ...: -l takes a value in GNU and is a switch in BSD, the others are not emulated: never pick one)
+        } else if (ch === 'f') {
+          r.scriptFiles.push(rest !== '' ? rest : (args[++i] ?? ''));
+          r.values.push(r.scriptFiles[r.scriptFiles.length - 1]);
+          r.exotic = true;
+          break;
+        } else if (ch === 'l') {
+          r.exotic = true; // (-l takes a value in GNU and is a switch in BSD)
+          if (!bsd) { r.values.push(rest !== '' ? rest : (args[i + 1] ?? '')); if (rest === '') i++; break; }
+        } else if (ch === 'z' || ch === 'b' || ch === 'a') r.exotic = true;
+        else if (ch === '$' || ch === '`') r.unknown = true; // (an option letter the shell fills in)
+        else r.exotic = true; // (an option no sed has: a usage error)
       }
-    } else if (bsd) { pos.push(...args.slice(i)); break; } else pos.push(a);
+    } else {
+      // Why: the word that would be the program may be an option instead when the shell fills it in
+      if (!r.scripts.length && !r.scriptFiles.length && pos.length === 0 && /^[`$]/.test(a) && dynamic(a)) r.unknown = true;
+      if (bsd || dialect === 'posix') { pos.push(...args.slice(i)); break; }
+      pos.push(a);
+    }
   }
-  if (scripts.length) r.prog = scripts.join(NL);
-  else { if (!pos.length) return null; r.prog = pos.shift(); r.consumed.add(r.prog); }
+  if (r.unknown) { r.scripts.push(...pos.slice(0, 1)); r.files = pos; return r; } // (a reading that cannot place the words: every one may be a program or a file)
+  if (!r.scripts.length && !r.scriptFiles.length) { if (!pos.length) r.bad = true; else { r.scripts.push(pos.shift()); r.consumed.add(r.scripts[0]); } }
   r.files = pos;
-  r.nfiles = pos.length;
   return r;
 }
+export const sedReadings = (args) => ['gnu', 'posix', 'bsd'].map((d) => readSedArgs(args, d));
 
 const MEMO = new Map();
 // $name, ${...}, $(...) and backticks are the shell's, not the program's; $d $p $s $q are sed addresses ($1 $@ $! ... are the shell's) unless the line assigns a variable of that name
 const SPECIAL = /\$([dpsq])(?![A-Za-z0-9_])|\$!/g;
-const dynamic = (prog) => /[`]|\$[A-Za-z0-9_{(@*#?$!\-[]/.test(prog.replace(SPECIAL, ''));
+// Why: a word the shell has not finished (`$O`, `${n}p`, a backtick) may be any option (`-i`) or program text; an address such as `$d` / `$p` is the sed's own
+export const dynamic = (prog) => /[`]|\$[A-Za-z0-9_{(@*#?$!\-[]/.test(prog.replace(SPECIAL, ''));
 // Why: in single quotes `$d` / `$!` are the program's, in double quotes the shell turns them into nothing (an unset variable) or a process id, and what is left of the program (`;s/X/sh/`) is another program: every way is a reading
 function progVariants(prog, vars) {
   const parts = [];
@@ -440,13 +468,16 @@ function prepare(args, vars) {
   const key = args.join('\u0000') + '\u0001' + [...vars].filter((v) => v.length === 1).sort().join('');
   if (MEMO.has(key)) return MEMO.get(key);
   let out = [];
-  for (const bsd of [false, true]) {
-    const r = readArgs(args, bsd);
-    if (r === null) { out = null; break; }
+  for (const dialect of ['gnu', 'posix', 'bsd']) {
+    const r = readSedArgs(args, dialect);
+    // (an option not modelled, a word no reading can place, a script file, no program: not emulated)
+    if (r.exotic || r.unknown || r.bad || r.scriptFiles.length) { out = null; break; }
+    r.prog = r.scripts.join(NL);
+    r.nfiles = r.files.length;
     const progs = dynamic(r.prog) ? null : progVariants(r.prog, vars);
     if (progs === null) { out = null; break; }
     for (const prog of progs) {
-      if (!out.some((x) => x.prog === prog && x.ere === r.ere && x.quiet === r.quiet && [...x.files].join('\u0000') === r.files.join('\u0000'))) out.push({ ...r, prog, files: new Set(r.files), operands: r.files, compiled: undefined });
+      if (!out.some((x) => x.prog === prog && x.ere === r.ere && x.quiet === r.quiet && x.inPlace === r.inPlace && [...x.consumed].join('\u0000') === [...r.consumed].join('\u0000') && [...x.files].join('\u0000') === r.files.join('\u0000'))) out.push({ ...r, prog, files: new Set(r.files), operands: r.files, compiled: undefined });
     }
   }
   if (MEMO.size > 500) MEMO.clear();
@@ -470,6 +501,8 @@ export function applySed({ args, word, vars = [] }, text) {
   if (readings === null) return null;
   const outs = new Set();
   for (const r of readings) {
+    // a reading in which this sed does not edit in place (its -i is an -e value, or an operand) leaves the text as it is
+    if (!r.inPlace) { outs.add(text); continue; }
     // Why: a word the reading takes for the program or a suffix is not edited; any other word it does not know as an operand is a differential in the reading: not computed
     if (!r.files.has(word)) { if (r.consumed.has(word)) { outs.add(text); continue; } return null; }
     const c = compiled(r);
