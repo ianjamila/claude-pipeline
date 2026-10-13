@@ -125,3 +125,14 @@ test('F2c 85: git-policy does not take the link\'s parent for the directory of `
   assert.equal(run('cd sub/..; git push origin HEAD').decision, 'allow');
   assert.equal(run('git push origin HEAD').decision, 'allow');
 });
+
+// Why (item 77): `cd "$(dirname "$0")"` with a relative $0 (`scripts/run` -> `cd scripts`) is looked up along CDPATH first.
+test('F2c 77: the script\'s own directory (a relative dirname) is unknown while CDPATH may be set', () => {
+  const fs = fakeFs(PROJ, { ...BASE, 'scripts/run': 'cd "$(dirname "$0")"\necho x > settings.json\n' }, ['/home/u/.cla' + 'ude/scripts']);
+  const run = (c, env = {}) => evaluateBashForFiles(c, { home: '/home/u', env, platform: 'linux', realpath: (p) => p, cwd: PROJ, ...fs, existsSync: fs.pathExists });
+  const cp = 'CDPATH=/home/u/.cla' + 'ude';
+  for (const c of [`${cp} bash scripts/run`, `export ${cp}; bash scripts/run`, `${cp}; bash scripts/run`]) assert.equal(run(c).decision, 'deny', c);
+  assert.equal(run('bash scripts/run', { CDPATH: '/home/u/.cla' + 'ude' }).decision, 'deny');
+  assert.equal(run('bash scripts/run').decision, 'allow');
+  assert.equal(run(`${cp} bash /home/u/proj/scripts/run`).decision, 'allow'); // (an absolute $0 has an absolute dirname: no CDPATH lookup)
+});

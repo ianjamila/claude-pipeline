@@ -859,6 +859,8 @@ function modelledCd(t, cmds, idx, ctx) {
     if (!ctx.selfAbs && earlierMove) return null;
     // (something earlier in the script may have changed $0: BASH_ARGV0 / `0=` assigned, or code run by source / . / eval)
     if (touched(['BASH_ARGV0']) || cmds.some((c) => Object.hasOwn(c.env ?? {}, '0') || c.argv.some((a) => /^0\+?=/.test(a))) || cmds.slice(0, idx).some((c) => ['source', '.', 'eval'].includes(baseOf(c.argv[0] ?? '')))) return null;
+    // (a relative $0 gives a relative dirname (`scripts/run` -> `scripts`), which `cd` looks up along CDPATH first: the line's, the environment's, one a source may have set)
+    if (!ctx.selfAbs && ((ctx.env?.CDPATH ?? '') !== '' || touched(['CDPATH']))) return null;
     return posix.normalize(posix.join(posix.dirname(self), sub(m[m.length - 1])));
   }
   let m = /^\$\(\s*git\s+rev-parse\s+--show-toplevel\s*\)(\/[\w./-]*)?$/.exec(t);
