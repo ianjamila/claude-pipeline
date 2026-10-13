@@ -11,6 +11,7 @@
 // - Everything is bounded (hard cap 15 s) and every effect (fetch, spawn, gh, git, clock, fs dirs) is injectable.
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn as nodeSpawn } from 'node:child_process';
@@ -223,6 +224,7 @@ export function parseSecrets(text) {
 
 const TOPIC_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const TOKEN_RE = /^[A-Za-z0-9_.-]{1,256}$/;
+const MACHINE_RE = /^[A-Za-z0-9 _.-]{1,20}$/;
 const DEFAULT_SERVER = 'https://ntfy.sh';
 
 function validServer(value) {
@@ -239,7 +241,9 @@ function validServer(value) {
 
 // { ok:true, topic, server, token } | { ok:false, reason }. Per field: the environment first, then the file. A field that
 // is present but invalid stops the send (never a fallback to another server or a looser value). A blank topic or token
-// counts as unset; a blank server does not (the default applies only when NTFY_SERVER is unset everywhere).
+// counts as unset; a blank server does not (the default applies only when NTFY_SERVER is unset everywhere). The optional
+// NTFY_MACHINE (the label shown in the title) is read the same way but is cosmetic: an invalid value is dropped
+// (`machineInvalid: true`) and never stops the send.
 export function loadNotifyConfig({ env = process.env, secretsFile, readFile = (f) => fs.readFileSync(f, 'utf8') } = {}) {
   if (String(env.PIPELINE_NOTIFY ?? '').toLowerCase() === 'off') return { ok: false, reason: 'disabled' };
   const file = secretsFile ?? env.PIPELINE_SECRETS_FILE ?? DEFAULT_SECRETS_FILE;
@@ -269,7 +273,19 @@ export function loadNotifyConfig({ env = process.env, secretsFile, readFile = (f
   }
   if (token === INVALID || (token !== undefined && !TOKEN_RE.test(token))) return { ok: false, reason: 'invalid-config:token' };
   if (topic === undefined) return { ok: false, reason: 'no-topic' };
-  return { ok: true, topic, server, token };
+  const rawMachine = pick('NTFY_MACHINE');
+  const machineInvalid = rawMachine !== undefined && (rawMachine === INVALID || !MACHINE_RE.test(rawMachine));
+  return { ok: true, topic, server, token, ...(rawMachine !== undefined && !machineInvalid ? { machine: rawMachine } : {}), ...(machineInvalid ? { machineInvalid: true } : {}) };
+}
+
+// Which machine the run is on: Mac (darwin), PC (WSL or Windows), otherwise the sanitized hostname.
+export function machineLabel({ platform = process.platform, wsl = false, hostname = () => os.hostname() } = {}) {
+  if (platform === 'darwin') return 'Mac';
+  if (wsl || platform === 'win32') return 'PC';
+  let h = '';
+  try { h = String(hostname() ?? ''); } catch { /* fall through */ }
+  h = h.trim().replace(/[^A-Za-z0-9 _.-]+/g, '-').slice(0, 20).trim();
+  return h || 'unknown';
 }
 
 // Replace every secret (and the server path) with *** in text that may be surfaced.
@@ -296,14 +312,16 @@ export function scrubber({ topic, token, server } = {}) {
 const clean = (s) => String(s ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
 const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 
-export function buildTitle(pr, title) {
+// `machine` is the "[Mac]" prefix; the whole title is clipped to 80 characters, so the label is never cut away.
+export function buildTitle(pr, title, machine) {
   const t = clean(title);
-  if (!pr) return clip(t || 'Pipeline', 80);
-  return clip(t ? `#${pr} ${t}` : `#${pr}`, 80);
+  const prefix = machine ? `[${machine}] ` : '';
+  if (!pr) return clip(`${prefix}${t || 'Pipeline'}`, 80);
+  return clip(`${prefix}${t ? `#${pr} ${t}` : `#${pr}`}`, 80);
 }
 
 // -> { title, message, priority, tags, click? }. Body: "<label>: <action> [items: ids] (repo)", at most 300 characters.
-export function buildMessage(ev, { repoName, click } = {}) {
+export function buildMessage(ev, { repoName, click, machine } = {}) {
   const def = EVENTS[ev.event] ?? {};
   const label = ev.label ?? def.label ?? ev.event;
   const ids = (ev.ids ?? []).filter((i) => !/^(issue|revert)#/.test(i));
@@ -312,7 +330,7 @@ export function buildMessage(ev, { repoName, click } = {}) {
   if (head.length + suffix.length > 300) head = `${head.slice(0, 300 - suffix.length - 1)}…`;
   const tags = [ev.tag ?? def.tag, repoName && repoName.replace(/[^A-Za-z0-9_-]/g, '')].filter(Boolean);
   return {
-    title: buildTitle(ev.pr, ev.title),
+    title: buildTitle(ev.pr, ev.title, machine),
     message: head + suffix,
     priority: ev.priority ?? def.priority ?? 4,
     tags,
@@ -444,11 +462,32 @@ function within(promise, ms, fallback) {
   return Promise.race([Promise.resolve(promise), t]).finally(() => clearTimeout(timer));
 }
 
-async function sendNtfy({ cfg, push, fetchFn, timeoutMs, signal }) {
+// Node's happy-eyeballs gives each resolved address only 250 ms (net.getDefaultAutoSelectFamilyAttemptTimeout()). Measured on
+// the owner's WSL2 PC (Node 24.21) that failed ~4 of 5 real publishes with ETIMEDOUT after ~282 ms; 2500 ms succeeded 5/5.
+// The pipeline CLI is a short-lived process, so raising the process-wide default is acceptable. It only ever raises, and is a
+// no-op on a Node without the API (engines >=20). get/set are injectable for the test.
+export const MIN_ATTEMPT_TIMEOUT_MS = 2500;
+export function raiseAutoSelectFamilyTimeout({ get = net.getDefaultAutoSelectFamilyAttemptTimeout, set = net.setDefaultAutoSelectFamilyAttemptTimeout, minMs = MIN_ATTEMPT_TIMEOUT_MS } = {}) {
+  if (typeof get !== 'function' || typeof set !== 'function') return false;
+  try {
+    const cur = get();
+    if (typeof cur === 'number' && cur >= minMs) return false;
+    set(minMs);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// One retry on a network-level failure (fetch rejected) when at least this much of the ntfy budget remains.
+const RETRY_MIN_REMAINING_MS = 1000;
+
+async function sendNtfy({ cfg, push, fetchFn, timeoutMs, signal, nowFn = () => Date.now() }) {
   const controller = new AbortController();
   const onCap = () => controller.abort();
   signal?.addEventListener('abort', onCap, { once: true });
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const startedAt = nowFn();
   const body = {
     topic: cfg.topic,
     title: push.title,
@@ -460,16 +499,25 @@ async function sendNtfy({ cfg, push, fetchFn, timeoutMs, signal }) {
   const headers = { 'Content-Type': 'application/json' };
   if (cfg.token) headers.Authorization = `Bearer ${cfg.token}`;
   try {
-    const res = await within(
-      fetchFn(cfg.server, { method: 'POST', headers, body: JSON.stringify(body), signal: controller.signal }),
-      timeoutMs,
-      'timeout',
-    );
-    if (res === 'timeout') return { status: 'failed', detail: 'timed out' };
-    if (!res?.ok) return { status: 'failed', detail: `HTTP ${res?.status ?? '?'}` };
-    return { status: 'sent' };
-  } catch (err) {
-    return { status: 'failed', detail: String(err?.message ?? err) };
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const remaining = Math.max(1, timeoutMs - (nowFn() - startedAt));
+        const res = await within(
+          fetchFn(cfg.server, { method: 'POST', headers, body: JSON.stringify(body), signal: controller.signal }),
+          remaining,
+          'timeout',
+        );
+        if (res === 'timeout') return { status: 'failed', detail: 'timed out' };
+        // Any HTTP response is final: a 4xx/5xx is never retried.
+        if (!res?.ok) return { status: 'failed', detail: `HTTP ${res?.status ?? '?'}` };
+        return { status: 'sent' };
+      } catch (err) {
+        const left = timeoutMs - (nowFn() - startedAt);
+        if (attempt >= 2 || controller.signal.aborted || left < RETRY_MIN_REMAINING_MS) {
+          return { status: 'failed', detail: String(err?.message ?? err) };
+        }
+      }
+    }
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener('abort', onCap);
@@ -615,6 +663,8 @@ async function runNotify(event, deps, { transports, errors, budget, signal, out,
   const env = deps.env ?? process.env;
   const now = deps.now ?? (() => Date.now());
   const cwd = deps.cwd ?? process.cwd();
+  // Only the real transport needs the slow-network tolerance; a test that injects fetch never touches the process default.
+  if (!deps.fetch) raiseAutoSelectFamilyTimeout();
   const fetchFn = deps.fetch ?? globalThis.fetch;
   const spawnFn = deps.spawn ?? nodeSpawn;
   const git = deps.git ?? defaultGit;
@@ -679,15 +729,16 @@ async function runNotify(event, deps, { transports, errors, budget, signal, out,
   const web = remote ? `https://${remote.host}/${remote.slug}` : null;
   if (!url && web && event.pr) url = `${web}/pull/${event.pr}`;
   if (event.issueNumber && web) url = event.issueUrl && /^https:\/\//.test(event.issueUrl) ? event.issueUrl : `${web}/issues/${event.issueNumber}`;
-  const push = buildMessage({ ...event, title }, { repoName, click: url });
+  const wsl = deps.isWsl ? deps.isWsl() : detectWsl({ env, readFile: deps.readFile });
+  const machine = cfg.machine ?? machineLabel({ platform: deps.platform, wsl, hostname: deps.hostname });
+  const push = buildMessage({ ...event, title }, { repoName, click: url, machine });
 
   // 3. Send. Each transport records its own result the moment it settles, so an acknowledged ntfy is never lost to a
   // hung toast (or to the hard cap), and a retry cannot send it twice.
-  const wsl = deps.isWsl ? deps.isWsl() : detectWsl({ env, readFile: deps.readFile });
   const hasPs = wsl && (deps.hasPowershell ? deps.hasPowershell() : Boolean(findOnPath('powershell.exe', env)));
   const jobs = [
     (async () => {
-      const r = await sendNtfy({ cfg, push, fetchFn, timeoutMs: budget.ntfyMs, signal });
+      const r = await sendNtfy({ cfg, push, fetchFn, timeoutMs: budget.ntfyMs, signal, nowFn: now });
       transports.ntfy = r.status;
       if (r.detail) errors.ntfy = scrub(r.detail).slice(0, 200);
       await record('ntfy', r.status);
@@ -703,7 +754,7 @@ async function runNotify(event, deps, { transports, errors, budget, signal, out,
   }
   await Promise.all(jobs);
   const sent = transports.ntfy === 'sent' || transports.toast === 'sent';
-  return out({ ...(sent ? {} : { reason: 'send-failed' }), ...(ledger ? { ledger } : {}) });
+  return out({ ...(sent ? {} : { reason: 'send-failed' }), ...(ledger ? { ledger } : {}), ...(cfg.machineInvalid ? { machineLabel: 'default (invalid NTFY_MACHINE)' } : {}) });
 }
 
 // The `notify --test` event: a timestamp in the identity so it is never deduplicated.

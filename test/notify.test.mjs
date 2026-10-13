@@ -7,8 +7,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  OUTCOME_EVENTS, classifyOutcome, defaultAction, prodEvent, prodErrorEvent, parseSecrets, loadNotifyConfig, scrubber, buildTitle,
-  buildMessage, eventKey, parseRemote, notifyEvent, testEvent, detectWsl, TOAST_SCRIPT, TOAST_AUMID, encodeToastScript, LEDGER_NAME, DEFAULT_SECRETS_FILE,
+  OUTCOME_EVENTS, classifyOutcome, defaultAction, prodEvent, prodErrorEvent, parseSecrets, loadNotifyConfig, scrubber, buildTitle, machineLabel,
+  buildMessage, eventKey, parseRemote, notifyEvent, testEvent, detectWsl, raiseAutoSelectFamilyTimeout, TOAST_SCRIPT, TOAST_AUMID, encodeToastScript, LEDGER_NAME, DEFAULT_SECRETS_FILE,
 } from '../pipeline/lib/notify.mjs';
 import { run as notifyCommand } from '../pipeline/commands/notify.mjs';
 import { UsageError } from '../pipeline/lib/cli.mjs';
@@ -82,6 +82,8 @@ function rig(over = {}) {
     cwd: dir,
     git: (args) => (args[0] === 'remote' ? 'git@github.com:acme/widgets.git' : 'abc1234def5678'),
     isWsl: () => false,
+    platform: 'linux',
+    hostname: () => 'testbox',
     // Never run a real `gh` from a test (on a runner with gh installed it would be a live process with its cwd in the temp
     // dir); the one test that exercises the real lookup opts in with realLookup.
     ...(over.realLookup ? {} : { lookup: async () => null }),
@@ -152,6 +154,85 @@ test('title is truncated to 80, and is just #N without a PR title', () => {
   assert.equal(t.length, 80);
   assert.ok(t.startsWith('#9 xxx') && t.endsWith('…'));
   assert.equal(buildTitle(9, 'two\nlines\tand   spaces'), '#9 two lines and spaces');
+});
+
+// ---- machine label -------------------------------------------------------------------------------------------------------
+
+test('machine label: Mac on darwin, PC under WSL or on win32, otherwise the sanitized hostname', () => {
+  assert.equal(machineLabel({ platform: 'darwin', wsl: false, hostname: () => 'whatever' }), 'Mac');
+  assert.equal(machineLabel({ platform: 'linux', wsl: true, hostname: () => 'whatever' }), 'PC');
+  assert.equal(machineLabel({ platform: 'win32', wsl: false, hostname: () => 'whatever' }), 'PC');
+  assert.equal(machineLabel({ platform: 'linux', wsl: false, hostname: () => '  build-box.local \n' }), 'build-box.local');
+  assert.equal(machineLabel({ platform: 'linux', wsl: false, hostname: () => 'we!rd/host' }), 'we-rd-host');
+  assert.equal(machineLabel({ platform: 'linux', wsl: false, hostname: () => 'h'.repeat(60) }).length, 20);
+  assert.equal(machineLabel({ platform: 'linux', wsl: false, hostname: () => '' }), 'unknown');
+  assert.equal(machineLabel({ platform: 'linux', wsl: false, hostname: () => { throw new Error('no'); } }), 'unknown');
+});
+
+test('title carries the machine label and the whole title is clipped to 80 with the label intact', () => {
+  assert.equal(buildTitle(9, 'A thing', 'Mac'), '[Mac] #9 A thing');
+  assert.equal(buildTitle(9, undefined, 'PC'), '[PC] #9');
+  assert.equal(buildTitle(undefined, 'Pipeline notify test', 'PC'), '[PC] Pipeline notify test');
+  const t = buildTitle(9, 'x'.repeat(200), 'a-twenty-char-label_');
+  assert.equal(t.length, 80);
+  assert.ok(t.startsWith('[a-twenty-char-label_] #9 xxx') && t.endsWith('…'));
+  assert.equal(buildMessage({ event: 'stopped', pr: 5, title: 'T', action: 'a' }, { machine: 'Mac' }).title, '[Mac] #5 T');
+});
+
+test('push title says which machine: Mac, WSL (PC), win32 (PC) and another host by hostname', async () => {
+  const cases = [
+    [{ platform: 'darwin' }, '[Mac] #12 Fix the thing'],
+    [{ platform: 'linux', isWsl: () => true }, '[PC] #12 Fix the thing'],
+    [{ platform: 'win32' }, '[PC] #12 Fix the thing'],
+    [{ platform: 'linux', hostname: () => 'ci-runner-7' }, '[ci-runner-7] #12 Fix the thing'],
+  ];
+  for (const [deps, expected] of cases) {
+    const r = rig({ deps });
+    await notifyEvent(STOP, r.deps);
+    assert.equal(r.fetchCalls[0].body.title, expected);
+  }
+});
+
+test('NTFY_MACHINE overrides the label from the environment and from the secrets file; the environment wins', async () => {
+  const e = rig({ env: { NTFY_MACHINE: 'Office Mac' }, deps: { platform: 'darwin' } });
+  await notifyEvent(STOP, e.deps);
+  assert.equal(e.fetchCalls[0].body.title, '[Office Mac] #12 Fix the thing');
+  const f = rig({ secrets: `export NTFY_TOPIC=${TOPIC}\nNTFY_MACHINE=Desk-2\n`, deps: { platform: 'darwin' } });
+  await notifyEvent(STOP, f.deps);
+  assert.equal(f.fetchCalls[0].body.title, '[Desk-2] #12 Fix the thing');
+  const both = rig({ env: { NTFY_MACHINE: 'FromEnv' }, secrets: `export NTFY_TOPIC=${TOPIC}\nNTFY_MACHINE=FromFile\n` });
+  await notifyEvent(STOP, both.deps);
+  assert.equal(both.fetchCalls[0].body.title, '[FromEnv] #12 Fix the thing');
+});
+
+test('an invalid NTFY_MACHINE is ignored: the default label is used, the push still goes out, and the result says so', async () => {
+  for (const bad of ['has/slash', 'x'.repeat(21), 'tab\there', '$(whoami)']) {
+    const r = rig({ env: { NTFY_MACHINE: bad }, deps: { platform: 'darwin' } });
+    const res = await notifyEvent(STOP, r.deps);
+    assert.equal(res.sent, true, bad);
+    assert.equal(r.fetchCalls[0].body.title, '[Mac] #12 Fix the thing');
+    assert.equal(res.machineLabel, 'default (invalid NTFY_MACHINE)');
+  }
+  const f = rig({ secrets: `export NTFY_TOPIC=${TOPIC}\nNTFY_MACHINE=$(whoami)\n`, deps: { platform: 'darwin' } });
+  const res = await notifyEvent(STOP, f.deps);
+  assert.equal(res.sent, true);
+  assert.equal(f.fetchCalls[0].body.title, '[Mac] #12 Fix the thing');
+  assert.equal(res.machineLabel, 'default (invalid NTFY_MACHINE)');
+  const ok = await notifyEvent(STOP, rig().deps);
+  assert.equal(ok.machineLabel, undefined);
+});
+
+test('the machine label is not part of the event identity or the ledger', async () => {
+  const r = rig({ deps: { platform: 'darwin' } });
+  await notifyEvent(STOP, r.deps);
+  const key = ledgerRecords(r.deps.stateDir)[0].key;
+  assert.equal(key, eventKey(STOP, { repo: 'acme/widgets', head: STOP.head }));
+  // The same event from a differently labelled machine against the same ledger is still a duplicate.
+  const again = await notifyEvent(STOP, { ...r.deps, platform: 'linux', env: { NTFY_MACHINE: 'Other' } });
+  assert.equal(again.reason, 'duplicate');
+  assert.ok(ledgerRecords(r.deps.stateDir).every((x) => x.key === key));
+  assert.ok(!r.ledger().includes('Mac'));
+  assert.equal(r.fetchCalls.length, 1);
 });
 
 test('body is at most 300 characters and keeps the repo name; needs-human lists its items', () => {
@@ -368,7 +449,7 @@ test('ntfy: JSON publish with topic, title, message, priority, tags, click and a
   assert.equal(init.method, 'POST');
   assert.equal(init.headers.Authorization, `Bearer ${TOKEN}`);
   assert.equal(body.topic, TOPIC);
-  assert.equal(body.title, '#12 Fix the thing');
+  assert.equal(body.title, '[testbox] #12 Fix the thing');
   assert.equal(body.message, 'Run stopped: Read the PR: the run stopped (widgets)');
   assert.equal(body.priority, 4);
   assert.deepEqual(body.tags, ['octagonal_sign', 'widgets']);
@@ -398,14 +479,14 @@ test('title lookup: only when the caller has no title; a failed lookup still sen
   const looked = [];
   const r = rig({ deps: { lookup: async (pr) => { looked.push(pr); return { title: 'From GitHub', url: 'https://github.com/acme/widgets/pull/12' }; } } });
   await notifyEvent({ ...STOP, title: undefined }, r.deps);
-  assert.equal(r.fetchCalls[0].body.title, '#12 From GitHub');
+  assert.equal(r.fetchCalls[0].body.title, '[testbox] #12 From GitHub');
   const s = rig({ deps: { lookup: async (pr) => { looked.push(pr); return null; } } });
   await notifyEvent(STOP, s.deps);
   assert.equal(looked.length, 1, 'a passed title skips the lookup');
   const f = rig({ deps: { lookup: async () => { throw new Error('boom'); } } });
   const res = await notifyEvent({ ...STOP, title: undefined }, f.deps);
   assert.equal(res.sent, true);
-  assert.equal(f.fetchCalls[0].body.title, '#12');
+  assert.equal(f.fetchCalls[0].body.title, '[testbox] #12');
 });
 
 test('an unknown event is not sent', async () => {
@@ -554,6 +635,71 @@ test('a lock held by another process: still sends within the budget, and says th
   }
 });
 
+// ---- slow-network tolerance: one retry, raised happy-eyeballs timeout ------------------------------------------------------
+
+const netFail = () => new TypeError('fetch failed', { cause: { code: 'ETIMEDOUT' } });
+
+test('ntfy: a network-level failure is retried once inside the budget; the ledger records one outcome', async () => {
+  let n = 0;
+  const r = rig({ fetch: async () => { if (++n === 1) throw netFail(); return { ok: true, status: 200 }; } });
+  const res = await notifyEvent(STOP, r.deps);
+  assert.equal(res.sent, true);
+  assert.equal(res.transports.ntfy, 'sent');
+  assert.equal(r.fetchCalls.length, 2);
+  assert.equal(ledgerRecords(r.deps.stateDir).filter((x) => x.kind === 'ntfy').length, 1);
+});
+
+test('ntfy: two network failures in a row fail after exactly two attempts', async () => {
+  const r = rig({ fetch: async () => { throw netFail(); } });
+  const res = await notifyEvent(STOP, r.deps);
+  assert.equal(res.transports.ntfy, 'failed');
+  assert.equal(res.errors.ntfy, 'fetch failed');
+  assert.equal(r.fetchCalls.length, 2);
+});
+
+test('ntfy: an HTTP error response is final, never retried', async () => {
+  const r = rig({ fetch: async () => ({ ok: false, status: 500 }) });
+  const res = await notifyEvent(STOP, r.deps);
+  assert.equal(res.errors.ntfy, 'HTTP 500');
+  assert.equal(r.fetchCalls.length, 1);
+});
+
+test('ntfy: no retry when too little of the budget is left', async () => {
+  const r = rig({ fetch: async () => { throw netFail(); } });
+  const res = await notifyEvent(STOP, { ...r.deps, budget: { ntfyMs: 500 } });
+  assert.equal(res.transports.ntfy, 'failed');
+  assert.equal(r.fetchCalls.length, 1);
+});
+
+test('ntfy: a hung fetch is aborted at the budget and not attempted again', async () => {
+  const r = rig({ fetch: () => new Promise(() => {}) });
+  const res = await notifyEvent(STOP, { ...r.deps, budget: { ntfyMs: 1500 } });
+  assert.equal(res.errors.ntfy, 'timed out');
+  assert.equal(r.fetchCalls.length, 1);
+});
+
+test('ntfy: a failure that comes after the budget aborted the request is not retried', async () => {
+  const r = rig({ fetch: (url, init) => new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(new Error('aborted')))) });
+  const res = await notifyEvent(STOP, { ...r.deps, budget: { ntfyMs: 1500 } });
+  assert.equal(res.transports.ntfy, 'failed');
+  assert.equal(r.fetchCalls.length, 1);
+});
+
+test('raiseAutoSelectFamilyTimeout: raises a lower value, leaves a higher one alone, no-ops without the API', () => {
+  let cur = 250;
+  const set = (v) => { cur = v; };
+  assert.equal(raiseAutoSelectFamilyTimeout({ get: () => cur, set }), true);
+  assert.equal(cur, 2500);
+  cur = 4000;
+  assert.equal(raiseAutoSelectFamilyTimeout({ get: () => cur, set }), false);
+  assert.equal(cur, 4000);
+  cur = 2500;
+  assert.equal(raiseAutoSelectFamilyTimeout({ get: () => cur, set }), false);
+  assert.equal(raiseAutoSelectFamilyTimeout({ get: null, set }), false);
+  assert.equal(raiseAutoSelectFamilyTimeout({ get: () => cur, set: null }), false);
+  assert.equal(cur, 2500);
+});
+
 // ---- budget ---------------------------------------------------------------------------------------------------------------
 
 test('a hung fetch is aborted at the ntfy timeout (even one that ignores the signal)', async () => {
@@ -581,7 +727,7 @@ test('a hung gh title lookup is killed at the lookup budget and the push still g
     const took = Date.now() - t0;
     assert.equal(res.sent, true);
     assert.ok(took >= 2000 && took < 6000, `took ${took} ms`);
-    assert.equal(r.fetchCalls[0].body.title, '#12');
+    assert.equal(r.fetchCalls[0].body.title, '[testbox] #12');
     // Positive evidence that the real lookup launched the fixture: the pid file must appear.
     for (let i = 0; i < 200 && !existsSync(pidFile); i++) await sleep(50);
     assert.ok(existsSync(pidFile), 'the lookup never started the fake gh');
@@ -629,7 +775,7 @@ test('toast: powershell.exe -EncodedCommand <constant script>, data as base64 UT
   assert.equal(Buffer.from(call.args[3], 'base64').toString('utf16le'), TOAST_SCRIPT);
   assert.equal(call.args[3], encodeToastScript());
   const payload = JSON.parse(Buffer.from(call.stdin, 'base64').toString('utf8'));
-  assert.deepEqual(payload, { title: '#12 Fix the thing', body: 'Run stopped: Read the PR: the run stopped (widgets)', url: 'https://github.com/acme/widgets/pull/12' });
+  assert.deepEqual(payload, { title: '[PC] #12 Fix the thing', body: 'Run stopped: Read the PR: the run stopped (widgets)', url: 'https://github.com/acme/widgets/pull/12' });
   assert.ok(TOAST_SCRIPT.includes(TOAST_AUMID));
   assert.ok(TOAST_SCRIPT.includes('[Console]::In.ReadToEnd()'));
   assert.ok(TOAST_SCRIPT.includes('[System.Security.SecurityElement]::Escape'));
@@ -704,7 +850,7 @@ test('notify --test sends one real push to all transports and is never deduplica
   assert.equal(b.exitCode, 0);
   assert.deepEqual(a.output.transports, { ntfy: 'sent', toast: 'sent' });
   assert.equal(r.fetchCalls.length, 2);
-  assert.equal(r.fetchCalls[0].body.title, 'Pipeline notify test');
+  assert.equal(r.fetchCalls[0].body.title, '[PC] Pipeline notify test');
   assert.notEqual(testEvent(1).cause, testEvent(2).cause);
 });
 
@@ -725,7 +871,7 @@ test('notify --event stopped --pr N --action TEXT [--cause CODE]: one push, repl
   assert.equal(a.output.ok, true);
   assert.equal(a.output.sent, true);
   assert.equal(r.fetchCalls[0].body.message, 'Run stopped: Read the blocked comment (widgets)');
-  assert.equal(r.fetchCalls[0].body.title, '#33');
+  assert.equal(r.fetchCalls[0].body.title, '[testbox] #33');
   const b = await notifyCommand(argv, ctx);
   assert.equal(b.exitCode, 0);
   assert.equal(b.output.reason, 'duplicate');

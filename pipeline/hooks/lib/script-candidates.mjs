@@ -35,7 +35,8 @@ export function execLineOf(sf, expand) {
 // Why: `${X:-w}`, `${X-w}`, `${X:=w}`, `${X:+w}` read as the value of X, the word w or nothing, depending on a state the guard does not see: every reading is judged (the value as `${X}`,
 // which a policy expands from the variables of the line). `over`: more readings than MAX_READINGS (the caller refuses).
 const MAX_READINGS = 32;
-const PARAM_OPEN = /\$\{([A-Za-z_]\w*)(:?)([-=+?])/;
+// (a parameter is a name, a name[subscript], a digit or a special parameter, optionally indirect: ${1:-w}, ${@:-w}, ${A[0]:-w}, ${!A:-w})
+const PARAM_OPEN = /\$\{(!?(?:[A-Za-z_]\w*(?:\[[^\]}]*\])?|\d+|[@*#?$!-]))(:?)([-=+?])/;
 export function paramReadings(word) {
   let list = [word];
   let over = false;
@@ -107,36 +108,57 @@ export function spliceLines(raw) {
   return { lines: [...lines], over };
 }
 
-// The command lines a program named by a variable or a default word may run, with its arguments (`G=bash; $G ev.sh`, `"${X:-bash}" ev.sh`): the policies judge each as text one level
-// deeper. A single-word reading holding a `/` is a path: the candidate list judges the file as a script.
-const quoteWord = (w) => (/^[\w@%+=:,./-]+$/.test(w) ? w : `"${w.replace(/[\\"`]/g, '\\$&')}"`);
 // Why: `: ${X:=w}` / `${X=w}` assigns X for the commands after it, so a later `$X` may be w: the words such an expansion assigns, by name
 const ASSIGNING = /\$\{([A-Za-z_]\w*):?=([^}]*)\}/g;
 export function assigningDefaults(text) {
   const out = new Map();
-  for (const m of String(text ?? '').matchAll(ASSIGNING)) out.set(m[1], [...(out.get(m[1]) ?? []), m[2]]);
+  for (const m of String(text ?? '').matchAll(ASSIGNING)) {
+    const ws = out.get(m[1]) ?? [];
+    if (!ws.includes(m[2])) ws.push(m[2]);
+    out.set(m[1], ws);
+  }
   return out;
 }
-// the readings of a word, plus those with a name an assigning expansion may have set replaced by the words it assigns
+// the readings of a word, plus those with a name an assigning expansion may have set replaced by the words it assigns, repeatedly (`: ${A:=./}; : ${B:=f.sh}; bash $A$B`).
+// An assigned word that itself holds an expansion (`${X:=${Y:-w}}`, `${X:=$X/f}`) cannot be resolved here: `over`, the caller refuses.
 export function readingsOf(word, assigned) {
   const rs = paramReadings(word);
   if (!assigned?.size) return rs;
   const out = new Set(rs);
-  for (const r of rs) for (const [n, ws] of assigned) if (new RegExp(`\\$(?:\\{${n}\\}|${n}(?![A-Za-z0-9_]))`).test(r)) for (const w of ws) out.add(r.replace(new RegExp(`\\$(?:\\{${n}\\}|${n}(?![A-Za-z0-9_]))`, 'g'), () => w));
-  const list = [...out].slice(0, MAX_READINGS);
-  return Object.defineProperty(list, 'over', { value: rs.over || out.size > MAX_READINGS, enumerable: false });
+  let over = rs.over === true;
+  const queue = [...rs];
+  while (queue.length && !over) {
+    const r = queue.shift();
+    for (const [n, ws] of assigned) {
+      if (!new RegExp(`\\$(?:\\{${n}\\}|${n}(?![A-Za-z0-9_]))`).test(r)) continue;
+      for (const w of ws) {
+        if (/[$`]/.test(w)) { over = true; break; }
+        const nr = r.replace(new RegExp(`\\$(?:\\{${n}\\}|${n}(?![A-Za-z0-9_]))`, 'g'), () => w);
+        if (out.has(nr)) continue;
+        out.add(nr);
+        queue.push(nr);
+        if (out.size > MAX_READINGS) { over = true; break; }
+      }
+      if (over) break;
+    }
+  }
+  return Object.defineProperty([...out].slice(0, MAX_READINGS), 'over', { value: over, enumerable: false });
 }
-// The command lines a program named by a variable or a default word may run, with its arguments (`G=bash; $G ev.sh`, `"${X:-bash}" ev.sh`): the policies judge each as text one level deeper.
+// The command lines a program named by a variable or a default word may run, with its arguments (`G=bash; $G ev.sh`, `"${X:-bash}" ev.sh`): the policies judge each as text one level
+// deeper. `over` (a non-enumerable property of the list): the readings were cut off or are too many, and the caller refuses.
+const quoteWord = (w) => (/^[\w@%+=:,./-]+$/.test(w) ? w : `"${w.replace(/[\\"`]/g, '\\$&')}"`);
 export function execLinesOf(sf, expand, assigned) {
-  if (sf.kind !== 'exec' || sf.words?.length !== 1 || !sf.words[0].includes('$')) return [];
+  const none = Object.defineProperty([], 'over', { value: false, enumerable: false });
+  if (sf.kind !== 'exec' || sf.words?.length !== 1 || !sf.words[0].includes('$')) return none;
   const w0 = sf.words[0];
+  const rs = readingsOf(w0, assigned);
   const out = [];
-  for (const r of readingsOf(w0, assigned)) {
+  for (const r of rs) {
     const e = expand(r).trim();
-    if (e === '' || e === w0 || e.startsWith('$') || /\$\(|`/.test(e)) continue;
+    if (e === '' || e === w0 || e.startsWith('$') || /\$\(|`/.test(e)) continue; // (still unknown: the candidate list covers it)
     out.push([e, ...(sf.args ?? []).map(quoteWord)].join(' '));
   }
-  return [...new Set(out)];
+  return Object.defineProperty([...new Set(out)], 'over', { value: rs.over === true, enumerable: false });
 }
 
 // Thrown when a limit above is hit; each policy's entry point turns it into a denial carrying the message.
@@ -324,7 +346,7 @@ function buildCandidates(sf, { expand, dirs, joinPath, readDir, ifs, assigned })
   for (const w0 of sf.words ?? []) {
     const rs = readingsOf(w0, assigned);
     if (rs.over) return { files: [], dynamic, over: true };
-    words.push(...rs);
+    words.push(w0, ...rs); // (quoting is lost: the word as written may be a file that is literally named so)
   }
   // the file `name` in each directory PATH may hold (sf.pathValues; none given: unknown). An empty PATH entry is the cwd; a directory known only at run time makes the script unknown.
   const addPathDirs = (name) => {

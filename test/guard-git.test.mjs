@@ -107,6 +107,108 @@ const DENY = [
   ['B=main; false && B=agent/x; git push origin $B'],
   ['L=human-approved; false && L=ok; gh pr edit 1 --add-label $L'],
   ['X=push; X=diff git $X origin main'],
+  // a push destination with a parameter expansion is ONE run-time word: the `:` of ${B:-x} is not a refspec separator
+  ['B=main; git push origin ${B:-x}'],
+  ['B=main; git push origin ${B:+main}'],
+  ['git push origin ${B:-main}'],
+  ['B=main; git push origin ${B:0}'],
+  ['git push origin ${B:=main}'],
+  ['git push origin ${B:-agent/x}'],
+  ['git push origin HEAD:${B:-x}'],
+  ['git push origin +HEAD:${B:-x}'],
+  ['git push origin ${B:-x}:${C:-y}'],
+  ['git push origin :${B:-x}'],
+  ['git push origin --delete ${B:-x}'],
+  ['git push origin $(echo a:b)'],
+  ['git push origin "$(echo x:main)"'],
+  ['git push origin `echo a:b`'],
+  ['git push origin HEAD:${B:-"}:main"}'],
+  ['git push origin ${B:-x'],
+  ['git push --repo=${R:-o} ${B:-agent/x}'],
+  // a run-time SOURCE can add a force prefix or more refspecs: any part of a refspec built at run time is unresolvable
+  ['git push origin ${B:-x}:agent/x'],
+  ['git push origin ${B:-${C:-+HEAD}}:agent/x'],
+  ['git push origin "${B:-${C:-+HEAD}}:agent/x"'],
+  ['git push origin ${B:-${C:-HEAD:main HEAD}}:agent/x'],
+  ['git push origin "${B:-${C:-HEAD:main HEAD}}:agent/x"'],
+  ['git push origin $(echo +HEAD):agent/x'],
+  ['git push origin `echo +HEAD`:agent/x'],
+  ['git push origin $X:agent/x'],
+  ['git push origin ${B:-x}:'],
+  // the -c VALUE is never expanded with the line's variables: an alias body assigns and pushes in its own shell
+  ['V=agent/x; git -c alias.p=\'!V=main; git push origin $V\' p'],
+  ['V=agent/x; git -c alias.p=\'!V=+HEAD:agent/x; git push origin $V\' p'],
+  ['V=agent/x; git config alias.p \'!V=main; git push origin $V\'; git p'],
+  // an option or remote built at run time can be any option; so is a known value that splits into several words
+  ['git push origin --${F:-mirror}'],
+  ['git push origin -${F:-f} agent/x'],
+  ['git push origin ${F:---force} agent/x'],
+  ['git push origin --force-with-lease=${F:-x} agent/x'],
+  ['git push origin --${X:-all}'],
+  ['git push origin --${X:-delete} agent/x'],
+  ['git push "$R" HEAD:agent/x'],
+  ['git push $R HEAD:agent/x'],
+  ['git push -o ${B:-x} origin agent/x'],
+  ['R="x HEAD:main"; git push origin $R'],
+  ['R="agent/x HEAD:main"; git push origin "$R"'],
+  ['R="agent/*"; git push origin $R'],
+  ['R=--mirror; git push origin $R'],
+  ['R=-f; git push origin $R agent/x'],
+  ['R=+HEAD:agent/x; git push origin $R'],
+  // word splitting follows IFS, not only blanks; an empty unquoted value drops the word
+  ['IFS=,; R="x,HEAD:main"; git push origin $R'],
+  ['IFS=,; R="agent/x,main"; git push origin $R'],
+  ['IFS=,; R="agent/x"; git push origin $R'],
+  ['export IFS=:; R=agent/x; git push origin $R'],
+  ['read IFS <<< ","; R="x,HEAD:main"; git push origin $R'],
+  ['IFS=; R=agent/x; git push origin $R'],
+  ['IFS=x git push origin agent/x; R=agent/x; IFS=a; git push origin $R'],
+  ['E=; git push origin $E'],
+  ['E=""; git push origin "$E"'],
+  ['E=; git push $E agent/x'],
+  // IFS assigned without the letters IFS in a row, or by a computed name
+  ['eval "I""FS=,"; R="agent/x,main"; git push origin $R'],
+  ['N=IFS; printf -v $N ,; R="agent/x,main"; git push origin $R'],
+  ['N=IFS; read $N <<< ","; R="agent/x,main"; git push origin $R'],
+  ['declare I""FS=,; R="agent/x,main"; git push origin $R'],
+  ['f() { local I""FS=,; R="agent/x,main"; git push origin $R; }; f'],
+  ['N=IFS; export "$N=,"; R="agent/x,main"; git push origin $R'],
+  ['source ./env.sh; R=agent/x; git push origin $R'],
+  ['. ./env.sh; R=agent/x; git push origin $R'],
+  ['IFS+=,; R="agent/x,main"; git push origin $R'],
+  ['IFS=, git push origin agent/x; R=agent/x,main; git push origin $R'],
+  ['R="agent/x,main"; git push origin ${=R}'],
+  ['setopt shwordsplit; R="agent/x main"; git push origin $R'],
+  // quote removal hides whether '$O' was a literal name or a variable: a push is judged under both readings
+  ['O=-o; git push origin \'$O\' HEAD:main'],
+  ['O=--push-option; git push origin \'$O\' HEAD:main'],
+  ['O=--repo; git push origin \'$O\' HEAD:main'],
+  ['O=--receive-pack; git push origin \'$O\' HEAD:main'],
+  ['O=--exec; git push origin \'$O\' HEAD:main'],
+  ['O=-o; git branch \'$O\'; git push origin \'$O\' HEAD:main'],
+  // IFS named through an attached binder option with a quoted name
+  ['printf -vI""FS ,; R=agent/x,main; git push origin $R'],
+  ['read -aI""FS <<< x; R=agent/x,main; git push origin $R'],
+  // a -c word that is (or may be) several git arguments
+  ['KV="user.name=x -C /other"; git -c $KV push origin agent/x'],
+  ['git -c $KV push origin agent/x'],
+  ['git -c user.name=$N push origin agent/x'],
+  ['git -c core.pager=${P:-cat} push origin agent/x'],
+  // a push is judged for EVERY mix of literal / expanded `$` words (the quoting of each is lost), not only all-or-none
+  ['O=-o; B=main; git push origin \'$O\' $B'],
+  ['O=-o; B=main; git branch \'$O\'; git push origin \'$O\' $B'],
+  ['O=-o; P=-f; B=main; git push origin \'$O\' \'$P\' $B'],
+  ['O=--repo; B=main; git push origin \'$O\' $B'],
+  ['O=-o; B=main; git push origin $O \'$B\' $B'],
+  ['A=agent/x; git push origin $A $A $A $A $A $A $A $A $A'],
+  // a config key / push.default value built at run time can be remote.*.push or upstream
+  ['git -c $K=HEAD:agent/x push'],
+  ['K=remote.origin.push; git -c $K=HEAD:agent/x push'],
+  ['git -c ${K:-remote.origin.push}=HEAD push'],
+  ['git -c push.default=$V push'],
+  ['git -c push.default=${V:-up}stream push'],
+  ['git config $K v; git push'],
+  ['git config ${K:-remote.origin.push} v; git push'],
 ];
 
 const ALLOW = [
@@ -141,6 +243,13 @@ const ALLOW = [
   ['git diff "$BASE"..HEAD'],
   ['git -C "$DIR" log --oneline -3'],
   ['B=agent/x; git push origin $B'], // assigned once on the line: still known
+  ['git push origin HEAD:$(git branch --show-current)'],
+  ['git push origin HEAD:agent/x'], // a literal source with a literal destination is unchanged
+  ['O=-o; B=agent/y; git push origin \'$O\' $B'],
+  ['A=agent/x; git push origin $A $A $A $A $A $A $A $A'],
+  ['export B=agent/x; git push origin $B'],
+  ['B=agent/x; git push origin ${B}'],
+  ['git -c alias.p=\'!V=agent/y; git push origin $V\' p'], // the value is judged as written, in the alias's own shell
 ];
 
 const label = (command, o) => (o ? `${command}  ${JSON.stringify(o, (k, v) => (v instanceof Error ? `Error(${v.message})` : v))}` : command);
@@ -1730,4 +1839,29 @@ test('a ( subshell hidden behind escaped quotes or a $\'…\' string is still fo
     "echo $'it\\'s (fine)'; cd /work/repo && bash step.sh",
   ];
   for (const c of allowCmds) assert.equal(evaluate(c, o).decision, 'allow', c);
+});
+
+// ---- the literal / expanded mixes of a push obey the deadline and reuse lookups ------------------------------------------------
+
+test('a push with many $ words: the mixes are bounded by the evaluation deadline (injected clock) and reuse each lookup', () => {
+  const sevenA = ' --recurse-submodules=$A'.repeat(7);
+  const base = { cwd: '/work/repo', home: '/home/u', pushDestination: () => null, issueLabels: () => [], readText: () => null, pathExists: () => false };
+  // 400 ms per clock read: the 128 mixes cannot all be judged inside the 5 s deadline, so the line is denied as too slow
+  let t = 1_000_000;
+  const slow = evaluateGitCommand(`A=no; git push${sevenA} origin agent/x`, { ...base, currentBranch: () => 'agent/x', now: () => (t += 400) });
+  assert.equal(slow.decision, 'deny');
+  assert.match(slow.reason, /took too long/);
+  // with time to spare the same line is judged, and the branch is looked up once however many mixes there are
+  let calls = 0;
+  let clock = 0;
+  const fast = evaluateGitCommand(`A=no; git push${sevenA} origin`, { ...base, currentBranch: () => { calls++; clock += 100; return 'agent/x'; }, now: () => clock });
+  assert.equal(fast.decision, 'allow');
+  assert.equal(calls, 1, 'one lookup for all 128 mixes');
+  // 100 ms per lookup, 256 mixes of a push that is denied only by its literal reading: still denied, and quickly
+  calls = 0;
+  clock = 0;
+  const dflt = ['ma', 'in'].join('');
+  const probe = evaluateGitCommand(`O=-o; A=no; git push${sevenA} origin '$O' HEAD:${dflt}`, { ...base, currentBranch: () => { calls++; clock += 100; return 'agent/x'; }, now: () => clock });
+  assert.equal(probe.decision, 'deny');
+  assert.ok(calls <= 2 && clock <= 1000, `${calls} lookups, ${clock} ms of injected time`);
 });

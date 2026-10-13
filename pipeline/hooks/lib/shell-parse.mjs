@@ -483,7 +483,7 @@ const INTERP_VALUE_FLAGS = new Set(['-r', '--require', '--import', '--loader', '
 // Why: a command whose OPTIONS can make it run code (a shell's `-c` / `-s`, `source`, an interpreter, find -exec, sed -e / w, awk, make) and that has a word with a default / alternative
 // (`bash ${A:--c ./ev.sh}`): the word may be an option when A is unset, so the policies judge the line again with each reading (see spliceLines).
 const SPLICE_HEADS = new Set(['source', '.', 'eval', 'find', 'awk', 'gawk', 'mawk', 'sed', 'gsed', 'make', 'gmake']);
-const DEFAULTED_WORD = /\$\{[A-Za-z_]\w*:?[-=+]/;
+const DEFAULTED_WORD = /\$\{!?(?:[A-Za-z_]\w*(?:\[[^\]}]*\])?|\d+|[@*#?$!-]):?[-=+]/;
 export function splicesOptions(argv) {
   if (!argv?.length) return false;
   const name = base(argv[0]);

@@ -46,8 +46,29 @@ const CURRENT_BRANCH_IDIOM = /^(?:\$\(|`)\s*git\s+(?:branch\s+--show-current|rev
 // Config the environment can inject into git (GIT_CONFIG_COUNT/KEY_n/VALUE_n, GIT_CONFIG_PARAMETERS, GIT_CONFIG_GLOBAL/SYSTEM).
 const GIT_ENV_CONFIG = /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+|PARAMETERS|GLOBAL|SYSTEM)$/i;
 // Config that can redirect a bare `git push` somewhere the branch name does not suggest.
-const RISKY_CONFIG = (key, value) => /^remote\..*\.push$/.test(key) || /^branch\./.test(key)
-  || (key === 'push.default' && /^(upstream|tracking|matching)$/i.test(value));
+// A key or push.default value built at run time (`-c $K=HEAD:main`, `-c push.default=${V:-up}stream`) can be any of them.
+const RISKY_CONFIG = (key, value) => DYNAMIC.test(key) || /^remote\..*\.push$/.test(key) || /^branch\./.test(key)
+  || (key === 'push.default' && (DYNAMIC.test(value) || /^(upstream|tracking|matching)$/i.test(value)));
+
+// Index of the first `sep` that is NOT inside a `${…}`, `$(…)`, `$((…))` or backtick expansion; -1 when there is none or the
+// word cannot be split reliably (an unbalanced expansion, or a quote / backslash inside one, which can hide a bracket or the
+// separator). -1 makes the caller treat the whole word as ONE run-time value, which is then denied: `${B:-x}` is a single
+// unresolvable word, never the refspec `${B` : `-x}`.
+function splitIndex(word, sep) {
+  const stack = [];
+  for (let i = 0; i < word.length; i++) {
+    const c = word[i];
+    const top = stack[stack.length - 1];
+    if (c === '\\') { if (stack.length) return -1; i++; continue; }
+    if (stack.length && (c === "'" || c === '"')) return -1;
+    if (c === '`') { if (top === '`') stack.pop(); else stack.push('`'); continue; }
+    if (c === '$' && (word[i + 1] === '{' || word[i + 1] === '(')) { stack.push(word[i + 1] === '{' ? '}' : ')'); i++; continue; }
+    if (c === '(' && top === ')') { stack.push(')'); continue; }
+    if (stack.length && c === top) { stack.pop(); continue; }
+    if (!stack.length && c === sep) return i;
+  }
+  return -1;
+}
 
 const deny = (reason) => ({ decision: 'deny', reason });
 const allowed = () => ({ decision: 'allow', reason: '' });
@@ -210,10 +231,21 @@ function nextDir(dir, name, argv, ctx, cdpath = false) {
   return joinDir(dir, operands[0], ctx);
 }
 
+// The repository does not change while a line is judged, so each lookup is made once per evaluation (a push judged in many mixes, a
+// script judged in many readings, must not repeat a call that can take seconds). Errors are remembered as unknown too.
+function memoLookup(ctx, key, fn) {
+  const memo = (ctx.budget.lookups ??= new Map());
+  const k = JSON.stringify(key);
+  if (!memo.has(k)) { try { memo.set(k, { v: fn() }); } catch { memo.set(k, { err: true }); } }
+  const e = memo.get(k);
+  if (e.err) throw new Error('lookup failed');
+  return e.v;
+}
+
 function branchOf(dir, gitDir, ctx) {
   if (dir === null) return null;
   let b;
-  try { b = ctx.currentBranch(dir, { gitDir }); } catch { return null; }
+  try { b = memoLookup(ctx, ['branch', dir, gitDir ?? null], () => ctx.currentBranch(dir, { gitDir })); } catch { return null; }
   if (typeof b !== 'string') return null;
   b = b.trim().replace(/^refs\/heads\//, '');
   return b === '' || b === 'HEAD' ? null : b;
@@ -239,7 +271,7 @@ function effectiveBranch(dir, gitDir, ctx) {
 function pushDestOf(dir, gitDir, ctx, branch) {
   if (dir === null) return null;
   let d;
-  try { d = ctx.pushDestination(dir, branch === undefined ? { gitDir } : { gitDir, branch }); } catch { return null; }
+  try { d = memoLookup(ctx, ['push', dir, gitDir ?? null, branch ?? null], () => ctx.pushDestination(dir, branch === undefined ? { gitDir } : { gitDir, branch })); } catch { return null; }
   return typeof d === 'string' && d.trim() ? d.trim() : null;
 }
 
@@ -267,8 +299,13 @@ function globMatchesProtected(pattern) {
 
 function checkRefspec(spec, dir, gitDir, ctx) {
   if (spec.startsWith('+')) return deny(FORCE_REASON);
-  const colon = spec.indexOf(':');
+  const colon = splitIndex(spec, ':');
   const src = colon < 0 ? spec : spec.slice(0, colon);
+  // A run-time source can carry a `+` (force) prefix or word-split into more refspecs (`${B:-${C:-+HEAD}}:agent/x`), so a
+  // source that is not literal text cannot be verified either, not only the destination.
+  if (colon >= 0 && DYNAMIC.test(src)) {
+    return deny(`the refspec source "${src}" is built at run time, so what is pushed (a force prefix, extra refspecs) cannot be verified. Write the refspec out: git push -u origin HEAD:agent/<slug>.`);
+  }
   let dst = colon < 0 ? spec : spec.slice(colon + 1);
   dst = expandVars(dst, ctx); // `B=agent/x; git push origin HEAD:$B`
   if (colon >= 0 && src === '' && dst === '') return deny('`git push <remote> :` pushes every matching branch, including main. Name your branch explicitly.');
@@ -294,7 +331,67 @@ function checkRefspec(spec, dir, gitDir, ctx) {
   return null;
 }
 
+// `HEAD:$(git branch --show-current)` is the one run-time word a push may carry (checkRefspec judges it).
+const CURRENT_BRANCH_WORD = new RegExp(`(^|:)${CURRENT_BRANCH_IDIOM.source.slice(1, -1)}$`);
+
+// Every word of a push is read as written: an option or remote built at run time (`--${F:-mirror}`, `-${F:-f}`, `"$R"`) can be
+// any option, and a variable with a known value that holds blanks or glob characters splits into several words when it is
+// unquoted (`R="x HEAD:main"; git push origin $R`; zsh does not split, so both readings are denied).
+// Can the shell split on something other than blanks? IFS written anywhere in the text judged (assignment, `read`, `local`,
+// `unset`), set in the environment, or a sourced script that may have set variables.
+// A name can be written without the letters IFS in a row (`eval "I""FS=,"`, `read $N`, `printf -v $N`, `declare I""FS=,`, `N=IFS; export $N`),
+// so the commands that assign a variable by a computed or split-up name count as well.
+const SETS_BY_NAME = /\b(?:eval|read|mapfile|readarray|getopts|source)\b|\bprintf\s+-[A-Za-z]*v|(?:^|[\s;&|(])\.\s|\b(?:export|unset|declare|typeset|local|readonly)\b[^;&|\n]*[$`'"]/;
+// Both the text as written and with its quotes and backslashes removed (`printf -vI""FS ,` spells the name only once they are gone).
+const ifsMayBeSet = (ctx) => [ctx.fullText ?? '', String(ctx.fullText ?? '').replace(/['"\\]/g, '')].some((t) => /IFS/.test(t) || SETS_BY_NAME.test(t)) || assignedNames(ctx).includes('IFS') || Object.hasOwn(ctx.env ?? {}, 'IFS') || ctx.tainted.size > 0;
+
+function unverifiableWord(raw, ctx) {
+  if (raw.includes(LITERAL_MARK)) return null; // (a word judged as the plain text it spells)
+  const x = expandVars(raw, ctx);
+  // an unquoted empty value drops the word (`E=; git push origin $E` is a push with no refspec), shifting every later argument
+  if (x === '' && raw !== '') return `the word "${raw}" expands to nothing, which removes it from the push's arguments, so the push cannot be verified. Write the arguments out.`;
+  if (x !== raw && ifsMayBeSet(ctx)) return `the word "${raw}" holds a variable and IFS may be set here, so where the shell splits its value cannot be verified. Write the arguments out.`;
+  const w = x.replace(CURRENT_BRANCH_WORD, '$1X');
+  if (x !== raw && /[\s*?[]/.test(w)) return `the word "${raw}" expands to text with blanks or glob characters, which the shell may split into several arguments, so it cannot be verified. Write the arguments out.`;
+  if (DYNAMIC.test(w)) return `the argument "${x}" is built at run time (an option, remote or refspec can hide in it), so it cannot be verified. Write the push out: git push -u origin agent/<slug>.`;
+  return null;
+}
+
+// The policy sees words after quote removal, so `'$O'` (a literal branch name) and `$O` (an option) look the same, and each word of a
+// line may be either. A push is judged for EVERY mix: each word that holds a `$` or backtick is taken as the variable it names or as the
+// plain text it spells (its `$` then marked so no later step expands or flags it), and denied if any mix denies. More than MAX_MIXED such
+// words is too many mixes to judge, so it is refused.
+const LITERAL_MARK = '\u0001';
+const MAX_MIXED = 8;
+const asText = (a) => a.replace(/\$/g, `${LITERAL_MARK}d`).replace(/`/g, `${LITERAL_MARK}b`);
 function checkPush(args, dir, gitDir, ctx, configs) {
+  const idx = args.map((a, i) => (DYNAMIC.test(a) ? i : -1)).filter((i) => i >= 0);
+  const seen = new Set();
+  const judge = (mask) => {
+    checkDeadline(ctx.budget); // up to 2^MAX_MIXED mixes: the evaluation as a whole has a deadline
+    const mixed = args.map((a, i) => { const j = idx.indexOf(i); return j >= 0 && (mask >> j) & 1 ? asText(a) : a; });
+    for (const a of mixed) {
+      const why = unverifiableWord(a, ctx);
+      if (why) return deny(why);
+    }
+    // (an option held in a variable, `F=--mirror; git push origin $F`, is an option)
+    const expanded = mixed.map((a) => expandVars(a, ctx));
+    const key = JSON.stringify(expanded);
+    if (seen.has(key)) return null; // a mix that reads the same as one already judged
+    seen.add(key);
+    return pushReading(expanded, dir, gitDir, ctx, configs);
+  };
+  const first = judge(0); // every word as the variable it names (the expansion budget is spent here first)
+  if (first) return first;
+  if (idx.length > MAX_MIXED) return deny(`this push has ${idx.length} words with a variable or substitution; every way each could be quoted cannot be judged, so it cannot be verified. Write the arguments out.`);
+  for (let mask = 1; mask < (1 << idx.length); mask++) {
+    const v = judge(mask);
+    if (v) return v;
+  }
+  return null;
+}
+
+function pushReading(args, dir, gitDir, ctx, configs) {
   const { flags, positionals: rawPositionals } = parseOpts(args, { longValue: PUSH_LONG_VALUE, shortValue: 'o', abbrev: true });
   const positionals = rawPositionals.map((p) => expandVars(p, ctx));
   let repoGiven = false;
@@ -349,9 +446,11 @@ function parseGitGlobal(argv, dir, env, ctx) {
     const t = argv[i];
     if (t === '-C') { d = joinDir(d, argv[++i], ctx); continue; }
     if (t === '-c') {
+      // Only the KEY is expanded (`-c $K=v`). The value stays as written: an alias body (`alias.p='!V=…; git push origin $V'`)
+      // runs in its own shell, where the line's variables are not the ones it sees.
       const kv = argv[++i] ?? '';
-      const eq = kv.indexOf('=');
-      configs.push({ key: (eq < 0 ? kv : kv.slice(0, eq)).toLowerCase(), value: eq < 0 ? '' : kv.slice(eq + 1) });
+      const eq = splitIndex(kv, '=');
+      configs.push({ raw: kv, key: expandVars(eq < 0 ? kv : kv.slice(0, eq), ctx).toLowerCase(), value: eq < 0 ? '' : kv.slice(eq + 1) });
       continue;
     }
     if (t.startsWith('--git-dir=')) { gitDir = joinDir(d, t.slice('--git-dir='.length), ctx); gitDirUnknown = false; continue; }
@@ -461,6 +560,11 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
   if (sub === 'push' || sub === 'send-pack') { // send-pack is push without the remote configuration
     if (/\bxargs\b/.test(raw)) return deny('`xargs git push` takes its refspecs from stdin, so it cannot be verified. Push the branch by name.');
     // config handed in through the environment (this command's prefix / `env`, or an earlier assignment or export on the line)
+    // a `-c` word that expands to blanks / glob characters (or may) splits into more git arguments (`-c $KV push …`, `-c k=$V`)
+    for (const c of g.configs) {
+      const why = unverifiableWord(c.raw, ctx);
+      if (why) return deny(why);
+    }
     ctx.envCfgDirty = [...Object.keys(env), ...assignedNames(ctx)].some((k) => GIT_ENV_CONFIG.test(k));
     return checkPush(args, g.d, g.gitDir, ctx, g.configs);
   }
@@ -1281,7 +1385,7 @@ function checkSplices(c, dir, ctx, level) {
   if (r.over) return deny('a default or alternative word (${X:-w}) in this command may be an option, and its readings cannot be worked out exactly (a quote, backslash, backtick or $( ) near it, or too many), so what the command runs cannot be verified. Write the options literally.');
   for (const line of r.lines) {
     if (level >= MAX_NESTING) return deny('a default word in an option position is nested too deeply to verify.');
-    const v = judgeScoped(line, dir, ctx, level, { kind: 'shell' });
+    const v = judgeScoped(line, dir, ctx, level, { kind: 'shell', candidate: true }); // (one of several readings: what it changes is uncertain)
     if (v.decision === 'deny') return deny(`a default word in this command may be an option; read as \`${line}\` it would run a blocked command: ${v.reason}`);
   }
   return null;
@@ -1291,8 +1395,17 @@ function checkSplices(c, dir, ctx, level) {
 // word the shell runs is unknown. Judge every word that could be it (see script-candidates.mjs) like a named script. A
 // word that is still unknown (`$UNSET`) cannot be judged: denied when the line mentions a guarded operation, as for a
 // script named at run time.
-// the words `${N:=w}` expansions of the whole line (and the text being judged) may assign
-const assignedOf = (ctx) => (ctx.assigned ??= assigningDefaults(`${ctx.fullText}\n${ctx.lineText}`));
+// the words a `${X:=w}` / `${X=w}` anywhere on the line (this text, or the line it came from) may have assigned: a later $X may be any of them.
+// Kept with the text it was worked out from: a nested context copies the fields of its parent but judges other text (a startup file).
+const assignedOf = (ctx) => {
+  if (ctx.assigned && ctx.assignedFrom === ctx.fullText) return ctx.assigned;
+  const out = new Map();
+  for (const t of [ctx.lineText, ctx.fullText]) for (const [n, ws] of assigningDefaults(typeof t === 'string' ? t : '')) out.set(n, [...new Set([...(out.get(n) ?? []), ...ws])]);
+  ctx.assigned = out;
+  ctx.assignedFrom = ctx.fullText;
+  return out;
+};
+
 function checkCandidateScripts(sf, dir, ctx, level) {
   const here = path.resolve(dir ?? ctx.cwd);
   const expand = (w) => {
@@ -1308,9 +1421,11 @@ function checkCandidateScripts(sf, dir, ctx, level) {
   }
   // after a cd that may not have run, a relative word (or a glob over one) names a file in an unknown directory
   if (dir === null && sf.kind !== 'scan' && sf.words.some((w) => !path.isAbsolute(expand(w)))) return deny('cannot tell which directory this runs in, so which script it runs cannot be verified. Use an absolute path, or chain the cd with &&.');
-  for (const line of execLinesOf(sf, expand, assignedOf(ctx))) {
+  const lines = execLinesOf(sf, expand, assignedOf(ctx));
+  if (lines.over) return deny('too many readings of the program word (a default or assigned word) to judge, so what it runs cannot be verified. Write the command out.');
+  for (const line of lines) {
     if (level >= MAX_NESTING) return deny('the command line held in a variable is nested too deeply to verify.');
-    const v = judgeScoped(line, dir, ctx, level, { kind: 'shell' });
+    const v = judgeScoped(line, dir, ctx, level, { kind: 'shell', candidate: true }); // (one of several readings: what it changes is uncertain)
     if (v.decision === 'deny') return deny(`the command line ${sf.words[0]} expands to would run a blocked command: ${v.reason}`);
   }
   // a file the line writes before this command is among the names a glob matches (cp f.sh n.sh; bash n*.sh)

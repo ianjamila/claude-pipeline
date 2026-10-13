@@ -1661,7 +1661,9 @@ function judgeSplices(c, dirs, ctx, opts) {
 // names a protected pipeline file.
 function judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw) {
   const joinPath = (d, r) => (isAbs(r) ? posix.normalize(r) : posix.join(d, r));
-  for (const line of execLinesOf(sf, (w) => expandRefs(w, ctx), ctx.assigned)) {
+  const lines = execLinesOf(sf, (w) => expandRefs(w, ctx), ctx.assigned);
+  if (lines.over) return deny('too many readings of the program word (a default or assigned word) to judge, so what it runs cannot be checked; write the command out');
+  for (const line of lines) {
     if ((opts._depth ?? 0) >= 4) return deny('the command line held in a variable is nested too deeply to check');
     // run in every directory the command may be in, with the line's variables
     for (const d of dirs) {
@@ -1999,6 +2001,9 @@ function evaluateBashForFilesFrame(command, opts) {
   if (ctx.admin) return allow();
   const raw = typeof command === 'string' ? command : '';
   if (!raw.trim()) return allow();
+  // the words a `${X:=w}` on the line (or the line this text came from) may have assigned: a later $X may be any of them
+  ctx.assigned = new Map([...(opts._assigned ?? [])].map(([n, ws]) => [n, [...ws]]));
+  for (const [n, ws] of assigningDefaults(raw)) ctx.assigned.set(n, [...new Set([...(ctx.assigned.get(n) ?? []), ...ws])]);
   if (raw.length > MAX_LINE_CHARS) {
     // too long to scan in the time budget: judged by what it mentions once quotes and escapes are removed
     return SENSITIVE_WORDS.test(raw.replace(/['"`\\]/g, '')) ? deny('the command line is too long to check and mentions a protected pipeline file or switch; split it into simpler commands') : allow();
@@ -2139,7 +2144,7 @@ function evaluateBashForFilesFrame(command, opts) {
       if (known && (!known.sens || known.flag === flag)) return known.v;
       const seen0 = ctx.budget.unmodelledSeen ?? 0;
       memo.set(key, { v: null, sens: false, flag });
-      const seed = { ...opts, _ignoreUnmodelled: true, _depth: 0, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set(unknown) };
+      const seed = { ...opts, _ignoreUnmodelled: true, _depth: 0, _assigned: ctx.assigned, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set(unknown) };
       let v = null;
       const abs = expandRefs(st.file, ctx);
       const text = isAbs(abs) ? ctx.readText(abs) : null;

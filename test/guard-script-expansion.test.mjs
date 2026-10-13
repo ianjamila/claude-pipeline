@@ -893,3 +893,114 @@ test('a backslash that reaches the script name through a variable is a file name
     denyBoth(c, spec);
   allowBoth(`D='x\\b'; bash "$D.sh"`, spec); // missing: nothing runs
 });
+
+// ---- a default / alternative word in a script or option position is judged on every reading --------------------------------
+// `bash ${A:-./ev.sh}` runs ev.sh when A is unset, `bash ${A:--c ./ev.sh}` is `bash -c ./ev.sh`, `bash ${A:--s} < ev.sh` is `bash -s < ev.sh`.
+
+test('guard-git: a default word in a script or option position is judged on every reading', () => {
+  for (const c of [
+    'bash ${A:-./f.sh}', 'bash ${A:-f.sh}', 'bash ${A-./f.sh}', 'bash ${A:=./f.sh}', 'bash ${A:+./f.sh}', 'A=x; bash ${A:+./f.sh}', 'source ${A:-f.sh}', 'bash -x ${A:-./f.sh}',
+    'bash ${1:-./f.sh}', 'bash ${@:-./f.sh}', 'bash ${*:--c ./f.sh}', 'bash ${A[0]:-./f.sh}', 'bash ${A[@]:--c ./f.sh}', 'bash ${!A:-./f.sh}', 'bash ${#:-./f.sh}',
+    'bash ${A:--c ./f.sh}', 'bash ${A:--c "./f.sh"}', 'sh ${A:--c ./f.sh}', 'bash ${A:--s} < f.sh', 'bash ${A-s} < f.sh', 'bash ${A:--c "bash f.sh"}',
+  ]) assert.equal(git(c).decision, 'deny', c);
+  for (const c of ['bash ${A:-./ok.sh}', 'bash ${A:-ok.sh}', 'bash ${A:--c ./ok.sh}', 'bash ${A:--s} < ok.sh', 'sh ${A:--c ./ok.sh}', 'A=x; bash ${A:+./ok.sh}', 'echo ${A:-./f.sh}', 'bash ${1:-./ok.sh}', 'bash ${A[0]:--c ./ok.sh}', 'bash ${!A:-./ok.sh}'])
+    assert.equal(git(c).decision, 'allow', c);
+});
+
+test('guard-files: a default word in a script or option position is judged on every reading', () => {
+  for (const c of [
+    'bash ${A:-./w.sh}', 'bash ${A:-w.sh}', 'bash ${A-./w.sh}', 'bash ${A:=./w.sh}', 'bash ${A:+./w.sh}', 'A=x; bash ${A:+./w.sh}', 'source ${A:-w.sh}', 'bash -x ${A:-./w.sh}',
+    'bash ${1:-./w.sh}', 'bash ${@:-./w.sh}', 'bash ${*:--c ./w.sh}', 'bash ${A[0]:-./w.sh}', 'bash ${A[@]:--c ./w.sh}', 'bash ${!A:-./w.sh}', 'bash ${#:-./w.sh}',
+    'bash ${A:--c ./w.sh}', 'bash ${A:--c "./w.sh"}', 'sh ${A:--c ./w.sh}', 'bash ${A:--s} < w.sh', 'bash ${A-s} < w.sh',
+  ]) assert.equal(files(c).decision, 'deny', c);
+  for (const c of ['bash ${A:-./ok.sh}', 'bash ${A:-ok.sh}', 'bash ${A:--c ./ok.sh}', 'bash ${A:--s} < ok.sh', 'sh ${A:--c ./ok.sh}', 'A=x; bash ${A:+./ok.sh}', 'echo ${A:-./w.sh}', 'bash ${1:-./ok.sh}', 'bash ${A[0]:--c ./ok.sh}', 'bash ${!A:-./ok.sh}'])
+    assert.equal(files(c).decision, 'allow', c);
+});
+
+test('guard-git: a ${X:=w} on the line may have set the $X a later script word uses', () => {
+  for (const c of [': ${X:=./f.sh}; bash $X', 'echo ${X:=f.sh}; bash $X', ': ${X:=f.sh}; source $X', 'bash -c \': ${X:=./f.sh}; bash $X\'', ': ${X=./f.sh}; bash "$X"'])
+    assert.equal(git(c).decision, 'deny', c);
+  for (const c of [': ${X:=./ok.sh}; bash $X', 'echo ${X:=ok.sh}; bash $X', 'echo ${X:=./f.sh}; echo $X']) assert.equal(git(c).decision, 'allow', c);
+});
+
+test('guard-files: a ${X:=w} on the line may have set the $X a later script word uses', () => {
+  for (const c of [': ${X:=./w.sh}; bash $X', 'echo ${X:=w.sh}; bash $X', ': ${X:=w.sh}; source $X', 'bash -c \': ${X:=./w.sh}; bash $X\'', ': ${X=./w.sh}; bash "$X"'])
+    assert.equal(files(c).decision, 'deny', c);
+  for (const c of [': ${X:=./ok.sh}; bash $X', 'echo ${X:=ok.sh}; bash $X', 'echo ${X:=./w.sh}; echo $X']) assert.equal(files(c).decision, 'allow', c);
+});
+
+test('guard-git/files: a reading set that is too big or too deep is refused, never judged in part', () => {
+  const nest = (n, leaf) => '${A:-'.repeat(n) + leaf + '}'.repeat(n);
+  const many = (n) => `${Array.from({ length: n }, (_, i) => `: \${X:=w${i}.sh}`).join('; ')}; bash $X`;
+  for (const c of [`bash ${nest(20, './ok.sh')}`, `bash ${nest(40, '-c ./ok.sh')}`, `bash ${nest(1500, './ok.sh')}`, many(60), many(300)]) {
+    assert.equal(git(c).decision, 'deny', `git ${c.slice(0, 40)}`);
+    assert.equal(files(c).decision, 'deny', `files ${c.slice(0, 40)}`);
+  }
+  // a small nest is still judged exactly
+  for (const c of ['bash ${A:-${B:-${C:-./ok.sh}}}', ': ${X:=./ok.sh}; : ${X:=ok.sh}; bash $X']) {
+    assert.equal(git(c).decision, 'allow', c);
+    assert.equal(files(c).decision, 'allow', c);
+  }
+});
+
+// ---- a command HEAD with a known value or a default word is judged as the command line each reading makes ---------------------
+
+test('guard-git: a program named by a variable or a default word is judged with its arguments on every reading', () => {
+  for (const c of [
+    '"${X:-bash}" f.sh', '${X:-bash} f.sh', '${X-bash} f.sh', '${X:=bash} f.sh', 'X=x; ${X:+bash} f.sh', 'G=bash; $G f.sh', 'G=bash; "$G" f.sh', 'G=bash; ${G} f.sh',
+    'G="bash -x"; $G f.sh', 'G="bash -c"; $G ./f.sh', '${X:-bash -x} f.sh', '${X:-sh} f.sh', ': ${G:=bash}; $G f.sh',
+  ]) assert.equal(git(c).decision, 'deny', c);
+  for (const c of ['"${X:-bash}" ok.sh', 'G=bash; $G ok.sh', 'G="bash -x"; $G ok.sh', '${X:-bash -x} ok.sh', '${X:-./ok.sh}', 'G=./ok.sh; $G', 'G=bash; $G', 'G=ls; $G f.sh'])
+    assert.equal(git(c).decision, 'allow', c);
+  // more readings than can be judged: refused, not judged in part
+  assert.equal(git(`${'${A:-'.repeat(20)}bash${'}'.repeat(20)} ok.sh`).decision, 'deny');
+});
+
+test('guard-files: a program named by a variable or a default word is judged with its arguments on every reading', () => {
+  for (const c of [
+    '"${X:-bash}" w.sh', '${X:-bash} w.sh', '${X-bash} w.sh', '${X:=bash} w.sh', 'X=x; ${X:+bash} w.sh', 'G=bash; $G w.sh', 'G=bash; "$G" w.sh', 'G=bash; ${G} w.sh',
+    'G="bash -x"; $G w.sh', 'G="bash -c"; $G ./w.sh', '${X:-bash -x} w.sh', '${X:-sh} w.sh', ': ${G:=bash}; $G w.sh',
+  ]) assert.equal(files(c).decision, 'deny', c);
+  for (const c of ['"${X:-bash}" ok.sh', 'G=bash; $G ok.sh', 'G="bash -x"; $G ok.sh', '${X:-bash -x} ok.sh', '${X:-./ok.sh}', 'G=./ok.sh; $G', 'G=bash; $G', 'G=ls; $G w.sh'])
+    assert.equal(files(c).decision, 'allow', c);
+  assert.equal(files(`${'${A:-'.repeat(20)}bash${'}'.repeat(20)} ok.sh`).decision, 'deny');
+});
+
+// ---- recheck 3: speculative readings leave no definite state; the written word stays a candidate; nested / chained assignments refuse ----
+
+test('guard-git: a reading that may not run never sets the branch for later commands', () => {
+  const fx = gitFs({ 's.sh': 'git checkout agent/x', 'p.sh': 'git push' });
+  const onMain = { currentBranch: () => 'main' };
+  // the hypothetical `bash s.sh` reading switches to agent/x; X=echo means it never ran, so p.sh pushes from the default branch
+  for (const c of ['X=echo; ${X:-bash} s.sh; bash p.sh', 'G=bash; $G s.sh; bash p.sh', 'bash ${A:--c ./s.sh}; bash p.sh', 'bash ${A:--c "bash s.sh"}; bash p.sh'])
+    assert.equal(git(c, fx, onMain).decision, 'deny', c);
+  // a switch that certainly runs is still believed
+  assert.equal(git('bash s.sh; bash p.sh', fx, onMain).decision, 'allow');
+  assert.equal(git('bash p.sh', fx, onMain).decision, 'deny');
+});
+
+test('guard-git/files: a word written as a literal file name is still a candidate next to its readings', () => {
+  const g = gitFs({ '${A-ok.sh}': 'git push origin main' });
+  const f = filesFs({ '${A-ok.sh}': 'echo x > ~/.claude/settings.json' });
+  for (const c of ["bash '${A-ok.sh}'", 'bash "${A-ok.sh}"', "source '${A-ok.sh}'"]) {
+    assert.equal(git(c, g).decision, 'deny', `git ${c}`);
+    assert.equal(files(c, f).decision, 'deny', `files ${c}`);
+  }
+  const g2 = gitFs({ '${A-ok.sh}': 'git status' });
+  const f2 = filesFs({ '${A-ok.sh}': 'echo hi' });
+  for (const c of ["bash '${A-ok.sh}'", 'bash ${A-ok.sh}']) {
+    assert.equal(git(c, g2).decision, 'allow', `git ${c}`);
+    assert.equal(files(c, f2).decision, 'allow', `files ${c}`);
+  }
+});
+
+test('guard-git/files: a nested assigning default, or a path built from two assigned names, is judged or refused', () => {
+  for (const c of [': ${X:=${Y:-./f.sh}}; bash $X', ': ${A:=./}; : ${B:=f.sh}; bash $A$B', ': ${A:=.}; : ${B:=f.sh}; bash $A/$B', ': ${X:=$X/f.sh}; bash $X'])
+    assert.equal(git(c).decision, 'deny', c);
+  for (const c of [': ${X:=${Y:-./w.sh}}; bash $X', ': ${A:=./}; : ${B:=w.sh}; bash $A$B', ': ${A:=.}; : ${B:=w.sh}; bash $A/$B', ': ${X:=$X/w.sh}; bash $X'])
+    assert.equal(files(c).decision, 'deny', c);
+  for (const c of [': ${A:=./}; : ${B:=ok.sh}; bash $A$B', ': ${A:=.}; : ${B:=ok.sh}; bash $A/$B']) {
+    assert.equal(git(c).decision, 'allow', c);
+    assert.equal(files(c).decision, 'allow', c);
+  }
+});
