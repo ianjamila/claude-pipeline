@@ -42,8 +42,11 @@ path away before the final inspection**:
 daemon, a container, anything started through sudo) cannot be read without privileges, so step 3 cannot see whether
 such a process sits inside the tree. They are counted and reported ("N processes could not be inspected"), never a
 keep reason: every non-root user sees every root daemon that way, so it would keep everything. What protects the tree
-from such a process is the quarantine re-inspection itself: any write it makes after the run starts shows up as an
-mtime ≥ run start or a new blocker/evidence file, and the tree is moved back.
+from such a process is the quarantine re-inspection itself, which has limits. It catches a write to any file that is
+not covered by the delete or archive patterns (mtime ≥ run start) and any new blocker file, and the tree is moved back.
+It does not catch a write to a delete-pattern (cache) path: that file is deleted along with the rest of the cache,
+undetected. A write to an archive-pattern (evidence) path does not move the tree back either: the file is archived
+and kept in holding.
 
 The only writers that can still reach the quarantined tree are processes holding a cwd/fd opened before the move; step 3
 detects those (and their writes) after the move, so there is no unobserved window left except the sub-second gap between
