@@ -19,7 +19,7 @@ import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
-import { simpleCommands, runsAfter, trustedFns, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText } from './shell-parse.mjs';
+import { simpleCommands, runsAfter, trustedFns, exportsFunctions, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
 import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit, execLinesOf, paramReadings, assigningDefaults, spliceLines } from './script-candidates.mjs';
 
@@ -1254,7 +1254,7 @@ const onlyReads = (c, ctx) => (c.argv.length === 0 || SUBSHELL_READS.has(baseOf(
   && !(c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && !FD_DUP.test(r.target ?? '') && r.target !== '/dev/null');
 const insideOf = (cd) => { const g = cd.grp ?? []; return (c) => (c.grp ?? []).length >= g.length && g.every((id, k) => c.grp[k] === id); };
 function readsOnlyInSubshell(cd, cmds, ctx) {
-  if (!(cd.grp ?? []).length) return false;
+  if (!(cd.grp ?? []).length || ctx.fnUnknown) return false;
   // (a function, alias or hook the text may define can stand behind a read-only name: `pwd() { echo x > settings.json; }; (cd ~/.claude; pwd)` -- review of #50)
   const fns = trustedFns(cmds);
   if (!fns) return false;
@@ -1266,6 +1266,7 @@ function readsOnlyInSubshell(cd, cmds, ctx) {
 // runsAfter in shell-parse.mjs: later ones in its subshell or script, and trap actions) only reads, the directory it went to is never written in. Only for a script
 // file run in a process of its own (ctx.selfZero): after the line or a sourced file, the next command (or Bash call) goes on in that directory.
 function nothingWritesAfterCd(ci, cmds, ctx) {
+  if (ctx.fnUnknown) return false;
   const after = runsAfter(cmds, ci);
   return after !== null && after.every((c) => onlyReads(c, ctx));
 }
@@ -2107,6 +2108,9 @@ function evaluateBashForFilesFrame(command, opts) {
   if (assumedCwd) opts = { ...opts, _assumedCwd: false };
   checkDeadline(opts._budget);
   const ctx = makeCtx(opts);
+  // Why: a function this text did not define may stand behind a command name: one a parent exported (`export -f`), one bash imports from the environment (BASH_FUNC_...),
+  // one a startup file of this shell defined. Then no name is trusted for the cd shortcuts (readsOnlyInSubshell, nothingWritesAfterCd). (review of #50)
+  ctx.fnUnknown = opts._fnUnknown === true || Object.keys(opts.env ?? process.env).some((k) => /^BASH_FUNC_/.test(k));
   ctx.lineDefs = definedNames(typeof command === 'string' ? command : '');
   ctx.assigned = assigningDefaults(typeof command === 'string' ? command : ''); // (and those of the line this text was made from: `: ${X:=w}; G=bash; $G $X`)
   for (const [n, ws] of opts._assigned ?? []) ctx.assigned.set(n, [...(ctx.assigned.get(n) ?? []), ...ws]);
@@ -2241,7 +2245,7 @@ function evaluateBashForFilesFrame(command, opts) {
       return [...t.matchAll(/\$\{?(\w+)/g)].some((x) => unknownName(x[1]));
     });
   };
-  const withLineVars = (o, c = null) => ({ ...o, _unknownCwd: unknownCwd(), _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set([...ctx.unknownVars, ...ctx.pickUnknown]), _unknownW: new Set(ctx.unknownVars), _srcChanged: taintClosure(ctx.srcChanged, cmds, c?.env ?? {}, newName, ctx.srcChanged.size > 0 || ctx.unknownAll), _unknownAll: ctx.unknownAll, _assigned: ctx.assigned });
+  const withLineVars = (o, c = null) => ({ ...o, _fnUnknown: ctx.fnUnknown || exportsFunctions(cmds), _unknownCwd: unknownCwd(), _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set([...ctx.unknownVars, ...ctx.pickUnknown]), _unknownW: new Set(ctx.unknownVars), _srcChanged: taintClosure(ctx.srcChanged, cmds, c?.env ?? {}, newName, ctx.srcChanged.size > 0 || ctx.unknownAll), _unknownAll: ctx.unknownAll, _assigned: ctx.assigned });
 
   // A startup file is judged once per evaluation. It is marked first: a startup file that starts shells itself would be judged again and
   // again otherwise (a denial ends the whole evaluation, so marking before the verdict is safe).
@@ -2350,7 +2354,7 @@ function evaluateBashForFilesFrame(command, opts) {
         const sfj = sf;
         let v;
         try {
-          v = judgeScriptFile(sfj, sdirsNow(), ctx, withLineVars(opts, c), scanRaw);
+          v = judgeScriptFile(sfj, sdirsNow(), ctx, { ...withLineVars(opts, c), ...(sts.length ? { _fnUnknown: true } : {}) }, scanRaw); // (a startup file the shell reads first may define functions)
         } finally {
           ctx.execCmd = outer;
         }

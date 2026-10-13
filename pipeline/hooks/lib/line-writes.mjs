@@ -31,13 +31,10 @@ export const inFlow = (from, i) => from >= 0 && i >= from;
 // or a trap action may not run, and one in a subshell (`( )`, `$( )`, backticks: grp) does not run in this shell. Without the marks (a parse cut short, an unmarked
 // command): every command from the first construct on, as inFlow.
 export const mayNotRun = (cmds, from, i) => (!cmds.truncated && !cmds.ctlBroken && cmds[i]?.ctl && cmds[i].grp ? Object.values(cmds[i].ctl).some(Boolean) || cmds[i].grp.length > 0 : inFlow(brokenFrom(cmds, from), i));
-// Why: when the parser could not trust its marks (cmds.ctlBroken: a closer with no opener, e.g. a prefix we do not model before `if` / `case`), a flow keyword anywhere in a
-// command's words starts the conservative region too (`nocorrect case "$X" in a) B=x ;; esac`: the keyword is no command name there)
-const FLOW_WORDS = new Set(['if', 'then', 'elif', 'else', 'while', 'until', 'for', 'do', 'case', 'select', 'repeat', 'foreach']);
+// Why: when the parser could not trust its marks (cmds.ctlBroken: a closer with no opener, e.g. a prefix we do not model before `if` / `case` / `function`), every command of
+// the line may not run and may run in any order: nothing known about one construct may be lost to another (review of #50)
 export function brokenFrom(cmds, from) {
-  if (!cmds.ctlBroken) return from;
-  const k = cmds.findIndex((c) => c.argv.some((a) => FLOW_WORDS.has(a)));
-  return k < 0 ? from : from < 0 ? k : Math.min(from, k);
+  return cmds.ctlBroken ? 0 : from;
 }
 
 // ---- static text ----------------------------------------------------------------------------------------------

@@ -328,3 +328,49 @@ test('S6b codex: ... `time` is read exactly (what comes after the construct is s
   assert.equal(F('bash s.sh', spec('nocorrect while true; do echo hi > out.txt; cd "$U"; done\n')), 'deny', '(the loop runs the write again after the cd)');
   assert.equal(F('bash s.sh', spec('nocorrect while true; do bash h.sh; cp bad.sh h.sh; done\n')), 'deny', '(the copy lands before the next run)');
 });
+
+// ---- Codex recheck of #50 (P1 x3) -------------------------------------------------------------------------------------------------------------------------------
+
+test('S6b codex recheck: a function defined over two lines, or handed to a child (export -f, BASH_FUNC_ in the environment, a startup file), keeps the subshell cd judged', () => {
+  const spec = { 'r.txt': 'x', 's.sh': '(cd /home/u/.claude; pwd)\n', 'rc': 'pwd() { echo x > settings.json; }' };
+  assert.equal(F('function pwd\n{ echo x > settings.json; }\n(cd /home/u/.claude; pwd)', spec), 'deny');
+  assert.equal(F('pwd()\n{ echo x > settings.json; }\n(cd /home/u/.claude; pwd)', spec), 'deny');
+  assert.equal(F('time function pwd { echo x > settings.json; }; (cd /home/u/.claude; pwd)', spec), 'deny');
+  assert.equal(F('pwd() { echo x > settings.json; }; export -f pwd; bash s.sh', spec), 'deny');
+  assert.equal(F('pwd() { echo x > settings.json; }; declare -fx pwd; bash s.sh', spec), 'deny');
+  assert.equal(F('bash s.sh', spec, { env: { ...REAL_ENV, 'BASH_FUNC_pwd%%': '() { echo x > settings.json; }' } }), 'deny');
+  assert.equal(F('BASH_ENV=rc bash s.sh', spec), 'deny');
+  assert.equal(F('bash s.sh', spec), 'allow', '(nothing redefines pwd)');
+  const fns = simpleCommands('function pwd\n{ :; }\ntime function g { :; }');
+  assert.deepEqual([...fns.fns].sort(), ['g', 'pwd']);
+});
+
+test('S6b codex recheck: `}|` and `}&` with no blank still run the group in a subshell', () => {
+  const env = { B: 'main' };
+  for (const c of [
+    '{ if true; then :; fi; B=agent/x; true; }| cat; git push origin "$B"',
+    '{ if true; then :; fi; B=agent/x; true; }& git push origin "$B"',
+    '{ B=agent/x; true; }|cat; git push origin "$B"',
+  ]) assert.equal(G(c, {}, { env }), 'deny', c);
+});
+
+test('S6b codex recheck: marks the parser cannot trust never turn a conditional assignment into a sure one', () => {
+  const env = { B: 'main' };
+  for (const c of [
+    'function f { B=agent/x; }; time function g { :; }; git push origin "$B"',
+    'f() { B=agent/x; }; nocorrect if true; then :; fi; git push origin "$B"',
+    'B2=1; nocorrect if true; then :; fi; B=agent/x; false && B=main; git push origin "$B"',
+  ]) assert.equal(G(c, {}, { env }), 'deny', c);
+});
+
+test('S6b codex recheck: ... the two-line body is a function body for the marks, and an exported / startup-file function reaches the cd rules of a child script in both policies', () => {
+  const env = { B: 'main' };
+  assert.equal(G('function f\n{ B=agent/x; }\ngit push origin "$B"', {}, { env }), 'deny');
+  // (files: an exported function's body is judged in the parent text only, before and after this PR: issue #51)
+  // git: after the child's cd into an unsure directory, an exported or startup-file `pwd` pushes the branch checked out there
+  const gs = { 's.sh': 'D=a\nif [ -n "$X" ]; then D=b; fi\ncd "$D" && pwd\n', 'rc': 'pwd() { git push; }' };
+  assert.equal(G('pwd() { git push; }; export -f pwd; bash s.sh', gs), 'deny');
+  assert.equal(G('BASH_ENV=rc bash s.sh', gs), 'deny');
+  assert.equal(G('bash s.sh', gs, { env: { 'BASH_FUNC_pwd%%': '() { git push; }' } }), 'deny');
+  assert.equal(G('bash s.sh', gs), 'allow', '(nothing redefines pwd)');
+});

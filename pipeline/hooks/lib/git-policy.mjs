@@ -15,7 +15,7 @@
 import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { sourcePathSearch, commandName, simpleCommands, runsAfter, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText } from './shell-parse.mjs';
+import { sourcePathSearch, commandName, simpleCommands, runsAfter, exportsFunctions, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText } from './shell-parse.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
 import { scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
@@ -1255,6 +1255,7 @@ function judgeWrittenScript(w, sf, abs, dir, ctx, level) {
 // "$NVM_DIR/nvm.sh" runs d/nvm.sh, and a value that is unknown makes that name unknown (refused). The memo is keyed on that state.
 // The startup files a shell reads (startupFilesOf), in the order it reads them: the first denial, else null.
 function judgeStartupList(list, c, dir, ctx, level) {
+  if (list.length) ctx.fnUnknown = true; // (a startup file may define functions the scripts after it call by command names)
   for (const st of list) {
     // the real home's file (no word on the line names it) is judged on its own, once: see implicitStartupVerdict
     if (st.implicit) {
@@ -1594,7 +1595,7 @@ function unsureVarReachingCommand(cmds, ctx) {
   const cdMemo = new Map();
   const sensitive = (c) => {
     const head = c.argv[0];
-    if (ctx.ownProcess === true && !UNSURE_OK.has(baseName(head)) && DIR_CHANGERS.includes(head)) {
+    if (ctx.ownProcess === true && !ctx.fnUnknown && !UNSURE_OK.has(baseName(head)) && DIR_CHANGERS.includes(head)) {
       if (!cdMemo.has(c)) {
         cdMemo.set(c, true);
         const after = runsAfter(cmds, cmds.indexOf(c));
@@ -1634,6 +1635,8 @@ function evalString(str, startDir, ctx, level) {
   }
   // A variable whose value is not certain (see collectAssignments) denies the line when it reaches git / gh, a command
   // that runs code, cd / pushd / popd or a command name: the checks below read the expanded text.
+  // (functions exported to children, imported from the environment, or from a startup file: no name is trusted for the own-process cd rule, from here on -- review of #50)
+  if (exportsFunctions(cmds) || Object.keys(ctx.env ?? {}).some((k) => /^BASH_FUNC_/.test(k))) ctx.fnUnknown = true;
   collectAssignments(cmds, ctx, !definesFunction(str, cmds));
   if (ctx.unsureVars.size || ctx.tainted.size) {
     const unsure = unsureVarReachingCommand(cmds, ctx);

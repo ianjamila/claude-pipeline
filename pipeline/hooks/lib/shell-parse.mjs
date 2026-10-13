@@ -1743,21 +1743,25 @@ class Parser {
       else if (q < 0 && cmdPos && text === 'case') { cs.push({ st: 'subj' }); this.ctlOpen('case'); seg.ctl = { ...seg.ctl, cond: true }; }
       // loops, if / case branches and function bodies (see emit: ctl): `while`/`for`/... open a loop (its own words loop too), `done` closes one; `if`/`fi`, `case`/`esac` likewise; a `{` after `f()` (or
       // `function f`) opens a function body, any other command-position `{` a plain group; `}` closes the last of those
-      const fnKw = text === '{' && seg.words.length >= 2 && seg.words[0].qa < 0 && seg.words[0].text === 'function';
+      // (`function NAME` -- after keywords or `time`, its `{` on this line or the next: every word up to the `{` / `(` is a name the text defines)
+      let fnName = false;
+      if (q < 0 && cmdPos && text === 'function') seg.fnActive = true;
+      else if (seg.fnActive && text !== '{') { fnName = true; ctx.fns.add(text); seg.fnHasName = true; }
+      const fnKw = text === '{' && seg.fnActive === true && seg.fnHasName === true;
       if (q < 0 && cmdPos && LOOP_WORDS.has(text)) { this.ctlOpen('loop'); seg.ctl = { ...seg.ctl, loop: true }; }
       else if (q < 0 && cmdPos && text === 'if') { this.ctlOpen('if'); seg.ctl = { ...seg.ctl, cond: true }; }
       else if (q < 0 && cmdPos && text === 'fi') seg.closesFrom = this.ctlClose(['if']);
       else if (q < 0 && cmdPos && text === 'done') seg.closesFrom = this.ctlClose(['loop']);
       else if (q < 0 && cmdPos && text === '}') seg.closesFrom = this.ctlClose(['fn', 'brace', 'cbrace']);
       else if (q < 0 && (cmdPos || fnKw) && text === '{') {
-        if (fnKw) for (const w of seg.words.slice(1)) ctx.fns.add(w.text);
         // (a plain group after && / || runs only when that holds, and one that is a pipeline stage runs in a subshell: its commands may not run here -- review of #50)
         const kind = fnPending || fnKw ? 'fn' : ['&&', '||', '|'].includes(seg.sep) ? 'cbrace' : 'brace';
         this.ctlOpen(kind);
         if (kind === 'fn') seg.ctl = { ...seg.ctl, fn: true }; // (the body's first command is in this segment: `{ echo x > f; }`)
         if (kind === 'cbrace') seg.ctl = { ...seg.ctl, cond: true };
       }
-      fnPending = false;
+      if (text === '{' || text === '(') seg.fnActive = false;
+      fnPending = fnName && seg.fnActive === true; // (a name of `function NAME` ending the line: its body may open on the next)
       seg.words.push({ text, qa: q, bm: marks, dyn, subs, win, pat });
     };
     const endSeg = (idx) => {
@@ -1876,7 +1880,7 @@ class Parser {
       } else if (c === '&') {
         const nx = s[this.i + 1];
         if (nx === '&') { endSeg(this.i); lastSep = '&&'; this.i += 2; }
-        else if (nx !== '>' || noRedir) { const closed = seg?.closesFrom; endSeg(this.i); this.markClosedOut(closed); lastSep = '&'; this.i++; } // a background job: the command before it ran in a subshell
+        else if (nx !== '>' || noRedir) { flushWord(); const closed = seg?.closesFrom; endSeg(this.i); this.markClosedOut(closed); lastSep = '&'; this.i++; } // a background job: the command before it ran in a subshell
         else if (nx === '>' && !noRedir) {
           flushWord(); startSeg();
           redir = 'file'; rfd = null;
@@ -1884,6 +1888,7 @@ class Parser {
         }
       } else if (c === '|') {
         const nx = s[this.i + 1];
+        flushWord(); // (`}|cat`: the closing word first)
         const closed = seg?.closesFrom;
         endSeg(this.i);
         if (nx !== '|') this.markClosedOut(closed);
@@ -2569,8 +2574,12 @@ const LATER_RUNNERS = new Set(['source', '.', 'alias', 'autoload', 'enable', 'di
 const HOOK_FUNCTIONS = /^(?:TRAP|chpwd|precmd|preexec|periodic|zshexit|zshaddhistory|zsh_directory_name|command_not_found_handler?)/i;
 // The names a command word may not mean what it says (functions the text defines, compared without case), or null when no command name can be trusted: the parse was cut
 // short or names a command at run time, the text defines a hook function, or it can bring in code it does not hold (source, eval, alias, autoload, `functions[...]=` ...).
+// Does the text export functions to the processes it starts (`export -f`, `declare -fx`, `typeset -fx`, `readonly -f`)? A child bash then runs them for names that look like commands.
+export function exportsFunctions(cmds) {
+  return (cmds ?? []).some((c) => ['export', 'declare', 'typeset', 'local', 'readonly'].includes(base(c.argv[0] ?? '')) && c.argv.slice(1).some((a) => /^-[A-Za-z]*f/.test(a)));
+}
 export function trustedFns(cmds) {
-  if (!cmds?.fns || cmds.truncated || cmds.dynamic) return null;
+  if (!cmds?.fns || cmds.truncated || cmds.dynamic || exportsFunctions(cmds)) return null;
   if ([...cmds.fns].some((n) => HOOK_FUNCTIONS.test(n))) return null;
   for (const c of cmds) if (LATER_RUNNERS.has(base(c.argv[0] ?? '')) || c.argv.some((a) => /^functions(?:\[|\+?=)/.test(a)) || Object.keys(c.env ?? {}).some((k) => /^functions$/i.test(k))) return null;
   return new Set([...cmds.fns].map((n) => base(n)));
