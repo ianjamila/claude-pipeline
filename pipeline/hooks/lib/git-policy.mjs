@@ -260,22 +260,21 @@ function globMatchesProtected(pattern) {
   return PROTECTED_BRANCHES.some((b) => re.test(b));
 }
 
-// `literal`: judge the word with every `$` as the character it is (the reading where it was single-quoted); see checkPush.
-function checkRefspec(spec, dir, gitDir, ctx, literal = false) {
+function checkRefspec(spec, dir, gitDir, ctx) {
   if (spec.startsWith('+')) return deny(FORCE_REASON);
   const colon = splitIndex(spec, ':');
   const src = colon < 0 ? spec : spec.slice(0, colon);
   // A run-time source can carry a `+` (force) prefix or word-split into more refspecs (`${B:-${C:-+HEAD}}:agent/x`), so a
   // source that is not literal text cannot be verified either, not only the destination.
-  if (!literal && colon >= 0 && DYNAMIC.test(src)) {
+  if (colon >= 0 && DYNAMIC.test(src)) {
     return deny(`the refspec source "${src}" is built at run time, so what is pushed (a force prefix, extra refspecs) cannot be verified. Write the refspec out: git push -u origin HEAD:agent/<slug>.`);
   }
   let dst = colon < 0 ? spec : spec.slice(colon + 1);
-  if (!literal) dst = expandVars(dst, ctx); // `B=agent/x; git push origin HEAD:$B`
+  dst = expandVars(dst, ctx); // `B=agent/x; git push origin HEAD:$B`
   if (colon >= 0 && src === '' && dst === '') return deny('`git push <remote> :` pushes every matching branch, including main. Name your branch explicitly.');
   if (dst === '') dst = src; // `src:` is not a destination git accepts; judge it by the source name
   dst = stripHeads(dst);
-  if (!literal && DYNAMIC.test(dst)) {
+  if (DYNAMIC.test(dst)) {
     // `git push origin "$(git branch --show-current)"` is common and means the current branch: accept exactly that
     // spelling (a variable that holds a literal has already been expanded above), and only when the branch is known
     // and not protected. Any other run-time text (${B:-main}, $(cat f), m${x}ain, a loop variable) can be main.
@@ -310,6 +309,7 @@ const SETS_BY_NAME = /\b(?:eval|read|mapfile|readarray|getopts|source)\b|\bprint
 const ifsMayBeSet = (ctx) => [ctx.fullText ?? '', String(ctx.fullText ?? '').replace(/['"\\]/g, '')].some((t) => /IFS/.test(t) || SETS_BY_NAME.test(t)) || assignedNames(ctx).includes('IFS') || Object.hasOwn(ctx.env ?? {}, 'IFS') || ctx.tainted.size > 0;
 
 function unverifiableWord(raw, ctx) {
+  if (raw.includes(LITERAL_MARK)) return null; // (a word judged as the plain text it spells)
   const x = expandVars(raw, ctx);
   // an unquoted empty value drops the word (`E=; git push origin $E` is a push with no refspec), shifting every later argument
   if (x === '' && raw !== '') return `the word "${raw}" expands to nothing, which removes it from the push's arguments, so the push cannot be verified. Write the arguments out.`;
@@ -320,20 +320,37 @@ function unverifiableWord(raw, ctx) {
   return null;
 }
 
-// The policy sees words after quote removal, so `'$O'` (a literal branch name) and `$O` (an option) look the same. A push is
-// judged under BOTH readings, every `$` word as the variable it names and as the plain text it spells, and denied if either denies.
+// The policy sees words after quote removal, so `'$O'` (a literal branch name) and `$O` (an option) look the same, and each word of a
+// line may be either. A push is judged for EVERY mix: each word that holds a `$` or backtick is taken as the variable it names or as the
+// plain text it spells (its `$` then marked so no later step expands or flags it), and denied if any mix denies. More than MAX_MIXED such
+// words is too many mixes to judge, so it is refused.
+const LITERAL_MARK = '\u0001';
+const MAX_MIXED = 8;
+const asText = (a) => a.replace(/\$/g, `${LITERAL_MARK}d`).replace(/`/g, `${LITERAL_MARK}b`);
 function checkPush(args, dir, gitDir, ctx, configs) {
-  for (const a of args) {
-    const why = unverifiableWord(a, ctx);
-    if (why) return deny(why);
+  const idx = args.map((a, i) => (DYNAMIC.test(a) ? i : -1)).filter((i) => i >= 0);
+  const judge = (mask) => {
+    const mixed = args.map((a, i) => { const j = idx.indexOf(i); return j >= 0 && (mask >> j) & 1 ? asText(a) : a; });
+    for (const a of mixed) {
+      const why = unverifiableWord(a, ctx);
+      if (why) return deny(why);
+    }
+    // (an option held in a variable, `F=--mirror; git push origin $F`, is an option)
+    return pushReading(mixed.map((a) => expandVars(a, ctx)), dir, gitDir, ctx, configs);
+  };
+  const first = judge(0); // every word as the variable it names (the expansion budget is spent here first)
+  if (first) return first;
+  if (idx.length > MAX_MIXED) return deny(`this push has ${idx.length} words with a variable or substitution; every way each could be quoted cannot be judged, so it cannot be verified. Write the arguments out.`);
+  for (let mask = 1; mask < (1 << idx.length); mask++) {
+    const v = judge(mask);
+    if (v) return v;
   }
-  return pushReading(args.map((a) => expandVars(a, ctx)), dir, gitDir, ctx, configs, false) // an option held in a variable (`F=--mirror; git push origin $F`) is an option
-    ?? (args.some((a) => DYNAMIC.test(a)) ? pushReading(args, dir, gitDir, ctx, configs, true) : null);
+  return null;
 }
 
-function pushReading(args, dir, gitDir, ctx, configs, literal) {
+function pushReading(args, dir, gitDir, ctx, configs) {
   const { flags, positionals: rawPositionals } = parseOpts(args, { longValue: PUSH_LONG_VALUE, shortValue: 'o', abbrev: true });
-  const positionals = literal ? rawPositionals : rawPositionals.map((p) => expandVars(p, ctx));
+  const positionals = rawPositionals.map((p) => expandVars(p, ctx));
   let repoGiven = false;
   for (const f of flags) {
     if (f.short) {
@@ -367,7 +384,7 @@ function pushReading(args, dir, gitDir, ctx, configs, literal) {
     return null;
   }
   for (const spec of refspecs) {
-    const v = checkRefspec(spec, dir, gitDir, ctx, literal);
+    const v = checkRefspec(spec, dir, gitDir, ctx);
     if (v) return v;
   }
   return null;
@@ -1091,7 +1108,7 @@ function checkSplices(c, dir, ctx, level) {
   if (r.over) return deny('a default or alternative word (${X:-w}) in this command may be an option, and its readings cannot be worked out exactly (a quote, backslash, backtick or $( ) near it, or too many), so what the command runs cannot be verified. Write the options literally.');
   for (const line of r.lines) {
     if (level >= MAX_NESTING) return deny('a default word in an option position is nested too deeply to verify.');
-    const v = judgeScoped(line, dir, ctx, level, { kind: 'shell' });
+    const v = judgeScoped(line, dir, ctx, level, { kind: 'shell', candidate: true }); // (one of several readings: what it changes is uncertain)
     if (v.decision === 'deny') return deny(`a default word in this command may be an option; read as \`${line}\` it would run a blocked command: ${v.reason}`);
   }
   return null;
@@ -1127,7 +1144,7 @@ function checkCandidateScripts(sf, dir, ctx, level) {
   if (lines.over) return deny('too many readings of the program word (a default or assigned word) to judge, so what it runs cannot be verified. Write the command out.');
   for (const line of lines) {
     if (level >= MAX_NESTING) return deny('the command line held in a variable is nested too deeply to verify.');
-    const v = judgeScoped(line, dir, ctx, level, { kind: 'shell' });
+    const v = judgeScoped(line, dir, ctx, level, { kind: 'shell', candidate: true }); // (one of several readings: what it changes is uncertain)
     if (v.decision === 'deny') return deny(`the command line ${sf.words[0]} expands to would run a blocked command: ${v.reason}`);
   }
   const c = scriptCandidates(sf, { expand, dirs: [here], joinPath: (d, r) => path.resolve(d, r), readDir: ctx.readDir, ifs: ctx.vars.IFS, assigned: assignedOf(ctx) });

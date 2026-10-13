@@ -194,6 +194,13 @@ const DENY = [
   ['git -c $KV push origin agent/x'],
   ['git -c user.name=$N push origin agent/x'],
   ['git -c core.pager=${P:-cat} push origin agent/x'],
+  // a push is judged for EVERY mix of literal / expanded `$` words (the quoting of each is lost), not only all-or-none
+  ['O=-o; B=main; git push origin \'$O\' $B'],
+  ['O=-o; B=main; git branch \'$O\'; git push origin \'$O\' $B'],
+  ['O=-o; P=-f; B=main; git push origin \'$O\' \'$P\' $B'],
+  ['O=--repo; B=main; git push origin \'$O\' $B'],
+  ['O=-o; B=main; git push origin $O \'$B\' $B'],
+  ['A=agent/x; git push origin $A $A $A $A $A $A $A $A $A'],
   // a config key / push.default value built at run time can be remote.*.push or upstream
   ['git -c $K=HEAD:agent/x push'],
   ['K=remote.origin.push; git -c $K=HEAD:agent/x push'],
@@ -238,6 +245,8 @@ const ALLOW = [
   ['B=agent/x; git push origin $B'], // assigned once on the line: still known
   ['git push origin HEAD:$(git branch --show-current)'],
   ['git push origin HEAD:agent/x'], // a literal source with a literal destination is unchanged
+  ['O=-o; B=agent/y; git push origin \'$O\' $B'],
+  ['A=agent/x; git push origin $A $A $A $A $A $A $A $A'],
   ['export B=agent/x; git push origin $B'],
   ['B=agent/x; git push origin ${B}'],
   ['git -c alias.p=\'!V=agent/y; git push origin $V\' p'], // the value is judged as written, in the alias's own shell

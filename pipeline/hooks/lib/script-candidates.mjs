@@ -119,16 +119,30 @@ export function assigningDefaults(text) {
   }
   return out;
 }
-// the readings of a word, plus those with a name an assigning expansion may have set replaced by the words it assigns
+// the readings of a word, plus those with a name an assigning expansion may have set replaced by the words it assigns, repeatedly (`: ${A:=./}; : ${B:=f.sh}; bash $A$B`).
+// An assigned word that itself holds an expansion (`${X:=${Y:-w}}`, `${X:=$X/f}`) cannot be resolved here: `over`, the caller refuses.
 export function readingsOf(word, assigned) {
   const rs = paramReadings(word);
   if (!assigned?.size) return rs;
   const out = new Set(rs);
-  let over = rs.over;
-  // (a cap that is hit refuses: `over` makes every caller deny, it never drops readings quietly)
-  for (const r of rs) for (const [n, ws] of assigned) if (new RegExp(`\\$(?:\\{${n}\\}|${n}(?![A-Za-z0-9_]))`).test(r)) for (const w of ws) { out.add(r.replace(new RegExp(`\\$(?:\\{${n}\\}|${n}(?![A-Za-z0-9_]))`, 'g'), () => w)); if (out.size > MAX_READINGS) { over = true; break; } }
-  const list = [...out].slice(0, MAX_READINGS);
-  return Object.defineProperty(list, 'over', { value: over || out.size > MAX_READINGS, enumerable: false });
+  let over = rs.over === true;
+  const queue = [...rs];
+  while (queue.length && !over) {
+    const r = queue.shift();
+    for (const [n, ws] of assigned) {
+      if (!new RegExp(`\\$(?:\\{${n}\\}|${n}(?![A-Za-z0-9_]))`).test(r)) continue;
+      for (const w of ws) {
+        if (/[$`]/.test(w)) { over = true; break; }
+        const nr = r.replace(new RegExp(`\\$(?:\\{${n}\\}|${n}(?![A-Za-z0-9_]))`, 'g'), () => w);
+        if (out.has(nr)) continue;
+        out.add(nr);
+        queue.push(nr);
+        if (out.size > MAX_READINGS) { over = true; break; }
+      }
+      if (over) break;
+    }
+  }
+  return Object.defineProperty([...out].slice(0, MAX_READINGS), 'over', { value: over, enumerable: false });
 }
 // The command lines a program named by a variable or a default word may run, with its arguments (`G=bash; $G ev.sh`, `"${X:-bash}" ev.sh`): the policies judge each as text one level
 // deeper. `over` (a non-enumerable property of the list): the readings were cut off or are too many, and the caller refuses.
@@ -332,7 +346,7 @@ function buildCandidates(sf, { expand, dirs, joinPath, readDir, ifs, assigned })
   for (const w0 of sf.words ?? []) {
     const rs = readingsOf(w0, assigned);
     if (rs.over) return { files: [], dynamic, over: true };
-    words.push(...rs);
+    words.push(w0, ...rs); // (quoting is lost: the word as written may be a file that is literally named so)
   }
   for (const w of words) {
     const e = expand(w);

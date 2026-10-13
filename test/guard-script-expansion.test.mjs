@@ -965,3 +965,42 @@ test('guard-files: a program named by a variable or a default word is judged wit
     assert.equal(files(c).decision, 'allow', c);
   assert.equal(files(`${'${A:-'.repeat(20)}bash${'}'.repeat(20)} ok.sh`).decision, 'deny');
 });
+
+// ---- recheck 3: speculative readings leave no definite state; the written word stays a candidate; nested / chained assignments refuse ----
+
+test('guard-git: a reading that may not run never sets the branch for later commands', () => {
+  const fx = gitFs({ 's.sh': 'git checkout agent/x', 'p.sh': 'git push' });
+  const onMain = { currentBranch: () => 'main' };
+  // the hypothetical `bash s.sh` reading switches to agent/x; X=echo means it never ran, so p.sh pushes from the default branch
+  for (const c of ['X=echo; ${X:-bash} s.sh; bash p.sh', 'G=bash; $G s.sh; bash p.sh', 'bash ${A:--c ./s.sh}; bash p.sh', 'bash ${A:--c "bash s.sh"}; bash p.sh'])
+    assert.equal(git(c, fx, onMain).decision, 'deny', c);
+  // a switch that certainly runs is still believed
+  assert.equal(git('bash s.sh; bash p.sh', fx, onMain).decision, 'allow');
+  assert.equal(git('bash p.sh', fx, onMain).decision, 'deny');
+});
+
+test('guard-git/files: a word written as a literal file name is still a candidate next to its readings', () => {
+  const g = gitFs({ '${A-ok.sh}': 'git push origin main' });
+  const f = filesFs({ '${A-ok.sh}': 'echo x > ~/.claude/settings.json' });
+  for (const c of ["bash '${A-ok.sh}'", 'bash "${A-ok.sh}"', "source '${A-ok.sh}'"]) {
+    assert.equal(git(c, g).decision, 'deny', `git ${c}`);
+    assert.equal(files(c, f).decision, 'deny', `files ${c}`);
+  }
+  const g2 = gitFs({ '${A-ok.sh}': 'git status' });
+  const f2 = filesFs({ '${A-ok.sh}': 'echo hi' });
+  for (const c of ["bash '${A-ok.sh}'", 'bash ${A-ok.sh}']) {
+    assert.equal(git(c, g2).decision, 'allow', `git ${c}`);
+    assert.equal(files(c, f2).decision, 'allow', `files ${c}`);
+  }
+});
+
+test('guard-git/files: a nested assigning default, or a path built from two assigned names, is judged or refused', () => {
+  for (const c of [': ${X:=${Y:-./f.sh}}; bash $X', ': ${A:=./}; : ${B:=f.sh}; bash $A$B', ': ${A:=.}; : ${B:=f.sh}; bash $A/$B', ': ${X:=$X/f.sh}; bash $X'])
+    assert.equal(git(c).decision, 'deny', c);
+  for (const c of [': ${X:=${Y:-./w.sh}}; bash $X', ': ${A:=./}; : ${B:=w.sh}; bash $A$B', ': ${A:=.}; : ${B:=w.sh}; bash $A/$B', ': ${X:=$X/w.sh}; bash $X'])
+    assert.equal(files(c).decision, 'deny', c);
+  for (const c of [': ${A:=./}; : ${B:=ok.sh}; bash $A$B', ': ${A:=.}; : ${B:=ok.sh}; bash $A/$B']) {
+    assert.equal(git(c).decision, 'allow', c);
+    assert.equal(files(c).decision, 'allow', c);
+  }
+});
