@@ -468,6 +468,18 @@ const SYSTEM_BIN = /^(?:\/usr)?(?:\/local)?\/(?:s?bin|libexec)\/|^\/opt\/homebre
 const INLINE_FLAGS = new Set(['-e', '-E', '-p', '-c', '-m', '--eval', '--print', '--check', '--test', '--input-type']);
 const INTERP_VALUE_FLAGS = new Set(['-r', '--require', '--import', '--loader', '--experimental-loader', '-C', '--conditions', '-W', '-X', '-I', '-x', '--env-file', '--title', '--max-old-space-size']);
 
+// Why: a command whose OPTIONS can make it run code (a shell's `-c` / `-s`, `source`, an interpreter, find -exec, sed -e / w, awk, make) and that has a word with a default / alternative
+// (`bash ${A:--c ./ev.sh}`): the word may be an option when A is unset, so the policies judge the line again with each reading (see spliceLines).
+const SPLICE_HEADS = new Set(['source', '.', 'eval', 'find', 'awk', 'gawk', 'mawk', 'sed', 'gsed', 'make', 'gmake']);
+const DEFAULTED_WORD = /\$\{!?(?:[A-Za-z_]\w*(?:\[[^\]}]*\])?|\d+|[@*#?$!-]):?[-=+]/;
+export function splicesOptions(argv) {
+  if (!argv?.length) return false;
+  const name = base(argv[0]);
+  return (SHELLS.has(name) || INTERPRETER.test(name) || SPLICE_HEADS.has(name)) && argv.slice(1).some((w) => DEFAULTED_WORD.test(w));
+}
+// the command's own text; a record without one is rebuilt from its words (a word with an expansion stays bare so it splits)
+export const spliceText = (c) => (typeof c.raw === 'string' && c.raw ? c.raw : c.argv.map((w) => (DEFAULTED_WORD.test(w) || /^[\w@%+=:,./-]+$/.test(w) ? w : `"${w.replace(/[\\"`$]/g, '\\$&')}"`)).join(' '));
+
 // The file a command will read and run: `bash f`, `source f`, `. f`, `node f.mjs`, `python f.py`, `./f`.
 // {kind:'shell'} is run as a shell script (the caller judges its commands), {kind:'interp'} is program text in
 // another language (the caller scans it), {kind:'exec'} is a program run by path (shell or interpreter, from its
@@ -539,6 +551,8 @@ const MAX_OCCURRENCES = 32;
 // ksh/bash extglob (`*(`, `?(`, `+(`, `@(`, `!(`), zsh `(#i)` and `<1-2>` numeric ranges attached to a word
 const PATTERN_SYNTAX = /[*?+@!\]]\(|\(#|[^\s<>&|;(]<\d*-\d*>/;
 
+// (the arguments of a program named by a variable, for the policies that judge the command line it expands to; not part of the record's shape)
+const withArgs = (sf, argv) => Object.defineProperty(sf, 'args', { value: argv.slice(1), enumerable: false });
 function scriptFileOfArgv(argv) {
   if (!argv.length) return null;
   const name = base(argv[0]);
@@ -573,10 +587,10 @@ function scriptFileOfArgv(argv) {
   // (a backslash is an ordinary file name character off Windows, so a path holding one is judged like any other)
   if (/[/]/.test(argv[0]) && !SYSTEM_BIN.test(argv[0])) {
     // `./ev*.sh` / `$D/x.sh`: the shell runs whatever the word expands to, so it is a candidate list of one word
-    return hasExpansion(argv[0]) ? { kind: 'exec', file: argv[0], ambiguous: true, words: [argv[0]] } : { kind: 'exec', file: argv[0] };
+    return hasExpansion(argv[0]) ? withArgs({ kind: 'exec', file: argv[0], ambiguous: true, words: [argv[0]] }, argv) : { kind: 'exec', file: argv[0] };
   }
   // `X=./evil.sh; $X`: a program named by a variable has no `/` to show it is a path
-  if (/[$`]/.test(argv[0])) return { kind: 'exec', file: argv[0], ambiguous: true, words: [argv[0]] };
+  if (/[$`]/.test(argv[0])) return withArgs({ kind: 'exec', file: argv[0], ambiguous: true, words: [argv[0]] }, argv);
   return null;
 }
 const INTERPRETER_NO_EXT = new Set(['python', 'ruby', 'perl', 'php']);
