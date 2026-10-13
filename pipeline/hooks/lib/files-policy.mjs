@@ -1150,6 +1150,8 @@ function collectVars(cmds, ctx) {
   };
   for (const c of cmds) {
     for (const [k, v] of Object.entries(c.env ?? {})) set(k, v);
+    // (`set -- ev.sh`: the positional parameters, so `bash $1` is that file)
+    if (baseOf(c.argv[0] ?? '') === 'set' && !c.argv.some((a) => /^[-+][A-Za-z]*A/.test(a))) { const w = setPositionals(c.argv); if (w) for (let i = 1; i <= 9; i++) set(String(i), i <= w.length ? w[i - 1] : ''); }
     if (['export', 'declare', 'typeset', 'local', 'readonly'].includes(baseOf(c.argv[0] ?? ''))) {
       const d = declAttrs(c.argv);
       for (const k of d.bare) {
@@ -1744,6 +1746,7 @@ const VAR_COMMANDS = new Set(['export', 'declare', 'typeset', 'local', 'readonly
 // builtins that bind a name without a NAME=value word
 const BINDERS = new Set(['read', 'mapfile', 'readarray', 'getopts', 'unset', 'let', 'printf', 'select', 'for', 'shift', 'wait', 'coproc']);
 const RUNS_CODE = new Set(['eval', 'source', '.', 'exec', 'trap', 'alias', 'unalias', 'enable', 'builtin', 'command', 'setopt', 'unsetopt', 'shopt', 'emulate', 'zmodload', 'autoload']);
+const LINE_BINDERS = new Set(['read', 'mapfile', 'readarray', 'getopts', 'printf', 'select', 'wait']);
 const HOME_NAMES = new Set(['HOME', 'USER', 'LOGNAME', 'USERPROFILE', 'USERNAME']);
 
 // What the text of a file run in the current shell leaves behind: { vars: Map(name -> text | null), cds: [word], all }. A name is null (unknown) when it is set
@@ -1754,6 +1757,30 @@ function definedNames(text) {
   const names = new Set([...text.matchAll(/(?:^|[\n;&|({])\s*function\s+([^\s(){;'"$`]+)/g), ...text.matchAll(/(?:^|[\n;&|({])\s*([^\s(){;'"$`=]+)\s*\(\s*\)/g)].map((m) => m[1]));
   for (const a of text.matchAll(/\balias\s+([^;&|\n]*)/g)) for (const m of a[1].matchAll(/(?:^|\s)([^\s=]+)=/g)) names.add(m[1]);
   return names;
+}
+// Why: the names a binder command sets: those it is given (an option may carry its name, `printf -vF`, `wait -pF`), the ones it binds without being given them, and a nameref's target.
+// weird: a word that is not a plain name (`read "$1"`, `unset $n`): any name may be bound.
+function bindsOf(name, argv) {
+  const names = new Set(name === 'getopts' ? ['OPTARG', 'OPTIND'] : name === 'mapfile' || name === 'readarray' ? ['MAPFILE'] : name === 'read' || name === 'select' ? ['REPLY'] : []);
+  let weird = false;
+  for (const a of argv.slice(1)) {
+    const m = /^[A-Za-z_]\w*/.exec(a);
+    if (m) names.add(m[0]);
+    else if (/^-[A-Za-z]+/.test(a)) for (let i = 1; i < a.length; i++) { const n = /^[A-Za-z_]\w*/.exec(a.slice(i)); if (n) names.add(n[0]); }
+    else if (/[$`*?[{\\'"(~]/.test(a)) weird = true;
+  }
+  return { names, weird };
+}
+// `set -- a b` / `set a b`: the words that become the positional parameters (null: `set` with only options)
+function setPositionals(argv) {
+  const a = argv.slice(1);
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] === '--') return a.slice(i + 1);
+    if (/^[-+]o$/.test(a[i])) { i++; continue; }
+    if (/^[-+]/.test(a[i])) continue;
+    return a.slice(i);
+  }
+  return null;
 }
 function sourcedEffects(text, ctx) {
   const out = { vars: new Map(), cds: [], all: false, unknownCd: false };
@@ -1794,8 +1821,14 @@ function sourcedEffects(text, ctx) {
     else if (BINDERS.has(name)) {
       // (a name that is not a plain word -- `read "$1"`, `unset $n`, `getopts ab "$v"` -- may be any)
       // (and the names they bind without being given them)
-      for (const k of name === 'getopts' ? ['OPTARG', 'OPTIND'] : name === 'mapfile' || name === 'readarray' ? ['MAPFILE'] : name === 'read' || name === 'select' ? ['REPLY'] : []) set(k, null, false);
-      for (const a of c.argv.slice(1)) { const m = /^[A-Za-z_]\w*/.exec(a); if (m) set(m[0], null, false); else if (/[$`*?[{\\'"(~]/.test(a)) out.all = true; }
+      const b = bindsOf(name, c.argv);
+      for (const k of b.names) set(k, null, false);
+      if (b.weird) out.all = true;
+    }
+    // (the positional parameters: `set -- ev.sh` then `bash $1`)
+    else if (name === 'set' && !c.argv.slice(1).some((a) => /^[-+][A-Za-z]*A/.test(a)) && setPositionals(c.argv) !== null) {
+      const w = setPositionals(c.argv);
+      for (let i = 1; i <= 9; i++) set(String(i), i <= w.length ? w[i - 1] : '', sure);
     }
     // (an allowlist, as for the script-directory names: a command outside it -- a zsh binder, a function the file defines, anything unknown -- may bind any name)
     else if (RUNS_CODE.has(name) || /[$`]/.test(c.argv[0]) || !(fns.has(name) || onlyNonBinders([c]) || (name === 'set' && !c.argv.slice(1).some((a) => /^[-+][A-Za-z]*A/.test(a))))) out.all = true;
@@ -1852,13 +1885,15 @@ function absorbSourced(rec, dirs, ctx) {
   const { texts, unknown } = sourcedTexts(rec, dirs, ctx);
   // (a file that can set any name: every name the line has set so far may have been changed, and any other may be set; a script they pick is refused. The values
   // stay for the paths a writer builds, which is what they were before the file ran)
-  const poison = () => { ctx.unknownAll = true; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.srcChanged.add(k); } };
+  const poison = () => { ctx.unknownAll = true; ctx.sourcedCdUnknown = true; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.srcChanged.add(k); } };
   if (unknown) poison();
   const merged = new Map();
+  const effs = [];
   for (const t of texts) {
     const eff = sourcedEffects(t, ctx);
     if (eff.all) poison();
     if (eff.unknownCd) ctx.sourcedCdUnknown = true; // (a cd the file does into a directory only known at run time: the line's directory is unknown from here)
+    effs.push(eff);
     for (const [k, v] of eff.vars) merged.set(k, merged.has(k) && merged.get(k) !== v ? null : v); // (the file may be one of several: a name they set differently is unknown)
     for (const t2 of eff.cds) {
       const e = expandRefs(t2, ctx);
@@ -1869,6 +1904,8 @@ function absorbSourced(rec, dirs, ctx) {
       }
     }
   }
+  // Why: one of several files runs (a glob, a written file and the one on disk): a name that not every one sets keeps its old value in the others, so it is not definite
+  if (effs.length > 1) for (const k of merged.keys()) if (!effs.every((e) => e.vars.has(k))) merged.set(k, null);
   for (const [k, v] of merged) {
     ctx.srcTouched.add(k);
     if (v === null) { delete ctx.vars[k]; delete ctx.keptVars?.[k]; ctx.pickUnknown.add(k); ctx.srcChanged.add(k); continue; }
@@ -2050,7 +2087,7 @@ function evaluateBashForFilesFrame(command, opts) {
       return [...t.matchAll(/\$\{?(\w+)/g)].some((x) => unknownName(x[1]));
     });
   };
-  const withLineVars = (o, c = null) => ({ ...o, _unknownCwd: unknownCwd(), _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set([...ctx.unknownVars, ...ctx.pickUnknown]), _unknownW: new Set(ctx.unknownVars), _srcChanged: taintClosure(ctx.srcChanged, cmds, c?.env ?? {}, newName, ctx.srcChanged.size > 0 || ctx.unknownAll), _unknownAll: ctx.unknownAll });
+  const withLineVars = (o, c = null) => ({ ...o, _unknownCwd: unknownCwd(), _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set([...ctx.unknownVars, ...ctx.pickUnknown]), _unknownW: new Set(ctx.unknownVars), _srcChanged: taintClosure(ctx.srcChanged, cmds, c?.env ?? {}, newName, ctx.srcChanged.size > 0 || ctx.unknownAll), _unknownAll: ctx.unknownAll, _assigned: ctx.assigned });
 
   // A startup file is judged once per evaluation. It is marked first: a startup file that starts shells itself would be judged again and
   // again otherwise (a denial ends the whole evaluation, so marking before the verdict is safe).
@@ -2098,7 +2135,7 @@ function evaluateBashForFilesFrame(command, opts) {
 
   // 7: a script file (bash f.sh, source f, ./f, node f.mjs) runs whatever is in it
   // Why: after a cd into a directory only known at run time a relative script may be in the directories the line knows OR in any protected one (or above one): each is looked in
-  const sdirs = unknownCwd() ? unique([...dirs, ...assumedCwds(ctx)]) : dirs;
+  const sdirsNow = () => (unknownCwd() ? unique([...dirs, ...assumedCwds(ctx)]) : dirs); // (a sourced file may make the directory unknown part-way through the line)
   if ((opts._depth ?? 0) < 4) {
     for (const [idx, c] of cmds.entries()) {
       frame.i = idx;
@@ -2107,6 +2144,9 @@ function evaluateBashForFilesFrame(command, opts) {
       if (!c.argv.length && (ctx.unknownVars.size || ctx.pickUnknown.size || ctx.srcTouched.size) && c.sep !== '&&' && c.sep !== '||' && c.depth === 0 && !inFlow(flowStart(cmds), idx)) {
         for (const k of Object.keys(c.env ?? {})) if ((ctx.unknownVars.has(k) || ctx.pickUnknown.has(k) || ctx.srcTouched.has(k)) && !/[$`]/.test(c.env[k]) && !ctx.declared?.unknown.has(k)) { ctx.unknownVars.delete(k); ctx.pickUnknown.delete(k); ctx.srcChanged.delete(k); ctx.vars[k] = applyTransform(expandRefs(c.env[k], ctx), ctx.declared?.transform.get(k) ?? null); }
       }
+      // Why: a binder on the line (`read F`, `mapfile`, `getopts`, `printf -v F`, a nameref's target) gives its names a run-time value: a script they pick is refused, whatever the line assigned before
+      if (c.argv.length && LINE_BINDERS.has(baseOf(c.argv[0])) && (baseOf(c.argv[0]) !== 'printf' || c.argv.some((a) => /^-v/.test(a)))) for (const k of bindsOf(baseOf(c.argv[0]), c.argv).names) { ctx.pickUnknown.add(k); }
+      if (c.argv.length && ['declare', 'typeset', 'local'].includes(baseOf(c.argv[0])) && c.argv.slice(1).some((a) => /^-[A-Za-z]*n/.test(a))) for (const a of c.argv.slice(1)) { const t = /^[A-Za-z_]\w*=([A-Za-z_]\w*)/.exec(a); if (t) { ctx.pickUnknown.add(t[1]); ctx.unknownVars.add(t[1]); ctx.declared?.unknown.add(t[1]); } }
       const sf = scriptFileOf(c.argv, c.raw, raw);
       const withPath = (rec) => { if (rec.words?.some(isEqualsWord)) rec.pathValues = pathValuesOf(c, cmds, { env: startupEnv, inherited: inheritedStartup }); return rec; }; // (zsh `=tool`: the PATH directories to look in)
       if (sf) withPath(sf);
@@ -2129,7 +2169,7 @@ function evaluateBashForFilesFrame(command, opts) {
         const sfj = sf;
         let v;
         try {
-          v = judgeScriptFile(sfj, sdirs, ctx, withLineVars(opts, c), scanRaw);
+          v = judgeScriptFile(sfj, sdirsNow(), ctx, withLineVars(opts, c), scanRaw);
         } finally {
           ctx.execCmd = outer;
         }
@@ -2139,7 +2179,7 @@ function evaluateBashForFilesFrame(command, opts) {
       // script text that reaches a shell without being named (`bash < f.sh`, `cat f.sh | bash`, `eval "$(cat f.sh)"`): its files are judged like `bash f.sh`
       for (const fd of scriptFeedsOf(c, raw, (w) => expandRefs(w, ctx))) {
         withPath(fd);
-        const v = judgeScriptFile(fd, sdirs, ctx, withLineVars(opts, c), scanRaw);
+        const v = judgeScriptFile(fd, sdirsNow(), ctx, withLineVars(opts, c), scanRaw);
         if (v) return v;
       }
       undo?.();
