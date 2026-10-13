@@ -283,6 +283,58 @@ test('update installs exactly the commit main points to, verifies it, and leaves
   assert.equal(JSON.stringify(settings).includes('guard-files.mjs'), true);
 });
 
+// A commit that predates the installer's exception for a source under <home>/pipeline-state/tmp: its install.mjs rejects
+// any --source inside the Claude home. Built from the real remote with install.mjs replaced by the one at the merge
+// base (before the exception) and private-tmp.mjs removed.
+const PRE_EXCEPTION_COMMIT = '886b9baa345dfa1bda31c1b435882414c9ebbe44';
+let oldRemoteCache = null;
+function oldRemote() {
+  if (oldRemoteCache) return oldRemoteCache;
+  const work = scratch('cp-upd-oldwork');
+  git(work, ['clone', '--quiet', remote().bare, '.']);
+  const old = spawnSync('git', ['show', `${PRE_EXCEPTION_COMMIT}:install.mjs`], { cwd: REPO, encoding: 'utf8' });
+  assert.equal(old.status, 0, `the pre-exception installer must be reachable in this checkout: ${old.stderr}`);
+  writeFileSync(join(work, 'install.mjs'), old.stdout);
+  rmSync(join(work, 'pipeline', 'lib', 'private-tmp.mjs'));
+  git(work, ['add', '-A']);
+  git(work, ['-c', 'commit.gpgsign=false', 'commit', '--quiet', '-m', 'old installer']);
+  git(work, ['branch', '-M', 'main']);
+  const bare = join(scratch('cp-upd-oldbare'), 'upstream.git');
+  git(work, ['clone', '--quiet', '--bare', work, bare]);
+  oldRemoteCache = { bare, sha: git(work, ['rev-parse', 'HEAD']), tree: work };
+  return oldRemoteCache;
+}
+
+test('update to a commit whose installer predates the downloads-under-the-home exception stops with a clear error and installs nothing', async () => {
+  const old = oldRemote();
+  // Control: that installer really does refuse a source inside the Claude home (so the new check guards a real failure).
+  const probeHome = newHome();
+  const inside = join(probeHome, 'pipeline-state', 'tmp', 'src');
+  mkdirSync(dirname(inside), { recursive: true });
+  cpSync(old.tree, inside, { recursive: true });
+  const direct = spawnSync(process.execPath, [join(inside, 'install.mjs'), '--claude-home', probeHome, '--source', inside, '--json'], { encoding: 'utf8', env: envFor(null) });
+  assert.notEqual(direct.status, 0, 'control: the old installer rejects a source inside the home');
+  assert.match(direct.stdout + direct.stderr, /inside the claude-home/);
+
+  for (const guardFiles of [true, false]) {
+    const home = newHome();
+    if (!guardFiles) {
+      const first = spawnSync(process.execPath, [join(REPO, 'install.mjs'), '--claude-home', home, '--source', REPO, '--skip-file-guard', '--json'], { encoding: 'utf8', env: envFor(null) });
+      assert.equal(first.status, 0, first.stderr);
+    }
+    const before = existsSync(join(home, 'pipeline', 'INSTALLED.json')) ? readFileSync(join(home, 'pipeline', 'INSTALLED.json'), 'utf8') : null;
+    const { result: r, left } = await withTmp(home, () => update(['--claude-home', home], { env: envFor(ghFor(old.sha, cmp('ahead', 'a'.repeat(40), old.sha)), { PIPELINE_UPDATE_REMOTE: old.bare }) }));
+    assert.equal(r.exitCode, 1, JSON.stringify(r.output));
+    assert.equal(r.output.ok, false);
+    assert.equal(r.output.error, 'installer-too-old');
+    assert.match(r.output.message, /older installer/);
+    assert.ok(r.output.message.includes(`./install.sh --claude-home ${home}${guardFiles ? '' : ' --skip-file-guard'}`), r.output.message);
+    assert.equal(r.output.install, null, 'the downloaded installer was never run');
+    assert.equal(existsSync(join(home, 'pipeline', 'INSTALLED.json')) ? readFileSync(join(home, 'pipeline', 'INSTALLED.json'), 'utf8') : null, before, 'the installed copy is untouched');
+    assert.deepEqual(left, [], 'the download is removed');
+  }
+});
+
 test('update on an up-to-date install changes nothing and reports before === after', async () => {
   const { sha } = remote();
   const home = await updatedHome();

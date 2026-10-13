@@ -83,6 +83,19 @@ export function installerEnv(env) {
   return Object.fromEntries(Object.entries(env).filter(([k, v]) => v !== undefined && !NODE_INJECTION_VARS.has(k.toUpperCase())));
 }
 
+// The download lives under <home>/pipeline-state/tmp, and only an installer that knows that root (install.mjs imports
+// TMP_ROOT_REL from pipeline/lib/private-tmp.mjs - keep that import, this check reads it) accepts a --source inside the
+// Claude home; an older one (rolling back to an earlier main, or a branch installed before it merged) rejects it and
+// the update would die in `install-failed` with a message about overwriting. Better to say so up front.
+export function installerAcceptsPrivateTmpSource(src) {
+  try {
+    if (!fs.statSync(path.join(src, 'pipeline', 'lib', 'private-tmp.mjs')).isFile()) return false;
+    return /\bTMP_ROOT_REL\b/.test(fs.readFileSync(path.join(src, 'install.mjs'), 'utf8'));
+  } catch {
+    return false;
+  }
+}
+
 function runInstaller(src, args, env) {
   const r = runProcess(process.execPath, [path.join(src, 'install.mjs'), ...args], { cwd: src, env: installerEnv(env), replaceEnv: true, timeoutMs: INSTALL_TIMEOUT_MS });
   let json = null;
@@ -167,6 +180,10 @@ export async function run(argv, ctx = {}) {
       src = fetchSource(tmp, isoDir, main.sha, fetchRemote(env));
     } catch (err) {
       return fail('fetch-failed', err.message);
+    }
+    if (!installerAcceptsPrivateTmpSource(src)) {
+      const manual = `./install.sh --claude-home ${home}${flags.join(' ') ? ` ${flags.join(' ')}` : ''}`;
+      return fail('installer-too-old', `upstream main ${sha7(main.sha)} has an older installer that cannot install from the folder this command downloads into, so nothing was changed. Update from a clone of that version instead: run \`${manual}\` in it (on Windows: \`${manual.replace('./install.sh', '.\\install.ps1')}\`).`);
     }
     say(`installing into ${home} ...`);
     const common = ['--claude-home', home, '--source', src, '--json', ...flags];

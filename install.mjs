@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { run } from './pipeline/lib/proc.mjs';
 import { expandHome, isInside, safeTimestamp } from './pipeline/lib/paths.mjs';
+// `pipeline update` (commands/update.mjs installerAcceptsPrivateTmpSource) detects this import to know the installer accepts its download.
 import { TMP_ROOT_REL } from './pipeline/lib/private-tmp.mjs';
 import * as I from './pipeline/lib/installer.mjs';
 import { hasClaudeCodeAncestor } from './pipeline/lib/claude-ancestry.mjs';
