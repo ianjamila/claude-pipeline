@@ -434,6 +434,13 @@ function unwrap(argv) {
 const EXPANDS = /[$`*?[^#]|[^=]~(?!\d|$)|^=[^=(~]/;
 const EQUALS_WORD = /^=[^=(~\s]/;
 export const isEqualsWord = (w) => EQUALS_WORD.test(w);
+// Why: `source NAME` / `. NAME` without a slash looks NAME up in the PATH directories first, then in the cwd (bash; zsh also searches PATH): the record then lists PATH as places to look
+// (only when the line itself sets PATH -- a prefix, `export PATH=...`, `PATH=...; ` -- the hook's own PATH holds the user's tools, not files the line plants)
+export function sourcePathSearch(rec, argv, cmds = []) {
+  if (!cmds.some((c) => Object.hasOwn(c.env ?? {}, 'PATH') || (c.argv ?? []).some((a) => /^PATH(?:\+?=|\[)/.test(a)))) return false;
+  if (!rec || rec.kind !== 'shell' || !['source', '.'].includes(base(argv?.[0] ?? ''))) return false;
+  return (rec.words ?? [rec.file]).some((w) => typeof w === 'string' && w !== '' && !w.includes('/'));
+}
 const hasExpansion = (w) => EXPANDS.test(w);
 // A word that is a process substitution: the shell runs a command and reads its output through a /dev/fd path.
 // (zsh's `=(cmd)` is the same thing with a temp file)

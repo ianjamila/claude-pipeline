@@ -284,7 +284,20 @@ function buildCandidates(sf, { expand, dirs, joinPath, readDir, ifs, assigned })
     if (rs.over) return { files: [], dynamic, over: true };
     words.push(...rs);
   }
+  // the file `name` in each directory PATH may hold (sf.pathValues; none given: unknown). An empty PATH entry is the cwd; a directory known only at run time makes the script unknown.
+  const addPathDirs = (name) => {
+    if (!sf.pathValues) dynamic = true;
+    for (const v of sf.pathValues ?? []) {
+      for (const comp of v.split(':')) {
+        if (/^\$\{?PATH\}?$/.test(comp) || comp === '') continue;
+        const dir = expand(comp);
+        if (/[$`]/.test(dir)) dynamic = true;
+        else add(`${dir.replace(/\/+$/, '')}/${name}`);
+      }
+    }
+  };
   for (const w of words) {
+    if (sf.pathSearch && !isEqualsWord(w) && !w.includes('/')) { const name = expand(w); if (/[$`]/.test(name)) dynamic = true; else addPathDirs(name); } // (`source NAME`: the PATH directories, then the cwd below)
     // zsh EQUALS: `=tool` is the file `tool` resolves to in a PATH directory (sf.pathValues: the values PATH may have; none given: unknown).
     // An empty PATH entry is the cwd; a directory known only at run time makes the script unknown.
     if (isEqualsWord(w)) {
@@ -293,15 +306,7 @@ function buildCandidates(sf, { expand, dirs, joinPath, readDir, ifs, assigned })
       if (/[$`]/.test(name)) dynamic = true;
       else {
         add(name);
-        if (!sf.pathValues) dynamic = true;
-        for (const v of sf.pathValues ?? []) {
-          for (const comp of v.split(':')) {
-            if (/^\$\{?PATH\}?$/.test(comp) || comp === '') continue;
-            const dir = expand(comp);
-            if (/[$`]/.test(dir)) dynamic = true;
-            else add(`${dir.replace(/\/+$/, '')}/${name}`);
-          }
-        }
+        addPathDirs(name);
       }
       if (files.size > MAX_CANDIDATES) return { files: [], dynamic, over: true };
       continue;

@@ -93,3 +93,17 @@ test('F2b-2 58: after an unknown cd, relative script operands and relative feeds
   ]);
   allows(files, inHome, [`cd ${D}D; bash h.sh`, `cd ${D}D; bash < h.sh`]);
 });
+
+test('F2b-2 84: `source NAME` without a slash is looked up along PATH (line, prefix, export) before the cwd', () => {
+  const lib = { '/home/u/bin/lib.sh': BAD, 'lib.sh': 'echo hi' };
+  for (const run of [files, git]) {
+    denies(run, lib, [
+      `PATH=/home/u/bin:${D}PATH; source lib.sh`,
+      `export PATH=/home/u/bin:${D}PATH; . lib.sh`,
+      `PATH=/home/u/bin source lib.sh`,
+      `PATH=/home/u/bin:${D}PATH; source lib.sh; echo hi`,
+    ]);
+    // a slash names the file (no PATH search); a PATH without that file, or a name found only in the cwd, stays allowed
+    allows(run, lib, [`PATH=/home/u/bin:${D}PATH; source ./lib.sh`, `PATH=/home/u/other:${D}PATH; source lib.sh`, 'source lib.sh']);
+  }
+});
