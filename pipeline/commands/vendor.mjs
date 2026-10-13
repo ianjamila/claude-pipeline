@@ -5,12 +5,13 @@
 // Source paths are relative to this file only (<commandsDir>/../lib etc.), so the same code works from the git
 // checkout (pipeline/ is a child of the repo root) and from the installed copy under ~/.claude/pipeline/.
 import { createHash } from 'node:crypto';
-import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EXIT, UsageError, parseCommandArgs, requireOption } from '../lib/cli.mjs';
-import { git } from '../lib/git.mjs';
+import { checkoutIdentity, formatStamp, installedIdentity, parseStamp } from '../lib/identity.mjs';
 import { repoRoot } from '../lib/repo.mjs';
+import { readRegularFile } from '../lib/safe-read.mjs';
 
 export const meta = {
   summary: 'copy the CI-side scripts into a project (scripts/pipeline/); --check reports drift',
@@ -39,28 +40,21 @@ function layout() {
   };
 }
 
-// Base version from VERSION, else INSTALLED.json (what `pipeline version` falls back to for an installed copy).
-function baseVersion({ versionDir, pipelineDir }) {
-  if (versionDir) return readFileSync(join(versionDir, VERSION_FILE), 'utf8').trim();
-  try {
-    return String(JSON.parse(readFileSync(join(pipelineDir, 'INSTALLED.json'), 'utf8')).version);
-  } catch {
-    return 'unknown';
+// The identity stamped into scripts/pipeline/VERSION comes from where vendor runs (lib/identity.mjs): an installed
+// copy is hashed against its own INSTALLED.json, a checkout is compared with HEAD and the local origin/main over
+// exactly the files vendor copies. A label that cannot be proven carries .modified / .incomplete / .unverified or
+// +unknown instead of passing for a clean build. Returns { base, stamp }.
+function vendorIdentity({ versionDir, pipelineDir }, items) {
+  if (existsSync(join(pipelineDir, 'INSTALLED.json'))) {
+    const id = installedIdentity(resolve(pipelineDir, '..'));
+    if (id) return { base: id.base, stamp: id.stamp };
+    let base = 'unknown';
+    try { base = readFileSync(join(pipelineDir, VERSION_FILE), 'utf8').trim() || 'unknown'; } catch { /* unknown */ }
+    return { base, stamp: formatStamp(base, null, ['unverified']) };
   }
-}
-
-// Short sha of THIS pipeline checkout. Only trusted when the git root is exactly the directory holding VERSION:
-// an installed copy under ~/.claude/pipeline can sit inside an unrelated git repo (dotfiles), and stamping that
-// repo's sha would be a lie, so it says "unknown" instead.
-function pipelineSha({ versionDir }) {
-  if (!versionDir) return 'unknown';
-  try {
-    const top = git(['rev-parse', '--show-toplevel'], { cwd: versionDir }).trim();
-    if (realpathSync(top) !== realpathSync(versionDir)) return 'unknown';
-    return git(['rev-parse', '--short', 'HEAD'], { cwd: versionDir }).trim() || 'unknown';
-  } catch {
-    return 'unknown';
-  }
+  if (!versionDir) return { base: 'unknown', stamp: formatStamp('unknown', null, ['unverified']) };
+  const id = checkoutIdentity(versionDir, items.map((i) => i.src));
+  return { base: id.base, stamp: id.stamp };
 }
 
 // [{ rel (inside scripts/pipeline), src }] for every copied file; VERSION is generated, so it is not in the list.
@@ -73,6 +67,51 @@ function manifest(l) {
 }
 
 const repoRel = (rel) => posix(...DEST, rel);
+
+// Content drift of a project's scripts/pipeline/ from the code this pipeline would vendor: [{ file, reason }] for every
+// file that is missing or whose bytes differ (empty = identical). Only bytes count: the VERSION stamp's +sha moves with
+// every pipeline commit and says nothing about the copied code. Takes the repo root from the caller, runs no git, so
+// the SessionStart hook can call it in-process under its deadline.
+export function vendorDrift(root, items = manifest(layout())) {
+  const target = join(root, ...DEST);
+  const drift = [];
+  for (const it of items) {
+    const dest = join(target, it.rel);
+    if (!existsSync(dest)) drift.push({ file: repoRel(it.rel), reason: 'missing' });
+    else if (sha256(dest) !== sha256(it.src)) drift.push({ file: repoRel(it.rel), reason: 'differs' });
+  }
+  return drift;
+}
+
+// The same comparison for a caller that must not be held hostage by the repo it inspects (the SessionStart hook): the
+// project's files are untrusted, so a destination that is a symlink or any non-regular file (a FIFO, /dev/zero, a
+// directory) or larger than `maxBytes` counts as 'differs' without being read through, every file is read with a size
+// cap, and the loop stops once `deadlineAt` (ms, compared with `now()`) has passed. Returns { drift, timedOut };
+// when timedOut the drift list is partial and the caller must not report from it.
+export const DRIFT_MAX_FILE_BYTES = 2 * 1024 * 1024;
+export function vendorDriftBounded(root, { deadlineAt = Infinity, now = Date.now, maxBytes = DRIFT_MAX_FILE_BYTES, items = manifest(layout()) } = {}) {
+  const target = join(root, ...DEST);
+  const drift = [];
+  for (const it of items) {
+    if (now() >= deadlineAt) return { drift, timedOut: true };
+    const have = readRegularFile(join(target, it.rel), maxBytes, { rejectLarger: true });
+    if (have.status === 'missing') drift.push({ file: repoRel(it.rel), reason: 'missing' });
+    else if (have.status !== 'ok') drift.push({ file: repoRel(it.rel), reason: 'differs' });
+    else if (!have.buffer.equals(readFileSync(it.src))) drift.push({ file: repoRel(it.rel), reason: 'differs' });
+  }
+  return { drift, timedOut: false };
+}
+
+// Why a project's VERSION stamp proves nothing about the vendored code, or null when it is a clean, sha-bearing one.
+function stampWarning(text) {
+  const p = parseStamp(text);
+  if (!p) return `${repoRel(VERSION_FILE)} (${JSON.stringify(text)}) is not a version stamp`;
+  const problems = [];
+  if (!p.sha) problems.push('no source sha');
+  for (const f of p.flags) if (['unverified', 'modified', 'incomplete'].includes(f)) problems.push(`.${f}`);
+  if (problems.length === 0) return null;
+  return `${repoRel(VERSION_FILE)} is stamped ${text} (${problems.join(', ')}): it does not prove which pipeline commit these files came from; run \`pipeline vendor\` from a clean, published checkout or install to restamp`;
+}
 
 // What a project's .gitattributes must say so that vendored bytes survive a checkout: with Git for Windows' default
 // autocrlf=true every vendored .mjs would be rewritten to CRLF and `vendor --check` (a byte comparison) would report
@@ -110,35 +149,28 @@ export async function run(argv) {
     if (!existsSync(it.src)) throw new Error(`pipeline source file is missing: ${it.src}`);
   }
   const target = join(root, ...DEST);
-  const version = `${baseVersion(l)}+${pipelineSha(l)}`;
+  const { base, stamp: version } = vendorIdentity(l, items);
   const allFiles = [...items.map((i) => repoRel(i.rel)), repoRel(VERSION_FILE)];
 
   if (values.check) {
-    const drift = [];
-    for (const it of items) {
-      const dest = join(target, it.rel);
-      if (!existsSync(dest)) drift.push({ file: repoRel(it.rel), reason: 'missing' });
-      else if (sha256(dest) !== sha256(it.src)) drift.push({ file: repoRel(it.rel), reason: 'differs' });
-    }
+    const drift = vendorDrift(root, items);
     // The +sha moves with every pipeline commit and says nothing about the copied code, so only the base version counts.
     const vfile = join(target, VERSION_FILE);
     if (!existsSync(vfile)) drift.push({ file: repoRel(VERSION_FILE), reason: 'missing' });
     else {
       const have = readFileSync(vfile, 'utf8').trim().split('+')[0];
-      const want = version.split('+')[0];
-      if (have !== want) drift.push({ file: repoRel(VERSION_FILE), reason: `version ${have} != pipeline ${want}` });
+      if (have !== base) drift.push({ file: repoRel(VERSION_FILE), reason: `version ${have} != pipeline ${base}` });
     }
     if (drift.length > 0) return { exitCode: EXIT.FAILED, output: { ok: false, drift } };
     const gaFile = join(root, '.gitattributes');
     const present = attributeLines(existsSync(gaFile) ? readFileSync(gaFile, 'utf8') : '');
     const unpinned = ATTRIBUTES.filter((l) => !present.has(l));
-    return {
-      exitCode: EXIT.OK,
-      output: {
-        ok: true, files: allFiles, version: readFileSync(vfile, 'utf8').trim(),
-        ...(unpinned.length ? { warnings: [`.gitattributes lacks ${unpinned.map((l) => JSON.stringify(l)).join(', ')}: with autocrlf a Windows checkout rewrites the vendored files and this check reports drift; run \`pipeline vendor\` to add it`] } : {}),
-      },
-    };
+    const stamp = readFileSync(vfile, 'utf8').trim();
+    const warnings = [
+      ...(unpinned.length ? [`.gitattributes lacks ${unpinned.map((l) => JSON.stringify(l)).join(', ')}: with autocrlf a Windows checkout rewrites the vendored files and this check reports drift; run \`pipeline vendor\` to add it`] : []),
+      ...[stampWarning(stamp)].filter(Boolean),
+    ];
+    return { exitCode: EXIT.OK, output: { ok: true, files: allFiles, version: stamp, ...(warnings.length ? { warnings } : {}) } };
   }
 
   for (const it of items) {

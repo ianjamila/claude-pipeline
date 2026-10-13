@@ -17,6 +17,9 @@ export const MANIFEST_REL = 'pipeline/INSTALLED.json';
 export const GUARD_GIT_MATCHER = 'Bash|PowerShell|Monitor|mcp__.*';
 export const GUARD_FILES_MATCHER = 'Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|Monitor|mcp__.*';
 export const HOOK_TIMEOUT_S = 15;
+export const SESSION_HOOK_TIMEOUT_S = 10;
+// The events whose hooks this installer manages: guard hooks on PreToolUse, the version-status hook on SessionStart.
+const HOOK_EVENTS = ['PreToolUse', 'SessionStart'];
 export const STAGING_REL = 'backups/.staging';
 export const TILDE_ALLOW_ENTRY = 'Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)';
 export const SUBAGENT_NOTE = 'Pinned agent models (judge=opus, arbiter=fable) still win over this env var — verified on Claude Code 2.1.285; unpinned subagents use it.';
@@ -73,11 +76,13 @@ export function sha256File(file) {
 
 // Relative POSIX paths of the regular files under root, skipping excluded names at any depth and topLevel
 // names only directly under root. Symlinked directories are not followed; a symlink to a file counts as that file.
-export function walkFiles(root, { exclude = EXCLUDED_NAMES, topLevel = EXCLUDED_TOP_LEVEL } = {}) {
+// A directory that cannot be listed is skipped, but reported to `onError(relDir, error)` when given, so a caller that
+// must not read "nothing found" as "nothing there" can tell.
+export function walkFiles(root, { exclude = EXCLUDED_NAMES, topLevel = EXCLUDED_TOP_LEVEL, onError = null } = {}) {
   const out = [];
   const visit = (abs, rel) => {
     let entries;
-    try { entries = fs.readdirSync(abs, { withFileTypes: true }); } catch { return; }
+    try { entries = fs.readdirSync(abs, { withFileTypes: true }); } catch (err) { if (onError) onError(rel, err); return; }
     for (const e of entries) {
       if (exclude.has(e.name) || (rel === '' && topLevel.has(e.name))) continue;
       const childAbs = path.join(abs, e.name);
@@ -97,7 +102,7 @@ export function walkFiles(root, { exclude = EXCLUDED_NAMES, topLevel = EXCLUDED_
 }
 
 const isDirectory = (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } };
-const isFile = (p) => { try { return fs.statSync(p).isFile(); } catch { return false; } };
+export const isFile = (p) => { try { return fs.statSync(p).isFile(); } catch { return false; } };
 export const lexists = (p) => { try { fs.lstatSync(p); return true; } catch { return false; } };
 export const fromRel = (base, rel) => path.join(base, ...rel.split('/'));
 
@@ -131,7 +136,7 @@ export function buildPlan(source) {
     const entries = walkFiles(pipelineDir)
       .filter((r) => r !== 'INSTALLED.json')
       .map((r) => ({ rel: `pipeline/${r}`, abs: path.join(pipelineDir, ...r.split('/')) }));
-    for (const hook of ['guard-git.mjs', 'guard-files.mjs']) {
+    for (const hook of ['guard-git.mjs', 'guard-files.mjs', 'session-version.mjs']) {
       if (!entries.some((e) => e.rel === `pipeline/hooks/${hook}`)) problems.push(`pipeline/hooks/${hook} is missing`);
     }
     if (isFile(path.join(source, 'VERSION'))) {
@@ -181,6 +186,41 @@ export function scanUnitDisk(home, unit) {
   return out;
 }
 
+// The installer-owned units, by descriptor only (no source needed): the places an install writes under a claude-home.
+export const installedUnits = () => [
+  { kind: 'pipeline', name: 'pipeline', rel: 'pipeline' },
+  ...AGENTS.map((name) => ({ kind: 'agent', name, rel: `agents/${name}.md` })),
+  ...SKILLS.map((name) => ({ kind: 'skill', name, rel: `skills/${name}` })),
+];
+
+// Home-relative paths of files sitting in an installer-owned unit that the manifest does not list (something added
+// after the install). Same walker and exclusions as install, so what install ignores is ignored here too. Paths are
+// only listed, never read: one unreadable file must not hide the others. Returns { extra, unreadable }; `unreadable`
+// = home-relative directories that could not be listed (what is in them is unknown).
+export function scanExtraInstalledFiles(home, manifest) {
+  const extra = [];
+  const unreadable = [];
+  for (const unit of installedUnits()) {
+    const target = unitTarget(home, unit);
+    if (unit.kind === 'agent') {
+      if (isFile(target) && !Object.hasOwn(manifest.files, unit.rel)) extra.push(unit.rel);
+      continue;
+    }
+    if (!isDirectory(target)) continue;
+    const onError = (relDir) => unreadable.push(relDir ? `${unit.rel}/${relDir}` : unit.rel);
+    for (const r of walkFiles(target, { onError })) {
+      if (unit.kind === 'pipeline' && r === 'INSTALLED.json') continue;
+      const rel = `${unit.rel}/${r}`;
+      if (!Object.hasOwn(manifest.files, rel)) extra.push(rel);
+    }
+  }
+  return { extra: extra.sort(byCodeUnit), unreadable: unreadable.sort(byCodeUnit) };
+}
+
+export function extraInstalledFiles(home, manifest) {
+  return scanExtraInstalledFiles(home, manifest).extra;
+}
+
 // 'missing' (nothing at the target), 'same' (exactly our files, byte for byte) or 'different'.
 export function unitState(home, unit) {
   const target = unitTarget(home, unit);
@@ -221,16 +261,87 @@ export function safeManifestKey(key) {
   return parts.every((p) => p !== '' && p !== '.' && p !== '..');
 }
 
+// `git ls-tree -r -z HEAD` output -> Map of path -> blob id (regular files and symlinks; submodule entries are skipped).
+export function parseLsTree(text) {
+  const blobs = new Map();
+  for (const entry of text.split('\0')) {
+    const tab = entry.indexOf('\t');
+    if (tab < 0) continue;
+    const [, type, id] = entry.slice(0, tab).split(' ');
+    if (type === 'blob') blobs.set(entry.slice(tab + 1), id);
+  }
+  return blobs;
+}
+
+// Of the paths HEAD holds (source-root-relative, POSIX), the ones an install would copy, named as the plan names the
+// source file: pipeline/** (minus INSTALLED.json, EXCLUDED_NAMES anywhere, EXCLUDED_TOP_LEVEL directly under pipeline/),
+// agents/<name>.md for AGENTS, skills/<name>/** for SKILLS (same exclusions) and the root VERSION, which is what
+// installs as pipeline/VERSION. Lets provenance notice a source file deleted from the working tree.
+export function installableSourcePaths(headPaths) {
+  const out = new Set();
+  const keep = (parts) => parts.length > 0 && !EXCLUDED_TOP_LEVEL.has(parts[0]) && !parts.some((p) => EXCLUDED_NAMES.has(p));
+  for (const p of headPaths) {
+    const parts = p.split('/');
+    if (p === 'VERSION' || p === 'pipeline/VERSION') out.add('VERSION');
+    else if (parts[0] === 'pipeline' && parts.length > 1) {
+      if (p !== 'pipeline/INSTALLED.json' && keep(parts.slice(1))) out.add(p);
+    } else if (parts[0] === 'agents' && parts.length === 2) {
+      if (AGENTS.some((n) => parts[1] === `${n}.md`)) out.add(p);
+    } else if (parts[0] === 'skills' && parts.length > 2 && SKILLS.includes(parts[1])) {
+      if (keep(parts.slice(2))) out.add(p);
+    }
+  }
+  return out;
+}
+
+// Source-relative paths (POSIX) of planned files that are not exactly what HEAD holds: absent from HEAD, or a different
+// blob. `hashes` is the blob id git computes for each path in the working tree (filters applied), in the same order.
+export function pathsDifferingFromHead(paths, headBlobs, hashes) {
+  return paths.filter((p, i) => headBlobs.get(p) !== hashes[i]);
+}
+
+// The real location of `p`: symlinks resolved on the deepest ancestor that exists, the not-yet-created rest appended.
+// A claude-home reached through an alias (a symlinked ~/.claude, a second mount point) must name the same lock.
+export function canonicalPath(p) {
+  let cur = path.resolve(p);
+  const rest = [];
+  for (;;) {
+    try { return path.join(fs.realpathSync.native(cur), ...rest); } catch { /* not there yet: try the parent */ }
+    const parent = path.dirname(cur);
+    if (parent === cur) return path.resolve(p);
+    rest.unshift(path.basename(cur));
+    cur = parent;
+  }
+}
+
+// Where the write lock for `home` lives: inside the destination itself, so it is scoped to that home and never to
+// whoever happens to run the installer.
+export const installLockDir = (home) => path.join(canonicalPath(home), 'backups', '.locks');
+
+// Name of the write lock for one claude-home: two installs into the same home exclude each other, installs into
+// different homes do not. The canonical (symlink-resolved) path is case-folded where the filesystem is (Windows,
+// macOS), then hashed so the name is a safe file name whatever the path holds.
+export function installLockName(home) {
+  const resolved = canonicalPath(home);
+  return `installer-${createHash('sha256').update(foldCase(resolved)).digest('hex').slice(0, 16)}`;
+}
+
 // The same manifest, minus the one field that changes on every run.
 export const manifestWithoutTime = ({ installedAt, ...rest }) => rest;
 
-export function buildManifest({ plan, sourceSha, skipFileGuard, now = new Date() }) {
+// complete: false is what the pipeline unit carries while the rest of the install is still being swapped in; the
+// final rewrite says true. A manifest without the field (every install before it existed) counts as complete.
+export const manifestComplete = (manifest) => manifest?.complete !== false;
+
+export function buildManifest({ plan, sourceSha, skipFileGuard, complete = false, sourceDirty = false, now = new Date() }) {
   const files = {};
   for (const rel of [...plan.files.keys()].sort(byCodeUnit)) files[rel] = plan.files.get(rel).sha256;
   return {
     version: plan.version,
     sourceSha: sourceSha ?? null,
+    ...(sourceDirty ? { sourceDirty: true } : {}),
     installedAt: now.toISOString(),
+    complete: Boolean(complete),
     files,
     hooks: { guardGit: true, guardFiles: !skipFileGuard },
   };
@@ -335,11 +446,31 @@ export function ourAllowEntries(home) {
   return entries;
 }
 
+// Why: Claude Code treats a hook that exits 1 (what `node <missing file>` does, e.g. while an install swaps the hooks
+// dir in) as a NON-blocking error, so the tool call is allowed. Exit 2 blocks. The guards are therefore started through
+// this loader: it imports the hook file (process.argv[1], the first argument after `-e`) and, if the import itself
+// fails (file missing, a module that will not load), says so on stderr and exits 2. A hook that loads runs exactly as
+// before: it reads stdin and writes its own JSON; the loader adds nothing to its output or exit code.
+export const HOOK_LOADER = [
+  "import { pathToFileURL } from 'node:url';",
+  'try { await import(pathToFileURL(process.argv[1]).href); } catch (e) {',
+  "process.stderr.write('claude-pipeline: hook could not be loaded (' + ((e && (e.code || e.message)) || e) + '); blocking this call\\n', () => process.exit(2));",
+  '}',
+].join(' ');
+
 const handlerFor = (home, name) => ({
   type: 'command',
   command: 'node',
-  args: [joinNative(home, 'pipeline', 'hooks', `${name}.mjs`)],
+  args: ['--input-type=module', '-e', HOOK_LOADER, joinNative(home, 'pipeline', 'hooks', `${name}.mjs`)],
   timeout: HOOK_TIMEOUT_S,
+});
+
+// The status hook is deliberately NOT started through the fail-closed loader: a SessionStart failure must never block anything.
+const sessionHandlerFor = (home) => ({
+  type: 'command',
+  command: 'node',
+  args: [joinNative(home, 'pipeline', 'hooks', 'session-version.mjs')],
+  timeout: SESSION_HOOK_TIMEOUT_S,
 });
 
 export function ourHookGroups(home, { skipFileGuard = false } = {}) {
@@ -348,11 +479,16 @@ export function ourHookGroups(home, { skipFileGuard = false } = {}) {
   return groups;
 }
 
+// Our own group (no matcher: every start source), appended after whatever the owner already has on SessionStart.
+export const ourSessionStartGroups = (home) => [{ hooks: [sessionHandlerFor(home)] }];
+
 function assertShape(settings) {
   if (!isPlainObject(settings)) throw new SettingsShapeError('settings.json must contain a JSON object');
   if ('hooks' in settings && !isPlainObject(settings.hooks)) throw new SettingsShapeError('settings.json: "hooks" is not an object');
-  if (isPlainObject(settings.hooks) && 'PreToolUse' in settings.hooks && !Array.isArray(settings.hooks.PreToolUse)) {
-    throw new SettingsShapeError('settings.json: "hooks.PreToolUse" is not an array');
+  for (const event of HOOK_EVENTS) {
+    if (isPlainObject(settings.hooks) && event in settings.hooks && !Array.isArray(settings.hooks[event])) {
+      throw new SettingsShapeError(`settings.json: "hooks.${event}" is not an array`);
+    }
   }
   if ('permissions' in settings && !isPlainObject(settings.permissions)) throw new SettingsShapeError('settings.json: "permissions" is not an object');
   if (isPlainObject(settings.permissions) && 'allow' in settings.permissions && !Array.isArray(settings.permissions.allow)) {
@@ -360,24 +496,27 @@ function assertShape(settings) {
   }
 }
 
-// Removes our handlers from hooks.PreToolUse in place; drops groups that this leaves empty. Returns the count.
+// Removes our handlers from hooks.PreToolUse and hooks.SessionStart in place; drops groups that this leaves empty.
+// Returns the count removed.
 function stripOurHandlers(settings, home) {
-  const groups = settings.hooks?.PreToolUse;
-  if (!Array.isArray(groups)) return 0;
   let removed = 0;
-  settings.hooks.PreToolUse = groups.filter((group) => {
-    if (!isPlainObject(group) || !Array.isArray(group.hooks) || group.hooks.length === 0) return true;
-    const kept = group.hooks.filter((h) => !isOurHandler(h, home));
-    removed += group.hooks.length - kept.length;
-    if (kept.length === group.hooks.length) return true;
-    group.hooks = kept;
-    return kept.length > 0;
-  });
+  for (const event of HOOK_EVENTS) {
+    const groups = settings.hooks?.[event];
+    if (!Array.isArray(groups)) continue;
+    settings.hooks[event] = groups.filter((group) => {
+      if (!isPlainObject(group) || !Array.isArray(group.hooks) || group.hooks.length === 0) return true;
+      const kept = group.hooks.filter((h) => !isOurHandler(h, home));
+      removed += group.hooks.length - kept.length;
+      if (kept.length === group.hooks.length) return true;
+      group.hooks = kept;
+      return kept.length > 0;
+    });
+  }
   return removed;
 }
 
-// Pure: returns a new settings object with our hook groups appended (guard-files last) and our allow entries
-// added once. Any earlier handlers of ours are replaced; every other key, hook and entry is left as it was.
+// Pure: returns a new settings object with our hook groups appended (guard-files last; the SessionStart status group
+// after the owner's own) and our allow entries added once. Any earlier handlers of ours are replaced; every other key, hook and entry is left as it was.
 export function mergeSettings(settings, { home, skipFileGuard = false }) {
   assertShape(settings);
   const out = structuredClone(settings);
@@ -385,19 +524,21 @@ export function mergeSettings(settings, { home, skipFileGuard = false }) {
   out.hooks ??= {};
   out.hooks.PreToolUse ??= [];
   out.hooks.PreToolUse.push(...ourHookGroups(home, { skipFileGuard }));
+  out.hooks.SessionStart ??= [];
+  out.hooks.SessionStart.push(...ourSessionStartGroups(home));
   out.permissions ??= {};
   out.permissions.allow ??= [];
   for (const entry of ourAllowEntries(home)) if (!out.permissions.allow.includes(entry)) out.permissions.allow.push(entry);
   return out;
 }
 
-// Pure inverse for --uninstall. A container (PreToolUse, hooks, allow, permissions) that our removal leaves
-// empty is dropped, so installing into a settings file that had none of them and uninstalling round-trips.
+// Pure inverse for --uninstall. A container (PreToolUse, SessionStart, hooks, allow, permissions) that our removal
+// leaves empty is dropped, so installing into a settings file that had none of them and uninstalling round-trips.
 export function removeOurSettings(settings, { home }) {
   assertShape(settings);
   const out = structuredClone(settings);
-  if (stripOurHandlers(out, home) > 0 && out.hooks.PreToolUse.length === 0) {
-    delete out.hooks.PreToolUse;
+  if (stripOurHandlers(out, home) > 0) {
+    for (const event of HOOK_EVENTS) if (Array.isArray(out.hooks[event]) && out.hooks[event].length === 0) delete out.hooks[event];
     if (Object.keys(out.hooks).length === 0) delete out.hooks;
   }
   const allow = out.permissions?.allow;
@@ -419,26 +560,34 @@ const scriptOf = (handler) => {
   const text = [handler.command, ...(Array.isArray(handler.args) ? handler.args : [])].filter((s) => typeof s === 'string').map(toPosix).join(' ');
   if (/\/guard-git\.mjs/.test(text)) return 'guard-git';
   if (/\/guard-files\.mjs/.test(text)) return 'guard-files';
+  if (/\/session-version\.mjs/.test(text)) return 'session-version';
   return null;
 };
 
-// Our handlers in hooks.PreToolUse, grouped by script, each flagged exact when it equals what install writes.
+// Our handlers, grouped by script, each flagged exact when it equals what install writes. The guards are read from
+// hooks.PreToolUse, the status hook from hooks.SessionStart; one of ours under the wrong event is `unknown`.
 export function inspectHooks(settings, home) {
-  const out = { 'guard-git': [], 'guard-files': [], unknown: [] };
-  const groups = settings?.hooks?.PreToolUse;
-  if (!Array.isArray(groups)) return out;
-  const matcherFor = { 'guard-git': GUARD_GIT_MATCHER, 'guard-files': GUARD_FILES_MATCHER };
-  for (const group of groups) {
-    if (!isPlainObject(group) || !Array.isArray(group.hooks)) continue;
-    for (const handler of group.hooks) {
-      if (!isOurHandler(handler, home)) continue;
-      const script = scriptOf(handler);
-      if (!script) { out.unknown.push({ matcher: group.matcher, handler }); continue; }
-      out[script].push({
-        matcher: group.matcher,
-        handler,
-        exact: group.matcher === matcherFor[script] && isDeepStrictEqual(handler, handlerFor(home, script)),
-      });
+  const out = { 'guard-git': [], 'guard-files': [], 'session-version': [], unknown: [] };
+  const expected = {
+    'guard-git': { event: 'PreToolUse', matcher: GUARD_GIT_MATCHER, handler: handlerFor(home, 'guard-git') },
+    'guard-files': { event: 'PreToolUse', matcher: GUARD_FILES_MATCHER, handler: handlerFor(home, 'guard-files') },
+    'session-version': { event: 'SessionStart', matcher: undefined, handler: sessionHandlerFor(home) },
+  };
+  for (const event of HOOK_EVENTS) {
+    const groups = settings?.hooks?.[event];
+    if (!Array.isArray(groups)) continue;
+    for (const group of groups) {
+      if (!isPlainObject(group) || !Array.isArray(group.hooks)) continue;
+      for (const handler of group.hooks) {
+        if (!isOurHandler(handler, home)) continue;
+        const script = scriptOf(handler);
+        if (!script || expected[script].event !== event) { out.unknown.push({ matcher: group.matcher, handler }); continue; }
+        out[script].push({
+          matcher: group.matcher,
+          handler,
+          exact: group.matcher === expected[script].matcher && isDeepStrictEqual(handler, expected[script].handler),
+        });
+      }
     }
   }
   return out;
@@ -454,6 +603,7 @@ export function computeDrift({ home, plan, manifest, settings, settingsProblem, 
   const add = (kind, p, message) => drift.push({ kind, path: p, message });
 
   if (!manifest) add('not-installed', MANIFEST_REL, `${MANIFEST_REL} is missing: claude-pipeline is not installed in ${home}`);
+  else if (!manifestComplete(manifest)) add('incomplete', MANIFEST_REL, 'incomplete: a previous install did not finish; re-run the installer');
   const states = new Map();
   for (const unit of plan.units) states.set(unit.rel, unitState(home, unit));
 
@@ -507,15 +657,16 @@ export function computeDrift({ home, plan, manifest, settings, settingsProblem, 
   }
   const found = inspectHooks(settings, home);
   const before = drift.length;
-  const hookCheck = (script, expected) => {
+  const hookCheck = (script, expected, event = 'PreToolUse') => {
     const list = found[script];
-    if (expected && list.length === 0) add('hook-missing', script, `hook missing: ${script} is not in hooks.PreToolUse`);
-    else if (expected && list.length > 1) add('hook-duplicated', script, `hook duplicated: ${script} appears ${list.length} times in hooks.PreToolUse`);
+    if (expected && list.length === 0) add('hook-missing', script, `hook missing: ${script} is not in hooks.${event}`);
+    else if (expected && list.length > 1) add('hook-duplicated', script, `hook duplicated: ${script} appears ${list.length} times in hooks.${event}`);
     else if (expected && !list[0].exact) add('hook-differs', script, `hook differs: the ${script} entry is not what install writes (path, matcher or timeout)`);
     else if (!expected && list.length > 0) add('hook-unexpected', script, `unexpected hook: ${script} is installed but this install omits it (--skip-file-guard)`);
   };
   hookCheck('guard-git', true);
   hookCheck('guard-files', expectGuardFiles);
+  hookCheck('session-version', true, 'SessionStart');
   for (const u of found.unknown) add('hook-unknown', null, `unrecognised hook entry in the pipeline hooks dir: ${JSON.stringify(u.handler)}`);
 
   const allow = Array.isArray(settings.permissions?.allow) ? settings.permissions.allow : [];
@@ -526,7 +677,8 @@ export function computeDrift({ home, plan, manifest, settings, settingsProblem, 
   if (drift.length === before) {
     let merged = null;
     try { merged = mergeSettings(settings, { home, skipFileGuard: !expectGuardFiles }); } catch { /* shape problems surface at install */ }
-    if (merged && !isDeepStrictEqual(merged, settings)) {
+    // Only PreToolUse is order-sensitive (guard-files must run last); other SessionStart entries may follow ours.
+    if (merged && !isDeepStrictEqual(merged.hooks?.PreToolUse, settings.hooks?.PreToolUse)) {
       add('hook-order', 'settings.json', 'hook order: our hook entries are not the last PreToolUse entries (guard-files must be last); reinstall fixes it');
     }
   }

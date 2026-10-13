@@ -1,6 +1,8 @@
-// `pipeline agent-log queue|stage`: the run log (config.agent_log). `queue` parks a line for later (a merged PR cannot
+// `pipeline agent-log queue|stage|close`: the run log (config.agent_log). `queue` parks a line for later (a merged PR cannot
 // commit its own "merged" line); `stage` writes the queued lines plus this PR's line into the log file of the PR
-// worktree and commits it, so the log rides along in the PR being merged. Pushing is the caller's job.
+// worktree and commits it, so the log rides along in the PR being merged; `close` turns the bot-posted production smoke
+// results of merged PRs into resolution lines (see lib/agentlog-close.mjs). Pushing is the caller's job.
+import { readFileSync } from 'node:fs';
 import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
@@ -9,22 +11,32 @@ import { loadState } from '../lib/state.mjs';
 import { LockTimeoutError } from '../lib/locks.mjs';
 import { inlineOptionValues } from '../lib/finalgate.mjs';
 import {
-  appendToQueue, assertSingleLine, buildAgentLogLine, commitLines, landedLines, queuePath, readQueue, resolveLogPath, withQueueLock, writeQueue,
+  DEFAULT_OUTCOME, appendToQueue, assertSingleLine, buildAgentLogLine, commitLines, landedLines, originLogLines, queuePath, readQueue, resolveLogPath, withQueueLock,
+  writeQueue,
 } from '../lib/agentlog.mjs';
+import { closeLines, parseLog, readScanState, unionLogText, writeScanState } from '../lib/agentlog-close.mjs';
 import { loadConfig } from '../lib/config.mjs';
 
 export const meta = {
-  summary: 'queue a line for the agent log, or stage queued lines + this PR\'s line as a commit in the worktree',
+  summary: 'queue a line for the agent log, stage queued lines + this PR\'s line as a commit in the worktree, or close pending prod-smoke lines',
   usage: [
-    'pipeline agent-log queue --line "<line>" [--repo DIR]   -> {ok, queued, file}',
+    'pipeline agent-log queue --line "<line>" [--repo DIR]   -> {ok, queued, file}; a line already in the queue (staged in an open PR or not) is not added again',
     'pipeline agent-log stage --pr N [--line "<line>"] [--repo DIR]   -> {ok, committed, lines, file, staged, dropped}; run in the PR worktree;',
     '  staged lines stay queued ("staged in PR N") until origin/<default> contains them, and are re-staged if that PR closes unmerged;',
     '  default line = the PR\'s agent-log line with outcome "merged — prod smoke pending"; exit 2 when the worktree has other uncommitted changes,',
     '  is on the default branch or a detached HEAD, or is not the PR\'s head branch at the PR\'s head commit; exit 3 when GitHub cannot say',
+    'pipeline agent-log close [--queue] [--pr N]... [--all] [--repo DIR]   -> {ok, lines, pending, skipped, unreadable, originReadable, originRefreshed, queued?, scanError?}; for every "prod smoke pending" log line reads the',
+    '  bot-authored prod-smoke-result comments on that PR (production.watch: workflow) and prints one resolution line per PR whose newest result',
+    '  is not logged yet (never an earlier minute than the newest logged one; the same minute only when the line differs); the log read is the worktree log plus the origin/<default> copy; one repo-wide read of the comments since the last successful read on this machine (at least 14 days)',
+    '  finds new results on any PR (a hit only triggers reading the whole comment history of that PR), and a PR is read on its own only when it has no',
+    '  resolution line, is the newest pending PR, is named by --pr N (repeatable) or --all is given (a resolved PR the scan did not mention is `skipped`,',
+    '  costing no call); a dry run unless --queue (queues each line like `queue`, a line already queued is not added again; never commits; only --queue advances the scan window, and only when the origin/<default> copy of the log was readable AND `git fetch origin <default>` succeeded, else originReadable / originRefreshed is false and a note goes to stderr); exit 1 when some',
+    '  PRs could not be read (`unreadable`; the lines for the others are still produced and queued: still run `stage` and name them in the summary), 3 when GitHub is',
+    '  unavailable (skip the close, still stage)',
   ].join('\n'),
 };
 
-export const DEFAULT_OUTCOME = 'merged — prod smoke pending';
+export { DEFAULT_OUTCOME };
 
 function singleLine(raw) {
   try {
@@ -51,15 +63,18 @@ async function dropLanded(root, fetch) {
   }
 }
 
+// Appends lines to the queue under its lock and drops the entries origin/<default> already has; returns the queue length.
+const queueLines = (root, lines) => withQueueLock(root, async () => {
+  for (const line of lines) appendToQueue(root, line);
+  await dropLanded(root, false);
+  return readQueue(root).length;
+});
+
 async function queue(rest, ctx) {
   const { values } = parseCommandArgs(inlineOptionValues(rest, ['--line']), { line: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
   const line = singleLine(requireOption(values, 'line'));
   const root = resolveRepo(values, ctx);
-  const queued = await withQueueLock(root, async () => {
-    appendToQueue(root, line);
-    await dropLanded(root, false);
-    return readQueue(root).length;
-  });
+  const queued = await queueLines(root, [line]);
   return { exitCode: EXIT.OK, output: { ok: true, queued, file: queuePath(root) } };
 }
 
@@ -148,9 +163,70 @@ async function stage(rest, ctx) {
   }
 }
 
+async function close(rest, ctx) {
+  const { values } = parseCommandArgs(rest, { queue: { type: 'boolean' }, all: { type: 'boolean' }, pr: { type: 'string', multiple: true }, repo: { type: 'string' } }, { allowPositionals: false });
+  const prs = (values.pr ?? []).map((raw) => {
+    if (!/^[1-9]\d{0,8}$/.test(raw)) throw new UsageError('--pr must be a positive PR number');
+    return raw;
+  });
+  const root = resolveRepo(values, ctx);
+  const { config } = await requireConfig(root);
+  let file;
+  try {
+    file = resolveLogPath(root, config.agent_log);
+  } catch (err) {
+    throw new Fail(EXIT.USAGE, { ok: false, error: 'config', message: err.message });
+  }
+  let logText = '';
+  try {
+    logText = readFileSync(file, 'utf8');
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
+  // The closer reasons over the UNION of this worktree's log and origin/<default>'s copy (fetched best effort): a worktree on an
+  // older branch lacks the lines other PRs merged since. When origin's copy cannot be read the run still closes what it can,
+  // but must not advance the shared scan checkpoint past PRs its own log may lack.
+  const origin = originLogLines(root, { logFile: file, defaultBranch: config.default_branch, fetch: true });
+  const originOk = origin.lines !== null;
+  const originRefreshed = origin.refreshed;
+  if (originOk) logText = unionLogText(logText, [...origin.lines].join('\n'));
+  if (!originOk) process.stderr.write(`origin/${config.default_branch} agent log unreadable — closing from the worktree log; scan checkpoint not advanced\n`);
+  else if (!originRefreshed) process.stderr.write(`could not refresh origin/${config.default_branch} (git fetch failed) — closing from the cached copy; scan checkpoint not advanced\n`);
+  const gh = createGitHub({ cwd: root, env: ctx.env });
+  const github = {
+    mergeSha: (n) => gh.prView(n, ['mergeCommit']).mergeCommit?.oid ?? null,
+    listComments: (n) => gh.listComments(n),
+    listRepoComments: (since) => gh.listRepoComments(since),
+  };
+  // Cheap up-front probe so "GitHub is unavailable" (3) is told apart from "this PR could not be read" (1).
+  if (parseLog(logText).pending.length > 0 && !gh.authStatus().ok) {
+    throw new Fail(EXIT.UNAVAILABLE, { ok: false, error: 'unavailable', message: 'GitHub is unavailable (gh is not authenticated or unreachable)' });
+  }
+  // The scan window covers the whole gap since the last successful scan on this machine. The state moves only once this scan's
+  // results are safely queued (--queue: every append succeeded), the scan was complete and every PR it surfaced was readable and
+  // origin's copy of the log was readable; a dry run, a failed scan or a failed append leaves it alone so the next run re-covers the gap. A failing PR outside the scan
+  // results (an unresolved one) is re-read every run anyway and does not hold the window back.
+  const now = Date.now();
+  const { lines, pending, skipped, unreadable, scanError, scanned, scanUnreadable } = await closeLines({
+    logText, gh: github, now, prs, all: values.all === true, lastScanAt: readScanState(root, now),
+  });
+  const incomplete = unreadable.length > 0 || scanError !== null;
+  const output = { ok: !incomplete, lines, pending: pending.map(Number), skipped: skipped.map(Number), unreadable: unreadable.map((u) => ({ pr: Number(u.pr), message: u.message })), originReadable: originOk, originRefreshed };
+  if (scanError !== null) output.scanError = scanError;
+  // Exit 1 only means some PRs could not be read: the lines for the others are still queued.
+  if (values.queue) {
+    const have = new Set(readQueue(root).map((e) => e.line));
+    output.queued = lines.filter((l) => !have.has(l)).length; // a line already queued is not added again
+    if (lines.length) await queueLines(root, lines);
+    if (scanned && scanUnreadable.length === 0 && originOk && originRefreshed) writeScanState(root, now);
+  }
+  return { exitCode: incomplete ? EXIT.FAILED : EXIT.OK, output };
+}
+
 export const run = guarded(async (argv, ctx) => {
   const [sub, ...rest] = argv;
   if (sub === 'queue') return queue(rest, ctx);
   if (sub === 'stage') return stage(rest, ctx);
-  throw new UsageError('usage: pipeline agent-log (queue --line "<line>" | stage --pr N [--line "<line>"])');
+  if (sub === 'close') return close(rest, ctx);
+  throw new UsageError('usage: pipeline agent-log (queue --line "<line>" | stage --pr N [--line "<line>"] | close [--queue] [--pr N]... [--all])');
 });

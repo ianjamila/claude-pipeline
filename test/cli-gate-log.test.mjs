@@ -389,6 +389,19 @@ test('agent-log queue: appends {line, at} to the queue file under the git common
   assert.equal(a.json.file, t.queueFile());
 });
 
+test('agent-log queue: queueing the same line twice leaves one entry, also when the first copy is already staged in another open PR', () => {
+  const t = logRepo();
+  assert.equal(t.q('- same line').json.queued, 1);
+  assert.equal(t.q('- same line').json.queued, 1);
+  assertExit(t.stage('--line', '- this PR'), 0);
+  const staged = readFileSync(t.queueFile(), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.deepEqual(staged.map((e) => [e.line, e.staged?.pr]), [['- same line', PR]]);
+  assert.equal(t.q('- same line').json.queued, 1, 'a line staged in an open PR is not re-added');
+  const after = readFileSync(t.queueFile(), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.deepEqual(after, staged, 'the staged entry is untouched');
+  assert.equal(t.q('- another').json.queued, 2);
+});
+
 test('agent-log queue: a missing, empty or multi-line --line is a usage error and queues nothing', () => {
   const t = logRepo();
   assertExit(cli(['agent-log', 'queue'], { dir: t.repo.dir, fake: t.fake }), 2);

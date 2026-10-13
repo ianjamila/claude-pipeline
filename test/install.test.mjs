@@ -13,9 +13,10 @@ import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join, dirname, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { tryAcquire, release, inspect } from '../pipeline/lib/locks.mjs';
 import {
   mergeSettings, removeOurSettings, isOurHandler, ourAllowEntries, renameWithRetry, collectDiagnostics,
-  shellRcPaths, parseArgs, buildPlan, walkFiles, safeManifestKey, GUARD_FILES_MATCHER, GUARD_GIT_MATCHER,
+  installLockName, shellRcPaths, parseArgs, buildPlan, walkFiles, safeManifestKey, GUARD_FILES_MATCHER, GUARD_GIT_MATCHER, HOOK_LOADER, joinNative,
 } from '../pipeline/lib/installer.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -86,13 +87,18 @@ function writeSettings(home, obj) {
   writeFileSync(settingsPath(home), `${JSON.stringify(obj, null, 2)}\n`);
 }
 
-const guardGit = (home) => ({
-  matcher: 'Bash|PowerShell|Monitor|mcp__.*',
-  hooks: [{ type: 'command', command: 'node', args: [join(home, 'pipeline', 'hooks', 'guard-git.mjs')], timeout: 15 }],
+// The guards start through the fail-closed loader (A2): `node --input-type=module -e <loader> <hook file>`.
+const loaded = (home, name) => ({
+  type: 'command', command: 'node', args: ['--input-type=module', '-e', HOOK_LOADER, join(home, 'pipeline', 'hooks', `${name}.mjs`)], timeout: 15,
 });
+const guardGit = (home) => ({ matcher: 'Bash|PowerShell|Monitor|mcp__.*', hooks: [loaded(home, 'guard-git')] });
 const guardFiles = (home) => ({
   matcher: 'Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|Monitor|mcp__.*',
-  hooks: [{ type: 'command', command: 'node', args: [join(home, 'pipeline', 'hooks', 'guard-files.mjs')], timeout: 15 }],
+  hooks: [loaded(home, 'guard-files')],
+});
+// The SessionStart status hook (A3): plain, not the fail-closed loader, in its own group without a matcher.
+const sessionVersion = (home) => ({
+  hooks: [{ type: 'command', command: 'node', args: [joinNative(home, 'pipeline', 'hooks', 'session-version.mjs')], timeout: 10 }],
 });
 const allowEntries = (home) => [
   `Bash(node ${posix(home)}/pipeline/bin/pipeline.mjs:*)`,
@@ -163,6 +169,7 @@ test('fresh install into an empty home (path with a space): files, manifest, hoo
 
   const s = readSettings(home);
   assert.deepEqual(s.hooks.PreToolUse, [guardGit(home), guardFiles(home)]);
+  assert.deepEqual(s.hooks.SessionStart, [sessionVersion(home)]);
   assert.deepEqual(s.permissions.allow, allowEntries(home));
   assert.deepEqual(Object.keys(s).sort(), ['hooks', 'permissions']);
   assert.equal(existsSync(join(home, 'backups')), false, 'no settings existed, so nothing to back up');
@@ -197,6 +204,7 @@ test('existing settings: every other key survives unchanged, ours is appended on
 
   const expected = structuredClone(before);
   expected.hooks.PreToolUse.push(guardGit(home), guardFiles(home));
+  expected.hooks.SessionStart.push(sessionVersion(home));
   expected.permissions.allow.push(...allowEntries(home));
   assert.deepEqual(after, expected);
   assert.deepEqual(Object.keys(after), Object.keys(before), 'top-level key order is preserved');
@@ -270,6 +278,7 @@ test('an older install in the string command form is replaced, not duplicated', 
   const after = readSettings(home);
   const expected = structuredClone(ownersSettings());
   expected.hooks.PreToolUse.push({ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }] }, guardGit(home), guardFiles(home));
+  expected.hooks.SessionStart.push(sessionVersion(home));
   expected.permissions.allow.push(...allowEntries(home));
   assert.deepEqual(after, expected);
 });
@@ -719,8 +728,8 @@ test('mergeSettings on an empty object builds the minimal structure; skipFileGua
 test('mergeSettings writes native Windows paths in args and a posix path in the allow entry', () => {
   const home = 'C:\\Users\\Jo Smith\\.claude';
   const out = mergeSettings({}, { home });
-  assert.deepEqual(out.hooks.PreToolUse[0].hooks[0].args, ['C:\\Users\\Jo Smith\\.claude\\pipeline\\hooks\\guard-git.mjs']);
-  assert.deepEqual(out.hooks.PreToolUse[1].hooks[0].args, ['C:\\Users\\Jo Smith\\.claude\\pipeline\\hooks\\guard-files.mjs']);
+  assert.deepEqual(out.hooks.PreToolUse[0].hooks[0].args, ['--input-type=module', '-e', HOOK_LOADER, 'C:\\Users\\Jo Smith\\.claude\\pipeline\\hooks\\guard-git.mjs']);
+  assert.deepEqual(out.hooks.PreToolUse[1].hooks[0].args, ['--input-type=module', '-e', HOOK_LOADER, 'C:\\Users\\Jo Smith\\.claude\\pipeline\\hooks\\guard-files.mjs']);
   assert.equal(out.permissions.allow[0], 'Bash(node C:/Users/Jo Smith/.claude/pipeline/bin/pipeline.mjs:*)');
   // and an earlier Windows-style entry is recognised as ours and replaced
   const again = mergeSettings(out, { home });
@@ -1028,4 +1037,456 @@ test('stage and rollback copies live under backups/.staging, never inside skills
   assert.ok(readdirSync(join(home, 'skills')).every((n) => !/\.(new|old)-/.test(n)));
   assert.ok(readdirSync(join(home, 'agents')).every((n) => !/\.(new|old)-/.test(n)));
   assert.equal(existsSync(join(home, 'backups', '.staging')), false, 'the staging dir is removed when empty');
+});
+
+// ---- A1: complete-install marker --------------------------------------------------------------------------------
+
+test('a finished install says complete: true; a legacy manifest without the field counts as complete', () => {
+  const home = newHome();
+  assert.equal(install(home).status, 0);
+  assert.equal(readManifest(home).complete, true);
+
+  const m = readManifest(home);
+  delete m.complete;
+  writeFileSync(join(home, 'pipeline', 'INSTALLED.json'), `${JSON.stringify(m, null, 2)}\n`);
+  const check = install(home, ['--check', '--json']);
+  assert.equal(check.status, 0, check.stdout);
+  assert.deepEqual(JSON.parse(check.stdout).drift, []);
+  const before = readFileSync(join(home, 'pipeline', 'INSTALLED.json'), 'utf8');
+  assert.equal(install(home).status, 0);
+  assert.equal(readFileSync(join(home, 'pipeline', 'INSTALLED.json'), 'utf8'), before, 'a legacy-but-current manifest is left byte-identical');
+});
+
+test('an install that dies after the pipeline unit leaves complete: false, --check says incomplete, a re-run repairs it', () => {
+  const home = newHome();
+  mkdirSync(home, { recursive: true });
+  writeFileSync(join(home, 'agents'), 'a file where the agents/ dir has to go\n'); // the agents unit cannot be staged
+  const failed = install(home);
+  assert.equal(failed.status, 1, failed.stdout);
+  assert.equal(readManifest(home).complete, false, 'the pipeline unit landed, the install did not finish');
+
+  const check = install(home, ['--check', '--json']);
+  assert.equal(check.status, 1);
+  const incomplete = JSON.parse(check.stdout).drift.filter((d) => d.kind === 'incomplete');
+  assert.deepEqual(incomplete, [{
+    kind: 'incomplete',
+    path: 'pipeline/INSTALLED.json',
+    message: 'incomplete: a previous install did not finish; re-run the installer',
+  }]);
+  assert.match(install(home, ['--check']).stdout, /incomplete: a previous install did not finish/);
+
+  rmSync(join(home, 'agents'));
+  const repaired = install(home);
+  assert.equal(repaired.status, 0, repaired.stderr);
+  assert.equal(readManifest(home).complete, true);
+  assert.equal(install(home, ['--check']).status, 0);
+});
+
+test('a later unit failing while the pipeline unit is unchanged still marks the install incomplete', () => {
+  const home = newHome();
+  const src = copyFixture();
+  assert.equal(install(home, [], { source: src }).status, 0);
+  writeFileSync(join(src, 'skills', 'ship', 'SKILL.md'), 'newer ship skill\n');
+  rmSync(join(home, 'agents', 'judge.md'));
+  mkdirSync(join(home, 'agents', 'judge.md')); // a directory where the agent file goes: its swap fails
+  writeFileSync(join(home, 'agents', 'judge.md', 'x'), 'x');
+  const failed = install(home, ['--force'], { source: src });
+  assert.equal(failed.status, 1, failed.stdout);
+  assert.equal(readManifest(home).complete, false);
+  rmSync(join(home, 'agents', 'judge.md'), { recursive: true });
+  assert.equal(install(home, [], { source: src }).status, 0);
+  assert.equal(readManifest(home).complete, true);
+});
+
+// ---- A2: fail-closed hook loading -------------------------------------------------------------------------------
+
+function runLoader(hookPath, input) {
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', HOOK_LOADER, hookPath], { encoding: 'utf8', input, timeout: 30000 });
+  return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+}
+function runDirect(hookPath, input) {
+  const r = spawnSync(process.execPath, [hookPath], { encoding: 'utf8', input, timeout: 30000 });
+  return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+}
+
+test('the hook loader blocks (exit 2, one stderr line) when the hook file is missing', () => {
+  const dir = scratch('cp-loader');
+  const r = runLoader(join(dir, 'pipeline', 'hooks', 'guard-git.mjs'), '{}');
+  assert.equal(r.status, 2, r.stderr);
+  assert.equal(r.stdout, '');
+  assert.match(r.stderr, /^claude-pipeline: hook could not be loaded \(ERR_MODULE_NOT_FOUND\); blocking this call\n$/);
+});
+
+test('the hook loader blocks when the hook file exists but its module graph does not load', () => {
+  const dir = scratch('cp-loader');
+  writeFileSync(join(dir, 'broken.mjs'), "import './not-there.mjs';\n");
+  const syntax = join(dir, 'syntax.mjs');
+  writeFileSync(syntax, 'this is ( not javascript\n');
+  assert.equal(runLoader(join(dir, 'broken.mjs'), '{}').status, 2);
+  assert.equal(runLoader(syntax, '{}').status, 2);
+});
+
+test('the hook loader changes nothing for a hook that loads: same stdout and exit code as running it directly', () => {
+  const guard = join(REPO, 'pipeline', 'hooks', 'guard-git.mjs');
+  const cwd = scratch('cp-loader-cwd');
+  for (const command of ['ls -la', 'git push --force origin main']) {
+    const input = JSON.stringify({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command }, cwd });
+    const direct = runDirect(guard, input);
+    const viaLoader = runLoader(guard, input);
+    assert.equal(viaLoader.status, direct.status, command);
+    assert.equal(viaLoader.stdout, direct.stdout, command);
+    assert.equal(viaLoader.stderr, direct.stderr, command);
+  }
+  const allowed = runLoader(guard, JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls -la' }, cwd }));
+  assert.equal(allowed.status, 0, allowed.stderr);
+});
+
+test('the installer writes the loader handler; an old plain-args handler is hook-differs under --check and replaced by a reinstall', () => {
+  const home = newHome();
+  const s = ownersSettings();
+  s.hooks.PreToolUse.push({
+    matcher: 'Bash|PowerShell|Monitor|mcp__.*',
+    hooks: [{ type: 'command', command: 'node', args: [join(home, 'pipeline', 'hooks', 'guard-git.mjs')], timeout: 15 }],
+  });
+  writeSettings(home, s);
+  assert.equal(install(home).status, 0);
+  const after = readSettings(home);
+  const ours = after.hooks.PreToolUse.filter((g) => g.hooks.some((h) => isOurHandler(h, home)));
+  assert.deepEqual(ours, [guardGit(home), guardFiles(home)], 'the old entry was replaced, not duplicated');
+
+  // restore the old shape and see --check call it out
+  after.hooks.PreToolUse = after.hooks.PreToolUse.map((g) => (g.hooks.some((h) => String(h.args?.at(-1)).endsWith('guard-git.mjs'))
+    ? { ...g, hooks: [{ type: 'command', command: 'node', args: [join(home, 'pipeline', 'hooks', 'guard-git.mjs')], timeout: 15 }] } : g));
+  writeSettings(home, after);
+  const check = install(home, ['--check', '--json']);
+  assert.equal(check.status, 1);
+  assert.ok(JSON.parse(check.stdout).drift.some((d) => d.kind === 'hook-differs' && d.path === 'guard-git'), check.stdout);
+});
+
+// ---- A3: SessionStart status hook -------------------------------------------------------------------------------
+
+test('install appends the session-version group after the owner\'s SessionStart groups, once, and touches none of theirs', () => {
+  const home = newHome();
+  const before = ownersSettings();
+  before.hooks.SessionStart.push({ matcher: 'startup', hooks: [{ type: 'command', command: 'node ~/memory-sync.js' }] });
+  writeSettings(home, before);
+  assert.equal(install(home).status, 0);
+  assert.equal(install(home).status, 0);
+  const s = readSettings(home);
+  assert.deepEqual(s.hooks.SessionStart, [...before.hooks.SessionStart, sessionVersion(home)]);
+  assert.equal(install(home, ['--check']).status, 0, 'a clean install has no drift');
+});
+
+test('--check: a later SessionStart entry after ours is fine; a missing, duplicated or edited session-version hook is reported', () => {
+  const home = newHome();
+  assert.equal(install(home).status, 0);
+  const drift = () => { const r = install(home, ['--check', '--json']); return { status: r.status, items: JSON.parse(r.stdout).drift }; };
+
+  const s = readSettings(home);
+  s.hooks.SessionStart.push({ hooks: [{ type: 'command', command: 'echo plugin added this later' }] });
+  writeSettings(home, s);
+  assert.equal(drift().status, 0, 'order among SessionStart entries is not drift');
+
+  const dup = structuredClone(s);
+  dup.hooks.SessionStart.push(sessionVersion(home));
+  writeSettings(home, dup);
+  assert.ok(drift().items.some((d) => d.kind === 'hook-duplicated' && d.path === 'session-version'));
+
+  const edited = structuredClone(s);
+  edited.hooks.SessionStart[0].hooks[0].timeout = 99;
+  writeSettings(home, edited);
+  assert.ok(drift().items.some((d) => d.kind === 'hook-differs' && d.path === 'session-version'));
+
+  const gone = structuredClone(s);
+  gone.hooks.SessionStart = gone.hooks.SessionStart.filter((g) => !g.hooks.some((h) => isOurHandler(h, home)));
+  writeSettings(home, gone);
+  const missing = drift();
+  assert.equal(missing.status, 1);
+  assert.ok(missing.items.some((d) => d.kind === 'hook-missing' && d.path === 'session-version'));
+  assert.equal(install(home).status, 0);
+  assert.equal(drift().status, 0);
+});
+
+test('an install from before the status hook existed reports it missing until the next install', () => {
+  const home = newHome();
+  assert.equal(install(home).status, 0);
+  const s = readSettings(home);
+  delete s.hooks.SessionStart;
+  writeSettings(home, s);
+  const r = install(home, ['--check', '--json']);
+  assert.deepEqual(JSON.parse(r.stdout).drift.map((d) => d.kind), ['hook-missing']);
+});
+
+test('--uninstall removes the session-version hook only; the owner\'s SessionStart groups stay', () => {
+  const home = newHome();
+  const before = ownersSettings();
+  writeSettings(home, before);
+  assert.equal(install(home).status, 0);
+  assert.equal(install(home, ['--uninstall']).status, 0);
+  assert.deepEqual(readSettings(home).hooks.SessionStart, before.hooks.SessionStart);
+  assert.deepEqual(readSettings(home), before);
+});
+
+test('mergeSettings/removeOurSettings round-trip with SessionStart; our handler is lifted out of a shared SessionStart group', () => {
+  const home = '/h/.claude';
+  assert.deepEqual(removeOurSettings(mergeSettings({}, { home }), { home }), {});
+  const shared = { hooks: { SessionStart: [{ hooks: [
+    { type: 'command', command: 'echo mine' },
+    { type: 'command', command: 'node', args: ['/h/.claude/pipeline/hooks/session-version.mjs'], timeout: 10 },
+  ] }] } };
+  const merged = mergeSettings(shared, { home });
+  assert.deepEqual(merged.hooks.SessionStart, [{ hooks: [{ type: 'command', command: 'echo mine' }] }, sessionVersion(home)]);
+  assert.throws(() => mergeSettings({ hooks: { SessionStart: {} } }, { home }), /hooks\.SessionStart" is not an array/);
+});
+
+test('buildPlan requires pipeline/hooks/session-version.mjs like the two guards', () => {
+  const src = copyFixture();
+  rmSync(join(src, 'pipeline', 'hooks', 'session-version.mjs'));
+  assert.ok(buildPlan(src).problems.includes('pipeline/hooks/session-version.mjs is missing'));
+  assert.equal(buildPlan(FIXTURE).problems.length, 0);
+});
+
+// ---- A4: honest sourceSha ---------------------------------------------------------------------------------------
+
+function git(cwd, ...args) {
+  const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' };
+  for (const k of Object.keys(env)) if (/^GIT_(DIR|WORK_TREE|INDEX_FILE|COMMON_DIR)$/.test(k)) delete env[k];
+  const r = spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', '-c', 'commit.gpgsign=false', '-c', 'core.autocrlf=false', ...args], { cwd, env, encoding: 'utf8' });
+  assert.equal(r.status, 0, `git ${args.join(' ')}: ${r.stderr}`);
+  return r.stdout.trim();
+}
+// A committed copy of the fixture; returns { dir, head }.
+function committedSource({ attributes } = {}) {
+  const dir = copyFixture();
+  if (attributes) writeFileSync(join(dir, '.gitattributes'), attributes);
+  git(dir, 'init', '-q');
+  git(dir, 'add', '-A');
+  git(dir, 'commit', '-q', '-m', 'fixture');
+  return { dir, head: git(dir, 'rev-parse', 'HEAD') };
+}
+const installReport = (home, source) => JSON.parse(install(home, ['--json'], { source }).stdout);
+
+test('a clean checkout records its HEAD sha and no sourceDirty flag', () => {
+  const { dir, head } = committedSource();
+  const home = newHome();
+  const report = installReport(home, dir);
+  assert.equal(report.sourceSha, head);
+  assert.deepEqual(report.warnings, []);
+  const m = readManifest(home);
+  assert.equal(m.sourceSha, head);
+  assert.equal('sourceDirty' in m, false);
+});
+
+test('an edited tracked file, an untracked file and an ignored extra each make sourceSha null with sourceDirty and a warning', () => {
+  const edited = committedSource();
+  writeFileSync(join(edited.dir, 'skills', 'ship', 'SKILL.md'), 'edited after the commit\n');
+  const home1 = newHome();
+  const r1 = installReport(home1, edited.dir);
+  assert.equal(r1.sourceSha, null);
+  assert.deepEqual(r1.warnings, [`source is not a clean checkout of ${edited.head.slice(0, 7)}: skills/ship/SKILL.md; recording no source sha`]);
+  assert.equal(readManifest(home1).sourceSha, null);
+  assert.equal(readManifest(home1).sourceDirty, true);
+
+  const untracked = committedSource();
+  writeFileSync(join(untracked.dir, 'pipeline', 'lib', 'extra.mjs'), '// not committed\n');
+  const r2 = installReport(newHome(), untracked.dir);
+  assert.equal(r2.sourceSha, null);
+  assert.match(r2.warnings[0], /not a clean checkout of [0-9a-f]{7}: pipeline\/lib\/extra\.mjs; recording no source sha/);
+
+  const ignored = committedSource();
+  writeFileSync(join(ignored.dir, '.gitignore'), 'pipeline/lib/local-only.mjs\n');
+  git(ignored.dir, 'add', '.gitignore');
+  git(ignored.dir, 'commit', '-q', '-m', 'ignore');
+  writeFileSync(join(ignored.dir, 'pipeline', 'lib', 'local-only.mjs'), '// ignored, but copied\n');
+  const home3 = newHome();
+  const r3 = installReport(home3, ignored.dir);
+  assert.equal(r3.sourceSha, null, 'an ignored extra is copied into the install, so HEAD does not describe it');
+  assert.equal(readManifest(home3).sourceDirty, true);
+});
+
+test('an installable file deleted from the working tree (but still in HEAD) leaves no source sha; excluded files do not count', () => {
+  for (const gone of ['pipeline/lib/answer.mjs', 'skills/ship/reference/notes.md', 'agents/arbiter.md']) {
+    const { dir, head } = committedSource();
+    rmSync(join(dir, ...gone.split('/')));
+    const home = newHome();
+    const r = installReport(home, dir);
+    assert.equal(r.sourceSha, null, gone);
+    assert.deepEqual(r.warnings.filter((w) => w.includes('not a clean checkout')), [`source is not a clean checkout of ${head.slice(0, 7)}: ${gone}; recording no source sha`], gone);
+    assert.equal(readManifest(home).sourceDirty, true, gone);
+  }
+
+  // HEAD holds files the installer never copies (pipeline/test/**, node_modules, a stray INSTALLED.json): deleting them is not a deletion of source.
+  const dir = copyFixture();
+  for (const f of ['pipeline/test/t.mjs', 'pipeline/node_modules/m/i.js', 'pipeline/INSTALLED.json', 'skills/ship/test/t.md']) {
+    mkdirSync(dirname(join(dir, ...f.split('/'))), { recursive: true });
+    writeFileSync(join(dir, ...f.split('/')), 'x\n');
+  }
+  git(dir, 'init', '-q');
+  git(dir, 'add', '-A', '-f');
+  git(dir, 'commit', '-q', '-m', 'fixture');
+  const head = git(dir, 'rev-parse', 'HEAD');
+  for (const f of ['pipeline/test', 'pipeline/node_modules', 'pipeline/INSTALLED.json', 'skills/ship/test']) rmSync(join(dir, ...f.split('/')), { recursive: true });
+  assert.equal(installReport(newHome(), dir).sourceSha, head);
+});
+
+test('only the first three differing paths are named', () => {
+  const { dir } = committedSource();
+  for (const n of ['a', 'b', 'c', 'd']) writeFileSync(join(dir, 'pipeline', 'lib', `${n}.mjs`), '//\n');
+  const r = installReport(newHome(), dir);
+  assert.match(r.warnings[0], /: pipeline\/lib\/a\.mjs, pipeline\/lib\/b\.mjs, pipeline\/lib\/c\.mjs; recording/);
+});
+
+test('a source that is not a git checkout records sourceSha null without a dirty flag or warning', () => {
+  const dir = join(scratch('cp-nogit'), 'src');
+  cpSync(FIXTURE, dir, { recursive: true });
+  const home = newHome();
+  const report = installReport(home, dir);
+  // scratch dirs live under the OS temp dir, outside any repo
+  assert.equal(report.sourceSha, null);
+  assert.deepEqual(report.warnings, []);
+  assert.equal('sourceDirty' in readManifest(home), false);
+});
+
+test('line-ending filters do not make a clean checkout look edited (hash-object applies .gitattributes)', () => {
+  const { dir, head } = committedSource({ attributes: '*.md text\n' });
+  const file = join(dir, 'agents', 'judge.md');
+  writeFileSync(file, readFileSync(file, 'utf8').replace(/\r?\n/g, '\r\n')); // what a Windows checkout with eol=crlf holds
+  const report = installReport(newHome(), dir);
+  assert.equal(report.sourceSha, head);
+  assert.deepEqual(report.warnings, []);
+});
+
+test('a source that is a subdirectory of a repo is compared by its own paths', () => {
+  const outer = scratch('cp-outer');
+  const dir = join(outer, 'vendor', 'src');
+  cpSync(FIXTURE, dir, { recursive: true });
+  git(outer, 'init', '-q');
+  git(outer, 'add', '-A');
+  git(outer, 'commit', '-q', '-m', 'x');
+  const head = git(outer, 'rev-parse', 'HEAD');
+  assert.equal(installReport(newHome(), dir).sourceSha, head);
+  writeFileSync(join(dir, 'VERSION'), '9.9.8\n');
+  assert.equal(installReport(newHome(), dir).sourceSha, null);
+});
+
+// ---- A5: one write lock -----------------------------------------------------------------------------------------
+
+const MACHINE = 'test-machine-id';
+function lockEnv() {
+  const dir = scratch('cp-locks');
+  return { dir, env: { PIPELINE_LOCK_DIR: dir, PIPELINE_MACHINE_ID: MACHINE } };
+}
+const holdLock = (home, dir, extra = {}) => {
+  const got = tryAcquire(installLockName(home), { dir, machineId: MACHINE, ...extra });
+  assert.equal(got.acquired, true);
+  return got.lock;
+};
+
+test('the lock name is scoped to the resolved claude-home: same home same name, another home another name, always a safe file name', () => {
+  const a = newHome();
+  const b = newHome();
+  assert.equal(installLockName(a), installLockName(join(a, '..', 'claude')));
+  assert.notEqual(installLockName(a), installLockName(b));
+  assert.match(installLockName(newHome({ space: true })), /^installer-[0-9a-f]{16}$/);
+});
+
+test('the lock is scoped to the canonical destination: a symlinked alias names the same lock and a busy install through it is refused', { skip: process.platform === 'win32' }, () => {
+  const real = newHome();
+  mkdirSync(real, { recursive: true });
+  const alias = join(scratch('cp-alias'), 'link');
+  symlinkSync(real, alias, 'dir');
+  assert.equal(installLockName(alias), installLockName(real));
+  // not created yet, reached through an alias of its parent
+  const parentLink = join(scratch('cp-alias2'), 'plink');
+  symlinkSync(dirname(real), parentLink, 'dir');
+  assert.equal(installLockName(join(parentLink, 'claude')), installLockName(real));
+
+  // No PIPELINE_LOCK_DIR: the default lock directory is inside the destination, not in the caller's ~/.claude.
+  const env = { PIPELINE_MACHINE_ID: MACHINE };
+  const locks = join(real, 'backups', '.locks');
+  const lock = holdLock(real, locks);
+  try {
+    const busy = install(alias, [], { env });
+    assert.equal(busy.status, 1, busy.stderr);
+    assert.match(busy.stderr, /another install is running in /);
+    assert.equal(existsSync(join(real, 'pipeline')), false, 'nothing was written');
+    assert.equal(existsSync(join(busy.userHome, '.claude')), false, 'the caller\'s ~/.claude was not used for the lock');
+  } finally {
+    release(lock);
+  }
+  assert.equal(install(alias, [], { env }).status, 0);
+});
+
+test('install and uninstall refuse while another install holds the lock for that home (exit 1, nothing written); --check ignores it', () => {
+  const home = newHome();
+  const { dir, env } = lockEnv();
+  assert.equal(install(home, [], { env }).status, 0);
+  const manifestBefore = readFileSync(join(home, 'pipeline', 'INSTALLED.json'), 'utf8');
+  const lock = holdLock(home, dir);
+  try {
+    writeFileSync(join(home, 'skills', 'ship', 'SKILL.md'), 'edited while locked\n');
+    const busy = install(home, [], { env });
+    assert.equal(busy.status, 1);
+    assert.match(busy.stderr, /another install is running in /);
+    assert.ok(busy.stderr.includes(home), busy.stderr);
+    assert.equal(readFileSync(join(home, 'skills', 'ship', 'SKILL.md'), 'utf8'), 'edited while locked\n', 'nothing was repaired');
+    assert.equal(readFileSync(join(home, 'pipeline', 'INSTALLED.json'), 'utf8'), manifestBefore);
+
+    const busyUninstall = install(home, ['--uninstall'], { env });
+    assert.equal(busyUninstall.status, 1);
+    assert.match(busyUninstall.stderr, /another install is running in /);
+    assert.ok(existsSync(join(home, 'pipeline')), 'nothing was removed');
+
+    const json = install(home, ['--json'], { env });
+    assert.equal(json.status, 1);
+    assert.match(JSON.parse(json.stdout).error, /another install is running in /);
+
+    const check = install(home, ['--check'], { env });
+    assert.equal(check.status, 1, 'drift (the edit), not a lock error');
+    assert.match(check.stdout, /modified: skills\/ship\/SKILL\.md/);
+
+    const other = newHome();
+    assert.equal(install(other, [], { env }).status, 0, 'a different claude-home has its own lock');
+  } finally {
+    release(lock);
+  }
+  assert.equal(install(home, [], { env }).status, 0);
+  assert.equal(readFileSync(join(home, 'skills', 'ship', 'SKILL.md'), 'utf8'), readFileSync(join(FIXTURE, 'skills', 'ship', 'SKILL.md'), 'utf8'));
+});
+
+test('a lock left by a dead process is reclaimed; the lock is released after install, uninstall and a failed install', () => {
+  const home = newHome();
+  const { dir, env } = lockEnv();
+  const dead = spawnSync(process.execPath, ['-e', '0']).pid;
+  holdLock(home, dir, { pid: dead });
+  assert.equal(install(home, [], { env }).status, 0, 'owner pid is gone: reclaimed');
+  assert.equal(inspect(installLockName(home), { dir }), null, 'released after install');
+
+  assert.equal(install(home, ['--uninstall'], { env }).status, 0);
+  assert.equal(inspect(installLockName(home), { dir }), null, 'released after uninstall');
+
+  const broken = newHome();
+  mkdirSync(broken, { recursive: true });
+  writeFileSync(join(broken, 'agents'), 'a file where the agents/ dir has to go\n');
+  assert.equal(install(broken, [], { env }).status, 1);
+  assert.equal(inspect(installLockName(broken), { dir }), null, 'released after a failed install');
+});
+
+// ---- a source inside the claude-home ------------------------------------------------------------------------------
+
+test('a source inside the claude-home is refused, except under pipeline-state/tmp (where `pipeline update` downloads)', () => {
+  const home = newHome();
+  const inside = join(home, 'skills-copy');
+  cpSync(FIXTURE, inside, { recursive: true });
+  const refused = install(home, [], { source: inside });
+  assert.equal(refused.status, 1, refused.stderr);
+  assert.match(refused.stderr, /is inside the claude-home/);
+  assert.equal(existsSync(join(home, 'pipeline')), false, 'nothing was installed');
+
+  const tmpSrc = join(home, 'pipeline-state', 'tmp', 'claude-pipeline-update-abc123', 'src');
+  cpSync(FIXTURE, tmpSrc, { recursive: true });
+  const ok = install(home, [], { source: tmpSrc });
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.equal(existsSync(join(home, 'pipeline', 'INSTALLED.json')), true);
+  assert.equal(existsSync(tmpSrc), true, 'the installer did not touch the source');
 });
