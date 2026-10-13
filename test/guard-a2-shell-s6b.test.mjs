@@ -232,3 +232,57 @@ test('S6b git: in a script run by a shell, a cd into an unsure directory that no
   assert.equal(G('bash s.sh', { 's.sh': 'source ./lib.sh\ngit status\n', 'lib.sh': `${tail}cd "$D" && pwd\n` }), 'deny');
   assert.equal(G(`${tail.replace(/\n/g, '; ')}cd "$D" && pwd`, {}), 'deny');
 });
+
+// ---- files policy: live replay groups (S6, part 3) ---------------------------------------------------------------------------------------------------------
+
+test('S6b files: the real home\'s .zshenv named through ZDOTDIR is not taken to be rewritten by a program the guard does not model (as without ZDOTDIR); a modelled write still counts', () => {
+  const env = { HOME: '/home/u', ZDOTDIR: '/home/u' };
+  const spec = { '/home/u/.zshenv': 'export EDITOR=vi' };
+  assert.equal(F('mytool --version; zsh -ic \'echo hi > "$OUT"\'', spec, { env }), 'allow');
+  assert.equal(F('mytool --version; zsh -ic \'echo hi > "$OUT"\'', spec, { env: { HOME: '/home/u' } }), 'allow');
+  // the line writes it first (a write the guard models), or ZDOTDIR is not the home: as before
+  assert.equal(F('echo "OUT=/home/u/.claude/settings.json" > /home/u/.zshenv; zsh -ic \'echo hi > "$OUT"\'', spec, { env }), 'deny');
+  assert.equal(F('mytool --version; zsh -ic \'echo hi > "$OUT"\'', { '/home/u/zd/.zshenv': 'export EDITOR=vi' }, { env: { HOME: '/home/u', ZDOTDIR: '/home/u/zd' } }), 'deny');
+});
+
+test('S6b files: a line run from inside ~/.claude that first cds to an existing directory outside it is judged there; each way it may still run inside keeps the refusal', () => {
+  const o = { cwd: '/home/u/.claude/hooks' };
+  const spec = { '/home/u/.claude/hooks/x.sh': 'echo hi' };
+  assert.equal(F('cd /home/u/proj && cp "$A" b.txt', spec, o), 'allow');
+  assert.equal(F('cd ~/proj; cp "$A" b.txt', spec, o), 'allow');
+  for (const c of [
+    'cp "$A" b.txt', // no cd
+    'cp "$A" b.txt; cd /home/u/proj', // before it
+    'cd /home/u/proj || cp "$A" b.txt', // runs only when the cd failed
+    'cd /home/u/proj && true || cp "$A" b.txt',
+    'true && cd /home/u/proj; cp "$A" b.txt', // the cd may not run
+    'cd /home/u/proj | true; cp "$A" b.txt', // in a pipeline: a subshell
+    '(cd /home/u/proj); cp "$A" b.txt', // in a subshell
+    'cd /home/u/gone && cp "$A" b.txt', // no such directory: the cd fails
+    'cd /home/u/proj; cd /home/u/.claude/hooks; cp "$A" b.txt', // back inside
+    'cd /home/u/proj; popd; cp "$A" b.txt',
+    'cd "$D"; cp "$A" b.txt', // a run-time target
+    'f() { cp "$A" b.txt; }; cd /home/u/proj; f', // a function body may run at any time
+    'HOME=/tmp; cd ~/proj; cp "$A" b.txt', // ~ is not the real home here
+  ]) assert.equal(F(c, spec, o), 'deny', c);
+});
+
+test('S6b files: a file a script sources may source another by a literal name: its effects are followed; a run-time name, a relative one, arguments, a cycle or a binder in it are not', () => {
+  const base = (envSh, fix = 'export Y=2') => ({ 's.sh': 'source /home/u/proj/env.sh\necho hi > "$1"\n', 'env.sh': envSh, 'fix.sh': fix });
+  assert.equal(F('bash s.sh out.txt', base('set -a\n. /home/u/proj/fix.sh\nexport X=1\n')), 'allow');
+  // what the nested file assigns is what the script sees
+  const vs = (fix) => ({ 's.sh': 'source /home/u/proj/env.sh\necho hi > "$OUT"\n', 'env.sh': '. /home/u/proj/fix.sh\n', 'fix.sh': fix });
+  assert.equal(F('bash s.sh', vs('OUT=/home/u/proj/out.txt')), 'allow');
+  assert.equal(F('bash s.sh', vs('OUT=/home/u/.claude/settings.json')), 'deny');
+  assert.equal(F('bash s.sh', vs('D=/home/u/.cl\nOUT=${D}aude/settings.json')), 'deny', '(spelled in pieces: only the value followed through both files finds it)');
+  for (const [envSh, fix] of [
+    ['set -a\n. /home/u/proj/fix.sh\n', 'set -- /home/u/.claude/settings.json'], // the nested file sets $1
+    ['. /home/u/proj/fix.sh\n', 'eval "$Z"'],
+    ['. "$F"\n', 'export Y=2'],
+    ['. ./fix.sh\n', 'export Y=2'],
+    ['. /home/u/proj/fix.sh a b\n', 'export Y=2'],
+    ['. /home/u/proj/env.sh\n', 'export Y=2'],
+    ['. /home/u/proj/missing.sh\n', 'export Y=2'],
+    ['. /home/u/proj/fix.sh\nexport X=1\n', 'export Y=2\nset -- /home/u/.claude/settings.json'],
+  ]) assert.equal(F('bash s.sh out.txt', base(envSh, fix)), 'deny', JSON.stringify(envSh + ' | ' + fix));
+});

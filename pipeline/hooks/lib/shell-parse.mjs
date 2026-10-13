@@ -1315,11 +1315,14 @@ export function startupFilesOf(cmd, cmds = [], { env = {}, inherited = () => [],
   const shell = SHELLS.has(name) && !NO_STARTUP.has(name);
   if (!shell && !exec) return [];
   const out = [];
-  const add = (file, implicit = false) => {
+  // home: the file is the real home's (its directory is the environment's HOME): judged like the implicit one as far as programs the guard does not model go (see sourcedTexts)
+  const add = (file, implicit = false, home = false) => {
     if (file === '' || out.some((o) => o.file === file)) return;
     const rec = /[$`]/.test(file) ? { kind: 'shell', file, ambiguous: true, words: [file] } : { kind: 'shell', file };
+    if (home) rec.home = true;
     out.push(implicit ? { ...rec, implicit: true } : rec);
   };
+  const isHome = (d) => typeof env.HOME === 'string' && env.HOME !== '' && !/[$`~]/.test(d) && d.replace(/\/+$/, '') === env.HOME.replace(/\/+$/, '');
   const values = (n) => startupValues(cmd, cmds, n, env, inherited);
   for (const n of ['BASH_ENV', 'ENV']) for (const v of values(n)) add(v);
   const opts = shell ? startupOptions(argv, cmd.litWords) : { login: false, interactive: false, unknown: false, rc: [] };
@@ -1330,7 +1333,7 @@ export function startupFilesOf(cmd, cmds = [], { env = {}, inherited = () => [],
   const homes = ownHome === null ? [...values('HOME'), '~'] : [ownHome];
   if (exec) {
     // (the shebang is not read here: a zsh script run by path gets .zshenv from the ZDOTDIR / HOME the line names; the real home is not judged for it)
-    for (const d of [...values('ZDOTDIR'), ...homes.filter((h) => h !== '~')]) add(`${dirOf(d)}/.zshenv`);
+    for (const d of [...values('ZDOTDIR'), ...homes.filter((h) => h !== '~')]) add(`${dirOf(d)}/.zshenv`, false, isHome(d));
     return out;
   }
   if (name === 'zsh') {
@@ -1338,7 +1341,7 @@ export function startupFilesOf(cmd, cmds = [], { env = {}, inherited = () => [],
     if (opts.login || opts.unknown) zNames.push('.zprofile', '.zlogin', '.zlogout');
     if (opts.interactive || opts.unknown) zNames.push('.zshrc');
     const own = cmd.env && Object.hasOwn(cmd.env, 'ZDOTDIR') && cmd.env.ZDOTDIR !== '' ? [cmd.env.ZDOTDIR] : null;
-    for (const d of own ?? [...values('ZDOTDIR'), ...homes]) for (const z of zNames) add(`${dirOf(d)}/${z}`, d === '~' && !own);
+    for (const d of own ?? [...values('ZDOTDIR'), ...homes]) for (const z of zNames) add(`${dirOf(d)}/${z}`, d === '~' && !own, isHome(d));
     return out;
   }
   // bash and the POSIX shells: a login shell reads the profile files (bash the first of three: all are judged), an interactive one
@@ -1346,7 +1349,7 @@ export function startupFilesOf(cmd, cmds = [], { env = {}, inherited = () => [],
   const names = [];
   if (opts.login || opts.unknown) names.push('.bash_profile', '.bash_login', '.profile', '.bash_logout');
   if (opts.interactive || opts.unknown) names.push('.bashrc');
-  for (const h of homes) for (const n of names) add(`${dirOf(h)}/${n}`, h === '~');
+  for (const h of homes) for (const n of names) add(`${dirOf(h)}/${n}`, h === '~', isHome(h));
   return out;
 }
 

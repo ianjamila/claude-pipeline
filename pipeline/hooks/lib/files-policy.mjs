@@ -1900,7 +1900,7 @@ function setPositionals(argv) {
   }
   return null;
 }
-function sourcedEffects(text, ctx) {
+function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
   const out = { vars: new Map(), cds: [], all: false, unknownCd: false };
   const cmds = simpleCommands(text, { bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline });
   if (cmds.truncated || cmds.dynamic) out.all = true;
@@ -1948,6 +1948,23 @@ function sourcedEffects(text, ctx) {
       const w = setPositionals(c.argv);
       for (let i = 1; i <= 9; i++) set(String(i), i <= w.length ? w[i - 1] : '', sure);
     }
+    // Why: a file that sources another by a literal absolute name (`set -a; . /repo/e2e/fixtures/test-env.sh` in an env.sh a script sources) has that file's effects, in
+    // this shell: followed, up to 4 deep, each file once. A name only known at run time, a relative one, a file this line writes, one that cannot be read, arguments
+    // (they set the positional parameters), or deeper: any name, as before.
+    else if ((name === 'source' || name === '.') && c.argv.length === 2 && depth < 4) {
+      const v = substVars(c.argv[1], local, ctx.budget);
+      const abs = /[`$*?[{\\]/.test(v) || !isAbs(toPosix(v)) ? null : posix.normalize(toPosix(v));
+      const t = abs && !seenFiles.has(abs) && !writtenTo(ctx.frames, abs, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: false }) ? ctx.readText(abs) : null;
+      if (typeof t !== 'string') out.all = true;
+      else {
+        const sub = sourcedEffects(t, ctx, depth + 1, new Set([...seenFiles, abs]));
+        for (const [k, val] of sub.vars) set(k, val, sure && val !== null);
+        out.cds.push(...sub.cds);
+        if (sub.all) out.all = true;
+        if (sub.unknownCd) out.unknownCd = true;
+        if (sub.home) out.home = true;
+      }
+    }
     // (an allowlist, as for the script-directory names: a command outside it -- a zsh binder, a function the file defines, anything unknown -- may bind any name)
     else if (RUNS_CODE.has(name) || /[$`]/.test(c.argv[0]) || !(fns.has(name) || onlyNonBinders([c]) || (name === 'set' && !c.argv.slice(1).some((a) => /^[-+][A-Za-z]*A/.test(a))))) out.all = true;
   }
@@ -1966,7 +1983,9 @@ function sourcedTexts(rec, dirs, ctx) {
   let unknown = !!(rec.joined || rec.unresolvable);
   const consider = (abs) => {
     // Why: a file the line writes earlier (`echo D=/tmp > rc; . ./rc`) is what those writes put there, not what is on disk now; a write may also fail or be skipped, so the disk text stays a case too
-    const w = writtenTo(ctx.frames, abs, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: false });
+    // (the real home's startup file named through ZDOTDIR / HOME, rec.home, is followed like any other, but a program the guard does not model is not taken to have
+    // rewritten it, as for the implicit home file: `supabase --version; zsh -c ...` with ZDOTDIR in the hook's environment)
+    const w = writtenTo(ctx.frames, abs, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: rec.home === true });
     if (w) {
       if (w.unknown || w.pieces || w.authored || w.files.length || w.scans.length || w.programs.length) unknown = true;
       texts.push(...w.texts, ...w.joined);
@@ -2502,8 +2521,29 @@ function evaluateBashForFilesFrame(command, opts) {
   const mentioning = cmds.filter(mentions);
   // Why: below ~/.claude (projects/, skills/other) nothing is protected by name, yet a destination built at run time (`cp x "$V"`, `tee $(echo ../settings.json)`) can climb back to a protected file:
   // refused for every command that is not read-only (FP: a command with a run-time word, run from inside ~/.claude/**)
+  // Why: a line that starts in the tree but first cds out to an existing directory outside it (`cd ~/Claude/x && node -e ...` from ~/.claude/hooks) runs what comes after
+  // that cd outside: when the start is the only directory in the tree, only the commands written before that cd count (a function body or trap action written before it
+  // counts wherever it runs). The cd: on the line itself (no subshell, loop, branch, function), a literal target (~ the real home: not when the line sets HOME), and no later cd / pushd /
+  // popd that could lead back (a later known cd outside the tree is fine: it is among the directories above).
+  const leaveAt = (() => {
+    if (!dirs.every((d) => d === ctx.cwd || !ctx.hitTree(d)) || cmds.some((c) => Object.hasOwn(c.env ?? {}, 'HOME') || c.argv.some((a) => /^HOME(?:=|\[)/.test(a)))) return -1;
+    const outside = (c) => {
+      if (!c.ctl || !c.grp || c.grp.length || c.depth !== 0 || Object.values(c.ctl).some(Boolean) || cdUnknownShape(c.argv)) return false;
+      const t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
+      const e = t === undefined ? null : expandRefs(t, ctx);
+      if (e === null || /[`$*?[{(\\]/.test(e) || !isAbs(e)) return false;
+      const abs = posix.normalize(e);
+      return !ctx.hitTree(abs) && Array.isArray(ctx.readDir(abs));
+    };
+    const j = cmds.findIndex((c) => CD_CMDS.has(baseOf(c.argv[0] ?? '')));
+    if (j < 0 || !outside(cmds[j])) return -1;
+    // (it surely runs, in this shell: not after && / ||, not in a pipeline or a background job; and nothing after it runs only when something failed: `cd X || cmd`)
+    if (!['', ';'].includes(cmds[j].sep ?? '') || ['|', '&'].includes(cmds[j + 1]?.sep) || cmds.some((c, k) => k > j && c.sep === '||')) return -1;
+    return cmds.every((c, k) => k <= j || !CD_CMDS.has(baseOf(c.argv[0] ?? '')) || outside(c)) ? j : -1;
+  })();
+  const atStart = (c, i) => leaveAt < 0 || i < leaveAt || !c.ctl; // (a function body or trap action written after the cd also runs after it)
   if (!insideRoot && opts._writesOnly !== true && dirs.some((d) => ctx.hitTree(d))) {
-    const w = cmds.find((c) => c.argv.length && !NOT_WRITERS.has(baseOf(c.argv[0])) && !isReadOnly(c, ctx) && c.argv.slice(1).some((a) => /[`$]/.test(expandRefs(a, ctx))));
+    const w = cmds.find((c, i) => c.argv.length && atStart(c, i) && !NOT_WRITERS.has(baseOf(c.argv[0])) && !isReadOnly(c, ctx) && c.argv.slice(1).some((a) => /[`$]/.test(expandRefs(a, ctx))));
     if (w) return deny(`${baseOf(w.argv[0])} is given a name only known at run time inside the protected pipeline tree, so the file it reaches cannot be checked; write the path out (${PROTECTED_MSG})`);
   }
   // A reference no single command names lives in a heredoc body or in program text the shell parser cut into
