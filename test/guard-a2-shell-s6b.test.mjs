@@ -374,3 +374,20 @@ test('S6b codex recheck: ... the two-line body is a function body for the marks,
   assert.equal(G('bash s.sh', gs, { env: { 'BASH_FUNC_pwd%%': '() { git push; }' } }), 'deny');
   assert.equal(G('bash s.sh', gs), 'allow', '(nothing redefines pwd)');
 });
+
+// ---- background security review of bb54d9f ----------------------------------------------------------------------------------------------------------------------
+
+test('S6b review 3: zsh hook arrays, traps and a moved PATH can run code behind a "read-only" name: the cd shortcuts are off', () => {
+  const spec = { 'r.txt': 'x', 's.sh': 'echo hi > out.txt\ncd "$U" && pwd\n' };
+  for (const c of [
+    'f() { echo x > settings.json; }; chpwd_functions=(f); (cd /home/u/.claude; ls)',
+    'f() { echo x > settings.json; }; chpwd_functions+=(f); (cd /home/u/.claude; ls)',
+    'f() { echo x > settings.json; }; add-zsh-hook chpwd f; (cd /home/u/.claude; ls)',
+    'trap "echo x > settings.json" DEBUG; (cd /home/u/.claude; ls)',
+    'PATH=/tmp/evil:$PATH; d=$(cd /home/u/.claude && dirname x); echo "$d"',
+    'export PATH=/tmp/evil:$PATH; (cd /home/u/.claude; basename x)',
+  ]) assert.equal(F(c, spec), 'deny', c);
+  assert.equal(F('bash s.sh', { ...spec, 's.sh': 'PATH=/tmp/evil:$PATH\necho hi > out.txt\ncd "$U" && dirname x\n' }), 'deny', '(the trailing cd rule too)');
+  assert.equal(F('bash s.sh', { ...spec, 's.sh': 'precmd_functions=(f)\necho hi > out.txt\ncd "$U" && pwd\n' }), 'deny');
+  assert.equal(F('d=$(cd /home/u/.claude && dirname x); echo "$d"', spec), 'allow', '(PATH unchanged)');
+});

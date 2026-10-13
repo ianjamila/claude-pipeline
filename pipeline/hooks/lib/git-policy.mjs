@@ -1595,7 +1595,7 @@ function unsureVarReachingCommand(cmds, ctx) {
   const cdMemo = new Map();
   const sensitive = (c) => {
     const head = c.argv[0];
-    if (ctx.ownProcess === true && !ctx.fnUnknown && !UNSURE_OK.has(baseName(head)) && DIR_CHANGERS.includes(head)) {
+    if (ctx.ownProcess === true && !ctx.fnUnknown && !cmds.some((x) => Object.keys(x.env ?? {}).some((k) => k === 'PATH' || k === 'path') || x.argv.some((a) => /^(?:PATH|path)(?:\+?=|\[)/.test(a))) && !UNSURE_OK.has(baseName(head)) && DIR_CHANGERS.includes(head)) {
       if (!cdMemo.has(c)) {
         cdMemo.set(c, true);
         const after = runsAfter(cmds, cmds.indexOf(c));

@@ -2570,7 +2570,9 @@ export function simpleCommands(str, opts) {
 // chpwd / TRAPEXIT ..., bash command_not_found_handle: they run on their own), a later command is named like a function the text defines (names compared without
 // case: macOS finds `Pwd` as pwd), or the text can run code it does not hold: a sourced file (its traps, functions, aliases), eval, alias, autoload, enable,
 // hash, `functions[...]=`. (Any other function body only runs when called, and no command returned calls one.)
-const LATER_RUNNERS = new Set(['source', '.', 'alias', 'autoload', 'enable', 'disable', 'hash', 'functions', 'unfunction', 'builtin', 'command', 'eval', 'exec']);
+const LATER_RUNNERS = new Set(['source', '.', 'alias', 'autoload', 'enable', 'disable', 'hash', 'functions', 'unfunction', 'builtin', 'command', 'eval', 'exec', 'add-zsh-hook', 'add-zle-hook-widget', 'zle']);
+// (zsh runs the functions these arrays name on its own: after every cd, before every prompt / command, at exit)
+const HOOK_ARRAYS = /^(?:chpwd|precmd|preexec|periodic|zshexit|zshaddhistory|zsh_directory_name)_functions(?:\[|\+?=|$)/i;
 const HOOK_FUNCTIONS = /^(?:TRAP|chpwd|precmd|preexec|periodic|zshexit|zshaddhistory|zsh_directory_name|command_not_found_handler?)/i;
 // The names a command word may not mean what it says (functions the text defines, compared without case), or null when no command name can be trusted: the parse was cut
 // short or names a command at run time, the text defines a hook function, or it can bring in code it does not hold (source, eval, alias, autoload, `functions[...]=` ...).
@@ -2581,7 +2583,7 @@ export function exportsFunctions(cmds) {
 export function trustedFns(cmds) {
   if (!cmds?.fns || cmds.truncated || cmds.dynamic || exportsFunctions(cmds)) return null;
   if ([...cmds.fns].some((n) => HOOK_FUNCTIONS.test(n))) return null;
-  for (const c of cmds) if (LATER_RUNNERS.has(base(c.argv[0] ?? '')) || c.argv.some((a) => /^functions(?:\[|\+?=)/.test(a)) || Object.keys(c.env ?? {}).some((k) => /^functions$/i.test(k))) return null;
+  for (const c of cmds) if (LATER_RUNNERS.has(base(c.argv[0] ?? '')) || c.argv.some((a) => /^functions(?:\[|\+?=)/.test(a) || HOOK_ARRAYS.test(a)) || Object.keys(c.env ?? {}).some((k) => /^functions$/i.test(k) || HOOK_ARRAYS.test(k))) return null;
   return new Set([...cmds.fns].map((n) => base(n)));
 }
 export function runsAfter(cmds, ci) {

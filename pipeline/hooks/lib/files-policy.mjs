@@ -1253,8 +1253,13 @@ const SUBSHELL_READS = new Set(['pwd', 'dirname', 'basename', 'true', 'false', '
 const onlyReads = (c, ctx) => (c.argv.length === 0 || SUBSHELL_READS.has(baseOf(c.argv[0])) || isReadOnly(c, ctx))
   && !(c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && !FD_DUP.test(r.target ?? '') && r.target !== '/dev/null');
 const insideOf = (cd) => { const g = cd.grp ?? []; return (c) => (c.grp ?? []).length >= g.length && g.every((id, k) => c.grp[k] === id); };
+// Why: `dirname` / `basename` are programs found along PATH: a line that may change PATH (or zsh's `path`) may run its own under those names (background review of bb54d9f)
+const pathMayMove = (cmds, ctx) => ['PATH', 'path'].some((n) => Object.hasOwn(ctx.vars, n) || ctx.srcChanged.has(n)) || ctx.unknownAll
+  || cmds.some((x) => Object.keys(x.env ?? {}).some((k) => k === 'PATH' || k === 'path') || x.argv.some((a) => /^(?:PATH|path)(?:\+?=|\[)/.test(a)));
 function readsOnlyInSubshell(cd, cmds, ctx) {
-  if (!(cd.grp ?? []).length || ctx.fnUnknown) return false;
+  if (!(cd.grp ?? []).length || ctx.fnUnknown || pathMayMove(cmds, ctx)) return false;
+  // (a trap action may run inside the subshell: DEBUG / ERR / RETURN, zsh's EXIT)
+  if (cmds.some((c) => c.ctl?.trap && !onlyReads(c, ctx))) return false;
   // (a function, alias or hook the text may define can stand behind a read-only name: `pwd() { echo x > settings.json; }; (cd ~/.claude; pwd)` -- review of #50)
   const fns = trustedFns(cmds);
   if (!fns) return false;
@@ -1266,7 +1271,7 @@ function readsOnlyInSubshell(cd, cmds, ctx) {
 // runsAfter in shell-parse.mjs: later ones in its subshell or script, and trap actions) only reads, the directory it went to is never written in. Only for a script
 // file run in a process of its own (ctx.selfZero): after the line or a sourced file, the next command (or Bash call) goes on in that directory.
 function nothingWritesAfterCd(ci, cmds, ctx) {
-  if (ctx.fnUnknown) return false;
+  if (ctx.fnUnknown || pathMayMove(cmds, ctx)) return false;
   const after = runsAfter(cmds, ci);
   return after !== null && after.every((c) => onlyReads(c, ctx));
 }
