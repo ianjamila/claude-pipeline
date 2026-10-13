@@ -1,9 +1,25 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, symlinkSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { archivePaths, listHolding, purgeHolding, holdingRoot } from '../pipeline/lib/worktree-prune/act.mjs';
+import { createTmpRepo } from './helpers/tmprepo.mjs';
+import { archivePaths, listHolding, purgeHolding, holdingRoot, removeWorktree, restoreLeftovers, QUARANTINE_DIR } from '../pipeline/lib/worktree-prune/act.mjs';
+
+// Same fixture as test/worktree-prune-inspect.test.mjs: a repo with an origin, an ignore list and a .worktrees dir.
+function world() {
+  const repo = createTmpRepo();
+  repo.write('a.txt', 'a\n'); repo.write('.gitignore', 'node_modules/\n.review/\n*.log\n.env*\nnotes.txt\n'); repo.commit('init');
+  const origin = mkdtempSync(join(tmpdir(), 'origin-'));
+  repo.git(['init', '--bare', '-q', origin]);
+  repo.git(['remote', 'add', 'origin', origin]);
+  repo.git(['push', '-q', 'origin', 'main']);
+  mkdirSync(join(repo.dir, '.worktrees'));
+  const add = (slug, branch) => { repo.git(['worktree', 'add', '-q', '-b', branch, join('.worktrees', slug), 'main']); return join(repo.dir, '.worktrees', slug); };
+  return { repo, origin, add };
+}
+const noProcs = () => ({ platform: 'linux', procRoot: mkdtempSync(join(tmpdir(), 'p-')) });
+const quarantineOf = (repo) => join(repo.dir, '.worktrees', QUARANTINE_DIR);
 
 const day = 86400e3;
 const T = Date.parse('2026-10-13T00:00:00Z');
@@ -107,4 +123,165 @@ test('purge: a batch with a missing or unparseable manifest is kept; one young i
   assert.equal(readFileSync(join(outside, 'precious.txt'), 'utf8'), 'p');
   assert.equal(existsSync(join(h, 'stray-file.txt')), true);
   assert.deepEqual(purgeHolding(join(base, 'missing'), { nowMs: T }), { purged: [], kept: [] });
+});
+
+test('archive: a symlinked directory on the way to the file is refused and the outside file survives', () => {
+  const wt = mkdtempSync(join(tmpdir(), 'wt-')); const h = mkdtempSync(join(tmpdir(), 'hold-'));
+  const outside = mkdtempSync(join(tmpdir(), 'outside-')); writeFileSync(join(outside, 'x'), 'precious');
+  symlinkSync(outside, join(wt, '.review'));
+  assert.throws(() => archivePaths({ wtPath: wt, rels: ['.review/x'], holdingDir: h, slug: 's', pr: 1, nowMs: T }), /symlink in path/);
+  assert.equal(readFileSync(join(outside, 'x'), 'utf8'), 'precious');
+  assert.deepEqual(readdirSync(h), [], 'nothing was written to holding');
+}, { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' });
+
+test('archive: a symlinked file, or a symlinked batch/slug dir on the holding side, is refused', () => {
+  const wt = mkdtempSync(join(tmpdir(), 'wt-')); const h = mkdtempSync(join(tmpdir(), 'hold-'));
+  const outside = mkdtempSync(join(tmpdir(), 'outside-')); writeFileSync(join(outside, 'secret'), 's');
+  symlinkSync(join(outside, 'secret'), join(wt, 'x.log'));
+  assert.throws(() => archivePaths({ wtPath: wt, rels: ['x.log'], holdingDir: h, slug: 's', pr: 1, nowMs: T }), /symlink in path/);
+  writeFileSync(join(wt, 'y.log'), 'y');
+  const elsewhere = mkdtempSync(join(tmpdir(), 'elsewhere-'));
+  symlinkSync(elsewhere, join(h, '2026-10-13'));
+  assert.throws(() => archivePaths({ wtPath: wt, rels: ['y.log'], holdingDir: h, slug: 's', pr: 1, nowMs: T }), /symlink in path/);
+  assert.deepEqual(readdirSync(elsewhere), []);
+  const h2 = mkdtempSync(join(tmpdir(), 'hold-'));
+  mkdirSync(join(h2, '2026-10-13')); symlinkSync(elsewhere, join(h2, '2026-10-13', 's'));
+  assert.throws(() => archivePaths({ wtPath: wt, rels: ['y.log'], holdingDir: h2, slug: 's', pr: 1, nowMs: T }), /symlink in path/);
+  assert.deepEqual(readdirSync(elsewhere), []);
+  assert.equal(readFileSync(join(wt, 'y.log'), 'utf8'), 'y', 'a refused archive leaves the file where it was');
+}, { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' });
+
+test('removeWorktree: eligible tree is archived, cleaned and removed; branch kept', async () => {
+  const { repo, add } = world();
+  const wt = add('agent-x', 'agent/x');
+  mkdirSync(join(wt, 'node_modules', 'p', 'empty'), { recursive: true }); writeFileSync(join(wt, 'node_modules', 'i.js'), '');
+  writeFileSync(join(wt, 'node_modules', 'p', 'j.js'), '');
+  mkdirSync(join(wt, '.review')); writeFileSync(join(wt, '.review', 's.json'), '{}');
+  const h = mkdtempSync(join(tmpdir(), 'hold-'));
+  // runStartMs in the future: the files above were written "before the run" even if the clock has not ticked since
+  const r = await removeWorktree({ root: repo.dir, wt: { slug: 'agent-x', path: wt }, cfg: { delete: ['node_modules/'], archive: ['.review/'] }, pr: 9, holdingDir: h, runId: 'r1', runStartMs: Date.now() + 5000, settleMs: 0, procOpts: noProcs() });
+  assert.equal(r.removed, true);
+  assert.deepEqual(r.deleted.sort(), ['node_modules/i.js', 'node_modules/p/j.js']);
+  assert.equal(r.archived.length, 1);
+  assert.equal(existsSync(wt), false);
+  assert.deepEqual(readdirSync(quarantineOf(repo)), [], 'nothing left in quarantine');
+  assert.match(repo.git(['branch', '--list', 'agent/x']), /agent\/x/);
+  assert.doesNotMatch(repo.git(['worktree', 'list', '--porcelain']), /agent-x/);
+  assert.equal(listHolding(h)[0].items, 1);
+});
+
+test('removeWorktree: a file written after the move => moved back intact, kept', async () => {
+  const { repo, add } = world();
+  const wt = add('agent-x', 'agent/x');
+  const r = await removeWorktree({ root: repo.dir, wt: { slug: 'agent-x', path: wt }, cfg: { delete: [], archive: [] }, pr: 9, holdingDir: mkdtempSync(join(tmpdir(), 'h-')), runId: 'r2', runStartMs: Date.now(), settleMs: 0,
+    procOpts: noProcs(),
+    hooks: { afterMove: (q) => writeFileSync(join(q, '.env.local'), 'SECRET=1') } });
+  assert.deepEqual([r.removed, r.restored], [false, true]);
+  assert.match(r.reason, /write detected during removal \(\.env\.local\)/);
+  assert.equal(readFileSync(join(wt, '.env.local'), 'utf8'), 'SECRET=1');
+  assert.match(repo.git(['worktree', 'list', '--porcelain']), /agent-x\n/);
+});
+
+test('removeWorktree: a recent write that matches no pattern (but is not a blocker kind) still moves it back', async () => {
+  const { repo, add } = world();
+  const wt = add('agent-x', 'agent/x');
+  mkdirSync(join(wt, 'node_modules'));
+  const r = await removeWorktree({ root: repo.dir, wt: { slug: 'agent-x', path: wt }, cfg: { delete: ['node_modules/'], archive: ['*.log'] }, pr: 9, holdingDir: mkdtempSync(join(tmpdir(), 'h-')), runId: 'r2b', runStartMs: Date.now() + 5000, settleMs: 0,
+    procOpts: noProcs(),
+    // same content, so git status may see no change; the mtime (pinned after runStartMs, no clock-granularity race) does
+    hooks: { afterMove: (q) => { writeFileSync(join(q, 'a.txt'), 'a\n'); const later = new Date(Date.now() + 60e3); utimesSync(join(q, 'a.txt'), later, later); } } });
+  assert.deepEqual([r.removed, r.restored], [false, true]);
+  assert.match(r.reason, /write detected during removal \(a\.txt\)/);
+  assert.equal(existsSync(wt), true);
+});
+
+test('removeWorktree: an absolute-path write after the move fails loudly (ENOENT)', async () => {
+  const { repo, add } = world();
+  const wt = add('agent-x', 'agent/x');
+  let err;
+  await removeWorktree({ root: repo.dir, wt: { slug: 'agent-x', path: wt }, cfg: { delete: [], archive: [] }, pr: 9, holdingDir: mkdtempSync(join(tmpdir(), 'h-')), runId: 'r3', runStartMs: Date.now(), settleMs: 0,
+    procOpts: noProcs(),
+    hooks: { afterMove: () => { try { writeFileSync(join(wt, 'HANDOFF.md'), 'x'); } catch (e) { err = e; } } } });
+  assert.equal(err?.code, 'ENOENT');
+});
+
+test('removeWorktree: a git refusal to move changes nothing', async () => {
+  const { repo, add } = world();
+  const wt = add('agent-x', 'agent/x');
+  repo.git(['worktree', 'lock', '--reason', 'owner', wt]);
+  const r = await removeWorktree({ root: repo.dir, wt: { slug: 'agent-x', path: wt }, cfg: { delete: [], archive: [] }, pr: 9, holdingDir: mkdtempSync(join(tmpdir(), 'h-')), runId: 'r4', runStartMs: Date.now() + 5000, settleMs: 0, procOpts: noProcs() });
+  assert.deepEqual([r.removed, r.restored], [false, false]);
+  assert.match(r.reason, /^move refused: /);
+  assert.equal(existsSync(join(wt, 'a.txt')), true);
+});
+
+test('removeWorktree: process inspection unavailable => moved back, kept', async () => {
+  const { repo, add } = world();
+  const wt = add('agent-x', 'agent/x');
+  const r = await removeWorktree({ root: repo.dir, wt: { slug: 'agent-x', path: wt }, cfg: { delete: [], archive: [] }, pr: 9, holdingDir: mkdtempSync(join(tmpdir(), 'h-')), runId: 'r5', runStartMs: Date.now() + 5000, settleMs: 0, procOpts: { platform: 'darwin' } });
+  assert.deepEqual([r.removed, r.restored, r.reason], [false, true, 'in use during removal']);
+  assert.equal(existsSync(join(wt, 'a.txt')), true);
+});
+
+test('removeWorktree: a process whose cwd is inside the quarantine => moved back, kept', async () => {
+  const { repo, add } = world();
+  const wt = add('agent-x', 'agent/x');
+  const proc = mkdtempSync(join(tmpdir(), 'proc-'));
+  const r = await removeWorktree({ root: repo.dir, wt: { slug: 'agent-x', path: wt }, cfg: { delete: [], archive: [] }, pr: 9, holdingDir: mkdtempSync(join(tmpdir(), 'h-')), runId: 'r6', runStartMs: Date.now() + 5000, settleMs: 0,
+    procOpts: { platform: 'linux', procRoot: proc },
+    hooks: { afterMove: (q) => { mkdirSync(join(proc, '4242', 'fd'), { recursive: true }); symlinkSync(q, join(proc, '4242', 'cwd')); } } });
+  assert.deepEqual([r.removed, r.restored, r.reason], [false, true, 'in use during removal']);
+  assert.equal(existsSync(join(wt, 'a.txt')), true);
+}, { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' });
+
+test('removeWorktree: an archive-matched symlink is a blocker (symlink in path); nothing outside is touched', async () => {
+  const { repo, add } = world();
+  const wt = add('agent-x', 'agent/x');
+  const outside = mkdtempSync(join(tmpdir(), 'outside-')); writeFileSync(join(outside, 'secret'), 'keep me');
+  symlinkSync(join(outside, 'secret'), join(wt, 'x.log'));
+  const h = mkdtempSync(join(tmpdir(), 'h-'));
+  const r = await removeWorktree({ root: repo.dir, wt: { slug: 'agent-x', path: wt }, cfg: { delete: [], archive: ['*.log'] }, pr: 9, holdingDir: h, runId: 'r7', runStartMs: Date.now() + 5000, settleMs: 0, procOpts: noProcs() });
+  assert.deepEqual([r.removed, r.restored], [false, true]);
+  assert.match(r.reason, /^symlink in path \(x\.log\)/);
+  assert.equal(readFileSync(join(outside, 'secret'), 'utf8'), 'keep me');
+  assert.deepEqual(readdirSync(h), []);
+}, { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' });
+
+test('removeWorktree: a runId with a dot is refused before anything moves', async () => {
+  const { repo, add } = world();
+  const wt = add('agent-x', 'agent/x');
+  await assert.rejects(removeWorktree({ root: repo.dir, wt: { slug: 'agent-x', path: wt }, cfg: { delete: [], archive: [] }, pr: 9, holdingDir: mkdtempSync(join(tmpdir(), 'h-')), runId: 'a.b', runStartMs: Date.now(), settleMs: 0, procOpts: noProcs() }), /runId/);
+  assert.equal(existsSync(wt), true);
+});
+
+test('restoreLeftovers: a quarantine left by a killed run goes back to its original path', () => {
+  const { repo, add } = world();
+  const wt = add('agent-x', 'agent/x');
+  const q = join(quarantineOf(repo), 'agent-x.dead');
+  mkdirSync(quarantineOf(repo));
+  repo.git(['worktree', 'move', wt, q]);
+  const r = restoreLeftovers(repo.dir, '.worktrees');
+  assert.deepEqual(r.map((x) => x.restored), [true]);
+  assert.deepEqual([r[0].from, r[0].to], [q, wt]);
+  assert.equal(existsSync(wt), true);
+});
+
+test('restoreLeftovers: dotted slug splits on the last dot; taken target and plain dirs are reported, not touched', () => {
+  const { repo, add } = world();
+  const dotted = add('ops.v2', 'ops/v2');
+  const taken = add('agent-y', 'agent/y');
+  mkdirSync(quarantineOf(repo));
+  repo.git(['worktree', 'move', dotted, join(quarantineOf(repo), 'ops.v2.run1')]);
+  repo.git(['worktree', 'add', '-q', '-b', 'agent/y2', join(quarantineOf(repo), 'agent-y.run2'), 'main']); // its slug's path is occupied
+  mkdirSync(join(quarantineOf(repo), 'gone.run3')); writeFileSync(join(quarantineOf(repo), 'gone.run3', 'left.txt'), 'l');
+  mkdirSync(join(quarantineOf(repo), 'nodot'));
+  const r = Object.fromEntries(restoreLeftovers(repo.dir, '.worktrees').map((x) => [x.from.slice(x.from.lastIndexOf(QUARANTINE_DIR) + QUARANTINE_DIR.length + 1), x]));
+  assert.equal(r['ops.v2.run1'].restored, true);
+  assert.equal(existsSync(join(dotted, 'a.txt')), true);
+  assert.deepEqual([r['agent-y.run2'].restored, r['agent-y.run2'].reason], [false, 'original path is taken']);
+  assert.equal(existsSync(join(taken, 'a.txt')), true);
+  assert.deepEqual([r['gone.run3'].restored, r['gone.run3'].reason], [false, 'not a worktree any more — inspect by hand']);
+  assert.equal(existsSync(join(quarantineOf(repo), 'gone.run3', 'left.txt')), true);
+  assert.equal(r.nodot.restored, false);
+  assert.deepEqual(restoreLeftovers(mkdtempSync(join(tmpdir(), 'empty-')), '.worktrees'), [], 'no quarantine dir => nothing to do');
 });
