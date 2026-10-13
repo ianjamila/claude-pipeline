@@ -817,7 +817,8 @@ function runsInlineCode(c, ctx) {
   return c.argv.some((w, i) => {
     if (!INLINE_RUNNERS.test(baseOf(w))) return false;
     const rest = c.argv.slice(i + 1);
-    if (/^(?:awk|gawk|mawk|nawk)$/.test(baseOf(w))) return !rest.some((a) => /^(?:-f|--file)/.test(a));
+    // (a program text next to -f -- gawk -e / --source / -E / --exec -- is inline code too; so is an include / load of a library)
+    if (/^(?:awk|gawk|mawk|nawk)$/.test(baseOf(w))) return !rest.some((a) => /^(?:-f|--file)/.test(a)) || rest.some((a) => /^(?:-[eEil]|--(?:source|exec|include|load))/.test(a));
     if (baseOf(w) === 'deno' && rest[0] === 'eval') return true;
     // (fail closed: any word that is a code option, attached or not (`-e'..'`, `-cprint(1)`, `--eval`), no file operand, or an option we do not know before the first operand
     // (it may take a value, so what follows is not known to be the file: `node -r x.js -e ..`, `perl -I lib -e ..`, `python3 -W ignore -c ..`))
@@ -916,7 +917,7 @@ function modelledCd(t, cmds, idx, ctx) {
   return null;
 }
 // Why: these write into the directory they run in without naming a file (an archive extracts there, curl -O / wget save there, git rewrites the work tree): in a rerun that assumes a protected directory they count as writes.
-const GIT_QUIET = new Set(['status', 'log', 'diff', 'show', 'add', 'commit', 'branch', 'fetch', 'rev-parse', 'rev-list', 'remote', 'ls-files', 'grep', 'blame', 'describe', 'tag', 'push', 'shortlog', 'ls-tree', 'cat-file', 'merge-base', 'symbolic-ref', 'for-each-ref', 'name-rev', 'worktree', 'config', 'version', 'help']);
+const GIT_QUIET = new Set(['status', 'log', 'diff', 'show', 'add', 'commit', 'branch', 'fetch', 'rev-parse', 'rev-list', 'remote', 'ls-files', 'grep', 'blame', 'describe', 'tag', 'push', 'shortlog', 'ls-tree', 'cat-file', 'merge-base', 'symbolic-ref', 'for-each-ref', 'name-rev', 'config', 'version', 'help']);
 // Why: a zsh script finds its own directory with `${0:A:h}` (symlinks resolved), `${0:a:h}`, `${0:h}`, repeated `:h`, or `${${(%):-%x}:A:h}` / `%N`, then `HERE=...; source "$HERE/lib.sh"` or `DIR="${HERE:h}"`.
 // For a file run as a zsh script these are its own directory, as `${0%/*}` is for bash (same conditions as modelledCd); the words are rewritten to that directory before anything reads
 // them, so a sourced sibling can be followed. Positive only: bash reads `${0:A:h}` as a substring, a function body has its own $0 in zsh, and a $0 that may have changed stays a run-time value.
@@ -1003,6 +1004,7 @@ function impliesCwdWrite(c) {
   if (['touch', 'mkdir', 'tee', 'truncate', 'rm', 'rmdir', 'mkfifo', 'mknod', 'chmod', 'chown', 'dd'].includes(name)) return relOperand;
   if (['sed', 'gsed'].includes(name) && args.some((a) => inPlaceFlag(a))) return relOperand;
   if (['perl', 'ruby'].includes(name) && args.some((a) => /^-[A-Za-z]*i/.test(a))) return relOperand; // (in-place edit)
+  if (name === 'find') return args.some((a) => FIND_UNSAFE.test(a)); // (-delete, -exec, -fprint ...: a write in the directory it runs in)
   if (name === 'curl') return args.some((a) => /^-[A-Za-z]*[OoJ]/.test(a) || /^--(?:output|remote-name|remote-header-name)/.test(a));
   if (name === 'git') {
     let i = 0;
@@ -1792,7 +1794,7 @@ function sourcedEffects(text, ctx) {
   // (a function the file defines is vetted through its own body, whose commands are in the list; the definition itself shows up as a command named like the function)
   const fns = definedNames(text);
   const set = (k, v, sure) => {
-    if (HOME_NAMES.has(k)) return;
+    if (HOME_NAMES.has(k)) { if (k === 'HOME') out.home = true; return; } // (HOME is never believed, but a file that sets it moves `cd` / `~`)
     const n = (seen.get(k) ?? 0) + 1;
     seen.set(k, n);
     const val = sure && n === 1 && typeof v === 'string' ? substVars(v, local, ctx.budget) : null;
@@ -1892,6 +1894,7 @@ function absorbSourced(rec, dirs, ctx) {
   for (const t of texts) {
     const eff = sourcedEffects(t, ctx);
     if (eff.all) poison();
+    if (eff.home) ctx.homeSourced = true; // (a bare `cd` / `cd ~` / `~/x` then goes elsewhere)
     if (eff.unknownCd) ctx.sourcedCdUnknown = true; // (a cd the file does into a directory only known at run time: the line's directory is unknown from here)
     effs.push(eff);
     for (const [k, v] of eff.vars) merged.set(k, merged.has(k) && merged.get(k) !== v ? null : v); // (the file may be one of several: a name they set differently is unknown)
@@ -2069,7 +2072,7 @@ function evaluateBashForFilesFrame(command, opts) {
     };
     const moved = (n) => stateAt(-1).moved(n) || Object.keys(snaps).some((ci) => stateAt(Number(ci)).moved(n));
     // Why: HOME is never believed from the line (the guard reads `~` as the real home), so a line that sets it, or a source that may, leaves `cd` / `cd ~` / `cd ~/x` without a known target
-    const homeMoved = ctx.unknownAll || moved('HOME') || cmds.some((c) => Object.hasOwn(c.env ?? {}, 'HOME') || c.argv.some((a) => /^HOME(?:=|\[|$)/.test(a)));
+    const homeMoved = ctx.unknownAll || ctx.homeSourced === true || moved('HOME') || cmds.some((c) => Object.hasOwn(c.env ?? {}, 'HOME') || c.argv.some((a) => /^HOME(?:=|\[|$)/.test(a)));
     // Why: with CDPATH set a relative `cd sub` goes to the first CDPATH entry that has `sub` (the line's, the environment's, one a source may have set)
     const cdpathSet = (startupEnv.CDPATH ?? '') !== '' || (Object.hasOwn(ctx.vars, 'CDPATH') && ctx.vars.CDPATH !== '') || moved('CDPATH') || cmds.some((c) => (c.env?.CDPATH ?? '') !== '');
     return cmds.some((c, ci) => {

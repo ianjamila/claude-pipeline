@@ -1185,6 +1185,7 @@ export function declAttrs(argv) {
       if (a[0] === '-') for (const ch of a.slice(1)) { if (ch === 'l') lower = true; else if (ch === 'u') upper = true; else if ('LRZin'.includes(ch)) out.unknown = true; }
       continue;
     }
+    ended = true; // (options stop at the first name: `declare D=x -u` makes -u a bad name, D keeps its case)
     const m = /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/.exec(a);
     if (m) out.assigns.push([m[1], m[2]]);
     else if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(a)) out.bare.push(a);

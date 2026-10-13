@@ -127,3 +127,20 @@ test('F2b-2 97: the order of binder effects -- an earlier binder reaches later c
     `D=/tmp/ok; echo x > ${D}D/out.txt; read E < list.txt`,
   ]);
 });
+
+test('F2b-2 86/83/51/56: awk program text next to -f is inline code, find actions and `git worktree` write in the cwd, declare options end at the first name, a sourced HOME moves cd', () => {
+  const awkProg = { 'p.awk': '{ print }', 'in.txt': 'a' };
+  denies(files, awkProg, [
+    `cd ${D}UNSET_X; gawk -f p.awk -e 'BEGIN { print "x" > "settings.json" }'`,
+    `cd ${D}UNSET_X; gawk -f p.awk --source 'BEGIN { print "x" > "settings.json" }'`,
+    `cd ${D}UNSET_X; find . -name settings.json -delete`,
+    `cd ${D}UNSET_X; find . -exec cp ev.sh {} ;`,
+    `cd ${D}UNSET_X; git worktree add wt`,
+    "declare D='/home/u/.cla''ude' -u; echo x > $D/settings.json",
+    "typeset D='/home/u/.cla''ude' -u; echo x > $D/settings.json",
+  ]);
+  allows(files, awkProg, [`cd ${D}UNSET_X; awk -f p.awk in.txt`, `cd ${D}UNSET_X; find . -name x`, `cd ${D}UNSET_X; git status`, 'declare -u D=/home/u/ok; echo x > $D/out.txt']);
+  // a sourced file that sets HOME: a bare cd / cd ~ lands there
+  denies(files, { 'rc.sh': 'HOME=/home/u/.claude' }, ['source rc.sh; cd; echo x > settings.json', 'source rc.sh; cd ~; echo x > settings.json']);
+  allows(files, { 'rc.sh': 'X=1' }, ['source rc.sh; cd; echo x > /tmp/settings.json']);
+});
