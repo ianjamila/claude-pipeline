@@ -50,8 +50,8 @@ const SCRUBBED_ENV = Object.fromEntries([
 // Runs git with forced config; returns the raw result unless the process did not finish on its own. `env` is the
 // one way to point git elsewhere on purpose (e.g. GIT_CEILING_DIRECTORIES in a test).
 // `timeoutMs` bounds a call that can hang on the network (fetch, push); a timeout is a GitError like any other.
-function exec(args, { cwd, run: runFn = run, input, env, timeoutMs } = {}) {
-  const r = runFn('git', [...FORCED_CONFIG, ...args], { cwd, env: { ...SCRUBBED_ENV, ...GIT_ENV, ...env }, input, ...(timeoutMs ? { timeoutMs } : {}) });
+function exec(args, { cwd, run: runFn = run, input, env, timeoutMs, maxBuffer } = {}) {
+  const r = runFn('git', [...FORCED_CONFIG, ...args], { cwd, env: { ...SCRUBBED_ENV, ...GIT_ENV, ...env }, input, ...(timeoutMs ? { timeoutMs } : {}), ...(maxBuffer ? { maxBuffer } : {}) });
   const abnormal = r.timedOut ? 'timed out' : r.signal ? `terminated by signal ${r.signal}` : null;
   if (abnormal) {
     throw new GitError({ args, code: r.code, stderr: [abnormal, (r.stderr ?? '').trim()].filter(Boolean).join(': ') });
@@ -60,6 +60,7 @@ function exec(args, { cwd, run: runFn = run, input, env, timeoutMs } = {}) {
 }
 
 // Returns stdout untouched (callers trim what they need to); throws GitError on any non-zero exit.
+// `o.maxBuffer` raises the 64 MiB cap on what one call may print (see contentHash).
 export function git(args, o) {
   const r = exec(args, o);
   if (r.code !== 0) throw new GitError({ args, code: r.code, stderr: r.stderr });
@@ -91,6 +92,31 @@ export function mergeBase(a, b, o) {
   const out = gitOrNull(args, 1, o); // exit 1 and no stderr: the two histories share no commit
   if (out === null) throw new GitError({ args, code: 1, stderr: `no common ancestor between ${a} and ${b}` });
   return out.trim();
+}
+
+// Is `a` an ancestor of (or equal to) `b`? git's exit 1 (with nothing on stderr) is the answer "no"; a commit git does
+// not know (exit 128) still throws, so a missing object can never read as "no".
+export const isAncestor = (a, b, o) => gitOrNull(['merge-base', '--is-ancestor', assertRef(a, ['merge-base', a, b]), assertRef(b, ['merge-base', a, b])], 1, o) !== null;
+
+// The installed git as [major, minor], or null when it prints something else. `merge-tree --write-tree` needs 2.38.
+export function gitVersion(o) {
+  const m = /^git version (\d+)\.(\d+)/.exec(git(['--version'], o).trim());
+  return m ? [Number(m[1]), Number(m[2])] : null;
+}
+export const supportsMergeTreeWrite = (o) => {
+  const v = gitVersion(o);
+  return v !== null && (v[0] > 2 || (v[0] === 2 && v[1] >= 38));
+};
+
+// A trial merge of `head` into `base` that touches no ref, index or working tree (it only writes tree objects).
+// -> { clean: true, tree } | { clean: false, tree } (exit 1: conflicts). Any other exit (a missing object, an old git) throws.
+export function mergeTree(base, head, o) {
+  const args = ['merge-tree', '--write-tree', assertRef(base, ['merge-tree', base, head]), assertRef(head, ['merge-tree', base, head])];
+  const r = exec(args, o);
+  if (r.code !== 0 && r.code !== 1) throw new GitError({ args, code: r.code, stderr: r.stderr });
+  const tree = String(r.stdout).split('\n')[0].trim();
+  if (!/^[0-9a-f]{40,64}$/.test(tree)) throw new GitError({ args, code: r.code, stderr: `merge-tree printed no tree id: ${String(r.stdout).slice(0, 200)}` });
+  return { clean: r.code === 0, tree };
 }
 
 export const headSha = (o) => git(['rev-parse', 'HEAD'], o).trim();
@@ -339,13 +365,18 @@ function normaliseDiff(text) {
 // `exclude` paths (e.g. an agent log the pipeline itself appends to) are left out: each is a literal repo-root-relative
 // path (`:(top,exclude,literal)`), so `*.js` is not a glob and `docs/x.md` does not match `sub/docs/x.md`. Pathspecs
 // are anchored at the repo root so cwd cannot narrow what is hashed.
-export function contentHash(base, head, { exclude = [], ...o } = {}) {
+// The diff is read as ONE string, so the cap is what a JS string can hold (V8: 2^29-24 chars, and a char is at least one
+// byte): 512 MiB. The default 64 MiB cap killed git with SIGKILL on a real 174 MB PR diff (a regenerated data file), which
+// made the gate and `P inbox` fail for exactly the PRs that most need a look. Past 512 MiB it fails loudly, never truncates.
+export const DIFF_MAX_BYTES = 512 * 1024 * 1024;
+
+export function contentHash(base, head, { exclude = [], maxBuffer = DIFF_MAX_BYTES, ...o } = {}) {
   const mb = mergeBase(base, head, o);
   const { skipped } = largeBinaryChanges(mb, head, o);
   const text = git([
     ...STABLE_CONFIG, 'diff', '--unified=3', '--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--src-prefix=a/', '--dst-prefix=b/',
     `${mb}..${assertRef(head, ['diff', head])}`, '--', ':/', ...exclude.map((p) => `:(top,exclude,literal)${p}`), ...excludeSpecs(skipped),
-  ], o);
+  ], { ...o, maxBuffer });
   const diff = normaliseDiff(text);
   const stoodIn = skipped.filter((c) => !exclude.includes(c.newPath ?? c.oldPath)); // an excluded path never counts
   if (stoodIn.length === 0) return createHash('sha256').update(diff).digest('hex');
@@ -386,8 +417,12 @@ export function reviewBaseRef(branch, o) {
 // THE content hash of "the code that was reviewed": what HEAD changes relative to where it forked from the PR base,
 // minus the agent log the pipeline itself appends to. The review loop (round coverage, review-complete) and the final
 // gate / merge both call this, so they cannot disagree about whether a review is current.
-export function reviewContentHash({ branch, agentLog } = {}, o) {
-  return contentHash(reviewBaseRef(branch, o), 'HEAD', { ...o, exclude: agentLog ? [agentLog] : [] });
+//
+// `head` (default 'HEAD') and `baseSha` (default: the resolved review base ref) let a caller hash an arbitrary commit
+// that is only present as objects (a PR head fetched, not checked out) against an explicit base; this stays the one
+// definition, so `ship inbox` / `ship resume` agree byte for byte with the review loop and the final gate.
+export function reviewContentHash({ branch, agentLog, head = 'HEAD', baseSha } = {}, o) {
+  return contentHash(baseSha ?? reviewBaseRef(branch, o), head, { ...o, exclude: agentLog ? [agentLog] : [] });
 }
 
 // Streams the file so a large untracked artifact does not have to fit in memory.

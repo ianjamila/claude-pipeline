@@ -55,6 +55,23 @@ pipeline artifacts push --pr N --dir DIR [--repo DIR]   -> {ok, files:[{name, ma
 
 Exit: 0 pushed (or nothing to push) · 2 environment / git error · 3 GitHub (`gh`) unavailable.
 
+## checkpoint
+
+record where the ship run stands in the PR summary comment (refuses unless local HEAD is the pushed PR head).
+
+```
+pipeline checkpoint --pr N --step build|verify|pr|review|gate|awaiting-owner-merge|merge|prod-watch|ended [--next TEXT] [--detail TEXT]
+                    [--request-file F] [--tasks-file F] [--task-done ID] [--verify-report] [--round R] [--resumed] [--repo DIR]
+  -> {ok, url, action, record, warnings}; exit 1 {error: unpushed | behind | diverged} (local HEAD is not the PR head on GitHub), 2 usage, 3 GitHub unavailable
+  --request-file: the user's request, text, at most 2 KB · --tasks-file: JSON [{id, title, spec}] · --task-done ID: mark one task done (repeatable)
+  --resumed: this run was taken over by `ship resume` (or adopts a PR): stamps record.resumed {at, host, head}, which later checkpoints keep and which makes `P merge` require --owner-approved-head
+  --verify-report: copy {head, tree, mode, ok, failedStep} of the verify report, only when its head and tree are this HEAD's (otherwise a warning)
+```
+
+Exit: 0 recorded · 1 `unpushed` (local HEAD is ahead of the PR head on GitHub: push first) / `behind` (the PR has newer commits: pull) / `diverged` (neither is an ancestor of the other, or the PR head is not fetched here: nothing is written) · 2 usage (unknown `--step`, a `--request-file` over 2 KB or not text, a bad `--tasks-file`, a record from a newer pipeline version) · 3 GitHub (`gh`) unavailable.
+
+`--resumed` is passed by a session that takes over a stalled run (or adopts a PR) as its first checkpoint: it stamps `record.resumed` `{at, host, head}`, which later checkpoints keep, and which makes `merge` demand `--owner-approved-head`. It sets the heartbeat (`os.hostname()` and the time) and keeps the summary sections already in the comment. `--verify-report` copies the report at `verify.report` only when its head and tree are this HEAD's; otherwise it is ignored and `warnings` says why. A step other than `ended` / `awaiting-owner-merge` clears a previous `outcome` (the run is going again).
+
 ## codex-review
 
 run one Codex review round over base..head and record its findings.
@@ -116,8 +133,11 @@ open an agent-suggestion issue for each FOLLOW-UP item of a round.
 
 ```
 pipeline followups create --round R [--repo DIR]
-  -> {ok, round, created:[{id, number, url}], skipped:[ids already filed], held:[ids waiting for a human]}
-  one issue per fingerprint across the whole review; a FOLLOW-UP that needs a human is held, not filed
+  -> {ok, round, created:[{id, number, url}], reused:[{id, number, url}], duplicates:[{id, canonical, others:[url]}],
+      skipped:[ids already filed], held:[ids waiting for a human]}
+  one issue per fingerprint across the whole review; a FOLLOW-UP that needs a human is held, not filed.
+  Each issue body starts with <!-- claude-pipeline:followup pr=N fp=FINGERPRINT -->; before creating, an issue of ours
+  (any state) with that marker is REUSED (several: lowest number is canonical, the rest are listed, never closed)
 ```
 
 Exit: 0 · 2 usage / no state · 3 GitHub (`gh`) unavailable.
@@ -133,6 +153,21 @@ pipeline hardstops --base REF --head REF [--labels a,b] [--repo DIR]   -> {ok, a
 With `owner_approval: chat` in pipeline.yml every would-be-blocking hit is returned as `advisory` + `ownerMerge` (also listed under `ownerMerge`; the owner merges them by saying "merge" in chat) and the exit is 0.
 
 Exit: 0 no blocking hits (report-only hits, `advisory`, are listed but never block), or blocking hits approved by `human-approved` · 1 unapproved blocking hits · 2 usage / config.
+
+## inbox
+
+read-only triage of every open PR (and recently merged ones): what each waits for and the next action.
+
+```
+pipeline inbox [--stale-days 14] [--merged-days 7] [--no-git] [--repo DIR]
+  -> {ok, generatedAt, bases[{ref, sha}], prs[], triage{merge, resume, close, leave}, strandedAfterMerge[], local{unpushed[], orphanWorktrees[]}, warnings[]}
+```
+
+Never comments, labels, closes, merges or creates a ref. Facts: one paginated GraphQL query for the open PRs (page size 20) and one for PRs merged within `--merged-days`; per PR the full paginated comment list (our run record, review state, needs-human reason and run events are read from the viewer's own comments only, so a forged marker from someone else is ignored; a record bound to another PR or branch is ignored with a warning). Git, unless `--no-git`: ONE `git fetch --no-tags origin +refs/heads/<base>:refs/remotes/origin/<base> refs/pull/<n>/head …` per distinct base (the only things it writes are fetched objects and that remote-tracking ref), then per PR `git merge-tree --write-tree` for `conflicts` / `alreadyOnBase` and the review content hash (the gate's own, agent log excluded) as `contentHash`. `--no-git`, git older than 2.38 or a failed fetch leave those facts `null` and add a `warnings` entry; with `--no-git` `local` is `{unpushed: null, orphanWorktrees: null}`. `local` lists branches with unpushed commits, uncommitted changes or a diverged ref, and worktrees under `worktree_dir` whose branch has no open PR (listed only). CI is judged against the required checks (`ci.required_checks` plus the guard contexts unless `ci.guard_checks: false`): `passed` only when every one has a successful row.
+
+Each PR carries `waitingOn` (`nothing-left` · `running` · `owner-decision` · `failing-check` · `review` · `owner-merge` · `pipeline` · `abandoned`), `reason`, `nextAction`, `lastActivity`, `stale` and `suggest` (`merge` · `resume` · `close` · `leave`, also the keys of `triage`). A PR with no run record and no review state whose last activity is older than `--stale-days` is `abandoned` (close) whatever else is wrong with it (conflicts, a red check, a draft are appended to the reason: "; also …"); `failing-check` names the failed required checks (`ciFailed`) or the base it conflicts with. `strandedAfterMerge` lists PRs merged within `--merged-days` whose run stopped in the merge / prod-watch step or has a `rollback-intent` without a `rollback-result`.
+
+Exit: 0 · 2 usage / config / not a git repository · 3 GitHub (`gh`) unavailable.
 
 ## integrity
 
@@ -179,10 +214,14 @@ Exit: 0 · 3 GitHub (`gh`) unavailable.
 merge the PR if (and only if) the final gate passes again, live; waits for MERGED.
 
 ```
-pipeline merge --pr N [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment
+pipeline merge --pr N [--owner-approved-head SHA] [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?, warnings?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment. While it runs the run record of the PR shows inFlight {kind: merge} and step merge; a prod-before event comment (the known-good deployment) is posted before the merge command, and when that post fails nothing is merged (error pre-merge); warnings lists a run record write that failed (never fatal). A run record marked resumed (`P checkpoint --resumed`: a run taken over by ship resume) refuses with error pre-merge unless --owner-approved-head names the full gate head: only the owner's "merge" for that head supplies it; so does a run record that cannot be checked (unreadable, invalid or unsupported: it may be a resumed one)
 ```
 
 Exit: 0 merged (a merge commit GitHub cannot name yet is `mergeSha: null` plus a `warning`; prod-watch resolves it) · 1 not merged / refused by the live gate or by the last pre-merge look at GitHub (run final-gate again; `behind-base`: the base moved, the branch was just updated on GitHub, so pull, re-verify and gate the new head) · 3 GitHub unavailable, or no known-good production deployment.
+
+Resumed runs: `merge` reads the PR's run record (the viewer's own summary comment) before anything irreversible; when it carries `resumed` (set by `checkpoint --resumed`, never cleared), `merge` refuses with exit 1 `{merged: false, error: pre-merge, reason: resumed run: the owner must approve this exact head (pass --owner-approved-head <sha>)}` unless `--owner-approved-head` is the full 40-character gate head. A record that cannot be checked fails closed: unreadable comments, or an `invalid` / `unsupported` (newer version) record, refuse the same way (`reason: <the run record could not be read (…) | the run record is invalid|unsupported>, so the resumed-run guard cannot be checked: the owner must approve this exact head (pass --owner-approved-head <sha>)`), because it may be a resumed one. No record (`absent`) or a `legacy` comment is an ordinary run.
+
+Run record: right after `.review/prod-before.json` is written, and before the merge command, `merge` sets the record's `inFlight` `{kind: merge, host, startedAt, maxMinutes: 2 × merge.wait_minutes + 15}` and `step: merge`, and posts, after the last look at GitHub and still before the merge command, a `prod-before` event (always a NEW comment: repo, environment, pr, `headBeforeMerge` = the approved PR head, `deployment {id, sha, url}`) when a known-good deployment was recorded (no `production` configured: no event). On every exit `inFlight` is cleared: merged → `step: prod-watch` and `mergeSha`; not merged → `step: gate`. The event fails CLOSED: it is the only cross-machine copy of the rollback target, so when it cannot be posted nothing is merged (exit 1, `error: pre-merge`, `reason: could not record the rollback target on the PR (prod-before event)`; `inFlight` is cleared). The run record itself is display: a failed record write is listed in `warnings` and never fails the merge.
 
 ## model-proof
 
@@ -229,13 +268,19 @@ Branch protection must require `ci.required_checks` AND, unless `ci.guard_checks
 verify the production deployment of a merge; roll back safely, open an issue and a revert PR if it fails.
 
 ```
-pipeline prod-watch (--sha MERGE_SHA [--pr N] | --pr N) [--expect-text T] [--retry-wait SEC=60] [--repo DIR]   -> {ok, outcome: merged|deploy-failed|deploy-not-observed|not-live|superseded|recovered|rollback-failed|changed-during-recovery|rollback-skipped|no-production, ..., notify}
+pipeline prod-watch (--sha MERGE_SHA [--pr N] | --pr N) [--expect-text T] [--retry-wait SEC=60] [--observe-only] [--repo DIR]   -> {ok, outcome: merged|deploy-failed|deploy-not-observed|not-live|superseded|recovered|rollback-failed|changed-during-recovery|rollback-skipped|needs-owner|no-production, ..., notify}
   with only --pr N (merge printed mergeSha:null) the merge commit is read from the merged PR (up to 6 looks); exit 1 {error:not-merged} when the PR is not MERGED, exit 3 {error:merge-sha-unresolved} when GitHub never names it
+  with --pr N it records rollback-intent / rollback-result / recovery-reported events on the PR and shows the watch as in flight in the run record
+  --observe-only: same smokes and outcomes, but never rolls back, opens an issue or revert PR, or adds a label: what would have rolled back is {outcome: needs-owner, evidence}; a rollback-intent with no rollback-result on the PR is {rollbackInterrupted: {intent, liveNow}}; a rollback-result of this merge already on the PR (the original watch died before `P summary`) is reported as its recorded outcome, recovered (ok and verified) or rollback-failed, without re-smoking, with {recorded: {id, url, ok, verified}} and the issue / revert PR urls of its recovery-reported event; with --pr N it also records its outcome in the run record (step ended) when the record has none yet (or only prod-unknown), so resume and the inbox stop routing the PR here; works from a detached worktree at the merge commit (the known-good target is read from the prod-before event when .review/prod-before.json is absent)
 ```
 
 `--expect-text` applies only to this merge's own deployment: smokes of the rolled-back or superseded (other) deployment run without it. `not-live` also covers a merge whose deployment succeeded but was never promoted while production still serves the known-good deployment (nothing is rolled back).
 
-Exit: 0 outcome `merged` (or no production configured) · 1 any other outcome (recovered, rollback-failed, ...), or with --pr only: the PR is not MERGED · 3 deployment not observed / GitHub unavailable / the merge commit could not be read.
+Events and the run record (with `--pr`): immediately BEFORE the rollback it posts a `rollback-intent` event on the PR (merge sha, failing deployment, rollback target); if that comment cannot be posted nothing is rolled back (`rollback-skipped`, "could not record the rollback intent on the PR"). Right after the rollback and its check it posts `rollback-result` (`ok`, `liveAfter`, `verified`), and after the incident issue / revert PR `recovery-reported`. Each is a NEW comment, never edited (ids `<sha7>-<n>`); failing to post the last two is only a warning. The watch also shows itself in the PR's run record (`inFlight` kind `prod-watch`, max `production.deploy_timeout_minutes` + 30 minutes, step `prod-watch`) and clears that on every exit; a record that cannot be written is a `warnings` entry, never a failure.
+
+`--observe-only` runs the same deployment lookup, smokes and outcome detection, but never rolls back, opens an issue or revert PR, adds a label, posts an event or takes the recovery lock. A failing smoke that a normal watch would have rolled back (or ended in `rollback-skipped` / `changed-during-recovery`) is outcome `needs-owner`: `reason` plus `evidence` {`underlying` (what a normal watch would have ended with), `failingDeployment`, `liveDeployment`, `knownGood`, `smokeFailure`}. It needs no PR branch, so it can run from a detached worktree at the merge commit: the known-good target is `.review/prod-before.json` when present, else the newest `prod-before` event on the PR. If the PR has a `rollback-intent` with no `rollback-result` of the same id, the JSON carries `rollbackInterrupted: {intent, liveNow}` (the live deployment now), whatever the outcome. With `--pr N` it then writes the outcome into the run record (`step: ended`, summary sections kept) unless the record already has one; `deploy-not-observed` is not recorded (it learned nothing), and no event is posted, so an open `rollback-intent` stays open.
+
+Exit: 0 outcome `merged` (or no production configured) · 1 any other outcome (recovered, rollback-failed, needs-owner, ...), or with --pr only: the PR is not MERGED · 3 deployment not observed / GitHub unavailable / the merge commit could not be read.
 
 Owner push: once `runProdWatch` has returned (the production lock is released) the owner gets one push for the outcome (`merged` priority 3, the rest 4, the three unsafe-rollback outcomes 5), worded from the artifacts that exist: a missing rollback issue reads "Rollback issue could not be confirmed — check whether merges are paused", never "merges are not paused". An error exit that has no outcome (`merge-sha-unresolved`, `not-merged`, or a deploy/API error that escapes the watch) sends a "Production check unfinished" push instead; the original exit code, JSON and error are unchanged. The JSON gains `notify` (`{sent, reason?, transports}`; `{sent:false, reason:'no-event'}` for `no-production`). A replay of the same result is a `duplicate` and sends nothing.
 
@@ -251,13 +296,40 @@ Exit: 0 dry run printed, or applied with nothing missing · 1 no admin rights / 
 
 ## resume
 
-list open PRs waiting for a cross-model review.
+find PRs a session can pick up, and plan where a stalled run resumes.
 
 ```
 pipeline resume list [--repo DIR]
+  -> {ok, prs[{number, title, headRefName, url, why}]}: open PRs labelled awaiting-review, plus open PRs whose run record
+     (written by this GitHub user) is readable and has no outcome yet (a run that stopped mid-way)
+pipeline resume plan --pr N [--repo DIR]
+  -> {ok, pr, title, url, prState, branch, base, liveHead, enter, reason, adopt, confirm, autoMerge, worktree, stop, recordStatus, record,
+      events, local, mergeSha, notes[], warnings[]}; read-only (its only git writes are fetches: the PR head, the base and origin/<branch>)
+     enter: closed | ended | observe-prod | not-resumable | local-work | decision | build | verify | review | followups | gate
+     adopt: no run record (the PR was not started by the pipeline); confirm: {host, step, minutesAgo, why} when another run may be live,
+     stop: where a run on a route that can reach Step 5 ends, never at a merge: awaiting-owner-merge (owner_approval chat) | needs-human (label mode); null on the other routes
+     autoMerge: {armed, action: disarm} when an unattended auto-merge is queued, worktree: {action: reuse|add-existing-ref|add-from-remote|none, path?, then?}
+  exit 2 when the PR does not exist
 ```
 
-Exit: 0 · 3 GitHub (`gh`) unavailable.
+`list` shows what a session can pick up: PRs parked as `awaiting-review` and open PRs whose run record (written by this GitHub user) has no outcome, i.e. a run that stopped mid-way. `plan` reads the PR, its comments (run record, review state, events), the local branch and the worktrees holding it, and routes the resume by the pure rules in `pipeline/lib/resume-plan.mjs`:
+
+| `enter` | When |
+|---|---|
+| `closed` | closed without a merge |
+| `ended` | merged and nothing is left to watch |
+| `observe-prod` | merged, but the run stopped in `merge` / `prod-watch`, or a `rollback-intent` has no `rollback-result`: watch production from a detached worktree of `origin/<base>` at the merge commit; never roll back |
+| `not-resumable` | fork PR |
+| `local-work` | the local branch diverged from the PR, or a worktree holding it is dirty: the owner decides |
+| `decision` | `needs-human`; `reason` is our needs-human comment's first sentence |
+| `build` / `verify` | the record has tasks not done / no passing verify for the live head and the run had only reached build or verify |
+| `review` | no review state, an incomplete round, content changed since the last round, a round that is not clean, or `awaiting-review` |
+| `followups` | published follow-ups without an issue |
+| `gate` | everything else: a fresh gate, then the owner-merge stop (resume never merges) |
+
+No usable run record means `adopt: true`; a published review state is still honoured ("no run record" is not "no review state"). `confirm` is set when the heartbeat is from another host and under 90 minutes old, or a command is in flight inside its time budget: ask the owner before doing anything. `autoMerge` asks the skill to disarm an armed auto-merge that no live merge owns. `worktree.action` is `reuse` (a worktree already holds the branch), `add-existing-ref`, `add-from-remote` or `none`, with `then: ff-only` (local behind) or `push` (local ahead); a branch is never reset with `-B`.
+
+Exit: 0 · 2 usage / PR not found · 3 GitHub (`gh`) unavailable.
 
 ## review-complete
 
@@ -296,8 +368,15 @@ show or update the review loop state (.review/state.json).
 
 ```
 pipeline state show [--round R] [--accepted] [--disputed] [--needs-human] [--pr N] [--repo DIR]
-  -> {ok, recovered, count, items}; with --pr and no local state, rebuilds it from the PR triage comment
-pipeline state outcome [--repo DIR]   -> roundOutcome + {clean}; exit 0 whether or not clean
+  -> {ok, recovered, source, count, items}; with --pr and no local state, rebuilds it from the PR triage comment
+  with --pr and a local state: the published (triage comment) state is authoritative. Local is kept (source local) when it
+  equals or strictly EXTENDS the published one; otherwise .review/ moves to .review/stale-<UTC time>/ (source quarantined,
+  quarantinedTo) and the published state is restored. source is local | published | quarantined | local-unverified
+  (GitHub unreachable but a local state exists: served as is with a `warnings` entry, exit 0; with no local state exit 3)
+pipeline state discard-round --round R [--pr N] [--repo DIR]
+  -> drop an unpublished, trailing round R from the local state and move .review/round-R/ into .review/stale-<UTC time>/;
+     refused (exit 2) when the PR triage comment already holds round R
+pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, followupsPending}; exit 0 whether or not clean
 pipeline state mark-implemented --ids a,b [--repo DIR]
   -> exit 2 {error:no-code-change} unless the branch content differs from what the accepting round reviewed
 pipeline state record-followup --id ID --url URL [--repo DIR]
@@ -360,10 +439,12 @@ Runs `install.mjs` from a clean, isolated download of exactly the commit main po
 bring the PR branch up to date with its base on GitHub (update-branch with expected_head_sha), return the new head (checks are not waited for by default).
 
 ```
-pipeline update-branch --pr N [--expect-head SHA] [--max-cycles N=3] [--wait-checks] [--repo DIR]   -> {ok, outcome, updated, cycles, base, startHead, head, localHead, pullNeeded, message?}; outcome up-to-date (exit 0; when updated: git pull --ff-only, then re-verify and run the gate on `head`; checks are NOT waited for unless --wait-checks) | rebase-needed | head-moved | cycle-cap | head-timeout | not-open | (with --wait-checks) checks-failed | checks-timeout (exit 1; rebase-needed = the update conflicts, needs-human), 3 GitHub unavailable
+pipeline update-branch --pr N [--expect-head SHA] [--max-cycles N=3] [--wait-checks] [--repo DIR]   -> {ok, outcome, updated, cycles, base, startHead, head, localHead, pullNeeded, message?, warnings?}; outcome up-to-date (exit 0; when updated: git pull --ff-only, then re-verify and run the gate on `head`; checks are NOT waited for unless --wait-checks) | rebase-needed | head-moved | cycle-cap | head-timeout | not-open | (with --wait-checks) checks-failed | checks-timeout (exit 1; rebase-needed = the update conflicts, needs-human), 3 GitHub unavailable. While it runs the run record of the PR shows inFlight {kind: update-branch}; warnings lists a record write that failed (never fatal)
 ```
 
 Exit: 0 `up-to-date` (the base tip is part of the PR head; `updated` says whether this run merged the base in: then `git pull --ff-only`, re-verify, and gate `head`) · 1 `rebase-needed` (the update conflicts: `needs-human`, never a force push), `head-moved` (someone pushed since the verified head, GitHub refused `expected_head_sha`, or the new head is not GitHub's merge of the base into the pinned head: nothing more was updated), `cycle-cap` (the base kept moving), `head-timeout` (GitHub never showed the new head), `not-open`; with `--wait-checks` also `checks-failed` / `checks-timeout` · 3 GitHub (`gh`) unavailable, including any unexpected failure reading checks.
+
+Run record: `inFlight` `{kind: update-branch, maxMinutes: 30}` is set before the update and cleared on every exit; a failed record write is listed in `warnings` and never fails the update.
 
 ## vendor
 
@@ -397,6 +478,6 @@ The spec table was written before the build; the CLI that shipped differs as fol
 | `triage-comment`, `summary` | `comment --kind triage|summary|needs-human|blocked|awaiting-review`; `summary` also posts the summary comment |
 | `preview-url` | `deploy url --sha SHA --environment ENV` (GitHub deployments only; no `preview.url_command`) |
 | `agent-log --line` (docs-only PR) | `agent-log queue --line` and `agent-log stage --pr N` (commit into the PR branch; the queue is flushed by `stage`) |
-| not listed | `artifacts push`, `followups create`, `hardstops`, `integrity`, `job start\|wait\|read`, `protect`, `resume list`, `review-complete`, `state show\|outcome\|mark-implemented\|record-followup\|set-outcome`, `triage settle\|light-lane`, `vendor`, `version` |
+| not listed | `artifacts push`, `followups create`, `hardstops`, `integrity`, `job start\|wait\|read`, `protect`, `resume list\|plan`, `review-complete`, `state show\|outcome\|mark-implemented\|record-followup\|set-outcome`, `triage settle\|light-lane`, `vendor`, `version` |
 | `risk` returns `files[]`, `stats` | `risk` returns `level, reasons, lightLane, changedLines, fileCount, hardStops, base, head, mergeBase` |
 | `prod-watch` rolls back with the rollback command | `prod-watch` runs `vercel rollback <known-good> --yes --timeout 3m` itself; `production.rollback.command` is documentation |

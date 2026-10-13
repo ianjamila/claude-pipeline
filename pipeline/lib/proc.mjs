@@ -123,7 +123,7 @@ function childEnv(env, replaceEnv) {
   return replaceEnv ? { ...env } : { ...process.env, ...env };
 }
 
-function baseOptions({ cwd, env, timeoutMs, replaceEnv } = {}) {
+function baseOptions({ cwd, env, timeoutMs, replaceEnv, maxBuffer = MAX_BUFFER } = {}) {
   return {
     cwd,
     env: childEnv(env, replaceEnv),
@@ -131,14 +131,16 @@ function baseOptions({ cwd, env, timeoutMs, replaceEnv } = {}) {
     killSignal: 'SIGKILL', // SIGTERM can be trapped; a timeout has to stick
     encoding: 'utf8',
     windowsHide: true,
-    maxBuffer: MAX_BUFFER,
+    maxBuffer,
   };
 }
 
-export function run(cmd, args = [], { cwd, env, input, timeoutMs, replaceEnv } = {}) {
+// `maxBuffer` (bytes of stdout / stderr kept) is for the rare caller whose output is legitimately huge; past it the child is
+// killed (spawnSync's own rule), so a limit that is too small is a failure, never a truncated answer.
+export function run(cmd, args = [], { cwd, env, input, timeoutMs, maxBuffer, replaceEnv } = {}) {
   const plan = planSpawn(cmd, args);
   const r = spawnSync(plan.file, plan.args, {
-    ...baseOptions({ cwd, env, timeoutMs, replaceEnv }),
+    ...baseOptions({ cwd, env, timeoutMs, maxBuffer, replaceEnv }),
     input,
     windowsVerbatimArguments: plan.windowsVerbatimArguments,
   });

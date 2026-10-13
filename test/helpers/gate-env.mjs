@@ -109,6 +109,11 @@ export function ghEntries(o) {
     ...(typeof o.extra === 'function' ? o.extra(o) : (o.extra ?? [])),
     ...previewDeployEntries(o),
     { match: '^pr view 12 --json state,headRefOid', stdoutJson: pr },
+    // The run record merge / update-branch keep in the summary comment: no comment yet, and writing one succeeds.
+    { match: '^pr view 12 --json headRefOid,headRefName,baseRefName', stdoutJson: { headRefOid: o.prHead, headRefName: 'agent/feature', baseRefName: o.base ?? 'main' } },
+    { match: 'repos/acme/widgets/issues/12/comments --paginate', stdoutJson: o.comments ?? [] },
+    { match: '-X POST repos/acme/widgets/issues/12/comments', stdoutJson: { id: 501, html_url: 'https://github.com/acme/widgets/pull/12#issuecomment-501' } },
+    { match: '-X PATCH repos/acme/widgets/issues/comments/', stdoutJson: { id: 501, html_url: 'https://github.com/acme/widgets/pull/12#issuecomment-501' } },
     { match: '^pr view 12 --json state,mergeCommit', stdoutJson: { labels: [], ...(o.mergeView ?? { state: 'MERGED', mergeCommit: { oid: MERGE_SHA } }) } },
     { match: '^pr merge 12 --disable-auto', code: o.disableAutoCode ?? 0 },
     // `behindBy`: how many base commits the PR head lacks (compare); 0 = up to date, which is what merge's update step expects.

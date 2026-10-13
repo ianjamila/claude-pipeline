@@ -8,6 +8,7 @@ import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, createFakeCodex, fullProtection, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { emptyState, saveState } from '../pipeline/lib/state.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
+import { applyCheckpoint, decodeRecord, emptyRecord, encodeRecord } from '../pipeline/lib/run-record.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 
 const bin = join(dirname(fileURLToPath(import.meta.url)), '..', 'pipeline', 'bin', 'pipeline.mjs');
@@ -173,6 +174,7 @@ function stateRepo() {
 
 const commentWorld = (existing = []) => createFakeGh([
   REPO, ME,
+  { match: '^pr view 4 --json', stdoutJson: { title: 'Add widget', headRefName: 'feat/w', baseRefName: 'main', headRefOid: 'a'.repeat(40) } },
   { match: 'issues/4/comments --paginate', stdoutJson: existing },
   { match: '^api -X PATCH repos/acme/widgets/issues/comments/(\\d+) ', stdoutJson: { id: 21, html_url: 'https://x/21' } },
   { match: '^api -X POST repos/acme/widgets/issues/4/comments ', stdoutJson: { id: 77, html_url: 'https://x/77' } },
@@ -214,8 +216,33 @@ test('comment summary: passes outcome and built text into the body', () => {
   assert.ok(body.startsWith(MARKERS.summary));
   assert.match(body, /Added the widget/);
   assert.match(body, /\*\*merged\*\*/);
+  // the same comment carries the run record: this run ended `merged`
+  const decoded = decodeRecord(body);
+  assert.equal(decoded.status, 'ok');
+  assert.deepEqual([decoded.record.outcome, decoded.record.step, decoded.record.branch, decoded.record.pr], ['merged', 'ended', 'feat/w', 4]);
+  assert.deepEqual(r.json.warnings, []);
   // --outcome is required for a summary
   assertExit(cli(['comment', '--pr', '4', '--kind', 'summary'], { repo, fake: commentWorld() }), 2);
+});
+
+test('comment summary: keeps the run record a checkpoint wrote (tasks survive) and PATCHes the one comment', () => {
+  const repo = stateRepo();
+  const rec = applyCheckpoint(emptyRecord({ repo: 'acme/widgets', pr: 4, branch: 'feat/w', baseRef: 'main' }), {
+    step: 'review', round: 2, tasks: [{ id: 'T1', title: 'one', spec: 's1', done: true }],
+  }, { host: 'mac', now: 0 });
+  const existing = () => [{ id: 21, body: `${MARKERS.summary}\n\n${encodeRecord(rec)}`, user: { login: 'me' } }];
+  const fake = commentWorld(existing());
+  const r = cli(['comment', '--pr', '4', '--kind', 'summary', '--outcome', 'awaiting-owner-merge'], { repo, fake });
+  assertExit(r, 0);
+  assert.equal(r.json.action, 'updated');
+  const sent = decodeRecord(JSON.parse(fake.calls().find((c) => c.argv.includes('PATCH')).stdin).body);
+  assert.equal(sent.status, 'ok');
+  assert.deepEqual(sent.record.tasks, rec.tasks);
+  assert.deepEqual([sent.record.outcome, sent.record.step, sent.record.round], ['awaiting-owner-merge', 'awaiting-owner-merge', 2]);
+  // an outcome the record does not know is rendered, warned about, and never recorded
+  const odd = cli(['comment', '--pr', '4', '--kind', 'summary', '--outcome', 'wild'], { repo, fake: commentWorld(existing()) });
+  assertExit(odd, 0);
+  assert.equal(odd.json.warnings.length, 1);
 });
 
 test('comment blocked: renders from .verify/report.json', () => {
@@ -356,14 +383,17 @@ test('deploy url: usage errors (missing flags, short sha) exit 2', () => {
 
 // ---- resume ---------------------------------------------------------------------------------
 
-test('resume list: open PRs labelled awaiting-review', () => {
-  const fake = createFakeGh([{
-    match: '^pr list --label awaiting-review --state open',
-    stdoutJson: [{ number: 5, title: 'Add widget', headRefName: 'feat/widget', url: 'https://github.com/acme/widgets/pull/5', labels: [] }],
+test('resume list: open PRs labelled awaiting-review, each with a why', () => {
+  const fake = createFakeGh([REPO, ME, {
+    match: 'graphql[\\s\\S]*states: OPEN',
+    stdoutJson: { data: { repository: { pullRequests: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{
+      number: 5, title: 'Add widget', headRefName: 'feat/widget', headRefOid: 'a'.repeat(40), baseRefName: 'main', url: 'https://github.com/acme/widgets/pull/5',
+      labels: { nodes: [{ name: 'awaiting-review' }] }, commits: { nodes: [] },
+    }] } } } },
   }]);
   const r = cli(['resume', 'list'], { repo: repoWith(), fake });
   assertExit(r, 0);
-  assert.deepEqual(r.json, { ok: true, prs: [{ number: 5, title: 'Add widget', headRefName: 'feat/widget', url: 'https://github.com/acme/widgets/pull/5' }] });
+  assert.deepEqual(r.json, { ok: true, prs: [{ number: 5, title: 'Add widget', headRefName: 'feat/widget', url: 'https://github.com/acme/widgets/pull/5', why: 'awaiting a cross-model review (label awaiting-review)' }] });
   assertExit(cli(['resume'], { repo: repoWith(), fake }), 2);
 });
 

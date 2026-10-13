@@ -2,6 +2,9 @@
 
 ## PR body template
 
+The PR is created as a draft right after the first task commits (Step 2), with a short body: the request and the task
+list. Step 3 replaces it with the full body below (`gh pr edit N --body-file <file>`).
+
 ```
 ## What & why
 <2–4 sentences: the change and the reason; link the request/issue (Closes #…)>
@@ -48,11 +51,26 @@ first (`P hardstops --base origin/<default_branch> --head HEAD > .review/hardsto
 array, or the `P hardstops` object itself: its `blocking` list is used); leave `--hits-file` out when there are no blocking hits.
 Report-only hits never make a needs-human note; they go in the PR body.
 
+## Run record and checkpoints
+
+The summary comment (marker `claude-pipeline:summary`) is created by the first `P checkpoint` and is the run's durable
+state: a visible **Pipeline run status** block (step · next · head · host · heartbeat) plus a hidden, compressed run
+record that `P inbox` and `P resume plan` read. `P checkpoint --pr N --step S` updates it; it refuses unless local HEAD
+is the PR's remote head. The checkpoints, in order: `build` (with `--request-file`, `--tasks-file`, `--task-done` after
+each task), `verify --verify-report`, `pr`, `review --round R` (after each round), `gate`, `awaiting-owner-merge`;
+`P summary` ends the record (`ended` + outcome). Only the viewer's own comments count; a record is display and routing
+only, never approval. The `--tasks-file` is JSON `[{id, title, spec}]`: `spec` = acceptance criteria + the tests to
+write, enough for another machine to continue the task.
+
+Evidence is never kept only in that editable record: `prod-before` (before the merge), `rollback-intent`,
+`rollback-result` and `recovery-reported` (prod-watch) are separate append-only event comments.
+
 ## Summary comment (Step 7)
 
 `P summary --pr <N> --outcome <outcome> --built "<2–3 sentences>"` (outcome: `merged`, `blocked`,
 `needs-human`, `awaiting-review`, `awaiting-owner-merge` (chat mode, stopped before the merge), or a prod-watch outcome such as `recovered`, `rollback-failed`,
-`superseded`, `not-live`, `deploy-failed`) prints `agentLogLine` and renders, in this order. `blocked` and
+`superseded`, `not-live`, `deploy-failed`, `needs-owner` (observe-only: the live smoke fails, nothing was changed)) keeps the status block and the record
+(setting `step: ended` and the outcome) and the summary sections that follow; it prints `agentLogLine` and renders, in this order. `blocked` and
 `awaiting-review` also work before any review round exists (verify red 3 times, Codex out in round 1):
 the comment then has no rounds, and a `blocked` one names the failing verify step; any other outcome
 needs `.review/state.json`.

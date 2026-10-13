@@ -2,7 +2,8 @@
 
 `P` = `node ~/.claude/pipeline/bin/pipeline.mjs`. For commands run as jobs (`update-branch`, `merge`, `prod-watch`),
 the codes below are the job's `exitCode`, and the JSON is in the `tail` (or `<jobDir>/log`); see
-Invariant 8 in `SKILL.md`. `P final-gate` runs directly.
+Invariant 8 in `SKILL.md`. `P final-gate` runs directly. `merge`, `prod-watch --pr N` and `update-branch` also show themselves in the PR's run record
+(`inFlight`, cleared on exit) so another machine sees them running; no `P checkpoint` is needed around them.
 
 ## `P final-gate --pr N`
 
@@ -65,6 +66,9 @@ the outcomes below marked *(only with `--wait-checks`)*.
 | 1 | `error: "behind-base"`, `outcome`, `head` | the base moved after the gate: merge already ran `update-branch` once on the approved head and refused (`outcome: updated`, `head` = the new head), so nothing merged on a stale tree → back to Step 5.2 (`git pull --ff-only`), re-verify, `P final-gate`, merge again. `outcome: rebase-needed` (conflict) ⇒ `needs-human` + `P summary --outcome needs-human --cause merge:rebase-needed --action "…"`; `head-moved` ⇒ `git fetch`, re-read, Step 5.1; `cycle-cap` / `head-timeout` ⇒ Step 5.2 once more, then `needs-human` + `P summary --outcome needs-human --cause merge:behind-base --action "…"` |
 | 1 | `error: "live-check"`, `reasons` = `<check>: <detail>` | a check failed live: handle it like the `final-gate` table; `pr-open: behind-base:` ⇒ update the branch, re-verify, back to Step 5.2 |
 | 1 | `error: "pre-merge"`, `reasons` | a label, a pause/rollback issue, a new push or a draft/closed PR appeared in the last seconds: head moved ⇒ back to Step 5; label or pause ⇒ `P summary --pr N --outcome stopped --cause merge:pre-merge --action "<which label or pause issue appeared>"`, stop and tell the user |
+| 1 | `error: "pre-merge"`, `reasons` = "could not record the rollback target on the PR (prod-before event)" | merge posts the `prod-before` event (the known-good production deployment, the only copy of the rollback target that survives this machine) before it runs the merge command, and refuses to merge without it. Nothing merged: retry once, then `P summary --pr N --outcome stopped --cause merge:prod-before --action "Merge refused: the rollback target could not be recorded on the PR"`, stop and tell the user |
+| 1 | `error: "pre-merge"`, `reason` = "resumed run: the owner must approve this exact head (pass --owner-approved-head <sha>)" | the PR's run record is marked `resumed` (a run taken over by Resume mode or adopted): nothing merged. Only the owner's "merge" for this exact head lifts it, by re-running `P merge --owner-approved-head <full head sha>`; without that approval `P summary --pr N --outcome awaiting-owner-merge --action "Say \"merge\" for head <sha7>"` (label mode: `needs-human`) and stop per Owner-merge approval → "Resumed runs" |
+| 1 | `error: "pre-merge"`, `reason` = "… so the resumed-run guard cannot be checked: the owner must approve this exact head (pass --owner-approved-head <sha>)" | the PR's run record could not be read (GitHub error) or is `invalid` / `unsupported`, so it may be a resumed one: nothing merged. Retry `P merge` once (a passing GitHub blip clears it). Still refused ⇒ treat it as a resumed run: only the owner's "merge" for this exact head lifts it (`P merge --owner-approved-head <full head sha>`); without it `P summary --pr N --outcome awaiting-owner-merge --action "Say \"merge\" for head <sha7>"` (label mode: `needs-human`) and stop |
 | 1 | no `error`, `reason` "merge command failed (exit …)" | read `commandOutput`; the PR is not merged and `autoMergeDisabled` says auto-merge was switched off: one retry after `P final-gate`, then `needs-human` + `P summary --outcome needs-human --cause merge:command-failed --action "…"` |
 | 1 | `reason` "not merged in time" / "could not read the PR state" | not merged, auto-merge disabled: the base probably moved or a check is pending → Step 5.2, then retry (max 2), then `needs-human` + `P summary --outcome needs-human --cause merge:not-merged --action "…"` |
 | 1 | `reason` "closed without merging" | the PR was closed: `P summary --pr N --outcome closed` (no push); stop; tell the user |
@@ -88,6 +92,14 @@ only in `recovered` / `rollback-failed`.
 | `not-live` (1) | the merge's deployment never went live (production kept serving an older one, e.g. never promoted after an earlier rollback); nothing rolled back | `not-live` |
 | `deploy-failed` (1) | the Production deployment of the merge failed; the previous one still serves | `deploy-failed` |
 | `deploy-not-observed` (3) | no successful deployment seen within `deploy_timeout_minutes`: unknown whether it is live; do NOT rerun (it would open a second issue) | `deploy-not-observed` |
+| `needs-owner` (1) | only with `--observe-only`: the smoke fails on the live deployment and a normal watch would have rolled back (or ended `rollback-skipped` / `changed-during-recovery`). Nothing was changed, no issue, no label; `evidence` has the live deployment, the known-good target and the smoke failure | `needs-owner` |
+
+`--observe-only` is what a resumed run uses after a merge: same smokes, never a rollback, issue, revert PR, label or event, and it
+works from a detached worktree at the merge commit (the rollback target comes from the `prod-before` event when
+`.review/prod-before.json` is missing). If its JSON has `rollbackInterrupted: {intent, liveNow}`, a rollback began (a
+`rollback-intent` event) and nothing recorded how it ended: tell the owner, with the live deployment next to the target. The owner
+decides; resume never rolls back. A normal `prod-watch --pr N` posts `rollback-intent` BEFORE it rolls back (if that comment cannot
+be posted it does not roll back: `rollback-skipped`), then `rollback-result` and `recovery-reported`.
 
 Tell the user at once for every outcome except `merged`/`no-production`: say what is live now, what
 was changed (rolled back or not), and which issue/PR to look at; for URGENT ones say that production

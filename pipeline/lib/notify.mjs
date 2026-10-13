@@ -39,6 +39,7 @@ export const OUTCOME_EVENTS = Object.freeze({
   'not-live': null,
   'deploy-failed': null,
   'deploy-not-observed': null,
+  'needs-owner': null, // an observe-only prod-watch (ship resume) pushed it already
 });
 
 // { known, event } for a summary outcome word. Unknown words are known:false, event:null.
@@ -82,6 +83,7 @@ const PROD_PRIORITY = Object.freeze({
   'rollback-failed': 5,
   'changed-during-recovery': 5,
   'rollback-skipped': 5,
+  'needs-owner': 5,
 });
 const PROD_LABEL = Object.freeze({
   merged: 'Production OK',
@@ -93,6 +95,7 @@ const PROD_LABEL = Object.freeze({
   'rollback-failed': 'ROLLBACK FAILED',
   'changed-during-recovery': 'PRODUCTION CHANGED',
   'rollback-skipped': 'ROLLBACK SKIPPED',
+  'needs-owner': 'PRODUCTION FAILING',
 });
 // Outcomes whose rollback issue carries the label that pauses further agent merges.
 const PAUSING = new Set(['recovered', 'rollback-failed', 'changed-during-recovery', 'rollback-skipped']);
@@ -144,6 +147,9 @@ export function prodEvent(output, { pr } = {}) {
       break;
     case 'changed-during-recovery':
       action = `Production changed while rolling back: check which deployment is live and healthy now.${issueN ? ` Issue #${issueN}.` : ''}${issueNote}`;
+      break;
+    case 'needs-owner': // observe-only (ship resume): nothing was rolled back, and no issue is ever opened
+      action = `Production fails the smoke after ${target} and nothing was rolled back (resumed run, observe only): check it now and roll back by hand if needed.`;
       break;
     default: // rollback-skipped
       action = `Rollback was skipped, production may be unhealthy: check it now.${issueN ? ` Issue #${issueN}.` : ''}${issueNote}`;

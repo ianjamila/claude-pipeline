@@ -205,6 +205,17 @@ test('prod urgent outcomes are priority 5; the other non-merged ones 4; never an
   }
 });
 
+test('prod needs-owner (observe-only, ship resume): priority 5, says nothing was rolled back, no issue', () => {
+  const e = prodEvent({ outcome: 'needs-owner', mergeSha: 'abc', issue: null }, { pr: 3 });
+  assert.equal(e.event, 'prod-needs-owner');
+  assert.equal(e.priority, 5);
+  assert.equal(e.label, 'PRODUCTION FAILING');
+  assert.match(e.action, /^Production fails the smoke after #3 and nothing was rolled back/);
+  assert.doesNotMatch(e.action, /issue/i);
+  // the resumed run's summary does not push it a second time
+  assert.deepEqual(classifyOutcome('needs-owner'), { known: true, event: null });
+});
+
 test('prod no-production and unknown outcomes owe no push', () => {
   assert.equal(prodEvent({ outcome: 'no-production' }, { pr: 1 }), null);
   assert.equal(prodEvent({ outcome: 'weird' }, { pr: 1 }), null);

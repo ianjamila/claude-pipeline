@@ -3,7 +3,7 @@
 // reviewed" means. In particular `currentContentHash` is the single definition of the hash that round coverage and
 // the merge gate compare, so a command that hashed differently would let a stale review look current. (The formula itself lives in git.mjs.)
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { EXIT } from './cli.mjs';
 import { Fail } from './cmd-common.mjs';
@@ -149,4 +149,89 @@ export function excerptWindow(content, line, { radius = EXCERPT_RADIUS, maxLines
   }
   if (start > end) return null; // a line number past the end of the file
   return { start, end, lines: all.slice(start - 1, end) };
+}
+
+// ---- review replay (published vs local state) -----------------------------------------------
+
+// A follow-up that is ready to be filed (not waiting for a human) but has no issue yet: resume replays
+// `followups create` from the published items before the gate.
+export const followupsPending = (state) => allItems(state).some(
+  (i) => i.final?.decision === 'FOLLOW-UP' && i.final.needsHuman !== true && !i.followupIssue,
+);
+
+// JSON with sorted keys and no undefined, so two copies of the same decision compare equal whatever order a writer
+// emitted the keys in.
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map((v) => canonicalJson(v ?? null)).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    return `{${Object.keys(value).sort().filter((k) => value[k] !== undefined).map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(value ?? null);
+}
+
+// The part of a round that records what was DECIDED: one definition, used to tell a local state that merely continues the
+// published one from one that disagrees with it. Items are compared by id, in id order.
+export function decidedItemsKey(round) {
+  const items = (round.items ?? []).map((i) => canonicalJson({
+    id: i.id, fingerprint: i.fingerprint, final: i.final, judge: i.judge, arbiter: i.arbiter, implemented: i.implemented, followupIssue: i.followupIssue,
+  }));
+  return items.sort().join('\n');
+}
+
+// True when `local` strictly extends `published`: every published round is present locally with the same n, toHead,
+// contentHashAtToHead and decided items. Extra local rounds (an unpublished, maybe incomplete, trailing one) are fine.
+export function stateExtends(local, published) {
+  const mine = new Map((local.rounds ?? []).map((r) => [r.n, r]));
+  return (published.rounds ?? []).every((p) => {
+    const r = mine.get(p.n);
+    return r !== undefined && r.toHead === p.toHead && r.contentHashAtToHead === p.contentHashAtToHead && decidedItemsKey(r) === decidedItemsKey(p);
+  });
+}
+
+// ---- stale quarantine -----------------------------------------------------------------------
+
+// `.review/stale-<UTC timestamp>/`, never deleted: it holds whatever the published state replaced or a discarded round.
+export function newStaleDir(root, now = new Date()) {
+  const stamp = now.toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
+  let dir = path.join(reviewDir(root), `stale-${stamp}`);
+  for (let k = 2; existsSync(dir); k += 1) dir = path.join(reviewDir(root), `stale-${stamp}-${k}`);
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+// Move everything in .review/ except earlier stale dirs into a new stale dir. Returns its path.
+export function quarantineReviewDir(root) {
+  const dir = newStaleDir(root);
+  for (const name of readdirSync(reviewDir(root))) {
+    if (name.startsWith('stale-')) continue;
+    renameSync(path.join(reviewDir(root), name), path.join(dir, name));
+  }
+  return dir;
+}
+
+// ---- model proofs ---------------------------------------------------------------------------
+
+// One entry per round whose Fable model proof passed. The round in the state carries the summary (`arbiter apply` stores
+// it so it travels in the triage comment); the .review/round-*/model-proof.json file is the fallback for a round whose
+// state predates that or whose state was not recovered.
+export function readModelProofs(root, state = null) {
+  const byRound = new Map();
+  for (const r of state?.rounds ?? []) {
+    const p = r?.modelProof;
+    if (p && typeof p === 'object') byRound.set(r.n, { transcript: p.transcript, models: p.models, ...(p.effort ? { effort: p.effort } : {}) });
+  }
+  const dir = reviewDir(root);
+  if (existsSync(dir)) {
+    for (const name of readdirSync(dir).filter((n) => /^round-\d+$/.test(n))) {
+      const n = Number(name.slice(6));
+      if (byRound.has(n)) continue;
+      try {
+        const p = JSON.parse(readFileSync(path.join(dir, name, 'model-proof.json'), 'utf8'));
+        if (p?.ok !== true) continue;
+        const efforts = p.efforts && typeof p.efforts === 'object' ? Object.keys(p.efforts).join(', ') : '';
+        byRound.set(n, { transcript: p.transcript, models: p.models, ...(efforts ? { effort: efforts } : {}) });
+      } catch { /* no proof for this round */ }
+    }
+  }
+  return [...byRound.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v);
 }

@@ -13,8 +13,13 @@ import { run as procRun } from '../pipeline/lib/proc.mjs';
 import { GitError, git as gitRunReal } from '../pipeline/lib/git.mjs';
 import { fill } from '../pipeline/lib/config.mjs';
 import {
-  runProdWatch, exitCodeFor, hostOf, readKnownGood, createGitOps, createSmoke, issueTitle, resolveMergeSha,
+  runProdWatch, exitCodeFor, hostOf, readKnownGood, knownGoodFromEvents, createGitOps, createSmoke, createRunRecordTracker, issueTitle,
+  resolveMergeSha,
 } from '../pipeline/lib/prodwatch.mjs';
+import { renderEvent, listEvents, parseEvent } from '../pipeline/lib/run-events.mjs';
+import { decodeRecord, emptyRecord } from '../pipeline/lib/run-record.mjs';
+import { writeSummaryComment } from '../pipeline/lib/summary-comment.mjs';
+import { planResume } from '../pipeline/lib/resume-plan.mjs';
 import { inspectAlias, rollback, vercelCommand, linkedProjectDir, VercelError, tail } from '../pipeline/lib/vercel.mjs';
 import { prodEvent, buildMessage, LEDGER_NAME } from '../pipeline/lib/notify.mjs';
 import { run as prodWatchRun } from '../pipeline/commands/prod-watch.mjs';
@@ -88,8 +93,26 @@ function harness(over = {}) {
   const findDeployment = seq(over.findDeployment ?? [{ state: 'success', id: 11, url: 'https://ours-abc-team.vercel.app', createdAt: DEPLOYED_AT }]);
   const sleeps = [];
   const locks = [];
+  // Opt-in (`events: true`, `record: true`): the plain harness has no PR to write to, like `prod-watch --sha` alone.
+  const posted = [];
+  const recordCalls = [];
+  const events = !over.events ? undefined : {
+    post: async (kind, id, sentence, data) => {
+      mark(`event:${kind}`);
+      if ((over.postFail ?? []).includes(kind)) throw new Error('gh api: 502 Bad Gateway');
+      posted.push({ kind, id, sentence, data });
+    },
+    list: async () => { if (over.eventListError) throw new Error('gh api: 500'); return over.eventList ?? []; },
+  };
+  const runRecord = !over.record ? undefined : {
+    set: async (inFlight) => { mark('record:set'); recordCalls.push(['set', inFlight]); if (over.recordFail === 'set') throw new Error('summary comment unreadable'); },
+    clear: async () => { mark('record:clear'); recordCalls.push(['clear']); if (over.recordFail === 'clear') throw new Error('gh api: 502'); },
+    finish: async (outcome, detail) => { mark('record:finish'); recordCalls.push(['finish', outcome, detail]); if (over.recordFail === 'finish') throw new Error('gh api: 503'); },
+  };
 
   const deps = {
+    ...(events ? { events } : {}),
+    ...(runRecord ? { runRecord } : {}),
     findDeployment: (a) => { mark('find'); return findDeployment(a); },
     smoke: async (a) => { mark('smoke'); return smoke(a); },
     inspectAlias: async (d) => { mark('inspect'); return inspect(d); },
@@ -103,7 +126,7 @@ function harness(over = {}) {
       deploymentStatuses: async (id) => (over.ghStatuses ?? {})[id] ?? [],
     },
     git: { revertBranch: async (a) => { mark('revert'); return revertBranch(a); } },
-    sleep: async (ms) => { sleeps.push(ms); },
+    sleep: async (ms) => { sleeps.push(ms); if (over.sleep) over.sleep(ms, sleeps.length); },
     now: () => T + 5000,
     lock: over.lock ?? (async (name, fn) => {
       locks.push(name);
@@ -120,7 +143,7 @@ function harness(over = {}) {
     note: () => {},
   };
   return {
-    log, held, sleeps, locks, smoke, inspect, rollbackFn, issueCreate, prCreate, issueComment, revertBranch, findDeployment,
+    log, held, sleeps, locks, posted, recordCalls, smoke, inspect, rollbackFn, issueCreate, prCreate, issueComment, revertBranch, findDeployment,
     go: (opts = {}) => runProdWatch({ config: over.config ?? config(), sha: SHA, pr: 12, root: '/repo', ...opts }, deps),
   };
 }
@@ -788,6 +811,535 @@ test('linkedProjectDir: the checkout itself when linked; else the main checkout 
   assert.equal(linkedProjectDir(wt), wt);
 });
 
+// ---- run events, the run record and --observe-only ----------------------------------------------------------------------
+
+const RECOVER = { smoke: [FAIL, FAIL, PASS], inspect: [OURS, OURS, OLDER] };
+// With a PR the watch re-reads production once more AFTER recording the rollback intent (before, again, after-intent, read-back).
+const RECOVER_EV = { smoke: [FAIL, FAIL, PASS], inspect: [OURS, OURS, OURS, OLDER] };
+
+// A one-PR stand-in for the bits of createGitHub() the summary comment and the run-record tracker use.
+function fakeSummaryGh(initial) {
+  let comment = typeof initial === 'string' ? { id: 1, user: { login: 'bot' }, body: initial } : null;
+  let writes = 0;
+  return {
+    viewer: () => 'bot',
+    repo: () => ({ slug: 'acme/widgets' }),
+    prView: () => ({ headRefName: 'agent/x', baseRefName: 'main' }),
+    listComments: () => (comment ? [comment] : []),
+    upsertComment: (n, marker, body) => {
+      assert.ok(body.startsWith(marker));
+      writes += 1;
+      comment = { id: comment?.id ?? 1, user: { login: 'bot' }, body };
+      return { id: comment.id, url: 'https://github.com/acme/widgets/pull/12#issuecomment-1', action: 'updated' };
+    },
+    body: () => comment?.body,
+    writes: () => writes,
+  };
+}
+
+let commentId = 100;
+// A viewer-authored event as `listEvents` returns it.
+const eventOf = (kind, id, data) => listEvents([{ id: (commentId += 1), user: { login: 'bot' }, html_url: `https://github.com/acme/widgets/pull/12#issuecomment-${commentId}`, body: renderEvent(kind, id, `${kind} sentence`, data) }], 'bot')[0];
+const PROD_BEFORE = eventOf('prod-before', '12-1', { environment: 'Production', pr: 12, deployment: { id: 'dpl_old', sha: OLD_SHA, url: 'https://old-xyz-team.vercel.app' } });
+
+test('events: rollback-intent is posted BEFORE the rollback, rollback-result AFTER it and its check, recovery-reported after the issue and revert PR', async () => {
+  const h = harness({ ...RECOVER_EV, events: true });
+  const r = await h.go();
+  assert.equal(r.outcome, 'recovered');
+  assert.deepEqual(h.posted.map((e) => e.kind), ['rollback-intent', 'rollback-result', 'recovery-reported']);
+  const at = (name) => h.log.indexOf(name);
+  assert.ok(at('event:rollback-intent') < at('rollback'), 'intent first');
+  assert.ok(at('rollback') < at('event:rollback-result'), 'result after the rollback');
+  assert.ok(at('smoke') < at('event:rollback-intent') && at('inspect') < at('event:rollback-intent'), 'intent comes after the last look at production');
+  assert.equal(h.log.filter((x) => x === 'smoke').length, 3, 'the post-rollback smoke ran before the result was written');
+  assert.ok(h.log.lastIndexOf('smoke') < at('event:rollback-result'));
+  assert.ok(at('pr') < at('event:recovery-reported') && at('issue') < at('event:recovery-reported'));
+  for (const name of ['event:rollback-intent', 'event:rollback-result', 'event:recovery-reported']) assert.equal(h.held[name], true, `${name} is written under the lock`);
+
+  assert.deepEqual(h.posted.map((e) => e.id), ['aaaaaaa-1', 'aaaaaaa-1', 'aaaaaaa-1']);
+  const [intent, result, reported] = h.posted.map((e) => e.data);
+  assert.equal(intent.mergeSha, SHA);
+  assert.deepEqual(intent.failingDeployment, { id: 11, url: 'https://ours-abc-team.vercel.app' });
+  assert.deepEqual(intent.target, { id: 'dpl_old', sha: OLD_SHA, url: 'https://old-xyz-team.vercel.app' });
+  assert.deepEqual(result, { mergeSha: SHA, ok: true, liveAfter: { id: 'dpl_old', url: 'old-xyz-team.vercel.app' }, verified: true });
+  assert.deepEqual(reported, {
+    mergeSha: SHA, issueUrl: 'https://github.com/acme/widgets/issues/50', revertPrUrl: 'https://github.com/acme/widgets/pull/51', issueNumber: 50, revertPrNumber: 51,
+  });
+  // Each is a valid event: render accepts the id and kind.
+  for (const e of h.posted) assert.ok(parseEvent(renderEvent(e.kind, e.id, e.sentence, e.data)));
+});
+
+test('events: production changing WHILE the intent is being recorded aborts the rollback and closes the intent with an aborted result', async () => {
+  const h = harness({ smoke: [FAIL, FAIL], inspect: [OURS, OURS, NEWER], events: true });
+  const r = await h.go();
+  assert.equal(r.outcome, 'changed-during-recovery');
+  assert.equal(h.rollbackFn.calls.length, 0);
+  assert.ok(!h.log.includes('rollback'));
+  assert.equal(r.live.id, 'dpl_newer');
+  assert.deepEqual(h.posted.map((e) => e.kind), ['rollback-intent', 'rollback-result']);
+  assert.deepEqual(h.posted[1].data, { mergeSha: SHA, ok: false, aborted: true, liveAfter: { id: 'dpl_newer', url: 'newer-def-team.vercel.app' }, verified: false });
+  assert.equal(h.posted[1].id, h.posted[0].id, 'the result closes the same attempt');
+  assert.ok(h.log.lastIndexOf('inspect') > h.log.indexOf('event:rollback-intent'), 'production was read again after the intent was posted');
+  for (const e of h.posted) assert.ok(parseEvent(renderEvent(e.kind, e.id, e.sentence, e.data)));
+});
+
+test('events: an unreadable live deployment after the intent also aborts (nothing rolled back, intent closed)', async () => {
+  const h = harness({ smoke: [FAIL, FAIL], inspect: [OURS, OURS, new Error('vercel inspect: 500')], events: true });
+  const r = await h.go();
+  assert.equal(r.outcome, 'rollback-skipped');
+  assert.match(r.reason, /after recording the rollback intent.*500/);
+  assert.equal(h.rollbackFn.calls.length, 0);
+  assert.deepEqual(h.posted.map((e) => e.kind), ['rollback-intent', 'rollback-result']);
+  assert.equal(h.posted[1].data.aborted, true);
+  assert.equal(h.posted[1].data.liveAfter, null);
+});
+
+test('events: no events dep (no PR known) rolls back exactly as before', async () => {
+  const h = harness(RECOVER);
+  assert.equal((await h.go()).outcome, 'recovered');
+  assert.equal(h.rollbackFn.calls.length, 1);
+});
+
+test('events: the event number counts the rollback-intents already on the PR for this merge', async () => {
+  const prior = eventOf('rollback-intent', 'aaaaaaa-1', { mergeSha: SHA });
+  const otherMerge = eventOf('rollback-intent', 'ccccccc-1', { mergeSha: 'c'.repeat(40) });
+  const h = harness({ ...RECOVER_EV, events: true, eventList: [prior, otherMerge] });
+  await h.go();
+  assert.deepEqual(h.posted.map((e) => e.id), ['aaaaaaa-2', 'aaaaaaa-2', 'aaaaaaa-2']);
+});
+
+test('events: if the rollback-intent cannot be recorded NOTHING is rolled back (rollback-skipped, urgent issue, no later events)', async () => {
+  const h = harness({ ...RECOVER_EV, events: true, postFail: ['rollback-intent'] });
+  const r = await h.go();
+  assert.equal(r.outcome, 'rollback-skipped');
+  assert.equal(r.reason, 'could not record the rollback intent on the PR');
+  assert.equal(h.rollbackFn.calls.length, 0);
+  assert.ok(!h.log.includes('rollback'));
+  assert.deepEqual(h.posted, []);
+  assert.ok(!h.log.includes('event:rollback-result') && !h.log.includes('event:recovery-reported'));
+  assert.deepEqual(h.issueCreate.calls[0][0].labels, ['pipeline-rollback']);
+  assert.ok(!h.log.includes('revert'));
+});
+
+test('events: if the existing rollback attempts cannot be read NOTHING is rolled back (an id could be reused): rollback-skipped, nothing posted', async () => {
+  const h = harness({ ...RECOVER_EV, events: true, eventListError: true });
+  const r = await h.go();
+  assert.equal(r.outcome, 'rollback-skipped');
+  assert.equal(r.reason, 'could not read existing rollback attempts on the PR');
+  assert.equal(h.rollbackFn.calls.length, 0);
+  assert.deepEqual(h.posted, []);
+  assert.deepEqual(h.issueCreate.calls[0][0].labels, ['pipeline-rollback']);
+});
+
+test('events: failing to post rollback-result or recovery-reported is a warning, never a different outcome', async () => {
+  const h = harness({ ...RECOVER_EV, events: true, postFail: ['rollback-result', 'recovery-reported'] });
+  const r = await h.go();
+  assert.equal(r.outcome, 'recovered');
+  assert.equal(r.warnings.length, 2);
+  assert.match(r.warnings[0], /rollback-result event.*502/);
+  assert.match(r.warnings[1], /recovery-reported event.*502/);
+});
+
+test('events: a rollback that fails is recorded as ok:false verified:false (and the incident is still reported)', async () => {
+  const h = harness({ ...RECOVER_EV, events: true, rollback: [{ ok: false, code: 1, tail: 'boom' }] });
+  const r = await h.go();
+  assert.equal(r.outcome, 'rollback-failed');
+  assert.deepEqual(h.posted.map((e) => e.kind), ['rollback-intent', 'rollback-result', 'recovery-reported']);
+  assert.deepEqual(h.posted[1].data, { mergeSha: SHA, ok: false, liveAfter: null, verified: false });
+});
+
+test('events: a rollback that ran but production still fails the smoke is ok:true verified:false', async () => {
+  const h = harness({ smoke: [FAIL, FAIL, FAIL, FAIL], inspect: [OURS, OURS, OURS, OLDER], events: true });
+  const r = await h.go();
+  assert.equal(r.outcome, 'rollback-failed');
+  assert.deepEqual(h.posted[1].data, { mergeSha: SHA, ok: true, liveAfter: { id: 'dpl_old', url: 'old-xyz-team.vercel.app' }, verified: false });
+});
+
+test('events: an unexpected error AFTER the rollback ran still writes a rollback-result (never an intent left open)', async () => {
+  // the pause before the post-rollback smoke retry is the 2nd sleep; it blows up
+  const h = harness({
+    smoke: [FAIL, FAIL, FAIL], inspect: [OURS, OURS, OURS, OLDER], events: true,
+    sleep: (ms, n) => { if (n === 2) throw new Error('clock exploded'); },
+  });
+  const r = await h.go();
+  assert.equal(r.outcome, 'rollback-failed');
+  assert.match(r.reason, /clock exploded/);
+  assert.equal(h.rollbackFn.calls.length, 1);
+  assert.deepEqual(h.posted.map((e) => e.kind), ['rollback-intent', 'rollback-result', 'recovery-reported']);
+  assert.equal(h.posted[1].data.ok, true);
+  assert.equal(h.posted[1].data.verified, false);
+});
+
+test('events: a result that cannot even be built is a warning, not a crash', async () => {
+  const exploding = { id: 'dpl_old', get url() { throw new Error('inspect reply was not an object'); } };
+  const h = harness({ smoke: [FAIL, FAIL], inspect: [OURS, OURS, OURS, exploding], events: true });
+  const r = await h.go();
+  assert.equal(r.outcome, 'rollback-failed');
+  assert.ok(r.warnings.some((w) => /rollback-result event/.test(w)));
+});
+
+test('events: nothing is posted when there is nothing to roll back (merged, deploy-failed, superseded, changed-during-recovery, no known-good)', async () => {
+  const cases = [
+    harness({ smoke: [PASS], inspect: [OURS], events: true }),
+    harness({ findDeployment: [{ state: 'failure', id: 9, url: 'https://x.vercel.app' }], events: true }),
+    harness({ smoke: [FAIL, FAIL, PASS], inspect: [NEWER], events: true }),
+    harness({ smoke: [FAIL, FAIL], inspect: [OURS, NEWER], events: true }),
+    harness({ smoke: [FAIL, FAIL], inspect: [OURS], readKnownGood: () => ({ ok: false, reason: 'none' }), events: true }),
+  ];
+  for (const h of cases) {
+    await h.go();
+    assert.deepEqual(h.posted, []);
+  }
+});
+
+// ---- inFlight in the run record
+
+test('record: inFlight is set before the first look and cleared after the last, on every outcome', async () => {
+  const outcomes = [
+    [harness({ smoke: [PASS], inspect: [OURS], record: true }), 'merged'],
+    [harness({ findDeployment: [{ state: 'failure', id: 9 }], record: true }), 'deploy-failed'],
+    [harness({ findDeployment: [{ state: 'timeout' }], record: true }), 'deploy-not-observed'],
+    [harness({ ...RECOVER, record: true }), 'recovered'],
+    [harness({ smoke: [FAIL, FAIL], inspect: [OURS], readKnownGood: () => ({ ok: false, reason: 'none' }), record: true }), 'rollback-skipped'],
+  ];
+  for (const [h, expected] of outcomes) {
+    const r = await h.go({ host: 'pc-1' });
+    assert.equal(r.outcome, expected);
+    assert.equal(h.log[0], 'record:set', expected);
+    assert.equal(h.log.at(-1), 'record:clear', expected);
+    assert.deepEqual(h.recordCalls[0], ['set', { kind: 'prod-watch', host: 'pc-1', startedAt: new Date(T + 5000).toISOString(), maxMinutes: 50 }]);
+    assert.deepEqual(h.recordCalls[1], ['clear']);
+    assert.equal(h.recordCalls.length, 2);
+  }
+});
+
+test('record: observe-only records its own outcome (after clearing inFlight); a normal run never does; deploy-not-observed stays open', async () => {
+  const observed = harness({ ...RECOVER, record: true });
+  const r = await observed.go({ observeOnly: true, host: 'pc-1' });
+  assert.equal(r.outcome, 'needs-owner');
+  assert.deepEqual(observed.log.filter((x) => x.startsWith('record:')), ['record:set', 'record:clear', 'record:finish']);
+  assert.deepEqual(observed.recordCalls.at(-1), ['finish', 'needs-owner', r.reason]);
+
+  const healthy = harness({ smoke: [PASS], inspect: [OURS], record: true });
+  assert.equal((await healthy.go({ observeOnly: true })).outcome, 'merged');
+  assert.deepEqual(healthy.recordCalls.at(-1), ['finish', 'merged', '']);
+
+  const normal = harness({ smoke: [PASS], inspect: [OURS], record: true });
+  await normal.go();
+  assert.ok(!normal.log.includes('record:finish'), 'a normal run is recorded by `P summary`, not by prod-watch');
+
+  const unseen = harness({ findDeployment: [{ state: 'timeout' }], record: true });
+  assert.equal((await unseen.go({ observeOnly: true })).outcome, 'deploy-not-observed');
+  assert.ok(!unseen.log.includes('record:finish'));
+
+  const failing = harness({ smoke: [PASS], inspect: [OURS], record: true, recordFail: 'finish' });
+  const out = await failing.go({ observeOnly: true });
+  assert.equal(out.outcome, 'merged');
+  assert.match(out.warnings[0], /record the observed outcome.*503/);
+});
+
+test('createRunRecordTracker.finish: ends a stranded record with the outcome, keeps the sections, never overwrites an existing outcome, and resume then routes ended', () => {
+  const gh = fakeSummaryGh();
+  writeSummaryComment(gh, 12, { record: { ...emptyRecord({ repo: 'acme/widgets', pr: 12, branch: 'agent/x', baseRef: 'main' }), step: 'prod-watch' }, sections: '## Summary\nDid the thing.' });
+  const tracker = createRunRecordTracker({ gh, pr: 12, host: 'pc-1', now: () => T });
+  tracker.set({ kind: 'prod-watch', host: 'pc-1', startedAt: 'now', maxMinutes: 50 });
+  tracker.clear();
+  assert.equal(tracker.finish('needs-owner', 'smoke fails'), true);
+  const rec = decodeRecord(gh.body()).record;
+  assert.deepEqual([rec.step, rec.outcome, rec.inFlight, rec.detail], ['ended', 'needs-owner', null, 'smoke fails']);
+  assert.match(gh.body(), /Did the thing\./);
+  const facts = { state: 'MERGED', isCrossRepository: false, labels: [], liveHead: 'a'.repeat(40), autoMergeArmed: false, host: 'pc-1', recordStatus: 'ok', record: rec, triage: null, contentHash: null, needsHumanReason: null, events: [], local: null };
+  assert.equal(planResume(facts, { now: T }).enter, 'ended');
+  // a second observation does not rewrite what is already recorded
+  const before = gh.body();
+  assert.equal(tracker.finish('merged'), false);
+  assert.equal(gh.body(), before);
+});
+
+test('createRunRecordTracker.finish: a prod-unknown record (the original watch never learned the result) is finished by the observation', () => {
+  const gh = fakeSummaryGh();
+  writeSummaryComment(gh, 12, { record: { ...emptyRecord({ repo: 'acme/widgets', pr: 12, branch: 'agent/x', baseRef: 'main' }), step: 'prod-watch', outcome: 'prod-unknown' }, sections: '## Summary' });
+  const tracker = createRunRecordTracker({ gh, pr: 12, host: 'pc-1', now: () => T });
+  assert.equal(tracker.finish('merged'), true);
+  const rec = decodeRecord(gh.body()).record;
+  assert.deepEqual([rec.step, rec.outcome], ['ended', 'merged']);
+});
+
+test('record: inFlight is cleared even when the watch throws', async () => {
+  const h = harness({ findDeployment: [new Error('github exploded')], record: true });
+  await assert.rejects(h.go(), /github exploded/);
+  assert.deepEqual(h.log.filter((x) => x.startsWith('record:')), ['record:set', 'record:clear']);
+  const lockLost = Object.assign(new Error('boom'), { name: 'SomethingElse' });
+  const h2 = harness({ smoke: [FAIL, FAIL], record: true, lock: async () => { throw lockLost; } });
+  await assert.rejects(h2.go(), /boom/);
+  assert.equal(h2.log.at(-1), 'record:clear');
+});
+
+test('record: a record that cannot be written is a warning in the JSON and never fails the watch', async () => {
+  for (const which of ['set', 'clear']) {
+    const h = harness({ smoke: [PASS], inspect: [OURS], record: true, recordFail: which });
+    const r = await h.go();
+    assert.equal(r.outcome, 'merged');
+    assert.equal(r.ok, true);
+    assert.equal(r.warnings.length, 1);
+    assert.match(r.warnings[0], /^run record: could not /);
+    assert.equal(h.log.at(-1), 'record:clear', 'clear is attempted even after set failed');
+  }
+});
+
+// ---- --observe-only
+
+// Every external effect that is not a read must stay at zero in observe-only.
+function assertReadOnly(h, r) {
+  assert.equal(h.rollbackFn.calls.length, 0, 'rollback');
+  assert.equal(h.issueCreate.calls.length, 0, 'issue');
+  assert.equal(h.prCreate.calls.length, 0, 'revert PR');
+  assert.equal(h.revertBranch.calls.length, 0, 'revert branch');
+  assert.equal(h.issueComment.calls.length, 0, 'issue comment');
+  assert.deepEqual(h.posted, [], 'events');
+  assert.deepEqual(h.locks, [], 'observe-only needs no recovery lock');
+  assert.equal(r.issue, null);
+  assert.equal(r.revertPr, null);
+  assert.equal(r.observeOnly, true);
+}
+
+test('observe-only: a failing smoke on our live deployment is needs-owner with the evidence, and NOTHING is changed', async () => {
+  const h = harness({ ...RECOVER_EV, events: true });
+  const r = await h.go({ observeOnly: true });
+  assert.equal(r.outcome, 'needs-owner');
+  assert.equal(r.ok, false);
+  assert.equal(exitCodeFor(r.outcome), 1);
+  assertReadOnly(h, r);
+  assert.equal(r.evidence.underlying, null);
+  assert.equal(r.evidence.liveDeployment.id, 'dpl_ours');
+  assert.equal(r.evidence.failingDeployment.url, 'https://ours-abc-team.vercel.app');
+  assert.deepEqual(r.evidence.knownGood, { id: 'dpl_old', sha: OLD_SHA, url: 'https://old-xyz-team.vercel.app' });
+  assert.match(r.evidence.smokeFailure.tail, /500/);
+  assert.match(r.reason, /would be rolled back to https:\/\/old-xyz-team\.vercel\.app/);
+});
+
+test('observe-only: every outcome that wanted a rollback or an urgent issue becomes needs-owner, none of them writes anything', async () => {
+  const cfgOther = config();
+  cfgOther.production.provider = 'other';
+  const cases = {
+    'rollback-skipped (no known-good)': harness({ smoke: [FAIL, FAIL], inspect: [OURS], readKnownGood: () => ({ ok: false, reason: 'none' }), events: true }),
+    'rollback-skipped (known-good is the failing deployment)': harness({ smoke: [FAIL, FAIL], inspect: [OURS], readKnownGood: () => ({ ok: true, id: 'x', url: 'https://ours-abc-team.vercel.app', sha: null }), events: true }),
+    'rollback-skipped (live deployment unreadable)': harness({ smoke: [FAIL, FAIL], inspect: [new Error('vercel down')], events: true }),
+    'rollback-skipped (unexpected error)': harness({ smoke: [FAIL, FAIL], inspect: [OURS], readKnownGood: () => { throw new Error('disk on fire'); }, events: true }),
+    'rollback-skipped (provider other)': harness({ config: cfgOther, smoke: [FAIL, FAIL], events: true }),
+    'changed-during-recovery': harness({ smoke: [FAIL, FAIL], inspect: [OURS, NEWER], events: true }),
+    'a different failing deployment is live': harness({ smoke: [FAIL, FAIL, FAIL], inspect: [NEWER, NEWER], events: true }),
+    'lock unavailable': harness({ smoke: [FAIL, FAIL], inspect: [OURS], events: true, lock: async () => { throw Object.assign(new Error('held'), { name: 'LockTimeoutError' }); } }),
+  };
+  for (const [name, h] of Object.entries(cases)) {
+    const r = await h.go({ observeOnly: true });
+    assert.equal(r.outcome, 'needs-owner', name);
+    assertReadOnly(h, r);
+    assert.ok(r.reason, name);
+    // the outcome a normal watch would have ended with is kept for the reader
+    if (name === 'changed-during-recovery') assert.equal(r.evidence.underlying, 'changed-during-recovery');
+    if (name.startsWith('rollback-skipped')) assert.equal(r.evidence.underlying, 'rollback-skipped', name);
+  }
+});
+
+test('observe-only: outcomes that never asked for an issue-and-rollback keep their name, and still open nothing', async () => {
+  const cases = {
+    merged: harness({ smoke: [PASS], inspect: [OURS], events: true }),
+    'deploy-failed': harness({ findDeployment: [{ state: 'failure', id: 9, url: 'https://x.vercel.app' }], events: true }),
+    'deploy-not-observed': harness({ findDeployment: [{ state: 'timeout' }], events: true }),
+    'not-live': harness({ smoke: [PASS], inspect: [OLDER], events: true }),
+    superseded: harness({ smoke: [FAIL, FAIL, PASS], inspect: [NEWER], events: true }),
+  };
+  for (const [name, h] of Object.entries(cases)) {
+    const r = await h.go({ observeOnly: true });
+    assert.equal(r.outcome, name);
+    assertReadOnly(h, r);
+  }
+});
+
+test('observe-only: the same smokes run as in a normal watch (retry included)', async () => {
+  const normal = harness({ ...RECOVER });
+  await normal.go();
+  const observed = harness({ ...RECOVER });
+  await observed.go({ observeOnly: true });
+  // normal: initial, retry, post-rollback; observe-only never reaches the post-rollback smoke
+  assert.equal(normal.smoke.calls.length, 3);
+  assert.equal(observed.smoke.calls.length, 2);
+  assert.deepEqual(observed.smoke.calls[0], normal.smoke.calls[0]);
+  assert.deepEqual(observed.sleeps, [60_000]);
+});
+
+test('observe-only: no issue labels, pause or otherwise, on any path', async () => {
+  const h = harness({ smoke: [FAIL, FAIL], inspect: [OURS], readKnownGood: () => ({ ok: false, reason: 'none' }) });
+  const r = await h.go({ observeOnly: true });
+  assert.equal(r.outcome, 'needs-owner');
+  assert.equal(h.issueCreate.calls.length, 0);
+});
+
+test('observe-only: reports an interrupted rollback (intent with no result) with the live deployment', async () => {
+  const intent = eventOf('rollback-intent', 'aaaaaaa-1', { mergeSha: SHA, target: { id: 'dpl_old', url: 'https://old-xyz-team.vercel.app' } });
+  const h = harness({ smoke: [PASS], inspect: [OLDER], events: true, eventList: [PROD_BEFORE, intent] });
+  const r = await h.go({ observeOnly: true });
+  assertReadOnly(h, r);
+  assert.equal(r.rollbackInterrupted.intent.id, 'aaaaaaa-1');
+  assert.equal(r.rollbackInterrupted.intent.url, intent.url);
+  assert.equal(r.rollbackInterrupted.intent.mergeSha, SHA);
+  assert.deepEqual(r.rollbackInterrupted.intent.target, { id: 'dpl_old', url: 'https://old-xyz-team.vercel.app' });
+  assert.deepEqual(r.rollbackInterrupted.liveNow, { id: 'dpl_old', url: 'old-xyz-team.vercel.app' });
+});
+
+test('observe-only: an intent with a matching result, or an intent for another merge, is not an interruption', async () => {
+  const intent = eventOf('rollback-intent', 'aaaaaaa-1', { mergeSha: SHA });
+  const result = eventOf('rollback-result', 'aaaaaaa-1', { mergeSha: SHA, ok: true, verified: true });
+  const other = eventOf('rollback-intent', 'ccccccc-1', { mergeSha: 'c'.repeat(40) });
+  const done = harness({ smoke: [PASS], inspect: [OURS], events: true, eventList: [intent, result, other] });
+  assert.equal((await done.go({ observeOnly: true })).rollbackInterrupted, undefined);
+  // a second attempt whose result is missing is still found, even though attempt 1 finished
+  const second = eventOf('rollback-intent', 'aaaaaaa-2', { mergeSha: SHA });
+  const open = harness({ smoke: [PASS], inspect: [OURS], events: true, eventList: [intent, result, second] });
+  assert.equal((await open.go({ observeOnly: true })).rollbackInterrupted.intent.id, 'aaaaaaa-2');
+});
+
+test('observe-only: an interrupted rollback is reported on every outcome, and an unreadable event list is only a warning', async () => {
+  const intent = eventOf('rollback-intent', 'aaaaaaa-1', { mergeSha: SHA });
+  const failing = harness({ ...RECOVER_EV, events: true, eventList: [intent] });
+  const r = await failing.go({ observeOnly: true });
+  assert.equal(r.outcome, 'needs-owner');
+  assert.equal(r.rollbackInterrupted.intent.id, 'aaaaaaa-1');
+
+  const unreadable = harness({ smoke: [PASS], inspect: [OURS], events: true, eventListError: true });
+  const out = await unreadable.go({ observeOnly: true });
+  assert.equal(out.outcome, 'merged');
+  assert.match(out.warnings[0], /interrupted rollback: gh api: 500/);
+});
+
+// ---- a rollback that already completed (the original watch died before `P summary`)
+
+const doneRollback = (over = {}, recovered = true) => [
+  eventOf('rollback-intent', 'aaaaaaa-1', { mergeSha: SHA }),
+  eventOf('rollback-result', 'aaaaaaa-1', { mergeSha: SHA, ok: true, verified: true, ...over }),
+  ...(recovered ? [eventOf('recovery-reported', 'aaaaaaa-1', { mergeSha: SHA, issueUrl: 'https://github.com/acme/widgets/issues/50', revertPrUrl: 'https://github.com/acme/widgets/pull/51' })] : []),
+];
+
+test('observe-only: a COMPLETED rollback is reported as recovered without re-smoking, with the issue and revert PR, and the record closes that way', async () => {
+  const h = harness({ smoke: [FAIL], inspect: [OLDER], events: true, record: true, eventList: [PROD_BEFORE, ...doneRollback()] });
+  const r = await h.go({ observeOnly: true, host: 'pc-2' });
+  assert.equal(r.outcome, 'recovered');
+  assert.equal(r.observeOnly, true);
+  // events written before the numbers were recorded carry only the urls: the numbers are read back from them
+  assert.deepEqual(r.issue, { url: 'https://github.com/acme/widgets/issues/50', number: 50 });
+  assert.deepEqual(r.revertPr, { url: 'https://github.com/acme/widgets/pull/51', number: 51 });
+  assert.equal(r.recorded.id, 'aaaaaaa-1');
+  assert.equal(h.smoke.calls.length, 0, 'no smoke: the recorded outcome is the truth');
+  assert.equal(h.findDeployment.calls.length, 0);
+  // read-only (the issue / revert PR in the JSON are the ones the ORIGINAL run recorded, not new ones)
+  assert.deepEqual([h.rollbackFn.calls.length, h.issueCreate.calls.length, h.prCreate.calls.length, h.revertBranch.calls.length, h.posted.length, h.locks.length], [0, 0, 0, 0, 0, 0]);
+  assert.equal(r.rollbackInterrupted, undefined);
+  assert.deepEqual(h.recordCalls.at(-1)?.slice(0, 2), ['finish', 'recovered']);
+});
+
+test('observe-only: a replayed recovery keeps the issue and revert PR numbers, so the owner push names them (recorded numbers win over the url)', async () => {
+  const withNumbers = [
+    ...doneRollback({}, false),
+    eventOf('recovery-reported', 'aaaaaaa-1', { mergeSha: SHA, issueUrl: 'https://github.com/acme/widgets/issues/50', revertPrUrl: 'https://github.com/acme/widgets/pull/51', issueNumber: 60, revertPrNumber: 61 }),
+  ];
+  for (const [eventList, issueN, prN] of [[doneRollback(), 50, 51], [withNumbers, 60, 61]]) {
+    const h = harness({ smoke: [FAIL], inspect: [OLDER], events: true, eventList: [PROD_BEFORE, ...eventList] });
+    const r = await h.go({ observeOnly: true });
+    assert.equal(r.outcome, 'recovered');
+    const push = prodEvent(r, { pr: 7 });
+    assert.match(push.action, new RegExp(`Review revert PR #${prN}; close issue #${issueN} to unpause merges\\.`));
+    assert.doesNotMatch(push.action, /could not be (opened|confirmed)/);
+    assert.equal(push.issueNumber, issueN);
+  }
+  // an unparseable url stays url-only (the push then says it could not confirm the issue, never a wrong number)
+  const odd = [...doneRollback({}, false), eventOf('recovery-reported', 'aaaaaaa-1', { mergeSha: SHA, issueUrl: 'https://example.test/x', revertPrUrl: null })];
+  const h = harness({ smoke: [FAIL], inspect: [OLDER], events: true, eventList: [PROD_BEFORE, ...odd] });
+  const r = await h.go({ observeOnly: true });
+  assert.deepEqual([r.issue, r.revertPr], [{ url: 'https://example.test/x' }, null]);
+});
+
+test('observe-only: a completed rollback that failed or was not verified is rollback-failed', async () => {
+  for (const over of [{ ok: false, verified: false }, { ok: true, verified: false }]) {
+    const h = harness({ smoke: [PASS], inspect: [OURS], events: true, record: true, eventList: doneRollback(over, false) });
+    const r = await h.go({ observeOnly: true });
+    assert.equal(r.outcome, 'rollback-failed', JSON.stringify(over));
+    assert.equal(h.smoke.calls.length, 0);
+    assert.equal(r.issue, null, 'no recovery-reported event, so no issue to surface');
+    assert.deepEqual(h.recordCalls.at(-1)?.slice(0, 2), ['finish', 'rollback-failed']);
+  }
+});
+
+test('observe-only: with no completed attempt on the PR (none, an aborted one, another merge\'s, an unreadable list) it re-derives from scratch', async () => {
+  const aborted = [eventOf('rollback-intent', 'aaaaaaa-1', { mergeSha: SHA }), eventOf('rollback-result', 'aaaaaaa-1', { mergeSha: SHA, ok: false, aborted: true, verified: false })];
+  const foreign = [eventOf('rollback-intent', 'ccccccc-1', { mergeSha: 'c'.repeat(40) }), eventOf('rollback-result', 'ccccccc-1', { mergeSha: 'c'.repeat(40), ok: true, verified: true })];
+  for (const eventList of [[], aborted, foreign]) {
+    const h = harness({ smoke: [PASS], inspect: [OURS], events: true, eventList });
+    assert.equal((await h.go({ observeOnly: true })).outcome, 'merged');
+    assert.ok(h.smoke.calls.length >= 1);
+  }
+  const unreadable = harness({ smoke: [PASS], inspect: [OURS], events: true, eventListError: true });
+  assert.equal((await unreadable.go({ observeOnly: true })).outcome, 'merged');
+});
+
+test('a normal (not observe-only) watch never short-circuits on old rollback events', async () => {
+  const h = harness({ smoke: [PASS], inspect: [OURS], events: true, eventList: doneRollback() });
+  assert.equal((await h.go()).outcome, 'merged');
+});
+
+test('knownGoodFromEvents: the NEWEST prod-before for the environment; unreadable or foreign ones are skipped', () => {
+  const older = eventOf('prod-before', '11-1', { environment: 'Production', deployment: { id: 'dpl_older', url: 'https://older.vercel.app' } });
+  const staging = eventOf('prod-before', '13-1', { environment: 'Preview', deployment: { id: 'dpl_stg', url: 'https://stg.vercel.app' } });
+  assert.deepEqual(knownGoodFromEvents([older, PROD_BEFORE, staging], 'Production'), { ok: true, id: 'dpl_old', url: 'https://old-xyz-team.vercel.app', sha: OLD_SHA });
+  const garbled = { ...PROD_BEFORE, dataStatus: 'invalid', data: null };
+  assert.equal(knownGoodFromEvents([older, garbled], 'Production').id, 'dpl_older');
+  assert.equal(knownGoodFromEvents([], 'Production').ok, false);
+  assert.match(knownGoodFromEvents([], 'Production').reason, /prod-before/);
+  const nothing = eventOf('prod-before', '14-1', { environment: 'Production', deployment: {} });
+  assert.match(knownGoodFromEvents([nothing], 'Production').reason, /neither a url nor an id/);
+  const unsafe = eventOf('prod-before', '15-1', { environment: 'Production', deployment: { url: '--yes' } });
+  assert.match(knownGoodFromEvents([unsafe], 'Production').reason, /unusable rollback target/);
+});
+
+test('createRunRecordTracker: sets then clears inFlight on the existing record, keeping the summary sections', () => {
+  const gh = fakeSummaryGh();
+  const first = emptyRecord({ repo: 'acme/widgets', pr: 12, branch: 'agent/x', baseRef: 'main' });
+  writeSummaryComment(gh, 12, { record: first, sections: '## Summary\nDid the thing.' });
+  const tracker = createRunRecordTracker({ gh, pr: 12, host: 'pc-1', now: () => T });
+  tracker.set({ kind: 'prod-watch', host: 'pc-1', startedAt: 'now', maxMinutes: 50 });
+  let rec = decodeRecord(gh.body()).record;
+  assert.equal(rec.step, 'prod-watch');
+  assert.equal(rec.inFlight.kind, 'prod-watch');
+  assert.equal(rec.inFlight.maxMinutes, 50);
+  assert.match(gh.body(), /Did the thing\./);
+  tracker.clear();
+  rec = decodeRecord(gh.body()).record;
+  assert.equal(rec.inFlight, null);
+  assert.equal(rec.step, 'prod-watch');
+  assert.equal(gh.writes(), 3);
+});
+
+test('createRunRecordTracker: a record for another PR, or an unreadable one, is left alone (it throws; the watch warns)', () => {
+  const foreign = fakeSummaryGh();
+  writeSummaryComment(foreign, 12, { record: emptyRecord({ repo: 'acme/other', pr: 12, branch: 'b', baseRef: 'main' }) });
+  const before = foreign.body();
+  assert.throws(() => createRunRecordTracker({ gh: foreign, pr: 12, host: 'h' }).set({ kind: 'prod-watch' }), /does not belong to this PR/);
+  assert.equal(foreign.body(), before);
+
+  const broken = fakeSummaryGh('<!-- claude-pipeline:summary -->\n\n<!-- claude-pipeline:record:AAAA -->');
+  assert.throws(() => createRunRecordTracker({ gh: broken, pr: 12, host: 'h' }).set({ kind: 'prod-watch' }), /left alone/);
+});
+
+test('createRunRecordTracker: with no summary comment yet a new record is made from the PR', () => {
+  const gh = fakeSummaryGh();
+  createRunRecordTracker({ gh, pr: 12, host: 'pc-1', now: () => T }).set({ kind: 'prod-watch', host: 'pc-1', startedAt: 'now', maxMinutes: 50 });
+  const rec = decodeRecord(gh.body()).record;
+  assert.equal(rec.branch, 'agent/x');
+  assert.equal(rec.baseRef, 'main');
+  assert.equal(rec.repo, 'acme/widgets');
+  assert.equal(rec.inFlight.kind, 'prod-watch');
+});
+
 // ---- the command end to end (fake gh + fake vercel + real git) ------------------------------------------------------
 
 const NEW_HOST = 'app-new-team.vercel.app';
@@ -898,8 +1450,18 @@ test('CLI merged: fake gh + fake vercel, healthy production serving our deployme
   assert.ok(!w.gh.lines().some((l) => /issues|pr create/.test(l)));
 });
 
+// A rollback with --pr reads the attempts already on the PR first (an unreadable list refuses the rollback): give the fake gh a
+// viewer and an empty comment list, in front of the world's own script.
+const withEmptyPrComments = (w, front = []) => w.gh.setScript([
+  ...front,
+  { match: '^api user', stdout: 'bot\n' },
+  { match: '^api repos/acme/widgets/issues/12/comments --paginate', stdoutJson: [] },
+  ...JSON.parse(readFileSync(w.gh.env.PIPELINE_FAKE_GH_SCRIPT, 'utf8')),
+]);
+
 test('CLI recovered: real rollback via fake vercel, revert pushed to the bare origin, issue + PR created through fake gh', () => {
   const w = cliWorld({ healthy: [OLD_HOST] });
+  withEmptyPrComments(w);
   const r = w.cli(['--sha', w.merge, '--pr', '12', '--retry-wait', '0']);
   assert.equal(r.code, 1, r.stderr);
   assert.equal(r.json.outcome, 'recovered');
@@ -953,6 +1515,56 @@ test('CLI: no production configured is exit 0 {outcome: no-production}', () => {
   const r = w.cli(['--sha', w.merge]);
   assert.equal(r.code, 0);
   assert.equal(r.json.outcome, 'no-production');
+});
+
+// A summary comment on PR 12 whose record stopped at step prod-watch with no outcome, as `merge` leaves it.
+function noProductionWorld({ patchFails = false } = {}) {
+  const w = cliWorld({ healthy: [] });
+  w.repo.write('.claude/pipeline.yml', 'version: 1\nproject: demo\nverify:\n  full: a\n  quick: b\n');
+  const seed = fakeSummaryGh();
+  writeSummaryComment(seed, 12, { record: { ...emptyRecord({ repo: 'acme/widgets', pr: 12, branch: 'agent/x', baseRef: 'main' }), step: 'prod-watch' }, sections: '## Summary\nDid the thing.' });
+  w.gh.setScript([
+    { match: '^repo view', stdoutJson: REPO_VIEW },
+    { match: '^api user', stdout: 'bot\n' },
+    { match: '^api repos/acme/widgets/issues/12/comments --paginate', stdoutJson: [{ id: 1, user: { login: 'bot' }, body: seed.body() }] },
+    patchFails
+      ? { match: '^api -X PATCH repos/acme/widgets/issues/comments/1', stderr: 'HTTP 500', code: 1 }
+      : { match: '^api -X PATCH repos/acme/widgets/issues/comments/1', stdoutJson: { id: 1, html_url: 'https://github.com/acme/widgets/pull/12#issuecomment-1' } },
+  ]);
+  const patched = () => w.gh.calls().filter((c) => c.argv.join(' ').startsWith('api -X PATCH'));
+  return { ...w, patched };
+}
+
+test('CLI --observe-only --pr with no production configured: closes the stranded run record (step ended, outcome no-production)', () => {
+  const w = noProductionWorld();
+  const r = w.cli(['--sha', w.merge, '--pr', '12', '--observe-only']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.json.outcome, 'no-production');
+  assert.equal(r.json.warnings, undefined);
+  const writes = w.patched();
+  assert.equal(writes.length, 1, 'one record write, no in-flight marker');
+  const rec = decodeRecord(JSON.parse(writes[0].stdin).body).record;
+  assert.equal(rec.step, 'ended');
+  assert.equal(rec.outcome, 'no-production');
+  assert.equal(rec.inFlight, null);
+  assert.match(JSON.parse(writes[0].stdin).body, /Did the thing\./, 'summary sections are kept');
+});
+
+test('CLI --observe-only --pr with no production configured: a failed record write is a warning, the exit is unchanged', () => {
+  const w = noProductionWorld({ patchFails: true });
+  const r = w.cli(['--sha', w.merge, '--pr', '12', '--observe-only']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.json.outcome, 'no-production');
+  assert.equal(r.json.warnings.length, 1);
+  assert.match(r.json.warnings[0], /run record: could not record the observed outcome/);
+});
+
+test('CLI with no production configured and no --observe-only: the run record is not touched (the caller records the outcome)', () => {
+  const w = noProductionWorld();
+  const r = w.cli(['--sha', w.merge, '--pr', '12']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.json.outcome, 'no-production');
+  assert.equal(w.patched().length, 0);
 });
 
 test('CLI usage errors exit 2: missing/short sha, bad --pr, unknown flag, stray argument', () => {
@@ -1015,6 +1627,77 @@ test('CLI with only --pr: a PR that is not MERGED is exit 1 not-merged; a merge 
   assert.ok(!w.vercel.calls().some((c) => c[0] === 'rollback'));
 });
 
+// ---- the command: run events and --observe-only end to end ---------------------------------------------------------------
+
+const postedBodies = (w) => w.gh.calls()
+  .filter((c) => /^api -X POST repos\/acme\/widgets\/issues\/12\/comments/.test(c.argv.join(' ')))
+  .map((c) => JSON.parse(c.stdin).body);
+
+test('CLI recovered with --pr: rollback-intent, rollback-result and recovery-reported land on the PR as separate new comments, intent first', () => {
+  const w = cliWorld({ healthy: [OLD_HOST] });
+  withEmptyPrComments(w, [{ match: '^pr view 12 --json headRefName', code: 1, stderr: 'gh: Server Error (HTTP 500)' }]);
+  const r = w.cli(['--sha', w.merge, '--pr', '12', '--retry-wait', '0']);
+  assert.equal(r.json.outcome, 'recovered', r.stderr);
+  const events = postedBodies(w).map((b) => parseEvent(b)).filter(Boolean);
+  assert.deepEqual(events.map((e) => e.kind), ['rollback-intent', 'rollback-result', 'recovery-reported']);
+  assert.ok(events.every((e) => e.id === `${w.merge.slice(0, 7)}-1` && e.dataStatus === 'ok'));
+  assert.equal(events[0].data.target.url, `https://${OLD_HOST}`);
+  assert.equal(events[1].data.verified, true);
+  assert.equal(events[2].data.issueUrl, 'https://github.com/acme/widgets/issues/77');
+  assert.ok(!w.gh.lines().some((l) => /-X PATCH/.test(l)), 'events are never edited');
+  // The fake gh cannot answer the PR view the run record needs, so the record could not be written: that is a warning, not a failure.
+  assert.ok(r.json.warnings.some((x) => /run record/.test(x)));
+});
+
+test('CLI recovered with --sha only (no PR): no events, the rollback still happens', () => {
+  const w = cliWorld({ healthy: [OLD_HOST] });
+  const r = w.cli(['--sha', w.merge, '--retry-wait', '0']);
+  assert.equal(r.json.outcome, 'recovered', r.stderr);
+  assert.deepEqual(postedBodies(w).map((b) => parseEvent(b)).filter(Boolean), []);
+});
+
+test('CLI --observe-only: failing smoke, no .review/prod-before.json; the target comes from the PR prod-before event, nothing is changed, and an unfinished rollback is reported', () => {
+  const w = cliWorld({ healthy: [] });
+  rmSync(join(w.repo.dir, '.review', 'prod-before.json'));
+  const beforeBody = renderEvent('prod-before', '12-1', 'Production before merge.', {
+    environment: 'Production', pr: 12, deployment: { id: 'dpl_old', sha: OLD_SHA, url: `https://${OLD_HOST}` },
+  });
+  const intentBody = renderEvent('rollback-intent', `${w.merge.slice(0, 7)}-1`, 'Rolling back.', { mergeSha: w.merge, target: { id: 'dpl_old', url: `https://${OLD_HOST}` } });
+  const comments = [
+    { id: 1, user: { login: 'bot' }, html_url: 'https://github.com/acme/widgets/pull/12#issuecomment-1', body: beforeBody },
+    { id: 2, user: { login: 'bot' }, html_url: 'https://github.com/acme/widgets/pull/12#issuecomment-2', body: intentBody },
+  ];
+  w.gh.setScript([
+    { match: '^api user', stdout: 'bot\n' },
+    { match: '^api repos/acme/widgets/issues/12/comments --paginate', stdoutJson: comments },
+    { match: '^pr view 12 --json headRefName', stdoutJson: { headRefName: 'agent/x', baseRefName: 'main' } },
+    ...JSON.parse(readFileSync(w.gh.env.PIPELINE_FAKE_GH_SCRIPT, 'utf8')),
+  ]);
+  const r = w.cli(['--pr', '12', '--sha', w.merge, '--retry-wait', '0', '--observe-only']);
+  assert.equal(r.code, 1, r.stderr);
+  assert.equal(r.json.outcome, 'needs-owner');
+  assert.equal(r.json.observeOnly, true);
+  assert.equal(r.json.evidence.knownGood.url, `https://${OLD_HOST}`);
+  assert.equal(r.json.rollbackInterrupted.intent.id, `${w.merge.slice(0, 7)}-1`);
+  assert.equal(r.json.rollbackInterrupted.liveNow.id, 'dpl_new');
+
+  assert.ok(!w.vercel.calls().some((c) => c[0] === 'rollback'), 'no rollback');
+  assert.equal(w.vercel.state().alias.id, 'dpl_new');
+  const lines = w.gh.lines();
+  assert.ok(!lines.some((l) => /pr create|add-label|remove-label|pr edit/.test(l)), 'no revert PR, no labels');
+  assert.ok(!lines.some((l) => /^api -X POST repos\/acme\/widgets\/issues( |$)/.test(l)), 'no incident issue');
+  assert.deepEqual(postedBodies(w).map((b) => parseEvent(b)).filter(Boolean), [], 'observe-only writes no events');
+  assert.ok(!existsSync(join(w.repo.dir, '.worktrees', 'revert-12')));
+});
+
+test('CLI --observe-only: a healthy production is merged (exit 0), the flag is a boolean', () => {
+  const w = cliWorld({ healthy: [NEW_HOST] });
+  const r = w.cli(['--sha', w.merge, '--retry-wait', '0', '--observe-only']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.json.outcome, 'merged');
+  assert.equal(r.json.observeOnly, true);
+});
+
 // ---- the owner push, end to end through the command (fake gh + fake vercel + fake push transports) --------------------
 
 test('push: merged is a quiet priority-3 "nothing to do" with the PR title', async () => {
@@ -1033,6 +1716,7 @@ test('push: merged is a quiet priority-3 "nothing to do" with the PR title', asy
 
 test('push: recovered names the revert PR and the issue to close, and clicks through to the rollback issue', async () => {
   const w = cliWorld({ healthy: [OLD_HOST] });
+  withEmptyPrComments(w); // with --pr the rollback-intent event must be posted first, or nothing is rolled back
   const t = await w.inproc(['--sha', w.merge, '--pr', '12', '--retry-wait', '0']);
   assert.equal(t.error, undefined);
   assert.equal(t.res.exitCode, 1, 'exit code unchanged');

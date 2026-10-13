@@ -1,12 +1,16 @@
 // `pipeline comment`: renders one of the pipeline's PR comments (render.mjs) and upserts it, so a PR
 // carries ONE comment per kind that is edited in place rather than a new one per round.
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { hostname } from 'node:os';
 import { resolve, join } from 'node:path';
 import { EXIT, UsageError, parseCommandArgs, intOption, requireOption } from '../lib/cli.mjs';
 import { loadConfig, DEFAULTS } from '../lib/config.mjs';
 import { loadState } from '../lib/state.mjs';
-import { MARKERS, triageComment, summaryComment, needsHumanComment, blockedComment, awaitingReviewComment } from '../lib/render.mjs';
+import { MARKERS, triageComment, summarySections, needsHumanComment, blockedComment, awaitingReviewComment } from '../lib/render.mjs';
+import { recordForOutcome } from '../lib/run-record.mjs';
+import { readSummaryComment, writeSummaryComment } from '../lib/summary-comment.mjs';
 import { createGitHub, commandCwd, guardGh, requireRepoRoot } from '../lib/github.mjs';
+import { readModelProofs } from '../lib/review-context.mjs';
 
 export const meta = {
   summary: 'render and upsert a pipeline PR comment (triage, summary, needs-human, blocked, awaiting-review)',
@@ -49,20 +53,18 @@ async function reportPath(root) {
   return resolve(root, cfg.ok ? cfg.config.verify.report : DEFAULTS.verify.report);
 }
 
-// One entry per round whose Fable model proof passed; rounds without (or with a failed) proof add nothing.
-function readModelProofs(root) {
-  const dir = join(root, '.review');
-  if (!existsSync(dir)) return [];
-  const proofs = [];
-  for (const name of readdirSync(dir).filter((n) => /^round-\d+$/.test(n)).sort()) {
-    try {
-      const p = JSON.parse(readFileSync(join(dir, name, 'model-proof.json'), 'utf8'));
-      if (p?.ok !== true) continue;
-      const efforts = p.efforts && typeof p.efforts === 'object' ? Object.keys(p.efforts).join(', ') : '';
-      proofs.push({ transcript: p.transcript, models: p.models, ...(efforts ? { effort: efforts } : {}) });
-    } catch { /* no proof for this round */ }
-  }
-  return proofs;
+// The summary comment also carries the run record: write the sections through the one writer, which keeps an existing
+// record (and sets how the run ended on it).
+function summaryKind(gh, pr, sections, outcome) {
+  const view = gh.prView(pr, ['headRefName', 'baseRefName', 'headRefOid']);
+  const existing = readSummaryComment(gh, pr);
+  if (existing.status === 'unsupported') throw new UsageError('the summary comment carries a run record from a newer pipeline version: update the pipeline CLI first');
+  const { record, warnings } = recordForOutcome(existing.status === 'ok' ? existing.record : null, {
+    repo: gh.repo().slug, pr, branch: view.headRefName, baseRef: view.baseRefName, head: view.headRefOid,
+    outcome, host: hostname(), now: Date.now(),
+  });
+  const r = writeSummaryComment(gh, pr, { record, sections, existing });
+  return { exitCode: EXIT.OK, output: { ok: true, kind: 'summary', pr, action: r.action, url: r.url, id: r.id, step: record.step, warnings } };
 }
 
 export async function run(argv, ctx) {
@@ -86,7 +88,8 @@ export async function run(argv, ctx) {
     body = triageComment(requireState(root, kind));
   } else if (kind === 'summary') {
     const outcome = requireOption(values, 'outcome');
-    body = summaryComment(requireState(root, kind), { outcome, built: values.built, modelProofs: readModelProofs(root) });
+    const state = requireState(root, kind);
+    body = summarySections(state, { outcome, built: values.built, modelProofs: readModelProofs(root, state) });
   } else if (kind === 'blocked') {
     const file = await reportPath(root);
     if (!existsSync(file)) throw new UsageError(`no verify report at ${file}: the blocked comment is rendered from it`);
@@ -115,6 +118,7 @@ export async function run(argv, ctx) {
 
   const gh = createGitHub({ cwd, env: ctx.env });
   return guardGh(() => {
+    if (kind === 'summary') return summaryKind(gh, pr, body, values.outcome);
     const r = gh.upsertComment(pr, MARKER_OF[kind], body);
     return { exitCode: EXIT.OK, output: { ok: true, kind, pr, action: r.action, url: r.url, id: r.id } };
   });

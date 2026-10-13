@@ -224,7 +224,10 @@ function applyLocked({ n, agentId, givenTag, expectModelPrefix, expectEffort, ma
   writeJson(path.join(dir, 'model-proof.json'), {
     ok: proofOk, transcript: found.jsonlPath, models: proof.models, efforts: proof.efforts, stopReasonMissing: proof.stopReasonMissing, finalVia: proof.finalVia, errors, tag, round: n,
   });
-  saveState(root, patchRound(updateItems(state, n, items), n, { arbiter: { ...stored, proofOk, transcript: found.jsonlPath } }));
+  // The proof summary rides in the round, so the triage comment (which embeds the state) carries it to another machine.
+  const efforts = proof.efforts && typeof proof.efforts === 'object' ? Object.keys(proof.efforts).join(', ') : '';
+  const modelProof = proofOk ? { transcript: found.jsonlPath, models: proof.models, ...(efforts ? { effort: efforts } : {}) } : undefined;
+  saveState(root, patchRound(updateItems(state, n, items), n, { arbiter: { ...stored, proofOk, transcript: found.jsonlPath }, modelProof }));
 
   const byId = new Map(items.map((i) => [i.id, i]));
   return {

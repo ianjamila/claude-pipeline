@@ -82,6 +82,12 @@ const ALLOW = [
   /report-only hits[^]*never stop the\s+PR/i,
   // "Ending a run with a PR open": the section that states the rule itself, including that pre-PR stops push nothing.
   /Stops before a PR\s+exists/,
+  // Resume mode: the owner, at the keyboard, just said the other session's run is still going. Nothing was taken over, and
+  // a summary would overwrite that live run's record.
+  /`confirm` non-null ⇒ ask the owner[^]*No ⇒ stop\./,
+  // Resume mode, `local-work`: the owner just asked to resume and is told about the worktree at once; nothing was taken over,
+  // and a summary would overwrite the record of the run whose uncommitted or diverged work that is.
+  /`resume plan` `enter: local-work`/,
 ];
 const texts = skillFiles.map((f) => [f, readFileSync(f, 'utf8')]);
 

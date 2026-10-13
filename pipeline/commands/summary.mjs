@@ -1,17 +1,21 @@
 // `pipeline summary --pr N --outcome O [--built TEXT] [--action TEXT] [--cause CODE]`: upserts the PR's single summary
-// comment (rendered from the review state, the Fable model proofs and the follow-up issues), prints the agent-log line for
-// this run and, for an outcome that needs the owner, sends the one push (pipeline/lib/notify.mjs) whether or not GitHub
-// answered.
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+// comment (rendered from the review state, the Fable model proofs and the follow-up issues, with the run record riding in
+// it), prints the agent-log line for this run and, for an outcome that needs the owner, sends the one push
+// (pipeline/lib/notify.mjs) whether or not GitHub answered.
+import { readFileSync } from 'node:fs';
+import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { emptyState, loadState } from '../lib/state.mjs';
 import { loadConfig } from '../lib/config.mjs';
-import { MARKERS, summaryComment } from '../lib/render.mjs';
+import { summarySections } from '../lib/render.mjs';
+import { recordForOutcome } from '../lib/run-record.mjs';
+import { readSummaryComment, writeSummaryComment } from '../lib/summary-comment.mjs';
 import { buildAgentLogLine } from '../lib/agentlog.mjs';
 import { inlineOptionValues } from '../lib/finalgate.mjs';
+import { readModelProofs } from '../lib/review-context.mjs';
 import { headSha } from '../lib/git.mjs';
 import { classifyOutcome, defaultAction, notifyEvent } from '../lib/notify.mjs';
 
@@ -38,22 +42,6 @@ async function verifyDetail(root) {
     if (failed?.name) return `verify failed at step ${String(failed.name).slice(0, 60)}${report.mode ? ` (${String(report.mode).slice(0, 20)})` : ''}`;
   } catch { /* no usable report */ }
   return null;
-}
-
-// One entry per round whose Fable model proof passed; a round without (or with a failed) proof adds nothing.
-function readModelProofs(root) {
-  const dir = join(root, '.review');
-  if (!existsSync(dir)) return [];
-  const proofs = [];
-  for (const name of readdirSync(dir).filter((n) => /^round-\d+$/.test(n)).sort((a, b) => Number(a.slice(6)) - Number(b.slice(6)))) {
-    try {
-      const p = JSON.parse(readFileSync(join(dir, name, 'model-proof.json'), 'utf8'));
-      if (p?.ok !== true) continue;
-      const efforts = p.efforts && typeof p.efforts === 'object' ? Object.keys(p.efforts).join(', ') : '';
-      proofs.push({ transcript: p.transcript, models: p.models, ...(efforts ? { effort: efforts } : {}) });
-    } catch { /* no proof for this round */ }
-  }
-  return proofs;
 }
 
 // FOLLOW-UP items that have an issue filed, once per finding (the same fingerprint can come back in a later round).
@@ -156,13 +144,21 @@ export const run = guarded(async (argv, ctx) => {
   let result;
   try {
     result = await guardGh(() => {
-      ({ title } = gh.prView(pr, ['title']));
-      const body = summaryComment(state, { outcome: detail ? `${outcome} — ${detail}` : outcome, built: values.built, followups: followupsOf(state), modelProofs: readModelProofs(root) });
-      const posted = gh.upsertComment(pr, MARKERS.summary, body);
+      const view = gh.prView(pr, ['title', 'headRefName', 'baseRefName', 'headRefOid']);
+      ({ title } = view);
+      const sections = summarySections(state, { outcome: detail ? `${outcome} — ${detail}` : outcome, built: values.built, followups: followupsOf(state), modelProofs: readModelProofs(root, state) });
+      const agentLogLine = buildAgentLogLine({ state, pr, title, outcome });
+      // The run record rides in the same comment: keep the one a checkpoint wrote, set how the run ended.
+      const existing = readSummaryComment(gh, pr);
+      if (existing.status === 'unsupported') throw new UsageError('the summary comment carries a run record from a newer pipeline version: update the pipeline CLI first');
+      const { record, warnings } = recordForOutcome(existing.status === 'ok' ? existing.record : null, {
+        repo: gh.repo().slug, pr, branch: view.headRefName, baseRef: view.baseRefName, head: view.headRefOid,
+        outcome, detail, agentLogLine, host: hostname(), now: Date.now(),
+      });
+      const posted = writeSummaryComment(gh, pr, { record, sections, existing });
       const prUrl = typeof posted.url === 'string' ? posted.url.replace(/#.*$/, '') : '';
       if (/\/pull\/\d+$/.test(prUrl)) url = prUrl;
-      const agentLogLine = buildAgentLogLine({ state, pr, title, outcome });
-      return { exitCode: EXIT.OK, output: { ok: true, url: posted.url, action: posted.action, agentLogLine } };
+      return { exitCode: EXIT.OK, output: { ok: true, url: posted.url, action: posted.action, agentLogLine, step: record.step, warnings } };
     });
   } finally {
     // Whether or not GitHub answered. When it threw, the error keeps its exit code and the push is still sent.
