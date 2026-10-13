@@ -19,7 +19,7 @@ import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
-import { simpleCommands, runsAfter, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText } from './shell-parse.mjs';
+import { simpleCommands, runsAfter, trustedFns, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
 import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit, execLinesOf, paramReadings, assigningDefaults, spliceLines } from './script-candidates.mjs';
 
@@ -1255,8 +1255,11 @@ const onlyReads = (c, ctx) => (c.argv.length === 0 || SUBSHELL_READS.has(baseOf(
 const insideOf = (cd) => { const g = cd.grp ?? []; return (c) => (c.grp ?? []).length >= g.length && g.every((id, k) => c.grp[k] === id); };
 function readsOnlyInSubshell(cd, cmds, ctx) {
   if (!(cd.grp ?? []).length) return false;
+  // (a function, alias or hook the text may define can stand behind a read-only name: `pwd() { echo x > settings.json; }; (cd ~/.claude; pwd)` -- review of #50)
+  const fns = trustedFns(cmds);
+  if (!fns) return false;
   const inside = insideOf(cd);
-  return cmds.every((c) => !inside(c) || onlyReads(c, ctx));
+  return cmds.every((c) => !inside(c) || (onlyReads(c, ctx) && !fns.has(baseOf(c.argv[0] ?? ''))));
 }
 
 // Why: a cd moves what runs after it, not what ran before: `sdd-workspace` ends with `cd -- "$dir" && pwd`. When every command that may run after it (see

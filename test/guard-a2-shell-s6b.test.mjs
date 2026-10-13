@@ -280,3 +280,51 @@ test('S6b files (review): ... also behind an assignment prefix or a wrapper', ()
   const env = { HOME: '/home/u', ZDOTDIR: '/home/u' };
   for (const pre of ['X=1 npx some-tool', 'nohup some-tool', 'env A=1 some-tool']) assert.equal(F(`${pre}; zsh -ic 'echo hi > "$OUT"'`, { '/home/u/.zshenv': 'export EDITOR=vi' }, { env }), 'deny', pre);
 });
+
+// ---- Codex review of #50 (P1 x3) and a sibling --------------------------------------------------------------------------------------------------------------
+
+test('S6b codex: a function the text defines can stand behind a "read-only" name in a subshell: the cd in that subshell is judged as before', () => {
+  const spec = { 'r.txt': 'x' };
+  assert.equal(F('pwd() { echo x > settings.json; }; (cd /home/u/.claude; pwd)', spec), 'deny');
+  assert.equal(F('Pwd() { echo x > settings.json; }; (cd /home/u/.claude; pwd)', spec), 'deny');
+  assert.equal(F('ls() { echo x > out.txt; }; d=$(cd "$Q" && ls); echo hi > out2.txt', spec), 'deny');
+  assert.equal(F('alias ls="touch settings.json"; (cd /home/u/.claude; ls)', spec), 'deny');
+  assert.equal(F('d=$(cd /home/u/.claude && pwd); echo hi > settings.json', spec), 'allow', '(no function: as in S6b)');
+});
+
+test('S6b codex: `time` (and an unknown prefix) before a compound command keeps its branches conditional', () => {
+  const env = { B: 'main' };
+  for (const c of [
+    'time if false; then B=agent/x; fi; git push origin "$B"',
+    'time -p if false; then B=agent/x; fi; git push origin "$B"',
+    'time while false; do B=agent/x; done; git push origin "$B"',
+    'nocorrect if false; then B=agent/x; fi; git push origin "$B"', // a prefix we do not model: the marks are not trusted
+  ]) assert.equal(G(c, {}, { env }), 'deny', c);
+});
+
+test('S6b codex: a brace group after && / || or in a pipeline / background job keeps every command in it conditional (or out of this shell)', () => {
+  const env = { B: 'main' };
+  for (const c of [
+    'false && { if true; then :; fi; B=agent/x; }; git push origin "$B"',
+    'false || { while false; do :; done; B=agent/x; }; git push origin "$B"',
+    'true | { B=agent/x; true; }; git push origin "$B"',
+    '{ B=agent/x; true; } | cat; git push origin "$B"',
+    '{ B=agent/x; true; } & git push origin "$B"',
+  ]) assert.equal(G(c, {}, { env }), 'deny', c);
+  assert.equal(G('{ B=agent/x; true; }; git push origin "$B"', {}, { env }), 'allow', '(a plain group runs in this shell, unconditionally)');
+  const m = simpleCommands('false && { if a; then b; fi; c; }; d');
+  assert.equal(m.find((x) => x.argv[0] === 'c').ctl.cond, true);
+  assert.equal(m.find((x) => x.argv[0] === 'd').ctl.cond, false);
+});
+
+test('S6b codex: ... `time` is read exactly (what comes after the construct is sure), and a construct an unknown prefix hides keeps every consumer on the old reading', () => {
+  const env = { B: 'main' };
+  assert.equal(G('time if false; then :; fi; B=agent/x; git push origin "$B"', {}, { env }), 'allow');
+  assert.equal(G('time -p while false; do :; done; B=agent/x; git push origin "$B"', {}, { env }), 'allow');
+  assert.equal(G('nocorrect case "$X" in a) B=agent/x ;; esac; git push origin "$B"', {}, { env }), 'deny');
+  const first = simpleCommands('false && { a; b; }; c');
+  assert.equal(first.find((x) => x.argv[0] === 'a').ctl.cond, true, '(the group\'s first command too)');
+  const spec = (body) => ({ 's.sh': body, 'h.sh': 'echo hi', 'bad.sh': BAD_WRITE });
+  assert.equal(F('bash s.sh', spec('nocorrect while true; do echo hi > out.txt; cd "$U"; done\n')), 'deny', '(the loop runs the write again after the cd)');
+  assert.equal(F('bash s.sh', spec('nocorrect while true; do bash h.sh; cp bad.sh h.sh; done\n')), 'deny', '(the copy lands before the next run)');
+});
