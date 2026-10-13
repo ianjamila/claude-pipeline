@@ -374,3 +374,18 @@ test('a gh call that timed out is a failure even if it printed something parseab
   assert.throws(() => gh.checks(3), GhError);
   assert.throws(() => gh.listIssues({ label: 'x' }), GhError);
 });
+
+test('pagePullRequests: extra variables reach gh api graphql as -f name=value', () => {
+  const calls = [];
+  const ghFn = (args) => {
+    calls.push(args);
+    if (args[0] === 'repo') return { code: 0, stdout: JSON.stringify(REPO_VIEW), stderr: '', timedOut: false };
+    const data = { repository: { pullRequests: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } };
+    return { code: 0, stdout: JSON.stringify({ data }), stderr: '', timedOut: false };
+  };
+  const gh = createGitHub({ cwd, ghFn });
+  gh.pagePullRequests('query { x }', () => {}, { branch: 'feat/x' });
+  const gql = calls.find((a) => a[0] === 'api');
+  const at = gql.indexOf('branch=feat/x');
+  assert.ok(at > 0 && gql[at - 1] === '-f');
+});
