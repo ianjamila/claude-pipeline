@@ -1813,3 +1813,30 @@ test('L5b: applySed computes what sed leaves (GNU empty-match rules, Nth match, 
   // a program every sed rejects (unpaired parentheses) leaves the file as it is
   assert.deepEqual(applySed({ args: ['-i.b', 's/\\(a/b/', 'f'], word: 'f' }, 'a\n'), ['a\n']);
 });
+
+test('L5b: an in-place sed may fail or be skipped, so the text the file holds now stays among the judged texts', () => {
+  // Why: sed -i is not certain to run (an unwritable directory, GNU-only syntax BSD rejects, a missing file, a read-only mount): the edited text alone would drop the text that then runs.
+  // (A bare `-i` is also read by BSD as taking the next word as its suffix, which leaves the text alone: these forms are read the same by both.)
+  const SEDS = ["sed -i.bak '1d'", "sed --in-place '1d'", "sed -i.bak -e '1d'", "sed -n -i.bak '2p'", "sed --in-place=.b '1d'", "sed -i.bak 's/[a-z]*/x/'", "sed -I.bak '1d'"];
+  // the file holds the blocked text now: an edit that rewrites it must not hide it
+  for (const s of SEDS) denyBoth(`${s} f.sh; bash f.sh`);
+  // the edit applied to a file the line wrote: the write is judged both with the edit and without it
+  for (const s of SEDS) {
+    denyBoth((bad) => `printf '${bad}\\n' > n.sh; ${s} n.sh; bash n.sh`);
+    denyBoth(`cp f.sh n.sh; ${s} n.sh; bash n.sh`);
+    denyBoth((bad) => `printf '${bad}\\n' > n.sh; echo hi >> n.sh; ${s} n.sh; bash n.sh`);
+    // the file is put together from pieces (cat of two files): the whole text is what a failed edit leaves, and no piece holds it alone
+    denyBoth(`cat p1.txt p2.txt > n.sh; ${s} n.sh; bash n.sh`);
+  }
+  // pieces that only together are blocked (a head on disk, a tail appended), then an edit that would remove it
+  const halves = [[git, GIT_ROOT, 'git push origin ma', 'in', 'main'], [files, PROJ, 'echo x > ~/.claude/settin', 'gs.json', 'settings']];
+  for (const [pol, root, head, tail, word] of halves) {
+    const fsx = fakeFs(root, { 'ok.sh': head }, DIRS);
+    for (const l of [`printf '${tail}' >> ok.sh; sed -i.bak 's/${word}/x/' ok.sh; bash ok.sh`, `printf '${tail}' >> ok.sh; sed --in-place 's/${word}/x/' ok.sh && bash ok.sh`]) assert.equal(pol(l, fsx).decision, 'deny', l);
+  }
+  // a chain: each edit may be skipped, the blocked text survives in any of the combinations
+  denyBoth((bad) => `printf '${bad}\\n' > n.sh; sed -i.bak 1d n.sh; sed -i.bak 's/a/b/' n.sh; sed -i.bak 's/c/d/' n.sh; bash n.sh`);
+  // the nearest twins stay allowed: the text now is clean and every edit of it is clean
+  allowBoth("sed -i.bak 's/git/echo/' ok.sh; bash ok.sh");
+  allowBoth("sed -i.bak '1d' ok.sh; sed -i.bak 's/a/b/' ok.sh; bash ok.sh");
+});

@@ -1537,7 +1537,7 @@ function contentsIn(frames, upto, asOf, P, io, depth) {
     let acc = [''];
     for (const el of seq) {
       if (el.rec?.sed) { // (every text the edit may leave, see sed-emulate.mjs; a program it does not emulate exactly is "built from pieces")
-        const next = new Set(); // (the edit may fail or be skipped: an unwritable directory, syntax one sed rejects, a missing file ... the text it was to edit stays)
+        const next = new Set(acc); // (the edit may fail or be skipped: an unwritable directory, syntax one sed rejects, a missing file ... the text it was to edit stays)
         for (const text of acc) {
           const edited = applySed(el.rec.sed, text);
           if (edited === null) { io.sedRefused = true; fail(); return looseIn ? true : null; }
