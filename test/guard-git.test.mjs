@@ -1840,3 +1840,28 @@ test('a ( subshell hidden behind escaped quotes or a $\'…\' string is still fo
   ];
   for (const c of allowCmds) assert.equal(evaluate(c, o).decision, 'allow', c);
 });
+
+// ---- the literal / expanded mixes of a push obey the deadline and reuse lookups ------------------------------------------------
+
+test('a push with many $ words: the mixes are bounded by the evaluation deadline (injected clock) and reuse each lookup', () => {
+  const sevenA = ' --recurse-submodules=$A'.repeat(7);
+  const base = { cwd: '/work/repo', home: '/home/u', pushDestination: () => null, issueLabels: () => [], readText: () => null, pathExists: () => false };
+  // 400 ms per clock read: the 128 mixes cannot all be judged inside the 5 s deadline, so the line is denied as too slow
+  let t = 1_000_000;
+  const slow = evaluateGitCommand(`A=no; git push${sevenA} origin agent/x`, { ...base, currentBranch: () => 'agent/x', now: () => (t += 400) });
+  assert.equal(slow.decision, 'deny');
+  assert.match(slow.reason, /took too long/);
+  // with time to spare the same line is judged, and the branch is looked up once however many mixes there are
+  let calls = 0;
+  let clock = 0;
+  const fast = evaluateGitCommand(`A=no; git push${sevenA} origin`, { ...base, currentBranch: () => { calls++; clock += 100; return 'agent/x'; }, now: () => clock });
+  assert.equal(fast.decision, 'allow');
+  assert.equal(calls, 1, 'one lookup for all 128 mixes');
+  // 100 ms per lookup, 256 mixes of a push that is denied only by its literal reading: still denied, and quickly
+  calls = 0;
+  clock = 0;
+  const dflt = ['ma', 'in'].join('');
+  const probe = evaluateGitCommand(`O=-o; A=no; git push${sevenA} origin '$O' HEAD:${dflt}`, { ...base, currentBranch: () => { calls++; clock += 100; return 'agent/x'; }, now: () => clock });
+  assert.equal(probe.decision, 'deny');
+  assert.ok(calls <= 2 && clock <= 1000, `${calls} lookups, ${clock} ms of injected time`);
+});

@@ -205,10 +205,21 @@ function nextDir(dir, name, argv, ctx) {
   return joinDir(dir, operands[0], ctx);
 }
 
+// The repository does not change while a line is judged, so each lookup is made once per evaluation (a push judged in many mixes, a
+// script judged in many readings, must not repeat a call that can take seconds). Errors are remembered as unknown too.
+function memoLookup(ctx, key, fn) {
+  const memo = (ctx.budget.lookups ??= new Map());
+  const k = JSON.stringify(key);
+  if (!memo.has(k)) { try { memo.set(k, { v: fn() }); } catch { memo.set(k, { err: true }); } }
+  const e = memo.get(k);
+  if (e.err) throw new Error('lookup failed');
+  return e.v;
+}
+
 function branchOf(dir, gitDir, ctx) {
   if (dir === null) return null;
   let b;
-  try { b = ctx.currentBranch(dir, { gitDir }); } catch { return null; }
+  try { b = memoLookup(ctx, ['branch', dir, gitDir ?? null], () => ctx.currentBranch(dir, { gitDir })); } catch { return null; }
   if (typeof b !== 'string') return null;
   b = b.trim().replace(/^refs\/heads\//, '');
   return b === '' || b === 'HEAD' ? null : b;
@@ -234,7 +245,7 @@ function effectiveBranch(dir, gitDir, ctx) {
 function pushDestOf(dir, gitDir, ctx, branch) {
   if (dir === null) return null;
   let d;
-  try { d = ctx.pushDestination(dir, branch === undefined ? { gitDir } : { gitDir, branch }); } catch { return null; }
+  try { d = memoLookup(ctx, ['push', dir, gitDir ?? null, branch ?? null], () => ctx.pushDestination(dir, branch === undefined ? { gitDir } : { gitDir, branch })); } catch { return null; }
   return typeof d === 'string' && d.trim() ? d.trim() : null;
 }
 
@@ -329,14 +340,20 @@ const MAX_MIXED = 8;
 const asText = (a) => a.replace(/\$/g, `${LITERAL_MARK}d`).replace(/`/g, `${LITERAL_MARK}b`);
 function checkPush(args, dir, gitDir, ctx, configs) {
   const idx = args.map((a, i) => (DYNAMIC.test(a) ? i : -1)).filter((i) => i >= 0);
+  const seen = new Set();
   const judge = (mask) => {
+    checkDeadline(ctx.budget); // up to 2^MAX_MIXED mixes: the evaluation as a whole has a deadline
     const mixed = args.map((a, i) => { const j = idx.indexOf(i); return j >= 0 && (mask >> j) & 1 ? asText(a) : a; });
     for (const a of mixed) {
       const why = unverifiableWord(a, ctx);
       if (why) return deny(why);
     }
     // (an option held in a variable, `F=--mirror; git push origin $F`, is an option)
-    return pushReading(mixed.map((a) => expandVars(a, ctx)), dir, gitDir, ctx, configs);
+    const expanded = mixed.map((a) => expandVars(a, ctx));
+    const key = JSON.stringify(expanded);
+    if (seen.has(key)) return null; // a mix that reads the same as one already judged
+    seen.add(key);
+    return pushReading(expanded, dir, gitDir, ctx, configs);
   };
   const first = judge(0); // every word as the variable it names (the expansion budget is spent here first)
   if (first) return first;
