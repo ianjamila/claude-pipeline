@@ -17,7 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, startupFilesOf, splicesOptions, spliceText } from './shell-parse.mjs';
 import { catchAllReason, guardedCommandText } from './guarded-text.mjs';
-import { scriptCandidates, spliceLines, assigningDefaults, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
+import { scriptCandidates, spliceLines, assigningDefaults, execLinesOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
 
 const PROTECTED_BRANCHES = ['main', 'master'];
 const APPROVAL_LABELS = ['human-approved', 'test-change-approved'];
@@ -1123,8 +1123,9 @@ function checkCandidateScripts(sf, dir, ctx, level) {
   }
   // after a cd that may not have run, a relative word (or a glob over one) names a file in an unknown directory
   if (dir === null && sf.kind !== 'scan' && sf.words.some((w) => !path.isAbsolute(expand(w)))) return deny('cannot tell which directory this runs in, so which script it runs cannot be verified. Use an absolute path, or chain the cd with &&.');
-  const line = execLineOf(sf, expand);
-  if (line !== null) {
+  const lines = execLinesOf(sf, expand, assignedOf(ctx));
+  if (lines.over) return deny('too many readings of the program word (a default or assigned word) to judge, so what it runs cannot be verified. Write the command out.');
+  for (const line of lines) {
     if (level >= MAX_NESTING) return deny('the command line held in a variable is nested too deeply to verify.');
     const v = judgeScoped(line, dir, ctx, level, { kind: 'shell' });
     if (v.decision === 'deny') return deny(`the command line ${sf.words[0]} expands to would run a blocked command: ${v.reason}`);

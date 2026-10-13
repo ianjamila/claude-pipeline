@@ -19,7 +19,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
 import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, splicesOptions, spliceText } from './shell-parse.mjs';
-import { scriptCandidates, spliceLines, assigningDefaults, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
+import { scriptCandidates, spliceLines, assigningDefaults, execLinesOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
 
 const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
@@ -1141,8 +1141,9 @@ function judgeSplices(c, dirs, ctx, opts) {
 // names a protected pipeline file.
 function judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw) {
   const joinPath = (d, r) => (isAbs(r) ? posix.normalize(r) : posix.join(d, r));
-  const line = execLineOf(sf, (w) => expandRefs(w, ctx));
-  if (line !== null) {
+  const lines = execLinesOf(sf, (w) => expandRefs(w, ctx), ctx.assigned);
+  if (lines.over) return deny('too many readings of the program word (a default or assigned word) to judge, so what it runs cannot be checked; write the command out');
+  for (const line of lines) {
     if ((opts._depth ?? 0) >= 4) return deny('the command line held in a variable is nested too deeply to check');
     // run in every directory the command may be in, with the line's variables
     for (const d of dirs) {

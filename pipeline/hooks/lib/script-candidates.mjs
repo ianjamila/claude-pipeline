@@ -130,6 +130,23 @@ export function readingsOf(word, assigned) {
   const list = [...out].slice(0, MAX_READINGS);
   return Object.defineProperty(list, 'over', { value: over || out.size > MAX_READINGS, enumerable: false });
 }
+// The command lines a program named by a variable or a default word may run, with its arguments (`G=bash; $G ev.sh`, `"${X:-bash}" ev.sh`): the policies judge each as text one level
+// deeper. `over` (a non-enumerable property of the list): the readings were cut off or are too many, and the caller refuses.
+const quoteWord = (w) => (/^[\w@%+=:,./-]+$/.test(w) ? w : `"${w.replace(/[\\"`]/g, '\\$&')}"`);
+export function execLinesOf(sf, expand, assigned) {
+  const none = Object.defineProperty([], 'over', { value: false, enumerable: false });
+  if (sf.kind !== 'exec' || sf.words?.length !== 1 || !sf.words[0].includes('$')) return none;
+  const w0 = sf.words[0];
+  const rs = readingsOf(w0, assigned);
+  const out = [];
+  for (const r of rs) {
+    const e = expand(r).trim();
+    if (e === '' || e === w0 || e.startsWith('$') || /\$\(|`/.test(e)) continue; // (still unknown: the candidate list covers it)
+    out.push([e, ...(sf.args ?? []).map(quoteWord)].join(' '));
+  }
+  return Object.defineProperty([...new Set(out)], 'over', { value: rs.over === true, enumerable: false });
+}
+
 // Thrown when a limit above is hit; each policy's entry point turns it into a denial carrying the message.
 export class GuardLimit extends Error {}
 

@@ -942,3 +942,26 @@ test('guard-git/files: a reading set that is too big or too deep is refused, nev
     assert.equal(files(c).decision, 'allow', c);
   }
 });
+
+// ---- a command HEAD with a known value or a default word is judged as the command line each reading makes ---------------------
+
+test('guard-git: a program named by a variable or a default word is judged with its arguments on every reading', () => {
+  for (const c of [
+    '"${X:-bash}" f.sh', '${X:-bash} f.sh', '${X-bash} f.sh', '${X:=bash} f.sh', 'X=x; ${X:+bash} f.sh', 'G=bash; $G f.sh', 'G=bash; "$G" f.sh', 'G=bash; ${G} f.sh',
+    'G="bash -x"; $G f.sh', 'G="bash -c"; $G ./f.sh', '${X:-bash -x} f.sh', '${X:-sh} f.sh', ': ${G:=bash}; $G f.sh',
+  ]) assert.equal(git(c).decision, 'deny', c);
+  for (const c of ['"${X:-bash}" ok.sh', 'G=bash; $G ok.sh', 'G="bash -x"; $G ok.sh', '${X:-bash -x} ok.sh', '${X:-./ok.sh}', 'G=./ok.sh; $G', 'G=bash; $G', 'G=ls; $G f.sh'])
+    assert.equal(git(c).decision, 'allow', c);
+  // more readings than can be judged: refused, not judged in part
+  assert.equal(git(`${'${A:-'.repeat(20)}bash${'}'.repeat(20)} ok.sh`).decision, 'deny');
+});
+
+test('guard-files: a program named by a variable or a default word is judged with its arguments on every reading', () => {
+  for (const c of [
+    '"${X:-bash}" w.sh', '${X:-bash} w.sh', '${X-bash} w.sh', '${X:=bash} w.sh', 'X=x; ${X:+bash} w.sh', 'G=bash; $G w.sh', 'G=bash; "$G" w.sh', 'G=bash; ${G} w.sh',
+    'G="bash -x"; $G w.sh', 'G="bash -c"; $G ./w.sh', '${X:-bash -x} w.sh', '${X:-sh} w.sh', ': ${G:=bash}; $G w.sh',
+  ]) assert.equal(files(c).decision, 'deny', c);
+  for (const c of ['"${X:-bash}" ok.sh', 'G=bash; $G ok.sh', 'G="bash -x"; $G ok.sh', '${X:-bash -x} ok.sh', '${X:-./ok.sh}', 'G=./ok.sh; $G', 'G=bash; $G', 'G=ls; $G w.sh'])
+    assert.equal(files(c).decision, 'allow', c);
+  assert.equal(files(`${'${A:-'.repeat(20)}bash${'}'.repeat(20)} ok.sh`).decision, 'deny');
+});
