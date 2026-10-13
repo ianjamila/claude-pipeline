@@ -125,6 +125,16 @@ const DENY = [
   ['git push origin HEAD:${B:-"}:main"}'],
   ['git push origin ${B:-x'],
   ['git push --repo=${R:-o} ${B:-agent/x}'],
+  // a run-time SOURCE can add a force prefix or more refspecs: any part of a refspec built at run time is unresolvable
+  ['git push origin ${B:-x}:agent/x'],
+  ['git push origin ${B:-${C:-+HEAD}}:agent/x'],
+  ['git push origin "${B:-${C:-+HEAD}}:agent/x"'],
+  ['git push origin ${B:-${C:-HEAD:main HEAD}}:agent/x'],
+  ['git push origin "${B:-${C:-HEAD:main HEAD}}:agent/x"'],
+  ['git push origin $(echo +HEAD):agent/x'],
+  ['git push origin `echo +HEAD`:agent/x'],
+  ['git push origin $X:agent/x'],
+  ['git push origin ${B:-x}:'],
   // a config key / push.default value built at run time can be remote.*.push or upstream
   ['git -c $K=HEAD:agent/x push'],
   ['K=remote.origin.push; git -c $K=HEAD:agent/x push'],
@@ -167,9 +177,9 @@ const ALLOW = [
   ['git diff "$BASE"..HEAD'],
   ['git -C "$DIR" log --oneline -3'],
   ['B=agent/x; git push origin $B'], // assigned once on the line: still known
-  ['git push origin ${B:-x}:agent/x'], // only the destination is judged; the source is free text
   ['git push origin HEAD:$(git branch --show-current)'],
   ['git push -o ${B:-x} origin agent/x'],
+  ['git push origin HEAD:agent/x'], // a literal source with a literal destination is unchanged
   ['git -c user.name=$N push origin agent/x'],
   ['git -c core.pager=${P:-cat} push origin agent/x'],
 ];

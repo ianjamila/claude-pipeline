@@ -264,6 +264,11 @@ function checkRefspec(spec, dir, gitDir, ctx) {
   if (spec.startsWith('+')) return deny(FORCE_REASON);
   const colon = splitIndex(spec, ':');
   const src = colon < 0 ? spec : spec.slice(0, colon);
+  // A run-time source can carry a `+` (force) prefix or word-split into more refspecs (`${B:-${C:-+HEAD}}:agent/x`), so a
+  // source that is not literal text cannot be verified either, not only the destination.
+  if (colon >= 0 && DYNAMIC.test(src)) {
+    return deny(`the refspec source "${src}" is built at run time, so what is pushed (a force prefix, extra refspecs) cannot be verified. Write the refspec out: git push -u origin HEAD:agent/<slug>.`);
+  }
   let dst = colon < 0 ? spec : spec.slice(colon + 1);
   dst = expandVars(dst, ctx); // `B=agent/x; git push origin HEAD:$B`
   if (colon >= 0 && src === '' && dst === '') return deny('`git push <remote> :` pushes every matching branch, including main. Name your branch explicitly.');
