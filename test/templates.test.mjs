@@ -279,6 +279,35 @@ test('stop-verify: runs config.verify.quick from the repo root with PIPELINE_STO
   assert.equal(run.calls[0].opts.timeoutMs, 840_000);
 });
 
+// The outer run limit is the execution time plus the project's queue allowance (scripts/lib/heavy-slots.mjs, optional).
+const timeouts = async (files) => {
+  const repo = await project({ files });
+  const { EXECUTION_TIMEOUT_MS, QUEUE_ALLOWANCE_MS, RUN_TIMEOUT_MS } = await importVendored(repo.dir, 'stop-verify');
+  return { EXECUTION_TIMEOUT_MS, QUEUE_ALLOWANCE_MS, RUN_TIMEOUT_MS };
+};
+
+test('stop-verify: without scripts/lib/heavy-slots.mjs the queue allowance is 0 and the run limit stays 840 s', async () => {
+  assert.deepEqual(await timeouts({}), { EXECUTION_TIMEOUT_MS: 840_000, QUEUE_ALLOWANCE_MS: 0, RUN_TIMEOUT_MS: 840_000 });
+});
+
+test('stop-verify: a project heavy-slots module adds its QUEUE_WAIT_QUICK_MS to the run limit', async () => {
+  const t = await timeouts({ 'scripts/lib/heavy-slots.mjs': 'export const QUEUE_WAIT_QUICK_MS = 300_000;\n' });
+  assert.deepEqual(t, { EXECUTION_TIMEOUT_MS: 840_000, QUEUE_ALLOWANCE_MS: 300_000, RUN_TIMEOUT_MS: 1_140_000 });
+});
+
+test('stop-verify: a heavy-slots module without QUEUE_WAIT_QUICK_MS gives an allowance of 0', async () => {
+  const t = await timeouts({ 'scripts/lib/heavy-slots.mjs': 'export const SOMETHING_ELSE = 1;\n' });
+  assert.deepEqual(t, { EXECUTION_TIMEOUT_MS: 840_000, QUEUE_ALLOWANCE_MS: 0, RUN_TIMEOUT_MS: 840_000 });
+});
+
+test('stop-verify: the quick verify run is given the full run limit including the allowance', async () => {
+  const repo = await project({ files: { 'scripts/lib/heavy-slots.mjs': 'export const QUEUE_WAIT_QUICK_MS = 60_000;\n' } });
+  edit(repo);
+  const run = spy(passing());
+  await stop(repo, { run });
+  assert.equal(run.calls[0].opts.timeoutMs, 900_000);
+});
+
 test('stop-verify: failing quick verify blocks, with the output tail (<=15 lines) as the reason', async () => {
   const repo = await project();
   edit(repo);
