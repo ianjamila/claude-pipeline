@@ -194,6 +194,8 @@ function makeCtx(opts) {
   const lexAncestors = ANCESTOR_REL.map((r) => `${base}/${r}`);
   const roots = unique([...withWindowsAliases(lexRoots, homePosix, platform), ...lexRoots.map((r) => realResolve(r, api))]);
   const ancestors = unique([...withWindowsAliases(lexAncestors, homePosix, platform), ...lexAncestors.map((r) => realResolve(r, api))]);
+  // (the whole tree below ~/.claude, not just the protected entries and the directories that hold them: a `..` from projects/ climbs back to them)
+  const treeRoots = unique([...withWindowsAliases([`${base}/.claude`], homePosix, platform), realResolve(`${base}/.claude`, api)]);
   const ci = caseInsensitive(platform);
   let rootIds = null;
   return {
@@ -214,6 +216,7 @@ function makeCtx(opts) {
     bashState: opts._bashState, // the BASH rewrite record of the whole evaluation (see evaluateBashForFilesUnchecked)
     hit: (p) => { const q = unFirm(p); return roots.some((r) => isInside(q, r, platform)); },
     hitAncestor: (p) => { const q = unFirm(p); return ancestors.some((a) => samePath(q, a, platform)); },
+    hitTree: (p) => { const q = unFirm(p); return treeRoots.some((r) => isInside(q, r, platform)); },
     unFirm,
     // Is `p`, or the nearest existing directory above it, the very same file or directory (same device and inode) as a
     // protected root? Catches hard links and any other spelling of the path that realpath does not unify.
@@ -1021,6 +1024,7 @@ const SHELL_NAMES = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'csh', 
 // For these only the destination (last word, or -t DIR) can change a protected file; reading one into /tmp is fine.
 const DEST_ONLY = new Set(['cp', 'rsync', 'install']);
 const MOVERS = new Set(['mv', 'ln', 'ditto']); // any named protected path counts, and so does DEST/basename(SRC)
+const NOT_WRITERS = new Set(['cd', 'pushd', 'popd', 'export', 'declare', 'typeset', 'local', 'readonly', 'unset', 'set', 'shift', 'read', 'wait', 'true', 'false', ':', 'exit', 'return', 'test', '[', '[[', 'source', '.']);
 const WRITE_OPS = new Set(['>', '>>', '>|', '>&', '&>', '&>>', '<>']);
 const FD_DUP = /^&(?:\d+|-)$/; // (the only redirect targets that are descriptors)
 // xargs is unwrapped by the parser, so its name only survives in the raw text.
@@ -2342,7 +2346,7 @@ function evaluateBashForFilesFrame(command, opts) {
       for (const target of [r.target, ...(r.target.startsWith('&') ? [r.target.slice(1)] : []), ...braceExpand(expandRefs(r.target, ctx), ctx).split(/\s+/).filter((x) => x && x !== r.target)]) {
       const e = expandRefs(target, ctx);
       // Why: a target built at run time (`echo settings.json`, an unset name) inside a protected directory can be any file there
-      if (/[`$]/.test(e) && dirs.some((d) => ctx.hit(d) || ctx.hitAncestor(d))) return deny(`the command redirects output to ${target}, a name only known at run time, inside a protected pipeline directory, so the file it reaches cannot be checked; write the path out (${PROTECTED_MSG})`);
+      if (/[`$]/.test(e) && dirs.some((d) => ctx.hit(d) || ctx.hitAncestor(d) || ctx.hitTree(d))) return deny(`the command redirects output to ${target}, a name only known at run time, inside a protected pipeline directory, so the file it reaches cannot be checked; write the path out (${PROTECTED_MSG})`);
       const abs = isAbs(e) ? [posix.normalize(e)] : dirs.map((d) => posix.join(d, e));
       const viaLink = abs.some((p) => !/[*?[]/.test(p) && (ctx.hit(realResolve(p, ctx.api)) || ctx.hitInode(p)));
       if (m.rawHit(target, dirs) || m.pathHit(target, dirs, true) || viaLink) return deny(`the command redirects output to ${target}, which is a protected pipeline file or the directory that holds it (${PROTECTED_MSG})`);
@@ -2388,6 +2392,12 @@ function evaluateBashForFilesFrame(command, opts) {
     return names(c) || (MOVERS.has(name) && destsOf(wordsOf(c), name).some(tokenHitAll));
   };
   const mentioning = cmds.filter(mentions);
+  // Why: below ~/.claude (projects/, skills/other) nothing is protected by name, yet a destination built at run time (`cp x "$V"`, `tee $(echo ../settings.json)`) can climb back to a protected file:
+  // refused for every command that is not read-only (FP: a command with a run-time word, run from inside ~/.claude/**)
+  if (!insideRoot && opts._writesOnly !== true && dirs.some((d) => ctx.hitTree(d))) {
+    const w = cmds.find((c) => c.argv.length && !NOT_WRITERS.has(baseOf(c.argv[0])) && !isReadOnly(c, ctx) && c.argv.slice(1).some((a) => /[`$]/.test(expandRefs(a, ctx))));
+    if (w) return deny(`${baseOf(w.argv[0])} is given a name only known at run time inside the protected pipeline tree, so the file it reaches cannot be checked; write the path out (${PROTECTED_MSG})`);
+  }
   // A reference no single command names lives in a heredoc body or in program text the shell parser cut into
   // pieces (a Python or JS one-liner): then every command on the line must be read-only.
   const unaccounted = protectedInRaw && !cmds.some(names);

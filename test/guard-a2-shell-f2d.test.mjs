@@ -149,3 +149,24 @@ test('F2c 78: the repo root is unknown when any git config the walk reads mentio
     assert.equal(run(root(extra), c).decision, 'deny', JSON.stringify(extra));
   }
 });
+
+// Why (item 40): a write target that stays a run-time value (`$(echo settings.json)`, `"$V"`) is refused once the cwd is inside the protected tree. The cwd may be BELOW the protected files
+// (projects/, skills/other): `../settings.json` climbs back to them.
+test('F2d 40: a run-time write target is refused anywhere under the protected directory', () => {
+  const T = '~/.cla' + 'ude';
+  const bad = [];
+  for (const dir of [T, `${T}/projects`, `${T}/projects/foo`, `${T}/skills/other`, `/home/u/.cla` + 'ude/projects']) {
+    for (const w of ['echo x > $(echo ../settings.json)', 'echo x > `echo ../settings.json`', 'echo x > "$V"', 'echo x > $(printf settings.json)', 'cp /tmp/x $V', 'mv /tmp/x $(echo ../settings.json)', 'echo x | tee "$V"', 'touch $V', 'rm $V', 'ln -sf /tmp/x $V', 'install /tmp/x $V', 'dd of=$V', 'truncate -s 0 $V', 'sed -i s/a/b/ $V', 'curl -o $V http://x']) bad.push(`cd ${dir} && ${w}`);
+  }
+  bad.push(`pushd ${T}/projects >/dev/null; echo x > $V`, `(cd ${T}/projects; echo x > $V)`, `cd ${T}/projects\necho x > $V`);
+  denies(files, {}, bad);
+  // the hook starts inside the tree
+  const inTree = (c) => evaluateBashForFiles(c, { home: '/home/u', env: {}, platform: 'linux', realpath: (p) => p, cwd: '/home/u/.cla' + 'ude/projects', ...fakeFs(PROJ, BASE, ['/home/u']), existsSync: () => true });
+  for (const c of ['echo x > "$V"', 'cp /tmp/x $(echo ../settings.json)', 'tee $V < /tmp/x']) assert.equal(inTree(c).decision, 'deny', c);
+  // literal targets, reads, and run-time targets outside the tree stay allowed
+  allows(files, {}, [
+    `cd ${T}/projects && echo x > notes.txt`, `cd ${T}/projects && echo hi`, `cd ${T}/projects && cat $V`, `cd ${T}/projects && cp a.txt b.txt`,
+    'cd /home/u/proj && echo x > $(echo out.txt)', 'cd /home/u/proj && cp /tmp/x "$V"', 'echo x > $V', 'cd /home/u/other && tee $V < /tmp/x',
+  ]);
+  assert.equal(inTree('echo x > notes.txt').decision, 'allow');
+});
