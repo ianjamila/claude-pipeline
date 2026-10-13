@@ -21,6 +21,7 @@ const LEAD_WORDS = new Set([...KEYWORDS, 'for', 'case', 'select', 'in', 'time', 
 // A group on a glob word that holds nothing but qualifier characters (`*(.)`, `*(^/)`, `*(om[1,3])`, `*(N)`) is not also read as a subshell.
 const QUALIFIER_ONLY = /^[/.@=*%^,\-[\]\d#qpPrwxARWXsStNDnMTUGEIoOmacLlbY]*$/;
 const MAX_QUALIFIER_CODES = 32; // code strings taken from the groups of one word; more than this and the parse is flagged truncated
+const MAX_QUALIFIER_CHARS = 65_536; // characters of those code strings, together (each is parsed again); more than this and the parse is flagged truncated
 const PS_ENV_RE = /^\$env:([A-Za-z_][A-Za-z0-9_]*)(=?)([\s\S]*)$/i;
 const MAX_BRACE_WORK = 20_000; // brace-expansion results across one line; beyond it words stay unexpanded and the parse is flagged truncated
 const BRACE_CAP = 64; // results of one brace expression; beyond it we keep the first ones and set `truncated`
@@ -932,29 +933,58 @@ function dequote(str) {
   return out;
 }
 
-function qualifierCodes(t) {
-  const out = [];
+// Bounded: one linear pass (the balanced close of every bracket delimiter is looked up in a table built once per bracket kind, and the
+// first-partner search resumes where the last one ended), `emit(code)` returns false to stop (the caller's cap), and `expired()` is polled
+// as it goes. Returns true when it stopped early, so the caller can flag the parse truncated instead of scanning on.
+function qualifierCodes(t, emit, expired = null) {
+  const matches = new Map(); // open char -> Map(position of an open char -> position of its balanced close)
+  const matchOf = (open, close) => {
+    let m = matches.get(open);
+    if (m) return m;
+    m = new Map();
+    const stack = [];
+    for (let k = 0; k < t.length; k++) {
+      if ((k & 4095) === 0 && expired?.()) { m.expired = true; break; }
+      if (t[k] === open) stack.push(k);
+      else if (t[k] === close && stack.length) m.set(stack.pop(), k);
+    }
+    matches.set(open, m);
+    return m;
+  };
+  const firstClose = new Map(); // close char -> { from, at } of the last search (the first occurrence at or after `from`)
+  const nextClose = (close, from) => {
+    const last = firstClose.get(close);
+    if (last && last.from <= from && (last.at < 0 || last.at >= from)) return last.at;
+    const at = t.indexOf(close, from);
+    firstClose.set(close, { from, at });
+    return at;
+  };
   for (let p = 0; p < t.length; p++) {
+    if ((p & 1023) === 0 && expired?.()) return true;
     if (t[p] === 'e' && p + 1 < t.length && !/[\w\s]/.test(t[p + 1])) {
       const open = t[p + 1];
       const close = BRACKETS[open] ?? open;
-      const first = t.indexOf(close, p + 2);
-      out.push(first < 0 ? t.slice(p + 2) : t.slice(p + 2, first));
+      const first = nextClose(close, p + 2);
+      if (!emit(first < 0 ? t.slice(p + 2) : t.slice(p + 2, first))) return true;
       if (close !== open) {
-        let depth = 1;
-        let q = p + 2;
-        for (; q < t.length; q++) { if (t[q] === open) depth++; else if (t[q] === close && --depth === 0) break; }
-        if (q < t.length && q !== first) out.push(t.slice(p + 2, q));
+        const m = matchOf(open, close);
+        if (m.expired) return true;
+        const q = m.get(p + 1) ?? -1;
+        if (q >= 0 && q !== first && !emit(t.slice(p + 2, q))) return true;
       }
     } else if (t[p] === '+' && /[A-Za-z_]/.test(t[p + 1] ?? '')) {
-      const name = /^\w+/.exec(t.slice(p + 1))[0];
-      out.push(name);
-      const long = /^[^\s,)^|~#*?[\]<>'"`$;&(){}]+/.exec(t.slice(p + 1))[0];
-      if (long !== name) out.push(long);
+      NAME_RE.lastIndex = p + 1;
+      LONG_NAME_RE.lastIndex = p + 1;
+      const name = NAME_RE.exec(t)[0];
+      const long = LONG_NAME_RE.exec(t)[0];
+      if (!emit(name)) return true;
+      if (long !== name && !emit(long)) return true;
     }
   }
-  return out;
+  return false;
 }
+const NAME_RE = /\w+/y;
+const LONG_NAME_RE = /[^\s,)^|~#*?[\]<>'"`$;&(){}]+/y;
 
 // ---- startup files ------------------------------------------------------------------------------------
 
@@ -1531,7 +1561,7 @@ class Parser {
       } else {
         startSeg();
         inWord = true;
-        if (((c === '{' && !cur.endsWith('$')) || c === ',' || c === '}') && !(lit > 0 && litGlob)) bm.push(cur.length);
+        if (!(lit > 0 && litGlob) && ((c === '{' && !cur.endsWith('$')) || c === ',' || c === '}')) bm.push(cur.length); // (the cheap test first: endsWith flattens the word built so far)
         if (/[*?[^#~]/.test(c)) wpat = true;
         cur += c;
         this.i++;
@@ -1546,13 +1576,25 @@ class Parser {
     // The word may just as well be a subshell glued to a word (`{(bash f.sh); }`, `foo(bash f.sh)`), so the whole body is also parsed as commands:
     // nothing between the parentheses is ever dropped.
     if (raw.trim() && !(wordGlob && QUALIFIER_ONLY.test(raw))) this.subParse(raw, depth + 1);
+    // Collected within the bound: never more than MAX_QUALIFIER_CODES distinct codes (and each is dequoted only once it is taken).
     const codes = new Set();
-    for (const code of qualifierCodes(raw)) { codes.add(code); codes.add(dequote(code)); }
-    for (const code of qualifierCodes(deq)) codes.add(code);
-    codes.delete('');
+    let cut = false;
+    let chars = 0;
+    const take = (withDeq) => (code) => {
+      if (code === '' || codes.has(code)) return true;
+      if ((chars += code.length) > MAX_QUALIFIER_CHARS) return false;
+      codes.add(code);
+      if (withDeq) { const d = dequote(code); chars += d.length; codes.add(d); }
+      codes.delete('');
+      return codes.size <= MAX_QUALIFIER_CODES && chars <= MAX_QUALIFIER_CHARS;
+    };
+    const expired = this.ctx.expired;
+    cut = qualifierCodes(raw, take(true), expired) || qualifierCodes(deq, take(false), expired);
+    if (cut) { this.ctx.truncated = true; if (expired?.()) this.ctx.stopped = true; }
     let n = 0;
     for (const code of codes) {
-      if (++n > MAX_QUALIFIER_CODES) { this.ctx.truncated = true; break; }
+      if (++n > MAX_QUALIFIER_CODES) break;
+      if (expired?.()) { this.ctx.truncated = true; this.ctx.stopped = true; break; }
       this.subParse(code, depth + 1);
     }
   }
