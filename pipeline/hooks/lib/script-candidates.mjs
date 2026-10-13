@@ -48,8 +48,9 @@ export function paramReadings(word) {
       let depth = 1;
       let j = m.index + m[0].length;
       for (; j < s.length && depth; j++) { if (s[j] === '{') depth++; else if (s[j] === '}') depth--; }
-      if (depth) { next.add(s); continue; } // no closing brace: left as written
-      const body = s.slice(m.index + m[0].length, j - 1);
+      const body = depth ? '' : s.slice(m.index + m[0].length, j - 1);
+      // Why: a reading is only built when the expansion's extent is certain: the closing brace was found, and the word holds no quote, backslash or half-open $( ) (a brace inside them ends the expansion elsewhere; parentheses on their own are plain characters)
+      if (depth || /['"`\\]/.test(body) || (body.includes('$(') && [...body].reduce((n, ch) => n + (ch === '(' ? 1 : ch === ')' ? -1 : 0), 0) !== 0)) { over = true; next.add(s); continue; }
       const pre = s.slice(0, m.index);
       const post = s.slice(j);
       const alts = m[3] === '+' ? [body, ''] : m[3] === '?' ? [`\${${m[1]}}`] : [`\${${m[1]}}`, body, ''];
@@ -67,15 +68,30 @@ export function paramReadings(word) {
 // The command lines a program named by a variable or a default word may run, with its arguments (`G=bash; $G ev.sh`, `"${X:-bash}" ev.sh`): the policies judge each as text one level
 // deeper. A single-word reading holding a `/` is a path: the candidate list judges the file as a script.
 const quoteWord = (w) => (/^[\w@%+=:,./-]+$/.test(w) ? w : `"${w.replace(/[\\"`]/g, '\\$&')}"`);
-export function execLinesOf(sf, expand) {
+// Why: `: ${X:=w}` / `${X=w}` assigns X for the commands after it, so a later `$X` may be w: the words such an expansion assigns, by name
+const ASSIGNING = /\$\{([A-Za-z_]\w*):?=([^}]*)\}/g;
+export function assigningDefaults(text) {
+  const out = new Map();
+  for (const m of String(text ?? '').matchAll(ASSIGNING)) out.set(m[1], [...(out.get(m[1]) ?? []), m[2]]);
+  return out;
+}
+// the readings of a word, plus those with a name an assigning expansion may have set replaced by the words it assigns
+export function readingsOf(word, assigned) {
+  const rs = paramReadings(word);
+  if (!assigned?.size) return rs;
+  const out = new Set(rs);
+  for (const r of rs) for (const [n, ws] of assigned) if (new RegExp(`\\$(?:\\{${n}\\}|${n}(?![A-Za-z0-9_]))`).test(r)) for (const w of ws) out.add(r.replace(new RegExp(`\\$(?:\\{${n}\\}|${n}(?![A-Za-z0-9_]))`, 'g'), () => w));
+  const list = [...out].slice(0, MAX_READINGS);
+  return Object.defineProperty(list, 'over', { value: rs.over || out.size > MAX_READINGS, enumerable: false });
+}
+// The command lines a program named by a variable or a default word may run, with its arguments (`G=bash; $G ev.sh`, `"${X:-bash}" ev.sh`): the policies judge each as text one level deeper.
+export function execLinesOf(sf, expand, assigned) {
   if (sf.kind !== 'exec' || sf.words?.length !== 1 || !sf.words[0].includes('$')) return [];
   const w0 = sf.words[0];
   const out = [];
-  for (const r of paramReadings(w0)) {
+  for (const r of readingsOf(w0, assigned)) {
     const e = expand(r).trim();
-    if (e === '' || e === w0 || /\$\(|`/.test(e)) continue;
-    const multi = /\s/.test(e);
-    if (!multi && (e.includes('/') || e.startsWith('$'))) continue; // a path (candidates), or still unknown
+    if (e === '' || e === w0 || e.startsWith('$') || /\$\(|`/.test(e)) continue;
     out.push([e, ...(sf.args ?? []).map(quoteWord)].join(' '));
   }
   return [...new Set(out)];
@@ -254,7 +270,7 @@ export function scriptCandidates(sf, deps) {
   try { return buildCandidates(sf, deps); } catch { return { files: [], dynamic: false, over: true }; }
 }
 
-function buildCandidates(sf, { expand, dirs, joinPath, readDir, ifs }) {
+function buildCandidates(sf, { expand, dirs, joinPath, readDir, ifs, assigned }) {
   const files = new Set();
   const budget = { work: 0, steps: 0, over: false };
   let dynamic = false;
@@ -264,7 +280,7 @@ function buildCandidates(sf, { expand, dirs, joinPath, readDir, ifs }) {
   const add = (c) => { if (!sf.needExt || SCRIPT_EXT.test(c)) files.add(c); };
   const words = [];
   for (const w0 of sf.words ?? []) {
-    const rs = paramReadings(w0);
+    const rs = readingsOf(w0, assigned);
     if (rs.over) return { files: [], dynamic, over: true };
     words.push(...rs);
   }

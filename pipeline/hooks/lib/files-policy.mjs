@@ -20,7 +20,7 @@ import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
 import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
-import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit, execLinesOf, paramReadings } from './script-candidates.mjs';
+import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit, execLinesOf, paramReadings, assigningDefaults } from './script-candidates.mjs';
 
 const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
@@ -1625,11 +1625,11 @@ function judgeWrittenScript(w, sf, abs, dir, ctx, opts, scanRaw) {
 // names a protected pipeline file.
 function judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw) {
   const joinPath = (d, r) => (isAbs(r) ? posix.normalize(r) : posix.join(d, r));
-  for (const line of execLinesOf(sf, (w) => expandRefs(w, ctx))) {
+  for (const line of execLinesOf(sf, (w) => expandRefs(w, ctx), ctx.assigned)) {
     if ((opts._depth ?? 0) >= 4) return deny('the command line held in a variable is nested too deeply to check');
     // run in every directory the command may be in, with the line's variables
     for (const d of dirs) {
-      const r = evaluateBashForFiles(line, { ...opts, cwd: d, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) } });
+      const r = evaluateBashForFiles(line, { ...opts, cwd: d, _assigned: ctx.assigned, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) } });
       if (r.decision === 'deny') return deny(`the command line ${sf.words[0]} expands to would run: ${r.reason}`);
     }
   }
@@ -1640,10 +1640,10 @@ function judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw) {
     const extra = writtenNamesIn(ctx.frames, d);
     return extra.length ? [...r, ...extra] : r;
   };
-  let c = scriptCandidates(sf, { expand: (w) => expandRefs(w, ctx), dirs, joinPath, readDir, ifs: ctx.vars.IFS });
+  let c = scriptCandidates(sf, { expand: (w) => expandRefs(w, ctx), dirs, joinPath, readDir, ifs: ctx.vars.IFS, assigned: ctx.assigned });
   // a backslash in a word is a file name character off Windows, but expandRefs reads it as a separator: expand (and glob) that reading too
   if (!c.over && !sf.unresolvable && sf.words.some((w) => mayHoldBackslash(w, ctx))) {
-    const k = scriptCandidates(sf, { expand: (w) => expandKeepingBackslash(w, ctx), dirs, joinPath, readDir, ifs: ctx.vars.IFS });
+    const k = scriptCandidates(sf, { expand: (w) => expandKeepingBackslash(w, ctx), dirs, joinPath, readDir, ifs: ctx.vars.IFS, assigned: ctx.assigned });
     c = { files: [...new Set([...c.files, ...k.files])], dynamic: c.dynamic || k.dynamic, over: k.over };
   }
   if (c.over) return deny('too many words, a glob matching too many files, or glob syntax that cannot be resolved could be the script this command runs, so it cannot be checked; name the script file');
@@ -1749,6 +1749,12 @@ const HOME_NAMES = new Set(['HOME', 'USER', 'LOGNAME', 'USERPROFILE', 'USERNAME'
 // What the text of a file run in the current shell leaves behind: { vars: Map(name -> text | null), cds: [word], all }. A name is null (unknown) when it is set
 // where it may not run, more than once, from a command's output, or by a builtin that binds it at run time; `all`: the file can set any name (eval, a nested
 // source, a parse cut short, a command named at run time), so no name is known any more. Only the first-level assignments are followed, not functions called later.
+// the names a text defines as functions (`function f`, `f()`) or aliases
+function definedNames(text) {
+  const names = new Set([...text.matchAll(/(?:^|[\n;&|({])\s*function\s+([^\s(){;'"$`]+)/g), ...text.matchAll(/(?:^|[\n;&|({])\s*([^\s(){;'"$`=]+)\s*\(\s*\)/g)].map((m) => m[1]));
+  for (const a of text.matchAll(/\balias\s+([^;&|\n]*)/g)) for (const m of a[1].matchAll(/(?:^|\s)([^\s=]+)=/g)) names.add(m[1]);
+  return names;
+}
 function sourcedEffects(text, ctx) {
   const out = { vars: new Map(), cds: [], all: false, unknownCd: false };
   const cmds = simpleCommands(text, { bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline });
@@ -1757,7 +1763,7 @@ function sourcedEffects(text, ctx) {
   const seen = new Map();
   const local = Object.create(null);
   // (a function the file defines is vetted through its own body, whose commands are in the list; the definition itself shows up as a command named like the function)
-  const fns = new Set([...text.matchAll(/(?:^|[\n;&|({])\s*function\s+([^\s(){;'"$`]+)/g), ...text.matchAll(/(?:^|[\n;&|({])\s*([^\s(){;'"$`=]+)\s*\(\s*\)/g)].map((m) => m[1]));
+  const fns = definedNames(text);
   const set = (k, v, sure) => {
     if (HOME_NAMES.has(k)) return;
     const n = (seen.get(k) ?? 0) + 1;
@@ -1769,6 +1775,8 @@ function sourcedEffects(text, ctx) {
     const sure = !(inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || c.sep === '|' || cmds[i + 1]?.sep === '|' || cmds[i + 1]?.sep === '&');
     if (!c.argv.length) { for (const [k, v] of Object.entries(c.env ?? {})) set(k, v, sure); continue; }
     const name = baseOf(c.argv[0]);
+    // Why: a function or alias the LINE defines may stand behind a name that looks harmless (`ls() { read F; }`), and a nameref (`declare -n r=F`) binds F through another name
+    if (ctx.lineDefs?.has(name) || (['declare', 'typeset', 'local'].includes(name) && c.argv.slice(1).some((a) => /^[-+][A-Za-z]*n/.test(a)))) { out.all = true; continue; }
     if (VAR_COMMANDS.has(name)) {
       const d = declAttrs(c.argv);
       for (const [k, v] of d.assigns) set(k, v, sure && !d.unknown && !d.transform && name !== 'local');
@@ -1781,9 +1789,12 @@ function sourcedEffects(text, ctx) {
       const cdpath = (ctx.env?.CDPATH ?? '') !== '' || (ctx.vars.CDPATH ?? '') !== '' || out.vars.has('CDPATH') || ctx.pickUnknown.has('CDPATH') || ctx.srcChanged.has('CDPATH') || (c.env?.CDPATH ?? '') !== '';
       if (cdUnknownShape(c.argv) || (v !== undefined && /[`$*?[{]/.test(v)) || (cdpath && v !== undefined && !isAbs(toPosix(v)) && !/^(?:\.\.?(?:[\\/]|$)|~)/.test(v))) out.unknownCd = true;
       else out.cds.push(t ?? '~');
+      set('PWD', null, false); set('OLDPWD', null, false); // (cd rebinds both)
     }
     else if (BINDERS.has(name)) {
       // (a name that is not a plain word -- `read "$1"`, `unset $n`, `getopts ab "$v"` -- may be any)
+      // (and the names they bind without being given them)
+      for (const k of name === 'getopts' ? ['OPTARG', 'OPTIND'] : name === 'mapfile' || name === 'readarray' ? ['MAPFILE'] : name === 'read' || name === 'select' ? ['REPLY'] : []) set(k, null, false);
       for (const a of c.argv.slice(1)) { const m = /^[A-Za-z_]\w*/.exec(a); if (m) set(m[0], null, false); else if (/[$`*?[{\\'"(~]/.test(a)) out.all = true; }
     }
     // (an allowlist, as for the script-directory names: a command outside it -- a zsh binder, a function the file defines, anything unknown -- may bind any name)
@@ -1823,7 +1834,7 @@ function sourcedTexts(rec, dirs, ctx) {
       const extra = writtenNamesIn(ctx.frames, d);
       return extra.length ? [...r, ...extra] : r;
     };
-    const c = scriptCandidates(rec, { expand: (w) => expandRefs(w, ctx), dirs, joinPath, readDir, ifs: ctx.vars.IFS });
+    const c = scriptCandidates(rec, { expand: (w) => expandRefs(w, ctx), dirs, joinPath, readDir, ifs: ctx.vars.IFS, assigned: ctx.assigned });
     if (c.over || c.dynamic) unknown = true;
     for (const file of c.files) for (const abs of new Set(isAbs(toPosix(file)) ? [posix.normalize(toPosix(file))] : dirs.map((d) => posix.join(d, toPosix(file))))) consider(abs); // (candidates are words: relative ones are looked up in every directory)
     return { texts, unknown };
@@ -1909,6 +1920,9 @@ function evaluateBashForFilesFrame(command, opts) {
   if (assumedCwd) opts = { ...opts, _assumedCwd: false };
   checkDeadline(opts._budget);
   const ctx = makeCtx(opts);
+  ctx.lineDefs = definedNames(typeof command === 'string' ? command : '');
+  ctx.assigned = assigningDefaults(typeof command === 'string' ? command : ''); // (and those of the line this text was made from: `: ${X:=w}; G=bash; $G $X`)
+  for (const [n, ws] of opts._assigned ?? []) ctx.assigned.set(n, [...(ctx.assigned.get(n) ?? []), ...ws]);
   opts = { ...opts, _selfZero: null, _selfBash: null, _selfAbs: false, _selfZsh: false }; // (only the script file judged right now has a $0; text it runs or reads has none)
   if (ctx.admin) return allow();
   const raw = typeof command === 'string' ? command : '';

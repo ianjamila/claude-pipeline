@@ -114,3 +114,79 @@ test('F2b 91: default words that do not spell a protected path stay allowed', ()
     assert.equal(d.decision, 'allow', `${c} -> ${d.reason}`);
   }
 });
+
+// ---- 93: what a sourced file's allowlisted commands still bind ------------------------------------------------------------------------------------------
+const filesIn = (command, fsOpts, o = {}) => evaluateBashForFiles(command, { home: '/home/u', env: {}, platform: 'linux', realpath: (p) => p, cwd: PROJ, ...fsOpts, existsSync: fsOpts.pathExists, ...o });
+const DIRS93 = ['bin', 'sub', '/home/u', '/tmp'];
+const rcTree = (body) => fakeFs(PROJ, { 'set.sh': `${body}\n`, 'evil.sh': BAD_WRITE, 'ok.sh': 'echo ok' }, DIRS93);
+
+// Why: read / select / mapfile / getopts / cd bind names they are not given (REPLY, MAPFILE, OPTARG, OPTIND, PWD, OLDPWD); a nameref (`declare -n r=F; r=x`) binds F through another name; a function or
+// alias the LINE defines can be called by an allowlisted-looking command of the sourced file.
+test('F2b 93: implicit binders, namerefs and line-defined functions / aliases make the name a later word picks unknown', () => {
+  const cases = [
+    ['REPLY', 'read <<< evil.sh'],
+    ['REPLY', 'select x in a; do break; done'],
+    ['MAPFILE', 'mapfile < evil.list'],
+    ['MAPFILE', 'readarray -t < evil.list'],
+    ['OPTARG', 'getopts "a:" x -a evil.sh'],
+    ['OPTIND', 'getopts "a:" x -a evil.sh'],
+    ['PWD', 'cd sub'],
+    ['OLDPWD', 'cd sub'],
+    ['F', 'declare -n r=F; r=evil.sh'],
+    ['F', 'typeset -n r=F; r=evil.sh'],
+    ['F', 'local -n r=F; r=evil.sh'],
+    ['F', 'export -n r=x; declare -n q=F; q=evil.sh'],
+  ];
+  for (const [n, body] of cases) {
+    const d = filesIn(`${n}=ok.sh; source set.sh; bash ${D}${n}`, rcTree(body));
+    assert.equal(d.decision, 'deny', `${n}: ${body} -> ${d.reason}`);
+  }
+  const defined = [
+    ['ls() { read F; }', 'ls <<< evil.sh'],
+    ['function ls { read F; }', 'ls <<< evil.sh'],
+    ["alias ls='read F'", 'ls <<< evil.sh'],
+    ['cat() { F=evil.sh; }', 'cat'],
+  ];
+  for (const [pre, body] of defined) {
+    const d = filesIn(`${pre}; F=ok.sh; source set.sh; bash ${D}F`, rcTree(body));
+    assert.equal(d.decision, 'deny', `${pre} / ${body} -> ${d.reason}`);
+  }
+  // (what stays modelled)
+  for (const calm of ['echo hi', 'set -eu', 'set -o allexport', 'set -- a b', 'export -n G', 'ls >/dev/null; test -d sub', 'cat set.sh']) {
+    const d = filesIn(`F=ok.sh; source set.sh; bash ${D}F`, rcTree(calm));
+    assert.equal(d.decision, 'allow', `${calm} -> ${d.reason}`);
+  }
+});
+
+// ---- 94: exactness of the readings (nested words, word splitting, globs, assigning expansions, forms that stay unresolved) ------------------------------------------------------------------------
+for (const [name, run] of runners) {
+  test(`F2b 94 ${name}: nested defaults, an unquoted default that is a command plus arguments, a glob and an assigning expansion are all judged`, () => {
+    for (const c of [
+      `${D}{X:-${D}{Y:-./ev.sh}} h.sh`,
+      `${D}{X:-bash ev.sh} h.sh`,
+      `${D}{X:-./e*.sh} h.sh`,
+      `: ${D}{X:=./ev.sh}; bash ${D}X`,
+      `: ${D}{X=./ev.sh}; "${D}X" h.sh`,
+      `: ${D}{X:=ev.sh}; bash "${D}{X}"`,
+      `: ${D}{X:=ev.sh}; G=bash; ${D}G ${D}X`,
+    ]) {
+      const d = run(c);
+      assert.equal(d.decision, 'deny', `${c} -> ${d.reason}`);
+    }
+  });
+
+  test(`F2b 94 ${name}: an expansion whose extent cannot be told (a brace inside quotes or a half-open substitution, unbalanced) is refused, never read as a literal word`, () => {
+    for (const c of [`"${D}{X:-"a b"}" c`, `${D}{X:-${D}(echo })} c`, `${D}{X:-"}"} c`, `bash ${D}{X:-"}"}`, `${D}{X:-a`]) {
+      const d = run(c);
+      assert.equal(d.decision, 'deny', `${c} -> ${d.reason}`);
+    }
+  });
+}
+
+test('F2b 94 guard-git: forms that stay unresolved (length, substring, indirection, substitution, case) are not read as a literal word', () => {
+  const MENTION = `echo "${GUARDED}"\n`;
+  for (const form of [`${D}{#X}`, `${D}{X:1:3}`, `${D}{!X}`, `${D}{X/a/b}`, `${D}{X^^}`, `${D}{=X}`]) {
+    const d = runners[0][1](`${MENTION}X=ok.sh; ${form} h.sh`);
+    assert.equal(d.decision, 'deny', `${form} -> ${d.reason}`);
+  }
+});

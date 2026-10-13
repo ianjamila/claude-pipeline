@@ -18,7 +18,7 @@ import path from 'node:path';
 import { commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform } from './shell-parse.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow } from './line-writes.mjs';
-import { scriptCandidates, execLinesOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
+import { scriptCandidates, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
 
 const PROTECTED_BRANCHES = ['main', 'master'];
 const APPROVAL_LABELS = ['human-approved', 'test-change-approved'];
@@ -1258,6 +1258,8 @@ function judgeScoped(text, dir, ctx, level, sf) {
 // word the shell runs is unknown. Judge every word that could be it (see script-candidates.mjs) like a named script. A
 // word that is still unknown (`$UNSET`) cannot be judged: denied when the line mentions a guarded operation, as for a
 // script named at run time.
+// the words `${N:=w}` expansions of the whole line (and the text being judged) may assign
+const assignedOf = (ctx) => (ctx.assigned ??= assigningDefaults(`${ctx.fullText}\n${ctx.lineText}`));
 function checkCandidateScripts(sf, dir, ctx, level) {
   const here = path.resolve(dir ?? ctx.cwd);
   const expand = (w) => {
@@ -1273,7 +1275,7 @@ function checkCandidateScripts(sf, dir, ctx, level) {
   }
   // after a cd that may not have run, a relative word (or a glob over one) names a file in an unknown directory
   if (dir === null && sf.kind !== 'scan' && sf.words.some((w) => !path.isAbsolute(expand(w)))) return deny('cannot tell which directory this runs in, so which script it runs cannot be verified. Use an absolute path, or chain the cd with &&.');
-  for (const line of execLinesOf(sf, expand)) {
+  for (const line of execLinesOf(sf, expand, assignedOf(ctx))) {
     if (level >= MAX_NESTING) return deny('the command line held in a variable is nested too deeply to verify.');
     const v = judgeScoped(line, dir, ctx, level, { kind: 'shell' });
     if (v.decision === 'deny') return deny(`the command line ${sf.words[0]} expands to would run a blocked command: ${v.reason}`);
@@ -1285,7 +1287,7 @@ function checkCandidateScripts(sf, dir, ctx, level) {
     const extra = writtenNamesIn(ctx.writeFrames, d);
     return extra.length ? [...r, ...extra] : r;
   };
-  const c = scriptCandidates(sf, { expand, dirs: [here], joinPath: (d, r) => path.resolve(d, r), readDir, ifs: ctx.vars.IFS });
+  const c = scriptCandidates(sf, { expand, dirs: [here], joinPath: (d, r) => path.resolve(d, r), readDir, ifs: ctx.vars.IFS, assigned: assignedOf(ctx) });
   if (c.over) return deny('too many words, a glob matching too many files, or glob syntax that cannot be resolved could be the script this command runs, so it cannot be verified. Name the script file.');
   if (c.dynamic && GUARDED_WORDS.test(ctx.fullText)) {
     return deny('which word is the script this command runs is only known at run time ($VAR / $(...) / a glob) and the line mentions a guarded operation, so it cannot be verified. Name the file and write the options literally.');
