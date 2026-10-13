@@ -900,17 +900,19 @@ test('a backslash that reaches the script name through a variable is a file name
 test('guard-git: a default word in a script or option position is judged on every reading', () => {
   for (const c of [
     'bash ${A:-./f.sh}', 'bash ${A:-f.sh}', 'bash ${A-./f.sh}', 'bash ${A:=./f.sh}', 'bash ${A:+./f.sh}', 'A=x; bash ${A:+./f.sh}', 'source ${A:-f.sh}', 'bash -x ${A:-./f.sh}',
+    'bash ${1:-./f.sh}', 'bash ${@:-./f.sh}', 'bash ${*:--c ./f.sh}', 'bash ${A[0]:-./f.sh}', 'bash ${A[@]:--c ./f.sh}', 'bash ${!A:-./f.sh}', 'bash ${#:-./f.sh}',
     'bash ${A:--c ./f.sh}', 'bash ${A:--c "./f.sh"}', 'sh ${A:--c ./f.sh}', 'bash ${A:--s} < f.sh', 'bash ${A-s} < f.sh', 'bash ${A:--c "bash f.sh"}',
   ]) assert.equal(git(c).decision, 'deny', c);
-  for (const c of ['bash ${A:-./ok.sh}', 'bash ${A:-ok.sh}', 'bash ${A:--c ./ok.sh}', 'bash ${A:--s} < ok.sh', 'sh ${A:--c ./ok.sh}', 'A=x; bash ${A:+./ok.sh}', 'echo ${A:-./f.sh}'])
+  for (const c of ['bash ${A:-./ok.sh}', 'bash ${A:-ok.sh}', 'bash ${A:--c ./ok.sh}', 'bash ${A:--s} < ok.sh', 'sh ${A:--c ./ok.sh}', 'A=x; bash ${A:+./ok.sh}', 'echo ${A:-./f.sh}', 'bash ${1:-./ok.sh}', 'bash ${A[0]:--c ./ok.sh}', 'bash ${!A:-./ok.sh}'])
     assert.equal(git(c).decision, 'allow', c);
 });
 
 test('guard-files: a default word in a script or option position is judged on every reading', () => {
   for (const c of [
     'bash ${A:-./w.sh}', 'bash ${A:-w.sh}', 'bash ${A-./w.sh}', 'bash ${A:=./w.sh}', 'bash ${A:+./w.sh}', 'A=x; bash ${A:+./w.sh}', 'source ${A:-w.sh}', 'bash -x ${A:-./w.sh}',
+    'bash ${1:-./w.sh}', 'bash ${@:-./w.sh}', 'bash ${*:--c ./w.sh}', 'bash ${A[0]:-./w.sh}', 'bash ${A[@]:--c ./w.sh}', 'bash ${!A:-./w.sh}', 'bash ${#:-./w.sh}',
     'bash ${A:--c ./w.sh}', 'bash ${A:--c "./w.sh"}', 'sh ${A:--c ./w.sh}', 'bash ${A:--s} < w.sh', 'bash ${A-s} < w.sh',
   ]) assert.equal(files(c).decision, 'deny', c);
-  for (const c of ['bash ${A:-./ok.sh}', 'bash ${A:-ok.sh}', 'bash ${A:--c ./ok.sh}', 'bash ${A:--s} < ok.sh', 'sh ${A:--c ./ok.sh}', 'A=x; bash ${A:+./ok.sh}', 'echo ${A:-./w.sh}'])
+  for (const c of ['bash ${A:-./ok.sh}', 'bash ${A:-ok.sh}', 'bash ${A:--c ./ok.sh}', 'bash ${A:--s} < ok.sh', 'sh ${A:--c ./ok.sh}', 'A=x; bash ${A:+./ok.sh}', 'echo ${A:-./w.sh}', 'bash ${1:-./ok.sh}', 'bash ${A[0]:--c ./ok.sh}', 'bash ${!A:-./ok.sh}'])
     assert.equal(files(c).decision, 'allow', c);
 });

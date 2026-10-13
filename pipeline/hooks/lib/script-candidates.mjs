@@ -35,7 +35,8 @@ export function execLineOf(sf, expand) {
 // Why: `${X:-w}`, `${X-w}`, `${X:=w}`, `${X:+w}` read as the value of X, the word w or nothing, depending on a state the guard does not see: every reading is judged (the value as `${X}`,
 // which a policy expands from the variables of the line). `over`: more readings than MAX_READINGS (the caller refuses).
 const MAX_READINGS = 32;
-const PARAM_OPEN = /\$\{([A-Za-z_]\w*)(:?)([-=+?])/;
+// (a parameter is a name, a name[subscript], a digit or a special parameter, optionally indirect: ${1:-w}, ${@:-w}, ${A[0]:-w}, ${!A:-w})
+const PARAM_OPEN = /\$\{(!?(?:[A-Za-z_]\w*(?:\[[^\]}]*\])?|\d+|[@*#?$!-]))(:?)([-=+?])/;
 export function paramReadings(word) {
   let list = [word];
   let over = false;
