@@ -557,7 +557,8 @@ function arithAssignsByName(line) {
   const d = p < 0 ? -1 : line.indexOf('$', p);
   return d >= 0 && line.indexOf('=', d) >= 0;
 }
-function bindsBash(str) {
+function bindsBash(text) {
+  const str = text.replace(/\\\r?\n/g, ''); // (a backslash-newline inside a name is removed before the shell reads it: `BA\<nl>SH=x` binds BASH)
   const mentions = (s) => /(?<![A-Za-z0-9_])BASH(?![A-Za-z0-9_])/.test(s.replace(BASH_REF, ''));
   if (mentions(str) || mentions(str.replace(/['"\\]/g, ''))) return true;
   if (/(?<![\w./$-])(?:source|eval)(?![\w-])/.test(str)) return true;
@@ -1953,7 +1954,7 @@ class Parser {
     // the name. Every other spelling (`$BASH f.sh` vanishes under zsh and runs f.sh itself) keeps its run-time head AND adds the bash / sh readings, so it is judged as strictly as either
     let bashAlso = null;
     if (a.length && BASH_WORD.test(a[0])) {
-      if (this.ctx.bashPlain && BASH_DEFAULT.test(a[0])) a = ['bash', ...a.slice(1)];
+      if (this.ctx.bashPlain && BASH_DEFAULT.test(a[0])) { a = ['bash', ...a.slice(1)]; if (this.ctx.bashState) this.ctx.bashState.rewrote = true; }
       else bashAlso = a.slice(1);
     }
     // a command name that is only known at run time ($g push, $(echo git) push)
@@ -2256,11 +2257,16 @@ export function simpleCommands(str, opts) {
   const requested = Number.isFinite(opts?.maxDepth) ? Math.trunc(opts.maxDepth) : 5;
   // opts.expired: () => true once the evaluation's wall-clock deadline has passed; scans that can run long poll it and give up (truncated)
   const expired = typeof opts?.expired === 'function' ? opts.expired : null;
-  const ctx = { out: [], expired, maxDepth: Math.min(Math.max(requested, 0), HARD_MAX_DEPTH), truncated: false, dynamic: false, subshell: false, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false };
+  const bashState = opts?.bashState; // the evaluation's shared record of the BASH rewrite (see below)
+  const ctx = { out: [], expired, maxDepth: Math.min(Math.max(requested, 0), HARD_MAX_DEPTH), truncated: false, dynamic: false, subshell: false, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState };
   let parser = null;
   try {
     parser = new Parser(ctx, String(str ?? ''));
-    ctx.bashPlain = (opts?.env ?? process.env).BASH === undefined && !bindsBash(parser.src);
+    // Why: every text of an evaluation (script, startup file, file the line wrote, heredoc body, nested frame) is parsed apart, but another text may bind BASH for the shell that runs this
+    // one. The first text that can bind it ends the rewrite for every text after it; a text already rewritten before that is stale, and the policy reruns the evaluation (bashState.bound)
+    const binds = bindsBash(parser.src);
+    if (binds && bashState) bashState.bound = true;
+    ctx.bashPlain = (opts?.env ?? process.env).BASH === undefined && !binds && !bashState?.bound;
     parser.parseTop(0);
   } catch {
     ctx.truncated = true;

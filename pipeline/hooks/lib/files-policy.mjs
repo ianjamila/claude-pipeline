@@ -211,6 +211,7 @@ function makeCtx(opts) {
     readDir: opts.readDir ?? defaultReadDir,
     admin: (opts.env ?? process.env).PIPELINE_ADMIN === '1',
     env: opts.env ?? process.env,
+    bashState: opts._bashState, // the BASH rewrite record of the whole evaluation (see evaluateBashForFilesUnchecked)
     hit: (p) => { const q = unFirm(p); return roots.some((r) => isInside(q, r, platform)); },
     hitAncestor: (p) => { const q = unFirm(p); return ancestors.some((a) => samePath(q, a, platform)); },
     unFirm,
@@ -1739,7 +1740,7 @@ const HOME_NAMES = new Set(['HOME', 'USER', 'LOGNAME', 'USERPROFILE', 'USERNAME'
 // source, a parse cut short, a command named at run time), so no name is known any more. Only the first-level assignments are followed, not functions called later.
 function sourcedEffects(text, ctx) {
   const out = { vars: new Map(), cds: [], all: false, unknownCd: false };
-  const cmds = simpleCommands(text, { expired: () => ctx.budget.now() > ctx.budget.deadline });
+  const cmds = simpleCommands(text, { bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline });
   if (cmds.truncated || cmds.dynamic) out.all = true;
   const from = flowStart(cmds);
   const seen = new Map();
@@ -1858,7 +1859,14 @@ function snapshotShell(ctx) {
 // ---- Bash --------------------------------------------------------------------------------------------
 
 export const evaluateBashForFiles = failClosed(evaluateBashForFilesUnchecked);
+// Why: see evaluateGitCommand: the first (outermost) call owns the BASH rewrite record; a text that binds BASH after another was rewritten makes the verdict stale, so the line is judged again with the rewrite off.
 function evaluateBashForFilesUnchecked(command, opts = {}) {
+  if (!opts._bashState) {
+    const state = { bound: false, rewrote: false };
+    const first = evaluateBashForFilesUnchecked(command, { ...opts, _bashState: state });
+    if (first.decision === 'deny' || !(state.bound && state.rewrote)) return first;
+    return evaluateBashForFilesUnchecked(command, { ...opts, _bashState: { bound: true, rewrote: false } });
+  }
   if (!opts._frames) opts = { ...opts, _frames: [] }; // the writes of this line and of the scripts it runs (shared with nested calls, popped on the way out)
   const depth = opts._frames.length;
   try {
@@ -1891,7 +1899,7 @@ function evaluateBashForFilesFrame(command, opts) {
   if (variantsOf(raw).some((t) => setsAdmin(t, ctx.platform) || setsAdmin(t.replace(/['"`]\s*\+\s*['"`]/g, '').replace(/['"`\\]/g, ''), ctx.platform))) return deny('the command sets PIPELINE_ADMIN; only the owner may set it, when launching Claude Code (naming it, e.g. in grep or prose, is fine)');
   if (hasDisableAll(raw) || hasDisableAll(flat)) return deny('the command mentions disableAllHooks, which would switch the pipeline hooks off');
 
-  const cmds = simpleCommands(raw, { env: opts.env ?? process.env, expired: () => opts._budget.now() > opts._budget.deadline }); // a scan that outlasts the deadline gives up: truncated, so denied
+  const cmds = simpleCommands(raw, { env: opts.env ?? process.env, bashState: opts._bashState, expired: () => opts._budget.now() > opts._budget.deadline }); // a scan that outlasts the deadline gives up: truncated, so denied
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (500 `true;` then
   // `e''cho x > ~/.cl""aude/settings.json` must not slip through on a text match).
   if (cmds.truncated) return deny('the command line is too complex to check (the parser gave up); split it into simpler commands');

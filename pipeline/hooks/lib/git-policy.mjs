@@ -1457,7 +1457,7 @@ function unsureVarReachingCommand(cmds, ctx) {
 function evalString(str, startDir, ctx, level) {
   checkDeadline(ctx.budget);
   if (level > MAX_NESTING) return deny('pipeline job start / alias is nested too deeply to verify.');
-  const cmds = simpleCommands(str, { env: ctx.env, expired: () => ctx.budget.now() > ctx.budget.deadline }); // a scan that outlasts the deadline gives up: truncated, so denied
+  const cmds = simpleCommands(str, { env: ctx.env, bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline }); // a scan that outlasts the deadline gives up: truncated, so denied
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (`g''it push` after
   // 500 `true;` must not slip through on a word match).
   if (cmds.truncated) return deny('command too complex to verify (the parser gave up). Split it into simpler commands.');
@@ -1609,7 +1609,15 @@ function judgeLongText(text) {
   return GUARDED_WORDS.test(text.replace(/['"`\\]/g, '')) ? deny('this text is too long to verify and mentions a guarded operation. Split it into simpler commands.') : allowed();
 }
 
-export function evaluateGitCommand(command, {
+// Why: "${BASH:-bash}" is rewritten to bash while no text judged so far can bind BASH (see simpleCommands); a text that binds it and is judged after a rewrite makes the verdict stale, so the whole
+// line is judged again with the rewrite off. (A denial stands: the second pass only adds readings.)
+export function evaluateGitCommand(command, opts = {}) {
+  const state = { bound: false, rewrote: false };
+  const first = evaluateGitOnce(command, opts, state);
+  if (first.decision === 'deny' || !(state.bound && state.rewrote)) return first;
+  return evaluateGitOnce(command, opts, { bound: true, rewrote: false });
+}
+function evaluateGitOnce(command, {
   cwd,
   home = os.homedir(),
   currentBranch = () => null,
@@ -1622,14 +1630,14 @@ export function evaluateGitCommand(command, {
   realpath = realpathSync.native, // symlinks followed when a write and a script are compared (tests fake it)
   now = Date.now, // injectable clock (tests)
   env = {}, // the hook process's environment (BASH_ENV / ENV / ZDOTDIR name startup files the shells run); {} keeps tests hermetic
-} = {}) {
+} = {}, bashState) {
   const text = typeof command === 'string' ? command : String(command ?? '');
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   const base = cwd || process.cwd();
   const ctx = {
     cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, readDir, readHead, realpath, env, budget: newEvalBudget(now), fullText: text, lineText: text,
     vars: Object.create(null), unsureVars: new Set(), tainted: new Set(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
-    branches: new Map(), cfgDirty: false, envCfgDirty: false, writeFrames: [],
+    branches: new Map(), cfgDirty: false, envCfgDirty: false, writeFrames: [], bashState,
   };
   // Why: a hook that throws or times out is allowed by Claude Code, so a limit hit (GuardLimit) and ANY other exception (a
   // readText that throws, a stack overflow) end here as a denial that names the cause.
