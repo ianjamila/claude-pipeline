@@ -279,8 +279,10 @@ export function summaryLine({ name, mode, dryRun, removed, wouldRemove, kept, re
 }
 
 // <PIPELINE_PRUNE_LOG_DIR or ~/.local/state/pipeline>/prune-<slug>.log, the last LOG_LINES runs. -> the file, or null.
+export const pruneLogDir = (env) => env.PIPELINE_PRUNE_LOG_DIR || path.join(os.homedir(), '.local', 'state', 'pipeline');
+
 function appendLog(env, slug, line) {
-  const dir = env.PIPELINE_PRUNE_LOG_DIR || path.join(os.homedir(), '.local', 'state', 'pipeline');
+  const dir = pruneLogDir(env);
   const file = path.join(dir, `prune-${safeName(slug)}.log`);
   mkdirSync(dir, { recursive: true });
   let lines = [];

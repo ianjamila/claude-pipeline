@@ -416,10 +416,13 @@ test('usage errors exit 2', () => {
 
 // ---- schedule: the nightly cron line (crontab and the time zone are injected; the real crontab is never touched) -----
 
-const { scheduleLine, applySchedule, run: runWorktrees } = await import('../pipeline/commands/worktrees.mjs');
+const { scheduleLine, applySchedule, detectTimezone, findOnPath, run: runWorktrees } = await import('../pipeline/commands/worktrees.mjs');
 
 const MARKER = '# claude-pipeline worktrees-prune worktrees-prune-0123456789ab';
-const LINE_ARGS = { nodePath: '/usr/bin/node', binPath: '/opt/p/pipeline/bin/pipeline.mjs', root: '/home/u/proj', at: '02:30', lockName: 'worktrees-prune-0123456789ab' };
+const LINE_ARGS = {
+  nodePath: '/usr/bin/node', binPath: '/opt/p/pipeline/bin/pipeline.mjs', root: '/home/u/proj', at: '02:30', lockName: 'worktrees-prune-0123456789ab',
+  pathDirs: ['/home/u/.nvm/bin', '/usr/bin'], logFile: '/home/u/.local/state/pipeline/cron-worktrees-prune-0123456789ab.log',
+};
 const OTHER_LINES = '# claude-memory-health\n17 3 * * * /home/u/bin/memory-health.sh\n# claude-notes-gitleaks\n*/30 * * * * /home/u/bin/notes-gitleaks.sh\n';
 
 // An in-memory crontab: read() answers the current text, write() records every replacement.
@@ -437,14 +440,21 @@ function fakeCrontab(initial = '') {
 test('scheduleLine: minute hour, cd into the root, node + bin, notify, marker last', () => {
   assert.equal(
     scheduleLine(LINE_ARGS),
-    `30 02 * * * cd '/home/u/proj' && /usr/bin/node /opt/p/pipeline/bin/pipeline.mjs worktrees prune --notify >/dev/null 2>&1 ${MARKER}`,
+    `30 02 * * * cd '/home/u/proj' && PATH='/home/u/.nvm/bin:/usr/bin:/bin' /usr/bin/node /opt/p/pipeline/bin/pipeline.mjs worktrees prune --notify >>'/home/u/.local/state/pipeline/cron-worktrees-prune-0123456789ab.log' 2>&1 ${MARKER}`,
   );
   assert.match(scheduleLine({ ...LINE_ARGS, at: '23:05' }), /^05 23 \* \* \* /);
 });
 
 test('scheduleLine: a root with spaces or a quote is single-quoted for the shell; node and bin paths with spaces too', () => {
   const line = scheduleLine({ ...LINE_ARGS, root: "/home/u/my proj/it's", nodePath: '/opt/my node/node', binPath: '/opt/p q/pipeline.mjs' });
-  assert.ok(line.includes(`cd '/home/u/my proj/it'\\''s' && '/opt/my node/node' '/opt/p q/pipeline.mjs' worktrees prune`), line);
+  assert.ok(line.includes(`cd '/home/u/my proj/it'\\''s' && PATH='/home/u/.nvm/bin:/usr/bin:/bin' '/opt/my node/node' '/opt/p q/pipeline.mjs' worktrees prune`), line);
+});
+
+test('scheduleLine: PATH lists the given dirs once, then /usr/bin:/bin; a log file with spaces or a quote is quoted', () => {
+  const line = scheduleLine({ ...LINE_ARGS, pathDirs: ['/a/bin', '/bin', '/a/bin'], logFile: "/l o/it's.log" });
+  assert.ok(line.includes("PATH='/a/bin:/bin:/usr/bin' "), line);
+  assert.ok(line.includes(`>>'/l o/it'\\''s.log' 2>&1`), line);
+  assert.ok(!line.includes('/dev/null'));
 });
 
 test('scheduleLine: % is escaped (cron turns a bare % into a newline); a newline in a path is refused', () => {
@@ -534,10 +544,12 @@ function scheduleWorld() {
   repo.write('a.txt', 'a\n');
   repo.commit('init');
   const ct = fakeCrontab(OTHER_LINES);
+  const logDir = tmp('cp-wtlog-');
+  const tools = { git: '/opt/git/bin/git', gh: '/opt/gh/bin/gh' };
   const ctx = (cwd = repo.dir, extra = {}) => ({
-    cwd, env: process.env, platform: 'linux', crontabFn: ct.fn, tzFn: () => 'Asia/Manila', nodePath: '/usr/bin/node', binPath: '/opt/p/pipeline/bin/pipeline.mjs', ...extra,
+    cwd, env: { ...process.env, PIPELINE_PRUNE_LOG_DIR: logDir }, platform: 'linux', whichFn: (cmd) => tools[cmd] ?? null, crontabFn: ct.fn, tzFn: () => 'Asia/Manila', nodePath: '/usr/bin/node', binPath: '/opt/p/pipeline/bin/pipeline.mjs', ...extra,
   });
-  return { repo, ct, ctx, run: (args, c = ctx()) => runWorktrees(['schedule', ...args], c) };
+  return { repo, ct, ctx, logDir, tools, run: (args, c = ctx()) => runWorktrees(['schedule', ...args], c) };
 }
 
 test('schedule --install: writes the repo-keyed line (default 02:30); --status and --remove follow', async () => {
@@ -547,7 +559,7 @@ test('schedule --install: writes the repo-keyed line (default 02:30); --status a
   assert.equal(r.exitCode, 0);
   assert.equal(r.output.ok, true);
   assert.equal(r.output.installed, true);
-  assert.equal(r.output.line, `30 02 * * * cd '${w.repo.dir}' && /usr/bin/node /opt/p/pipeline/bin/pipeline.mjs worktrees prune --notify >/dev/null 2>&1 # claude-pipeline worktrees-prune ${lockName}`);
+  assert.equal(r.output.line, `30 02 * * * cd '${w.repo.dir}' && PATH='/usr/bin:/opt/git/bin:/opt/gh/bin:/bin' /usr/bin/node /opt/p/pipeline/bin/pipeline.mjs worktrees prune --notify >>'${join(w.logDir, `cron-${lockName}.log`)}' 2>&1 # claude-pipeline worktrees-prune ${lockName}`);
   assert.equal(w.ct.box.text, `${OTHER_LINES}${r.output.line}\n`);
   const st = await w.run(['--status']);
   assert.deepEqual([st.exitCode, st.output.installed, st.output.line], [0, true, r.output.line]);
@@ -555,6 +567,49 @@ test('schedule --install: writes the repo-keyed line (default 02:30); --status a
   assert.deepEqual([rm.exitCode, rm.output.removed], [0, true]);
   assert.equal(w.ct.box.text, OTHER_LINES);
   assert.equal((await w.run(['--status'])).output.installed, false);
+});
+
+test('schedule --install: git or gh not found on PATH refuses with exit 2 and writes nothing; remove/status do not need them', async () => {
+  const w = scheduleWorld();
+  for (const missing of ['git', 'gh']) {
+    const r = await w.run(['--install'], w.ctx(w.repo.dir, { whichFn: (cmd) => (cmd === missing ? null : `/opt/${cmd}/bin/${cmd}`) }));
+    assert.equal(r.exitCode, 2, missing);
+    assert.equal(r.output.error, 'tool-missing');
+    assert.match(r.output.message, new RegExp(`${missing} was not found on PATH`));
+  }
+  assert.equal(w.ct.box.writes.length, 0);
+  const none = () => null;
+  assert.equal((await w.run(['--status'], w.ctx(w.repo.dir, { whichFn: none }))).exitCode, 0);
+  assert.equal((await w.run(['--remove'], w.ctx(w.repo.dir, { whichFn: none }))).exitCode, 0);
+});
+
+test('schedule --install creates the log directory so cron can open the redirect', async () => {
+  const w = scheduleWorld();
+  const nested = join(w.logDir, 'not', 'yet');
+  await w.run(['--install'], w.ctx(w.repo.dir, { env: { ...process.env, PIPELINE_PRUNE_LOG_DIR: nested } }));
+  assert.equal(existsSync(nested), true);
+});
+
+test('detectTimezone: timedatectl first, then the /etc/localtime link, then /etc/timezone last; a failing source is skipped', () => {
+  const val = (v) => () => v;
+  const boom = () => { throw new Error('no such file'); };
+  assert.equal(detectTimezone([val('Asia/Manila\n'), val('UTC'), val('Europe/Paris')]), 'Asia/Manila');
+  assert.equal(detectTimezone([val(null), val('America/New_York'), val('Stale/Zone')]), 'America/New_York');
+  assert.equal(detectTimezone([boom, val(''), val('Asia/Manila\n')]), 'Asia/Manila');
+  assert.equal(detectTimezone([boom, boom, boom]), null);
+  assert.equal(detectTimezone([val(null), val('  '), val(undefined)]), null);
+});
+
+test('findOnPath: the first executable match in PATH order, null when absent', { skip: process.platform === 'win32' }, () => {
+  const a = tmp('cp-wtpath-');
+  const b = tmp('cp-wtpath-');
+  writeFileSync(join(b, 'tool'), '#!/bin/sh\n');
+  chmodSync(join(b, 'tool'), 0o755);
+  writeFileSync(join(a, 'plain'), 'x');
+  chmodSync(join(a, 'plain'), 0o644);
+  assert.equal(findOnPath('tool', `${a}:${b}`), join(b, 'tool'));
+  assert.equal(findOnPath('plain', `${a}:${b}`), null);
+  assert.equal(findOnPath('missing', `${a}:${b}`), null);
 });
 
 test('schedule --install --at 04:15 uses that time; a bad --at is a usage error and writes nothing', async () => {
@@ -608,9 +663,12 @@ test('schedule through the CLI uses the system crontab: no crontab yet, then ins
     '',
   ].join('\n'));
   chmodSync(join(bin2, 'crontab'), 0o755);
+  writeFileSync(join(bin2, 'gh'), '#!/bin/sh\nexit 0\n'); // only has to exist: the install looks for it on PATH
+  chmodSync(join(bin2, 'gh'), 0o755);
+  const logs = tmp('cp-wtcronlog-');
   const cli = (...args) => {
     const r = spawnSync(process.execPath, [bin, 'worktrees', 'schedule', ...args], {
-      cwd: w.repo.dir, encoding: 'utf8', env: { ...process.env, PATH: `${bin2}:${process.env.PATH}` },
+      cwd: w.repo.dir, encoding: 'utf8', env: { ...process.env, PATH: `${bin2}:${process.env.PATH}`, PIPELINE_PRUNE_LOG_DIR: logs },
     });
     return { code: r.status, json: JSON.parse(r.stdout), stderr: r.stderr };
   };
@@ -619,8 +677,9 @@ test('schedule through the CLI uses the system crontab: no crontab yet, then ins
   assert.equal(inst.code, 0, inst.stderr);
   assert.equal(inst.json.installed, true);
   assert.equal(readFileSync(store, 'utf8'), `${inst.json.line}\n`);
-  assert.ok(inst.json.line.includes(`cd '${w.repo.dir}' && ${process.execPath} `), inst.json.line);
-  assert.ok(inst.json.line.includes(`${bin} worktrees prune --notify`), inst.json.line);
+  assert.ok(inst.json.line.includes(`cd '${w.repo.dir}' && PATH=`) && inst.json.line.includes(`' ${process.execPath} `), inst.json.line);
+  assert.ok(inst.json.line.includes(`${bin} worktrees prune --notify >>'${logs}/cron-`), inst.json.line);
+  assert.ok(inst.json.line.match(/PATH='([^']*)'/)[1].split(':').includes(bin2), inst.json.line); // the stub dir is where gh (and crontab) were found
   assert.equal(cli('--status').json.installed, true);
   assert.equal(cli('--remove').json.removed, true);
   assert.equal(readFileSync(store, 'utf8'), '');

@@ -509,8 +509,12 @@ Exit: 0 completed (also `skipped: "already running"` / `"git operation in progre
 `# claude-pipeline worktrees-prune <lock name>` at its end: `--install` adds it (or replaces it in place, so installing from the
 main checkout or any linked worktree gives the same single line) to run `worktrees prune --notify` from the main checkout at
 `--at HH:MM` (default `02:30`), `--remove` deletes it, `--status` says whether it is there. Every other crontab line is kept
-byte-for-byte. cron runs in the host's time zone: `--install` reports it as `timezone` and adds a `warning` when it is not
-`Asia/Manila` or cannot be read. The job only does what `worktrees.mode` allows, so a repository still on `report` just gets the report.
+byte-for-byte. cron's own `PATH` is only `/usr/bin:/bin`, so `--install` looks up `node`, `git` and `gh` on the current `PATH`
+(exit 2 `tool-missing` if `git` or `gh` is not found) and the job sets `PATH` to their directories plus `/usr/bin:/bin`. Its
+output is appended to `cron-<lock name>.log` in the prune log directory (`~/.local/state/pipeline`, or `PIPELINE_PRUNE_LOG_DIR`;
+created at install), so a failed start leaves a trace; the file is not rotated. cron runs in the host's time zone: `--install`
+reports it as `timezone` (from `timedatectl`, else the `/etc/localtime` link, else `/etc/timezone`) and adds a `warning` when
+it is not `Asia/Manila` or cannot be read. The job only does what `worktrees.mode` allows, so a repository still on `report` just gets the report.
 
 ## Where this differs from spec section 5.2
 

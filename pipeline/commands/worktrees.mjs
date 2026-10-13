@@ -4,7 +4,7 @@
 // default) and `off` change nothing, `--dry-run` never changes anything; keep-locks only protect, so they work in every
 // mode. The prune flow lives in lib/worktree-prune/run.mjs. Exit 0 completed (skips are normal), 2 usage / repo / config,
 // 3 GitHub unavailable. `schedule` adds, removes or reports one nightly cron line that runs `prune --notify` (Linux only).
-import { readFileSync } from 'node:fs';
+import { accessSync, constants, mkdirSync, readFileSync, readlinkSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EXIT, UsageError, parseCommandArgs } from '../lib/cli.mjs';
@@ -15,7 +15,7 @@ import { samePath } from '../lib/paths.mjs';
 import { run as runProc } from '../lib/proc.mjs';
 import { holdingRoot, listHolding, purgeHolding } from '../lib/worktree-prune/act.mjs';
 import { lockNameFor, modeAllows } from '../lib/worktree-prune/rules.mjs';
-import { loadRepo, prune } from '../lib/worktree-prune/run.mjs';
+import { loadRepo, prune, pruneLogDir } from '../lib/worktree-prune/run.mjs';
 
 export const meta = {
   summary: 'remove finished worktrees (prune), keep one with a lock (keep / unkeep), list or purge the holding folder',
@@ -112,13 +112,18 @@ const bareOrQuoted = (s) => (SAFE_WORD.test(s) ? s : shellQuote(s));
 
 export const scheduleMarker = (lockName) => `# claude-pipeline worktrees-prune ${lockName}`;
 
-// The crontab line. The root is always single-quoted; node and bin only when they need it. cron turns a bare % into a
-// newline, so each one is escaped; a newline in a path cannot be written to a crontab at all.
-export function scheduleLine({ nodePath, binPath, root, at, lockName }) {
+const CRON_PATH = ['/usr/bin', '/bin'];
+
+// The crontab line. cron's own PATH is just /usr/bin:/bin, so the job sets PATH to the directories of node, git and gh as
+// found at install time (plus those two), and appends all output to logFile so a startup failure leaves a trace. The root,
+// PATH and log file are always single-quoted; node and bin only when they need it. cron turns a bare % into a newline,
+// so each one is escaped; a newline in a path cannot be written to a crontab at all.
+export function scheduleLine({ nodePath, binPath, root, at, lockName, pathDirs, logFile }) {
   const m = AT_RE.exec(at ?? '');
   if (!m) throw new UsageError(`--at must be HH:MM (00-23:00-59), got ${JSON.stringify(at)}`);
-  if ([nodePath, binPath, root].some((p) => /[\r\n]/.test(p))) throw new UsageError('schedule: a path contains a newline, which a crontab line cannot hold');
-  const command = `cd ${shellQuote(root)} && ${bareOrQuoted(nodePath)} ${bareOrQuoted(binPath)} worktrees prune --notify >/dev/null 2>&1`;
+  if ([nodePath, binPath, root, logFile, ...pathDirs].some((p) => /[\r\n]/.test(p))) throw new UsageError('schedule: a path contains a newline, which a crontab line cannot hold');
+  const searchPath = [...new Set([...pathDirs, ...CRON_PATH])].join(':');
+  const command = `cd ${shellQuote(root)} && PATH=${shellQuote(searchPath)} ${bareOrQuoted(nodePath)} ${bareOrQuoted(binPath)} worktrees prune --notify >>${shellQuote(logFile)} 2>&1`;
   return `${m[2]} ${m[1]} * * * ${command.replace(/%/g, '\\%')} ${scheduleMarker(lockName)}`;
 }
 
@@ -173,14 +178,42 @@ function systemCrontab(op, text) {
   return undefined;
 }
 
-// The zone cron's times are local to: /etc/timezone, else timedatectl; null when neither answers.
-function systemTimezone() {
-  try {
-    const zone = readFileSync('/etc/timezone', 'utf8').trim();
-    if (zone) return zone;
-  } catch { /* not a Debian-style host */ }
-  const r = runProc('timedatectl', ['show', '-p', 'Timezone', '--value']);
-  return r.code === 0 && r.stdout.trim() ? r.stdout.trim() : null;
+// The zone cron's times are local to, from the most to the least trustworthy source: timedatectl, the /etc/localtime
+// symlink (what cron follows), /etc/timezone (can be stale). Each source returns a string or null/throws when it has no
+// answer; null when none answers. The sources are injectable for tests.
+const REAL_SOURCES = [
+  () => {
+    const r = runProc('timedatectl', ['show', '-p', 'Timezone', '--value']);
+    return r.code === 0 ? r.stdout : null;
+  },
+  () => {
+    const target = readlinkSync('/etc/localtime');
+    const at = target.lastIndexOf('zoneinfo/');
+    return at === -1 ? null : target.slice(at + 'zoneinfo/'.length);
+  },
+  () => readFileSync('/etc/timezone', 'utf8'),
+];
+
+export function detectTimezone(sources = REAL_SOURCES) {
+  for (const source of sources) {
+    try {
+      const zone = source()?.trim();
+      if (zone) return zone;
+    } catch { /* this source has no answer */ }
+  }
+  return null;
+}
+
+// The absolute path of an executable on PATH, or null.
+export function findOnPath(cmd, pathEnv = process.env.PATH ?? '') {
+  for (const dir of pathEnv.split(path.delimiter).filter(Boolean)) {
+    const candidate = path.join(dir, cmd);
+    try {
+      accessSync(candidate, constants.X_OK);
+      return candidate;
+    } catch { /* not here */ }
+  }
+  return null;
 }
 
 const BIN_PATH = fileURLToPath(new URL('../bin/pipeline.mjs', import.meta.url));
@@ -202,8 +235,26 @@ async function schedule(rest, ctx) {
   const repo = await loadRepo(values, ctx);
   const lockName = lockNameFor(repo.commonDir);
   const marker = scheduleMarker(lockName);
-  const line = scheduleLine({ nodePath: ctx?.nodePath ?? process.execPath, binPath: ctx?.binPath ?? BIN_PATH, root: repo.root, at, lockName });
-  const result = applySchedule({ action, line, marker, crontabFn: ctx?.crontabFn ?? systemCrontab, tzFn: ctx?.tzFn ?? systemTimezone });
+  let line;
+  if (action === 'install') {
+    const which = ctx?.whichFn ?? ((cmd) => findOnPath(cmd, (ctx?.env ?? process.env).PATH));
+    const nodePath = ctx?.nodePath ?? process.execPath;
+    const tools = {};
+    for (const cmd of ['git', 'gh']) {
+      tools[cmd] = which(cmd);
+      if (!tools[cmd]) {
+        return { exitCode: EXIT.USAGE, output: { ok: false, error: 'tool-missing', message: `cannot install the schedule: ${cmd} was not found on PATH (cron's own PATH is only /usr/bin:/bin, so the job needs to know where it is)` } };
+      }
+    }
+    const logDir = pruneLogDir(ctx?.env ?? process.env);
+    mkdirSync(logDir, { recursive: true });
+    line = scheduleLine({
+      nodePath, binPath: ctx?.binPath ?? BIN_PATH, root: repo.root, at, lockName,
+      pathDirs: [...new Set([nodePath, tools.git, tools.gh].map((p) => path.dirname(p)))],
+      logFile: path.join(logDir, `cron-${lockName}.log`),
+    });
+  }
+  const result = applySchedule({ action, line, marker, crontabFn: ctx?.crontabFn ?? systemCrontab, tzFn: ctx?.tzFn ?? detectTimezone });
   return { exitCode: EXIT.OK, output: { ok: true, ...result } };
 }
 
