@@ -785,7 +785,7 @@ function resolveGlobCd(e, bases, ctx, cmds, idx) {
   if (/[{`$]|\*\*|[<>^#]|~/.test(e)) return null;
   // (the listing is the one NOW: a command before the cd that may create, remove, rename or link a path, a write redirect, a sourced file or a startup file makes it unknown)
   // (also what the calling line wrote before this script: a record or an unmodelled command in an enclosing frame)
-  if (unmodelledBefore(ctx.frames) || JSON.parse(writeSignature(ctx.frames)).some((a) => a.length > 0)) return null;
+  if (unmodelledBefore(ctx.frames) || JSON.parse(writeSignature(ctx.frames)).some(([opaque, recs]) => opaque || recs.length > 0)) return null;
   if (ctx.parentFsChanged || mayChangeListing(cmds, idx, ctx)) return null;
   const found = new Set();
   for (const b of isAbs(e) ? [''] : bases) {
