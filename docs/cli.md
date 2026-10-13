@@ -481,6 +481,7 @@ pipeline worktrees prune [--repo DIR] [--dry-run] [--notify]   -> {ok, mode, rem
 pipeline worktrees keep NAME [--reason TEXT] [--repo DIR]   -> {ok, slug, locked}
 pipeline worktrees unkeep NAME [--run ID] [--repo DIR]   -> {ok, slug, unlocked}
 pipeline worktrees holding [--purge] [--repo DIR]   -> {ok, batches:[...], purged:[...]}
+pipeline worktrees schedule (--install [--at HH:MM] | --remove | --status) [--repo DIR]   -> {ok, installed, line, timezone, warning?} | {ok, removed} | {ok, installed, line}
 ```
 
 Design: [docs/specs/2026-10-13-worktree-prune-design.md](specs/2026-10-13-worktree-prune-design.md). `--repo` may name the
@@ -500,8 +501,16 @@ governs every mutation:
 | `keep` / `unkeep` locks | yes | yes | yes | n/a |
 
 `unkeep` releases only a `pipeline-keep:` lock, and with `--run ID` only the one whose reason carries `ship run ID`.
+
 Exit: 0 completed (also `skipped: "already running"` / `"git operation in progress"`) · 2 usage, repo, config, or the
 `gh` repository does not match `origin` · 3 GitHub unavailable.
+
+`schedule` (Linux, cron) keeps one crontab line per repository, found again by the marker comment
+`# claude-pipeline worktrees-prune <lock name>` at its end: `--install` adds it (or replaces it in place, so installing from the
+main checkout or any linked worktree gives the same single line) to run `worktrees prune --notify` from the main checkout at
+`--at HH:MM` (default `02:30`), `--remove` deletes it, `--status` says whether it is there. Every other crontab line is kept
+byte-for-byte. cron runs in the host's time zone: `--install` reports it as `timezone` and adds a `warning` when it is not
+`Asia/Manila` or cannot be read. The job only does what `worktrees.mode` allows, so a repository still on `report` just gets the report.
 
 ## Where this differs from spec section 5.2
 

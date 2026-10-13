@@ -413,3 +413,215 @@ test('usage errors exit 2', () => {
   assert.equal(w.cli(['keep']).code, 2);
   assert.equal(w.cli(['keep', '../x']).code, 2);
 });
+
+// ---- schedule: the nightly cron line (crontab and the time zone are injected; the real crontab is never touched) -----
+
+const { scheduleLine, applySchedule, run: runWorktrees } = await import('../pipeline/commands/worktrees.mjs');
+
+const MARKER = '# claude-pipeline worktrees-prune worktrees-prune-0123456789ab';
+const LINE_ARGS = { nodePath: '/usr/bin/node', binPath: '/opt/p/pipeline/bin/pipeline.mjs', root: '/home/u/proj', at: '02:30', lockName: 'worktrees-prune-0123456789ab' };
+const OTHER_LINES = '# claude-memory-health\n17 3 * * * /home/u/bin/memory-health.sh\n# claude-notes-gitleaks\n*/30 * * * * /home/u/bin/notes-gitleaks.sh\n';
+
+// An in-memory crontab: read() answers the current text, write() records every replacement.
+function fakeCrontab(initial = '') {
+  const box = { text: initial, writes: [] };
+  const fn = (op, text) => {
+    if (op === 'read') return box.text;
+    box.text = text;
+    box.writes.push(text);
+    return undefined;
+  };
+  return { box, fn };
+}
+
+test('scheduleLine: minute hour, cd into the root, node + bin, notify, marker last', () => {
+  assert.equal(
+    scheduleLine(LINE_ARGS),
+    `30 02 * * * cd '/home/u/proj' && /usr/bin/node /opt/p/pipeline/bin/pipeline.mjs worktrees prune --notify >/dev/null 2>&1 ${MARKER}`,
+  );
+  assert.match(scheduleLine({ ...LINE_ARGS, at: '23:05' }), /^05 23 \* \* \* /);
+});
+
+test('scheduleLine: a root with spaces or a quote is single-quoted for the shell; node and bin paths with spaces too', () => {
+  const line = scheduleLine({ ...LINE_ARGS, root: "/home/u/my proj/it's", nodePath: '/opt/my node/node', binPath: '/opt/p q/pipeline.mjs' });
+  assert.ok(line.includes(`cd '/home/u/my proj/it'\\''s' && '/opt/my node/node' '/opt/p q/pipeline.mjs' worktrees prune`), line);
+});
+
+test('scheduleLine: % is escaped (cron turns a bare % into a newline); a newline in a path is refused', () => {
+  assert.ok(scheduleLine({ ...LINE_ARGS, root: '/home/u/100%' }).includes("cd '/home/u/100\\%'"));
+  assert.throws(() => scheduleLine({ ...LINE_ARGS, root: '/home/u/a\nb' }), /newline/);
+});
+
+test('scheduleLine: --at must be HH:MM, 00-23 and 00-59', () => {
+  for (const at of ['24:00', '12:60', '2:30', '02:3', 'noon', '', '02:30:00', '-1:00']) {
+    assert.throws(() => scheduleLine({ ...LINE_ARGS, at }), /HH:MM/, at);
+  }
+  assert.match(scheduleLine({ ...LINE_ARGS, at: '00:00' }), /^00 00 /);
+  assert.match(scheduleLine({ ...LINE_ARGS, at: '23:59' }), /^59 23 /);
+});
+
+test('applySchedule install: appends one line after the existing ones, which stay byte-for-byte', () => {
+  const line = scheduleLine(LINE_ARGS);
+  const ct = fakeCrontab(OTHER_LINES);
+  const r = applySchedule({ action: 'install', line, marker: MARKER, crontabFn: ct.fn, tzFn: () => 'Asia/Manila' });
+  assert.deepEqual(r, { installed: true, line, timezone: 'Asia/Manila' });
+  assert.equal(ct.box.text, `${OTHER_LINES}${line}\n`);
+});
+
+test('applySchedule install: no crontab yet gives just the line; a final line without a newline gets one before ours', () => {
+  const line = scheduleLine(LINE_ARGS);
+  const empty = fakeCrontab('');
+  applySchedule({ action: 'install', line, marker: MARKER, crontabFn: empty.fn, tzFn: () => 'Asia/Manila' });
+  assert.equal(empty.box.text, `${line}\n`);
+  const bare = fakeCrontab('# only line');
+  applySchedule({ action: 'install', line, marker: MARKER, crontabFn: bare.fn, tzFn: () => 'Asia/Manila' });
+  assert.equal(bare.box.text, `# only line\n${line}\n`);
+});
+
+test('applySchedule install: a second install is idempotent (one line, no rewrite); a new time replaces the line in place', () => {
+  const line = scheduleLine(LINE_ARGS);
+  const ct = fakeCrontab(`${OTHER_LINES}${line}\n# tail\n`);
+  applySchedule({ action: 'install', line, marker: MARKER, crontabFn: ct.fn, tzFn: () => 'Asia/Manila' });
+  assert.equal(ct.box.writes.length, 0);
+  const later = scheduleLine({ ...LINE_ARGS, at: '04:15' });
+  applySchedule({ action: 'install', line: later, marker: MARKER, crontabFn: ct.fn, tzFn: () => 'Asia/Manila' });
+  assert.equal(ct.box.text, `${OTHER_LINES}${later}\n# tail\n`);
+  assert.equal(ct.box.text.split(MARKER).length - 1, 1);
+});
+
+test('applySchedule install: duplicate marker lines collapse to one; a line with a different lock name is left alone', () => {
+  const line = scheduleLine(LINE_ARGS);
+  const other = scheduleLine({ ...LINE_ARGS, root: '/home/u/other', lockName: 'worktrees-prune-ffffffffffff' });
+  const ct = fakeCrontab(`${line}\n${other}\n${line}\n`);
+  applySchedule({ action: 'install', line, marker: MARKER, crontabFn: ct.fn, tzFn: () => 'Asia/Manila' });
+  assert.equal(ct.box.text, `${line}\n${other}\n`);
+});
+
+test('applySchedule install: another time zone adds a warning; an unknown one says so', () => {
+  const line = scheduleLine(LINE_ARGS);
+  const utc = applySchedule({ action: 'install', line, marker: MARKER, crontabFn: fakeCrontab().fn, tzFn: () => 'UTC' });
+  assert.equal(utc.timezone, 'UTC');
+  assert.equal(utc.warning, 'cron runs in UTC, not Asia/Manila — 02:30 is local to that zone');
+  const unknown = applySchedule({ action: 'install', line, marker: MARKER, crontabFn: fakeCrontab().fn, tzFn: () => null });
+  assert.equal(unknown.timezone, null);
+  assert.match(unknown.warning, /could not tell/);
+  const at = applySchedule({ action: 'install', line: scheduleLine({ ...LINE_ARGS, at: '04:15' }), marker: MARKER, crontabFn: fakeCrontab().fn, tzFn: () => 'UTC' });
+  assert.match(at.warning, /04:15 is local/);
+});
+
+test('applySchedule remove: drops only the marker line, keeps the rest byte-for-byte; absent is a no-op', () => {
+  const line = scheduleLine(LINE_ARGS);
+  const ct = fakeCrontab(`${OTHER_LINES}${line}\n`);
+  assert.deepEqual(applySchedule({ action: 'remove', marker: MARKER, crontabFn: ct.fn }), { removed: true });
+  assert.equal(ct.box.text, OTHER_LINES);
+  assert.deepEqual(applySchedule({ action: 'remove', marker: MARKER, crontabFn: ct.fn }), { removed: false });
+  assert.equal(ct.box.writes.length, 1);
+});
+
+test('applySchedule status: reports presence and the line, never writes', () => {
+  const line = scheduleLine(LINE_ARGS);
+  const on = fakeCrontab(`${OTHER_LINES}${line}\n`);
+  assert.deepEqual(applySchedule({ action: 'status', marker: MARKER, crontabFn: on.fn }), { installed: true, line });
+  const off = fakeCrontab(OTHER_LINES);
+  assert.deepEqual(applySchedule({ action: 'status', marker: MARKER, crontabFn: off.fn }), { installed: false, line: null });
+  assert.equal(on.box.writes.length + off.box.writes.length, 0);
+});
+
+// The sub-verb itself, with the crontab, time zone, platform and install paths injected through the context.
+function scheduleWorld() {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml());
+  repo.write('a.txt', 'a\n');
+  repo.commit('init');
+  const ct = fakeCrontab(OTHER_LINES);
+  const ctx = (cwd = repo.dir, extra = {}) => ({
+    cwd, env: process.env, platform: 'linux', crontabFn: ct.fn, tzFn: () => 'Asia/Manila', nodePath: '/usr/bin/node', binPath: '/opt/p/pipeline/bin/pipeline.mjs', ...extra,
+  });
+  return { repo, ct, ctx, run: (args, c = ctx()) => runWorktrees(['schedule', ...args], c) };
+}
+
+test('schedule --install: writes the repo-keyed line (default 02:30); --status and --remove follow', async () => {
+  const w = scheduleWorld();
+  const lockName = lockNameFor(realpathSync.native(join(w.repo.dir, '.git')));
+  const r = await w.run(['--install']);
+  assert.equal(r.exitCode, 0);
+  assert.equal(r.output.ok, true);
+  assert.equal(r.output.installed, true);
+  assert.equal(r.output.line, `30 02 * * * cd '${w.repo.dir}' && /usr/bin/node /opt/p/pipeline/bin/pipeline.mjs worktrees prune --notify >/dev/null 2>&1 # claude-pipeline worktrees-prune ${lockName}`);
+  assert.equal(w.ct.box.text, `${OTHER_LINES}${r.output.line}\n`);
+  const st = await w.run(['--status']);
+  assert.deepEqual([st.exitCode, st.output.installed, st.output.line], [0, true, r.output.line]);
+  const rm = await w.run(['--remove']);
+  assert.deepEqual([rm.exitCode, rm.output.removed], [0, true]);
+  assert.equal(w.ct.box.text, OTHER_LINES);
+  assert.equal((await w.run(['--status'])).output.installed, false);
+});
+
+test('schedule --install --at 04:15 uses that time; a bad --at is a usage error and writes nothing', async () => {
+  const w = scheduleWorld();
+  assert.match((await w.run(['--install', '--at', '04:15'])).output.line, /^15 04 /);
+  const writes = w.ct.box.writes.length;
+  await assert.rejects(() => w.run(['--install', '--at', '25:00']), /HH:MM/);
+  assert.equal(w.ct.box.writes.length, writes);
+});
+
+test('schedule from the main checkout and from a linked worktree replaces the same line', async () => {
+  const w = scheduleWorld();
+  w.repo.git(['worktree', 'add', '-q', '-b', 'feat/x', join(w.repo.dir, '.worktrees', 'x'), 'main']);
+  const first = await w.run(['--install']);
+  const second = await w.run(['--install', '--at', '05:00'], w.ctx(join(w.repo.dir, '.worktrees', 'x')));
+  assert.equal(second.output.line.includes(`cd '${w.repo.dir}'`), true, 'the canonical root, not the worktree');
+  assert.equal(w.ct.box.text.split('# claude-pipeline worktrees-prune').length - 1, 1);
+  assert.equal(w.ct.box.text, `${OTHER_LINES}${second.output.line}\n`);
+  assert.notEqual(first.output.line, second.output.line);
+});
+
+test('schedule outside Linux is refused with exit 2 and the crontab is untouched', async () => {
+  const w = scheduleWorld();
+  for (const verb of ['--install', '--remove', '--status']) {
+    const r = await w.run([verb], w.ctx(w.repo.dir, { platform: 'win32' }));
+    assert.equal(r.exitCode, 2, verb);
+    assert.equal(r.output.message, 'schedule is only supported on Linux (cron) in this version');
+  }
+  assert.equal(w.ct.box.writes.length, 0);
+});
+
+test('schedule: exactly one of --install / --remove / --status; --at only with --install; no NAME', async () => {
+  const w = scheduleWorld();
+  for (const args of [[], ['--install', '--remove'], ['--status', '--at', '03:00'], ['--remove', '--at', '03:00'], ['--install', 'extra']]) {
+    await assert.rejects(() => w.run(args), /schedule/, args.join(' '));
+  }
+  assert.equal(w.ct.box.writes.length, 0);
+});
+
+// The real CLI path with a stub `crontab` first on PATH (a shell script, so Linux only): "no crontab for user" reads as an
+// empty crontab, and the new text arrives on stdin of `crontab -`.
+test('schedule through the CLI uses the system crontab: no crontab yet, then install, status, remove', { skip: !LINUX }, () => {
+  const w = scheduleWorld();
+  const bin2 = tmp('cp-wtcron-');
+  const store = join(bin2, 'store');
+  writeFileSync(join(bin2, 'crontab'), [
+    '#!/bin/sh',
+    `if [ "$1" = "-l" ]; then if [ -f '${store}' ]; then cat '${store}'; exit 0; fi; echo "no crontab for tester" >&2; exit 1; fi`,
+    `if [ "$1" = "-" ]; then cat > '${store}'; exit 0; fi`,
+    'exit 2',
+    '',
+  ].join('\n'));
+  chmodSync(join(bin2, 'crontab'), 0o755);
+  const cli = (...args) => {
+    const r = spawnSync(process.execPath, [bin, 'worktrees', 'schedule', ...args], {
+      cwd: w.repo.dir, encoding: 'utf8', env: { ...process.env, PATH: `${bin2}:${process.env.PATH}` },
+    });
+    return { code: r.status, json: JSON.parse(r.stdout), stderr: r.stderr };
+  };
+  assert.equal(cli('--status').json.installed, false);
+  const inst = cli('--install', '--at', '03:10');
+  assert.equal(inst.code, 0, inst.stderr);
+  assert.equal(inst.json.installed, true);
+  assert.equal(readFileSync(store, 'utf8'), `${inst.json.line}\n`);
+  assert.ok(inst.json.line.includes(`cd '${w.repo.dir}' && ${process.execPath} `), inst.json.line);
+  assert.ok(inst.json.line.includes(`${bin} worktrees prune --notify`), inst.json.line);
+  assert.equal(cli('--status').json.installed, true);
+  assert.equal(cli('--remove').json.removed, true);
+  assert.equal(readFileSync(store, 'utf8'), '');
+});
