@@ -84,3 +84,33 @@ for (const [name, run] of runners) {
     }
   });
 }
+
+// ---- 91: default / alternative words and command substitutions that spell a protected path (guard-files) ------------------------------------------------------------------------
+const filesRun = runners[1][1];
+test('F2b 91: a target whose default / alternative word, or command substitution, spells a protected path is refused (cp, redirect, tee)', () => {
+  const targets = [
+    `${D}{V:-~/.claude}/settings.json`,
+    `${D}{V:-${D}HOME/.claude}/settings.json`,
+    `"${D}{V:-${D}HOME/.claude}"/settings.json`,
+    `${D}{V-~/.claude}/settings.json`,
+    `${D}{V:=~/.claude}/settings.json`,
+    `${D}{V:+~/.claude}/settings.json`,
+    `${D}{V:-${D}{W:-~/.claude}}/settings.json`,
+    `"${D}(echo ~/.claude)"/settings.json`,
+    `${D}(echo ~/.claude)/settings.json`,
+    `\`echo ~/.claude\`/settings.json`,
+  ];
+  for (const t of targets) {
+    for (const c of [`cp x ${t}`, `echo x > ${t}`, `echo x | tee ${t}`]) {
+      const d = filesRun(c);
+      assert.equal(d.decision, 'deny', `${c} -> ${d.reason}`);
+    }
+  }
+});
+
+test('F2b 91: default words that do not spell a protected path stay allowed', () => {
+  for (const c of [`cp x ${D}{V:-/tmp}/a.json`, `echo x > ${D}{V:-out}/a.json`, `cp x ${D}V/a.json`, `echo x > "${D}(pwd)"/a.json`, `cp x ${D}{V:-${D}HOME/proj}/a.json`]) {
+    const d = filesRun(c);
+    assert.equal(d.decision, 'allow', `${c} -> ${d.reason}`);
+  }
+});

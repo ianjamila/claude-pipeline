@@ -20,7 +20,7 @@ import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
 import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
-import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit, execLinesOf } from './script-candidates.mjs';
+import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit, execLinesOf, paramReadings } from './script-candidates.mjs';
 
 const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
@@ -614,6 +614,12 @@ function makeMatchers(ctx) {
   // prefix, or by a relative tail that lands in a protected root from one of `dirs`.
   const rawHit = (text, dirs) => {
     if (!text) return false;
+    // Why: `${V:-~/.claude}/settings.json` is the protected file whenever V is unset or empty, so every reading of a default / alternative word is judged
+    const rs = paramReadings(String(text));
+    if (rs.over) return true;
+    return rawHitOne(text, dirs) || rs.some((r) => rawHitOne(r, dirs));
+  };
+  const rawHitOne = (text, dirs) => {
     for (const v of refVariants(String(text), ctx)) {
       if (rootRes.some((re) => re.test(v))) return true;
       if (!(ctx.ci ? v.toLowerCase() : v).includes('.claude')) continue;
@@ -651,11 +657,17 @@ function makeMatchers(ctx) {
     } else if (/^[A-Za-z_]+=./.test(tok)) parts = [tok, tok.slice(tok.indexOf('=') + 1)]; // (`of=settings.json`)
     for (const part of parts) {
       if (!part) continue;
-      const e = expandRefs(part, ctx);
-      const bases = isAbs(e) ? [''] : dirs;
-      for (const d of bases) {
-        const full = isAbs(e) ? posix.normalize(e) : posix.join(d, e);
-        if (/[*?[]/.test(full) ? globHit(full) : (ctx.hit(full) || (withAncestors && ctx.hitAncestor(full))) && (!plausible || plausible(full, e)) ) return true;
+      const rs = paramReadings(part);
+      if (rs.over) return true;
+      // Why: a target built by a command substitution (`"$(echo ~/.claude)"/settings.json`) is only known at run time: when its own text names a protected thing it is refused
+      if (/\$\(|`/.test(part) && SENSITIVE_WORDS.test(part)) return true;
+      for (const reading of rs) {
+        const e = expandRefs(reading, ctx);
+        const bases = isAbs(e) ? [''] : dirs;
+        for (const d of bases) {
+          const full = isAbs(e) ? posix.normalize(e) : posix.join(d, e);
+          if (/[*?[]/.test(full) ? globHit(full) : (ctx.hit(full) || (withAncestors && ctx.hitAncestor(full))) && (!plausible || plausible(full, e)) ) return true;
+        }
       }
     }
     return false;
