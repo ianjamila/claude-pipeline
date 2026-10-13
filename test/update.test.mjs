@@ -13,7 +13,7 @@ import { devNull, tmpdir } from 'node:os';
 import { dirname, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createFakeGh } from './helpers/fakegh-env.mjs';
-import { run as update, meta, installerEnv } from '../pipeline/commands/update.mjs';
+import { run as update, meta, installerEnv, shQuote, psQuote } from '../pipeline/commands/update.mjs';
 import { compare, fetchRemote, ISO_DIR_PREFIX, isolatedGit, isolatedGitArgs, isolatedGitEnv, mainSha, makeIsoDir, withIsolatedGit, UPSTREAM_HOST, UPSTREAM_REPO, UPSTREAM_URL } from '../pipeline/lib/upstream.mjs';
 import { seamValue } from '../pipeline/lib/proc.mjs';
 
@@ -284,17 +284,18 @@ test('update installs exactly the commit main points to, verifies it, and leaves
 });
 
 // A commit that predates the installer's exception for a source under <home>/pipeline-state/tmp: its install.mjs rejects
-// any --source inside the Claude home. Built from the real remote with install.mjs replaced by the one at the merge
-// base (before the exception) and private-tmp.mjs removed.
-const PRE_EXCEPTION_COMMIT = '886b9baa345dfa1bda31c1b435882414c9ebbe44';
+// any --source inside the Claude home. Built from the real remote with the exception (and its import) taken out of this
+// checkout's install.mjs and private-tmp.mjs removed - no git history needed, since CI checks out shallow.
+const EXCEPTION_IMPORT = "import { TMP_ROOT_REL } from './pipeline/lib/private-tmp.mjs';";
+const EXCEPTION_CLAUSE = ' && !isInside(source, path.join(home, TMP_ROOT_REL))';
 let oldRemoteCache = null;
 function oldRemote() {
   if (oldRemoteCache) return oldRemoteCache;
   const work = scratch('cp-upd-oldwork');
   git(work, ['clone', '--quiet', remote().bare, '.']);
-  const old = spawnSync('git', ['show', `${PRE_EXCEPTION_COMMIT}:install.mjs`], { cwd: REPO, encoding: 'utf8' });
-  assert.equal(old.status, 0, `the pre-exception installer must be reachable in this checkout: ${old.stderr}`);
-  writeFileSync(join(work, 'install.mjs'), old.stdout);
+  const now = readFileSync(join(REPO, 'install.mjs'), 'utf8');
+  assert.ok(now.includes(EXCEPTION_IMPORT) && now.includes(EXCEPTION_CLAUSE), 'install.mjs no longer carries the exception this fixture takes out');
+  writeFileSync(join(work, 'install.mjs'), now.replace(EXCEPTION_IMPORT, '').replace(EXCEPTION_CLAUSE, ''));
   rmSync(join(work, 'pipeline', 'lib', 'private-tmp.mjs'));
   git(work, ['add', '-A']);
   git(work, ['-c', 'commit.gpgsign=false', 'commit', '--quiet', '-m', 'old installer']);
@@ -317,7 +318,8 @@ test('update to a commit whose installer predates the downloads-under-the-home e
   assert.match(direct.stdout + direct.stderr, /inside the claude-home/);
 
   for (const guardFiles of [true, false]) {
-    const home = newHome();
+    // A home with a space and a quote: the suggested command must keep it one literal argument in sh and PowerShell.
+    const home = join(scratch('cp-upd-home'), "Jane O'Doe claude");
     if (!guardFiles) {
       const first = spawnSync(process.execPath, [join(REPO, 'install.mjs'), '--claude-home', home, '--source', REPO, '--skip-file-guard', '--json'], { encoding: 'utf8', env: envFor(null) });
       assert.equal(first.status, 0, first.stderr);
@@ -328,7 +330,9 @@ test('update to a commit whose installer predates the downloads-under-the-home e
     assert.equal(r.output.ok, false);
     assert.equal(r.output.error, 'installer-too-old');
     assert.match(r.output.message, /older installer/);
-    assert.ok(r.output.message.includes(`./install.sh --claude-home ${home}${guardFiles ? '' : ' --skip-file-guard'}`), r.output.message);
+    const flag = guardFiles ? '' : ' --skip-file-guard';
+    assert.ok(r.output.message.includes(`./install.sh --claude-home ${shQuote(home)}${flag}`), r.output.message);
+    assert.ok(r.output.message.includes(`.\\install.ps1 --claude-home ${psQuote(home)}${flag}`), r.output.message);
     assert.equal(r.output.install, null, 'the downloaded installer was never run');
     assert.equal(existsSync(join(home, 'pipeline', 'INSTALLED.json')) ? readFileSync(join(home, 'pipeline', 'INSTALLED.json'), 'utf8') : null, before, 'the installed copy is untouched');
     assert.deepEqual(left, [], 'the download is removed');
@@ -881,4 +885,12 @@ test('update: NODE_OPTIONS=--require in the caller environment does not run insi
   assert.equal(r.exitCode, 0, JSON.stringify(r.output));
   // The fake gh (a node script `update` itself runs, with the caller's environment) may load it; the installer must not.
   assert.doesNotMatch(existsSync(marker) ? readFileSync(marker, 'utf8') : '', /install\.mjs/, 'the injected module ran inside the installer');
+});
+
+test('the suggested manual command quotes the home so sh (and PowerShell) read it back as one literal argument', { skip: process.platform === 'win32' }, () => {
+  for (const s of ["/home/Jane O'Doe/.claude", 'C:\\Users\\Jane Doe\\.claude', '/tmp/$(touch x); `id` "q" * ~ & | ;']) {
+    const r = spawnSync('sh', ['-c', `printf '%s' ${shQuote(s)}`], { encoding: 'utf8' });
+    assert.equal(r.stdout, s);
+  }
+  assert.equal(psQuote("C:\\Users\\Jane O'Doe\\.claude"), "'C:\\Users\\Jane O''Doe\\.claude'");
 });

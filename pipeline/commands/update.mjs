@@ -36,6 +36,11 @@ const FETCH_TIMEOUT_MS = 180000;
 const INSTALL_TIMEOUT_MS = 300000;
 
 const sha7 = (sha) => (sha ? String(sha).slice(0, 7) : null);
+
+// One argument for a command the owner pastes: POSIX sh single quotes ('\'' for a quote), PowerShell single quotes ('').
+// Always quoted, so a home with spaces ("C:\Users\Jane Doe\.claude") or shell metacharacters stays one literal argument.
+export const shQuote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+export const psQuote = (s) => `'${String(s).replace(/'/g, "''")}'`;
 const tail = (text, n = 1500) => String(text ?? '').trim().slice(-n);
 
 // What `--check` and the update result say about the installed copy.
@@ -182,8 +187,10 @@ export async function run(argv, ctx = {}) {
       return fail('fetch-failed', err.message);
     }
     if (!installerAcceptsPrivateTmpSource(src)) {
-      const manual = `./install.sh --claude-home ${home}${flags.join(' ') ? ` ${flags.join(' ')}` : ''}`;
-      return fail('installer-too-old', `upstream main ${sha7(main.sha)} has an older installer that cannot install from the folder this command downloads into, so nothing was changed. Update from a clone of that version instead: run \`${manual}\` in it (on Windows: \`${manual.replace('./install.sh', '.\\install.ps1')}\`).`);
+      const rest = flags.map((f) => ` ${f}`).join('');
+      const posix = `./install.sh --claude-home ${shQuote(home)}${rest}`;
+      const windows = `.\\install.ps1 --claude-home ${psQuote(home)}${rest}`;
+      return fail('installer-too-old', `upstream main ${sha7(main.sha)} has an older installer that cannot install from the folder this command downloads into, so nothing was changed. Update from a clone of that version instead: run \`${posix}\` in it (on Windows: \`${windows}\`).`);
     }
     say(`installing into ${home} ...`);
     const common = ['--claude-home', home, '--source', src, '--json', ...flags];
