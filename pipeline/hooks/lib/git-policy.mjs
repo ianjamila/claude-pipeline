@@ -302,7 +302,10 @@ const CURRENT_BRANCH_WORD = new RegExp(`(^|:)${CURRENT_BRANCH_IDIOM.source.slice
 // unquoted (`R="x HEAD:main"; git push origin $R`; zsh does not split, so both readings are denied).
 // Can the shell split on something other than blanks? IFS written anywhere in the text judged (assignment, `read`, `local`,
 // `unset`), set in the environment, or a sourced script that may have set variables.
-const ifsMayBeSet = (ctx) => /IFS/.test(ctx.fullText ?? '') || assignedNames(ctx).includes('IFS') || Object.hasOwn(ctx.env ?? {}, 'IFS') || ctx.tainted.size > 0;
+// A name can be written without the letters IFS in a row (`eval "I""FS=,"`, `read $N`, `printf -v $N`, `declare I""FS=,`, `N=IFS; export $N`),
+// so the commands that assign a variable by a computed or split-up name count as well.
+const SETS_BY_NAME = /\b(?:eval|read|mapfile|readarray|getopts|source|printf\s+-v)\b|(?:^|[\s;&|(])\.\s|\b(?:export|unset|declare|typeset|local|readonly)\b[^;&|\n]*[$`'"]/;
+const ifsMayBeSet = (ctx) => /IFS/.test(ctx.fullText ?? '') || SETS_BY_NAME.test(ctx.fullText ?? '') || assignedNames(ctx).includes('IFS') || Object.hasOwn(ctx.env ?? {}, 'IFS') || ctx.tainted.size > 0;
 
 function unverifiableWord(raw, ctx) {
   const x = expandVars(raw, ctx);

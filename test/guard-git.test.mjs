@@ -166,6 +166,19 @@ const DENY = [
   ['E=; git push origin $E'],
   ['E=""; git push origin "$E"'],
   ['E=; git push $E agent/x'],
+  // IFS assigned without the letters IFS in a row, or by a computed name
+  ['eval "I""FS=,"; R="agent/x,main"; git push origin $R'],
+  ['N=IFS; printf -v $N ,; R="agent/x,main"; git push origin $R'],
+  ['N=IFS; read $N <<< ","; R="agent/x,main"; git push origin $R'],
+  ['declare I""FS=,; R="agent/x,main"; git push origin $R'],
+  ['f() { local I""FS=,; R="agent/x,main"; git push origin $R; }; f'],
+  ['N=IFS; export "$N=,"; R="agent/x,main"; git push origin $R'],
+  ['source ./env.sh; R=agent/x; git push origin $R'],
+  ['. ./env.sh; R=agent/x; git push origin $R'],
+  ['IFS+=,; R="agent/x,main"; git push origin $R'],
+  ['IFS=, git push origin agent/x; R=agent/x,main; git push origin $R'],
+  ['R="agent/x,main"; git push origin ${=R}'],
+  ['setopt shwordsplit; R="agent/x main"; git push origin $R'],
   // a config key / push.default value built at run time can be remote.*.push or upstream
   ['git -c $K=HEAD:agent/x push'],
   ['K=remote.origin.push; git -c $K=HEAD:agent/x push'],
@@ -211,6 +224,8 @@ const ALLOW = [
   ['git push origin HEAD:$(git branch --show-current)'],
   ['git push origin HEAD:agent/x'], // a literal source with a literal destination is unchanged
   ['git -c user.name=$N push origin agent/x'],
+  ['export B=agent/x; git push origin $B'],
+  ['B=agent/x; git push origin ${B}'],
   ['git -c alias.p=\'!V=agent/y; git push origin $V\' p'], // the value is judged as written, in the alias's own shell
   ['git -c core.pager=${P:-cat} push origin agent/x'],
 ];
