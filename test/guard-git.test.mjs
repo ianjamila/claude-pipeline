@@ -135,6 +135,26 @@ const DENY = [
   ['git push origin `echo +HEAD`:agent/x'],
   ['git push origin $X:agent/x'],
   ['git push origin ${B:-x}:'],
+  // the -c VALUE is never expanded with the line's variables: an alias body assigns and pushes in its own shell
+  ['V=agent/x; git -c alias.p=\'!V=main; git push origin $V\' p'],
+  ['V=agent/x; git -c alias.p=\'!V=+HEAD:agent/x; git push origin $V\' p'],
+  ['V=agent/x; git config alias.p \'!V=main; git push origin $V\'; git p'],
+  // an option or remote built at run time can be any option; so is a known value that splits into several words
+  ['git push origin --${F:-mirror}'],
+  ['git push origin -${F:-f} agent/x'],
+  ['git push origin ${F:---force} agent/x'],
+  ['git push origin --force-with-lease=${F:-x} agent/x'],
+  ['git push origin --${X:-all}'],
+  ['git push origin --${X:-delete} agent/x'],
+  ['git push "$R" HEAD:agent/x'],
+  ['git push $R HEAD:agent/x'],
+  ['git push -o ${B:-x} origin agent/x'],
+  ['R="x HEAD:main"; git push origin $R'],
+  ['R="agent/x HEAD:main"; git push origin "$R"'],
+  ['R="agent/*"; git push origin $R'],
+  ['R=--mirror; git push origin $R'],
+  ['R=-f; git push origin $R agent/x'],
+  ['R=+HEAD:agent/x; git push origin $R'],
   // a config key / push.default value built at run time can be remote.*.push or upstream
   ['git -c $K=HEAD:agent/x push'],
   ['K=remote.origin.push; git -c $K=HEAD:agent/x push'],
@@ -178,9 +198,9 @@ const ALLOW = [
   ['git -C "$DIR" log --oneline -3'],
   ['B=agent/x; git push origin $B'], // assigned once on the line: still known
   ['git push origin HEAD:$(git branch --show-current)'],
-  ['git push -o ${B:-x} origin agent/x'],
   ['git push origin HEAD:agent/x'], // a literal source with a literal destination is unchanged
   ['git -c user.name=$N push origin agent/x'],
+  ['git -c alias.p=\'!V=agent/y; git push origin $V\' p'], // the value is judged as written, in the alias's own shell
   ['git -c core.pager=${P:-cat} push origin agent/x'],
 ];
 

@@ -294,7 +294,26 @@ function checkRefspec(spec, dir, gitDir, ctx) {
   return null;
 }
 
+// `HEAD:$(git branch --show-current)` is the one run-time word a push may carry (checkRefspec judges it).
+const CURRENT_BRANCH_WORD = new RegExp(`(^|:)${CURRENT_BRANCH_IDIOM.source.slice(1, -1)}$`);
+
+// Every word of a push is read as written: an option or remote built at run time (`--${F:-mirror}`, `-${F:-f}`, `"$R"`) can be
+// any option, and a variable with a known value that holds blanks or glob characters splits into several words when it is
+// unquoted (`R="x HEAD:main"; git push origin $R`; zsh does not split, so both readings are denied).
+function unverifiableWord(raw, ctx) {
+  const x = expandVars(raw, ctx);
+  const w = x.replace(CURRENT_BRANCH_WORD, '$1X');
+  if (x !== raw && /[\s*?[]/.test(w)) return `the word "${raw}" expands to text with blanks or glob characters, which the shell may split into several arguments, so it cannot be verified. Write the arguments out.`;
+  if (DYNAMIC.test(w)) return `the argument "${x}" is built at run time (an option, remote or refspec can hide in it), so it cannot be verified. Write the push out: git push -u origin agent/<slug>.`;
+  return null;
+}
+
 function checkPush(args, dir, gitDir, ctx, configs) {
+  for (const a of args) {
+    const why = unverifiableWord(a, ctx);
+    if (why) return deny(why);
+  }
+  args = args.map((a) => expandVars(a, ctx)); // an option held in a variable (`F=--mirror; git push origin $F`) is an option
   const { flags, positionals: rawPositionals } = parseOpts(args, { longValue: PUSH_LONG_VALUE, shortValue: 'o', abbrev: true });
   const positionals = rawPositionals.map((p) => expandVars(p, ctx));
   let repoGiven = false;
@@ -349,9 +368,11 @@ function parseGitGlobal(argv, dir, env, ctx) {
     const t = argv[i];
     if (t === '-C') { d = joinDir(d, argv[++i], ctx); continue; }
     if (t === '-c') {
-      const kv = expandVars(argv[++i] ?? '', ctx);
+      // Only the KEY is expanded (`-c $K=v`). The value stays as written: an alias body (`alias.p='!V=…; git push origin $V'`)
+      // runs in its own shell, where the line's variables are not the ones it sees.
+      const kv = argv[++i] ?? '';
       const eq = splitIndex(kv, '=');
-      configs.push({ key: (eq < 0 ? kv : kv.slice(0, eq)).toLowerCase(), value: eq < 0 ? '' : kv.slice(eq + 1) });
+      configs.push({ key: expandVars(eq < 0 ? kv : kv.slice(0, eq), ctx).toLowerCase(), value: eq < 0 ? '' : kv.slice(eq + 1) });
       continue;
     }
     if (t.startsWith('--git-dir=')) { gitDir = joinDir(d, t.slice('--git-dir='.length), ctx); gitDirUnknown = false; continue; }
