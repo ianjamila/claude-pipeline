@@ -90,6 +90,8 @@ exists (Step 0 preflight and labels ensure) just stop: the owner is at the keybo
   `preview` is `null`, and `merge`/`production`. Config `warnings` are advice: mention them.
 - `P labels ensure` (idempotent; later steps use `pipeline-blocked`, `needs-human`,
   `awaiting-review`). Exit 3 ⇒ GitHub is unreachable: say so and stop.
+- `P worktrees prune --notify` removes worktrees whose PR merged ≥ 24h ago (only when `worktrees.mode: on`; otherwise it
+  reports). Read `summary`; never act on `kept` yourself.
 - `inbox` argument ("ship inbox", "what is each PR waiting on") → **Inbox** below (read-only; skip Steps 1–7).
 - `resume <pr>` argument or "resume pipeline reviews" → **Resume mode** below.
 
@@ -102,6 +104,9 @@ git worktree add --no-track -b agent/<slug> <worktree_dir>/agent-<slug> origin/<
 `--no-track` matters: a branch tracking `origin/main` can make a bare `git push` target main. `<slug>`: 2–5 lowercase words from the request. All later work happens in that worktree; tell
 every subagent its absolute path. Estimate risk from the paths you expect to touch (final risk
 comes from `P risk` on the real diff; the higher wins).
+
+Then `P worktrees keep agent-<slug> --reason "ship run agent-<slug>"` so no cleanup removes the worktree while this run uses it.
+The run id in the reason is the worktree's directory name (no PR exists yet); Step 7 and Resume step 3 use the same id.
 
 ## Step 2 — build and verify
 
@@ -308,8 +313,9 @@ The owner's chat message is the approval; never add an approval label yourself (
 (outliers first) and prints `agentLogLine`. Queue that line — `P agent-log queue --line
 "<agentLogLine>"` — for every outcome except a clean `merged` (that run's line was staged in
 Step 5.1). Then tell the user, in plain English: what shipped, PR link, outcome, follow-up issues,
-anything needing them. Remove the worktree (`git worktree remove <worktree_dir>/agent-<slug>`)
-when the PR is merged or closed; keep it while the PR waits for a human or for Codex.
+anything needing them. Release the worktree's keep lock: `P worktrees unkeep agent-<slug> --run agent-<slug>`, then
+`P worktrees prune --notify`. Prune removes the worktree once its PR has been merged for 24 h and keeps it while the PR
+waits for a human or for Codex; never remove it by hand.
 
 ## Inbox ("ship inbox", "what is each PR waiting on") — read-only
 
@@ -350,7 +356,8 @@ the owner's next move.
 3. Worktree per `worktree.action`: `reuse` ⇒ `cd` into `path`; `add-existing-ref` ⇒ `git worktree add <path> <branch>`;
    `add-from-remote` ⇒ `git fetch origin <branch>` then `git worktree add --no-track -b <branch> <path> origin/<branch>`;
    never `-B`. Then `then: ff-only` ⇒ `git merge --ff-only <liveHead>` (the plan's exact `liveHead` sha; `plan` already refreshed `origin/<branch>`, but never trust a tracking ref), `then: push` ⇒ `git push origin <branch>`.
-   `P preflight`. Then take the run over: `P checkpoint --pr N --step <enter> --resumed` (`followups` ⇒ `--step review`;
+   Then `P worktrees keep <worktree dir name> --reason "ship run <worktree dir name>"` (the directory name of the worktree
+   in use, e.g. `agent-<slug>`; the same id Step 7 passes to `unkeep --run`). `P preflight`. Then take the run over: `P checkpoint --pr N --step <enter> --resumed` (`followups` ⇒ `--step review`;
    for `adopt: true` step 5's checkpoint is the take-over and carries `--resumed`). The flag marks the record, so `P merge`
    will not run without `--owner-approved-head` even after a later session picks the run up. The plan's `stop` is where the run ends, with its `P summary --outcome <stop>` (Step 5 / Owner-merge approval).
 4. `P state show --pr N`; read `source`. `quarantined` ⇒ tell the owner the local `.review/` went to `quarantinedTo`
