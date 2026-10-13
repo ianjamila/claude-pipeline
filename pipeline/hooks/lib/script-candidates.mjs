@@ -108,6 +108,22 @@ export function spliceLines(raw) {
   return { lines: [...lines], over };
 }
 
+// Why: `: ${X:=w}` / `${X=w}` assigns X for the commands after it, so a later `$X` may be w: the words such an expansion assigns, by name
+const ASSIGNING = /\$\{([A-Za-z_]\w*):?=([^}]*)\}/g;
+export function assigningDefaults(text) {
+  const out = new Map();
+  for (const m of String(text ?? '').matchAll(ASSIGNING)) out.set(m[1], [...(out.get(m[1]) ?? []), m[2]]);
+  return out;
+}
+// the readings of a word, plus those with a name an assigning expansion may have set replaced by the words it assigns
+export function readingsOf(word, assigned) {
+  const rs = paramReadings(word);
+  if (!assigned?.size) return rs;
+  const out = new Set(rs);
+  for (const r of rs) for (const [n, ws] of assigned) if (new RegExp(`\\$(?:\\{${n}\\}|${n}(?![A-Za-z0-9_]))`).test(r)) for (const w of ws) out.add(r.replace(new RegExp(`\\$(?:\\{${n}\\}|${n}(?![A-Za-z0-9_]))`, 'g'), () => w));
+  const list = [...out].slice(0, MAX_READINGS);
+  return Object.defineProperty(list, 'over', { value: rs.over || out.size > MAX_READINGS, enumerable: false });
+}
 // Thrown when a limit above is hit; each policy's entry point turns it into a denial carrying the message.
 export class GuardLimit extends Error {}
 
@@ -281,7 +297,7 @@ export function scriptCandidates(sf, deps) {
   try { return buildCandidates(sf, deps); } catch { return { files: [], dynamic: false, over: true }; }
 }
 
-function buildCandidates(sf, { expand, dirs, joinPath, readDir, ifs }) {
+function buildCandidates(sf, { expand, dirs, joinPath, readDir, ifs, assigned }) {
   const files = new Set();
   const budget = { work: 0, steps: 0, over: false };
   let dynamic = false;
@@ -291,7 +307,7 @@ function buildCandidates(sf, { expand, dirs, joinPath, readDir, ifs }) {
   const add = (c) => { if (!sf.needExt || SCRIPT_EXT.test(c)) files.add(c); };
   const words = [];
   for (const w0 of sf.words ?? []) {
-    const rs = paramReadings(w0);
+    const rs = readingsOf(w0, assigned);
     if (rs.over) return { files: [], dynamic, over: true };
     words.push(...rs);
   }

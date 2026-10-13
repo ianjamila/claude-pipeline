@@ -916,3 +916,15 @@ test('guard-files: a default word in a script or option position is judged on ev
   for (const c of ['bash ${A:-./ok.sh}', 'bash ${A:-ok.sh}', 'bash ${A:--c ./ok.sh}', 'bash ${A:--s} < ok.sh', 'sh ${A:--c ./ok.sh}', 'A=x; bash ${A:+./ok.sh}', 'echo ${A:-./w.sh}', 'bash ${1:-./ok.sh}', 'bash ${A[0]:--c ./ok.sh}', 'bash ${!A:-./ok.sh}'])
     assert.equal(files(c).decision, 'allow', c);
 });
+
+test('guard-git: a ${X:=w} on the line may have set the $X a later script word uses', () => {
+  for (const c of [': ${X:=./f.sh}; bash $X', 'echo ${X:=f.sh}; bash $X', ': ${X:=f.sh}; source $X', 'bash -c \': ${X:=./f.sh}; bash $X\'', ': ${X=./f.sh}; bash "$X"'])
+    assert.equal(git(c).decision, 'deny', c);
+  for (const c of [': ${X:=./ok.sh}; bash $X', 'echo ${X:=ok.sh}; bash $X', 'echo ${X:=./f.sh}; echo $X']) assert.equal(git(c).decision, 'allow', c);
+});
+
+test('guard-files: a ${X:=w} on the line may have set the $X a later script word uses', () => {
+  for (const c of [': ${X:=./w.sh}; bash $X', 'echo ${X:=w.sh}; bash $X', ': ${X:=w.sh}; source $X', 'bash -c \': ${X:=./w.sh}; bash $X\'', ': ${X=./w.sh}; bash "$X"'])
+    assert.equal(files(c).decision, 'deny', c);
+  for (const c of [': ${X:=./ok.sh}; bash $X', 'echo ${X:=ok.sh}; bash $X', 'echo ${X:=./w.sh}; echo $X']) assert.equal(files(c).decision, 'allow', c);
+});
