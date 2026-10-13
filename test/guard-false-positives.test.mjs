@@ -383,3 +383,18 @@ test('J: an unknown psql line is refused only with protected text around, also w
     assert.equal(run(`psql -c "${sql.replaceAll('"', '\\"')}; select '/home/u/.claude/settings.json'"`).decision, 'deny', `${sql} + protected`);
   }
 });
+
+// Why (commit review of I and J): the value a word has when the shell runs is the one assigned before it, once; and the SQL placeholder must not be a name a command can set.
+test('K: no login files are skipped on a value assigned later or alongside; a variable named like the SQL placeholder is a variable', () => {
+  const run = (cmd, extra, env = { HOME: '/home/u' }) => files(cmd, fakeFs(PROJ, { '/home/u/.bash_profile': BAD_FILES, 'scripts/ok.sh': 'echo hi', ...extra }, ['scripts']), { env });
+  const lx = { HOME: '/home/u', X: '-l' };
+  for (const [cmd, env] of [['bash $X scripts/ok.sh; X=foo', lx], ['X=foo bash $X scripts/ok.sh', lx], ['X=foo true; bash $X scripts/ok.sh', lx], ['X=foo; X=-l; bash $X scripts/ok.sh'], ['for S in -l x; do bash $S scripts/ok.sh; done'],
+    ['S=x; f() { bash $S scripts/ok.sh; }; S=-l; f'], ['true || X=foo; bash $X scripts/ok.sh', lx], ['X=foo | true; bash $X scripts/ok.sh', lx], ['X=foo; read X; bash $X scripts/ok.sh'],
+    [': ${X:=-l}; X=foo; bash $X scripts/ok.sh'], ['X=foo; unset X; bash $X scripts/ok.sh', lx]]) {
+    assert.equal(run(cmd, {}, env).decision, 'deny', cmd);
+  }
+  assert.equal(run('S=/home/u/proj/scripts; bash $S/ok.sh', {}).decision, 'allow');
+  for (const cmd of ['source "$(echo x)"; bash $SQL_UNKNOWN_SHELL_LINE', 'source "$(echo x)"; $SQL_UNKNOWN_SHELL_LINE', 'eval "$(cat x)"; bash "$SQL_UNKNOWN_SHELL_LINE"']) {
+    assert.equal(run(cmd, { x: 'SQL_UNKNOWN_SHELL_LINE=/home/u/proj/evil.sh', 'evil.sh': BAD_FILES }).decision, 'deny', cmd);
+  }
+});

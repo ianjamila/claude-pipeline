@@ -3,6 +3,7 @@
 // Why: these clients run shell commands and write files from the TEXT they read (psql `\! cmd`, `\o |cmd`, mysql `system cmd`, sqlite3 `.shell cmd`),
 // include other files (`\i`, `source`, `.read`), and start from rc files and options of their own. The guards judge that text like shell lines, so the
 // model is an ALLOWLIST: a meta-command outside the known-safe set is an unknown shell line (dynamic: refused when guarded text is around), never skipped.
+import { randomBytes } from 'node:crypto';
 import { dirname, isAbsolute, join } from 'node:path';
 
 const FAMILY = { psql: 'psql', pgcli: 'psql', usql: 'psql', mysql: 'mysql', mariadb: 'mysql', mycli: 'mysql', sqlite3: 'sqlite' };
@@ -12,7 +13,8 @@ export const sqlFamilyOf = (name) => FAMILY[name] ?? null;
 
 // A shell line that stands for "something this client runs that cannot be known": a command named by a variable, so it is dynamic and the policies
 // refuse it when the line (or the text it sits in) mentions a guarded operation or a protected file.
-export const SQL_UNKNOWN_VAR = 'SQL_UNKNOWN_SHELL_LINE';
+// (the name carries a random suffix: a fixed one could be a variable the command itself sets, which files-policy would then take for this placeholder)
+export const SQL_UNKNOWN_VAR = `SQL_UNKNOWN_SHELL_LINE_${randomBytes(8).toString('hex')}`;
 const UNKNOWN = `$${SQL_UNKNOWN_VAR}`;
 const clean = (s) => String(s).replace(/\\/g, '').replace(/[`'"\\;&|<>()${}\n\r]/g, ' ').replace(/\s+/g, ' ').trim();
 const unq = (w) => String(w).trim().replace(/^(['"])([\s\S]*)\1$/, '$2');

@@ -1672,6 +1672,24 @@ function lineVarWord(w, ctx) {
   const names = [...w.matchAll(/\$\{?(\w+)/g)].map((x) => x[1]);
   return names.length && e0 && !/[\s$`*?[{~(]|^-/.test(e0) && names.every((n) => Object.hasOwn(ctx.vars, n) && !ctx.unknownVars.has(n) && !ctx.pickUnknown.has(n) && !ctx.srcChanged.has(n) && !ctx.srcTouched.has(n)) ? e0 : null;
 }
+// lineVarWord for the command at idx, where the value must be the one the word has WHEN that command runs (ctx.vars holds the line's last value of each name, a prefix
+// `X=v cmd` included): every name has exactly one assignment on the line, a bare one before idx that surely runs first, and is bound nowhere else (read / for / printf -v /
+// ${X:=w} / unset / an arithmetic name: the name stands as a word of its own). Anything else: null.
+function lineVarWordAt(w, ctx, cmds, idx, raw) {
+  const from = flowStart(cmds);
+  const once = (n) => {
+    const sites = [];
+    for (const [j, c] of cmds.entries()) if (Object.hasOwn(c.env ?? {}, n)) sites.push(j);
+    if (sites.length !== 1) return false;
+    const j = sites[0];
+    const c = cmds[j];
+    if (j >= idx || c.argv.length || c.depth !== 0 || c.sep === '&&' || c.sep === '||' || ['|', '&'].includes(cmds[j + 1]?.sep) || inFlow(from, j)) return false;
+    if (new RegExp(`\\$\\{${n}:?[=?+-]`).test(raw)) return false;
+    return (String(raw).match(new RegExp(`(?<![\\w$])(?<!\\$\\{)${n}(?!\\w)`, 'g')) ?? []).length === 1;
+  };
+  const names = [...w.matchAll(/\$\{?(\w+)/g)].map((x) => x[1]);
+  return names.length && names.every(once) ? lineVarWord(w, ctx) : null;
+}
 function judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw) {
   const joinPath = (d, r) => (isAbs(r) ? posix.normalize(r) : posix.join(d, r));
   const lines = execLinesOf(sf, (w) => expandRefs(w, ctx), ctx.assigned);
@@ -2211,7 +2229,7 @@ function evaluateBashForFilesFrame(command, opts) {
       // quotes kept it literal), so the shell is no login shell reading ~/.bash_profile: the startup files are those of `bash FILE`. The own-directory path is also judged as a
       // candidate (the word's other readings still are). A value with a space or a glob character would split or match: unchanged.
       const ownWord = sf0?.ambiguous && sf0.kind === 'shell' && !sf0.joined && c.argv[1] === sf0.words?.[0] && !['source', '.', 'eval'].includes(baseOf(c.argv[0] ?? '')) && !/^[-+]/.test(c.argv[1])
-        ? { self: selfPathWord(sf0.words[0], cmds, idx, ctx), line: lineVarWord(sf0.words[0], ctx) } : null;
+        ? { self: selfPathWord(sf0.words[0], cmds, idx, ctx), line: lineVarWordAt(sf0.words[0], ctx, cmds, idx, raw) } : null;
       const plain = (p) => p !== null && !/[\s*?[\]{}~$`\\]|^[-+]/.test(p);
       const own = ownWord && (plain(ownWord.self) ? ownWord.self : plain(ownWord.line) ? ownWord.line : null);
       const cs = own ? { ...c, argv: c.argv.map((w, i) => (i === 1 ? own : w)) } : c;
