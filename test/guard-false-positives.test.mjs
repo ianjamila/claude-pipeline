@@ -398,3 +398,14 @@ test('K: no login files are skipped on a value assigned later or alongside; a va
     assert.equal(run(cmd, { x: 'SQL_UNKNOWN_SHELL_LINE=/home/u/proj/evil.sh', 'evil.sh': BAD_FILES }).decision, 'deny', cmd);
   }
 });
+
+// Why (replay 10-13, 223 runs of eaglewatch's scripts/verify.mjs): JS template literals (`${ok ? 'PASS' : `FAIL ${x ?? '?'}`}`) were read as shell parameter defaults; too many
+// readings counted as naming a protected file, so a program that writes anything was refused.
+test('L: a program whose template literals overflow the default readings is judged on its text', () => {
+  const JSPROG = "const ok = true;\nsay(`verify (${mode}): ${ok ? 'PASS' : `FAIL at ${failed?.name ?? '?'}`} - ${a.filter((s) => s.x === 'pass').length}/${a.length}`);\nwarn(`lock ${lockName(g)} held by ${o?.pid ?? '?'} on ${o?.host ?? '?'}`);\nfs.writeFileSync('.verify/report.json', '{}');\n";
+  const run = (prog) => files('node scripts/verify.mjs --quick', fakeFs(PROJ, { 'scripts/verify.mjs': prog }, ['scripts']));
+  assert.equal(run(JSPROG).decision, 'allow');
+  for (const bad of ["fs.writeFileSync('/home/u/.claude/settings.json', x)", 'fs.writeFileSync(`${HOME}/.claude/settings.json`, x)', "fs.writeFileSync(os.homedir() + '/.claude/pipeline/x', x)"]) {
+    assert.equal(run(`${JSPROG}${bad}\n`).decision, 'deny', bad);
+  }
+});

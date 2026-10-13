@@ -616,11 +616,12 @@ function makeMatchers(ctx) {
 
   // Is a protected file named in `text`? By absolute path (in any of its spellings), by a tail with an unknown
   // prefix, or by a relative tail that lands in a protected root from one of `dirs`.
-  const rawHit = (text, dirs) => {
+  // (program: the text of a program in another language, where `${…}` is no shell default: readings that overflow leave the text itself to be judged)
+  const rawHit = (text, dirs, program = false) => {
     if (!text) return false;
     // Why: `${V:-~/.claude}/settings.json` is the protected file whenever V is unset or empty, so every reading of a default / alternative word is judged
     const rs = paramReadings(String(text));
-    if (rs.over) return true;
+    if (rs.over) return program ? rawHitOne(text, dirs) : true;
     return rawHitOne(text, dirs) || rs.some((r) => rawHitOne(r, dirs));
   };
   const rawHitOne = (text, dirs) => {
@@ -1593,7 +1594,7 @@ function judgeScriptText(text, sf, abs, dir, ctx, opts) {
   // program text in another language: the admin switch, the hook switch, or a write next to a protected path
   if (variantsOf(text).some((t) => setsAdmin(t, ctx.platform) || hasDisableAll(t))) return deny(`the program ${sf.file} sets PIPELINE_ADMIN or mentions disableAllHooks; only the owner may switch the pipeline guard off`);
   const m = makeMatchers(ctx);
-  if (text.length <= MAX_SCRIPT_BYTES && m.rawHit(text, [dir]) && WRITE_HINT.test(text)) return deny(`the program ${sf.file} refers to a protected pipeline file and writes (${PROTECTED_MSG})`);
+  if (text.length <= MAX_SCRIPT_BYTES && m.rawHit(text, [dir], true) && WRITE_HINT.test(text)) return deny(`the program ${sf.file} refers to a protected pipeline file and writes (${PROTECTED_MSG})`);
   return null;
 }
 
