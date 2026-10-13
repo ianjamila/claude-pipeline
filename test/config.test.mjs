@@ -75,6 +75,22 @@ test('production defaults: provider and deploy_timeout_minutes', () => {
   assert.equal(r.ok, true, r.errors.join('; '));
   assert.equal(r.config.production.deploy_timeout_minutes, 20);
   assert.equal(r.config.production.provider, 'github-deployments');
+  assert.equal(r.config.production.watch, 'session');
+});
+
+test('production.watch: session|workflow accepted, anything else rejected naming the key', () => {
+  const base = { url: 'https://x.example.com', environment: 'Production', smoke: 'curl {url}', rollback: { command: 'undo' } };
+  const withWatch = (watch) => validateConfig({ ...minimal(), production: { ...base, watch } });
+  for (const ok of ['session', 'workflow']) {
+    const r = withWatch(ok);
+    assert.equal(r.ok, true, r.errors.join('; '));
+    assert.equal(r.config.production.watch, ok);
+  }
+  for (const bad of ['', 'Workflow', 'ci', 'both', true, 1, null, [], {}]) {
+    const r = withWatch(bad);
+    assert.equal(r.ok, false, `watch = ${JSON.stringify(bad)}`);
+    assert.ok(has(r, 'production.watch must be one of session|workflow'), r.errors.join(' | '));
+  }
 });
 
 test('missing version is rejected', () => {

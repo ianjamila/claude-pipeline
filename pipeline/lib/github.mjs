@@ -103,6 +103,20 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     return r.stdout.trim() === '' ? null : parse(r, args);
   };
 
+  const commentList = (args) => {
+    const r = ok(args);
+    let list;
+    try {
+      list = parseConcatenatedJson(r.stdout);
+    } catch (err) {
+      throw new GhError({ code: r.code, stderr: `could not parse comments: ${err.message}`, args });
+    }
+    if (!list.every((c) => c !== null && typeof c === 'object')) {
+      throw new GhError({ code: r.code, stderr: 'comments reply was not a list of objects', args });
+    }
+    return list;
+  };
+
   const self = {
     api,
 
@@ -154,18 +168,12 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     editLabel: ({ name, color, description }) => ok(['label', 'edit', name, '--color', color, '--description', description]),
 
     listComments(n) {
-      const args = ['api', `repos/${self.repo().slug}/issues/${prNumber(n)}/comments`, '--paginate'];
-      const r = ok(args);
-      let list;
-      try {
-        list = parseConcatenatedJson(r.stdout);
-      } catch (err) {
-        throw new GhError({ code: r.code, stderr: `could not parse comments: ${err.message}`, args });
-      }
-      if (!list.every((c) => c !== null && typeof c === 'object')) {
-        throw new GhError({ code: r.code, stderr: 'comments reply was not a list of objects', args });
-      }
-      return list;
+      return commentList(['api', `repos/${self.repo().slug}/issues/${prNumber(n)}/comments`, '--paginate']);
+    },
+
+    // Every issue/PR comment of the repo updated since `since` (an ISO instant); each carries its `issue_url`.
+    listRepoComments(since) {
+      return commentList(['api', `repos/${self.repo().slug}/issues/comments?since=${encodeURIComponent(since)}&per_page=100`, '--paginate']);
     },
 
     // Only our own (viewer's) newest comment that STARTS with the marker is edited: a quoted or forged

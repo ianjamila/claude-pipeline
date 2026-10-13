@@ -19,6 +19,9 @@ export const AGENT_LOG_HEADER = [
   '',
 ].join('\n');
 
+// The outcome of the line `stage` writes for a run that merged: the production smoke has not reported yet.
+export const DEFAULT_OUTCOME = 'merged — prod smoke pending';
+
 const QUEUE_FILE = 'agent-log-queue.jsonl';
 const LOCK_NAME = 'agent-log-queue';
 const LOCK_WAIT_MS = 30_000;
@@ -73,8 +76,10 @@ export function assertSingleLine(line) {
   return line.trim();
 }
 
+// Idempotent: a line already in the queue (staged in some open PR or not) is not added again. Caller holds the queue lock.
 export function appendToQueue(cwd, line, at = new Date().toISOString()) {
   const clean = assertSingleLine(line);
+  if (readQueue(cwd).some((e) => e.line === clean)) return clean;
   const file = queuePath(cwd);
   mkdirSync(dirname(file), { recursive: true });
   appendFileSync(file, `${JSON.stringify({ line: clean, at })}\n`);
@@ -150,24 +155,31 @@ export function commitLines({ root, file, lines, pr }) {
   return { sha: git(['rev-parse', 'HEAD'], o).trim(), fresh };
 }
 
-// The log lines already on origin/<default>: what a queued line must reach to stop being queued. null when the default
-// branch (or the log file there) cannot be read, which keeps every entry queued. `fetch` refreshes origin/<default> first
-// (best effort, bounded): without it a merge we have not fetched yet just keeps the line queued a little longer.
-export function landedLines(root, { logFile, defaultBranch, fetch = false }) {
+// The log lines already on origin/<default>, and whether the refresh of that ref succeeded. `lines` is null when the default
+// branch (or the log file there) cannot be read, which keeps every queued entry queued. `fetch` refreshes origin/<default>
+// first (best effort, bounded): without it a merge we have not fetched yet just keeps the line queued a little longer.
+// `refreshed` is true only when a requested fetch succeeded: a readable but possibly STALE cached ref has lines and
+// refreshed false, which a caller that moves a shared checkpoint must tell apart from a fresh copy.
+export function originLogLines(root, { logFile, defaultBranch, fetch = false }) {
   const o = { cwd: root };
+  let refreshed = false;
   try {
     if (fetch) {
       try {
         git(['fetch', '--no-tags', 'origin', `+refs/heads/${defaultBranch}:refs/remotes/origin/${defaultBranch}`], { ...o, timeoutMs: NETWORK_TIMEOUT_MS });
+        refreshed = true;
       } catch { /* offline, or no origin: judge by the ref we already have */ }
     }
     const rel = relative(root, logFile).split('\\').join('/');
     const text = showFile(`origin/${defaultBranch}`, rel, o);
-    return text === null ? new Set() : new Set(text.split('\n').map((l) => l.replace(/\r$/, '')));
+    return { lines: text === null ? new Set() : new Set(text.split('\n').map((l) => l.replace(/\r$/, ''))), refreshed };
   } catch {
-    return null;
+    return { lines: null, refreshed };
   }
 }
+
+// The lines alone: null when origin/<default>'s copy cannot be read.
+export const landedLines = (root, opts) => originLogLines(root, opts).lines;
 
 // Rewrite the queue without the entries that were just written (matched one-for-one, so an identical line queued
 // again meanwhile survives). Entries appended since the read are kept.

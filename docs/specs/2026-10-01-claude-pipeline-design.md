@@ -161,6 +161,7 @@ All subcommands print one JSON object to stdout (human text to stderr), and use 
 | `smoke --target preview\|production --url URL [--expect-text T]` | Runs the configured smoke command with `{url}` substituted. |
 | `prod-watch --sha MERGE_SHA [--expect-text T]` | Wait for Production deployment success for the merge SHA → production smoke → on failure: `vercel rollback <known-good> --yes --timeout 3m` (run by prod-watch itself, not `production.rollback.command`), issue `pipeline-rollback` with evidence, revert PR (needs-human). |
 | `summary --pr N --outcome merged\|blocked\|needs-human\|reverted\|awaiting-review` | Render §10 summary → upsert comment `<!-- claude-pipeline:summary -->`; print the agent-log line. |
+| `agent-log close [--queue]` | Resolve "merged — prod smoke pending" log lines from bot-authored prod-smoke-result PR comments (see §10.1, `production.watch: workflow`); dry run unless `--queue`. |
 | `agent-log --line "…"` | Commit the line to `docs/agent-log.md` via a docs-only branch + PR (§10.3). |
 | `update-branch --pr N [--expect-head SHA] [--max-cycles N] [--wait-checks]` | If the base tip is not an ancestor of the PR head, `PUT pulls/{n}/update-branch` with `expected_head_sha` (no local push, never a force push), accept only GitHub's own merge commit (parents exactly [pinned head, captured base tip]) as the new head, re-check; at most 3 cycles. Does not wait for checks by default (the ready/label/CI-wait steps that follow do; `--wait-checks` opts in). Outcomes: `up-to-date`, `rebase-needed` (conflict ⇒ needs-human), `head-moved` (the head is not the verified one, GitHub refused the pin, or an external push raced the update: stop, re-read), `cycle-cap`, `head-timeout`, `not-open`; with `--wait-checks` also `checks-failed`/`checks-timeout`. |
 | `final-gate --pr N` | Assert: fresh full verify report bound to PR head SHA & tree, no blocking labels, no open pause/rollback issue, hard-stop recheck clean, review state exit-clean. Writes `.review/final-gate.json`. |
@@ -290,6 +291,7 @@ production:
   url: https://ewiapp.eaglewatch.ph
   environment: Production
   deploy_timeout_minutes: 20
+  watch: session            # session | workflow (see §10.1)
   smoke: "node scripts/pipeline/smoke.mjs --base {url} --production"
   rollback:
     command: "vercel rollback --yes"
@@ -529,6 +531,11 @@ SHA → production smoke (read-only, unauthenticated; never `smoke:hydration`) �
 deployment URL, merge SHA, rollback output, the Vercel auto-assign note) → revert PR
 (`git revert <merge sha>`) labelled `needs-human` → outcome `reverted`. While a
 `pipeline-rollback` issue is open, ship never merges.
+
+`production.watch: workflow` moves this out of the session: a CI workflow owns the smoke and posts
+bot-authored `<!-- prod-smoke-result v=1 sha=… deployment=… status=… vercel=… outcome=… observed=… run=… -->`
+comments on the merged PR. ship then never runs prod-watch and never rolls back (outcome `merged`); `agent-log close`
+turns the newest result for the merge commit into a resolution line for each "prod smoke pending" log line.
 
 ### 10.2 Summary comment (`<!-- claude-pipeline:summary -->`)
 Order: **Outliers** (arbiter rulings: finding · Codex view · Opus view · Fable ruling · one-line

@@ -72,7 +72,8 @@ them unless you set `ci.guard_checks: false`, only for a repo that does not run 
 organization, otherwise every approval fails closed with `org-repo-needs-ci.approvers`; ask the owner for
 the logins); preview (environment name in GitHub
 deployments + smoke command); production (URL, provider, read-only smoke, rollback command (documentation only: prod-watch runs
-`vercel rollback <known-good> --yes --timeout 3m` itself for provider `vercel`) + notes); `smoke_checks` (GET-only, unauthenticated); `risk.high_risk_paths`; `hard_stops.paths` /
+`vercel rollback <known-good> --yes --timeout 3m` itself for provider `vercel`) + notes; `watch: workflow` only when a CI workflow of the project
+posts the production smoke result on the merged PR, default `session`); `smoke_checks` (GET-only, unauthenticated); `risk.high_risk_paths`; `hard_stops.paths` /
 `patterns` / `auth_calls` (project extras on top of the universal list); `hard_stops.disable_rules: [R6-sensitive]` only when
 sensitive-data words are routine for the domain (an HR/payroll/medical app; nothing else can be switched off — ask the owner
 first); `hard_stops.report_only_rules` / `report_only_paths` downgrade non-database rules to report-only (listed, never blocking, no

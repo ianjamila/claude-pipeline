@@ -11,17 +11,25 @@ blocked · **2** usage or environment error (also: unknown command, unknown flag
 
 ## agent-log
 
-queue a line for the agent log, or stage queued lines + this PR's line as a commit in the worktree.
+queue a line for the agent log, stage queued lines + this PR's line as a commit in the worktree, or close pending prod-smoke lines.
 
 ```
-pipeline agent-log queue --line "<line>" [--repo DIR]   -> {ok, queued, file}
+pipeline agent-log queue --line "<line>" [--repo DIR]   -> {ok, queued, file}; a line already in the queue (staged in an open PR or not) is not added again
 pipeline agent-log stage --pr N [--line "<line>"] [--repo DIR]   -> {ok, committed, lines, file, staged, dropped}; run in the PR worktree;
   staged lines stay queued ("staged in PR N") until origin/<default> contains them, and are re-staged if that PR closes unmerged;
   default line = the PR's agent-log line with outcome "merged — prod smoke pending"; exit 2 when the worktree has other uncommitted changes,
   is on the default branch or a detached HEAD, or is not the PR's head branch at the PR's head commit; exit 3 when GitHub cannot say
+pipeline agent-log close [--queue] [--pr N]... [--all] [--repo DIR]   -> {ok, lines, pending, skipped, unreadable, originReadable, originRefreshed, queued?, scanError?}; for every "prod smoke pending" log line reads the
+  bot-authored prod-smoke-result comments on that PR (production.watch: workflow) and prints one resolution line per PR whose newest result
+  is not logged yet (never an earlier minute than the newest logged one; the same minute only when the line differs); the log read is the worktree log plus the origin/<default> copy; one repo-wide read of the comments since the last successful read on this machine (at least 14 days)
+  finds new results on any PR (a hit only triggers reading the whole comment history of that PR), and a PR is read on its own only when it has no
+  resolution line, is the newest pending PR, is named by --pr N (repeatable) or --all is given (a resolved PR the scan did not mention is `skipped`,
+  costing no call); a dry run unless --queue (queues each line like `queue`, a line already queued is not added again; never commits; only --queue advances the scan window, and only when the origin/<default> copy of the log was readable AND `git fetch origin <default>` succeeded, else originReadable / originRefreshed is false and a note goes to stderr); exit 1 when some
+  PRs could not be read (`unreadable`; the lines for the others are still produced and queued: still run `stage` and name them in the summary), 3 when GitHub is
+  unavailable (skip the close, still stage)
 ```
 
-Exit: 0 ok · 2 usage, or the worktree is not the PR's clean head branch (stage) · 3 GitHub cannot say / queue lock timeout.
+Exit: 0 ok · 1 some PRs could not be read (close; the others are still processed and queued) · 2 usage, or the worktree is not the PR's clean head branch (stage) · 3 GitHub cannot say / queue lock timeout.
 
 ## arbiter
 

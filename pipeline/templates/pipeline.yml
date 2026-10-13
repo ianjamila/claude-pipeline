@@ -43,6 +43,10 @@ production: null
 #  provider: vercel
 #  environment: Production
 #  deploy_timeout_minutes: 20
+#  watch: session               # session (default): ship runs prod-watch (smoke + rollback). workflow: a CI workflow of yours
+#                               # owns the production smoke and posts `<!-- prod-smoke-result v=1 … -->` comments (as
+#                               # github-actions[bot]) on the merged PR; ship never runs prod-watch or rolls back, and
+#                               # `pipeline agent-log close` copies those results into the agent log.
 #  smoke: node scripts/pipeline/smoke.mjs --base {url} --production
 #  rollback:                    # required by validation, but `command` is documentation for humans only:
 #    command: vercel rollback <known-good-deployment> --yes   # what prod-watch runs for provider "vercel": see below
