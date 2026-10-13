@@ -416,3 +416,20 @@ test('L: a program whose template literals overflow the default readings is judg
     assert.equal(run(`${JSPROG}${bad}\n`).decision, 'deny', bad);
   }
 });
+
+// Why (replay 10-13): `node ~/.claude/pipeline/bin/pipeline.mjs job start codex-r1 -- node ~/.claude/pipeline/bin/pipeline.mjs codex-review …` (the ship skill's review step):
+// the outer CLI is a program whose writes are unknown, so the inner one "may have been written", and the line "refers to a protected file" only because it names that CLI.
+test('M: the pipeline CLI run after a command whose writes are unknown is not refused for naming itself', () => {
+  const CLI = '/home/u/.claude/pipeline/bin/pipeline.mjs';
+  const run = (cmd) => files(cmd, fakeFs(PROJ, { [CLI]: 'console.log(1)\n' }, DIRS));
+  for (const cmd of [`B=$(git merge-base origin/main HEAD); node ${CLI} job start codex-r1 -- node ${CLI} codex-review --pr 1 --round 1 --base $B --head $(git rev-parse HEAD)`,
+    'node ~/.claude/pipeline/bin/pipeline.mjs job start c -- node ~/.claude/pipeline/bin/pipeline.mjs codex-review --head $(git rev-parse HEAD)', `node x.mjs; node ${CLI} status`]) {
+    assert.equal(run(cmd).decision, 'allow', cmd);
+  }
+  // another protected name or switch on the line still counts
+  const inner = `node ${CLI} job start c -- node ${CLI} codex-review --head $(git rev-parse HEAD)`;
+  for (const cmd of [`${inner} # ~/.claude/settings.json`, `${inner} # disable${'AllHooks'}`]) assert.equal(run(cmd).decision, 'deny', cmd);
+  // (only a protected script's own word is left out: another script named like a switch still counts)
+  const other = files('eval "$X"; bash PIPELINE_ADMIN.sh', fakeFs(PROJ, { 'PIPELINE_ADMIN.sh': 'echo hi\n' }, DIRS));
+  assert.equal(other.decision, 'deny');
+});

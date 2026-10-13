@@ -1660,8 +1660,11 @@ function judgeWrittenScript(w, sf, abs, dir, ctx, opts, scanRaw) {
       if (setsAdmin(v, ctx.platform) || hasDisableAll(v) || m.rawHit(v, [dir])) return deny(`the script ${sf.file} is written by an inline program that refers to a protected pipeline file or switch, so what it runs cannot be checked; write the file out literally`);
     }
   }
-  // the prose-masked line: a protected path, or (strictly) the bare words once quotes and escapes are stripped
-  if (w.unknown && (makeMatchers(ctx).rawHit(scanRaw, [dir]) || SENSITIVE_WORDS.test(scanRaw.replace(/['"`\\]/g, '')))) {
+  // the prose-masked line: a protected path, or (strictly) the bare words once quotes and escapes are stripped. Why: a protected script (the pipeline CLI run after a
+  // command whose writes are unknown, as the ship skill's `pipeline.mjs job start … -- node pipeline.mjs codex-review`) is not judged on its content, and the line names a
+  // protected file only by naming it: its own word is left out, any other protected name or switch still counts
+  const rest = ctx.hit(abs) ? scanRaw.split(String(sf.file)).join(' ') : scanRaw;
+  if (w.unknown && (makeMatchers(ctx).rawHit(rest, [dir]) || SENSITIVE_WORDS.test(rest.replace(/['"`\\]/g, '')))) {
     return deny(`the script ${sf.file} may have been written by an earlier command on the line (its content is only known at run time) and the line refers to a protected pipeline file or switch, so what it runs cannot be checked; write the file out literally`);
   }
   return null;
