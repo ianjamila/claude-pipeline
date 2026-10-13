@@ -176,7 +176,12 @@ async function evaluateCandidates(repo, { gh, mode, dryRun, env, runId, runStart
       kept.push({ slug: c.slug, reason: 'changed during the run', pr: v.pr });
       continue;
     }
-    const res = await removeWorktree({ root, wt: c, cfg: w, pr: v.pr, holdingDir, runId, runStartMs, settleMs: settleMs(env) });
+    let res;
+    try {
+      res = await removeWorktree({ root, wt: c, cfg: w, pr: v.pr, holdingDir, runId, runStartMs, settleMs: settleMs(env) });
+    } catch (err) {
+      res = { removed: false, reason: `removal failed: ${oneLine(err)}` };
+    }
     const archived = (res.archived ?? []).map((a) => a.stored);
     if (res.removed) removed.push({ ...item, archived, deleted: res.deleted });
     else kept.push({ slug: c.slug, reason: res.reason, pr: v.pr, ...(archived.length ? { archived } : {}) });
@@ -290,11 +295,9 @@ function appendLog(env, slug, line) {
 }
 
 async function pruneLocked(repo, { mode, dryRun, notify, ctx, env }) {
-  const { root, commonDir, worktreeDir } = repo;
+  const { root, worktreeDir } = repo;
   const runStartMs = Date.now();
   const runId = `${runStartMs.toString(36)}-${process.pid}`;
-  if (gitBusy(commonDir)) return { exitCode: EXIT.OK, output: { ok: true, mode, dryRun, skipped: 'git operation in progress' } };
-
   const restored = modeAllows(mode, 'restore-leftover', { dryRun }) ? restoreLeftovers(root, worktreeDir) : pendingLeftovers(root, worktreeDir);
 
   const { removed, wouldRemove, kept } = await guardGh(async () => {
@@ -307,23 +310,31 @@ async function pruneLocked(repo, { mode, dryRun, notify, ctx, env }) {
     return evaluateCandidates(repo, { gh, mode, dryRun, env, runId, runStartMs });
   });
 
-  const outside = outsideReport(root, env);
+  // Worktrees may already be gone: from here on a failing step becomes an `errors` entry, never a lost report.
+  const errors = [];
+  const step = async (name, fn, fallback) => {
+    try {
+      return await fn();
+    } catch (err) {
+      errors.push({ step: name, error: oneLine(err) });
+      return fallback;
+    }
+  };
+  const outside = await step('outside', () => outsideReport(root, env), []);
   const holdingDir = holdingRoot(repo.slug, env);
-  const purged = modeAllows(mode, 'purge', { dryRun }) ? purgeHolding(holdingDir, { nowMs: Date.now() }).purged : [];
-  const holding = { batches: listHolding(holdingDir), purged };
-  const summary = summaryLine({ name: repo.name, mode, dryRun, removed, wouldRemove, kept, restored, outside, holding });
-  const output = { ok: true, mode, dryRun, removed, wouldRemove, kept, restored, outside, holding, summary };
+  const purged = modeAllows(mode, 'purge', { dryRun }) ? await step('purge', () => purgeHolding(holdingDir, { nowMs: Date.now() }).purged, []) : [];
+  const holding = { batches: await step('holding', () => listHolding(holdingDir), []), purged };
+  const summary = summaryLine({ name: repo.name, mode, dryRun, removed, wouldRemove, kept, restored, outside, holding })
+    + (errors.length ? ` · errors: ${errors.map((e) => e.step).join(', ')}` : '');
+  const output = { ok: true, mode, dryRun, removed, wouldRemove, kept, restored, outside, holding, summary, errors };
 
-  try {
-    output.log = appendLog(env, repo.slug, `${new Date().toISOString()} ${summary}`);
-  } catch (err) {
-    output.logError = oneLine(err);
-  }
+  const log = await step('log', () => appendLog(env, repo.slug, `${new Date().toISOString()} ${summary}`), null);
+  if (log) output.log = log;
   if (notify && (removed.length || restored.some((r) => r.restored))) {
-    output.notify = await notifyEvent(
+    output.notify = await step('notify', () => notifyEvent(
       { event: 'worktrees', pr: null, action: summary, ids: removed.map((r) => r.slug) },
       { cwd: root, env, ...(ctx?.notifyDeps ?? {}) },
-    );
+    ), undefined);
   }
   return { exitCode: EXIT.OK, output };
 }
@@ -334,6 +345,8 @@ export async function prune(values, ctx) {
   const mode = repo.w.mode;
   const dryRun = values['dry-run'] === true;
   return withRunLock(repo.commonDir, env, async () => {
+    // spec §4 rule 7: git is busy => no evaluation and no move at all, not even restoring a leftover quarantine.
+    if (gitBusy(repo.commonDir)) return { exitCode: EXIT.OK, output: { ok: true, mode, dryRun, skipped: 'git operation in progress' } };
     // off: no evaluation at all; only a dead run's quarantine is undone (that is allowed in every mode).
     if (!modeAllows(mode, 'evaluate', { dryRun })) {
       return { exitCode: EXIT.OK, output: { ok: true, mode, dryRun, disabled: true, restored: restoreLeftovers(repo.root, repo.worktreeDir) } };

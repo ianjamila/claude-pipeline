@@ -38,6 +38,9 @@ function findWorktree(repo, positionals, sub) {
   return { name, entry };
 }
 
+// "pipeline-keep: ship run 7" -> "7"; null when the reason names no ship run.
+const shipRunOf = (reason) => /ship run ([A-Za-z0-9_-]+)/.exec(reason)?.[1] ?? null;
+
 async function keep(rest, ctx) {
   const { values, positionals } = parseCommandArgs(rest, { repo: { type: 'string' }, reason: { type: 'string' } });
   const text = values.reason?.trim() || 'kept by hand';
@@ -49,6 +52,11 @@ async function keep(rest, ctx) {
     return { exitCode: EXIT.OK, output: { ok: true, slug: name, locked: false, reason: 'already locked by someone else' } };
   }
   const reason = `${KEEP_PREFIX} ${text}`;
+  // A keep lock owned by a ship run is that run's to release: never overwrite it by hand or hand it to another run.
+  const owner = entry.locked !== null ? shipRunOf(entry.locked) : null;
+  if (owner !== null && shipRunOf(reason) !== owner) {
+    return { exitCode: EXIT.OK, output: { ok: true, slug: name, locked: false, reason: `kept by another run (ship run ${owner})` } };
+  }
   if (entry.locked !== null) git(['worktree', 'unlock', entry.path], { cwd: repo.root }); // refresh our own reason
   git(['worktree', 'lock', '--reason', reason, entry.path], { cwd: repo.root });
   return { exitCode: EXIT.OK, output: { ok: true, slug: name, locked: true, reason } };

@@ -6,7 +6,7 @@ import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import {
-  existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync,
+  chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -134,8 +134,8 @@ function world() {
     HOME: dirs.home, USERPROFILE: dirs.home, PIPELINE_HOLDING_DIR: dirs.holding, PIPELINE_PRUNE_LOG_DIR: dirs.logs,
     PIPELINE_LOCK_DIR: dirs.locks, PIPELINE_SCRATCH_DIR: dirs.scratch, PIPELINE_PRUNE_SETTLE_MS: '0', PIPELINE_NOTIFY: 'off',
   });
-  const cli = (args, { cwd = repo.dir } = {}) => {
-    const r = spawnSync(process.execPath, [bin, 'worktrees', ...args], { cwd, env, encoding: 'utf8' });
+  const cli = (args, { cwd = repo.dir, extraEnv = {} } = {}) => {
+    const r = spawnSync(process.execPath, [bin, 'worktrees', ...args], { cwd, env: { ...env, ...extraEnv }, encoding: 'utf8' });
     return { code: r.status, json: r.stdout ? JSON.parse(r.stdout) : null, stderr: r.stderr };
   };
   const setMode = (mode) => repo.write('.claude/pipeline.yml', `${pipelineYml()}worktrees:\n  mode: ${mode}\n`);
@@ -322,6 +322,60 @@ test('keep / unkeep: a pipeline-keep lock keeps the worktree; unkeep releases on
 
   const missing = w.cli(['keep', 'nope']);
   assert.equal(missing.code, 2);
+});
+
+test('keep never takes over a ship run\'s keep lock: not by hand, not for another run; the owning run still releases it', () => {
+  const w = world();
+  const porcelain = () => w.repo.git(['worktree', 'list', '--porcelain']);
+  assert.equal(w.cli(['keep', 'done', '--reason', 'ship run 7']).json.locked, true);
+  for (const args of [[], ['--reason', 'ship run 8'], ['--reason', 'ship run 70']]) {
+    const r = w.cli(['keep', 'done', ...args]);
+    assert.equal(r.code, 0, r.stderr);
+    assert.deepEqual([r.json.locked, r.json.reason], [false, 'kept by another run (ship run 7)'], args.join(' '));
+    assert.match(porcelain(), /locked pipeline-keep: ship run 7\n/);
+  }
+  assert.equal(w.cli(['keep', 'done', '--reason', 'ship run 7 resumed']).json.locked, true, 'the same run may refresh its own lock');
+  const released = w.cli(['unkeep', 'done', '--run', '7']);
+  assert.equal(released.json.unlocked, true);
+  assert.doesNotMatch(porcelain(), /pipeline-keep/);
+  assert.equal(w.cli(['keep', 'done']).json.locked, true, 'a hand keep lock (no run) may be refreshed by hand');
+  assert.equal(w.cli(['keep', 'done', '--reason', 'ship run 9']).json.locked, true, 'and taken over by a run');
+  assert.match(porcelain(), /locked pipeline-keep: ship run 9\n/);
+});
+
+test('git busy (index.lock) skips the run before anything moves, off mode and its leftover restore included', () => {
+  const w = world();
+  w.setMode('off');
+  const qDir = join(w.repo.dir, '.worktrees', '.prune-quarantine');
+  mkdirSync(qDir);
+  w.repo.git(['worktree', 'move', w.wtPath('open'), join(qDir, 'open.deadrun')]);
+  writeFileSync(join(w.repo.dir, '.git', 'index.lock'), '');
+  const before = w.snapshot();
+  const r = w.cli(['prune']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.json.skipped, 'git operation in progress');
+  assert.deepEqual(w.snapshot(), before);
+  assert.ok(existsSync(join(qDir, 'open.deadrun')), 'the leftover stays put while git is busy');
+});
+
+test('a failing step after removal (purge, log) is reported in errors; the removal record, log attempt and exit 0 survive', {
+  skip: (!LINUX && 'process inspection needs /proc') || (process.getuid?.() === 0 && 'root ignores directory permissions'),
+}, () => {
+  const w = world();
+  w.setMode('on');
+  const locked = join(w.holdingRepo, '2026-01-01', 'old');
+  chmodSync(locked, 0o555); // the expired batch cannot be deleted
+  writeFileSync(join(w.dirs.home, 'release-not-a-dir'), 'a file where the log directory should be');
+  try {
+    const r = w.cli(['prune'], { extraEnv: { PIPELINE_PRUNE_LOG_DIR: join(w.dirs.home, 'release-not-a-dir') } });
+    assert.equal(r.code, 0, r.stderr);
+    assert.deepEqual(slugs(r.json.removed), ['done'], JSON.stringify(r.json));
+    assert.deepEqual(r.json.errors.map((e) => e.step).sort(), ['log', 'purge'], JSON.stringify(r.json.errors));
+    assert.ok(r.json.holding.batches.length >= 1, 'holding is still listed');
+    assert.match(r.json.summary, /removed 1 .* · errors: purge$/, "the summary is the log line, so it names what failed before the log");
+  } finally {
+    chmodSync(locked, 0o755);
+  }
 });
 
 test('a quarantine left by a killed run is moved back, even in off mode', () => {
