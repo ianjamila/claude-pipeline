@@ -116,10 +116,17 @@ export function toResult(r) {
   return { code, stdout: r.stdout ?? '', stderr, timedOut, signal: r.signal ?? null };
 }
 
-function baseOptions({ cwd, env, timeoutMs } = {}) {
+// `env` is merged over process.env, unless `replaceEnv` is set: then `env` IS the child's whole environment (nothing is
+// inherited), for a call that must not see variables it did not list (isolatedGit, the installer `update` runs).
+function childEnv(env, replaceEnv) {
+  if (!env) return undefined;
+  return replaceEnv ? { ...env } : { ...process.env, ...env };
+}
+
+function baseOptions({ cwd, env, timeoutMs, replaceEnv } = {}) {
   return {
     cwd,
-    env: env ? { ...process.env, ...env } : undefined,
+    env: childEnv(env, replaceEnv),
     timeout: timeoutMs,
     killSignal: 'SIGKILL', // SIGTERM can be trapped; a timeout has to stick
     encoding: 'utf8',
@@ -128,10 +135,10 @@ function baseOptions({ cwd, env, timeoutMs } = {}) {
   };
 }
 
-export function run(cmd, args = [], { cwd, env, input, timeoutMs } = {}) {
+export function run(cmd, args = [], { cwd, env, input, timeoutMs, replaceEnv } = {}) {
   const plan = planSpawn(cmd, args);
   const r = spawnSync(plan.file, plan.args, {
-    ...baseOptions({ cwd, env, timeoutMs }),
+    ...baseOptions({ cwd, env, timeoutMs, replaceEnv }),
     input,
     windowsVerbatimArguments: plan.windowsVerbatimArguments,
   });
@@ -280,13 +287,13 @@ export function splitCommand(str, platform = process.platform) {
 }
 
 // ---- test seams are for the repo checkout only --------------------------------------------------------------------
-// PIPELINE_GH / PIPELINE_CODEX / PIPELINE_VERCEL swap the tool the gate trusts for a script, and PIPELINE_TEST_MODE relaxes
-// the arbiter's model proof. They exist so the test suite can run the real CLI against fakes; a production install must
+// PIPELINE_GH / PIPELINE_CODEX / PIPELINE_VERCEL swap the tool the gate trusts for a script, PIPELINE_TEST_MODE relaxes
+// the arbiter's model proof, and PIPELINE_UPDATE_REMOTE points `pipeline update` at another repository to fetch from. They exist so the test suite can run the real CLI against fakes; a production install must
 // never honour them (an environment variable set by anything that can launch the CLI would otherwise decide what the
 // gate sees). An installed copy is recognised by the INSTALLED.json manifest the installer writes into the pipeline root
 // (the directory holding bin/); the repo checkout has none. When installed, a seam is ignored with one warning on stderr.
 export const PIPELINE_ROOT = fileURLToPath(new URL('..', import.meta.url));
-export const SEAM_VARS = ['PIPELINE_GH', 'PIPELINE_CODEX', 'PIPELINE_VERCEL', 'PIPELINE_TEST_MODE'];
+export const SEAM_VARS = ['PIPELINE_GH', 'PIPELINE_CODEX', 'PIPELINE_VERCEL', 'PIPELINE_TEST_MODE', 'PIPELINE_UPDATE_REMOTE'];
 export const isInstalledCopy = (root = PIPELINE_ROOT) => existsSync(path.join(root, 'INSTALLED.json'));
 
 const warned = new Set();

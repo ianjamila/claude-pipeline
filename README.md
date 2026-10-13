@@ -22,10 +22,25 @@ Into `~/.claude` (or `$CLAUDE_CONFIG_DIR`):
 | `pipeline/bin/pipeline.mjs` | one zero-dependency Node CLI that makes every deterministic decision (hard-stops, final gate, merge, rollback) |
 | hook `guard-git` (matcher `Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks pushes/force-pushes to `main`, admin merges, protection edits, approval-label changes, whether typed in a shell, a `Monitor` command, a script file or an MCP tool call |
 | hook `guard-files` (matcher `Edit\|Write\|MultiEdit\|NotebookEdit\|Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks agents editing the pipeline's own files and settings — **installed last**, after the proofs |
+| hook `session-version` (SessionStart) | tells you at the top of a session when the installed pipeline is stale, edited, half-installed or older than a repo's vendored copy; silent when all is well (see [Staying current](#staying-current)) |
 | settings allow entries | `Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)` so pipeline calls don't prompt |
 
 A manifest (`~/.claude/pipeline/INSTALLED.json`: version, git SHA, file hashes) lets the installer
 refuse to overwrite skills or agents it didn't install, and lets `--check` report drift.
+
+- **Fail-closed guards.** The two guard hooks are started through a small loader, not directly. If
+  the hook file cannot be loaded (deleted, half-written, a syntax error) the loader blocks the
+  tool call with exit 2 instead of letting Claude Code treat the crash as "allowed". The
+  `session-version` status hook is the one exception: it never blocks anything.
+- **Complete-install marker.** The installer writes the manifest with `"complete": false` first and
+  flips it to `true` as its very last step, so an install that was interrupted (or whose later
+  steps failed) is never mistaken for a good one. `--check`, `pipeline version` and the session
+  warning all report it as `.incomplete`; re-running the installer (or `pipeline update`) fixes it.
+- **One writer at a time.** Install and uninstall take a per-`claude-home` lock for the whole
+  write run, so two of them (two terminals, two machines on a shared home) cannot interleave their
+  swaps. The lock sits inside that home (`backups/.locks`) and is named for its real,
+  symlink-resolved path, so reaching the home through an alias does not get around it. A lock whose owner process is gone is reclaimed; a live one is never touched, and the
+  second run stops with a message naming the owner.
 Requirements: Node ≥ 20, git, `gh` (authenticated); `codex` for reviews; `vercel` for projects
 that deploy there.
 
@@ -36,23 +51,41 @@ ancestry: an agent must not be able to rewrite its own rules). Run it **in your 
 Claude with `PIPELINE_ADMIN=1 claude`.
 
 ```sh
-git clone https://github.com/ianjamila/claude-pipeline ~/Claude/claude-pipeline   # private repo
+git clone https://github.com/ianjamila/claude-pipeline ~/Claude/claude-pipeline
 cd ~/Claude/claude-pipeline
 ./install.sh --skip-file-guard     # macOS / Linux   (Windows: .\install.ps1 --skip-file-guard)
 ./install.sh --check               # drift report only; exit 1 if anything differs; never writes
 ```
 
 - **Update:** the install is a copy, so a merged change reaches your sessions only after you
-  re-install. In your own terminal (not a Claude session):
+  update it. Once the pipeline is installed, the normal path is one command in your own terminal
+  (not a Claude session):
   ```sh
-  cd ~/Claude/claude-pipeline && git pull           # the checkout must be on main
-  ./install.sh --skip-file-guard                    # same flags as the original install
-  ./install.sh --check --skip-file-guard --claude-home ~/.claude   # expect "No drift"
+  node ~/.claude/pipeline/bin/pipeline.mjs update
   ```
-  (Windows: `git pull; .\install.ps1 …`.) Repeat `--skip-file-guard` on every update until you
-  have deliberately installed the file guard: an update without it installs the guard. Re-running
-  is idempotent; `settings.json` is backed up to `~/.claude/backups/settings.json.<UTC timestamp>`
-  before every change, and hook entries from other tools are never touched.
+  It looks up upstream's `main`, downloads exactly that commit into a private scratch directory
+  under `~/.claude/pipeline-state/tmp` (never the system temp dir, which other accounts may be able
+  to write to; it is created owner-only and refused if it is a symlink or someone else's) with an
+  isolated git (no config, hooks, credential helpers or `GIT_*` variables of yours), installs from
+  it, runs `install.mjs --check`, and reports success only when the installed stamp is that commit.
+  A copy installed with `--skip-file-guard` stays that way. It is idempotent, and
+  `settings.json` is backed up to `~/.claude/backups/settings.json.<UTC timestamp>` before every
+  change; hook entries from other tools are never touched.
+  - `update --check` only reports (installed stamp, upstream `main`, how they relate; exit 0 only
+    when the install is complete, unmodified and identical to `main`) and works anywhere,
+    including inside Claude Code. A real `update` refuses inside Claude Code, like the installer.
+  - Both Claude accounts share `~/.claude/pipeline`, so `update` always installs into `~/.claude`
+    and ignores `CLAUDE_CONFIG_DIR` (pass `--claude-home DIR` for any other location).
+  - **Proxies are not supported yet.** The update's git runs with an allowlisted environment
+    (`PATH`, `HOME`, the locale, and on Windows the few variables the runtime needs) and passes no
+    `HTTPS_PROXY`, CA-bundle or `GIT_SSH*` variables, because each can redirect or intercept the
+    download. On a network that needs a proxy, use the manual path below.
+  - **First-time install, and the manual path:** `update` needs an installed pipeline, so the
+    first install is still the clone + `install.sh` above. The same two steps update from a
+    checkout (`git pull` on `main`, then `./install.sh` with the flags you originally used, then
+    `./install.sh --check --skip-file-guard --claude-home ~/.claude`, expecting "No drift";
+    Windows: `git pull; .\install.ps1 …`). Repeat `--skip-file-guard` until you have
+    deliberately installed the file guard: an install without it installs the guard.
 - **Check from inside a Claude session:** pass `--claude-home` explicitly. A session started with
   `CLAUDE_CONFIG_DIR` set (a second account) makes a bare `--check` inspect that directory instead,
   and it reports everything as missing. A second account that symlinks `skills/`, `hooks/` and
@@ -66,6 +99,43 @@ cd ~/Claude/claude-pipeline
   kept in `backups/`), `--json`. The report also shows `CLAUDE_CODE_SUBAGENT_MODEL` and the
   claude / codex / gh versions. Keeping `CLAUDE_CODE_SUBAGENT_MODEL=sonnet` is fine: pinned agent
   models (judge = Opus, arbiter = Fable) still win over it.
+
+### Staying current
+
+Three things tell you where an install stands:
+
+- **The version stamp** (`node ~/.claude/pipeline/bin/pipeline.mjs version`, also written to a
+  repo's `scripts/pipeline/VERSION` by `pipeline vendor`) is `<base>+<sha7>` plus flags that say
+  what could *not* be proven:
+  | Stamp | Meaning |
+  |---|---|
+  | `0.1.0+a1b2c3d` | the files are byte-for-byte what was installed from that commit |
+  | `….modified` | an installed file differs from the manifest or is missing; re-run the installer or `update` |
+  | `….incomplete` | an install started and did not finish (the complete-install marker is still `false`) |
+  | `….unverified` | built from a source tree that was not a clean, published checkout (uncommitted edits, or HEAD not in `origin/main`), so the sha does not vouch for the files |
+  | `0.1.0+unknown` | no source commit is known (no git, or no manifest), so nothing can be compared |
+  A stamp with a flag or `+unknown` is never treated as "current": `update --check` exits 1, the
+  session warning says the version cannot be compared, and `pipeline vendor --check` warns that a
+  vendored `VERSION` carrying one does not prove which commit its files came from.
+- **The SessionStart warning.** At the top of a session the `session-version` hook prints a short
+  notice, and nothing at all when the install is fine. It compares your install with upstream
+  `main` and with the copy a repo vendored into `scripts/pipeline/`, within a 4-second budget, and
+  caches the lookups on disk (`$XDG_CACHE_HOME` or `~/.cache`, `claude-pipeline/`; `main` for 15
+  minutes) so most sessions never touch the network. What the messages mean:
+  | Message | What to do |
+  |---|---|
+  | `installed pipeline is modified / incomplete / unverified (…)` or `has no readable INSTALLED.json` | run `update` in your own terminal |
+  | `claude-pipeline main is ahead of your install (abc1234 → def5678)` | run `update` |
+  | `… have diverged, so it cannot be told which is newer` | `update` moves you to `main` |
+  | `WARNING: this repo's scripts/pipeline (…) is NEWER than your installed pipeline` | the repo's CI rules are newer than your local CLI, so local checks may pass what CI rejects: `update` before relying on it |
+  | `this repo's scripts/pipeline is out of date … a pipeline vendor PR is owed` | run `pipeline vendor` in that repo and open the PR |
+  | `could not check claude-pipeline main (<reason>); your install is <stamp>` | informational (the reason is one of `timed out`, `rate limited`, `not found`, `gh unavailable`, `network error`, `unexpected response`, never the raw error text): you are offline or GitHub is unreachable, so there is no comparison this session; a machine that is offline sees only this one line |
+  | `this repo's scripts/pipeline/VERSION is not a version stamp` / `… carries an unrecognised stamp` | informational: the repo's `VERSION` is missing a stamp's shape, is not a plain regular file (a symlink, FIFO, …), or has parts outside the known set; its text is never echoed because the repo is untrusted |
+  | `pipeline version check incomplete (timed out)` | informational: the 4-second budget ran out with nothing else to say |
+  Everything read from the session's repo is treated as hostile: `VERSION` is read as a plain regular file (no symlinks, at most 256 bytes), the vendored-file comparison skips symlinks and special files, caps each file at 2 MB and stops at the deadline, and no repo or `gh` text is repeated in a message.
+  The hook always exits 0 and is never started through the fail-closed loader: a failing version
+  check cannot block a session.
+- **`pipeline update --check`** gives the same comparison on demand, with exit codes (see above).
 
 ## Using it
 
@@ -151,8 +221,8 @@ head you did not review (the receipt names the head the event carried).
   guarded word), a push to a dynamic destination (only `$(git branch --show-current)`,
   `$(git rev-parse --abbrev-ref HEAD)` or a variable assigned a literal in the same command are
   understood; ship pushes `git push -u origin agent/<slug>`), `unset CLAUDECODE`, and setting
-  `PIPELINE_GH`, `PIPELINE_CODEX`, `PIPELINE_VERCEL` or `PIPELINE_TEST_MODE` on a `pipeline.mjs` command;
-  the installed CLI ignores those four seam variables altogether (they exist for the test suite).
+  `PIPELINE_GH`, `PIPELINE_CODEX`, `PIPELINE_VERCEL`, `PIPELINE_TEST_MODE` or `PIPELINE_UPDATE_REMOTE` on a `pipeline.mjs` command;
+  the installed CLI ignores those five seam variables altogether (they exist for the test suite).
 - **Branch protection needs GitHub Pro** for private repos. Without it a repo runs in `gate`
   mode (skills and CLI only) and preflight says so.
 - **Local verify, lean CI.** The full verify runs on your machine; CI keeps the repo's existing
@@ -198,7 +268,7 @@ executable.
   override, and that the model is available on your plan (an invalid model fails with
   `model_not_found`; it never silently falls back).
 - **Installer refuses** "inside a Claude Code session": run it from your own terminal.
-- **`--check` reports drift:** someone edited an installed file; re-run `./install.sh`.
+- **`--check` reports drift:** someone edited an installed file (or an install did not finish); run `node ~/.claude/pipeline/bin/pipeline.mjs update`, or re-run `./install.sh`.
 - **A merge didn't happen:** the run's summary comment and `.review/final-gate.json` in the
   worktree say which check failed (stale verify report, head moved, a required check not green,
   a blocking label, a pause or rollback issue).

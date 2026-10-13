@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Why: one installer for macOS and Windows that copies the pipeline's skills, agents and CLI into ~/.claude and
-// registers its two safety hooks in settings.json without disturbing anything else the owner has there.
+// registers its two safety hooks (plus a SessionStart version-status hook) in settings.json without disturbing anything else the owner has there.
 // It is idempotent, refuses to overwrite files it did not install, and refuses to run inside a Claude Code
 // session (an agent must not be able to reinstall or remove its own guards) unless PIPELINE_ADMIN=1. "Inside" means
 // CLAUDECODE=1 in the environment OR a Claude Code ancestor process (the variable can be stripped, the parent cannot).
@@ -13,8 +13,12 @@ import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { run } from './pipeline/lib/proc.mjs';
 import { expandHome, isInside, safeTimestamp } from './pipeline/lib/paths.mjs';
+// `pipeline update` (commands/update.mjs installerAcceptsPrivateTmpSource) detects this import to know the installer accepts its download.
+import { TMP_ROOT_REL } from './pipeline/lib/private-tmp.mjs';
 import * as I from './pipeline/lib/installer.mjs';
 import { hasClaudeCodeAncestor } from './pipeline/lib/claude-ancestry.mjs';
+import { tryAcquire, release } from './pipeline/lib/locks.mjs';
+import { fileProvenance } from './pipeline/lib/identity.mjs';
 
 class InstallError extends Error {
   constructor(message, exitCode = 1) {
@@ -184,11 +188,20 @@ function removeInstalledFile(home, rel) {
   return true;
 }
 
-function gitHead(source) {
-  const scrub = Object.fromEntries(['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR'].map((k) => [k, undefined]));
-  const r = run('git', ['-C', source, 'rev-parse', 'HEAD'], { env: scrub, timeoutMs: 10000 });
-  const sha = r.stdout.trim();
-  return r.code === 0 && /^[0-9a-f]{40,64}$/.test(sha) ? sha : null;
+// What to record as the source commit. HEAD is only the truth when the files being copied ARE HEAD's files
+// (fileProvenance in pipeline/lib/identity.mjs compares every planned file with HEAD's blobs). Anything not in HEAD or
+// with another blob (an edit, a new file, an ignored extra) means no sha is recorded: { sourceSha: null, sourceDirty:
+// true, warning }. Not a checkout, or git unavailable: { sourceSha: null, sourceDirty: false } as before.
+function sourceProvenance(source, plan) {
+  const p = fileProvenance(source, [...plan.files.values()].map((f) => f.abs), { scope: 'install' });
+  if (p.state === 'no-git') return { sourceSha: null, sourceDirty: false, warning: null };
+  if (p.state === 'unverifiable') return { sourceSha: null, sourceDirty: true, warning: `could not compare the source with ${p.head.slice(0, 7)}; recording no source sha` };
+  if (p.state === 'clean') return { sourceSha: p.head, sourceDirty: false, warning: null };
+  return {
+    sourceSha: null,
+    sourceDirty: true,
+    warning: `source is not a clean checkout of ${p.head.slice(0, 7)}: ${p.differing.slice(0, 3).join(', ')}; recording no source sha`,
+  };
 }
 
 function diagnostics(ctx, settings) {
@@ -209,7 +222,9 @@ function doInstall(ctx) {
   const warnings = [];
   const plan = loadPlan(source);
   warnings.push(...plan.warnings);
-  if (isInside(source, home)) throw new InstallError(`the source (${source}) is inside the claude-home (${home}); installing would overwrite it`);
+  // `pipeline update` downloads into <home>/pipeline-state/tmp (private-tmp.mjs), a place this installer never writes to
+  // (it only writes skills/, agents/, pipeline/, settings.json and backups/), so a source there cannot be overwritten.
+  if (isInside(source, home) && !isInside(source, path.join(home, TMP_ROOT_REL))) throw new InstallError(`the source (${source}) is inside the claude-home (${home}); installing would overwrite it`);
 
   // Everything that can refuse happens before the first write.
   const current = readSettings(home);
@@ -229,8 +244,14 @@ function doInstall(ctx) {
   const backup = settingsChanged && current.exists ? backupSettings(home, current.file) : null;
 
   const ts = safeTimestamp();
-  const manifestObj = I.buildManifest({ plan, sourceSha: gitHead(source), skipFileGuard: opts.skipFileGuard });
+  // The pipeline unit is staged with "complete": false; only the rewrite at the very end says true, so an install
+  // that dies half way never reads as current.
+  const provenance = sourceProvenance(source, plan);
+  if (provenance.warning) warnings.push(provenance.warning);
+  const manifestObj = I.buildManifest({ plan, sourceSha: provenance.sourceSha, sourceDirty: provenance.sourceDirty, skipFileGuard: opts.skipFileGuard, complete: false });
   const manifestText = `${JSON.stringify(manifestObj, null, 2)}\n`;
+  const manifestFile = I.fromRel(home, I.MANIFEST_REL);
+  const anyUnitChanges = plan.units.some((u) => states.get(u.rel) !== 'same');
   let copied = 0;
   let unchanged = 0;
   const foreignBackups = [];
@@ -239,9 +260,8 @@ function doInstall(ctx) {
     for (const unit of plan.units) {
       if (states.get(unit.rel) === 'same') {
         unchanged += unit.files.length;
-        // Only the install time would differ on a no-op run; leave the file byte-identical then.
-        const manifestSame = manifest && isDeepStrictEqual(I.manifestWithoutTime(manifest), I.manifestWithoutTime(manifestObj));
-        if (unit.kind === 'pipeline' && !manifestSame) writeFileAtomic(I.fromRel(home, I.MANIFEST_REL), manifestText, I.lexists(I.fromRel(home, I.MANIFEST_REL)));
+        // The pipeline files stay, but a later unit is about to change: the manifest must say "unfinished" until the end.
+        if (unit.kind === 'pipeline' && anyUnitChanges) writeFileAtomic(manifestFile, manifestText, I.lexists(manifestFile));
         continue;
       }
       const foreign = conflicts.includes(unit.rel);
@@ -269,6 +289,13 @@ function doInstall(ctx) {
   }
 
   if (settingsChanged) writeSettingsFile(current.file, merged, current.exists);
+
+  // Everything is in place: mark the install complete. A byte-identical no-op run keeps its file (only the time differs).
+  const finalObj = { ...manifestObj, complete: true };
+  // (any unit change means the manifest on disk is now the staged, incomplete copy)
+  const alreadyFinal = manifest && !anyUnitChanges && I.manifestComplete(manifest)
+    && isDeepStrictEqual(I.manifestWithoutTime({ ...manifest, complete: true }), I.manifestWithoutTime(finalObj));
+  if (!alreadyFinal) writeFileAtomic(manifestFile, `${JSON.stringify(finalObj, null, 2)}\n`, I.lexists(manifestFile));
 
   const allowBefore = new Set(current.settings.permissions?.allow ?? []);
   return {
@@ -325,7 +352,7 @@ function doUninstall(ctx) {
   warnings.push(...manifestWarnings);
 
   const found = I.inspectHooks(current.settings, home);
-  const hookCount = found['guard-git'].length + found['guard-files'].length + found.unknown.length;
+  const hookCount = found['guard-git'].length + found['guard-files'].length + found['session-version'].length + found.unknown.length;
   const allowBefore = new Set(current.settings.permissions?.allow ?? []);
   const allowRemoved = I.ourAllowEntries(home).filter((e) => allowBefore.has(e));
   const settingsChanged = current.exists && !isDeepStrictEqual(stripped, current.settings);
@@ -378,7 +405,7 @@ function formatReport(r) {
     lines.push(`claude-pipeline ${r.version} installed in ${r.home}`);
     lines.push(`  files:     ${r.files.copied} copied, ${r.files.unchanged} unchanged, ${r.files.removed.length} removed`);
     for (const rel of r.files.removed) lines.push(`             removed ${rel}`);
-    lines.push(`  hooks:     guard-git yes, guard-files ${r.hooks.guardFiles ? 'yes' : 'no (--skip-file-guard)'}`);
+    lines.push(`  hooks:     guard-git yes, guard-files ${r.hooks.guardFiles ? 'yes' : 'no (--skip-file-guard)'}, session-version (SessionStart) yes`);
     const state = r.settings.created ? 'created' : r.settings.changed ? 'updated' : 'unchanged';
     lines.push(`  settings:  ${r.settings.path} ${state}`);
     lines.push(`  backup:    ${r.settings.backup ?? 'none (settings.json was not changed or did not exist)'}`);
@@ -404,6 +431,40 @@ function formatReport(r) {
   return `${lines.join('\n')}\n`;
 }
 
+// ---- write lock --------------------------------------------------------------------------------------------
+
+// Install and uninstall (not --check) hold one lock per claude-home for the whole write run, so two of them can never
+// interleave their swaps. locks.mjs reclaims a lock whose owner process is dead; a live owner (or another machine's)
+// is never touched. The lock lives in <home>/backups/.locks, named for the home's canonical (symlink-resolved) path, so
+// an alias of the home cannot dodge it; PIPELINE_LOCK_DIR moves the lock directory (tests). `pipeline update` runs this
+// installer as a child and takes no lock of its own, so it cannot deadlock against it.
+function takeWriteLock(home, env) {
+  let got;
+  try {
+    got = tryAcquire(I.installLockName(home), { dir: env.PIPELINE_LOCK_DIR || I.installLockDir(home) });
+  } catch (err) {
+    throw new InstallError(`could not take the install lock: ${err?.message ?? err}`);
+  }
+  if (got.acquired) return got.lock;
+  if (got.error) throw new InstallError(`could not take the install lock: ${got.error.message}`);
+  const who = got.owner && !got.owner.incomplete ? ` (pid ${got.owner.pid} on ${got.owner.host}, since ${got.owner.startedAt})` : '';
+  throw new InstallError(`another install is running in ${home}${who}. Wait for it to finish, then run this again.`);
+}
+
+// The default lock directory is a stranger inside the owner's home. `willCreate` (called before the lock is taken) lists
+// the directories that do not exist yet, deepest first; `prune` takes them away again once no lock is left in them. rmdir
+// only removes an empty directory, so another install's lock (or anything else) keeps it and everything above it.
+function willCreate(home) {
+  const out = [];
+  for (let dir = I.installLockDir(home); !fs.existsSync(dir); dir = path.dirname(dir)) out.push(dir);
+  return out;
+}
+function prune(dirs) {
+  for (const dir of dirs) {
+    try { fs.rmdirSync(dir); } catch { return; }
+  }
+}
+
 // ---- main --------------------------------------------------------------------------------------------------
 
 function main(argv, env) {
@@ -425,7 +486,13 @@ function main(argv, env) {
   const home = path.resolve(expandHome(opts.claudeHome || env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude')));
   const source = path.resolve(expandHome(opts.source || path.dirname(fileURLToPath(import.meta.url))));
   const ctx = { opts, home, source, env };
+  let lock = null;
+  let created = [];
   try {
+    if (!opts.check) {
+      created = env.PIPELINE_LOCK_DIR ? [] : willCreate(home);
+      lock = takeWriteLock(home, env);
+    }
     const report = opts.check ? doCheck(ctx) : opts.uninstall ? doUninstall(ctx) : doInstall(ctx);
     process.stdout.write(opts.json ? `${JSON.stringify(report, null, 2)}\n` : formatReport(report));
     return report.ok ? 0 : 1;
@@ -435,6 +502,11 @@ function main(argv, env) {
     process.stderr.write(`install.mjs: ${message}\n`);
     if (opts.json) process.stdout.write(`${JSON.stringify({ ok: false, error: message }, null, 2)}\n`);
     return exitCode;
+  } finally {
+    if (lock) {
+      try { release(lock); } catch { /* a stuck lock is reclaimed once this process is gone */ }
+      prune(created);
+    }
   }
 }
 

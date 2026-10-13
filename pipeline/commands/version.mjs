@@ -1,17 +1,43 @@
-// Reports the installed pipeline version so skills and the installer can detect drift.
-import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+// Reports the pipeline version as a stamp that says what was proven: an installed copy is hashed against its own
+// INSTALLED.json (so an edited or half-finished install is labelled, not trusted), a checkout is compared with HEAD
+// and the local origin/main. Suffixes: .modified .incomplete .unverified; `+unknown` when no sha is known.
+// See pipeline/lib/identity.mjs for the rules.
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EXIT, parseCommandArgs } from '../lib/cli.mjs';
+import { buildPlan } from '../lib/installer.mjs';
+import { checkoutIdentity, formatStamp, installedIdentity } from '../lib/identity.mjs';
 
-export const meta = { summary: 'print the pipeline version', usage: 'pipeline version' };
+export const meta = {
+  summary: 'print the pipeline version stamp (base+sha, with .modified/.incomplete/.unverified when not proven)',
+  usage: 'pipeline version',
+};
+
+const readText = (file) => { try { return readFileSync(file, 'utf8').trim(); } catch { return ''; } };
+
+// The report for the pipeline whose pipeline/ directory is `pipelineDir`: the installed copy when INSTALLED.json sits
+// in it, else the checkout holding it.
+export function versionReport(pipelineDir) {
+  if (existsSync(join(pipelineDir, 'INSTALLED.json'))) {
+    const id = installedIdentity(dirname(pipelineDir));
+    if (id) {
+      return { ok: true, version: id.stamp, base: id.base, sourceSha: id.sourceSha, complete: id.complete, modified: id.modified, missing: id.missing, extra: id.extra, ...(id.scanError.length > 0 ? { scanError: id.scanError } : {}), kind: 'installed' };
+    }
+    // The manifest is there but unusable (corrupt): nothing vouches for the files.
+    const base = readText(join(pipelineDir, 'VERSION')) || 'unknown';
+    return { ok: true, version: formatStamp(base, null, ['unverified']), base, sourceSha: null, complete: false, modified: [], missing: [], extra: [], kind: 'installed' };
+  }
+  const root = dirname(pipelineDir);
+  if (!existsSync(join(root, 'VERSION'))) {
+    return { ok: true, version: 'unknown', base: 'unknown', sourceSha: null, complete: true, modified: [], missing: [], extra: [], kind: 'checkout' };
+  }
+  const id = checkoutIdentity(root, [...buildPlan(root).files.values()].map((f) => f.abs), { scope: 'install' });
+  return { ok: true, version: id.stamp, base: id.base, sourceSha: id.sourceSha, complete: true, modified: id.modified, missing: id.missing, extra: [], kind: 'checkout' };
+}
 
 export async function run(argv) {
   parseCommandArgs(argv, {}, { allowPositionals: false });
-  const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
-  let version = 'unknown';
-  try { version = readFileSync(join(root, 'VERSION'), 'utf8').trim(); } catch {
-    try { version = JSON.parse(readFileSync(join(root, 'pipeline', 'INSTALLED.json'), 'utf8')).version; } catch { /* keep unknown */ }
-  }
-  return { exitCode: EXIT.OK, output: { ok: true, version } };
+  const pipelineDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+  return { exitCode: EXIT.OK, output: versionReport(pipelineDir) };
 }

@@ -846,7 +846,7 @@ test('installer names survive quote-splitting and escapes', () => {
   assert.equal(bash('node ins""tall.mjs', '/home/u/other').decision, 'allow', 'outside a checkout nothing is protected by name');
 });
 
-const SEAMS = ['PIPELINE_GH', 'PIPELINE_CODEX', 'PIPELINE_VERCEL', 'PIPELINE_TEST_MODE'];
+const SEAMS = ['PIPELINE_GH', 'PIPELINE_CODEX', 'PIPELINE_VERCEL', 'PIPELINE_TEST_MODE', 'PIPELINE_UPDATE_REMOTE'];
 
 test('test seams: setting PIPELINE_GH / CODEX / VERCEL / TEST_MODE on a command that runs pipeline.mjs is denied', () => {
   const P = 'node ~/.claude/pipeline/bin/pipeline.mjs merge 12';

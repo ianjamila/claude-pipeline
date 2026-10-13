@@ -336,6 +336,25 @@ pipeline triage light-lane --round R [--repo DIR]
 
 Exit: `validate`: 0 applied, 1 judge output invalid (state untouched) · `settle`: 0 recorded, 1 refused · `light-lane`: 0 · 2 usage / no state.
 
+## update
+
+update the installed pipeline to upstream main (run in your own terminal); --check only reports.
+
+```
+pipeline update [--claude-home DIR] [--check] [--json]
+  Fetches upstream main (github.com/ianjamila/claude-pipeline), installs it and verifies the install.
+  --claude-home DIR  where the pipeline is installed (default ~/.claude: both Claude accounts share ~/.claude/pipeline,
+                     so CLAUDE_CONFIG_DIR is deliberately not consulted)
+  --check            read-only: report the installed stamp, upstream main and how they relate; exit 0 only when
+                     the install is complete, unmodified and identical to main (allowed inside Claude Code)
+  --json             no progress text on stderr (the result is always one JSON object on stdout)
+  Refuses inside Claude Code (run it in your own terminal) unless --check or PIPELINE_ADMIN=1.
+```
+
+Exit: 0 updated / up to date (`--check`: complete, unmodified and identical to main) · 1 not up to date (`--check`), upstream unreachable, or the fetch / install / verification failed · 2 usage, or refused inside Claude Code.
+
+Runs `install.mjs` from a clean, isolated download of exactly the commit main points to, then `install.mjs --check`; it succeeds only when that check passes and the installed stamp is that commit. It takes no install lock itself (the installer it runs does). A copy installed with `--skip-file-guard` stays that way.
+
 ## update-branch
 
 bring the PR branch up to date with its base on GitHub (update-branch with expected_head_sha), return the new head (checks are not waited for by default).
