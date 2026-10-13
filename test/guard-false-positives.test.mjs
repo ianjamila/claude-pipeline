@@ -394,6 +394,17 @@ test('K: no login files are skipped on a value assigned later or alongside; a va
     assert.equal(run(cmd, {}, env).decision, 'deny', cmd);
   }
   assert.equal(run('S=/home/u/proj/scripts; bash $S/ok.sh', {}).decision, 'allow');
+  // (a sourced file may change the name; a subshell's assignment is lost; a zsh modifier or subscript changes the value)
+  for (const [cmd, extra, env] of [['S=/home/u/proj/scripts; source ./env.sh; bash $S/ok.sh', { 'env.sh': 'S=-l\n' }], ['S=/home/u/proj/scripts; source "$(echo x)"; bash $S/ok.sh', {}],
+    ['(S=/home/u/proj/scripts); bash $S/ok.sh', {}, { HOME: '/home/u', S: '-l' }], ['S=x/-l; bash $S:t scripts/ok.sh', {}], ['S=(-l); bash $S[1] scripts/ok.sh', {}]]) {
+    assert.equal(run(cmd, extra, env).decision, 'deny', cmd);
+  }
+  // (every value the line assigns is tried, not only the last: here the first is the one the shell sees)
+  assert.equal(run('X=-l; bash $X/ok.sh; X=/home/u/proj/scripts', {}).decision, 'deny');
+  // (bound another way than a plain assignment: the value is unknown)
+  for (const b of ['let X=-1', '(( X = -1 ))', 'typeset X=-l', 'export X=-l', 'local X=-l', 'readonly X=-l', 'print -v X -- -l', 'printf -v X -- -l', 'vared X', 'zparseopts -A X', 'read X']) {
+    assert.equal(run(`X=/home/u/proj/scripts; ${b}; bash $X/ok.sh`, {}).decision, 'deny', b);
+  }
   // (an assignment that may not run leaves the inherited value or nothing: still no option, so still no login files)
   for (const cmd of ['cd sub && S=/home/u/proj/scripts && bash $S/ok.sh', 'cd sub && S=/home/u/proj/scripts; bash $S/ok.sh', 'true || S=/home/u/proj/scripts; bash ${S}/ok.sh']) assert.equal(run(cmd, {}).decision, 'allow', cmd);
   for (const cmd of ['source "$(echo x)"; bash $SQL_UNKNOWN_SHELL_LINE', 'source "$(echo x)"; $SQL_UNKNOWN_SHELL_LINE', 'eval "$(cat x)"; bash "$SQL_UNKNOWN_SHELL_LINE"']) {
@@ -429,6 +440,9 @@ test('M: the pipeline CLI run after a command whose writes are unknown is not re
   // another protected name or switch on the line still counts
   const inner = `node ${CLI} job start c -- node ${CLI} codex-review --head $(git rev-parse HEAD)`;
   for (const cmd of [`${inner} # ~/.claude/settings.json`, `${inner} # disable${'AllHooks'}`]) assert.equal(run(cmd).decision, 'deny', cmd);
+  // (the CLI handed to a program with unknown writes as an argument still counts: only the word an interpreter runs is left out)
+  assert.equal(run(`node x.mjs ${CLI}; node ${CLI} status`).decision, 'deny');
+  assert.equal(files(`eval "$X" ${CLI}; node ${CLI} status`, fakeFs(PROJ, { [CLI]: 'console.log(1)\n' }, DIRS)).decision, 'deny');
   // (only a protected script's own word is left out: another script named like a switch still counts)
   const other = files('eval "$X"; bash PIPELINE_ADMIN.sh', fakeFs(PROJ, { 'PIPELINE_ADMIN.sh': 'echo hi\n' }, DIRS));
   assert.equal(other.decision, 'deny');

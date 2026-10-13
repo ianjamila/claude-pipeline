@@ -1663,7 +1663,10 @@ function judgeWrittenScript(w, sf, abs, dir, ctx, opts, scanRaw) {
   // the prose-masked line: a protected path, or (strictly) the bare words once quotes and escapes are stripped. Why: a protected script (the pipeline CLI run after a
   // command whose writes are unknown, as the ship skill's `pipeline.mjs job start … -- node pipeline.mjs codex-review`) is not judged on its content, and the line names a
   // protected file only by naming it: its own word is left out, any other protected name or switch still counts
-  const rest = ctx.hit(abs) ? scanRaw.split(String(sf.file)).join(' ') : scanRaw;
+  // (only where an interpreter runs it, or it is the command word: handed to another program as an argument it still counts)
+  const esc = String(sf.file).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const own = new RegExp(`(^|[\\s;&|(])((?:node|nodejs|bash|sh|zsh|dash|deno|bun|tsx|python3?|ruby|perl|php)\\s+)?${esc}(?=$|[\\s;&|)])`, 'g');
+  const rest = ctx.hit(abs) ? scanRaw.replace(own, (m, lead, interp) => (interp || !/\s/.test(lead) ? `${lead}${interp ?? ''} ` : m)) : scanRaw;
   if (w.unknown && (makeMatchers(ctx).rawHit(rest, [dir]) || SENSITIVE_WORDS.test(rest.replace(/['"`\\]/g, '')))) {
     return deny(`the script ${sf.file} may have been written by an earlier command on the line (its content is only known at run time) and the line refers to a protected pipeline file or switch, so what it runs cannot be checked; write the file out literally`);
   }
@@ -1696,25 +1699,18 @@ function lineVarWord(w, ctx) {
   return names.length && e0 && !/[\s$`*?[{~(]|^-/.test(e0) && names.every((n) => Object.hasOwn(ctx.vars, n) && !ctx.unknownVars.has(n) && !ctx.pickUnknown.has(n) && !ctx.srcChanged.has(n) && !ctx.srcTouched.has(n)) ? e0 : null;
 }
 // The word the command at idx is given, only to tell that it is no option (a login shell reads other startup files). ctx.vars cannot say (it holds the line's LAST value of each
-// name, a prefix `X=v cmd` included), so every value a name may have WHEN that command runs is tried: its one bare assignment before idx, plus the environment's value (or
-// nothing) when that assignment may not run first (after && / ||, piped or backgrounded, in a loop or branch). Each reading must be a word with no space, glob character,
-// $ or leading - / + (a value built from other names keeps its $). Null when a name is assigned elsewhere or more than once, bound another way (read / for / printf -v /
-// ${X:=w} / unset / an arithmetic name: the name stands as a word of its own), or the word holds more than plain $NAME / ${NAME} references.
-function lineVarWordAt(w, ctx, cmds, idx, raw) {
-  if (!/^(?:[^$`\\]|\$\w+|\$\{\w+\})+$/.test(w)) return null;
-  const from = flowStart(cmds);
+// name, a prefix `X=v cmd` included), so every value a name may have WHEN that command runs is tried: each value the line assigns it (before or after, in a branch or a subshell:
+// a superset of the one it has then) and the environment's value or nothing. Each reading must be a word with no space, glob character, $ or leading - / + (a value built from
+// other names keeps its $). Null when a sourced file may have set a name, a name is bound another way (export / typeset / read / let / (( )) / printf -v / unset …: the name
+// stands as a word of its own outside its assignments), or the word holds more than plain $NAME / ${NAME} references (a zsh modifier `$S:t` or subscript `$S[1]` changes it).
+function lineVarWordAt(w, ctx, cmds, raw) {
+  if (!/^(?:[^$`\\]|\$\w+(?![\w:[])|\$\{\w+\})+$/.test(w)) return null;
   const values = (n) => {
-    const sites = [];
-    for (const [j, c] of cmds.entries()) if (Object.hasOwn(c.env ?? {}, n)) sites.push(j);
-    if (sites.length !== 1) return null;
-    const j = sites[0];
-    const c = cmds[j];
-    if (j >= idx || c.argv.length) return null;
-    if (new RegExp(`\\$\\{${n}:?[=?+-]`).test(raw)) return null;
-    if ((String(raw).match(new RegExp(`(?<![\\w$])(?<!\\$\\{)${n}(?!\\w)`, 'g')) ?? []).length !== 1) return null;
-    const v = String(c.env[n]).replace(/^(?:~|\$HOME|\$\{HOME\})(?=\/|$)/, ctx.homePosix ?? '');
-    const sure = c.depth === 0 && c.sep !== '&&' && c.sep !== '||' && !['|', '&'].includes(cmds[j + 1]?.sep) && !inFlow(from, j);
-    return sure ? [v] : [v, typeof ctx.env?.[n] === 'string' ? ctx.env[n] : ''];
+    if (ctx.unknownVars.has(n) || ctx.pickUnknown.has(n) || ctx.srcChanged.has(n) || ctx.srcTouched.has(n)) return null;
+    const vs = [];
+    for (const c of cmds) if (Object.hasOwn(c.env ?? {}, n)) vs.push(String(c.env[n]).replace(/^(?:~|\$HOME|\$\{HOME\})(?=\/|$)/, ctx.homePosix ?? ''));
+    if ((String(raw).match(new RegExp(`(?<![\\w$])(?<!\\$\\{)${n}(?!\\w)`, 'g')) ?? []).length !== vs.length) return null;
+    return [...vs, typeof ctx.env?.[n] === 'string' ? ctx.env[n] : ''];
   };
   const names = [...new Set([...w.matchAll(/\$\{?(\w+)/g)].map((x) => x[1]))];
   if (!names.length) return null;
@@ -2266,7 +2262,7 @@ function evaluateBashForFilesFrame(command, opts) {
       // quotes kept it literal), so the shell is no login shell reading ~/.bash_profile: the startup files are those of `bash FILE`. The own-directory path is also judged as a
       // candidate (the word's other readings still are). A value with a space or a glob character would split or match: unchanged.
       const ownWord = sf0?.ambiguous && sf0.kind === 'shell' && !sf0.joined && c.argv[1] === sf0.words?.[0] && !['source', '.', 'eval'].includes(baseOf(c.argv[0] ?? '')) && !/^[-+]/.test(c.argv[1])
-        ? { self: selfPathWord(sf0.words[0], cmds, idx, ctx), line: lineVarWordAt(sf0.words[0], ctx, cmds, idx, raw) } : null;
+        ? { self: selfPathWord(sf0.words[0], cmds, idx, ctx), line: lineVarWordAt(sf0.words[0], ctx, cmds, raw) } : null;
       const plain = (p) => p !== null && !/[\s*?[\]{}~$`\\]|^[-+]/.test(p);
       const own = ownWord && (plain(ownWord.self) ? ownWord.self : plain(ownWord.line) ? ownWord.line : null);
       const cs = own ? { ...c, argv: c.argv.map((w, i) => (i === 1 ? own : w)) } : c;
