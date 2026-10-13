@@ -1007,6 +1007,21 @@ function withStartupScope(cmd, ctx, fn) {
 // Judge `fn` on a copy of the line's state and put every field back afterwards, whatever `fn` changed (vars, taint, branches, config, aliases):
 // for a text that is only a FRAGMENT of what the shell reads, so a change it makes is not one the line can rely on or be blamed for.
 // (budget is shared on purpose, as in judgeScoped.)
+function lineState(ctx) {
+  return {
+    vars: Object.assign(Object.create(null), ctx.vars), unsureVars: new Set(ctx.unsureVars), tainted: new Set(ctx.tainted), aliasUnsure: new Set(ctx.aliasUnsure),
+    gitAliases: Object.assign(Object.create(null), ctx.gitAliases), ghAliases: Object.assign(Object.create(null), ctx.ghAliases),
+    branches: new Map([...ctx.branches].map(([d, e]) => [d, { ...e }])), cfgDirty: ctx.cfgDirty, envCfgDirty: ctx.envCfgDirty,
+  };
+}
+function restoreLineState(ctx, saved) {
+  for (const k of ['vars', 'gitAliases', 'ghAliases']) { for (const n of Object.keys(ctx[k])) delete ctx[k][n]; Object.assign(ctx[k], saved[k]); }
+  for (const k of ['unsureVars', 'tainted', 'aliasUnsure']) { ctx[k].clear(); for (const n of saved[k]) ctx[k].add(n); }
+  ctx.branches.clear();
+  for (const [d, e] of saved.branches) ctx.branches.set(d, { ...e });
+  ctx.cfgDirty = saved.cfgDirty;
+  ctx.envCfgDirty = saved.envCfgDirty;
+}
 function isolatedState(ctx, fn) {
   const saved = {
     vars: Object.assign(Object.create(null), ctx.vars), unsureVars: new Set(ctx.unsureVars), tainted: new Set(ctx.tainted), aliasUnsure: new Set(ctx.aliasUnsure),
@@ -1127,10 +1142,17 @@ function judgeStartupList(list, c, dir, ctx, level) {
       // what the line may have written), never for a run-time name
       const key = st.ambiguous ? null : `${st.file}\u0000${unmodelledBefore(ctx.writeFrames)}\u0000${stateFingerprint(ctx, dir, level)}`;
       if (key !== null) {
-        if (ctx.budget.startupOk.has(key)) return null;
+        if (ctx.budget.startupOk.has(key)) {
+          // Why: a sourced startup file (BASH_ENV=rc) leaves its variables, branch and config behind for the script that follows: a memo hit replays them (same state in, same state out)
+          const fx = ctx.budget.startupFx?.get(key);
+          if (fx) restoreLineState(ctx, fx);
+          return null;
+        }
         ctx.budget.startupOk.add(key); // marked first, so a startup file that starts shells itself is not judged again and again (a denial ends the evaluation)
       }
-      return checkScriptFile(st, dir, ctx, level);
+      const verdict = checkScriptFile(st, dir, ctx, level);
+      if (key !== null && !verdict && st.sourced) (ctx.budget.startupFx ??= new Map()).set(key, lineState(ctx));
+      return verdict;
     });
     if (v) return v;
   }

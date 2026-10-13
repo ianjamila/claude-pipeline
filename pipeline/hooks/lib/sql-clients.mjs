@@ -73,6 +73,7 @@ export function sqlShellEscapes(text, opts = {}) {
   const t = String(text ?? '');
   const out = [];
   const sources = opts.sources ?? [];
+  let shellRest;
   const unknown = (raw) => out.push(`${UNKNOWN} ${clean(raw)}`);
   const write = (f) => out.push(`: > ${targetOf(f)}`);
   const include = (prog, w, relative) => {
@@ -95,6 +96,7 @@ export function sqlShellEscapes(text, opts = {}) {
       if (!m) break;
       const word = m[1];
       let whole = line.slice(at + m[0].length);
+      let skipped = 0; // (the length cut off the front of `whole`: the offset of the next backslash is relative to what is left)
       // Why: `\g (format=csv) |cmd` / `\g (opts) FILE`: the leading balanced option list is not the target; unbalanced, the input is unknown
       if (word === 'g' || word === 'gx') {
         const lead = /^\s*\(/.exec(whole);
@@ -104,6 +106,7 @@ export function sqlShellEscapes(text, opts = {}) {
           for (let k = lead[0].length - 1; k < whole.length; k++) { if (whole[k] === '(') depth++; else if (whole[k] === ')' && --depth === 0) { end = k; break; } }
           if (end < 0) { unknown(t); break; }
           whole = whole.slice(end + 1);
+          skipped = end + 1;
         }
       }
       const next = whole.indexOf('\\');
@@ -117,7 +120,7 @@ export function sqlShellEscapes(text, opts = {}) {
       // Why: psql interpolates :var / :'var' / :"var" in the arguments (`\set f ~/.claude/x` then `\o :f`): the target, include or command is only known at run time,
       // so the whole input is the unknown line (what the variable was set to sits elsewhere in it)
       if (/^(?:!|i|include|ir|include_relative|o|out|g|gx|w|s|lo_export|copy)$/.test(word) && /(?:^|[\s'"(,]):['"]?[A-Za-z_]/.test(rest)) unknown(t);
-      if (word === '!') { if (rest.trim()) run(rest); else unknown(line.slice(at)); }
+      if (word === '!') { if (rest.trim()) run(rest); else { unknown(line.slice(at)); shellRest = true; } }
       else if (/^(?:i|include)$/.test(word)) { if (words[0]) include('psql', words[0], false); }
       else if (/^(?:ir|include_relative)$/.test(word)) { if (words[0]) include('psql', words[0], true); }
       else if (word === 'o' || word === 'out' || word === 'g' || word === 'gx' || word === 'w' || word === 's') {
@@ -129,7 +132,8 @@ export function sqlShellEscapes(text, opts = {}) {
         for (const p of rest.matchAll(/\bto\s+('(?:[^']|'')*'|"[^"]*"|[^\s;]+)/gi)) { const f = unq(p[1]); if (!/^(?:stdout|pstdout|program)$/i.test(f)) write(f); }
       } else if (PSQL_SAFE.has(word) || /^d[A-Za-z+]*$/.test(word) || /^l(?:ist)?\+?$/.test(word)) { /* safe */ }
       else if (all) { /* judged by the other tables */ } else unknown(line.slice(at));
-      at = escape || next < 0 ? -1 : at + m[0].length + next;
+      at = escape || next < 0 ? -1 : at + m[0].length + skipped + next;
+      if (at >= 0 && line[at] !== '\\') { unknown(t); at = -1; } // (the scan must land on a backslash; anything else means the offsets are off: unknown input)
     }
   };
   // ---- mysql: bare words at the start of a statement, `\X` commands anywhere in a line (`\!` and `\P` take the rest of the line, unsplit)
@@ -137,7 +141,7 @@ export function sqlShellEscapes(text, opts = {}) {
     let m;
     for (m of line.matchAll(/(?:^|;)\s*(system|source|tee|pager|edit)(?![\w])\s*([^\n]*)/gi)) {
       const w = m[1].toLowerCase();
-      if (w === 'system' || w === 'pager') run(m[2]);
+      if (w === 'system' || w === 'pager') { run(m[2]); if (w === 'system' && !m[2].trim()) shellRest = true; }
       else if (w === 'tee') { const f = unq(m[2].replace(/;\s*$/, '').trim()); if (f) write(f); }
       else if (w === 'edit') unknown(m[0]);
       else { const f = unq(m[2].replace(/;.*$/, '').trim()); if (f) include('mysql', f, false); else unknown(m[0]); }
@@ -152,7 +156,7 @@ export function sqlShellEscapes(text, opts = {}) {
       const escape = c === '!' || c === 'P';
       const rest = escape || c === '.' || c === 'T' ? whole : next < 0 ? whole : whole.slice(0, next);
       if (c === '\\') { /* a doubled backslash */ }
-      else if (escape) { run(whole); if (next >= 0) unknown(line.slice(at)); }
+      else if (escape) { run(whole); if (!whole.trim()) shellRest = true; if (next >= 0) unknown(line.slice(at)); }
       else if (c === '.') { const f = unq(rest.replace(/;.*$/, '').trim()); if (f) include('mysql', f, false); else unknown(line.slice(at)); }
       else if (c === 'T') { const f = unq(rest.replace(/;\s*$/, '').trim()); if (f) write(f); }
       else if (MYSQL_SAFE.has(c)) { /* safe */ }
@@ -172,7 +176,7 @@ export function sqlShellEscapes(text, opts = {}) {
     let bad = false;
     for (const c of new Set(cands)) {
       const role = SQLITE_ROLE[c];
-      if (role === 'shell') run(rest);
+      if (role === 'shell') { run(rest); if (!rest.trim()) shellRest = true; }
       else if (role === 'read') { if (/^\s*\|/.test(rest)) run(rest.replace(/^\s*\|/, '')); else if (words[0]) include('sqlite3', words[0], false); }
       else if (role === 'out') { if (/^\s*\|/.test(rest)) run(rest.replace(/^\s*\|/, '')); else if (words[0]?.startsWith('-')) bad = true; else if (words[0] && words[0] !== 'stdout') write(words[0]); }
       else if (role === 'import') { const a = words.filter((w) => !w.startsWith('-')); if (/^\s*(?:-\S+\s+)*["']?\|/.test(rest) || a[0]?.startsWith('|')) run(rest.replace(/^[^|]*\|/, '').replace(/["']\s*\S*\s*$/, '')); }
@@ -214,7 +218,10 @@ export function sqlShellEscapes(text, opts = {}) {
     else unknown(line);
   };
 
+  // Why: a bare `\!` (mysql `system`, sqlite `.shell` with nothing after it) starts a shell that reads the REST of the client's input: every later line is shell text too
+  shellRest = false;
   for (const line of t.split(/\r\n|\r|\n/)) {
+    if (shellRest) run(line);
     if (fam === 'psql' || all) psql(line);
     if (fam === 'mysql' || all) mysql(line);
     if (fam === 'sqlite' || all) sqlite(line);
@@ -226,7 +233,7 @@ export function sqlShellEscapes(text, opts = {}) {
 
 // ---- the client's command line ---------------------------------------------------------------------------
 
-const ROLE_ENV = /^(?:PAGER|PSQL_PAGER|MYSQL_PAGER|EDITOR|VISUAL|PSQL_EDITOR|PSQL_EDITOR_LINENUMBER_ARG|PSQLRC|MYSQL_HOME|SQLITE_HISTORY|PSQL_HISTORY|PGSYSCONFDIR|HOME|XDG_CONFIG_HOME|PGSERVICEFILE)$/;
+const ROLE_ENV = /^(?:PAGER|PSQL_PAGER|MYSQL_PAGER|EDITOR|VISUAL|PSQL_EDITOR|PSQL_EDITOR_LINENUMBER_ARG|PSQLRC|PSQL_WATCH_PAGER|SHELL|MYSQL_HOME|SQLITE_HISTORY|PSQL_HISTORY|PGSYSCONFDIR|HOME|XDG_CONFIG_HOME|PGSERVICEFILE)$/;
 // Options by client: [name, takes a value, role]. A role: cmd (SQL text run), file (input file), out (output file or |command), log (output file), set (variable),
 // pset (print setting), norc, bad (runs something we do not model); no role: harmless.
 const O = (s) => s.trim().split(/\s+/).map((x) => { const [n, a, r] = x.split(':'); return [n, a === '1', r || '']; });

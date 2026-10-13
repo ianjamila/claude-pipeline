@@ -90,3 +90,39 @@ test('F1/81: a file the line writes and then sources is modelled from what is wr
     "echo 'D=/tmp/x' > new.rc; . ./new.rc; echo x > $D/a.txt", "echo 'D=/tmp/x' > rc; . ./rc; echo x > $D/a.txt",
   ], 'allow', { 'ok.sh': 'echo ok' });
 });
+
+// ---- 80: a sourced explicit startup file's variable effects are applied on every use, not only the first -------------------------
+
+test('F1/80: the second BASH_ENV=rc run still sees what rc exports (the clean-verdict memo does not skip a sourced startup file)', () => {
+  const spec = { 'rc': 'export F=bad.sh', 'a.sh': 'echo $F', 'b.sh': 'bash "$F"', 'bad.sh': 'bad', 'ok.sh': 'ok' };
+  denyBoth('BASH_ENV=rc bash a.sh; BASH_ENV=rc bash b.sh', spec);
+  denyBoth('BASH_ENV=rc bash b.sh', spec);
+  // twin: rc exports a harmless script
+  allowBoth('BASH_ENV=rc bash a.sh; BASH_ENV=rc bash b.sh', { ...spec, rc: 'export F=ok.sh' });
+});
+
+// ---- 63 / 66: psql scanner offsets after a \g option list; a bare \! reads the rest of the input as shell text -----------------------
+
+test('F1/63: a meta-command after a \\g option list is still scanned (psql)', () => {
+  const spec = { 'q.sql': (bad) => `select 1 \\g (format=csv) \\! ${bad}`, 'q2.sql': (bad) => `select 1 \\g (format=csv) \\g (x=y) \\! ${bad}`, 'ok.sql': (_b, ok) => `select 1 \\g (format=csv) \\! ${ok}` };
+  denyBoth('psql < q.sql', spec);
+  denyBoth('psql < q2.sql', spec);
+  allowBoth('psql < ok.sql', spec);
+});
+
+test('F1/66: a bare \\! (psql, mysql, sqlite3) makes the rest of the input shell text', () => {
+  const spec = {
+    'p.sql': (bad) => `select 1;\n\\!\n${bad}\n`, 'm.sql': (bad) => `select 1;\n\\!\n${bad}\n`, 'ms.sql': (bad) => `system\n${bad}\n`, 's.sql': (bad) => `.shell\n${bad}\n`,
+    'okp.sql': (_b, ok) => `select 1;\n\\!\n${ok}\n`,
+  };
+  for (const c of ['psql < p.sql', 'mysql < m.sql', 'mysql < ms.sql', 'sqlite3 < s.sql']) denyBoth(c, spec);
+  allowBoth('psql < okp.sql', spec);
+});
+
+test('F1/80: a clean-verdict memo hit replays what the sourced startup file set (same file, same state, run again)', () => {
+  const spec = { 'rc': 'export F=sub/bad.sh', 'c.sh': 'echo hi', 'b.sh': 'bash "$F"', 'sub/bad.sh': 'bad' };
+  const three = 'BASH_ENV=rc bash c.sh; BASH_ENV=rc bash c.sh; BASH_ENV=rc bash c.sh; BASH_ENV=rc bash b.sh';
+  denyBoth(three, spec);
+  // twin: the same line with a harmless script behind the name
+  allowBoth(three, { ...spec, 'sub/bad.sh': 'ok' });
+});
