@@ -11,6 +11,7 @@
 //   pipeline, races with a background job, or may repeat before it (a loop).
 // Pure: the policies supply how to expand a word and where a command runs (see newWriteFrame).
 import { commandName } from './shell-parse.mjs';
+import { applySed } from './sed-emulate.mjs';
 
 // ---- control flow -------------------------------------------------------------------------------------------
 
@@ -604,7 +605,7 @@ function argRecords(cmd, name, idx, lineEnv = {}, io = {}) {
     const wfiles = isSed ? sedWriteTargets(args) : [];
     if (!inPlace) return wfiles.length ? wfiles.map((d) => unknown(d)) : null; // `w FILE` / `s///w FILE` write a file too
     // Why: an in-place edit turns the file's old text into new text (`s/X/sh/` completes `git puX`), so the file is a piece the line cannot see: `edit` (see contentsIn)
-    if (isSed) return [...sedPrograms(args).targets.map((dest) => unknown(dest, { edit: true })), ...wfiles.map((dest) => unknown(dest))]; // (one parser for the programs and the files; an in-place sed may also `w FILE`)
+    if (isSed) return [...sedPrograms(args).targets.map((dest) => unknown(dest, { edit: true, sed: { args, word: dest } })), ...wfiles.map((dest) => unknown(dest))]; // (one parser for the programs and the files; an in-place sed may also `w FILE`)
     const { pos, opts } = getopt(args, 'eIlF', ['expression', 'file', 'line-length']);
     const hasProgram = hasOpt(opts, 'e', 'f', 'expression', 'file');
     return (hasProgram ? pos : pos.slice(1)).map((dest) => unknown(dest, { edit: true }));
@@ -939,7 +940,7 @@ export function sedPrograms(args) {
         const rest = a.slice(k + 1);
         if (a[k] === 'e') { script = true; progs.push(rest !== '' ? rest : (args[++i] ?? '')); break; }
         if (a[k] === 'f') { file = true; script = true; values.push(rest !== '' ? rest : (args[i + 1] ?? '')); if (rest === '') i++; break; }
-        if (a[k] === 'l') { values.push(rest !== '' ? rest : (args[i + 1] ?? '')); if (rest === '') i++; break; }
+        if (a[k] === 'l') { values.push(rest !== '' ? rest : (args[i + 1] ?? '')); if (rest === '') { progs.push(args[i + 1] ?? ''); i++; } break; } // (-l takes a value in GNU, is a switch in BSD: that word is a program in one reading)
         if (a[k] === 'i' || a[k] === 'I') { if (rest === '') { bareInPlace = true; if ((args[i + 1] ?? '').startsWith('-')) dashedSuffix = true; } break; } // -i[SUFFIX] (BSD -I too; BSD takes a bare suffix as the next word)
       }
     } else pos.push(a);
@@ -1526,7 +1527,8 @@ function contentsIn(frames, upto, asOf, P, io, depth) {
   };
   const variant = (seqHits) => {
     let seq = [{ cur: true }];
-    for (const h of seqHits) { if (h.rec.append) seq.push(h); else seq = [h]; }
+    // Why: an emulated in-place sed turns the text before it (the file as it is, a copy, an append) into a new one, so it is one more step after them, not a replacement of them
+    for (const h of seqHits) { if (h.rec.append || h.rec.sed) seq.push(h); else seq = [h]; }
     // a file put together from several pieces that cannot be built is "built from pieces at run time"; one unknown piece alone is just unknown content.
     // Only a write to the file itself counts: a piece of a write that merely may hit it is the unknown-content signal, never a refusal
     const multi = seq.length > 1 || seq.some((el) => (el.rec?.parts?.length ?? 0) > 1 || el.rec?.edit); // (an in-place edit is old text + a program: two pieces)
@@ -1534,6 +1536,17 @@ function contentsIn(frames, upto, asOf, P, io, depth) {
     const fail = () => { if (multi && !looseIn) io.pieces = true; return null; };
     let acc = [''];
     for (const el of seq) {
+      if (el.rec?.sed) { // (every text the edit may leave, see sed-emulate.mjs; a program it does not emulate exactly is "built from pieces")
+        const next = new Set(); // (the edit may fail or be skipped: an unwritable directory, syntax one sed rejects, a missing file ... the text it was to edit stays)
+        for (const text of acc) {
+          const edited = applySed(el.rec.sed, text);
+          if (edited === null) { io.sedRefused = true; fail(); return looseIn ? true : null; }
+          for (const x of edited) next.add(x);
+        }
+        if (next.size > MAX_JOINED) { io.pieces = true; return looseIn ? true : null; }
+        acc = [...next];
+        continue;
+      }
       let alts;
       if (el.cur) {
         if (!io.exists(P)) alts = [''];
@@ -1635,6 +1648,8 @@ export function writtenTo(frames, target, { exists, readText = () => null, ignor
   // the whole text the writes build together (judged in addition to each piece)
   const io = { exists, readText, pieces: false };
   const built = contentsOf(frames, upto, frames[upto].i, target, io, 0);
+  // Why: the unknown text of an in-place sed is the edit's own result: once every text it leaves is built (the program emulated for every text it may get) it is judged as a text, not as run-time content
+  if (st.sedEdit && (built === null || io.pieces || io.sedRefused)) st.unknown = true;
   const joined = (built ?? []).filter((x) => !st.texts.has(x));
   return { texts: [...st.texts], files: [...st.files], scans: [...st.scans], programs: [...st.programs], authored: st.authored, unknown: st.unknown, viaUnmodelled: st.viaUnmodelled, joined, pieces: io.pieces || st.cut === true };
 }
@@ -1737,7 +1752,7 @@ function absorb(frames, fi, f, rec, items, Pv, st, depth, exists) {
   for (const it of items) {
     if (it.text !== undefined) st.texts.add(it.text);
     else if (it.program !== undefined) st.programs.add(it.program);
-    else if (it.unknown) { st.unknown = true; if (it.authored) st.authored = true; }
+    else if (it.unknown) { if (rec.sed) st.sedEdit = true; else st.unknown = true; if (it.authored) st.authored = true; } // (an emulated sed edit is unknown only if the texts cannot be built, see writtenTo)
     else if (it.scan !== undefined) addFiles(f, rec, it.scan, Pv, st, fi, depth, exists, 'scans');
     else if (it.abs !== undefined) addPath(frames, fi, rec, it.abs, st, depth, exists, 'files');
     else if (it.file !== undefined) addFiles(f, rec, it.file, Pv, st, fi, depth, exists, 'files', frames);
