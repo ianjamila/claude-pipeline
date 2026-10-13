@@ -24,6 +24,16 @@ export const DEFAULTS = deepFreeze({
   owner_approval: 'label',
   default_branch: 'main',
   worktree_dir: '.worktrees',
+  // worktrees: `pipeline worktrees prune`. mode 'report' (default) only reports; nothing is removed until 'on'.
+  worktrees: {
+    mode: 'report',
+    protect: ['foundation', '*.stack'],
+    min_idle_hours: 24,
+    min_merged_hours: 24,
+    delete: ['node_modules/', '.next/', 'supabase/.temp/', 'test-results/', 'playwright-report/', 'next-env.d.ts', 'public/sw.js', 'tsconfig.tsbuildinfo', '*.log'],
+    archive: ['.review/', '.verify/'],
+    memory_dirs: ['~/claude-memory'],
+  },
   verify: { report: '.verify/report.json', screenshots: '.verify/screenshots' },
   // guard_checks: the tamper-proof "Test integrity" and "Hard-stop scan" statuses are always required on top of
   // required_checks. false only for a repo that does not run the pipeline-guards workflow (e.g. this one).
@@ -73,6 +83,7 @@ const WATCH_MODES = ['session', 'workflow'];
 // Allowed keys per mapping. Anything else is a typo (or a removed option) and is rejected.
 const KEYS = {
   top: [...Object.keys(DEFAULTS), 'project'],
+  worktrees: ['mode', 'protect', 'min_idle_hours', 'min_merged_hours', 'delete', 'archive', 'memory_dirs'],
   verify: ['full', 'quick', 'report', 'screenshots', 'expected_steps'],
   ci: ['required_checks', 'e2e_label', 'draft_while_iterating', 'guard_checks', 'approvers'],
   merge: ['command', 'wait_minutes'],
@@ -340,6 +351,16 @@ export function validateConfig(obj) {
     }
     if (review && pos(risk.medium_lines) && pos(review.light_lane_max_lines) && review.light_lane_max_lines > risk.medium_lines) {
       errors.push('review.light_lane_max_lines must be <= risk.medium_lines');
+    }
+  }
+
+  const wt = section(config, 'worktrees', errors);
+  if (wt) {
+    if (!['off', 'report', 'on'].includes(wt.mode)) errors.push('worktrees.mode must be one of off, report, on');
+    for (const k of ['protect', 'delete', 'archive', 'memory_dirs']) checkStrArray(wt[k], `worktrees.${k}`, errors);
+    for (const k of ['min_idle_hours', 'min_merged_hours']) checkPosInt(wt[k], `worktrees.${k}`, errors);
+    if (isStrArray(wt.delete) && isStrArray(wt.archive)) {
+      for (const p of wt.delete) if (wt.archive.includes(p)) errors.push(`worktrees: ${p} is in both delete and archive`);
     }
   }
 
