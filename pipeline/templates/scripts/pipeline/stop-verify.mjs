@@ -13,13 +13,7 @@ import { matchAny } from './lib/glob.mjs';
 import { runShellAsync } from './lib/proc.mjs';
 
 export const MAX_BLOCKS = 3;
-// The checks get 14 minutes (the hook's own timeout is 1200 s: 900 s + the queue allowance, leaving room to report). A heavy step
-// may first wait for room in the machine-wide heavy-check queue (verify bounds that wait by QUEUE_WAIT_QUICK_MS); the outer limit
-// grows by exactly that allowance so waiting never eats the execution time. One source: scripts/lib/heavy-slots.mjs. A project
-// this file is vendored into without that module has no queue and no allowance.
-export const EXECUTION_TIMEOUT_MS = 840_000;
-export const QUEUE_ALLOWANCE_MS = await import('../lib/heavy-slots.mjs').then((m) => m.QUEUE_WAIT_QUICK_MS ?? 0, () => 0);
-export const RUN_TIMEOUT_MS = EXECUTION_TIMEOUT_MS + QUEUE_ALLOWANCE_MS;
+export const RUN_TIMEOUT_MS = 840_000; // the hook's own timeout is 900 s; leave room to report
 const EXCERPT_LINES = 15;
 const NOT_CODE = ['**/*.md', 'docs/**'];
 
