@@ -862,7 +862,9 @@ test('events: rollback-intent is posted BEFORE the rollback, rollback-result AFT
   assert.deepEqual(intent.failingDeployment, { id: 11, url: 'https://ours-abc-team.vercel.app' });
   assert.deepEqual(intent.target, { id: 'dpl_old', sha: OLD_SHA, url: 'https://old-xyz-team.vercel.app' });
   assert.deepEqual(result, { mergeSha: SHA, ok: true, liveAfter: { id: 'dpl_old', url: 'old-xyz-team.vercel.app' }, verified: true });
-  assert.deepEqual(reported, { mergeSha: SHA, issueUrl: 'https://github.com/acme/widgets/issues/50', revertPrUrl: 'https://github.com/acme/widgets/pull/51' });
+  assert.deepEqual(reported, {
+    mergeSha: SHA, issueUrl: 'https://github.com/acme/widgets/issues/50', revertPrUrl: 'https://github.com/acme/widgets/pull/51', issueNumber: 50, revertPrNumber: 51,
+  });
   // Each is a valid event: render accepts the id and kind.
   for (const e of h.posted) assert.ok(parseEvent(renderEvent(e.kind, e.id, e.sentence, e.data)));
 });
@@ -1224,8 +1226,9 @@ test('observe-only: a COMPLETED rollback is reported as recovered without re-smo
   const r = await h.go({ observeOnly: true, host: 'pc-2' });
   assert.equal(r.outcome, 'recovered');
   assert.equal(r.observeOnly, true);
-  assert.equal(r.issue.url, 'https://github.com/acme/widgets/issues/50');
-  assert.equal(r.revertPr.url, 'https://github.com/acme/widgets/pull/51');
+  // events written before the numbers were recorded carry only the urls: the numbers are read back from them
+  assert.deepEqual(r.issue, { url: 'https://github.com/acme/widgets/issues/50', number: 50 });
+  assert.deepEqual(r.revertPr, { url: 'https://github.com/acme/widgets/pull/51', number: 51 });
   assert.equal(r.recorded.id, 'aaaaaaa-1');
   assert.equal(h.smoke.calls.length, 0, 'no smoke: the recorded outcome is the truth');
   assert.equal(h.findDeployment.calls.length, 0);
@@ -1233,6 +1236,27 @@ test('observe-only: a COMPLETED rollback is reported as recovered without re-smo
   assert.deepEqual([h.rollbackFn.calls.length, h.issueCreate.calls.length, h.prCreate.calls.length, h.revertBranch.calls.length, h.posted.length, h.locks.length], [0, 0, 0, 0, 0, 0]);
   assert.equal(r.rollbackInterrupted, undefined);
   assert.deepEqual(h.recordCalls.at(-1)?.slice(0, 2), ['finish', 'recovered']);
+});
+
+test('observe-only: a replayed recovery keeps the issue and revert PR numbers, so the owner push names them (recorded numbers win over the url)', async () => {
+  const withNumbers = [
+    ...doneRollback({}, false),
+    eventOf('recovery-reported', 'aaaaaaa-1', { mergeSha: SHA, issueUrl: 'https://github.com/acme/widgets/issues/50', revertPrUrl: 'https://github.com/acme/widgets/pull/51', issueNumber: 60, revertPrNumber: 61 }),
+  ];
+  for (const [eventList, issueN, prN] of [[doneRollback(), 50, 51], [withNumbers, 60, 61]]) {
+    const h = harness({ smoke: [FAIL], inspect: [OLDER], events: true, eventList: [PROD_BEFORE, ...eventList] });
+    const r = await h.go({ observeOnly: true });
+    assert.equal(r.outcome, 'recovered');
+    const push = prodEvent(r, { pr: 7 });
+    assert.match(push.action, new RegExp(`Review revert PR #${prN}; close issue #${issueN} to unpause merges\\.`));
+    assert.doesNotMatch(push.action, /could not be (opened|confirmed)/);
+    assert.equal(push.issueNumber, issueN);
+  }
+  // an unparseable url stays url-only (the push then says it could not confirm the issue, never a wrong number)
+  const odd = [...doneRollback({}, false), eventOf('recovery-reported', 'aaaaaaa-1', { mergeSha: SHA, issueUrl: 'https://example.test/x', revertPrUrl: null })];
+  const h = harness({ smoke: [FAIL], inspect: [OLDER], events: true, eventList: [PROD_BEFORE, ...odd] });
+  const r = await h.go({ observeOnly: true });
+  assert.deepEqual([r.issue, r.revertPr], [{ url: 'https://example.test/x' }, null]);
 });
 
 test('observe-only: a completed rollback that failed or was not verified is rollback-failed', async () => {

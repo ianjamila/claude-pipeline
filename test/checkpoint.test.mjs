@@ -392,9 +392,10 @@ test('merge: an exception after inFlight was set still clears it (finally), then
 
 test('merge: a record write that fails only warns; the merge still happens', () => {
   // Only the summary comment write fails: it is a PATCH/POST of the record, the event is a POST too, so fail by body.
+  // (The comment list read fails too, so the resumed-run guard cannot be checked: the owner approves this exact head.)
   const s = mergeScenario({ gh: { extra: [{ match: 'repos/acme/widgets/issues/12/comments --paginate', code: 1, stderr: 'gh: Server Error (HTTP 502)' }, ...DEPLOYMENTS] } });
   assertExit(s.gate(), 0);
-  const r = s.merge();
+  const r = mergeWith(s, ['--owner-approved-head', s.head]);
   assertExit(r, 0);
   assert.equal(r.json.merged, true);
   assert.ok(r.json.warnings.some((w) => w.startsWith('run record not updated:')), r.json.warnings.join());
@@ -546,10 +547,37 @@ test('merge: a record that is NOT resumed merges as before, with or without the 
   assertExit(mergeWith(flagged, ['--owner-approved-head', 'b'.repeat(40)]), 0);
 });
 
-test('merge: a record that cannot be read does not block a normal run, but warns', () => {
-  const s = mergeScenario({ gh: { extra: [{ match: 'repos/acme/widgets/issues/12/comments --paginate', code: 1, stderr: 'gh: Server Error (HTTP 500)' }, ...DEPLOYMENTS] } });
+test('merge: a run record that cannot be checked fails CLOSED (it may be a resumed one): pre-merge unless the owner approved this exact head', () => {
+  const unreadable = () => mergeScenario({ gh: { extra: [{ match: 'repos/acme/widgets/issues/12/comments --paginate', code: 1, stderr: 'gh: Server Error (HTTP 500)' }, ...DEPLOYMENTS] } });
+  const cases = [
+    ['unreadable comments', unreadable, /^the run record could not be read \(.*\), so the resumed-run guard cannot be checked/],
+    ['a newer record version', () => withRecord({}, baseRecord({ step: 'gate', v: 99, resumed: RESUMED })), /^the run record is unsupported, so the resumed-run guard cannot be checked/],
+  ];
+  for (const [name, make, reason] of cases) {
+    const s = make();
+    assertExit(s.gate(), 0, name);
+    const r = mergeWith(s);
+    assertExit(r, 1, name);
+    assert.equal(r.json.error, 'pre-merge', name);
+    assert.match(r.json.reason, reason, name);
+    assert.match(r.json.reason, /pass --owner-approved-head <sha>\)$/, name);
+    assert.equal(marker(s), -1, `${name}: the merge command never ran`);
+    assert.deepEqual(eventWrites(s.fake), [], `${name}: no prod-before event`);
+    assert.deepEqual(s.mergeCalls(), [], name);
+    // another head still refuses
+    assertExit(mergeWith(s, ['--owner-approved-head', 'b'.repeat(40)]), 1, name);
+    assert.equal(marker(s), -1, name);
+  }
+  // the owner's approval of the exact gate head lets it through
+  const s = unreadable();
   assertExit(s.gate(), 0);
-  const r = mergeWith(s);
-  assertExit(r, 0, r.stdout);
-  assert.ok(r.json.warnings.some((w) => /could not read the run record/.test(w)), JSON.stringify(r.json.warnings));
+  const ok = mergeWith(s, ['--owner-approved-head', s.head]);
+  assertExit(ok, 0, ok.stdout);
+  assert.equal(ok.json.merged, true);
+});
+
+test('merge: no run record at all (absent) is an ordinary run and merges without the flag', () => {
+  const s = mergeScenario({});
+  assertExit(s.gate(), 0);
+  assertExit(mergeWith(s), 0);
 });

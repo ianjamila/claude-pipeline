@@ -236,7 +236,7 @@ Details and every exit code: `reference/gates-and-exits.md`. First: `P checkpoin
 **Every `P merge` attempt (the first, a retry, one after an update-branch or a new head) first passes the
 **Owner-merge approval** rule below.** With `owner_approval: label` its `ownerMerge` count rule is a no-op, but its
 resumed-run rule is not: a run in Resume mode or on an adopted PR never calls `P merge` without the owner's "merge"
-(`P merge` itself refuses a resumed record without `--owner-approved-head`). `P merge`,
+(`P merge` itself refuses a resumed record, or one it cannot check, without `--owner-approved-head`). `P merge`,
 `P prod-watch --pr N` and `P update-branch` keep the record's in-flight marker themselves (no checkpoint needed around
 them). `P merge` posts the `prod-before` event before merging and refuses (`error: pre-merge`, nothing merged) when it
 cannot: see `reference/gates-and-exits.md`.

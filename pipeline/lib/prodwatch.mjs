@@ -200,6 +200,16 @@ const fence = (text) => {
   const ticks = '`'.repeat(Math.max(3, ...[...body.matchAll(/`+/g)].map((m) => m[0].length + 1)));
   return `${ticks}\n${body}\n${ticks}`;
 };
+const positiveInt = (v) => (v !== null && v !== undefined && v !== '' && Number.isInteger(Number(v)) && Number(v) > 0 ? Number(v) : null);
+
+// An issue / revert PR as a recovery-reported event recorded it: {url, number}. The number is what the owner push and its
+// dedupe read; events written before it was recorded carry only the url, so it is read back from `/issues|pull/<n>`.
+function recordedArtifact(url, number, kind) {
+  if (typeof url !== 'string' || url === '') return null;
+  const n = positiveInt(number) ?? positiveInt(url.match(kind === 'pull' ? /\/pull\/(\d+)(?:[/?#]|$)/ : /\/issues\/(\d+)(?:[/?#]|$)/)?.[1]);
+  return n ? { url, number: n } : { url };
+}
+
 const describe = (d) => (d ? `${d.url ?? 'unknown url'} (id ${d.id ?? 'unknown'})` : 'unknown');
 
 export const issueTitle = (outcome, { pr, sha }) => `[pipeline] production ${outcome} after ${pr ? `#${pr} ` : ''}(${sha.slice(0, 7)})`;
@@ -491,8 +501,8 @@ async function watch(opts, deps) {
       if (recorded) {
         const reported = list.filter((e) => e.kind === 'recovery-reported' && e.id === recorded.id && e.dataStatus === 'ok' && e.data?.mergeSha === sha).at(-1);
         const done = recorded.data.ok === true && recorded.data.verified === true;
-        ev.issue = reported?.data?.issueUrl ? { url: reported.data.issueUrl } : null;
-        ev.revertPr = reported?.data?.revertPrUrl ? { url: reported.data.revertPrUrl } : null;
+        ev.issue = recordedArtifact(reported?.data?.issueUrl, reported?.data?.issueNumber, 'issues');
+        ev.revertPr = recordedArtifact(reported?.data?.revertPrUrl, reported?.data?.revertPrNumber, 'pull');
         ev.reason = `a rollback already ran for this merge (${recorded.id}): ${done ? 'production was verified healthy on the known-good deployment' : `it ${recorded.data.ok === true ? 'ran but production was NOT verified' : 'FAILED'}`}; not re-checked`;
         const out = result(done ? 'recovered' : 'rollback-failed');
         return { ...out, recorded: { id: recorded.id, url: recorded.url ?? null, ok: recorded.data.ok === true, verified: recorded.data.verified === true } };
@@ -733,6 +743,7 @@ async function watch(opts, deps) {
       if (rollbackTried) {
         await postLater('recovery-reported', () => `Rollback recovery reported: incident issue ${ev.issue?.url ?? 'not created'}, revert PR ${ev.revertPr?.url ?? 'not created'}.`, () => ({
           mergeSha: sha, issueUrl: ev.issue?.url ?? null, revertPrUrl: ev.revertPr?.url ?? null,
+          issueNumber: positiveInt(ev.issue?.number), revertPrNumber: positiveInt(ev.revertPr?.number),
         }));
       }
     });

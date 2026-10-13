@@ -23,7 +23,7 @@ import {
 
 export const meta = {
   summary: 'merge the PR if (and only if) the final gate passes again, live; waits for MERGED',
-  usage: 'pipeline merge --pr N [--owner-approved-head SHA] [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?, warnings?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment. While it runs the run record of the PR shows inFlight {kind: merge} and step merge; a prod-before event comment (the known-good deployment) is posted before the merge command, and when that post fails nothing is merged (error pre-merge); warnings lists a run record write that failed (never fatal). A run record marked resumed (`P checkpoint --resumed`: a run taken over by ship resume) refuses with error pre-merge unless --owner-approved-head names the full gate head: only the owner\'s \"merge\" for that head supplies it',
+  usage: 'pipeline merge --pr N [--owner-approved-head SHA] [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?, warnings?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment. While it runs the run record of the PR shows inFlight {kind: merge} and step merge; a prod-before event comment (the known-good deployment) is posted before the merge command, and when that post fails nothing is merged (error pre-merge); warnings lists a run record write that failed (never fatal). A run record marked resumed (`P checkpoint --resumed`: a run taken over by ship resume) refuses with error pre-merge unless --owner-approved-head names the full gate head: only the owner\'s \"merge\" for that head supplies it; so does a run record that cannot be checked (unreadable, invalid or unsupported: it may be a resumed one)',
 };
 
 const refuse = (error, reasons, extra = {}) => ({
@@ -53,21 +53,28 @@ export const run = guarded(async (argv, ctx) => {
 
     // 1a. A resumed run never merges on its own: the run record (viewer-authored, so not forgeable by a commenter) says whether this
     // run was taken over by `ship resume`; if so the owner's approval of THIS exact head must come in as a flag. Read before
-    // anything irreversible. A record that cannot be read does not block a normal run (a warning, not a refusal).
-    const warnings = [];
+    // anything irreversible. A record that cannot be checked (unreadable comments, an invalid or newer record) fails CLOSED: it
+    // may be a resumed one, so it needs the same approval. No record (absent) or a legacy comment is an ordinary run.
+    const ownerApproved = values['owner-approved-head'] === gate.head && /^[0-9a-f]{40}$/.test(gate.head);
+    let unchecked = null;
+    let existing = null;
     try {
-      const existing = readSummaryComment(gh, pr);
-      if (existing.status === 'ok' && existing.record.resumed) {
-        if (!(values['owner-approved-head'] === gate.head && /^[0-9a-f]{40}$/.test(gate.head))) {
-          const reason = 'resumed run: the owner must approve this exact head (pass --owner-approved-head <sha>)';
-          return refuse('pre-merge', [reason], { reason });
-        }
-      } else if (existing.status === 'invalid' || existing.status === 'unsupported') {
-        warnings.push(`could not read the run record (${existing.status}): the resumed-run guard could not be checked`);
-      }
+      existing = readSummaryComment(gh, pr);
+      if (existing.status === 'invalid' || existing.status === 'unsupported') unchecked = `the run record is ${existing.status}`;
     } catch (err) {
-      warnings.push(`could not read the run record: the resumed-run guard could not be checked (${String(err?.message ?? err).slice(0, 200)})`);
+      unchecked = `the run record could not be read (${String(err?.message ?? err).slice(0, 200)})`;
     }
+    if (!ownerApproved) {
+      if (existing?.status === 'ok' && existing.record.resumed) {
+        const reason = 'resumed run: the owner must approve this exact head (pass --owner-approved-head <sha>)';
+        return refuse('pre-merge', [reason], { reason });
+      }
+      if (unchecked) {
+        const reason = `${unchecked}, so the resumed-run guard cannot be checked: the owner must approve this exact head (pass --owner-approved-head <sha>)`;
+        return refuse('pre-merge', [reason], { reason });
+      }
+    }
+    const warnings = [];
 
     // 1b. Main may have moved since the gate ran: the gate, and the CI it waited on, then judged a tree that is NOT the one that
     // would land. Bring the branch up to date on GitHub (one update; expected_head_sha = the approved head), then refuse: the new
