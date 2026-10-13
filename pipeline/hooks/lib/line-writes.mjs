@@ -1544,6 +1544,7 @@ function contentsIn(frames, upto, asOf, P, io, depth) {
       if (el.rec?.sed) { // (every text the edit may leave, see sed-emulate.mjs; a program it does not emulate exactly is "built from pieces")
         const next = new Set(acc); // (the edit may fail or be skipped: an unwritable directory, syntax one sed rejects, a missing file ... the text it was to edit stays)
         for (const text of acc) {
+          frames[upto].tick?.(); // (each call may spend up to sed-emulate's MAX_WORK: the clock is read before every one, not every TICK_EVERY)
           const edited = applySed(el.rec.sed, text);
           if (edited === null) { io.sedRefused = true; fail(); return looseIn ? true : null; }
           for (const x of edited) next.add(x);

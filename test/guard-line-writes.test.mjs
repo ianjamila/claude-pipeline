@@ -2094,7 +2094,7 @@ test('time: piecesMatch answers as the regex it replaces did (anything between p
 });
 
 test('time: applySed refuses (null) a program whose regex work on the text could outlast the hook; ordinary edits are still computed', () => {
-  const line = `${'ab'.repeat(500)}\n`;
+  const line = `${'ab'.repeat(1000)}\n`; // (2,000 characters: every program below is over MAX_WORK on the FIRST line, so none of them runs at all)
   for (const prog of ['s/.*a.*b.*c/x/', '/.*a.*b.*c/d', 's/[ab]*[ab]*[ab]*c/x/', 's/[ab]\\{0,255\\}[ab]\\{0,255\\}c/x/']) {
     const t = Date.now();
     assert.equal(applySed({ args: ['-i', prog, 'f'], word: 'f' }, line.repeat(4)), null, prog);
