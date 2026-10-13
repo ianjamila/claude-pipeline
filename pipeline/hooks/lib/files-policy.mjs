@@ -846,6 +846,11 @@ function cdUnknownShape(argv) {
 // (`$(git rev-parse --show-toplevel)`, only for the first cd of the line), a fresh temp directory (`$(mktemp -d)`, `$TMPDIR`), `$(pwd)` / `$PWD`. `$0` of a sourced file is its parent's, so it is not modelled.
 const SELF_DIR = String.raw`\$\(\s*dirname\s+(?:--\s+)?"?\$(?:\{?(0|BASH_SOURCE(?:\[0\])?)\}?)"?\s*\)`;
 const SELF_RES = [new RegExp(`^(?:${SELF_DIR}|\\$\\{(0|BASH_SOURCE(?:\\[0\\])?)%/\\*\\})(/[\\w./-]*)?$`), new RegExp(`^\\$\\(\\s*cd\\s+"?(?:${SELF_DIR})"?\\s*(?:&&|;)\\s*pwd(?:\\s+-[LP])?\\s*\\)(/[\\w./-]*)?$`)];
+// A script word built from the judged script's own directory (`"$(dirname "$0")/helper"`, `"$(cd "$(dirname "$0")" && pwd)/helper"`, `"${0%/*}/helper"`): the same model
+// as a cd to that directory, with the same refusals (null when the word is not one of these, or the model cannot vouch for it)
+function selfPathWord(t, cmds, idx, ctx) {
+  return SELF_RES.some((re) => re.test(t)) ? modelledCd(t, cmds, idx, ctx) : null;
+}
 function modelledCd(t, cmds, idx, ctx) {
   if (/(?:^|\/)\.\.(?:\/|$)/.test(t)) return null; // (a suffix that climbs is not modelled)
   const sub = (x) => x ?? '';
@@ -1659,6 +1664,13 @@ function judgeSplices(c, dirs, ctx, opts) {
 // word the shell runs is unknown. Judge every word that could be it (see script-candidates.mjs) like a named script. A
 // word that is still unknown (`$UNSET`) cannot be judged: the textual rules still apply, and the line is denied when it
 // names a protected pipeline file.
+// The one file a word made only of names the line set names: no run-time part, glob or space, not an option (null otherwise)
+function lineVarWord(w, ctx) {
+  if (ctx.unknownAll || ctx.vars.IFS) return null;
+  const e0 = expandRefs(w, ctx);
+  const names = [...w.matchAll(/\$\{?(\w+)/g)].map((x) => x[1]);
+  return names.length && e0 && !/[\s$`*?[{~(]|^-/.test(e0) && names.every((n) => Object.hasOwn(ctx.vars, n) && !ctx.unknownVars.has(n) && !ctx.pickUnknown.has(n) && !ctx.srcChanged.has(n) && !ctx.srcTouched.has(n)) ? e0 : null;
+}
 function judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw) {
   const joinPath = (d, r) => (isAbs(r) ? posix.normalize(r) : posix.join(d, r));
   const lines = execLinesOf(sf, (w) => expandRefs(w, ctx), ctx.assigned);
@@ -1689,13 +1701,8 @@ function judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw) {
   if (sf.words?.some((w) => [...w.matchAll(/\$\{?(\w+)/g)].some((m) => ctx.unknownVars.has(m[1]) || ctx.pickUnknown.has(m[1]) || (ctx.unknownAll && !Object.hasOwn(ctx.vars, m[1]))))) return deny('the script is picked by a variable whose value is known only at run time (set to a run-time value, with a width or integer attribute, or by a sourced file that cannot be followed), so it cannot be checked; name the script file');
   if (c.dynamic && makeMatchers(ctx).rawHit(scanRaw, dirs)) return deny('which word is the script this command runs is only known at run time ($VAR / $(...) / a glob) and the line refers to a protected pipeline file; name the file and write the options literally');
   // Why: `bash $S/review-package ...` with S set on the line runs its first operand: a word made only of names the line set, with no run-time part, glob or space, not an option
-  let first = null;
-  if (sf.firstOperandRuns && sf.words?.length && !ctx.unknownAll && !ctx.vars.IFS) {
-    const e0 = expandRefs(sf.words[0], ctx);
-    const names = [...sf.words[0].matchAll(/\$\{?(\w+)/g)].map((x) => x[1]);
-    if (names.length && e0 && !/[\s$`*?[{~(]|^-/.test(e0) && names.every((n) => Object.hasOwn(ctx.vars, n) && !ctx.unknownVars.has(n) && !ctx.pickUnknown.has(n) && !ctx.srcChanged.has(n) && !ctx.srcTouched.has(n))) first = e0;
-  }
-  for (const file of c.files) {
+  const first = sf.firstOperandRuns && sf.words?.length ? sf.ownPath ?? lineVarWord(sf.words[0], ctx) : null;
+  for (const file of sf.ownPath && !c.files.includes(sf.ownPath) ? [...c.files, sf.ownPath] : c.files) {
     const v = judgeScriptFile({ kind: sf.kind, family: sf.family, file, candidate: true, ...(file === first ? { runsAsScript: true } : {}) }, dirs, ctx, opts);
     if (v) return v;
   }
@@ -2196,14 +2203,25 @@ function evaluateBashForFilesFrame(command, opts) {
       }
       markBound(c);
       if (splicesOptions(c.argv)) { const v = judgeSplices(c, sdirsNow(), ctx, withLineVars(opts, c)); if (v) return v; }
-      const sf = scriptFileOf(c.argv, c.raw, raw);
+      const sf0 = scriptFileOf(c.argv, c.raw, raw);
+      // Why: superpowers' task-brief runs `"${BASH:-bash}" "$(cd "$(dirname "$0")" && pwd)/sdd-workspace"`, and is run as `S=…/scripts; bash $S/task-brief`. The operand right
+      // after the shell, built from the judged script's own directory or only from names the line set, is no option in either reading (its value, or the word as written when
+      // quotes kept it literal), so the shell is no login shell reading ~/.bash_profile: the startup files are those of `bash FILE`. The own-directory path is also judged as a
+      // candidate (the word's other readings still are). A value with a space or a glob character would split or match: unchanged.
+      const ownWord = sf0?.ambiguous && sf0.kind === 'shell' && !sf0.joined && c.argv[1] === sf0.words?.[0] && !['source', '.', 'eval'].includes(baseOf(c.argv[0] ?? '')) && !/^[-+]/.test(c.argv[1])
+        ? { self: selfPathWord(sf0.words[0], cmds, idx, ctx), line: lineVarWord(sf0.words[0], ctx) } : null;
+      const plain = (p) => p !== null && !/[\s*?[\]{}~$`\\]|^[-+]/.test(p);
+      const own = ownWord && (plain(ownWord.self) ? ownWord.self : plain(ownWord.line) ? ownWord.line : null);
+      const cs = own ? { ...c, argv: c.argv.map((w, i) => (i === 1 ? own : w)) } : c;
+      const sf = sf0;
+      if (own && ownWord.self === own) sf.ownPath = own;
       const withPath = (rec) => { if (sourcePathSearch(rec, c.argv, cmds)) { rec.ambiguous = true; rec.words ??= [rec.file]; rec.pathSearch = true; } if (rec.words?.some(isEqualsWord) || rec.pathSearch) rec.pathValues = pathValuesOf(c, cmds, { env: startupEnv, inherited: inheritedStartup }); return rec; }; // (zsh `=tool`: the PATH directories to look in)
       if (sf) withPath(sf);
       // a shell runs its startup files (BASH_ENV, ENV, ZDOTDIR/.zshenv ...) BEFORE the script it was given, so they are judged first, in the
       // order the shell reads them: judged like `bash FILE`
       // Why: a startup file runs in the CHILD shell, so what it sets is the script's, not the rest of this line's: the effects are taken back once the child is judged (only `source` / `.` change this shell)
       let undo = null;
-      for (const st of startupFilesOf(c, cmds, { env: startupEnv, inherited: inheritedStartup, exec: sf?.kind === 'exec' })) {
+      for (const st of startupFilesOf(cs, cmds, { env: startupEnv, inherited: inheritedStartup, exec: sf?.kind === 'exec' })) {
         const v = judgeStartupFile(st);
         if (v) return v;
         if (!st.implicit) { undo ??= snapshotShell(ctx); absorbSourced(st, dirs, ctx); } // (the shell that runs the script read it first: its cds and variables are the script's)
@@ -2211,10 +2229,10 @@ function evaluateBashForFilesFrame(command, opts) {
       if (sf) {
         // (a program run by path is judged with the command that runs it: its shebang may name a shell, which reads startup files of its own)
         const outer = ctx.execCmd;
-        ctx.execCmd = sf.kind === 'exec' ? { c, cmds, env: startupEnv, inherited: inheritedStartup } : null;
+        ctx.execCmd = sf.kind === 'exec' ? { c: cs, cmds, env: startupEnv, inherited: inheritedStartup } : null;
         // (only a file the command runs as a script has a $0 and BASH_SOURCE of its own path: not a sourced one, a fed one, a glob / candidate record or a -c text; a variable-named first operand is marked for the candidate judgment)
-        const runsFile = (sf.kind === 'shell' || sf.kind === 'exec') && !sf.candidate && !sf.joined && !['source', '.', 'eval'].includes(baseOf(c.argv[0] ?? '')) && !c.argv.some((w) => /^-[A-Za-z]*[cs]$/.test(w));
-        if (runsFile) { if (sf.ambiguous) sf.firstOperandRuns = true; else { sf.runsAsScript = true; if (c.argv[1] === sf.file) sf.runShell = baseOf(c.argv[0]); } } // (runShell: the shell word of a plain `zsh file`; a program run by path takes its shebang's)
+        const runsFile = (sf.kind === 'shell' || sf.kind === 'exec') && !sf.candidate && !sf.joined && !['source', '.', 'eval'].includes(baseOf(cs.argv[0] ?? '')) && !cs.argv.some((w) => /^-[A-Za-z]*[cs]$/.test(w));
+        if (runsFile) { if (sf.ambiguous) sf.firstOperandRuns = true; else { sf.runsAsScript = true; if (cs.argv[1] === sf.file) sf.runShell = baseOf(cs.argv[0]); } } // (runShell: the shell word of a plain `zsh file`; a program run by path takes its shebang's)
         const sfj = sf;
         let v;
         try {

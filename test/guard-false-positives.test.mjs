@@ -348,3 +348,25 @@ test('H: a script by absolute path, judged where the directory is unknown, is ju
   assert.equal(w.decision, 'deny');
   assert.doesNotMatch(w.reason, /internal error/);
 });
+
+// Why (replay 10-13): superpowers' task-brief runs its helper as `"${BASH:-bash}" "$(cd "$(dirname "$0")" && pwd)/sdd-workspace"`. The unresolved operand might have been
+// `-l`, so bash was taken for a login shell reading ~/.bash_profile, whose `eval "$(brew shellenv)"` cannot be followed: every name became unknown and the helper was refused.
+test('I: a helper named from the script\'s own directory (or by names the line set) is judged as that file, with no login files', () => {
+  const run = (cmd, helper, extra = {}) => files(cmd, fakeFs(PROJ, {
+    '/home/u/.bash_profile': 'export EDITOR=vi\neval "$(/opt/homebrew/bin/brew shellenv)"\n', 'scripts/helper': helper, ...extra,
+  }, ['scripts']), { env: { HOME: '/home/u', ZDOTDIR: '/home/u' } });
+  const words = ['"$(dirname "$0")/helper"', '"$(cd "$(dirname "$0")" && pwd)/helper"', '"${0%/*}/helper"', '"$(cd "$(dirname "$0")" && pwd -P)/helper"'];
+  for (const w of words) {
+    for (const outer of ['bash scripts/run.sh p', 'bash /home/u/proj/scripts/run.sh p', 'S=/home/u/proj/scripts; bash $S/run.sh p']) {
+      const spec = { 'scripts/run.sh': `set -eu\nx=$("\${BASH:-bash}" ${w} "$1")\necho "$x"\n` };
+      assert.equal(run(outer, 'echo hi', spec).decision, 'allow', `${outer} / ${w}`);
+      assert.equal(run(outer, BAD_FILES, spec).decision, 'deny', `${outer} / ${w} (bad helper)`);
+    }
+  }
+  // the operand may still be an option, or names a file elsewhere: unchanged
+  assert.equal(run('X=-l; bash $X scripts/helper', 'echo hi').decision, 'deny');
+  const login = { 'scripts/run.sh': 'bash "$(dirname "$0")/helper"\n', '/home/u/.bash_profile': BAD_FILES };
+  assert.equal(run('bash -l scripts/run.sh', 'echo hi', login).decision, 'deny');
+  // $0 changed before the word is read: not modelled, so the helper is not vouched for
+  assert.equal(run('bash scripts/run.sh', 'echo hi', { 'scripts/run.sh': 'cd /tmp\nsource ./x.sh\nbash "$(dirname "$0")/helper"\n' }).decision, 'deny');
+});
