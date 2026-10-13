@@ -495,10 +495,38 @@ function compiled(r) {
   return r.compiled;
 }
 
+// L5f: the emulation runs only for an allowlist of plain argv shapes; every other spelling is refused (the callers keep "built from pieces"). Why: each exotic spelling is one more place where
+// the emulation and the real sed can read the words differently. Finding what a sed may WRITE (readSedArgs / sedReadings) is a separate job and stays as strict as it was.
+// Shape: [-i | -i.SUF | --in-place | --in-place=.SUF (once; a bare -i may be followed by BSD's empty suffix '')] [-E | -r | -n | a bundle of them] [-e PROG]... [PROG] FILE, all words plain.
+const PLAIN_WORD = /^[A-Za-z0-9_.\/\\:+@%,=-]+$/; // (a path or suffix: nothing the shell expands, no leading-dash trick below)
+const SUFFIX = /^\.[A-Za-z0-9_-]+$/;
+export function emulatedShape(args) {
+  if (!Array.isArray(args) || args.some((a) => typeof a !== 'string')) return false;
+  let i = 0;
+  let inPlace = 0;
+  let hasE = false;
+  const progs = [];
+  for (; i < args.length; i++) {
+    const a = args[i];
+    if (a === '-i') { inPlace++; if (args[i + 1] === '' && i + 2 < args.length) i++; } // (BSD: -i '' is an empty suffix)
+    else if (a === '--in-place') inPlace++;
+    else if (a.startsWith('-i.') || a.startsWith('--in-place=.')) { if (!SUFFIX.test(a.startsWith('--') ? a.slice(11) : a.slice(2))) return false; inPlace++; }
+    else if (a === '-e') { if (++i >= args.length) return false; hasE = true; progs.push(args[i]); }
+    else if (/^-[nEr]+$/.test(a)) continue;
+    else if (a.startsWith('-') && a !== '-') return false;
+    else break;
+  }
+  if (inPlace !== 1) return false;
+  if (!hasE) { if (i >= args.length) return false; progs.push(args[i++]); }
+  if (args.length - i !== 1 || !PLAIN_WORD.test(args[i]) || args[i].startsWith('-')) return false;
+  return progs.every((p) => p !== undefined && !/[\0`]/.test(p) && !dynamic(p));
+}
+
 // Every text the in-place edit `sed <args>` may leave in the file named by the word `word` when it held `text`, or null (not emulated exactly). A reading in which the word
 // is not edited (BSD takes the first word after a bare -i as its suffix) leaves the text as it is.
-export function applySed({ args, word, vars = [] }, text) {
+export function applySed({ args, word, vars = [], posix = false }, text) {
   if (text.length > MAX_TEXT) return null;
+  if (posix || process.env.POSIXLY_CORRECT !== undefined || !emulatedShape(args)) return null; // (L5f: anything outside the plain shapes is "built from pieces", as before the emulation)
   const readings = prepare(args, new Set(vars));
   if (readings === null) return null;
   const outs = new Set();

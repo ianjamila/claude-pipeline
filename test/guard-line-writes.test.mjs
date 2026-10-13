@@ -814,10 +814,12 @@ test('L1b: BSD sed -I (in place, separate suffix) and an abbreviated --in-place 
   // the files an in-place sed edits come from the same parser as its programs: abbreviations and bundles do not make the first file the program
   for (const l of ["sed --expr='y/a/b/' -i ok.sh", "sed -i --expression='y/a/b/' ok.sh", "sed --fi=s.sed -i ok.sh", "sed -i -ne 'y/a/b/;p' ok.sh", "sed -i -e p -e 'y/a/b/' ok.sh"]) denyBoth((_, mid) => `${l}; ${mid}; bash ok.sh`);
   // ... and the same option forms with a program that is emulated are computed: a clean result is allowed, a guarded one is not
-  for (const l of ["sed --expr='s/a/b/' -i ok.sh", "sed -i --expression='s/a/b/' ok.sh", "sed -i -ne p ok.sh", "sed -i -e p -e p ok.sh", "sed -I '' 's/a/b/' ok.sh", "sed --in-pl 's/a/b/' ok.sh", "sed -ni p ok.sh"]) {
+  for (const l of ["sed -i -e p -e p ok.sh", "sed -n -i p ok.sh"]) {
     assert.equal(run((_, mid) => `${l}; ${mid}; bash ok.sh`, SPEC).git.r.decision, 'allow', l); // (the mention of a guarded operation is harmless when the text the edit leaves is)
     allowBoth(`${l}; bash ok.sh`);
   }
+  // outside the emulated shapes (L5f): a long option, an option after -i, a bundle with i or e, BSD -I are not computed, so the edited file is "built from pieces"
+  for (const l of ["sed --expr='s/a/b/' -i ok.sh", "sed -i --expression='s/a/b/' ok.sh", "sed -i -ne p ok.sh", "sed -I '' 's/a/b/' ok.sh", "sed --in-pl 's/a/b/' ok.sh", "sed -ni p ok.sh"]) denyBoth(`${l}; bash ok.sh`);
   denyBoth((_, mid) => `sed -I '' 'w n.sh' ok.sh; ${mid}; bash n.sh`);
 });
 
@@ -838,7 +840,7 @@ test('L2: a lone in-place edit of a script the line then runs is judged by the t
     }
   }
   // an emulated program is computed: the result is the text that is judged (a push), not "pieces"
-  for (const prog of ["sed -i 's/X/sh/'", "sed -i.bak 's/X/sh/'", "sed -i '' 's/X/sh/'", "sed -I '' 's/X/sh/'", "sed --in-place 's/X/sh/'"]) {
+  for (const prog of ["sed -i 's/X/sh/'", "sed -i.bak 's/X/sh/'", "sed -i '' 's/X/sh/'", "sed --in-place 's/X/sh/'"]) {
     for (const tail of tails) {
       const l = `${prog} ok.sh; ${tail}`;
       const lf = l.replace('X/sh/', 'X//');
@@ -1715,9 +1717,9 @@ test('L5b: typical agent patches with sed -i, then run the file, are allowed (th
     "sed -i -E 's/(foo)\\(/\\1_x(/' x.mjs && node x.mjs", "sed -i.bak 's|foo|baz|g' x.mjs && node x.mjs", "sed -i '2,3d' x.mjs && node x.mjs", "sed -i '$d' x.mjs && node x.mjs",
     // a chain of edits (each may or may not have run: the number of texts stays small)
     "sed -i 's/foo/a1/' x.mjs; sed -i 's/a1/a2/' x.mjs; sed -i 's/a2/a3/' x.mjs; sed -i 's/const/let/' x.mjs; sed -i 's/ s2/ s3/' x.mjs; sed -i 's/(1)/(3)/' x.mjs; sed -i '1d' x.mjs; node x.mjs",
-    // several files are fine while the program does not depend on how they are joined
-    "sed -i 's/foo(/bar(/' x.mjs y.mjs && node x.mjs",
   ]) allowBoth(l, spec);
+  // outside the emulated shapes (L5f): several files are not computed, the edited file is "built from pieces"
+  for (const l of ["sed -i 's/foo(/bar(/' x.mjs y.mjs && node x.mjs"]) denyBoth(l, spec);
 });
 
 test('L5b: the text an emulated sed -i leaves is judged (git puX + s/X/sh/ is a push), addresses are exact', () => {
@@ -1775,7 +1777,8 @@ test('L5b: a program that is not emulated exactly stays "built from pieces"', ()
     "sed -i 's/./x/' u.mjs; node u.mjs", "sed -i 's/[^a]/x/' u.mjs; node u.mjs", "sed -i 's/[[:alpha:]]/x/' u.mjs; node u.mjs", "sed -i 's/FOO/x/I' u.mjs; node u.mjs", "sed -i 's/x*/-/g' u.mjs; node u.mjs",
   ]) assert.equal(git(l, gitFs).decision, 'deny', l);
   // ... but a plain literal substitution on the same non-ASCII text, and one file with line numbers, are exact
-  for (const l of ["sed -i 's/foo/bar/' u.mjs; node u.mjs", "sed -i '1d' x.mjs; node x.mjs", "sed -i 's/a/b/;s/x*$/!/' x.mjs y.mjs; node x.mjs"]) assert.equal(git(l, gitFs).decision, 'allow', l);
+  for (const l of ["sed -i 's/foo/bar/' u.mjs; node u.mjs", "sed -i '1d' x.mjs; node x.mjs"]) assert.equal(git(l, gitFs).decision, 'allow', l);
+  assert.equal(git("sed -i 's/a/b/;s/x*$/!/' x.mjs y.mjs; node x.mjs", gitFs).decision, 'deny'); // (outside the emulated shapes (L5f): two files)
 });
 
 test('L5b: applySed computes what sed leaves (GNU empty-match rules, Nth match, ranges, q, classes, intervals)', () => {
@@ -1810,7 +1813,7 @@ test('L5b: applySed computes what sed leaves (GNU empty-match rules, Nth match, 
   assert.equal(applySed({ args: ['-i.b', 'p', 'f', '*.sh'], word: 'f' }, 'a\n'), null);
   assert.equal(applySed({ args: ['-i.b', 'p', 'f', '$G'], word: 'f' }, 'a\n'), null);
   assert.equal(applySed({ args: ['-i.b', '-$O', 'p', 'f'], word: 'f' }, 'a\n'), null);
-  assert.notEqual(applySed({ args: ['-i.b', 'p', 'f', 'g'], word: 'f' }, 'a\n'), null);
+  assert.equal(applySed({ args: ['-i.b', 'p', 'f', 'g'], word: 'f' }, 'a\n'), null); // (outside the emulated shapes (L5f): two files)
   // a program every sed rejects (unpaired parentheses) leaves the file as it is
   assert.deepEqual(applySed({ args: ['-i.b', 's/\\(a/b/', 'f'], word: 'f' }, 'a\n'), ['a\n']);
 });
@@ -1852,8 +1855,8 @@ test('L5c: an in-place sed with more than one file operand is not emulated (an a
   for (const ops of [['f', 'f'], ['f', './f'], ['./f', 'f'], ['f', '/work/repo/f'], ['f', 'dir/../f'], ['F', 'f'], ['f', 'f*'], ['f', 'f?'], ['f', '{f,g}'], ['f', '$G'], ['f', '~/f']]) {
     assert.equal(ed(...ops), null, ops.join(' '));
   }
-  // different plain names are computed (the line-writes layer applies one edit per name to the file each name reaches, links included)
-  assert.ok(applySed({ args: ['-i', 's/X//', 'f', 'g'], word: 'f' }, 'puXXsh\n').includes('puXsh\n'));
+  // different plain names are not computed either (outside the emulated shapes (L5f): one file operand only)
+  assert.equal(applySed({ args: ['-i', 's/X//', 'f', 'g'], word: 'f' }, 'puXXsh\n'), null);
   // a glob or a variable in the operand itself is whatever the shell makes of it
   for (const w of ['f*', 'f?', '[f]', '{f,g}', '$G', '~/f']) assert.equal(applySed({ args: ['-i', 's/X//', w], word: w }, 'puXXsh\n'), null, w);
   // end to end: the file is edited once or twice depending on the names, and either text may run
@@ -1971,8 +1974,8 @@ test('L5d: the files an in-place sed edits are found whichever reading places th
   assert.deepEqual(sedPrograms(['-i.sh', '-l', 's/X/sh/', 'ok.sh']).targets, ['ok.sh']); // (BSD: -l is a switch, ok.sh is edited)
   assert.equal(sedArgsUnsafe(['--s', 'p', 'f']), true); // (ambiguous: --separate / --silent / --sandbox)
   assert.equal(sedArgsUnsafe(['--indent', 'p', 'f']), false); // (no sed has it: a usage error)
-  // the emulation takes the reading in which the file is not edited (-i is an -e value) as an unchanged text
-  assert.deepEqual(applySed({ args: ['-e', '-i', 'f'], word: 'f' }, 'abc\n'), ['abc\n']);
+  // a sed with no in-place option of its own (-i is an -e value) is outside the emulated shapes (L5f)
+  assert.equal(applySed({ args: ['-e', '-i', 'f'], word: 'f' }, 'abc\n'), null);
 });
 
 // ---- L5e: run-time words in option position, BSD suffix with a slash, backups through links -----------------------------------
@@ -2024,4 +2027,32 @@ test('L5e: --follow-symlinks puts the backup beside the link\'s TARGET (any abbr
   ]) denyBoth(l, spec);
   // twins: no backup suffix, or no --follow-symlinks (the backup is LINK + SUF, which is recorded)
   for (const l of ["sed --follow-symlinks -i 's/x/y/' ok.sh; bash ok.sh.sh", "sed --follow-symlinks -i '' 's/x/y/' ok.sh; bash ok.sh.sh"]) allowBoth(l, { ...SPEC });
+});
+
+// ---- L5f: the emulation runs only for an allowlist of plain argv shapes --------------------------------------------------------
+
+test('L5f: applySed computes only the allowlisted argv shapes; every other spelling is null (built from pieces, as before the emulation)', () => {
+  const ed = (args) => applySed({ args, word: 'f' }, 'puXXsh\n');
+  // the shapes agents use
+  for (const args of [['-i', 's/X//', 'f'], ['-i.bak', 's/X//', 'f'], ['--in-place', 's/X//', 'f'], ['--in-place=.bak', 's/X//', 'f'], ['-i', '', 's/X//', 'f'], ['-i.bak', '-E', 's/(X)/\\1/', 'f'], ['-n', '-i', 'p', 'f'], ['-nE', '-i', 'p', 'f'], ['-r', '-e', 'p', '-e', 's/X//', '-i', 'f'], ['-i', '/^x$/d', 'f']]) {
+    assert.notEqual(ed(args), null, args.join(' '));
+  }
+  assert.notEqual(applySed({ args: ['-i', 'p', '/work/repo/f'], word: '/work/repo/f' }, 'a\n'), null);
+  // outside the emulated shapes (L5f)
+  const outside = [
+    ['-i', 'p', 'f', 'g'], ['-i', 'p'], ['-i', '-e', 'p'], ['-i', '-s', 'p', 'f'], ['-i', '-l', '5', 'p', 'f'], ['-i', '-z', 'p', 'f'], ['-i', '-u', 'p', 'f'], ['-i', '-f', 's.sed', 'f'],
+    ['--follow-symlinks', '-i', 'p', 'f'], ['--posix', '-i', 'p', 'f'], ['-i', '--', 'p', 'f'], ['-ni', 'p', 'f'], ['-Ei.b', 'p', 'f'], ['-i.a/b', 'p', 'f'], ['-i.b c', 'p', 'f'], ['-ib', 'p', 'f'],
+    ['--in-place=b', 'p', 'f'], ['--in-pl', 'p', 'f'], ['--expression=p', '-i', 'f'], ['-i', '-ep', 'f'], ['-i', 'p', '*.sh'], ['-i', 'p', '~/f'], ['-i', 'p', '$F'], ['-i', 'p', '{f,g}'], ['-i', 'p', '-f'], ['-i', 'p', ''],
+    ['-i', '-i', 'p', 'f'], ['-i.b', '-i', 'p', 'f'], ['-I', '', 'p', 'f'], ['-n', 'p', 'f'], ['-i', '-n', '--', 'p', 'f'], ['-i', 'p', 'f', '--follow-symlinks'], ['-i', 'p', 'f', '-s'], ['-i', 'p', 'a b'], ['-i', 'p', 'f$G'],
+  ];
+  for (const args of outside) assert.equal(ed(args), null, args.join(' '));
+  // POSIXLY_CORRECT, on the line or in the environment, changes how the sed reads its options and programs
+  assert.equal(applySed({ args: ['-i', 'p', 'f'], word: 'f', posix: true }, 'a\n'), null);
+  const had = process.env.POSIXLY_CORRECT;
+  process.env.POSIXLY_CORRECT = '1';
+  try { assert.equal(ed(['-i', 'p', 'f']), null); } finally { if (had === undefined) delete process.env.POSIXLY_CORRECT; else process.env.POSIXLY_CORRECT = had; }
+  // end to end: POSIXLY_CORRECT on the line leaves the edited file "built from pieces"; the twin without it is computed
+  const gitFs = fakeFs(GIT_ROOT, { 'ok.sh': 'echo hi' }, DIRS);
+  for (const l of ["POSIXLY_CORRECT=1 sed -i 's/a/b/' ok.sh; bash ok.sh", "export POSIXLY_CORRECT=1; sed -i 's/a/b/' ok.sh; bash ok.sh"]) assert.equal(git(l, gitFs).decision, 'deny', l);
+  assert.equal(git("sed -i 's/a/b/' ok.sh; bash ok.sh", gitFs).decision, 'allow');
 });

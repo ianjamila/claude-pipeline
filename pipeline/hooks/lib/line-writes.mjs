@@ -613,7 +613,7 @@ function argRecords(cmd, name, idx, lineEnv = {}, io = {}) {
       // Why: -i.SUF / --in-place=SUF / BSD -i SUF first copies the file's ORIGINAL text to FILE+SUF (`sed -i.sh 's/x/y/' f; bash f.sh` runs f's old text): a record that holds the pre-edit text. A suffix with a * (the base name), a / (another directory)
       // or only known at run time puts the copy where we cannot tell: it may be anywhere
       const copies = targets.flatMap((dest) => bk.sufs.map((suf) => ({ idx, dest: dest + suf, backup: true, items: [{ file: dest }] })));
-      return orAnywhere([...targets.map((dest) => unknown(dest, { edit: true, sed: { args, word: dest } })), ...wfiles.map((dest) => unknown(dest)), ...copies], idx, bk.odd);
+      return orAnywhere([...targets.map((dest) => unknown(dest, { edit: true, sed: { args, word: dest, posix: Object.keys({ ...cmd.env, ...lineEnv }).includes('POSIXLY_CORRECT') } })), ...wfiles.map((dest) => unknown(dest)), ...copies], idx, bk.odd);
     }
     const { pos, opts } = getopt(args, 'eIlF', ['expression', 'file', 'line-length']);
     const hasProgram = hasOpt(opts, 'e', 'f', 'expression', 'file');
