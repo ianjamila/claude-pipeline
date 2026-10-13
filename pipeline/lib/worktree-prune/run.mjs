@@ -138,8 +138,9 @@ function evaluate(c, { root, gh, w, nowMs, transcriptDirs }) {
 }
 
 // Right before removal: the worktree must still be where, what and as unlocked as it was when it was evaluated.
-function unchangedSince(root, c) {
-  const now = listWorktrees(root).find((e) => samePath(e.path, c.path));
+// `list` is a test seam (ctx.pruneDeps.listWorktrees).
+function unchangedSince(root, c, list = listWorktrees) {
+  const now = list(root).find((e) => samePath(e.path, c.path));
   return Boolean(now) && now.locked === null && now.head === c.head && now.branch === c.branch;
 }
 
@@ -148,7 +149,7 @@ function settleMs(env) {
   return env.PIPELINE_PRUNE_SETTLE_MS !== undefined && Number.isInteger(n) && n >= 0 ? n : SETTLE_MS;
 }
 
-async function evaluateCandidates(repo, { gh, mode, dryRun, env, runId, runStartMs }) {
+async function evaluateCandidates(repo, { gh, mode, dryRun, env, runId, runStartMs, deps = {} }) {
   const { root, w, worktreeDir } = repo;
   const { candidates, skipped } = listCandidates(root, { worktreeDir, protect: w.protect });
   const kept = skipped.map(({ slug, reason }) => ({ slug, reason }));
@@ -172,8 +173,14 @@ async function evaluateCandidates(repo, { gh, mode, dryRun, env, runId, runStart
       wouldRemove.push(item);
       continue;
     }
-    if (!unchangedSince(root, c)) {
-      kept.push({ slug: c.slug, reason: 'changed during the run', pr: v.pr });
+    let changed = null;
+    try {
+      if (!unchangedSince(root, c, deps.listWorktrees)) changed = 'changed during the run';
+    } catch (err) {
+      changed = `changed during the run (could not re-read: ${oneLine(err)})`; // never abort: earlier removals must be reported
+    }
+    if (changed) {
+      kept.push({ slug: c.slug, reason: changed, pr: v.pr });
       continue;
     }
     let res;
@@ -309,7 +316,7 @@ async function pruneLocked(repo, { mode, dryRun, notify, ctx, env }) {
       if (identity.unavailable) throw new UnavailableError(identity.reason);
       throw new Fail(EXIT.USAGE, { ok: false, error: 'repo-mismatch', message: identity.reason });
     }
-    return evaluateCandidates(repo, { gh, mode, dryRun, env, runId, runStartMs });
+    return evaluateCandidates(repo, { gh, mode, dryRun, env, runId, runStartMs, deps: ctx?.pruneDeps });
   });
 
   // Worktrees may already be gone: from here on a failing step becomes an `errors` entry, never a lost report.

@@ -146,7 +146,7 @@ function world() {
     refs: repo.git(['for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads']),
   });
   const keptReason = (json, slug) => json.kept.find((k) => k.slug === slug)?.reason;
-  return { repo, dirs, wtPath, cli, setMode, snapshot, fake, script, keptReason, holdingRepo };
+  return { repo, dirs, env, wtPath, cli, setMode, snapshot, fake, script, keptReason, holdingRepo };
 }
 
 const slugs = (list) => list.map((x) => x.slug).sort();
@@ -376,6 +376,31 @@ test('a failing step after removal (purge, log) is reported in errors; the remov
   } finally {
     chmodSync(locked, 0o755);
   }
+});
+
+test('the pre-removal re-read throwing keeps that worktree ("changed during the run") and the run still reports and logs', {
+  skip: !LINUX && 'process inspection needs /proc',
+}, async () => {
+  const w = world();
+  w.setMode('on');
+  const { run: runCli } = await import('../pipeline/commands/worktrees.mjs');
+  const homeBefore = process.env.HOME;
+  process.env.HOME = w.dirs.home; // in-process: transcript and memory lookups must not read the real home
+  let r;
+  try {
+    r = await runCli(['prune'], {
+      cwd: w.repo.dir, env: w.env,
+      pruneDeps: { listWorktrees: () => { throw new Error('worktree list exploded'); } },
+    });
+  } finally {
+    process.env.HOME = homeBefore;
+  }
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.deepEqual(r.output.removed, []);
+  assert.equal(w.keptReason(r.output, 'done'), 'changed during the run (could not re-read: worktree list exploded)');
+  assert.deepEqual(slugs(r.output.kept), ['dirty', 'done', 'local', 'nopr', 'open'], 'every candidate is still reported');
+  assert.ok(existsSync(w.wtPath('done')));
+  assert.ok(r.output.log && readFileSync(r.output.log, 'utf8').includes(r.output.summary), 'the run is logged');
 });
 
 test('a quarantine left by a killed run is moved back, even in off mode', () => {
