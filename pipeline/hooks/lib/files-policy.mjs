@@ -15,6 +15,7 @@
 // Backstop for installer runs: the installer itself refuses to run inside a Claude Code process (CLAUDECODE set, or a Claude Code
 // ancestor process); commands that unset or override CLAUDECODE are denied here.
 import fs from 'node:fs';
+import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
@@ -1698,7 +1699,8 @@ function judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw) {
   }
   if (c.over) return deny('too many words, a glob matching too many files, or glob syntax that cannot be resolved could be the script this command runs, so it cannot be checked; name the script file');
   // a variable the line set to a run-time value (`NVM_DIR=$(cmd)`) picks the script: which one is unknown
-  if (sf.words?.some((w) => [...w.matchAll(/\$\{?(\w+)/g)].some((m) => ctx.unknownVars.has(m[1]) || ctx.pickUnknown.has(m[1]) || (ctx.unknownAll && !Object.hasOwn(ctx.vars, m[1]))))) return deny('the script is picked by a variable whose value is known only at run time (set to a run-time value, with a width or integer attribute, or by a sourced file that cannot be followed), so it cannot be checked; name the script file');
+  // (the unknown line a SQL client may run is not a variable: it is dynamic, refused by the rule below when protected text is around)
+  if (sf.words?.some((w) => [...w.matchAll(/\$\{?(\w+)/g)].some((m) => m[1] !== SQL_UNKNOWN_VAR && (ctx.unknownVars.has(m[1]) || ctx.pickUnknown.has(m[1]) || (ctx.unknownAll && !Object.hasOwn(ctx.vars, m[1])))))) return deny('the script is picked by a variable whose value is known only at run time (set to a run-time value, with a width or integer attribute, or by a sourced file that cannot be followed), so it cannot be checked; name the script file');
   if (c.dynamic && makeMatchers(ctx).rawHit(scanRaw, dirs)) return deny('which word is the script this command runs is only known at run time ($VAR / $(...) / a glob) and the line refers to a protected pipeline file; name the file and write the options literally');
   // Why: `bash $S/review-package ...` with S set on the line runs its first operand: a word made only of names the line set, with no run-time part, glob or space, not an option
   const first = sf.firstOperandRuns && sf.words?.length ? sf.ownPath ?? lineVarWord(sf.words[0], ctx) : null;

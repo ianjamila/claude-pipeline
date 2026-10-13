@@ -370,3 +370,16 @@ test('I: a helper named from the script\'s own directory (or by names the line s
   // $0 changed before the word is read: not modelled, so the helper is not vouched for
   assert.equal(run('bash scripts/run.sh', 'echo hi', { 'scripts/run.sh': 'cd /tmp\nsource ./x.sh\nbash "$(dirname "$0")/helper"\n' }).decision, 'deny');
 });
+
+// Why (replay 10-13, 150 psql commands): a `:name` the psql model cannot place (`'{"a":null}'`, `':x'`: quotes are not tracked) leaves an unknown shell line, which is
+// dynamic: refused when the line mentions a protected file. With a startup file that cannot be followed, every name was unknown, and the line's placeholder counted as a
+// variable picking the script, so any such psql command was refused.
+test('J: an unknown psql line is refused only with protected text around, also when a startup file cannot be followed', () => {
+  const env = { env: { HOME: '/home/u', ZDOTDIR: '/home/u' } };
+  const spec = { '/home/u/.zshenv': 'source "$(echo x)"\n' }; // (a sourced file that cannot be followed: every name is unknown)
+  const run = (cmd) => files(cmd, fakeFs(PROJ, spec, DIRS), env);
+  for (const sql of ["select ':x'", 'select \'{"a":null}\'::jsonb', "insert into t values ('{\"k\":\"v\"}')"]) {
+    assert.equal(run(`psql -c "${sql.replaceAll('"', '\\"')}"`).decision, 'allow', sql);
+    assert.equal(run(`psql -c "${sql.replaceAll('"', '\\"')}; select '/home/u/.claude/settings.json'"`).decision, 'deny', `${sql} + protected`);
+  }
+});

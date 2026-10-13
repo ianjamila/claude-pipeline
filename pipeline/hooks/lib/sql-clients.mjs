@@ -12,7 +12,8 @@ export const sqlFamilyOf = (name) => FAMILY[name] ?? null;
 
 // A shell line that stands for "something this client runs that cannot be known": a command named by a variable, so it is dynamic and the policies
 // refuse it when the line (or the text it sits in) mentions a guarded operation or a protected file.
-const UNKNOWN = '$SQL_UNKNOWN_SHELL_LINE';
+export const SQL_UNKNOWN_VAR = 'SQL_UNKNOWN_SHELL_LINE';
+const UNKNOWN = `$${SQL_UNKNOWN_VAR}`;
 const clean = (s) => String(s).replace(/\\/g, '').replace(/[`'"\\;&|<>()${}\n\r]/g, ' ').replace(/\s+/g, ' ').trim();
 const unq = (w) => String(w).trim().replace(/^(['"])([\s\S]*)\1$/, '$2');
 // (a name psql could interpolate has `:`; only a drive letter keeps one)
