@@ -90,8 +90,8 @@ exists (Step 0 preflight and labels ensure) just stop: the owner is at the keybo
   `preview` is `null`, and `merge`/`production`. Config `warnings` are advice: mention them.
 - `P labels ensure` (idempotent; later steps use `pipeline-blocked`, `needs-human`,
   `awaiting-review`). Exit 3 ⇒ GitHub is unreachable: say so and stop.
-- `P worktrees prune --notify` removes worktrees whose PR merged ≥ 24h ago (only when `worktrees.mode: on`; otherwise it
-  reports). Read `summary`; never act on `kept` yourself.
+- `P worktrees prune --notify` (skip it for `ship inbox`, which is read-only) removes worktrees whose PR merged ≥ 24h ago
+  (only when `worktrees.mode: on`; otherwise it reports). Read `summary`; never act on `kept` yourself.
 - `inbox` argument ("ship inbox", "what is each PR waiting on") → **Inbox** below (read-only; skip Steps 1–7).
 - `resume <pr>` argument or "resume pipeline reviews" → **Resume mode** below.
 
@@ -348,8 +348,8 @@ the owner's next move.
      `.review/state.json` from the triage comment when this checkout has none), then `P summary --pr N --outcome merged` (pushes
      nothing); tell the owner the production result is the workflow's comment on the PR. Never roll back.
    - `observe-prod` ⇒ `git worktree add --detach <worktree_dir>/agent-<slug>-prod <mergeSha>` (fetch `origin/<base>`
-     first), run `P job start prod -- node ~/.claude/pipeline/bin/pipeline.mjs prod-watch --observe-only --pr N` from there, report the outcome and any
-     `rollbackInterrupted`. prod-watch records the outcome itself (run record `step: ended`, `outcome` set, summary sections kept; a
+     first), then `P worktrees keep agent-<slug>-prod --reason "ship run agent-<slug>-prod"`; run `P job start prod -- node ~/.claude/pipeline/bin/pipeline.mjs prod-watch --observe-only --pr N` from there, report the outcome and any
+     `rollbackInterrupted`, then release the lock: `P worktrees unkeep agent-<slug>-prod --run agent-<slug>-prod`. prod-watch records the outcome itself (run record `step: ended`, `outcome` set, summary sections kept; a
      `deploy-not-observed` outcome stays open to watch again), so nothing else needs writing and the next `resume plan` routes `ended`. `needs-owner` ⇒
      tell the owner at once. Never roll back.
    - `build | verify | review | followups | gate` ⇒ steps 3–5, then the matching step.
