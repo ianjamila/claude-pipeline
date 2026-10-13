@@ -190,3 +190,13 @@ test('F2b 94 guard-git: forms that stay unresolved (length, substring, indirecti
     assert.equal(d.decision, 'deny', `${form} -> ${d.reason}`);
   }
 });
+
+// ---- 60 (closed by the 87 allowlist: return / exit / break / continue are not on it, so the file makes every name unknown; pinned here): return / exit / break / continue in a sourced file end it: later assignments and cds may never run ------------------------------------------------------------------------
+test('F2b 60: a name or directory a sourced file sets after a return / exit / break / continue is unknown', () => {
+  for (const body of ['return\nF=evil.sh', 'return 0\nF=evil.sh', '[ -z "x" ] && return\nF=evil.sh', 'exit\nF=evil.sh', 'for i in 1; do break; F=evil.sh; done']) {
+    const d = filesIn(`F=ok.sh; source set.sh; bash ${D}F`, rcTree(body));
+    assert.equal(d.decision, 'deny', `${body} -> ${d.reason}`);
+  }
+  const d = filesIn(`source set.sh; echo x > settings.json`, fakeFs(PROJ, { 'set.sh': 'return\ncd /home/u/.cla' + 'ude\n' }, DIRS93));
+  assert.equal(d.decision, 'deny', d.reason);
+});
