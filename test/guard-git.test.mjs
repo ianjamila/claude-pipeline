@@ -107,6 +107,32 @@ const DENY = [
   ['B=main; false && B=agent/x; git push origin $B'],
   ['L=human-approved; false && L=ok; gh pr edit 1 --add-label $L'],
   ['X=push; X=diff git $X origin main'],
+  // a push destination with a parameter expansion is ONE run-time word: the `:` of ${B:-x} is not a refspec separator
+  ['B=main; git push origin ${B:-x}'],
+  ['B=main; git push origin ${B:+main}'],
+  ['git push origin ${B:-main}'],
+  ['B=main; git push origin ${B:0}'],
+  ['git push origin ${B:=main}'],
+  ['git push origin ${B:-agent/x}'],
+  ['git push origin HEAD:${B:-x}'],
+  ['git push origin +HEAD:${B:-x}'],
+  ['git push origin ${B:-x}:${C:-y}'],
+  ['git push origin :${B:-x}'],
+  ['git push origin --delete ${B:-x}'],
+  ['git push origin $(echo a:b)'],
+  ['git push origin "$(echo x:main)"'],
+  ['git push origin `echo a:b`'],
+  ['git push origin HEAD:${B:-"}:main"}'],
+  ['git push origin ${B:-x'],
+  ['git push --repo=${R:-o} ${B:-agent/x}'],
+  // a config key / push.default value built at run time can be remote.*.push or upstream
+  ['git -c $K=HEAD:agent/x push'],
+  ['K=remote.origin.push; git -c $K=HEAD:agent/x push'],
+  ['git -c ${K:-remote.origin.push}=HEAD push'],
+  ['git -c push.default=$V push'],
+  ['git -c push.default=${V:-up}stream push'],
+  ['git config $K v; git push'],
+  ['git config ${K:-remote.origin.push} v; git push'],
 ];
 
 const ALLOW = [
@@ -141,6 +167,11 @@ const ALLOW = [
   ['git diff "$BASE"..HEAD'],
   ['git -C "$DIR" log --oneline -3'],
   ['B=agent/x; git push origin $B'], // assigned once on the line: still known
+  ['git push origin ${B:-x}:agent/x'], // only the destination is judged; the source is free text
+  ['git push origin HEAD:$(git branch --show-current)'],
+  ['git push -o ${B:-x} origin agent/x'],
+  ['git -c user.name=$N push origin agent/x'],
+  ['git -c core.pager=${P:-cat} push origin agent/x'],
 ];
 
 const label = (command, o) => (o ? `${command}  ${JSON.stringify(o, (k, v) => (v instanceof Error ? `Error(${v.message})` : v))}` : command);

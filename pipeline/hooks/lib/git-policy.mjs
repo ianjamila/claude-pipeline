@@ -45,8 +45,29 @@ const CURRENT_BRANCH_IDIOM = /^(?:\$\(|`)\s*git\s+(?:branch\s+--show-current|rev
 // Config the environment can inject into git (GIT_CONFIG_COUNT/KEY_n/VALUE_n, GIT_CONFIG_PARAMETERS, GIT_CONFIG_GLOBAL/SYSTEM).
 const GIT_ENV_CONFIG = /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+|PARAMETERS|GLOBAL|SYSTEM)$/i;
 // Config that can redirect a bare `git push` somewhere the branch name does not suggest.
-const RISKY_CONFIG = (key, value) => /^remote\..*\.push$/.test(key) || /^branch\./.test(key)
-  || (key === 'push.default' && /^(upstream|tracking|matching)$/i.test(value));
+// A key or push.default value built at run time (`-c $K=HEAD:main`, `-c push.default=${V:-up}stream`) can be any of them.
+const RISKY_CONFIG = (key, value) => DYNAMIC.test(key) || /^remote\..*\.push$/.test(key) || /^branch\./.test(key)
+  || (key === 'push.default' && (DYNAMIC.test(value) || /^(upstream|tracking|matching)$/i.test(value)));
+
+// Index of the first `sep` that is NOT inside a `${…}`, `$(…)`, `$((…))` or backtick expansion; -1 when there is none or the
+// word cannot be split reliably (an unbalanced expansion, or a quote / backslash inside one, which can hide a bracket or the
+// separator). -1 makes the caller treat the whole word as ONE run-time value, which is then denied: `${B:-x}` is a single
+// unresolvable word, never the refspec `${B` : `-x}`.
+function splitIndex(word, sep) {
+  const stack = [];
+  for (let i = 0; i < word.length; i++) {
+    const c = word[i];
+    const top = stack[stack.length - 1];
+    if (c === '\\') { if (stack.length) return -1; i++; continue; }
+    if (stack.length && (c === "'" || c === '"')) return -1;
+    if (c === '`') { if (top === '`') stack.pop(); else stack.push('`'); continue; }
+    if (c === '$' && (word[i + 1] === '{' || word[i + 1] === '(')) { stack.push(word[i + 1] === '{' ? '}' : ')'); i++; continue; }
+    if (c === '(' && top === ')') { stack.push(')'); continue; }
+    if (stack.length && c === top) { stack.pop(); continue; }
+    if (!stack.length && c === sep) return i;
+  }
+  return -1;
+}
 
 const deny = (reason) => ({ decision: 'deny', reason });
 const allowed = () => ({ decision: 'allow', reason: '' });
@@ -241,7 +262,7 @@ function globMatchesProtected(pattern) {
 
 function checkRefspec(spec, dir, gitDir, ctx) {
   if (spec.startsWith('+')) return deny(FORCE_REASON);
-  const colon = spec.indexOf(':');
+  const colon = splitIndex(spec, ':');
   const src = colon < 0 ? spec : spec.slice(0, colon);
   let dst = colon < 0 ? spec : spec.slice(colon + 1);
   dst = expandVars(dst, ctx); // `B=agent/x; git push origin HEAD:$B`
@@ -323,8 +344,8 @@ function parseGitGlobal(argv, dir, env, ctx) {
     const t = argv[i];
     if (t === '-C') { d = joinDir(d, argv[++i], ctx); continue; }
     if (t === '-c') {
-      const kv = argv[++i] ?? '';
-      const eq = kv.indexOf('=');
+      const kv = expandVars(argv[++i] ?? '', ctx);
+      const eq = splitIndex(kv, '=');
       configs.push({ key: (eq < 0 ? kv : kv.slice(0, eq)).toLowerCase(), value: eq < 0 ? '' : kv.slice(eq + 1) });
       continue;
     }
