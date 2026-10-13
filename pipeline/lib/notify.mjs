@@ -223,6 +223,7 @@ export function parseSecrets(text) {
 
 const TOPIC_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const TOKEN_RE = /^[A-Za-z0-9_.-]{1,256}$/;
+const MACHINE_RE = /^[A-Za-z0-9 _.-]{1,20}$/;
 const DEFAULT_SERVER = 'https://ntfy.sh';
 
 function validServer(value) {
@@ -239,7 +240,9 @@ function validServer(value) {
 
 // { ok:true, topic, server, token } | { ok:false, reason }. Per field: the environment first, then the file. A field that
 // is present but invalid stops the send (never a fallback to another server or a looser value). A blank topic or token
-// counts as unset; a blank server does not (the default applies only when NTFY_SERVER is unset everywhere).
+// counts as unset; a blank server does not (the default applies only when NTFY_SERVER is unset everywhere). The optional
+// NTFY_MACHINE (the label shown in the title) is read the same way but is cosmetic: an invalid value is dropped
+// (`machineInvalid: true`) and never stops the send.
 export function loadNotifyConfig({ env = process.env, secretsFile, readFile = (f) => fs.readFileSync(f, 'utf8') } = {}) {
   if (String(env.PIPELINE_NOTIFY ?? '').toLowerCase() === 'off') return { ok: false, reason: 'disabled' };
   const file = secretsFile ?? env.PIPELINE_SECRETS_FILE ?? DEFAULT_SECRETS_FILE;
@@ -269,7 +272,19 @@ export function loadNotifyConfig({ env = process.env, secretsFile, readFile = (f
   }
   if (token === INVALID || (token !== undefined && !TOKEN_RE.test(token))) return { ok: false, reason: 'invalid-config:token' };
   if (topic === undefined) return { ok: false, reason: 'no-topic' };
-  return { ok: true, topic, server, token };
+  const rawMachine = pick('NTFY_MACHINE');
+  const machineInvalid = rawMachine !== undefined && (rawMachine === INVALID || !MACHINE_RE.test(rawMachine));
+  return { ok: true, topic, server, token, ...(rawMachine !== undefined && !machineInvalid ? { machine: rawMachine } : {}), ...(machineInvalid ? { machineInvalid: true } : {}) };
+}
+
+// Which machine the run is on: Mac (darwin), PC (WSL or Windows), otherwise the sanitized hostname.
+export function machineLabel({ platform = process.platform, wsl = false, hostname = () => os.hostname() } = {}) {
+  if (platform === 'darwin') return 'Mac';
+  if (wsl || platform === 'win32') return 'PC';
+  let h = '';
+  try { h = String(hostname() ?? ''); } catch { /* fall through */ }
+  h = h.trim().replace(/[^A-Za-z0-9 _.-]+/g, '-').slice(0, 20).trim();
+  return h || 'unknown';
 }
 
 // Replace every secret (and the server path) with *** in text that may be surfaced.
@@ -296,14 +311,16 @@ export function scrubber({ topic, token, server } = {}) {
 const clean = (s) => String(s ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
 const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 
-export function buildTitle(pr, title) {
+// `machine` is the "[Mac]" prefix; the whole title is clipped to 80 characters, so the label is never cut away.
+export function buildTitle(pr, title, machine) {
   const t = clean(title);
-  if (!pr) return clip(t || 'Pipeline', 80);
-  return clip(t ? `#${pr} ${t}` : `#${pr}`, 80);
+  const prefix = machine ? `[${machine}] ` : '';
+  if (!pr) return clip(`${prefix}${t || 'Pipeline'}`, 80);
+  return clip(`${prefix}${t ? `#${pr} ${t}` : `#${pr}`}`, 80);
 }
 
 // -> { title, message, priority, tags, click? }. Body: "<label>: <action> [items: ids] (repo)", at most 300 characters.
-export function buildMessage(ev, { repoName, click } = {}) {
+export function buildMessage(ev, { repoName, click, machine } = {}) {
   const def = EVENTS[ev.event] ?? {};
   const label = ev.label ?? def.label ?? ev.event;
   const ids = (ev.ids ?? []).filter((i) => !/^(issue|revert)#/.test(i));
@@ -312,7 +329,7 @@ export function buildMessage(ev, { repoName, click } = {}) {
   if (head.length + suffix.length > 300) head = `${head.slice(0, 300 - suffix.length - 1)}…`;
   const tags = [ev.tag ?? def.tag, repoName && repoName.replace(/[^A-Za-z0-9_-]/g, '')].filter(Boolean);
   return {
-    title: buildTitle(ev.pr, ev.title),
+    title: buildTitle(ev.pr, ev.title, machine),
     message: head + suffix,
     priority: ev.priority ?? def.priority ?? 4,
     tags,
@@ -679,11 +696,12 @@ async function runNotify(event, deps, { transports, errors, budget, signal, out,
   const web = remote ? `https://${remote.host}/${remote.slug}` : null;
   if (!url && web && event.pr) url = `${web}/pull/${event.pr}`;
   if (event.issueNumber && web) url = event.issueUrl && /^https:\/\//.test(event.issueUrl) ? event.issueUrl : `${web}/issues/${event.issueNumber}`;
-  const push = buildMessage({ ...event, title }, { repoName, click: url });
+  const wsl = deps.isWsl ? deps.isWsl() : detectWsl({ env, readFile: deps.readFile });
+  const machine = cfg.machine ?? machineLabel({ platform: deps.platform, wsl, hostname: deps.hostname });
+  const push = buildMessage({ ...event, title }, { repoName, click: url, machine });
 
   // 3. Send. Each transport records its own result the moment it settles, so an acknowledged ntfy is never lost to a
   // hung toast (or to the hard cap), and a retry cannot send it twice.
-  const wsl = deps.isWsl ? deps.isWsl() : detectWsl({ env, readFile: deps.readFile });
   const hasPs = wsl && (deps.hasPowershell ? deps.hasPowershell() : Boolean(findOnPath('powershell.exe', env)));
   const jobs = [
     (async () => {
@@ -703,7 +721,7 @@ async function runNotify(event, deps, { transports, errors, budget, signal, out,
   }
   await Promise.all(jobs);
   const sent = transports.ntfy === 'sent' || transports.toast === 'sent';
-  return out({ ...(sent ? {} : { reason: 'send-failed' }), ...(ledger ? { ledger } : {}) });
+  return out({ ...(sent ? {} : { reason: 'send-failed' }), ...(ledger ? { ledger } : {}), ...(cfg.machineInvalid ? { machineLabel: 'default (invalid NTFY_MACHINE)' } : {}) });
 }
 
 // The `notify --test` event: a timestamp in the identity so it is never deduplicated.

@@ -1429,6 +1429,8 @@ function notifyRig() {
     stateDir: join(dir, 'state'),
     git: (args) => (args[0] === 'remote' ? 'git@github.com:acme/widgets.git' : ''),
     isWsl: () => false,
+    platform: 'linux',
+    hostname: () => 'testbox',
     lookup: async () => ({ title: 'Add widget', url: 'https://github.com/acme/widgets/pull/12' }),
     fetch: async (url, init) => {
       fetchCalls.push({ url, body: JSON.parse(init.body) });
@@ -1709,7 +1711,7 @@ test('push: merged is a quiet priority-3 "nothing to do" with the PR title', asy
   assert.equal(t.res.output.notify.sent, true);
   assert.equal(t.rig.fetchCalls.length, 1);
   const b = t.rig.fetchCalls[0].body;
-  assert.equal(b.title, '#12 Add widget');
+  assert.equal(b.title, '[testbox] #12 Add widget');
   assert.equal(b.message, 'Production OK: Live and healthy — nothing to do. (widgets)');
   assert.equal(b.priority, 3);
 });
@@ -1777,7 +1779,7 @@ test('push: a merge commit GitHub never names is exit 3 as before, plus one prod
   assert.match(t.res.output.reason, /did not name its merge commit/);
   assert.equal(t.rig.fetchCalls.length, 1);
   const b = t.rig.fetchCalls[0].body;
-  assert.equal(b.title, '#12 Add widget');
+  assert.equal(b.title, '[testbox] #12 Add widget');
   assert.match(b.message, /^Production check unfinished: Production check couldn't finish \(PR #12 is MERGED but GitHub did not name its merge commit/);
   assert.match(b.message, /check #12's deployment by hand/);
   assert.equal(b.priority, 4);
