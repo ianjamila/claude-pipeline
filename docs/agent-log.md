@@ -20,3 +20,5 @@ full record.
 - 2026-10-13 · #42 · feat(notify): owner pushes name the machine — [Mac] / [PC] / hostname, NTFY_MACHINE override · risk high · rounds 1 · arbiter 0 · needs-human
 - 2026-10-13 · #42 · feat(notify): owner pushes name the machine ([Mac]/[PC]) + reliable ntfy publish on slow networks · risk high · rounds 2 · arbiter 0 · merged
 - 2026-10-13 · #45 · chore(pipeline): owner_approval: chat for claude-pipeline (no approval labels) + monotonic clock in the hung-gh test · risk high · rounds 1 · arbiter 0 · merged — prod smoke pending
+- 2026-10-14 · #47 · feat(session-version): vendor-owed warning offers to open the vendor PR · risk high · rounds 2 · arbiter 0 · awaiting-owner-merge
+- 2026-10-14 · #52 · feat: skipped verify steps + owner rulings on needs-human review items · risk high · rounds 3 · arbiter 0 · merged — prod smoke pending

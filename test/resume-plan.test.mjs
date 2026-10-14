@@ -364,3 +364,17 @@ test('stop: routes that never reach Step 5 have none', () => {
     assert.equal(plan(over, { ownerApproval: 'chat' }).stop, null, JSON.stringify(Object.keys(over)));
   }
 });
+
+test('owner ruled in chat and removed needs-human: a record that ended needs-human resumes at the gate (or the review), it does not stop', () => {
+  const ended = record({ step: 'ended', outcome: 'needs-human' });
+  // label still on: the owner's, nothing to do
+  assert.equal(plan({ labels: ['needs-human'], record: ended }).enter, 'decision');
+  // label removed and the owner's rulings made the published review clean: the gate runs again, then the owner merges
+  const clean = plan({ record: ended }, { ownerApproval: 'chat' });
+  assert.equal(clean.enter, 'gate');
+  assert.equal(clean.stop, 'awaiting-owner-merge');
+  // an ACCEPT the owner ruled still has to be built and reviewed
+  const accept = plan({ record: ended, triage: cleanTriage({ clean: false }) }, { ownerApproval: 'chat' });
+  assert.equal(accept.enter, 'review');
+  assert.equal(accept.stop, 'awaiting-owner-merge');
+});

@@ -19,7 +19,8 @@ import { findDeployment } from './deploy.mjs';
 import { toPosix } from './paths.mjs';
 import { loadState } from './state.mjs';
 import { parseYaml } from './yaml.mjs';
-import { reviewValidFor } from './triage.mjs';
+import { ownerRuledItems, reviewValidFor } from './triage.mjs';
+import { skipOf } from './verify-steps.mjs';
 import { commitTime, diffFiles, headSha, mergeBase, revParse, reviewBaseRef, reviewContentHash, treeFingerprint } from './git.mjs';
 
 export const GATE_FILE = 'final-gate.json';
@@ -247,6 +248,9 @@ async function preflightCheck({ root, env, gh }) {
   return check('preflight', false, report.reasons.length ? report.reasons.join('; ') : 'preflight says the pipeline may not merge');
 }
 
+const SKIP_REASON_SHOWN = 80;
+const clip = (text, n) => (text.length > n ? `${text.slice(0, n)}\u2026` : text);
+
 function verifyReportCheck({ root, config, head, tree, o }) {
   let report;
   try {
@@ -273,8 +277,16 @@ function verifyReportCheck({ root, config, head, tree, o }) {
   if (steps && expected && JSON.stringify(steps.map((s) => s?.name)) !== JSON.stringify(expected)) {
     problems.push(`steps [${steps.map((s) => s?.name).join(', ')}] do not match ${source} [${expected.join(', ')}]`);
   }
-  const notPassed = (steps ?? []).filter((s) => s?.status !== 'pass').map((s) => `${s?.name}=${s?.status}`);
+  // A skipped step is accepted only when the owner listed it in verify.skippable_steps and it says why; anything else that
+  // is not a plain pass (fail, not-run, an unknown status) is refused as before.
+  const skippable = Array.isArray(config.verify.skippable_steps) ? config.verify.skippable_steps : [];
+  const skips = (steps ?? []).map(skipOf).filter(Boolean);
+  const notPassed = (steps ?? []).filter((s) => s?.status !== 'pass' && skipOf(s) === null).map((s) => `${s?.name}=${s?.status}`);
   if (notPassed.length) problems.push(`steps not passing: ${notPassed.join(', ')}`);
+  for (const k of skips) {
+    if (!skippable.includes(k.name)) problems.push(`step ${k.name} was skipped; list it in verify.skippable_steps to allow that`);
+    else if (k.reason === '') problems.push(`step ${k.name} was skipped without a reason`);
+  }
 
   const g = isObject(report.git) ? report.git : {};
   if (g.head !== head) problems.push(`report is for ${short(g.head)}, HEAD is ${short(head)}`);
@@ -287,7 +299,7 @@ function verifyReportCheck({ root, config, head, tree, o }) {
   if (!Number.isFinite(finished)) problems.push('finishedAt is missing or not a date');
   else if (finished < commitTime(head, o)) problems.push('report finished before the HEAD commit was made');
 
-  return problems.length ? check('verify-report', false, problems.join('; ')) : check('verify-report', true, `full verify passed at ${short(head)} (${steps.length} steps)`);
+  return problems.length ? check('verify-report', false, problems.join('; ')) : check('verify-report', true, `full verify passed at ${short(head)} (${steps.length} steps${skips.length ? `: ${steps.length - skips.length} ran, ${skips.length} skipped: ${skips.map((k) => `${k.name} \u2014 ${clip(k.reason, SKIP_REASON_SHOWN)}`).join('; ')}` : ''})`);
 }
 
 async function hardstopsCheck({ root, config, diff }) {
@@ -322,6 +334,10 @@ function integrityCheck({ config, diff }) {
   return check('integrity', false, `${r.violations.length} test-integrity violation(s): ${shown}`);
 }
 
+// How many owner-ruled items the review detail lists, and how much of each quote.
+const OWNER_RULED_SHOWN = 5;
+const OWNER_QUOTE_SHOWN = 100;
+
 function reviewCheck({ root, config, pr, diff, hash, hashError }) {
   const d = diff();
   if (!d.ok) return check('review', false, `could not diff against the base: ${d.error}`);
@@ -333,6 +349,13 @@ function reviewCheck({ root, config, pr, diff, hash, hashError }) {
   if (!hash) return check('review', false, `cannot compute the content hash: ${hashError}`);
   if (!reviewValidFor(state, hash)) {
     return check('review', false, `no clean review round covers the current content (${short(hash)}), or findings are unresolved`);
+  }
+  // owner_approval: chat: an item the owner ruled in chat (an original or a later round's cached copy) never clears the merge by
+  // itself. It stays visible here and counts as ownerMerge, so the owner's "merge" for this head is still needed.
+  const ruled = ownerRuledItems(state);
+  if (ruled.length > 0) {
+    const shown = ruled.slice(0, OWNER_RULED_SHOWN).map((i) => `${i.id} "${clip(String(i.final.ownerQuote).replace(/\s+/g, ' ').trim(), OWNER_QUOTE_SHOWN)}"`).join('; ');
+    return check('review', true, `review valid for content ${short(hash)}; ${ruled.length} owner-ruled item(s), owner-merge: ${shown}${ruled.length > OWNER_RULED_SHOWN ? '; ...' : ''}`, ruled.length);
   }
   return check('review', true, `review valid for content ${short(hash)}`);
 }

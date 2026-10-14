@@ -20,7 +20,8 @@ export const meta = {
   summary: 'decide which items need the arbiter, then prove and apply its rulings',
   usage: [
     'pipeline arbiter needed --round R [--force] [--repo DIR]',
-    '  -> {needed:false, items:[]} | {needed:true, items, inputPath, digest, digest8, tag}',
+    '  -> {needed:false, items:[]} | {needed:true, items, inputPath, digest, digest8, tag, promptHeader}',
+    '  start the arbiter prompt with promptHeader, pasted verbatim (the two lines ROUND: / INPUT-DIGEST:): without them `arbiter apply` cannot prove the arbiter saw this input and marks every item needsHuman',
     'pipeline arbiter apply --round R [--tag TAG | --agent-id ID] [--projects-dir DIR] [--max-age-ms N] [--repo DIR]',
     '  the proof is pinned to claude-fable- at effort high; --expect-model / --expect-effort are honoured only with PIPELINE_TEST_MODE=1 in a repo checkout (an installed copy ignores it)',
     '  -> {ok, round, tag, transcript, errors, items}; exit 0 proven + applied, 1 unproven (every arbitrated item needsHuman), 2 no transcript',
@@ -120,7 +121,8 @@ function neededLocked(values, n, root, ctx) {
   writeFileAtomic(inputPath, `ROUND: ${n}\nINPUT-DIGEST: ${digest}\n\n${body}`);
   const ids = items.map((i) => i.id);
   saveState(root, patchRound(state, n, { arbiter: { inputDigest: digest, items: ids, tag } }));
-  return { exitCode: EXIT.OK, output: { needed: true, items: ids, inputPath, digest, digest8, tag } };
+  const promptHeader = `ROUND: ${n}\nINPUT-DIGEST: ${digest}`;
+  return { exitCode: EXIT.OK, output: { needed: true, items: ids, inputPath, digest, digest8, tag, promptHeader } };
 }
 
 // ---- apply ----------------------------------------------------------------------------------
