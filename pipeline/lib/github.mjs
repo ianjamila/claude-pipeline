@@ -230,12 +230,12 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
 
     // Follows pageInfo until the end. `visit(nodes)` returns true to stop early. A cursor that does not advance is an error
     // (an endless loop would hang the pipeline), as is a reply without the pull request connection.
-    pagePullRequests(query, visit) {
+    pagePullRequests(query, visit, extraVars = {}) {
       const { owner, name } = self.repo();
       let after = null;
       const seen = new Set();
       for (let page = 0; page < MAX_PAGES; page += 1) {
-        const data = self.graphql(query, { owner, name, first: GRAPHQL_PAGE, after });
+        const data = self.graphql(query, { ...extraVars, owner, name, first: GRAPHQL_PAGE, after });
         const conn = data?.repository?.pullRequests;
         if (!conn || !Array.isArray(conn.nodes)) {
           throw new GhError({ code: 0, stderr: 'GraphQL reply has no pullRequests connection', args: ['api', 'graphql'] });
