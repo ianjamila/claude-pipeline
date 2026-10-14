@@ -1103,7 +1103,15 @@ test('state mark-implemented fails closed: a conflicting base merge, or a state 
   assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
   // The default branch edits the line round 1 reviewed the PR changing: the trial merge conflicts, so the PR's own change
   // since round 1 cannot be separated from main's, and no fix is accepted on a guess.
-  mergeMainInto(w, { 'src/a.js': aFile(false).replace('v12 = 12', 'v12 = 1200'), 'src/from-main.js': 'export const other = 1;\n' }, { resolve: { 'src/a.js': aFile(true) } });
+  // The PR is then rebuilt on top of main (a rebase): no merge commit records how the conflict was resolved, so nothing
+  // marks where the PR's own work since round 1 starts.
+  w.repo.checkout('main');
+  w.repo.write('src/a.js', aFile(false).replace('v12 = 12', 'v12 = 1200'));
+  w.repo.write('src/from-main.js', 'export const other = 1;\n');
+  w.repo.commit('main moves on');
+  w.repo.git(['checkout', '-q', '-B', 'feat/x', 'main']);
+  w.repo.write('src/a.js', aFile(true));
+  w.repo.commit('feature, rebuilt on main');
   w.repo.write('src/a.test.js', 'console.log("test");\n');
   w.repo.commit('add a test');
   const before = w.stateText();
@@ -1125,6 +1133,87 @@ test('state mark-implemented fails closed: a conflicting base merge, or a state 
   assertExit(bad, 2, bad.stderr + bad.stdout);
   assert.equal(bad.json.error, 'base-unresolved');
   assert.equal(w2.item('R1-B1').implemented, undefined);
+});
+
+// A conflicting base merge cannot be separated from the PR's own change by a trial merge, so the PR's work since round N is
+// measured from the merge commit that resolved the conflict (the latest one on the PR's first-parent history whose other parent
+// is the default branch carrying the current fork point).
+const conflictMerge = (w, extra = {}) =>
+  mergeMainInto(w, { 'src/a.js': aFile(false).replace('v12 = 12', 'v12 = 1200'), 'src/from-main.js': 'export const other = 1;\n', ...extra }, { resolve: { 'src/a.js': aFile(true) } });
+const acceptedWorld = (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
+  return w;
+};
+const fixA = (w) => {
+  w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
+  return w.repo.commit('fix');
+};
+
+test('state mark-implemented: after a conflicting base merge is resolved, a real fix committed after the resolution counts', (t) => {
+  const w = acceptedWorld(t);
+  conflictMerge(w);
+  fixA(w);
+  const r = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(w.item('R1-B1').implemented, true);
+});
+
+test('state mark-implemented: after a resolved conflicting merge, only a test file committed since is still refused', (t) => {
+  const w = acceptedWorld(t);
+  conflictMerge(w);
+  w.repo.write('src/a.test.js', 'console.log("test");\n');
+  w.repo.commit('add a test');
+  const refused = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assertExit(refused, 2, refused.stderr + refused.stdout);
+  assert.equal(refused.json.error, 'no-code-change');
+  assert.match(refused.json.message, /only test files changed \(src\/a\.test\.js\)/);
+  assert.equal(w.item('R1-B1').implemented, undefined);
+});
+
+test('state mark-implemented: a resolved conflicting merge with no later commit is refused', (t) => {
+  const w = acceptedWorld(t);
+  conflictMerge(w);
+  const refused = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assertExit(refused, 2, refused.stderr + refused.stdout);
+  assert.equal(refused.json.error, 'no-code-change');
+  assert.equal(w.item('R1-B1').implemented, undefined);
+});
+
+test('state mark-implemented: files main brings in after the resolving merge do not count as the fix', (t) => {
+  const w = acceptedWorld(t);
+  conflictMerge(w);
+  w.repo.write('src/a.test.js', 'console.log("test");\n');
+  w.repo.commit('add a test');
+  mergeMainInto(w, { 'src/more-from-main.js': 'export const more = 1;\n' }); // a clean second update-branch
+  const refused = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assertExit(refused, 2, refused.stderr + refused.stdout);
+  assert.equal(refused.json.error, 'no-code-change', 'main\'s new file is not the PR\'s change');
+  assert.doesNotMatch(refused.json.message, /more-from-main/);
+});
+
+test('state mark-implemented: a conflict resolved by merging a branch other than the default branch stays unresolved', (t) => {
+  const w = acceptedWorld(t);
+  // main gets the conflicting change; a side branch (containing it plus more) is what the PR merges, so no merge commit
+  // brings in the default branch itself.
+  w.repo.checkout('main');
+  w.repo.write('src/a.js', aFile(false).replace('v12 = 12', 'v12 = 1200'));
+  w.repo.commit('main moves on');
+  w.repo.git(['checkout', '-q', '-b', 'side', 'main']);
+  w.repo.write('src/side.js', 'export const side = 1;\n');
+  w.repo.commit('side work');
+  w.repo.checkout('feat/x');
+  try { w.repo.git(['merge', '--no-ff', '-m', 'merge side', 'side']); } catch {
+    w.repo.write('src/a.js', aFile(true));
+    w.repo.git(['add', '-A']);
+    w.repo.git(['commit', '-q', '--no-edit']);
+  }
+  fixA(w);
+  const refused = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assertExit(refused, 2, refused.stderr + refused.stdout);
+  assert.equal(refused.json.error, 'base-unresolved');
+  assert.doesNotMatch(refused.json.message, /resolve the base branch merge and try again/);
 });
 
 test('state record-followup and set-outcome', (t) => {

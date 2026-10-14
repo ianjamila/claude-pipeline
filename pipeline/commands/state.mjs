@@ -5,7 +5,7 @@ import { EXIT, UnavailableError, UsageError, intOption, parseCommandArgs, requir
 import { mkdirSync, existsSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
-import { effectiveReviewBase, git, mergeBase } from '../lib/git.mjs';
+import { effectiveReviewBase, git, isAncestor, mergeBase, revParse } from '../lib/git.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { MARKERS } from '../lib/render.mjs';
@@ -179,6 +179,23 @@ async function outcome(rest, ctx) {
   };
 }
 
+// The latest merge commit on HEAD's first-parent history after `toHead` that merged the default branch (as it stands now) into the
+// PR: its second parent contains the PR's current fork point and is itself part of the default branch. A merge commit is where a
+// conflict with the default branch was resolved, so only commits after it are the PR's own work since. null when there is none.
+// Only the default branch counts (a merge of any other branch says nothing about what main brought in). Throws on a git error.
+function resolvingMerge({ root, config, toHead, forkPoint }) {
+  const o = { cwd: root };
+  const baseRef = reviewBaseRef(root, config);
+  const merges = git(['rev-list', '--first-parent', '--merges', `${revParse(toHead, o)}..HEAD`], o).split('\n').filter(Boolean);
+  for (const m of merges) {
+    const parents = git(['rev-list', '--parents', '-n', '1', m], o).trim().split(/\s+/).slice(1);
+    if (parents.length !== 2) continue;
+    const other = parents[1];
+    if (isAncestor(forkPoint, other, o) && isAncestor(other, baseRef, o)) return m;
+  }
+  return null;
+}
+
 // ---- small updates --------------------------------------------------------------------------
 
 async function markImplemented(rest, ctx) {
@@ -208,18 +225,28 @@ async function markImplemented(rest, ctx) {
       }
       // A settle-by-test commit changes the hash too, so also require a non-test file to have changed since then.
       // Measured from the round's head, minus whatever was merged in from the default branch since (those are not the PR's
-      // change). This gate fails closed: if that range cannot be worked out exactly (git failed, the trial merge conflicted
-      // or is unsupported, so the only base left is the whole PR), the mark is refused rather than counting files the fix did
-      // not touch.
+      // change). This gate fails closed: if that range cannot be worked out exactly (git failed, or a conflicting merge
+      // whose resolution is not recorded as a merge commit), the mark is refused rather than counting files the fix did not touch.
       let changed;
       try {
-        const since = effectiveReviewBase({ from: round.toHead, forkPoint: mergeBase(reviewBaseRef(root, config), 'HEAD', { cwd: root }) }, { cwd: root });
-        if (since.kind !== 'previous' && since.kind !== 'synthetic') throw new Error(`the default branch was merged into the PR since round ${round.n} and the merge cannot be separated from the PR's own changes (${since.kind})`);
-        changed = git(['diff', '--name-only', '--no-renames', `${since.base}..HEAD`], { cwd: root }).split('\n').filter(Boolean);
+        const forkPoint = mergeBase(reviewBaseRef(root, config), 'HEAD', { cwd: root });
+        const since = effectiveReviewBase({ from: round.toHead, forkPoint }, { cwd: root });
+        let base = since.base;
+        if (since.kind === 'whole-pr') {
+          // The trial merge conflicted (or is unsupported), and it will never change: both of its inputs are fixed. The PR's
+          // own work since then starts at the merge commit that resolved the conflict.
+          base = resolvingMerge({ root, config, toHead: round.toHead, forkPoint });
+          if (base === null) {
+            throw new Error(`the default branch was merged into the PR since round ${round.n} with a conflict, and no merge commit of the default branch after that round records the resolution, so the PR's own changes cannot be told apart from the default branch's`);
+          }
+        } else if (since.kind !== 'previous' && since.kind !== 'synthetic') {
+          throw new Error(`unexpected review base kind ${since.kind}`);
+        }
+        changed = git(['diff', '--name-only', '--no-renames', `${base}..HEAD`], { cwd: root }).split('\n').filter(Boolean);
       } catch (err) {
         throw new Fail(EXIT.USAGE, {
           ok: false, error: 'base-unresolved',
-          message: `${item.id} cannot be marked implemented: could not tell which files changed since round ${round.n} (${err.message}); resolve the base branch merge and try again`,
+          message: `${item.id} cannot be marked implemented: could not tell which files changed since round ${round.n} (${err.message})`,
         });
       }
       const code = changed.filter((f) => f !== config.agent_log && !matchAny(f, config.integrity.test_globs));
