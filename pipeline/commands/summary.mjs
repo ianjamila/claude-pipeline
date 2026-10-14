@@ -12,6 +12,7 @@ import { emptyState, loadState } from '../lib/state.mjs';
 import { loadConfig } from '../lib/config.mjs';
 import { summarySections } from '../lib/render.mjs';
 import { recordForOutcome } from '../lib/run-record.mjs';
+import { costReport, guardLogFile, readGuardLog } from '../lib/run-cost.mjs';
 import { readSummaryComment, writeSummaryComment } from '../lib/summary-comment.mjs';
 import { buildAgentLogLine } from '../lib/agentlog.mjs';
 import { inlineOptionValues } from '../lib/finalgate.mjs';
@@ -21,7 +22,7 @@ import { classifyOutcome, defaultAction, notifyEvent } from '../lib/notify.mjs';
 
 export const meta = {
   summary: 'upsert the PR summary comment and print the agent-log line',
-  usage: 'pipeline summary --pr N --outcome O [--built TEXT] [--action TEXT] [--cause CODE] [--repo DIR]   -> {ok, url, agentLogLine, notify}',
+  usage: 'pipeline summary --pr N --outcome O [--built TEXT] [--action TEXT] [--cause CODE] [--session ID]... [--repo DIR]   -> {ok, url, agentLogLine, cost, notify}',
 };
 
 // These stops never reach a review round (verify red three times, Codex out in round 1) or happen after the run's state
@@ -107,10 +108,23 @@ function planPush({ outcome, state, values, root }) {
   return { event: { event: kind, outcome, action, ids, ...(head ? { head } : {}), ...(cause ? { cause } : {}) } };
 }
 
+// Where the guard hooks' deny log is (tests and odd installs point PIPELINE_GUARD_LOG_FILE at another file).
+const guardLogPath = (ctx) => ctx.guardLogFile ?? ctx.env?.PIPELINE_GUARD_LOG_FILE ?? guardLogFile();
+
+// How many commands the guards denied to this run's sessions: the ones the record already knows plus --session. No
+// session known, or no log file (the guards have not written one yet): nothing is counted and the old count stays.
+function guardBlocksFor(record, extraSessions, ctx) {
+  const sessions = [...new Set([...(record?.cost?.sessions ?? []), ...extraSessions])];
+  if (!sessions.length) return { blocks: undefined, warnings: [] };
+  const log = readGuardLog(guardLogPath(ctx), sessions);
+  if (!log.present) return { blocks: undefined, warnings: [] };
+  return { blocks: log.blocks, warnings: log.skipped ? [`guard log: ${log.skipped} unreadable line(s) skipped`] : [] };
+}
+
 export const run = guarded(async (argv, ctx) => {
-  const { values } = parseCommandArgs(inlineOptionValues(argv, ['--outcome', '--built', '--action', '--cause']), {
+  const { values } = parseCommandArgs(inlineOptionValues(argv, ['--outcome', '--built', '--action', '--cause', '--session']), {
     pr: { type: 'string' }, outcome: { type: 'string' }, built: { type: 'string' }, repo: { type: 'string' },
-    action: { type: 'string' }, cause: { type: 'string' },
+    action: { type: 'string' }, cause: { type: 'string' }, session: { type: 'string', multiple: true },
   }, { allowPositionals: false });
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const outcome = requireOption(values, 'outcome');
@@ -151,14 +165,16 @@ export const run = guarded(async (argv, ctx) => {
       // The run record rides in the same comment: keep the one a checkpoint wrote, set how the run ended.
       const existing = readSummaryComment(gh, pr);
       if (existing.status === 'unsupported') throw new UsageError('the summary comment carries a run record from a newer pipeline version: update the pipeline CLI first');
+      const guard = guardBlocksFor(existing.status === 'ok' ? existing.record : null, values.session ?? [], ctx);
       const { record, warnings } = recordForOutcome(existing.status === 'ok' ? existing.record : null, {
         repo: gh.repo().slug, pr, branch: view.headRefName, baseRef: view.baseRefName, head: view.headRefOid,
-        outcome, detail, agentLogLine, host: hostname(), now: Date.now(),
+        outcome, detail, agentLogLine, host: hostname(), now: Date.now(), sessions: values.session, guardBlocks: guard.blocks,
       });
+      warnings.push(...guard.warnings);
       const posted = writeSummaryComment(gh, pr, { record, sections, existing });
       const prUrl = typeof posted.url === 'string' ? posted.url.replace(/#.*$/, '') : '';
       if (/\/pull\/\d+$/.test(prUrl)) url = prUrl;
-      return { exitCode: EXIT.OK, output: { ok: true, url: posted.url, action: posted.action, agentLogLine, step: record.step, warnings } };
+      return { exitCode: EXIT.OK, output: { ok: true, url: posted.url, action: posted.action, agentLogLine, step: record.step, cost: costReport(record.cost), warnings } };
     });
   } finally {
     // Whether or not GitHub answered. When it threw, the error keeps its exit code and the push is still sent.
