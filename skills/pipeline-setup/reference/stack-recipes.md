@@ -16,7 +16,9 @@ Each recipe lists `STEPS` for `scripts/verify.mjs` (`quick: true` marks steps th
 | build | `npm run build` with the dedicated instance's env (`supabase-local.mjs env --project <id>`; the `verify.mjs` template's `supabaseEnv()` does this) | no |
 | e2e | `npx playwright test -c playwright.smoke.config.ts --project=smoke` (templates `e2e/playwright.smoke.config.ts` + `e2e/smoke.spec.ts`; its port comes from `PIPELINE_SMOKE_PORT`, which `supabase-local env` prints; screenshots to `.verify/screenshots/`) | no |
 
-Set `verify.expected_steps` in `pipeline.yml` to these step names, in order (only the steps the repo really has).
+Set `verify.expected_steps` in `pipeline.yml` to these step names, in order (only the steps the repo really has). A slow step
+may carry a `skipIf` in `verify.mjs` (full mode only; it must fail closed); list it in `verify.skippable_steps` or final-gate refuses
+the skipped report.
 
 Preview: GitHub deployments environment `Preview`; production: provider `vercel`. On a failed production
 smoke `pipeline prod-watch` itself runs the Vercel CLI (`vercel rollback <known-good> --yes --timeout 3m`, where

@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { createFakeGh } from './helpers/fakegh-env.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import {
-  DEADLINE_MS, MAIN_TTL_MS, TIMEOUT_LINE, UPDATE_COMMAND, cacheDirFor, checkSession, createCache, formatOutput, gatherFacts, installedProblems, messagesFor, readVendoredStamp, reasonLabel, safeStampLabel,
+  DEADLINE_MS, MAIN_TTL_MS, TIMEOUT_LINE, UPDATE_COMMAND, cacheDirFor, checkSession, createCache, formatOutput, gatherFacts, installedProblems, isVendorOwedLine, messagesFor, readVendoredStamp, reasonLabel, safeStampLabel, vendorGuidance, VENDOR_OFFER, VENDOR_PR_TITLE_PREFIX,
 } from '../pipeline/lib/session-version.mjs';
 import { MANIFEST_REL, sha256File, walkFiles } from '../pipeline/lib/installer.mjs';
 
@@ -104,6 +104,75 @@ test('formatOutput: nothing is the empty string; a message is one JSON line with
   assert.equal(out.endsWith('\n'), true);
   assert.equal(out.trim().split('\n').length, 1);
   assert.deepEqual(JSON.parse(out), { systemMessage: 'one\ntwo', hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: 'one\ntwo' } });
+});
+
+// The vendor-owed line is the one finding the owner can act on by just saying yes, so the user-facing line ends with
+// the offer and Claude (only) gets the how-to. Any other finding gets neither.
+const VENDOR_LINE = 'this repo\'s scripts/pipeline is out of date (ccccccc, your install is aaaaaaa) — a `pipeline vendor` PR is owed (2 vendored files differ)';
+const parse = (out) => JSON.parse(out);
+
+test('vendorGuidance: the new PR must be titled with the same prefix the duplicate-PR search uses', () => {
+  assert.equal(VENDOR_PR_TITLE_PREFIX, 'chore(pipeline): vendor');
+  const g = vendorGuidance('aaaaaaa');
+  assert.ok(g.includes(`--search "${VENDOR_PR_TITLE_PREFIX} in:title"`), 'search uses the shared prefix');
+  assert.ok(g.includes(`\`${VENDOR_PR_TITLE_PREFIX} claude-pipeline aaaaaaa\``), 'title instruction uses the shared prefix and the installed sha7');
+  assert.match(g, /title must start with/i);
+});
+
+test('formatOutput: the vendor-owed line ends with the offer in systemMessage; additionalContext carries Claude guidance with the installed sha7 and the existing-PR check', () => {
+  const out = parse(formatOutput([VENDOR_LINE], { installed7: 'aaaaaaa' }));
+  assert.equal(out.systemMessage, `${VENDOR_LINE}${VENDOR_OFFER}`);
+  assert.match(VENDOR_OFFER, /^ — say "open the vendor PR" and Claude opens it$/);
+  const ctx = out.hookSpecificOutput.additionalContext;
+  assert.equal(ctx, `${VENDOR_LINE}\n${vendorGuidance('aaaaaaa')}`);
+  assert.match(ctx, /offer once, early in the session/i);
+  assert.match(ctx, /gh pr list --state open --search "chore\(pipeline\): vendor in:title"/);
+  assert.match(ctx, /title must start with `chore\(pipeline\): vendor`/);
+  assert.match(ctx, /ship resume <N>/);
+  assert.match(ctx, /claude-pipeline aaaaaaa/);
+  assert.match(ctx, /pipeline vendor --repo \./);
+  assert.match(ctx, /new agent\/ branch/);
+  assert.match(ctx, /never on the current branch/i);
+  assert.match(ctx, /never vendor without the owner agreeing/i);
+});
+
+test('formatOutput: the guidance never reaches systemMessage (the owner reads that one)', () => {
+  const out = parse(formatOutput([VENDOR_LINE, 'another line'], { installed7: 'aaaaaaa' }));
+  assert.equal(out.systemMessage, `${VENDOR_LINE}${VENDOR_OFFER}\nanother line`);
+  for (const bit of ['gh pr list', 'ship resume', 'agent/', 'additionalContext', 'never vendor']) assert.equal(out.systemMessage.includes(bit), false, bit);
+});
+
+test('formatOutput: no offer and no guidance for any other finding, or without the installed sha', () => {
+  const others = [
+    ['up to date', []],
+    ['main ahead', [`claude-pipeline main is ahead of your install (aaaaaaa → bbbbbbb): ${own}`]],
+    ['diverged', ['this repo\'s scripts/pipeline (ccccccc) and your installed pipeline (aaaaaaa) have diverged, so it cannot be told which is newer']],
+    ['NEWER warning', messagesFor(facts({ repo: vendored, vendoredVsInstalled: { status: 'behind' } }))],
+    ['timeout', [TIMEOUT_LINE]],
+    ['unresolved', messagesFor(facts({ repo: vendored, vendoredVsInstalled: { status: 'unresolved', reason: 'boom' } }))],
+  ];
+  for (const [name, lines] of others) {
+    const raw = formatOutput(lines);
+    const withOpt = formatOutput(lines, { installed7: 'aaaaaaa' });
+    assert.equal(withOpt, raw, name);
+    if (lines.length > 0) {
+      const o = parse(withOpt);
+      assert.equal(o.systemMessage, lines.join('\n'), name);
+      assert.equal(o.hookSpecificOutput.additionalContext, lines.join('\n'), name);
+    }
+  }
+  // the vendor line, but the installed sha is unknown: nothing is invented
+  assert.equal(formatOutput([VENDOR_LINE]), formatOutput([VENDOR_LINE], {}));
+  assert.equal(parse(formatOutput([VENDOR_LINE])).systemMessage, VENDOR_LINE);
+});
+
+test('isVendorOwedLine: matches only the vendor-owed message messagesFor produces', () => {
+  const [line] = messagesFor(facts({ repo: vendored, vendoredVsInstalled: { status: 'ahead' }, vendorDrift: [{ file: 'a', reason: 'differs' }] }));
+  assert.equal(isVendorOwedLine(line), true);
+  assert.equal(isVendorOwedLine(VENDOR_LINE), true);
+  assert.equal(isVendorOwedLine(`WARNING: this repo's scripts/pipeline is out of date, a \`pipeline vendor\` PR is owed`), false);
+  assert.equal(isVendorOwedLine(TIMEOUT_LINE), false);
+  assert.equal(isVendorOwedLine(undefined), false);
 });
 
 // ---- the cache ---------------------------------------------------------------------------------------------------
@@ -362,8 +431,12 @@ test('hook: a repo whose vendored scripts/pipeline is older and differs -> "vend
   repo.write('scripts/pipeline/VERSION', `1.3.0+${VEND.slice(0, 7)}\n`);
   const r = runHook(home, { cwd: repo.dir, env: hookEnv(gh) });
   assert.equal(r.status, 0, r.stderr);
-  const msg = JSON.parse(r.stdout).systemMessage;
-  assert.match(msg, /^this repo's scripts\/pipeline is out of date \(ccccccc, your install is aaaaaaa\) — a `pipeline vendor` PR is owed \(\d+ vendored files differ\)$/);
+  const out = JSON.parse(r.stdout);
+  assert.match(out.systemMessage, /^this repo's scripts\/pipeline is out of date \(ccccccc, your install is aaaaaaa\) — a `pipeline vendor` PR is owed \(\d+ vendored files differ\) — say "open the vendor PR" and Claude opens it$/);
+  const ctx = out.hookSpecificOutput.additionalContext;
+  assert.equal(ctx.endsWith(vendorGuidance('aaaaaaa')), true);
+  assert.match(ctx, /ship resume <N>/);
+  assert.equal(out.systemMessage.includes('ship resume'), false);
 });
 
 test('hook: a repo vendoring a NEWER pipeline than the install -> the WARNING line', () => {

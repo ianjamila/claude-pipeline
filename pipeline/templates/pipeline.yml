@@ -21,6 +21,9 @@ verify:
   screenshots: .verify/screenshots
   # expected_steps: [install, typecheck, lint, unit, build]   # optional: final-gate then requires the report's steps to
   #                                # equal this list exactly (in order), not the list the report declares for itself
+  # skippable_steps: [db]          # optional: steps verify may skip (report status "skipped" + a reason, e.g. a slow db step
+  #                                # when nothing it depends on changed). final-gate refuses a skipped step not listed here;
+  #                                # absent = no step may be skipped. Every name must also be in expected_steps (when set).
 
 ci:
   required_checks: ["Test integrity", "Hard-stop scan"]   # + your CI job names
