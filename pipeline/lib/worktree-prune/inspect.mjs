@@ -308,9 +308,11 @@ function prefixMayReach(prefix, root, platform) {
 }
 
 // The environment handed to lsof: a UTF-8 locale and nothing else of ours (no tokens or other secrets), plus PATH only when
-// set, because the fallback exe is the bare name 'lsof' and Node resolves it through options.env.PATH.
-function lsofEnv(env = process.env) {
-  return { LC_ALL: 'en_US.UTF-8', LANG: 'en_US.UTF-8', ...(env.PATH ? { PATH: env.PATH } : {}) };
+// set, because the fallback exe is the bare name 'lsof' and Node resolves it through options.env.PATH. PATH is read by name
+// so the hard-stop scan can see exactly which variable leaves this process.
+function lsofEnv() {
+  const path = process.env.PATH;
+  return { LC_ALL: 'en_US.UTF-8', LANG: 'en_US.UTF-8', ...(path ? { PATH: path } : {}) };
 }
 
 // macOS: one `lsof -n -P -w -F pfn` for the whole machine. Fail-closed -> { available: false }: lsof missing, killed or timed
