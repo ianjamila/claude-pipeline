@@ -38,7 +38,8 @@ const runTests = () => new Promise((done) => {
     child = null;
     done({ status, signal, error, timedOut, stdout });
   };
-  const c = spawn(process.execPath, ['--test', ...TESTS], { stdio: ['ignore', 'pipe', 'pipe'] });
+  // spec reporter by name: Node 20/22 print TAP (`# fail N`) when stdout is a pipe, and `count` reads the spec summary
+  const c = spawn(process.execPath, ['--test', '--test-reporter=spec', ...TESTS], { stdio: ['ignore', 'pipe', 'pipe'] });
   child = c;
   c.stdout.setEncoding('utf8');
   c.stdout.on('data', (d) => { stdout += d; });
@@ -93,6 +94,8 @@ for (const { name, file: rel, from, to, defensive } of muts) {
   } finally {
     try { writeFileSync(file, orig); restored = true; } catch (e) { console.error('RESTORE FAILED for ' + file + ': ' + e.message + '\n  original content is saved at ' + backup); }
     if (restored) rmSync(backupDir, { recursive: true, force: true });
+    // the file may still hold the mutation: never run on (a later mutation would take it as the original) or exit 0
+    else process.exit(1);
   }
   if (interrupted) {
     console.error('interrupted by ' + interrupted + ': restored ' + file + ' (backup copy ' + backup + (restored ? ' removed' : ' KEPT') + ').');
