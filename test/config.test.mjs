@@ -607,3 +607,31 @@ test('verify.skippable_steps: optional list of unique step names, each also in e
   assert.equal(unknown.ok, false);
   assert.ok(unknown.errors.some((e) => /verify\.skippable_steps/.test(e) && /sql-arms/.test(e) && /expected_steps/.test(e)), unknown.errors.join('|'));
 });
+
+test('worktrees block: defaults when absent', () => {
+  const r = validateConfig(minimal());
+  assert.equal(r.ok, true, r.errors.join('; '));
+  assert.deepEqual(r.config.worktrees, {
+    mode: 'report',
+    protect: ['foundation', '*.stack'],
+    min_idle_hours: 24,
+    min_merged_hours: 24,
+    delete: ['node_modules/', '.next/', 'supabase/.temp/', 'test-results/', 'playwright-report/', 'next-env.d.ts', 'public/sw.js', 'tsconfig.tsbuildinfo', '*.log'],
+    archive: ['.review/', '.verify/'],
+    memory_dirs: ['~/claude-memory'],
+  });
+});
+
+test('worktrees block: rejects a bad mode, unknown key, non-positive hours', () => {
+  const r = validateConfig({ ...minimal(), worktrees: { mode: true, min_idle_hours: 0, bogus: 1 } });
+  assert.equal(r.ok, false);
+  assert.ok(has(r, 'worktrees.mode'));
+  assert.ok(has(r, 'worktrees.min_idle_hours'));
+  assert.ok(has(r, 'unknown key: worktrees.bogus'));
+});
+
+test('worktrees block: a path in delete must not also be in archive', () => {
+  const r = validateConfig({ ...minimal(), worktrees: { delete: ['.review/'] } });
+  assert.equal(r.ok, false);
+  assert.ok(has(r, 'worktrees: .review/ is in both delete and archive'));
+});
