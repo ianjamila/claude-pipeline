@@ -83,10 +83,10 @@ const fenced = (obj) => `Done.\n\n\`\`\`json\n${JSON.stringify(obj)}\n\`\`\``;
 
 // By default the feature commit is big enough (>= 50 changed lines) to be off the light lane, so the arbiter rules apply in
 // full; `light: true` keeps the change tiny.
-function world(t, { gh = GH, light = false } = {}) {
+function world(t, { gh = GH, light = false, yml = pipelineYml() } = {}) {
   const repo = createTmpRepo();
   t.after(() => repo.cleanup());
-  repo.write('.claude/pipeline.yml', pipelineYml());
+  repo.write('.claude/pipeline.yml', yml);
   repo.write('src/a.js', aFile(false));
   repo.write('src/b.js', bFile);
   const base = repo.commit('init');
@@ -2075,4 +2075,134 @@ test('summary reads model proofs from the state rounds, the files only as a fall
   writeFileSync(w.roundFile(1, 'model-proof.json'), JSON.stringify({ ok: true, transcript: '/t/from-file.jsonl', models: { 'claude-fable-5-1': 1 }, efforts: { high: 1 } }));
   assertExit(w.cli(['summary', '--pr', '7', '--outcome', 'merged']), 0);
   assert.ok(body().includes('from-file.jsonl'));
+});
+
+// ---- triage owner-ruling (owner_approval: chat) -----------------------------------------------
+
+const CHAT_YML = `${pipelineYml()}owner_approval: chat\n`;
+const QUOTE = 'Yes, file it as a follow-up, not part of this PR.';
+
+// A round whose listed items an arbiter left waiting for a human (what `arbiter apply` does on a failed model proof).
+function waitingForHuman(w, decisions) {
+  const state = w.state();
+  for (const item of state.rounds[0].items) {
+    if (decisions[item.id]) item.final = { decision: decisions[item.id], by: 'arbiter', needsHuman: true, reason: 'model-proof failed' };
+  }
+  writeFileSync(join(w.repo.dir, '.review', 'state.json'), JSON.stringify(state));
+}
+const rule = (id, decision, { quote = QUOTE, reason = 'owner confirmed in chat', extra = [] } = {}) =>
+  ['triage', 'owner-ruling', '--round', '1', '--id', id, '--decision', decision, '--reason', reason, '--owner-quote', quote, ...extra];
+
+test('triage owner-ruling: refused in label mode, for an item that needs no human, a missing item, an empty quote or reason', (t) => {
+  const label = world(t);
+  assertExit(label.codex(1, findingsOf([finding()])), 0);
+  waitingForHuman(label, { 'R1-B1': 'FOLLOW-UP' });
+  const refused = label.cli(rule('R1-B1', 'FOLLOW-UP'));
+  assertExit(refused, 1);
+  assert.match(refused.json.reason, /owner_approval: chat/);
+  assert.equal(label.item('R1-B1').final.by, 'arbiter', 'state untouched');
+
+  const w = world(t, { yml: CHAT_YML });
+  assertExit(w.codex(1, findingsOf([finding()], [finding({ title: 'Rename helper', file: 'src/b.js', line: 3 })])), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'], 'R1-S1': ['ACCEPT'] }), 0);
+  waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP' });
+  const settledItem = w.cli(rule('R1-S1', 'ACCEPT'));
+  assertExit(settledItem, 1);
+  assert.match(settledItem.json.reason, /does not need a human/);
+  assert.equal(w.item('R1-S1').final.by, 'judge');
+  const missing = w.cli(rule('R1-X9', 'REJECT'));
+  assertExit(missing, 1);
+  assert.match(missing.json.reason, /no item R1-X9 in round 1/);
+  assertExit(w.cli(rule('R1-B1', 'FOLLOW-UP', { quote: '   ' })), 1);
+  assertExit(w.cli(rule('R1-B1', 'FOLLOW-UP', { reason: ' ' })), 1);
+  assertExit(w.cli(rule('R1-B1', 'FOLLOW-UP', { quote: 'x'.repeat(1001) })), 1);
+  assertExit(w.cli(rule('R1-B1', 'FOLLOW-UP', { extra: ['--pr', '99'] })), 1, 'a PR number that is not the review state\'s');
+  assertExit(w.cli(rule('R1-B1', 'MAYBE')), 2);
+  assertExit(w.cli(['triage', 'owner-ruling', '--round', '1', '--id', 'R1-B1', '--decision', 'REJECT', '--reason', 'r']), 2, 'no --owner-quote at all');
+  assertExit(w.cli(['triage', 'owner-ruling', '--round', '9', '--id', 'R1-B1', '--decision', 'REJECT', '--reason', 'r', '--owner-quote', 'q']), 2);
+  assert.equal(w.item('R1-B1').final.by, 'arbiter', 'every refusal left the state untouched');
+});
+
+test('triage owner-ruling: records the owner ruling, keeps the overruled final, and clears the needs-human block', (t) => {
+  const w = world(t, { yml: CHAT_YML });
+  assertExit(w.codex(1, findingsOf([finding()], [finding({ title: 'Rename helper', file: 'src/b.js', line: 3 })])), 0);
+  waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP', 'R1-S1': 'REJECT' });
+  assert.deepEqual(w.cli(['state', 'outcome']).json.needsHuman, ['R1-B1', 'R1-S1']);
+
+  const r = w.cli(rule('R1-B1', 'FOLLOW-UP', { extra: ['--pr', '7'] }));
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.ok, true);
+  const final = w.item('R1-B1').final;
+  assert.deepEqual({ ...final, ruledAt: undefined }, {
+    decision: 'FOLLOW-UP', by: 'owner', needsHuman: false, reason: 'owner confirmed in chat', ownerQuote: QUOTE, ruledAt: undefined,
+    overruled: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, reason: 'model-proof failed' },
+  });
+  assert.ok(!Number.isNaN(Date.parse(final.ruledAt)));
+  assert.deepEqual(r.json.final, final);
+  assert.equal(w.cli(['state', 'outcome']).json.clean, false, 'one item still waits');
+  assertExit(w.cli(rule('R1-S1', 'REJECT')), 0);
+  const outcome = w.cli(['state', 'outcome']).json;
+  assert.deepEqual(outcome.needsHuman, []);
+  assert.equal(outcome.clean, true, JSON.stringify(outcome));
+  assertExit(w.cli(rule('R1-S1', 'ACCEPT')), 1, 'an item the owner already ruled is settled: no second ruling');
+});
+
+test('triage owner-ruling: ACCEPT stays unclean until the fix is built and a later round reviews it', (t) => {
+  const w = world(t, { yml: CHAT_YML });
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  waitingForHuman(w, { 'R1-B1': 'REJECT' });
+  assertExit(w.cli(rule('R1-B1', 'ACCEPT')), 0);
+  assert.notEqual(w.item('R1-B1').implemented, true, 'ACCEPT still has to be built');
+  const open = w.cli(['state', 'outcome']).json;
+  assert.equal(open.clean, false);
+  assert.deepEqual(open.unimplemented, ['R1-B1']);
+  w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
+  const head2 = w.repo.commit('fix');
+  assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']), 0);
+  assert.equal(w.cli(['state', 'outcome']).json.clean, false, 'built but not yet re-reviewed');
+  assertExit(w.codex(2, findingsOf(), { from: w.head, to: head2 }), 0);
+  assert.equal(w.cli(['state', 'outcome']).json.clean, true);
+});
+
+test('triage owner-ruling: works on a published round, and a state rebuilt from the triage comment keeps the ruling', (t) => {
+  const w0 = world(t, { yml: CHAT_YML });
+  assertExit(w0.codex(1, findingsOf([finding()])), 0);
+  waitingForHuman(w0, { 'R1-B1': 'FOLLOW-UP' });
+  assertExit(w0.cli(rule('R1-B1', 'FOLLOW-UP')), 0);
+  const ruled = w0.state();
+  const gh = [
+    ...GH,
+    { match: '^api user', stdout: 'me\n' },
+    { match: 'issues/7/comments --paginate', stdoutJson: [{ id: 9, user: { login: 'me' }, body: triageComment(ruled) }] },
+  ];
+  const w = world(t, { gh, yml: CHAT_YML });
+  const shown = w.cli(['state', 'show', '--pr', '7']);
+  assertExit(shown, 0, shown.stderr + shown.stdout);
+  assert.equal(shown.json.recovered, true);
+  assert.deepEqual(w.item('R1-B1').final, ruled.rounds[0].items[0].final);
+  assert.ok(triageComment(w.state()).includes(`owner (chat): ${QUOTE}`));
+});
+
+test('followups create: a FOLLOW-UP ruled by the owner is filed, one that is still waiting for a human is held', (t) => {
+  const url = 'https://github.com/acme/widgets/issues/31';
+  const w = world(t, { yml: CHAT_YML, gh: [...GH, ...NO_ISSUES, { match: '^api -X POST repos/acme/widgets/issues ', stdoutJson: { number: 31, html_url: url } }] });
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP' });
+  const held = w.cli(['followups', 'create', '--round', '1']);
+  assert.deepEqual([held.json.held, held.json.created], [['R1-B1'], []]);
+  assertExit(w.cli(rule('R1-B1', 'FOLLOW-UP')), 0);
+  const r = w.cli(['followups', 'create', '--round', '1']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual(r.json.created, [{ id: 'R1-B1', number: 31, url }]);
+  const post = w.fake.calls().find((c) => c.argv.join(' ').startsWith('api -X POST repos/acme/widgets/issues '));
+  assert.ok(JSON.parse(post.stdin).body.includes('**Owner (why this is a follow-up, not part of the PR):** owner confirmed in chat'));
+});
+
+test('arbiter needed: returns promptHeader, exactly the ROUND / INPUT-DIGEST header of the input file', (t) => {
+  const w = readyForArbiter(t);
+  const r = w.cli(['arbiter', 'needed', '--round', '1']);
+  assertExit(r, 0);
+  assert.equal(r.json.promptHeader, `ROUND: 1\nINPUT-DIGEST: ${r.json.digest}`);
+  assert.ok(readFileSync(r.json.inputPath, 'utf8').startsWith(`${r.json.promptHeader}\n\n`));
+  assert.equal(arbiterRun(w, { prompt: `${r.json.promptHeader}\nRule on every item.` }).code, 0, 'a prompt that starts with the header passes the proof');
 });

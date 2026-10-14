@@ -19,7 +19,7 @@ import { findDeployment } from './deploy.mjs';
 import { toPosix } from './paths.mjs';
 import { loadState } from './state.mjs';
 import { parseYaml } from './yaml.mjs';
-import { reviewValidFor } from './triage.mjs';
+import { ownerRuledItems, reviewValidFor } from './triage.mjs';
 import { skipOf } from './verify-steps.mjs';
 import { commitTime, diffFiles, headSha, mergeBase, revParse, reviewBaseRef, reviewContentHash, treeFingerprint } from './git.mjs';
 
@@ -334,6 +334,10 @@ function integrityCheck({ config, diff }) {
   return check('integrity', false, `${r.violations.length} test-integrity violation(s): ${shown}`);
 }
 
+// How many owner-ruled items the review detail lists, and how much of each quote.
+const OWNER_RULED_SHOWN = 5;
+const OWNER_QUOTE_SHOWN = 100;
+
 function reviewCheck({ root, config, pr, diff, hash, hashError }) {
   const d = diff();
   if (!d.ok) return check('review', false, `could not diff against the base: ${d.error}`);
@@ -345,6 +349,13 @@ function reviewCheck({ root, config, pr, diff, hash, hashError }) {
   if (!hash) return check('review', false, `cannot compute the content hash: ${hashError}`);
   if (!reviewValidFor(state, hash)) {
     return check('review', false, `no clean review round covers the current content (${short(hash)}), or findings are unresolved`);
+  }
+  // owner_approval: chat: an item the owner ruled in chat (an original or a later round's cached copy) never clears the merge by
+  // itself. It stays visible here and counts as ownerMerge, so the owner's "merge" for this head is still needed.
+  const ruled = ownerRuledItems(state);
+  if (ruled.length > 0) {
+    const shown = ruled.slice(0, OWNER_RULED_SHOWN).map((i) => `${i.id} "${clip(String(i.final.ownerQuote).replace(/\s+/g, ' ').trim(), OWNER_QUOTE_SHOWN)}"`).join('; ');
+    return check('review', true, `review valid for content ${short(hash)}; ${ruled.length} owner-ruled item(s), owner-merge: ${shown}${ruled.length > OWNER_RULED_SHOWN ? '; ...' : ''}`, ruled.length);
   }
   return check('review', true, `review valid for content ${short(hash)}`);
 }

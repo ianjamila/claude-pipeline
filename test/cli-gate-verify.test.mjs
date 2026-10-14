@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { saveState } from '../pipeline/lib/state.mjs';
+import { addRound, saveState } from '../pipeline/lib/state.mjs';
 import { treeFingerprint } from '../pipeline/lib/git.mjs';
 import { cli, scenario, ghEntries, reviewState, named, assertOnlyFails, bump, ymlFor, STEPS, PR, AGENT_LOG } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
@@ -230,4 +230,46 @@ test('final-gate: a long skip reason is cut to about 80 characters in the detail
   const detail = named(r.json, 'verify-report').detail;
   assert.match(detail, /skipped: unit — x{70,85}…\)/);
   assert.ok(detail.length < 200, detail);
+});
+
+// ---- final-gate: owner-ruled review items ---------------------------------------------------------
+
+const ownerItem = (id, over = {}) => ({
+  id, bucket: 'BLOCKING', title: 'a finding', fingerprint: `fp-${id}`,
+  final: {
+    decision: 'FOLLOW-UP', by: 'owner', needsHuman: false, reason: 'filed', ownerQuote: 'file it for later',
+    ruledAt: '2026-10-14T01:02:03.000Z', overruled: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, reason: 'model-proof failed' },
+  },
+  ...over,
+});
+
+test('final-gate: owner-ruled review items (also cached copies in later rounds) pass review but count as ownerMerge with their quotes', () => {
+  const s = scenario({ yml: `${ymlFor()}owner_approval: chat\n` });
+  let state = reviewState(s.hash);
+  state.rounds[0].items = [ownerItem('R1-B1')];
+  state = addRound(state, {
+    n: 2, fromHead: 'b', toHead: 'c', contentHashAtToHead: s.hash,
+    items: [{ ...ownerItem('R2-B1'), final: { ...ownerItem('R1-B1').final, by: 'cache' } }],
+  });
+  saveState(s.repo.dir, state);
+  const r = s.gate();
+  assertExit(r, 0, r.stderr + r.stdout);
+  const review = named(r.json, 'review');
+  assert.equal(review.ok, true);
+  assert.equal(review.ownerMerge, 2);
+  for (const needle of ['R1-B1', 'R2-B1', 'file it for later']) assert.ok(review.detail.includes(needle), review.detail);
+  assert.equal(r.json.ownerMerge, 2, 'the gate total tells the ship skill the owner must say "merge"');
+});
+
+test('final-gate: a review with no owner rulings has no ownerMerge, and an unresolved item still fails review even when others are owner-ruled', () => {
+  const plain = scenario();
+  const r = plain.gate();
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(named(r.json, 'review').ownerMerge, undefined);
+
+  const s = scenario({ yml: `${ymlFor()}owner_approval: chat\n` });
+  const state = reviewState(s.hash);
+  state.rounds[0].items = [ownerItem('R1-B1'), { id: 'R1-B2', bucket: 'BLOCKING', title: 'open', judge: { decision: 'ACCEPT', confidence: 'high', reason: 'x' } }];
+  saveState(s.repo.dir, state);
+  assertOnlyFails(s.gate(), 'review', /unresolved/);
 });
