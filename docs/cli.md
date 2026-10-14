@@ -542,7 +542,8 @@ is still `unsupported-platform`: "schedule is only supported on Linux (cron) and
   ignored) and `launchctl bootstrap gui/<uid> <plist>`; so a repeat install also reloads the job. A failing bootstrap is exit 2
   `{error: "launchctl"}`. The result is `{ok, installed, line, plist, changed, timezone, warning?, note}` (`line` is the plist
   path); `timezone` comes from the `/etc/localtime` link, and `warning` fires when it is not `Asia/Manila` or unreadable.
-- `--remove` boots the job out and deletes the plist: `{ok, removed}`. `--status` is `{ok, installed, line, plist, loaded}`:
+- `--remove` boots the job out, checks with `launchctl print` that it is really gone, and only then deletes the plist: `{ok, removed}`;
+  a job that is still loaded is exit 2 `{error: "launchctl", message: "could not unload <label>: …"}` and the plist stays. `--status` is `{ok, installed, line, plist, loaded}`:
   `installed` means the plist exists **and** launchd has it loaded; `line` is the plist path (or `null` when it is missing).
 - Check by hand: `launchctl print gui/$(id -u)/<label>`.
 

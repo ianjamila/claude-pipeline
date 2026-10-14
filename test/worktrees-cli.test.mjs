@@ -888,16 +888,32 @@ test('schedule --install on macOS: git or gh not found refuses with exit 2 and w
   assert.equal(w.lc.calls.length, 0);
 });
 
-test('schedule --remove on macOS: bootout, then the plist is deleted; absent is removed:false (bootout failure ignored)', async () => {
+test('schedule --remove on macOS: bootout, confirm unloaded with print, then the plist is deleted; absent is removed:false (bootout failure ignored)', async () => {
   const w = darwinWorld();
   await w.drun(['--install']);
-  w.lc.calls.length = 0;
-  const rm = await w.drun(['--remove']);
+  const unloaded = fakeLaunchctl({ print: { code: 113 } }); // after bootout the job is gone
+  const rm = await w.drun(['--remove'], { launchctlFn: unloaded.fn });
   assert.deepEqual([rm.exitCode, rm.output.ok, rm.output.removed], [0, true, true]);
   assert.equal(existsSync(w.plistPath), false);
-  assert.deepEqual(w.lc.calls, [['bootout', `gui/501/${w.label}`]]);
-  const none = await w.drun(['--remove'], { launchctlFn: fakeLaunchctl({ bootout: { code: 3 } }).fn });
+  assert.deepEqual(unloaded.calls, [['bootout', `gui/501/${w.label}`], ['print', `gui/501/${w.label}`]]);
+  const none = await w.drun(['--remove'], { launchctlFn: fakeLaunchctl({ bootout: { code: 3 }, print: { code: 113 } }).fn });
   assert.deepEqual([none.exitCode, none.output.removed], [0, false]);
+});
+
+test('schedule --remove on macOS: bootout fails and the job is still loaded -> exit 2 error launchctl, the plist stays', async () => {
+  const w = darwinWorld();
+  await w.drun(['--install']);
+  const stuck = fakeLaunchctl({ bootout: { code: 5, stderr: 'Boot-out failed: 5: Input/output error\n' } }); // print keeps answering 0 = still loaded
+  const rm = await w.drun(['--remove'], { launchctlFn: stuck.fn });
+  assert.equal(rm.exitCode, 2);
+  assert.equal(rm.output.ok, false);
+  assert.equal(rm.output.error, 'launchctl');
+  assert.equal(rm.output.message, `could not unload ${w.label}: Boot-out failed: 5: Input/output error`);
+  assert.equal(existsSync(w.plistPath), true, 'a still-loaded job keeps its plist so the next remove can retry');
+  assert.deepEqual(stuck.calls, [['bootout', `gui/501/${w.label}`], ['print', `gui/501/${w.label}`]]);
+  const silent = await w.drun(['--remove'], { launchctlFn: fakeLaunchctl({ bootout: { code: 7 } }).fn });
+  assert.equal(silent.output.message, `could not unload ${w.label}: exit 7`, 'no stderr -> the exit code');
+  assert.equal(existsSync(w.plistPath), true);
 });
 
 test('schedule --status on macOS: installed only when the plist exists AND launchctl print succeeds', async () => {
@@ -916,13 +932,13 @@ test('schedule --status on macOS: installed only when the plist exists AND launc
   assert.deepEqual([gone.output.installed, gone.output.loaded, gone.output.line], [false, false, null]);
 });
 
-test('applyLaunchd status only probes with print; remove only boots out; neither bootstraps', () => {
+test('applyLaunchd status only probes with print; remove boots out and probes; neither bootstraps', () => {
   const home = tmp('cp-wthome-');
   const plistPath = join(home, 'x.plist');
-  const lc = fakeLaunchctl();
+  const lc = fakeLaunchctl({ print: { code: 113 } });
   applyLaunchd({ action: 'status', plistPath, label: 'l', launchctlFn: lc.fn, uid: 7 });
   applyLaunchd({ action: 'remove', plistPath, label: 'l', launchctlFn: lc.fn, uid: 7 });
-  assert.deepEqual(lc.calls, [['print', 'gui/7/l'], ['bootout', 'gui/7/l']]);
+  assert.deepEqual(lc.calls, [['print', 'gui/7/l'], ['bootout', 'gui/7/l'], ['print', 'gui/7/l']]);
 });
 
 test('schedule: exactly one of --install / --remove / --status; --at only with --install; no NAME', async () => {

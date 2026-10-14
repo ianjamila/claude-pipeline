@@ -279,8 +279,10 @@ const DARWIN_TZ_SOURCES = [REAL_SOURCES[1]];
 // launchctl through the same runner as crontab; code/stdout/stderr come back as-is.
 const systemLaunchctl = (args) => runProc('launchctl', args);
 
-// Install / remove / report the LaunchAgent. bootout and the `print` probe may fail for a job that is not loaded, so their
-// results are only read, never thrown; a failing bootstrap is the one launchctl error that stops the install.
+// Install / remove / report the LaunchAgent. bootout and the `print` probe may fail for a job that is not loaded, so on install
+// their results are only read, never thrown (a failing bootstrap is the launchctl error that stops it, and it fails too when
+// the old job is still loaded). Remove cannot take that shortcut: it asks `print` whether the job is really gone and refuses
+// to delete the plist, or report success, while it is still loaded.
 export function applyLaunchd({ action, plist, plistPath, label, launchctlFn, tzFn, uid }) {
   const domain = `gui/${uid}`;
   const target = `${domain}/${label}`;
@@ -291,7 +293,10 @@ export function applyLaunchd({ action, plist, plistPath, label, launchctlFn, tzF
     return { installed: exists && loaded, line: exists ? plistPath : null, plist: plistPath, loaded };
   }
   if (action === 'remove') {
-    bootout();
+    const out = bootout();
+    if (launchctlFn(['print', target]).code === 0) {
+      throw new Fail(EXIT.USAGE, { ok: false, error: 'launchctl', message: `could not unload ${label}: ${out.stderr?.trim() || `exit ${out.code}`}` });
+    }
     const had = existsSync(plistPath);
     if (had) rmSync(plistPath);
     return { removed: had };
