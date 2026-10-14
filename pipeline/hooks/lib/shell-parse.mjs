@@ -823,7 +823,12 @@ function inlineCodeIndex(name, argv) {
 }
 
 // groups: the exact files, one array per producer in the order it names them (what `st.files` was filled from), so the join can be rebuilt
-const newSt = () => ({ dyn: false, unordered: false, mixed: false, files: [], groups: [], computed: [], raws: [], pat: new Set(), unq: new Set(), ops: new Set() });
+// seq: the stream's parts in the order its producers run ({text} a static producer prints, {file} an exact reader's file, {scan} a rewriting producer's word); see producePieces
+// ordered: set while producePieces records seq (a static producer then does not make the stream `mixed` by itself)
+// unordered: the producers' texts may not make the stream in the order recorded (one may stop the group, print elsewhere, not run, run in the background); unsure:
+// the same except stopping the group, which only cuts the stream short (a guarded word found in a part of it is in the whole: the scan of a rewritten stream holds)
+const newSt = () => ({ dyn: false, unordered: false, unsure: false, mixed: false, ordered: false, seq: [], whole: new Set(), files: [], groups: [], computed: [], raws: [], pat: new Set(), unq: new Set(), ops: new Set() });
+const hasTextPiece = (seq) => (seq ?? []).some((p) => Object.hasOwn(p, 'text'));
 
 // Adds what `b` collected to `a` (a descriptor opened twice, a variable assigned twice: both may be read).
 function mergeSt(a, b) {
@@ -831,10 +836,14 @@ function mergeSt(a, b) {
   for (const x of [a, b]) {
     out.dyn = out.dyn || x.dyn;
     out.unordered = out.unordered || x.unordered;
+    out.unsure = out.unsure || x.unsure;
     out.mixed = out.mixed || x.mixed;
-    out.files.push(...x.files); out.groups.push(...x.groups); out.computed.push(...x.computed); out.raws.push(...x.raws);
-    for (const k of ['pat', 'unq', 'ops']) for (const w of x[k]) out[k].add(w);
+    out.files.push(...x.files); out.groups.push(...x.groups); out.computed.push(...x.computed); out.raws.push(...x.raws); out.seq.push(...x.seq);
+    for (const k of ['pat', 'unq', 'ops', 'whole']) for (const w of x[k]) out[k].add(w);
   }
+  // (two texts that may each be read are not one stream: static text in either cannot be placed)
+  const some = (x) => x.files.length || x.computed.length || x.seq.length;
+  if ((hasTextPiece(a.seq) || hasTextPiece(b.seq)) && some(a) && some(b)) out.mixed = true;
   return out;
 }
 
@@ -850,6 +859,15 @@ function noteVarFeeds(ctx, name, subs) {
   e.raws.push(...st.raws);
   const prev = ctx.varFeeds.get(name);
   ctx.varFeeds.set(name, prev ? mergeSt(prev, e) : e);
+}
+
+// Why: a substitution's files are the exact script text only when one quoted substitution is the whole script (`eval "$(cat f)"`, `bash -c "$(cat f)"`). Unquoted it is
+// split into words (`eval $(cat f)`, `$(cat f)`: f's lines become ONE command), eval joins several words with spaces and text around it is added to it (`eval "x $(cat f)"`):
+// the files are then scanned, like a variable that holds a file's text (noteVarFeeds).
+function scannedSubs(st) {
+  for (const w of st.files) { st.computed.push(w); st.pat.add(w); st.ops.add(w); st.whole.add(w); }
+  st.files.length = 0;
+  st.groups.length = 0;
 }
 
 // The feeds of the variables `text` refers to (`$X`, `${X}`, `"$X"`), added to `st`; `seg.vf` is the line's table of variables that hold file text.
@@ -899,10 +917,10 @@ function noteReads(seg, name, argv, st, exact) {
     if (!noFile && !argOnly) st.ops.add(w);
   }
   if (group.length) st.groups.push(group);
-  if (group.length && seg.sep === '&') st.unordered = true; // (a job in the background: the order it prints in, among the others, is not known)
+  if (group.length && seg.sep === '&') st.unordered = st.unsure = true; // (a job in the background: the order it prints in, among the others, is not known)
   // Why: a producer that may not run (after && / ||, in an if / case branch, a loop, a function body or a trap action) leaves its text out of the stream, or
   // repeats it: `{ cat a; false && cat b; cat c; } | bash` runs a+c, which the join a+b+c hides (Codex review 3 of #50). Such a join is not rebuilt (refused).
-  if (group.length && (seg.sep === '&&' || seg.sep === '||' || Object.values(seg.ctl ?? {}).some(Boolean))) st.unordered = true;
+  if (group.length && (seg.sep === '&&' || seg.sep === '||' || Object.values(seg.ctl ?? {}).some(Boolean))) st.unordered = st.unsure = true;
   if (words.length) st.raws.push(seg.raw);
 }
 
@@ -913,6 +931,96 @@ function subsProduced(subs, st, hops) {
   const out = [];
   for (const s of subs) out.push(...producedBy(s, st, hops, !piped.has(s)));
   return out;
+}
+
+// The exact text a static producer prints, or null when it cannot be rebuilt exactly: echo (its newline; `-n`), printf with a format of plain text, `%s`, `%%`
+// and `\n` (the format is reused for the arguments left), cat of a quoted heredoc (its last newline; `<<-` strips the tabs) or of a here-string. An expansion,
+// a backslash echo may interpret (zsh's does by default), an option, another format or an unquoted heredoc that expands is not rebuilt.
+function staticOutput(seg) {
+  const pa = seg.final ? seg.final.argv : [];
+  const pn = pa.length ? base(pa[0]) : '';
+  if (pn === 'echo' || pn === 'printf') {
+    if (seg.heredocs.length || seg.herestrings.length || pa.slice(1).some((w) => seg.meta.has(w) || seg.pat.has(w))) return null;
+  }
+  if (pn === 'echo') {
+    const nl = pa[1] === '-n' ? '' : '\n';
+    const words = pa.slice(nl ? 1 : 2);
+    if (words[0]?.startsWith('-') || words.some((w) => w.includes('\\'))) return null;
+    return words.join(' ') + nl;
+  }
+  if (pn === 'printf') {
+    const fmt = pa[1];
+    if (fmt === undefined || fmt.startsWith('-')) return null;
+    const toks = fmt.match(/%s|%%|\\n|[^%\\]+/g) ?? [];
+    if (toks.join('') !== fmt) return null;
+    const args = pa.slice(2);
+    const n = toks.filter((t) => t === '%s').length;
+    let out = '';
+    let k = 0;
+    do {
+      for (const t of toks) out += t === '%s' ? args[k++] ?? '' : t === '%%' ? '%' : t === '\\n' ? '\n' : t;
+    } while (n > 0 && k < args.length);
+    return out;
+  }
+  if (pn === 'cat' && pa.length === 1 && !seg.stdinFiles.length && seg.heredocs.length + seg.herestrings.length === 1) {
+    const h = seg.heredocs[0];
+    if (h) {
+      if (!h.lines || (!h.quoted && /[$`\\]/.test(h.text))) return null; // (no line: '' and one empty line look alike)
+      return h.text + '\n'; // (`<<-` tabs already stripped: readHeredocs)
+    }
+    const hs = seg.herestrings[0];
+    return hs.dyn || hs.subs.length ? null : hs.text + '\n';
+  }
+  return null;
+}
+
+// Why: static text (echo, printf, a heredoc) and files in ONE stream (`{ echo "begin;"; cat m.sql; cat <<'SQL' ... SQL } | psql`, daily database work): the stream
+// is rebuilt from what each producer prints, in the order they run (st.seq), and judged as one text (scriptFeedsOf). `stages`: the stream's producers in source order
+// (a pipeline's earlier commands feed its last one: their part is the last one's), `run(s)`: producedBy for one of them, returning the texts it adds. A producer whose
+// static text cannot be rebuilt exactly (staticOutput) or comes with files makes the stream `mixed`; one that may not run (after && / ||, in a branch or loop,
+// in the background) makes it `unsure`: either is refused when static text and files feed one program (scriptFeedsOf).
+function producePieces(stages, st, run) {
+  const onward = new Set();
+  for (const s of stages) for (const p of s.pipedFrom ?? []) onward.add(p);
+  const was = st.ordered;
+  st.ordered = true;
+  const out = [];
+  try {
+    let mark = null;
+    let texts = 0;
+    let piped = false;
+    for (const s of stages) {
+      if (!mark) { mark = { files: st.files.length, computed: st.computed.length }; texts = 0; piped = false; }
+      const t = run(s);
+      out.push(...t);
+      texts += t.length;
+      if (s.pipedFrom?.length) piped = true;
+      if (onward.has(s)) continue; // (its output is the next command's input)
+      const files = st.files.slice(mark.files);
+      const computed = st.computed.slice(mark.computed);
+      mark = null;
+      const may = s.sep === '&' || s.sep === '&&' || s.sep === '||' || Object.values(s.ctl ?? {}).some(Boolean);
+      if (may && (texts || files.length || computed.length)) st.unsure = true;
+      if (!texts) {
+        for (const w of files) st.seq.push({ file: w });
+        for (const w of computed) st.seq.push({ scan: w });
+        continue;
+      }
+      const text = files.length || computed.length || piped ? null : staticOutput(s);
+      if (text === null) { st.mixed = true; continue; }
+      if (text !== '') st.seq.push({ text });
+    }
+  } finally { st.ordered = was; }
+  return out;
+}
+
+// Whether `st.seq` is the whole stream st describes: its file parts are st.files in order, its scan parts st.computed (anything added outside producePieces --
+// `< F`, a descriptor, a client's -f file -- leaves it incomplete, so static text in it cannot be placed).
+function seqCovers(st) {
+  const files = st.seq.filter((p) => Object.hasOwn(p, 'file')).map((p) => p.file);
+  const scans = st.seq.filter((p) => Object.hasOwn(p, 'scan')).map((p) => p.scan).sort();
+  const comp = [...st.computed].sort();
+  return files.length === st.files.length && files.every((w, i) => w === st.files[i]) && scans.length === comp.length && scans.every((w, i) => w === comp[i]);
 }
 
 // Static text a command writes to stdout (or hands a shell on stdin): its heredocs and here-strings, and what
@@ -934,10 +1042,11 @@ function producedBy(seg, st, hops = 0, exact = true) {
   // elsewhere (`cat b >&2`, `> /dev/null`) adds nothing, and a command between them that is no reader and no static text (`exit`, a test, `false` under set -e)
   // may stop the group and drop the producers after it (`a`+`b` pushes main while the joined `a`+`b`+`c` reads main-feature). Such a join is refused (unordered).
   const OUT = ['>', '>>', '>|', '&>', '&>>', '>&'];
-  if ((seg.redirects ?? []).some((r) => OUT.includes(r.op) && (r.fd === null || r.fd === undefined || r.fd === 1) && r.target !== '&1')) st.unordered = true;
+  if ((seg.redirects ?? []).some((r) => OUT.includes(r.op) && (r.fd === null || r.fd === undefined || r.fd === 1) && r.target !== '&1')) st.unordered = st.unsure = true;
   if (pa.length && !['echo', 'printf', 'true', ':'].includes(pn) && !Object.hasOwn(READERS, pn)) st.unordered = true;
-  // (static text in the same stream as files, `{ cat a; printf %s sh; cat b; }`: the files are judged joined without it, so the stream is not rebuilt -- Codex recheck of a5c0e5a)
-  if (seg.heredocs.length || seg.herestrings.length || pn === 'echo' || pn === 'printf') st.mixed = true;
+  // (static text in the same stream as files, `{ cat a; printf %s sh; cat b; }`: the files would be judged joined without it -- Codex recheck of a5c0e5a. Only a
+  // stream producePieces records is rebuilt with it; anywhere else (`eval "$(echo x; cat f)"`, a variable, xargs) it is not)
+  if (!st.ordered && (seg.heredocs.length || seg.herestrings.length || pn === 'echo' || pn === 'printf')) st.mixed = true;
   noteReads(seg, pn, pa, st, exact);
   if (pn === 'echo' || pn === 'printf') {
     for (const a of pa.slice(1)) {
@@ -973,22 +1082,35 @@ function stdinSource(seg) {
   let fed = seg.stdinSubs.length > 0 || (seg.pipedFrom !== null && seg.pipedFrom.length > 0);
   let fedTexts = 0;
   for (const hs of seg.herestrings) {
-    texts.push(hs.text);
+    // (`bash <<< "$(cat f)"`: the text is what the substitution prints, judged below; the word itself read as script would be a command word, which is split. Only
+    // files read as they are: a program's output is unknown text, and reading the word again keeps what that means)
+    const shape = hs.subs.length > 0 && !hs.subs.some((x) => x.split) && (hs.text.match(/\$\(|`/g) ?? []).length === 1 && /^(?:\$\(|`)/.test(hs.text) && /[)`]$/.test(hs.text);
+    const before = { files: st.files.length, computed: st.computed.length, dyn: st.dyn };
+    const produced = subsProduced(hs.subs, st, 1);
+    const whole = shape && st.files.length > before.files && st.computed.length === before.computed && st.dyn === before.dyn;
+    if (!whole) texts.push(hs.text);
     if (hs.dyn) st.dyn = true;
-    texts.push(...subsProduced(hs.subs, st, 1));
+    texts.push(...produced);
     varFeedsInto(seg, hs.text, st);
   }
-  { const t = subsProduced(seg.stdinSubs, st, 1); fedTexts += t.length; texts.push(...t); }
+  { const t = producePieces(seg.stdinSubs, st, (s) => producedBy(s, st, 1, !seg.stdinSubs.some((x) => x.pipedFrom?.includes(s)))); fedTexts += t.length; texts.push(...t); }
+  const subsSeq = st.seq.length;
   const walk = (stage, hops) => {
-    if (hops > 8) return;
+    if (hops > 8) return [];
+    const got = [];
     for (const p of stage) {
-      const t = producedBy(p, st, 0, hops === 0);
-      fedTexts += t.length;
-      texts.push(...t);
-      if (p.pipedFrom) walk(p.pipedFrom, hops + 1);
+      got.push(...producedBy(p, st, 0, hops === 0));
+      if (p.pipedFrom) got.push(...walk(p.pipedFrom, hops + 1));
     }
+    return got;
   };
-  if (seg.pipedFrom) walk(seg.pipedFrom, 0);
+  // (each of the stage's commands with what its upstream prints into it: one part of the stream)
+  if (seg.pipedFrom) {
+    const t = producePieces(seg.pipedFrom, st, (p) => [...producedBy(p, st, 0, true), ...(p.pipedFrom ? walk(p.pipedFrom, 1) : [])]);
+    fedTexts += t.length;
+    texts.push(...t);
+    if (subsSeq && st.seq.length > subsSeq && hasTextPiece(st.seq)) st.mixed = true; // (`< <(...)` and a pipe: one of them is the stdin, not both in a row)
+  }
   const unknown = (fed && fedTexts === 0) || seg.stdinFile || st.dyn;
   return { texts, unknown, st };
 }
@@ -1015,14 +1137,18 @@ function streamsOf(seg, argv) {
 // `interp`: the fed text is the program of an interpreter (`node < f.mjs`), not shell script text; 'sql': the input of psql / mysql / sqlite3 (only its shell escapes run).
 function addFeeds(cmd, st, interp = false) {
   if (!cmd || (!st.files.length && !st.computed.length && !st.rcOnly)) return;
-  if (!cmd.feeds) Object.defineProperty(cmd, 'feeds', { value: { files: [], groups: [], computed: [], raws: [], pat: [], unq: [], ops: [], rc: [], unordered: false, mixed: false, interp: false, sql: false }, enumerable: false });
+  if (!cmd.feeds) Object.defineProperty(cmd, 'feeds', { value: { files: [], groups: [], computed: [], raws: [], pat: [], unq: [], ops: [], rc: [], seqs: [], whole: [], unordered: false, unsure: false, mixed: false, interp: false, sql: false }, enumerable: false });
   if (st.unordered) cmd.feeds.unordered = true;
+  if (st.unsure) cmd.feeds.unsure = true;
   if (st.mixed) cmd.feeds.mixed = true;
+  // (each stream keeps its own parts: two feeds of one command are two texts, not one; static text in a stream that is not wholly recorded cannot be placed)
+  if (hasTextPiece(st.seq)) { if (seqCovers(st)) cmd.feeds.seqs.push([...st.seq]); else cmd.feeds.mixed = true; }
   if (typeof interp === 'string') cmd.feeds.sql = interp;
   else if (interp) cmd.feeds.interp = true;
   cmd.feeds.pat.push(...st.pat);
   cmd.feeds.unq.push(...st.unq);
   cmd.feeds.ops.push(...st.ops);
+  cmd.feeds.whole.push(...(st.whole ?? []));
   cmd.feeds.files.push(...st.files);
   cmd.feeds.groups.push(...st.groups);
   cmd.feeds.computed.push(...st.computed);
@@ -1062,8 +1188,8 @@ function sqlFamilyValue(value) {
   return !first.includes('/') || first.startsWith('/') ? sqlFamilyOf(base(first)) : null;
 }
 function mergeFeeds(a, b) {
-  const out = { ...a, unordered: a.unordered || b.unordered, mixed: a.mixed || b.mixed, interp: a.interp || b.interp, sql: a.sql || b.sql };
-  for (const k of ['files', 'groups', 'computed', 'raws', 'pat', 'unq', 'ops', 'rc']) out[k] = [...(a[k] ?? []), ...(b[k] ?? [])];
+  const out = { ...a, unordered: a.unordered || b.unordered, unsure: a.unsure || b.unsure, mixed: a.mixed || b.mixed, interp: a.interp || b.interp, sql: a.sql || b.sql };
+  for (const k of ['files', 'groups', 'computed', 'raws', 'pat', 'unq', 'ops', 'rc', 'seqs', 'whole']) out[k] = [...(a[k] ?? []), ...(b[k] ?? [])];
   return out;
 }
 
@@ -1116,12 +1242,15 @@ function feedRecords1(cmd, line, resolve, raw0) {
   const rec = (kind) => (w) => (hasExpansion(w) ? { kind, file: w, ambiguous: true, words: [w] } : { kind, file: w });
   // a computed producer's word quoted in the command (`grep '^(A|B)=' F`, `sed 's/^/x/'`) never globs: with no `$` / backtick it is the literal name it spells
   const pat = new Set(f.pat);
-  const lit = (w) => (hasExpansion(w) && !pat.has(w) && !/[$`]/.test(w) ? { kind: 'scan', file: w } : rec('scan')(w));
+  // (`whole`: the file's text is the stream itself, split into words: one that cannot be read is refused like a script -- scannedSubs)
+  const whole = new Set((raw0.whole ?? []).map(R));
+  const lit0 = (w) => (hasExpansion(w) && !pat.has(w) && !/[$`]/.test(w) ? { kind: 'scan', file: w } : rec('scan')(w));
+  const lit = (w) => (whole.has(w) ? { ...lit0(w), whole: true } : lit0(w));
   const out = [...exact.map(rec('shell')), ...computed.map(lit)];
   const raws = [cmd.raw, ...f.raws].filter((r) => typeof r === 'string' && r);
   const refuse = { kind: 'shell', file: out[0]?.file ?? '', ambiguous: true, unresolvable: true, words: [] };
   if (out.length > MAX_FEED_FILES || raws.some((r) => hasPatternSyntax(r, line))) return [refuse];
-  if (raw0.mixed && (f.files.length || f.computed.length)) return [refuse]; // (static text and files in one stream: see producedBy)
+  if (raw0.mixed && (f.files.length || f.computed.length)) return [refuse]; // (static text and files in one stream that cannot be rebuilt: see producedBy / producePieces)
   // Several files feed ONE program: the shell reads their texts one after the other, so they are ALSO judged joined (a record with `joined`), in
   // command-line order, repeats included (`cat a b` with `git pu` in a and `sh origin main` in b); each file is still judged on its own. Only a
   // single reader names them in an order that can be rebuilt: feeds from several producers (or a word that expands) are refused. A rewriting
@@ -1140,7 +1269,37 @@ function feedRecords1(cmd, line, resolve, raw0) {
   if (f.files.length >= 1 && f.computed.length >= 1) return [refuse];
   // a reader's operand that is itself a process substitution (`cat a <(tail -c 99 b) | bash`) is the text ANOTHER producer prints, not a file name
   if ([...f.files, ...f.computed].some(isProcSub)) return [refuse];
-  if (f.files.length >= 2) {
+  // Why: static text and files in one stream (`{ echo "begin;"; cat m.sql; cat <<'SQL' ... SQL } | psql`) are judged as the text they make, in the order they run:
+  // a record with `pieces` ({text} / {file}; a rewriting producer's words are {file} parts of a `scan` record). Refused when the order is not certain, a file
+  // part is not one exact name, or exact and rewritten parts meet (as for several files below).
+  const streams = (raw0.seqs ?? []).filter(hasTextPiece);
+  // (`covered`: the streams hold every file that feeds the program, so the joins below would only repeat them without the static text)
+  const inStreams = { files: [], scans: [] };
+  if (streams.length && (f.files.length || f.computed.length)) {
+    if (raw0.unsure) return [refuse];
+    for (const seq of streams) {
+      const parts = seq.map((p) => (Object.hasOwn(p, 'text') ? p : Object.hasOwn(p, 'file') ? { file: R(p.file) } : { scan: R(p.scan) }));
+      const exactParts = parts.filter((p) => Object.hasOwn(p, 'file')).map((p) => p.file);
+      const scans = parts.filter((p) => Object.hasOwn(p, 'scan')).map((p) => p.scan);
+      if (!exactParts.length && !scans.length) continue;
+      if (exactParts.length && scans.length) return [refuse];
+      if (exactParts.length && raw0.unordered) return [refuse]; // (an exact stream cut short is another script; a scan of a rewritten one holds: see newSt)
+      inStreams.files.push(...exactParts);
+      inStreams.scans.push(...scans);
+      if (exactParts.some((w) => opaqueFile(w, true) || isProcSub(w))) return [refuse];
+      if (scans.some((w) => isProcSub(w) || (pat.has(w) && ops.has(w) && opaqueFile(w, unq.has(w))))) return [refuse];
+      if (exactParts.length) out.push({ kind: 'shell', file: exactParts.join(' '), joined: exactParts, pieces: parts });
+      else {
+        // (a rewriting producer's program words and words that expand are left out of the join, as below)
+        const kept = parts.filter((p) => !Object.hasOwn(p, 'scan') || !hasExpansion(p.scan)).map((p) => (Object.hasOwn(p, 'scan') ? { file: p.scan } : p));
+        const names = kept.filter((p) => Object.hasOwn(p, 'file')).map((p) => p.file);
+        if (names.length) out.push({ kind: 'scan', file: names.join(' '), joined: names, pieces: kept });
+      }
+    }
+  }
+  const same = (x, y) => x.length === y.length && [...x].sort().every((w, i) => w === [...y].sort()[i]);
+  const covered = (inStreams.files.length || inStreams.scans.length) && same(inStreams.files, f.files) && same(inStreams.scans, f.computed);
+  if (f.files.length >= 2 && !covered) {
     // Why: `{ cat a; cat b; } | bash`: the producers run one after the other, so the text is their files in the order the line names them (`cat a b`
     // is the same program). Refused when a job in the background makes the order unknown, or a file operand cannot be tied to one producer.
     const names = f.groups.flat();
@@ -1148,7 +1307,7 @@ function feedRecords1(cmd, line, resolve, raw0) {
     out.push({ kind: 'shell', file: names.join(' '), joined: names });
   }
   const words = f.computed.filter((w) => !hasExpansion(w));
-  if (words.length >= 2) out.push({ kind: 'scan', file: words.join(' '), joined: words });
+  if (words.length >= 2 && !covered) out.push({ kind: 'scan', file: words.join(' '), joined: words });
   if (raw0.interp) for (const r of out) if (r.kind === 'shell') r.kind = 'interp';
   if (raw0.sql) for (const r of out) if (r.kind === 'shell') { r.kind = 'sql'; r.family = raw0.sql; }
   // a client outside the option allowlist may be a shell: its input is judged as a script too
@@ -1600,11 +1759,14 @@ class Parser {
         if (cmp === h.delim) { found = true; break; }
         lines.push(line);
       }
-      const text = lines.join('\n');
-      h.seg.heredocs.push({ text, quoted: h.quoted });
+      // Why: `<<-` strips the leading tabs of the body before the command reads it (`bash <<-'EOF'` + `\tgit pu\` + `\tsh origin main`: one push the tabs hid)
+      const raw = lines.join('\n');
+      const text = h.strip ? lines.map((l) => l.replace(/^\t+/, '')).join('\n') : raw;
+      h.seg.heredocs.push({ text, quoted: h.quoted, lines: lines.length });
       // where the body sits in the line (see heredocSpans in simpleCommands): only for a body this parser read out of the line itself and that ended at
-      // its terminator; one read out of another text (backticks, bash -c, a body's own substitution) or that ran to the end is not located
-      if (found && this.src === this.ctx.rootSrc) this.ctx.hdSpans.push([bodyAt, bodyAt + text.length, h.quoted]);
+      // its terminator; one read out of another text (backticks, bash -c, a body's own substitution) or that ran to the end is not located.
+      // The span covers the raw body as written (tabs included), not the stripped text
+      if (found && this.src === this.ctx.rootSrc) this.ctx.hdSpans.push([bodyAt, bodyAt + raw.length, h.quoted]);
       else this.ctx.hdForeign = true;
       h.seg.pending--;
       if (h.seg.muted) continue;
@@ -1756,7 +1918,7 @@ class Parser {
       }
       if (seg.words.length === 0 && q < 0) {
         if (text === '{') this.braceStack.push(this.log.length);
-        else if (text === '}' && this.braceStack.length) seg.groupStage = this.log.slice(this.braceStack.pop());
+        else if (text === '}' && this.braceStack.length) seg.groupStage = this.log.slice(this.braceStack.pop()).filter((x) => x.depth === depth); // (see the ( ) group)
       }
       const top = cs[cs.length - 1];
       const cmdPos = seg.kwOnly !== false; // every word before this one is an unquoted keyword or `{` (kept as it goes: a rescan per word is quadratic)
@@ -1855,12 +2017,14 @@ class Parser {
         takeSubs();
       } else if (c === '`') {
         startSeg(); inWord = true; wdyn = true;
+        const n0 = this.subAcc.length;
         cur += this.backtick(depth);
+        for (const x of this.subAcc.slice(n0)) x.split = true; // (unquoted: what it prints is split into words, see scannedSubs)
         takeSubs();
       } else if (c === '$') {
         startSeg();
         const nx = s[this.i + 1];
-        if (nx === '(') { inWord = true; wdyn = true; cur += this.substitution(depth); takeSubs(); }
+        if (nx === '(') { inWord = true; wdyn = true; const n0 = this.subAcc.length; cur += this.substitution(depth); for (const x of this.subAcc.slice(n0)) x.split = true; takeSubs(); }
         else if (nx === "'") { mark(); const r = readAnsiC(s, this.i + 1); cur += r.text; this.i = r.next; }
         else if (nx === '"') { mark(); this.i += 2; cur += this.readDq(depth); if (this.lastDqDyn) wdyn = true; takeSubs(); }
         else if (nx === '{' && this.paramSpan(this.i) > 0) {
@@ -1968,18 +2132,24 @@ class Parser {
           // `f ()`, `f()`, zsh `f g ()`, `function f ()`: the words before an empty `()` are names of functions, and the next `{ }` or `( )` is their body
           const head = /^\(\s*\)/.test(s.slice(this.i, this.i + 64)) && seg ? seg.words.filter((w, k) => !(k === 0 && w.qa < 0 && w.text === 'function')).map((w) => w.text) : null;
           const body = fnPending; // (this group is the body of the function named just before it)
+          // (a subshell after && / || runs only when that holds, and one that is a pipeline stage runs apart: its commands may not run, as for a { } group (cbrace).
+          // `{ cat a; true || (cat x); cat c; } | bash` runs a+c, which the join a+x+c hid)
+          const cond = !body && !(seg && seg.words.length) && ['&&', '||', '|'].includes(lastSep);
           endSeg(this.i);
           lastSep = ';';
           this.i++;
           if (depth === 0) this.ctx.subshell = true; // ((...)) arithmetic too: conservative (and the `()` of `f()`: flowStart reads it as "from here on, maybe later")
           const mark0 = this.log.length;
           if (body) this.ctx.ctl.fn++;
+          if (cond) this.ctx.ctl.cond++;
           try {
             this.inGroup(() => this.nestParse(depth, { stopAtParen: true, noRedir: noRedir || s[this.i] === '(' })); // ((...)) is arithmetic
-          } finally { if (body) this.ctx.ctl.fn--; }
+          } finally { if (body) this.ctx.ctl.fn--; if (cond) this.ctx.ctl.cond--; }
           fnPending = false;
           if (head?.length) { for (const name of head) ctx.fns.add(name); fnPending = true; }
-          this.lastStage = this.log.slice(mark0);
+          // Why: the group's own commands print into the pipe; a substitution's body (`{ X=$(cat x); cat a; cat b; } | bash`, one level deeper) prints into its word, not the
+          // stream, so it is no part of it (x's text in front of a+b hid a guarded line in the join)
+          this.lastStage = this.log.slice(mark0).filter((x) => x.depth === depth);
         }
       } else if (c === ')') {
         endSeg(this.i);
@@ -2285,7 +2455,7 @@ class Parser {
       // `$(cat f.sh)` as the command: the shell runs whatever the substitution prints
       const m = seg.meta.get(a[0]);
       const st = newSt();
-      if (m) subsProduced(m.subs, st, 1);
+      if (m) { subsProduced(m.subs, st, 1); scannedSubs(st); }
       addFeeds(cmd, st);
     }
     this.interpret(a, seg, cmd);
@@ -2392,6 +2562,7 @@ class Parser {
   // parse whatever a substitution among them prints (eval "$(cat <<'EOF' ... EOF)" runs the heredoc body).
   // `feed`: the words are script text (eval, -c), so the files a substitution among them reads are recorded on the command
   noteWords(seg, words, depth, feed = false) {
+    let exact = words.length > 0;
     for (const w of words) {
       const m = seg.meta.get(w);
       if (!m) continue;
@@ -2399,12 +2570,17 @@ class Parser {
       const st = newSt();
       for (const text of subsProduced(m.subs, st, 1)) this.subParse(text, depth);
       if (feed && st.dyn) this.ctx.dynamic = true;
+      // (only files read as they are: a program's output is unknown text, and reading the word again keeps what that means -- it may cd, run anything)
+      if (!st.files.length || st.computed.length || st.dyn) exact = false;
+      if (feed && (words.length > 1 || m.subs.some((x) => x.split) || (w.match(/\$\(|`/g) ?? []).length !== 1 || !/^(?:\$\(|`)/.test(w) || !/[)`]$/.test(w))) { scannedSubs(st); exact = false; }
       if (feed) addFeeds(this.cmd, st);
     }
+    return exact && words.every((w) => seg.meta.has(w));
   }
 
   runScript(seg, words, text, depth) {
-    this.noteWords(seg, words, depth, true);
+    // Why: `eval "$(cat f)"`: the script is f's text, judged as it is (noteWords); read again, the text `$(cat f)` would be a command word, which is split (scanned)
+    if (this.noteWords(seg, words, depth, true)) return;
     this.subParse(text, depth);
   }
 
@@ -2421,7 +2597,9 @@ class Parser {
     const m = seg.meta.get(word);
     const st = newSt();
     let found = 0;
-    for (const text of subsProduced(m ? m.subs : [], st, 1)) { found++; this.subParse(text, depth); }
+    const subs = m ? m.subs : [];
+    // (what the substitution prints is the script itself, one stream: recorded in order, see producePieces)
+    for (const text of producePieces(subs, st, (s) => producedBy(s, st, 1, !subs.some((x) => x.pipedFrom?.includes(s))))) { found++; this.subParse(text, depth); }
     if (found === 0 || st.dyn) this.ctx.dynamic = true;
     addFeeds(this.cmd, st);
   }

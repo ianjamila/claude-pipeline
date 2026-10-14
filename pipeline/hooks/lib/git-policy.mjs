@@ -1030,7 +1030,7 @@ function checkScriptFile(sf, dir, ctx, level) {
   const text = ctx.readText(abs);
   if (typeof text !== 'string') {
     if (sf.candidate && ctx.readDir(abs)) return null; // a shell cannot run a directory
-    if (sf.kind === 'shell' && ctx.pathExists(abs)) return deny(`cannot read the script ${sf.file} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified.`);
+    if ((sf.kind === 'shell' || sf.whole) && ctx.pathExists(abs)) return deny(`cannot read the script ${sf.file} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified.`);
     // over the read cap: a program run by path is peeked at (a shell script is refused, a binary or an interpreter file is not
     // ours to judge); text a rewriting command computes from a file we cannot read cannot be scanned
     if (sf.kind === 'exec' || sf.kind === 'scan' || sf.kind === 'sql') {
@@ -1085,7 +1085,10 @@ function judgeSqlEscapes(escapes, sf, dir, ctx, level) {
 function checkJoinedScripts(sf, dir, ctx, level) {
   const parts = [];
   const srcs = [];
-  for (const w of sf.joined) {
+  // (`pieces`: static text a producer prints between the files, in stream order -- scriptFeedsOf)
+  for (const pc of sf.pieces ?? sf.joined.map((file) => ({ file }))) {
+    if (Object.hasOwn(pc, 'text')) { parts.push([pc.text]); continue; }
+    const w = pc.file;
     const home = w === '~' || w.startsWith('~/') ? ctx.home + w.slice(1) : w;
     if (dir === null && sf.kind !== 'scan' && !path.isAbsolute(home)) return deny(`cannot tell which directory this runs in, so which ${w} runs cannot be verified. Use an absolute path, or chain the cd with &&.`);
     const abs = path.resolve(dir ?? ctx.cwd, home);
