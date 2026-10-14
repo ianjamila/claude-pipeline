@@ -35,7 +35,9 @@ already holds. A `P state outcome` with `followupsPending: true` means a publish
   --round <round> --base <base> --head <head> --effort <effort>` → `P job wait codex-r<round> --run-id
   <runId> --timeout 540` until done (`replaced` ⇒ start the job again). Then read `exitCode` and the
   JSON in `tail`:
-  - 0: round recorded: `counts`, `preRuled` (items answered from the cache), `lightLane`.
+  - 0: round recorded: `counts`, `preRuled` (items answered from the cache), `lightLane`. Commits merged in from the
+    base branch since the previous round ("Update branch") are not shown to Codex. If the output has `baseOnly: true`
+    the round was only such a merge: Codex did not run, there are no items, and it counts as a clean round with no findings.
   - 3 (`unavailable: true`, reason quota / auth / unavailable / error / malformed / github) ⇒
     `gh pr edit <pr> --add-label awaiting-review`, `P comment --pr <pr> --kind awaiting-review
     --reason "<reason>"`, `P summary --pr <pr> --outcome awaiting-review --built "…"` (works with no

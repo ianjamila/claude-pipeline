@@ -82,11 +82,15 @@ pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium
   -> {ok, round, counts:{blocking, suggestions, worth_considering}, preRuled, lightLane, path}
   --base must be the PR's merge base for round 1 and the previous round's toHead after that, else exit 2 {error:base-mismatch}
   exit 2 {error:empty-range} when earlier rounds accepted items and the branch content is unchanged since the last round (base == head)
+  commits merged in from the PR's base branch since the previous round are left out of the reviewed diff; a round that only merged them in
+    is recorded without running Codex: {ok:true, baseOnly:true, counts all 0}
   exit 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|malformed|github} when Codex or GitHub could not deliver
   env: PIPELINE_CODEX_TIMEOUT_MS overrides the 30 minute Codex timeout (tests)
 ```
 
 Exit: 0 round recorded · 2 usage or base-mismatch · 3 Codex or GitHub could not deliver (quota, auth, unavailable, error, malformed, github): never "no findings".
+
+A later round is diffed against what the previous round reviewed plus the PR's base branch as it is now (a trial merge, `reviewBaseKind: synthetic`), not against the previous head itself, so commits an "Update branch" merged in from the base branch are never shown to Codex: they were reviewed in their own PRs. When that trial merge conflicts (or git is older than 2.38), the round reviews the whole PR against the new base instead (`whole-pr`). Each round records `reviewBase` and `reviewBaseKind` next to `fromHead` / `toHead`. A round whose only new commit is such a merge is recorded as `baseOnly: true` with no items and Codex is not run; the outcome treats it like a clean round with no findings. `state mark-implemented` measures "a non-test file changed since round N" the same way.
 
 ## comment
 
