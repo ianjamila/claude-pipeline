@@ -515,7 +515,7 @@ test('skipIf: a positive answer skips the step in a full run; the row says skipp
   const seen = [];
   const steps = [
     pass('one'),
-    { name: 'two', cmd: touch('ran-two'), quick: false, skipIf: (ctx) => { seen.push(ctx); return { skip: true, reason: 'nothing under db/ changed', log: 'custom log line\n' }; } },
+    { name: 'two', cmd: touch('ran-two'), quick: false, skipIf: (ctx) => { seen.push(ctx); return { run: false, reason: 'nothing under db/ changed', log: 'custom log line\n' }; } },
     { name: 'three', cmd: touch('ran-three'), quick: false },
   ];
   const r = await verify(repo, [], steps);
@@ -539,7 +539,7 @@ test('skipIf: a positive answer skips the step in a full run; the row says skipp
 
 test('skipIf: without a log the reason is written to the step log; a run with no skips keeps the old tally', async () => {
   const repo = await setup();
-  await verify(repo, [], [{ name: 'two', cmd: touch('ran-two'), quick: false, skipIf: () => ({ skip: true, reason: 'because' }) }, pass('one')]);
+  await verify(repo, [], [{ name: 'two', cmd: touch('ran-two'), quick: false, skipIf: () => ({ run: false, reason: 'because' }) }, pass('one')]);
   assert.match(readFileSync(join(repo.dir, '.verify', 'logs', 'two.log'), 'utf8'), /skipped: because/);
   const plain = await verify(repo, [], [pass('one'), { ...pass('two'), skipIf: () => null }]);
   assert.match(plain.out, /verify \(full\): PASS - 2\/2 steps passed/);
@@ -549,7 +549,7 @@ test('skipIf: without a log the reason is written to the step log; a run with no
 test('skipIf: only consulted in a full run, never in --quick or --only', async () => {
   const repo = await setup();
   let calls = 0;
-  const steps = [{ name: 'one', cmd: touch('ran-one'), quick: true, skipIf: () => { calls += 1; return { skip: true, reason: 'x' }; } }];
+  const steps = [{ name: 'one', cmd: touch('ran-one'), quick: true, skipIf: () => { calls += 1; return { run: false, reason: 'x' }; } }];
   for (const argv of [['--quick'], ['--only', 'one']]) {
     const r = await verify(repo, argv, steps);
     assert.equal(r.exitCode, 0, argv.join(' '));
@@ -566,11 +566,11 @@ test('skipIf: fails closed. A throw or a junk answer runs the step and records w
     ['throws', () => { throw new Error('probe broke'); }, /probe broke/],
     ['true', () => true, /skipIf must return/],
     ['a string', () => 'skip', /skipIf must return/],
-    ['skip without a reason', () => ({ skip: true }), /skipIf must return/],
-    ['an empty reason', () => ({ skip: true, reason: '  ' }), /skipIf must return/],
-    ['skip not literally true', () => ({ skip: 'yes', reason: 'x' }), /skipIf must return/],
-    ['a non-string log', () => ({ skip: true, reason: 'x', log: 5 }), /skipIf must return/],
-    ['a promise', () => Promise.resolve({ skip: true, reason: 'x' }), /skipIf must return/],
+    ['skip without a reason', () => ({ run: false }), /skipIf must return/],
+    ['an empty reason', () => ({ run: false, reason: '  ' }), /skipIf must return/],
+    ['run not literally false', () => ({ run: 0, reason: 'x' }), /skipIf must return/],
+    ['a non-string log', () => ({ run: false, reason: 'x', log: 5 }), /skipIf must return/],
+    ['a promise', () => Promise.resolve({ run: false, reason: 'x' }), /skipIf must return/],
   ];
   for (const [label, skipIf, why] of answers) {
     rmSync(join(repo.dir, 'ran-s'), { force: true });
@@ -600,7 +600,7 @@ test('skipIf: { run: true, reason } runs the step and says why; skipIf must be a
 test('skipIf: a skipped step does not hide a later failure, and the failing step still stops the run', async () => {
   const repo = await setup();
   const steps = [
-    { name: 'one', cmd: touch('ran-one'), quick: false, skipIf: () => ({ skip: true, reason: 'unchanged' }) },
+    { name: 'one', cmd: touch('ran-one'), quick: false, skipIf: () => ({ run: false, reason: 'unchanged' }) },
     { name: 'two', cmd: nodeCmd('process.exit(4)'), quick: false },
     { name: 'three', cmd: touch('ran-three'), quick: false },
   ];

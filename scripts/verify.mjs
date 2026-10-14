@@ -33,9 +33,9 @@ const PROJECT = 'claude-pipeline'; // must match `project:` in .claude/pipeline.
 // lockGroup 'db' = needs the dedicated local database; consecutive steps in one group run under a single lock
 // env       extra environment: an object, or a function returning one (called just before the step starts)
 // timeoutMs per-step limit (default 30 minutes)
-// skipIf    function({ cwd, env, git, mode }) -> null | { run: true, reason } | { skip: true, reason, log? }:
+// skipIf    function({ cwd, env, git, mode }) -> null | { run: true, reason } | { run: false, reason, log? }:
 //           consulted ONLY in a FULL run (never --quick or --only), after the env checks. null runs the step; `{ run: true,
-//           reason }` also runs it but records `skipCheck: <reason>`. `{ skip: true, reason }` skips it: the row becomes
+//           reason }` also runs it but records `skipCheck: <reason>`. `{ run: false, reason }` skips it: the row becomes
 //           status 'skipped' + skipReason (final-gate then accepts it only if the step is listed in verify.skippable_steps),
 //           and `log` (default: the reason) is written to .verify/logs/<step>.log. `git` is the report's git block. It must
 //           fail closed: a throw or any other answer runs the step and records `skipCheck: skip check failed: <why>`.
@@ -306,8 +306,8 @@ export async function runVerify(opts = {}) {
           if (d !== null && d !== undefined) {
             const reasoned = typeof d === 'object' && typeof d.reason === 'string' && d.reason.trim() !== '';
             if (reasoned && d.run === true) runReason = d.reason.trim();
-            else if (reasoned && d.skip === true && (d.log === undefined || typeof d.log === 'string')) skip = d;
-            else throw new Error('skipIf must return null, { run: true, reason } or { skip: true, reason, log? }');
+            else if (reasoned && d.run === false && (d.log === undefined || typeof d.log === 'string')) skip = d;
+            else throw new Error('skipIf must return null, { run: true, reason } or { run: false, reason, log? }');
           }
         } catch (e) {
           runReason = `skip check failed: ${e.message}`;
