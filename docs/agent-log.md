@@ -22,6 +22,3 @@ full record.
 - 2026-10-13 · #45 · chore(pipeline): owner_approval: chat for claude-pipeline (no approval labels) + monotonic clock in the hung-gh test · risk high · rounds 1 · arbiter 0 · merged — prod smoke pending
 - 2026-10-14 · #47 · feat(session-version): vendor-owed warning offers to open the vendor PR · risk high · rounds 2 · arbiter 0 · awaiting-owner-merge
 - 2026-10-14 · #52 · feat: skipped verify steps + owner rulings on needs-human review items · risk high · rounds 3 · arbiter 0 · merged — prod smoke pending
-- 2026-10-14 · #64 · feat(worktrees): macOS support (lsof process check, launchd schedule) + outside report skips non-project scratch · risk high · rounds 2 · arbiter 1 · needs-human
-- 2026-10-14 · #54 · test: two timing-flaky tests made reliable (monotonic lock waits; linear scan spans n/16 -> n) · risk high · rounds 3 · arbiter 1 · awaiting-owner-merge
-- 2026-10-14 · #64 · feat(worktrees): macOS support (lsof process check, launchd schedule) + outside report skips non-project scratch · risk high · rounds 3 · arbiter 1 · merged — prod smoke pending
