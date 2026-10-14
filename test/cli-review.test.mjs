@@ -1193,6 +1193,24 @@ test('state mark-implemented: files main brings in after the resolving merge do 
   assert.doesNotMatch(refused.json.message, /more-from-main/);
 });
 
+test('state mark-implemented: a fix committed before a later clean base merge still counts, and the later merge alone does not', (t) => {
+  const w = acceptedWorld(t);
+  conflictMerge(w);
+  fixA(w);
+  mergeMainInto(w, { 'src/more-from-main.js': 'export const more = 1;\n' }); // update-branch again, no conflict
+  const r = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(w.item('R1-B1').implemented, true);
+
+  const w2 = acceptedWorld(t);
+  conflictMerge(w2);
+  mergeMainInto(w2, { 'src/more-from-main.js': 'export const more = 1;\n' });
+  const refused = w2.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assertExit(refused, 2, refused.stderr + refused.stdout);
+  assert.equal(refused.json.error, 'no-code-change');
+  assert.equal(w2.item('R1-B1').implemented, undefined);
+});
+
 test('state mark-implemented: a conflict resolved by merging a branch other than the default branch stays unresolved', (t) => {
   const w = acceptedWorld(t);
   // main gets the conflicting change; a side branch (containing it plus more) is what the PR merges, so no merge commit

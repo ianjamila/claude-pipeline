@@ -179,19 +179,21 @@ async function outcome(rest, ctx) {
   };
 }
 
-// The latest merge commit on HEAD's first-parent history after `toHead` that merged the default branch (as it stands now) into the
-// PR: its second parent contains the PR's current fork point and is itself part of the default branch. A merge commit is where a
-// conflict with the default branch was resolved, so only commits after it are the PR's own work since. null when there is none.
-// Only the default branch counts (a merge of any other branch says nothing about what main brought in). Throws on a git error.
-function resolvingMerge({ root, config, toHead, forkPoint }) {
+// What to diff HEAD against when the default branch was merged into the PR with a conflict since `toHead`: walk the merge commits of
+// the default branch on HEAD's first-parent history after `toHead`, OLDEST first (the first is the one that resolved the conflict), and
+// take the first whose own review base is exact (effectiveReviewBase from that merge: 'previous', or 'synthetic' when the default branch
+// was merged in again cleanly later, which leaves main's later files out). A merge counts only when its second parent is part of the
+// default branch (a merge of any other branch says nothing about what main brought in). A merge whose own base is still 'whole-pr'
+// (a second conflict) is skipped in favour of the next one. null when none gives an exact base: the caller refuses. Throws on a git error.
+function baseAfterConflictMerge({ root, config, toHead, forkPoint }) {
   const o = { cwd: root };
   const baseRef = reviewBaseRef(root, config);
-  const merges = git(['rev-list', '--first-parent', '--merges', `${revParse(toHead, o)}..HEAD`], o).split('\n').filter(Boolean);
+  const merges = git(['rev-list', '--first-parent', '--merges', '--reverse', `${revParse(toHead, o)}..HEAD`], o).split('\n').filter(Boolean);
   for (const m of merges) {
     const parents = git(['rev-list', '--parents', '-n', '1', m], o).trim().split(/\s+/).slice(1);
-    if (parents.length !== 2) continue;
-    const other = parents[1];
-    if (isAncestor(forkPoint, other, o) && isAncestor(other, baseRef, o)) return m;
+    if (parents.length !== 2 || !isAncestor(parents[1], baseRef, o)) continue;
+    const since = effectiveReviewBase({ from: m, forkPoint }, o);
+    if (since.kind === 'previous' || since.kind === 'synthetic') return since.base;
   }
   return null;
 }
@@ -234,8 +236,8 @@ async function markImplemented(rest, ctx) {
         let base = since.base;
         if (since.kind === 'whole-pr') {
           // The trial merge conflicted (or is unsupported), and it will never change: both of its inputs are fixed. The PR's
-          // own work since then starts at the merge commit that resolved the conflict.
-          base = resolvingMerge({ root, config, toHead: round.toHead, forkPoint });
+          // own work since then is measured from the merge commit that resolved the conflict.
+          base = baseAfterConflictMerge({ root, config, toHead: round.toHead, forkPoint });
           if (base === null) {
             throw new Error(`the default branch was merged into the PR since round ${round.n} with a conflict, and no merge commit of the default branch after that round records the resolution, so the PR's own changes cannot be told apart from the default branch's`);
           }
