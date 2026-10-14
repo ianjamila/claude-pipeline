@@ -1782,11 +1782,13 @@ const varWordRe = (k) => new RegExp(`(?<![A-Za-z0-9_])${k}(?![A-Za-z0-9_])`, 'g'
 const SPECIAL_NAMES = /^(?:PATH|IFS|HOME|CDPATH|ENV|BASH_ENV|ZDOTDIR|PWD|OLDPWD|SHELL|SHELLOPTS|BASHOPTS|POSIXLY_CORRECT|PS\d|PROMPT_COMMAND|FPATH|MAILPATH|EDITOR|VISUAL|PAGER|TMOUT|HISTFILE|GIT\w*|GH_\w*|BASH\w*|ZSH\w*|LD_\w*|DYLD_\w*|NODE_\w*|NPM_\w*|PYTHON\w*|PERL\w*|RUBY\w*|PIPELINE_\w*|CLAUDE\w*|path|cdpath|fpath|manpath|mailpath|psvar|prompt\w*|precmd\w*|preexec\w*|chpwd\w*|periodic\w*|zshaddhistory\w*|zshexit\w*)$/;
 // The text with what the shell never expands blanked out: single-quoted strings and comments (double-quoted text expands, so it stays). Null for `$'…'`
 // or an unterminated quote (the caller keeps its answer).
-function withoutLiteralText(s) {
+export function withoutLiteralText(s) {
   // Why (#56 replay): `for n in 1 2; do echo "$n $(gh pr view $n --jq '.x')"; done` lost its readings because a quote inside a $( … ) inside double quotes
   // gave up. A $( … ) starts a fresh quoting context (its single quotes are quotes again), so each context is a frame on a stack: top, a double-quoted
   // string, a $( … ), a backtick. Still given up (null): a bare ( or $(( inside a $( … ) (a case pattern or arithmetic would end it early), a quote or ( inside
   // backticks, $'…', and anything left open at the end.
+  // Also given up: a `case` inside a $( … ) -- its patterns end in a bare `)` that this scanner would take for the end of the $( … ), and every quote after
+  // it would then be read in the wrong context (security review of 61296d8).
   let out = '';
   const stack = ['top'];
   const cur = () => stack[stack.length - 1];
@@ -1816,6 +1818,7 @@ function withoutLiteralText(s) {
     if (fr === 'sub') {
       if (ch === '$' && s[i + 1] === '(') { if (s[i + 2] === '(') return null; stack.push('sub'); out += '$('; i += 2; continue; }
       if (ch === '(') return null;
+      if (ch === 'c' && s.startsWith('case', i) && !/[A-Za-z0-9_]/.test(s[i + 4] ?? '') && (i === 0 || !/[A-Za-z0-9_]/.test(s[i - 1]))) return null;
       if (ch === ')') { stack.pop(); out += ch; i++; continue; }
       if (ch === '`') return null;
     }

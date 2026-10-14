@@ -11,7 +11,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolve, dirname, basename } from 'node:path';
-import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
+import { evaluateGitCommand, withoutLiteralText } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 
 function fakeFs(root, files, dirs = []) {
@@ -372,4 +372,20 @@ test('#56 repro 1/2: a literal cd chained with && and a lone assignment before {
   allowBoth("S=/tmp/s; { cat <<'EOF'\nhello brief\nEOF\n} > $S/brief.md; wc -l $S/brief.md; ( node a.mjs > \"$S/x.log\" 2>&1 ) &", SPEC);
   denyBoth("S=/tmp/s; { cat <<'EOF'\nhello\nEOF\n} > $S/brief.md; ( bash run.sh > \"$S/x.log\" 2>&1 ) &", SPEC);
   denyBoth('cd /work/repo && node bad.mjs > out.txt 2>&1', SPEC);
+});
+
+test("#56 scanner: a case inside a $( … ) gives up (its pattern ) would end the $( … ) early), the shapes it follows still read", () => {
+  // (null keeps the denial: the readings need the scanner, so a line it cannot follow is judged as before #56)
+  for (const t of [
+    `echo "$(case a in a) echo x;; esac)"`,
+    `echo "$(echo y; case $n in 1) :;; esac)" z`,
+    `X="$(case a in a) echo;; esac)"; echo $X`,
+  ]) assert.equal(withoutLiteralText(t), null, t);
+  // a word that only contains "case" is no keyword; top-level case is outside any $( … ) and never confuses the frames
+  for (const t of [
+    `echo "$(cat showcase.txt)"`,
+    `echo "$(cases)"`,
+    "case a in a) echo x;; esac",
+    `echo "$(gh pr view 1 --jq .x)"`,
+  ]) assert.notEqual(withoutLiteralText(t), null, t);
 });
