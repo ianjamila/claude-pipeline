@@ -247,6 +247,19 @@ async function preflightCheck({ root, env, gh }) {
   return check('preflight', false, report.reasons.length ? report.reasons.join('; ') : 'preflight says the pipeline may not merge');
 }
 
+// A verify step that did not run for a stated reason. Two shapes: `status: 'skipped'` + `skipReason`, and the legacy
+// eaglewatch row `status: 'pass', skipped: true` (reason in `skipCheck`, else the row's `command`). Everything else
+// (including a failed row that merely carries skipped:true) is not a skip. `reason` is '' when none is given.
+export function skipOf(step) {
+  if (!isObject(step)) return null;
+  const legacy = step.status === 'pass' && step.skipped === true;
+  if (step.status !== 'skipped' && !legacy) return null;
+  const given = step.status === 'skipped' ? step.skipReason : (step.skipCheck ?? step.command);
+  return { name: step.name, reason: typeof given === 'string' ? given.trim() : '' };
+}
+const SKIP_REASON_SHOWN = 80;
+const clip = (text, n) => (text.length > n ? `${text.slice(0, n)}\u2026` : text);
+
 function verifyReportCheck({ root, config, head, tree, o }) {
   let report;
   try {
@@ -273,8 +286,16 @@ function verifyReportCheck({ root, config, head, tree, o }) {
   if (steps && expected && JSON.stringify(steps.map((s) => s?.name)) !== JSON.stringify(expected)) {
     problems.push(`steps [${steps.map((s) => s?.name).join(', ')}] do not match ${source} [${expected.join(', ')}]`);
   }
-  const notPassed = (steps ?? []).filter((s) => s?.status !== 'pass').map((s) => `${s?.name}=${s?.status}`);
+  // A skipped step is accepted only when the owner listed it in verify.skippable_steps and it says why; anything else that
+  // is not a plain pass (fail, not-run, an unknown status) is refused as before.
+  const skippable = Array.isArray(config.verify.skippable_steps) ? config.verify.skippable_steps : [];
+  const skips = (steps ?? []).map(skipOf).filter(Boolean);
+  const notPassed = (steps ?? []).filter((s) => s?.status !== 'pass' && skipOf(s) === null).map((s) => `${s?.name}=${s?.status}`);
   if (notPassed.length) problems.push(`steps not passing: ${notPassed.join(', ')}`);
+  for (const k of skips) {
+    if (!skippable.includes(k.name)) problems.push(`step ${k.name} was skipped; list it in verify.skippable_steps to allow that`);
+    else if (k.reason === '') problems.push(`step ${k.name} was skipped without a reason`);
+  }
 
   const g = isObject(report.git) ? report.git : {};
   if (g.head !== head) problems.push(`report is for ${short(g.head)}, HEAD is ${short(head)}`);
@@ -287,7 +308,7 @@ function verifyReportCheck({ root, config, head, tree, o }) {
   if (!Number.isFinite(finished)) problems.push('finishedAt is missing or not a date');
   else if (finished < commitTime(head, o)) problems.push('report finished before the HEAD commit was made');
 
-  return problems.length ? check('verify-report', false, problems.join('; ')) : check('verify-report', true, `full verify passed at ${short(head)} (${steps.length} steps)`);
+  return problems.length ? check('verify-report', false, problems.join('; ')) : check('verify-report', true, `full verify passed at ${short(head)} (${steps.length} steps${skips.length ? `: ${steps.length - skips.length} ran, ${skips.length} skipped: ${skips.map((k) => `${k.name} \u2014 ${clip(k.reason, SKIP_REASON_SHOWN)}`).join('; ')}` : ''})`);
 }
 
 async function hardstopsCheck({ root, config, diff }) {

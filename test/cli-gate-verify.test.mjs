@@ -170,3 +170,64 @@ test('final-gate: a review state whose pr is missing, zero, a string or another 
     assert.match(named(r.json, 'review').detail, /review state is for PR|records no valid PR/, label);
   }
 });
+
+// ---- final-gate: skipped verify steps -------------------------------------------------------------
+
+// A step the verify runner skipped is accepted only when the owner listed it in verify.skippable_steps and it says why.
+const skippable = (names) => ({ yml: ymlFor().replace('  quick: npm run verify:quick\n', `  quick: npm run verify:quick\n  skippable_steps: [${names.join(', ')}]\n`) });
+const skipRow = (r, reason = 'no unit dependency changed vs origin/main') => { r.steps[3] = { ...r.steps[3], status: 'skipped', skipReason: reason, exitCode: null }; };
+const legacySkipRow = (r, reason = '(skipped - no unit dependency changed)') => { r.steps[3] = { ...r.steps[3], status: 'pass', skipped: true, command: reason }; };
+
+test('final-gate: a skipped step the owner listed in verify.skippable_steps passes, and the detail names it', () => {
+  const r = scenario({ ...skippable(['unit']), report: (rep) => skipRow(rep) }).gate();
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.match(named(r.json, 'verify-report').detail, /full verify passed at [0-9a-f]{8} \(5 steps: 4 ran, 1 skipped: unit — no unit dependency changed vs origin\/main\)/);
+});
+
+test('final-gate: a skipped step that is not listed, or has no reason, fails verify-report', () => {
+  const unlisted = scenario({ report: (rep) => skipRow(rep) }).gate();
+  assertExit(unlisted, 1, 'unlisted');
+  assert.deepEqual(unlisted.json.failed, ['verify-report']);
+  assert.match(named(unlisted.json, 'verify-report').detail, /unit was skipped; list it in verify\.skippable_steps/);
+  const other = scenario({ ...skippable(['lint']), report: (rep) => skipRow(rep) }).gate();
+  assertExit(other, 1, 'a different step is listed');
+  assert.match(named(other.json, 'verify-report').detail, /unit was skipped/);
+  for (const [label, reason] of [['empty reason', ''], ['blank reason', '   '], ['non-string reason', 5], ['no reason', undefined]]) {
+    const r = scenario({ ...skippable(['unit']), report: (rep) => { skipRow(rep, reason); if (reason === undefined) delete rep.steps[3].skipReason; } }).gate();
+    assertExit(r, 1, label);
+    assert.deepEqual(r.json.failed, ['verify-report'], label);
+    assert.match(named(r.json, 'verify-report').detail, /unit was skipped without a reason/, label);
+  }
+});
+
+test('final-gate: the legacy shape (status pass + skipped:true) is a skip too: listed passes, unlisted fails', () => {
+  const listed = scenario({ ...skippable(['unit']), report: (rep) => legacySkipRow(rep) }).gate();
+  assertExit(listed, 0, listed.stderr + listed.stdout);
+  assert.match(named(listed.json, 'verify-report').detail, /4 ran, 1 skipped: unit — \(skipped - no unit dependency changed\)/);
+  const viaCheck = scenario({ ...skippable(['unit']), report: (rep) => { legacySkipRow(rep, 'node scripts/x.mjs'); rep.steps[3].skipCheck = 'deps unchanged'; } }).gate();
+  assertExit(viaCheck, 0, viaCheck.stderr + viaCheck.stdout);
+  assert.match(named(viaCheck.json, 'verify-report').detail, /skipped: unit — deps unchanged/, 'skipCheck wins over command');
+  const unlisted = scenario({ report: (rep) => legacySkipRow(rep) }).gate();
+  assertExit(unlisted, 1, 'legacy unlisted');
+  assert.deepEqual(unlisted.json.failed, ['verify-report']);
+  assert.match(named(unlisted.json, 'verify-report').detail, /unit was skipped; list it in verify\.skippable_steps/);
+});
+
+test('final-gate: skipped:true on a step that did not pass, and unknown statuses, still fail', () => {
+  const failedSkip = scenario({ ...skippable(['unit']), report: (rep) => { rep.steps[3].status = 'fail'; rep.steps[3].skipped = true; } }).gate();
+  assertExit(failedSkip, 1, 'fail + skipped:true');
+  assert.match(named(failedSkip.json, 'verify-report').detail, /unit=fail/);
+  for (const status of ['skip', 'SKIPPED', 'ok', '', null]) {
+    const r = scenario({ ...skippable(['unit']), report: (rep) => { rep.steps[3].status = status; rep.steps[3].skipReason = 'because'; } }).gate();
+    assertExit(r, 1, String(status));
+    assert.match(named(r.json, 'verify-report').detail, /steps not passing: unit=/, String(status));
+  }
+});
+
+test('final-gate: a long skip reason is cut to about 80 characters in the detail', () => {
+  const r = scenario({ ...skippable(['unit']), report: (rep) => skipRow(rep, 'x'.repeat(300)) }).gate();
+  assertExit(r, 0, r.stderr + r.stdout);
+  const detail = named(r.json, 'verify-report').detail;
+  assert.match(detail, /skipped: unit — x{70,85}…\)/);
+  assert.ok(detail.length < 200, detail);
+});
