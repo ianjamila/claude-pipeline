@@ -1684,6 +1684,29 @@ const MAX_CHAIN = 24; // a file copied from a file copied from a file ... (longe
 // `viaUnmodelled` in the result: the answer depends on a command we do not model (a cached verdict must not outlive a new one).
 // `readText(path)`: the text of a file now (string, or null). `joined`: the whole texts the file may hold when several writes build it (appends, cat A B);
 // `pieces`: it is built from pieces and cannot be put together (a piece unknown, computed or too many), so no single piece can be judged for what the file runs.
+// The texts a file may hold after the line's writes to it (w: a writtenTo result), with `disk` its text now (null when missing: '' then, as a write may fail),
+// or null when they cannot be built (a content only known at run time, pieces, an inline program's output, a rewrite of other files, a copied file we cannot read).
+export function writtenCandidates(w, disk, readText) {
+  if (w.unknown || w.pieces || w.authored || w.programs.length || w.scans.length) return null;
+  const out = [...w.texts, ...w.joined.filter((t) => t !== '')];
+  for (const f of w.files) {
+    const t = readText(f);
+    if (typeof t !== 'string') return null;
+    out.push(t);
+  }
+  out.push(typeof disk === 'string' ? disk : '');
+  return [...new Set(out)];
+}
+// Every text that parts read one after the other may form (one candidate text per part), or null when there are more than `cap`.
+export function joinedReadings(parts, cap = 32) {
+  let acc = [''];
+  for (const p of parts) {
+    if (acc.length * p.length > cap) return null;
+    acc = acc.flatMap((a) => p.map((t) => a + t));
+  }
+  return acc;
+}
+
 export function writtenTo(frames, target, { exists, readText = () => null, ignoreUnmodelled = false }) {
   if (!frames.length || !frames.some((f) => f.recs.length || f.unmodelled.size)) return null;
   const st = { texts: new Set(), files: new Set(), scans: new Set(), programs: new Set(), authored: false, unknown: false, any: false, seen: new Set(), ignoreUnmodelled, viaUnmodelled: false };

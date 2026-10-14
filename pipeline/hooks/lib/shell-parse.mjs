@@ -890,6 +890,9 @@ function noteReads(seg, name, argv, st, exact) {
   }
   if (group.length) st.groups.push(group);
   if (group.length && seg.sep === '&') st.unordered = true; // (a job in the background: the order it prints in, among the others, is not known)
+  // Why: a producer that may not run (after && / ||, in an if / case branch, a loop, a function body or a trap action) leaves its text out of the stream, or
+  // repeats it: `{ cat a; false && cat b; cat c; } | bash` runs a+c, which the join a+b+c hides (Codex review 3 of #50). Such a join is not rebuilt (refused).
+  if (group.length && (seg.sep === '&&' || seg.sep === '||' || Object.values(seg.ctl ?? {}).some(Boolean))) st.unordered = true;
   if (words.length) st.raws.push(seg.raw);
 }
 

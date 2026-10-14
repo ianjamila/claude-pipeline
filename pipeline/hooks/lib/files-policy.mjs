@@ -20,7 +20,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
 import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText } from './shell-parse.mjs';
-import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
+import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
 import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit, execLinesOf, paramReadings, assigningDefaults, spliceLines } from './script-candidates.mjs';
 
 const posix = path.posix;
@@ -1504,42 +1504,60 @@ function judgeJoinedScripts(sf, dirs, ctx, opts) {
       const key = abss.join('\u0000');
       if (seen.has(key)) continue;
       seen.add(key);
-      const texts = [];
+      const parts = [];
       for (const abs of abss) {
-        if (!ctx.api.existsSync(abs)) continue;
         if (ctx.hit(abs) || ctx.hit(realResolve(abs, ctx.api)) || /\/node_modules\//.test(abs)) continue;
         checkDeadline(ctx.budget);
-        const text = ctx.readText(abs);
-        if (typeof text !== 'string') {
+        const exists = ctx.api.existsSync(abs);
+        const text = exists ? ctx.readText(abs) : null;
+        if (exists && typeof text !== 'string') {
           if (sf.kind === 'shell') return deny(`cannot read the script ${abs} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified`);
           const head = ctx.readHead(abs);
           if (typeof head === 'string') return deny(`${abs} is too large to verify (over 1 MB), so what it feeds a shell cannot be known`);
-          continue;
         }
-        countScript(ctx.budget);
-        texts.push(text);
-      }
-      if (!texts.length) continue;
-      if (sf.kind === 'scan') {
-        const m = makeMatchers(ctx);
-        for (const t of [texts.join(''), [...texts].reverse().join('')]) {
-          if (variantsOf(t).some((v) => setsAdmin(v, ctx.platform) || hasDisableAll(v)) || SENSITIVE_WORDS.test(t) || m.rawHit(t, [d || ctx.cwd])) {
-            return deny(`${sf.file} are read by a command that feeds a shell, and refer to a protected pipeline file or switch, so what the shell runs cannot be verified (${PROTECTED_MSG})`);
+        // Why: a part the line writes before this command may hold what those writes put there, not what is on disk now (Codex review 3 of #50): every text it
+        // may hold is joined with every text of the others; a content only known at run time is judged as for a single script (judgeWrittenScript)
+        let cands = null;
+        const wr = writtenTo(ctx.frames, abs, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: sf.startup === true || ctx.ignoreUnmodelled });
+        if (wr) {
+          cands = writtenCandidates(wr, typeof text === 'string' ? text : null, (q) => ctx.readText(q));
+          if (cands === null) {
+            const r = judgeWrittenScript(wr, sf, abs, d || ctx.cwd, ctx, opts, '');
+            if (r) return r;
           }
         }
-        continue;
+        if (cands === null) {
+          if (typeof text !== 'string') continue; // missing (or unreadable data): it prints nothing we can judge
+          cands = [text];
+        }
+        countScript(ctx.budget);
+        parts.push(cands);
       }
-      // Why: the fed text of an interpreter (`cat a b | node`) is one program, judged as program text like a single `node f.mjs`
-      if (sf.kind === 'interp') {
-        const r = judgeScriptText(texts.join(''), sf, abss.join(' '), d || ctx.cwd, ctx, opts);
-        if (r) return r;
-        continue;
+      if (!parts.length) continue;
+      const joins = joinedReadings(parts);
+      const back = sf.kind === 'scan' ? joinedReadings([...parts].reverse()) : [];
+      if (joins === null || back === null) return deny(`${sf.file} may hold too many texts together (files the line writes first), so what they run when fed to one program cannot be verified`);
+      for (const joined of new Set([...joins, ...back])) {
+        if (!joined) continue;
+        if (sf.kind === 'scan') {
+          const m = makeMatchers(ctx);
+          if (variantsOf(joined).some((v) => setsAdmin(v, ctx.platform) || hasDisableAll(v)) || SENSITIVE_WORDS.test(joined) || m.rawHit(joined, [d || ctx.cwd])) {
+            return deny(`${sf.file} are read by a command that feeds a shell, and refer to a protected pipeline file or switch, so what the shell runs cannot be verified (${PROTECTED_MSG})`);
+          }
+          continue;
+        }
+        // Why: the fed text of an interpreter (`cat a b | node`) is one program, judged as program text like a single `node f.mjs`
+        if (sf.kind === 'interp') {
+          const r = judgeScriptText(joined, sf, abss.join(' '), d || ctx.cwd, ctx, opts);
+          if (r) return r;
+          continue;
+        }
+        // (a database client reads the files as ONE stream: the escapes are read from the joined text)
+        const joinedText = sf.kind === 'sql' ? sqlShellEscapes(joined, { family: sf.family, sources: abss }).join('\n') : joined;
+        if (!joinedText) continue;
+        const r = evaluateBashForFiles(joinedText, { ...opts, cwd: d || ctx.cwd, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup });
+        if (r.decision === 'deny') return deny(`the scripts ${sf.file} would run: ${r.reason}`);
       }
-      // (a database client reads the files as ONE stream: the escapes are read from the joined text)
-      const joinedText = sf.kind === 'sql' ? sqlShellEscapes(texts.join(''), { family: sf.family, sources: abss }).join('\n') : texts.join('');
-      if (!joinedText) continue;
-      const r = evaluateBashForFiles(joinedText, { ...opts, cwd: d || ctx.cwd, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup });
-      if (r.decision === 'deny') return deny(`the scripts ${sf.file} would run: ${r.reason}`);
     }
   }
   return null;

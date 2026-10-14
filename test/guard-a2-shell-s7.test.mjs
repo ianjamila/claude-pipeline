@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolve, dirname, basename } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
+import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 
 function fakeFs(root, files, dirs = []) {
   const abs = (p) => resolve(root, p);
@@ -135,4 +136,67 @@ test('S7 git: ... inside the subshell it counts, a cd outside one (a brace group
   ]) assert.equal(G(c, {}, { currentBranch: (d) => (resolve(d) === GIT_ROOT ? 'agent/x' : 'main') }), 'deny', c);
   // (the real branch is main: a switch that may not have run does not make the push safe)
   assert.equal(G('x=$(false && git checkout agent/x); git push', {}, { currentBranch: () => 'main' }), 'deny');
+});
+
+// ---- Codex round 3 (review of 34bacb5) ---------------------------------------------------------------------------------------------------------------------
+
+const PAYLOAD = { 'payload.sh': 'git push origin main\n' };
+test('S7 codex r3: a descriptor duplication (`0>&"$fd"`) can hand a readable file to stdin: an unsure word in it still counts', () => {
+  assert.equal(G('fd=3; fd=4; bash 4< payload.sh 0>&"$fd"', PAYLOAD), 'deny');
+  assert.equal(G('fd=3; fd=4; bash 4< payload.sh >&"$fd"', PAYLOAD), 'deny');
+  assert.equal(G(`${IFOUT}sort p.md > "$out"`), 'allow', '(a plain output file still is no refusal)');
+});
+
+// run.sh is only in /work/other (a checkout of main), not in the agent repo nor the home
+const OTHER_RUN = { '/work/other/run.sh': 'git push\n' };
+test('S7 codex r3: a cd whose operand is a directory-stack entry built at run time (`cd -"$N"`) leaves the directory unknown, not home', () => {
+  for (const c of [
+    'N=1; N=0; cd -"$N" && bash run.sh',
+    'N=1; N=0; cd +"$N" && bash run.sh',
+    'N=1; N=0; pushd "+$N" && bash run.sh',
+    'N=1; N=0; cd -"$N" && git push',
+  ]) assert.equal(G(c, OTHER_RUN), 'deny', c);
+});
+
+test('S7 codex r3: a bare `cd` / `cd ~` goes to the HOME the command sees (its prefix, the line\'s assignment), or to an unknown directory when that is unsure', () => {
+  for (const c of [
+    'D=/work/repo; D=/work/other; HOME="$D" cd && bash run.sh',
+    'HOME=/work/other cd && git push',
+    'HOME=/work/other; cd && git push',
+    'export HOME=/work/other; cd ~ && git push',
+    'HOME=/work/other; cd ~/ && bash run.sh',
+    'D=/work/repo; D=/work/other; HOME=$D; cd && git push',
+  ]) assert.equal(G(c, OTHER_RUN), 'deny', c);
+  assert.equal(G('HOME=/work/repo; cd && git push', OTHER_RUN), 'allow', '(a HOME the line sets, known: the agent repo)');
+  assert.equal(G('cd && git push', OTHER_RUN, { home: '/work/repo' }), 'allow', '(the real home)');
+});
+
+const PROJ = '/home/u/proj';
+const files = (command, spec) => {
+  const fs = fakeFs(PROJ, spec, ['sub', '/home/u', '/home/u/.claude']);
+  return evaluateBashForFiles(command, { home: '/home/u', env: { HOME: '/home/u', ZDOTDIR: '/home/u' }, platform: 'linux', realpath: (p) => p, cwd: PROJ, ...fs, existsSync: fs.pathExists }).decision;
+};
+// a guarded line split over three files: the middle one comments the rest out, so only a run that skips it does the guarded thing
+const SPLIT_GIT = { 'a.sh': 'git pu', 'b.sh': '\n#', 'c.sh': 'sh origin main\n' };
+const SPLIT_FILES = { 'a.sh': 'echo x > /home/u/.cl', 'b.sh': '\n#', 'c.sh': 'aude/settings.json\n' };
+test('S7 codex r3: producers feeding one shell that may not all run (after && / ||, in an if, a loop) cannot be joined: refused', () => {
+  for (const c of [
+    '{ cat a.sh; false && cat b.sh; cat c.sh; } | bash',
+    '{ cat a.sh; true || cat b.sh; cat c.sh; } | bash',
+    '{ cat a.sh; if [ -n "$X" ]; then cat b.sh; fi; cat c.sh; } | bash',
+    '{ cat a.sh; for i in 1; do cat b.sh; done; cat c.sh; } | bash',
+  ]) {
+    assert.equal(G(c, SPLIT_GIT), 'deny', `git: ${c}`);
+    assert.equal(files(c, SPLIT_FILES), 'deny', `files: ${c}`);
+  }
+  assert.equal(G('{ cat a.sh; cat b.sh; } | bash', { 'a.sh': 'echo a\n', 'b.sh': 'echo b\n' }), 'allow', '(producers that all run, one after the other: joined as before)');
+});
+
+test('S7 codex r3: a file the line may have written before it is fed joined is not read from disk: refused', () => {
+  const ok = { 'a.sh': 'echo a\n', 'b.sh': 'echo b\n' };
+  for (const feed of ['{ cat a.sh; cat b.sh; } | bash', 'cat a.sh b.sh | bash']) {
+    assert.equal(G(`printf %s 'git pu' > a.sh; printf %s 'sh origin main' > b.sh; ${feed}`, ok), 'deny', `git: ${feed}`);
+    assert.equal(files(`printf %s 'echo x > /home/u/.cl' > a.sh; printf %s 'aude/settings.json' > b.sh; ${feed}`, ok), 'deny', `files: ${feed}`);
+  }
+  assert.equal(G('{ cat a.sh; cat b.sh; } | bash', ok), 'allow', '(nothing written on the line: read from disk)');
 });

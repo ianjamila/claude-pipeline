@@ -226,7 +226,8 @@ test('g: the work counts against the shared script budget', () => {
   const spec = { ...Object.fromEntries(names.map((n) => [n, 'ok'])), ...Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`a${i}.sh`, inner])) };
   const outer = `cat ${Array.from({ length: 30 }, (_, i) => `a${i}.sh`).join(' ')} | bash`;
   const r = denyBoth(outer, spec);
-  assert.match(r.git.reason, /too many script files/);
+  // (PR A2 S7: joined parts are also looked up in the line's writes, whose chain cap can be the limit reached first)
+  assert.match(r.git.reason, /too many script files|built from pieces/);
   assert.match(r.files.reason, /too many script files/);
   // more files than a feed list may hold are refused without reading any
   const many = Array.from({ length: 300 }, (_, i) => `m${i}.sh`).join(' ');

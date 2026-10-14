@@ -17,7 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText } from './shell-parse.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
-import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
+import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
 import { scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
 
 const PROTECTED_BRANCHES = ['main', 'master'];
@@ -195,8 +195,11 @@ function joinDir(dir, target, ctx) {
   if (typeof target !== 'string') return null;
   let t = expandVars(target, ctx);
   if (DYNAMIC.test(t) || t === '-') return null;
-  if (t === '~' || t.startsWith('~/')) t = ctx.home + t.slice(1);
-  else if (t.startsWith('~')) return null;
+  if (t === '~' || t.startsWith('~/')) {
+    const home = lineHome(ctx);
+    if (home === null) return null;
+    t = home + t.slice(1);
+  } else if (t.startsWith('~')) return null;
   const lexical = path.isAbsolute(t) ? path.resolve(t) : dir === null ? null : path.resolve(dir, t);
   // Why: `cd -P link/..`, `set -P`, zsh chaselinks: a `..` after a symlink goes to the target's parent, not the link's. When the two readings differ the directory is unknown.
   if (lexical !== null && /[^/]\/\.\.(?:\/|$)/.test(t)) {
@@ -221,16 +224,30 @@ function cdpathMaybe(cmds, ctx) {
     || cmds.some((c) => Object.keys(c.env ?? {}).some((n) => is(n) && c.env[n] !== '') || c.argv.some((a) => /^(?:CDPATH|cdpath)(?:\+?=|\[)/.test(a) || (is(a) && c.argv.length > 1 && VAR_BUILTINS.includes(baseName(c.argv[0])))));
 }
 
-function nextDir(dir, name, argv, ctx, cdpath = false) {
+// Why: `~` expands to the HOME the line has when the word is expanded: one the line assigned (known, or unsure: null), else the real home
+function lineHome(ctx) {
+  if (unsureVar(ctx, 'HOME')) return null;
+  const h = Object.hasOwn(ctx.vars, 'HOME') ? ctx.vars.HOME : ctx.home;
+  return typeof h === 'string' && path.isAbsolute(h) && !DYNAMIC.test(h) ? h : null;
+}
+function nextDir(dir, name, argv, ctx, cdpath = false, env = {}) {
   if (name === 'popd') return null;
-  const args = argv.slice(1);
+  // (the words as the cd sees them: `cd -"$N"` is an option or a stack entry only once $N is known)
+  const args = argv.slice(1).map((a) => expandVars(a, ctx));
   // Why: neither form below goes to its operand, and an unsure value now reaches a cd (see unsureVarReachingCommand): a directory-stack entry (`cd -1`, `cd +2`,
-  // `pushd +1`, zsh and bash) and zsh's `cd OLD NEW` (OLD replaced by NEW in the current directory; bash refuses it) leave the directory unknown
-  if (args.some((a) => /^[+-]\d+$/.test(a))) return null;
+  // `pushd +1`, zsh and bash) and zsh's `cd OLD NEW` (OLD replaced by NEW in the current directory; bash refuses it) leave the directory unknown, and so does
+  // a word still holding a run-time part (`cd -"$N"` may be a stack entry; Codex review 3 of #50)
+  if (args.some((a) => /^[+-]\d+$/.test(a) || DYNAMIC.test(a))) return null;
   const k = args.indexOf('--');
   const operands = k >= 0 ? args.slice(k + 1) : args.filter((a) => !(a.length > 1 && a[0] === '-'));
   if (operands.length > 1) return null;
-  if (operands.length === 0) return name === 'cd' ? ctx.home : null;
+  // Why: a bare cd goes to the HOME the cd builtin sees: its own prefix (`HOME=d cd`), else the line's (Codex review 3 of #50)
+  if (operands.length === 0) {
+    if (name !== 'cd') return null;
+    if (!Object.hasOwn(env, 'HOME')) return lineHome(ctx);
+    const h = expandVars(env.HOME, ctx);
+    return path.isAbsolute(h) && !DYNAMIC.test(h) ? path.resolve(h) : null;
+  }
   if (cdpath && !path.isAbsolute(operands[0]) && !/^(?:\.\.?(?:\/|$)|~)/.test(operands[0])) return null;
   return joinDir(dir, operands[0], ctx);
 }
@@ -926,9 +943,12 @@ function cdTargets(cmds, startDir, ctx) {
     const nm = c.argv.length ? baseName(c.argv[0]) : '';
     if (nm !== 'cd' && nm !== 'pushd') continue;
     const t = c.argv.slice(1).find((a) => !a.startsWith('-'));
-    const e = t === undefined ? '~' : expandVars(t, ctx).replace(/^\$\{?HOME\}?(?=\/|$)/, ctx.home);
+    const e = t === undefined ? '~' : expandVars(t, ctx).replace(/^\$\{?HOME\}?(?=\/|$)/, () => lineHome(ctx) ?? '$HOME');
     if (DYNAMIC.test(e) || e === '-') continue;
-    const target = e === '~' || e.startsWith('~/') ? ctx.home + e.slice(1) : e;
+    // (a HOME the line or the cd's prefix sets: see nextDir)
+    const home = t === undefined && Object.hasOwn(c.env ?? {}, 'HOME') ? null : lineHome(ctx);
+    if ((e === '~' || e.startsWith('~/')) && home === null) continue;
+    const target = e === '~' || e.startsWith('~/') ? home + e.slice(1) : e;
     for (const d of [...dirs]) {
       const nd = path.resolve(d, target);
       if (!dirs.includes(nd) && dirs.length < 32) dirs.push(nd);
@@ -1052,7 +1072,7 @@ function judgeSqlEscapes(escapes, sf, dir, ctx, level) {
 // order the command names them, repeats included (a guarded command split across them is one command). `scan`: the text a rewriting command
 // prints from them (in an order we do not know): refused when a guarded word is in the joined text, read in either order.
 function checkJoinedScripts(sf, dir, ctx, level) {
-  const texts = [];
+  const parts = [];
   const srcs = [];
   for (const w of sf.joined) {
     const home = w === '~' || w.startsWith('~/') ? ctx.home + w.slice(1) : w;
@@ -1066,27 +1086,55 @@ function checkJoinedScripts(sf, dir, ctx, level) {
         const head = ctx.readHead(abs);
         if (typeof head === 'string') return deny(`${w} is too large to verify (over 1 MB), so what it runs (or feeds a shell) cannot be known.`);
       }
-      continue; // missing: it prints nothing
+    }
+    // Why: a part the line writes before this command may hold what those writes put there, not what is on disk now (Codex review 3 of #50: `printf 'git pu' > a;
+    // printf 'sh origin main' > b; cat a b | bash`): every text it may hold is joined with every text of the others. A content only known at run time is judged as
+    // for a single script, and refused when the line mentions a guarded operation (what it adds to the join cannot be read)
+    let cands = null;
+    const wr = writtenTo(ctx.writeFrames, abs, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: sf.startup === true || ctx.ignoreUnmodelled === true });
+    if (wr) {
+      cands = writtenCandidates(wr, typeof text === 'string' ? text : null, (q) => ctx.readText(q));
+      if (cands === null) {
+        const r = isolatedState(ctx, () => judgeWrittenScript(wr, sf, abs, dir, ctx, level)); // (a fragment: what it changes is not the line's, see R2-B2)
+        if (r) return r;
+        if (lineMentionsGuarded(ctx)) return deny(`${w} may be written earlier on the line with a text only known at run time, and it is fed to one program together with other files while the line mentions a guarded operation, so what runs cannot be verified. Run the files one by one, or write the text out.`);
+      }
+    }
+    if (cands === null) {
+      if (typeof text !== 'string') continue; // missing: it prints nothing
+      cands = [text];
     }
     countScript(ctx.budget);
-    texts.push(text);
+    parts.push(cands);
     srcs.push(abs);
   }
-  if (!texts.length) return null;
+  if (!parts.length) return null;
+  const readings = joinedReadings(parts);
+  const back = sf.kind === 'scan' ? joinedReadings([...parts].reverse()) : []; // (a rewriting command prints them in an order we do not know)
+  if (readings === null || back === null) return deny(`${sf.file} may hold too many texts together (files the line writes first), so what they run when fed to one program cannot be verified. Run the files one by one.`);
+  // (one reading is the program the shell runs: what it changes carries on; of several, which one runs is not known, so each is a candidate: see judgeScoped)
+  const all = [...new Set([...readings, ...back])].filter(Boolean);
+  for (const t of all) {
+    const v = judgeJoinedText(t, all.length > 1 ? { ...sf, candidate: true } : sf, srcs, dir, ctx, level);
+    if (v) return v;
+  }
+  return null;
+}
+function judgeJoinedText(text, sf, srcs, dir, ctx, level) {
   if (sf.kind === 'scan') {
-    return GUARDED_WORDS.test(texts.join('')) || GUARDED_WORDS.test([...texts].reverse().join(''))
+    return GUARDED_WORDS.test(text)
       ? deny(`${sf.file} are read by a command that feeds a shell, and mention a guarded operation, so what the shell runs cannot be verified. Write the command out literally.`)
       : null;
   }
   // Why: the fed text of an interpreter (`cat a b | node`) is one program, judged as program text like a single `node f.mjs`, not as shell commands
   if (sf.kind === 'interp') {
-    const why = guardedCommandText(texts.join(''));
+    const why = guardedCommandText(text);
     return why ? deny(`the programs ${sf.file} (fed to an interpreter together) contain a guarded command (${why}); it cannot be verified by the guard. Run the operation directly.`) : null;
   }
   // Why: the client reads the files as ONE stream (a meta-command can start in one and end in the next), so the escapes are read from the joined text
-  if (sf.kind === 'sql') return judgeSqlEscapes(sqlShellEscapes(texts.join(''), { family: sf.family, sources: srcs }), sf, dir, ctx, level);
+  if (sf.kind === 'sql') return judgeSqlEscapes(sqlShellEscapes(text, { family: sf.family, sources: srcs }), sf, dir, ctx, level);
   if (level >= MAX_NESTING) return deny(`the scripts ${sf.file} are nested too deeply (scripts running scripts) to verify.`);
-  const v = judgeScoped(texts.join(''), dir, ctx, level, sf);
+  const v = judgeScoped(text, dir, ctx, level, sf);
   return v.decision === 'deny' ? deny(`the scripts ${sf.file} would run a blocked command: ${v.reason}`) : null;
 }
 
@@ -1570,8 +1618,9 @@ function definesFunction(str, cmds) {
 // with a sensitive stage counts). Returns the variable's name, or null.
 // Why: a redirect that only sends OUTPUT somewhere (`awk ... > "$out"`, superpowers' task-brief) hands the command nothing to read: the shell opens the file, the
 // command never sees the name. Where it writes is the write frame's business (a word known only at run time may be any file: see line-writes.mjs). A redirect the
-// command reads from (`<`, `<<<`, `<>`, `<&`) still counts.
-const OUTPUT_ONLY_OPS = new Set(['>', '>>', '>|', '>&', '&>', '&>>']);
+// command reads from (`<`, `<<<`, `<>`, `<&`) still counts, and so does a duplication (`>&WORD`): `0>&"$fd"` hands a READABLE descriptor (`4< payload.sh`)
+// to stdin (Codex review 3 of #50).
+const OUTPUT_ONLY_OPS = new Set(['>', '>>', '>|', '&>', '&>>']);
 function unsureVarReachingCommand(cmds, ctx) {
   // taint: a variable assigned from an unsure one is unsure (`X=$F; bash "$X"`), to a fixed point
   const assigns = [];
@@ -1723,7 +1772,7 @@ function evalString(str, startDir, ctx, level) {
         // (a value that still holds a `$` is not worked out: the case change would apply to what it expands to)
         if (d.transform && DYNAMIC.test(v)) { delete ctx.vars[k]; ctx.unsureVars.add(k); } else setVar(ctx, k, applyTransform(v, d.transform), level);
       }
-    } else if (name === 'cd' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name, argv, ctx, cdp);
+    } else if (name === 'cd' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name, argv, ctx, cdp, c.env ?? {});
     else if (name === 'git' || name === 'gh') {
       const unsure = unsureVarUsed([...argv.slice(1), ...Object.values(c.env)], ctx);
       if (unsure !== null) verdict = deny(`$${unsure} was assigned more than once on this line, so its value (and what this ${name} command does with it) cannot be verified. Assign it once, or write the value out.`);
