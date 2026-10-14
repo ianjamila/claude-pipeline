@@ -1037,7 +1037,7 @@ function judgeScriptText(text, sf, abs, dir, ctx, level) {
   // text a command rewrites on its way to a shell (sed, awk, base64 ...) is computed at run time: a file holding a guarded word is refused
   if (sf.kind === 'scan') return GUARDED_WORDS.test(text) ? deny(`${sf.file} is read by a command that feeds a shell, and mentions a guarded operation, so what the shell runs cannot be verified. Write the command out literally.`) : null;
   // Why: psql / mysql / sqlite3 run only the shell escapes in their input (\! , \g |cmd, .shell ...): those lines are judged like a script
-  if (sf.kind === 'sql') return judgeSqlEscapes(sqlShellEscapes(text, { family: sf.family, sources: [abs] }), sf, dir, ctx, level);
+  if (sf.kind === 'sql') return judgeSqlEscapes(sqlShellEscapes(text, { family: sf.family, sources: [abs], budget: ctx.budget }), sf, dir, ctx, level);
   let kind = sf.kind;
   if (kind === 'exec') {
     if (text.slice(0, 4096).includes('\u0000')) return null; // a binary
@@ -1139,7 +1139,7 @@ function judgeJoinedText(text, sf, srcs, dir, ctx, level) {
     return why ? deny(`the programs ${sf.file} (fed to an interpreter together) contain a guarded command (${why}); it cannot be verified by the guard. Run the operation directly.`) : null;
   }
   // Why: the client reads the files as ONE stream (a meta-command can start in one and end in the next), so the escapes are read from the joined text
-  if (sf.kind === 'sql') return judgeSqlEscapes(sqlShellEscapes(text, { family: sf.family, sources: srcs }), sf, dir, ctx, level);
+  if (sf.kind === 'sql') return judgeSqlEscapes(sqlShellEscapes(text, { family: sf.family, sources: srcs, budget: ctx.budget }), sf, dir, ctx, level);
   if (level >= MAX_NESTING) return deny(`the scripts ${sf.file} are nested too deeply (scripts running scripts) to verify.`);
   const v = judgeScoped(text, dir, ctx, level, sf);
   return v.decision === 'deny' ? deny(`the scripts ${sf.file} would run a blocked command: ${v.reason}`) : null;

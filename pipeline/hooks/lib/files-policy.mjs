@@ -1561,7 +1561,7 @@ function judgeJoinedScripts(sf, dirs, ctx, opts, scanRaw = '') {
           continue;
         }
         // (a database client reads the files as ONE stream: the escapes are read from the joined text)
-        const joinedText = sf.kind === 'sql' ? sqlShellEscapes(joined, { family: sf.family, sources: abss }).join('\n') : joined;
+        const joinedText = sf.kind === 'sql' ? sqlShellEscapes(joined, { family: sf.family, sources: abss, budget: ctx.budget }).join('\n') : joined;
         if (!joinedText) continue;
         const r = evaluateBashForFiles(joinedText, { ...opts, cwd: d || ctx.cwd, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup });
         if (r.decision === 'deny') return deny(`the scripts ${sf.file} would run: ${r.reason}`);
@@ -1613,7 +1613,7 @@ function judgeScriptText(text, sf, abs, dir, ctx, opts) {
   }
   // Why: psql / mysql / sqlite3 run only the shell escapes in their input (\! , \g |cmd, .shell ...): those lines are judged like a script
   if (sf.kind === 'sql') {
-    const esc = sqlShellEscapes(text, { family: sf.family, sources: [abs] }).join('\n');
+    const esc = sqlShellEscapes(text, { family: sf.family, sources: [abs], budget: ctx.budget }).join('\n');
     if (!esc) return null;
     const r = evaluateBashForFiles(esc, { ...opts, cwd: dir, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup });
     return r.decision === 'deny' ? deny(`the input ${sf.file} would run: ${r.reason}`) : null;

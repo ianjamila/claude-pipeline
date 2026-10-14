@@ -1,10 +1,12 @@
-// Why (review round 3 of the SQL-client scanner): R3-B1 a quoted sqlite pipe target (`.output "|cmd"`) is a command, not a file.
+// Why (review round 3 of the SQL-client scanner): R3-B1 a quoted sqlite pipe target (`.output "|cmd"`) is a command, not a file; R3-B2 psql interpolation
+// marks the WHOLE input unknown once (it was once per line: quadratic output) and the scan honours the evaluation deadline.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolve, dirname, basename } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { sqlShellEscapes } from '../pipeline/hooks/lib/sql-clients.mjs';
+import { newEvalBudget, GuardLimit } from '../pipeline/hooks/lib/script-candidates.mjs';
 
 function fakeFs(root, files, dirs = []) {
   const abs = (p) => resolve(root, p);
@@ -60,4 +62,33 @@ test('R3-B1 twins: a quoted harmless pipe command is allowed; a quoted plain fil
   assert.deepEqual(sqlShellEscapes('.output "out.txt"', { family: 'sqlite' }), [': > out.txt']);
   assert.deepEqual(sqlShellEscapes(".once 'out.txt'", { family: 'sqlite' }), [': > out.txt']);
   assert.deepEqual(sqlShellEscapes('.output stdout', { family: 'sqlite' }), []);
+});
+
+// ---- R3-B2 -----------------------------------------------------------------------------------------------------------------------
+
+test('R3-B2: an interpolating psql input marks the whole input unknown once, output stays linear in the input', () => {
+  const small = sqlShellEscapes('select :x;\nselect 1;', { family: 'psql' });
+  assert.equal(small.length, 1, 'one whole-input unknown line');
+  const lines = Array.from({ length: 5000 }, (_, i) => `select :x${i};`);
+  const text = lines.join('\n');
+  const out = sqlShellEscapes(text, { family: 'psql' });
+  const size = out.reduce((n, l) => n + l.length, 0);
+  assert.ok(size < text.length * 3, `output ${size} chars for ${text.length} input chars`);
+  assert.ok(out.length < 10, `${out.length} output lines`);
+  // the family-unknown scan (every table) behaves the same
+  assert.ok(sqlShellEscapes(text).reduce((n, l) => n + l.length, 0) < text.length * 3);
+});
+
+test('R3-B2: the verdict for an interpolating psql file is unchanged (still unknown input, refused next to a guarded word)', () => {
+  assert.deepEqual(verdicts('psql < q.sql', 'select :x;\nselect 1;\n\\! @@'), { git: 'deny', files: 'deny' });
+  assert.deepEqual(verdicts('psql < q.sql', 'select :x;\nselect 1;'), { git: 'allow', files: 'allow' });
+});
+
+test('R3-B2: the scan stops at the evaluation deadline (fail closed with a GuardLimit)', () => {
+  let t = 0;
+  const budget = newEvalBudget(() => t);
+  const text = Array.from({ length: 50 }, (_, i) => `select ${i};`).join('\n');
+  assert.doesNotThrow(() => sqlShellEscapes(text, { family: 'psql', budget }));
+  t = 10 ** 9; // past the deadline
+  assert.throws(() => sqlShellEscapes(text, { family: 'psql', budget }), GuardLimit);
 });

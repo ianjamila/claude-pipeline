@@ -5,6 +5,7 @@
 // model is an ALLOWLIST: a meta-command outside the known-safe set is an unknown shell line (dynamic: refused when guarded text is around), never skipped.
 import { randomBytes } from 'node:crypto';
 import { dirname, isAbsolute, join } from 'node:path';
+import { newEvalBudget, checkDeadline } from './script-candidates.mjs'; // (used only when a scan runs, so the import cycle through shell-parse is harmless)
 
 const FAMILY = { psql: 'psql', pgcli: 'psql', usql: 'psql', mysql: 'mysql', mariadb: 'mysql', mycli: 'mysql', sqlite3: 'sqlite' };
 const PROG = { psql: 'psql', mysql: 'mysql', sqlite: 'sqlite3' };
@@ -69,7 +70,8 @@ function interpolates(text) {
  * and an unknown line for every meta-command outside the known-safe set.
  * @param {string} text
  * @param {{family?: string, sources?: string[]}} opts family: psql | mysql | sqlite | mycnf | any (unknown client); sources: absolute paths of the files the text was read
- * from (`\ir` is relative to the directory of the one being read, `\i` and the rest to the working directory, where the sub-script is judged).
+ * from (`\ir` is relative to the directory of the one being read, `\i` and the rest to the working directory, where the sub-script is judged);
+ * budget: the evaluation budget (its deadline is checked once per line; none given: a fresh one), a scan past it throws GuardLimit, which the policies turn into a denial.
  */
 export function sqlShellEscapes(text, opts = {}) {
   const fam = opts.family ?? 'any';
@@ -77,7 +79,11 @@ export function sqlShellEscapes(text, opts = {}) {
   const out = [];
   const sources = opts.sources ?? [];
   let shellRest;
+  const budget = opts.budget ?? newEvalBudget();
   const unknown = (raw) => out.push(`${UNKNOWN} ${clean(raw)}`);
+  // Why: the whole input as an unknown line is the same line however often it is asked for, and cleaning all of it once per input LINE is quadratic output (6,500 chars gave 2.7 MB)
+  let wholeUnknown = false;
+  const unknownWhole = () => { if (!wholeUnknown) { wholeUnknown = true; unknown(t); } };
   const write = (f) => out.push(`: > ${targetOf(f)}`);
   const include = (prog, w, relative) => {
     const f = unq(w);
@@ -88,13 +94,14 @@ export function sqlShellEscapes(text, opts = {}) {
   // (the command of a sqlite `|cmd` argument: unquoted it is the rest of the text after the pipe; quoted, the whole decoded word after it)
   const pipeCommand = (rest, word) => (/^\s*\|/.test(rest) ? rest.replace(/^\s*\|/, '') : word.slice(1));
   const all = fam === 'any';
+  const interp = (fam === 'psql' || all) && interpolates(t); // (once: the answer is about the whole input, not the line)
 
   // ---- psql: `\word args` anywhere in a line (quotes are not tracked: a backslash in a string is read as a command, fail closed).
   // Why: a shell escape's text is the REST OF THE LINE, unsplit (`\! git push origin ma\in`: the shell reads `ma\in` as main); a later backslash in it also leaves the line unknown.
   const psql = (line) => {
     // Why: psql re-lexes the value of an interpolated variable (`\set x '\\! cmd'` then `:x` on any line is a backslash command), so any interpolation, or a `\set` value that holds a backslash, is unknown input
     // (`\gset` fills variables from a query result, whose text is unknown; `\set` anywhere on the line, then a backslash after it)
-    if (interpolates(t) || /\\set\b[\s\S]*\\./.test(line) || /\\gset\b/.test(line)) unknown(t);
+    if (interp || /\\set\b[\s\S]*\\./.test(line) || /\\gset\b/.test(line)) unknownWhole();
     let at = line.indexOf('\\');
     while (at >= 0) {
       const m = /^\\(\\|[A-Za-z0-9_]+|.)/.exec(line.slice(at));
@@ -109,7 +116,7 @@ export function sqlShellEscapes(text, opts = {}) {
           let depth = 0;
           let end = -1;
           for (let k = lead[0].length - 1; k < whole.length; k++) { if (whole[k] === '(') depth++; else if (whole[k] === ')' && --depth === 0) { end = k; break; } }
-          if (end < 0) { unknown(t); break; }
+          if (end < 0) { unknownWhole(); break; }
           whole = whole.slice(end + 1);
           skipped = end + 1;
         }
@@ -124,7 +131,7 @@ export function sqlShellEscapes(text, opts = {}) {
       for (const k of ticks) run(k);
       // Why: psql interpolates :var / :'var' / :"var" in the arguments (`\set f ~/.claude/x` then `\o :f`): the target, include or command is only known at run time,
       // so the whole input is the unknown line (what the variable was set to sits elsewhere in it)
-      if (/^(?:!|i|include|ir|include_relative|o|out|g|gx|w|s|lo_export|copy)$/.test(word) && /(?:^|[\s'"(,]):['"]?[A-Za-z_]/.test(rest)) unknown(t);
+      if (/^(?:!|i|include|ir|include_relative|o|out|g|gx|w|s|lo_export|copy)$/.test(word) && /(?:^|[\s'"(,]):['"]?[A-Za-z_]/.test(rest)) unknownWhole();
       if (word === '!') { if (rest.trim()) run(rest); else { unknown(line.slice(at)); shellRest = true; } }
       else if (/^(?:i|include)$/.test(word)) { if (words[0]) include('psql', words[0], false); }
       else if (/^(?:ir|include_relative)$/.test(word)) { if (words[0]) include('psql', words[0], true); }
@@ -138,7 +145,7 @@ export function sqlShellEscapes(text, opts = {}) {
       } else if (PSQL_SAFE.has(word) || /^d[A-Za-z+]*$/.test(word) || /^l(?:ist)?\+?$/.test(word)) { /* safe */ }
       else if (all) { /* judged by the other tables */ } else unknown(line.slice(at));
       at = escape || next < 0 ? -1 : at + m[0].length + skipped + next;
-      if (at >= 0 && line[at] !== '\\') { unknown(t); at = -1; } // (the scan must land on a backslash; anything else means the offsets are off: unknown input)
+      if (at >= 0 && line[at] !== '\\') { unknownWhole(); at = -1; } // (the scan must land on a backslash; anything else means the offsets are off: unknown input)
     }
   };
   // ---- mysql: bare words at the start of a statement, `\X` commands anywhere in a line (`\!` and `\P` take the rest of the line, unsplit)
@@ -197,7 +204,8 @@ export function sqlShellEscapes(text, opts = {}) {
   const sqliteSql = (whole) => {
     // (unknown: the text as it is, and with its string concatenations joined, so a name split as 'a' || 'b' is read whole)
     const CAT = /'\s*(?:\/\*[\s\S]*?\*\/\s*|--[^\n]*\n\s*)*\|\|\s*(?:\/\*[\s\S]*?\*\/\s*|--[^\n]*\n\s*)*'/g;
-    const unknownSql = () => { unknown(whole); unknown(whole.replace(CAT, '')); };
+    let flagged = false; // (the same two lines however many matches ask for them)
+    const unknownSql = () => { if (flagged) return; flagged = true; unknown(whole); unknown(whole.replace(CAT, '')); };
     const text = whole;
     // (comments are cut first, then the lines are folded: `writefile(\n'F',\n x)` is one call)
     const bare = text.replace(/--[^\n]*|\/\*[\s\S]*?\*\//g, ' ').replace(/\s+/g, ' ');
@@ -227,6 +235,7 @@ export function sqlShellEscapes(text, opts = {}) {
   // Why: a bare `\!` (mysql `system`, sqlite `.shell` with nothing after it) starts a shell that reads the REST of the client's input: every later line is shell text too
   shellRest = false;
   for (const line of t.split(/\r\n|\r|\n/)) {
+    checkDeadline(budget);
     if (shellRest) run(line);
     if (fam === 'psql' || all) psql(line);
     if (fam === 'mysql' || all) mysql(line);
