@@ -433,6 +433,111 @@ test('codex-review: rulings from earlier rounds go into the next prompt and pre-
   assert.equal(w.state().rounds[1].toHead, head2);
 });
 
+// ---- review range across an update-branch (main merged into the PR branch) ---------------------
+
+// Main moves on (a commit touching `files`), then the PR branch merges it in, the way "Update branch" does. A conflict
+// is resolved with `resolve` (path -> content). -> the merge commit.
+function mergeMainInto(w, files, { resolve = {} } = {}) {
+  w.repo.checkout('main');
+  for (const [file, content] of Object.entries(files)) w.repo.write(file, content);
+  w.repo.commit('main moves on');
+  w.repo.checkout('feat/x');
+  try {
+    w.repo.git(['merge', '--no-ff', '-m', 'Merge main into feat/x', 'main']);
+  } catch (err) {
+    if (Object.keys(resolve).length === 0) throw err;
+    for (const [file, content] of Object.entries(resolve)) w.repo.write(file, content);
+    w.repo.git(['add', '-A']);
+    w.repo.git(['commit', '-q', '--no-edit']);
+  }
+  return w.repo.git(['rev-parse', 'HEAD']).trim();
+}
+// The real repo ignores .review/; the throwaway one commits everything with add -A, which would put round files into the diffs under test.
+function worldIgnoringReview(t) {
+  const w = world(t);
+  writeFileSync(join(w.repo.dir, '.git', 'info', 'exclude'), '.review/\n');
+  return w;
+}
+const patchOf = (w, n) => readFileSync(w.roundFile(n, 'diff.patch'), 'utf8');
+
+test('codex-review: a round after no merge reviews previous toHead..head, recorded as the previous head', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf()), 0);
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  const head2 = w.repo.commit('more');
+  const r = w.codex(2, findingsOf(), { from: w.head, to: head2 });
+  assertExit(r, 0, r.stderr + r.stdout);
+  const round = w.state().rounds[1];
+  assert.deepEqual([round.fromHead, round.reviewBase, round.reviewBaseKind], [w.head, w.head, 'previous']);
+  assert.match(patchOf(w, 2), /src\/c\.js/);
+  assert.doesNotMatch(patchOf(w, 2), /src\/a\.js/);
+  assert.doesNotMatch(w.captured()[1].stdin, /merged in from the base branch/);
+  assert.equal(w.state().rounds[0].reviewBase, w.base, 'round 1 is reviewed against the merge base');
+});
+
+test('codex-review: commits merged in from the base branch are not in the next round\'s diff, the prompt or the record', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf()), 0);
+  mergeMainInto(w, { 'src/from-main.js': 'export const other = "someone else\'s PR";\n' });
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  const head2 = w.repo.commit('later pr commit');
+  const r = w.codex(2, findingsOf(), { from: w.head, to: head2 });
+  assertExit(r, 0, r.stderr + r.stdout);
+
+  const patch = patchOf(w, 2);
+  assert.doesNotMatch(patch, /from-main\.js/, 'main\'s file is not shown to Codex');
+  assert.match(patch, /src\/c\.js/, 'the PR\'s own later commit is');
+  const round = w.state().rounds[1];
+  assert.equal(round.reviewBaseKind, 'synthetic');
+  assert.equal(round.fromHead, w.head);
+  assert.equal(round.toHead, head2);
+  assert.match(round.reviewBase, /^[0-9a-f]{40,64}$/);
+  const prompt = w.captured()[1].stdin;
+  assert.match(prompt, new RegExp(`git diff ${round.reviewBase}\\.\\.${head2}`));
+  assert.match(prompt, /merged in from the base branch are excluded/);
+});
+
+test('codex-review: a round that only merged the base branch in is recorded as baseOnly and Codex is not run', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf()), 0);
+  const merged = mergeMainInto(w, { 'src/from-main.js': 'export const other = 1;\n' });
+  const calls = w.captured().length;
+  const r = w.codex(2, findingsOf([finding()]), { from: w.head, to: merged });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.baseOnly, true);
+  assert.deepEqual(r.json.counts, { blocking: 0, suggestions: 0, worth_considering: 0 });
+  assert.equal(w.captured().length, calls, 'the Codex stub was not called');
+  const round = w.state().rounds[1];
+  assert.deepEqual([round.n, round.baseOnly, round.items, round.toHead, round.reviewBaseKind], [2, true, [], merged, 'synthetic']);
+
+  // Nothing pending and the content is what round 1 reviewed: the outcome treats it like a clean round.
+  const outcome = w.cli(['state', 'outcome']);
+  assertExit(outcome, 0);
+  assert.equal(outcome.json.clean, true, JSON.stringify(outcome.json));
+  assert.equal(outcome.json.coverageValid, true);
+});
+
+test('codex-review: a conflicting merge falls back to the whole PR against the new base, never main\'s own changes', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf()), 0);
+  // Main edits the very line (src/a.js 12) that round 1 reviewed the PR changing, so merging what was reviewed with the new
+  // base conflicts; the real merge resolves it by hand.
+  const mainA = aFile(false).replace('v12 = 12', 'v12 = 1200');
+  const merged = mergeMainInto(w, { 'src/a.js': mainA, 'src/from-main.js': 'export const other = 1;\n' }, { resolve: { 'src/a.js': aFile(true) } });
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  const head2 = w.repo.commit('later pr commit');
+  const r = w.codex(2, findingsOf(), { from: w.head, to: head2 });
+  assertExit(r, 0, r.stderr + r.stdout);
+  const round = w.state().rounds[1];
+  assert.equal(round.reviewBaseKind, 'whole-pr');
+  assert.equal(round.reviewBase, w.repo.git(['merge-base', 'main', head2]).trim());
+  const patch = patchOf(w, 2);
+  assert.doesNotMatch(patch, /from-main\.js/);
+  assert.match(patch, /src\/a\.js/, 'the whole PR is reviewed');
+  assert.match(patch, /src\/c\.js/);
+  assert.ok(merged);
+});
+
 test('codex-review: when the code around a ruled finding changed, the ruling is not reused', (t) => {
   const w = world(t);
   assertExit(w.codex(1, findingsOf([finding()])), 0);
@@ -916,6 +1021,22 @@ test('state show: filters by round, accepted, disputed and needs-human; mark-imp
   assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1,R9-B9']), 2);
   assertExit(w.cli(['state', 'mark-implemented', '--ids', '']), 2);
   assert.equal(w.stateText(), before, 'a bad id list changes nothing');
+});
+
+test('state mark-implemented: files that came in from merging the base branch do not count as the fix', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
+  mergeMainInto(w, { 'src/from-main.js': 'export const other = 1;\n' });
+  w.repo.write('src/a.test.js', 'console.log("only a test");\n');
+  w.repo.commit('add a test');
+  const refused = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assertExit(refused, 2, refused.stderr + refused.stdout);
+  assert.match(refused.json.message, /only test files changed \(src\/a\.test\.js\)/, 'main\'s src/from-main.js is not the PR\'s change');
+
+  w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
+  w.repo.commit('fix');
+  assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']), 0);
 });
 
 test('state record-followup and set-outcome', (t) => {

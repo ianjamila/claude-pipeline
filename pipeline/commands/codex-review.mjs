@@ -6,7 +6,10 @@
 //
 // The range is not the caller's to choose. Round 1 must start at the merge base of the PR (so the review covers the
 // whole PR and risk / light lane are measured on all of it); every later round must start where the previous one
-// ended (so nothing between two rounds goes unreviewed). Anything else is exit 2 before Codex runs. The state is
+// ended (so nothing between two rounds goes unreviewed). Anything else is exit 2 before Codex runs.
+// What Codex is shown for a later round is that range minus whatever was merged in from the PR's base branch since the
+// previous round (git.mjs#effectiveReviewBase): those commits were reviewed in their own PRs. A round that is nothing but
+// such a merge is recorded as `baseOnly` without running Codex. The state is
 // read-modified-written under the per-PR lock, but the lock is NOT held while Codex runs (up to 30 minutes): the
 // state is read again under the lock once Codex has answered, and a round recorded in the meantime wins.
 import { existsSync, readFileSync, rmSync, statSync } from 'node:fs';
@@ -17,7 +20,9 @@ import {
   validateFindings,
 } from '../lib/codex.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
-import { GitError, diffFiles, headSha, mergeBase, reviewPatch, revParse, showFile } from '../lib/git.mjs';
+import {
+  GitError, NETWORK_TIMEOUT_MS, diffFiles, effectiveReviewBase, git, headSha, mergeBase, reviewPatch, revParse, showFile,
+} from '../lib/git.mjs';
 import { collectHardStops } from '../lib/hardstops.mjs';
 import { createGitHub } from '../lib/github.mjs';
 import { GhError, codexCommand, runAsync } from '../lib/proc.mjs';
@@ -36,6 +41,8 @@ export const meta = {
     '  -> {ok, round, counts:{blocking, suggestions, worth_considering}, preRuled, lightLane, path}',
     '  --base must be the PR\'s merge base for round 1 and the previous round\'s toHead after that, else exit 2 {error:base-mismatch}',
     '  exit 2 {error:empty-range} when earlier rounds accepted items and the branch content is unchanged since the last round (base == head)',
+    '  commits merged in from the PR\'s base branch since the previous round are left out of the reviewed diff; a round that only merged them in',
+    '    is recorded without running Codex: {ok:true, baseOnly:true, counts all 0}',
     '  exit 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|malformed|github} when Codex or GitHub could not deliver',
     '  env: PIPELINE_CODEX_TIMEOUT_MS overrides the 30 minute Codex timeout (tests)',
   ].join('\n'),
@@ -128,6 +135,13 @@ export const run = guarded(async (argv, ctx) => {
 
   // The merge base of the whole PR: where the PR forked from the branch it targets (origin/<base> when it exists).
   const prBase = typeof view.baseRefName === 'string' && view.baseRefName !== '' ? view.baseRefName : config.default_branch;
+  // Best effort: a fresh origin/<base> is what "merged in from the base branch" is measured against. Offline, no remote or a
+  // slow one just means the cached ref is used.
+  try {
+    git(['fetch', '--no-tags', 'origin', `+refs/heads/${prBase}:refs/remotes/origin/${prBase}`], { ...o, timeoutMs: NETWORK_TIMEOUT_MS });
+  } catch (err) {
+    if (!(err instanceof GitError)) throw err;
+  }
   const forkPoint = mergeBase(reviewBaseRef(root, config, prBase), head, o);
   const checkBase = (st) => {
     const last = st?.rounds.at(-1);
@@ -161,9 +175,13 @@ export const run = guarded(async (argv, ctx) => {
   const lightLane = (state ? state.lightLane === true : true) && isLightLane({ level, changedLines, hits, config });
 
   ensureRoundDir(root, round);
-  // What Codex is shown (and what the fix commits are measured against) is exactly this range.
+  // What Codex is shown (and what the fix commits are measured against) is exactly this range. Round 1 starts at the merge
+  // base; a later round starts where the previous one ended, with the base branch's commits merged in since then taken out.
+  const review = state?.rounds.length > 0 ? effectiveReviewBase({ from: base, forkPoint }, o) : { base: forkPoint, kind: 'merge-base' };
   // Large binary documents would overflow the buffer; they are named at the end of the patch and in the prompt instead.
-  const { patch, skipped: largeBinaries } = reviewPatch(base, head, o);
+  const { patch, skipped: largeBinaries } = reviewPatch(review.base, head, o);
+  // Only the base branch was merged in since the last round: there is nothing of the PR's own to review.
+  const baseOnly = review.kind === 'synthetic' && patch === '' && largeBinaries.length === 0;
   const note = largeBinaryNote(largeBinaries);
   writeFileAtomic(path.join(dir, 'diff.patch'), note.length === 0 ? patch : `${patch}\nLarge binary files (content not shown):\n${note.join('\n')}\n`);
 
@@ -175,40 +193,49 @@ export const run = guarded(async (argv, ctx) => {
     id: item.id, title: item.title, ruling: `${cache[fp].decision ?? 'unknown'}: ${cache[fp].reason ?? ''}`,
   }));
   const prompt = buildReviewPrompt({
-    pr, title: view.title, body: view.body, base, head, risk: level, round, lightLane, priorRulings, rulesRef: forkPoint, largeBinaries,
+    pr, title: view.title, body: view.body, base: review.base, head, risk: level, round, lightLane, priorRulings, rulesRef: forkPoint, largeBinaries, baseKind: review.kind,
   });
 
   const hashAtHead = currentContentHash(root, config);
 
-  // Whatever is at the output path now was not written by this run; remove it so it can never be read as this
-  // run's answer. (The mtime check below is the second line of defence, the tree kill on timeout the third.)
-  rmSync(outPath, { force: true });
-  const startedAt = Date.now();
-  const { cmd, prefixArgs } = codexCommand(ctx.env);
-  const timeoutMs = Number(ctx.env?.PIPELINE_CODEX_TIMEOUT_MS) || CODEX_TIMEOUT_MS;
-  // On a timeout the whole process tree is killed, so a helper Codex started cannot write its answer afterwards.
-  const r = await runAsync(cmd, [...prefixArgs, ...args], { cwd: root, env: ctx.env, input: prompt, timeoutMs });
-  // A spawn failure is reported as stderr "spawn <cmd> ENOENT"; classify it as the missing binary it is.
-  const spawnError = /^spawn(?:Sync)? .*\bENOENT\b/.test(r.stderr) ? { code: 'ENOENT', message: r.stderr } : undefined;
-  if (r.code !== 0 || r.timedOut) {
-    rmSync(outPath, { force: true });
-    const reason = classifyCodexFailure({ code: r.code, stderr: r.stderr, stdout: r.stdout, timedOut: r.timedOut, spawnError });
-    throw unavailable(reason, { code: r.code, timedOut: r.timedOut, detail: tail(r.stderr || r.stdout) });
-  }
-
   const headMoved = () => new Fail(EXIT.USAGE, { ok: false, error: 'head-moved', message: 'HEAD moved while Codex was reviewing; run the round again' });
-  if (headSha(o) !== head) throw headMoved();
+  // Runs Codex over the prepared prompt and returns its validated findings (every failure is an exit-3 Fail).
+  const askCodex = async () => {
+    // Whatever is at the output path now was not written by this run; remove it so it can never be read as this
+    // run's answer. (The mtime check below is the second line of defence, the tree kill on timeout the third.)
+    rmSync(outPath, { force: true });
+    const startedAt = Date.now();
+    const { cmd, prefixArgs } = codexCommand(ctx.env);
+    const timeoutMs = Number(ctx.env?.PIPELINE_CODEX_TIMEOUT_MS) || CODEX_TIMEOUT_MS;
+    // On a timeout the whole process tree is killed, so a helper Codex started cannot write its answer afterwards.
+    const r = await runAsync(cmd, [...prefixArgs, ...args], { cwd: root, env: ctx.env, input: prompt, timeoutMs });
+    // A spawn failure is reported as stderr "spawn <cmd> ENOENT"; classify it as the missing binary it is.
+    const spawnError = /^spawn(?:Sync)? .*\bENOENT\b/.test(r.stderr) ? { code: 'ENOENT', message: r.stderr } : undefined;
+    if (r.code !== 0 || r.timedOut) {
+      rmSync(outPath, { force: true });
+      const reason = classifyCodexFailure({ code: r.code, stderr: r.stderr, stdout: r.stdout, timedOut: r.timedOut, spawnError });
+      throw unavailable(reason, { code: r.code, timedOut: r.timedOut, detail: tail(r.stderr || r.stdout) });
+    }
 
-  let findings;
-  try {
-    if (!existsSync(outPath)) throw new Error('codex exited 0 but wrote no output file');
-    if (statSync(outPath).mtimeMs < startedAt - MTIME_SLACK_MS) throw new Error('codex output file predates this run');
-    findings = JSON.parse(readFileSync(outPath, 'utf8'));
-  } catch (err) {
-    throw unavailable('malformed', { errors: [err.message] });
-  }
-  const checked = validateFindings(findings);
-  if (!checked.ok) throw unavailable('malformed', { errors: checked.errors });
+    if (headSha(o) !== head) throw headMoved();
+
+    let findings;
+    try {
+      if (!existsSync(outPath)) throw new Error('codex exited 0 but wrote no output file');
+      if (statSync(outPath).mtimeMs < startedAt - MTIME_SLACK_MS) throw new Error('codex output file predates this run');
+      findings = JSON.parse(readFileSync(outPath, 'utf8'));
+    } catch (err) {
+      throw unavailable('malformed', { errors: [err.message] });
+    }
+    const checked = validateFindings(findings);
+    if (!checked.ok) throw unavailable('malformed', { errors: checked.errors });
+
+    return findings;
+  };
+  // A base-merge-only round has nothing to ask about: zero findings, and the round says why.
+  const findings = baseOnly
+    ? { summary: 'Only the base branch was merged in since the previous round; Codex was not run.', blocking: [], suggestions: [], worth_considering: [] }
+    : await askCodex();
 
   const fileCache = new Map();
   const excerptFor = (file, line) => {
@@ -238,6 +265,7 @@ export const run = guarded(async (argv, ctx) => {
     const ruled = reuseRuled(assignIds(findings, round, excerptFor, { contentHash: hashAtHead }), ruledCacheFrom(allItems(base0)));
     const next = addRound({ ...base0, risk: level, lightLane, currentContentHash: hashAtHead }, {
       n: round, fromHead: base, toHead: head, contentHashAtToHead: hashAtHead, items: ruled,
+      reviewBase: review.base, reviewBaseKind: review.kind, ...(baseOnly ? { baseOnly: true } : {}),
     });
     writeJson(path.join(dir, 'codex.json'), { findings, items: ruled });
     writeFileAtomic(path.join(dir, 'codex.md'), renderFindingsMarkdown(findings, round, ruled));
@@ -256,6 +284,7 @@ export const run = guarded(async (argv, ctx) => {
         suggestions: findings.suggestions.length,
         worth_considering: findings.worth_considering.length,
       },
+      ...(baseOnly ? { baseOnly: true } : {}),
       preRuled: items.filter((i) => i.final).length,
       lightLane: state.lightLane,
       path: dir,

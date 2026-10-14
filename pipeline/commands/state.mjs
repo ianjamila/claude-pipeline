@@ -5,15 +5,15 @@ import { EXIT, UnavailableError, UsageError, intOption, parseCommandArgs, requir
 import { mkdirSync, existsSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
-import { git } from '../lib/git.mjs';
+import { effectiveReviewBase, git, mergeBase } from '../lib/git.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { MARKERS } from '../lib/render.mjs';
 import { decodeFromComment, loadState, saveState, updateItems } from '../lib/state.mjs';
 import { roundOutcome } from '../lib/triage.mjs';
 import {
-  allItems, currentContentHash, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, requireState, roundDir,
-  stateExtends, withStateLock,
+  allItems, currentContentHash, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, requireState, reviewBaseRef,
+  roundDir, stateExtends, withStateLock,
 } from '../lib/review-context.mjs';
 
 export const meta = {
@@ -207,7 +207,9 @@ async function markImplemented(rest, ctx) {
         });
       }
       // A settle-by-test commit changes the hash too, so also require a non-test file to have changed since then.
-      const changed = git(['diff', '--name-only', '--no-renames', `${round.toHead}..HEAD`], { cwd: root }).split('\n').filter(Boolean);
+      // Measured from the round's head, minus whatever was merged in from the base branch since (those are not the PR's change).
+      const since = effectiveReviewBase({ from: round.toHead, forkPoint: mergeBase(reviewBaseRef(root, config), 'HEAD', { cwd: root }) }, { cwd: root });
+      const changed = git(['diff', '--name-only', '--no-renames', `${since.base}..HEAD`], { cwd: root }).split('\n').filter(Boolean);
       const code = changed.filter((f) => f !== config.agent_log && !matchAny(f, config.integrity.test_globs));
       if (code.length === 0) {
         throw new Fail(EXIT.USAGE, {
