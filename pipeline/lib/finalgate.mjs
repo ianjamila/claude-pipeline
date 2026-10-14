@@ -20,6 +20,7 @@ import { toPosix } from './paths.mjs';
 import { loadState } from './state.mjs';
 import { parseYaml } from './yaml.mjs';
 import { reviewValidFor } from './triage.mjs';
+import { skipOf } from './verify-steps.mjs';
 import { commitTime, diffFiles, headSha, mergeBase, revParse, reviewBaseRef, reviewContentHash, treeFingerprint } from './git.mjs';
 
 export const GATE_FILE = 'final-gate.json';
@@ -247,16 +248,6 @@ async function preflightCheck({ root, env, gh }) {
   return check('preflight', false, report.reasons.length ? report.reasons.join('; ') : 'preflight says the pipeline may not merge');
 }
 
-// A verify step that did not run for a stated reason. Two shapes: `status: 'skipped'` + `skipReason`, and the legacy
-// eaglewatch row `status: 'pass', skipped: true` (reason in `skipCheck`, else the row's `command`). Everything else
-// (including a failed row that merely carries skipped:true) is not a skip. `reason` is '' when none is given.
-export function skipOf(step) {
-  if (!isObject(step)) return null;
-  const legacy = step.status === 'pass' && step.skipped === true;
-  if (step.status !== 'skipped' && !legacy) return null;
-  const given = step.status === 'skipped' ? step.skipReason : (step.skipCheck ?? step.command);
-  return { name: step.name, reason: typeof given === 'string' ? given.trim() : '' };
-}
 const SKIP_REASON_SHOWN = 80;
 const clip = (text, n) => (text.length > n ? `${text.slice(0, n)}\u2026` : text);
 

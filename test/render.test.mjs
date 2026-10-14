@@ -581,3 +581,21 @@ test('agentLogLine: every field is sanitised to a single line without markers or
     assert.ok(!line.includes('<!--') && !line.includes('-->') && !line.includes('@'), `${f}: ${line}`);
   }
 });
+
+test('blockedComment: a skipped step (either report shape) shows as skipped with its reason, not as a pass or a failure', () => {
+  const report = {
+    mode: 'full', ok: false, git: { head: 'abcdef1234567890' },
+    steps: [
+      { name: 'install', status: 'pass', durationMs: 1500, command: 'npm ci', exitCode: 0, errorExcerpt: '' },
+      { name: 'sql-arms', status: 'skipped', skipReason: 'no dependency changed | @owner', durationMs: 0, command: 'node arms.mjs', exitCode: null, errorExcerpt: '' },
+      { name: 'old-skip', status: 'pass', skipped: true, durationMs: 3, command: '(skipped - nothing to do)', exitCode: null, errorExcerpt: '' },
+      { name: 'unit', status: 'fail', durationMs: 9000, command: 'vitest run', exitCode: 1, errorExcerpt: 'boom' },
+    ],
+  };
+  const rows = blockedComment(report).split('\n').filter((l) => /^\| (install|sql-arms|old-skip|unit) /.test(l));
+  assert.equal(rows.length, 4);
+  assert.match(rows[1], /\| skipped \(no dependency changed &#124; ＠owner\) \| — \|/);
+  assert.match(rows[2], /\| skipped \(\(skipped - nothing to do\)\) \| — \|/);
+  assert.ok(!/\bpass\b/.test(rows[1]) && !/\bpass\b/.test(rows[2]));
+  assert.equal(rows[1].slice(1, -1).split('|').length, 4, 'no stray pipe adds a column');
+});

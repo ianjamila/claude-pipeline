@@ -7,6 +7,7 @@
 // commercial at (U+FF20) so it can never notify anyone (it looks the same, also inside code).
 // Single-line values are flattened, and pipes in table cells become &#124;.
 import { encodeForComment } from './state.mjs';
+import { skipOf } from './verify-steps.mjs';
 
 export const MARKERS = {
   triage: '<!-- claude-pipeline:triage -->',
@@ -227,10 +228,13 @@ export function blockedComment(report) {
   } else {
     out.push('| Step | Status | Duration | Command |', '|---|---|---|---|');
     for (const s of steps) {
-      const ran = s.status !== 'not-run' && Number.isFinite(s.durationMs);
+      const skip = skipOf(s);
+      const ran = s.status !== 'not-run' && !skip && Number.isFinite(s.durationMs);
       const duration = ran ? `${(s.durationMs / 1000).toFixed(1)}s` : '—';
       const command = s.command ? cell(s.command) : '';
-      out.push(`| ${cell(s.name)} | ${cell(s.status)} | ${duration} | ${command} |`);
+      // A skipped step reads "skipped (reason)", also for the legacy pass+skipped:true row: it did not run, so it is not a pass.
+      const status = skip ? cell(`skipped${skip.reason ? ` (${clip(flat(skip.reason), 80)})` : ''}`) : cell(s.status);
+      out.push(`| ${cell(s.name)} | ${status} | ${duration} | ${command} |`);
     }
     for (const s of steps.filter((x) => x.status === 'fail' && excerptOf(x))) {
       const code = s.exitCode == null ? '' : ` (exit ${line(s.exitCode)})`;
