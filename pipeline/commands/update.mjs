@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { EXIT, UsageError, parseCommandArgs } from '../lib/cli.mjs';
-import { installedIdentity } from '../lib/identity.mjs';
+import { installedIdentity, isClean as clean } from '../lib/identity.mjs';
 import { readManifest } from '../lib/installer.mjs';
 import { expandHome } from '../lib/paths.mjs';
 import { run as runProcess } from '../lib/proc.mjs';
@@ -68,8 +68,6 @@ function relate(id, main, env) {
   if (!id.sourceSha) return { status: 'unresolved', reason: 'the installed copy records no source commit' };
   return compare(id.sourceSha, main.sha, { timeoutMs: NETWORK_TIMEOUT_MS, env });
 }
-
-const clean = (id) => Boolean(id && id.complete && !id.sourceDirty && id.modified.length === 0 && id.missing.length === 0 && (id.extra?.length ?? 0) === 0 && (id.scanError?.length ?? 0) === 0);
 
 // Fetches exactly `sha` into <tmp>/src with an isolated git (its private config/hooks directory is `isoDir`) and checks it out detached. Returns the source directory;
 // throws an Error with a plain-language message when any step fails or the checked-out HEAD is not `sha`.
@@ -168,7 +166,10 @@ export async function run(argv, ctx = {}) {
 }
 
 // The install itself: fetch exactly main's commit, run its installer, prove the result. Shared by `update` and `update --scheduled`.
-async function performUpdate({ home, main, before, relation, env, say }) {
+// `expectInstalled` (the scheduled run only): the sha of the clean install the caller decided to replace. The download takes minutes,
+// so the install can change meanwhile (an owner edit, a newer manual install); it is re-checked just before the installer starts
+// and again by the installer itself under its write lock (--expect-installed), and a change ends in `install-changed`, nothing written.
+async function performUpdate({ home, main, before, relation, env, say, expectInstalled = null }) {
   // The installer's guard-file choice survives an update: a copy installed with --skip-file-guard stays that way.
   const manifest = readManifest(home).manifest;
   const flags = manifest?.hooks?.guardFiles === false ? ['--skip-file-guard'] : [];
@@ -209,10 +210,17 @@ async function performUpdate({ home, main, before, relation, env, say }) {
       const windows = `.\\install.ps1 --claude-home ${psQuote(home)}${rest}`;
       return fail('installer-too-old', `upstream main ${sha7(main.sha)} has an older installer that cannot install from the folder this command downloads into, so nothing was changed. Update from a clone of that version instead: run \`${posix}\` in it (on Windows: \`${windows}\`).`);
     }
+    if (expectInstalled) {
+      const now = installedIdentity(home);
+      if (!now || !clean(now) || now.sourceSha !== expectInstalled) {
+        return fail('install-changed', `the installed copy changed while the update was downloading (now ${now?.stamp ?? 'nothing'}), so it was left alone`);
+      }
+    }
     say(`installing into ${home} ...`);
     const common = ['--claude-home', home, '--source', src, '--json', ...flags];
-    const install = runInstaller(src, common, env);
+    const install = runInstaller(src, [...common, ...(expectInstalled ? ['--expect-installed', expectInstalled] : [])], env);
     result.install = { ok: install.ok, exitCode: install.code, error: install.json?.error ?? null };
+    if (install.json?.error === 'install-changed') return fail('install-changed', install.json.message || 'the installed copy changed while the update was downloading, so it was left alone');
     if (!install.ok) return fail('install-failed', install.json?.error || install.stderr || `install.mjs exited ${install.code}`, { stderr: install.stderr });
     const check = runInstaller(src, ['--check', ...common], env);
     result.check = { ok: check.ok, exitCode: check.code, drift: check.json?.drift ?? [] };
@@ -288,11 +296,13 @@ async function scheduledRun({ home, env, ctx, say }) {
     if (relation.status === 'identical') return await finish(EXIT.OK, { ok: true, action: 'none', status: relation.status, ...base }, null, { silent: true });
     if (relation.status !== 'ahead') return await skipped('downgrade', `the installed commit is ${relation.status} relative to main, and updating would replace it with an older or unrelated one`);
 
-    const r = await auto.performUpdate({ home, main, before, relation, env, say });
+    const r = await auto.performUpdate({ home, main, before, relation, env, say, expectInstalled: before.sourceSha });
     if (r.exitCode === EXIT.OK) {
       return await finish(EXIT.OK, { ok: true, action: 'updated', status: relation.status, before: r.output.before, after: r.output.after, main: r.output.main, warnings: r.output.warnings ?? [] }, null);
     }
     const o = r.output;
+    // The owner edited or installed during the download: the same pause as finding the install modified up front, not a failure.
+    if (o.error === 'install-changed') return await skipped('modified', o.message || 'the installed copy changed while the update was downloading');
     const busy = o.error === 'install-failed' && LOCK_BUSY.test(`${o.message ?? ''} ${o.stderr ?? ''}`);
     return await failed(o.error, o.message, main.sha, { ...base, status: relation.status }, busy ? { transient: true, reason: 'install-lock-busy' } : {});
   } catch (err) {

@@ -1490,3 +1490,105 @@ test('a source inside the claude-home is refused, except under pipeline-state/tm
   assert.equal(existsSync(join(home, 'pipeline', 'INSTALLED.json')), true);
   assert.equal(existsSync(tmpSrc), true, 'the installer did not touch the source');
 });
+
+// ---- --expect-installed: the unattended update's re-check, made under the write lock --------------------------------------
+
+// Two committed sources with different heads (B adds a file, so its tree and sha differ from A's).
+function twoSources() {
+  const a = committedSource();
+  const b = committedSource();
+  writeFileSync(join(b.dir, 'pipeline', 'lib', 'extra-for-expect.mjs'), '// b\n');
+  git(b.dir, 'add', '-A');
+  git(b.dir, 'commit', '-q', '-m', 'b');
+  return { a: a.dir, headA: a.head, b: b.dir, headB: git(b.dir, 'rev-parse', 'HEAD') };
+}
+
+test('parseArgs: --expect-installed takes a sha and cannot be combined with --check or --uninstall', () => {
+  assert.equal(parseArgs(['--expect-installed', 'a'.repeat(40)]).opts.expectInstalled, 'a'.repeat(40));
+  assert.equal(parseArgs(['--expect-installed=' + 'b'.repeat(40)]).opts.expectInstalled, 'b'.repeat(40));
+  assert.equal('expectInstalled' in parseArgs([]).opts, false, 'absent unless given, so a plain install\'s options are unchanged');
+  assert.ok(parseArgs(['--expect-installed']).error);
+  assert.ok(parseArgs(['--expect-installed', '--json']).error);
+  assert.ok(parseArgs(['--expect-installed', 'x', '--check']).error);
+  assert.ok(parseArgs(['--expect-installed', 'x', '--uninstall']).error);
+});
+
+test('--expect-installed installs when the install is still the clean commit the caller saw', () => {
+  const { a, headA, b, headB } = twoSources();
+  const home = newHome();
+  assert.equal(install(home, ['--json'], { source: a }).status, 0);
+  const r = install(home, ['--json', '--expect-installed', headA], { source: b });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(readManifest(home).sourceSha, headB);
+});
+
+test('--expect-installed refuses with install-changed (exit 3, nothing written) when the installed commit is no longer the expected one', () => {
+  const { a, headA, b, headB } = twoSources();
+  const home = newHome();
+  assert.equal(install(home, ['--json'], { source: b }).status, 0); // somebody installed a newer version meanwhile
+  const before = readFileSync(join(home, 'pipeline', 'INSTALLED.json'), 'utf8');
+  const r = install(home, ['--json', '--expect-installed', headA], { source: a });
+  assert.equal(r.status, 3, r.stderr);
+  const out = JSON.parse(r.stdout);
+  assert.deepEqual([out.ok, out.error], [false, 'install-changed']);
+  assert.match(out.message, new RegExp(headB.slice(0, 7)));
+  assert.equal(readFileSync(join(home, 'pipeline', 'INSTALLED.json'), 'utf8'), before, 'nothing was written');
+  assert.equal(readManifest(home).sourceSha, headB);
+});
+
+test('--expect-installed refuses when a managed file was edited, or an extra one added, since the caller looked', () => {
+  const { a, headA, b } = twoSources();
+  const home = newHome();
+  assert.equal(install(home, ['--json'], { source: a }).status, 0);
+  const manifest = readManifest(home);
+  const rel = Object.keys(manifest.files).find((f) => f.startsWith('pipeline/'));
+  const file = join(home, ...rel.split('/'));
+  const original = readFileSync(file);
+  writeFileSync(file, `${original}\n// owner edit\n`);
+  const edited = install(home, ['--json', '--expect-installed', headA], { source: b });
+  assert.equal(edited.status, 3, edited.stderr);
+  assert.equal(JSON.parse(edited.stdout).error, 'install-changed');
+  assert.match(readFileSync(file, 'utf8'), /owner edit/, 'the owner\'s edit was not overwritten');
+  assert.equal(readManifest(home).sourceSha, headA);
+  writeFileSync(file, original);
+  writeFileSync(join(home, 'pipeline', 'lib', 'owner-added.mjs'), '// x\n');
+  const extra = install(home, ['--json', '--expect-installed', headA], { source: b });
+  assert.equal(extra.status, 3, extra.stderr);
+  assert.equal(JSON.parse(extra.stdout).error, 'install-changed');
+});
+
+test('--expect-installed refuses when nothing is installed any more, in plain text too', () => {
+  const { a, headA } = twoSources();
+  const home = newHome();
+  const r = install(home, ['--expect-installed', headA], { source: a });
+  assert.equal(r.status, 3, r.stderr);
+  assert.match(r.stderr, /install-changed/);
+  assert.equal(existsSync(join(home, 'pipeline')), false);
+});
+
+test('--expect-installed is checked under the write lock: a busy lock is reported as busy, not as a changed install', () => {
+  const { a, headA, b } = twoSources();
+  const home = newHome();
+  assert.equal(install(home, ['--json'], { source: b }).status, 0);
+  const { dir, env } = lockEnv();
+  const lock = holdLock(home, dir);
+  try {
+    const r = install(home, ['--json', '--expect-installed', headA], { source: a, env });
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stderr, /another install is running in /);
+    assert.doesNotMatch(r.stdout, /install-changed/);
+  } finally {
+    release(lock);
+  }
+});
+
+test('without --expect-installed the installer still replaces a modified install, exactly as before', () => {
+  const { a, b, headB } = twoSources();
+  const home = newHome();
+  assert.equal(install(home, ['--json'], { source: a }).status, 0);
+  const rel = Object.keys(readManifest(home).files).find((f) => f.startsWith('pipeline/'));
+  writeFileSync(join(home, ...rel.split('/')), '// edited\n');
+  const r = install(home, ['--json'], { source: b });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(readManifest(home).sourceSha, headB);
+});

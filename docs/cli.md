@@ -458,9 +458,11 @@ Runs `install.mjs` from a clean, isolated download of exactly the commit main po
 |---|---|---|---|
 | clean, identical to main | `none` (no install) | 0 | no |
 | clean, behind main | `updated` (the normal update path; `before`, `after`) | 0 | no |
-| modified, incomplete, or no recorded source commit | `skipped`, `reason: "modified"` (never overwritten) | 0 | once per main sha |
+| modified, incomplete, or no recorded source commit, or changed while the download ran | `skipped`, `reason: "modified"` (never overwritten) | 0 | once per main sha |
 | ahead of main or diverged | `skipped`, `reason: "downgrade"` | 0 | once per main sha |
 | any failure (`upstream-unresolved`, `fetch-failed`, `installer-too-old`, `install-failed`, `check-failed`, `unverified`) | `failed`, the same `error` codes as a manual update | 1 | once per (error, main sha) |
+
+The download takes minutes, so the decision "clean and behind" is re-checked twice before anything is written: just before the installer starts, and by the installer itself, under its write lock, through `install.mjs --expect-installed <sha>` (the installed copy must still be a clean install of that commit, else exit 3 with `{error: "install-changed"}` and nothing written). Only `--scheduled` passes it; a manual `pipeline update` or `./install.sh` is unchanged.
 
 A busy install lock and an unresolved upstream (network, a failed compare) are transient: they push only after 3 runs in a row. The push is the notify event `pipeline-update` ("Pipeline auto-update failed" / "Pipeline auto-update paused") whose action is the one thing to do: run the manual update in your own terminal and read its error. Dedupe state: `auto-update-state.json` in `~/.local/state/pipeline` (or `PIPELINE_PRUNE_LOG_DIR`, next to the worktrees cron logs); a run that ends well (`none` / `updated`) clears it, so the next failure pushes again. A push that was not delivered is retried on the next run.
 

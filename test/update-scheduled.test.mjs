@@ -254,3 +254,22 @@ test('the state file is written next to the worktrees logs by default (PIPELINE_
   await update(['--scheduled', '--json', '--claude-home', join(dir, 'h')], { env: { PIPELINE_PRUNE_LOG_DIR: dir }, hasClaudeCodeAncestor: () => false, auto });
   assert.equal(JSON.parse(readFileSync(join(dir, 'auto-update-state.json'), 'utf8')).notified, `install-failed:${SHA_A}`);
 });
+
+test('R1-B1: the install is expected to still be the commit the run looked at (passed to performUpdate)', async () => {
+  const t = rig();
+  let seen = null;
+  const r = await t.go({ performUpdate: async (args) => { seen = args; return t.w.install; } });
+  assert.equal(r.output.action, 'updated');
+  assert.equal(seen.expectInstalled, OLD);
+});
+
+test('R1-B1: an install that changed during the download (install-changed) is skipped as modified, exit 0, pushed once, nothing failed', async () => {
+  const t = rig({ install: { exitCode: 1, output: { ok: false, error: 'install-changed', message: 'the installed copy was modified since the update was planned' } } });
+  const r = await t.go();
+  assert.deepEqual([r.exitCode, r.output.ok, r.output.action, r.output.reason], [0, true, 'skipped', 'modified']);
+  assert.equal(t.calls.install, 1);
+  assert.equal(t.calls.notify.length, 1);
+  assert.equal(t.calls.notify[0].title, 'Pipeline auto-update paused');
+  await t.go();
+  assert.equal(t.calls.notify.length, 1, 'deduped like any other modified skip');
+});

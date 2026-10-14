@@ -34,6 +34,7 @@ const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArr
 // Arguments
 
 const USAGE = `usage: node install.mjs [--claude-home DIR] [--source DIR] [--check] [--uninstall] [--skip-file-guard] [--force] [--json]
+                          [--expect-installed SHA]
 
   --claude-home DIR   where to install (default: $CLAUDE_CONFIG_DIR, else ~/.claude)
   --source DIR        the claude-pipeline checkout to install from (default: the directory holding install.mjs)
@@ -41,12 +42,14 @@ const USAGE = `usage: node install.mjs [--claude-home DIR] [--source DIR] [--che
   --uninstall         remove what was installed (files in the manifest, our hook entries, our allow entries)
   --skip-file-guard   do not install the file-guard hook (guard-git is always installed)
   --force             overwrite a same-named skill/agent/pipeline dir this installer did not install (kept in backups/)
+  --expect-installed SHA  install only if the claude-home still holds a clean install of commit SHA (checked under the write lock,
+                      before anything is written); otherwise exit 3 with error install-changed. The unattended update passes it.
   --json              machine-readable report on stdout`;
 export const usageText = () => USAGE;
 
 export function parseArgs(argv) {
   const opts = { claudeHome: null, source: null, check: false, uninstall: false, skipFileGuard: false, force: false, json: false };
-  const valued = { '--claude-home': 'claudeHome', '--source': 'source' };
+  const valued = { '--claude-home': 'claudeHome', '--source': 'source', '--expect-installed': 'expectInstalled' };
   const flags = { '--check': 'check', '--uninstall': 'uninstall', '--skip-file-guard': 'skipFileGuard', '--force': 'force', '--json': 'json' };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -64,6 +67,7 @@ export function parseArgs(argv) {
     }
   }
   if (opts.check && opts.uninstall) return { opts, error: '--check and --uninstall cannot be combined' };
+  if (opts.expectInstalled && (opts.check || opts.uninstall)) return { opts, error: '--expect-installed only applies to an install' };
   return { opts };
 }
 
