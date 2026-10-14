@@ -129,7 +129,7 @@ test('default actions name the one thing to do', () => {
   assert.equal(defaultAction('pipeline-update'), 'Run the manual update in your own terminal and read its error');
 });
 
-test('pipeline-update (the hourly auto-update) is a known event: custom title, the owner action, one push per cause', async () => {
+test('pipeline-update (the scheduled auto-update) is a known event: custom title, the owner action, one push per cause', async () => {
   const m = buildMessage({ event: 'pipeline-update', pr: null, title: 'Pipeline auto-update failed', action: 'install-failed. Run the manual update in your own terminal and read its error' }, { repoName: 'claude' });
   assert.equal(m.title, 'Pipeline auto-update failed');
   assert.equal(m.message, 'Pipeline auto-update: install-failed. Run the manual update in your own terminal and read its error (claude)');

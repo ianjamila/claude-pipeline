@@ -1,13 +1,14 @@
-// State and wording for `pipeline update --scheduled` (the hourly unattended update): when to push the owner, once.
+// State and wording for `pipeline update --scheduled` (the recurring unattended update): when to push the owner, once.
 // The state is one small JSON file next to the worktrees cron logs (~/.local/state/pipeline, or PIPELINE_PRUNE_LOG_DIR):
 //   { pending: {key, episode}, notified: key, transient: {reason, runs} }
-// A problem is keyed by (reason, main sha), so an hourly failure pushes once per main sha; a new main sha is a new key.
+// A problem is keyed by (reason, main sha), so a failure that repeats every run pushes once per main sha; a new main sha is a new key.
 // A transient problem (network, a busy install lock) pushes only when it has failed TRANSIENT_RUNS runs in a row. Any
 // run that ends well (nothing to do, or updated) clears the file, so the next failure pushes again. `pending` is written
 // BEFORE the push so a retry after a crash reuses the same episode in notify's ledger key and cannot push twice;
 // `notified` is written only once a push was delivered (or notify's ledger says it already was).
 import fs from 'node:fs';
 import path from 'node:path';
+import { hasClaudeCodeAncestor } from './claude-ancestry.mjs';
 import { pruneLogDir } from './worktree-prune/run.mjs';
 
 export const STATE_FILE = 'auto-update-state.json';
@@ -67,7 +68,16 @@ export function markNotified(state, push) {
   return { ...rest, notified: push.key };
 }
 
-const MANUAL = 'Run the manual update in your own terminal and read its error';
+// Why this process counts as inside a Claude Code session, or null when it does not. `pipeline update` and `update schedule
+// --install` both refuse inside one: an update replaces the guard hooks, the one thing an agent must not do to itself. The
+// owner's admin variable bypasses it. `ctx.hasClaudeCodeAncestor` is the injectable process-tree check.
+export function insideClaudeCode(env, ctx = {}) {
+  if (env.PIPELINE_ADMIN === '1') return null;
+  if (env.CLAUDECODE === '1') return 'CLAUDECODE=1';
+  return (ctx.hasClaudeCodeAncestor ?? hasClaudeCodeAncestor)() ? 'a Claude Code process is an ancestor of this one' : null;
+}
+
+const MANUAL ='Run the manual update in your own terminal and read its error';
 
 // The notify event for a problem; head = the main sha, so the ledger key is (reason, main sha, episode).
 export function ownerEvent(problem, push) {
@@ -76,10 +86,10 @@ export function ownerEvent(problem, push) {
   let action;
   if (problem.skipped === 'modified') {
     title = 'Pipeline auto-update paused';
-    action = `The installed pipeline has local changes, so the hourly update left it alone. ${MANUAL.replace(' and read its error', '')} to replace it with main ${sha7}`;
+    action = `The installed pipeline has local changes, so the scheduled update left it alone. ${MANUAL.replace(' and read its error', '')} to replace it with main ${sha7}`;
   } else if (problem.skipped === 'downgrade') {
     title = 'Pipeline auto-update paused';
-    action = `The installed pipeline is not behind main ${sha7} (it is ahead or has diverged), so the hourly update left it alone. Check it in your own terminal with \`pipeline update --check\``;
+    action = `The installed pipeline is not behind main ${sha7} (it is ahead or has diverged), so the scheduled update left it alone. Check it in your own terminal with \`pipeline update --check\``;
   } else if (problem.transient) {
     title = 'Pipeline auto-update failed';
     action = `${problem.reason} on ${TRANSIENT_RUNS} runs in a row. ${MANUAL}`;

@@ -61,6 +61,24 @@ test('identical and clean: action none, no install, no push, compact output', as
   assert.equal(t.calls.notify.length, 0);
 });
 
+test('only the quiet run is silent: emit prints nothing for action none, one compact line for every other action', async () => {
+  const { emit } = await import('../pipeline/lib/cli.mjs');
+  const printed = (result) => { let out = ''; const code = emit(result, { stdout: { write: (s) => { out += s; } } }); return { out, code }; };
+  const none = await rig({ relation: { status: 'identical' } }).go();
+  assert.equal(none.silent, true);
+  assert.deepEqual(printed(none), { out: '', code: 0 });
+  const updated = await rig().go();
+  assert.equal(updated.output.action, 'updated');
+  assert.equal(updated.silent, undefined);
+  const skipped = await rig({ id: { ...pristine(), modified: ['x'] } }).go();
+  const failed = await rig({ main: { ok: false, reason: 'offline' } }).go();
+  for (const r of [updated, skipped, failed]) {
+    const { out } = printed(r);
+    assert.equal(out.trimEnd().split('\n').length, 1);
+    assert.equal(JSON.parse(out).mode, 'scheduled');
+  }
+});
+
 test('a modified install is skipped (never overwritten) and the owner is pushed once; a second run pushes nothing', async () => {
   const t = rig({ id: { ...pristine(), modified: ['pipeline/lib/x.mjs'] } });
   const r = await t.go();

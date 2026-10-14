@@ -9,14 +9,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { EXIT, UsageError, parseCommandArgs } from '../lib/cli.mjs';
-import { hasClaudeCodeAncestor } from '../lib/claude-ancestry.mjs';
 import { installedIdentity } from '../lib/identity.mjs';
 import { readManifest } from '../lib/installer.mjs';
 import { expandHome } from '../lib/paths.mjs';
 import { run as runProcess } from '../lib/proc.mjs';
 import { makePrivateTmpDir } from '../lib/private-tmp.mjs';
-import { markNotified, ownerEvent, planPush, readState, stateFile, writeState } from '../lib/auto-update.mjs';
+import { insideClaudeCode, markNotified, ownerEvent, planPush, readState, stateFile, writeState } from '../lib/auto-update.mjs';
 import { notifyEvent } from '../lib/notify.mjs';
+import { runSchedule } from '../lib/update-schedule.mjs';
 import { compare, fetchRemote, isolatedGit, mainSha, makeIsoDir, removeTree } from '../lib/upstream.mjs';
 
 export const meta = {
@@ -32,7 +32,12 @@ export const meta = {
     '  Refuses inside Claude Code (run it in your own terminal) unless --check or PIPELINE_ADMIN=1.',
     'pipeline update --scheduled [--claude-home DIR] [--json]',
     '  What the unattended auto-update job runs: install main when the install is behind it, do nothing when current, never touch a',
-    '  modified install or downgrade one (skipped); push the owner only on failure or a pause, once per main sha. One compact JSON line.',
+    '  modified install or downgrade one (skipped); push the owner only on failure or a pause, once per main sha. One compact JSON line',
+    '  per run, and nothing at all on a run that found nothing to do (so the job log only grows on real events).',
+    'pipeline update schedule (--install [--every N] | --remove | --status)',
+    '  The recurring auto-update job: cron on Linux/WSL, a LaunchAgent on macOS; it runs `update --scheduled --json` of the installed',
+    '  pipeline. --every N  minutes between runs: 5, 10, 15, 20, 30 or 60 (default 15). --install refuses inside Claude Code',
+    '  (it arranges for the guard hooks to be replaced unattended); --status and --remove are allowed anywhere.',
   ].join('\n'),
 };
 
@@ -114,6 +119,7 @@ function runInstaller(src, args, env) {
 }
 
 export async function run(argv, ctx = {}) {
+  if (argv[0] === 'schedule') return runSchedule(argv.slice(1), ctx);
   const env = ctx.env ?? process.env;
   const { values } = parseCommandArgs(argv, {
     'claude-home': { type: 'string' },
@@ -124,10 +130,8 @@ export async function run(argv, ctx = {}) {
   if (values.scheduled && values.check) throw new UsageError('--scheduled and --check cannot be combined');
   const say = (line) => { if (!values.json) process.stderr.write(`${line}\n`); };
 
-  if (!values.check && env.PIPELINE_ADMIN !== '1') {
-    const inside = env.CLAUDECODE === '1'
-      ? 'CLAUDECODE=1'
-      : (ctx.hasClaudeCodeAncestor ?? hasClaudeCodeAncestor)() ? 'a Claude Code process is an ancestor of this one' : null;
+  if (!values.check) {
+    const inside = insideClaudeCode(env, ctx);
     if (inside) {
       const message = `pipeline update refuses to run inside a Claude Code session (${inside}): an update replaces the guard hooks. Run it in your own terminal (\`node ~/.claude/pipeline/bin/pipeline.mjs update\`); \`--check\` is allowed anywhere.`;
       say(message);
@@ -239,9 +243,10 @@ const LOCK_BUSY = /another install is running|install lock/i;
 
 async function scheduledRun({ home, env, ctx, say }) {
   const auto = { mainSha, installedIdentity, relate, performUpdate, notify: notifyEvent, now: () => new Date(), stateFile: stateFile(env), ...(ctx.auto ?? {}) };
-  const done = (exitCode, o) => ({ exitCode, compact: true, output: { mode: 'scheduled', home, ...o } });
+  // `silent`: print nothing (the job appends stdout to its log, so a run with nothing to do must not grow it).
+  const done = (exitCode, o, silent = false) => ({ exitCode, compact: true, ...(silent ? { silent: true } : {}), output: { mode: 'scheduled', home, ...o } });
   // Persist the dedupe state, push once if this run owes the owner one, and only then call the push delivered.
-  const finish = async (exitCode, o, problem) => {
+  const finish = async (exitCode, o, problem, { silent = false } = {}) => {
     const plan = planPush(readState(auto.stateFile), problem, { nowIso: auto.now().toISOString() });
     writeState(auto.stateFile, plan.state);
     const output = { ...o };
@@ -255,7 +260,7 @@ async function scheduledRun({ home, env, ctx, say }) {
       if (res?.sent || res?.reason === 'duplicate') writeState(auto.stateFile, markNotified(plan.state, plan.push));
       output.notify = { sent: Boolean(res?.sent), ...(res?.reason ? { reason: res.reason } : {}) };
     }
-    return done(exitCode, output);
+    return done(exitCode, output, silent);
   };
   const failed = (error, message, sha, o, { transient = false, reason = error } = {}) => {
     say(`scheduled update failed: ${message}`);
@@ -280,7 +285,7 @@ async function scheduledRun({ home, env, ctx, say }) {
     if (relation.status === 'unresolved') {
       return await failed('upstream-unresolved', `could not compare the install with main: ${relation.reason}`, main.sha, base, { transient: true });
     }
-    if (relation.status === 'identical') return await finish(EXIT.OK, { ok: true, action: 'none', status: relation.status, ...base }, null);
+    if (relation.status === 'identical') return await finish(EXIT.OK, { ok: true, action: 'none', status: relation.status, ...base }, null, { silent: true });
     if (relation.status !== 'ahead') return await skipped('downgrade', `the installed commit is ${relation.status} relative to main, and updating would replace it with an older or unrelated one`);
 
     const r = await auto.performUpdate({ home, main, before, relation, env, say });

@@ -440,7 +440,12 @@ pipeline update [--claude-home DIR] [--check] [--json]
   Refuses inside Claude Code (run it in your own terminal) unless --check or PIPELINE_ADMIN=1.
 pipeline update --scheduled [--claude-home DIR] [--json]
   What the unattended auto-update job runs: install main when the install is behind it, do nothing when current, never touch a
-  modified install or downgrade one (skipped); push the owner only on failure or a pause, once per main sha. One compact JSON line.
+  modified install or downgrade one (skipped); push the owner only on failure or a pause, once per main sha. One compact JSON line
+  per run, and nothing at all on a run that found nothing to do (so the job log only grows on real events).
+pipeline update schedule (--install [--every N] | --remove | --status)
+  The recurring auto-update job: cron on Linux/WSL, a LaunchAgent on macOS; it runs `update --scheduled --json` of the installed
+  pipeline. --every N  minutes between runs: 5, 10, 15, 20, 30 or 60 (default 15). --install refuses inside Claude Code
+  (it arranges for the guard hooks to be replaced unattended); --status and --remove are allowed anywhere.
 ```
 
 Exit: 0 updated / up to date (`--check`: complete, unmodified and identical to main) · 1 not up to date (`--check`), upstream unreachable, or the fetch / install / verification failed · 2 usage, or refused inside Claude Code.
@@ -458,6 +463,17 @@ Runs `install.mjs` from a clean, isolated download of exactly the commit main po
 | any failure (`upstream-unresolved`, `fetch-failed`, `installer-too-old`, `install-failed`, `check-failed`, `unverified`) | `failed`, the same `error` codes as a manual update | 1 | once per (error, main sha) |
 
 A busy install lock and an unresolved upstream (network, a failed compare) are transient: they push only after 3 runs in a row. The push is the notify event `pipeline-update` ("Pipeline auto-update failed" / "Pipeline auto-update paused") whose action is the one thing to do: run the manual update in your own terminal and read its error. Dedupe state: `auto-update-state.json` in `~/.local/state/pipeline` (or `PIPELINE_PRUNE_LOG_DIR`, next to the worktrees cron logs); a run that ends well (`none` / `updated`) clears it, so the next failure pushes again. A push that was not delivered is retried on the next run.
+
+A run that finds nothing to do (`none`) prints nothing at all, so the job's log (stdout and stderr are appended to it) only grows on a real event: an update, a skip or a failure.
+
+### update schedule
+
+`pipeline update schedule (--install [--every N] | --remove | --status)` -> `{ok, installed, line, changed, every, note, timezone?}` (install), `{ok, removed}` (remove), `{ok, installed, line}` (status). `--every N` is the number of minutes between runs: 5, 10, 15, 20, 30 or 60 (default 15); anything else is a usage error. The job runs `update --scheduled --json` of the INSTALLED pipeline (`~/.claude/pipeline/bin/pipeline.mjs`), so an update replaces what the job runs next; it needs no `cd`. Output is appended to `auto-update.log` next to the state file.
+
+- **Linux / WSL (cron).** One crontab line ending in the marker `# claude-pipeline auto-update`: `*/N * * * *` (for 60, `17 * * * *`, once an hour at minute 17), `PATH=` set to the directories of node, git and gh as found at install time plus `/usr/bin:/bin`, and `%` escaped. The owner's other lines are kept byte for byte; installing again replaces the marker line in place, and the crontab is written only when its text changes.
+- **macOS (launchd).** The LaunchAgent `com.claude-pipeline.auto-update` (`~/Library/LaunchAgents/com.claude-pipeline.auto-update.plist`) with `StartInterval` = N x 60 seconds and `RunAtLoad` true (a Mac that slept through the interval catches up at wake). The plist is written only when its text differs; install runs `launchctl bootout gui/<uid>/<label>` (not-loaded ignored) then `launchctl bootstrap gui/<uid> <plist>` (a failing bootstrap is exit 2, `error: launchctl`). `--remove` boots the job out, confirms with `launchctl print` that it is gone and only then deletes the plist (still loaded or unconfirmed: exit 2, plist kept). `--status`: `installed` = the plist exists AND the job is loaded.
+- Any other platform (native Windows): exit 2, `error: unsupported-platform` (Linux/WSL cron and macOS launchd only).
+- `--install` refuses inside Claude Code (`error: refused`, same check and same owner bypass as `pipeline update`) because it arranges for the guard hooks to be replaced unattended; `--status` and `--remove` only report on the job or take it away and are allowed anywhere. Also exit 2: `tool-missing` (git or gh not on PATH), `not-installed` (no pipeline at the install path).
 
 ## update-branch
 
