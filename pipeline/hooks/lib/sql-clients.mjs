@@ -85,6 +85,8 @@ export function sqlShellEscapes(text, opts = {}) {
     for (const c of cands) out.push(`${prog} < ${PLAIN.test(c) ? c : shq(c)}`);
   };
   const run = (cmd) => { if (cmd.trim()) out.push(cmd.trim()); };
+  // (the command of a sqlite `|cmd` argument: unquoted it is the rest of the text after the pipe; quoted, the whole decoded word after it)
+  const pipeCommand = (rest, word) => (/^\s*\|/.test(rest) ? rest.replace(/^\s*\|/, '') : word.slice(1));
   const all = fam === 'any';
 
   // ---- psql: `\word args` anywhere in a line (quotes are not tracked: a backslash in a string is read as a command, fail closed).
@@ -180,8 +182,9 @@ export function sqlShellEscapes(text, opts = {}) {
     for (const c of new Set(cands)) {
       const role = SQLITE_ROLE[c];
       if (role === 'shell') { run(rest); if (!rest.trim()) shellRest = true; }
-      else if (role === 'read') { if (/^\s*\|/.test(rest)) run(rest.replace(/^\s*\|/, '')); else if (words[0]) include('sqlite3', words[0], false); }
-      else if (role === 'out') { if (/^\s*\|/.test(rest)) run(rest.replace(/^\s*\|/, '')); else if (words[0]?.startsWith('-')) bad = true; else if (words[0] && words[0] !== 'stdout') write(words[0]); }
+      // Why: sqlite removes the quotes before it looks for the pipe (`.output "|cmd"` runs cmd), so the decision is made on the decoded word; the command is what follows the `|` in the argument text
+      else if (role === 'read') { if (words[0]?.startsWith('|')) run(pipeCommand(rest, words[0])); else if (words[0]) include('sqlite3', words[0], false); }
+      else if (role === 'out') { if (words[0]?.startsWith('|')) run(pipeCommand(rest, words[0])); else if (words[0]?.startsWith('-')) bad = true; else if (words[0] && words[0] !== 'stdout') write(words[0]); }
       else if (role === 'import') { const a = words.filter((w) => !w.startsWith('-')); if (/^\s*(?:-\S+\s+)*["']?\|/.test(rest) || a[0]?.startsWith('|')) run(rest.replace(/^[^|]*\|/, '').replace(/["']\s*\S*\s*$/, '')); }
       else if (role === 'openw') { const f = words.filter((w) => !w.startsWith('-')).pop(); if (f && f !== ':memory:') write(f); }
       else if (role === 'write') { const f = words[words.length - 1]; if (f && !f.startsWith('-')) write(f); }
