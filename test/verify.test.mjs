@@ -3,7 +3,7 @@
 // tests patch the STEPS block the way pipeline-setup's per-project edit does.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, copyFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, copyFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { project, runNode, scratchDir, importVendored } from './helpers/project.mjs';
@@ -506,4 +506,107 @@ test('importVendored still resolves scripts/pipeline entries next to verify.mjs'
   const repo = await setup();
   const mod = await importVendored(repo.dir, 'supabase-local');
   assert.equal(typeof mod.ensureDedicatedInstance, 'function');
+});
+
+// ---- skipIf: a full run may skip a step for a stated reason ------------------------------------------------------------
+
+test('skipIf: a positive answer skips the step in a full run; the row says skipped and why, and the run still passes', async () => {
+  const repo = await setup();
+  const seen = [];
+  const steps = [
+    pass('one'),
+    { name: 'two', cmd: touch('ran-two'), quick: false, skipIf: (ctx) => { seen.push(ctx); return { skip: true, reason: 'nothing under db/ changed', log: 'custom log line\n' }; } },
+    { name: 'three', cmd: touch('ran-three'), quick: false },
+  ];
+  const r = await verify(repo, [], steps);
+  assert.equal(r.exitCode, 0);
+  assert.ok(!existsSync(join(repo.dir, 'ran-two')), 'a skipped step must not run');
+  assert.ok(existsSync(join(repo.dir, 'ran-three')), 'later steps still run');
+  const rep = reportOf(repo);
+  assert.equal(rep.ok, true);
+  assert.deepEqual(rep.steps.map((s) => s.status), ['pass', 'skipped', 'pass']);
+  assert.equal(rep.steps[1].skipReason, 'nothing under db/ changed');
+  assert.deepEqual([rep.steps[1].exitCode, rep.steps[1].errorExcerpt, rep.steps[1].durationMs >= 0], [null, '', true]);
+  assert.equal(rep.steps[1].skipped, undefined, 'the legacy flag is not written');
+  assert.equal(readFileSync(join(repo.dir, '.verify', 'logs', 'two.log'), 'utf8'), 'custom log line\n');
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].mode, 'full');
+  assert.equal(seen[0].cwd, repo.dir);
+  assert.equal(seen[0].git.head, rep.git.head);
+  assert.match(r.out, /\[skip\] two \(nothing under db\/ changed\)/);
+  assert.match(r.out, /verify \(full\): PASS - 2 passed, 1 skipped \(3 steps\)/);
+});
+
+test('skipIf: without a log the reason is written to the step log; a run with no skips keeps the old tally', async () => {
+  const repo = await setup();
+  await verify(repo, [], [{ name: 'two', cmd: touch('ran-two'), quick: false, skipIf: () => ({ skip: true, reason: 'because' }) }, pass('one')]);
+  assert.match(readFileSync(join(repo.dir, '.verify', 'logs', 'two.log'), 'utf8'), /skipped: because/);
+  const plain = await verify(repo, [], [pass('one'), { ...pass('two'), skipIf: () => null }]);
+  assert.match(plain.out, /verify \(full\): PASS - 2\/2 steps passed/);
+  assert.deepEqual(reportOf(repo).steps.map((s) => [s.status, s.skipReason, s.skipCheck]), [['pass', undefined, undefined], ['pass', undefined, undefined]]);
+});
+
+test('skipIf: only consulted in a full run, never in --quick or --only', async () => {
+  const repo = await setup();
+  let calls = 0;
+  const steps = [{ name: 'one', cmd: touch('ran-one'), quick: true, skipIf: () => { calls += 1; return { skip: true, reason: 'x' }; } }];
+  for (const argv of [['--quick'], ['--only', 'one']]) {
+    const r = await verify(repo, argv, steps);
+    assert.equal(r.exitCode, 0, argv.join(' '));
+    assert.equal(reportOf(repo).steps[0].status, 'pass', argv.join(' '));
+    assert.ok(existsSync(join(repo.dir, 'ran-one')), argv.join(' '));
+    rmSync(join(repo.dir, 'ran-one'));
+  }
+  assert.equal(calls, 0);
+});
+
+test('skipIf: fails closed. A throw or a junk answer runs the step and records why', async () => {
+  const repo = await setup();
+  const answers = [
+    ['throws', () => { throw new Error('probe broke'); }, /probe broke/],
+    ['true', () => true, /skipIf must return/],
+    ['a string', () => 'skip', /skipIf must return/],
+    ['skip without a reason', () => ({ skip: true }), /skipIf must return/],
+    ['an empty reason', () => ({ skip: true, reason: '  ' }), /skipIf must return/],
+    ['skip not literally true', () => ({ skip: 'yes', reason: 'x' }), /skipIf must return/],
+    ['a non-string log', () => ({ skip: true, reason: 'x', log: 5 }), /skipIf must return/],
+    ['a promise', () => Promise.resolve({ skip: true, reason: 'x' }), /skipIf must return/],
+  ];
+  for (const [label, skipIf, why] of answers) {
+    rmSync(join(repo.dir, 'ran-s'), { force: true });
+    const r = await verify(repo, [], [{ name: 's', cmd: touch('ran-s'), quick: false, skipIf }]);
+    assert.equal(r.exitCode, 0, label);
+    assert.ok(existsSync(join(repo.dir, 'ran-s')), `${label}: the step must run`);
+    const row = reportOf(repo).steps[0];
+    assert.equal(row.status, 'pass', label);
+    assert.match(row.skipCheck, /^skip check failed: /, label);
+    assert.match(row.skipCheck, why, label);
+    assert.match(r.out, /\(runs: skip check failed: /, label);
+  }
+});
+
+test('skipIf: { run: true, reason } runs the step and says why; skipIf must be a function', async () => {
+  const repo = await setup();
+  const r = await verify(repo, [], [{ name: 's', cmd: touch('ran-s'), quick: false, skipIf: () => ({ run: true, reason: 'src/ changed' }) }]);
+  assert.equal(r.exitCode, 0);
+  assert.ok(existsSync(join(repo.dir, 'ran-s')));
+  assert.equal(reportOf(repo).steps[0].skipCheck, 'src/ changed');
+  assert.match(r.out, /\[run \] s: .*\(runs: src\/ changed\)/);
+  const bad = await verify(repo, [], [{ name: 's', cmd: touch('x'), quick: false, skipIf: 'yes' }]);
+  assert.equal(bad.exitCode, 2);
+  assert.match(bad.err, /skipIf must be a function/);
+});
+
+test('skipIf: a skipped step does not hide a later failure, and the failing step still stops the run', async () => {
+  const repo = await setup();
+  const steps = [
+    { name: 'one', cmd: touch('ran-one'), quick: false, skipIf: () => ({ skip: true, reason: 'unchanged' }) },
+    { name: 'two', cmd: nodeCmd('process.exit(4)'), quick: false },
+    { name: 'three', cmd: touch('ran-three'), quick: false },
+  ];
+  const r = await verify(repo, [], steps);
+  assert.equal(r.exitCode, 1);
+  assert.deepEqual(reportOf(repo).steps.map((s) => s.status), ['skipped', 'fail', 'not-run']);
+  assert.equal(reportOf(repo).ok, false);
+  assert.match(r.out, /verify \(full\): FAIL at two - 0 passed, 1 skipped \(3 steps\)/);
 });
