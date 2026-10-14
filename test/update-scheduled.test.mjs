@@ -226,7 +226,7 @@ test('planPush: pure state transitions, and a corrupt state file reads as empty'
   const p1 = planPush({}, prob, { nowIso: 't1' });
   assert.deepEqual(p1.push, { key: `install-failed:${SHA_A}`, episode: 't1' });
   const s1 = markNotified(p1.state, p1.push);
-  assert.equal(s1.notified, p1.push.key);
+  assert.deepEqual(s1.notified, [p1.push.key]);
   assert.equal(s1.pending, undefined);
   assert.equal(planPush(s1, prob, { nowIso: 't2' }).push, null);
   assert.deepEqual(planPush(s1, null, { nowIso: 't2' }), { push: null, state: {} });
@@ -252,7 +252,57 @@ test('the state file is written next to the worktrees logs by default (PIPELINE_
   const auto = { ...t.auto };
   delete auto.stateFile;
   await update(['--scheduled', '--json', '--claude-home', join(dir, 'h')], { env: { PIPELINE_PRUNE_LOG_DIR: dir }, hasClaudeCodeAncestor: () => false, auto });
-  assert.equal(JSON.parse(readFileSync(join(dir, 'auto-update-state.json'), 'utf8')).notified, `install-failed:${SHA_A}`);
+  assert.deepEqual(JSON.parse(readFileSync(join(dir, 'auto-update-state.json'), 'utf8')).notified, [`install-failed:${SHA_A}`]);
+});
+
+test('R1-B2: alternating failures at one main sha push each (reason, sha) exactly once until a good run', async () => {
+  const fetchFailed = { exitCode: 1, output: { ok: false, error: 'fetch-failed', message: 'git fetch timed out' } };
+  const lockBusy = { exitCode: 1, output: { ok: false, error: 'install-failed', message: 'another install is running in /h. Wait for it to finish' } };
+  const t = rig({ install: fetchFailed });
+  const step = async (install) => { t.w.install = install; return t.go(); };
+  await step(fetchFailed);
+  assert.equal(t.calls.notify.length, 1, 'fetch-failed pushed');
+  for (let i = 0; i < TRANSIENT_RUNS; i += 1) await step(lockBusy);
+  assert.equal(t.calls.notify.length, 2, 'lock-busy pushed once on its third run');
+  await step(fetchFailed);
+  assert.equal(t.calls.notify.length, 2, 'fetch-failed again at the same sha: already told');
+  for (let i = 0; i < TRANSIENT_RUNS + 1; i += 1) await step(lockBusy);
+  await step(fetchFailed);
+  assert.equal(t.calls.notify.length, 2, 'still nothing new after more alternation');
+
+  t.w.main = { ok: true, sha: SHA_B, via: 'gh' };
+  await step(fetchFailed);
+  assert.equal(t.calls.notify.length, 3, 'a new main sha is a new key');
+
+  t.w.install = { exitCode: 0, output: { ok: true, before: 'x', after: 'y', main: { sha: SHA_B } } };
+  assert.equal((await t.go()).output.action, 'updated');
+  assert.equal(existsSync(t.auto.stateFile), false, 'a good run clears every remembered key');
+  await step(fetchFailed);
+  assert.equal(t.calls.notify.length, 4, 'after a good run the same failure pushes again');
+});
+
+test('R1-B2: planPush keeps every notified key of the episode; an old single-key state file is migrated, not dropped', () => {
+  const a = { reason: 'fetch-failed', sha: SHA_A, transient: false };
+  const b = { reason: 'check-failed', sha: SHA_A, transient: false };
+  let state = {};
+  const send = (prob, t) => {
+    const plan = planPush(state, prob, { nowIso: t });
+    state = plan.push ? markNotified(plan.state, plan.push) : plan.state;
+    return plan.push;
+  };
+  assert.ok(send(a, 't1'));
+  assert.ok(send(b, 't2'));
+  assert.equal(send(a, 't3'), null);
+  assert.equal(send(b, 't4'), null);
+  assert.deepEqual([...state.notified].sort(), [`check-failed:${SHA_A}`, `fetch-failed:${SHA_A}`]);
+  assert.ok(send({ ...a, sha: SHA_B }, 't5'), 'a new sha pushes');
+  assert.deepEqual(planPush(state, null, { nowIso: 't6' }), { push: null, state: {} });
+  // The state file written before this change held one key as a string: it still silences that key (and joins the list).
+  const old = { notified: `fetch-failed:${SHA_A}` };
+  assert.equal(planPush(old, a, { nowIso: 't7' }).push, null);
+  const fresh = planPush(old, b, { nowIso: 't8' });
+  assert.ok(fresh.push);
+  assert.deepEqual([...markNotified(fresh.state, fresh.push).notified].sort(), [`check-failed:${SHA_A}`, `fetch-failed:${SHA_A}`]);
 });
 
 test('R1-B1: the install is expected to still be the commit the run looked at (passed to performUpdate)', async () => {

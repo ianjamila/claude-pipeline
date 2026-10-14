@@ -1,9 +1,11 @@
 // State and wording for `pipeline update --scheduled` (the recurring unattended update): when to push the owner, once.
 // The state is one small JSON file next to the worktrees cron logs (~/.local/state/pipeline, or PIPELINE_PRUNE_LOG_DIR):
-//   { pending: {key, episode}, notified: key, transient: {reason, runs} }
+//   { pending: {key, episode}, notified: [key, ...], transient: {reason, runs} }
 // A problem is keyed by (reason, main sha), so a failure that repeats every run pushes once per main sha; a new main sha is a new key.
+// `notified` lists EVERY key pushed since the last good run, so failures that alternate at one sha (fetch-failed, lock busy,
+// fetch-failed ...) push each key once, not once per switch.
 // A transient problem (network, a busy install lock) pushes only when it has failed TRANSIENT_RUNS runs in a row. Any
-// run that ends well (nothing to do, or updated) clears the file, so the next failure pushes again. `pending` is written
+// run that ends well (nothing to do, or updated) clears the file (all keys), so the next failure pushes again. `pending` is written
 // BEFORE the push so a retry after a crash reuses the same episode in notify's ledger key and cannot push twice;
 // `notified` is written only once a push was delivered (or notify's ledger says it already was).
 import fs from 'node:fs';
@@ -49,14 +51,15 @@ export function planPush(state, problem, { nowIso }) {
   if (!problem) return { push: null, state: {} };
   const key = `${problem.transient ? 'transient:' : ''}${problem.reason}:${problem.sha}`;
   const next = {};
-  if (state.notified) next.notified = state.notified;
+  const told = notifiedKeys(state);
+  if (told.length > 0) next.notified = told;
   if (problem.transient) {
     const runs = (state.transient?.reason === problem.reason ? Number(state.transient.runs) || 0 : 0) + 1;
     next.transient = { reason: problem.reason, runs };
     if (runs < TRANSIENT_RUNS) return { push: null, state: next };
   }
   else if (state.transient) delete next.transient; // a different, definite problem ends the streak
-  if (next.notified === key) return { push: null, state: next };
+  if (told.includes(key)) return { push: null, state: next };
   const episode = state.pending?.key === key ? state.pending.episode : nowIso;
   next.pending = { key, episode };
   return { push: { key, episode }, state: next };
@@ -65,7 +68,16 @@ export function planPush(state, problem, { nowIso }) {
 export function markNotified(state, push) {
   const { pending, ...rest } = state;
   void pending;
-  return { ...rest, notified: push.key };
+  const told = notifiedKeys(state);
+  return { ...rest, notified: told.includes(push.key) ? told : [...told, push.key] };
+}
+
+// Every key already pushed in this failure episode. A state file written before this held ONE key as a string: it reads as a
+// one-key list (so that key stays silenced) and is rewritten as a list by the next write.
+function notifiedKeys(state) {
+  const n = state?.notified;
+  if (Array.isArray(n)) return n.filter((k) => typeof k === 'string' && k);
+  return typeof n === 'string' && n ? [n] : [];
 }
 
 // Why this process counts as inside a Claude Code session, or null when it does not. `pipeline update` and `update schedule
