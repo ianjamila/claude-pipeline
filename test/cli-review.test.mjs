@@ -2220,3 +2220,14 @@ test('triage settle: a cached copy of an owner ruling (by cache, ownerQuote kept
   assert.match(s.json.reason, /already ruled by the owner/);
   assert.equal(w.stateText(), before, 'state untouched');
 });
+
+test('triage owner-ruling: says the ruling is not published yet and that state show would restore the published state without it', (t) => {
+  const w = world(t, { yml: CHAT_YML });
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP' });
+  const r = w.cli(rule('R1-B1', 'FOLLOW-UP', { extra: ['--pr', '7'] }));
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.published, false);
+  assert.match(r.json.next, /comment --pr 7 --kind triage/);
+  assert.match(r.json.next, /state show/);
+});

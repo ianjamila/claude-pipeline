@@ -29,10 +29,10 @@ export const meta = {
     '  -> a bug-disproved result on a security/auth/permissions/data item is still needsHuman',
     'pipeline triage light-lane --round R [--repo DIR]',
     'pipeline triage owner-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJECT --reason TEXT --owner-quote TEXT [--pr N] [--repo DIR]',
-    '  -> {ok, round, id, final}; records the OWNER\'s decision (final.by owner, needsHuman false, the exact quote and time, the overruled final kept) for an item that needs a human',
+    '  -> {ok, round, id, final, published: false, next}; records the OWNER\'s decision (final.by owner, needsHuman false, the exact quote and time, the overruled final kept) for an item that needs a human',
     '  -> only with owner_approval: chat; exit 1 for label mode, an item that is not waiting for a human (settled items are not reopened), a missing item, an empty reason or quote, or a --pr that is not the review state\'s',
     '  -> works on an already published round. ACCEPT still needs the fix and a later review round; FOLLOW-UP is filed by `followups create`; the quote is published in the triage comment and the final gate counts it as ownerMerge (the owner\'s "merge" is still needed)',
-    '  -> pass the owner\'s own words as --owner-quote, never a paraphrase; then re-post the triage comment (`pipeline comment --kind triage`)',
+    '  -> pass the owner\'s own words as --owner-quote, never a paraphrase; then re-post the triage comment NOW (`pipeline comment --pr N --kind triage`); until then the ruling is local only (`published: false`) and `pipeline state show` restores the published state without it',
   ].join('\n'),
 };
 
@@ -274,7 +274,8 @@ async function ownerRuling(rest, ctx) {
     if (why) return refuse(why);
     const ruled = applyOwnerRuling(item, { decision, reason, ownerQuote, ruledAt: new Date().toISOString() });
     saveState(root, updateItems(state, n, [ruled]));
-    return { exitCode: EXIT.OK, output: { ok: true, round: n, id, final: ruled.final } };
+    const next = `run \`pipeline comment --pr ${state.pr ?? pr ?? '<N>'} --kind triage\` now: until the triage comment is re-posted the ruling is only local, and \`pipeline state show\` restores the published state without it`;
+    return { exitCode: EXIT.OK, output: { ok: true, round: n, id, final: ruled.final, published: false, next } };
   }, pr);
 }
 

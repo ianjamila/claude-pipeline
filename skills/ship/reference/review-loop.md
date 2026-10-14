@@ -167,7 +167,8 @@ word in chat, never by you. When the owner rules on it ("accept R4-B1", "follow-
 1. Per item, with the owner's EXACT words (copy the message, never a paraphrase): `P triage owner-ruling --round <round> --id <id>
    --decision ACCEPT|FOLLOW-UP|REJECT --reason "<why, one line>" --owner-quote "<the owner's words>" --pr <pr>`. It refuses label mode, an item
    that is not `needsHuman` and an empty quote; a published round is fine. It never clears the merge by itself: the quote is published in
-   the triage comment and the final gate counts the item in `ownerMerge`, so the owner still has to say "merge" for the head.
+   the triage comment and the final gate counts the item in `ownerMerge`, so the owner still has to say "merge" for the head. Its output says
+   `published: false` and a `next`: the ruling is local only until step 2, and `P state show` before that restores the published state WITHOUT it.
 2. `P comment --pr <pr> --kind triage` (re-post, so the ruling is published), then `P followups create --round <round>` for FOLLOW-UP,
    then post the triage comment again for the issue links.
 3. ACCEPT: it is not clean until built and reviewed: implement it (step 6), `P state mark-implemented`, and run a new round.
