@@ -6,7 +6,7 @@
 // directory (gh api / ls-remote with an isolated git, the scratch under the Claude home), so the line needs no `cd`.
 // --install arranges for the guard hooks to be replaced unattended, so it refuses inside Claude Code exactly like
 // `pipeline update`; --status and --remove (which only take the job away) are allowed anywhere.
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { EXIT, UsageError, parseCommandArgs } from './cli.mjs';
@@ -74,6 +74,44 @@ function systemCrontab(op, text) {
   const r = runProc('crontab', ['-'], { input: text });
   if (r.code !== 0) throw fail('cannot write the crontab', r);
   return undefined;
+}
+
+// ---- is the schedule installed? (the SessionStart hook's question) -------------------------------------------------
+// Cheap and read-only: one `crontab -l` (Linux/WSL) or one file read (macOS), no launchctl, no network, never throws. "Installed"
+// here means the job's own marker line / plist is there, not that launchd has it loaded (--status asks that, at more cost).
+const CRON_EVERY = /^\s*\*\/(\d{1,2})\s+\*\s+\*\s+\*\s+\*\s/;
+const CRON_ONCE_AN_HOUR = new RegExp(`^\\s*${ONCE_AN_HOUR_MINUTE}\\s+\\*\\s+\\*\\s+\\*\\s+\\*\\s`);
+const PLIST_INTERVAL = /<key>StartInterval<\/key>\s*<integer>(\d+)<\/integer>/;
+
+// A bounded `crontab -l`; no crontab at all reads as empty. Anything else (crontab missing, denied, timed out) throws.
+function readCrontabBounded(timeoutMs) {
+  const r = runProc('crontab', ['-l'], { timeoutMs });
+  if (r.code === 0) return r.stdout;
+  if (/no crontab/i.test(r.stderr)) return '';
+  throw new Error(`crontab -l failed: exit ${r.code}`);
+}
+
+const validEvery = (n) => (Number.isInteger(n) && n >= 1 && n <= 60 ? n : null);
+
+export function scheduleInstalled({ platform = process.platform, home = os.homedir(), crontabRead, readFile, timeoutMs } = {}) {
+  const none = { installed: false, every: null };
+  try {
+    if (platform === 'linux') {
+      const text = (crontabRead ?? (() => readCrontabBounded(timeoutMs)))();
+      const line = String(text ?? '').split(/\r?\n/).find((l) => !l.trimStart().startsWith('#') && l.trimEnd().endsWith(CRON_MARKER));
+      if (line === undefined) return none;
+      const m = CRON_EVERY.exec(line);
+      if (m) return { installed: true, every: validEvery(Number(m[1])) };
+      return { installed: true, every: CRON_ONCE_AN_HOUR.test(line) ? 60 : null };
+    }
+    if (platform === 'darwin') {
+      const text = (readFile ?? ((f) => readFileSync(f, 'utf8')))(launchd.agentPlistPath(home, LAUNCHD_LABEL));
+      if (typeof text !== 'string') return none;
+      const m = PLIST_INTERVAL.exec(text);
+      return { installed: true, every: m && Number(m[1]) % 60 === 0 ? validEvery(Number(m[1]) / 60) : null };
+    }
+  } catch { /* unreadable = not installed */ }
+  return none;
 }
 
 const NOTE = (every) => `runs every ${every} minutes: installs main when this machine is behind it, does nothing when current, and pushes you only on failure (deduped). Check with \`pipeline update schedule --status\`; remove with \`--remove\`.`;

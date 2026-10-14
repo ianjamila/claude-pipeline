@@ -8,7 +8,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { run as update, meta } from '../pipeline/commands/update.mjs';
-import { CRON_MARKER, EVERY_CHOICES, LAUNCHD_LABEL, cronExpression, parseEvery, scheduleLine, schedulePlist } from '../pipeline/lib/update-schedule.mjs';
+import { CRON_MARKER, EVERY_CHOICES, LAUNCHD_LABEL, cronExpression, parseEvery, scheduleInstalled, scheduleLine, schedulePlist } from '../pipeline/lib/update-schedule.mjs';
 import { insideClaudeCode } from '../pipeline/lib/auto-update.mjs';
 
 const made = [];
@@ -315,4 +315,52 @@ test('insideClaudeCode: the owner-admin variable bypasses it, like a manual upda
   assert.equal(insideClaudeCode({ CLAUDECODE: '1' }, { hasClaudeCodeAncestor: never }), 'CLAUDECODE=1');
   assert.equal(insideClaudeCode({}, { hasClaudeCodeAncestor: () => true }), 'a Claude Code process is an ancestor of this one');
   assert.equal(insideClaudeCode({}, { hasClaudeCodeAncestor: () => false }), null);
+});
+
+// ---- scheduleInstalled: the SessionStart hook's cheap question --------------------------------------------------------
+
+const crontabWith = (every) => `${OTHER}${scheduleLine({ ...LINE_ARGS, every })}\n`;
+
+test('scheduleInstalled (linux): finds the marker line and reads the interval from */N, or 60 from the once-an-hour form', () => {
+  for (const every of EVERY_CHOICES) {
+    assert.deepEqual(scheduleInstalled({ platform: 'linux', crontabRead: () => crontabWith(every) }), { installed: true, every }, String(every));
+  }
+  assert.deepEqual(scheduleInstalled({ platform: 'linux', crontabRead: () => `17 * * * * /x ${CRON_MARKER}\n` }), { installed: true, every: 60 });
+});
+
+test('scheduleInstalled (linux): other lines, a commented-out marker, a marker with a form it cannot read, and garbage', () => {
+  const none = { installed: false, every: null };
+  assert.deepEqual(scheduleInstalled({ platform: 'linux', crontabRead: () => OTHER }), none);
+  assert.deepEqual(scheduleInstalled({ platform: 'linux', crontabRead: () => '' }), none);
+  assert.deepEqual(scheduleInstalled({ platform: 'linux', crontabRead: () => `#${scheduleLine(LINE_ARGS)}\n` }), none, 'a commented-out job does not run');
+  assert.deepEqual(scheduleInstalled({ platform: 'linux', crontabRead: () => '\u0000\ufffd not a crontab \n*/x * * * *' }), none);
+  assert.deepEqual(scheduleInstalled({ platform: 'linux', crontabRead: () => `@daily /x ${CRON_MARKER}\n` }), { installed: true, every: null });
+  assert.deepEqual(scheduleInstalled({ platform: 'linux', crontabRead: () => `*/0 * * * * /x ${CRON_MARKER}\n` }), { installed: true, every: null });
+});
+
+test('scheduleInstalled (linux): a crontab read that throws or returns junk is "not installed", never a throw', () => {
+  const none = { installed: false, every: null };
+  assert.deepEqual(scheduleInstalled({ platform: 'linux', crontabRead: () => { throw new Error('crontab: not found'); } }), none);
+  assert.deepEqual(scheduleInstalled({ platform: 'linux', crontabRead: () => undefined }), none);
+  assert.deepEqual(scheduleInstalled({ platform: 'linux', crontabRead: () => 42 }), none);
+});
+
+test('scheduleInstalled (darwin): reads StartInterval from the plist in the given home; no file, no key or garbage is handled', () => {
+  const plistFor = (every) => schedulePlist({ ...LINE_ARGS, every });
+  const seen = [];
+  const read = (text) => (f) => { seen.push(f); return text; };
+  assert.deepEqual(scheduleInstalled({ platform: 'darwin', home: '/Users/me', readFile: read(plistFor(15)) }), { installed: true, every: 15 });
+  assert.deepEqual(seen, [`/Users/me/Library/LaunchAgents/${LAUNCHD_LABEL}.plist`]);
+  assert.equal(plistFor(15).includes('<integer>900</integer>'), true);
+  assert.deepEqual(scheduleInstalled({ platform: 'darwin', readFile: read(plistFor(60)) }), { installed: true, every: 60 });
+  assert.deepEqual(scheduleInstalled({ platform: 'darwin', readFile: read('<plist><dict></dict></plist>') }), { installed: true, every: null });
+  assert.deepEqual(scheduleInstalled({ platform: 'darwin', readFile: read('<key>StartInterval</key><integer>90</integer>') }), { installed: true, every: null });
+  assert.deepEqual(scheduleInstalled({ platform: 'darwin', readFile: () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); } }), { installed: false, every: null });
+  assert.deepEqual(scheduleInstalled({ platform: 'darwin', readFile: read(undefined) }), { installed: false, every: null });
+});
+
+test('scheduleInstalled: other platforms are never installed, and the crontab is not read', () => {
+  let reads = 0;
+  assert.deepEqual(scheduleInstalled({ platform: 'win32', crontabRead: () => { reads += 1; return crontabWith(15); } }), { installed: false, every: null });
+  assert.equal(reads, 0);
 });
