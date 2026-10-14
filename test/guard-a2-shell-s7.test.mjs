@@ -241,13 +241,13 @@ test('S7 codex r3 recheck: an edit that empties a joined part (`sed -i d`) is on
   assert.equal(G("sed -i 'd' c.sh; cat a.sh b.sh c.sh | bash", { 'a.sh': 'git pu', 'b.sh': 'sh origin main', 'c.sh': '-feature\n' }), 'deny');
 });
 
-test('S7 codex r3 recheck: static text and files fed to one shell together (`{ cat a; printf %s sh; cat b; }`) are judged as one stream (rebuilt since S8)', () => {
+test('S7 codex r3 recheck: static text and files fed to one shell together (`{ cat a; printf %s sh; cat b; }`) cannot be rebuilt as one stream: refused (only a SQL client\'s stream is rebuilt since Codex review 4, guard-a2-shell-s9.test.mjs)', () => {
   for (const c of [
     '{ cat a.sh; printf %s sh; cat b.sh; } | bash',
     '{ printf %s "git pu"; printf %s sh; cat b.sh; } | bash',
+    '{ printf %s "git pu"; cat b.sh; } | bash',
     '{ cat a.sh; echo -n sh; cat b.sh; } | bash',
   ]) assert.equal(G(c, { 'a.sh': 'git pu', 'b.sh': ' origin main\n' }), 'deny', c);
-  assert.equal(G('{ printf %s "git pu"; cat b.sh; } | bash', { 'b.sh': ' origin main\n' }), 'allow', '(the stream is `git pu origin main`)');
   assert.equal(files('{ printf %s "echo x > /home/u/.cl"; cat b.sh; } | bash', { 'b.sh': 'aude/settings.json\n' }), 'deny');
   assert.equal(G('{ echo "echo hi"; echo "echo there"; } | bash', {}), 'allow', '(static text alone is judged as it is)');
 });

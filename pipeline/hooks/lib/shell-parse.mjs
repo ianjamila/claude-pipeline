@@ -939,6 +939,8 @@ function subsProduced(subs, st, hops) {
 function staticOutput(seg) {
   const pa = seg.final ? seg.final.argv : [];
   const pn = pa.length ? base(pa[0]) : '';
+  // (bash ends an argument at a NUL, `$'git pu\0#'` prints `git pu`; zsh keeps it: neither is rebuilt -- Codex review 4)
+  if (pa.some((w) => w.includes('\0')) || [...seg.heredocs, ...seg.herestrings].some((h) => h.text.includes('\0'))) return null;
   if (pn === 'echo' || pn === 'printf') {
     if (seg.heredocs.length || seg.herestrings.length || pa.slice(1).some((w) => seg.meta.has(w) || seg.pat.has(w))) return null;
   }
@@ -1006,7 +1008,9 @@ function producePieces(stages, st, run) {
         for (const w of computed) st.seq.push({ scan: w });
         continue;
       }
-      const text = files.length || computed.length || piped ? null : staticOutput(s);
+      // (a line that defines a function or can rename a command -- `echo() { :; }`, alias, enable -n, functions[echo]=, source, eval ... -- may print anything
+      // under echo's name: not rebuilt, without telling which names it reaches -- Codex review 4; see noteRedef)
+      const text = files.length || computed.length || piped || s.defs?.redef || s.fns?.size ? null : staticOutput(s);
       if (text === null) { st.mixed = true; continue; }
       if (text !== '') st.seq.push({ text });
     }
@@ -1276,7 +1280,10 @@ function feedRecords1(cmd, line, resolve, raw0) {
   // (`covered`: the streams hold every file that feeds the program, so the joins below would only repeat them without the static text)
   const inStreams = { files: [], scans: [] };
   if (streams.length && (f.files.length || f.computed.length)) {
-    if (raw0.unsure) return [refuse];
+    // (only a SQL client's stream is rebuilt, where just its shell escapes run: every such stream in 21 days fed psql. Text fed to a shell or an interpreter is
+    // the program itself, and static text in it is refused as before -- owner, Codex review 4 of #50; a stream of more parts than MAX_FEED_FILES too)
+    if (!raw0.sql || raw0.both || raw0.interp || raw0.unsure) return [refuse];
+    if (streams.some((seq) => seq.length > MAX_FEED_FILES)) return [refuse];
     for (const seq of streams) {
       const parts = seq.map((p) => (Object.hasOwn(p, 'text') ? p : Object.hasOwn(p, 'file') ? { file: R(p.file) } : { scan: R(p.scan) }));
       const exactParts = parts.filter((p) => Object.hasOwn(p, 'file')).map((p) => p.file);
@@ -1297,7 +1304,8 @@ function feedRecords1(cmd, line, resolve, raw0) {
       }
     }
   }
-  const same = (x, y) => x.length === y.length && [...x].sort().every((w, i) => w === [...y].sort()[i]);
+  // (each side sorted once: sorting y again for every element was quadratic, 60,000 parts ran past the hook's 15 s limit -- Codex review 4)
+  const same = (x, y) => { if (x.length !== y.length) return false; const a = [...x].sort(); const b = [...y].sort(); return a.every((w, i) => w === b[i]); };
   const covered = (inStreams.files.length || inStreams.scans.length) && same(inStreams.files, f.files) && same(inStreams.scans, f.computed);
   if (f.files.length >= 2 && !covered) {
     // Why: `{ cat a; cat b; } | bash`: the producers run one after the other, so the text is their files in the order the line names them (`cat a b`
@@ -1581,7 +1589,19 @@ function zshAlternationAt(s, i) {
   return false;
 }
 
+// Why: the stream rebuild (producePieces) takes echo / printf / cat for the shell's own; a line that can make a name run something else -- an alias, a builtin turned
+// off (enable -n, zsh disable), zsh's functions / aliases / builtins tables (`functions[echo]=:`, `read -A aliases`), autoload, a sourced or eval'd text, a trap --
+// switches the rebuild off for the whole line (as does any function it defines: ctx.fns). Codex review 4 of #50; the owner chose this over chasing each name.
+const REDEF_CMDS = new Set(['alias', 'unalias', 'enable', 'disable', 'functions', 'unfunction', 'unhash', 'autoload', 'source', '.', 'eval', 'emulate', 'zmodload', 'trap']);
+const REDEF_TABLE = /^(?:dis_)?(?:functions|functions_source|aliases|galiases|saliases|builtins|reswords)(?:\[|\+?=|$)/;
+function noteRedef(ctx, argv, env) {
+  if (!ctx.defs || ctx.defs.redef) return;
+  if (argv.length && REDEF_CMDS.has(base(argv[0]))) ctx.defs.redef = true;
+  else if (argv.some((w) => REDEF_TABLE.test(w)) || Object.keys(env ?? {}).some((k) => REDEF_TABLE.test(k))) ctx.defs.redef = true;
+}
+
 function emit(ctx, argv, env, raw, depth, redirects = [], sep = ';') {
+  noteRedef(ctx, argv, env);
   if (ctx.out.length >= MAX_COMMANDS) { ctx.truncated = true; ctx.stopped = true; return null; }
   const cmd = { argv, env, raw, depth, redirects };
   // grp: the subshells (`$( )`, `( )`, backticks, `<( )`) it runs inside, outermost first, as ids: a cd in one is lost when it ends. Not enumerable
@@ -1847,7 +1867,7 @@ class Parser {
       if (!inWord) wstart = this.i;
       if (!seg) {
         seg = {
-          words: [], heredocs: [], herestrings: [], redirects: [], stdinSubs: [], stdinFile: false, stdinFiles: [], outSubs: [], fdFeeds: [], vf: ctx.varFeeds, cmd: null, meta: new Map(), win: new Map(),
+          words: [], heredocs: [], herestrings: [], redirects: [], stdinSubs: [], stdinFile: false, stdinFiles: [], outSubs: [], fdFeeds: [], vf: ctx.varFeeds, fns: ctx.fns, defs: ctx.defs, cmd: null, meta: new Map(), win: new Map(),
           start: this.i, depth, pending: 0, muted, raw: '', final: null, groupStage: null, pat: new Set(), grp: ctx.grp, ctl: ctlMarks(ctx.ctl),
           pipedFrom: lastSep === '|' ? this.lastStage : null, sep: lastSep,
         };
@@ -2722,7 +2742,7 @@ class Parser {
 }
 
 function newCtx(maxDepth, expired, bashState) {
-  return { out: [], expired, maxDepth, truncated: false, dynamic: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, ctlBroken: false, fns: new Set(), stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
+  return { out: [], expired, maxDepth, truncated: false, dynamic: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, ctlBroken: false, fns: new Set(), defs: { redef: false }, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
 }
 
 // The text with every comment the lexer skips blanked out (newlines kept), from a lexing pass that interprets nothing (muted); null when that pass did not
