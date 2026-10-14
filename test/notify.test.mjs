@@ -721,12 +721,14 @@ test('a hung gh title lookup is killed at the lookup budget and the push still g
   const r = rig({ realLookup: true, env: { PIPELINE_GH: `"${process.execPath}" "${script}"` } });
   let pid = null;
   try {
-    const t0 = Date.now();
+    // Monotonic clock on purpose: the wall clock (Date.now) steps on a WSL2 host (measured here: a 570 ms backwards step within 20 s),
+    // which once made a correct 2016 ms lookup read as 1513 ms and fail the lower bound. The timers under test are monotonic too.
+    const t0 = performance.now();
     // The lookup's own kill fires at 2000 ms (lookupMs minus the slack); the outer race at 2500 ms.
     const res = await notifyEvent({ ...STOP, title: undefined }, { ...r.deps, budget: { lookupMs: 2500 } });
-    const took = Date.now() - t0;
+    const took = performance.now() - t0;
     assert.equal(res.sent, true);
-    assert.ok(took >= 2000 && took < 6000, `took ${took} ms`);
+    assert.ok(took >= 1900 && took < 6000, `took ${Math.round(took)} ms`); // 100 ms under the kill timer: timer rounding only
     assert.equal(r.fetchCalls[0].body.title, '[testbox] #12');
     // Positive evidence that the real lookup launched the fixture: the pid file must appear.
     for (let i = 0; i < 200 && !existsSync(pidFile); i++) await sleep(50);
