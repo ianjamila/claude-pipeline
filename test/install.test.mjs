@@ -100,6 +100,10 @@ const guardFiles = (home) => ({
 const sessionVersion = (home) => ({
   hooks: [{ type: 'command', command: 'node', args: [joinNative(home, 'pipeline', 'hooks', 'session-version.mjs')], timeout: 10 }],
 });
+// #58: the owner-go recorder, on UserPromptSubmit, started without the fail-closed loader (it must never block a prompt)
+const ownerGo = (home) => ({
+  hooks: [{ type: 'command', command: 'node', args: [joinNative(home, 'pipeline', 'hooks', 'owner-go.mjs')], timeout: 10 }],
+});
 const allowEntries = (home) => [
   `Bash(node ${posix(home)}/pipeline/bin/pipeline.mjs:*)`,
   ...(/\s/.test(home) ? [`Bash(node "${posix(home)}/pipeline/bin/pipeline.mjs":*)`] : []),
@@ -205,6 +209,7 @@ test('existing settings: every other key survives unchanged, ours is appended on
   const expected = structuredClone(before);
   expected.hooks.PreToolUse.push(guardGit(home), guardFiles(home));
   expected.hooks.SessionStart.push(sessionVersion(home));
+  expected.hooks.UserPromptSubmit.push(ownerGo(home)); // (after the owner's own)
   expected.permissions.allow.push(...allowEntries(home));
   assert.deepEqual(after, expected);
   assert.deepEqual(Object.keys(after), Object.keys(before), 'top-level key order is preserved');
@@ -279,6 +284,7 @@ test('an older install in the string command form is replaced, not duplicated', 
   const expected = structuredClone(ownersSettings());
   expected.hooks.PreToolUse.push({ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }] }, guardGit(home), guardFiles(home));
   expected.hooks.SessionStart.push(sessionVersion(home));
+  expected.hooks.UserPromptSubmit.push(ownerGo(home)); // (after the owner's own)
   expected.permissions.allow.push(...allowEntries(home));
   assert.deepEqual(after, expected);
 });
@@ -401,6 +407,15 @@ test('--check: clean after install, names an edited file, notices a deleted hook
   const noHook = install(home, ['--check']);
   assert.equal(noHook.status, 1);
   assert.match(noHook.stdout, /guard-git/);
+
+  // #58: a missing owner-go recorder is drift too (without it no owner "merge" is ever recorded, so P merge refuses every owner item)
+  assert.equal(install(home).status, 0);
+  const s2 = readSettings(home);
+  s2.hooks.UserPromptSubmit = s2.hooks.UserPromptSubmit.filter((g) => !g.hooks.some((h) => (h.args ?? []).some((a) => a.endsWith('owner-go.mjs'))));
+  writeSettings(home, s2);
+  const noRecorder = install(home, ['--check']);
+  assert.equal(noRecorder.status, 1);
+  assert.match(noRecorder.stdout, /hook missing: owner-go is not in hooks\.UserPromptSubmit/);
 });
 
 test('--check also reports a missing file, a duplicated hook, a missing allow entry and a removed-from-source file', () => {
