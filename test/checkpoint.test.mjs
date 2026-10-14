@@ -12,6 +12,7 @@ import { decodeRecord } from '../pipeline/lib/run-record.mjs';
 import { parseEvent } from '../pipeline/lib/run-events.mjs';
 import { writeSummaryComment } from '../pipeline/lib/summary-comment.mjs';
 import { run as mergeRun } from '../pipeline/commands/merge.mjs';
+import { approvalFlags, mergeRequest, ownerSays } from './helpers/owner-go.mjs';
 
 // ---- what the fake GitHub saw ----------------------------------------------------------------------------------------
 
@@ -390,12 +391,14 @@ test('merge: an exception after inFlight was set still clears it (finally), then
   assert.equal(marker(s), -1, 'the merge command never ran');
 });
 
-test('merge: a record write that fails only warns; the merge still happens', () => {
+test('merge: a record write that fails only warns; the merge still happens', (t) => {
   // Only the summary comment write fails: it is a PATCH/POST of the record, the event is a POST too, so fail by body.
   // (The comment list read fails too, so the resumed-run guard cannot be checked: the owner approves this exact head.)
   const s = mergeScenario({ gh: { extra: [{ match: 'repos/acme/widgets/issues/12/comments --paginate', code: 1, stderr: 'gh: Server Error (HTTP 502)' }, ...DEPLOYMENTS] } });
-  assertExit(s.gate(), 0);
-  const r = mergeWith(s, ['--owner-approved-head', s.head]);
+  const g = s.gate();
+  assertExit(g, 0);
+  ownerSays(t, 'merge', mergeRequest(12, s.head, g.json.ownerItems));
+  const r = mergeWith(s, approvalFlags(s.head, g.json.ownerItems));
   assertExit(r, 0);
   assert.equal(r.json.merged, true);
   assert.ok(r.json.warnings.some((w) => w.startsWith('run record not updated:')), r.json.warnings.join());
@@ -510,7 +513,7 @@ test('merge: a RESUMED run record refuses to merge without --owner-approved-head
   assertExit(r, 1);
   assert.equal(r.json.merged, false);
   assert.equal(r.json.error, 'pre-merge');
-  assert.equal(r.json.reason, 'resumed run: the owner must approve this exact head (pass --owner-approved-head <sha>)');
+  assert.equal(r.json.reason, "resumed run: the owner must say \"merge\" for this exact head (then pass --owner-approved-head <full head> --owner-approved-items <the gate's ownerItems>)");
   assert.equal(marker(s), -1, 'the merge command never ran');
   assert.deepEqual(eventWrites(s.fake), [], 'no prod-before event');
   assert.deepEqual(recordWrites(s.fake), [], 'no inFlight');
@@ -529,10 +532,14 @@ test('merge: --owner-approved-head must be the full gate head; another sha, or a
   assert.equal(marker(s), -1);
 });
 
-test('merge: a resumed run merges once the owner\'s approval names exactly the gate head', () => {
+test('merge: a resumed run merges once the owner\'s recorded "merge" names exactly the gate head', (t) => {
   const s = withRecord({}, baseRecord({ step: 'gate', resumed: RESUMED }));
-  assertExit(s.gate(), 0);
-  const r = mergeWith(s, ['--owner-approved-head', s.head]);
+  const g = s.gate();
+  assertExit(g, 0);
+  // (the flags alone, without the owner's recorded "merge", still refuse: #58)
+  assertExit(mergeWith(s, approvalFlags(s.head, g.json.ownerItems)), 1);
+  ownerSays(t, 'merge', mergeRequest(12, s.head, g.json.ownerItems));
+  const r = mergeWith(s, approvalFlags(s.head, g.json.ownerItems));
   assertExit(r, 0, r.stdout);
   assert.equal(r.json.merged, true);
   assert.ok(marker(s) >= 0, 'the merge command ran');
@@ -547,7 +554,7 @@ test('merge: a record that is NOT resumed merges as before, with or without the 
   assertExit(mergeWith(flagged, ['--owner-approved-head', 'b'.repeat(40)]), 0);
 });
 
-test('merge: a run record that cannot be checked fails CLOSED (it may be a resumed one): pre-merge unless the owner approved this exact head', () => {
+test('merge: a run record that cannot be checked fails CLOSED (it may be a resumed one): pre-merge unless the owner approved this exact head', (t) => {
   const unreadable = () => mergeScenario({ gh: { extra: [{ match: 'repos/acme/widgets/issues/12/comments --paginate', code: 1, stderr: 'gh: Server Error (HTTP 500)' }, ...DEPLOYMENTS] } });
   const cases = [
     ['unreadable comments', unreadable, /^the run record could not be read \(.*\), so the resumed-run guard cannot be checked/],
@@ -560,7 +567,7 @@ test('merge: a run record that cannot be checked fails CLOSED (it may be a resum
     assertExit(r, 1, name);
     assert.equal(r.json.error, 'pre-merge', name);
     assert.match(r.json.reason, reason, name);
-    assert.match(r.json.reason, /pass --owner-approved-head <sha>\)$/, name);
+    assert.match(r.json.reason, /then pass --owner-approved-head <full head> --owner-approved-items <the gate's ownerItems>\)$/, name);
     assert.equal(marker(s), -1, `${name}: the merge command never ran`);
     assert.deepEqual(eventWrites(s.fake), [], `${name}: no prod-before event`);
     assert.deepEqual(s.mergeCalls(), [], name);
@@ -570,8 +577,10 @@ test('merge: a run record that cannot be checked fails CLOSED (it may be a resum
   }
   // the owner's approval of the exact gate head lets it through
   const s = unreadable();
-  assertExit(s.gate(), 0);
-  const ok = mergeWith(s, ['--owner-approved-head', s.head]);
+  const g = s.gate();
+  assertExit(g, 0);
+  ownerSays(t, 'merge', mergeRequest(12, s.head, g.json.ownerItems));
+  const ok = mergeWith(s, approvalFlags(s.head, g.json.ownerItems));
   assertExit(ok, 0, ok.stdout);
   assert.equal(ok.json.merged, true);
 });

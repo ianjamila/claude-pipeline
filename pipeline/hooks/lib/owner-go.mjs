@@ -23,7 +23,17 @@ const MAX_RECORD_BYTES = 1024 * 1024; // one session file; a bigger one is not r
 const SESSION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 export const HEAD_CHARS = 12; // the head is shown (and matched) by its first 12 characters at least
 
-export const ownerGoDir = (home = os.homedir()) => path.join(home, ...OWNER_GO_REL.split('/'));
+// The account's home from the OS user database, NOT $HOME: `HOME=/tmp/x P merge …` must not point the check at a folder the agent
+// can write. (The `home` options below are for the unit tests, which call these functions in-process.)
+export function accountHome() {
+  try {
+    const h = os.userInfo().homedir;
+    if (typeof h === 'string' && h) return h;
+  } catch { /* no passwd entry: fall back */ }
+  return os.homedir();
+}
+
+export const ownerGoDir = (home = accountHome()) => path.join(home, ...OWNER_GO_REL.split('/'));
 
 // The words that may follow "merge" in an approval besides its targets (#N, N, a head prefix).
 const FILLER = /^(?:and|it|both|all|them|these|those|please|pls|now|go|ok|okay|thanks|thank|you|thx|ty)$/i;
@@ -70,7 +80,7 @@ export function presentedRequests(text) {
   return { prs, requests };
 }
 
-// The text of the most recent assistant reply in the transcript that holds a 🔀 merge request ('' when none). Only the
+// The text of the last assistant reply in the transcript when it holds a 🔀 merge request ('' when none). Only the
 // transcript's last 4 MB are read. A reply is every assistant text block between two prompts.
 export function lastRequestText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES } = {}) {
   let raw = '';
@@ -103,7 +113,9 @@ export function lastRequestText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BY
       for (const b of content) if (b?.type === 'text' && typeof b.text === 'string') replies[replies.length - 1] += `${b.text}\n`;
     }
   }
-  for (let i = replies.length - 1; i >= 0; i--) if (READY_LINE.test(replies[i])) return replies[i];
+  // Only the LAST reply that has text (the one the owner is answering; the prompt itself may already be the last entry, leaving an
+  // empty reply after it). An older request is never revived by a later "merge": the agent shows it again.
+  for (let i = replies.length - 1; i >= 0; i--) if (replies[i].trim()) return READY_LINE.test(replies[i]) ? replies[i] : '';
   return '';
 }
 
@@ -135,7 +147,7 @@ function realDirChain(home, rel) {
 
 // The recorder. Writes one line to <home>/.claude/pipeline-state/owner-go/<session>.jsonl for an owner prompt that approves;
 // returns the record, or null (not an approval, a subagent, no session, or the write failed). Never throws.
-export function recordApproval(input, { home = os.homedir(), now = Date.now } = {}) {
+export function recordApproval(input, { home = accountHome(), now = Date.now } = {}) {
   try {
     if (notOwnerPrompt(input)) return null;
     const session = String(input?.session_id ?? '');
@@ -178,7 +190,7 @@ export function recordApproval(input, { home = os.homedir(), now = Date.now } = 
 }
 
 // Every valid record younger than maxAgeMs, from one session's file or (session null) from all of them. Never throws.
-export function readApprovals({ home = os.homedir(), session = null, now = Date.now, maxAgeMs = MAX_AGE_MS } = {}) {
+export function readApprovals({ home = accountHome(), session = null, now = Date.now, maxAgeMs = MAX_AGE_MS } = {}) {
   const dir = ownerGoDir(home);
   const out = [];
   let names = [];
