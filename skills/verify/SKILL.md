@@ -36,6 +36,8 @@ no pipeline; I can't certify it end-to-end. Want me to run pipeline-setup?"
 2. Read the report, not the scrollback: `ok`, `mode`, `git.head`, each step's `status` and
    `errorExcerpt`. A report whose `git.head` isn't your HEAD, or with `dirty: true`, proves
    nothing about your commit.
+   A step with status `skipped` did not run: say so and quote its `skipReason`; it is not a pass, and the
+   final gate accepts it only when the owner listed it in `verify.skippable_steps`.
 3. Fix the first failing step (it fails fast), rerun. Repeat until `ok: true`.
 4. Never make it green by weakening checks: no skipping, deleting, or loosening tests, no
    lowering coverage thresholds, no editing verify scripts or CI config to dodge a failure.

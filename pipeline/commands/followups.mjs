@@ -40,7 +40,7 @@ export function followupMarker(pr, item) {
 // (the marker is ours and goes in first, after the defusing).
 export function issueBody(item, pr) {
   const where = item.file ? (item.line > 0 ? `${item.file}:${item.line}` : item.file) : null;
-  const decidedBy = item.arbiter && item.final?.by === 'arbiter' ? 'Arbiter' : 'Judge';
+  const decidedBy = item.final?.by === 'owner' ? 'Owner' : item.arbiter && item.final?.by === 'arbiter' ? 'Arbiter' : 'Judge';
   const lines = [
     String(item.detail ?? '').trim(),
     '',
