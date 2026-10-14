@@ -79,7 +79,7 @@ Evidence is never kept only in that editable record: `prod-before` (before the m
 the comment then has no rounds, and a `blocked` one names the failing verify step; any other outcome
 needs `.review/state.json`.
 1. **Outliers** — every arbiter ruling (finding · Codex view · Opus view · Fable ruling · one-line
-   reason · model-proof line), close-call rejections (low-confidence REJECTs), strong
+   reason · model-proof line), close-call rejections (REJECTs the judge was not highly confident in), strong
    disagreements (judge REJECT on a Codex BLOCKING).
 2. What was built.
 3. Suggestions implemented (with round).

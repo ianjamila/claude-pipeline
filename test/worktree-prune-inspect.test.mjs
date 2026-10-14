@@ -440,6 +440,31 @@ test('processesInside (darwin): the positive control still works when our own cw
   assert.equal(env?.LANG, 'en_US.UTF-8');
 });
 
+test('processesInside (darwin): lsof gets a minimal env (LC_ALL, LANG, PATH) and none of our other variables', () => {
+  const wt = '/Users/me/projects/app/.worktrees/agent-x';
+  const saved = { secret: process.env.FAKE_SECRET_TOKEN, path: process.env.PATH };
+  const lsofEnvKeys = (path) => {
+    process.env.FAKE_SECRET_TOKEN = 'do-not-leak';
+    if (path === undefined) delete process.env.PATH;
+    else process.env.PATH = path;
+    const run = fakeRun({ lsof: lsofText(own), ps: '' });
+    darwin(wt, { run });
+    return run.calls.find(([c]) => /lsof$/.test(c))[2].env;
+  };
+  try {
+    const withPath = lsofEnvKeys('/usr/bin:/bin');
+    assert.deepEqual(Object.keys(withPath).sort(), ['LANG', 'LC_ALL', 'PATH']);
+    assert.equal(withPath.PATH, '/usr/bin:/bin');
+    const noPath = lsofEnvKeys(undefined);
+    assert.deepEqual(Object.keys(noPath).sort(), ['LANG', 'LC_ALL']);
+  } finally {
+    if (saved.secret === undefined) delete process.env.FAKE_SECRET_TOKEN;
+    else process.env.FAKE_SECRET_TOKEN = saved.secret;
+    if (saved.path === undefined) delete process.env.PATH;
+    else process.env.PATH = saved.path;
+  }
+});
+
 const hasLsof = spawnSync('lsof', ['-v'], { encoding: 'utf8' }).error === undefined;
 test('processesInside (darwin path) with the real lsof finds a child whose cwd is inside the dir', { skip: !hasLsof && 'lsof is not installed', timeout: 120_000 }, async () => {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), 'lsof-wt-')));
