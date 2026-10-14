@@ -257,6 +257,20 @@ test('#56 bypass: a binder whose NAME is only known at run time may set any vari
   ]) allowGit(cmd, SPEC);
 });
 
+test('#56 replay: quotes inside a $( … ) inside double quotes are followed (a loop reading survives them)', () => {
+  for (const cmd of [
+    `for n in 1 2; do echo "$n $(gh pr view $n --jq '[.labels[].name]|join(",")')"; done`,
+    `for n in 1 2; do echo "$(gh pr checks $n 2>&1 | grep -i 'hard-stop')"; done`,
+  ]) allowGit(cmd, SPEC);
+  // twins: a reassignment next to, or behind, nested quotes is still seen
+  for (const cmd of [
+    `for f in ok.sh; do echo "$(echo "'")"; f=run.sh; bash $f; echo "'"; done`,
+    `for f in ok.sh; do echo "$(echo ')' )"; f=run.sh; bash $f; done`,
+    `for f in ok.sh; do echo "$(case x in x) :;; esac)"; f=run.sh; bash $f; done`,
+    `for f in ok.sh; do echo "\`echo 'x'\`"; f=run.sh; bash $f; done`,
+  ]) denyGit(cmd, SPEC);
+});
+
 test('#56 replay: `npx tsx` reads a heredoc as data like node; `set -a` changes no directory', () => {
   for (const cmd of [
     "cat > s.mjs <<'EOF'\nconst ROOT = process.cwd()\nEOF\nnpx tsx s.mjs",

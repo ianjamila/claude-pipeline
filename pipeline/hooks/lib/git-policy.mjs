@@ -1781,32 +1781,50 @@ const SPECIAL_NAMES = /^(?:PATH|IFS|HOME|CDPATH|ENV|BASH_ENV|ZDOTDIR|PWD|OLDPWD|
 // The text with what the shell never expands blanked out: single-quoted strings and comments (double-quoted text expands, so it stays). Null for `$'…'`
 // or an unterminated quote (the caller keeps its answer).
 function withoutLiteralText(s) {
+  // Why (#56 replay): `for n in 1 2; do echo "$n $(gh pr view $n --jq '.x')"; done` lost its readings because a quote inside a $( … ) inside double quotes
+  // gave up. A $( … ) starts a fresh quoting context (its single quotes are quotes again), so each context is a frame on a stack: top, a double-quoted
+  // string, a $( … ), a backtick. Still given up (null): a bare ( or $(( inside a $( … ) (a case pattern or arithmetic would end it early), a quote or ( inside
+  // backticks, $'…', and anything left open at the end.
   let out = '';
-  let dq = false;
-  let depth = 0; // $( … ) opened inside double quotes (its own quotes are not followed here: a quote inside one gives up)
-  let tick = false; // a backtick opened inside double quotes, likewise
+  const stack = ['top'];
+  const cur = () => stack[stack.length - 1];
   for (let i = 0; i < s.length;) {
     const ch = s[i];
+    const fr = cur();
     if (ch === '\\') { out += s.slice(i, i + 2); i += 2; continue; }
-    if (dq && ch === '$' && s[i + 1] === '(') { depth++; out += '$('; i += 2; continue; }
-    if (dq && depth && ch === ')') { depth--; out += ch; i++; continue; }
-    if (dq && ch === '`') tick = !tick;
-    if ((depth || tick) && (ch === "'" || ch === '"' || ch === '(')) return null;
-    if (ch === '"') { dq = !dq; out += ch; i++; continue; }
-    if (!dq && ch === '$' && s[i + 1] === "'") return null;
-    if (!dq && ch === "'") {
+    if (fr === 'tick') {
+      if (ch === '`') stack.pop();
+      else if (ch === "'" || ch === '"' || ch === '(') return null;
+      out += ch; i++; continue;
+    }
+    if (fr === 'dq') {
+      if (ch === '"') stack.pop();
+      else if (ch === '$' && s[i + 1] === '(') { stack.push('sub'); out += '$('; i += 2; continue; }
+      else if (ch === '`') stack.push('tick');
+      out += ch; i++; continue;
+    }
+    // top or sub: the same quoting rules
+    if (ch === '$' && s[i + 1] === "'") return null;
+    if (ch === "'") {
       const j = s.indexOf("'", i + 1);
       if (j < 0) return null;
       out += ' '.repeat(j + 1 - i); i = j + 1; continue;
     }
-    if (!dq && ch === '#' && (i === 0 || /[\s;&|()]/.test(s[i - 1]))) {
+    if (ch === '"') { stack.push('dq'); out += ch; i++; continue; }
+    if (fr === 'sub') {
+      if (ch === '$' && s[i + 1] === '(') { if (s[i + 2] === '(') return null; stack.push('sub'); out += '$('; i += 2; continue; }
+      if (ch === '(') return null;
+      if (ch === ')') { stack.pop(); out += ch; i++; continue; }
+      if (ch === '`') return null;
+    }
+    if (ch === '#' && (i === 0 || /[\s;&|()]/.test(s[i - 1]))) {
       const j = s.indexOf('\n', i);
       const e = j < 0 ? s.length : j;
       out += ' '.repeat(e - i); i = e; continue;
     }
     out += ch; i++;
   }
-  return dq || depth || tick ? null : out;
+  return stack.length === 1 ? out : null;
 }
 function onceAssignedNames(cmds, ctx, str) {
   if (ctx.tainted.size || cmds.truncated || cmds.dynamic || definesFunction(str, cmds) || cmds.some(isStateHazard) || !subshellsTrusted(cmds)) return [];
