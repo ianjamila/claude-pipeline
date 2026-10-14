@@ -28,6 +28,15 @@ function deny(reason) {
   })}\n`);
 }
 
+// Why: only shell denies are logged (not Edit/Write). Imported dynamically inside try/catch like the policy, so a missing or
+// broken lib/deny-log.mjs can never change the verdict or crash the hook.
+async function recordDeny(input, reason) {
+  try {
+    const { logDeny } = await import('./lib/deny-log.mjs');
+    logDeny({ hook: 'files', reason, command: input.tool_input?.command, session: input.session_id });
+  } catch { /* logging only */ }
+}
+
 async function main() {
   let raw = '';
   let input;
@@ -51,7 +60,10 @@ async function main() {
     const verdict = isShell
       ? evaluateBashForFiles(input.tool_input?.command, { ...opts, cwd })
       : evaluateFileTool({ ...input, cwd }, opts);
-    if (verdict?.decision === 'deny') deny(verdict.reason);
+    if (verdict?.decision === 'deny') {
+      if (isShell) await recordDeny(input, verdict.reason);
+      deny(verdict.reason);
+    }
     else if (verdict?.decision !== 'allow') throw new TypeError('the policy returned no decision');
   } catch (err) {
     if (process.env.PIPELINE_ADMIN === '1') return;

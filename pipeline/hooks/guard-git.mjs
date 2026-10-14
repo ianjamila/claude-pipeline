@@ -6,6 +6,15 @@
 // load failure lands in a fail-closed path instead of crashing the process (a crash would allow the call): the policy and
 // wiring inside the evaluator (runHook denies any internal error, whatever the command), hook-io.mjs itself below.
 
+// Why: the deny log (lib/deny-log.mjs) is a measurement aid. It is imported lazily inside try/catch so a missing or broken
+// file, or a failed write, can never change the verdict or crash the hook.
+async function recordDeny(input, command, verdict) {
+  try {
+    const { logDeny } = await import('./lib/deny-log.mjs');
+    logDeny({ hook: 'git', reason: verdict.reason, command, session: input.session_id });
+  } catch { /* logging only */ }
+}
+
 async function evaluate(input) {
   // Bash, PowerShell and Monitor take the same `tool_input.command` text (the shell parser reads all of them); an MCP
   // tool is judged by its command / cmd / script string fields. Everything else is not ours.
@@ -22,7 +31,10 @@ async function evaluate(input) {
   };
   for (const text of texts) {
     const verdict = evaluateGitCommand(text, opts);
-    if (verdict.decision === 'deny') return verdict;
+    if (verdict.decision === 'deny') {
+      await recordDeny(input, text, verdict);
+      return verdict;
+    }
   }
   return { decision: 'allow', reason: '' };
 }
