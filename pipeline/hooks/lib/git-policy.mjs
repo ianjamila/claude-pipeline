@@ -224,8 +224,12 @@ function cdpathMaybe(cmds, ctx) {
 function nextDir(dir, name, argv, ctx, cdpath = false) {
   if (name === 'popd') return null;
   const args = argv.slice(1);
+  // Why: neither form below goes to its operand, and an unsure value now reaches a cd (see unsureVarReachingCommand): a directory-stack entry (`cd -1`, `cd +2`,
+  // `pushd +1`, zsh and bash) and zsh's `cd OLD NEW` (OLD replaced by NEW in the current directory; bash refuses it) leave the directory unknown
+  if (args.some((a) => /^[+-]\d+$/.test(a))) return null;
   const k = args.indexOf('--');
   const operands = k >= 0 ? args.slice(k + 1) : args.filter((a) => !(a.length > 1 && a[0] === '-'));
+  if (operands.length > 1) return null;
   if (operands.length === 0) return name === 'cd' ? ctx.home : null;
   if (cdpath && !path.isAbsolute(operands[0]) && !/^(?:\.\.?(?:\/|$)|~)/.test(operands[0])) return null;
   return joinDir(dir, operands[0], ctx);
@@ -1564,6 +1568,10 @@ function definesFunction(str, cmds) {
 // the value — anything outside UNSURE_OK, a path or dynamic command name, or the command name itself — directly (argv,
 // env prefix, a redirect such as `<<< "$F"`) or through a pipe (`echo "$F" | xargs git push`: every stage of a pipeline
 // with a sensitive stage counts). Returns the variable's name, or null.
+// Why: a redirect that only sends OUTPUT somewhere (`awk ... > "$out"`, superpowers' task-brief) hands the command nothing to read: the shell opens the file, the
+// command never sees the name. Where it writes is the write frame's business (a word known only at run time may be any file: see line-writes.mjs). A redirect the
+// command reads from (`<`, `<<<`, `<>`, `<&`) still counts.
+const OUTPUT_ONLY_OPS = new Set(['>', '>>', '>|', '>&', '&>', '&>>']);
 function unsureVarReachingCommand(cmds, ctx) {
   // taint: a variable assigned from an unsure one is unsure (`X=$F; bash "$X"`), to a fixed point
   const assigns = [];
@@ -1582,11 +1590,15 @@ function unsureVarReachingCommand(cmds, ctx) {
       if (!ctx.unsureVars.has(k) && unsureVarUsed([v], ctx) !== null) { delete ctx.vars[k]; ctx.unsureVars.add(k); changed = true; }
     }
   }
+  // Why: a cd / pushd / popd handed an unsure value goes to a directory the walk below cannot name, exactly like `cd "$(cmd)"`: an unsure name is never in ctx.vars, so
+  // nextDir reads `$D` as written and the directory is unknown (null) from there on; whatever needs it (a bare push, a relative script) is refused there.
+  // (superpowers' sdd-workspace ends with `cd -- "$dir" && pwd`, `dir` set in an if)
   const sensitive = (c) => {
     const head = c.argv[0];
+    if (DIR_CHANGERS.includes(head)) return false;
     return !UNSURE_OK.has(baseName(head)) || head.includes('/') || DYNAMIC.test(head) || unsureVarUsed([head], ctx) !== null;
   };
-  const words = (c) => [...c.argv, ...Object.values(c.env), ...(c.redirects ?? []).map((r) => r.target ?? '')];
+  const words = (c) => [...c.argv, ...Object.values(c.env), ...(c.redirects ?? []).filter((r) => !OUTPUT_ONLY_OPS.has(r.op)).map((r) => r.target ?? '')];
   // pipelines: runs of commands joined by | (command-substitution bodies are commands of their own in this list)
   const groups = [];
   for (const [i, c] of cmds.entries()) {
@@ -1602,6 +1614,20 @@ function unsureVarReachingCommand(cmds, ctx) {
     }
   }
   return null;
+}
+
+// The subshell marks (grp, see shell-parse.mjs) can tell where a subshell ends: the parse finished and trusts its marks, every command carries them, and the commands
+// of each subshell come one after the other (a heredoc body the parser finishes later, after commands outside its subshell, would make one end too early).
+function subshellsTrusted(cmds) {
+  if (cmds.truncated || cmds.ctlBroken || !cmds.every((c) => Array.isArray(c.grp))) return false;
+  const ended = new Set();
+  let prev = [];
+  for (const c of cmds) {
+    for (const id of prev) if (!c.grp.includes(id)) ended.add(id);
+    if (c.grp.some((id) => ended.has(id))) return false;
+    prev = c.grp;
+  }
+  return true;
 }
 
 function evalString(str, startDir, ctx, level) {
@@ -1652,10 +1678,26 @@ function evalString(str, startDir, ctx, level) {
     tick: () => checkDeadline(ctx.budget),
   });
   ctx.writeFrames.push(frame);
+  // the subshells open at the command being walked, outermost first: { id, dir, uncertain } as they were when it started (null: marks not trusted, see subshellsTrusted)
+  const subs = subshellsTrusted(cmds) ? [] : null;
   try {
   for (const [i, c] of cmds.entries()) {
     checkDeadline(ctx.budget); // a lookup (branch, labels) can take seconds; the evaluation as a whole may not
     const argv = c.argv;
+    if (subs) {
+      // Why: a cd inside a subshell ($( ), ( ), backticks, <( )) moves that subshell only: when it ends, the line goes on in the directory it had when the subshell
+      // started, whatever the commands are named (superpowers' task-brief finds its helper with `$(cd "$(dirname "$0")" && pwd)` and then goes on where it was).
+      // A branch switched in it is the repository's, so it stays switched, or unknown when the switch may not have run.
+      let k = 0;
+      while (k < subs.length && k < c.grp.length && subs[k].id === c.grp[k]) k++;
+      if (k < subs.length) {
+        if (uncertain) for (const e of ctx.branches.values()) e.name = null;
+        dir = subs[k].dir;
+        uncertain = subs[k].uncertain;
+        subs.length = k;
+      }
+      for (; k < c.grp.length; k++) subs.push({ id: c.grp[k], dir, uncertain });
+    }
     if (hazard) forgetState();
     // Only commands chained with && after it are certain to see the change (`cd d && git push`); anything else may run
     // without it (`false && cd d; git push`, `cd d &`, `(cd d)`, `cd d || git push`), so the state is unknown.

@@ -188,16 +188,17 @@ test('S6b git: an assignment after an if / case has ended runs as surely as one 
   ]) assert.equal(G(c, {}), 'deny', c);
 });
 
-test('S6b git: a cd into an unsure directory is refused: in a script, on the line, in a sourced file, before git', () => {
-  const sc = (body) => ({ 's.sh': body });
+// (a cd into an unsure directory leaves it unknown from there on, as `cd "$(cmd)"` does: guard-a2-shell-s7.test.mjs)
+test('S6b git: after a cd into an unsure directory, what needs the directory is refused: in a script, on the line, after a sourced file, after a loop', () => {
+  const sc = (body) => ({ 's.sh': body, 'run.sh': 'echo hi' });
   const tail = 'D=a\nif [ -n "$X" ]; then D=b; fi\n';
   assert.equal(G('bash s.sh', sc(`${tail}cd "$D" && git push origin main\n`)), 'deny');
   assert.equal(G('bash s.sh', sc(`${tail}cd "$D"\nbash run.sh\n`)), 'deny');
-  assert.equal(G('bash s.sh', sc(`for i in 1; do ${tail}cd "$D"; done\n`)), 'deny');
-  assert.equal(G('source s.sh', sc(`${tail}cd "$D" && pwd\n`)), 'deny');
+  assert.equal(G('bash s.sh', sc(`for i in 1; do ${tail}cd "$D"; done\ngit push\n`)), 'deny');
+  assert.equal(G('source s.sh; git push', sc(`${tail}cd "$D" && pwd\n`)), 'deny');
   // a file a script sources runs in that script: what the script runs after it goes on in that directory
-  assert.equal(G('bash s.sh', { 's.sh': 'source ./lib.sh\ngit status\n', 'lib.sh': `${tail}cd "$D" && pwd\n` }), 'deny');
-  assert.equal(G(`${tail.replace(/\n/g, '; ')}cd "$D" && pwd`, {}), 'deny');
+  assert.equal(G('bash s.sh', { 's.sh': 'source ./lib.sh\ngit push\n', 'lib.sh': `${tail}cd "$D" && pwd\n` }), 'deny');
+  assert.equal(G(`${tail.replace(/\n/g, '; ')}cd "$D" && git push`, {}), 'deny');
 });
 
 // ---- files policy: live replay groups (S6, part 3) ---------------------------------------------------------------------------------------------------------
@@ -328,7 +329,7 @@ test('S6b codex recheck: marks the parser cannot trust never turn a conditional 
   ]) assert.equal(G(c, {}, { env }), 'deny', c);
 });
 
-test('S6b codex recheck: ... the two-line body is a function body for the marks, and a child script that cds into an unsure directory stays refused with an exported / startup-file function', () => {
+test('S6b codex recheck: ... the two-line body is a function body for the marks, and a function the line exports to a child script, or a startup file defines for it, is judged', () => {
   const env = { B: 'main' };
   assert.equal(G('function f\n{ B=agent/x; }\ngit push origin "$B"', {}, { env }), 'deny');
   // (files: an exported function's body is judged in the parent text only, before and after this PR: issue #51)
@@ -336,7 +337,7 @@ test('S6b codex recheck: ... the two-line body is a function body for the marks,
   const gs = { 's.sh': 'D=a\nif [ -n "$X" ]; then D=b; fi\ncd "$D" && pwd\n', 'rc': 'pwd() { git push; }' };
   assert.equal(G('pwd() { git push; }; export -f pwd; bash s.sh', gs), 'deny');
   assert.equal(G('BASH_ENV=rc bash s.sh', gs), 'deny');
-  assert.equal(G('bash s.sh', gs, { env: { 'BASH_FUNC_pwd%%': '() { git push; }' } }), 'deny');
+  // (a function a child imports from the environment, BASH_FUNC_pwd%%, is never read: issue #51)
 });
 
 // ---- background security review of bb54d9f ----------------------------------------------------------------------------------------------------------------------

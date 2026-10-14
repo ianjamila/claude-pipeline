@@ -1612,7 +1612,7 @@ test('a line that passes an unsure variable to something that runs code or picks
     'for i in 1 2; do X=$i; done; node $X',
     'while true; do X=a; done; python $X',
     'case a in a) X=1;; esac; source $X',
-    '(X=a); cd $X',
+    '(X=a); cd $X; git push', // (PR A2 S7: an unsure cd leaves the directory unknown, as `cd "$(cmd)"` does; what needs it is refused: guard-a2-shell-s7.test.mjs)
     'echo $(X=a); sh $X',
     'X=a | cat; gh pr view $X',
     // taint: a value built from an unsure variable is unsure itself
