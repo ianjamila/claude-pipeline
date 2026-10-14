@@ -19,7 +19,7 @@ import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
-import { simpleCommands, runsAfter, trustedFns, exportsFunctions, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText } from './shell-parse.mjs';
+import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
 import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit, execLinesOf, paramReadings, assigningDefaults, spliceLines } from './script-candidates.mjs';
 
@@ -1232,7 +1232,6 @@ function collectDirs(cmds, ctx) {
     for (const b of baseDirsOf(c.argv)) addDir(expandRefs(b, ctx));
     const cdName = baseOf(c.argv[0] ?? '');
     if (!CD_CMDS.has(cdName)) continue;
-    if (readsOnlyInSubshell(c, cmds, ctx)) continue; // (`d=$(cd "$(dirname "$0")" && pwd)`: nothing runs in that directory but reads, and the cd ends with the subshell)
     let t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
     if (!t && (cdName === 'cd' || cdName === 'pushd')) t = '~'; // a bare `cd` goes home
     if (c.raw.includes('\\')) {
@@ -1244,36 +1243,6 @@ function collectDirs(cmds, ctx) {
     addDir(mc !== null ? mc : expandRefs(t, ctx), mc === null ? ci : -1);
   }
   return dirs;
-}
-
-// Why: a cd inside a subshell (`d=$(cd "$D" && pwd)`, `(cd "$D"; ls)`) is lost when the subshell ends (shell-parse tags each command with the subshells it runs in: `grp`).
-// When every command in that subshell (nested ones included) only reads and writes nothing, the directory it went to is never written in, wherever it is.
-// (a command the parser could not tag, or a copy that lost the tag, counts as outside every subshell: its cd stays judged)
-const SUBSHELL_READS = new Set(['pwd', 'dirname', 'basename', 'true', 'false', ':', 'exit', 'return']);
-const onlyReads = (c, ctx) => (c.argv.length === 0 || SUBSHELL_READS.has(baseOf(c.argv[0])) || isReadOnly(c, ctx))
-  && !(c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && !FD_DUP.test(r.target ?? '') && r.target !== '/dev/null');
-const insideOf = (cd) => { const g = cd.grp ?? []; return (c) => (c.grp ?? []).length >= g.length && g.every((id, k) => c.grp[k] === id); };
-// Why: `dirname` / `basename` are programs found along PATH: a line that may change PATH (or zsh's `path`) may run its own under those names (background review of bb54d9f)
-const pathMayMove = (cmds, ctx) => ['PATH', 'path'].some((n) => Object.hasOwn(ctx.vars, n) || ctx.srcChanged.has(n)) || ctx.unknownAll
-  || cmds.some((x) => Object.keys(x.env ?? {}).some((k) => k === 'PATH' || k === 'path') || x.argv.some((a) => /^(?:PATH|path)(?:\+?=|\[)/.test(a)));
-function readsOnlyInSubshell(cd, cmds, ctx) {
-  if (!(cd.grp ?? []).length || ctx.fnUnknown || pathMayMove(cmds, ctx)) return false;
-  // (a trap action may run inside the subshell: DEBUG / ERR / RETURN, zsh's EXIT)
-  if (cmds.some((c) => c.ctl?.trap && !onlyReads(c, ctx))) return false;
-  // (a function, alias or hook the text may define can stand behind a read-only name: `pwd() { echo x > settings.json; }; (cd ~/.claude; pwd)` -- review of #50)
-  const fns = trustedFns(cmds);
-  if (!fns) return false;
-  const inside = insideOf(cd);
-  return cmds.every((c) => !inside(c) || (onlyReads(c, ctx) && !fns.has(baseOf(c.argv[0] ?? ''))));
-}
-
-// Why: a cd moves what runs after it, not what ran before: `sdd-workspace` ends with `cd -- "$dir" && pwd`. When every command that may run after it (see
-// runsAfter in shell-parse.mjs: later ones in its subshell or script, and trap actions) only reads, the directory it went to is never written in. Only for a script
-// file run in a process of its own (ctx.selfZero): after the line or a sourced file, the next command (or Bash call) goes on in that directory.
-function nothingWritesAfterCd(ci, cmds, ctx) {
-  if (ctx.fnUnknown || pathMayMove(cmds, ctx)) return false;
-  const after = runsAfter(cmds, ci);
-  return after !== null && after.every((c) => onlyReads(c, ctx));
 }
 
 // The directory words of commands whose other arguments are read relative to them.
@@ -2113,9 +2082,6 @@ function evaluateBashForFilesFrame(command, opts) {
   if (assumedCwd) opts = { ...opts, _assumedCwd: false };
   checkDeadline(opts._budget);
   const ctx = makeCtx(opts);
-  // Why: a function this text did not define may stand behind a command name: one a parent exported (`export -f`), one bash imports from the environment (BASH_FUNC_...),
-  // one a startup file of this shell defined. Then no name is trusted for the cd shortcuts (readsOnlyInSubshell, nothingWritesAfterCd). (review of #50)
-  ctx.fnUnknown = opts._fnUnknown === true || Object.keys(opts.env ?? process.env).some((k) => /^BASH_FUNC_/.test(k));
   ctx.lineDefs = definedNames(typeof command === 'string' ? command : '');
   ctx.assigned = assigningDefaults(typeof command === 'string' ? command : ''); // (and those of the line this text was made from: `: ${X:=w}; G=bash; $G $X`)
   for (const [n, ws] of opts._assigned ?? []) ctx.assigned.set(n, [...(ctx.assigned.get(n) ?? []), ...ws]);
@@ -2237,7 +2203,6 @@ function evaluateBashForFilesFrame(command, opts) {
     return cmds.some((c, ci) => {
       const cn = baseOf(c.argv[0] ?? '');
       if (!CD_CMDS.has(cn)) return false;
-      if (readsOnlyInSubshell(c, cmds, ctx) || (ctx.selfZero && nothingWritesAfterCd(ci, cmds, ctx))) return false; // (a cd the line or a sourced file ends with: the next command goes on there)
       const { unknownName } = stateAt(ci);
       if (cdUnknownShape(c.argv)) return true;
       const t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
@@ -2250,7 +2215,7 @@ function evaluateBashForFilesFrame(command, opts) {
       return [...t.matchAll(/\$\{?(\w+)/g)].some((x) => unknownName(x[1]));
     });
   };
-  const withLineVars = (o, c = null) => ({ ...o, _fnUnknown: ctx.fnUnknown || exportsFunctions(cmds), _unknownCwd: unknownCwd(), _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set([...ctx.unknownVars, ...ctx.pickUnknown]), _unknownW: new Set(ctx.unknownVars), _srcChanged: taintClosure(ctx.srcChanged, cmds, c?.env ?? {}, newName, ctx.srcChanged.size > 0 || ctx.unknownAll), _unknownAll: ctx.unknownAll, _assigned: ctx.assigned });
+  const withLineVars = (o, c = null) => ({ ...o, _unknownCwd: unknownCwd(), _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set([...ctx.unknownVars, ...ctx.pickUnknown]), _unknownW: new Set(ctx.unknownVars), _srcChanged: taintClosure(ctx.srcChanged, cmds, c?.env ?? {}, newName, ctx.srcChanged.size > 0 || ctx.unknownAll), _unknownAll: ctx.unknownAll, _assigned: ctx.assigned });
 
   // A startup file is judged once per evaluation. It is marked first: a startup file that starts shells itself would be judged again and
   // again otherwise (a denial ends the whole evaluation, so marking before the verdict is safe).
@@ -2359,7 +2324,7 @@ function evaluateBashForFilesFrame(command, opts) {
         const sfj = sf;
         let v;
         try {
-          v = judgeScriptFile(sfj, sdirsNow(), ctx, { ...withLineVars(opts, c), ...(sts.length ? { _fnUnknown: true } : {}) }, scanRaw); // (a startup file the shell reads first may define functions)
+          v = judgeScriptFile(sfj, sdirsNow(), ctx, { ...withLineVars(opts, c) }, scanRaw);
         } finally {
           ctx.execCmd = outer;
         }

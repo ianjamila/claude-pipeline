@@ -2564,46 +2564,6 @@ export function simpleCommands(str, opts) {
   return ctx.out;
 }
 
-// The commands of `cmds` (one simpleCommands result) that may run after cmds[ci] in the shell that runs it: the later ones in its subshell (nested ones
-// included) and every trap action. Null when that cannot be told: cmds[ci] is in a loop (it runs again before the loop's earlier commands), a function body or a
-// trap action, the parse was cut short or names a command only at run time, cmds[ci] calls a function the text defines, the text defines a hook function (zsh
-// chpwd / TRAPEXIT ..., bash command_not_found_handle: they run on their own), a later command is named like a function the text defines (names compared without
-// case: macOS finds `Pwd` as pwd), or the text can run code it does not hold: a sourced file (its traps, functions, aliases), eval, alias, autoload, enable,
-// hash, `functions[...]=`. (Any other function body only runs when called, and no command returned calls one.)
-const LATER_RUNNERS = new Set(['source', '.', 'alias', 'autoload', 'enable', 'disable', 'hash', 'functions', 'unfunction', 'builtin', 'command', 'eval', 'exec', 'add-zsh-hook', 'add-zle-hook-widget', 'zle']);
-// (zsh runs the functions these arrays name on its own: after every cd, before every prompt / command, at exit)
-const HOOK_ARRAYS = /^(?:chpwd|precmd|preexec|periodic|zshexit|zshaddhistory|zsh_directory_name)_functions(?:\[|\+?=|$)/i;
-const HOOK_FUNCTIONS = /^(?:TRAP|chpwd|precmd|preexec|periodic|zshexit|zshaddhistory|zsh_directory_name|command_not_found_handler?)/i;
-// The names a command word may not mean what it says (functions the text defines, compared without case), or null when no command name can be trusted: the parse was cut
-// short or names a command at run time, the text defines a hook function, or it can bring in code it does not hold (source, eval, alias, autoload, `functions[...]=` ...).
-// Does the text export functions to the processes it starts (`export -f`, `declare -fx`, `typeset -fx`, `readonly -f`)? A child bash then runs them for names that look like commands.
-export function exportsFunctions(cmds) {
-  return (cmds ?? []).some((c) => ['export', 'declare', 'typeset', 'local', 'readonly'].includes(base(c.argv[0] ?? '')) && c.argv.slice(1).some((a) => /^-[A-Za-z]*f/.test(a)));
-}
-export function trustedFns(cmds) {
-  if (!cmds?.fns || cmds.truncated || cmds.dynamic || exportsFunctions(cmds)) return null;
-  if ([...cmds.fns].some((n) => HOOK_FUNCTIONS.test(n))) return null;
-  for (const c of cmds) if (LATER_RUNNERS.has(base(c.argv[0] ?? '')) || c.argv.some((a) => /^functions(?:\[|\+?=)/.test(a) || HOOK_ARRAYS.test(a)) || Object.keys(c.env ?? {}).some((k) => /^functions$/i.test(k) || HOOK_ARRAYS.test(k))) return null;
-  return new Set([...cmds.fns].map((n) => base(n)));
-}
-export function runsAfter(cmds, ci) {
-  const me = cmds?.[ci];
-  if (!me?.ctl || me.ctl.loop || me.ctl.fn || me.ctl.trap || cmds.ctlBroken) return null;
-  const fns = trustedFns(cmds);
-  if (!fns || fns.has(base(me.argv[0] ?? ''))) return null;
-  const g = me.grp ?? [];
-  const inside = (c) => (c.grp ?? []).length >= g.length && g.every((id, k) => c.grp[k] === id);
-  const out = [];
-  for (const [cj, c] of cmds.entries()) {
-    if (!c.ctl) return null;
-    const name = base(c.argv[0] ?? '');
-    if (cj === ci || !inside(c) || (cj < ci && !c.ctl.trap)) continue; // (itself, outside its subshell, or run before it)
-    if (fns.has(name)) return null;
-    out.push(c);
-  }
-  return out;
-}
-
 // Every redirection of every command, in order: [{op, target, fd}]. `target` is the redirect word with quotes
 // removed (otherwise raw); `&1` / `&2` / `&-` for descriptor duplication / close; null for a heredoc.
 export function allRedirects(commands) {

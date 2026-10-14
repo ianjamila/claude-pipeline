@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { resolve, dirname, basename } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
-import { simpleCommands, runsAfter } from '../pipeline/hooks/lib/shell-parse.mjs';
+import { simpleCommands } from '../pipeline/hooks/lib/shell-parse.mjs';
 
 function fakeFs(root, files, dirs = []) {
   const abs = (p) => resolve(root, p);
@@ -95,28 +95,6 @@ test('S6b parse: loops, function bodies, trap actions and if / case branches are
   assert.equal(marks(n.find((c) => c.argv[0] === 'c')), '');
 });
 
-test('S6b parse: runsAfter lists what may run after a command (later ones in its subshell, trap actions), or null when the order cannot be told', () => {
-  const at = (t, name) => { const cs = simpleCommands(t); return [cs, cs.findIndex((c) => c.argv[0] === name)]; };
-  const names = (r) => (r === null ? null : r.map((c) => c.argv[0]));
-  assert.deepEqual(names(runsAfter(...at('a; cd x; b; c', 'cd'))), ['b', 'c']);
-  assert.deepEqual(names(runsAfter(...at('a; y=$(cd x; b); c', 'cd'))), ['b'], 'the subshell ends: c is not after it');
-  assert.deepEqual(names(runsAfter(...at('trap "t" EXIT; cd x; b', 'cd'))), ['t', 'b'], 'a trap action fires later');
-  assert.deepEqual(names(runsAfter(...at('f() { w; }; cd x; b', 'cd'))), ['b'], 'a function body only runs when called');
-  for (const t of [
-    'for i in 1; do cd x; done; b', // in a loop: runs again before the loop's earlier commands
-    'f() { cd x; }; f', // in a function body
-    'pwd() { w; }; cd x; pwd', // a later command named like a function the text defines
-    'Pwd() { w; }; cd x; pwd', // (names compared without case)
-    'chpwd() { w; }; cd x', // zsh runs chpwd after every cd
-    'TRAPEXIT() { w; }; cd x', // zsh runs it at exit
-    'source lib.sh; cd x; b', // a sourced file may set traps, functions, aliases
-    'alias pwd=w; cd x; pwd',
-    'eval "$X"; cd x',
-    'functions[pwd]=w; cd x; pwd',
-    '$CMD; cd x', // a command known only at run time
-  ]) assert.equal(runsAfter(...at(t, 'cd')), null, t);
-});
-
 test('S6b parse: a word in a comment binds no BASH, a binder in code still does (also one a comment-looking line inside a quote hides)', () => {
   const bound = (t) => { const st = { bound: false, rewrote: false }; simpleCommands(t, { bashState: st, env: {} }); return st.bound; };
   assert.equal(bound('# Single source of truth\n# read or overwrite another plan\'s\necho hi'), false);
@@ -133,29 +111,19 @@ test('S6b parse: a word in a comment binds no BASH, a binder in code still does 
 
 // ---- files policy: where a cd reaches ---------------------------------------------------------------------------------------------------------------------
 
-test('S6b files: a cd inside a subshell where only reads run reaches nothing outside it; a write inside that subshell, or any non-read, keeps the old reading', () => {
+// (PR #50 first let a cd in a subshell of reads, or one a script ends with, reach nothing: every name a shell can run hidden code behind had to be denied. The owner
+// dropped those shortcuts on 2026-10-14; what stays is that each of these is refused.)
+test('S6b files: a cd into an unknown directory, in a subshell or not, keeps a write after it or inside the subshell refused', () => {
   const spec = { 'r.txt': 'x' };
-  assert.equal(F('d=$(cd "$Q" && pwd); echo hi > out.txt', spec), 'allow');
-  assert.equal(F('d=$(CDPATH= cd -- "$(dirname "$P")" && pwd -P); echo hi > out.txt', spec), 'allow');
-  assert.equal(F('(cd "$Q"; ls); echo hi > out.txt', spec), 'allow');
   assert.equal(F('d=$(cd "$Q" && echo hi > out.txt)', spec), 'deny');
   assert.equal(F('(cd "$Q"; echo hi > out.txt)', spec), 'deny');
   assert.equal(F('(cd "$Q"; touch out.txt)', spec), 'deny');
   assert.equal(F('cd "$Q"; echo hi > out.txt', spec), 'deny');
-  // its target is no directory the line works in either (a protected one included); a write in that subshell still is judged there
-  assert.equal(F('d=$(cd /home/u/.claude && pwd); echo hi > settings.json', spec), 'allow');
   assert.equal(F('(cd /home/u/.claude && echo hi > settings.json)', spec), 'deny');
 });
 
 const SCRIPT = (body) => ({ 's.sh': body, 'lib.sh': 'echo lib' });
-test('S6b files: in a script run by a shell, a cd into an unknown directory that only reads come after reaches no write before it', () => {
-  assert.equal(F('bash s.sh', SCRIPT('echo hi > out.txt\ncd "$U" && pwd\n')), 'allow');
-  assert.equal(F('bash s.sh', SCRIPT('echo hi > out.txt\nCDPATH= cd -- "$U" && pwd\n')), 'allow');
-  assert.equal(F('bash s.sh', SCRIPT('trap "echo bye" EXIT\necho hi > out.txt\ncd "$U" && pwd\n')), 'allow');
-  assert.equal(F('bash s.sh', SCRIPT('f() { echo hi > out.txt; }\nf\ncd "$U" && pwd\n')), 'allow');
-});
-
-test('S6b files: ... and each way something may write after it keeps the old reading', () => {
+test('S6b files: in a script run by a shell, a cd into an unknown directory with a write after it (or one that may run after it) is refused', () => {
   for (const body of [
     'cd "$U"\necho hi > out.txt\n', // a write after it
     'cd "$U" && touch out.txt\n',
@@ -220,10 +188,9 @@ test('S6b git: an assignment after an if / case has ended runs as surely as one 
   ]) assert.equal(G(c, {}), 'deny', c);
 });
 
-test('S6b git: in a script run by a shell, a cd into an unsure directory that nothing sensitive comes after is no refusal; on the line, in a sourced file, or before git, it is', () => {
+test('S6b git: a cd into an unsure directory is refused: in a script, on the line, in a sourced file, before git', () => {
   const sc = (body) => ({ 's.sh': body });
   const tail = 'D=a\nif [ -n "$X" ]; then D=b; fi\n';
-  assert.equal(G('bash s.sh', sc(`${tail}cd "$D" && pwd\n`)), 'allow');
   assert.equal(G('bash s.sh', sc(`${tail}cd "$D" && git push origin main\n`)), 'deny');
   assert.equal(G('bash s.sh', sc(`${tail}cd "$D"\nbash run.sh\n`)), 'deny');
   assert.equal(G('bash s.sh', sc(`for i in 1; do ${tail}cd "$D"; done\n`)), 'deny');
@@ -283,13 +250,12 @@ test('S6b files (review): ... also behind an assignment prefix or a wrapper', ()
 
 // ---- Codex review of #50 (P1 x3) and a sibling --------------------------------------------------------------------------------------------------------------
 
-test('S6b codex: a function the text defines can stand behind a "read-only" name in a subshell: the cd in that subshell is judged as before', () => {
+test('S6b codex: a function or alias the text defines behind a "read-only" name in a subshell after a cd into ~/.claude is refused', () => {
   const spec = { 'r.txt': 'x' };
   assert.equal(F('pwd() { echo x > settings.json; }; (cd /home/u/.claude; pwd)', spec), 'deny');
   assert.equal(F('Pwd() { echo x > settings.json; }; (cd /home/u/.claude; pwd)', spec), 'deny');
   assert.equal(F('ls() { echo x > out.txt; }; d=$(cd "$Q" && ls); echo hi > out2.txt', spec), 'deny');
   assert.equal(F('alias ls="touch settings.json"; (cd /home/u/.claude; ls)', spec), 'deny');
-  assert.equal(F('d=$(cd /home/u/.claude && pwd); echo hi > settings.json', spec), 'allow', '(no function: as in S6b)');
 });
 
 test('S6b codex: `time` (and an unknown prefix) before a compound command keeps its branches conditional', () => {
@@ -331,7 +297,7 @@ test('S6b codex: ... `time` is read exactly (what comes after the construct is s
 
 // ---- Codex recheck of #50 (P1 x3) -------------------------------------------------------------------------------------------------------------------------------
 
-test('S6b codex recheck: a function defined over two lines, or handed to a child (export -f, BASH_FUNC_ in the environment, a startup file), keeps the subshell cd judged', () => {
+test('S6b codex recheck: a function defined over two lines, or handed to a child (export -f, BASH_FUNC_ in the environment, a startup file), behind a subshell cd is refused', () => {
   const spec = { 'r.txt': 'x', 's.sh': '(cd /home/u/.claude; pwd)\n', 'rc': 'pwd() { echo x > settings.json; }' };
   assert.equal(F('function pwd\n{ echo x > settings.json; }\n(cd /home/u/.claude; pwd)', spec), 'deny');
   assert.equal(F('pwd()\n{ echo x > settings.json; }\n(cd /home/u/.claude; pwd)', spec), 'deny');
@@ -340,7 +306,6 @@ test('S6b codex recheck: a function defined over two lines, or handed to a child
   assert.equal(F('pwd() { echo x > settings.json; }; declare -fx pwd; bash s.sh', spec), 'deny');
   assert.equal(F('bash s.sh', spec, { env: { ...REAL_ENV, 'BASH_FUNC_pwd%%': '() { echo x > settings.json; }' } }), 'deny');
   assert.equal(F('BASH_ENV=rc bash s.sh', spec), 'deny');
-  assert.equal(F('bash s.sh', spec), 'allow', '(nothing redefines pwd)');
   const fns = simpleCommands('function pwd\n{ :; }\ntime function g { :; }');
   assert.deepEqual([...fns.fns].sort(), ['g', 'pwd']);
 });
@@ -363,7 +328,7 @@ test('S6b codex recheck: marks the parser cannot trust never turn a conditional 
   ]) assert.equal(G(c, {}, { env }), 'deny', c);
 });
 
-test('S6b codex recheck: ... the two-line body is a function body for the marks, and an exported / startup-file function reaches the cd rules of a child script in both policies', () => {
+test('S6b codex recheck: ... the two-line body is a function body for the marks, and a child script that cds into an unsure directory stays refused with an exported / startup-file function', () => {
   const env = { B: 'main' };
   assert.equal(G('function f\n{ B=agent/x; }\ngit push origin "$B"', {}, { env }), 'deny');
   // (files: an exported function's body is judged in the parent text only, before and after this PR: issue #51)
@@ -372,12 +337,11 @@ test('S6b codex recheck: ... the two-line body is a function body for the marks,
   assert.equal(G('pwd() { git push; }; export -f pwd; bash s.sh', gs), 'deny');
   assert.equal(G('BASH_ENV=rc bash s.sh', gs), 'deny');
   assert.equal(G('bash s.sh', gs, { env: { 'BASH_FUNC_pwd%%': '() { git push; }' } }), 'deny');
-  assert.equal(G('bash s.sh', gs), 'allow', '(nothing redefines pwd)');
 });
 
 // ---- background security review of bb54d9f ----------------------------------------------------------------------------------------------------------------------
 
-test('S6b review 3: zsh hook arrays, traps and a moved PATH can run code behind a "read-only" name: the cd shortcuts are off', () => {
+test('S6b review 3: zsh hook arrays, traps and a moved PATH that run code behind a "read-only" name after a cd into ~/.claude are refused', () => {
   const spec = { 'r.txt': 'x', 's.sh': 'echo hi > out.txt\ncd "$U" && pwd\n' };
   for (const c of [
     'f() { echo x > settings.json; }; chpwd_functions=(f); (cd /home/u/.claude; ls)',
@@ -387,7 +351,6 @@ test('S6b review 3: zsh hook arrays, traps and a moved PATH can run code behind 
     'PATH=/tmp/evil:$PATH; d=$(cd /home/u/.claude && dirname x); echo "$d"',
     'export PATH=/tmp/evil:$PATH; (cd /home/u/.claude; basename x)',
   ]) assert.equal(F(c, spec), 'deny', c);
-  assert.equal(F('bash s.sh', { ...spec, 's.sh': 'PATH=/tmp/evil:$PATH\necho hi > out.txt\ncd "$U" && dirname x\n' }), 'deny', '(the trailing cd rule too)');
+  assert.equal(F('bash s.sh', { ...spec, 's.sh': 'PATH=/tmp/evil:$PATH\necho hi > out.txt\ncd "$U" && dirname x\n' }), 'deny');
   assert.equal(F('bash s.sh', { ...spec, 's.sh': 'precmd_functions=(f)\necho hi > out.txt\ncd "$U" && pwd\n' }), 'deny');
-  assert.equal(F('d=$(cd /home/u/.claude && dirname x); echo "$d"', spec), 'allow', '(PATH unchanged)');
 });
