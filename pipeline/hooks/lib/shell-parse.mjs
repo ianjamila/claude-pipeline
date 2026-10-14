@@ -814,7 +814,7 @@ function inlineCodeIndex(name, argv) {
 }
 
 // groups: the exact files, one array per producer in the order it names them (what `st.files` was filled from), so the join can be rebuilt
-const newSt = () => ({ dyn: false, unordered: false, files: [], groups: [], computed: [], raws: [], pat: new Set(), unq: new Set(), ops: new Set() });
+const newSt = () => ({ dyn: false, unordered: false, mixed: false, files: [], groups: [], computed: [], raws: [], pat: new Set(), unq: new Set(), ops: new Set() });
 
 // Adds what `b` collected to `a` (a descriptor opened twice, a variable assigned twice: both may be read).
 function mergeSt(a, b) {
@@ -822,6 +822,7 @@ function mergeSt(a, b) {
   for (const x of [a, b]) {
     out.dyn = out.dyn || x.dyn;
     out.unordered = out.unordered || x.unordered;
+    out.mixed = out.mixed || x.mixed;
     out.files.push(...x.files); out.groups.push(...x.groups); out.computed.push(...x.computed); out.raws.push(...x.raws);
     for (const k of ['pat', 'unq', 'ops']) for (const w of x[k]) out[k].add(w);
   }
@@ -926,6 +927,8 @@ function producedBy(seg, st, hops = 0, exact = true) {
   const OUT = ['>', '>>', '>|', '&>', '&>>', '>&'];
   if ((seg.redirects ?? []).some((r) => OUT.includes(r.op) && (r.fd === null || r.fd === undefined || r.fd === 1) && r.target !== '&1')) st.unordered = true;
   if (pa.length && !['echo', 'printf', 'true', ':'].includes(pn) && !Object.hasOwn(READERS, pn)) st.unordered = true;
+  // (static text in the same stream as files, `{ cat a; printf %s sh; cat b; }`: the files are judged joined without it, so the stream is not rebuilt -- Codex recheck of a5c0e5a)
+  if (seg.heredocs.length || seg.herestrings.length || pn === 'echo' || pn === 'printf') st.mixed = true;
   noteReads(seg, pn, pa, st, exact);
   if (pn === 'echo' || pn === 'printf') {
     for (const a of pa.slice(1)) {
@@ -1003,8 +1006,9 @@ function streamsOf(seg, argv) {
 // `interp`: the fed text is the program of an interpreter (`node < f.mjs`), not shell script text; 'sql': the input of psql / mysql / sqlite3 (only its shell escapes run).
 function addFeeds(cmd, st, interp = false) {
   if (!cmd || (!st.files.length && !st.computed.length && !st.rcOnly)) return;
-  if (!cmd.feeds) Object.defineProperty(cmd, 'feeds', { value: { files: [], groups: [], computed: [], raws: [], pat: [], unq: [], ops: [], rc: [], unordered: false, interp: false, sql: false }, enumerable: false });
+  if (!cmd.feeds) Object.defineProperty(cmd, 'feeds', { value: { files: [], groups: [], computed: [], raws: [], pat: [], unq: [], ops: [], rc: [], unordered: false, mixed: false, interp: false, sql: false }, enumerable: false });
   if (st.unordered) cmd.feeds.unordered = true;
+  if (st.mixed) cmd.feeds.mixed = true;
   if (typeof interp === 'string') cmd.feeds.sql = interp;
   else if (interp) cmd.feeds.interp = true;
   cmd.feeds.pat.push(...st.pat);
@@ -1049,7 +1053,7 @@ function sqlFamilyValue(value) {
   return !first.includes('/') || first.startsWith('/') ? sqlFamilyOf(base(first)) : null;
 }
 function mergeFeeds(a, b) {
-  const out = { ...a, unordered: a.unordered || b.unordered, interp: a.interp || b.interp, sql: a.sql || b.sql };
+  const out = { ...a, unordered: a.unordered || b.unordered, mixed: a.mixed || b.mixed, interp: a.interp || b.interp, sql: a.sql || b.sql };
   for (const k of ['files', 'groups', 'computed', 'raws', 'pat', 'unq', 'ops', 'rc']) out[k] = [...(a[k] ?? []), ...(b[k] ?? [])];
   return out;
 }
@@ -1108,6 +1112,7 @@ function feedRecords1(cmd, line, resolve, raw0) {
   const raws = [cmd.raw, ...f.raws].filter((r) => typeof r === 'string' && r);
   const refuse = { kind: 'shell', file: out[0]?.file ?? '', ambiguous: true, unresolvable: true, words: [] };
   if (out.length > MAX_FEED_FILES || raws.some((r) => hasPatternSyntax(r, line))) return [refuse];
+  if (raw0.mixed && (f.files.length || f.computed.length)) return [refuse]; // (static text and files in one stream: see producedBy)
   // Several files feed ONE program: the shell reads their texts one after the other, so they are ALSO judged joined (a record with `joined`), in
   // command-line order, repeats included (`cat a b` with `git pu` in a and `sh origin main` in b); each file is still judged on its own. Only a
   // single reader names them in an order that can be rebuilt: feeds from several producers (or a word that expands) are refused. A rewriting

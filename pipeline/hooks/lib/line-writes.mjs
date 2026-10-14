@@ -1688,7 +1688,7 @@ const MAX_CHAIN = 24; // a file copied from a file copied from a file ... (longe
 // or null when they cannot be built (a content only known at run time, pieces, an inline program's output, a rewrite of other files, a copied file we cannot read).
 export function writtenCandidates(w, disk, readText) {
   if (w.unknown || w.pieces || w.authored || w.programs.length || w.scans.length) return null;
-  const out = [...w.texts, ...w.joined.filter((t) => t !== '')];
+  const out = [...w.texts, ...w.joined]; // ('' too: an edit that empties the part changes the stream -- Codex recheck of a5c0e5a)
   for (const f of w.files) {
     const t = readText(f);
     if (typeof t !== 'string') return null;

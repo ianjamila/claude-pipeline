@@ -1091,9 +1091,13 @@ function checkJoinedScripts(sf, dir, ctx, level) {
     // printf 'sh origin main' > b; cat a b | bash`): every text it may hold is joined with every text of the others. A content only known at run time is judged as
     // for a single script, and refused when the line mentions a guarded operation (what it adds to the join cannot be read)
     let cands = null;
-    const wr = writtenTo(ctx.writeFrames, abs, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: sf.startup === true || ctx.ignoreUnmodelled === true });
+    // (`own`: the line's own writes the guard places; `any`: also a command that may write anything, eval, a program the guard does not model)
+    const own = writtenTo(ctx.writeFrames, abs, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: true });
+    const wr = own ?? writtenTo(ctx.writeFrames, abs, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: sf.startup === true || ctx.ignoreUnmodelled === true });
     if (wr) {
-      cands = writtenCandidates(wr, typeof text === 'string' ? text : null, (q) => ctx.readText(q));
+      cands = own ? writtenCandidates(own, typeof text === 'string' ? text : null, (q) => ctx.readText(q)) : null;
+      // (a part the line itself rewrites with a text the guard cannot build, `tr X s < src > b.sh`: the stream cannot be rebuilt; Codex recheck of a5c0e5a)
+      if (own && cands === null && sf.kind !== 'scan') return deny(`${w} is rewritten earlier on the line with a text that cannot be worked out, and it is fed to one program together with other files, so what runs cannot be verified. Run the files one by one, or write the text out.`);
       if (cands === null) {
         const r = isolatedState(ctx, () => judgeWrittenScript(wr, sf, abs, dir, ctx, level)); // (a fragment: what it changes is not the line's, see R2-B2)
         if (r) return r;

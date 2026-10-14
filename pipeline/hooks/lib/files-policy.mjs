@@ -1518,9 +1518,13 @@ function judgeJoinedScripts(sf, dirs, ctx, opts, scanRaw = '') {
         // Why: a part the line writes before this command may hold what those writes put there, not what is on disk now (Codex review 3 of #50): every text it
         // may hold is joined with every text of the others; a content only known at run time is judged as for a single script (judgeWrittenScript)
         let cands = null;
-        const wr = writtenTo(ctx.frames, abs, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: sf.startup === true || ctx.ignoreUnmodelled });
+        // (`own`: the line's own writes the guard places; `any`: also a command that may write anything, eval, a program the guard does not model)
+        const own = writtenTo(ctx.frames, abs, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: true });
+        const wr = own ?? writtenTo(ctx.frames, abs, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: sf.startup === true || ctx.ignoreUnmodelled });
         if (wr) {
-          cands = writtenCandidates(wr, typeof text === 'string' ? text : null, (q) => ctx.readText(q));
+          cands = own ? writtenCandidates(own, typeof text === 'string' ? text : null, (q) => ctx.readText(q)) : null;
+          // (a part the line itself rewrites with a text the guard cannot build: the stream cannot be rebuilt; Codex recheck of a5c0e5a)
+          if (own && cands === null && sf.kind !== 'scan') return deny(`${abs} is rewritten earlier on the line with a text that cannot be worked out, and it is fed to one program together with other files, so what runs cannot be verified`);
           if (cands === null) {
             const r = judgeWrittenScript(wr, sf, abs, d || ctx.cwd, ctx, opts, scanRaw);
             if (r) return r;

@@ -224,7 +224,31 @@ test('S7 review r3: a command in the group that may stop it early (`exit`, a tes
     'set -e; { cat a.sh; cat b.sh; false; cat c.sh; } | bash',
     '{ cat a.sh; cat b.sh; return 2>/dev/null; cat c.sh; } | bash',
   ]) assert.equal(G(c, TAIL), 'deny', c);
-  assert.equal(G('{ cat a.sh; cat b.sh; echo; cat c.sh; } | bash', { 'a.sh': 'echo a\n', 'b.sh': 'echo b\n', 'c.sh': 'echo c\n' }), 'allow', '(static text between readers)');
+  assert.equal(G('{ cat a.sh; cat b.sh; true; cat c.sh; } | bash', { 'a.sh': 'echo a\n', 'b.sh': 'echo b\n', 'c.sh': 'echo c\n' }), 'allow', '(a command that prints nothing and cannot stop the group)');
+});
+
+// ---- Codex recheck of a5c0e5a ----------------------------------------------------------------------------------------------------------------------------------
+
+test('S7 codex r3 recheck: a joined part rewritten with a text the guard cannot build (`tr X s < src > b.sh`) is not read from disk: refused', () => {
+  const spec = { 'a.sh': 'git pu', 'b.sh': 'echo b\n', src: 'Xh origin main\n' };
+  for (const feed of ['{ cat a.sh; cat b.sh; } | bash', 'cat a.sh b.sh | bash']) assert.equal(G(`tr X s < src > b.sh; ${feed}`, spec), 'deny', feed);
+  const fspec = { 'a.sh': 'echo x > /home/u/.cl', 'b.sh': 'echo b\n', src: 'Xude/settings.json\n' };
+  assert.equal(files('tr X a < src > b.sh; cat a.sh b.sh | bash', fspec), 'deny');
+});
+
+test('S7 codex r3 recheck: an edit that empties a joined part (`sed -i d`) is one of the texts it may hold', () => {
+  assert.equal(G("sed -i 'd' c.sh; { cat a.sh; cat b.sh; cat c.sh; } | bash", { 'a.sh': 'git pu', 'b.sh': 'sh origin main', 'c.sh': '-feature\n' }), 'deny');
+  assert.equal(G("sed -i 'd' c.sh; cat a.sh b.sh c.sh | bash", { 'a.sh': 'git pu', 'b.sh': 'sh origin main', 'c.sh': '-feature\n' }), 'deny');
+});
+
+test('S7 codex r3 recheck: static text and files fed to one shell together (`{ cat a; printf %s sh; cat b; }`) cannot be rebuilt as one stream: refused', () => {
+  for (const c of [
+    '{ cat a.sh; printf %s sh; cat b.sh; } | bash',
+    '{ printf %s "git pu"; cat b.sh; } | bash',
+    '{ cat a.sh; echo -n sh; cat b.sh; } | bash',
+  ]) assert.equal(G(c, { 'a.sh': 'git pu', 'b.sh': ' origin main\n' }), 'deny', c);
+  assert.equal(files('{ printf %s "echo x > /home/u/.cl"; cat b.sh; } | bash', { 'b.sh': 'aude/settings.json\n' }), 'deny');
+  assert.equal(G('{ echo "echo hi"; echo "echo there"; } | bash', {}), 'allow', '(static text alone is judged as it is)');
 });
 
 test('S7 review r3: files: a joined part written earlier with a content only known at run time is judged as for a single script (the line names a protected file)', () => {
