@@ -14,13 +14,16 @@ import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, REPO_VIEW, pipelineYml } from './helpers/fakegh-env.mjs';
 import { lockNameFor } from '../pipeline/lib/worktree-prune/rules.mjs';
+import { processesInside } from '../pipeline/lib/worktree-prune/inspect.mjs';
 import { summaryLine, outsideReport } from '../pipeline/lib/worktree-prune/run.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const bin = join(here, '..', 'pipeline', 'bin', 'pipeline.mjs');
 const holdLock = join(here, 'fixtures', 'hold-lock.mjs');
-// /proc is how a process inside a worktree is seen; elsewhere the answer is "cannot check" and the worktree is kept.
+// Linux reads /proc, macOS asks lsof; where neither answers (Windows, a Mac whose lsof is blocked) the answer is "cannot
+// check" and the worktree is kept. Ask the real check once so each machine expects what its CLI will actually do.
 const LINUX = process.platform === 'linux';
+const SEES_PROCESSES = processesInside(tmpdir()).available;
 
 const scratch = [];
 const tmp = (prefix) => {
@@ -152,7 +155,7 @@ function world() {
 
 const slugs = (list) => list.map((x) => x.slug).sort();
 const assertDoneEvaluated = (w, json, key) => {
-  if (LINUX) assert.deepEqual(slugs(json[key]), ['done'], JSON.stringify(json.kept));
+  if (SEES_PROCESSES) assert.deepEqual(slugs(json[key]), ['done'], JSON.stringify(json.kept));
   else assert.match(w.keptReason(json, 'done'), /cannot check running processes/);
 };
 
@@ -166,7 +169,7 @@ test('report mode (default): the eligible worktree is reported, nothing on disk 
   assert.equal(r.json.mode, 'report');
   assert.equal(r.json.notify, undefined, 'nothing removed or restored: no push');
   assertDoneEvaluated(w, r.json, 'wouldRemove');
-  if (LINUX) assert.ok(r.json.wouldRemove[0].bytes > 0);
+  if (SEES_PROCESSES) assert.ok(r.json.wouldRemove[0].bytes > 0);
   assert.deepEqual(r.json.removed, []);
   assert.match(w.keptReason(r.json, 'open'), /open PR #2/);
   assert.equal(w.keptReason(r.json, 'nopr'), 'no PR');
@@ -211,7 +214,7 @@ test('--dry-run with mode: on evaluates but changes nothing', () => {
   assert.deepEqual(w.snapshot(), before);
 });
 
-test('mode: on removes only the eligible worktree, archives its evidence, keeps every branch, purges the expired batch', { skip: !LINUX && 'process inspection needs /proc' }, () => {
+test('mode: on removes only the eligible worktree, archives its evidence, keeps every branch, purges the expired batch', { skip: !SEES_PROCESSES && 'cannot check running processes here' }, () => {
   const w = world();
   w.setMode('on');
   const refsBefore = w.repo.git(['for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads']);
@@ -416,7 +419,7 @@ test('--summary-only prints one compact line: ok + summary, errors only when a s
 });
 
 test('a failing step after removal (purge, log) is reported in errors; the removal record, log attempt and exit 0 survive', {
-  skip: (!LINUX && 'process inspection needs /proc') || (process.getuid?.() === 0 && 'root ignores directory permissions'),
+  skip: (!SEES_PROCESSES && 'cannot check running processes here') || (process.getuid?.() === 0 && 'root ignores directory permissions'),
 }, () => {
   const w = world();
   w.setMode('on');
@@ -436,7 +439,7 @@ test('a failing step after removal (purge, log) is reported in errors; the remov
 });
 
 test('the pre-removal re-read throwing keeps that worktree ("changed during the run") and the run still reports and logs', {
-  skip: !LINUX && 'process inspection needs /proc',
+  skip: !SEES_PROCESSES && 'cannot check running processes here',
 }, async () => {
   const w = world();
   w.setMode('on');
