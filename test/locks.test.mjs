@@ -361,9 +361,9 @@ test('10a. acquire waits for a lock held by another process and gets it after re
   const holder = launch([dir, 'db', '700']);
   await holder.waitFor(/^held$/m);
   const waits = [];
-  const started = Date.now();
+  const started = performance.now(); // monotonic: the wall clock can step back mid-wait
   const lock = await acquire('db', { dir, waitMs: 5000, pollMs: 50, onWait: (owner) => waits.push(owner) });
-  assert.ok(Date.now() - started >= 200, 'it really waited');
+  assert.ok(performance.now() - started >= 200, 'it really waited');
   assert.ok(waits.length > 0, 'onWait was called');
   assert.equal(waits[0].pid, holder.pid);
   assert.equal(inspect('db', { dir }).pid, process.pid);
@@ -375,7 +375,7 @@ test('10b. acquire with a short waitMs throws LockTimeoutError carrying the owne
   const dir = tmpDir();
   const holder = launch([dir, 'db', '900']);
   await holder.waitFor(/^held$/m);
-  const started = Date.now();
+  const started = performance.now(); // monotonic: the wall clock can step back mid-wait
   await assert.rejects(acquire('db', { dir, waitMs: 300, pollMs: 50 }), (err) => {
     assert.ok(err instanceof LockTimeoutError);
     assert.equal(err.name, 'LockTimeoutError');
@@ -385,7 +385,7 @@ test('10b. acquire with a short waitMs throws LockTimeoutError carrying the owne
     assert.match(err.message, /db/);
     return true;
   });
-  assert.ok(Date.now() - started >= 250, 'waited roughly waitMs before giving up');
+  assert.ok(performance.now() - started >= 250, 'waited roughly waitMs before giving up');
   assert.equal(await holder.exit, 0);
   assert.equal(inspect('db', { dir }), null, 'holder released normally');
 });
