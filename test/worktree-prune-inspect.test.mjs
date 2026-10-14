@@ -289,8 +289,8 @@ const lsofText = (...procs) => procs.map(({ pid, files }) => `p${pid}\n${files.m
 const own = { pid: OWN, files: [['cwd', '/Users/me/work'], ['txt', '/usr/local/bin/node']] };
 function fakeRun({ lsof, ps, lsofResult = {}, psResult = {} } = {}) {
   const calls = [];
-  const run = (cmd, args) => {
-    calls.push([cmd, args]);
+  const run = (cmd, args, opts) => {
+    calls.push([cmd, args, opts]);
     if (/lsof$/.test(cmd)) return { status: 0, signal: null, error: undefined, stdout: lsof, pid: 9001, ...lsofResult };
     return { status: 0, signal: null, error: undefined, stdout: ps ?? '', pid: 9002, ...psResult };
   };
@@ -364,6 +364,61 @@ test('processesInside (darwin): hidden = ps pids with no readable cwd in lsof, m
   assert.deepEqual(darwin(wt, { run: fakeRun({ lsof, ps }) }), { available: true, pids: [], hidden: 4 }); // 1, 72, 73, 74
   assert.deepEqual(darwin(wt, { run: fakeRun({ lsof, ps, psResult: { status: 1 } }) }), { available: true, pids: [], hidden: 0 });
   assert.deepEqual(darwin(wt, { run: fakeRun({ lsof, ps, psResult: { status: null, error: new Error('x') } }) }), { available: true, pids: [], hidden: 0 });
+});
+
+// lsof prints a "safe" form of a name: non-ASCII bytes it cannot print as \xNN, \b \f \n \r \t, other controls as ^X (^? = DEL).
+test('processesInside (darwin): lsof-escaped \\xNN names are decoded to UTF-8 before the inside check (worktree named café)', () => {
+  const wt = '/Users/me/projects/app/.worktrees/café';
+  const run = fakeRun({
+    lsof: lsofText(own,
+      { pid: 81, files: [['cwd', '/Users/me/projects/app/.worktrees/caf\\xc3\\xa9']] },
+      { pid: 82, files: [['cwd', '/'], ['4', '/Users/me/projects/app/.worktrees/caf\\xc3\\xa9/sub/na\\xc3\\xafve.txt']] },
+      { pid: 83, files: [['cwd', '/Users/me/projects/app/.worktrees/caf\\xc3\\xa8']] }, // cafè: a different directory
+      { pid: 84, files: [['cwd', '/Users/me/projects/app/.worktrees/caf\\xc3\\xa9x']] }), // not a segment boundary
+    ps: '',
+  });
+  assert.deepEqual(darwin(wt, { run }), { available: true, pids: [81, 82], hidden: 0 });
+  assert.deepEqual(darwin('/Users/me/projects/app/.worktrees/cafe', { run }), { available: true, pids: [], hidden: 0 });
+});
+
+test('processesInside (darwin): control characters in a name (\\t, ^I, ^?) are decoded; the same name outside the root is not a match', () => {
+  const wt = '/Users/me/projects/app/.worktrees/agent-x';
+  const run = fakeRun({
+    lsof: lsofText(own,
+      { pid: 91, files: [['cwd', '/'], ['4', `${wt}/a\\tb.log`]] },
+      { pid: 92, files: [['cwd', '/'], ['4', `${wt}/a^Ib.log`]] },
+      { pid: 93, files: [['cwd', '/'], ['4', `${wt}/del^?.log`]] },
+      { pid: 94, files: [['cwd', '/'], ['4', '/Users/me/elsewhere/a\\tb.log'], ['5', '/Users/me/elsewhere/caf\\xc3\\xa9/x']] }),
+    ps: '',
+  });
+  assert.deepEqual(darwin(wt, { run }), { available: true, pids: [91, 92, 93], hidden: 0 });
+});
+
+test('processesInside (darwin): a name whose escapes cannot be decoded unambiguously counts as inside when it could lie in the root', () => {
+  const wt = '/Users/me/projects/app/.worktrees/agent-x';
+  const run = fakeRun({
+    lsof: lsofText(own,
+      { pid: 101, files: [['cwd', '/'], ['4', `${wt}/odd\\qname`]] }, // unknown \q escape
+      { pid: 102, files: [['cwd', '/'], ['4', `${wt}/odd^[name`]] }, // ^[ : control or a literal caret
+      { pid: 103, files: [['cwd', '/'], ['4', '/Users/me/projects/app/.worktr\\q']] }, // prefix could still grow into the root
+      { pid: 104, files: [['cwd', '/'], ['4', '/Users/me/projects/other/odd\\qname']] }, // prefix can never reach the root
+      { pid: 105, files: [['cwd', '/'], ['4', '/Users/me/projects/app/.worktrees/agent-xy\\qz']] }, // agent-xy is not agent-x
+      { pid: 106, files: [['cwd', '/'], ['4', '/Users/ME/projects/APP/.worktrees/AGENT-X/odd\\qname']] }), // darwin folds case
+    ps: '',
+  });
+  assert.deepEqual(darwin(wt, { run }), { available: true, pids: [101, 102, 103, 106], hidden: 0 });
+});
+
+test('processesInside (darwin): the positive control still works when our own cwd carries an escape; lsof runs with a UTF-8 locale', () => {
+  const wt = '/Users/me/projects/app/.worktrees/agent-x';
+  const run = fakeRun({
+    lsof: lsofText({ pid: OWN, files: [['cwd', '/Users/me/caf\\xc3\\xa9/work']] }, { pid: 111, files: [['cwd', wt]] }),
+    ps: '',
+  });
+  assert.deepEqual(darwin(wt, { run }), { available: true, pids: [111], hidden: 0 });
+  const env = run.calls.find(([c]) => /lsof$/.test(c))[2]?.env;
+  assert.equal(env?.LC_ALL, 'en_US.UTF-8');
+  assert.equal(env?.LANG, 'en_US.UTF-8');
 });
 
 const hasLsof = spawnSync('lsof', ['-v'], { encoding: 'utf8' }).error === undefined;

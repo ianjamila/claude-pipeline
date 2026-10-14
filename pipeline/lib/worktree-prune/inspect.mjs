@@ -221,13 +221,57 @@ const FIRMLINK = /^\/System\/Volumes\/Data(?=\/|$)/i;
 const unFirm = (p) => p.replace(FIRMLINK, '');
 
 // One external command, spawn failures kept visible (lib/proc.mjs `run` folds ENOENT into exit 1, which lsof also uses).
-function runCapture(cmd, args) {
-  const r = spawnSync(cmd, args, { encoding: 'utf8', timeout: LSOF_TIMEOUT_MS, maxBuffer: LSOF_MAX_BUFFER, killSignal: 'SIGKILL', windowsHide: true });
+function runCapture(cmd, args, { env } = {}) {
+  const r = spawnSync(cmd, args, { encoding: 'utf8', env, timeout: LSOF_TIMEOUT_MS, maxBuffer: LSOF_MAX_BUFFER, killSignal: 'SIGKILL', windowsHide: true });
   return { status: r.status, signal: r.signal, error: r.error, stdout: r.stdout ?? '', pid: r.pid };
 }
 
-// `lsof -F pfn` output -> Map<pid, { names: string[], cwd: boolean }>. `p<pid>` starts a process, `f<fd>` a file of it
-// (fcwd, ftxt, numeric fds…), `n<name>` names that file; other field letters are ignored. `cwd` = a readable absolute fcwd.
+// lsof prints a "safe" form of every name (util.c safestrprt): a byte it cannot print as-is becomes \xNN (non-ASCII under a
+// locale that does not know it, e.g. the C locale launchd hands a job: café -> caf\xc3\xa9), \b \f \n \r \t are spelled out,
+// and any other control character is ^X (^@..^_, ^? for DEL). We decode that back to the real name. A backslash is not escaped
+// itself, so some outputs are ambiguous: a `\` that is none of the known forms, and a `^` followed by @..._ or ? (a control
+// escape, or a literal caret in the file name). A wrong guess here would hide a live process and let its worktree be
+// removed, so anything ambiguous is judged CONSERVATIVELY (see lsofNameForms): kept whenever it could be inside a root.
+const LSOF_NAMED = { b: 0x08, f: 0x0c, n: 0x0a, r: 0x0d, t: 0x09 };
+function lsofNameForms(raw) {
+  const bytes = [];
+  let ambiguousAt = -1; // byte count decoded before the first ambiguous character
+  for (let i = 0; i < raw.length;) {
+    const ch = raw[i];
+    const hex = ch === '\\' ? /^x([0-9a-fA-F]{2})/.exec(raw.slice(i + 1)) : null;
+    if (hex) {
+      bytes.push(parseInt(hex[1], 16));
+      i += 4;
+    } else if (ch === '\\' && Object.hasOwn(LSOF_NAMED, raw[i + 1])) {
+      bytes.push(LSOF_NAMED[raw[i + 1]]);
+      i += 2;
+    } else if (ch === '^' && raw[i + 1] !== undefined && /[@-_?]/.test(raw[i + 1])) {
+      if (ambiguousAt < 0) ambiguousAt = bytes.length;
+      bytes.push(raw[i + 1] === '?' ? 0x7f : raw.charCodeAt(i + 1) - 0x40);
+      i += 2;
+    } else {
+      if (ch === '\\' && ambiguousAt < 0) ambiguousAt = bytes.length;
+      const cp = raw.codePointAt(i);
+      bytes.push(...Buffer.from(String.fromCodePoint(cp), 'utf8'));
+      i += cp > 0xffff ? 2 : 1;
+    }
+  }
+  const text = (b) => Buffer.from(b).toString('utf8');
+  const decoded = text(bytes);
+  const prefixes = [];
+  if (ambiguousAt >= 0) prefixes.push(text(bytes.slice(0, ambiguousAt)));
+  // bytes that are not UTF-8 decode to U+FFFD, which no real directory name equals: the text before it is judged like an
+  // ambiguous prefix too.
+  const bad = decoded.indexOf('�');
+  if (bad >= 0) prefixes.push(decoded.slice(0, bad));
+  // the literal undecoded name covers a file whose real name contains a backslash or caret sequence
+  return { names: [...new Set([decoded, raw])], prefixes };
+}
+
+// `lsof -F pfn` output -> Map<pid, { names: string[], prefixes: string[], cwd: boolean }>. `p<pid>` starts a process, `f<fd>`
+// a file of it (fcwd, ftxt, numeric fds…), `n<name>` names that file; other field letters are ignored. `names` are decoded
+// absolute paths (plus the raw spelling), `prefixes` the decoded text before an ambiguous escape; `cwd` = a readable
+// absolute fcwd.
 function parseLsofFields(text) {
   const procs = new Map();
   let cur = null;
@@ -237,17 +281,29 @@ function parseLsofFields(text) {
     const val = line.slice(1);
     if (tag === 'p') {
       const pid = Number(val);
-      cur = /^\d+$/.test(val) ? procs.get(pid) ?? procs.set(pid, { names: [], cwd: false }).get(pid) : null;
+      cur = /^\d+$/.test(val) ? procs.get(pid) ?? procs.set(pid, { names: [], prefixes: [], cwd: false }).get(pid) : null;
       fd = null;
     } else if (tag === 'f') fd = val;
     else if (tag === 'n' && cur) {
-      const name = unFirm(val.replace(/ \(deleted\)$/, ''));
-      if (!path.isAbsolute(name)) continue; // sockets and pipes (*:443, ->0x…) are not paths
-      cur.names.push(name);
+      const forms = lsofNameForms(val.replace(/ \(deleted\)$/, ''));
+      const names = forms.names.filter((n) => path.isAbsolute(n)).map(unFirm); // sockets and pipes (*:443, ->0x…) are not paths
+      if (names.length === 0) continue;
+      cur.names.push(...names);
+      cur.prefixes.push(...forms.prefixes.filter((p) => path.isAbsolute(p)).flatMap((p) => [p, unFirm(p)]));
       if (fd === 'cwd') cur.cwd = true;
     }
   }
   return procs;
+}
+
+// Could a name that starts with `prefix` (and then continues in some unknown way) lie inside `root`? Yes when the prefix
+// already is the root or below it, or is still a prefix of "<root>/" (the unknown rest may complete the path). Same case
+// folding as isInside on darwin.
+function prefixMayReach(prefix, root, platform) {
+  const fold = (s) => (platform === 'darwin' || platform === 'win32' ? s.toLowerCase() : s);
+  const p = fold(prefix.replace(/\\/g, '/'));
+  const r = `${fold(root.replace(/\\/g, '/')).replace(/\/$/, '')}/`;
+  return p.startsWith(r) || r.startsWith(p);
 }
 
 // macOS: one `lsof -n -P -w -F pfn` for the whole machine. Fail-closed -> { available: false }: lsof missing, killed or timed
@@ -257,14 +313,16 @@ function parseLsofFields(text) {
 function processesInsideLsof(dir, { platform, run = runCapture, ownPid = process.pid } = {}) {
   const unavailable = { available: false, pids: [], hidden: 0 };
   const exe = existsSync('/usr/sbin/lsof') ? '/usr/sbin/lsof' : 'lsof';
-  const r = run(exe, ['-n', '-P', '-w', '-F', 'pfn']);
+  // a UTF-8 locale keeps non-ASCII names printable where the machine has one; the decoding above covers where it has not
+  const r = run(exe, ['-n', '-P', '-w', '-F', 'pfn'], { env: { ...process.env, LC_ALL: 'en_US.UTF-8', LANG: 'en_US.UTF-8' } });
   if (!r || r.error || r.signal || (r.status !== 0 && r.status !== 1)) return unavailable;
   const procs = parseLsofFields(String(r.stdout ?? ''));
   if (!procs.get(ownPid)?.cwd) return unavailable;
   const roots = [dir, tolerant(() => realpathSync(dir), dir)].map(unFirm);
   const pids = [];
   for (const [pid, info] of procs) {
-    if (info.names.some((n) => roots.some((root) => isInside(n, root, platform)))) pids.push(pid);
+    const hit = roots.some((root) => info.names.some((n) => isInside(n, root, platform)) || info.prefixes.some((p) => prefixMayReach(p, root, platform)));
+    if (hit) pids.push(pid);
   }
   let hidden = 0;
   const ps = run('ps', ['-axo', 'pid=']);
