@@ -40,7 +40,7 @@ export function guardedCommandText(text) {
 }
 
 // The words of `argv` that are not the value of a message-like flag.
-function dataLessArgs(args) {
+export function dataLessArgs(args) {
   const out = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];

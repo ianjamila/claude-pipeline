@@ -1,7 +1,7 @@
 // Every external process the pipeline starts goes through here, so Windows quirks live in one place:
 // npm/codex/vercel/npx are .cmd shims that spawn cannot run directly, and cmd.exe needs its own quoting.
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { accessSync, constants as fsConstants, existsSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -334,9 +334,39 @@ export class GhError extends Error {
   }
 }
 
+// Why: Claude Code's hook PATH can lack the dir that holds gh (brew's /opt/homebrew/bin on macOS), so a bare `gh` was
+// ENOENT and an allowed gh action was denied. When the PATH lookup misses, try these fixed absolute dirs (POSIX only).
+export const GH_FALLBACK_DIRS = ['/opt/homebrew/bin', '/usr/local/bin', '/home/linuxbrew/.linuxbrew/bin', '/usr/bin'];
+
+function isExecutableFile(file) {
+  try {
+    accessSync(file, fsConstants.X_OK);
+    return statSync(file).isFile();
+  } catch {
+    return false;
+  }
+}
+
+// The absolute path of bare command `cmd` from PATH, else from `fallbackDirs`, else null. Only absolute dirs count (an
+// empty or relative PATH entry means the cwd, where a planted file could win) and only executable regular files.
+export function findOnPosixPath(cmd, pathVar, fallbackDirs = GH_FALLBACK_DIRS) {
+  const dirs = [...String(pathVar ?? '').split(path.delimiter), ...fallbackDirs];
+  for (const dir of dirs) {
+    if (!dir || !path.isAbsolute(dir)) continue;
+    const file = path.join(dir, cmd);
+    if (isExecutableFile(file)) return file;
+  }
+  return null;
+}
+
 export function gh(args, opts = {}) {
   const { cmd, prefixArgs } = overrideCommand('PIPELINE_GH', 'gh', opts.env);
-  return run(cmd, [...prefixArgs, ...args], opts);
+  let file = cmd;
+  // Fail closed: with no hit anywhere the bare name stays, so the spawn fails (ENOENT) and the caller denies.
+  if (cmd === 'gh' && process.platform !== 'win32') {
+    file = findOnPosixPath('gh', opts.env?.PATH ?? process.env.PATH, opts.fallbackDirs) ?? cmd;
+  }
+  return run(file, [...prefixArgs, ...args], opts);
 }
 
 export function ghJson(args, opts = {}) {
