@@ -10,11 +10,16 @@
 // A shell / source / eval fed script text from files (`bash < f.sh`, `cat f.sh | bash`, `eval "$(cat f.sh)"`) carries them in a
 // non-enumerable `feeds`; scriptFeedsOf turns it into script-file records for the callers.
 
+import { sqlShellEscapes, sqlFamilyOf, sqlClientPlan, SQL_CLIENT_NAMES, SQL_RC_MENTION } from './sql-clients.mjs';
 const MAX_COMMANDS = 500;
 const MAX_NEST = 200; // in-place nesting of $( ), ( ), <( ) before we give up on the line
 const MAX_WORK = 8_000_000; // total characters lexed across all recursive parses
 const HARD_MAX_DEPTH = 50;
 const ASSIGN_RE = /^([A-Za-z_][A-Za-z0-9_]*)\+?=/;
+// the counter (ctx.ctl) each construct kind of ctlOpen raises: in a loop, a function body, an if / case branch
+const CTL_COUNTER = { loop: 'loop', fn: 'fn', if: 'cond', case: 'cond', cbrace: 'cond' }; // (cbrace: a { group after && / || / |)
+const ctlMarks = (c) => ({ loop: c.loop > 0, fn: c.fn > 0, trap: c.trap > 0, cond: c.cond > 0 });
+const LOOP_WORDS = new Set(['while', 'until', 'for', 'select', 'repeat', 'foreach']);
 const KEYWORDS = new Set(['if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', 'until', '!', 'esac', 'coproc']);
 // A word right before a ( that opens a subshell, a condition or arithmetic (`if(true)`, `for((i=0;;))`), not a glob qualifier group.
 const LEAD_WORDS = new Set([...KEYWORDS, 'for', 'case', 'select', 'in', 'time', 'function', 'foreach', 'switch', 'catch', 'elseif', 'param', 'trap', 'return', 'exit', 'throw']);
@@ -35,7 +40,8 @@ const WIN_PATH_RE = /[^\\]\\[^\\]|^\\\\/; // C:\Git\git.exe, .\git.exe, \\server
 const ANSI_C = { n: '\n', t: '\t', r: '\r', a: '\x07', b: '\b', e: '\x1b', E: '\x1b', f: '\f', v: '\v', '\\': '\\', "'": "'", '"': '"', '?': '?' };
 
 const isSpace = (c) => c === ' ' || c === '\t' || c === '\r';
-const base = (w) => String(w).split(/[\\/]/).pop().toLowerCase().replace(/\.(exe|cmd|bat|com)$/, '');
+// Why: zsh EQUALS expansion: a command word `=git` runs the `git` found on PATH, so it names the same command (`=` alone and `==x` are ordinary words).
+const base = (w) => String(w).split(/[\\/]/).pop().toLowerCase().replace(/\.(exe|cmd|bat|com)$/, '').replace(/^=(?=[^=(~])/, '');
 
 // The name hooks should compare against: basename, lowercased, without .exe/.cmd/.bat/.com.
 // Handles /usr/bin/git, C:\Git\bin\Git.EXE and .\git.exe alike.
@@ -429,7 +435,17 @@ function unwrap(argv) {
 // A word whose value is only known at run time: `$VAR`, `$(..)`, backticks, or a glob (also zsh extendedglob operators
 // `^`, `#`, a non-leading `~`, which only act when the user's zshrc sets extendedglob; `~1`, a trailing `~` and `=~` are
 // ordinary). It may become no word, one word or several, so it hides which of the words after it is the script.
-const EXPANDS = /[$`*?[^#]|[^=]~(?!\d|$)/;
+// (and zsh EQUALS: `=tool` is the PATH lookup of `tool`; `==`, `=(` and `=~` are not)
+const EXPANDS = /[$`*?[^#]|[^=]~(?!\d|$)|^=[^=(~]/;
+const EQUALS_WORD = /^=[^=(~\s]/;
+export const isEqualsWord = (w) => EQUALS_WORD.test(w);
+// Why: `source NAME` / `. NAME` without a slash looks NAME up in the PATH directories first, then in the cwd (bash; zsh also searches PATH): the record then lists PATH as places to look
+// (only when the line itself sets PATH -- a prefix, `export PATH=...`, `PATH=...; ` -- the hook's own PATH holds the user's tools, not files the line plants)
+export function sourcePathSearch(rec, argv, cmds = []) {
+  if (!cmds.some((c) => Object.hasOwn(c.env ?? {}, 'PATH') || (c.argv ?? []).some((a) => /^PATH(?:\+?=|\[)/.test(a)))) return false;
+  if (!rec || rec.kind !== 'shell' || !['source', '.'].includes(base(argv?.[0] ?? ''))) return false;
+  return (rec.words ?? [rec.file]).some((w) => typeof w === 'string' && w !== '' && !w.includes('/'));
+}
 const hasExpansion = (w) => EXPANDS.test(w);
 // A word that is a process substitution: the shell runs a command and reads its output through a /dev/fd path.
 // (zsh's `=(cmd)` is the same thing with a temp file)
@@ -516,7 +532,8 @@ function hasPatternSyntax(raw, line, file) {
   if (ats.length > MAX_OCCURRENCES) pattern = true;
   const wordEnd = (from) => { let e = from; while (e < text.length && !/\s/.test(text[e])) e++; return e; };
   for (const st of starts) {
-    if (PATTERN_SYNTAX.test(maskQuoted(text.slice(st, wordEnd(st + raw.length))))) pattern = true;
+    const masked = maskQuoted(text.slice(st, wordEnd(st + raw.length)));
+    if (PATTERN_SYNTAX.test(masked) || ZSH_ALTERNATION.test(masked.replace(/'[^']*'/g, (q) => '_'.repeat(q.length)))) pattern = true;
     for (const at of ats) if (PATTERN_SYNTAX.test(text.slice(st, wordEnd(st + at + file.length)))) pattern = true;
   }
   return pattern;
@@ -549,8 +566,42 @@ function maskQuoted(t) {
   return out;
 }
 const MAX_OCCURRENCES = 32;
+// `$BASH`, `${BASH}`, `${BASH:-bash}`, `${BASH-sh}`: the shell running the script (or the shell the default names)
+const BASH_WORD = /^\$(?:BASH|\{BASH(?::?-(?:bash|sh))?\})$/;
+const BASH_DEFAULT = /^\$\{BASH:?-bash\}$/; // (the only spelling that names bash whether the shell is bash (it sets BASH) or zsh / sh (BASH unset))
+const BASH_REF = /\$BASH(?![A-Za-z0-9_])|\$\{BASH(?::?-(?:bash|sh))?\}/g;
+// commands that bind a name given as an operand (`read N`, `declare N=v`, `printf -v N`, `let`, zsh `vared` ...): a name that is not a plain word could be BASH
+const BINDERS = /(?<![\w.$/-])(?:read|declare|typeset|local|export|readonly|mapfile|readarray|getopts|unset|let|vared|zparseopts|printf|print|strftime|zstyle|sysread|zstat|getln|integer|float|select|set|autoload|compgen)(?![\w-])([^\n;&|<>]*)/g;
+// Is BASH ever bound by the text? Fail closed: every mention that is not a plain reference counts (also with quotes taken out: `read B""ASH`), a binder
+// whose operand name is not a plain word (`declare "${n}SH=x"`, `read -r "$v"`, `export $n=x`, `read BA{SH,}`), `(( $n = 1 ))`, eval, source / `.` (the sourced
+// file may bind it), an ANSI-C string with an escape. A mention inside a quote or comment only makes this stricter.
+// `(( $n = 1 ))`: a `((`, later a `$`, later an `=` on one line (first occurrences only: linear, a pattern with `[^\n]*` twice is not)
+function arithAssignsByName(line) {
+  const p = line.indexOf('((');
+  const d = p < 0 ? -1 : line.indexOf('$', p);
+  return d >= 0 && line.indexOf('=', d) >= 0;
+}
+function bindsBash(text) {
+  const str = text.replace(/\\\r?\n/g, ''); // (a backslash-newline inside a name is removed before the shell reads it: `BA\<nl>SH=x` binds BASH)
+  const mentions = (s) => /(?<![A-Za-z0-9_])BASH(?![A-Za-z0-9_])/.test(s.replace(BASH_REF, ''));
+  if (mentions(str) || mentions(str.replace(/['"\\]/g, ''))) return true;
+  if (/(?<![\w./$-])(?:source|eval)(?![\w-])/.test(str)) return true;
+  if (/(?:^|[\n;&|({`!]|\b(?:then|do|else|elif|if|while|until|builtin|command)\b)\s*\.\s+\S/.test(str)) return true;
+  if (/\$'[^']*\\[xuU0-7]/.test(str)) return true;
+  if (str.split('\n').some(arithAssignsByName)) return true;
+  for (const m of str.matchAll(BINDERS)) {
+    const toks = m[1].trim().split(/\s+/).filter(Boolean);
+    const vOpt = /^(?:printf|print)$/.test(m[0].trim().split(/\s/)[0]);
+    const names = vOpt ? toks.filter((x, i) => i > 0 && /^-\w*v$/.test(toks[i - 1])) : toks.filter((x) => !x.startsWith('-'));
+    if (names.some((x) => /[$`{}*?[\\'"(~]/.test(x.split('=')[0]))) return true;
+  }
+  return false;
+}
 // ksh/bash extglob (`*(`, `?(`, `+(`, `@(`, `!(`), zsh `(#i)` and `<1-2>` numeric ranges attached to a word
 const PATTERN_SYNTAX = /[*?+@!\]]\(|\(#|[^\s<>&|;(]<\d*-\d*>/;
+// zsh alternation `(a|b)`: a `(` that opens no substitution, with a `|` and no blank before the `)`. Only the text with quotes masked is checked (a
+// quoted `'^(A|B)='` is a regex argument, not a glob; maskQuoted stops masking inside a double-quoted `$(`, so single-quoted runs are masked again)
+const ZSH_ALTERNATION = /(?<![$<>=(])\([^\s]*\|[^\s]*\)/;
 
 // (the arguments of a program named by a variable, for the policies that judge the command line it expands to; not part of the record's shape)
 const withArgs = (sf, argv) => Object.defineProperty(sf, 'args', { value: argv.slice(1), enumerable: false });
@@ -590,11 +641,36 @@ function scriptFileOfArgv(argv) {
     // `./ev*.sh` / `$D/x.sh`: the shell runs whatever the word expands to, so it is a candidate list of one word
     return hasExpansion(argv[0]) ? withArgs({ kind: 'exec', file: argv[0], ambiguous: true, words: [argv[0]] }, argv) : { kind: 'exec', file: argv[0] };
   }
+  // `=tool`: zsh runs the file `tool` resolves to on PATH (the candidates are its PATH directories, see script-candidates.mjs)
   // `X=./evil.sh; $X`: a program named by a variable has no `/` to show it is a path
-  if (/[$`]/.test(argv[0])) return withArgs({ kind: 'exec', file: argv[0], ambiguous: true, words: [argv[0]] }, argv);
+  if (/[$`]/.test(argv[0]) || EQUALS_WORD.test(argv[0])) return withArgs({ kind: 'exec', file: argv[0], ambiguous: true, words: [argv[0]] }, argv);
   return null;
 }
 const INTERPRETER_NO_EXT = new Set(['python', 'ruby', 'perl', 'php']);
+// A descriptor path (`/dev/fd/3`): a shell run on it reads whatever the descriptor was opened from
+const FD_PATH = /^\/(?:dev|proc\/self)\/fd\/(?:[3-9]|[1-9]\d+)$|^\/(?:dev|proc\/self)\/fd\/\$/;
+// Marks a command as one that reads its program / script from stdin (an output process substitution's stream reaches those); non-enumerable like `feeds`
+function markStdin(cmd, interp, sql = false) {
+  if (!cmd) return;
+  Object.defineProperty(cmd, 'stdinShell', { value: true, enumerable: false, configurable: true });
+  if (interp) Object.defineProperty(cmd, 'interpStdin', { value: true, enumerable: false, configurable: true });
+  if (sql) Object.defineProperty(cmd, 'sqlStdin', { value: sql, enumerable: false, configurable: true });
+}
+// Why: an interpreter given no script operand (`node`, `python3 -u`, `node -`) reads its program from stdin: `node < f.mjs` runs the file like `node f.mjs`
+function interpReadsStdin(argv) {
+  const name = base(argv[0]);
+  let i = 1;
+  if ((name === 'deno' || name === 'bun') && argv[1] === 'run') i = 2;
+  for (; i < argv.length; i++) {
+    const t = argv[i];
+    if (t === '--') { i++; break; }
+    if (INLINE_FLAGS.has(t.split('=')[0]) || (/^-[A-Za-z]*[ecEmp]$/.test(t) && !t.startsWith('--') && name !== 'node')) return false;
+    if (/^(?:-v|-V|-h|--version|--help|--v8-options)$/.test(t)) return false; // prints and exits
+    if (t.length > 1 && t[0] === '-') { if (INTERP_VALUE_FLAGS.has(t)) i++; continue; }
+    break;
+  }
+  return i >= argv.length || STDIN_FILES.has(argv[i]);
+}
 
 const PWSH_VALUE_FLAGS = ['executionpolicy', 'windowstyle', 'workingdirectory', 'inputformat', 'outputformat', 'version', 'configurationname', 'settingsfile', 'custompipename'];
 const PWSH_VALUE_ALIASES = ['ep', 'w', 'wd', 'if', 'of', 'o', 'v', 'config'];
@@ -644,7 +720,14 @@ const READERS = {
   cat: ['', []], tac: ['', []], less: ['', []], more: ['', []], bat: ['', []], batcat: ['', []],
   head: ['nc', ['--lines', '--bytes']], tail: ['nc', ['--lines', '--bytes']],
 };
-const EXACT_READERS = new Set(['cat', 'less', 'more', 'bat', 'batcat']);
+// Why: only option-less `cat` (and `cat -u`, `--`) prints its files byte for byte. `cat -n/-s/-A` number, squeeze or show characters, `bat` / `less` decorate
+// and page, `head -c` / `tail -c` cut: what reaches the shell is computed from the file, so it is scanned, never rebuilt as the file's own text.
+// (the words after a `--` are file operands, even `-n`: the same reading as line-writes' isExactCat)
+const exactCopy = (name, argv) => {
+  if (name !== 'cat') return false;
+  const dd = argv.indexOf('--', 1);
+  return argv.slice(1, dd < 0 ? undefined : dd).every((w) => w === '-u' || w === '-' || w[0] !== '-');
+};
 const MAX_FEED_FILES = 64; // more files than this feed one command: refused, not judged
 
 // The file operands of a reader: words that are not options, minus the values of options that take one.
@@ -717,8 +800,79 @@ function producerScript(argv) {
   return sf && !sf.ambiguous && !sf.unresolvable && typeof sf.file === 'string' && sf.file !== '' ? sf.file : null;
 }
 
+// The index of the word that holds the program text of an inline interpreter run (`node -e CODE`, `node --eval=CODE`, `python -c CODE`, `php -r CODE`), or -1.
+function inlineCodeIndex(name, argv) {
+  if (!INTERPRETER.test(name)) return -1;
+  for (let i = 1; i < argv.length; i++) {
+    const t = argv[i];
+    if (t === '--' || t === '-' || t[0] !== '-') return -1;
+    const flag = t.split('=')[0];
+    if (['-e', '-E', '-p', '-c', '-r', '--eval', '--print'].includes(flag) || (name !== 'node' && /^-[A-Za-z]*[ecEpr]$/.test(t))) return t.includes('=') && t[1] === '-' ? i : i + 1;
+    if (INTERP_VALUE_FLAGS.has(t)) i++;
+  }
+  return -1;
+}
+
 // groups: the exact files, one array per producer in the order it names them (what `st.files` was filled from), so the join can be rebuilt
-const newSt = () => ({ dyn: false, files: [], groups: [], computed: [], raws: [], pat: new Set(), unq: new Set(), ops: new Set() });
+// seq: the stream's parts in the order its producers run ({text} a static producer prints, {file} an exact reader's file, {scan} a rewriting producer's word); see producePieces
+// ordered: set while producePieces records seq (a static producer then does not make the stream `mixed` by itself)
+// unordered: the producers' texts may not make the stream in the order recorded (one may stop the group, print elsewhere, not run, run in the background); unsure:
+// the same except stopping the group, which only cuts the stream short (a guarded word found in a part of it is in the whole: the scan of a rewritten stream holds)
+const newSt = () => ({ dyn: false, unordered: false, unsure: false, mixed: false, ordered: false, seq: [], whole: new Set(), files: [], groups: [], computed: [], raws: [], pat: new Set(), unq: new Set(), ops: new Set() });
+const hasTextPiece = (seq) => (seq ?? []).some((p) => Object.hasOwn(p, 'text'));
+
+// Adds what `b` collected to `a` (a descriptor opened twice, a variable assigned twice: both may be read).
+function mergeSt(a, b) {
+  const out = newSt();
+  for (const x of [a, b]) {
+    out.dyn = out.dyn || x.dyn;
+    out.unordered = out.unordered || x.unordered;
+    out.unsure = out.unsure || x.unsure;
+    out.mixed = out.mixed || x.mixed;
+    out.files.push(...x.files); out.groups.push(...x.groups); out.computed.push(...x.computed); out.raws.push(...x.raws); out.seq.push(...x.seq);
+    for (const k of ['pat', 'unq', 'ops', 'whole']) for (const w of x[k]) out[k].add(w);
+  }
+  // (two texts that may each be read are not one stream: static text in either cannot be placed)
+  const some = (x) => x.files.length || x.computed.length || x.seq.length;
+  if ((hasTextPiece(a.seq) || hasTextPiece(b.seq)) && some(a) && some(b)) out.mixed = true;
+  return out;
+}
+
+// Why: `X=$(cat f.sh); eval "$X"`: the variable holds the text of a file (the substitution strips trailing newlines and an unquoted use splits it into words,
+// so it is never the file's exact text: scanned, like a rewriting producer's). Assigned once or twice, in a branch or not: every assignment is remembered.
+function noteVarFeeds(ctx, name, subs) {
+  const st = newSt();
+  subsProduced(subs, st, 1);
+  if (!st.files.length && !st.computed.length && !st.dyn) return;
+  const e = newSt();
+  e.dyn = st.dyn;
+  for (const w of [...st.files, ...st.computed]) { e.computed.push(w); e.pat.add(w); e.ops.add(w); }
+  e.raws.push(...st.raws);
+  const prev = ctx.varFeeds.get(name);
+  ctx.varFeeds.set(name, prev ? mergeSt(prev, e) : e);
+}
+
+// Why: a substitution's files are the exact script text only when one quoted substitution is the whole script (`eval "$(cat f)"`, `bash -c "$(cat f)"`). Unquoted it is
+// split into words (`eval $(cat f)`, `$(cat f)`: f's lines become ONE command), eval joins several words with spaces and text around it is added to it (`eval "x $(cat f)"`):
+// the files are then scanned, like a variable that holds a file's text (noteVarFeeds).
+function scannedSubs(st) {
+  for (const w of st.files) { st.computed.push(w); st.pat.add(w); st.ops.add(w); st.whole.add(w); }
+  st.files.length = 0;
+  st.groups.length = 0;
+}
+
+// The feeds of the variables `text` refers to (`$X`, `${X}`, `"$X"`), added to `st`; `seg.vf` is the line's table of variables that hold file text.
+const VAR_REF = /\$\{?([A-Za-z_][A-Za-z0-9_]*)/g;
+function varFeedsInto(seg, text, st) {
+  if (!seg.vf || !seg.vf.size || typeof text !== 'string' || !text.includes('$')) return;
+  for (const m of text.matchAll(VAR_REF)) {
+    const e = seg.vf.get(m[1]);
+    if (!e) continue;
+    if (e.dyn) st.dyn = true;
+    for (const w of e.computed) { st.computed.push(w); st.pat.add(w); st.ops.add(w); }
+    st.raws.push(...e.raws);
+  }
+}
 
 // What the command `seg` prints, when its output reaches the shell through a file: the files it reads. `exact`: nothing
 // between the command and the shell rewrites its output, so a plain reader's files ARE the script text (`st.files`); otherwise
@@ -735,9 +889,12 @@ function noteReads(seg, name, argv, st, exact) {
   // [operand, the word it came from, argv index, argOnly]; a word with no unquoted pattern character is a literal name even if it looks like a regex (`'^(A|B)='`).
   // The script's other words stay scanned (the script may print a file they name: `s.sh` = `cat "$1"`), but they are not FILE operands for the join rule.
   const scriptArgs = () => looseOperands(argv).filter(([w]) => w !== script).map(([w, full, idx]) => [w, full, idx, true]);
-  const words = reader ? readerOperands(argv, ...READERS[name]).map((w) => [w, w]) : script !== null ? [[script, script, argv.indexOf(script)], ...scriptArgs()] : looseOperands(argv);
+  // Why: `node -e 'code'` / `python -c 'code'`: the code text is a program, not a file name (JS `[0] === 2` or a backtick made it a glob that could not be resolved);
+  // the words after it stay candidates, the program may print a file it is given (`node -e '...readFileSync(process.argv[1])' f.sh`)
+  const code = reader ? -1 : inlineCodeIndex(name, argv);
+  const words = reader ? readerOperands(argv, ...READERS[name]).map((w) => [w, w]) : script !== null ? [[script, script, argv.indexOf(script)], ...scriptArgs()] : looseOperands(argv).filter(([, , idx]) => idx !== code);
   for (const f of seg.stdinFiles) { words.push([f, f]); st.pat.add(f); }
-  const list = exact && (EXACT_READERS.has(name) || argv.length === 0) ? st.files : st.computed;
+  const list = exact && (exactCopy(name, argv) || argv.length === 0) ? st.files : st.computed;
   const prog = reader ? -1 : programIndex(name, argv);
   const group = [];
   for (const [w, full, idx, argOnly] of words) {
@@ -751,6 +908,10 @@ function noteReads(seg, name, argv, st, exact) {
     if (!noFile && !argOnly) st.ops.add(w);
   }
   if (group.length) st.groups.push(group);
+  if (group.length && seg.sep === '&') st.unordered = st.unsure = true; // (a job in the background: the order it prints in, among the others, is not known)
+  // Why: a producer that may not run (after && / ||, in an if / case branch, a loop, a function body or a trap action) leaves its text out of the stream, or
+  // repeats it: `{ cat a; false && cat b; cat c; } | bash` runs a+c, which the join a+b+c hides (Codex review 3 of #50). Such a join is not rebuilt (refused).
+  if (group.length && (seg.sep === '&&' || seg.sep === '||' || Object.values(seg.ctl ?? {}).some(Boolean))) st.unordered = st.unsure = true;
   if (words.length) st.raws.push(seg.raw);
 }
 
@@ -761,6 +922,100 @@ function subsProduced(subs, st, hops) {
   const out = [];
   for (const s of subs) out.push(...producedBy(s, st, hops, !piped.has(s)));
   return out;
+}
+
+// The exact text a static producer prints, or null when it cannot be rebuilt exactly: echo (its newline; `-n`), printf with a format of plain text, `%s`, `%%`
+// and `\n` (the format is reused for the arguments left), cat of a quoted heredoc (its last newline; `<<-` strips the tabs) or of a here-string. An expansion,
+// a backslash echo may interpret (zsh's does by default), an option, another format or an unquoted heredoc that expands is not rebuilt.
+function staticOutput(seg) {
+  const pa = seg.final ? seg.final.argv : [];
+  const pn = pa.length ? base(pa[0]) : '';
+  // (bash ends an argument at a NUL, `$'git pu\0#'` prints `git pu`; zsh keeps it: neither is rebuilt -- Codex review 4)
+  if (pa.some((w) => w.includes('\0')) || [...seg.heredocs, ...seg.herestrings].some((h) => h.text.includes('\0'))) return null;
+  if (pn === 'echo' || pn === 'printf') {
+    if (seg.heredocs.length || seg.herestrings.length || pa.slice(1).some((w) => seg.meta.has(w) || seg.pat.has(w))) return null;
+  }
+  if (pn === 'echo') {
+    const nl = pa[1] === '-n' ? '' : '\n';
+    const words = pa.slice(nl ? 1 : 2);
+    if (words[0]?.startsWith('-') || words.some((w) => w.includes('\\'))) return null;
+    return words.join(' ') + nl;
+  }
+  if (pn === 'printf') {
+    const fmt = pa[1];
+    if (fmt === undefined || fmt.startsWith('-')) return null;
+    const toks = fmt.match(/%s|%%|\\n|[^%\\]+/g) ?? [];
+    if (toks.join('') !== fmt) return null;
+    const args = pa.slice(2);
+    const n = toks.filter((t) => t === '%s').length;
+    let out = '';
+    let k = 0;
+    do {
+      for (const t of toks) out += t === '%s' ? args[k++] ?? '' : t === '%%' ? '%' : t === '\\n' ? '\n' : t;
+    } while (n > 0 && k < args.length);
+    return out;
+  }
+  if (pn === 'cat' && pa.length === 1 && !seg.stdinFiles.length && seg.heredocs.length + seg.herestrings.length === 1) {
+    const h = seg.heredocs[0];
+    if (h) {
+      if (!h.lines || (!h.quoted && /[$`\\]/.test(h.text))) return null; // (no line: '' and one empty line look alike)
+      return h.text + '\n'; // (`<<-` tabs already stripped: readHeredocs)
+    }
+    const hs = seg.herestrings[0];
+    return hs.dyn || hs.subs.length ? null : hs.text + '\n';
+  }
+  return null;
+}
+
+// Why: static text (echo, printf, a heredoc) and files in ONE stream (`{ echo "begin;"; cat m.sql; cat <<'SQL' ... SQL } | psql`, daily database work): the stream
+// is rebuilt from what each producer prints, in the order they run (st.seq), and judged as one text (scriptFeedsOf). `stages`: the stream's producers in source order
+// (a pipeline's earlier commands feed its last one: their part is the last one's), `run(s)`: producedBy for one of them, returning the texts it adds. A producer whose
+// static text cannot be rebuilt exactly (staticOutput) or comes with files makes the stream `mixed`; one that may not run (after && / ||, in a branch or loop,
+// in the background) makes it `unsure`: either is refused when static text and files feed one program (scriptFeedsOf).
+function producePieces(stages, st, run) {
+  const onward = new Set();
+  for (const s of stages) for (const p of s.pipedFrom ?? []) onward.add(p);
+  const was = st.ordered;
+  st.ordered = true;
+  const out = [];
+  try {
+    let mark = null;
+    let texts = 0;
+    let piped = false;
+    for (const s of stages) {
+      if (!mark) { mark = { files: st.files.length, computed: st.computed.length }; texts = 0; piped = false; }
+      const t = run(s);
+      out.push(...t);
+      texts += t.length;
+      if (s.pipedFrom?.length) piped = true;
+      if (onward.has(s)) continue; // (its output is the next command's input)
+      const files = st.files.slice(mark.files);
+      const computed = st.computed.slice(mark.computed);
+      mark = null;
+      const may = s.sep === '&' || s.sep === '&&' || s.sep === '||' || Object.values(s.ctl ?? {}).some(Boolean);
+      if (may && (texts || files.length || computed.length)) st.unsure = true;
+      if (!texts) {
+        for (const w of files) st.seq.push({ file: w });
+        for (const w of computed) st.seq.push({ scan: w });
+        continue;
+      }
+      // (a line that defines a function or can rename a command -- `echo() { :; }`, alias, enable -n, functions[echo]=, source, eval ... -- may print anything
+      // under echo's name: not rebuilt, without telling which names it reaches -- Codex review 4; see noteRedef)
+      const text = files.length || computed.length || piped || s.defs?.redef || s.fns?.size ? null : staticOutput(s);
+      if (text === null) { st.mixed = true; continue; }
+      if (text !== '') st.seq.push({ text });
+    }
+  } finally { st.ordered = was; }
+  return out;
+}
+
+// Whether `st.seq` is the whole stream st describes: its file parts are st.files in order, its scan parts st.computed (anything added outside producePieces --
+// `< F`, a descriptor, a client's -f file -- leaves it incomplete, so static text in it cannot be placed).
+function seqCovers(st) {
+  const files = st.seq.filter((p) => Object.hasOwn(p, 'file')).map((p) => p.file);
+  const scans = st.seq.filter((p) => Object.hasOwn(p, 'scan')).map((p) => p.scan).sort();
+  const comp = [...st.computed].sort();
+  return files.length === st.files.length && files.every((w, i) => w === st.files[i]) && scans.length === comp.length && scans.every((w, i) => w === comp[i]);
 }
 
 // Static text a command writes to stdout (or hands a shell on stdin): its heredocs and here-strings, and what
@@ -774,12 +1029,23 @@ function producedBy(seg, st, hops = 0, exact = true) {
     out.push(hs.text);
     if (hs.dyn) st.dyn = true;
     out.push(...subsProduced(hs.subs, st, hops + 1));
+    varFeedsInto(seg, hs.text, st);
   }
   const pa = seg.final ? seg.final.argv : [];
   const pn = pa.length ? base(pa[0]) : '';
+  // Why: the stream several producers make is rebuilt only when each of them really feeds it, all of them (background review of f3aa3f6): one whose stdout goes
+  // elsewhere (`cat b >&2`, `> /dev/null`) adds nothing, and a command between them that is no reader and no static text (`exit`, a test, `false` under set -e)
+  // may stop the group and drop the producers after it (`a`+`b` pushes main while the joined `a`+`b`+`c` reads main-feature). Such a join is refused (unordered).
+  const OUT = ['>', '>>', '>|', '&>', '&>>', '>&'];
+  if ((seg.redirects ?? []).some((r) => OUT.includes(r.op) && (r.fd === null || r.fd === undefined || r.fd === 1) && r.target !== '&1')) st.unordered = st.unsure = true;
+  if (pa.length && !['echo', 'printf', 'true', ':'].includes(pn) && !Object.hasOwn(READERS, pn)) st.unordered = true;
+  // (static text in the same stream as files, `{ cat a; printf %s sh; cat b; }`: the files would be judged joined without it -- Codex recheck of a5c0e5a. Only a
+  // stream producePieces records is rebuilt with it; anywhere else (`eval "$(echo x; cat f)"`, a variable, xargs) it is not)
+  if (!st.ordered && (seg.heredocs.length || seg.herestrings.length || pn === 'echo' || pn === 'printf')) st.mixed = true;
   noteReads(seg, pn, pa, st, exact);
   if (pn === 'echo' || pn === 'printf') {
     for (const a of pa.slice(1)) {
+      varFeedsInto(seg, a, st);
       const m = seg.meta.get(a);
       if (!m) continue;
       if (m.dyn) st.dyn = true;
@@ -806,27 +1072,56 @@ function stdinSource(seg) {
   const texts = [];
   st.files.push(...seg.stdinFiles); // `bash < F`: the script is the file
   if (seg.stdinFiles.length) st.groups.push([...seg.stdinFiles]);
+  for (const e of seg.fdFeeds) { st.computed.push(...e.computed); for (const w of e.computed) { st.pat.add(w); st.ops.add(w); } st.raws.push(...e.raws); if (e.dyn) st.dyn = true; }
   for (const h of seg.heredocs) texts.push(h.text);
   let fed = seg.stdinSubs.length > 0 || (seg.pipedFrom !== null && seg.pipedFrom.length > 0);
   let fedTexts = 0;
   for (const hs of seg.herestrings) {
-    texts.push(hs.text);
+    // (`bash <<< "$(cat f)"`: the text is what the substitution prints, judged below; the word itself read as script would be a command word, which is split. Only
+    // files read as they are: a program's output is unknown text, and reading the word again keeps what that means)
+    const shape = hs.subs.length > 0 && !hs.subs.some((x) => x.split) && (hs.text.match(/\$\(|`/g) ?? []).length === 1 && /^(?:\$\(|`)/.test(hs.text) && /[)`]$/.test(hs.text);
+    const before = { files: st.files.length, computed: st.computed.length, dyn: st.dyn };
+    const produced = subsProduced(hs.subs, st, 1);
+    const whole = shape && st.files.length > before.files && st.computed.length === before.computed && st.dyn === before.dyn;
+    if (!whole) texts.push(hs.text);
     if (hs.dyn) st.dyn = true;
-    texts.push(...subsProduced(hs.subs, st, 1));
+    texts.push(...produced);
+    varFeedsInto(seg, hs.text, st);
   }
-  { const t = subsProduced(seg.stdinSubs, st, 1); fedTexts += t.length; texts.push(...t); }
+  { const t = producePieces(seg.stdinSubs, st, (s) => producedBy(s, st, 1, !seg.stdinSubs.some((x) => x.pipedFrom?.includes(s)))); fedTexts += t.length; texts.push(...t); }
+  const subsSeq = st.seq.length;
   const walk = (stage, hops) => {
-    if (hops > 8) return;
+    if (hops > 8) return [];
+    const got = [];
     for (const p of stage) {
-      const t = producedBy(p, st, 0, hops === 0);
-      fedTexts += t.length;
-      texts.push(...t);
-      if (p.pipedFrom) walk(p.pipedFrom, hops + 1);
+      got.push(...producedBy(p, st, 0, hops === 0));
+      if (p.pipedFrom) got.push(...walk(p.pipedFrom, hops + 1));
     }
+    return got;
   };
-  if (seg.pipedFrom) walk(seg.pipedFrom, 0);
+  // (each of the stage's commands with what its upstream prints into it: one part of the stream)
+  if (seg.pipedFrom) {
+    const t = producePieces(seg.pipedFrom, st, (p) => [...producedBy(p, st, 0, true), ...(p.pipedFrom ? walk(p.pipedFrom, 1) : [])]);
+    fedTexts += t.length;
+    texts.push(...t);
+    if (subsSeq && st.seq.length > subsSeq && hasTextPiece(st.seq)) st.mixed = true; // (`< <(...)` and a pipe: one of them is the stdin, not both in a row)
+  }
   const unknown = (fed && fedTexts === 0) || seg.stdinFile || st.dyn;
   return { texts, unknown, st };
+}
+
+// The text a command prints (`out`: its heredocs / here-strings, echo / printf text, the files a reader names) and what it reads on stdin
+// (`stdin`: its own heredoc, `< F`, `<(...)`, the pipe it is fed from). `files` hold text as it is, `computed` are files a rewriting
+// command (sed, base64 ...) reads, `dyn` is set when part of it is only known at run time, `fed` when stdin comes from a pipe or a substitution.
+function streamsOf(seg, argv) {
+  const view = { ...seg, final: { argv } };
+  const o = newSt();
+  const outTexts = producedBy(view, o);
+  const s = stdinSource(view);
+  return {
+    out: { texts: outTexts, files: o.files, computed: o.computed, dyn: o.dyn },
+    stdin: { texts: s.texts, files: s.st.files, computed: s.st.computed, dyn: s.st.dyn, fed: seg.stdinSubs.length > 0 || (seg.pipedFrom !== null && seg.pipedFrom.length > 0) },
+  };
 }
 
 // ---- script text fed to a shell from files ---------------------------------------------------------
@@ -834,12 +1129,21 @@ function stdinSource(seg) {
 // `cmd.feeds` (not enumerable, like `sep`) lists the files the text a shell / source / eval runs comes from, when it is not
 // named as a script file: `files` hold the text as it is (a stdin redirect, `cat F |`, `<(cat F)`, `$(<F)`), `computed` are words
 // a command that rewrites its input (sed, awk, base64, tr ...) may read; `raws` are the producers' command texts.
-function addFeeds(cmd, st) {
-  if (!cmd || (!st.files.length && !st.computed.length)) return;
-  if (!cmd.feeds) Object.defineProperty(cmd, 'feeds', { value: { files: [], groups: [], computed: [], raws: [], pat: [], unq: [], ops: [] }, enumerable: false });
+// `interp`: the fed text is the program of an interpreter (`node < f.mjs`), not shell script text; 'sql': the input of psql / mysql / sqlite3 (only its shell escapes run).
+function addFeeds(cmd, st, interp = false) {
+  if (!cmd || (!st.files.length && !st.computed.length && !st.rcOnly)) return;
+  if (!cmd.feeds) Object.defineProperty(cmd, 'feeds', { value: { files: [], groups: [], computed: [], raws: [], pat: [], unq: [], ops: [], rc: [], seqs: [], whole: [], unordered: false, unsure: false, mixed: false, interp: false, sql: false }, enumerable: false });
+  if (st.unordered) cmd.feeds.unordered = true;
+  if (st.unsure) cmd.feeds.unsure = true;
+  if (st.mixed) cmd.feeds.mixed = true;
+  // (each stream keeps its own parts: two feeds of one command are two texts, not one; static text in a stream that is not wholly recorded cannot be placed)
+  if (hasTextPiece(st.seq)) { if (seqCovers(st)) cmd.feeds.seqs.push([...st.seq]); else cmd.feeds.mixed = true; }
+  if (typeof interp === 'string') cmd.feeds.sql = interp;
+  else if (interp) cmd.feeds.interp = true;
   cmd.feeds.pat.push(...st.pat);
   cmd.feeds.unq.push(...st.unq);
   cmd.feeds.ops.push(...st.ops);
+  cmd.feeds.whole.push(...(st.whole ?? []));
   cmd.feeds.files.push(...st.files);
   cmd.feeds.groups.push(...st.groups);
   cmd.feeds.computed.push(...st.computed);
@@ -859,9 +1163,69 @@ const opaqueFile = (w, globs) => (globs ? hasExpansion(w) : /[$`]/.test(w)) || B
 // parser cut the producer at, or too many files, is unresolvable (the caller must refuse). `line` is the whole line `cmd` came from.
 // `resolve` (optional): the caller's value for a word that holds `$` (the variables the line has set: `F=x/y; ... $F/s.sh`); a word it
 // returns without `$` / backtick / whitespace is that one file name and is decided on as such, anything else stays as written.
+// Why: a command whose name is a variable (`$PSQL $DB < q.sql`) may be a shell reading its script from stdin; when the caller knows the value and it is one of
+// these programs, the file is data for it. Not a shell, an interpreter or a wrapper that starts one (env, sudo, xargs ...): an unknown name stays a possible shell.
+// (the SQL clients are not here: sql-clients.mjs models them, and one outside its option allowlist keeps its stdin as a feed)
+const DATA_PROGRAMS = new Set(['pg_restore', 'jq', 'yq', 'grep', 'egrep', 'fgrep', 'rg', 'wc', 'sort', 'uniq', 'cut', 'tr', 'head', 'tail', 'cat', 'less', 'more', 'diff', 'cmp', 'column', 'md5sum', 'shasum', 'sha256sum', 'cksum', 'xxd', 'od', 'base64', 'nl', 'fold', 'paste', 'comm']);
+export function isDataProgram(value) {
+  if (typeof value !== 'string' || /[$`;&|<>()\\"'\n]/.test(value)) return false;
+  const first = value.trim().split(/\s+/)[0] ?? '';
+  return (!first.includes('/') || first.startsWith('/')) && DATA_PROGRAMS.has(base(first));
+}
+// Why: psql / mysql / sqlite3 and their cousins run shell commands, write files and include other files from the text they read: see sql-clients.mjs (one model for
+// the direct path, the variable-named path and the files). A value that names one (`Q=psql`, `PSQL="psql -h x"`) is a client, not a shell.
+export const isSqlShellProgram = (value) => sqlFamilyValue(value) !== null;
+export { sqlShellEscapes };
+// the client family a resolved command value names (`psql -h localhost`), or null
+function sqlFamilyValue(value) {
+  if (typeof value !== 'string' || /[$`;&|<>()\\"'\n]/.test(value)) return null;
+  const first = value.trim().split(/\s+/)[0] ?? '';
+  return !first.includes('/') || first.startsWith('/') ? sqlFamilyOf(base(first)) : null;
+}
+function mergeFeeds(a, b) {
+  const out = { ...a, unordered: a.unordered || b.unordered, unsure: a.unsure || b.unsure, mixed: a.mixed || b.mixed, interp: a.interp || b.interp, sql: a.sql || b.sql };
+  for (const k of ['files', 'groups', 'computed', 'raws', 'pat', 'unq', 'ops', 'rc', 'seqs', 'whole']) out[k] = [...(a[k] ?? []), ...(b[k] ?? [])];
+  return out;
+}
+
 export function scriptFeedsOf(cmd, line = cmd?.raw, resolve = null) {
-  const raw0 = cmd?.feeds;
+  let raw0 = cmd?.feeds;
+  let extra = [];
+  if (cmd?.headDyn && typeof resolve === 'function') {
+    // Why: a command named by a variable may be a shell reading its script from stdin; when its value is a database client it is modelled like the same client named
+    // directly (sql-clients.mjs): its stdin and files are SQL input, its options and text are judged, and anything outside the allowlist leaves it a possible shell.
+    const prog = resolve(cmd.argv?.[0] ?? '');
+    const fam = sqlFamilyValue(prog);
+    const plan = fam ? sqlClientPlan(fam, [...prog.trim().split(/\s+/).slice(1), ...cmd.argv.slice(1)], cmd.env ?? {}, resolve) : null;
+    if (plan?.modelled) {
+      if (cmd.headStdinSql) extra.push(...feedRecords(cmd, line, resolve, { ...cmd.headStdinSql, sql: fam }));
+      if (plan.lines.length) extra.push({ kind: 'sqllines', file: 'the SQL text', lines: plan.lines });
+      for (const f of plan.files) extra.push({ kind: 'sql', family: fam, file: f });
+      extra.push(...rcRecords(plan.rc, line));
+    } else {
+      if (cmd.headStdin && (plan || !isDataProgram(prog))) raw0 = raw0 ? mergeFeeds(raw0, cmd.headStdin) : cmd.headStdin;
+      if (plan && cmd.headStdinSql) extra.push(...feedRecords(cmd, line, resolve, { ...cmd.headStdinSql, sql: 'any' }));
+      if (plan) {
+        if (plan.lines.length) extra.push({ kind: 'sqllines', file: 'the SQL text', lines: plan.lines });
+        for (const f of plan.files) extra.push({ kind: 'sql', family: 'any', file: f });
+        extra.push(...rcRecords(plan.rc, line));
+      }
+    }
+  } else if (cmd?.headStdin) {
+    raw0 = raw0 ? mergeFeeds(raw0, cmd.headStdin) : cmd.headStdin;
+  }
+  return [...feedRecords(cmd, line, resolve, raw0), ...extra];
+}
+// The rc files a client reads before its input; a line that also names one (so may write it) leaves it unknown (a name only known at run time).
+function rcRecords(rc, line) {
+  return (rc ?? []).flatMap((r) => [{ kind: 'sql', family: r.family, file: r.file, rc: true, ...(r.glob ? { ambiguous: true, words: [r.file] } : {}) }, ...(SQL_RC_MENTION.test(String(line)) ? [{ kind: 'sql', family: r.family, file: '$SQL_RC_UNKNOWN', rc: true }] : [])]);
+}
+
+function feedRecords(cmd, line, resolve, raw0) {
   if (!raw0) return [];
+  return [...feedRecords1(cmd, line, resolve, raw0), ...rcRecords(raw0.rc, line)];
+}
+function feedRecords1(cmd, line, resolve, raw0) {
   const R = (w) => {
     if (typeof resolve !== 'function' || !w.includes('$')) return w;
     const e = resolve(w);
@@ -873,11 +1237,15 @@ export function scriptFeedsOf(cmd, line = cmd?.raw, resolve = null) {
   const rec = (kind) => (w) => (hasExpansion(w) ? { kind, file: w, ambiguous: true, words: [w] } : { kind, file: w });
   // a computed producer's word quoted in the command (`grep '^(A|B)=' F`, `sed 's/^/x/'`) never globs: with no `$` / backtick it is the literal name it spells
   const pat = new Set(f.pat);
-  const lit = (w) => (hasExpansion(w) && !pat.has(w) && !/[$`]/.test(w) ? { kind: 'scan', file: w } : rec('scan')(w));
+  // (`whole`: the file's text is the stream itself, split into words: one that cannot be read is refused like a script -- scannedSubs)
+  const whole = new Set((raw0.whole ?? []).map(R));
+  const lit0 = (w) => (hasExpansion(w) && !pat.has(w) && !/[$`]/.test(w) ? { kind: 'scan', file: w } : rec('scan')(w));
+  const lit = (w) => (whole.has(w) ? { ...lit0(w), whole: true } : lit0(w));
   const out = [...exact.map(rec('shell')), ...computed.map(lit)];
   const raws = [cmd.raw, ...f.raws].filter((r) => typeof r === 'string' && r);
   const refuse = { kind: 'shell', file: out[0]?.file ?? '', ambiguous: true, unresolvable: true, words: [] };
   if (out.length > MAX_FEED_FILES || raws.some((r) => hasPatternSyntax(r, line))) return [refuse];
+  if (raw0.mixed && (f.files.length || f.computed.length)) return [refuse]; // (static text and files in one stream that cannot be rebuilt: see producedBy / producePieces)
   // Several files feed ONE program: the shell reads their texts one after the other, so they are ALSO judged joined (a record with `joined`), in
   // command-line order, repeats included (`cat a b` with `git pu` in a and `sh origin main` in b); each file is still judged on its own. Only a
   // single reader names them in an order that can be rebuilt: feeds from several producers (or a word that expands) are refused. A rewriting
@@ -896,13 +1264,53 @@ export function scriptFeedsOf(cmd, line = cmd?.raw, resolve = null) {
   if (f.files.length >= 1 && f.computed.length >= 1) return [refuse];
   // a reader's operand that is itself a process substitution (`cat a <(tail -c 99 b) | bash`) is the text ANOTHER producer prints, not a file name
   if ([...f.files, ...f.computed].some(isProcSub)) return [refuse];
-  if (f.files.length >= 2) {
-    const g = f.groups;
-    if (g.length !== 1 || g[0].length !== f.files.length) return [refuse];
-    out.push({ kind: 'shell', file: g[0].join(' '), joined: [...g[0]] });
+  // Why: static text and files in one stream (`{ echo "begin;"; cat m.sql; cat <<'SQL' ... SQL } | psql`) are judged as the text they make, in the order they run:
+  // a record with `pieces` ({text} / {file}; a rewriting producer's words are {file} parts of a `scan` record). Refused when the order is not certain, a file
+  // part is not one exact name, or exact and rewritten parts meet (as for several files below).
+  const streams = (raw0.seqs ?? []).filter(hasTextPiece);
+  // (`covered`: the streams hold every file that feeds the program, so the joins below would only repeat them without the static text)
+  const inStreams = { files: [], scans: [] };
+  if (streams.length && (f.files.length || f.computed.length)) {
+    // (only a SQL client's stream is rebuilt, where just its shell escapes run: every such stream in 21 days fed psql. Text fed to a shell or an interpreter is
+    // the program itself, and static text in it is refused as before -- owner, Codex review 4 of #50; a stream of more parts than MAX_FEED_FILES too)
+    if (!raw0.sql || raw0.both || raw0.interp || raw0.unsure) return [refuse];
+    if (streams.some((seq) => seq.length > MAX_FEED_FILES)) return [refuse];
+    for (const seq of streams) {
+      const parts = seq.map((p) => (Object.hasOwn(p, 'text') ? p : Object.hasOwn(p, 'file') ? { file: R(p.file) } : { scan: R(p.scan) }));
+      const exactParts = parts.filter((p) => Object.hasOwn(p, 'file')).map((p) => p.file);
+      const scans = parts.filter((p) => Object.hasOwn(p, 'scan')).map((p) => p.scan);
+      if (!exactParts.length && !scans.length) continue;
+      if (exactParts.length && scans.length) return [refuse];
+      if (exactParts.length && raw0.unordered) return [refuse]; // (an exact stream cut short is another script; a scan of a rewritten one holds: see newSt)
+      inStreams.files.push(...exactParts);
+      inStreams.scans.push(...scans);
+      if (exactParts.some((w) => opaqueFile(w, true) || isProcSub(w))) return [refuse];
+      if (scans.some((w) => isProcSub(w) || (pat.has(w) && ops.has(w) && opaqueFile(w, unq.has(w))))) return [refuse];
+      if (exactParts.length) out.push({ kind: 'shell', file: exactParts.join(' '), joined: exactParts, pieces: parts });
+      else {
+        // (a rewriting producer's program words and words that expand are left out of the join, as below)
+        const kept = parts.filter((p) => !Object.hasOwn(p, 'scan') || !hasExpansion(p.scan)).map((p) => (Object.hasOwn(p, 'scan') ? { file: p.scan } : p));
+        const names = kept.filter((p) => Object.hasOwn(p, 'file')).map((p) => p.file);
+        if (names.length) out.push({ kind: 'scan', file: names.join(' '), joined: names, pieces: kept });
+      }
+    }
+  }
+  // (each side sorted once: sorting y again for every element was quadratic, 60,000 parts ran past the hook's 15 s limit -- Codex review 4)
+  const same = (x, y) => { if (x.length !== y.length) return false; const a = [...x].sort(); const b = [...y].sort(); return a.every((w, i) => w === b[i]); };
+  const covered = (inStreams.files.length || inStreams.scans.length) && same(inStreams.files, f.files) && same(inStreams.scans, f.computed);
+  if (f.files.length >= 2 && !covered) {
+    // Why: `{ cat a; cat b; } | bash`: the producers run one after the other, so the text is their files in the order the line names them (`cat a b`
+    // is the same program). Refused when a job in the background makes the order unknown, or a file operand cannot be tied to one producer.
+    const names = f.groups.flat();
+    if (names.length !== f.files.length || (f.groups.length > 1 && raw0.unordered)) return [refuse];
+    out.push({ kind: 'shell', file: names.join(' '), joined: names });
   }
   const words = f.computed.filter((w) => !hasExpansion(w));
-  if (words.length >= 2) out.push({ kind: 'scan', file: words.join(' '), joined: words });
+  if (words.length >= 2 && !covered) out.push({ kind: 'scan', file: words.join(' '), joined: words });
+  if (raw0.interp) for (const r of out) if (r.kind === 'shell') r.kind = 'interp';
+  if (raw0.sql) for (const r of out) if (r.kind === 'shell') { r.kind = 'sql'; r.family = raw0.sql; }
+  // a client outside the option allowlist may be a shell: its input is judged as a script too
+  if (raw0.both) out.push(...out.filter((r) => r.kind === 'sql').map((r) => ({ ...r, kind: 'shell', family: undefined })));
   return out;
 }
 
@@ -995,6 +1403,31 @@ const LONG_NAME_RE = /[^\s,)^|~#*?[\]<>'"`$;&(){}]+/y;
 const NO_STARTUP = new Set(['fish', 'csh', 'tcsh']);
 const VAR_DECLS = new Set(['export', 'declare', 'typeset', 'local', 'readonly']);
 
+// Why: `declare` / `typeset` / `local` attributes change the value a name holds: -l / -u lower / upper case it, zsh -L / -R / -Z pad or cut it to a width, -i
+// evaluates it as arithmetic, -n makes it a reference. `transform`: 'lower' | 'upper' (applied to an assigned value); `unknown`: a value that cannot be
+// worked out from the text. `bare`: names declared without a value (the attribute then applies to every later assignment, and to the current value).
+export function declAttrs(argv) {
+  const out = { transform: null, unknown: false, assigns: [], bare: [] };
+  let lower = false;
+  let upper = false;
+  let ended = false;
+  for (const a of argv.slice(1)) {
+    if (!ended && a === '--') { ended = true; continue; }
+    if (!ended && /^[-+][A-Za-z0-9]+$/.test(a)) {
+      if (a[0] === '-') for (const ch of a.slice(1)) { if (ch === 'l') lower = true; else if (ch === 'u') upper = true; else if ('LRZin'.includes(ch)) out.unknown = true; }
+      continue;
+    }
+    ended = true; // (options stop at the first name: `declare D=x -u` makes -u a bad name, D keeps its case)
+    const m = /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/.exec(a);
+    if (m) out.assigns.push([m[1], m[2]]);
+    else if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(a)) out.bare.push(a);
+  }
+  if (lower && upper) out.unknown = true;
+  else out.transform = lower ? 'lower' : upper ? 'upper' : null;
+  return out;
+}
+export const applyTransform = (value, transform) => (transform === 'lower' ? String(value).toLowerCase() : transform === 'upper' ? String(value).toUpperCase() : value);
+
 // The options before the operand: login / interactive flags (zsh), `unknown` when one expands, and the rc files bash is given.
 function startupOptions(argv, lit = new Set()) {
   const o = { login: false, interactive: false, unknown: false, rc: [] };
@@ -1046,6 +1479,34 @@ function startupValues(cmd, cmds, name, env, inherited) {
   return [...out];
 }
 
+// The shell a script run by path starts, from its first line: `#!/bin/bash -l` -> ['/bin/bash', '-l'], `#!/usr/bin/env -S bash -l` ->
+// ['bash', '-l'], `#!/bin/zsh` -> ['/bin/zsh']. Null when it is not a shebang or the program is not a shell. Strict: the kernel hands the
+// shell ONE argument, but every word after the program counts as an option, so a flag in any of them is seen.
+export function shebangShell(text) {
+  if (typeof text !== 'string' || !text.startsWith('#!')) return null;
+  const tokens = text.slice(2).split(/\r?\n/, 1)[0].trim().split(/\s+/).filter(Boolean);
+  let i = 0;
+  if (base(tokens[0] ?? '') === 'env') {
+    i = 1;
+    for (; i < tokens.length; i++) {
+      const t = tokens[i];
+      if (/^-[uC]$|^--(?:unset|chdir)$/.test(t)) i++; // options with a value
+      else if (/^-S./.test(t) && !t.startsWith('--')) { tokens[i] = t.slice(2); break; } // `-Sbash -l`
+      else if (!t.startsWith('-') && !ASSIGN_RE.test(t)) break;
+    }
+  }
+  const prog = tokens[i];
+  return prog !== undefined && SHELLS.has(base(prog)) ? [prog, ...tokens.slice(i + 1)] : null;
+}
+
+// The values PATH may have for `cmd` (words as written), where zsh looks up `=tool`: its own prefix replaces every other source, unless it
+// refers to `$PATH` (`PATH=bin:$PATH cmd`), which stands for them; those are every assignment on the line, what the policy knows and the hook's environment.
+export function pathValuesOf(cmd, cmds = [], { env = {}, inherited = () => [] } = {}) {
+  const own = cmd?.env && Object.hasOwn(cmd.env, 'PATH') && cmd.env.PATH !== '' ? cmd.env.PATH : undefined;
+  if (own !== undefined && !/\$\{?PATH\b/.test(own)) return [own];
+  return [...new Set([...(own === undefined ? [] : [own]), ...startupValues({ env: {} }, cmds, 'PATH', env, inherited)])];
+}
+
 // What the line assigns to the startup variables, for the scripts it runs in this shell (`BASH_ENV=f.sh; source outer.sh`): {NAME: [values]}.
 export function startupVarsOf(cmds, { env = {}, inherited = () => [] } = {}) {
   const out = {};
@@ -1065,11 +1526,14 @@ export function startupFilesOf(cmd, cmds = [], { env = {}, inherited = () => [],
   const shell = SHELLS.has(name) && !NO_STARTUP.has(name);
   if (!shell && !exec) return [];
   const out = [];
-  const add = (file, implicit = false) => {
+  // home: the file is the real home's (its directory is the environment's HOME): judged like the implicit one as far as programs the guard does not model go (see sourcedTexts)
+  const add = (file, implicit = false, home = false) => {
     if (file === '' || out.some((o) => o.file === file)) return;
     const rec = /[$`]/.test(file) ? { kind: 'shell', file, ambiguous: true, words: [file] } : { kind: 'shell', file };
+    if (home) rec.home = true;
     out.push(implicit ? { ...rec, implicit: true } : rec);
   };
+  const isHome = (d) => typeof env.HOME === 'string' && env.HOME !== '' && !/[$`~]/.test(d) && d.replace(/\/+$/, '') === env.HOME.replace(/\/+$/, '');
   const values = (n) => startupValues(cmd, cmds, n, env, inherited);
   for (const n of ['BASH_ENV', 'ENV']) for (const v of values(n)) add(v);
   const opts = shell ? startupOptions(argv, cmd.litWords) : { login: false, interactive: false, unknown: false, rc: [] };
@@ -1080,7 +1544,7 @@ export function startupFilesOf(cmd, cmds = [], { env = {}, inherited = () => [],
   const homes = ownHome === null ? [...values('HOME'), '~'] : [ownHome];
   if (exec) {
     // (the shebang is not read here: a zsh script run by path gets .zshenv from the ZDOTDIR / HOME the line names; the real home is not judged for it)
-    for (const d of [...values('ZDOTDIR'), ...homes.filter((h) => h !== '~')]) add(`${dirOf(d)}/.zshenv`);
+    for (const d of [...values('ZDOTDIR'), ...homes.filter((h) => h !== '~')]) add(`${dirOf(d)}/.zshenv`, false, isHome(d));
     return out;
   }
   if (name === 'zsh') {
@@ -1088,7 +1552,7 @@ export function startupFilesOf(cmd, cmds = [], { env = {}, inherited = () => [],
     if (opts.login || opts.unknown) zNames.push('.zprofile', '.zlogin', '.zlogout');
     if (opts.interactive || opts.unknown) zNames.push('.zshrc');
     const own = cmd.env && Object.hasOwn(cmd.env, 'ZDOTDIR') && cmd.env.ZDOTDIR !== '' ? [cmd.env.ZDOTDIR] : null;
-    for (const d of own ?? [...values('ZDOTDIR'), ...homes]) for (const z of zNames) add(`${dirOf(d)}/${z}`, d === '~' && !own);
+    for (const d of own ?? [...values('ZDOTDIR'), ...homes]) for (const z of zNames) add(`${dirOf(d)}/${z}`, d === '~' && !own, isHome(d));
     return out;
   }
   // bash and the POSIX shells: a login shell reads the profile files (bash the first of three: all are judged), an interactive one
@@ -1096,15 +1560,46 @@ export function startupFilesOf(cmd, cmds = [], { env = {}, inherited = () => [],
   const names = [];
   if (opts.login || opts.unknown) names.push('.bash_profile', '.bash_login', '.profile', '.bash_logout');
   if (opts.interactive || opts.unknown) names.push('.bashrc');
-  for (const h of homes) for (const n of names) add(`${dirOf(h)}/${n}`, h === '~');
+  for (const h of homes) for (const n of names) add(`${dirOf(h)}/${n}`, h === '~', isHome(h));
   return out;
 }
 
 // ---- the parser ---------------------------------------------------------------------------------
 
+// Does the `(` at s[i] open a zsh alternation `(a|b)`: a group with a `|` at some level, no blank, and no substitution, quote or operator inside?
+function zshAlternationAt(s, i) {
+  let depth = 0;
+  let bar = false;
+  for (let j = i; j < s.length; j++) {
+    const c = s[j];
+    if (c === '(') depth++;
+    else if (c === ')') { if (--depth === 0) return bar; }
+    else if (c === '|') bar = true;
+    else if (/[\s;&<>`$'"\\]/.test(c)) return false;
+  }
+  return false;
+}
+
+// Why: the stream rebuild (producePieces) takes echo / printf / cat for the shell's own; a line that can make a name run something else -- an alias, a builtin turned
+// off (enable -n, zsh disable), zsh's functions / aliases / builtins tables (`functions[echo]=:`, `read -A aliases`), autoload, a sourced or eval'd text, a trap --
+// switches the rebuild off for the whole line (as does any function it defines: ctx.fns). Codex review 4 of #50; the owner chose this over chasing each name.
+const REDEF_CMDS = new Set(['alias', 'unalias', 'enable', 'disable', 'functions', 'unfunction', 'unhash', 'autoload', 'source', '.', 'eval', 'emulate', 'zmodload', 'trap']);
+const REDEF_TABLE = /^(?:dis_)?(?:functions|functions_source|aliases|galiases|saliases|builtins|reswords)(?:\[|\+?=|$)/;
+function noteRedef(ctx, argv, env) {
+  if (!ctx.defs || ctx.defs.redef) return;
+  if (argv.length && REDEF_CMDS.has(base(argv[0]))) ctx.defs.redef = true;
+  else if (argv.some((w) => REDEF_TABLE.test(w)) || Object.keys(env ?? {}).some((k) => REDEF_TABLE.test(k))) ctx.defs.redef = true;
+}
+
 function emit(ctx, argv, env, raw, depth, redirects = [], sep = ';') {
+  noteRedef(ctx, argv, env);
   if (ctx.out.length >= MAX_COMMANDS) { ctx.truncated = true; ctx.stopped = true; return null; }
   const cmd = { argv, env, raw, depth, redirects };
+  // grp: the subshells (`$( )`, `( )`, backticks, `<( )`) it runs inside, outermost first, as ids: a cd in one is lost when it ends. Not enumerable
+  Object.defineProperty(cmd, 'grp', { value: ctx.grp, enumerable: false });
+  // ctl: it is in a loop (may run again after a later command), a function body or a trap action (runs when called / when the signal fires: maybe after any command),
+  // an if / case branch (cond: may not run; loops, function bodies and traps may not either). Not enumerable
+  Object.defineProperty(cmd, 'ctl', { value: ctlMarks(ctx.ctl), enumerable: false });
   // sep: the operator before it (; & && || |), for callers that care whether it surely runs; not enumerable, like `truncated`
   Object.defineProperty(cmd, 'sep', { value: sep, enumerable: false });
   ctx.out.push(cmd);
@@ -1124,6 +1619,10 @@ class Parser {
     this.subAcc = []; // segments run by substitutions inside the word being lexed
     this.lastDqDyn = false;
     this.cmd = null; // the command object interpret() is working on
+    this.comments = null; // [start, end] of each comment of this text, when asked for (see withoutComments)
+    this.ctlFrom = []; // ctx.out length when each open construct opened
+    this.ctlStack = []; // loops / function bodies / { groups open (see ctlOpen), for every nesting level of this text
+    this.ctlBase = 0; // where the current level's entries start
     ctx.work += src.length;
     if (ctx.work > MAX_WORK) { ctx.stopped = true; ctx.truncated = true; }
   }
@@ -1170,7 +1669,7 @@ class Parser {
     const start = this.i;
     const mark = this.log.length;
     this.i += 2;
-    this.nestParse(depth + 1, { stopAtParen: true, noRedir: s[start] === '$' && s[this.i] === '(' });
+    this.inGroup(() => this.nestParse(depth + 1, { stopAtParen: true, noRedir: s[start] === '$' && s[this.i] === '(' }));
     this.subAcc.push(...this.log.slice(mark));
     return s.slice(start, this.i);
   }
@@ -1189,7 +1688,7 @@ class Parser {
       body += c;
       this.i++;
     }
-    this.subAcc.push(...this.subParse(body, depth + 1));
+    this.subAcc.push(...this.inGroup(() => this.subParse(body, depth + 1)));
     return s.slice(start, this.i);
   }
 
@@ -1270,15 +1769,20 @@ class Parser {
         if (cmp === h.delim) { found = true; break; }
         lines.push(line);
       }
-      const text = lines.join('\n');
-      h.seg.heredocs.push({ text, quoted: h.quoted });
+      // Why: `<<-` strips the leading tabs of the body before the command reads it (`bash <<-'EOF'` + `\tgit pu\` + `\tsh origin main`: one push the tabs hid)
+      const text = (h.strip ? lines.map((l) => l.replace(/^\t+/, '')) : lines).join('\n');
+      h.seg.heredocs.push({ text, quoted: h.quoted, lines: lines.length });
       h.seg.pending--;
       if (h.seg.muted) continue;
-      // No terminator: either a malformed command or a `<<` we mistook for a heredoc that then swallowed the rest
-      // of the line. Parsing the body as script costs a false positive at worst, never a miss.
-      if (!found) this.subParse(text, h.seg.depth + 1);
-      // An unquoted heredoc still expands $(...) and backticks, so a body can run commands. Quoted ones are inert data.
-      else if (!h.quoted) this.scanExpansions(text, h.seg.depth);
+      const grp = this.ctx.grp;
+      this.ctx.grp = h.seg.grp; // (the body expands where its command runs: inside the subshells that command was written in)
+      try {
+        // No terminator: either a malformed command or a `<<` we mistook for a heredoc that then swallowed the rest
+        // of the line. Parsing the body as script costs a false positive at worst, never a miss.
+        if (!found) this.subParse(text, h.seg.depth + 1);
+        // An unquoted heredoc still expands $(...) and backticks, so a body can run commands. Quoted ones are inert data.
+        else if (!h.quoted) this.scanExpansions(text, h.seg.depth);
+      } finally { this.ctx.grp = grp; }
     }
     this.hd = [];
     this.i = pos;
@@ -1305,7 +1809,13 @@ class Parser {
     ctx.nest++;
     const saved = this.subAcc;
     this.subAcc = [];
-    try { this.lex(depth, stopAtParen, noRedir); } finally { ctx.nest--; this.subAcc = saved; }
+    const base = this.ctlBase;
+    this.ctlBase = this.ctlStack.length;
+    try { this.lex(depth, stopAtParen, noRedir); } finally {
+      ctx.nest--; this.subAcc = saved;
+      while (this.ctlStack.length > this.ctlBase) { const kind = this.ctlStack.pop(); this.ctlFrom.pop(); if (CTL_COUNTER[kind]) ctx.ctl[CTL_COUNTER[kind]]--; } // (left open: ends with the level)
+      this.ctlBase = base;
+    }
   }
 
   lex(depth, stopAtParen, noRedir) {
@@ -1332,13 +1842,17 @@ class Parser {
     let gCur = 0; // index in `cur` just after it
     let gGlob = false; // the word before the group holds a glob character
     let lastSep = ';';
+    // `case` statements open at this level: st 'subj' (its word comes next), 'in', 'pat' (patterns up to `)` come next: no commands),
+    // 'body' (an arm's commands, up to ;; ;& ;;& ;| or esac), 'end' (the esac word comes next). A stack: arms hold nested cases.
+    const cs = [];
+    let fnPending = false; // an empty `()` after names was just read: the next group is a function body
 
     const startSeg = () => {
       if (!inWord) wstart = this.i;
       if (!seg) {
         seg = {
-          words: [], heredocs: [], herestrings: [], redirects: [], stdinSubs: [], stdinFile: false, stdinFiles: [], meta: new Map(), win: new Map(),
-          start: this.i, depth, pending: 0, muted, raw: '', final: null, groupStage: null, pat: new Set(),
+          words: [], heredocs: [], herestrings: [], redirects: [], stdinSubs: [], stdinFile: false, stdinFiles: [], outSubs: [], fdFeeds: [], vf: ctx.varFeeds, fns: ctx.fns, defs: ctx.defs, cmd: null, meta: new Map(), win: new Map(),
+          start: this.i, depth, pending: 0, muted, raw: '', final: null, groupStage: null, pat: new Set(), grp: ctx.grp, ctl: ctlMarks(ctx.ctl),
           pipedFrom: lastSep === '|' ? this.lastStage : null, sep: lastSep,
         };
       }
@@ -1369,6 +1883,19 @@ class Parser {
         // >&2 / 2>&1 duplicate a descriptor: the target is recorded as &2 / &1 so it is not mistaken for a file name
         const dup = (rop === '>&' || rop === '<&') && /^(?:[0-9]+|-)$/.test(text);
         seg.redirects.push({ op: rop, target: dup ? '&' + text : text, fd: rfd });
+        if (subs.length && text.startsWith('>(')) seg.outSubs.push(subs); // `cat f > >(bash)`: the substitution's commands read what this command writes
+        // Why: `exec 3< f.sh; bash <&3`: a descriptor opened from a file earlier on the line (or a `{fd}<` named one) is read by the shell that gets it as stdin
+        if ((rop === '<' || rop === '<>') && ((rfd !== null && rfd !== 0) || (rfd === null && /^\{[A-Za-z_]\w*\}$/.test(seg.words[seg.words.length - 1]?.text ?? '')))) {
+          const e = newSt();
+          if (subs.length && isProcSub(text)) subsProduced(subs, e, 1); else if (text !== '/dev/null') { e.files.push(text); e.groups.push([text]); }
+          const prev = this.ctx.fdFeeds.get(rfd ?? '{}');
+          this.ctx.fdFeeds.set(rfd ?? '{}', prev ? mergeSt(prev, e) : e);
+        }
+        if (rop === '<&' && (rfd === null || rfd === 0)) {
+          const es = /^[0-9]+$/.test(text) ? [this.ctx.fdFeeds.get(Number(text))] : [...this.ctx.fdFeeds.values()];
+          seg.stdinFile = true; // (a descriptor's contents are never known from this command alone: the dynamic rules apply)
+          for (const e of [...es, this.ctx.fdFeeds.get('{}')]) if (e) { seg.stdinFiles.push(...e.files); seg.fdFeeds.push(e); }
+        }
         if (rop === '<') {
           if (subs.length && isProcSub(text)) seg.stdinSubs.push(...subs);
           else seg.stdinFile = true;
@@ -1395,8 +1922,40 @@ class Parser {
       }
       if (seg.words.length === 0 && q < 0) {
         if (text === '{') this.braceStack.push(this.log.length);
-        else if (text === '}' && this.braceStack.length) seg.groupStage = this.log.slice(this.braceStack.pop());
+        else if (text === '}' && this.braceStack.length) seg.groupStage = this.log.slice(this.braceStack.pop()).filter((x) => x.depth === depth); // (see the ( ) group)
       }
+      const top = cs[cs.length - 1];
+      const cmdPos = seg.kwOnly !== false; // every word before this one is an unquoted keyword or `{` (kept as it goes: a rescan per word is quadratic)
+      // (`time` and its options before a compound command: `time if ...; fi` -- review of #50)
+      const timeOpt = seg.timePrefix === true && /^(?:-[A-Za-z]+|--)$/.test(text);
+      seg.kwOnly = cmdPos && q < 0 && (KEYWORDS.has(text) || text === '{' || text === 'time' || timeOpt);
+      seg.timePrefix = cmdPos && q < 0 && (text === 'time' || timeOpt);
+      if (top?.st === 'subj') top.st = 'in';
+      else if (top?.st === 'in') { if (q < 0 && text === 'in') top.st = 'pat'; else { cs.pop(); this.ctlClose(['case']); } } // `case x {` (zsh) and the like: patterns read as commands (strict)
+      else if (q < 0 && cmdPos && text === 'esac' && (top?.st === 'body' || top?.st === 'end')) { cs.pop(); seg.closesFrom = this.ctlClose(['case']); }
+      else if (q < 0 && cmdPos && text === 'esac') ctx.ctlBroken = true; // (an esac with no case we opened: a prefix we do not model hid it)
+      else if (q < 0 && cmdPos && text === 'case') { cs.push({ st: 'subj' }); this.ctlOpen('case'); seg.ctl = { ...seg.ctl, cond: true }; }
+      // loops, if / case branches and function bodies (see emit: ctl): `while`/`for`/... open a loop (its own words loop too), `done` closes one; `if`/`fi`, `case`/`esac` likewise; a `{` after `f()` (or
+      // `function f`) opens a function body, any other command-position `{` a plain group; `}` closes the last of those
+      // (`function NAME` -- after keywords or `time`, its `{` on this line or the next: every word up to the `{` / `(` is a name the text defines)
+      let fnName = false;
+      if (q < 0 && cmdPos && text === 'function') seg.fnActive = true;
+      else if (seg.fnActive && text !== '{') { fnName = true; ctx.fns.add(text); seg.fnHasName = true; }
+      const fnKw = text === '{' && seg.fnActive === true && seg.fnHasName === true;
+      if (q < 0 && cmdPos && LOOP_WORDS.has(text)) { this.ctlOpen('loop'); seg.ctl = { ...seg.ctl, loop: true }; }
+      else if (q < 0 && cmdPos && text === 'if') { this.ctlOpen('if'); seg.ctl = { ...seg.ctl, cond: true }; }
+      else if (q < 0 && cmdPos && text === 'fi') seg.closesFrom = this.ctlClose(['if']);
+      else if (q < 0 && cmdPos && text === 'done') seg.closesFrom = this.ctlClose(['loop']);
+      else if (q < 0 && cmdPos && text === '}') seg.closesFrom = this.ctlClose(['fn', 'brace', 'cbrace']);
+      else if (q < 0 && (cmdPos || fnKw) && text === '{') {
+        // (a plain group after && / || runs only when that holds, and one that is a pipeline stage runs in a subshell: its commands may not run here -- review of #50)
+        const kind = fnPending || fnKw ? 'fn' : ['&&', '||', '|'].includes(seg.sep) ? 'cbrace' : 'brace';
+        this.ctlOpen(kind);
+        if (kind === 'fn') seg.ctl = { ...seg.ctl, fn: true }; // (the body's first command is in this segment: `{ echo x > f; }`)
+        if (kind === 'cbrace') seg.ctl = { ...seg.ctl, cond: true };
+      }
+      if (text === '{' || text === '(') seg.fnActive = false;
+      fnPending = fnName && seg.fnActive === true; // (a name of `function NAME` ending the line: its body may open on the next)
       seg.words.push({ text, qa: q, bm: marks, dyn, subs, win, pat });
     };
     const endSeg = (idx) => {
@@ -1412,6 +1971,16 @@ class Parser {
     };
 
     while (this.i < n && !ctx.stopped) {
+      if (cs.length && cs[cs.length - 1].st === 'pat' && !inWord && lit === 0) {
+        endSeg(this.i);
+        lastSep = ';';
+        const top = cs[cs.length - 1];
+        this.caseGap();
+        if (/^esac(?=$|[\s;&|()<>])/.test(s.slice(this.i, this.i + 5))) top.st = 'end'; // (the word itself is lexed as usual)
+        else if (this.casePattern(depth)) top.st = 'body';
+        else { cs.pop(); this.ctlClose(['case']); } // a pattern no shell accepts: what follows is read as commands, as before
+        continue;
+      }
       const c = s[this.i];
       if (lit > 0 && (isSpace(c) || c === '\n')) { cur += ' '; this.i++; continue; }
       if (lit > 0 && (c === '(' || c === ')')) {
@@ -1431,7 +2000,9 @@ class Parser {
         this.i++;
         if (this.hd.length) this.readHeredocs();
       } else if (c === '#' && !inWord) {
+        const from = this.i;
         while (this.i < n && s[this.i] !== '\n') this.i++;
+        if (this.comments) this.comments.push([from, this.i]);
       } else if (c === '\\') {
         const nx = s[this.i + 1];
         if (nx === '\n') this.i += 2;
@@ -1450,12 +2021,14 @@ class Parser {
         takeSubs();
       } else if (c === '`') {
         startSeg(); inWord = true; wdyn = true;
+        const n0 = this.subAcc.length;
         cur += this.backtick(depth);
+        for (const x of this.subAcc.slice(n0)) x.split = true; // (unquoted: what it prints is split into words, see scannedSubs)
         takeSubs();
       } else if (c === '$') {
         startSeg();
         const nx = s[this.i + 1];
-        if (nx === '(') { inWord = true; wdyn = true; cur += this.substitution(depth); takeSubs(); }
+        if (nx === '(') { inWord = true; wdyn = true; const n0 = this.subAcc.length; cur += this.substitution(depth); for (const x of this.subAcc.slice(n0)) x.split = true; takeSubs(); }
         else if (nx === "'") { mark(); const r = readAnsiC(s, this.i + 1); cur += r.text; this.i = r.next; }
         else if (nx === '"') { mark(); this.i += 2; cur += this.readDq(depth); if (this.lastDqDyn) wdyn = true; takeSubs(); }
         else if (nx === '{' && this.paramSpan(this.i) > 0) {
@@ -1493,18 +2066,28 @@ class Parser {
       } else if (c === ';') {
         endSeg(this.i);
         lastSep = ';';
-        this.i++;
+        const top = cs[cs.length - 1];
+        const nx = s[this.i + 1];
+        if (top?.st === 'body' && (nx === ';' || nx === '&' || nx === '|')) {
+          // ;; ;& ;;& (bash) ;| (zsh) end an arm: patterns come next
+          this.i += nx === ';' && s[this.i + 2] === '&' ? 3 : 2;
+          top.st = 'pat';
+        } else this.i++;
       } else if (c === '&') {
         const nx = s[this.i + 1];
         if (nx === '&') { endSeg(this.i); lastSep = '&&'; this.i += 2; }
+        else if (nx !== '>' || noRedir) { flushWord(); const closed = seg?.closesFrom; endSeg(this.i); this.markClosedOut(closed); lastSep = '&'; this.i++; } // a background job: the command before it ran in a subshell
         else if (nx === '>' && !noRedir) {
           flushWord(); startSeg();
           redir = 'file'; rfd = null;
           if (s[this.i + 2] === '>') { rop = '&>>'; this.i += 3; } else { rop = '&>'; this.i += 2; }
-        } else { endSeg(this.i); lastSep = '&'; this.i++; } // a background job: the command before it ran in a subshell
+        }
       } else if (c === '|') {
         const nx = s[this.i + 1];
+        flushWord(); // (`}|cat`: the closing word first)
+        const closed = seg?.closesFrom;
         endSeg(this.i);
+        if (nx !== '|') this.markClosedOut(closed);
         if (nx === '|') { lastSep = '||'; this.i += 2; }
         else if (nx === '&') { lastSep = '|'; this.i += 2; }
         else { lastSep = '|'; this.i++; }
@@ -1539,19 +2122,38 @@ class Parser {
         cur += this.substitution(depth);
         takeSubs();
       } else if (c === '(') {
-        if (inWord && /^[A-Za-z_][A-Za-z0-9_]*\+?=$/.test(cur) && (qa < 0 || qa >= cur.length)) {
+        if (!inWord && seg && seg.words.length > 0 && !seg.words.some((w) => w.qa < 0 && ['case', 'select'].includes(w.text)) && !seg.words.every((w) => LEAD_WORDS.has(w.text.toLowerCase())) && zshAlternationAt(s, this.i)) {
+          // zsh `bash (f|x).sh`: after a command's words a `(` opens a glob group (an alternation), not a subshell (bash: a syntax error)
+          startSeg(); inWord = true;
+          lit = 1; litGlob = true; wpat = true; gGlob = false; cur += '('; this.i++; gRaw = this.i; gCur = cur.length;
+        } else if (inWord && /^[A-Za-z_][A-Za-z0-9_]*\+?=$/.test(cur) && (qa < 0 || qa >= cur.length)) {
           lit = 1; litGlob = false; cur += '('; this.i++; // NAME=(a b) array literal, not a subshell
         } else if (inWord && s[this.i + 1] !== ')' && !(seg && seg.words.length === 0 && qa < 0 && LEAD_WORDS.has(cur.toLowerCase()))) {
           // `*(e:'cmd':)`, `foo(+f)`, `*.(jpg|png)`: a glob group glued to a word is part of the word (and `f()` is a function definition)
           lit = 1; litGlob = true; wpat = true; gGlob = /[*?[]/.test(cur); cur += '('; this.i++; gRaw = this.i; gCur = cur.length;
         } else {
+          flushWord();
+          // `f ()`, `f()`, zsh `f g ()`, `function f ()`: the words before an empty `()` are names of functions, and the next `{ }` or `( )` is their body
+          const head = /^\(\s*\)/.test(s.slice(this.i, this.i + 64)) && seg ? seg.words.filter((w, k) => !(k === 0 && w.qa < 0 && w.text === 'function')).map((w) => w.text) : null;
+          const body = fnPending; // (this group is the body of the function named just before it)
+          // (a subshell after && / || runs only when that holds, and one that is a pipeline stage runs apart: its commands may not run, as for a { } group (cbrace).
+          // `{ cat a; true || (cat x); cat c; } | bash` runs a+c, which the join a+x+c hid)
+          const cond = !body && !(seg && seg.words.length) && ['&&', '||', '|'].includes(lastSep);
           endSeg(this.i);
           lastSep = ';';
           this.i++;
-          if (depth === 0) this.ctx.subshell = true; // ((...)) arithmetic too: conservative
+          if (depth === 0) this.ctx.subshell = true; // ((...)) arithmetic too: conservative (and the `()` of `f()`: flowStart reads it as "from here on, maybe later")
           const mark0 = this.log.length;
-          this.nestParse(depth, { stopAtParen: true, noRedir: noRedir || s[this.i] === '(' }); // ((...)) is arithmetic
-          this.lastStage = this.log.slice(mark0);
+          if (body) this.ctx.ctl.fn++;
+          if (cond) this.ctx.ctl.cond++;
+          try {
+            this.inGroup(() => this.nestParse(depth, { stopAtParen: true, noRedir: noRedir || s[this.i] === '(' })); // ((...)) is arithmetic
+          } finally { if (body) this.ctx.ctl.fn--; if (cond) this.ctx.ctl.cond--; }
+          fnPending = false;
+          if (head?.length) { for (const name of head) ctx.fns.add(name); fnPending = true; }
+          // Why: the group's own commands print into the pipe; a substitution's body (`{ X=$(cat x); cat a; cat b; } | bash`, one level deeper) prints into its word, not the
+          // stream, so it is no part of it (x's text in front of a+b hid a guarded line in the join)
+          this.lastStage = this.log.slice(mark0).filter((x) => x.depth === depth);
         }
       } else if (c === ')') {
         endSeg(this.i);
@@ -1599,10 +2201,73 @@ class Parser {
     }
   }
 
+  // Blanks, newlines (with the heredoc bodies they start), line continuations and comments before a `case` arm's patterns.
+  caseGap() {
+    const s = this.src;
+    const n = s.length;
+    while (this.i < n) {
+      const c = s[this.i];
+      if (isSpace(c)) this.i++;
+      else if (c === '\n') { this.i++; if (this.hd.length) this.readHeredocs(); }
+      else if (c === '\\' && s[this.i + 1] === '\n') this.i += 2;
+      else if (c === '#') { while (this.i < n && s[this.i] !== '\n') this.i++; }
+      else break;
+    }
+  }
+
+  // Reads one `case` arm's patterns (`a|b)`, `(a)`, `"$r"/*)`) through the closing `)`: true when it did. Patterns are no commands, but the
+  // substitutions in them run (parsed as commands here), and the body of a group (`@(a|b)`, `x(e:...:)`, zsh `=(...)`) is also judged like a glob
+  // qualifier: nothing between parentheses is dropped. False, with this.i back where it was, for text no shell takes as a pattern list (two words
+  // without a `|`, ; & < > or a newline before the `)`, the end of the text): the caller then reads it as commands, as before (strict).
+  // Every scan is charged to the work budget: a failed scan is lexed again, and nested failures must not multiply unseen.
+  casePattern(depth) {
+    const ctx = this.ctx;
+    const s = this.src;
+    const n = s.length;
+    const start = this.i;
+    let i = start;
+    const done = (ok) => {
+      ctx.work += Math.max(i - start, 1);
+      if (ctx.work > MAX_WORK) { ctx.stopped = true; ctx.truncated = true; }
+      this.subAcc.length = 0;
+      this.i = ok ? i : start;
+      return ok;
+    };
+    if (s[i] === '(') i++;
+    let d = 0;
+    let word = false; // the current alternative has begun
+    let gap = false; // a blank ended it: only | or ) may follow
+    let gOpen = 0;
+    while (i < n) {
+      if (ctx.stopped || ((i & 1023) === 0 && ctx.expired?.())) { ctx.stopped = true; ctx.truncated = true; return done(false); }
+      const c = s[i];
+      if (d === 0 && isSpace(c)) { gap = word; i++; continue; }
+      if (d === 0 && c === ')') { i++; return done(true); }
+      if (d === 0 && c === '|') { word = false; gap = false; i++; continue; }
+      if (gap || c === '\n' || c === ';' || c === '&' || c === '<' || c === '>') return done(false);
+      word = true;
+      if (c === '\\') i += 2;
+      else if (c === "'") { const j = s.indexOf("'", i + 1); i = j < 0 ? n : j + 1; }
+      else if (c === '"' || (c === '$' && s[i + 1] === '"')) { this.i = i + (c === '$' ? 2 : 1); this.readDq(depth); i = this.i; }
+      else if (c === '$' && s[i + 1] === '(') { this.i = i; this.substitution(depth); i = this.i; }
+      else if (c === '`') { this.i = i; this.backtick(depth); i = this.i; }
+      else if (c === '$' && s[i + 1] === "'") i = readAnsiC(s, i + 1).next;
+      else if (c === '$' && s[i + 1] === '{' && this.paramSpan(i) > 0) i = this.paramSpan(i);
+      else if (c === '(') { if (d++ === 0) gOpen = i + 1; i++; }
+      else if (c === ')') { if (--d === 0) this.qualifierCode(s.slice(gOpen, i), s.slice(gOpen, i), depth, false); i++; }
+      else i++;
+    }
+    return done(false);
+  }
+
   // Interprets one finished simple command: strip keywords/assignments/wrappers, emit it, recurse into interpreters.
   finalize(seg) {
     if (seg.muted) return;
     this.log.push(seg);
+    const grp = this.ctx.grp;
+    const ctl = this.ctx.ctl;
+    this.ctx.ctl = { loop: +seg.ctl.loop, fn: +seg.ctl.fn, trap: +seg.ctl.trap, cond: +seg.ctl.cond };
+    this.ctx.grp = seg.grp; // (what it runs, `bash -c` text included, is in the subshells it was written in, wherever the queue finishes it)
     try {
       this.finalizeSeg(seg);
     } catch {
@@ -1610,7 +2275,41 @@ class Parser {
       this.ctx.truncated = true;
       const argv = seg.words.map((w) => w.text);
       if (argv.length) emit(this.ctx, argv, {}, seg.raw, seg.depth, [...seg.redirects]);
+    } finally { this.ctx.grp = grp; this.ctx.ctl = ctl; }
+  }
+
+  // A loop / function body / plain `{` group opens at this nesting level (closed by ctlClose, or when the level ends: see parseList).
+  ctlOpen(kind) {
+    this.ctlStack.push(kind);
+    this.ctlFrom.push(this.ctx.out.length);
+    if (CTL_COUNTER[kind]) this.ctx.ctl[CTL_COUNTER[kind]]++;
+  }
+
+  // Closes the last open construct of one of `kinds` at this level, and whatever was opened after it; nothing when there is none.
+  ctlClose(kinds) {
+    for (let k = this.ctlStack.length - 1; k >= this.ctlBase; k--) {
+      if (!kinds.includes(this.ctlStack[k])) continue;
+      const from = this.ctlFrom[k];
+      while (this.ctlStack.length > k) { const kind = this.ctlStack.pop(); this.ctlFrom.pop(); if (CTL_COUNTER[kind]) this.ctx.ctl[CTL_COUNTER[kind]]--; }
+      return from;
     }
+    this.ctx.ctlBroken = true; // (a closer with no opener we saw: a prefix we do not model hid it (`nocorrect if ...`), so the marks are not to be trusted)
+    return undefined;
+  }
+
+  // The commands of a construct that closed right before `|` or a background `&` ran in a subshell: they may not run in this shell (marked cond). Commands still
+  // waiting for a heredoc are not out yet: the marks are then not to be trusted.
+  markClosedOut(from) {
+    if (from === undefined) return;
+    if (this.queue.length) this.ctx.ctlBroken = true;
+    for (const c of this.ctx.out.slice(from)) c.ctl.cond = true;
+  }
+
+  // Runs fn with one more subshell open (see emit: grp).
+  inGroup(fn) {
+    const saved = this.ctx.grp;
+    this.ctx.grp = [...saved, ++this.ctx.grpN];
+    try { return fn(); } finally { this.ctx.grp = saved; }
   }
 
   finalizeSeg(seg) {
@@ -1638,6 +2337,7 @@ class Parser {
     seg.final = { argv: [] };
     let last = null;
     for (const g of groups) last = this.finalizeGroup(g, seg) ?? last;
+    if (seg.outSubs.length || seg.words.some((w) => w.subs.length && w.text.includes('>('))) this.feedOutSubs(seg);
     // Redirections belong to the command they were written on; a redirect with no command of its own
     // (`> file`, `{ a; } > file`, `(a) > file`) still has to reach the caller.
     if (last) last.redirects = [...seg.redirects];
@@ -1670,6 +2370,12 @@ class Parser {
       if (!a) break;
       setEnv(env, a[0], a[1]);
     }
+    for (let k = 0; k < words.length; k++) {
+      // (the prefix assignments of a command are only in that command's environment, but `X=$(cat f) cmd` alone, `export X=$(cat f)` and `declare X=...` stay)
+      if (k >= i && !(k > i && ['export', 'declare', 'typeset', 'local', 'readonly'].includes(words[i].text))) continue;
+      const a = assignOf(words[k]);
+      if (a && words[k].subs.length && (i >= words.length || k > i)) noteVarFeeds(this.ctx, a[0], words[k].subs);
+    }
     if (i >= words.length) return Object.keys(env).length ? emit(this.ctx, [], env, seg.raw, seg.depth, [], seg.sep) : null;
     // brace expansion: {a,b} in an unquoted word becomes several words (assignment words before the command are exempt)
     const argv = [];
@@ -1697,44 +2403,170 @@ class Parser {
 
   process(argv, env, seg, isExec) {
     let a = this.winFix(argv, seg);
+    let fan = null; // the xargs / parallel that built this command from stdin text
     for (let guard = 0; guard < 32 && a.length; guard++) {
       const un = unwrap(a);
       if (!un) break;
+      if (!fan && (base(a[0]) === 'xargs' || base(a[0]) === 'parallel')) fan = a;
       for (const k of Object.keys(un.env)) setEnv(env, k, un.env[k]);
       a = this.winFix(un.argv, seg);
+    }
+    // Why: bash sets $BASH to its own path (zsh leaves it unset), so `"${BASH:-bash}" f.sh` runs f.sh with bash: read as bash, unless the text (or the environment) can bind
+    // the name. Every other spelling (`$BASH f.sh` vanishes under zsh and runs f.sh itself) keeps its run-time head AND adds the bash / sh readings, so it is judged as strictly as either
+    let bashAlso = null;
+    if (a.length && BASH_WORD.test(a[0])) {
+      if (this.ctx.bashPlain && BASH_DEFAULT.test(a[0])) { a = ['bash', ...a.slice(1)]; if (this.ctx.bashState) this.ctx.bashState.rewrote = true; }
+      else bashAlso = a.slice(1);
     }
     // a command name that is only known at run time ($g push, $(echo git) push)
     const headDyn = a.length > 0 && (a[0].startsWith('$') || a[0].includes('$(') || a[0].includes('`'));
     if (headDyn) this.ctx.dynamic = true;
     const cmd = emit(this.ctx, a, env, seg.raw, seg.depth, [], seg.sep);
+    if (bashAlso) for (const sh of ['bash', 'sh']) emit(this.ctx, [sh, ...bashAlso], env, seg.raw, seg.depth, [], seg.sep);
     if (cmd) Object.defineProperty(cmd, 'litWords', { value: new Set(a.filter((w) => !seg.meta.get(w)?.dyn && !seg.pat.has(w))), enumerable: false });
-    if (!isExec) seg.final = { argv: a };
+    if (!isExec) { seg.final = { argv: a }; seg.cmd = cmd; }
+    // what the command prints and what it reads on stdin, for callers that ask which text a write of its output holds (see line-writes.mjs); lazy, most commands never need it
+    if (cmd && !isExec) Object.defineProperty(cmd, 'streams', { value: () => streamsOf(seg, a), enumerable: false });
+    if (fan && cmd && !isExec) this.fanOut(seg, fan, a, cmd);
     if (headDyn && cmd) {
+      Object.defineProperty(cmd, 'headDyn', { value: true, enumerable: false });
+      const hv = newSt();
+      varFeedsInto(seg, a[0], hv); // `X=$(cat f.sh); $X`
+      if (hv.dyn) this.ctx.dynamic = true;
+      addFeeds(cmd, hv);
       // `$X < f.sh`, `cat f.sh | $X`: the program may be a shell reading its script from stdin
       const saved = this.cmd;
       this.cmd = cmd;
       try {
         // the files it reads, as a scan (refused only when they hold a guarded word: `$PSQL < q.sql` is data, `X="sh -s"; $X < f.sh` is a script); heredoc text is not judged here
-        const st = stdinSource(seg).st;
+        const src0 = stdinSource(seg);
+        const st = src0.st;
+        // (a heredoc / here-string / pipe text: a shell escape in it is a command of this line, in case the name is a database client)
+        for (const text of src0.texts) { const e = sqlShellEscapes(text); if (e.length) this.subParse(e.join('\n'), seg.depth + 1); }
+        const sqlSt = { ...st, files: [...st.files], groups: st.groups.map((g) => [...g]), computed: [...st.computed] };
         st.computed.push(...st.files);
         st.files.length = 0;
         st.groups.length = 0;
-        addFeeds(cmd, st);
+        // Why: kept apart from the other feeds so a caller that knows the command name is a data program (`$PSQL < q.sql`) can leave it out (scriptFeedsOf)
+        const held = {};
+        addFeeds(held, st);
+        if (held.feeds) Object.defineProperty(cmd, 'headStdin', { value: held.feeds, enumerable: false });
+        const heldSql = {};
+        addFeeds(heldSql, sqlSt, 'any');
+        Object.defineProperty(cmd, 'headDyn', { value: true, enumerable: false });
+        if (heldSql.feeds) Object.defineProperty(cmd, 'headStdinSql', { value: heldSql.feeds, enumerable: false });
       } finally { this.cmd = saved; }
       // `$(cat f.sh)` as the command: the shell runs whatever the substitution prints
       const m = seg.meta.get(a[0]);
       const st = newSt();
-      if (m) subsProduced(m.subs, st, 1);
+      if (m) { subsProduced(m.subs, st, 1); scannedSubs(st); }
       addFeeds(cmd, st);
     }
     this.interpret(a, seg, cmd);
     return cmd;
   }
 
+  // Why: `xargs -I{} sh -c '{}' < f.sh`, `xargs bash -c < f.sh`, `cat f.sh | xargs -0 sh -c`: xargs puts the text it reads into the command line of the shell, as the
+  // script it runs (no operand after -c: the first word it reads; the replacement string among the script words: each line). Quote handling
+  // and splitting change the text, so the files are scanned. `fan`: the xargs / parallel words, `argv`: the command it starts.
+  fanOut(seg, fan, argv, cmd) {
+    if (!SHELLS.has(base(argv[0]))) return;
+    const r = shellInvocation(argv);
+    const repl = new Set(['{}']);
+    let argFile = null;
+    for (let k = 1; k < fan.length; k++) {
+      const t = fan[k];
+      if ((t === '-I' || t === '-J') && fan[k + 1] !== undefined) repl.add(fan[k + 1]);
+      else if (/^-[IJ]./.test(t) || /^--replace=./.test(t)) repl.add(t.startsWith('--') ? t.slice(10) : t.slice(2));
+      else if (/^-i./.test(t)) repl.add(t.slice(2));
+      if (t === '-a' || t === '--arg-file') argFile = fan[k + 1] ?? null;
+      else if (/^-a./.test(t) && t[1] !== '-') argFile = t.slice(2);
+      else if (t.startsWith('--arg-file=')) argFile = t.slice(11);
+    }
+    const parallel = base(fan[0]) === 'parallel';
+    const fed = r.kind === 'none' || (r.kind === 'script' && (parallel ? /\{[^}]*\}/.test(r.text) : [...repl].some((x) => r.text.includes(x))));
+    if (!fed) return;
+    const src = stdinSource(seg);
+    const st = src.st;
+    for (const text of src.texts) this.subParse(text, seg.depth + 1);
+    st.computed.push(...st.files);
+    st.files.length = 0;
+    st.groups.length = 0;
+    if (argFile !== null) { st.computed.push(argFile); st.pat.add(argFile); st.ops.add(argFile); st.raws.push(seg.raw); }
+    if (st.dyn || (src.unknown && !st.computed.length)) this.ctx.dynamic = true;
+    addFeeds(cmd, st);
+  }
+
+  // Why: `tee >(bash) < f.sh`, `cat f.sh | tee >(bash)`, `cat f.sh > >(bash)`: the commands of an output process substitution read the stream of the command it is an
+  // operand of (what that command reads on stdin, and what it prints). A shell among them gets those files as its script text, in every
+  // position of the substitution's own pipeline (the stream is not rebuilt through its other stages).
+  feedOutSubs(seg) {
+    const subs = [...seg.outSubs.flat()];
+    for (const w of seg.words) if (w.subs.length && w.text.includes('>(')) subs.push(...w.subs);
+    const targets = subs.filter((x) => x.cmd?.stdinShell);
+    if (!targets.length || !seg.final) return;
+    const view = { ...seg, final: { argv: seg.final.argv } };
+    const src = stdinSource(view);
+    const out = newSt();
+    if (base(seg.final.argv[0] ?? '') !== 'tee') producedBy(view, out); // (tee copies its stdin; its operands are the files it writes)
+    const merged = mergeSt(src.st, out);
+    // (a file operand of a producer is also its stdin file: once is enough, and an exact file is not also scanned)
+    merged.computed = [...new Set(merged.computed)].filter((w) => !w.startsWith('>(') && !merged.files.includes(w));
+    for (const t of targets) {
+      if (merged.dyn || (src.unknown && !merged.files.length && !merged.computed.length)) this.ctx.dynamic = true;
+      addFeeds(t.cmd, merged, t.cmd.sqlStdin || !!t.cmd.interpStdin);
+    }
+  }
+
+  // `node < f.mjs`, `cat f.sh | python3`: an interpreter with no script operand reads its program from stdin
+  runInterpStdin(seg) {
+    const src = stdinSource(seg);
+    markStdin(this.cmd, true);
+    if (src.st.dyn || (src.unknown && !src.st.files.length && !src.st.computed.length)) this.ctx.dynamic = true;
+    addFeeds(this.cmd, src.st, true);
+  }
+
+  // `psql < q.sql`, `cat q.sql | sqlite3 db`, `mysql -e '\! cmd'`, `psql -f q.sql`: the shell commands, writes and includes in the text a database client reads run like a script
+  // line (sql-clients.mjs holds the model, shared with a client named by a variable). The files it reads are judged for those only; a text only known at run time
+  // (`pg_dump | psql`) is a dynamic feed, refused with guarded text around. Outside the option allowlist the client may be anything: its stdin is a script.
+  runSql(seg, argv, depth) {
+    const fam = sqlFamilyOf(base(argv[0]));
+    const plan = sqlClientPlan(fam, argv.slice(1), this.cmd?.env ?? {});
+    const src = stdinSource(seg);
+    markStdin(this.cmd, false, plan.modelled ? fam : false);
+    for (const text of src.texts) {
+      if (!plan.modelled) this.subParse(text, depth);
+      const e = sqlShellEscapes(text, { family: plan.modelled ? fam : 'any' });
+      if (e.length) this.subParse(e.join('\n'), depth);
+    }
+    if (plan.lines.length) this.subParse(plan.lines.join('\n'), depth);
+    const st = src.st;
+    for (const f of plan.files) { st.files.push(f); st.groups.push([f]); }
+    if (st.dyn || (src.unknown && !st.files.length && !st.computed.length)) this.ctx.dynamic = true;
+    addFeeds(this.cmd, st, plan.modelled ? fam : 'any');
+    if (!plan.modelled && this.cmd?.feeds) this.cmd.feeds.both = true;
+    // (the rc files it reads first: recorded even with no input at all)
+    if (plan.rc.length && this.cmd) {
+      if (!this.cmd.feeds) addFeeds(this.cmd, { ...newSt(), rcOnly: true }, plan.modelled ? fam : false);
+      if (this.cmd.feeds && plan.modelled && !this.cmd.feeds.sql) this.cmd.feeds.sql = fam;
+      this.cmd.feeds.rc.push(...plan.rc);
+    }
+  }
+
+  // `bash /dev/fd/3`, `source /dev/fd/3`: the script is whatever the descriptor was opened from
+  runFd(seg, word) {
+    markStdin(this.cmd, false);
+    const n = /^\/(?:dev|proc\/self)\/fd\/(\d+)$/.exec(word)?.[1];
+    const es = n === undefined ? [] : [this.ctx.fdFeeds.get(Number(n)), this.ctx.fdFeeds.get('{}')].filter(Boolean);
+    if (!es.length) { this.ctx.dynamic = true; return; }
+    for (const e of es) { addFeeds(this.cmd, e); if (e.dyn) this.ctx.dynamic = true; }
+  }
+
   // The words of an interpreter's script: flag the run as dynamic if they hold run-time expansions, and
   // parse whatever a substitution among them prints (eval "$(cat <<'EOF' ... EOF)" runs the heredoc body).
   // `feed`: the words are script text (eval, -c), so the files a substitution among them reads are recorded on the command
   noteWords(seg, words, depth, feed = false) {
+    let exact = words.length > 0;
     for (const w of words) {
       const m = seg.meta.get(w);
       if (!m) continue;
@@ -1742,16 +2574,22 @@ class Parser {
       const st = newSt();
       for (const text of subsProduced(m.subs, st, 1)) this.subParse(text, depth);
       if (feed && st.dyn) this.ctx.dynamic = true;
+      // (only files read as they are: a program's output is unknown text, and reading the word again keeps what that means -- it may cd, run anything)
+      if (!st.files.length || st.computed.length || st.dyn) exact = false;
+      if (feed && (words.length > 1 || m.subs.some((x) => x.split) || (w.match(/\$\(|`/g) ?? []).length !== 1 || !/^(?:\$\(|`)/.test(w) || !/[)`]$/.test(w))) { scannedSubs(st); exact = false; }
       if (feed) addFeeds(this.cmd, st);
     }
+    return exact && words.every((w) => seg.meta.has(w));
   }
 
   runScript(seg, words, text, depth) {
-    this.noteWords(seg, words, depth, true);
+    // Why: `eval "$(cat f)"`: the script is f's text, judged as it is (noteWords); read again, the text `$(cat f)` would be a command word, which is split (scanned)
+    if (this.noteWords(seg, words, depth, true)) return;
     this.subParse(text, depth);
   }
 
   runStdin(seg, depth) {
+    markStdin(this.cmd, false);
     const src = stdinSource(seg);
     for (const text of src.texts) this.subParse(text, depth);
     if (src.unknown) this.ctx.dynamic = true;
@@ -1763,7 +2601,9 @@ class Parser {
     const m = seg.meta.get(word);
     const st = newSt();
     let found = 0;
-    for (const text of subsProduced(m ? m.subs : [], st, 1)) { found++; this.subParse(text, depth); }
+    const subs = m ? m.subs : [];
+    // (what the substitution prints is the script itself, one stream: recorded in order, see producePieces)
+    for (const text of producePieces(subs, st, (s) => producedBy(s, st, 1, !subs.some((x) => x.pipedFrom?.includes(s))))) { found++; this.subParse(text, depth); }
     if (found === 0 || st.dyn) this.ctx.dynamic = true;
     addFeeds(this.cmd, st);
   }
@@ -1839,21 +2679,30 @@ class Parser {
       if (r.kind === 'script') this.runScript(seg, [r.text], r.text, depth);
       else if (r.kind === 'stdin') this.runStdin(seg, depth);
       else if (r.kind === 'file' && isProcSub(r.text)) this.runProcessSub(seg, r.text, depth);
+      else if (r.kind === 'file' && FD_PATH.test(r.text)) this.runFd(seg, r.text);
       if (r.amb) this.maybeProcessSubs(seg, argv, depth, r.kind === 'file' ? r.text : undefined);
     } else if (name === 'source' || name === '.') {
       const op = argv[1];
       if (op === undefined) return;
       if (STDIN_FILES.has(op)) this.runStdin(seg, depth);
+      else if (FD_PATH.test(op)) this.runFd(seg, op);
       else if (isProcSub(op)) this.runProcessSub(seg, op, depth);
       else this.noteWords(seg, [op], depth);
       if (hasExpansion(op) || op.startsWith('-')) this.maybeProcessSubs(seg, argv, depth, isProcSub(op) ? op : undefined);
+    } else if (INTERPRETER.test(name) && interpReadsStdin(argv)) {
+      this.runInterpStdin(seg);
+    } else if (SQL_CLIENT_NAMES.has(name)) {
+      this.runSql(seg, argv, depth);
     } else if (name === 'eval') {
       if (argv.length > 1) this.runScript(seg, argv.slice(1), argv.slice(1).join(' '), depth);
     } else if (name === 'trap') {
       // trap 'script' SIGNAL...: the first word runs as a script when the signal fires
       let k = 1;
       while (k < argv.length && (argv[k] === '-l' || argv[k] === '-p' || argv[k] === '--')) k++;
-      if (argv.length - k >= 2 && argv[k] !== '-') this.runScript(seg, [argv[k]], argv[k], depth);
+      if (argv.length - k >= 2 && argv[k] !== '-') {
+        this.ctx.ctl.trap++;
+        try { this.runScript(seg, [argv[k]], argv[k], depth); } finally { this.ctx.ctl.trap--; }
+      }
     } else if (name === 'watch') {
       const i = skipOpts(argv, 1, 'n', ['--interval']);
       if (i < argv.length) this.runScript(seg, argv.slice(i), argv.slice(i).join(' '), depth); // watch runs its args via sh -c
@@ -1876,14 +2725,40 @@ class Parser {
   }
 }
 
+function newCtx(maxDepth, expired, bashState) {
+  return { out: [], expired, maxDepth, truncated: false, dynamic: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, ctlBroken: false, fns: new Set(), defs: { redef: false }, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState };
+}
+
+// The text with every comment the lexer skips blanked out (newlines kept), from a lexing pass that interprets nothing (muted); null when that pass did not
+// read the whole text (a limit, an error): the caller keeps the text as it is.
+function withoutComments(src, maxDepth, expired) {
+  const ctx = newCtx(Math.min(Math.max(maxDepth, 0), HARD_MAX_DEPTH), expired, null);
+  ctx.muted = 1;
+  const p = new Parser(ctx, src);
+  p.comments = [];
+  try { p.parseTop(0); } catch { return null; }
+  if (ctx.stopped || ctx.truncated) return null;
+  let out = '';
+  let at = 0;
+  for (const [a, b] of p.comments) { out += src.slice(at, a) + ' '.repeat(b - a); at = b; }
+  return out + src.slice(at);
+}
+
 export function simpleCommands(str, opts) {
   const requested = Number.isFinite(opts?.maxDepth) ? Math.trunc(opts.maxDepth) : 5;
   // opts.expired: () => true once the evaluation's wall-clock deadline has passed; scans that can run long poll it and give up (truncated)
   const expired = typeof opts?.expired === 'function' ? opts.expired : null;
-  const ctx = { out: [], expired, maxDepth: Math.min(Math.max(requested, 0), HARD_MAX_DEPTH), truncated: false, dynamic: false, subshell: false, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0 };
+  const bashState = opts?.bashState; // the evaluation's shared record of the BASH rewrite (see below)
+  const ctx = newCtx(Math.min(Math.max(requested, 0), HARD_MAX_DEPTH), expired, bashState);
   let parser = null;
   try {
     parser = new Parser(ctx, String(str ?? ''));
+    // Why: every text of an evaluation (script, startup file, file the line wrote, heredoc body, nested frame) is parsed apart, but another text may bind BASH for the shell that runs this
+    // one. The first text that can bind it ends the rewrite for every text after it; a text already rewritten before that is stale, and the policy reruns the evaluation (bashState.bound)
+    // (a word in a comment is no binding: when the text looks like it binds BASH, it is checked again without the comments the lexer sees; any doubt keeps the first answer)
+    const binds = bindsBash(parser.src) && bindsBash(withoutComments(parser.src, requested, expired) ?? parser.src);
+    if (binds && bashState) bashState.bound = true;
+    ctx.bashPlain = (opts?.env ?? process.env).BASH === undefined && !binds && !bashState?.bound;
     parser.parseTop(0);
   } catch {
     ctx.truncated = true;
@@ -1892,6 +2767,10 @@ export function simpleCommands(str, opts) {
   Object.defineProperty(ctx.out, 'truncated', { value: ctx.truncated, enumerable: false });
   Object.defineProperty(ctx.out, 'dynamic', { value: ctx.dynamic, enumerable: false });
   Object.defineProperty(ctx.out, 'subshell', { value: ctx.subshell, enumerable: false });
+  // fns: every name the text defines as a function (`f()`, `function f`, zsh `f g ()`), wherever it is
+  Object.defineProperty(ctx.out, 'fns', { value: ctx.fns, enumerable: false });
+  // ctlBroken: the loop / branch / function marks (ctl) are not to be trusted (an unmatched closer, a construct finished out of order): callers read the line as before
+  Object.defineProperty(ctx.out, 'ctlBroken', { value: ctx.ctlBroken, enumerable: false });
   return ctx.out;
 }
 

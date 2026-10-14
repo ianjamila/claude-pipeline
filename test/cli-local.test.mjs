@@ -486,7 +486,8 @@ test('job: a job that is still running is exit 0 state running, then done', asyn
   const release = join(repo.dir, 'release-slow');
   t.after(() => { writeFileSync(release, ''); repo.cleanup(); });
   const hold = "const fs = require('fs'); const end = Date.now() + 60000; "
-    + 'const t = setInterval(() => { if (fs.existsSync(process.argv[1]) || Date.now() > end) clearInterval(t); }, 50);';
+    // (no `>` in the program: `job start` also judges the unquoted reading of the command, where a `>` is a redirect and the file guard refuses a redirect it cannot place)
+    + 'const t = setInterval(function () { if (fs.existsSync(process.argv[1]) || end < Date.now()) clearInterval(t); }, 50);';
   assertExit(cli(repo.dir, ['job', 'start', 'slow', '--', 'node', '-e', hold, release]), 0);
   const early = cli(repo.dir, ['job', 'read', 'slow']);
   assertExit(early, 0);

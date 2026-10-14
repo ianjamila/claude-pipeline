@@ -67,7 +67,7 @@ const TABLE = [
   ['if/then', 'if git push origin main; then echo ok; fi', ['git push origin main', 'echo ok'], 'exact'],
   ['while/do', 'while ! git push origin main; do sleep 1; done', ['git push origin main', 'sleep 1'], 'exact'],
   ['for loop body', 'for b in a b; do git push origin $b; done', ['for b in a b', 'git push origin $b'], 'exact'],
-  ['case branch', 'case $x in main) git push origin main ;; esac', ['case $x in main', 'git push origin main'], 'exact'],
+  ['case branch', 'case $x in main) git push origin main ;; esac', ['case $x in', 'git push origin main'], 'exact'], // (the pattern `main)` is no command: guard-a2-shell-s6.test.mjs
   ['function body on one line', 'function f { git push -f; }; f', ['git push -f', 'f'], 'exact'],
   ['posix function definition', 'f() { git push -f; }', ['f', 'git push -f'], 'exact'],
   ['negation', '! git push -f', ['git push -f'], 'exact'],

@@ -310,7 +310,7 @@ test('removeWorktree: a git refusal to move changes nothing', async () => {
 test('removeWorktree: process inspection unavailable => moved back, kept', async () => {
   const { repo, add } = world();
   const wt = add('agent-x', 'agent/x');
-  const r = await removeWorktree({ root: repo.dir, wt: { slug: 'agent-x', path: wt }, cfg: { delete: [], archive: [] }, pr: 9, holdingDir: mkdtempSync(join(tmpdir(), 'h-')), runId: 'r5', runStartMs: Date.now() + 5000, settleMs: 0, procOpts: { platform: 'darwin' } });
+  const r = await removeWorktree({ root: repo.dir, wt: { slug: 'agent-x', path: wt }, cfg: { delete: [], archive: [] }, pr: 9, holdingDir: mkdtempSync(join(tmpdir(), 'h-')), runId: 'r5', runStartMs: Date.now() + 5000, settleMs: 0, procOpts: { platform: 'win32' } });
   assert.deepEqual([r.removed, r.restored, r.reason], [false, true, 'in use during removal']);
   assert.equal(existsSync(join(wt, 'a.txt')), true);
 });
