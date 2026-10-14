@@ -173,7 +173,7 @@ Codex (`P codex-review --pr N --round R …` as a job; light lane with nothing b
 for items without a ruling yet; `P triage validate --round R --from-tag "pipeline-judge R<R> <d8>"`)
 → settle disputed bugs with tests (implementer commits the test; `P triage settle … --test-cmd …
 --test-file …` runs it) → arbiter if `P arbiter needed` says so (`arbiter` agent, no model param,
-one batched call) → `P arbiter apply --round R --tag "pipeline-arbiter R<R> <digest8>"` (proves
+one batched call; its prompt starts with the `promptHeader` from `P arbiter needed`, pasted verbatim) → `P arbiter apply --round R --tag "pipeline-arbiter R<R> <digest8>"` (proves
 Fable from the subagent transcript; the tag is the Agent call's description) → implement ACCEPTED
 items (implementer + verifier full verify) → `P followups create --round R` for FOLLOW-UP →
 `P comment --pr N --kind triage`. After each round: `P checkpoint --pr N --step review --round R`. Exit when
@@ -181,7 +181,9 @@ items (implementer + verifier full verify) → `P followups create --round R` fo
 discard-round` for an interrupted round): `reference/review-loop.md`. Not clean after the
 last round, or any item `needsHuman` ⇒ label `needs-human`, post
 `P comment --pr N --kind needs-human --reason "…"` (no `--hits-file`),
-`P summary --pr N --outcome needs-human --action "…" --cause review:<reason>`, stop.
+`P summary --pr N --outcome needs-human --action "…" --cause review:<reason>`, stop. With `owner_approval: chat` and items still `needsHuman`, that
+summary's `--action` is "Rule on <ids> in chat (accept / follow-up / reject), remove needs-human, then say ship resume N"; when the owner
+rules in chat, record it with `P triage owner-ruling` (**Owner rules in chat** in `reference/review-loop.md`).
 
 Codex `exitCode: 3` at any point (Codex unavailable) ⇒ `gh pr edit N --add-label awaiting-review`,
 `P comment --pr N --kind awaiting-review --reason "<reason from the JSON>"`,
@@ -295,7 +297,8 @@ head the gate covered; any other head is refused).
 Owner-merge items are hard-stop hits or test-integrity violations that `label` mode would block. Immediately before
 each `P merge`, take the `ownerMerge` count of the `P final-gate --pr N` that covers the head you are about to merge:
 - `0` ⇒ merge as usual.
-- `> 0` ⇒ merge ONLY if the owner said "merge" in THIS session for exactly this head sha and no owner-merge item beyond
+- `> 0` (also review items the owner ruled in chat with `P triage owner-ruling`: the gate's `review` detail lists their ids and the
+  owner's quotes; show them in the stop comment) ⇒ merge ONLY if the owner said "merge" in THIS session for exactly this head sha and no owner-merge item beyond
   the ones shown to them. A "merge" given for an earlier head never carries over: a new commit, an update-branch, a rebase or
   a retry after a head change (Step 5.2, a `behind-base` return, a refreshed gate) needs a new stop. If there is no such
   approval, STOP:
@@ -343,7 +346,7 @@ the owner's next move.
    - `autoMerge.action: disarm` ⇒ `gh pr merge N --disable-auto`, tell the owner.
 2. Route on `enter`:
    - `closed` / `ended` / `not-resumable` ⇒ report `reason`, stop.
-   - `decision` ⇒ show the `needs-human` reason, stop (the owner decides). The label alone does not mean this: Step 3.5 adds it before the review loop, so a run whose record is mid-run or ended `awaiting-review` / `blocked` / `awaiting-owner-merge` resumes as usual (the plan's `notes` say the run still ends in `needs-human`, no merge); `decision` is only for an ended `needs-human` outcome or no usable record.
+   - `decision` ⇒ show the `needs-human` reason, stop (the owner decides; with `owner_approval: chat` and review items `needsHuman`, tell them to rule on the ids in chat, see **Owner rules in chat** in `reference/review-loop.md`). The label alone does not mean this: Step 3.5 adds it before the review loop, so a run whose record is mid-run or ended `awaiting-review` / `blocked` / `awaiting-owner-merge` resumes as usual (the plan's `notes` say the run still ends in `needs-human`, no merge); `decision` is only for an ended `needs-human` outcome or no usable record.
    - `local-work` ⇒ report the worktree state (diverged / dirty / unpushed), stop. Never reset or discard it.
    - `observe-prod` with `production.watch: workflow` (`P config`) ⇒ do NOT run prod-watch: the project's CI workflow owns
      the production smoke and posts its result on the merged PR (Step 5.2). Close the record: `P state show --pr N` (rebuilds
@@ -354,7 +357,7 @@ the owner's next move.
      `rollbackInterrupted`, then release the lock: `P worktrees unkeep agent-<slug>-prod --run agent-<slug>-prod`. prod-watch records the outcome itself (run record `step: ended`, `outcome` set, summary sections kept; a
      `deploy-not-observed` outcome stays open to watch again), so nothing else needs writing and the next `resume plan` routes `ended`. `needs-owner` ⇒
      tell the owner at once. Never roll back.
-   - `build | verify | review | followups | gate` ⇒ steps 3–5, then the matching step.
+   - `build | verify | review | followups | gate` ⇒ steps 3–5, then the matching step. A run that ended `needs-human` for review items and whose label the owner removed after ruling in chat routes here (`gate` once the rulings made the review clean, `review` while an ACCEPT still has to be built and reviewed).
 3. Worktree per `worktree.action`: `reuse` ⇒ `cd` into `path`; `add-existing-ref` ⇒ `git worktree add <path> <branch>`;
    `add-from-remote` ⇒ `git fetch origin <branch>` then `git worktree add --no-track -b <branch> <path> origin/<branch>`;
    never `-B`. Then `then: ff-only` ⇒ `git merge --ff-only <liveHead>` (the plan's exact `liveHead` sha; `plan` already refreshed `origin/<branch>`, but never trust a tracking ref), `then: push` ⇒ `git push origin <branch>`.
@@ -386,7 +389,7 @@ read the issue, link it in the PR body (`Closes #123`).
 | verify red after 3 fix cycles | draft PR + `pipeline-blocked`, `summary --outcome blocked --action …`, stop |
 | blocking hard-stop hit | review loop, then `needs-human` + `summary --outcome needs-human --action …`, stop (`owner_approval: chat`: review loop, gate, then `summary --outcome awaiting-owner-merge`) |
 | Codex unavailable / quota (`exitCode: 3`) | `awaiting-review`, `summary --outcome awaiting-review --action …`, stop |
-| `P arbiter apply` proof fails | items → `needs-human` (the CLI marks them), `summary --outcome needs-human --action …`, stop |
+| `P arbiter apply` proof fails | items → `needs-human` (the CLI marks them), `summary --outcome needs-human --action …`, stop (chat mode: the action is "Rule on <ids> in chat (accept / follow-up / reject), remove needs-human, then say ship resume N") |
 | `triage validate` / `arbiter apply` exit 2 `not-found` | transcript not written yet: wait ~10 s, retry once, then `needs-human` + `summary --outcome needs-human --action …` |
 | final gate fails, can't fix | `needs-human` + `summary --outcome needs-human --action …` (`labels` / `preflight`: `summary --outcome stopped --action …`), stop |
 | `behind-base:` / base moved | `P update-branch --pr N` (Step 5.2), re-verify, new round if content changed (max 2 times, then `needs-human` + `summary --outcome needs-human --action …`); `rebase-needed` ⇒ the same |

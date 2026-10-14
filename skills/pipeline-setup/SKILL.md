@@ -45,7 +45,7 @@ Use implementer subagents for the file work; give each the exact template path +
   clean install → typecheck → lint/static guards → unit tests → database reset + all migrations
   + permission/policy tests → production build → Playwright E2E smoke (screenshots to
   `.verify/screenshots/`). `--quick` = typecheck + lint + tests related to changed files.
-- Writes `.verify/report.json` (per step: status, duration, error excerpt; plus `mode`,
+- Writes `.verify/report.json` (per step: status `pass|fail|not-run|skipped`, duration, error excerpt, `skipReason` when skipped; plus `mode`,
   `expectedSteps`, git head/tree/dirty). Fail fast.
 - Add missing tooling: Vitest (JS/TS unit), Playwright (`e2e/smoke/*.spec.ts`, own config +
   port), pgTAP (`supabase/tests/*.test.sql`, run by `supabase test db`). Start each with at least
@@ -63,7 +63,8 @@ Use implementer subagents for the file work; give each the exact template path +
 ### c. `.claude/pipeline.yml`
 
 From `templates/pipeline.yml`: verify commands and `verify.expected_steps` (the step names of
-`STEPS` in order, so final-gate holds the report to YOUR list, not the one the report declares);
+`STEPS` in order, so final-gate holds the report to YOUR list, not the one the report declares), and
+`verify.skippable_steps` only if a step may be skipped by a `skipIf` in `verify.mjs` (the owner's list: final-gate refuses any other skipped step);
 `merge.command` (must contain `{pr}` and
 `{sha}`; reuse an existing merge gate if the repo has one, with flags that refuse branch
 updates and pin the head); `ci.required_checks` (your CI job names; `Test integrity` and `Hard-stop scan` are required on top of

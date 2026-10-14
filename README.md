@@ -128,7 +128,7 @@ Three things tell you where an install stands:
   | `claude-pipeline main is ahead of your install (abc1234 → def5678)` | run `update` |
   | `… have diverged, so it cannot be told which is newer` | `update` moves you to `main` |
   | `WARNING: this repo's scripts/pipeline (…) is NEWER than your installed pipeline` | the repo's CI rules are newer than your local CLI, so local checks may pass what CI rejects: `update` before relying on it |
-  | `this repo's scripts/pipeline is out of date … a pipeline vendor PR is owed` | run `pipeline vendor` in that repo and open the PR |
+  | `this repo's scripts/pipeline is out of date … a pipeline vendor PR is owed` | run `pipeline vendor` in that repo and open the PR - or say "open the vendor PR": the message ends with that offer, and Claude (told so in its own context only) checks for an already-open vendor PR first, then runs `ship` on a new `agent/` branch; it never vendors without your yes |
   | `could not check claude-pipeline main (<reason>); your install is <stamp>` | informational (the reason is one of `timed out`, `rate limited`, `not found`, `gh unavailable`, `network error`, `unexpected response`, never the raw error text): you are offline or GitHub is unreachable, so there is no comparison this session; a machine that is offline sees only this one line |
   | `this repo's scripts/pipeline/VERSION is not a version stamp` / `… carries an unrecognised stamp` | informational: the repo's `VERSION` is missing a stamp's shape, is not a plain regular file (a symlink, FIFO, …), or has parts outside the known set; its text is never echoed because the repo is untrusted |
   | `pipeline version check incomplete (timed out)` | informational: the 4-second budget ran out with nothing else to say |
@@ -269,6 +269,9 @@ executable.
   `~/.claude/agents/` still pin `model:` (`./install.sh --check`), that nothing passed a `model`
   override, and that the model is available on your plan (an invalid model fails with
   `model_not_found`; it never silently falls back).
+  With `owner_approval: chat` you can instead rule on the disputed items in chat: the run records it with
+  `pipeline triage owner-ruling` (your exact words are published in the triage comment), you still say "merge"
+  yourself, then remove `needs-human` and say `ship resume N`.
 - **Installer refuses** "inside a Claude Code session": run it from your own terminal.
 - **`--check` reports drift:** someone edited an installed file (or an install did not finish); run `node ~/.claude/pipeline/bin/pipeline.mjs update`, or re-run `./install.sh`.
 - **A merge didn't happen:** the run's summary comment and `.review/final-gate.json` in the

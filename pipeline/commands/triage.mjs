@@ -2,6 +2,7 @@
 // say-so about where it came from), refuses anything that is not exactly one decision per pending item, applies it,
 // and settles whatever the deterministic rules allow without the arbiter. `settle` records a test result, which
 // outranks every opinion. `light-lane` closes out the untriaged WORTH CONSIDERING items of a small low-risk PR.
+// `owner-ruling` records what the owner decided in chat about an item that was waiting for a human.
 import path from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
@@ -11,14 +12,14 @@ import { runShellAsync } from '../lib/proc.mjs';
 import { findSubagentTranscript, proveModel, extractJsonBlock } from '../lib/transcript.mjs';
 import { saveState, updateItems } from '../lib/state.mjs';
 import {
-  applyJudge, applyTestResult, finalizeWithoutArbiter, markLightLane, validateTriage,
+  applyJudge, applyOwnerRuling, applyTestResult, DECISIONS, finalizeWithoutArbiter, isOwnerRuled, markLightLane, validateTriage,
 } from '../lib/triage.mjs';
 import {
   ensureRoundDir, findItem, findRound, readFileOrFail, requireState, withStateLock, writeJson,
 } from '../lib/review-context.mjs';
 
 export const meta = {
-  summary: 'apply the judge triage, settle disputed bugs with test results, close the light lane',
+  summary: 'apply the judge triage, settle disputed bugs with test results, close the light lane, record owner rulings made in chat',
   usage: [
     'pipeline triage validate --round R (--from-tag TAG | --file F) [--projects-dir DIR] [--max-age-ms N] [--repo DIR]',
     '  -> {ok, round, counts:{ACCEPT,FOLLOW-UP,REJECT}, settled, unsettled, judgeProof}; exit 1 + errors when the judge output is invalid (state untouched)',
@@ -27,6 +28,11 @@ export const meta = {
     '  -> only for a disputed bug with a possible settle test and no test result yet; exit 1 for an item that needs a human, was ruled by the arbiter or is implemented',
     '  -> a bug-disproved result on a security/auth/permissions/data item is still needsHuman',
     'pipeline triage light-lane --round R [--repo DIR]',
+    'pipeline triage owner-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJECT --reason TEXT --owner-quote TEXT [--pr N] [--repo DIR]',
+    '  -> {ok, round, id, final, published: false, next}; records the OWNER\'s decision (final.by owner, needsHuman false, the exact quote and time, the overruled final kept) for an item that needs a human',
+    '  -> only with owner_approval: chat; exit 1 for label mode, an item that is not waiting for a human (settled items are not reopened), a missing item, an empty reason or quote, or a --pr that is not the review state\'s',
+    '  -> works on an already published round. ACCEPT still needs the fix and a later review round; FOLLOW-UP is filed by `followups create`; the quote is published in the triage comment and the final gate counts it as ownerMerge (the owner\'s "merge" is still needed)',
+    '  -> pass the owner\'s own words as --owner-quote, never a paraphrase; then re-post the triage comment NOW (`pipeline comment --pr N --kind triage`); until then the ruling is local only (`published: false`) and `pipeline state show` restores the published state without it',
   ].join('\n'),
 };
 
@@ -134,6 +140,7 @@ const tailOf = (s, n) => {
 function settleRefusal(item, id) {
   if (item.final?.needsHuman === true) return `${id} needs a human decision; a test result cannot settle it`;
   if (item.final?.by === 'arbiter') return `${id} was already ruled by the arbiter`;
+  if (isOwnerRuled(item)) return `${id} was already ruled by the owner`;
   if (item.implemented === true) return `${id} is already implemented`;
   if ((item.test?.status ?? 'none') !== 'none') return `${id} already has a test result`;
   if (!(item.judge?.disputedBug === true && item.judge.settleTest?.possible === true)) {
@@ -223,7 +230,56 @@ function lightLaneLocked(n, root) {
   };
 }
 
-const SUBCOMMANDS = { validate, settle, 'light-lane': lightLane };
+// What the owner said is recorded as said (trimmed only), with a cap so a pasted wall of text cannot bloat the published state.
+const OWNER_TEXT_MAX = 1000;
+
+// Why this ruling may not be recorded, or null. The command exists for ONE case: the owner confirmed in chat what to do with
+// an item that is waiting for a human. It is not a way to reopen an item somebody already settled.
+function ownerRulingRefusal(item, id, round) {
+  if (item === undefined) return `no item ${id} in round ${round}`;
+  if (item.final?.needsHuman !== true) return `${id} does not need a human decision (an owner ruling cannot reopen a settled item)`;
+  return null;
+}
+
+async function ownerRuling(rest, ctx) {
+  const { values } = parseCommandArgs(rest, {
+    round: { type: 'string' }, id: { type: 'string' }, decision: { type: 'string' }, reason: { type: 'string' },
+    'owner-quote': { type: 'string' }, pr: { type: 'string' }, repo: { type: 'string' },
+  }, { allowPositionals: false });
+  const n = intOption(values, 'round', { required: true, min: 1 });
+  const pr = intOption(values, 'pr', { min: 1 });
+  const id = requireOption(values, 'id');
+  const decision = requireOption(values, 'decision');
+  if (!DECISIONS.includes(decision)) throw new UsageError(`--decision must be ${DECISIONS.join('|')}`);
+  if (values.reason === undefined) throw new UsageError('missing --reason');
+  if (values['owner-quote'] === undefined) throw new UsageError('missing --owner-quote');
+  const root = resolveRepo(values, ctx);
+  const { config } = await requireConfig(root);
+  const refuse = (reason) => ({ exitCode: EXIT.FAILED, output: { ok: false, round: n, id, reason } });
+  if (config.owner_approval !== 'chat') {
+    return refuse('an owner ruling is recorded only with owner_approval: chat in pipeline.yml; in label mode the owner clears needs-human by label');
+  }
+  const reason = values.reason.trim();
+  const ownerQuote = values['owner-quote'].trim();
+  if (reason === '' || ownerQuote === '') return refuse('--reason and --owner-quote must not be empty: record the owner\'s own words');
+  if (reason.length > OWNER_TEXT_MAX || ownerQuote.length > OWNER_TEXT_MAX) {
+    return refuse(`--reason and --owner-quote are at most ${OWNER_TEXT_MAX} characters`);
+  }
+
+  return withStateLock(root, ctx, () => {
+    const state = requireState(root);
+    if (pr !== undefined && state.pr !== pr) return refuse(`the review state is for PR #${state.pr}, not #${pr}`);
+    const item = findRound(state, n).items.find((i) => i.id === id);
+    const why = ownerRulingRefusal(item, id, n);
+    if (why) return refuse(why);
+    const ruled = applyOwnerRuling(item, { decision, reason, ownerQuote, ruledAt: new Date().toISOString() });
+    saveState(root, updateItems(state, n, [ruled]));
+    const next = `run \`pipeline comment --pr ${state.pr ?? pr ?? '<N>'} --kind triage\` now: until the triage comment is re-posted the ruling is only local, and \`pipeline state show\` restores the published state without it`;
+    return { exitCode: EXIT.OK, output: { ok: true, round: n, id, final: ruled.final, published: false, next } };
+  }, pr);
+}
+
+const SUBCOMMANDS = { validate, settle, 'light-lane': lightLane, 'owner-ruling': ownerRuling };
 
 export const run = guarded(async (argv, ctx) => {
   const [sub, ...rest] = argv;

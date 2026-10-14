@@ -86,7 +86,7 @@ const WATCH_MODES = ['session', 'workflow'];
 const KEYS = {
   top: [...Object.keys(DEFAULTS), 'project'],
   worktrees: ['mode', 'protect', 'min_idle_hours', 'min_merged_hours', 'delete', 'archive', 'memory_dirs'],
-  verify: ['full', 'quick', 'report', 'screenshots', 'expected_steps', 'stop_queue_wait_minutes'],
+  verify: ['full', 'quick', 'report', 'screenshots', 'expected_steps', 'skippable_steps', 'stop_queue_wait_minutes'],
   ci: ['required_checks', 'e2e_label', 'draft_while_iterating', 'guard_checks', 'approvers'],
   merge: ['command', 'wait_minutes'],
   preview: ['environment', 'smoke', 'provider'],
@@ -315,6 +315,19 @@ export function validateConfig(obj) {
         errors.push('verify.expected_steps must be a non-empty array of non-empty step names');
       } else if (new Set(steps).size !== steps.length) {
         errors.push('verify.expected_steps must not repeat a step name');
+      }
+    }
+    // Optional. The steps the owner allows verify to skip (a step skipped for a documented reason, e.g. a slow db step when no
+    // dependency changed). final-gate refuses a skipped step that is not listed here; absent = no step may be skipped.
+    if (verify.skippable_steps !== undefined) {
+      const steps = verify.skippable_steps;
+      if (!Array.isArray(steps) || !steps.every(isStr)) {
+        errors.push('verify.skippable_steps must be an array of non-empty step names');
+      } else if (new Set(steps).size !== steps.length) {
+        errors.push('verify.skippable_steps must not repeat a step name');
+      } else if (Array.isArray(verify.expected_steps)) {
+        const unknown = steps.filter((n) => !verify.expected_steps.includes(n));
+        if (unknown.length) errors.push(`verify.skippable_steps names step(s) not in verify.expected_steps: ${unknown.join(', ')}`);
       }
     }
   }

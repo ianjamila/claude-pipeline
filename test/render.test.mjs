@@ -581,3 +581,55 @@ test('agentLogLine: every field is sanitised to a single line without markers or
     assert.ok(!line.includes('<!--') && !line.includes('-->') && !line.includes('@'), `${f}: ${line}`);
   }
 });
+
+test('blockedComment: a skipped step (either report shape) shows as skipped with its reason, not as a pass or a failure', () => {
+  const report = {
+    mode: 'full', ok: false, git: { head: 'abcdef1234567890' },
+    steps: [
+      { name: 'install', status: 'pass', durationMs: 1500, command: 'npm ci', exitCode: 0, errorExcerpt: '' },
+      { name: 'sql-arms', status: 'skipped', skipReason: 'no dependency changed | @owner', durationMs: 0, command: 'node arms.mjs', exitCode: null, errorExcerpt: '' },
+      { name: 'old-skip', status: 'pass', skipped: true, durationMs: 3, command: '(skipped - nothing to do)', exitCode: null, errorExcerpt: '' },
+      { name: 'unit', status: 'fail', durationMs: 9000, command: 'vitest run', exitCode: 1, errorExcerpt: 'boom' },
+    ],
+  };
+  const rows = blockedComment(report).split('\n').filter((l) => /^\| (install|sql-arms|old-skip|unit) /.test(l));
+  assert.equal(rows.length, 4);
+  assert.match(rows[1], /\| skipped \(no dependency changed &#124; ＠owner\) \| — \|/);
+  assert.match(rows[2], /\| skipped \(\(skipped - nothing to do\)\) \| — \|/);
+  assert.ok(!/\bpass\b/.test(rows[1]) && !/\bpass\b/.test(rows[2]));
+  assert.equal(rows[1].slice(1, -1).split('|').length, 4, 'no stray pipe adds a column');
+});
+
+// ---- owner rulings ----------------------------------------------------------------------------
+
+const ownerFinal = (over = {}) => ({
+  decision: 'FOLLOW-UP', by: 'owner', needsHuman: false, reason: 'filed for later', ownerQuote: 'yes, make it a follow-up',
+  ruledAt: '2026-10-14T01:02:03.000Z', overruled: final('FOLLOW-UP', 'arbiter', 'model-proof failed', true), ...over,
+});
+
+test('triageComment: an owner ruling shows by owner with the owner\'s quote, and the ruling survives the published round trip', () => {
+  const s = stateWith([[item({ id: 'R1-B1', title: 'Null deref', final: ownerFinal() })]]);
+  const comment = triageComment(s);
+  const row = comment.split('\n').find((l) => l.startsWith('| 1 | R1-B1'));
+  assert.match(row, /\| FOLLOW-UP \| owner \|/);
+  assert.ok(row.includes('owner (chat): yes, make it a follow-up'), row);
+  assert.deepEqual(decodeFromComment(comment).rounds[0].items[0].final, ownerFinal());
+});
+
+test('triageComment: the owner quote is defused like any other text, and a cached copy still shows it', () => {
+  const s = stateWith([[
+    item({ id: 'R1-B1', final: ownerFinal({ ownerQuote: 'ok <!-- x --> @someone | now' }) }),
+    item({ id: 'R2-B1', final: { ...ownerFinal(), by: 'cache' } }),
+  ]]);
+  const rows = triageComment(s).split('\n').filter((l) => /^\| \d+ \| R/.test(l));
+  assert.ok(!rows[0].includes('<!--') && !rows[0].includes('@someone'), rows[0]);
+  assert.equal(rows[0].match(/\|/g).length, 9, 'the pipe in the quote did not add a column');
+  assert.match(rows[1], /\| cache \|.*owner \(chat\): yes, make it a follow-up/);
+});
+
+test('summaryComment: owner rulings are listed under Outliers with the quote', () => {
+  const s = stateWith([[item({ id: 'R1-B1', title: 'Null deref', final: ownerFinal() })]]);
+  const outliers = summaryComment(s, { outcome: 'awaiting-owner-merge' }).split('### What was built')[0];
+  assert.match(outliers, /R1-B1/);
+  assert.match(outliers, /Owner \(chat\): FOLLOW-UP — "yes, make it a follow-up"/);
+});
