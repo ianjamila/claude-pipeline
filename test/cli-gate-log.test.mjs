@@ -62,6 +62,7 @@ test('summary: upserts the marker comment from the state and prints the agent-lo
   assert.equal(r.json.url, 'https://github.com/acme/widgets/pull/12#issuecomment-5');
   assert.match(r.json.agentLogLine, /^- \d{4}-\d{2}-\d{2} · #12 · Add widget · risk medium · rounds 2 · arbiter 1 · merged$/);
   assert.equal(r.json.agentLogLine.split(' · ')[0].slice(2), new Date().toISOString().slice(0, 10));
+  assert.equal(r.json.pendingLogLine, r.json.agentLogLine.replace(/merged$/, 'merged — prod smoke pending'), 'a merged run also prints the line agent-log close resolves');
 
   const post = fake.calls().find((c) => c.argv.includes('POST'));
   const body = JSON.parse(post.stdin).body;
@@ -105,6 +106,7 @@ test('summary: --outcome blocked / awaiting-review render without state.json (em
   const blocked = cli(['summary', '--pr', String(PR), '--outcome', 'blocked'], { dir: repo.dir, fake });
   assertExit(blocked, 0);
   assert.match(blocked.json.agentLogLine, /^- \d{4}-\d{2}-\d{2} · #12 · Add widget · risk unknown · rounds 0 · arbiter 0 · blocked$/);
+  assert.equal('pendingLogLine' in blocked.json, false, 'only a merged run has a pending line');
   const body = JSON.parse(fake.calls().find((c) => c.argv.includes('POST')).stdin).body;
   assert.ok(body.startsWith(MARKERS.summary));
   assert.match(body, /\*\*blocked — verify failed at step lint \(full\)\*\*/);

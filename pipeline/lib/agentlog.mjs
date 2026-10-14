@@ -6,7 +6,7 @@
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
-import { git, GitError, showFile, NETWORK_TIMEOUT_MS } from './git.mjs';
+import { git, GitError, NETWORK_TIMEOUT_MS } from './git.mjs';
 import { pipelineStateDir } from './repo.mjs';
 import { withLock } from './locks.mjs';
 import { agentLogLine } from './render.mjs';
@@ -167,14 +167,47 @@ function fetchLogBranch(root, g) {
   return { tip: g(['rev-parse', '--verify', '-q', REMOTE_LOG_REF], root).trim(), exists: true };
 }
 
-// A commit on top of `parent` (or a root commit) whose tree is the parent's tree with `rel` set to `text`. Built with plumbing in a
+// The log branch is NOT protected: anyone with push access can rewrite it, so everything read from it is untrusted data. It is only ever
+// compared line by line or appended to; it is never executed, put into a command line, or used as a path.
+export const MAX_LOG_BYTES = 5 * 1024 * 1024;
+export class LogTooLargeError extends Error {
+  constructor(ref, size) {
+    super(`the agent log at ${ref} is ${size} bytes, over the 5 MB limit: refusing to read it (trim or replace the file on that branch)`);
+    this.name = 'LogTooLargeError';
+  }
+}
+const OID_RE = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+
+// The file `rel` at `ref` as text, or null when there is no REGULAR file there: missing ref or path, a symlink, a submodule, a tree,
+// an executable-bit file (anything but mode 100644 as a blob). Over MAX_LOG_BYTES it throws LogTooLargeError before reading the
+// content. `run(args)` is the caller's git (cwd already bound).
+function readRegularFile(run, ref, rel, { strictRef = false } = {}) {
+  try {
+    run(['rev-parse', '--verify', '-q', `${ref}^{commit}`]);
+  } catch (err) {
+    if (err instanceof GitError && err.code === 1 && !strictRef) return null; // strictRef: a missing ref is an error, not "no file"
+    throw err;
+  }
+  const entries = run(['ls-tree', '-z', '-l', ref, '--', rel]).split('\0').filter(Boolean);
+  for (const entry of entries) {
+    const tab = entry.indexOf('\t');
+    if (tab < 0 || entry.slice(tab + 1) !== rel) continue; // exact path only
+    const m = /^(\d{6}) (\w+) ([0-9a-f]+) +(\d+|-)$/.exec(entry.slice(0, tab));
+    if (!m || m[1] !== '100644' || m[2] !== 'blob' || !OID_RE.test(m[3])) return null;
+    if (Number(m[4]) > MAX_LOG_BYTES) throw new LogTooLargeError(ref, m[4]);
+    return run(['cat-file', 'blob', m[3]]);
+  }
+  return null;
+}
+
+// A commit on top of `parent` (or a root commit) whose tree contains ONLY `rel`, built fresh from `text`: nothing is carried over
+// from the parent's tree (a file someone planted on the branch, say a workflow, never rides into our commit). Built with plumbing in a
 // private temp index: the caller's index, HEAD, branches and working tree are never read or written.
 function commitFile({ root, g, rel, text, parent, message }) {
   const dir = mkdtempSync(join(tmpdir(), 'cp-agent-log-'));
   try {
     const env = { GIT_INDEX_FILE: join(dir, 'index') };
     const run = (args, extra = {}) => gitIn(g, root, args, { env, ...extra });
-    if (parent) run(['read-tree', parent]);
     const blob = run(['hash-object', '-w', '--stdin'], { input: text }).trim();
     run(['update-index', '--add', '--cacheinfo', `100644,${blob},${rel}`]);
     const tree = run(['write-tree']).trim();
@@ -208,20 +241,15 @@ export function publishLines({ root, logRel, lines, defaultBranch, gitFn = git }
   for (let attempt = 1; attempt <= ATTEMPTS; attempt += 1) {
     try {
       const { tip } = fetchLogBranch(root, g);
-      let existing = null;
-      if (tip) {
-        existing = showFile(tip, logRel, { cwd: root });
-      } else {
+      if (tip !== null && !OID_RE.test(tip)) throw new GitError({ args: ['rev-parse'], code: 0, stderr: `unexpected tip id: ${String(tip).slice(0, 80)}` });
+      const read = (ref) => readRegularFile((args) => g(args, root), ref, logRel);
+      let existing = tip ? read(tip) : null;
+      if (existing === null) {
         try {
           g(['fetch', '--no-tags', REMOTE, `+refs/heads/${defaultBranch}:refs/remotes/${REMOTE}/${defaultBranch}`], root, NETWORK_TIMEOUT_MS);
         } catch { /* offline default branch: seed from the cached ref, or the header */ }
-        // A default branch we do not have (a brand-new remote) seeds the header; any other read failure is real.
-        try {
-          g(['rev-parse', '--verify', '-q', `${REMOTE}/${defaultBranch}^{commit}`], root);
-          existing = showFile(`${REMOTE}/${defaultBranch}`, logRel, { cwd: root });
-        } catch (err) {
-          if (!(err instanceof GitError && err.code === 1)) throw err;
-        }
+        // No regular log file on the branch (a new branch, or something else at that path): start from main's copy, else the header.
+        existing = read(`${REMOTE}/${defaultBranch}`);
       }
       const { text, fresh } = appendLines(existing, clean);
       if (fresh.length === 0) return { commit: tip, pushed: false, lines: [] }; // all already in the log: nothing to push
@@ -259,12 +287,10 @@ export function originLogLines(root, { logFile, defaultBranch, fetch = false }) 
       } catch { branchRefreshed = false; }
     }
     const rel = relative(root, logFile).split('\\').join('/');
-    const text = showFile(`${REMOTE}/${defaultBranch}`, rel, o);
+    const run = (args) => git(args, o);
+    const text = readRegularFile(run, `${REMOTE}/${defaultBranch}`, rel, { strictRef: true }); // origin/<default> missing = unreadable
     const lines = new Set(text === null ? [] : text.split('\n').map((l) => l.replace(/\r$/, '')));
-    let branchText = null;
-    try {
-      branchText = showFile(REMOTE_LOG_REF, rel, o);
-    } catch { /* no log branch yet */ }
+    const branchText = readRegularFile(run, REMOTE_LOG_REF, rel); // no log branch yet is null; a hostile or oversized file makes the whole read fail closed
     if (branchText !== null) for (const l of branchText.split('\n')) lines.add(l.replace(/\r$/, ''));
     return { lines, refreshed: refreshed && branchRefreshed };
   } catch {

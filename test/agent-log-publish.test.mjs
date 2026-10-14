@@ -3,7 +3,7 @@
 // never touched", the push target and the race retry are proven against actual git, not a mock.
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
@@ -337,4 +337,109 @@ test('a box with no git identity still publishes (fallback author), without writ
   } finally {
     for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
   }
+});
+
+// ---- the log branch is untrusted data (anyone with push access can rewrite it) -----------------------
+
+// Pushes a commit straight onto the log branch from a second clone, as a hostile or careless writer would. `build(dir)` lays out
+// the files; the commit is made on top of the branch's current tip when it exists.
+function plant(w, build, { message = 'planted', stageAll = true } = {}) {
+  const other = tmp('cp-log-planter-');
+  raw(['init', '-q', '-b', 'planter', other], w.repo.dir);
+  raw(['config', 'user.name', 'Planter'], other);
+  raw(['config', 'user.email', 'planter@example.invalid'], other);
+  raw(['config', 'commit.gpgsign', 'false'], other);
+  raw(['remote', 'add', 'origin', w.bare], other);
+  try {
+    raw(['fetch', '-q', 'origin', `${BRANCH}:${BRANCH}`], other);
+    raw(['checkout', '-q', BRANCH], other);
+  } catch { /* no branch yet: the planted commit is a root */ }
+  build(other);
+  if (stageAll) raw(['add', '-A'], other);
+  raw(['commit', '-q', '-m', message], other);
+  raw(['push', '-q', '-f', 'origin', `HEAD:refs/heads/${BRANCH}`], other);
+}
+const tipTree = (w) => w.onOrigin('ls-tree', '-r', '--name-only', BRANCH).split('\n').filter(Boolean);
+
+test('hardening 1: the new commit\'s tree holds ONLY the log file, whatever else the remote tip carries (a planted workflow is not carried over)', () => {
+  const w = world();
+  assertExit(w.run(['publish', '--line', L1]), 0);
+  plant(w, (d) => {
+    mkdirSync(join(d, '.github', 'workflows'), { recursive: true });
+    writeFileSync(join(d, '.github', 'workflows', 'x.yml'), 'on: push\njobs: {}\n');
+    writeFileSync(join(d, 'other.txt'), 'extra\n');
+  });
+  assert.ok(tipTree(w).includes('.github/workflows/x.yml'), 'precondition: the tip carries the planted file');
+  const planted = w.onOrigin('rev-parse', BRANCH).trim();
+  assertExit(w.run(['publish', '--line', L2]), 0);
+  assert.deepEqual(tipTree(w), [AGENT_LOG], 'only the log file in our commit');
+  assert.equal(w.onOrigin('rev-parse', `${BRANCH}^`).trim(), planted, 'still a fast-forward of their tip');
+  const log = w.logOnBranch();
+  assert.ok(log.includes(L1) && log.includes(L2));
+});
+
+test('hardening 2: a symlink, a directory or a submodule at the log path is "no file": the branch restarts from main\'s copy, as a regular file', () => {
+  for (const make of [
+    (d) => { mkdirSync(join(d, 'docs'), { recursive: true }); symlinkSync('/etc/hostname', join(d, AGENT_LOG)); },
+    (d) => { mkdirSync(join(d, AGENT_LOG), { recursive: true }); writeFileSync(join(d, AGENT_LOG, 'inner.md'), 'x\n'); },
+  ]) {
+    const w = world();
+    plant(w, make);
+    const r = w.run(['publish', '--line', L1]);
+    assertExit(r, 0);
+    assert.equal(r.json.pushed, true);
+    assert.equal(w.onOrigin('ls-tree', BRANCH, '--', AGENT_LOG).split(' ')[0], '100644');
+    assert.deepEqual(tipTree(w), [AGENT_LOG]);
+    const log = w.logOnBranch();
+    assert.ok(log.includes('· #1 · old ·') && log.includes(L1), 'seeded from main\'s copy');
+    assert.ok(!log.includes('/etc/hostname'));
+  }
+  // a gitlink (submodule) entry at the path
+  const w = world();
+  plant(w, (d) => {
+    mkdirSync(join(d, 'docs'), { recursive: true });
+    raw(['update-index', '--add', '--cacheinfo', `160000,${'a'.repeat(40)},${AGENT_LOG}`], d);
+  }, { stageAll: false });
+  assert.equal(w.onOrigin('ls-tree', BRANCH, '--', AGENT_LOG).split(' ')[0], '160000', 'precondition: a gitlink sits at the log path');
+  assertExit(w.run(['publish', '--line', L1]), 0);
+  assert.equal(w.onOrigin('ls-tree', BRANCH, '--', AGENT_LOG).split(' ')[0], '100644');
+});
+
+test('hardening 2: a log over 5 MB on the branch is refused (exit 1, clear error), never read, and every line stays queued', () => {
+  const w = world();
+  plant(w, (d) => {
+    mkdirSync(join(d, 'docs'), { recursive: true });
+    writeFileSync(join(d, AGENT_LOG), `${'x'.repeat(1023)}\n`.repeat(5 * 1024 + 8));
+  });
+  const tip = w.onOrigin('rev-parse', BRANCH).trim();
+  const r = w.run(['publish', '--line', L1]);
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'log-too-large');
+  assert.match(r.json.message, /5 MB/);
+  assert.deepEqual(w.queued(), [L1]);
+  assert.equal(w.onOrigin('rev-parse', BRANCH).trim(), tip, 'nothing pushed');
+  // close does not read it either: the origin copy counts as unreadable
+  w.fake.setScript([{ match: '^auth status', stdout: 'Logged in' }, { match: '^repo view', stdoutJson: REPO_VIEW }]);
+  const c = w.run(['close']);
+  assert.equal(c.json.originReadable, false);
+});
+
+test('hardening 3: existing lines are never rewritten or dropped, only appended after (odd content, CRLF and a missing final newline included)', () => {
+  const w = world();
+  const theirs = '# Not our header\r\n- weird line\r\n\n- 2026-01-01 · #5 · mine · merged — prod smoke pending';
+  plant(w, (d) => { mkdirSync(join(d, 'docs'), { recursive: true }); writeFileSync(join(d, AGENT_LOG), theirs); });
+  assertExit(w.run(['publish', '--line', L1]), 0);
+  const log = w.logOnBranch();
+  assert.ok(log.startsWith(theirs), 'their bytes are a verbatim prefix');
+  assert.equal(log, `${theirs}\n${L1}\n`);
+});
+
+test('hardening 4: the landed-check matches lines exactly (a near-miss on the branch does not drop a queued line)', () => {
+  const w = world();
+  plant(w, (d) => { mkdirSync(join(d, 'docs'), { recursive: true }); writeFileSync(join(d, AGENT_LOG), `${AGENT_LOG_HEADER}${L1} \n${L2.toUpperCase()}\n`); });
+  w.run(['queue', '--line', L1]);
+  const r = w.run(['publish', '--line', L2]);
+  assertExit(r, 0);
+  assert.equal(r.json.dropped, 0);
+  assert.deepEqual(r.json.lines, [L1, L2]);
 });

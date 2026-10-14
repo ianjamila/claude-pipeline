@@ -11,7 +11,7 @@ import { GitError } from '../lib/git.mjs';
 import { LockTimeoutError } from '../lib/locks.mjs';
 import { inlineOptionValues } from '../lib/finalgate.mjs';
 import {
-  AGENT_LOG_BRANCH, DEFAULT_OUTCOME, appendToQueue, assertSingleLine, clearWritten, landedLines, logRelPath, originLogLines, publishLines, queuePath, readQueue,
+  AGENT_LOG_BRANCH, DEFAULT_OUTCOME, LogTooLargeError, appendToQueue, assertSingleLine, clearWritten, landedLines, logRelPath, originLogLines, publishLines, queuePath, readQueue,
   resolveLogPath, withQueueLock, writeQueue,
 } from '../lib/agentlog.mjs';
 import { closeLines, parseLog, readScanState, unionLogText, writeScanState } from '../lib/agentlog-close.mjs';
@@ -24,7 +24,8 @@ export const meta = {
     'pipeline agent-log publish [--line "<line>"] [--repo DIR]   -> {ok, branch, commit, pushed, lines, remaining}; queues --line, drops lines the log branch or origin/<default> already has,',
     '  appends the rest to config.agent_log on the orphan branch pipeline-agent-log and pushes ONLY that ref (never forced; a lost race is retried on the new tip);',
     '  the caller\'s HEAD, index, branches and working tree are never touched, nothing is committed to a PR branch. Published entries leave the queue only after',
-    '  the push succeeded; exit 3 when the push or the network fails (the lines stay queued for the next run, a note in the summary is enough)',
+    '  the push succeeded; exit 3 when the push or the network fails (the lines stay queued for the next run, a note in the summary is enough);',
+    '  the log branch is untrusted data: a commit holds ONLY the log file, the file is read only as a regular file under 5 MB (a bigger one: exit 1, error log-too-large, lines stay queued), existing lines are only appended after',
     'pipeline agent-log stage [--pr N] [--line "<line>"] [--repo DIR]   -> DEPRECATED alias of publish (older skills call it): never commits into the worktree or PR branch;',
     '  prints {ok, deprecated: true, committed: null, ...publish\'s fields}',
     'pipeline agent-log close [--queue] [--pr N]... [--all] [--repo DIR]   -> {ok, lines, pending, skipped, unreadable, originReadable, originRefreshed, queued?, scanError?}; for every "prod smoke pending" log line reads the',
@@ -115,6 +116,7 @@ async function publish(rest, ctx, { deprecated = false } = {}) {
       try {
         result = publishLines({ root, logRel, lines: entries.map((e) => e.line), defaultBranch: config.default_branch });
       } catch (err) {
+        if (err instanceof LogTooLargeError) throw new Fail(EXIT.FAILED, { ok: false, error: 'log-too-large', message: `${err.message}; the lines stay queued`, remaining: entries.length });
         if (!(err instanceof GitError)) throw err;
         throw new Fail(EXIT.UNAVAILABLE, { ok: false, error: 'publish-failed', message: `could not publish the agent log (${err.message.slice(0, 300)}); the lines stay queued for the next run`, remaining: entries.length });
       }
