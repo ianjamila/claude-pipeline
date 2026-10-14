@@ -1637,7 +1637,9 @@ const SOURCING = ['source', '.'];
 const DATA_COMMANDS = new Set(['git', 'gh', 'node', 'nodejs', 'python', 'python3', 'deno', 'bun', 'ruby', 'perl', 'cat', 'echo', 'printf', 'grep', 'egrep', 'fgrep', 'rg', 'sed', 'awk', 'jq', 'psql', 'mysql', 'sqlite3', 'npm', 'npx', 'pnpm', 'yarn', 'supabase', 'curl', 'wget', 'ls', 'head', 'tail', 'wc', 'sort', 'uniq', 'cut', 'tr', 'tee', 'diff', 'mkdir', 'rm', 'cp', 'mv', 'touch', 'find', 'date', 'sleep', 'cd', 'pwd', 'true', 'false', 'rsync', 'tar', 'ln', 'chmod', 'open', 'tsc', 'vitest',
   // (#56 replay: `npx tsx s.mjs` after `cat > s.mjs <<'EOF'` holding `process.cwd()` made the directory unknown: external programs, like the ones above)
   'tsx', 'ts-node', 'bunx', 'pnpx', 'playwright', 'eslint', 'prettier', 'stat', 'basename', 'dirname', 'realpath', 'readlink', 'cmp', 'du',
-  'shasum', 'sha256sum', 'md5', 'file', 'lsof', 'ps', 'zip', 'unzip', 'gzip']);
+  'shasum', 'sha256sum', 'md5', 'file', 'lsof', 'ps', 'zip', 'unzip', 'gzip',
+  // (shell keywords and test builtins the parser emits as commands: they run no quoted text; `grep "function base" f; for f in *.mjs; do …` was refused)
+  'for', 'do', 'if', 'then', 'elif', 'else', 'while', 'until', 'case', 'select', '!', ':', 'test', '[', 'break', 'continue']);
 const dataOnly = (c) => {
   if (!c.argv.length) return !Object.keys(c.env ?? {}).some((k) => /^(?:PROMPT_COMMAND|PS[0-4]|BASH_ENV|ENV|IFS|PATH|CDPATH)$/.test(k));
   const nm = baseName(c.argv[0]);

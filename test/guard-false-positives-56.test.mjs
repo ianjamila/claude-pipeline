@@ -279,11 +279,15 @@ test('#56 replay: `npx tsx` reads a heredoc as data like node; `set -a` changes 
     "cat > s.mjs <<'EOF'\nconst ROOT = process.cwd()\nEOF\nnpx tsx s.mjs",
     "cat > s.mjs <<'EOF'\nconst ROOT = process.cwd()\nEOF\ntsx s.mjs && node a.mjs",
     'set -a; X=1; set +a; bash ok.sh',
+    'grep -n "a\\|function base\\b" src/a.ts | head; for f in *.mjs; do node --check $f || echo BAD $f; done',
+    'if grep -q "f()" src/a.ts; then node a.mjs; fi',
   ]) allowGit(cmd, SPEC);
   for (const cmd of [
     "cat > s.mjs <<'EOF'\nconst ROOT = process.cwd()\nEOF\nf() { cd /elsewhere; }; npx tsx s.mjs; bash run.sh",
     "cat > s.mjs <<'EOF'\nconst ROOT = process.cwd()\nEOF\nnpx tsx s.mjs; bash run.sh",
     'set -k; bash ok.sh',
+    'f() { cd /elsewhere; }; for g in a; do f; done; bash ok.sh',
+    'if true; then g() { cd /elsewhere; }; fi; g; bash ok.sh',
     'set -a; . ./env.sh; set +a; bash ok.sh',
   ]) denyGit(cmd, { ...SPEC, 'env.sh': 'cd /elsewhere' });
 });
