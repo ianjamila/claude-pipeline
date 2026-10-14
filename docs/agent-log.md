@@ -13,3 +13,7 @@ full record.
 - 2026-10-13 · #42 · feat(notify): owner pushes name the machine — [Mac] / [PC] / hostname, NTFY_MACHINE override · risk high · rounds 1 · arbiter 0 · needs-human
 - 2026-10-13 · #42 · feat(notify): owner pushes name the machine ([Mac]/[PC]) + reliable ntfy publish on slow networks · risk high · rounds 2 · arbiter 0 · merged
 - 2026-10-13 · #45 · chore(pipeline): owner_approval: chat for claude-pipeline (no approval labels) + monotonic clock in the hung-gh test · risk high · rounds 1 · arbiter 0 · merged — prod smoke pending
+- 2026-10-13 · #46 · fix(guards): bound the glob-qualifier scan in time and size · risk high · rounds 1 · arbiter 0 · needs-human
+- 2026-10-13 · #45 · chore(pipeline): owner_approval: chat for claude-pipeline (no approval labels) + monotonic clock in the hung-gh test · risk high · rounds 1 · arbiter 0 · awaiting-owner-merge
+- 2026-10-13 · #49 · feat(worktrees): automatic, safe cleanup of finished worktrees (pipeline worktrees) · risk high · rounds 2 · arbiter 1 · needs-human
+- 2026-10-14 · #54 · test: two timing-flaky tests made reliable (monotonic lock waits; linear scan compares n/4 with n) · risk high · rounds 1 · arbiter 0 · merged — prod smoke pending
