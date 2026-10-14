@@ -315,6 +315,8 @@ export async function runVerify(opts = {}) {
       if (mode === 'full' && s.skipIf) {
         try {
           const d = s.skipIf({ cwd, env, git: report.git, mode });
+          // An async skipIf is an invalid answer; consume its eventual rejection so it cannot become an unhandledRejection.
+          if (d && typeof d.then === 'function') d.then(undefined, () => {});
           if (d !== null && d !== undefined) {
             const reasoned = typeof d === 'object' && typeof d.reason === 'string' && d.reason.trim() !== '';
             if (reasoned && d.run === true) runReason = d.reason.trim();

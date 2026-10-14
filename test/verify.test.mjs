@@ -585,6 +585,16 @@ test('skipIf: fails closed. A throw or a junk answer runs the step and records w
   }
 });
 
+test('skipIf: a promise that later rejects is consumed, so verify fails closed instead of crashing (R1-B1)', async () => {
+  const repo = await setup();
+  const r = await verify(repo, [], [{ name: 's', cmd: touch('ran-s'), quick: false, skipIf: () => Promise.reject(new Error('probe failed')) }]);
+  assert.equal(r.exitCode, 0, r.err);
+  assert.ok(existsSync(join(repo.dir, 'ran-s')), 'the step must run');
+  const row = reportOf(repo).steps[0];
+  assert.equal(row.status, 'pass');
+  assert.match(row.skipCheck, /^skip check failed/);
+});
+
 test('skipIf: { run: true, reason } runs the step and says why; skipIf must be a function', async () => {
   const repo = await setup();
   const r = await verify(repo, [], [{ name: 's', cmd: touch('ran-s'), quick: false, skipIf: () => ({ run: true, reason: 'src/ changed' }) }]);
