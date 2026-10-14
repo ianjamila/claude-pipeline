@@ -229,9 +229,10 @@ function runCapture(cmd, args, { env } = {}) {
 // lsof prints a "safe" form of every name (util.c safestrprt): a byte it cannot print as-is becomes \xNN (non-ASCII under a
 // locale that does not know it, e.g. the C locale launchd hands a job: café -> caf\xc3\xa9), \b \f \n \r \t are spelled out,
 // and any other control character is ^X (^@..^_, ^? for DEL). We decode that back to the real name. A backslash is not escaped
-// itself, so some outputs are ambiguous: a `\` that is none of the known forms, and a `^` followed by @..._ or ? (a control
-// escape, or a literal caret in the file name). A wrong guess here would hide a live process and let its worktree be
-// removed, so anything ambiguous is judged CONSERVATIVELY (see lsofNameForms): kept whenever it could be inside a root.
+// itself, so EVERY backslash is ambiguous (even a recognised \xNN or \t may be a literal backslash in a directory name), and so
+// is a `^` followed by @..._ or ? (a control escape, or a literal caret in the file name). A wrong guess here would hide a live
+// process and let its worktree be removed, so a name with any of them is judged CONSERVATIVELY (see lsofNameForms): kept
+// whenever the text before the first one could still reach a root. The decoded and raw spellings are still checked exactly.
 const LSOF_NAMED = { b: 0x08, f: 0x0c, n: 0x0a, r: 0x0d, t: 0x09 };
 function lsofNameForms(raw) {
   const bytes = [];
@@ -239,6 +240,7 @@ function lsofNameForms(raw) {
   for (let i = 0; i < raw.length;) {
     const ch = raw[i];
     const hex = ch === '\\' ? /^x([0-9a-fA-F]{2})/.exec(raw.slice(i + 1)) : null;
+    if (ch === '\\' && ambiguousAt < 0) ambiguousAt = bytes.length; // any backslash, recognised or not, may be literal
     if (hex) {
       bytes.push(parseInt(hex[1], 16));
       i += 4;
@@ -250,7 +252,6 @@ function lsofNameForms(raw) {
       bytes.push(raw[i + 1] === '?' ? 0x7f : raw.charCodeAt(i + 1) - 0x40);
       i += 2;
     } else {
-      if (ch === '\\' && ambiguousAt < 0) ambiguousAt = bytes.length;
       const cp = raw.codePointAt(i);
       bytes.push(...Buffer.from(String.fromCodePoint(cp), 'utf8'));
       i += cp > 0xffff ? 2 : 1;

@@ -367,18 +367,37 @@ test('processesInside (darwin): hidden = ps pids with no readable cwd in lsof, m
 });
 
 // lsof prints a "safe" form of a name: non-ASCII bytes it cannot print as \xNN, \b \f \n \r \t, other controls as ^X (^? = DEL).
-test('processesInside (darwin): lsof-escaped \\xNN names are decoded to UTF-8 before the inside check (worktree named café)', () => {
+test('processesInside (darwin): lsof-escaped \\xNN names are decoded to UTF-8 before the inside check (worktree named café); any backslash makes a sibling fail closed', () => {
   const wt = '/Users/me/projects/app/.worktrees/café';
   const run = fakeRun({
     lsof: lsofText(own,
       { pid: 81, files: [['cwd', '/Users/me/projects/app/.worktrees/caf\\xc3\\xa9']] },
       { pid: 82, files: [['cwd', '/'], ['4', '/Users/me/projects/app/.worktrees/caf\\xc3\\xa9/sub/na\\xc3\\xafve.txt']] },
-      { pid: 83, files: [['cwd', '/Users/me/projects/app/.worktrees/caf\\xc3\\xa8']] }, // cafè: a different directory
-      { pid: 84, files: [['cwd', '/Users/me/projects/app/.worktrees/caf\\xc3\\xa9x']] }), // not a segment boundary
+      // cafè and caféx are NOT inside café, but a recognised escape is also possibly a literal backslash (R2-B1), so the name is
+      // judged conservatively: the text before the first backslash (.../caf) can still grow into the root -> flagged.
+      { pid: 83, files: [['cwd', '/Users/me/projects/app/.worktrees/caf\\xc3\\xa8']] },
+      { pid: 84, files: [['cwd', '/Users/me/projects/app/.worktrees/caf\\xc3\\xa9x']] },
+      { pid: 85, files: [['cwd', '/Users/me/projects/app/.worktrees/cafex']] }, // no backslash at all: exact judgement, outside
+      { pid: 86, files: [['cwd', '/Users/me/projects/other/caf\\xc3\\xa8']] }), // prefix before the backslash cannot reach the root
     ps: '',
   });
-  assert.deepEqual(darwin(wt, { run }), { available: true, pids: [81, 82], hidden: 0 });
-  assert.deepEqual(darwin('/Users/me/projects/app/.worktrees/cafe', { run }), { available: true, pids: [], hidden: 0 });
+  assert.deepEqual(darwin(wt, { run }), { available: true, pids: [81, 82, 83, 84], hidden: 0 });
+  assert.deepEqual(darwin('/Users/me/projects/app/.worktrees/cafe', { run }), { available: true, pids: [81, 82, 83, 84], hidden: 0 }, 'fail closed: .../caf may still become .../cafe');
+  assert.deepEqual(darwin('/Users/me/projects/app/.worktrees/agent-x', { run }), { available: true, pids: [], hidden: 0 });
+});
+
+// R2-B1: a LITERAL backslash sequence in one component plus a real escaped byte in another matches neither the fully
+// decoded nor the raw spelling; only the conservative prefix check (from the first backslash) can catch it.
+test('processesInside (darwin): a literal \\t in one directory name plus an escaped byte in another is still flagged (fail closed)', () => {
+  const wt = '/Users/me/wt/a\\tb/café'; // the directory really is named a, backslash, t, b
+  const run = fakeRun({
+    lsof: lsofText(own,
+      { pid: 121, files: [['cwd', '/Users/me/wt/a\\tb/caf\\xc3\\xa9/x']] },
+      { pid: 122, files: [['cwd', '/Users/me/elsewhere/a\\tb/caf\\xc3\\xa9/x']] }, // prefix cannot reach the root
+      { pid: 123, files: [['cwd', '/Users/me/elsewhere/cafe']] }), // no backslash, outside
+    ps: '',
+  });
+  assert.deepEqual(darwin(wt, { run }), { available: true, pids: [121], hidden: 0 });
 });
 
 test('processesInside (darwin): control characters in a name (\\t, ^I, ^?) are decoded; the same name outside the root is not a match', () => {
