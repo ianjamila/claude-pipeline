@@ -584,6 +584,15 @@ test('buildReviewPrompt states the review scope, range and rules files', () => {
   assert.match(p, /read-only/i);
 });
 
+test('buildReviewPrompt: a synthetic base (a tree id) is accepted and the prompt says merged-in base commits are excluded', () => {
+  const tree = 'c'.repeat(40);
+  const p = buildReviewPrompt(promptArgs({ base: tree, baseKind: 'synthetic' }));
+  assert.ok(p.includes(`git diff ${tree}..task/1.8`));
+  assert.match(p, /Commits merged in from the base branch are excluded/);
+  assert.doesNotMatch(buildReviewPrompt(promptArgs()), /merged in from the base branch/);
+  assert.doesNotMatch(buildReviewPrompt(promptArgs({ baseKind: 'whole-pr' })), /merged in from the base branch/);
+});
+
 test('largeBinaryNote names each large binary with size and status; buildReviewPrompt lists them only when there are some', () => {
   const MiB = 1024 * 1024;
   const changes = [

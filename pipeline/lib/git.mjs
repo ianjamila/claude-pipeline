@@ -119,6 +119,29 @@ export function mergeTree(base, head, o) {
   return { clean: r.code === 0, tree };
 }
 
+// What a later review round (or a "did a non-test file change since round N" check) should diff the branch head against.
+// `from` is where the previous round ended, `forkPoint` the PR's CURRENT merge base with the branch it targets. When the
+// base branch was merged into the PR since `from`, from..head would contain the base branch's own commits (other PRs'
+// work). So:
+//   - `from` already contains `forkPoint`: nothing was merged in, `from` it is (kind 'previous');
+//   - otherwise a trial merge of forkPoint into `from` ("what was reviewed, plus the new base") is the base; the head differs
+//     from it only by the PR's own later changes (kind 'synthetic', a tree id; `git diff <tree>..<commit>` accepts one);
+//   - a conflicting merge, or a git without merge-tree --write-tree, falls back to `forkPoint`: the whole PR against the new
+//     base, which still never shows the base branch's code (kind 'whole-pr').
+// -> { base, kind }
+export function effectiveReviewBase({ from, forkPoint }, o) {
+  if (isAncestor(forkPoint, from, o)) return { base: from, kind: 'previous' };
+  try {
+    if (supportsMergeTreeWrite(o)) {
+      const merged = mergeTree(from, forkPoint, o);
+      if (merged.clean) return { base: merged.tree, kind: 'synthetic' };
+    }
+  } catch (err) {
+    if (!(err instanceof GitError)) throw err; // a merge-tree that cannot run is the same answer as a conflict
+  }
+  return { base: forkPoint, kind: 'whole-pr' };
+}
+
 export const headSha = (o) => git(['rev-parse', 'HEAD'], o).trim();
 
 // `HEAD` when detached. Reads the full ref instead of using --short/--abbrev-ref, which print `heads/x` when a tag
