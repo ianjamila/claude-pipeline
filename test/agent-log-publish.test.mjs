@@ -5,7 +5,7 @@ import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { cli, AGENT_LOG } from './helpers/gate-env.mjs';
@@ -377,11 +377,13 @@ test('an agent_log path outside the repo (or through .git) is refused and nothin
   assert.match(r.json.message, /inside the repo/);
   assertExit(w.run(['publish', '--line', '- a\n- forged']), 2);
   assert.deepEqual(w.queued(), []);
-  assert.throws(() => logRelPath('/repo', '/etc/passwd'), /relative/);
-  assert.throws(() => logRelPath('/repo', '../x.md'), /inside the repo/);
-  assert.throws(() => logRelPath('/repo', '.git/hooks/log.md'), /usable path/);
-  assert.throws(() => logRelPath('/repo', 'docs/.GIT/x.md'), /usable path/);
-  assert.equal(logRelPath('/repo', 'docs/./agent-log.md'), 'docs/agent-log.md');
+  // A resolved root, as resolveRepo gives: on Windows a bare '/repo' is not absolute and every path would fail the inside check first.
+  const root = resolve('/repo');
+  assert.throws(() => logRelPath(root, '/etc/passwd'), /relative/);
+  assert.throws(() => logRelPath(root, '../x.md'), /inside the repo/);
+  assert.throws(() => logRelPath(root, '.git/hooks/log.md'), /usable path/);
+  assert.throws(() => logRelPath(root, 'docs/.GIT/x.md'), /usable path/);
+  assert.equal(logRelPath(root, 'docs/./agent-log.md'), 'docs/agent-log.md');
 });
 
 test('assertSafeLogTarget only allows refs/heads/pipeline-agent-log', () => {
