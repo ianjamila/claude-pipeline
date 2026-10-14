@@ -207,9 +207,21 @@ async function markImplemented(rest, ctx) {
         });
       }
       // A settle-by-test commit changes the hash too, so also require a non-test file to have changed since then.
-      // Measured from the round's head, minus whatever was merged in from the base branch since (those are not the PR's change).
-      const since = effectiveReviewBase({ from: round.toHead, forkPoint: mergeBase(reviewBaseRef(root, config), 'HEAD', { cwd: root }) }, { cwd: root });
-      const changed = git(['diff', '--name-only', '--no-renames', `${since.base}..HEAD`], { cwd: root }).split('\n').filter(Boolean);
+      // Measured from the round's head, minus whatever was merged in from the default branch since (those are not the PR's
+      // change). This gate fails closed: if that range cannot be worked out exactly (git failed, the trial merge conflicted
+      // or is unsupported, so the only base left is the whole PR), the mark is refused rather than counting files the fix did
+      // not touch.
+      let changed;
+      try {
+        const since = effectiveReviewBase({ from: round.toHead, forkPoint: mergeBase(reviewBaseRef(root, config), 'HEAD', { cwd: root }) }, { cwd: root });
+        if (since.kind !== 'previous' && since.kind !== 'synthetic') throw new Error(`the default branch was merged into the PR since round ${round.n} and the merge cannot be separated from the PR's own changes (${since.kind})`);
+        changed = git(['diff', '--name-only', '--no-renames', `${since.base}..HEAD`], { cwd: root }).split('\n').filter(Boolean);
+      } catch (err) {
+        throw new Fail(EXIT.USAGE, {
+          ok: false, error: 'base-unresolved',
+          message: `${item.id} cannot be marked implemented: could not tell which files changed since round ${round.n} (${err.message}); resolve the base branch merge and try again`,
+        });
+      }
       const code = changed.filter((f) => f !== config.agent_log && !matchAny(f, config.integrity.test_globs));
       if (code.length === 0) {
         throw new Fail(EXIT.USAGE, {

@@ -177,7 +177,15 @@ export const run = guarded(async (argv, ctx) => {
   ensureRoundDir(root, round);
   // What Codex is shown (and what the fix commits are measured against) is exactly this range. Round 1 starts at the merge
   // base; a later round starts where the previous one ended, with the base branch's commits merged in since then taken out.
-  const review = state?.rounds.length > 0 ? effectiveReviewBase({ from: base, forkPoint }, o) : { base: forkPoint, kind: 'merge-base' };
+  // Only commits that came from the protected default branch are left out: the base side is origin/<default_branch> (never a
+  // branch the PR author chose), and a PR that targets any other branch leaves nothing out. A failed or stale fetch only
+  // leaves an older origin/<default_branch>, which can only make the range bigger.
+  let review = { base: forkPoint, kind: 'merge-base' };
+  if (state?.rounds.length > 0) {
+    review = prBase === config.default_branch
+      ? effectiveReviewBase({ from: base, forkPoint }, o)
+      : { base, kind: 'previous' };
+  }
   // Large binary documents would overflow the buffer; they are named at the end of the patch and in the prompt instead.
   const { patch, skipped: largeBinaries } = reviewPatch(review.base, head, o);
   // Only the base branch was merged in since the last round: there is nothing of the PR's own to review.
