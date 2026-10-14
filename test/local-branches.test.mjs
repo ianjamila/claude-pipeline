@@ -131,3 +131,17 @@ test('parseWorktreePorcelain: Windows forward-slash paths become native backslas
   const posix = parseWorktreePorcelain('worktree /home/me/repo\nHEAD aaaa\nbranch refs/heads/main\n\n', 'linux');
   assert.equal(posix[0].path, '/home/me/repo');
 });
+
+test('parseWorktreePorcelain: locked, prunable, detached', () => {
+  const out = [
+    'worktree /r', 'HEAD aaa', 'branch refs/heads/main', '',
+    'worktree /r/.worktrees/a', 'HEAD bbb', 'branch refs/heads/a', 'locked pipeline-keep: ship run 7', '',
+    'worktree /r/.worktrees/b', 'HEAD ccc', 'detached', 'locked', '',
+    'worktree /r/.worktrees/c', 'HEAD ddd', 'branch refs/heads/c', 'prunable gitdir file points to non-existent location', '',
+  ].join('\n');
+  const [m, a, b, c] = parseWorktreePorcelain(out, 'linux');
+  assert.equal(m.locked, null); assert.equal(m.prunable, false); assert.equal(m.detached, false);
+  assert.equal(a.locked, 'pipeline-keep: ship run 7');
+  assert.equal(b.locked, ''); assert.equal(b.detached, true); assert.equal(b.branch, null);
+  assert.equal(c.prunable, true);
+});
