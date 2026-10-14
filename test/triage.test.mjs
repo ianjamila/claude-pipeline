@@ -520,7 +520,7 @@ test('validateTriage: catches a bad enum, a non-boolean disputedBug and a malfor
   assert.ok(r.errors.some((e) => /decision/.test(e)), r.errors.join('\n'));
   r = bad({ decision: 'accept' });
   assert.equal(r.ok, false, 'enums are case-sensitive');
-  r = bad({ confidence: 'medium' });
+  r = bad({ confidence: 'Medium' });
   assert.equal(r.ok, false);
   assert.ok(r.errors.some((e) => /confidence/.test(e)));
   r = bad({ disputedBug: 'yes' });
@@ -567,7 +567,7 @@ test('validateRulings: accepts a complete set and catches missing, duplicate, un
   assert.ok(unknown.errors.some((e) => /unknown/i.test(e) && e.includes('R2-B9')));
 
   assert.equal(validateRulings({ rulings: [ruling('R1-B1', 'NOPE')] }, ['R1-B1']).ok, false);
-  assert.equal(validateRulings({ rulings: [ruling('R1-B1', 'ACCEPT', 'medium')] }, ['R1-B1']).ok, false);
+  assert.equal(validateRulings({ rulings: [ruling('R1-B1', 'ACCEPT', 'Medium')] }, ['R1-B1']).ok, false);
   assert.equal(validateRulings({ rulings: [{ id: 'R1-B1', ruling: 'ACCEPT', confidence: 'high' }] }, ['R1-B1']).ok, false);
   assert.equal(validateRulings(null, ['R1-B1']).ok, false);
   assert.equal(validateRulings({}, ['R1-B1']).ok, false);
@@ -897,7 +897,7 @@ test('finalizeWithoutArbiter: an invalid judge decision that skipped validation 
 test('applyRulings: a ruling or confidence outside the enums goes to a human (case-sensitive)', () => {
   const cases = [
     ['accept', 'high'], ['Reject', 'high'], ['FOLLOWUP', 'high'], [undefined, 'high'], [null, 'high'], ['', 'high'],
-    ['ACCEPT', 'HIGH'], ['ACCEPT', 'medium'], ['ACCEPT', undefined], ['ACCEPT', null], ['ACCEPT', ''],
+    ['ACCEPT', 'HIGH'], ['ACCEPT', 'Medium'], ['ACCEPT', undefined], ['ACCEPT', null], ['ACCEPT', ''],
   ];
   for (const [r, confidence] of cases) {
     const it = judged('SUGGESTION', 'REJECT', 'high', {}, { id: 'R1-S1' });
@@ -1075,5 +1075,58 @@ test('reuseRuled: a security dismissal the OWNER ruled on is reused next round a
       const plain = item({ id: 'R1-B2', fingerprint: 'fp', bucket: 'BLOCKING', category, final: settled(decision, 'arbiter') });
       assert.equal(reuseRuled([item({ fingerprint: 'fp', bucket: 'BLOCKING', category })], ruledCacheFrom([plain]))[0].final, null, `${decision} ${category}: non-owner not reused`);
     }
+  }
+});
+
+// ---- confidence "medium" ----------------------------------------------------------------------
+
+test('validateRulings and validateTriage accept confidence "medium"', () => {
+  assert.deepEqual(validateRulings({ rulings: [ruling('R1-B1', 'ACCEPT', 'medium')] }, ['R1-B1']), { ok: true, errors: [] });
+  const t = goodTriage('R1-B1');
+  t.items[0].confidence = 'medium';
+  assert.deepEqual(validateTriage(t, ['R1-B1']), { ok: true, errors: [] });
+});
+
+test('confidence stays strict: "Medium" and "unsure" are invalid', () => {
+  for (const c of ['Medium', 'unsure', 'High']) {
+    assert.equal(validateRulings({ rulings: [ruling('R1-B1', 'ACCEPT', c)] }, ['R1-B1']).ok, false, c);
+    const t = goodTriage('R1-B1');
+    t.items[0].confidence = c;
+    assert.equal(validateTriage(t, ['R1-B1']).ok, false, c);
+  }
+});
+
+test('applyRulings: arbiter "medium" ACCEPT stands like high and keeps the literal confidence', () => {
+  const it = judged('SUGGESTION', 'REJECT', 'high', {}, { id: 'R1-S1' });
+  const [out] = applyRulings([it], [ruling('R1-S1', 'ACCEPT', 'medium', 'fine')], { proofOk: true, transcript: 't.jsonl' });
+  assert.deepEqual(out.final, { decision: 'ACCEPT', by: 'arbiter', needsHuman: false, reason: 'fine' });
+  assert.equal(out.arbiter.confidence, 'medium');
+});
+
+test('applyRulings: arbiter "medium" REJECT of a BLOCKING security item still goes to a human', () => {
+  const it = judged('BLOCKING', 'REJECT', 'high', {}, { id: 'R1-B1', category: 'security' });
+  const [out] = applyRulings([it], [ruling('R1-B1', 'REJECT', 'medium')], { proofOk: true });
+  assert.equal(out.final.needsHuman, true);
+  assert.equal(out.final.reason, 'would dismiss a blocking security/data item');
+});
+
+test('applyRulings: arbiter "medium" without proof still goes to a human', () => {
+  const it = judged('SUGGESTION', 'REJECT', 'high', {}, { id: 'R1-S1' });
+  const [out] = applyRulings([it], [ruling('R1-S1', 'ACCEPT', 'medium')], { proofOk: false });
+  assert.equal(out.final.needsHuman, true);
+});
+
+test('applyRulings: arbiter "Medium" or "unsure" is invalid output and goes to a human', () => {
+  const it = judged('SUGGESTION', 'REJECT', 'high', {}, { id: 'R1-S1' });
+  for (const c of ['Medium', 'unsure', null]) {
+    const [out] = applyRulings([it], [ruling('R1-S1', 'ACCEPT', c)], { proofOk: true });
+    assert.equal(out.final.needsHuman, true, String(c));
+    assert.equal(out.final.reason, 'invalid arbiter output');
+  }
+});
+
+test('arbiterNeeded: judge "medium" confidence needs the arbiter', () => {
+  for (const bucket of ['BLOCKING', 'SUGGESTION', 'WORTH_CONSIDERING']) {
+    assert.equal(arbiterNeeded(judged(bucket, 'ACCEPT', 'medium')), true, bucket);
   }
 });

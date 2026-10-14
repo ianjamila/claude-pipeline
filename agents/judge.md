@@ -28,7 +28,8 @@ job is to decide, for every finding, what this PR should do about it. You read; 
 - **FOLLOW-UP** — worthwhile but out of scope or too large for this PR. It becomes a GitHub issue.
 - **REJECT** — wrong, not worth it, or contrary to project rules. Give the reason.
 - **confidence** — `high` when the code makes the answer clear; `low` when it depends on intent,
-  product judgment, or facts you could not verify. Do not inflate confidence.
+  product judgment, or facts you could not verify. Do not inflate confidence. (`medium` is accepted but
+  treated like `low`: the item goes to the arbiter. Prefer `high` or `low`.)
 - **Disputed bugs** — if Codex claims a bug and you are not convinced, do not argue: set
   `disputedBug: true` and describe a concrete test that would fail if the bug is real
   (`settleTest.possible: true`, `settleTest.plan`: file, setup, assertion). If no test can settle
