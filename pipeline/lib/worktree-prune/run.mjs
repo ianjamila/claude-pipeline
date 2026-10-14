@@ -237,7 +237,9 @@ const listDir = (dir) => {
 };
 
 // spec §6: things outside worktrees that only get REPORTED (read-only): container-root scratch and evidence, the
-// screenshots folder, and Claude's per-session scratch (/tmp/claude-<uid>/<project>/<session>, POSIX only).
+// screenshots folder, and Claude's per-session scratch (/tmp/claude-<uid>/<project>/<session>, POSIX only). Only a Claude
+// project dir counts: Claude encodes the absolute project path with "/" -> "-" (-home-u-projects-app), so its name starts
+// with "-". Other children (bash-edit-diff/<hash>, Claude Code's own edit-diff temp) are not sessions and are skipped.
 export function outsideReport(root, env) {
   const items = [];
   for (const e of listDir(path.join(root, '.claude'))) {
@@ -251,7 +253,7 @@ export function outsideReport(root, env) {
   }
   const scratch = env.PIPELINE_SCRATCH_DIR || (typeof process.getuid === 'function' ? `/tmp/claude-${process.getuid()}` : null);
   if (scratch) {
-    for (const project of listDir(scratch).filter((e) => e.isDirectory())) {
+    for (const project of listDir(scratch).filter((e) => e.isDirectory() && e.name.startsWith('-'))) {
       for (const session of listDir(path.join(scratch, project.name)).filter((e) => e.isDirectory())) {
         items.push(measure(path.join(scratch, project.name, session.name)));
       }

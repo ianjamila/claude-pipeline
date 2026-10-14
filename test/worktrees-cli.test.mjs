@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, REPO_VIEW, pipelineYml } from './helpers/fakegh-env.mjs';
 import { lockNameFor } from '../pipeline/lib/worktree-prune/rules.mjs';
-import { summaryLine } from '../pipeline/lib/worktree-prune/run.mjs';
+import { summaryLine, outsideReport } from '../pipeline/lib/worktree-prune/run.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const bin = join(here, '..', 'pipeline', 'bin', 'pipeline.mjs');
@@ -122,8 +122,8 @@ function world() {
     version: 1, items: [{ original: '/x/f.txt', stored: join(holdingRepo, '2026-01-01', 'old', 'f.txt'), size: 4, sha256: '', archivedAt: iso(Date.now() - 40 * DAY), slug: 'old', pr: 9 }],
   }));
   mkdirSync(join(repo.dir, 'screenshots from mac'));
-  mkdirSync(join(dirs.scratch, 'proj', 'sess'), { recursive: true });
-  writeFileSync(join(dirs.scratch, 'proj', 'sess', 'note.txt'), 'scratch\n');
+  mkdirSync(join(dirs.scratch, '-proj', 'sess'), { recursive: true });
+  writeFileSync(join(dirs.scratch, '-proj', 'sess', 'note.txt'), 'scratch\n');
 
   const graphqlPage = (nodes) => ({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: false, endCursor: null }, nodes } } } });
   const script = (extra = []) => [...extra, { match: '^repo view', stdoutJson: REPO_VIEW }, { match: '^api graphql', stdoutJson: graphqlPage(prs) }];
@@ -176,7 +176,7 @@ test('report mode (default): the eligible worktree is reported, nothing on disk 
   assert.equal(r.json.holding.batches.length, 1);
   const outside = r.json.outside.map((o) => o.path);
   assert.ok(outside.includes(join(w.repo.dir, 'screenshots from mac')), JSON.stringify(outside));
-  assert.ok(outside.includes(join(w.dirs.scratch, 'proj', 'sess')), JSON.stringify(outside));
+  assert.ok(outside.includes(join(w.dirs.scratch, '-proj', 'sess')), JSON.stringify(outside));
   assert.match(r.json.summary, /^worktrees prune \(demo, report mode\): /);
   assert.deepEqual(w.snapshot(), before, 'report mode changes nothing');
   const log = readFileSync(join(w.dirs.logs, 'prune-acme_widgets.log'), 'utf8').trim().split('\n');
@@ -515,7 +515,7 @@ test('usage errors exit 2', () => {
 
 // ---- schedule: the nightly cron line (crontab and the time zone are injected; the real crontab is never touched) -----
 
-const { scheduleLine, applySchedule, detectTimezone, findOnPath, run: runWorktrees } = await import('../pipeline/commands/worktrees.mjs');
+const { scheduleLine, schedulePlist, scheduleLabel, applyLaunchd, applySchedule, detectTimezone, findOnPath, run: runWorktrees } = await import('../pipeline/commands/worktrees.mjs');
 
 const MARKER = '# claude-pipeline worktrees-prune worktrees-prune-0123456789ab';
 const LINE_ARGS = {
@@ -730,14 +730,253 @@ test('schedule from the main checkout and from a linked worktree replaces the sa
   assert.notEqual(first.output.line, second.output.line);
 });
 
-test('schedule outside Linux is refused with exit 2 and the crontab is untouched', async () => {
+test('schedule on Windows is refused with exit 2 and the crontab is untouched', async () => {
   const w = scheduleWorld();
   for (const verb of ['--install', '--remove', '--status']) {
     const r = await w.run([verb], w.ctx(w.repo.dir, { platform: 'win32' }));
     assert.equal(r.exitCode, 2, verb);
-    assert.equal(r.output.message, 'schedule is only supported on Linux (cron) in this version');
+    assert.equal(r.output.error, 'unsupported-platform');
+    assert.equal(r.output.message, 'schedule is only supported on Linux (cron) and macOS (launchd)');
   }
   assert.equal(w.ct.box.writes.length, 0);
+});
+
+// ---- macOS: the LaunchAgent (launchctl, home, uid, platform and the time zone are injected; the real launchctl is never run) ----
+
+// A fake launchctl: records every call; `answers` maps the first argument (bootout / bootstrap / print) to {code, stderr}.
+function fakeLaunchctl(answers = {}) {
+  const calls = [];
+  const fn = (args) => {
+    calls.push(args);
+    return { code: 0, stdout: '', stderr: '', ...(answers[args[0]] ?? {}) };
+  };
+  return { calls, fn, answers };
+}
+
+function darwinWorld() {
+  const w = scheduleWorld();
+  const home = tmp('cp-wthome-');
+  const lc = fakeLaunchctl();
+  const lockName = lockNameFor(realpathSync.native(join(w.repo.dir, '.git')));
+  const label = `com.claude-pipeline.${lockName}`;
+  const plistPath = join(home, 'Library', 'LaunchAgents', `${label}.plist`);
+  const dctx = (extra = {}) => w.ctx(w.repo.dir, { platform: 'darwin', home, uid: 501, launchctlFn: lc.fn, ...extra });
+  return { ...w, home, lc, lockName, label, plistPath, dctx, drun: (args, extra) => runWorktrees(['schedule', ...args], dctx(extra)) };
+}
+
+const PLIST_ARGS = {
+  nodePath: '/opt/node/bin/node', binPath: '/opt/p/pipeline/bin/pipeline.mjs', root: '/home/u/proj', at: '02:30',
+  label: 'com.claude-pipeline.worktrees-prune-0123456789ab', pathDirs: ['/opt/node/bin', '/opt/git/bin'], logFile: '/Users/u/.local/state/pipeline/cron-worktrees-prune-0123456789ab.log',
+};
+
+test('scheduleLabel: the cron marker lock name under a reverse-DNS prefix', () => {
+  assert.equal(scheduleLabel('worktrees-prune-0123456789ab'), 'com.claude-pipeline.worktrees-prune-0123456789ab');
+});
+
+test('schedulePlist: the exact plist (label, argv, root, PATH, calendar interval, log files, no RunAtLoad)', () => {
+  assert.equal(schedulePlist(PLIST_ARGS), [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+    '<plist version="1.0">',
+    '<dict>',
+    '  <key>Label</key>',
+    '  <string>com.claude-pipeline.worktrees-prune-0123456789ab</string>',
+    '  <key>ProgramArguments</key>',
+    '  <array>',
+    '    <string>/opt/node/bin/node</string>',
+    '    <string>/opt/p/pipeline/bin/pipeline.mjs</string>',
+    '    <string>worktrees</string>',
+    '    <string>prune</string>',
+    '    <string>--notify</string>',
+    '    <string>--summary-only</string>',
+    '  </array>',
+    '  <key>WorkingDirectory</key>',
+    '  <string>/home/u/proj</string>',
+    '  <key>EnvironmentVariables</key>',
+    '  <dict>',
+    '    <key>PATH</key>',
+    '    <string>/opt/node/bin:/opt/git/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>',
+    '  </dict>',
+    '  <key>StartCalendarInterval</key>',
+    '  <dict>',
+    '    <key>Hour</key>',
+    '    <integer>2</integer>',
+    '    <key>Minute</key>',
+    '    <integer>30</integer>',
+    '  </dict>',
+    '  <key>StandardOutPath</key>',
+    '  <string>/Users/u/.local/state/pipeline/cron-worktrees-prune-0123456789ab.log</string>',
+    '  <key>StandardErrorPath</key>',
+    '  <string>/Users/u/.local/state/pipeline/cron-worktrees-prune-0123456789ab.log</string>',
+    '  <key>RunAtLoad</key>',
+    '  <false/>',
+    '</dict>',
+    '</plist>',
+    '',
+  ].join('\n'));
+});
+
+test('schedulePlist: every string is XML-escaped; PATH dirs are listed once; --at is parsed to integers; bad input is refused', () => {
+  const p = schedulePlist({ ...PLIST_ARGS, root: '/home/u/a&b <c> "d" \'e\'', pathDirs: ['/a/bin', '/usr/bin', '/a/bin'], at: '23:05' });
+  assert.ok(p.includes('<string>/home/u/a&amp;b &lt;c&gt; &quot;d&quot; &apos;e&apos;</string>'), p);
+  assert.ok(p.includes('<string>/a/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>'), p);
+  assert.ok(p.includes('<integer>23</integer>') && p.includes('<integer>5</integer>'), p);
+  assert.throws(() => schedulePlist({ ...PLIST_ARGS, at: '25:00' }), /HH:MM/);
+  assert.throws(() => schedulePlist({ ...PLIST_ARGS, root: '/home/u/a\u0001b' }), /control character/);
+});
+
+test('schedule --install on macOS: writes the plist under ~/Library/LaunchAgents, then bootout and bootstrap in gui/<uid>', async () => {
+  const w = darwinWorld();
+  const r = await w.drun(['--install']);
+  assert.equal(r.exitCode, 0);
+  assert.deepEqual([r.output.ok, r.output.installed, r.output.changed, r.output.line, r.output.plist, r.output.timezone], [true, true, true, w.plistPath, w.plistPath, 'Asia/Manila']);
+  assert.equal(r.output.warning, undefined);
+  assert.match(r.output.note, /missed run when the Mac wakes/);
+  const text = readFileSync(w.plistPath, 'utf8');
+  assert.equal(text, schedulePlist({
+    nodePath: '/usr/bin/node', binPath: '/opt/p/pipeline/bin/pipeline.mjs', root: w.repo.dir, at: '02:30', label: w.label,
+    pathDirs: ['/usr/bin', '/opt/git/bin', '/opt/gh/bin'], logFile: join(w.logDir, `cron-${w.lockName}.log`),
+  }));
+  assert.ok(text.includes(`<string>${w.label}</string>`) && text.includes(`<string>${w.repo.dir}</string>`));
+  assert.deepEqual(w.lc.calls, [['bootout', `gui/501/${w.label}`], ['bootstrap', 'gui/501', w.plistPath]]);
+  assert.equal(w.ct.box.writes.length, 0, 'the crontab is not touched on macOS');
+});
+
+test('schedule --install on macOS: a second identical install does not rewrite the file but still reloads it; a new --at does', async () => {
+  const w = darwinWorld();
+  await w.drun(['--install']);
+  const t0 = lstatSync(w.plistPath).mtimeMs;
+  utimesSync(w.plistPath, 1, 1);
+  const again = await w.drun(['--install']);
+  assert.equal(again.output.changed, false);
+  assert.equal(lstatSync(w.plistPath).mtimeMs, 1000, `untouched (was ${t0})`);
+  assert.deepEqual(w.lc.calls.slice(2), [['bootout', `gui/501/${w.label}`], ['bootstrap', 'gui/501', w.plistPath]]);
+  const later = await w.drun(['--install', '--at', '04:15']);
+  assert.equal(later.output.changed, true);
+  assert.match(readFileSync(w.plistPath, 'utf8'), /<integer>4<\/integer>\s*<key>Minute<\/key>\s*<integer>15<\/integer>/);
+});
+
+test('schedule --install on macOS: a time zone other than Asia/Manila (or an unknown one) adds a launchd warning', async () => {
+  const w = darwinWorld();
+  assert.equal((await w.drun(['--install'], { tzFn: () => 'UTC' })).output.warning, 'launchd runs in UTC, not Asia/Manila — 02:30 is local time in that zone');
+  const unknown = await w.drun(['--install'], { tzFn: () => null });
+  assert.equal(unknown.output.timezone, null);
+  assert.match(unknown.output.warning, /could not tell which time zone launchd runs in/);
+});
+
+test('schedule --install on macOS: a bootout failure is ignored (not loaded); a bootstrap failure is exit 2 error launchctl', async () => {
+  const w = darwinWorld();
+  const ok = await w.drun(['--install'], { launchctlFn: fakeLaunchctl({ bootout: { code: 3, stderr: 'Boot-out failed: 3: No such process' } }).fn });
+  assert.equal(ok.exitCode, 0);
+  const bad = fakeLaunchctl({ bootstrap: { code: 5, stderr: 'Bootstrap failed: 5: Input/output error\n' } });
+  const r = await w.drun(['--install'], { launchctlFn: bad.fn });
+  assert.equal(r.exitCode, 2);
+  assert.equal(r.output.ok, false);
+  assert.equal(r.output.error, 'launchctl');
+  assert.match(r.output.message, /Bootstrap failed: 5/);
+});
+
+test('schedule --install on macOS: git or gh not found refuses with exit 2 and writes nothing', async () => {
+  const w = darwinWorld();
+  for (const missing of ['git', 'gh']) {
+    const r = await w.drun(['--install'], { whichFn: (cmd) => (cmd === missing ? null : `/opt/${cmd}/bin/${cmd}`) });
+    assert.equal(r.exitCode, 2, missing);
+    assert.equal(r.output.error, 'tool-missing');
+    assert.match(r.output.message, new RegExp(`${missing} was not found on PATH \\(launchd's own PATH is minimal`));
+  }
+  assert.equal(existsSync(w.plistPath), false);
+  assert.equal(w.lc.calls.length, 0);
+});
+
+test('schedule --remove on macOS: bootout, confirm unloaded with print, then the plist is deleted; absent is removed:false (bootout failure ignored)', async () => {
+  const w = darwinWorld();
+  await w.drun(['--install']);
+  const unloaded = fakeLaunchctl({ print: { code: 113 } }); // after bootout the job is gone
+  const rm = await w.drun(['--remove'], { launchctlFn: unloaded.fn });
+  assert.deepEqual([rm.exitCode, rm.output.ok, rm.output.removed], [0, true, true]);
+  assert.equal(existsSync(w.plistPath), false);
+  assert.deepEqual(unloaded.calls, [['bootout', `gui/501/${w.label}`], ['print', `gui/501/${w.label}`]]);
+  const none = await w.drun(['--remove'], { launchctlFn: fakeLaunchctl({ bootout: { code: 3 }, print: { code: 113 } }).fn });
+  assert.deepEqual([none.exitCode, none.output.removed], [0, false]);
+});
+
+test('schedule --remove on macOS: bootout fails and the job is still loaded -> exit 2 error launchctl, the plist stays', async () => {
+  const w = darwinWorld();
+  await w.drun(['--install']);
+  const stuck = fakeLaunchctl({ bootout: { code: 5, stderr: 'Boot-out failed: 5: Input/output error\n' } }); // print keeps answering 0 = still loaded
+  const rm = await w.drun(['--remove'], { launchctlFn: stuck.fn });
+  assert.equal(rm.exitCode, 2);
+  assert.equal(rm.output.ok, false);
+  assert.equal(rm.output.error, 'launchctl');
+  assert.equal(rm.output.message, `could not unload ${w.label}: Boot-out failed: 5: Input/output error`);
+  assert.equal(existsSync(w.plistPath), true, 'a still-loaded job keeps its plist so the next remove can retry');
+  assert.deepEqual(stuck.calls, [['bootout', `gui/501/${w.label}`], ['print', `gui/501/${w.label}`]]);
+  const silent = await w.drun(['--remove'], { launchctlFn: fakeLaunchctl({ bootout: { code: 7 } }).fn });
+  assert.equal(silent.output.message, `could not unload ${w.label}: exit 7`, 'no stderr -> the exit code');
+  assert.equal(existsSync(w.plistPath), true);
+});
+
+test('schedule --remove on macOS: a launchctl that cannot run at all is NOT "unloaded" -> exit 2 error launchctl, the plist stays', async () => {
+  const w = darwinWorld();
+  await w.drun(['--install']);
+  const enoent = { code: 1, stderr: 'spawn launchctl ENOENT' };
+  const dead = fakeLaunchctl({ bootout: enoent, print: enoent });
+  const rm = await w.drun(['--remove'], { launchctlFn: dead.fn });
+  assert.equal(rm.exitCode, 2);
+  assert.equal(rm.output.ok, false);
+  assert.equal(rm.output.error, 'launchctl');
+  assert.equal(rm.output.message, `could not confirm ${w.label} is unloaded: spawn launchctl ENOENT`);
+  assert.equal(existsSync(w.plistPath), true);
+  const mute = await w.drun(['--remove'], { launchctlFn: fakeLaunchctl({ bootout: { code: 1 }, print: { code: 1 } }).fn });
+  assert.equal(mute.output.message, `could not confirm ${w.label} is unloaded: exit 1`, 'no stderr -> the exit code');
+  assert.equal(existsSync(w.plistPath), true);
+});
+
+test('schedule --remove on macOS: print saying "Could not find service" (exit 113, or its text in either stream) confirms the job is gone', async () => {
+  const w = darwinWorld();
+  await w.drun(['--install']);
+  const gone = fakeLaunchctl({ print: { code: 113, stderr: 'Could not find service "x" in domain for port' } });
+  const rm = await w.drun(['--remove'], { launchctlFn: gone.fn });
+  assert.deepEqual([rm.exitCode, rm.output.removed], [0, true]);
+  assert.equal(existsSync(w.plistPath), false);
+  await w.drun(['--install']);
+  const byText = await w.drun(['--remove'], { launchctlFn: fakeLaunchctl({ print: { code: 1, stdout: 'could not find service "x"' } }).fn });
+  assert.deepEqual([byText.exitCode, byText.output.removed], [0, true]);
+});
+
+test('schedule --status on macOS: loaded:false when print confirms absence; an unexplained print failure adds a warning', async () => {
+  const w = darwinWorld();
+  await w.drun(['--install']);
+  const absent = await w.drun(['--status'], { launchctlFn: fakeLaunchctl({ print: { code: 113, stderr: 'Could not find service' } }).fn });
+  assert.deepEqual([absent.output.loaded, absent.output.warning], [false, undefined]);
+  const dead = await w.drun(['--status'], { launchctlFn: fakeLaunchctl({ print: { code: 1, stderr: 'spawn launchctl ENOENT' } }).fn });
+  assert.deepEqual([dead.exitCode, dead.output.loaded, dead.output.installed], [0, false, false]);
+  assert.equal(dead.output.warning, `could not tell whether ${w.label} is loaded: spawn launchctl ENOENT`);
+});
+
+test('schedule --status on macOS: installed only when the plist exists AND launchctl print succeeds', async () => {
+  const w = darwinWorld();
+  const none = await w.drun(['--status']);
+  assert.deepEqual([none.output.installed, none.output.loaded, none.output.line, none.output.plist], [false, true, null, w.plistPath]); // print answers 0 (loaded) but there is no plist
+  await w.drun(['--install']);
+  w.lc.calls.length = 0;
+  const on = await w.drun(['--status']);
+  assert.deepEqual([on.output.ok, on.output.installed, on.output.loaded, on.output.line, on.output.plist], [true, true, true, w.plistPath, w.plistPath]);
+  assert.deepEqual(w.lc.calls, [['print', `gui/501/${w.label}`]]);
+  const unloaded = await w.drun(['--status'], { launchctlFn: fakeLaunchctl({ print: { code: 113 } }).fn });
+  assert.deepEqual([unloaded.output.installed, unloaded.output.loaded, unloaded.output.line], [false, false, w.plistPath]);
+  rmSync(w.plistPath);
+  const gone = await w.drun(['--status'], { launchctlFn: fakeLaunchctl({ print: { code: 113 } }).fn });
+  assert.deepEqual([gone.output.installed, gone.output.loaded, gone.output.line], [false, false, null]);
+});
+
+test('applyLaunchd status only probes with print; remove boots out and probes; neither bootstraps', () => {
+  const home = tmp('cp-wthome-');
+  const plistPath = join(home, 'x.plist');
+  const lc = fakeLaunchctl({ print: { code: 113 } });
+  applyLaunchd({ action: 'status', plistPath, label: 'l', launchctlFn: lc.fn, uid: 7 });
+  applyLaunchd({ action: 'remove', plistPath, label: 'l', launchctlFn: lc.fn, uid: 7 });
+  assert.deepEqual(lc.calls, [['print', 'gui/7/l'], ['bootout', 'gui/7/l'], ['print', 'gui/7/l']]);
 });
 
 test('schedule: exactly one of --install / --remove / --status; --at only with --install; no NAME', async () => {
@@ -782,4 +1021,14 @@ test('schedule through the CLI uses the system crontab: no crontab yet, then ins
   assert.equal(cli('--status').json.installed, true);
   assert.equal(cli('--remove').json.removed, true);
   assert.equal(readFileSync(store, 'utf8'), '');
+});
+
+test('outsideReport lists only Claude project dirs (name starts with "-") as session scratch', () => {
+  const root = tmp('outside-root-');
+  const scr = tmp('outside-scratch-');
+  mkdirSync(join(scr, '-home-x-proj', 'sess1'), { recursive: true });
+  mkdirSync(join(scr, '-home-x-proj', 'sess2'), { recursive: true });
+  mkdirSync(join(scr, 'bash-edit-diff', 'abc123'), { recursive: true }); // Claude Code's own edit-diff temp, not a project
+  const got = outsideReport(root, { PIPELINE_SCRATCH_DIR: scr }).map((o) => o.path).sort();
+  assert.deepEqual(got, [join(scr, '-home-x-proj', 'sess1'), join(scr, '-home-x-proj', 'sess2')]);
 });

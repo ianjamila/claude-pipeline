@@ -1,13 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, realpathSync, existsSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, realpathSync, existsSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import path, { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   run, runAsync, runShell, runShellAsync, splitCommand, escapeArgument, escapeCommand, quoteForCmd, planSpawn,
   cmdExe, createResolver, toResult, shellResult,
-  gh, ghJson, GhError, codexCommand,
+  gh, ghJson, GhError, codexCommand, findOnPosixPath,
 } from '../pipeline/lib/proc.mjs';
 
 const fakeGh = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'fake-gh.mjs');
@@ -535,4 +535,62 @@ test('run passes awkward args through a real .cmd shim unchanged', { skip: proce
   const r = run(shim, input);
   assert.equal(r.code, 0, r.stderr);
   assert.deepEqual(JSON.parse(r.stdout), input);
+});
+
+// gh on macOS: the hook's PATH lacks /opt/homebrew/bin, so a bare `gh` was ENOENT and an allowed gh action was denied.
+const posixOnly = { skip: process.platform === 'win32' };
+function fakeGhDir(out) {
+  const dir = scratch();
+  const file = join(dir, 'gh');
+  writeFileSync(file, `#!/bin/sh\nprintf '${out}'\n`);
+  chmodSync(file, 0o755);
+  return dir;
+}
+
+test('gh falls back to a fixed install dir when the PATH lookup misses', posixOnly, () => {
+  const emptyPath = scratch();
+  const fallback = fakeGhDir('from-fallback');
+  const r = gh(['issue', 'view', '1'], { env: { PATH: emptyPath, PIPELINE_GH: '' }, fallbackDirs: [fallback] });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.stdout, 'from-fallback');
+});
+
+test('gh prefers the PATH hit over the fallback dirs', posixOnly, () => {
+  const onPath = fakeGhDir('from-path');
+  const fallback = fakeGhDir('from-fallback');
+  const r = gh(['x'], { env: { PATH: onPath, PIPELINE_GH: '' }, fallbackDirs: [fallback] });
+  assert.equal(r.stdout, 'from-path');
+});
+
+test('gh still fails (non-zero, nothing run) when neither PATH nor the fallback dirs hold gh', posixOnly, () => {
+  const r = gh(['x'], { env: { PATH: scratch(), PIPELINE_GH: '' }, fallbackDirs: [scratch()] });
+  assert.notEqual(r.code, 0);
+  assert.equal(r.stdout, '');
+});
+
+test('gh never takes a cwd-relative or non-executable fallback entry', posixOnly, () => {
+  const dir = scratch();
+  writeFileSync(join(dir, 'gh'), '#!/bin/sh\nprintf pwned\n'); // present but not executable
+  const r = gh(['x'], { env: { PATH: scratch(), PIPELINE_GH: '' }, fallbackDirs: [dir, '.', ''], cwd: dir });
+  assert.notEqual(r.code, 0);
+  assert.equal(r.stdout, '');
+});
+
+test('gh with a PIPELINE_GH override does not consult the fallback dirs', posixOnly, () => {
+  const fallback = fakeGhDir('from-fallback');
+  const r = gh(['x'], { env: { PATH: scratch(), PIPELINE_GH: 'cp-no-such-gh-xyz' }, fallbackDirs: [fallback] });
+  assert.notEqual(r.code, 0);
+  assert.equal(r.stdout, '');
+});
+
+test('findOnPosixPath skips empty and relative entries even when the cwd holds an executable gh', posixOnly, () => {
+  const dir = realpathSync.native(fakeGhDir('planted'));
+  const before = process.cwd();
+  process.chdir(dir);
+  try {
+    assert.equal(findOnPosixPath('gh', `${['', '.', 'rel'].join(path.delimiter)}`, ['.', '', 'rel']), null);
+    assert.equal(findOnPosixPath('gh', dir, []), join(dir, 'gh'));
+  } finally {
+    process.chdir(before);
+  }
 });

@@ -8,6 +8,8 @@
 //   E. `$(( $(cmd) - 2 ))`: arithmetic re-evaluates the text (`a[$(cmd)]` runs code), so a substitution inside it still feeds a shell.
 //   F. `$T` holding `npx vitest run x.test.tsx`: only the words a wrapper/interpreter really runs are script candidates.
 //   G. A bracket expression JS cannot compile still matches exactly one character in the shell.
+//   H. A script named by an absolute path, judged after the line made the directory unknown (a function definition, `export PATH=…`), crashed
+//      the git guard (path.resolve(null)) when the script writes a file: an internal error, so the line was denied.
 // The file system is faked (like test/guard-script-expansion.test.mjs); the guarded text only lives in fake file contents.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -329,4 +331,119 @@ test('C: variables the line sets reach the real home startup file (NVM_DIR=d ...
   allowBoth('cd sub && NVM_DIR=e bash -l -c true', rel);
   // not set on the line: it comes from the real environment, which is judged independently
   allowBoth('bash -l -c true', spec(true));
+});
+
+test('H: a script by absolute path, judged where the directory is unknown, is judged (no internal error)', () => {
+  const run = (command, spec) => git(command, fakeFs(GIT_ROOT, spec, DIRS));
+  const lines = (s) => [`f() { :; }; bash ${s}`, `export PATH=/x:$PATH; bash ${s}`, `f() { :; }; bash ${s} && cd sub`];
+  for (const l of lines('/work/repo/w.sh')) {
+    const ok = run(l, { 'w.sh': 'echo hi > out.txt\ncd sub && echo hi > o2.txt\ncd /tmp; git status' });
+    assert.equal(ok.decision, 'allow', `${l} -> ${ok.reason}`);
+    const bad = run(l, { 'w.sh': `echo hi > out.txt\ncd sub && ${BAD_GIT}` });
+    assert.equal(bad.decision, 'deny', l);
+    assert.doesNotMatch(bad.reason, /internal error/, l);
+  }
+  // a script the judged one writes and then runs, from a directory that is not known: still refused
+  const w = run('f() { :; }; bash /work/repo/w.sh', { 'w.sh': `cd sub; echo '${BAD_GIT}' > a.sh; bash /work/repo/sub/a.sh` });
+  assert.equal(w.decision, 'deny');
+  assert.doesNotMatch(w.reason, /internal error/);
+});
+
+// Why (replay 10-13): superpowers' task-brief runs its helper as `"${BASH:-bash}" "$(cd "$(dirname "$0")" && pwd)/sdd-workspace"`. The unresolved operand might have been
+// `-l`, so bash was taken for a login shell reading ~/.bash_profile, whose `eval "$(brew shellenv)"` cannot be followed: every name became unknown and the helper was refused.
+test('I: a helper named from the script\'s own directory (or by names the line set) is judged as that file, with no login files', () => {
+  const run = (cmd, helper, extra = {}) => files(cmd, fakeFs(PROJ, {
+    '/home/u/.bash_profile': 'export EDITOR=vi\neval "$(/opt/homebrew/bin/brew shellenv)"\n', 'scripts/helper': helper, ...extra,
+  }, ['scripts']), { env: { HOME: '/home/u', ZDOTDIR: '/home/u' } });
+  const words = ['"$(dirname "$0")/helper"', '"$(cd "$(dirname "$0")" && pwd)/helper"', '"${0%/*}/helper"', '"$(cd "$(dirname "$0")" && pwd -P)/helper"'];
+  for (const w of words) {
+    for (const outer of ['bash scripts/run.sh p', 'bash /home/u/proj/scripts/run.sh p', 'S=/home/u/proj/scripts; bash $S/run.sh p']) {
+      const spec = { 'scripts/run.sh': `set -eu\nx=$("\${BASH:-bash}" ${w} "$1")\necho "$x"\n` };
+      assert.equal(run(outer, 'echo hi', spec).decision, 'allow', `${outer} / ${w}`);
+      assert.equal(run(outer, BAD_FILES, spec).decision, 'deny', `${outer} / ${w} (bad helper)`);
+    }
+  }
+  // the operand may still be an option, or names a file elsewhere: unchanged
+  assert.equal(run('X=-l; bash $X scripts/helper', 'echo hi').decision, 'deny');
+  const login = { 'scripts/run.sh': 'bash "$(dirname "$0")/helper"\n', '/home/u/.bash_profile': BAD_FILES };
+  assert.equal(run('bash -l scripts/run.sh', 'echo hi', login).decision, 'deny');
+  // $0 changed before the word is read: not modelled, so the helper is not vouched for
+  assert.equal(run('bash scripts/run.sh', 'echo hi', { 'scripts/run.sh': 'cd /tmp\nsource ./x.sh\nbash "$(dirname "$0")/helper"\n' }).decision, 'deny');
+});
+
+// Why (replay 10-13, 150 psql commands): a `:name` the psql model cannot place (`'{"a":null}'`, `':x'`: quotes are not tracked) leaves an unknown shell line, which is
+// dynamic: refused when the line mentions a protected file. With a startup file that cannot be followed, every name was unknown, and the line's placeholder counted as a
+// variable picking the script, so any such psql command was refused.
+test('J: an unknown psql line is refused only with protected text around, also when a startup file cannot be followed', () => {
+  const env = { env: { HOME: '/home/u', ZDOTDIR: '/home/u' } };
+  const spec = { '/home/u/.zshenv': 'source "$(echo x)"\n' }; // (a sourced file that cannot be followed: every name is unknown)
+  const run = (cmd) => files(cmd, fakeFs(PROJ, spec, DIRS), env);
+  for (const sql of ["select ':x'", 'select \'{"a":null}\'::jsonb', "insert into t values ('{\"k\":\"v\"}')"]) {
+    assert.equal(run(`psql -c "${sql.replaceAll('"', '\\"')}"`).decision, 'allow', sql);
+    assert.equal(run(`psql -c "${sql.replaceAll('"', '\\"')}; select '/home/u/.claude/settings.json'"`).decision, 'deny', `${sql} + protected`);
+  }
+});
+
+// Why (commit review of I and J): the value a word has when the shell runs is the one assigned before it, once; and the SQL placeholder must not be a name a command can set.
+test('K: no login files are skipped on a value assigned later or alongside; a variable named like the SQL placeholder is a variable', () => {
+  const run = (cmd, extra, env = { HOME: '/home/u' }) => files(cmd, fakeFs(PROJ, { '/home/u/.bash_profile': BAD_FILES, 'scripts/ok.sh': 'echo hi', ...extra }, ['scripts']), { env });
+  const lx = { HOME: '/home/u', X: '-l' };
+  for (const [cmd, env] of [['bash $X scripts/ok.sh; X=foo', lx], ['X=foo bash $X scripts/ok.sh', lx], ['X=foo true; bash $X scripts/ok.sh', lx], ['X=foo; X=-l; bash $X scripts/ok.sh'], ['for S in -l x; do bash $S scripts/ok.sh; done'],
+    ['S=x; f() { bash $S scripts/ok.sh; }; S=-l; f'], ['true || X=foo; bash $X scripts/ok.sh', lx], ['X=foo | true; bash $X scripts/ok.sh', lx], ['X=foo; read X; bash $X scripts/ok.sh'],
+    [': ${X:=-l}; X=foo; bash $X scripts/ok.sh'], ['X=foo; unset X; bash $X scripts/ok.sh', lx]]) {
+    assert.equal(run(cmd, {}, env).decision, 'deny', cmd);
+  }
+  assert.equal(run('S=/home/u/proj/scripts; bash $S/ok.sh', {}).decision, 'allow');
+  // (a sourced file may change the name; a subshell's assignment is lost; a zsh modifier or subscript changes the value)
+  for (const [cmd, extra, env] of [['S=/home/u/proj/scripts; source ./env.sh; bash $S/ok.sh', { 'env.sh': 'S=-l\n' }], ['S=/home/u/proj/scripts; source "$(echo x)"; bash $S/ok.sh', {}],
+    ['(S=/home/u/proj/scripts); bash $S/ok.sh', {}, { HOME: '/home/u', S: '-l' }], ['S=x/-l; bash $S:t scripts/ok.sh', {}], ['S=(-l); bash $S[1] scripts/ok.sh', {}]]) {
+    assert.equal(run(cmd, extra, env).decision, 'deny', cmd);
+  }
+  // (every value the line assigns is tried, not only the last: here the first is the one the shell sees)
+  assert.equal(run('X=-l; bash $X/ok.sh; X=/home/u/proj/scripts', {}).decision, 'deny');
+  // (bound another way than a plain assignment: the value is unknown)
+  for (const b of ['let X=-1', '(( X = -1 ))', 'typeset X=-l', 'export X=-l', 'local X=-l', 'readonly X=-l', 'print -v X -- -l', 'printf -v X -- -l', 'vared X', 'zparseopts -A X', 'read X']) {
+    assert.equal(run(`X=/home/u/proj/scripts; ${b}; bash $X/ok.sh`, {}).decision, 'deny', b);
+  }
+  // (an assignment that may not run leaves the inherited value or nothing: still no option, so still no login files)
+  for (const cmd of ['cd sub && S=/home/u/proj/scripts && bash $S/ok.sh', 'cd sub && S=/home/u/proj/scripts; bash $S/ok.sh', 'true || S=/home/u/proj/scripts; bash ${S}/ok.sh']) assert.equal(run(cmd, {}).decision, 'allow', cmd);
+  for (const cmd of ['source "$(echo x)"; bash $SQL_UNKNOWN_SHELL_LINE', 'source "$(echo x)"; $SQL_UNKNOWN_SHELL_LINE', 'eval "$(cat x)"; bash "$SQL_UNKNOWN_SHELL_LINE"']) {
+    assert.equal(run(cmd, { x: 'SQL_UNKNOWN_SHELL_LINE=/home/u/proj/evil.sh', 'evil.sh': BAD_FILES }).decision, 'deny', cmd);
+  }
+});
+
+// Why (replay 10-13, 223 runs of eaglewatch's scripts/verify.mjs): JS template literals (`${ok ? 'PASS' : `FAIL ${x ?? '?'}`}`) were read as shell parameter defaults; too many
+// readings counted as naming a protected file, so a program that writes anything was refused.
+test('L: a program whose template literals overflow the default readings is judged on its text', () => {
+  const JSPROG = "const ok = true;\nsay(`verify (${mode}): ${ok ? 'PASS' : `FAIL at ${failed?.name ?? '?'}`} - ${a.filter((s) => s.x === 'pass').length}/${a.length}`);\nwarn(`lock ${lockName(g)} held by ${o?.pid ?? '?'} on ${o?.host ?? '?'}`);\nfs.writeFileSync('.verify/report.json', '{}');\n";
+  const run = (prog) => files('node scripts/verify.mjs --quick', fakeFs(PROJ, { 'scripts/verify.mjs': prog }, ['scripts']));
+  assert.equal(run(JSPROG).decision, 'allow');
+  // (one word whose own readings overflow is still a hit)
+  const many = Array.from({ length: 20 }, (_, i) => `\${V${i}:-x}`).join('');
+  assert.equal(run(`${JSPROG}execSync('cp a ${many}/home/u/.cla\${Z:-ude}/settings.json')\n`).decision, 'deny');
+  for (const bad of ["fs.writeFileSync('/home/u/.claude/settings.json', x)", 'fs.writeFileSync(`${HOME}/.claude/settings.json`, x)', "fs.writeFileSync(os.homedir() + '/.claude/pipeline/x', x)",
+    // (a shell default inside one word of a command the program runs: its readings are still judged, word by word)
+    "execSync('cat x > ${X:-/home/u/.cla}ude/settings.json')", "execSync(`cp a ${A:-~/.c}${B:-laude}/settings.json`)", "execSync('cat x > ${X:-/home/u/.cla}ude/settings.json${')"]) {
+    assert.equal(run(`${JSPROG}${bad}\n`).decision, 'deny', bad);
+  }
+});
+
+// Why (replay 10-13): `node ~/.claude/pipeline/bin/pipeline.mjs job start codex-r1 -- node ~/.claude/pipeline/bin/pipeline.mjs codex-review …` (the ship skill's review step):
+// the outer CLI is a program whose writes are unknown, so the inner one "may have been written", and the line "refers to a protected file" only because it names that CLI.
+test('M: the pipeline CLI run after a command whose writes are unknown is not refused for naming itself', () => {
+  const CLI = '/home/u/.claude/pipeline/bin/pipeline.mjs';
+  const run = (cmd) => files(cmd, fakeFs(PROJ, { [CLI]: 'console.log(1)\n' }, DIRS));
+  for (const cmd of [`B=$(git merge-base origin/main HEAD); node ${CLI} job start codex-r1 -- node ${CLI} codex-review --pr 1 --round 1 --base $B --head $(git rev-parse HEAD)`,
+    'node ~/.claude/pipeline/bin/pipeline.mjs job start c -- node ~/.claude/pipeline/bin/pipeline.mjs codex-review --head $(git rev-parse HEAD)', `node x.mjs; node ${CLI} status`]) {
+    assert.equal(run(cmd).decision, 'allow', cmd);
+  }
+  // another protected name or switch on the line still counts
+  const inner = `node ${CLI} job start c -- node ${CLI} codex-review --head $(git rev-parse HEAD)`;
+  for (const cmd of [`${inner} # ~/.claude/settings.json`, `${inner} # disable${'AllHooks'}`]) assert.equal(run(cmd).decision, 'deny', cmd);
+  // (the CLI handed to a program with unknown writes as an argument still counts: only the word an interpreter runs is left out)
+  assert.equal(run(`node x.mjs ${CLI}; node ${CLI} status`).decision, 'deny');
+  assert.equal(files(`eval "$X" ${CLI}; node ${CLI} status`, fakeFs(PROJ, { [CLI]: 'console.log(1)\n' }, DIRS)).decision, 'deny');
+  // (only a protected script's own word is left out: another script named like a switch still counts)
+  const other = files('eval "$X"; bash PIPELINE_ADMIN.sh', fakeFs(PROJ, { 'PIPELINE_ADMIN.sh': 'echo hi\n' }, DIRS));
+  assert.equal(other.decision, 'deny');
 });

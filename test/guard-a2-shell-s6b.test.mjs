@@ -1,0 +1,357 @@
+// Why (PR A2, batch S6, part 2): superpowers' SDD helpers (task-brief, review-package -> sdd-workspace) were still refused after the case-pattern fix: a cd inside
+// `$( )` counted for the whole script, the cd sdd-workspace ends with counted for the writes before it, words in a comment (or in a grep pattern elsewhere on the
+// line) switched off the `${BASH:-bash}` reading, an `if` at the top made every later write "maybe first", and the git policy read every assignment after an `if`
+// as "may not run". Each test pins the workflow that must pass next to the nearest dangerous twin that must stay refused. Fake file systems like
+// guard-a2-shell-s5d.test.mjs; guarded text only lives in fake file contents or command strings.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { resolve, dirname, basename } from 'node:path';
+import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
+import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
+import { simpleCommands } from '../pipeline/hooks/lib/shell-parse.mjs';
+
+function fakeFs(root, files, dirs = []) {
+  const abs = (p) => resolve(root, p);
+  const F = Object.fromEntries(Object.entries(files).map(([k, v]) => [abs(k), v]));
+  const D = new Set([root, ...dirs.map(abs)].map((p) => resolve(p)));
+  for (const p of Object.keys(F)) for (let d = dirname(p); dirname(d) !== d; d = dirname(d)) D.add(d);
+  const names = (d) => {
+    const out = new Set();
+    for (const p of [...Object.keys(F), ...D]) if (p !== d && dirname(p) === d) out.add(basename(p));
+    return [...out];
+  };
+  return {
+    readText: (p) => (typeof F[resolve(p)] === 'string' ? F[resolve(p)] : null),
+    readHead: () => null,
+    pathExists: (p) => resolve(p) in F || D.has(resolve(p)),
+    readDir: (p) => (D.has(resolve(p)) ? names(resolve(p)) : null),
+  };
+}
+const GIT_ROOT = resolve('/work/repo');
+const PROJ = '/home/u/proj';
+const REAL_ENV = { HOME: '/home/u', ZDOTDIR: '/home/u' };
+const git = (command, fsOpts, o = {}) => evaluateGitCommand(command, {
+  cwd: GIT_ROOT, home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], ...fsOpts, ...o,
+});
+const files = (command, fsOpts, o = {}) => evaluateBashForFiles(command, {
+  home: '/home/u', env: REAL_ENV, platform: 'linux', realpath: (p) => p, cwd: PROJ, ...fsOpts, existsSync: fsOpts.pathExists, ...o,
+});
+const BAD_GIT = 'git push origin main';
+const BAD_WRITE = 'echo x > /home/u/.claude/settings.json';
+const DIRS = ['sub', '/home/u'];
+const F = (command, spec, o) => files(command, fakeFs(PROJ, spec, DIRS), o).decision;
+const Fr = (command, spec, o) => files(command, fakeFs(PROJ, spec, DIRS), o);
+const G = (command, spec, o) => git(command, fakeFs(GIT_ROOT, spec, DIRS), o).decision;
+const marks = (c) => Object.entries(c.ctl).filter(([, v]) => v).map(([k]) => k).join(',');
+
+// ---- the parser's marks -----------------------------------------------------------------------------------------------------------------------------------
+
+test('S6b parse: every command carries the subshells it runs in (grp): $( ), ( ), backticks, <( ), and a heredoc body expands where its command runs', () => {
+  const cs = simpleCommands('a; x=$(b; (c)); `d`; e <(f); (g <<EOF\n$(h)\nEOF\n)');
+  const by = Object.fromEntries(cs.filter((c) => c.argv.length).map((c) => [c.argv[0], c.grp]));
+  assert.deepEqual(by.a, []);
+  assert.equal(by.b.length, 1);
+  assert.equal(by.c.length, 2);
+  assert.deepEqual(by.c.slice(0, 1), by.b);
+  assert.equal(by.d.length, 1);
+  assert.deepEqual(by.e, []);
+  assert.equal(by.f.length, 1);
+  assert.equal(by.g.length, 1);
+  assert.deepEqual(by.h.slice(0, by.g.length), by.g, 'the heredoc body of g expands in g\'s subshell');
+  assert.equal(by.h.length, by.g.length + 1, '(in a substitution of its own)');
+  // distinct subshells get distinct ids
+  assert.notDeepEqual(by.b, by.d);
+  // a heredoc whose body is read after its subshell closed: the body and the commands finished with it still belong to that subshell
+  const late = simpleCommands('x=$(cat <<EOF); y\n$(h)\nEOF\n(cat <<EOF; bash -c "z")\nbody\nEOF');
+  const cats = late.filter((c) => c.argv[0] === 'cat');
+  const lh = late.find((c) => c.argv[0] === 'h');
+  const lz = late.find((c) => c.argv[0] === 'z');
+  assert.equal(cats.length, 2);
+  for (const c of cats) assert.equal(c.grp.length, 1, 'cat runs in its subshell although the queue finishes it later');
+  assert.deepEqual(lh.grp.slice(0, 1), cats[0].grp, 'the body of the first heredoc expands in the substitution');
+  assert.deepEqual(lz.grp.slice(0, 1), cats[1].grp, 'bash -c text run in the subshell');
+  assert.deepEqual(late.find((c) => c.argv[0] === 'y').grp, []);
+});
+
+test('S6b parse: loops, function bodies, trap actions and if / case branches are marked (ctl), and the names a text defines as functions are listed (fns)', () => {
+  const cs = simpleCommands('f() { a; }; function g { b; }; function h() ( c ); k l () { d; }\nfor i in 1; do e; done; x\nwhile y; do z; done\ntrap "t" EXIT\nif p; then q; else r; fi; s\ncase $v in w) u ;; esac; after');
+  const m = Object.fromEntries(cs.filter((c) => c.argv.length).map((c) => [c.argv.join(' '), marks(c)]));
+  for (const k of ['a', 'b', 'c', 'd']) assert.equal(m[k], 'fn', k);
+  assert.equal(m.e, 'loop');
+  assert.equal(m.y, 'loop', 'the loop condition runs again too');
+  assert.equal(m.z, 'loop');
+  assert.equal(m.t, 'trap');
+  for (const k of ['p', 'q', 'r', 'u']) assert.equal(m[k], 'cond', k);
+  for (const k of ['x', 's', 'after']) assert.equal(m[k], '', `${k}: after the construct ended`);
+  assert.deepEqual([...cs.fns].sort(), ['f', 'g', 'h', 'k', 'l']);
+  // every command of a longer body, and none after it
+  const body = simpleCommands('f() {\n  a1\n  a2; a3\n}\nfunction g {\n  b1\n  b2\n}\nafter');
+  const bm = Object.fromEntries(body.filter((c) => c.argv.length).map((c) => [c.argv[0], marks(c)]));
+  for (const k of ['a1', 'a2', 'a3', 'b1', 'b2']) assert.equal(bm[k], 'fn', k);
+  assert.equal(bm.after, '');
+  // a `done` / `}` / `fi` inside a substitution or a -c text closes nothing outside it
+  const n = simpleCommands('while a; do x=$(done; fi); b; done; c');
+  assert.equal(marks(n.find((c) => c.argv[0] === 'b')), 'loop');
+  assert.equal(marks(n.find((c) => c.argv[0] === 'c')), '');
+});
+
+test('S6b parse: a word in a comment binds no BASH, a binder in code still does (also one a comment-looking line inside a quote hides)', () => {
+  const bound = (t) => { const st = { bound: false, rewrote: false }; simpleCommands(t, { bashState: st, env: {} }); return st.bound; };
+  assert.equal(bound('# Single source of truth\n# read or overwrite another plan\'s\necho hi'), false);
+  assert.equal(bound('echo hi # eval it later'), false);
+  for (const t of [
+    'source x.sh',
+    'eval "$X"',
+    'read -r "$n"',
+    'x=\'\n# \' ; read "$v" ; \'\n\'', // the `#` line is inside a quote: the read is code
+    'cat <<EOF\n# source\nEOF', // a heredoc body is no comment to us: stricter
+    'echo "# source"', // a quoted word is no comment
+  ]) assert.equal(bound(t), true, JSON.stringify(t));
+});
+
+// ---- files policy: where a cd reaches ---------------------------------------------------------------------------------------------------------------------
+
+// (PR #50 first let a cd in a subshell of reads, or one a script ends with, reach nothing: every name a shell can run hidden code behind had to be denied. The owner
+// dropped those shortcuts on 2026-10-14; what stays is that each of these is refused.)
+test('S6b files: a cd into an unknown directory, in a subshell or not, keeps a write after it or inside the subshell refused', () => {
+  const spec = { 'r.txt': 'x' };
+  assert.equal(F('d=$(cd "$Q" && echo hi > out.txt)', spec), 'deny');
+  assert.equal(F('(cd "$Q"; echo hi > out.txt)', spec), 'deny');
+  assert.equal(F('(cd "$Q"; touch out.txt)', spec), 'deny');
+  assert.equal(F('cd "$Q"; echo hi > out.txt', spec), 'deny');
+  assert.equal(F('(cd /home/u/.claude && echo hi > settings.json)', spec), 'deny');
+});
+
+const SCRIPT = (body) => ({ 's.sh': body, 'lib.sh': 'echo lib' });
+test('S6b files: in a script run by a shell, a cd into an unknown directory with a write after it (or one that may run after it) is refused', () => {
+  for (const body of [
+    'cd "$U"\necho hi > out.txt\n', // a write after it
+    'cd "$U" && touch out.txt\n',
+    'for i in 1 2; do echo hi > out.txt; cd "$U"; done\n', // the loop's earlier write runs again after it
+    'trap "echo bye > out.txt" EXIT\ncd "$U"\n', // the trap fires after it
+    'pwd() { echo hi > out.txt; }\ncd "$U" && pwd\n', // `pwd` is the script's function
+    'Pwd() { echo hi > out.txt; }\ncd "$U" && Pwd\n',
+    'chpwd() { echo hi > out.txt; }\ncd "$U"\n', // zsh runs chpwd after the cd
+    'f() { cd "$U"; }\necho hi > out.txt\nf\n', // the cd is in a function body
+    'source lib.sh\necho hi > out.txt\ncd "$U"\n', // the sourced file may have set a trap
+  ]) assert.equal(F('bash s.sh', SCRIPT(body)), 'deny', JSON.stringify(body));
+  // the line itself, or a sourced file: the next command (or call) goes on in that directory
+  assert.equal(F('echo hi > out.txt; cd "$U" && pwd', {}), 'deny');
+  assert.equal(F('source s.sh', SCRIPT('echo hi > out.txt\ncd "$U" && pwd\n')), 'deny');
+});
+
+// ---- files policy: write order -----------------------------------------------------------------------------------------------------------------------------
+
+test('S6b files: a write later in a script than the script it runs cannot change it, even after an `if`; in a loop, a function or a trap it can', () => {
+  // (bad.sh holds the guarded write: the scripts below never spell a protected path, so only the order of the copy decides)
+  const spec = (body) => ({ 's.sh': body, 'h.sh': 'echo hi', 'bad.sh': BAD_WRITE });
+  assert.equal(F('bash s.sh', spec('if [ -n "$X" ]; then echo x; fi\nbash h.sh\ncp bad.sh h.sh\n')), 'allow');
+  assert.equal(F('bash s.sh', spec('case "$X" in a) echo a ;; esac\nbash h.sh\n{ cat bad.sh; } > h.sh\n')), 'allow');
+  for (const body of [
+    'for i in 1 2; do bash h.sh; cp bad.sh h.sh; done\n',
+    'while read l; do bash h.sh; cp bad.sh h.sh; done\n',
+    'f() { bash h.sh; }\nf\ncp bad.sh h.sh\nf\n',
+    'trap "bash h.sh" EXIT\ncp bad.sh h.sh\n',
+    'cp bad.sh h.sh\nif [ -n "$X" ]; then echo x; fi\nbash h.sh\n', // (copied before: as always)
+  ]) assert.equal(F('bash s.sh', spec(body)), 'deny', JSON.stringify(body));
+});
+
+// ---- files policy: BASH in a script run by bash -------------------------------------------------------------------------------------------------------------
+
+const TB = '#!/usr/bin/env bash\n# Single source of truth: read or overwrite another plan\'s\nplan=$1\ndir=$("${BASH:-bash}" "$(cd "$(dirname "$0")" && pwd)/helper" "$plan")\necho "$dir"\n';
+test('S6b files: in a script run by plain bash, `${BASH:-bash}` names bash whatever the rest of the line (or the script\'s comments) says', () => {
+  // (a harmful login file: the old reading, `${BASH:-bash}` unknown, ends in a login shell that reads it; the bash reading never does)
+  const ok = { 'scripts/tb': TB, 'scripts/helper': 'echo hi', '/home/u/.bash_profile': BAD_WRITE };
+  const bad = { ...ok, 'scripts/helper': BAD_WRITE };
+  const BIND = 'grep -n "export type X\\|export interface Y" f.ts; ';
+  for (const pre of ['', BIND, 'read -r "$n" < f; ']) {
+    assert.equal(F(`${pre}bash scripts/tb plan.md`, ok), 'allow', pre);
+    assert.equal(F(`${pre}bash scripts/tb plan.md`, bad), 'deny', `${pre} (the helper is judged)`);
+  }
+  assert.equal(F(`S=scripts; ${BIND}bash $S/tb plan.md`, ok), 'allow', '(the script picked through a variable)');
+  // the bash reads a startup file first (it may bind BASH), or the line may change which program `bash` is: the old reading
+  assert.equal(F('BASH_ENV=rc bash scripts/tb plan.md', { ...ok, rc: 'read -r BASH' }), 'deny');
+  assert.equal(F(`${BIND}PATH=/tmp/x:$PATH bash scripts/tb plan.md`, ok), 'deny');
+});
+
+// ---- git policy -------------------------------------------------------------------------------------------------------------------------------------------
+
+test('S6b git: an assignment after an if / case has ended runs as surely as one before it; one inside a branch, a loop, a function or a subshell may not run', () => {
+  assert.equal(G('if [ -n "$X" ]; then echo x; fi; B=agent/x; git push origin "$B"', {}), 'allow');
+  assert.equal(G('case "$X" in a) echo a ;; esac; B=agent/x; git push origin "$B"', {}), 'allow');
+  for (const c of [
+    'B=agent/x; if [ -n "$X" ]; then B=main; fi; git push origin "$B"',
+    'B=agent/x; case "$X" in a) B=main ;; esac; git push origin "$B"',
+    'B=agent/x; for i in 1; do B=main; done; git push origin "$B"',
+    'B=agent/x; f() { B=main; }; git push origin "$B"',
+    '(B=main); git push origin "$B"',
+  ]) assert.equal(G(c, {}), 'deny', c);
+});
+
+// (a cd into an unsure directory leaves it unknown from there on, as `cd "$(cmd)"` does: guard-a2-shell-s7.test.mjs)
+test('S6b git: after a cd into an unsure directory, what needs the directory is refused: in a script, on the line, after a sourced file, after a loop', () => {
+  const sc = (body) => ({ 's.sh': body, 'run.sh': 'echo hi' });
+  const tail = 'D=a\nif [ -n "$X" ]; then D=b; fi\n';
+  assert.equal(G('bash s.sh', sc(`${tail}cd "$D" && git push origin main\n`)), 'deny');
+  assert.equal(G('bash s.sh', sc(`${tail}cd "$D"\nbash run.sh\n`)), 'deny');
+  assert.equal(G('bash s.sh', sc(`for i in 1; do ${tail}cd "$D"; done\ngit push\n`)), 'deny');
+  assert.equal(G('source s.sh; git push', sc(`${tail}cd "$D" && pwd\n`)), 'deny');
+  // a file a script sources runs in that script: what the script runs after it goes on in that directory
+  assert.equal(G('bash s.sh', { 's.sh': 'source ./lib.sh\ngit push\n', 'lib.sh': `${tail}cd "$D" && pwd\n` }), 'deny');
+  assert.equal(G(`${tail.replace(/\n/g, '; ')}cd "$D" && git push`, {}), 'deny');
+});
+
+// ---- files policy: live replay groups (S6, part 3) ---------------------------------------------------------------------------------------------------------
+
+test('S6b files: the real home\'s .zshenv named through ZDOTDIR is not taken to be rewritten by a program the guard does not model (as without ZDOTDIR); a modelled write still counts', () => {
+  const env = { HOME: '/home/u', ZDOTDIR: '/home/u' };
+  const spec = { '/home/u/.zshenv': 'export EDITOR=vi' };
+  assert.equal(F('mytool --version; zsh -ic \'echo hi > "$OUT"\'', spec, { env }), 'allow');
+  assert.equal(F('mytool --version; zsh -ic \'echo hi > "$OUT"\'', spec, { env: { HOME: '/home/u' } }), 'allow');
+  // the line writes it first (a write the guard models), or ZDOTDIR is not the home: as before
+  assert.equal(F('echo "OUT=/home/u/.claude/settings.json" > /home/u/.zshenv; zsh -ic \'echo hi > "$OUT"\'', spec, { env }), 'deny');
+  assert.equal(F('mytool --version; zsh -ic \'echo hi > "$OUT"\'', { '/home/u/zd/.zshenv': 'export EDITOR=vi' }, { env: { HOME: '/home/u', ZDOTDIR: '/home/u/zd' } }), 'deny');
+});
+
+test('S6b files: a file a script sources may source another by a literal name: its effects are followed; a run-time name, a relative one, arguments, a cycle or a binder in it are not', () => {
+  const base = (envSh, fix = 'export Y=2') => ({ 's.sh': 'source /home/u/proj/env.sh\necho hi > "$1"\n', 'env.sh': envSh, 'fix.sh': fix });
+  assert.equal(F('bash s.sh out.txt', base('set -a\n. /home/u/proj/fix.sh\nexport X=1\n')), 'allow');
+  // what the nested file assigns is what the script sees
+  const vs = (fix) => ({ 's.sh': 'source /home/u/proj/env.sh\necho hi > "$OUT"\n', 'env.sh': '. /home/u/proj/fix.sh\n', 'fix.sh': fix });
+  assert.equal(F('bash s.sh', vs('OUT=/home/u/proj/out.txt')), 'allow');
+  assert.equal(F('bash s.sh', vs('OUT=/home/u/.claude/settings.json')), 'deny');
+  assert.equal(F('bash s.sh', vs('D=/home/u/.cl\nOUT=${D}aude/settings.json')), 'deny', '(spelled in pieces: only the value followed through both files finds it)');
+  for (const [envSh, fix] of [
+    ['set -a\n. /home/u/proj/fix.sh\n', 'set -- /home/u/.claude/settings.json'], // the nested file sets $1
+    ['. /home/u/proj/fix.sh\n', 'eval "$Z"'],
+    ['. "$F"\n', 'export Y=2'],
+    ['. ./fix.sh\n', 'export Y=2'],
+    ['. /home/u/proj/fix.sh a b\n', 'export Y=2'],
+    ['. /home/u/proj/env.sh\n', 'export Y=2'],
+    ['. /home/u/proj/missing.sh\n', 'export Y=2'],
+    ['. /home/u/proj/fix.sh\nexport X=1\n', 'export Y=2\nset -- /home/u/.claude/settings.json'],
+  ]) assert.equal(F('bash s.sh out.txt', base(envSh, fix)), 'deny', JSON.stringify(envSh + ' | ' + fix));
+});
+
+test('S6b files (review): on a line that runs code an agent steers, or names the file, the home .zshenv may have been rewritten by any program, as before', () => {
+  const env = { HOME: '/home/u', ZDOTDIR: '/home/u' };
+  const spec = { '/home/u/.zshenv': 'export EDITOR=vi', 'w.py': 'print(1)' };
+  for (const pre of [
+    'node -e "require(\'fs\').writeFileSync(process.argv[1], \'x\')" /tmp/a',
+    'python3 w.py',
+    'npx some-tool',
+    'mytool --out /home/u/.zshenv',
+    '$TOOL --version',
+  ]) assert.equal(F(`${pre}; zsh -ic 'echo hi > "$OUT"'`, spec, { env }), 'deny', pre);
+});
+test('S6b files (review): ... also behind an assignment prefix or a wrapper', () => {
+  const env = { HOME: '/home/u', ZDOTDIR: '/home/u' };
+  for (const pre of ['X=1 npx some-tool', 'nohup some-tool', 'env A=1 some-tool']) assert.equal(F(`${pre}; zsh -ic 'echo hi > "$OUT"'`, { '/home/u/.zshenv': 'export EDITOR=vi' }, { env }), 'deny', pre);
+});
+
+// ---- Codex review of #50 (P1 x3) and a sibling --------------------------------------------------------------------------------------------------------------
+
+test('S6b codex: a function or alias the text defines behind a "read-only" name in a subshell after a cd into ~/.claude is refused', () => {
+  const spec = { 'r.txt': 'x' };
+  assert.equal(F('pwd() { echo x > settings.json; }; (cd /home/u/.claude; pwd)', spec), 'deny');
+  assert.equal(F('Pwd() { echo x > settings.json; }; (cd /home/u/.claude; pwd)', spec), 'deny');
+  assert.equal(F('ls() { echo x > out.txt; }; d=$(cd "$Q" && ls); echo hi > out2.txt', spec), 'deny');
+  assert.equal(F('alias ls="touch settings.json"; (cd /home/u/.claude; ls)', spec), 'deny');
+});
+
+test('S6b codex: `time` (and an unknown prefix) before a compound command keeps its branches conditional', () => {
+  const env = { B: 'main' };
+  for (const c of [
+    'time if false; then B=agent/x; fi; git push origin "$B"',
+    'time -p if false; then B=agent/x; fi; git push origin "$B"',
+    'time while false; do B=agent/x; done; git push origin "$B"',
+    'nocorrect if false; then B=agent/x; fi; git push origin "$B"', // a prefix we do not model: the marks are not trusted
+  ]) assert.equal(G(c, {}, { env }), 'deny', c);
+});
+
+test('S6b codex: a brace group after && / || or in a pipeline / background job keeps every command in it conditional (or out of this shell)', () => {
+  const env = { B: 'main' };
+  for (const c of [
+    'false && { if true; then :; fi; B=agent/x; }; git push origin "$B"',
+    'false || { while false; do :; done; B=agent/x; }; git push origin "$B"',
+    'true | { B=agent/x; true; }; git push origin "$B"',
+    '{ B=agent/x; true; } | cat; git push origin "$B"',
+    '{ B=agent/x; true; } & git push origin "$B"',
+  ]) assert.equal(G(c, {}, { env }), 'deny', c);
+  assert.equal(G('{ B=agent/x; true; }; git push origin "$B"', {}, { env }), 'allow', '(a plain group runs in this shell, unconditionally)');
+  const m = simpleCommands('false && { if a; then b; fi; c; }; d');
+  assert.equal(m.find((x) => x.argv[0] === 'c').ctl.cond, true);
+  assert.equal(m.find((x) => x.argv[0] === 'd').ctl.cond, false);
+});
+
+test('S6b codex: ... `time` is read exactly (what comes after the construct is sure), and a construct an unknown prefix hides keeps every consumer on the old reading', () => {
+  const env = { B: 'main' };
+  assert.equal(G('time if false; then :; fi; B=agent/x; git push origin "$B"', {}, { env }), 'allow');
+  assert.equal(G('time -p while false; do :; done; B=agent/x; git push origin "$B"', {}, { env }), 'allow');
+  assert.equal(G('nocorrect case "$X" in a) B=agent/x ;; esac; git push origin "$B"', {}, { env }), 'deny');
+  const first = simpleCommands('false && { a; b; }; c');
+  assert.equal(first.find((x) => x.argv[0] === 'a').ctl.cond, true, '(the group\'s first command too)');
+  const spec = (body) => ({ 's.sh': body, 'h.sh': 'echo hi', 'bad.sh': BAD_WRITE });
+  assert.equal(F('bash s.sh', spec('nocorrect while true; do echo hi > out.txt; cd "$U"; done\n')), 'deny', '(the loop runs the write again after the cd)');
+  assert.equal(F('bash s.sh', spec('nocorrect while true; do bash h.sh; cp bad.sh h.sh; done\n')), 'deny', '(the copy lands before the next run)');
+});
+
+// ---- Codex recheck of #50 (P1 x3) -------------------------------------------------------------------------------------------------------------------------------
+
+test('S6b codex recheck: a function defined over two lines, or handed to a child (export -f, BASH_FUNC_ in the environment, a startup file), behind a subshell cd is refused', () => {
+  const spec = { 'r.txt': 'x', 's.sh': '(cd /home/u/.claude; pwd)\n', 'rc': 'pwd() { echo x > settings.json; }' };
+  assert.equal(F('function pwd\n{ echo x > settings.json; }\n(cd /home/u/.claude; pwd)', spec), 'deny');
+  assert.equal(F('pwd()\n{ echo x > settings.json; }\n(cd /home/u/.claude; pwd)', spec), 'deny');
+  assert.equal(F('time function pwd { echo x > settings.json; }; (cd /home/u/.claude; pwd)', spec), 'deny');
+  assert.equal(F('pwd() { echo x > settings.json; }; export -f pwd; bash s.sh', spec), 'deny');
+  assert.equal(F('pwd() { echo x > settings.json; }; declare -fx pwd; bash s.sh', spec), 'deny');
+  assert.equal(F('bash s.sh', spec, { env: { ...REAL_ENV, 'BASH_FUNC_pwd%%': '() { echo x > settings.json; }' } }), 'deny');
+  assert.equal(F('BASH_ENV=rc bash s.sh', spec), 'deny');
+  const fns = simpleCommands('function pwd\n{ :; }\ntime function g { :; }');
+  assert.deepEqual([...fns.fns].sort(), ['g', 'pwd']);
+});
+
+test('S6b codex recheck: `}|` and `}&` with no blank still run the group in a subshell', () => {
+  const env = { B: 'main' };
+  for (const c of [
+    '{ if true; then :; fi; B=agent/x; true; }| cat; git push origin "$B"',
+    '{ if true; then :; fi; B=agent/x; true; }& git push origin "$B"',
+    '{ B=agent/x; true; }|cat; git push origin "$B"',
+  ]) assert.equal(G(c, {}, { env }), 'deny', c);
+});
+
+test('S6b codex recheck: marks the parser cannot trust never turn a conditional assignment into a sure one', () => {
+  const env = { B: 'main' };
+  for (const c of [
+    'function f { B=agent/x; }; time function g { :; }; git push origin "$B"',
+    'f() { B=agent/x; }; nocorrect if true; then :; fi; git push origin "$B"',
+    'B2=1; nocorrect if true; then :; fi; B=agent/x; false && B=main; git push origin "$B"',
+  ]) assert.equal(G(c, {}, { env }), 'deny', c);
+});
+
+test('S6b codex recheck: ... the two-line body is a function body for the marks, and a function the line exports to a child script, or a startup file defines for it, is judged', () => {
+  const env = { B: 'main' };
+  assert.equal(G('function f\n{ B=agent/x; }\ngit push origin "$B"', {}, { env }), 'deny');
+  // (files: an exported function's body is judged in the parent text only, before and after this PR: issue #51)
+  // git: after the child's cd into an unsure directory, an exported or startup-file `pwd` pushes the branch checked out there
+  const gs = { 's.sh': 'D=a\nif [ -n "$X" ]; then D=b; fi\ncd "$D" && pwd\n', 'rc': 'pwd() { git push; }' };
+  assert.equal(G('pwd() { git push; }; export -f pwd; bash s.sh', gs), 'deny');
+  assert.equal(G('BASH_ENV=rc bash s.sh', gs), 'deny');
+  // (a function a child imports from the environment, BASH_FUNC_pwd%%, is never read: issue #51)
+});
+
+// ---- background security review of bb54d9f ----------------------------------------------------------------------------------------------------------------------
+
+test('S6b review 3: zsh hook arrays, traps and a moved PATH that run code behind a "read-only" name after a cd into ~/.claude are refused', () => {
+  const spec = { 'r.txt': 'x', 's.sh': 'echo hi > out.txt\ncd "$U" && pwd\n' };
+  for (const c of [
+    'f() { echo x > settings.json; }; chpwd_functions=(f); (cd /home/u/.claude; ls)',
+    'f() { echo x > settings.json; }; chpwd_functions+=(f); (cd /home/u/.claude; ls)',
+    'f() { echo x > settings.json; }; add-zsh-hook chpwd f; (cd /home/u/.claude; ls)',
+    'trap "echo x > settings.json" DEBUG; (cd /home/u/.claude; ls)',
+    'PATH=/tmp/evil:$PATH; d=$(cd /home/u/.claude && dirname x); echo "$d"',
+    'export PATH=/tmp/evil:$PATH; (cd /home/u/.claude; basename x)',
+  ]) assert.equal(F(c, spec), 'deny', c);
+  assert.equal(F('bash s.sh', { ...spec, 's.sh': 'PATH=/tmp/evil:$PATH\necho hi > out.txt\ncd "$U" && dirname x\n' }), 'deny');
+  assert.equal(F('bash s.sh', { ...spec, 's.sh': 'precmd_functions=(f)\necho hi > out.txt\ncd "$U" && pwd\n' }), 'deny');
+});
