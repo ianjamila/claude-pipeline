@@ -212,6 +212,51 @@ test('#56 replay: a loop over one command substitution holds one value only know
   ]) assert.equal(git(cmd, fakeFs(GIT_ROOT, { 'run.sh': BAD_GIT, 'ok.sh': 'git status' }, DIRS)).decision, 'deny', cmd);
 });
 
+test('#56 replay: a literal loop reading survives an option or path word equal to the name, and an export whose value expands', () => {
+  for (const cmd of [
+    'for p in 58051 68251; do echo "== $p"; ps -o command= -p $p | tail -5; done',
+    'for p in 1 2; do ps -p $p; done; git status',
+    'export PATH="/opt/homebrew/bin:$PATH"; for n in 1422 1417; do gh pr view $n --repo a/b --json labels; done',
+    'for f in src/a.ts; do sed -n 1,5p $f; done; cat /tmp/f',
+    'for w in a b; do printf "%s %s\\n" $w "$(grep -c $w src/a.ts)"; done',
+  ]) allowBoth(cmd, SPEC);
+  // twins: a real second binding of the name, or a binder whose NAME is only known at run time, keeps the denial
+  for (const cmd of [
+    'for p in ok.sh; do read -p x p; bash $p; done',
+    'for p in ok.sh; do getopts ab p; bash $p; done',
+    'for f in ok.sh; do printf -v f run.sh; bash $f; done',
+    'F=ok.sh; true && printf -v $N run.sh; bash $F',
+    'export $X=run.sh; for f in ok.sh; do bash $f; done',
+    'for p in ok.sh; do true && p=run.sh; bash $p; done',
+    'for f in ok.sh; do (( f = 1 )); bash $f; done',
+    'export PATH="/x:$PATH"; F=ok.sh; true && F=run.sh; bash $F',
+  ]) denyGit(cmd, SPEC);
+});
+
+test('#56 bypass: a binder whose NAME is only known at run time may set any variable, in the git and the files guard', () => {
+  // git: N may hold F, so F may be run.sh
+  for (const cmd of [
+    'F=ok.sh; export $N=run.sh; bash $F',
+    'F=ok.sh; declare "$N=run.sh"; bash $F',
+    'F=ok.sh; printf -v $N run.sh; bash $F',
+    'F=ok.sh; read $N < list; bash $F',
+    'F=ok.sh; typeset ${N}=run.sh; bash $F',
+  ]) denyGit(cmd, SPEC);
+  // files: N may hold F or HOME
+  for (const cmd of [
+    'F=/tmp/x; export $N=/home/u/.claude/settings.json; echo x > $F',
+    'F=/tmp/x; printf -v $N /home/u/.claude/settings.json; cp /tmp/a $F',
+    'declare "$N=/home/u/.claude"; cp /tmp/a $HOME/settings.json',
+  ]) assert.equal(files(cmd, fakeFs(PROJ, {}, DIRS)).decision, 'deny', cmd);
+  // controls: a literal name, a value that expands and printf without -v keep their meaning
+  for (const cmd of [
+    'F=ok.sh; export G=$F; bash $F',
+    'export PATH="/x:$PATH"; F=ok.sh; bash $F',
+    'F=ok.sh; printf "%s\\n" "$N"; bash $F',
+    'F=ok.sh; read -r line < list; bash $F',
+  ]) allowGit(cmd, SPEC);
+});
+
 // ---- 3. values built from other variables (a live bypass) -------------------------------------------------------------------
 
 test('#56 bypass: a value built from another variable is worked out when it is assigned', () => {

@@ -1562,6 +1562,30 @@ function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0) {
     }
   }
   for (const [k, n] of counts) if (n > 1) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
+  // Why (#56, a live bypass on main): `F=ok.sh; export $N=run.sh; bash $F` ran run.sh when N held F, while the guard judged ok.sh. A binder whose
+  // NAME is only known at run time (export / declare / local / typeset / readonly, read, mapfile, getopts, unset, let, select, printf -v) may set
+  // any variable: every name the line assigns or reads is unknown from here on.
+  if (cmds.some(bindsRunTimeName)) for (const k of [...Object.keys(ctx.vars), ...namesReadOn(cmds)]) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
+}
+// A command that binds a variable whose name is only known at run time (see collectAssignments).
+function bindsRunTimeName(c) {
+  if (!c.argv.length) return false;
+  const nm = baseName(c.argv[0]);
+  const words = c.argv.slice(1);
+  if (VAR_BUILTINS.includes(nm)) return words.some((w) => DYNAMIC.test(w.includes('=') ? w.slice(0, w.indexOf('=')) : w));
+  if (!VALUE_BINDERS.has(nm)) return false;
+  if (nm === 'printf' && !words.some((w) => /^-[A-Za-z]*v/.test(w))) return false;
+  return words.some((w) => DYNAMIC.test(w));
+}
+// Every `$NAME` / `${NAME…}` the line's words, prefixes and redirections read.
+function namesReadOn(cmds) {
+  const out = new Set();
+  for (const c of cmds) {
+    for (const w of [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')]) {
+      for (const m of String(w).matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)/g)) out.add(m[1]);
+    }
+  }
+  return out;
 }
 
 // Why (#56 replay): `for p in $(lsof -t -i :4000); do ps -p $p; done` was refused once loop variables stopped being read as environment values (about 660
@@ -1786,8 +1810,13 @@ function onceAssignedNames(cmds, ctx, str) {
     if (!c.argv.length) continue;
     const nm = baseName(c.argv[0]);
     if (DYNAMIC.test(c.argv[0]) || SOURCING.includes(nm) || nm === 'eval') return [];
-    const binder = VAR_BUILTINS.includes(nm) || VALUE_BINDERS.has(nm);
-    if (binder && (c.argv.slice(1).some((w) => DYNAMIC.test(w)) || (VAR_BUILTINS.includes(nm) && declAttrs(c.argv).unknown))) return [];
+    // Why (#56 replay): only a binder whose NAME is only known at run time may set any name (`export $X=1`, `read $V`); a value that expands
+    // (`export PATH=/x:$PATH`, the first command of many lines) names its target. printf binds only with -v.
+    if (VAR_BUILTINS.includes(nm)) {
+      if (declAttrs(c.argv).unknown || c.argv.slice(1).some((w) => DYNAMIC.test(w.includes('=') ? w.slice(0, w.indexOf('=')) : w))) return [];
+    } else if (VALUE_BINDERS.has(nm) && (nm !== 'printf' || c.argv.some((w) => /^-[A-Za-z]*v/.test(w)))) {
+      if (c.argv.slice(1).some((w) => DYNAMIC.test(w))) return [];
+    }
   }
   const spans = /<</.test(str) ? cmds.heredocSpans : [];
   if (!Array.isArray(spans)) return [];
@@ -1831,6 +1860,8 @@ function onceAssignedNames(cmds, ctx, str) {
       const after = text.slice(m.index + k.length, m.index + k.length + 2);
       if (before.endsWith('${')) { if (/^:?=/.test(after) || after[0] === '[') odd = true; continue; }
       if (before.endsWith('$')) { if (after[0] === '[') odd = true; continue; }
+      // (a name right after - . / is part of an option or a path, `ps -p $p`, `cd /tmp/p`: no assignment can start there)
+      if (/[-./]$/.test(before)) continue;
       if (after[0] === '=') { assigns++; continue; }
       if (/(?:^|[\s;&|(){])for\s+$/.test(text.slice(Math.max(0, m.index - 8), m.index)) && site.argv[0] === 'for') { assigns++; continue; } // (the loop's own name)
       odd = true;

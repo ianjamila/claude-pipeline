@@ -2337,6 +2337,12 @@ function evaluateBashForFilesFrame(command, opts) {
     if (!c.argv.length) return;
     const cn = baseOf(c.argv[0]);
     const names = [];
+    // Why (#56, a live bypass on main): `F=/tmp/x; printf -v $N ~/.claude/settings.json; cp a $F` and `declare "$N=~/.claude"; cp a $HOME/settings.json`
+    // wrote the protected file when N held F / HOME. A binder whose name is only known at run time may set any name: every name is unknown from here on,
+    // as after a sourced file that cannot be followed.
+    const anyName = (LINE_BINDERS.has(cn) && (cn !== 'printf' || c.argv.some((a) => /^-[A-Za-z]*v/.test(a))) && bindsOf(cn, c.argv).weird)
+      || (['export', 'declare', 'typeset', 'local', 'readonly', 'unset', 'let'].includes(cn) && c.argv.slice(1).some((a) => /[$`]/.test(a.includes('=') ? a.slice(0, a.indexOf('=')) : a)));
+    if (anyName) { ctx.unknownAll = true; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.unknownVars.add(k); ctx.srcChanged.add(k); } }
     if (LINE_BINDERS.has(cn) && (cn !== 'printf' || c.argv.some((a) => /^-v/.test(a)))) names.push(...bindsOf(cn, c.argv).names);
     if (['declare', 'typeset', 'local'].includes(cn) && c.argv.slice(1).some((a) => /^-[A-Za-z]*n/.test(a))) for (const a of c.argv.slice(1)) { const t = /^[A-Za-z_]\w*=([A-Za-z_]\w*)/.exec(a); if (t) { names.push(t[1]); ctx.declared?.unknown.add(t[1]); } }
     for (const k of names) { ctx.pickUnknown.add(k); if (Object.hasOwn(ctx.vars, k)) ctx.unknownVars.add(k); }
@@ -2433,7 +2439,7 @@ function evaluateBashForFilesFrame(command, opts) {
     for (const [ci, c] of cmds.entries()) {
       const refs = (w) => [...String(w).matchAll(/\$\{?(\w+)/g)].some((x) => ctx.unknownVars.has(x[1]) || snaps[ci]?.unknownV.has(x[1]));
       if ((c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && refs(r.target ?? '')) || (c.argv.length && !['export', 'declare', 'typeset', 'local', 'readonly'].includes(baseOf(c.argv[0])) && !isReadOnly(c, ctx) && (c.argv.some(refs) || Object.values(c.env ?? {}).some(refs)))) {
-        return deny('the command writes through a variable whose value is only known at run time (a width or integer attribute), so the file it reaches cannot be checked; write the path out');
+        return deny('the command writes through a variable whose value is only known at run time (a width or integer attribute, or a binder such as `export $N=…` / `printf -v $N` whose name is only known at run time), so the file it reaches cannot be checked; write the path out');
       }
     }
   }
@@ -2461,7 +2467,7 @@ function evaluateBashForFilesFrame(command, opts) {
       const script = scriptFileOf(c.argv)?.file;
       const operands = script === undefined ? c.argv : c.argv.filter((w, i) => w !== script || c.argv.indexOf(w) !== i);
       if ((c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && changed(r.target ?? '')) || (writes && (operands.some(changed) || Object.entries(c.env ?? {}).some(([k, v]) => !PATH_LISTS.has(k) && taintedEnv(v))))) {
-        return deny('the command writes through a variable that a sourced file may have changed, so the file it reaches cannot be checked; write the path out');
+        return deny('the command writes through a variable that a sourced file (or a binder whose name is only known at run time) may have changed, so the file it reaches cannot be checked; write the path out');
       }
     }
   }
