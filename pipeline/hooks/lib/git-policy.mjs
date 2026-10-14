@@ -1537,7 +1537,10 @@ function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0) {
     const n = mayNotRun(cmds, from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) ? 2 : 1;
     // Why (#56, a live bypass on main): `for f in run.sh; do bash $f; done` ran run.sh while the guard read `bash $f` as a value from the environment. A loop
     // variable takes each word of the list in turn (or the positional parameters): it is set on the line, more than once.
-    if (c.argv[0] === 'for' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '')) bump(c.argv[1], 2);
+    // A list that is one run-time word (`for p in $(lsof -t …)`) gives the name one value only known at run time, like `P=$(lsof -t …)` (see computedLoopWord;
+    // the walk records it): counted once, so the value is judged where it lands (a script, a directory, a ref) instead of refusing every command it reaches.
+    // Once even where the loop may not run (an empty list, `false && for …`): an unknown value already stands for any value, the one held before included.
+    if (c.argv[0] === 'for' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '')) bump(c.argv[1], computedLoopWord(c.argv) === null ? 2 : 1);
     // builtins that bind a variable without a NAME=value word: its value is whatever was read / parsed at run time
     if (c.argv.length && VALUE_BINDERS.has(baseName(c.argv[0]))) {
       for (const a of c.argv.slice(1)) {
@@ -1559,6 +1562,18 @@ function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0) {
     }
   }
   for (const [k, n] of counts) if (n > 1) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
+}
+
+// Why (#56 replay): `for p in $(lsof -t -i :4000); do ps -p $p; done` was refused once loop variables stopped being read as environment values (about 660
+// lines in 21 days: ps, kill, gh pr view, git log, cp). The single list word, a command substitution, is one value only known at run time, the
+// same as `P=$(lsof -t -i :4000)`, and is judged the same way wherever it lands. Null for any other list: literal words are read one by one (judgeReadings),
+// and several words of which some are computed, a variable (`L=run.sh; for f in $L`: its value is known, and splits), `for f; do` (the positional
+// parameters) or a list with quotes or globs around the expansion stay refused. Where the value lands it is judged like `F=$(cmd)` today: a script picked
+// by it is refused only when the line mentions a guarded operation (scriptFileOf), the same known limit as `bash $(ls *.sh)`.
+function computedLoopWord(argv) {
+  if (argv[0] !== 'for' || argv[2] !== 'in' || argv.length !== 4) return null;
+  const w = argv[3];
+  return /^(?:\$\([^()]*(?:\([^()]*\)[^()]*)*\)|\x60[^\x60]*\x60)$/.test(w) ? w : null;
 }
 
 // Commands that may be handed an unsure value: they print, compare, count or wait, and run nothing. An ALLOWLIST on purpose
@@ -1954,7 +1969,8 @@ function evalString(str, startDir, ctx, level) {
         // (a value that still holds a `$` is not worked out: the case change would apply to what it expands to)
         if (d.transform && DYNAMIC.test(v)) { delete ctx.vars[k]; ctx.unsureVars.add(k); } else setVar(ctx, k, applyTransform(v, d.transform), level);
       }
-    } else if (name === 'cd' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name, argv, ctx, cdp, c.env ?? {});
+    } else if (name === 'for' && computedLoopWord(argv) !== null) setVar(ctx, argv[1], computedLoopWord(argv), level);
+    else if (name === 'cd' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name, argv, ctx, cdp, c.env ?? {});
     else if (name === 'git' || name === 'gh') {
       const unsure = unsureVarUsed([...argv.slice(1), ...Object.values(c.env)], ctx);
       if (unsure !== null) verdict = deny(`$${unsure} was assigned more than once on this line, so its value (and what this ${name} command does with it) cannot be verified. Assign it once, or write the value out.`);

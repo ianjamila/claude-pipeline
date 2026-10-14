@@ -149,8 +149,9 @@ test('#56 bypass: a loop variable is each word of its list, in the git and the f
   const r = files('for f in settings.json; do cp /tmp/a /home/u/.claude/$f; done', fakeFs(PROJ, {}, DIRS));
   assert.equal(r.decision, 'deny', r.reason);
   assert.equal(files('for f in pipeline; do rm -rf /home/u/.claude/$f; done', fakeFs(PROJ, {}, DIRS)).decision, 'deny');
-  // a word list only known at run time: the variable is unknown, so a script or a guarded command it picks is refused
-  for (const cmd of ['for f in $(ls); do bash $f; done', 'for n in 5 $M; do gh issue close $n; done']) denyGit(cmd, SPEC);
+  // a word list only known at run time: a guarded command it picks is refused. (`for f in $(ls); do bash $f; done` is judged like `F=$(ls); bash $F`:
+  // a script named only at run time is refused when the line mentions a guarded operation; see the replay test below and the PR's known limits)
+  for (const cmd of ['for n in 5 $M; do gh issue close $n; done']) denyGit(cmd, SPEC);
   // and the loops people write every day still pass
   for (const cmd of [
     'for f in src/a.ts a.mjs; do sed -n 1,5p $f; done',
@@ -164,6 +165,50 @@ test('#56 bypass: a loop variable is each word of its list, in the git and the f
   const fsx = fakeFs(GIT_ROOT, {}, DIRS);
   assert.equal(git('for n in 5; do gh issue close $n; done', fsx, { issueLabels: labels }).decision, 'allow');
   assert.equal(git('for n in 5 7; do gh issue close $n; done', fsx, { issueLabels: labels }).decision, 'deny');
+});
+
+test('#56 replay: a loop over one command substitution holds one value only known at run time, judged where it lands like F=$(cmd)', () => {
+  // ~660 lines in 21 days: the loop variable only reached commands that print, signal or read
+  for (const cmd of [
+    'for p in $(lsof -t -i :4000); do ps -o pid= -p $p; done',
+    'for p in $(cat /tmp/x.pids); do kill $p; done',
+    "for n in $(gh pr list --json number --jq '.[].number'); do gh pr view $n --json labels; done",
+    "for b in $(git branch --format='%(refname:short)'); do git log --oneline -3 $b; done",
+    'for f in $(grep -l x /tmp/*.md); do cp "$f" /tmp/b/; done',
+    'for f in `ls /tmp`; do wc -l $f; done',
+  ]) allowBoth(cmd, SPEC);
+  // malicious twins: where the value picks a ref, an issue, a directory, a command or a repository it is still refused
+  const labels = () => ['pipeline-pause'];
+  const fsx = fakeFs(GIT_ROOT, {}, DIRS);
+  for (const cmd of [
+    "for b in $(git branch --format='%(refname:short)'); do git push origin $b; done",
+    'for r in $(echo HEAD:main); do git push origin $r; done',
+    'for d in $(ls -d /work/*/); do git -C $d push; done',
+    'for d in $(ls -d /work/*/); do cd $d && git push; done',
+    'for d in $(echo /work/repo); do cd $d; bash run.sh; done',
+    'for g in $(echo git); do $g push origin main; done',
+    "for n in $(gh pr list --json number --jq '.[].number'); do gh pr merge $n --admin; done",
+    'for d in $(echo /x/.git); do export GIT_DIR=$d; done; git push origin agent/x',
+    'for f in $(ls *.sh); do bash $f; done',
+    'for f in $(ls *.sh); do source $f; done',
+  ]) assert.equal(git(cmd, fakeFs(GIT_ROOT, { 'run.sh': BAD_GIT }, DIRS)).decision, 'deny', cmd);
+  assert.equal(git("for n in $(gh issue list --json number --jq '.[].number'); do gh issue close $n; done", fsx, { issueLabels: labels }).decision, 'deny');
+  // the files guard: a protected place reached through the value
+  for (const cmd of [
+    'for f in $(echo settings.json); do echo x > ~/.claude/$f; done',
+    'for d in $(echo ~/.claude); do cp /tmp/x $d/settings.json; done',
+  ]) assert.equal(files(cmd, fakeFs(PROJ, {}, DIRS)).decision, 'deny', cmd);
+  // still refused: a variable as the list (its value is known and splits), several words, the positional parameters, a second loop over the name,
+  // select, and a name also assigned elsewhere
+  for (const cmd of [
+    'L=run.sh; for f in $L; do bash $f; done',
+    'L="ok.sh run.sh"; for f in ${L}; do bash $f; done',
+    'for f in $(true) run.sh; do bash $f; done',
+    'set -- run.sh; for f; do bash $f; done',
+    'for f in $(ls x); do :; done; for f in $(ls *.sh); do bash $f; done',
+    'for f in $(ls x); do :; done; f=run.sh; bash $f',
+    'select f in $(ls *.sh); do bash $f; done',
+  ]) assert.equal(git(cmd, fakeFs(GIT_ROOT, { 'run.sh': BAD_GIT, 'ok.sh': 'git status' }, DIRS)).decision, 'deny', cmd);
 });
 
 // ---- 3. values built from other variables (a live bypass) -------------------------------------------------------------------
