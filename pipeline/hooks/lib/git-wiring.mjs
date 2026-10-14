@@ -42,36 +42,58 @@ export function realGitWiring() {
   return { currentBranch, pushDestination, issueLabels };
 }
 
-// #58: what the git policy asks before a direct merge (`gh pr merge`, the repo's merge command, auto-merge through the API):
-// the repo's owner_approval mode and merge command (its .claude/pipeline.yml, found from the command's directory up to the
-// repository root), and whether the owner said "merge" for that PR in THIS session (lib/owner-go.mjs). A pipeline.yml that
-// exists but cannot be read or parsed throws: the policy then treats the repo as owner_approval: chat (fail closed).
-export function ownerGoWiring(session, { readText = (p) => readFileSync(p, 'utf8'), exists = existsSync } = {}) {
-  const configOf = (dir) => {
+// #58: what the git policy asks before a direct merge (`gh pr merge`, the repo's merge command, auto-merge through the API).
+// The repo's owner_approval mode and merge commands come from .claude/pipeline.yml at the REPOSITORY ROOT (a copy in a subfolder
+// is never read), in every version at hand: the working tree, HEAD and the remote's default branch. Any one of them saying chat
+// makes it a chat repo, so a local edit or an uncommitted file cannot switch the check off (a rewritten local ref still can:
+// the documented residual). A pipeline.yml that cannot be parsed throws: the policy then treats the repo as chat (fail closed).
+// Whether the owner said "merge" comes from the owner-go records of THIS session, for the exact PR and head (lib/owner-go.mjs).
+const COMMITTED_REFS = ['HEAD', 'origin/HEAD', 'origin/main', 'origin/master'];
+const defaultGitShow = (root, ref) => {
+  const r = run('git', ['-C', root, 'show', `${ref}:.claude/pipeline.yml`], { timeoutMs: LOOKUP_TIMEOUT_MS });
+  return r.code === 0 ? r.stdout : null;
+};
+export function ownerGoWiring(session, { readText = (p) => readFileSync(p, 'utf8'), exists = existsSync, gitShow = defaultGitShow } = {}) {
+  const rootOf = (dir) => {
     let d = path.resolve(dir);
     for (;;) {
-      const yml = path.join(d, '.claude', 'pipeline.yml');
-      if (exists(yml)) return parseYaml(readText(yml)) ?? {};
-      if (exists(path.join(d, '.git'))) return null;
+      if (exists(path.join(d, '.git'))) return d;
       const up = path.dirname(d);
       if (up === d) return null;
       d = up;
     }
   };
+  const configsOf = (dir) => {
+    const root = rootOf(dir);
+    if (root === null) return [];
+    const texts = [];
+    const yml = path.join(root, '.claude', 'pipeline.yml');
+    if (exists(yml)) texts.push(readText(yml));
+    for (const ref of COMMITTED_REFS) {
+      const t = gitShow(root, ref);
+      if (typeof t === 'string') texts.push(t);
+    }
+    return texts.map((t) => parseYaml(t) ?? {});
+  };
   return {
     mode: (dir) => {
-      const c = configOf(dir);
-      if (c === null) return 'none';
-      return c.owner_approval === 'chat' ? 'chat' : 'label';
+      const all = configsOf(dir);
+      if (all.length === 0) return 'none';
+      return all.some((c) => c.owner_approval === 'chat') ? 'chat' : 'label';
     },
-    // the words of the repo's merge command before its {pr} placeholder (null: none, or it does not start with literal words)
-    mergePrefix: (dir) => {
-      const cmd = configOf(dir)?.merge?.command;
-      if (typeof cmd !== 'string') return null;
-      const at = cmd.indexOf('{pr}');
-      const words = (at < 0 ? '' : cmd.slice(0, at)).trim().split(/\s+/).filter(Boolean);
-      return words.length && words.every((w) => /^[A-Za-z0-9_@%+=:,./-]+$/.test(w)) ? words : null;
+    // each distinct merge command as { prefix: the literal words before {pr}, shaFlag: the word before {sha} (null when it pins no head) }
+    mergeTemplates: (dir) => {
+      const out = [];
+      for (const cmd of new Set(configsOf(dir).map((c) => c?.merge?.command).filter((c) => typeof c === 'string'))) {
+        const words = cmd.trim().split(/\s+/);
+        const at = words.indexOf('{pr}');
+        const prefix = at > 0 ? words.slice(0, at) : [];
+        if (!prefix.length || !prefix.every((w) => /^[A-Za-z0-9_@%+=:,./-]+$/.test(w))) continue;
+        const sa = words.indexOf('{sha}');
+        out.push({ prefix, shaFlag: sa > 0 && /^-{1,2}[A-Za-z][A-Za-z0-9-]*$/.test(words[sa - 1]) ? words[sa - 1] : null });
+      }
+      return out;
     },
-    approvedPr: (pr) => approvedPr({ pr, session }),
+    approvedHead: (pr, head) => approvedPr({ pr, head, session }),
   };
 }

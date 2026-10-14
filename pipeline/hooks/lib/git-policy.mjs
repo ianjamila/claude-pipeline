@@ -798,30 +798,45 @@ const prNumberOf = (w) => {
   return m ? Number(m[1]) : null;
 };
 // `elsewhere`: the command names another repository (-R, a PR URL), whose mode is unknown here: judged as a chat repo.
-function directMergeVerdict(pr, dir, ctx, what, elsewhere = false) {
+// `head`: the head the command pins (gh: --match-head-commit; the repo command: the flag before its {sha}); a merge that pins no full
+// head could land a later push the owner never saw, so it is refused, and the owner's "merge" must be for exactly that head.
+function directMergeVerdict(pr, head, dir, ctx, what, elsewhere = false, pinFlag = '--match-head-commit') {
   if (!ctx?.ownerGo) return null;
   if (!elsewhere && ownerGoMode(dir, ctx) !== 'chat') return null;
   const where = elsewhere ? 'a merge named by -R or a PR URL (its repository may need the owner)' : 'in this repository (owner_approval: chat) a merge';
-  if (pr === null) return deny(`${what} without a literal PR number: ${where} needs the owner's "merge" for that PR. Name the PR number (\`gh pr merge 123 …\`, run from the repository), or merge through \`P merge\`.`);
+  const via = `Merge through \`P merge --pr ${pr ?? 'N'}\` (it merges a low-risk PR itself), or show the request (Head and 🔀 lines) and wait for the owner to type "merge".`;
+  if (pr === null) return deny(`${what} without a literal PR number: ${where} needs the owner's "merge" for that PR and head. Name the PR number (run from the repository), or ${via[0].toLowerCase()}${via.slice(1)}`);
+  if (!pinFlag) return deny(`${what} #${pr}: ${where} needs the owner's "merge" for the head it lands, and this merge command pins no head. ${via}`);
+  if (!/^[0-9a-f]{40}$/.test(String(head ?? ''))) return deny(`${what} #${pr}: ${where} must pin the head the owner said "merge" for: add \`${pinFlag} <full 40-character head>\`. ${via}`);
   let ok = false;
   try {
-    ok = ctx.ownerGo.approvedPr(pr) === true;
+    ok = ctx.ownerGo.approvedHead(pr, head) === true;
   } catch { /* unreadable records: not approved */ }
   if (ok) return null;
-  return deny(`${what} #${pr}: ${where} needs the owner's "merge" for #${pr} in this session, and none is recorded. Merge through \`P merge --pr ${pr}\` (it merges a low-risk PR itself), or show the request and wait for the owner to type "merge".`);
+  return deny(`${what} #${pr}: ${where} needs the owner's "merge" for #${pr} at head ${head.slice(0, 12)} in this session, and none is recorded. ${via}`);
 }
-// The repo's own merge command (pipeline.yml merge.command, e.g. `npm run merge -- {pr} …`) typed by hand. A `gh …` command is judged as gh.
+// The repo's own merge command (pipeline.yml merge.command, e.g. `npm run merge -- {pr} --expect-head {sha}`) typed by hand. A `gh …`
+// command is judged as gh.
 function repoMergeCommandVerdict(argv, dir, ctx) {
   if (!ctx?.ownerGo || dir === null) return null;
-  let prefix = null;
+  let templates = [];
   try {
-    prefix = ctx.ownerGo.mergePrefix(dir);
-  } catch { /* unreadable: the mode check below fails closed for gh; this form cannot be recognised */ }
-  if (!Array.isArray(prefix) || !prefix.length || baseName(prefix[0]) === 'gh') return null;
-  const p = prefix.filter((w) => w !== '--');
-  const words = argv.map((a) => expandVars(a, ctx)).filter((w) => w !== '--');
-  if (words.length < p.length || baseName(words[0]) !== baseName(p[0]) || !p.slice(1).every((w, i) => words[i + 1] === w)) return null;
-  return directMergeVerdict(prNumberOf(words[p.length]), dir, ctx, `\`${prefix.join(' ')}\``);
+    templates = ctx.ownerGo.mergeTemplates(dir) ?? [];
+  } catch { /* unreadable: this form cannot be recognised (gh merges still fail closed on the mode) */ }
+  const words = argv.map((a) => expandVars(a, ctx));
+  const plain = words.filter((w) => w !== '--');
+  for (const { prefix, shaFlag } of templates) {
+    if (!Array.isArray(prefix) || !prefix.length || baseName(prefix[0]) === 'gh') continue;
+    const p = prefix.filter((w) => w !== '--');
+    if (plain.length < p.length || baseName(plain[0]) !== baseName(p[0]) || !p.slice(1).every((w, i) => plain[i + 1] === w)) continue;
+    let head = null;
+    if (shaFlag) {
+      const at = words.indexOf(shaFlag);
+      head = at >= 0 ? words[at + 1] : words.find((w) => w.startsWith(`${shaFlag}=`))?.slice(shaFlag.length + 1) ?? null;
+    }
+    return directMergeVerdict(prNumberOf(plain[p.length]), head, dir, ctx, `\`${prefix.join(' ')}\``, false, shaFlag);
+  }
+  return null;
 }
 
 function checkGh(argv, env, dir, ctx, raw, level = 0) {
@@ -872,7 +887,7 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
     if (rest.includes('--disable-auto')) return null; // (turns a queued merge off)
     const { flags, positionals } = parseOpts(rest, { longValue: ['author-email', 'body', 'body-file', 'match-head-commit', 'repo', 'subject'], shortValue: 'AbFtR' });
     const elsewhere = flagValues(flags, ['repo'], 'R').length > 0 || /\/pull\//.test(positionals[0] ?? '');
-    return directMergeVerdict(prNumberOf(positionals[0]), dir, ctx, '`gh pr merge`', elsewhere);
+    return directMergeVerdict(prNumberOf(positionals[0]), flagValues(flags, ['match-head-commit'])[0] ?? null, dir, ctx, '`gh pr merge`', elsewhere);
   }
 
   if ((group === 'pr' || group === 'issue') && (verb === 'edit' || verb === 'create')) {
@@ -1487,7 +1502,7 @@ export function evaluateGitCommand(command, {
   readDir = defaultReadDir,
   now = Date.now, // injectable clock (tests)
   env = {}, // the hook process's environment (BASH_ENV / ENV / ZDOTDIR name startup files the shells run); {} keeps tests hermetic
-  ownerGo = null, // #58: { mode(dir), mergePrefix(dir), approvedPr(pr) } (git-wiring.mjs ownerGoWiring); null = no direct-merge check
+  ownerGo = null, // #58: { mode(dir), mergeTemplates(dir), approvedHead(pr, head) } (git-wiring.mjs ownerGoWiring); null = no direct-merge check
 } = {}) {
   const text = typeof command === 'string' ? command : String(command ?? '');
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);

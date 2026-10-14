@@ -19,7 +19,7 @@ export const meta = {
     '                    [--request-file F] [--tasks-file F] [--task-done ID] [--verify-report] [--round R] [--resumed] [--repo DIR]',
     '  -> {ok, url, action, record, warnings}; exit 1 {error: unpushed | behind | diverged} (local HEAD is not the PR head on GitHub), 2 usage, 3 GitHub unavailable',
     "  --request-file: the user's request, text, at most 2 KB · --tasks-file: JSON [{id, title, spec}] · --task-done ID: mark one task done (repeatable)",
-    '  --resumed: this run was taken over by `ship resume` (or adopts a PR): stamps record.resumed {at, host, head}, which later checkpoints keep and which makes `P merge` require --owner-approved-head',
+    '  --resumed: this run was taken over by `ship resume` (or adopts a PR): stamps record.resumed {at, host, head}, which later checkpoints keep and which makes `P merge` require the owner\'s recorded "merge" (--owner-approved-head + --owner-approved-items)',
     "  --verify-report: copy {head, tree, mode, ok, failedStep} of the verify report, only when its head and tree are this HEAD's (otherwise a warning)",
   ].join('\n'),
 };

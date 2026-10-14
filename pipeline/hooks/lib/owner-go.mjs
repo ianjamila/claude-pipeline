@@ -241,10 +241,11 @@ export function approvedRequest({ pr, head, items, ...opts }) {
   return readApprovals(opts).some((r) => r.requests.some((q) => q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head) && q.items === items));
 }
 
-// The guard: did the owner say "merge" naming this PR (or for a request about it) in this session (last 24 h)?
-export function approvedPr({ pr, session, ...opts }) {
-  if (!Number.isInteger(pr) || !SESSION_RE.test(String(session ?? ''))) return false;
-  return readApprovals({ ...opts, session }).some((r) => r.prs.includes(pr) || r.requests.some((q) => q.pr === pr));
+// The guard, before a direct merge: did the owner say "merge" in this session (last 24 h) for a request about this PR whose head
+// is this full head? (A PR merely named in the prompt, `merge #7`, is recorded in `prs` for the audit trail but approves no head.)
+export function approvedPr({ pr, head, session, ...opts }) {
+  if (!Number.isInteger(pr) || !/^[0-9a-f]{40}$/.test(String(head)) || !SESSION_RE.test(String(session ?? ''))) return false;
+  return readApprovals({ ...opts, session }).some((r) => r.requests.some((q) => q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head)));
 }
 
 // The owner-item set as one short digest: each item is one line (kind, rule or id, file); 'none' when there are none.

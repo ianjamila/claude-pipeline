@@ -121,14 +121,20 @@ test('owner-go: approvals last a day, never come from the future, and must be in
   assert.equal(approvedRequest({ ...q, head: HEAD.slice(0, 12), now: () => at }), false, 'the full head is required');
   assert.equal(approvedRequest({ ...q, items: 'none', now: () => at }), false, 'another item set');
   assert.equal(approvedRequest({ ...q, pr: 59, now: () => at }), false, 'another PR');
-  // the guard's question: this PR, this session
-  assert.equal(approvedPr({ pr: 58, session: 'sess-1', home, now: () => at }), true);
-  assert.equal(approvedPr({ pr: 58, session: 'sess-2', home, now: () => at }), false);
-  assert.equal(approvedPr({ pr: 59, session: 'sess-1', home, now: () => at }), false);
+  // the guard's question: this PR at this full head, this session
+  const g = { pr: 58, head: HEAD, session: 'sess-1', home, now: () => at };
+  assert.equal(approvedPr(g), true);
+  assert.equal(approvedPr({ ...g, session: 'sess-2' }), false);
+  assert.equal(approvedPr({ ...g, pr: 59 }), false);
+  assert.equal(approvedPr({ ...g, head: HEAD.slice(0, 12) }), false, 'a full head only');
+  assert.equal(approvedPr({ ...g, head: 'f'.repeat(40) }), false, 'another head');
+  // a PR merely named in the prompt approves no head
+  recordApproval(input(home, 'merge #60', [said('nothing shown')]), { home, now: () => at });
+  assert.equal(approvedPr({ ...g, pr: 60 }), false);
   // a line copied into another session's file does not count there
   const line = readFileSync(join(ownerGoDir(home), 'sess-1.jsonl'), 'utf8');
   writeFileSync(join(ownerGoDir(home), 'sess-2.jsonl'), line);
-  assert.equal(approvedPr({ pr: 58, session: 'sess-2', home, now: () => at }), false);
+  assert.equal(approvedPr({ ...g, session: 'sess-2' }), false);
 });
 
 test('owner-go: the owner-item digest is order-free and "none" without items', () => {
