@@ -28,3 +28,4 @@ full record.
 - 2026-10-14 · #54 · test: two timing-flaky tests made reliable (monotonic lock waits; linear scan compares n/4 with n) · risk high · rounds 1 · arbiter 0 · awaiting-owner-merge
 - 2026-10-14 · #54 · test: two timing-flaky tests made reliable (monotonic lock waits; linear scan compares n/4 with n) · risk high · rounds 2 · arbiter 1 · needs-human
 - 2026-10-14 · #54 · test: two timing-flaky tests made reliable (monotonic lock waits; linear scan spans n/16 -> n) · risk high · rounds 2 · arbiter 1 · merged — prod smoke pending
+- 2026-10-14 · #67 · feat(update): automatic pipeline updates every 15 minutes (pipeline update schedule) · risk high · rounds 2 · arbiter 0 · merged — prod smoke pending
