@@ -126,7 +126,7 @@ pipeline worktrees holding [--purge] [--json]        # list holding batches + re
    `.env*`, `HANDOFF*.md`, `*.patch`, a real `.superpowers/` directory) ⇒ kept. A `.superpowers` **symlink** into
    `~/claude-notes` is allowed (removal unlinks only). All paths `realpath`-contained in the worktree; symlinks never
    followed.
-6. **Not in use.** Not locked; no process cwd/fd inside (`/proc/*/cwd`, `/proc/*/fd`); no Claude transcript modified in
+6. **Not in use.** Not locked; no process cwd/fd inside (`/proc/*/cwd`, `/proc/*/fd` on Linux; one `lsof -n -P -w -F pfn` on macOS, fail-closed — spawn failure, timeout, exit status other than 0/1, or our own pid missing an absolute cwd (positive control) ⇒ "cannot check" ⇒ kept; Windows stays unavailable); no Claude transcript modified in
    the last `min_idle_hours` shows a session working in the worktree (`~/.claude/projects/**/*.jsonl` and
    `~/.claude-eaglewatch/projects/**/*.jsonl`, de-duplicated by realpath). A JSONL line counts only when its top-level
    `cwd` equals or is inside the worktree path, or it carries a `tool_use` content block whose `input` names the path
@@ -220,6 +220,10 @@ a non-root prune: they are counted as `hiddenProcesses` and left to the quaranti
 to catch their writes, §2); cron execution with WSL idle/asleep;
 `git worktree move` behaviour with a process cwd inside on WSL2's ext4. All three are exercised by the integration tests
 on this PC before `mode: on`.
+
+Real `lsof` on a Mac (other users' processes, how long the single machine-wide scan takes, the `/System/Volumes/Data`
+firmlink spelling) is owed on a Mac before `mode: on` there; the macOS branch is covered by injected-runner fixtures and
+one integration test against whatever `lsof` the host has.
 
 ## 11. Review findings and how rev 3 answers them
 

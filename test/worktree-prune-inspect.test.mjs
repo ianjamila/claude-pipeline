@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn, spawnSync } from 'node:child_process';
 import { chmodSync, mkdirSync, readFileSync, writeFileSync, symlinkSync, utimesSync, mkdtempSync, realpathSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -279,4 +280,102 @@ test('transcriptMentions matches every spelling of the path: its realpath, and a
   assert.deepEqual(transcriptMentions([real], { dirs: [t], sinceMs: since }).sort(), expected, 'registered by its real path');
   assert.deepEqual(transcriptMentions([alias], { dirs: [t], sinceMs: since }).sort(), expected, 'registered through the alias');
   assert.ok(!transcriptMentions([real], { dirs: [t], sinceMs: since }).includes(listing));
+});
+
+// ---- macOS: processesInside through lsof -F pfn (the runner is injected; one integration test uses the real lsof) ----
+const OWN = 4242;
+// fixture: a runner answering lsof then ps. `lsofOut` is lsof -F text; ps defaults to the pids that lsof listed.
+const lsofText = (...procs) => procs.map(({ pid, files }) => `p${pid}\n${files.map(([f, n]) => `f${f}\nn${n}\n`).join('')}`).join('');
+const own = { pid: OWN, files: [['cwd', '/Users/me/work'], ['txt', '/usr/local/bin/node']] };
+function fakeRun({ lsof, ps, lsofResult = {}, psResult = {} } = {}) {
+  const calls = [];
+  const run = (cmd, args) => {
+    calls.push([cmd, args]);
+    if (/lsof$/.test(cmd)) return { status: 0, signal: null, error: undefined, stdout: lsof, pid: 9001, ...lsofResult };
+    return { status: 0, signal: null, error: undefined, stdout: ps ?? '', pid: 9002, ...psResult };
+  };
+  run.calls = calls;
+  return run;
+}
+const darwin = (dir, opts) => processesInside(dir, { platform: 'darwin', ownPid: OWN, ...opts });
+
+test('processesInside (darwin): in use via cwd, an open file fd, and ignores unrelated paths and sockets', () => {
+  const wt = '/Users/me/projects/app/.worktrees/agent-x';
+  const run = fakeRun({
+    lsof: lsofText(own,
+      { pid: 11, files: [['cwd', wt]] },
+      { pid: 12, files: [['cwd', '/Users/me'], ['4', `${wt}/server.log`]] },
+      { pid: 13, files: [['cwd', '/Users/me/projects/app/.worktrees/agent-xy'], ['txt', '/bin/zsh']] },
+      { pid: 14, files: [['cwd', '/'], ['5', '*:443'], ['6', '->0x1234abcd'], ['7', 'relative/agent-x']] }),
+    ps: ` ${OWN}\n 11\n 12\n 13\n 14\n 9001\n 9002\n`,
+  });
+  assert.deepEqual(darwin(wt, { run }), { available: true, pids: [11, 12], hidden: 0 });
+  const lsofCall = run.calls.find(([c]) => /lsof$/.test(c));
+  assert.deepEqual(lsofCall[1], ['-n', '-P', '-w', '-F', 'pfn']);
+  assert.equal(run.calls.filter(([c]) => /lsof$/.test(c)).length, 1, 'lsof runs once per call');
+});
+
+test('processesInside (darwin): a worktree reached through a symlinked parent is matched by its realpath', { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' }, () => {
+  const real = realpathSync(mkdtempSync(join(tmpdir(), 'wt-')));
+  const via = join(mkdtempSync(join(tmpdir(), 'lnk-')), 'wt-link');
+  symlinkSync(real, via);
+  const run = fakeRun({ lsof: lsofText(own, { pid: 31, files: [['cwd', real]] }), ps: '' });
+  assert.deepEqual(darwin(via, { run }), { available: true, pids: [31], hidden: 0 });
+});
+
+test('processesInside (darwin): the /System/Volumes/Data firmlink prefix is stripped from names', () => {
+  const wt = '/Users/me/projects/app/.worktrees/agent-x';
+  const run = fakeRun({
+    lsof: lsofText(own,
+      { pid: 41, files: [['cwd', `/System/Volumes/Data${wt}/src`]] },
+      { pid: 42, files: [['cwd', '/Users/me'], ['3', `/system/volumes/data${wt}/a.log`]] }),
+    ps: '',
+  });
+  assert.deepEqual(darwin(wt, { run }), { available: true, pids: [41, 42], hidden: 0 });
+  assert.deepEqual(darwin(`/System/Volumes/Data${wt}`, { run }), { available: true, pids: [41, 42], hidden: 0 });
+});
+
+test('processesInside (darwin): positive control - our own pid must show an absolute cwd, else the scan is blind', () => {
+  const wt = '/Users/me/projects/app/.worktrees/agent-x';
+  const blind = { available: false, pids: [], hidden: 0 };
+  const other = { pid: 51, files: [['cwd', wt]] };
+  assert.deepEqual(darwin(wt, { run: fakeRun({ lsof: lsofText(other), ps: '' }) }), blind, 'own pid missing');
+  assert.deepEqual(darwin(wt, { run: fakeRun({ lsof: lsofText({ pid: OWN, files: [['txt', '/usr/local/bin/node']] }, other), ps: '' }) }), blind, 'own pid without a cwd');
+  assert.deepEqual(darwin(wt, { run: fakeRun({ lsof: lsofText({ pid: OWN, files: [['cwd', 'unreadable']] }, other), ps: '' }) }), blind, 'own cwd not an absolute path');
+  assert.deepEqual(darwin(wt, { run: fakeRun({ lsof: '', ps: '' }) }), blind, 'empty output');
+});
+
+test('processesInside (darwin): lsof failures are unavailable (spawn error, signal/timeout, exit 2); exit 1 is fine', () => {
+  const wt = '/Users/me/projects/app/.worktrees/agent-x';
+  const good = lsofText(own, { pid: 61, files: [['cwd', wt]] });
+  const blind = { available: false, pids: [], hidden: 0 };
+  const enoent = Object.assign(new Error('spawn lsof ENOENT'), { code: 'ENOENT' });
+  assert.deepEqual(darwin(wt, { run: fakeRun({ lsof: '', lsofResult: { status: null, error: enoent } }) }), blind);
+  assert.deepEqual(darwin(wt, { run: fakeRun({ lsof: good, lsofResult: { status: null, signal: 'SIGKILL' } }) }), blind);
+  assert.deepEqual(darwin(wt, { run: fakeRun({ lsof: good, lsofResult: { status: 2 } }) }), blind);
+  assert.deepEqual(darwin(wt, { run: fakeRun({ lsof: good, lsofResult: { status: 1 }, ps: '' }) }), { available: true, pids: [61], hidden: 0 });
+});
+
+test('processesInside (darwin): hidden = ps pids with no readable cwd in lsof, minus ours, lsof and ps; a failing ps gives 0', () => {
+  const wt = '/Users/me/projects/app/.worktrees/agent-x';
+  const lsof = lsofText(own, { pid: 71, files: [['cwd', '/Users/me']] }, { pid: 72, files: [['txt', '/bin/zsh']] });
+  // 72 is listed by lsof but without a cwd (counts as hidden); 73 and 74 only appear in ps (other users').
+  const ps = ` 1\n ${OWN}\n 71\n 72\n 73\n 74\n 9001\n 9002\n`;
+  assert.deepEqual(darwin(wt, { run: fakeRun({ lsof, ps }) }), { available: true, pids: [], hidden: 4 }); // 1, 72, 73, 74
+  assert.deepEqual(darwin(wt, { run: fakeRun({ lsof, ps, psResult: { status: 1 } }) }), { available: true, pids: [], hidden: 0 });
+  assert.deepEqual(darwin(wt, { run: fakeRun({ lsof, ps, psResult: { status: null, error: new Error('x') } }) }), { available: true, pids: [], hidden: 0 });
+});
+
+const hasLsof = spawnSync('lsof', ['-v'], { encoding: 'utf8' }).error === undefined;
+test('processesInside (darwin path) with the real lsof finds a child whose cwd is inside the dir', { skip: !hasLsof && 'lsof is not installed', timeout: 120_000 }, async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'lsof-wt-')));
+  const child = spawn(process.execPath, ['-e', 'setTimeout(()=>{},30000)'], { cwd: dir, stdio: 'ignore' });
+  try {
+    const got = processesInside(dir, { platform: 'darwin' });
+    assert.equal(got.available, true, JSON.stringify(got));
+    assert.ok(got.pids.includes(child.pid), JSON.stringify(got));
+    assert.ok(!got.pids.includes(process.pid));
+  } finally {
+    child.kill('SIGKILL');
+  }
 });

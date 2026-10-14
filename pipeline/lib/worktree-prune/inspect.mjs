@@ -1,7 +1,8 @@
 // Fact gathering for `pipeline worktrees` (spec docs/specs/2026-10-13-worktree-prune-design.md §4): which worktrees are
 // candidates, what is inside them, whether their commits are in the merged PR, and every "someone is using this" signal.
 // Reads only (git status / fetch of a temporary ref / fs / /proc); the decisions live in rules.mjs and the mutations in act.mjs.
-import { closeSync, lstatSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, statSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { closeSync, existsSync, lstatSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { GitError, NETWORK_TIMEOUT_MS, git, isAncestor, revParse } from '../git.mjs';
@@ -167,10 +168,12 @@ export function checkAncestry(root, { head, pr }) {
   }
 }
 
-// Linux only: processes whose cwd or any open fd lies inside `dir`. Elsewhere the answer is "unavailable" (callers keep).
-// A process whose links cannot be read (EACCES/EPERM: another user's, e.g. a root daemon) is counted in `hidden`, not
-// guessed at; one that exited mid-scan (ENOENT/ESRCH/ENOTDIR) is simply gone. -> { available, pids, hidden }
-export function processesInside(dir, { procRoot = '/proc', platform = process.platform } = {}) {
+// Processes whose cwd or any open file lies inside `dir`. Linux reads /proc; macOS asks lsof (processesInsideLsof); any
+// other platform answers "unavailable" (callers keep). On Linux a process whose links cannot be read (EACCES/EPERM: another
+// user's, e.g. a root daemon) is counted in `hidden`, not guessed at; one that exited mid-scan (ENOENT/ESRCH/ENOTDIR) is
+// simply gone. -> { available, pids, hidden }
+export function processesInside(dir, { procRoot = '/proc', platform = process.platform, run, ownPid } = {}) {
+  if (platform === 'darwin') return processesInsideLsof(dir, { platform, run, ownPid });
   if (platform !== 'linux') return { available: false, pids: [], hidden: 0 };
   let names;
   try {
@@ -207,6 +210,70 @@ export function processesInside(dir, { procRoot = '/proc', platform = process.pl
     }
     if (links.some(inside)) pids.push(Number(name));
     else if (denied) hidden += 1;
+  }
+  return { available: true, pids: pids.sort((a, b) => a - b), hidden };
+}
+
+const LSOF_TIMEOUT_MS = 60_000;
+const LSOF_MAX_BUFFER = 64 * 1024 * 1024;
+// macOS spells every path on the boot volume a second way: /System/Volumes/Data/Users/u == /Users/u (a firmlink).
+const FIRMLINK = /^\/System\/Volumes\/Data(?=\/|$)/i;
+const unFirm = (p) => p.replace(FIRMLINK, '');
+
+// One external command, spawn failures kept visible (lib/proc.mjs `run` folds ENOENT into exit 1, which lsof also uses).
+function runCapture(cmd, args) {
+  const r = spawnSync(cmd, args, { encoding: 'utf8', timeout: LSOF_TIMEOUT_MS, maxBuffer: LSOF_MAX_BUFFER, killSignal: 'SIGKILL', windowsHide: true });
+  return { status: r.status, signal: r.signal, error: r.error, stdout: r.stdout ?? '', pid: r.pid };
+}
+
+// `lsof -F pfn` output -> Map<pid, { names: string[], cwd: boolean }>. `p<pid>` starts a process, `f<fd>` a file of it
+// (fcwd, ftxt, numeric fds…), `n<name>` names that file; other field letters are ignored. `cwd` = a readable absolute fcwd.
+function parseLsofFields(text) {
+  const procs = new Map();
+  let cur = null;
+  let fd = null;
+  for (const line of text.split('\n')) {
+    const tag = line[0];
+    const val = line.slice(1);
+    if (tag === 'p') {
+      const pid = Number(val);
+      cur = /^\d+$/.test(val) ? procs.get(pid) ?? procs.set(pid, { names: [], cwd: false }).get(pid) : null;
+      fd = null;
+    } else if (tag === 'f') fd = val;
+    else if (tag === 'n' && cur) {
+      const name = unFirm(val.replace(/ \(deleted\)$/, ''));
+      if (!path.isAbsolute(name)) continue; // sockets and pipes (*:443, ->0x…) are not paths
+      cur.names.push(name);
+      if (fd === 'cwd') cur.cwd = true;
+    }
+  }
+  return procs;
+}
+
+// macOS: one `lsof -n -P -w -F pfn` for the whole machine. Fail-closed -> { available: false }: lsof missing, killed or timed
+// out, exit status other than 0/1 (1 = "some items could not be examined", normal when other users own processes), or the
+// positive control failing (our own process always has a readable cwd; if lsof does not show it the scan is blind).
+// `hidden` = processes `ps` lists that lsof showed no readable cwd for (other users'); informational, never a keep reason.
+function processesInsideLsof(dir, { platform, run = runCapture, ownPid = process.pid } = {}) {
+  const unavailable = { available: false, pids: [], hidden: 0 };
+  const exe = existsSync('/usr/sbin/lsof') ? '/usr/sbin/lsof' : 'lsof';
+  const r = run(exe, ['-n', '-P', '-w', '-F', 'pfn']);
+  if (!r || r.error || r.signal || (r.status !== 0 && r.status !== 1)) return unavailable;
+  const procs = parseLsofFields(String(r.stdout ?? ''));
+  if (!procs.get(ownPid)?.cwd) return unavailable;
+  const roots = [dir, tolerant(() => realpathSync(dir), dir)].map(unFirm);
+  const pids = [];
+  for (const [pid, info] of procs) {
+    if (info.names.some((n) => roots.some((root) => isInside(n, root, platform)))) pids.push(pid);
+  }
+  let hidden = 0;
+  const ps = run('ps', ['-axo', 'pid=']);
+  if (ps && !ps.error && !ps.signal && ps.status === 0) {
+    const skip = new Set([ownPid, r.pid, ps.pid]);
+    for (const m of String(ps.stdout ?? '').matchAll(/^\s*(\d+)\s*$/gm)) {
+      const pid = Number(m[1]);
+      if (!skip.has(pid) && !procs.get(pid)?.cwd) hidden += 1;
+    }
   }
   return { available: true, pids: pids.sort((a, b) => a - b), hidden };
 }
