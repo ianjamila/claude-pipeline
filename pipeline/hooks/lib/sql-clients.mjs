@@ -39,14 +39,57 @@ const SQLITE_SAFE = new Set(['bail', 'binary', 'changes', 'connection', 'databas
 // roles of the commands that are not simply safe
 const SQLITE_ROLE = { shell: 'shell', system: 'shell', read: 'read', output: 'out', once: 'out', import: 'import', save: 'write', backup: 'write', open: 'openw', log: 'write', trace: 'write', cd: 'unknown' };
 
+// sqlite's own reading of a double-quoted dot-command argument (shell.c resolve_backslashes): \a \b \t \n \v \f \r \" \' \\, octal \NNN (up to three digits), \xHH.
+// Anything that cannot be modelled exactly (an unknown escape, a NUL, a byte past ASCII: C strings end at the NUL and the rest is encoding-dependent) is `bad`.
+const SQLITE_ESC = { a: '\x07', b: '\b', t: '\t', n: '\n', v: '\v', f: '\f', r: '\r', '"': '"', "'": "'", '\\': '\\' };
+function sqliteDecode(s) {
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] !== '\\') { out += s[i]; continue; }
+    const c = s[++i];
+    let v;
+    if (c !== undefined && Object.hasOwn(SQLITE_ESC, c)) v = SQLITE_ESC[c];
+    else if (c !== undefined && /[0-7]/.test(c)) {
+      let n = +c;
+      for (let k = 0; k < 2 && /[0-7]/.test(s[i + 1] ?? ''); k++) n = n * 8 + +s[++i];
+      if (n === 0 || n > 0x7f) return { text: s, bad: true };
+      v = String.fromCharCode(n);
+    } else if (c === 'x' && /^[0-9a-fA-F]/.test(s[i + 1] ?? '')) {
+      let h = s[++i];
+      if (/[0-9a-fA-F]/.test(s[i + 1] ?? '')) h += s[++i];
+      const n = parseInt(h, 16);
+      if (n === 0 || n > 0x7f) return { text: s, bad: true };
+      v = String.fromCharCode(n);
+    } else return { text: s, bad: true };
+    out += v;
+  }
+  return { text: out, bad: out.includes('\0') };
+}
+
 // Words of a meta-command's argument text: quotes removed; a backtick part is a shell command (returned apart).
-function metaArgs(rest) {
+// sqlite mode reads the words the way sqlite does: double-quoted arguments are backslash-decoded, single-quoted ones are literal (`bad`: a word that could not be modelled
+// exactly, or a quoted word glued to more text; `quoted[i]`: the word had quotes).
+function metaArgs(rest, mode = 'psql') {
   const words = [];
+  const quoted = [];
   const ticks = [];
+  let bad = false;
   for (const m of rest.matchAll(/`([^`]*)`/g)) ticks.push(m[1]);
   const body = rest.replace(/`[^`]*`/g, ' ');
+  if (mode === 'sqlite') {
+    for (const m of body.matchAll(/'([^']*)'|"((?:[^"\\]|\\.)*)"|(\S+)/g)) {
+      if (m[1] !== undefined || m[2] !== undefined) {
+        const glued = body[m.index + m[0].length] !== undefined && !/\s/.test(body[m.index + m[0].length]);
+        const d = m[2] !== undefined ? sqliteDecode(m[2]) : { text: m[1], bad: false };
+        if (d.bad || glued) bad = true;
+        words.push(d.text);
+        quoted.push(true);
+      } else { words.push(m[3]); quoted.push(false); }
+    }
+    return { words, ticks, bad, quoted };
+  }
   for (const m of body.matchAll(/'((?:[^'\\]|''|\\.)*)'|"((?:[^"\\]|\\.)*)"|(\S+)/g)) words.push(m[1] ?? m[2] ?? m[3]);
-  return { words, ticks };
+  return { words, ticks, bad, quoted };
 }
 
 // Why: the nested evaluation must judge the real path text, so a name that is not a plain word is emitted shell-quoted (single quotes, so nothing in it expands); a sqlite `file:` URI names
@@ -182,17 +225,22 @@ export function sqlShellEscapes(text, opts = {}) {
     if (!m) return;
     const [, word, rest] = m;
     const cands = word ? SQLITE_CMDS.filter((c) => c.startsWith(word.toLowerCase())) : [];
-    const { words, ticks } = metaArgs(rest);
+    const { words, ticks, bad: badArgs, quoted } = metaArgs(rest, 'sqlite');
     for (const k of ticks) run(k);
     if (!cands.length) { unknown(line); return; }
-    let bad = false;
+    let bad = badArgs; // (an argument that could not be decoded exactly: the line is unknown, whatever else it is read as)
     for (const c of new Set(cands)) {
       const role = SQLITE_ROLE[c];
       if (role === 'shell') { run(rest); if (!rest.trim()) shellRest = true; }
       // Why: sqlite removes the quotes before it looks for the pipe (`.output "|cmd"` runs cmd), so the decision is made on the decoded word; the command is what follows the `|` in the argument text
       else if (role === 'read') { if (words[0]?.startsWith('|')) run(pipeCommand(rest, words[0])); else if (words[0]) include('sqlite3', words[0], false); }
       else if (role === 'out') { if (words[0]?.startsWith('|')) run(pipeCommand(rest, words[0])); else if (words[0]?.startsWith('-')) bad = true; else if (words[0] && words[0] !== 'stdout') write(words[0]); }
-      else if (role === 'import') { const a = words.filter((w) => !w.startsWith('-')); if (/^\s*(?:-\S+\s+)*["']?\|/.test(rest) || a[0]?.startsWith('|')) run(rest.replace(/^[^|]*\|/, '').replace(/["']\s*\S*\s*$/, '')); }
+      else if (role === 'import') {
+        const k = words.findIndex((w) => !w.startsWith('-'));
+        // (a quoted `|cmd` is the decoded word; unquoted, the old rest-of-text reading)
+        if (k >= 0 && quoted[k] && words[k].startsWith('|')) run(words[k].slice(1));
+        else if (/^\s*(?:-\S+\s+)*["']?\|/.test(rest) || words[k]?.startsWith('|')) run(rest.replace(/^[^|]*\|/, '').replace(/["']\s*\S*\s*$/, ''));
+      }
       else if (role === 'openw') { const f = words.filter((w) => !w.startsWith('-')).pop(); if (f && f !== ':memory:') write(f); }
       else if (role === 'write') { const f = words[words.length - 1]; if (f && !f.startsWith('-')) write(f); }
       else if (!SQLITE_SAFE.has(c)) bad = true;

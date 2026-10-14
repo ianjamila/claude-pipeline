@@ -64,6 +64,57 @@ test('R3-B1 twins: a quoted harmless pipe command is allowed; a quoted plain fil
   assert.deepEqual(sqlShellEscapes('.output stdout', { family: 'sqlite' }), []);
 });
 
+// ---- R4-B1 -----------------------------------------------------------------------------------------------------------------------
+// sqlite decodes C escapes in a DOUBLE-quoted dot-command argument (\a \b \t \n \v \f \r \" \' \\, octal \NNN, \xHH) and nothing in a single-quoted one
+
+// (the text as a function of the guarded command, so the git policy and the files policy each judge their own)
+const verdictsOf = (command, mk) => ({
+  git: git(command, fakeFs(GIT_ROOT, { 'q.sql': mk(BAD) }, ['sub', '/home/u'])).decision,
+  files: files(command, fakeFs(PROJ, { 'q.sql': mk(BAD_WRITE) }, ['sub', '/home/u'])).decision,
+});
+const hexAll = (s) => [...s].map((c) => '\\x' + c.charCodeAt(0).toString(16).padStart(2, '0')).join('');
+const octAll = (s) => [...s].map((c) => '\\' + c.charCodeAt(0).toString(8).padStart(3, '0')).join('');
+
+test('R4-B1: an escaped double quote inside a double-quoted pipe command is decoded before the command is judged', () => {
+  const quoted = (cmd) => cmd.replace('push', String.raw`\"push\"`);
+  for (const dot of ['.output', '.once', '.read']) {
+    assert.deepEqual(verdictsOf('sqlite3 < q.sql', (c) => `${dot} "|${quoted(c)}"`), { git: 'deny', files: 'deny' }, dot);
+    assert.ok(sqlShellEscapes(`${dot} "|${quoted(BAD)}"`, { family: 'sqlite' }).includes('git "push" origin main'), `escapes of ${dot}`);
+  }
+  // the protected-file write, its path quoted the same way
+  assert.deepEqual(verdictsOf('sqlite3 < q.sql', (c) => `.output "|${c.replace('/home/u/.claude/settings.json', String.raw`\"/home/u/.claude/settings.json\"`)}"`).files, 'deny');
+});
+
+test('R4-B1: octal and hex escapes in a double-quoted pipe command are decoded', () => {
+  for (const dot of ['.output', '.once', '.read']) {
+    assert.deepEqual(verdictsOf('sqlite3 < q.sql', (c) => `${dot} "|${c.replace('push', String.raw`\160ush`)}"`), { git: 'deny', files: 'deny' }, `${dot} octal`);
+    assert.deepEqual(verdictsOf('sqlite3 < q.sql', (c) => `${dot} "|${c.replace('push', String.raw`\x70ush`)}"`), { git: 'deny', files: 'deny' }, `${dot} hex`);
+    assert.deepEqual(verdictsOf('sqlite3 < q.sql', (c) => `${dot} "|${hexAll(c)}"`), { git: 'deny', files: 'deny' }, `${dot} all hex`);
+    assert.deepEqual(verdictsOf('sqlite3 < q.sql', (c) => `${dot} "|${octAll(c)}"`), { git: 'deny', files: 'deny' }, `${dot} all octal`);
+  }
+  assert.ok(sqlShellEscapes(String.raw`.output "|git \160ush origin main"`, { family: 'sqlite' }).includes(BAD));
+  // (a short octal escape: one or two digits, the next character is not part of it)
+  assert.ok(sqlShellEscapes(String.raw`.output "|echo \1x"`, { family: 'sqlite' }).some((l) => l.includes('\x01x')));
+});
+
+test('R4-B1: what cannot be modelled exactly (NUL, a byte past ASCII, an unknown escape) leaves an unknown line, not a guess', () => {
+  for (const text of [String.raw`.output "|git \0 push origin main"`, String.raw`.output "|git \x00push"`, String.raw`.once "|git \377push"`, String.raw`.read "|git \xffpush"`, String.raw`.output "|git \qpush"`]) {
+    const out = sqlShellEscapes(text, { family: 'sqlite' });
+    assert.ok(out.some((l) => l.startsWith('$SQL_UNKNOWN_SHELL_LINE_')), `unknown line for ${text}`);
+  }
+});
+
+test('R4-B1: a single-quoted dot-command argument is literal, a backslash in it is just a character', () => {
+  assert.deepEqual(sqlShellEscapes(String.raw`.output 'a\b.txt'`, { family: 'sqlite' }), [": > 'a\\b.txt'"]);
+  // (`\'` does not escape the quote: the argument is `a\`, and `.txt'` after it is not part of the target)
+  assert.deepEqual(sqlShellEscapes(String.raw`.once 'a\' ; select 1`, { family: 'sqlite' }), [": > 'a\\'"]);
+  // (a double-quoted argument decodes the same text: `\b` is a backspace, so the file name is not the one with a backslash)
+  assert.deepEqual(sqlShellEscapes(String.raw`.output "a\\b.txt"`, { family: 'sqlite' }), [": > 'a\\b.txt'"]);
+  // an existing harmless case stays allowed
+  assert.deepEqual(verdicts('sqlite3 < q.sql', '.output "|git \\"status\\""'), { git: 'allow', files: 'allow' });
+  assert.deepEqual(sqlShellEscapes('.output "out.txt"', { family: 'sqlite' }), [': > out.txt']);
+});
+
 // ---- R3-B2 -----------------------------------------------------------------------------------------------------------------------
 
 test('R3-B2: an interpolating psql input marks the whole input unknown once, output stays linear in the input', () => {
