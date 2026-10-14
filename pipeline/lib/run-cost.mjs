@@ -123,6 +123,27 @@ export function readGuardLog(file, sessions) {
   return { present: true, blocks: Object.values(bySession).reduce((a, b) => a + b, 0), bySession, skipped };
 }
 
+// ---- list prices ---------------------------------------------------------------------------------------------------
+
+// Why: an agent knows the tokens a subagent used but rarely its price, so USD was 0 unless passed by hand. List prices in
+// USD per million tokens [input, output, cache read, cache write (5 min)], the same proxy as the owner's weekly usage report.
+// An estimate, not a bill (plans and discounts differ); a model this table does not know adds tokens and no USD.
+export const PRICES = Object.freeze({
+  opus: [5, 25, 0.5, 6.25], sonnet: [3, 15, 0.3, 3.75], haiku: [1, 5, 0.1, 1.25], fable: [12.5, 62.5, 1.25, 15.6],
+});
+export const modelFamily = (model) => {
+  const m = String(model ?? '').toLowerCase();
+  return /fable/.test(m) ? 'fable' : /sonnet/.test(m) ? 'sonnet' : /haiku/.test(m) ? 'haiku' : /opus/.test(m) ? 'opus' : null;
+};
+// USD for a token count at a model's list price; null when the model is unknown.
+export function listPriceUsd(model, t) {
+  const p = PRICES[modelFamily(model)];
+  if (!p) return null;
+  const n = (v) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : 0);
+  const usd = (n(t.input) * p[0] + n(t.output) * p[1] + n(t.cacheRead) * p[2] + n(t.cacheWrite) * p[3]) / 1e6;
+  return Math.round(usd * 1e6) / 1e6;
+}
+
 // ---- token usage from a Claude transcript (JSONL) ------------------------------------------------------------------
 
 // Sums message.usage over the assistant lines of one transcript. A streamed message may appear on several lines with
@@ -140,16 +161,22 @@ export function usageFromTranscript(text) {
     }
     const u = e?.message?.usage;
     if (!isPlainObject(u)) continue;
-    byId.set(e.message.id ?? `anon-${anon++}`, u);
+    byId.set(e.message.id ?? `anon-${anon++}`, { u, model: e.message.model });
   }
-  const sum = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, messages: byId.size };
+  // usd: each message at its own model's list price; unpricedMessages: messages whose model the price table does not know
+  const sum = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd: 0, messages: byId.size, unpricedMessages: 0 };
   const n = (v) => (Number.isFinite(v) && v > 0 ? Math.floor(v) : 0);
-  for (const u of byId.values()) {
-    sum.input += n(u.input_tokens);
-    sum.output += n(u.output_tokens);
-    sum.cacheRead += n(u.cache_read_input_tokens);
-    sum.cacheWrite += n(u.cache_creation_input_tokens);
+  for (const { u, model } of byId.values()) {
+    const t = { input: n(u.input_tokens), output: n(u.output_tokens), cacheRead: n(u.cache_read_input_tokens), cacheWrite: n(u.cache_creation_input_tokens) };
+    sum.input += t.input;
+    sum.output += t.output;
+    sum.cacheRead += t.cacheRead;
+    sum.cacheWrite += t.cacheWrite;
+    const price = listPriceUsd(model, t);
+    if (price === null) sum.unpricedMessages++;
+    else sum.usd += price;
   }
+  sum.usd = Math.round(sum.usd * 1e6) / 1e6;
   return sum;
 }
 

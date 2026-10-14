@@ -9,7 +9,7 @@ import { cli, scenario, ghEntries, PR } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
 import {
-  PHASES, ROLES, addCostEntry, addRetries, addSessions, costLines, emptyCost, readGuardLog, setGuardBlocks, usageFromTranscript,
+  PHASES, ROLES, addCostEntry, listPriceUsd, modelFamily, addRetries, addSessions, costLines, emptyCost, readGuardLog, setGuardBlocks, usageFromTranscript,
 } from '../pipeline/lib/run-cost.mjs';
 import {
   STEPS, applyCheckpoint, decodeRecord, emptyRecord, encodeRecord, recordForOutcome, renderStatusBlock,
@@ -146,7 +146,24 @@ test('usageFromTranscript: sums message.usage, counting a streamed message id on
     line('m2', { input_tokens: 1, output_tokens: 2 }),
     'garbage', JSON.stringify({ type: 'user', message: { content: 'hi' } }),
   ].join('\n');
-  assert.deepEqual(usageFromTranscript(text), { input: 4, output: 11, cacheRead: 100, cacheWrite: 10, messages: 2 });
+  assert.deepEqual(usageFromTranscript(text), { input: 4, output: 11, cacheRead: 100, cacheWrite: 10, usd: 0, messages: 2, unpricedMessages: 2 });
+});
+
+test('list prices: each transcript message at its own model, unknown models add tokens and no USD', () => {
+  const line = (id, model, u) => JSON.stringify({ type: 'assistant', message: { id, model, usage: u } });
+  const text = [
+    line('a', 'claude-sonnet-5-5', { input_tokens: 1e6 }), // $3
+    line('b', 'claude-opus-5-5', { output_tokens: 1e6, cache_read_input_tokens: 1e6 }), // $25 + $0.5
+    line('c', 'claude-haiku-5-5', { cache_creation_input_tokens: 1e6 }), // $1.25
+    line('d', 'some-other-model', { input_tokens: 1e6 }),
+  ].join('\n');
+  const u = usageFromTranscript(text);
+  assert.equal(u.usd, 29.75);
+  assert.equal(u.unpricedMessages, 1);
+  assert.equal(u.input, 2e6);
+  assert.equal(listPriceUsd('fable', { input: 1e6, output: 1e6 }), 75);
+  assert.equal(listPriceUsd('gpt-5', { input: 1 }), null);
+  assert.equal(modelFamily('Claude-Sonnet-5-5[1m]'), 'sonnet');
 });
 
 // ---- the CLI -------------------------------------------------------------------------------------------------------
@@ -196,6 +213,27 @@ test('P cost --from-transcript: the transcript usage is booked, explicit amounts
   assertExit(r, 0);
   assert.deepEqual([r.json.cost.total.input, r.json.cost.total.output, r.json.cost.total.cacheRead, r.json.cost.total.cacheWrite], [10, 25, 30, 40]);
   assertExit(costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/missing.jsonl']), 2);
+});
+
+test('P cost: USD from list prices (--model, transcript models); --usd wins; tokens with no price warn', () => {
+  const s = scenario();
+  const r = costCli(s, ['--phase', 'review', '--role', 'judge', '--input', '1000000', '--model', 'sonnet']);
+  assertExit(r, 0);
+  assert.equal(r.json.cost.total.usd, 3);
+  assert.deepEqual(r.json.warnings, []);
+  s.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'm', model: 'claude-opus-5-5', usage: { output_tokens: 1000000 } } })}\n`);
+  const t = costCli(scenario(), ['--phase', 'build', '--role', 'implementer', '--input', '10']);
+  assertExit(t, 0);
+  assert.equal(t.json.cost.total.usd, 0);
+  assert.match(t.json.warnings.join('\n'), /without --model or --usd/);
+  const s3 = scenario();
+  s3.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'm', model: 'claude-opus-5-5', usage: { output_tokens: 1000000 } } })}\n`);
+  const w = costCli(s3, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/t.jsonl']);
+  assertExit(w, 0);
+  assert.equal(w.json.cost.total.usd, 25);
+  const x = costCli(scenario(), ['--phase', 'build', '--role', 'judge', '--input', '1000000', '--model', 'sonnet', '--usd', '0.5']);
+  assert.equal(x.json.cost.total.usd, 0.5);
+  assertExit(costCli(scenario(), ['--phase', 'build', '--role', 'judge', '--input', '1', '--model', 'gpt']), 2);
 });
 
 const summary = (s, args, env = {}) => cli(['summary', '--pr', String(PR), '--outcome', 'merged', ...args], { dir: s.repo.dir, fake: s.fake, env: { ...s.env, ...env } });

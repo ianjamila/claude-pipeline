@@ -79,8 +79,8 @@ exists (Step 0 preflight and labels ensure) just stop: the owner is at the keybo
 
 **Cost booking (best effort, never a reason to stop).** Once the PR exists, after each subagent dispatch or review call
 that reports its token use, book it: `P cost --pr N --phase <build|verify|review|gate|…> --role <implementer|judge|arbiter|verifier|controller>
---input <n> --output <n> [--cache-read <n>] [--cache-write <n>] [--usd <x>]` (an agent transcript can be passed instead:
-`--from-transcript <file>`). Add `--retry` for each fix-and-reverify retry, and `--session <this session's id>` once per
+--input <n> --output <n> [--cache-read <n>] [--cache-write <n>] [--model sonnet|opus|haiku|fable | --usd <x>]` (an agent transcript
+can be passed instead, priced per message at list price: `--from-transcript <the agent's output file>`). Add `--retry` for each fix-and-reverify retry, and `--session <this session's id>` once per
 session so `P summary` can count the guard blocks. `P summary` shows the totals and the per-phase / per-role breakdown. A failed
 `P cost` is a warning only; skip it when no figures are available.
 
