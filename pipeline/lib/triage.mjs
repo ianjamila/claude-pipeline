@@ -226,7 +226,8 @@ export const ownerRuledItems = (state) => allItems(state).filter(isOwnerRuled);
 // performance idea must not settle the same text when it comes back as a BLOCKING security bug. A cache entry (see
 // ruledCacheFrom) therefore carries the bucket and category it was ruled under, and is reused only when both match.
 // A dismissal (REJECT / FOLLOW-UP) of a security, auth, permissions or data category is never reused, whatever the
-// bucket: those are looked at every time. An entry without bucket and category (a hand-built cache) is not reused.
+// bucket: those are looked at every time, unless the OWNER ruled on it (its final keeps the ownerQuote): asking again would make
+// the owner rule twice on the same finding, and the copy still counts as ownerMerge at the final gate. An entry without bucket and category (a hand-built cache) is not reused.
 export function reuseRuled(items, ruledCache) {
   return items.map((item) => {
     const next = structuredClone(item);
@@ -235,7 +236,7 @@ export function reuseRuled(items, ruledCache) {
     const { bucket, category, followupIssue, ...final } = structuredClone(ruledCache[next.fingerprint]);
     if (bucket !== next.bucket || category !== next.category) return next;
     const dismissal = final.decision === 'REJECT' || final.decision === 'FOLLOW-UP';
-    if (dismissal && SECURITY_CATEGORIES.includes(next.category)) return next;
+    if (dismissal && SECURITY_CATEGORIES.includes(next.category) && !isOwnerRuled({ final })) return next;
     next.final = { ...final, by: 'cache' };
     // The issue filed for the earlier item is the issue for this one: carrying it keeps `followups create` from
     // filing the same suggestion again every round.

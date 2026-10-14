@@ -1061,3 +1061,19 @@ test('an owner ruling reused from the cache (by cache, ownerQuote kept) is not o
   assert.equal(after.final.ownerQuote, 'yes, follow-up');
   assert.equal(isOwnerRuled(after), true);
 });
+
+test('reuseRuled: a security dismissal the OWNER ruled on is reused next round and still counts as owner-ruled; a non-owner one is not', () => {
+  for (const category of SECURITY_CATEGORIES) {
+    for (const decision of ['REJECT', 'FOLLOW-UP']) {
+      const stuck = item({ id: 'R1-B1', fingerprint: 'fp', bucket: 'BLOCKING', category, final: needsHumanFinal(decision) });
+      const owner = applyOwnerRuling(stuck, ownerOk(decision));
+      const [again] = reuseRuled([item({ id: 'R2-B1', fingerprint: 'fp', bucket: 'BLOCKING', category })], ruledCacheFrom([owner]));
+      assert.equal(again.final?.by, 'cache', `${decision} ${category}: reused`);
+      assert.equal(isOwnerRuled(again), true, `${decision} ${category}: still the owner's word`);
+      assert.equal(again.final.needsHuman, false);
+      assert.equal(ownerRuledItems(stateOf([round(2, [again])])).length, 1);
+      const plain = item({ id: 'R1-B2', fingerprint: 'fp', bucket: 'BLOCKING', category, final: settled(decision, 'arbiter') });
+      assert.equal(reuseRuled([item({ fingerprint: 'fp', bucket: 'BLOCKING', category })], ruledCacheFrom([plain]))[0].final, null, `${decision} ${category}: non-owner not reused`);
+    }
+  }
+});
