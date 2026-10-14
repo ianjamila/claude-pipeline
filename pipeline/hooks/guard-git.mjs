@@ -7,7 +7,12 @@
 // wiring inside the evaluator (runHook denies any internal error, whatever the command), hook-io.mjs itself below.
 
 // Why: the deny log (lib/deny-log.mjs) is a measurement aid. It is imported lazily inside try/catch so a missing or broken
-// file, or a failed write, can never change the verdict or crash the hook.
+// file, or a failed write, can never change the verdict or crash the hook. It runs only AFTER runHook has written the deny
+// (evaluate parks the deny in pendingDeny), so a slow or hanging log cannot hold the verdict back.
+let pendingDeny = null;
+// resolves once everything written to stdout so far has been handed to the OS (a pipe is asynchronous on macOS: without
+// this, a log call that blocked the thread would also hold back the deny already queued)
+const stdoutFlushed = () => new Promise((resolve) => { try { process.stdout.write('', () => resolve()); } catch { resolve(); } });
 async function recordDeny(input, command, verdict) {
   try {
     const { logDeny } = await import('./lib/deny-log.mjs');
@@ -32,7 +37,7 @@ async function evaluate(input) {
   for (const text of texts) {
     const verdict = evaluateGitCommand(text, opts);
     if (verdict.decision === 'deny') {
-      await recordDeny(input, text, verdict);
+      pendingDeny = { input, text, verdict };
       return verdict;
     }
   }
@@ -41,7 +46,14 @@ async function evaluate(input) {
 
 try {
   const { runHook } = await import('./lib/hook-io.mjs');
-  await runHook(evaluate);
+  const outcome = await runHook(evaluate);
+  if (outcome === 'deny' && pendingDeny) {
+    // own try: the deny is already out, so nothing here may reach the catch below (it would print a second deny)
+    try {
+      await stdoutFlushed();
+      await recordDeny(pendingDeny.input, pendingDeny.text, pendingDeny.verdict);
+    } catch { /* logging only */ }
+  }
 } catch (err) {
   // hook-io.mjs is missing or broken (runHook itself never rejects): deny with the same JSON, written by hand
   try {

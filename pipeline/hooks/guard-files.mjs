@@ -28,10 +28,15 @@ function deny(reason) {
   })}\n`);
 }
 
+// resolves once everything written to stdout so far has been handed to the OS (a pipe is asynchronous on macOS: without
+// this, a log call that blocked the thread would also hold back the deny already queued)
+const stdoutFlushed = () => new Promise((resolve) => { try { process.stdout.write('', () => resolve()); } catch { resolve(); } });
+
 // Why: only shell denies are logged (not Edit/Write). Imported dynamically inside try/catch like the policy, so a missing or
-// broken lib/deny-log.mjs can never change the verdict or crash the hook.
+// broken lib/deny-log.mjs can never change the verdict or crash the hook. Called only after the deny is written.
 async function recordDeny(input, reason) {
   try {
+    await stdoutFlushed();
     const { logDeny } = await import('./lib/deny-log.mjs');
     logDeny({ hook: 'files', reason, command: input.tool_input?.command, session: input.session_id });
   } catch { /* logging only */ }
@@ -61,8 +66,8 @@ async function main() {
       ? evaluateBashForFiles(input.tool_input?.command, { ...opts, cwd })
       : evaluateFileTool({ ...input, cwd }, opts);
     if (verdict?.decision === 'deny') {
-      if (isShell) await recordDeny(input, verdict.reason);
       deny(verdict.reason);
+      if (isShell) await recordDeny(input, verdict.reason);
     }
     else if (verdict?.decision !== 'allow') throw new TypeError('the policy returned no decision');
   } catch (err) {

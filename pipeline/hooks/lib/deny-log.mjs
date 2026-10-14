@@ -8,8 +8,13 @@
 // pipeline-state/ is where the other runtime state (locks, notify state) already lives.
 // Never throws and never changes a verdict: it is called while a deny is being returned, and a failure here must not
 // turn it into a crash (a crashing hook counts as "allowed"). PIPELINE_GUARD_LOG=0 turns it off.
+// Safety: the hooks emit the deny BEFORE they log (a slow or failed log cannot cost the verdict), and the log is only
+// ever written as a regular file: the folder must be a real directory (not a symlink), the file is opened with
+// O_NOFOLLOW (a symlink at the path is refused, so an agent cannot point the hook at a protected file and have it
+// appended to) and O_NONBLOCK (a FIFO at the path fails at once instead of hanging the hook), and an open handle that
+// is not a regular file is closed unwritten.
 import { createHash } from 'node:crypto';
-import { appendFileSync, mkdirSync, renameSync, statSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, renameSync, writeSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -39,6 +44,24 @@ export function reasonCode(reason) {
   return 'other';
 }
 
+// O_NOFOLLOW and O_NONBLOCK do not exist on Windows (undefined there); the lstat checks still apply
+const OPEN_FLAGS = constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
+
+// Opens the log for appending, or returns -1 when the path is anything but a regular file (or absent).
+function openRegular(file) {
+  try {
+    if (!lstatSync(file).isFile()) return -1; // symlink, FIFO, socket, device, directory
+  } catch (err) {
+    if (err?.code !== 'ENOENT') return -1;
+  }
+  const fd = openSync(file, OPEN_FLAGS, 0o600);
+  try {
+    if (fstatSync(fd).isFile()) return fd;
+  } catch { /* fall through */ }
+  closeSync(fd);
+  return -1;
+}
+
 export const guardLogFile = (home = os.homedir()) => path.join(home, '.claude', 'pipeline-state', 'guard-log.jsonl');
 
 // Returns true when a line was written, false when logging is off or anything failed.
@@ -46,10 +69,17 @@ export function logDeny({ hook, reason, command, session, home = os.homedir(), n
   try {
     if (env.PIPELINE_GUARD_LOG === '0') return false;
     const file = guardLogFile(home);
-    mkdirSync(path.dirname(file), { recursive: true });
-    let size = 0;
-    try { size = statSync(file).size; } catch { /* no log yet */ }
-    if (size > maxBytes) renameSync(file, file.replace(/\.jsonl$/, '.1.jsonl')); // replaces an older .1
+    const dir = path.dirname(file);
+    mkdirSync(dir, { recursive: true });
+    if (!lstatSync(dir).isDirectory()) return false; // a symlinked folder would move the log somewhere else
+    let fd = openRegular(file);
+    if (fd < 0) return false;
+    if (fstatSync(fd).size > maxBytes) {
+      closeSync(fd);
+      renameSync(file, file.replace(/\.jsonl$/, '.1.jsonl')); // replaces an older .1 (a symlink there is replaced, not followed)
+      fd = openRegular(file);
+      if (fd < 0) return false;
+    }
     const line = JSON.stringify({
       ts: new Date(now()).toISOString(),
       session: typeof session === 'string' && session !== '' ? session : null,
@@ -57,7 +87,11 @@ export function logDeny({ hook, reason, command, session, home = os.homedir(), n
       reason_code: reasonCode(reason),
       cmd_hash: createHash('sha256').update(String(command ?? '')).digest('hex').slice(0, 16),
     });
-    appendFileSync(file, `${line}\n`);
+    try {
+      writeSync(fd, `${line}\n`);
+    } finally {
+      closeSync(fd);
+    }
     return true;
   } catch {
     return false;

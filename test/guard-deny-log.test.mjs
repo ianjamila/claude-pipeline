@@ -1,7 +1,7 @@
 // The guard deny log: reason slugs, the line format, privacy, rotation, never-throws, the two hooks, the CLI summary.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -130,14 +130,74 @@ test('logDeny never throws: a home that is a file, or odd arguments, return fals
   assert.doesNotThrow(() => logDeny({ home: null, now: () => { throw new Error('clock'); } }));
 });
 
+// ---- only a regular file is ever written: symlinks, FIFOs and a symlinked folder are refused --------------
+
+const POSIX = process.platform !== 'win32';
+const stateDir = (home) => dirname(guardLogFile(home));
+const mkfifo = (p) => assert.equal(spawnSync('mkfifo', [p]).status, 0, 'mkfifo failed');
+
+test('logDeny refuses a symlink at the log path: the file it points to is left unchanged', { skip: !POSIX }, () => {
+  const home = freshHome();
+  mkdirSync(stateDir(home), { recursive: true });
+  const target = join(home, 'settings.json');
+  writeFileSync(target, '{"keep":true}\n');
+  symlinkSync(target, guardLogFile(home));
+  assert.equal(logDeny({ hook: 'git', reason: 'x', command: 'c', home }), false);
+  assert.equal(readFileSync(target, 'utf8'), '{"keep":true}\n');
+  assert.ok(lstatSync(guardLogFile(home)).isSymbolicLink());
+  // a dangling symlink is not created through either
+  const home2 = freshHome();
+  mkdirSync(stateDir(home2), { recursive: true });
+  const missing = join(home2, 'created-through-link.json');
+  symlinkSync(missing, guardLogFile(home2));
+  assert.equal(logDeny({ hook: 'git', reason: 'x', command: 'c', home: home2 }), false);
+  assert.equal(existsSync(missing), false);
+});
+
+test('logDeny refuses a pipeline-state folder that is a symlink: nothing lands in the folder it points to', { skip: !POSIX }, () => {
+  const home = freshHome();
+  const elsewhere = join(home, 'elsewhere');
+  mkdirSync(elsewhere);
+  mkdirSync(join(home, '.claude'));
+  symlinkSync(elsewhere, stateDir(home));
+  assert.equal(logDeny({ hook: 'git', reason: 'x', command: 'c', home }), false);
+  assert.deepEqual(readdirSync(elsewhere), []);
+});
+
+test('logDeny: rotation over a symlinked guard-log.1.jsonl replaces the link and leaves its target unchanged', { skip: !POSIX }, () => {
+  const home = freshHome();
+  mkdirSync(stateDir(home), { recursive: true });
+  const target = join(home, 'keep.txt');
+  writeFileSync(target, 'keep\n');
+  writeFileSync(guardLogFile(home), 'x'.repeat(200));
+  const older = guardLogFile(home).replace(/\.jsonl$/, '.1.jsonl');
+  symlinkSync(target, older);
+  assert.equal(logDeny({ hook: 'git', reason: 'x', command: 'c', home, maxBytes: 100 }), true);
+  assert.equal(readFileSync(target, 'utf8'), 'keep\n');
+  assert.ok(lstatSync(older).isFile());
+  assert.equal(lines(home).length, 1);
+});
+
+test('logDeny refuses a FIFO at the log path at once (no hang) and a directory there too', { skip: !POSIX }, () => {
+  const home = freshHome();
+  mkdirSync(stateDir(home), { recursive: true });
+  mkfifo(guardLogFile(home));
+  const t0 = Date.now();
+  assert.equal(logDeny({ hook: 'git', reason: 'x', command: 'c', home }), false);
+  assert.ok(Date.now() - t0 < 2000);
+  const home2 = freshHome();
+  mkdirSync(guardLogFile(home2), { recursive: true });
+  assert.equal(logDeny({ hook: 'git', reason: 'x', command: 'c', home: home2 }), false);
+});
+
 // ---- the hooks, spawned as Claude Code runs them -----------------------------------------------------------
 
-function spawnHook(hooksDir, name, input, home, extraEnv = {}) {
+function spawnHook(hooksDir, name, input, home, extraEnv = {}, timeout = undefined) {
   const env = { ...process.env, HOME: home, USERPROFILE: home, ...extraEnv };
   delete env.PIPELINE_GUARD_LOG;
   delete env[ADMIN_VAR];
   Object.assign(env, extraEnv);
-  return spawnSync(process.execPath, [join(hooksDir, name)], { input: JSON.stringify(input), encoding: 'utf8', env });
+  return spawnSync(process.execPath, [join(hooksDir, name)], { input: JSON.stringify(input), encoding: 'utf8', env, timeout });
 }
 const bashInput = (command, cwd) => ({ session_id: 'sess-h', cwd, hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command } });
 const decisionOf = (r) => (r.stdout.trim() === '' ? 'allow' : JSON.parse(r.stdout).hookSpecificOutput.permissionDecision);
@@ -213,6 +273,33 @@ test('guard-files: a Bash deny writes one line (hook files), an allow and a file
   const writeDeny = spawnHook(HOOKS, 'guard-files.mjs', { session_id: 's', cwd: TMP, tool_name: 'Write', tool_input: { file_path: protectedFile, content: 'x' } }, home);
   assert.equal(decisionOf(writeDeny), 'deny');
   assert.equal(lines(home).length, 1);
+});
+
+test('both hooks: a FIFO at the log path still gets the deny out at once, and nothing is logged', { skip: !POSIX }, () => {
+  const home = freshHome();
+  mkdirSync(stateDir(home), { recursive: true });
+  mkfifo(guardLogFile(home));
+  const g = spawnHook(HOOKS, 'guard-git.mjs', bashInput(FORCE_CMD, TMP), home, {}, 15000);
+  assert.equal(g.signal, null, 'guard-git hung on the FIFO');
+  assert.equal(decisionOf(g), 'deny');
+  const f = spawnHook(HOOKS, 'guard-files.mjs', bashInput(`echo x > ${join(home, '.claude', 'settings.json')}`, TMP), home, {}, 15000);
+  assert.equal(f.signal, null, 'guard-files hung on the FIFO');
+  assert.equal(decisionOf(f), 'deny');
+  assert.ok(lstatSync(guardLogFile(home)).isFIFO());
+});
+
+test('both hooks: the deny is written before logging starts (a log call that blocks the thread cannot hold it back)', () => {
+  const hang = hooksWithout('deny-log.mjs');
+  // blocks the event loop for 60 s: only a deny already flushed to the pipe reaches the parent before the kill
+  writeFileSync(join(hang, 'lib', 'deny-log.mjs'), 'export function logDeny() { const t = Date.now() + 60000; while (Date.now() < t); return true; }\n');
+  const home = freshHome();
+  const g = spawnHook(hang, 'guard-git.mjs', bashInput(FORCE_CMD, TMP), home, {}, 4000);
+  assert.equal(g.signal, 'SIGTERM');
+  assert.equal(decisionOf(g), 'deny');
+  assert.match(reasonOf(g), /force-pushing/);
+  const f = spawnHook(hang, 'guard-files.mjs', bashInput(`echo x > ${join(home, '.claude', 'settings.json')}`, TMP), home, {}, 4000);
+  assert.equal(f.signal, 'SIGTERM');
+  assert.equal(decisionOf(f), 'deny');
 });
 
 test('guard-files: with deny-log.mjs missing or throwing the deny is still returned', () => {
