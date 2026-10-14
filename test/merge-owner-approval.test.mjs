@@ -5,9 +5,9 @@
 // Findings (read the code before trusting a green run):
 //  - label mode (default): a blocking hard-stop fails the gate AND the live re-gate, whatever labels the PR carries and
 //    whatever flag is passed. `P merge` cannot merge such a PR at all; the owner merges it in the GitHub UI.
-//  - chat mode: the gate passes with ownerMerge > 0 and `P merge` itself checks NOTHING about the owner's "merge" for a
-//    normal run: that rule lives only in the ship skill's text. `--owner-approved-head` is enforced only for a RESUMED run
-//    (see checkpoint.test.mjs). The three `todo` tests below pin that gap; they fail today and are expected to.
+//  - chat mode: the gate passes with ownerMerge > 0. `P merge` then refuses unless --owner-approved-head names the exact head
+//    (checked on the gate file and again on the live gate), for normal and resumed runs alike. Open: the flag is plain argv, so
+//    it cannot tell the owner from the agent (the `todo` test at the end).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
@@ -78,7 +78,7 @@ test('low-risk PR (no hard-stop hit) merges through P merge after the final gate
   }
 });
 
-// ---- chat mode: the gap. P merge does not itself require the owner's approval of a hard-stop head ------------------------
+// ---- chat mode: a head with items for the owner merges only with the owner's approval of that exact head ------------------
 
 test('chat mode, hard-stop PR: the gate passes only as an owner-merge item (ownerMerge > 0)', () => {
   const s = scenario({ yml: chatYml() });
@@ -111,22 +111,48 @@ test('chat mode, hard-stop PR, resumed run: a wrong or missing approval head ref
   assert.deepEqual(s.mergeCalls(), []);
 });
 
-test('GAP chat mode, hard-stop PR, NO approval: P merge must refuse', { todo: 'gap: P merge merges an ownerMerge > 0 head of a normal run with no approval; only the ship skill text asks the owner' }, () => {
+test('chat mode, hard-stop PR, normal run, NO approval: P merge refuses before touching GitHub', () => {
   const s = scenario({ yml: chatYml() });
   assertExit(s.gate(), 0);
   const r = mergeWith(s);
   assertExit(r, 1);
+  assert.equal(r.json.error, 'pre-merge');
+  assert.match(r.json.reason, /owner must say "merge" for this exact head/);
   assert.deepEqual(s.mergeCalls(), []);
 });
 
-test('GAP chat mode, hard-stop PR, STALE approval (an older head): P merge must refuse', { todo: 'gap: --owner-approved-head is ignored unless the run record is resumed, so an approval for an old head is not even compared' }, () => {
+test('chat mode, hard-stop PR, normal run, STALE approval (an older head): P merge refuses', () => {
   const s = scenario({ yml: chatYml() });
   assertExit(s.gate(), 0);
-  const r = mergeWith(s, ['--owner-approved-head', OLD]);
-  assertExit(r, 1);
+  for (const args of [['--owner-approved-head', OLD], ['--owner-approved-head', s.head.slice(0, 12)]]) {
+    const r = mergeWith(s, args);
+    assertExit(r, 1);
+    assert.equal(r.json.error, 'pre-merge', args.join(' '));
+  }
   assert.deepEqual(s.mergeCalls(), []);
 });
 
+test('chat mode, hard-stop PR: a gate file edited to ownerMerge 0 is caught by the live gate', () => {
+  const s = scenario({ yml: chatYml() });
+  assertExit(s.gate(), 0);
+  forgeGate(s); // (no ownerMerge field: the early check passes)
+  const r = mergeWith(s);
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'pre-merge');
+  assert.deepEqual(s.mergeCalls(), []);
+});
+
+test('chat mode, hard-stop PR: the owner\'s approval of the exact head merges', () => {
+  const s = scenario({ yml: chatYml() });
+  assertExit(s.gate(), 0);
+  const r = mergeWith(s, ['--owner-approved-head', s.head]);
+  assertExit(r, 0);
+  assert.equal(r.json.merged, true);
+  assert.equal(s.mergeCalls().length, 1);
+});
+
+// Still open (needs an owner design decision, see the PR): --owner-approved-head is a plain argv flag, so the exact-head check
+// stops a missing or stale approval but cannot tell the owner's "merge" from the agent typing the same SHA itself.
 test('GAP chat mode, hard-stop PR, approval flag supplied by the agent itself: P merge cannot tell it from the owner\'s', { todo: 'gap: --owner-approved-head is a plain argv flag; nothing records that the owner (not the agent) said "merge" for this head' }, () => {
   const s = scenario({ yml: chatYml() });
   assertExit(s.gate(), 0);

@@ -311,7 +311,8 @@ each `P merge`, take the `ownerMerge` count of the `P final-gate --pr N` that co
 - `0` ⇒ merge as usual.
 - `> 0` (also review items the owner ruled in chat with `P triage owner-ruling`: the gate's `review` detail lists their ids and the
   owner's quotes; show them in the stop comment) ⇒ merge ONLY if the owner said "merge" in THIS session for exactly this head sha and no owner-merge item beyond
-  the ones shown to them. A "merge" given for an earlier head never carries over: a new commit, an update-branch, a rebase or
+  the ones shown to them, with `P merge --pr N --owner-approved-head <full 40-character head>` (`P merge` refuses an
+  `ownerMerge > 0` head without it, or with any other head). A "merge" given for an earlier head never carries over: a new commit, an update-branch, a rebase or
   a retry after a head change (Step 5.2, a `behind-base` return, a refreshed gate) needs a new stop. If there is no such
   approval, STOP:
   1. Post one comment: `gh pr comment N --body "<each item: rule, file, one-line why; head <sha7>; the owner merges by saying \"merge\" in chat>"`.

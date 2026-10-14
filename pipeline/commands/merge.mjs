@@ -26,6 +26,8 @@ export const meta = {
   usage: 'pipeline merge --pr N [--owner-approved-head SHA] [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?, warnings?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment. While it runs the run record of the PR shows inFlight {kind: merge} and step merge; a prod-before event comment (the known-good deployment) is posted before the merge command, and when that post fails nothing is merged (error pre-merge); warnings lists a run record write that failed (never fatal). A run record marked resumed (`P checkpoint --resumed`: a run taken over by ship resume) refuses with error pre-merge unless --owner-approved-head names the full gate head: only the owner\'s \"merge\" for that head supplies it; so does a run record that cannot be checked (unreadable, invalid or unsupported: it may be a resumed one)',
 };
 
+const OWNER_MERGE_REASON = 'the final gate left items for the owner (owner_approval: chat): the owner must say "merge" for this exact head (pass --owner-approved-head <sha>)';
+
 const refuse = (error, reasons, extra = {}) => ({
   exitCode: EXIT.FAILED,
   output: { ok: false, merged: false, error, reasons, message: error === 'gate' ? 'run final-gate again' : reasons.join('; '), ...extra },
@@ -73,6 +75,10 @@ export const run = guarded(async (argv, ctx) => {
         const reason = `${unchecked}, so the resumed-run guard cannot be checked: the owner must approve this exact head (pass --owner-approved-head <sha>)`;
         return refuse('pre-merge', [reason], { reason });
       }
+      // Why (#58): with owner_approval: chat a head the final gate left items for the owner on (ownerMerge > 0: hard-stop paths, test
+      // changes) merged with no approval, or with one for an older head, because the flag was only read for resumed runs. Checked here
+      // from the gate file (before anything touches GitHub) and again on the live gate below (the file is local and could be edited).
+      if (Number(gate.ownerMerge) > 0) return refuse('pre-merge', [OWNER_MERGE_REASON], { reason: OWNER_MERGE_REASON });
     }
     const warnings = [];
 
@@ -111,6 +117,7 @@ export const run = guarded(async (argv, ctx) => {
     if (fresh.head !== gate.head || fresh.contentHash !== gate.contentHash) {
       return refuse('live-check', ['the live gate is for a different head or patch than final-gate.json approved']);
     }
+    if (Number(fresh.ownerMerge) > 0 && !ownerApproved) return refuse('pre-merge', [OWNER_MERGE_REASON], { reason: OWNER_MERGE_REASON });
 
     if (prodBefore) {
       writeReviewJson(root, 'prod-before.json', {
