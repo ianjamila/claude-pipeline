@@ -17,3 +17,9 @@ test('skipOf: everything else is not a skip', () => {
     assert.equal(skipOf(row), null, JSON.stringify(row));
   }
 });
+
+test('skipOf: a legacy row falls back to command only when it is a "(skipped ..." note, never a plain command', () => {
+  assert.deepEqual(skipOf({ name: 'a', status: 'pass', skipped: true, command: 'npm test' }), { name: 'a', reason: '' });
+  assert.deepEqual(skipOf({ name: 'a', status: 'pass', skipped: true, command: '(skipped — deps unchanged)' }), { name: 'a', reason: '(skipped — deps unchanged)' });
+  assert.deepEqual(skipOf({ name: 'a', status: 'pass', skipped: true, skipCheck: 'why', command: 'npm test' }), { name: 'a', reason: 'why' });
+});
