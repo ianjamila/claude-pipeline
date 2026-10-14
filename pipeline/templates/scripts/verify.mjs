@@ -5,7 +5,7 @@
 //   node scripts/verify.mjs --quick        only steps marked quick:true (using quickCmd when a step has one)
 //   node scripts/verify.mjs --only a,b     just those steps (report mode "partial"; never a substitute for a full run)
 //   node scripts/verify.mjs --list         print the steps
-// Writes .verify/report.json (+ .verify/logs/<step>.log). Exit 0 all passed, 1 a step failed, 2 refused or usage error.
+// Writes .verify/report.json (+ .verify/logs/<step>.log). Exit 0 all passed (or skipped), 1 a step failed, 2 refused or usage error.
 // Safety: it refuses to run at all when a database variable (NEXT_PUBLIC_SUPABASE_URL, SUPABASE_URL, DATABASE_URL,
 // POSTGRES_URL*, DIRECT_URL, SUPABASE_DB_URL, PGHOST, PGHOSTADDR; also a host=/hostaddr= inside a URL) points anywhere but
 // localhost, in the environment, in a step's env or in a repo-root .env / .env.local / .env.test / .env.development file,
@@ -32,6 +32,12 @@ const PROJECT = 'my-app'; // must match `project:` in .claude/pipeline.yml (name
 // lockGroup 'db' = needs the dedicated local database; consecutive steps in one group run under a single lock
 // env       extra environment: an object, or a function returning one (called just before the step starts)
 // timeoutMs per-step limit (default 30 minutes)
+// skipIf    function({ cwd, env, git, mode }) -> null | { run: true, reason } | { run: false, reason, log? }:
+//           consulted ONLY in a FULL run (never --quick or --only), after the env checks. null runs the step; `{ run: true,
+//           reason }` also runs it but records `skipCheck: <reason>`. `{ run: false, reason }` skips it: the row becomes
+//           status 'skipped' + skipReason (final-gate then accepts it only if the step is listed in verify.skippable_steps),
+//           and `log` (default: the reason) is written to .verify/logs/<step>.log. `git` is the report's git block. It must
+//           fail closed: a throw or any other answer runs the step and records `skipCheck: skip check failed: <why>`.
 const STEPS = [
   { name: 'install', cmd: 'npm ci', quick: false },
   { name: 'typecheck', cmd: 'npx tsc --noEmit', quick: true, quickCmd: 'npx tsc --noEmit --incremental --tsBuildInfoFile .verify/tsbuildinfo' },
@@ -174,6 +180,7 @@ function validateSteps(steps) {
     if (typeof s.cmd !== 'string' || !s.cmd.trim()) throw new UsageError(`step ${s.name}: cmd must be a non-empty string`);
     if (s.quickCmd !== undefined && (typeof s.quickCmd !== 'string' || !s.quickCmd.trim())) throw new UsageError(`step ${s.name}: quickCmd must be a non-empty string`);
     if (s.lockGroup !== undefined && (typeof s.lockGroup !== 'string' || !NAME_RE.test(s.lockGroup))) throw new UsageError(`step ${s.name}: bad lockGroup`);
+    if (s.skipIf !== undefined && typeof s.skipIf !== 'function') throw new UsageError(`step ${s.name}: skipIf must be a function`);
   }
 }
 
@@ -301,7 +308,36 @@ export async function runVerify(opts = {}) {
       const stepEnv = typeof s.env === 'function' ? await s.env() : (s.env ?? {});
       const badNow = [...nonLocalDb({ ...env, ...stepEnv }), ...nonLocalEnvFiles(fileDefs, { ...env, ...stepEnv })];
       if (badNow.length > 0) throw new Refused(refusal(badNow, `step ${s.name}'s env`));
-      say(`[run ] ${s.name}: ${r.command}`);
+      // A skip is only consulted in a full run, after the refusal checks above. A skipIf that throws or answers with junk
+      // never skips: the step runs and the reason is recorded.
+      let skip = null;
+      let runReason = null; // why a consulted skipIf let the step run (null = it said nothing, or was not consulted)
+      if (mode === 'full' && s.skipIf) {
+        try {
+          const d = s.skipIf({ cwd, env, git: report.git, mode });
+          // An async skipIf is an invalid answer; consume its eventual rejection so it cannot become an unhandledRejection.
+          if (d && typeof d.then === 'function') d.then(undefined, () => {});
+          if (d !== null && d !== undefined) {
+            const reasoned = typeof d === 'object' && typeof d.reason === 'string' && d.reason.trim() !== '';
+            if (reasoned && d.run === true) runReason = d.reason.trim();
+            else if (reasoned && d.run === false && (d.log === undefined || typeof d.log === 'string')) skip = d;
+            else throw new Error('skipIf must return null, { run: true, reason } or { run: false, reason, log? }');
+          }
+        } catch (e) {
+          runReason = `skip check failed: ${e.message}`;
+        }
+      }
+      if (skip) {
+        const t1 = Date.now();
+        r.status = 'skipped';
+        r.skipReason = skip.reason.trim();
+        writeFileSync(join(logsDir, `${s.name}.log`), skip.log ?? `skipped: ${r.skipReason}\n`);
+        r.durationMs = Date.now() - t1;
+        say(`[skip] ${s.name} (${r.skipReason})`);
+        return true;
+      }
+      if (runReason !== null) r.skipCheck = runReason;
+      say(`[run ] ${s.name}: ${r.command}${runReason !== null ? `  (runs: ${runReason})` : ''}`);
       const t0 = Date.now();
       const res = await runShellAsync(r.command, { cwd, env: env === process.env ? stepEnv : { ...env, ...stepEnv }, timeoutMs: s.timeoutMs ?? STEP_TIMEOUT_MS });
       r.durationMs = Date.now() - t0;
@@ -355,9 +391,12 @@ export async function runVerify(opts = {}) {
       if (stopped) break;
     }
 
-    const ok = report.steps.every((s) => s.status === 'pass');
+    const ok = report.steps.every((s) => s.status === 'pass' || s.status === 'skipped');
     const failed = report.steps.find((s) => s.status === 'fail');
-    say(`verify (${mode}): ${ok ? 'PASS' : `FAIL at ${failed?.name ?? '?'}`} - ${report.steps.filter((s) => s.status === 'pass').length}/${report.steps.length} steps passed. Report: ${reportFile}`);
+    const skipped = report.steps.filter((s) => s.status === 'skipped').length;
+    const passed = report.steps.filter((s) => s.status === 'pass').length;
+    const tally = skipped > 0 ? `${passed} passed, ${skipped} skipped (${report.steps.length} steps)` : `${passed}/${report.steps.length} steps passed`;
+    say(`verify (${mode}): ${ok ? 'PASS' : `FAIL at ${failed?.name ?? '?'}`} - ${tally}. Report: ${reportFile}`);
     return finish(ok ? 0 : 1);
   } catch (e) {
     warn(`verify: ${e.message}`);

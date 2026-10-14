@@ -7,6 +7,7 @@
 // commercial at (U+FF20) so it can never notify anyone (it looks the same, also inside code).
 // Single-line values are flattened, and pipes in table cells become &#124;.
 import { encodeForComment } from './state.mjs';
+import { skipOf } from './verify-steps.mjs';
 
 export const MARKERS = {
   triage: '<!-- claude-pipeline:triage -->',
@@ -35,6 +36,12 @@ export const cell = (s, max = Infinity) => line(s, max).replace(/\|/g, '&#124;')
 
 const TRIAGE_HEADER = '| Round | ID | Bucket | Finding | Decision | By | Conf. | Reason |';
 
+// An owner ruling shows the owner's own words (the cell is longer than the usual 120 so the quote is not cut off).
+const OWNER_REASON_MAX = 360;
+const ownerReason = (final) => (typeof final?.ownerQuote === 'string' && final.ownerQuote !== ''
+  ? `owner (chat): ${final.ownerQuote}${final.reason ? ` — ${final.reason}` : ''}`
+  : null);
+
 function triageRow(n, item) {
   const { final, judge, arbiter } = item;
   let decision = 'pending';
@@ -42,9 +49,9 @@ function triageRow(n, item) {
   else if (judge) decision = `${judge.decision} (pending)`;
   const by = final?.by ?? '—';
   const conf = arbiter?.confidence ?? judge?.confidence ?? '—';
-  const reason = final?.reason ?? judge?.reason ?? '';
+  const reason = ownerReason(final) ?? final?.reason ?? judge?.reason ?? '';
   const finding = item.title || item.file || '';
-  return `| ${cell(n)} | ${cell(item.id)} | ${cell(item.bucket)} | ${cell(finding, 80)} | ${cell(decision)} | ${cell(by)} | ${cell(conf)} | ${cell(reason, 120)} |`;
+  return `| ${cell(n)} | ${cell(item.id)} | ${cell(item.bucket)} | ${cell(finding, 80)} | ${cell(decision)} | ${cell(by)} | ${cell(conf)} | ${cell(reason, final?.ownerQuote ? OWNER_REASON_MAX : 120)} |`;
 }
 
 export function triageComment(state) {
@@ -108,6 +115,9 @@ function outliersSection(entries, modelProofs) {
     if (!strong && !closeCall) continue;
     const settled = item.final ? `final: ${line(item.final.decision ?? 'unknown')} by ${line(item.final.by)}` : 'final: pending';
     out.push(`- ${findingLabel(item)} · ${codexView(item)} · ${opusView(item)} · ${settled} _(${strong ? 'strong disagreement' : 'close call'})_`);
+  }
+  for (const { item } of unique(entries.filter(({ item: i }) => i.final?.ownerQuote))) {
+    out.push(`- ${findingLabel(item)} · Owner (chat): ${line(item.final.decision)} — "${line(item.final.ownerQuote, 300)}"`);
   }
   for (const p of modelProofs) {
     out.push(`- Fable proof: ${line(p.transcript)}, models ${fmtModels(p)}, effort ${line(p.effort ?? 'high')}`);
@@ -227,10 +237,13 @@ export function blockedComment(report) {
   } else {
     out.push('| Step | Status | Duration | Command |', '|---|---|---|---|');
     for (const s of steps) {
-      const ran = s.status !== 'not-run' && Number.isFinite(s.durationMs);
+      const skip = skipOf(s);
+      const ran = s.status !== 'not-run' && !skip && Number.isFinite(s.durationMs);
       const duration = ran ? `${(s.durationMs / 1000).toFixed(1)}s` : '—';
       const command = s.command ? cell(s.command) : '';
-      out.push(`| ${cell(s.name)} | ${cell(s.status)} | ${duration} | ${command} |`);
+      // A skipped step reads "skipped (reason)", also for the legacy pass+skipped:true row: it did not run, so it is not a pass.
+      const status = skip ? cell(`skipped${skip.reason ? ` (${clip(flat(skip.reason), 80)})` : ''}`) : cell(s.status);
+      out.push(`| ${cell(s.name)} | ${status} | ${duration} | ${command} |`);
     }
     for (const s of steps.filter((x) => x.status === 'fail' && excerptOf(x))) {
       const code = s.exitCode == null ? '' : ` (exit ${line(s.exitCode)})`;
