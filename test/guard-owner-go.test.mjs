@@ -30,7 +30,8 @@ test('#58 chat repo: a direct `gh pr merge` needs the owner\'s recorded "merge" 
   }
   // the head the owner approved, and only that one
   assert.match(deny(`gh pr merge 7 --squash --match-head-commit ${H8}`).reason, /#7 at head 888888888888/);
-  for (const cmd of ['gh pr merge 7 --squash --auto', 'gh pr merge 7 --match-head-commit 7777777', `gh pr merge 7 --subject ${H7}`]) {
+  for (const cmd of ['gh pr merge 7 --squash --auto', 'gh pr merge 7 --match-head-commit 7777777', `gh pr merge 7 --subject ${H7}`,
+    `gh pr merge 7 --match-head-commit ${H7} --match-head-commit ${H8}`, `gh pr merge 7 --match-head-commit=${H7} --match-head-commit=${H7}`]) {
     assert.match(deny(cmd).reason, /must pin the head the owner said "merge" for: add `--match-head-commit <full 40-character head>`/, cmd);
   }
   assert.match(deny('gh pr merge --squash --auto').reason, /without a literal PR number/, 'the current branch\'s PR cannot be checked');
@@ -46,6 +47,7 @@ test('#58 chat repo: the repo\'s own merge command typed by hand is judged the s
   allow(`npm run merge -- 7 --expect-head=${H7}`);
   deny(`npm run merge -- 8 --no-update --expect-head ${H8}`);
   assert.match(deny('npm run merge -- 7 --no-update').reason, /must pin the head .*add `--expect-head <full 40-character head>`/);
+  assert.match(deny(`npm run merge -- 7 --expect-head ${H7} --expect-head ${H8}`).reason, /must pin the head/, 'a repeated head flag pins nothing');
   deny(`npm run merge 8 --expect-head ${H8}`);
   assert.match(deny('node scripts/m.mjs 7').reason, /pins no head/, 'a merge command without {sha} cannot be bound to a head');
   allow('npm run build');

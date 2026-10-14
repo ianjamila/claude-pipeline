@@ -233,7 +233,9 @@ head you did not review (the receipt names the head the event carried).
   calls the recorder's library, `curl` with your token, a local edit of the refs or `pipeline.yml` the guard reads) can still
   forge or skip it, and chat-mode CI passes owner items. It stops mistakes and casual workarounds, not a determined agent. The
   server-side backstop is a second GitHub identity plus a ruleset (issue #65). A direct `gh pr merge` in a chat repo must pin
-  the head (`--match-head-commit`, or the head flag of the repo's merge command) the owner said "merge" for in this session.
+  the head (`--match-head-commit`, or the head flag of the repo's merge command) the owner said "merge" for in this session. The chat
+  mode is read from the repository the command runs in: a nested or separate clone whose own `pipeline.yml` is not chat is
+  not caught (a protected registry of chat repos is the planned fix).
 - **Branch protection needs GitHub Pro** for private repos. Without it a repo runs in `gate`
   mode (skills and CLI only) and preflight says so.
 - **Local verify, lean CI.** The full verify runs on your machine; CI keeps the repo's existing

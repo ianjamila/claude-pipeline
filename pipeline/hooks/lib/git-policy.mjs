@@ -831,8 +831,9 @@ function repoMergeCommandVerdict(argv, dir, ctx) {
     if (plain.length < p.length || baseName(plain[0]) !== baseName(p[0]) || !p.slice(1).every((w, i) => plain[i + 1] === w)) continue;
     let head = null;
     if (shaFlag) {
-      const at = words.indexOf(shaFlag);
-      head = at >= 0 ? words[at + 1] : words.find((w) => w.startsWith(`${shaFlag}=`))?.slice(shaFlag.length + 1) ?? null;
+      // (exactly one head flag: with two, which one the script honours is unknown)
+      const vals = words.flatMap((w, j) => (w === shaFlag ? [words[j + 1]] : w.startsWith(`${shaFlag}=`) ? [w.slice(shaFlag.length + 1)] : []));
+      head = vals.length === 1 ? vals[0] ?? null : null;
     }
     return directMergeVerdict(prNumberOf(plain[p.length]), head, dir, ctx, `\`${prefix.join(' ')}\``, false, shaFlag);
   }
@@ -887,7 +888,9 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
     if (rest.includes('--disable-auto')) return null; // (turns a queued merge off)
     const { flags, positionals } = parseOpts(rest, { longValue: ['author-email', 'body', 'body-file', 'match-head-commit', 'repo', 'subject'], shortValue: 'AbFtR' });
     const elsewhere = flagValues(flags, ['repo'], 'R').length > 0 || /\/pull\//.test(positionals[0] ?? '');
-    return directMergeVerdict(prNumberOf(positionals[0]), flagValues(flags, ['match-head-commit'])[0] ?? null, dir, ctx, '`gh pr merge`', elsewhere);
+    // (gh uses the LAST --match-head-commit: a repeated one could pin another head than the one checked, so it pins nothing)
+    const pins = flagValues(flags, ['match-head-commit']);
+    return directMergeVerdict(prNumberOf(positionals[0]), pins.length === 1 ? pins[0] : null, dir, ctx, '`gh pr merge`', elsewhere);
   }
 
   if ((group === 'pr' || group === 'issue') && (verb === 'edit' || verb === 'create')) {
