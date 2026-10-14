@@ -16,6 +16,10 @@ verify:
   screenshots: .verify/screenshots
   # expected_steps: [install, typecheck, lint, unit, build]   # optional: final-gate then requires the report's steps to
   #                                # equal this list exactly (in order), not the list the report declares for itself
+  # stop_queue_wait_minutes: 5   # optional, integer 0..30, default 0: minutes verify.quick may WAIT (e.g. for a machine-wide
+  #                                # heavy-check slot) before it runs. The Stop hook adds this to its 840 s execution allowance, so
+  #                                # raise the hook's "timeout" in .claude/settings.json to 900 + minutes * 60 seconds (5 -> 1200);
+  #                                # `P config` warns when it is lower.
 
 ci:
   required_checks: ["Test integrity", "Hard-stop scan"]   # + your CI job names

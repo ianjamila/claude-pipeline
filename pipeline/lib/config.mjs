@@ -24,7 +24,9 @@ export const DEFAULTS = deepFreeze({
   owner_approval: 'label',
   default_branch: 'main',
   worktree_dir: '.worktrees',
-  verify: { report: '.verify/report.json', screenshots: '.verify/screenshots' },
+  // stop_queue_wait_minutes: how long verify.quick may WAIT (for a machine-wide heavy-check slot) before it runs, on top of the
+  // Stop hook's own 840 s execution allowance. 0 = no queue. The hook's timeout in .claude/settings.json must grow to match.
+  verify: { report: '.verify/report.json', screenshots: '.verify/screenshots', stop_queue_wait_minutes: 0 },
   // guard_checks: the tamper-proof "Test integrity" and "Hard-stop scan" statuses are always required on top of
   // required_checks. false only for a repo that does not run the pipeline-guards workflow (e.g. this one).
   // approvers: GitHub logins whose approval labels (human-approved, test-change-approved) count. Empty = the repo owner,
@@ -73,7 +75,7 @@ const WATCH_MODES = ['session', 'workflow'];
 // Allowed keys per mapping. Anything else is a typo (or a removed option) and is rejected.
 const KEYS = {
   top: [...Object.keys(DEFAULTS), 'project'],
-  verify: ['full', 'quick', 'report', 'screenshots', 'expected_steps'],
+  verify: ['full', 'quick', 'report', 'screenshots', 'expected_steps', 'stop_queue_wait_minutes'],
   ci: ['required_checks', 'e2e_label', 'draft_while_iterating', 'guard_checks', 'approvers'],
   merge: ['command', 'wait_minutes'],
   preview: ['environment', 'smoke', 'provider'],
@@ -293,6 +295,7 @@ export function validateConfig(obj) {
     if (!isStr(verify.full)) errors.push('verify.full is required (the full verify command)');
     if (!isStr(verify.quick)) errors.push('verify.quick is required (the quick verify command)');
     for (const k of ['report', 'screenshots']) if (!isStr(verify[k])) errors.push(`verify.${k} must be a non-empty string`);
+    if (!inRange(verify.stop_queue_wait_minutes, 0, 30)) errors.push('verify.stop_queue_wait_minutes must be an integer 0..30');
     // Optional. When set, final-gate requires the verify report's step names to equal this list exactly, in order,
     // instead of trusting the list the report declares about itself.
     if (verify.expected_steps !== undefined) {
@@ -380,6 +383,34 @@ export function validateConfig(obj) {
   return errors.length === 0 ? { ok: true, errors, warnings, config } : { ok: false, errors, warnings, config: null };
 }
 
+// The Stop hook's own timeout (seconds) in the template settings.json, and the part of it stop-verify spends executing.
+const STOP_HOOK_TIMEOUT_S = 900;
+
+/**
+ * Advisory for verify.stop_queue_wait_minutes > 0: the Stop hook entry in .claude/settings.json that runs stop-verify must
+ * time out no earlier than 900 s + the allowance, or Claude Code kills the hook while verify.quick is still queued.
+ * settingsText is the file's text (null = missing). Returns a warning string, or null when there is nothing to say; a
+ * missing, unreadable or odd-shaped settings file, or a hook with no numeric timeout, never warns.
+ */
+export function stopHookTimeoutWarning(config, settingsText) {
+  const minutes = config?.verify?.stop_queue_wait_minutes;
+  if (!isInt(minutes) || minutes <= 0 || typeof settingsText !== 'string') return null;
+  let settings;
+  try { settings = JSON.parse(settingsText); } catch { return null; }
+  const groups = settings?.hooks?.Stop;
+  if (!Array.isArray(groups)) return null;
+  const needed = STOP_HOOK_TIMEOUT_S + minutes * 60;
+  for (const group of groups) {
+    for (const hook of Array.isArray(group?.hooks) ? group.hooks : []) {
+      if (typeof hook?.command !== 'string' || !hook.command.includes('stop-verify')) continue;
+      if (typeof hook.timeout === 'number' && hook.timeout < needed) {
+        return `verify.stop_queue_wait_minutes: ${minutes} needs the Stop hook timeout in .claude/settings.json to be at least ${needed} s (${STOP_HOOK_TIMEOUT_S} + ${minutes} * 60), but the stop-verify hook has ${hook.timeout} s: Claude Code would kill it while verify.quick is still queued`;
+      }
+    }
+  }
+  return null;
+}
+
 /** Read <repoDir>/.claude/pipeline.yml and validate it. IO is injectable for tests. */
 export async function loadConfig(repoDir, { readFile = fs.promises.readFile } = {}) {
   const file = path.join(repoDir, '.claude', 'pipeline.yml');
@@ -396,7 +427,14 @@ export async function loadConfig(repoDir, { readFile = fs.promises.readFile } = 
   } catch (err) {
     return { ok: false, errors: [err.message], config: null, path: file };
   }
-  return { ...validateConfig(parsed), path: file };
+  const result = validateConfig(parsed);
+  if (result.ok && result.config.verify.stop_queue_wait_minutes > 0) {
+    let settingsText = null;
+    try { settingsText = String(await readFile(path.join(repoDir, '.claude', 'settings.json'), 'utf8')); } catch { /* no settings: nothing to compare */ }
+    const warning = stopHookTimeoutWarning(result.config, settingsText);
+    if (warning) result.warnings.push(warning);
+  }
+  return { ...result, path: file };
 }
 
 /**

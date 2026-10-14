@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseYaml } from '../pipeline/lib/yaml.mjs';
-import { DEFAULTS, GUARD_CHECKS, requiredChecks, validateConfig, loadConfig, fill } from '../pipeline/lib/config.mjs';
+import { DEFAULTS, GUARD_CHECKS, requiredChecks, stopHookTimeoutWarning, validateConfig, loadConfig, fill } from '../pipeline/lib/config.mjs';
 
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
 const fixture = (name) => parseYaml(fs.readFileSync(path.join(fixtures, name), 'utf8'));
@@ -588,4 +588,59 @@ test('ci.approvers: defaults to [], accepts GitHub logins (incl. bots), rejects 
     const r = validateConfig({ ...minimal(), ci: { approvers: bad } });
     assert.ok(has(r, 'ci.approvers must be an array of GitHub logins'), JSON.stringify(bad));
   }
+});
+
+test('verify.stop_queue_wait_minutes: defaults to 0, accepts 0..30, rejects anything else naming the key', () => {
+  const withMinutes = (v) => validateConfig({ ...minimal(), verify: { ...minimal().verify, stop_queue_wait_minutes: v } });
+  assert.equal(validateConfig(minimal()).config.verify.stop_queue_wait_minutes, 0);
+  assert.equal(validateConfig(minimal()).ok, true);
+  for (const good of [0, 1, 5, 30]) {
+    const r = withMinutes(good);
+    assert.equal(r.ok, true, `${good}: ${r.errors.join('; ')}`);
+    assert.equal(r.config.verify.stop_queue_wait_minutes, good);
+  }
+  for (const bad of [-1, 31, 1.5, '5', null, true, [], {}, NaN, Infinity]) {
+    assert.ok(has(withMinutes(bad), 'verify.stop_queue_wait_minutes must be an integer 0..30'), String(bad));
+  }
+});
+
+const stopSettings = (timeout, command = 'node "${CLAUDE_PROJECT_DIR:-.}/scripts/pipeline/stop-verify.mjs"') =>
+  JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command, ...(timeout === undefined ? {} : { timeout }) }] }] } });
+const queueConfig = (minutes) => ({ ...minimal(), verify: { ...minimal().verify, stop_queue_wait_minutes: minutes } });
+const yml = (minutes) => `version: 1\nproject: p\nverify:\n  full: f\n  quick: q\n  stop_queue_wait_minutes: ${minutes}\n`;
+const loadWith = (minutes, settings) => loadConfig('/nowhere', {
+  readFile: async (file) => {
+    if (String(file).endsWith('pipeline.yml')) return yml(minutes);
+    if (settings === undefined) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    return settings;
+  },
+});
+
+test('stopHookTimeoutWarning: warns when the Stop hook timeout is below 900 s + the queue allowance, naming both numbers', () => {
+  const short = stopHookTimeoutWarning(queueConfig(5), stopSettings(900));
+  assert.match(short, /stop_queue_wait_minutes: 5/);
+  assert.match(short, /900/);
+  assert.match(short, /1200/);
+  assert.equal(stopHookTimeoutWarning(queueConfig(5), stopSettings(1199)) === null, false);
+  assert.equal(stopHookTimeoutWarning(queueConfig(5), stopSettings(1200)), null);
+  assert.equal(stopHookTimeoutWarning(queueConfig(5), stopSettings(1800)), null);
+});
+
+test('stopHookTimeoutWarning: silent for allowance 0, an unrelated hook, no timeout, or missing/unreadable settings', () => {
+  assert.equal(stopHookTimeoutWarning(queueConfig(0), stopSettings(900)), null);
+  assert.equal(stopHookTimeoutWarning(queueConfig(5), stopSettings(60, 'node other.mjs')), null);
+  assert.equal(stopHookTimeoutWarning(queueConfig(5), stopSettings(undefined)), null);
+  assert.equal(stopHookTimeoutWarning(queueConfig(5), null), null);
+  assert.equal(stopHookTimeoutWarning(queueConfig(5), 'not json {'), null);
+  assert.equal(stopHookTimeoutWarning(queueConfig(5), '{"hooks":{"Stop":"nope"}}'), null);
+  assert.equal(stopHookTimeoutWarning(queueConfig(5), '[]'), null);
+});
+
+test('loadConfig: warns about a Stop hook timeout that is too short for stop_queue_wait_minutes; settings are optional', async () => {
+  const short = await loadWith(5, stopSettings(900));
+  assert.equal(short.ok, true, short.errors.join('; '));
+  assert.ok(short.warnings.some((w) => w.includes('stop_queue_wait_minutes') && w.includes('1200')), short.warnings.join('|'));
+  assert.ok(!(await loadWith(5, stopSettings(1200))).warnings.some((w) => w.includes('stop_queue_wait_minutes')));
+  assert.ok(!(await loadWith(5, undefined)).warnings.some((w) => w.includes('stop_queue_wait_minutes')), 'no settings file: no warning');
+  assert.ok(!(await loadWith(0, stopSettings(900))).warnings.some((w) => w.includes('stop_queue_wait_minutes')));
 });
