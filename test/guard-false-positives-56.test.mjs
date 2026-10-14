@@ -204,6 +204,7 @@ test('#56 replay: a loop over one command substitution holds one value only know
     'L=run.sh; for f in $L; do bash $f; done',
     'L="ok.sh run.sh"; for f in ${L}; do bash $f; done',
     'for f in $(true) run.sh; do bash $f; done',
+    'for f in run.sh $(true); do bash $f; done',
     'set -- run.sh; for f; do bash $f; done',
     'for f in $(ls x); do :; done; for f in $(ls *.sh); do bash $f; done',
     'for f in $(ls x); do :; done; f=run.sh; bash $f',
