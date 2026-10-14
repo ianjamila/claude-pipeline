@@ -151,6 +151,8 @@ const knownValues = (ctx, n) => [ctx.vars[n], unsureVar(ctx, n) ? `$${n}` : unde
 // assignment ran depends on control flow the parser does not model, so its value is left as `$B` (dynamic).
 // Only an assignment on the line itself (level 0) makes a tainted variable known again; one inside a judged script is ignored for it.
 function setVar(ctx, k, v, level) {
+  // (a reading of the line pins how its one assignment of k went: it ran, or it did not; see judgeReadings)
+  if (level === 0 && ctx.pins?.has(k)) { if (ctx.pins.get(k) === 'set') ctx.vars[k] = v; return; }
   if (level === 0) ctx.tainted.delete(k);
   else if (ctx.tainted.has(k)) return;
   if (sameValue(ctx, k, v)) return;
@@ -159,6 +161,15 @@ function setVar(ctx, k, v, level) {
 // Why: a name set again to the literal value it already holds (a startup file the nested shell reads again) is still certain; it is not "assigned more than once".
 const sameValue = (ctx, k, v) => !DYNAMIC.test(v) && !ctx.unsureVars.has(k) && !ctx.tainted.has(k) && Object.hasOwn(ctx.vars, k) && ctx.vars[k] === v;
 const recordVars = (env, ctx, level) => { for (const k of Object.keys(env)) setVar(ctx, k, env[k], level); };
+// Why (#56, a live bypass on main): `S=run; F=$S.sh; bash $F` ran run.sh while the guard read `bash $S.sh`, a script only known at run time, allowed on a line
+// that names no guarded operation. The shell works a value out when it assigns it, so a bare assignment's value is expanded here with what is known at that
+// point, left to right (`A=1 B=$A`). Only when the assignment's own text shows that every `$` in it expands: the parser removes quotes, so `F='$S'` and
+// `F=$S` give the same value; a single quote or a backslash in the text keeps the value as written (unknown at run time, as before).
+function recordAssigned(c, ctx, level) {
+  const raw = typeof c.raw === 'string' ? c.raw : '';
+  const exact = raw !== '' && !/['\\]/.test(raw);
+  for (const k of Object.keys(c.env)) setVar(ctx, k, exact && c.env[k].includes('$') ? expandVars(c.env[k], ctx) : c.env[k], level);
+}
 
 // A variable whose value is unknown: assigned more than once (or where it may not run), or tainted (a script that may
 // or may not be the one sourced earlier on the line may have set it).
@@ -1515,12 +1526,15 @@ const STATE_GIT = new Set(['checkout', 'switch', 'branch', 'rebase', 'symbolic-r
 
 // Collects every assignment on the line BEFORE any command is judged. A name assigned more than once, or assigned
 // where it may not run (after && / ||, in a pipeline, a subshell, an if / loop / case), is unsure for the whole line.
-function collectAssignments(cmds, ctx, topLevelLocal = false) {
+function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0) {
   const counts = new Map();
-  const bump = (k, n) => counts.set(k, (counts.get(k) ?? (k in ctx.vars || ctx.unsureVars.has(k) ? 1 : 0)) + n);
+  const bump = (k, n) => { if (level === 0 && ctx.pins?.has(k)) return; counts.set(k, (counts.get(k) ?? (k in ctx.vars || ctx.unsureVars.has(k) ? 1 : 0)) + n); };
   const from = flowStart(cmds);
   for (const [i, c] of cmds.entries()) {
     const n = mayNotRun(cmds, from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) ? 2 : 1;
+    // Why (#56, a live bypass on main): `for f in run.sh; do bash $f; done` ran run.sh while the guard read `bash $f` as a value from the environment. A loop
+    // variable takes each word of the list in turn (or the positional parameters): it is set on the line, more than once.
+    if (c.argv[0] === 'for' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '')) bump(c.argv[1], 2);
     // builtins that bind a variable without a NAME=value word: its value is whatever was read / parsed at run time
     if (c.argv.length && VALUE_BINDERS.has(baseName(c.argv[0]))) {
       for (const a of c.argv.slice(1)) {
@@ -1609,11 +1623,31 @@ function unquotedText(s) {
   }
   return out;
 }
+// Why (#56): a heredoc body is the input of the command it is attached to, and every command here only reads it as data (`cat > fix.mjs <<'EOF'` with a
+// `function rep(a, b)` in the JavaScript): its text is blanked out, at the places the parser read it from, before looking for a definition. Its `$(...)` run in
+// subshells (a function defined there is gone when it ends) and are commands of their own in `cmds`, judged by dataOnly like the rest. A body the parser could
+// not locate in the line (read out of backticks or another text, no terminator) keeps the old answer: a heredoc is a hazard.
 function definesFunction(str, cmds) {
   if (!FUNCTION_DEF.test(str)) return false;
-  if (/<</.test(str) || !cmds.every(dataOnly)) return true;
-  const u = unquotedText(str);
+  if (!cmds.every(dataOnly)) return true;
+  const text = withoutHeredocBodies(str, cmds);
+  if (text === null) return true;
+  const u = unquotedText(text);
   return u === null || FUNCTION_DEF.test(u);
+}
+// The line with every heredoc body blanked out (same length, newlines kept), or null when a body could not be located (see heredocSpans in shell-parse.mjs).
+function withoutHeredocBodies(str, cmds) {
+  if (!/<</.test(str)) return str;
+  const spans = cmds.heredocSpans;
+  if (!Array.isArray(spans)) return null;
+  let out = '';
+  let at = 0;
+  for (const [a, b] of [...spans].sort((x, y) => x[0] - y[0])) {
+    if (a < at || b > str.length) return null; // (spans that overlap or run past the text: not ours to trust)
+    out += str.slice(at, a) + str.slice(a, b).replace(/[^\n]/g, ' ');
+    at = b;
+  }
+  return out + str.slice(at);
 }
 
 // An unsure variable (assigned more than once, or where it may not run) that reaches a command whose effect may depend on
@@ -1683,6 +1717,142 @@ function subshellsTrusted(cmds) {
   return true;
 }
 
+// ---- #56: a variable assigned once, where the assignment may not run ------------------------------------------------------------
+// Why: `cd /wt && F=src/a.ts; sed -n 1,9p $F`, `if …; then S=/x; fi; node a.mjs $S`, `for f in a b; do F=/tmp/$f; node a.mjs $F; done` were refused (about
+// 1,600 lines in 21 days of transcripts) because F "may not be assigned". With ONE assignment of F on the line, every use after it sees one of two values: the
+// assigned text (the assignment ran) or the value the line started with (it did not). Both cases are judged, each as a whole line ("readings"): F pinned to its
+// text, and F never assigned (an unknown value, as for any variable the line does not set). The line is allowed only when every reading is; a guarded use
+// (`git push origin $B`, `bash $F`, `xargs` fed $F) is then judged on the real text in the first reading and as an unknown value in the second, exactly as
+// the rest of the guard judges those. Uniform readings cover the real run only when the uses cannot see different values within one run, so a name qualifies
+// only when: it has exactly one assignment, a bare `F=value` (not a prefix, not in $( ), a pipeline stage or a background job); nothing else on the line can bind
+// it (no read / declare / export / printf -v / for / arithmetic / ${F:=…} / eval / source / function definitions / aliases or traps, no command named at run
+// time); its value does not read itself; and every use comes after the assignment, in the subshells it is in, and outside unquoted heredoc bodies (those expand
+// when their command runs, which may come before). Anything else keeps the denial. At most 4 names (16 readings) per line.
+const MAX_READINGS = 64;
+const varWordRe = (k) => new RegExp(`(?<![A-Za-z0-9_])${k}(?![A-Za-z0-9_])`, 'g');
+// names a shell, git, gh, an interpreter or this guard read for themselves (where they act is not only where the line expands them): never read
+const SPECIAL_NAMES = /^(?:PATH|IFS|HOME|CDPATH|ENV|BASH_ENV|ZDOTDIR|PWD|OLDPWD|SHELL|SHELLOPTS|BASHOPTS|POSIXLY_CORRECT|PS\d|PROMPT_COMMAND|FPATH|MAILPATH|EDITOR|VISUAL|PAGER|TMOUT|HISTFILE|GIT\w*|GH_\w*|BASH\w*|ZSH\w*|LD_\w*|DYLD_\w*|NODE_\w*|NPM_\w*|PYTHON\w*|PERL\w*|RUBY\w*|PIPELINE_\w*|CLAUDE\w*|path|cdpath|fpath|manpath|mailpath|psvar|prompt\w*|precmd\w*|preexec\w*|chpwd\w*|periodic\w*|zshaddhistory\w*|zshexit\w*)$/;
+// The text with what the shell never expands blanked out: single-quoted strings and comments (double-quoted text expands, so it stays). Null for `$'…'`
+// or an unterminated quote (the caller keeps its answer).
+function withoutLiteralText(s) {
+  let out = '';
+  let dq = false;
+  let depth = 0; // $( … ) opened inside double quotes (its own quotes are not followed here: a quote inside one gives up)
+  let tick = false; // a backtick opened inside double quotes, likewise
+  for (let i = 0; i < s.length;) {
+    const ch = s[i];
+    if (ch === '\\') { out += s.slice(i, i + 2); i += 2; continue; }
+    if (dq && ch === '$' && s[i + 1] === '(') { depth++; out += '$('; i += 2; continue; }
+    if (dq && depth && ch === ')') { depth--; out += ch; i++; continue; }
+    if (dq && ch === '`') tick = !tick;
+    if ((depth || tick) && (ch === "'" || ch === '"' || ch === '(')) return null;
+    if (ch === '"') { dq = !dq; out += ch; i++; continue; }
+    if (!dq && ch === '$' && s[i + 1] === "'") return null;
+    if (!dq && ch === "'") {
+      const j = s.indexOf("'", i + 1);
+      if (j < 0) return null;
+      out += ' '.repeat(j + 1 - i); i = j + 1; continue;
+    }
+    if (!dq && ch === '#' && (i === 0 || /[\s;&|()]/.test(s[i - 1]))) {
+      const j = s.indexOf('\n', i);
+      const e = j < 0 ? s.length : j;
+      out += ' '.repeat(e - i); i = e; continue;
+    }
+    out += ch; i++;
+  }
+  return dq || depth || tick ? null : out;
+}
+function onceAssignedNames(cmds, ctx, str) {
+  if (ctx.tainted.size || cmds.truncated || cmds.dynamic || definesFunction(str, cmds) || cmds.some(isStateHazard) || !subshellsTrusted(cmds)) return [];
+  for (const c of cmds) {
+    if (!c.argv.length) continue;
+    const nm = baseName(c.argv[0]);
+    if (DYNAMIC.test(c.argv[0]) || SOURCING.includes(nm) || nm === 'eval') return [];
+    const binder = VAR_BUILTINS.includes(nm) || VALUE_BINDERS.has(nm);
+    if (binder && (c.argv.slice(1).some((w) => DYNAMIC.test(w)) || (VAR_BUILTINS.includes(nm) && declAttrs(c.argv).unknown))) return [];
+  }
+  const spans = /<</.test(str) ? cmds.heredocSpans : [];
+  if (!Array.isArray(spans)) return [];
+  const blank = withoutHeredocBodies(str, cmds);
+  const text = blank === null ? null : withoutLiteralText(blank);
+  if (text === null) return [];
+  const live = spans.filter(([, , quoted]) => !quoted).map(([a, b]) => str.slice(a, b)); // (unquoted bodies: they expand when their command runs)
+  const mentions = (c, k) => {
+    const re = new RegExp(`\\$\\{?${k}(?![A-Za-z0-9_])`);
+    return [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')].some((w) => re.test(String(w)));
+  };
+  const out = [];
+  for (const k of ctx.unsureVars) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k) || SPECIAL_NAMES.test(k)) continue;
+    const sites = [];
+    for (const [i, c] of cmds.entries()) {
+      const nm = c.argv.length ? baseName(c.argv[0]) : '';
+      if (Object.hasOwn(c.env ?? {}, k) || ((VAR_BUILTINS.includes(nm) || VALUE_BINDERS.has(nm) || nm === 'for' || nm === 'select') && c.argv.slice(1).some((a) => varWordRe(k).test(a)))) sites.push(i);
+    }
+    if (sites.length !== 1) continue;
+    const s = sites[0];
+    const site = cmds[s];
+    if (site.depth > 0 || ranInSubshell(cmds, s)) continue;
+    // the values it can take: a bare assignment's text (or none: it did not run), or each word of a `for k in …` list
+    let modes;
+    if (!site.argv.length) {
+      if (new RegExp(`\\$\\{?${k}(?![A-Za-z0-9_])`).test(String(site.env[k]))) continue; // (its value reads itself)
+      modes = ['set', 'skip'];
+    } else if (site.argv[0] === 'for' && site.argv[1] === k && site.argv[2] === 'in' && site.argv.length > 3) {
+      // (each word as written: a glob stands for the files it matches, judged as candidates where the word lands; a word that expands, splits or brace-expands is not read)
+      const words = site.argv.slice(3);
+      if (!words.every((w) => /^[A-Za-z0-9_@%+=:,./*?-]+$/.test(w))) continue;
+      modes = [...new Set(words)].map((w) => ({ val: w }));
+    } else continue;
+    if (live.some((b) => varWordRe(k).test(b))) continue;
+    // every mention in the text the shell reads: one assignment, the rest plain references (no ${k:=…} / ${k=…}, no k[…], no other bare word k)
+    let assigns = 0;
+    let odd = false;
+    for (const m of text.matchAll(varWordRe(k))) {
+      const before = text.slice(Math.max(0, m.index - 2), m.index);
+      const after = text.slice(m.index + k.length, m.index + k.length + 2);
+      if (before.endsWith('${')) { if (/^:?=/.test(after) || after[0] === '[') odd = true; continue; }
+      if (before.endsWith('$')) { if (after[0] === '[') odd = true; continue; }
+      if (after[0] === '=') { assigns++; continue; }
+      if (/(?:^|[\s;&|(){])for\s+$/.test(text.slice(Math.max(0, m.index - 8), m.index)) && site.argv[0] === 'for') { assigns++; continue; } // (the loop's own name)
+      odd = true;
+    }
+    if (odd || assigns !== 1) continue;
+    let ok = true;
+    for (const [i, c] of cmds.entries()) {
+      if (i === s || !mentions(c, k)) continue;
+      if (i < s || !Array.isArray(c.grp) || site.grp.some((id, j) => c.grp[j] !== id)) { ok = false; break; }
+    }
+    if (ok) out.push({ k, modes });
+  }
+  return out;
+}
+// Judges the line once per reading of the names (each assignment ran, or did not); the first denial wins. Null when there is nothing to read.
+function judgeReadings(str, startDir, ctx, level, names, saved) {
+  if (level !== 0 || ctx.pins || names.length === 0) return null;
+  const total = names.reduce((n, { modes }) => n * modes.length, 1);
+  if (total > MAX_READINGS) return null;
+  try {
+    for (let r = 0; r < total; r++) {
+      checkDeadline(ctx.budget);
+      restoreLineState(ctx, saved);
+      ctx.pins = new Map();
+      let rest = r;
+      for (const { k, modes } of names) {
+        const m = modes[rest % modes.length];
+        rest = Math.floor(rest / modes.length);
+        ctx.pins.set(k, m);
+        if (typeof m === 'object') ctx.vars[k] = m.val; // (a loop variable: every use comes after the `for`, so it holds the word from the start)
+      }
+      const v = evalString(str, startDir, ctx, level);
+      if (v.decision === 'deny') return v;
+    }
+    return allowed();
+  } finally {
+    ctx.pins = undefined;
+  }
+}
+
 function evalString(str, startDir, ctx, level) {
   checkDeadline(ctx.budget);
   if (level > MAX_NESTING) return deny('pipeline job start / alias is nested too deeply to verify.');
@@ -1695,10 +1865,15 @@ function evalString(str, startDir, ctx, level) {
   }
   // A variable whose value is not certain (see collectAssignments) denies the line when it reaches git / gh, a command
   // that runs code, cd / pushd / popd or a command name: the checks below read the expanded text.
-  collectAssignments(cmds, ctx, !definesFunction(str, cmds));
+  const saved = level === 0 && !ctx.pins ? lineState(ctx) : null; // (the state before this line's assignments: each reading starts from it)
+  collectAssignments(cmds, ctx, !definesFunction(str, cmds), level);
   if (ctx.unsureVars.size || ctx.tainted.size) {
     const unsure = unsureVarReachingCommand(cmds, ctx);
-    if (unsure !== null) return deny(`$${unsure} is assigned more than once (or where it may not run) on this line, so its value at run time cannot be verified. Assign it once, unconditionally.`);
+    if (unsure !== null) {
+      const read = saved && judgeReadings(str, startDir, ctx, level, onceAssignedNames(cmds, ctx, str), saved);
+      if (read) return read;
+      return deny(`$${unsure} is assigned more than once (or where it may not run) on this line, so its value at run time cannot be verified. Rewrite: assign it once, as the first command of the line (\`${unsure}=value; …\`), or write the value out where it is used.`);
+    }
   }
   let dir = startDir;
   const cdp = cdpathMaybe(cmds, ctx);
@@ -1767,7 +1942,7 @@ function evalString(str, startDir, ctx, level) {
     }
     frame.i = i;
     dirAt.set(i, dir);
-    if (!argv.length) { recordVars(c.env, ctx, level); continue; } // a bare `NAME=value`
+    if (!argv.length) { recordAssigned(c, ctx, level); continue; } // a bare `NAME=value`
     const name = baseName(argv[0]);
     let verdict = null;
     if (VAR_BUILTINS.includes(name)) {

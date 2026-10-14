@@ -1514,7 +1514,11 @@ function copyMayFail(frames, h, exists) {
 }
 const MAX_VARIANTS = 1024; // the ways the writes before a command can be put in order and in or out
 function contentsIn(frames, upto, asOf, P, io, depth) {
-  const hits = hitsOn(frames, upto, asOf, P);
+  // Why (#56, repro 7: a regression of A2): a program whose words may name the file (`node /tmp/s1.mjs --a=$X1`: $X1 may be any path) may write it with content
+  // only known at run time. Such a write adds no text here: in every order it either comes last (the variant gives up, unknown, adding nothing), or a later
+  // write replaces it, or appends follow an unknown start (unknown again). collect() reports it (the caller's `unknown`). Ten of them on one line made 2^10
+  // orders and refused a line of `echo … && node /tmp/sN.mjs --a=$XN` as "built from pieces", so they are left out of the orders.
+  const hits = hitsOn(frames, upto, asOf, P).filter((h) => !(h.loose && h.rec.generic !== undefined));
   // Why: a write that may or may not be this file (loose), may be skipped or fail (opt), runs in the background or beside another writer (bg / conc) is tried both ways, and a background or concurrent
   // one in every place among the writes that certainly run (it lands when it lands); the combinations are capped, and too many is "built from pieces" (denied), never a silent cut
   const ordered = hits.filter((h) => !h.place.bg && !h.place.conc);

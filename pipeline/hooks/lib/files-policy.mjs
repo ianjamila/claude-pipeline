@@ -1185,7 +1185,11 @@ function collectVars(cmds, ctx) {
     vars[k] = applyTransform(expandHomeRefs(substVars(toPosix(String(v)).replace(USER_RE, ctx.user), vars, ctx.budget), ctx.homePosix), t);
     kept[k] = applyTransform(expandHomeRefs(substVars(toPosix(String(v).replace(/\\/g, bs)).replace(USER_RE, ctx.user), kept, ctx.budget), ctx.homePosix).split(bs).join('\\'), t);
   };
+  const pins = ctx.loopPins; // (see loopReadings: the word each loop variable holds in this reading, or null: every one is only known at run time)
   for (const c of cmds) {
+    if (pins !== undefined && c.argv[0] === 'for' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '')) {
+      if (pins === null || !pins.has(c.argv[1])) unknown.add(c.argv[1]); else set(c.argv[1], pins.get(c.argv[1]));
+    }
     for (const [k, v] of Object.entries(c.env ?? {})) set(k, v);
     // (`set -- ev.sh`: the positional parameters, so `bash $1` is that file)
     if (baseOf(c.argv[0] ?? '') === 'set' && !c.argv.some((a) => /^[-+][A-Za-z]*A/.test(a))) { const w = setPositionals(c.argv); if (w) for (let i = 1; i <= 9; i++) set(String(i), i <= w.length ? w[i - 1] : ''); }
@@ -2086,6 +2090,20 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
     // (the second pass spends what the first left, so every cap still ends in a denial; only the startup-file memo starts empty)
     return evaluateBashForFilesUnchecked(command, { ...opts, _budget: { ...budget, startupOk: new Set() }, _bashState: { bound: true, rewrote: false } });
   }
+  // Why (#56, a live bypass on main): `for f in settings.json; do cp x ~/.claude/$f; done` wrote a protected file while $f was read as a value from the
+  // environment (any name the line does not set). A loop variable takes each word of its list in turn: the text is judged once per word ("readings"; a
+  // word that expands stands as written, so a `$(…)` or a glob is judged as if it were written where the variable is). Past 64 readings every loop
+  // variable is only known at run time (a script or a writer it picks is refused).
+  if (typeof command === 'string' && opts._loopPins?.text !== command && /(?:^|[\s;&|(){])for\s/.test(command)) {
+    const readings = loopReadings(command, opts);
+    if (readings) {
+      for (const pins of readings) {
+        const v = evaluateBashForFilesUnchecked(command, { ...opts, _loopPins: { text: command, pins } });
+        if (v.decision !== 'allow') return v;
+      }
+      return allow();
+    }
+  }
   if (!opts._frames) opts = { ...opts, _frames: [] }; // the writes of this line and of the scripts it runs (shared with nested calls, popped on the way out)
   const depth = opts._frames.length;
   try {
@@ -2098,12 +2116,36 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
     opts._frames.length = depth;
   }
 }
+const MAX_LOOP_READINGS = 64;
+// The readings of a text's loop variables: one Map (name -> word) per combination, [null] when there are too many, null when the text has no loop.
+function loopReadings(command, opts) {
+  const cmds = simpleCommands(command, { env: opts.env ?? process.env });
+  const loops = new Map();
+  for (const c of cmds) {
+    if (c.argv[0] !== 'for' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '')) continue;
+    const words = c.argv[2] === 'in' ? c.argv.slice(3) : ['$@'];
+    loops.set(c.argv[1], [...new Set([...(loops.get(c.argv[1]) ?? []), ...(words.length ? words : [''])])]);
+  }
+  if (!loops.size) return null;
+  const names = [...loops.keys()];
+  const total = names.reduce((n, k) => n * loops.get(k).length, 1);
+  if (total > MAX_LOOP_READINGS) return [null];
+  const out = [];
+  for (let r = 0; r < total; r++) {
+    const pins = new Map();
+    let rest = r;
+    for (const k of names) { const ws = loops.get(k); pins.set(k, ws[rest % ws.length]); rest = Math.floor(rest / ws.length); }
+    out.push(pins);
+  }
+  return out;
+}
 function evaluateBashForFilesFrame(command, opts) {
   if (!opts._budget) opts = { ...opts, _budget: newEvalBudget(opts.now) }; // one budget for this evaluation and every script it reads
   const assumedCwd = opts._assumedCwd === true; // (a rerun of the line with the cwd assumed to be a protected directory; what it runs is judged normally)
   if (assumedCwd) opts = { ...opts, _assumedCwd: false };
   checkDeadline(opts._budget);
   const ctx = makeCtx(opts);
+  if (opts._loopPins && opts._loopPins.text === command) ctx.loopPins = opts._loopPins.pins; // (this text's loop readings; see evaluateBashForFilesUnchecked)
   ctx.lineDefs = definedNames(typeof command === 'string' ? command : '');
   ctx.assigned = assigningDefaults(typeof command === 'string' ? command : ''); // (and those of the line this text was made from: `: ${X:=w}; G=bash; $G $X`)
   for (const [n, ws] of opts._assigned ?? []) ctx.assigned.set(n, [...(ctx.assigned.get(n) ?? []), ...ws]);

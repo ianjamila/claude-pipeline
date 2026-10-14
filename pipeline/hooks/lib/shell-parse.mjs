@@ -460,19 +460,27 @@ function shellInvocation(argv) {
   let i = 1;
   let sawC = false;
   let sawS = false;
+  // Why (#56): `bash -n f.sh` only reads f.sh for syntax errors and runs none of it (noexec). Every shell here has -n: bash/sh/dash/ksh/zsh/yash/csh/fish
+  // ("read commands but do not execute them"). Only a plain `-n` in a cluster of short options turns it on; `+n` turns it off again, bash ignores it in an
+  // interactive shell (`-i`), and any long option or -o / +o name we do not read (zsh `-o exec`, `--no-exec`) leaves it off.
+  let noexec = false;
+  let execUnsure = false;
   while (i < argv.length) {
     const t = argv[i];
     if (t === '--') { i++; break; }
     if (t.length < 2 || (t[0] !== '-' && t[0] !== '+') || (t[0] === '+' && !/^\+[A-Za-z]/.test(t))) break; // (`+(f|fa).sh` is a pattern operand, not an option)
-    if (t.startsWith('--')) { i += t === '--rcfile' || t === '--init-file' ? 2 : 1; continue; }
+    if (t.startsWith('--')) { execUnsure = true; i += t === '--rcfile' || t === '--init-file' ? 2 : 1; continue; }
     if (t[0] === '-' && t.includes('c')) sawC = true;
     if (t[0] === '-' && t.includes('s')) sawS = true;
+    if (/n/.test(t.slice(1))) noexec = t[0] === '-';
+    if (/i/.test(t.slice(1))) execUnsure = true;
+    if (/[oO]$/.test(t) && /exec/i.test(argv[i + 1] ?? '')) execUnsure = true;
     i += /[oO]$/.test(t) ? 2 : 1; // -o / -O take an option name
   }
   const before = argv.slice(1, i).some(hasExpansion);
   if (sawC) return i < argv.length ? { kind: 'script', text: argv[i], amb: before } : { kind: 'none' };
   if (sawS) return { kind: 'stdin', amb: before };
-  if (i < argv.length) return STDIN_FILES.has(argv[i]) ? { kind: 'stdin', amb: before } : { kind: 'file', text: argv[i], amb: argv.slice(1, i + 1).some(hasExpansion) };
+  if (i < argv.length) return STDIN_FILES.has(argv[i]) ? { kind: 'stdin', amb: before } : { kind: 'file', text: argv[i], amb: argv.slice(1, i + 1).some(hasExpansion), parseOnly: noexec && !execUnsure && !before };
   return { kind: 'stdin', amb: argv.slice(1).some(hasExpansion) }; // `bash -$X` may be `bash -x f.sh`
 }
 
@@ -610,6 +618,7 @@ function scriptFileOfArgv(argv) {
   const name = base(argv[0]);
   if (SHELLS.has(name)) {
     const r = shellInvocation(argv);
+    if (r.kind === 'file' && r.parseOnly && !r.amb && !isProcSub(r.text) && !FD_PATH.test(r.text)) return null; // (`bash -n f.sh`: checks the syntax, runs nothing)
     // a `<(...)` operand is script text, not a file, unless a word before it expands: then it is one more candidate word
     if (r.kind === 'file' && (r.amb || !isProcSub(r.text))) return r.amb ? { kind: 'shell', file: r.text, ambiguous: true, words: argv.slice(1) } : { kind: 'shell', file: r.text };
     return r.amb && (r.kind === 'stdin' || r.kind === 'script') ? { kind: 'shell', file: undefined, ambiguous: true, words: argv.slice(1) } : null;
@@ -1579,6 +1588,7 @@ class Parser {
     let pos = this.i;
     for (const h of this.hd) {
       const lines = [];
+      const bodyAt = pos;
       let found = false;
       while (pos < s.length) {
         const eol = s.indexOf('\n', pos);
@@ -1592,6 +1602,10 @@ class Parser {
       }
       const text = lines.join('\n');
       h.seg.heredocs.push({ text, quoted: h.quoted });
+      // where the body sits in the line (see heredocSpans in simpleCommands): only for a body this parser read out of the line itself and that ended at
+      // its terminator; one read out of another text (backticks, bash -c, a body's own substitution) or that ran to the end is not located
+      if (found && this.src === this.ctx.rootSrc) this.ctx.hdSpans.push([bodyAt, bodyAt + text.length, h.quoted]);
+      else this.ctx.hdForeign = true;
       h.seg.pending--;
       if (h.seg.muted) continue;
       const grp = this.ctx.grp;
@@ -2530,7 +2544,7 @@ class Parser {
 }
 
 function newCtx(maxDepth, expired, bashState) {
-  return { out: [], expired, maxDepth, truncated: false, dynamic: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, ctlBroken: false, fns: new Set(), stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState };
+  return { out: [], expired, maxDepth, truncated: false, dynamic: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, ctlBroken: false, fns: new Set(), stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
 }
 
 // The text with every comment the lexer skips blanked out (newlines kept), from a lexing pass that interprets nothing (muted); null when that pass did not
@@ -2557,6 +2571,7 @@ export function simpleCommands(str, opts) {
   let parser = null;
   try {
     parser = new Parser(ctx, String(str ?? ''));
+    ctx.rootSrc = parser.src;
     // Why: every text of an evaluation (script, startup file, file the line wrote, heredoc body, nested frame) is parsed apart, but another text may bind BASH for the shell that runs this
     // one. The first text that can bind it ends the rewrite for every text after it; a text already rewritten before that is stale, and the policy reruns the evaluation (bashState.bound)
     // (a word in a comment is no binding: when the text looks like it binds BASH, it is checked again without the comments the lexer sees; any doubt keeps the first answer)
@@ -2575,6 +2590,8 @@ export function simpleCommands(str, opts) {
   Object.defineProperty(ctx.out, 'fns', { value: ctx.fns, enumerable: false });
   // ctlBroken: the loop / branch / function marks (ctl) are not to be trusted (an unmatched closer, a construct finished out of order): callers read the line as before
   Object.defineProperty(ctx.out, 'ctlBroken', { value: ctx.ctlBroken, enumerable: false });
+  // heredocSpans: [start, end, quoted] of every heredoc body in the text (quoted: its delimiter was quoted, so nothing in it expands), or null when one cannot be located (read out of other text, no terminator, a parse that gave up)
+  Object.defineProperty(ctx.out, 'heredocSpans', { value: ctx.hdForeign || ctx.truncated ? null : ctx.hdSpans, enumerable: false });
   return ctx.out;
 }
 
