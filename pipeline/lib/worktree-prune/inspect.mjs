@@ -307,6 +307,14 @@ function prefixMayReach(prefix, root, platform) {
   return p.startsWith(r) || r.startsWith(p);
 }
 
+// The environment handed to lsof: a UTF-8 locale and nothing else of ours (no tokens or other secrets), plus PATH only when
+// set, because the fallback exe is the bare name 'lsof' and Node resolves it through options.env.PATH. PATH is read by name
+// so the hard-stop scan can see exactly which variable leaves this process.
+function lsofEnv() {
+  const path = process.env.PATH;
+  return { LC_ALL: 'en_US.UTF-8', LANG: 'en_US.UTF-8', ...(path ? { PATH: path } : {}) };
+}
+
 // macOS: one `lsof -n -P -w -F pfn` for the whole machine. Fail-closed -> { available: false }: lsof missing, killed or timed
 // out, exit status other than 0/1 (1 = "some items could not be examined", normal when other users own processes), or the
 // positive control failing (our own process always has a readable cwd; if lsof does not show it the scan is blind).
@@ -314,8 +322,9 @@ function prefixMayReach(prefix, root, platform) {
 function processesInsideLsof(dir, { platform, run = runCapture, ownPid = process.pid } = {}) {
   const unavailable = { available: false, pids: [], hidden: 0 };
   const exe = existsSync('/usr/sbin/lsof') ? '/usr/sbin/lsof' : 'lsof';
-  // a UTF-8 locale keeps non-ASCII names printable where the machine has one; the decoding above covers where it has not
-  const r = run(exe, ['-n', '-P', '-w', '-F', 'pfn'], { env: { ...process.env, LC_ALL: 'en_US.UTF-8', LANG: 'en_US.UTF-8' } });
+  // a UTF-8 locale keeps non-ASCII names printable where the machine has one; the decoding above covers where it has not.
+  // The env is minimal on purpose (lsofEnv): lsof needs none of our variables, so it gets none of our secrets.
+  const r = run(exe, ['-n', '-P', '-w', '-F', 'pfn'], { env: lsofEnv() });
   if (!r || r.error || r.signal || (r.status !== 0 && r.status !== 1)) return unavailable;
   const procs = parseLsofFields(String(r.stdout ?? ''));
   if (!procs.get(ownPid)?.cwd) return unavailable;
