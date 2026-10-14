@@ -50,14 +50,13 @@ test('S8: the database workflows of the replay are allowed (static text + migrat
   ]) both(c, SQL, 'allow');
 });
 
-test('S8: static text and a script fed to one shell are judged as the stream they make (allowed when harmless)', () => {
+test('S8: static text and a script fed to one SHELL stay refused, even when harmless (only a SQL client\'s stream is rebuilt: owner, Codex review 4)', () => {
   for (const c of [
     '{ echo "echo a"; cat ok.sh; } | bash',
     '{ cat ok.sh; echo hi; } | bash',
     "{ printf '%s\\n' 'echo a'; cat ok.sh; } | bash",
     "{ cat <<'EOF'\necho a\nEOF\ncat ok.sh; } | bash",
-    'bash <(echo "echo a"; cat ok.sh)',
-  ]) both(c, SQL, 'allow');
+  ]) both(c, SQL, 'deny');
 });
 
 // a guarded line split between static text and a file
@@ -137,13 +136,19 @@ test('S8: a `<<-` heredoc is judged without the leading tabs the shell strips (a
 
 test('S8: printf reuses its format for the arguments left (`printf %s a b` prints ab)', () => {
   assert.equal(G("{ printf '%s' 'git ' 'pu'; cat b.sh; } | bash", { 'b.sh': 'sh origin main\n' }), 'deny');
-  assert.equal(G("{ printf '%s\\n' 'echo a' 'echo b'; cat ok.sh; } | bash", { 'ok.sh': 'echo ok\n' }), 'allow');
+  // (psql: `\` and `!` printed one after the other make the meta-command that runs the file's text)
+  assert.equal(G(`${DB}{ printf '%s' '\\' '!'; cat q.sql; } | psql "$DB"`, { 'q.sql': ' git push origin main\n' }), 'deny');
+  both("{ printf '%s\\n' 'select 1;' 'select 2;'; cat m.sql; } | psql", SQL, 'allow');
 });
 
 test('S8: the rebuilt stream keeps the newline echo, printf and a heredoc print (a harmless stream stays allowed)', () => {
   const S = { 'c.sh': 'push origin main\n' }; // (`git ` then a newline, then `push ...`: two commands, no push)
-  for (const c of ['{ echo "git "; cat c.sh; } | bash', "{ printf 'git \\n'; cat c.sh; } | bash", "{ cat <<'EOF'\ngit \nEOF\ncat c.sh; } | bash", '{ cat <<< "git "; cat c.sh; } | bash']) assert.equal(G(c, S), 'allow', c);
-  for (const c of ['{ echo -n "git "; cat c.sh; } | bash', "{ printf 'git '; cat c.sh; } | bash"]) assert.equal(G(c, S), 'deny', c);
+  // (fed to a shell, static text with a file is refused since Codex review 4, newline or not; fed to psql the rebuilt stream is scanned)
+  for (const c of ['{ echo "git "; cat c.sh; } | bash', '{ echo -n "git "; cat c.sh; } | bash', "{ printf 'git '; cat c.sh; } | bash"]) assert.equal(G(c, S), 'deny', c);
+  for (const c of ['{ echo "select 1;"; cat m.sql; } | psql', "{ printf 'select 1;\\n'; cat m.sql; } | psql", "{ cat <<'EOF'\nselect 1;\nEOF\ncat m.sql; } | psql", '{ cat <<< "select 1;"; cat m.sql; } | psql']) both(c, SQL, 'allow');
+  // (`\` then the file's `! cmd`: the meta-command forms only without the newline echo and printf '\n' would print)
+  const Q = { 'q.sql': '! git push origin main\n' };
+  assert.equal(G(`${DB}{ printf '%s' '\\'; cat q.sql; } | psql "$DB"`, Q), 'deny');
 });
 
 test('S8: more twins that stay refused (an empty heredoc, a stream cut short, a rewritten part that may not run or prints elsewhere, text before a substitution)', () => {

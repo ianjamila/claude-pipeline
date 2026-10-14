@@ -1772,11 +1772,13 @@ test('state that becomes unknown mid-line stays enforced; control flow counts fr
     '/work/repo/step.sh': 'echo hi\n',
     '/other/step.sh': 'git push origin main\n',
   };
+  // (keys resolved: on Windows the guard asks for D:\other\step.sh)
+  const abs = Object.fromEntries(Object.entries(files).map(([k, v]) => [resolve(k), v]));
   const o = {
     byDir: { '/work/repo': 'agent/x', '/other': 'agent/y' },
     labelsByNum: {},
-    readText: (p) => files[p] ?? null,
-    pathExists: (p) => p in files,
+    readText: (p) => abs[resolve(p)] ?? null,
+    pathExists: (p) => resolve(p) in abs,
   };
   const denyCmds = [
     // a variable known when the line was first checked, unknown after `source`
@@ -1817,11 +1819,13 @@ test('a ( subshell hidden behind escaped quotes or a $\'…\' string is still fo
     '/work/repo/step.sh': 'echo hi\n',
     '/other/step.sh': 'git push origin main\n',
   };
+  // (keys resolved: on Windows the guard asks for D:\other\step.sh)
+  const abs = Object.fromEntries(Object.entries(files).map(([k, v]) => [resolve(k), v]));
   const o = {
     byDir: { '/work/repo': 'agent/x', '/other': 'agent/y' },
     labelsByNum: {},
-    readText: (p) => files[p] ?? null,
-    pathExists: (p) => p in files,
+    readText: (p) => abs[resolve(p)] ?? null,
+    pathExists: (p) => resolve(p) in abs,
     cwd: '/other',
   };
   const denyCmds = [

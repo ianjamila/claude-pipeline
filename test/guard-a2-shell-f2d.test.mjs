@@ -2,7 +2,7 @@
 // Guarded text lives in fake file contents only; the commands only name files.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolve, dirname, basename } from 'node:path';
+import { resolve, dirname, basename, sep } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { spliceLines } from '../pipeline/hooks/lib/script-candidates.mjs';
@@ -108,7 +108,8 @@ test('F2c 51: declare / typeset options end at the first name (the -u after a na
 // Why (item 85): `cd -P link/..` / `set -P` / zsh chaselinks go to the PHYSICAL parent of the link's target while the line's own arithmetic is lexical; the cwd list holds both readings.
 test('F2c 85: a `..` after a symlinked directory also names the target\'s parent', () => {
   const links = { '/home/u/proj/lnk': '/home/u/.cla' + 'ude/pipeline' };
-  const real = (p) => { const q = resolve(p); for (const [l, t] of Object.entries(links)) if (q === l || q.startsWith(`${l}/`)) return t + q.slice(l.length); return q; };
+  // (link and target resolved: on Windows the guard asks for D:\home\u\proj\lnk, with backslashes)
+  const real = (p) => { const q = resolve(p); for (const [l0, t0] of Object.entries(links)) { const l = resolve(l0); if (q === l || q.startsWith(l + sep)) return resolve(t0) + q.slice(l.length); } return q; };
   const fs = fakeFs(PROJ, BASE, ['/home/u/.cla' + 'ude/pipeline', '/home/u/proj/lnk']);
   const run = (c) => evaluateBashForFiles(c, { home: '/home/u', env: {}, platform: 'linux', realpath: real, cwd: PROJ, ...fs, existsSync: fs.pathExists });
   for (const c of ['cd -P lnk/..; echo x > settings.json', 'set -P; cd lnk/..; echo x > settings.json', 'cd -eP -- lnk/..; echo x > settings.json', 'pushd -P lnk/..; echo x > settings.json', 'cd lnk/../.; echo x > settings.json']) assert.equal(run(c).decision, 'deny', c);
@@ -117,7 +118,8 @@ test('F2c 85: a `..` after a symlinked directory also names the target\'s parent
 
 test('F2c 85: git-policy does not take the link\'s parent for the directory of `cd -P link/..`', () => {
   const links = { [resolve('/work/repo/lnk')]: resolve('/work/other/sub') };
-  const real = (p) => { const q = resolve(p); for (const [l, t] of Object.entries(links)) if (q === l || q.startsWith(`${l}/`)) return t + q.slice(l.length); return q; };
+  // (link and target resolved: on Windows the guard asks for D:\home\u\proj\lnk, with backslashes)
+  const real = (p) => { const q = resolve(p); for (const [l0, t0] of Object.entries(links)) { const l = resolve(l0); if (q === l || q.startsWith(l + sep)) return resolve(t0) + q.slice(l.length); } return q; };
   const fs = fakeFs(GIT_ROOT, BASE, ['/home/u', '/work/other/sub', '/work/repo/lnk']);
   const run = (c) => evaluateGitCommand(c, { cwd: GIT_ROOT, home: '/home/u', realpath: real, currentBranch: (d) => (resolve(d) === GIT_ROOT ? 'agent/x' : 'main'), pushDestination: () => null, issueLabels: () => [], ...fs });
   assert.equal(run('cd -P lnk/..; git push origin HEAD').decision, 'deny');
