@@ -23,6 +23,7 @@ A root is a directory that holds `pipeline/`. Keep roots in a scratch dir, not i
     node tools/guard-replay/replay.mjs <oldRoot> <newRoot> ~/.claude/projects <days> <out.json> [workers=4] [capMs=20000]
 
 - Worker pool; each command has a cap (`capMs`), and a command that is cut lands in `timeouts`.
+- A worker that fails before it is ready (missing policy module, syntax error) aborts the run: error on stderr, exit 1.
 - Progress goes to stderr every 10 s. `slow` lists commands over 1 s on either side.
 - 21 days is about 138k commands and takes 3-4 minutes.
 - Output: `summary {commands, flips, byDir, slow, timeouts}` and `flips [{k, from, to, reason, cwd, command}]`
@@ -48,8 +49,11 @@ A root is a directory that holds `pipeline/`. Keep roots in a scratch dir, not i
   Use it with a hand-made mutation: a failure or a kill means the mutation was caught.
 - `mutate.mjs <worktree> <mutations.json> <testFile>...`: the mutation check. Every fix reverted on its own must make
   a test fail. `mutations.json` is `[{name, file, from, to, defensive?}]` with `file` relative to the worktree and `from`
-  occurring exactly once (else the mutation is skipped and counts as bad). The file is always restored. It prints
-  `caught`, `defens.` or `MISSED` per mutation and exits 1 if a non-defensive mutation is missed or skipped.
+  occurring exactly once (else the mutation is skipped and counts as bad). The tests first run once on the unmodified
+  tree; unless they pass (`fail 0`, pass > 0) nothing is mutated and it exits 1. The file is always restored, also on
+  Ctrl-C / SIGTERM (exit 130 / 143; a copy of the original sits in the OS temp dir meanwhile). It prints `caught`,
+  `defens.`, `MISSED` or `error` per mutation. `caught` needs a parsed `fail N` with N > 0; a timeout, spawn error,
+  signal or unparsed output is `error`. Exit 1 if a non-defensive mutation is missed or skipped, or any run errored.
   Mark a mutation `defensive` only when another layer catches it, and say which layer in a comment next to the change.
   See `examples/mutations-s9.json`.
 

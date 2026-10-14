@@ -67,10 +67,19 @@ if (!isMainThread) {
   };
   const progress = setInterval(() => console.error(`[replay] ${done}/${cmds.length} ${Math.round((Date.now() - started) / 1000)}s flips=${flips.length} slow=${slow.length} timeouts=${timeouts.length}`), 10000);
   let live = 0;
+  const workers = new Set();
+  // A worker that dies before `ready` (policy module missing, syntax error) would otherwise be respawned forever.
+  const abort = (msg) => {
+    clearInterval(progress);
+    console.error(`[replay] worker failed before it was ready: ${msg}`);
+    for (const x of workers) x.terminate();
+    process.exit(1);
+  };
   const spawn = () => {
     live++;
     const w = new Worker(fileURLToPath(import.meta.url), { workerData: { oldRoot, newRoot } });
-    let job = null, phase = '', timer = null;
+    workers.add(w);
+    let job = null, phase = '', timer = null, ready = false;
     const give = () => {
       if (next >= cmds.length) { w.terminate(); return; }
       job = next++;
@@ -85,7 +94,7 @@ if (!isMainThread) {
       w.postMessage({ i: job, ...cmds[job] });
     };
     w.on('message', (m) => {
-      if (m.ready) return give();
+      if (m.ready) { ready = true; return give(); }
       if (m.i !== job) return;
       if (m.phase) { phase = m.phase; return; }
       clearTimeout(timer);
@@ -98,9 +107,14 @@ if (!isMainThread) {
       done++;
       give();
     });
-    w.on('error', (e) => { if (job !== null) { clearTimeout(timer); timeouts.push({ i: job, phase, error: String(e?.message ?? e), ...cmds[job] }); done++; job = null; } });
+    w.on('error', (e) => {
+      if (!ready) return abort(String(e?.stack ?? e));
+      if (job !== null) { clearTimeout(timer); timeouts.push({ i: job, phase, error: String(e?.message ?? e), ...cmds[job] }); done++; job = null; }
+    });
     w.on('exit', () => {
       clearTimeout(timer);
+      workers.delete(w);
+      if (!ready) return abort('worker exited without an error message');
       live--;
       if (next < cmds.length) spawn();
       else if (live === 0) { clearInterval(progress); finish(); }
