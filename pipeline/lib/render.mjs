@@ -36,6 +36,12 @@ export const cell = (s, max = Infinity) => line(s, max).replace(/\|/g, '&#124;')
 
 const TRIAGE_HEADER = '| Round | ID | Bucket | Finding | Decision | By | Conf. | Reason |';
 
+// An owner ruling shows the owner's own words (the cell is longer than the usual 120 so the quote is not cut off).
+const OWNER_REASON_MAX = 360;
+const ownerReason = (final) => (typeof final?.ownerQuote === 'string' && final.ownerQuote !== ''
+  ? `owner (chat): ${final.ownerQuote}${final.reason ? ` — ${final.reason}` : ''}`
+  : null);
+
 function triageRow(n, item) {
   const { final, judge, arbiter } = item;
   let decision = 'pending';
@@ -43,9 +49,9 @@ function triageRow(n, item) {
   else if (judge) decision = `${judge.decision} (pending)`;
   const by = final?.by ?? '—';
   const conf = arbiter?.confidence ?? judge?.confidence ?? '—';
-  const reason = final?.reason ?? judge?.reason ?? '';
+  const reason = ownerReason(final) ?? final?.reason ?? judge?.reason ?? '';
   const finding = item.title || item.file || '';
-  return `| ${cell(n)} | ${cell(item.id)} | ${cell(item.bucket)} | ${cell(finding, 80)} | ${cell(decision)} | ${cell(by)} | ${cell(conf)} | ${cell(reason, 120)} |`;
+  return `| ${cell(n)} | ${cell(item.id)} | ${cell(item.bucket)} | ${cell(finding, 80)} | ${cell(decision)} | ${cell(by)} | ${cell(conf)} | ${cell(reason, final?.ownerQuote ? OWNER_REASON_MAX : 120)} |`;
 }
 
 export function triageComment(state) {
@@ -109,6 +115,9 @@ function outliersSection(entries, modelProofs) {
     if (!strong && !closeCall) continue;
     const settled = item.final ? `final: ${line(item.final.decision ?? 'unknown')} by ${line(item.final.by)}` : 'final: pending';
     out.push(`- ${findingLabel(item)} · ${codexView(item)} · ${opusView(item)} · ${settled} _(${strong ? 'strong disagreement' : 'close call'})_`);
+  }
+  for (const { item } of unique(entries.filter(({ item: i }) => i.final?.ownerQuote))) {
+    out.push(`- ${findingLabel(item)} · Owner (chat): ${line(item.final.decision)} — "${line(item.final.ownerQuote, 300)}"`);
   }
   for (const p of modelProofs) {
     out.push(`- Fable proof: ${line(p.transcript)}, models ${fmtModels(p)}, effort ${line(p.effort ?? 'high')}`);

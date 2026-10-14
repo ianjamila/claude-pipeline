@@ -19,6 +19,9 @@ import {
   markLightLane,
   roundOutcome,
   reviewValidFor,
+  applyOwnerRuling,
+  isOwnerRuled,
+  ownerRuledItems,
 } from '../pipeline/lib/triage.mjs';
 
 // ---- fixtures -------------------------------------------------------------------------------
@@ -983,4 +986,67 @@ test('applyTestResult: evidence is capped at 500 characters with an ellipsis, in
   // Capped by code point: an emoji at the boundary is never split.
   const emoji = '😀'.repeat(600);
   assert.equal(Array.from(applyTestResult(item(), 'bug-confirmed', emoji).test.evidence).length, 501);
+});
+
+// ---- owner rulings (owner_approval: chat) ---------------------------------------------------
+
+const needsHumanFinal = (decision = 'FOLLOW-UP', by = 'arbiter') => ({ decision, by, needsHuman: true, reason: 'model-proof failed' });
+const ownerOk = (decision, over = {}) => ({ decision, reason: 'owner agrees', ownerQuote: 'yes, follow-up', ruledAt: '2026-10-14T01:02:03.000Z', ...over });
+
+test('applyOwnerRuling: records the owner as the decider, keeps the old final as overruled, never mutates its input', () => {
+  const before = item({ id: 'R1-B1', final: needsHumanFinal() });
+  const out = applyOwnerRuling(before, ownerOk('REJECT'));
+  assert.deepEqual(out.final, {
+    decision: 'REJECT', by: 'owner', needsHuman: false, reason: 'owner agrees', ownerQuote: 'yes, follow-up',
+    ruledAt: '2026-10-14T01:02:03.000Z', overruled: needsHumanFinal(),
+  });
+  assert.deepEqual(before.final, needsHumanFinal(), 'input not mutated');
+  assert.equal(isOwnerRuled(out), true);
+  assert.equal(isOwnerRuled(before), false);
+  assert.equal(out.implemented, false, 'ACCEPT still has to be built');
+});
+
+test('applyOwnerRuling: refuses a decision outside ACCEPT|FOLLOW-UP|REJECT and an item that needs no human', () => {
+  assert.throws(() => applyOwnerRuling(item({ final: needsHumanFinal() }), ownerOk('MAYBE')), /decision/);
+  assert.throws(() => applyOwnerRuling(item({ final: settled('ACCEPT') }), ownerOk('REJECT')), /needs no human/);
+  assert.throws(() => applyOwnerRuling(item(), ownerOk('REJECT')), /needs no human/);
+});
+
+test('ownerRuledItems: finds owner rulings in every round, including cached copies', () => {
+  const owner = applyOwnerRuling(item({ id: 'R1-B1', fingerprint: 'fp', final: needsHumanFinal() }), ownerOk('REJECT'));
+  const cache = ruledCacheFrom([owner]);
+  const [cached] = reuseRuled([item({ id: 'R2-B1', fingerprint: 'fp' })], { fp: { ...cache.fp, bucket: 'BLOCKING', category: 'logic' } });
+  assert.equal(cached.final.by, 'cache');
+  assert.equal(cached.final.ownerQuote, 'yes, follow-up', 'the cached copy still carries the owner quote');
+  assert.equal(isOwnerRuled(cached), true);
+  const found = ownerRuledItems(stateOf([round(1, [owner, item({ id: 'R1-B9', final: settled('REJECT') })]), round(2, [cached])]));
+  assert.deepEqual(found.map((i) => i.id), ['R1-B1', 'R2-B1']);
+});
+
+test('owner ruling: REJECT and FOLLOW-UP clear a needs-human item, ACCEPT stays unclean until built and re-reviewed', () => {
+  const stuck = (id) => item({ id, bucket: 'BLOCKING', final: needsHumanFinal('FOLLOW-UP') });
+  const blocked = roundOutcome(stateOf([round(1, [stuck('R1-B1')])]));
+  assert.equal(blocked.clean, false);
+  assert.deepEqual(blocked.needsHuman, ['R1-B1']);
+  for (const decision of ['REJECT', 'FOLLOW-UP']) {
+    const s = stateOf([round(1, [applyOwnerRuling(stuck('R1-B1'), ownerOk(decision))])]);
+    assert.equal(roundOutcome(s).clean, true, decision);
+    assert.equal(reviewValidFor(s, 'h-final'), true, decision);
+  }
+  const accepted = applyOwnerRuling(stuck('R1-B1'), ownerOk('ACCEPT'));
+  let s = stateOf([round(1, [accepted])]);
+  assert.equal(roundOutcome(s).clean, false);
+  assert.deepEqual(roundOutcome(s).unimplemented, ['R1-B1']);
+  assert.equal(reviewValidFor(s, 'h-final'), false);
+  s = stateOf([round(1, [{ ...accepted, implemented: true }])]);
+  assert.equal(roundOutcome(s).clean, false, 'built, but the fix is not reviewed yet');
+  s = stateOf([round(1, [{ ...accepted, implemented: true }]), round(2, [])]);
+  assert.equal(roundOutcome(s).clean, true, 'a later clean round reviews the fix');
+  assert.equal(reviewValidFor(s, 'h-final'), true);
+});
+
+test('an owner ruling is not overridden by an arbiter ruling or a test result', () => {
+  const owner = applyOwnerRuling(item({ id: 'R1-B1', final: needsHumanFinal() }), ownerOk('REJECT'));
+  const [after] = applyRulings([owner], { rulings: [{ id: 'R1-B1', ruling: 'ACCEPT', confidence: 'high', reasoning: 'x' }] }, { proofOk: true });
+  assert.deepEqual(after.final, owner.final);
 });

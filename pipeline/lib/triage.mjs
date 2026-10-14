@@ -165,7 +165,7 @@ export function applyRulings(items, rulings, { proofOk, transcript } = {}) {
     const next = structuredClone(item);
     const r = byId.get(item.id);
     if (!r) return next;
-    if (next.final?.by === 'test') return next; // a test is evidence; no opinion overrides it
+    if (next.final?.by === 'test' || next.final?.by === 'owner') return next; // a test is evidence and the owner's word is final; no opinion overrides either
     next.arbiter = { ruling: r.ruling, confidence: r.confidence, reasoning: r.reasoning, transcript: transcript ?? null };
     const rulingValid = DECISIONS.includes(r.ruling) && CONFIDENCES.includes(r.confidence);
     const dismissesBlockingSecurity =
@@ -199,6 +199,25 @@ export function applyRulings(items, rulings, { proofOk, transcript } = {}) {
     return next;
   });
 }
+
+// ---- owner ruling (owner_approval: chat) ---------------------------------------------------
+
+// A ruling the owner made in chat (`pipeline triage owner-ruling`) on an item that was waiting for a human. The quote is
+// the owner's own words, kept so the ruling stays visible and checkable: it is published in the triage comment and counted at
+// the final gate, where it never replaces the owner's "merge". The final it overrules is kept as `overruled`. ACCEPT leaves
+// `implemented` false, so the exit rules still ask for the fix and a review round that covers it.
+export function applyOwnerRuling(item, { decision, reason, ownerQuote, ruledAt }) {
+  if (!DECISIONS.includes(decision)) throw new Error(`decision must be one of ${DECISIONS.join('|')}`);
+  if (item.final?.needsHuman !== true) throw new Error(`${item.id} needs no human decision`);
+  const next = structuredClone(item);
+  next.final = { decision, by: 'owner', needsHuman: false, reason, ownerQuote, ruledAt, overruled: structuredClone(item.final) };
+  return next;
+}
+
+// The marker is the quote, not `by`: a later round's cached copy of the ruling has by 'cache' and is still the owner's word.
+export const isOwnerRuled = (item) => typeof item.final?.ownerQuote === 'string' && item.final.ownerQuote !== '';
+
+export const ownerRuledItems = (state) => allItems(state).filter(isOwnerRuled);
 
 // ---- cache and light lane -------------------------------------------------------------------
 
