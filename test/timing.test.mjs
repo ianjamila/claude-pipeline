@@ -39,6 +39,30 @@ test('assertLinear: below the timer slack (a few ms of excess) nothing is measur
   assert.throws(() => assertLinear(() => 20, () => 100), /not linear/); // 60 ms over linear
 });
 
+test('assertLinear factor 4: a linear cost with a one-off 1.5x cache step (50 -> 300) passes with ratio 8', () => {
+  assert.doesNotThrow(() => assertLinear(() => 50, () => 300, { factor: 4, ratio: 8 })); // 6x for 4x the input
+});
+
+test('assertLinear factor 4: a quadratic cost (50 -> 800) fails and the message says n/4', () => {
+  assert.throws(() => assertLinear(() => 50, () => 800, { factor: 4, ratio: 8, label: 'fake' }), /fake: 50ms at n\/4 -> 800ms at n .*not linear/);
+});
+
+test('assertLinear factor 16: a linear cost with a 2.5x per-byte cache climb (20 -> 800) passes; a quadratic (20 -> 5120) fails and names n/16', () => {
+  assert.doesNotThrow(() => assertLinear(() => 20, () => 800, { factor: 16, ratio: 64 })); // 40x for 16x the input
+  assert.throws(() => assertLinear(() => 20, () => 5120, { factor: 16, ratio: 64, label: 'fake' }), /fake: 20ms at n\/16 -> 5120ms at n .*not linear/);
+});
+
+test('assertLinear: the default factor still reports n/2', () => {
+  assert.throws(() => assertLinear(() => 50, () => 800), /50ms at n\/2 -> 800ms at n/);
+});
+
+test('assertLinear factor 4: the slack is measured over 4x the baseline', () => {
+  assert.doesNotThrow(() => assertLinear(() => 2, () => 20, { factor: 4, ratio: 8 })); // 12 ms over linear
+  assert.doesNotThrow(() => assertLinear(() => 2, () => 31, { factor: 4, ratio: 8 })); // 23 ms over linear (27 at factor 2 would fail)
+  assert.throws(() => assertLinear(() => 2, () => 31), /not linear/);
+  assert.throws(() => assertLinear(() => 20, () => 200, { factor: 4, ratio: 8 }), /not linear/); // ratio 10, 120 ms over linear
+});
+
 test('bestOf takes the minimum; cpuTime measures a callback in ms', () => {
   const xs = [5, 2, 9];
   assert.equal(bestOf(3, () => xs.shift()), 2);
