@@ -257,6 +257,20 @@ test('#56 bypass: a binder whose NAME is only known at run time may set any vari
   ]) allowGit(cmd, SPEC);
 });
 
+test('#56 replay: `npx tsx` reads a heredoc as data like node; `set -a` changes no directory', () => {
+  for (const cmd of [
+    "cat > s.mjs <<'EOF'\nconst ROOT = process.cwd()\nEOF\nnpx tsx s.mjs",
+    "cat > s.mjs <<'EOF'\nconst ROOT = process.cwd()\nEOF\ntsx s.mjs && node a.mjs",
+    'set -a; X=1; set +a; bash ok.sh',
+  ]) allowGit(cmd, SPEC);
+  for (const cmd of [
+    "cat > s.mjs <<'EOF'\nconst ROOT = process.cwd()\nEOF\nf() { cd /elsewhere; }; npx tsx s.mjs; bash run.sh",
+    "cat > s.mjs <<'EOF'\nconst ROOT = process.cwd()\nEOF\nnpx tsx s.mjs; bash run.sh",
+    'set -k; bash ok.sh',
+    'set -a; . ./env.sh; set +a; bash ok.sh',
+  ]) denyGit(cmd, { ...SPEC, 'env.sh': 'cd /elsewhere' });
+});
+
 // ---- 3. values built from other variables (a live bypass) -------------------------------------------------------------------
 
 test('#56 bypass: a value built from another variable is worked out when it is assigned', () => {

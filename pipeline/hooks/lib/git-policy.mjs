@@ -1621,7 +1621,8 @@ const STATE_HAZARD_CMDS = new Set([
   'zmodload', 'unfunction', 'emulate',
 ]);
 // `set` is everywhere (`set -euo pipefail`); only an option outside these (zsh `set -o autocd`, …) is a hazard.
-const SAFE_SET_ARG = /^(?:[-+][euxvfCo]+|pipefail|errexit|nounset|xtrace|verbose|noglob|noclobber|--)$/;
+// (-a / allexport only exports later assignments: whether an earlier one reaches a command is already unknown to the checks that care, GIT_DIR / GH_REPO)
+const SAFE_SET_ARG = /^(?:[-+][euxvfCoa]+|pipefail|errexit|nounset|xtrace|verbose|noglob|noclobber|allexport|--)$/;
 const isStateHazard = (c) => {
   if (!c.argv.length) return false;
   const nm = baseName(c.argv[0]);
@@ -1633,7 +1634,10 @@ const SOURCING = ['source', '.'];
 // Why: only unquoted text defines a function: `create function f(uuid)` in a psql -c, `fn()` in a node -e program or a commit message is data. That holds only when every command on the line is
 // one that never evaluates its words in the current shell (external programs and plain builtins below); anything else (eval, a shell, source, trap, mapfile -C, complete -C, bind -x, fc, let / (( )),
 // export / declare / printf -v with a subscript, a name known only at run time, an assignment to PROMPT_COMMAND ...) reads quoted text as code, and so does a heredoc (an apostrophe in its body would unbalance the quotes).
-const DATA_COMMANDS = new Set(['git', 'gh', 'node', 'nodejs', 'python', 'python3', 'deno', 'bun', 'ruby', 'perl', 'cat', 'echo', 'printf', 'grep', 'egrep', 'fgrep', 'rg', 'sed', 'awk', 'jq', 'psql', 'mysql', 'sqlite3', 'npm', 'npx', 'pnpm', 'yarn', 'supabase', 'curl', 'wget', 'ls', 'head', 'tail', 'wc', 'sort', 'uniq', 'cut', 'tr', 'tee', 'diff', 'mkdir', 'rm', 'cp', 'mv', 'touch', 'find', 'date', 'sleep', 'cd', 'pwd', 'true', 'false', 'rsync', 'tar', 'ln', 'chmod', 'open', 'tsc', 'vitest']);
+const DATA_COMMANDS = new Set(['git', 'gh', 'node', 'nodejs', 'python', 'python3', 'deno', 'bun', 'ruby', 'perl', 'cat', 'echo', 'printf', 'grep', 'egrep', 'fgrep', 'rg', 'sed', 'awk', 'jq', 'psql', 'mysql', 'sqlite3', 'npm', 'npx', 'pnpm', 'yarn', 'supabase', 'curl', 'wget', 'ls', 'head', 'tail', 'wc', 'sort', 'uniq', 'cut', 'tr', 'tee', 'diff', 'mkdir', 'rm', 'cp', 'mv', 'touch', 'find', 'date', 'sleep', 'cd', 'pwd', 'true', 'false', 'rsync', 'tar', 'ln', 'chmod', 'open', 'tsc', 'vitest',
+  // (#56 replay: `npx tsx s.mjs` after `cat > s.mjs <<'EOF'` holding `process.cwd()` made the directory unknown: external programs, like the ones above)
+  'tsx', 'ts-node', 'bunx', 'pnpx', 'playwright', 'eslint', 'prettier', 'stat', 'basename', 'dirname', 'realpath', 'readlink', 'cmp', 'du',
+  'shasum', 'sha256sum', 'md5', 'file', 'lsof', 'ps', 'zip', 'unzip', 'gzip']);
 const dataOnly = (c) => {
   if (!c.argv.length) return !Object.keys(c.env ?? {}).some((k) => /^(?:PROMPT_COMMAND|PS[0-4]|BASH_ENV|ENV|IFS|PATH|CDPATH)$/.test(k));
   const nm = baseName(c.argv[0]);
