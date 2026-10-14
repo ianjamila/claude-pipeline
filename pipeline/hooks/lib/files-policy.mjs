@@ -1505,7 +1505,11 @@ function judgeJoinedScripts(sf, dirs, ctx, opts, scanRaw = '') {
       if (seen.has(key)) continue;
       seen.add(key);
       const parts = [];
-      for (const abs of abss) {
+      // (`pieces`: static text a producer prints between the files, in stream order -- scriptFeedsOf; the files are abss in that order)
+      let fi = 0;
+      for (const pc of sf.pieces ?? sf.joined.map((file) => ({ file }))) {
+        if (Object.hasOwn(pc, 'text')) { parts.push([pc.text]); continue; }
+        const abs = abss[fi++];
         if (ctx.hit(abs) || ctx.hit(realResolve(abs, ctx.api)) || /\/node_modules\//.test(abs)) continue;
         checkDeadline(ctx.budget);
         const exists = ctx.api.existsSync(abs);
@@ -1585,7 +1589,7 @@ function judgeFoundScript(sf, abs, dir, ctx, opts) {
   const text = ctx.readText(abs);
   if (typeof text !== 'string') {
     if (sf.candidate && ctx.readDir(abs)) return null; // a shell cannot run a directory
-    if (sf.kind === 'shell') return deny(`cannot read the script ${sf.file} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified`);
+    if (sf.kind === 'shell' || sf.whole) return deny(`cannot read the script ${sf.file} (missing permission, a directory or larger than 1 MB), so what it runs cannot be verified`);
     // over the read cap: a program run by path is peeked at (a shell script is refused, a binary or an interpreter file is not
     // ours to judge); text a rewriting command computes from a file we cannot read cannot be scanned
     if (sf.kind === 'exec' || sf.kind === 'scan' || sf.kind === 'sql') {

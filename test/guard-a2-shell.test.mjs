@@ -277,8 +277,10 @@ test('S2: only option-less cat (and cat -u) is an exact copy of a file: everythi
 });
 
 test('S2: several producers of one feed are judged joined when every one of them is a file that can be named', () => {
-  for (const c of ['{ cat f.sh; cat ok.sh; } | bash', '{ cat x.sh; cat f.sh; } | bash', '{ cat x.sh; cat $Z; } | bash', '{ cat x.sh; cat *.sh; } | bash', '{ cat x.sh; tail -c 9 f.sh; } | bash', '{ cat x.sh; cat ~root/a.sh; } | bash', '{ cat x.sh; echo hi; } | bash']) denyBoth(c, FEED); // (static text with files in one stream: refused since the Codex recheck of a5c0e5a, guard-a2-shell-s7.test.mjs)
-  for (const c of ['{ cat x.sh; cat ok.sh; } | bash', '{ cat x.sh; cat ok.sh; cat x.sh; } | sh', '(cat x.sh; cat ok.sh) | bash']) allowBoth(c, FEED);
+  for (const c of ['{ cat f.sh; cat ok.sh; } | bash', '{ cat x.sh; cat f.sh; } | bash', '{ cat x.sh; cat $Z; } | bash', '{ cat x.sh; cat *.sh; } | bash', '{ cat x.sh; tail -c 9 f.sh; } | bash', '{ cat x.sh; cat ~root/a.sh; } | bash']) denyBoth(c, FEED);
+  // (static text with files in one stream: judged as the stream it rebuilds since S8, guard-a2-shell-s8.test.mjs)
+  for (const c of ['{ cat x.sh; cat ok.sh; } | bash', '{ cat x.sh; cat ok.sh; cat x.sh; } | sh', '(cat x.sh; cat ok.sh) | bash', '{ cat x.sh; echo hi; } | bash']) allowBoth(c, FEED);
+  denyBoth('{ cat x.sh; echo hi; cat f.sh; } | bash', FEED);
   // the texts are one program: a guarded command split between two producers is one command
   const split = { 'a1.sh': 'git pu', 'a2.sh': 'sh origin main' };
   assert.equal(git('{ cat a1.sh; cat a2.sh; } | bash', fakeFs(GIT_ROOT, split, DIRS)).decision, 'deny');

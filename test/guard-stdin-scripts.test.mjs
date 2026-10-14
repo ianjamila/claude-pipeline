@@ -137,8 +137,9 @@ test('g: a producer that rewrites what it reads: a named file holding a guarded 
 
 test('g: a plain reader feeds the file as the script (judged by what it runs); a rewriting producer only gets the word scan', () => {
   const spec = { 'mid.sh': 'mid' };
-  for (const c of ['bash < mid.sh', 'cat mid.sh | bash', 'eval "$(cat mid.sh)"', 'bash <(cat mid.sh)', 'bash <<< "$(cat mid.sh)"', '$(cat mid.sh)']) allowBoth(c, spec);
-  for (const c of ['sed p mid.sh | bash', 'cat mid.sh | tr a b | bash', 'eval "$(cat mid.sh | tr a b)"', 'bash <(awk 1 mid.sh)', 'cat mid.sh | tee /dev/null | sh', 'head -n 1 mid.sh | bash']) denyBoth(c, spec);
+  for (const c of ['bash < mid.sh', 'cat mid.sh | bash', 'eval "$(cat mid.sh)"', 'bash <(cat mid.sh)', 'bash <<< "$(cat mid.sh)"']) allowBoth(c, spec);
+  // (a substitution as the command word is split into words, so its file is not the script's exact text: scanned since S8, guard-a2-shell-s8.test.mjs)
+  for (const c of ['$(cat mid.sh)', 'sed p mid.sh | bash', 'cat mid.sh | tr a b | bash', 'eval "$(cat mid.sh | tr a b)"', 'bash <(awk 1 mid.sh)', 'cat mid.sh | tee /dev/null | sh', 'head -n 1 mid.sh | bash']) denyBoth(c, spec);
 });
 
 test('g: harmless controls stay allowed', () => {
