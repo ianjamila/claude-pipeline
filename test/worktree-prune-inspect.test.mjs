@@ -69,7 +69,7 @@ test('checkAncestry: behind the merged head is fine, local-only commit is not, s
   assert.equal(repo.git(['for-each-ref', 'refs/pipeline-prune']), '', 'the temporary ref is always removed');
 });
 
-test('processesInside: fake /proc tree; non-linux is unavailable', () => {
+test('processesInside: fake /proc tree; non-linux is unavailable', { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' }, () => {
   const proc = mkdtempSync(join(tmpdir(), 'proc-'));
   const target = mkdtempSync(join(tmpdir(), 'wt-'));
   mkdirSync(join(proc, '101', 'fd'), { recursive: true });
@@ -80,7 +80,7 @@ test('processesInside: fake /proc tree; non-linux is unavailable', () => {
   assert.deepEqual(processesInside(target, { procRoot: proc, platform: 'linux' }), { available: true, pids: [101, 202], hidden: 0 });
   assert.deepEqual(processesInside(target, { procRoot: proc, platform: 'win32' }), { available: false, pids: [], hidden: 0 });
   assert.deepEqual(processesInside(target, { procRoot: join(proc, 'missing'), platform: 'linux' }), { available: false, pids: [], hidden: 0 });
-}, { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' });
+});
 
 test('transcriptMentions / memoryMentions / recentFiles', () => {
   const t = mkdtempSync(join(tmpdir(), 'tr-'));
@@ -98,7 +98,7 @@ test('transcriptMentions / memoryMentions / recentFiles', () => {
   assert.deepEqual(recentFiles(walk, { sinceMs: Date.now() - 3600e3, ignore: ['node_modules/'] }), ['src/a.ts']);
 });
 
-test('entriesFor flags a symlink and walkTree does not follow it', () => {
+test('entriesFor flags a symlink and walkTree does not follow it', { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' }, () => {
   const { add } = world();
   const wt = add('agent-x', 'agent/x');
   const outside = mkdtempSync(join(tmpdir(), 'outside-')); writeFileSync(join(outside, 'secret.txt'), '');
@@ -107,7 +107,7 @@ test('entriesFor flags a symlink and walkTree does not follow it', () => {
   assert.equal(e.link.isSymlink, true);
   assert.equal(e.link.kind, 'untracked');
   assert.deepEqual(walkTree(wt).map((w) => w.path).filter((p) => p.startsWith('link')), ['link']);
-}, { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' });
+});
 
 test('transcriptMentions finds a needle that straddles the 1 MiB chunk seam', () => {
   const t = mkdtempSync(join(tmpdir(), 'tr-'));
@@ -127,7 +127,7 @@ test('defaultTranscriptDirs: CLAUDE_CONFIG_DIR plus ~/.claude*/projects, existin
   assert.deepEqual(dirs, [join(home, '.claude', 'projects'), join(home, '.claude-ew', 'projects')]);
 });
 
-test('an unreadable directory is a blocker, never an empty one', () => {
+test('an unreadable directory is a blocker, never an empty one', { skip: (process.platform === 'win32' && 'chmod 000 is not enforced on Windows') || (process.getuid?.() === 0 && 'root can read any directory') }, () => {
   const { add } = world();
   const wt = add('agent-x', 'agent/x');
   const secret = join(wt, 'node_modules', 'locked');
@@ -142,9 +142,9 @@ test('an unreadable directory is a blocker, never an empty one', () => {
   } finally {
     chmodSync(secret, 0o700);
   }
-}, { skip: (process.platform === 'win32' && 'chmod 000 is not enforced on Windows') || (process.getuid?.() === 0 && 'root can read any directory') });
+});
 
-test('processesInside matches a worktree reached through a symlinked path', () => {
+test('processesInside matches a worktree reached through a symlinked path', { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' }, () => {
   const proc = mkdtempSync(join(tmpdir(), 'proc-'));
   const real = realpathSync(mkdtempSync(join(tmpdir(), 'wt-')));
   const via = join(mkdtempSync(join(tmpdir(), 'lnk-')), 'wt-link');
@@ -152,9 +152,9 @@ test('processesInside matches a worktree reached through a symlinked path', () =
   mkdirSync(join(proc, '303', 'fd'), { recursive: true });
   symlinkSync(real, join(proc, '303', 'cwd'));
   assert.deepEqual(processesInside(via, { procRoot: proc, platform: 'linux' }), { available: true, pids: [303], hidden: 0 });
-}, { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' });
+});
 
-test('processesInside ignores non-path fd targets (socket:[N], anon_inode:…) even with cwd inside the worktree', () => {
+test('processesInside ignores non-path fd targets (socket:[N], anon_inode:…) even with cwd inside the worktree', { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' }, () => {
   const proc = mkdtempSync(join(tmpdir(), 'proc-'));
   const target = realpathSync(mkdtempSync(join(tmpdir(), 'wt-')));
   mkdirSync(join(proc, '404', 'fd'), { recursive: true });
@@ -170,9 +170,9 @@ test('processesInside ignores non-path fd targets (socket:[N], anon_inode:…) e
   } finally {
     process.chdir(before);
   }
-}, { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' });
+});
 
-test('transcriptMentions counts an unreadable recent transcript as a hit (fail-closed)', () => {
+test('transcriptMentions counts an unreadable recent transcript as a hit (fail-closed)', { skip: (process.platform === 'win32' && 'chmod 000 is not enforced on Windows') || (process.getuid?.() === 0 && 'root can read any file') }, () => {
   const t = mkdtempSync(join(tmpdir(), 'tr-'));
   mkdirSync(join(t, 'proj'));
   const locked = join(t, 'proj', 'locked.jsonl');
@@ -184,11 +184,11 @@ test('transcriptMentions counts an unreadable recent transcript as a hit (fail-c
   } finally {
     chmodSync(locked, 0o600); chmodSync(join(t, 'proj', 'old-locked.jsonl'), 0o600);
   }
-}, { skip: (process.platform === 'win32' && 'chmod 000 is not enforced on Windows') || (process.getuid?.() === 0 && 'root can read any file') });
+});
 
 // Another user's process: its /proc/<pid> links cannot be read (EACCES). It is counted as hidden, never as "inside",
 // and never makes process inspection unavailable (every non-root user sees root daemons this way).
-test('processesInside counts an unreadable process as hidden; a vanished one is just gone', () => {
+test('processesInside counts an unreadable process as hidden; a vanished one is just gone', { skip: (process.platform === 'win32' && 'chmod 000 is not enforced on Windows') || (process.getuid?.() === 0 && 'root can read any directory') }, () => {
   const proc = mkdtempSync(join(tmpdir(), 'proc-'));
   const target = realpathSync(mkdtempSync(join(tmpdir(), 'wt-')));
   mkdirSync(join(proc, '606', 'fd'), { recursive: true });
@@ -200,7 +200,7 @@ test('processesInside counts an unreadable process as hidden; a vanished one is 
   } finally {
     chmodSync(join(proc, '606'), 0o700);
   }
-}, { skip: (process.platform === 'win32' && 'chmod 000 is not enforced on Windows') || (process.getuid?.() === 0 && 'root can read any directory') });
+});
 
 // spec §5: a pipeline-keep lock older than 7 days is reported as a stale keep ("still needed?"), never released. Its age
 // is the mtime of the worktree's own `locked` file, found through the `.git` file's gitdir line: a second worktree with
@@ -261,7 +261,7 @@ test('transcriptMentions judges a JSON line that spans the 1 MiB chunk seam as o
 
 // A path has more than one spelling when a symlink leads into it (this PC: ~/Claude -> ~/projects). git records a worktree
 // by its real path, and a session started under the alias logs the alias spelling; either way it is the same worktree.
-test('transcriptMentions matches every spelling of the path: its realpath, and an alias through a symlinked ancestor', () => {
+test('transcriptMentions matches every spelling of the path: its realpath, and an alias through a symlinked ancestor', { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' }, () => {
   const base = realpathSync(mkdtempSync(join(tmpdir(), 'spell-')));
   mkdirSync(join(base, 'projects', 'repo', '.worktrees', 'agent-x'), { recursive: true });
   symlinkSync(join(base, 'projects'), join(base, 'Claude'));
@@ -279,4 +279,4 @@ test('transcriptMentions matches every spelling of the path: its realpath, and a
   assert.deepEqual(transcriptMentions([real], { dirs: [t], sinceMs: since }).sort(), expected, 'registered by its real path');
   assert.deepEqual(transcriptMentions([alias], { dirs: [t], sinceMs: since }).sort(), expected, 'registered through the alias');
   assert.ok(!transcriptMentions([real], { dirs: [t], sinceMs: since }).includes(listing));
-}, { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' });
+});

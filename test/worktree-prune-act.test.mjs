@@ -143,16 +143,16 @@ test('purge: a batch with a missing or unparseable manifest is kept; one young i
   assert.deepEqual(purgeHolding(join(base, 'missing'), { nowMs: T }), { purged: [], kept: [] });
 });
 
-test('archive: a symlinked directory on the way to the file is refused and the outside file survives', () => {
+test('archive: a symlinked directory on the way to the file is refused and the outside file survives', { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' }, () => {
   const wt = mkdtempSync(join(tmpdir(), 'wt-')); const h = mkdtempSync(join(tmpdir(), 'hold-'));
   const outside = mkdtempSync(join(tmpdir(), 'outside-')); writeFileSync(join(outside, 'x'), 'precious');
   symlinkSync(outside, join(wt, '.review'));
   assert.throws(() => archivePaths({ wtPath: wt, rels: ['.review/x'], holdingDir: h, slug: 's', pr: 1, nowMs: T }), /symlink in path/);
   assert.equal(readFileSync(join(outside, 'x'), 'utf8'), 'precious');
   assert.deepEqual(readdirSync(h), [], 'nothing was written to holding');
-}, { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' });
+});
 
-test('archive: a symlinked file, or a symlinked batch/slug dir on the holding side, is refused', () => {
+test('archive: a symlinked file, or a symlinked batch/slug dir on the holding side, is refused', { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' }, () => {
   const wt = mkdtempSync(join(tmpdir(), 'wt-')); const h = mkdtempSync(join(tmpdir(), 'hold-'));
   const outside = mkdtempSync(join(tmpdir(), 'outside-')); writeFileSync(join(outside, 'secret'), 's');
   symlinkSync(join(outside, 'secret'), join(wt, 'x.log'));
@@ -167,7 +167,7 @@ test('archive: a symlinked file, or a symlinked batch/slug dir on the holding si
   assert.throws(() => archivePaths({ wtPath: wt, rels: ['y.log'], holdingDir: h2, slug: 's', pr: 1, nowMs: T }), /symlink in path/);
   assert.deepEqual(readdirSync(elsewhere), []);
   assert.equal(readFileSync(join(wt, 'y.log'), 'utf8'), 'y', 'a refused archive leaves the file where it was');
-}, { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' });
+});
 
 test('removeWorktree: eligible tree is archived, cleaned and removed; branch kept', async () => {
   const { repo, add } = world();
@@ -315,7 +315,7 @@ test('removeWorktree: process inspection unavailable => moved back, kept', async
   assert.equal(existsSync(join(wt, 'a.txt')), true);
 });
 
-test('removeWorktree: a process whose cwd is inside the quarantine => moved back, kept', async () => {
+test('removeWorktree: a process whose cwd is inside the quarantine => moved back, kept', { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' }, async () => {
   const { repo, add } = world();
   const wt = add('agent-x', 'agent/x');
   const proc = mkdtempSync(join(tmpdir(), 'proc-'));
@@ -324,9 +324,9 @@ test('removeWorktree: a process whose cwd is inside the quarantine => moved back
     hooks: { afterMove: (q) => { mkdirSync(join(proc, '4242', 'fd'), { recursive: true }); symlinkSync(q, join(proc, '4242', 'cwd')); } } });
   assert.deepEqual([r.removed, r.restored, r.reason], [false, true, 'in use during removal']);
   assert.equal(existsSync(join(wt, 'a.txt')), true);
-}, { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' });
+});
 
-test('removeWorktree: an archive-matched symlink is a blocker (symlink in path); nothing outside is touched', async () => {
+test('removeWorktree: an archive-matched symlink is a blocker (symlink in path); nothing outside is touched', { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' }, async () => {
   const { repo, add } = world();
   const wt = add('agent-x', 'agent/x');
   const outside = mkdtempSync(join(tmpdir(), 'outside-')); writeFileSync(join(outside, 'secret'), 'keep me');
@@ -337,7 +337,7 @@ test('removeWorktree: an archive-matched symlink is a blocker (symlink in path);
   assert.match(r.reason, /^symlink in path \(x\.log\)/);
   assert.equal(readFileSync(join(outside, 'secret'), 'utf8'), 'keep me');
   assert.deepEqual(readdirSync(h), []);
-}, { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' });
+});
 
 test('removeWorktree: a runId with a dot is refused before anything moves', async () => {
   const { repo, add } = world();
