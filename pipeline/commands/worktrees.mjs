@@ -3,8 +3,9 @@
 // docs/specs/2026-10-13-worktree-prune-design.md. One `worktrees.mode` setting governs every mutation: `report` (the
 // default) and `off` change nothing, `--dry-run` never changes anything; keep-locks only protect, so they work in every
 // mode. The prune flow lives in lib/worktree-prune/run.mjs. Exit 0 completed (skips are normal), 2 usage / repo / config,
-// 3 GitHub unavailable. `schedule` adds, removes or reports one nightly cron line that runs `prune --notify --summary-only` (Linux only).
-import { accessSync, constants, mkdirSync, readFileSync, readlinkSync } from 'node:fs';
+// 3 GitHub unavailable. `schedule` adds, removes or reports one nightly cron line that runs `prune --notify --summary-only` (Linux, cron) or one launchd LaunchAgent (macOS).
+import { accessSync, constants, existsSync, mkdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EXIT, UsageError, errorResult, parseCommandArgs } from '../lib/cli.mjs';
@@ -24,7 +25,7 @@ export const meta = {
     'pipeline worktrees keep NAME [--reason TEXT] [--repo DIR]   -> {ok, slug, locked}',
     'pipeline worktrees unkeep NAME [--run ID] [--repo DIR]   -> {ok, slug, unlocked}',
     'pipeline worktrees holding [--purge] [--repo DIR]   -> {ok, batches:[...], purged:[...]}',
-    'pipeline worktrees schedule (--install [--at HH:MM] | --remove | --status) [--repo DIR]   -> {ok, installed, line, timezone, warning?} | {ok, removed} | {ok, installed, line}',
+    'pipeline worktrees schedule (--install [--at HH:MM] | --remove | --status) [--repo DIR]   -> {ok, installed, line, timezone, warning?} | {ok, removed} | {ok, installed, line}   (macOS: a launchd LaunchAgent; adds plist, changed, loaded, note)',
   ].join('\n'),
 };
 
@@ -218,6 +219,134 @@ export function findOnPath(cmd, pathEnv = process.env.PATH ?? '') {
 
 const BIN_PATH = fileURLToPath(new URL('../bin/pipeline.mjs', import.meta.url));
 
+// ---- macOS: one per-user LaunchAgent per repository. launchd runs a StartCalendarInterval job missed while the Mac slept
+// when it wakes, which cron never does. The label is the cron marker's lock name under a reverse-DNS prefix. -------------
+
+export const scheduleLabel = (lockName) => `com.claude-pipeline.${lockName}`;
+
+const xmlEscape = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+const LAUNCHD_PATH = ['/usr/bin', '/bin', '/usr/sbin', '/sbin']; // lsof is /usr/sbin/lsof
+
+// The LaunchAgent plist, generated deterministically so an unchanged install leaves the file alone. launchd's own PATH is
+// minimal, so the job gets the directories of node, git and gh as found at install time.
+export function schedulePlist({ nodePath, binPath, root, at, label, pathDirs, logFile }) {
+  const m = AT_RE.exec(at ?? '');
+  if (!m) throw new UsageError(`--at must be HH:MM (00-23:00-59), got ${JSON.stringify(at)}`);
+  const all = [nodePath, binPath, root, logFile, label, ...pathDirs];
+  if (all.some((p) => /[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(p))) throw new UsageError('schedule: a path contains a control character, which a plist cannot hold');
+  const str = (v, pad) => `${pad}<string>${xmlEscape(v)}</string>`;
+  const searchPath = [...new Set([...pathDirs, ...LAUNCHD_PATH])].join(':');
+  return [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+    '<plist version="1.0">',
+    '<dict>',
+    '  <key>Label</key>',
+    str(label, '  '),
+    '  <key>ProgramArguments</key>',
+    '  <array>',
+    ...[nodePath, binPath, 'worktrees', 'prune', '--notify', '--summary-only'].map((a) => str(a, '    ')),
+    '  </array>',
+    '  <key>WorkingDirectory</key>',
+    str(root, '  '),
+    '  <key>EnvironmentVariables</key>',
+    '  <dict>',
+    '    <key>PATH</key>',
+    str(searchPath, '    '),
+    '  </dict>',
+    '  <key>StartCalendarInterval</key>',
+    '  <dict>',
+    '    <key>Hour</key>',
+    `    <integer>${Number(m[1])}</integer>`,
+    '    <key>Minute</key>',
+    `    <integer>${Number(m[2])}</integer>`,
+    '  </dict>',
+    '  <key>StandardOutPath</key>',
+    str(logFile, '  '),
+    '  <key>StandardErrorPath</key>',
+    str(logFile, '  '),
+    '  <key>RunAtLoad</key>',
+    '  <false/>',
+    '</dict>',
+    '</plist>',
+    '',
+  ].join('\n');
+}
+
+// The Mac's zone is the /etc/localtime link (systemsetup needs root; there is no timedatectl or /etc/timezone).
+const DARWIN_TZ_SOURCES = [REAL_SOURCES[1]];
+
+// launchctl through the same runner as crontab; code/stdout/stderr come back as-is. By absolute path (like /usr/sbin/lsof in
+// worktree-prune/inspect.mjs), so a PATH without /bin cannot make it "not found"; lib/proc.mjs turns a spawn failure into a
+// non-zero code with stderr "spawn <cmd> ENOENT", which absentJob() below refuses to read as "unloaded".
+const LAUNCHCTL = '/bin/launchctl';
+const systemLaunchctl = (args) => runProc(LAUNCHCTL, args);
+
+// `launchctl print` CONFIRMS a job is not loaded only by exit 113 or by saying "Could not find service". Any other non-zero
+// (launchctl missing, a permission or domain error) tells nothing about the job, so it is never read as "unloaded".
+const absentJob = (r) => r.code === 113 || /could not find service/i.test(`${r.stderr ?? ''}\n${r.stdout ?? ''}`);
+const why = (r) => r.stderr?.trim() || `exit ${r.code}`;
+
+// Install / remove / report the LaunchAgent. bootout and the `print` probe may fail for a job that is not loaded, so on install
+// their results are only read, never thrown (a failing bootstrap is the launchctl error that stops it, and it fails too when
+// the old job is still loaded). Remove cannot take that shortcut: it asks `print` whether the job is really gone and refuses
+// to delete the plist, or report success, unless `print` CONFIRMS the job is absent (absentJob). `--status` keeps loaded as
+// "print exited 0"; an unexplained print failure adds a `warning` instead of staying silent.
+export function applyLaunchd({ action, plist, plistPath, label, launchctlFn, tzFn, uid }) {
+  const domain = `gui/${uid}`;
+  const target = `${domain}/${label}`;
+  const bootout = () => launchctlFn(['bootout', target]);
+  if (action === 'status') {
+    const exists = existsSync(plistPath);
+    const probe = launchctlFn(['print', target]);
+    const loaded = probe.code === 0;
+    const out = { installed: exists && loaded, line: exists ? plistPath : null, plist: plistPath, loaded };
+    if (!loaded && !absentJob(probe)) out.warning = `could not tell whether ${label} is loaded: ${why(probe)}`;
+    return out;
+  }
+  if (action === 'remove') {
+    const out = bootout();
+    const probe = launchctlFn(['print', target]);
+    if (probe.code === 0) {
+      throw new Fail(EXIT.USAGE, { ok: false, error: 'launchctl', message: `could not unload ${label}: ${why(out)}` });
+    }
+    if (!absentJob(probe)) {
+      throw new Fail(EXIT.USAGE, { ok: false, error: 'launchctl', message: `could not confirm ${label} is unloaded: ${why(probe)}` });
+    }
+    const had = existsSync(plistPath);
+    if (had) rmSync(plistPath);
+    return { removed: had };
+  }
+  let before = null;
+  try { before = readFileSync(plistPath, 'utf8'); } catch { /* no plist yet */ }
+  const changed = before !== plist;
+  if (changed) {
+    mkdirSync(path.dirname(plistPath), { recursive: true });
+    writeFileSync(plistPath, plist);
+  }
+  // Always reload, even when the file is unchanged: that also repairs a job that is not loaded (after a remove by hand).
+  bootout();
+  const r = launchctlFn(['bootstrap', domain, plistPath]);
+  if (r.code !== 0) throw new Fail(EXIT.USAGE, { ok: false, error: 'launchctl', message: `cannot load the LaunchAgent: ${r.stderr.trim() || `exit ${r.code}`}` });
+  const timezone = tzFn();
+  const when = (() => {
+    const m = /<key>Hour<\/key>\s*<integer>(\d+)<\/integer>\s*<key>Minute<\/key>\s*<integer>(\d+)<\/integer>/.exec(plist);
+    return m ? `${m[1].padStart(2, '0')}:${m[2].padStart(2, '0')}` : 'the time';
+  })();
+  const result = { installed: true, line: plistPath, plist: plistPath, changed, timezone, note: 'launchd runs a missed run when the Mac wakes' };
+  if (timezone === null) result.warning = `could not tell which time zone launchd runs in — ${when} is local time, not necessarily Asia/Manila`;
+  else if (timezone !== 'Asia/Manila') result.warning = `launchd runs in ${timezone}, not Asia/Manila — ${when} is local time in that zone`;
+  return result;
+}
+
+// git and gh must be found on PATH at install time (the job's own PATH is minimal); null when both are found.
+function missingTool(which, why) {
+  for (const cmd of ['git', 'gh']) {
+    if (!which(cmd)) return { exitCode: EXIT.USAGE, output: { ok: false, error: 'tool-missing', message: `cannot install the schedule: ${cmd} was not found on PATH (${why}, so the job needs to know where it is)` } };
+  }
+  return null;
+}
+
 async function schedule(rest, ctx) {
   const { values, positionals } = parseCommandArgs(rest, {
     repo: { type: 'string' }, install: { type: 'boolean' }, remove: { type: 'boolean' }, status: { type: 'boolean' }, at: { type: 'string' },
@@ -229,32 +358,42 @@ async function schedule(rest, ctx) {
   if (values.at !== undefined && action !== 'install') throw new UsageError('worktrees schedule: --at only goes with --install');
   const at = values.at ?? DEFAULT_AT;
   if (!AT_RE.test(at)) throw new UsageError(`--at must be HH:MM (00-23:00-59), got ${JSON.stringify(at)}`);
-  if ((ctx?.platform ?? process.platform) !== 'linux') {
-    return { exitCode: EXIT.USAGE, output: { ok: false, error: 'unsupported-platform', message: 'schedule is only supported on Linux (cron) in this version' } };
+  const platform = ctx?.platform ?? process.platform;
+  if (platform !== 'linux' && platform !== 'darwin') {
+    return { exitCode: EXIT.USAGE, output: { ok: false, error: 'unsupported-platform', message: 'schedule is only supported on Linux (cron) and macOS (launchd)' } };
   }
+  const darwin = platform === 'darwin';
   const repo = await loadRepo(values, ctx);
   const lockName = lockNameFor(repo.commonDir);
   const marker = scheduleMarker(lockName);
+  const label = scheduleLabel(lockName);
   let line;
+  let plist;
   if (action === 'install') {
     const which = ctx?.whichFn ?? ((cmd) => findOnPath(cmd, (ctx?.env ?? process.env).PATH));
     const nodePath = ctx?.nodePath ?? process.execPath;
-    const tools = {};
-    for (const cmd of ['git', 'gh']) {
-      tools[cmd] = which(cmd);
-      if (!tools[cmd]) {
-        return { exitCode: EXIT.USAGE, output: { ok: false, error: 'tool-missing', message: `cannot install the schedule: ${cmd} was not found on PATH (cron's own PATH is only /usr/bin:/bin, so the job needs to know where it is)` } };
-      }
-    }
+    const missing = missingTool(which, darwin ? "launchd's own PATH is minimal" : "cron's own PATH is only /usr/bin:/bin");
+    if (missing) return missing;
     const logDir = pruneLogDir(ctx?.env ?? process.env);
     mkdirSync(logDir, { recursive: true });
-    line = scheduleLine({
-      nodePath, binPath: ctx?.binPath ?? BIN_PATH, root: repo.root, at, lockName,
-      pathDirs: [...new Set([nodePath, tools.git, tools.gh].map((p) => path.dirname(p)))],
+    const args = {
+      nodePath, binPath: ctx?.binPath ?? BIN_PATH, root: repo.root, at,
+      pathDirs: [...new Set([nodePath, which('git'), which('gh')].map((p) => path.dirname(p)))],
       logFile: path.join(logDir, `cron-${lockName}.log`),
-    });
+    };
+    if (darwin) plist = schedulePlist({ ...args, label });
+    else line = scheduleLine({ ...args, lockName });
   }
-  const result = applySchedule({ action, line, marker, crontabFn: ctx?.crontabFn ?? systemCrontab, tzFn: ctx?.tzFn ?? detectTimezone });
+  let result;
+  if (darwin) {
+    const plistPath = path.join(ctx?.home ?? os.homedir(), 'Library', 'LaunchAgents', `${label}.plist`);
+    result = applyLaunchd({
+      action, plist, plistPath, label, launchctlFn: ctx?.launchctlFn ?? systemLaunchctl,
+      tzFn: ctx?.tzFn ?? (() => detectTimezone(DARWIN_TZ_SOURCES)), uid: ctx?.uid ?? process.getuid(),
+    });
+  } else {
+    result = applySchedule({ action, line, marker, crontabFn: ctx?.crontabFn ?? systemCrontab, tzFn: ctx?.tzFn ?? detectTimezone });
+  }
   return { exitCode: EXIT.OK, output: { ok: true, ...result } };
 }
 
