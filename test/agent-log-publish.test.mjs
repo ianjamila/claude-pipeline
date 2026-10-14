@@ -204,6 +204,32 @@ test('a race lost three times in a row is an error (the caller keeps its lines)'
   assert.equal(pushes, 3);
 });
 
+test('the log branch deleted on the remote: a stale cached copy does not make publish drop a line; the branch is recreated with it', () => {
+  const w = world();
+  assertExit(w.run(['publish', '--line', L1]), 0);
+  assertExit(w.run(['publish', '--line', L2]), 0); // fetches the branch, so the remote-tracking copy is cached with L1 and L2
+  const cached = `refs/remotes/origin/${BRANCH}`;
+  assert.ok(w.repo.git(['rev-parse', '--verify', '-q', cached]).trim(), 'the remote-tracking copy exists');
+  w.onOrigin('update-ref', '-d', `refs/heads/${BRANCH}`);
+
+  const r = w.run(['publish', '--line', L1]); // L1 was in the old log, which is gone
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.pushed, true, JSON.stringify(r.json));
+  assert.deepEqual(r.json.lines, [L1]);
+  assert.ok(w.logOnBranch().split('\n').includes(L1), 'the recreated branch carries the line');
+  assert.deepEqual(w.queued(), []);
+});
+
+test('the remote cannot be asked whether the log branch exists: a line only the cached copy has stays queued, never dropped', () => {
+  const w = world();
+  assertExit(w.run(['publish', '--line', L1]), 0);
+  assertExit(w.run(['publish', '--line', L2]), 0);
+  w.repo.git(['remote', 'set-url', 'origin', join(w.bare, 'does-not-exist')]);
+  const r = w.run(['publish', '--line', L1]);
+  assertExit(r, 3, r.stderr + r.stdout);
+  assert.deepEqual(w.queued(), [L1], 'the cached copy is not proof that the line is published');
+});
+
 test('a failed push (origin unreachable) exits 3 and every line stays queued, including --line', () => {
   const w = world();
   w.run(['queue', '--line', L1]);

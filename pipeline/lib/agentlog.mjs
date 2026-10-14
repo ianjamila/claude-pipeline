@@ -160,7 +160,14 @@ function fetchLogBranch(root, g) {
   try {
     g(['ls-remote', '--exit-code', '--heads', REMOTE, `refs/heads/${AGENT_LOG_BRANCH}`], root, NETWORK_TIMEOUT_MS);
   } catch (err) {
-    if (err instanceof GitError && err.code === 2) return { tip: null, exists: false };
+    if (err instanceof GitError && err.code === 2) {
+      // The remote has no log branch (deleted, or never made): a cached copy of the old one is stale and must not be read as published.
+      try {
+        g(['rev-parse', '--verify', '-q', REMOTE_LOG_REF], root); // nothing cached: nothing to delete
+        g(['update-ref', '-d', REMOTE_LOG_REF], root);
+      } catch { /* not cached, or not deletable: callers skip it by `exists` anyway */ }
+      return { tip: null, exists: false };
+    }
     throw err;
   }
   g(['fetch', '--no-tags', REMOTE, `+refs/heads/${AGENT_LOG_BRANCH}:${REMOTE_LOG_REF}`], root, NETWORK_TIMEOUT_MS);
@@ -270,12 +277,15 @@ export function publishLines({ root, logRel, lines, defaultBranch, gitFn = git }
 // queued. `fetch` refreshes both refs first (best effort, bounded): without it a publish we have not fetched yet just keeps the
 // line queued a little longer. `refreshed` is true only when every requested fetch succeeded: a readable but possibly STALE
 // cached ref has lines and refreshed false, which a caller that moves a shared checkpoint must tell apart from a fresh copy.
-// A remote with no log branch yet is not a failed fetch.
-export function originLogLines(root, { logFile, defaultBranch, fetch = false }) {
+// A remote with no log branch yet is not a failed fetch, and its cached copy (a deleted branch) is not read. When the existence check
+// itself failed (no network), the cached log branch is stale evidence: it is read only with `trustCachedBranch` (a closer reasoning
+// over what it can see), never to drop queued lines.
+export function originLogLines(root, { logFile, defaultBranch, fetch = false, trustCachedBranch = true }) {
   const o = { cwd: root };
   const g = (args, cwd = root, timeoutMs) => git(args, { cwd, ...(timeoutMs ? { timeoutMs } : {}) });
   let refreshed = false;
   let branchRefreshed = true;
+  let branchExists = true;
   try {
     if (fetch) {
       try {
@@ -283,14 +293,14 @@ export function originLogLines(root, { logFile, defaultBranch, fetch = false }) 
         refreshed = true;
       } catch { /* offline, or no origin: judge by the ref we already have */ }
       try {
-        fetchLogBranch(root, g);
+        branchExists = fetchLogBranch(root, g).exists;
       } catch { branchRefreshed = false; }
     }
     const rel = relative(root, logFile).split('\\').join('/');
     const run = (args) => git(args, o);
     const text = readRegularFile(run, `${REMOTE}/${defaultBranch}`, rel, { strictRef: true }); // origin/<default> missing = unreadable
     const lines = new Set(text === null ? [] : text.split('\n').map((l) => l.replace(/\r$/, '')));
-    const branchText = readRegularFile(run, REMOTE_LOG_REF, rel); // no log branch yet is null; a hostile or oversized file makes the whole read fail closed
+    const branchText = branchExists && (branchRefreshed || trustCachedBranch) ? readRegularFile(run, REMOTE_LOG_REF, rel) : null; // no log branch yet is null; a hostile or oversized file makes the whole read fail closed
     if (branchText !== null) for (const l of branchText.split('\n')) lines.add(l.replace(/\r$/, ''));
     return { lines, refreshed: refreshed && branchRefreshed };
   } catch {
@@ -298,8 +308,9 @@ export function originLogLines(root, { logFile, defaultBranch, fetch = false }) 
   }
 }
 
-// The lines alone: null when origin/<default>'s copy cannot be read.
-export const landedLines = (root, opts) => originLogLines(root, opts).lines;
+// The lines alone, for dropping queued entries: null when origin/<default>'s copy cannot be read. A log branch that could not be
+// checked against the remote does not count.
+export const landedLines = (root, opts) => originLogLines(root, { ...opts, trustCachedBranch: false }).lines;
 
 // Rewrite the queue without the entries that were just written (matched one-for-one, so an identical line queued
 // again meanwhile survives). Entries appended since the read are kept.
