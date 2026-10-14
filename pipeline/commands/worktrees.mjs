@@ -276,26 +276,42 @@ export function schedulePlist({ nodePath, binPath, root, at, label, pathDirs, lo
 // The Mac's zone is the /etc/localtime link (systemsetup needs root; there is no timedatectl or /etc/timezone).
 const DARWIN_TZ_SOURCES = [REAL_SOURCES[1]];
 
-// launchctl through the same runner as crontab; code/stdout/stderr come back as-is.
-const systemLaunchctl = (args) => runProc('launchctl', args);
+// launchctl through the same runner as crontab; code/stdout/stderr come back as-is. By absolute path (like /usr/sbin/lsof in
+// worktree-prune/inspect.mjs), so a PATH without /bin cannot make it "not found"; lib/proc.mjs turns a spawn failure into a
+// non-zero code with stderr "spawn <cmd> ENOENT", which absentJob() below refuses to read as "unloaded".
+const LAUNCHCTL = '/bin/launchctl';
+const systemLaunchctl = (args) => runProc(LAUNCHCTL, args);
+
+// `launchctl print` CONFIRMS a job is not loaded only by exit 113 or by saying "Could not find service". Any other non-zero
+// (launchctl missing, a permission or domain error) tells nothing about the job, so it is never read as "unloaded".
+const absentJob = (r) => r.code === 113 || /could not find service/i.test(`${r.stderr ?? ''}\n${r.stdout ?? ''}`);
+const why = (r) => r.stderr?.trim() || `exit ${r.code}`;
 
 // Install / remove / report the LaunchAgent. bootout and the `print` probe may fail for a job that is not loaded, so on install
 // their results are only read, never thrown (a failing bootstrap is the launchctl error that stops it, and it fails too when
 // the old job is still loaded). Remove cannot take that shortcut: it asks `print` whether the job is really gone and refuses
-// to delete the plist, or report success, while it is still loaded.
+// to delete the plist, or report success, unless `print` CONFIRMS the job is absent (absentJob). `--status` keeps loaded as
+// "print exited 0"; an unexplained print failure adds a `warning` instead of staying silent.
 export function applyLaunchd({ action, plist, plistPath, label, launchctlFn, tzFn, uid }) {
   const domain = `gui/${uid}`;
   const target = `${domain}/${label}`;
   const bootout = () => launchctlFn(['bootout', target]);
   if (action === 'status') {
     const exists = existsSync(plistPath);
-    const loaded = launchctlFn(['print', target]).code === 0;
-    return { installed: exists && loaded, line: exists ? plistPath : null, plist: plistPath, loaded };
+    const probe = launchctlFn(['print', target]);
+    const loaded = probe.code === 0;
+    const out = { installed: exists && loaded, line: exists ? plistPath : null, plist: plistPath, loaded };
+    if (!loaded && !absentJob(probe)) out.warning = `could not tell whether ${label} is loaded: ${why(probe)}`;
+    return out;
   }
   if (action === 'remove') {
     const out = bootout();
-    if (launchctlFn(['print', target]).code === 0) {
-      throw new Fail(EXIT.USAGE, { ok: false, error: 'launchctl', message: `could not unload ${label}: ${out.stderr?.trim() || `exit ${out.code}`}` });
+    const probe = launchctlFn(['print', target]);
+    if (probe.code === 0) {
+      throw new Fail(EXIT.USAGE, { ok: false, error: 'launchctl', message: `could not unload ${label}: ${why(out)}` });
+    }
+    if (!absentJob(probe)) {
+      throw new Fail(EXIT.USAGE, { ok: false, error: 'launchctl', message: `could not confirm ${label} is unloaded: ${why(probe)}` });
     }
     const had = existsSync(plistPath);
     if (had) rmSync(plistPath);

@@ -543,7 +543,7 @@ is still `unsupported-platform`: "schedule is only supported on Linux (cron) and
   `{error: "launchctl"}`. The result is `{ok, installed, line, plist, changed, timezone, warning?, note}` (`line` is the plist
   path); `timezone` comes from the `/etc/localtime` link, and `warning` fires when it is not `Asia/Manila` or unreadable.
 - `--remove` boots the job out, checks with `launchctl print` that it is really gone, and only then deletes the plist: `{ok, removed}`;
-  a job that is still loaded is exit 2 `{error: "launchctl", message: "could not unload <label>: …"}` and the plist stays. `--status` is `{ok, installed, line, plist, loaded}`:
+  a job that is still loaded is exit 2 `{error: "launchctl", message: "could not unload <label>: …"}` and the plist stays; so does a `print` that fails without saying the job is gone (exit 113 / "Could not find service" is the only confirmation), `message: "could not confirm <label> is unloaded: …"`. `--status` is `{ok, installed, line, plist, loaded, warning?}` (`warning` only when `print` fails unexplained):
   `installed` means the plist exists **and** launchd has it loaded; `line` is the plist path (or `null` when it is missing).
 - Check by hand: `launchctl print gui/$(id -u)/<label>`.
 

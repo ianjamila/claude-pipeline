@@ -916,6 +916,44 @@ test('schedule --remove on macOS: bootout fails and the job is still loaded -> e
   assert.equal(existsSync(w.plistPath), true);
 });
 
+test('schedule --remove on macOS: a launchctl that cannot run at all is NOT "unloaded" -> exit 2 error launchctl, the plist stays', async () => {
+  const w = darwinWorld();
+  await w.drun(['--install']);
+  const enoent = { code: 1, stderr: 'spawn launchctl ENOENT' };
+  const dead = fakeLaunchctl({ bootout: enoent, print: enoent });
+  const rm = await w.drun(['--remove'], { launchctlFn: dead.fn });
+  assert.equal(rm.exitCode, 2);
+  assert.equal(rm.output.ok, false);
+  assert.equal(rm.output.error, 'launchctl');
+  assert.equal(rm.output.message, `could not confirm ${w.label} is unloaded: spawn launchctl ENOENT`);
+  assert.equal(existsSync(w.plistPath), true);
+  const mute = await w.drun(['--remove'], { launchctlFn: fakeLaunchctl({ bootout: { code: 1 }, print: { code: 1 } }).fn });
+  assert.equal(mute.output.message, `could not confirm ${w.label} is unloaded: exit 1`, 'no stderr -> the exit code');
+  assert.equal(existsSync(w.plistPath), true);
+});
+
+test('schedule --remove on macOS: print saying "Could not find service" (exit 113, or its text in either stream) confirms the job is gone', async () => {
+  const w = darwinWorld();
+  await w.drun(['--install']);
+  const gone = fakeLaunchctl({ print: { code: 113, stderr: 'Could not find service "x" in domain for port' } });
+  const rm = await w.drun(['--remove'], { launchctlFn: gone.fn });
+  assert.deepEqual([rm.exitCode, rm.output.removed], [0, true]);
+  assert.equal(existsSync(w.plistPath), false);
+  await w.drun(['--install']);
+  const byText = await w.drun(['--remove'], { launchctlFn: fakeLaunchctl({ print: { code: 1, stdout: 'could not find service "x"' } }).fn });
+  assert.deepEqual([byText.exitCode, byText.output.removed], [0, true]);
+});
+
+test('schedule --status on macOS: loaded:false when print confirms absence; an unexplained print failure adds a warning', async () => {
+  const w = darwinWorld();
+  await w.drun(['--install']);
+  const absent = await w.drun(['--status'], { launchctlFn: fakeLaunchctl({ print: { code: 113, stderr: 'Could not find service' } }).fn });
+  assert.deepEqual([absent.output.loaded, absent.output.warning], [false, undefined]);
+  const dead = await w.drun(['--status'], { launchctlFn: fakeLaunchctl({ print: { code: 1, stderr: 'spawn launchctl ENOENT' } }).fn });
+  assert.deepEqual([dead.exitCode, dead.output.loaded, dead.output.installed], [0, false, false]);
+  assert.equal(dead.output.warning, `could not tell whether ${w.label} is loaded: spawn launchctl ENOENT`);
+});
+
 test('schedule --status on macOS: installed only when the plist exists AND launchctl print succeeds', async () => {
   const w = darwinWorld();
   const none = await w.drun(['--status']);
