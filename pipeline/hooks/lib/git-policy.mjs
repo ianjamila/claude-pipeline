@@ -674,13 +674,17 @@ function graphqlMutations(query) {
   return names;
 }
 
-function checkGraphql(body) {
+function checkGraphql(body, dir = null, ctx = null) {
   for (const q of body.queries) {
     if (/^\s*(\$\(|`|\$\{?[A-Za-z_])/.test(q)) return deny('the graphql query is built at run time, so it cannot be verified. Pass the query text directly.');
     const names = graphqlMutations(q);
     if (names === null) return deny('the graphql query contains a mutation that cannot be parsed, so it cannot be verified.');
     const bad = names.find((n) => !GRAPHQL_ALLOWED_MUTATIONS.has(n));
     if (bad) return deny(`the graphql mutation ${bad} is not on the allowed list (${[...GRAPHQL_ALLOWED_MUTATIONS].join(', ')}). ${OWNER_ONLY}`);
+    // #58: auto-merge names the PR by its node id, which says nothing about whether the owner said "merge" for it
+    if (names.includes('enablePullRequestAutoMerge') && ownerGoMode(dir, ctx) === 'chat') {
+      return deny('turning on auto-merge through the API skips the owner\'s "merge" in this repository (owner_approval: chat). Use `gh pr merge <N> --auto` after the owner said "merge", or `P merge`.');
+    }
   }
   if (body.unknown) return deny('cannot verify the graphql body (--input - / unreadable file).');
   return null;
@@ -770,8 +774,54 @@ function checkApi(rest, env, dir, ctx) {
   if (/\/git\/refs\/heads\/(main|master)$/i.test(p)) return deny(`${method} to the main/master ref is a push to main. It is blocked.`);
   if (method === 'POST' && /\/git\/refs$/i.test(p) && /refs\/heads\/(main|master)\b/i.test(haystack)) return deny('creating the main/master ref through the API is blocked.');
 
-  if (/^graphql$/i.test(ep)) return checkGraphql(body);
+  if (/^graphql$/i.test(ep)) return checkGraphql(body, dir, ctx);
   return null;
+}
+
+// ---- #58: direct merges in an owner_approval: chat repo ----------------------------------------------------------------
+// Why: P merge checks the owner's recorded "merge" (hooks/lib/owner-go.mjs) before it merges an owner item, but a plain
+// `gh pr merge`, the repo's own merge command or auto-merge through the API skipped P merge entirely (Codex design review of #58,
+// verified). In a chat repo each of them now needs the owner's "merge" naming that PR in this session. P merge runs the merge
+// command as its own child process, which the guard never sees, so low-risk PRs still merge on their own through P merge.
+// Without the owner-go wiring (tests, older callers) nothing here applies.
+function ownerGoMode(dir, ctx) {
+  if (!ctx?.ownerGo) return 'none';
+  if (dir === null) return 'chat'; // (which repository is unknown)
+  try {
+    return ctx.ownerGo.mode(dir);
+  } catch {
+    return 'chat'; // (a pipeline.yml that cannot be read)
+  }
+}
+const prNumberOf = (w) => {
+  const m = /^#?(\d{1,7})$/.exec(String(w ?? '')) ?? /\/pull\/(\d{1,7})(?:[/?#]|$)/.exec(String(w ?? ''));
+  return m ? Number(m[1]) : null;
+};
+// `elsewhere`: the command names another repository (-R, a PR URL), whose mode is unknown here: judged as a chat repo.
+function directMergeVerdict(pr, dir, ctx, what, elsewhere = false) {
+  if (!ctx?.ownerGo) return null;
+  if (!elsewhere && ownerGoMode(dir, ctx) !== 'chat') return null;
+  const where = elsewhere ? 'a merge named by -R or a PR URL (its repository may need the owner)' : 'in this repository (owner_approval: chat) a merge';
+  if (pr === null) return deny(`${what} without a literal PR number: ${where} needs the owner's "merge" for that PR. Name the PR number (\`gh pr merge 123 …\`, run from the repository), or merge through \`P merge\`.`);
+  let ok = false;
+  try {
+    ok = ctx.ownerGo.approvedPr(pr) === true;
+  } catch { /* unreadable records: not approved */ }
+  if (ok) return null;
+  return deny(`${what} #${pr}: ${where} needs the owner's "merge" for #${pr} in this session, and none is recorded. Merge through \`P merge --pr ${pr}\` (it merges a low-risk PR itself), or show the request and wait for the owner to type "merge".`);
+}
+// The repo's own merge command (pipeline.yml merge.command, e.g. `npm run merge -- {pr} …`) typed by hand. A `gh …` command is judged as gh.
+function repoMergeCommandVerdict(argv, dir, ctx) {
+  if (!ctx?.ownerGo || dir === null) return null;
+  let prefix = null;
+  try {
+    prefix = ctx.ownerGo.mergePrefix(dir);
+  } catch { /* unreadable: the mode check below fails closed for gh; this form cannot be recognised */ }
+  if (!Array.isArray(prefix) || !prefix.length || baseName(prefix[0]) === 'gh') return null;
+  const p = prefix.filter((w) => w !== '--');
+  const words = argv.map((a) => expandVars(a, ctx)).filter((w) => w !== '--');
+  if (words.length < p.length || baseName(words[0]) !== baseName(p[0]) || !p.slice(1).every((w, i) => words[i + 1] === w)) return null;
+  return directMergeVerdict(prNumberOf(words[p.length]), dir, ctx, `\`${prefix.join(' ')}\``);
 }
 
 function checkGh(argv, env, dir, ctx, raw, level = 0) {
@@ -819,7 +869,10 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
 
   if (group === 'pr' && verb === 'merge') {
     if (rest.some((t) => t === '--admin' || t.startsWith('--admin='))) return deny(`\`gh pr merge --admin\` bypasses the merge gate and is blocked. Use \`--auto\` / the pipeline merge command. ${OWNER_ONLY}`);
-    return null;
+    if (rest.includes('--disable-auto')) return null; // (turns a queued merge off)
+    const { flags, positionals } = parseOpts(rest, { longValue: ['author-email', 'body', 'body-file', 'match-head-commit', 'repo', 'subject'], shortValue: 'AbFtR' });
+    const elsewhere = flagValues(flags, ['repo'], 'R').length > 0 || /\/pull\//.test(positionals[0] ?? '');
+    return directMergeVerdict(prNumberOf(positionals[0]), dir, ctx, '`gh pr merge`', elsewhere);
   }
 
   if ((group === 'pr' || group === 'issue') && (verb === 'edit' || verb === 'create')) {
@@ -1358,6 +1411,7 @@ function evalString(str, startDir, ctx, level) {
         const v = evalString(inner, dir, ctx, level + 1);
         if (v.decision === 'deny') { verdict = v; break; }
       }
+      if (!verdict) verdict = repoMergeCommandVerdict(argv, dir, ctx); // (#58)
       if (!verdict) {
         // a string or program text the parser cannot unwrap (node -e, osascript, make CMD=...) that carries a guarded command
         const why = catchAllReason(argv);
@@ -1433,12 +1487,13 @@ export function evaluateGitCommand(command, {
   readDir = defaultReadDir,
   now = Date.now, // injectable clock (tests)
   env = {}, // the hook process's environment (BASH_ENV / ENV / ZDOTDIR name startup files the shells run); {} keeps tests hermetic
+  ownerGo = null, // #58: { mode(dir), mergePrefix(dir), approvedPr(pr) } (git-wiring.mjs ownerGoWiring); null = no direct-merge check
 } = {}) {
   const text = typeof command === 'string' ? command : String(command ?? '');
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   const base = cwd || process.cwd();
   const ctx = {
-    cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, readDir, readHead, env, budget: newEvalBudget(now), fullText: text, lineAssigned: assigningDefaults(typeof text === 'string' ? text : ''),
+    cwd: base, home, currentBranch, pushDestination, issueLabels, ownerGo, readText, pathExists, readDir, readHead, env, budget: newEvalBudget(now), fullText: text, lineAssigned: assigningDefaults(typeof text === 'string' ? text : ''),
     vars: Object.create(null), unsureVars: new Set(), tainted: new Set(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
     branches: new Map(), cfgDirty: false, envCfgDirty: false,
   };

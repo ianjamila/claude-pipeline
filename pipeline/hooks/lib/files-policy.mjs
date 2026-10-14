@@ -39,12 +39,14 @@ const PROTECTED_REL = [
   '.claude/agents/arbiter.md',
   '.claude/pipeline',
   '.claude/settings.json',
+  // #58: the owner's recorded chat "merge" (hooks/lib/owner-go.mjs): only the owner-go hook writes it, P merge and the guard read it
+  '.claude/pipeline-state/owner-go',
 ];
 
 // The directories that hold them. Writing INTO them is fine (history, projects, CLAUDE.md, other skills), but
 // replacing, deleting, moving or running a repo command in them reaches the protected files, so for a
 // non-read-only command a word that IS one of these (exactly, not a child) counts as a protected reference.
-const ANCESTOR_REL = ['.claude', '.claude/skills', '.claude/agents'];
+const ANCESTOR_REL = ['.claude', '.claude/skills', '.claude/agents', '.claude/pipeline-state'];
 
 const DEVICE_PREFIX = /^\/\/[?.]\/(?=[A-Za-z]:\/)/; // \\?\C:\ and \\.\C:\ forms
 
@@ -243,7 +245,10 @@ function lexicalTarget(target, ctx) {
   return s.length > 1 && s.endsWith('/') ? s.slice(0, -1) : s;
 }
 
-const PROTECTED_MSG = 'skills, agents, ~/.claude/pipeline and ~/.claude/settings.json can only be changed by the owner with PIPELINE_ADMIN=1';
+// #58: the owner-go recorder (installed in ~/.claude/pipeline/hooks, or a source checkout's pipeline/hooks) and its library.
+const OWNER_GO_RECORDER = /(?:^|\/)hooks\/(?:lib\/)?owner-go\.mjs$/i;
+
+const PROTECTED_MSG = 'skills, agents, ~/.claude/pipeline, ~/.claude/settings.json and the owner-go records (~/.claude/pipeline-state/owner-go) can only be changed by the owner with PIPELINE_ADMIN=1';
 
 // MCP servers (a filesystem server, any other server's write tools, a browser or IDE that runs code) reach the
 // same files without Edit/Write. Their tool_input has no fixed shape, so values are picked out by key name.
@@ -672,10 +677,12 @@ function gitReadOnly(args) {
   return !args.slice(i + 1).some((a) => a === '--output' || a.startsWith('--output=') || a === '--ext-diff');
 }
 
+// (not the owner-go recorder: run by hand with made-up input it would write an owner "merge" -- Codex design review of #58)
 function isPipelineTool(arg, ctx) {
   if (typeof arg !== 'string') return false;
   const e = expandRefs(arg, ctx);
   if (!isAbs(e)) return false;
+  if (OWNER_GO_RECORDER.test(e)) return false;
   return samePath(e, `${ctx.homePosix}/.claude/pipeline/bin/pipeline.mjs`, ctx.platform)
     || isInside(e, `${ctx.homePosix}/.claude/pipeline/hooks`, ctx.platform);
 }
@@ -684,6 +691,7 @@ function isPipelineTool(arg, ctx) {
 function pipelineToolInRaw(raw, ctx) {
   const t = expandRefs(raw, ctx);
   const root = escapeRe(`${ctx.homePosix}/.claude/pipeline`);
+  if (/owner-go/i.test(t)) return false;
   return new RegExp(`^\\s*(?:\\S*/)?node(?:\\.exe)?\\s+["']?${root}/(?:bin/pipeline\\.mjs|hooks/[^\\s'"]*)(?:["']?\\s|["']?$)`, ctx.ci ? 'i' : '').test(t);
 }
 
@@ -1391,6 +1399,16 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
   if (tooMany) ctx.dynamic = true;
   const insideRoot = dirs.some((d) => ctx.hit(d) || ctx.hitAncestor(d)); // cwd or a `cd` target is a protected dir (or its parent): relative words and bare commands reach it
   const protectedInRaw = m.rawHit(scanRaw, dirs);
+
+  // #58: running the owner-go recorder (any copy) by hand would write an owner "merge" the owner never typed. Only Claude Code runs it,
+  // on the owner's prompt. Reading, diffing or committing the file stays allowed: only a runtime (or the file run by path) is refused.
+  for (const c of cmds) {
+    if (!c.argv.length) continue;
+    const runs = RUNTIMES.has(baseOf(c.argv[0])) || OWNER_GO_RECORDER.test(toPosix(c.argv[0]));
+    if (runs && c.argv.some((w) => /owner-go\.mjs/i.test(toPosix(expandRefs(w, ctx))))) {
+      return deny('the owner-go recorder records the owner\'s chat "merge"; only Claude Code runs it, on a prompt the owner types (PIPELINE_ADMIN=1 for the owner)');
+    }
+  }
 
   // Output redirections write wherever they point, whatever the command: resolve every target (against the cwd and
   // every cd target, with ~ and variables expanded) and deny on a protected one. A symlink already pointing into

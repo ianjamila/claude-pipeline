@@ -2,7 +2,11 @@
 // on, where a bare `git push` would go, and which labels an issue carries. The guard-git hook and `pipeline job start`
 // must ask them the same way, or a command the hook denies could slip through the job runner (or the reverse), so the
 // lookups live here once. Every lookup fails toward "unknown" (null / throw), which the policy turns into a denial.
+import { existsSync, readFileSync } from 'node:fs';
+import path from 'node:path';
 import { run, gh } from '../../lib/proc.mjs';
+import { parseYaml } from '../../lib/yaml.mjs';
+import { approvedPr } from './owner-go.mjs';
 
 const LOOKUP_TIMEOUT_MS = 5000;
 const PUSH_LOOKUP_TIMEOUT_MS = 3000;
@@ -36,4 +40,38 @@ export function realGitWiring() {
   };
 
   return { currentBranch, pushDestination, issueLabels };
+}
+
+// #58: what the git policy asks before a direct merge (`gh pr merge`, the repo's merge command, auto-merge through the API):
+// the repo's owner_approval mode and merge command (its .claude/pipeline.yml, found from the command's directory up to the
+// repository root), and whether the owner said "merge" for that PR in THIS session (lib/owner-go.mjs). A pipeline.yml that
+// exists but cannot be read or parsed throws: the policy then treats the repo as owner_approval: chat (fail closed).
+export function ownerGoWiring(session, { readText = (p) => readFileSync(p, 'utf8'), exists = existsSync } = {}) {
+  const configOf = (dir) => {
+    let d = path.resolve(dir);
+    for (;;) {
+      const yml = path.join(d, '.claude', 'pipeline.yml');
+      if (exists(yml)) return parseYaml(readText(yml)) ?? {};
+      if (exists(path.join(d, '.git'))) return null;
+      const up = path.dirname(d);
+      if (up === d) return null;
+      d = up;
+    }
+  };
+  return {
+    mode: (dir) => {
+      const c = configOf(dir);
+      if (c === null) return 'none';
+      return c.owner_approval === 'chat' ? 'chat' : 'label';
+    },
+    // the words of the repo's merge command before its {pr} placeholder (null: none, or it does not start with literal words)
+    mergePrefix: (dir) => {
+      const cmd = configOf(dir)?.merge?.command;
+      if (typeof cmd !== 'string') return null;
+      const at = cmd.indexOf('{pr}');
+      const words = (at < 0 ? '' : cmd.slice(0, at)).trim().split(/\s+/).filter(Boolean);
+      return words.length && words.every((w) => /^[A-Za-z0-9_@%+=:,./-]+$/.test(w)) ? words : null;
+    },
+    approvedPr: (pr) => approvedPr({ pr, session }),
+  };
 }
