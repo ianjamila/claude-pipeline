@@ -18,6 +18,17 @@ export const UPDATE_COMMAND = 'node ~/.claude/pipeline/bin/pipeline.mjs update';
 export const TIMEOUT_LINE = 'pipeline version check incomplete (timed out)';
 
 const OWN_TERMINAL = `run \`${UPDATE_COMMAND}\` in your own terminal`;
+export const SCHEDULE_COMMAND = 'pipeline update schedule --install';
+
+// The 'main is ahead' advice. With the automatic update installed it only has to say when it lands; without, it adds how to get
+// it. (The diverged line keeps the manual instruction: the scheduled job never overwrites a diverged install.)
+export function aheadAdvice(schedule) {
+  if (schedule?.installed === true) {
+    const when = Number.isInteger(schedule.every) && schedule.every > 0 ? `within ${schedule.every} minute${schedule.every === 1 ? '' : 's'}` : 'shortly';
+    return `the automatic update installs it ${when}, or ${OWN_TERMINAL} to update now`;
+  }
+  return `${OWN_TERMINAL}, or run \`${SCHEDULE_COMMAND}\` once to make this automatic`;
+}
 const short = (sha) => String(sha ?? '').slice(0, 7);
 const isTimeout = (r) => Boolean(r && (r.timedOut || /timed out/i.test(String(r.reason ?? ''))));
 
@@ -66,6 +77,7 @@ export function installedProblems(installed) {
 //   vendoredVsInstalled: null | compare(vendoredSha, installedSha) result  ('behind' = the vendored copy is newer,
 //                                                                          'ahead' = the install is newer)
 //   vendorDrift: null | [{ file, reason }]   (only read when the install is newer than the vendored copy)
+//   schedule:   null (not looked up: only read when main is ahead) | { installed, every }   (scheduleInstalled's answer)
 //   timedOut:   true when a step was skipped or cut off by the deadline
 // }
 // Returns the lines to show, [] when everything is fine. "check incomplete (timed out)" is the line of last resort: it
@@ -96,7 +108,7 @@ export function messagesFor(facts) {
   } else if (main && main.ok) {
     const c = facts.installedVsMain;
     if (c?.status === 'ahead') {
-      lines.push(`claude-pipeline main is ahead of your install (${inst7} → ${short(main.sha)}): ${OWN_TERMINAL}`);
+      lines.push(`claude-pipeline main is ahead of your install (${inst7} → ${short(main.sha)}): ${aheadAdvice(facts.schedule)}`);
     } else if (c?.status === 'diverged') {
       lines.push(`your installed pipeline (${inst7}) and claude-pipeline main (${short(main.sha)}) have diverged, so it cannot be told which is newer: ${OWN_TERMINAL} to move to main`);
     } else if (c?.status === 'unresolved') {
@@ -245,18 +257,19 @@ export function readVendoredStamp(file, root) {
 }
 
 // Bounded by the hook's deadline; an injected dep may return a plain array (a finished drift) or { drift, timedOut }.
+const realScheduleInstalled = async (opts) => (await import('./update-schedule.mjs')).scheduleInstalled(opts);
 const realVendorDrift = async (root, { deadlineAt, now }) => (await import('../commands/vendor.mjs')).vendorDriftBounded(root, { deadlineAt, now });
 
 // Collects the facts messagesFor needs, within `deadlineMs` in total. Anything that cannot finish in time is left out and
 // flagged timedOut; any unexpected error is swallowed (a version check must never disturb a session).
 export async function gatherFacts({ home, cwd, env = process.env, now = Date.now, deadlineMs = DEADLINE_MS, deps = {} }) {
   const d = {
-    installedIdentity, mainSha, compare, gitIn, vendorDrift: realVendorDrift,
+    installedIdentity, mainSha, compare, gitIn, vendorDrift: realVendorDrift, scheduleInstalled: realScheduleInstalled,
     readFile: readVendoredStamp, cache: createCache(cacheDirFor(env), now), ...deps,
   };
   const end = now() + deadlineMs;
   const left = () => end - now();
-  const facts = { installed: null, repo: null, main: null, installedVsMain: null, vendoredVsInstalled: null, vendorDrift: null, timedOut: false };
+  const facts = { installed: null, repo: null, main: null, installedVsMain: null, vendoredVsInstalled: null, vendorDrift: null, schedule: null, timedOut: false };
   const cut = (r) => { if (r && r.status === 'unresolved' && left() <= 0) r.timedOut = true; return r; };
   try {
     try { facts.installed = d.installedIdentity(home); } catch { facts.error = true; return facts; }
@@ -297,6 +310,11 @@ export async function gatherFacts({ home, cwd, env = process.env, now = Date.now
       return r;
     };
     if (facts.main?.ok) facts.installedVsMain = relate(inst.sourceSha, facts.main.sha);
+
+    // Only the 'ahead' advice depends on it: one crontab read / file read, inside the same deadline. A failure is 'not installed'.
+    if (facts.installedVsMain?.status === 'ahead' && left() > 0) {
+      try { facts.schedule = await d.scheduleInstalled({ timeoutMs: Math.max(1, left()) }); } catch { facts.schedule = null; }
+    }
 
     // The vendored copy against the install - only when its stamp names a commit it can be compared by.
     const vendored = facts.repo?.vendoredStamp != null ? parseStamp(facts.repo.vendoredStamp) : null;

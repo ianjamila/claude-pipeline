@@ -18,7 +18,7 @@ import { TMP_ROOT_REL } from './pipeline/lib/private-tmp.mjs';
 import * as I from './pipeline/lib/installer.mjs';
 import { hasClaudeCodeAncestor } from './pipeline/lib/claude-ancestry.mjs';
 import { tryAcquire, release } from './pipeline/lib/locks.mjs';
-import { fileProvenance } from './pipeline/lib/identity.mjs';
+import { fileProvenance, installedIdentity, isClean } from './pipeline/lib/identity.mjs';
 
 class InstallError extends Error {
   constructor(message, exitCode = 1) {
@@ -465,6 +465,20 @@ function prune(dirs) {
   }
 }
 
+// ---- --expect-installed ------------------------------------------------------------------------------------------
+
+// `pipeline update --scheduled` decides to install onto a clean install of one commit, then downloads for minutes. This is its re-check,
+// made with the write lock held and before anything is written (a check outside the lock leaves a window): same identity rules as update.mjs.
+// null when the install is still the clean `sha`; otherwise a plain-language reason.
+const EXIT_INSTALL_CHANGED = 3;
+function installChanged(home, sha) {
+  const id = installedIdentity(home);
+  if (!id) return 'nothing is installed there any more';
+  if (id.sourceSha !== sha) return `the installed commit is ${id.sourceSha ? id.sourceSha.slice(0, 7) : 'unknown'}, not the ${String(sha).slice(0, 7)} the update was planned for`;
+  if (!isClean(id)) return `the installed copy ${id.stamp} was modified since the update was planned`;
+  return null;
+}
+
 // ---- main --------------------------------------------------------------------------------------------------
 
 function main(argv, env) {
@@ -492,6 +506,12 @@ function main(argv, env) {
     if (!opts.check) {
       created = env.PIPELINE_LOCK_DIR ? [] : willCreate(home);
       lock = takeWriteLock(home, env);
+      const changed = opts.expectInstalled ? installChanged(home, opts.expectInstalled) : null;
+      if (changed) {
+        process.stderr.write(`install.mjs: install-changed: ${changed}\n`);
+        if (opts.json) process.stdout.write(`${JSON.stringify({ ok: false, error: 'install-changed', message: changed }, null, 2)}\n`);
+        return EXIT_INSTALL_CHANGED;
+      }
     }
     const report = opts.check ? doCheck(ctx) : opts.uninstall ? doUninstall(ctx) : doInstall(ctx);
     process.stdout.write(opts.json ? `${JSON.stringify(report, null, 2)}\n` : formatReport(report));

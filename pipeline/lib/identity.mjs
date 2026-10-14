@@ -141,6 +141,9 @@ export function installedIdentity(home) {
   };
 }
 
+// A pristine install of one known commit: complete, built from a clean checkout, nothing modified, missing, added or unreadable.
+export const isClean = (id) => Boolean(id && id.complete && !id.sourceDirty && id.modified.length === 0 && id.missing.length === 0 && (id.extra?.length ?? 0) === 0 && (id.scanError?.length ?? 0) === 0);
+
 // ---- a checkout ------------------------------------------------------------------------------------------------
 
 // Identity of the git checkout at `root` for the given absolute file paths (the files the stamp is vouching for).

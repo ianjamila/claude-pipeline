@@ -125,7 +125,7 @@ Three things tell you where an install stands:
   | Message | What to do |
   |---|---|
   | `installed pipeline is modified / incomplete / unverified (…)` or `has no readable INSTALLED.json` | run `update` in your own terminal |
-  | `claude-pipeline main is ahead of your install (abc1234 → def5678)` | run `update` |
+  | `claude-pipeline main is ahead of your install (abc1234 → def5678)` | run `update`. When no automatic update is set up the message also names `pipeline update schedule --install`; with one, it says the update lands within N minutes and still offers the manual `update` now |
   | `… have diverged, so it cannot be told which is newer` | `update` moves you to `main` |
   | `WARNING: this repo's scripts/pipeline (…) is NEWER than your installed pipeline` | the repo's CI rules are newer than your local CLI, so local checks may pass what CI rejects: `update` before relying on it |
   | `this repo's scripts/pipeline is out of date … a pipeline vendor PR is owed` | run `pipeline vendor` in that repo and open the PR - or say "open the vendor PR": the message ends with that offer, and Claude (told so in its own context only) checks for an already-open vendor PR first, then runs `ship` on a new `agent/` branch; it never vendors without your yes |
@@ -136,6 +136,22 @@ Three things tell you where an install stands:
   The hook always exits 0 and is never started through the fail-closed loader: a failing version
   check cannot block a session.
 - **`pipeline update --check`** gives the same comparison on demand, with exit codes (see above).
+
+### Automatic updates
+
+Run this once per machine, from your own terminal (it refuses inside Claude Code, because it arranges for the guard hooks to be replaced unattended):
+
+```sh
+node ~/.claude/pipeline/bin/pipeline.mjs update schedule --install
+```
+
+It sets up a recurring job (cron on Linux/WSL, a LaunchAgent on macOS) that runs `pipeline update --scheduled`.
+
+- **Every 15 minutes** by default; `--every 5|10|15|20|30|60` changes it.
+- It installs only when `main` has moved. It never overwrites a hand-edited install and never downgrades a diverged or newer one; those wait for you.
+- It pushes your phone only on failure, once per `main` commit (a brief network or lock hiccup waits for a few failed runs first).
+- Output goes to `~/.local/state/pipeline/auto-update.log` (or under `$PIPELINE_PRUNE_LOG_DIR`).
+- `pipeline update schedule --status` shows whether it is installed; `--remove` takes it away. Both work anywhere.
 
 ## Using it
 

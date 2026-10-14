@@ -894,3 +894,54 @@ test('the suggested manual command quotes the home so sh (and PowerShell) read i
   }
   assert.equal(psQuote("C:\\Users\\Jane O'Doe\\.claude"), "'C:\\Users\\Jane O''Doe\\.claude'");
 });
+
+// ---- --scheduled re-checks the install before and while installing (R1-B1) ------------------------------------------------
+
+// `relate` runs after the scheduled run decided "clean and ahead" and before it downloads, so changing the home inside it is the
+// owner editing a file (or installing by hand) during the download. The real performUpdate and the real installer then run.
+async function scheduledOver(home, { beforeInstall } = {}) {
+  const { sha } = remote();
+  const state = scratch('cp-upd-state');
+  const pushes = [];
+  const r = await update(['--scheduled', '--json', '--claude-home', home], {
+    env: envFor(null, { PIPELINE_PRUNE_LOG_DIR: state }),
+    hasClaudeCodeAncestor: () => false,
+    auto: {
+      mainSha: () => ({ ok: true, sha, via: 'gh' }),
+      relate: () => { beforeInstall?.(); return { status: 'ahead' }; },
+      notify: async (ev) => { pushes.push(ev); return { sent: true }; },
+    },
+  });
+  return { r, pushes, sha };
+}
+
+test('scheduled: an install that is still the clean commit it saw is updated, and the installer accepted --expect-installed', async () => {
+  const home = await updatedHome();
+  const { r, pushes, sha } = await scheduledOver(home);
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.equal(r.output.action, 'updated');
+  assert.equal(readManifest(home).sourceSha, sha);
+  assert.equal(pushes.length, 0);
+});
+
+test('scheduled: a file edited during the download is not overwritten - skipped as modified, exit 0, one push', async () => {
+  const home = await updatedHome();
+  const file = join(home, 'pipeline', 'bin', 'pipeline.mjs');
+  const { r, pushes } = await scheduledOver(home, { beforeInstall: () => writeFileSync(file, '// owner edit\n', { flag: 'a' }) });
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.deepEqual([r.output.action, r.output.reason], ['skipped', 'modified']);
+  assert.match(readFileSync(file, 'utf8'), /owner edit/, 'the edit survived');
+  assert.equal(pushes.length, 1);
+  assert.equal(pushes[0].title, 'Pipeline auto-update paused');
+});
+
+test('scheduled: a different version installed during the download is not replaced - skipped as modified', async () => {
+  const home = await updatedHome();
+  const manifestFile = join(home, 'pipeline', 'INSTALLED.json');
+  const other = JSON.parse(readFileSync(manifestFile, 'utf8'));
+  other.sourceSha = 'e'.repeat(40);
+  const { r } = await scheduledOver(home, { beforeInstall: () => writeFileSync(manifestFile, `${JSON.stringify(other)}\n`) });
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.deepEqual([r.output.action, r.output.reason], ['skipped', 'modified']);
+  assert.equal(JSON.parse(readFileSync(manifestFile, 'utf8')).sourceSha, 'e'.repeat(40), 'nothing was written');
+});

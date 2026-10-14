@@ -8,13 +8,15 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { EXIT, parseCommandArgs } from '../lib/cli.mjs';
-import { hasClaudeCodeAncestor } from '../lib/claude-ancestry.mjs';
-import { installedIdentity } from '../lib/identity.mjs';
+import { EXIT, UsageError, parseCommandArgs } from '../lib/cli.mjs';
+import { installedIdentity, isClean as clean } from '../lib/identity.mjs';
 import { readManifest } from '../lib/installer.mjs';
 import { expandHome } from '../lib/paths.mjs';
 import { run as runProcess } from '../lib/proc.mjs';
 import { makePrivateTmpDir } from '../lib/private-tmp.mjs';
+import { insideClaudeCode, markNotified, ownerEvent, planPush, readState, stateFile, writeState } from '../lib/auto-update.mjs';
+import { notifyEvent } from '../lib/notify.mjs';
+import { runSchedule } from '../lib/update-schedule.mjs';
 import { compare, fetchRemote, isolatedGit, mainSha, makeIsoDir, removeTree } from '../lib/upstream.mjs';
 
 export const meta = {
@@ -28,6 +30,14 @@ export const meta = {
     '                     the install is complete, unmodified and identical to main (allowed inside Claude Code)',
     '  --json             no progress text on stderr (the result is always one JSON object on stdout)',
     '  Refuses inside Claude Code (run it in your own terminal) unless --check or PIPELINE_ADMIN=1.',
+    'pipeline update --scheduled [--claude-home DIR] [--json]',
+    '  What the unattended auto-update job runs: install main when the install is behind it, do nothing when current, never touch a',
+    '  modified install or downgrade one (skipped); push the owner only on failure or a pause, once per main sha. One compact JSON line',
+    '  per run, and nothing at all on a run that found nothing to do (so the job log only grows on real events).',
+    'pipeline update schedule (--install [--every N] | --remove | --status)',
+    '  The recurring auto-update job: cron on Linux/WSL, a LaunchAgent on macOS; it runs `update --scheduled --json` of the installed',
+    '  pipeline. --every N  minutes between runs: 5, 10, 15, 20, 30 or 60 (default 15). --install refuses inside Claude Code',
+    '  (it arranges for the guard hooks to be replaced unattended); --status and --remove are allowed anywhere.',
   ].join('\n'),
 };
 
@@ -58,8 +68,6 @@ function relate(id, main, env) {
   if (!id.sourceSha) return { status: 'unresolved', reason: 'the installed copy records no source commit' };
   return compare(id.sourceSha, main.sha, { timeoutMs: NETWORK_TIMEOUT_MS, env });
 }
-
-const clean = (id) => Boolean(id && id.complete && !id.sourceDirty && id.modified.length === 0 && id.missing.length === 0 && (id.extra?.length ?? 0) === 0 && (id.scanError?.length ?? 0) === 0);
 
 // Fetches exactly `sha` into <tmp>/src with an isolated git (its private config/hooks directory is `isoDir`) and checks it out detached. Returns the source directory;
 // throws an Error with a plain-language message when any step fails or the checked-out HEAD is not `sha`.
@@ -109,18 +117,19 @@ function runInstaller(src, args, env) {
 }
 
 export async function run(argv, ctx = {}) {
+  if (argv[0] === 'schedule') return runSchedule(argv.slice(1), ctx);
   const env = ctx.env ?? process.env;
   const { values } = parseCommandArgs(argv, {
     'claude-home': { type: 'string' },
     check: { type: 'boolean' },
+    scheduled: { type: 'boolean' },
     json: { type: 'boolean' },
   }, { allowPositionals: false });
+  if (values.scheduled && values.check) throw new UsageError('--scheduled and --check cannot be combined');
   const say = (line) => { if (!values.json) process.stderr.write(`${line}\n`); };
 
-  if (!values.check && env.PIPELINE_ADMIN !== '1') {
-    const inside = env.CLAUDECODE === '1'
-      ? 'CLAUDECODE=1'
-      : (ctx.hasClaudeCodeAncestor ?? hasClaudeCodeAncestor)() ? 'a Claude Code process is an ancestor of this one' : null;
+  if (!values.check) {
+    const inside = insideClaudeCode(env, ctx);
     if (inside) {
       const message = `pipeline update refuses to run inside a Claude Code session (${inside}): an update replaces the guard hooks. Run it in your own terminal (\`node ~/.claude/pipeline/bin/pipeline.mjs update\`); \`--check\` is allowed anywhere.`;
       say(message);
@@ -129,6 +138,7 @@ export async function run(argv, ctx = {}) {
   }
 
   const home = path.resolve(expandHome(values['claude-home'] || path.join(os.homedir(), '.claude')));
+  if (values.scheduled) return scheduledRun({ home, env, ctx, say });
   const main = mainSha({ timeoutMs: NETWORK_TIMEOUT_MS, env, home });
   const before = installedIdentity(home);
 
@@ -152,6 +162,14 @@ export async function run(argv, ctx = {}) {
     };
   }
 
+  return performUpdate({ home, main, before, relation, env, say });
+}
+
+// The install itself: fetch exactly main's commit, run its installer, prove the result. Shared by `update` and `update --scheduled`.
+// `expectInstalled` (the scheduled run only): the sha of the clean install the caller decided to replace. The download takes minutes,
+// so the install can change meanwhile (an owner edit, a newer manual install); it is re-checked just before the installer starts
+// and again by the installer itself under its write lock (--expect-installed), and a change ends in `install-changed`, nothing written.
+async function performUpdate({ home, main, before, relation, env, say, expectInstalled = null }) {
   // The installer's guard-file choice survives an update: a copy installed with --skip-file-guard stays that way.
   const manifest = readManifest(home).manifest;
   const flags = manifest?.hooks?.guardFiles === false ? ['--skip-file-guard'] : [];
@@ -192,10 +210,17 @@ export async function run(argv, ctx = {}) {
       const windows = `.\\install.ps1 --claude-home ${psQuote(home)}${rest}`;
       return fail('installer-too-old', `upstream main ${sha7(main.sha)} has an older installer that cannot install from the folder this command downloads into, so nothing was changed. Update from a clone of that version instead: run \`${posix}\` in it (on Windows: \`${windows}\`).`);
     }
+    if (expectInstalled) {
+      const now = installedIdentity(home);
+      if (!now || !clean(now) || now.sourceSha !== expectInstalled) {
+        return fail('install-changed', `the installed copy changed while the update was downloading (now ${now?.stamp ?? 'nothing'}), so it was left alone`);
+      }
+    }
     say(`installing into ${home} ...`);
     const common = ['--claude-home', home, '--source', src, '--json', ...flags];
-    const install = runInstaller(src, common, env);
+    const install = runInstaller(src, [...common, ...(expectInstalled ? ['--expect-installed', expectInstalled] : [])], env);
     result.install = { ok: install.ok, exitCode: install.code, error: install.json?.error ?? null };
+    if (install.json?.error === 'install-changed') return fail('install-changed', install.json.message || 'the installed copy changed while the update was downloading, so it was left alone');
     if (!install.ok) return fail('install-failed', install.json?.error || install.stderr || `install.mjs exited ${install.code}`, { stderr: install.stderr });
     const check = runInstaller(src, ['--check', ...common], env);
     result.check = { ok: check.ok, exitCode: check.code, drift: check.json?.drift ?? [] };
@@ -216,5 +241,71 @@ export async function run(argv, ctx = {}) {
   } finally {
     if (isoDir) removeTree(isoDir);
     if (tmp) removeTree(tmp);
+  }
+}
+
+// ---- --scheduled: the unattended run (cron / launchd). Quiet and safe: it installs main only onto a clean install that is
+// behind it, and tells the owner only about a failure or a pause (lib/auto-update.mjs decides "once"). One compact JSON line
+// per run, which the job appends to its log. Every step is injectable through ctx.auto (tests never fetch or install).
+const LOCK_BUSY = /another install is running|install lock/i;
+
+async function scheduledRun({ home, env, ctx, say }) {
+  const auto = { mainSha, installedIdentity, relate, performUpdate, notify: notifyEvent, now: () => new Date(), stateFile: stateFile(env), ...(ctx.auto ?? {}) };
+  // `silent`: print nothing (the job appends stdout to its log, so a run with nothing to do must not grow it).
+  const done = (exitCode, o, silent = false) => ({ exitCode, compact: true, ...(silent ? { silent: true } : {}), output: { mode: 'scheduled', home, ...o } });
+  // Persist the dedupe state, push once if this run owes the owner one, and only then call the push delivered.
+  const finish = async (exitCode, o, problem, { silent = false } = {}) => {
+    const plan = planPush(readState(auto.stateFile), problem, { nowIso: auto.now().toISOString() });
+    writeState(auto.stateFile, plan.state);
+    const output = { ...o };
+    if (plan.push) {
+      let res;
+      try {
+        res = await auto.notify(ownerEvent(problem, plan.push), { cwd: home, env, ...(ctx.notifyDeps ?? {}) });
+      } catch (err) {
+        res = { sent: false, reason: 'error', error: String(err?.message ?? err).slice(0, 200) };
+      }
+      if (res?.sent || res?.reason === 'duplicate') writeState(auto.stateFile, markNotified(plan.state, plan.push));
+      output.notify = { sent: Boolean(res?.sent), ...(res?.reason ? { reason: res.reason } : {}) };
+    }
+    return done(exitCode, output, silent);
+  };
+  const failed = (error, message, sha, o, { transient = false, reason = error } = {}) => {
+    say(`scheduled update failed: ${message}`);
+    return finish(EXIT.FAILED, { ok: false, action: 'failed', error, message, ...o }, { reason, sha: sha ?? 'unknown', transient, message });
+  };
+
+  try {
+    const main = auto.mainSha({ timeoutMs: NETWORK_TIMEOUT_MS, env, home });
+    const before = auto.installedIdentity(home);
+    if (!main.ok) {
+      const message = `could not resolve upstream main: ${main.reason}`;
+      return await failed('upstream-unresolved', message, null, { home, installed: installedSummary(before), main: null }, { transient: true });
+    }
+    const base = { before: before?.stamp ?? null, main: { sha: main.sha, via: main.via } };
+    const skipped = (reason, why) => {
+      say(`scheduled update skipped (${reason}): ${why}`);
+      return finish(EXIT.OK, { ok: true, action: 'skipped', reason, message: why, ...base }, { reason, skipped: reason, sha: main.sha });
+    };
+    // Never overwrite what is not a pristine install of one known commit, whatever main is.
+    if (!clean(before) || !before.sourceSha) return await skipped('modified', before ? 'the installed copy is modified, incomplete or records no source commit' : 'nothing is installed there');
+    const relation = auto.relate(before, main, env);
+    if (relation.status === 'unresolved') {
+      return await failed('upstream-unresolved', `could not compare the install with main: ${relation.reason}`, main.sha, base, { transient: true });
+    }
+    if (relation.status === 'identical') return await finish(EXIT.OK, { ok: true, action: 'none', status: relation.status, ...base }, null, { silent: true });
+    if (relation.status !== 'ahead') return await skipped('downgrade', `the installed commit is ${relation.status} relative to main, and updating would replace it with an older or unrelated one`);
+
+    const r = await auto.performUpdate({ home, main, before, relation, env, say, expectInstalled: before.sourceSha });
+    if (r.exitCode === EXIT.OK) {
+      return await finish(EXIT.OK, { ok: true, action: 'updated', status: relation.status, before: r.output.before, after: r.output.after, main: r.output.main, warnings: r.output.warnings ?? [] }, null);
+    }
+    const o = r.output;
+    // The owner edited or installed during the download: the same pause as finding the install modified up front, not a failure.
+    if (o.error === 'install-changed') return await skipped('modified', o.message || 'the installed copy changed while the update was downloading');
+    const busy = o.error === 'install-failed' && LOCK_BUSY.test(`${o.message ?? ''} ${o.stderr ?? ''}`);
+    return await failed(o.error, o.message, main.sha, { ...base, status: relation.status }, busy ? { transient: true, reason: 'install-lock-busy' } : {});
+  } catch (err) {
+    return failed('check-failed', `the scheduled update crashed: ${String(err?.message ?? err).slice(0, 300)}`, null, {});
   }
 }

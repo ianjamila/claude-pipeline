@@ -17,6 +17,7 @@ import {
   DEADLINE_MS, MAIN_TTL_MS, TIMEOUT_LINE, UPDATE_COMMAND, cacheDirFor, checkSession, createCache, formatOutput, gatherFacts, installedProblems, isVendorOwedLine, messagesFor, readVendoredStamp, reasonLabel, safeStampLabel, vendorGuidance, VENDOR_OFFER, VENDOR_PR_TITLE_PREFIX,
 } from '../pipeline/lib/session-version.mjs';
 import { MANIFEST_REL, sha256File, walkFiles } from '../pipeline/lib/installer.mjs';
+import { CRON_MARKER } from '../pipeline/lib/update-schedule.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 const made = [];
@@ -33,6 +34,7 @@ const install = (extra = {}) => ({
 const facts = (over = {}) => ({ installed: install(), repo: null, main: null, installedVsMain: null, vendoredVsInstalled: null, vendorDrift: null, timedOut: false, ...over });
 const mainOk = { ok: true, sha: MAIN };
 const own = `run \`${UPDATE_COMMAND}\` in your own terminal`;
+const notScheduled = `${own}, or run \`pipeline update schedule --install\` once to make this automatic`;
 const vendored = { root: '/r', vendoredStamp: `1.4.0+${VEND.slice(0, 7)}` };
 
 // ---- the decision, one row per case ------------------------------------------------------------------------------
@@ -51,7 +53,7 @@ const CASES = [
   ['case 1: several states, and nothing else is compared', facts({ installed: install({ complete: false, modified: ['a'], stamp: 'S' }), main: mainOk, installedVsMain: { status: 'ahead' } }),
     [`installed pipeline is incomplete (a previous install did not finish) and modified (1 installed file differs from what was installed) (S): ${own}`]],
   ['case 2: main is ahead', facts({ main: mainOk, installedVsMain: { status: 'ahead' } }),
-    [`claude-pipeline main is ahead of your install (aaaaaaa → bbbbbbb): ${own}`]],
+    [`claude-pipeline main is ahead of your install (aaaaaaa → bbbbbbb): ${notScheduled}`]],
   ['case 3: the repo vendors a NEWER pipeline than the install', facts({ repo: vendored, vendoredVsInstalled: { status: 'behind' } }),
     [`WARNING: this repo's scripts/pipeline (ccccccc) is NEWER than your installed pipeline (aaaaaaa): the repo's CI rules are newer than your local CLI, so local checks may pass what CI rejects. Run \`${UPDATE_COMMAND}\` in your own terminal before relying on it`]],
   ['case 4: vendored copy is older and its content differs', facts({ repo: vendored, vendoredVsInstalled: { status: 'ahead' }, vendorDrift: [{ file: 'a', reason: 'differs' }, { file: 'b', reason: 'missing' }] }),
@@ -82,12 +84,28 @@ const CASES = [
   ['timeout reported by main: the incomplete line only', facts({ main: { ok: false, reason: 'gh api timed out', timedOut: true } }), [TIMEOUT_LINE]],
   ['timeout reported by a compare: the incomplete line only', facts({ main: mainOk, installedVsMain: { status: 'unresolved', reason: 'gh api timed out' } }), [TIMEOUT_LINE]],
   ['timeout never hides a real message', facts({ timedOut: true, main: mainOk, installedVsMain: { status: 'ahead' } }),
-    [`claude-pipeline main is ahead of your install (aaaaaaa → bbbbbbb): ${own}`]],
+    [`claude-pipeline main is ahead of your install (aaaaaaa → bbbbbbb): ${notScheduled}`]],
 ];
 
 for (const [name, input, expected] of CASES) {
   test(`messagesFor: ${name}`, () => assert.deepEqual(messagesFor(input), expected));
 }
+
+test('messagesFor: main ahead with the automatic update installed says when it lands, and still offers the manual update', () => {
+  const ahead = { main: mainOk, installedVsMain: { status: 'ahead' } };
+  assert.deepEqual(messagesFor(facts({ ...ahead, schedule: { installed: true, every: 15 } })),
+    [`claude-pipeline main is ahead of your install (aaaaaaa → bbbbbbb): the automatic update installs it within 15 minutes, or ${own} to update now`]);
+  assert.deepEqual(messagesFor(facts({ ...ahead, schedule: { installed: true, every: null } })),
+    [`claude-pipeline main is ahead of your install (aaaaaaa → bbbbbbb): the automatic update installs it shortly, or ${own} to update now`]);
+  assert.deepEqual(messagesFor(facts({ ...ahead, schedule: { installed: false, every: null } })),
+    [`claude-pipeline main is ahead of your install (aaaaaaa → bbbbbbb): ${notScheduled}`]);
+  assert.deepEqual(messagesFor(facts({ ...ahead, schedule: null })), messagesFor(facts(ahead)), 'not looked up reads as not installed');
+});
+
+test('messagesFor: diverged keeps the manual instruction even when the schedule is installed (the job never overwrites a diverged install)', () => {
+  const lines = messagesFor(facts({ main: mainOk, installedVsMain: { status: 'diverged' }, schedule: { installed: true, every: 15 } }));
+  assert.deepEqual(lines, [`your installed pipeline (aaaaaaa) and claude-pipeline main (bbbbbbb) have diverged, so it cannot be told which is newer: ${own} to move to main`]);
+});
 
 test('messagesFor: two findings are two lines, the main-ahead line first', () => {
   const lines = messagesFor(facts({ main: mainOk, installedVsMain: { status: 'ahead' }, repo: vendored, vendoredVsInstalled: { status: 'behind' } }));
@@ -145,7 +163,7 @@ test('formatOutput: the guidance never reaches systemMessage (the owner reads th
 test('formatOutput: no offer and no guidance for any other finding, or without the installed sha', () => {
   const others = [
     ['up to date', []],
-    ['main ahead', [`claude-pipeline main is ahead of your install (aaaaaaa → bbbbbbb): ${own}`]],
+    ['main ahead', [`claude-pipeline main is ahead of your install (aaaaaaa → bbbbbbb): ${notScheduled}`]],
     ['diverged', ['this repo\'s scripts/pipeline (ccccccc) and your installed pipeline (aaaaaaa) have diverged, so it cannot be told which is newer']],
     ['NEWER warning', messagesFor(facts({ repo: vendored, vendoredVsInstalled: { status: 'behind' } }))],
     ['timeout', [TIMEOUT_LINE]],
@@ -245,6 +263,7 @@ function gatherWith(over = {}, opts = {}) {
     gitIn: () => { calls.git += 1; return { code: 0, stdout: '/the/repo\n', stderr: '', timedOut: false }; },
     readFile: () => `1.4.0+${VEND.slice(0, 7)}\n`,
     vendorDrift: async () => [{ file: 'f', reason: 'differs' }],
+    scheduleInstalled: async () => ({ installed: false, every: null }),
     cache: memCache(),
     ...over,
   };
@@ -266,6 +285,25 @@ test('gatherFacts: collects installed, repo stamp, main, both compares and the v
   assert.equal(g.calls.main, 1);
   assert.equal(g.calls.compare.length, 2);
   assert.equal(again.installedVsMain.status, 'ahead');
+});
+
+test('gatherFacts: the schedule is read only when main is ahead, once, with the time left; a throwing read is just "not looked up"', async () => {
+  const seen = [];
+  const g = gatherWith({ scheduleInstalled: async (o) => { seen.push(o); return { installed: true, every: 15 }; } });
+  const f = await g.run();
+  assert.deepEqual(f.schedule, { installed: true, every: 15 });
+  assert.deepEqual(seen, [{ timeoutMs: DEADLINE_MS }]);
+  assert.match(messagesFor(f)[0], /the automatic update installs it within 15 minutes/);
+
+  seen.length = 0;
+  const same = gatherWith({ compare: (b, h) => ({ status: 'identical', baseSha: b, headSha: h }), scheduleInstalled: async (o) => { seen.push(o); return { installed: true, every: 15 }; } });
+  assert.equal((await same.run()).schedule, null);
+  assert.deepEqual(seen, [], 'nothing to say about an update when there is no update');
+
+  const boom = gatherWith({ scheduleInstalled: async () => { throw new Error('crontab exploded'); } });
+  const fb = await boom.run();
+  assert.equal(fb.schedule, null);
+  assert.equal(messagesFor(fb)[0], `claude-pipeline main is ahead of your install (aaaaaaa → bbbbbbb): ${notScheduled}`);
 });
 
 test('gatherFacts: an unresolved or timed-out answer is NOT cached', async () => {
@@ -358,6 +396,9 @@ function fakeGhBin(entries, { hang = false } = {}) {
   const target = hang ? `"${node}" -e "setTimeout(() => {}, 60000)"` : `"${node}" "${join(REPO, 'test', 'fixtures', 'fake-gh.mjs')}"`;
   writeFileSync(join(bin, 'gh'), `#!/bin/sh\nexec ${target} "$@"\n`);
   chmodSync(join(bin, 'gh'), 0o755);
+  // the hook reads the machine's crontab to word the 'main is ahead' line: a stand-in with none keeps these runs the same everywhere
+  writeFileSync(join(bin, 'crontab'), '#!/bin/sh\necho "no crontab for test" >&2\nexit 1\n');
+  chmodSync(join(bin, 'crontab'), 0o755);
   writeFileSync(join(bin, 'gh.cmd'), `@echo off\r\n${target} %*\r\n`);
   const env = { ...fake.env };
   delete env.PIPELINE_GH;
@@ -396,6 +437,19 @@ test('hook: installed pipeline is current -> prints nothing, exits 0, one gh cal
   assert.equal(gh.fake.calls().length, 1);
 });
 
+test('hook: main ahead and the schedule installed (a real `crontab -l` read) -> the automatic update is named, inside the deadline', { skip: process.platform !== 'linux' && 'the crontab read is Linux/WSL only (macOS reads a plist in HOME)' }, () => {
+  const home = installedHome();
+  const gh = fakeGhBin([
+    { match: 'commits/main', stdout: `${MAIN}\n` },
+    { match: 'compare/', stdoutJson: compareBody('ahead', INST, MAIN) },
+  ]);
+  writeFileSync(join(gh.bin, 'crontab'), `#!/bin/sh\necho '30 2 * * * /usr/bin/backup'\necho '*/10 * * * * /x update --scheduled ${CRON_MARKER}'\n`);
+  const r = runHook(home, { cwd: createTmpRepo().dir, env: hookEnv(gh) });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(JSON.parse(r.stdout).systemMessage, `claude-pipeline main is ahead of your install (aaaaaaa → bbbbbbb): the automatic update installs it within 10 minutes, or ${own} to update now`);
+  assert.ok(r.ms < DEADLINE_MS + 3000, `took ${r.ms} ms`);
+});
+
 test('hook: main ahead of the install -> one JSON object with the update instruction; a second session uses the cache', () => {
   const home = installedHome();
   const gh = fakeGhBin([
@@ -410,7 +464,7 @@ test('hook: main ahead of the install -> one JSON object with the update instruc
   assert.deepEqual(Object.keys(out).sort(), ['hookSpecificOutput', 'systemMessage']);
   assert.equal(out.hookSpecificOutput.hookEventName, 'SessionStart');
   assert.equal(out.hookSpecificOutput.additionalContext, out.systemMessage);
-  assert.equal(out.systemMessage, `claude-pipeline main is ahead of your install (aaaaaaa → bbbbbbb): ${own}`);
+  assert.equal(out.systemMessage, `claude-pipeline main is ahead of your install (aaaaaaa → bbbbbbb): ${notScheduled}`);
   const callsAfterFirst = gh.fake.calls().length;
   assert.equal(callsAfterFirst, 2);
   gh.fake.setScript([]); // gh now answers nothing: the next session must not need it
