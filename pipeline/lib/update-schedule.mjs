@@ -13,7 +13,7 @@ import { EXIT, UsageError, parseCommandArgs } from './cli.mjs';
 import { Fail, guarded } from './cmd-common.mjs';
 import { run as runProc } from './proc.mjs';
 import { applySchedule, detectTimezone, findOnPath } from '../commands/worktrees.mjs';
-import { logFile, insideClaudeCode } from './auto-update.mjs';
+import { LOG_FILE, stateDir, insideClaudeCode } from './auto-update.mjs';
 import * as launchd from './launchd.mjs';
 
 export const CRON_MARKER = '# claude-pipeline auto-update';
@@ -60,8 +60,9 @@ export function schedulePlist({ nodePath, binPath, every, pathDirs, logFile: log
   });
 }
 
-// The installed copy of the CLI (what an update replaces), under the default Claude home.
-export const installedBin = (home = os.homedir()) => path.join(home, '.claude', 'pipeline', 'bin', 'pipeline.mjs');
+// The installed copy of the CLI (what an update replaces), under the default Claude home. Every path this module builds is for
+// cron or launchd (Linux/macOS), so it is POSIX-joined whatever host runs it: a simulated Linux/macOS on Windows then matches reality.
+export const installedBin = (home = os.homedir()) => path.posix.join(home, '.claude', 'pipeline', 'bin', 'pipeline.mjs');
 
 function systemCrontab(op, text) {
   const fail = (what, r) => new Fail(EXIT.USAGE, { ok: false, error: 'crontab', message: `${what}: ${r.stderr.trim() || `exit ${r.code}`}` });
@@ -163,9 +164,9 @@ export const runSchedule = guarded(async (rest, ctx = {}) => {
         return { exitCode: EXIT.USAGE, output: { ok: false, error: 'tool-missing', message: `cannot install the schedule: ${cmd} was not found on PATH (the job's own PATH is minimal, so it needs to know where it is)` } };
       }
     }
-    const log = logFile(env);
-    (ctx.mkdirFn ?? ((d) => mkdirSync(d, { recursive: true })))(path.dirname(log));
-    const args = { nodePath, binPath, every, pathDirs: [...new Set([nodePath, tools.git, tools.gh].map((p) => path.dirname(p)))], logFile: log };
+    const log = path.posix.join(stateDir(env), LOG_FILE); // = auto-update's logFile(env), POSIX-joined for the cron/launchd target
+    (ctx.mkdirFn ?? ((d) => mkdirSync(d, { recursive: true })))(path.posix.dirname(log));
+    const args = { nodePath, binPath, every, pathDirs: [...new Set([nodePath, tools.git, tools.gh].map((p) => path.posix.dirname(p)))], logFile: log };
     if (darwin) plist = schedulePlist(args);
     else line = scheduleLine(args);
   }

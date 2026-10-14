@@ -15,7 +15,8 @@ import { run as runProc } from './proc.mjs';
 export const LAUNCHCTL = '/bin/launchctl';
 export const systemLaunchctl = (args) => runProc(LAUNCHCTL, args);
 
-export const agentPlistPath = (home, label) => path.join(home, 'Library', 'LaunchAgents', `${label}.plist`);
+// A macOS path, so always POSIX-joined (a simulated darwin on a Windows host must still give /Users/me/Library/...).
+export const agentPlistPath = (home, label) => path.posix.join(home, 'Library', 'LaunchAgents', `${label}.plist`);
 
 const xmlEscape = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 const str = (v, pad) => `${pad}<string>${xmlEscape(v)}</string>`;

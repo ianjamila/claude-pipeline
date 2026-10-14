@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, posix } from 'node:path';
 import { run as update, meta } from '../pipeline/commands/update.mjs';
 import { CRON_MARKER, EVERY_CHOICES, LAUNCHD_LABEL, cronExpression, parseEvery, scheduleInstalled, scheduleLine, schedulePlist } from '../pipeline/lib/update-schedule.mjs';
 import { insideClaudeCode } from '../pipeline/lib/auto-update.mjs';
@@ -22,12 +22,14 @@ const LINE_ARGS = { nodePath: '/usr/bin/node', binPath: '/home/me/.claude/pipeli
 function rig({ platform = 'linux', crontab = OTHER, launchctl, env = {}, ancestor = false } = {}) {
   const dir = scratch();
   const home = join(dir, 'home');
-  const bin = join(home, '.claude', 'pipeline', 'bin', 'pipeline.mjs');
+  // The installed bin and the log directory are what the cron line / plist names, so they are POSIX-style fakes (existsFn vouches
+  // for the bin): a host path (C:\\... on Windows CI) would be shell-quoted and not match the Linux/macOS line being simulated.
+  const bin = '/home/me/.claude/pipeline/bin/pipeline.mjs';
   const w = { crontab, writes: 0, launchctlCalls: [] };
   const defaultLaunchctl = () => ({ code: 0, stdout: '', stderr: '' });
   const ctx = {
     platform, home, uid: 501, binPath: bin, existsFn: (p) => p === bin || existsSync(p),
-    env: { PATH: '/usr/bin', PIPELINE_PRUNE_LOG_DIR: join(dir, 'logs'), ...env },
+    env: { PATH: '/usr/bin', PIPELINE_PRUNE_LOG_DIR: '/home/me/.local/state/pipeline', ...env },
     hasClaudeCodeAncestor: () => ancestor,
     whichFn: (cmd) => `/opt/${cmd}/bin/${cmd}`,
     nodePath: '/opt/node/bin/node',
@@ -42,7 +44,7 @@ function rig({ platform = 'linux', crontab = OTHER, launchctl, env = {}, ancesto
     launchctlFn: (args) => { w.launchctlCalls.push(args); return (launchctl ?? defaultLaunchctl)(args, w); },
   };
   const go = (args, extra = {}) => update(['schedule', ...args], { ...ctx, ...extra });
-  return { w, ctx, go, dir, home, bin, plist: join(home, 'Library', 'LaunchAgents', `${LAUNCHD_LABEL}.plist`) };
+  return { w, ctx, go, dir, home, bin, plist: posix.join(home, 'Library', 'LaunchAgents', `${LAUNCHD_LABEL}.plist`) };
 }
 
 test('meta documents update schedule', () => {
