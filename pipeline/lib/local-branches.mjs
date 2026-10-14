@@ -10,17 +10,21 @@ import { isInside, samePath } from './paths.mjs';
 // read from git becomes native; POSIX paths pass through unchanged.
 const nativePath = (p, platform) => (platform === 'win32' ? path.win32.resolve(p) : p);
 
-// -> [{ path, head, branch|null (detached or bare), bare }], main worktree first. `platform` is for tests.
+// -> [{ path, head, branch|null (detached or bare), bare, locked (reason; '' = no reason; null = unlocked), prunable, detached }],
+// main worktree first. `platform` is for tests.
 export function parseWorktreePorcelain(out, platform = process.platform) {
   const list = [];
   for (const block of out.split(/\r?\n\r?\n+/)) {
     if (!block.trim()) continue;
-    const entry = { path: null, head: null, branch: null, bare: false };
+    const entry = { path: null, head: null, branch: null, bare: false, locked: null, prunable: false, detached: false };
     for (const line of block.split(/\r?\n/)) {
       if (line.startsWith('worktree ')) entry.path = nativePath(line.slice('worktree '.length), platform);
       else if (line.startsWith('HEAD ')) entry.head = line.slice('HEAD '.length);
       else if (line.startsWith('branch ')) entry.branch = line.slice('branch '.length).replace(/^refs\/heads\//, '');
       else if (line === 'bare') entry.bare = true;
+      else if (line === 'locked' || line.startsWith('locked ')) entry.locked = line === 'locked' ? '' : line.slice(7);
+      else if (line === 'prunable' || line.startsWith('prunable ')) entry.prunable = true;
+      else if (line === 'detached') entry.detached = true;
     }
     if (entry.path) list.push(entry);
   }

@@ -1,0 +1,282 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { chmodSync, mkdirSync, readFileSync, writeFileSync, symlinkSync, utimesSync, mkdtempSync, realpathSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { createTmpRepo } from './helpers/tmprepo.mjs';
+import { resolveCanonicalRoot, listCandidates, entriesFor, walkTree, defaultTranscriptDirs, checkAncestry, processesInside, transcriptMentions, memoryMentions, recentFiles } from '../pipeline/lib/worktree-prune/inspect.mjs';
+
+function world() {
+  const repo = createTmpRepo();
+  repo.write('a.txt', 'a\n'); repo.write('.gitignore', 'node_modules/\n.review/\n*.log\n.env*\nnotes.txt\n'); repo.commit('init');
+  const origin = mkdtempSync(join(tmpdir(), 'origin-'));
+  repo.git(['init', '--bare', '-q', origin]);
+  repo.git(['remote', 'add', 'origin', origin]);
+  repo.git(['push', '-q', 'origin', 'main']);
+  mkdirSync(join(repo.dir, '.worktrees'));
+  const add = (slug, branch) => { repo.git(['worktree', 'add', '-q', '-b', branch, join('.worktrees', slug), 'main']); return join(repo.dir, '.worktrees', slug); };
+  return { repo, origin, add };
+}
+
+test('canonical root is the main worktree from anywhere', () => {
+  const { repo, add } = world();
+  const wt = add('agent-x', 'agent/x');
+  const a = resolveCanonicalRoot(repo.dir);
+  const b = resolveCanonicalRoot(wt);
+  assert.equal(a.root, b.root);
+  assert.equal(a.commonDir, b.commonDir);
+  assert.equal(realpathSync(a.root), realpathSync(repo.dir));
+});
+
+test('listCandidates: direct children of worktree_dir only; protect, locked, detached skipped', () => {
+  const { repo, add } = world();
+  add('agent-x', 'agent/x'); add('foundation', 'f'); add('ops.stack', 's'); const d = add('det', 'd');
+  repo.git(['-C', d, 'checkout', '-q', '--detach']);
+  const l = add('locked-one', 'l'); repo.git(['worktree', 'lock', '--reason', 'owner', l]);
+  const { candidates, skipped } = listCandidates(repo.dir, { worktreeDir: '.worktrees', protect: ['foundation', '*.stack'] });
+  assert.deepEqual(candidates.map((c) => c.slug), ['agent-x']);
+  assert.deepEqual(Object.fromEntries(skipped.map((s) => [s.slug, s.reason])), {
+    foundation: 'protected', 'ops.stack': 'protected', det: 'detached HEAD', 'locked-one': 'locked (owner)',
+  });
+});
+
+test('entriesFor: untracked, ignored files listed per file; symlink flagged', () => {
+  const { add } = world();
+  const wt = add('agent-x', 'agent/x');
+  mkdirSync(join(wt, 'node_modules', 'p'), { recursive: true }); writeFileSync(join(wt, 'node_modules', 'p', 'i.js'), '');
+  writeFileSync(join(wt, 'new.ts'), ''); writeFileSync(join(wt, 'notes.txt'), '');
+  const e = Object.fromEntries(entriesFor(wt).map((x) => [x.path, x.kind]));
+  assert.equal(e['node_modules/p/i.js'], 'ignored');
+  assert.equal(e['new.ts'], 'untracked');
+  assert.equal(e['notes.txt'], 'ignored');
+});
+
+test('checkAncestry: behind the merged head is fine, local-only commit is not, sha mismatch is not', () => {
+  const { repo, add } = world();
+  const wt = add('agent-x', 'agent/x');
+  writeFileSync(join(wt, 'b.txt'), 'b'); repo.git(['-C', wt, 'add', 'b.txt']); repo.git(['-C', wt, 'commit', '-qm', 'b']);
+  const local = repo.git(['-C', wt, 'rev-parse', 'HEAD']).trim();
+  writeFileSync(join(wt, 'c.txt'), 'c'); repo.git(['-C', wt, 'add', 'c.txt']); repo.git(['-C', wt, 'commit', '-qm', 'c']);
+  const prHead = repo.git(['-C', wt, 'rev-parse', 'HEAD']).trim();
+  repo.git(['-C', wt, 'push', '-q', 'origin', `HEAD:refs/pull/9/head`]);
+  repo.git(['-C', wt, 'reset', '-q', '--hard', local]);
+  assert.deepEqual(checkAncestry(repo.dir, { head: local, pr: { number: 9, headRefOid: prHead } }), { ok: true });
+  assert.match(checkAncestry(repo.dir, { head: local, pr: { number: 9, headRefOid: 'f'.repeat(40) } }).reason, /does not match/);
+  writeFileSync(join(wt, 'd.txt'), 'd'); repo.git(['-C', wt, 'add', 'd.txt']); repo.git(['-C', wt, 'commit', '-qm', 'local only']);
+  const ahead = repo.git(['-C', wt, 'rev-parse', 'HEAD']).trim();
+  assert.match(checkAncestry(repo.dir, { head: ahead, pr: { number: 9, headRefOid: prHead } }).reason, /commits that are not in PR #9/);
+  assert.match(checkAncestry(repo.dir, { head: local, pr: { number: 404, headRefOid: prHead } }).reason, /could not fetch PR #404/);
+  assert.equal(repo.git(['for-each-ref', 'refs/pipeline-prune']), '', 'the temporary ref is always removed');
+});
+
+test('processesInside: fake /proc tree; non-linux is unavailable', { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' }, () => {
+  const proc = mkdtempSync(join(tmpdir(), 'proc-'));
+  const target = mkdtempSync(join(tmpdir(), 'wt-'));
+  mkdirSync(join(proc, '101', 'fd'), { recursive: true });
+  mkdirSync(join(proc, '202', 'fd'), { recursive: true });
+  symlinkSync(target, join(proc, '101', 'cwd'));
+  symlinkSync(tmpdir(), join(proc, '202', 'cwd'));
+  symlinkSync(join(target, 'x.log'), join(proc, '202', 'fd', '3'));
+  assert.deepEqual(processesInside(target, { procRoot: proc, platform: 'linux' }), { available: true, pids: [101, 202], hidden: 0 });
+  assert.deepEqual(processesInside(target, { procRoot: proc, platform: 'win32' }), { available: false, pids: [], hidden: 0 });
+  assert.deepEqual(processesInside(target, { procRoot: join(proc, 'missing'), platform: 'linux' }), { available: false, pids: [], hidden: 0 });
+});
+
+test('transcriptMentions / memoryMentions / recentFiles', () => {
+  const t = mkdtempSync(join(tmpdir(), 'tr-'));
+  mkdirSync(join(t, 'proj')); writeFileSync(join(t, 'proj', 's1.jsonl'), '{"cwd":"/r/.worktrees/agent-x"}\n');
+  writeFileSync(join(t, 'proj', 'old.jsonl'), '/r/.worktrees/agent-x'); utimesSync(join(t, 'proj', 'old.jsonl'), 1, 1);
+  assert.deepEqual(transcriptMentions(['/r/.worktrees/agent-x'], { dirs: [t], sinceMs: Date.now() - 3600e3 }).map((p) => p.endsWith('s1.jsonl')), [true]);
+  const m = mkdtempSync(join(tmpdir(), 'mem-'));
+  mkdirSync(join(m, 'eaglewatch')); mkdirSync(join(m, 'archive'));
+  writeFileSync(join(m, 'eaglewatch', 'a.md'), 'agent-x is BUILDING phase 2\n');
+  writeFileSync(join(m, 'eaglewatch', 'b.md'), 'agent-x merged long ago\n');
+  writeFileSync(join(m, 'archive', 'c.md'), 'agent-x BUILDING\n');
+  writeFileSync(join(m, 'eaglewatch', 'MEMORY-archive.md'), 'agent-x BUILDING\n');
+  assert.deepEqual(memoryMentions({ slug: 'agent-x', branch: 'agent/x' }, { dirs: [m] }).map((p) => p.endsWith('a.md')), [true]);
+  const walk = [{ path: 'src/a.ts', isDir: false, mtimeMs: Date.now() }, { path: 'node_modules/x', isDir: false, mtimeMs: Date.now() }, { path: 'old.ts', isDir: false, mtimeMs: 1 }];
+  assert.deepEqual(recentFiles(walk, { sinceMs: Date.now() - 3600e3, ignore: ['node_modules/'] }), ['src/a.ts']);
+});
+
+test('entriesFor flags a symlink and walkTree does not follow it', { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' }, () => {
+  const { add } = world();
+  const wt = add('agent-x', 'agent/x');
+  const outside = mkdtempSync(join(tmpdir(), 'outside-')); writeFileSync(join(outside, 'secret.txt'), '');
+  symlinkSync(outside, join(wt, 'link'));
+  const e = Object.fromEntries(entriesFor(wt).map((x) => [x.path, x]));
+  assert.equal(e.link.isSymlink, true);
+  assert.equal(e.link.kind, 'untracked');
+  assert.deepEqual(walkTree(wt).map((w) => w.path).filter((p) => p.startsWith('link')), ['link']);
+});
+
+test('transcriptMentions finds a needle that straddles the 1 MiB chunk seam', () => {
+  const t = mkdtempSync(join(tmpdir(), 'tr-'));
+  mkdirSync(join(t, 'proj'));
+  const needle = '/r/.worktrees/agent-x';
+  writeFileSync(join(t, 'proj', 's.jsonl'), Buffer.concat([Buffer.alloc((1 << 20) - 5, 'a'), Buffer.from(needle)]));
+  assert.equal(transcriptMentions([needle], { dirs: [t], sinceMs: 0 }).length, 1);
+  assert.deepEqual(transcriptMentions(['/r/.worktrees/other'], { dirs: [t], sinceMs: 0 }), []);
+});
+
+test('defaultTranscriptDirs: CLAUDE_CONFIG_DIR plus ~/.claude*/projects, existing and de-duplicated', () => {
+  const home = mkdtempSync(join(tmpdir(), 'home-'));
+  mkdirSync(join(home, '.claude', 'projects'), { recursive: true });
+  mkdirSync(join(home, '.claude-ew', 'projects'), { recursive: true });
+  mkdirSync(join(home, '.claude-empty'));
+  const dirs = defaultTranscriptDirs(home, { CLAUDE_CONFIG_DIR: join(home, '.claude') });
+  assert.deepEqual(dirs, [join(home, '.claude', 'projects'), join(home, '.claude-ew', 'projects')]);
+});
+
+test('an unreadable directory is a blocker, never an empty one', { skip: (process.platform === 'win32' && 'chmod 000 is not enforced on Windows') || (process.getuid?.() === 0 && 'root can read any directory') }, () => {
+  const { add } = world();
+  const wt = add('agent-x', 'agent/x');
+  const secret = join(wt, 'node_modules', 'locked');
+  mkdirSync(secret, { recursive: true }); writeFileSync(join(secret, 'hidden.js'), '');
+  chmodSync(secret, 0o000);
+  try {
+    const walk = walkTree(wt);
+    assert.ok(walk.some((w) => w.path === 'node_modules/locked' && w.unreadable === true));
+    const e = entriesFor(wt).find((x) => x.path === 'node_modules/locked');
+    assert.equal(e?.kind, 'tracked-change');
+    assert.deepEqual(recentFiles(walk, { sinceMs: Date.now() - 3600e3, ignore: [] }).filter((p) => p === 'node_modules/locked'), ['node_modules/locked']);
+  } finally {
+    chmodSync(secret, 0o700);
+  }
+});
+
+test('processesInside matches a worktree reached through a symlinked path', { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' }, () => {
+  const proc = mkdtempSync(join(tmpdir(), 'proc-'));
+  const real = realpathSync(mkdtempSync(join(tmpdir(), 'wt-')));
+  const via = join(mkdtempSync(join(tmpdir(), 'lnk-')), 'wt-link');
+  symlinkSync(real, via);
+  mkdirSync(join(proc, '303', 'fd'), { recursive: true });
+  symlinkSync(real, join(proc, '303', 'cwd'));
+  assert.deepEqual(processesInside(via, { procRoot: proc, platform: 'linux' }), { available: true, pids: [303], hidden: 0 });
+});
+
+test('processesInside ignores non-path fd targets (socket:[N], anon_inode:…) even with cwd inside the worktree', { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' }, () => {
+  const proc = mkdtempSync(join(tmpdir(), 'proc-'));
+  const target = realpathSync(mkdtempSync(join(tmpdir(), 'wt-')));
+  mkdirSync(join(proc, '404', 'fd'), { recursive: true });
+  mkdirSync(join(proc, '505', 'fd'), { recursive: true });
+  symlinkSync('socket:[1]', join(proc, '404', 'fd', '3'));
+  symlinkSync('anon_inode:[eventfd]', join(proc, '404', 'fd', '4'));
+  symlinkSync('pipe:[7]', join(proc, '404', 'fd', '5'));
+  symlinkSync(`${target} (deleted)`, join(proc, '505', 'cwd'));
+  const before = process.cwd();
+  try {
+    process.chdir(target);
+    assert.deepEqual(processesInside(target, { procRoot: proc, platform: 'linux' }), { available: true, pids: [505], hidden: 0 });
+  } finally {
+    process.chdir(before);
+  }
+});
+
+test('transcriptMentions counts an unreadable recent transcript as a hit (fail-closed)', { skip: (process.platform === 'win32' && 'chmod 000 is not enforced on Windows') || (process.getuid?.() === 0 && 'root can read any file') }, () => {
+  const t = mkdtempSync(join(tmpdir(), 'tr-'));
+  mkdirSync(join(t, 'proj'));
+  const locked = join(t, 'proj', 'locked.jsonl');
+  writeFileSync(locked, 'nothing relevant\n');
+  writeFileSync(join(t, 'proj', 'old-locked.jsonl'), ''); utimesSync(join(t, 'proj', 'old-locked.jsonl'), 1, 1);
+  chmodSync(locked, 0o000); chmodSync(join(t, 'proj', 'old-locked.jsonl'), 0o000);
+  try {
+    assert.deepEqual(transcriptMentions(['/r/.worktrees/agent-x'], { dirs: [t], sinceMs: Date.now() - 3600e3 }), [locked]);
+  } finally {
+    chmodSync(locked, 0o600); chmodSync(join(t, 'proj', 'old-locked.jsonl'), 0o600);
+  }
+});
+
+// Another user's process: its /proc/<pid> links cannot be read (EACCES). It is counted as hidden, never as "inside",
+// and never makes process inspection unavailable (every non-root user sees root daemons this way).
+test('processesInside counts an unreadable process as hidden; a vanished one is just gone', { skip: (process.platform === 'win32' && 'chmod 000 is not enforced on Windows') || (process.getuid?.() === 0 && 'root can read any directory') }, () => {
+  const proc = mkdtempSync(join(tmpdir(), 'proc-'));
+  const target = realpathSync(mkdtempSync(join(tmpdir(), 'wt-')));
+  mkdirSync(join(proc, '606', 'fd'), { recursive: true });
+  symlinkSync(target, join(proc, '606', 'cwd'));
+  chmodSync(join(proc, '606'), 0o000);
+  mkdirSync(join(proc, '707')); // exited between the listing and the read: no cwd, no fd (ENOENT)
+  try {
+    assert.deepEqual(processesInside(target, { procRoot: proc, platform: 'linux' }), { available: true, pids: [], hidden: 1 });
+  } finally {
+    chmodSync(join(proc, '606'), 0o700);
+  }
+});
+
+// spec §5: a pipeline-keep lock older than 7 days is reported as a stale keep ("still needed?"), never released. Its age
+// is the mtime of the worktree's own `locked` file, found through the `.git` file's gitdir line: a second worktree with
+// the same basename makes git suffix the admin dir's id, so guessing <commonDir>/worktrees/<slug> would read the wrong one.
+test('listCandidates: a pipeline-keep lock older than 7 days is a stale keep; a fresh one and an owner lock stay plain locked', () => {
+  const { repo, add } = world();
+  mkdirSync(join(repo.dir, 'elsewhere'));
+  repo.git(['worktree', 'add', '-q', '-b', 'decoy', join('elsewhere', 'old'), 'main']);
+  const fresh = add('fresh', 'fr');
+  const old = add('old', 'ol');
+  const owner = add('owner-old', 'oo');
+  repo.git(['worktree', 'lock', '--reason', 'pipeline-keep: ship run a', fresh]);
+  repo.git(['worktree', 'lock', '--reason', 'pipeline-keep: ship run b', old]);
+  repo.git(['worktree', 'lock', '--reason', 'owner', owner]);
+  const adminDir = (wt) => resolve(wt, /^gitdir: (.*)$/m.exec(readFileSync(join(wt, '.git'), 'utf8'))[1].trim());
+  assert.notEqual(adminDir(old), join(realpathSync(join(repo.dir, '.git')), 'worktrees', 'old'), 'the decoy took the plain id');
+  const past = (Date.now() - 8 * 86400e3) / 1000;
+  utimesSync(join(adminDir(old), 'locked'), past, past);
+  utimesSync(join(adminDir(owner), 'locked'), past, past);
+  const { skipped } = listCandidates(repo.dir, { worktreeDir: '.worktrees', protect: [] });
+  assert.deepEqual(Object.fromEntries(skipped.map((s) => [s.slug, s.reason])), {
+    fresh: 'locked (pipeline-keep: ship run a)',
+    old: 'stale keep (8d: ship run b) — still needed?',
+    'owner-old': 'locked (owner)',
+  });
+  assert.match(repo.git(['worktree', 'list', '--porcelain']), /locked pipeline-keep: ship run b/, 'never released');
+});
+
+// spec §4 rule 6: only a session WORKING in the worktree counts (its cwd, or a tool call naming the path), never a
+// listing that merely prints it (`git worktree list`, `ship inbox`) or prose about it.
+test('transcriptMentions: cwd inside or a tool_use input naming the path count; tool results and prose do not', () => {
+  const p = '/r/.worktrees/agent-x';
+  const t = mkdtempSync(join(tmpdir(), 'tr-'));
+  mkdirSync(join(t, 'proj'));
+  const file = (name, lines) => { writeFileSync(join(t, 'proj', name), lines.map((l) => (typeof l === 'string' ? l : JSON.stringify(l))).join('\n') + '\n'); return join(t, 'proj', name); };
+  const result = file('result.jsonl', [{ type: 'user', cwd: '/r', message: { content: [{ type: 'tool_result', tool_use_id: 'x', content: `${p}  abc1234 [agent/x]\n/r/.worktrees/other` }] } }]);
+  const prose = file('prose.jsonl', [{ type: 'assistant', cwd: '/r', message: { content: [{ type: 'text', text: `I will look at ${p} later` }] } }, { type: 'user', cwd: '/r', message: { content: `clean up ${p}` } }]);
+  const sibling = file('sibling.jsonl', [{ type: 'user', cwd: `${p}2`, message: { content: 'hi' } }]);
+  const toolUse = file('tool-use.jsonl', [{ type: 'user', cwd: '/r' }, { type: 'assistant', cwd: '/r', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: `cd ${p} && npm test` } }] } }]);
+  const cwd = file('cwd.jsonl', [{ type: 'user', cwd: `${p}/src`, message: { content: 'hi' } }]);
+  const garbage = file('garbage.jsonl', [{ type: 'user', cwd: '/r' }, `{"truncated": "${p}`]);
+  const hits = transcriptMentions([p], { dirs: [t], sinceMs: Date.now() - 3600e3 }).sort();
+  assert.deepEqual(hits, [cwd, garbage, toolUse].sort());
+  assert.ok(![result, prose, sibling].some((f) => hits.includes(f)));
+});
+
+test('transcriptMentions judges a JSON line that spans the 1 MiB chunk seam as one line', () => {
+  const p = '/r/.worktrees/agent-x';
+  const t = mkdtempSync(join(tmpdir(), 'tr-'));
+  mkdirSync(join(t, 'proj'));
+  const pad = JSON.stringify({ type: 'user', cwd: '/r', message: { content: 'a'.repeat((1 << 20) - 60) } });
+  const use = JSON.stringify({ type: 'assistant', cwd: '/r', message: { content: [{ type: 'tool_use', input: { command: `ls ${p}` } }] } });
+  const res = JSON.stringify({ type: 'user', cwd: '/r', message: { content: [{ type: 'tool_result', content: `ls ${p}` }] } });
+  writeFileSync(join(t, 'proj', 'use.jsonl'), `${pad}\n${use}\n`);
+  writeFileSync(join(t, 'proj', 'res.jsonl'), `${pad}\n${res}\n`);
+  assert.deepEqual(transcriptMentions([p], { dirs: [t], sinceMs: 0 }), [join(t, 'proj', 'use.jsonl')]);
+});
+
+// A path has more than one spelling when a symlink leads into it (this PC: ~/Claude -> ~/projects). git records a worktree
+// by its real path, and a session started under the alias logs the alias spelling; either way it is the same worktree.
+test('transcriptMentions matches every spelling of the path: its realpath, and an alias through a symlinked ancestor', { skip: process.platform === 'win32' && 'symlinks need privileges on Windows CI' }, () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'spell-')));
+  mkdirSync(join(base, 'projects', 'repo', '.worktrees', 'agent-x'), { recursive: true });
+  symlinkSync(join(base, 'projects'), join(base, 'Claude'));
+  const real = join(base, 'projects', 'repo', '.worktrees', 'agent-x');
+  const alias = join(base, 'Claude', 'repo', '.worktrees', 'agent-x');
+  const t = mkdtempSync(join(tmpdir(), 'tr-'));
+  mkdirSync(join(t, 'proj'));
+  const file = (name, obj) => { writeFileSync(join(t, 'proj', name), `${JSON.stringify(obj)}\n`); return join(t, 'proj', name); };
+  const realCwd = file('real-cwd.jsonl', { type: 'user', cwd: join(real, 'src') });
+  const aliasUse = file('alias-use.jsonl', { type: 'assistant', cwd: base, message: { content: [{ type: 'tool_use', input: { command: `cd ${alias} && ls` } }] } });
+  const aliasCwd = file('alias-cwd.jsonl', { type: 'user', cwd: alias });
+  const listing = file('alias-result.jsonl', { type: 'user', cwd: base, message: { content: [{ type: 'tool_result', content: alias }] } });
+  const since = Date.now() - 3600e3;
+  const expected = [aliasCwd, aliasUse, realCwd].sort();
+  assert.deepEqual(transcriptMentions([real], { dirs: [t], sinceMs: since }).sort(), expected, 'registered by its real path');
+  assert.deepEqual(transcriptMentions([alias], { dirs: [t], sinceMs: since }).sort(), expected, 'registered through the alias');
+  assert.ok(!transcriptMentions([real], { dirs: [t], sinceMs: since }).includes(listing));
+});

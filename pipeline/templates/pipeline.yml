@@ -8,6 +8,11 @@ enforcement: github            # github = branch protection must be live; gate =
 #                              # or test-integrity violation merge. chat = no labels: CI does not fail on those, the ship skill
 #                              # stops before the merge, lists them in a PR comment and merges when the owner says "merge" in chat.
 worktree_dir: .worktrees       # ship creates agent/<name> worktrees here (must be gitignored)
+# worktrees:                 # `pipeline worktrees prune` (spec docs/specs/2026-10-13-worktree-prune-design.md)
+#   mode: report             # off | report | on — nothing is removed until this says on
+#   protect: [foundation, "*.stack"]
+#   min_idle_hours: 24
+#   min_merged_hours: 24
 
 verify:
   full: node scripts/verify.mjs          # everything; must pass before a PR and at the final gate
