@@ -474,7 +474,7 @@ test('agent-log: the queue is shared across worktrees of one repo (lines queued 
   }
 });
 
-test('agent-log publish: needs no GitHub, no clean tree and no PR branch (default branch, detached HEAD and a dirty tree all work); stage does the same', () => {
+test('agent-log publish: needs no GitHub, no clean tree and no PR branch (default branch, detached HEAD and a dirty tree all work); stage only asks about its own PR', () => {
   const t = logRepoWithOrigin();
   try {
     t.fake.setScript([{ match: '.', code: 1, stderr: 'HTTP 401' }]); // any gh call would fail
@@ -482,8 +482,10 @@ test('agent-log publish: needs no GitHub, no clean tree and no PR branch (defaul
     t.repo.git(['checkout', '-q', 'main']);
     assertExit(t.publish('--line', '- on main'), 0);
     t.repo.git(['checkout', '-q', '--detach']);
+    assert.deepEqual(t.fake.lines(), [], 'plain publish never called GitHub');
+    // stage --pr N holds its line until PR 12 merges, so it asks GitHub about that PR (and only that)
     assertExit(cli(['agent-log', 'stage', '--pr', '12', '--line', '- detached'], { dir: t.repo.dir, fake: t.fake }), 0);
-    assert.deepEqual(t.fake.lines(), [], 'GitHub was never called');
+    assert.ok(t.fake.lines().every((l) => l.startsWith('pr view 12 ')), t.fake.lines().join('\n'));
     assert.equal(t.repo.git(['status', '--porcelain']).trim(), 'M README.md');
   } finally {
     rmSync(t.bare, { recursive: true, force: true });

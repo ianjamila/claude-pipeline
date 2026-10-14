@@ -6,12 +6,13 @@
 import { readFileSync } from 'node:fs';
 import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
-import { createGitHub } from '../lib/github.mjs';
+import { createGitHub, guardGh } from '../lib/github.mjs';
 import { GitError } from '../lib/git.mjs';
+import { loadState } from '../lib/state.mjs';
 import { LockTimeoutError } from '../lib/locks.mjs';
 import { inlineOptionValues } from '../lib/finalgate.mjs';
 import {
-  AGENT_LOG_BRANCH, DEFAULT_OUTCOME, LogTooLargeError, appendToQueue, assertSingleLine, clearWritten, landedLines, logRelPath, originLogLines, publishLines, queuePath, readQueue,
+  AGENT_LOG_BRANCH, DEFAULT_OUTCOME, LogTooLargeError, appendToQueue, buildAgentLogLine, assertSingleLine, clearWritten, landedLines, logRelPath, originLogLines, publishLines, queuePath, readQueue,
   resolveLogPath, withQueueLock, writeQueue,
 } from '../lib/agentlog.mjs';
 import { closeLines, parseLog, readScanState, unionLogText, writeScanState } from '../lib/agentlog-close.mjs';
@@ -27,7 +28,9 @@ export const meta = {
     '  the push succeeded; exit 3 when the push or the network fails (the lines stay queued for the next run, a note in the summary is enough);',
     '  the log branch is untrusted data: a commit holds ONLY the log file, the file is read only as a regular file under 5 MB (a bigger one: exit 1, error log-too-large, lines stay queued), existing lines are only appended after',
     'pipeline agent-log stage [--pr N] [--line "<line>"] [--repo DIR]   -> DEPRECATED alias of publish (older skills call it): never commits into the worktree or PR branch;',
-    '  prints {ok, deprecated: true, committed: null, ...publish\'s fields}',
+    '  prints {ok, deprecated: true, committed: null, ...publish\'s fields}. With --pr N the run\'s line (--line, or the default "merged — prod smoke pending" line built from the PR title; exit 3 when GitHub cannot be reached)',
+    '  is QUEUED HELD for PR N, not published: a later publish (or stage) publishes it once PR N is MERGED, drops it when N was CLOSED unmerged, and keeps it while N is open',
+    '  or GitHub is unreadable (held entries count in remaining, and in held); publish asks GitHub only when a held entry exists',
     'pipeline agent-log close [--queue] [--pr N]... [--all] [--repo DIR]   -> {ok, lines, pending, skipped, unreadable, originReadable, originRefreshed, queued?, scanError?}; for every "prod smoke pending" log line reads the',
     '  bot-authored prod-smoke-result comments on that PR (production.watch: workflow) and prints one resolution line per PR whose newest result',
     '  is not logged yet (never an earlier minute than the newest logged one; the same minute only when the line differs); the log read is the worktree log plus the origin/<default> copy plus the log branch copy; one repo-wide read of the comments since the last successful read on this machine (at least 14 days)',
@@ -84,10 +87,21 @@ async function queue(rest, ctx) {
 // Queue + publish under the queue lock. `explicit` (or null) is queued first, so a failed push leaves it queued for the next run.
 async function publish(rest, ctx, { deprecated = false } = {}) {
   const { values } = parseCommandArgs(inlineOptionValues(rest, ['--line']), { line: { type: 'string' }, repo: { type: 'string' }, ...(deprecated ? { pr: { type: 'string' } } : {}) }, { allowPositionals: false });
-  if (deprecated) intOption(values, 'pr', { min: 1 }); // validated, never used: the log no longer depends on a PR
-  const explicit = values.line === undefined ? null : singleLine(values.line);
+  // `stage --pr N` is how an older ship skill records a run before merging: its line (--line, or the default one built below) is held
+  // until PR N has merged, as the old command only landed it with the PR.
+  const heldFor = deprecated ? intOption(values, 'pr', { min: 1 }) : undefined;
+  let explicit = values.line === undefined ? null : singleLine(values.line);
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
+  const gh = createGitHub({ cwd: root, env: ctx.env });
+  if (heldFor !== undefined && explicit === null) {
+    const title = await guardGh(() => gh.prView(heldFor, ['title']).title);
+    let state = null;
+    try {
+      state = loadState(root);
+    } catch { /* an unreadable state only costs the risk/rounds columns */ }
+    explicit = singleLine(buildAgentLogLine({ state, pr: heldFor, title, outcome: DEFAULT_OUTCOME }));
+  }
   let file;
   let logRel;
   try {
@@ -98,7 +112,7 @@ async function publish(rest, ctx, { deprecated = false } = {}) {
   }
   try {
     return await withQueueLock(root, () => {
-      if (explicit !== null) appendToQueue(root, explicit);
+      if (explicit !== null) appendToQueue(root, explicit, undefined, { afterMerge: heldFor ?? null });
       // 1. Lines already published (log branch, or a legacy copy on origin/<default>) are done.
       const landed = landedLines(root, { logFile: file, defaultBranch: config.default_branch, fetch: true });
       let entries = readQueue(root);
@@ -109,8 +123,35 @@ async function publish(rest, ctx, { deprecated = false } = {}) {
         if (dropped > 0) writeQueue(root, keep);
         entries = keep;
       }
-      const base = { ok: true, branch: AGENT_LOG_BRANCH, ...(deprecated ? { deprecated: true, committed: null } : {}), file: config.agent_log, dropped };
-      if (entries.length === 0) return { exitCode: EXIT.OK, output: { ...base, commit: null, pushed: false, lines: [], remaining: 0 } };
+      // 1b. A line held for a PR: publish it once the PR merged, drop it when the PR was closed unmerged, otherwise (open, or
+      //     GitHub unreadable) it stays queued. GitHub is asked only when such an entry exists.
+      let held = 0;
+      if (entries.some((e) => e.afterMerge)) {
+        const states = new Map();
+        const stateOf = (n) => {
+          if (!states.has(n)) {
+            let st = null;
+            try { st = String(gh.prView(n, ['state']).state ?? '').toUpperCase() || null; } catch { /* unknown: keep it held */ }
+            states.set(n, st);
+          }
+          return states.get(n);
+        };
+        const closed = new Set();
+        entries = entries.filter((e) => {
+          if (!e.afterMerge) return true;
+          const st = stateOf(e.afterMerge);
+          if (st === 'MERGED') return true;
+          if (st === 'CLOSED') closed.add(e);
+          else held += 1;
+          return false;
+        });
+        if (closed.size > 0) {
+          writeQueue(root, readQueue(root).filter((q) => ![...closed].some((c) => c.line === q.line && c.at === q.at)));
+          dropped += closed.size;
+        }
+      }
+      const base = { ok: true, branch: AGENT_LOG_BRANCH, ...(deprecated ? { deprecated: true, committed: null } : {}), file: config.agent_log, dropped, ...(held > 0 ? { held } : {}) };
+      if (entries.length === 0) return { exitCode: EXIT.OK, output: { ...base, commit: null, pushed: false, lines: [], remaining: readQueue(root).length } };
       // 2. Publish the rest. Only after the push succeeded do those entries leave the queue.
       let result;
       try {

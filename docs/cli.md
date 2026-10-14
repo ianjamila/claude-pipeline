@@ -21,7 +21,9 @@ pipeline agent-log publish [--line "<line>"] [--repo DIR]   -> {ok, branch, comm
   the push succeeded; exit 3 when the push or the network fails (the lines stay queued for the next run, a note in the summary is enough);
   the log branch is untrusted data: a commit holds ONLY the log file, the file is read only as a regular file under 5 MB (a bigger one: exit 1, error log-too-large, lines stay queued), existing lines are only appended after
 pipeline agent-log stage [--pr N] [--line "<line>"] [--repo DIR]   -> DEPRECATED alias of publish (older skills call it): never commits into the worktree or PR branch;
-  prints {ok, deprecated: true, committed: null, ...publish's fields}
+  prints {ok, deprecated: true, committed: null, ...publish's fields}. With --pr N the run's line (--line, or the default "merged — prod smoke pending" line built from the PR title; exit 3 when GitHub cannot be reached)
+  is QUEUED HELD for PR N, not published: a later publish (or stage) publishes it once PR N is MERGED, drops it when N was CLOSED unmerged, and keeps it while N is open
+  or GitHub is unreadable (held entries count in remaining, and in held); publish asks GitHub only when a held entry exists
 pipeline agent-log close [--queue] [--pr N]... [--all] [--repo DIR]   -> {ok, lines, pending, skipped, unreadable, originReadable, originRefreshed, queued?, scanError?}; for every "prod smoke pending" log line reads the
   bot-authored prod-smoke-result comments on that PR (production.watch: workflow) and prints one resolution line per PR whose newest result
   is not logged yet (never an earlier minute than the newest logged one; the same minute only when the line differs); the log read is the worktree log plus the origin/<default> copy plus the log branch copy; one repo-wide read of the comments since the last successful read on this machine (at least 14 days)

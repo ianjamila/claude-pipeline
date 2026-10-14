@@ -261,17 +261,100 @@ test('stage is a deprecated alias: it never commits into the worktree, publishes
   const w = world();
   w.run(['queue', '--line', L1]);
   const before = w.snapshot();
+  // PR 12 is open (GitHub says so), so its line is held back until it merges; the rest of the queue is published.
+  w.fake.setScript([{ match: '^pr view 12 --json state', stdoutJson: { state: 'OPEN' } }]);
   const r = w.run(['stage', '--pr', '12', '--line', L2]);
   assertExit(r, 0);
   assert.equal(r.json.ok, true);
   assert.equal(r.json.deprecated, true);
   assert.equal(r.json.committed, null);
   assert.equal(r.json.pushed, true);
-  assert.deepEqual(r.json.lines, [L1, L2]);
+  assert.deepEqual(r.json.lines, [L1]);
   assert.deepEqual(w.snapshot(), before, 'no commit, no file written in the worktree');
-  assert.ok(w.logOnBranch().includes(L2));
+  assert.ok(w.logOnBranch().includes(L1));
+  assert.ok(!w.logOnBranch().includes(L2), 'the line of an unmerged PR is not published');
+  assert.deepEqual(w.queued(), [L2]);
   assertExit(w.run(['stage', '--pr', 'x']), 2);
   assertExit(w.run(['stage', '--bogus']), 2);
+});
+
+// The older ship skill calls `stage --pr N` (no --line) before merging and never queues a line for a clean merge: the line it
+// would have built has to reach the log once PR N merges, and not before.
+const queueEntries = (w) => (existsSync(w.queueFile) ? readFileSync(w.queueFile, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);
+const PR12_TITLE = [{ match: '^pr view 12 --json title', stdoutJson: { title: 'Add widget' } }, { match: '^pr view 12 --json state', stdoutJson: { state: 'OPEN' } }];
+const stageDefault = (w) => {
+  w.fake.setScript(PR12_TITLE);
+  return w.run(['stage', '--pr', '12']);
+};
+
+test('stage --pr N without --line builds the PR\'s default line and queues it for after the merge, publishing nothing for it', () => {
+  const w = world();
+  const r = stageDefault(w);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.pushed, false);
+  assert.deepEqual(r.json.lines, []);
+  const entries = queueEntries(w);
+  assert.equal(entries.length, 1);
+  assert.match(entries[0].line, /#12 · Add widget · .*merged — prod smoke pending/);
+  assert.equal(entries[0].afterMerge, 12);
+  assert.equal(w.onOrigin('branch', '--list', BRANCH).trim(), '', 'no branch was created for an unmerged PR');
+  assert.equal(r.json.remaining, 1);
+  // stage twice (a retried step) does not duplicate it
+  stageDefault(w);
+  assert.equal(queueEntries(w).length, 1);
+});
+
+test('stage --pr N without --line exits 3 when GitHub cannot be reached, as the old command did', () => {
+  const w = world();
+  w.fake.setScript([{ match: '.', code: 1, stderr: 'HTTP 401' }]);
+  const r = w.run(['stage', '--pr', '12']);
+  assertExit(r, 3, r.stderr + r.stdout);
+  assert.deepEqual(queueEntries(w), []);
+});
+
+test('publish: a line held for PR N is published once N is MERGED, dropped when N was CLOSED, and kept while it is open or unreadable', () => {
+  const w = world();
+  stageDefault(w);
+  const line = queueEntries(w)[0].line;
+  const state = (v) => w.fake.setScript([{ match: '^pr view 12 --json state', stdoutJson: { state: v } }]);
+
+  state('OPEN');
+  assertExit(w.run(['publish']), 0);
+  assert.deepEqual(queueEntries(w).map((e) => e.line), [line], 'open: kept');
+  w.fake.setScript([{ match: '.', code: 1, stderr: 'HTTP 502' }]);
+  const unreadable = w.run(['publish']);
+  assertExit(unreadable, 0);
+  assert.deepEqual(queueEntries(w).map((e) => e.line), [line], 'GitHub unreadable: kept');
+  assert.equal(unreadable.json.pushed, false);
+
+  state('MERGED');
+  const merged = w.run(['publish']);
+  assertExit(merged, 0, merged.stderr + merged.stdout);
+  assert.deepEqual(merged.json.lines, [line]);
+  assert.ok(w.logOnBranch().includes(line));
+  assert.deepEqual(queueEntries(w), []);
+
+  const w2 = world();
+  stageDefault(w2);
+  w2.fake.setScript([{ match: '^pr view 12 --json state', stdoutJson: { state: 'CLOSED' } }]);
+  const closed = w2.run(['publish']);
+  assertExit(closed, 0, closed.stderr + closed.stdout);
+  assert.deepEqual(queueEntries(w2), [], 'closed without merging: dropped');
+  assert.equal(closed.json.pushed, false);
+  assert.equal(w2.onOrigin('branch', '--list', BRANCH).trim(), '');
+});
+
+test('queue entries round-trip afterMerge, and an invalid value is ignored (a plain entry)', () => {
+  const w = world();
+  mkdirSync(join(w.repo.dir, '.git', 'claude-pipeline'), { recursive: true });
+  writeFileSync(w.queueFile, [
+    { line: L1, at: 'a', afterMerge: 5 }, { line: L2, at: 'b', afterMerge: 'x' }, { line: '- three', at: 'c', afterMerge: -1 }, { line: '- four', at: 'd', afterMerge: 1.5 },
+  ].map((e) => JSON.stringify(e)).join('\n') + '\n');
+  w.fake.setScript([{ match: '^pr view 5 --json state', stdoutJson: { state: 'OPEN' } }]);
+  const r = w.run(['publish']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual(r.json.lines, [L2, '- three', '- four'], 'only the valid afterMerge entry is held');
+  assert.deepEqual(queueEntries(w), [{ line: L1, at: 'a', afterMerge: 5 }]);
 });
 
 test('an old queue file with "staged" entries is read as plain queued and published', () => {

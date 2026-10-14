@@ -34,7 +34,8 @@ export const queuePath = (cwd) => join(pipelineStateDir(cwd), QUEUE_FILE);
 export const withQueueLock = (cwd, fn) =>
   withLock(LOCK_NAME, fn, { dir: join(pipelineStateDir(cwd), 'locks'), waitMs: LOCK_WAIT_MS });
 
-// Every entry is `{line, at}`. (Older queue files may carry `staged: {pr, at}` from the retired "staged in PR N" flow: it is
+// Every entry is `{line, at}`, plus `afterMerge: N` for a line held until PR N merges (the deprecated `stage --pr N`); a value that is
+// not a positive integer is ignored (a plain entry). (Older queue files may carry `staged: {pr, at}` from the retired "staged in PR N" flow: it is
 // ignored, the entry is plain queued.) A line that is not valid JSON or has no string `line` is dropped rather than trusted.
 export function readQueue(cwd) {
   let text;
@@ -49,7 +50,9 @@ export function readQueue(cwd) {
     if (!raw.trim()) continue;
     try {
       const e = JSON.parse(raw);
-      if (e && typeof e.line === 'string' && e.line !== '') entries.push({ line: e.line, at: e.at ?? null });
+      if (e && typeof e.line === 'string' && e.line !== '') {
+        entries.push({ line: e.line, at: e.at ?? null, ...(Number.isSafeInteger(e.afterMerge) && e.afterMerge > 0 ? { afterMerge: e.afterMerge } : {}) });
+      }
     } catch { /* a torn or hand-edited line: skip it */ }
   }
   return entries;
@@ -73,13 +76,14 @@ export function assertSingleLine(line) {
   return line.trim();
 }
 
-// Idempotent: a line already in the queue is not added again. Caller holds the queue lock.
-export function appendToQueue(cwd, line, at = new Date().toISOString()) {
+// Idempotent: a line already in the queue is not added again. Caller holds the queue lock. `afterMerge` (a PR number) holds the line
+// back from `publish` until that PR has merged.
+export function appendToQueue(cwd, line, at = new Date().toISOString(), { afterMerge = null } = {}) {
   const clean = assertSingleLine(line);
   if (readQueue(cwd).some((e) => e.line === clean)) return clean;
   const file = queuePath(cwd);
   mkdirSync(dirname(file), { recursive: true });
-  appendFileSync(file, `${JSON.stringify({ line: clean, at })}\n`);
+  appendFileSync(file, `${JSON.stringify({ line: clean, at, ...(afterMerge ? { afterMerge } : {}) })}\n`);
   return clean;
 }
 
