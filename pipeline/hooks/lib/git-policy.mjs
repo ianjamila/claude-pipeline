@@ -443,7 +443,7 @@ function pushReading(args, dir, gitDir, ctx, configs) {
   if (repoGiven || (positionals.length && !looksLikeRemote(positionals[0]))) refspecs = positionals;
   else refspecs = positionals.slice(1);
   if (refspecs.length === 0) {
-    if (dir === null) return deny('cannot tell which directory this `git push` runs in (unresolved cd / -C), so the current branch cannot be verified.');
+    if (dir === null) return deny('cannot tell which directory this `git push` runs in (unresolved cd / -C), so the current branch cannot be verified. Rewrite: name the branch (`git push origin agent/x`), or give the directory literally (`git -C /abs/repo push`, or `cd /abs/repo && git push`).');
     if (ctx.cfgDirty || ctx.envCfgDirty || configs.some((c) => RISKY_CONFIG(c.key, c.value))) {
       return deny('this line changes upstream/push configuration (git config, branch -u, -c push.default/remote.*.push), so where a bare `git push` goes cannot be verified. Push explicitly: git push -u origin HEAD:agent/<slug>.');
     }
@@ -1864,7 +1864,7 @@ function evalString(str, startDir, ctx, level) {
   // 500 `true;` must not slip through on a word match).
   if (cmds.truncated) return deny('command too complex to verify (the parser gave up). Split it into simpler commands.');
   if (cmds.dynamic && GUARDED_WORDS.test(str)) {
-    return deny('the command that runs is only known at run time ($VAR / $(...) / piped into a shell) and the line mentions a guarded operation, so it cannot be verified. Write the command out literally.');
+    return deny('the command that runs is only known at run time ($VAR / $(...) / piped into a shell) and the line mentions a guarded operation, so it cannot be verified. Rewrite: write the command out literally (`git push origin agent/x`, not `$G push` or `... | sh`); if the guarded words are only text (a commit message, a PR body), put that text in a file (`git commit -F msg.txt`, `gh pr create --body-file body.md`).');
   }
   // A variable whose value is not certain (see collectAssignments) denies the line when it reaches git / gh, a command
   // that runs code, cd / pushd / popd or a command name: the checks below read the expanded text.
