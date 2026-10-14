@@ -481,7 +481,7 @@ pipeline worktrees prune [--repo DIR] [--dry-run] [--notify] [--summary-only]   
 pipeline worktrees keep NAME [--reason TEXT] [--repo DIR]   -> {ok, slug, locked}
 pipeline worktrees unkeep NAME [--run ID] [--repo DIR]   -> {ok, slug, unlocked}
 pipeline worktrees holding [--purge] [--repo DIR]   -> {ok, batches:[...], purged:[...]}
-pipeline worktrees schedule (--install [--at HH:MM] | --remove | --status) [--repo DIR]   -> {ok, installed, line, timezone, warning?} | {ok, removed} | {ok, installed, line}
+pipeline worktrees schedule (--install [--at HH:MM] | --remove | --status) [--repo DIR]   -> {ok, installed, line, timezone, warning?} | {ok, removed} | {ok, installed, line}   (macOS: a launchd LaunchAgent; adds plist, changed, loaded, note)
 ```
 
 Design: [docs/specs/2026-10-13-worktree-prune-design.md](specs/2026-10-13-worktree-prune-design.md). `--repo` may name the
@@ -515,7 +515,7 @@ summary prints its usual error object, also on one line.
 Exit: 0 completed (also `skipped: "already running"` / `"git operation in progress"`) · 2 usage, repo, config, or the
 `gh` repository does not match `origin` · 3 GitHub unavailable.
 
-`schedule` (Linux, cron) keeps one crontab line per repository, found again by the marker comment
+`schedule` (Linux: cron; macOS: launchd, below) keeps one crontab line per repository, found again by the marker comment
 `# claude-pipeline worktrees-prune <lock name>` at its end: `--install` adds it (or replaces it in place, so installing from the
 main checkout or any linked worktree gives the same single line) to run `worktrees prune --notify --summary-only` from the main checkout at
 `--at HH:MM` (default `02:30`), `--remove` deletes it, `--status` says whether it is there. Every other crontab line is kept
@@ -526,6 +526,28 @@ created at install), so a failed start leaves a trace; the file is not rotated, 
 per run. cron runs in the host's time zone: `--install`
 reports it as `timezone` (from `timedatectl`, else the `/etc/localtime` link, else `/etc/timezone`) and adds a `warning` when
 it is not `Asia/Manila` or cannot be read. The job only does what `worktrees.mode` allows, so a repository still on `report` just gets the report.
+
+**macOS (launchd).** The Mac sleeps, so a 02:30 cron job is missed; launchd runs a missed `StartCalendarInterval` job when the
+Mac wakes. On macOS `schedule` therefore installs one per-user LaunchAgent per repository instead of a crontab line (Windows
+is still `unsupported-platform`: "schedule is only supported on Linux (cron) and macOS (launchd)"):
+
+- Label `com.claude-pipeline.<lock name>` (the same lock name as the cron marker); plist
+  `~/Library/LaunchAgents/<label>.plist`. It runs `node <pipeline> worktrees prune --notify --summary-only` from the main
+  checkout at `--at HH:MM` (default `02:30`, `StartCalendarInterval`, `RunAtLoad` false). Its `PATH` is the directories of `node`,
+  `git` and `gh` (found at install time; exit 2 `tool-missing` if `git` or `gh` is missing) plus `/usr/bin:/bin:/usr/sbin:/sbin`
+  (`lsof` is `/usr/sbin/lsof`).
+- Output goes to the same `cron-<lock name>.log` in the prune log directory (`~/.local/state/pipeline`, or
+  `PIPELINE_PRUNE_LOG_DIR`), standard output and error alike.
+- `--install` writes the plist only when its text differs, then `launchctl bootout gui/<uid>/<label>` (a "not loaded" failure is
+  ignored) and `launchctl bootstrap gui/<uid> <plist>`; so a repeat install also reloads the job. A failing bootstrap is exit 2
+  `{error: "launchctl"}`. The result is `{ok, installed, line, plist, changed, timezone, warning?, note}` (`line` is the plist
+  path); `timezone` comes from the `/etc/localtime` link, and `warning` fires when it is not `Asia/Manila` or unreadable.
+- `--remove` boots the job out and deletes the plist: `{ok, removed}`. `--status` is `{ok, installed, line, plist, loaded}`:
+  `installed` means the plist exists **and** launchd has it loaded; `line` is the plist path (or `null` when it is missing).
+- Check by hand: `launchctl print gui/$(id -u)/<label>`.
+
+To replace a hand-made Mac cleanup job, the owner runs `pipeline worktrees schedule --install` once per repository and sets
+`worktrees.mode: on` in that repository's `.claude/pipeline.yml` (until then the job only reports).
 
 ## Where this differs from spec section 5.2
 
