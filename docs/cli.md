@@ -142,6 +142,18 @@ pipeline followups create --round R [--repo DIR]
 
 Exit: 0 · 2 usage / no state · 3 GitHub (`gh`) unavailable.
 
+## guard-log
+
+count guard denies per day and reason code from the deny log.
+
+```
+pipeline guard-log [--days N] [--file PATH]   -> {ok, file, days:{YYYY-MM-DD:{total,byCode}}, total, perDay, skipped}; default 7 days
+```
+
+Exit: 0 (a missing log is an empty summary) · 2 usage.
+
+Both guard hooks append one line per deny to `~/.claude/pipeline-state/guard-log.jsonl`: `{ts, session, hook, reason_code, cmd_hash}`. The command and reason text are never stored (`cmd_hash` is the first 16 hex of the command's SHA-256). The file rotates to `guard-log.1.jsonl` past 5 MB; `PIPELINE_GUARD_LOG=0` turns the log off. `perDay` is the total divided by the days that have entries; lines that cannot be read are counted in `skipped`.
+
 ## hardstops
 
 list hard-stop hits for a branch diff (exit 1 on blocking hits unless human-approved).
