@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, REPO_VIEW, pipelineYml } from './helpers/fakegh-env.mjs';
 import { lockNameFor } from '../pipeline/lib/worktree-prune/rules.mjs';
-import { summaryLine } from '../pipeline/lib/worktree-prune/run.mjs';
+import { summaryLine, outsideReport } from '../pipeline/lib/worktree-prune/run.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const bin = join(here, '..', 'pipeline', 'bin', 'pipeline.mjs');
@@ -122,8 +122,8 @@ function world() {
     version: 1, items: [{ original: '/x/f.txt', stored: join(holdingRepo, '2026-01-01', 'old', 'f.txt'), size: 4, sha256: '', archivedAt: iso(Date.now() - 40 * DAY), slug: 'old', pr: 9 }],
   }));
   mkdirSync(join(repo.dir, 'screenshots from mac'));
-  mkdirSync(join(dirs.scratch, 'proj', 'sess'), { recursive: true });
-  writeFileSync(join(dirs.scratch, 'proj', 'sess', 'note.txt'), 'scratch\n');
+  mkdirSync(join(dirs.scratch, '-proj', 'sess'), { recursive: true });
+  writeFileSync(join(dirs.scratch, '-proj', 'sess', 'note.txt'), 'scratch\n');
 
   const graphqlPage = (nodes) => ({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: false, endCursor: null }, nodes } } } });
   const script = (extra = []) => [...extra, { match: '^repo view', stdoutJson: REPO_VIEW }, { match: '^api graphql', stdoutJson: graphqlPage(prs) }];
@@ -176,7 +176,7 @@ test('report mode (default): the eligible worktree is reported, nothing on disk 
   assert.equal(r.json.holding.batches.length, 1);
   const outside = r.json.outside.map((o) => o.path);
   assert.ok(outside.includes(join(w.repo.dir, 'screenshots from mac')), JSON.stringify(outside));
-  assert.ok(outside.includes(join(w.dirs.scratch, 'proj', 'sess')), JSON.stringify(outside));
+  assert.ok(outside.includes(join(w.dirs.scratch, '-proj', 'sess')), JSON.stringify(outside));
   assert.match(r.json.summary, /^worktrees prune \(demo, report mode\): /);
   assert.deepEqual(w.snapshot(), before, 'report mode changes nothing');
   const log = readFileSync(join(w.dirs.logs, 'prune-acme_widgets.log'), 'utf8').trim().split('\n');
@@ -782,4 +782,14 @@ test('schedule through the CLI uses the system crontab: no crontab yet, then ins
   assert.equal(cli('--status').json.installed, true);
   assert.equal(cli('--remove').json.removed, true);
   assert.equal(readFileSync(store, 'utf8'), '');
+});
+
+test('outsideReport lists only Claude project dirs (name starts with "-") as session scratch', () => {
+  const root = tmp('outside-root-');
+  const scr = tmp('outside-scratch-');
+  mkdirSync(join(scr, '-home-x-proj', 'sess1'), { recursive: true });
+  mkdirSync(join(scr, '-home-x-proj', 'sess2'), { recursive: true });
+  mkdirSync(join(scr, 'bash-edit-diff', 'abc123'), { recursive: true }); // Claude Code's own edit-diff temp, not a project
+  const got = outsideReport(root, { PIPELINE_SCRATCH_DIR: scr }).map((o) => o.path).sort();
+  assert.deepEqual(got, [join(scr, '-home-x-proj', 'sess1'), join(scr, '-home-x-proj', 'sess2')]);
 });
