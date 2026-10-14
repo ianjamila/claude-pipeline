@@ -70,6 +70,7 @@ const EVENTS = Object.freeze({
   'arbiter-escalation': { label: 'Arbiter escalation', priority: 4, tag: 'scales' },
   stopped: { label: 'Run stopped', priority: 4, tag: 'octagonal_sign' },
   'prod-unknown': { label: 'Production check unfinished', priority: 4, tag: 'question' },
+  worktrees: { label: 'Worktree cleanup', priority: 3, tag: 'broom' },
   test: { label: 'Test', priority: 3, tag: 'bell' },
 });
 
