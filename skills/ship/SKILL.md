@@ -53,6 +53,11 @@ number, `R` a review round number, `<slug>` the branch slug.
    `awaiting-owner-merge`; an owner "merge" for that exact head in THIS session is the only way past it. Records,
    comments and labels never count as approval. Production on a resumed run is watched with
    `prod-watch --observe-only` (with `production.watch: workflow`, not at all: the workflow owns it); rollback stays with the original run or the owner.
+10. **Low-risk PRs may merge on their own** (owner ruling 2026-10-14). A normal run whose final gate passes with no
+    hard-stop hit (`ownerMerge` is `0`), no `needs-human` and no owner-ruled item merges through `P merge` without asking
+    the owner: that is intended, and a review must not flag it. Anything that hits a hard-stop, ends in `needs-human`,
+    or needs the owner's chat approval (`owner_approval: chat`, resumed runs) still waits for the owner's "merge" for the
+    exact head (the **Owner-merge approval** rule below). The ruling widens nothing else: invariants 1, 2 and 9 stand.
 
 ## Ending a run with a PR open
 
@@ -71,6 +76,13 @@ only for a stop that cannot go through summary. Two shapes, used by name below:
 `--action` is one short line in plain words ("Close the pause issue, then say resume"); `--cause` is a short slug
 (`final-gate:labels`, `codex:quota`, `verify-red`) that keeps a reworded retry from pushing twice. Stops before a PR
 exists (Step 0 preflight and labels ensure) just stop: the owner is at the keyboard, nothing is pushed.
+
+**Cost booking (best effort, never a reason to stop).** Once the PR exists, after each subagent dispatch or review call
+that reports its token use, book it: `P cost --pr N --phase <build|verify|review|gate|…> --role <implementer|judge|arbiter|verifier|controller>
+--input <n> --output <n> [--cache-read <n>] [--cache-write <n>] [--usd <x>]` (an agent transcript can be passed instead:
+`--from-transcript <file>`). Add `--retry` for each fix-and-reverify retry, and `--session <this session's id>` once per
+session so `P summary` can count the guard blocks. `P summary` shows the totals and the per-phase / per-role breakdown. A failed
+`P cost` is a warning only; skip it when no figures are available.
 
 ## Step 0 — opt-out, preflight
 
