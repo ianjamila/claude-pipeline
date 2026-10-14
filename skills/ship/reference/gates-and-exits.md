@@ -28,7 +28,7 @@ A stop on any failed check below follows "Ending a run with a PR open" in `SKILL
 | | `step X was skipped; list it in verify.skippable_steps` (or `skipped without a reason`) | the owner decides whether X may be skipped: if yes they add it to `verify.skippable_steps` in `pipeline.yml` (never you); otherwise re-run `verify.full` so X really runs. A pass says `N steps: M ran, K skipped: X — <reason>`: quote the skipped steps in the PR body |
 | `hardstops` | blocking hits (report-only hits pass: the detail says `N report-only`; with `owner_approval: chat` it passes and says `N owner-merge`, and the gate output has `ownerMerge` > 0) | Step 3.5 (`needs-human`); chat mode: **Owner-merge approval** in SKILL.md |
 | `integrity` | test weakening (chat mode: passes, `N owner-merge test-integrity violation(s)`, counted in `ownerMerge`) | implementer restores the tests, or `needs-human` (chat mode: **Owner-merge approval**) |
-| `review` | no clean round covers the current content, or open items | Step 4 (a new round), then Step 5 again |
+| `review` | no clean round covers the current content, or open items (an item the owner ruled in chat with `P triage owner-ruling` passes but the detail lists `N owner-ruled item(s), owner-merge: <id "quote">` and `ownerMerge` > 0) | Step 4 (a new round), then Step 5 again; chat mode: **Owner-merge approval** in SKILL.md |
 | `ci` | checks failing / not passing | fix the cause (new commit ⇒ Step 5.1); `required check(s) missing` ⇒ `needs-human` + `P summary --outcome needs-human --cause final-gate:ci --action "…"` (the CI config is wrong) |
 | `preview` | no/old smoke evidence, deployment mismatch | redo Step 5.6 on the current head |
 

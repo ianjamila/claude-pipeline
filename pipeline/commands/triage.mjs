@@ -19,7 +19,7 @@ import {
 } from '../lib/review-context.mjs';
 
 export const meta = {
-  summary: 'apply the judge triage, settle disputed bugs with test results, close the light lane',
+  summary: 'apply the judge triage, settle disputed bugs with test results, close the light lane, record owner rulings made in chat',
   usage: [
     'pipeline triage validate --round R (--from-tag TAG | --file F) [--projects-dir DIR] [--max-age-ms N] [--repo DIR]',
     '  -> {ok, round, counts:{ACCEPT,FOLLOW-UP,REJECT}, settled, unsettled, judgeProof}; exit 1 + errors when the judge output is invalid (state untouched)',
