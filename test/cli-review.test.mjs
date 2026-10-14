@@ -2206,3 +2206,17 @@ test('arbiter needed: returns promptHeader, exactly the ROUND / INPUT-DIGEST hea
   assert.ok(readFileSync(r.json.inputPath, 'utf8').startsWith(`${r.json.promptHeader}\n\n`));
   assert.equal(arbiterRun(w, { prompt: `${r.json.promptHeader}\nRule on every item.` }).code, 0, 'a prompt that starts with the header passes the proof');
 });
+
+test('triage settle: a cached copy of an owner ruling (by cache, ownerQuote kept) is still the owner\'s word', (t) => {
+  const w = world(t);
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  editState(w, (s) => {
+    s.rounds[0].items[0].judge = { decision: 'REJECT', confidence: 'high', reason: 'r', ...DISPUTED };
+    s.rounds[0].items[0].final = { decision: 'REJECT', by: 'cache', needsHuman: false, reason: 'ok', ownerQuote: 'reject it', ruledAt: '2026-10-14T00:00:00.000Z' };
+  });
+  const before = w.stateText();
+  const s = w.cli(settleArgs(w, 'R1-B1', 'bug-disproved'));
+  assertExit(s, 1, s.stdout);
+  assert.match(s.json.reason, /already ruled by the owner/);
+  assert.equal(w.stateText(), before, 'state untouched');
+});

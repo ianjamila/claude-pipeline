@@ -165,7 +165,7 @@ export function applyRulings(items, rulings, { proofOk, transcript } = {}) {
     const next = structuredClone(item);
     const r = byId.get(item.id);
     if (!r) return next;
-    if (next.final?.by === 'test' || next.final?.by === 'owner') return next; // a test is evidence and the owner's word is final; no opinion overrides either
+    if (next.final?.by === 'test' || isOwnerRuled(next)) return next; // a test is evidence and the owner's word is final (also its cached copy, by 'cache'); no opinion overrides either
     next.arbiter = { ruling: r.ruling, confidence: r.confidence, reasoning: r.reasoning, transcript: transcript ?? null };
     const rulingValid = DECISIONS.includes(r.ruling) && CONFIDENCES.includes(r.confidence);
     const dismissesBlockingSecurity =

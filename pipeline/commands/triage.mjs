@@ -12,7 +12,7 @@ import { runShellAsync } from '../lib/proc.mjs';
 import { findSubagentTranscript, proveModel, extractJsonBlock } from '../lib/transcript.mjs';
 import { saveState, updateItems } from '../lib/state.mjs';
 import {
-  applyJudge, applyOwnerRuling, applyTestResult, DECISIONS, finalizeWithoutArbiter, markLightLane, validateTriage,
+  applyJudge, applyOwnerRuling, applyTestResult, DECISIONS, finalizeWithoutArbiter, isOwnerRuled, markLightLane, validateTriage,
 } from '../lib/triage.mjs';
 import {
   ensureRoundDir, findItem, findRound, readFileOrFail, requireState, withStateLock, writeJson,
@@ -140,7 +140,7 @@ const tailOf = (s, n) => {
 function settleRefusal(item, id) {
   if (item.final?.needsHuman === true) return `${id} needs a human decision; a test result cannot settle it`;
   if (item.final?.by === 'arbiter') return `${id} was already ruled by the arbiter`;
-  if (item.final?.by === 'owner') return `${id} was already ruled by the owner`;
+  if (isOwnerRuled(item)) return `${id} was already ruled by the owner`;
   if (item.implemented === true) return `${id} is already implemented`;
   if ((item.test?.status ?? 'none') !== 'none') return `${id} already has a test result`;
   if (!(item.judge?.disputedBug === true && item.judge.settleTest?.possible === true)) {

@@ -1050,3 +1050,14 @@ test('an owner ruling is not overridden by an arbiter ruling or a test result', 
   const [after] = applyRulings([owner], { rulings: [{ id: 'R1-B1', ruling: 'ACCEPT', confidence: 'high', reasoning: 'x' }] }, { proofOk: true });
   assert.deepEqual(after.final, owner.final);
 });
+
+test('an owner ruling reused from the cache (by cache, ownerQuote kept) is not overridden either, and stays owner-ruled', () => {
+  const owner = applyOwnerRuling(item({ id: 'R1-B1', fingerprint: 'fp', final: needsHumanFinal() }), ownerOk('REJECT'));
+  const [cached] = reuseRuled([item({ id: 'R2-B1', fingerprint: 'fp' })], ruledCacheFrom([owner]));
+  assert.equal(cached.final.by, 'cache');
+  const ruling = { rulings: [{ id: 'R2-B1', ruling: 'ACCEPT', confidence: 'high', reasoning: 'x' }] };
+  const [after] = applyRulings([cached], ruling, { proofOk: true });
+  assert.deepEqual(after.final, cached.final, 'the arbiter cannot replace it');
+  assert.equal(after.final.ownerQuote, 'yes, follow-up');
+  assert.equal(isOwnerRuled(after), true);
+});
