@@ -13,7 +13,7 @@
         "properties": {
           "id": { "type": "string", "minLength": 1, "description": "Codex finding id, e.g. R1-B1 (blocking), R1-S1 (suggestion), R1-W1 (worth considering)." },
           "decision": { "enum": ["ACCEPT", "FOLLOW-UP", "REJECT"], "description": "ACCEPT: implement in this PR. FOLLOW-UP: becomes a GitHub issue. REJECT: wrong or not worth it." },
-          "confidence": { "enum": ["high", "low"], "description": "low when it depends on intent, product judgment, or facts the judge could not verify." },
+          "confidence": { "enum": ["high", "medium", "low"], "description": "low when it depends on intent, product judgment, or facts the judge could not verify. medium is accepted and escalates to the arbiter like low; prefer high or low." },
           "reason": { "type": "string", "description": "One line citing the code." },
           "disputedBug": { "type": "boolean", "description": "true when Codex claims a bug the judge is not convinced of." },
           "settleTest": {

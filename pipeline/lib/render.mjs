@@ -111,7 +111,7 @@ function outliersSection(entries, modelProofs) {
     const j = item.judge;
     const decision = item.final?.decision ?? j.decision;
     const strong = item.bucket === 'BLOCKING' && (j.decision === 'REJECT' || j.decision === 'FOLLOW-UP');
-    const closeCall = item.final?.by !== 'test' && decision === 'REJECT' && j.confidence === 'low';
+    const closeCall = item.final?.by !== 'test' && decision === 'REJECT' && j.confidence !== 'high';
     if (!strong && !closeCall) continue;
     const settled = item.final ? `final: ${line(item.final.decision ?? 'unknown')} by ${line(item.final.by)}` : 'final: pending';
     out.push(`- ${findingLabel(item)} · ${codexView(item)} · ${opusView(item)} · ${settled} _(${strong ? 'strong disagreement' : 'close call'})_`);
