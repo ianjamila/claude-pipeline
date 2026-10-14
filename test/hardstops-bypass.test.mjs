@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { classifyHardStops, collectHardStops, scanEnvLine, parsePythonDeps, enclosingStatements } from '../pipeline/lib/hardstops.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { MIG, pkg, cfg, file, rulesOf, classify, run } from './helpers/hardstops.mjs';
-import { assertLinear } from './helpers/timing.mjs';
+import { assertLinear, bestOf } from './helpers/timing.mjs';
 
 const A = (path, ...added) => file(path, { status: 'A', added });
 const flags = (files, opts) => rulesOf(run(files, opts));
@@ -569,9 +569,11 @@ test('13 the whole-file import scan stays linear on a ~1.5 MB file of adversaria
   for (const [unit, n, name, padOnly] of shapes) {
     const make = (k) => (padOnly ? `from${' '.repeat(k)}` : unit.repeat(k));
     const smallText = make(n / 16), fullText = make(n);
-    const t0 = performance.now();
+    // Calibrate on WARM runs: a cold first run (JIT, regex compile) made reps 1 on Windows (`;import a,` read 1 ms at n/16 against
+    // 187 ms at n under ~15.6 ms CPU ticks). Cap 200 so a fast machine's tiny small scan still reaches ~60 ms.
     once(smallText, name);
-    const reps = Math.min(50, Math.max(1, Math.ceil(60 / Math.max(performance.now() - t0, 1))));
+    const best = bestOf(3, () => { const t0 = performance.now(); once(smallText, name); return performance.now() - t0; });
+    const reps = Math.min(200, Math.max(1, Math.ceil(60 / Math.max(best, 0.3))));
     const label = `${unit.slice(0, 16)}...`;
     const { hi } = assertLinear(cpu(smallText, name, reps), cpu(fullText, name, reps), { label, factor: 16, ratio: 64 });
     assert.ok(hi / reps < 8000, `${label} took ${Math.round(hi / reps)}ms of CPU`);
