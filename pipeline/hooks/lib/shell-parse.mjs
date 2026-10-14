@@ -920,6 +920,12 @@ function producedBy(seg, st, hops = 0, exact = true) {
   }
   const pa = seg.final ? seg.final.argv : [];
   const pn = pa.length ? base(pa[0]) : '';
+  // Why: the stream several producers make is rebuilt only when each of them really feeds it, all of them (background review of f3aa3f6): one whose stdout goes
+  // elsewhere (`cat b >&2`, `> /dev/null`) adds nothing, and a command between them that is no reader and no static text (`exit`, a test, `false` under set -e)
+  // may stop the group and drop the producers after it (`a`+`b` pushes main while the joined `a`+`b`+`c` reads main-feature). Such a join is refused (unordered).
+  const OUT = ['>', '>>', '>|', '&>', '&>>', '>&'];
+  if ((seg.redirects ?? []).some((r) => OUT.includes(r.op) && (r.fd === null || r.fd === undefined || r.fd === 1) && r.target !== '&1')) st.unordered = true;
+  if (pa.length && !['echo', 'printf', 'true', ':'].includes(pn) && !Object.hasOwn(READERS, pn)) st.unordered = true;
   noteReads(seg, pn, pa, st, exact);
   if (pn === 'echo' || pn === 'printf') {
     for (const a of pa.slice(1)) {

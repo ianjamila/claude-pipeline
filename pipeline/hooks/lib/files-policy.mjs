@@ -1451,7 +1451,7 @@ const WRITE_HINT = /write|append|unlink|\brm\b|rmSync|rmdir|rename|copy|\bcp\b|\
 // installed files are not judged (the installed CLI legitimately names its own settings).
 function judgeScriptFile(sf, dirs, ctx, opts, scanRaw = '', keepBackslash = false) {
   if (sf.kind === 'sqllines') return judgeSqlLines(sf, dirs, ctx, opts);
-  if (sf.joined) return judgeJoinedScripts(sf, dirs, ctx, opts);
+  if (sf.joined) return judgeJoinedScripts(sf, dirs, ctx, opts, scanRaw);
   if (sf.ambiguous) return judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw);
   // expandRefs turns \ into / (Windows paths), but off Windows a backslash is part of the file name: judge that reading too
   if (!keepBackslash && mayHoldBackslash(sf.file, ctx)) {
@@ -1490,7 +1490,7 @@ function judgeScriptFile(sf, dirs, ctx, opts, scanRaw = '', keepBackslash = fals
 // the command names them, repeats included (a protected name split across them is one name). `scan`: the text a rewriting command prints from
 // them (in an order we do not know): refused when the joined text refers to a protected file or switch, read in either order. Run in every
 // directory the command may be in; a file that is missing there prints nothing, and the pipeline's own installed files are not judged (as above).
-function judgeJoinedScripts(sf, dirs, ctx, opts) {
+function judgeJoinedScripts(sf, dirs, ctx, opts, scanRaw = '') {
   const readings = [false];
   if (sf.joined.some((w) => mayHoldBackslash(w, ctx))) readings.push(true); // a backslash is a file name character off Windows: judge that reading too
   const seen = new Set();
@@ -1522,7 +1522,7 @@ function judgeJoinedScripts(sf, dirs, ctx, opts) {
         if (wr) {
           cands = writtenCandidates(wr, typeof text === 'string' ? text : null, (q) => ctx.readText(q));
           if (cands === null) {
-            const r = judgeWrittenScript(wr, sf, abs, d || ctx.cwd, ctx, opts, '');
+            const r = judgeWrittenScript(wr, sf, abs, d || ctx.cwd, ctx, opts, scanRaw);
             if (r) return r;
           }
         }
