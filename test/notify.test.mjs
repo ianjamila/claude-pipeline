@@ -126,6 +126,20 @@ test('default actions name the one thing to do', () => {
   assert.equal(defaultAction('needs-human'), 'Read the needs-human comment and decide');
   assert.equal(defaultAction('arbiter-escalation', { ids: ['a1', 'b2'] }), 'Rule on a1, b2 in the triage comment');
   assert.equal(defaultAction('stopped'), 'Read the PR: the run stopped');
+  assert.equal(defaultAction('pipeline-update'), 'Run the manual update in your own terminal and read its error');
+});
+
+test('pipeline-update (the hourly auto-update) is a known event: custom title, the owner action, one push per cause', async () => {
+  const m = buildMessage({ event: 'pipeline-update', pr: null, title: 'Pipeline auto-update failed', action: 'install-failed. Run the manual update in your own terminal and read its error' }, { repoName: 'claude' });
+  assert.equal(m.title, 'Pipeline auto-update failed');
+  assert.equal(m.message, 'Pipeline auto-update: install-failed. Run the manual update in your own terminal and read its error (claude)');
+  assert.equal(m.priority, 4);
+  const r = rig();
+  const ev = { event: 'pipeline-update', pr: null, title: 'Pipeline auto-update failed', action: 'x', head: 'a'.repeat(40), outcome: 'failed', cause: 'install-failed:aaaaaaa@t1' };
+  assert.equal((await notifyEvent(ev, r.deps)).sent, true);
+  assert.equal((await notifyEvent({ ...ev, action: 'reworded' }, r.deps)).reason, 'duplicate');
+  assert.equal((await notifyEvent({ ...ev, cause: 'install-failed:aaaaaaa@t2' }, r.deps)).sent, true);
+  assert.equal(r.fetchCalls.length, 2);
 });
 
 // ---- message --------------------------------------------------------------------------------------------------------------

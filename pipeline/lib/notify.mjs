@@ -59,6 +59,8 @@ export function defaultAction(event, { head, ids = [], reason } = {}) {
       return ids.length ? `Rule on ${ids.join(', ')} in the triage comment` : 'Rule on the escalated items in the triage comment';
     case 'needs-human':
       return 'Read the needs-human comment and decide';
+    case 'pipeline-update':
+      return 'Run the manual update in your own terminal and read its error';
     default:
       return reason ? `Read the PR: ${reason}` : 'Read the PR: the run stopped';
   }
@@ -71,6 +73,7 @@ const EVENTS = Object.freeze({
   stopped: { label: 'Run stopped', priority: 4, tag: 'octagonal_sign' },
   'prod-unknown': { label: 'Production check unfinished', priority: 4, tag: 'question' },
   worktrees: { label: 'Worktree cleanup', priority: 3, tag: 'broom' },
+  'pipeline-update': { label: 'Pipeline auto-update', priority: 4, tag: 'arrows_counterclockwise' }, // `update --scheduled`: failures and pauses only
   test: { label: 'Test', priority: 3, tag: 'bell' },
 });
 

@@ -438,11 +438,26 @@ pipeline update [--claude-home DIR] [--check] [--json]
                      the install is complete, unmodified and identical to main (allowed inside Claude Code)
   --json             no progress text on stderr (the result is always one JSON object on stdout)
   Refuses inside Claude Code (run it in your own terminal) unless --check or PIPELINE_ADMIN=1.
+pipeline update --scheduled [--claude-home DIR] [--json]
+  What the unattended auto-update job runs: install main when the install is behind it, do nothing when current, never touch a
+  modified install or downgrade one (skipped); push the owner only on failure or a pause, once per main sha. One compact JSON line.
 ```
 
 Exit: 0 updated / up to date (`--check`: complete, unmodified and identical to main) · 1 not up to date (`--check`), upstream unreachable, or the fetch / install / verification failed · 2 usage, or refused inside Claude Code.
 
 Runs `install.mjs` from a clean, isolated download of exactly the commit main points to, then `install.mjs --check`; it succeeds only when that check passes and the installed stamp is that commit. It takes no install lock itself (the installer it runs does). A copy installed with `--skip-file-guard` stays that way.
+
+`--scheduled` is what the auto-update job runs (see `update schedule`); it cannot be combined with `--check` and prints ONE compact JSON line per run (`mode: "scheduled"`). It resolves main and then:
+
+| installed copy | action | exit | owner pushed |
+|---|---|---|---|
+| clean, identical to main | `none` (no install) | 0 | no |
+| clean, behind main | `updated` (the normal update path; `before`, `after`) | 0 | no |
+| modified, incomplete, or no recorded source commit | `skipped`, `reason: "modified"` (never overwritten) | 0 | once per main sha |
+| ahead of main or diverged | `skipped`, `reason: "downgrade"` | 0 | once per main sha |
+| any failure (`upstream-unresolved`, `fetch-failed`, `installer-too-old`, `install-failed`, `check-failed`, `unverified`) | `failed`, the same `error` codes as a manual update | 1 | once per (error, main sha) |
+
+A busy install lock and an unresolved upstream (network, a failed compare) are transient: they push only after 3 runs in a row. The push is the notify event `pipeline-update` ("Pipeline auto-update failed" / "Pipeline auto-update paused") whose action is the one thing to do: run the manual update in your own terminal and read its error. Dedupe state: `auto-update-state.json` in `~/.local/state/pipeline` (or `PIPELINE_PRUNE_LOG_DIR`, next to the worktrees cron logs); a run that ends well (`none` / `updated`) clears it, so the next failure pushes again. A push that was not delivered is retried on the next run.
 
 ## update-branch
 
