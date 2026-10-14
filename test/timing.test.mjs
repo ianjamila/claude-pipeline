@@ -47,6 +47,11 @@ test('assertLinear factor 4: a quadratic cost (50 -> 800) fails and the message 
   assert.throws(() => assertLinear(() => 50, () => 800, { factor: 4, ratio: 8, label: 'fake' }), /fake: 50ms at n\/4 -> 800ms at n .*not linear/);
 });
 
+test('assertLinear factor 16: a linear cost with a 2.5x per-byte cache climb (20 -> 800) passes; a quadratic (20 -> 5120) fails and names n/16', () => {
+  assert.doesNotThrow(() => assertLinear(() => 20, () => 800, { factor: 16, ratio: 64 })); // 40x for 16x the input
+  assert.throws(() => assertLinear(() => 20, () => 5120, { factor: 16, ratio: 64, label: 'fake' }), /fake: 20ms at n\/16 -> 5120ms at n .*not linear/);
+});
+
 test('assertLinear: the default factor still reports n/2', () => {
   assert.throws(() => assertLinear(() => 50, () => 800), /50ms at n\/2 -> 800ms at n/);
 });

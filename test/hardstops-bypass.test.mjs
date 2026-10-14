@@ -554,11 +554,12 @@ test('13 a line stuffed with import specifiers stays fast (and is flagged as unr
 
 test('13 the whole-file import scan stays linear on a ~1.5 MB file of adversarial shapes', () => {
   // Linearity, not raw speed: CI's Node 20 runs these ~3x slower than a laptop, so an absolute budget flaked (2.1 s for the
-  // backslash chain on ubuntu-latest). Quadrupling the input (n/4 -> n) may at most ~quadruple the CPU (ratio < 8; a quadratic
-  // shape gives ~16), and a generous absolute ceiling still catches a pathological constant. Why 4x and not a doubling: on CI the
-  // single-line shapes (';import a, ', ';from a import ', 'require("') cost ~2x per doubling except at ONE doubling where the input
-  // outgrows the CPU cache and the cost steps up ~1.5x (measured locally, 0.5n->n->2n->4n->8n ratios 2.48 3.08 1.78 2.31; CI failures
-  // were 140->422 ms and 47->155 ms, best of 5). A 4x span with an 8x limit absorbs that one-off step, a quadratic still fails with 2x margin. Windows counts process CPU in ~15.6 ms ticks (15 ms ->
+  // backslash chain on ubuntu-latest). Growing the input 16x (n/16 -> n) may at most ~16x the CPU (ratio < 64; a quadratic
+  // shape gives ~256), and a generous absolute ceiling still catches a pathological constant. Why a span of 16x: the per-byte cost
+  // climbs over SEVERAL doublings (CPU cache), not one (Node 20 locally, `require("` at n/8..2n: 10 / 15 / 43 / 92 / 202 ms), so any
+  // narrow span sits near its limit (n/4 -> n failed on ubuntu-latest: 38 -> 315 ms, 8.3x vs a limit of 8). A wide span keeps 4x
+  // margin both ways: linear 16x, limit 64, quadratic 256x; measured n/16 -> n locally max 22.9x (Node 20), 16.4x (Node 24), and CI
+  // runs ~2x worse per byte (~45x expected worst). Windows counts process CPU in ~15.6 ms ticks (15 ms ->
   // 47 ms once failed this test), so each sample repeats the scan enough times (calibrated on the high-resolution clock) to span
   // ~60 ms (4 ticks), and each size is the best of several samples (timing.mjs).
   const shapes = [[';from a import ', 100_000, 'a.py'], ['from' + ' ', 1_500_000, 'a.ts', true], ['require("', 190_000, 'a.ts'], [';import a, ', 100_000, 'a.py'], ['"""\n', 250_000, 'a.py'],
@@ -567,12 +568,12 @@ test('13 the whole-file import scan stays linear on a ~1.5 MB file of adversaria
   const cpu = (text, name, reps) => () => cpuMs(() => { for (let i = 0; i < reps; i++) once(text, name); }).ms;
   for (const [unit, n, name, padOnly] of shapes) {
     const make = (k) => (padOnly ? `from${' '.repeat(k)}` : unit.repeat(k));
-    const smallText = make(n / 4), fullText = make(n);
+    const smallText = make(n / 16), fullText = make(n);
     const t0 = performance.now();
     once(smallText, name);
     const reps = Math.min(50, Math.max(1, Math.ceil(60 / Math.max(performance.now() - t0, 1))));
     const label = `${unit.slice(0, 16)}...`;
-    const { hi } = assertLinear(cpu(smallText, name, reps), cpu(fullText, name, reps), { label, factor: 4, ratio: 8 });
+    const { hi } = assertLinear(cpu(smallText, name, reps), cpu(fullText, name, reps), { label, factor: 16, ratio: 64 });
     assert.ok(hi / reps < 8000, `${label} took ${Math.round(hi / reps)}ms of CPU`);
   }
 });

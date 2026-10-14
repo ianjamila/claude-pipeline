@@ -19,8 +19,8 @@ export function bestOf(runs, sample) {
 }
 
 // Asserts that `large()` (`factor` times the input of `small()`, default 2) takes under `ratio` times as long (a linear scan gives ~factor,
-// a quadratic one ~factor^2). A wider span (factor 4, ratio 8) absorbs a one-off cost step between the two sizes (e.g. the input
-// outgrowing the CPU cache, ~1.5x at one doubling) that a single doubling cannot, while a quadratic (16x) still fails with 2x margin.
+// a quadratic one ~factor^2). A wider span (e.g. factor 16, ratio 64: linear 16x, quadratic 256x) absorbs a per-byte cost that climbs
+// across several doublings (the input outgrowing the CPU cache) that a single doubling cannot, with 4x margin on each side.
 // Both return ms. One warm-up run of `small` is discarded (JIT, caches). The baseline is the best of `smallRuns`; the large run is
 // repeated until it passes, at most `largeRuns` times, so a slow sample cannot fail the test but a slow best-of-all cannot pass.
 // The check also passes when the excess over a perfectly linear run is below `slackMs`: under the clock's resolution there is
