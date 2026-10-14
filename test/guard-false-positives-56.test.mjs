@@ -265,6 +265,9 @@ test('#56 replay: quotes inside a $( … ) inside double quotes are followed (a 
   // twins: a reassignment next to, or behind, nested quotes is still seen
   for (const cmd of [
     `for f in ok.sh; do echo "$(echo "'")"; f=run.sh; bash $f; echo "'"; done`,
+    `for f in ok.sh; do echo "'"; f=run.sh; bash $f; echo "'"; done`,
+    `for f in ok.sh; do echo "'"; f[0]=run.sh; bash $f; echo "'"; done`,
+    `for f in ok.sh; do echo "$(echo x) '"; f=run.sh; bash $f; echo "'"; done`,
     `for f in ok.sh; do echo "$(echo ')' )"; f=run.sh; bash $f; done`,
     `for f in ok.sh; do echo "$(case x in x) :;; esac)"; f=run.sh; bash $f; done`,
     `for f in ok.sh; do echo "\`echo 'x'\`"; f=run.sh; bash $f; done`,
