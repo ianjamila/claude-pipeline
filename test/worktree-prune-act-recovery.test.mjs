@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 import { archivePaths, listHolding, purgeHolding, removeWorktree } from '../pipeline/lib/worktree-prune/act.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 
@@ -101,14 +102,15 @@ test('a move that fails drops its intent and leaves the file in place', () => {
 
 // ---- recovery after a crash between the move and the "done" write: a pre-seeded pending entry ------------------------
 
-function seeded({ destExists, ageDays = 40 }) {
+const SHA = createHash('sha256').update('{"a":1}').digest('hex');
+function seeded({ destExists, ageDays = 40, content = '{"a":1}' }) {
   const h = mkdtempSync(join(tmpdir(), 'hold-'));
   const dir = join(h, BATCH);
   mkdirSync(join(dir, 's'), { recursive: true });
   const stored = join(dir, 's', 'state.json');
-  if (destExists) writeFileSync(stored, '{"a":1}');
+  if (destExists) writeFileSync(stored, content);
   const item = {
-    original: '/gone/wt/.review/state.json', stored, size: 7, sha256: '', archivedAt: new Date(T - ageDays * day).toISOString(), slug: 's', pr: 7,
+    original: '/gone/wt/.review/state.json', stored, size: 7, sha256: SHA, archivedAt: new Date(T - ageDays * day).toISOString(), slug: 's', pr: 7,
     status: 'pending', source: '/gone/q/.review/state.json',
   };
   writeFileSync(join(dir, 'MANIFEST.json'), JSON.stringify({ version: 1, items: [item] }));
@@ -191,4 +193,62 @@ test('removeWorktree: a failed "done" write with no way back keeps the worktree,
   assert.match(r.reason, /cleanup failed during removal: ENOSPC/);
   assert.equal(r.archived.length, 1, 'the file in holding is reported');
   assert.ok(restores(h).some((c) => c.includes(r.archived[0].stored)));
+});
+
+// ---- R1-B1: a pending entry counts as archived only when the stored file is the file that was meant to be stored ------
+
+for (const [what, content] of [['truncated (size differs)', '{"a"'], ['same size, different bytes', '{"a":2}']]) {
+  test(`pending entry with a ${what} stored file: no restore command, purge refuses, append does not mark it done`, () => {
+    const { h, dir, stored } = seeded({ destExists: true, content });
+    const [b] = listHolding(h);
+    assert.deepEqual(b.restore, [], 'no restore command offered for an unverified copy');
+    assert.equal(b.unverified, 1);
+    assert.equal(b.items, 0);
+    assert.equal('incomplete' in b, false);
+    const r = purgeHolding(h, { nowMs: T });
+    assert.deepEqual(r.purged, []);
+    assert.match(r.kept[0].reason, /unverified.*check by hand/);
+    assert.equal(existsSync(stored), true);
+    const wt = mkdtempSync(join(tmpdir(), 'wt-'));
+    writeFileSync(join(wt, 'x.txt'), 'x');
+    archivePaths({ wtPath: wt, rels: ['x.txt'], holdingDir: h, slug: 's', pr: 7, nowMs: T });
+    const items = JSON.parse(readFileSync(join(dir, 'MANIFEST.json'), 'utf8')).items;
+    assert.equal(items.find((i) => i.stored === stored).status, 'pending', 'still pending after the append');
+  });
+}
+
+test('pending entry with a verified stored file is still restorable', () => {
+  const { h } = seeded({ destExists: true });
+  const [b] = listHolding(h);
+  assert.equal(b.restore.length, 1);
+  assert.equal('unverified' in b, false);
+});
+
+// ---- R1-B3: a failed move whose copy cannot be removed keeps its intent and is reported -------------------------------
+
+test('a move that fails and leaves a copy that cannot be removed keeps the pending entry and reports the file', () => {
+  const f = fixture();
+  const io = {
+    move: (from, to) => { mkdirSync(join(to, '..'), { recursive: true }); writeFileSync(to, '{"a"'); throw new Error('EIO mid-copy'); },
+    unlink: () => { throw new Error('EBUSY'); },
+  };
+  let caught;
+  try { run(f, { io }); } catch (err) { caught = err; }
+  assert.match(caught.message, /EIO/);
+  assert.equal(caught.archivedItems.length, 1);
+  const stored = caught.archivedItems[0].stored;
+  assert.equal(existsSync(stored), true);
+  assert.equal(existsSync(f.orig), true, 'the source is intact');
+  const entry = readManifest(f.h).items.find((i) => i.stored === stored);
+  assert.equal(entry.status, 'pending', 'the intent is kept');
+  assert.equal(listHolding(f.h)[0].unverified, 1, 'and the unverified copy is surfaced');
+});
+
+test('a move that fails and whose copy is removed drops the intent (nothing reported)', () => {
+  const f = fixture();
+  const io = { move: (from, to) => { mkdirSync(join(to, '..'), { recursive: true }); writeFileSync(to, '{"a"'); throw new Error('EIO'); } };
+  let caught;
+  try { run(f, { io }); } catch (err) { caught = err; }
+  assert.deepEqual(caught.archivedItems, []);
+  assert.deepEqual(readManifest(f.h).items, []);
 });

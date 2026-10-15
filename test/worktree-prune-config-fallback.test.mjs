@@ -113,3 +113,18 @@ test('CLI: prune warns that the committed default-branch config was used', () =>
   assert.equal(out.disabled, true);
   assert.match(out.warnings[0], /main checkout has no \.claude\/pipeline\.yml.*origin\/main/);
 });
+
+// R1-B2: the ref is read fully qualified, so a local branch or tag named like the remote ref cannot take its place.
+test('a local branch or tag named origin/main cannot replace the remote default branch config', async () => {
+  const { repo } = setup({ originConfig: pipelineYml(), rootConfig: null });
+  const evil = pipelineYml().replace('project: demo', 'project: evil');
+  repo.git(['checkout', '-q', '-b', 'tmp-evil', 'main']);
+  repo.write('.claude/pipeline.yml', evil);
+  repo.commit('evil');
+  repo.git(['branch', 'origin/main', 'HEAD']);
+  repo.git(['tag', 'origin/master', 'HEAD']);
+  repo.git(['checkout', '-q', 'local/root-scratch']);
+  const r = await loadRepo({}, { cwd: repo.dir });
+  assert.equal(r.config.project, 'demo');
+  assert.equal(r.configSource, 'origin/main');
+});

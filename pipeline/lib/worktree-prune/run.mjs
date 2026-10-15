@@ -42,15 +42,16 @@ function configuredOrigin(root) {
 const CONFIG_FILE = '.claude/pipeline.yml';
 
 // The remote default branch's refs worth trying, best first: what origin/HEAD points at, then origin/main, origin/master.
+// Fully qualified (refs/remotes/...): an abbreviated `origin/main` would let a local branch or tag of that name win.
 function defaultBranchRefs(root) {
   const refs = [];
   try {
     const head = git(['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD'], { cwd: root }).trim();
-    if (head.startsWith('refs/remotes/')) refs.push(head.slice('refs/remotes/'.length));
+    if (head.startsWith('refs/remotes/')) refs.push(head);
   } catch (err) {
     if (!(err instanceof GitError)) throw err; // origin/HEAD is simply not set
   }
-  for (const r of ['origin/main', 'origin/master']) if (!refs.includes(r)) refs.push(r);
+  for (const r of ['refs/remotes/origin/main', 'refs/remotes/origin/master']) if (!refs.includes(r)) refs.push(r);
   return refs;
 }
 
@@ -61,7 +62,7 @@ function committedConfig(root) {
     try {
       git(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { cwd: root });
       const text = showFile(ref, CONFIG_FILE, { cwd: root });
-      if (text !== null) return { ref, text };
+      if (text !== null) return { ref: ref.slice('refs/remotes/'.length), full: ref, text }; // `ref` is the short name, for reports only
     } catch (err) {
       if (!(err instanceof GitError)) throw err; // no such ref: try the next one
     }

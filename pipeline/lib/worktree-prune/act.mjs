@@ -90,25 +90,48 @@ const isFile = (p) => {
   }
 };
 
+// Is the file at `item.stored` the one the intent promised? (An interrupted cross-device copy leaves a truncated file.)
+function storedMatches(item) {
+  if (typeof item.stored !== 'string' || !isFile(item.stored)) return false;
+  try {
+    const data = readFileSync(item.stored);
+    return data.length === item.size && createHash('sha256').update(data).digest('hex') === item.sha256;
+  } catch {
+    return false;
+  }
+}
+
 // An archive writes its entry as `status: 'pending'` (plus `source`) BEFORE the file moves and drops both fields once the
 // move is recorded; an entry without `status` is a finished one, so older manifests read as before. A pending entry that a
-// failed write or a crash left behind is settled by looking at the disk: the stored file exists => the move happened, the
-// entry counts as archived (and is reported as `incomplete`); it does not => the move never happened, the intent is dropped.
-// Pure: nothing is written. -> { items: every entry that stands, incomplete: the settled-as-archived ones }
+// failed write or a crash left behind is settled by looking at the disk: the stored file is there and its size and sha256
+// match => the move happened, the entry counts as archived (and is reported as `incomplete`); no stored file => the move
+// never happened, the intent is dropped; a stored file that does NOT match (a copy cut short) => `unverified`: not offered
+// for restore, never purged, kept as pending on disk for a check by hand. Pure: nothing is written.
+// -> { items: entries that stand, incomplete: the settled-as-archived ones, unverified: the raw pending entries to check,
+//      persist: what a rewritten manifest should hold (items + unverified, in order) }
 function settleItems(manifest) {
   const items = [];
   const incomplete = [];
+  const unverified = [];
+  const persist = [];
   for (const item of manifest.items) {
     if (item?.status !== 'pending') {
       items.push(item);
+      persist.push(item);
       continue;
     }
     if (typeof item.stored !== 'string' || !isFile(item.stored)) continue;
+    if (!storedMatches(item)) {
+      unverified.push(item);
+      persist.push(item);
+      continue;
+    }
     const { status: _status, source: _source, ...settled } = item;
     items.push(settled);
     incomplete.push(settled);
+    persist.push(settled);
   }
-  return { items, incomplete };
+  return { items, incomplete, unverified, persist };
 }
 
 const CORRUPT_PREFIX = `${MANIFEST}.corrupt-`;
@@ -118,7 +141,7 @@ const CORRUPT_PREFIX = `${MANIFEST}.corrupt-`;
 function manifestToAppend(dir) {
   const fresh = { version: 1, items: [] };
   const m = readManifest(dir);
-  if (m) return { ...m, items: settleItems(m).items }; // the next write persists what an earlier crash left unsettled
+  if (m) return { ...m, items: settleItems(m).persist }; // the next write persists what an earlier crash left unsettled
   const file = path.join(dir, MANIFEST);
   let st;
   try {
@@ -186,6 +209,7 @@ function freeName(target) {
 export function archivePaths({ wtPath, originalRoot = wtPath, rels, holdingDir, slug, pr, nowMs, io = {} }) {
   const move = io.move ?? moveFile; // seams for tests: the real file move and manifest write
   const writeManifest = io.writeManifest ?? writeManifestAtomic;
+  const unlink = io.unlink ?? unlinkSync;
   const day = new Date(nowMs).toISOString().slice(0, 10);
   const archivedAt = new Date(nowMs).toISOString();
   const sources = rels.map((rel) => {
@@ -222,10 +246,14 @@ export function archivePaths({ wtPath, originalRoot = wtPath, rels, holdingDir, 
       try {
         move(abs, stored);
       } catch (err) {
-        // A cross-device copy can fail after the copy: drop our copy, then the intent (best effort; an intent whose
-        // stored file is absent is ignored by listing and purging anyway).
-        if (isFile(abs)) {
-          try { unlinkSync(stored); } catch { /* no copy was made */ }
+        // A cross-device copy can fail part-way: remove our copy while the source is intact. The intent is dropped only once
+        // the copy is confirmed gone; a copy that stays keeps its pending entry on disk and is reported to the caller.
+        if (isFile(abs) && isFile(stored)) {
+          try { unlink(stored); } catch { /* confirmed below */ }
+        }
+        if (isFile(stored)) {
+          unrecovered = item;
+          throw err;
         }
         manifest.items.pop();
         try { writeManifest(batchDir, manifest); } catch { /* the stale intent is settled on the next read */ }
@@ -277,7 +305,7 @@ function batchDirs(holdingDir) {
 export function listHolding(holdingDir) {
   return batchDirs(holdingDir).map((batch) => {
     const manifest = readManifest(path.join(holdingDir, batch));
-    const settled = manifest ? settleItems(manifest) : { items: [], incomplete: [] };
+    const settled = manifest ? settleItems(manifest) : { items: [], incomplete: [], unverified: [] };
     const items = settled.items;
     const stamps = items.map((i) => i?.archivedAt).filter((s) => Number.isFinite(Date.parse(s)));
     stamps.sort((a, b) => Date.parse(a) - Date.parse(b));
@@ -285,6 +313,7 @@ export function listHolding(holdingDir) {
       batch,
       archivedAt: stamps.length ? stamps[stamps.length - 1] : null,
       ...(settled.incomplete.length ? { incomplete: settled.incomplete.length } : {}), // moves a failed write or a crash left unrecorded
+      ...(settled.unverified.length ? { unverified: settled.unverified.length } : {}), // copies that do not match their entry: check by hand
       items: items.length,
       bytes: items.reduce((sum, i) => sum + (Number.isFinite(i?.size) ? i.size : 0), 0),
       restore: items.filter((i) => i?.stored && i?.original)
@@ -319,7 +348,11 @@ export function purgeHolding(holdingDir, { nowMs, days = 30 }) {
       kept.push({ batch, reason: 'no readable manifest' });
       continue;
     }
-    const { items, incomplete } = settleItems(manifest);
+    const { items, incomplete, unverified } = settleItems(manifest);
+    if (unverified.length) {
+      kept.push({ batch, reason: `holds ${unverified.length} unverified move(s) (${path.basename(unverified[0].stored)}) — needs a check by hand` });
+      continue;
+    }
     if (incomplete.length) {
       kept.push({ batch, reason: `holds ${incomplete.length} incomplete move(s) (${path.basename(incomplete[0].stored)}) — restore or remove by hand` });
       continue;
