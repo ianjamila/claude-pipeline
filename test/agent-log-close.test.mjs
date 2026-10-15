@@ -1,11 +1,11 @@
 // `pipeline agent-log close`: the pure part (markers, authors, shas, newest-by-observed, PHT dating, dedupe, the repo-wide scan
-// and which PRs are read on their own) against an injected gh, and the CLI (dry run, --queue + stage, --pr/--all, unreadable PR,
+// and which PRs are read on their own) against an injected gh, and the CLI (dry run, --queue + publish, --pr/--all, unreadable PR,
 // GitHub unavailable) against the scripted fake gh. Every age-sensitive pure test passes an explicit `now`: no real clock.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, pipelineYml } from './helpers/fakegh-env.mjs';
 import { cli, AGENT_LOG, REPO, PR } from './helpers/gate-env.mjs';
@@ -342,7 +342,7 @@ test('agent-log close: dry run prints {lines, pending, unreadable} and writes no
   assert.equal(t.repo.git(['status', '--porcelain']), '', 'and changes nothing in the worktree');
 });
 
-test('agent-log close --queue: queues each line (no commit); stage then commits it and a later close emits nothing', () => {
+test('agent-log close --queue: queues each line (no commit); publish then pushes it to the log branch and a later close emits nothing', () => {
   const t = closeRepo(pendingLine(1420), [shaEntry(1420), commentsEntry(1420, [comment(marker())])]);
   const head = t.repo.git(['rev-parse', 'HEAD']).trim();
   const r = t.close('--queue');
@@ -352,21 +352,17 @@ test('agent-log close --queue: queues each line (no commit); stage then commits 
   assert.deepEqual(readQueueLines(t), [resolved(1420)]);
   assert.equal(t.repo.git(['rev-parse', 'HEAD']).trim(), head, 'close never commits');
 
-  // the queued line rides along with `stage` into the PR branch's log
+  // the queued line goes to the pipeline-agent-log branch, not into the PR branch
   t.repo.branch('agent/feature');
-  t.fake.setScript([
-    AUTH, REPO,
-    { match: `^pr view ${PR} --json headRefName,headRefOid`, stdoutJson: { headRefName: 'agent/feature', headRefOid: head } },
-  ]);
-  const staged = cli(['agent-log', 'stage', '--pr', String(PR), '--line', '- this PR'], { dir: t.repo.dir, fake: t.fake });
-  assertExit(staged, 0);
-  assert.deepEqual(staged.json.lines, [resolved(1420), '- this PR']);
-  const log = readFileSync(join(t.repo.dir, AGENT_LOG), 'utf8');
-  assert.ok(log.includes(resolved(1420)));
-  assert.notEqual(t.repo.git(['rev-parse', 'HEAD']).trim(), head);
+  const published = cli(['agent-log', 'publish', '--line', '- this PR'], { dir: t.repo.dir, fake: t.fake });
+  assertExit(published, 0);
+  assert.deepEqual(published.json.lines, [resolved(1420), '- this PR']);
+  assert.equal(t.repo.git(['rev-parse', 'HEAD']).trim(), head, 'nothing committed to the PR branch');
   assert.equal(t.repo.git(['status', '--porcelain']), '');
+  assert.ok(!readFileSync(join(t.repo.dir, AGENT_LOG), 'utf8').includes(resolved(1420)), 'the worktree file is not written');
+  assert.ok(t.repo.git(['show', `origin/pipeline-agent-log:${AGENT_LOG}`]).includes(resolved(1420)));
 
-  // now that the log holds the resolution, a fresh close has nothing to emit
+  // now that the log branch holds the resolution, a fresh close (reading branch + worktree + main) has nothing to emit
   t.fake.setScript([AUTH, REPO, shaEntry(1420), commentsEntry(1420, [comment(marker())])]);
   const again = t.close('--queue');
   assertExit(again, 0);
@@ -538,38 +534,22 @@ test('scan window (d): a failed scan, or an unreadable PR, leaves the state unto
   assert.ok(fresh.fake.lines().some((l) => l.includes('since=2026-01-04T00%3A00%3A00Z')), 'a day before the oldest pending line (2026-01-05)');
 });
 
-test('a queued line staged in another open PR stays that PR\'s: close --queue does not re-add it and stage in a second worktree does not carry it', () => {
+test('an old queue entry marked "staged in PR N" is a plain queued line: close --queue does not re-add it and publish publishes it', () => {
   const t = closeRepo(pendingLine(1420), [shaEntry(1420), commentsEntry(1420, [comment(marker())])]);
   const L = resolved(1420);
-  assertExit(cli(['agent-log', 'queue', '--line', L], { dir: t.repo.dir, fake: t.fake }), 0);
-  const OTHER_PR = 4321;
-  writeFileSync(t.queueFile, `${JSON.stringify({ line: L, at: '2026-10-12T00:00:00.000Z', staged: { pr: OTHER_PR, at: '2026-10-12T01:00:00.000Z' } })}\n`);
+  mkdirSync(dirname(t.queueFile), { recursive: true });
+  writeFileSync(t.queueFile, `${JSON.stringify({ line: L, at: '2026-10-12T00:00:00.000Z', staged: { pr: 4321, at: '2026-10-12T01:00:00.000Z' } })}\n`);
 
   const r = t.close('--queue');
   assertExit(r, 0);
   assert.deepEqual(r.json.lines, [L], 'still not in the log, so it is emitted again');
-  assert.equal(r.json.queued, 0);
-  const entries = readFileSync(t.queueFile, 'utf8').trim().split('\n').map((x) => JSON.parse(x));
-  assert.equal(entries.length, 1);
-  assert.equal(entries[0].line, L);
-  assert.equal(entries[0].staged.pr, OTHER_PR);
+  assert.equal(r.json.queued, 0, 'but already queued');
+  assert.deepEqual(readQueueLines(t), [L]);
 
-  // PR B's worktree: stage must leave L to PR A (still open)
-  const head = t.repo.git(['rev-parse', 'HEAD']).trim();
-  t.repo.branch('agent/feature');
-  t.fake.setScript([
-    AUTH, REPO,
-    { match: `^pr view ${PR} --json headRefName,headRefOid`, stdoutJson: { headRefName: 'agent/feature', headRefOid: head } },
-    { match: `^pr view ${OTHER_PR} --json state`, stdoutJson: { state: 'OPEN' } },
-  ]);
-  const staged = cli(['agent-log', 'stage', '--pr', String(PR), '--line', '- this PR'], { dir: t.repo.dir, fake: t.fake });
-  assertExit(staged, 0);
-  assert.deepEqual(staged.json.lines, ['- this PR']);
-  assert.equal(staged.json.staged, 0);
-  assert.ok(!readFileSync(join(t.repo.dir, AGENT_LOG), 'utf8').includes(L));
-  const after = readFileSync(t.queueFile, 'utf8').trim().split('\n').map((x) => JSON.parse(x));
-  assert.equal(after.length, 1);
-  assert.equal(after[0].staged.pr, OTHER_PR);
+  const published = cli(['agent-log', 'publish'], { dir: t.repo.dir, fake: t.fake });
+  assertExit(published, 0);
+  assert.deepEqual(published.json.lines, [L]);
+  assert.deepEqual(readQueueLines(t), []);
 });
 
 // ---- Addendum B: scan hits are triggers, emission is monotonic, the log is the union with origin's copy ----

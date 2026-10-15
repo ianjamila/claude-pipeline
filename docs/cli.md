@@ -11,25 +11,30 @@ blocked · **2** usage or environment error (also: unknown command, unknown flag
 
 ## agent-log
 
-queue a line for the agent log, stage queued lines + this PR's line as a commit in the worktree, or close pending prod-smoke lines.
+queue a line for the agent log, publish queued lines to the `pipeline-agent-log` branch, or close pending prod-smoke lines. The log lives on that orphan branch (like `pipeline-artifacts`), never in a PR branch.
 
 ```
-pipeline agent-log queue --line "<line>" [--repo DIR]   -> {ok, queued, file}; a line already in the queue (staged in an open PR or not) is not added again
-pipeline agent-log stage --pr N [--line "<line>"] [--repo DIR]   -> {ok, committed, lines, file, staged, dropped}; run in the PR worktree;
-  staged lines stay queued ("staged in PR N") until origin/<default> contains them, and are re-staged if that PR closes unmerged;
-  default line = the PR's agent-log line with outcome "merged — prod smoke pending"; exit 2 when the worktree has other uncommitted changes,
-  is on the default branch or a detached HEAD, or is not the PR's head branch at the PR's head commit; exit 3 when GitHub cannot say
+pipeline agent-log queue --line "<line>" [--repo DIR]   -> {ok, queued, file}; a line already in the queue is not added again
+pipeline agent-log publish [--line "<line>"] [--repo DIR]   -> {ok, branch, commit, pushed, lines, remaining}; queues --line, drops lines the log branch or origin/<default> already has,
+  appends the rest to config.agent_log on the orphan branch pipeline-agent-log and pushes ONLY that ref (never forced; a lost race is retried on the new tip);
+  the caller's HEAD, index, branches and working tree are never touched, nothing is committed to a PR branch. Published entries leave the queue only after
+  the push succeeded; exit 3 when the push or the network fails (the lines stay queued for the next run, a note in the summary is enough);
+  the log branch is untrusted data: a commit holds ONLY the log file, the file is read only as a regular file under 5 MB (a bigger one: exit 1, error log-too-large, lines stay queued), existing lines are only appended after
+pipeline agent-log stage [--pr N] [--line "<line>"] [--repo DIR]   -> DEPRECATED alias of publish (older skills call it): never commits into the worktree or PR branch;
+  prints {ok, deprecated: true, committed: null, ...publish's fields}. With --pr N the run's line (--line, or the default "merged — prod smoke pending" line built from the PR title; exit 3 when GitHub cannot be reached)
+  is QUEUED HELD for PR N, not published: a later publish (or stage) publishes it once PR N is MERGED, drops it when N was CLOSED unmerged, and keeps it while N is open
+  or GitHub is unreadable (held entries count in remaining, and in held); publish asks GitHub only when a held entry exists
 pipeline agent-log close [--queue] [--pr N]... [--all] [--repo DIR]   -> {ok, lines, pending, skipped, unreadable, originReadable, originRefreshed, queued?, scanError?}; for every "prod smoke pending" log line reads the
   bot-authored prod-smoke-result comments on that PR (production.watch: workflow) and prints one resolution line per PR whose newest result
-  is not logged yet (never an earlier minute than the newest logged one; the same minute only when the line differs); the log read is the worktree log plus the origin/<default> copy; one repo-wide read of the comments since the last successful read on this machine (at least 14 days)
+  is not logged yet (never an earlier minute than the newest logged one; the same minute only when the line differs); the log read is the worktree log plus the origin/<default> copy plus the log branch copy; one repo-wide read of the comments since the last successful read on this machine (at least 14 days)
   finds new results on any PR (a hit only triggers reading the whole comment history of that PR), and a PR is read on its own only when it has no
   resolution line, is the newest pending PR, is named by --pr N (repeatable) or --all is given (a resolved PR the scan did not mention is `skipped`,
-  costing no call); a dry run unless --queue (queues each line like `queue`, a line already queued is not added again; never commits; only --queue advances the scan window, and only when the origin/<default> copy of the log was readable AND `git fetch origin <default>` succeeded, else originReadable / originRefreshed is false and a note goes to stderr); exit 1 when some
-  PRs could not be read (`unreadable`; the lines for the others are still produced and queued: still run `stage` and name them in the summary), 3 when GitHub is
-  unavailable (skip the close, still stage)
+  costing no call); a dry run unless --queue (queues each line like `queue`, a line already queued is not added again; never commits; only --queue advances the scan window, and only when the origin/<default> copy of the log was readable AND the fetches of origin/<default> and the log branch succeeded, else originReadable / originRefreshed is false and a note goes to stderr); exit 1 when some
+  PRs could not be read (`unreadable`; the lines for the others are still produced and queued: still run `publish` and name them in the summary), 3 when GitHub is
+  unavailable (skip the close, still publish)
 ```
 
-Exit: 0 ok · 1 some PRs could not be read (close; the others are still processed and queued) · 2 usage, or the worktree is not the PR's clean head branch (stage) · 3 GitHub cannot say / queue lock timeout.
+Exit: 0 ok · 1 some PRs could not be read (close; the others are still processed and queued), or the log on the branch is over 5 MB (publish; lines stay queued) · 2 usage / config · 3 GitHub cannot say, the push or network failed (publish; lines stay queued), or queue lock timeout.
 
 ## arbiter
 
@@ -82,11 +87,15 @@ pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium
   -> {ok, round, counts:{blocking, suggestions, worth_considering}, preRuled, lightLane, path}
   --base must be the PR's merge base for round 1 and the previous round's toHead after that, else exit 2 {error:base-mismatch}
   exit 2 {error:empty-range} when earlier rounds accepted items and the branch content is unchanged since the last round (base == head)
+  commits merged in from the PR's base branch since the previous round are left out of the reviewed diff; a round that only merged them in
+    is recorded without running Codex: {ok:true, baseOnly:true, counts all 0}
   exit 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|malformed|github} when Codex or GitHub could not deliver
   env: PIPELINE_CODEX_TIMEOUT_MS overrides the 30 minute Codex timeout (tests)
 ```
 
 Exit: 0 round recorded · 2 usage or base-mismatch · 3 Codex or GitHub could not deliver (quota, auth, unavailable, error, malformed, github): never "no findings".
+
+A later round is diffed against what the previous round reviewed plus the PR's base branch as it is now (a trial merge, `reviewBaseKind: synthetic`), not against the previous head itself, so commits an "Update branch" merged in from the default branch (`origin/<default_branch>`) are never shown to Codex: they were reviewed in their own PRs. Only the default branch counts: a PR that targets another branch, or code merged in from any other branch, is reviewed in full (nothing is left out, and Codex always runs). A stale `origin/<default_branch>` (the best-effort fetch failed) can only make the range bigger. When that trial merge conflicts (or git is older than 2.38), the round reviews the whole PR against the new base instead (`whole-pr`). Each round records `reviewBase` and `reviewBaseKind` next to `fromHead` / `toHead`. A round whose only new commit is such a merge is recorded as `baseOnly: true` with no items and Codex is not run; the outcome treats it like a clean round with no findings. `state mark-implemented` measures "a non-test file changed since round N" the same way and fails closed: when that range cannot be worked out exactly (conflicting trial merge, git error) it refuses with `base-unresolved`.
 
 ## comment
 
@@ -395,7 +404,7 @@ Exit: 0 · 2 no state / usage (`outcome` is 0 whether or not `clean`).
 upsert the PR summary comment and print the agent-log line.
 
 ```
-pipeline summary --pr N --outcome O [--built TEXT] [--action TEXT] [--cause CODE] [--repo DIR]   -> {ok, url, agentLogLine, notify}
+pipeline summary --pr N --outcome O [--built TEXT] [--action TEXT] [--cause CODE] [--repo DIR]   -> {ok, url, agentLogLine, pendingLogLine?, notify}   (pendingLogLine: only for --outcome merged, the same line with outcome "merged — prod smoke pending")
 ```
 
 Exit: 0 · 2 usage / no state · 3 GitHub (`gh`) unavailable.
@@ -565,7 +574,7 @@ The spec table was written before the build; the CLI that shipped differs as fol
 | `triage-validate`, `arbiter-needed`, `rulings-apply` | `triage validate`, `arbiter needed`, `arbiter apply` (apply proves the model from the transcript itself; no separate `model-proof` step needed) |
 | `triage-comment`, `summary` | `comment --kind triage|summary|needs-human|blocked|awaiting-review`; `summary` also posts the summary comment |
 | `preview-url` | `deploy url --sha SHA --environment ENV` (GitHub deployments only; no `preview.url_command`) |
-| `agent-log --line` (docs-only PR) | `agent-log queue --line` and `agent-log stage --pr N` (commit into the PR branch; the queue is flushed by `stage`) |
+| `agent-log --line` (docs-only PR) | `agent-log queue --line` and `agent-log publish [--line]` (appends to the orphan branch `pipeline-agent-log`; `stage` is a deprecated alias that commits nothing) |
 | not listed | `artifacts push`, `followups create`, `hardstops`, `integrity`, `job start\|wait\|read`, `protect`, `resume list\|plan`, `review-complete`, `state show\|outcome\|mark-implemented\|record-followup\|set-outcome`, `triage settle\|light-lane\|owner-ruling`, `vendor`, `version` |
 | `risk` returns `files[]`, `stats` | `risk` returns `level, reasons, lightLane, changedLines, fileCount, hardStops, base, head, mergeBase` |
 | `prod-watch` rolls back with the rollback command | `prod-watch` runs `vercel rollback <known-good> --yes --timeout 3m` itself; `production.rollback.command` is documentation |

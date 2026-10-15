@@ -5,15 +5,15 @@ import { EXIT, UnavailableError, UsageError, intOption, parseCommandArgs, requir
 import { mkdirSync, existsSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
-import { git } from '../lib/git.mjs';
+import { effectiveReviewBase, git, isAncestor, mergeBase, revParse } from '../lib/git.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { MARKERS } from '../lib/render.mjs';
 import { decodeFromComment, loadState, saveState, updateItems } from '../lib/state.mjs';
 import { roundOutcome } from '../lib/triage.mjs';
 import {
-  allItems, currentContentHash, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, requireState, roundDir,
-  stateExtends, withStateLock,
+  allItems, currentContentHash, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, requireState, reviewBaseRef,
+  roundDir, stateExtends, withStateLock,
 } from '../lib/review-context.mjs';
 
 export const meta = {
@@ -179,6 +179,25 @@ async function outcome(rest, ctx) {
   };
 }
 
+// What to diff HEAD against when the default branch was merged into the PR with a conflict since `toHead`: walk the merge commits of
+// the default branch on HEAD's first-parent history after `toHead`, OLDEST first (the first is the one that resolved the conflict), and
+// take the first whose own review base is exact (effectiveReviewBase from that merge: 'previous', or 'synthetic' when the default branch
+// was merged in again cleanly later, which leaves main's later files out). A merge counts only when its second parent is part of the
+// default branch (a merge of any other branch says nothing about what main brought in). A merge whose own base is still 'whole-pr'
+// (a second conflict) is skipped in favour of the next one. null when none gives an exact base: the caller refuses. Throws on a git error.
+function baseAfterConflictMerge({ root, config, toHead, forkPoint }) {
+  const o = { cwd: root };
+  const baseRef = reviewBaseRef(root, config);
+  const merges = git(['rev-list', '--first-parent', '--merges', '--reverse', `${revParse(toHead, o)}..HEAD`], o).split('\n').filter(Boolean);
+  for (const m of merges) {
+    const parents = git(['rev-list', '--parents', '-n', '1', m], o).trim().split(/\s+/).slice(1);
+    if (parents.length !== 2 || !isAncestor(parents[1], baseRef, o)) continue;
+    const since = effectiveReviewBase({ from: m, forkPoint }, o);
+    if (since.kind === 'previous' || since.kind === 'synthetic') return since.base;
+  }
+  return null;
+}
+
 // ---- small updates --------------------------------------------------------------------------
 
 async function markImplemented(rest, ctx) {
@@ -207,7 +226,31 @@ async function markImplemented(rest, ctx) {
         });
       }
       // A settle-by-test commit changes the hash too, so also require a non-test file to have changed since then.
-      const changed = git(['diff', '--name-only', '--no-renames', `${round.toHead}..HEAD`], { cwd: root }).split('\n').filter(Boolean);
+      // Measured from the round's head, minus whatever was merged in from the default branch since (those are not the PR's
+      // change). This gate fails closed: if that range cannot be worked out exactly (git failed, or a conflicting merge
+      // whose resolution is not recorded as a merge commit), the mark is refused rather than counting files the fix did not touch.
+      let changed;
+      try {
+        const forkPoint = mergeBase(reviewBaseRef(root, config), 'HEAD', { cwd: root });
+        const since = effectiveReviewBase({ from: round.toHead, forkPoint }, { cwd: root });
+        let base = since.base;
+        if (since.kind === 'whole-pr') {
+          // The trial merge conflicted (or is unsupported), and it will never change: both of its inputs are fixed. The PR's
+          // own work since then is measured from the merge commit that resolved the conflict.
+          base = baseAfterConflictMerge({ root, config, toHead: round.toHead, forkPoint });
+          if (base === null) {
+            throw new Error(`the default branch was merged into the PR since round ${round.n} with a conflict, and no merge commit of the default branch after that round records the resolution, so the PR's own changes cannot be told apart from the default branch's`);
+          }
+        } else if (since.kind !== 'previous' && since.kind !== 'synthetic') {
+          throw new Error(`unexpected review base kind ${since.kind}`);
+        }
+        changed = git(['diff', '--name-only', '--no-renames', `${base}..HEAD`], { cwd: root }).split('\n').filter(Boolean);
+      } catch (err) {
+        throw new Fail(EXIT.USAGE, {
+          ok: false, error: 'base-unresolved',
+          message: `${item.id} cannot be marked implemented: could not tell which files changed since round ${round.n} (${err.message})`,
+        });
+      }
       const code = changed.filter((f) => f !== config.agent_log && !matchAny(f, config.integrity.test_globs));
       if (code.length === 0) {
         throw new Fail(EXIT.USAGE, {
