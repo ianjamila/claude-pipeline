@@ -35,12 +35,14 @@ already holds. A `P state outcome` with `followupsPending: true` means a publish
   --round <round> --base <base> --head <head> --effort <effort>` → `P job wait codex-r<round> --run-id
   <runId> --timeout 540` until done (`replaced` ⇒ start the job again). Then read `exitCode` and the
   JSON in `tail`:
-  - 0: round recorded: `counts`, `preRuled` (items answered from the cache), `lightLane`.
+  - 0: round recorded: `counts`, `preRuled` (items answered from the cache), `lightLane`. Commits merged in from the
+    base branch since the previous round ("Update branch") are not shown to Codex. If the output has `baseOnly: true`
+    the round was only such a merge: Codex did not run, there are no items, and it counts as a clean round with no findings.
   - 3 (`unavailable: true`, reason quota / auth / unavailable / error / malformed / github) ⇒
     `gh pr edit <pr> --add-label awaiting-review`, `P comment --pr <pr> --kind awaiting-review
     --reason "<reason>"`, `P summary --pr <pr> --outcome awaiting-review --built "…"` (works with no
     review state, i.e. in round 1) plus `--cause codex:<reason> --action "Say \"resume pipeline reviews\" when Codex is back"`,
-    `P agent-log queue --line "<agentLogLine>"`, stop. Never treat a
+    `P agent-log publish --line "<agentLogLine>"`, stop. Never treat a
     failed Codex run as "no findings".
   - 2 `error: empty-range`: earlier rounds accepted items but the branch content is unchanged — the
     "fix" did not change code. Go back to step 6 and make the real change.
@@ -97,10 +99,11 @@ possible settle test; no test result yet):
 
 ### 5. Arbiter (at most one call per round)
 
-`P arbiter needed --round <round>` → `{needed, items, inputPath, digest, digest8, tag}`; `tag` is
-`pipeline-arbiter R<round> <digest8>`.
+`P arbiter needed --round <round>` → `{needed, items, inputPath, digest, digest8, tag, promptHeader}`; `tag` is
+`pipeline-arbiter R<round> <digest8>`; `promptHeader` is the two header lines below, ready to paste.
 If `needed`: invoke the `arbiter` agent — **no `model` parameter** — with
-`description: <the tag from arbiter needed>` and a prompt whose first lines are exactly
+`description: <the tag from arbiter needed>` and a prompt that starts with `promptHeader` **pasted verbatim** (do not retype it:
+a prompt without the header fails the model proof and parks every arbitrated item), i.e. exactly
 ```
 ROUND: <round>
 INPUT-DIGEST: <digest>
@@ -155,8 +158,23 @@ permissions / data-integrity / data-loss item ⇒ `needsHuman` (the CLI applies 
 **Park needs-human** (every `needs-human` stop in this loop is this exact sequence, never a bare label):
 `gh pr edit <pr> --add-label needs-human`, `P comment --pr <pr> --kind needs-human --reason "…"` (no `--hits-file`),
 `P summary --pr <pr> --outcome needs-human --action "<the one thing the owner does>" --cause review:<reason>`
-(`<reason>`: `unresolved`, `needs-human-items`, `judge:not-found` …), `P agent-log queue --line "<agentLogLine>"`, stop.
+(`<reason>`: `unresolved`, `needs-human-items`, `judge:not-found` …), `P agent-log publish --line "<agentLogLine>"`, stop.
+With `owner_approval: chat` and `needsHuman` items, the `--action` is "Rule on <ids> in chat (accept / follow-up / reject), remove needs-human, then say ship resume N".
 An arbiter ruling that parked an item makes the push an arbiter escalation by itself: summary reads the state.
 
-Any commit after the last clean round that changes PR content (anything except the agent-log
-line) invalidates coverage — `P final-gate` will demand another round.
+### Owner rules in chat (`owner_approval: chat` only)
+
+An item parked `needsHuman` (a failed model proof, a low-confidence arbiter, a dismissed security item) is cleared by the owner's
+word in chat, never by you. When the owner rules on it ("accept R4-B1", "follow-up", "reject, it is fine"):
+1. Per item, with the owner's EXACT words (copy the message, never a paraphrase): `P triage owner-ruling --round <round> --id <id>
+   --decision ACCEPT|FOLLOW-UP|REJECT --reason "<why, one line>" --owner-quote "<the owner's words>" --pr <pr>`. It refuses label mode, an item
+   that is not `needsHuman` and an empty quote; a published round is fine. It never clears the merge by itself: the quote is published in
+   the triage comment and the final gate counts the item in `ownerMerge`, so the owner still has to say "merge" for the head. Its output says
+   `published: false` and a `next`: the ruling is local only until step 2, and `P state show` before that restores the published state WITHOUT it.
+2. `P comment --pr <pr> --kind triage` (re-post, so the ruling is published), then `P followups create --round <round>` for FOLLOW-UP,
+   then post the triage comment again for the issue links.
+3. ACCEPT: it is not clean until built and reviewed: implement it (step 6), `P state mark-implemented`, and run a new round.
+4. The owner removes `needs-human` (never you) and says `ship resume <pr>`; resume routes to `review` or `gate`.
+
+Any commit after the last clean round that changes PR content (the agent log is never committed to a
+PR branch) invalidates coverage — `P final-gate` will demand another round.

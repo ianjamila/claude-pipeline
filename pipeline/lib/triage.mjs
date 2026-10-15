@@ -5,7 +5,9 @@
 export const SECURITY_CATEGORIES = ['security', 'auth', 'permissions', 'data-integrity', 'data-loss'];
 export const BUCKETS = ['BLOCKING', 'SUGGESTION', 'WORTH_CONSIDERING'];
 export const DECISIONS = ['ACCEPT', 'FOLLOW-UP', 'REJECT'];
-export const CONFIDENCES = ['high', 'low'];
+// 'medium' is accepted so a wording slip does not park an item: the judge's escalates to the arbiter (anything but 'high'),
+// the arbiter's stands like 'high' (only 'low' sends it to a human).
+export const CONFIDENCES = ['high', 'medium', 'low'];
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const idsOf = (items) => items.map((i) => i.id);
@@ -165,7 +167,7 @@ export function applyRulings(items, rulings, { proofOk, transcript } = {}) {
     const next = structuredClone(item);
     const r = byId.get(item.id);
     if (!r) return next;
-    if (next.final?.by === 'test') return next; // a test is evidence; no opinion overrides it
+    if (next.final?.by === 'test' || isOwnerRuled(next)) return next; // a test is evidence and the owner's word is final (also its cached copy, by 'cache'); no opinion overrides either
     next.arbiter = { ruling: r.ruling, confidence: r.confidence, reasoning: r.reasoning, transcript: transcript ?? null };
     const rulingValid = DECISIONS.includes(r.ruling) && CONFIDENCES.includes(r.confidence);
     const dismissesBlockingSecurity =
@@ -200,6 +202,25 @@ export function applyRulings(items, rulings, { proofOk, transcript } = {}) {
   });
 }
 
+// ---- owner ruling (owner_approval: chat) ---------------------------------------------------
+
+// A ruling the owner made in chat (`pipeline triage owner-ruling`) on an item that was waiting for a human. The quote is
+// the owner's own words, kept so the ruling stays visible and checkable: it is published in the triage comment and counted at
+// the final gate, where it never replaces the owner's "merge". The final it overrules is kept as `overruled`. ACCEPT leaves
+// `implemented` false, so the exit rules still ask for the fix and a review round that covers it.
+export function applyOwnerRuling(item, { decision, reason, ownerQuote, ruledAt }) {
+  if (!DECISIONS.includes(decision)) throw new Error(`decision must be one of ${DECISIONS.join('|')}`);
+  if (item.final?.needsHuman !== true) throw new Error(`${item.id} needs no human decision`);
+  const next = structuredClone(item);
+  next.final = { decision, by: 'owner', needsHuman: false, reason, ownerQuote, ruledAt, overruled: structuredClone(item.final) };
+  return next;
+}
+
+// The marker is the quote, not `by`: a later round's cached copy of the ruling has by 'cache' and is still the owner's word.
+export const isOwnerRuled = (item) => typeof item.final?.ownerQuote === 'string' && item.final.ownerQuote !== '';
+
+export const ownerRuledItems = (state) => allItems(state).filter(isOwnerRuled);
+
 // ---- cache and light lane -------------------------------------------------------------------
 
 // A ruled item is not reopened unless its code changed (the fingerprint covers file, title and excerpt) AND it is the
@@ -207,7 +228,8 @@ export function applyRulings(items, rulings, { proofOk, transcript } = {}) {
 // performance idea must not settle the same text when it comes back as a BLOCKING security bug. A cache entry (see
 // ruledCacheFrom) therefore carries the bucket and category it was ruled under, and is reused only when both match.
 // A dismissal (REJECT / FOLLOW-UP) of a security, auth, permissions or data category is never reused, whatever the
-// bucket: those are looked at every time. An entry without bucket and category (a hand-built cache) is not reused.
+// bucket: those are looked at every time, unless the OWNER ruled on it (its final keeps the ownerQuote): asking again would make
+// the owner rule twice on the same finding, and the copy still counts as ownerMerge at the final gate. An entry without bucket and category (a hand-built cache) is not reused.
 export function reuseRuled(items, ruledCache) {
   return items.map((item) => {
     const next = structuredClone(item);
@@ -216,7 +238,7 @@ export function reuseRuled(items, ruledCache) {
     const { bucket, category, followupIssue, ...final } = structuredClone(ruledCache[next.fingerprint]);
     if (bucket !== next.bucket || category !== next.category) return next;
     const dismissal = final.decision === 'REJECT' || final.decision === 'FOLLOW-UP';
-    if (dismissal && SECURITY_CATEGORIES.includes(next.category)) return next;
+    if (dismissal && SECURITY_CATEGORIES.includes(next.category) && !isOwnerRuled({ final })) return next;
     next.final = { ...final, by: 'cache' };
     // The issue filed for the earlier item is the issue for this one: carrying it keeps `followups create` from
     // filing the same suggestion again every round.

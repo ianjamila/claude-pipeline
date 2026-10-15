@@ -83,10 +83,10 @@ const fenced = (obj) => `Done.\n\n\`\`\`json\n${JSON.stringify(obj)}\n\`\`\``;
 
 // By default the feature commit is big enough (>= 50 changed lines) to be off the light lane, so the arbiter rules apply in
 // full; `light: true` keeps the change tiny.
-function world(t, { gh = GH, light = false } = {}) {
+function world(t, { gh = GH, light = false, yml = pipelineYml() } = {}) {
   const repo = createTmpRepo();
   t.after(() => repo.cleanup());
-  repo.write('.claude/pipeline.yml', pipelineYml());
+  repo.write('.claude/pipeline.yml', yml);
   repo.write('src/a.js', aFile(false));
   repo.write('src/b.js', bFile);
   const base = repo.commit('init');
@@ -431,6 +431,169 @@ test('codex-review: rulings from earlier rounds go into the next prompt and pre-
   assert.equal(same.final.decision, 'REJECT');
   assert.equal(w.item('R2-B2').final ?? null, null);
   assert.equal(w.state().rounds[1].toHead, head2);
+});
+
+// ---- review range across an update-branch (main merged into the PR branch) ---------------------
+
+// Main moves on (a commit touching `files`), then the PR branch merges it in, the way "Update branch" does. A conflict
+// is resolved with `resolve` (path -> content). `branch` merges another branch instead; `evil` is written into the merge
+// commit itself (an "evil merge": changes that are in neither parent). -> the merge commit.
+function mergeMainInto(w, files, { resolve = {}, branch = 'main', evil = {} } = {}) {
+  w.repo.checkout(branch);
+  for (const [file, content] of Object.entries(files)) w.repo.write(file, content);
+  w.repo.commit('main moves on');
+  w.repo.checkout('feat/x');
+  try {
+    w.repo.git(['merge', '--no-ff', ...(Object.keys(evil).length > 0 ? ['--no-commit'] : []), '-m', 'Merge main into feat/x', branch]);
+    if (Object.keys(evil).length > 0) {
+      for (const [file, content] of Object.entries(evil)) w.repo.write(file, content);
+      w.repo.git(['add', '-A']);
+      w.repo.git(['commit', '-q', '--no-edit']);
+    }
+  } catch (err) {
+    if (Object.keys(resolve).length === 0) throw err;
+    for (const [file, content] of Object.entries(resolve)) w.repo.write(file, content);
+    w.repo.git(['add', '-A']);
+    w.repo.git(['commit', '-q', '--no-edit']);
+  }
+  return w.repo.git(['rev-parse', 'HEAD']).trim();
+}
+// The real repo ignores .review/; the throwaway one commits everything with add -A, which would put round files into the diffs under test.
+function worldIgnoringReview(t, opts) {
+  const w = world(t, opts);
+  writeFileSync(join(w.repo.dir, '.git', 'info', 'exclude'), '.review/\n');
+  return w;
+}
+const patchOf = (w, n) => readFileSync(w.roundFile(n, 'diff.patch'), 'utf8');
+
+test('codex-review: a round after no merge reviews previous toHead..head, recorded as the previous head', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf()), 0);
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  const head2 = w.repo.commit('more');
+  const r = w.codex(2, findingsOf(), { from: w.head, to: head2 });
+  assertExit(r, 0, r.stderr + r.stdout);
+  const round = w.state().rounds[1];
+  assert.deepEqual([round.fromHead, round.reviewBase, round.reviewBaseKind], [w.head, w.head, 'previous']);
+  assert.match(patchOf(w, 2), /src\/c\.js/);
+  assert.doesNotMatch(patchOf(w, 2), /src\/a\.js/);
+  assert.doesNotMatch(w.captured()[1].stdin, /merged in from the base branch/);
+  assert.equal(w.state().rounds[0].reviewBase, w.base, 'round 1 is reviewed against the merge base');
+});
+
+test('codex-review: commits merged in from the base branch are not in the next round\'s diff, the prompt or the record', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf()), 0);
+  mergeMainInto(w, { 'src/from-main.js': 'export const other = "someone else\'s PR";\n' });
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  const head2 = w.repo.commit('later pr commit');
+  const r = w.codex(2, findingsOf(), { from: w.head, to: head2 });
+  assertExit(r, 0, r.stderr + r.stdout);
+
+  const patch = patchOf(w, 2);
+  assert.doesNotMatch(patch, /from-main\.js/, 'main\'s file is not shown to Codex');
+  assert.match(patch, /src\/c\.js/, 'the PR\'s own later commit is');
+  const round = w.state().rounds[1];
+  assert.equal(round.reviewBaseKind, 'synthetic');
+  assert.equal(round.fromHead, w.head);
+  assert.equal(round.toHead, head2);
+  assert.match(round.reviewBase, /^[0-9a-f]{40,64}$/);
+  const prompt = w.captured()[1].stdin;
+  assert.match(prompt, new RegExp(`git diff ${round.reviewBase}\\.\\.${head2}`));
+  assert.match(prompt, /merged in from the base branch are excluded/);
+});
+
+test('codex-review: a round that only merged the base branch in is recorded as baseOnly and Codex is not run', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf()), 0);
+  const merged = mergeMainInto(w, { 'src/from-main.js': 'export const other = 1;\n' });
+  const calls = w.captured().length;
+  const r = w.codex(2, findingsOf([finding()]), { from: w.head, to: merged });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.baseOnly, true);
+  assert.deepEqual(r.json.counts, { blocking: 0, suggestions: 0, worth_considering: 0 });
+  assert.equal(w.captured().length, calls, 'the Codex stub was not called');
+  const round = w.state().rounds[1];
+  assert.deepEqual([round.n, round.baseOnly, round.items, round.toHead, round.reviewBaseKind], [2, true, [], merged, 'synthetic']);
+
+  // Nothing pending and the content is what round 1 reviewed: the outcome treats it like a clean round.
+  const outcome = w.cli(['state', 'outcome']);
+  assertExit(outcome, 0);
+  assert.equal(outcome.json.clean, true, JSON.stringify(outcome.json));
+  assert.equal(outcome.json.coverageValid, true);
+});
+
+test('codex-review: a conflicting merge falls back to the whole PR against the new base, never main\'s own changes', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf()), 0);
+  // Main edits the very line (src/a.js 12) that round 1 reviewed the PR changing, so merging what was reviewed with the new
+  // base conflicts; the real merge resolves it by hand.
+  const mainA = aFile(false).replace('v12 = 12', 'v12 = 1200');
+  const merged = mergeMainInto(w, { 'src/a.js': mainA, 'src/from-main.js': 'export const other = 1;\n' }, { resolve: { 'src/a.js': aFile(true) } });
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  const head2 = w.repo.commit('later pr commit');
+  const r = w.codex(2, findingsOf(), { from: w.head, to: head2 });
+  assertExit(r, 0, r.stderr + r.stdout);
+  const round = w.state().rounds[1];
+  assert.equal(round.reviewBaseKind, 'whole-pr');
+  assert.equal(round.reviewBase, w.repo.git(['merge-base', 'main', head2]).trim());
+  const patch = patchOf(w, 2);
+  assert.doesNotMatch(patch, /from-main\.js/);
+  assert.match(patch, /src\/a\.js/, 'the whole PR is reviewed');
+  assert.match(patch, /src\/c\.js/);
+  assert.ok(merged);
+});
+
+test('codex-review: a PR that targets a branch other than the default branch excludes nothing, and a merge-only round still runs Codex', (t) => {
+  const gh = GH.map((e) => (e.match === '^pr view 7' ? { ...e, stdoutJson: { ...e.stdoutJson, baseRefName: 'release' } } : e));
+  const w = worldIgnoringReview(t, { gh });
+  w.repo.git(['branch', 'release', w.base]);
+  assertExit(w.codex(1, findingsOf()), 0);
+  const merged = mergeMainInto(w, { 'src/from-release.js': 'export const x = 1;\n' }, { branch: 'release' });
+  const r = w.codex(2, findingsOf(), { from: w.head, to: merged });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.baseOnly, undefined);
+  assert.equal(w.captured().length, 2, 'Codex ran');
+  assert.match(patchOf(w, 2), /from-release\.js/, 'the author-chosen base branch\'s code is reviewed');
+  assert.equal(w.state().rounds[1].reviewBaseKind, 'previous');
+});
+
+test('codex-review: code merged in from a branch other than the PR\'s base is reviewed (only the default branch is left out)', (t) => {
+  const w = worldIgnoringReview(t);
+  w.repo.git(['branch', 'side', w.base]);
+  assertExit(w.codex(1, findingsOf()), 0);
+  const merged = mergeMainInto(w, { 'src/from-side.js': 'export const x = 1;\n' }, { branch: 'side' });
+  const r = w.codex(2, findingsOf(), { from: w.head, to: merged });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.baseOnly, undefined, 'not a base-only round');
+  assert.equal(w.captured().length, 2, 'Codex ran');
+  assert.match(patchOf(w, 2), /from-side\.js/);
+});
+
+test('codex-review: an evil merge (extra changes inside the merge commit) is in the diff, and is not a base-only round', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf()), 0);
+  const merged = mergeMainInto(w, { 'src/from-main.js': 'export const other = 1;\n' }, { evil: { 'src/smuggled.js': 'export const evil = true;\n' } });
+  const r = w.codex(2, findingsOf(), { from: w.head, to: merged });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.baseOnly, undefined);
+  assert.equal(w.captured().length, 2, 'Codex ran');
+  const patch = patchOf(w, 2);
+  assert.match(patch, /smuggled\.js/, 'what the merge commit itself adds is reviewed');
+  assert.doesNotMatch(patch, /from-main\.js/, 'what really came from main is not');
+  assert.equal(w.state().rounds[1].reviewBaseKind, 'synthetic');
+});
+
+test('codex-review: a stale origin/<default> can only widen the reviewed range', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf()), 0);
+  // origin/main still points at the old fork point (no fetch could update it) although main was merged in.
+  w.repo.git(['update-ref', 'refs/remotes/origin/main', w.base]);
+  const merged = mergeMainInto(w, { 'src/from-main.js': 'export const other = 1;\n' });
+  const r = w.codex(2, findingsOf(), { from: w.head, to: merged });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.match(patchOf(w, 2), /from-main\.js/, 'the merged-in commits are not known to be main\'s, so they are shown');
+  assert.equal(r.json.baseOnly, undefined);
 });
 
 test('codex-review: when the code around a ruled finding changed, the ruling is not reused', (t) => {
@@ -916,6 +1079,159 @@ test('state show: filters by round, accepted, disputed and needs-human; mark-imp
   assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1,R9-B9']), 2);
   assertExit(w.cli(['state', 'mark-implemented', '--ids', '']), 2);
   assert.equal(w.stateText(), before, 'a bad id list changes nothing');
+});
+
+test('state mark-implemented: files that came in from merging the base branch do not count as the fix', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
+  mergeMainInto(w, { 'src/from-main.js': 'export const other = 1;\n' });
+  w.repo.write('src/a.test.js', 'console.log("only a test");\n');
+  w.repo.commit('add a test');
+  const refused = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assertExit(refused, 2, refused.stderr + refused.stdout);
+  assert.match(refused.json.message, /only test files changed \(src\/a\.test\.js\)/, 'main\'s src/from-main.js is not the PR\'s change');
+
+  w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
+  w.repo.commit('fix');
+  assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']), 0);
+});
+
+test('state mark-implemented fails closed: a conflicting base merge, or a state whose toHead git cannot resolve, refuses the mark', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
+  // The default branch edits the line round 1 reviewed the PR changing: the trial merge conflicts, so the PR's own change
+  // since round 1 cannot be separated from main's, and no fix is accepted on a guess.
+  // The PR is then rebuilt on top of main (a rebase): no merge commit records how the conflict was resolved, so nothing
+  // marks where the PR's own work since round 1 starts.
+  w.repo.checkout('main');
+  w.repo.write('src/a.js', aFile(false).replace('v12 = 12', 'v12 = 1200'));
+  w.repo.write('src/from-main.js', 'export const other = 1;\n');
+  w.repo.commit('main moves on');
+  w.repo.git(['checkout', '-q', '-B', 'feat/x', 'main']);
+  w.repo.write('src/a.js', aFile(true));
+  w.repo.commit('feature, rebuilt on main');
+  w.repo.write('src/a.test.js', 'console.log("test");\n');
+  w.repo.commit('add a test');
+  const before = w.stateText();
+  const refused = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assertExit(refused, 2, refused.stderr + refused.stdout);
+  assert.equal(refused.json.error, 'base-unresolved');
+  assert.equal(w.stateText(), before, 'nothing was marked');
+
+  // An unresolvable toHead is an error, never "a non-test file changed".
+  const w2 = worldIgnoringReview(t);
+  assertExit(w2.codex(1, findingsOf([finding()])), 0);
+  assertExit(w2.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
+  w2.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
+  w2.repo.commit('fix');
+  const st = JSON.parse(w2.stateText());
+  st.rounds[0].toHead = 'f'.repeat(40);
+  writeFileSync(join(w2.repo.dir, '.review', 'state.json'), JSON.stringify(st));
+  const bad = w2.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assertExit(bad, 2, bad.stderr + bad.stdout);
+  assert.equal(bad.json.error, 'base-unresolved');
+  assert.equal(w2.item('R1-B1').implemented, undefined);
+});
+
+// A conflicting base merge cannot be separated from the PR's own change by a trial merge, so the PR's work since round N is
+// measured from the merge commit that resolved the conflict (the latest one on the PR's first-parent history whose other parent
+// is the default branch carrying the current fork point).
+const conflictMerge = (w, extra = {}) =>
+  mergeMainInto(w, { 'src/a.js': aFile(false).replace('v12 = 12', 'v12 = 1200'), 'src/from-main.js': 'export const other = 1;\n', ...extra }, { resolve: { 'src/a.js': aFile(true) } });
+const acceptedWorld = (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
+  return w;
+};
+const fixA = (w) => {
+  w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
+  return w.repo.commit('fix');
+};
+
+test('state mark-implemented: after a conflicting base merge is resolved, a real fix committed after the resolution counts', (t) => {
+  const w = acceptedWorld(t);
+  conflictMerge(w);
+  fixA(w);
+  const r = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(w.item('R1-B1').implemented, true);
+});
+
+test('state mark-implemented: after a resolved conflicting merge, only a test file committed since is still refused', (t) => {
+  const w = acceptedWorld(t);
+  conflictMerge(w);
+  w.repo.write('src/a.test.js', 'console.log("test");\n');
+  w.repo.commit('add a test');
+  const refused = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assertExit(refused, 2, refused.stderr + refused.stdout);
+  assert.equal(refused.json.error, 'no-code-change');
+  assert.match(refused.json.message, /only test files changed \(src\/a\.test\.js\)/);
+  assert.equal(w.item('R1-B1').implemented, undefined);
+});
+
+test('state mark-implemented: a resolved conflicting merge with no later commit is refused', (t) => {
+  const w = acceptedWorld(t);
+  conflictMerge(w);
+  const refused = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assertExit(refused, 2, refused.stderr + refused.stdout);
+  assert.equal(refused.json.error, 'no-code-change');
+  assert.equal(w.item('R1-B1').implemented, undefined);
+});
+
+test('state mark-implemented: files main brings in after the resolving merge do not count as the fix', (t) => {
+  const w = acceptedWorld(t);
+  conflictMerge(w);
+  w.repo.write('src/a.test.js', 'console.log("test");\n');
+  w.repo.commit('add a test');
+  mergeMainInto(w, { 'src/more-from-main.js': 'export const more = 1;\n' }); // a clean second update-branch
+  const refused = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assertExit(refused, 2, refused.stderr + refused.stdout);
+  assert.equal(refused.json.error, 'no-code-change', 'main\'s new file is not the PR\'s change');
+  assert.doesNotMatch(refused.json.message, /more-from-main/);
+});
+
+test('state mark-implemented: a fix committed before a later clean base merge still counts, and the later merge alone does not', (t) => {
+  const w = acceptedWorld(t);
+  conflictMerge(w);
+  fixA(w);
+  mergeMainInto(w, { 'src/more-from-main.js': 'export const more = 1;\n' }); // update-branch again, no conflict
+  const r = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(w.item('R1-B1').implemented, true);
+
+  const w2 = acceptedWorld(t);
+  conflictMerge(w2);
+  mergeMainInto(w2, { 'src/more-from-main.js': 'export const more = 1;\n' });
+  const refused = w2.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assertExit(refused, 2, refused.stderr + refused.stdout);
+  assert.equal(refused.json.error, 'no-code-change');
+  assert.equal(w2.item('R1-B1').implemented, undefined);
+});
+
+test('state mark-implemented: a conflict resolved by merging a branch other than the default branch stays unresolved', (t) => {
+  const w = acceptedWorld(t);
+  // main gets the conflicting change; a side branch (containing it plus more) is what the PR merges, so no merge commit
+  // brings in the default branch itself.
+  w.repo.checkout('main');
+  w.repo.write('src/a.js', aFile(false).replace('v12 = 12', 'v12 = 1200'));
+  w.repo.commit('main moves on');
+  w.repo.git(['checkout', '-q', '-b', 'side', 'main']);
+  w.repo.write('src/side.js', 'export const side = 1;\n');
+  w.repo.commit('side work');
+  w.repo.checkout('feat/x');
+  try { w.repo.git(['merge', '--no-ff', '-m', 'merge side', 'side']); } catch {
+    w.repo.write('src/a.js', aFile(true));
+    w.repo.git(['add', '-A']);
+    w.repo.git(['commit', '-q', '--no-edit']);
+  }
+  fixA(w);
+  const refused = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assertExit(refused, 2, refused.stderr + refused.stdout);
+  assert.equal(refused.json.error, 'base-unresolved');
+  assert.doesNotMatch(refused.json.message, /resolve the base branch merge and try again/);
 });
 
 test('state record-followup and set-outcome', (t) => {
@@ -2075,4 +2391,159 @@ test('summary reads model proofs from the state rounds, the files only as a fall
   writeFileSync(w.roundFile(1, 'model-proof.json'), JSON.stringify({ ok: true, transcript: '/t/from-file.jsonl', models: { 'claude-fable-5-1': 1 }, efforts: { high: 1 } }));
   assertExit(w.cli(['summary', '--pr', '7', '--outcome', 'merged']), 0);
   assert.ok(body().includes('from-file.jsonl'));
+});
+
+// ---- triage owner-ruling (owner_approval: chat) -----------------------------------------------
+
+const CHAT_YML = `${pipelineYml()}owner_approval: chat\n`;
+const QUOTE = 'Yes, file it as a follow-up, not part of this PR.';
+
+// A round whose listed items an arbiter left waiting for a human (what `arbiter apply` does on a failed model proof).
+function waitingForHuman(w, decisions) {
+  const state = w.state();
+  for (const item of state.rounds[0].items) {
+    if (decisions[item.id]) item.final = { decision: decisions[item.id], by: 'arbiter', needsHuman: true, reason: 'model-proof failed' };
+  }
+  writeFileSync(join(w.repo.dir, '.review', 'state.json'), JSON.stringify(state));
+}
+const rule = (id, decision, { quote = QUOTE, reason = 'owner confirmed in chat', extra = [] } = {}) =>
+  ['triage', 'owner-ruling', '--round', '1', '--id', id, '--decision', decision, '--reason', reason, '--owner-quote', quote, ...extra];
+
+test('triage owner-ruling: refused in label mode, for an item that needs no human, a missing item, an empty quote or reason', (t) => {
+  const label = world(t);
+  assertExit(label.codex(1, findingsOf([finding()])), 0);
+  waitingForHuman(label, { 'R1-B1': 'FOLLOW-UP' });
+  const refused = label.cli(rule('R1-B1', 'FOLLOW-UP'));
+  assertExit(refused, 1);
+  assert.match(refused.json.reason, /owner_approval: chat/);
+  assert.equal(label.item('R1-B1').final.by, 'arbiter', 'state untouched');
+
+  const w = world(t, { yml: CHAT_YML });
+  assertExit(w.codex(1, findingsOf([finding()], [finding({ title: 'Rename helper', file: 'src/b.js', line: 3 })])), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'], 'R1-S1': ['ACCEPT'] }), 0);
+  waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP' });
+  const settledItem = w.cli(rule('R1-S1', 'ACCEPT'));
+  assertExit(settledItem, 1);
+  assert.match(settledItem.json.reason, /does not need a human/);
+  assert.equal(w.item('R1-S1').final.by, 'judge');
+  const missing = w.cli(rule('R1-X9', 'REJECT'));
+  assertExit(missing, 1);
+  assert.match(missing.json.reason, /no item R1-X9 in round 1/);
+  assertExit(w.cli(rule('R1-B1', 'FOLLOW-UP', { quote: '   ' })), 1);
+  assertExit(w.cli(rule('R1-B1', 'FOLLOW-UP', { reason: ' ' })), 1);
+  assertExit(w.cli(rule('R1-B1', 'FOLLOW-UP', { quote: 'x'.repeat(1001) })), 1);
+  assertExit(w.cli(rule('R1-B1', 'FOLLOW-UP', { extra: ['--pr', '99'] })), 1, 'a PR number that is not the review state\'s');
+  assertExit(w.cli(rule('R1-B1', 'MAYBE')), 2);
+  assertExit(w.cli(['triage', 'owner-ruling', '--round', '1', '--id', 'R1-B1', '--decision', 'REJECT', '--reason', 'r']), 2, 'no --owner-quote at all');
+  assertExit(w.cli(['triage', 'owner-ruling', '--round', '9', '--id', 'R1-B1', '--decision', 'REJECT', '--reason', 'r', '--owner-quote', 'q']), 2);
+  assert.equal(w.item('R1-B1').final.by, 'arbiter', 'every refusal left the state untouched');
+});
+
+test('triage owner-ruling: records the owner ruling, keeps the overruled final, and clears the needs-human block', (t) => {
+  const w = world(t, { yml: CHAT_YML });
+  assertExit(w.codex(1, findingsOf([finding()], [finding({ title: 'Rename helper', file: 'src/b.js', line: 3 })])), 0);
+  waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP', 'R1-S1': 'REJECT' });
+  assert.deepEqual(w.cli(['state', 'outcome']).json.needsHuman, ['R1-B1', 'R1-S1']);
+
+  const r = w.cli(rule('R1-B1', 'FOLLOW-UP', { extra: ['--pr', '7'] }));
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.ok, true);
+  const final = w.item('R1-B1').final;
+  assert.deepEqual({ ...final, ruledAt: undefined }, {
+    decision: 'FOLLOW-UP', by: 'owner', needsHuman: false, reason: 'owner confirmed in chat', ownerQuote: QUOTE, ruledAt: undefined,
+    overruled: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, reason: 'model-proof failed' },
+  });
+  assert.ok(!Number.isNaN(Date.parse(final.ruledAt)));
+  assert.deepEqual(r.json.final, final);
+  assert.equal(w.cli(['state', 'outcome']).json.clean, false, 'one item still waits');
+  assertExit(w.cli(rule('R1-S1', 'REJECT')), 0);
+  const outcome = w.cli(['state', 'outcome']).json;
+  assert.deepEqual(outcome.needsHuman, []);
+  assert.equal(outcome.clean, true, JSON.stringify(outcome));
+  assertExit(w.cli(rule('R1-S1', 'ACCEPT')), 1, 'an item the owner already ruled is settled: no second ruling');
+});
+
+test('triage owner-ruling: ACCEPT stays unclean until the fix is built and a later round reviews it', (t) => {
+  const w = world(t, { yml: CHAT_YML });
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  waitingForHuman(w, { 'R1-B1': 'REJECT' });
+  assertExit(w.cli(rule('R1-B1', 'ACCEPT')), 0);
+  assert.notEqual(w.item('R1-B1').implemented, true, 'ACCEPT still has to be built');
+  const open = w.cli(['state', 'outcome']).json;
+  assert.equal(open.clean, false);
+  assert.deepEqual(open.unimplemented, ['R1-B1']);
+  w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
+  const head2 = w.repo.commit('fix');
+  assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']), 0);
+  assert.equal(w.cli(['state', 'outcome']).json.clean, false, 'built but not yet re-reviewed');
+  assertExit(w.codex(2, findingsOf(), { from: w.head, to: head2 }), 0);
+  assert.equal(w.cli(['state', 'outcome']).json.clean, true);
+});
+
+test('triage owner-ruling: works on a published round, and a state rebuilt from the triage comment keeps the ruling', (t) => {
+  const w0 = world(t, { yml: CHAT_YML });
+  assertExit(w0.codex(1, findingsOf([finding()])), 0);
+  waitingForHuman(w0, { 'R1-B1': 'FOLLOW-UP' });
+  assertExit(w0.cli(rule('R1-B1', 'FOLLOW-UP')), 0);
+  const ruled = w0.state();
+  const gh = [
+    ...GH,
+    { match: '^api user', stdout: 'me\n' },
+    { match: 'issues/7/comments --paginate', stdoutJson: [{ id: 9, user: { login: 'me' }, body: triageComment(ruled) }] },
+  ];
+  const w = world(t, { gh, yml: CHAT_YML });
+  const shown = w.cli(['state', 'show', '--pr', '7']);
+  assertExit(shown, 0, shown.stderr + shown.stdout);
+  assert.equal(shown.json.recovered, true);
+  assert.deepEqual(w.item('R1-B1').final, ruled.rounds[0].items[0].final);
+  assert.ok(triageComment(w.state()).includes(`owner (chat): ${QUOTE}`));
+});
+
+test('followups create: a FOLLOW-UP ruled by the owner is filed, one that is still waiting for a human is held', (t) => {
+  const url = 'https://github.com/acme/widgets/issues/31';
+  const w = world(t, { yml: CHAT_YML, gh: [...GH, ...NO_ISSUES, { match: '^api -X POST repos/acme/widgets/issues ', stdoutJson: { number: 31, html_url: url } }] });
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP' });
+  const held = w.cli(['followups', 'create', '--round', '1']);
+  assert.deepEqual([held.json.held, held.json.created], [['R1-B1'], []]);
+  assertExit(w.cli(rule('R1-B1', 'FOLLOW-UP')), 0);
+  const r = w.cli(['followups', 'create', '--round', '1']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual(r.json.created, [{ id: 'R1-B1', number: 31, url }]);
+  const post = w.fake.calls().find((c) => c.argv.join(' ').startsWith('api -X POST repos/acme/widgets/issues '));
+  assert.ok(JSON.parse(post.stdin).body.includes('**Owner (why this is a follow-up, not part of the PR):** owner confirmed in chat'));
+});
+
+test('arbiter needed: returns promptHeader, exactly the ROUND / INPUT-DIGEST header of the input file', (t) => {
+  const w = readyForArbiter(t);
+  const r = w.cli(['arbiter', 'needed', '--round', '1']);
+  assertExit(r, 0);
+  assert.equal(r.json.promptHeader, `ROUND: 1\nINPUT-DIGEST: ${r.json.digest}`);
+  assert.ok(readFileSync(r.json.inputPath, 'utf8').startsWith(`${r.json.promptHeader}\n\n`));
+  assert.equal(arbiterRun(w, { prompt: `${r.json.promptHeader}\nRule on every item.` }).code, 0, 'a prompt that starts with the header passes the proof');
+});
+
+test('triage settle: a cached copy of an owner ruling (by cache, ownerQuote kept) is still the owner\'s word', (t) => {
+  const w = world(t);
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  editState(w, (s) => {
+    s.rounds[0].items[0].judge = { decision: 'REJECT', confidence: 'high', reason: 'r', ...DISPUTED };
+    s.rounds[0].items[0].final = { decision: 'REJECT', by: 'cache', needsHuman: false, reason: 'ok', ownerQuote: 'reject it', ruledAt: '2026-10-14T00:00:00.000Z' };
+  });
+  const before = w.stateText();
+  const s = w.cli(settleArgs(w, 'R1-B1', 'bug-disproved'));
+  assertExit(s, 1, s.stdout);
+  assert.match(s.json.reason, /already ruled by the owner/);
+  assert.equal(w.stateText(), before, 'state untouched');
+});
+
+test('triage owner-ruling: says the ruling is not published yet and that state show would restore the published state without it', (t) => {
+  const w = world(t, { yml: CHAT_YML });
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP' });
+  const r = w.cli(rule('R1-B1', 'FOLLOW-UP', { extra: ['--pr', '7'] }));
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.published, false);
+  assert.match(r.json.next, /comment --pr 7 --kind triage/);
+  assert.match(r.json.next, /state show/);
 });

@@ -277,6 +277,7 @@ verify:
   quick: node scripts/verify.mjs --quick
   report: .verify/report.json
   screenshots: .verify/screenshots
+  # skippable_steps: [db]      # optional owner list: steps verify may skip (status "skipped" + reason); others fail the final gate
 ci:
   required_checks: ["Typecheck + Vitest", "Static guards", "Test integrity", "Hard-stop scan", "Vercel"]
   e2e_label: run-e2e           # ship applies it for high-risk PRs before the final gate
@@ -318,7 +319,7 @@ agent_log: docs/agent-log.md
 - Steps run in order, **fail fast** (first failure stops; rest `not-run`), each with its log in
   `.verify/logs/<step>.log`. Report `.verify/report.json`:
   `{version:1, mode, ok, startedAt, finishedAt, git:{head, base, mergeBase, dirty, treeHash},
-  steps:[{name, status:pass|fail|not-run, durationMs, command, exitCode, errorExcerpt}]}`;
+  steps:[{name, status:pass|fail|not-run|skipped, durationMs, command, exitCode, errorExcerpt, skipReason?}]}`;
   excerpt ≤ 40 lines.
 - Full mode (EagleWatch): `install` (`npm ci`), `typecheck`, `lint` (the static-guard scripts
   CI runs; a unit test asserts verify's list ⊇ `static-guards.yml`'s list), `unit`

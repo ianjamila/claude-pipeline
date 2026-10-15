@@ -19,6 +19,9 @@ import {
   markLightLane,
   roundOutcome,
   reviewValidFor,
+  applyOwnerRuling,
+  isOwnerRuled,
+  ownerRuledItems,
 } from '../pipeline/lib/triage.mjs';
 
 // ---- fixtures -------------------------------------------------------------------------------
@@ -517,7 +520,7 @@ test('validateTriage: catches a bad enum, a non-boolean disputedBug and a malfor
   assert.ok(r.errors.some((e) => /decision/.test(e)), r.errors.join('\n'));
   r = bad({ decision: 'accept' });
   assert.equal(r.ok, false, 'enums are case-sensitive');
-  r = bad({ confidence: 'medium' });
+  r = bad({ confidence: 'Medium' });
   assert.equal(r.ok, false);
   assert.ok(r.errors.some((e) => /confidence/.test(e)));
   r = bad({ disputedBug: 'yes' });
@@ -564,7 +567,7 @@ test('validateRulings: accepts a complete set and catches missing, duplicate, un
   assert.ok(unknown.errors.some((e) => /unknown/i.test(e) && e.includes('R2-B9')));
 
   assert.equal(validateRulings({ rulings: [ruling('R1-B1', 'NOPE')] }, ['R1-B1']).ok, false);
-  assert.equal(validateRulings({ rulings: [ruling('R1-B1', 'ACCEPT', 'medium')] }, ['R1-B1']).ok, false);
+  assert.equal(validateRulings({ rulings: [ruling('R1-B1', 'ACCEPT', 'Medium')] }, ['R1-B1']).ok, false);
   assert.equal(validateRulings({ rulings: [{ id: 'R1-B1', ruling: 'ACCEPT', confidence: 'high' }] }, ['R1-B1']).ok, false);
   assert.equal(validateRulings(null, ['R1-B1']).ok, false);
   assert.equal(validateRulings({}, ['R1-B1']).ok, false);
@@ -894,7 +897,7 @@ test('finalizeWithoutArbiter: an invalid judge decision that skipped validation 
 test('applyRulings: a ruling or confidence outside the enums goes to a human (case-sensitive)', () => {
   const cases = [
     ['accept', 'high'], ['Reject', 'high'], ['FOLLOWUP', 'high'], [undefined, 'high'], [null, 'high'], ['', 'high'],
-    ['ACCEPT', 'HIGH'], ['ACCEPT', 'medium'], ['ACCEPT', undefined], ['ACCEPT', null], ['ACCEPT', ''],
+    ['ACCEPT', 'HIGH'], ['ACCEPT', 'Medium'], ['ACCEPT', undefined], ['ACCEPT', null], ['ACCEPT', ''],
   ];
   for (const [r, confidence] of cases) {
     const it = judged('SUGGESTION', 'REJECT', 'high', {}, { id: 'R1-S1' });
@@ -983,4 +986,147 @@ test('applyTestResult: evidence is capped at 500 characters with an ellipsis, in
   // Capped by code point: an emoji at the boundary is never split.
   const emoji = '😀'.repeat(600);
   assert.equal(Array.from(applyTestResult(item(), 'bug-confirmed', emoji).test.evidence).length, 501);
+});
+
+// ---- owner rulings (owner_approval: chat) ---------------------------------------------------
+
+const needsHumanFinal = (decision = 'FOLLOW-UP', by = 'arbiter') => ({ decision, by, needsHuman: true, reason: 'model-proof failed' });
+const ownerOk = (decision, over = {}) => ({ decision, reason: 'owner agrees', ownerQuote: 'yes, follow-up', ruledAt: '2026-10-14T01:02:03.000Z', ...over });
+
+test('applyOwnerRuling: records the owner as the decider, keeps the old final as overruled, never mutates its input', () => {
+  const before = item({ id: 'R1-B1', final: needsHumanFinal() });
+  const out = applyOwnerRuling(before, ownerOk('REJECT'));
+  assert.deepEqual(out.final, {
+    decision: 'REJECT', by: 'owner', needsHuman: false, reason: 'owner agrees', ownerQuote: 'yes, follow-up',
+    ruledAt: '2026-10-14T01:02:03.000Z', overruled: needsHumanFinal(),
+  });
+  assert.deepEqual(before.final, needsHumanFinal(), 'input not mutated');
+  assert.equal(isOwnerRuled(out), true);
+  assert.equal(isOwnerRuled(before), false);
+  assert.equal(out.implemented, false, 'ACCEPT still has to be built');
+});
+
+test('applyOwnerRuling: refuses a decision outside ACCEPT|FOLLOW-UP|REJECT and an item that needs no human', () => {
+  assert.throws(() => applyOwnerRuling(item({ final: needsHumanFinal() }), ownerOk('MAYBE')), /decision/);
+  assert.throws(() => applyOwnerRuling(item({ final: settled('ACCEPT') }), ownerOk('REJECT')), /needs no human/);
+  assert.throws(() => applyOwnerRuling(item(), ownerOk('REJECT')), /needs no human/);
+});
+
+test('ownerRuledItems: finds owner rulings in every round, including cached copies', () => {
+  const owner = applyOwnerRuling(item({ id: 'R1-B1', fingerprint: 'fp', final: needsHumanFinal() }), ownerOk('REJECT'));
+  const cache = ruledCacheFrom([owner]);
+  const [cached] = reuseRuled([item({ id: 'R2-B1', fingerprint: 'fp' })], { fp: { ...cache.fp, bucket: 'BLOCKING', category: 'logic' } });
+  assert.equal(cached.final.by, 'cache');
+  assert.equal(cached.final.ownerQuote, 'yes, follow-up', 'the cached copy still carries the owner quote');
+  assert.equal(isOwnerRuled(cached), true);
+  const found = ownerRuledItems(stateOf([round(1, [owner, item({ id: 'R1-B9', final: settled('REJECT') })]), round(2, [cached])]));
+  assert.deepEqual(found.map((i) => i.id), ['R1-B1', 'R2-B1']);
+});
+
+test('owner ruling: REJECT and FOLLOW-UP clear a needs-human item, ACCEPT stays unclean until built and re-reviewed', () => {
+  const stuck = (id) => item({ id, bucket: 'BLOCKING', final: needsHumanFinal('FOLLOW-UP') });
+  const blocked = roundOutcome(stateOf([round(1, [stuck('R1-B1')])]));
+  assert.equal(blocked.clean, false);
+  assert.deepEqual(blocked.needsHuman, ['R1-B1']);
+  for (const decision of ['REJECT', 'FOLLOW-UP']) {
+    const s = stateOf([round(1, [applyOwnerRuling(stuck('R1-B1'), ownerOk(decision))])]);
+    assert.equal(roundOutcome(s).clean, true, decision);
+    assert.equal(reviewValidFor(s, 'h-final'), true, decision);
+  }
+  const accepted = applyOwnerRuling(stuck('R1-B1'), ownerOk('ACCEPT'));
+  let s = stateOf([round(1, [accepted])]);
+  assert.equal(roundOutcome(s).clean, false);
+  assert.deepEqual(roundOutcome(s).unimplemented, ['R1-B1']);
+  assert.equal(reviewValidFor(s, 'h-final'), false);
+  s = stateOf([round(1, [{ ...accepted, implemented: true }])]);
+  assert.equal(roundOutcome(s).clean, false, 'built, but the fix is not reviewed yet');
+  s = stateOf([round(1, [{ ...accepted, implemented: true }]), round(2, [])]);
+  assert.equal(roundOutcome(s).clean, true, 'a later clean round reviews the fix');
+  assert.equal(reviewValidFor(s, 'h-final'), true);
+});
+
+test('an owner ruling is not overridden by an arbiter ruling or a test result', () => {
+  const owner = applyOwnerRuling(item({ id: 'R1-B1', final: needsHumanFinal() }), ownerOk('REJECT'));
+  const [after] = applyRulings([owner], { rulings: [{ id: 'R1-B1', ruling: 'ACCEPT', confidence: 'high', reasoning: 'x' }] }, { proofOk: true });
+  assert.deepEqual(after.final, owner.final);
+});
+
+test('an owner ruling reused from the cache (by cache, ownerQuote kept) is not overridden either, and stays owner-ruled', () => {
+  const owner = applyOwnerRuling(item({ id: 'R1-B1', fingerprint: 'fp', final: needsHumanFinal() }), ownerOk('REJECT'));
+  const [cached] = reuseRuled([item({ id: 'R2-B1', fingerprint: 'fp' })], ruledCacheFrom([owner]));
+  assert.equal(cached.final.by, 'cache');
+  const ruling = { rulings: [{ id: 'R2-B1', ruling: 'ACCEPT', confidence: 'high', reasoning: 'x' }] };
+  const [after] = applyRulings([cached], ruling, { proofOk: true });
+  assert.deepEqual(after.final, cached.final, 'the arbiter cannot replace it');
+  assert.equal(after.final.ownerQuote, 'yes, follow-up');
+  assert.equal(isOwnerRuled(after), true);
+});
+
+test('reuseRuled: a security dismissal the OWNER ruled on is reused next round and still counts as owner-ruled; a non-owner one is not', () => {
+  for (const category of SECURITY_CATEGORIES) {
+    for (const decision of ['REJECT', 'FOLLOW-UP']) {
+      const stuck = item({ id: 'R1-B1', fingerprint: 'fp', bucket: 'BLOCKING', category, final: needsHumanFinal(decision) });
+      const owner = applyOwnerRuling(stuck, ownerOk(decision));
+      const [again] = reuseRuled([item({ id: 'R2-B1', fingerprint: 'fp', bucket: 'BLOCKING', category })], ruledCacheFrom([owner]));
+      assert.equal(again.final?.by, 'cache', `${decision} ${category}: reused`);
+      assert.equal(isOwnerRuled(again), true, `${decision} ${category}: still the owner's word`);
+      assert.equal(again.final.needsHuman, false);
+      assert.equal(ownerRuledItems(stateOf([round(2, [again])])).length, 1);
+      const plain = item({ id: 'R1-B2', fingerprint: 'fp', bucket: 'BLOCKING', category, final: settled(decision, 'arbiter') });
+      assert.equal(reuseRuled([item({ fingerprint: 'fp', bucket: 'BLOCKING', category })], ruledCacheFrom([plain]))[0].final, null, `${decision} ${category}: non-owner not reused`);
+    }
+  }
+});
+
+// ---- confidence "medium" ----------------------------------------------------------------------
+
+test('validateRulings and validateTriage accept confidence "medium"', () => {
+  assert.deepEqual(validateRulings({ rulings: [ruling('R1-B1', 'ACCEPT', 'medium')] }, ['R1-B1']), { ok: true, errors: [] });
+  const t = goodTriage('R1-B1');
+  t.items[0].confidence = 'medium';
+  assert.deepEqual(validateTriage(t, ['R1-B1']), { ok: true, errors: [] });
+});
+
+test('confidence stays strict: "Medium" and "unsure" are invalid', () => {
+  for (const c of ['Medium', 'unsure', 'High']) {
+    assert.equal(validateRulings({ rulings: [ruling('R1-B1', 'ACCEPT', c)] }, ['R1-B1']).ok, false, c);
+    const t = goodTriage('R1-B1');
+    t.items[0].confidence = c;
+    assert.equal(validateTriage(t, ['R1-B1']).ok, false, c);
+  }
+});
+
+test('applyRulings: arbiter "medium" ACCEPT stands like high and keeps the literal confidence', () => {
+  const it = judged('SUGGESTION', 'REJECT', 'high', {}, { id: 'R1-S1' });
+  const [out] = applyRulings([it], [ruling('R1-S1', 'ACCEPT', 'medium', 'fine')], { proofOk: true, transcript: 't.jsonl' });
+  assert.deepEqual(out.final, { decision: 'ACCEPT', by: 'arbiter', needsHuman: false, reason: 'fine' });
+  assert.equal(out.arbiter.confidence, 'medium');
+});
+
+test('applyRulings: arbiter "medium" REJECT of a BLOCKING security item still goes to a human', () => {
+  const it = judged('BLOCKING', 'REJECT', 'high', {}, { id: 'R1-B1', category: 'security' });
+  const [out] = applyRulings([it], [ruling('R1-B1', 'REJECT', 'medium')], { proofOk: true });
+  assert.equal(out.final.needsHuman, true);
+  assert.equal(out.final.reason, 'would dismiss a blocking security/data item');
+});
+
+test('applyRulings: arbiter "medium" without proof still goes to a human', () => {
+  const it = judged('SUGGESTION', 'REJECT', 'high', {}, { id: 'R1-S1' });
+  const [out] = applyRulings([it], [ruling('R1-S1', 'ACCEPT', 'medium')], { proofOk: false });
+  assert.equal(out.final.needsHuman, true);
+});
+
+test('applyRulings: arbiter "Medium" or "unsure" is invalid output and goes to a human', () => {
+  const it = judged('SUGGESTION', 'REJECT', 'high', {}, { id: 'R1-S1' });
+  for (const c of ['Medium', 'unsure', null]) {
+    const [out] = applyRulings([it], [ruling('R1-S1', 'ACCEPT', c)], { proofOk: true });
+    assert.equal(out.final.needsHuman, true, String(c));
+    assert.equal(out.final.reason, 'invalid arbiter output');
+  }
+});
+
+test('arbiterNeeded: judge "medium" confidence needs the arbiter', () => {
+  for (const bucket of ['BLOCKING', 'SUGGESTION', 'WORTH_CONSIDERING']) {
+    assert.equal(arbiterNeeded(judged(bucket, 'ACCEPT', 'medium')), true, bucket);
+  }
 });

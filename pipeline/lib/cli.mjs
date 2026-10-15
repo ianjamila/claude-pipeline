@@ -34,9 +34,10 @@ export function intOption(values, name, { required = false, min = -Infinity, max
   return n;
 }
 
-// Commands return { exitCode, output }; output is serialised as the single stdout JSON object.
-export function emit({ exitCode = EXIT.OK, output = {} }, { stdout = process.stdout } = {}) {
-  stdout.write(JSON.stringify(output, null, 2) + '\n');
+// Commands return { exitCode, output }; output is serialised as the single stdout JSON object, indented unless the
+// command asks for `compact: true` (one line, for a log that is appended to).
+export function emit({ exitCode = EXIT.OK, output = {}, compact = false }, { stdout = process.stdout } = {}) {
+  stdout.write(JSON.stringify(output, null, compact ? 0 : 2) + '\n');
   return exitCode;
 }
 

@@ -589,3 +589,49 @@ test('ci.approvers: defaults to [], accepts GitHub logins (incl. bots), rejects 
     assert.ok(has(r, 'ci.approvers must be an array of GitHub logins'), JSON.stringify(bad));
   }
 });
+
+test('verify.skippable_steps: optional list of unique step names, each also in expected_steps when that is set', () => {
+  const withVerify = (extra) => validateConfig({ ...minimal(), verify: { ...minimal().verify, ...extra } });
+  const ok = withVerify({ expected_steps: ['install', 'sql-arms'], skippable_steps: ['sql-arms'] });
+  assert.equal(ok.ok, true, ok.errors.join('|'));
+  assert.deepEqual(ok.config.verify.skippable_steps, ['sql-arms']);
+  assert.equal(validateConfig(minimal()).config.verify.skippable_steps, undefined, 'absent by default: nothing may be skipped');
+  assert.equal(withVerify({ skippable_steps: ['anything'] }).ok, true, 'without expected_steps there is no list to check against');
+  assert.equal(withVerify({ skippable_steps: [] }).ok, true, 'an empty list is the same as absent');
+  for (const bad of ['sql-arms', ['a', 'a'], ['a', ''], ['a', 3], null, {}]) {
+    const r = withVerify({ skippable_steps: bad });
+    assert.equal(r.ok, false, JSON.stringify(bad));
+    assert.ok(has(r, 'verify.skippable_steps'), r.errors.join('|'));
+  }
+  const unknown = withVerify({ expected_steps: ['install'], skippable_steps: ['install', 'sql-arms'] });
+  assert.equal(unknown.ok, false);
+  assert.ok(unknown.errors.some((e) => /verify\.skippable_steps/.test(e) && /sql-arms/.test(e) && /expected_steps/.test(e)), unknown.errors.join('|'));
+});
+
+test('worktrees block: defaults when absent', () => {
+  const r = validateConfig(minimal());
+  assert.equal(r.ok, true, r.errors.join('; '));
+  assert.deepEqual(r.config.worktrees, {
+    mode: 'report',
+    protect: ['foundation', '*.stack'],
+    min_idle_hours: 24,
+    min_merged_hours: 24,
+    delete: ['node_modules/', '.next/', 'supabase/.temp/', 'test-results/', 'playwright-report/', 'next-env.d.ts', 'public/sw.js', 'tsconfig.tsbuildinfo', '*.log'],
+    archive: ['.review/', '.verify/'],
+    memory_dirs: ['~/claude-memory'],
+  });
+});
+
+test('worktrees block: rejects a bad mode, unknown key, non-positive hours', () => {
+  const r = validateConfig({ ...minimal(), worktrees: { mode: true, min_idle_hours: 0, bogus: 1 } });
+  assert.equal(r.ok, false);
+  assert.ok(has(r, 'worktrees.mode'));
+  assert.ok(has(r, 'worktrees.min_idle_hours'));
+  assert.ok(has(r, 'unknown key: worktrees.bogus'));
+});
+
+test('worktrees block: a path in delete must not also be in archive', () => {
+  const r = validateConfig({ ...minimal(), worktrees: { delete: ['.review/'] } });
+  assert.equal(r.ok, false);
+  assert.ok(has(r, 'worktrees: .review/ is in both delete and archive'));
+});

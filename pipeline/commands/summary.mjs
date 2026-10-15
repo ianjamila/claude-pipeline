@@ -13,7 +13,7 @@ import { loadConfig } from '../lib/config.mjs';
 import { summarySections } from '../lib/render.mjs';
 import { recordForOutcome } from '../lib/run-record.mjs';
 import { readSummaryComment, writeSummaryComment } from '../lib/summary-comment.mjs';
-import { buildAgentLogLine } from '../lib/agentlog.mjs';
+import { DEFAULT_OUTCOME, buildAgentLogLine } from '../lib/agentlog.mjs';
 import { inlineOptionValues } from '../lib/finalgate.mjs';
 import { readModelProofs } from '../lib/review-context.mjs';
 import { headSha } from '../lib/git.mjs';
@@ -21,7 +21,7 @@ import { classifyOutcome, defaultAction, notifyEvent } from '../lib/notify.mjs';
 
 export const meta = {
   summary: 'upsert the PR summary comment and print the agent-log line',
-  usage: 'pipeline summary --pr N --outcome O [--built TEXT] [--action TEXT] [--cause CODE] [--repo DIR]   -> {ok, url, agentLogLine, notify}',
+  usage: 'pipeline summary --pr N --outcome O [--built TEXT] [--action TEXT] [--cause CODE] [--repo DIR]   -> {ok, url, agentLogLine, pendingLogLine?, notify}   (pendingLogLine: only for --outcome merged, the same line with outcome "merged — prod smoke pending")',
 };
 
 // These stops never reach a review round (verify red three times, Codex out in round 1) or happen after the run's state
@@ -158,7 +158,10 @@ export const run = guarded(async (argv, ctx) => {
       const posted = writeSummaryComment(gh, pr, { record, sections, existing });
       const prUrl = typeof posted.url === 'string' ? posted.url.replace(/#.*$/, '') : '';
       if (/\/pull\/\d+$/.test(prUrl)) url = prUrl;
-      return { exitCode: EXIT.OK, output: { ok: true, url: posted.url, action: posted.action, agentLogLine, step: record.step, warnings } };
+      const output = { ok: true, url: posted.url, action: posted.action, agentLogLine, step: record.step, warnings };
+      // A merged run under `production.watch: workflow` logs the line `agent-log close` later resolves from the CI smoke result.
+      if (outcome === 'merged') output.pendingLogLine = buildAgentLogLine({ state, pr, title, outcome: DEFAULT_OUTCOME });
+      return { exitCode: EXIT.OK, output };
     });
   } finally {
     // Whether or not GitHub answered. When it threw, the error keeps its exit code and the push is still sent.

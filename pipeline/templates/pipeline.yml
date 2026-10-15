@@ -8,6 +8,11 @@ enforcement: github            # github = branch protection must be live; gate =
 #                              # or test-integrity violation merge. chat = no labels: CI does not fail on those, the ship skill
 #                              # stops before the merge, lists them in a PR comment and merges when the owner says "merge" in chat.
 worktree_dir: .worktrees       # ship creates agent/<name> worktrees here (must be gitignored)
+# worktrees:                 # `pipeline worktrees prune` (spec docs/specs/2026-10-13-worktree-prune-design.md)
+#   mode: report             # off | report | on — nothing is removed until this says on
+#   protect: [foundation, "*.stack"]
+#   min_idle_hours: 24
+#   min_merged_hours: 24
 
 verify:
   full: node scripts/verify.mjs          # everything; must pass before a PR and at the final gate
@@ -16,6 +21,9 @@ verify:
   screenshots: .verify/screenshots
   # expected_steps: [install, typecheck, lint, unit, build]   # optional: final-gate then requires the report's steps to
   #                                # equal this list exactly (in order), not the list the report declares for itself
+  # skippable_steps: [db]          # optional: steps verify may skip (report status "skipped" + a reason, e.g. a slow db step
+  #                                # when nothing it depends on changed). final-gate refuses a skipped step not listed here;
+  #                                # absent = no step may be skipped. Every name must also be in expected_steps (when set).
 
 ci:
   required_checks: ["Test integrity", "Hard-stop scan"]   # + your CI job names
@@ -80,4 +88,4 @@ review:
   max_rounds: 3
   light_lane_max_lines: 50
 
-agent_log: docs/agent-log.md
+agent_log: docs/agent-log.md   # one line per run; kept on the orphan branch `pipeline-agent-log` (`pipeline agent-log publish`), never committed to a PR branch
