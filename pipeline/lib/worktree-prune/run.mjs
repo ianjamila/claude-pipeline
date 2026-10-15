@@ -2,12 +2,13 @@
 // (decisions), prs.mjs (GitHub), inspect.mjs (facts) and act.mjs (the only mutations). Every mutation asks the mode table
 // first, so `off` / `report` / `--dry-run` leave the repo and the holding folder exactly as they were. Also the repo
 // context the other `worktrees` subcommands share (canonical root, its config, the origin-derived repo slug).
-import { lstatSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { promises as fsp, lstatSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { EXIT, UnavailableError } from '../cli.mjs';
-import { Fail, requireConfig } from '../cmd-common.mjs';
-import { GitError, git } from '../git.mjs';
+import { Fail } from '../cmd-common.mjs';
+import { loadConfig } from '../config.mjs';
+import { GitError, git, showFile } from '../git.mjs';
 import { createGitHub, guardGh } from '../github.mjs';
 import { listWorktrees } from '../local-branches.mjs';
 import { LockTimeoutError, withLock } from '../locks.mjs';
@@ -38,6 +39,60 @@ function configuredOrigin(root) {
   }
 }
 
+const CONFIG_FILE = '.claude/pipeline.yml';
+
+// The remote default branch's refs worth trying, best first: what origin/HEAD points at, then origin/main, origin/master.
+// Fully qualified (refs/remotes/...): an abbreviated `origin/main` would let a local branch or tag of that name win.
+function defaultBranchRefs(root) {
+  const refs = [];
+  try {
+    const head = git(['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD'], { cwd: root }).trim();
+    if (head.startsWith('refs/remotes/')) refs.push(head);
+  } catch (err) {
+    if (!(err instanceof GitError)) throw err; // origin/HEAD is simply not set
+  }
+  for (const r of ['refs/remotes/origin/main', 'refs/remotes/origin/master']) if (!refs.includes(r)) refs.push(r);
+  return refs;
+}
+
+// The config committed on the remote default branch, read through git (no checkout): { ref, text } or null. Only the
+// canonical root's repository is asked, never a feature worktree's files, so a feature branch cannot change prune behaviour.
+function committedConfig(root) {
+  for (const ref of defaultBranchRefs(root)) {
+    try {
+      git(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { cwd: root });
+      const text = showFile(ref, CONFIG_FILE, { cwd: root });
+      if (text !== null) return { ref: ref.slice('refs/remotes/'.length), full: ref, text }; // `ref` is the short name, for reports only
+    } catch (err) {
+      if (!(err instanceof GitError)) throw err; // no such ref: try the next one
+    }
+  }
+  return null;
+}
+
+// The validated config for the canonical root: its working tree's file first. Only when that file is MISSING (an invalid
+// or unreadable one fails as ever) the copy committed on the remote default branch is used, because the main checkout may
+// sit on a scratch branch that never had one. -> { loaded, configSource: 'worktree' | 'origin/<branch>' }.
+async function loadRepoConfig(root) {
+  let missing = false;
+  const loaded = await loadConfig(root, {
+    readFile: async (file, enc) => {
+      try {
+        return await fsp.readFile(file, enc);
+      } catch (err) {
+        if (err?.code === 'ENOENT') missing = true;
+        throw err;
+      }
+    },
+  });
+  if (loaded.ok) return { loaded, configSource: 'worktree' };
+  const fallback = missing ? committedConfig(root) : null;
+  if (fallback === null) throw new Fail(EXIT.USAGE, { ok: false, error: 'config', errors: loaded.errors, path: loaded.path });
+  const viaGit = await loadConfig(root, { readFile: async () => fallback.text });
+  if (!viaGit.ok) throw new Fail(EXIT.USAGE, { ok: false, error: 'config', errors: viaGit.errors, path: `${fallback.ref}:${CONFIG_FILE}` });
+  return { loaded: viaGit, configSource: fallback.ref };
+}
+
 // Canonical root (the main worktree, whichever checkout --repo names), its config and the repo's identity.
 export async function loadRepo(values, ctx) {
   const dir = path.resolve(ctx?.cwd ?? process.cwd(), values.repo ?? '.');
@@ -49,10 +104,10 @@ export async function loadRepo(values, ctx) {
     throw err;
   }
   const { root, commonDir } = canonical;
-  const { config } = await requireConfig(root);
+  const { loaded: { config }, configSource } = await loadRepoConfig(root);
   const originUrl = configuredOrigin(root);
   return {
-    root, commonDir, config, w: config.worktrees, worktreeDir: config.worktree_dir, originUrl,
+    root, commonDir, config, configSource, w: config.worktrees, worktreeDir: config.worktree_dir, originUrl,
     slug: parseRemote(originUrl)?.slug ?? path.basename(root),
     name: config.project || path.basename(root),
   };
@@ -383,7 +438,7 @@ export async function prune(values, ctx) {
   const mode = repo.w.mode;
   const dryRun = values['dry-run'] === true;
   // Every completed invocation logs one line: the skips and off mode here, a full run in pruneLocked.
-  return withRunLock(repo.commonDir, env, async () => {
+  const result = await withRunLock(repo.commonDir, env, async () => {
     // spec §4 rule 7: git is busy => no evaluation and no move at all, not even restoring a leftover quarantine.
     if (gitBusy(repo.commonDir)) return finishShort(repo, env, { ok: true, mode, dryRun, skipped: 'git operation in progress' });
     // off: no evaluation at all; only a dead run's quarantine is undone (that is allowed in every mode).
@@ -392,6 +447,9 @@ export async function prune(values, ctx) {
     }
     return pruneLocked(repo, { mode, dryRun, notify: values.notify === true, ctx, env });
   }, () => finishShort(repo, env, { ok: true, mode, dryRun, skipped: 'already running' }));
+  if (repo.configSource === 'worktree') return result;
+  const warning = `the main checkout has no ${CONFIG_FILE}; used the copy committed on ${repo.configSource}`;
+  return { ...result, output: { ...result.output, warnings: [warning] } };
 }
 
 // --summary-only (the cron line): just `ok` and the one-line `summary`, plus `errors` when a step failed; a run that
@@ -399,5 +457,5 @@ export async function prune(values, ctx) {
 // cron log grows by one line per run.
 export function summaryOnly({ exitCode, output }) {
   if (output.summary === undefined) return { exitCode, output, compact: true };
-  return { exitCode, output: { ok: output.ok, summary: output.summary, ...(output.errors?.length ? { errors: output.errors } : {}) }, compact: true };
+  return { exitCode, output: { ok: output.ok, summary: output.summary, ...(output.errors?.length ? { errors: output.errors } : {}), ...(output.warnings?.length ? { warnings: output.warnings } : {}) }, compact: true };
 }

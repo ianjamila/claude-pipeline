@@ -82,6 +82,58 @@ function readManifest(dir) {
   }
 }
 
+const isFile = (p) => {
+  try {
+    return lstatSync(p).isFile();
+  } catch {
+    return false;
+  }
+};
+
+// Is the file at `item.stored` the one the intent promised? (An interrupted cross-device copy leaves a truncated file.)
+function storedMatches(item) {
+  if (typeof item.stored !== 'string' || !isFile(item.stored)) return false;
+  try {
+    const data = readFileSync(item.stored);
+    return data.length === item.size && createHash('sha256').update(data).digest('hex') === item.sha256;
+  } catch {
+    return false;
+  }
+}
+
+// An archive writes its entry as `status: 'pending'` (plus `source`) BEFORE the file moves and drops both fields once the
+// move is recorded; an entry without `status` is a finished one, so older manifests read as before. A pending entry that a
+// failed write or a crash left behind is settled by looking at the disk: the stored file is there and its size and sha256
+// match => the move happened, the entry counts as archived (and is reported as `incomplete`); no stored file => the move
+// never happened, the intent is dropped; a stored file that does NOT match (a copy cut short) => `unverified`: not offered
+// for restore, never purged, kept as pending on disk for a check by hand. Pure: nothing is written.
+// -> { items: entries that stand, incomplete: the settled-as-archived ones, unverified: the raw pending entries to check,
+//      persist: what a rewritten manifest should hold (items + unverified, in order) }
+function settleItems(manifest) {
+  const items = [];
+  const incomplete = [];
+  const unverified = [];
+  const persist = [];
+  for (const item of manifest.items) {
+    if (item?.status !== 'pending') {
+      items.push(item);
+      persist.push(item);
+      continue;
+    }
+    if (typeof item.stored !== 'string' || !isFile(item.stored)) continue;
+    if (!storedMatches(item)) {
+      unverified.push(item);
+      persist.push(item);
+      continue;
+    }
+    const { status: _status, source: _source, ...settled } = item;
+    items.push(settled);
+    incomplete.push(settled);
+    persist.push(settled);
+  }
+  return { items, incomplete, unverified, persist };
+}
+
 const CORRUPT_PREFIX = `${MANIFEST}.corrupt-`;
 
 // The batch's manifest to append to. One that exists but cannot be read or parsed is renamed aside to the first free
@@ -89,7 +141,7 @@ const CORRUPT_PREFIX = `${MANIFEST}.corrupt-`;
 function manifestToAppend(dir) {
   const fresh = { version: 1, items: [] };
   const m = readManifest(dir);
-  if (m) return m;
+  if (m) return { ...m, items: settleItems(m).persist }; // the next write persists what an earlier crash left unsettled
   const file = path.join(dir, MANIFEST);
   let st;
   try {
@@ -154,7 +206,10 @@ function freeName(target) {
 // archives again. No directory between holdingDir and the stored file may be a symlink either. `originalRoot` is where
 // the files really live when `wtPath` is a temporary location (the quarantine): the manifest's `original` (and so the
 // restore command) points there, never at a path that stops existing after the run.
-export function archivePaths({ wtPath, originalRoot = wtPath, rels, holdingDir, slug, pr, nowMs }) {
+export function archivePaths({ wtPath, originalRoot = wtPath, rels, holdingDir, slug, pr, nowMs, io = {} }) {
+  const move = io.move ?? moveFile; // seams for tests: the real file move and manifest write
+  const writeManifest = io.writeManifest ?? writeManifestAtomic;
+  const unlink = io.unlink ?? unlinkSync;
   const day = new Date(nowMs).toISOString().slice(0, 10);
   const archivedAt = new Date(nowMs).toISOString();
   const sources = rels.map((rel) => {
@@ -168,21 +223,62 @@ export function archivePaths({ wtPath, originalRoot = wtPath, rels, holdingDir, 
   ensureRealDirs(batchDir, [safeName(slug)]);
   const manifest = manifestToAppend(batchDir);
   const items = [];
-  for (const { rel, abs } of sources) {
-    assertNoSymlinkBetween(wtPath, abs); // again, right before the move
-    const data = readFileSync(abs);
-    const relParts = String(rel).split('/');
-    const destDir = ensureRealDirs(batchDir, [safeName(slug), ...relParts.slice(0, -1)]);
-    const stored = freeName(path.join(destDir, relParts[relParts.length - 1]));
-    moveFile(abs, stored);
-    const item = {
-      original: path.join(originalRoot, ...relParts), stored, size: data.length, sha256: createHash('sha256').update(data).digest('hex'),
-      archivedAt, slug, pr: pr ?? null,
-    };
-    items.push(item);
-    manifest.items.push(item);
-    writeManifestAtomic(batchDir, manifest); // after every file: a crash mid-batch still leaves a record of what moved
-    pruneEmptyParents(path.dirname(abs), wtPath);
+  let unrecovered = null; // a file that is in holding but whose "done" record could not be written, and could not be moved back
+  try {
+    for (const { rel, abs } of sources) {
+      assertNoSymlinkBetween(wtPath, abs); // again, right before the move
+      const data = readFileSync(abs);
+      const relParts = String(rel).split('/');
+      const destDir = ensureRealDirs(batchDir, [safeName(slug), ...relParts.slice(0, -1)]);
+      const stored = freeName(path.join(destDir, relParts[relParts.length - 1]));
+      const item = {
+        original: path.join(originalRoot, ...relParts), stored, size: data.length, sha256: createHash('sha256').update(data).digest('hex'),
+        archivedAt, slug, pr: pr ?? null,
+      };
+      // Intent first: from here on the file is recorded wherever the run dies. If this write fails, nothing has moved.
+      manifest.items.push({ ...item, status: 'pending', source: abs });
+      try {
+        writeManifest(batchDir, manifest);
+      } catch (err) {
+        manifest.items.pop();
+        throw err;
+      }
+      try {
+        move(abs, stored);
+      } catch (err) {
+        // A cross-device copy can fail part-way: remove our copy while the source is intact. The intent is dropped only once
+        // the copy is confirmed gone; a copy that stays keeps its pending entry on disk and is reported to the caller.
+        if (isFile(abs) && isFile(stored)) {
+          try { unlink(stored); } catch { /* confirmed below */ }
+        }
+        if (isFile(stored)) {
+          unrecovered = item;
+          throw err;
+        }
+        manifest.items.pop();
+        try { writeManifest(batchDir, manifest); } catch { /* the stale intent is settled on the next read */ }
+        throw err;
+      }
+      manifest.items[manifest.items.length - 1] = item;
+      try {
+        writeManifest(batchDir, manifest); // mark it done
+      } catch (err) {
+        try {
+          move(stored, abs); // put it back, so the worktree is whole and nothing sits unrecorded in holding
+          manifest.items.pop();
+          try { writeManifest(batchDir, manifest); } catch { /* the intent on disk finds its stored file gone and is ignored */ }
+        } catch {
+          // Cannot move back: the intent already on disk keeps the file listed and restorable; hand it to the caller too.
+          unrecovered = item;
+        }
+        throw err;
+      }
+      items.push(item);
+      pruneEmptyParents(path.dirname(abs), wtPath);
+    }
+  } catch (err) {
+    if (err && typeof err === 'object') err.archivedItems = unrecovered ? [...items, unrecovered] : items; // what reached holding
+    throw err;
   }
   return { batchDir, items };
 }
@@ -209,12 +305,15 @@ function batchDirs(holdingDir) {
 export function listHolding(holdingDir) {
   return batchDirs(holdingDir).map((batch) => {
     const manifest = readManifest(path.join(holdingDir, batch));
-    const items = manifest?.items ?? [];
+    const settled = manifest ? settleItems(manifest) : { items: [], incomplete: [], unverified: [] };
+    const items = settled.items;
     const stamps = items.map((i) => i?.archivedAt).filter((s) => Number.isFinite(Date.parse(s)));
     stamps.sort((a, b) => Date.parse(a) - Date.parse(b));
     return {
       batch,
       archivedAt: stamps.length ? stamps[stamps.length - 1] : null,
+      ...(settled.incomplete.length ? { incomplete: settled.incomplete.length } : {}), // moves a failed write or a crash left unrecorded
+      ...(settled.unverified.length ? { unverified: settled.unverified.length } : {}), // copies that do not match their entry: check by hand
       items: items.length,
       bytes: items.reduce((sum, i) => sum + (Number.isFinite(i?.size) ? i.size : 0), 0),
       restore: items.filter((i) => i?.stored && i?.original)
@@ -249,12 +348,21 @@ export function purgeHolding(holdingDir, { nowMs, days = 30 }) {
       kept.push({ batch, reason: 'no readable manifest' });
       continue;
     }
-    if (manifest.items.length === 0) {
+    const { items, incomplete, unverified } = settleItems(manifest);
+    if (unverified.length) {
+      kept.push({ batch, reason: `holds ${unverified.length} unverified move(s) (${path.basename(unverified[0].stored)}) — needs a check by hand` });
+      continue;
+    }
+    if (incomplete.length) {
+      kept.push({ batch, reason: `holds ${incomplete.length} incomplete move(s) (${path.basename(incomplete[0].stored)}) — restore or remove by hand` });
+      continue;
+    }
+    if (items.length === 0) {
       kept.push({ batch, reason: 'manifest lists no items' });
       continue;
     }
     let reason = null;
-    for (const item of manifest.items) {
+    for (const item of items) {
       const at = typeof item?.archivedAt === 'string' ? Date.parse(item.archivedAt) : NaN;
       if (!Number.isFinite(at)) { reason = 'unparseable archivedAt'; break; }
       if (at > nowMs) { reason = 'archivedAt is in the future'; break; }
@@ -361,10 +469,11 @@ export async function removeWorktree({ root, wt, cfg, pr, holdingDir, runId, run
   try {
     const nowMs = Date.now();
     for (const rel of verdict.arch) {
-      archived.push(...archivePaths({ wtPath: q, originalRoot: wt.path, rels: [rel], holdingDir, slug: wt.slug, pr, nowMs }).items);
+      archived.push(...archivePaths({ wtPath: q, originalRoot: wt.path, rels: [rel], holdingDir, slug: wt.slug, pr, nowMs, io: hooks.archiveIo }).items);
     }
     for (const rel of verdict.del) deleteInside(q, rel);
   } catch (err) {
+    archived.push(...(err?.archivedItems ?? [])); // a file that could not be moved back is in holding: report it
     const why = err instanceof SymlinkInPathError ? `symlink in path (${err.message})` : `cleanup failed during removal: ${err.message}`;
     return moveBack(why, { archived });
   }
