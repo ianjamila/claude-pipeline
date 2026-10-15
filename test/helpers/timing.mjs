@@ -18,18 +18,20 @@ export function bestOf(runs, sample) {
   return best;
 }
 
-// Asserts that `large()` (twice the input of `small()`) takes under `ratio` times as long (a linear scan gives ~2, a quadratic one ~4).
+// Asserts that `large()` (`factor` times the input of `small()`, default 2) takes under `ratio` times as long (a linear scan gives ~factor,
+// a quadratic one ~factor^2). A wider span (e.g. factor 16, ratio 64: linear 16x, quadratic 256x) absorbs a per-byte cost that climbs
+// across several doublings (the input outgrowing the CPU cache) that a single doubling cannot, with 4x margin on each side.
 // Both return ms. One warm-up run of `small` is discarded (JIT, caches). The baseline is the best of `smallRuns`; the large run is
 // repeated until it passes, at most `largeRuns` times, so a slow sample cannot fail the test but a slow best-of-all cannot pass.
 // The check also passes when the excess over a perfectly linear run is below `slackMs`: under the clock's resolution there is
 // nothing to measure. Size the inputs so the baseline is well above that slack (tens of ms), or a quadratic one slips through it.
-export function assertLinear(small, large, { label = 'work', ratio = 3, slackMs = 25, smallRuns = 3, largeRuns = 5 } = {}) {
+export function assertLinear(small, large, { label = 'work', ratio = 3, slackMs = 25, smallRuns = 3, largeRuns = 5, factor = 2 } = {}) {
   small();
   const lo = Math.max(bestOf(smallRuns, small), 1);
   let hi = Infinity;
   for (let i = 0; i < largeRuns; i++) {
     hi = Math.min(hi, large());
-    if (hi / lo < ratio || hi - 2 * lo < slackMs) return { lo, hi };
+    if (hi / lo < ratio || hi - factor * lo < slackMs) return { lo, hi };
   }
-  assert.fail(`${label}: ${Math.round(lo)}ms at n/2 -> ${Math.round(hi)}ms at n (best of ${largeRuns}): not linear`);
+  assert.fail(`${label}: ${Math.round(lo)}ms at n/${factor} -> ${Math.round(hi)}ms at n (best of ${largeRuns}): not linear`);
 }

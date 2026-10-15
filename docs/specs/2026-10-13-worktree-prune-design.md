@@ -126,7 +126,7 @@ pipeline worktrees holding [--purge] [--json]        # list holding batches + re
    `.env*`, `HANDOFF*.md`, `*.patch`, a real `.superpowers/` directory) ⇒ kept. A `.superpowers` **symlink** into
    `~/claude-notes` is allowed (removal unlinks only). All paths `realpath`-contained in the worktree; symlinks never
    followed.
-6. **Not in use.** Not locked; no process cwd/fd inside (`/proc/*/cwd`, `/proc/*/fd`); no Claude transcript modified in
+6. **Not in use.** Not locked; no process cwd/fd inside (`/proc/*/cwd`, `/proc/*/fd` on Linux; one `lsof -n -P -w -F pfn` on macOS, fail-closed — spawn failure, timeout, exit status other than 0/1, or our own pid missing an absolute cwd (positive control) ⇒ "cannot check" ⇒ kept; Windows stays unavailable); no Claude transcript modified in
    the last `min_idle_hours` shows a session working in the worktree (`~/.claude/projects/**/*.jsonl` and
    `~/.claude-eaglewatch/projects/**/*.jsonl`, de-duplicated by realpath). A JSONL line counts only when its top-level
    `cwd` equals or is inside the worktree path, or it carries a `tool_use` content block whose `input` names the path
@@ -153,6 +153,13 @@ pipeline worktrees holding [--purge] [--json]        # list holding batches + re
   Absolute node path (nvm), log `~/.local/state/pipeline/prune-<repo>.log`, last 30 runs kept; every completed run
   (skipped and off mode included) writes its one line there. The cron line runs `prune --notify --summary-only`, so
   its own unrotated output file grows by one line per night.
+- **Nightly on a Mac: a per-user LaunchAgent**, not cron, because the Mac sleeps and cron skips the 02:30 it slept
+  through, while launchd runs a missed `StartCalendarInterval` job at wake. `schedule --install` on darwin writes
+  `~/Library/LaunchAgents/com.claude-pipeline.<lock name>.plist` (the cron marker's lock name; same `prune --notify
+  --summary-only` command, same `cron-<lock name>.log` for stdout and stderr, `PATH` = node/git/gh dirs +
+  `/usr/bin:/bin:/usr/sbin:/sbin`, `RunAtLoad` false), then `launchctl bootout` (failure ignored) and `launchctl bootstrap
+  gui/<uid>`. `--remove` boots out and deletes the plist; `--status` needs the plist AND a successful `launchctl print`. The
+  zone warning reads the `/etc/localtime` link (`systemsetup` needs root). Windows stays unsupported.
 
 ## 6. Files outside worktrees — all report-only in this version
 
@@ -221,6 +228,14 @@ to catch their writes, §2); cron execution with WSL idle/asleep;
 `git worktree move` behaviour with a process cwd inside on WSL2's ext4. All three are exercised by the integration tests
 on this PC before `mode: on`.
 
+Real `lsof` on a Mac (other users' processes, how long the single machine-wide scan takes, the `/System/Volumes/Data`
+firmlink spelling) is owed on a Mac before `mode: on` there; the macOS branch is covered by injected-runner fixtures and
+one integration test against whatever `lsof` the host has.
+
+The launchd schedule (§5) is covered by an injected `launchctl` runner, home and uid; a **real launchd run on a Mac is owed**:
+that `bootstrap` accepts the generated plist, that the 02:30 job fires, that a run missed during sleep runs at wake, and that
+the job's minimal `PATH` finds `node`, `git`, `gh` and `lsof`.
+
 ## 11. Review findings and how rev 3 answers them
 
 | Finding | Answer |
@@ -241,4 +256,4 @@ on this PC before `mode: on`.
 ## 12. Out of scope
 
 Deleting branches; moving/deleting B, C, D or root evidence; other repos until they opt in via `pipeline.yml` (DRMed can
-later); Mac-specific scheduling (launchd) — the PC is the machine where worktrees pile up today.
+later); Windows scheduling (the Mac is covered by launchd, §5).

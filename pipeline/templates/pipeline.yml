@@ -92,4 +92,4 @@ review:
   max_rounds: 3
   light_lane_max_lines: 50
 
-agent_log: docs/agent-log.md
+agent_log: docs/agent-log.md   # one line per run; kept on the orphan branch `pipeline-agent-log` (`pipeline agent-log publish`), never committed to a PR branch

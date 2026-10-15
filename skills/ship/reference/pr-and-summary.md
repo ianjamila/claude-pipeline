@@ -79,7 +79,7 @@ Evidence is never kept only in that editable record: `prod-before` (before the m
 the comment then has no rounds, and a `blocked` one names the failing verify step; any other outcome
 needs `.review/state.json`.
 1. **Outliers** — every arbiter ruling (finding · Codex view · Opus view · Fable ruling · one-line
-   reason · model-proof line), close-call rejections (low-confidence REJECTs), strong
+   reason · model-proof line), close-call rejections (REJECTs the judge was not highly confident in), strong
    disagreements (judge REJECT on a Codex BLOCKING).
 2. What was built.
 3. Suggestions implemented (with round).
@@ -90,12 +90,12 @@ needs `.review/state.json`.
 
 ## Agent log
 
-- Final gate start: `P agent-log stage --pr <N>` appends this run's line (outcome `merged —
-  prod smoke pending`) plus any queued lines to `docs/agent-log.md` in the PR branch and commits;
-  push afterwards. The worktree must be clean and on the PR's head.
-- Runs that don't merge and post-deploy outcomes: take the `agentLogLine` that `P summary` printed and
-  queue it: `P agent-log queue --line "<agentLogLine>"` (stored in the git common dir).
-- There is no separate flush: the next `P agent-log stage` writes every queued line into that PR's log
-  together with its own. Staged lines stay queued (marked staged) until `origin/<default_branch>`
-  contains them, so a PR that closes unmerged does not lose them; the output's `staged` and
-  `dropped` say what happened.
+- The log lives on its own orphan branch, `pipeline-agent-log` (file `config.agent_log`), never in a PR branch: a file every PR
+  edits would conflict as soon as the base moves, and each log commit would be a new head for the owner to approve.
+- Every outcome, a clean `merged` run too: after `P summary`, `P agent-log publish --line "<line>"`. The line is the
+  `agentLogLine` that `P summary` printed, or its `pendingLogLine` (outcome `merged — prod smoke pending`) for a merged run
+  under `production.watch: workflow`, so `agent-log close` can resolve it. With `workflow`, run `P agent-log close --queue` first.
+- `publish` queues the line (git common dir, shared by every worktree), appends the whole queue to the log on the branch and
+  pushes only that branch. Entries leave the queue only after the push succeeded; exit 3 (push or network failure) is fine:
+  they go out with the next run. Lines already on the branch (or in the default branch's old copy) are dropped, not repeated.
+- `P agent-log stage` is the retired name: it now only publishes and commits nothing.

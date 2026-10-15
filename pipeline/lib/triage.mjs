@@ -5,7 +5,9 @@
 export const SECURITY_CATEGORIES = ['security', 'auth', 'permissions', 'data-integrity', 'data-loss'];
 export const BUCKETS = ['BLOCKING', 'SUGGESTION', 'WORTH_CONSIDERING'];
 export const DECISIONS = ['ACCEPT', 'FOLLOW-UP', 'REJECT'];
-export const CONFIDENCES = ['high', 'low'];
+// 'medium' is accepted so a wording slip does not park an item: the judge's escalates to the arbiter (anything but 'high'),
+// the arbiter's stands like 'high' (only 'low' sends it to a human).
+export const CONFIDENCES = ['high', 'medium', 'low'];
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const idsOf = (items) => items.map((i) => i.id);

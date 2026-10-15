@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import {
   git, GitError, mergeBase, headSha, currentBranch, isClean, revParse, diffFiles, showFile, grepAtRef,
-  commitTime, contentHash, treeFingerprint, reviewPatch,
+  commitTime, contentHash, treeFingerprint, reviewPatch, effectiveReviewBase,
 } from '../pipeline/lib/git.mjs';
 import { run } from '../pipeline/lib/proc.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
@@ -1097,4 +1097,58 @@ test('contentHash: a diff larger than 64 MiB still hashes, to exactly the sha256
   assert.equal(contentHash('main', 'big', o), expected.digest('hex'));
   // a caller-set limit below the diff fails loudly instead of hashing a truncated diff
   assert.throws(() => contentHash('main', 'big', { ...o, maxBuffer: 1024 * 1024 }), (err) => err instanceof GitError);
+});
+
+// ---------- effectiveReviewBase ----------
+
+// main -> feat (one commit, the "previous round" head); returns what a later round needs.
+function reviewedBranch() {
+  const { repo, base, o } = baseRepo();
+  repo.branch('feat');
+  repo.write('src/feat.js', 'feat\n');
+  const from = repo.commit('feature');
+  return { repo, base, from, o };
+}
+const mergeMain = (repo, files) => {
+  repo.checkout('main');
+  for (const [f, c] of Object.entries(files)) repo.write(f, c);
+  const tip = repo.commit('main moves on');
+  repo.checkout('feat');
+  return tip;
+};
+
+test('effectiveReviewBase: nothing merged in keeps the previous head', () => {
+  const { from, base, o } = reviewedBranch();
+  assert.deepEqual(effectiveReviewBase({ from, forkPoint: base }, o), { base: from, kind: 'previous' });
+});
+
+test('effectiveReviewBase: a clean merge of the base branch gives a synthetic tree whose diff to the merge is only the PR\'s own change', () => {
+  const { repo, from, o } = reviewedBranch();
+  const tip = mergeMain(repo, { 'src/main-only.js': 'main\n' });
+  repo.git(['merge', '--no-ff', '-q', '-m', 'merge main', 'main']);
+  repo.write('src/later.js', 'later\n');
+  const head = repo.commit('later');
+  const got = effectiveReviewBase({ from, forkPoint: mergeBase(tip, head, o) }, o);
+  assert.equal(got.kind, 'synthetic');
+  assert.equal(repo.git(['cat-file', '-t', got.base]).trim(), 'tree');
+  assert.deepEqual(repo.git(['diff', '--name-only', `${got.base}..${head}`]).trim().split('\n'), ['src/later.js']);
+});
+
+test('effectiveReviewBase: a conflicting merge, or a git too old for merge-tree --write-tree, falls back to the whole PR', () => {
+  const { repo, o } = reviewedBranch();
+  repo.write('src/a.js', 'one\nbranch\nthree\n');
+  const reviewed = repo.commit('branch edits a');
+  const tip = mergeMain(repo, { 'src/a.js': 'one\nmain\nthree\n' });
+  try { repo.git(['merge', '--no-ff', '-q', '-m', 'merge main', 'main']); } catch { /* conflict, resolved next */ }
+  repo.write('src/a.js', 'one\nresolved\nthree\n');
+  const head = repo.commit('merge main, resolved');
+  const forkPoint = mergeBase(tip, head, o);
+  assert.deepEqual(effectiveReviewBase({ from: reviewed, forkPoint }, o), { base: forkPoint, kind: 'whole-pr' });
+
+  // The same clean merge as above, but pretend the installed git is 2.30.
+  const clean = reviewedBranch();
+  const cleanTip = mergeMain(clean.repo, { 'src/main-only.js': 'main\n' });
+  clean.repo.git(['merge', '--no-ff', '-q', '-m', 'merge main', 'main']);
+  const oldGit = { ...clean.o, run: (cmd, args, opts) => (args.includes('--version') ? { code: 0, stdout: 'git version 2.30.0\n', stderr: '' } : run(cmd, args, opts)) };
+  assert.deepEqual(effectiveReviewBase({ from: clean.from, forkPoint: cleanTip }, oldGit), { base: cleanTip, kind: 'whole-pr' });
 });

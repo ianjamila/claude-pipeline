@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { classifyHardStops, collectHardStops, scanEnvLine, parsePythonDeps, enclosingStatements } from '../pipeline/lib/hardstops.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { MIG, pkg, cfg, file, rulesOf, classify, run } from './helpers/hardstops.mjs';
-import { assertLinear } from './helpers/timing.mjs';
+import { assertLinear, bestOf } from './helpers/timing.mjs';
 
 const A = (path, ...added) => file(path, { status: 'A', added });
 const flags = (files, opts) => rulesOf(run(files, opts));
@@ -554,8 +554,12 @@ test('13 a line stuffed with import specifiers stays fast (and is flagged as unr
 
 test('13 the whole-file import scan stays linear on a ~1.5 MB file of adversarial shapes', () => {
   // Linearity, not raw speed: CI's Node 20 runs these ~3x slower than a laptop, so an absolute budget flaked (2.1 s for the
-  // backslash chain on ubuntu-latest). Doubling the input may at most ~double the CPU (ratio < 3; a quadratic shape gives ~4),
-  // and a generous absolute ceiling still catches a pathological constant. Windows counts process CPU in ~15.6 ms ticks (15 ms ->
+  // backslash chain on ubuntu-latest). Growing the input 16x (n/16 -> n) may at most ~16x the CPU (ratio < 64; a quadratic
+  // shape gives ~256), and a generous absolute ceiling still catches a pathological constant. Why a span of 16x: the per-byte cost
+  // climbs over SEVERAL doublings (CPU cache), not one (Node 20 locally, `require("` at n/8..2n: 10 / 15 / 43 / 92 / 202 ms), so any
+  // narrow span sits near its limit (n/4 -> n failed on ubuntu-latest: 38 -> 315 ms, 8.3x vs a limit of 8). A wide span keeps 4x
+  // margin both ways: linear 16x, limit 64, quadratic 256x; measured n/16 -> n locally max 22.9x (Node 20), 16.4x (Node 24), and CI
+  // runs ~2x worse per byte (~45x expected worst). Windows counts process CPU in ~15.6 ms ticks (15 ms ->
   // 47 ms once failed this test), so each sample repeats the scan enough times (calibrated on the high-resolution clock) to span
   // ~60 ms (4 ticks), and each size is the best of several samples (timing.mjs).
   const shapes = [[';from a import ', 100_000, 'a.py'], ['from' + ' ', 1_500_000, 'a.ts', true], ['require("', 190_000, 'a.ts'], [';import a, ', 100_000, 'a.py'], ['"""\n', 250_000, 'a.py'],
@@ -564,12 +568,14 @@ test('13 the whole-file import scan stays linear on a ~1.5 MB file of adversaria
   const cpu = (text, name, reps) => () => cpuMs(() => { for (let i = 0; i < reps; i++) once(text, name); }).ms;
   for (const [unit, n, name, padOnly] of shapes) {
     const make = (k) => (padOnly ? `from${' '.repeat(k)}` : unit.repeat(k));
-    const halfText = make(n / 2), fullText = make(n);
-    const t0 = performance.now();
-    once(halfText, name);
-    const reps = Math.min(50, Math.max(1, Math.ceil(60 / Math.max(performance.now() - t0, 1))));
+    const smallText = make(n / 16), fullText = make(n);
+    // Calibrate on WARM runs: a cold first run (JIT, regex compile) made reps 1 on Windows (`;import a,` read 1 ms at n/16 against
+    // 187 ms at n under ~15.6 ms CPU ticks). Cap 200 so a fast machine's tiny small scan still reaches ~60 ms.
+    once(smallText, name);
+    const best = bestOf(3, () => { const t0 = performance.now(); once(smallText, name); return performance.now() - t0; });
+    const reps = Math.min(200, Math.max(1, Math.ceil(60 / Math.max(best, 0.3))));
     const label = `${unit.slice(0, 16)}...`;
-    const { hi } = assertLinear(cpu(halfText, name, reps), cpu(fullText, name, reps), { label });
+    const { hi } = assertLinear(cpu(smallText, name, reps), cpu(fullText, name, reps), { label, factor: 16, ratio: 64 });
     assert.ok(hi / reps < 8000, `${label} took ${Math.round(hi / reps)}ms of CPU`);
   }
 });
