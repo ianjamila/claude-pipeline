@@ -8,6 +8,7 @@
 // operation / a protected file. A missing script after a command the guard cannot model (make, npm run ...) is treated the same way.
 // The file system is faked (like test/guard-script-expansion.test.mjs); guarded text only lives in fake file contents or in the constants below.
 import { test } from 'node:test';
+import { cpuTimed } from './helpers/timing.mjs';
 import assert from 'node:assert/strict';
 import { resolve, dirname, basename, posix } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
@@ -2064,14 +2065,13 @@ test('time: a word with many run-time parts is matched against a path in linear 
   // (the line from the replay that hung: the sed program, a word starting with `/`, is a path pattern with one part per bracket)
   const classes = '[Cc][Rr][Ee][Aa][Tt][Ee] [Oo][Rr] [Rr][Ee][Pp][Ll][Aa][Cc][Ee] [Ff][Uu][Nn][Cc][Tt][Ii][Oo][Nn] public.x';
   const line = `git grep -l x -- d | sort | xargs -I{} sh -c 'grep -l -i "create or replace function public.x" {} >/dev/null && echo {}'; sed -n '/${classes}/,/\\$\\$;/p' $f | head -30`;
-  const t = Date.now();
-  const r = git(line, fakeFs(GIT_ROOT, { 'ok.sh': 'echo hi' }, DIRS));
-  assert.ok(Date.now() - t < 2000, `took ${Date.now() - t} ms`);
+  const { r, ms } = cpuTimed(() => git(line, fakeFs(GIT_ROOT, { 'ok.sh': 'echo hi' }, DIRS)));
+  assert.ok(ms < 2000, `took ${Math.round(ms)} ms of CPU`);
   assert.equal(r.decision, 'allow', r.reason);
   const long = `/${'a'.repeat(3000)}`;
-  const t2 = Date.now();
-  assert.equal(piecesMatch(['/', ...Array(40).fill('a'), 'b'], long, { abs: true }), false);
-  assert.ok(Date.now() - t2 < 500, `took ${Date.now() - t2} ms`);
+  const m = cpuTimed(() => piecesMatch(['/', ...Array(40).fill('a'), 'b'], long, { abs: true }));
+  assert.equal(m.r, false);
+  assert.ok(m.ms < 500, `took ${Math.round(m.ms)} ms of CPU`);
 });
 
 test('time: piecesMatch answers as the regex it replaces did (anything between pieces; start of the path / of a name; end of the path / of a directory)', () => {
@@ -2096,9 +2096,9 @@ test('time: piecesMatch answers as the regex it replaces did (anything between p
 test('time: applySed refuses (null) a program whose regex work on the text could outlast the hook; ordinary edits are still computed', () => {
   const line = `${'ab'.repeat(1000)}\n`; // (2,000 characters: every program below is over MAX_WORK on the FIRST line, so none of them runs at all)
   for (const prog of ['s/.*a.*b.*c/x/', '/.*a.*b.*c/d', 's/[ab]*[ab]*[ab]*c/x/', 's/[ab]\\{0,255\\}[ab]\\{0,255\\}c/x/']) {
-    const t = Date.now();
-    assert.equal(applySed({ args: ['-i', prog, 'f'], word: 'f' }, line.repeat(4)), null, prog);
-    assert.ok(Date.now() - t < 500, `${prog} took ${Date.now() - t} ms`);
+    const s = cpuTimed(() => applySed({ args: ['-i', prog, 'f'], word: 'f' }, line.repeat(4)));
+    assert.equal(s.r, null, prog);
+    assert.ok(s.ms < 500, `${prog} took ${Math.round(s.ms)} ms of CPU`);
   }
   const file = Array.from({ length: 2000 }, (_, i) => `const v${i} = foo(${i}); // ${'x'.repeat(40)} bar`).join('\n') + '\n';
   for (const prog of ['s/foo.*bar/x/', 's/foo/x/g', '/v1[0-9]*/d', 's/^const //']) assert.notEqual(applySed({ args: ['-i', prog, 'f'], word: 'f' }, file), null, prog);

@@ -57,7 +57,7 @@ const both = [
   ['guard-git', (c, f, o) => git(c, asFs(gitFs, GIT_ROOT, f), o), gitFs],
   ['guard-files', (c, f, o) => files(c, asFs(filesFs, PROJ, f), o), filesFs],
 ];
-const timed = (fn) => { const t0 = Date.now(); const r = fn(); return { r, ms: Date.now() - t0 }; };
+const timed = cpuTimed; // CPU ms, not wall: a loaded machine must not trip a cap
 
 // ---- one budget for every script file read -----------------------------------------------------------------------
 
@@ -66,7 +66,7 @@ for (const [name, run] of both) {
     const { r, ms } = timed(() => run('bash n1_0.sh', tree(500, 4)));
     assert.equal(r.decision, 'deny');
     assert.match(r.reason, /too many script files/);
-    assert.ok(ms < 3000, `took ${ms} ms`);
+    assert.ok(ms < 3000, `took ${Math.round(ms)} ms of CPU`);
   });
 
   test(`${name}: a smaller tree (20 lines, 3 levels = 421 reads) is denied: the budget counts named scripts, not only candidates`, () => {
@@ -133,7 +133,7 @@ test('guard-files: a x10-per-level variable chain is denied quickly instead of g
   const { r, ms } = timed(() => files(`${chainLine(7)}; echo ok`, filesFs({})));
   assert.equal(r.decision, 'deny');
   assert.match(r.reason, /expand to more text/);
-  assert.ok(ms < 3000, `took ${ms} ms`);
+  assert.ok(ms < 3000, `took ${Math.round(ms)} ms of CPU`);
 });
 
 test('guard-files: a short chain that stays small is still allowed', () => {
@@ -145,7 +145,7 @@ test('guard-git: a 60k-character value repeated 1000 times in one word is denied
   const { r, ms } = timed(() => git(line, gitFs({})));
   assert.equal(r.decision, 'deny');
   assert.match(r.reason, /expand to more text/);
-  assert.ok(ms < 3000, `took ${ms} ms`);
+  assert.ok(ms < 3000, `took ${Math.round(ms)} ms of CPU`);
 });
 
 test('guard-git: a 60k-character value passed as 5000 separate arguments is denied quickly (total across the line)', () => {
@@ -153,7 +153,7 @@ test('guard-git: a 60k-character value passed as 5000 separate arguments is deni
   const { r, ms } = timed(() => git(line, gitFs({})));
   assert.equal(r.decision, 'deny');
   assert.match(r.reason, /expand to more text/);
-  assert.ok(ms < 3000, `took ${ms} ms`);
+  assert.ok(ms < 3000, `took ${Math.round(ms)} ms of CPU`);
 });
 
 test('guard-files: the same 60k value repeated is denied quickly', () => {
@@ -161,7 +161,7 @@ test('guard-files: the same 60k value repeated is denied quickly', () => {
   const { r, ms } = timed(() => files(line, filesFs({})));
   assert.equal(r.decision, 'deny');
   assert.match(r.reason, /expand to more text/);
-  assert.ok(ms < 3000, `took ${ms} ms`);
+  assert.ok(ms < 3000, `took ${Math.round(ms)} ms of CPU`);
 });
 
 test('guard-git: a few small variables on a git line are still judged normally', () => {
@@ -241,7 +241,7 @@ test('guard-files: a big file judged as program text is not an expansion (PATH=.
 // ---- review R1-B1: the parameter-expansion scan is one linear pass and obeys the deadline -------------------------------------------
 // `: ${x:-` + 150,000 `(` + `}` used to rescan the rest of the body for every `(` (quadratic: ~21 s, past the hook timeout, which Claude Code
 // reads as allow). The text after it is a push to the protected branch, built at run time so this file holds no guarded text.
-import { assertLinear, cpuTime } from './helpers/timing.mjs';
+import { assertLinear, cpuTime, cpuTimed } from './helpers/timing.mjs';
 
 const parenBomb = (n, tail) => `: \${x:-${'('.repeat(n)}}; ${tail}`;
 const MAIN_PUSH = `git push origin ${'ma'}${'in'}`;
@@ -258,7 +258,7 @@ for (const [name, run] of both) {
   test(`${name}: 150,000 open parentheses in \${...} then a guarded command is denied, and fast`, () => {
     const { r, ms } = timed(() => decide(parenBomb(150_000, BAD)));
     assert.equal(r.decision, 'deny');
-    assert.ok(ms < 3000, `took ${ms} ms`);
+    assert.ok(ms < 3000, `took ${Math.round(ms)} ms of CPU`);
   });
 
   test(`${name}: the parenthesis scan checks the evaluation's deadline (injected clock): past it is a denial, not an allow`, () => {
@@ -291,19 +291,26 @@ for (const [name, run] of both) {
   test(`${name}: a guarded command followed by a 120,000-character nested qualifier group is denied, and fast`, () => {
     const { r, ms } = timed(() => run(`${BAD}\n${nestedQualifier(40_000)}`, {}));
     assert.equal(r.decision, 'deny');
-    assert.ok(ms < 2000, `took ${ms} ms`);
+    assert.ok(ms < 2000, `took ${Math.round(ms)} ms of CPU`);
   });
 }
 
 test('qualifier scan: a deeply nested group is parsed fast and the parse is truncated', () => {
   const { r, ms } = timed(() => simpleCommands(nestedQualifier(40_000)));
   assert.equal(r.truncated, true);
-  assert.ok(ms < 2000, `took ${ms} ms`);
+  assert.ok(ms < 2000, `took ${Math.round(ms)} ms of CPU`);
 });
 
-test('qualifier scan: the scan is linear (CPU time at 2n vs n)', () => {
-  const sample = (n) => () => cpuTime(() => simpleCommands(`echo *(${'e{'.repeat(n)}x${'}'.repeat(n)})`, { maxDepth: 1 }));
-  assertLinear(sample(20_000), sample(40_000), { label: 'qualifier scan' });
+test('qualifier scan: the scan is linear (CPU time: one parse of 16n vs 16 parses of n)', () => {
+  // Equal total input, so the baseline is large: a Windows CPU clock ticks every ~15 ms and a baseline under ~30 ms is unreliable
+  // (the old 2n-vs-n form read 3.0-3.8x there). A linear scan reads ~1x, a per-byte cost that climbs with input size (cache) ~2x
+  // (measured on a Mac: 65 ms for 16 x n = 4,000 against 125 ms for n = 64,000), a quadratic one ~16x: 4x margin on that side.
+  // n = 64,000 is a 192,009-character line, just under the 200,000-character MAX_LINE_CHARS the guards parse at all; above ~240k
+  // characters the parse cost climbs steeply, which is unreachable because the guards never parse such a line.
+  const parse = (n) => simpleCommands(`echo *(${'e{'.repeat(n)}x${'}'.repeat(n)})`, { maxDepth: 1 });
+  const small = () => cpuTime(() => { for (let i = 0; i < 16; i++) parse(4_000); });
+  const large = () => cpuTime(() => parse(64_000));
+  assertLinear(small, large, { label: 'qualifier scan', factor: 1, ratio: 4 });
 });
 
 test('qualifier scan: more than MAX_QUALIFIER_CODES distinct codes is truncated, 32 or fewer is not', () => {

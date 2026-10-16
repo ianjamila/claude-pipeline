@@ -6,6 +6,7 @@
 // The file system is faked (like test/guard-script-expansion.test.mjs); the guarded text only lives in fake file contents or in
 // command strings (never in a shell command of the session).
 import { test } from 'node:test';
+import { cpuTimed } from './helpers/timing.mjs';
 import assert from 'node:assert/strict';
 import { resolve, dirname, basename } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
@@ -719,9 +720,9 @@ test('S4d: the rest of a line after an unknown cd is judged as if the cwd were e
 test('S4d: the rerun is bounded (a long line after an unknown cd is judged in time)', () => {
   const fs = fakeFs(PROJ, {}, DIRS);
   const long = `cd $UNSET && ${Array.from({ length: 60 }, (_, i) => `echo ${i} > /tmp/o${i}`).join(' && ')}`;
-  const t0 = Date.now();
-  assert.equal(files(long, fs).decision, 'allow');
-  assert.ok(Date.now() - t0 < 5000, `took ${Date.now() - t0} ms`);
+  const { r: v, ms } = cpuTimed(() => files(long, fs));
+  assert.equal(v.decision, 'allow');
+  assert.ok(ms < 5000, `took ${Math.round(ms)} ms of CPU`);
   // (nested unknown cds multiply the reruns: past the budget the line is refused, not slow)
   const nested = Array.from({ length: 9 }, (_, i) => `cd $U${i}`).join(' && ') + ' && echo x > /tmp/o';
   const r = files(nested, fs);
