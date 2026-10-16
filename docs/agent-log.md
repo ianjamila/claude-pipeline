@@ -1,0 +1,45 @@
+# Agent log
+
+One line per pipeline run, newest last. Written by the `ship` skill; the PR summary comment is the
+full record.
+
+- 2026-10-07 · #10 · fix(guards): bash -n (syntax check only) is not judged as running the script · risk high · rounds 3 · arbiter 0 · needs-human
+- 2026-10-09 · #17 · fix: accept a proven SubagentHandback report as the judge/arbiter final answer · risk high · rounds 2 · arbiter 0 · needs-human
+- 2026-10-09 · #23 · fix(guards): judge every candidate script when a word before it expands at run time · risk high · rounds 3 · arbiter 0 · needs-human
+- 2026-10-12 · #35 · fix(git): large binary documents no longer crash diffFiles, contentHash and the review patch · risk high · rounds 2 · arbiter 0 · needs-human
+- 2026-10-12 · #34 · fix(guards): fail closed — script budget, startup files, script text from files, zsh qualifiers (#18 #20 #21) · risk high · rounds 3 · arbiter 1 · merged
+- 2026-10-13 · #47 · feat(session-version): vendor-owed warning offers to open the vendor PR · risk high · rounds 2 · arbiter 0 · needs-human
+- 2026-10-14 · #47 · feat(session-version): vendor-owed warning offers to open the vendor PR · risk high · rounds 2 · arbiter 0 · merged — prod smoke pending
+- 2026-10-12 · #37 · feat(notify): owner push notifications (ntfy + WSL toast) for the five owner-facing ship events · risk high · rounds 3 · arbiter 0 · needs-human
+- 2026-10-12 · #36 · feat: ship inbox + ship resume — durable run record so a stopped run can be picked up on any machine · risk high · rounds 2 · arbiter 0 · needs-human
+- 2026-10-12 · #38 · Install/version sync phase 1: session-start drift warning, one-command update, trustworthy stamps, two installer fixes · risk high · rounds 3 · arbiter 0 · needs-human
+- 2026-10-12 · #37 · feat(notify): owner push notifications (ntfy + WSL toast) for the five owner-facing ship events · risk high · rounds 3 · arbiter 0 · merged
+- 2026-10-12 · #39 · feat: production.watch workflow + agent-log close (smoke owned by CI, never auto-rollback) · risk high · rounds 3 · arbiter 0 · needs-human
+- 2026-10-13 · #36 · feat: ship inbox + ship resume — durable run record so a stopped run can be picked up on any machine · risk high · rounds 4 · arbiter 1 · needs-human
+- 2026-10-13 · #38 · Install/version sync phase 1: session-start drift warning, one-command update, trustworthy stamps, two installer fixes · risk high · rounds 3 · arbiter 0 · merged
+- 2026-10-13 · #42 · feat(notify): owner pushes name the machine — [Mac] / [PC] / hostname, NTFY_MACHINE override · risk high · rounds 1 · arbiter 0 · needs-human
+- 2026-10-13 · #42 · feat(notify): owner pushes name the machine ([Mac]/[PC]) + reliable ntfy publish on slow networks · risk high · rounds 2 · arbiter 0 · merged
+- 2026-10-13 · #45 · chore(pipeline): owner_approval: chat for claude-pipeline (no approval labels) + monotonic clock in the hung-gh test · risk high · rounds 1 · arbiter 0 · merged — prod smoke pending
+- 2026-10-13 · #46 · fix(guards): bound the glob-qualifier scan in time and size · risk high · rounds 1 · arbiter 0 · needs-human
+- 2026-10-13 · #45 · chore(pipeline): owner_approval: chat for claude-pipeline (no approval labels) + monotonic clock in the hung-gh test · risk high · rounds 1 · arbiter 0 · awaiting-owner-merge
+- 2026-10-13 · #49 · feat(worktrees): automatic, safe cleanup of finished worktrees (pipeline worktrees) · risk high · rounds 2 · arbiter 1 · needs-human
+- 2026-10-14 · #47 · feat(session-version): vendor-owed warning offers to open the vendor PR · risk high · rounds 2 · arbiter 0 · awaiting-owner-merge
+- 2026-10-14 · #52 · feat: skipped verify steps + owner rulings on needs-human review items · risk high · rounds 3 · arbiter 0 · merged — prod smoke pending
+- 2026-10-14 · #54 · test: two timing-flaky tests made reliable (monotonic lock waits; linear scan compares n/4 with n) · risk high · rounds 1 · arbiter 0 · awaiting-owner-merge
+- 2026-10-14 · #54 · test: two timing-flaky tests made reliable (monotonic lock waits; linear scan compares n/4 with n) · risk high · rounds 2 · arbiter 1 · needs-human
+- 2026-10-14 · #54 · test: two timing-flaky tests made reliable (monotonic lock waits; linear scan spans n/16 -> n) · risk high · rounds 2 · arbiter 1 · merged — prod smoke pending
+- 2026-10-14 · #64 · feat(worktrees): macOS support (lsof process check, launchd schedule) + outside report skips non-project scratch · risk high · rounds 2 · arbiter 1 · needs-human
+- 2026-10-14 · #54 · test: two timing-flaky tests made reliable (monotonic lock waits; linear scan spans n/16 -> n) · risk high · rounds 3 · arbiter 1 · awaiting-owner-merge
+- 2026-10-14 · #64 · feat(worktrees): macOS support (lsof process check, launchd schedule) + outside report skips non-project scratch · risk high · rounds 3 · arbiter 1 · awaiting-owner-merge
+- 2026-10-14 · #64 · feat(worktrees): macOS support (lsof process check, launchd schedule) + outside report skips non-project scratch · risk high · rounds 3 · arbiter 1 · merged — prod smoke pending
+- 2026-10-14 · #68 · fix(review): accept confidence "medium"; lsof gets a minimal env · risk high · rounds 1 · arbiter 0 · merged — prod smoke pending
+- 2026-10-14 · #55 · feat(config): verify.stop_queue_wait_minutes — Stop-hook queue allowance from config · risk high · rounds 1 · arbiter 0 · awaiting-owner-merge
+- 2026-10-14 · #52 · feat: skipped verify steps + owner rulings on needs-human review items · risk high · rounds 3 · arbiter 0 · awaiting-owner-merge
+- 2026-10-14 · #52 · feat: skipped verify steps + owner rulings on needs-human review items · risk high · rounds 4 · arbiter 1 · awaiting-owner-merge
+- 2026-10-14 · #55 · feat(config): verify.stop_queue_wait_minutes — Stop-hook queue allowance from config · risk high · rounds 2 · arbiter 1 · needs-human
+- 2026-10-14 · #69 · tools: keep the guard replay / probe / mutation tools (tools/guard-replay) · risk high · rounds 3 · arbiter 0 · stopped
+- 2026-10-14 · #66 · fix: reviews skip main's merged-in code; agent log off PR branches · risk high · rounds 4 · arbiter 1 · stopped
+- 2026-10-15 · #70 · fix(worktrees): config fallback for keep/unkeep/prune + record evidence moves before making them (#59) · risk high · rounds 2 · arbiter 0 · stopped
+- 2026-10-15 · #66 · fix: reviews skip main's merged-in code; agent log off PR branches · risk high · rounds 4 · arbiter 1 · awaiting-owner-merge
+- 2026-10-15 · #66 · fix: reviews skip main's merged-in code; agent log off PR branches · risk high · rounds 4 · arbiter 1 · merged
+- 2026-10-16 · #55 · feat(config): verify.stop_queue_wait_minutes — Stop-hook queue allowance from config · risk high · rounds 3 · arbiter 1 · awaiting-owner-merge
