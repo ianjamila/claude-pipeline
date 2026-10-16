@@ -165,19 +165,43 @@ export function execLinesOf(sf, expand, assigned) {
 export class GuardLimit extends Error {}
 
 // One per top-level evaluation, shared through every nested call. `now` is injectable so tests do not depend on timing.
+// Why (#81 security follow-up): the readings of a text (one per word of a loop, one per value of a name assigned twice) are multiplied again for every script it runs: three nested scripts
+// that each assign four names twice and loop over eight words were 1024 readings each, 1024^3 in all, and the check ended at the 5 s deadline instead of at once. The readings of a whole
+// evaluation, nested scripts included, share this allowance; past it the check is refused (GuardLimit), as for too many script files.
+export const MAX_TOTAL_READINGS = 1024;
 export function newEvalBudget(now = Date.now) {
   // startupOk: startup files already judged in a given state (see the policies), so a line with many shells reads ~/.zshenv once, not once each
-  return { now, deadline: now() + EVAL_DEADLINE_MS, scripts: MAX_SCRIPT_JUDGMENTS, grown: 0, startupOk: new Set() };
+  return { now, deadline: now() + EVAL_DEADLINE_MS, scripts: MAX_SCRIPT_JUDGMENTS, readings: MAX_TOTAL_READINGS, grown: 0, startupOk: new Set() };
 }
 
 export function checkDeadline(budget) {
   if (budget.now() > budget.deadline) throw new GuardLimit('the check took too long (a script chain or a command line too large to verify in time), so it cannot be verified. Split it into simpler commands or name the script file.');
 }
 
+// A reading of a text is about to be judged: one unit of the shared allowance of readings.
+export function countReading(budget) {
+  if (--budget.readings < 0) throw new GuardLimit('too many readings to check (loops over many words, or names given several values, in scripts that run scripts ...), so what they run cannot be verified. Name the script file and write the loop words or values out.');
+}
+
 // A script file is about to be judged: one unit of the shared budget.
 export function countScript(budget) {
   checkDeadline(budget);
   if (--budget.scripts < 0) throw new GuardLimit('too many script files to check (scripts that run scripts that run scripts ...), so what they run cannot be verified. Name the script file.');
+}
+
+// Why (#74): zsh applies to an UNBRACED `$NAME` a modifier after `:` (`$B:r`, `:h :t :e :a :A :l :u :q :Q :P :s/…/…/ :&`, the prefixes `:f :F :w :W :g`) and a subscript
+// after `[` (`$B[1,6]`); the hook does not know the shell, so a name followed by either is a value only known at run time and is never expanded. `${B}:r` is no
+// modifier (the value, then text) and `$H:8080` / `$A:$B` / `$X:done` have no modifier letter after the `:`, so they are worked out as before. (`:p :S :G`
+// are not modifiers of a parameter in zsh 5.9, probed. A bash-style `$B:feature/x` IS read by zsh as `:f` + `e` + `ature/x`, so it is a run-time value too.)
+// Lookahead for a regex that matches the bare name: put it after the name and after a `(?![A-Za-z0-9_])` (the name takes every letter that follows).
+const ZSH_TAIL = '\\[|:[aAcefFghlPqQrstuwWx&]';
+export const ZSH_MODIFIED = `(?!${ZSH_TAIL})`;
+// The names the texts read with a modifier or a subscript (`$B:r`, `"$B[1,6]"`): the guards' bookkeeping of a name (known value, assigned once) does not hold for
+// them, because the word the shell makes of it is not the value; they are treated as a name only known at run time.
+export function zshModifiedNames(texts) {
+  const out = new Set();
+  for (const t of texts) for (const m of String(t).matchAll(new RegExp(`\\$(\\w+)(?!\\w)(?=${ZSH_TAIL})`, 'g'))) out.add(m[1]);
+  return out;
 }
 
 // `text.replace(re, ...)` where `lookup(match, ...groups)` gives the replacement (or the match itself when nothing is known),
