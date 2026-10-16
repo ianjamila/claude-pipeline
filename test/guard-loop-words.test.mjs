@@ -57,6 +57,9 @@ test('#81 A1: a list that is one command substitution is recognised from the par
     'for f in `ls src | grep "(a)"`; do node chk.mjs $f; done',
     'for f in "$(git branch -r --format=\'%(refname:short)\')"; do node chk.mjs $f; done',
     'for l in $(cat list.txt); do npm run -s $l; done',
+    // (the loop in a subshell, or in a substitution: one name, one computed value, wherever the loop sits)
+    'echo "$(for p in $(lsof -t -i :4000); do ps -p $p; done)"',
+    '(for p in $(lsof -t -i :4000); do ps -p $p; done)',
     // a list of literal words and one substitution: the literal words are read one by one, the substitution is one run-time value
     "for f in $(git branch -r --format='%(refname:short)') x; do node chk.mjs $f; done",
     'for f in x $(git branch -r | head -3) y; do git show $f; done',
@@ -138,6 +141,8 @@ test('#81 A2 twins: the word is still the script that runs, or not text at all',
   // an expansion, a substitution, braces, a backslash or a quote in the word is not text
   deny('for f in "$(echo run.sh)x" ok.sh; do bash "$f"; done', files);
   deny('for f in "{run,ok}.sh"; do bash "$f"; done', files);
+  deny('for f in `echo run.sh`x ok.sh; do bash "$f"; done', files);
+  deny('for f in =run.sh; do bash $f; done', files);
   deny("for f in 'r\\un.sh'; do bash \"$f\"; done", files);
 });
 

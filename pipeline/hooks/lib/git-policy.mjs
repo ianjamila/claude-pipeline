@@ -1989,11 +1989,11 @@ function subshellsTrusted(cmds) {
 const MAX_READINGS = 64;
 const varWordRe = (k) => new RegExp(`(?<![A-Za-z0-9_])${k}(?![A-Za-z0-9_])`, 'g');
 const bindWordRe = (k) => new RegExp(`(?<![A-Za-z0-9_]|\\$|\\$\\{)${k}(?![A-Za-z0-9_])`); // (the name, not a `$k` / `${k` read of it)
-// #81: literal loop text beyond LOOP_WORD_IN: what the parser unquoted. No `$` or backtick (an expansion), brace, backslash, quote, `;&|<>` or control character, and no leading `=` (zsh
-// expands `=cmd`). An UNQUOTED word with a character zsh may read as a pattern (`^ # ~ ( ) |`, parser: not in litWords) is not text: refused, as is `~user`. A leading `~/` is the home
+// #81: literal loop text beyond LOOP_WORD_IN: what the parser unquoted. No `$` or backtick (an expansion), brace or backslash, and no leading `=` (zsh expands `=cmd`).
+// (A value is substituted as written and never read again, so quotes, `;&|<>` and the like in it do no harm; `eval "$c"` re-reads it exactly as the shell would.) An UNQUOTED word with a character zsh may read as a pattern (`^ # ~ ( ) |`, parser: not in litWords) is not text: refused, as is `~user`. A leading `~/` is the home
 // directory like anywhere else on the line, only when the header holds no quote or backslash (a quoted `"~/x"` is the literal text, and the parser's word does not say which it was).
 // Not here: `*?[` globs (LOOP_WORD_IN, judged as candidates where the word lands).
-const LOOP_TEXT = /^(?!=)[^\x00-\x1f\x7f$\x60{}\\'";&|<>]*$/;
+const LOOP_TEXT = /^(?!=)[^$\x60{}\\]*$/;
 function loopTextWord(w, site) {
   if (!LOOP_TEXT.test(w)) return false;
   if (w === '~' || w.startsWith('~/')) return !/['"\\]/.test(String(site.raw ?? "'"));
@@ -2111,7 +2111,7 @@ function onceAssignedNames(cmds, ctx, str) {
       const textual = (w) => !computed(w) && !LOOP_WORD_IN.test(w) && loopTextWord(w, site);
       if (!words.every((w) => computed(w) || LOOP_WORD_IN.test(w) || textual(w))) continue;
       const expand = words.some((w) => w.includes('$') && !computed(w));
-      if (expand && (/['\\]/.test(String(site.raw ?? "'")) || ifsMayBeSet(ctx) || words.some((w) => !computed(w) && [...w.matchAll(/\$\{?(\w+)/g)].some((x) => x[1] === k)))) continue;
+      if (expand && (/['\\]/.test(String(site.raw ?? "'")) || ifsMayBeSet(ctx) || words.some((w) => [...w.matchAll(/\$\{?(\w+)/g)].some((x) => x[1] === k)))) continue;
       modes = [...new Set(words)].map((w) => (w.includes('$') && !computed(w) ? { val: w, expand: true } : { val: w }));
       // (#56, Codex review of 8b86e2b: `false && for b in agent/x; do :; done; git push origin $b` pushes the value b had before. Where the loop may not run, or a
       // word is a glob that may match nothing, the name may also keep that value: one more reading, the name not set by the line)
