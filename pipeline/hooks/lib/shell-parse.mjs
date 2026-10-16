@@ -2771,7 +2771,7 @@ class Parser {
     }
     // a command name that is only known at run time ($g push, $(echo git) push)
     const headDyn = a.length > 0 && (a[0].startsWith('$') || a[0].includes('$(') || a[0].includes('`'));
-    if (headDyn) this.ctx.dynamic = true;
+    if (headDyn) this.ctx.dynamicHead = true; // (kept apart from the other causes of ctx.dynamic: see dynamicOther in simpleCommands)
     const cmd = emit(this.ctx, a, env, seg.raw, seg.depth, [], seg.sep);
     if (bashAlso) for (const sh of ['bash', 'sh']) emit(this.ctx, [sh, ...bashAlso], env, seg.raw, seg.depth, [], seg.sep);
     // the words that are exactly one command substitution (`for f in $(cmd)`): see wspans (#81)
@@ -3079,7 +3079,7 @@ class Parser {
 }
 
 function newCtx(maxDepth, expired, bashState) {
-  return { out: [], expired, maxDepth, truncated: false, dynamic: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, ctlBroken: false, fns: new Set(), defs: { redef: false }, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
+  return { out: [], expired, maxDepth, truncated: false, dynamic: false, dynamicHead: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, ctlBroken: false, fns: new Set(), defs: { redef: false }, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
 }
 
 // The text with every comment the lexer skips blanked out (newlines kept), from a lexing pass that interprets nothing (muted); null when that pass did not
@@ -3119,7 +3119,10 @@ export function simpleCommands(str, opts) {
     try { parser?.drain(true); } catch { /* best effort */ }
   }
   Object.defineProperty(ctx.out, 'truncated', { value: ctx.truncated, enumerable: false });
-  Object.defineProperty(ctx.out, 'dynamic', { value: ctx.dynamic, enumerable: false });
+  Object.defineProperty(ctx.out, 'dynamic', { value: ctx.dynamic || ctx.dynamicHead, enumerable: false });
+  // dynamicOther: dynamic for a reason other than a command word that starts with `$` or holds a substitution (#81 t8: such a head is resolved per reading by the git policy's onceAssignedNames;
+  // a stdin feed of that command, a process substitution, an unknown descriptor ... still count here)
+  Object.defineProperty(ctx.out, 'dynamicOther', { value: ctx.dynamic, enumerable: false });
   Object.defineProperty(ctx.out, 'subshell', { value: ctx.subshell, enumerable: false });
   // fns: every name the text defines as a function (`f()`, `function f`, zsh `f g ()`), wherever it is
   Object.defineProperty(ctx.out, 'fns', { value: ctx.fns, enumerable: false });

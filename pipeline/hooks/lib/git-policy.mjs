@@ -1847,6 +1847,10 @@ const isStateHazard = (c) => {
   const nm = baseName(c.argv[0]);
   return STATE_HAZARD_CMDS.has(nm) || (nm === 'set' && c.argv.slice(1).some((a) => !SAFE_SET_ARG.test(a)));
 };
+// (the names of builtins and shells that run a string as shell code in the current shell, or whose string may define what the line later calls; `declare` and the like keep the old answer too)
+const EVALUATES_HERE = new Set(['eval', 'source', '.', 'trap', 'alias', 'unalias', 'builtin', 'command', 'exec', 'fc', 'let', '((', 'mapfile', 'readarray', 'complete', 'bind', 'coproc', 'declare', 'typeset', 'local', 'readonly', 'integer', 'float',
+  'sh', 'bash', 'zsh', 'dash', 'ksh', 'ash', 'fish', 'csh', 'tcsh', 'functions', 'autoload', 'zmodload', 'emulate', 'setopt', 'shopt', 'enable', 'hash', 'printf']);
+const readsOnlyData = (c) => dataOnly(c) || (c.argv.length > 0 && !DYNAMIC.test(c.argv[0]) && !EVALUATES_HERE.has(baseName(c.argv[0])) && !(baseName(c.argv[0]) === 'export' && c.argv.some((w) => w.includes('['))));
 const FUNCTION_DEF = /(?:^|[\s;&|(){])(?:function\s+[^\s(){};&|<>]+|[A-Za-z_][\w.:-]*\s*\(\s*\))/;
 // `source` / `.` run a file in THIS shell: it may cd, check out a branch or reassign any variable.
 const SOURCING = ['source', '.'];
@@ -1894,9 +1898,12 @@ function unquotedText(s) {
 // `function rep(a, b)` in the JavaScript): its text is blanked out, at the places the parser read it from, before looking for a definition. Its `$(...)` run in
 // subshells (a function defined there is gone when it ends) and are commands of their own in `cmds`, judged by dataOnly like the rest. A body the parser could
 // not locate in the line (read out of backticks or another text, no terminator) keeps the old answer: a heredoc is a hazard.
+// #81 t8: the parser lists the functions the text really defines (cmds.fns: `f()`, `function f`, zsh `f g ()`, also in an eval string or a script it unwraps), so a `name()` it did not list sits in
+// text that is not shell code here: the argument of an external program (`docker exec db psql -c "select now()"`). Only a command that reads its words as code IN THIS SHELL can make such text
+// a definition (EVALUATES_HERE: eval, source, trap, alias, a shell ... and a name known only at run time); with one of those on the line the old answer stands.
 function definesFunction(str, cmds) {
   if (!FUNCTION_DEF.test(str)) return false;
-  if (!cmds.every(dataOnly)) return true;
+  if (cmds.fns instanceof Set ? cmds.fns.size > 0 || !cmds.every(readsOnlyData) : !cmds.every(dataOnly)) return true;
   const text = withoutHeredocBodies(str, cmds);
   if (text === null) return true;
   const u = unquotedText(text);
@@ -2065,12 +2072,56 @@ function isLoopListWord(text, i, k, site) {
   const mine = site.argv.slice(3);
   return words.length === mine.length && words.every((w, x) => w === mine[x]);
 }
+// Why (#81 t8): `PSQL=/usr/bin/psql; for f in a b; do $PSQL -At -c "select 1" $f; done` and `S=/x; for n in 1 2; do $S/run.sh $S/m$n.sql; done` switched the readings off for the whole line,
+// because the command word is only known at run time. The word is read only when it is plain text and `$NAME` / `${NAME}` (no quote or backslash around the command, no modifier or subscript),
+// and each name is given by the line itself as literal text: assigned once, before, in the same subshells (a bare `NAME=value`), or by a reading (each of its values literal, none "not set").
+// The resolved first word is then checked like a word written out: not a builtin that binds a name, sources, evals or changes the shell (BIND_HEADS).
+const HEAD_IN = /^(?!=)(?:[A-Za-z0-9_@%+=:,./-]|\$[A-Za-z_][A-Za-z0-9_]*(?![A-Za-z0-9_[:])|\$\{[A-Za-z_][A-Za-z0-9_]*\}(?![\[:]))+$/;
+const HEAD_VALUE = /^[A-Za-z0-9_@%+=:,./ -]*$/;
+const BIND_HEADS = new Set([...SOURCING, 'eval', ...VAR_BUILTINS, ...VALUE_BINDERS, ...STATE_HAZARD_CMDS, 'set', 'builtin', 'command', 'exec', 'coproc', 'fc', 'let', '((', 'for', 'select', 'vared', 'zparseopts', 'print', 'compdef', 'noglob', 'time', 'nohup', 'env', 'xargs']);
+function headResolves(c, cmds, ctx, out, text) {
+  const head = c.argv[0];
+  if (!HEAD_IN.test(head)) return false;
+  // (the command word as written, after the keywords and prefix assignments that may come first in the segment: it is the head itself or the head in double quotes, so no single quote or backslash is in it)
+  const toks = String(c.raw ?? '').trim().split(/\s+/);
+  const wordAt = toks.findIndex((t) => t === head || t === `"${head}"`);
+  if (wordAt < 0 || !toks.slice(0, wordAt).every((t) => /^(?:[A-Za-z_][A-Za-z0-9_]*=\S*|do|then|else|elif|if|while|until|\{|\(|!|&&|\|\||time)$/.test(t))) return false;
+  if (head.includes('/')) return !bindsRunTimeName(c);
+  const at = cmds.indexOf(c);
+  const valuesOf = (k) => {
+    const o = out.find((x) => x.k === k);
+    const site = cmds.findIndex((x) => !x.argv.length && Object.hasOwn(x.env ?? {}, k));
+    if (o) {
+      const vals = o.modes.map((m) => (m === 'set' ? (site >= 0 ? cmds[site].env[k] : null) : typeof m === 'object' && !m.expand ? m.val : null));
+      return vals.every((v) => typeof v === 'string' && HEAD_VALUE.test(v)) ? vals : null;
+    }
+    if (ctx.unsureVars.has(k) || ctx.tainted.has(k) || SPECIAL_NAMES.test(k)) return null;
+    if (site < 0) return Object.hasOwn(ctx.vars, k) && HEAD_VALUE.test(ctx.vars[k]) ? [ctx.vars[k]] : null; // (given by an earlier line)
+    const mine = [...text.matchAll(varWordRe(k))].filter((m) => !/\$\{?$/.test(text.slice(Math.max(0, m.index - 2), m.index)));
+    const x = cmds[site];
+    if (mine.length !== 1 || text[mine[0].index + k.length] !== '=' || site > at || x.depth > 0 || ranInSubshell(cmds, site) || !Array.isArray(x.grp) || !Array.isArray(c.grp) || x.grp.some((id, j) => c.grp[j] !== id)) return null;
+    return HEAD_VALUE.test(x.env[k]) ? [x.env[k]] : null;
+  };
+  let words = [head];
+  for (const k of new Set([...head.matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)/g)].map((m) => m[1]))) {
+    const vals = valuesOf(k);
+    if (!vals) return false;
+    words = words.flatMap((w) => [...new Set(vals)].map((v) => w.replace(new RegExp(`\\$(?:\\{${k}\\}|${k}(?![A-Za-z0-9_]))`, 'g'), () => v)));
+    if (words.length > 16) return false;
+  }
+  return words.every((w) => {
+    const nm = baseName(w.trim().split(/\s+/)[0] ?? '');
+    return nm !== '' && !BIND_HEADS.has(nm) && !bindsRunTimeName({ ...c, argv: [nm, ...c.argv.slice(1)] });
+  });
+}
 function onceAssignedNames(cmds, ctx, str) {
-  if (ctx.tainted.size || cmds.truncated || cmds.dynamic || definesFunction(str, cmds) || cmds.some(isStateHazard) || !subshellsTrusted(cmds) || indirectExpansionOnLine(str, cmds)) return [];
+  if (ctx.tainted.size || cmds.truncated || cmds.dynamicOther || definesFunction(str, cmds) || cmds.some(isStateHazard) || !subshellsTrusted(cmds) || indirectExpansionOnLine(str, cmds)) return [];
+  const heads = []; // (#81 t8: the commands named by a variable; each is resolved below, once the readings are known, and judged as the command it names)
   for (const c of cmds) {
     if (!c.argv.length) continue;
     const nm = baseName(c.argv[0]);
-    if (DYNAMIC.test(c.argv[0]) || SOURCING.includes(nm) || nm === 'eval' || bindsRunTimeName(c)) return [];
+    if (DYNAMIC.test(c.argv[0])) { heads.push(c); continue; }
+    if (SOURCING.includes(nm) || nm === 'eval' || bindsRunTimeName(c)) return [];
     // Why (#56 replay): only a binder whose NAME is only known at run time may set any name (`export $X=1`, `read $V`); a value that expands
     // (`export PATH=/x:$PATH`, the first command of many lines) names its target. printf binds only with -v.
     if (VAR_BUILTINS.includes(nm)) {
@@ -2185,6 +2236,9 @@ function onceAssignedNames(cmds, ctx, str) {
     }
     if (ok) out.push({ k, modes });
   }
+  // #81 t8: a command named by a variable can bind a name or run code in this shell (`X=read; $X f`, `X=eval`) when it is one of those; it is read only when every name in its word
+  // has literal text (one value, or each value of a reading) and no value names such a builtin (a head with a `/` is a program by path, whatever the names hold)
+  if (heads.length && !heads.every((c) => headResolves(c, cmds, ctx, out, text))) return [];
   // #81 t5: asked for only when the product is over the cap (judgeReadings): which names can be read one group at a time
   out.split = () => independentReadings(cmds, str, out);
   return out;

@@ -100,7 +100,8 @@ test('A2 a head that resolves to a binder, eval or source, or cannot be resolved
   gitDeny('for p in eval ls; do $p x; git show $p; done');
   gitDeny('for p in a b; do $q x; git show $p; done'); // ($q is not given by the line)
   gitDeny('X=$(echo ls); for f in a b; do $X $f; git show $f; done');
-  gitDeny('X=ls; for f in a b; do $X < in.txt; git show $f; done'.replace('X=ls', "X='ls -l'"));
+  gitAllow("X='ls -l'; for f in a b; do $X < in.txt; git show $f; done");
+  gitDeny('X=bash; for f in a b; do $X < run.sh; git show $f; done', fakeFs(GIT_ROOT, { 'run.sh': BAD_GIT })); // (the shell reads its script from stdin: judged in the reading)
 });
 test('A3 source / . stay a hazard (a sourced file can set any name)', () => {
   gitDeny('set -a; . ~/env.sh; for f in a b; do git show $f; done');
