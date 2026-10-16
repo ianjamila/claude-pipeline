@@ -49,7 +49,7 @@ function both(command, spec, dirs = ['scripts']) {
   };
 }
 // run.sh / run2.sh / scripts/run2.sh hold the guarded command; ok.sh / run1.sh / scripts/run1.sh are harmless
-const SPEC = { 'run.sh': 'bad', 'run2.sh': 'bad', 'ok.sh': 'ok', 'run1.sh': 'ok', 'scripts/run2.sh': 'bad', 'scripts/run1.sh': 'ok' };
+const SPEC = { 'RUN.SH': 'bad', 'run.sh': 'bad', 'run2.sh': 'bad', 'ok.sh': 'ok', 'run1.sh': 'ok', 'scripts/run2.sh': 'bad', 'scripts/run1.sh': 'ok' };
 const allow = (cmd, spec = SPEC) => {
   const r = both(cmd, spec);
   assert.equal(r.git.decision, 'allow', `git: ${cmd} -> ${r.git.reason}`);
@@ -201,12 +201,13 @@ test('B6 adversarial 200 kB lines and glob patterns are answered quickly', () =>
   ];
   for (const c of cases) {
     // (this reading's own work, then the guards; the parser alone takes 2-3 s on some of these on main too, so the guards get the deadline's third)
-    const t0 = Date.now();
+    const cpu = () => { const u = process.cpuUsage(); return (u.user + u.system) / 1000; }; // (CPU time, not the clock: a busy machine must not fail the test)
+    const t0 = cpu();
     assigningDefaults(c);
-    const own = Date.now() - t0;
+    const own = cpu() - t0;
     assert.ok(own < 500, `${own} ms in assigningDefaults for ${c.slice(0, 40)}...`);
     both(c, SPEC);
-    const ms = Date.now() - t0;
+    const ms = cpu() - t0;
     assert.ok(ms < 8000, `${ms} ms for ${c.slice(0, 40)}...`);
   }
 });
@@ -283,4 +284,11 @@ test('B8 assigningDefaults itself: a cap or a give-up leaves an unknown word in 
   assert.ok(assigningDefaults('F=a; G=${F:#x}').get('G').includes(U), 'pattern after colon');
   assert.ok(assigningDefaults('A=${U:-run.sh}; B=$A').get('B').includes('run.sh'), 'a name built from a computed one');
   assert.equal(assigningDefaults('F=ok.sh; G=${F}').size, 0, 'a plain reference is the guard\'s own expansion');
+});
+
+test('B8 case, element-index and long-array forms', () => {
+  denyBoth('F=run.sh; G=${F^^}; bash $G');
+  denyBoth('F=(ok.sh [5]=run.sh); bash ${F[5]}');
+  const els = Array.from({ length: 70 }, (_, i) => `e${i}.sh`).join(' ');
+  denyBoth(`F=(${els}); G=\${F[1]%%*}; bash $G`); // (70 words are more than kept: whatever an operator makes of them is unknown)
 });
