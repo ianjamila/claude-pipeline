@@ -1731,7 +1731,7 @@ function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0, text = 
     // A list that is one run-time word (`for p in $(lsof -t …)`) gives the name one value only known at run time, like `P=$(lsof -t …)` (see computedLoopWord;
     // the walk records it): counted once, so the value is judged where it lands (a script, a directory, a ref) instead of refusing every command it reaches.
     // Once even where the loop may not run (an empty list, `false && for …`): an unknown value already stands for any value, the one held before included.
-    if (c.argv[0] === 'for' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '')) bump(c.argv[1], computedLoopWord(c.argv) === null ? 2 : 1);
+    if (c.argv[0] === 'for' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '')) bump(c.argv[1], computedLoopWord(c) === null ? 2 : 1);
     // builtins that bind a variable without a NAME=value word: its value is whatever was read / parsed at run time
     if (c.argv.length && VALUE_BINDERS.has(baseName(c.argv[0]))) {
       for (const a of c.argv.slice(1)) {
@@ -1802,10 +1802,12 @@ function namesReadOn(cmds) {
 // and several words of which some are computed, a variable (`L=run.sh; for f in $L`: its value is known, and splits), `for f; do` (the positional
 // parameters) or a list with quotes or globs around the expansion stay refused. Where the value lands it is judged like `F=$(cmd)` today: a script picked
 // by it is refused only when the line mentions a guarded operation (scriptFileOf), the same known limit as `bash $(ls *.sh)`.
-function computedLoopWord(argv) {
+// #81: "a single command-substitution word" is what the PARSER says the word is (c.subWords: one substitution covers the whole word, however deep its parentheses, quotes and
+// nested substitutions go), not a pattern over the text. A list that is a split variable (`F=$(cmd); for f in ${=F}`) stays refused, as test/guard-false-positives-56 documents.
+function computedLoopWord(c) {
+  const argv = c.argv;
   if (argv[0] !== 'for' || argv[2] !== 'in' || argv.length !== 4) return null;
-  const w = argv[3];
-  return /^(?:\$\([^()]*(?:\([^()]*\)[^()]*)*\)|\x60[^\x60]*\x60)$/.test(w) ? w : null;
+  return c.subWords?.has(argv[3]) ? argv[3] : null;
 }
 
 // Commands that may be handed an unsure value: they print, compare, count or wait, and run nothing. An ALLOWLIST on purpose
@@ -1987,6 +1989,17 @@ function subshellsTrusted(cmds) {
 const MAX_READINGS = 64;
 const varWordRe = (k) => new RegExp(`(?<![A-Za-z0-9_])${k}(?![A-Za-z0-9_])`, 'g');
 const bindWordRe = (k) => new RegExp(`(?<![A-Za-z0-9_]|\\$|\\$\\{)${k}(?![A-Za-z0-9_])`); // (the name, not a `$k` / `${k` read of it)
+// #81: literal loop text beyond LOOP_WORD_IN: what the parser unquoted. No `$` or backtick (an expansion), brace, backslash, quote, `;&|<>` or control character, and no leading `=` (zsh
+// expands `=cmd`). An UNQUOTED word with a character zsh may read as a pattern (`^ # ~ ( ) |`, parser: not in litWords) is not text: refused, as is `~user`. A leading `~/` is the home
+// directory like anywhere else on the line, only when the header holds no quote or backslash (a quoted `"~/x"` is the literal text, and the parser's word does not say which it was).
+// Not here: `*?[` globs (LOOP_WORD_IN, judged as candidates where the word lands).
+const LOOP_TEXT = /^(?!=)[^\x00-\x1f\x7f$\x60{}\\'";&|<>]*$/;
+function loopTextWord(w, site) {
+  if (!LOOP_TEXT.test(w)) return false;
+  if (w === '~' || w.startsWith('~/')) return !/['"\\]/.test(String(site.raw ?? "'"));
+  if (w.startsWith('~')) return false;
+  return site.litWords?.has(w) === true || !/[\^#~()|]/.test(w);
+}
 // A loop word the readings follow: literal text (globs included) and `$NAME` / `${NAME}`; what it is worked out to must be literal text (LOOP_WORD).
 // (not a name followed by `[` or `:`: zsh reads `$B[1,6]` as a subscript and `$B:r` as a modifier, where this guard would read text; nor a word that starts
 // with `=`: zsh expands `=cmd` to the path of a command. The name takes every letter that follows: `$BB:r` must not read as `$B` + `B:r`)
@@ -2091,11 +2104,15 @@ function onceAssignedNames(cmds, ctx, str) {
       // Why (#56 replay): `B=app/x && for f in $B/a.ts $B/b.ts` and `for f in "app/[id]/page.tsx"` were refused. A word may also hold `[…]` (a glob class, judged like
       // `*`) and `$NAME` / `${NAME}`: such a word is worked out when the walk reaches the `for` (loopWordAt), with what is known there. Not when the header holds a
       // single quote or a backslash (`'$B'` is the text $B, which the argv no longer shows), nor where IFS may be set (ifsMayBeSet: it changes how the value splits).
+      // #81: a word may also be any other literal text the parser has unquoted (a space, parentheses, a `#` or `^`, empty: loopTextWord), and a word that is one command substitution
+      // (site.subWords): its value is only known at run time and is judged where it lands, as `for p in $(…)` alone is (computedLoopWord); the literal words beside it are read one by one.
       const words = site.argv.slice(3);
-      if (!words.every((w) => LOOP_WORD_IN.test(w))) continue;
-      const expand = words.some((w) => w.includes('$'));
-      if (expand && (/['\\]/.test(String(site.raw ?? "'")) || ifsMayBeSet(ctx) || words.some((w) => [...w.matchAll(/\$\{?(\w+)/g)].some((x) => x[1] === k)))) continue;
-      modes = [...new Set(words)].map((w) => (w.includes('$') ? { val: w, expand: true } : { val: w }));
+      const computed = (w) => site.subWords?.has(w) === true;
+      const textual = (w) => !computed(w) && !LOOP_WORD_IN.test(w) && loopTextWord(w, site);
+      if (!words.every((w) => computed(w) || LOOP_WORD_IN.test(w) || textual(w))) continue;
+      const expand = words.some((w) => w.includes('$') && !computed(w));
+      if (expand && (/['\\]/.test(String(site.raw ?? "'")) || ifsMayBeSet(ctx) || words.some((w) => !computed(w) && [...w.matchAll(/\$\{?(\w+)/g)].some((x) => x[1] === k)))) continue;
+      modes = [...new Set(words)].map((w) => (w.includes('$') && !computed(w) ? { val: w, expand: true } : { val: w }));
       // (#56, Codex review of 8b86e2b: `false && for b in agent/x; do :; done; git push origin $b` pushes the value b had before. Where the loop may not run, or a
       // word is a glob that may match nothing, the name may also keep that value: one more reading, the name not set by the line)
       // (the `for` itself carries its own loop mark, so mayNotRun cannot tell; after any earlier loop mark it may sit in an outer loop that runs no time)
@@ -2267,7 +2284,7 @@ function evalString(str, startDir, ctx, level) {
         if (d.transform && DYNAMIC.test(v)) { delete ctx.vars[k]; ctx.unsureVars.add(k); } else setVar(ctx, k, applyTransform(v, d.transform), level);
       }
     } else if (name === 'for' && level === 0 && ctx.pins?.get(argv[1])?.expand) verdict = loopWordAt(argv[1], ctx);
-    else if (name === 'for' && computedLoopWord(argv) !== null) setVar(ctx, argv[1], computedLoopWord(argv), level);
+    else if (name === 'for' && computedLoopWord(c) !== null) setVar(ctx, argv[1], computedLoopWord(c), level);
     else if (name === 'cd' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name, argv, ctx, cdp, c.env ?? {});
     else if (name === 'git' || name === 'gh') {
       const unsure = unsureVarUsed([...argv.slice(1), ...Object.values(c.env)], ctx);
