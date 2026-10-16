@@ -2097,9 +2097,11 @@ function onceAssignedNames(cmds, ctx, str) {
     }
     // #81 t6: a name that only `for` loops one after another bind (`for n in 1 2; do …; done; for n in 3 4; do …; done`) takes every word of every list (below)
     const isForSite = (c) => c.argv[0] === 'for' && c.argv[1] === k && c.argv[2] === 'in' && c.argv.length > 3;
+    // (defence in depth for the all-`for` test: loopsInSequence below counts the `for k in` headers, and a binder site is not one, so it refuses the line too)
     if (sites.length === 0 || (sites.length > 1 && !sites.every((i) => isForSite(cmds[i])))) continue;
     const s = sites[0];
     const site = cmds[s];
+    // (every site, not only the first: defence in depth for the later ones, whose bad word the union of the words finds at every use anyway)
     if (sites.some((i) => cmds[i].depth > 0 || ranInSubshell(cmds, i))) continue;
     // (every loop in the same subshell as the first: a loop in `( … )` or a pipe stage mixed with one outside it is not read. Defence in depth for the pipe / background loop,
     // which markClosedOut marks as conditional, so the readings below also hold the unset name; the subshell loop is the case this stops: its value is lost outside it)
@@ -2252,6 +2254,7 @@ function judgeReadings(str, startDir, ctx, level, names, saved) {
   const all = names.map((_, i) => i);
   if (product(all) > MAX_READINGS) {
     const groups = names.split?.();
+    // (the per-group test is defence in depth: a group over the cap makes the sum over the cap too)
     if (!groups || groups.length < 2 || groups.some((g) => product(g) > MAX_READINGS) || groups.reduce((n, g) => n + product(g), 1 - groups.length) > MAX_READINGS) return null;
     plan = [];
     groups.forEach((g, gi) => {
@@ -2300,6 +2303,7 @@ function judgeReadings(str, startDir, ctx, level, names, saved) {
     }
     if (level > 0 && total > 1) {
       // (config is only ever set; a branch or alias that differs from the state the script started with, in any reading, may or may not have changed)
+      // (the alias part is defence in depth: the candidate-script comparison (spec.git vs ctx.gitAliases) makes a redefined alias unsure as well)
       ctx.cfgDirty = dirty;
       ctx.envCfgDirty = envDirty;
       for (const d of moved) ctx.branches.set(d, { name: null, trackMain: false });

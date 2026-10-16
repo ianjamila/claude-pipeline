@@ -139,6 +139,7 @@ test('t5 twins: the cap still bites on one name and on the sum, names that meet 
   const two = `for a in x r ${words(10)}; do ps -p $a; done; for b in y un.sh ${words(10, 'v')}; do ps -p $b; done`;
   allowGit(two, PAIR); // (without the script the two groups are counted by sum: 12 + 12 readings)
   denyGit(`${two}; bash s.sh`, PAIR);
+  denyGit(`${two}; echo s.sh | xargs bash`, PAIR); // (a tool that is no plain reader and no script the guard opens by name: not split either)
   // a 3-deep count over the cap whose names meet at the innermost command
   denyGit(`for a in ${words(5)}; do for b in ${words(9)}; do for c in x y z; do ps -p $a$b$c; done; done; done`, SPEC);
 });
