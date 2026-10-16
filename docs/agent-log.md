@@ -51,3 +51,4 @@ full record.
 - 2026-10-16 · #80 · fix(worktrees): purge takes the holding-folder lock · risk high · rounds 1 · arbiter 0 · awaiting-owner-merge
 - 2026-10-16 · #78 · test: guard timing caps measure CPU time; qualifier linearity test uses an equal-work span · risk high · rounds 1 · arbiter 0 · awaiting-owner-merge
 - 2026-10-16 · #80 · fix(worktrees): purge takes the holding-folder lock · risk high · rounds 1 · arbiter 0 · merged
+- 2026-10-16 · #79 · fix: project commands (merge, smoke) find gh when it is only in a fallback dir · risk high · rounds 1 · arbiter 0 · awaiting-owner-merge
