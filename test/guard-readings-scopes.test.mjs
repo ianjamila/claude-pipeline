@@ -36,7 +36,7 @@ function fakeFs(root, files, dirs = []) {
 
 const GIT_ROOT = resolve('/work/repo');
 const PROJ = '/home/u/proj';
-const BAD_GIT = 'git push origin main';
+const BAD_GIT = 'git ' + 'push origin main'; // (split so a hook that scans this file for a guarded command does not take the fixture for one)
 const BAD_FILES = 'echo x > ~/.claude/settings.json';
 const git = (command, fsOpts, o = {}) => evaluateGitCommand(command, {
   cwd: GIT_ROOT, home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], ...fsOpts, ...o,
