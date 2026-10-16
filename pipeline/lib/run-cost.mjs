@@ -147,8 +147,9 @@ export function listPriceUsd(model, t) {
 // ---- token usage from a Claude transcript (JSONL) ------------------------------------------------------------------
 
 // Sums message.usage over the assistant lines of one transcript. A streamed message may appear on several lines with
-// the same message id; each id is counted once (last line wins, it carries the final totals).
-export function usageFromTranscript(text) {
+// the same message id; each id is counted once (last line wins, it carries the final totals). `defaultModel` prices the messages that carry
+// no model of their own (a message's own model always wins).
+export function usageFromTranscript(text, { defaultModel } = {}) {
   const byId = new Map();
   let anon = 0;
   for (const raw of String(text).split('\n')) {
@@ -172,7 +173,7 @@ export function usageFromTranscript(text) {
     sum.output += t.output;
     sum.cacheRead += t.cacheRead;
     sum.cacheWrite += t.cacheWrite;
-    const price = listPriceUsd(model, t);
+    const price = listPriceUsd(typeof model === 'string' && model !== '' ? model : defaultModel, t);
     if (price === null) sum.unpricedMessages++;
     else sum.usd += price;
   }

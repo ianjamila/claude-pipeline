@@ -127,8 +127,8 @@ pipeline cost --pr N --phase build|verify|pr|review|gate|merge|... --role implem
   -> {ok, recorded, cost, warnings}; exit 2 usage (a negative or non-numeric amount), 3 GitHub unavailable
   An unknown --role is booked as `other`, an unknown --phase as `other`. --from-transcript FILE: sum the message.usage of a Claude transcript (JSONL, at most 50 MB);
   explicit --input/--output/--cache-* then add to it. --retry alone (no amounts) only counts a retry.
-  USD: --usd X as given; otherwise list price (opus / sonnet / haiku / fable) of each transcript message's own model plus the explicit
-  tokens at --model M. Tokens with no known model add no USD (a warning says so).
+  USD: --usd X as given; otherwise list price (opus / sonnet / haiku / fable) of each transcript message's own model (--model M prices the messages
+  that carry none) plus the explicit tokens at --model M. Tokens with no known model add no USD (a warning says so).
 ```
 
 Exit: 0 booked · 1 the run record could not be written (`warnings` says why) · 2 usage · 3 GitHub (`gh`) unavailable.

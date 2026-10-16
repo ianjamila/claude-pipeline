@@ -18,14 +18,14 @@ export const meta = {
     '  -> {ok, recorded, cost, warnings}; exit 2 usage (a negative or non-numeric amount), 3 GitHub unavailable',
     '  An unknown --role is booked as `other`, an unknown --phase as `other`. --from-transcript FILE: sum the message.usage of a Claude transcript (JSONL, at most 50 MB);',
     '  explicit --input/--output/--cache-* then add to it. --retry alone (no amounts) only counts a retry.',
-  '  USD: --usd X as given; otherwise list price (opus / sonnet / haiku / fable) of each transcript message\'s own model plus the explicit',
-  '  tokens at --model M. Tokens with no known model add no USD (a warning says so).',
+  '  USD: --usd X as given; otherwise list price (opus / sonnet / haiku / fable) of each transcript message\'s own model (--model M prices the messages',
+  '  that carry none) plus the explicit tokens at --model M. Tokens with no known model add no USD (a warning says so).',
   ].join('\n'),
 };
 
 const MAX_TRANSCRIPT_BYTES = 50 * 1024 * 1024;
 
-function transcriptUsage(file, root) {
+function transcriptUsage(file, root, defaultModel) {
   const abs = resolve(root, file);
   let size;
   try {
@@ -34,7 +34,7 @@ function transcriptUsage(file, root) {
     throw new UsageError(`--from-transcript: cannot read ${file} (${err.code ?? err.message})`);
   }
   if (size > MAX_TRANSCRIPT_BYTES) throw new UsageError(`--from-transcript: ${file} is ${size} bytes, at most ${MAX_TRANSCRIPT_BYTES} allowed`);
-  return usageFromTranscript(readFileSync(abs, 'utf8'));
+  return usageFromTranscript(readFileSync(abs, 'utf8'), { defaultModel });
 }
 
 export const run = guarded(async (argv, ctx) => {
@@ -52,8 +52,8 @@ export const run = guarded(async (argv, ctx) => {
   const spent = ['input', 'output', 'cache-read', 'cache-write', 'usd', 'from-transcript'].some((k) => values[k] !== undefined);
   if (!spent && !values.retry && !values.session?.length) throw new UsageError('nothing to record: pass amounts (--input … --usd), --retry or --session');
 
-  const fromFile = values['from-transcript'] ? transcriptUsage(values['from-transcript'], root) : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd: 0, unpricedMessages: 0 };
   if (values.model !== undefined && modelFamily(values.model) === null) throw new UsageError(`--model ${values.model}: not one of opus, sonnet, haiku, fable`);
+  const fromFile = values['from-transcript'] ? transcriptUsage(values['from-transcript'], root, values.model) : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd: 0, unpricedMessages: 0 };
   const num = (flag) => {
     if (values[flag] === undefined) return 0;
     const n = Number(values[flag]);

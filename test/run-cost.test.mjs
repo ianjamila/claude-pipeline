@@ -295,3 +295,29 @@ test('P summary: with no session known the guard log is not read at all', () => 
   assertExit(r, 0);
   assert.equal(r.json.cost.guardBlocks, null);
 });
+
+// Codex review (#57) finding 6: --model is the default for transcript messages that carry no model
+test('usageFromTranscript: a message with no model is priced at the default model; its own model still wins', () => {
+  const line = (id, model, u) => JSON.stringify({ type: 'assistant', message: { id, ...(model ? { model } : {}), usage: u } });
+  const text = [line('a', undefined, { input_tokens: 1e6 }), line('b', 'claude-opus-5-5', { output_tokens: 1e6 }), line('c', 'some-other-model', { input_tokens: 1e6 })].join('\n');
+  const none = usageFromTranscript(text);
+  assert.deepEqual([none.usd, none.unpricedMessages], [25, 2]);
+  const dflt = usageFromTranscript(text, { defaultModel: 'sonnet' });
+  assert.deepEqual([dflt.usd, dflt.unpricedMessages], [28, 1], 'a: $3 at sonnet; b: $25 at its own opus; c: an unknown model of its own stays unpriced');
+});
+
+test('P cost --from-transcript --model: transcript messages without model metadata are priced at --model; --usd still overrides', () => {
+  const s = scenario();
+  s.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'm', usage: { input_tokens: 1000000 } } })}\n${JSON.stringify({ message: { id: 'n', model: 'claude-opus-5-5', usage: { output_tokens: 1000000 } } })}\n`);
+  const r = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/t.jsonl', '--model', 'sonnet']);
+  assertExit(r, 0);
+  assert.equal(r.json.cost.total.usd, 28);
+  assert.deepEqual(r.json.warnings, []);
+  const u = costCli(scenario(), ['--phase', 'build', '--role', 'implementer', '--input', '10', '--usd', '0.5', '--model', 'sonnet']);
+  assert.equal(u.json.cost.total.usd, 0.5);
+  const s2 = scenario();
+  s2.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'm', usage: { input_tokens: 1000000 } } })}\n`);
+  assert.equal(costCli(s2, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/t.jsonl', '--usd', '0.5', '--model', 'sonnet']).json.cost.total.usd, 0.5);
+  const noModel = costCli(scenario(), ['--phase', 'build', '--role', 'implementer', '--input', '10']);
+  assert.match(noModel.json.warnings.join('\n'), /without --model or --usd/);
+});
