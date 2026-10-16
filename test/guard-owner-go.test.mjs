@@ -13,9 +13,11 @@ import { ownerGoWiring } from '../pipeline/hooks/lib/git-wiring.mjs';
 // #7 at head H7 only.
 const H7 = '7'.repeat(40);
 const H8 = '8'.repeat(40);
+// (the guard hands these the resolved directory: `D:\chat` on Windows)
+const posix = (dir) => String(dir).replace(/\\/g, '/').replace(/^[A-Za-z]:/, '');
 const ownerGo = {
-  mode: (dir) => (dir.startsWith('/chat') ? 'chat' : dir.startsWith('/broken') ? (() => { throw new Error('bad yml'); })() : 'none'),
-  mergeTemplates: (dir) => (dir.startsWith('/chat') ? [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: '--expect-head' }, { prefix: ['node', 'scripts/m.mjs'], shaFlag: null }] : []),
+  mode: (dir) => (posix(dir).startsWith('/chat') ? 'chat' : posix(dir).startsWith('/broken') ? (() => { throw new Error('bad yml'); })() : 'none'),
+  mergeTemplates: (dir) => (posix(dir).startsWith('/chat') ? [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: '--expect-head' }, { prefix: ['node', 'scripts/m.mjs'], shaFlag: null }] : []),
   approvedHead: (pr, head) => pr === 7 && head === H7,
 };
 const opts = (cwd) => ({ cwd, home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], ownerGo });
