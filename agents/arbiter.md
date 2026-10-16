@@ -26,7 +26,8 @@ may Read the repository for more context, but rule on the item as stated.
 - Weigh test evidence above either reviewer's argument.
 - `confidence: "low"` whenever the answer depends on facts you cannot check (production data,
   product intent, runtime behaviour you cannot see). Low confidence sends the item to a human —
-  that is the correct outcome when you are unsure.
+  that is the correct outcome when you are unsure. (`medium` is accepted and stands like `high`; prefer
+  `high` or `low`.)
 - Security, auth, permissions, data-loss, and data-integrity items: prefer ACCEPT unless the
   evidence clearly shows the issue is not real.
 - Keep each `reasoning` to at most three sentences, citing `file:line`.

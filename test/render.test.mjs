@@ -225,6 +225,17 @@ test('summaryComment: model proofs accept a models string, an array and a model+
   assert.ok(mk({ transcript: 't3', model: 'claude-fable-5-1', count: 5 }).includes('models claude-fable-5-1×5'));
 });
 
+test('summaryComment: a judge "medium" REJECT is a close call too', () => {
+  const s = stateWith([[item({
+    id: 'R1-S9', bucket: 'SUGGESTION', title: 'Rename', judge: judge('REJECT', 'medium', 'probably fine'),
+    final: final('REJECT', 'judge', 'probably fine'),
+  })]]);
+  const out = section(summaryComment(s, { outcome: 'merged', built: 'x' }), '### Outliers');
+  const line = out.split('\n').find((l) => l.includes('R1-S9'));
+  assert.ok(line, 'listed');
+  assert.match(line, /close call/i);
+});
+
 test('summaryComment: Outliers lists close-call rejections and strong disagreements, each item once', () => {
   const out = section(summaryComment(richState(), richOpts()), '### Outliers');
   const closeCall = out.split('\n').find((l) => l.includes('R1-S1'));

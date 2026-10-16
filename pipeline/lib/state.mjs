@@ -137,12 +137,17 @@ export function decodeFromComment(body) {
   }
 }
 
-export function addRound(state, { n, fromHead, toHead, contentHashAtToHead, items }) {
+// reviewBase / reviewBaseKind: what the round was actually diffed against (see git.mjs#effectiveReviewBase); baseOnly: the
+// round only merged the base branch in, so Codex did not run. Each is recorded only when given.
+export function addRound(state, { n, fromHead, toHead, contentHashAtToHead, items, reviewBase, reviewBaseKind, baseOnly }) {
   if (!Array.isArray(items)) throw new Error(`round ${n}: items must be an array`);
   if (state.rounds.some((r) => r.n === n)) throw new Error(`round ${n} already exists in the review state`);
   return {
     ...state,
-    rounds: [...state.rounds, { n, fromHead, toHead, contentHashAtToHead, items: structuredClone(items) }],
+    rounds: [...state.rounds, {
+      n, fromHead, toHead, ...(reviewBase === undefined ? {} : { reviewBase, reviewBaseKind }), contentHashAtToHead,
+      ...(baseOnly === true ? { baseOnly: true } : {}), items: structuredClone(items),
+    }],
   };
 }
 

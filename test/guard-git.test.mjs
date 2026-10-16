@@ -1612,7 +1612,7 @@ test('a line that passes an unsure variable to something that runs code or picks
     'for i in 1 2; do X=$i; done; node $X',
     'while true; do X=a; done; python $X',
     'case a in a) X=1;; esac; source $X',
-    '(X=a); cd $X',
+    '(X=a); cd $X; git push', // (PR A2 S7: an unsure cd leaves the directory unknown, as `cd "$(cmd)"` does; what needs it is refused: guard-a2-shell-s7.test.mjs)
     'echo $(X=a); sh $X',
     'X=a | cat; gh pr view $X',
     // taint: a value built from an unsure variable is unsure itself
@@ -1772,11 +1772,13 @@ test('state that becomes unknown mid-line stays enforced; control flow counts fr
     '/work/repo/step.sh': 'echo hi\n',
     '/other/step.sh': 'git push origin main\n',
   };
+  // (keys resolved: on Windows the guard asks for D:\other\step.sh)
+  const abs = Object.fromEntries(Object.entries(files).map(([k, v]) => [resolve(k), v]));
   const o = {
     byDir: { '/work/repo': 'agent/x', '/other': 'agent/y' },
     labelsByNum: {},
-    readText: (p) => files[p] ?? null,
-    pathExists: (p) => p in files,
+    readText: (p) => abs[resolve(p)] ?? null,
+    pathExists: (p) => resolve(p) in abs,
   };
   const denyCmds = [
     // a variable known when the line was first checked, unknown after `source`
@@ -1817,11 +1819,13 @@ test('a ( subshell hidden behind escaped quotes or a $\'…\' string is still fo
     '/work/repo/step.sh': 'echo hi\n',
     '/other/step.sh': 'git push origin main\n',
   };
+  // (keys resolved: on Windows the guard asks for D:\other\step.sh)
+  const abs = Object.fromEntries(Object.entries(files).map(([k, v]) => [resolve(k), v]));
   const o = {
     byDir: { '/work/repo': 'agent/x', '/other': 'agent/y' },
     labelsByNum: {},
-    readText: (p) => files[p] ?? null,
-    pathExists: (p) => p in files,
+    readText: (p) => abs[resolve(p)] ?? null,
+    pathExists: (p) => resolve(p) in abs,
     cwd: '/other',
   };
   const denyCmds = [
