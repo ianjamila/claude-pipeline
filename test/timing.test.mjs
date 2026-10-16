@@ -2,7 +2,7 @@
 // The "clock" here is fake (numbers computed from the size), so these tests cannot flake themselves.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { assertLinear, bestOf, cpuTime } from './helpers/timing.mjs';
+import { assertLinear, bestOf, cpuTime, cpuTimed } from './helpers/timing.mjs';
 
 const fake = (cost, n) => () => cost(n);
 
@@ -68,4 +68,13 @@ test('bestOf takes the minimum; cpuTime measures a callback in ms', () => {
   assert.equal(bestOf(3, () => xs.shift()), 2);
   const ms = cpuTime(() => { const end = Date.now() + 30; while (Date.now() < end) { /* burn CPU */ } });
   assert.ok(ms > 0);
+});
+
+test("cpuTimed returns fn's value; CPU burn counts, a sleep does not (so machine load cannot trip a cap)", () => {
+  assert.equal(cpuTimed(() => 42).r, 42);
+  const burn = cpuTimed(() => { const t0 = process.cpuUsage(); let x = 0; for (;;) { const d = process.cpuUsage(t0); if (d.user + d.system >= 50_000) return x; x++; } });
+  assert.ok(burn.ms >= 30, `50 ms of CPU read ${burn.ms} ms`);
+  const sleep = cpuTimed(() => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50));
+  assert.ok(sleep.ms < 25, `a 50 ms sleep read ${sleep.ms} ms of CPU`);
+  assert.ok(sleep.ms < burn.ms);
 });
