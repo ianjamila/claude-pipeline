@@ -1917,7 +1917,9 @@ function evalString(str, startDir, ctx, level) {
     }
     else {
       for (const inner of jobStartCommands(argv, ctx) ?? []) {
-        const v = evalString(inner, dir, ctx, level + 1);
+        // Why (#58 round 3): the job runs in THIS command's environment, so its prefix (`GH_REPO=o/chat … job start m -- gh pr merge 8`) names the
+        // merge's repository exactly as it would for the merge typed directly.
+        const v = withPrefixEnv(c, ctx, () => evalString(inner, dir, ctx, level + 1));
         if (v.decision === 'deny') { verdict = v; break; }
       }
       if (!verdict) verdict = repoMergeCommandVerdict(argv, dir, ctx); // (#58)

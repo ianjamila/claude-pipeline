@@ -80,6 +80,22 @@ test('#58 a job started through the pipeline runner is judged the same way', () 
   allow('node ~/.claude/pipeline/bin/pipeline.mjs job start m -- node ~/.claude/pipeline/bin/pipeline.mjs merge --pr 8');
 });
 
+test('#58 round 3: a GH_REPO on the job-start line (or in the hook\'s environment) reaches the merge inside the job', () => {
+  const job = 'node ~/.claude/pipeline/bin/pipeline.mjs job start m --';
+  // from a directory that is not a chat repo, GH_REPO names the repository: judged as a merge elsewhere (as for a direct `gh pr merge`)
+  assert.match(deny(`GH_REPO=o/chat ${job} gh pr merge 8 --squash --match-head-commit ${H8}`, '/other').reason, /#8 at head 888888888888/);
+  deny(`GH_REPO=o/chat ${job} gh pr merge 8 --squash`, '/other');
+  deny(`env GH_REPO=o/chat ${job} gh pr merge 8 --squash`, '/other');
+  // the owner's recorded "merge" for that PR and head still lets it through
+  allow(`GH_REPO=o/chat ${job} gh pr merge 7 --squash --match-head-commit ${H7}`, '/other');
+  // no GH_REPO / not a merge: untouched
+  allow(`${job} gh pr merge 8 --squash`, '/other');
+  allow(`GH_REPO=o/chat ${job} gh pr view 8`, '/other');
+  allow(`GH_REPO=o/chat ${job} node scripts/build.mjs`, '/other');
+  // the same through the process environment (what `pipeline job start` itself sees)
+  assert.equal(evaluateGitCommand(`${job} gh pr merge 8 --squash`, { ...opts('/other'), env: { GH_REPO: 'o/chat' } }).decision, 'deny');
+});
+
 test('#58 ownerGoWiring: the repository root\'s pipeline.yml in every version at hand; any one saying chat makes a chat repo', () => {
   const root = mkdtempSync(join(tmpdir(), 'owner-go-wiring-'));
   const repo = (name, yml) => {
