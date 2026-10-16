@@ -53,6 +53,11 @@ number, `R` a review round number, `<slug>` the branch slug.
    `awaiting-owner-merge`; an owner "merge" for that exact head in THIS session is the only way past it. Records,
    comments and labels never count as approval. Production on a resumed run is watched with
    `prod-watch --observe-only` (with `production.watch: workflow`, not at all: the workflow owns it); rollback stays with the original run or the owner.
+10. **Low-risk PRs may merge on their own** (owner ruling 2026-10-14). A normal run whose final gate passes with no
+    hard-stop hit (`ownerMerge` is `0`), no `needs-human` and no owner-ruled item merges through `P merge` without asking
+    the owner: that is intended, and a review must not flag it. Anything that hits a hard-stop, ends in `needs-human`,
+    or needs the owner's chat approval (`owner_approval: chat`, resumed runs) still waits for the owner's "merge" for the
+    exact head (the **Owner-merge approval** rule below). The ruling widens nothing else: invariants 1, 2 and 9 stand.
 
 ## Ending a run with a PR open
 
@@ -71,6 +76,13 @@ only for a stop that cannot go through summary. Two shapes, used by name below:
 `--action` is one short line in plain words ("Close the pause issue, then say resume"); `--cause` is a short slug
 (`final-gate:labels`, `codex:quota`, `verify-red`) that keeps a reworded retry from pushing twice. Stops before a PR
 exists (Step 0 preflight and labels ensure) just stop: the owner is at the keyboard, nothing is pushed.
+
+**Cost booking (best effort, never a reason to stop).** Once the PR exists, after each subagent dispatch or review call
+that reports its token use, book it: `P cost --pr N --phase <build|verify|review|gate|…> --role <implementer|judge|arbiter|verifier|controller>
+--input <n> --output <n> [--cache-read <n>] [--cache-write <n>] [--model sonnet|opus|haiku|fable | --usd <x>]` (an agent transcript
+can be passed instead, priced per message at list price: `--from-transcript <the agent's output file>`). Add `--retry` for each fix-and-reverify retry, and `--session <this session's id>` once per
+session so `P summary` can count the guard blocks. `P summary` shows the totals and the per-phase / per-role breakdown. A failed
+`P cost` is a warning only; skip it when no figures are available.
 
 ## Step 0 — opt-out, preflight
 
@@ -244,12 +256,12 @@ Details and every exit code: `reference/gates-and-exits.md`. First: `P checkpoin
 **Every `P merge` attempt (the first, a retry, one after an update-branch or a new head) first passes the
 **Owner-merge approval** rule below.** With `owner_approval: label` its `ownerMerge` count rule is a no-op, but its
 resumed-run rule is not: a run in Resume mode or on an adopted PR never calls `P merge` without the owner's "merge"
-(`P merge` itself refuses a resumed record, or one it cannot check, without `--owner-approved-head`). `P merge`,
+(`P merge` itself refuses a resumed record, or one it cannot check, without the owner's recorded "merge": see below). `P merge`,
 `P prod-watch --pr N` and `P update-branch` keep the record's in-flight marker themselves (no checkpoint needed around
 them). `P merge` posts the `prod-before` event before merging and refuses (`error: pre-merge`, nothing merged) when it
 cannot: see `reference/gates-and-exits.md`.
 
-1. `P job start merge -- node ~/.claude/pipeline/bin/pipeline.mjs merge --pr N` (a resumed run adds `--owner-approved-head <sha>`, see below) → `P job wait
+1. `P job start merge -- node ~/.claude/pipeline/bin/pipeline.mjs merge --pr N` (an owner-approved run adds `--owner-approved-head <sha> --owner-approved-items <ownerItems>`, see below) → `P job wait
    merge --run-id <runId> --timeout 540`; read `exitCode` and the JSON in `tail`:
    - 0 ⇒ merged. `mergeSha` is the merge commit; `null` (with a `warning`) means GitHub did not
      name it yet: still run prod-watch, with `--pr N` alone (2 below). Never skip prod-watch unless `production.watch` is `workflow` (2 below).
@@ -289,26 +301,39 @@ cannot: see `reference/gates-and-exits.md`.
 too. Without it, STOP: `chat` ⇒ `P checkpoint --pr N --step awaiting-owner-merge`, `P summary --pr N --outcome
 awaiting-owner-merge --built "…"`, and the reply's last two lines below (items may be none); `label` ⇒ add `needs-human`,
 `P comment --pr N --kind needs-human --reason "resumed run: the owner merges"`, `P summary --pr N --outcome needs-human
---built "…"`. When the owner says "merge" for that head, run `P merge --pr N --owner-approved-head <sha>` (the full 40-character
-head the gate covered; any other head is refused).
+--built "…"`. When the owner says "merge" for that head, run `P merge --pr N --owner-approved-head <sha> --owner-approved-items <ownerItems>`
+(the full 40-character head and the `ownerItems` of the gate that covered it; anything else is refused).
 
 Owner-merge items are hard-stop hits or test-integrity violations that `label` mode would block. Immediately before
 each `P merge`, take the `ownerMerge` count of the `P final-gate --pr N` that covers the head you are about to merge:
 - `0` ⇒ merge as usual.
 - `> 0` (also review items the owner ruled in chat with `P triage owner-ruling`: the gate's `review` detail lists their ids and the
   owner's quotes; show them in the stop comment) ⇒ merge ONLY if the owner said "merge" in THIS session for exactly this head sha and no owner-merge item beyond
-  the ones shown to them. A "merge" given for an earlier head never carries over: a new commit, an update-branch, a rebase or
+  the ones shown to them, with `P merge --pr N --owner-approved-head <full 40-character head> --owner-approved-items <ownerItems>` (`P merge` refuses an
+  `ownerMerge > 0` head without the owner's recorded "merge" for that head and item set). A "merge" given for an earlier head never carries over: a new commit, an update-branch, a rebase or
   a retry after a head change (Step 5.2, a `behind-base` return, a refreshed gate) needs a new stop. If there is no such
   approval, STOP:
-  1. Post one comment: `gh pr comment N --body "<each item: rule, file, one-line why; head <sha7>; the owner merges by saying \"merge\" in chat>"`.
-  2. `P checkpoint --pr N --step awaiting-owner-merge`, then `P summary --pr N --outcome awaiting-owner-merge --action "Check the listed items, then say \"merge\" for head <sha7>" --built "…"`, publish the agent-log line (Step 7), end the run with
-     outcome `awaiting-owner-merge`, keep the worktree. The reply's LAST two lines are exactly (7 = the first 7 characters of the head):
-     `Head <sha7>`
+  1. Post one comment: `gh pr comment N --body "<each item: rule, file, one-line why; head <sha12>; the owner merges by saying \"merge\" in chat>"`.
+  2. `P checkpoint --pr N --step awaiting-owner-merge`, then `P summary --pr N --outcome awaiting-owner-merge --action "Check the listed items, then say \"merge\" for head <sha12>" --built "…"`, publish the agent-log line (Step 7), end the run with
+     outcome `awaiting-owner-merge`, keep the worktree. The reply's LAST two lines are exactly (sha12 = the first 12 characters of
+     the head; ownerItems = the gate's `ownerItems`, `none` when there are no items):
+     `Head <sha12> · items <ownerItems>`
      `🔀 Ready to merge #N — say "merge"`
+     Several PRs at once: one `#N head <sha12> · items <ownerItems>` line per PR, then `🔀 Ready to merge #N, #M — say "merge"`.
 - When the owner then says "merge" and the head and items are unchanged, run Step 6 (final gate again if the base moved,
   `P merge`, prod-watch, rollback handling). If the head changed or new items appeared after they said "merge",
   show the updated items and the new head and stop again, with a new `awaiting-owner-merge` summary for that head.
 The owner's chat message is the approval; never add an approval label yourself (invariant 2).
+
+**How the "merge" is recorded (#58).** The owner-go hook (UserPromptSubmit) records a prompt the owner types that STARTS with
+"merge" ("merge", "merge #N", "merge <sha12>"; never "do not merge" or "merge?"), bound to the Head / items lines of the reply
+right before it, and says so in one context line (`[claude-pipeline owner-go] the owner's "merge" is recorded: #N head … items …`).
+`P merge` checks that record: the flags only name it. So: always end the request reply with the two lines above (the record binds
+only to the LAST reply: if anything else was said since, show the request again); never type, quote or simulate the owner's
+prompt, run the owner-go hook, or write `~/.claude/pipeline-state/owner-go` (the guards refuse it). No record ⇒ `P merge` says
+"no owner \"merge\" is recorded": show the request again and wait. In an `owner_approval: chat` repo a direct `gh pr merge`, the repo's
+merge command typed by hand, or auto-merge through the API is refused too unless the owner said "merge" for that PR and head in this
+session (and it pins the head: `--match-head-commit <full head>`); `P merge` is the normal way.
 
 ## Step 7 — summary
 
@@ -368,7 +393,7 @@ the owner's next move.
    Then `P worktrees keep <worktree dir name> --reason "ship run <worktree dir name>"` (the directory name of the worktree
    in use, e.g. `agent-<slug>`; the same id Step 7 passes to `unkeep --run`). `P preflight`. Then take the run over: `P checkpoint --pr N --step <enter> --resumed` (`followups` ⇒ `--step review`;
    for `adopt: true` step 5's checkpoint is the take-over and carries `--resumed`). The flag marks the record, so `P merge`
-   will not run without `--owner-approved-head` even after a later session picks the run up. The plan's `stop` is where the run ends, with its `P summary --outcome <stop>` (Step 5 / Owner-merge approval).
+   will not run without the owner's recorded "merge" (and `--owner-approved-head`) even after a later session picks the run up. The plan's `stop` is where the run ends, with its `P summary --outcome <stop>` (Step 5 / Owner-merge approval).
 4. `P state show --pr N`; read `source`. `quarantined` ⇒ tell the owner the local `.review/` went to `quarantinedTo`
    and the published state was restored. Exit 2 `no-state` is normal when Codex was down in round 1.
 5. `adopt: true` (no run record: the PR was not started by the pipeline) ⇒ Step 3.2 checks on the real diff, then
@@ -379,7 +404,7 @@ the owner's next move.
 7. After a clean review, `P review-complete --pr N` removes `awaiting-review` (exit 1 ⇒ the review is not valid for
    this head: run another round). Every route that reaches Step 5 ends at the plan's `stop` (invariant 9), with its
    `P summary --outcome awaiting-owner-merge` (chat) or `needs-human` (label), see **Owner-merge approval** "Resumed runs". Step 6
-   runs only after the owner says "merge" for the head the gate covered, and then with `--owner-approved-head <sha>`.
+   runs only after the owner says "merge" for the head the gate covered, and then with `--owner-approved-head <sha> --owner-approved-items <ownerItems>`.
 
 ## Promoting suggestions
 

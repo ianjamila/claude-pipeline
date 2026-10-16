@@ -70,13 +70,13 @@ pipeline checkpoint --pr N --step build|verify|pr|review|gate|awaiting-owner-mer
                     [--request-file F] [--tasks-file F] [--task-done ID] [--verify-report] [--round R] [--resumed] [--repo DIR]
   -> {ok, url, action, record, warnings}; exit 1 {error: unpushed | behind | diverged} (local HEAD is not the PR head on GitHub), 2 usage, 3 GitHub unavailable
   --request-file: the user's request, text, at most 2 KB · --tasks-file: JSON [{id, title, spec}] · --task-done ID: mark one task done (repeatable)
-  --resumed: this run was taken over by `ship resume` (or adopts a PR): stamps record.resumed {at, host, head}, which later checkpoints keep and which makes `P merge` require --owner-approved-head
+  --resumed: this run was taken over by `ship resume` (or adopts a PR): stamps record.resumed {at, host, head}, which later checkpoints keep and which makes `P merge` require the owner's recorded "merge" (--owner-approved-head + --owner-approved-items)
   --verify-report: copy {head, tree, mode, ok, failedStep} of the verify report, only when its head and tree are this HEAD's (otherwise a warning)
 ```
 
 Exit: 0 recorded · 1 `unpushed` (local HEAD is ahead of the PR head on GitHub: push first) / `behind` (the PR has newer commits: pull) / `diverged` (neither is an ancestor of the other, or the PR head is not fetched here: nothing is written) · 2 usage (unknown `--step`, a `--request-file` over 2 KB or not text, a bad `--tasks-file`, a record from a newer pipeline version) · 3 GitHub (`gh`) unavailable.
 
-`--resumed` is passed by a session that takes over a stalled run (or adopts a PR) as its first checkpoint: it stamps `record.resumed` `{at, host, head}`, which later checkpoints keep, and which makes `merge` demand `--owner-approved-head`. It sets the heartbeat (`os.hostname()` and the time) and keeps the summary sections already in the comment. `--verify-report` copies the report at `verify.report` only when its head and tree are this HEAD's; otherwise it is ignored and `warnings` says why. A step other than `ended` / `awaiting-owner-merge` clears a previous `outcome` (the run is going again).
+`--resumed` is passed by a session that takes over a stalled run (or adopts a PR) as its first checkpoint: it stamps `record.resumed` `{at, host, head}`, which later checkpoints keep, and which makes `merge` demand the owner's recorded "merge" for the exact head and owner-item set (`--owner-approved-head` + `--owner-approved-items`, checked against the owner-go records). It sets the heartbeat (`os.hostname()` and the time) and keeps the summary sections already in the comment. `--verify-report` copies the report at `verify.report` only when its head and tree are this HEAD's; otherwise it is ignored and `warnings` says why. A step other than `ended` / `awaiting-owner-merge` clears a previous `outcome` (the run is going again).
 
 ## codex-review
 
@@ -117,6 +117,24 @@ pipeline config [--repo DIR]   -> {ok, path, config}; exit 2 when missing or inv
 
 Exit: 0 valid · 2 missing or invalid (`errors` listed). A valid config may carry `warnings` (e.g. `ci.required_checks` omits the guard contexts `Test integrity` / `Hard-stop scan`, or `verify.stop_queue_wait_minutes` is above 0 and the Stop hook running `stop-verify` in `.claude/settings.json` has a `timeout` below 900 + minutes * 60 seconds). `verify.stop_queue_wait_minutes` (integer 0..30, default 0) is the time `verify.quick` may spend queued before it runs: the Stop hook's run limit is 840 s plus that many minutes, so set the hook's `timeout` to 900 + minutes * 60 (5 -> 1200).
 
+## cost
+
+book tokens / USD / retries of one agent call in the run record (shown by `P summary`).
+
+```
+pipeline cost --pr N --phase build|verify|pr|review|gate|merge|... --role implementer|judge|arbiter|verifier|controller|other
+              [--input N] [--output N] [--cache-read N] [--cache-write N] [--usd X | --model M] [--from-transcript FILE] [--retry] [--session ID]... [--repo DIR]
+  -> {ok, recorded, cost, warnings}; exit 2 usage (a negative or non-numeric amount), 3 GitHub unavailable
+  An unknown --role is booked as `other`, an unknown --phase as `other`. --from-transcript FILE: sum the message.usage of a Claude transcript (JSONL, at most 50 MB);
+  explicit --input/--output/--cache-* then add to it. --retry alone (no amounts) only counts a retry.
+  USD: --usd X as given; otherwise list price (opus / sonnet / haiku / fable) of each transcript message's own model (--model M prices the messages
+  that carry none) plus the explicit tokens at --model M. Tokens with no known model add no USD (a warning says so).
+```
+
+Exit: 0 booked · 1 the run record could not be written (`warnings` says why) · 2 usage · 3 GitHub (`gh`) unavailable.
+
+Cost attribution (issue #57): the run record gets a `cost` section {total, byPhase, byRole, retries, guardBlocks, sessions}, each of total / phase / role holding {input, output, cacheRead, cacheWrite, usd, calls}. Phases are the record steps; roles are implementer, judge, arbiter, verifier, controller and other (an unknown phase or role is booked as `other`). Records written before this have no `cost` section and everything that reads it treats that as "nothing booked". `P summary` shows the totals and both breakdowns in the status block and as `cost` in its JSON. `--session ID` (on `cost` or `summary`) names a Claude session of the run; `summary` counts the guard denies of those sessions in `<home>/.claude/pipeline-state/guard-log.jsonl` (override with `PIPELINE_GUARD_LOG_FILE`) into `guardBlocks` and keeps each session's own count in `guardBySession` ({sessionId: denies}, at most 20 sessions, `null` while the count is unknown; shown as `(s1 2 · s2 0)` after the status-line count). A missing log leaves the count unknown (shown as a dash), unreadable lines are skipped and reported in `warnings`. The numbers are display only: no command decides anything from them. The amounts are what the caller books (`--from-transcript` sums a transcript's own usage counts; the USD figure is whatever `--usd` says).
+
 ## deploy
 
 wait for a commit's deployment and print its URL.
@@ -151,6 +169,18 @@ pipeline followups create --round R [--repo DIR]
 ```
 
 Exit: 0 · 2 usage / no state · 3 GitHub (`gh`) unavailable.
+
+## guard-log
+
+count guard denies per day and reason code from the deny log.
+
+```
+pipeline guard-log [--days N] [--file PATH]   -> {ok, file, days:{YYYY-MM-DD:{total,byCode}}, total, perDay, skipped}; default 7 days
+```
+
+Exit: 0 (a missing log is an empty summary) · 2 usage.
+
+Both guard hooks append one line per deny to `~/.claude/pipeline-state/guard-log.jsonl`: `{ts, session, hook, reason_code, cmd_hash}`. The command and reason text are never stored (`cmd_hash` is the first 16 hex of the command's SHA-256). The file rotates to `guard-log.1.jsonl` past 5 MB; `PIPELINE_GUARD_LOG=0` turns the log off. `perDay` is the total divided by the days that have entries; lines that cannot be read are counted in `skipped`.
 
 ## hardstops
 
@@ -224,12 +254,14 @@ Exit: 0 · 3 GitHub (`gh`) unavailable.
 merge the PR if (and only if) the final gate passes again, live; waits for MERGED.
 
 ```
-pipeline merge --pr N [--owner-approved-head SHA] [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?, warnings?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment. While it runs the run record of the PR shows inFlight {kind: merge} and step merge; a prod-before event comment (the known-good deployment) is posted before the merge command, and when that post fails nothing is merged (error pre-merge); warnings lists a run record write that failed (never fatal). A run record marked resumed (`P checkpoint --resumed`: a run taken over by ship resume) refuses with error pre-merge unless --owner-approved-head names the full gate head: only the owner's "merge" for that head supplies it; so does a run record that cannot be checked (unreadable, invalid or unsupported: it may be a resumed one)
+pipeline merge --pr N [--owner-approved-head SHA --owner-approved-items DIGEST] [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?, warnings?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment. While it runs the run record of the PR shows inFlight {kind: merge} and step merge; a prod-before event comment (the known-good deployment) is posted before the merge command, and when that post fails nothing is merged (error pre-merge); warnings lists a run record write that failed (never fatal). A run record marked resumed (`P checkpoint --resumed`: a run taken over by ship resume) refuses with error pre-merge unless the owner approved it; so does a run record that cannot be checked (unreadable, invalid or unsupported: it may be a resumed one), and with owner_approval: chat a gate with ownerMerge > 0. Approved = --owner-approved-head names the full gate head, --owner-approved-items the gate's ownerItems, AND the owner-go hook recorded the owner's "merge" for exactly that PR, head and item set (the flags alone refuse); the live gate must still show those ownerItems
 ```
 
 Exit: 0 merged (a merge commit GitHub cannot name yet is `mergeSha: null` plus a `warning`; prod-watch resolves it) · 1 not merged / refused by the live gate or by the last pre-merge look at GitHub (run final-gate again; `behind-base`: the base moved, the branch was just updated on GitHub, so pull, re-verify and gate the new head) · 3 GitHub unavailable, or no known-good production deployment.
 
-Resumed runs: `merge` reads the PR's run record (the viewer's own summary comment) before anything irreversible; when it carries `resumed` (set by `checkpoint --resumed`, never cleared), `merge` refuses with exit 1 `{merged: false, error: pre-merge, reason: resumed run: the owner must approve this exact head (pass --owner-approved-head <sha>)}` unless `--owner-approved-head` is the full 40-character gate head. A record that cannot be checked fails closed: unreadable comments, or an `invalid` / `unsupported` (newer version) record, refuse the same way (`reason: <the run record could not be read (…) | the run record is invalid|unsupported>, so the resumed-run guard cannot be checked: the owner must approve this exact head (pass --owner-approved-head <sha>)`), because it may be a resumed one. No record (`absent`) or a `legacy` comment is an ordinary run.
+Resumed runs: `merge` reads the PR's run record (the viewer's own summary comment) before anything irreversible; when it carries `resumed` (set by `checkpoint --resumed`, never cleared), `merge` refuses with exit 1 `{merged: false, error: pre-merge, reason: resumed run: the owner must say "merge" for this exact head (then pass …)}` unless the owner approved it (below). A record that cannot be checked fails closed: unreadable comments, or an `invalid` / `unsupported` (newer version) record, refuse the same way (`reason: <the run record could not be read (…) | the run record is invalid|unsupported>, so the resumed-run guard cannot be checked: …`), because it may be a resumed one. No record (`absent`) or a `legacy` comment is an ordinary run.
+
+Owner approval (#58): with `owner_approval: chat` a gate with `ownerMerge > 0`, and any resumed or unchecked run, merges only with `--owner-approved-head <full gate head> --owner-approved-items <the gate's ownerItems>` AND a record of the owner-go hook (`~/.claude/pipeline-state/owner-go/<session>.jsonl` under the account's home, never `$HOME`; written only when the owner types a prompt starting with "merge" right after a reply that showed `Head <sha12> · items <ownerItems>` and the 🔀 line; valid 24 h) for exactly that PR, head and item set. The flags alone refuse (the reason then ends with `(no owner "merge" is recorded for #N head … items …)`). The live gate must still show the approved `ownerItems`, else `reason: the owner items changed since the owner said "merge" …`. `final-gate` reports `ownerItems` (a 12-character digest of the owner items, `none` without any).
 
 Run record: right after `.review/prod-before.json` is written, and before the merge command, `merge` sets the record's `inFlight` `{kind: merge, host, startedAt, maxMinutes: 2 × merge.wait_minutes + 15}` and `step: merge`, and posts, after the last look at GitHub and still before the merge command, a `prod-before` event (always a NEW comment: repo, environment, pr, `headBeforeMerge` = the approved PR head, `deployment {id, sha, url}`) when a known-good deployment was recorded (no `production` configured: no event). On every exit `inFlight` is cleared: merged → `step: prod-watch` and `mergeSha`; not merged → `step: gate`. The event fails CLOSED: it is the only cross-machine copy of the rollback target, so when it cannot be posted nothing is merged (exit 1, `error: pre-merge`, `reason: could not record the rollback target on the PR (prod-before event)`; `inFlight` is cleared). The run record itself is display: a failed record write is listed in `warnings` and never fails the merge.
 
@@ -406,7 +438,7 @@ Exit: 0 · 2 no state / usage (`outcome` is 0 whether or not `clean`).
 upsert the PR summary comment and print the agent-log line.
 
 ```
-pipeline summary --pr N --outcome O [--built TEXT] [--action TEXT] [--cause CODE] [--repo DIR]   -> {ok, url, agentLogLine, pendingLogLine?, notify}   (pendingLogLine: only for --outcome merged, the same line with outcome "merged — prod smoke pending")
+pipeline summary --pr N --outcome O [--built TEXT] [--action TEXT] [--cause CODE] [--session ID]... [--repo DIR]   -> {ok, url, agentLogLine, pendingLogLine?, cost, notify}   (pendingLogLine: only for --outcome merged, the same line with outcome "merged — prod smoke pending")
 ```
 
 Exit: 0 · 2 usage / no state · 3 GitHub (`gh`) unavailable.

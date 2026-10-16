@@ -23,6 +23,7 @@ Into `~/.claude` (or `$CLAUDE_CONFIG_DIR`):
 | hook `guard-git` (matcher `Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks pushes/force-pushes to `main`, admin merges, protection edits, approval-label changes, whether typed in a shell, a `Monitor` command, a script file or an MCP tool call |
 | hook `guard-files` (matcher `Edit\|Write\|MultiEdit\|NotebookEdit\|Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks agents editing the pipeline's own files and settings — **installed last**, after the proofs |
 | hook `session-version` (SessionStart) | tells you at the top of a session when the installed pipeline is stale, edited, half-installed or older than a repo's vendored copy; silent when all is well (see [Staying current](#staying-current)) |
+| hook `owner-go` (UserPromptSubmit) | records your chat "merge" (a prompt that starts with "merge") against the PR, head and owner items the reply before it showed, so `P merge` and the guards can tell your approval from the agent's word (`owner_approval: chat`, resumed runs); never blocks or changes a prompt |
 | settings allow entries | `Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)` so pipeline calls don't prompt |
 
 A manifest (`~/.claude/pipeline/INSTALLED.json`: version, git SHA, file hashes) lets the installer
@@ -31,7 +32,7 @@ refuse to overwrite skills or agents it didn't install, and lets `--check` repor
 - **Fail-closed guards.** The two guard hooks are started through a small loader, not directly. If
   the hook file cannot be loaded (deleted, half-written, a syntax error) the loader blocks the
   tool call with exit 2 instead of letting Claude Code treat the crash as "allowed". The
-  `session-version` status hook is the one exception: it never blocks anything.
+  `session-version` status hook and the `owner-go` recorder are the exceptions: they never block anything.
 - **Complete-install marker.** The installer writes the manifest with `"complete": false` first and
   flips it to `true` as its very last step, so an install that was interrupted (or whose later
   steps failed) is never mistaken for a good one. `--check`, `pipeline version` and the session
@@ -189,6 +190,7 @@ Hard-stop PRs still go through the full review loop first, so you always get a r
 | Pause switch | | | ✅ can't close the pause issue | ✅ |
 | Production smoke + rollback | | | | ✅ prod-watch |
 | Agents can't edit their own rules | ✅ protection edits need admin | | ✅ guard-files / guard-git | |
+| Owner items (`owner_approval: chat`) and resumed runs merge only on your chat "merge" for that head and item set | | | ✅ owner-go records (guard-files protects them); guard-git refuses a direct merge in a chat repo without one | ✅ `P merge` checks the record |
 
 The label-based approvals rely on the local hook because the agents use your GitHub account.
 
@@ -225,6 +227,19 @@ head you did not review (the receipt names the head the event carried).
   understood; ship pushes `git push -u origin agent/<slug>`), `unset CLAUDECODE`, and setting
   `PIPELINE_GH`, `PIPELINE_CODEX`, `PIPELINE_VERCEL`, `PIPELINE_TEST_MODE` or `PIPELINE_UPDATE_REMOTE` on a `pipeline.mjs` command;
   the installed CLI ignores those five seam variables altogether (they exist for the test suite).
+- **Your chat "merge" is checked locally.** The owner-go hook records only prompts you type (Claude Code never runs it for
+  the model or a subagent), and `P merge` and guard-git trust only those records. But the agent runs as your OS user and with
+  your GitHub token: a program the guards cannot see into (a script that builds the record path at run time, a test that
+  calls the recorder's library, `curl` with your token, a local edit of the refs or `pipeline.yml` the guard reads) can still
+  forge or skip it, and chat-mode CI passes owner items. It stops mistakes and casual workarounds, not a determined agent. The
+  server-side backstop is a second GitHub identity plus a ruleset (issue #65). A direct `gh pr merge` in a chat repo must pin
+  the head (`--match-head-commit`, or the head flag of the repo's merge command) the owner said "merge" for in this session. When
+  the repo's merge command is a package script (`npm run merge -- {pr} --expect-head {sha}`), only that exact shape typed by hand is approvable: the
+  template's own words, then `--`, the PR and the pin, with nothing between the script name and `--` and no manager option before it. Any other way
+  of running the script (another manager or spelling, `run-script`, a wrapper such as `npx npm@11`, `--prefix` / `-C` / `--cwd` / workspace options,
+  words before `--`) is refused in a chat repo; the refusal names the exact form. Merge through `P merge --pr N` otherwise. The chat
+  mode is read from the repository the command runs in: a nested or separate clone whose own `pipeline.yml` is not chat is
+  not caught (a protected registry of chat repos is the planned fix).
 - **Branch protection needs GitHub Pro** for private repos. Without it a repo runs in `gate`
   mode (skills and CLI only) and preflight says so.
 - **Local verify, lean CI.** The full verify runs on your machine; CI keeps the repo's existing

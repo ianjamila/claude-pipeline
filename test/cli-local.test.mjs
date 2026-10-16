@@ -22,8 +22,8 @@ const fixtures = join(here, 'fixtures');
 const ENV = { ...process.env };
 delete ENV.PIPELINE_ADMIN;
 
-function cli(cwd, args) {
-  const r = spawnSync(process.execPath, [bin, ...args], { cwd, encoding: 'utf8', env: ENV });
+function cli(cwd, args, env = ENV) {
+  const r = spawnSync(process.execPath, [bin, ...args], { cwd, encoding: 'utf8', env });
   let json = null;
   try { json = r.stdout ? JSON.parse(r.stdout) : null; } catch { /* leave null: the assertion on json will say so */ }
   return { code: r.status, json, stdout: r.stdout, stderr: r.stderr };
@@ -529,6 +529,20 @@ test('job: -h and --help after "--" belong to the command; before it they ask fo
   const help = cli(repo.dir, ['job', 'start', '--help']);
   assertExit(help, 0);
   assert.match(help.json.usage, /job start/);
+});
+
+test('job: GH_REPO in the runner\'s environment names the target of a merge started through it (#58 round 3)', (t) => {
+  const repo = project();
+  t.after(() => repo.cleanup());
+  // the repo itself is not an owner_approval: chat repo, so only GH_REPO makes this a merge elsewhere (as for a direct `gh pr merge`)
+  const refused = cli(repo.dir, ['job', 'start', 'm', '--', 'gh', 'pr', 'merge', '8', '--squash'], { ...ENV, GH_REPO: 'o/chat' });
+  assertExit(refused, 1, refused.stdout);
+  assert.equal(refused.json.refused, true);
+  assert.match(refused.json.reason, /GH_REPO|-R, a PR URL/);
+  assert.equal(existsSync(join(repo.dir, '.review', 'jobs', 'm')), false);
+  // GH_REPO does not stop a command that is no merge
+  const started = cli(repo.dir, ['job', 'start', 'ok', '--', 'node', '-e', '0'], { ...ENV, GH_REPO: 'o/chat' });
+  assertExit(started, 0, started.stdout);
 });
 
 test('job: a command the git guard denies is refused and no job directory is created', (t) => {

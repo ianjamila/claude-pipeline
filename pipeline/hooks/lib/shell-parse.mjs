@@ -407,6 +407,8 @@ const WRAPPERS = {
   yarn: runnerAt(['exec', 'dlx']),
   command: unwrapCommand,
   builtin: plain(),
+  noglob: plain(), // (zsh precommand modifiers: `noglob read k` runs read; #56 Fable review of 2edea61)
+  nocorrect: plain(),
   exec: plain('a'),
   nohup: plain(),
   setsid: plain(),
@@ -460,19 +462,27 @@ function shellInvocation(argv) {
   let i = 1;
   let sawC = false;
   let sawS = false;
+  // Why (#56): `bash -n f.sh` only reads f.sh for syntax errors and runs none of it (noexec). Every shell here has -n: bash/sh/dash/ksh/zsh/yash/csh/fish
+  // ("read commands but do not execute them"). Only a plain `-n` in a cluster of short options turns it on; `+n` turns it off again, bash ignores it in an
+  // interactive shell (`-i`), and any long option or -o / +o name we do not read (zsh `-o exec`, `--no-exec`) leaves it off.
+  let noexec = false;
+  let execUnsure = false;
   while (i < argv.length) {
     const t = argv[i];
     if (t === '--') { i++; break; }
     if (t.length < 2 || (t[0] !== '-' && t[0] !== '+') || (t[0] === '+' && !/^\+[A-Za-z]/.test(t))) break; // (`+(f|fa).sh` is a pattern operand, not an option)
-    if (t.startsWith('--')) { i += t === '--rcfile' || t === '--init-file' ? 2 : 1; continue; }
+    if (t.startsWith('--')) { execUnsure = true; i += t === '--rcfile' || t === '--init-file' ? 2 : 1; continue; }
     if (t[0] === '-' && t.includes('c')) sawC = true;
     if (t[0] === '-' && t.includes('s')) sawS = true;
+    if (/n/.test(t.slice(1))) noexec = t[0] === '-';
+    if (/i/.test(t.slice(1))) execUnsure = true;
+    if (/[oO]$/.test(t) && /exec/i.test(argv[i + 1] ?? '')) execUnsure = true;
     i += /[oO]$/.test(t) ? 2 : 1; // -o / -O take an option name
   }
   const before = argv.slice(1, i).some(hasExpansion);
   if (sawC) return i < argv.length ? { kind: 'script', text: argv[i], amb: before } : { kind: 'none' };
   if (sawS) return { kind: 'stdin', amb: before };
-  if (i < argv.length) return STDIN_FILES.has(argv[i]) ? { kind: 'stdin', amb: before } : { kind: 'file', text: argv[i], amb: argv.slice(1, i + 1).some(hasExpansion) };
+  if (i < argv.length) return STDIN_FILES.has(argv[i]) ? { kind: 'stdin', amb: before } : { kind: 'file', text: argv[i], amb: argv.slice(1, i + 1).some(hasExpansion), parseOnly: noexec && !execUnsure && !before };
   return { kind: 'stdin', amb: argv.slice(1).some(hasExpansion) }; // `bash -$X` may be `bash -x f.sh`
 }
 
@@ -571,7 +581,157 @@ const BASH_WORD = /^\$(?:BASH|\{BASH(?::?-(?:bash|sh))?\})$/;
 const BASH_DEFAULT = /^\$\{BASH:?-bash\}$/; // (the only spelling that names bash whether the shell is bash (it sets BASH) or zsh / sh (BASH unset))
 const BASH_REF = /\$BASH(?![A-Za-z0-9_])|\$\{BASH(?::?-(?:bash|sh))?\}/g;
 // commands that bind a name given as an operand (`read N`, `declare N=v`, `printf -v N`, `let`, zsh `vared` ...): a name that is not a plain word could be BASH
-const BINDERS = /(?<![\w.$/-])(?:read|declare|typeset|local|export|readonly|mapfile|readarray|getopts|unset|let|vared|zparseopts|printf|print|strftime|zstyle|sysread|zstat|getln|integer|float|select|set|autoload|compgen)(?![\w-])([^\n;&|<>]*)/g;
+const BINDERS = /(?<![\w.$/-])(?:read|declare|typeset|local|export|readonly|mapfile|readarray|getopts|unset|let|vared|zparseopts|printf|print|strftime|zstyle|sysread|zstat|getln|integer|float|select|set|autoload|compgen|private|zformat|zregexparse|ztcp|zsocket|zpty|zselect|zsystem|sysopen|syswrite|pcre_match|zgetattr|zlistattr|zcurses|compadd|zle|coproc)(?![\w-])([^\n;&|<>]*)/g; // (the module builtins: see ZSH_NAME_BINDERS)
+// Why (#56, Codex recheck of d925d42): zsh builtins that bind names their operands give in shapes the guards do not read (`zparseopts -a B`, `b:=B` specs,
+// `vared B`, `strftime -s B`, `zstat -A B`, `integer B=5`): the git and files guards treat one on the line as binding any name. (`print -v B` is read like printf -v.)
+// (and the module builtins that bind a name or set REPLY / MATCH: zformat -f / -a, zregexparse, ztcp / zsocket / zpty (REPLY), zselect -A, zsystem flock -f,
+// sysopen -u, syswrite -c, pcre_match -v / -a (MATCH), zgetattr, zlistattr, zcurses, compadd -A / -O, zle -U / widgets)
+export const ZSH_NAME_BINDERS = new Set(['vared', 'zparseopts', 'strftime', 'zstyle', 'sysread', 'zstat', 'getln', 'integer', 'float', 'private', 'zformat', 'zregexparse',
+  'ztcp', 'zsocket', 'zpty', 'zselect', 'zsystem', 'sysopen', 'syswrite', 'pcre_match', 'zgetattr', 'zlistattr', 'zcurses', 'compadd', 'zle']);
+// The text with what the shell never expands blanked out: single-quoted strings and comments (double-quoted text expands, so it stays). Null for `$'…'`
+// or an unterminated quote (the caller keeps its answer).
+export function withoutLiteralText(s, { dqData = false } = {}) {
+  // Why (#56 replay): `for n in 1 2; do echo "$n $(gh pr view $n --jq '.x')"; done` lost its readings because a quote inside a $( … ) inside double quotes
+  // gave up. A $( … ) starts a fresh quoting context (its single quotes are quotes again), so each context is a frame on a stack: top, a double-quoted
+  // string, a $( … ), a backtick. Still given up (null): a bare ( or $(( inside a $( … ) (a case pattern or arithmetic would end it early), a quote or ( inside
+  // backticks, $'…', and anything left open at the end.
+  // Also given up: a `case` inside a $( … ) -- its patterns end in a bare `)` that this scanner would take for the end of the $( … ), and every quote after
+  // it would then be read in the wrong context (security review of 61296d8).
+  // `dqData` (#56 replay: `for f in a.ts b.ts; do node -e "const f='$f'; fs.readFileSync(f)"; done` read `f=` and `(f` in the program as shell text): inside
+  // double quotes only `$name`, `${…}`, `$( … )` and backticks are the shell's, so any other word there is blanked too. A `${…}` is kept as written (`${f:=x}`
+  // assigns); one holding a quote, a `$`, a backtick, a brace or a backslash ends the blanking for the rest of the text (kept, as without dqData). `$[ … ]`
+  // (arithmetic, it can assign) gives up.
+  let out = '';
+  const stack = ['top'];
+  const cur = () => stack[stack.length - 1];
+  for (let i = 0; i < s.length;) {
+    const ch = s[i];
+    const fr = cur();
+    if (ch === '\\') { out += s.slice(i, i + 2); i += 2; continue; }
+    if (fr === 'tick') {
+      if (ch === '`') stack.pop();
+      else if (ch === "'" || ch === '"' || ch === '(') return null;
+      out += ch; i++; continue;
+    }
+    if (fr === 'dq') {
+      if (ch === '"') stack.pop();
+      else if (ch === '$' && s[i + 1] === '(') { stack.push('sub'); out += '$('; i += 2; continue; }
+      else if (ch === '`') stack.push('tick');
+      else if (dqData) {
+        if (ch === '$' && s[i + 1] === '[') return null;
+        if (ch === '$' && s[i + 1] === '{') {
+          const j = s.indexOf('}', i + 2);
+          if (j < 0 || /["'`$\\{]/.test(s.slice(i + 2, j))) dqData = false;
+          else { out += s.slice(i, j + 1); i = j + 1; continue; }
+        } else if (ch === '$' && /[A-Za-z0-9_]/.test(s[i + 1] ?? '')) {
+          const w = /^\$[A-Za-z0-9_]+/.exec(s.slice(i))[0];
+          out += w; i += w.length; continue;
+        } else if (/[A-Za-z0-9_]/.test(ch)) {
+          const w = /^[A-Za-z0-9_]+/.exec(s.slice(i))[0];
+          out += ' '.repeat(w.length); i += w.length; continue;
+        }
+      }
+      out += ch; i++; continue;
+    }
+    // top or sub: the same quoting rules
+    if (ch === '$' && s[i + 1] === "'") return null;
+    if (ch === "'") {
+      const j = s.indexOf("'", i + 1);
+      if (j < 0) return null;
+      out += ' '.repeat(j + 1 - i); i = j + 1; continue;
+    }
+    if (ch === '"') { stack.push('dq'); out += ch; i++; continue; }
+    if (fr === 'sub') {
+      if (ch === '$' && s[i + 1] === '(') { if (s[i + 2] === '(') return null; stack.push('sub'); out += '$('; i += 2; continue; }
+      if (ch === '(') return null;
+      if (ch === 'c' && s.startsWith('case', i) && !/[A-Za-z0-9_]/.test(s[i + 4] ?? '') && (i === 0 || !/[A-Za-z0-9_]/.test(s[i - 1]))) return null;
+      if (ch === ')') { stack.pop(); out += ch; i++; continue; }
+      if (ch === '`') return null;
+    }
+    if (ch === '#' && (i === 0 || /[\s;&|()]/.test(s[i - 1]))) {
+      const j = s.indexOf('\n', i);
+      const e = j < 0 ? s.length : j;
+      out += ' '.repeat(e - i); i = e; continue;
+    }
+    out += ch; i++;
+  }
+  return stack.length === 1 ? out : null;
+}
+export const INDIRECT_EXPANSION = /\$\{(?:!|\((?!%\)[:}])[^)]*\)|[A-Za-z_]\w*::=)/; // (fail closed: `${!…}`, zsh `${N::=…}` and every zsh flag expansion but the prompt-only `${(%):…}` with no name (the script-directory idiom `${${(%):-%x}:A:h}`); P, e, A, … can assign)
+// Is there an indirect expansion in the text the shell expands? (#56 replay of 96848c2: a JavaScript template `${(err.stderr || …)}` in a quoted heredoc
+// body or a single-quoted `node -e '…'` program is no expansion, and refusing it cost ~110 lines in 21 days.) Quoted heredoc bodies and single-quoted
+// text are blanked; unquoted bodies and double-quoted text expand, so they stay. True (fail closed) where the text cannot be told: `$'…'`, an unterminated
+// quote, heredoc spans that cannot be placed.
+export function indirectExpansionOnLine(str, cmds) {
+  if (!INDIRECT_EXPANSION.test(str)) return false;
+  let t = String(str);
+  if (/<</.test(t)) {
+    const spans = cmds?.heredocSpans;
+    if (!Array.isArray(spans)) return true;
+    for (const [a, b, quoted] of spans) {
+      if (!(a >= 0 && a <= b && b <= t.length)) return true;
+      // (an unquoted body expands, and its quotes are text: `'${(P)N::=x}'` there is a real expansion, and a lone `'` must not shift the scan of the lines
+      // after it. So it is judged as written, then blanked like a quoted one; security review of e9ec717)
+      if (!quoted && INDIRECT_EXPANSION.test(t.slice(a, b).replace(SAFE_FLAG_EXPANSION, '${'))) return true;
+      t = t.slice(0, a) + t.slice(a, b).replace(/[^\n]/g, ' ') + t.slice(b);
+    }
+  }
+  // Single-quoted text is blanked by a scanner of its own: withoutLiteralText also blanks comments, and it reads the `#` of `${(#)X}` as one. Nothing else
+  // is taken out, so text left in only refuses more. A backslash keeps the next character from the shell, in or out of double quotes (`\${(e as X)}` is
+  // text; `\\${…}` still expands). `$'…'` and an unterminated single quote: true.
+  let u = '';
+  let q = null;
+  for (let i = 0; i < t.length; i++) {
+    const ch = t[i];
+    if (q === "'") { if (ch === "'") q = null; u += ch === '\n' ? '\n' : ' '; continue; }
+    if (ch === '\\') { u += '  '; i++; continue; }
+    // (a $( … ) or backtick inside double quotes starts a new quoting context, whose quotes this scanner does not follow: `"$(echo '"')${(P)N::=x}"; echo "'"`
+    // would lose its place and blank the real expansion. Then nothing is blanked: the whole text is judged; security review of f79370b)
+    if (q === '"' && (ch === '`' || (ch === '$' && t[i + 1] === '('))) return INDIRECT_EXPANSION.test(t.replace(SAFE_FLAG_EXPANSION, '${'));
+    if (q === '"') { if (ch === '"') q = null; u += ch; continue; }
+    // (a comment's quotes are no quotes: `B=x # it's` … `# '` would blank the lines between. Where a comment may start, nothing is blanked)
+    if (ch === '#' && (i === 0 || /[\s;&|()]/.test(t[i - 1]))) return INDIRECT_EXPANSION.test(t.replace(SAFE_FLAG_EXPANSION, '${'));
+    if (ch === "'") { if (t[i - 1] === '$') return true; q = "'"; u += ' '; continue; }
+    if (ch === '"') q = '"';
+    u += ch;
+  }
+  return q === "'" || INDIRECT_EXPANSION.test(u.replace(SAFE_FLAG_EXPANSION, '${'));
+}
+// Why (#56 replay of 96848c2): `for x in ${(f)f}`, `FILES=("${(@f)$(git diff --name-only)}")`, `${(@u)FILES}` are common zsh and cannot assign: flags
+// that only split, join, sort, unique, quote or count (no P, e, A, g, ~, ^, =, # (arithmetic: it can assign)), with a plain delimiter, followed by a NAME and `}` or by a command
+// substitution (it runs in a subshell). Anything else after the flags (`${(f)F::=x}`, `${(f)F:=x}`, `${(s:$x:)…}`) stays an indirect expansion.
+const SAFE_FLAG_EXPANSION = /\$\{\((?:[@fFuUoOinkvaqQzLcwWt0]|[sj]:[^:$(){}'"`\\]*:)+\)(?=[A-Za-z_]\w*\}|"?\$\()/g;
+// zsh `=~` and the (#b) / (#m) glob flags set these, bash `=~` sets BASH_REMATCH
+const MATCH_NAMES = ['MATCH', 'match', 'MBEGIN', 'MEND', 'mbegin', 'mend', 'BASH_REMATCH'];
+// The names a command sets without being given them: `read` REPLY (zsh `read -A`: reply), `select` REPLY, `getopts` OPTARG / OPTIND, `mapfile` MAPFILE,
+// `[[ … =~ … ]]` and a (#…) pattern flag the match names. (Why, #56 Codex recheck of d925d42: `for REPLY in 5; do read <<< 7; gh issue close $REPLY; done`
+// closed issue 7 while the readings judged 5.)
+export function implicitBindsOf(c) {
+  const nm = c.argv?.length ? commandName(c.argv[0]) : '';
+  const out = nm === 'read' ? ['REPLY', 'reply'] : nm === 'select' ? ['REPLY'] : nm === 'getopts' ? ['OPTARG', 'OPTIND'] : nm === 'mapfile' || nm === 'readarray' ? ['MAPFILE'] : [];
+  if (nm === '[[' || [...(c.argv ?? []), ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')].some((w) => String(w).includes('(#'))) out.push(...MATCH_NAMES);
+  // (#56, Fable review of 2edea61) also: an option that carries its name (`printf -vk`, `wait -pk`; `wait -p k`), an array element (`k[0]=7`: `$k` is
+  // element 0), a named file descriptor (`exec {k}>f`: k is the fd number), `coproc k { …; }` (k, k_PID; COPROC without a name), and the names the
+  // shell sets by itself (`$_` after every command, RANDOM, SECONDS, …: a value the line gives them is not what a later use reads)
+  const argv = c.argv ?? [];
+  if (nm === 'printf' || nm === 'print' || nm === 'wait') {
+    for (const [i, a] of argv.entries()) {
+      const m = /^-[A-Za-z]*?[vp]([A-Za-z_]\w*)$/.exec(a);
+      if (m) out.push(m[1]);
+      else if (/^-[A-Za-z]*[vp]$/.test(a) && /^[A-Za-z_]\w*$/.test(argv[i + 1] ?? '')) out.push(argv[i + 1]);
+    }
+  }
+  const el = /^([A-Za-z_]\w*)\[[^\]]*\]\+?=/.exec(argv[0] ?? '');
+  if (el) out.push(el[1]);
+  for (const a of argv) { const fd = /^\{([A-Za-z_]\w*)\}$/.exec(a); if (fd) out.push(fd[1]); }
+  if (/^\s*coproc\b/.test(String(c.raw ?? ''))) {
+    out.push('COPROC', 'COPROC_PID');
+    if (/^[A-Za-z_]\w*$/.test(argv[0] ?? '')) out.push(argv[0], `${argv[0]}_PID`);
+  }
+  if (argv.length) out.push(...SHELL_SET_NAMES);
+  return out;
+}
+export const SHELL_SET_NAMES = ['_', 'RANDOM', 'SRANDOM', 'SECONDS', 'LINENO', 'EPOCHSECONDS', 'EPOCHREALTIME', 'BASHPID', 'HISTCMD', 'status', 'pipestatus', 'PIPESTATUS', 'ERRNO'];
 // Is BASH ever bound by the text? Fail closed: every mention that is not a plain reference counts (also with quotes taken out: `read B""ASH`), a binder
 // whose operand name is not a plain word (`declare "${n}SH=x"`, `read -r "$v"`, `export $n=x`, `read BA{SH,}`), `(( $n = 1 ))`, eval, source / `.` (the sourced
 // file may bind it), an ANSI-C string with an escape. A mention inside a quote or comment only makes this stricter.
@@ -610,6 +770,7 @@ function scriptFileOfArgv(argv) {
   const name = base(argv[0]);
   if (SHELLS.has(name)) {
     const r = shellInvocation(argv);
+    if (r.kind === 'file' && r.parseOnly && !r.amb && !isProcSub(r.text) && !FD_PATH.test(r.text)) return null; // (`bash -n f.sh`: checks the syntax, runs nothing)
     // a `<(...)` operand is script text, not a file, unless a word before it expands: then it is one more candidate word
     if (r.kind === 'file' && (r.amb || !isProcSub(r.text))) return r.amb ? { kind: 'shell', file: r.text, ambiguous: true, words: argv.slice(1) } : { kind: 'shell', file: r.text };
     return r.amb && (r.kind === 'stdin' || r.kind === 'script') ? { kind: 'shell', file: undefined, ambiguous: true, words: argv.slice(1) } : null;
@@ -1758,6 +1919,7 @@ class Parser {
     let pos = this.i;
     for (const h of this.hd) {
       const lines = [];
+      const bodyAt = pos;
       let found = false;
       while (pos < s.length) {
         const eol = s.indexOf('\n', pos);
@@ -1770,8 +1932,14 @@ class Parser {
         lines.push(line);
       }
       // Why: `<<-` strips the leading tabs of the body before the command reads it (`bash <<-'EOF'` + `\tgit pu\` + `\tsh origin main`: one push the tabs hid)
-      const text = (h.strip ? lines.map((l) => l.replace(/^\t+/, '')) : lines).join('\n');
+      const raw = lines.join('\n');
+      const text = h.strip ? lines.map((l) => l.replace(/^\t+/, '')).join('\n') : raw;
       h.seg.heredocs.push({ text, quoted: h.quoted, lines: lines.length });
+      // where the body sits in the line (see heredocSpans in simpleCommands): only for a body this parser read out of the line itself and that ended at
+      // its terminator; one read out of another text (backticks, bash -c, a body's own substitution) or that ran to the end is not located.
+      // The span covers the raw body as written (tabs included), not the stripped text
+      if (found && this.src === this.ctx.rootSrc) this.ctx.hdSpans.push([bodyAt, bodyAt + raw.length, h.quoted]);
+      else this.ctx.hdForeign = true;
       h.seg.pending--;
       if (h.seg.muted) continue;
       const grp = this.ctx.grp;
@@ -2726,7 +2894,7 @@ class Parser {
 }
 
 function newCtx(maxDepth, expired, bashState) {
-  return { out: [], expired, maxDepth, truncated: false, dynamic: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, ctlBroken: false, fns: new Set(), defs: { redef: false }, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState };
+  return { out: [], expired, maxDepth, truncated: false, dynamic: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, ctlBroken: false, fns: new Set(), defs: { redef: false }, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
 }
 
 // The text with every comment the lexer skips blanked out (newlines kept), from a lexing pass that interprets nothing (muted); null when that pass did not
@@ -2753,6 +2921,7 @@ export function simpleCommands(str, opts) {
   let parser = null;
   try {
     parser = new Parser(ctx, String(str ?? ''));
+    ctx.rootSrc = parser.src;
     // Why: every text of an evaluation (script, startup file, file the line wrote, heredoc body, nested frame) is parsed apart, but another text may bind BASH for the shell that runs this
     // one. The first text that can bind it ends the rewrite for every text after it; a text already rewritten before that is stale, and the policy reruns the evaluation (bashState.bound)
     // (a word in a comment is no binding: when the text looks like it binds BASH, it is checked again without the comments the lexer sees; any doubt keeps the first answer)
@@ -2771,6 +2940,8 @@ export function simpleCommands(str, opts) {
   Object.defineProperty(ctx.out, 'fns', { value: ctx.fns, enumerable: false });
   // ctlBroken: the loop / branch / function marks (ctl) are not to be trusted (an unmatched closer, a construct finished out of order): callers read the line as before
   Object.defineProperty(ctx.out, 'ctlBroken', { value: ctx.ctlBroken, enumerable: false });
+  // heredocSpans: [start, end, quoted] of every heredoc body in the text (quoted: its delimiter was quoted, so nothing in it expands), or null when one cannot be located (read out of other text, no terminator, a parse that gave up)
+  Object.defineProperty(ctx.out, 'heredocSpans', { value: ctx.hdForeign || ctx.truncated ? null : ctx.hdSpans, enumerable: false });
   return ctx.out;
 }
 
