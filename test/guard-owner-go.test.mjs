@@ -235,3 +235,23 @@ test('#58 a package-manager wrapper or an unreadable option never hides the merg
   assert.equal(evaluateGitCommand(`false && cd /x; npm run merge -- 8 --expect-head ${H8}`, o).decision, 'deny');
   assert.equal(evaluateGitCommand('false && cd /x; npm run build', o).decision, 'allow');
 });
+
+// Codex recheck of round 2 (#58 round 3): the config names ONE package manager; the same script through another one is still the merge command
+test('#58 round 3: the merge script through yarn / pnpm / npm is the merge command whichever package manager the template names', () => {
+  const only = (prefix) => ({ ...opts('/chat'), ownerGo: { ...ownerGo, mergeTemplates: () => [{ prefix, shaFlag: '--expect-head' }] } });
+  const npmOnly = only(['npm', 'run', 'merge', '--']);
+  const d = (cmd, o) => evaluateGitCommand(cmd, o);
+  for (const cmd of [`yarn run merge 8 --expect-head ${H8}`, `yarn merge 8 --expect-head ${H8}`, `pnpm run merge 8 --expect-head ${H8}`, `pnpm merge 8 --expect-head ${H8}`,
+    `pnpm run merge -- 8 --expect-head ${H8}`, `yarn --silent merge 8 --expect-head ${H8}`, `npm run-script merge -- 8 --expect-head ${H8}`, `yarn merge 7`, `pnpm merge 7 --no-update`,
+    `yarn --mystery val run merge 8 --expect-head ${H8}`]) assert.equal(d(cmd, npmOnly).decision, 'deny', cmd);
+  assert.match(d(`yarn merge 8 --expect-head ${H8}`, npmOnly).reason, /#8 at head 888888888888/);
+  assert.match(d('pnpm merge 7', npmOnly).reason, /must pin the head/);
+  for (const cmd of [`yarn run merge 7 --expect-head ${H7}`, `yarn merge 7 --expect-head=${H7}`, `pnpm run merge 7 --expect-head ${H7}`, `pnpm merge 7 --expect-head ${H7}`, `pnpm merge -- 7 --expect-head ${H7}`,
+    'yarn build', 'pnpm build', 'yarn run merge-report', 'pnpm run-script merge-report', 'yarn install', 'pnpm test']) assert.equal(d(cmd, npmOnly).decision, 'allow', `${cmd}: ${d(cmd, npmOnly).reason}`);
+  // and the other way round: a yarn / pnpm template, the call through npm
+  for (const prefix of [['yarn', 'merge'], ['pnpm', 'run', 'merge', '--']]) {
+    const o = only(prefix);
+    assert.equal(d(`npm run merge -- 8 --expect-head ${H8}`, o).decision, 'deny', prefix.join(' '));
+    assert.equal(d(`npm run merge -- 7 --expect-head ${H7}`, o).decision, 'allow', prefix.join(' '));
+  }
+});

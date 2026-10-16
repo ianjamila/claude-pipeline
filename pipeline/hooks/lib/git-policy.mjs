@@ -897,7 +897,28 @@ function canonPm(words) {
   return [words[0], ...words.slice(i)];
 }
 // The script a template runs through a package manager ('' when it is not one).
-const pmScriptOf = (prefix) => { const c = canonPm(prefix); return c.length > 2 && c[1] === 'run' && PM_RUN_ALIASES[baseName(c[0])] ? c[2] : ''; };
+// (canonPm output of a package manager's script call: `<pm> run <script> …`)
+const isPmRun = (c) => c.length > 2 && c[1] === 'run' && Object.hasOwn(PM_RUN_ALIASES, baseName(c[0]));
+const pmScriptOf = (prefix) => { const c = canonPm(prefix); return isPmRun(c) ? c[2] : ''; };
+// The words the script itself receives. Why (#58 round 3): npm keeps every option written before `--` for itself (`npm run merge 7 --expect-head=H`
+// hands the script only `7`), so for npm only the words AFTER `--` count; yarn and pnpm forward the words after the script name.
+const pmForwarded = (c) => c.slice(3).filter((w) => w !== '--');
+// Subcommands that cannot run a repo script (read-only queries, installs): `npm view merge version` names the word `merge` and is no merge.
+// (an unknown subcommand, `run`, `exec`, `x`, `dlx`, `explore`, `test`, `start` … stay judged as before)
+const PM_NO_SCRIPT = new Set(['view', 'v', 'info', 'show', 'ls', 'll', 'la', 'list', 'outdated', 'help', 'help-search', 'search', 's', 'find', 'why', 'explain', 'config', 'whoami', 'bin', 'root', 'prefix', 'ping', 'audit', 'fund', 'docs', 'home', 'repo', 'bugs',
+  'install', 'i', 'add', 'remove', 'rm', 'uninstall', 'un', 'update', 'up', 'upgrade']);
+const PM_BOOL_OPTS = new Set(['--silent', '-s', '--quiet', '-q', '--no-color', '--json', '--no-progress', '--no-audit', '--no-fund', '-g', '--global']);
+// (only options it knows may precede the subcommand: an unknown one could take the next word as its value and leave the real subcommand behind it)
+function pmCannotRunScript(words) {
+  if (!Object.hasOwn(PM_RUN_ALIASES, baseName(words[0] ?? ''))) return false;
+  let i = 1;
+  while (i < words.length && words[i].startsWith('-') && words[i] !== '--') {
+    if (PM_VALUE_OPTS.has(words[i])) i += 2;
+    else if (PM_BOOL_OPTS.has(words[i])) i += 1;
+    else return false;
+  }
+  return PM_NO_SCRIPT.has(String(words[i] ?? '').toLowerCase());
+}
 
 // The repo's own merge command (pipeline.yml merge.command, e.g. `npm run merge -- {pr} --expect-head {sha}`) typed by hand. A `gh …`
 // command is judged as gh.
@@ -914,24 +935,28 @@ function repoMergeCommandVerdict(argv, dir, ctx) {
   for (const { prefix, shaFlag } of templates) {
     if (!Array.isArray(prefix) || !prefix.length || baseName(prefix[0]) === 'gh') continue;
     const words = canonPm(raw); // (package-manager spellings, normalised)
-    const plain = words.filter((w) => w !== '--');
-    const p = canonPm(prefix).filter((w) => w !== '--');
-    if (plain.length < p.length || baseName(plain[0]) !== baseName(p[0]) || !p.slice(1).every((w, i) => plain[i + 1] === w)) {
+    const canonP = canonPm(prefix);
+    // (Why #58 round 3: the same script through npm, yarn or pnpm is the same merge command, whichever one the template names)
+    const viaPm = isPmRun(words) && isPmRun(canonP) && words[2] === canonP[2];
+    const plain = viaPm ? pmForwarded(words) : words.filter((w) => w !== '--');
+    const p = viaPm ? canonP.slice(3).filter((w) => w !== '--') : canonP.filter((w) => w !== '--');
+    if (viaPm ? !p.every((w, i) => plain[i] === w) : plain.length < p.length || baseName(plain[0]) !== baseName(p[0]) || !p.slice(1).every((w, i) => plain[i + 1] === w)) {
       // An option the matcher does not know may take a value and hide the subcommand: if this is the same package manager and the
       // script's name still stands as a word before `--`, it could run the merge script, so it is judged as the merge command (no PR, no head).
       // (also when a word before `--` is built at run time, and when a wrapper — npm exec / npx / dlx … — could run the same package manager)
       const script = pmScriptOf(prefix);
       const end = raw.indexOf('--');
       const before = raw.slice(1, end < 0 ? undefined : end);
-      const same = baseName(raw[0]) === baseName(prefix[0]);
-      const wrapped = (same || PM_WRAPPERS.has(baseName(raw[0]))) && raw.some((w) => PM_WRAPPERS.has(String(w).toLowerCase())) && raw.some((w) => baseName(w) === baseName(prefix[0]));
+      // (any package manager: yarn / pnpm / npm run the same script name)
+      const same = Object.hasOwn(PM_RUN_ALIASES, baseName(raw[0])) && Object.hasOwn(PM_RUN_ALIASES, baseName(prefix[0]));
+      const wrapped = (same || PM_WRAPPERS.has(baseName(raw[0]))) && raw.some((w) => PM_WRAPPERS.has(String(w).toLowerCase())) && raw.some((w) => Object.hasOwn(PM_RUN_ALIASES, baseName(w)));
       if (script && ((same && (before.includes(script) || before.some((w) => DYNAMIC.test(w)))) || (wrapped && raw.includes(script)))) return directMergeVerdict(null, null, dir, ctx, `\`${prefix.join(' ')}\``, false, shaFlag);
       continue;
     }
     let head = null;
     if (shaFlag) {
       // (exactly one head flag: with two, which one the script honours is unknown)
-      const vals = words.flatMap((w, j) => (w === shaFlag ? [words[j + 1]] : w.startsWith(`${shaFlag}=`) ? [w.slice(shaFlag.length + 1)] : []));
+      const vals = (viaPm ? plain : words).flatMap((w, j, all) => (w === shaFlag ? [all[j + 1]] : w.startsWith(`${shaFlag}=`) ? [w.slice(shaFlag.length + 1)] : []));
       head = vals.length === 1 ? vals[0] ?? null : null;
     }
     return directMergeVerdict(prNumberOf(plain[p.length]), head, dir, ctx, `\`${prefix.join(' ')}\``, false, shaFlag);
