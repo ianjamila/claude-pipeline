@@ -46,3 +46,4 @@ full record.
 - 2026-10-16 · #55 · feat(config): verify.stop_queue_wait_minutes — Stop-hook queue allowance from config · risk high · rounds 3 · arbiter 1 · merged
 - 2026-10-16 · #69 · tools: keep the guard replay / probe / mutation tools (tools/guard-replay) · risk high · rounds 5 · arbiter 0 · awaiting-owner-merge
 - 2026-10-16 · #69 · tools: keep the guard replay / probe / mutation tools (tools/guard-replay) · risk high · rounds 5 · arbiter 0 · merged
+- 2026-10-16 · #77 · fix(worktrees): prune never loses skip-worktree edits or concurrent archives (#62, #63) · risk high · rounds 2 · arbiter 0 · awaiting-owner-merge
