@@ -1600,7 +1600,7 @@ const ARITH_ASSIGNED_DYN = new RegExp(String.raw`\$(?:\{[^}]{0,64}\}|\w+)\s*(?:\
 const ARITH_COMPARE = new Set(['-eq', '-ne', '-lt', '-le', '-gt', '-ge']);
 const ARITH_APPENDED = /(?<![\w$.\/-])([A-Za-z_]\w*)\+=/g;
 const ARITH_WORD = /(?:"[^"]*"|'[^']*'|\\.|[^\s"'\\])+/g;
-function arithBodies(s) {
+function arithBodies(s, g) {
   // $(( … )), (( … )) and $[ … ] in ONE pass (a scan per opener is quadratic on 150,000 of them): the text inside any of them, an unmatched opener taking the rest of the text
   const out = [];
   const stack = [];
@@ -1634,18 +1634,20 @@ function arithBodies(s) {
     prev = w;
   }
   // a subscript: `[` right after a name character or `}` (`${a[…]}`, `a[…]=x`, `$x[…]`), to its closing `]` (nested ones counted; at most 200 characters)
-  for (let i = s.indexOf('['); i >= 0; i = s.indexOf('[', i + 1)) {
-    if (i === 0 || !/[\w}]/.test(s[i - 1])) continue;
+  for (let i = g.indexOf('['); i >= 0; i = g.indexOf('[', i + 1)) {
+    if (i === 0 || !/[\w}]/.test(g[i - 1])) continue;
     let depth = 0;
     let j = i + 1;
-    for (; j < s.length && j < i + 200; j++) {
-      if (s[j] === '[') depth++;
-      else if (s[j] === ']') { if (depth === 0) break; depth--; }
+    for (; j < g.length && j < i + 200; j++) {
+      if (g[j] === '[') depth++;
+      else if (g[j] === ']') { if (depth === 0) break; depth--; }
     }
-    out.push(s.slice(i + 1, j));
+    out.push(g.slice(i + 1, j));
   }
+  // (zsh reads a bare `$x[n=3]` as a subscript also inside double quotes, where `g` has blanked the letters: the text as written)
+  for (const m of s.matchAll(/\$[A-Za-z_]\w*\[([^\]\n]{0,200})\]/g)) out.push(m[1]);
   // a substring: `${x:off:len}`, `${a[@]:off}`, `${x: off : len}` (the `:-` `:=` `:+` `:?` operators are no offset)
-  for (const m of s.matchAll(/\$\{[A-Za-z_]\w*(?:\[[^\]\n]{0,64}\])?:(?![-=+?])([^}\n]{0,200})\}/g)) out.push(m[1]);
+  for (const m of g.matchAll(/\$\{[A-Za-z_]\w*(?:\[[^\]\n]{0,64}\])?:(?![-=+?])([^}\n]{0,200})\}/g)) out.push(m[1]);
   return out;
 }
 const quotedBodiesBlank = (s, cmds) => {
@@ -1659,6 +1661,21 @@ const quotedBodiesBlank = (s, cmds) => {
   }
   return t;
 };
+// The text the subscript, substring and append scans read: what the shell expands. Single-quoted strings, comments and (in double quotes) every word that is no expansion are blanked, so a
+// program text (`node -e "…a[i]=…; s+=…"`) is no assignment; a heredoc body is cut to its expansions (${…}, $[ ], $(( ))). Null from the scanner (`$'…'`, an open quote): the text as written.
+const expansionText = (s, cmds) => {
+  let main = s;
+  const live = [];
+  const spans = /<</.test(s) ? cmds?.heredocSpans : null;
+  if (Array.isArray(spans)) {
+    for (const [a, b, quoted] of [...spans].sort((x, y) => x[0] - y[0])) {
+      if (!(a >= 0 && a <= b && b <= main.length)) return s;
+      if (!quoted) for (const m of main.slice(a, b).matchAll(/\$\{[^}\n]*\}|\$\[[^\]\n]*\]|\$\(\([^\n]*?\)\)/g)) live.push(m[0]);
+      main = main.slice(0, a) + main.slice(a, b).replace(/[^\n]/g, ' ') + main.slice(b);
+    }
+  }
+  return (withoutLiteralText(main, { dqData: true }) ?? main) + '\n' + live.join('\n');
+};
 const ARITH_CACHE = new WeakMap();
 export function arithAssignedNames(raw, cmds = null) {
   const text = String(raw);
@@ -1668,11 +1685,12 @@ export function arithAssignedNames(raw, cmds = null) {
   let dynamic = false;
   if (/\(\(|\$\[|\[|\+=|\$\{\w+:|(?<![\w.$/-])let\s/.test(text)) {
     const s = quotedBodiesBlank(text, cmds);
-    for (const body of arithBodies(s)) {
+    const g = expansionText(s, cmds);
+    for (const body of arithBodies(s, g)) {
       for (const m of body.matchAll(ARITH_ASSIGNED)) names.add(m[1] ?? m[2] ?? m[3] ?? m[4]);
       if (ARITH_ASSIGNED_DYN.test(body)) dynamic = true;
     }
-    for (const m of s.matchAll(ARITH_APPENDED)) names.add(m[1]);
+    for (const m of g.matchAll(ARITH_APPENDED)) names.add(m[1]);
   }
   const res = { names, dynamic };
   if (cmds) ARITH_CACHE.set(cmds, { text, res });

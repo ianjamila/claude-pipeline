@@ -262,3 +262,13 @@ test('loop words alone (names assigned once) also share the allowance across nes
   assert.match(r.reason, /too many readings/, r.reason);
   assert.ok(Date.now() - t0 < 3000, `took ${Date.now() - t0} ms`);
 });
+
+test('program text in quotes (node -e, awk, sed) is no assignment: += and a[i]= in it change nothing', () => {
+  for (const c of [
+    `n=2; node -e "let s=''; s+='x'; const a=[1]; a[0]=2; console.log(s)"; bash s$n.sh`,
+    `n=2; node -e 'let s=""; s+="x"; const a=[1]; a[0]=2; console.log(s)'; bash s$n.sh`,
+    `n=2; awk 'BEGIN { x+=1; a[1]=2 }'; bash s$n.sh`,
+    `n=2; node <<'EOF'\nlet s=''; s+='x'; a[n=7]=1\nEOF\nbash s$n.sh`,
+    `n=2; sed -e 's/a[b]=c/x+=y/' f; bash s$n.sh`,
+  ]) allow(c);
+});
