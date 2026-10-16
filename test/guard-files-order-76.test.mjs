@@ -126,3 +126,9 @@ deny(`A=1; A=2; B=1; B=2; C=1; C=2; D=1; D=2; E=1; E=2; F=settings.json; printf 
 deny('A=1; A=2; B=1; B=2; C=1; C=2; D=1; D=2; E=1; E=2; S=s7.sh; bash $S; S=s1.sh', SCRIPTS);
 // a subscript too long to be told from a read is still taken for an assignment
 deny(`n=1; : $(( n[${'a'.repeat(80)}] = 7 )); bash s$n.sh`, SCRIPTS);
+
+// the body ends at its own closer: parentheses inside it are balanced, and an arithmetic with no closer takes the rest of the text
+allow('n=1; : $(( (1+2) * 3 )); n=2; bash s$n.sh', SCRIPTS);
+allow('n=1; : $(( (1+2) * 3 )); : $((4)); n=2; bash s$n.sh', SCRIPTS);
+deny('n=1; : $(( n += 6 ; bash s$n.sh', SCRIPTS);
+deny('n=1; echo "$[ n += 6 "; bash s$n.sh', SCRIPTS);

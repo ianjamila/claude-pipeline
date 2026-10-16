@@ -1196,8 +1196,7 @@ function arithBodies(raw) {
   let buf = '';
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
-    const two = s.startsWith('$((', i) ? 3 : s.startsWith('((', i) ? 2 : 0;
-    if (two) { stack.push({ close: ')', need: 2, depth: 0 }); i += two - 1; continue; }
+    if (s.startsWith('((', i)) { stack.push({ close: ')', need: 2, depth: 0 }); i += 1; continue; } // (also the `((` of `$((`)
     if (s.startsWith('$[', i)) { stack.push({ close: ']', need: 1, depth: 0 }); i += 1; continue; }
     if (!stack.length) continue;
     const top = stack[stack.length - 1];
