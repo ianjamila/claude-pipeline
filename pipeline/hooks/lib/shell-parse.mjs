@@ -590,9 +590,9 @@ export const ZSH_NAME_BINDERS = new Set(['vared', 'zparseopts', 'strftime', 'zst
   'ztcp', 'zsocket', 'zpty', 'zselect', 'zsystem', 'sysopen', 'syswrite', 'pcre_match', 'zgetattr', 'zlistattr', 'zcurses', 'compadd', 'zle']);
 // #81: the end (just after the closing `))`) of the `$((` arithmetic that starts at i, or -1 when it cannot be told from a subshell inside a command
 // substitution (`$((cmd) )`, `$((a); b)`) or holds a quote, backtick or backslash (those would need the frames).
-const arithEnd = (s, i) => {
+const arithEnd = (s, i, skip = 3) => {
   let depth = 0;
-  for (let j = i + 3; j < s.length; j++) {
+  for (let j = i + skip; j < s.length; j++) {
     const c = s[j];
     if (c === '"' || c === "'" || c === '`' || c === '\\') return -1;
     if (c === '(') depth++;
@@ -600,6 +600,8 @@ const arithEnd = (s, i) => {
   }
   return -1;
 };
+// (does the `$((` / `((` at i close as `))` within 2000 characters? A longer one reads as a subshell: its redirects count. Bounded, so a text of many openers stays linear.)
+const closesAsArith = (s, i, skip) => arithEnd(s.slice(i, i + 2000 + skip), 0, skip) >= 0;
 // The text with what the shell never expands blanked out: single-quoted strings and comments (double-quoted text expands, so it stays). Null for `$'…'`
 // or an unterminated quote (the caller keeps its answer).
 export function withoutLiteralText(s, { dqData = false } = {}) {
@@ -1948,7 +1950,8 @@ class Parser {
     const start = this.i;
     const mark = this.log.length;
     this.i += 2;
-    this.inGroup(() => this.nestParse(depth + 1, { stopAtParen: true, noRedir: s[start] === '$' && s[this.i] === '(' }));
+    // (`$((` is arithmetic, where `a > b` compares, only when it closes as `))`; else it is a subshell in a command substitution -- `$((cmd > f) )` RUNS cmd and writes f, in bash and zsh -- and its redirects count)
+    this.inGroup(() => this.nestParse(depth + 1, { stopAtParen: true, noRedir: s[start] === '$' && s[this.i] === '(' && closesAsArith(s, start, 3) }));
     this.subAcc.push(...this.log.slice(mark));
     return s.slice(start, this.i);
   }
@@ -2445,7 +2448,7 @@ class Parser {
           if (body) this.ctx.ctl.fn++;
           if (cond) this.ctx.ctl.cond++;
           try {
-            this.inGroup(() => this.nestParse(depth, { stopAtParen: true, noRedir: noRedir || s[this.i] === '(' })); // ((...)) is arithmetic
+            this.inGroup(() => this.nestParse(depth, { stopAtParen: true, noRedir: noRedir || (s[this.i] === '(' && closesAsArith(s, this.i - 1, 2)) })); // ((...)) is arithmetic when it closes as `))`; `((cmd) )` is nested subshells, redirects and all
           } finally { if (body) this.ctx.ctl.fn--; if (cond) this.ctx.ctl.cond--; }
           fnPending = false;
           if (head?.length) { for (const name of head) ctx.fns.add(name); fnPending = true; }
