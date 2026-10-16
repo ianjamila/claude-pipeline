@@ -115,10 +115,10 @@ const guardLogPath = (ctx) => ctx.guardLogFile ?? ctx.env?.PIPELINE_GUARD_LOG_FI
 // session known, or no log file (the guards have not written one yet): nothing is counted and the old count stays.
 function guardBlocksFor(record, extraSessions, ctx) {
   const sessions = [...new Set([...(record?.cost?.sessions ?? []), ...extraSessions])];
-  if (!sessions.length) return { blocks: undefined, warnings: [] };
+  if (!sessions.length) return { blocks: undefined, bySession: undefined, warnings: [] };
   const log = readGuardLog(guardLogPath(ctx), sessions);
-  if (!log.present) return { blocks: undefined, warnings: [] };
-  return { blocks: log.blocks, warnings: log.skipped ? [`guard log: ${log.skipped} unreadable line(s) skipped`] : [] };
+  if (!log.present) return { blocks: undefined, bySession: undefined, warnings: [] };
+  return { blocks: log.blocks, bySession: log.bySession, warnings: log.skipped ? [`guard log: ${log.skipped} unreadable line(s) skipped`] : [] };
 }
 
 export const run = guarded(async (argv, ctx) => {
@@ -168,7 +168,7 @@ export const run = guarded(async (argv, ctx) => {
       const guard = guardBlocksFor(existing.status === 'ok' ? existing.record : null, values.session ?? [], ctx);
       const { record, warnings } = recordForOutcome(existing.status === 'ok' ? existing.record : null, {
         repo: gh.repo().slug, pr, branch: view.headRefName, baseRef: view.baseRefName, head: view.headRefOid,
-        outcome, detail, agentLogLine, host: hostname(), now: Date.now(), sessions: values.session, guardBlocks: guard.blocks,
+        outcome, detail, agentLogLine, host: hostname(), now: Date.now(), sessions: values.session, guardBlocks: guard.blocks, guardBySession: guard.bySession,
       });
       warnings.push(...guard.warnings);
       const posted = writeSummaryComment(gh, pr, { record, sections, existing });

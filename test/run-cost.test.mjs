@@ -9,7 +9,7 @@ import { cli, scenario, ghEntries, PR } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
 import {
-  PHASES, ROLES, addCostEntry, listPriceUsd, modelFamily, addRetries, addSessions, costLines, emptyCost, readGuardLog, setGuardBlocks, usageFromTranscript,
+  PHASES, ROLES, addCostEntry, listPriceUsd, modelFamily, addRetries, addSessions, costLines, costReport, emptyCost, readGuardLog, setGuardBlocks, usageFromTranscript,
 } from '../pipeline/lib/run-cost.mjs';
 import {
   STEPS, applyCheckpoint, decodeRecord, emptyRecord, encodeRecord, recordForOutcome, renderStatusBlock,
@@ -320,4 +320,39 @@ test('P cost --from-transcript --model: transcript messages without model metada
   assert.equal(costCli(s2, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/t.jsonl', '--usd', '0.5', '--model', 'sonnet']).json.cost.total.usd, 0.5);
   const noModel = costCli(scenario(), ['--phase', 'build', '--role', 'implementer', '--input', '10']);
   assert.match(noModel.json.warnings.join('\n'), /without --model or --usd/);
+});
+
+// Codex review (#57) finding 7: the per-session guard counts are kept, not just their total
+test('guard blocks by session: stored with the total, replaced on the next count, shown in the lines and the report, null on old records', () => {
+  assert.equal(emptyCost().guardBySession ?? null, null);
+  const c = setGuardBlocks(addRetries(null), 3, { s1: 2, s2: 1 });
+  assert.deepEqual(c.guardBySession, { s1: 2, s2: 1 });
+  assert.deepEqual(setGuardBlocks(c, 4, { s1: 4 }).guardBySession, { s1: 4 }, 'the new count replaces the old');
+  assert.equal(setGuardBlocks(c, 3).guardBySession.s1, 2, 'a total alone leaves the per-session counts');
+  assert.throws(() => setGuardBlocks(c, 1, { 'has space': 1 }), /plain id/);
+  assert.throws(() => setGuardBlocks(c, 1, { s1: -1 }), /non-negative/);
+  assert.match(costLines(c).join('\n'), /\*\*Guard blocks:\*\* 3 \(s1 2 · s2 1\)/);
+  assert.deepEqual(costReport(c).guardBySession, { s1: 2, s2: 1 });
+  assert.equal(costReport(addRetries(null)).guardBySession, null);
+  const r = applyCheckpoint(rec(), { cost: { sessions: ['s1', 's2'], guardBlocks: 3, guardBySession: { s1: 2, s2: 1 } } }, { host: 'h', now: NOW });
+  assert.deepEqual(r.cost.guardBySession, { s1: 2, s2: 1 });
+  const kept = recordForOutcome(r, { repo: 'acme/widgets', pr: PR, branch: 'agent/feature', baseRef: 'main', outcome: 'merged', host: 'h', now: NOW });
+  assert.deepEqual(kept.record.cost.guardBySession, { s1: 2, s2: 1 });
+  const next = recordForOutcome(r, { repo: 'acme/widgets', pr: PR, branch: 'agent/feature', baseRef: 'main', outcome: 'merged', host: 'h', now: NOW, guardBlocks: 1, guardBySession: { s1: 1, s2: 0 } });
+  assert.deepEqual(next.record.cost.guardBySession, { s1: 1, s2: 0 });
+});
+
+test('P summary: the per-session guard denies are recorded and reported', () => {
+  const s = scenario();
+  const file = join(tmp(), 'guard-log.jsonl');
+  writeFileSync(file, [logLine('s1'), logLine('s1'), logLine('s2'), logLine('stranger')].join('\n') + '\n');
+  withComment(s, existing(withCost({ entry: entry(), sessions: ['s1', 's3'] })));
+  const r = summary(s, ['--session', 's2'], { PIPELINE_GUARD_LOG_FILE: file });
+  assertExit(r, 0);
+  assert.deepEqual(r.json.cost.guardBySession, { s1: 2, s3: 0, s2: 1 });
+  assert.deepEqual(written(s).cost.guardBySession, { s1: 2, s3: 0, s2: 1 });
+  assert.match(JSON.parse(s.fake.calls().filter((c) => c.argv.includes('PATCH')).at(-1).stdin).body, /Guard blocks:\*\* 3 \(s1 2 · s2 1 · s3 0\)/);
+  const absent = scenario();
+  withComment(absent, existing(withCost({ entry: entry(), sessions: ['s1'] })));
+  assert.equal(summary(absent, [], { PIPELINE_GUARD_LOG_FILE: join(tmp(), 'nope.jsonl') }).json.cost.guardBySession, null);
 });

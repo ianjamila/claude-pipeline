@@ -74,9 +74,17 @@ export function addRetries(cost, n = 1) {
   return next;
 }
 
-export function setGuardBlocks(cost, n) {
+// `bySession` ({sessionId: denies}, at most MAX_SESSIONS of them, the last ones kept) replaces the per-session counts; left out, they stay.
+export function setGuardBlocks(cost, n, bySession) {
   const next = structuredClone(isPlainObject(cost) ? { ...emptyCost(), ...cost } : emptyCost());
   next.guardBlocks = n === null ? null : amount(n, 'guard blocks', { integer: true });
+  if (n === null) next.guardBySession = null;
+  else if (bySession !== undefined) {
+    next.guardBySession = Object.fromEntries(Object.entries(bySession ?? {}).slice(-MAX_SESSIONS).map(([id, v]) => {
+      if (!SESSION_RE.test(id)) throw new Error(`session id ${JSON.stringify(id.slice(0, 20))}… is not a plain id`);
+      return [id, amount(v, 'guard blocks', { integer: true })];
+    }));
+  }
   return next;
 }
 
@@ -120,6 +128,7 @@ export function readGuardLog(file, sessions) {
     }
     if (wanted.has(e.session)) bySession[e.session] = (bySession[e.session] ?? 0) + 1;
   }
+  for (const id of wanted) bySession[id] ??= 0; // (a session with no denies is listed with 0)
   return { present: true, blocks: Object.values(bySession).reduce((a, b) => a + b, 0), bySession, skipped };
 }
 
@@ -195,7 +204,8 @@ export function costLines(cost) {
   const hasGuard = Number.isInteger(cost.guardBlocks);
   if (!total.calls && !retries && !hasGuard) return [];
   const out = [`- **Cost:** ${usd(total.usd)} · ${tokens(total)} · ${num(total.calls)} call${total.calls === 1 ? '' : 's'}`];
-  out.push(`- **Retries:** ${num(retries)} · **Guard blocks:** ${hasGuard ? num(cost.guardBlocks) : '—'}`);
+  const per = hasGuard && isPlainObject(cost.guardBySession) ? Object.entries(cost.guardBySession) : [];
+  out.push(`- **Retries:** ${num(retries)} · **Guard blocks:** ${hasGuard ? num(cost.guardBlocks) : '—'}${per.length ? ` (${per.map(([id, n]) => `${id} ${num(n)}`).join(' · ')})` : ''}`);
   const rows = (label, order, map) => {
     const keys = order.filter((k) => isPlainObject(map?.[k]));
     if (!keys.length) return;
@@ -215,6 +225,7 @@ export function costReport(cost) {
     byRole: cost.byRole,
     retries: Number(cost.retries) || 0,
     guardBlocks: Number.isInteger(cost.guardBlocks) ? cost.guardBlocks : null,
+    guardBySession: Number.isInteger(cost.guardBlocks) && isPlainObject(cost.guardBySession) ? cost.guardBySession : null,
     sessions: Array.isArray(cost.sessions) ? cost.sessions : [],
   };
 }
