@@ -686,6 +686,8 @@ export function indirectExpansionOnLine(str, cmds) {
     // would lose its place and blank the real expansion. Then nothing is blanked: the whole text is judged; security review of f79370b)
     if (q === '"' && (ch === '`' || (ch === '$' && t[i + 1] === '('))) return INDIRECT_EXPANSION.test(t.replace(SAFE_FLAG_EXPANSION, '${'));
     if (q === '"') { if (ch === '"') q = null; u += ch; continue; }
+    // (a comment's quotes are no quotes: `B=x # it's` … `# '` would blank the lines between. Where a comment may start, nothing is blanked)
+    if (ch === '#' && (i === 0 || /[\s;&|()]/.test(t[i - 1]))) return INDIRECT_EXPANSION.test(t.replace(SAFE_FLAG_EXPANSION, '${'));
     if (ch === "'") { if (t[i - 1] === '$') return true; q = "'"; u += ' '; continue; }
     if (ch === '"') q = '"';
     u += ch;
