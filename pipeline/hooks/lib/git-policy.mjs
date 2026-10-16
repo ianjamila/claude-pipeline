@@ -1569,7 +1569,7 @@ function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0) {
   if (cmds.some(bindsRunTimeName) || cmds.some(indirectExpansion)) for (const k of [...Object.keys(ctx.vars), ...namesReadOn(cmds)]) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
 }
 // A zsh parameter expansion with flags (`${(P)N::=x}` assigns the variable N names) or a bash indirect one (`${!N}`), anywhere in a command's words.
-export const INDIRECT_EXPANSION = /\$\{(?:!|\((?!%\))[^)]*\))/; // (fail closed: `${!…}` and every zsh flag expansion but the prompt-only `${(%)…}` (the script-directory idiom `${${(%):-%x}:A:h}`); P, e, A, … can assign)
+export const INDIRECT_EXPANSION = /\$\{(?:!|\((?!%\)[:}])[^)]*\)|[A-Za-z_]\w*::=)/; // (fail closed: `${!…}`, zsh `${N::=…}` and every zsh flag expansion but the prompt-only `${(%):…}` with no name (the script-directory idiom `${${(%):-%x}:A:h}`); P, e, A, … can assign)
 const indirectExpansion = (c) => [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')].some((w) => INDIRECT_EXPANSION.test(String(w)));
 // A command that binds a variable whose name is only known at run time (see collectAssignments).
 function bindsRunTimeName(c) {

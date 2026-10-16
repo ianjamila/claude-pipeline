@@ -447,6 +447,8 @@ test('#56 Codex review of 8b86e2b: a later loop, a loop that may not run and an 
     'F=settings.json; false && for F in safe; do :; done; printf x > ~/.claude/$F',
     'F=settings.json; (for F in safe; do :; done); printf x > ~/.claude/$F',
     'F=safe; : "${(P)N::=settings.json}"; printf x > ~/.claude/$F', // (zsh: assigns the name N holds; on main too)
+    'F=safe; : "${(%)F::=settings.json}"; printf x > ~/.claude/$F', // (a name after the prompt flag: assigns it)
+    'F=safe; : ${F::=settings.json}; printf x > ~/.claude/$F', // (zsh ::= assigns)
     'for F in safe; do : "${(P)N::=settings.json}"; printf x > ~/.claude/$F; done',
   ]) assert.equal(files(cmd, fakeFs(PROJ, {}, DIRS)).decision, 'deny', cmd);
   // (git guard)
