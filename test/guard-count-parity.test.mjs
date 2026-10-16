@@ -146,6 +146,12 @@ test('#81: an arithmetic assignment changes the name: every form stays refused',
     'true && n=1; : "$((n=7))"; bash s$n.sh', // (inside double quotes)
     'true && n=1; : "$n,$((n+=6))"; bash s$n.sh',
     'for n in 1; do : $((n=7)); bash s$n.sh; done',
+    'true && n=1; : $((n[0]=7)); bash s$n.sh', // (an array element)
+    'true && n=1; : $((n && n=7)); bash s$n.sh',
+    'true && n=1; : $((n &&= 7)); bash s$n.sh',
+    'true && n=8; : $((n-- - 1)); bash s$n.sh',
+    'true && n=1; : $((0 || n||=7)); bash s$n.sh',
+    'true && n=1; : $((n^^=7)); bash s$n.sh',
     'true && n=1; : $((n=7)) $((n+1)); bash s$n.sh', // (an assignment next to a read)
     'true && n=1; : $((n+1)) $((n=7)); bash s$n.sh',
     'true && n=1; : $((n+1)); : $((n=7)); bash s$n.sh', // (a read, then a separate assignment)
