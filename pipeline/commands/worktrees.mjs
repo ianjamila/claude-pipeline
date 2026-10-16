@@ -14,7 +14,7 @@ import { git } from '../lib/git.mjs';
 import { listWorktrees } from '../lib/local-branches.mjs';
 import { samePath } from '../lib/paths.mjs';
 import { run as runProc } from '../lib/proc.mjs';
-import { holdingRoot, listHolding, purgeHolding } from '../lib/worktree-prune/act.mjs';
+import { holdingRoot, listHolding, purgeHoldingLocked } from '../lib/worktree-prune/act.mjs';
 import { KEEP_PREFIX, lockNameFor, modeAllows } from '../lib/worktree-prune/rules.mjs';
 import { loadRepo, prune, pruneLogDir, summaryOnly } from '../lib/worktree-prune/run.mjs';
 
@@ -94,9 +94,10 @@ async function holding(rest, ctx) {
   const output = { ok: true, dir, batches: [], purged: [] };
   if (values.purge) {
     if (modeAllows(repo.w.mode, 'purge')) {
-      const r = purgeHolding(dir, { nowMs: Date.now() });
+      const r = await purgeHoldingLocked(dir, { nowMs: Date.now(), lockDir: env.PIPELINE_LOCK_DIR || undefined });
       output.purged = r.purged;
       output.keptBatches = r.kept;
+      if (r.skipped) output.purgeSkipped = r.skipped;
     } else output.note = 'purge needs mode: on';
   }
   output.batches = listHolding(dir);
