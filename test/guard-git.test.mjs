@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync, execFileSync } from 'node:child_process';
+import { cpuTimed } from './helpers/timing.mjs';
 import { mkdtempSync, writeFileSync, rmSync, realpathSync, readFileSync, cpSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
@@ -1221,19 +1222,19 @@ test('the installed matchers cover Monitor and MCP tools for guard-git', async (
 
 test('an oversized command line is not parsed: denied when it mentions a guarded word (quotes stripped), allowed otherwise', () => {
   const spam = '{a,b}'.repeat(60_000); // 300 KB
-  const t0 = Date.now();
-  assert.equal(evaluate(`echo ${spam}`).decision, 'allow');
-  assert.equal(evaluate(`echo ${spam}; git push origin main`).decision, 'deny');
-  assert.equal(evaluate(`echo ${spam}; g''it pu"sh" origin main`).decision, 'deny');
-  assert.equal(evaluate(`echo ${spam}; gh pr edit 1 --add-label human-""approved`).decision, 'deny');
-  assert.ok(Date.now() - t0 < 3000, 'the size cap must keep the hook far below its 15 s timeout');
+  const { ms } = cpuTimed(() => {
+    assert.equal(evaluate(`echo ${spam}`).decision, 'allow');
+    assert.equal(evaluate(`echo ${spam}; git push origin main`).decision, 'deny');
+    assert.equal(evaluate(`echo ${spam}; g''it pu"sh" origin main`).decision, 'deny');
+    assert.equal(evaluate(`echo ${spam}; gh pr edit 1 --add-label human-""approved`).decision, 'deny');
+  });
+  assert.ok(ms < 3000, `the size cap must keep the hook far below its 15 s timeout (${Math.round(ms)} ms of CPU)`);
 });
 
 test('brace spam just under the size cap is cut off by the expansion budget, not by the clock', () => {
   const spam = Array.from({ length: 12_000 }, () => '{a,b,c}').join(' ');
-  const t0 = Date.now();
-  evaluate(`echo ${spam}`);
-  assert.ok(Date.now() - t0 < 3000);
+  const { ms } = cpuTimed(() => evaluate(`echo ${spam}`));
+  assert.ok(ms < 3000, `took ${Math.round(ms)} ms of CPU`);
 });
 
 // ---- dynamic push destinations and env-supplied git config (review findings 3 and 4) -------------------
