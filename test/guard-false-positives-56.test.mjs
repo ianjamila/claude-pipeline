@@ -418,6 +418,9 @@ test('#56 replay 2: loop words from a known variable, quoted [ ] words, code in 
     'B=run.shXY; for f in $B[1,6]; do bash $f; done',
     'B=run.shXY; for f in ${B}[1,6]; do bash $f; done',
     'for f in =run.sh; do bash $f; done',
+    // (a longer name: the pattern must not read `$BB:r` as `$B` + text; Codex probe of ede8872)
+    'BB=run.sh.x; for f in $BB:r; do bash $f; done',
+    'BB=run.shXY; for f in $BB[1,6]; do bash $f; done',
     'B=ok; for f in $B.sh; do bash $f; B=run; done', // (the name the word reads is set twice)
   ]) denyGit(cmd, SPEC);
   // still refused (documented): two loops over the same name, and a loop over a variable holding command output
