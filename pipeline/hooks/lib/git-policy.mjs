@@ -902,7 +902,7 @@ const isPmRun = (c) => c.length > 2 && c[1] === 'run' && Object.hasOwn(PM_RUN_AL
 const pmScriptOf = (prefix) => { const c = canonPm(prefix); return isPmRun(c) ? c[2] : ''; };
 // The words the script itself receives. Why (#58 round 3): npm keeps every option written before `--` for itself (`npm run merge 7 --expect-head=H`
 // hands the script only `7`), so for npm only the words AFTER `--` count; yarn and pnpm forward the words after the script name.
-const pmForwarded = (c) => c.slice(3).filter((w) => w !== '--');
+const pmForwarded = (c) => (baseName(c[0]) === 'npm' ? (c.indexOf('--', 3) < 0 ? [] : c.slice(c.indexOf('--', 3) + 1)) : c.slice(3).filter((w) => w !== '--'));
 // Subcommands that cannot run a repo script (read-only queries, installs): `npm view merge version` names the word `merge` and is no merge.
 // (an unknown subcommand, `run`, `exec`, `x`, `dlx`, `explore`, `test`, `start` … stay judged as before)
 const PM_NO_SCRIPT = new Set(['view', 'v', 'info', 'show', 'ls', 'll', 'la', 'list', 'outdated', 'help', 'help-search', 'search', 's', 'find', 'why', 'explain', 'config', 'whoami', 'bin', 'root', 'prefix', 'ping', 'audit', 'fund', 'docs', 'home', 'repo', 'bugs',

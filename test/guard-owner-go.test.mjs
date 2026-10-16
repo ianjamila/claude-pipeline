@@ -255,3 +255,20 @@ test('#58 round 3: the merge script through yarn / pnpm / npm is the merge comma
     assert.equal(d(`npm run merge -- 7 --expect-head ${H7}`, o).decision, 'allow', prefix.join(' '));
   }
 });
+
+test('#58 round 3: npm keeps the options written before `--` for itself, so only the words after `--` reach the merge script', () => {
+  const o = { ...opts('/chat'), ownerGo: { ...ownerGo, mergeTemplates: () => [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: '--expect-head' }] } };
+  const d = (cmd) => evaluateGitCommand(cmd, o);
+  // npm eats `--expect-head=H` (the script gets only `7`): an unpinned merge
+  for (const cmd of [`npm run merge 7 --expect-head=${H7}`, `npm run merge 7 --expect-head ${H7}`, `npm run merge --expect-head=${H7} -- 7`, `npm run-script merge 7 --expect-head ${H7}`, `npm --silent run merge 7 --expect-head=${H7}`]) {
+    assert.equal(d(cmd).decision, 'deny', cmd);
+  }
+  assert.match(d(`npm run merge 7 --expect-head=${H7}`).reason, /without a literal PR number|must pin the head/);
+  assert.match(d(`npm run merge -- 7 --expect-head ${H7} --expect-head ${H8}`).reason, /must pin the head/);
+  for (const cmd of [`npm run merge -- 7 --expect-head=${H7}`, `npm run merge --if-present -- 7 --expect-head ${H7}`, `npm run-script merge -- 7 --no-update --expect-head ${H7}`]) {
+    assert.equal(d(cmd).decision, 'allow', `${cmd}: ${d(cmd).reason}`);
+  }
+  // yarn and pnpm forward the words after the script name
+  for (const cmd of [`yarn merge 7 --expect-head=${H7}`, `pnpm merge 7 --expect-head ${H7}`, `pnpm run merge 7 --expect-head=${H7}`]) assert.equal(d(cmd).decision, 'allow', `${cmd}: ${d(cmd).reason}`);
+  assert.equal(d(`yarn merge 7 --expect-head ${H8}`).decision, 'deny');
+});
