@@ -226,3 +226,61 @@ test('B7 a backslash or $\'..\' in the assigned word, an operator not worked out
   denyBoth('F=ok.sh; G=${F^^pat}x; bash $G'.replace('^^pat', '@U'));
   denyBoth(`G=${'${U:-'.repeat(20)}run.sh${'}'.repeat(20)}; bash $G`);
 });
+
+// ---- B8. every cap, give-up or structure not followed makes the name's candidate set UNKNOWN (refused when the name is used as a script), never a shorter list --------
+test('B8 an array longer than the words kept, or with more elements than the scan reads, is unknown for any subscript', () => {
+  const els = (n) => Array.from({ length: n }, (_, i) => `e${i}.sh`).join(' ');
+  denyBoth(`F=(${els(40)} run.sh); bash \${F[40]}`);
+  denyBoth(`F=(${els(300)} run.sh); bash \${F[300]}`);
+  denyBoth(`F=(${els(300)} run.sh); bash "\${F[@]}"`);
+  denyBoth(`F=(${els(20)} run.sh); bash \${F[20]} `.replace('bash', 'bash -x'));
+  allow(`F=(${els(20)} ok.sh); bash \${F[20]}`);
+});
+test('B8 a default built from too many alternatives is unknown', () => {
+  denyBoth('G=${A:-1}${B:-2}${C:-3}${D:-4}${E:-5}${H:-6}run.sh; bash $G');
+  denyBoth('G=${A:-${B:-x}}${C:-${D:-y}}${E:-${H:-z}}${I:-${J:-w}}run.sh; bash $G');
+});
+test('B8 an operator the scan does not work out is unknown, on a name the text gives or not', () => {
+  for (const v of ['${U@Q}', '${!U}', '${#U}', '${(P)U}', '${U:#pat}', '${${U}:-x}', '${(U)U}', '${U[1]@Q}', '${F@U}', '${F:#x}', '${(L)F}', '${!F[@]}']) {
+    denyBoth(`F=ok.sh; G=${v}; bash $G`);
+  }
+});
+test('B8 a name built from an unknown or computed one is that unknown or computed set', () => {
+  denyBoth('A=${U:-run.sh}; B=$A; bash $B');
+  denyBoth('A=${U:-run.sh}; B=${A}; bash $B');
+  denyBoth('A=${U:-run.sh}; B=x${A}; C=${B#x}; bash $C');
+  denyBoth('F=(ok.sh run.sh); G=$F[2]; bash $G');
+  denyBoth('F=(ok.sh run.sh); G=$F; bash $G');
+  denyBoth('F=(ok.sh run.sh); G=${F[@]}; bash $G');
+  allow('A=${U:-ok.sh}; B=$A; bash $B');
+  allow('ROOT=${0%/*}; bash $ROOT/ok.sh');
+});
+test('B8 more entries than the scan follows makes every name used as a script unknown', () => {
+  const many = Array.from({ length: 300 }, (_, i) => `A${i}=(x)`).join('; ');
+  denyBoth(`${many}; Z=ok.sh; bash $Z`);
+  const plain = Array.from({ length: 5000 }, (_, i) => `P${i}=${i}`).join('; ');
+  denyBoth(`${plain}; F=(ok.sh); Z=ok.sh; bash $Z`);
+});
+test('B8 a quoted head the scan does not read, and a loop that may not run, keep the hazard', () => {
+  gitDeny("S=scripts; for n in 1 2; do '$S/run1.sh' $n; git show $n; done", fakeFs(GIT_ROOT, { 'scripts/run1.sh': 'git status' }, ['scripts']));
+  gitDeny('[ -d x ] && for p in ls cat; do $p x; git show $p; done');
+  gitAllow('for p in ls cat; do $p x; git show $p; done');
+});
+
+test('B8 assigningDefaults itself: a cap or a give-up leaves an unknown word in the set, never a shorter list', () => {
+  const U = '$(?)';
+  const els = (n) => Array.from({ length: n }, (_, i) => `e${i}.sh`).join(' ');
+  assert.ok(assigningDefaults(`F=(${els(40)})`).get('F[]').includes(U), '40 elements');
+  assert.ok(assigningDefaults(`F=(${els(300)})`).get('F[]').includes(U), '300 elements');
+  assert.ok(assigningDefaults('F=(a b c').get('F[]').includes(U), 'no closing parenthesis');
+  assert.ok(!assigningDefaults(`F=(${els(5)})`).get('F[]').includes(U), 'a short array is complete');
+  assert.deepEqual(assigningDefaults('x=${U:-a}${U:-' + 'b'.repeat(250_000) + '}').get('*'), [U], 'text over the cap: every name unknown');
+  assert.deepEqual(assigningDefaults(`${Array.from({ length: 300 }, (_, i) => `A${i}=(x)`).join('; ')}`).get('*'), [U], 'more arrays than followed');
+  assert.deepEqual(assigningDefaults(`${Array.from({ length: 5000 }, (_, i) => `P${i}=1`).join('; ')}; F=(x)`).get('*'), [U], 'more assignments than followed');
+  assert.ok(assigningDefaults('G=${U:-"a"}').get('G').includes(U), 'quote in braces');
+  assert.ok(assigningDefaults('G=${U:-a').get('G').includes(U), 'brace never closes');
+  assert.ok(assigningDefaults('F=a; G=${F@Q}').get('G').includes(U), 'transform');
+  assert.ok(assigningDefaults('F=a; G=${F:#x}').get('G').includes(U), 'pattern after colon');
+  assert.ok(assigningDefaults('A=${U:-run.sh}; B=$A').get('B').includes('run.sh'), 'a name built from a computed one');
+  assert.equal(assigningDefaults('F=ok.sh; G=${F}').size, 0, 'a plain reference is the guard\'s own expansion');
+});

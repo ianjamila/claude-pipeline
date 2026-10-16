@@ -134,7 +134,10 @@ const UNKNOWN_WORD = '$(?)';
 // Every limit keeps the scan linear-ish and short: a hook past its deadline is ALLOWED by the host, and a regular expression cannot be interrupted. No regular expression here matches a glob; the
 // matcher below counts its steps against one allowance per call, and a pattern, value or line over a cap gives UNKNOWN_WORD (refused when the name is used as a script), never a guess.
 const MAX_ASSIGN_WORDS = 32;
-const MAX_ASSIGN_ENTRIES = 256;
+const MAX_ASSIGN_ENTRIES = 256; // assignments that hold an expansion or an array
+const MAX_PLAIN_ENTRIES = 4096; // all assignments (plain values feed the operators)
+const WILD = '*'; // the key that stands for EVERY name: the text had more than the scan follows (readingsOf refuses any word that reads a variable)
+const wildcard = () => new Map([[WILD, [UNKNOWN_WORD]]]);
 const MAX_VALUE_CHARS = 1024; // one assigned word, scanned
 const MAX_OP_VALUE = 512; // a value an operator is applied to
 const MAX_PATTERN = 64;
@@ -239,17 +242,21 @@ function valueWord(s, i, inArray) {
 const ASSIGN_AT = /(?<![\w$.\/-])([A-Za-z_]\w{0,63})(?:\[([^\]\n]{0,64})\])?(\+?)=/g;
 function assignedValues(text) {
   // cheap, linear test first: an expansion, an array or an element assignment
-  if (text.length > 200_000 || !(text.includes('${') || text.includes('=(') || /\]\+?=/.test(text))) return new Map();
+  if (!(text.includes('${') || text.includes('=(') || /\]\+?=/.test(text))) return new Map();
+  if (text.length > 200_000) return wildcard();
   const found = []; // { name, array, words[] } (a word null: unknown)
+  let interesting = 0;
   for (const m of text.matchAll(ASSIGN_AT)) {
-    if (found.length >= MAX_ASSIGN_ENTRIES) break; // (the names past the cap are not followed: no looser than a line without this reading)
+    if (found.length >= MAX_PLAIN_ENTRIES) return wildcard(); // (a name past the cap would not be followed)
     let i = m.index + m[0].length;
     if (m[2] === undefined && text[i] === '(') {
       const words = [];
       i++;
+      let closed = false;
       for (let n = 0; n < 256 && i < text.length; n++) {
         while (i < text.length && /\s/.test(text[i])) i++;
-        if (i >= text.length || text[i] === ')') break;
+        if (i >= text.length) break;
+        if (text[i] === ')') { closed = true; break; }
         let [w, j] = valueWord(text, i, true);
         if (j === i && w === '') break;
         if (w !== null) w = w.replace(/^\[[^\]]{0,64}\]=/, '');
@@ -257,27 +264,44 @@ function assignedValues(text) {
         if (w === null) break;
         i = j;
       }
+      if (!closed && words.at(-1) !== null) words.push(null); // (more elements than read, or no closing parenthesis: the rest is unknown)
       found.push({ name: m[1], array: true, words });
+      if (++interesting > MAX_ASSIGN_ENTRIES) return wildcard();
     } else {
       const [w] = valueWord(text, i, false);
       // a word the scan could not follow is unknown when it holds an expansion it was meant to work out (the rest are values this reading never covered)
       if (w === null && !text.slice(i, i + 256).includes('${')) continue;
       found.push({ name: m[1], array: m[2] !== undefined, words: [w] });
+      if (w === null || m[2] !== undefined || w.includes('${') || w.includes('$')) if (++interesting > MAX_ASSIGN_ENTRIES) return wildcard();
     }
   }
   if (!found.some((x) => x.array || x.words.some((w) => w === null || w.includes('${')))) return new Map();
   const cand = new Map(); // name -> Set of words (a scalar, or any element of an array)
   const arrays = new Set(found.filter((x) => x.array).map((x) => x.name));
   const opNames = new Set(found.filter((x) => x.array || x.words.some((w) => w === null || (w.includes('${') && !/^\$\{[A-Za-z_]\w*\}$/.test(w)))).map((x) => x.name));
-  const add = (k, w) => { const set = cand.get(k) ?? new Set(); if (set.size < MAX_ASSIGN_WORDS * 2) set.add(w); cand.set(k, set); };
+  // a name built from one of these (`B=$A`, `B=x${A}`, `G=$F[2]`) is one of them too, to a fixed point
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const x of found) {
+      if (opNames.has(x.name)) continue;
+      if (x.words.some((w) => typeof w === 'string' && [...w.matchAll(/\$\{?([A-Za-z_]\w*)/g)].some((r) => opNames.has(r[1])))) { opNames.add(x.name); changed = true; }
+    }
+  }
+  const over = new Set(); // names that had more words than kept
+  const add = (k, w) => { const set = cand.get(k) ?? new Set(); if (set.size < MAX_ASSIGN_WORDS * 2) set.add(w); else over.add(k); cand.set(k, set); };
   const work = { n: 0 };
   // the words a `${…}` group stands for (inner = the text between the braces): null = leave the reading out (a value the environment gives)
   const group = (inner) => {
-    let m = /^([A-Za-z_]\w*)(?:\[[^\]]{0,64}\])?$/.exec(inner);
-    if (m) return cand.has(m[1]) ? [...cand.get(m[1])] : null;
-    m = /^([A-Za-z_]\w*)(?:\[[^\]]{0,64}\])?(\/\/?|##?|%%?|\^\^?|,,?|:)([\s\S]*)$/.exec(inner);
-    if (!m) { const k = /^[!#]?([A-Za-z_]\w*)/.exec(inner)?.[1]; return k !== undefined && cand.has(k) ? [UNKNOWN_WORD] : null; } // (an operator not listed, on a name the text gives: unknown; on any other: the environment's)
+    if (/^\$\{\(%\):-%[xN]\}(?::[aAcefFghlPqQrstuwWx&]){0,6}$/.test(inner)) return null; // (zsh: the path of the running script, like $0: the environment's)
+    const NAME = '([A-Za-z_]\\w*|\\d+|[@*])(?:\\[[^\\]]{0,64}\\])?';
+    let m = new RegExp(`^${NAME}$`).exec(inner);
+    if (m) return cand.has(m[1]) ? [...cand.get(m[1]), ...(over.has(m[1]) ? [UNKNOWN_WORD] : [])] : null; // (a name nothing here gives: the environment's value, left out)
+    m = new RegExp(`^${NAME}(\\/\\/?|##?|%%?|\\^\\^?|,,?|:)([\\s\\S]*)$`).exec(inner);
+    if (!m) return [UNKNOWN_WORD]; // (an operator or form not worked out -- ${U@Q} ${!U} ${#U} ${(P)U} ${U:#p} ${${U}:-x} -- on any name)
+    // (not a substring: a zsh modifier ${0:A:h} on a name nothing here gives is the environment's, as before; any other form, and a modifier on a name the text gives, is unknown)
+    if (m[2] === ':' && !/^\s{0,8}-?\d{1,6}(?::\d{1,6})?$/.test(m[3])) return /^[aAcefFghlPqQrstuwWx&]/.test(m[3]) && !cand.has(m[1]) ? null : [UNKNOWN_WORD];
     const subj = cand.get(m[1]);
+    if (over.has(m[1])) return [UNKNOWN_WORD];
     if (!subj) return null;
     return [...subj].map((v) => (v === UNKNOWN_WORD ? v : applyOp(v, m[2], m[3], work) ?? UNKNOWN_WORD));
   };
@@ -296,7 +320,8 @@ function assignedValues(text) {
         if (j < 0) { done.add(UNKNOWN_WORD); continue; }
         for (const v of group(a.slice(at + 2, j)) ?? []) next.push(a.slice(0, at) + v + a.slice(j + 1));
       }
-      alts = [...new Set(next)].slice(0, MAX_ASSIGN_WORDS * 2);
+      alts = [...new Set(next)];
+      if (alts.length > MAX_ASSIGN_WORDS * 2) { alts = alts.slice(0, MAX_ASSIGN_WORDS * 2); done.add(UNKNOWN_WORD); } // (alternatives dropped: unknown)
     }
     if (alts.length) done.add(UNKNOWN_WORD); // (not settled within the steps allowed)
     return [...done];
@@ -312,7 +337,12 @@ function assignedValues(text) {
     }
   }
   const out = new Map();
-  for (const k of opNames) if (cand.has(k)) out.set(arrays.has(k) ? `${k}[]` : k, [...cand.get(k)].slice(0, MAX_ASSIGN_WORDS));
+  for (const k of opNames) {
+    if (!cand.has(k)) continue;
+    const ws = [...cand.get(k)];
+    // (more words than kept: the kept ones and an unknown word, never a shorter list)
+    out.set(arrays.has(k) ? `${k}[]` : k, over.has(k) || ws.length > MAX_ASSIGN_WORDS ? [...ws.slice(0, MAX_ASSIGN_WORDS - 1), UNKNOWN_WORD] : ws);
+  }
   return out;
 }
 // the readings of a word, plus those with a name an assigning expansion may have set replaced by the words it assigns, repeatedly (`: ${A:=./}; : ${B:=f.sh}; bash $A$B`).
@@ -327,8 +357,8 @@ export function readingsOf(word, assigned) {
     const r = queue.shift();
     for (const [key, ws] of assigned) {
       // (an array, `NAME[]`: its elements stand for any use of the name, with a subscript or without)
-      const n = key.endsWith('[]') ? key.slice(0, -2) : key;
-      const ref = key.endsWith('[]') ? `\\$(?:\\{${n}(?:\\[[^\\]]{0,64}\\])?\\}|${n}(?![A-Za-z0-9_])(?:\\[[^\\]]{0,64}\\])?)` : `\\$(?:\\{${n}\\}|${n}(?![A-Za-z0-9_]))`;
+      const n = key === WILD ? '' : key.endsWith('[]') ? key.slice(0, -2) : key;
+      const ref = key === WILD ? '\\$\\{?[A-Za-z_]' : key.endsWith('[]') ? `\\$(?:\\{${n}(?:\\[[^\\]]{0,64}\\])?\\}|${n}(?![A-Za-z0-9_])(?:\\[[^\\]]{0,64}\\])?)` : `\\$(?:\\{${n}\\}|${n}(?![A-Za-z0-9_]))`;
       if (!new RegExp(ref).test(r)) continue;
       for (const w of ws) {
         if (/[$`]/.test(w)) { over = true; break; }

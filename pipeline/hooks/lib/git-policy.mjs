@@ -2086,7 +2086,7 @@ function headResolves(c, cmds, ctx, out, text) {
   const toks = String(c.raw ?? '').trim().split(/\s+/);
   const wordAt = toks.findIndex((t) => t === head || t === `"${head}"`);
   if (wordAt < 0 || !toks.slice(0, wordAt).every((t) => /^(?:[A-Za-z_][A-Za-z0-9_]*=\S*|do|then|else|elif|if|while|until|\{|\(|!|&&|\|\||time)$/.test(t))) return false;
-  if (head.includes('/')) return !bindsRunTimeName(c);
+  if (head.includes('/')) return true; // (a program by path is never a builtin)
   const at = cmds.indexOf(c);
   const valuesOf = (k) => {
     const o = out.find((x) => x.k === k);
