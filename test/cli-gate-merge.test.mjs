@@ -133,6 +133,15 @@ test('merge: runs the configured command with the approved pr and head, then exi
   assert.ok(!s.fake.lines().some((l) => l.includes('--disable-auto')));
 });
 
+test('merge: the merge command runs with the caller PATH intact (PIPELINE_GH override: gh dir not appended)', () => {
+  const s = scenario();
+  assertExit(s.gate(), 0);
+  const file = join(s.repo.dir, '.review', 'merge-path.log');
+  const PATH = process.env.PATH;
+  assertExit(s.merge({ FAKE_MERGE_PATH_FILE: file, PATH }), 0);
+  assert.equal(readFileSync(file, 'utf8').trim(), PATH);
+});
+
 test('merge: a merge command that exits non-zero (the gate refused) fails with its output, auto-merge left disarmed', () => {
   const s = scenario({ gh: { mergeView: { state: 'OPEN', mergeCommit: null } } });
   assertExit(s.gate(), 0);
