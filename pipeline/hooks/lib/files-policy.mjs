@@ -1179,13 +1179,15 @@ function collectVars(cmds, ctx) {
   // ways not worked out: such a name keeps the text as written, but is listed in ctx.unknownVars (a script or a writer it picks is refused)
   const attrs = new Map();
   const unknown = new Set();
-  // Why (#56, Codex review of 8b86e2b; on main too): `F=settings.json; printf x > ~/.claude/$F; F=safe` judged the write with the LAST value. A name the line
-  // gives two different values (assignments, declarations, loop readings) holds one of them where it is used: it is only known at run time (ctx.unknownVars).
+  // Why (#56, Codex review of 8b86e2b): `F=settings.json; printf x > ~/.claude/$F; for F in safe; do :; done` judged the write with the loop's word (the last
+  // value). A name a loop reading sets that the line also gives another value holds one of them where it is used: it is only known at run time (ctx.unknownVars).
+  // (Two plain assignments still keep the last value, as on main: `if …; then out=$3; else out=$dir/x; fi; … > "$out"` is common; issue: judge each value.)
   const given = new Map();
-  const set = (k, v) => {
+  const set = (k, v, loop = false) => {
     if (SKIP.has(k)) return;
-    if (given.has(k) && given.get(k) !== String(v)) unknown.add(k);
-    given.set(k, String(v));
+    const was = given.get(k);
+    if (was && was.v !== String(v) && (loop || was.loop)) unknown.add(k);
+    given.set(k, { v: String(v), loop: loop || was?.loop === true });
     const t = attrs.get(k) ?? null;
     vars[k] = applyTransform(expandHomeRefs(substVars(toPosix(String(v)).replace(USER_RE, ctx.user), vars, ctx.budget), ctx.homePosix), t);
     kept[k] = applyTransform(expandHomeRefs(substVars(toPosix(String(v).replace(/\\/g, bs)).replace(USER_RE, ctx.user), kept, ctx.budget), ctx.homePosix).split(bs).join('\\'), t);
@@ -1193,7 +1195,7 @@ function collectVars(cmds, ctx) {
   const pins = ctx.loopPins; // (see loopReadings: the word each loop variable holds in this reading, or null: every one is only known at run time)
   for (const c of cmds) {
     if (pins !== undefined && c.argv[0] === 'for' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '')) {
-      if (pins === null || !pins.has(c.argv[1])) unknown.add(c.argv[1]); else if (pins.get(c.argv[1]) !== LOOP_NOT_RUN) set(c.argv[1], pins.get(c.argv[1]));
+      if (pins === null || !pins.has(c.argv[1])) unknown.add(c.argv[1]); else if (pins.get(c.argv[1]) !== LOOP_NOT_RUN) set(c.argv[1], pins.get(c.argv[1]), true);
     }
     for (const [k, v] of Object.entries(c.env ?? {})) set(k, v);
     // (`set -- ev.sh`: the positional parameters, so `bash $1` is that file)
@@ -2129,7 +2131,7 @@ const MAX_LOOP_READINGS = 64;
 // (a reading where the loop did not run: the name is not set by the line, as main read every loop variable)
 const LOOP_NOT_RUN = Symbol('loop not run');
 // A zsh parameter expansion with flags (`${(P)N::=x}` assigns the variable N names) or a bash indirect one (`${!N}`).
-const INDIRECT_EXPANSION = /\$\{(?:\([^)]*\)|!)/;
+const INDIRECT_EXPANSION = /\$\{(?:![A-Za-z_]|\([^)]*P[^)]*\)|\([^)]*\)[A-Za-z_]\w*:{0,2}=)/; // (`${!N}`, the zsh P flag, or flags before an assignment `${(A)N::=x}`; not `${(%):-%x}`)
 // The readings of a text's loop variables: one Map (name -> word) per combination, [null] when there are too many, null when the text has no loop.
 function loopReadings(command, opts) {
   const cmds = simpleCommands(command, { env: opts.env ?? process.env });
@@ -2452,7 +2454,7 @@ function evaluateBashForFilesFrame(command, opts) {
     for (const [ci, c] of cmds.entries()) {
       const refs = (w) => [...String(w).matchAll(/\$\{?(\w+)/g)].some((x) => ctx.unknownVars.has(x[1]) || snaps[ci]?.unknownV.has(x[1]));
       if ((c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && refs(r.target ?? '')) || (c.argv.length && !['export', 'declare', 'typeset', 'local', 'readonly'].includes(baseOf(c.argv[0])) && !isReadOnly(c, ctx) && (c.argv.some(refs) || Object.values(c.env ?? {}).some(refs)))) {
-        return deny('the command writes through a variable whose value is only known at run time (a width or integer attribute, two different values on the line, or a binder such as `export $N=…` / `printf -v $N` / `${(P)N::=…}` whose name is only known at run time), so the file it reaches cannot be checked; write the path out');
+        return deny('the command writes through a variable whose value is only known at run time (a width or integer attribute, a loop word and another value on the line, or a binder such as `export $N=…` / `printf -v $N` / `${(P)N::=…}` whose name is only known at run time), so the file it reaches cannot be checked; write the path out');
       }
     }
   }

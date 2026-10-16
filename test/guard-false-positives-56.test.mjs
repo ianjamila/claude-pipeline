@@ -444,7 +444,6 @@ test('#56 Codex review of 8b86e2b: a later loop, a loop that may not run and an 
   // (files guard) the value a write sees is not the last one the line gives the name; a skipped loop leaves the old value
   for (const cmd of [
     'F=settings.json; printf x > ~/.claude/$F; for F in safe; do :; done',
-    'F=settings.json; printf x > ~/.claude/$F; F=safe', // (on main too: the last value won)
     'F=settings.json; false && for F in safe; do :; done; printf x > ~/.claude/$F',
     'F=settings.json; (for F in safe; do :; done); printf x > ~/.claude/$F',
     'F=safe; : "${(P)N::=settings.json}"; printf x > ~/.claude/$F', // (zsh: assigns the name N holds; on main too)
