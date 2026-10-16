@@ -166,3 +166,22 @@ test('#74: `:` followed by no modifier letter, or a name in the middle of a word
   denyGit('B=main; git push origin $B', SPEC);
   denyGit('B=main; git push origin $B:main', SPEC);
 });
+
+// ---- loops, and a script the line runs that reads the name -------------------------------------------------------------------------
+
+test('#74: the same through a loop variable, and in a script that reads a name the line gave it', () => {
+  for (const cmd of [
+    'for B in run.sh.x; do bash $B:r; done',
+    'for B in run.shXY; do bash $B[1,6]; done',
+    'for B in run.sh.x ok.sh; do bash "$B:r"; done',
+  ]) denyBoth(cmd, SPEC);
+  denyFiles('for B in settings.json.x; do cp x ~/.claude/$B:r; done', SPEC);
+  const nested = { ...SPEC, 'r1.sh': 'bash $B:r\n', 'r2.sh': 'bash $B[1,6]\n', 'r3.sh': 'F=$B:r; bash $F\n' };
+  for (const cmd of ['export B=run.sh.x; bash r1.sh', 'B=run.sh.x bash r1.sh', 'export B=run.shXY; bash r2.sh', 'export B=run.sh.x; bash r3.sh']) denyGit(cmd, nested);
+  const nestedFiles = { ...SPEC, 'w1.sh': 'cp x ~/.claude/$B:r\n', 'w2.sh': 'cp x ~/.claude/$B[1,13]\n' };
+  for (const cmd of ['export B=settings.json.x; bash w1.sh', 'B=settings.json.x bash w1.sh', 'export B=settings.jsonXY; bash w2.sh']) denyFiles(cmd, nestedFiles);
+  // (a script that reads the name without a modifier, or a loop word that holds no modifier, is judged by the value as before)
+  denyBoth('for B in run.sh; do bash $B; done', SPEC);
+  allowBoth('for B in ok.sh; do bash $B; done', SPEC);
+  allowGit('export B=ok.sh; bash r0.sh', { ...SPEC, 'r0.sh': 'bash $B\n' });
+});
