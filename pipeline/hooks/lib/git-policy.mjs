@@ -950,7 +950,7 @@ function repoMergeCommandVerdict(argv, dir, ctx) {
       // (any package manager: yarn / pnpm / npm run the same script name)
       const same = Object.hasOwn(PM_RUN_ALIASES, baseName(raw[0])) && Object.hasOwn(PM_RUN_ALIASES, baseName(prefix[0]));
       const wrapped = (same || PM_WRAPPERS.has(baseName(raw[0]))) && raw.some((w) => PM_WRAPPERS.has(String(w).toLowerCase())) && raw.some((w) => Object.hasOwn(PM_RUN_ALIASES, baseName(w)));
-      if (script && ((same && (before.includes(script) || before.some((w) => DYNAMIC.test(w)))) || (wrapped && raw.includes(script)))) return directMergeVerdict(null, null, dir, ctx, `\`${prefix.join(' ')}\``, false, shaFlag);
+      if (script && !pmCannotRunScript(raw) && ((same && (before.includes(script) || before.some((w) => DYNAMIC.test(w)))) || (wrapped && raw.includes(script)))) return directMergeVerdict(null, null, dir, ctx, `\`${prefix.join(' ')}\``, false, shaFlag);
       continue;
     }
     let head = null;

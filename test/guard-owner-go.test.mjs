@@ -272,3 +272,18 @@ test('#58 round 3: npm keeps the options written before `--` for itself, so only
   for (const cmd of [`yarn merge 7 --expect-head=${H7}`, `pnpm merge 7 --expect-head ${H7}`, `pnpm run merge 7 --expect-head=${H7}`]) assert.equal(d(cmd).decision, 'allow', `${cmd}: ${d(cmd).reason}`);
   assert.equal(d(`yarn merge 7 --expect-head ${H8}`).decision, 'deny');
 });
+
+test('#58 round 3: read-only and install package-manager commands that only mention `merge` are not a merge', () => {
+  const o = { ...opts('/chat'), ownerGo: { ...ownerGo, mergeTemplates: () => [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: '--expect-head' }] } };
+  const d = (cmd) => evaluateGitCommand(cmd, o);
+  for (const cmd of ['npm view merge version', 'npm info merge', 'npm show merge', 'npm ls merge', 'npm list merge', 'npm outdated merge', 'npm help merge', 'npm search merge', 'npm why merge', 'npm explain merge', 'npm config get merge',
+    'npm --silent view merge', 'npm --prefix x ls merge', 'npm install merge', 'npm i merge', 'yarn info merge', 'yarn why merge', 'pnpm view merge', 'pnpm ls merge', 'pnpm add merge', 'pnpm why merge']) {
+    assert.equal(d(cmd).decision, 'allow', `${cmd}: ${d(cmd).reason}`);
+  }
+  // anything that can run the script, and any subcommand or option we do not know, stays a merge
+  for (const cmd of ['npm run merge', 'npm run-script merge', 'npm x -- npm run merge', 'npm explore pkg merge', 'npm --mystery val run merge -- 8', 'npm --mystery view merge', 'npm frobnicate merge', 'yarn merge', 'pnpm merge', 'yarn run merge',
+    'npx npm run merge']) {
+    assert.equal(d(cmd).decision, 'deny', cmd);
+  }
+  assert.equal(evaluateGitCommand('npm view merge version', { ...o, ownerGo: { ...ownerGo, mergeTemplates: () => { throw new Error('bad yml'); } } }).decision, 'allow');
+});
