@@ -13,7 +13,7 @@
 import { sqlShellEscapes, sqlFamilyOf, sqlClientPlan, SQL_CLIENT_NAMES, SQL_RC_MENTION } from './sql-clients.mjs';
 const MAX_COMMANDS = 500;
 const MAX_NEST = 200; // in-place nesting of $( ), ( ), <( ) before we give up on the line
-export const MAX_WORK = 8_000_000; // total characters lexed across all recursive parses
+const MAX_WORK = 8_000_000; // total characters lexed across all recursive parses
 const HARD_MAX_DEPTH = 50;
 const ASSIGN_RE = /^([A-Za-z_][A-Za-z0-9_]*)\+?=/;
 // the counter (ctx.ctl) each construct kind of ctlOpen raises: in a loop, a function body, an if / case branch
@@ -2766,7 +2766,6 @@ export function simpleCommands(str, opts) {
   }
   Object.defineProperty(ctx.out, 'truncated', { value: ctx.truncated, enumerable: false });
   Object.defineProperty(ctx.out, 'dynamic', { value: ctx.dynamic, enumerable: false });
-  Object.defineProperty(ctx.out, 'work', { value: ctx.work, enumerable: false }); // characters lexed, counted against MAX_WORK (tests assert the budget on this, not the clock)
   Object.defineProperty(ctx.out, 'subshell', { value: ctx.subshell, enumerable: false });
   // fns: every name the text defines as a function (`f()`, `function f`, zsh `f g ()`), wherever it is
   Object.defineProperty(ctx.out, 'fns', { value: ctx.fns, enumerable: false });
