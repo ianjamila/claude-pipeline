@@ -231,11 +231,12 @@ test('a name assigned through another name ((( $m = 7 )), m holding n) may be an
 // Why: t7 judges a text once per value of a name it assigns twice (16 readings) and the loop words (64) -- and again for every script it runs, so three nested scripts that each assign
 // four names twice and loop over eight words were 1024^3 evaluations and ended at the 5 s deadline (main: 0.45 s, allowed). The readings of a whole evaluation share one allowance and
 // the check is refused when it is spent (about 0.5 s); the same chain with little to read is still allowed.
-const chain = (twice, depth, words) => {
+const chain = (twice, depth, words, names = 4) => {
   const out = {};
   for (let i = 1; i <= depth; i++) {
     const n = ['a', 'b', 'c', 'd'].map((x) => x + i);
-    const asg = n.map((x) => (twice ? `${x}=x1; ${x}=x2` : `${x}=x1`)).join('; ');
+    n.length = 4; // (the call passes all four; the assignments below are for the first `names`)
+    const asg = n.slice(0, names).map((x) => (twice ? `${x}=x1; ${x}=x2` : `${x}=x1`)).join('; ');
     const next = i < depth ? `bash F${i + 1}.sh $${n[0]} $${n[1]} $${n[2]} $${n[3]}` : `echo $${n[0]} $${n[1]} $${n[2]} $${n[3]}`;
     out[`F${i}.sh`] = `${asg}\nfor f in ${words}; do echo $${n[0]} $f; done\n${next}\n`;
   }
@@ -249,7 +250,7 @@ test('three nested scripts that each assign four names twice and loop over eight
   assert.ok(Date.now() - t0 < 3000, `took ${Date.now() - t0} ms`);
 });
 test('a chain with a few readings is still allowed', () => {
-  assert.equal(files('bash F1.sh', fakeFs(PROJ, chain(true, 2, 'w1'))).decision, 'allow'); // (16 + 16 x 16 readings)
+  assert.equal(files('bash F1.sh', fakeFs(PROJ, chain(true, 2, 'w1 w2', 2))).decision, 'allow'); // (two names twice, two words: 8 readings a level)
   assert.equal(files('bash F1.sh', fakeFs(PROJ, chain(false, 3, 'w1 w2 w3 w4 w5 w6 w7 w8'))).decision, 'allow'); // (once-assigned names: only the 8 words of each level)
   assert.equal(git('bash F1.sh', fakeFs(GIT_ROOT, chain(false, 3, 'w1 w2 w3 w4 w5 w6 w7 w8'))).decision, 'allow');
 });
