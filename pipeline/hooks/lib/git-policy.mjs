@@ -126,6 +126,9 @@ function parseOpts(args, { longValue = [], shortValue = '', abbrev = false } = {
   return { flags, positionals };
 }
 
+// Every flag `gh pr merge` has (short: -A -b -F -d -m -r -s -t -R -h)
+const GH_MERGE_LONG = ['admin', 'author-email', 'auto', 'body', 'body-file', 'delete-branch', 'disable-auto', 'help', 'match-head-commit', 'merge', 'rebase', 'repo', 'squash', 'subject'];
+const GH_MERGE_SHORT = 'AbFdmrstRh';
 // A boolean long flag's effective setting (the last one wins, as in gh): 'on', 'off' (also when absent) or 'bad' (a value gh would reject).
 function boolFlag(flags, name) {
   const last = flags.filter((f) => !f.short && f.name === name).at(-1);
@@ -876,6 +879,7 @@ function directMergeVerdict(pr, head, dir, ctx, what, elsewhere = false, pinFlag
 // `<pm> run <script> …`; an option it does not know is read as a flag without a value. (The value-taking ones it knows are skipped with their value.)
 const PM_RUN_ALIASES = { npm: ['run', 'run-script', 'rum', 'urn'], pnpm: ['run', 'run-script'], yarn: ['run'] };
 const PM_VALUE_OPTS = new Set(['--prefix', '--workspace', '-w', '--userconfig', '--globalconfig', '--cache', '--loglevel', '--registry', '--dir', '-C', '--filter', '-F', '--cwd', '--use-yarnrc', '--tag', '--scope', '--otp', '--script-shell']);
+const PM_WRAPPERS = new Set(['npx', 'pnpx', 'bunx', 'corepack', 'exec', 'x', 'dlx']);
 const PM_COMMANDS = new Set(['install', 'i', 'add', 'remove', 'rm', 'uninstall', 'update', 'up', 'upgrade', 'exec', 'dlx', 'x', 'test', 't', 'start', 'stop', 'restart', 'publish', 'pack', 'link', 'unlink', 'init', 'create', 'audit', 'outdated', 'list', 'ls', 'why', 'info', 'view', 'config', 'cache', 'version', 'help', 'login', 'logout', 'whoami', 'ci', 'rebuild', 'prune', 'dedupe', 'store', 'env', 'patch', 'import', 'fetch', 'run']);
 function canonPm(words) {
   const pm = baseName(words[0] ?? '');
@@ -898,11 +902,14 @@ const pmScriptOf = (prefix) => { const c = canonPm(prefix); return c.length > 2 
 // The repo's own merge command (pipeline.yml merge.command, e.g. `npm run merge -- {pr} --expect-head {sha}`) typed by hand. A `gh …`
 // command is judged as gh.
 function repoMergeCommandVerdict(argv, dir, ctx) {
-  if (!ctx?.ownerGo || dir === null) return null;
+  if (!ctx?.ownerGo) return null;
+  // (an unknown directory is judged by the session's own; a pipeline.yml that cannot be read leaves `npm run merge` as the guess, as the mode of an unreadable one is chat)
   let templates = [];
   try {
-    templates = ctx.ownerGo.mergeTemplates(dir) ?? [];
-  } catch { /* unreadable: this form cannot be recognised (gh merges still fail closed on the mode) */ }
+    templates = ctx.ownerGo.mergeTemplates(dir ?? ctx.cwd) ?? [];
+  } catch {
+    templates = [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: null }];
+  }
   const raw = argv.map((a) => expandVars(a, ctx));
   for (const { prefix, shaFlag } of templates) {
     if (!Array.isArray(prefix) || !prefix.length || baseName(prefix[0]) === 'gh') continue;
@@ -912,9 +919,13 @@ function repoMergeCommandVerdict(argv, dir, ctx) {
     if (plain.length < p.length || baseName(plain[0]) !== baseName(p[0]) || !p.slice(1).every((w, i) => plain[i + 1] === w)) {
       // An option the matcher does not know may take a value and hide the subcommand: if this is the same package manager and the
       // script's name still stands as a word before `--`, it could run the merge script, so it is judged as the merge command (no PR, no head).
+      // (also when a word before `--` is built at run time, and when a wrapper — npm exec / npx / dlx … — could run the same package manager)
       const script = pmScriptOf(prefix);
       const end = raw.indexOf('--');
-      if (script && baseName(raw[0]) === baseName(prefix[0]) && raw.slice(1, end < 0 ? undefined : end).includes(script)) return directMergeVerdict(null, null, dir, ctx, `\`${prefix.join(' ')}\``, false, shaFlag);
+      const before = raw.slice(1, end < 0 ? undefined : end);
+      const same = baseName(raw[0]) === baseName(prefix[0]);
+      const wrapped = (same || PM_WRAPPERS.has(baseName(raw[0]))) && raw.some((w) => PM_WRAPPERS.has(String(w).toLowerCase())) && raw.some((w) => baseName(w) === baseName(prefix[0]));
+      if (script && ((same && (before.includes(script) || before.some((w) => DYNAMIC.test(w)))) || (wrapped && raw.includes(script)))) return directMergeVerdict(null, null, dir, ctx, `\`${prefix.join(' ')}\``, false, shaFlag);
       continue;
     }
     let head = null;
@@ -976,7 +987,9 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
     const { flags, positionals } = parseOpts(rest, { longValue: ['author-email', 'body', 'body-file', 'match-head-commit', 'repo', 'subject'], shortValue: 'AbFtR' });
     // (a real `--disable-auto` flag whose LAST setting is on, with `--auto` not on, turns a queued merge off and merges nothing. `--disable-auto`
     // as the value of --subject / --body …, `--disable-auto=false`, or one next to `--auto` is no cancellation: the PR merges)
-    if (boolFlag(flags, 'disable-auto') === 'on' && boolFlag(flags, 'auto') === 'off') return null;
+    // (and only when every flag is one gh pr merge has, and no word is built at run time: an unknown flag or a `$(…)` word could be what makes it a merge)
+    const known = flags.every((f) => (f.short ? GH_MERGE_SHORT.includes(f.name) : GH_MERGE_LONG.includes(f.name)));
+    if (known && !rest.some((t) => DYNAMIC.test(t)) && boolFlag(flags, 'disable-auto') === 'on' && boolFlag(flags, 'auto') === 'off') return null;
     // (gh reads the repository from -R, a PR URL or GH_REPO: set on this command, earlier on the line (unknown if it ran) or inherited. An empty GH_REPO selects nothing)
     const ghRepo = envVar(env, ctx, 'GH_REPO');
     const viaEnv = !ghRepo.known || (Object.hasOwn(env, 'GH_REPO') ? ghRepo.value !== '' : (ghRepo.value !== undefined && ghRepo.value !== '') || (typeof ctx.env?.GH_REPO === 'string' && ctx.env.GH_REPO !== ''));

@@ -171,3 +171,51 @@ test('#58 the repo\'s merge script run through another npm / pnpm / yarn spellin
   bad(`npm --mystery val run merge -- 8 --expect-head ${H8}`);
   assert.match(v(`npm --mystery val run merge -- 7 --expect-head ${H7}`).reason, /merge/);
 });
+
+// Security re-check of the findings above (parser differentials, fail-open paths)
+test('#58 gh pr merge flag parsing matches gh/pflag; anything unreadable is a merge that needs the record', () => {
+  const pin8 = `--match-head-commit ${H8}`;
+  for (const cmd of [
+    'gh pr merge 8 -sd --disable-auto=false', 'gh pr merge 8 -t=--disable-auto', 'gh pr merge 8 -t--disable-auto', 'gh pr merge 8 -sb --disable-auto', 'gh pr merge 8 --subject=--disable-auto',
+    'gh pr merge 8 --disable-auto --unknown-flag', 'gh pr merge 8 --unknown --disable-auto', 'gh pr merge 8 --disable-auto -x', 'gh pr merge 8 --disable-auto --disable-auto=', 'gh pr merge 8 --disable-auto=yes',
+    'gh pr merge 8 $(echo -t) --disable-auto', 'gh pr merge 8 `echo --subject` --disable-auto', 'gh pr merge 8 --disable-auto=$X', 'gh pr merge 8 -- --disable-auto',
+    'gh pr merge 8 --disable-auto --auto', 'gh pr merge 8 --auto --disable-auto --auto=1', `gh pr merge 8 -s --disable-auto=0 ${pin8}`,
+  ]) assert.equal(verdict(cmd).decision, 'deny', cmd);
+  for (const cmd of ['gh pr merge 8 --disable-auto', 'gh pr merge 8 -s --disable-auto', 'gh pr merge 8 --squash --delete-branch --disable-auto', 'gh pr merge 8 -sd --disable-auto', 'gh pr merge --disable-auto=1 8']) allow(cmd);
+  // `-R` before the verb belongs to `pr`; the verb is still `merge`
+  assert.equal(verdict(`gh pr -R o/chat merge 8 ${pin8}`, '/other').decision, 'deny');
+  assert.equal(verdict(`gh -R o/chat pr merge 8 ${pin8}`, '/other').decision, 'deny');
+  assert.equal(verdict(`gh pr --repo=o/chat merge 8 ${pin8}`, '/other').decision, 'deny');
+});
+
+test('#58 GH_REPO: every way it can be set (or be unknown) counts as another repository', () => {
+  const pin8 = `--match-head-commit ${H8}`;
+  for (const cmd of [
+    `GH_REPO=o/chat gh pr merge 8 ${pin8}`, `env GH_REPO=o/chat gh pr merge 8 ${pin8}`, `export GH_REPO=o/chat; gh pr merge 8 ${pin8}`, `declare -x GH_REPO=o/chat; gh pr merge 8 ${pin8}`,
+    `typeset -x GH_REPO=o/chat; gh pr merge 8 ${pin8}`, `GH_REPO=o/chat; gh pr merge 8 ${pin8}`, `GH_REPO=$R gh pr merge 8 ${pin8}`, `GH_REPO="$(cat r)" gh pr merge 8 ${pin8}`,
+    `R=o/chat; GH_REPO=$R gh pr merge 8 ${pin8}`, `export GH_REPO=o/a; export GH_REPO=o/b; gh pr merge 8 ${pin8}`, `env -i GH_REPO=o/chat gh pr merge 8 ${pin8}`, `env $X gh pr merge 8 ${pin8}`,
+    `command gh pr merge -R o/chat 8 ${pin8}`, `GH_REPO=o/chat command gh pr merge 8 ${pin8}`,
+  ]) assert.equal(verdict(cmd, '/other').decision, 'deny', cmd);
+  // (the same line from the chat repo's own folder is judged as before)
+  assert.equal(verdict(`GH_REPO=o/chat gh pr merge 8 ${pin8}`, '/chat').decision, 'deny');
+});
+
+test('#58 a package-manager wrapper or an unreadable option never hides the merge script; an unreadable pipeline.yml / directory fails closed', () => {
+  const tmpl = [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: '--expect-head' }];
+  const o = { ...opts('/chat'), ownerGo: { ...ownerGo, mergeTemplates: () => tmpl } };
+  const d = (cmd, over = {}) => evaluateGitCommand(cmd, { ...o, ...over }).decision;
+  for (const cmd of [
+    `npm --prefix x run merge -- 8 --expect-head ${H8}`, `npm -w a run merge -- 8 --expect-head ${H8}`, `npm exec -- npm run merge -- 8 --expect-head ${H8}`, `npm exec npm run merge -- 8`, `npx npm run merge -- 8 --expect-head ${H8}`,
+    `npx --yes npm run-script merge -- 8`, `npm x -- npm run merge -- 8`, `pnpm dlx npm run merge -- 8`, `npm run merge --if-present -- 8 --expect-head ${H8}`, `npm run --workspaces merge -- 8`,
+    `npm --foo bar run merge -- 8`, `npm --loglevel=silent run merge -- 8 --expect-head ${H8}`, `npm run merge 8 --expect-head=${H8}`, `env npm run merge -- 8 --expect-head ${H8}`, `command npm run merge -- 8`, `nice npm run merge -- 8`,
+    `npm run "mer""ge" -- 8`, `npm run $S -- 8`,
+  ]) assert.equal(d(cmd), 'deny', cmd);
+  for (const cmd of ['npm run build', 'npm --prefix x run build', 'npm exec -- prettier --check .', 'npx prettier .', 'npm test -- merge']) assert.equal(d(cmd), 'allow', cmd);
+  // yml unreadable: the templates are unknown, so a package-manager call naming `merge` is the merge command
+  const broken = { ...o, ownerGo: { ...ownerGo, mergeTemplates: () => { throw new Error('bad yml'); } } };
+  assert.equal(evaluateGitCommand(`npm run merge -- 8 --expect-head ${H8}`, broken).decision, 'deny');
+  assert.equal(evaluateGitCommand('npm run build', broken).decision, 'allow');
+  // directory unknown after a cd the guard cannot follow
+  assert.equal(evaluateGitCommand(`false && cd /x; npm run merge -- 8 --expect-head ${H8}`, o).decision, 'deny');
+  assert.equal(evaluateGitCommand('false && cd /x; npm run build', o).decision, 'allow');
+});
