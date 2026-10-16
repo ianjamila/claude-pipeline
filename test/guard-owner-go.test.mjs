@@ -186,7 +186,9 @@ test('#58 the repo\'s merge script run through another npm / pnpm / yarn spellin
     if (pre.startsWith('npm exec')) continue; // (a wrapper the policy never unwraps: out of scope here)
     bad(`${pre} 8 --expect-head ${H8}`);
     unpinned(`${pre} 7`);
-    ok(`${pre} 7 --expect-head ${H7}`);
+    // (round 4: only a template's own spelling is approvable; every other spelling of the script is refused even with a record)
+    if (['npm run merge --', 'pnpm run merge --', 'yarn merge'].includes(pre)) ok(`${pre} 7 --expect-head ${H7}`);
+    else bad(`${pre} 7 --expect-head ${H7}`);
   }
   // another script, or a word that only appears after `--`, is not the merge command
   for (const cmd of ['npm --silent run build', 'npm run-script merge-report', 'npm --silent run build -- merge', 'npm test', 'npm install merge-deep', 'pnpm build', 'yarn build']) ok(cmd);
@@ -251,15 +253,18 @@ test('#58 round 3: the merge script through yarn / pnpm / npm is the merge comma
   for (const cmd of [`yarn run merge 8 --expect-head ${H8}`, `yarn merge 8 --expect-head ${H8}`, `pnpm run merge 8 --expect-head ${H8}`, `pnpm merge 8 --expect-head ${H8}`,
     `pnpm run merge -- 8 --expect-head ${H8}`, `yarn --silent merge 8 --expect-head ${H8}`, `npm run-script merge -- 8 --expect-head ${H8}`, `yarn merge 7`, `pnpm merge 7 --no-update`,
     `yarn --mystery val run merge 8 --expect-head ${H8}`]) assert.equal(d(cmd, npmOnly).decision, 'deny', cmd);
-  assert.match(d(`yarn merge 8 --expect-head ${H8}`, npmOnly).reason, /#8 at head 888888888888/);
-  assert.match(d('pnpm merge 7', npmOnly).reason, /must pin the head/);
-  for (const cmd of [`yarn run merge 7 --expect-head ${H7}`, `yarn merge 7 --expect-head=${H7}`, `pnpm run merge 7 --expect-head ${H7}`, `pnpm merge 7 --expect-head ${H7}`, `pnpm merge -- 7 --expect-head ${H7}`,
-    'yarn build', 'pnpm build', 'yarn run merge-report', 'pnpm run-script merge-report', 'yarn install', 'pnpm test']) assert.equal(d(cmd, npmOnly).decision, 'allow', `${cmd}: ${d(cmd, npmOnly).reason}`);
+  assert.match(d(`yarn merge 8 --expect-head ${H8}`, npmOnly).reason, /npm run merge -- <PR> --expect-head/); // (round 4: it names the canonical form, not the PR)
+  assert.match(d('pnpm merge 7', npmOnly).reason, /P merge --pr N/);
+  // (round 4: yarn / pnpm forms with a record were allowed here; with an npm template no other manager is approvable any more)
+  for (const cmd of [`yarn run merge 7 --expect-head ${H7}`, `yarn merge 7 --expect-head=${H7}`, `pnpm run merge 7 --expect-head ${H7}`, `pnpm merge 7 --expect-head ${H7}`, `pnpm merge -- 7 --expect-head ${H7}`]) assert.equal(d(cmd, npmOnly).decision, 'deny', cmd);
+  for (const cmd of ['yarn build', 'pnpm build', 'yarn run merge-report', 'pnpm run-script merge-report', 'yarn install', 'pnpm test']) assert.equal(d(cmd, npmOnly).decision, 'allow', `${cmd}: ${d(cmd, npmOnly).reason}`);
   // and the other way round: a yarn / pnpm template, the call through npm
   for (const prefix of [['yarn', 'merge'], ['pnpm', 'run', 'merge', '--']]) {
     const o = only(prefix);
     assert.equal(d(`npm run merge -- 8 --expect-head ${H8}`, o).decision, 'deny', prefix.join(' '));
-    assert.equal(d(`npm run merge -- 7 --expect-head ${H7}`, o).decision, 'allow', prefix.join(' '));
+    // (round 4: was 'allow' — with a yarn / pnpm template the npm spelling is no longer approvable; the template's own spelling is)
+    assert.equal(d(`npm run merge -- 7 --expect-head ${H7}`, o).decision, 'deny', prefix.join(' '));
+    assert.equal(d(`${prefix.join(' ')} 7 --expect-head ${H7}`, o).decision, 'allow', prefix.join(' '));
   }
 });
 
@@ -270,13 +275,11 @@ test('#58 round 3: npm keeps the options written before `--` for itself, so only
   for (const cmd of [`npm run merge 7 --expect-head=${H7}`, `npm run merge 7 --expect-head ${H7}`, `npm run merge --expect-head=${H7} -- 7`, `npm run-script merge 7 --expect-head ${H7}`, `npm --silent run merge 7 --expect-head=${H7}`]) {
     assert.equal(d(cmd).decision, 'deny', cmd);
   }
-  assert.match(d(`npm run merge 7 --expect-head=${H7}`).reason, /without a literal PR number|must pin the head/);
+  assert.match(d(`npm run merge 7 --expect-head=${H7}`).reason, /npm run merge -- <PR> --expect-head <full 40-character head>/); // (round 4: the canonical form is named)
   assert.match(d(`npm run merge -- 7 --expect-head ${H7} --expect-head ${H8}`).reason, /must pin the head/);
-  for (const cmd of [`npm run merge -- 7 --expect-head=${H7}`, `npm run merge --if-present -- 7 --expect-head ${H7}`, `npm run-script merge -- 7 --no-update --expect-head ${H7}`]) {
-    assert.equal(d(cmd).decision, 'allow', `${cmd}: ${d(cmd).reason}`);
-  }
-  // yarn and pnpm forward the words after the script name
-  for (const cmd of [`yarn merge 7 --expect-head=${H7}`, `pnpm merge 7 --expect-head ${H7}`, `pnpm run merge 7 --expect-head=${H7}`]) assert.equal(d(cmd).decision, 'allow', `${cmd}: ${d(cmd).reason}`);
+  // (round 4: `npm run merge --if-present -- …`, `npm run-script merge -- …` and the yarn / pnpm forms were allowed with a record; only the template's shape is now)
+  assert.equal(d(`npm run merge -- 7 --expect-head=${H7}`).decision, 'allow');
+  for (const cmd of [`npm run merge --if-present -- 7 --expect-head ${H7}`, `npm run-script merge -- 7 --no-update --expect-head ${H7}`, `yarn merge 7 --expect-head=${H7}`, `pnpm merge 7 --expect-head ${H7}`, `pnpm run merge 7 --expect-head=${H7}`]) assert.equal(d(cmd).decision, 'deny', cmd);
   assert.equal(d(`yarn merge 7 --expect-head ${H8}`).decision, 'deny');
 });
 
@@ -293,4 +296,56 @@ test('#58 round 3: read-only and install package-manager commands that only ment
     assert.equal(d(cmd).decision, 'deny', cmd);
   }
   assert.equal(evaluateGitCommand('npm view merge version', { ...o, ownerGo: { ...ownerGo, mergeTemplates: () => { throw new Error('bad yml'); } } }).decision, 'allow');
+});
+
+// #58 round 4 (strict shape): the repo's package-script merge command is approvable ONLY in the template's own canonical shape; every
+// other way that may run that script is refused, so the guard no longer has to recognise each package runner one by one.
+test('#58 round 4: only the template\'s exact shape is approvable; every other way to run the merge script is refused', () => {
+  const only = (prefix) => ({ ...opts('/other'), ownerGo: { ...ownerGo, mode: () => 'chat', mergeTemplates: () => [{ prefix, shaFlag: '--expect-head' }] } });
+  const npmOnly = only(['npm', 'run', 'merge', '--']);
+  const d = (cmd, o = npmOnly) => evaluateGitCommand(cmd, o);
+  const CANON = /npm run merge -- <PR> --expect-head <full 40-character head>/;
+  // canonical: allowed with a record, refused without one
+  assert.equal(d(`npm run merge -- 7 --expect-head ${H7}`).decision, 'allow', d(`npm run merge -- 7 --expect-head ${H7}`).reason);
+  assert.equal(d(`npm run merge -- 7 --no-update --expect-head=${H7}`).decision, 'allow');
+  assert.match(d(`npm run merge -- 8 --expect-head ${H8}`).reason, /#8 at head 888888888888/);
+  // words before `--` reach npm / the script: Codex P1 (`npm run merge 8 -- 7` forwards 8 and 7)
+  for (const cmd of [`npm run merge 8 -- 7 --expect-head=${H7}`, `npm run merge 8 -- 7 --expect-head ${H7}`]) assert.match(d(cmd).reason, CANON, cmd);
+  // an option or a spelling that moves the target directory, from a cwd that is not the chat repo
+  for (const cmd of [`npm --prefix /chat run merge -- 8 --expect-head ${H8}`, `npm --prefix=/chat run merge -- 8 --expect-head ${H8}`, `pnpm -C /chat run merge -- 8 --expect-head ${H8}`, `pnpm --dir /chat merge 8 --expect-head ${H8}`,
+    `yarn --cwd /chat merge 8 --expect-head ${H8}`, `npm -w pkg run merge -- 8 --expect-head ${H8}`, `npm --workspace=pkg run merge -- 8 --expect-head ${H8}`, `pnpm --filter pkg merge 8 --expect-head ${H8}`, `yarn workspace pkg merge 8 --expect-head ${H8}`,
+    `npm --prefix /chat run merge -- 7 --expect-head ${H7}`, `bun --cwd /chat run merge 8 --expect-head ${H8}`]) {
+    assert.match(d(cmd).reason, CANON, cmd);
+  }
+  // another manager, a wrapper, or another spelling of the subcommand: not approvable even with a record for the PR and head
+  for (const cmd of [`bun run merge 8 --expect-head ${H8}`, `bun run merge 7 --expect-head ${H7}`, `npx npm@11 run merge -- 8 --expect-head ${H8}`, `npx npm@11 run merge -- 7 --expect-head ${H7}`, `corepack pnpm run merge -- 8 --expect-head ${H8}`,
+    `corepack yarn merge 7 --expect-head ${H7}`, `pnpx pnpm merge 7 --expect-head ${H7}`, `bunx bun run merge 7 --expect-head ${H7}`, `yarn merge 7 --expect-head ${H7}`, `pnpm run merge 7 --expect-head ${H7}`, `pnpm merge -- 7 --expect-head ${H7}`,
+    `npm run-script merge -- 7 --expect-head ${H7}`, `npm --silent run merge -- 7 --expect-head ${H7}`, `npm run --silent merge -- 7 --expect-head ${H7}`, `npm run merge --if-present -- 7 --expect-head ${H7}`, `npm rum merge -- 7 --expect-head ${H7}`,
+    `/usr/local/bin/npm --silent run merge -- 7 --expect-head ${H7}`, `pnpm run merge -- 7 --expect-head ${H7}`]) {
+    assert.match(d(cmd).reason, CANON, cmd);
+  }
+  // the message offers P merge too
+  assert.match(d(`bun run merge 7 --expect-head ${H7}`).reason, /P merge --pr N/);
+  // read-only subcommands that only mention `merge` are still no merge, and so are other scripts
+  for (const cmd of ['npm view merge version', 'npm --prefix /chat ls merge', 'yarn info merge', 'pnpm add merge', 'bun add merge', 'npm run merge-report', 'bun run build', 'npx prettier .', 'npm run build -- merge']) {
+    assert.equal(d(cmd).decision, 'allow', `${cmd}: ${d(cmd).reason}`);
+  }
+  // an unknown subcommand is still refused (fail closed)
+  assert.match(d('npm frobnicate merge').reason, CANON);
+  // other managers' templates: the template's own spelling is the one approvable shape
+  const pnpmT = only(['pnpm', 'run', 'merge', '--']);
+  assert.equal(d(`pnpm run merge -- 7 --expect-head ${H7}`, pnpmT).decision, 'allow');
+  assert.match(d(`npm run merge -- 7 --expect-head ${H7}`, pnpmT).reason, /pnpm run merge -- <PR> --expect-head <full 40-character head>/);
+  const yarnT = only(['yarn', 'merge']);
+  assert.equal(d(`yarn merge 7 --expect-head ${H7}`, yarnT).decision, 'allow');
+  assert.match(d(`yarn run merge 7 --expect-head ${H7}`, yarnT).reason, /yarn merge <PR> --expect-head/);
+  // not a chat repo (from its own cwd): nothing changes, but a directory option makes the target unknown, so it is judged as chat
+  const none = { ...opts('/other'), ownerGo: { ...ownerGo, mode: () => 'none', mergeTemplates: () => [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: '--expect-head' }] } };
+  assert.equal(d(`bun run merge 8 --expect-head ${H8}`, none).decision, 'allow');
+  assert.equal(d(`npm --prefix /chat run merge -- 8 --expect-head ${H8}`, none).decision, 'deny');
+  // several templates: any one canonical shape is approvable
+  const many = { ...opts('/chat'), ownerGo: { ...ownerGo, mergeTemplates: () => [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: '--expect-head' }, { prefix: ['yarn', 'merge'], shaFlag: '--expect-head' }] } };
+  assert.equal(d(`yarn merge 7 --expect-head ${H7}`, many).decision, 'allow');
+  assert.equal(d(`npm run merge -- 7 --expect-head ${H7}`, many).decision, 'allow');
+  assert.equal(d(`pnpm merge 7 --expect-head ${H7}`, many).decision, 'deny');
 });

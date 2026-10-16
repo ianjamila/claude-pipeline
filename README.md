@@ -233,7 +233,11 @@ head you did not review (the receipt names the head the event carried).
   calls the recorder's library, `curl` with your token, a local edit of the refs or `pipeline.yml` the guard reads) can still
   forge or skip it, and chat-mode CI passes owner items. It stops mistakes and casual workarounds, not a determined agent. The
   server-side backstop is a second GitHub identity plus a ruleset (issue #65). A direct `gh pr merge` in a chat repo must pin
-  the head (`--match-head-commit`, or the head flag of the repo's merge command) the owner said "merge" for in this session. The chat
+  the head (`--match-head-commit`, or the head flag of the repo's merge command) the owner said "merge" for in this session. When
+  the repo's merge command is a package script (`npm run merge -- {pr} --expect-head {sha}`), only that exact shape typed by hand is approvable: the
+  template's own words, then `--`, the PR and the pin, with nothing between the script name and `--` and no manager option before it. Any other way
+  of running the script (another manager or spelling, `run-script`, a wrapper such as `npx npm@11`, `--prefix` / `-C` / `--cwd` / workspace options,
+  words before `--`) is refused in a chat repo; the refusal names the exact form. Merge through `P merge --pr N` otherwise. The chat
   mode is read from the repository the command runs in: a nested or separate clone whose own `pipeline.yml` is not chat is
   not caught (a protected registry of chat repos is the planned fix).
 - **Branch protection needs GitHub Pro** for private repos. Without it a repo runs in `gate`
