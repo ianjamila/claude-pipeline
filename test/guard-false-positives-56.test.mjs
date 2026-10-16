@@ -454,6 +454,7 @@ test('#56 Codex review of 8b86e2b: a later loop, a loop that may not run and an 
     'N="b"; for b in agent/x; do : "${(P)N::=main}"; git push origin $b; done',
     'B=agent/x; : "${(P)N::=main}"; git push origin $B', // (on main too)
     'B=agent/x; : "${!N}"; git push origin $B',
+    'B=agent/x; : "${(e)X}"; git push origin $B', // (zsh e flag: X may hold ${B::=main})
     'false && for b in agent/x; do :; done; git push origin $b', // (the loop is skipped: b keeps the value it had)
     'true || for b in agent/x; do :; done; git push origin $b',
     'if false; then for b in agent/x; do :; done; fi; git push origin $b',
