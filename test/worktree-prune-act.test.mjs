@@ -456,3 +456,18 @@ test('removeWorktree: the holding folder lock is released afterwards (a second r
   }
   assert.equal(listHolding(h)[0].items, 2);
 });
+
+test('holdingLockName: a symlink alias of the holding folder names the same lock', { skip: process.platform === 'win32' }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'hl-'));
+  const real = join(base, 'holding'); mkdirSync(real);
+  const alias = join(base, 'alias'); symlinkSync(real, alias);
+  assert.equal(holdingLockName(alias), holdingLockName(real));
+});
+
+test('holdingLockName: a holding folder not created yet, under a symlinked parent, names the same lock as under the real parent', { skip: process.platform === 'win32' }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'hl-'));
+  const realParent = join(base, 'parent'); mkdirSync(realParent);
+  const aliasParent = join(base, 'parent-alias'); symlinkSync(realParent, aliasParent);
+  assert.equal(holdingLockName(join(aliasParent, 'not', 'yet')), holdingLockName(join(realParent, 'not', 'yet')));
+  assert.notEqual(holdingLockName(join(realParent, 'a')), holdingLockName(join(realParent, 'b')));
+});
