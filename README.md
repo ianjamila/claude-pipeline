@@ -229,8 +229,9 @@ head you did not review (the receipt names the head the event carried).
   mode (skills and CLI only) and preflight says so.
 - **Local verify, lean CI.** The full verify runs on your machine; CI keeps the repo's existing
   checks plus the cheap guard jobs, and runs E2E only for high-risk PRs.
-- **Agent log is delayed.** `docs/agent-log.md` can't be pushed to `main` directly, so each run's
-  outcome line is committed in the *next* ship PR. The PR's summary comment is the immediate record.
+- **Agent log lives on its own branch.** `docs/agent-log.md` can't be pushed to `main` directly and a file every PR edits would
+  conflict, so each run's outcome line is pushed to the orphan branch `pipeline-agent-log` (never into a PR). If that push
+  fails, the line stays queued and goes out with the next run. The PR's summary comment is the immediate record.
 - **Rollback race.** prod-watch re-reads the live deployment before and after rolling back and
   reports `superseded`, `recovered` or `rollback-failed`; a deploy from a merge outside the run
   can still race it, but is always detected, never silent. After a Vercel rollback, Vercel stops

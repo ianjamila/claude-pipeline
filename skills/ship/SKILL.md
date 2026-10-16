@@ -57,8 +57,8 @@ number, `R` a review round number, `<slug>` the branch slug.
 ## Ending a run with a PR open
 
 A run that has a PR and ends for any reason except a successful merge ends with exactly one
-`P summary --pr N --outcome <word> --action "<the one thing the owner does>" [--cause <code>]`, then the agent-log
-queue line (Step 7). The summary also pushes the owner's phone; `P prod-watch` pushes the production result itself.
+`P summary --pr N --outcome <word> --action "<the one thing the owner does>" [--cause <code>]`, then
+`P agent-log publish --line "<agentLogLine>"` (Step 7). The summary also pushes the owner's phone; `P prod-watch` pushes the production result itself.
 Notifications are automatic: never send one for progress, and use `P notify --event stopped --pr N --action "…"`
 only for a stop that cannot go through summary. Two shapes, used by name below:
 
@@ -134,7 +134,7 @@ note it in the summary and carry on, never stop the run for it.
    gh pr edit N --add-label pipeline-blocked --body-file <body file>
    P comment --pr N --kind blocked
    P summary --pr N --outcome blocked --cause verify-red --action "Read the blocked comment: verify stays red after 3 fixes" --built "<what was attempted and where it stuck>"
-   P agent-log queue --line "<agentLogLine from the summary output>"
+   P agent-log publish --line "<agentLogLine from the summary output>"
    ```
    (The PR exists since the first checkpoint: label it, no second `gh pr create`. `blocked` works without review
    state; the PR body carries the verify report table.) Stop.
@@ -188,7 +188,7 @@ rules in chat, record it with `P triage owner-ruling` (**Owner rules in chat** i
 Codex `exitCode: 3` at any point (Codex unavailable) ⇒ `gh pr edit N --add-label awaiting-review`,
 `P comment --pr N --kind awaiting-review --reason "<reason from the JSON>"`,
 `P summary --pr N --outcome awaiting-review --cause codex:<reason> --action "Say \"resume pipeline reviews\" when Codex is back" --built "<what is done>"` (works even in round 1, when no
-review state exists yet), `P agent-log queue --line "<agentLogLine>"`, stop.
+review state exists yet), `P agent-log publish --line "<agentLogLine>"` (exit 3 is fine: the line stays queued), stop.
 
 ## Step 5 — final gate
 
@@ -196,9 +196,7 @@ Details and every exit code: `reference/gates-and-exits.md`. First: `P checkpoin
 
 1. Recompute the checks on the head as it is NOW (review fixes may have moved risk): `P risk`,
    `P hardstops … > .review/hardstops.json` and `P integrity`, as in Step 3.2. A new blocking
-   hard-stop hit ⇒ Step 3.5. Then, only when `production.watch` is `workflow` (read it from `P config`), `P agent-log close
-   --queue` (queues the production results the workflow posted on earlier merged PRs; exit 1 = some PRs could not be read: still run `agent-log stage` and name them in the summary; exit 3 = GitHub unavailable: skip the close, still stage); then `P agent-log stage --pr N`
-   (commits this run's log line + queued lines into the PR branch) and `git push origin agent/<slug>`.
+   hard-stop hit ⇒ Step 3.5. (The agent log is never committed to the PR branch: Step 7 publishes it to the `pipeline-agent-log` branch.)
 2. Up to date with the base — docs-only and light-lane PRs too, so the gate (and the CI it waits on)
    judges the tree that will land: `P job start update -- node ~/.claude/pipeline/bin/pipeline.mjs
    update-branch --pr N` → `P job wait update --run-id <runId> --timeout 540` (repeat until `done`).
@@ -269,7 +267,7 @@ cannot: see `reference/gates-and-exits.md`.
    the project smokes production and posts the result on the merged PR, and nothing is rolled back. prod-watch is what
    sends the production push, so here no production push is sent: the workflow owns that result. Summary outcome
    `merged` (it pushes nothing); tell the user the workflow posts the production result on the PR and never rolls back (a later ship run
-   copies it into the agent log, Step 5.1). Otherwise merged ⇒ `P job start prod -- node ~/.claude/pipeline/bin/pipeline.mjs prod-watch --sha
+   copies it into the agent log, Step 7). Otherwise merged ⇒ `P job start prod -- node ~/.claude/pipeline/bin/pipeline.mjs prod-watch --sha
    <mergeSha> --pr N [--expect-text …]` (no `mergeSha`: `prod-watch --pr N`, it reads the merge
    commit itself) → `P job wait prod --run-id <runId> --timeout 540`. `--expect-text` must be text
    the NEW build shows: smokes of a rolled-back or superseded deployment ignore it. Read the
@@ -303,7 +301,7 @@ each `P merge`, take the `ownerMerge` count of the `P final-gate --pr N` that co
   a retry after a head change (Step 5.2, a `behind-base` return, a refreshed gate) needs a new stop. If there is no such
   approval, STOP:
   1. Post one comment: `gh pr comment N --body "<each item: rule, file, one-line why; head <sha7>; the owner merges by saying \"merge\" in chat>"`.
-  2. `P checkpoint --pr N --step awaiting-owner-merge`, then `P summary --pr N --outcome awaiting-owner-merge --action "Check the listed items, then say \"merge\" for head <sha7>" --built "…"`, queue the agent-log line (Step 7), end the run with
+  2. `P checkpoint --pr N --step awaiting-owner-merge`, then `P summary --pr N --outcome awaiting-owner-merge --action "Check the listed items, then say \"merge\" for head <sha7>" --built "…"`, publish the agent-log line (Step 7), end the run with
      outcome `awaiting-owner-merge`, keep the worktree. The reply's LAST two lines are exactly (7 = the first 7 characters of the head):
      `Head <sha7>`
      `🔀 Ready to merge #N — say "merge"`
@@ -315,9 +313,15 @@ The owner's chat message is the approval; never add an approval label yourself (
 ## Step 7 — summary
 
 `P summary --pr N --outcome <outcome> --action "<the one thing the owner does>" --built "<2–3 sentences>"` posts the summary comment
-(outliers first) and prints `agentLogLine`. Queue that line — `P agent-log queue --line
-"<agentLogLine>"` — for every outcome except a clean `merged` (that run's line was staged in
-Step 5.1). Then tell the user, in plain English: what shipped, PR link, outcome, follow-up issues,
+(outliers first) and prints `agentLogLine` (for `--outcome merged` also `pendingLogLine`, the same line ending
+`merged — prod smoke pending`, which `agent-log close` later resolves). Log it for EVERY outcome, a clean `merged` run included:
+when `production.watch` is `workflow` (read it from `P config`) first `P agent-log close --queue` (queues the production results the
+workflow posted on earlier merged PRs; exit 1 = some PRs could not be read: still publish and name them in the summary; exit 3 =
+GitHub unavailable: skip the close, still publish), then `P agent-log publish --line "<line>"` with `pendingLogLine` for a merged run
+under `workflow` and `agentLogLine` otherwise. `publish` appends every queued line plus this one to `docs/agent-log.md` on the
+`pipeline-agent-log` branch and pushes only that branch: it commits nothing to the PR branch, so no new head to approve and no
+conflicts. Exit 3 (push or network failed) is fine: the lines stay queued and go out with the next run; say so in the summary.
+Then tell the user, in plain English: what shipped, PR link, outcome, follow-up issues,
 anything needing them. Release the worktree's keep lock: `P worktrees unkeep agent-<slug> --run agent-<slug>`, then
 `P worktrees prune --notify` and read `summary` (or `skipped`). Prune removes the worktree once its PR has been merged
 for 24 h and keeps it while the PR waits for a human or for Codex; never remove it by hand.
