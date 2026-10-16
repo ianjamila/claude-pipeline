@@ -49,7 +49,7 @@ function both(command, spec, dirs = ['scripts']) {
   };
 }
 // run.sh / run2.sh / scripts/run2.sh hold the guarded command; ok.sh / run1.sh / scripts/run1.sh are harmless
-const SPEC = { 'RUN.SH': 'bad', 'run.sh': 'bad', 'run2.sh': 'bad', 'ok.sh': 'ok', 'run1.sh': 'ok', 'scripts/run2.sh': 'bad', 'scripts/run1.sh': 'ok' };
+const SPEC = { 'run3.sh': 'bad', 'RUN4.SH': 'bad', 'run.sh': 'bad', 'run2.sh': 'bad', 'ok.sh': 'ok', 'run1.sh': 'ok', 'scripts/run2.sh': 'bad', 'scripts/run1.sh': 'ok' };
 const allow = (cmd, spec = SPEC) => {
   const r = both(cmd, spec);
   assert.equal(r.git.decision, 'allow', `git: ${cmd} -> ${r.git.reason}`);
@@ -130,7 +130,7 @@ test('B2 replace, trim, case and substring operators on a known value', () => {
   denyBoth('F=ok.sh; G=${F//ok/run}; bash $G');
   denyBoth('F=run2.sh; G=${F%2.sh}.sh; bash $G');
   denyBoth('F=xrun.sh; G=${F#x}; bash $G');
-  denyBoth('F=RUN.SH; G=${F,,}; bash $G');
+  denyBoth('F=RUN3.SH; G=${F,,}; bash $G');
   denyBoth('F=run.sh.bak; G=${F%.bak}; bash $G');
   denyBoth('F=xxrun.sh; G=${F:2}; bash $G');
   allow('F=ok.sh; G=${F/ok/run1}; bash $G');
@@ -287,7 +287,7 @@ test('B8 assigningDefaults itself: a cap or a give-up leaves an unknown word in 
 });
 
 test('B8 case, element-index and long-array forms', () => {
-  denyBoth('F=run.sh; G=${F^^}; bash $G');
+  denyBoth('F=run4.sh; G=${F^^}; bash $G');
   denyBoth('F=(ok.sh [5]=run.sh); bash ${F[5]}');
   const els = Array.from({ length: 70 }, (_, i) => `e${i}.sh`).join(' ');
   denyBoth(`F=(${els}); G=\${F[1]%%*}; bash $G`); // (70 words are more than kept: whatever an operator makes of them is unknown)
