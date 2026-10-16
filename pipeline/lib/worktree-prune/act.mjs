@@ -10,7 +10,7 @@ import path from 'node:path';
 import { GitError, git } from '../git.mjs';
 import { listWorktrees } from '../local-branches.mjs';
 import { LockTimeoutError, withLock } from '../locks.mjs';
-import { isInside, samePath } from '../paths.mjs';
+import { canonicalPath, isInside, samePath } from '../paths.mjs';
 import { entriesFor, processesInside, recentFiles, walkTree } from './inspect.mjs';
 import { classifyEntries } from './rules.mjs';
 
@@ -216,7 +216,7 @@ export function archivePaths({ wtPath, originalRoot = wtPath, rels, holdingDir, 
   return { batchDir, items };
 }
 
-export const holdingLockName = (holdingDir) => `worktrees-holding-${createHash('sha256').update(path.resolve(holdingDir)).digest('hex').slice(0, 12)}`;
+export const holdingLockName = (holdingDir) => `worktrees-holding-${createHash('sha256').update(canonicalPath(holdingDir)).digest('hex').slice(0, 12)}`;
 
 // The lock is keyed by the holding folder (not the git common dir the run lock uses): two clones of one repo have two run
 // locks but one holding folder. A lock that cannot be had within lockWaitMs throws LockTimeoutError: callers keep the worktree.
