@@ -510,6 +510,8 @@ test('#56 Codex recheck of d925d42: a builtin that sets a name it is not given (
   ]) assert.equal(files(cmd, fakeFs(PROJ, {}, DIRS)).decision, 'deny', cmd);
   for (const cmd of [
     'B=agent/x; zparseopts -D -a B b; git push origin $B',
+    'B=agent/x; zparseopts -D b:=B; git push origin $B', // (the spec names B after =)
+    'B=agent/x; strftime -s B %s 1; git push origin $B',
     'B=agent/x; print -v B main; git push origin $B',
     'B=agent/x; vared B; git push origin $B',
     'MATCH=agent/x; [[ main =~ main ]]; git push origin $MATCH',
