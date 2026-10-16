@@ -1572,12 +1572,12 @@ function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0) {
   // NAME is only known at run time (export / declare / local / typeset / readonly, read, mapfile, getopts, unset, let, select, printf -v) may set
   // any variable: every name the line assigns or reads is unknown from here on.
   // (#56, Codex review of 8b86e2b: zsh `${(P)N::=main}` assigns the variable N names, a bash `${!N…}` reads or sets through it: the same, on main too)
-  if (cmds.some(bindsRunTimeName) || cmds.some((c) => indirectExpansion(c, cmds)) || (cmds.heredocSpans ?? []).some?.((s) => !s[2]) && INDIRECT_EXPANSION.test(String(ctx.fullText ?? ''))) for (const k of [...Object.keys(ctx.vars), ...namesReadOn(cmds)]) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
+  if (cmds.some(bindsRunTimeName) || cmds.some((c) => indirectExpansion(c, cmds)) || (cmds.heredocSpans ?? []).some?.((s) => !s[2]) && (!ctx.fullText || INDIRECT_EXPANSION.test(String(ctx.fullText)))) for (const k of [...Object.keys(ctx.vars), ...namesReadOn(cmds)]) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
 }
 // A zsh parameter expansion with flags (`${(P)N::=x}` assigns the variable N names) or a bash indirect one (`${!N}`), anywhere in a command's words.
 // (#56 replay of 96848c2: judged on the command's own text, single-quoted parts blanked — a `node -e '…${(x)}…'` program is no expansion; its words, quotes
 // removed, when the text is not there or the line has an unquoted heredoc, whose body expands and is not in the command's text: then the line's whole
-// text is looked at, fail closed)
+// text is looked at, fail closed; inside a script the guard opens there is no line text: an unquoted heredoc there counts as one)
 const indirectExpansion = (c, cmds) => (typeof c.raw === 'string' && c.raw && !(cmds?.heredocSpans ?? []).some?.((s) => !s[2]) ? indirectExpansionOnLine(c.raw, null) : argvIndirect(c));
 const argvIndirect = (c) => [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')].some((w) => INDIRECT_EXPANSION.test(String(w)));
 // A command that binds a variable whose name is only known at run time (see collectAssignments).

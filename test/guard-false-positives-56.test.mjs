@@ -570,10 +570,13 @@ test('#56 replay of 96848c2: template text the shell never expands, and zsh flag
     'F=safe; : ${(s:$X:)Y}; printf x > ~/.claude/$F',
     'F=safe; : "\\\\${(P)N::=settings.json}"; printf x > ~/.claude/$F', // (an escaped backslash: the expansion is real)
     "F=safe; cat <<EOF\n${(P)N::=settings.json}\nEOF\nprintf x > ~/.claude/$F", // (an unquoted heredoc body expands)
+    "F=safe; : \"$(echo '\"')${(P)N::=settings.json}\"; echo \"'\"; printf x > ~/.claude/$F", // (a quote inside $( ) inside double quotes: the scanner must not lose its place)
+    "F=safe; : \"`echo '\"'`${(P)N::=settings.json}\"; echo \"'\"; printf x > ~/.claude/$F",
   ]) assert.equal(files(cmd, D).decision, 'deny', cmd);
   for (const cmd of [
     'B=agent/x; : ${(f)B::=main}; git push origin $B',
     "B=agent/x; cat <<EOF\n${(P)N::=main}\nEOF\ngit push origin $B",
+    "B=agent/x; : \"$(echo '\"')${(P)N::=main}\"; echo \"'\"; git push origin $B",
   ]) denyGit(cmd, SPEC);
   allowGit("B=agent/x; node -e 'const m = `${(e.stderr)}`'; git push origin $B", SPEC);
 });

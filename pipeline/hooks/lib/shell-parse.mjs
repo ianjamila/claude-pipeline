@@ -682,6 +682,9 @@ export function indirectExpansionOnLine(str, cmds) {
     const ch = t[i];
     if (q === "'") { if (ch === "'") q = null; u += ch === '\n' ? '\n' : ' '; continue; }
     if (ch === '\\') { u += '  '; i++; continue; }
+    // (a $( … ) or backtick inside double quotes starts a new quoting context, whose quotes this scanner does not follow: `"$(echo '"')${(P)N::=x}"; echo "'"`
+    // would lose its place and blank the real expansion. Then nothing is blanked: the whole text is judged; security review of f79370b)
+    if (q === '"' && (ch === '`' || (ch === '$' && t[i + 1] === '('))) return INDIRECT_EXPANSION.test(t.replace(SAFE_FLAG_EXPANSION, '${'));
     if (q === '"') { if (ch === '"') q = null; u += ch; continue; }
     if (ch === "'") { if (t[i - 1] === '$') return true; q = "'"; u += ' '; continue; }
     if (ch === '"') q = '"';
