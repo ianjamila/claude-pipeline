@@ -507,11 +507,16 @@ test('#56 Codex recheck of d925d42: a builtin that sets a name it is not given (
     'F=safe; strftime -s F %s 1; printf x > ~/.claude/$F',
     'F=safe; print -v F settings.json; printf x > ~/.claude/$F',
     'F=safe; integer F=1; printf x > ~/.claude/$F',
+    'F=safe; zformat -f F settings.json; printf x > ~/.claude/$F',
+    'REPLY=safe; ztcp localhost 1; printf x > ~/.claude/$REPLY', // (ztcp sets REPLY)
+    'F=safe; zsystem flock -f F /tmp/l; printf x > ~/.claude/$F',
   ]) assert.equal(files(cmd, fakeFs(PROJ, {}, DIRS)).decision, 'deny', cmd);
   for (const cmd of [
     'B=agent/x; zparseopts -D -a B b; git push origin $B',
     'B=agent/x; zparseopts -D b:=B; git push origin $B', // (the spec names B after =)
     'B=agent/x; strftime -s B %s 1; git push origin $B',
+    'B=agent/x; zformat -f B main; git push origin $B',
+    'REPLY=agent/x; ztcp localhost 1; git push origin $REPLY',
     'B=agent/x; print -v B main; git push origin $B',
     'B=agent/x; vared B; git push origin $B',
     'MATCH=agent/x; [[ main =~ main ]]; git push origin $MATCH',

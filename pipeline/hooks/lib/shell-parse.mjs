@@ -582,7 +582,10 @@ const BASH_REF = /\$BASH(?![A-Za-z0-9_])|\$\{BASH(?::?-(?:bash|sh))?\}/g;
 const BINDERS = /(?<![\w.$/-])(?:read|declare|typeset|local|export|readonly|mapfile|readarray|getopts|unset|let|vared|zparseopts|printf|print|strftime|zstyle|sysread|zstat|getln|integer|float|select|set|autoload|compgen)(?![\w-])([^\n;&|<>]*)/g;
 // Why (#56, Codex recheck of d925d42): zsh builtins that bind names their operands give in shapes the guards do not read (`zparseopts -a B`, `b:=B` specs,
 // `vared B`, `strftime -s B`, `zstat -A B`, `integer B=5`): the git and files guards treat one on the line as binding any name. (`print -v B` is read like printf -v.)
-export const ZSH_NAME_BINDERS = new Set(['vared', 'zparseopts', 'strftime', 'zstyle', 'sysread', 'zstat', 'getln', 'integer', 'float', 'private']);
+// (and the module builtins that bind a name or set REPLY / MATCH: zformat -f / -a, zregexparse, ztcp / zsocket / zpty (REPLY), zselect -A, zsystem flock -f,
+// sysopen -u, syswrite -c, pcre_match -v / -a (MATCH), zgetattr, zlistattr, zcurses, compadd -A / -O, zle -U / widgets)
+export const ZSH_NAME_BINDERS = new Set(['vared', 'zparseopts', 'strftime', 'zstyle', 'sysread', 'zstat', 'getln', 'integer', 'float', 'private', 'zformat', 'zregexparse',
+  'ztcp', 'zsocket', 'zpty', 'zselect', 'zsystem', 'sysopen', 'syswrite', 'pcre_match', 'zgetattr', 'zlistattr', 'zcurses', 'compadd', 'zle']);
 // zsh `=~` and the (#b) / (#m) glob flags set these, bash `=~` sets BASH_REMATCH
 const MATCH_NAMES = ['MATCH', 'match', 'MBEGIN', 'MEND', 'mbegin', 'mend', 'BASH_REMATCH'];
 // The names a command sets without being given them: `read` REPLY (zsh `read -A`: reply), `select` REPLY, `getopts` OPTARG / OPTIND, `mapfile` MAPFILE,
