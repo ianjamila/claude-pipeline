@@ -1697,7 +1697,7 @@ export function declAttrs(argv) {
     }
     ended = true; // (options stop at the first name: `declare D=x -u` makes -u a bad name, D keeps its case)
     const m = /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/.exec(a);
-    // (`declare n+=7` / `export n+=7` append to what n holds: its value is not the text)
+    // (`declare n+=7` / `export n+=7` append to what n holds: its value is not the text. Defence in depth: arithAssignedNames lists the same name from the text scan for `+=`)
     const ap = /^([A-Za-z_][A-Za-z0-9_]*)\+=/.exec(a);
     if (ap) { out.bare.push(ap[1]); out.unknown = true; } else if (m) out.assigns.push([m[1], m[2]]);
     else if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(a)) out.bare.push(a);

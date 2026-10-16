@@ -2293,7 +2293,7 @@ function evaluateBashForFilesFrame(command, opts) {
   for (const k of opts._unknownW ?? []) ctx.unknownVars.add(k);
   ctx.pickUnknown = new Set(opts._unknown ?? []); // (a name the line gave a run-time value: only a script it picks is refused; the writer rule is for the names above)
   ctx.srcTouched = new Set(); // names a sourced file set on this line (a later plain assignment of one is the value again)
-  ctx.unknownAll = opts._unknownAll === true || ctx.arith.dynamic; // (an arithmetic that assigns through a name may set any name, also one the line never gave)
+  ctx.unknownAll = opts._unknownAll === true || ctx.arith.dynamic; // (an arithmetic that assigns through a name may set any name, also one the line never gave. Defence in depth for the names the line gave: collectVars marks every one when arith.dynamic)
   ctx.srcChanged = new Set(opts._srcChanged ?? []); // names an unfollowable sourced file may have changed (a write target that uses one is refused)
   // a name held in a variable (N=PIPELINE_ADMIN; env $N=1 claude)
   if (Object.keys(ctx.vars).length && setsAdmin(substVars(flat, ctx.vars, ctx.budget), ctx.platform)) return deny('the command sets PIPELINE_ADMIN through a variable; only the owner may set it, when launching Claude Code');
