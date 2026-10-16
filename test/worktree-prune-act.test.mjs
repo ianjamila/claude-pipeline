@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { tryAcquire, release } from '../pipeline/lib/locks.mjs';
-import { archivePaths, archivePathsLocked, holdingLockName, listHolding, purgeHolding, holdingRoot, removeWorktree, restoreLeftovers, QUARANTINE_DIR } from '../pipeline/lib/worktree-prune/act.mjs';
+import { archivePaths, archivePathsLocked, holdingLockName, listHolding, purgeHolding, purgeHoldingLocked, holdingRoot, removeWorktree, restoreLeftovers, QUARANTINE_DIR } from '../pipeline/lib/worktree-prune/act.mjs';
 
 // Same fixture as test/worktree-prune-inspect.test.mjs: a repo with an origin, an ignore list and a .worktrees dir.
 function world() {
@@ -106,6 +106,26 @@ test('archive: an unparseable same-day manifest is set aside (first free .corrup
   const r = purgeHolding(h, { nowMs: T + 90 * day });
   assert.deepEqual(r.purged, []);
   assert.match(r.kept.find((k) => k.batch === '2026-10-13').reason, /MANIFEST\.json\.corrupt-1/);
+});
+
+test('purgeHoldingLocked: holding lock held elsewhere => nothing deleted and reported busy; once released the old batch goes', async () => {
+  const h = mkdtempSync(join(tmpdir(), 'hold-')); const lockDir = mkdtempSync(join(tmpdir(), 'locks-'));
+  const batch = join(h, '2026-09-01'); mkdirSync(batch);
+  writeFileSync(join(batch, 'MANIFEST.json'), JSON.stringify({ version: 1, items: [{ original: '/x', stored: join(batch, 'x'), size: 0, sha256: '', archivedAt: new Date(T - 40 * day).toISOString() }] }));
+  const held = tryAcquire(holdingLockName(h), { dir: lockDir });
+  assert.ok(held.acquired);
+  try {
+    const r = await purgeHoldingLocked(h, { nowMs: T, lockDir, lockWaitMs: 150 });
+    assert.deepEqual(r.purged, []);
+    assert.match(r.skipped, /holding folder.*busy|lock/i);
+    assert.equal(existsSync(batch), true);
+  } finally {
+    release(held.lock);
+  }
+  const r2 = await purgeHoldingLocked(h, { nowMs: T, lockDir, lockWaitMs: 2000 });
+  assert.deepEqual(r2.purged, ['2026-09-01']);
+  assert.equal(r2.skipped, undefined);
+  assert.equal(existsSync(batch), false);
 });
 
 test('list: restore commands quote paths with spaces; an unreadable manifest still lists', () => {

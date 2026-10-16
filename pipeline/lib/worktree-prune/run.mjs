@@ -13,7 +13,7 @@ import { listWorktrees } from '../local-branches.mjs';
 import { LockTimeoutError, withLock } from '../locks.mjs';
 import { notifyEvent, parseRemote } from '../notify.mjs';
 import { samePath } from '../paths.mjs';
-import { QUARANTINE_DIR, holdingRoot, listHolding, purgeHolding, removeWorktree, restoreLeftovers } from './act.mjs';
+import { QUARANTINE_DIR, holdingRoot, listHolding, purgeHoldingLocked, removeWorktree, restoreLeftovers } from './act.mjs';
 import {
   checkAncestry, defaultTranscriptDirs, entriesFor, listCandidates, memoryMentions, processesInside, recentFiles,
   resolveCanonicalRoot, transcriptMentions, walkTree,
@@ -293,7 +293,7 @@ export function summaryLine({ name, mode, dryRun, removed, wouldRemove, kept, hi
   if (hiddenProcesses) parts.push(`${hiddenProcesses} process${hiddenProcesses === 1 ? '' : 'es'} could not be inspected (other users)`);
   if (restored.length) parts.push(restoredPart(restored));
   parts.push(`outside worktrees: ${outside.length} item${outside.length === 1 ? '' : 's'} (report only)`);
-  parts.push(`holding: ${holding.batches.length} batch${holding.batches.length === 1 ? '' : 'es'}${holding.purged.length ? `, purged ${holding.purged.length}` : ''}`);
+  parts.push(`holding: ${holding.batches.length} batch${holding.batches.length === 1 ? '' : 'es'}${holding.purged.length ? `, purged ${holding.purged.length}` : ''}${holding.purgeSkipped ? ', purge skipped (holding folder busy)' : ''}`);
   return `${summaryHead({ name, mode, dryRun })}: ${parts.join(' · ')}`;
 }
 
@@ -360,8 +360,10 @@ async function pruneLocked(repo, { mode, dryRun, notify, ctx, env }) {
   };
   const outside = await step('outside', () => outsideReport(root, env), []);
   const holdingDir = holdingRoot(repo.slug, env);
-  const purged = modeAllows(mode, 'purge', { dryRun }) ? await step('purge', () => purgeHolding(holdingDir, { nowMs: Date.now() }).purged, []) : [];
-  const holding = { batches: await step('holding', () => listHolding(holdingDir), []), purged };
+  const purge = modeAllows(mode, 'purge', { dryRun })
+    ? await step('purge', () => purgeHoldingLocked(holdingDir, { nowMs: Date.now(), lockDir: env.PIPELINE_LOCK_DIR || undefined }), { purged: [] })
+    : { purged: [] };
+  const holding = { batches: await step('holding', () => listHolding(holdingDir), []), purged: purge.purged, ...(purge.skipped ? { purgeSkipped: purge.skipped } : {}) };
   const summary = summaryLine({ name: repo.name, mode, dryRun, removed, wouldRemove, kept, hiddenProcesses, restored, outside, holding })
     + (errors.length ? ` · errors: ${errors.map((e) => e.step).join(', ')}` : '');
   const output = { ok: true, mode, dryRun, removed, wouldRemove, kept, hiddenProcesses, restored, outside, holding, summary, errors };
