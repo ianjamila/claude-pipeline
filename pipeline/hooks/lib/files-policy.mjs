@@ -1179,8 +1179,13 @@ function collectVars(cmds, ctx) {
   // ways not worked out: such a name keeps the text as written, but is listed in ctx.unknownVars (a script or a writer it picks is refused)
   const attrs = new Map();
   const unknown = new Set();
+  // Why (#56, Codex review of 8b86e2b; on main too): `F=settings.json; printf x > ~/.claude/$F; F=safe` judged the write with the LAST value. A name the line
+  // gives two different values (assignments, declarations, loop readings) holds one of them where it is used: it is only known at run time (ctx.unknownVars).
+  const given = new Map();
   const set = (k, v) => {
     if (SKIP.has(k)) return;
+    if (given.has(k) && given.get(k) !== String(v)) unknown.add(k);
+    given.set(k, String(v));
     const t = attrs.get(k) ?? null;
     vars[k] = applyTransform(expandHomeRefs(substVars(toPosix(String(v)).replace(USER_RE, ctx.user), vars, ctx.budget), ctx.homePosix), t);
     kept[k] = applyTransform(expandHomeRefs(substVars(toPosix(String(v).replace(/\\/g, bs)).replace(USER_RE, ctx.user), kept, ctx.budget), ctx.homePosix).split(bs).join('\\'), t);
@@ -1188,7 +1193,7 @@ function collectVars(cmds, ctx) {
   const pins = ctx.loopPins; // (see loopReadings: the word each loop variable holds in this reading, or null: every one is only known at run time)
   for (const c of cmds) {
     if (pins !== undefined && c.argv[0] === 'for' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '')) {
-      if (pins === null || !pins.has(c.argv[1])) unknown.add(c.argv[1]); else set(c.argv[1], pins.get(c.argv[1]));
+      if (pins === null || !pins.has(c.argv[1])) unknown.add(c.argv[1]); else if (pins.get(c.argv[1]) !== LOOP_NOT_RUN) set(c.argv[1], pins.get(c.argv[1]));
     }
     for (const [k, v] of Object.entries(c.env ?? {})) set(k, v);
     // (`set -- ev.sh`: the positional parameters, so `bash $1` is that file)
@@ -2121,6 +2126,10 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
   }
 }
 const MAX_LOOP_READINGS = 64;
+// (a reading where the loop did not run: the name is not set by the line, as main read every loop variable)
+const LOOP_NOT_RUN = Symbol('loop not run');
+// A zsh parameter expansion with flags (`${(P)N::=x}` assigns the variable N names) or a bash indirect one (`${!N}`).
+const INDIRECT_EXPANSION = /\$\{(?:\([^)]*\)|!)/;
 // The readings of a text's loop variables: one Map (name -> word) per combination, [null] when there are too many, null when the text has no loop.
 function loopReadings(command, opts) {
   const cmds = simpleCommands(command, { env: opts.env ?? process.env });
@@ -2128,9 +2137,10 @@ function loopReadings(command, opts) {
   for (const c of cmds) {
     if (c.argv[0] !== 'for' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '')) continue;
     const words = c.argv[2] === 'in' ? c.argv.slice(3) : ['$@'];
-    loops.set(c.argv[1], [...new Set([...(loops.get(c.argv[1]) ?? []), ...(words.length ? words : [''])])]);
+    loops.set(c.argv[1], [...new Set([...(loops.get(c.argv[1]) ?? []), ...(words.length ? words : ['']), LOOP_NOT_RUN])]);
   }
   if (!loops.size) return null;
+  if (INDIRECT_EXPANSION.test(command)) return [null]; // (an indirect expansion may set any loop variable: every one is only known at run time)
   const names = [...loops.keys()];
   const total = names.reduce((n, k) => n * loops.get(k).length, 1);
   if (total > MAX_LOOP_READINGS) return [null];
@@ -2333,7 +2343,10 @@ function evaluateBashForFilesFrame(command, opts) {
   // Why: after a cd into a directory only known at run time a relative script may be in the directories the line knows OR in any protected one (or above one): each is looked in
   // Why: a binder on the line (`read F`, `mapfile`, `getopts`, `printf -v F`, a nameref's target) gives its names a run-time value: a script they pick is refused, and a writer that uses a name the line had
   // given a value is refused, whatever the line assigned before. Applied as the command is reached (a name the line gave a value is also in unknownVars, which the per-command snapshots carry, so a loop binder reaches the commands above it and a later plain assignment does not clean an earlier use).
+  const lineIndirect = typeof command === 'string' && INDIRECT_EXPANSION.test(command);
   const markBound = (c) => {
+    // (#56, Codex review of 8b86e2b; on main too: zsh `${(P)N::=~/.claude/settings.json}` / a bash `${!N…}` may set any name, like `export $N=…`)
+    if (lineIndirect) { ctx.unknownAll = true; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.unknownVars.add(k); ctx.srcChanged.add(k); } }
     if (!c.argv.length) return;
     const cn = baseOf(c.argv[0]);
     const names = [];
@@ -2439,7 +2452,7 @@ function evaluateBashForFilesFrame(command, opts) {
     for (const [ci, c] of cmds.entries()) {
       const refs = (w) => [...String(w).matchAll(/\$\{?(\w+)/g)].some((x) => ctx.unknownVars.has(x[1]) || snaps[ci]?.unknownV.has(x[1]));
       if ((c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && refs(r.target ?? '')) || (c.argv.length && !['export', 'declare', 'typeset', 'local', 'readonly'].includes(baseOf(c.argv[0])) && !isReadOnly(c, ctx) && (c.argv.some(refs) || Object.values(c.env ?? {}).some(refs)))) {
-        return deny('the command writes through a variable whose value is only known at run time (a width or integer attribute, or a binder such as `export $N=…` / `printf -v $N` whose name is only known at run time), so the file it reaches cannot be checked; write the path out');
+        return deny('the command writes through a variable whose value is only known at run time (a width or integer attribute, two different values on the line, or a binder such as `export $N=…` / `printf -v $N` / `${(P)N::=…}` whose name is only known at run time), so the file it reaches cannot be checked; write the path out');
       }
     }
   }

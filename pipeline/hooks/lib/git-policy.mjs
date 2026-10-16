@@ -1565,8 +1565,12 @@ function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0) {
   // Why (#56, a live bypass on main): `F=ok.sh; export $N=run.sh; bash $F` ran run.sh when N held F, while the guard judged ok.sh. A binder whose
   // NAME is only known at run time (export / declare / local / typeset / readonly, read, mapfile, getopts, unset, let, select, printf -v) may set
   // any variable: every name the line assigns or reads is unknown from here on.
-  if (cmds.some(bindsRunTimeName)) for (const k of [...Object.keys(ctx.vars), ...namesReadOn(cmds)]) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
+  // (#56, Codex review of 8b86e2b: zsh `${(P)N::=main}` assigns the variable N names, a bash `${!N…}` reads or sets through it: the same, on main too)
+  if (cmds.some(bindsRunTimeName) || cmds.some(indirectExpansion)) for (const k of [...Object.keys(ctx.vars), ...namesReadOn(cmds)]) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
 }
+// A zsh parameter expansion with flags (`${(P)N::=x}` assigns the variable N names) or a bash indirect one (`${!N}`), anywhere in a command's words.
+export const INDIRECT_EXPANSION = /\$\{(?:\([^)]*\)|!)/;
+const indirectExpansion = (c) => [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')].some((w) => INDIRECT_EXPANSION.test(String(w)));
 // A command that binds a variable whose name is only known at run time (see collectAssignments).
 function bindsRunTimeName(c) {
   if (!c.argv.length) return false;
@@ -1856,7 +1860,7 @@ export function withoutLiteralText(s, { dqData = false } = {}) {
   return stack.length === 1 ? out : null;
 }
 function onceAssignedNames(cmds, ctx, str) {
-  if (ctx.tainted.size || cmds.truncated || cmds.dynamic || definesFunction(str, cmds) || cmds.some(isStateHazard) || !subshellsTrusted(cmds)) return [];
+  if (ctx.tainted.size || cmds.truncated || cmds.dynamic || definesFunction(str, cmds) || cmds.some(isStateHazard) || !subshellsTrusted(cmds) || INDIRECT_EXPANSION.test(str)) return [];
   for (const c of cmds) {
     if (!c.argv.length) continue;
     const nm = baseName(c.argv[0]);
@@ -1908,6 +1912,12 @@ function onceAssignedNames(cmds, ctx, str) {
       const expand = words.some((w) => w.includes('$'));
       if (expand && (/['\\]/.test(String(site.raw ?? "'")) || ifsMayBeSet(ctx) || words.some((w) => [...w.matchAll(/\$\{?(\w+)/g)].some((x) => x[1] === k)))) continue;
       modes = [...new Set(words)].map((w) => (w.includes('$') ? { val: w, expand: true } : { val: w }));
+      // (#56, Codex review of 8b86e2b: `false && for b in agent/x; do :; done; git push origin $b` pushes the value b had before. Where the loop may not run, or a
+      // word is a glob that may match nothing, the name may also keep that value: one more reading, the name not set by the line)
+      // (the `for` itself carries its own loop mark, so mayNotRun cannot tell; after any earlier loop mark it may sit in an outer loop that runs no time)
+      const ctl = site.ctl;
+      const mayNot = !ctl || cmds.ctlBroken || cmds.truncated || ctl.cond || ctl.fn || ctl.trap || site.sep === '&&' || site.sep === '||' || cmds.slice(0, s).some((c) => !c.ctl || c.ctl.loop);
+      if (mayNot || words.some((w) => /[*?[]/.test(w))) modes.push('skip');
     } else continue;
     if (live.some((b) => varWordRe(k).test(b))) continue;
     // every mention in the text the shell reads: one assignment, the rest plain references (no ${k:=…} / ${k=…}, no k[…], no other bare word k)

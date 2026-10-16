@@ -439,3 +439,32 @@ test('#56 scanner dqData: inside double quotes only the shell\'s own text is kep
   // without the option nothing changes
   assert.equal(withoutLiteralText(`"const f=1"`), `"const f=1"`);
 });
+
+test('#56 Codex review of 8b86e2b: a later loop, a loop that may not run and an indirect expansion do not hide the value a use sees', () => {
+  // (files guard) the value a write sees is not the last one the line gives the name; a skipped loop leaves the old value
+  for (const cmd of [
+    'F=settings.json; printf x > ~/.claude/$F; for F in safe; do :; done',
+    'F=settings.json; printf x > ~/.claude/$F; F=safe', // (on main too: the last value won)
+    'F=settings.json; false && for F in safe; do :; done; printf x > ~/.claude/$F',
+    'F=settings.json; (for F in safe; do :; done); printf x > ~/.claude/$F',
+    'F=safe; : "${(P)N::=settings.json}"; printf x > ~/.claude/$F', // (zsh: assigns the name N holds; on main too)
+    'for F in safe; do : "${(P)N::=settings.json}"; printf x > ~/.claude/$F; done',
+  ]) assert.equal(files(cmd, fakeFs(PROJ, {}, DIRS)).decision, 'deny', cmd);
+  // (git guard)
+  for (const cmd of [
+    'N="b"; for b in agent/x; do : "${(P)N::=main}"; git push origin $b; done',
+    'B=agent/x; : "${(P)N::=main}"; git push origin $B', // (on main too)
+    'B=agent/x; : "${!N}"; git push origin $B',
+    'false && for b in agent/x; do :; done; git push origin $b', // (the loop is skipped: b keeps the value it had)
+    'true || for b in agent/x; do :; done; git push origin $b',
+    'if false; then for b in agent/x; do :; done; fi; git push origin $b',
+    'for a in x; do for b in agent/x; do :; done; done; git push origin $b',
+    'for b in agent/nomatch*; do :; done; git push origin $b', // (a glob may match nothing)
+  ]) denyGit(cmd, SPEC);
+  // still allowed: a loop that surely runs, and loops over files
+  for (const cmd of [
+    'for b in agent/x; do git push origin $b; done',
+    'for b in agent/x agent/y; do git push origin $b; done; git status',
+  ]) allowGit(cmd, SPEC);
+  for (const cmd of ['for f in src/a.ts a.mjs; do cp $f /tmp/x/; done']) allowBoth(cmd, SPEC);
+});
