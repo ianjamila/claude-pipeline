@@ -154,7 +154,7 @@ function freeName(target) {
 // archives again. No directory between holdingDir and the stored file may be a symlink either. `originalRoot` is where
 // the files really live when `wtPath` is a temporary location (the quarantine): the manifest's `original` (and so the
 // restore command) points there, never at a path that stops existing after the run.
-export function archivePaths({ wtPath, originalRoot = wtPath, rels, holdingDir, slug, pr, nowMs }) {
+export function archivePaths({ wtPath, originalRoot = wtPath, rels, holdingDir, slug, pr, nowMs, hooks = {} }) {
   const day = new Date(nowMs).toISOString().slice(0, 10);
   const archivedAt = new Date(nowMs).toISOString();
   const sources = rels.map((rel) => {
@@ -174,6 +174,7 @@ export function archivePaths({ wtPath, originalRoot = wtPath, rels, holdingDir, 
     const relParts = String(rel).split('/');
     const destDir = ensureRealDirs(batchDir, [safeName(slug), ...relParts.slice(0, -1)]);
     const stored = freeName(path.join(destDir, relParts[relParts.length - 1]));
+    hooks.afterPick?.(stored); // test seam: lets a test run another archiver between the name pick and the move
     moveFile(abs, stored);
     const item = {
       original: path.join(originalRoot, ...relParts), stored, size: data.length, sha256: createHash('sha256').update(data).digest('hex'),
@@ -185,6 +186,13 @@ export function archivePaths({ wtPath, originalRoot = wtPath, rels, holdingDir, 
     pruneEmptyParents(path.dirname(abs), wtPath);
   }
   return { batchDir, items };
+}
+
+export const holdingLockName = (holdingDir) => `worktrees-holding-${createHash('sha256').update(path.resolve(holdingDir)).digest('hex').slice(0, 12)}`;
+
+// archivePaths under the holding folder's lock (spec: see issue #63). Not locked yet.
+export async function archivePathsLocked(opts) {
+  return archivePaths(opts);
 }
 
 // Always single-quoted (POSIX sh): a quote inside becomes '\'' and nothing else in the path is special.
