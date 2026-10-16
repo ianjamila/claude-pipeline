@@ -2059,7 +2059,7 @@ class Parser {
       const dyn = wdyn;
       const pat = wpat;
       const subs = wsubs;
-      const one = wspans.length === 1 && wspans[0][0] === 0 && wspans[0][1] === text.length;
+      const one = wspans.length > 0 && wspans[0][0] === 0 && wspans[0][1] === text.length; // (the first span covers the whole text: no other can follow it)
       const from = wstart;
       cur = '';
       inWord = false;

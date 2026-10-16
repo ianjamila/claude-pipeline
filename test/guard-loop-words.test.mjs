@@ -91,6 +91,9 @@ test('#81 parser: subWords holds the words that are exactly one command substitu
   assert.deepEqual(one('for f in $(a)$(b); do :; done'), []);
   assert.deepEqual(one('for f in $"$(a)"; do :; done'), []);
   assert.deepEqual(one('for f in a b; do :; done'), []);
+  // (the same text twice: one word that is exactly a substitution and one that is not, in either order, is not one)
+  assert.deepEqual(one('for f in "$(a)" $"$(a)"; do :; done'), []);
+  assert.deepEqual(one('for f in $"$(a)" "$(a)"; do :; done'), []);
 });
 
 // ---- 2. a literal word the parser has unquoted --------------------------------------------------------------------------------
@@ -121,6 +124,9 @@ test('#81 A2 twins: the word is still the script that runs, or not text at all',
   // an empty word beside the script
   deny("for f in '' run.sh; do bash $f; done", files);
   deny("for f in '' ok.sh; do bash $f; done; for g in run.sh; do bash $g; done", files);
+  // zsh patterns (extendedglob `^` and `~`) are not text
+  deny('for f in ^ok.sh; do bash $f; done', files);
+  deny('for f in *.sh~ok.sh; do bash $f; done', files);
   // a quoted `~/` is the literal text (a directory named ~ here, holding the bad script), not the home directory: never read as the home
   deny('for f in "~/ok.sh"; do bash "$f"; done', files);
   // another user's home, or a tilde the shell expands, is not text
