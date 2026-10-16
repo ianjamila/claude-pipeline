@@ -19,7 +19,7 @@ import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
-import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText } from './shell-parse.mjs';
+import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, indirectExpansionOnLine } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
 import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit, execLinesOf, paramReadings, assigningDefaults, spliceLines } from './script-candidates.mjs';
 
@@ -70,6 +70,8 @@ function taintClosure(base, cmds, extra = {}, isNew = () => false, active = fals
     } else if (active && cn === 'read') for (const a of c.argv.slice(1)) always(a);
     else if (active && (cn === 'mapfile' || cn === 'readarray')) { always('MAPFILE'); for (const a of c.argv.slice(1)) always(a); }
     else if (active && cn === 'printf') { const i = c.argv.indexOf('-v'); if (i > 0) always(c.argv[i + 1] ?? ''); }
+    // (#56, Codex recheck of d925d42: the names a builtin sets without being given them, and zsh binders whose operands are not read: every name they mention)
+    if (active) { for (const k of implicitBindsOf(c)) always(k); if (ZSH_NAME_BINDERS.has(cn) || (cn === 'print' && c.argv.some((a) => /^-[A-Za-z]*v/.test(a)))) for (const a of c.argv.slice(1)) for (const m of a.matchAll(/[A-Za-z_]\w*/g)) always(m[0]); }
   }
   sets.push(...Object.entries(extra));
   for (let grew = true; grew;) { grew = false; for (const [k, v] of sets) if (!set.has(k) && refs(v)) { set.add(k); grew = true; } }
@@ -987,6 +989,7 @@ function mayRebind(name, cmds, raw) {
   const re = (s) => new RegExp(s.replaceAll('NAME', name));
   // (a `${...}` that mentions the name and assigns -- `${N:=x}`, `${N::=x}`, `${(flags)N=x}`, `${N+=}`)
   if (re('\\$\\{[^}]*\\bNAME\\b[^}]*=|\\$\\{!?NAME\\[|\\bNAME\\[[^\\]]*\\]\\+?=|\\b(?:for|select|foreach)\\s+NAME\\b|\\(\\([^)]*\\bNAME\\b|\\{NAME\\}\\s*(?:[<>]|&>)|\\bNAME\\+=').test(raw)) return true; // (`${N:=x}`, `N[1]=`, a loop variable, arithmetic)
+  if (cmds.some((c) => implicitBindsOf(c).includes(name))) return true; // (`[[ x =~ y ]]` sets MATCH, `read` REPLY …: see implicitBindsOf)
   return !onlyNonBinders(cmds);
 }
 function modelZshSelfDirs(cmds, raw, ctx) {
@@ -1179,13 +1182,24 @@ function collectVars(cmds, ctx) {
   // ways not worked out: such a name keeps the text as written, but is listed in ctx.unknownVars (a script or a writer it picks is refused)
   const attrs = new Map();
   const unknown = new Set();
-  const set = (k, v) => {
+  // Why (#56, Codex review of 8b86e2b): `F=settings.json; printf x > ~/.claude/$F; for F in safe; do :; done` judged the write with the loop's word (the last
+  // value). A name a loop reading sets that the line also gives another value holds one of them where it is used: it is only known at run time (ctx.unknownVars).
+  // (Two plain assignments still keep the last value, as on main: `if …; then out=$3; else out=$dir/x; fi; … > "$out"` is common; issue: judge each value.)
+  const given = new Map();
+  const set = (k, v, loop = false) => {
     if (SKIP.has(k)) return;
+    const was = given.get(k);
+    if (was && was.v !== String(v) && (loop || was.loop)) unknown.add(k);
+    given.set(k, { v: String(v), loop: loop || was?.loop === true });
     const t = attrs.get(k) ?? null;
     vars[k] = applyTransform(expandHomeRefs(substVars(toPosix(String(v)).replace(USER_RE, ctx.user), vars, ctx.budget), ctx.homePosix), t);
     kept[k] = applyTransform(expandHomeRefs(substVars(toPosix(String(v).replace(/\\/g, bs)).replace(USER_RE, ctx.user), kept, ctx.budget), ctx.homePosix).split(bs).join('\\'), t);
   };
+  const pins = ctx.loopPins; // (see loopReadings: the word each loop variable holds in this reading, or null: every one is only known at run time)
   for (const c of cmds) {
+    if (pins !== undefined && c.argv[0] === 'for' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '')) {
+      if (pins === null || !pins.has(c.argv[1])) unknown.add(c.argv[1]); else if (pins.get(c.argv[1]) !== LOOP_NOT_RUN) set(c.argv[1], pins.get(c.argv[1]), true);
+    }
     for (const [k, v] of Object.entries(c.env ?? {})) set(k, v);
     // (`set -- ev.sh`: the positional parameters, so `bash $1` is that file)
     if (baseOf(c.argv[0] ?? '') === 'set' && !c.argv.some((a) => /^[-+][A-Za-z]*A/.test(a))) { const w = setPositionals(c.argv); if (w) for (let i = 1; i <= 9; i++) set(String(i), i <= w.length ? w[i - 1] : ''); }
@@ -1883,7 +1897,7 @@ function definedNames(text) {
 // Why: the names a binder command sets: those it is given (an option may carry its name, `printf -vF`, `wait -pF`), the ones it binds without being given them, and a nameref's target.
 // weird: a word that is not a plain name (`read "$1"`, `unset $n`): any name may be bound.
 function bindsOf(name, argv) {
-  const names = new Set(name === 'getopts' ? ['OPTARG', 'OPTIND'] : name === 'mapfile' || name === 'readarray' ? ['MAPFILE'] : name === 'read' || name === 'select' ? ['REPLY'] : []);
+  const names = new Set(implicitBindsOf({ argv: [name, ...argv.slice(1)] }));
   let weird = false;
   for (const a of argv.slice(1)) {
     const m = /^[A-Za-z_]\w*/.exec(a);
@@ -1926,6 +1940,9 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
     const name = baseOf(c.argv[0]);
     // Why: a function or alias the LINE defines may stand behind a name that looks harmless (`ls() { read F; }`), and a nameref (`declare -n r=F`) binds F through another name
     if (ctx.lineDefs?.has(name) || (['declare', 'typeset', 'local'].includes(name) && c.argv.slice(1).some((a) => /^[-+][A-Za-z]*n/.test(a)))) { out.all = true; continue; }
+    // (#56, Codex recheck of d925d42: zsh binders whose operands are not read may bind any name; `read` / `[[ =~ ]]` … set names they are not given)
+    if (ZSH_NAME_BINDERS.has(name) || (name === 'print' && c.argv.slice(1).some((a) => /^-[A-Za-z]*v/.test(a)))) { out.all = true; continue; }
+    for (const k of implicitBindsOf(c)) set(k, null, false);
     if (VAR_COMMANDS.has(name)) {
       const d = declAttrs(c.argv);
       for (const [k, v] of d.assigns) set(k, v, sure && !d.unknown && !d.transform && name !== 'local');
@@ -2090,6 +2107,20 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
     // (the second pass spends what the first left, so every cap still ends in a denial; only the startup-file memo starts empty)
     return evaluateBashForFilesUnchecked(command, { ...opts, _budget: { ...budget, startupOk: new Set() }, _bashState: { bound: true, rewrote: false } });
   }
+  // Why (#56, a live bypass on main): `for f in settings.json; do cp x ~/.claude/$f; done` wrote a protected file while $f was read as a value from the
+  // environment (any name the line does not set). A loop variable takes each word of its list in turn: the text is judged once per word ("readings"; a
+  // word that expands stands as written, so a `$(…)` or a glob is judged as if it were written where the variable is). Past 64 readings every loop
+  // variable is only known at run time (a script or a writer it picks is refused).
+  if (typeof command === 'string' && opts._loopPins?.text !== command && /(?:^|[\s;&|(){])for\s/.test(command)) {
+    const readings = loopReadings(command, opts);
+    if (readings) {
+      for (const pins of readings) {
+        const v = evaluateBashForFilesUnchecked(command, { ...opts, _loopPins: { text: command, pins } });
+        if (v.decision !== 'allow') return v;
+      }
+      return allow();
+    }
+  }
   if (!opts._frames) opts = { ...opts, _frames: [] }; // the writes of this line and of the scripts it runs (shared with nested calls, popped on the way out)
   const depth = opts._frames.length;
   try {
@@ -2102,12 +2133,40 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
     opts._frames.length = depth;
   }
 }
+const MAX_LOOP_READINGS = 64;
+// (a reading where the loop did not run: the name is not set by the line, as main read every loop variable)
+const LOOP_NOT_RUN = Symbol('loop not run');
+// A zsh parameter expansion with flags (`${(P)N::=x}` assigns the variable N names) or a bash indirect one (`${!N}`).
+// The readings of a text's loop variables: one Map (name -> word) per combination, [null] when there are too many, null when the text has no loop.
+function loopReadings(command, opts) {
+  const cmds = simpleCommands(command, { env: opts.env ?? process.env });
+  const loops = new Map();
+  for (const c of cmds) {
+    if (c.argv[0] !== 'for' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '')) continue;
+    const words = c.argv[2] === 'in' ? c.argv.slice(3) : ['$@'];
+    loops.set(c.argv[1], [...new Set([...(loops.get(c.argv[1]) ?? []), ...(words.length ? words : ['']), LOOP_NOT_RUN])]);
+  }
+  if (!loops.size) return null;
+  if (indirectExpansionOnLine(command, cmds)) return [null]; // (an indirect expansion may set any loop variable: every one is only known at run time)
+  const names = [...loops.keys()];
+  const total = names.reduce((n, k) => n * loops.get(k).length, 1);
+  if (total > MAX_LOOP_READINGS) return [null];
+  const out = [];
+  for (let r = 0; r < total; r++) {
+    const pins = new Map();
+    let rest = r;
+    for (const k of names) { const ws = loops.get(k); pins.set(k, ws[rest % ws.length]); rest = Math.floor(rest / ws.length); }
+    out.push(pins);
+  }
+  return out;
+}
 function evaluateBashForFilesFrame(command, opts) {
   if (!opts._budget) opts = { ...opts, _budget: newEvalBudget(opts.now) }; // one budget for this evaluation and every script it reads
   const assumedCwd = opts._assumedCwd === true; // (a rerun of the line with the cwd assumed to be a protected directory; what it runs is judged normally)
   if (assumedCwd) opts = { ...opts, _assumedCwd: false };
   checkDeadline(opts._budget);
   const ctx = makeCtx(opts);
+  if (opts._loopPins && opts._loopPins.text === command) ctx.loopPins = opts._loopPins.pins; // (this text's loop readings; see evaluateBashForFilesUnchecked)
   ctx.lineDefs = definedNames(typeof command === 'string' ? command : '');
   ctx.assigned = assigningDefaults(typeof command === 'string' ? command : ''); // (and those of the line this text was made from: `: ${X:=w}; G=bash; $G $X`)
   for (const [n, ws] of opts._assigned ?? []) ctx.assigned.set(n, [...(ctx.assigned.get(n) ?? []), ...ws]);
@@ -2291,11 +2350,22 @@ function evaluateBashForFilesFrame(command, opts) {
   // Why: after a cd into a directory only known at run time a relative script may be in the directories the line knows OR in any protected one (or above one): each is looked in
   // Why: a binder on the line (`read F`, `mapfile`, `getopts`, `printf -v F`, a nameref's target) gives its names a run-time value: a script they pick is refused, and a writer that uses a name the line had
   // given a value is refused, whatever the line assigned before. Applied as the command is reached (a name the line gave a value is also in unknownVars, which the per-command snapshots carry, so a loop binder reaches the commands above it and a later plain assignment does not clean an earlier use).
+  const lineIndirect = typeof raw === 'string' && indirectExpansionOnLine(raw, cmds); // (only the text the shell expands: see indirectExpansionOnLine)
   const markBound = (c) => {
+    // (#56, Codex review of 8b86e2b; on main too: zsh `${(P)N::=~/.claude/settings.json}` / a bash `${!N…}` may set any name, like `export $N=…`)
+    if (lineIndirect) { ctx.unknownAll = true; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.unknownVars.add(k); ctx.srcChanged.add(k); } }
     if (!c.argv.length) return;
     const cn = baseOf(c.argv[0]);
     const names = [];
+    // Why (#56, a live bypass on main): `F=/tmp/x; printf -v $N ~/.claude/settings.json; cp a $F` and `declare "$N=~/.claude"; cp a $HOME/settings.json`
+    // wrote the protected file when N held F / HOME. A binder whose name is only known at run time may set any name: every name is unknown from here on,
+    // as after a sourced file that cannot be followed.
+    const anyName = (LINE_BINDERS.has(cn) && (cn !== 'printf' || c.argv.some((a) => /^-[A-Za-z]*v/.test(a))) && bindsOf(cn, c.argv).weird)
+      || (['export', 'declare', 'typeset', 'local', 'readonly', 'unset', 'let'].includes(cn) && c.argv.slice(1).some((a) => /[$`]/.test(a.includes('=') ? a.slice(0, a.indexOf('=')) : a)))
+      || ZSH_NAME_BINDERS.has(cn) || (cn === 'print' && c.argv.some((a) => /^-[A-Za-z]*v/.test(a))); // (#56, Codex recheck of d925d42: zsh binders whose operands are not read)
+    if (anyName) { ctx.unknownAll = true; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.unknownVars.add(k); ctx.srcChanged.add(k); } }
     if (LINE_BINDERS.has(cn) && (cn !== 'printf' || c.argv.some((a) => /^-v/.test(a)))) names.push(...bindsOf(cn, c.argv).names);
+    names.push(...implicitBindsOf(c)); // (`[[ x =~ y ]]` sets MATCH, a (#m) pattern flag too: see implicitBindsOf)
     if (['declare', 'typeset', 'local'].includes(cn) && c.argv.slice(1).some((a) => /^-[A-Za-z]*n/.test(a))) for (const a of c.argv.slice(1)) { const t = /^[A-Za-z_]\w*=([A-Za-z_]\w*)/.exec(a); if (t) { names.push(t[1]); ctx.declared?.unknown.add(t[1]); } }
     for (const k of names) { ctx.pickUnknown.add(k); if (Object.hasOwn(ctx.vars, k)) ctx.unknownVars.add(k); }
   };
@@ -2391,7 +2461,7 @@ function evaluateBashForFilesFrame(command, opts) {
     for (const [ci, c] of cmds.entries()) {
       const refs = (w) => [...String(w).matchAll(/\$\{?(\w+)/g)].some((x) => ctx.unknownVars.has(x[1]) || snaps[ci]?.unknownV.has(x[1]));
       if ((c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && refs(r.target ?? '')) || (c.argv.length && !['export', 'declare', 'typeset', 'local', 'readonly'].includes(baseOf(c.argv[0])) && !isReadOnly(c, ctx) && (c.argv.some(refs) || Object.values(c.env ?? {}).some(refs)))) {
-        return deny('the command writes through a variable whose value is only known at run time (a width or integer attribute), so the file it reaches cannot be checked; write the path out');
+        return deny('the command writes through a variable whose value is only known at run time (a width or integer attribute, a loop word and another value on the line, or a binder such as `export $N=…` / `printf -v $N` / `${(P)N::=…}` whose name is only known at run time), so the file it reaches cannot be checked; write the path out');
       }
     }
   }
@@ -2419,7 +2489,7 @@ function evaluateBashForFilesFrame(command, opts) {
       const script = scriptFileOf(c.argv)?.file;
       const operands = script === undefined ? c.argv : c.argv.filter((w, i) => w !== script || c.argv.indexOf(w) !== i);
       if ((c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && changed(r.target ?? '')) || (writes && (operands.some(changed) || Object.entries(c.env ?? {}).some(([k, v]) => !PATH_LISTS.has(k) && taintedEnv(v))))) {
-        return deny('the command writes through a variable that a sourced file may have changed, so the file it reaches cannot be checked; write the path out');
+        return deny('the command writes through a variable that a sourced file (or a binder whose name is only known at run time) may have changed, so the file it reaches cannot be checked; write the path out');
       }
     }
   }
