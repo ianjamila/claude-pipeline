@@ -127,6 +127,18 @@ function parseOpts(args, { longValue = [], shortValue = '', abbrev = false } = {
   return { flags, positionals };
 }
 
+// Every flag `gh pr merge` has (short: -A -b -F -d -m -r -s -t -R -h)
+const GH_MERGE_LONG = ['admin', 'author-email', 'auto', 'body', 'body-file', 'delete-branch', 'disable-auto', 'help', 'match-head-commit', 'merge', 'rebase', 'repo', 'squash', 'subject'];
+const GH_MERGE_SHORT = 'AbFdmrstRh';
+// A boolean long flag's effective setting (the last one wins, as in gh): 'on', 'off' (also when absent) or 'bad' (a value gh would reject).
+function boolFlag(flags, name) {
+  const last = flags.filter((f) => !f.short && f.name === name).at(-1);
+  if (!last) return 'off';
+  if (last.value === null) return 'on';
+  const v = last.value.toLowerCase();
+  return v === '1' || v === 't' || v === 'true' ? 'on' : v === '0' || v === 'f' || v === 'false' ? 'off' : 'bad';
+}
+
 const flagValues = (flags, longNames, shortNames = '') => flags
   .filter((f) => (f.short ? shortNames.includes(f.name) : longNames.includes(f.name)) && f.value !== null)
   .map((f) => f.value);
@@ -733,13 +745,19 @@ function graphqlMutations(query) {
   return names;
 }
 
-function checkGraphql(body) {
+function checkGraphql(body, dir = null, ctx = null) {
   for (const q of body.queries) {
     if (/^\s*(\$\(|`|\$\{?[A-Za-z_])/.test(q)) return deny('the graphql query is built at run time, so it cannot be verified. Pass the query text directly.');
     const names = graphqlMutations(q);
     if (names === null) return deny('the graphql query contains a mutation that cannot be parsed, so it cannot be verified.');
     const bad = names.find((n) => !GRAPHQL_ALLOWED_MUTATIONS.has(n));
     if (bad) return deny(`the graphql mutation ${bad} is not on the allowed list (${[...GRAPHQL_ALLOWED_MUTATIONS].join(', ')}). ${OWNER_ONLY}`);
+    // #58: auto-merge names the PR by its node id, which says nothing about whether the owner said "merge" for it, nor which repository it is in.
+    // Why (#58 round 3): the node id can name a PR in a chat repo whatever directory this runs in, so the target repository can never be resolved
+    // here: it is judged as a chat repo's (the owner's "merge" is needed, and a node id cannot match one), not as the current directory's.
+    if (names.includes('enablePullRequestAutoMerge') && ctx?.ownerGo) {
+      return deny('turning on auto-merge through the API skips the owner\'s "merge": it names the PR by a node id, so its repository (owner_approval: chat?) and head cannot be checked. Use `gh pr merge <N> --auto --match-head-commit <sha>` after the owner said "merge", or `P merge`.');
+    }
   }
   if (body.unknown) return deny('cannot verify the graphql body (--input - / unreadable file).');
   return null;
@@ -829,7 +847,163 @@ function checkApi(rest, env, dir, ctx) {
   if (/\/git\/refs\/heads\/(main|master)$/i.test(p)) return deny(`${method} to the main/master ref is a push to main. It is blocked.`);
   if (method === 'POST' && /\/git\/refs$/i.test(p) && /refs\/heads\/(main|master)\b/i.test(haystack)) return deny('creating the main/master ref through the API is blocked.');
 
-  if (/^graphql$/i.test(ep)) return checkGraphql(body);
+  if (/^graphql$/i.test(ep)) return checkGraphql(body, dir, ctx);
+  return null;
+}
+
+// ---- #58: direct merges in an owner_approval: chat repo ----------------------------------------------------------------
+// Why: P merge checks the owner's recorded "merge" (hooks/lib/owner-go.mjs) before it merges an owner item, but a plain
+// `gh pr merge`, the repo's own merge command or auto-merge through the API skipped P merge entirely (Codex design review of #58,
+// verified). In a chat repo each of them now needs the owner's "merge" naming that PR in this session. P merge runs the merge
+// command as its own child process, which the guard never sees, so low-risk PRs still merge on their own through P merge.
+// Without the owner-go wiring (tests, older callers) nothing here applies.
+function ownerGoMode(dir, ctx) {
+  if (!ctx?.ownerGo) return 'none';
+  if (dir === null) return 'chat'; // (which repository is unknown)
+  try {
+    return ctx.ownerGo.mode(dir);
+  } catch {
+    return 'chat'; // (a pipeline.yml that cannot be read)
+  }
+}
+const prNumberOf = (w) => {
+  const m = /^#?(\d{1,7})$/.exec(String(w ?? '')) ?? /\/pull\/(\d{1,7})(?:[/?#]|$)/.exec(String(w ?? ''));
+  return m ? Number(m[1]) : null;
+};
+// `elsewhere`: the command names another repository (-R, a PR URL), whose mode is unknown here: judged as a chat repo.
+// `head`: the head the command pins (gh: --match-head-commit; the repo command: the flag before its {sha}); a merge that pins no full
+// head could land a later push the owner never saw, so it is refused, and the owner's "merge" must be for exactly that head.
+function directMergeVerdict(pr, head, dir, ctx, what, elsewhere = false, pinFlag = '--match-head-commit') {
+  if (!ctx?.ownerGo) return null;
+  if (!elsewhere && ownerGoMode(dir, ctx) !== 'chat') return null;
+  const where = elsewhere ? 'a merge named by -R, a PR URL or GH_REPO (its repository may need the owner)' : 'in this repository (owner_approval: chat) a merge';
+  const via = `Merge through \`P merge --pr ${pr ?? 'N'}\` (it merges a low-risk PR itself), or show the request (Head and 🔀 lines) and wait for the owner to type "merge".`;
+  if (pr === null) return deny(`${what} without a literal PR number: ${where} needs the owner's "merge" for that PR and head. Name the PR number (run from the repository), or ${via[0].toLowerCase()}${via.slice(1)}`);
+  if (!pinFlag) return deny(`${what} #${pr}: ${where} needs the owner's "merge" for the head it lands, and this merge command pins no head. ${via}`);
+  if (!/^[0-9a-f]{40}$/.test(String(head ?? ''))) return deny(`${what} #${pr}: ${where} must pin the head the owner said "merge" for: add \`${pinFlag} <full 40-character head>\`. ${via}`);
+  let ok = false;
+  try {
+    ok = ctx.ownerGo.approvedHead(pr, head) === true;
+  } catch { /* unreadable records: not approved */ }
+  if (ok) return null;
+  return deny(`${what} #${pr}: ${where} needs the owner's "merge" for #${pr} at head ${head.slice(0, 12)} in this session, and none is recorded. ${via}`);
+}
+// Package-manager spellings of one script: `npm --silent run merge`, `npm run-script merge`, `npm rum merge`, `pnpm merge`, `yarn merge` all run
+// script "merge". canonPm drops the global options (before the subcommand and between `run` and the script) and maps the aliases to
+// `<pm> run <script> …`; an option it does not know is read as a flag without a value. (The value-taking ones it knows are skipped with their value.)
+const PM_RUN_ALIASES = { npm: ['run', 'run-script', 'rum', 'urn'], pnpm: ['run', 'run-script'], yarn: ['run'], bun: ['run'] };
+const PM_VALUE_OPTS = new Set(['--prefix', '--workspace', '-w', '--userconfig', '--globalconfig', '--cache', '--loglevel', '--registry', '--dir', '-C', '--filter', '-F', '--cwd', '--use-yarnrc', '--tag', '--scope', '--otp', '--script-shell']);
+const PM_WRAPPERS = new Set(['npx', 'pnpx', 'bunx', 'corepack', 'exec', 'x', 'dlx']);
+const PM_COMMANDS = new Set(['install', 'i', 'add', 'remove', 'rm', 'uninstall', 'update', 'up', 'upgrade', 'exec', 'dlx', 'x', 'test', 't', 'start', 'stop', 'restart', 'publish', 'pack', 'link', 'unlink', 'init', 'create', 'audit', 'outdated', 'list', 'ls', 'why', 'info', 'view', 'config', 'cache', 'version', 'help', 'login', 'logout', 'whoami', 'ci', 'rebuild', 'prune', 'dedupe', 'store', 'env', 'patch', 'import', 'fetch', 'run']);
+function canonPm(words) {
+  const pm = baseName(words[0] ?? '');
+  const aliases = PM_RUN_ALIASES[pm];
+  if (!aliases) return words;
+  const skipOpts = (i) => { while (i < words.length && words[i].startsWith('-') && words[i] !== '--') i += PM_VALUE_OPTS.has(words[i]) ? 2 : 1; return i; };
+  let i = skipOpts(1);
+  const sub = (words[i] ?? '').toLowerCase();
+  if (sub === '' || sub === '--') return words;
+  if (aliases.includes(sub)) {
+    i = skipOpts(i + 1);
+    return [words[0], 'run', ...words.slice(i)];
+  }
+  if (pm !== 'npm' && !PM_COMMANDS.has(sub)) return [words[0], 'run', ...words.slice(i)]; // (`yarn merge`, `pnpm merge`: a script)
+  return [words[0], ...words.slice(i)];
+}
+// The script a template runs through a package manager ('' when it is not one).
+// (canonPm output of a package manager's script call: `<pm> run <script> …`)
+const isPmRun = (c) => c.length > 2 && c[1] === 'run' && Object.hasOwn(PM_RUN_ALIASES, baseName(c[0]));
+const pmScriptOf = (prefix) => { const c = canonPm(prefix); return isPmRun(c) ? c[2] : ''; };
+// The words the script itself receives. Why (#58 round 3): npm keeps every option written before `--` for itself (`npm run merge 7 --expect-head=H`
+// hands the script only `7`), so for npm only the words AFTER `--` count; yarn and pnpm forward the words after the script name.
+const pmForwarded = (c) => (baseName(c[0]) === 'npm' ? (c.indexOf('--', 3) < 0 ? [] : c.slice(c.indexOf('--', 3) + 1)) : c.slice(3).filter((w) => w !== '--'));
+// Subcommands that cannot run a repo script (read-only queries, installs): `npm view merge version` names the word `merge` and is no merge.
+// (an unknown subcommand, `run`, `exec`, `x`, `dlx`, `explore`, `test`, `start` … stay judged as before)
+const PM_NO_SCRIPT = new Set(['view', 'v', 'info', 'show', 'ls', 'll', 'la', 'list', 'outdated', 'help', 'help-search', 'search', 's', 'find', 'why', 'explain', 'config', 'whoami', 'bin', 'root', 'prefix', 'ping', 'audit', 'fund', 'docs', 'home', 'repo', 'bugs',
+  'install', 'i', 'add', 'remove', 'rm', 'uninstall', 'un', 'update', 'up', 'upgrade']);
+const PM_BOOL_OPTS = new Set(['--silent', '-s', '--quiet', '-q', '--no-color', '--json', '--no-progress', '--no-audit', '--no-fund', '-g', '--global']);
+// (only options it knows may precede the subcommand: an unknown one could take the next word as its value and leave the real subcommand behind it)
+function pmCannotRunScript(words) {
+  if (!Object.hasOwn(PM_RUN_ALIASES, baseName(words[0] ?? ''))) return false;
+  let i = 1;
+  while (i < words.length && words[i].startsWith('-') && words[i] !== '--') {
+    if (PM_VALUE_OPTS.has(words[i])) i += 2;
+    else if (PM_BOOL_OPTS.has(words[i])) i += 1;
+    else return false;
+  }
+  return PM_NO_SCRIPT.has(String(words[i] ?? '').toLowerCase());
+}
+
+// The repo's own merge command (pipeline.yml merge.command, e.g. `npm run merge -- {pr} --expect-head {sha}`) typed by hand. A `gh …`
+// command is judged as gh.
+// Why (#58 round 4, strict shape): when the template is a package script, the guard does not try to recognise every package runner (npm / yarn /
+// pnpm / bun, wrappers, `run-script`, `--prefix` / `-C` / `--cwd` / workspaces, words before `--` that npm forwards …). Only the template's exact
+// spelling — its own words, then the PR and the pin after them, with nothing in between — is approvable (read as before: PR and head against the
+// owner-go record). Any other command that may run that script is refused in a chat repo with the canonical form named. A manager option that
+// moves the target directory is judged as a chat repo whatever the current directory is.
+const pmName = (w) => baseName(String(w ?? '')).replace(/@[^@/]*$/, '').toLowerCase();
+const isPmWord = (w) => Object.hasOwn(PM_RUN_ALIASES, pmName(w));
+const MOVES_DIR = /^(?:--prefix|--cwd|--dir|--workdir|--workspaces?|--filter|--filter-prod|--include-workspace-root|--userconfig|--globalconfig|--global|--location|-w|-ws|-C|-F|-g)(?:=.*)?$|^-[CwF]./;
+// (a package-manager setting the line gives — `npm_config_prefix=/chat npm run merge …`, `export npm_config_…`, `env YARN_…` — may move it the same way: npm reads
+// npm_config_* like its options, whatever the case. Fails closed on any such name; the guard's variables hold only what the line sets.)
+const pmSettingOnLine = (ctx) => [...Object.keys(ctx.vars ?? {}), ...(ctx.unsureVars ?? []), ...(ctx.tainted ?? [])].some((k) => /^(?:npm_config_|yarn_|pnpm_|bun_|berry_)/i.test(k));
+function pmScriptRefusal(prefix, shaFlag, raw, dir, ctx) {
+  const script = pmScriptOf(prefix);
+  const end = raw.indexOf('--');
+  const before = raw.slice(1, end < 0 ? undefined : end);
+  // (the manager, or a wrapper — npx / pnpx / bunx / corepack / exec / dlx … — that runs one, with the script's name on the line or a word built at run time before `--`)
+  const same = isPmWord(raw[0]);
+  const wrapped = (same || PM_WRAPPERS.has(pmName(raw[0]))) && raw.some((w) => PM_WRAPPERS.has(String(w).toLowerCase())) && raw.some(isPmWord);
+  const mayRun = ((same && (before.includes(script) || before.some((w) => DYNAMIC.test(w)))) || (wrapped && raw.includes(script))) && !pmCannotRunScript(raw);
+  if (!mayRun) return undefined;
+  const moved = before.some((w) => MOVES_DIR.test(w) || w === 'workspace') || pmSettingOnLine(ctx);
+  if (!moved && ownerGoMode(dir, ctx) !== 'chat') return null;
+  const canon = `${prefix.join(' ')} <PR>${shaFlag ? ` ${shaFlag} <full 40-character head>` : ''}`;
+  return deny(`\`${raw.join(' ').slice(0, 120)}\` may run the merge script \`${script}\`, and ${moved ? 'a manager option moves its target directory, so it is judged as a chat repository' : 'in this repository (owner_approval: chat)'} a merge needs the owner's "merge" for that PR and head. Only the exact form \`${canon}\` is checked against the owner's record (nothing between the script name and \`--\`, no manager options, no wrapper). Use it, or merge through \`P merge --pr N\` (it merges a low-risk PR itself).`);
+}
+function repoMergeCommandVerdict(argv, dir, ctx) {
+  if (!ctx?.ownerGo) return null;
+  // (an unknown directory is judged by the session's own; a pipeline.yml that cannot be read leaves `npm run merge` as the guess, as the mode of an unreadable one is chat)
+  let templates = [];
+  try {
+    templates = ctx.ownerGo.mergeTemplates(dir ?? ctx.cwd) ?? [];
+  } catch {
+    templates = [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: null }];
+  }
+  const raw = argv.map((a) => expandVars(a, ctx));
+  const usable = templates.filter((t) => Array.isArray(t.prefix) && t.prefix.length && baseName(t.prefix[0]) !== 'gh');
+  // Package-script templates: the canonical shape of any of them is approvable; anything else that may run a template's script is refused.
+  const scripts = usable.filter((t) => pmScriptOf(t.prefix));
+  for (const { prefix, shaFlag } of scripts) {
+    if (pmSettingOnLine(ctx)) break; // (judged below as a moved target)
+    if (raw.length < prefix.length || baseName(raw[0]) !== baseName(prefix[0]) || !prefix.every((w, i) => i === 0 || raw[i] === w)) continue;
+    // (npm keeps every option written before `--` for itself: a template without `--` hands the script no option)
+    const tail = raw.slice(prefix.length);
+    const given = baseName(prefix[0]) === 'npm' && !prefix.includes('--') ? tail.filter((w) => !w.startsWith('-')) : tail;
+    let head = null;
+    if (shaFlag) {
+      // (exactly one head flag: with two, which one the script honours is unknown)
+      const vals = given.flatMap((w, j, all) => (w === shaFlag ? [all[j + 1]] : w.startsWith(`${shaFlag}=`) ? [w.slice(shaFlag.length + 1)] : []));
+      head = vals.length === 1 ? vals[0] ?? null : null;
+    }
+    return directMergeVerdict(prNumberOf(given[0]), head, dir, ctx, `\`${prefix.join(' ')}\``, false, shaFlag);
+  }
+  for (const { prefix, shaFlag } of scripts) {
+    const v = pmScriptRefusal(prefix, shaFlag, raw, dir, ctx);
+    if (v !== undefined) return v;
+  }
+  for (const { prefix, shaFlag } of usable) {
+    if (pmScriptOf(prefix)) continue;
+    const plain = raw.filter((w) => w !== '--');
+    const p = prefix.filter((w) => w !== '--');
+    if (plain.length < p.length || baseName(plain[0]) !== baseName(p[0]) || !p.slice(1).every((w, i) => plain[i + 1] === w)) continue;
+    let head = null;
+    if (shaFlag) {
+      const vals = plain.flatMap((w, j, all) => (w === shaFlag ? [all[j + 1]] : w.startsWith(`${shaFlag}=`) ? [w.slice(shaFlag.length + 1)] : []));
+      head = vals.length === 1 ? vals[0] ?? null : null;
+    }
+    return directMergeVerdict(prNumberOf(plain[p.length]), head, dir, ctx, `\`${prefix.join(' ')}\``, false, shaFlag);
+  }
   return null;
 }
 
@@ -878,7 +1052,19 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
 
   if (group === 'pr' && verb === 'merge') {
     if (rest.some((t) => t === '--admin' || t.startsWith('--admin='))) return deny(`\`gh pr merge --admin\` bypasses the merge gate and is blocked. Use \`--auto\` / the pipeline merge command. ${OWNER_ONLY}`);
-    return null;
+    const { flags, positionals } = parseOpts(rest, { longValue: ['author-email', 'body', 'body-file', 'match-head-commit', 'repo', 'subject'], shortValue: 'AbFtR' });
+    // (a real `--disable-auto` flag whose LAST setting is on, with `--auto` not on, turns a queued merge off and merges nothing. `--disable-auto`
+    // as the value of --subject / --body …, `--disable-auto=false`, or one next to `--auto` is no cancellation: the PR merges)
+    // (and only when every flag is one gh pr merge has, and no word is built at run time: an unknown flag or a `$(…)` word could be what makes it a merge)
+    const known = flags.every((f) => (f.short ? GH_MERGE_SHORT.includes(f.name) : GH_MERGE_LONG.includes(f.name)));
+    if (known && !rest.some((t) => DYNAMIC.test(t)) && boolFlag(flags, 'disable-auto') === 'on' && boolFlag(flags, 'auto') === 'off') return null;
+    // (gh reads the repository from -R, a PR URL or GH_REPO: set on this command, earlier on the line (unknown if it ran) or inherited. An empty GH_REPO selects nothing)
+    const ghRepo = envVar(env, ctx, 'GH_REPO');
+    const viaEnv = !ghRepo.known || (Object.hasOwn(env, 'GH_REPO') ? ghRepo.value !== '' : (ghRepo.value !== undefined && ghRepo.value !== '') || (typeof ctx.env?.GH_REPO === 'string' && ctx.env.GH_REPO !== ''));
+    const elsewhere = flagValues(flags, ['repo'], 'R').length > 0 || /\/pull\//.test(positionals[0] ?? '') || viaEnv;
+    // (gh uses the LAST --match-head-commit: a repeated one could pin another head than the one checked, so it pins nothing)
+    const pins = flagValues(flags, ['match-head-commit']);
+    return directMergeVerdict(prNumberOf(positionals[0]), pins.length === 1 ? pins[0] : null, dir, ctx, '`gh pr merge`', elsewhere);
   }
 
   if ((group === 'pr' || group === 'issue') && (verb === 'edit' || verb === 'create')) {
@@ -2028,9 +2214,12 @@ function evalString(str, startDir, ctx, level) {
     }
     else {
       for (const inner of jobStartCommands(argv, ctx) ?? []) {
-        const v = evalString(inner, dir, ctx, level + 1);
+        // Why (#58 round 3): the job runs in THIS command's environment, so its prefix (`GH_REPO=o/chat … job start m -- gh pr merge 8`) names the
+        // merge's repository exactly as it would for the merge typed directly.
+        const v = withPrefixEnv(c, ctx, () => evalString(inner, dir, ctx, level + 1));
         if (v.decision === 'deny') { verdict = v; break; }
       }
+      if (!verdict) verdict = withPrefixEnv(c, ctx, () => repoMergeCommandVerdict(argv, dir, ctx)); // (#58; with its prefix: `npm_config_prefix=/chat npm run merge …`)
       if (!verdict) {
         // a string or program text the parser cannot unwrap (node -e, osascript, make CMD=...) that carries a guarded command
         const why = catchAllReason(argv);
@@ -2121,12 +2310,13 @@ function evaluateGitOnce(command, {
   realpath = realpathSync.native, // symlinks followed when a write and a script are compared (tests fake it)
   now = Date.now, // injectable clock (tests)
   env = {}, // the hook process's environment (BASH_ENV / ENV / ZDOTDIR name startup files the shells run); {} keeps tests hermetic
+  ownerGo = null, // #58: { mode(dir), mergeTemplates(dir), approvedHead(pr, head) } (git-wiring.mjs ownerGoWiring); null = no direct-merge check
 } = {}, bashState) {
   const text = typeof command === 'string' ? command : String(command ?? '');
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   const base = cwd || process.cwd();
   const ctx = {
-    cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, readDir, readHead, realpath, env, budget: bashState?.carry ? { ...bashState.carry, startupOk: new Set(), startupFx: undefined } : newEvalBudget(now), fullText: text, lineText: text,
+    cwd: base, home, currentBranch, pushDestination, issueLabels, ownerGo, readText, pathExists, readDir, readHead, realpath, env, budget: bashState?.carry ? { ...bashState.carry, startupOk: new Set(), startupFx: undefined } : newEvalBudget(now), fullText: text, lineText: text,
     vars: Object.create(null), unsureVars: new Set(), tainted: new Set(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
     branches: new Map(), cfgDirty: false, envCfgDirty: false, writeFrames: [], bashState,
   };

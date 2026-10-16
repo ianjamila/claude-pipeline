@@ -27,12 +27,14 @@ async function evaluate(input) {
   const texts = commandTextsOf(input.tool_name, input.tool_input);
   if (texts.length === 0) return { decision: 'allow', reason: '' };
   const { evaluateGitCommand } = await import('./lib/git-policy.mjs');
-  const { realGitWiring } = await import('./lib/git-wiring.mjs');
+  const { realGitWiring, ownerGoWiring } = await import('./lib/git-wiring.mjs');
 
   const opts = {
     cwd: typeof input.cwd === 'string' && input.cwd ? input.cwd : process.cwd(),
     env: process.env,
     ...realGitWiring(),
+    // #58: a direct merge in an owner_approval: chat repo needs the owner's "merge" recorded in THIS session (the hook input names it)
+    ownerGo: ownerGoWiring(typeof input.session_id === 'string' ? input.session_id : null),
   };
   for (const text of texts) {
     const verdict = evaluateGitCommand(text, opts);
