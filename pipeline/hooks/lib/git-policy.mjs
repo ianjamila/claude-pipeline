@@ -2095,35 +2095,58 @@ function onceAssignedNames(cmds, ctx, str) {
       const binder = VAR_BUILTINS.includes(nm) || (VALUE_BINDERS.has(nm) && (nm !== 'printf' || c.argv.some((w) => /^-[A-Za-z]*v/.test(w)))) || nm === 'for' || nm === 'select';
       if (Object.hasOwn(c.env ?? {}, k) || (binder && c.argv.slice(1).some((a) => bindWordRe(k).test(a))) || implicitBindsOf(c).includes(k)) sites.push(i);
     }
-    if (sites.length !== 1) continue;
+    // #81 t6: a name that only `for` loops one after another bind (`for n in 1 2; do …; done; for n in 3 4; do …; done`) takes every word of every list (below)
+    const isForSite = (c) => c.argv[0] === 'for' && c.argv[1] === k && c.argv[2] === 'in' && c.argv.length > 3;
+    if (sites.length === 0 || (sites.length > 1 && !sites.every((i) => isForSite(cmds[i])))) continue;
     const s = sites[0];
     const site = cmds[s];
-    if (site.depth > 0 || ranInSubshell(cmds, s)) continue;
+    if (sites.some((i) => cmds[i].depth > 0 || ranInSubshell(cmds, i))) continue;
+    // (every loop in the same subshell as the first: a loop in `( … )` or a pipe stage mixed with one outside it is not read. Defence in depth for the pipe / background loop,
+    // which markClosedOut marks as conditional, so the readings below also hold the unset name; the subshell loop is the case this stops: its value is lost outside it)
+    if (sites.some((i) => !Array.isArray(cmds[i].grp) || cmds[i].grp.length !== site.grp?.length || cmds[i].grp.some((id, j) => id !== site.grp[j]))) continue;
     // the values it can take: a bare assignment's text (or none: it did not run), or each word of a `for k in …` list
     let modes;
     if (!site.argv.length) {
       if (new RegExp(`\\$\\{?${k}(?![A-Za-z0-9_])`).test(String(site.env[k]))) continue; // (its value reads itself)
       modes = ['set', 'skip'];
-    } else if (site.argv[0] === 'for' && site.argv[1] === k && site.argv[2] === 'in' && site.argv.length > 3) {
+    } else if (isForSite(site)) {
       // (each word as written: a glob stands for the files it matches, judged as candidates where the word lands; a word that splits or brace-expands is not read)
       // Why (#56 replay): `B=app/x && for f in $B/a.ts $B/b.ts` and `for f in "app/[id]/page.tsx"` were refused. A word may also hold `[…]` (a glob class, judged like
       // `*`) and `$NAME` / `${NAME}`: such a word is worked out when the walk reaches the `for` (loopWordAt), with what is known there. Not when the header holds a
       // single quote or a backslash (`'$B'` is the text $B, which the argv no longer shows), nor where IFS may be set (ifsMayBeSet: it changes how the value splits).
       // #81: a word may also be any other literal text the parser has unquoted (a space, parentheses, a `#` or `^`, empty: loopTextWord), and a word that is one command substitution
       // (site.subWords): its value is only known at run time and is judged where it lands, as `for p in $(…)` alone is (computedLoopWord); the literal words beside it are read one by one.
-      const words = site.argv.slice(3);
-      const computed = (w) => site.subWords?.has(w) === true;
-      const textual = (w) => !computed(w) && !LOOP_WORD_IN.test(w) && loopTextWord(w, site);
-      if (!words.every((w) => computed(w) || LOOP_WORD_IN.test(w) || textual(w))) continue;
-      const expand = words.some((w) => w.includes('$') && !computed(w));
-      if (expand && (/['\\]/.test(String(site.raw ?? "'")) || ifsMayBeSet(ctx) || words.some((w) => [...w.matchAll(/\$\{?(\w+)/g)].some((x) => x[1] === k)))) continue;
-      modes = [...new Set(words)].map((w) => (w.includes('$') && !computed(w) ? { val: w, expand: true } : { val: w }));
-      // (#56, Codex review of 8b86e2b: `false && for b in agent/x; do :; done; git push origin $b` pushes the value b had before. Where the loop may not run, or a
-      // word is a glob that may match nothing, the name may also keep that value: one more reading, the name not set by the line)
-      // (the `for` itself carries its own loop mark, so mayNotRun cannot tell; after any earlier loop mark it may sit in an outer loop that runs no time)
-      const ctl = site.ctl;
-      const mayNot = !ctl || cmds.ctlBroken || cmds.truncated || ctl.cond || ctl.fn || ctl.trap || site.sep === '&&' || site.sep === '||' || cmds.slice(0, s).some((c) => !c.ctl || c.ctl.loop);
-      if (mayNot || words.some((w) => /[*?[]/.test(w))) modes.push('skip');
+      // #81 t6: with several loops the readings are every word of every list (deduplicated), and the unset name when any loop may not run. A use anywhere (in a loop's body,
+      // between the loops, after them) sees a word of one of the lists or the value the name had before, so each is covered; a bad word in ANY list is found at every use
+      // (the same as before for one loop: a union of one). Nothing here depends on which loop a use is in, so a nested loop would be read soundly too; it stays refused (below).
+      const seen = new Map();
+      let mayNot = false;
+      let bad = false;
+      for (const si of sites) {
+        const lp = cmds[si];
+        const words = lp.argv.slice(3);
+        const computed = (w) => lp.subWords?.has(w) === true;
+        const textual = (w) => !computed(w) && !LOOP_WORD_IN.test(w) && loopTextWord(w, lp);
+        if (!words.every((w) => computed(w) || LOOP_WORD_IN.test(w) || textual(w))) { bad = true; break; }
+        const expand = words.some((w) => w.includes('$') && !computed(w));
+        if (expand && (/['\\]/.test(String(lp.raw ?? "'")) || ifsMayBeSet(ctx) || words.some((w) => [...w.matchAll(/\$\{?(\w+)/g)].some((x) => x[1] === k)))) { bad = true; break; }
+        for (const w of words) {
+          const m = w.includes('$') && !computed(w) ? { val: w, expand: true } : { val: w };
+          seen.set((m.expand ? 'x' : 'v') + w, m);
+        }
+        // (#56, Codex review of 8b86e2b: `false && for b in agent/x; do :; done; git push origin $b` pushes the value b had before. Where the loop may not run, or a
+        // word is a glob that may match nothing, the name may also keep that value: one more reading, the name not set by the line)
+        // (the `for` itself carries its own loop mark, so mayNotRun cannot tell; after any earlier loop mark it may sit in an outer loop that runs no time.
+        // For a later loop of the same name that look-back would always find the earlier loop: a loop opened between them is judged by the first loop's look-back and the readings above)
+        const ctl = lp.ctl;
+        if (!ctl || cmds.ctlBroken || cmds.truncated || ctl.cond || ctl.fn || ctl.trap || lp.sep === '&&' || lp.sep === '||' || (si === s && cmds.slice(0, s).some((c) => !c.ctl || c.ctl.loop)) || words.some((w) => /[*?[]/.test(w))) mayNot = true;
+      }
+      if (bad) continue;
+      // loops one after another, none inside another (a nested loop that reuses the name keeps the denial): between two headers every loop opened is closed
+      // (defence in depth: the readings above are sound for a nested loop too; this keeps the refusal that was asked for. A miscount can only refuse more, or read a nested loop soundly.)
+      if (sites.length > 1 && !loopsInSequence(text, k, sites.length)) continue;
+      modes = [...seen.values()];
+      if (mayNot) modes.push('skip');
     } else continue;
     if (live.some((b) => varWordRe(k).test(b))) continue;
     // every mention in the text the shell reads: one assignment, the rest plain references (no ${k:=…} / ${k=…}, no k[…], no other bare word k)
@@ -2145,15 +2168,66 @@ function onceAssignedNames(cmds, ctx, str) {
       if (/(?:^|[\s;&|(){])for\s+$/.test(text.slice(Math.max(0, m.index - 8), m.index)) && site.argv[0] === 'for') { assigns++; continue; } // (the loop's own name)
       odd = true;
     }
-    if (odd || assigns !== 1) continue;
+    if (odd || assigns !== sites.length) continue;
     let ok = true;
     for (const [i, c] of cmds.entries()) {
-      if (i === s || !mentions(c, k)) continue;
+      if (sites.includes(i) || !mentions(c, k)) continue;
       if (i < s || !Array.isArray(c.grp) || site.grp.some((id, j) => c.grp[j] !== id)) { ok = false; break; }
     }
     if (ok) out.push({ k, modes });
   }
+  // #81 t5: asked for only when the product is over the cap (judgeReadings): which names can be read one group at a time
+  out.split = () => independentReadings(cmds, str, out);
   return out;
+}
+// #81 t5: the readings of names that cannot meet are counted by SUM (each name's own values with the others at their first), not multiplied. Names meet when one command reads
+// both (also a `for` header, an assignment and the names its value is built from); a command is then judged on its own words and nothing else only when the line holds no
+// command that could run a script or change the state the others are judged in (a script may read any name the line has set; a write may be the script a later command runs;
+// cd and git / gh state). So every command of the line must be a bare assignment or a plain tool named without a path that the guard does not open as a script: a builtin
+// that only reads or tests (UNSURE_OK) or a tool that only runs a program elsewhere (OPAQUE_TOOLS: docker, npm, ps …). Anything else gives null: the product, as before.
+// Null also when a name is not plainly a group member of its own; the groups come as arrays of indexes into `names`.
+const OPAQUE_TOOLS = new Set(['npm', 'npx', 'docker', 'supabase', 'psql', 'ps', 'lsof', 'pgrep', 'pidof', 'kill', 'rm', 'mkdir', 'touch', 'cp', 'mv', 'du', 'df', 'file', 'shasum', 'diff', 'cmp', 'uname', 'whoami', 'hostname', 'id', 'wait']);
+function independentReadings(cmds, str, names) {
+  for (const c of cmds) {
+    if (!c.argv.length) continue;
+    const head = c.argv[0];
+    if (typeof head !== 'string' || DYNAMIC.test(head) || head.includes('/') || !(UNSURE_OK.has(head) || OPAQUE_TOOLS.has(head))) return null;
+    if (VAR_BUILTINS.includes(head) || VALUE_BINDERS.has(head)) continue; // (a binder is a site of the name it binds: it joins the group below)
+    if (splicesOptions(c.argv) || scriptFileOf(c.argv, c.raw, str) !== null) return null; // (defence in depth: none of these names opens a script; the readings of a script are never split)
+  }
+  const parent = names.map((_, i) => i);
+  const find = (i) => { while (parent[i] !== i) i = parent[i] = parent[parent[i]]; return i; };
+  const reads = names.map(({ k }) => new RegExp(`\\$\\{?${k}(?![A-Za-z0-9_])`));
+  const bare = names.map(({ k }) => varWordRe(k));
+  for (const c of cmds) {
+    const text = [c.raw ?? '', ...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')].join('\n');
+    // (a name read as `$k` / `${k…}`; as a bare word only where the shell reads a bare word as a name -- arithmetic, `[[ ]]`, `let`, a subscript -- or binds it: a `for` / binder word, a prefix assignment.
+    // Elsewhere a bare `p` is a flag (`ps -p`), not the name.)
+    const nm = c.argv.length ? c.argv[0] : '';
+    const bareOk = /\(\(|\[|\blet\b/.test(text);
+    const binds = nm === 'for' || nm === 'select' || VAR_BUILTINS.includes(nm) || VALUE_BINDERS.has(nm);
+    let first = -1;
+    for (let i = 0; i < names.length; i++) {
+      const { k } = names[i];
+      if (!reads[i].test(text) && !(bareOk && bare[i].test(text)) && !(binds && c.argv.slice(1).some((a) => bare[i].test(a))) && !Object.hasOwn(c.env ?? {}, k) && !implicitBindsOf(c).includes(k)) continue;
+      if (first < 0) first = i; else parent[find(i)] = find(first);
+    }
+  }
+  const groups = new Map();
+  for (let i = 0; i < names.length; i++) { const r = find(i); groups.set(r, [...(groups.get(r) ?? []), i]); }
+  return [...groups.values()];
+}
+// #81 t6: the `for NAME in` headers in the (quote-blanked) text are `count` in number and each one's loop is closed before the next opens
+function loopsInSequence(text, k, count) {
+  const heads = [...text.matchAll(new RegExp(`(?:^|[\\s;&|(){])for\\s+${k}\\s+in(?=\\s)`, 'g'))].map((m) => m.index + m[0].indexOf('for'));
+  if (heads.length !== count) return false;
+  const opens = /(?:^|[\s;&|(){])(?:for|while|until|select|repeat|foreach)(?=\s|$)/g;
+  const closes = /(?:^|[\s;&|(){])done(?=[\s;&|(){}]|$)/g;
+  for (let j = 0; j + 1 < heads.length; j++) {
+    const seg = text.slice(heads[j] - 1 < 0 ? 0 : heads[j] - 1, heads[j + 1]);
+    if ((seg.match(opens) ?? []).length !== (seg.match(closes) ?? []).length) return false;
+  }
+  return true;
 }
 // A reading's loop word that holds `$NAME` gets its value where the `for` runs (every use of the loop name comes after it): the names it reads must be known
 // there and give literal text, else the reading is refused. Null when the value is set.
@@ -2171,8 +2245,25 @@ function loopWordAt(k, ctx) {
 // (defence in depth: a name that reaches a git command is refused as unsure in the reading where its assignment did not run, so the readings do not leave different states in practice).
 function judgeReadings(str, startDir, ctx, level, names, saved) {
   if (pinsAt(ctx, level) || names.length === 0) return null;
-  const total = names.reduce((n, { modes }) => n * modes.length, 1);
-  if (total > MAX_READINGS) return null;
+  // each reading is one mode per name. Names that cannot meet (independentReadings) are read a group at a time, the others at their first mode: the sum of the groups' sizes
+  // (each at most the cap, the sum too) instead of their product; else every combination of all of them, at most the cap
+  let plan = null;
+  const product = (idx) => idx.reduce((n, i) => n * names[i].modes.length, 1);
+  const all = names.map((_, i) => i);
+  if (product(all) > MAX_READINGS) {
+    const groups = names.split?.();
+    if (!groups || groups.length < 2 || groups.some((g) => product(g) > MAX_READINGS) || groups.reduce((n, g) => n + product(g), 1 - groups.length) > MAX_READINGS) return null;
+    plan = [];
+    groups.forEach((g, gi) => {
+      for (let r = gi === 0 ? 0 : 1; r < product(g); r++) {
+        const pick = names.map(() => 0);
+        let rest = r;
+        for (const i of g) { pick[i] = rest % names[i].modes.length; rest = Math.floor(rest / names[i].modes.length); }
+        plan.push(pick);
+      }
+    });
+  }
+  const total = plan ? plan.length : product(all);
   const outer = [ctx.pins, ctx.pinsLevel];
   let dirty = false;
   let envDirty = false;
@@ -2185,8 +2276,8 @@ function judgeReadings(str, startDir, ctx, level, names, saved) {
       ctx.pinsLevel = level;
       ctx.pins = new Map();
       let rest = r;
-      for (const { k, modes } of names) {
-        const m = modes[rest % modes.length];
+      for (const [x, { k, modes }] of names.entries()) {
+        const m = plan ? modes[plan[r][x]] : modes[rest % modes.length];
         rest = Math.floor(rest / modes.length);
         ctx.pins.set(k, m);
         if (typeof m === 'object') ctx.vars[k] = m.val; // (a loop variable: every use comes after the `for`, so it holds the word from the start)
