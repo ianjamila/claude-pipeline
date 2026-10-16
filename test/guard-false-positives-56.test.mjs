@@ -472,3 +472,48 @@ test('#56 Codex review of 8b86e2b: a later loop, a loop that may not run and an 
   ]) allowGit(cmd, SPEC);
   for (const cmd of ['for f in src/a.ts a.mjs; do cp $f /tmp/x/; done']) allowBoth(cmd, SPEC);
 });
+
+test('#56 Codex recheck of d925d42: a builtin that sets a name it is not given (read REPLY, getopts OPTARG, mapfile MAPFILE, zsh =~ MATCH) is no single binding site', () => {
+  const labels = (n) => (n === '7' ? ['pipeline-pause'] : []);
+  const fsx = fakeFs(GIT_ROOT, {}, DIRS);
+  for (const cmd of [
+    'for REPLY in 5; do read <<< 7; gh issue close $REPLY; done',
+    'for REPLY in 5; do select x in a; do break; done <<< 7; gh issue close $REPLY; done',
+    'for OPTARG in 5; do getopts n: o -n 7; gh issue close $OPTARG; done',
+    'for OPTIND in 5; do getopts n: o -n 7; gh issue close $OPTIND; done',
+    'for MAPFILE in 5; do mapfile <<< 7; gh issue close $MAPFILE; done',
+    'for reply in 5; do read -A <<< 7; gh issue close $reply; done',
+    'for MATCH in 5; do [[ 7 =~ 7 ]]; gh issue close $MATCH; done',
+    'for match in 5; do [[ 7 =~ (7) ]]; gh issue close $match; done',
+    'REPLY=5; read <<< 7; gh issue close $REPLY',
+  ]) assert.equal(git(cmd, fsx, { issueLabels: labels }).decision, 'deny', cmd);
+  // the same shapes in a push and a write: both guards
+  for (const cmd of [
+    'for REPLY in agent/x; do read <<< main; git push origin $REPLY; done',
+    'for OPTARG in agent/x; do getopts b: o -b main; git push origin $OPTARG; done',
+  ]) denyGit(cmd, SPEC);
+  for (const cmd of [
+    'for REPLY in safe; do read <<< settings.json; printf x > ~/.claude/$REPLY; done',
+    'for MAPFILE in safe; do mapfile <<< settings.json; printf x > ~/.claude/$MAPFILE; done',
+    'for OPTARG in safe; do getopts f: o -f settings.json; printf x > ~/.claude/$OPTARG; done',
+    'for reply in safe; do read -A <<< settings.json; printf x > ~/.claude/$reply; done', // (zsh read -A sets reply; on main too)
+    'reply=safe; read -A <<< settings.json; printf x > ~/.claude/$reply',
+    'for MATCH in safe; do [[ settings.json =~ settings.json ]]; printf x > ~/.claude/$MATCH; done', // (zsh =~ sets MATCH / match)
+    'MATCH=safe; [[ settings.json =~ settings.json ]]; printf x > ~/.claude/$MATCH',
+    'match=safe; [[ settings.json =~ (settings.json) ]]; printf x > ~/.claude/$match',
+    'setopt extendedglob; MATCH=safe; w=settings.json; : ${w//(#m)*/x}; printf x > ~/.claude/$MATCH', // (the (#m) glob flag)
+    'F=safe; zparseopts -D -a F f; printf x > ~/.claude/$F', // (zsh binders: any name)
+    'F=safe; vared F; printf x > ~/.claude/$F',
+    'F=safe; strftime -s F %s 1; printf x > ~/.claude/$F',
+    'F=safe; print -v F settings.json; printf x > ~/.claude/$F',
+    'F=safe; integer F=1; printf x > ~/.claude/$F',
+  ]) assert.equal(files(cmd, fakeFs(PROJ, {}, DIRS)).decision, 'deny', cmd);
+  for (const cmd of [
+    'B=agent/x; zparseopts -D -a B b; git push origin $B',
+    'B=agent/x; print -v B main; git push origin $B',
+    'B=agent/x; vared B; git push origin $B',
+    'MATCH=agent/x; [[ main =~ main ]]; git push origin $MATCH',
+  ]) denyGit(cmd, SPEC);
+  // still judged one by one: an ordinary name next to a read that names its own target
+  assert.equal(git('for n in 5; do read -r x <<< 7; gh issue close $n; done', fsx, { issueLabels: labels }).decision, 'allow');
+});

@@ -15,7 +15,7 @@
 import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText } from './shell-parse.mjs';
+import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS } from './shell-parse.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
 import { scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
@@ -1548,6 +1548,7 @@ function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0) {
         if (m) bump(m[1], 2);
       }
     }
+    for (const k of implicitBindsOf(c)) bump(k, 2); // (`read` sets REPLY, `getopts` OPTARG, `[[ =~ ]]` MATCH …: see implicitBindsOf)
     for (const k of Object.keys(c.env)) if (!sameValue(ctx, k, c.env[k])) bump(k, n);
     if (c.argv.length && VAR_BUILTINS.includes(baseName(c.argv[0]))) {
       // `declare -n X=F` makes X a NAMEREF: $X reads $F at run time, while the text says "F". Unknown, like a binder.
@@ -1577,6 +1578,7 @@ function bindsRunTimeName(c) {
   const nm = baseName(c.argv[0]);
   const words = c.argv.slice(1);
   if (VAR_BUILTINS.includes(nm)) return words.some((w) => DYNAMIC.test(w.includes('=') ? w.slice(0, w.indexOf('=')) : w));
+  if (ZSH_NAME_BINDERS.has(nm) || (nm === 'print' && words.some((w) => /^-[A-Za-z]*v/.test(w)))) return true; // (zsh binders whose operands are not read: any name, see ZSH_NAME_BINDERS)
   if (!VALUE_BINDERS.has(nm)) return false;
   if (nm === 'printf' && !words.some((w) => /^-[A-Za-z]*v/.test(w))) return false;
   return words.some((w) => DYNAMIC.test(w));
@@ -1864,7 +1866,7 @@ function onceAssignedNames(cmds, ctx, str) {
   for (const c of cmds) {
     if (!c.argv.length) continue;
     const nm = baseName(c.argv[0]);
-    if (DYNAMIC.test(c.argv[0]) || SOURCING.includes(nm) || nm === 'eval') return [];
+    if (DYNAMIC.test(c.argv[0]) || SOURCING.includes(nm) || nm === 'eval' || bindsRunTimeName(c)) return [];
     // Why (#56 replay): only a binder whose NAME is only known at run time may set any name (`export $X=1`, `read $V`); a value that expands
     // (`export PATH=/x:$PATH`, the first command of many lines) names its target. printf binds only with -v.
     if (VAR_BUILTINS.includes(nm)) {
@@ -1891,7 +1893,7 @@ function onceAssignedNames(cmds, ctx, str) {
       const nm = c.argv.length ? baseName(c.argv[0]) : '';
       // (a binder's word binds k when it names k itself: `$k` / `${k…}` there is a value it reads, `printf '%s' $p` without -v binds nothing; #56 replay)
       const binder = VAR_BUILTINS.includes(nm) || (VALUE_BINDERS.has(nm) && (nm !== 'printf' || c.argv.some((w) => /^-[A-Za-z]*v/.test(w)))) || nm === 'for' || nm === 'select';
-      if (Object.hasOwn(c.env ?? {}, k) || (binder && c.argv.slice(1).some((a) => bindWordRe(k).test(a)))) sites.push(i);
+      if (Object.hasOwn(c.env ?? {}, k) || (binder && c.argv.slice(1).some((a) => bindWordRe(k).test(a))) || implicitBindsOf(c).includes(k)) sites.push(i);
     }
     if (sites.length !== 1) continue;
     const s = sites[0];

@@ -580,6 +580,20 @@ const BASH_DEFAULT = /^\$\{BASH:?-bash\}$/; // (the only spelling that names bas
 const BASH_REF = /\$BASH(?![A-Za-z0-9_])|\$\{BASH(?::?-(?:bash|sh))?\}/g;
 // commands that bind a name given as an operand (`read N`, `declare N=v`, `printf -v N`, `let`, zsh `vared` ...): a name that is not a plain word could be BASH
 const BINDERS = /(?<![\w.$/-])(?:read|declare|typeset|local|export|readonly|mapfile|readarray|getopts|unset|let|vared|zparseopts|printf|print|strftime|zstyle|sysread|zstat|getln|integer|float|select|set|autoload|compgen)(?![\w-])([^\n;&|<>]*)/g;
+// Why (#56, Codex recheck of d925d42): zsh builtins that bind names their operands give in shapes the guards do not read (`zparseopts -a B`, `b:=B` specs,
+// `vared B`, `strftime -s B`, `zstat -A B`, `integer B=5`): the git and files guards treat one on the line as binding any name. (`print -v B` is read like printf -v.)
+export const ZSH_NAME_BINDERS = new Set(['vared', 'zparseopts', 'strftime', 'zstyle', 'sysread', 'zstat', 'getln', 'integer', 'float', 'private']);
+// zsh `=~` and the (#b) / (#m) glob flags set these, bash `=~` sets BASH_REMATCH
+const MATCH_NAMES = ['MATCH', 'match', 'MBEGIN', 'MEND', 'mbegin', 'mend', 'BASH_REMATCH'];
+// The names a command sets without being given them: `read` REPLY (zsh `read -A`: reply), `select` REPLY, `getopts` OPTARG / OPTIND, `mapfile` MAPFILE,
+// `[[ … =~ … ]]` and a (#…) pattern flag the match names. (Why, #56 Codex recheck of d925d42: `for REPLY in 5; do read <<< 7; gh issue close $REPLY; done`
+// closed issue 7 while the readings judged 5.)
+export function implicitBindsOf(c) {
+  const nm = c.argv?.length ? commandName(c.argv[0]) : '';
+  const out = nm === 'read' ? ['REPLY', 'reply'] : nm === 'select' ? ['REPLY'] : nm === 'getopts' ? ['OPTARG', 'OPTIND'] : nm === 'mapfile' || nm === 'readarray' ? ['MAPFILE'] : [];
+  if (nm === '[[' || [...(c.argv ?? []), ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')].some((w) => String(w).includes('(#'))) out.push(...MATCH_NAMES);
+  return out;
+}
 // Is BASH ever bound by the text? Fail closed: every mention that is not a plain reference counts (also with quotes taken out: `read B""ASH`), a binder
 // whose operand name is not a plain word (`declare "${n}SH=x"`, `read -r "$v"`, `export $n=x`, `read BA{SH,}`), `(( $n = 1 ))`, eval, source / `.` (the sourced
 // file may bind it), an ANSI-C string with an escape. A mention inside a quote or comment only makes this stricter.

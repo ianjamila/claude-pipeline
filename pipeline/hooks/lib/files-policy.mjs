@@ -19,7 +19,7 @@ import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
-import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText } from './shell-parse.mjs';
+import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
 import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit, execLinesOf, paramReadings, assigningDefaults, spliceLines } from './script-candidates.mjs';
 
@@ -70,6 +70,8 @@ function taintClosure(base, cmds, extra = {}, isNew = () => false, active = fals
     } else if (active && cn === 'read') for (const a of c.argv.slice(1)) always(a);
     else if (active && (cn === 'mapfile' || cn === 'readarray')) { always('MAPFILE'); for (const a of c.argv.slice(1)) always(a); }
     else if (active && cn === 'printf') { const i = c.argv.indexOf('-v'); if (i > 0) always(c.argv[i + 1] ?? ''); }
+    // (#56, Codex recheck of d925d42: the names a builtin sets without being given them, and zsh binders whose operands are not read: every name they mention)
+    if (active) { for (const k of implicitBindsOf(c)) always(k); if (ZSH_NAME_BINDERS.has(cn) || (cn === 'print' && c.argv.some((a) => /^-[A-Za-z]*v/.test(a)))) for (const a of c.argv.slice(1)) for (const m of a.matchAll(/[A-Za-z_]\w*/g)) always(m[0]); }
   }
   sets.push(...Object.entries(extra));
   for (let grew = true; grew;) { grew = false; for (const [k, v] of sets) if (!set.has(k) && refs(v)) { set.add(k); grew = true; } }
@@ -987,6 +989,7 @@ function mayRebind(name, cmds, raw) {
   const re = (s) => new RegExp(s.replaceAll('NAME', name));
   // (a `${...}` that mentions the name and assigns -- `${N:=x}`, `${N::=x}`, `${(flags)N=x}`, `${N+=}`)
   if (re('\\$\\{[^}]*\\bNAME\\b[^}]*=|\\$\\{!?NAME\\[|\\bNAME\\[[^\\]]*\\]\\+?=|\\b(?:for|select|foreach)\\s+NAME\\b|\\(\\([^)]*\\bNAME\\b|\\{NAME\\}\\s*(?:[<>]|&>)|\\bNAME\\+=').test(raw)) return true; // (`${N:=x}`, `N[1]=`, a loop variable, arithmetic)
+  if (cmds.some((c) => implicitBindsOf(c).includes(name))) return true; // (`[[ x =~ y ]]` sets MATCH, `read` REPLY …: see implicitBindsOf)
   return !onlyNonBinders(cmds);
 }
 function modelZshSelfDirs(cmds, raw, ctx) {
@@ -1894,7 +1897,7 @@ function definedNames(text) {
 // Why: the names a binder command sets: those it is given (an option may carry its name, `printf -vF`, `wait -pF`), the ones it binds without being given them, and a nameref's target.
 // weird: a word that is not a plain name (`read "$1"`, `unset $n`): any name may be bound.
 function bindsOf(name, argv) {
-  const names = new Set(name === 'getopts' ? ['OPTARG', 'OPTIND'] : name === 'mapfile' || name === 'readarray' ? ['MAPFILE'] : name === 'read' || name === 'select' ? ['REPLY'] : []);
+  const names = new Set(implicitBindsOf({ argv: [name, ...argv.slice(1)] }));
   let weird = false;
   for (const a of argv.slice(1)) {
     const m = /^[A-Za-z_]\w*/.exec(a);
@@ -1937,6 +1940,9 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
     const name = baseOf(c.argv[0]);
     // Why: a function or alias the LINE defines may stand behind a name that looks harmless (`ls() { read F; }`), and a nameref (`declare -n r=F`) binds F through another name
     if (ctx.lineDefs?.has(name) || (['declare', 'typeset', 'local'].includes(name) && c.argv.slice(1).some((a) => /^[-+][A-Za-z]*n/.test(a)))) { out.all = true; continue; }
+    // (#56, Codex recheck of d925d42: zsh binders whose operands are not read may bind any name; `read` / `[[ =~ ]]` … set names they are not given)
+    if (ZSH_NAME_BINDERS.has(name) || (name === 'print' && c.argv.slice(1).some((a) => /^-[A-Za-z]*v/.test(a)))) { out.all = true; continue; }
+    for (const k of implicitBindsOf(c)) set(k, null, false);
     if (VAR_COMMANDS.has(name)) {
       const d = declAttrs(c.argv);
       for (const [k, v] of d.assigns) set(k, v, sure && !d.unknown && !d.transform && name !== 'local');
@@ -2356,9 +2362,11 @@ function evaluateBashForFilesFrame(command, opts) {
     // wrote the protected file when N held F / HOME. A binder whose name is only known at run time may set any name: every name is unknown from here on,
     // as after a sourced file that cannot be followed.
     const anyName = (LINE_BINDERS.has(cn) && (cn !== 'printf' || c.argv.some((a) => /^-[A-Za-z]*v/.test(a))) && bindsOf(cn, c.argv).weird)
-      || (['export', 'declare', 'typeset', 'local', 'readonly', 'unset', 'let'].includes(cn) && c.argv.slice(1).some((a) => /[$`]/.test(a.includes('=') ? a.slice(0, a.indexOf('=')) : a)));
+      || (['export', 'declare', 'typeset', 'local', 'readonly', 'unset', 'let'].includes(cn) && c.argv.slice(1).some((a) => /[$`]/.test(a.includes('=') ? a.slice(0, a.indexOf('=')) : a)))
+      || ZSH_NAME_BINDERS.has(cn) || (cn === 'print' && c.argv.some((a) => /^-[A-Za-z]*v/.test(a))); // (#56, Codex recheck of d925d42: zsh binders whose operands are not read)
     if (anyName) { ctx.unknownAll = true; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.unknownVars.add(k); ctx.srcChanged.add(k); } }
     if (LINE_BINDERS.has(cn) && (cn !== 'printf' || c.argv.some((a) => /^-v/.test(a)))) names.push(...bindsOf(cn, c.argv).names);
+    names.push(...implicitBindsOf(c)); // (`[[ x =~ y ]]` sets MATCH, a (#m) pattern flag too: see implicitBindsOf)
     if (['declare', 'typeset', 'local'].includes(cn) && c.argv.slice(1).some((a) => /^-[A-Za-z]*n/.test(a))) for (const a of c.argv.slice(1)) { const t = /^[A-Za-z_]\w*=([A-Za-z_]\w*)/.exec(a); if (t) { names.push(t[1]); ctx.declared?.unknown.add(t[1]); } }
     for (const k of names) { ctx.pickUnknown.add(k); if (Object.hasOwn(ctx.vars, k)) ctx.unknownVars.add(k); }
   };
