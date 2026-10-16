@@ -43,3 +43,4 @@ full record.
 - 2026-10-15 · #66 · fix: reviews skip main's merged-in code; agent log off PR branches · risk high · rounds 4 · arbiter 1 · awaiting-owner-merge
 - 2026-10-15 · #66 · fix: reviews skip main's merged-in code; agent log off PR branches · risk high · rounds 4 · arbiter 1 · merged
 - 2026-10-16 · #55 · feat(config): verify.stop_queue_wait_minutes — Stop-hook queue allowance from config · risk high · rounds 3 · arbiter 1 · awaiting-owner-merge
+- 2026-10-16 · #55 · feat(config): verify.stop_queue_wait_minutes — Stop-hook queue allowance from config · risk high · rounds 3 · arbiter 1 · merged
