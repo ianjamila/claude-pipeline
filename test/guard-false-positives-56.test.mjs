@@ -576,7 +576,19 @@ test('#56 replay of 96848c2: template text the shell never expands, and zsh flag
     "F=safe; cat <<EOF\n'${(P)N::=settings.json}'\nEOF\nprintf x > ~/.claude/$F", // (single quotes in an unquoted heredoc body are text: the expansion is real)
     "F=safe; cat <<EOF\nit's\nEOF\n: ${(P)N::=settings.json}; echo \"'\"; printf x > ~/.claude/$F", // (a quote in a body must not shift the scan of the lines after it)
     "for F in safe; do cat <<EOF\n'${(P)N::=settings.json}'\nEOF\nprintf x > ~/.claude/$F; done",
+    "F=safe; : $'\\'' ${(P)N::=settings.json} $'\\''; printf x > ~/.claude/$F", // ($'…' takes a backslash-escaped quote: a plain quote scanner would blank the expansion)
+    'F=safe; : ${(P)N}; printf x > ~/.claude/$F', // ((P) alone: N may hold `F[$(…)]` or an arithmetic subscript that assigns)
+    'F=safe; : ${(f)G:=x}${(f)F::=settings.json}; printf x > ~/.claude/$F',
   ]) assert.equal(files(cmd, D).decision, 'deny', cmd);
+  assert.equal(files('D=/tmp/x; echo ${(@u)FILES} > $D/b.txt', D).decision, 'allow'); // (flags that only shape the value, outside double quotes)
+  // a script the git guard opens has no line text: an unquoted heredoc in it counts as an indirect expansion
+  const SX = fakeFs(GIT_ROOT, { 'run.sh': "B=agent/x\ncat <<EOF\n'${(P)N::=main}'\nEOF\ngit push origin $B\n", 'ok.sh': "B=agent/x\ncat <<'EOF'\n${(e.x)}\nEOF\ngit push origin $B\n" }, DIRS);
+  assert.equal(git('bash run.sh', SX).decision, 'deny');
+  assert.equal(git('bash ok.sh', SX).decision, 'allow');
+  for (const body of ["'${(P)N::=main}'", '${(P)N::=main}']) assert.equal(git('bash r2.sh', fakeFs(GIT_ROOT, { 'r2.sh': `B=agent/x\ncat <<EOF\n${body}\nEOF\ngit push origin $B\n` }, DIRS)).decision, 'deny', body);
+  const FX = (body) => fakeFs(PROJ, { 'run.sh': `F=safe\ncat <<EOF\n${body}\nEOF\nprintf x > ~/.claude/$F\n` }, DIRS);
+  for (const body of ["'${(P)N::=settings.json}'", '${(P)N::=settings.json}']) assert.equal(files('bash run.sh', FX(body)).decision, 'deny', body);
+  assert.equal(files('bash run.sh', fakeFs(PROJ, { 'run.sh': "F=safe\ncat <<'EOF'\n${(e.x)}\nEOF\nprintf x > /tmp/$F\n" }, DIRS)).decision, 'allow');
   for (const cmd of [
     'B=agent/x; : ${(f)B::=main}; git push origin $B',
     "B=agent/x; cat <<EOF\n${(P)N::=main}\nEOF\ngit push origin $B",

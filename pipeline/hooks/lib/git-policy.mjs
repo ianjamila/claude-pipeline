@@ -1530,7 +1530,7 @@ const STATE_GIT = new Set(['checkout', 'switch', 'branch', 'rebase', 'symbolic-r
 
 // Collects every assignment on the line BEFORE any command is judged. A name assigned more than once, or assigned
 // where it may not run (after && / ||, in a pipeline, a subshell, an if / loop / case), is unsure for the whole line.
-function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0) {
+function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0, text = null) {
   const counts = new Map();
   const implicit = new Set();
   const bump = (k, n) => { if (level === 0 && ctx.pins?.has(k)) return; counts.set(k, (counts.get(k) ?? (k in ctx.vars || ctx.unsureVars.has(k) ? 1 : 0)) + n); };
@@ -1572,12 +1572,13 @@ function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0) {
   // NAME is only known at run time (export / declare / local / typeset / readonly, read, mapfile, getopts, unset, let, select, printf -v) may set
   // any variable: every name the line assigns or reads is unknown from here on.
   // (#56, Codex review of 8b86e2b: zsh `${(P)N::=main}` assigns the variable N names, a bash `${!N…}` reads or sets through it: the same, on main too)
-  if (cmds.some(bindsRunTimeName) || cmds.some((c) => indirectExpansion(c, cmds)) || (cmds.heredocSpans ?? []).some?.((s) => !s[2]) && (!ctx.fullText || INDIRECT_EXPANSION.test(String(ctx.fullText)))) for (const k of [...Object.keys(ctx.vars), ...namesReadOn(cmds)]) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
+  if (cmds.some(bindsRunTimeName) || cmds.some((c) => indirectExpansion(c, cmds)) || (cmds.heredocSpans ?? []).some?.((s) => !s[2]) && (typeof text !== "string" || indirectExpansionOnLine(text, cmds))) for (const k of [...Object.keys(ctx.vars), ...namesReadOn(cmds)]) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
 }
 // A zsh parameter expansion with flags (`${(P)N::=x}` assigns the variable N names) or a bash indirect one (`${!N}`), anywhere in a command's words.
 // (#56 replay of 96848c2: judged on the command's own text, single-quoted parts blanked — a `node -e '…${(x)}…'` program is no expansion; its words, quotes
 // removed, when the text is not there or the line has an unquoted heredoc, whose body expands and is not in the command's text: then the line's whole
-// text is looked at, fail closed; inside a script the guard opens there is no line text: an unquoted heredoc there counts as one)
+// text being judged is looked at (the line, or the script the guard opened: not ctx.fullText, which is the outer line — `bash run.sh` hid a body in
+// run.sh), unquoted bodies as written; security review of 5188c68)
 const indirectExpansion = (c, cmds) => (typeof c.raw === 'string' && c.raw && !(cmds?.heredocSpans ?? []).some?.((s) => !s[2]) ? indirectExpansionOnLine(c.raw, null) : argvIndirect(c));
 const argvIndirect = (c) => [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')].some((w) => INDIRECT_EXPANSION.test(String(w)));
 // A command that binds a variable whose name is only known at run time (see collectAssignments).
@@ -1932,7 +1933,7 @@ function evalString(str, startDir, ctx, level) {
   // A variable whose value is not certain (see collectAssignments) denies the line when it reaches git / gh, a command
   // that runs code, cd / pushd / popd or a command name: the checks below read the expanded text.
   const saved = level === 0 && !ctx.pins ? lineState(ctx) : null; // (the state before this line's assignments: each reading starts from it)
-  collectAssignments(cmds, ctx, !definesFunction(str, cmds), level);
+  collectAssignments(cmds, ctx, !definesFunction(str, cmds), level, str);
   if (ctx.unsureVars.size || ctx.tainted.size) {
     const unsure = unsureVarReachingCommand(cmds, ctx);
     if (unsure !== null) {
