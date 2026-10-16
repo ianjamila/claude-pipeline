@@ -6,7 +6,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import { toPosix } from './paths.mjs';
+import { canonicalPath, toPosix } from './paths.mjs';
+
+// Kept exported from here: callers have imported it from the installer.
+export { canonicalPath };
 
 export const SKILLS = ['ship', 'verify', 'pipeline-setup'];
 export const AGENTS = ['implementer', 'verifier', 'judge', 'arbiter'];
@@ -298,20 +301,6 @@ export function installableSourcePaths(headPaths) {
 // blob. `hashes` is the blob id git computes for each path in the working tree (filters applied), in the same order.
 export function pathsDifferingFromHead(paths, headBlobs, hashes) {
   return paths.filter((p, i) => headBlobs.get(p) !== hashes[i]);
-}
-
-// The real location of `p`: symlinks resolved on the deepest ancestor that exists, the not-yet-created rest appended.
-// A claude-home reached through an alias (a symlinked ~/.claude, a second mount point) must name the same lock.
-export function canonicalPath(p) {
-  let cur = path.resolve(p);
-  const rest = [];
-  for (;;) {
-    try { return path.join(fs.realpathSync.native(cur), ...rest); } catch { /* not there yet: try the parent */ }
-    const parent = path.dirname(cur);
-    if (parent === cur) return path.resolve(p);
-    rest.unshift(path.basename(cur));
-    cur = parent;
-  }
 }
 
 // Where the write lock for `home` lives: inside the destination itself, so it is scoped to that home and never to

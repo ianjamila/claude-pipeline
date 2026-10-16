@@ -506,7 +506,7 @@ run lock all come from the main worktree. A worktree is removed only when its ne
 nothing uses it (lock, process, a recent Claude transcript whose session worked there — its `cwd` inside the worktree or
 a tool call naming the path; a tool result or prose that merely prints it does not count — memory note, recently changed
 file); removal goes through a quarantine move and a final re-inspection, and the `archive` files wait 30 days in the
-holding folder. The process check reads `/proc` on Linux and runs one `lsof` on macOS (fail-closed: a missing or failing `lsof`, or
+holding folder (archiving takes a lock on that folder, so two clones of one repo cannot overwrite each other's files or manifest; a lock not obtained within 30 s keeps the worktree). The process check reads `/proc` on Linux and runs one `lsof` on macOS (fail-closed: a missing or failing `lsof`, or
 one that cannot show our own process's cwd — the positive control — keeps every candidate); on Windows every candidate
 is kept ("cannot check running processes on this platform") and prune never removes anything there — `mode: on` is
 report-only in effect. A `pipeline-keep:` lock older than 7 days is reported as `stale keep (<N>d: <reason>) — still needed?` (its own
