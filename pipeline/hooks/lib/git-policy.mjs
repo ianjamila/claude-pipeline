@@ -1997,6 +1997,8 @@ const SPECIAL_NAMES = /^(?:PATH|IFS|HOME|CDPATH|ENV|BASH_ENV|ZDOTDIR|PWD|OLDPWD|
 // #81: the scan in onceAssignedNames counts a bare mention of a name as a possible assignment. These three tell a mention that is provably not one.
 // awk's `-v NAME=value`: the mention follows `-v ` and the same command segment (up to a ; & | or newline) holds the word awk, so NAME= is awk's.
 // Anything else keeps being counted (`sort -v f=1`, `awk … && f=x`, `f=x` after the awk command all stay).
+// (The `-v` and awk-word tests are defence in depth: another layer already holds a real `-v NAME=` binder, `declare -v f=x` is a binder site the parser sees
+// (sites.length !== 1), and every other `-v NAME=` is an argument word. They keep the skip to the one command whose `-v` is known to be awk's.)
 function isAwkVar(text, i) {
   if (!/(?:^|\s)-v\s+$/.test(text.slice(Math.max(0, i - 40), i))) return false;
   const before = text.slice(0, i);
@@ -2018,6 +2020,8 @@ function enclosingArith(text, i) {
   }
   return null;
 }
+// (The body and enclosure tests are defence in depth: ARITH_ASSIGN_AFTER and the test for `++` / `--` before the name catch every assignment form, and a binder
+// that takes the name as a word (`read n`) is a site the parser sees. They keep the skip to text that really is arithmetic.)
 function isArithRead(text, i, len) {
   const body = enclosingArith(text, i);
   if (body === null) return false;
@@ -2033,6 +2037,7 @@ function isLoopListWord(text, i, k, site) {
   if (!head) return false;
   const start = head.index + head[0].length - head[1].length;
   if (i < start || i >= start + head[1].length) return false;
+  // (defence in depth: quoted text is blanked by withoutLiteralText, and every `for NAME` in the text counts as an assignment, so a second header makes the count 2)
   const words = head[1].trim().split(/\s+/);
   const mine = site.argv.slice(3);
   return words.length === mine.length && words.every((w, x) => w === mine[x]);

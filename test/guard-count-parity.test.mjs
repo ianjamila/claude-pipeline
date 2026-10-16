@@ -84,6 +84,9 @@ test('#81: awk -v does not hide a shell assignment of the same name elsewhere on
     "true && f=ok.sh; awk -v g=1 '{print}' x.txt | f=run.sh; bash $f",
     "true && f=ok.sh; awk -v f=1 '{print}' x.txt; read f; bash $f",
     "true && f=1; awk \"$((f=7))\" x.txt; bash s$f.sh", // (awk's text holds a real arithmetic assignment, no -v)
+    "true && f=1; awk \"$((1,f=7))\" x.txt; bash s$f.sh",
+    "true && f=1; awk \"$((0?1:f=7))\" x.txt; bash s$f.sh",
+    "true && f=1; awk \"$((f+=6))\" x.txt; bash s$f.sh",
     "true && f=ok.sh; awk '{print}' x.txt; command declare -v f=run.sh; bash $f", // (-v after another command, awk earlier on the line)
     'true && f=ok.sh; command declare -v f=run.sh; bash $f',
     "true && f=ok.sh; sort -v f=1 x.txt; f=run.sh; bash $f", // (not awk)
@@ -153,6 +156,8 @@ test('#81: an arithmetic assignment changes the name: every form stays refused',
     'true && n=1; : "$n,$((n+=6))"; bash s$n.sh',
     'for n in 1; do : $((n=7)); bash s$n.sh; done',
     'true && n=1; : $((n[0]=7)); bash s$n.sh', // (an array element)
+    'true && n=1; : $((n[0]++)); bash s$n.sh',
+    'true && n=1; : $((n[0]+=6)); bash s$n.sh',
     'true && n=1; : $((n && n=7)); bash s$n.sh',
     'true && n=1; : $((n &&= 7)); bash s$n.sh',
     'true && n=8; : $((n-- - 1)); bash s$n.sh',
