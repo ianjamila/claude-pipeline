@@ -19,7 +19,7 @@ import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
-import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, indirectExpansionOnLine } from './shell-parse.mjs';
+import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit, execLinesOf, paramReadings, assigningDefaults, spliceLines } from './script-candidates.mjs';
 
@@ -1181,48 +1181,6 @@ function destsOf(argv, name) {
   return written;
 }
 
-// Why (#76 / #81 t7): the parser reads `$((n=7))` as a plain assignment (so the guard judged n as 7) but not `$((n+=6))`, `$(( n = 7 ))`, `((n++))` or `let n+=6`, and a name
-// changed there was judged by the value before (`true && n=1; : $((n+=6)); bash s$n.sh` ran s7.sh while the guard read s1.sh). The names an arithmetic body assigns (`=`, `op=`, `++`, `--`,
-// before or after the name, with blanks) are listed here, and so is every name read with a subscript (`n[0]=…`; a long subscript is not told from a read); collectVars then marks each one only known at run time. `dynamic`: a `$name` or `${name}` is assigned
-// (`$(( $n = 1 ))` assigns the variable n holds): any name may have changed. The text is scanned as written (quotes are not told apart): a name listed for text that is only quoted is a stricter reading, never a looser one.
-const ARITH_OP = String.raw`(?:\*\*|<<|>>|&&|\|\||\^\^|[-+*/%&|^])?`;
-const ARITH_ASSIGNED = new RegExp(String.raw`(?<![\w$.])([A-Za-z_]\w*)\s*(?:\[[^\]]{0,64}\]\s*)?${ARITH_OP}=(?!=)|(?<![\w$.])([A-Za-z_]\w*)\s*(?:\[[^\]]{0,64}\]\s*)?(?:\+\+|--)|(?:\+\+|--)\s*([A-Za-z_]\w*)|(?<![\w$.])([A-Za-z_]\w*)\s*\[`, 'g');
-const ARITH_ASSIGNED_DYN = new RegExp(String.raw`\$(?:\{[^}]{0,64}\}|\w+)\s*(?:\[[^\]]{0,64}\]\s*)?(?:${ARITH_OP}=(?!=)|\+\+|--)|(?:\+\+|--)\s*\$|\$\w+\s*\[`);
-function arithBodies(raw) {
-  const s = String(raw);
-  // $(( … )), (( … )) and $[ … ] in ONE pass (a scan per opener is quadratic on 150,000 of them): the text inside any of them, an unmatched opener taking the rest of the text
-  const out = [];
-  const stack = [];
-  let buf = '';
-  for (let i = 0; i < s.length; i++) {
-    const ch = s[i];
-    if (s.startsWith('((', i)) { stack.push({ close: ')', need: 2, depth: 0 }); i += 1; continue; } // (also the `((` of `$((`)
-    if (s.startsWith('$[', i)) { stack.push({ close: ']', need: 1, depth: 0 }); i += 1; continue; }
-    if (!stack.length) continue;
-    const top = stack[stack.length - 1];
-    if (ch === '(' || ch === '[') top.depth++;
-    else if (ch === ')' || ch === ']') {
-      if (top.depth > 0) top.depth--;
-      else if (ch === top.close && --top.need === 0) { stack.pop(); out.push(buf); buf = ''; continue; }
-    }
-    buf += ch;
-  }
-  if (buf) out.push(buf);
-  // `let a=1 "b+=2"`: the rest of the command segment
-  for (const m of s.matchAll(/(?<![\w.$/-])let\s+([^;&|\n]*)/g)) out.push(m[1]);
-  return out;
-}
-function arithAssignedNames(raw) {
-  const names = new Set();
-  let dynamic = false;
-  if (!/\(\(|\$\[|(?<![\w.$/-])let\s/.test(String(raw))) return { names, dynamic };
-  for (const body of arithBodies(raw)) {
-    for (const m of body.matchAll(ARITH_ASSIGNED)) names.add(m[1] ?? m[2] ?? m[3] ?? m[4]);
-    if (ARITH_ASSIGNED_DYN.test(body)) dynamic = true;
-  }
-  return { names, dynamic };
-}
-
 // $NAME values assigned on the line: `D=x cmd`, a bare `D=x`, `export D=x`, `declare -x D=x`.
 // Also fills ctx.keptVars: the same values with every backslash kept as a file name character (toPosix reads it as a
 // separator), for the off-Windows reading of a script name (`D='x\a'; bash "$D.sh"` runs x\a.sh).
@@ -1264,7 +1222,7 @@ function collectVars(cmds, ctx) {
     for (const [k, v] of Object.entries(c.env ?? {})) set(k, v);
     // (`set -- ev.sh`: the positional parameters, so `bash $1` is that file)
     if (baseOf(c.argv[0] ?? '') === 'set' && !c.argv.some((a) => /^[-+][A-Za-z]*A/.test(a))) { const w = setPositionals(c.argv); if (w) for (let i = 1; i <= 9; i++) set(String(i), i <= w.length ? w[i - 1] : ''); }
-    if (['export', 'declare', 'typeset', 'local', 'readonly'].includes(baseOf(c.argv[0] ?? ''))) {
+    if (['export', 'declare', 'typeset', 'local', 'readonly', 'integer', 'float'].includes(baseOf(c.argv[0] ?? ''))) {
       const d = declAttrs(c.argv);
       for (const k of d.bare) {
         if (d.transform) { attrs.set(k, d.transform); if (Object.hasOwn(vars, k)) { vars[k] = applyTransform(vars[k], d.transform); kept[k] = applyTransform(kept[k], d.transform); } }
@@ -1282,8 +1240,9 @@ function collectVars(cmds, ctx) {
   // and so is every name built from it (`F=$B:r; … $F`), to a fixed point.
   for (const k of ctx.zshModified ?? []) if (given.has(k) || Object.hasOwn(ctx.inheritedVars ?? {}, k)) unknown.add(k);
   if (aPins === null) for (const [k, r] of raws) if (r.size > 1) unknown.add(k);
-  // Why (#76 / #81 t7): a name an arithmetic assigns holds a value the text does not give (see arithAssignedNames); `dynamic`: any name the line or an outer line gave
-  for (const k of ctx.arith?.names ?? []) if (given.has(k) || Object.hasOwn(ctx.inheritedVars ?? {}, k)) unknown.add(k);
+  // Why (#76 / #81 t7 and the security follow-up): a name an arithmetic assigns (or appends to) holds a value the text does not give (see arithAssignedNames), whether or not the line gave it one
+  // before (`(( n += 7 )); bash s$n.sh`); `dynamic`: any name the line or an outer line gave (and any other, see ctx.unknownAll below)
+  for (const k of ctx.arith?.names ?? []) unknown.add(k);
   if (ctx.arith?.dynamic) for (const k of [...given.keys(), ...Object.keys(ctx.inheritedVars ?? {})]) unknown.add(k);
   for (let changed = true; changed;) {
     changed = false;
@@ -2326,13 +2285,13 @@ function evaluateBashForFilesFrame(command, opts) {
   modelZshSelfDirs(cmds, raw, ctx);
   ctx.inheritedVars = opts._vars ?? {}; // (#74: collectVars also marks a name the line only reads with a zsh modifier, when an outer line gave it its value)
   ctx.zshModified = zshModifiedNames(cmds.flatMap((c) => [...(c.argv ?? []), ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')])); // (the names this line reads as `$N:r` / `$N[1]`)
-  ctx.arith = arithAssignedNames(raw);
+  ctx.arith = arithAssignedNames(raw, cmds);
   ctx.vars = collectVars(cmds, ctx);
   if (opts._vars) { ctx.vars = { ...opts._vars, ...ctx.vars }; ctx.keptVars = { ...(opts._keptVars ?? {}), ...ctx.keptVars }; } // variables the line set before the shell that runs this file started
   for (const k of opts._unknownW ?? []) ctx.unknownVars.add(k);
   ctx.pickUnknown = new Set(opts._unknown ?? []); // (a name the line gave a run-time value: only a script it picks is refused; the writer rule is for the names above)
   ctx.srcTouched = new Set(); // names a sourced file set on this line (a later plain assignment of one is the value again)
-  ctx.unknownAll = opts._unknownAll === true;
+  ctx.unknownAll = opts._unknownAll === true || ctx.arith.dynamic; // (an arithmetic that assigns through a name may set any name, also one the line never gave)
   ctx.srcChanged = new Set(opts._srcChanged ?? []); // names an unfollowable sourced file may have changed (a write target that uses one is refused)
   // a name held in a variable (N=PIPELINE_ADMIN; env $N=1 claude)
   if (Object.keys(ctx.vars).length && setsAdmin(substVars(flat, ctx.vars, ctx.budget), ctx.platform)) return deny('the command sets PIPELINE_ADMIN through a variable; only the owner may set it, when launching Claude Code');

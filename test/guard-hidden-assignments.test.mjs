@@ -183,8 +183,10 @@ test('a name with the integer or float attribute holds the value of an arithmeti
   ]);
   for (const c of [
     'declare -i m; m=2+5; n=2; bash s$n.sh', // (another name)
-    'integer m; m=2+5; n=2; bash s$n.sh',
   ]) allow(c);
+  // (the git guard refuses every zsh binder of names it does not read: `integer m` binds any name for it, as before)
+  const r = both('integer m; m=2+5; n=2; bash s$n.sh', SPEC);
+  assert.equal(r.files.decision, 'allow', r.files.reason);
 });
 
 test('an unquoted heredoc or here-string expands $(( )) in the current shell: its body is scanned like command text', () => {

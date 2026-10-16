@@ -1579,6 +1579,104 @@ const LONG_NAME_RE = /[^\s,)^|~#*?[\]<>'"`$;&(){}]+/y;
 const NO_STARTUP = new Set(['fish', 'csh', 'tcsh']);
 const VAR_DECLS = new Set(['export', 'declare', 'typeset', 'local', 'readonly']);
 
+// Why (#76 / #81 t7, and the security follow-up on the parser differential): the parser reads `$((n=7))` as a plain assignment (so the guard judged n as 7) but not `$((n+=6))`, `$(( n = 7 ))`,
+// `((n++))` or `let n+=6`, and a name changed there was judged by the value before (`true && n=1; : $((n+=6)); bash s$n.sh` ran s7.sh while the guard read s1.sh). The names an
+// arithmetic body assigns (`=`, `op=`, `++`, `--`, before or after the name, with blanks) are listed here, and so is every name read with a subscript (`n[0]=…`; a long subscript is
+// not told from a read). Bodies are not only `$(( ))`, `(( ))`, `$[ ]` and `let`: bash and zsh also evaluate as arithmetic
+//   - the operands of `-eq -ne -lt -le -gt -ge` in `[[ ]]` (`[[ n=7 -eq 7 ]]`; `[ ]` and `test` do not), only the two words around the operator, so `[[ $# -gt 0 && $1 = -v ]]` is no assignment;
+//   - an array subscript, in `${a[n=7]}`, `a[n=7]=x`, `${#a[n=7]}`, `declare a[n=7]=x` and zsh's bare `$x[n=7]` (any `[` right after a name character or `}`; a glob class `f[ab]` has no assignment in it);
+//   - a substring offset and length, `${x:n=3:1}`, `${a[@]:n=1}` (not `${x:-…}`, `${x:=…}`, `${x:+…}`, `${x:?…}`).
+// Not arithmetic but the same hidden change: `n+=7` appends (the parser keeps only the new text, and `export n+=7` / `declare n+=7` it does not read at all), so a name that is appended to is
+// listed too. A name an arithmetic assigns is ONLY known at run time, whether or not the line gave it a value (`(( n += 7 )); bash s$n.sh` with no `n=` before): callers mark every one.
+// `dynamic`: a `$name` or `${name}` is assigned (`$(( $n = 1 ))` assigns the variable n holds): any name may have changed.
+// The text is scanned as written (quotes are not told apart), so a name listed for text that is only quoted is a stricter reading, never a looser one. Only the body of a heredoc whose
+// delimiter is QUOTED is blanked: it is data (nothing in it expands), and a script that shows `$((n=7))` there assigns nothing. An UNQUOTED body (and a here-string) expands in the
+// current shell, so it is scanned like command text. (cmds: what simpleCommands gave for this text; without it, or when a body cannot be placed, nothing is blanked.)
+const ARITH_OP = String.raw`(?:\*\*|<<|>>|&&|\|\||\^\^|[-+*/%&|^])?`;
+const ARITH_ASSIGNED = new RegExp(String.raw`(?<![\w$.])([A-Za-z_]\w*)\s*(?:\[[^\]]{0,64}\]\s*)?${ARITH_OP}=(?!=)|(?<![\w$.])([A-Za-z_]\w*)\s*(?:\[[^\]]{0,64}\]\s*)?(?:\+\+|--)|(?:\+\+|--)\s*([A-Za-z_]\w*)|(?<![\w$.])([A-Za-z_]\w*)\s*\[`, 'g');
+const ARITH_ASSIGNED_DYN = new RegExp(String.raw`\$(?:\{[^}]{0,64}\}|\w+)\s*(?:\[[^\]]{0,64}\]\s*)?(?:${ARITH_OP}=(?!=)|\+\+|--)|(?:\+\+|--)\s*\$|\$\w+\s*\[`);
+const ARITH_COMPARE = new Set(['-eq', '-ne', '-lt', '-le', '-gt', '-ge']);
+const ARITH_APPENDED = /(?<![\w$.\/-])([A-Za-z_]\w*)\+=/g;
+const ARITH_WORD = /(?:"[^"]*"|'[^']*'|\\.|[^\s"'\\])+/g;
+function arithBodies(s) {
+  // $(( … )), (( … )) and $[ … ] in ONE pass (a scan per opener is quadratic on 150,000 of them): the text inside any of them, an unmatched opener taking the rest of the text
+  const out = [];
+  const stack = [];
+  let buf = '';
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (s.startsWith('((', i)) { stack.push({ close: ')', need: 2, depth: 0 }); i += 1; continue; } // (also the `((` of `$((`)
+    if (s.startsWith('$[', i)) { stack.push({ close: ']', need: 1, depth: 0 }); i += 1; continue; }
+    if (!stack.length) continue;
+    const top = stack[stack.length - 1];
+    if (ch === '(' || ch === '[') top.depth++;
+    else if (ch === ')' || ch === ']') {
+      if (top.depth > 0) top.depth--;
+      else if (ch === top.close && --top.need === 0) { stack.pop(); out.push(buf); buf = ''; continue; }
+    }
+    buf += ch;
+  }
+  if (buf) out.push(buf);
+  // `let a=1 "b+=2"`: the rest of the command segment
+  for (const m of s.matchAll(/(?<![\w.$/-])let\s+([^;&|\n]*)/g)) out.push(m[1]);
+  // `[[ a -eq b ]]`: the words next to a numeric comparison. One pass over the text: an open `[[` takes words up to the next `]]` (a second `[[` inside it changes nothing)
+  let open = false;
+  let prev = null;
+  let cmp = false;
+  for (const m of s.matchAll(ARITH_WORD)) {
+    const w = m[0];
+    if (!open) { if (w === '[[') { open = true; prev = null; cmp = false; } continue; }
+    if (w.startsWith(']]')) { open = false; continue; }
+    if (cmp && prev !== null) out.push(w);
+    if (ARITH_COMPARE.has(w) && prev !== null) { out.push(prev); cmp = true; } else cmp = false;
+    prev = w;
+  }
+  // a subscript: `[` right after a name character or `}` (`${a[…]}`, `a[…]=x`, `$x[…]`), to its closing `]` (nested ones counted; at most 200 characters)
+  for (let i = s.indexOf('['); i >= 0; i = s.indexOf('[', i + 1)) {
+    if (i === 0 || !/[\w}]/.test(s[i - 1])) continue;
+    let depth = 0;
+    let j = i + 1;
+    for (; j < s.length && j < i + 200; j++) {
+      if (s[j] === '[') depth++;
+      else if (s[j] === ']') { if (depth === 0) break; depth--; }
+    }
+    out.push(s.slice(i + 1, j));
+  }
+  // a substring: `${x:off:len}`, `${a[@]:off}`, `${x: off : len}` (the `:-` `:=` `:+` `:?` operators are no offset)
+  for (const m of s.matchAll(/\$\{[A-Za-z_]\w*(?:\[[^\]\n]{0,64}\])?:(?![-=+?])([^}\n]{0,200})\}/g)) out.push(m[1]);
+  return out;
+}
+const quotedBodiesBlank = (s, cmds) => {
+  if (!/<</.test(s)) return s;
+  const spans = cmds?.heredocSpans;
+  if (!Array.isArray(spans)) return s;
+  let t = s;
+  for (const [a, b, quoted] of spans) {
+    if (!(a >= 0 && a <= b && b <= t.length)) return s;
+    if (quoted) t = t.slice(0, a) + t.slice(a, b).replace(/[^\n]/g, ' ') + t.slice(b);
+  }
+  return t;
+};
+const ARITH_CACHE = new WeakMap();
+export function arithAssignedNames(raw, cmds = null) {
+  const text = String(raw);
+  const hit = cmds ? ARITH_CACHE.get(cmds) : null;
+  if (hit && hit.text === text) return hit.res;
+  const names = new Set();
+  let dynamic = false;
+  if (/\(\(|\$\[|\[|\+=|\$\{\w+:|(?<![\w.$/-])let\s/.test(text)) {
+    const s = quotedBodiesBlank(text, cmds);
+    for (const body of arithBodies(s)) {
+      for (const m of body.matchAll(ARITH_ASSIGNED)) names.add(m[1] ?? m[2] ?? m[3] ?? m[4]);
+      if (ARITH_ASSIGNED_DYN.test(body)) dynamic = true;
+    }
+    for (const m of s.matchAll(ARITH_APPENDED)) names.add(m[1]);
+  }
+  const res = { names, dynamic };
+  if (cmds) ARITH_CACHE.set(cmds, { text, res });
+  return res;
+}
+
 // Why: `declare` / `typeset` / `local` attributes change the value a name holds: -l / -u lower / upper case it, zsh -L / -R / -Z pad or cut it to a width, -i
 // evaluates it as arithmetic, -n makes it a reference. `transform`: 'lower' | 'upper' (applied to an assigned value); `unknown`: a value that cannot be
 // worked out from the text. `bare`: names declared without a value (the attribute then applies to every later assignment, and to the current value).
@@ -1587,15 +1685,19 @@ export function declAttrs(argv) {
   let lower = false;
   let upper = false;
   let ended = false;
+  // (zsh `integer n` is `typeset -i n`, `float n` is `typeset -E n`: an assignment is then arithmetic)
+  if (/(?:^|\/)(?:integer|float)$/.test(argv[0] ?? '')) out.unknown = true;
   for (const a of argv.slice(1)) {
     if (!ended && a === '--') { ended = true; continue; }
     if (!ended && /^[-+][A-Za-z0-9]+$/.test(a)) {
-      if (a[0] === '-') for (const ch of a.slice(1)) { if (ch === 'l') lower = true; else if (ch === 'u') upper = true; else if ('LRZin'.includes(ch)) out.unknown = true; }
+      if (a[0] === '-') for (const ch of a.slice(1)) { if (ch === 'l') lower = true; else if (ch === 'u') upper = true; else if ('LRZinEF'.includes(ch)) out.unknown = true; }
       continue;
     }
     ended = true; // (options stop at the first name: `declare D=x -u` makes -u a bad name, D keeps its case)
     const m = /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/.exec(a);
-    if (m) out.assigns.push([m[1], m[2]]);
+    // (`declare n+=7` / `export n+=7` append to what n holds: its value is not the text)
+    const ap = /^([A-Za-z_][A-Za-z0-9_]*)\+=/.exec(a);
+    if (ap) { out.bare.push(ap[1]); out.unknown = true; } else if (m) out.assigns.push([m[1], m[2]]);
     else if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(a)) out.bare.push(a);
   }
   if (lower && upper) out.unknown = true;

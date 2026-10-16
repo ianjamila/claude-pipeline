@@ -15,7 +15,7 @@
 import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine } from './shell-parse.mjs';
+import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
 export { withoutLiteralText, INDIRECT_EXPANSION };
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
@@ -1764,11 +1764,16 @@ function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0, text = 
   for (const k of zshModifiedNames(cmds.flatMap((c) => [...c.argv, ...Object.values(c.env), ...(c.redirects ?? []).map((r) => r.target ?? '')]))) if (counts.has(k) || k in ctx.vars) { bump(k, 2); (ctx.zshNames ??= new Set()).add(k); }
   if (implicit.size) { const reads = namesReadOn(cmds); for (const k of implicit) if (counts.has(k) || k in ctx.vars || (reads.has(k) && !SHELL_SET_NAMES.includes(k))) bump(k, 2); }
   for (const [k, n] of counts) if (n > 1) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
+  // Why (#81 security follow-up, on main too): the parser reads `$((n=7))` as an assignment but not `$(( n = 7 ))`, `((n++))`, `while ((n++ < 7))`, `$[n=7]`, a `[[ x -eq n=7 ]]` operand, a subscript
+  // (`${a[n=7]}`, `a[n=7]=x`) or a substring offset (`${x:n=3:1}`), and not an append (`n+=7`, `export n+=7`): `n=2; [[ n=7 -eq 7 ]]; bash s$n.sh` ran s7.sh while the guard read s2.sh. A name
+  // such text assigns is unsure, whether or not the line gave it a value (see arithAssignedNames); one that assigns through a name (`(( $m = 7 ))`) may set any name, as an indirect expansion does.
+  const ar = typeof text === 'string' ? arithAssignedNames(text, cmds) : null;
+  if (ar) for (const k of ar.names) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
   // Why (#56, a live bypass on main): `F=ok.sh; export $N=run.sh; bash $F` ran run.sh when N held F, while the guard judged ok.sh. A binder whose
   // NAME is only known at run time (export / declare / local / typeset / readonly, read, mapfile, getopts, unset, let, select, printf -v) may set
   // any variable: every name the line assigns or reads is unknown from here on.
   // (#56, Codex review of 8b86e2b: zsh `${(P)N::=main}` assigns the variable N names, a bash `${!N…}` reads or sets through it: the same, on main too)
-  if (cmds.some(bindsRunTimeName) || cmds.some((c) => indirectExpansion(c, cmds)) || (cmds.heredocSpans ?? []).some?.((s) => !s[2]) && (typeof text !== "string" || indirectExpansionOnLine(text, cmds))) for (const k of [...Object.keys(ctx.vars), ...namesReadOn(cmds)]) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
+  if (ar?.dynamic || cmds.some(bindsRunTimeName) || cmds.some((c) => indirectExpansion(c, cmds)) || (cmds.heredocSpans ?? []).some?.((s) => !s[2]) && (typeof text !== "string" || indirectExpansionOnLine(text, cmds))) for (const k of [...Object.keys(ctx.vars), ...namesReadOn(cmds)]) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
 }
 const zshModifiedReason = (n) => `$${n} is followed by \`:\` and a letter or by \`[\` (\`$${n}:r\`, \`$${n}[1,6]\`): zsh reads that as a modifier or a subscript and applies it to the value, so the word it makes is only known at run time. Write the word out, or brace the name (\`\${${n}}:r\`) when the text after it is meant literally.`;
 // A zsh parameter expansion with flags (`${(P)N::=x}` assigns the variable N names) or a bash indirect one (`${!N}`), anywhere in a command's words.
@@ -2074,6 +2079,8 @@ function onceAssignedNames(cmds, ctx, str) {
       if (c.argv.slice(1).some((w) => DYNAMIC.test(w))) return [];
     }
   }
+  const ar = arithAssignedNames(str, cmds); // (an arithmetic can assign a name the text scan below does not show: a double-quoted `"${a[n=7]}"` is blanked there)
+  if (ar.dynamic) return [];
   const spans = /<</.test(str) ? cmds.heredocSpans : [];
   if (!Array.isArray(spans)) return [];
   const blank = withoutHeredocBodies(str, cmds);
@@ -2087,7 +2094,7 @@ function onceAssignedNames(cmds, ctx, str) {
   const out = [];
   const modified = zshModifiedNames(cmds.flatMap((c) => [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')])); // (#74: `$k:r` / `$k[1]` is not the value a reading gives k)
   for (const k of ctx.unsureVars) {
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k) || SPECIAL_NAMES.test(k) || modified.has(k)) continue;
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k) || SPECIAL_NAMES.test(k) || modified.has(k) || ar.names.has(k)) continue;
     const sites = [];
     for (const [i, c] of cmds.entries()) {
       const nm = c.argv.length ? baseName(c.argv[0]) : '';
