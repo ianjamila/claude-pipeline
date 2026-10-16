@@ -3,13 +3,14 @@
 // quarantine-move removal itself, the only code that removes a worktree.
 import { createHash } from 'node:crypto';
 import {
-  copyFileSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, unlinkSync, writeFileSync,
+  constants as fsConstants, copyFileSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { GitError, git } from '../git.mjs';
 import { listWorktrees } from '../local-branches.mjs';
-import { isInside, samePath } from '../paths.mjs';
+import { LockTimeoutError, withLock } from '../locks.mjs';
+import { canonicalPath, isInside, samePath } from '../paths.mjs';
 import { entriesFor, processesInside, recentFiles, walkTree } from './inspect.mjs';
 import { classifyEntries } from './rules.mjs';
 
@@ -22,15 +23,37 @@ export function holdingRoot(repoSlug, env = process.env) {
   return path.join(base, safeName(repoSlug));
 }
 
-// rename, or copy + unlink when the holding folder is on another device.
-function moveFile(from, to) {
+// Move `from` to `to` and NEVER replace an existing `to` (rename would, silently): hard link + unlink, or an exclusive copy
+// + unlink across devices. Filesystems without hard links get an existence check + rename (safe under the holding lock).
+// -> false when `to` already exists (nothing moved); the caller picks another name.
+const NO_LINK_CODES = new Set(['EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS']);
+function moveFileExclusive(from, to) {
   try {
-    renameSync(from, to);
+    linkSync(from, to);
   } catch (err) {
-    if (err?.code !== 'EXDEV') throw err;
-    copyFileSync(from, to);
-    unlinkSync(from);
+    if (err?.code === 'EEXIST') return false;
+    if (err?.code === 'EXDEV') {
+      try {
+        copyFileSync(from, to, fsConstants.COPYFILE_EXCL);
+      } catch (copyErr) {
+        if (copyErr?.code === 'EEXIST') return false;
+        throw copyErr;
+      }
+    } else if (NO_LINK_CODES.has(err?.code)) {
+      try {
+        lstatSync(to);
+        return false;
+      } catch (statErr) {
+        if (statErr?.code !== 'ENOENT') throw statErr;
+      }
+      renameSync(from, to);
+      return true;
+    } else {
+      throw err;
+    }
   }
+  unlinkSync(from);
+  return true;
 }
 
 class SymlinkInPathError extends Error {}
@@ -149,12 +172,14 @@ function freeName(target) {
   }
 }
 
+// Callers hold the holding folder's lock (withHoldingLock) around this: the name pick, the move and the manifest
+// read-modify-write must not interleave with another archiver, and two clones of one repo share one holding folder.
 // `rels` are FILES inside the worktree (a symlink, or a symlinked directory on the way, is refused). Each is moved to
 // <holdingDir>/<YYYY-MM-DD>/<slug>/<rel>; the manifest in the dated dir is appended to (not replaced) when the same day
 // archives again. No directory between holdingDir and the stored file may be a symlink either. `originalRoot` is where
 // the files really live when `wtPath` is a temporary location (the quarantine): the manifest's `original` (and so the
 // restore command) points there, never at a path that stops existing after the run.
-export function archivePaths({ wtPath, originalRoot = wtPath, rels, holdingDir, slug, pr, nowMs }) {
+export function archivePaths({ wtPath, originalRoot = wtPath, rels, holdingDir, slug, pr, nowMs, hooks = {} }) {
   const day = new Date(nowMs).toISOString().slice(0, 10);
   const archivedAt = new Date(nowMs).toISOString();
   const sources = rels.map((rel) => {
@@ -173,8 +198,12 @@ export function archivePaths({ wtPath, originalRoot = wtPath, rels, holdingDir, 
     const data = readFileSync(abs);
     const relParts = String(rel).split('/');
     const destDir = ensureRealDirs(batchDir, [safeName(slug), ...relParts.slice(0, -1)]);
-    const stored = freeName(path.join(destDir, relParts[relParts.length - 1]));
-    moveFile(abs, stored);
+    let stored;
+    for (;;) { // a name that got taken after the pick (never expected under the holding lock) just means: pick the next one
+      stored = freeName(path.join(destDir, relParts[relParts.length - 1]));
+      hooks.afterPick?.(stored); // test seam: lets a test run another archiver between the name pick and the move
+      if (moveFileExclusive(abs, stored)) break;
+    }
     const item = {
       original: path.join(originalRoot, ...relParts), stored, size: data.length, sha256: createHash('sha256').update(data).digest('hex'),
       archivedAt, slug, pr: pr ?? null,
@@ -185,6 +214,18 @@ export function archivePaths({ wtPath, originalRoot = wtPath, rels, holdingDir, 
     pruneEmptyParents(path.dirname(abs), wtPath);
   }
   return { batchDir, items };
+}
+
+export const holdingLockName = (holdingDir) => `worktrees-holding-${createHash('sha256').update(canonicalPath(holdingDir)).digest('hex').slice(0, 12)}`;
+
+// The lock is keyed by the holding folder (not the git common dir the run lock uses): two clones of one repo have two run
+// locks but one holding folder. A lock that cannot be had within lockWaitMs throws LockTimeoutError: callers keep the worktree.
+export async function withHoldingLock(holdingDir, fn, { lockDir, lockWaitMs = 30_000, lockPollMs = 50 } = {}) {
+  return withLock(holdingLockName(holdingDir), fn, { dir: lockDir || undefined, waitMs: lockWaitMs, pollMs: lockPollMs });
+}
+
+export async function archivePathsLocked({ lockDir, lockWaitMs, lockPollMs, ...opts }) {
+  return withHoldingLock(opts.holdingDir, () => archivePaths(opts), { lockDir, lockWaitMs, lockPollMs });
 }
 
 // Always single-quoted (POSIX sh): a quote inside becomes '\'' and nothing else in the path is special.
@@ -323,7 +364,7 @@ function deleteInside(q, rel) {
 // re-inspect there, then archive + delete + `git worktree remove`. Any doubt after the move => move it back and keep it.
 // The quarantine sits next to the worktree: candidates are direct children of <root>/<worktree_dir>.
 // -> { removed: true, archived: [manifest items], deleted: [rels] } | { removed: false, reason, restored }
-export async function removeWorktree({ root, wt, cfg, pr, holdingDir, runId, runStartMs, settleMs = 5000, hooks = {}, procOpts }) {
+export async function removeWorktree({ root, wt, cfg, pr, holdingDir, runId, runStartMs, settleMs = 5000, hooks = {}, procOpts, lockDir, lockWaitMs, lockPollMs }) {
   if (!RUN_ID.test(String(runId))) throw new Error(`removeWorktree: runId must match ${RUN_ID}: ${runId}`);
   if (!Number.isFinite(runStartMs)) throw new Error('removeWorktree: runStartMs must be a number');
   const qDir = path.join(path.dirname(wt.path), QUARANTINE_DIR);
@@ -360,12 +401,18 @@ export async function removeWorktree({ root, wt, cfg, pr, holdingDir, runId, run
   const archived = [];
   try {
     const nowMs = Date.now();
-    for (const rel of verdict.arch) {
-      archived.push(...archivePaths({ wtPath: q, originalRoot: wt.path, rels: [rel], holdingDir, slug: wt.slug, pr, nowMs }).items);
+    if (verdict.arch.length) {
+      await withHoldingLock(holdingDir, () => {
+        for (const rel of verdict.arch) {
+          archived.push(...archivePaths({ wtPath: q, originalRoot: wt.path, rels: [rel], holdingDir, slug: wt.slug, pr, nowMs }).items);
+        }
+      }, { lockDir, lockWaitMs, lockPollMs });
     }
     for (const rel of verdict.del) deleteInside(q, rel);
   } catch (err) {
-    const why = err instanceof SymlinkInPathError ? `symlink in path (${err.message})` : `cleanup failed during removal: ${err.message}`;
+    const why = err instanceof SymlinkInPathError ? `symlink in path (${err.message})`
+      : err instanceof LockTimeoutError ? `holding folder is busy (lock not obtained): ${gitMessage(err)}`
+        : `cleanup failed during removal: ${err.message}`;
     return moveBack(why, { archived });
   }
 

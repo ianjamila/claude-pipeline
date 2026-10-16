@@ -77,6 +77,7 @@ export function listCandidates(root, { worktreeDir, protect, nowMs = Date.now() 
 }
 
 // -> [{ path (posix, relative; a trailing "/" marks an ignored/untracked directory), kind: ignored|untracked|tracked-change }]
+// (tracked-change also covers a skip-worktree / assume-unchanged entry, see below)
 export function statusEntries(wtPath) {
   const out = git(['status', '--porcelain=v1', '--ignored', '--untracked-files=all', '-z'], { cwd: wtPath });
   const fields = out.split('\0');
@@ -88,6 +89,13 @@ export function statusEntries(wtPath) {
     const kind = xy === '!!' ? 'ignored' : xy === '??' ? 'untracked' : 'tracked-change';
     entries.push({ path: f.slice(3), kind });
     if (/[RC]/.test(xy)) i += 1; // a rename/copy carries its source path as the next field
+  }
+  // `git status` does not report edits to a tracked file flagged skip-worktree or assume-unchanged, so the worktree would look
+  // clean while holding unsaved work. `ls-files -v` tags such entries `S` (skip-worktree) or with a lowercase letter
+  // (assume-unchanged, also skip-worktree + assume-unchanged). The flag alone blocks, whether or not the file was edited
+  // (git cannot say cheaply, and a sparse checkout's skipped files block too): fail closed. A failing call throws, so the caller keeps.
+  for (const f of git(['ls-files', '-v', '-z'], { cwd: wtPath }).split('\0')) {
+    if (/^[a-zS] /.test(f)) entries.push({ path: f.slice(2), kind: 'tracked-change' });
   }
   return entries;
 }
