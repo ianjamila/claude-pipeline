@@ -87,7 +87,11 @@ export function presentedRequests(text) {
 
 // The text of the last assistant reply in the transcript when it holds a 🔀 merge request ('' when none). Only the
 // transcript's last 4 MB are read. A reply is every assistant text block between two prompts.
-export function lastRequestText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES } = {}) {
+// `prompt` is the text being submitted (the UserPromptSubmit hook's input.prompt). Why (#58 round 3): the hook may run before or after the
+// transcript gets that prompt, so the newest prompt entry is "the current one" (its empty slot skipped) only when its text IS that prompt;
+// any other newest prompt is an older, unanswered one, and the empty reply slot after it is the reply to use: no request, the one before is stale.
+// Without `prompt` the newest prompt entry is taken to be the current one.
+export function lastRequestText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, prompt } = {}) {
   let raw = '';
   try {
     if (!lstatSync(transcriptPath).isFile()) return '';
@@ -107,15 +111,20 @@ export function lastRequestText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BY
   }
   const replies = [''];
   let lastIsPrompt = false; // is the newest user/assistant entry a prompt (the owner's current one)?
+  let lastPromptText = '';
+  const plain = (t) => String(t ?? '').replace(/\r\n/g, '\n').trim();
   for (const line of raw.split('\n')) {
     if (!line.trim()) continue;
     let e;
     try { e = JSON.parse(line); } catch { continue; }
     const content = e?.message?.content;
     if (e?.type === 'user') {
-      const prompt = typeof content === 'string' || (Array.isArray(content) && content.some((b) => b?.type === 'text') && !content.some((b) => b?.type === 'tool_result'));
-      if (prompt) replies.push('');
-      lastIsPrompt = prompt;
+      const isPrompt = typeof content === 'string' || (Array.isArray(content) && content.some((b) => b?.type === 'text') && !content.some((b) => b?.type === 'tool_result'));
+      if (isPrompt) {
+        replies.push('');
+        lastPromptText = plain(typeof content === 'string' ? content : content.filter((b) => b?.type === 'text').map((b) => b.text).join('\n'));
+      }
+      lastIsPrompt = isPrompt;
     } else if (e?.type === 'assistant' && Array.isArray(content)) {
       lastIsPrompt = false;
       for (const b of content) if (b?.type === 'text' && typeof b.text === 'string') replies[replies.length - 1] += `${b.text}\n`;
@@ -124,7 +133,8 @@ export function lastRequestText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BY
   // Only the reply right before the owner's prompt: when the newest entry is that prompt, its own (empty) slot is skipped, and that is
   // the ONLY slot that may be. A later prompt plus a text-less assistant turn (tool calls only) leaves the old request stale, and an
   // older request is never revived by a later "merge": the agent shows it again.
-  const last = replies.length - 1 - (lastIsPrompt && replies.length > 1 ? 1 : 0);
+  const current = lastIsPrompt && (prompt === undefined || plain(prompt) === lastPromptText);
+  const last = replies.length - 1 - (current && replies.length > 1 ? 1 : 0);
   return READY_LINE.test(replies[last]) ? replies[last] : '';
 }
 
@@ -163,7 +173,7 @@ export function recordApproval(input, { home = accountHome(), now = Date.now } =
     if (!SESSION_RE.test(session)) return null;
     const a = parseApproval(input?.prompt);
     if (!a) return null;
-    const shown = presentedRequests(lastRequestText(String(input?.transcript_path ?? '')));
+    const shown = presentedRequests(lastRequestText(String(input?.transcript_path ?? ''), { prompt: String(input.prompt) }));
     const wanted = (pr) => a.prs.length === 0 || a.prs.includes(pr);
     const shaOk = (head) => a.shas.length === 0 || a.shas.some((s) => head.startsWith(s) || s.startsWith(head));
     const requests = shown.requests.filter((r) => wanted(r.pr) && shaOk(r.head));

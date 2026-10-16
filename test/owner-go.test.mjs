@@ -179,3 +179,25 @@ test('owner-go: a tool-only turn between the request and the "merge" invalidates
   const t3 = transcript(home, [user('go'), said(REQUEST), user('merge'), { type: 'system', content: 'x' }]);
   assert.match(lastRequestText(t3), /Ready to merge #58/, 'the current prompt\'s own empty slot is skipped (other entry kinds do not count)');
 });
+
+// #58 round 3: whether the hook runs before or after the current prompt is written to the transcript must not matter
+test('owner-go: the newest prompt in the transcript is "the current one" only when its text is the prompt being submitted', () => {
+  const home = tmp();
+  const req = /Ready to merge #58/;
+  // the current prompt is already in the transcript: its own empty slot is skipped
+  assert.match(lastRequestText(transcript(home, [user('go'), said(REQUEST), user('merge')]), { prompt: 'merge' }), req);
+  assert.match(lastRequestText(transcript(home, [user('go'), said(REQUEST), { type: 'user', message: { content: [{ type: 'text', text: 'merge' }] } }]), { prompt: 'merge' }), req, 'block content');
+  assert.match(lastRequestText(transcript(home, [user('go'), said(REQUEST), user('merge\n')]), { prompt: '  merge' }), req, 'surrounding whitespace is ignored');
+  // not yet written: the newest entry is the reply itself
+  assert.match(lastRequestText(transcript(home, [user('go'), said(REQUEST)]), { prompt: 'merge' }), req);
+  // the newest entry is an OLDER, unanswered prompt: its empty slot is the reply to use, so there is no request (the request before it is stale)
+  assert.equal(lastRequestText(transcript(home, [user('go'), said(REQUEST), user('run the tests')]), { prompt: 'merge' }), '');
+  assert.equal(lastRequestText(transcript(home, [user('go'), said(REQUEST), user('run the tests'), toolResult()]), { prompt: 'merge' }), '');
+  // and through the recorder: an approval recorded for a request that an older prompt already made stale shows nothing
+  const now = () => Date.parse('2026-10-14T10:00:00Z');
+  const stale = { hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: 'merge', transcript_path: transcript(home, [user('go'), said(REQUEST), user('run the tests')]) };
+  assert.deepEqual(recordApproval(stale, { home, now }).requests, []);
+  assert.deepEqual(recordApproval(stale, { home, now }).prs, []);
+  const fresh = { ...stale, transcript_path: transcript(home, [user('go'), said(REQUEST)]) };
+  assert.deepEqual(recordApproval(fresh, { home, now }).requests, [{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS }]);
+});
