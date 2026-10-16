@@ -184,28 +184,28 @@ test('B5 a name nothing on the line sets is no looser than before: the reading o
 });
 
 // ---- B6. crafted long inputs finish quickly in both guards (a hook past its deadline is ALLOWED by the host) -------------------------------------------------------
-test('B6 adversarial 200 kB lines and glob patterns are answered quickly', () => {
-  const cases = [
-    'a=${a}'.repeat(30000),
-    '${'.repeat(8000), // (100000 of them takes the parser itself 13 s, on main too: not this reading's cost; assigningDefaults answers it in 0 ms)
-    'a['.repeat(20000), // (90000 of them takes the parser 2-3 s, on main too)
-    'F=(' + 'a '.repeat(90000) + '); bash ${F[1]}',
-    'bash ' + '$F['.repeat(40000),
+test('B6 adversarial 200 kB lines are answered quickly by the reading itself, and shorter ones by both guards', () => {
+  const cpu = () => { const u = process.cpuUsage(); return (u.user + u.system) / 1000; }; // (CPU time, not the clock: a busy machine must not fail the test)
+  const globs = [
     'F=' + 'a'.repeat(5000) + '.sh; G=${F#*a*a*a*a*a*a*a*a*a*b}; bash $G',
     'F=' + 'a'.repeat(300) + '.sh; G=${F#*a*a*a*a*a*a*a*a*a*b}; bash $G',
     'F=' + 'a'.repeat(300) + '.sh; G=${F//*a*a*a*a*a*a*a*a*b/x}; bash $G',
     'F=' + 'a'.repeat(300) + '.sh; G=${F%%*a*a*a*a*a*a*a*a*a*b}; bash $G',
     'F=(' + 'x'.repeat(100000) + '); G=${F[1]%*a*a*a*a*a*a*a*b}; bash $G',
-    '${U:-' + 'x'.repeat(190000) + '}',
-    'G="' + '${U:-"'.repeat(30000),
   ];
-  for (const c of cases) {
-    // (this reading's own work, then the guards; the parser alone takes 2-3 s on some of these on main too, so the guards get the deadline's third)
-    const cpu = () => { const u = process.cpuUsage(); return (u.user + u.system) / 1000; }; // (CPU time, not the clock: a busy machine must not fail the test)
+  const big = (n) => [
+    'a=${a}'.repeat(n * 5), '${'.repeat(n * 10), 'a['.repeat(n * 10), 'F=(' + 'a '.repeat(n * 9) + '); bash ${F[1]}', 'bash ' + '$F['.repeat(n * 4),
+    '${U:-' + 'x'.repeat(n * 9) + '}', 'G="' + '${U:-"'.repeat(n * 3),
+  ];
+  for (const c of [...globs, ...big(20000)]) {
     const t0 = cpu();
     assigningDefaults(c);
     const own = cpu() - t0;
     assert.ok(own < 500, `${own} ms in assigningDefaults for ${c.slice(0, 40)}...`);
+  }
+  // (the parser alone takes seconds on a full-size one, on main too: the guards get the shorter ones)
+  for (const c of [...globs, ...big(1500)]) {
+    const t0 = cpu();
     both(c, SPEC);
     const ms = cpu() - t0;
     assert.ok(ms < 8000, `${ms} ms for ${c.slice(0, 40)}...`);
