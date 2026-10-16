@@ -2131,7 +2131,7 @@ const MAX_LOOP_READINGS = 64;
 // (a reading where the loop did not run: the name is not set by the line, as main read every loop variable)
 const LOOP_NOT_RUN = Symbol('loop not run');
 // A zsh parameter expansion with flags (`${(P)N::=x}` assigns the variable N names) or a bash indirect one (`${!N}`).
-const INDIRECT_EXPANSION = /\$\{(?:![A-Za-z_]|\([^)]*[Pe][^)]*\)|\([^)]*\)[A-Za-z_]\w*:{0,2}=)/; // (`${!N}`, the zsh P flag or e flag (it evaluates the value again: `${(e)X}` may assign), or flags before an assignment `${(A)N::=x}`; not `${(%):-%x}`)
+const INDIRECT_EXPANSION = /\$\{(?:!|\((?!%\))[^)]*\))/; // (fail closed: `${!…}` and every zsh flag expansion but the prompt-only `${(%)…}` (the script-directory idiom `${${(%):-%x}:A:h}`); P, e, A, … can assign)
 // The readings of a text's loop variables: one Map (name -> word) per combination, [null] when there are too many, null when the text has no loop.
 function loopReadings(command, opts) {
   const cmds = simpleCommands(command, { env: opts.env ?? process.env });
