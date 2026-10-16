@@ -413,6 +413,12 @@ test('#56 replay 2: loop words from a known variable, quoted [ ] words, code in 
     'for f in ok.sh; do echo "${f::=run.sh}"; bash $f; done', // (zsh ::= assigns, inside double quotes…)
     'for f in ok.sh; do : ${f::=run.sh}; bash $f; done', // (…and outside)
     'for f in ok.sh; do echo "${f:=x} $f"; f=run.sh; bash $f; done',
+    // zsh reads a subscript or a modifier after the name, and `=cmd` as a command path (commit security review of 6b19a21)
+    'B=run.sh.x; for f in $B:r; do bash $f; done',
+    'B=run.shXY; for f in $B[1,6]; do bash $f; done',
+    'B=run.shXY; for f in ${B}[1,6]; do bash $f; done',
+    'for f in =run.sh; do bash $f; done',
+    'B=ok; for f in $B.sh; do bash $f; B=run; done', // (the name the word reads is set twice)
   ]) denyGit(cmd, SPEC);
   // still refused (documented): two loops over the same name, and a loop over a variable holding command output
   for (const cmd of [
