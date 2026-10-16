@@ -166,9 +166,13 @@ const knownValues = (ctx, n) => [ctx.vars[n], unsureVar(ctx, n) ? `$${n}` : unde
 // A variable assigned more than once in what is judged (`B=main; false && B=agent/x`) is unknown from then on: which
 // assignment ran depends on control flow the parser does not model, so its value is left as `$B` (dynamic).
 // Only an assignment on the line itself (level 0) makes a tainted variable known again; one inside a judged script is ignored for it.
+// #81: the readings of one text (the line, or a script the guard opened) belong to that text's level: a script judged under a reading of the line, or
+// a script it runs, has none of the line's pins and may take readings of its own (judgeReadings puts the outer ones back when it is done).
+const pinsAt = (ctx, level) => (ctx.pins && ctx.pinsLevel === level ? ctx.pins : undefined);
 function setVar(ctx, k, v, level) {
   // (a reading of the line pins how its one assignment of k went: it ran, or it did not; see judgeReadings)
-  if (level === 0 && ctx.pins?.has(k)) { if (ctx.pins.get(k) === 'set') ctx.vars[k] = v; return; }
+  const pins = pinsAt(ctx, level);
+  if (pins?.has(k)) { if (pins.get(k) === 'set') ctx.vars[k] = v; return; }
   if (level === 0) ctx.tainted.delete(k);
   else if (ctx.tainted.has(k)) return;
   if (sameValue(ctx, k, v)) return;
@@ -1258,7 +1262,7 @@ function judgeScriptText(text, sf, abs, dir, ctx, level) {
     return why ? deny(`the program ${sf.file} contains a guarded command (${why}); it cannot be verified by the guard. Run the operation directly.`) : null;
   }
   if (level >= MAX_NESTING) return deny(`the script ${sf.file} is nested too deeply (scripts running scripts) to verify.`);
-  const v = judgeScoped(text, dir, ctx, level, sf);
+  const v = judgeScoped(text, dir, ctx, level, sf, !sf.sourced); // (a script of its own takes readings (judgeReadings); a sourced file shares the line's variables, which evalString's check after `source` makes unsure: the same as before)
   return v.decision === 'deny' ? deny(`the script ${sf.file} would run a blocked command: ${v.reason}`) : null;
 }
 
@@ -1599,7 +1603,7 @@ function implicitStartupVerdict(st, ctx, cmd, dir) {
 //   gitAliases, ghAliases         config on disk: kept; one a speculative candidate (re)defines is also unsure (aliasUnsure)
 //   cwd, home, fullText, readers  constants of the evaluation; budget (script reads, deadline, expansion) is shared on purpose (never restored)
 // (a `cd` inside a sourced file is not followed: evalString's directory is local to each call)
-function judgeScoped(text, dir, ctx, level, sf) {
+function judgeScoped(text, dir, ctx, level, sf, child = false) {
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   if (sf.sourced && !sf.candidate) return evalString(text, dir, ctx, level + 1);
   const saved = Object.assign(Object.create(null), ctx.vars);
@@ -1607,7 +1611,7 @@ function judgeScoped(text, dir, ctx, level, sf) {
   const savedUnsure = new Set(ctx.unsureVars);
   const spec = sf.candidate ? { branches: new Map(ctx.branches), git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases } } : null;
   try {
-    return evalString(text, dir, ctx, level + 1);
+    return evalString(text, dir, ctx, level + 1, child);
   } finally {
     if (spec) { // anything added, changed or removed: unknown (it may not have run), never the candidate's value nor the old one
       for (const d of new Set([...spec.branches.keys(), ...ctx.branches.keys()])) {
@@ -1722,7 +1726,7 @@ const STATE_GIT = new Set(['checkout', 'switch', 'branch', 'rebase', 'symbolic-r
 function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0, text = null) {
   const counts = new Map();
   const implicit = new Set();
-  const bump = (k, n) => { if (level === 0 && ctx.pins?.has(k)) return; counts.set(k, (counts.get(k) ?? (k in ctx.vars || ctx.unsureVars.has(k) ? 1 : 0)) + n); };
+  const bump = (k, n) => { if (pinsAt(ctx, level)?.has(k)) return; counts.set(k, (counts.get(k) ?? (k in ctx.vars || ctx.unsureVars.has(k) ? 1 : 0)) + n); };
   const from = flowStart(cmds);
   for (const [i, c] of cmds.entries()) {
     const n = mayNotRun(cmds, from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) ? 2 : 1;
@@ -2160,14 +2164,23 @@ function loopWordAt(k, ctx) {
   return null;
 }
 // Judges the line once per reading of the names (each assignment ran, or did not); the first denial wins. Null when there is nothing to read.
+// #81: also for a script the guard opened (evalString's `child`: a shell of its own), whose text is read like a line of its own: a loop in the script, a name it assigns once.
+// (The line's own names reach it as they are: a name the script assigns once is then judged both ways too, so a collision with the line's loop name (`for n in 1 2; do bash brief.sh $n; done`
+// with `n=$2` in brief.sh) is read by the same readings. A name the line exports reaches the script, one it does not export may not; the script is judged as if all did, the stricter way.)
+// What the script leaves behind for the text that ran it is the union of its readings: a branch, an alias or a config the readings leave differently is unknown, as for a candidate script
+// (defence in depth: a name that reaches a git command is refused as unsure in the reading where its assignment did not run, so the readings do not leave different states in practice).
 function judgeReadings(str, startDir, ctx, level, names, saved) {
-  if (level !== 0 || ctx.pins || names.length === 0) return null;
+  if (pinsAt(ctx, level) || names.length === 0) return null;
   const total = names.reduce((n, { modes }) => n * modes.length, 1);
   if (total > MAX_READINGS) return null;
+  const outer = [ctx.pins, ctx.pinsLevel];
+  let dirty = false;
+  let envDirty = false;
   try {
     for (let r = 0; r < total; r++) {
       checkDeadline(ctx.budget);
       restoreLineState(ctx, saved);
+      ctx.pinsLevel = level;
       ctx.pins = new Map();
       let rest = r;
       for (const { k, modes } of names) {
@@ -2178,14 +2191,31 @@ function judgeReadings(str, startDir, ctx, level, names, saved) {
       }
       const v = evalString(str, startDir, ctx, level);
       if (v.decision === 'deny') return v;
+      dirty ||= ctx.cfgDirty;
+      envDirty ||= ctx.envCfgDirty;
+    }
+    if (level > 0 && total > 1) {
+      // (config is only ever set; a branch or alias that differs from the state the script started with may or may not have changed)
+      // (defensive: the layer is the refusal of an unsure name at a git command, above)
+      ctx.cfgDirty = dirty;
+      ctx.envCfgDirty = envDirty;
+      for (const d of new Set([...saved.branches.keys(), ...ctx.branches.keys()])) {
+        const a = saved.branches.get(d);
+        const b = ctx.branches.get(d);
+        if (a?.name !== b?.name || a?.trackMain !== b?.trackMain) ctx.branches.set(d, { name: null, trackMain: false });
+      }
+      for (const [kind, now] of [['git', ctx.gitAliases], ['gh', ctx.ghAliases]]) {
+        const was = saved[kind === 'git' ? 'gitAliases' : 'ghAliases'];
+        for (const n of new Set([...Object.keys(was), ...Object.keys(now)])) if (was[n] !== now[n]) ctx.aliasUnsure.add(`${kind}:${n}`);
+      }
     }
     return allowed();
   } finally {
-    ctx.pins = undefined;
+    [ctx.pins, ctx.pinsLevel] = outer;
   }
 }
 
-function evalString(str, startDir, ctx, level) {
+function evalString(str, startDir, ctx, level, child = false) {
   checkDeadline(ctx.budget);
   if (level > MAX_NESTING) return deny('pipeline job start / alias is nested too deeply to verify.');
   const cmds = simpleCommands(str, { env: ctx.env, bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline }); // a scan that outlasts the deadline gives up: truncated, so denied
@@ -2197,7 +2227,7 @@ function evalString(str, startDir, ctx, level) {
   }
   // A variable whose value is not certain (see collectAssignments) denies the line when it reaches git / gh, a command
   // that runs code, cd / pushd / popd or a command name: the checks below read the expanded text.
-  const saved = level === 0 && !ctx.pins ? lineState(ctx) : null; // (the state before this line's assignments: each reading starts from it)
+  const saved = (level === 0 || child) && !pinsAt(ctx, level) ? lineState(ctx) : null; // (the state before this line's assignments: each reading starts from it)
   collectAssignments(cmds, ctx, !definesFunction(str, cmds), level, str);
   if (ctx.unsureVars.size || ctx.tainted.size) {
     const unsure = unsureVarReachingCommand(cmds, ctx);
@@ -2284,7 +2314,7 @@ function evalString(str, startDir, ctx, level) {
         // (a value that still holds a `$` is not worked out: the case change would apply to what it expands to)
         if (d.transform && DYNAMIC.test(v)) { delete ctx.vars[k]; ctx.unsureVars.add(k); } else setVar(ctx, k, applyTransform(v, d.transform), level);
       }
-    } else if (name === 'for' && level === 0 && ctx.pins?.get(argv[1])?.expand) verdict = loopWordAt(argv[1], ctx);
+    } else if (name === 'for' && pinsAt(ctx, level)?.get(argv[1])?.expand) verdict = loopWordAt(argv[1], ctx);
     else if (name === 'for' && computedLoopWord(c) !== null) setVar(ctx, argv[1], computedLoopWord(c), level);
     else if (name === 'cd' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name, argv, ctx, cdp, c.env ?? {});
     else if (name === 'git' || name === 'gh') {

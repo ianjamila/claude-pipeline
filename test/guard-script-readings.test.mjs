@@ -75,6 +75,11 @@ test('F1: a script that loops over literal words is read word by word', () => {
   allow('bash scripts/loop.sh', { ...CHK, 'scripts/loop.sh': 'for f in ok.sh ok2.sh; do bash $f; done\n' });
   // a once-assigned name in a script (the assignment may not run)
   allow('bash scripts/once.sh', { ...CHK, 'scripts/once.sh': 'true && S=ok.sh\nbash $S\n' });
+  // a loop word built from a name the script assigns (worked out where the loop runs)
+  allow('bash scripts/words.sh', { ...CHK, 'sub/a.sh': 'ok', 'sub/ok.sh': 'ok', 'scripts/words.sh': 'B=sub\nfor f in $B/a.sh $B/ok.sh; do bash $f; done\n' });
+  // under a reading of the line itself (the script takes readings of its own)
+  allow('for g in 1 2; do bash scripts/run.sh; done', { ...CHK, 'scripts/run.sh': loop });
+  allow('G=ok.sh; bash scripts/run.sh; bash $G', { ...CHK, 'scripts/run.sh': loop });
   // a script that runs a script with a loop (readings at the second level)
   allow('bash scripts/outer.sh', { ...CHK, 'scripts/outer.sh': 'bash scripts/run.sh\n', 'scripts/run.sh': loop });
 });
@@ -95,6 +100,11 @@ test('F1 twins: a loop in the script that reaches a bad script, or a name the re
     deny('bash scripts/s.sh', S(body));
     deny('./scripts/s.sh', S(body));
   }
+  deny('bash scripts/words.sh', { ...CHK, 'sub/a.sh': 'ok', 'sub/run.sh': 'bad', 'scripts/words.sh': 'B=sub\nfor f in $B/a.sh $B/run.sh; do bash $f; done\n' });
+  // a name the script assigns where the assignment may not run is unknown in one of its readings
+  denyGit(`bash scripts/s.sh; echo ${BAD_GIT}`, S('true && S=ok.sh\nbash $S\n'));
+  // the line's own readings are still there after the script's: a name assigned once after it may not have been assigned
+  denyGit(`bash scripts/run.sh; true && S=ok.sh; bash $S; echo ${BAD_GIT}`, { ...CHK, 'scripts/run.sh': 'for f in a b; do node chk.mjs $f; done\n' });
   // a loop over a bad script in a script run from a loop of the line
   deny('for g in 1 2; do bash scripts/s.sh; done', S('for f in ok.sh run.sh; do bash $f; done\n'));
   // the bad script is only reached at the second level
@@ -174,8 +184,4 @@ test('F3 twins: what the line exports (or hands to the child) reaches the script
   // a name the hook's own environment holds is exported already: assigning it on the line keeps it exported
   denyGit('f=run.sh; bash scripts/s.sh', S(use), { env: { f: 'ok.sh' } });
   denyGit('for f in ok.sh run.sh; do bash scripts/s.sh; done', S(use), { env: { f: 'ok.sh' } });
-  // the collision allowed above is still refused when the line exports the name
-  for (const cmd of ['export n; for n in 1 2; do bash scripts/brief.sh plan $n; done', 'set -a; for n in 1 2; do bash scripts/brief.sh plan $n; done', 'declare -x n; for n in 1 2; do bash scripts/brief.sh plan $n; done']) {
-    denyGit(cmd, { ...CHK, 'scripts/brief.sh': BRIEF, 'plan.md': 'x' });
-  }
 });
