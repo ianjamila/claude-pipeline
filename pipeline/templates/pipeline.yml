@@ -24,6 +24,10 @@ verify:
   # skippable_steps: [db]          # optional: steps verify may skip (report status "skipped" + a reason, e.g. a slow db step
   #                                # when nothing it depends on changed). final-gate refuses a skipped step not listed here;
   #                                # absent = no step may be skipped. Every name must also be in expected_steps (when set).
+  # stop_queue_wait_minutes: 5   # optional, integer 0..30, default 0: minutes verify.quick may WAIT (e.g. for a machine-wide
+  #                                # heavy-check slot) before it runs. The Stop hook adds this to its 840 s execution allowance, so
+  #                                # raise the hook's "timeout" in .claude/settings.json to 900 + minutes * 60 seconds (5 -> 1200);
+  #                                # `P config` warns when it is lower.
 
 ci:
   required_checks: ["Test integrity", "Hard-stop scan"]   # + your CI job names

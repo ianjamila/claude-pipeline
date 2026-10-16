@@ -5,6 +5,7 @@ import { chmodSync, mkdirSync, readFileSync, writeFileSync, symlinkSync, utimesS
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
+import { classifyEntries } from '../pipeline/lib/worktree-prune/rules.mjs';
 import { resolveCanonicalRoot, listCandidates, entriesFor, walkTree, defaultTranscriptDirs, checkAncestry, processesInside, transcriptMentions, memoryMentions, recentFiles } from '../pipeline/lib/worktree-prune/inspect.mjs';
 
 function world() {
@@ -477,4 +478,49 @@ test('processesInside (darwin path) with the real lsof finds a child whose cwd i
   } finally {
     child.kill('SIGKILL');
   }
+});
+
+// `git status` hides a modified tracked file flagged skip-worktree or assume-unchanged, so the flagged entry itself must block (issue #62).
+for (const flag of ['skip-worktree', 'assume-unchanged']) {
+  test(`entriesFor: a modified tracked file flagged ${flag} is a tracked-change blocker`, () => {
+    const { repo, add } = world();
+    const wt = add('agent-x', 'agent/x');
+    repo.git(['-C', wt, 'update-index', `--${flag}`, 'a.txt']);
+    writeFileSync(join(wt, 'a.txt'), 'unsaved edit\n');
+    assert.equal(repo.git(['-C', wt, 'status', '--porcelain']).trim(), '', 'precondition: git status hides the edit');
+    const hit = entriesFor(wt).filter((x) => x.path === 'a.txt');
+    assert.deepEqual(hit.map((x) => x.kind), ['tracked-change']);
+    assert.deepEqual(classifyEntries(entriesFor(wt), { delete: [], archive: [] }).blockers, ['a.txt']);
+  });
+
+  // Not worth telling a flag on an untouched file from one on an edited file (that is what the flag hides): fail closed, keep it.
+  test(`entriesFor: an unmodified file flagged ${flag} still blocks (fail closed)`, () => {
+    const { repo, add } = world();
+    const wt = add('agent-x', 'agent/x');
+    repo.git(['-C', wt, 'update-index', `--${flag}`, 'a.txt']);
+    assert.deepEqual(entriesFor(wt).filter((x) => x.path === 'a.txt').map((x) => x.kind), ['tracked-change']);
+  });
+}
+
+test('entriesFor: a worktree with no flagged entries reports no tracked-change', () => {
+  const { add } = world();
+  const wt = add('agent-x', 'agent/x');
+  assert.deepEqual(entriesFor(wt).filter((x) => x.kind === 'tracked-change'), []);
+});
+
+test('entriesFor: a failing `git ls-files -v` is an error, never "clean" (callers keep the worktree)', { skip: process.platform === 'win32' && 'needs a sh shim' }, () => {
+  const { repo, add } = world();
+  const wt = add('agent-x', 'agent/x');
+  const realGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
+  const shim = mkdtempSync(join(tmpdir(), 'gitshim-'));
+  writeFileSync(join(shim, 'git'), `#!/bin/sh\nfor a in "$@"; do [ "$a" = ls-files ] && { echo boom >&2; exit 128; }; done\nexec "${realGit}" "$@"\n`, { mode: 0o755 });
+  const prev = process.env.PATH;
+  process.env.PATH = `${shim}:${prev}`;
+  try {
+    assert.throws(() => entriesFor(wt), /ls-files .* failed/);
+  } finally {
+    process.env.PATH = prev;
+  }
+  assert.ok(entriesFor(wt), 'the real git still works afterwards');
+  void repo;
 });

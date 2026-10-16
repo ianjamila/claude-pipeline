@@ -279,6 +279,36 @@ test('stop-verify: runs config.verify.quick from the repo root with PIPELINE_STO
   assert.equal(run.calls[0].opts.timeoutMs, 840_000);
 });
 
+test('stop-verify: runTimeoutMs adds verify.stop_queue_wait_minutes to the 840 s execution allowance', async () => {
+  const repo = await project();
+  const sv = await importVendored(repo.dir, 'stop-verify');
+  assert.equal(sv.EXECUTION_TIMEOUT_MS, 840_000);
+  assert.equal(sv.RUN_TIMEOUT_MS, 840_000, 'the old export keeps working');
+  assert.equal(sv.runTimeoutMs({ verify: {} }), 840_000);
+  assert.equal(sv.runTimeoutMs({ verify: { stop_queue_wait_minutes: 0 } }), 840_000);
+  assert.equal(sv.runTimeoutMs({ verify: { stop_queue_wait_minutes: 5 } }), 1_140_000);
+  assert.equal(sv.runTimeoutMs({}), 840_000, 'a config with no verify section is the default');
+});
+
+test('stop-verify: without deps.timeoutMs the run gets the configured queue allowance; deps.timeoutMs still wins', async () => {
+  const repo = await project({ config: CONFIG('node -e "process.exit(0)"', '  stop_queue_wait_minutes: 5\n') });
+  edit(repo);
+  const run = spy(passing());
+  await stop(repo, { run });
+  assert.equal(run.calls[0].opts.timeoutMs, 1_140_000);
+  edit(repo);
+  const explicit = spy(passing());
+  await stop(repo, { run: explicit, timeoutMs: 1234 });
+  assert.equal(explicit.calls[0].opts.timeoutMs, 1234);
+});
+
+test('stop-verify: the timed-out message reports the allowance that was actually used', async () => {
+  const repo = await project({ config: CONFIG('node -e "process.exit(0)"', '  stop_queue_wait_minutes: 5\n') });
+  edit(repo);
+  const r = await stop(repo, { run: spy(failing({ code: null, timedOut: true })) });
+  assert.match(r.output.reason, /timed out after 19 min/);
+});
+
 test('stop-verify: failing quick verify blocks, with the output tail (<=15 lines) as the reason', async () => {
   const repo = await project();
   edit(repo);
