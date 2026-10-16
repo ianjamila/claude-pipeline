@@ -343,6 +343,15 @@ test('#58 round 4: only the template\'s exact shape is approvable; every other w
   const none = { ...opts('/other'), ownerGo: { ...ownerGo, mode: () => 'none', mergeTemplates: () => [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: '--expect-head' }] } };
   assert.equal(d(`bun run merge 8 --expect-head ${H8}`, none).decision, 'allow');
   assert.equal(d(`npm --prefix /chat run merge -- 8 --expect-head ${H8}`, none).decision, 'deny');
+  // a package-manager setting on the line moves the target too (npm reads npm_config_prefix like --prefix); a config file option may hold one
+  for (const cmd of [`npm_config_prefix=/chat npm run merge -- 8 --expect-head ${H8}`, `NPM_CONFIG_PREFIX=/chat npm run merge -- 8 --expect-head ${H8}`,
+    `export npm_config_prefix=/chat; npm run merge -- 8 --expect-head ${H8}`, `env npm_config_prefix=/chat npm run merge -- 8 --expect-head ${H8}`,
+    `npm --userconfig /tmp/rc run merge -- 8 --expect-head ${H8}`, `npm -g run merge -- 8 --expect-head ${H8}`, `npm --location=global run merge -- 8 --expect-head ${H8}`]) {
+    assert.equal(d(cmd, none).decision, 'deny', cmd);
+    assert.equal(d(cmd.replaceAll(' 8 ', ' 7 ').replaceAll(H8, H7)).decision, 'deny', `${cmd} (chat, with a record)`);
+  }
+  assert.equal(d(`npm run merge -- 8 --expect-head ${H8}`, none).decision, 'allow'); // (unchanged in a repo without owner_approval: chat)
+  assert.equal(d(`FOO=1 npm run merge -- 7 --expect-head ${H7}`).decision, 'allow'); // (an unrelated variable changes nothing)
   // several templates: any one canonical shape is approvable
   const many = { ...opts('/chat'), ownerGo: { ...ownerGo, mergeTemplates: () => [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: '--expect-head' }, { prefix: ['yarn', 'merge'], shaFlag: '--expect-head' }] } };
   assert.equal(d(`yarn merge 7 --expect-head ${H7}`, many).decision, 'allow');

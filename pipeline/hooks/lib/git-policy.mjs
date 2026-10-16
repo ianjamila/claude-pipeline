@@ -931,7 +931,10 @@ function pmCannotRunScript(words) {
 // moves the target directory is judged as a chat repo whatever the current directory is.
 const pmName = (w) => baseName(String(w ?? '')).replace(/@[^@/]*$/, '').toLowerCase();
 const isPmWord = (w) => Object.hasOwn(PM_RUN_ALIASES, pmName(w));
-const MOVES_DIR = /^(?:--prefix|--cwd|--dir|--workdir|--workspaces?|--filter|--filter-prod|--include-workspace-root|-w|-ws|-C|-F)(?:=.*)?$|^-[CwF]./;
+const MOVES_DIR = /^(?:--prefix|--cwd|--dir|--workdir|--workspaces?|--filter|--filter-prod|--include-workspace-root|--userconfig|--globalconfig|--global|--location|-w|-ws|-C|-F|-g)(?:=.*)?$|^-[CwF]./;
+// (a package-manager setting the line gives — `npm_config_prefix=/chat npm run merge …`, `export npm_config_…`, `env YARN_…` — may move it the same way: npm reads
+// npm_config_* like its options, whatever the case. Fails closed on any such name; the guard's variables hold only what the line sets.)
+const pmSettingOnLine = (ctx) => [...Object.keys(ctx.vars ?? {}), ...(ctx.unsureVars ?? []), ...(ctx.tainted ?? [])].some((k) => /^(?:npm_config_|yarn_|pnpm_|bun_|berry_)/i.test(k));
 function pmScriptRefusal(prefix, shaFlag, raw, dir, ctx) {
   const script = pmScriptOf(prefix);
   const end = raw.indexOf('--');
@@ -941,7 +944,7 @@ function pmScriptRefusal(prefix, shaFlag, raw, dir, ctx) {
   const wrapped = (same || PM_WRAPPERS.has(pmName(raw[0]))) && raw.some((w) => PM_WRAPPERS.has(String(w).toLowerCase())) && raw.some(isPmWord);
   const mayRun = ((same && (before.includes(script) || before.some((w) => DYNAMIC.test(w)))) || (wrapped && raw.includes(script))) && !pmCannotRunScript(raw);
   if (!mayRun) return undefined;
-  const moved = before.some((w) => MOVES_DIR.test(w) || w === 'workspace');
+  const moved = before.some((w) => MOVES_DIR.test(w) || w === 'workspace') || pmSettingOnLine(ctx);
   if (!moved && ownerGoMode(dir, ctx) !== 'chat') return null;
   const canon = `${prefix.join(' ')} <PR>${shaFlag ? ` ${shaFlag} <full 40-character head>` : ''}`;
   return deny(`\`${raw.join(' ').slice(0, 120)}\` may run the merge script \`${script}\`, and ${moved ? 'a manager option moves its target directory, so it is judged as a chat repository' : 'in this repository (owner_approval: chat)'} a merge needs the owner's "merge" for that PR and head. Only the exact form \`${canon}\` is checked against the owner's record (nothing between the script name and \`--\`, no manager options, no wrapper). Use it, or merge through \`P merge --pr N\` (it merges a low-risk PR itself).`);
@@ -960,6 +963,7 @@ function repoMergeCommandVerdict(argv, dir, ctx) {
   // Package-script templates: the canonical shape of any of them is approvable; anything else that may run a template's script is refused.
   const scripts = usable.filter((t) => pmScriptOf(t.prefix));
   for (const { prefix, shaFlag } of scripts) {
+    if (pmSettingOnLine(ctx)) break; // (judged below as a moved target)
     if (raw.length < prefix.length || baseName(raw[0]) !== baseName(prefix[0]) || !prefix.every((w, i) => i === 0 || raw[i] === w)) continue;
     // (npm keeps every option written before `--` for itself: a template without `--` hands the script no option)
     const tail = raw.slice(prefix.length);
@@ -1974,7 +1978,7 @@ function evalString(str, startDir, ctx, level) {
         const v = withPrefixEnv(c, ctx, () => evalString(inner, dir, ctx, level + 1));
         if (v.decision === 'deny') { verdict = v; break; }
       }
-      if (!verdict) verdict = repoMergeCommandVerdict(argv, dir, ctx); // (#58)
+      if (!verdict) verdict = withPrefixEnv(c, ctx, () => repoMergeCommandVerdict(argv, dir, ctx)); // (#58; with its prefix: `npm_config_prefix=/chat npm run merge …`)
       if (!verdict) {
         // a string or program text the parser cannot unwrap (node -e, osascript, make CMD=...) that carries a guarded command
         const why = catchAllReason(argv);
