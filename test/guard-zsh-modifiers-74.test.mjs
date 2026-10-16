@@ -191,3 +191,9 @@ test('#74: a name a sourced file gave, read here with a modifier or subscript', 
   for (const cmd of ['. e1.sh; bash $B:r', 'source e1.sh; bash "$B:r"', 'source e2.sh; bash $B[1,6]']) denyGit(cmd, src);
   for (const cmd of ['. e3.sh; cp x ~/.claude/$B:r', 'source e3.sh; echo x > ~/.claude/$B:r']) denyFiles(cmd, src);
 });
+
+test('#74: a longer name is not read as a shorter one followed by text', () => {
+  denyGit('B=main; git push origin HEAD:$BB:r', SPEC); // ($BB is another name, with a modifier: run time; not `$B` + `B:r`)
+  denyGit('B=main; git push origin HEAD:$BB[1]', SPEC);
+  allowGit('B=agent/x; git push origin HEAD:$B', SPEC);
+});

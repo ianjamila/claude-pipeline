@@ -148,7 +148,8 @@ const flagValues = (flags, longNames, shortNames = '') => flags
 // $NAME / ${NAME} that an earlier command on the same line assigned; anything else is left as written.
 // A value is substituted as written (never expanded again), but a long value used in many words still multiplies, so the
 // text produced is capped per result and per evaluation (substitute throws GuardLimit, which evaluateGitCommand denies).
-// (an unbraced name that zsh would read a modifier or a subscript after is left as written: ZSH_MODIFIED, #74; `${B}:r` is no modifier)
+// (an unbraced name that zsh would read a modifier or a subscript after is left as written: ZSH_MODIFIED, #74; `${B}:r` is no modifier). Defence in depth: collectAssignments already makes a name the line assigns and reads so unsure, so the guard also holds without this lookahead for those; it keeps
+// the text of one reaching expandVars by another way (a value from a sourced file, a script judged alone) from being read as the value.
 const EXPAND_RE = new RegExp(`\\$(?:\\{([A-Za-z_][A-Za-z0-9_]*)\\}|([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_])${ZSH_MODIFIED})`, 'g');
 function expandVars(text, ctx) {
   return substitute(ctx.budget, String(text), EXPAND_RE, (m, a, b) => ctx.vars[a ?? b] ?? m);

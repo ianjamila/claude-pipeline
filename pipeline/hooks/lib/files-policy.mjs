@@ -483,7 +483,8 @@ const mayHoldBackslash = (w, ctx) => w.includes('\\') || Object.values(ctx.keptV
 
 // $NAME / ${NAME} for variables assigned earlier on the same line (D=$HOME/.claude; echo x > $D/settings.json).
 // Values are stored already expanded, and a value used in many words multiplies: the produced text is capped (substitute).
-// (an unbraced name that zsh would read a modifier or a subscript after is left as written: ZSH_MODIFIED, #74; `${B}:r` is no modifier)
+// (an unbraced name that zsh would read a modifier or a subscript after is left as written: ZSH_MODIFIED, #74; `${B}:r` is no modifier). Defence in depth: collectVars already makes a name the line assigns, inherits or sources and reads so unknown (ctx.unknownVars); this keeps the text of one
+// reaching substVars by another way from being read as the value.
 const SUBST_RE = new RegExp(`\\$\\{(\\w+)\\}|\\$(\\w+)(?!\\w)${ZSH_MODIFIED}`, 'g');
 function substVars(text, vars, budget) {
   let t = text;
