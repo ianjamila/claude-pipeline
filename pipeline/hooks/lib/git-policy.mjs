@@ -126,6 +126,15 @@ function parseOpts(args, { longValue = [], shortValue = '', abbrev = false } = {
   return { flags, positionals };
 }
 
+// A boolean long flag's effective setting (the last one wins, as in gh): 'on', 'off' (also when absent) or 'bad' (a value gh would reject).
+function boolFlag(flags, name) {
+  const last = flags.filter((f) => !f.short && f.name === name).at(-1);
+  if (!last) return 'off';
+  if (last.value === null) return 'on';
+  const v = last.value.toLowerCase();
+  return v === '1' || v === 't' || v === 'true' ? 'on' : v === '0' || v === 'f' || v === 'false' ? 'off' : 'bad';
+}
+
 const flagValues = (flags, longNames, shortNames = '') => flags
   .filter((f) => (f.short ? shortNames.includes(f.name) : longNames.includes(f.name)) && f.value !== null)
   .map((f) => f.value);
@@ -850,7 +859,7 @@ const prNumberOf = (w) => {
 function directMergeVerdict(pr, head, dir, ctx, what, elsewhere = false, pinFlag = '--match-head-commit') {
   if (!ctx?.ownerGo) return null;
   if (!elsewhere && ownerGoMode(dir, ctx) !== 'chat') return null;
-  const where = elsewhere ? 'a merge named by -R or a PR URL (its repository may need the owner)' : 'in this repository (owner_approval: chat) a merge';
+  const where = elsewhere ? 'a merge named by -R, a PR URL or GH_REPO (its repository may need the owner)' : 'in this repository (owner_approval: chat) a merge';
   const via = `Merge through \`P merge --pr ${pr ?? 'N'}\` (it merges a low-risk PR itself), or show the request (Head and 🔀 lines) and wait for the owner to type "merge".`;
   if (pr === null) return deny(`${what} without a literal PR number: ${where} needs the owner's "merge" for that PR and head. Name the PR number (run from the repository), or ${via[0].toLowerCase()}${via.slice(1)}`);
   if (!pinFlag) return deny(`${what} #${pr}: ${where} needs the owner's "merge" for the head it lands, and this merge command pins no head. ${via}`);
@@ -862,6 +871,30 @@ function directMergeVerdict(pr, head, dir, ctx, what, elsewhere = false, pinFlag
   if (ok) return null;
   return deny(`${what} #${pr}: ${where} needs the owner's "merge" for #${pr} at head ${head.slice(0, 12)} in this session, and none is recorded. ${via}`);
 }
+// Package-manager spellings of one script: `npm --silent run merge`, `npm run-script merge`, `npm rum merge`, `pnpm merge`, `yarn merge` all run
+// script "merge". canonPm drops the global options (before the subcommand and between `run` and the script) and maps the aliases to
+// `<pm> run <script> …`; an option it does not know is read as a flag without a value. (The value-taking ones it knows are skipped with their value.)
+const PM_RUN_ALIASES = { npm: ['run', 'run-script', 'rum', 'urn'], pnpm: ['run', 'run-script'], yarn: ['run'] };
+const PM_VALUE_OPTS = new Set(['--prefix', '--workspace', '-w', '--userconfig', '--globalconfig', '--cache', '--loglevel', '--registry', '--dir', '-C', '--filter', '-F', '--cwd', '--use-yarnrc', '--tag', '--scope', '--otp', '--script-shell']);
+const PM_COMMANDS = new Set(['install', 'i', 'add', 'remove', 'rm', 'uninstall', 'update', 'up', 'upgrade', 'exec', 'dlx', 'x', 'test', 't', 'start', 'stop', 'restart', 'publish', 'pack', 'link', 'unlink', 'init', 'create', 'audit', 'outdated', 'list', 'ls', 'why', 'info', 'view', 'config', 'cache', 'version', 'help', 'login', 'logout', 'whoami', 'ci', 'rebuild', 'prune', 'dedupe', 'store', 'env', 'patch', 'import', 'fetch', 'run']);
+function canonPm(words) {
+  const pm = baseName(words[0] ?? '');
+  const aliases = PM_RUN_ALIASES[pm];
+  if (!aliases) return words;
+  const skipOpts = (i) => { while (i < words.length && words[i].startsWith('-') && words[i] !== '--') i += PM_VALUE_OPTS.has(words[i]) ? 2 : 1; return i; };
+  let i = skipOpts(1);
+  const sub = (words[i] ?? '').toLowerCase();
+  if (sub === '' || sub === '--') return words;
+  if (aliases.includes(sub)) {
+    i = skipOpts(i + 1);
+    return [words[0], 'run', ...words.slice(i)];
+  }
+  if (pm !== 'npm' && !PM_COMMANDS.has(sub)) return [words[0], 'run', ...words.slice(i)]; // (`yarn merge`, `pnpm merge`: a script)
+  return [words[0], ...words.slice(i)];
+}
+// The script a template runs through a package manager ('' when it is not one).
+const pmScriptOf = (prefix) => { const c = canonPm(prefix); return c.length > 2 && c[1] === 'run' && PM_RUN_ALIASES[baseName(c[0])] ? c[2] : ''; };
+
 // The repo's own merge command (pipeline.yml merge.command, e.g. `npm run merge -- {pr} --expect-head {sha}`) typed by hand. A `gh …`
 // command is judged as gh.
 function repoMergeCommandVerdict(argv, dir, ctx) {
@@ -870,12 +903,20 @@ function repoMergeCommandVerdict(argv, dir, ctx) {
   try {
     templates = ctx.ownerGo.mergeTemplates(dir) ?? [];
   } catch { /* unreadable: this form cannot be recognised (gh merges still fail closed on the mode) */ }
-  const words = argv.map((a) => expandVars(a, ctx));
-  const plain = words.filter((w) => w !== '--');
+  const raw = argv.map((a) => expandVars(a, ctx));
   for (const { prefix, shaFlag } of templates) {
     if (!Array.isArray(prefix) || !prefix.length || baseName(prefix[0]) === 'gh') continue;
-    const p = prefix.filter((w) => w !== '--');
-    if (plain.length < p.length || baseName(plain[0]) !== baseName(p[0]) || !p.slice(1).every((w, i) => plain[i + 1] === w)) continue;
+    const words = canonPm(raw); // (package-manager spellings, normalised)
+    const plain = words.filter((w) => w !== '--');
+    const p = canonPm(prefix).filter((w) => w !== '--');
+    if (plain.length < p.length || baseName(plain[0]) !== baseName(p[0]) || !p.slice(1).every((w, i) => plain[i + 1] === w)) {
+      // An option the matcher does not know may take a value and hide the subcommand: if this is the same package manager and the
+      // script's name still stands as a word before `--`, it could run the merge script, so it is judged as the merge command (no PR, no head).
+      const script = pmScriptOf(prefix);
+      const end = raw.indexOf('--');
+      if (script && baseName(raw[0]) === baseName(prefix[0]) && raw.slice(1, end < 0 ? undefined : end).includes(script)) return directMergeVerdict(null, null, dir, ctx, `\`${prefix.join(' ')}\``, false, shaFlag);
+      continue;
+    }
     let head = null;
     if (shaFlag) {
       // (exactly one head flag: with two, which one the script honours is unknown)
@@ -932,9 +973,14 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
 
   if (group === 'pr' && verb === 'merge') {
     if (rest.some((t) => t === '--admin' || t.startsWith('--admin='))) return deny(`\`gh pr merge --admin\` bypasses the merge gate and is blocked. Use \`--auto\` / the pipeline merge command. ${OWNER_ONLY}`);
-    if (rest.includes('--disable-auto')) return null; // (turns a queued merge off)
     const { flags, positionals } = parseOpts(rest, { longValue: ['author-email', 'body', 'body-file', 'match-head-commit', 'repo', 'subject'], shortValue: 'AbFtR' });
-    const elsewhere = flagValues(flags, ['repo'], 'R').length > 0 || /\/pull\//.test(positionals[0] ?? '');
+    // (a real `--disable-auto` flag whose LAST setting is on, with `--auto` not on, turns a queued merge off and merges nothing. `--disable-auto`
+    // as the value of --subject / --body …, `--disable-auto=false`, or one next to `--auto` is no cancellation: the PR merges)
+    if (boolFlag(flags, 'disable-auto') === 'on' && boolFlag(flags, 'auto') === 'off') return null;
+    // (gh reads the repository from -R, a PR URL or GH_REPO: set on this command, earlier on the line (unknown if it ran) or inherited. An empty GH_REPO selects nothing)
+    const ghRepo = envVar(env, ctx, 'GH_REPO');
+    const viaEnv = !ghRepo.known || (Object.hasOwn(env, 'GH_REPO') ? ghRepo.value !== '' : (ghRepo.value !== undefined && ghRepo.value !== '') || (typeof ctx.env?.GH_REPO === 'string' && ctx.env.GH_REPO !== ''));
+    const elsewhere = flagValues(flags, ['repo'], 'R').length > 0 || /\/pull\//.test(positionals[0] ?? '') || viaEnv;
     // (gh uses the LAST --match-head-commit: a repeated one could pin another head than the one checked, so it pins nothing)
     const pins = flagValues(flags, ['match-head-commit']);
     return directMergeVerdict(prNumberOf(positionals[0]), pins.length === 1 ? pins[0] : null, dir, ctx, '`gh pr merge`', elsewhere);

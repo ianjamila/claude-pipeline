@@ -113,3 +113,61 @@ test('#58 ownerGoWiring: the repository root\'s pipeline.yml in every version at
   assert.throws(() => w.mode(broken));
   assert.equal(w.approvedHead(1, 'a'.repeat(40)), false, 'no record for a made-up session');
 });
+
+// Codex review (#58) finding 1: only a real, effective cancellation skips the check
+test('#58 `gh pr merge --disable-auto` is exempt only when it can only cancel auto-merge', () => {
+  const pin = `--match-head-commit ${H8}`;
+  // (`--disable-auto` here is a flag VALUE, or switched off again, or alongside an enabling flag: the PR would merge)
+  for (const cmd of [`gh pr merge 8 --squash --subject --disable-auto ${pin}`, 'gh pr merge 8 --squash --subject --disable-auto', 'gh pr merge 8 -t --disable-auto',
+    'gh pr merge 8 --body --disable-auto', 'gh pr merge 8 -b --disable-auto', 'gh pr merge 8 --body-file --disable-auto', 'gh pr merge 8 -F --disable-auto',
+    'gh pr merge 8 --author-email --disable-auto', 'gh pr merge 8 -A --disable-auto', 'gh pr merge 8 --match-head-commit --disable-auto',
+    'gh pr merge 8 --squash --disable-auto --disable-auto=false', 'gh pr merge 8 --disable-auto=false', 'gh pr merge 8 --disable-auto=0',
+    'gh pr merge 8 --disable-auto --auto', 'gh pr merge 8 --disable-auto --auto=true', 'gh pr merge 8 --disable-auto=banana', 'gh pr merge 8 -- --disable-auto',
+    'gh pr merge 8 --squash --disable-auto=true --disable-auto=false']) {
+    assert.match(deny(cmd).reason, /gh pr merge/, cmd);
+  }
+  // a real cancellation (the last --disable-auto is on; --auto is not) stays exempt
+  for (const cmd of ['gh pr merge 8 --disable-auto', 'gh pr merge --disable-auto 8', 'gh pr merge 8 --squash --disable-auto', 'gh pr merge 8 --disable-auto=true',
+    'gh pr merge 8 --disable-auto=false --disable-auto', 'gh pr merge 8 --disable-auto --auto=false', 'gh pr merge -R o/chat 8 --disable-auto']) allow(cmd);
+});
+
+// Codex review (#58) finding 2: GH_REPO selects the repository like -R
+test('#58 GH_REPO (command prefix, earlier on the line, or inherited) selects another repository like -R', () => {
+  const pin8 = `--match-head-commit ${H8}`;
+  const pin7 = `--match-head-commit ${H7}`;
+  for (const cmd of [`GH_REPO=o/chat gh pr merge 8 --squash ${pin8}`, `env GH_REPO=o/chat gh pr merge 8 ${pin8}`, `export GH_REPO=o/chat; gh pr merge 8 ${pin8}`,
+    `GH_REPO=o/chat; gh pr merge 8 ${pin8}`, `GH_REPO=o/chat gh pr merge 8 --squash --auto`, `false && export GH_REPO=o/x; gh pr merge 8 ${pin8}`]) {
+    assert.match(deny(cmd, '/other').reason, /named by -R or a PR URL|may need the owner|needs the owner's "merge"|must pin/, cmd);
+  }
+  allow(`GH_REPO=o/chat gh pr merge 7 --squash ${pin7}`, '/other');
+  allow(`export GH_REPO=o/chat; gh pr merge 7 --squash ${pin7}`, '/other');
+  const inherited = (cmd, env) => evaluateGitCommand(cmd, { ...opts('/other'), env });
+  assert.equal(inherited(`gh pr merge 8 --squash ${pin8}`, { GH_REPO: 'o/chat' }).decision, 'deny', 'the hook process\'s own GH_REPO');
+  assert.equal(inherited(`gh pr merge 7 --squash ${pin7}`, { GH_REPO: 'o/chat' }).decision, 'allow');
+  assert.equal(inherited(`gh pr merge 8 --squash ${pin8}`, {}).decision, 'allow', 'no GH_REPO: the directory\'s repository, which is not a chat repo');
+  allow('GH_REPO= gh pr merge 8 --squash', '/other'); // (an empty GH_REPO selects nothing)
+  allow('GH_REPO=o/chat gh pr view 8', '/other');
+});
+
+// Codex review (#58) finding 3: package-manager spellings of the same script
+test('#58 the repo\'s merge script run through another npm / pnpm / yarn spelling is the merge command', () => {
+  const tmpl = [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: '--expect-head' }, { prefix: ['pnpm', 'run', 'merge', '--'], shaFlag: '--expect-head' }, { prefix: ['yarn', 'merge'], shaFlag: '--expect-head' }];
+  const o = { ...opts('/chat'), ownerGo: { ...ownerGo, mergeTemplates: () => tmpl } };
+  const v = (cmd) => evaluateGitCommand(cmd, o);
+  const bad = (cmd) => assert.equal(v(cmd).decision, 'deny', cmd);
+  const ok = (cmd) => assert.equal(v(cmd).decision, 'allow', `${cmd}: ${v(cmd).reason}`);
+  const unpinned = (cmd) => assert.match(v(cmd).reason, /merge/, cmd);
+  for (const pre of ['npm --silent run merge --', 'npm -s run merge --', 'npm run-script merge --', 'npm rum merge --', 'npm urn merge --', 'npm --prefix . run merge --', 'npm --silent --no-color run-script merge --',
+    'npm run --silent merge --', 'npm run --if-present merge --', 'npm run merge --', 'npm -w pkg run merge --', 'pnpm merge --', 'pnpm --silent run merge --', 'pnpm -C . run merge --', 'pnpm run-script merge --', 'yarn merge', 'yarn run merge', 'yarn --silent merge',
+    'npm exec -- npm run merge --', 'NPM_CONFIG_X=1 npm --silent run merge --']) {
+    if (pre.startsWith('npm exec')) continue; // (a wrapper the policy never unwraps: out of scope here)
+    bad(`${pre} 8 --expect-head ${H8}`);
+    unpinned(`${pre} 7`);
+    ok(`${pre} 7 --expect-head ${H7}`);
+  }
+  // another script, or a word that only appears after `--`, is not the merge command
+  for (const cmd of ['npm --silent run build', 'npm run-script merge-report', 'npm --silent run build -- merge', 'npm test', 'npm install merge-deep', 'pnpm build', 'yarn build']) ok(cmd);
+  // an option the matcher does not know may take a value: when the script name still appears, it is judged as the merge command
+  bad(`npm --mystery val run merge -- 8 --expect-head ${H8}`);
+  assert.match(v(`npm --mystery val run merge -- 7 --expect-head ${H7}`).reason, /merge/);
+});
