@@ -34,6 +34,7 @@ test('protectedRoots lists the pipeline files under <home>/.claude in POSIX form
     '/home/u/.claude/agents/arbiter.md',
     '/home/u/.claude/pipeline',
     '/home/u/.claude/settings.json',
+    '/home/u/.claude/pipeline-state/owner-go',
   ]);
   assert.equal(protectedRoots('C:\\Users\\u\\')[0], 'C:/Users/u/.claude/skills/ship');
 });
@@ -873,4 +874,45 @@ test('hook: a script file in the real working directory is read by the hook', (t
   const run = (command) => runHook({ tool_name: 'Bash', tool_input: { command }, cwd: path.join(home, 'proj') }, { home });
   for (const c of ['bash w.sh', './w.sh', 'source w.sh', 'env bash w.sh']) assert.equal(JSON.parse(run(c).stdout).hookSpecificOutput.permissionDecision, 'deny', c);
   assert.equal(run('bash ok.sh').stdout, '');
+});
+
+// ---- #58: the owner-go records and recorder ---------------------------------------------------------------------------
+test('#58 owner-go: the records folder is protected from every write; reading it and the other pipeline-state folders stay open', () => {
+  const R = '/home/u/.claude/pipeline-state/owner-go';
+  assert.equal(file('Write', { file_path: `${R}/s.jsonl`, content: '{}' }), 'deny');
+  assert.equal(file('Edit', { file_path: `${R}/s.jsonl`, old_string: 'a', new_string: 'b' }), 'deny');
+  for (const cmd of [
+    `echo '{}' >> ${R}/s.jsonl`,
+    `cp /tmp/x.jsonl ${R}/s.jsonl`,
+    `rm -rf ${R}`,
+    'rm -rf ~/.claude/pipeline-state', // (the folder that holds it)
+    'mv ~/.claude/pipeline-state /tmp/old',
+    `ln -s /tmp/mine ${R}`,
+    `tee -a ${R}/s.jsonl < /tmp/x`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [
+    `ls -la ${R}`,
+    `cat ${R}/s.jsonl`,
+    'rm -rf ~/.claude/pipeline-state/locks/x.lock',
+    'cat ~/.claude/pipeline-state/guard-log.jsonl',
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+test('#58 owner-go: running the recorder by hand (installed or a source copy) is refused; reading or committing it is not', () => {
+  for (const cmd of [
+    `echo '{"prompt":"merge"}' | node /home/u/.claude/pipeline/hooks/owner-go.mjs`,
+    'node ~/.claude/pipeline/hooks/owner-go.mjs < /tmp/in.json',
+    `node ${CHECKOUT}/pipeline/hooks/owner-go.mjs < /tmp/in.json`,
+    'node pipeline/hooks/owner-go.mjs < /tmp/in.json',
+    'bun ./pipeline/hooks/owner-go.mjs',
+    './pipeline/hooks/owner-go.mjs < /tmp/in.json',
+    `node -e "import('./pipeline/hooks/lib/owner-go.mjs').then((m) => m.recordApproval({}))"`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [
+    'cat pipeline/hooks/owner-go.mjs',
+    'git add pipeline/hooks/owner-go.mjs pipeline/hooks/lib/owner-go.mjs',
+    'git diff -- pipeline/hooks/lib/owner-go.mjs',
+    'node --test test/owner-go.test.mjs',
+    'node /home/u/.claude/pipeline/hooks/session-version.mjs', // (the other installed hooks keep their read-only standing)
+  ]) assert.equal(bash(cmd), 'allow', cmd);
 });

@@ -799,7 +799,10 @@ const BYPASS_DENY = [
   ['gh api -X PATCH repos/o/r/branches/main%2Fx/protection -f a=b'],
   ['gh issue close 5 7', { labelsByNum: { 7: ['pipeline-pause'] } }],
   ['gh issue close 5 7', { labelsByNum: { 5: ['pipeline-rollback'] } }],
-  ['for n in 5; do gh issue close $n; done'],
+  // (#56: a loop variable takes each word of its list: each issue it names is looked up; one only known at run time is refused)
+  ['for n in 5 7; do gh issue close $n; done', { labelsByNum: { 7: ['pipeline-pause'] } }],
+  ['for n in $(gh issue list -q .[].number --json number); do gh issue close $n; done'],
+  ['for n in 5 $M; do gh issue close $n; done'],
   ['gh issue close $(gh issue list -l pipeline-pause -q ".[0].number" --json number)'],
   ['gh issue close "$N"'],
   ['gh issue list --json number -q ".[].number" | while read n; do gh issue close $n; done'],
@@ -1607,11 +1610,16 @@ test('a line that passes an unsure variable to something that runs code or picks
     'F=a; F=b; bash -c "echo $F"',
     // assigned where it may not run, then handed to something that runs code or picks the repository
     'false && X=agent/x; git push origin $X',
-    'true || X=a; bash $X',
+    // (#56: one assignment that may not run is judged both ways (it ran: the script it names; it did not: an unknown value), so these name the bad script)
+    'true || X=run.sh; bash $X',
     'cd /work/repo && X=agent/x && git push origin $X',
-    'if true; then X=a; fi; bash $X',
-    'for i in 1 2; do X=$i; done; node $X',
-    'while true; do X=a; done; python $X',
+    'if true; then X=run.sh; fi; bash $X',
+    'for i in 1 run.sh; do X=$i; done; bash $X',
+    'while true; do X=run.sh; done; bash $X',
+    // (#56: a loop variable takes every word of its list; it was read as a value from the environment)
+    'for f in run.sh; do bash $f; done',
+    'for f in x run; do sh $f.sh; done',
+    'for i in 1 2; do X=$i; done; node $X; for j in run.sh; do Y=$j; done; bash $Y',
     'case a in a) X=1;; esac; source $X',
     '(X=a); cd $X; git push', // (PR A2 S7: an unsure cd leaves the directory unknown, as `cd "$(cmd)"` does; what needs it is refused: guard-a2-shell-s7.test.mjs)
     'echo $(X=a); sh $X',
@@ -1654,6 +1662,12 @@ test('a line that passes an unsure variable to something that runs code or picks
     'B=$B; B=x; true',
     'A=a; A=b; echo hi > $A',
     'if true; then X=a; fi; echo $X',
+    // (#56: the same shapes with values that name nothing harmful: every reading is clean)
+    'true || X=a; bash $X',
+    'if true; then X=a; fi; bash $X',
+    'for i in 1 2; do X=$i; done; node $X',
+    'while true; do X=a; done; python $X',
+    'for f in a b; do bash $f; done',
     'for i in 1 2; do X=$i; done; echo $X',
     'X=a | cat; echo $X',
     'for i in $(seq 1 55); do s=$(gh pr view 15 --json x --jq y); n=$(echo "$s" | grep -c Z); [ "$n" -ge 2 ] && break; sleep 10; done',

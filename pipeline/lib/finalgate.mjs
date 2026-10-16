@@ -7,6 +7,7 @@
 // The evidence is bound to the head in three independent ways: git.head (the report is for this commit),
 // git.tree (nothing changed in the working tree since verify ran) and contentHash (the review covered exactly
 // this patch). Each one defeats a different mistake, so none is redundant.
+import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { gh as ghRun } from './proc.mjs';
@@ -22,6 +23,7 @@ import { parseYaml } from './yaml.mjs';
 import { ownerRuledItems, reviewValidFor } from './triage.mjs';
 import { skipOf } from './verify-steps.mjs';
 import { commitTime, diffFiles, headSha, mergeBase, revParse, reviewBaseRef, reviewContentHash, treeFingerprint } from './git.mjs';
+import { ownerItemsDigest } from '../hooks/lib/owner-go.mjs';
 
 export const GATE_FILE = 'final-gate.json';
 export const BLOCKING_LABELS = Object.freeze(['needs-human', 'awaiting-review', 'pipeline-blocked']);
@@ -54,8 +56,11 @@ const MAX_LINE = 400;
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const short = (sha) => (typeof sha === 'string' && sha ? sha.slice(0, 8) : String(sha));
-// ownerMerge (owner_approval: chat): how many items of this check the owner merges in chat; only present when > 0.
-const check = (name, ok, detail, ownerMerge = 0) => ({ name, ok: ok === true, detail, ...(ownerMerge > 0 ? { ownerMerge } : {}) });
+// ownerMerge (owner_approval: chat): how many items of this check the owner merges in chat; only present when > 0. ownerItems: one
+// line per item (kind, rule or id, file), folded into the gate's ownerItems digest, which the owner's "merge" is bound to (#58).
+const check = (name, ok, detail, ownerMerge = 0, ownerItems = []) => ({
+  name, ok: ok === true, detail, ...(ownerMerge > 0 ? { ownerMerge } : {}), ...(ownerItems.length > 0 ? { ownerItems } : {}),
+});
 
 // ---- review-dir files ---------------------------------------------------------------------------
 
@@ -309,12 +314,13 @@ async function hardstopsCheck({ root, config, diff }) {
   if (hits.length === 0) return check('hardstops', true, 'no hard-stops');
   // Report-only (advisory) hits are listed, never failing: only blocking hits stop the merge.
   const blocking = blockingHits(hits);
-  const chat = ownerMergeHits(hits).length;
+  const chatHits = ownerMergeHits(hits);
+  const chat = chatHits.length;
   const advisoryCount = hits.length - blocking.length - chat;
   if (blocking.length === 0) {
     if (chat === 0) return check('hardstops', true, `no blocking hard-stops (${advisoryCount} report-only)`);
     // owner_approval: chat: nothing blocks, but the owner must say "merge" for these.
-    return check('hardstops', true, `no blocking hard-stops (${chat} owner-merge, ${advisoryCount} report-only)`, chat);
+    return check('hardstops', true, `no blocking hard-stops (${chat} owner-merge, ${advisoryCount} report-only)`, chat, chatHits.map((h) => `hardstop ${h.rule} ${h.file ?? ''}`.trim()));
   }
   const shown = blocking.slice(0, 5).map((h) => `${h.rule} ${h.file ?? ''}`.trim()).join('; ');
   const note = advisoryCount > 0 ? ` (+${advisoryCount} report-only)` : '';
@@ -328,7 +334,9 @@ function integrityCheck({ config, diff }) {
   const r = checkIntegrity({ files: d.files, config, labels: [] });
   if (r.ok) {
     const chat = r.ownerMerge?.length ?? 0;
-    return chat > 0 ? check('integrity', true, `${chat} owner-merge test-integrity violation(s)`, chat) : check('integrity', true, 'no test weakening');
+    return chat > 0
+      ? check('integrity', true, `${chat} owner-merge test-integrity violation(s)`, chat, r.ownerMerge.map((v) => `integrity ${v.rule ?? v.type ?? 'violation'} ${v.file ?? ''}`.trim()))
+      : check('integrity', true, 'no test weakening');
   }
   const shown = r.violations.slice(0, 5).map((v) => `${v.rule ?? v.type ?? 'violation'} ${v.file ?? ''}`.trim()).join('; ');
   return check('integrity', false, `${r.violations.length} test-integrity violation(s): ${shown}`);
@@ -355,7 +363,8 @@ function reviewCheck({ root, config, pr, diff, hash, hashError }) {
   const ruled = ownerRuledItems(state);
   if (ruled.length > 0) {
     const shown = ruled.slice(0, OWNER_RULED_SHOWN).map((i) => `${i.id} "${clip(String(i.final.ownerQuote).replace(/\s+/g, ' ').trim(), OWNER_QUOTE_SHOWN)}"`).join('; ');
-    return check('review', true, `review valid for content ${short(hash)}; ${ruled.length} owner-ruled item(s), owner-merge: ${shown}${ruled.length > OWNER_RULED_SHOWN ? '; ...' : ''}`, ruled.length);
+    return check('review', true, `review valid for content ${short(hash)}; ${ruled.length} owner-ruled item(s), owner-merge: ${shown}${ruled.length > OWNER_RULED_SHOWN ? '; ...' : ''}`, ruled.length,
+      ruled.map((i) => `review ${i.id} ${createHash('sha256').update(String(i.final.ownerQuote)).digest('hex').slice(0, 12)}`));
   }
   return check('review', true, `review valid for content ${short(hash)}`);
 }
@@ -523,6 +532,9 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
     checks,
     // owner_approval: chat: items the owner merges in chat (0 = none, merge as usual). The ship skill reads this.
     ownerMerge: checks.reduce((n, c) => n + (c.ownerMerge ?? 0), 0),
+    // #58: the owner-item set as one digest ('none' without items). The owner's "merge" is recorded against it, and P merge needs the
+    // live gate to show the same set: an item added or swapped after the owner said "merge" (same head) needs a new "merge".
+    ownerItems: ownerItemsDigest(checks.flatMap((c) => c.ownerItems ?? [])),
     failed: checks.filter((c) => !c.ok).map((c) => c.name),
     at: new Date().toISOString(),
   };

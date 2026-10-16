@@ -4,6 +4,7 @@
 // pass `now` and `host`).
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { MARKERS, clip, line } from './render.mjs';
+import { addCostEntry, addRetries, addSessions, costLines, costShapeProblem, setGuardBlocks } from './run-cost.mjs';
 
 export const RECORD_VERSION = 1;
 
@@ -128,7 +129,8 @@ function shapeProblem(r) {
   if (!r.history.every(isPlainObject)) return 'bad history entry';
   if (r.inFlight != null && !isPlainObject(r.inFlight)) return 'bad inFlight';
   if (r.heartbeat != null && !isPlainObject(r.heartbeat)) return 'bad heartbeat';
-  return null;
+  // `cost` is optional: a record from before cost attribution has none.
+  return costShapeProblem(r.cost);
 }
 
 // Never throws. `body` is a comment body the caller already knows is viewer-authored. Only a body that STARTS with the
@@ -185,7 +187,7 @@ function normaliseInFlight(v) {
 
 // Returns a NEW record. `patch` keys (all optional): step, outcome, next, detail, head, request, tasks (the full list,
 // done kept for ids it omits `done` for), done (ids to mark done), verify, round, mergeSha, inFlight (object | null),
-// agentLogLine, cliVersion, resumed ({at, host, head}: a run taken over by `ship resume`; set once, never cleared). Every call stamps the heartbeat and appends a history entry (capped, oldest dropped).
+// agentLogLine, cliVersion, cost ({entry: {phase, role, input, output, cacheRead, cacheWrite, usd}, retries: n to add, sessions: [ids], guardBlocks: n | null, guardBySession: {id: n}; see run-cost.mjs), resumed ({at, host, head}: a run taken over by `ship resume`; set once, never cleared). Every call stamps the heartbeat and appends a history entry (capped, oldest dropped).
 export function applyCheckpoint(record, patch, { host, now }) {
   const next = structuredClone(record);
   if (patch.step !== undefined) {
@@ -217,6 +219,15 @@ export function applyCheckpoint(record, patch, { host, now }) {
   if (patch.inFlight !== undefined) next.inFlight = normaliseInFlight(patch.inFlight);
   if (patch.agentLogLine !== undefined) next.agentLogLine = patch.agentLogLine;
   if (patch.cliVersion !== undefined) next.cliVersion = patch.cliVersion;
+  if (patch.cost != null) {
+    if (!isPlainObject(patch.cost)) throw new Error('cost must be an object');
+    let cost = next.cost;
+    if (patch.cost.entry !== undefined) cost = addCostEntry(cost, patch.cost.entry);
+    if (patch.cost.retries !== undefined) cost = addRetries(cost, patch.cost.retries);
+    if (patch.cost.sessions !== undefined) cost = addSessions(cost, patch.cost.sessions);
+    if (patch.cost.guardBlocks !== undefined) cost = setGuardBlocks(cost, patch.cost.guardBlocks, patch.cost.guardBySession);
+    next.cost = cost;
+  }
   // A resumed record stays resumed: `null` / absent never clears it (only a record made fresh can lack it).
   if (patch.resumed != null) {
     if (!isPlainObject(patch.resumed)) throw new Error('resumed must be {at, host, head}');
@@ -232,7 +243,7 @@ export function applyCheckpoint(record, patch, { host, now }) {
 // The record to write when `P summary` / `P comment --kind summary` ends a run. An existing record is kept (and updated)
 // when it belongs to this PR; otherwise a fresh one is made from what the caller knows. An outcome that is not in
 // OUTCOMES is still shown in the comment, but never enters the record: it only adds a warning.
-export function recordForOutcome(existing, { repo, pr, branch, baseRef, head, outcome, detail, agentLogLine, host, now }) {
+export function recordForOutcome(existing, { repo, pr, branch, baseRef, head, outcome, detail, agentLogLine, host, now, sessions, guardBlocks, guardBySession }) {
   const warnings = [];
   let base = existing;
   if (base) {
@@ -246,6 +257,8 @@ export function recordForOutcome(existing, { repo, pr, branch, baseRef, head, ou
   const patch = {};
   if (head) patch.head = head;
   if (agentLogLine !== undefined) patch.agentLogLine = agentLogLine;
+  // Sessions named now join the ones already recorded; `guardBlocks` / `guardBySession` (counted by the caller from the guard log) replace the old counts.
+  if (sessions?.length || guardBlocks !== undefined) patch.cost = { ...(sessions?.length ? { sessions } : {}), ...(guardBlocks !== undefined ? { guardBlocks, ...(guardBySession !== undefined ? { guardBySession } : {}) } : {}) };
   if (OUTCOMES.includes(outcome)) {
     patch.outcome = outcome;
     patch.step = OUTCOME_STEP[outcome];
@@ -275,6 +288,7 @@ export function renderStatusBlock(record) {
     `- **Head:** ${head} · **Round:** ${line(r.round ?? 0)}${total ? ` · **Tasks:** ${done}/${total} done` : ''}`,
   ];
   if (f) out.push(`- **In flight:** ${line(f.kind)} on ${line(f.host)} since ${line(f.startedAt)}${f.maxMinutes ? ` (max ${line(f.maxMinutes)} min)` : ''}`);
+  out.push(...costLines(r.cost));
   if (r.detail) out.push(`- **Detail:** ${line(r.detail, LIMITS.text)}`);
   out.push(
     `- **Host:** ${r.heartbeat?.host ? line(r.heartbeat.host) : '—'} · **Heartbeat:** ${r.heartbeat?.at ? line(r.heartbeat.at) : '—'}`,
