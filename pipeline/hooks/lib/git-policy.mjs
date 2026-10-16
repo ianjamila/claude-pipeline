@@ -2176,6 +2176,8 @@ function judgeReadings(str, startDir, ctx, level, names, saved) {
   const outer = [ctx.pins, ctx.pinsLevel];
   let dirty = false;
   let envDirty = false;
+  const moved = new Set(); // (directories whose branch some reading left different from the start; alias keys likewise: see below)
+  const redefined = new Set();
   try {
     for (let r = 0; r < total; r++) {
       checkDeadline(ctx.budget);
@@ -2193,21 +2195,24 @@ function judgeReadings(str, startDir, ctx, level, names, saved) {
       if (v.decision === 'deny') return v;
       dirty ||= ctx.cfgDirty;
       envDirty ||= ctx.envCfgDirty;
-    }
-    if (level > 0 && total > 1) {
-      // (config is only ever set; a branch or alias that differs from the state the script started with may or may not have changed)
-      // (defensive: the layer is the refusal of an unsure name at a git command, above)
-      ctx.cfgDirty = dirty;
-      ctx.envCfgDirty = envDirty;
+      // (t4 state-union, security review: the end state of EVERY reading is compared with the start, not only the last one's: a branch or alias an earlier reading changed
+      // and the last did not would stay known. The readings are alternatives, so whatever any of them changed is unknown afterwards.)
       for (const d of new Set([...saved.branches.keys(), ...ctx.branches.keys()])) {
         const a = saved.branches.get(d);
         const b = ctx.branches.get(d);
-        if (a?.name !== b?.name || a?.trackMain !== b?.trackMain) ctx.branches.set(d, { name: null, trackMain: false });
+        if (a?.name !== b?.name || a?.trackMain !== b?.trackMain) moved.add(d);
       }
       for (const [kind, now] of [['git', ctx.gitAliases], ['gh', ctx.ghAliases]]) {
         const was = saved[kind === 'git' ? 'gitAliases' : 'ghAliases'];
-        for (const n of new Set([...Object.keys(was), ...Object.keys(now)])) if (was[n] !== now[n]) ctx.aliasUnsure.add(`${kind}:${n}`);
+        for (const n of new Set([...Object.keys(was), ...Object.keys(now)])) if (was[n] !== now[n]) redefined.add(`${kind}:${n}`);
       }
+    }
+    if (level > 0 && total > 1) {
+      // (config is only ever set; a branch or alias that differs from the state the script started with, in any reading, may or may not have changed)
+      ctx.cfgDirty = dirty;
+      ctx.envCfgDirty = envDirty;
+      for (const d of moved) ctx.branches.set(d, { name: null, trackMain: false });
+      for (const a of redefined) ctx.aliasUnsure.add(a);
     }
     return allowed();
   } finally {
