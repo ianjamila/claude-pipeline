@@ -134,6 +134,11 @@ test('t5 twins: the cap still bites on one name and on the sum, names that meet 
   denyGit(`for a in ${words(8)}; do echo $a; done; for b in ${words(8, 'v')}; do echo $b; done; for c in ok.sh run.sh; do bash $c; done`, SPEC);
   // a write may be the script a later command runs (the file's name and text are built from the names)
   denyGit(`for a in ${words(10)}; do echo $a > f$a.sh; done; for b in ${words(10, 'v')}; do echo $b; done; for c in ${words(2, 'q')}; do bash f$c.sh; done`, SPEC);
+  // a script that reads TWO of the line's names (the only bad pair is a=r, b=un.sh, which the first values of each never give): the line keeps the product
+  const PAIR = { ...SPEC, 's.sh': 'bash $a$b\n' };
+  const two = `for a in x r ${words(10)}; do ps -p $a; done; for b in y un.sh ${words(10, 'v')}; do ps -p $b; done`;
+  allowGit(two, PAIR); // (without the script the two groups are counted by sum: 12 + 12 readings)
+  denyGit(`${two}; bash s.sh`, PAIR);
   // a 3-deep count over the cap whose names meet at the innermost command
   denyGit(`for a in ${words(5)}; do for b in ${words(9)}; do for c in x y z; do ps -p $a$b$c; done; done; done`, SPEC);
 });
