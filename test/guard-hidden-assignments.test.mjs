@@ -254,3 +254,11 @@ test('a chain with a few readings is still allowed', () => {
   assert.equal(files('bash F1.sh', fakeFs(PROJ, chain(false, 3, 'w1 w2 w3 w4 w5 w6 w7 w8'))).decision, 'allow'); // (once-assigned names: only the 8 words of each level)
   assert.equal(git('bash F1.sh', fakeFs(GIT_ROOT, chain(false, 3, 'w1 w2 w3 w4 w5 w6 w7 w8'))).decision, 'allow');
 });
+test('loop words alone (names assigned once) also share the allowance across nested scripts', () => {
+  const words = Array.from({ length: 20 }, (_, i) => `w${i + 1}`).join(' '); // (20 + 20^2 + 20^3 readings)
+  const t0 = Date.now();
+  const r = files('bash F1.sh', fakeFs(PROJ, chain(false, 3, words)));
+  assert.equal(r.decision, 'deny');
+  assert.match(r.reason, /too many readings/, r.reason);
+  assert.ok(Date.now() - t0 < 3000, `took ${Date.now() - t0} ms`);
+});

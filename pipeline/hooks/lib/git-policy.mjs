@@ -2079,7 +2079,7 @@ function onceAssignedNames(cmds, ctx, str) {
       if (c.argv.slice(1).some((w) => DYNAMIC.test(w))) return [];
     }
   }
-  const ar = arithAssignedNames(str, cmds); // (an arithmetic can assign a name the text scan below does not show: a double-quoted `"${a[n=7]}"` is blanked there)
+  const ar = arithAssignedNames(str, cmds); // (an arithmetic can assign a name the text scan below does not show. Defence in depth for the skip of ar.names and ar.dynamic below: the mention scan already refuses a name whose assignment it sees, and collectAssignments made the names unsure)
   if (ar.dynamic) return [];
   const spans = /<</.test(str) ? cmds.heredocSpans : [];
   if (!Array.isArray(spans)) return [];
