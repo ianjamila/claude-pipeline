@@ -131,67 +131,118 @@ export function assigningDefaults(text) {
 //   - `${F/pat/rep}` `${F//pat/rep}` `${F#p}` `${F##p}` `${F%p}` `${F%%p}` `${F^^}` `${F,,}` `${F:o:n}` on a name the text gives literal words: worked out for each (a glob `*` `?` in a pattern too). A name nothing here
 //     gives is the environment's (left out as above); any other operator on a name the text does give makes the word unknown (`$(?)`: readingsOf refuses it).
 const UNKNOWN_WORD = '$(?)';
+// Every limit keeps the scan linear-ish and short: a hook past its deadline is ALLOWED by the host, and a regular expression cannot be interrupted. No regular expression here matches a glob; the
+// matcher below counts its steps against one allowance per call, and a pattern, value or line over a cap gives UNKNOWN_WORD (refused when the name is used as a script), never a guess.
 const MAX_ASSIGN_WORDS = 32;
-const globRe = (p) => {
-  let src = '';
-  for (const ch of p) src += ch === '*' ? '.*' : ch === '?' ? '.' : ch.replace(/[.+^$(){}|\\\[\]]/g, '\\$&');
-  return new RegExp(`^(?:${src})$`, 's');
-};
-function applyOp(v, op, arg) {
+const MAX_ASSIGN_ENTRIES = 256;
+const MAX_VALUE_CHARS = 1024; // one assigned word, scanned
+const MAX_OP_VALUE = 512; // a value an operator is applied to
+const MAX_PATTERN = 64;
+const MAX_STARS = 8;
+const MAX_GLOB_TICKS = 200_000;
+class Over extends Error {}
+// whole-string glob match with `*` and `?` (a linear two-pointer walk with the star backtrack: O(pattern x value)); every step is counted
+function globMatch(p, s, work) {
+  let pi = 0;
+  let si = 0;
+  let star = -1;
+  let mark = 0;
+  while (si < s.length) {
+    if (++work.n > MAX_GLOB_TICKS) throw new Over();
+    if (pi < p.length && p[pi] === '*') { star = pi++; mark = si; }
+    else if (pi < p.length && (p[pi] === '?' || p[pi] === s[si])) { pi++; si++; }
+    else if (star >= 0) { pi = star + 1; si = ++mark; }
+    else return false;
+  }
+  while (pi < p.length && p[pi] === '*') pi++;
+  return pi === p.length;
+}
+// the value with the operator applied, or undefined (not worked out: the caller makes the word unknown)
+function applyOp(v, op, arg, work) {
+  if (v.length > MAX_OP_VALUE) return undefined;
   if (op === '^^') return v.toUpperCase();
   if (op === ',,') return v.toLowerCase();
   if (op === '^') return v.slice(0, 1).toUpperCase() + v.slice(1);
   if (op === ',') return v.slice(0, 1).toLowerCase() + v.slice(1);
   if (op === ':') {
-    const m = /^\s*(-?\d+)(?::(\d+))?$/.exec(arg);
+    const m = /^\s{0,8}(-?\d{1,6})(?::(\d{1,6}))?$/.exec(arg);
     if (!m) return undefined;
     const off = +m[1] < 0 ? Math.max(0, v.length + +m[1]) : +m[1];
     return m[2] === undefined ? v.slice(off) : v.slice(off, off + +m[2]);
   }
-  if (/\[/.test(arg)) return undefined; // (a bracket class: not worked out)
-  if (op === '#' || op === '##' || op === '%' || op === '%%') {
-    const re = globRe(arg);
-    const idx = [...Array(v.length + 1).keys()];
-    if (op === '#' || op === '##') { for (const i of op === '#' ? idx : idx.reverse()) if (re.test(v.slice(0, i))) return v.slice(i); return v; }
-    for (const i of op === '%%' ? idx : idx.reverse()) if (re.test(v.slice(i))) return v.slice(0, i);
-    return v;
-  }
-  if (op === '/' || op === '//') {
-    const cut = arg.indexOf('/');
-    let pat = cut < 0 ? arg : arg.slice(0, cut);
-    const rep = cut < 0 ? '' : arg.slice(cut + 1);
-    if (pat === '' || /^[#%]/.test(pat) || rep.includes('&') || rep.includes('\\')) return undefined;
-    const re = new RegExp(globRe(pat).source.slice(4, -2), op === '//' ? 'gs' : 's');
-    return v.replace(re, () => rep);
-  }
+  const cut = op === '/' || op === '//' ? arg.indexOf('/') : -1;
+  const pat = cut < 0 ? arg : arg.slice(0, cut);
+  if (pat.length > MAX_PATTERN || /[[\\]/.test(pat) || pat.split('*').length - 1 > MAX_STARS) return undefined;
+  try {
+    if (op === '#' || op === '##' || op === '%' || op === '%%') {
+      const idx = [...Array(v.length + 1).keys()];
+      if (op === '#' || op === '##') { for (const i of op === '#' ? idx : idx.reverse()) if (globMatch(pat, v.slice(0, i), work)) return v.slice(i); return v; }
+      for (const i of op === '%%' ? idx : idx.reverse()) if (globMatch(pat, v.slice(i), work)) return v.slice(0, i);
+      return v;
+    }
+    if (op === '/' || op === '//') {
+      const rep = cut < 0 ? '' : arg.slice(cut + 1);
+      if (pat === '' || /^[#%]/.test(pat) || /[&\\]/.test(rep)) return undefined;
+      let out = '';
+      let i = 0;
+      while (i < v.length) {
+        let hit = -1;
+        for (let j = v.length; j > i; j--) if (globMatch(pat, v.slice(i, j), work)) { hit = j; break; } // (the longest match at this place)
+        if (hit < 0) { out += v[i++]; continue; }
+        out += rep;
+        i = hit;
+        if (op === '/') { out += v.slice(i); i = v.length; }
+      }
+      return out;
+    }
+  } catch (e) { if (e instanceof Over) return undefined; throw e; }
   return undefined;
 }
-// the end of the `${ … }` that opens at s[i] (the index of its `}`), or -1
+// the index of the `}` that closes the `${` whose `{` is at s[i], or -1 when the text between holds anything the scan cannot follow exactly (a quote, a backslash, a backtick, `$(`, `$'`)
+// or the brace never closes: the caller then makes the word unknown
 function closeBrace(s, i) {
   let depth = 1;
-  for (let j = i + 1; j < s.length; j++) { if (s[j] === '{') depth++; else if (s[j] === '}') { if (--depth === 0) return j; } }
+  for (let j = i + 1; j < s.length && j < i + MAX_VALUE_CHARS; j++) {
+    const c = s[j];
+    if (c === "'" || c === '"' || c === '\\' || c === '`' || (c === '$' && (s[j + 1] === '(' || s[j + 1] === "'"))) return -1;
+    if (c === '{') depth++;
+    else if (c === '}' && --depth === 0) return j;
+  }
   return -1;
 }
-// one word of the value at s[i...]: quotes removed, up to an unquoted blank or `;&|<>` (and `)` inside an array); [word, index after it]
+// one word of the value at s[i...], quotes removed exactly as the shell does for what it follows (single quotes, double quotes without expansions the scan cannot follow, concatenations),
+// up to an unquoted blank or `;&|<>` (and `)` inside an array): [word, index after it]; word null when the word holds anything else (a backslash, `$'`, a backtick, `$(`, a brace or quote
+// it cannot follow, more than MAX_VALUE_CHARS). A `${…}` is kept as written, its text free of quotes (closeBrace).
 function valueWord(s, i, inArray) {
   let w = '';
-  for (; i < s.length; i++) {
+  const stop = Math.min(s.length, i + MAX_VALUE_CHARS);
+  for (; i < stop; i++) {
     const c = s[i];
-    if (/\s/.test(c) || ';&|<>'.includes(c) || (c === ')' && inArray) || (c === '(' && !inArray)) break;
-    if (c === '\\') { w += s[i + 1] ?? ''; i++; continue; }
-    if (c === "'") { const j = s.indexOf("'", i + 1); if (j < 0) return [w + s.slice(i + 1), s.length]; w += s.slice(i + 1, j); i = j; continue; }
-    if (c === '"') { let j = i + 1; while (j < s.length && s[j] !== '"') j += s[j] === '\\' ? 2 : 1; w += s.slice(i + 1, j); i = j; continue; }
-    if (c === '$' && s[i + 1] === '{') { const j = closeBrace(s, i + 1); if (j < 0) { w += s.slice(i); return [w, s.length]; } w += s.slice(i, j + 1); i = j; continue; }
+    if (/\s/.test(c) || ';&|<>'.includes(c) || (c === ')' && inArray) || (c === '(' && !inArray)) return [w, i];
+    if (c === '\\' || c === '`' || (c === '$' && (s[i + 1] === '(' || s[i + 1] === "'"))) return [null, i];
+    if (c === "'") { const j = s.indexOf("'", i + 1); if (j < 0 || j >= stop) return [null, i]; w += s.slice(i + 1, j); i = j; continue; }
+    if (c === '"') {
+      for (i++; i < stop && s[i] !== '"'; i++) {
+        const d = s[i];
+        if (d === '\\' || d === '`' || (d === '$' && (s[i + 1] === '(' || s[i + 1] === "'"))) return [null, i];
+        if (d === '$' && s[i + 1] === '{') { const j = closeBrace(s, i + 1); if (j < 0) return [null, i]; w += s.slice(i, j + 1); i = j; continue; }
+        w += d;
+      }
+      if (i >= stop) return [null, i];
+      continue;
+    }
+    if (c === '$' && s[i + 1] === '{') { const j = closeBrace(s, i + 1); if (j < 0) return [null, i]; w += s.slice(i, j + 1); i = j; continue; }
     w += c;
   }
-  return [w, i];
+  return i >= s.length ? [w, i] : [null, i];
 }
-const ASSIGN_AT = /(?<![\w$.\/-])([A-Za-z_]\w*)(?:\[([^\]\n]*)\])?(\+?)=/g;
+const ASSIGN_AT = /(?<![\w$.\/-])([A-Za-z_]\w{0,63})(?:\[([^\]\n]{0,64})\])?(\+?)=/g;
 function assignedValues(text) {
-  // cheap test first: a value with an expansion that has an operator, an array, or an element assignment
-  if (!/=\(|\]\+?=|=[^\s;&|]*\$\{[^}]*[-=+:/#%^,]/.test(text) || text.length > 200_000) return new Map();
-  const found = []; // { name, array, words[], op }
-  for (const m of text.slice(0, 200_000).matchAll(ASSIGN_AT)) {
+  // cheap, linear test first: an expansion, an array or an element assignment
+  if (text.length > 200_000 || !(text.includes('${') || text.includes('=(') || /\]\+?=/.test(text))) return new Map();
+  const found = []; // { name, array, words[] } (a word null: unknown)
+  for (const m of text.matchAll(ASSIGN_AT)) {
+    if (found.length >= MAX_ASSIGN_ENTRIES) break; // (the names past the cap are not followed: no looser than a line without this reading)
     let i = m.index + m[0].length;
     if (m[2] === undefined && text[i] === '(') {
       const words = [];
@@ -200,54 +251,60 @@ function assignedValues(text) {
         while (i < text.length && /\s/.test(text[i])) i++;
         if (i >= text.length || text[i] === ')') break;
         let [w, j] = valueWord(text, i, true);
-        if (j === i) break;
-        w = w.replace(/^\[[^\]]*\]=/, '');
+        if (j === i && w === '') break;
+        if (w !== null) w = w.replace(/^\[[^\]]{0,64}\]=/, '');
         words.push(w);
+        if (w === null) break;
         i = j;
       }
       found.push({ name: m[1], array: true, words });
     } else {
       const [w] = valueWord(text, i, false);
-      found.push({ name: m[1], array: m[2] !== undefined, words: [w], sub: m[2] !== undefined });
+      // a word the scan could not follow is unknown when it holds an expansion it was meant to work out (the rest are values this reading never covered)
+      if (w === null && !text.slice(i, i + 256).includes('${')) continue;
+      found.push({ name: m[1], array: m[2] !== undefined, words: [w] });
     }
   }
-  if (!found.some((x) => x.array || /\$\{/.test(x.words[0] ?? ''))) return new Map();
+  if (!found.some((x) => x.array || x.words.some((w) => w === null || w.includes('${')))) return new Map();
   const cand = new Map(); // name -> Set of words (a scalar, or any element of an array)
   const arrays = new Set(found.filter((x) => x.array).map((x) => x.name));
-  const opNames = new Set(found.filter((x) => x.array || x.words.some((w) => /\$\{/.test(w) && !/^\$\{[A-Za-z_]\w*\}$/.test(w))).map((x) => x.name));
+  const opNames = new Set(found.filter((x) => x.array || x.words.some((w) => w === null || (w.includes('${') && !/^\$\{[A-Za-z_]\w*\}$/.test(w)))).map((x) => x.name));
   const add = (k, w) => { const set = cand.get(k) ?? new Set(); if (set.size < MAX_ASSIGN_WORDS * 2) set.add(w); cand.set(k, set); };
-  const wordsOf = (k) => (arrays.has(k) ? cand.get(k) : cand.get(k)) ?? null;
+  const work = { n: 0 };
   // the words a `${…}` group stands for (inner = the text between the braces): null = leave the reading out (a value the environment gives)
   const group = (inner) => {
-    let m = /^([A-Za-z_]\w*)(?:\[[^\]]*\])?$/.exec(inner);
-    if (m) return wordsOf(m[1]) ? [...wordsOf(m[1])] : null;
-    m = /^([A-Za-z_]\w*)(?:\[[^\]]*\])?(\/\/?|##?|%%?|\^\^?|,,?|:)([\s\S]*)$/.exec(inner);
+    let m = /^([A-Za-z_]\w*)(?:\[[^\]]{0,64}\])?$/.exec(inner);
+    if (m) return cand.has(m[1]) ? [...cand.get(m[1])] : null;
+    m = /^([A-Za-z_]\w*)(?:\[[^\]]{0,64}\])?(\/\/?|##?|%%?|\^\^?|,,?|:)([\s\S]*)$/.exec(inner);
     if (!m) return null;
-    const subj = wordsOf(m[1]);
+    const subj = cand.get(m[1]);
     if (!subj) return null;
-    return [...subj].map((v) => applyOp(v, m[2], m[3]) ?? UNKNOWN_WORD);
+    return [...subj].map((v) => (v === UNKNOWN_WORD ? v : applyOp(v, m[2], m[3], work) ?? UNKNOWN_WORD));
   };
   const resolve = (word) => {
-    let alts = [...paramReadings(word)];
-    const done = new Set();
+    const pr = paramReadings(word);
+    let alts = [...pr];
+    const done = new Set(pr.over ? [UNKNOWN_WORD] : []);
     for (let guard = 0; guard < 64 && alts.length; guard++) {
       const next = [];
       for (const a of alts) {
         const at = a.indexOf('${');
         const bare = at < 0 ? /\$([A-Za-z_]\w*)/.exec(a) : null;
         if (at < 0 && !bare) { if (!/[$`]/.test(a) || a.includes(UNKNOWN_WORD)) done.add(a); continue; }
-        if (bare) { const g = wordsOf(bare[1]); for (const v of g ?? []) next.push(a.slice(0, bare.index) + v + a.slice(bare.index + bare[0].length)); continue; }
+        if (bare) { for (const v of cand.get(bare[1]) ?? []) next.push(a.slice(0, bare.index) + v + a.slice(bare.index + bare[0].length)); continue; }
         const j = closeBrace(a, at + 1);
-        if (j < 0) continue;
+        if (j < 0) { done.add(UNKNOWN_WORD); continue; }
         for (const v of group(a.slice(at + 2, j)) ?? []) next.push(a.slice(0, at) + v + a.slice(j + 1));
       }
       alts = [...new Set(next)].slice(0, MAX_ASSIGN_WORDS * 2);
     }
+    if (alts.length) done.add(UNKNOWN_WORD); // (not settled within the steps allowed)
     return [...done];
   };
   for (let pass = 0; pass < 3; pass++) {
     for (const x of found) {
       for (const w of x.words) {
+        if (w === null) { if (opNames.has(x.name)) add(x.name, UNKNOWN_WORD); continue; }
         if (!/[$`]/.test(w)) { add(x.name, w); continue; }
         if (!opNames.has(x.name)) continue;
         for (const r of resolve(w)) add(x.name, r);
@@ -271,7 +328,7 @@ export function readingsOf(word, assigned) {
     for (const [key, ws] of assigned) {
       // (an array, `NAME[]`: its elements stand for any use of the name, with a subscript or without)
       const n = key.endsWith('[]') ? key.slice(0, -2) : key;
-      const ref = key.endsWith('[]') ? `\\$(?:\\{${n}(?:\\[[^\\]]*\\])?\\}|${n}(?![A-Za-z0-9_])(?:\\[[^\\]]*\\])?)` : `\\$(?:\\{${n}\\}|${n}(?![A-Za-z0-9_]))`;
+      const ref = key.endsWith('[]') ? `\\$(?:\\{${n}(?:\\[[^\\]]{0,64}\\])?\\}|${n}(?![A-Za-z0-9_])(?:\\[[^\\]]{0,64}\\])?)` : `\\$(?:\\{${n}\\}|${n}(?![A-Za-z0-9_]))`;
       if (!new RegExp(ref).test(r)) continue;
       for (const w of ws) {
         if (/[$`]/.test(w)) { over = true; break; }

@@ -12,6 +12,7 @@ import assert from 'node:assert/strict';
 import { resolve, dirname, basename } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
+import { assigningDefaults } from '../pipeline/hooks/lib/script-candidates.mjs';
 
 function fakeFs(root, files, dirs = []) {
   const abs = (p) => resolve(root, p);
@@ -159,4 +160,59 @@ test('B4 harmless values stay allowed', () => {
   allow('ROOT=${0%/*}; echo $ROOT');
   allow('N=${1:-3}; echo $N');
   allow('F=(a b c); echo ${F[1]}');
+});
+
+// ---- B5. quoting and brace structure the scan cannot follow exactly is an unknown word (fail closed), never a truncated or half-unquoted one -------------------------
+test('B5 quotes, backslashes and $\'..\' in a default word, or braces it cannot follow: refused like any word only known at run time', () => {
+  for (const v of ['${U:-"run.sh"}', "${U:-'run.sh'}", '${U:-r"un".sh}', "${U:-$'run.sh'}", '${U:-\\run.sh}', '${U:-"}"run.sh}', '${U:-$(echo })}', '${U:-`echo }`}']) {
+    denyBoth(`G=${v}; bash $G`);
+  }
+  denyBoth('G="${U:-"run.sh"}"; bash $G');
+  denyBoth('F=("a b" ${U:-"run.sh"}); bash ${F[1]}');
+  // the shell unquotes these exactly as the scan does
+  denyBoth('G="${U:-run.sh}"; bash $G');
+  denyBoth("G='run.sh'${U:+x}; bash $G");
+  allow('G="${U:-ok.sh}"; bash "$G"');
+  allow('F=("a b" ok.sh); bash ${F[1]}'.replace('"a b" ', ''));
+});
+test('B5 a name nothing on the line sets is no looser than before: the reading of the name itself stays, so a guarded operation on the line still refuses it', () => {
+  allow('G=${U:-ok.sh}; bash $G');
+  const r = both(`G=\${U:-ok.sh}; bash $G; git ${PUSH} origin main`, SPEC);
+  assert.equal(r.git.decision, 'deny');
+  const e = both('F=${U:-x}; G=${F/ok/run}; bash $G', SPEC); // (F is the environment's here: no word to judge, as for any name the line does not set)
+  assert.equal(e.git.decision, 'allow');
+});
+
+// ---- B6. crafted long inputs finish quickly in both guards (a hook past its deadline is ALLOWED by the host) -------------------------------------------------------
+test('B6 adversarial 200 kB lines and glob patterns are answered quickly', () => {
+  const cases = [
+    'a=${a}'.repeat(30000),
+    '${'.repeat(8000), // (100000 of them takes the parser itself 13 s, on main too: not this reading's cost; assigningDefaults answers it in 0 ms)
+    'a['.repeat(20000), // (90000 of them takes the parser 2-3 s, on main too)
+    'F=(' + 'a '.repeat(90000) + '); bash ${F[1]}',
+    'bash ' + '$F['.repeat(40000),
+    'F=' + 'a'.repeat(5000) + '.sh; G=${F#*a*a*a*a*a*a*a*a*a*b}; bash $G',
+    'F=' + 'a'.repeat(300) + '.sh; G=${F#*a*a*a*a*a*a*a*a*a*b}; bash $G',
+    'F=' + 'a'.repeat(300) + '.sh; G=${F//*a*a*a*a*a*a*a*a*b/x}; bash $G',
+    'F=' + 'a'.repeat(300) + '.sh; G=${F%%*a*a*a*a*a*a*a*a*a*b}; bash $G',
+    'F=(' + 'x'.repeat(100000) + '); G=${F[1]%*a*a*a*a*a*a*a*b}; bash $G',
+    '${U:-' + 'x'.repeat(190000) + '}',
+    'G="' + '${U:-"'.repeat(30000),
+  ];
+  for (const c of cases) {
+    // (this reading's own work, then the guards; the parser alone takes 2-3 s on some of these on main too, so the guards get the deadline's third)
+    const t0 = Date.now();
+    assigningDefaults(c);
+    const own = Date.now() - t0;
+    assert.ok(own < 500, `${own} ms in assigningDefaults for ${c.slice(0, 40)}...`);
+    both(c, SPEC);
+    const ms = Date.now() - t0;
+    assert.ok(ms < 8000, `${ms} ms for ${c.slice(0, 40)}...`);
+  }
+});
+test('B6 a glob with many stars on a long value is an unknown word, not a long search', () => {
+  denyBoth('F=' + 'a'.repeat(200) + '.sh; G=${F#*a*a*a*a*a*a*a*a*a*b}; bash $G');
+  denyBoth('F=run.sh; G=${F#*a*a*a*a*a*a*a*a*a*b}; bash $G'.replace('#*a*a*a*a*a*a*a*a*a*b', '%.sh*q*q*q*q*q*q*q*q*q'));
+  denyBoth('F=xrun.sh; G=${F#?}; bash $G');
+  denyBoth('F=run.shx; G=${F%?}; bash $G');
 });
