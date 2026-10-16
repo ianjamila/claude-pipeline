@@ -152,3 +152,30 @@ test('owner-go hook: never blocks a prompt; prints one line of context only when
     assert.equal(r.stdout, '', stdin);
   }
 });
+
+// Codex review (#58) finding 4: only the terminal request block (the reply's last lines) binds anything
+test('owner-go: only the terminal request block binds; an earlier block, trailing text or a duplicate binding binds nothing', () => {
+  const A = 'a'.repeat(12);
+  const B = 'b'.repeat(12);
+  const two = `Head ${A} · items none\n🔀 Ready to merge #7 — say "merge"\nHead ${B} · items none\n🔀 Ready to merge #8 — say "merge"`;
+  assert.deepEqual(presentedRequests(two), { prs: [8], requests: [{ pr: 8, head: B, items: 'none' }] }, 'the earlier #7 block is not a request');
+  const dup = `Head ${A} · items none\nHead ${B} · items none\n🔀 Ready to merge #8 — say "merge"`;
+  assert.deepEqual(presentedRequests(dup).requests, [], 'two heads for one PR: ambiguous, so none');
+  const dupPr = `#8 head ${A} · items none\n#8 head ${A} · items none\n🔀 Ready to merge #8, #9 — say "merge"`;
+  assert.deepEqual(presentedRequests(dupPr).requests, [], 'the same PR bound twice: ambiguous');
+  const after = `Head ${A} · items none\n🔀 Ready to merge #8 — say "merge"\nOne more thing: also CI is green.`;
+  assert.deepEqual(presentedRequests(after), { prs: [], requests: [] }, 'text after the 🔀 line: the reply does not END with the request');
+  const apart = `Head ${A} · items none\nSome prose.\n🔀 Ready to merge #8 — say "merge"`;
+  assert.deepEqual(presentedRequests(apart).requests, [], 'a Head line not directly above the 🔀 line is not part of the block');
+});
+
+// Codex review (#58) finding 5: only the slot of the current prompt may be empty
+test('owner-go: a tool-only turn between the request and the "merge" invalidates it', () => {
+  const home = tmp();
+  const t1 = transcript(home, [user('go'), said(REQUEST), user('run the tests'), { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'x', name: 'Bash', input: {} }] } }, toolResult(), user('merge')]);
+  assert.equal(lastRequestText(t1), '', 'an intervening prompt and a text-less assistant turn: the old request is stale');
+  const t2 = transcript(home, [user('go'), said(REQUEST), user('run the tests'), { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'x', name: 'Bash', input: {} }] } }, toolResult()]);
+  assert.equal(lastRequestText(t2), '', 'the "merge" not yet in the transcript: the text-less turn is the last reply');
+  const t3 = transcript(home, [user('go'), said(REQUEST), user('merge'), { type: 'system', content: 'x' }]);
+  assert.match(lastRequestText(t3), /Ready to merge #58/, 'the current prompt\'s own empty slot is skipped (other entry kinds do not count)');
+});

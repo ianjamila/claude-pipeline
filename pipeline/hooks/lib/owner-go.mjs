@@ -57,27 +57,32 @@ export function parseApproval(prompt) {
   return { prs: [...new Set(prs)], shas: [...new Set(shas)] };
 }
 
-// The merge requests one reply showed. The 🔀 line names the PRs; each `Head <sha12> · items <digest>` line (or, for several
-// PRs, `#N head <sha12> · items <digest>`) binds a PR to the head and owner-item set the owner was shown. Returns
-// { prs: [N…] (every PR on the 🔀 line), requests: [{ pr, head, items }] }.
+// The merge request a reply ENDS with. The reply's last lines are the request (skills/ship): optional `Head <sha12> · items <digest>`
+// lines (or, for several PRs, `#N head <sha12> · items <digest>`) directly above the 🔀 line, which is the last non-blank line.
+// Only that terminal block binds: an earlier block in the same reply, a Head line with prose between it and the 🔀 line, or any
+// text after the 🔀 line binds nothing, and a PR bound twice (two heads, or the same line twice) is ambiguous, so it binds nothing.
+// Returns { prs: [N…] (every PR on the 🔀 line; [] when the reply does not end with it), requests: [{ pr, head, items }] }.
 const READY_LINE = /🔀\s*Ready to merge\s+([^\n]*)/;
 const HEAD_LINE = new RegExp(`^\\s*(?:#(\\d+)\\s+)?head\\s+([0-9a-f]{${HEAD_CHARS},40})\\s*(?:·|\\|)\\s*items\\s+([0-9a-f]{12}|none)\\s*$`, 'i');
 export function presentedRequests(text) {
   const lines = String(text ?? '').split(/\r?\n/);
-  let prs = [];
-  for (const line of lines) {
-    const r = READY_LINE.exec(line);
-    if (r) prs = [...new Set([...r[1].split(/—|\s--?\s|\bsay\b/)[0].matchAll(/#(\d{1,6})\b/g)].map((x) => Number(x[1])))];
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  const r = READY_LINE.exec(lines[lines.length - 1] ?? '');
+  if (!r) return { prs: [], requests: [] };
+  const prs = [...new Set([...r[1].split(/—|\s--?\s|\bsay\b/)[0].matchAll(/#(\d{1,6})\b/g)].map((x) => Number(x[1])))];
+  const block = [];
+  for (let i = lines.length - 2; i >= 0; i--) {
+    const h = HEAD_LINE.exec(lines[i]);
+    if (!h) break;
+    block.unshift(h);
   }
-  const requests = [];
-  for (const line of lines) {
-    const h = HEAD_LINE.exec(line);
-    if (!h) continue;
+  const bound = new Map();
+  for (const h of block) {
     const pr = h[1] ? Number(h[1]) : prs.length === 1 ? prs[0] : null;
     if (pr === null || !prs.includes(pr)) continue;
-    requests.push({ pr, head: h[2].toLowerCase(), items: h[3].toLowerCase() });
+    bound.set(pr, bound.has(pr) ? null : { pr, head: h[2].toLowerCase(), items: h[3].toLowerCase() });
   }
-  return { prs, requests };
+  return { prs, requests: [...bound.values()].filter(Boolean) };
 }
 
 // The text of the last assistant reply in the transcript when it holds a 🔀 merge request ('' when none). Only the
@@ -101,6 +106,7 @@ export function lastRequestText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BY
     return '';
   }
   const replies = [''];
+  let lastIsPrompt = false; // is the newest user/assistant entry a prompt (the owner's current one)?
   for (const line of raw.split('\n')) {
     if (!line.trim()) continue;
     let e;
@@ -109,14 +115,17 @@ export function lastRequestText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BY
     if (e?.type === 'user') {
       const prompt = typeof content === 'string' || (Array.isArray(content) && content.some((b) => b?.type === 'text') && !content.some((b) => b?.type === 'tool_result'));
       if (prompt) replies.push('');
+      lastIsPrompt = prompt;
     } else if (e?.type === 'assistant' && Array.isArray(content)) {
+      lastIsPrompt = false;
       for (const b of content) if (b?.type === 'text' && typeof b.text === 'string') replies[replies.length - 1] += `${b.text}\n`;
     }
   }
-  // Only the LAST reply that has text (the one the owner is answering; the prompt itself may already be the last entry, leaving an
-  // empty reply after it). An older request is never revived by a later "merge": the agent shows it again.
-  for (let i = replies.length - 1; i >= 0; i--) if (replies[i].trim()) return READY_LINE.test(replies[i]) ? replies[i] : '';
-  return '';
+  // Only the reply right before the owner's prompt: when the newest entry is that prompt, its own (empty) slot is skipped, and that is
+  // the ONLY slot that may be. A later prompt plus a text-less assistant turn (tool calls only) leaves the old request stale, and an
+  // older request is never revived by a later "merge": the agent shows it again.
+  const last = replies.length - 1 - (lastIsPrompt && replies.length > 1 ? 1 : 0);
+  return READY_LINE.test(replies[last]) ? replies[last] : '';
 }
 
 // Is this hook input a subagent's (or not a prompt at all)? Those never approve anything.
