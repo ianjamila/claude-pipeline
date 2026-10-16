@@ -369,6 +369,22 @@ export function gh(args, opts = {}) {
   return run(file, [...prefixArgs, ...args], opts);
 }
 
+// Why: gh() finds gh in a fallback dir, but a project command the pipeline spawns (merge.command, the smokes) inherits
+// the caller PATH, so its own `gh` was ENOENT in a sandbox that lacks /opt/homebrew/bin. Returns a copy of `env` whose
+// PATH has the directory of the gh that gh() would run APPENDED (never prepended: it cannot shadow anything already on
+// PATH), only when PATH has no gh of its own. Unchanged on win32, under a PIPELINE_GH override, or when gh is nowhere.
+export function envWithGhDir(env, { fallbackDirs = GH_FALLBACK_DIRS, platform = process.platform } = {}) {
+  const out = { ...(env ?? {}) };
+  if (platform === 'win32' || overrideCommand('PIPELINE_GH', 'gh', env).cmd !== 'gh') return out;
+  const pathVar = env?.PATH ?? process.env.PATH ?? '';
+  if (findOnPosixPath('gh', pathVar, [])) return out;
+  const found = findOnPosixPath('gh', '', fallbackDirs);
+  if (!found) return out;
+  const dir = path.dirname(found);
+  out.PATH = pathVar ? `${pathVar}${path.delimiter}${dir}` : dir;
+  return out;
+}
+
 export function ghJson(args, opts = {}) {
   const r = gh(args, opts);
   if (r.code !== 0 || r.timedOut) throw new GhError({ code: r.code, stderr: r.stderr, args, timedOut: r.timedOut });
