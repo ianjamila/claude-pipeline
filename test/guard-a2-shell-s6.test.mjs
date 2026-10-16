@@ -4,7 +4,7 @@
 // and a pattern the shells would reject is parsed as before (as commands: strict).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { simpleCommands } from '../pipeline/hooks/lib/shell-parse.mjs';
+import { simpleCommands, MAX_WORK } from '../pipeline/hooks/lib/shell-parse.mjs';
 
 const argvs = (s) => simpleCommands(s).map((c) => c.argv.join(' ')).filter(Boolean); // (assignment-only commands have no argv)
 
@@ -99,9 +99,9 @@ test('case: nested patterns that fail after a substitution cannot multiply the w
   for (const b of builds) for (const k of [25, 60]) {
     let t = 'true';
     for (let j = 0; j < k; j++) t = b(t);
-    const started = Date.now();
     const cs = simpleCommands(t);
-    assert.ok(Date.now() - started < 5000, `finished in reasonable time (${k} levels)`);
+    // the work counter, not the clock (a loaded machine slows a stopwatch): charged retries run the count up to MAX_WORK, where the parse stops (within one scan of it)
+    assert.ok(cs.work >= MAX_WORK && cs.work <= MAX_WORK + t.length, `work ended at the budget (${k} levels): ${cs.work} vs ${MAX_WORK}`);
     assert.equal(cs.truncated, true);
   }
 });
