@@ -259,7 +259,7 @@ test('guard-git: with deny-log.mjs missing, broken or throwing the deny is still
 test('guard-files: a Bash deny writes one line (hook files), an allow and a file-tool deny write none', () => {
   const home = freshHome();
   const protectedFile = join(home, '.claude', 'settings.json');
-  const cmd = `echo x > ${protectedFile}`;
+  const cmd = 'echo x > ~/.claude/settings.json'; // (a joined Windows path holds backslashes, which the shell reads as escapes)
   assert.equal(decisionOf(spawnHook(HOOKS, 'guard-files.mjs', bashInput(cmd, TMP), home)), 'deny');
   const [entry, ...rest] = lines(home);
   assert.equal(rest.length, 0);
@@ -282,7 +282,7 @@ test('both hooks: a FIFO at the log path still gets the deny out at once, and no
   const g = spawnHook(HOOKS, 'guard-git.mjs', bashInput(FORCE_CMD, TMP), home, {}, 15000);
   assert.equal(g.signal, null, 'guard-git hung on the FIFO');
   assert.equal(decisionOf(g), 'deny');
-  const f = spawnHook(HOOKS, 'guard-files.mjs', bashInput(`echo x > ${join(home, '.claude', 'settings.json')}`, TMP), home, {}, 15000);
+  const f = spawnHook(HOOKS, 'guard-files.mjs', bashInput('echo x > ~/.claude/settings.json', TMP), home, {}, 15000);
   assert.equal(f.signal, null, 'guard-files hung on the FIFO');
   assert.equal(decisionOf(f), 'deny');
   assert.ok(lstatSync(guardLogFile(home)).isFIFO());
@@ -294,17 +294,17 @@ test('both hooks: the deny is written before logging starts (a log call that blo
   writeFileSync(join(hang, 'lib', 'deny-log.mjs'), 'export function logDeny() { const t = Date.now() + 60000; while (Date.now() < t); return true; }\n');
   const home = freshHome();
   const g = spawnHook(hang, 'guard-git.mjs', bashInput(FORCE_CMD, TMP), home, {}, 4000);
-  assert.equal(g.signal, 'SIGTERM');
+  assert.equal(g.error?.code, 'ETIMEDOUT'); // (killed at the timeout: Windows reports no signal)
   assert.equal(decisionOf(g), 'deny');
   assert.match(reasonOf(g), /force-pushing/);
-  const f = spawnHook(hang, 'guard-files.mjs', bashInput(`echo x > ${join(home, '.claude', 'settings.json')}`, TMP), home, {}, 4000);
-  assert.equal(f.signal, 'SIGTERM');
+  const f = spawnHook(hang, 'guard-files.mjs', bashInput('echo x > ~/.claude/settings.json', TMP), home, {}, 4000);
+  assert.equal(f.error?.code, 'ETIMEDOUT');
   assert.equal(decisionOf(f), 'deny');
 });
 
 test('guard-files: with deny-log.mjs missing or throwing the deny is still returned', () => {
   const home = freshHome();
-  const cmd = `echo x > ${join(home, '.claude', 'settings.json')}`;
+  const cmd = 'echo x > ~/.claude/settings.json';
   const missing = hooksWithout('deny-log.mjs');
   const r = spawnHook(missing, 'guard-files.mjs', bashInput(cmd, TMP), home);
   assert.equal(decisionOf(r), 'deny');
