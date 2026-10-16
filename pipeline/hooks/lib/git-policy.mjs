@@ -740,9 +740,11 @@ function checkGraphql(body, dir = null, ctx = null) {
     if (names === null) return deny('the graphql query contains a mutation that cannot be parsed, so it cannot be verified.');
     const bad = names.find((n) => !GRAPHQL_ALLOWED_MUTATIONS.has(n));
     if (bad) return deny(`the graphql mutation ${bad} is not on the allowed list (${[...GRAPHQL_ALLOWED_MUTATIONS].join(', ')}). ${OWNER_ONLY}`);
-    // #58: auto-merge names the PR by its node id, which says nothing about whether the owner said "merge" for it
-    if (names.includes('enablePullRequestAutoMerge') && ownerGoMode(dir, ctx) === 'chat') {
-      return deny('turning on auto-merge through the API skips the owner\'s "merge" in this repository (owner_approval: chat). Use `gh pr merge <N> --auto` after the owner said "merge", or `P merge`.');
+    // #58: auto-merge names the PR by its node id, which says nothing about whether the owner said "merge" for it, nor which repository it is in.
+    // Why (#58 round 3): the node id can name a PR in a chat repo whatever directory this runs in, so the target repository can never be resolved
+    // here: it is judged as a chat repo's (the owner's "merge" is needed, and a node id cannot match one), not as the current directory's.
+    if (names.includes('enablePullRequestAutoMerge') && ctx?.ownerGo) {
+      return deny('turning on auto-merge through the API skips the owner\'s "merge": it names the PR by a node id, so its repository (owner_approval: chat?) and head cannot be checked. Use `gh pr merge <N> --auto --match-head-commit <sha>` after the owner said "merge", or `P merge`.');
     }
   }
   if (body.unknown) return deny('cannot verify the graphql body (--input - / unreadable file).');

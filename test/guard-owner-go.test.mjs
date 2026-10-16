@@ -57,8 +57,15 @@ test('#58 chat repo: the repo\'s own merge command typed by hand is judged the s
 test('#58 chat repo: auto-merge through the GraphQL API is refused (its node id cannot be checked)', () => {
   const q = "gh api graphql -f query='mutation { enablePullRequestAutoMerge(input: {pullRequestId: \"PR_x\"}) { clientMutationId } }'";
   assert.match(deny(q).reason, /auto-merge through the API skips the owner's "merge"/);
-  allow(q, '/other');
+  // (round 3: the node id may name a PR in a chat repo whatever the current directory is, so no directory makes it safe)
+  for (const cwd of ['/other', '/broken']) assert.match(deny(q, cwd).reason, /auto-merge through the API skips the owner's "merge".*P merge/s, cwd);
+  deny(`cd /other && ${q}`, '/chat');
+  deny(`false && cd /other; ${q}`, '/other');
+  assert.equal(evaluateGitCommand(q, { ...opts('/other'), ownerGo: null }).decision, 'allow', 'without the wiring nothing changes');
   allow("gh api graphql -f query='mutation { disablePullRequestAutoMerge(input: {pullRequestId: \"PR_x\"}) { clientMutationId } }'");
+  allow("gh api graphql -f query='mutation { disablePullRequestAutoMerge(input: {pullRequestId: \"PR_x\"}) { clientMutationId } }'", '/other');
+  allow("gh api graphql -f query='mutation { addComment(input: {subjectId: \"PR_x\", body: \"hi\"}) { clientMutationId } }'", '/other');
+  allow("gh api graphql -f query='query { viewer { login } }'", '/other');
 });
 
 test('#58 other repos merge as before; an unknown directory or an unreadable pipeline.yml fails closed', () => {
