@@ -19,7 +19,7 @@ import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf,
 export { withoutLiteralText, INDIRECT_EXPANSION };
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
-import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
+import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit } from './script-candidates.mjs';
 
 const PROTECTED_BRANCHES = ['main', 'master'];
 const APPROVAL_LABELS = ['human-approved', 'test-change-approved'];
@@ -2282,6 +2282,7 @@ function judgeReadings(str, startDir, ctx, level, names, saved) {
   try {
     for (let r = 0; r < total; r++) {
       checkDeadline(ctx.budget);
+      countReading(ctx.budget); // (the readings of the whole evaluation, nested scripts included, share one allowance)
       restoreLineState(ctx, saved);
       ctx.pinsLevel = level;
       ctx.pins = new Map();

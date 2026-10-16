@@ -165,13 +165,22 @@ export function execLinesOf(sf, expand, assigned) {
 export class GuardLimit extends Error {}
 
 // One per top-level evaluation, shared through every nested call. `now` is injectable so tests do not depend on timing.
+// Why (#81 security follow-up): the readings of a text (one per word of a loop, one per value of a name assigned twice) are multiplied again for every script it runs: three nested scripts
+// that each assign four names twice and loop over eight words were 1024 readings each, 1024^3 in all, and the check ended at the 5 s deadline instead of at once. The readings of a whole
+// evaluation, nested scripts included, share this allowance; past it the check is refused (GuardLimit), as for too many script files.
+export const MAX_TOTAL_READINGS = 1024;
 export function newEvalBudget(now = Date.now) {
   // startupOk: startup files already judged in a given state (see the policies), so a line with many shells reads ~/.zshenv once, not once each
-  return { now, deadline: now() + EVAL_DEADLINE_MS, scripts: MAX_SCRIPT_JUDGMENTS, grown: 0, startupOk: new Set() };
+  return { now, deadline: now() + EVAL_DEADLINE_MS, scripts: MAX_SCRIPT_JUDGMENTS, readings: MAX_TOTAL_READINGS, grown: 0, startupOk: new Set() };
 }
 
 export function checkDeadline(budget) {
   if (budget.now() > budget.deadline) throw new GuardLimit('the check took too long (a script chain or a command line too large to verify in time), so it cannot be verified. Split it into simpler commands or name the script file.');
+}
+
+// A reading of a text is about to be judged: one unit of the shared allowance of readings.
+export function countReading(budget) {
+  if (--budget.readings < 0) throw new GuardLimit('too many readings to check (loops over many words, or names given several values, in scripts that run scripts ...), so what they run cannot be verified. Name the script file and write the loop words or values out.');
 }
 
 // A script file is about to be judged: one unit of the shared budget.

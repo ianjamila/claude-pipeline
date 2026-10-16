@@ -21,7 +21,7 @@ import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
 import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
-import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit, execLinesOf, paramReadings, assigningDefaults, spliceLines } from './script-candidates.mjs';
+import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, assigningDefaults, spliceLines } from './script-candidates.mjs';
 
 const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
@@ -2181,6 +2181,7 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
     const readings = loopReadings(command, opts);
     if (readings) {
       for (const pins of readings) {
+        countReading(opts._budget);
         const v = evaluateBashForFilesUnchecked(command, { ...opts, _loopPins: { text: command, pins } });
         if (v.decision !== 'allow') return v;
       }
@@ -2192,6 +2193,7 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
     const readings = assignReadings(command, opts);
     if (readings) {
       for (const pins of readings) {
+        countReading(opts._budget);
         const v = evaluateBashForFilesUnchecked(command, { ...opts, _assignPins: { text: command, pins } });
         if (v.decision !== 'allow') return v;
       }
