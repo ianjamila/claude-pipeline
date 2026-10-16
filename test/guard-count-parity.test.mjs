@@ -83,6 +83,9 @@ test('#81: awk -v does not hide a shell assignment of the same name elsewhere on
     "true && f=ok.sh; awk -v g=1 '{print}' x.txt && f=run.sh; bash $f", // (after && : a new command, not awk's option)
     "true && f=ok.sh; awk -v g=1 '{print}' x.txt | f=run.sh; bash $f",
     "true && f=ok.sh; awk -v f=1 '{print}' x.txt; read f; bash $f",
+    "true && f=1; awk \"$((f=7))\" x.txt; bash s$f.sh", // (awk's text holds a real arithmetic assignment, no -v)
+    "true && f=ok.sh; awk '{print}' x.txt; command declare -v f=run.sh; bash $f", // (-v after another command, awk earlier on the line)
+    'true && f=ok.sh; command declare -v f=run.sh; bash $f',
     "true && f=ok.sh; sort -v f=1 x.txt; f=run.sh; bash $f", // (not awk)
     "true && f=ok.sh; : $((f=0)); awk -v f=1 '{print}' x.txt; bash $f.sh",
     "for f in ok.sh; do awk -v f=1 '{print}' x.txt; bash $f; done; f=run.sh; bash $f",
@@ -116,6 +119,9 @@ test('#81: a backslash does not hide a real assignment: only the letter it escap
 
 test('#81: an arithmetic read $((n+1)) is no assignment', () => {
   for (const cmd of [
+    'for n in 908 948; do sed -n "$n,$((n+6))p" a.ts; done', // (the replay shape: sed reads its program from the name)
+    'for n in 908 948; do sed -n $n,$((n+6))p a.ts; done',
+    'for n in 908 948; do sed -n $n,$((n-1))p a.ts; done',
     'for n in 1 2; do echo $((n+1)); done',
     'for n in 1 2; do echo $(( n + 1 )) $((2*n)) $((n<=2)) $((n==1)) $((n!=1)) $((n>1?n:3)); done',
     'for n in 1 2; do echo $(((n+1)*2)); done',
@@ -162,6 +168,10 @@ test('#81: a name in text that merely looks like arithmetic keeps its denial', (
   for (const cmd of [
     'true && n=ok.sh; : $((true); read n); bash $n', // (a $( (…) …) command substitution, not arithmetic: read binds n)
     'true && n=ok.sh; : $((true); n=run.sh); bash $n',
+    'true && n=ok.sh; x=$((true; read n)); bash $n',
+    'true && n=ok.sh; x=$((echo a; command read n)); bash $n',
+    'true && n=ok.sh; : $((1)); command read n; bash $n', // (a mention after the arithmetic closed is outside it)
+    'true && n=ok.sh; : $((1)) $(command read n); bash $n',
   ]) denyGit(cmd, SPEC);
 });
 
