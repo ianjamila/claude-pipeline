@@ -132,3 +132,5 @@ allow('n=1; : $(( (1+2) * 3 )); n=2; bash s$n.sh', SCRIPTS);
 allow('n=1; : $(( (1+2) * 3 )); : $((4)); n=2; bash s$n.sh', SCRIPTS);
 deny('n=1; : $(( n += 6 ; bash s$n.sh', SCRIPTS);
 deny('n=1; echo "$[ n += 6 "; bash s$n.sh', SCRIPTS);
+deny('n=1; : $(( (1) , (2) , n += 6 )); bash s$n.sh', SCRIPTS);
+deny('n=1; : $(( (1) + (2) + (n += 6) )); bash s$n.sh', SCRIPTS);
