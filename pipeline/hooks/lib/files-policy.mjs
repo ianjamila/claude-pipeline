@@ -1181,6 +1181,49 @@ function destsOf(argv, name) {
   return written;
 }
 
+// Why (#76 / #81 t7): the parser reads `$((n=7))` as a plain assignment (so the guard judged n as 7) but not `$((n+=6))`, `$(( n = 7 ))`, `((n++))` or `let n+=6`, and a name
+// changed there was judged by the value before (`true && n=1; : $((n+=6)); bash s$n.sh` ran s7.sh while the guard read s1.sh). The names an arithmetic body assigns (`=`, `op=`, `++`, `--`,
+// before or after the name, with blanks) are listed here, and so is every name read with a subscript (`n[0]=…`; a long subscript is not told from a read); collectVars then marks each one only known at run time. `dynamic`: a `$name` or `${name}` is assigned
+// (`$(( $n = 1 ))` assigns the variable n holds): any name may have changed. The text is scanned as written (quotes are not told apart): a name listed for text that is only quoted is a stricter reading, never a looser one.
+const ARITH_OP = String.raw`(?:\*\*|<<|>>|&&|\|\||\^\^|[-+*/%&|^])?`;
+const ARITH_ASSIGNED = new RegExp(String.raw`(?<![\w$.])([A-Za-z_]\w*)\s*(?:\[[^\]]{0,64}\]\s*)?${ARITH_OP}=(?!=)|(?<![\w$.])([A-Za-z_]\w*)\s*(?:\[[^\]]{0,64}\]\s*)?(?:\+\+|--)|(?:\+\+|--)\s*([A-Za-z_]\w*)|(?<![\w$.])([A-Za-z_]\w*)\s*\[`, 'g');
+const ARITH_ASSIGNED_DYN = new RegExp(String.raw`\$(?:\{[^}]{0,64}\}|\w+)\s*(?:\[[^\]]{0,64}\]\s*)?(?:${ARITH_OP}=(?!=)|\+\+|--)|(?:\+\+|--)\s*\$|\$\w+\s*\[`);
+function arithBodies(raw) {
+  const s = String(raw);
+  // $(( … )), (( … )) and $[ … ] in ONE pass (a scan per opener is quadratic on 150,000 of them): the text inside any of them, an unmatched opener taking the rest of the text
+  const out = [];
+  const stack = [];
+  let buf = '';
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    const two = s.startsWith('$((', i) ? 3 : s.startsWith('((', i) ? 2 : 0;
+    if (two) { stack.push({ close: ')', need: 2, depth: 0 }); i += two - 1; continue; }
+    if (s.startsWith('$[', i)) { stack.push({ close: ']', need: 1, depth: 0 }); i += 1; continue; }
+    if (!stack.length) continue;
+    const top = stack[stack.length - 1];
+    if (ch === '(' || ch === '[') top.depth++;
+    else if (ch === ')' || ch === ']') {
+      if (top.depth > 0) top.depth--;
+      else if (ch === top.close && --top.need === 0) { stack.pop(); out.push(buf); buf = ''; continue; }
+    }
+    buf += ch;
+  }
+  if (buf) out.push(buf);
+  // `let a=1 "b+=2"`: the rest of the command segment
+  for (const m of s.matchAll(/(?<![\w.$/-])let\s+([^;&|\n]*)/g)) out.push(m[1]);
+  return out;
+}
+function arithAssignedNames(raw) {
+  const names = new Set();
+  let dynamic = false;
+  if (!/\(\(|\$\[|(?<![\w.$/-])let\s/.test(String(raw))) return { names, dynamic };
+  for (const body of arithBodies(raw)) {
+    for (const m of body.matchAll(ARITH_ASSIGNED)) names.add(m[1] ?? m[2] ?? m[3] ?? m[4]);
+    if (ARITH_ASSIGNED_DYN.test(body)) dynamic = true;
+  }
+  return { names, dynamic };
+}
+
 // $NAME values assigned on the line: `D=x cmd`, a bare `D=x`, `export D=x`, `declare -x D=x`.
 // Also fills ctx.keptVars: the same values with every backslash kept as a file name character (toPosix reads it as a
 // separator), for the off-Windows reading of a script name (`D='x\a'; bash "$D.sh"` runs x\a.sh).
@@ -1197,8 +1240,16 @@ function collectVars(cmds, ctx) {
   // value). A name a loop reading sets that the line also gives another value holds one of them where it is used: it is only known at run time (ctx.unknownVars).
   // (Two plain assignments still keep the last value, as on main: `if …; then out=$3; else out=$dir/x; fi; … > "$out"` is common; issue: judge each value.)
   const given = new Map();
+  // Why (#76): a name the line gives more than one value is judged once per value (assignReadings): ctx.assignPins pins every plain assignment of it to the one raw value of this reading,
+  // or is null when there are too many readings: such a name is only known at run time. (A loop word is not a plain assignment: loopPins.)
+  const aPins = ctx.assignPins;
+  const raws = new Map();
   const set = (k, v, loop = false) => {
     if (SKIP.has(k)) return;
+    if (!loop) {
+      raws.set(k, (raws.get(k) ?? new Set()).add(String(v)));
+      if (aPins?.has(k)) v = aPins.get(k);
+    }
     const was = given.get(k);
     if (was && was.v !== String(v) && (loop || was.loop)) unknown.add(k);
     given.set(k, { v: String(v), loop: loop || was?.loop === true });
@@ -1231,6 +1282,10 @@ function collectVars(cmds, ctx) {
   // writes settings.json). A name the line assigns and reads so is only known at run time wherever it is used (ctx.unknownVars: a script or a writer it picks is refused),
   // and so is every name built from it (`F=$B:r; … $F`), to a fixed point.
   for (const k of ctx.zshModified ?? []) if (given.has(k) || Object.hasOwn(ctx.inheritedVars ?? {}, k)) unknown.add(k);
+  if (aPins === null) for (const [k, r] of raws) if (r.size > 1) unknown.add(k);
+  // Why (#76 / #81 t7): a name an arithmetic assigns holds a value the text does not give (see arithAssignedNames); `dynamic`: any name the line or an outer line gave
+  for (const k of ctx.arith?.names ?? []) if (given.has(k) || Object.hasOwn(ctx.inheritedVars ?? {}, k)) unknown.add(k);
+  if (ctx.arith?.dynamic) for (const k of [...given.keys(), ...Object.keys(ctx.inheritedVars ?? {})]) unknown.add(k);
   for (let changed = true; changed;) {
     changed = false;
     for (const [k, g] of given) if (!unknown.has(k) && [...g.v.matchAll(/\$\{?(\w+)/g)].some((m) => unknown.has(m[1]))) { unknown.add(k); changed = true; }
@@ -1240,6 +1295,40 @@ function collectVars(cmds, ctx) {
   ctx.declared = { transform: attrs, unknown: new Set(unknown) }; // (attributes stay with the name: a later plain assignment does not clear them)
   return vars;
 }
+
+// Why (#76): `F=settings.json; printf x > ~/.claude/$F; F=safe` was judged with F's LAST value. A name the text gives more than one value (a plain `F=v`, `export F=v`, `declare F=v`;
+// a loop variable is loopReadings') is judged once per value ("readings"): each reading is the whole text with every assignment of the name taken as that one value, and the text is
+// allowed only when every reading is. So a use sees each value the name may hold there, and the harmless `if …; then out=$3; else out="$dir/x"; fi; … > "$out"` stays allowed (both
+// values are harmless). Order is not told: a value given only AFTER the last use is judged too, and so is one that a later assignment replaces before the use (stricter, never looser).
+// More than MAX_ASSIGN_READINGS readings in all: each such name is only known at run time (a script or a writer it picks is refused).
+const MAX_ASSIGN_READINGS = 16;
+function assignReadings(command, opts) {
+  // (cheap test first: a name must be assigned twice in the text before it is parsed again)
+  const seen = new Set();
+  let twice = false;
+  for (const m of command.matchAll(/(?<![\w$.\/-])([A-Za-z_]\w*)\+?=/g)) { if (seen.has(m[1])) { twice = true; break; } seen.add(m[1]); }
+  if (!twice) return null;
+  const cmds = simpleCommands(command, { env: opts.env ?? process.env });
+  const values = new Map();
+  const add = (k, v) => { if (!SKIP_READING.has(k)) values.set(k, [...new Set([...(values.get(k) ?? []), String(v)])]); };
+  for (const c of cmds) {
+    for (const [k, v] of Object.entries(c.env ?? {})) add(k, v);
+    if (['export', 'declare', 'typeset', 'local', 'readonly'].includes(baseOf(c.argv[0] ?? ''))) for (const [k, v] of declAttrs(c.argv).assigns) add(k, v);
+  }
+  const names = [...values.keys()].filter((k) => values.get(k).length > 1 && /^[A-Za-z_]\w*$/.test(k));
+  if (!names.length) return null;
+  const total = names.reduce((n, k) => n * values.get(k).length, 1);
+  if (total > MAX_ASSIGN_READINGS) return [null];
+  const out = [];
+  for (let r = 0; r < total; r++) {
+    const pins = new Map();
+    let rest = r;
+    for (const k of names) { const ws = values.get(k); pins.set(k, ws[rest % ws.length]); rest = Math.floor(rest / ws.length); }
+    out.push(pins);
+  }
+  return out;
+}
+const SKIP_READING = new Set(['HOME', 'USER', 'LOGNAME', 'USERPROFILE', 'USERNAME']); // (collectVars never records these)
 
 // Directories the command line may be operating in: the hook's cwd plus every `cd` target (chained ones too).
 function collectDirs(cmds, ctx) {
@@ -2140,6 +2229,17 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
       return allow();
     }
   }
+  // Why (#76): the same for a name the text assigns more than once (see assignReadings)
+  if (typeof command === 'string' && opts._assignPins?.text !== command) {
+    const readings = assignReadings(command, opts);
+    if (readings) {
+      for (const pins of readings) {
+        const v = evaluateBashForFilesUnchecked(command, { ...opts, _assignPins: { text: command, pins } });
+        if (v.decision !== 'allow') return v;
+      }
+      return allow();
+    }
+  }
   if (!opts._frames) opts = { ...opts, _frames: [] }; // the writes of this line and of the scripts it runs (shared with nested calls, popped on the way out)
   const depth = opts._frames.length;
   try {
@@ -2185,6 +2285,7 @@ function evaluateBashForFilesFrame(command, opts) {
   if (assumedCwd) opts = { ...opts, _assumedCwd: false };
   checkDeadline(opts._budget);
   const ctx = makeCtx(opts);
+  if (opts._assignPins && opts._assignPins.text === command) ctx.assignPins = opts._assignPins.pins; // (this text's assignment readings, see assignReadings)
   if (opts._loopPins && opts._loopPins.text === command) ctx.loopPins = opts._loopPins.pins; // (this text's loop readings; see evaluateBashForFilesUnchecked)
   ctx.lineDefs = definedNames(typeof command === 'string' ? command : '');
   ctx.assigned = assigningDefaults(typeof command === 'string' ? command : ''); // (and those of the line this text was made from: `: ${X:=w}; G=bash; $G $X`)
@@ -2226,6 +2327,7 @@ function evaluateBashForFilesFrame(command, opts) {
   modelZshSelfDirs(cmds, raw, ctx);
   ctx.inheritedVars = opts._vars ?? {}; // (#74: collectVars also marks a name the line only reads with a zsh modifier, when an outer line gave it its value)
   ctx.zshModified = zshModifiedNames(cmds.flatMap((c) => [...(c.argv ?? []), ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')])); // (the names this line reads as `$N:r` / `$N[1]`)
+  ctx.arith = arithAssignedNames(raw);
   ctx.vars = collectVars(cmds, ctx);
   if (opts._vars) { ctx.vars = { ...opts._vars, ...ctx.vars }; ctx.keptVars = { ...(opts._keptVars ?? {}), ...ctx.keptVars }; } // variables the line set before the shell that runs this file started
   for (const k of opts._unknownW ?? []) ctx.unknownVars.add(k);
