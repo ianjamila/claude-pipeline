@@ -407,6 +407,8 @@ const WRAPPERS = {
   yarn: runnerAt(['exec', 'dlx']),
   command: unwrapCommand,
   builtin: plain(),
+  noglob: plain(), // (zsh precommand modifiers: `noglob read k` runs read; #56 Fable review of 2edea61)
+  nocorrect: plain(),
   exec: plain('a'),
   nohup: plain(),
   setsid: plain(),
@@ -579,7 +581,7 @@ const BASH_WORD = /^\$(?:BASH|\{BASH(?::?-(?:bash|sh))?\})$/;
 const BASH_DEFAULT = /^\$\{BASH:?-bash\}$/; // (the only spelling that names bash whether the shell is bash (it sets BASH) or zsh / sh (BASH unset))
 const BASH_REF = /\$BASH(?![A-Za-z0-9_])|\$\{BASH(?::?-(?:bash|sh))?\}/g;
 // commands that bind a name given as an operand (`read N`, `declare N=v`, `printf -v N`, `let`, zsh `vared` ...): a name that is not a plain word could be BASH
-const BINDERS = /(?<![\w.$/-])(?:read|declare|typeset|local|export|readonly|mapfile|readarray|getopts|unset|let|vared|zparseopts|printf|print|strftime|zstyle|sysread|zstat|getln|integer|float|select|set|autoload|compgen)(?![\w-])([^\n;&|<>]*)/g;
+const BINDERS = /(?<![\w.$/-])(?:read|declare|typeset|local|export|readonly|mapfile|readarray|getopts|unset|let|vared|zparseopts|printf|print|strftime|zstyle|sysread|zstat|getln|integer|float|select|set|autoload|compgen|private|zformat|zregexparse|ztcp|zsocket|zpty|zselect|zsystem|sysopen|syswrite|pcre_match|zgetattr|zlistattr|zcurses|compadd|zle|coproc)(?![\w-])([^\n;&|<>]*)/g; // (the module builtins: see ZSH_NAME_BINDERS)
 // Why (#56, Codex recheck of d925d42): zsh builtins that bind names their operands give in shapes the guards do not read (`zparseopts -a B`, `b:=B` specs,
 // `vared B`, `strftime -s B`, `zstat -A B`, `integer B=5`): the git and files guards treat one on the line as binding any name. (`print -v B` is read like printf -v.)
 // (and the module builtins that bind a name or set REPLY / MATCH: zformat -f / -a, zregexparse, ztcp / zsocket / zpty (REPLY), zselect -A, zsystem flock -f,
@@ -595,8 +597,28 @@ export function implicitBindsOf(c) {
   const nm = c.argv?.length ? commandName(c.argv[0]) : '';
   const out = nm === 'read' ? ['REPLY', 'reply'] : nm === 'select' ? ['REPLY'] : nm === 'getopts' ? ['OPTARG', 'OPTIND'] : nm === 'mapfile' || nm === 'readarray' ? ['MAPFILE'] : [];
   if (nm === '[[' || [...(c.argv ?? []), ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')].some((w) => String(w).includes('(#'))) out.push(...MATCH_NAMES);
+  // (#56, Fable review of 2edea61) also: an option that carries its name (`printf -vk`, `wait -pk`; `wait -p k`), an array element (`k[0]=7`: `$k` is
+  // element 0), a named file descriptor (`exec {k}>f`: k is the fd number), `coproc k { …; }` (k, k_PID; COPROC without a name), and the names the
+  // shell sets by itself (`$_` after every command, RANDOM, SECONDS, …: a value the line gives them is not what a later use reads)
+  const argv = c.argv ?? [];
+  if (nm === 'printf' || nm === 'print' || nm === 'wait') {
+    for (const [i, a] of argv.entries()) {
+      const m = /^-[A-Za-z]*?[vp]([A-Za-z_]\w*)$/.exec(a);
+      if (m) out.push(m[1]);
+      else if (/^-[A-Za-z]*[vp]$/.test(a) && /^[A-Za-z_]\w*$/.test(argv[i + 1] ?? '')) out.push(argv[i + 1]);
+    }
+  }
+  const el = /^([A-Za-z_]\w*)\[[^\]]*\]\+?=/.exec(argv[0] ?? '');
+  if (el) out.push(el[1]);
+  for (const a of argv) { const fd = /^\{([A-Za-z_]\w*)\}$/.exec(a); if (fd) out.push(fd[1]); }
+  if (/^\s*coproc\b/.test(String(c.raw ?? ''))) {
+    out.push('COPROC', 'COPROC_PID');
+    if (/^[A-Za-z_]\w*$/.test(argv[0] ?? '')) out.push(argv[0], `${argv[0]}_PID`);
+  }
+  if (argv.length) out.push(...SHELL_SET_NAMES);
   return out;
 }
+export const SHELL_SET_NAMES = ['_', 'RANDOM', 'SRANDOM', 'SECONDS', 'LINENO', 'EPOCHSECONDS', 'EPOCHREALTIME', 'BASHPID', 'HISTCMD', 'status', 'pipestatus', 'PIPESTATUS', 'ERRNO'];
 // Is BASH ever bound by the text? Fail closed: every mention that is not a plain reference counts (also with quotes taken out: `read B""ASH`), a binder
 // whose operand name is not a plain word (`declare "${n}SH=x"`, `read -r "$v"`, `export $n=x`, `read BA{SH,}`), `(( $n = 1 ))`, eval, source / `.` (the sourced
 // file may bind it), an ANSI-C string with an escape. A mention inside a quote or comment only makes this stricter.

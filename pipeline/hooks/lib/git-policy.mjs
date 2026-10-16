@@ -15,7 +15,7 @@
 import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS } from './shell-parse.mjs';
+import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES } from './shell-parse.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
 import { scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
@@ -1531,6 +1531,7 @@ const STATE_GIT = new Set(['checkout', 'switch', 'branch', 'rebase', 'symbolic-r
 // where it may not run (after && / ||, in a pipeline, a subshell, an if / loop / case), is unsure for the whole line.
 function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0) {
   const counts = new Map();
+  const implicit = new Set();
   const bump = (k, n) => { if (level === 0 && ctx.pins?.has(k)) return; counts.set(k, (counts.get(k) ?? (k in ctx.vars || ctx.unsureVars.has(k) ? 1 : 0)) + n); };
   const from = flowStart(cmds);
   for (const [i, c] of cmds.entries()) {
@@ -1548,7 +1549,7 @@ function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0) {
         if (m) bump(m[1], 2);
       }
     }
-    for (const k of implicitBindsOf(c)) bump(k, 2); // (`read` sets REPLY, `getopts` OPTARG, `[[ =~ ]]` MATCH …: see implicitBindsOf)
+    for (const k of implicitBindsOf(c)) implicit.add(k); // (`read` sets REPLY, `getopts` OPTARG, `[[ =~ ]]` MATCH, `k[0]=`, `$_` …: see implicitBindsOf)
     for (const k of Object.keys(c.env)) if (!sameValue(ctx, k, c.env[k])) bump(k, n);
     if (c.argv.length && VAR_BUILTINS.includes(baseName(c.argv[0]))) {
       // `declare -n X=F` makes X a NAMEREF: $X reads $F at run time, while the text says "F". Unknown, like a binder.
@@ -1562,6 +1563,9 @@ function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0) {
       for (const k of d.bare) if (odd || d.transform !== null || localHere) bump(k, 2);
     }
   }
+  // (only the ones the line assigns or reads: an unsure name nobody uses changes nothing. `$_` / `status` / RANDOM …, which every command sets, only when
+  // the line assigns them: `$_` in a ruby / perl program word is that program's)
+  if (implicit.size) { const reads = namesReadOn(cmds); for (const k of implicit) if (counts.has(k) || k in ctx.vars || (reads.has(k) && !SHELL_SET_NAMES.includes(k))) bump(k, 2); }
   for (const [k, n] of counts) if (n > 1) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
   // Why (#56, a live bypass on main): `F=ok.sh; export $N=run.sh; bash $F` ran run.sh when N held F, while the guard judged ok.sh. A binder whose
   // NAME is only known at run time (export / declare / local / typeset / readonly, read, mapfile, getopts, unset, let, select, printf -v) may set

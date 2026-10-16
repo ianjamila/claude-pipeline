@@ -524,3 +524,31 @@ test('#56 Codex recheck of d925d42: a builtin that sets a name it is not given (
   // still judged one by one: an ordinary name next to a read that names its own target
   assert.equal(git('for n in 5; do read -r x <<< 7; gh issue close $n; done', fsx, { issueLabels: labels }).decision, 'allow');
 });
+
+test('#56 Fable review of 2edea61: a zsh precommand modifier, an option carrying the name, an array element, a named fd, coproc and $_ rebind the name', () => {
+  const labels = (n) => (n === '7' || n === '10' ? ['pipeline-pause'] : []);
+  const fsx = fakeFs(GIT_ROOT, {}, DIRS);
+  for (const cmd of [
+    'k=5; noglob read k <<< 7; gh issue close $k',
+    'k=5; nocorrect read k <<< 7; gh issue close $k',
+    'k=5; printf -vk 7; gh issue close $k',
+    'k=5; wait -p k; gh issue close $k',
+    'k=5; wait -pk; gh issue close $k',
+    'k=5; k[0]=7; gh issue close $k',
+    'k=5; exec {k}>/dev/null; gh issue close $k',
+    'k=5; coproc k { cat; }; gh issue close $k',
+    '_=5; echo 7; gh issue close $_',
+    'for k in 5; do noglob read k <<< 7; gh issue close $k; done',
+    'for k in 5; do k[0]=7; gh issue close $k; done',
+  ]) assert.equal(git(cmd, fsx, { issueLabels: labels }).decision, 'deny', cmd);
+  for (const cmd of [
+    'F=safe; noglob read F <<< settings.json; printf x > ~/.claude/$F',
+    'F=safe; F[0]=settings.json; printf x > ~/.claude/$F',
+    'F=safe; printf -vF settings.json; printf x > ~/.claude/$F',
+    'for F in safe; do F[0]=settings.json; printf x > ~/.claude/$F; done',
+  ]) assert.equal(files(cmd, fakeFs(PROJ, {}, DIRS)).decision, 'deny', cmd);
+  // unchanged: a line that neither assigns nor reads the names the shell sets by itself
+  assert.equal(git('k=5; echo hi; gh issue close $k', fsx, { issueLabels: labels }).decision, 'allow');
+  assert.equal(git('for n in 5; do noglob echo x; gh issue close $n; done', fsx, { issueLabels: labels }).decision, 'allow');
+  allowBoth('for f in src/a.ts a.mjs; do cp $f /tmp/x/; done', SPEC);
+});
