@@ -1,0 +1,19 @@
+[
+  {"note": "F1 echo fn", "c": "echo() { :; }; { echo -n '#'; cat /work/repo/a; cat /work/repo/b; } | bash", "spec": {"a": "git p", "b": "ush origin ma@@\n"}},
+  {"note": "F1 echo fn files", "c": "echo() { :; }; { echo -n '#'; cat /work/repo/a; cat /work/repo/b; } | bash", "spec": {"a": "echo x > /home/u/.cl", "b": "aude/settings.json\n"}},
+  {"note": "F1 printf fn", "c": "printf() { :; }; { printf '#'; cat /work/repo/a; cat /work/repo/b; } | bash", "spec": {"a": "git pu", "b": "sh origin ma@@\n"}},
+  {"note": "F1 alias", "c": "alias echo=:; { echo -n '#'; cat a; cat b; } | bash", "spec": {"a": "git p", "b": "ush origin ma@@\n"}},
+  {"note": "F1 fn keyword", "c": "function printf { :; }; { printf '#'; cat a; cat b; } | bash", "spec": {"a": "git pu", "b": "sh origin ma@@\n"}},
+  {"note": "F1 cat fn", "c": "cat() { :; }; { echo -n '#'; cat a; cat b; } | bash", "spec": {"a": "git p", "b": "ush origin ma@@\n"}},
+  {"note": "F2 NUL", "c": "{ printf '%s' $'git pu\\0#'; cat b; } | bash", "spec": {"b": "sh origin ma@@\n"}},
+  {"note": "F2 NUL files", "c": "{ printf '%s' $'echo x > /home/u/.cl\\0#'; cat b; } | bash", "spec": {"b": "aude/settings.json\n"}},
+  {"note": "F2 NUL echo", "c": "{ echo -n $'git pu\\0#'; cat b; } | bash", "spec": {"b": "sh origin ma@@\n"}},
+  {"note": "F3 tr", "c": "{ printf '%s' 'git pu'; tr -d X b; } | bash", "spec": {"b": "sXh origin ma@@\n"}},
+  {"note": "F3 tr files", "c": "{ printf '%s' 'echo x > /home/u/.cl'; tr -d X b; } | bash", "spec": {"b": "auXde/settings.json\n"}},
+  {"note": "F3 sed files", "c": "{ printf '%s' 'echo x > /home/u/.cl'; sed 's/X//' b; } | bash", "spec": {"b": "auXde/settings.json\n"}},
+  {"note": "F3 tr gi", "c": "{ printf '%s' 'gi'; tr -d X b; } | bash", "spec": {"b": "Xt puXsh origin maXin\n"}},
+  {"note": "pre tr alone", "c": "tr -d X < b | bash", "spec": {"b": "git puXsh origin ma@@\n"}},
+  {"note": "pre tr alone2", "c": "tr -d X b | bash", "spec": {"b": "git puXsh origin ma@@\n"}},
+  {"note": "ok psql", "c": "{ echo 'begin;'; cat m.sql; cat <<'SQL'\ncommit;\nSQL\n} | psql", "spec": {"m.sql": "select 1;\n"}},
+  {"note": "ok echo+cat", "c": "{ echo 'set -e'; cat a.sh; } | bash", "spec": {"a.sh": "ls\n"}}
+]
