@@ -389,3 +389,44 @@ test("#56 scanner: a case inside a $( … ) gives up (its pattern ) would end th
     `echo "$(gh pr view 1 --jq .x)"`,
   ]) assert.notEqual(withoutLiteralText(t), null, t);
 });
+
+// ---- replay of the branch head against main (2026-10-16): loop shapes the readings refused that main allowed -----------------------------
+
+test('#56 replay 2: loop words from a known variable, quoted [ ] words, code in double quotes and printf without -v keep their readings', () => {
+  for (const cmd of [
+    'B=src && for f in $B/a.ts ${B}/x.ts; do echo "== $f"; sed -n 1,16p $f; done',
+    'for f in "src/[id]/a.ts" src/a.ts; do echo "=== $f"; git diff HEAD -- "$f" | head -60; done',
+    `for f in src/a.ts a.mjs; do node -e "const fs=require('fs');const f='$f';let s=fs.readFileSync(f,'utf8');fs.writeFileSync(f,s)"; done`,
+    "for p in vitest postcss; do printf '%-22s ' $p; npm view $p version 2>/dev/null | tail -1; done",
+  ]) allowBoth(cmd, SPEC);
+  // malicious twins: the word is worked out before it is judged, and what may rebind the name keeps the denial
+  for (const cmd of [
+    'S=run; for f in $S.sh; do bash $f; done', // (worked out to run.sh)
+    'B=.; for f in ok.sh ${B}/run.sh; do bash $f; done',
+    'for f in [r]un.sh; do bash $f; done', // (a glob class: judged as the files it matches)
+    'for f in $UNSET/run.sh; do bash $f; done', // (a name not known on the line)
+    'B=ok; true && B=run; for f in $B.sh; do bash $f; done', // (a name with two values)
+    "B=ok; for f in '$B'.sh; do bash $f; done", // (single quotes: the argv no longer shows that $B is text)
+    'IFS=.; B=run; for f in $B.sh; do bash $f; done', // (IFS on the line)
+    'for p in ok.sh; do printf -v p %s run.sh; bash $p; done', // (printf -v binds)
+    'for f in ok.sh; do declare -n R=f; R=run.sh; bash $f; done', // (a nameref to it)
+    'for f in ok.sh; do echo "${f::=run.sh}"; bash $f; done', // (zsh ::= assigns, inside double quotes…)
+    'for f in ok.sh; do : ${f::=run.sh}; bash $f; done', // (…and outside)
+    'for f in ok.sh; do echo "${f:=x} $f"; f=run.sh; bash $f; done',
+  ]) denyGit(cmd, SPEC);
+  // still refused (documented): two loops over the same name, and a loop over a variable holding command output
+  for (const cmd of [
+    'for f in src/a.ts; do sed -n 1,9p "$f"; done; for f in a.mjs; do sed -n 1,9p "$f"; done',
+    'F1=$(grep -rl x src); for f in ${=F1}; do sed -i.bak s/a/b/ "$f"; done',
+  ]) denyGit(cmd, SPEC);
+});
+
+test('#56 scanner dqData: inside double quotes only the shell\'s own text is kept', () => {
+  assert.equal(withoutLiteralText(`"const f=1; g(f)" $f`, { dqData: true }), `"       = ;  ( )" $f`);
+  assert.equal(withoutLiteralText(`"$f \${f:=x} \${g}"`, { dqData: true }), `"$f \${f:=x} \${g}"`);
+  assert.equal(withoutLiteralText(`"$[f=1]"`, { dqData: true }), null); // (arithmetic can assign)
+  // a ${…} the blanking does not follow ends it: the rest is kept as written
+  assert.equal(withoutLiteralText(`"\${g:-$h} f=1"`, { dqData: true }), `"\${g:-$h} f=1"`);
+  // without the option nothing changes
+  assert.equal(withoutLiteralText(`"const f=1"`), `"const f=1"`);
+});

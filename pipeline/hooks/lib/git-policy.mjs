@@ -1778,17 +1778,25 @@ function subshellsTrusted(cmds) {
 // when their command runs, which may come before). Anything else keeps the denial. At most 4 names (16 readings) per line.
 const MAX_READINGS = 64;
 const varWordRe = (k) => new RegExp(`(?<![A-Za-z0-9_])${k}(?![A-Za-z0-9_])`, 'g');
+const bindWordRe = (k) => new RegExp(`(?<![A-Za-z0-9_]|\\$|\\$\\{)${k}(?![A-Za-z0-9_])`); // (the name, not a `$k` / `${k` read of it)
+// A loop word the readings follow: literal text (globs included) and `$NAME` / `${NAME}`; what it is worked out to must be literal text (LOOP_WORD).
+const LOOP_WORD = /^[A-Za-z0-9_@%+=:,./*?[\]-]+$/;
+const LOOP_WORD_IN = /^(?:[A-Za-z0-9_@%+=:,./*?[\]-]|\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*\})+$/;
 // names a shell, git, gh, an interpreter or this guard read for themselves (where they act is not only where the line expands them): never read
 const SPECIAL_NAMES = /^(?:PATH|IFS|HOME|CDPATH|ENV|BASH_ENV|ZDOTDIR|PWD|OLDPWD|SHELL|SHELLOPTS|BASHOPTS|POSIXLY_CORRECT|PS\d|PROMPT_COMMAND|FPATH|MAILPATH|EDITOR|VISUAL|PAGER|TMOUT|HISTFILE|GIT\w*|GH_\w*|BASH\w*|ZSH\w*|LD_\w*|DYLD_\w*|NODE_\w*|NPM_\w*|PYTHON\w*|PERL\w*|RUBY\w*|PIPELINE_\w*|CLAUDE\w*|path|cdpath|fpath|manpath|mailpath|psvar|prompt\w*|precmd\w*|preexec\w*|chpwd\w*|periodic\w*|zshaddhistory\w*|zshexit\w*)$/;
 // The text with what the shell never expands blanked out: single-quoted strings and comments (double-quoted text expands, so it stays). Null for `$'…'`
 // or an unterminated quote (the caller keeps its answer).
-export function withoutLiteralText(s) {
+export function withoutLiteralText(s, { dqData = false } = {}) {
   // Why (#56 replay): `for n in 1 2; do echo "$n $(gh pr view $n --jq '.x')"; done` lost its readings because a quote inside a $( … ) inside double quotes
   // gave up. A $( … ) starts a fresh quoting context (its single quotes are quotes again), so each context is a frame on a stack: top, a double-quoted
   // string, a $( … ), a backtick. Still given up (null): a bare ( or $(( inside a $( … ) (a case pattern or arithmetic would end it early), a quote or ( inside
   // backticks, $'…', and anything left open at the end.
   // Also given up: a `case` inside a $( … ) -- its patterns end in a bare `)` that this scanner would take for the end of the $( … ), and every quote after
   // it would then be read in the wrong context (security review of 61296d8).
+  // `dqData` (#56 replay: `for f in a.ts b.ts; do node -e "const f='$f'; fs.readFileSync(f)"; done` read `f=` and `(f` in the program as shell text): inside
+  // double quotes only `$name`, `${…}`, `$( … )` and backticks are the shell's, so any other word there is blanked too. A `${…}` is kept as written (`${f:=x}`
+  // assigns); one holding a quote, a `$`, a backtick, a brace or a backslash ends the blanking for the rest of the text (kept, as without dqData). `$[ … ]`
+  // (arithmetic, it can assign) gives up.
   let out = '';
   const stack = ['top'];
   const cur = () => stack[stack.length - 1];
@@ -1805,6 +1813,20 @@ export function withoutLiteralText(s) {
       if (ch === '"') stack.pop();
       else if (ch === '$' && s[i + 1] === '(') { stack.push('sub'); out += '$('; i += 2; continue; }
       else if (ch === '`') stack.push('tick');
+      else if (dqData) {
+        if (ch === '$' && s[i + 1] === '[') return null;
+        if (ch === '$' && s[i + 1] === '{') {
+          const j = s.indexOf('}', i + 2);
+          if (j < 0 || /["'`$\\{]/.test(s.slice(i + 2, j))) dqData = false;
+          else { out += s.slice(i, j + 1); i = j + 1; continue; }
+        } else if (ch === '$' && /[A-Za-z0-9_]/.test(s[i + 1] ?? '')) {
+          const w = /^\$[A-Za-z0-9_]+/.exec(s.slice(i))[0];
+          out += w; i += w.length; continue;
+        } else if (/[A-Za-z0-9_]/.test(ch)) {
+          const w = /^[A-Za-z0-9_]+/.exec(s.slice(i))[0];
+          out += ' '.repeat(w.length); i += w.length; continue;
+        }
+      }
       out += ch; i++; continue;
     }
     // top or sub: the same quoting rules
@@ -1848,7 +1870,7 @@ function onceAssignedNames(cmds, ctx, str) {
   const spans = /<</.test(str) ? cmds.heredocSpans : [];
   if (!Array.isArray(spans)) return [];
   const blank = withoutHeredocBodies(str, cmds);
-  const text = blank === null ? null : withoutLiteralText(blank);
+  const text = blank === null ? null : withoutLiteralText(blank, { dqData: true });
   if (text === null) return [];
   const live = spans.filter(([, , quoted]) => !quoted).map(([a, b]) => str.slice(a, b)); // (unquoted bodies: they expand when their command runs)
   const mentions = (c, k) => {
@@ -1861,7 +1883,9 @@ function onceAssignedNames(cmds, ctx, str) {
     const sites = [];
     for (const [i, c] of cmds.entries()) {
       const nm = c.argv.length ? baseName(c.argv[0]) : '';
-      if (Object.hasOwn(c.env ?? {}, k) || ((VAR_BUILTINS.includes(nm) || VALUE_BINDERS.has(nm) || nm === 'for' || nm === 'select') && c.argv.slice(1).some((a) => varWordRe(k).test(a)))) sites.push(i);
+      // (a binder's word binds k when it names k itself: `$k` / `${k…}` there is a value it reads, `printf '%s' $p` without -v binds nothing; #56 replay)
+      const binder = VAR_BUILTINS.includes(nm) || (VALUE_BINDERS.has(nm) && (nm !== 'printf' || c.argv.some((w) => /^-[A-Za-z]*v/.test(w)))) || nm === 'for' || nm === 'select';
+      if (Object.hasOwn(c.env ?? {}, k) || (binder && c.argv.slice(1).some((a) => bindWordRe(k).test(a)))) sites.push(i);
     }
     if (sites.length !== 1) continue;
     const s = sites[0];
@@ -1873,10 +1897,15 @@ function onceAssignedNames(cmds, ctx, str) {
       if (new RegExp(`\\$\\{?${k}(?![A-Za-z0-9_])`).test(String(site.env[k]))) continue; // (its value reads itself)
       modes = ['set', 'skip'];
     } else if (site.argv[0] === 'for' && site.argv[1] === k && site.argv[2] === 'in' && site.argv.length > 3) {
-      // (each word as written: a glob stands for the files it matches, judged as candidates where the word lands; a word that expands, splits or brace-expands is not read)
+      // (each word as written: a glob stands for the files it matches, judged as candidates where the word lands; a word that splits or brace-expands is not read)
+      // Why (#56 replay): `B=app/x && for f in $B/a.ts $B/b.ts` and `for f in "app/[id]/page.tsx"` were refused. A word may also hold `[…]` (a glob class, judged like
+      // `*`) and `$NAME` / `${NAME}`: such a word is worked out when the walk reaches the `for` (loopWordAt), with what is known there. Not when the header holds a
+      // single quote or a backslash (`'$B'` is the text $B, which the argv no longer shows), nor where IFS may be set (ifsMayBeSet: it changes how the value splits).
       const words = site.argv.slice(3);
-      if (!words.every((w) => /^[A-Za-z0-9_@%+=:,./*?-]+$/.test(w))) continue;
-      modes = [...new Set(words)].map((w) => ({ val: w }));
+      if (!words.every((w) => LOOP_WORD_IN.test(w))) continue;
+      const expand = words.some((w) => w.includes('$'));
+      if (expand && (/['\\]/.test(String(site.raw ?? "'")) || ifsMayBeSet(ctx) || words.some((w) => [...w.matchAll(/\$\{?(\w+)/g)].some((x) => x[1] === k)))) continue;
+      modes = [...new Set(words)].map((w) => (w.includes('$') ? { val: w, expand: true } : { val: w }));
     } else continue;
     if (live.some((b) => varWordRe(k).test(b))) continue;
     // every mention in the text the shell reads: one assignment, the rest plain references (no ${k:=…} / ${k=…}, no k[…], no other bare word k)
@@ -1885,7 +1914,7 @@ function onceAssignedNames(cmds, ctx, str) {
     for (const m of text.matchAll(varWordRe(k))) {
       const before = text.slice(Math.max(0, m.index - 2), m.index);
       const after = text.slice(m.index + k.length, m.index + k.length + 2);
-      if (before.endsWith('${')) { if (/^:?=/.test(after) || after[0] === '[') odd = true; continue; }
+      if (before.endsWith('${')) { if (/^(?::?=|::)/.test(after) || after[0] === '[') odd = true; continue; } // (zsh `${k::=x}` assigns too)
       if (before.endsWith('$')) { if (after[0] === '[') odd = true; continue; }
       // (a name right after - . / is part of an option or a path, `ps -p $p`, `cd /tmp/p`: no assignment can start there)
       if (/[-./]$/.test(before)) continue;
@@ -1902,6 +1931,14 @@ function onceAssignedNames(cmds, ctx, str) {
     if (ok) out.push({ k, modes });
   }
   return out;
+}
+// A reading's loop word that holds `$NAME` gets its value where the `for` runs (every use of the loop name comes after it): the names it reads must be known
+// there and give literal text, else the reading is refused. Null when the value is set.
+function loopWordAt(k, ctx) {
+  const v = expandVars(ctx.pins.get(k).val, ctx);
+  if (v.includes('$') || !LOOP_WORD.test(v)) return deny(`$${k} takes a loop word built from a variable whose value is not known here (or is not plain text), so its value at run time cannot be verified. Rewrite: write the loop words out.`);
+  ctx.vars[k] = v;
+  return null;
 }
 // Judges the line once per reading of the names (each assignment ran, or did not); the first denial wins. Null when there is nothing to read.
 function judgeReadings(str, startDir, ctx, level, names, saved) {
@@ -2027,7 +2064,8 @@ function evalString(str, startDir, ctx, level) {
         // (a value that still holds a `$` is not worked out: the case change would apply to what it expands to)
         if (d.transform && DYNAMIC.test(v)) { delete ctx.vars[k]; ctx.unsureVars.add(k); } else setVar(ctx, k, applyTransform(v, d.transform), level);
       }
-    } else if (name === 'for' && computedLoopWord(argv) !== null) setVar(ctx, argv[1], computedLoopWord(argv), level);
+    } else if (name === 'for' && level === 0 && ctx.pins?.get(argv[1])?.expand) verdict = loopWordAt(argv[1], ctx);
+    else if (name === 'for' && computedLoopWord(argv) !== null) setVar(ctx, argv[1], computedLoopWord(argv), level);
     else if (name === 'cd' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name, argv, ctx, cdp, c.env ?? {});
     else if (name === 'git' || name === 'gh') {
       const unsure = unsureVarUsed([...argv.slice(1), ...Object.values(c.env)], ctx);
