@@ -588,6 +588,18 @@ const BINDERS = /(?<![\w.$/-])(?:read|declare|typeset|local|export|readonly|mapf
 // sysopen -u, syswrite -c, pcre_match -v / -a (MATCH), zgetattr, zlistattr, zcurses, compadd -A / -O, zle -U / widgets)
 export const ZSH_NAME_BINDERS = new Set(['vared', 'zparseopts', 'strftime', 'zstyle', 'sysread', 'zstat', 'getln', 'integer', 'float', 'private', 'zformat', 'zregexparse',
   'ztcp', 'zsocket', 'zpty', 'zselect', 'zsystem', 'sysopen', 'syswrite', 'pcre_match', 'zgetattr', 'zlistattr', 'zcurses', 'compadd', 'zle']);
+// #81: the end (just after the closing `))`) of the `$((` arithmetic that starts at i, or -1 when it cannot be told from a subshell inside a command
+// substitution (`$((cmd) )`, `$((a); b)`) or holds a quote, backtick or backslash (those would need the frames).
+const arithEnd = (s, i) => {
+  let depth = 0;
+  for (let j = i + 3; j < s.length; j++) {
+    const c = s[j];
+    if (c === '"' || c === "'" || c === '`' || c === '\\') return -1;
+    if (c === '(') depth++;
+    else if (c === ')') { if (depth > 0) depth--; else return s[j + 1] === ')' ? j + 2 : -1; }
+  }
+  return -1;
+};
 // The text with what the shell never expands blanked out: single-quoted strings and comments (double-quoted text expands, so it stays). Null for `$'…'`
 // or an unterminated quote (the caller keeps its answer).
 export function withoutLiteralText(s, { dqData = false } = {}) {
@@ -615,6 +627,9 @@ export function withoutLiteralText(s, { dqData = false } = {}) {
     }
     if (fr === 'dq') {
       if (ch === '"') stack.pop();
+      // Why (#81 replay): `"$n,$((n+6))p"` gave up at the second `(` (a sub frame), so the readings were off for the whole line. An arithmetic holds no quote, so it
+      // is copied as written (the caller judges the names in it); one that cannot be followed still gives up.
+      else if (ch === '$' && s.startsWith('$((', i)) { const e = arithEnd(s, i); if (e < 0) return null; out += s.slice(i, e); i = e; continue; }
       else if (ch === '$' && s[i + 1] === '(') { stack.push('sub'); out += '$('; i += 2; continue; }
       else if (ch === '`') stack.push('tick');
       else if (dqData) {

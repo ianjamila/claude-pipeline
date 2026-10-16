@@ -1994,6 +1994,49 @@ const LOOP_WORD = /^[A-Za-z0-9_@%+=:,./*?[\]-]+$/;
 const LOOP_WORD_IN = /^(?!=)(?:[A-Za-z0-9_@%+=:,./*?[\]-]|\$[A-Za-z_][A-Za-z0-9_]*(?![A-Za-z0-9_[:])|\$\{[A-Za-z_][A-Za-z0-9_]*\}(?![\[:]))+$/;
 // names a shell, git, gh, an interpreter or this guard read for themselves (where they act is not only where the line expands them): never read
 const SPECIAL_NAMES = /^(?:PATH|IFS|HOME|CDPATH|ENV|BASH_ENV|ZDOTDIR|PWD|OLDPWD|SHELL|SHELLOPTS|BASHOPTS|POSIXLY_CORRECT|PS\d|PROMPT_COMMAND|FPATH|MAILPATH|EDITOR|VISUAL|PAGER|TMOUT|HISTFILE|GIT\w*|GH_\w*|BASH\w*|ZSH\w*|LD_\w*|DYLD_\w*|NODE_\w*|NPM_\w*|PYTHON\w*|PERL\w*|RUBY\w*|PIPELINE_\w*|CLAUDE\w*|path|cdpath|fpath|manpath|mailpath|psvar|prompt\w*|precmd\w*|preexec\w*|chpwd\w*|periodic\w*|zshaddhistory\w*|zshexit\w*)$/;
+// #81: the scan in onceAssignedNames counts a bare mention of a name as a possible assignment. These three tell a mention that is provably not one.
+// awk's `-v NAME=value`: the mention follows `-v ` and the same command segment (up to a ; & | or newline) holds the word awk, so NAME= is awk's.
+// Anything else keeps being counted (`sort -v f=1`, `awk … && f=x`, `f=x` after the awk command all stay).
+function isAwkVar(text, i) {
+  if (!/(?:^|\s)-v\s+$/.test(text.slice(Math.max(0, i - 40), i))) return false;
+  const before = text.slice(0, i);
+  const seg = before.slice(Math.max(before.lastIndexOf(';'), before.lastIndexOf('&'), before.lastIndexOf('|'), before.lastIndexOf('\n')) + 1);
+  return /(?:^|\s)(?:awk|gawk|mawk|nawk)\s/.test(seg);
+}
+// A name read inside `$(( … ))`. The body must look like arithmetic (operators, numbers, names, parentheses: no `;`, quote, backtick, command
+// substitution, and no two words side by side, which is how `read n` or `echo n` would look inside a `$((cmd); …)` that is really a subshell), and the
+// name must not be assigned, incremented or indexed there (`n=`, `n+=`, `n<<=`, `n**=`, `n++`, `++n`, `n[0]=`).
+const ARITH_ASSIGN_AFTER = /^\s*(?:(?:\*\*|&&|\|\||\^\^|<<|>>|[-+*/%&|^])?=(?!=)|\+\+|--|\[)/;
+function enclosingArith(text, i) {
+  const open = text.lastIndexOf('$((', i);
+  if (open < 0) return null;
+  let depth = 0;
+  for (let j = open + 3; j < text.length; j++) {
+    const c = text[j];
+    if (c === '(') depth++;
+    else if (c === ')') { if (depth > 0) depth--; else return text[j + 1] === ')' && j >= i ? text.slice(open + 3, j) : null; }
+  }
+  return null;
+}
+function isArithRead(text, i, len) {
+  const body = enclosingArith(text, i);
+  if (body === null) return false;
+  if (!/^[\w\s+\-*/%&|^<>=!?:,()~.${}[\]]*$/.test(body) || /\w\s+\w/.test(body) || /\$\((?!\()/.test(body)) return false;
+  if (ARITH_ASSIGN_AFTER.test(text.slice(i + len)) || /(?:\+\+|--)\s*$/.test(text.slice(0, i))) return false;
+  return true;
+}
+// A bare word of the loop's own list that spells the loop's name (`for f in b c d e f`): the words are what the readings follow, so it is no assignment.
+// The header found in the text must be the site's own (the same words), so quoted text that looks like a header never hides a later `read f`.
+function isLoopListWord(text, i, k, site) {
+  if (site.argv[0] !== 'for' || !/\s$/.test(text.slice(i - 1, i)) || !/^(?:\s|;|$)/.test(text.slice(i + k.length, i + k.length + 1))) return false;
+  const head = new RegExp(`(?:^|[\\s;&|(){])for\\s+${k}\\s+in\\s+([^;\\n]*)`).exec(text);
+  if (!head) return false;
+  const start = head.index + head[0].length - head[1].length;
+  if (i < start || i >= start + head[1].length) return false;
+  const words = head[1].trim().split(/\s+/);
+  const mine = site.argv.slice(3);
+  return words.length === mine.length && words.every((w, x) => w === mine[x]);
+}
 function onceAssignedNames(cmds, ctx, str) {
   if (ctx.tainted.size || cmds.truncated || cmds.dynamic || definesFunction(str, cmds) || cmds.some(isStateHazard) || !subshellsTrusted(cmds) || indirectExpansionOnLine(str, cmds)) return [];
   for (const c of cmds) {
@@ -2065,7 +2108,12 @@ function onceAssignedNames(cmds, ctx, str) {
       if (before.endsWith('${')) { if (/^(?::?=|::)/.test(after) || after[0] === '[') odd = true; continue; } // (zsh `${k::=x}` assigns too)
       if (before.endsWith('$')) { if (after[0] === '[') odd = true; continue; }
       // (a name right after - . / is part of an option or a path, `ps -p $p`, `cd /tmp/p`: no assignment can start there)
-      if (/[-./]$/.test(before)) continue;
+      // (nor right after a backslash: `\s` / `\n` in a regex, or `\n=x` outside quotes, is text or one word that starts with the backslash. #81)
+      if (/--\s*$/.test(text.slice(Math.max(0, m.index - 40), m.index)) && enclosingArith(text, m.index) !== null) { odd = true; continue; } // ($((--n)) decrements; the `-` below is a path or an option otherwise)
+      if (/[-./\\]$/.test(before)) continue;
+      if (after[0] === '=' && isAwkVar(text, m.index)) continue; // (awk's `-v NAME=value` sets awk's variable, not the shell's. #81)
+      if (isArithRead(text, m.index, k.length)) continue; // (a read inside $(( )); an assignment operator there is not skipped. #81)
+      if (isLoopListWord(text, m.index, k, site)) continue; // (`for f in b c f`: a word of the list. #81)
       if (after[0] === '=') { assigns++; continue; }
       if (/(?:^|[\s;&|(){])for\s+$/.test(text.slice(Math.max(0, m.index - 8), m.index)) && site.argv[0] === 'for') { assigns++; continue; } // (the loop's own name)
       odd = true;
