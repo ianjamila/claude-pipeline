@@ -201,3 +201,28 @@ test('owner-go: the newest prompt in the transcript is "the current one" only wh
   const fresh = { ...stale, transcript_path: transcript(home, [user('go'), said(REQUEST)]) };
   assert.deepEqual(recordApproval(fresh, { home, now }).requests, [{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS }]);
 });
+
+// #58 round 4: an image-only (or any non-text, non-tool_result) user message is a prompt boundary too
+test('owner-go: a user message with no tool_result is a prompt, text or not', () => {
+  const home = tmp();
+  const image = { type: 'user', message: { content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } }] } };
+  const tools = { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'x', name: 'Bash', input: {} }] } };
+  // request -> image-only user message -> tool-only assistant turn -> "merge": the request is stale
+  assert.equal(lastRequestText(transcript(home, [user('go'), said(REQUEST), image, tools, user('merge')]), { prompt: 'merge' }), '');
+  assert.equal(lastRequestText(transcript(home, [user('go'), said(REQUEST), image, tools, user('merge')])), '');
+  // the image is the newest entry (the hook runs before the transcript has "merge"): an older, unanswered prompt, not the current one
+  assert.equal(lastRequestText(transcript(home, [user('go'), said(REQUEST), image]), { prompt: 'merge' }), '');
+  // a text + image message is a prompt whose text is compared
+  const both = { type: 'user', message: { content: [{ type: 'text', text: 'merge' }, image.message.content[0]] } };
+  assert.match(lastRequestText(transcript(home, [user('go'), said(REQUEST), both]), { prompt: 'merge' }), /Ready to merge #58/);
+  // an image-only message is the current prompt only when the submitted prompt is empty too
+  assert.match(lastRequestText(transcript(home, [user('go'), said(REQUEST), image]), { prompt: '' }), /Ready to merge #58/);
+  assert.equal(lastRequestText(transcript(home, [user('go'), said(REQUEST), image]), { prompt: 'merge' }), '');
+  // tool_result entries stay non-prompts (even with other blocks), and the request survives them
+  const mixed = { type: 'user', message: { content: [{ type: 'tool_result', content: 'ok' }, image.message.content[0]] } };
+  assert.match(lastRequestText(transcript(home, [user('go'), said(REQUEST), toolResult(), mixed, user('merge')]), { prompt: 'merge' }), /Ready to merge #58/);
+  // through the recorder
+  const now = () => Date.parse('2026-10-14T10:00:00Z');
+  const stale = { hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: 'merge', transcript_path: transcript(home, [user('go'), said(REQUEST), image, tools, user('merge')]) };
+  assert.deepEqual(recordApproval(stale, { home, now }).requests, []);
+});

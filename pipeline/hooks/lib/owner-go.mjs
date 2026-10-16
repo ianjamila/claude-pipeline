@@ -119,10 +119,11 @@ export function lastRequestText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BY
     try { e = JSON.parse(line); } catch { continue; }
     const content = e?.message?.content;
     if (e?.type === 'user') {
-      const isPrompt = typeof content === 'string' || (Array.isArray(content) && content.some((b) => b?.type === 'text') && !content.some((b) => b?.type === 'tool_result'));
+      // (round 4: a user message is a prompt unless it carries a tool_result: an image-only message is one too, with no text)
+      const isPrompt = typeof content === 'string' || (Array.isArray(content) && !content.some((b) => b?.type === 'tool_result'));
       if (isPrompt) {
         replies.push('');
-        lastPromptText = plain(typeof content === 'string' ? content : content.filter((b) => b?.type === 'text').map((b) => b.text).join('\n'));
+        lastPromptText = plain(typeof content === 'string' ? content : content.filter((b) => b?.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n'));
       }
       lastIsPrompt = isPrompt;
     } else if (e?.type === 'assistant' && Array.isArray(content)) {
