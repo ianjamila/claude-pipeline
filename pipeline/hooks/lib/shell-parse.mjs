@@ -588,6 +588,111 @@ const BINDERS = /(?<![\w.$/-])(?:read|declare|typeset|local|export|readonly|mapf
 // sysopen -u, syswrite -c, pcre_match -v / -a (MATCH), zgetattr, zlistattr, zcurses, compadd -A / -O, zle -U / widgets)
 export const ZSH_NAME_BINDERS = new Set(['vared', 'zparseopts', 'strftime', 'zstyle', 'sysread', 'zstat', 'getln', 'integer', 'float', 'private', 'zformat', 'zregexparse',
   'ztcp', 'zsocket', 'zpty', 'zselect', 'zsystem', 'sysopen', 'syswrite', 'pcre_match', 'zgetattr', 'zlistattr', 'zcurses', 'compadd', 'zle']);
+// The text with what the shell never expands blanked out: single-quoted strings and comments (double-quoted text expands, so it stays). Null for `$'…'`
+// or an unterminated quote (the caller keeps its answer).
+export function withoutLiteralText(s, { dqData = false } = {}) {
+  // Why (#56 replay): `for n in 1 2; do echo "$n $(gh pr view $n --jq '.x')"; done` lost its readings because a quote inside a $( … ) inside double quotes
+  // gave up. A $( … ) starts a fresh quoting context (its single quotes are quotes again), so each context is a frame on a stack: top, a double-quoted
+  // string, a $( … ), a backtick. Still given up (null): a bare ( or $(( inside a $( … ) (a case pattern or arithmetic would end it early), a quote or ( inside
+  // backticks, $'…', and anything left open at the end.
+  // Also given up: a `case` inside a $( … ) -- its patterns end in a bare `)` that this scanner would take for the end of the $( … ), and every quote after
+  // it would then be read in the wrong context (security review of 61296d8).
+  // `dqData` (#56 replay: `for f in a.ts b.ts; do node -e "const f='$f'; fs.readFileSync(f)"; done` read `f=` and `(f` in the program as shell text): inside
+  // double quotes only `$name`, `${…}`, `$( … )` and backticks are the shell's, so any other word there is blanked too. A `${…}` is kept as written (`${f:=x}`
+  // assigns); one holding a quote, a `$`, a backtick, a brace or a backslash ends the blanking for the rest of the text (kept, as without dqData). `$[ … ]`
+  // (arithmetic, it can assign) gives up.
+  let out = '';
+  const stack = ['top'];
+  const cur = () => stack[stack.length - 1];
+  for (let i = 0; i < s.length;) {
+    const ch = s[i];
+    const fr = cur();
+    if (ch === '\\') { out += s.slice(i, i + 2); i += 2; continue; }
+    if (fr === 'tick') {
+      if (ch === '`') stack.pop();
+      else if (ch === "'" || ch === '"' || ch === '(') return null;
+      out += ch; i++; continue;
+    }
+    if (fr === 'dq') {
+      if (ch === '"') stack.pop();
+      else if (ch === '$' && s[i + 1] === '(') { stack.push('sub'); out += '$('; i += 2; continue; }
+      else if (ch === '`') stack.push('tick');
+      else if (dqData) {
+        if (ch === '$' && s[i + 1] === '[') return null;
+        if (ch === '$' && s[i + 1] === '{') {
+          const j = s.indexOf('}', i + 2);
+          if (j < 0 || /["'`$\\{]/.test(s.slice(i + 2, j))) dqData = false;
+          else { out += s.slice(i, j + 1); i = j + 1; continue; }
+        } else if (ch === '$' && /[A-Za-z0-9_]/.test(s[i + 1] ?? '')) {
+          const w = /^\$[A-Za-z0-9_]+/.exec(s.slice(i))[0];
+          out += w; i += w.length; continue;
+        } else if (/[A-Za-z0-9_]/.test(ch)) {
+          const w = /^[A-Za-z0-9_]+/.exec(s.slice(i))[0];
+          out += ' '.repeat(w.length); i += w.length; continue;
+        }
+      }
+      out += ch; i++; continue;
+    }
+    // top or sub: the same quoting rules
+    if (ch === '$' && s[i + 1] === "'") return null;
+    if (ch === "'") {
+      const j = s.indexOf("'", i + 1);
+      if (j < 0) return null;
+      out += ' '.repeat(j + 1 - i); i = j + 1; continue;
+    }
+    if (ch === '"') { stack.push('dq'); out += ch; i++; continue; }
+    if (fr === 'sub') {
+      if (ch === '$' && s[i + 1] === '(') { if (s[i + 2] === '(') return null; stack.push('sub'); out += '$('; i += 2; continue; }
+      if (ch === '(') return null;
+      if (ch === 'c' && s.startsWith('case', i) && !/[A-Za-z0-9_]/.test(s[i + 4] ?? '') && (i === 0 || !/[A-Za-z0-9_]/.test(s[i - 1]))) return null;
+      if (ch === ')') { stack.pop(); out += ch; i++; continue; }
+      if (ch === '`') return null;
+    }
+    if (ch === '#' && (i === 0 || /[\s;&|()]/.test(s[i - 1]))) {
+      const j = s.indexOf('\n', i);
+      const e = j < 0 ? s.length : j;
+      out += ' '.repeat(e - i); i = e; continue;
+    }
+    out += ch; i++;
+  }
+  return stack.length === 1 ? out : null;
+}
+export const INDIRECT_EXPANSION = /\$\{(?:!|\((?!%\)[:}])[^)]*\)|[A-Za-z_]\w*::=)/; // (fail closed: `${!…}`, zsh `${N::=…}` and every zsh flag expansion but the prompt-only `${(%):…}` with no name (the script-directory idiom `${${(%):-%x}:A:h}`); P, e, A, … can assign)
+// Is there an indirect expansion in the text the shell expands? (#56 replay of 96848c2: a JavaScript template `${(err.stderr || …)}` in a quoted heredoc
+// body or a single-quoted `node -e '…'` program is no expansion, and refusing it cost ~110 lines in 21 days.) Quoted heredoc bodies and single-quoted
+// text are blanked; unquoted bodies and double-quoted text expand, so they stay. True (fail closed) where the text cannot be told: `$'…'`, an unterminated
+// quote, heredoc spans that cannot be placed.
+export function indirectExpansionOnLine(str, cmds) {
+  if (!INDIRECT_EXPANSION.test(str)) return false;
+  let t = String(str);
+  if (/<</.test(t)) {
+    const spans = cmds?.heredocSpans;
+    if (!Array.isArray(spans)) return true;
+    for (const [a, b, quoted] of spans) {
+      if (!(a >= 0 && a <= b && b <= t.length)) return true;
+      if (quoted) t = t.slice(0, a) + t.slice(a, b).replace(/[^\n]/g, ' ') + t.slice(b);
+    }
+  }
+  // Single-quoted text is blanked by a scanner of its own: withoutLiteralText also blanks comments, and it reads the `#` of `${(#)X}` as one. Nothing else
+  // is taken out, so text left in only refuses more. A backslash keeps the next character from the shell, in or out of double quotes (`\${(e as X)}` is
+  // text; `\\${…}` still expands). `$'…'` and an unterminated single quote: true.
+  let u = '';
+  let q = null;
+  for (let i = 0; i < t.length; i++) {
+    const ch = t[i];
+    if (q === "'") { if (ch === "'") q = null; u += ch === '\n' ? '\n' : ' '; continue; }
+    if (ch === '\\') { u += '  '; i++; continue; }
+    if (q === '"') { if (ch === '"') q = null; u += ch; continue; }
+    if (ch === "'") { if (t[i - 1] === '$') return true; q = "'"; u += ' '; continue; }
+    if (ch === '"') q = '"';
+    u += ch;
+  }
+  return q === "'" || INDIRECT_EXPANSION.test(u.replace(SAFE_FLAG_EXPANSION, '${'));
+}
+// Why (#56 replay of 96848c2): `for x in ${(f)f}`, `FILES=("${(@f)$(git diff --name-only)}")`, `${(@u)FILES}` are common zsh and cannot assign: flags
+// that only split, join, sort, unique, quote or count (no P, e, A, g, ~, ^, =, # (arithmetic: it can assign)), with a plain delimiter, followed by a NAME and `}` or by a command
+// substitution (it runs in a subshell). Anything else after the flags (`${(f)F::=x}`, `${(f)F:=x}`, `${(s:$x:)…}`) stays an indirect expansion.
+const SAFE_FLAG_EXPANSION = /\$\{\((?:[@fFuUoOinkvaqQzLcwWt0]|[sj]:[^:$(){}'"`\\]*:)+\)(?=[A-Za-z_]\w*\}|"?\$\()/g;
 // zsh `=~` and the (#b) / (#m) glob flags set these, bash `=~` sets BASH_REMATCH
 const MATCH_NAMES = ['MATCH', 'match', 'MBEGIN', 'MEND', 'mbegin', 'mend', 'BASH_REMATCH'];
 // The names a command sets without being given them: `read` REPLY (zsh `read -A`: reply), `select` REPLY, `getopts` OPTARG / OPTIND, `mapfile` MAPFILE,

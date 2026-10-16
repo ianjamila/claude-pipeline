@@ -552,3 +552,28 @@ test('#56 Fable review of 2edea61: a zsh precommand modifier, an option carrying
   assert.equal(git('for n in 5; do noglob echo x; gh issue close $n; done', fsx, { issueLabels: labels }).decision, 'allow');
   allowBoth('for f in src/a.ts a.mjs; do cp $f /tmp/x/; done', SPEC);
 });
+
+test('#56 replay of 96848c2: template text the shell never expands, and zsh flags that cannot assign, are no indirect expansion', () => {
+  const D = fakeFs(PROJ, {}, DIRS);
+  for (const cmd of [
+    "D=/tmp/x; cat > $D/a.mjs <<'EOF'\nconst m = `${(e.stderr || e.message)}`\nEOF\necho ok > $D/b.txt", // (a quoted heredoc body is data)
+    "D=/tmp/x; node -e 'const m = `${(e.stderr)}`' > $D/b.txt", // (single quotes)
+    'D=/tmp/x; node -e "const m = \\`\\${(e as X)}\\`" > $D/b.txt', // (an escaped dollar)
+    'D=/tmp/x; FILES=("${(@f)$(git diff --name-only)}"); echo ${(@u)FILES} > $D/b.txt',
+    'D=/tmp/x; for f in ${(f)"$(ls)"}; do wc -l "$f"; done > $D/b.txt',
+  ]) assert.equal(files(cmd, D).decision, 'allow', cmd);
+  for (const cmd of [
+    'F=safe; : "${(P)N::=settings.json}"; printf x > ~/.claude/$F',
+    'F=safe; : ${(f)F::=settings.json}; printf x > ~/.claude/$F', // (flags, then an assignment)
+    'F=safe; : ${(f)F:=x}${(e)X}; printf x > ~/.claude/$F',
+    'F=safe; : ${(#)X}; printf x > ~/.claude/$F', // (# evaluates arithmetic: X may hold F=…)
+    'F=safe; : ${(s:$X:)Y}; printf x > ~/.claude/$F',
+    'F=safe; : "\\\\${(P)N::=settings.json}"; printf x > ~/.claude/$F', // (an escaped backslash: the expansion is real)
+    "F=safe; cat <<EOF\n${(P)N::=settings.json}\nEOF\nprintf x > ~/.claude/$F", // (an unquoted heredoc body expands)
+  ]) assert.equal(files(cmd, D).decision, 'deny', cmd);
+  for (const cmd of [
+    'B=agent/x; : ${(f)B::=main}; git push origin $B',
+    "B=agent/x; cat <<EOF\n${(P)N::=main}\nEOF\ngit push origin $B",
+  ]) denyGit(cmd, SPEC);
+  allowGit("B=agent/x; node -e 'const m = `${(e.stderr)}`'; git push origin $B", SPEC);
+});

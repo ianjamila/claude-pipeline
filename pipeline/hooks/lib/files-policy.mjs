@@ -19,7 +19,7 @@ import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
-import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS } from './shell-parse.mjs';
+import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, indirectExpansionOnLine } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
 import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit, execLinesOf, paramReadings, assigningDefaults, spliceLines } from './script-candidates.mjs';
 
@@ -2137,7 +2137,6 @@ const MAX_LOOP_READINGS = 64;
 // (a reading where the loop did not run: the name is not set by the line, as main read every loop variable)
 const LOOP_NOT_RUN = Symbol('loop not run');
 // A zsh parameter expansion with flags (`${(P)N::=x}` assigns the variable N names) or a bash indirect one (`${!N}`).
-const INDIRECT_EXPANSION = /\$\{(?:!|\((?!%\)[:}])[^)]*\)|[A-Za-z_]\w*::=)/; // (fail closed: `${!…}`, zsh `${N::=…}` and every zsh flag expansion but the prompt-only `${(%):…}` with no name (the script-directory idiom `${${(%):-%x}:A:h}`); P, e, A, … can assign)
 // The readings of a text's loop variables: one Map (name -> word) per combination, [null] when there are too many, null when the text has no loop.
 function loopReadings(command, opts) {
   const cmds = simpleCommands(command, { env: opts.env ?? process.env });
@@ -2148,7 +2147,7 @@ function loopReadings(command, opts) {
     loops.set(c.argv[1], [...new Set([...(loops.get(c.argv[1]) ?? []), ...(words.length ? words : ['']), LOOP_NOT_RUN])]);
   }
   if (!loops.size) return null;
-  if (INDIRECT_EXPANSION.test(command)) return [null]; // (an indirect expansion may set any loop variable: every one is only known at run time)
+  if (indirectExpansionOnLine(command, cmds)) return [null]; // (an indirect expansion may set any loop variable: every one is only known at run time)
   const names = [...loops.keys()];
   const total = names.reduce((n, k) => n * loops.get(k).length, 1);
   if (total > MAX_LOOP_READINGS) return [null];
@@ -2351,7 +2350,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // Why: after a cd into a directory only known at run time a relative script may be in the directories the line knows OR in any protected one (or above one): each is looked in
   // Why: a binder on the line (`read F`, `mapfile`, `getopts`, `printf -v F`, a nameref's target) gives its names a run-time value: a script they pick is refused, and a writer that uses a name the line had
   // given a value is refused, whatever the line assigned before. Applied as the command is reached (a name the line gave a value is also in unknownVars, which the per-command snapshots carry, so a loop binder reaches the commands above it and a later plain assignment does not clean an earlier use).
-  const lineIndirect = typeof command === 'string' && INDIRECT_EXPANSION.test(command);
+  const lineIndirect = typeof raw === 'string' && indirectExpansionOnLine(raw, cmds); // (only the text the shell expands: see indirectExpansionOnLine)
   const markBound = (c) => {
     // (#56, Codex review of 8b86e2b; on main too: zsh `${(P)N::=~/.claude/settings.json}` / a bash `${!N…}` may set any name, like `export $N=…`)
     if (lineIndirect) { ctx.unknownAll = true; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.unknownVars.add(k); ctx.srcChanged.add(k); } }

@@ -15,7 +15,8 @@
 import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES } from './shell-parse.mjs';
+import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine } from './shell-parse.mjs';
+export { withoutLiteralText, INDIRECT_EXPANSION };
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
 import { scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
@@ -1571,11 +1572,14 @@ function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0) {
   // NAME is only known at run time (export / declare / local / typeset / readonly, read, mapfile, getopts, unset, let, select, printf -v) may set
   // any variable: every name the line assigns or reads is unknown from here on.
   // (#56, Codex review of 8b86e2b: zsh `${(P)N::=main}` assigns the variable N names, a bash `${!N…}` reads or sets through it: the same, on main too)
-  if (cmds.some(bindsRunTimeName) || cmds.some(indirectExpansion)) for (const k of [...Object.keys(ctx.vars), ...namesReadOn(cmds)]) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
+  if (cmds.some(bindsRunTimeName) || cmds.some((c) => indirectExpansion(c, cmds)) || (cmds.heredocSpans ?? []).some?.((s) => !s[2]) && INDIRECT_EXPANSION.test(String(ctx.fullText ?? ''))) for (const k of [...Object.keys(ctx.vars), ...namesReadOn(cmds)]) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
 }
 // A zsh parameter expansion with flags (`${(P)N::=x}` assigns the variable N names) or a bash indirect one (`${!N}`), anywhere in a command's words.
-export const INDIRECT_EXPANSION = /\$\{(?:!|\((?!%\)[:}])[^)]*\)|[A-Za-z_]\w*::=)/; // (fail closed: `${!…}`, zsh `${N::=…}` and every zsh flag expansion but the prompt-only `${(%):…}` with no name (the script-directory idiom `${${(%):-%x}:A:h}`); P, e, A, … can assign)
-const indirectExpansion = (c) => [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')].some((w) => INDIRECT_EXPANSION.test(String(w)));
+// (#56 replay of 96848c2: judged on the command's own text, single-quoted parts blanked — a `node -e '…${(x)}…'` program is no expansion; its words, quotes
+// removed, when the text is not there or the line has an unquoted heredoc, whose body expands and is not in the command's text: then the line's whole
+// text is looked at, fail closed)
+const indirectExpansion = (c, cmds) => (typeof c.raw === 'string' && c.raw && !(cmds?.heredocSpans ?? []).some?.((s) => !s[2]) ? indirectExpansionOnLine(c.raw, null) : argvIndirect(c));
+const argvIndirect = (c) => [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')].some((w) => INDIRECT_EXPANSION.test(String(w)));
 // A command that binds a variable whose name is only known at run time (see collectAssignments).
 function bindsRunTimeName(c) {
   if (!c.argv.length) return false;
@@ -1796,77 +1800,8 @@ const LOOP_WORD = /^[A-Za-z0-9_@%+=:,./*?[\]-]+$/;
 const LOOP_WORD_IN = /^(?!=)(?:[A-Za-z0-9_@%+=:,./*?[\]-]|\$[A-Za-z_][A-Za-z0-9_]*(?![A-Za-z0-9_[:])|\$\{[A-Za-z_][A-Za-z0-9_]*\}(?![\[:]))+$/;
 // names a shell, git, gh, an interpreter or this guard read for themselves (where they act is not only where the line expands them): never read
 const SPECIAL_NAMES = /^(?:PATH|IFS|HOME|CDPATH|ENV|BASH_ENV|ZDOTDIR|PWD|OLDPWD|SHELL|SHELLOPTS|BASHOPTS|POSIXLY_CORRECT|PS\d|PROMPT_COMMAND|FPATH|MAILPATH|EDITOR|VISUAL|PAGER|TMOUT|HISTFILE|GIT\w*|GH_\w*|BASH\w*|ZSH\w*|LD_\w*|DYLD_\w*|NODE_\w*|NPM_\w*|PYTHON\w*|PERL\w*|RUBY\w*|PIPELINE_\w*|CLAUDE\w*|path|cdpath|fpath|manpath|mailpath|psvar|prompt\w*|precmd\w*|preexec\w*|chpwd\w*|periodic\w*|zshaddhistory\w*|zshexit\w*)$/;
-// The text with what the shell never expands blanked out: single-quoted strings and comments (double-quoted text expands, so it stays). Null for `$'…'`
-// or an unterminated quote (the caller keeps its answer).
-export function withoutLiteralText(s, { dqData = false } = {}) {
-  // Why (#56 replay): `for n in 1 2; do echo "$n $(gh pr view $n --jq '.x')"; done` lost its readings because a quote inside a $( … ) inside double quotes
-  // gave up. A $( … ) starts a fresh quoting context (its single quotes are quotes again), so each context is a frame on a stack: top, a double-quoted
-  // string, a $( … ), a backtick. Still given up (null): a bare ( or $(( inside a $( … ) (a case pattern or arithmetic would end it early), a quote or ( inside
-  // backticks, $'…', and anything left open at the end.
-  // Also given up: a `case` inside a $( … ) -- its patterns end in a bare `)` that this scanner would take for the end of the $( … ), and every quote after
-  // it would then be read in the wrong context (security review of 61296d8).
-  // `dqData` (#56 replay: `for f in a.ts b.ts; do node -e "const f='$f'; fs.readFileSync(f)"; done` read `f=` and `(f` in the program as shell text): inside
-  // double quotes only `$name`, `${…}`, `$( … )` and backticks are the shell's, so any other word there is blanked too. A `${…}` is kept as written (`${f:=x}`
-  // assigns); one holding a quote, a `$`, a backtick, a brace or a backslash ends the blanking for the rest of the text (kept, as without dqData). `$[ … ]`
-  // (arithmetic, it can assign) gives up.
-  let out = '';
-  const stack = ['top'];
-  const cur = () => stack[stack.length - 1];
-  for (let i = 0; i < s.length;) {
-    const ch = s[i];
-    const fr = cur();
-    if (ch === '\\') { out += s.slice(i, i + 2); i += 2; continue; }
-    if (fr === 'tick') {
-      if (ch === '`') stack.pop();
-      else if (ch === "'" || ch === '"' || ch === '(') return null;
-      out += ch; i++; continue;
-    }
-    if (fr === 'dq') {
-      if (ch === '"') stack.pop();
-      else if (ch === '$' && s[i + 1] === '(') { stack.push('sub'); out += '$('; i += 2; continue; }
-      else if (ch === '`') stack.push('tick');
-      else if (dqData) {
-        if (ch === '$' && s[i + 1] === '[') return null;
-        if (ch === '$' && s[i + 1] === '{') {
-          const j = s.indexOf('}', i + 2);
-          if (j < 0 || /["'`$\\{]/.test(s.slice(i + 2, j))) dqData = false;
-          else { out += s.slice(i, j + 1); i = j + 1; continue; }
-        } else if (ch === '$' && /[A-Za-z0-9_]/.test(s[i + 1] ?? '')) {
-          const w = /^\$[A-Za-z0-9_]+/.exec(s.slice(i))[0];
-          out += w; i += w.length; continue;
-        } else if (/[A-Za-z0-9_]/.test(ch)) {
-          const w = /^[A-Za-z0-9_]+/.exec(s.slice(i))[0];
-          out += ' '.repeat(w.length); i += w.length; continue;
-        }
-      }
-      out += ch; i++; continue;
-    }
-    // top or sub: the same quoting rules
-    if (ch === '$' && s[i + 1] === "'") return null;
-    if (ch === "'") {
-      const j = s.indexOf("'", i + 1);
-      if (j < 0) return null;
-      out += ' '.repeat(j + 1 - i); i = j + 1; continue;
-    }
-    if (ch === '"') { stack.push('dq'); out += ch; i++; continue; }
-    if (fr === 'sub') {
-      if (ch === '$' && s[i + 1] === '(') { if (s[i + 2] === '(') return null; stack.push('sub'); out += '$('; i += 2; continue; }
-      if (ch === '(') return null;
-      if (ch === 'c' && s.startsWith('case', i) && !/[A-Za-z0-9_]/.test(s[i + 4] ?? '') && (i === 0 || !/[A-Za-z0-9_]/.test(s[i - 1]))) return null;
-      if (ch === ')') { stack.pop(); out += ch; i++; continue; }
-      if (ch === '`') return null;
-    }
-    if (ch === '#' && (i === 0 || /[\s;&|()]/.test(s[i - 1]))) {
-      const j = s.indexOf('\n', i);
-      const e = j < 0 ? s.length : j;
-      out += ' '.repeat(e - i); i = e; continue;
-    }
-    out += ch; i++;
-  }
-  return stack.length === 1 ? out : null;
-}
 function onceAssignedNames(cmds, ctx, str) {
-  if (ctx.tainted.size || cmds.truncated || cmds.dynamic || definesFunction(str, cmds) || cmds.some(isStateHazard) || !subshellsTrusted(cmds) || INDIRECT_EXPANSION.test(str)) return [];
+  if (ctx.tainted.size || cmds.truncated || cmds.dynamic || definesFunction(str, cmds) || cmds.some(isStateHazard) || !subshellsTrusted(cmds) || indirectExpansionOnLine(str, cmds)) return [];
   for (const c of cmds) {
     if (!c.argv.length) continue;
     const nm = baseName(c.argv[0]);
