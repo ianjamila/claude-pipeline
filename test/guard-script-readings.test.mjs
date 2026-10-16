@@ -3,8 +3,9 @@
 // about them is risky (replay of 21 days of transcripts, "bucket F"):
 //   F1. a script with its own loop: `for f in a b; do node chk.mjs $f; done`, run by `bash scripts/run.sh`.
 //   F2. the same script written by the line (`cat > x.sh <<'EOF' … EOF`) and then run.
-//   F3. a name collision: the line's loop name flows into the script (`for n in 1 2; do bash scripts/brief.sh plan $n; done` with `n=$2` in brief.sh), although a child shell
-//       starts with the EXPORTED variables of its parent only (superpowers' task-brief pattern).
+//   F3. a name collision: the line's loop name flows into the script (`for n in 1 2; do bash scripts/brief.sh plan $n; done` with `n=$2` in brief.sh; superpowers' task-brief pattern).
+//       The script's own assignment is read both ways like a line's, so the collision needs no rule about which names a child shell inherits; the twins below pin what must
+//       still reach the script (exported names, a prefix assignment, `set -a`, a sourced file's shared variables).
 // Each shape is allowed now, next to its malicious twins (a fake script that holds a guarded command), which must stay refused. The file system is faked; guarded text only lives
 // in fake file contents. The files guard has loop handling of its own (unchanged here): these tests judge the git guard, and the twins are also checked against the files guard.
 import { test } from 'node:test';
@@ -36,7 +37,7 @@ const BAD_GIT = 'git push origin main';
 const BAD_FILES = 'echo x > ~/.claude/settings.json';
 const DIRS = ['scripts', 'sub'];
 const git = (command, files, o = {}) => evaluateGitCommand(command, {
-  cwd: GIT_ROOT, home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], ...fakeFs(GIT_ROOT, files, DIRS), ...o,
+  cwd: GIT_ROOT, home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs(GIT_ROOT, files, DIRS), ...o,
 });
 const filesGuard = (command, files) => {
   const fs = fakeFs(PROJ, files, DIRS);
@@ -141,7 +142,7 @@ test('F2 twins: a written script with a loop over a bad script stays refused', (
 
 const BRIEF = 'set -euo pipefail\nn=$2\nawk -v n="$n" \'BEGIN { print n }\' plan.md\n';
 
-test('F3: a child shell starts with the exported variables only: the line\'s loop name does not reach it', () => {
+test('F3: the line\'s loop name and a name the script assigns once are both read (brief.sh: n=$2)', () => {
   const fs = { ...CHK, 'scripts/brief.sh': BRIEF, 'plan.md': 'x' };
   for (const cmd of [
     'bash scripts/brief.sh plan 1', // (the same script run once is allowed)
