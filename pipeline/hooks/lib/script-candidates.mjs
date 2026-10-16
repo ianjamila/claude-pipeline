@@ -180,6 +180,21 @@ export function countScript(budget) {
   if (--budget.scripts < 0) throw new GuardLimit('too many script files to check (scripts that run scripts that run scripts ...), so what they run cannot be verified. Name the script file.');
 }
 
+// Why (#74): zsh applies to an UNBRACED `$NAME` a modifier after `:` (`$B:r`, `:h :t :e :a :A :l :u :q :Q :P :s/…/…/ :&`, the prefixes `:f :F :w :W :g`) and a subscript
+// after `[` (`$B[1,6]`); the hook does not know the shell, so a name followed by either is a value only known at run time and is never expanded. `${B}:r` is no
+// modifier (the value, then text) and `$H:8080` / `$A:$B` / `$X:done` have no modifier letter after the `:`, so they are worked out as before. (`:p :S :G`
+// are not modifiers of a parameter in zsh 5.9, probed. A bash-style `$B:feature/x` IS read by zsh as `:f` + `e` + `ature/x`, so it is a run-time value too.)
+// Lookahead for a regex that matches the bare name: put it after the name and after a `(?![A-Za-z0-9_])` (the name takes every letter that follows).
+const ZSH_TAIL = '\\[|:[aAcefFghlPqQrstuwWx&]';
+export const ZSH_MODIFIED = `(?!${ZSH_TAIL})`;
+// The names the texts read with a modifier or a subscript (`$B:r`, `"$B[1,6]"`): the guards' bookkeeping of a name (known value, assigned once) does not hold for
+// them, because the word the shell makes of it is not the value; they are treated as a name only known at run time.
+export function zshModifiedNames(texts) {
+  const out = new Set();
+  for (const t of texts) for (const m of String(t).matchAll(new RegExp(`\\$(\\w+)(?!\\w)(?=${ZSH_TAIL})`, 'g'))) out.add(m[1]);
+  return out;
+}
+
 // `text.replace(re, ...)` where `lookup(match, ...groups)` gives the replacement (or the match itself when nothing is known),
 // counted as it grows: the text ADDED by one call may not exceed MAX_EXPANDED_CHARS, nor the text added across the evaluation
 // MAX_EXPANDED_TOTAL. Growth is counted, never the length of `text` itself: a program file judged as text can be 1 MB. It throws before the oversized string exists (`A=<100k chars>; ... $A$A$A` x 50k refs is gigabytes).

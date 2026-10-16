@@ -19,7 +19,7 @@ import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf,
 export { withoutLiteralText, INDIRECT_EXPANSION };
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
-import { scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
+import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
 
 const PROTECTED_BRANCHES = ['main', 'master'];
 const APPROVAL_LABELS = ['human-approved', 'test-change-approved'];
@@ -148,8 +148,10 @@ const flagValues = (flags, longNames, shortNames = '') => flags
 // $NAME / ${NAME} that an earlier command on the same line assigned; anything else is left as written.
 // A value is substituted as written (never expanded again), but a long value used in many words still multiplies, so the
 // text produced is capped per result and per evaluation (substitute throws GuardLimit, which evaluateGitCommand denies).
+// (an unbraced name that zsh would read a modifier or a subscript after is left as written: ZSH_MODIFIED, #74; `${B}:r` is no modifier)
+const EXPAND_RE = new RegExp(`\\$(?:\\{([A-Za-z_][A-Za-z0-9_]*)\\}|([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_])${ZSH_MODIFIED})`, 'g');
 function expandVars(text, ctx) {
-  return substitute(ctx.budget, String(text), /\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g, (m, a, b) => ctx.vars[a ?? b] ?? m);
+  return substitute(ctx.budget, String(text), EXPAND_RE, (m, a, b) => ctx.vars[a ?? b] ?? m);
 }
 
 // Everything a script judged here can depend on: the directory, the nesting level and the line's variable / branch / config / alias state.
@@ -1752,6 +1754,9 @@ function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0, text = 
   }
   // (only the ones the line assigns or reads: an unsure name nobody uses changes nothing. `$_` / `status` / RANDOM …, which every command sets, only when
   // the line assigns them: `$_` in a ruby / perl program word is that program's)
+  // Why (#74): zsh reads `$B:r` / `$B[1,6]` (an unbraced name and a modifier or subscript) as another word than the one expandVars gives (`B=run.sh.x; bash $B:r` runs run.sh).
+  // A name the line assigns and reads so is only known at run time wherever it is used, like one assigned twice; what is built from it is unsure too (unsureVarReachingCommand).
+  for (const k of zshModifiedNames(cmds.flatMap((c) => [...c.argv, ...Object.values(c.env), ...(c.redirects ?? []).map((r) => r.target ?? '')]))) if (counts.has(k) || k in ctx.vars) { bump(k, 2); (ctx.zshNames ??= new Set()).add(k); }
   if (implicit.size) { const reads = namesReadOn(cmds); for (const k of implicit) if (counts.has(k) || k in ctx.vars || (reads.has(k) && !SHELL_SET_NAMES.includes(k))) bump(k, 2); }
   for (const [k, n] of counts) if (n > 1) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
   // Why (#56, a live bypass on main): `F=ok.sh; export $N=run.sh; bash $F` ran run.sh when N held F, while the guard judged ok.sh. A binder whose
@@ -1760,6 +1765,7 @@ function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0, text = 
   // (#56, Codex review of 8b86e2b: zsh `${(P)N::=main}` assigns the variable N names, a bash `${!N…}` reads or sets through it: the same, on main too)
   if (cmds.some(bindsRunTimeName) || cmds.some((c) => indirectExpansion(c, cmds)) || (cmds.heredocSpans ?? []).some?.((s) => !s[2]) && (typeof text !== "string" || indirectExpansionOnLine(text, cmds))) for (const k of [...Object.keys(ctx.vars), ...namesReadOn(cmds)]) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
 }
+const zshModifiedReason = (n) => `$${n} is followed by \`:\` and a letter or by \`[\` (\`$${n}:r\`, \`$${n}[1,6]\`): zsh reads that as a modifier or a subscript and applies it to the value, so the word it makes is only known at run time. Write the word out, or brace the name (\`\${${n}}:r\`) when the text after it is meant literally.`;
 // A zsh parameter expansion with flags (`${(P)N::=x}` assigns the variable N names) or a bash indirect one (`${!N}`), anywhere in a command's words.
 // (#56 replay of 96848c2: judged on the command's own text, single-quoted parts blanked — a `node -e '…${(x)}…'` program is no expansion; its words, quotes
 // removed, when the text is not there or the line has an unquoted heredoc, whose body expands and is not in the command's text: then the line's whole
@@ -2012,8 +2018,9 @@ function onceAssignedNames(cmds, ctx, str) {
     return [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')].some((w) => re.test(String(w)));
   };
   const out = [];
+  const modified = zshModifiedNames(cmds.flatMap((c) => [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')])); // (#74: `$k:r` / `$k[1]` is not the value a reading gives k)
   for (const k of ctx.unsureVars) {
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k) || SPECIAL_NAMES.test(k)) continue;
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k) || SPECIAL_NAMES.test(k) || modified.has(k)) continue;
     const sites = [];
     for (const [i, c] of cmds.entries()) {
       const nm = c.argv.length ? baseName(c.argv[0]) : '';
@@ -2125,6 +2132,7 @@ function evalString(str, startDir, ctx, level) {
     if (unsure !== null) {
       const read = saved && judgeReadings(str, startDir, ctx, level, onceAssignedNames(cmds, ctx, str), saved);
       if (read) return read;
+      if (ctx.zshNames?.has(unsure)) return deny(zshModifiedReason(unsure));
       return deny(`$${unsure} is assigned more than once (or where it may not run) on this line, so its value at run time cannot be verified. Rewrite: assign it once, as the first command of the line (\`${unsure}=value; …\`), or write the value out where it is used.`);
     }
   }
@@ -2209,7 +2217,8 @@ function evalString(str, startDir, ctx, level) {
     else if (name === 'cd' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name, argv, ctx, cdp, c.env ?? {});
     else if (name === 'git' || name === 'gh') {
       const unsure = unsureVarUsed([...argv.slice(1), ...Object.values(c.env)], ctx);
-      if (unsure !== null) verdict = deny(`$${unsure} was assigned more than once on this line, so its value (and what this ${name} command does with it) cannot be verified. Assign it once, or write the value out.`);
+      if (unsure !== null && ctx.zshNames?.has(unsure)) verdict = deny(zshModifiedReason(unsure));
+      else if (unsure !== null) verdict = deny(`$${unsure} was assigned more than once on this line, so its value (and what this ${name} command does with it) cannot be verified. Assign it once, or write the value out.`);
       else verdict = name === 'git' ? checkGit(argv, c.env, dir, ctx, c.raw ?? '') : checkGh(argv, c.env, dir, ctx, c.raw ?? '');
     }
     else {

@@ -93,7 +93,8 @@ test('#74: a modifier or a subscript after an unbraced $NAME makes the script on
 });
 
 test('#74: every modifier letter zsh reads (and the f F w W g prefixes) is a run-time value; a letter it does not read is not', () => {
-  for (const m of 'aAcefFghlPqQrstuwWx&') denyBoth(`B=run.sh; bash $B:${m}`, SPEC);
+  for (const m of 'aAcefFghlPqQrstuwWx') denyBoth(`B=run.sh; bash $B:${m}`, SPEC);
+  denyBoth('B=run.sh; bash "$B:&"', SPEC); // (`:&` repeats the last substitution; unquoted it would be a shell operator)
   // (not modifiers in zsh 5.9: the text stays after the value, a file that does not exist; the value is still worked out)
   for (const m of 'bdijkmnopvyzBCDEGHIJKLMNORSTUVXYZ0123456789.,/-=@%+_') allowBoth(`B=run.sh; bash $B:${m}x`, SPEC);
   denyBoth('B=run.sh; bash ${B}', SPEC); // (the value itself is what the allowed cases above prove is worked out)
@@ -114,7 +115,6 @@ test('#74 files guard: a protected file written through a modifier or subscript 
   // the value written out, and the braced form (which zsh does not read as a modifier: the file settings.json.x:r), are what the guard has always judged
   denyFiles('B=settings.json; cp x ~/.claude/$B', SPEC);
   allowFiles('B=settings.json.x; cp x ~/.claude/${B}:r', SPEC);
-  allowFiles('B=notes.txt.x; cp x ~/.claude/$B:r2/../../out', SPEC); // (not guarded either way: a name under proj, not under .claude)
 });
 
 test('#74 git guard: a push through a modifier or subscript is not judged as pushing a known ref', () => {

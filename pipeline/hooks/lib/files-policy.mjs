@@ -21,7 +21,7 @@ import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
 import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, indirectExpansionOnLine } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
-import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit, execLinesOf, paramReadings, assigningDefaults, spliceLines } from './script-candidates.mjs';
+import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit, execLinesOf, paramReadings, assigningDefaults, spliceLines } from './script-candidates.mjs';
 
 const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
@@ -483,10 +483,12 @@ const mayHoldBackslash = (w, ctx) => w.includes('\\') || Object.values(ctx.keptV
 
 // $NAME / ${NAME} for variables assigned earlier on the same line (D=$HOME/.claude; echo x > $D/settings.json).
 // Values are stored already expanded, and a value used in many words multiplies: the produced text is capped (substitute).
+// (an unbraced name that zsh would read a modifier or a subscript after is left as written: ZSH_MODIFIED, #74; `${B}:r` is no modifier)
+const SUBST_RE = new RegExp(`\\$\\{(\\w+)\\}|\\$(\\w+)(?!\\w)${ZSH_MODIFIED}`, 'g');
 function substVars(text, vars, budget) {
   let t = text;
   for (let pass = 0; pass < 4 && t.includes('$'); pass++) {
-    const next = substitute(budget, t, /\$\{(\w+)\}|\$(\w+)/g, (m, a, b) => (Object.hasOwn(vars, a ?? b) ? vars[a ?? b] : m));
+    const next = substitute(budget, t, SUBST_RE, (m, a, b) => (Object.hasOwn(vars, a ?? b) ? vars[a ?? b] : m));
     if (next === t) break;
     t = next;
   }
@@ -1223,6 +1225,14 @@ function collectVars(cmds, ctx) {
         set(k, v);
       }
     }
+  }
+  // Why (#74): zsh reads `$B:r` / `$B[1,6]` (an unbraced name and a modifier or subscript) as another word than the one substVars gives (`B=settings.json.x; cp x ~/.claude/$B:r`
+  // writes settings.json). A name the line assigns and reads so is only known at run time wherever it is used (ctx.unknownVars: a script or a writer it picks is refused),
+  // and so is every name built from it (`F=$B:r; … $F`), to a fixed point.
+  for (const k of zshModifiedNames(cmds.flatMap((c) => [...(c.argv ?? []), ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')]))) if (given.has(k)) unknown.add(k);
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const [k, g] of given) if (!unknown.has(k) && [...g.v.matchAll(/\$\{?(\w+)/g)].some((m) => unknown.has(m[1]))) { unknown.add(k); changed = true; }
   }
   ctx.keptVars = kept;
   ctx.unknownVars = unknown;
