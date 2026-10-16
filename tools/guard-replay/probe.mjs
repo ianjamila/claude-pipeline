@@ -10,7 +10,7 @@ function fakeFs(root, files) {
   const D = new Set([root, '/home/u']);
   for (const p of Object.keys(F)) for (let d = dirname(p); dirname(d) !== d; d = dirname(d)) D.add(d);
   return { readText: (p) => F[resolve(p)] ?? null, readHead: () => null, pathExists: (p) => resolve(p) in F || D.has(resolve(p)), existsSync: (p) => resolve(p) in F || D.has(resolve(p)),
-    readDir: (p) => (D.has(resolve(p)) ? [...new Set(Object.keys(F).filter((x) => dirname(x) === resolve(p)).map((x) => basename(x)))] : null), realpath: (p) => p };
+    readDir: (p) => (D.has(resolve(p)) ? [...new Set([...Object.keys(F), ...D].filter((x) => x !== resolve(p) && dirname(x) === resolve(p)).map((x) => basename(x)))] : null), realpath: (p) => p };
 }
 const [casesFile, ...roots] = process.argv.slice(2);
 const pol = [];
