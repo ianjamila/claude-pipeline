@@ -185,3 +185,9 @@ test('#74: the same through a loop variable, and in a script that reads a name t
   allowBoth('for B in ok.sh; do bash $B; done', SPEC);
   allowGit('export B=ok.sh; bash r0.sh', { ...SPEC, 'r0.sh': 'bash $B\n' });
 });
+
+test('#74: a name a sourced file gave, read here with a modifier or subscript', () => {
+  const src = { ...SPEC, 'e1.sh': 'B=run.sh.x\n', 'e2.sh': 'B=run.shXY\n', 'e3.sh': 'B=settings.json.x\n' };
+  for (const cmd of ['. e1.sh; bash $B:r', 'source e1.sh; bash "$B:r"', 'source e2.sh; bash $B[1,6]']) denyGit(cmd, src);
+  for (const cmd of ['. e3.sh; cp x ~/.claude/$B:r', 'source e3.sh; echo x > ~/.claude/$B:r']) denyFiles(cmd, src);
+});
