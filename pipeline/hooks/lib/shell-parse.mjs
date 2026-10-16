@@ -1794,6 +1794,7 @@ class Parser {
     this.braceStack = []; // log positions where standalone { groups opened
     this.subAcc = []; // segments run by substitutions inside the word being lexed
     this.lastDqDyn = false;
+    this.lastDqSubs = 0;
     this.cmd = null; // the command object interpret() is working on
     this.comments = null; // [start, end] of each comment of this text, when asked for (see withoutComments)
     this.ctlFrom = []; // ctx.out length when each open construct opened
@@ -1906,6 +1907,8 @@ class Parser {
     const n = s.length;
     let out = '';
     let dyn = false;
+    let subN = 0; // the substitutions in it, and whether the text is exactly one of them (see wspans)
+    let subText = '';
     while (this.i < n && !this.ctx.stopped) {
       const c = s[this.i];
       const nx = s[this.i + 1];
@@ -1916,8 +1919,8 @@ class Parser {
         else if (nx === '\r' && s[this.i + 2] === '\n') this.i += 3;
         else if (nx === '"' || nx === '\\' || nx === '$' || nx === '`') { out += nx; this.i += 2; }
         else { out += '\\' + nx; this.i += 2; }
-      } else if (c === '$' && nx === '(') { dyn = true; out += this.substitution(depth); }
-      else if (c === '`') { dyn = true; out += this.backtick(depth); }
+      } else if (c === '$' && nx === '(') { dyn = true; subText = this.substitution(depth); out += subText; subN++; }
+      else if (c === '`') { dyn = true; subText = this.backtick(depth); out += subText; subN++; }
       else {
         if (c === '$' && nx !== undefined && DYN_AFTER_DOLLAR.test(nx)) dyn = true;
         out += c;
@@ -1925,6 +1928,7 @@ class Parser {
       }
     }
     this.lastDqDyn = dyn;
+    this.lastDqSubs = subN === 0 ? 0 : subN === 1 && out === subText ? 1 : 2; // (0: none, 1: the text is exactly one substitution, 2: anything else)
     return out;
   }
 
@@ -2014,6 +2018,9 @@ class Parser {
     let wdyn = false; // the word contains an expansion that is only known at run time
     let wpat = false; // the word holds an UNQUOTED glob / pattern character (`*?[^#~`, or a glued group): the shell may expand it to file names
     let wsubs = []; // segments run by substitutions inside the word
+    // Why (#81): where each command substitution sits in the word, [from, to) in `cur` ([-1, -1]: a double-quoted text that holds one amid other text). A word is "one substitution"
+    // (`one`) when a single such span covers all of it: `$(cmd)`, `"$(cmd)"`, a backtick pair; not `$(a)$(b)`, `$(a)x`, `x$(a)`. Process substitutions are not counted.
+    let wspans = [];
     let wstart = 0; // source index where the word began
     let redir = null; // pending redirection whose target word comes next: 'file' | 'heredoc' | 'herestring'
     let rop = ''; // that redirection's operator
@@ -2052,6 +2059,7 @@ class Parser {
       const dyn = wdyn;
       const pat = wpat;
       const subs = wsubs;
+      const one = wspans.length === 1 && wspans[0][0] === 0 && wspans[0][1] === text.length;
       const from = wstart;
       cur = '';
       inWord = false;
@@ -2060,6 +2068,7 @@ class Parser {
       wdyn = false;
       wpat = false;
       wsubs = [];
+      wspans = [];
       const mode = redir;
       redir = null;
       if (mode === 'file') {
@@ -2139,7 +2148,7 @@ class Parser {
       }
       if (text === '{' || text === '(') seg.fnActive = false;
       fnPending = fnName && seg.fnActive === true; // (a name of `function NAME` ending the line: its body may open on the next)
-      seg.words.push({ text, qa: q, bm: marks, dyn, subs, win, pat });
+      seg.words.push({ text, qa: q, bm: marks, dyn, subs, win, pat, one });
     };
     const endSeg = (idx) => {
       flushWord();
@@ -2199,21 +2208,25 @@ class Parser {
       } else if (c === '"') {
         startSeg(); mark();
         this.i++;
+        const at = cur.length;
         cur += this.readDq(depth);
         if (this.lastDqDyn) wdyn = true;
+        if (this.lastDqSubs) wspans.push(this.lastDqSubs === 1 ? [at, cur.length] : [-1, -1]);
         takeSubs();
       } else if (c === '`') {
         startSeg(); inWord = true; wdyn = true;
         const n0 = this.subAcc.length;
+        const at = cur.length;
         cur += this.backtick(depth);
+        wspans.push([at, cur.length]);
         for (const x of this.subAcc.slice(n0)) x.split = true; // (unquoted: what it prints is split into words, see scannedSubs)
         takeSubs();
       } else if (c === '$') {
         startSeg();
         const nx = s[this.i + 1];
-        if (nx === '(') { inWord = true; wdyn = true; const n0 = this.subAcc.length; cur += this.substitution(depth); for (const x of this.subAcc.slice(n0)) x.split = true; takeSubs(); }
+        if (nx === '(') { inWord = true; wdyn = true; const n0 = this.subAcc.length; const at = cur.length; cur += this.substitution(depth); wspans.push([at, cur.length]); for (const x of this.subAcc.slice(n0)) x.split = true; takeSubs(); }
         else if (nx === "'") { mark(); const r = readAnsiC(s, this.i + 1); cur += r.text; this.i = r.next; }
-        else if (nx === '"') { mark(); this.i += 2; cur += this.readDq(depth); if (this.lastDqDyn) wdyn = true; takeSubs(); }
+        else if (nx === '"') { mark(); this.i += 2; cur += this.readDq(depth); if (this.lastDqDyn) wdyn = true; if (this.lastDqSubs) wspans.push([-1, -1]); takeSubs(); }
         else if (nx === '{' && this.paramSpan(this.i) > 0) {
           // `${f%%(*}`, `${x:-a b;c}`: one word; the ( ) ; | & and blanks inside the braces are not shell syntax
           const end = this.paramSpan(this.i);
@@ -2282,7 +2295,7 @@ class Parser {
         } else {
           // an all-digit unquoted word glued to the operator is the fd number (2>&1), not an argument
           rfd = null;
-          if (inWord && qa < 0 && /^[0-9]+$/.test(cur)) { rfd = Number(cur); cur = ''; inWord = false; bm = []; wdyn = false; wpat = false; wsubs = []; } else flushWord();
+          if (inWord && qa < 0 && /^[0-9]+$/.test(cur)) { rfd = Number(cur); cur = ''; inWord = false; bm = []; wdyn = false; wpat = false; wsubs = []; wspans = []; } else flushWord();
           startSeg();
           let j = this.i + 1;
           if (c === '>') {
@@ -2513,6 +2526,7 @@ class Parser {
       if (w.dyn || w.subs.length) {
         const m = seg.meta.get(w.text) ?? { dyn: false, subs: [] };
         m.dyn = m.dyn || w.dyn;
+        m.one = (m.one ?? true) && w.one; // (every word of this text is exactly one command substitution)
         m.subs.push(...w.subs);
         seg.meta.set(w.text, m);
       }
@@ -2606,6 +2620,8 @@ class Parser {
     if (headDyn) this.ctx.dynamic = true;
     const cmd = emit(this.ctx, a, env, seg.raw, seg.depth, [], seg.sep);
     if (bashAlso) for (const sh of ['bash', 'sh']) emit(this.ctx, [sh, ...bashAlso], env, seg.raw, seg.depth, [], seg.sep);
+    // the words that are exactly one command substitution (`for f in $(cmd)`): see wspans (#81)
+    if (cmd) Object.defineProperty(cmd, 'subWords', { value: new Set(a.filter((w) => seg.meta.get(w)?.one === true)), enumerable: false });
     if (cmd) Object.defineProperty(cmd, 'litWords', { value: new Set(a.filter((w) => !seg.meta.get(w)?.dyn && !seg.pat.has(w))), enumerable: false });
     if (!isExec) { seg.final = { argv: a }; seg.cmd = cmd; }
     // what the command prints and what it reads on stdin, for callers that ask which text a write of its output holds (see line-writes.mjs); lazy, most commands never need it
