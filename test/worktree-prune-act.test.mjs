@@ -417,9 +417,10 @@ test('archive: two clones archiving the same name into one holding folder at onc
 test('archive: a destination that appears after the name was picked is never overwritten', () => {
   const wt = mkdtempSync(join(tmpdir(), 'wt-')); const h = mkdtempSync(join(tmpdir(), 'hold-'));
   writeFileSync(join(wt, 'a.txt'), 'new');
+  let planted = false;
   const r = archivePaths({
     wtPath: wt, rels: ['a.txt'], holdingDir: h, slug: 's', pr: 1, nowMs: T,
-    hooks: { afterPick: (stored) => writeFileSync(stored, 'someone else got here first') },
+    hooks: { afterPick: (stored) => { if (!planted) { planted = true; writeFileSync(stored, 'someone else got here first'); } } },
   });
   const first = r.items[0].stored.replace(/\.\d+$/, '');
   assert.equal(readFileSync(first, 'utf8'), 'someone else got here first');
