@@ -1652,6 +1652,7 @@ function arithBodies(s, g, cmds) {
   for (const m of g.matchAll(/\$\{[A-Za-z_]\w*(?:\[[^\]\n]{0,64}\])?:(?![-=+?])([^}\n]{0,200})\}/g)) out.push(m[1]);
   return out;
 }
+// (Defence in depth for expansionText, which blanks a quoted body for the scans that read it: this one covers the zsh bare-subscript scan and the no-cmds fallback of the [[ scan)
 const quotedBodiesBlank = (s, cmds) => {
   if (!/<</.test(s)) return s;
   const spans = cmds?.heredocSpans;
