@@ -1993,11 +1993,12 @@ const bindWordRe = (k) => new RegExp(`(?<![A-Za-z0-9_]|\\$|\\$\\{)${k}(?![A-Za-z
 // (A value is substituted as written and never read again, so quotes, `;&|<>` and the like in it do no harm; `eval "$c"` re-reads it exactly as the shell would.) An UNQUOTED word with a character zsh may read as a pattern (`^ # ~ ( ) |`, parser: not in litWords) is not text: refused, as is `~user`. A leading `~/` is the home
 // directory like anywhere else on the line, only when the header holds no quote or backslash (a quoted `"~/x"` is the literal text, and the parser's word does not say which it was).
 // Not here: `*?[` globs (LOOP_WORD_IN, judged as candidates where the word lands).
+// (The `$` test is defence in depth: a word with `$` is routed to the expand reading (`expand` in onceAssignedNames), which loopWordAt refuses unless it works out to plain text.)
 const LOOP_TEXT = /^(?!=)[^$\x60{}\\]*$/;
 function loopTextWord(w, site) {
   if (!LOOP_TEXT.test(w)) return false;
   if (w === '~' || w.startsWith('~/')) return !/['"\\]/.test(String(site.raw ?? "'"));
-  if (w.startsWith('~')) return false;
+  // (An unquoted `~user`, `^x` or `*.sh~x` is never in litWords. The pattern test is defence in depth for a script position: scriptFileOf reads such a word as a glob that cannot be resolved and refuses it.)
   return site.litWords?.has(w) === true || !/[\^#~()|]/.test(w);
 }
 // A loop word the readings follow: literal text (globs included) and `$NAME` / `${NAME}`; what it is worked out to must be literal text (LOOP_WORD).
