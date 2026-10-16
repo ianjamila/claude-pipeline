@@ -276,7 +276,7 @@ function assignedValues(text) {
     let m = /^([A-Za-z_]\w*)(?:\[[^\]]{0,64}\])?$/.exec(inner);
     if (m) return cand.has(m[1]) ? [...cand.get(m[1])] : null;
     m = /^([A-Za-z_]\w*)(?:\[[^\]]{0,64}\])?(\/\/?|##?|%%?|\^\^?|,,?|:)([\s\S]*)$/.exec(inner);
-    if (!m) return null;
+    if (!m) { const k = /^[!#]?([A-Za-z_]\w*)/.exec(inner)?.[1]; return k !== undefined && cand.has(k) ? [UNKNOWN_WORD] : null; } // (an operator not listed, on a name the text gives: unknown; on any other: the environment's)
     const subj = cand.get(m[1]);
     if (!subj) return null;
     return [...subj].map((v) => (v === UNKNOWN_WORD ? v : applyOp(v, m[2], m[3], work) ?? UNKNOWN_WORD));

@@ -216,3 +216,13 @@ test('B6 a glob with many stars on a long value is an unknown word, not a long s
   denyBoth('F=xrun.sh; G=${F#?}; bash $G');
   denyBoth('F=run.shx; G=${F%?}; bash $G');
 });
+
+test('B7 a backslash or $\'..\' in the assigned word, an operator not worked out and a default nested past the steps allowed are unknown words', () => {
+  denyBoth('G=\\run.sh${U:+x}; bash $G');
+  denyBoth("G=$'run.sh'${U:+x}; bash $G");
+  denyBoth('G=`echo run.sh`${U:+x}; bash $G');
+  denyBoth('F=ok.sh; G=${F:abc}; bash $G');
+  denyBoth('F=ok.sh; G=${F/[a-z]/x}; bash $G');
+  denyBoth('F=ok.sh; G=${F^^pat}x; bash $G'.replace('^^pat', '@U'));
+  denyBoth(`G=${'${U:-'.repeat(20)}run.sh${'}'.repeat(20)}; bash $G`);
+});
