@@ -1303,7 +1303,7 @@ function collectVars(cmds, ctx) {
 // More than MAX_ASSIGN_READINGS readings in all: each such name is only known at run time (a script or a writer it picks is refused).
 const MAX_ASSIGN_READINGS = 16;
 function assignReadings(command, opts) {
-  // (cheap test first: a name must be assigned twice in the text before it is parsed again)
+  // (cheap test first, so a text with no name assigned twice is not parsed again. Defence in depth: the `names.length` test below drops the same texts, only after the parse)
   const seen = new Set();
   let twice = false;
   for (const m of command.matchAll(/(?<![\w$.\/-])([A-Za-z_]\w*)\+?=/g)) { if (seen.has(m[1])) { twice = true; break; } seen.add(m[1]); }

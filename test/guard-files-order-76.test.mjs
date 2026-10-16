@@ -120,3 +120,9 @@ deny('n=1; : $(( n[0] = 7 )); bash s$n.sh', SCRIPTS);
 deny(`n=1; : $(( n<<=1, n+=5 )); printf x > ~/${CL}/f$n`);
 allow('n=1; : $(( n << 1 )) $(( n >> 1 )) $(( n < 2 )); bash s$n.sh', SCRIPTS);
 allow('n=1; echo $(( (n + 1) * 2 )); n=1; bash s$n.sh', SCRIPTS);
+
+// too many readings (5 names with 2 values each and the target's 2 = 64 > 16): the target name is then only known at run time, not read as its last value
+deny(`A=1; A=2; B=1; B=2; C=1; C=2; D=1; D=2; E=1; E=2; F=settings.json; printf x > ~/${CL}/$F; F=safe`);
+deny('A=1; A=2; B=1; B=2; C=1; C=2; D=1; D=2; E=1; E=2; S=s7.sh; bash $S; S=s1.sh', SCRIPTS);
+// a subscript too long to be told from a read is still taken for an assignment
+deny(`n=1; : $(( n[${'a'.repeat(80)}] = 7 )); bash s$n.sh`, SCRIPTS);
