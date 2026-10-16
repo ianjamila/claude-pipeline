@@ -670,7 +670,10 @@ export function indirectExpansionOnLine(str, cmds) {
     if (!Array.isArray(spans)) return true;
     for (const [a, b, quoted] of spans) {
       if (!(a >= 0 && a <= b && b <= t.length)) return true;
-      if (quoted) t = t.slice(0, a) + t.slice(a, b).replace(/[^\n]/g, ' ') + t.slice(b);
+      // (an unquoted body expands, and its quotes are text: `'${(P)N::=x}'` there is a real expansion, and a lone `'` must not shift the scan of the lines
+      // after it. So it is judged as written, then blanked like a quoted one; security review of e9ec717)
+      if (!quoted && INDIRECT_EXPANSION.test(t.slice(a, b).replace(SAFE_FLAG_EXPANSION, '${'))) return true;
+      t = t.slice(0, a) + t.slice(a, b).replace(/[^\n]/g, ' ') + t.slice(b);
     }
   }
   // Single-quoted text is blanked by a scanner of its own: withoutLiteralText also blanks comments, and it reads the `#` of `${(#)X}` as one. Nothing else
