@@ -376,6 +376,8 @@ pipeline smoke --target preview|production --url URL [--expect-text T] [--sha SH
 
 Exit: 0 passed · 1 failed · 2 not configured / usage.
 
+PATH of project commands: `merge.command` (merge), the `smoke` commands (smoke, prod-watch) run with the caller's environment. When `gh` is not on that `PATH` but the pipeline's own `gh()` finds it in a fixed install dir (`/opt/homebrew/bin`, `/usr/local/bin`, `/home/linuxbrew/.linuxbrew/bin`, `/usr/bin`), that directory is APPENDED to the command's `PATH`, so a command that spawns `gh` itself (a sandbox `PATH` often lacks `/opt/homebrew/bin`) no longer fails `spawn gh ENOENT`. Unchanged on Windows, under a `PIPELINE_GH` override, or when `gh` is nowhere.
+
 ## state
 
 show or update the review loop state (.review/state.json).
