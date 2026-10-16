@@ -1,5 +1,6 @@
 // Path helpers that behave the same on macOS, Linux and Windows. Everything is compared in POSIX
 // form (forward slashes, ".." resolved) so a Windows path can be checked without touching the disk.
+import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -53,4 +54,18 @@ export function isInside(child, parent, platform = process.platform) {
 // UTC, no colons: safe in Windows filenames and sorts chronologically.
 export function safeTimestamp(date = new Date()) {
   return date.toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
+}
+
+// The real location of `p`: symlinks resolved on the deepest ancestor that exists, the not-yet-created rest appended.
+// A claude-home reached through an alias (a symlinked ~/.claude, a second mount point) must name the same lock.
+export function canonicalPath(p) {
+  let cur = path.resolve(p);
+  const rest = [];
+  for (;;) {
+    try { return path.join(fs.realpathSync.native(cur), ...rest); } catch { /* not there yet: try the parent */ }
+    const parent = path.dirname(cur);
+    if (parent === cur) return path.resolve(p);
+    rest.unshift(path.basename(cur));
+    cur = parent;
+  }
 }

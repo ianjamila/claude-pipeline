@@ -192,7 +192,7 @@ async function evaluateCandidates(repo, { gh, mode, dryRun, env, runId, runStart
     }
     let res;
     try {
-      res = await removeWorktree({ root, wt: c, cfg: w, pr: v.pr, holdingDir, runId, runStartMs, settleMs: settleMs(env) });
+      res = await removeWorktree({ root, wt: c, cfg: w, pr: v.pr, holdingDir, runId, runStartMs, settleMs: settleMs(env), lockDir: env.PIPELINE_LOCK_DIR || undefined });
     } catch (err) {
       res = { removed: false, reason: `removal failed: ${oneLine(err)}` };
     }
