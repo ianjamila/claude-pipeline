@@ -224,6 +224,17 @@ export async function withHoldingLock(holdingDir, fn, { lockDir, lockWaitMs = 30
   return withLock(holdingLockName(holdingDir), fn, { dir: lockDir || undefined, waitMs: lockWaitMs, pollMs: lockPollMs });
 }
 
+// Purge takes the same lock as archiving: it deletes batches and reads manifests the archiver rewrites. No lock in time =>
+// nothing is deleted (fail closed) and `skipped` says why.
+export async function purgeHoldingLocked(holdingDir, { lockDir, lockWaitMs, lockPollMs, ...opts }) {
+  try {
+    return await withHoldingLock(holdingDir, () => purgeHolding(holdingDir, opts), { lockDir, lockWaitMs, lockPollMs });
+  } catch (err) {
+    if (!(err instanceof LockTimeoutError)) throw err;
+    return { purged: [], kept: [], skipped: `holding folder is busy (lock not obtained): ${gitMessage(err)}` };
+  }
+}
+
 export async function archivePathsLocked({ lockDir, lockWaitMs, lockPollMs, ...opts }) {
   return withHoldingLock(opts.holdingDir, () => archivePaths(opts), { lockDir, lockWaitMs, lockPollMs });
 }
