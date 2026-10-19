@@ -363,7 +363,10 @@ test('CLI: --only STEPS is appended to verify.full', TIMEOUT, async () => {
   try {
     const r = await startCli(repo.dir, lockDir, ['--only', 'db,db-grants']).done;
     assert.equal(r.code, 0, r.stderr);
-    assert.deepEqual(JSON.parse(readFileSync(out, 'utf8')), [out, '--only', 'db,db-grants']);
+    const [first, ...rest] = JSON.parse(readFileSync(out, 'utf8'));
+    // The helper's Windows quoting can double the path's backslashes on the way through the shell; the same file either way.
+    assert.equal(path.normalize(first), path.normalize(out));
+    assert.deepEqual(rest, ['--only', 'db,db-grants']);
   } finally {
     repo.cleanup();
   }
