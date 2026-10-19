@@ -1291,7 +1291,7 @@ function packageScriptVerdict(argv, dir, ctx, level) {
   const said = argv.slice(0, 4).join(' ');
   if (call.unresolved) return deny('package script: ' + call.unresolved);
   // (a variable family the managers read, or a name exported that is only known at run time: `export $N=x`)
-  const mover = call.mover ? '--userconfig / --globalconfig' : pmMoverName([...Object.keys(ctx.vars), ...ctx.unsureVars, ...ctx.tainted]) ?? ((ctx.nameRun ??= nameAtRunTimeIn(ctx.fullText)) ? 'a variable named at run time' : null);
+  const mover = call.mover ? call.mover : pmMoverName([...Object.keys(ctx.vars), ...ctx.unsureVars, ...ctx.tainted]) ?? ((ctx.nameRun ??= nameAtRunTimeIn(ctx.fullText)) ? 'a variable named at run time' : null);
   if (mover) return deny(`package script: ${mover} may point the package manager at another package.json or configuration, so which script \`${said}\` runs cannot be verified. Run it without it (set the directory with --prefix).`);
   // (the manager's own write earlier on the line, or in a script it ran, changed package.json or a configuration file: markPackageState)
   if (pkgOwnWrite(ctx.budget)) return deny(`package script: an earlier command on the line (npm pkg set, npm set-script, npm config set, npm init ...) changes package.json or the package manager's configuration before \`${said}\` reads them, so which script it runs cannot be verified. Run it in a command of its own.`);

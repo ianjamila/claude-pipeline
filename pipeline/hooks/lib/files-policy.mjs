@@ -1646,7 +1646,7 @@ function judgePackageScripts(c, dirs, ctx, opts, scanRaw = '') {
   if (!c.argv.length) return null;
   const call = pmCall(c.argv.map((w) => expandRefs(w, ctx)));
   if (!call) return null;
-  const mover = call.mover ? '--userconfig / --globalconfig' : pmMoverName([...Object.keys(ctx.vars), ...ctx.unknownVars, ...ctx.pickUnknown, ...Object.keys(c.env ?? {})]) ?? ((ctx.nameRun ??= new Map()).get(scanRaw) ?? ctx.nameRun.set(scanRaw, nameAtRunTimeIn(scanRaw)).get(scanRaw) ? 'a variable named at run time' : null);
+  const mover = call.mover ? call.mover : pmMoverName([...Object.keys(ctx.vars), ...ctx.unknownVars, ...ctx.pickUnknown, ...Object.keys(c.env ?? {})]) ?? ((ctx.nameRun ??= new Map()).get(scanRaw) ?? ctx.nameRun.set(scanRaw, nameAtRunTimeIn(scanRaw)).get(scanRaw) ? 'a variable named at run time' : null);
   if (call.unresolved) return deny('package script: ' + call.unresolved);
   if (mover) return deny(`package script: ${mover} may point the package manager at another package.json or configuration, so which script \`${c.argv.slice(0, 4).join(' ')}\` runs cannot be verified. Run it without it (set the directory with --prefix)`);
   if (pkgOwnWrite(ctx.budget)) return deny(`package script: an earlier command on the line (npm pkg set, npm set-script, npm config set, npm init ...) changes package.json or the package manager's configuration before \`${c.argv.slice(0, 4).join(' ')}\` reads them, so which script it runs cannot be verified. Run it in a command of its own`);

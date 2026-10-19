@@ -71,7 +71,7 @@ export function pmCannotRunScript(words) {
 // script argument, may take the next word as its value: `unresolved`, refused. Returns null when nothing can run, else
 // { pm, sub, names, gate, main, extra, dir, workspace, mover, dynamic, dirDynamic, unresolved, bin, execText, startDefault, installGroup }:
 //   names: the scripts the manager runs, in order; gate: at least one must exist; main: the script the user named, which receives `extra`; dir: the --prefix / -C / --dir / --cwd value
-//   workspace: a workspace selection (-w, --workspaces, --filter, -r, `yarn workspace`): the script may be in any workspace package; mover: --userconfig / --globalconfig
+//   workspace: a workspace selection (-w, --workspaces, --filter, -r, `yarn workspace`): the script may be in any workspace package; mover: the option that was used (--userconfig, --globalconfig, --script-shell, --node-options), else false
 //   bin: a bare yarn / pnpm / bun name, which falls back to node_modules/.bin/<name> when no script has it; execText: the command `npm exec -c` / `pnpm -r exec` runs
 const hooks = (n) => [`pre${n}`, n, `post${n}`];
 const INSTALL = ['preinstall', 'install', 'postinstall', 'prepublish', 'preprepare', 'prepare', 'postprepare'];
@@ -101,7 +101,7 @@ const NO_SCRIPT = {
 const EXEC_SUBS = new Set(['exec', 'x', 'dlx']);
 const DIR_OPTS = new Set(['--prefix', '-C', '--dir', '--cwd']);
 const WORKSPACE_OPT = /^(?:-w|-ws|--workspaces?|--filter|-F|--filter-prod|-r|--recursive|--include-workspace-root|--workspace-root)$/;
-const MOVER_OPT = /^(?:--userconfig|--globalconfig)$/;
+const MOVER_OPT = /^(?:--userconfig|--globalconfig|--script-shell|--node-options)$/; // (the same keys a .npmrc is refused for: RC_REFUSED)
 const RUN_TIME = /[$`]/;
 const GLOBAL_OPT = /^(?:-[a-zA-Z]*g[a-zA-Z]*|--global(?:=(?!false$|0$).*)?)$/i;
 // `npm explore` (and its unique abbreviations: npm reads `expl` as ambiguous with explain) runs a command in node_modules/PKG. A scoped name is two path parts.
@@ -140,7 +140,7 @@ function scanOpts(words, i, pm, st) {
     const key = eq > 0 ? w.slice(0, eq) : w;
     const hasNext = i + 1 < words.length;
     if (DIR_OPTS.has(key)) st.dir = eq > 0 ? w.slice(eq + 1) : words[i + 1] ?? '';
-    if (MOVER_OPT.test(key)) st.mover = true;
+    if (MOVER_OPT.test(key)) st.mover = key;
     if (WORKSPACE_OPT.test(key)) st.workspace = true;
     if (GLOBAL_OPT.test(w) || (key === '--location' && (eq > 0 ? w.slice(eq + 1) : words[i + 1]) === 'global')) st.global = true;
     if (key === '--ignore-scripts') st.ignore = eq > 0 ? !/^(?:false|0)$/i.test(w.slice(eq + 1)) : true;
@@ -187,9 +187,9 @@ export function pmCall(allWords) {
       const eq = w.startsWith('--') ? w.indexOf('=') : -1;
       const key = eq > 0 ? w.slice(0, eq) : w;
       if (DIR_OPTS.has(key)) st.dir = eq > 0 ? w.slice(eq + 1) : after[k + 1] ?? '';
-      if (MOVER_OPT.test(key)) st.mover = true;
+      if (MOVER_OPT.test(key)) st.mover = key;
       if (WORKSPACE_OPT.test(key)) st.workspace = true;
-      if (key === '--ignore-scripts') st.ignore = true;
+      if (key === '--ignore-scripts') st.ignore = eq > 0 ? !/^(?:false|0)$/i.test(w.slice(eq + 1)) : true;
       if (key === '--no-ignore-scripts') st.ignore = false;
       if (kind === 'value' && eq < 0) k++;
       else if (kind === 'unknown' && eq < 0 && after[k + 1] !== undefined && !after[k + 1].startsWith('-') && !call.unresolved) call.unresolved = `the option \`${w}\` is not known to the guard and may take the next word (\`${after[k + 1]}\`) as its value, so what \`${words.slice(0, 5).join(' ')}\` hands the script cannot be verified. Write it as --name=value.`;
