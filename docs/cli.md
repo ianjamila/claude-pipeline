@@ -150,10 +150,12 @@ Exit: 0 deployed · 1 the deployment failed · 3 nothing finished in time (or Gi
 prove this PR head is verified, reviewed, CI-green and smoked; writes .review/final-gate.json.
 
 ```
-pipeline final-gate --pr N [--repo DIR]   -> {ok, repo, pr, base, head, tree, contentHash, checks[{name,ok,detail}], failed[], at}; exit 0 all checks pass, 1 any fails (pr-open detail starts "behind-base:" when the PR is behind its base: update the branch and re-verify), 3 GitHub unavailable
+pipeline final-gate --pr N [--repo DIR]   -> {ok, repo, pr, base, head, tree, contentHash, checks[{name,ok,detail}], failed[], at, proofs?}; exit 0 all checks pass, 1 any fails (pr-open detail starts "behind-base:" when the PR is behind its base: update the branch and re-verify), 3 GitHub unavailable
 ```
 
 Exit: 0 every check passes (writes .review/final-gate.json) · 1 any check fails · 3 GitHub (`gh`) unavailable.
+
+`proofs` appears only for a repo with `verify.deferrable_steps`, when `verify-report` passed: `[{step, source: "local"}]` for a step the Mac ran, `[{step, source: "ci", run: {id, attempt, jobId, workflow, job, url}}]` for a step a GitHub Actions run vouched for (a report row `skipped` with `skipKind: "ci"`). The gate reads `deferrable_steps`, `ci_proof` and `ci_proof_inputs` from the BASE branch's `.claude/pipeline.yml`, never the PR's, and takes the proof only when ALL hold: the PR touches none of `.github/**`, `.claude/pipeline.yml`, `scripts/verify*` or `ci_proof_inputs`; the newest `pull_request` run of the configured workflow file for this exact head belongs to this PR (one `pull_requests` entry, this PR into the base branch, its head branch, a head from this repo, not a fork); the merge commit that run executed (`refs/pull/N/merge` in `referenced_workflows`) has the same tree as the PR head (a run that does not say is not accepted); and exactly one job there has the configured name and succeeded. A newer queued or running run is `ci-proof-pending:<step>`; a red job is `ci-proof-failed:<step>`; everything else, including any GitHub error and a cancelled or skipped run, is `ci-proof-missing:<step>`: the Mac must run the step. `pipeline merge` re-evaluates the proof live and records the one it used.
 
 ## followups
 
@@ -254,7 +256,7 @@ Exit: 0 · 3 GitHub (`gh`) unavailable.
 merge the PR if (and only if) the final gate passes again, live; waits for MERGED.
 
 ```
-pipeline merge --pr N [--owner-approved-head SHA --owner-approved-items DIGEST] [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?, warnings?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment. While it runs the run record of the PR shows inFlight {kind: merge} and step merge; a prod-before event comment (the known-good deployment) is posted before the merge command, and when that post fails nothing is merged (error pre-merge); warnings lists a run record write that failed (never fatal). A run record marked resumed (`P checkpoint --resumed`: a run taken over by ship resume) refuses with error pre-merge unless the owner approved it; so does a run record that cannot be checked (unreadable, invalid or unsupported: it may be a resumed one), and with owner_approval: chat a gate with ownerMerge > 0. Approved = --owner-approved-head names the full gate head, --owner-approved-items the gate's ownerItems, AND the owner-go hook recorded the owner's "merge" for exactly that PR, head and item set (the flags alone refuse); the live gate must still show those ownerItems
+pipeline merge --pr N [--owner-approved-head SHA --owner-approved-items DIGEST] [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?, warnings?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment. While it runs the run record of the PR shows inFlight {kind: merge} and step merge; a prod-before event comment (the known-good deployment) is posted before the merge command, and when that post fails nothing is merged (error pre-merge); for a repo with verify.deferrable_steps the proofs of the live gate (where each deferrable step was proved: the Mac, or a GitHub run and attempt) are recorded in the run record and in an append-only ci-proof-used event comment before the merge command too, and when either write fails nothing is merged (error pre-merge); warnings lists a run record write that failed (never fatal). A run record marked resumed (`P checkpoint --resumed`: a run taken over by ship resume) refuses with error pre-merge unless the owner approved it; so does a run record that cannot be checked (unreadable, invalid or unsupported: it may be a resumed one), and with owner_approval: chat a gate with ownerMerge > 0. Approved = --owner-approved-head names the full gate head, --owner-approved-items the gate's ownerItems, AND the owner-go hook recorded the owner's "merge" for exactly that PR, head and item set (the flags alone refuse); the live gate must still show those ownerItems
 ```
 
 Exit: 0 merged (a merge commit GitHub cannot name yet is `mergeSha: null` plus a `warning`; prod-watch resolves it) · 1 not merged / refused by the live gate or by the last pre-merge look at GitHub (run final-gate again; `behind-base`: the base moved, the branch was just updated on GitHub, so pull, re-verify and gate the new head) · 3 GitHub unavailable, or no known-good production deployment.
@@ -510,6 +512,31 @@ pipeline vendor --repo DIR [--check]
 Exit: 0 copied / no drift · 1 drift found (`--check`) · 2 usage.
 
 Vendoring also appends `scripts/pipeline/** -text` and `scripts/verify text eol=lf` to the project's `.gitattributes` (idempotent; output `gitattributes` lists what was added), so a Windows autocrlf checkout cannot make the byte comparison drift. `--check` warns when the entries are missing.
+
+## verify
+
+plan the verify commands for the ship loop (plan-after-fix); limit parallel full verifies (slot).
+
+```
+pipeline verify plan-after-fix --round R [--repo DIR]   -> {ok, mode, commands, matchedSteps, base, head, files}
+  verify.after_fix full (default): commands = [verify.full]. quick: commands = [verify.quick] plus, when the fixes since round R's
+  reviewed head (renames count on both sides) touch a path in verify.after_fix_steps_by_path, verify.full --only <those steps>;
+  run them in order, either red = fix cycle. exit 1 {ok:false, error} when round R has no recorded review state (fail closed)
+  verify.max_parallel_full set: the full commands above come back as `node ~/.claude/pipeline/bin/pipeline.mjs verify slot --run [--only STEPS]`
+pipeline verify slot --run [--only STEP,STEP... | --defer STEP,STEP...] [--repo DIR]   wait for a free slot, run the repo's verify.full (with --only STEPS appended; npm gets "--" first),
+  inherited stdio, free the slot when it ends; exit code = verify.full's. It runs nothing else: any other argument, or "--", is a usage error (exit 2).
+  The exact command line is judged first by the same git and file guards as `job start`: denied -> exit 1 {ok:false, refused:true, reason}, nothing queued or run.
+  Slots are machine-wide (all repos); the limit is verify.max_parallel_full of the repo it runs in; unset = it runs at once. Waiters go in arrival order.
+  One stderr line before verify.full starts: {"slot":{index,of,waitedSeconds,loadWaitSeconds,warnings}}. With verify.max_load it then waits (5-30 s jitter between
+  checks, at most verify.max_load_wait_minutes) while the 1-minute load average is above it, and proceeds with a warning when the time is up.
+  --defer STEPS (each in verify.deferrable_steps) is appended like --only, for the gate's full verify of a repo with verify.ci_proof; not with --only.
+  SIGINT/SIGTERM/SIGHUP go to the running verify. STEPS: letters, digits and . _ : - only, no repeats, each in verify.expected_steps when that is set.
+pipeline verify slot --status   -> {ok, lockDir, holders[{index,pid,host,startedAt,alive}], waiters[{seq,pid,host,alive}]}   (read only; the whole machine)
+```
+
+Exit (plan-after-fix): 0 · 1 `no-round-state` / `base-not-ancestor` (run `verify.full` instead) · 2 usage.
+
+`slot --run` is for repos that set `verify.max_parallel_full: <n>` (a positive integer): at most n full verifies of ALL repos run at once on this machine, the rest wait in arrival order, so one machine is not overloaded by several sessions' database-heavy verifies. It wraps the run instead of an acquire/release pair because a slot is a machine lock (pipeline/lib/locks.mjs) owned by a live process: the wrapper is that process for exactly as long as the verify runs, and a wrapper killed hard frees its slot through the usual dead-owner reclaim. It runs ONLY the repo's `verify.full` from `.claude/pipeline.yml` (plus a validated `--only`), never a command of the caller's, so it cannot be used as an exec that walks past the git and file guards; since a PR can change that config, the exact command line is also judged by the same guards as `job start` first (denied: exit 1 `{ok:false, refused:true, reason}`, nothing queued or run). The wrapper exits with the verify's exit code (128 + n for a signal) and prints nothing on stdout. Before the verify starts it writes ONE JSON line to stderr, `{"slot":{"index","of","waitedSeconds","loadWaitSeconds","warnings"}}`, which the ship summary quotes. `verify.max_load` (positive number, needs `max_parallel_full`) adds a second, optional wait AFTER the slot is held: while the 1-minute load average is above it, re-check every 5-30 s (random, so waiters do not start together) for at most `verify.max_load_wait_minutes` (default 10, at most 10), then run anyway with a warning. On Windows the load check is skipped (warning). `slot --status` is read only. `PIPELINE_LOCK_DIR` moves the lock directory (a test seam; changing it splits the machine-wide limit).
 
 ## version
 
