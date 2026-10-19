@@ -8,11 +8,13 @@ const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
 // a plain command such as 'npm test' says nothing about why the step was skipped.
 const legacyReason = (step) => (typeof step.skipCheck === 'string' ? step.skipCheck : (typeof step.command === 'string' && step.command.trimStart().startsWith('(skipped') ? step.command : undefined));
 
-// null when the row is not a skip, else { name, reason } with reason '' when none was given.
+// null when the row is not a skip, else { name, reason } with reason '' when none was given. When the row carries a string
+// `skipKind` ('local' | 'ci' | anything else the writer chose) the result also has `kind`; rows without one (every legacy row) get no
+// `kind` key at all, so their result is byte-for-byte what it always was.
 export function skipOf(step) {
   if (!isObject(step)) return null;
   const legacy = step.status === 'pass' && step.skipped === true;
   if (step.status !== 'skipped' && !legacy) return null;
   const given = step.status === 'skipped' ? step.skipReason : legacyReason(step);
-  return { name: step.name, reason: typeof given === 'string' ? given.trim() : '' };
+  return { name: step.name, reason: typeof given === 'string' ? given.trim() : '', ...(typeof step.skipKind === 'string' ? { kind: step.skipKind } : {}) };
 }
