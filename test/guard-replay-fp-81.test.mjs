@@ -238,3 +238,16 @@ test('t11 a loop pair over the allowance with npm run is judged on every pair: t
   // the same loops over a script that pushes nothing stay allowed
   assert.equal(git(`for a in ${as}; do export a; for b in ${bs}; do export b; npm run x; done; done`, mk('echo $a$b')).decision, 'allow');
 });
+
+// ---- 10. workspace patterns: only a literal path and a single trailing /* are read, inside the project ---------------------------------------------------------------------------------------------
+const wsTree = (patterns) => ({ '.git': 'x', 'package.json': JSON.stringify({ name: 'r', scripts: { lint: 'echo hi' }, workspaces: patterns }), 'packages/a/package.json': pkg(OK_SCRIPTS), '../outside/package.json': pkg(OK_SCRIPTS) });
+test('t11 a workspace pattern that is not a plain path or one trailing /* inside the tree leaves the workspace set unknown', () => {
+  for (const patterns of [['packages/*'], ['packages/a'], ['./packages/a'], ['*']]) {
+    const t = wsTree(patterns);
+    assert.equal(git('npm run lint -w packages/a', t).decision, 'allow', JSON.stringify(patterns));
+  }
+  for (const patterns of [['../outside'], ['packages/../../outside'], ['/home/u/outside'], ['/work/outside'], ['packages/**'], ['packages/*/x'], ['pack*/a'], ['packages/{a,b}'], ['packages/?'], ['packages/[ab]'], ['~/x'], ['']]) {
+    const g = git('npm run lint -w packages/a', wsTree(patterns));
+    assert.equal(g.decision, 'deny', JSON.stringify(patterns));
+  }
+});

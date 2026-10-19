@@ -643,6 +643,8 @@ export function packageScripts(call, env) {
         if (typeof raw !== 'string') return refuse(`a workspace pattern in ${root} is not text, so the packages it names cannot be listed. Run the script from the package's own directory.`);
         if (raw.startsWith('!')) continue;
         const pat = raw.replace(/^\.\//, '').replace(/\/+$/, '');
+        // (t11: only a literal path or a single trailing /* is read, inside the tree: an absolute path, a .. segment, a backslash or an empty pattern leaves the workspace set unknown)
+        if (pat === '' || pat.startsWith('/') || /(?:^|\/)\.\.(?:\/|$)|\\|^~/.test(pat)) return refuse(`the workspace pattern \`${raw}\` in ${root} leaves the project directory or is not a plain path, so which packages a workspace option reaches cannot be verified. Run the script from the package's own directory.`);
         let dirs;
         if (!/[*?[\]{}()!]/.test(pat)) dirs = [p.join(root, pat)];
         else if (/^[^*?[\]{}()!]+\/\*$/.test(pat) || pat === '*') {
