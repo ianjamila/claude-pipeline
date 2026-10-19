@@ -56,6 +56,113 @@ conditions to every running stack. All decisions are pure functions over probe r
 
 ---
 
+## Revision 2 — Codex plan review R1 (2026-10-19, binding)
+
+Codex session `01a1525a-3633-7921-afcf-ef74257b04c9`, verdict "needs revision"; every finding was checked against the
+code and accepted. **Where these amendments differ from a task's text below, the amendment wins.** Each task's brief
+repeats its amendments.
+
+- **R2-1 (Task 1) — "no such process" must be positive.** `run()` (`pipeline/lib/proc.mjs` `toResult`) turns a
+  signalled child into `code 1` with empty output and a spawn failure (ENOENT) into `code 1` + the error text, so
+  `code 1` alone never means "dead". `procIdentity` returns `ok(null)` only when BOTH: ps gave `code 1`, `signal`
+  null, `timedOut` false, empty stdout AND empty stderr; and an injected `kill(pid, 0)` (default `process.kill`)
+  throws `ESRCH`. Any other combination (signal, timeout, ENOENT text, EPERM, ps says dead but kill says alive) ⇒
+  `unknown`. Tests for each case. All stacks functions take an injected `platform` (default `process.platform`);
+  `findClaudeOwner` on `platform:'win32'` ⇒ `unknown('windows')` (its own test; the POSIX owner test passes
+  `platform:'darwin'`).
+- **R2-2 (Tasks 1, 2, 5) — one deadline bounds everything in the register hook.** `register` computes
+  `deadlineAt = now + deadlineMs` and passes `deadlineAt` to every blocking dependency: each docker call
+  (`timeoutMs = min(10 000, remaining)`), each ps/lookup call in `findClaudeOwner` (`min(3 000, remaining)`; the
+  walk stops with `unknown('deadline')` when < 500 ms remain), the git toplevel call, and the lock wait. The stacks
+  code uses its own ancestry lookup built on the injected `run` (ps binary from the `PIPELINE_PS` seam, default
+  `/bin/ps`), not `claude-ancestry.mjs`'s `realLookup` (which shells out with a fixed 3 s and no budget); it reuses only
+  `isClaudeCodeProcess`. End-to-end hook tests: a fake docker that sleeps past the deadline and a fake ps that sleeps
+  ⇒ the hook exits 2 with `deadline` well inside the 30 s hook timeout (use `deadlineMs` 1500 via the test seam
+  `PIPELINE_STACKS_DEADLINE_MS`, honoured only together with `PIPELINE_STACKS_HOME`).
+- **R2-3 (Task 5) — a dev-record failure never skips stack registration.** Dev recording stays best-effort (failure
+  ⇒ log line) but the flow then CONTINUES into the stack prefilter / registration. Test:
+  `SUPABASE_URL=http://127.0.0.1:54421 npm run dev` with the dev append failing ⇒ the sa-corrections lease is still
+  written (or exit 2 if that append also fails).
+- **R2-4 (Task 6) — strict probes, no reuse of the tolerant prune probes.** `processesInside` / `transcriptMentions`
+  in `worktree-prune/inspect.mjs` accept lsof exit 1, ignore hidden processes and turn unreadable directories into
+  empty lists; that is fine for prune (it also checks other things) but not here. Write strict versions in
+  `evidence.mjs` (reuse only the pure parsers/helpers that are exported, e.g. `pathSpellings`, `lineShowsWork`):
+  - lsof: exit 0 ⇒ ok; exit 1 ⇒ ok ONLY if the positive control passes (our own pid listed with a readable cwd) AND
+    every pid that ps lists for the current uid (`ps -axo pid=,uid=`) appears in the lsof output; anything else
+    (signal, timeout, other exit, own-uid process missing) ⇒ `unknown`. Other users' processes are out of scope (a
+    one-user Mac) and named in the report as `hidden`.
+  - directory walks (transcripts, memory, worktree `.env*`): `ENOENT` of a configured root ⇒ ok(empty) with a report
+    note; any other readdir/read error (EACCES, EISDIR, EIO) ⇒ `unknown`.
+  - one runner contract everywhere: the plan's `run` result `{code, stdout, stderr, timedOut, signal}`; no
+    `{status, error}` adapters leak into stacks code.
+  - Tests at the boundary: real-shaped lsof/ps text, a directory made unreadable (`chmod 000`, POSIX only), an lsof
+    exit 1 with an own-uid pid missing ⇒ unknown.
+  - Every C2/C3 hit carries the process identity `{pid, birth}` read at observation time via `procIdentity`
+    (`birth: null` when that lookup is unknown) — R2-9 needs it.
+  - `prStates`: per consumer worktree, its branch via `git rev-parse --abbrev-ref HEAD` and HEAD sha;
+    `checkRepoIdentity` (prs.mjs) for the repo, mismatch ⇒ unknown; `fetchBranchPrs(gh, branch)` with all pages
+    (a page error ⇒ unknown). State: any OPEN ⇒ `OPEN`; else the PR whose `headRefOid` equals the worktree HEAD
+    (exact 40-char equality) ⇒ its `MERGED`/`CLOSED` with `headMatches:true`; PRs exist but none match ⇒ latest by
+    `updatedAt` with `headMatches:false`; no PR ⇒ `NONE`. A consumer worktree that no longer exists ⇒ eligible (no PR
+    lookup). `NONE` or `headMatches:false` on an existing worktree ⇒ the stack is `listed`, never `stop`.
+- **R2-5 (Task 3) — ledger repair cannot lose a lease.** Every ledger writer (register `use`/`dev`, dev-bind
+  `dev-post`/`dev-bind`) and `repairLedger` take the lock `stacks-ledger` (same `locks` dir) around their write;
+  appenders open the file by path for each append (never a cached fd). Lock order, everywhere: project locks first
+  (sorted by name), then `stacks-ledger`, held only for the single append or the repair. Repair: lock → read →
+  write good lines to temp → fsync → rename → release. Interleaving test: a child process appends while repair is
+  paused between read and rename (test seam `afterRead`) ⇒ the appended lease is present after repair (the append
+  waits for the lock). The register hook's ledger-lock wait comes out of the same R2-2 deadline.
+- **R2-6 (Tasks 10, 11, 12) — fresh gates right before every mutation.** Immediately before each `supabase stop`
+  and each SIGTERM, under the lock (stack: `stacks-<project>`; dev: `stacks-dev-<port>`), re-read: pause file
+  absent, `config.json` status `ok`, and the relevant mode is `apply`. Any of them failing ⇒ `kept` (reason
+  `paused` / `not configured` / `mode report`), no call. `runSessionEnd` with config not ok ⇒ record
+  `not configured`, no stack or dev decisions. Tests: pause created, config deleted, mode flipped to `report`
+  between assessment and the mutation (seam `deps.beforeMutate`) ⇒ no call, for both stack and dev paths.
+- **R2-7 (Task 12) — the schedule can never run against an isolated root.** `stacks schedule --install` refuses
+  (exit 2, `schedule works only for the default state root`) when `PIPELINE_STACKS_HOME` is set; the plist / cron line
+  carries no `PIPELINE_STACKS_*` variable and runs `stacks sweep --apply --summary-only` against the default root.
+  Test: install under an isolated root refused; the generated plist's EnvironmentVariables hold PATH only and its
+  ProgramArguments are exactly `[node, bin, stacks, sweep, --apply, --summary-only]`; the same for the cron line.
+- **R2-8 (Task 8) — the post-check names the database volume.** Before the stop, record the volume mounted at
+  `/var/lib/postgresql/data` in the `supabase_db_<project>` container (`Mounts[].Name` + `Destination`). After the
+  stop: the generation container is absent (`docker inspect` "No such object") OR not running, AND that exact volume
+  exists (`docker volume inspect <name>` exit 0). Volume missing ⇒ action `stopped` with `alert:'db-volume-missing'`
+  and a report headline. Tests: db volume missing while an unrelated project volume remains ⇒ alert; container gone
+  (Supabase removes containers on stop) ⇒ fine; no db volume recorded before the stop ⇒ `kept` (`db volume
+  unknown`), no stop. Task 15 records `supabase --version` and what `docker ps -a` / `docker volume ls` show after a
+  real stop, and the PR body states it.
+- **R2-9 (Tasks 9, 11, 12) — MISS needs an identity.** A "use" is `{t, pid, birth}`; ledger `use` events take the
+  owner's identity, C2/C3 hits take the identity read at observation (R2-4). `classifyUse`: `birth` null ⇒
+  `UNKNOWN`. The report counts UNKNOWN next to MISS and the "MISS must be 0 to switch on" headline treats any
+  UNKNOWN as a MISS ("MISS 0 (+2 unknown ⇒ not yet)"). Integration test: fake lsof/ps output → re-probe → outcome
+  summary MISS / RESTART / UNKNOWN counts.
+- **R2-10 (all tasks) — Windows and fakes.** CI runs the whole suite on ubuntu AND windows. Every test that spawns a
+  hook entry or uses POSIX tools is `{ skip: process.platform === 'win32' && 'POSIX only' }`; pure functions get
+  `platform` injected and get a `win32` test asserting no `run`/fs call happens and exit 0. End-to-end hook tests
+  control every process probe through seams (`PIPELINE_DOCKER`, `PIPELINE_PS`, `PIPELINE_LSOF`, `PIPELINE_SUPABASE`:
+  absolute paths to fake scripts in `test/fixtures/`), never the real ps tree. Seams are honoured only when
+  `PIPELINE_STACKS_HOME` is also set (so production hooks never read them).
+- **R2-11 (Task 13) — installer fixtures and two register entries.** Add the three new hook files to
+  `test/fixtures/src-tree/pipeline/hooks/` (the installer tests require the fixture tree to be complete).
+  `inspectHooks`/`computeDrift` check `stack-register` once PER MATCHER (`Bash`, `Read|Edit|Write|Grep|Glob|NotebookEdit`):
+  each must exist exactly once and be exact; tests remove one matcher's entry by hand ⇒ `hook-missing` naming the
+  matcher.
+- **R2-12 (Task 15) — consistent smoke expectations.** The worker file `workers/<pid>.json` gains `phase`
+  (`waiting` → `decided` → `observing`); Step 3 waits for `phase: decided` (≤ 3 min), not for `workers/` to empty
+  (the worker stays for its +30/+120 min observations; after the smoke the controller kills only the smoke workers it
+  started, by pid, after checking their cwd/args). Step 9's `PIPELINE_STACKS_ONLY` = the real private ids PLUS
+  `e2e-ci,DRMed,eaglewatch-pipeline`, so the shared rows appear (as `shared`, never assessable).
+- **R2-13 (Task 12 split).** Task 12 becomes **12a** (move the schedule helpers to `pipeline/lib/schedule.mjs`, no
+  behaviour change, `node scripts/test.mjs worktrees` green before and after, own commit) and **12b** (sweep +
+  `P stacks` + R2-7). Quick verify runs only `skills-commands docs-facts config`, so every task ALSO runs its own
+  test files plus the suites of every existing module it touches, and reports both.
+- **R2-14 (acceptance cases to add).** Task 1: identity under a non-UTC `TZ` in the parent env (ps still gets UTC).
+  Task 3: a ledger line whose `t` is not a valid ISO time ⇒ damage. Task 7: no-PR consumer ⇒ `listed`; mixed
+  consumers (one gone/merged, one OPEN) ⇒ `kept`. Tasks 11 and 12b: a damaged ledger ⇒ zero stops on both stop
+  paths (session-end records `ledger damaged`, sweep lists every stack with that reason).
+
+---
+
 ## File map
 
 | File | Responsibility |
@@ -627,7 +734,7 @@ for (const [name, flip] of Object.entries(flips)) test(`sweep: ${name} prevents 
 
 ---
 
-### Task 12: Sweep flow, `P stacks` command, shared schedule helpers
+### Task 12 (split into 12a + 12b, R2-13): Sweep flow, `P stacks` command, shared schedule helpers
 
 **Files:**
 - Create: `pipeline/lib/stacks/sweep.mjs`, `pipeline/commands/stacks.mjs`, `pipeline/lib/schedule.mjs`
@@ -677,7 +784,8 @@ for (const [name, flip] of Object.entries(flips)) test(`sweep: ${name} prevents 
 
 ### Task 13: Installer — register the three hooks; uninstall extras
 
-**Files:** Modify `pipeline/lib/installer.mjs`, `install.mjs`, `.github/scripts/installer-round-trip.sh`; Test
+**Files:** Modify `pipeline/lib/installer.mjs`, `install.mjs`, `.github/scripts/installer-round-trip.sh`; Create
+`test/fixtures/src-tree/pipeline/hooks/stack-{register,dev-bind,session-end}.mjs` (R2-11); Test
 `test/install.test.mjs` (extend)
 
 **Interfaces:**
@@ -729,7 +837,7 @@ Run on the Mac from the feature worktree after full verify is green; paste resul
   supabase_db_autostop-smoke psql -U postgres`.
 - [ ] **Step 3:** headless session with test settings pointing at the worktree hooks (`--settings <json>` with the
   three hook entries using worktree paths): `claude -p --model haiku --settings <json> "Run exactly this bash command
-  and nothing else: supabase status --workdir <dir>"`. After it exits, wait for the worker (`workers/` empty, ≤ 3 min).
+  and nothing else: supabase status --workdir <dir>"`. After it exits, wait for the worker's `phase: decided` (≤ 3 min; R2-12).
   Expect: decision `stopped` in `$ROOT/actions.jsonl`; `docker ps` shows no running `autostop-smoke` containers;
   `docker volume ls --filter label=com.supabase.cli.project=autostop-smoke` non-empty.
 - [ ] **Step 4:** `supabase start …` again; `select x from sentinel` ⇒ 42 (data kept).
@@ -743,7 +851,7 @@ Run on the Mac from the feature worktree after full verify is green; paste resul
   kept) to free memory; the smoke volume stays (never delete volumes) and is listed in the PR body.
 - [ ] **Step 9: Real-machine sweep, report only.** The production root has no config until the owner installs, so use
   an isolated root whose `config.json` is the `init` proposal, `mode.json` all `report`, and `PIPELINE_STACKS_ONLY`
-  = today's real private stack ids. Put a `supabase` wrapper first on PATH that logs its argv and exits 1 on `stop`.
+  = today's real private stack ids plus `e2e-ci,DRMed,eaglewatch-pipeline` (R2-12). Put a `supabase` wrapper first on PATH that logs its argv and exits 1 on `stop`.
   Expected rows as in the spec (shared ×3, sub-detachments kept, sa-corrections kept) and zero `stop` calls in the
   wrapper log.
 
@@ -756,6 +864,9 @@ Run on the Mac from the feature worktree after full verify is green; paste resul
 3. `P stacks schedule --install` (Claude, when the owner says so).
 4. Claude adds the ~10-line read-only include to `~/.claude/scripts/worktree-autoclean.mjs` (diff shown first,
    backup kept).
-5. 7 days later: owner reads `report.md` (MISS must be 0) and decides whether to flip any mode to `apply`; global
+5. Owner tries once, in report mode: `/clear` (no decision recorded), `/exit` (worker decides `would-stop`/`kept`),
+   `claude --resume` of a session after its worker decided (the new session's first stack use registers a fresh lease),
+   closing the terminal window (SessionEnd still fires or the sweep later shows the lease dead).
+6. 7 days later: owner reads `report.md` (MISS must be 0) and decides whether to flip any mode to `apply`; global
    CLAUDE.md gains its one line only then.
-6. PC: reinstall there too; inert until a config is written.
+7. PC: reinstall there too; inert until a config is written.
