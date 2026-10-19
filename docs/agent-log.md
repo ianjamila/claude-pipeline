@@ -64,3 +64,4 @@ full record.
 - 2026-10-19 · #87 · fix(inbox): never suggest close on age alone; never suggest merge when mergeability is unknown · risk high · rounds 1 · arbiter 0 · merged
 - 2026-10-19 · #83 · feat(stacks): stop private Supabase stacks nobody uses (measure-first) · risk high · rounds 7 · arbiter 0 · awaiting-owner-merge
 - 2026-10-19 · #83 · feat(stacks): stop private Supabase stacks nobody uses (measure-first) · risk high · rounds 7 · arbiter 0 · merged
+- 2026-10-19 · #90 · fix(state): mark-implemented accepts a test-only fix for a testing finding or the finding's own file (#53) · risk high · rounds 1 · arbiter 0 · awaiting-owner-merge
