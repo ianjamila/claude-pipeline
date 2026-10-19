@@ -114,3 +114,27 @@ test('H2 a line of open braces is read without flattening the word for each one 
     assert.ok(ms < 1000, `${Math.round(ms)} ms of CPU`);
   }
 });
+
+// ---- the candidates are never fewer than the real values, and nothing after a place the scan gives up is left unjudged ------------------------------------------------------
+test('H1 twins: a name the line gives only a harmless way stays allowed, one that can hold a protected word is refused (never looser than main)', () => {
+  allow('D=${U:-x}; echo y > ~/$D/settings.json');
+  allow('D=${U/x/y}; echo y > ~/$D/settings.json');
+  allow('D=(a b); echo y > ~/${D[2]}/settings.json');
+  allow(`F=x${CL}; D=\${F#y}; echo y > ~/$D/a.txt`);
+  deny(`D=\${U:+${CL}}; echo y > ~/$D/settings.json`);
+  deny(`F=x; D=\${F#x}${CL}; echo y > ~/$D/settings.json`);
+  deny(`D=\${U:-x}; echo y > ~/${CL}/settings.json`);
+  deny(`D=\${F:-x}; E=\${D:-${CL}}; echo y > ~/$E/settings.json`);
+});
+test('H2 a guarded write after the point where the parameter scans give up is still judged (both guards)', () => {
+  const filler = '${'.repeat(60000); // (the scans together pass MAX_PARAM_WORK long before the end)
+  const rf = files(`${filler}; echo x > ~/${CL}/settings.json`);
+  assert.equal(rf.decision, 'deny', `files: ${rf.reason ?? 'allowed'}`);
+  const rg = git(`${filler}; git ${'pu' + 'sh'} origin ${'ma' + 'in'}`);
+  assert.equal(rg.decision, 'deny', `git: ${rg.reason ?? 'allowed'}`);
+  assert.equal(files(`${filler}; echo x > ~/other.txt`).decision, 'allow');
+});
+test('H1 a target with more defaults than the scan reads is refused as before (the own readings stay over)', () => {
+  const r = deny(`echo y > ~/${'${a:-x}'.repeat(14)}/f`);
+  assert.ok(r.reason);
+});

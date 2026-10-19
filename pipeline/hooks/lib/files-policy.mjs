@@ -649,6 +649,7 @@ function makeMatchers(ctx) {
     if (!text) return false;
     // Why: `${V:-~/.claude}/settings.json` is the protected file whenever V is unset or empty, so every reading of a default / alternative word is judged
     // (#81 t8b: and every word a NAME may hold whose assignment holds an operator or is an array, `F=ok; D=${F/ok/.claude}; echo x > ~/$D/settings.json`: readingsOf, as for a script name)
+    // Defensive (mutation check): reading only paramReadings here is still caught by pathHit, which reads the assigned words for the same target.
     const rs = hitReadings(String(text));
     if (rs.over) {
       if (!program) return true;
@@ -699,6 +700,7 @@ function makeMatchers(ctx) {
     } else if (/^[A-Za-z_]+=./.test(tok)) parts = [tok, tok.slice(tok.indexOf('=') + 1)]; // (`of=settings.json`)
     for (const part of parts) {
       if (!part) continue;
+      // Defensive (mutation check): reading only paramReadings here is still caught by rawHit, which reads the assigned words for the same target.
       const rs = hitReadings(part); // (#81 t8b: the words an operator or array assignment gives, see rawHit)
       if (rs.over) return true;
       // Why: a target built by a command substitution (`"$(echo ~/.claude)"/settings.json`) is only known at run time: when its own text names a protected thing it is refused
@@ -1255,6 +1257,7 @@ function collectVars(cmds, ctx) {
     const raw = given.get(name)?.v;
     if (k !== '*' && ws.includes(UNKNOWN_WORD) && raw !== undefined && !/\$\(|`/.test(raw) && (raw.startsWith('(') || /\$\{[^}]*[^\w}]/.test(raw))) unknown.add(name);
   }
+  // Defensive (mutation check): with more assignments than the scan follows, the target is still judged by rawHit / pathHit on the expanded values (expandRefs) as on main.
   if (ctx.assigned?.has('*')) for (const k of given.keys()) unknown.add(k); // (more assignments than the scan follows: every name the line gives is only known at run time)
   if (aPins === null) for (const [k, r] of raws) if (r.size > 1) unknown.add(k);
   // Why (#76 / #81 t7 and the security follow-up): a name an arithmetic assigns (or appends to) holds a value the text does not give (see arithAssignedNames), whether or not the line gave it one
