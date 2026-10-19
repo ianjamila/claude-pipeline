@@ -7,7 +7,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { addRound, emptyState, saveState } from '../pipeline/lib/state.mjs';
-import { slotWrapped, withOnly } from '../pipeline/commands/verify.mjs';
+import { slotRunCommand, withOnly } from '../pipeline/commands/verify.mjs';
 
 const bin = join(dirname(fileURLToPath(import.meta.url)), '..', 'pipeline', 'bin', 'pipeline.mjs');
 const ENV = { ...process.env };
@@ -200,24 +200,24 @@ test('usage errors: missing/zero --round, unknown subcommand exit 2', (t) => {
   assert.equal(cli(repo.dir, ['verify']).code, 2);
 });
 
-// verify.max_parallel_full: every full command comes back wrapped in `slot --run` (one quoted argument), the quick one never.
-const WRAP = 'node ~/.claude/pipeline/bin/pipeline.mjs verify slot --run -- ';
+// verify.max_parallel_full: every full command comes back as `slot --run` (which runs verify.full itself), the quick one never.
+const RUN = 'node ~/.claude/pipeline/bin/pipeline.mjs verify slot --run';
 
-test('slotWrapped: the whole command is ONE argument, quoted only when it has to be', () => {
-  assert.equal(slotWrapped('node scripts/verify.mjs'), WRAP + "'node scripts/verify.mjs'");
-  assert.equal(slotWrapped('verify'), WRAP + 'verify');
-  assert.equal(slotWrapped('npm run verify -- --only db'), WRAP + "'npm run verify -- --only db'");
+test('slotRunCommand: no steps -> plain slot --run; steps -> --only a,b', () => {
+  assert.equal(slotRunCommand(), RUN);
+  assert.equal(slotRunCommand([]), RUN);
+  assert.equal(slotRunCommand(['db', 'db-grants']), RUN + ' --only db,db-grants');
 });
 
-test('max_parallel_full set, after_fix full: commands = [verify.full wrapped in slot --run]', (t) => {
+test('max_parallel_full set, after_fix full: commands = [slot --run]', (t) => {
   const { repo } = project({ afterFix: 'full', slots: 2 });
   t.after(() => repo.cleanup());
   const r = cli(repo.dir, ['verify', 'plan-after-fix', '--round', '1']);
   assert.equal(r.code, 0, r.stderr + r.stdout);
-  assert.deepEqual(r.json.commands, [WRAP + "'node scripts/verify.mjs'"]);
+  assert.deepEqual(r.json.commands, [RUN]);
 });
 
-test('max_parallel_full set, quick: the quick command stays bare, the --only full run is wrapped', (t) => {
+test('max_parallel_full set, quick: the quick command stays bare, the --only full run is slot --run --only', (t) => {
   const { repo, reviewed } = project({ slots: 1 });
   t.after(() => repo.cleanup());
   repo.write('supabase/migrations/002.sql', 'select 2;\n');
@@ -225,7 +225,7 @@ test('max_parallel_full set, quick: the quick command stays bare, the --only ful
   recordRound(repo, reviewed);
   const r = cli(repo.dir, ['verify', 'plan-after-fix', '--round', '1']);
   assert.equal(r.code, 0, r.stderr + r.stdout);
-  assert.deepEqual(r.json.commands, ['node scripts/verify.mjs --quick', WRAP + "'node scripts/verify.mjs --only db,db-grants'"]);
+  assert.deepEqual(r.json.commands, ['node scripts/verify.mjs --quick', RUN + ' --only db,db-grants']);
 });
 
 test('max_parallel_full set, quick, no mapped path: still only the bare quick command', (t) => {
@@ -238,10 +238,10 @@ test('max_parallel_full set, quick, no mapped path: still only the bare quick co
   assert.deepEqual(r.json.commands, ['node scripts/verify.mjs --quick']);
 });
 
-test('max_parallel_full set, no round state: the error names the wrapped full command', (t) => {
+test('max_parallel_full set, no round state: the error names slot --run as the full command', (t) => {
   const { repo } = project({ slots: 1 });
   t.after(() => repo.cleanup());
   const r = cli(repo.dir, ['verify', 'plan-after-fix', '--round', '1']);
   assert.equal(r.code, 1);
-  assert.match(r.json.message, /slot --run -- 'node scripts\/verify\.mjs'/);
+  assert.ok(r.json.message.includes('run the full verify (' + RUN + ')'), r.json.message);
 });

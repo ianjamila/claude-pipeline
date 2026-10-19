@@ -133,7 +133,7 @@ permissions / data-integrity / data-loss item ⇒ `needsHuman` (the CLI applies 
   <round> --accepted`): fix each, add/adjust tests where behaviour changes, quick verify, commit,
   `git push origin agent/<slug>`. Then the verifier runs `verify.full` (`P config` `verify.after_fix: full`, the default).
   When `verify.after_fix` is `quick`, run `P verify plan-after-fix --round <round>` instead and have the verifier run each
-  command in its `commands` list, in order (a quick check, then the extra full steps the fixes touched; run them exactly as printed: with `verify.max_parallel_full` set the full ones come back wrapped in `verify slot --run`); exit 1 ⇒ run `verify.full` (wrapped the same way, SKILL.md Step 2.2).
+  command in its `commands` list, in order (a quick check, then the extra full steps the fixes touched; run them exactly as printed: with `verify.max_parallel_full` set the full ones come back as `verify slot --run [--only <steps>]`); exit 1 ⇒ run `verify.full` (as `verify slot --run` when `verify.max_parallel_full` is set, SKILL.md Step 2.2).
   Either red ⇒ fix cycle (max 2), else
   `needs-human` (park it as below, `--cause verify-red`). Then `P state mark-implemented --ids <ids>` — exit 2 `no-code-change` means the
   branch content is still what the round reviewed: the fix has not actually changed code, so go back to

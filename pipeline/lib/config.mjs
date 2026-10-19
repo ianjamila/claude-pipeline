@@ -84,7 +84,7 @@ const PROVIDERS = ['vercel', 'github-deployments', 'other'];
 // Who owns the production smoke: the ship session (prod-watch) or a CI workflow that posts the result on the merged PR.
 const WATCH_MODES = ['session', 'workflow'];
 const AFTER_FIX_MODES = ['full', 'quick'];
-const SAFE_STEP = /^[A-Za-z0-9_.:-]+$/;
+export const SAFE_STEP = /^[A-Za-z0-9_.:-]+$/;
 
 // Allowed keys per mapping. Anything else is a typo (or a removed option) and is rejected.
 const KEYS = {

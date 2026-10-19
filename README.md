@@ -288,7 +288,7 @@ verify:
   `pipeline verify plan-after-fix --round R` prints the commands.
 - `after_fix_never`: steps that may only run as part of a full verify. Listing one in `after_fix_steps_by_path` too is a config error.
 - `max_parallel_full` (positive integer): full verifies of all repos on this machine share that many slots; the rest wait
-  in arrival order (`pipeline verify slot --status` shows who holds them). `max_load` and `max_load_wait_minutes` add a
+  in arrival order (`pipeline verify slot --status` shows who holds them; `pipeline verify slot --run` runs only the repo's own `verify.full` in a slot, never another command). `max_load` and `max_load_wait_minutes` add a
   wait for a quiet machine after the slot is taken; when the time is up the verify runs anyway, with a warning.
 
 Rollout: the config rejects unknown keys, so set these in a repo only after every machine that works on it has run

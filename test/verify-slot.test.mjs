@@ -7,17 +7,18 @@ import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tryAcquire } from '../pipeline/lib/locks.mjs';
-import { defaultJitterMs, runWithSlot, slotStatus } from '../pipeline/commands/verify.mjs';
+import { defaultJitterMs, runWithSlot, slotRunLine, slotStatus } from '../pipeline/commands/verify.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 
 process.env.PIPELINE_MACHINE_ID ||= 'test-machine-id';
 const BIN = fileURLToPath(new URL('../pipeline/bin/pipeline.mjs', import.meta.url));
 const CHILD = fileURLToPath(new URL('./fixtures/slot-child.mjs', import.meta.url));
+const ECHO = fileURLToPath(new URL('./fixtures/slot-echo.mjs', import.meta.url));
 const HOST = os.hostname();
 const MACHINE = process.env.PIPELINE_MACHINE_ID;
 
@@ -302,17 +303,20 @@ test('default jitter is 5-30 seconds', () => {
 });
 
 // ---- the real CLI ---------------------------------------------------------------------------------------------------------
-function repoWith(slots) {
+// `slot --run` runs only verify.full from the repo's pipeline.yml; each repo here points verify.full at a fixture script.
+const q = (p) => JSON.stringify(p);
+function repoWith(slots, { script = CHILD, args = [], extra = '' } = {}) {
   const repo = createTmpRepo();
-  repo.write('.claude/pipeline.yml', `version: 1\nproject: demo\nverify:\n  full: node scripts/verify.mjs\n  quick: node scripts/verify.mjs --quick\n${slots === undefined ? '' : `  max_parallel_full: ${slots}\n`}`);
+  const full = [process.execPath, script, ...args].map(q).join(' ');
+  repo.write('.claude/pipeline.yml', `version: 1\nproject: demo\nverify:\n  full: ${JSON.stringify(full)}\n  quick: node scripts/verify.mjs --quick\n${slots === undefined ? '' : `  max_parallel_full: ${slots}\n`}${extra}`);
   repo.commit('config');
   return repo;
 }
 const cliEnv = (lockDir) => ({ ...process.env, PIPELINE_LOCK_DIR: lockDir, PIPELINE_SLOT_POLL_MS: '20', PIPELINE_MACHINE_ID: MACHINE });
-const childCmd = (dir, name, exit = 0) => [process.execPath, CHILD, path.join(dir, `${name}.started`), path.join(dir, 'release'), String(exit)];
+const childArgs = (dir, name, exit = 0) => [path.join(dir, `${name}.started`), path.join(dir, 'release'), String(exit)];
 
-function startCli(cwd, lockDir, args) {
-  const p = spawn(process.execPath, [BIN, 'verify', 'slot', '--run', '--', ...args], { cwd, env: cliEnv(lockDir), stdio: ['ignore', 'pipe', 'pipe'] });
+function startCli(cwd, lockDir, args = []) {
+  const p = spawn(process.execPath, [BIN, 'verify', 'slot', '--run', ...args], { cwd, env: cliEnv(lockDir), stdio: ['ignore', 'pipe', 'pipe'] });
   const out = { stdout: '', stderr: '' };
   p.stdout.on('data', (d) => { out.stdout += d; });
   p.stderr.on('data', (d) => { out.stderr += d; });
@@ -328,14 +332,15 @@ async function until(cond, what, ms = 10_000) {
 }
 const statusOf = (lockDir) => JSON.parse(spawnSync(process.execPath, [BIN, 'verify', 'slot', '--status'], { env: cliEnv(lockDir), encoding: 'utf8' }).stdout);
 
-test('CLI: the command runs, its exit code is the wrapper\'s, stdout stays the command\'s, and one stderr line reports the slot', TIMEOUT, async () => {
-  const repo = repoWith(2);
-  const lockDir = tmp();
+test('CLI: runs verify.full from the config; its exit code is the wrapper\'s, stdout stays its own, one stderr line reports the slot', TIMEOUT, async () => {
   const work = tmp();
   writeFileSync(path.join(work, 'release'), '');
+  const repo = repoWith(2, { args: childArgs(work, 'a', 7) });
+  const lockDir = tmp();
   try {
-    const r = await startCli(repo.dir, lockDir, childCmd(work, 'a', 7)).done;
+    const r = await startCli(repo.dir, lockDir).done;
     assert.equal(r.code, 7);
+    assert.ok(existsSync(path.join(work, 'a.started')), 'the configured verify.full ran');
     assert.equal(r.stdout, '', 'no JSON result on stdout');
     const line = JSON.parse(r.stderr.trim().split('\n')[0]);
     assert.deepEqual(Object.keys(line), ['slot']);
@@ -349,25 +354,64 @@ test('CLI: the command runs, its exit code is the wrapper\'s, stdout stays the c
   }
 });
 
-test('CLI: one argument is a whole shell command line', TIMEOUT, async () => {
-  const repo = repoWith(1);
+test('CLI: --only STEPS is appended to verify.full', TIMEOUT, async () => {
+  const work = tmp();
+  const out = path.join(work, 'argv.json');
+  const repo = repoWith(1, { script: ECHO, args: [out], extra: '  expected_steps: [db, unit, db-grants]\n' });
   const lockDir = tmp();
   try {
-    const r = await startCli(repo.dir, lockDir, [`"${process.execPath}" -e "process.stdout.write('hi'); process.exit(4)"`]).done;
-    assert.equal(r.code, 4);
-    assert.equal(r.stdout, 'hi');
+    const r = await startCli(repo.dir, lockDir, ['--only', 'db,db-grants']).done;
+    assert.equal(r.code, 0, r.stderr);
+    assert.deepEqual(JSON.parse(readFileSync(out, 'utf8')), [out, '--only', 'db,db-grants']);
   } finally {
     repo.cleanup();
   }
 });
 
-test('CLI: no verify.max_parallel_full -> the command just runs (no slot)', TIMEOUT, async () => {
-  const repo = repoWith(undefined);
+test('slotRunLine: appends --only, with the npm -- forwarding plan-after-fix uses', () => {
+  assert.equal(slotRunLine({ full: 'node scripts/verify.mjs' }, {}), 'node scripts/verify.mjs');
+  assert.equal(slotRunLine({ full: 'node scripts/verify.mjs' }, { only: 'db,unit' }), 'node scripts/verify.mjs --only db,unit');
+  assert.equal(slotRunLine({ full: 'npm run verify' }, { only: 'db' }), 'npm run verify -- --only db');
+  assert.equal(slotRunLine({ full: 'npm run verify -- --x' }, { only: 'db' }), 'npm run verify -- --x --only db');
+});
+
+test('CLI: anything but verify.full is refused with exit 2 and nothing is spawned', TIMEOUT, async () => {
+  const work = tmp();
+  const marker = path.join(work, 'argv.json');
+  const repo = repoWith(1, { script: ECHO, args: [marker], extra: '  expected_steps: [db, unit]\n' });
   const lockDir = tmp();
+  const bad = [
+    ['--', 'echo', 'any', 'other', 'command'],
+    ['--only', 'db', '--', 'echo', 'x'],
+    ['echo', 'positional'],
+    ['--only', 'db;touch x'],
+    ['--only', 'db,$(id)'],
+    ['--only', 'db,,unit'],
+    ['--only', ''],
+    ['--only', 'db,db'],
+    ['--only', 'nope'],
+    ['--cmd', 'echo hi'],
+    ['--only'],
+  ];
+  try {
+    for (const args of bad) {
+      const r = await startCli(repo.dir, lockDir, args).done;
+      assert.equal(r.code, 2, `${JSON.stringify(args)}: ${r.stderr}`);
+      assert.equal(existsSync(marker), false, `${JSON.stringify(args)} must not run anything`);
+    }
+    assert.equal(existsSync(path.join(lockDir, 'verify-full-queue')), false, 'refused before any queueing');
+  } finally {
+    repo.cleanup();
+  }
+});
+
+test('CLI: no verify.max_parallel_full -> verify.full just runs (no slot)', TIMEOUT, async () => {
   const work = tmp();
   writeFileSync(path.join(work, 'release'), '');
+  const repo = repoWith(undefined, { args: childArgs(work, 'a', 0) });
+  const lockDir = tmp();
   try {
-    const r = await startCli(repo.dir, lockDir, childCmd(work, 'a', 0)).done;
+    const r = await startCli(repo.dir, lockDir).done;
     assert.equal(r.code, 0);
     const line = JSON.parse(r.stderr.trim().split('\n')[0]);
     assert.deepEqual(line.slot, { index: null, of: null, waitedSeconds: 0, loadWaitSeconds: 0, warnings: [] });
@@ -378,14 +422,14 @@ test('CLI: no verify.max_parallel_full -> the command just runs (no slot)', TIME
 });
 
 test('CLI: two different repos share the one machine slot; the second runs after the first ends', TIMEOUT, async () => {
-  const one = repoWith(1);
-  const two = repoWith(1);
-  const lockDir = tmp();
   const work = tmp();
+  const one = repoWith(1, { args: childArgs(work, 'a') });
+  const two = repoWith(1, { args: childArgs(work, 'b') });
+  const lockDir = tmp();
   try {
-    const a = startCli(one.dir, lockDir, childCmd(work, 'a'));
-    await until(() => existsSync(path.join(work, 'a.started')), 'first command to start');
-    const b = startCli(two.dir, lockDir, childCmd(work, 'b'));
+    const a = startCli(one.dir, lockDir);
+    await until(() => existsSync(path.join(work, 'a.started')), 'first verify to start');
+    const b = startCli(two.dir, lockDir);
     await until(() => statusOf(lockDir).waiters.length === 1, 'second repo to queue');
     assert.equal(existsSync(path.join(work, 'b.started')), false);
     assert.equal(statusOf(lockDir).holders.length, 1);
@@ -394,7 +438,6 @@ test('CLI: two different repos share the one machine slot; the second runs after
     assert.equal(ra.code, 0);
     assert.equal(rb.code, 0);
     assert.ok(existsSync(path.join(work, 'b.started')));
-    assert.ok(JSON.parse(rb.stderr.trim().split('\n')[0]).slot.waitedSeconds >= 0);
     assert.deepEqual(statusOf(lockDir).holders, []);
   } finally {
     one.cleanup();
@@ -402,13 +445,13 @@ test('CLI: two different repos share the one machine slot; the second runs after
   }
 });
 
-test('CLI: SIGTERM to the wrapper reaches the command and frees the slot', TIMEOUT, async () => {
-  const repo = repoWith(1);
-  const lockDir = tmp();
+test('CLI: SIGTERM to the wrapper reaches the verify and frees the slot', TIMEOUT, async () => {
   const work = tmp();
+  const repo = repoWith(1, { args: childArgs(work, 'a') });
+  const lockDir = tmp();
   try {
-    const a = startCli(repo.dir, lockDir, childCmd(work, 'a'));
-    await until(() => existsSync(path.join(work, 'a.started')), 'command to start');
+    const a = startCli(repo.dir, lockDir);
+    await until(() => existsSync(path.join(work, 'a.started')), 'verify to start');
     assert.equal(statusOf(lockDir).holders.length, 1);
     a.p.kill('SIGTERM');
     const r = await a.done;
@@ -421,15 +464,13 @@ test('CLI: SIGTERM to the wrapper reaches the command and frees the slot', TIMEO
   }
 });
 
-test('CLI: usage errors (exit 2): neither/both mode, no command, --status with a command', () => {
+test('CLI: usage errors (exit 2): neither/both mode, --status with other options', () => {
   const lockDir = tmp();
   const run = (args) => spawnSync(process.execPath, [BIN, 'verify', 'slot', ...args], { env: cliEnv(lockDir), encoding: 'utf8' });
   assert.equal(run([]).status, 2);
   assert.equal(run(['--run', '--status']).status, 2);
-  assert.equal(run(['--run']).status, 2);
-  assert.equal(run(['--run', '--']).status, 2);
+  assert.equal(run(['--status', '--only', 'db']).status, 2);
   assert.equal(run(['--status', '--', 'x']).status, 2);
-  assert.equal(run(['--run', 'echo', 'hi']).status, 2, 'the command must come after --');
   const ok = run(['--status']);
   assert.equal(ok.status, 0);
   assert.deepEqual(JSON.parse(ok.stdout), { ok: true, lockDir, holders: [], waiters: [] });

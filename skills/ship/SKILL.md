@@ -138,7 +138,7 @@ note it in the summary and carry on, never stop the run for it.
    `P checkpoint --pr N --step build --task-done <id>`. A `checkpoint` exit 1 `unpushed` ⇒ `git push`; `behind` ⇒
    `git pull --ff-only`; `diverged` ⇒ stop and report; then checkpoint again.
 2. Dispatch the **verifier** with `verify.full` (from `P config`). When `verify.max_parallel_full` is set, every full verify (here, Step 5.3,
-   and the full runs of review-loop §6) runs as `node ~/.claude/pipeline/bin/pipeline.mjs verify slot --run -- <verify.full>` instead,
+   and the full runs of review-loop §6) runs as `node ~/.claude/pipeline/bin/pipeline.mjs verify slot --run` (it runs `verify.full` itself; nothing goes after it) instead,
    so only that many run at once on this machine; the wrapper passes the exit code through and prints one stderr line
    `{"slot":{…,"waitedSeconds","loadWaitSeconds","warnings"}}`: the verifier reports it, and the controller puts the waits (and any
    warning) in the summary when they are above 0. Green ⇒ `P checkpoint --pr N --step verify

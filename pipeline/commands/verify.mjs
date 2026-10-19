@@ -2,10 +2,14 @@
 // lines by hand. Subcommands: plan-after-fix (which verify commands to run after a round's accepted fixes) and slot (limit how
 // many full verifies run at once on one machine, opt-in through verify.max_parallel_full).
 //
-// Why `slot --run -- CMD` WRAPS the command instead of the plan's `slot --acquire` / `--release` pair: locks.mjs reclaims a
-// lock whose owner PID is dead, and a short-lived `--acquire` process dies right after taking the slot, so its slot would be
-// reclaimed at once and the limit would hold nothing. The wrapper stays alive (its PID is the lock owner) for exactly as long
-// as the child runs; a wrapper killed hard frees its slot through the same dead-owner reclaim.
+// Why `slot --run` WRAPS the run instead of the plan's `slot --acquire` / `--release` pair: locks.mjs reclaims a lock whose
+// owner PID is dead, and a short-lived `--acquire` process dies right after taking the slot, so its slot would be reclaimed at
+// once and the limit would hold nothing. The wrapper stays alive (its PID is the lock owner) for exactly as long as the child
+// runs; a wrapper killed hard frees its slot through the same dead-owner reclaim.
+//
+// `slot --run` runs ONLY the repo's configured `verify.full` (plus a validated `--only <steps>`), never a command of the
+// caller's: the git and file guards judge the commands a session runs (and unwrap `job start NAME -- CMD`), so a wrapper that
+// took an arbitrary command would be an exec that walks past them. Any extra argument, or anything after `--`, is a usage error.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -16,8 +20,8 @@ import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs
 import { git, headSha, isAncestor, revParse } from '../lib/git.mjs';
 import { matchGlob } from '../lib/glob.mjs';
 import { defaultLockDir, INCOMPLETE_STALE_MS, inspect, isPidAlive, machineId, release, tryAcquire } from '../lib/locks.mjs';
+import { SAFE_STEP } from '../lib/config.mjs';
 import { loadState } from '../lib/state.mjs';
-import { quoteCommand } from './job.mjs';
 
 export const meta = {
   summary: 'plan the verify commands for the ship loop (plan-after-fix); limit parallel full verifies (slot)',
@@ -26,12 +30,13 @@ export const meta = {
     '  verify.after_fix full (default): commands = [verify.full]. quick: commands = [verify.quick] plus, when the fixes since round R\'s',
     '  reviewed head (renames count on both sides) touch a path in verify.after_fix_steps_by_path, verify.full --only <those steps>;',
     '  run them in order, either red = fix cycle. exit 1 {ok:false, error} when round R has no recorded review state (fail closed)',
-    '  verify.max_parallel_full set: every full command above comes back wrapped in `slot --run` (a --only run executes the database steps)',
-    'pipeline verify slot --run [--repo DIR] -- CMD...   wait for a free slot, run CMD (inherited stdio), free the slot when it ends; exit code = CMD\'s',
-    '  Slots are machine-wide (all repos); the limit is verify.max_parallel_full of the repo it runs in; unset = CMD runs at once. Waiters go in arrival order.',
-    '  One stderr line before CMD starts: {"slot":{index,of,waitedSeconds,loadWaitSeconds,warnings}}. With verify.max_load it then waits (5-30 s jitter between',
+    '  verify.max_parallel_full set: the full commands above come back as `node ~/.claude/pipeline/bin/pipeline.mjs verify slot --run [--only STEPS]`',
+    'pipeline verify slot --run [--only STEP,STEP...] [--repo DIR]   wait for a free slot, run the repo\'s verify.full (with --only STEPS appended; npm gets "--" first),',
+    '  inherited stdio, free the slot when it ends; exit code = verify.full\'s. It runs nothing else: any other argument, or "--", is a usage error (exit 2).',
+    '  Slots are machine-wide (all repos); the limit is verify.max_parallel_full of the repo it runs in; unset = it runs at once. Waiters go in arrival order.',
+    '  One stderr line before verify.full starts: {"slot":{index,of,waitedSeconds,loadWaitSeconds,warnings}}. With verify.max_load it then waits (5-30 s jitter between',
     '  checks, at most verify.max_load_wait_minutes) while the 1-minute load average is above it, and proceeds with a warning when the time is up.',
-    '  One argument is a whole shell command line ("npm run verify"); several arguments are quoted for the shell like job start. SIGINT/SIGTERM/SIGHUP go to CMD.',
+    '  SIGINT/SIGTERM/SIGHUP go to the running verify. STEPS: letters, digits and . _ : - only, no repeats, each in verify.expected_steps when that is set.',
     'pipeline verify slot --status   -> {ok, lockDir, holders[{index,pid,host,startedAt,alive}], waiters[{seq,pid,host,alive}]}   (read only; the whole machine)',
   ].join('\n'),
 };
@@ -70,12 +75,12 @@ async function planAfterFix(argv, ctx) {
   const { config } = await requireConfig(root);
   const { full, quick, after_fix: mode, after_fix_steps_by_path: byPath = {}, max_parallel_full: slots } = config.verify;
   // Every full run (a --only run too: it executes the database steps) takes a slot when the repo limits parallel full verifies.
-  const wrap = (cmd) => (slots === undefined ? cmd : slotWrapped(cmd));
+  const fullRun = (steps = []) => (slots !== undefined ? slotRunCommand(steps) : steps.length > 0 ? withOnly(full, steps) : full);
   const o = { cwd: root };
   const head = headSha(o);
 
   if (mode !== 'quick') {
-    return { exitCode: EXIT.OK, output: { ok: true, mode: 'full', commands: [wrap(full)], matchedSteps: [], base: null, head, files: [] } };
+    return { exitCode: EXIT.OK, output: { ok: true, mode: 'full', commands: [fullRun()], matchedSteps: [], base: null, head, files: [] } };
   }
 
   // The head round R was reviewed at: the fixes to verify are everything committed after it. No record, no plan
@@ -88,11 +93,11 @@ async function planAfterFix(argv, ctx) {
   }
   const found = state?.rounds?.find((r) => r.n === round);
   if (!found || typeof found.toHead !== 'string' || found.toHead === '') {
-    throw new Fail(EXIT.FAILED, { ok: false, error: 'no-round-state', message: `no review state for round ${round} (.review/state.json): cannot tell which commits the fixes are; run the full verify (${wrap(full)})` });
+    throw new Fail(EXIT.FAILED, { ok: false, error: 'no-round-state', message: `no review state for round ${round} (.review/state.json): cannot tell which commits the fixes are; run the full verify (${fullRun()})` });
   }
   const base = revParse(found.toHead, o);
   if (!isAncestor(base, head, o)) {
-    throw new Fail(EXIT.FAILED, { ok: false, error: 'base-not-ancestor', message: `round ${round}'s reviewed head ${base} is not an ancestor of HEAD ${head} (history was rewritten); run the full verify (${wrap(full)})` });
+    throw new Fail(EXIT.FAILED, { ok: false, error: 'base-not-ancestor', message: `round ${round}'s reviewed head ${base} is not an ancestor of HEAD ${head} (history was rewritten); run the full verify (${fullRun()})` });
   }
 
   const files = changedPaths(base, head, o);
@@ -101,7 +106,7 @@ async function planAfterFix(argv, ctx) {
     if (!files.some((f) => matchGlob(f, glob))) continue;
     for (const s of steps) if (!matchedSteps.includes(s)) matchedSteps.push(s);
   }
-  const commands = [quick, ...(matchedSteps.length > 0 ? [wrap(withOnly(full, matchedSteps))] : [])];
+  const commands = [quick, ...(matchedSteps.length > 0 ? [fullRun(matchedSteps)] : [])];
   return { exitCode: EXIT.OK, output: { ok: true, mode: 'quick', commands, matchedSteps, base, head, files } };
 }
 
@@ -119,9 +124,9 @@ const DEFAULT_POLL_MS = 1000; // keep <= 2000: a queue should notice a freed slo
 export const defaultJitterMs = () => 5000 + Math.random() * 25000;
 const realSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-export const SLOT_RUN = 'node ~/.claude/pipeline/bin/pipeline.mjs verify slot --run --';
-// The whole command as ONE argument (single-quoted when it has spaces), so the wrapper runs it as a shell line.
-export const slotWrapped = (command) => `${SLOT_RUN} ${quoteCommand([command])}`;
+// What plan-after-fix prints for a full verify that must take a slot. Step names are shell-safe (config validation), so no quoting.
+export const SLOT_RUN = 'node ~/.claude/pipeline/bin/pipeline.mjs verify slot --run';
+export const slotRunCommand = (steps = []) => (steps.length > 0 ? `${SLOT_RUN} --only ${steps.join(',')}` : SLOT_RUN);
 
 const ticketOrder = (a, b) => a.seq - b.seq || a.pid - b.pid || (a.rand < b.rand ? -1 : a.rand > b.rand ? 1 : 0);
 
@@ -333,30 +338,52 @@ export function slotStatus({ lockDir = defaultLockDir(), isAlive = isPidAlive, h
   return { ok: true, lockDir, holders, waiters };
 }
 
+// The flags of `slot --run` that become part of the verify.full command line, each with its own validation. A new flag
+// (a later feature) is one more entry: { parse(value, config) -> the argument text appended to verify.full }.
+const RUN_FLAGS = {
+  only: {
+    option: { type: 'string' },
+    parse(raw, verify) {
+      const steps = raw.split(',');
+      if (steps.some((n) => !SAFE_STEP.test(n))) throw new UsageError('verify slot --only: step names may only use letters, digits and . _ : - (comma separated)');
+      if (new Set(steps).size !== steps.length) throw new UsageError('verify slot --only: a step is listed twice');
+      const unknown = Array.isArray(verify.expected_steps) ? steps.filter((n) => !verify.expected_steps.includes(n)) : [];
+      if (unknown.length > 0) throw new UsageError(`verify slot --only: not in verify.expected_steps: ${unknown.join(', ')}`);
+      return { steps };
+    },
+  },
+};
+
+// The one command `slot --run` may start: verify.full from the config, plus the validated flags. Exported for tests.
+export function slotRunLine(verify, flags) {
+  const steps = flags.only !== undefined ? RUN_FLAGS.only.parse(flags.only, verify).steps : [];
+  return steps.length > 0 ? withOnly(verify.full, steps) : verify.full;
+}
+
 // Test seams (environment): PIPELINE_LOCK_DIR moves the machine lock directory, PIPELINE_SLOT_POLL_MS the queue poll interval.
 async function slotCommand(rest, ctx) {
-  const dd = rest.indexOf('--');
-  const own = dd < 0 ? rest : rest.slice(0, dd);
-  const { values, positionals } = parseCommandArgs(own, { run: { type: 'boolean' }, status: { type: 'boolean' }, repo: { type: 'string' } });
-  if (positionals.length > 0) throw new UsageError('verify slot: put the command after "--": pipeline verify slot --run -- CMD...');
+  // No "--" and no positional argument: nothing the caller types is ever run (see the header).
+  if (rest.includes('--')) throw new UsageError('verify slot takes no command: it runs verify.full from the config (pipeline verify slot --run [--only STEPS])');
+  const options = { run: { type: 'boolean' }, status: { type: 'boolean' }, repo: { type: 'string' }, ...Object.fromEntries(Object.entries(RUN_FLAGS).map(([k, f]) => [k, f.option])) };
+  const { values, positionals } = parseCommandArgs(rest, options);
+  if (positionals.length > 0) throw new UsageError(`verify slot takes no command (got ${JSON.stringify(positionals[0])}): it runs verify.full from the config`);
   if (Boolean(values.run) === Boolean(values.status)) throw new UsageError('verify slot needs exactly one of --run or --status');
   const env = ctx?.env ?? process.env;
   const lockDir = env.PIPELINE_LOCK_DIR || defaultLockDir();
+  const flags = Object.fromEntries(Object.keys(RUN_FLAGS).filter((k) => values[k] !== undefined).map((k) => [k, values[k]]));
 
   if (values.status) {
-    if (dd >= 0) throw new UsageError('verify slot --status takes no command');
+    if (Object.keys(flags).length > 0 || values.repo !== undefined) throw new UsageError('verify slot --status takes no other option');
     return { exitCode: EXIT.OK, output: slotStatus({ lockDir }) };
   }
 
-  const args = dd < 0 ? [] : rest.slice(dd + 1);
-  if (args.length === 0 || args[0].trim() === '') throw new UsageError('verify slot --run needs a command after "--"');
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
   const { max_parallel_full: n, max_load: maxLoad, max_load_wait_minutes: maxLoadWaitMinutes } = config.verify;
-  const command = args.length === 1 ? args[0] : quoteCommand(args);
+  const command = slotRunLine(config.verify, flags); // validates every flag before anything is spawned
   const poll = Number(env.PIPELINE_SLOT_POLL_MS);
   const code = await runWithSlot({ command, cwd: root, n, maxLoad, maxLoadWaitMinutes, lockDir, env, ...(poll > 0 ? { pollMs: poll } : {}) });
-  // The command's own output owns stdout, so no JSON result is printed: leave with its exit code directly.
+  // The verify's own output owns stdout, so no JSON result is printed: leave with its exit code directly.
   process.exit(code);
 }
 
@@ -364,5 +391,5 @@ export const run = guarded(async (argv, ctx) => {
   const [sub, ...rest] = argv;
   if (sub === 'plan-after-fix') return planAfterFix(rest, ctx);
   if (sub === 'slot') return slotCommand(rest, ctx);
-  throw new UsageError('usage: pipeline verify (plan-after-fix --round R [--repo DIR] | slot --run [--repo DIR] -- CMD... | slot --status)');
+  throw new UsageError('usage: pipeline verify (plan-after-fix --round R [--repo DIR] | slot --run [--only STEPS] [--repo DIR] | slot --status)');
 });
