@@ -78,6 +78,7 @@ A stack is in use if ANY holds (all sources evaluated together):
   `localhost:<port>`). A live process with cwd inside a consumer worktree ⇒ in use (session-end); an existing consumer
   worktree with an open PR or no PR ⇒ in use (sweeper).
 - **C6 Recent transcripts (sweeper only):** a transcript modified in the last 24 h names the stack folder/project.
+Other users' processes (R3-1): their real use of a stack is covered by C2 (server side) and by C3's command line; their environment and cwd/open files cannot be read without root, so those checks see this user's processes only (reports show `hidden: N`).
 (Kong/Postgres traffic mining is dropped from the gates — Codex's P3 simplification; it may come back as a report
 column later.)
 
@@ -216,7 +217,7 @@ owner.json, dead-pid / never-finished reclaim serialized by a guard dir, live pi
   disappears.
 
 ### 8. Docs
-Header of `pipeline/lib/stacks/decide.mjs` holds the rules; repo README explains modes and the measure-first policy. Global
+Header of `pipeline/lib/stacks/decide.mjs` holds the rules (pure verdicts; no fs, subprocess, environment or clock). The module set in `pipeline/lib/stacks/`: `paths` (state root, isolation), `config` (machine config, modes, keep list, pause), `result` (ok/unknown), `inventory` (Docker stacks), `identity` (process birth), `evidence` (ps/lsof probes), `match` (which stack a tool call names), `assess` (facts per stack), `decide` (verdicts), `act` (the only `supabase stop`), `ledger` (leases), `register` (register hook flow), `dev` (dev servers), `session-end` (hook and worker), `sweep` (daily sweep), `outcomes` (decisions log and reports), `uninstall` (pause and worker wait); repo README explains modes and the measure-first policy. Global
 CLAUDE.md shared-stacks bullet gains one line only when a mode is switched to `apply`. Memory note
 [[supabase-stack-autostop]] updated at each step.
 
