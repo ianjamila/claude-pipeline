@@ -1,0 +1,266 @@
+// Shared assessment helpers of stack-stop: what is true of ONE stack right now, gathered the same way by the session-end worker
+// and (Task 12b) the daily sweep. Two jobs:
+//   1. buildCurrent -> the `current` object act.mjs/decide.mjs checkBinding compares against what was assessed
+//      ({ workdirExists, workdirReal, labelWorkdirReal, configProject, labelProject, generation, shared, dbVolume }), built from a
+//      FRESH inventory plus the workdir's supabase/config.toml and a realpath, never from the earlier assessment;
+//   2. gatherEvidence -> the evidence object a verdict takes (decide.mjs sessionEndVerdict / sweepVerdict), with `probes` naming
+//      which probes to run, so each caller asks for exactly its verdict's inputs. Every probe answers ok | unknown (fail closed):
+//      a probe that is not requested is simply absent from the object (a verdict reads an absent required input as unknown).
+//
+// The ledger is always read under the ledger lock (name `ledger`), so a line another process is writing right now is never
+// mistaken for damage; a damaged ledger makes every lease probe unknown, and with it every verdict `kept` (R2-14).
+// Lock order: callers may hold a project lock (reassess runs inside one); the ledger lock is only ever taken after it.
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { acquire as realAcquire, release as realRelease } from '../locks.mjs';
+import { run as realRun } from '../proc.mjs';
+import { isShared, isPaused, loadKeep, loadMachineConfig } from './config.mjs';
+import { checkBinding } from './decide.mjs';
+import * as realEvidence from './evidence.mjs';
+import { isAlive as realIsAlive } from './identity.mjs';
+import { readInventory as realReadInventory } from './inventory.mjs';
+import { leasesFor, liveOwners, readLedger } from './ledger.mjs';
+import { readProjectId } from './match.mjs';
+import { lockDirs, stackFiles } from './paths.mjs';
+import { ok, unknown } from './result.mjs';
+
+export const SESSION_END_PROBES = Object.freeze(['paused', 'keep', 'otherLiveLeases', 'connections', 'processRefs', 'cwdProcs', 'binding']);
+export const SWEEP_PROBES = Object.freeze(['paused', 'keep', 'liveLeases', 'consumers', 'prStates', 'cwdProcs', 'connections', 'processRefs', 'uptimeMs', 'memory', 'transcripts', 'binding']);
+export const DEFAULT_DEADLINE_MS = 120_000;
+export const TRANSCRIPT_WINDOW_MS = 24 * 3_600_000;
+
+const lower = (s) => String(s ?? '').toLowerCase();
+const ownerKey = (o) => `${o?.pid}:${o?.birth}`;
+const shortMsg = (err) => String(err?.message ?? err).split('\n')[0].slice(0, 200);
+
+// ---- the ledger, read under its lock ----
+
+// ok(events) | unknown. The lock wait is bounded (waitMs) so a stuck writer cannot hang a worker.
+export async function readLedgerLocked({ files, root, acquire = realAcquire, release = realRelease, waitMs = 10_000, pollMs = 20, read = readLedger } = {}) {
+  let lock;
+  try {
+    lock = await acquire('ledger', { dir: lockDirs(root).ledger, waitMs, pollMs });
+  } catch (err) {
+    return unknown(`ledger lock unavailable: ${shortMsg(err)}`);
+  }
+  try {
+    return read(files.ledger);
+  } finally {
+    try {
+      release(lock);
+    } catch {
+      /* a lock whose owner is gone is reclaimed by the next taker */
+    }
+  }
+}
+
+// ---- the binding, read now ----
+
+export const findStack = (inventory, project) => (inventory?.stacks ?? []).find((s) => lower(s.project) === lower(project)) ?? null;
+
+// `assessed` = the Stack the verdict was made on; `fresh` = the same project's Stack from an inventory read just now (null when
+// its containers are gone). realpath/readFile are injectable. Nothing here throws.
+export function buildCurrent(assessed, fresh, { cfg, realpath = fs.realpathSync, readFile = (p) => fs.readFileSync(p, 'utf8') } = {}) {
+  let workdirReal = null;
+  let workdirExists = false;
+  if (typeof assessed?.workdir === 'string' && assessed.workdir !== '') {
+    try {
+      workdirReal = realpath(assessed.workdir);
+      workdirExists = true;
+    } catch {
+      workdirReal = null;
+    }
+  }
+  let configProject = null;
+  if (workdirReal !== null) {
+    try {
+      configProject = readProjectId(readFile(path.join(workdirReal, 'supabase', 'config.toml')));
+    } catch {
+      configProject = null;
+    }
+  }
+  // Shared if the inventory says so, the labelled project is shared, or the config.toml in the workdir NOW names a shared project
+  // (a symlinked workdir re-pointed at e2e-ci / DRMed / eaglewatch-pipeline). No fresh stack means sharing is unknown => true.
+  const shared = fresh
+    ? fresh.shared === true || isShared({ project: fresh.project, workdir: fresh.workdir }, cfg) || (configProject !== null && isShared({ project: configProject, workdir: workdirReal }, cfg))
+    : true;
+  return {
+    workdirExists,
+    workdirReal,
+    labelWorkdirReal: fresh?.workdirExists === true && typeof fresh.workdir === 'string' ? fresh.workdir : null,
+    configProject,
+    labelProject: fresh?.project ?? null,
+    generation: fresh?.generation ?? null,
+    shared,
+    dbVolume: fresh?.dbVolume ?? null,
+  };
+}
+
+// ok({ fresh: Stack | null, dockerDown }) | unknown, from a fresh (uncached) inventory.
+export function freshStack(project, { run = realRun, cfg, docker = 'docker', deadlineAt, now = Date.now, readInventory = realReadInventory } = {}) {
+  const inv = readInventory({ run, cfg, docker, deadlineAt, now });
+  if (!inv?.ok) return unknown(`inventory unavailable: ${inv?.reason ?? 'no answer'}`);
+  return ok({ fresh: findStack(inv.value, project), dockerDown: inv.value.dockerDown === true });
+}
+
+// ---- evidence ----
+
+// The directories a "live process with cwd inside" check covers: the stack folder plus every consumer worktree that exists.
+export function cwdDirs(stack, consumers) {
+  const dirs = [];
+  if (typeof stack?.workdir === 'string' && stack.workdir !== '') dirs.push(stack.workdir);
+  for (const w of consumers ?? []) if (w?.exists !== false && typeof w?.path === 'string' && !dirs.includes(w.path)) dirs.push(w.path);
+  return dirs;
+}
+
+// gatherEvidence(stack, ctx, { probes, excludeOwner, deadlineMs }) -> Promise<{ evidence, current, fresh }>
+//   stack         the Stack as assessed (inventory.mjs shape)
+//   probes        which of SESSION_END_PROBES / SWEEP_PROBES to run (any subset; 'binding' is the only one needing a fresh inventory)
+//   excludeOwner  {pid, birth} whose leases do not count as "other" (the exiting session); also never charged as live
+//   ctx           { root, files?, cfg, run, docker, bins: { lsof, ps }, platform, now, kill, home, isAlive, acquire, release,
+//                   readInventory, readEvents (async () => ok(events)), evidence (override probe functions), excludePids,
+//                   ghFor, listWorktrees, git, fsx }
+//   evidence      { stack, paused?, keep?, otherLiveLeases?, liveLeases?, consumers?, prStates?, cwdProcs?, connections?, processRefs?,
+//                   uptimeMs?, memory?, transcripts?, binding? }: `stack` is the FRESH stack when one was read, else the assessed one
+//   current       buildCurrent(...) when 'binding' was requested (else null); fresh the fresh Stack (or null)
+export async function gatherEvidence(stack, ctx = {}, { probes = SESSION_END_PROBES, excludeOwner = null, deadlineMs = DEFAULT_DEADLINE_MS } = {}) {
+  const want = new Set(probes);
+  const now = ctx.now ?? Date.now;
+  const platform = ctx.platform ?? process.platform;
+  const home = ctx.home ?? os.homedir();
+  const run = ctx.run ?? realRun;
+  const root = ctx.root;
+  const files = ctx.files ?? stackFiles(root);
+  const cfg = ctx.cfg ?? loadMachineConfig(files.config, { home });
+  const bins = ctx.bins ?? { lsof: undefined, ps: undefined };
+  const ev = { ...realEvidence, ...(ctx.evidence ?? {}) };
+  const deadlineAt = now() + deadlineMs;
+  const isAliveFn = ctx.isAlive ?? ((o) => realIsAlive(o, { run, ps: bins.ps, kill: ctx.kill, platform, deadlineAt, now }));
+  const excludePids = ctx.excludePids ?? new Set([process.pid]);
+  const probeOpts = { run, ...(bins.lsof ? { lsof: bins.lsof } : {}), ...(bins.ps ? { ps: bins.ps } : {}), ...(ctx.kill ? { kill: ctx.kill } : {}), platform, deadlineAt, now };
+
+  const evidence = {};
+  let current = null;
+  let fresh = null;
+  let probeStack = stack;
+
+  // The fresh stack first: ports and the running state used by the other probes are the ones read now.
+  if (want.has('binding')) {
+    const f = (ctx.freshStack ?? freshStack)(stack.project, { run, cfg, docker: ctx.docker ?? 'docker', deadlineAt, now, ...(ctx.readInventory ? { readInventory: ctx.readInventory } : {}) });
+    if (f.ok) {
+      fresh = f.value.fresh;
+      current = buildCurrent(stack, fresh, { cfg, ...(ctx.realpath ? { realpath: ctx.realpath } : {}), ...(ctx.readFile ? { readFile: ctx.readFile } : {}) });
+      evidence.binding = checkBinding(stack, current);
+      if (fresh) probeStack = fresh;
+    } else {
+      evidence.binding = { ok: false, reasons: [`binding not proved: ${f.reason}`] };
+    }
+  }
+  evidence.stack = probeStack;
+
+  // ledger events, at most once per call
+  let events;
+  const getEvents = async () => {
+    events ??= await (ctx.readEvents ?? (() => readLedgerLocked({ files, root, acquire: ctx.acquire, release: ctx.release })))();
+    return events;
+  };
+  const leaseProbe = async (excluding) => {
+    const evs = await getEvents();
+    if (!evs.ok) return evs;
+    let list;
+    try {
+      list = leasesFor(evs.value, probeStack);
+      if (excluding) list = list.filter((e) => ownerKey(e?.owner) !== ownerKey(excluding));
+    } catch (err) {
+      return unknown(`lease lookup failed: ${shortMsg(err)}`);
+    }
+    return liveOwners(list, { isAlive: isAliveFn });
+  };
+
+  if (want.has('paused')) evidence.paused = isPaused(files.pause);
+  if (want.has('keep')) evidence.keep = loadKeep(files.keep);
+  if (want.has('otherLiveLeases')) evidence.otherLiveLeases = await leaseProbe(excludeOwner);
+  if (want.has('liveLeases')) evidence.liveLeases = await leaseProbe(null);
+
+  // consumer worktrees: needed by cwdProcs and prStates, so computed once
+  let consumers;
+  const getConsumers = async () => {
+    if (consumers !== undefined) return consumers;
+    const evs = await getEvents();
+    if (!evs.ok) return (consumers = unknown(`consumers need the ledger: ${evs.reason}`));
+    try {
+      consumers = ev.consumerWorktrees(probeStack, {
+        events: evs.value,
+        transcripts: cfg.status === 'ok' && cfg.transcriptDirs.length ? { dirs: cfg.transcriptDirs, sinceMs: now() - TRANSCRIPT_WINDOW_MS } : null,
+        repos: cfg.repos ?? [],
+        platform,
+        ...(ctx.listWorktrees ? { listWorktrees: ctx.listWorktrees } : {}),
+        ...(ctx.fsx ? { fsx: ctx.fsx } : {}),
+      });
+    } catch (err) {
+      consumers = unknown(`consumer worktrees failed: ${shortMsg(err)}`);
+    }
+    return consumers;
+  };
+  if (want.has('consumers')) evidence.consumers = await getConsumers();
+  if (want.has('prStates')) {
+    const c = await getConsumers();
+    if (!c.ok) evidence.prStates = unknown(`prStates need the consumer worktrees: ${c.reason}`);
+    else {
+      try {
+        evidence.prStates = ev.prStates(c.value, { platform, ...(ctx.ghFor ? { ghFor: ctx.ghFor } : {}), ...(ctx.git ? { git: ctx.git } : {}) });
+      } catch (err) {
+        evidence.prStates = unknown(`pr states failed: ${shortMsg(err)}`);
+      }
+    }
+  }
+  if (want.has('cwdProcs')) {
+    const c = await getConsumers();
+    if (!c.ok) evidence.cwdProcs = unknown(`cwdProcs need the consumer worktrees: ${c.reason}`);
+    else {
+      try {
+        evidence.cwdProcs = ev.cwdInside(cwdDirs(probeStack, c.value), { ...probeOpts, excludePids });
+      } catch (err) {
+        evidence.cwdProcs = unknown(`cwd probe failed: ${shortMsg(err)}`);
+      }
+    }
+  }
+  const guarded = (fn) => {
+    try {
+      return fn();
+    } catch (err) {
+      return unknown(`probe failed: ${shortMsg(err)}`);
+    }
+  };
+  if (want.has('connections')) evidence.connections = guarded(() => ev.connections(probeStack, { ...probeOpts, excludePids }));
+  if (want.has('processRefs')) evidence.processRefs = guarded(() => ev.processRefs(probeStack, { ...probeOpts, excludePids }));
+  if (want.has('uptimeMs')) {
+    const started = Date.parse(probeStack?.generation?.startedAt);
+    // sweepVerdict reads uptimeMs as a bare number; a start time that cannot be read leaves it undefined (=> listed)
+    evidence.uptimeMs = Number.isFinite(started) ? Math.max(0, now() - started) : undefined;
+  }
+  if (want.has('memory')) evidence.memory = guarded(() => ev.memoryRefs(probeStack, { dirs: cfg.memoryDirs ?? [], exclude: cfg.memoryExclude ?? [], platform }));
+  if (want.has('transcripts')) {
+    evidence.transcripts = guarded(() => ev.transcriptRefs(probeStack, { dirs: cfg.transcriptDirs ?? [], sinceMs: now() - TRANSCRIPT_WINDOW_MS, platform }));
+  }
+  return { evidence, current, fresh };
+}
+
+// A compact, line-sized summary of an evidence object for the decisions log (the full probe results can be large).
+export function summarizeEvidence(evidence = {}, verdict = null) {
+  const count = (r) => {
+    if (!r) return null;
+    if (!r.ok) return `unknown: ${String(r.reason).slice(0, 120)}`;
+    const v = r.value;
+    return Array.isArray(v) ? v.length : v instanceof Map || v instanceof Set ? v.size : v;
+  };
+  const out = {};
+  for (const k of ['keep', 'otherLiveLeases', 'liveLeases', 'connections', 'processRefs', 'cwdProcs', 'consumers', 'prStates', 'memory', 'transcripts']) {
+    if (evidence[k] !== undefined) out[k] = k === 'keep' ? (evidence.keep?.ok ? [...evidence.keep.value].includes(lower(evidence.stack?.project)) : count(evidence.keep)) : count(evidence[k]);
+  }
+  if (evidence.paused !== undefined) out.paused = evidence.paused;
+  if (evidence.binding) out.binding = evidence.binding.ok ? 'ok' : evidence.binding.reasons?.slice(0, 3);
+  if (verdict?.notes?.length) out.notes = verdict.notes.slice(0, 5);
+  return out;
+}

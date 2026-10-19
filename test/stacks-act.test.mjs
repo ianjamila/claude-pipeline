@@ -133,6 +133,39 @@ test('the project lock is held during the stop and released after', async () => 
   });
 });
 
+test('an async log is finished while the project lock is still held (the next session sees the decision)', async () => {
+  const w = makeWorld();
+  const dir = lockDirs(w.root).project;
+  const states = [];
+  const slowLog = async (rec) => {
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    const probe = tryAcquire(projectLockName('alpha'), { dir });
+    states.push({ action: rec.action, lockFreeAtWrite: probe.acquired });
+    if (probe.acquired) release(probe.lock);
+    w.logs.push(rec);
+  };
+  await check(w, { log: slowLog }, (r) => {
+    assert.equal(r.action, 'stopped');
+    assert.deepEqual(states, [{ action: 'stopped', lockFreeAtWrite: false }], 'the decision was written while the lock was held');
+    assert.equal(w.logs.length, 1, 'stopStack answered only after the async log finished');
+    const after = tryAcquire(projectLockName('alpha'), { dir });
+    assert.equal(after.acquired, true);
+    release(after.lock);
+  });
+});
+
+test('an early return (no lock held) also waits for its async log; a rejecting log changes nothing', async () => {
+  const w = makeWorld();
+  let finished = false;
+  const r = await w.stop({ reassess: undefined, log: async () => { await new Promise((resolve) => setTimeout(resolve, 40)); finished = true; } });
+  assert.equal(r.action, 'kept');
+  assert.equal(finished, true);
+  const rejected = await w.stop({ log: async () => { throw new Error('disk full'); } });
+  assert.equal(rejected.action, 'stopped');
+  assertSafe(w);
+  w.cleanup();
+});
+
 test('mode report: would-stop, no supabase call', async () => {
   const w = makeWorld({ mode: 'report' });
   await check(w, { mode: 'report' }, (r) => {

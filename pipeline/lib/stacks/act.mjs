@@ -16,7 +16,8 @@
 //   5. the single supabase call, never retried;
 //   6. post-check: the generation container is absent or not running, AND the database volume still exists. A missing
 //      volume is still `stopped` but carries `alert: 'db-volume-missing'`.
-// - Anything unknown on the way keeps the stack (fail closed). Every decision goes to `log` (Task 9 wires appendDecision).
+// - Anything unknown on the way keeps the stack (fail closed). Every decision goes to `log` (the decisions log; it may be async and
+//   is awaited before the project lock is released, so the next session to take the lock already sees a `stopped` record).
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -101,16 +102,28 @@ function volumeState(run, docker, name) {
 //   lockWaitMs / pollMs   how long to wait for the project lock (default 60 s)
 //   afterLock / beforeMutate   test-only seams (a pause inside the lock; a change between reassess and the call)
 // -> { action: 'stopped' | 'would-stop' | 'kept' | 'failed' | 'already-stopped' | 'skipped-lock', reasons, post?, alert? }
-export async function stopStack({
+export async function stopStack(opts = {}) {
+  const pending = [];
+  try {
+    return await stopStackLocked(opts, pending);
+  } finally {
+    await Promise.allSettled(pending); // a decision logged on an early return (no lock held) is also written before we answer
+  }
+}
+
+async function stopStackLocked({
   stack, mode, modeKey = 'sessionEnd', reassess, root, run = realRun, docker = 'docker', supabaseBin,
   acquire = realAcquire, release = realRelease, log = () => {}, now = Date.now, home = os.homedir(),
   lockWaitMs = LOCK_WAIT_MS, pollMs = 1000, afterLock, beforeMutate, realpath = fs.realpathSync,
-} = {}) {
+} = {}, pending) {
   const files = root ? stackFiles(root) : null;
   const done = (action, reasons, extra = {}) => {
     const result = { action, reasons: [...reasons], ...extra };
     try {
-      log({ t: new Date(now()).toISOString(), project: stack?.project, generation: stack?.generation ?? null, mode, ...result });
+      // `log` may be async (the decisions log is a locked append): the promise is awaited before the project lock is
+      // released (see the finally below), so a session that gets the lock next already sees a `stopped` record.
+      const p = log({ t: new Date(now()).toISOString(), project: stack?.project, generation: stack?.generation ?? null, mode, ...result });
+      if (p && typeof p.then === 'function') pending.push(Promise.resolve(p).catch(() => {}));
     } catch {
       /* the decision log is best effort; never let it undo or hide what happened */
     }
@@ -196,6 +209,7 @@ export async function stopStack({
     if (after.unknown || vol.unknown) return done('stopped', [`post-check incomplete: ${after.unknown ?? vol.unknown}`], { post, alert: 'post-check-unknown' });
     return done('stopped', ['stopped'], { post });
   } finally {
+    await Promise.allSettled(pending); // the decision is on disk before anyone else can take the lock
     try {
       release(lock);
     } catch {
