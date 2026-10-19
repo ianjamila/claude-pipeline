@@ -1,7 +1,7 @@
 # Ship redesign (redesign PR 4) — design
 
-Status: DRAFT r3. Codex astra-xhigh R1 (9 + P3) and recheck R2 (10 + P3) folded in; the Codex cap (review + 1 recheck) is
-used. Next: Fable once on this version, then the owner. Owner decisions 2026-10-15 (memory `pipeline-redesign-2026-10-15`,
+Status: DRAFT r4. Codex astra-xhigh R1 (9 + P3) and recheck R2 (10 + P3) folded in (r2, r3); Fable high on r3 (B1–B4,
+S1–S9, X1–X4) folded in (r4). Review caps used (Codex 2, Fable 1). Next: the owner reviews this spec, then writing-plans. Owner decisions 2026-10-15 (memory `pipeline-redesign-2026-10-15`,
 items 1–3, 5–7 + planning budget) and 2026-10-19 (this session) are the requirements; cp issue #88 is folded in.
 Risk: **high** (pipeline core: merge gate, owner-approval recorder, run state).
 
@@ -38,9 +38,10 @@ catch up, it hands the owner a green PR to merge in GitHub, saying plainly what 
 Anything on GitHub is writable with the agent's token (the owner's: `git-policy.mjs:35` allows comment mutations;
 guarding marker text is whack-a-mole, Codex R2-1). So **GitHub never proves approval**. The roots are:
 1. **The owner-go record** (`~/.claude/pipeline-state/owner-go`, guarded by guard-files, written only by the
-   UserPromptSubmit recorder that only a typed owner prompt reaches; `owner-go.mjs` header). The plan record binds
-   `{kind: "plan", pr, blob prefix, scopeDigest, recordId, promptSha256, recordedAt, session}` to the reply that showed the
-   request lines. Same residual as #58 (same OS user; opaque programs; the owner's token). No new residual.
+   UserPromptSubmit recorder that only a typed owner prompt reaches; `owner-go.mjs` header; `notOwnerPrompt` ~143). The
+   plan record binds `{v: 1, kind: "plan", pr, blob (full 40 hex), scopeDigest, recordId, promptSha256, ts, session}` to
+   the reply that showed the request lines. The folder stays write-only-by-the-hook (`files-policy.mjs` ~44: no CLI
+   writes it, Fable B2). Same residual as #58 (same OS user; opaque programs; the owner's token). No new residual.
 2. **The plan blob in git.** The approved plan is identified by its full blob sha; its scope and tasks are always
    re-parsed from `git cat-file blob <sha>` (content-addressed: editing the file makes a different blob). Event data is
    never the source of scope or tasks.
@@ -50,12 +51,17 @@ GitHub event comments (`run-events.mjs`) are **pointers and evidence of existenc
 approved where; they never make anything pass on their own.
 
 **Verified vs unverified approval.** An approval is *verified* on a machine when a local owner-go plan record exists with
-the same `recordId`, `promptSha256`, PR, blob prefix and `scopeDigest` (recomputed from the blob). Issuance window: `P plan
-approve` consumes a record ≤ 24 h old (existing UTC + future-skew rules, `owner-go.mjs` ~245). Validity window for the
-gate: a consumed plan record stays valid 30 days (`PLAN_RECORD_MAX_AGE_MS`; `readApprovals` already filters by age and
-never deletes). Everything that needs an approval (gate, resume routing to build) treats an unverified one as **not
-approved here**: resume re-shows the request so the owner says "approve" on this machine (one word on a machine switch);
-the gate adds an owner-merge item (section 4).
+the same `recordId`, `promptSha256`, PR, full blob and `scopeDigest` (recomputed from the blob). Windows: `P plan approve`
+accepts a record ≤ 24 h old (existing UTC + future-skew rules, `owner-go.mjs` ~245); the gate and resume accept it for 30
+days from `ts` (`PLAN_RECORD_MAX_AGE_MS`; `readApprovals` filters by age and never deletes). No "consumed" marker (Fable
+B2/X3): a record binds one blob + scope, so approving it twice is idempotent and a different blob never matches.
+Owner-go reader (Fable S6): records stay `v: 1`; merge readers (`readApprovals`, ~244/251) skip `kind: "plan"`; a new
+`readPlanApprovals` reads only plan records.
+**Unverified on this machine (Fable X2):**
+- build work remains (open tasks of the active plan) → resume re-shows the plan request and waits for "approve" here;
+- no build work remains → no re-approval. The gate adds owner-merge item `plan-scope unverified <host>`, which sits in
+  the items digest the owner's "merge" binds to; a machine switch is a resume, and invariant 9 already requires the
+  owner's "merge" for resumed runs, so the owner says one word, not two.
 
 ## 1. Route line (D7) — skill prose only
 ship Step 0 ends with one line: `Route: ship | brainstorm first | debug first | superpowers-only | plan + several ships`
@@ -76,9 +82,11 @@ summary).
      1..`LIMITS.tasks` tasks. `specSha` = sha256 of the canonical full definition (title + text, CRLF→LF, trailing space
      trimmed), computed BEFORE any clipping (Codex R2-8). The record keeps a clipped `spec` for display; implementers get
      the full text from the approved blob.
-2. **Commit + push + draft PR** (Step 2's first-checkpoint PR creation moves here): commit the plan,
-   `git push -u origin agent/<slug>`, `gh pr create --draft`.
-3. **`P plan record --pr N --file <plan>`** (new: `pipeline/commands/plan.mjs`):
+2. **Commit + push + draft PR** (Step 2's first-checkpoint PR creation moves here): commit the plan with `[skip ci]` in
+   the message (Fable S9: a plan-only push must not start eaglewatch's full suite), `git push -u origin agent/<slug>`,
+   `gh pr create --draft`.
+3. **`P plan record --pr N --file <plan> [--request-file <file>]`** (new: `pipeline/commands/plan.mjs`; the request file
+   seeds the record's `request`, which the first Step 2 checkpoint used to set, Fable S7):
    - The plan must be committed and pushed: `HEAD:<plan>` blob == the working file, `HEAD` == `origin/agent/<slug>`
      (else exit 1 `dirty` / `unpushed`).
    - Parses; prints `{blob, scopeDigest, tasks, requestLines}`.
@@ -87,21 +95,24 @@ summary).
      proposal events), so restoring an earlier blob makes it active again.
    - Checkpoints the record: `step: plan`, `plan: {path, blob, scopeDigest, state: 'proposed'}` (display only).
 4. **Reviews** (section 3). Each fix commits a new revision and runs `P plan record` again.
-5. **Approval request** (D1). The reply shows the plain-English summary, the full plan (or its path + section list when
-   > 150 lines; the owner can ask for all of it), the reviewer tally ("Codex found X; accepted Y; rejected Z because …;
-   Fable …"), the plan-phase token total, any owner extras, then ENDS with exactly:
-   `Plan <blob12> · scope <scopeDigest>`
+5. **Approval request** (D1). The reply shows the plain-English summary, the full plan (or, when > 150 lines, its path +
+   section list + the `## Scope` section IN FULL, Fable S4; the owner can ask for all of it), the reviewer tally ("Codex
+   found X; accepted Y; rejected Z because …; Fable …"), the plan-phase token total, any owner extras, then ENDS with
+   exactly (full 40-hex blob, Fable S3: a 12-hex prefix is a 48-bit target the agent could collide):
+   `Plan <blob40> · scope <scopeDigest>`
    `📋 Ready to approve plan #N — say "approve"`
    Then `P summary --pr N --outcome awaiting-plan-approval --action "Read the plan, then say \"approve\""`. Issue-driven
    runs (agent-build label, owner not at the keyboard) stop here; the summary pushes the owner's phone.
 6. **Owner says "approve"** → the recorder (2a) writes a `kind: "plan"` record → `P plan approve --pr N`:
-   - the active proposal's blob must start with the record's blob prefix, and `scopeDigest` recomputed from that blob
-     must equal the record's (else exit 1 `superseded` / `no-approval`: re-show the request for the active proposal);
-   - record within the issuance window, this PR, not yet consumed (`consumedBy` written into the record folder's
-     companion file by `P plan approve`; the folder is guarded);
-   - posts event `plan-approved` (pointer data, trust model) and checkpoints `step: build`, `tasks` re-parsed from the
-     approved blob. **Task completion survives only when `specSha` is unchanged**; a changed definition resets `done`
-     (fixes `applyCheckpoint` ~260 keeping `done` by id alone).
+   - the active proposal's blob must equal the record's full blob, and `scopeDigest` recomputed from that blob must
+     equal the record's (else exit 1 `superseded` / `no-approval`: re-show the request for the active proposal);
+   - record within the 24 h issuance window, this PR; idempotent (an existing `plan-approved` for this blob + recordId is
+     reused);
+   - posts event `plan-approved` (pointer data, trust model). **Only when `record.step === 'plan'`** (Fable B1) it also
+     checkpoints `step: build` + `tasks` re-parsed from the approved blob; a re-approval later in the run (another
+     machine, amend→restore) posts the event and changes nothing else, so the run never moves backwards. **Task
+     completion survives only when `specSha` is unchanged**; a changed definition resets `done` (fixes
+     `applyCheckpoint` ~260 keeping `done` by id alone).
 7. Build continues from the approved tasks (`--tasks-file` stays for runs without a plan, e.g. resumed legacy runs).
 
 **Plan amended after approval**: edit the plan, `P plan record` (new active occurrence), a NEW approval request (scope diff
@@ -113,7 +124,7 @@ approved set, so new or changed tasks are not built and extra files show as owne
 - `parsePlanApproval`: prompt STARTS with `approve`/`approved` (+ optional `#N`, blob prefix ≥ 7 hex, the merge fillers);
   `?`, "don't approve", "approve later" → null.
 - `presentedPlanRequests(text)`: the reply's last non-blank line is the 📋 line; the line right above it is the
-  `Plan <hex12+> · scope <hex12>` line. Same terminal-block-only rule as merge (prose between, text after, or two Plan
+  `Plan <hex40> · scope <hex12>` line. Same terminal-block-only rule as merge (prose between, text after, or two Plan
   lines bind nothing).
 - Records get `kind: "plan"`; merge records `kind: "merge"` (absent = merge, for older records). A "merge" never
   satisfies `P plan approve` and an "approve" never satisfies `P merge` (unit tests both ways). Each record gets
@@ -137,27 +148,27 @@ unless the owner answers.
 start while another host's heartbeat is fresh without the owner's confirmation (`confirm`). The rules below make a
 second controller harmless for the budget (it cannot get an extra paid run counted as valid), not impossible.
 
-**Reservations (Codex R1-4, R2-3).** `P plan reserve --pr N --reviewer codex|fable --key <key> [--extra "<owner words>"]`
-posts event `plan-review-reserved` `{reviewer, key, planBlob, extra}`, then re-lists events and decides:
-- Duplicates by `key` collapse to the EARLIEST comment with that key (a retry returns it; no new comment is posted when
-  one already exists).
-- Then, per reviewer, in comment-id order: a reservation is **valid** iff its position ≤ cap + the extras posted BEFORE
-  it (cap: codex 2, fable 1). A later extra never revives an earlier void reservation. Void ⇒ exit 1 `cap`.
-**Execution claims.** Before ANY launch (Codex by `P plan review`, Fable by the controller), `P plan claim --reservation
-<id>` posts `plan-review-started {reservation, claimId}`, re-lists, and returns `go` only when its claim is the EARLIEST
-started event for that reservation; otherwise `taken` (do not launch). An ambiguous POST (timeout, no response) ⇒ re-list:
-a claim with our `claimId` exists ⇒ decide as above; none ⇒ post again (same `claimId`, deduped by it). A reservation
-with a winning claim is consumed even if the run then crashes; another run needs a new valid reservation (cap or owner
-extra).
-**Codex plan review.** `P plan review --pr N --reservation <id> [--effort xhigh|high]` (claims itself, then runs Codex on
+**Reserve = claim, one event (Codex R1-4, R2-3; Fable X1).** Immediately before ANY launch (Codex by `P plan review`,
+Fable by the controller), `P plan start --pr N --reviewer codex|fable --key <key> [--extra "<owner words>"]` posts event
+`plan-review-started {reviewer, key, planBlob, extra}`, then re-lists events and decides:
+- Duplicates by `key` collapse to the EARLIEST comment with that key. A retry (same key) first re-lists and posts nothing
+  when the key exists; an ambiguous POST (timeout, no response) is settled the same way.
+- Per reviewer, in comment-id order: a start is **valid** iff its position ≤ cap + the extras posted BEFORE it. A later
+  extra never revives an earlier void start. Void ⇒ exit 1 `cap`, do not launch. `go` ⇒ launch.
+- **Caps are per PR** (the whole plan stage, every blob; Fable S5): codex 2 (review + recheck), fable 1. A later
+  owner-requested amendment that needs another review uses an `--extra` with the owner's words (recorded verbatim, shown
+  in the approval request and the PR summary).
+- A valid start is consumed even if the run then crashes; another run needs a new valid start (cap or owner extra).
+**Codex plan review.** `P plan review --pr N --key <key> [--effort xhigh|high]` (runs `plan start` itself, then Codex on
 the active blob with a new plan prompt in `pipeline/lib/codex.mjs`: plan file + read-only repo; same
-`codex-findings.schema.json`) as a job. Output `.review/plan/<reservation>.json` + markdown. Effort `xhigh` for high risk,
+`codex-findings.schema.json`) as a job. Output `.review/plan/<key>.json` + markdown. Effort `xhigh` for high risk,
 else `high`. A recheck resumes the first run's Codex session when one exists.
 **Fable plan pass.** New agent `agents/fable-reviewer.md` (model fable, effort high, read-only; mode `plan` | `pr`). The
-controller reserves, claims, then dispatches with the prompt header from `P plan claim` (`ROUND: plan`, `INPUT-DIGEST:
-<sha256(repo, pr, 'fable-plan', blob, reservation)>`). `P plan findings --reservation <id> --tag <tag>` proves the model
+controller runs `P plan start --reviewer fable`, then dispatches with the prompt header it prints (`ROUND: plan`,
+`INPUT-DIGEST: <sha256(repo, pr, 'fable-plan', blob, key)>`). `P plan findings --key <key> --tag <tag>` proves the model
 (`claude-fable-`), checks the header in the first user message (as `arbiter apply` does, `arbiter.mjs` ~199), and takes
 the JSON from the proven final text; anything else is refused.
+`P plan findings` also refuses a transcript older than its start event, or a key whose findings are already recorded.
 **Token report (Codex R1-8, R2-5).** `run-cost.mjs` gains phase `plan` and roles `codex`, `fable`, `security`,
 `screenshot`. Each booking carries a canonical **execution key**: `agent:<agentId>` (subagent transcript),
 `codex:<session id>` (Codex), `ctl:<session id>:<phase>` (controller). Entries are keyed: booking the same key again
@@ -184,6 +195,8 @@ the git objects of the approved blobs.
   Residual (accepted, shown to the owner): on a machine without the local record, deleting every plan event turns
   `lost` into `none`; both stop for the owner's "merge".
 - `owner_approval: label`: items block (→ `needs-human`), as hard-stop hits do. `plan.required: false` → report only.
+- **Recovery from `lost`** (Fable S8): re-show the active proposal's request; a new verified `plan-approved` (newer than
+  every unreadable/tampered event) clears it. The gate's detail says so.
 Items fold into `ownerItems`, so a newly outside file after the owner's "merge" needs a new stop.
 
 ## 5. PR-stage reviewers and model mix (D5, D6)
@@ -218,39 +231,55 @@ with an honest statement of the integration evidence, and lets the owner take th
 the source by `P merge` (its own update before `error: behind-base`) and by `P update-branch` (only when it merged the
 base). After an update the run goes through Step 5.3–5.7 for the NEW head as today (full verify, CI, review coverage,
 gate). When that head's gate (or `P merge`'s live check) then fails ONLY `pr-open: behind-base` and the run already has
-≥ 1 recorded update, the skill runs **`P handoff check --pr N`** BEFORE any further update-branch, so the fully verified
-head is what is handed over.
+≥ 2 recorded updates (Fable S1: one move during a 15-min CI is routine on eaglewatch, and a 1-update trigger would make
+this exit the common path and defeat low-risk auto-merge), the skill runs **`P handoff check --pr N`** BEFORE any
+further update-branch, so the fully verified head is what is handed over. Fewer updates → today's loop.
 **Conditions (all, read live; any miss → the existing loop / needs-human path):**
 1. Base branch protection does NOT require up-to-date branches (`required_status_checks.strict` false; unreadable = not
    eligible).
 2. A LIVE `P final-gate` evaluation on the current head fails ONLY `pr-open: behind-base` (pause/rollback issues, labels,
    CI, review, verify report for this head, hard-stops, plan-scope all evaluated now).
-3. Owner-merge items: none, or the owner already said "merge" for this head + item set.
-4. `git merge-tree` of head vs base tip T: no conflicts.
-5. `verify.quick` passes on the local prospective merge tree (head merged with T, in a temp worktree).
-**Action.** Outcome `owner-ui-merge` (step `awaiting-owner-merge`). PR comment: head sha; T; "verified: full verify + CI +
-review on head; quick verify on head merged with main@T. NOT verified: full verify / CI on the merged tree"; main's commits
-since the verified base with their files and whether any touch this PR's files (overlap shown, not hidden); "merge in
-GitHub only if you accept that; the pipeline will not merge". Summary pushes the owner. If main moves past T the inbox
-shows "main moved N commits since the hand-off". When the owner merges, resume / inbox route `merged-externally` (agent
-log; prod watch per `production.watch`, observe-only).
+3. `git merge-tree` of head vs base tip T: no conflicts.
+4. `verify.quick` passes on the local prospective merge tree (head merged with T, in a temp worktree).
+Owner-merge items do not block the hand-off (Fable X4): the owner's GitHub click is the approval, and the comment lists
+every item (hard-stop files, test changes, owner-ruled review items, plan-scope items) above the merge instruction.
+**Action.** Outcome `owner-ui-merge` (step `awaiting-owner-merge`). PR comment:
+- head sha and T;
+- "verified: full verify + review on head; CI on head merged with main@<the base GitHub used at CI time> (Fable S2:
+  `pull_request` checks run on the merge ref); quick verify on head merged with main@T. NOT verified: full verify / CI
+  on head merged with main@T";
+- main's commits since the verified base with their files and whether any touch this PR's files (overlap shown, not
+  hidden);
+- the owner-merge items, if any;
+- **production (Fable B4):** with `production.watch: session`, nobody watches production or rolls back after a GitHub
+  merge until the owner says `ship resume N` (observe-only, never rolls back); with `workflow`, the project's workflow
+  posts the result as usual;
+- "merge in GitHub only if you accept that; the pipeline will not merge".
+Summary pushes the owner. If main moves past T the inbox shows "main moved N commits since the hand-off". When the owner
+merges, resume / inbox route `merged-externally` (agent log; prod watch per `production.watch`, observe-only).
 **Not the dropped 10-14 design:** that one changed what the gate accepts; this one leaves the gate alone and makes the
 owner's existing manual step explicit and evidenced.
 
 ## 7. Run state, resume, inbox (Codex R1-3)
 - `STEPS` gains `plan` (first). `OUTCOMES` gains `awaiting-plan-approval` (step `plan`) and `owner-ui-merge` (step
-  `awaiting-owner-merge`). `EVENT_KINDS` gains `plan-proposed`, `plan-approved`, `plan-review-reserved`,
-  `plan-review-started`. Record fields `plan` (display), `behindBaseUpdates`. `RECORD_VERSION` → 2.
+  `awaiting-owner-merge`). `EVENT_KINDS` gains `plan-proposed`, `plan-approved`, `plan-review-started`. Record fields
+  `plan` (display), `behindBaseUpdates`. `RECORD_VERSION` → 2.
 - **Resume derives plan state FIRST**, before any task/step routing (`resume-plan.mjs` ~113), whatever the record's step
-  or outcome (`stopped`, `blocked`, missing record): plan evidence exists (event, record `plan`, or local record) and the
-  active proposal has no VERIFIED approval on this machine → `enter: plan` (re-show its request lines, stop; never approve
-  for the owner). Tampered/lost → `enter: decision` ("plan evidence lost or tampered").
+  or outcome (`stopped`, `blocked`, missing record): plan evidence exists (event, record `plan`, or local record), the
+  active proposal has no VERIFIED approval on this machine, AND build work remains (no approved plan yet, or open tasks)
+  → `enter: plan` (re-show its request lines, stop; never approve for the owner). No build work left → normal routing;
+  the gate's `plan-scope unverified` item covers it (trust model, X2). Tampered/lost → `enter: decision` ("plan
+  evidence lost or tampered", with the recovery in section 4).
 - Partial failures: event posted + checkpoint failed → events win on the next read; checkpoint written + event failed →
   `lost` at the gate, `plan` on resume (re-run `P plan record`: idempotent); `plan approve` event posted + checkpoint
   failed → resume sees the verified approval, routes `build`. An event write failure (GitHub down) exits 3 and the run
   stops `stopped`; nothing is assumed approved.
 - `owner-ui-merge` → resume checks `merged-externally`, else stops with the same comment.
-- Inbox: `waitingOn` gains `plan approval` and `owner GitHub merge`.
+- Inbox (Fable B4): `waitingOn` gains `plan approval` (outcome `awaiting-plan-approval`, nextAction "read the plan, say
+  \"approve\"") and `owner GitHub merge` (outcome `owner-ui-merge`, nextAction "merge in GitHub if you accept the
+  hand-off", suggest `leave`, never `resume`). Both are matched in `inbox.mjs` AFTER the conflicts/CI failing-check
+  branch and BEFORE the `pipeline` fallthrough (~234): a handed-off PR is behind base by definition and must not fall
+  through to "resume" (which would only re-post the hand-off).
 
 ## 8. Config + rollout (Codex R1-7, R2-P3)
 ```yaml
@@ -264,10 +293,13 @@ review:
 ```
 - **This PR adds NO new keys to cp's own `.claude/pipeline.yml`** (the installed CLI would reject them, `config.mjs` ~94;
   `merge.mjs` ~45 needs valid config). Defaults give the new behaviour.
-- **Operational rule, not an automatic stop:** an older CLI reads a v2 record as `unsupported` and may still adopt the PR
-  (`resume-plan.test.mjs` ~245 treats unsupported as adoptable, with a warning). So the owner runs `pipeline update` on
-  BOTH machines before any new-style run, and never processes a v2 run with an older CLI. The session-version hook
-  already warns on a stale CLI; the plan-stage skill text repeats the rule.
+- **Older CLIs (Fable B3, corrects r3):** an older CLI's `resume plan` lists a v2 record as adoptable with a warning
+  (`resume-plan.test.mjs` ~245), but every write is refused (`checkpoint.mjs` ~135 throws on `unsupported`), so it
+  cannot take the run over. The real old-CLI hole: `P merge` with the owner's recorded "merge" skips the unchecked-record
+  and ownerMerge refusals (`merge.mjs` ~85–95), and the old gate has no `plan-scope`, so an old machine could merge a v2
+  run without the scope check. Installed CLIs cannot be fixed; this is a residual the owner's "merge" accepts. Rule: the
+  owner runs `pipeline update` on BOTH machines before any new-style run and never says "merge" to a v2 run on an older
+  CLI. The session-version hook already warns on a stale CLI; the plan-stage skill text repeats the rule.
 - Rollback: reinstall the previous version and do not resume v2 runs until re-update. Old readers ignore unknown event
   kinds.
 - After update, open PRs with no plan evidence get one `plan-scope none` item: chat-mode repos ask for the owner's
@@ -278,27 +310,33 @@ Unit (node:test, existing style):
 - plan parser (sections missing/empty refused; full-text specSha before clipping; CRLF/trailing-space canonical form);
 - `plan record`: push/dirty checks; retry reuses the active occurrence; A→B→A makes A active again;
 - owner-go `approve` parsing + binding (wrong blob/scope, older reply, two Plan lines, merge↔approve cross-rejection,
-  24 h issuance, 30-day validity, consumed-twice refused, future clock, UTC);
+  24 h issuance, 30-day validity, approving the same blob twice is idempotent, full 40-hex blob required, merge readers
+  skip `kind: "plan"`, future clock, UTC);
+- `plan approve` at step `gate` / `awaiting-owner-merge` posts the event and leaves step + tasks unchanged (B1);
 - trust: a forged `plan-approved` pointer with no local record → `unverified` item; forged pointer copying a real
   recordId but another blob → unverified; edited event → tampered → lost; newer tampered event blocks fallback to an older
   approval; deleted events with a local record → lost; deleted everything elsewhere → none;
-- reservations: duplicate key collapses before the cap; cap; extras do not revive earlier void ones; two racing
-  reservations; claims: earliest wins, ambiguous POST + re-list, consumed after crash; Fable header/digest mismatch refused;
+- `plan start`: duplicate key collapses before the cap; per-PR cap across blobs; extras do not revive earlier void
+  starts; two racing starts (earliest wins); ambiguous POST + re-list; consumed after crash; Fable header/digest
+  mismatch, transcript older than its start, and findings recorded twice refused;
 - cost: same execution key twice = once; verify-after-write retry; new phase/roles;
 - gate `plan-scope`: verified / unverified / lost (each cause) / none / outside / inside / rename / blob missing / label
   mode / `required: false`;
 - obligations: derived at round creation; pending, proof failed, header for another head, unparsable → not clean; zero
   items + failed proof → not clean; empty proven → clean; security re-obligation when trigger files change;
 - `P risk` security flag: plain-table migration (no hits) → true; R2 hit → true; `security: off` → false;
-- handoff: trigger only after a fully verified post-update head; each condition failing alone; overlap shown;
-- record v2 + new steps/outcomes; resume `plan` routing over every record state and with/without a local record; task
-  `done` reset on specSha change; inbox strings.
+- handoff: no trigger with < 2 recorded updates; trigger only after a fully verified post-update head; each condition
+  failing alone; owner-merge items listed, not blocking; overlap shown; production line per `production.watch`;
+- record v2 + new steps/outcomes; resume `plan` routing over every record state, with/without a local record, with and
+  without open tasks; task `done` reset on specSha change;
+- inbox: `awaiting-plan-approval` → `plan approval`; `owner-ui-merge` behind base → `owner GitHub merge` + `leave`
+  (never `pipeline`/resume).
 - Skill lint: SKILL.md / reference files name only existing `P` commands and flags.
 Integration evidence to collect during the build (Codex R2 validation gaps; not unit-testable): GitHub REST comment
 listing returns a just-created comment (read-your-writes) and comment ids are monotonic within an issue; one manual
-two-session run of `P plan claim` on the same reservation.
+two-session run of `P plan start` with the same key.
 
 ## Out of scope
 Item 7 (Sonnet main session), inbox improvements (PR 5), cp #67, PC setup, #72 macOS CI, step-based test limits.
-Possible follow-up: sync consumed owner-go plan records between Mac and PC (claude-notes) so a machine switch needs no
+Possible follow-up: sync owner-go plan records between Mac and PC (claude-notes) so a machine switch needs no
 re-approval. Every file here is a cp hard-stop → the owner merges in chat; both machines run `pipeline update` after merge.
