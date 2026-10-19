@@ -534,13 +534,19 @@ export function packageScripts(call, env) {
   const exists = (f) => env.pathExists(f) || lexists(f);
   const refuse = (msg) => ({ refuse: `package script: ${msg}` });
   // (`npm explore PKG -- CMD` runs in node_modules/PKG of the project: set once the project is known, below)
-  let direct = call.execText ? [{ name: null, label: `${call.pm} ${call.explore !== null ? 'explore' : 'exec'} command`, text: call.execText, dir: env.cwd, file: env.cwd }] : [];
+  let direct = [];
   const end = (r) => (r.none && direct.length ? { runs: direct } : r.runs && direct.length ? { runs: [...direct, ...r.runs] } : r);
   if (env.cwd === null || env.cwd === undefined) return refuse('cannot tell which directory the package manager runs in, so which package.json it uses cannot be verified. Use an absolute --prefix, or chain the cd with &&.');
   let start = env.cwd;
   if (call.dir !== null) {
     const d = call.dir === '~' || call.dir.startsWith('~/') ? p.join(env.home ?? '', call.dir.slice(1)) : call.dir;
     start = p.resolve(env.cwd, d);
+  }
+  // (R1-B6: the command runs in the working directory; node_modules/.bin is looked up from the --prefix directory AND, as it is not certain which of them npm puts on the PATH, from the working directory: binDir)
+  if (call.execText) {
+    const label = `${call.pm} ${call.explore !== null ? 'explore' : 'exec'} command`;
+    direct = [{ name: null, label, text: call.execText, dir: env.cwd, file: env.cwd, binDir: start }];
+    if (start !== env.cwd) direct.push({ name: null, label: `${label} (bins of the working directory)`, text: call.execText, dir: env.cwd, file: env.cwd, binDir: env.cwd });
   }
   const read = (pj) => {
     if (cache.has(pj)) return cache.get(pj);

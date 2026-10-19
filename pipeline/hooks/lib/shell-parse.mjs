@@ -2780,11 +2780,19 @@ class Parser {
   process(argv, env, seg, isExec) {
     let a = this.winFix(argv, seg);
     let fan = null; // the xargs / parallel that built this command from stdin text
+    const runnerDirs = [];
     let viaRunner = false; // a package runner (npx, npm exec, pnpm dlx ...) started it: a bare name is looked up in node_modules/.bin
     for (let guard = 0; guard < 32 && a.length; guard++) {
       const un = unwrap(a);
       if (!un) break;
-      if (PACKAGE_RUNNERS.has(base(a[0]))) viaRunner = true;
+      if (PACKAGE_RUNNERS.has(base(a[0]))) {
+        viaRunner = true;
+        // (R1-B6: `npx --prefix sub tool`, `npm exec --prefix sub tool`: the bin is looked up from that directory too; every directory option among the words counts, a tool's own --prefix included: more places, never fewer)
+        for (let k = 1; k < a.length; k++) {
+          if (/^(?:--prefix|--dir|--cwd|-C)$/.test(a[k])) runnerDirs.push(a[k + 1] ?? '');
+          else if (/^--(?:prefix|dir|cwd)=/.test(a[k])) runnerDirs.push(a[k].slice(a[k].indexOf('=') + 1));
+        }
+      }
       if (!fan && (base(a[0]) === 'xargs' || base(a[0]) === 'parallel')) fan = a;
       for (const k of Object.keys(un.env)) setEnv(env, k, un.env[k]);
       a = this.winFix(un.argv, seg);
@@ -2801,6 +2809,7 @@ class Parser {
     if (headDyn) this.ctx.dynamicHead = true; // (kept apart from the other causes of ctx.dynamic: see dynamicOther in simpleCommands)
     const cmd = emit(this.ctx, a, env, seg.raw, seg.depth, [], seg.sep);
     if (cmd && viaRunner) Object.defineProperty(cmd, 'viaRunner', { value: true, enumerable: false });
+    if (cmd && runnerDirs.length) Object.defineProperty(cmd, 'runnerDirs', { value: runnerDirs, enumerable: false });
     if (bashAlso) for (const sh of ['bash', 'sh']) emit(this.ctx, [sh, ...bashAlso], env, seg.raw, seg.depth, [], seg.sep);
     // the words that are exactly one command substitution (`for f in $(cmd)`): see wspans (#81)
     if (cmd) Object.defineProperty(cmd, 'subWords', { value: new Set(a.filter((w) => seg.meta.get(w)?.one === true)), enumerable: false });

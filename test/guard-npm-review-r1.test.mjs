@@ -144,6 +144,9 @@ test('R1-B6 npm --prefix sub exec TOOL looks the bin up under the prefix (and th
     denied(cmd, inSub);
     denied(cmd, inCwd); // (unsure where npm looks: both chains)
   }
+  // a prefix outside the working directory: the working directory's bins are looked at too
+  denied('npm --prefix /elsewhere exec tool', inCwd);
+  denied('npx --prefix /elsewhere tool', inCwd);
   // the bin the prefix holds runs the project's run.sh from the working directory
   const relative = (g) => ({ 'sub/package.json': pkg({}), 'sub/node_modules/.bin/tool': sh('bash run.sh'), 'run.sh': sh(g.bad) });
   denied('npm --prefix sub exec tool', relative);

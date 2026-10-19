@@ -1668,7 +1668,7 @@ function judgePackageScripts(c, dirs, ctx, opts, scanRaw = '') {
       seen.add(key);
       // (#89 t3: `npm explore PKG -- bash run.sh` runs a file inside node_modules on purpose: that package's files are judged, which a program run by path in node_modules otherwise is not)
       // (the manager puts every node_modules/.bin from the package's directory upward on the PATH of the script's commands: _scriptBinDir; a bare command name in it may be one of those bins)
-      const r = judgeScriptText(run.text, { kind: 'shell', file: run.label }, run.file, run.dir, ctx, { ...opts, _scriptBinDir: run.dir, ...(run.pkgDir ? { _pkgDir: run.pkgDir } : {}) });
+      const r = judgeScriptText(run.text, { kind: 'shell', file: run.label }, run.file, run.dir, ctx, { ...opts, _scriptBinDir: run.binDir ?? run.dir, ...(run.pkgDir ? { _pkgDir: run.pkgDir } : {}) });
       if (r) return r;
     }
     // (yarn / pnpm / bun NAME with no script of that name run node_modules/.bin/NAME)
@@ -1682,9 +1682,10 @@ function judgePackageScripts(c, dirs, ctx, opts, scanRaw = '') {
 
 // #81 t9: the shell script node_modules/.bin/NAME of a bare name a package runner (or yarn / pnpm / bun) runs. judgeFoundScript leaves node_modules alone, as it should for packages' own programs, so a
 // bin that starts with a shell shebang (or none) is judged here; a program in another language is not. An install earlier on the line may add it: refused when the line refers to a protected path.
-function judgeBinScript(name, dirs, ctx, opts, scanRaw = '', quiet = false) {
-  for (const d of dirs) {
-    const bin = localBin(name, { cwd: d, pathExists: (x) => ctx.api.existsSync(x), p: posix, written: (x) => writtenTo(ctx.frames, x, { exists: (y) => ctx.api.existsSync(y), readText: ctx.readText, ignoreUnmodelled: true }) });
+function judgeBinScript(name, dirs, ctx, opts, scanRaw = '', quiet = false, lookups = null, only = false) {
+  // (`lookups`: places to look for the bin from besides the directory it runs in -- a package runner's --prefix --, each judged as run in every dir of `dirs`; `only`: instead of that directory)
+  for (const [d, l] of dirs.flatMap((x) => [...(only ? [] : [[x, x]]), ...(lookups ?? []).map((y) => [x, posix.resolve(x, y)])])) {
+    const bin = localBin(name, { cwd: l, pathExists: (x) => ctx.api.existsSync(x), p: posix, written: (x) => writtenTo(ctx.frames, x, { exists: (y) => ctx.api.existsSync(y), readText: ctx.readText, ignoreUnmodelled: true }) });
     if (!bin) {
       if (!quiet && ctx.budget.pkgBinsDirty && (makeMatchers(ctx).rawHit(scanRaw, [d]) || SENSITIVE_WORDS.test(String(scanRaw).replace(/['"`\\]/g, '')))) return deny(`package script: an earlier install on the line may add node_modules/.bin/${name}, and the line refers to a protected pipeline file, so what it runs cannot be checked; run the install in a command of its own`);
       continue;
@@ -2690,11 +2691,14 @@ function evaluateBashForFilesFrame(command, opts) {
       }
       // #81 t9: and a bare name a package runner started is the bin node_modules/.bin/NAME
       if (c.viaRunner && c.argv[0] && !c.argv[0].includes('/')) {
-        const v = judgeBinScript(expandRefs(c.argv[0], ctx), sdirsNow(), ctx, withLineVars(opts, c), scanRaw);
+        const prefixes = (c.runnerDirs ?? []).map((x) => expandRefs(x, ctx)).filter((x) => !/[$`]/.test(x)).map((x) => (x === '~' || x.startsWith('~/') ? posix.join(ctx.homePosix ?? '', x.slice(1)) : x));
+        const v = judgeBinScript(expandRefs(c.argv[0], ctx), sdirsNow(), ctx, withLineVars(opts, c), scanRaw, false, prefixes);
         if (v) return v;
       } else if (!c.viaRunner && (typeof opts._scriptBinDir === 'string' || c.binPath) && c.argv[0] && !c.argv[0].includes('/')) {
         // (a bare command name in a package script: node_modules/.bin/NAME of the package's directory or above it comes first on the PATH; none there = an ordinary command)
-        const v = judgeBinScript(expandRefs(c.argv[0], ctx), typeof opts._scriptBinDir === 'string' ? [opts._scriptBinDir] : sdirsNow(), ctx, withLineVars(opts, c), scanRaw, true);
+        const v = typeof opts._scriptBinDir === 'string'
+          ? judgeBinScript(expandRefs(c.argv[0], ctx), sdirsNow(), ctx, withLineVars(opts, c), scanRaw, true, [opts._scriptBinDir], true) // (R1-B6: looked up from the package's bin directory, run where the script is)
+          : judgeBinScript(expandRefs(c.argv[0], ctx), sdirsNow(), ctx, withLineVars(opts, c), scanRaw, true);
         if (v) return v;
       }
       markPackageState(ctx.budget, [c.argv], { dirs: cwdsNow(), expand: (w) => expandRefs(w, ctx), home: ctx.homePosix, p: posix }); // (what this command may change, for the package scripts after it)

@@ -1311,7 +1311,7 @@ function packageScriptVerdict(argv, dir, ctx, level) {
   for (const run of plan.runs ?? []) {
     // (the manager puts every node_modules/.bin from the package's directory upward on the PATH of the script's commands: a bare command name in it may be one of those bins)
     const outerBinDir = ctx.scriptBinDir;
-    ctx.scriptBinDir = run.dir;
+    ctx.scriptBinDir = run.binDir ?? run.dir;
     try {
       const v = judgeScriptText(run.text, { kind: 'shell', file: run.label }, run.file, run.dir, ctx, level);
       if (v) return v;
@@ -1340,12 +1340,12 @@ function binKind(bin, ctx) {
   return binIsProgram(head) ? 'program' : 'open';
 }
 // `quiet`: the lookup of a command inside a package script (PATH has node_modules/.bin): a name with no bin there is an ordinary command, nothing to refuse
-function binVerdict(name, dir, ctx, level, quiet = false) {
+function binVerdict(name, dir, ctx, level, quiet = false, lookup = dir) {
   // (a bin is a program file like a script: the plain-script reading of what the line writes, a missing one included)
   // (quiet: every command word of a script is looked up, so only a write that certainly puts a bin there counts, not one that may)
   const written = (abs) => (writtenTo(ctx.writeFrames, abs, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: true }) ? 'known' : !quiet && writtenTo(ctx.writeFrames, abs, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: ctx.ignoreUnmodelled === true }) ? 'maybe' : null);
   const maybes = [];
-  const bin = localBin(name, { cwd: dir, pathExists: ctx.pathExists, p: path, written, onMaybe: (f) => maybes.push(f) });
+  const bin = localBin(name, { cwd: lookup, pathExists: ctx.pathExists, p: path, written, onMaybe: (f) => maybes.push(f) });
   for (const m of maybes) { // (a bin the line may write: judged on what it may hold, and refused when the line mentions a guarded operation)
     const v = checkScriptFile({ kind: 'exec', file: m, candidate: true }, dir, ctx, level);
     if (v) return v;
@@ -1359,9 +1359,9 @@ function binVerdict(name, dir, ctx, level, quiet = false) {
   if (bin) return checkScriptFile({ kind: 'exec', file: bin, candidate: true }, dir, ctx, level);
   return !quiet && ctx.budget.pkgBinsDirty && lineMentionsGuarded(ctx) ? deny(`package script: an earlier install on the line may add node_modules/.bin/${name}, and the line mentions a guarded operation, so what it runs cannot be verified. Run the install in a command of its own.`) : null;
 }
-function runnerBinVerdict(argv, dir, ctx, level, quiet = false) {
+function runnerBinVerdict(argv, dir, ctx, level, quiet = false, lookup = dir) {
   const name = expandVars(argv[0], ctx);
-  return name.includes('/') ? null : binVerdict(name, dir, ctx, level, quiet);
+  return name.includes('/') ? null : binVerdict(name, dir, ctx, level, quiet, lookup);
 }
 
 function judgeSqlEscapes(escapes, sf, dir, ctx, level) {
@@ -2623,9 +2623,18 @@ function evalString(str, startDir, ctx, level, child = false) {
       if (!verdict) verdict = withPrefixEnv(c, ctx, () => repoMergeCommandVerdict(argv, dir, ctx)); // (#58; with its prefix: `npm_config_prefix=/chat npm run merge …`)
       // (npm exec NAME / npx NAME: the parser unwraps them to `NAME …`, marked viaRunner. NAME is a bin, never a script, but it is judged as the merge script when it carries that name: `npx npm run NAME`)
       if (!verdict && c.viaRunner) verdict = withPrefixEnv(c, ctx, () => repoMergeCommandVerdict(['npx', 'npm', 'run', argv[0]], dir, ctx));
-      if (!verdict && c.viaRunner) verdict = runnerBinVerdict(argv, dir, ctx, level);
+      if (!verdict && c.viaRunner) {
+        verdict = runnerBinVerdict(argv, dir, ctx, level);
+        // (R1-B6: `npx --prefix sub tool`: the bin may come from the prefix's node_modules/.bin; it still runs in the working directory)
+        for (const pfx of dir === null ? [] : c.runnerDirs ?? []) {
+          if (verdict) break;
+          const w = expandVars(pfx, ctx);
+          if (/[$`]/.test(w)) continue;
+          verdict = runnerBinVerdict(argv, dir, ctx, level, false, path.resolve(dir, w === '~' || w.startsWith('~/') ? path.join(ctx.home ?? '', w.slice(1)) : w));
+        }
+      }
       // (a bare command name in a package script: node_modules/.bin/NAME of the package's directory or above it comes first on the PATH; none there = an ordinary command)
-      if (!verdict && !c.viaRunner && (typeof ctx.scriptBinDir === 'string' || (c.binPath && dir !== null))) verdict = runnerBinVerdict(argv, typeof ctx.scriptBinDir === 'string' ? ctx.scriptBinDir : dir, ctx, level, true);
+      if (!verdict && !c.viaRunner && (typeof ctx.scriptBinDir === 'string' || (c.binPath && dir !== null))) verdict = runnerBinVerdict(argv, typeof ctx.scriptBinDir === 'string' ? (dir ?? ctx.scriptBinDir) : dir, ctx, level, true, typeof ctx.scriptBinDir === 'string' ? ctx.scriptBinDir : dir); // (R1-B6: looked up from the package's bin directory, run where the script is)
       if (!verdict) verdict = withPrefixEnv(c, ctx, () => packageScriptVerdict(argv, dir, ctx, level)); // (#81 t9: `npm run NAME` runs the text package.json holds for NAME)
       if (!verdict) {
         // a string or program text the parser cannot unwrap (node -e, osascript, make CMD=...) that carries a guarded command
