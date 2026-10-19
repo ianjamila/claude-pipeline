@@ -31,7 +31,8 @@ function fakeGhEnv(entries) {
 
 test('run captures stdout and exit code', () => {
   const r = run('node', ['-e', 'process.stdout.write("hi")']);
-  assert.deepEqual(r, { code: 0, stdout: 'hi', stderr: '', timedOut: false, signal: null });
+  assert.equal(typeof r.pid, 'number', 'the child pid is reported');
+  assert.deepEqual({ ...r, pid: undefined }, { code: 0, stdout: 'hi', stderr: '', timedOut: false, signal: null, pid: undefined });
 });
 
 test('run reports a non-zero exit code and stderr', () => {
@@ -669,4 +670,10 @@ test('envWithGhDir does nothing on win32', () => {
   const p = scratch();
   const out = envWithGhDir({ PATH: p, PIPELINE_GH: '' }, { fallbackDirs: [fakeGhDir('x')], platform: 'win32' });
   assert.equal(out.PATH, p);
+});
+
+test('toResult: carries the child pid, null when the child never started', () => {
+  assert.equal(toResult({ status: 0, pid: 4242 }).pid, 4242);
+  assert.equal(toResult({ status: null, pid: 0, error: new Error('spawn x ENOENT') }).pid, 0, 'spawnSync reports pid 0 for a failed spawn; kept as given');
+  assert.equal(toResult({ status: 0 }).pid, null);
 });

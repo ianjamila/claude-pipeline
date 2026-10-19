@@ -24,6 +24,9 @@ Into `~/.claude` (or `$CLAUDE_CONFIG_DIR`):
 | hook `guard-files` (matcher `Edit\|Write\|MultiEdit\|NotebookEdit\|Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks agents editing the pipeline's own files and settings — **installed last**, after the proofs |
 | hook `session-version` (SessionStart) | tells you at the top of a session when the installed pipeline is stale, edited, half-installed or older than a repo's vendored copy; silent when all is well (see [Staying current](#staying-current)) |
 | hook `owner-go` (UserPromptSubmit) | records your chat "merge" (a prompt that starts with "merge") against the PR, head and owner items the reply before it showed, so `P merge` and the guards can tell your approval from the agent's word (`owner_approval: chat`, resumed runs); never blocks or changes a prompt |
+| hook `stack-register` (PreToolUse on `Bash` and the file tools `Read\|Edit\|Write\|Grep\|Glob\|NotebookEdit`, 30 s) | records which private Supabase stack a session is about to use, before the tool runs; **fail-closed** like the guards (an unloadable file blocks with exit 2) |
+| hook `stack-dev-bind` (PostToolUse on `Bash`, 10 s) | notes which stack a dev server you started is bound to; non-blocking |
+| hook `stack-session-end` (SessionEnd, 10 s) | when a session ends (not on `/clear`) it starts a detached worker that decides whether that session's stacks can be stopped; non-blocking |
 | settings allow entries | `Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)` so pipeline calls don't prompt |
 
 A manifest (`~/.claude/pipeline/INSTALLED.json`: version, git SHA, file hashes) lets the installer
@@ -32,7 +35,7 @@ refuse to overwrite skills or agents it didn't install, and lets `--check` repor
 - **Fail-closed guards.** The two guard hooks are started through a small loader, not directly. If
   the hook file cannot be loaded (deleted, half-written, a syntax error) the loader blocks the
   tool call with exit 2 instead of letting Claude Code treat the crash as "allowed". The
-  `session-version` status hook and the `owner-go` recorder are the exceptions: they never block anything.
+  `session-version` status hook, the `owner-go` recorder and the `stack-dev-bind` and `stack-session-end` hooks are the exceptions: they never block anything. `stack-register` is fail-closed like the guards.
 - **Complete-install marker.** The installer writes the manifest with `"complete": false` first and
   flips it to `true` as its very last step, so an install that was interrupted (or whose later
   steps failed) is never mistaken for a good one. `--check`, `pipeline version` and the session
@@ -159,6 +162,17 @@ for this repo. Ask me about hard-stops you can't infer."*
 pipeline. ship and verify stand down and the project Stop hook skips; branch protection and the
 global git guard stay on regardless.
 
+### `P stacks`: stopping private Supabase stacks nobody needs
+
+Private local stacks (one per worktree) keep eating memory after the work is done. `P stacks` stops the ones nobody uses.
+
+- **Measure first.** Every mode (`sessionEnd`, `sweeper`, `devServers`) starts as `report`: it logs what it *would* stop and stops nothing. Check `P stacks status`. After 7 days with `MISS 0` (a stack it would have stopped was used within 2 h), flip one mode to `apply` in `~/.claude/pipeline-state/stacks/mode.json`. Only you do that.
+- **Pause.** `touch ~/.claude/pipeline-state/stacks/pause` stops everything on every path; delete the file to resume.
+- **Keep list.** `~/.claude/pipeline-state/stacks/keep` holds one project id per line (`#` comments); a listed project is never stopped.
+- **Setup.** `P stacks init --write` writes the machine config (which ids are shared, which repos to scan). `P stacks schedule --install` adds the daily sweep. Install writes neither.
+- **Look and fix.** `P stacks status` shows modes, leases and the last report. `P stacks repair` moves a damaged ledger aside.
+- **Safety.** Shared stacks (your configured ids, anything ending `-pipeline`, anything under `.verify/supabase-workdir`) are never stopped. The only stop command is `supabase stop --workdir <dir>`, which keeps the data. Volumes are never deleted. Any doubt (a probe fails, a process cannot be read) means the stack is kept. Processes of other OS users are seen by their connections and command lines only; their environment and open files cannot be read without root.
+
 **Pausing all merges in a repo:** open an issue labelled `pipeline-pause`. While it is open no run
 merges (PRs still get built, verified and reviewed). Agents cannot close it. A failed production
 smoke opens a `pipeline-rollback` issue that has the same effect until you close it.
@@ -227,6 +241,7 @@ head you did not review (the receipt names the head the event carried).
   understood; ship pushes `git push -u origin agent/<slug>`), `unset CLAUDECODE`, and setting
   `PIPELINE_GH`, `PIPELINE_CODEX`, `PIPELINE_VERCEL`, `PIPELINE_TEST_MODE` or `PIPELINE_UPDATE_REMOTE` on a `pipeline.mjs` command;
   the installed CLI ignores those five seam variables altogether (they exist for the test suite).
+  The stack-stop seams `PIPELINE_DOCKER`, `PIPELINE_PS`, `PIPELINE_LSOF`, `PIPELINE_SUPABASE`, `PIPELINE_STACKS_DEADLINE_MS` and `PIPELINE_INSTALL_WORKER_WAIT_MS` follow a stricter rule: an installed copy ignores them always; in the repo checkout they count only when `PIPELINE_STACKS_HOME` points somewhere other than the default `~/.claude/pipeline-state/stacks` **and** `PIPELINE_STACKS_ONLY` names the projects that isolated run may touch.
 - **Your chat "merge" is checked locally.** The owner-go hook records only prompts you type (Claude Code never runs it for
   the model or a subagent), and `P merge` and guard-git trust only those records. But the agent runs as your OS user and with
   your GitHub token: a program the guards cannot see into (a script that builds the record path at run time, a test that
