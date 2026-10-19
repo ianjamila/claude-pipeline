@@ -103,6 +103,10 @@ const DIR_OPTS = new Set(['--prefix', '-C', '--dir', '--cwd']);
 const WORKSPACE_OPT = /^(?:-w|-ws|--workspaces?|--filter|-F|--filter-prod|-r|--recursive|--include-workspace-root|--workspace-root)$/;
 const MOVER_OPT = /^(?:--userconfig|--globalconfig)$/;
 const RUN_TIME = /[$`]/;
+const GLOBAL_OPT = /^(?:-[a-zA-Z]*g[a-zA-Z]*|--global(?:=(?!false$|0$).*)?)$/i;
+// `npm explore` (and its unique abbreviations: npm reads `expl` as ambiguous with explain) runs a command in node_modules/PKG. A scoped name is two path parts.
+const EXPLORE_SUB = /^explo(?:r(?:e)?)?$/;
+const EXPLORE_PKG = /^(?:@[A-Za-z0-9._~-]+\/)?[A-Za-z0-9._~-]+$/;
 // Options by how they take their value. A value option takes the next word unless it is written `--name=value`; an option that is on neither list may be either: unresolved.
 const VALUE_NPM = new Set([...PM_VALUE_OPTS, '--node-options', '--omit', '--include', '--access', '--before', '--audit-level', '--install-strategy', '--lockfile-version', '--logs-dir', '--cafile', '--proxy', '--https-proxy', '--noproxy', '--user-agent', '--reporter', '--workspace-concurrency']);
 const VALUE_OTHER = new Set([...VALUE_NPM].filter((o) => o !== '-w'));
@@ -138,6 +142,7 @@ function scanOpts(words, i, pm, st) {
     if (DIR_OPTS.has(key)) st.dir = eq > 0 ? w.slice(eq + 1) : words[i + 1] ?? '';
     if (MOVER_OPT.test(key)) st.mover = true;
     if (WORKSPACE_OPT.test(key)) st.workspace = true;
+    if (GLOBAL_OPT.test(w) || (key === '--location' && (eq > 0 ? w.slice(eq + 1) : words[i + 1]) === 'global')) st.global = true;
     if (key === '--ignore-scripts') st.ignore = eq > 0 ? !/^(?:false|0)$/i.test(w.slice(eq + 1)) : true;
     if (key === '--no-ignore-scripts') st.ignore = false;
     if (kind === 'unknown') st.unknown.push(w);
@@ -149,12 +154,12 @@ export function pmCall(allWords) {
   const words = baseName(allWords[0] ?? '') === 'corepack' ? allWords.slice(1) : allWords; // (`corepack pnpm ship`)
   const pm = baseName(words[0] ?? '');
   if (!Object.hasOwn(PM_RUN_ALIASES, pm)) return null;
-  const st = { dir: null, workspace: false, mover: false, ignore: false, unknown: [] };
+  const st = { dir: null, workspace: false, mover: false, ignore: false, global: false, unknown: [] };
   let i = scanOpts(words, 1, pm, st);
   if (words[i] === '--') i++; // (`npm -- run x`: the words after `--` are positional, the first is the subcommand)
   const sub = (words[i] ?? '').toLowerCase();
   const rest = words.slice(i + 1);
-  const call = { pm, sub, names: [], gate: [], main: null, extra: [], dir: null, workspace: false, mover: false, dynamic: false, dirDynamic: false, unresolved: null, bin: null, execText: null, startDefault: false, installGroup: false };
+  const call = { pm, sub, names: [], gate: [], main: null, extra: [], dir: null, workspace: false, mover: false, dynamic: false, dirDynamic: false, unresolved: null, bin: null, execText: null, explore: null, startDefault: false, installGroup: false };
   const finish = () => {
     call.dir = st.dir; call.workspace ||= st.workspace; call.mover ||= st.mover;
     call.dirDynamic = call.dir !== null && RUN_TIME.test(call.dir);
@@ -246,6 +251,31 @@ export function pmCall(allWords) {
   const groups = pm === 'npm' ? GROUPS.npm : GROUPS.other;
   const g = groups.find(([re]) => re.test(sub));
   if (g) { scanRest(); setNames(g[1]); call.installGroup = g[1] === INSTALL || g[1].includes('install'); return finish(); }
+  // `npm explore PKG -- CMD...`: CMD (the words joined by single spaces, as npm does) runs through the script shell in node_modules/PKG of the project. No command: an interactive shell, nothing to judge.
+  const exploring = pm === 'npm' && EXPLORE_SUB.test(sub);
+  if (exploring) {
+    let pkg = null;
+    const cmd = [];
+    let loose = null;
+    for (let k = 0; k < rest.length; k++) {
+      const w = rest[k];
+      if (w === '--') { for (const x of rest.slice(k + 1)) { if (pkg === null) pkg = x; else cmd.push(x); } break; }
+      if (w.startsWith('-')) {
+        const kind = optKind(w, pm);
+        if (kind === 'value' && !w.includes('=')) k++;
+        else if (kind === 'unknown' && !w.includes('=') && rest[k + 1] !== undefined && !rest[k + 1].startsWith('-') && !loose) loose = w;
+        continue;
+      }
+      if (pkg === null) pkg = w; else cmd.push(w);
+    }
+    call.explore = pkg;
+    call.execText = cmd.join(' ').trim() ? cmd.join(' ') : null;
+    if (call.execText) {
+      const said = words.slice(0, 5).join(' ');
+      if (pkg === null || !EXPLORE_PKG.test(pkg) || pkg.split('/').some((x) => /^\.+$/.test(x))) call.unresolved = `the package directory \`${pkg}\` that \`${said}\` runs its command in is not a plain package name (a variable, a glob, \`..\` or a path), so which directory and which program it runs cannot be verified. Name the package.`;
+      else if (loose) call.unresolved = `the option \`${loose}\` is not known to the guard and may take the next word as its value, so which package \`${said}\` runs its command in cannot be verified. Write it as --name=value.`;
+    }
+  }
   // exec forms the parser did not unwrap (options between `pnpm` and `exec`): the command is judged as a line of its own
   if (EXEC_SUBS.has(sub)) {
     let k = 0;
@@ -263,7 +293,8 @@ export function pmCall(allWords) {
   }
   // any other subcommand: unknown to the guard, so every lifecycle script and every word as a script name may run
   scanRest();
-  setNames([...UNION, ...rest.filter((w) => !w.startsWith('-')).flatMap(hooks)]);
+  if (exploring && call.execText && st.global && !call.unresolved) call.unresolved = `\`${words.slice(0, 5).join(' ')}\` runs its command in the global node_modules, whose place (the global prefix) the guard cannot verify. Run it by hand outside the guard's reach.`;
+  setNames([...UNION, ...(exploring ? [] : rest.filter((w) => !w.startsWith('-')).flatMap(hooks))]); // (explore runs no script: the words after it are not script names)
   call.installGroup = true;
   return finish();
 }
@@ -464,6 +495,7 @@ const defaultLexists = (f) => { try { lstatSync(f); return true; } catch { retur
 // (not `prefix`: npm takes the project from the command line's --prefix alone -- @npmcli/config loadLocalPrefix reads the 'cli' source -- so a `prefix=` in a .npmrc, which people set to move their GLOBAL packages, moves nothing here)
 const RC_REFUSED = new Set(['script-shell', 'node-options', 'workspaces', 'workspace', 'include-workspace-root', 'globalconfig', 'userconfig', 'shell', 'onload-script']);
 const GLOBAL_RCS = ['/etc/npmrc', '/usr/local/etc/npmrc', '/opt/homebrew/etc/npmrc'];
+// (the `prefix` key is no mover of the PROJECT -- see above -- but it is where npm looks for the GLOBAL configuration, <prefix>/etc/npmrc, and the one it ships with, <prefix>/lib/node_modules/npm/npmrc)
 
 // Where the scripts are and what they hold, for one evaluation. env: { cwd (null: unknown), home, readText, pathExists, readDir, cache (a Map kept for the whole evaluation),
 // written(abs) -> 'known' | 'maybe' | null (does the line write that file before the command?), mentionsGuarded() -> boolean, p (path module), tick() }.
@@ -475,7 +507,8 @@ export function packageScripts(call, env) {
   const lexists = env.lexists ?? defaultLexists;
   const exists = (f) => env.pathExists(f) || lexists(f);
   const refuse = (msg) => ({ refuse: `package script: ${msg}` });
-  const direct = call.execText ? [{ name: null, label: `${call.pm} exec command`, text: call.execText, dir: env.cwd, file: env.cwd }] : [];
+  // (`npm explore PKG -- CMD` runs in node_modules/PKG of the project: set once the project is known, below)
+  let direct = call.execText ? [{ name: null, label: `${call.pm} ${call.explore !== null ? 'explore' : 'exec'} command`, text: call.execText, dir: env.cwd, file: env.cwd }] : [];
   const end = (r) => (r.none && direct.length ? { runs: direct } : r.runs && direct.length ? { runs: [...direct, ...r.runs] } : r);
   if (env.cwd === null || env.cwd === undefined) return refuse('cannot tell which directory the package manager runs in, so which package.json it uses cannot be verified. Use an absolute --prefix, or chain the cd with &&.');
   let start = env.cwd;
@@ -509,6 +542,7 @@ export function packageScripts(call, env) {
     const walked = [];
     let found = null;
     let atRoot = false;
+    let root = from;
     let d = from;
     for (let i = 0; i < MAX_WALK; i++) {
       const pj = p.join(d, 'package.json');
@@ -516,16 +550,20 @@ export function packageScripts(call, env) {
       env.tick?.();
       // (a package.json the line only MAY write is not the project yet: the one above it is what runs if the write does not happen, and is judged -- the maybe itself is refused below when the line mentions a guarded operation)
       if (exists(pj) || env.written?.(pj) === 'known') { found = { dir: d, file: pj }; break; }
-      if (nm && env.pathExists(p.join(d, 'node_modules'))) { atRoot = true; break; }
+      if (nm && env.pathExists(p.join(d, 'node_modules'))) { atRoot = true; root = d; break; }
       const up = p.dirname(d);
       if (up === d) { atRoot = true; break; }
       d = up;
     }
-    const r = { found, walked, complete: found !== null || atRoot };
+    const r = { found, walked, complete: found !== null || atRoot, root };
     cache.set(key, r);
     return r;
   };
   const up = upward(start);
+  if (call.explore !== null && call.execText) { // (the walk's dir when no package.json: npm's local prefix is then the directory it stopped at, or the working directory)
+    const pd = p.join(up.found?.dir ?? up.root, 'node_modules', call.explore);
+    direct = [{ name: null, label: `npm explore command (in ${p.relative(env.cwd, pd) || pd})`, text: call.execText, dir: pd, file: pd, pkgDir: pd }];
+  }
   for (const pj of up.walked) {
     const w = env.written?.(pj);
     if (w === 'known' || (w === 'maybe' && env.mentionsGuarded?.())) return writtenMsg(pj);
@@ -605,6 +643,13 @@ export function packageScripts(call, env) {
       const bad = rcRefusal(rc, env, cache, exists);
       if (bad) return refuse(bad);
     }
+    // the global configuration (and the one that comes with npm) sit under the global prefix, which the user's or the project's .npmrc, --prefix or node's own place moves
+    const pfx = prefixRcFiles(call, cand.dir, env, p, exists);
+    if (pfx.refuse) return refuse(pfx.refuse);
+    for (const rc of pfx.files) {
+      const bad = rcRefusal(rc, env, cache, exists);
+      if (bad) return refuse(bad);
+    }
     const scripts = rec.scripts ?? {};
     const present = (n) => Object.hasOwn(scripts, n) && typeof scripts[n] === 'string';
     const add = (n, text) => runs.push({ name: n, label: `${p.relative(env.cwd, cand.file) || 'package.json'} script "${n}"`, text, dir: cand.dir, file: cand.file });
@@ -631,6 +676,42 @@ function rcFiles(call, dir, env, p) {
   if (call.pm === 'bun') { list.push(p.join(dir, 'bunfig.toml')); if (env.home) list.push(p.join(env.home, '.bunfig.toml')); }
   return list;
 }
+// The global-prefix configuration files. The prefix is read from the user's and the project's .npmrc (npm reads the global config from the prefix the earlier files name -- all of them are tried, a file that is not
+// there costs nothing), --prefix and node's own place (env.nodePrefix; the default is where this node binary lives: dirname(dirname(execPath)), on Windows dirname(execPath); null: none).
+// A `prefix` the guard cannot work out (a ${VAR} it does not know -- only HOME, and what env.envValue gives --, an unreadable file, an empty value) is a refusal.
+function prefixRcFiles(call, dir, env, p, exists) {
+  const roots = [];
+  const bad = (msg) => ({ files: [], refuse: msg });
+  const sources = [p.join(dir, '.npmrc')];
+  if (env.home) sources.push(p.join(env.home, '.npmrc'));
+  for (const file of sources) {
+    if (!exists(file)) continue;
+    const text = env.readText(file);
+    if (typeof text !== 'string') return bad(`cannot read ${file} (missing permission, a directory or larger than 1 MB), so what it sets for the package manager cannot be verified.`);
+    for (const line of text.split(/\r?\n/)) {
+      const m = /^\s*prefix\s*=(.*)$/i.exec(line);
+      if (!m) continue;
+      let v = m[1].trim();
+      if (/^(["']).*\1$/.test(v)) v = v.slice(1, -1);
+      else v = v.replace(/\s*[;#].*$/, '');
+      v = v.trim();
+      if (v.includes('${')) {
+        let unknown = false;
+        v = v.replace(/\$\{([^}?-]+)([?-][^}]*)?\}/g, (all, name) => { const val = name === 'HOME' && env.home ? env.home : env.envValue?.(name); if (typeof val !== 'string') unknown = true; return val ?? ''; });
+        if (unknown || v.includes('${')) return bad(`${file} sets \`prefix\` with a variable (${line.trim()}) the guard does not know, so where the global npm configuration lies cannot be verified. Write the path out.`);
+      }
+      if (v === '') return bad(`${file} sets an empty \`prefix\`, so where the global npm configuration lies cannot be verified.`);
+      roots.push(v === '~' || v.startsWith('~/') ? p.join(env.home ?? '', v.slice(1)) : p.resolve(env.cwd ?? dir, v));
+    }
+  }
+  if (call.dir !== null && call.dir !== undefined) roots.push(p.resolve(env.cwd ?? dir, call.dir === '~' || call.dir.startsWith('~/') ? p.join(env.home ?? '', call.dir.slice(1)) : call.dir));
+  const nodePrefix = env.nodePrefix !== undefined ? env.nodePrefix : nodeDefaultPrefix();
+  if (nodePrefix) roots.push(nodePrefix);
+  const files = [];
+  for (const r of new Set(roots)) files.push(p.join(r, 'etc', 'npmrc'), p.join(r, 'lib', 'node_modules', 'npm', 'npmrc'), p.join(r, 'node_modules', 'npm', 'npmrc'));
+  return { files, refuse: null };
+}
+const nodeDefaultPrefix = () => (process.platform === 'win32' ? nodePath.dirname(process.execPath) : nodePath.dirname(nodePath.dirname(process.execPath)));
 // (the file's own text is read once per evaluation: the disk does not change while the guard looks. What the LINE writes to it is asked every time: a second manager call comes after
 // writes the first one did not see -- `npm test && echo 'script-shell=/x' > .npmrc && npm run lint`)
 function rcRefusal(file, env, cache, exists) {

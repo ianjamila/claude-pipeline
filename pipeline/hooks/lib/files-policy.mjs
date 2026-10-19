@@ -217,6 +217,7 @@ function makeCtx(opts) {
     frames: opts._frames ?? [], // the files each command list being evaluated writes (see line-writes.mjs), outermost first
     budget: opts._budget ?? newEvalBudget(opts.now), // script reads, deadline and expansion allowance of this evaluation (shared with nested calls)
     readDir: opts.readDir ?? defaultReadDir,
+    nodePrefix: opts.nodePrefix, // #89 t3: where this node binary's npm keeps its global configuration; undefined: from process.execPath, null: none (tests)
     admin: (opts.env ?? process.env).PIPELINE_ADMIN === '1',
     env: opts.env ?? process.env,
     bashState: opts._bashState, // the BASH rewrite record of the whole evaluation (see evaluateBashForFilesUnchecked)
@@ -1652,7 +1653,7 @@ function judgePackageScripts(c, dirs, ctx, opts, scanRaw = '') {
   for (const d of dirs) {
     const mentionsGuarded = () => makeMatchers(ctx).rawHit(scanRaw, [d]) || SENSITIVE_WORDS.test(String(scanRaw).replace(/['"`\\]/g, ''));
     const plan = packageScripts(call, {
-      cwd: d, home: ctx.homePosix, readText: ctx.readText, pathExists: (x) => ctx.api.existsSync(x), readDir: ctx.readDir, cache: (ctx.budget.pkgCache ??= new Map()), p: posix, tick: () => checkDeadline(ctx.budget),
+      cwd: d, home: ctx.homePosix, nodePrefix: ctx.nodePrefix, readText: ctx.readText, pathExists: (x) => ctx.api.existsSync(x), readDir: ctx.readDir, cache: (ctx.budget.pkgCache ??= new Map()), p: posix, tick: () => checkDeadline(ctx.budget),
       written: (abs) => pkgFileWritten(ctx, abs),
       mentionsGuarded,
     });
@@ -1663,7 +1664,8 @@ function judgePackageScripts(c, dirs, ctx, opts, scanRaw = '') {
       const key = `${run.file}\u0000${run.label}\u0000${run.text}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      const r = judgeScriptText(run.text, { kind: 'shell', file: run.label }, run.file, run.dir, ctx, opts);
+      // (#89 t3: `npm explore PKG -- bash run.sh` runs a file inside node_modules on purpose: that package's files are judged, which a program run by path in node_modules otherwise is not)
+      const r = judgeScriptText(run.text, { kind: 'shell', file: run.label }, run.file, run.dir, ctx, run.pkgDir ? { ...opts, _pkgDir: run.pkgDir } : opts);
       if (r) return r;
     }
     // (yarn / pnpm / bun NAME with no script of that name run node_modules/.bin/NAME)
@@ -1722,7 +1724,7 @@ function judgeJoinedScripts(sf, dirs, ctx, opts, scanRaw = '') {
       for (const pc of sf.pieces ?? sf.joined.map((file) => ({ file }))) {
         if (Object.hasOwn(pc, 'text')) { parts.push([pc.text]); continue; }
         const abs = abss[fi++];
-        if (ctx.hit(abs) || ctx.hit(realResolve(abs, ctx.api)) || /\/node_modules\//.test(abs)) continue;
+        if (ctx.hit(abs) || ctx.hit(realResolve(abs, ctx.api)) || inNodeModules(abs, opts)) continue;
         checkDeadline(ctx.budget);
         const exists = ctx.api.existsSync(abs);
         const text = exists ? ctx.readText(abs) : null;
@@ -1794,9 +1796,11 @@ function judgeSqlLines(sf, dirs, ctx, opts) {
   return null;
 }
 
+// A node_modules file is a package's own program, not judged -- except inside the package directory an `npm explore` runs its command in (opts._pkgDir)
+const inNodeModules = (abs, opts) => /\/node_modules\//.test(abs) && !(opts?._pkgDir && (abs === opts._pkgDir || abs.startsWith(`${opts._pkgDir}/`)));
 // One existing script file (`abs`, found in directory `dir`).
 function judgeFoundScript(sf, abs, dir, ctx, opts) {
-  if (ctx.hit(abs) || ctx.hit(realResolve(abs, ctx.api)) || /\/node_modules\//.test(abs)) return null;
+  if (ctx.hit(abs) || ctx.hit(realResolve(abs, ctx.api)) || inNodeModules(abs, opts)) return null;
   checkDeadline(ctx.budget);
   const text = ctx.readText(abs);
   if (typeof text !== 'string') {

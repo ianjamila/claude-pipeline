@@ -1265,7 +1265,7 @@ function judgeScriptText(text, sf, abs, dir, ctx, level) {
 // A script, directory or setting that is only known at run time cannot be read: refused when the line mentions a guarded operation (as for `bash $F`); a setting that moves the package.json
 // (npm_config_prefix, INIT_CWD, PNPM_* ...) always, as which package.json the manager reads is then unknown.
 const pkgEnv = (ctx, cwd) => ({
-  cwd, home: ctx.home, readText: ctx.readText, pathExists: ctx.pathExists, readDir: ctx.readDir, cache: (ctx.budget.pkgCache ??= new Map()), p: path, tick: () => checkDeadline(ctx.budget),
+  cwd, home: ctx.home, nodePrefix: ctx.nodePrefix, readText: ctx.readText, pathExists: ctx.pathExists, readDir: ctx.readDir, cache: (ctx.budget.pkgCache ??= new Map()), p: path, tick: () => checkDeadline(ctx.budget),
   written: (abs) => pkgFileWritten(ctx, abs),
   mentionsGuarded: () => lineMentionsGuarded(ctx),
 });
@@ -2701,13 +2701,14 @@ function evaluateGitOnce(command, {
   realpath = realpathSync.native, // symlinks followed when a write and a script are compared (tests fake it)
   now = Date.now, // injectable clock (tests)
   env = {}, // the hook process's environment (BASH_ENV / ENV / ZDOTDIR name startup files the shells run); {} keeps tests hermetic
+  nodePrefix, // #89 t3: where this node binary's npm keeps its global configuration (<nodePrefix>/etc/npmrc); undefined: from process.execPath, null: none (tests)
   ownerGo = null, // #58: { mode(dir), mergeTemplates(dir), approvedHead(pr, head) } (git-wiring.mjs ownerGoWiring); null = no direct-merge check
 } = {}, bashState) {
   const text = typeof command === 'string' ? command : String(command ?? '');
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   const base = cwd || process.cwd();
   const ctx = {
-    cwd: base, home, currentBranch, pushDestination, issueLabels, ownerGo, readText, pathExists, readDir, readHead, realpath, env, budget: bashState?.carry ? { ...bashState.carry, startupOk: new Set(), startupFx: undefined } : newEvalBudget(now), fullText: text, lineText: text,
+    cwd: base, home, nodePrefix, currentBranch, pushDestination, issueLabels, ownerGo, readText, pathExists, readDir, readHead, realpath, env, budget: bashState?.carry ? { ...bashState.carry, startupOk: new Set(), startupFx: undefined } : newEvalBudget(now), fullText: text, lineText: text,
     vars: Object.create(null), unsureVars: new Set(), tainted: new Set(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
     branches: new Map(), cfgDirty: false, envCfgDirty: false, writeFrames: [], bashState,
   };
