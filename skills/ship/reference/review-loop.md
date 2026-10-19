@@ -131,10 +131,15 @@ permissions / data-integrity / data-loss item ⇒ `needsHuman` (the CLI applies 
 
 - ACCEPT (not yet implemented): one implementer dispatch with the list (`P state show --round
   <round> --accepted`): fix each, add/adjust tests where behaviour changes, quick verify, commit,
-  `git push origin agent/<slug>`. Then the verifier runs `verify.full`. Red ⇒ fix cycle (max 2), else
+  `git push origin agent/<slug>`. Then the verifier runs `verify.full` (`P config` `verify.after_fix: full`, the default).
+  When `verify.after_fix` is `quick`, run `P verify plan-after-fix --round <round>` instead and have the verifier run each
+  command in its `commands` list, in order (a quick check, then the extra full steps the fixes touched); exit 1 ⇒ run `verify.full`.
+  Either red ⇒ fix cycle (max 2), else
   `needs-human` (park it as below, `--cause verify-red`). Then `P state mark-implemented --ids <ids>` — exit 2 `no-code-change` means the
   branch content is still what the round reviewed: the fix has not actually changed code, so go back to
-  the implementer (marking never substitutes for a fix; a green `verify.full` must show the fix).
+  the implementer (marking never substitutes for a fix; a green verify must show the fix).
+  Step 2.2's initial full verify and Step 5.3's gate verify stay full whatever `verify.after_fix` says: the gate
+  still needs a full, clean report on the exact head.
 - `P comment --pr <pr> --kind triage` (one comment, updated in place each round): post it FIRST, so the decided
   items are published before any issue exists. A run that dies after this point resumes from that comment.
 - FOLLOW-UP: `P followups create --round <round>` (one issue each, label `agent-suggestion`). Each issue body starts

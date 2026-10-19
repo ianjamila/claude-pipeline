@@ -28,6 +28,12 @@ verify:
   #                                # heavy-check slot) before it runs. The Stop hook adds this to its 840 s execution allowance, so
   #                                # raise the hook's "timeout" in .claude/settings.json to 900 + minutes * 60 seconds (5 -> 1200);
   #                                # `P config` warns when it is lower.
+  # after_fix: quick            # optional, full (default) | quick: what the verifier runs after review fixes are accepted. quick = verify.quick,
+  #                                # plus verify.full --only <steps> when the fixes touch a path below (`P verify plan-after-fix --round R`
+  #                                # prints the commands). The first full verify and the final gate's verify stay full.
+  # after_fix_steps_by_path:       # optional: glob -> steps to add (`verify.full --only a,b`) when the round's fixes touch a match
+  #   "supabase/**": [db, db-grants]
+  # after_fix_never: [sql-arms]    # optional: steps that must stay full-verify only; one listed in the map above is a config error
 
 ci:
   required_checks: ["Test integrity", "Hard-stop scan"]   # + your CI job names

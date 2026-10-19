@@ -187,7 +187,7 @@ for items without a ruling yet; `P triage validate --round R --from-tag "pipelin
 --test-file …` runs it) → arbiter if `P arbiter needed` says so (`arbiter` agent, no model param,
 one batched call; its prompt starts with the `promptHeader` from `P arbiter needed`, pasted verbatim) → `P arbiter apply --round R --tag "pipeline-arbiter R<R> <digest8>"` (proves
 Fable from the subagent transcript; the tag is the Agent call's description) → implement ACCEPTED
-items (implementer + verifier full verify) → `P followups create --round R` for FOLLOW-UP →
+items (implementer + verifier: `verify.full`, or with `verify.after_fix: quick` the commands from `P verify plan-after-fix --round R`; Steps 2.2 and 5.3 stay full) → `P followups create --round R` for FOLLOW-UP →
 `P comment --pr N --kind triage`. After each round: `P checkpoint --pr N --step review --round R`. Exit when
 `P state outcome` says `clean`. Order and replay traps (triage comment BEFORE `followups create`, `P state
 discard-round` for an interrupted round): `reference/review-loop.md`. Not clean after the

@@ -511,6 +511,19 @@ Exit: 0 copied / no drift · 1 drift found (`--check`) · 2 usage.
 
 Vendoring also appends `scripts/pipeline/** -text` and `scripts/verify text eol=lf` to the project's `.gitattributes` (idempotent; output `gitattributes` lists what was added), so a Windows autocrlf checkout cannot make the byte comparison drift. `--check` warns when the entries are missing.
 
+## verify
+
+plan the verify commands for the ship loop (plan-after-fix).
+
+```
+pipeline verify plan-after-fix --round R [--repo DIR]   -> {ok, mode, commands, matchedSteps, base, head, files}
+  verify.after_fix full (default): commands = [verify.full]. quick: commands = [verify.quick] plus, when the fixes since round R's
+  reviewed head (renames count on both sides) touch a path in verify.after_fix_steps_by_path, verify.full --only <those steps>;
+  run them in order, either red = fix cycle. exit 1 {ok:false, error} when round R has no recorded review state (fail closed)
+```
+
+Exit: 0 · 1 `no-round-state` / `base-not-ancestor` (run `verify.full` instead) · 2 usage.
+
 ## version
 
 print the pipeline version.
