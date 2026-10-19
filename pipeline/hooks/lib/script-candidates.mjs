@@ -159,6 +159,7 @@ function globMatch(p, s, work) {
   let star = -1;
   let mark = 0;
   while (si < s.length) {
+    // Defensive (mutation check): the step allowance is also held by the pattern cap (MAX_PATTERN) and the star cap (MAX_STARS).
     if (++work.n > MAX_GLOB_TICKS) throw new Over();
     if (pi < p.length && p[pi] === '*') { star = pi++; mark = si; }
     else if (pi < p.length && (p[pi] === '?' || p[pi] === s[si])) { pi++; si++; }
@@ -170,6 +171,7 @@ function globMatch(p, s, work) {
 }
 // the value with the operator applied, or undefined (not worked out: the caller makes the word unknown)
 function applyOp(v, op, arg, work) {
+  // Defensive (mutation check): the value cap is also held by the pattern and star caps (MAX_PATTERN, MAX_STARS).
   if (v.length > MAX_OP_VALUE) return undefined;
   if (op === '^^') return v.toUpperCase();
   if (op === ',,') return v.toLowerCase();
@@ -215,6 +217,7 @@ function closeBrace(s, i) {
   let depth = 1;
   for (let j = i + 1; j < s.length && j < i + MAX_VALUE_CHARS; j++) {
     const c = s[j];
+    // Defensive (mutation check): a quote inside the braces is still refused by the paramReadings quote check.
     if (c === "'" || c === '"' || c === '\\' || c === '`' || (c === '$' && (s[j + 1] === '(' || s[j + 1] === "'"))) return -1;
     if (c === '{') depth++;
     else if (c === '}' && --depth === 0) return j;
@@ -296,6 +299,7 @@ function assignedValues(text) {
     }
   }
   const over = new Set(); // names that had more words than kept
+  // Defensive (mutation check): the cap on kept words is also held by the readingsOf cap (MAX_READINGS).
   const add = (k, w) => { const set = cand.get(k) ?? new Set(); if (set.size < MAX_ASSIGN_WORDS * 2) set.add(w); else over.add(k); cand.set(k, set); };
   const work = { n: 0 };
   // the words a `${…}` group stands for (inner = the text between the braces): null = leave the reading out (a value the environment gives)
@@ -329,6 +333,7 @@ function assignedValues(text) {
         for (const v of group(a.slice(at + 2, j)) ?? []) next.push(a.slice(0, at) + v + a.slice(j + 1));
       }
       alts = [...new Set(next)];
+      // Defensive (mutation check): truncating the alternatives is also held by the readingsOf cap (MAX_READINGS).
       if (alts.length > MAX_ASSIGN_WORDS * 2) { alts = alts.slice(0, MAX_ASSIGN_WORDS * 2); done.add(UNKNOWN_WORD); } // (alternatives dropped: unknown)
     }
     if (alts.length) done.add(UNKNOWN_WORD); // (not settled within the steps allowed)

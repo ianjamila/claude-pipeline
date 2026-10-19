@@ -1848,8 +1848,11 @@ const isStateHazard = (c) => {
   return STATE_HAZARD_CMDS.has(nm) || (nm === 'set' && c.argv.slice(1).some((a) => !SAFE_SET_ARG.test(a)));
 };
 // (the names of builtins and shells that run a string as shell code in the current shell, or whose string may define what the line later calls; `declare` and the like keep the old answer too)
+// Defensive (mutation check): dropping `eval` here is still caught by the parser's `fns` list and the eval / trap gates in onceAssignedNames.
+// Defensive (mutation check): dropping `trap` here is still caught by the eval / trap gates in onceAssignedNames and the parser's `fns` list.
 const EVALUATES_HERE = new Set(['eval', 'source', '.', 'trap', 'alias', 'unalias', 'builtin', 'command', 'exec', 'fc', 'let', '((', 'mapfile', 'readarray', 'complete', 'bind', 'coproc', 'declare', 'typeset', 'local', 'readonly', 'integer', 'float',
   'sh', 'bash', 'zsh', 'dash', 'ksh', 'ash', 'fish', 'csh', 'tcsh', 'functions', 'autoload', 'zmodload', 'emulate', 'setopt', 'shopt', 'enable', 'hash', 'printf']);
+// Defensive (mutation check): a dynamic head counted as data is still caught by the eval / trap gates in onceAssignedNames and the parser's `fns` list.
 const readsOnlyData = (c) => dataOnly(c) || (c.argv.length > 0 && !DYNAMIC.test(c.argv[0]) && !EVALUATES_HERE.has(baseName(c.argv[0])) && !(baseName(c.argv[0]) === 'export' && c.argv.some((w) => w.includes('['))));
 const FUNCTION_DEF = /(?:^|[\s;&|(){])(?:function\s+[^\s(){};&|<>]+|[A-Za-z_][\w.:-]*\s*\(\s*\))/;
 // `source` / `.` run a file in THIS shell: it may cd, check out a branch or reassign any variable.
@@ -1903,6 +1906,7 @@ function unquotedText(s) {
 // a definition (EVALUATES_HERE: eval, source, trap, alias, a shell ... and a name known only at run time); with one of those on the line the old answer stands.
 function definesFunction(str, cmds) {
   if (!FUNCTION_DEF.test(str)) return false;
+  // Defensive (mutation check): without the parser's real function definitions the unquotedText scan still refuses a text that defines a function.
   if (cmds.fns instanceof Set ? cmds.fns.size > 0 || !cmds.every(readsOnlyData) : !cmds.every(dataOnly)) return true;
   const text = withoutHeredocBodies(str, cmds);
   if (text === null) return true;
