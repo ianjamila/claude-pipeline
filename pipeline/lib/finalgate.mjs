@@ -12,7 +12,9 @@ import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node
 import { join, resolve } from 'node:path';
 import { gh as ghRun } from './proc.mjs';
 import { checkGuardVerdict, GUARD_CONTEXT_CHECKS } from './guard-provenance.mjs';
-import { GUARD_CHECKS } from './config.mjs';
+import { GUARD_CHECKS, validateConfig } from './config.mjs';
+import { ciProof as defaultCiProof } from './ci-proof.mjs';
+import { matchGlob } from './glob.mjs';
 import { blockingHits, collectHardStops, ownerMergeHits } from './hardstops.mjs';
 import { checkIntegrity } from './integrity.mjs';
 import { runPreflight } from './preflight.mjs';
@@ -22,7 +24,7 @@ import { loadState } from './state.mjs';
 import { parseYaml } from './yaml.mjs';
 import { ownerRuledItems, reviewValidFor } from './triage.mjs';
 import { skipOf } from './verify-steps.mjs';
-import { commitTime, diffFiles, headSha, mergeBase, revParse, reviewBaseRef, reviewContentHash, treeFingerprint } from './git.mjs';
+import { NETWORK_TIMEOUT_MS, commitTime, diffFiles, git, headSha, mergeBase, revParse, reviewBaseRef, reviewContentHash, showFile, treeFingerprint } from './git.mjs';
 import { ownerItemsDigest } from '../hooks/lib/owner-go.mjs';
 
 export const GATE_FILE = 'final-gate.json';
@@ -256,7 +258,79 @@ async function preflightCheck({ root, env, gh }) {
 const SKIP_REASON_SHOWN = 80;
 const clip = (text, n) => (text.length > n ? `${text.slice(0, n)}\u2026` : text);
 
-function verifyReportCheck({ root, config, head, tree, o }) {
+// Paths a PR may never touch if GitHub's run is to stand in for the local one: the CI setup itself, the pipeline config, the verify
+// runner. The repo's own verify.ci_proof_inputs (the deferred suite's specs, runner, deps) are added from the BASE branch.
+const CI_PROOF_PROTECTED = Object.freeze(['.github/**', '.claude/pipeline.yml', 'scripts/verify*', 'scripts/verify*/**']);
+const firstLine = (err) => String(err?.message ?? err).split('\n')[0];
+const CI_PROOF_STATES = new Set(['pass', 'pending', 'failure', 'missing']);
+
+// The proof settings as the BASE branch has them (never the PR's own copy: a PR must not be able to grant itself a CI proof). Fetches
+// the base first; any failure to fetch, read or validate it is { ok: false, reason }, which the caller turns into ci-proof-missing.
+function baseProofSettings({ root, config }) {
+  const o = { cwd: root };
+  const branch = config.default_branch;
+  const ref = `origin/${branch}`;
+  try {
+    git(['fetch', '--no-tags', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`], { ...o, timeoutMs: NETWORK_TIMEOUT_MS });
+  } catch (err) {
+    return { ok: false, reason: `could not fetch ${ref}: ${firstLine(err)}` };
+  }
+  try {
+    const text = showFile(ref, '.claude/pipeline.yml', o);
+    if (text === null) return { ok: false, reason: `${ref} has no .claude/pipeline.yml` };
+    const parsed = validateConfig(parseYaml(text));
+    if (!parsed.ok) return { ok: false, reason: `${ref}'s .claude/pipeline.yml is not a valid config: ${parsed.errors.slice(0, 2).join('; ')}` };
+    const v = parsed.config.verify;
+    return {
+      ok: true, ref, branch, sha: revParse(`${ref}^{commit}`, o),
+      deferrable: v.deferrable_steps ?? [], proof: v.ci_proof ?? {}, inputs: v.ci_proof_inputs ?? [],
+    };
+  } catch (err) {
+    return { ok: false, reason: `could not read the proof settings from ${ref}: ${firstLine(err)}` };
+  }
+}
+
+// The first path of the PR diff (against the base, renames on both sides) that is a protected input, else null. Throws when the diff
+// cannot be taken: the caller treats that as ineligible.
+function protectedInputHit({ root, settings }) {
+  const globs = [...CI_PROOF_PROTECTED, ...settings.inputs];
+  for (const file of diffFiles(settings.ref, 'HEAD', { cwd: root })) {
+    for (const p of pathsOf(file)) if (globs.some((g) => matchGlob(p, g, { nocase: true }))) return p;
+  }
+  return null;
+}
+
+// One deferred step -> { proof } (GitHub vouches for it) or { problem } (why the gate cannot accept the deferral). Fail closed: every
+// path that is not an explicit 'pass' from ciProof with a run attached is a problem, and a throw anywhere is ci-proof-missing.
+async function proveDeferredStep({ step, ctx }) {
+  const missing = (why) => ({ problem: `ci-proof-missing:${step} (${why})` });
+  try {
+    const settings = ctx.settings();
+    if (!settings.ok) return missing(settings.reason);
+    if (!settings.deferrable.includes(step)) return missing(`${settings.ref} does not list ${step} in verify.deferrable_steps`);
+    const spec = Object.hasOwn(settings.proof, step) ? settings.proof[step] : undefined;
+    if (!isObject(spec)) return missing(`${settings.ref} has no verify.ci_proof entry for ${step}`);
+    const hit = ctx.protectedHit();
+    if (hit !== null) return missing(`this PR changes ${hit}, an input of the CI proof, so only a local run can vouch for ${step}`);
+    const res = await ctx.ciProof({
+      root: ctx.root, step, spec: structuredClone(spec), pr: ctx.pr, head: ctx.head, tree: ctx.tree,
+      base: { ref: settings.branch, sha: settings.sha }, gh: ctx.gh, env: ctx.env,
+    });
+    const state = isObject(res) ? res.state : undefined;
+    const why = typeof res?.reason === 'string' && res.reason.trim() ? res.reason.trim() : 'no reason given';
+    if (!CI_PROOF_STATES.has(state)) return missing(`the CI proof lookup returned ${JSON.stringify(state)}`);
+    if (state === 'pending') return { problem: `ci-proof-pending:${step} (${why})` };
+    if (state === 'failure') return { problem: `ci-proof-failed:${step} (${why})` };
+    if (state === 'missing') return missing(why);
+    if (!isObject(res.run)) return missing('the CI proof lookup said pass but named no run');
+    return { proof: { step, source: 'ci', run: res.run } };
+  } catch (err) {
+    return missing(`the CI proof lookup failed: ${firstLine(err)}`);
+  }
+}
+
+// `proofs` is an out-array: filled (in report order) only when this check passes, with where each deferrable step was proved.
+export async function verifyReportCheck({ root, config, head, tree, o, pr, gh, env, ciProof, proofs = [] }) {
   let report;
   try {
     report = JSON.parse(readFileSync(resolve(root, config.verify.report), 'utf8'));
@@ -284,13 +358,60 @@ function verifyReportCheck({ root, config, head, tree, o }) {
   }
   // A skipped step is accepted only when the owner listed it in verify.skippable_steps and it says why; anything else that
   // is not a plain pass (fail, not-run, an unknown status) is refused as before.
+  // verify.deferrable_steps (T2) adds a second, separate kind of skip: a step whose local run GitHub's run replaces. Such a step
+  // may be reported only as a pass, or as `skipped` with skipKind "ci" (accepted only with a CI proof read from the base branch);
+  // a step in BOTH lists must say whether it was skipped locally (skipKind "local": today's rule) or deferred ("ci").
+  // A step only in skippable_steps keeps the legacy rule untouched, except that a row claiming a CI deferral is refused there.
   const skippable = Array.isArray(config.verify.skippable_steps) ? config.verify.skippable_steps : [];
-  const skips = (steps ?? []).map(skipOf).filter(Boolean);
-  const notPassed = (steps ?? []).filter((s) => s?.status !== 'pass' && skipOf(s) === null).map((s) => `${s?.name}=${s?.status}`);
+  const deferrable = Array.isArray(config.verify.deferrable_steps) ? config.verify.deferrable_steps : [];
+  const rows = steps ?? [];
+  const skips = rows.map(skipOf).filter(Boolean);
+  const notPassed = rows.filter((s) => s?.status !== 'pass' && skipOf(s) === null).map((s) => `${s?.name}=${s?.status}`);
   if (notPassed.length) problems.push(`steps not passing: ${notPassed.join(', ')}`);
-  for (const k of skips) {
-    if (!skippable.includes(k.name)) problems.push(`step ${k.name} was skipped; list it in verify.skippable_steps to allow that`);
-    else if (k.reason === '') problems.push(`step ${k.name} was skipped without a reason`);
+  const toProve = [];
+  for (const row of rows) {
+    const k = skipOf(row);
+    if (k === null) continue;
+    const legacyRule = () => {
+      if (!skippable.includes(k.name)) problems.push(`step ${k.name} was skipped; list it in verify.skippable_steps to allow that`);
+      else if (k.reason === '') problems.push(`step ${k.name} was skipped without a reason`);
+    };
+    if (!deferrable.includes(k.name)) {
+      if (k.kind === 'ci') problems.push(`step ${k.name} was deferred to CI; list it in verify.deferrable_steps to allow that`);
+      else legacyRule();
+      continue;
+    }
+    const kinds = skippable.includes(k.name) ? 'skipKind "local" or "ci"' : 'skipKind "ci"';
+    if (row.status !== 'skipped') problems.push(`step ${k.name} is deferrable: report it as pass or as skipped with ${kinds}, not as a legacy skip`);
+    else if (k.kind === 'ci') toProve.push(k.name);
+    else if (k.kind === 'local' && skippable.includes(k.name)) legacyRule();
+    else problems.push(`step ${k.name} is deferrable: it was skipped with ${k.kind === undefined ? 'no skipKind' : `skipKind ${JSON.stringify(k.kind)}`}, expected ${kinds}`);
+  }
+
+  // CI proof for every deferred step. The base-branch settings and the protected-input scan are computed once, on first use.
+  const ciProved = new Map();
+  if (toProve.length > 0) {
+    let settings;
+    let hit;
+    const ctx = {
+      root, pr, head, tree, gh, env, ciProof: ciProof ?? defaultCiProof,
+      settings: () => (settings ??= baseProofSettings({ root, config })),
+      protectedHit: () => {
+        if (hit === undefined) {
+          try {
+            hit = protectedInputHit({ root, settings: ctx.settings() });
+          } catch (err) {
+            hit = `(the PR diff could not be read: ${firstLine(err)})`;
+          }
+        }
+        return hit;
+      },
+    };
+    for (const step of new Set(toProve)) {
+      const r = await proveDeferredStep({ step, ctx });
+      if (r.proof) ciProved.set(step, r.proof);
+      else problems.push(r.problem);
+    }
   }
 
   const g = isObject(report.git) ? report.git : {};
@@ -304,7 +425,13 @@ function verifyReportCheck({ root, config, head, tree, o }) {
   if (!Number.isFinite(finished)) problems.push('finishedAt is missing or not a date');
   else if (finished < commitTime(head, o)) problems.push('report finished before the HEAD commit was made');
 
-  return problems.length ? check('verify-report', false, problems.join('; ')) : check('verify-report', true, `full verify passed at ${short(head)} (${steps.length} steps${skips.length ? `: ${steps.length - skips.length} ran, ${skips.length} skipped: ${skips.map((k) => `${k.name} \u2014 ${clip(k.reason, SKIP_REASON_SHOWN)}`).join('; ')}` : ''})`);
+  if (problems.length) return check('verify-report', false, problems.join('; '));
+  for (const row of rows) {
+    if (ciProved.has(row.name)) proofs.push(ciProved.get(row.name));
+    else if (row.status === 'pass' && deferrable.includes(row.name)) proofs.push({ step: row.name, source: 'local' });
+  }
+  const via = ciProved.size > 0 ? `; CI proof: ${[...ciProved.values()].map((p) => `${p.step} via run ${p.run.id ?? '?'} attempt ${p.run.attempt ?? '?'}`).join(', ')}` : '';
+  return check('verify-report', true, `full verify passed at ${short(head)} (${steps.length} steps${skips.length ? `: ${steps.length - skips.length} ran, ${skips.length} skipped: ${skips.map((k) => `${k.name} \u2014 ${clip(k.reason, SKIP_REASON_SHOWN)}`).join('; ')}` : ''}${via})`);
 }
 
 async function hardstopsCheck({ root, config, diff }) {
@@ -484,7 +611,7 @@ async function safely(name, fn) {
 
 // Runs every check (no short-circuit, so one run reports every problem). A gh failure on the PR lookup itself throws:
 // the caller maps it to exit 3, because without the PR there is nothing to judge.
-export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultSleep }) {
+export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultSleep, ciProof = defaultCiProof }) {
   const o = { cwd: root };
   const head = headSha(o);
   const info = await readPrSettled({ gh, pr, fields: [...PR_FIELDS], sleep, pauseMs: mergeablePause(env) });
@@ -506,11 +633,12 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
     repo = gh.repo().slug;
   } catch { /* recorded as null */ }
 
+  const proofs = [];
   const checks = [
     await safely('pr-open', () => prOpenCheck({ info, head, config, behind: behindBase({ info, diff, root, config }) })),
     await safely('labels', () => labelsCheck(info)),
     await safely('preflight', () => preflightCheck({ root, env, gh })),
-    await safely('verify-report', () => verifyReportCheck({ root, config, head, tree, o })),
+    await safely('verify-report', () => verifyReportCheck({ root, config, head, tree, o, pr, gh, env, ciProof, proofs })),
     await safely('hardstops', () => hardstopsCheck({ root, config, diff })),
     await safely('integrity', () => integrityCheck({ config, diff })),
     await safely('review', () => reviewCheck({ root, config, pr, diff, hash, hashError })),
@@ -535,6 +663,9 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
     // #58: the owner-item set as one digest ('none' without items). The owner's "merge" is recorded against it, and P merge needs the
     // live gate to show the same set: an item added or swapped after the owner said "merge" (same head) needs a new "merge".
     ownerItems: ownerItemsDigest(checks.flatMap((c) => c.ownerItems ?? [])),
+    // Where each deferrable verify step was proved (T2): [{ step, source: 'local' }] or [{ step, source: 'ci', run: {...} }]. Only present
+    // for a repo that configures verify.deferrable_steps, and only when verify-report passed; P merge records it.
+    ...(proofs.length > 0 && checks.find((c) => c.name === 'verify-report')?.ok ? { proofs } : {}),
     failed: checks.filter((c) => !c.ok).map((c) => c.name),
     at: new Date().toISOString(),
   };

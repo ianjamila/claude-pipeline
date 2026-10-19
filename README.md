@@ -244,6 +244,8 @@ head you did not review (the receipt names the head the event carried).
   mode (skills and CLI only) and preflight says so.
 - **Local verify, lean CI.** The full verify runs on your machine; CI keeps the repo's existing
   checks plus the cheap guard jobs, and runs E2E only for high-risk PRs.
+- **Verify slots are per machine.** `verify.max_parallel_full` limits full verifies on one computer, not across your machines, and the
+  `verify.max_load` check is skipped on Windows (with a warning).
 - **Agent log lives on its own branch.** `docs/agent-log.md` can't be pushed to `main` directly and a file every PR edits would
   conflict, so each run's outcome line is pushed to the orphan branch `pipeline-agent-log` (never into a PR). If that push
   fails, the line stays queued and goes out with the next run. The PR's summary comment is the immediate record.
@@ -263,6 +265,54 @@ and `ci.approvers` (logins whose approval labels count; required for org-owned r
 fail closed with `org-repo-needs-ci.approvers`). `pipeline config` prints `warnings` for config that is valid
 but suspicious. Documentation and test files are exempt from the content rules (sensitive terms, SQL, auth) but keep
 one: a real-looking secret key literal (not marked fake inside the key itself) is still a `needs-human` hit there.
+
+### Faster verify (opt-in)
+
+Three groups of optional `verify` keys cut the wait without weakening the checks that matter. Leave them unset and
+nothing changes: every verify is the full one, and runs at once.
+
+```yaml
+verify:
+  after_fix: quick                 # full (default) | quick
+  after_fix_steps_by_path:         # glob -> steps to add when a fix touches a match
+    "supabase/**": [db, db-grants]
+  after_fix_never: [sql-arms]      # steps that must always run in a full verify
+  max_parallel_full: 2             # at most 2 full verifies at once on this machine
+  max_load: 12                     # then wait while the 1-minute load average is above 12
+  max_load_wait_minutes: 10        # ... for at most this long (default 10, maximum 10)
+```
+
+- `after_fix`: what the verifier runs after review fixes are accepted. `quick` runs `verify.quick`, plus
+  `verify.full --only <steps>` for the steps whose paths (`after_fix_steps_by_path`) the fixes touched. The first full
+  verify, and the gate's fresh full verify on the exact head that will merge, are always full and unchanged.
+  `pipeline verify plan-after-fix --round R` prints the commands.
+- `after_fix_never`: steps that may only run as part of a full verify. Listing one in `after_fix_steps_by_path` too is a config error.
+- `max_parallel_full` (positive integer): full verifies of all repos on this machine share that many slots; the rest wait
+  in arrival order (`pipeline verify slot --status` shows who holds them; `pipeline verify slot --run` runs only the repo's own `verify.full` in a slot, never another command). `max_load` and `max_load_wait_minutes` add a
+  wait for a quiet machine after the slot is taken; when the time is up the verify runs anyway, with a warning.
+
+A fourth, stricter group lets GitHub's own test run replace one slow local step at the final gate:
+
+```yaml
+verify:
+  deferrable_steps: [sql-arms]     # steps whose local run a GitHub Actions run may replace
+  ci_proof:
+    sql-arms: { workflow: .github/workflows/migration-replay.yml, job: "SQL arms", event: pull_request }
+  ci_proof_inputs: [supabase/tests/sql-arms/**]   # extra paths that make a PR ineligible
+  ci_proof_wait_minutes: 20        # how long ship waits for that run (unset = it does not wait)
+```
+
+- Safety rule: the Mac is skipped for a step only when the final gate finds a passed run of exactly that workflow file and job, on this
+  exact commit, for this pull request (not a fork), whose merged test copy has the same files as the pull request's head, and the pull
+  request changed neither the CI setup (`.github/**`), the pipeline settings, the verify scripts nor `ci_proof_inputs`. The three settings are
+  read from the main branch, never from the pull request. Anything unclear (no run, still running, cancelled, a GitHub error) sends the step
+  back to the Mac; `merge` records which proof was used (Mac, or GitHub run and attempt) on the pull request.
+- `ci_proof_wait_minutes` is the longest ship waits for the GitHub run before it runs the step on the Mac instead; set it from the measured CI time.
+- Rollout: eaglewatch enables `ci_proof` only after its PR B (draft runs, always-report, sharded jobs with one aggregator job) and one measured database PR.
+  Until then it uses only `after_fix` and the slot limit.
+
+Rollout: the config rejects unknown keys, so set these in a repo only after every machine that works on it has run
+`pipeline update` to a version that knows them.
 
 | Variable | Meaning |
 |---|---|

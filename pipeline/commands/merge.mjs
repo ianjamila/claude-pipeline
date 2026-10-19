@@ -13,6 +13,7 @@ import { headSha } from '../lib/git.mjs';
 import { currentProduction } from '../lib/deploy.mjs';
 import { envWithGhDir, runShellAsync } from '../lib/proc.mjs';
 import { postEvent } from '../lib/run-events.mjs';
+import { proofLine } from '../lib/run-record.mjs';
 import { readSummaryComment } from '../lib/summary-comment.mjs';
 import { createRunRecorder, inFlightSince } from '../lib/run-progress.mjs';
 import { bringUpToDate, updateTiming } from '../lib/updatebranch.mjs';
@@ -24,7 +25,7 @@ import {
 
 export const meta = {
   summary: 'merge the PR if (and only if) the final gate passes again, live; waits for MERGED',
-  usage: 'pipeline merge --pr N [--owner-approved-head SHA --owner-approved-items DIGEST] [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?, warnings?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment. While it runs the run record of the PR shows inFlight {kind: merge} and step merge; a prod-before event comment (the known-good deployment) is posted before the merge command, and when that post fails nothing is merged (error pre-merge); warnings lists a run record write that failed (never fatal). A run record marked resumed (`P checkpoint --resumed`: a run taken over by ship resume) refuses with error pre-merge unless the owner approved it; so does a run record that cannot be checked (unreadable, invalid or unsupported: it may be a resumed one), and with owner_approval: chat a gate with ownerMerge > 0. Approved = --owner-approved-head names the full gate head, --owner-approved-items the gate\'s ownerItems, AND the owner-go hook recorded the owner\'s \"merge\" for exactly that PR, head and item set (the flags alone refuse); the live gate must still show those ownerItems',
+  usage: 'pipeline merge --pr N [--owner-approved-head SHA --owner-approved-items DIGEST] [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?, warnings?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment. While it runs the run record of the PR shows inFlight {kind: merge} and step merge; a prod-before event comment (the known-good deployment) is posted before the merge command, and when that post fails nothing is merged (error pre-merge); for a repo with verify.deferrable_steps the proofs of the live gate (where each deferrable step was proved: the Mac, or a GitHub run and attempt) are recorded in the run record and in an append-only ci-proof-used event comment before the merge command too, and when either write fails nothing is merged (error pre-merge); warnings lists a run record write that failed (never fatal). A run record marked resumed (`P checkpoint --resumed`: a run taken over by ship resume) refuses with error pre-merge unless the owner approved it; so does a run record that cannot be checked (unreadable, invalid or unsupported: it may be a resumed one), and with owner_approval: chat a gate with ownerMerge > 0. Approved = --owner-approved-head names the full gate head, --owner-approved-items the gate\'s ownerItems, AND the owner-go hook recorded the owner\'s \"merge\" for exactly that PR, head and item set (the flags alone refuse); the live gate must still show those ownerItems',
 };
 
 const APPROVAL_FLAGS = "--owner-approved-head <full head> --owner-approved-items <the gate's ownerItems>";
@@ -173,6 +174,26 @@ export const run = guarded(async (argv, ctx) => {
           const reason = 'could not record the rollback target on the PR (prod-before event)';
           return refuse('pre-merge', [reason], { reason, detail: String(err?.message ?? err).slice(0, 200) });
         }
+      }
+
+      // 3d. Which proof each deferrable verify step stood on (T2: the Mac, or a GitHub run), taken from THIS live evaluation, never the
+      // saved gate (gate passed on run A, now run B: B is recorded). Fail CLOSED like 3c: the append-only event first, then the run
+      // record, and when either cannot be written nothing is merged. A repo without verify.deferrable_steps has no proofs: no calls.
+      const proofs = Array.isArray(fresh.proofs) ? fresh.proofs : [];
+      if (proofs.length > 0) {
+        const refuseProof = (why, detail) => {
+          const reason = `could not record the verify proof on the PR (${why})`;
+          return refuse('pre-merge', [reason], { reason, ...(detail ? { detail: String(detail).slice(0, 200) } : {}) });
+        };
+        try {
+          postEvent(gh, pr, 'ci-proof-used', `pr${pr}-${gate.head.slice(0, 12)}`,
+            `Verify proof used to merge #${pr} at ${gate.head.slice(0, 12)}: ${proofs.map(proofLine).join('; ')}.`, {
+              repo: gh.repo().slug, pr, head: gate.head, proofs,
+            });
+        } catch (err) {
+          return refuseProof('ci-proof-used event', err?.message ?? err);
+        }
+        if (recorder.update({ proofs }) === null) return refuseProof('run record', recorder.warnings.at(-1));
       }
 
       // 4. Merge with the approved head (fill is strict: a missing {sha} throws instead of merging whatever head exists).

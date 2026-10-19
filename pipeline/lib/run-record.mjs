@@ -4,6 +4,7 @@
 // pass `now` and `host`).
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { MARKERS, clip, line } from './render.mjs';
+import { MAX_PROOFS, MAX_PROOF_STEP } from './config.mjs';
 import { addCostEntry, addRetries, addSessions, costLines, costShapeProblem, setGuardBlocks } from './run-cost.mjs';
 
 export const RECORD_VERSION = 1;
@@ -129,6 +130,11 @@ function shapeProblem(r) {
   if (!r.history.every(isPlainObject)) return 'bad history entry';
   if (r.inFlight != null && !isPlainObject(r.inFlight)) return 'bad inFlight';
   if (r.heartbeat != null && !isPlainObject(r.heartbeat)) return 'bad heartbeat';
+  // `proofs` is optional too (only a merge of a repo with verify.deferrable_steps writes it).
+  if (r.proofs !== undefined) {
+    const why = proofsProblem(r.proofs);
+    if (why) return `bad proofs: ${why}`;
+  }
   // `cost` is optional: a record from before cost attribution has none.
   return costShapeProblem(r.cost);
 }
@@ -163,6 +169,55 @@ export function bindRecord(record, { repo, pr, branch }) {
 
 const text = (v, max) => clip(String(v ?? '').trim(), max);
 
+// ---- verify proofs (T2): where each deferrable verify step was proved when the PR merged -----------------------------------
+// [{ step, source: 'local' }] (the Mac ran it) or [{ step, source: 'ci', run: { id, attempt, jobId, workflow, job, url } }] (GitHub's run
+// vouched for it). Written by `P merge` from its live gate evaluation; display + audit (the append-only ci-proof-used event is the copy
+// that survives a rewritten record).
+// MAX_PROOFS / MAX_PROOF_STEP (defined in config.mjs, the vendored module) are the one source of the limits: config validation (verify.deferrable_steps, verify.ci_proof) enforces
+// them too, so a config the validator accepts can never produce proofs this record refuses (merge would then refuse forever).
+export { MAX_PROOFS, MAX_PROOF_STEP };
+const PROOF_STEP = new RegExp(`^[A-Za-z0-9._:-]{1,${MAX_PROOF_STEP}}$`);
+const RUN_COUNTERS = ['id', 'attempt', 'jobId'];
+
+function proofProblem(p) {
+  if (!isPlainObject(p) || !isStr(p.step) || !PROOF_STEP.test(p.step)) return 'bad step name';
+  if (p.source === 'local') return p.run === undefined ? null : 'a local proof names no run';
+  if (p.source !== 'ci') return 'unknown source';
+  const r = p.run;
+  if (!isPlainObject(r)) return 'a ci proof needs a run';
+  if (!RUN_COUNTERS.every((k) => Number.isInteger(r[k]) && r[k] > 0)) return 'run id, attempt and jobId must be positive whole numbers';
+  if (!['workflow', 'job', 'url'].every((k) => isStr(r[k]) && r[k] !== '')) return 'run workflow, job and url must be text';
+  return null;
+}
+
+export function proofsProblem(proofs) {
+  if (!Array.isArray(proofs)) return 'proofs is not a list';
+  if (proofs.length > MAX_PROOFS) return `more than ${MAX_PROOFS} proofs`;
+  for (const p of proofs) {
+    const why = proofProblem(p);
+    if (why) return why;
+  }
+  return null;
+}
+
+// A NEW, trimmed copy; throws (naming the problem) on anything malformed, so a bad proof can never be recorded half-way.
+export function normaliseProofs(proofs) {
+  const why = proofsProblem(proofs);
+  if (why) throw new Error(`proofs: ${why}`);
+  return proofs.map((p) => (p.source === 'local'
+    ? { step: p.step, source: 'local' }
+    : {
+      step: p.step, source: 'ci',
+      run: {
+        id: p.run.id, attempt: p.run.attempt, jobId: p.run.jobId,
+        workflow: clip(p.run.workflow, LIMITS.title), job: clip(p.run.job, LIMITS.title), url: clip(p.run.url, LIMITS.text),
+      },
+    }));
+}
+
+// "<step> proof: GitHub run <id> attempt <n>" or "<step> proof: Mac".
+export const proofLine = (p) => `${line(p.step)} proof: ${p.source === 'ci' ? `GitHub run ${p.run.id} attempt ${p.run.attempt}` : 'Mac'}`;
+
 function normaliseTask(t, previous) {
   if (!isPlainObject(t) || t.id === undefined || t.id === null || String(t.id) === '') throw new Error('a task needs an id');
   if (String(t.id).length > MAX_TASK_ID) throw new Error(`task id ${JSON.stringify(String(t.id).slice(0, 20))}… is longer than ${MAX_TASK_ID} characters`);
@@ -187,7 +242,7 @@ function normaliseInFlight(v) {
 
 // Returns a NEW record. `patch` keys (all optional): step, outcome, next, detail, head, request, tasks (the full list,
 // done kept for ids it omits `done` for), done (ids to mark done), verify, round, mergeSha, inFlight (object | null),
-// agentLogLine, cliVersion, cost ({entry: {phase, role, input, output, cacheRead, cacheWrite, usd}, retries: n to add, sessions: [ids], guardBlocks: n | null, guardBySession: {id: n}; see run-cost.mjs), resumed ({at, host, head}: a run taken over by `ship resume`; set once, never cleared). Every call stamps the heartbeat and appends a history entry (capped, oldest dropped).
+// agentLogLine, cliVersion, proofs ([{step, source: 'local'} | {step, source: 'ci', run: {id, attempt, jobId, workflow, job, url}}], replaces the list; set by `P merge`), cost ({entry: {phase, role, input, output, cacheRead, cacheWrite, usd}, retries: n to add, sessions: [ids], guardBlocks: n | null, guardBySession: {id: n}; see run-cost.mjs), resumed ({at, host, head}: a run taken over by `ship resume`; set once, never cleared). Every call stamps the heartbeat and appends a history entry (capped, oldest dropped).
 export function applyCheckpoint(record, patch, { host, now }) {
   const next = structuredClone(record);
   if (patch.step !== undefined) {
@@ -218,6 +273,7 @@ export function applyCheckpoint(record, patch, { host, now }) {
   if (patch.mergeSha !== undefined) next.mergeSha = patch.mergeSha;
   if (patch.inFlight !== undefined) next.inFlight = normaliseInFlight(patch.inFlight);
   if (patch.agentLogLine !== undefined) next.agentLogLine = patch.agentLogLine;
+  if (patch.proofs !== undefined) next.proofs = normaliseProofs(patch.proofs);
   if (patch.cliVersion !== undefined) next.cliVersion = patch.cliVersion;
   if (patch.cost != null) {
     if (!isPlainObject(patch.cost)) throw new Error('cost must be an object');
@@ -288,6 +344,7 @@ export function renderStatusBlock(record) {
     `- **Head:** ${head} · **Round:** ${line(r.round ?? 0)}${total ? ` · **Tasks:** ${done}/${total} done` : ''}`,
   ];
   if (f) out.push(`- **In flight:** ${line(f.kind)} on ${line(f.host)} since ${line(f.startedAt)}${f.maxMinutes ? ` (max ${line(f.maxMinutes)} min)` : ''}`);
+  for (const p of Array.isArray(r.proofs) ? r.proofs : []) out.push(`- ${proofLine(p)}`);
   out.push(...costLines(r.cost));
   if (r.detail) out.push(`- **Detail:** ${line(r.detail, LIMITS.text)}`);
   out.push(
