@@ -63,3 +63,4 @@ full record.
 - 2026-10-19 · #81 · fix(guards): fewer false alarms after #75 + about a dozen bypasses closed (#74, #76) · risk high · rounds 6 · arbiter 0 · merged
 - 2026-10-19 · #87 · fix(inbox): never suggest close on age alone; never suggest merge when mergeability is unknown · risk high · rounds 1 · arbiter 0 · merged
 - 2026-10-19 · #83 · feat(stacks): stop private Supabase stacks nobody uses (measure-first) · risk high · rounds 7 · arbiter 0 · awaiting-owner-merge
+- 2026-10-19 · #83 · feat(stacks): stop private Supabase stacks nobody uses (measure-first) · risk high · rounds 7 · arbiter 0 · merged
