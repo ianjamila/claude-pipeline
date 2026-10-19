@@ -503,3 +503,18 @@ test('t9 both guards open the shell-script bins a runner or yarn / pnpm / bun ru
   assert.equal(f('npx other', shell).decision, 'allow');
   assert.equal(f('npx js', { ...shell, 'node_modules/.bin/js': `#!/usr/bin/env node\n${BAD_FILES}\n` }).decision, 'allow', 'a program in another language in node_modules is not ours to judge');
 });
+
+// ---- control parity: nothing main refused is allowed now (probed against 9b0b862 on 122 lines; these are the shapes that write a protected path or push straight from a package-manager line) ----------------
+test('t9 a package-manager line that writes a protected path or pushes directly stays refused, with or without a package.json', () => {
+  const T = `~/${CL}/settings.json`;
+  const D = `~/${CL}`;
+  const filesLines = [`npx foo > ${T}`, `npx prettier . > ${T}`, `npm exec -- cp a ${T}`, `npm exec cp a ${T}`, `npx cp a ${T}`, `npx -c 'cp a ${T}'`, `npm pkg set a=b --prefix ${D}`, `npm install --prefix ${D}`, `cd ${D} && npm init -y`,
+    `npm run x > ${T}`, `npm test > ${T}`, `npm ls > ${T}`, `npm --version > ${T}`, `npm run > ${T}`, `pnpm run x > ${T}`, `yarn x > ${T}`, `bun run x > ${T}`, `pnpm exec cp a ${T}`, `pnpm dlx cp a ${T}`, `yarn dlx cp a ${T}`, `bunx cp a ${T}`,
+    `npm run x -- ${T}`, `npm run x --prefix ${D}`, `npm --prefix ${D} run x`, `npm cache clean --cache ${D}`, `npm run x 2> ${T}`, `env npm run x > ${T}`, `corepack npm run x > ${T}`, `npm run x | tee ${T}`, `npx x; cp a ${T}`, `npm run x && cp a ${T}`,
+    `tee ${T} < <(npm ls)`, `cd ${D}; npm run x`, `cd ${D}/skills && npm test`];
+  const gitLines = [`npm run x && ${BAD_GIT}`, `npm run x; ${BAD_GIT}`, `npx foo && ${BAD_GIT}`, `npm exec -- ${BAD_GIT}`, `npx ${BAD_GIT}`, `pnpm exec ${BAD_GIT}`, `yarn dlx ${BAD_GIT}`, `pnpm -r exec ${BAD_GIT}`, `npm_config_prefix=/e npm run x; ${BAD_GIT}`];
+  for (const tree of [{}, { 'package.json': pkg({ x: 'echo hi', lint: 'echo lint' }) }]) {
+    for (const cmd of filesLines) assert.equal(filesGuard(cmd, tree).decision, 'deny', `files: ${cmd}`);
+    for (const cmd of gitLines) assert.equal(git(cmd, tree).decision, 'deny', `git: ${cmd}`);
+  }
+});
