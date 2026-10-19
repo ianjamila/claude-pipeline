@@ -138,3 +138,26 @@ test('H1 a target with more defaults than the scan reads is refused as before (t
   const r = deny(`echo y > ~/${'${a:-x}'.repeat(14)}/f`);
   assert.ok(r.reason);
 });
+
+// ---- the subscript-body scan is bounded, and the bound fails closed (#81: `a[a[a[…` was 100x slower than main) ----------------------------------------------------------
+test('H2 overlapping subscripts: past the body budget the arithmetic scan answers dynamic (fail closed); a line under it is read in full as before', async () => {
+  const { arithAssignedNames } = await import('../pipeline/hooks/lib/shell-parse.mjs');
+  const capped = arithAssignedNames('a['.repeat(100000));
+  assert.equal(capped.dynamic, true, 'every name the line gave is unsure when the subscripts cannot all be read');
+  assert.equal(arithAssignedNames('a['.repeat(1000)).dynamic, false, 'a line under the budget is read in full');
+  const closed = arithAssignedNames('a[n=7] '.repeat(30000));
+  assert.deepEqual([...closed.names], ['n'], 'closed subscripts are short: 30,000 of them are under the budget');
+  assert.equal(closed.dynamic, false);
+  assert.ok(arithAssignedNames('${a[n=7]}').names.has('n'));
+});
+test('H2 a 200 kB line of nested name-subscripts is answered quickly by both guards, and the git guard still judges what follows', () => {
+  const line = fill('a[');
+  for (const run of [() => git(line), () => files(line)]) {
+    const t0 = cpu();
+    run();
+    const ms = cpu() - t0;
+    assert.ok(ms < 3000, `${Math.round(ms)} ms of CPU`);
+  }
+  const r = git(`${'a['.repeat(30000)}; git ${'pu' + 'sh'} origin ${'ma' + 'in'}`);
+  assert.equal(r.decision, 'deny', `git: ${r.reason ?? 'allowed'}`);
+});
