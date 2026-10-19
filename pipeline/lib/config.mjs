@@ -84,6 +84,7 @@ const PROVIDERS = ['vercel', 'github-deployments', 'other'];
 // Who owns the production smoke: the ship session (prod-watch) or a CI workflow that posts the result on the merged PR.
 const WATCH_MODES = ['session', 'workflow'];
 const AFTER_FIX_MODES = ['full', 'quick'];
+const SAFE_STEP = /^[A-Za-z0-9_.:-]+$/;
 
 // Allowed keys per mapping. Anything else is a typo (or a removed option) and is rejected.
 const KEYS = {
@@ -160,6 +161,8 @@ function checkAfterFix(verify, errors) {
       continue;
     }
     if (new Set(steps).size !== steps.length) errors.push(`${where} must not repeat a step name`);
+    // These names are put on a command line (`--only a,b`), so they stay shell-inert.
+    if (steps.every(isStr) && steps.some((n) => !SAFE_STEP.test(n))) errors.push(`${where}: step names may only use letters, digits and . _ : -`);
     if (neverOk) {
       const banned = steps.filter((n) => never.includes(n));
       if (banned.length) errors.push(`${where} lists step(s) that verify.after_fix_never forbids: ${banned.join(', ')}`);

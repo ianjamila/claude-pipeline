@@ -706,6 +706,7 @@ test('verify.after_fix: full (default) | quick; the by-path map and never list a
   const unknown = withVerify({ expected_steps: ['install'], after_fix_steps_by_path: { 'supabase/**': ['db'] } });
   assert.equal(unknown.ok, false);
   assert.ok(unknown.errors.some((e) => /after_fix_steps_by_path/.test(e) && /db/.test(e) && /expected_steps/.test(e)), unknown.errors.join('|'));
+  for (const bad of ['db;rm', 'a b', '$(x)', 'a,b']) assert.equal(withVerify({ after_fix_steps_by_path: { 'x/**': [bad] } }).ok, false, `shell-unsafe step ${bad}`);
   const tooComplex = withVerify({ after_fix_steps_by_path: { [Array(20).fill('*').join('/a')]: ['db'] } });
   assert.equal(tooComplex.ok, false, 'a glob the matcher refuses is a config error, not a runtime crash');
 });
