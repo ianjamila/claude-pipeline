@@ -295,7 +295,8 @@ function assignedValues(text) {
   const inline = new Set();
   for (const m of text.matchAll(INLINE_OP)) {
     const j = closeBrace(text, m.index + 1);
-    if (j < 0 || inline.size >= MAX_ASSIGN_ENTRIES) continue;
+    // (an expansion the scan cannot close, or one past the cap, would be read as written: the unknown word, like every other cap here)
+    if (j < 0 || (!inline.has(text.slice(m.index, j + 1)) && inline.size >= MAX_ASSIGN_ENTRIES)) return wildcard();
     inline.add(text.slice(m.index, j + 1));
   }
   for (const expr of inline) { found.push({ name: INLINE + expr, array: false, words: [expr] }); interesting++; }

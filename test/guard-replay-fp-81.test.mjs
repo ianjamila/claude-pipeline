@@ -41,12 +41,14 @@ const MENTION = /may have been written by an earlier command|guarded command|gua
 // ---- K2. a JavaScript method call, and a clustered commit message flag ---------------------------------------------------------------------------------------
 // `mounts.rw.push(x)` / `_.merge(a, b)` in a `node -e` program: a word between a dot and a parenthesis is a method call, never a git subcommand. `git commit -qm TEXT` hides TEXT like `-m TEXT`.
 test('K2 a JavaScript method call is not a mention of a guarded subcommand', () => {
-  for (const tail of [`node -e 'mounts.rw.${PUSH}(1)'`, `node -e 'lodash.${MERGE}(a, b)'`, `node -e 'rows.${PUSH} (r)'`, `node -e 'a.b.${PUSH}(1);b.${PUSH}(2)'`]) {
+  for (const tail of [`node -e 'mounts.rw.${PUSH}(1)'`, `node -e 'lodash.${MERGE}(a, b)'`, `node -e 'a.b.${PUSH}(1);b.${PUSH}(2)'`]) {
     const r = gitGuard(FETCH + tail);
     assert.equal(r.decision, 'allow', `${tail}: ${r.reason}`);
   }
   // ... a mention that is not a method call is still one
-  for (const tail of [`node -e 'x = "git ${PUSH} origin ${MAIN}"'`, `node -e 'mounts.rw.${PUSH}(1); y = "${PUSH}"'`, `node -e '${PUSH}(1)'`, `node -e 'z = a.${PUSH}'`, `node -e 'a.b.${MERGE} = 1'`,
+  for (const tail of [`node -e 'x = "git ${PUSH} origin ${MAIN}"'`, `node -e 'mounts.rw.${PUSH}(1); y = "${PUSH}"'`, `node -e '${PUSH}(1)'`, `node -e 'z = a.${PUSH}'`, `node -e 'a.b.${MERGE} = 1'`, `node -e 'rows.${PUSH} (r)'`,
+    // (zsh reads `word(N)` as a glob with a qualifier: with a file named like the word, `git ${PUSH}(N) origin ${MAIN}` runs the real subcommand; a dot with nothing to its left or a space before the parenthesis is no method call)
+    `git ${PUSH}(N) origin ${MAIN}`, `git ${MERGE}(N)`, `node -e '.${PUSH}(1)'`, `node -e ' .${MERGE}(1)'`, `node -e '(.${PUSH}(1))'`, `node -e '"x".${PUSH}(1)'`, `node -e '/.${PUSH}(1)'`,
     `node -e 'a.${PUSH}(1)'; echo ${PUSH}`, `echo ${MERGE}`, `git -C x ${PUSH}`, `git config alias.p ${PUSH}`]) {
     const r = gitGuard(FETCH + tail);
     assert.equal(r.decision, 'deny', `${tail} -> allowed`);
@@ -59,24 +61,35 @@ test('K2 git commit -qm / -am / -qam TEXT hides TEXT like -m TEXT; a word outsid
     const r = gitGuard(FETCH + c);
     assert.equal(r.decision, 'allow', `${c}: ${r.reason}`);
   }
+  // ... a substitution, a backtick, an arithmetic or process substitution inside the message is judged on its own (the text hidden is the one word the shell gives the flag, as for -m)
+  const SUB = `git ${PUSH} origin ${MAIN}`;
+  for (const flag of ['-m', '-qm', '-am', '-qam']) {
+    for (const c of [`git commit ${flag} "$(${SUB})"`, `git commit ${flag} "\`${SUB}\`"`, `git commit ${flag} $(${SUB})`, `git commit ${flag} "$((1+$(${SUB})))"`, `git commit ${flag} <(${SUB})`, `git commit ${flag}"$(${SUB})"`,
+      `git commit ${flag} "x $(${SUB}) y"`, `git commit ${flag} one ${PUSH}`, `git commit ${flag} 'a b' ${MERGE}`]) {
+      assert.equal(gitGuard(FETCH + c).decision, 'deny', `${FETCH}${c} -> allowed`);
+      if (c.includes('$') || c.includes('`') || c.includes('<(')) assert.equal(gitGuard(c).decision, 'deny', `${c} -> allowed`);
+    }
+  }
+  // ... the clustered spelling is a git commit's: another command's words after a flag that merely ends in m are not a message
+  for (const c of [`ssh -vm hmac-sha2 "git ${PUSH} origin ${MAIN}"`, `sh -nzm x "git ${PUSH} origin ${MAIN}"`, `bash -qm "git ${PUSH} origin ${MAIN}"`]) {
+    assert.equal(gitGuard(c).decision, 'deny', `${c} -> allowed`);
+    assert.equal(gitGuard(FETCH + c).decision, 'deny', `${FETCH}${c} -> allowed`);
+  }
   for (const c of [`git commit -qm "x" ${MERGE}`, `git commit -qm x; echo ${MERGE}`, `git commit -qam "x" -- ${PUSH}.txt`, `git commit -qa ${MERGE}`, `git commit -qm x && git ${PUSH}`, `git commit -qmx ${MERGE}`]) {
     const r = gitGuard(FETCH + c);
     assert.equal(r.decision, 'deny', `${c} -> allowed`);
   }
 });
 
-// ---- K3. a mention in a command that only reads ---------------------------------------------------------------------------------------------------------------
-// `grep -rn "MERGE_X" app`, `cat scripts/merge-pr.mjs | head -3`, `ls push-*`: the words of a command that only reads or lists name data. Others (echo, a git command, a program text, sed, awk) still count.
-test('K3 a guarded word in the arguments of a command that only reads is no mention; in an echo, a git command or a program text it still is', () => {
-  for (const c of [`grep -rn "${MERGE.toUpperCase()}_X" app | head -2`, `cat scripts/${MERGE}-pr.mjs | head -3`, `grep -c ${PUSH} log.txt`, `ls ${PUSH}-*`, `tail -8 ${MERGE}.log`, `diff a.txt ${MERGE}.txt`,
-    `rg ${PUSH} src`, `wc -l ${MERGE}.txt`, `stat ${PUSH}.log`, `file ${MERGE}.bin`, `du -sh ${PUSH}`, `cmp a ${MERGE}`, `head -3 /usr/bin/${PUSH}`, `/bin/cat ${MERGE}.txt`]) {
-    const r = gitGuard(FETCH + c);
-    assert.equal(r.decision, 'allow', `${c}: ${r.reason}`);
+// ---- K3 (dropped). a mention in the arguments of a command that only reads ------------------------------------------------------------------------------------
+// The guarded-mention scan is what refuses a script only known at run time (`bash $(...)`, `bash $F`), and the arguments of grep / cat / ls ... are exactly what a selector names it by:
+// `bash $(grep -l PATTERN scripts/*)`. Those words still count as a mention (an `rg --pre CMD`, or a function or alias named grep on the line, runs code too).
+test('K3 a guarded word in the arguments of grep / rg / cat / ls ... still counts as a mention (a run-time-only script is refused)', () => {
+  for (const c of [`grep -c ${PUSH} log.txt`, `cat scripts/${MERGE}-pr.mjs | head -3`, `ls ${PUSH}-*`, `tail -8 ${MERGE}.log`, `diff a.txt ${MERGE}.txt`, `rg --pre sh ${PUSH} src`, `wc -l ${MERGE}.txt`, `stat ${PUSH}.log`]) {
+    assert.equal(gitGuard(FETCH + c).decision, 'deny', `${c} -> allowed`);
   }
-  for (const c of [`echo ${PUSH}`, `printf ${MERGE}`, `git log --oneline origin/${MAIN}..HEAD; echo ${PUSH}`, `node -e 'console.log("${PUSH}")'`, `sed -n 1p ${PUSH}.txt`, `awk 1 ${MERGE}.txt`,
-    `grep x f; echo ${PUSH}`, `cat f; git ${PUSH}`, `ls f && git ${PUSH} origin ${MAIN}`, `cat f | xargs git ${PUSH}`, `cat f | sh -c "git ${PUSH}"`, `ls $(git ${PUSH} origin ${MAIN})`, `cat f; xargs ${PUSH} < f`]) {
-    const r = gitGuard(FETCH + c);
-    assert.equal(r.decision, 'deny', `${c} -> allowed`);
+  for (const c of [`bash $(grep -l "git ${PUSH} origin ${MAIN}" scripts/*)`, `bash $(rg -l ${PUSH} .)`, `F=$(ls ${PUSH}-*); bash $F`, `F=$(cat ${MERGE}.txt); bash $F`]) {
+    assert.equal(gitGuard(c).decision, 'deny', `${c} -> allowed`);
   }
 });
 
@@ -90,5 +103,33 @@ test('K4 a name of unknown value in the words of gh api / gh pr view names no pa
   }
   for (const cmd of ['cp x $SHA', 'gh run download 5 -D $SHA', 'gh release download v1 -D $SHA', 'gh pr checkout $SHA', 'gh repo clone o/r $SHA', 'gh api repos/o/r --output $SHA', 'tee $SHA < x']) {
     assert.equal(filesGuard(M + cmd).decision, 'deny', cmd);
+  }
+});
+
+// ---- K1 caps: past a cap the word is the unknown word, never the literal text ------------------------------------------------------------------------------------
+// (security review of #81 K1) More distinct inline expansions than the scan keeps (256) used to leave the later ones unrecorded, so a line padded with harmless ones and then
+// `F=ok; echo x > ~/${F/ok/.claude}/settings.json` was judged by its literal text. The scans' other caps (assignments, the parser's span budget, 200 kB) are pinned beside it.
+const SCRIPT_TWIN = `F=ok.sh; G=\${F/ok/run}; bash $G`;
+const gitWithScripts = (c) => gitGuard(c, { readText: (p) => (p.endsWith('/run.sh') ? `git ${PUSH} origin ${MAIN}` : p.endsWith('/ok.sh') ? 'echo ok' : null), pathExists: (p) => /\/(run|ok)\.sh$/.test(p) });
+const PADS = {
+  'distinct inline replace x300': 'echo ' + Array.from({ length: 300 }, (_, i) => `\${V/a/b${i}}`).join(' ') + '; ',
+  'distinct inline trim x300': 'echo ' + Array.from({ length: 300 }, (_, i) => `\${V#b${i}}`).join(' ') + '; ',
+  'unclosed inline': 'echo ${V/a/b; ',
+  'assignments with expansions x300': Array.from({ length: 300 }, (_, i) => `A${i}=\${U:-v${i}}`).join('; ') + '; ',
+  'plain assignments x4100': Array.from({ length: 4100 }, (_, i) => `A${i}=v`).join('; ') + '; ',
+  'parser span budget spent': 'echo ' + '${a'.repeat(20000) + '; ',
+  'nested spans': 'echo ' + '${x:-'.repeat(5000) + '}'.repeat(5000) + '; ',
+  'many plain expansions': 'echo ' + '${x} '.repeat(3000) + '; ',
+};
+test('K1 caps: a line padded past the scan caps still judges the later expansion (files guard)', () => {
+  const target = `F=ok; echo x > ~/\${F/ok/${CL}}/settings.json`;
+  for (const [name, pad] of Object.entries(PADS)) {
+    for (const c of [pad + target, target + '; ' + pad]) assert.equal(filesGuard(c).decision, 'deny', `${name}: allowed`);
+  }
+});
+test('K1 caps: a line padded past the scan caps still judges the script a computed name selects (git guard)', () => {
+  assert.equal(gitWithScripts(SCRIPT_TWIN).decision, 'deny');
+  for (const [name, pad] of Object.entries(PADS)) {
+    for (const c of [pad + SCRIPT_TWIN, SCRIPT_TWIN + '; ' + pad]) assert.equal(gitWithScripts(c).decision, 'deny', `${name}: allowed`);
   }
 });

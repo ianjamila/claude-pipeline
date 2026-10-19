@@ -1438,15 +1438,16 @@ function isolatedState(ctx, fn) {
 // heredoc body that feeds a non-shell is not a command at all)? The detector is the one used for interpreter files, plus the protection / ruleset /
 // issue-close shapes of gh and git.
 // The line as the guard reads it: every command's words without the values of prose flags (commit -m, --body ...). A heredoc body is not part of it.
-// (t11: the words of a command that only reads or lists -- a grep pattern, `cat scripts/merge-pr.mjs`, `ls push-*` -- name data, and there is no way to turn them into something that runs: the line does not "mention" a guarded operation by them)
-const DATA_READERS = new Set(['grep', 'egrep', 'fgrep', 'rg', 'ls', 'wc', 'stat', 'file', 'du', 'cat', 'head', 'tail', 'diff', 'cmp']);
+// (a `git ... commit` command: the only one whose clustered flags -qm, -am, -qam are read as -m)
+const isCommit = (argv) => baseName(argv[0] ?? '') === 'git' && argv.slice(1).includes('commit');
 function maskedLine(ctx) {
-  ctx.lineMasked ??= simpleCommands(ctx.lineText).filter((c) => c.argv.length).map((c) => [c.argv[0], ...(DATA_READERS.has(baseName(c.argv[0])) ? [] : dataLessArgs(c.argv.slice(1)))].join(' ')).join('\n');
+  ctx.lineMasked ??= simpleCommands(ctx.lineText).filter((c) => c.argv.length).map((c) => [c.argv[0], ...dataLessArgs(c.argv.slice(1), isCommit(c.argv))].join(' ')).join('\n');
   return ctx.lineMasked;
 }
 // ... a guarded command, or (strictly) a guarded word: the masked line as written and with its quotes and escapes stripped
-// (t11: a JavaScript method call -- `mounts.rw.push(x)`, `_.merge(a, b)` in a `node -e` program -- is no git subcommand: a git subcommand is never a word that follows a dot and precedes a parenthesis)
-const JS_METHOD_CALL = /\.\s*(?:push|merge)\s*\(/gi;
+// (t11: a JavaScript method call -- `mounts.rw.push(x)`, `_.merge(a, b)` in a `node -e` program -- is no git subcommand: the name follows a dot that is part of the same word, with something to its
+// left (`x.push(`). A bare `push(` or `.push(` is not excluded: in zsh `push(N)` is a glob with a qualifier that names the file `push`.)
+const JS_METHOD_CALL = /[\w$\])]\.(?:push|merge)\(/gi;
 const mentionsGuardedWord = (text) => GUARDED_WORDS.test(text.replace(JS_METHOD_CALL, '('));
 function lineMentionsGuarded(ctx) {
   const m = maskedLine(ctx);
@@ -1458,7 +1459,7 @@ function lineHoldsGuardedCommand(ctx) {
     ctx.lineHolds = false;
     for (const c of simpleCommands(ctx.lineText)) {
       if (!c.argv.length) continue;
-      const args = dataLessArgs(c.argv.slice(1));
+      const args = dataLessArgs(c.argv.slice(1), isCommit(c.argv));
       const text = [c.argv[0], ...args].join(' ');
       // (a push whose destination merely STARTS with main / master counts too: printf '%.19s' can cut a longer word down to it)
       if (guardedCommandText(text) || /git\s+(?:-\S+\s+)*push\b[^;&|\n]*\b(?:main|master)/i.test(text) || (['git', 'gh'].includes(baseName(c.argv[0])) && /(?:^|\s)(?:protection|ruleset|rulesets)(?=\s|$)|issue\s+close/i.test(text))) { ctx.lineHolds = true; break; }
