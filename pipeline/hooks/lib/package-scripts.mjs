@@ -263,7 +263,7 @@ export function pmCall(allWords) {
       if (w.startsWith('-')) {
         const kind = optKind(w, pm);
         if (kind === 'value' && !w.includes('=')) k++;
-        else if (kind === 'unknown' && !w.includes('=') && rest[k + 1] !== undefined && !rest[k + 1].startsWith('-') && !loose) loose = w;
+        else if (kind === 'unknown' && !loose) loose = w; // (an option the tables do not know may take the next word as its value, which shifts which word is the package)
         continue;
       }
       if (pkg === null) pkg = w; else cmd.push(w);
@@ -273,7 +273,7 @@ export function pmCall(allWords) {
     if (call.execText) {
       const said = words.slice(0, 5).join(' ');
       if (pkg === null || !EXPLORE_PKG.test(pkg) || pkg.split('/').some((x) => /^\.+$/.test(x))) call.unresolved = `the package directory \`${pkg}\` that \`${said}\` runs its command in is not a plain package name (a variable, a glob, \`..\` or a path), so which directory and which program it runs cannot be verified. Name the package.`;
-      else if (loose) call.unresolved = `the option \`${loose}\` is not known to the guard and may take the next word as its value, so which package \`${said}\` runs its command in cannot be verified. Write it as --name=value.`;
+      else if (loose) call.unresolved = `the option \`${loose}\` is not known to the guard and may take the next word as its value, so which word of \`${said}\` is the package and which is the command cannot be verified. Write it as --name=value.`;
     }
   }
   // exec forms the parser did not unwrap (options between `pnpm` and `exec`): the command is judged as a line of its own
@@ -695,13 +695,16 @@ function prefixRcFiles(call, dir, env, p, exists) {
       if (/^(["']).*\1$/.test(v)) v = v.slice(1, -1);
       else v = v.replace(/\s*[;#].*$/, '');
       v = v.trim();
-      if (v.includes('${')) {
-        let unknown = false;
-        v = v.replace(/\$\{([^}?-]+)([?-][^}]*)?\}/g, (all, name) => { const val = name === 'HOME' && env.home ? env.home : env.envValue?.(name); if (typeof val !== 'string') unknown = true; return val ?? ''; });
-        if (unknown || v.includes('${')) return bad(`${file} sets \`prefix\` with a variable (${line.trim()}) the guard does not know, so where the global npm configuration lies cannot be verified. Write the path out.`);
+      // (npm's envReplace: `${NAME}` and `${NAME?}`, NAME free of $ { } ? -- no `-` / `:-` operators, so `${VAR-x}` looks up a variable literally named `VAR-x`. Anything else with `${`, or an escape, is refused)
+      if (v.includes('${') || /\\\$/.test(v)) {
+        let unknown = /\\\$\{/.test(v);
+        if (!unknown) v = v.replace(/\$\{([^${}?]+)\??\}/g, (all, name) => { const val = name === 'HOME' && env.home ? env.home : env.envValue?.(name); if (typeof val !== 'string') unknown = true; return val ?? ''; });
+        if (unknown || v.includes('${')) return bad(`${file} sets \`prefix\` with a variable or an escape (${line.trim()}) the guard does not know how npm reads, so where the global npm configuration lies cannot be verified. Write the path out.`);
       }
       if (v === '') return bad(`${file} sets an empty \`prefix\`, so where the global npm configuration lies cannot be verified.`);
-      roots.push(v === '~' || v.startsWith('~/') ? p.join(env.home ?? '', v.slice(1)) : p.resolve(env.cwd ?? dir, v));
+      if (v === '~' || v.startsWith('~/')) roots.push(p.join(env.home ?? '', v.slice(1)));
+      else if (p.isAbsolute(v)) roots.push(v);
+      else return bad(`${file} sets a relative \`prefix\` (${line.trim()}), and the directory npm resolves it against is not something the guard verifies, so where the global npm configuration lies cannot be verified. Write the absolute path.`);
     }
   }
   if (call.dir !== null && call.dir !== undefined) roots.push(p.resolve(env.cwd ?? dir, call.dir === '~' || call.dir.startsWith('~/') ? p.join(env.home ?? '', call.dir.slice(1)) : call.dir));

@@ -114,7 +114,6 @@ test('t3 the user .npmrc prefix= names the directory of the global npmrc (script
   rcDenies('npm test', { '/home/u/.npmrc': 'prefix=~/.npm-global\n', '/home/u/.npm-global/etc/npmrc': 'script-shell=/tmp/s\n' }, {}, '~/ prefix');
   rcDenies('npm test', { '/home/u/.npmrc': 'prefix=${HOME}/.npm-global\n', '/home/u/.npm-global/etc/npmrc': 'script-shell=/tmp/s\n' }, {}, '${HOME} prefix');
   rcAllows('npm test', { '/home/u/.npmrc': 'prefix=${HOME}/.npm-global\n', '/home/u/.npm-global/etc/npmrc': 'registry=https://r.example\n' }, {}, '${HOME} prefix, harmless');
-  rcDenies('npm test', { '/home/u/.npmrc': 'prefix=glob\n', [`${GIT_ROOT}/glob/etc/npmrc`]: 'script-shell=/tmp/s\n', [`${PROJ}/glob/etc/npmrc`]: 'script-shell=/tmp/s\n' }, {}, 'relative prefix');
   // the project's own .npmrc may set it too (all are tried), and --prefix names the global one as well
   rcDenies('npm test', { '.npmrc': 'prefix=/x/pfx\n', '/x/pfx/etc/npmrc': 'script-shell=/tmp/s\n' }, {}, 'project .npmrc prefix');
   rcDenies('npm test --prefix /x/pfx', { '/x/pfx/package.json': pj, '/x/pfx/etc/npmrc': 'script-shell=/tmp/s\n' }, {}, '--prefix');
@@ -134,6 +133,30 @@ test('t3 a prefix the guard cannot work out is refused (an unknown ${VAR}, an em
   rcAllows('npm test', { '/home/u/.npmrc': '# prefix=${UNKNOWN_VAR}\n; prefix=\nregistry=https://r.example\n' }, {}, 'a commented-out prefix');
   // the scripts must run for the rc to matter
   assert.equal(git('npm ls', { ...base, '/home/u/.npmrc': 'prefix=${UNKNOWN_VAR}\n' }).decision, 'allow');
+});
+test('t3 a prefix in an rc is read as npm reads it: only ${NAME} and ${NAME?} expand; a relative value, an escape or any other ${...} form is refused', () => {
+  // (the review of c8cab6f: ${VAR-x} / ${VAR:-x} are no operators in npm -- it looks up a variable literally named `VAR-x`)
+  for (const line of ['prefix=${HOME-x}/p', 'prefix=${HOME:-/x}/p', 'prefix=${HOME:-}', 'prefix=${HOME}${UNKNOWN_VAR?}', 'prefix=\\${HOME}/p', 'prefix=/x/\\${HOME}', 'prefix=${HOME}/${', 'prefix=${}/p', 'prefix=${HOME', 'prefix=${HO${ME}}']) {
+    const r = rcDenies('npm test', { '/home/u/.npmrc': `${line}\n` }, {}, `prefix written as ${JSON.stringify(line)}`);
+    assert.match(r.git.reason, /prefix/);
+  }
+  rcAllows('npm test', { '/home/u/.npmrc': 'prefix=${HOME?}/.npm-global\n', '/home/u/.npm-global/etc/npmrc': 'registry=https://r.example\n' }, {}, '${HOME?} is the optional form of a known name');
+  rcDenies('npm test', { '/home/u/.npmrc': 'prefix=${HOME?}/.npm-global\n', '/home/u/.npm-global/etc/npmrc': 'script-shell=/tmp/s\n' }, {}, '${HOME?} read');
+  // a relative value: npm's base for it is not something the guard verifies
+  for (const line of ['prefix=glob', 'prefix=./glob', 'prefix=../glob', 'prefix=glob/x']) rcDenies('npm test', { '/home/u/.npmrc': `${line}\n` }, {}, `relative ${line}`);
+  rcAllows('npm test', { '/home/u/.npmrc': 'prefix=/abs/pfx\n' }, {}, 'absolute');
+});
+test('t3 npm explore: any option before the command that the guard does not know refuses (it may take the next word, shifting which one is the package)', () => {
+  const t = () => ({ 'package.json': pj, 'node_modules/foo/package.json': '{}' });
+  for (const cmd of ['npm explore --weird foo -- ls', 'npm explore --weird=1 foo -- ls', 'npm explore -Z foo -- ls', 'npm explore foo --weird -- ls', 'npm explore foo --weird x -- ls', 'npm explore foo ls -Z']) {
+    // --weird=1 and the like carry their value: only a word that takes none of them is fine; the others are refused or judged as the tables say
+    const g = git(cmd, t());
+    if (/--weird=1/.test(cmd)) assert.equal(g.decision, 'allow', cmd); else denies(g, `git: ${cmd}`);
+  }
+  // a known value option takes its value; a known boolean does not
+  allows(git('npm explore --prefix . foo -- ls', t()), 'value option');
+  allows(git('npm explore --silent foo -- ls', t()), 'boolean option');
+  allows(git('npm explore -- foo ls', t()), 'after --');
 });
 test('t3 the global npmrc of the place node lives in (injectable nodePrefix; the default is dirname(dirname(process.execPath)))', () => {
   rcDenies('npm test', { '/n/pfx/etc/npmrc': 'node-options=--require /e/x.js\n' }, { nodePrefix: '/n/pfx' }, 'node-options in <nodePrefix>/etc/npmrc');
