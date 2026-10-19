@@ -23,7 +23,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { acquire as realAcquire, release as realRelease, LockTimeoutError } from '../locks.mjs';
 import { run as realRun } from '../proc.mjs';
-import { inspectHooks } from '../installer.mjs';
+import { inspectHooks, STACK_REGISTER_MATCHERS } from '../installer.mjs';
 import { isShared, isPaused, loadMachineConfig, loadModes } from './config.mjs';
 import { sweepVerdict } from './decide.mjs';
 import { procIdentity as realProcIdentity, isAlive as realIsAlive } from './identity.mjs';
@@ -65,8 +65,9 @@ function writeAtomic(file, text) {
 // ---------------------------------------------------------------- installed hook health
 
 // -> [{ file, problem }] for each stack hook whose installed file or settings.json entry is missing or differs. `home` is
-// injected (tests never read the real one). inspectHooks does not know the stack hooks before the installer learns them (Task
-// 13): then every hook reads as "not installed", cleanly; once it knows them, an entry that is not exact is reported too.
+// injected (tests never read the real one). inspectHooks is given the claude-home (<home>/.claude), the same value the installer
+// writes its expected entries from, so an entry is "exact" only if it equals what install writes. stack-register has one entry per
+// matcher (STACK_REGISTER_MATCHERS): each must be present.
 export function hookHealth({ home = os.homedir(), fsx = fs } = {}) {
   const dir = path.join(home, '.claude', 'pipeline', 'hooks');
   let settings = null;
@@ -79,7 +80,7 @@ export function hookHealth({ home = os.homedir(), fsx = fs } = {}) {
   let found = null;
   if (settings) {
     try {
-      found = inspectHooks(settings, home);
+      found = inspectHooks(settings, path.join(home, '.claude'));
     } catch (err) {
       settingsProblem = `settings.json cannot be inspected (${oneLine(err?.message ?? err)})`;
     }
@@ -98,6 +99,10 @@ export function hookHealth({ home = os.homedir(), fsx = fs } = {}) {
     const entries = found?.[name];
     if (!Array.isArray(entries) || entries.length === 0) problems.push(settingsProblem ?? 'no entry in settings.json (not installed)');
     else if (entries.some((e) => e?.exact !== true)) problems.push('settings.json entry differs from what install writes');
+    else if (name === 'stack-register') {
+      const missing = STACK_REGISTER_MATCHERS.filter((m) => !entries.some((e) => e.matcher === m));
+      if (missing.length) problems.push(`no entry in settings.json for matcher ${missing.map((m) => JSON.stringify(m)).join(', ')} (not installed)`);
+    }
     if (problems.length) out.push({ file, problem: problems.join('; ') });
   }
   return out;

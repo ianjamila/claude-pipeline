@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, realpathSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { mergeSettings, STACK_REGISTER_MATCHERS } from '../pipeline/lib/installer.mjs';
 import { runSweep, hookHealth, cleanWorkers, ledgerUses, currentLeases, STACK_HOOKS } from '../pipeline/lib/stacks/sweep.mjs';
 import { stopArgs } from '../pipeline/lib/stacks/act.mjs';
 import { appendEvent } from '../pipeline/lib/stacks/ledger.mjs';
@@ -499,6 +500,46 @@ test('hookHealth: nothing installed reads as "not installed" for each stack hook
     for (const row of h) assert.equal(row.problem, 'no entry in settings.json (not installed)');
     writeFileSync(join(home, '.claude', 'settings.json'), '{broken');
     assert.match(hookHealth({ home })[0].problem, /settings\.json is unreadable/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// The installer's own entries are what "healthy" means: hookHealth asks inspectHooks about <home>/.claude, the home install writes into.
+test('hookHealth: a settings.json written by the installer is healthy; each broken stack-register matcher / hook is named', () => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), 'stacks-hooks-ok-')));
+  try {
+    const claude = join(home, '.claude');
+    const hooksDir = join(claude, 'pipeline', 'hooks');
+    mkdirSync(hooksDir, { recursive: true });
+    for (const n of STACK_HOOKS) writeFileSync(join(hooksDir, `${n}.mjs`), '// hook\n');
+    const installed = mergeSettings({ hooks: { SessionEnd: [{ hooks: [{ type: 'command', command: 'node ~/hb.mjs' }] }] } }, { home: claude });
+    const put = (obj) => writeFileSync(join(claude, 'settings.json'), JSON.stringify(obj));
+    put(installed);
+    assert.deepEqual(hookHealth({ home }), [], 'exactly what install writes is healthy (a foreign SessionEnd entry beside it changes nothing)');
+
+    for (const matcher of STACK_REGISTER_MATCHERS) {
+      const broken = structuredClone(installed);
+      broken.hooks.PreToolUse = broken.hooks.PreToolUse.filter((g) => g.matcher !== matcher || !g.hooks.some((h) => String(h.args?.at(-1)).endsWith('stack-register.mjs')));
+      put(broken);
+      const h = hookHealth({ home });
+      assert.equal(h.length, 1, JSON.stringify(h));
+      assert.match(h[0].file, /stack-register\.mjs$/);
+      assert.ok(h[0].problem.includes(JSON.stringify(matcher)), h[0].problem);
+    }
+
+    const edited = structuredClone(installed);
+    edited.hooks.SessionEnd.at(-1).hooks[0].timeout = 99;
+    put(edited);
+    const h2 = hookHealth({ home });
+    assert.equal(h2.length, 1);
+    assert.match(h2[0].file, /stack-session-end\.mjs$/);
+    assert.match(h2[0].problem, /differs from what install writes/);
+
+    const gone = structuredClone(installed);
+    delete gone.hooks.PostToolUse;
+    put(gone);
+    assert.match(hookHealth({ home })[0].problem, /no entry in settings\.json/);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

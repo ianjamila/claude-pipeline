@@ -17,6 +17,7 @@ import { tryAcquire, release, inspect } from '../pipeline/lib/locks.mjs';
 import {
   mergeSettings, removeOurSettings, isOurHandler, ourAllowEntries, renameWithRetry, collectDiagnostics,
   installLockName, shellRcPaths, parseArgs, buildPlan, walkFiles, safeManifestKey, GUARD_FILES_MATCHER, GUARD_GIT_MATCHER, HOOK_LOADER, joinNative,
+  STACK_REGISTER_MATCHERS, STACK_REGISTER_TIMEOUT_S, STACK_HOOK_TIMEOUT_S, ourStackGroups, inspectHooks,
 } from '../pipeline/lib/installer.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -62,7 +63,7 @@ const FAKE_PS_DIR = (() => {
 })();
 
 // The child must not inherit CLAUDECODE (the tests may themselves run inside Claude Code), nor the real HOME.
-function run(args, { env = {}, script = INSTALL, command = process.execPath, lead = [], psTable } = {}) {
+function run(args, { env = {}, script = INSTALL, command = process.execPath, lead = [], psTable, cwd } = {}) {
   const userHome = scratch('cp-userhome');
   const childEnv = { ...process.env, HOME: userHome, USERPROFILE: userHome, PIPELINE_INSTALL_NO_PROBES: '1' };
   for (const k of ['CLAUDECODE', 'PIPELINE_ADMIN', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_SUBAGENT_MODEL', 'FAKE_PS_TABLE', 'FAKE_PS_FAIL']) delete childEnv[k];
@@ -71,7 +72,7 @@ function run(args, { env = {}, script = INSTALL, command = process.execPath, lea
     if (psTable) childEnv.FAKE_PS_TABLE = JSON.stringify(psTable);
   }
   Object.assign(childEnv, env);
-  const r = spawnSync(command, [...lead, script, ...args], { encoding: 'utf8', env: childEnv, timeout: 60000 });
+  const r = spawnSync(command, [...lead, script, ...args], { encoding: 'utf8', env: childEnv, timeout: 60000, ...(cwd ? { cwd } : {}) });
   return { status: r.status, stdout: r.stdout, stderr: r.stderr, userHome };
 }
 function install(home, extra = [], { source = FIXTURE, env, psTable } = {}) {
@@ -104,6 +105,17 @@ const sessionVersion = (home) => ({
 const ownerGo = (home) => ({
   hooks: [{ type: 'command', command: 'node', args: [joinNative(home, 'pipeline', 'hooks', 'owner-go.mjs')], timeout: 10 }],
 });
+// The stack-stop hooks: stack-register through the fail-closed loader (30 s) once per matcher, dev-bind and session-end plain (10 s).
+const stackRegisters = (home) => [
+  { matcher: 'Bash', hooks: [{ ...loaded(home, 'stack-register'), timeout: 30 }] },
+  { matcher: 'Read|Edit|Write|Grep|Glob|NotebookEdit', hooks: [{ ...loaded(home, 'stack-register'), timeout: 30 }] },
+];
+const stackDevBind = (home) => ({
+  matcher: 'Bash', hooks: [{ type: 'command', command: 'node', args: [joinNative(home, 'pipeline', 'hooks', 'stack-dev-bind.mjs')], timeout: 10 }],
+});
+const stackSessionEnd = (home) => ({
+  hooks: [{ type: 'command', command: 'node', args: [joinNative(home, 'pipeline', 'hooks', 'stack-session-end.mjs')], timeout: 10 }],
+});
 const allowEntries = (home) => [
   `Bash(node ${posix(home)}/pipeline/bin/pipeline.mjs:*)`,
   ...(/\s/.test(home) ? [`Bash(node "${posix(home)}/pipeline/bin/pipeline.mjs":*)`] : []),
@@ -123,8 +135,10 @@ function ownersSettings() {
       ],
       PostToolUse: [
         { matcher: 'Edit|Write', hooks: [{ type: 'command', command: 'node /opt/memory-index.js', timeout: 5 }] },
+        { matcher: 'Bash', hooks: [{ type: 'command', command: '~/.claude/hooks/tab-event.sh', timeout: 5 }] },
       ],
       SessionStart: [{ hooks: [{ type: 'command', command: 'echo start' }] }],
+      SessionEnd: [{ hooks: [{ type: 'command', command: 'node ~/.claude/scripts/heartbeat.mjs', timeout: 5 }] }],
       UserPromptSubmit: [{ hooks: [{ type: 'command', command: 'echo prompt' }] }],
       Stop: [{ hooks: [{ type: 'command', command: 'echo stop' }] }],
     },
@@ -154,6 +168,7 @@ test('fresh install into an empty home (path with a space): files, manifest, hoo
     'skills/ship/SKILL.md', 'skills/ship/reference/notes.md', 'skills/verify/SKILL.md', 'skills/pipeline-setup/SKILL.md',
     'agents/implementer.md', 'agents/verifier.md', 'agents/judge.md', 'agents/arbiter.md',
     'pipeline/bin/pipeline.mjs', 'pipeline/hooks/guard-git.mjs', 'pipeline/hooks/guard-files.mjs',
+    'pipeline/hooks/stack-register.mjs', 'pipeline/hooks/stack-dev-bind.mjs', 'pipeline/hooks/stack-session-end.mjs',
     'pipeline/lib/answer.mjs', 'pipeline/templates/example.md', 'pipeline/VERSION', 'pipeline/INSTALLED.json',
   ]) assert.ok(existsSync(join(home, ...rel.split('/'))), `${rel} should be installed`);
   assert.equal(readFileSync(join(home, 'pipeline', 'VERSION'), 'utf8'), readFileSync(join(FIXTURE, 'VERSION'), 'utf8'));
@@ -172,8 +187,10 @@ test('fresh install into an empty home (path with a space): files, manifest, hoo
   for (const [rel, h] of Object.entries(m.files)) assert.equal(sha(join(home, ...rel.split('/'))), h, rel);
 
   const s = readSettings(home);
-  assert.deepEqual(s.hooks.PreToolUse, [guardGit(home), guardFiles(home)]);
+  assert.deepEqual(s.hooks.PreToolUse, [...stackRegisters(home), guardGit(home), guardFiles(home)]);
+  assert.deepEqual(s.hooks.PostToolUse, [stackDevBind(home)]);
   assert.deepEqual(s.hooks.SessionStart, [sessionVersion(home)]);
+  assert.deepEqual(s.hooks.SessionEnd, [stackSessionEnd(home)]);
   assert.deepEqual(s.permissions.allow, allowEntries(home));
   assert.deepEqual(Object.keys(s).sort(), ['hooks', 'permissions']);
   assert.equal(existsSync(join(home, 'backups')), false, 'no settings existed, so nothing to back up');
@@ -207,8 +224,10 @@ test('existing settings: every other key survives unchanged, ours is appended on
   const after = readSettings(home);
 
   const expected = structuredClone(before);
-  expected.hooks.PreToolUse.push(guardGit(home), guardFiles(home));
+  expected.hooks.PreToolUse.push(...stackRegisters(home), guardGit(home), guardFiles(home));
+  expected.hooks.PostToolUse.push(stackDevBind(home)); // (after the owner's tab-event.sh and memory-index.js)
   expected.hooks.SessionStart.push(sessionVersion(home));
+  expected.hooks.SessionEnd.push(stackSessionEnd(home)); // (after the owner's heartbeat.mjs)
   expected.hooks.UserPromptSubmit.push(ownerGo(home)); // (after the owner's own)
   expected.permissions.allow.push(...allowEntries(home));
   assert.deepEqual(after, expected);
@@ -231,7 +250,9 @@ test('a second install changes nothing: settings, manifest files and hooks are i
   assert.deepEqual(readSettings(home), JSON.parse(s1));
   assert.deepEqual(readManifest(home).files, m1.files);
   const s = readSettings(home);
-  assert.equal(s.hooks.PreToolUse.filter((g) => g.hooks.some((h) => isOurHandler(h, home))).length, 2);
+  assert.equal(s.hooks.PreToolUse.filter((g) => g.hooks.some((h) => isOurHandler(h, home))).length, 4, 'two stack-register groups and the two guards');
+  assert.equal(s.hooks.PostToolUse.filter((g) => g.hooks.some((h) => isOurHandler(h, home))).length, 1);
+  assert.equal(s.hooks.SessionEnd.filter((g) => g.hooks.some((h) => isOurHandler(h, home))).length, 1);
   for (const e of allowEntries(home)) assert.equal(s.permissions.allow.filter((x) => x === e).length, 1);
   const report = JSON.parse(r2.stdout);
   assert.equal(report.files.copied, 0, 'identical units are not rewritten');
@@ -256,12 +277,12 @@ test('--skip-file-guard installs only guard-git; a later full install adds guard
   writeSettings(home, before);
   assert.equal(install(home, ['--skip-file-guard']).status, 0);
   let s = readSettings(home);
-  assert.deepEqual(s.hooks.PreToolUse.slice(1), [guardGit(home)]);
+  assert.deepEqual(s.hooks.PreToolUse.slice(1), [...stackRegisters(home), guardGit(home)]);
   assert.deepEqual(readManifest(home).hooks, { guardGit: true, guardFiles: false });
 
   assert.equal(install(home).status, 0);
   s = readSettings(home);
-  assert.deepEqual(s.hooks.PreToolUse, [...before.hooks.PreToolUse, guardGit(home), guardFiles(home)]);
+  assert.deepEqual(s.hooks.PreToolUse, [...before.hooks.PreToolUse, ...stackRegisters(home), guardGit(home), guardFiles(home)]);
   assert.deepEqual(readManifest(home).hooks, { guardGit: true, guardFiles: true });
   assert.equal(readdirSync(join(home, 'backups')).length, 2, 'two settings changes, two distinct backups (none overwritten)');
 });
@@ -282,8 +303,10 @@ test('an older install in the string command form is replaced, not duplicated', 
   assert.equal(install(home).status, 0);
   const after = readSettings(home);
   const expected = structuredClone(ownersSettings());
-  expected.hooks.PreToolUse.push({ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }] }, guardGit(home), guardFiles(home));
+  expected.hooks.PreToolUse.push({ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }] }, ...stackRegisters(home), guardGit(home), guardFiles(home));
+  expected.hooks.PostToolUse.push(stackDevBind(home));
   expected.hooks.SessionStart.push(sessionVersion(home));
+  expected.hooks.SessionEnd.push(stackSessionEnd(home));
   expected.hooks.UserPromptSubmit.push(ownerGo(home)); // (after the owner's own)
   expected.permissions.allow.push(...allowEntries(home));
   assert.deepEqual(after, expected);
@@ -727,24 +750,27 @@ test('mergeSettings never mutates its input and returns a new object', () => {
   assert.deepEqual(input, snapshot);
   assert.notEqual(out, input);
   assert.notEqual(out.hooks, input.hooks);
-  assert.equal(out.hooks.PreToolUse.length, input.hooks.PreToolUse.length + 2);
+  assert.equal(out.hooks.PreToolUse.length, input.hooks.PreToolUse.length + 4);
 });
 
 test('mergeSettings on an empty object builds the minimal structure; skipFileGuard omits guard-files', () => {
   const full = mergeSettings({}, { home: '/h/.claude' });
-  assert.equal(full.hooks.PreToolUse.length, 2);
-  assert.equal(full.hooks.PreToolUse[1].matcher, GUARD_FILES_MATCHER);
+  assert.equal(full.hooks.PreToolUse.length, 4);
+  assert.equal(full.hooks.PreToolUse.at(-1).matcher, GUARD_FILES_MATCHER);
   assert.deepEqual(full.permissions.allow, ['Bash(node /h/.claude/pipeline/bin/pipeline.mjs:*)', 'Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)']);
   const partial = mergeSettings({}, { home: '/h/.claude', skipFileGuard: true });
-  assert.equal(partial.hooks.PreToolUse.length, 1);
-  assert.equal(partial.hooks.PreToolUse[0].matcher, 'Bash|PowerShell|Monitor|mcp__.*');
+  assert.equal(partial.hooks.PreToolUse.length, 3, 'the stack-register groups are installed with or without the file guard');
+  assert.equal(partial.hooks.PreToolUse.at(-1).matcher, 'Bash|PowerShell|Monitor|mcp__.*');
 });
 
 test('mergeSettings writes native Windows paths in args and a posix path in the allow entry', () => {
   const home = 'C:\\Users\\Jo Smith\\.claude';
   const out = mergeSettings({}, { home });
-  assert.deepEqual(out.hooks.PreToolUse[0].hooks[0].args, ['--input-type=module', '-e', HOOK_LOADER, 'C:\\Users\\Jo Smith\\.claude\\pipeline\\hooks\\guard-git.mjs']);
-  assert.deepEqual(out.hooks.PreToolUse[1].hooks[0].args, ['--input-type=module', '-e', HOOK_LOADER, 'C:\\Users\\Jo Smith\\.claude\\pipeline\\hooks\\guard-files.mjs']);
+  assert.deepEqual(out.hooks.PreToolUse[2].hooks[0].args, ['--input-type=module', '-e', HOOK_LOADER, 'C:\\Users\\Jo Smith\\.claude\\pipeline\\hooks\\guard-git.mjs']);
+  assert.deepEqual(out.hooks.PreToolUse[3].hooks[0].args, ['--input-type=module', '-e', HOOK_LOADER, 'C:\\Users\\Jo Smith\\.claude\\pipeline\\hooks\\guard-files.mjs']);
+  assert.deepEqual(out.hooks.PreToolUse[0].hooks[0].args, ['--input-type=module', '-e', HOOK_LOADER, 'C:\\Users\\Jo Smith\\.claude\\pipeline\\hooks\\stack-register.mjs']);
+  assert.deepEqual(out.hooks.PostToolUse[0].hooks[0].args, ['C:\\Users\\Jo Smith\\.claude\\pipeline\\hooks\\stack-dev-bind.mjs']);
+  assert.deepEqual(out.hooks.SessionEnd[0].hooks[0].args, ['C:\\Users\\Jo Smith\\.claude\\pipeline\\hooks\\stack-session-end.mjs']);
   assert.equal(out.permissions.allow[0], 'Bash(node C:/Users/Jo Smith/.claude/pipeline/bin/pipeline.mjs:*)');
   // and an earlier Windows-style entry is recognised as ours and replaced
   const again = mergeSettings(out, { home });
@@ -763,7 +789,7 @@ test('isOurHandler matches the pipeline hooks dir in command or args, either sla
   assert.equal(isOurHandler({ type: 'prompt', prompt: 'x' }), false);
 });
 
-test('mergeSettings drops a group left empty but keeps a group with other handlers; non-PreToolUse hooks are never touched', () => {
+test('mergeSettings drops a group left empty but keeps a group with other handlers; hooks of an event we do not manage are never touched', () => {
   const input = {
     hooks: {
       PreToolUse: [
@@ -771,7 +797,8 @@ test('mergeSettings drops a group left empty but keeps a group with other handle
         { matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }, { type: 'command', command: 'node /a/.claude/pipeline/hooks/guard-files.mjs' }] },
         { matcher: 'Read', hooks: [] },
       ],
-      PostToolUse: [{ hooks: [{ type: 'command', command: 'node /a/.claude/pipeline/hooks/guard-git.mjs' }] }],
+      // (PostToolUse is managed since the stack hooks; Stop is not)
+      Stop: [{ hooks: [{ type: 'command', command: 'node /a/.claude/pipeline/hooks/guard-git.mjs' }] }],
     },
   };
   const out = mergeSettings(input, { home: '/h/.claude' });
@@ -779,7 +806,7 @@ test('mergeSettings drops a group left empty but keeps a group with other handle
     { matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }] },
     { matcher: 'Read', hooks: [] },
   ]);
-  assert.deepEqual(out.hooks.PostToolUse, input.hooks.PostToolUse);
+  assert.deepEqual(out.hooks.Stop, input.hooks.Stop);
 });
 
 test('mergeSettings rejects wrongly shaped settings instead of guessing', () => {
@@ -918,16 +945,16 @@ test('shellRcPaths: POSIX rc files everywhere, PowerShell profiles on win32', ()
 test('guard-git matches Bash, PowerShell, Monitor and MCP tools, guard-files stays last with its wider matcher; both come from constants', () => {
   assert.equal(GUARD_GIT_MATCHER, 'Bash|PowerShell|Monitor|mcp__.*');
   const out = mergeSettings({}, { home: '/h/.claude' });
-  assert.deepEqual(out.hooks.PreToolUse.map((g) => g.matcher), ['Bash|PowerShell|Monitor|mcp__.*', GUARD_FILES_MATCHER]);
+  assert.deepEqual(out.hooks.PreToolUse.map((g) => g.matcher), [...STACK_REGISTER_MATCHERS, 'Bash|PowerShell|Monitor|mcp__.*', GUARD_FILES_MATCHER]);
   const skip = mergeSettings({}, { home: '/h/.claude', skipFileGuard: true });
-  assert.deepEqual(skip.hooks.PreToolUse.map((g) => g.matcher), ['Bash|PowerShell|Monitor|mcp__.*']);
+  assert.deepEqual(skip.hooks.PreToolUse.map((g) => g.matcher), [...STACK_REGISTER_MATCHERS, 'Bash|PowerShell|Monitor|mcp__.*']);
 
   // --check treats the old Bash-only matcher as drift (the hook would never fire on PowerShell)
   const home = newHome();
   assert.equal(install(home).status, 0);
   assert.equal(run(['--check', '--claude-home', home, '--source', FIXTURE]).status, 0);
   const s = readSettings(home);
-  s.hooks.PreToolUse[0].matcher = 'Bash';
+  s.hooks.PreToolUse.find((g) => g.matcher === GUARD_GIT_MATCHER).matcher = 'Bash';
   writeSettings(home, s);
   const r = run(['--check', '--claude-home', home, '--source', FIXTURE]);
   assert.equal(r.status, 1);
@@ -943,9 +970,9 @@ test('a user hook under some other /pipeline/hooks/guard-*.mjs survives install 
   assert.equal(isOurHandler(userGroup2.hooks[0], home), false);
   writeSettings(home, before);
   assert.equal(install(home).status, 0);
-  assert.deepEqual(readSettings(home).hooks.PreToolUse, [userGroup, userGroup2, guardGit(home), guardFiles(home)]);
+  assert.deepEqual(readSettings(home).hooks.PreToolUse, [userGroup, userGroup2, ...stackRegisters(home), guardGit(home), guardFiles(home)]);
   assert.equal(install(home).status, 0);
-  assert.equal(readSettings(home).hooks.PreToolUse.length, 4, 'a second install does not add or drop anything');
+  assert.equal(readSettings(home).hooks.PreToolUse.length, 6, 'a second install does not add or drop anything');
   assert.equal(run(['--uninstall', '--claude-home', home]).status, 0);
   assert.deepEqual(readSettings(home), before);
 });
@@ -1167,7 +1194,7 @@ test('the installer writes the loader handler; an old plain-args handler is hook
   assert.equal(install(home).status, 0);
   const after = readSettings(home);
   const ours = after.hooks.PreToolUse.filter((g) => g.hooks.some((h) => isOurHandler(h, home)));
-  assert.deepEqual(ours, [guardGit(home), guardFiles(home)], 'the old entry was replaced, not duplicated');
+  assert.deepEqual(ours, [...stackRegisters(home), guardGit(home), guardFiles(home)], 'the old entry was replaced, not duplicated');
 
   // restore the old shape and see --check call it out
   after.hooks.PreToolUse = after.hooks.PreToolUse.map((g) => (g.hooks.some((h) => String(h.args?.at(-1)).endsWith('guard-git.mjs'))
@@ -1259,6 +1286,14 @@ test('buildPlan requires pipeline/hooks/session-version.mjs like the two guards'
   rmSync(join(src, 'pipeline', 'hooks', 'session-version.mjs'));
   assert.ok(buildPlan(src).problems.includes('pipeline/hooks/session-version.mjs is missing'));
   assert.equal(buildPlan(FIXTURE).problems.length, 0);
+});
+
+test('buildPlan requires the three stack hook files', () => {
+  for (const name of ['stack-register', 'stack-dev-bind', 'stack-session-end']) {
+    const src = copyFixture();
+    rmSync(join(src, 'pipeline', 'hooks', `${name}.mjs`));
+    assert.ok(buildPlan(src).problems.includes(`pipeline/hooks/${name}.mjs is missing`), name);
+  }
 });
 
 // ---- A4: honest sourceSha ---------------------------------------------------------------------------------------
@@ -1504,4 +1539,344 @@ test('a source inside the claude-home is refused, except under pipeline-state/tm
   assert.equal(ok.status, 0, ok.stderr);
   assert.equal(existsSync(join(home, 'pipeline', 'INSTALLED.json')), true);
   assert.equal(existsSync(tmpSrc), true, 'the installer did not touch the source');
+});
+
+// ---- the stack-stop hooks (Task 13) -------------------------------------------------------------------------------
+
+const ourEntries = (groups, home) => (groups ?? []).filter((g) => g.hooks?.some((h) => isOurHandler(h, home)));
+const driftOf = (home, source = FIXTURE) => {
+  const r = install(home, ['--check', '--json'], { source });
+  return { status: r.status, items: JSON.parse(r.stdout).drift ?? [] };
+};
+
+test('constants and ourStackGroups: stack-register per matcher through the fail-closed loader (30 s), dev-bind and session-end plain (10 s)', () => {
+  assert.deepEqual([...STACK_REGISTER_MATCHERS], ['Bash', 'Read|Edit|Write|Grep|Glob|NotebookEdit']);
+  assert.equal(STACK_REGISTER_TIMEOUT_S, 30);
+  assert.equal(STACK_HOOK_TIMEOUT_S, 10);
+  const g = ourStackGroups('/h/.claude');
+  assert.deepEqual(g.PreToolUse, stackRegisters('/h/.claude'));
+  assert.deepEqual(g.PostToolUse, [stackDevBind('/h/.claude')]);
+  assert.deepEqual(g.SessionEnd, [stackSessionEnd('/h/.claude')]);
+  assert.equal(g.PreToolUse[0].hooks[0].args[2], HOOK_LOADER);
+  assert.equal(g.PostToolUse[0].hooks[0].args.length, 1, 'plain handler: no loader');
+});
+
+test('fresh install adds exactly one stack-register group per matcher, one PostToolUse and one SessionEnd group, guard-files stays last', () => {
+  const home = newHome();
+  assert.equal(install(home).status, 0);
+  const s = readSettings(home);
+  assert.deepEqual(ourEntries(s.hooks.PreToolUse, home), [...stackRegisters(home), guardGit(home), guardFiles(home)]);
+  assert.equal(s.hooks.PreToolUse.at(-1).matcher, GUARD_FILES_MATCHER, 'guard-files is the last PreToolUse entry');
+  assert.deepEqual(s.hooks.PostToolUse, [stackDevBind(home)]);
+  assert.deepEqual(s.hooks.SessionEnd, [stackSessionEnd(home)]);
+  const found = inspectHooks(s, home);
+  assert.equal(found['stack-register'].length, 2);
+  assert.ok(found['stack-register'].every((e) => e.exact));
+  assert.deepEqual(found['stack-register'].map((e) => e.matcher), [...STACK_REGISTER_MATCHERS]);
+  assert.ok(found['stack-dev-bind'].length === 1 && found['stack-dev-bind'][0].exact);
+  assert.ok(found['stack-session-end'].length === 1 && found['stack-session-end'][0].exact);
+  assert.deepEqual(found.unknown, []);
+});
+
+test('the owner\'s foreign PostToolUse and SessionEnd entries (tab-event.sh, heartbeat.mjs) survive install, a no-op reinstall and uninstall', () => {
+  const home = newHome();
+  const before = ownersSettings();
+  const tab = before.hooks.PostToolUse[1];
+  const heartbeat = before.hooks.SessionEnd[0];
+  writeSettings(home, before);
+  assert.equal(install(home).status, 0);
+  const afterInstall = readFileSync(settingsPath(home), 'utf8');
+  const s = JSON.parse(afterInstall);
+  assert.deepEqual(s.hooks.PostToolUse, [...before.hooks.PostToolUse, stackDevBind(home)]);
+  assert.deepEqual(s.hooks.SessionEnd, [heartbeat, stackSessionEnd(home)]);
+  assert.deepEqual(s.hooks.PostToolUse[1], tab);
+
+  const again = install(home, ['--json']);
+  assert.equal(again.status, 0, again.stderr);
+  assert.equal(JSON.parse(again.stdout).settings.changed, false, 'reinstall changes nothing');
+  assert.equal(readFileSync(settingsPath(home), 'utf8'), afterInstall, 'byte-identical settings after a reinstall');
+
+  assert.equal(install(home, ['--uninstall']).status, 0);
+  assert.deepEqual(readSettings(home), before, 'the owner\'s settings are back exactly, foreign entries in place');
+});
+
+test('a foreign hook sharing a group with ours on PostToolUse / SessionEnd survives; only ours is lifted out', () => {
+  const home = newHome();
+  const before = { hooks: {
+    PostToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }, { type: 'command', command: 'node', args: [join(home, 'pipeline', 'hooks', 'stack-dev-bind.mjs')], timeout: 3 }] }],
+    SessionEnd: [{ hooks: [{ type: 'command', command: 'echo bye' }, { type: 'command', command: 'node', args: [join(home, 'pipeline', 'hooks', 'stack-session-end.mjs')] }] }],
+  } };
+  writeSettings(home, before);
+  assert.equal(install(home).status, 0);
+  const s = readSettings(home);
+  assert.deepEqual(s.hooks.PostToolUse, [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }] }, stackDevBind(home)]);
+  assert.deepEqual(s.hooks.SessionEnd, [{ hooks: [{ type: 'command', command: 'echo bye' }] }, stackSessionEnd(home)]);
+  assert.equal(driftOf(home).status, 0);
+  assert.equal(install(home, ['--uninstall']).status, 0);
+  assert.deepEqual(readSettings(home), { hooks: {
+    PostToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }] }],
+    SessionEnd: [{ hooks: [{ type: 'command', command: 'echo bye' }] }],
+  } });
+});
+
+test('--check: no drift after install; removing the SessionEnd entry by hand is drift (hook-missing, named), reinstall repairs it', () => {
+  const home = newHome();
+  assert.equal(install(home).status, 0);
+  const clean = driftOf(home);
+  assert.equal(clean.status, 0, JSON.stringify(clean.items));
+  assert.deepEqual(clean.items, []);
+
+  const s = readSettings(home);
+  delete s.hooks.SessionEnd;
+  writeSettings(home, s);
+  const d = driftOf(home);
+  assert.equal(d.status, 1);
+  assert.deepEqual(d.items.map((i) => [i.kind, i.path]), [['hook-missing', 'stack-session-end']]);
+  assert.match(d.items[0].message, /stack-session-end is not in hooks\.SessionEnd/);
+  const text = install(home, ['--check']).stdout;
+  assert.match(text, /hook missing: stack-session-end/);
+  assert.equal(install(home).status, 0);
+  assert.equal(driftOf(home).status, 0);
+});
+
+test('--check: a missing, duplicated or edited stack-dev-bind is reported; so is one under the wrong event', () => {
+  const home = newHome();
+  assert.equal(install(home).status, 0);
+  const base = readSettings(home);
+
+  const gone = structuredClone(base);
+  delete gone.hooks.PostToolUse;
+  writeSettings(home, gone);
+  assert.deepEqual(driftOf(home).items.map((i) => [i.kind, i.path]), [['hook-missing', 'stack-dev-bind']]);
+
+  const dup = structuredClone(base);
+  dup.hooks.PostToolUse.push(stackDevBind(home));
+  writeSettings(home, dup);
+  assert.deepEqual(driftOf(home).items.map((i) => [i.kind, i.path]), [['hook-duplicated', 'stack-dev-bind']]);
+
+  const edited = structuredClone(base);
+  edited.hooks.PostToolUse[0].hooks[0].timeout = 99;
+  writeSettings(home, edited);
+  assert.deepEqual(driftOf(home).items.map((i) => [i.kind, i.path]), [['hook-differs', 'stack-dev-bind']]);
+
+  const wrongMatcher = structuredClone(base);
+  wrongMatcher.hooks.PostToolUse[0].matcher = 'Edit';
+  writeSettings(home, wrongMatcher);
+  assert.deepEqual(driftOf(home).items.map((i) => [i.kind, i.path]), [['hook-differs', 'stack-dev-bind']]);
+
+  const wrongEvent = structuredClone(base);
+  wrongEvent.hooks.Stop = wrongEvent.hooks.PostToolUse;
+  delete wrongEvent.hooks.PostToolUse;
+  writeSettings(home, wrongEvent);
+  assert.equal(driftOf(home).status, 1);
+});
+
+test('--check checks stack-register once PER MATCHER: removing one matcher\'s entry by hand is hook-missing naming that matcher', () => {
+  const home = newHome();
+  assert.equal(install(home).status, 0);
+  const base = readSettings(home);
+  for (const matcher of STACK_REGISTER_MATCHERS) {
+    const s = structuredClone(base);
+    s.hooks.PreToolUse = s.hooks.PreToolUse.filter((g) => !(g.matcher === matcher && g.hooks.some((h) => String(h.args?.at(-1)).endsWith('stack-register.mjs'))));
+    writeSettings(home, s);
+    const d = driftOf(home);
+    assert.equal(d.status, 1);
+    const missing = d.items.filter((i) => i.kind === 'hook-missing');
+    assert.equal(missing.length, 1, JSON.stringify(d.items));
+    assert.ok(missing[0].message.includes(matcher), missing[0].message);
+    assert.match(missing[0].message, /stack-register/);
+    assert.equal(d.items.length, 1, 'only the removed matcher is reported');
+    assert.equal(install(home).status, 0, 'reinstall repairs it');
+    assert.equal(driftOf(home).status, 0);
+  }
+});
+
+test('--check: a duplicated, edited or wrongly matched stack-register entry is reported; a late stack-register after guard-files is an order drift', () => {
+  const home = newHome();
+  assert.equal(install(home).status, 0);
+  const base = readSettings(home);
+
+  const dup = structuredClone(base);
+  dup.hooks.PreToolUse.splice(2, 0, stackRegisters(home)[0]);
+  writeSettings(home, dup);
+  assert.ok(driftOf(home).items.some((i) => i.kind === 'hook-duplicated' && /stack-register \(Bash\)/.test(i.path)));
+
+  const edited = structuredClone(base);
+  edited.hooks.PreToolUse[1].hooks[0].timeout = 5;
+  writeSettings(home, edited);
+  assert.ok(driftOf(home).items.some((i) => i.kind === 'hook-differs' && /stack-register \(Read/.test(i.path)));
+
+  const plainArgs = structuredClone(base);
+  plainArgs.hooks.PreToolUse[0].hooks[0].args = [joinNative(home, 'pipeline', 'hooks', 'stack-register.mjs')];
+  writeSettings(home, plainArgs);
+  assert.ok(driftOf(home).items.some((i) => i.kind === 'hook-differs' && /stack-register \(Bash\)/.test(i.path)), 'not the fail-closed loader');
+
+  const odd = structuredClone(base);
+  odd.hooks.PreToolUse[0].matcher = 'Bash|Edit';
+  writeSettings(home, odd);
+  const items = driftOf(home).items;
+  assert.ok(items.some((i) => i.kind === 'hook-missing' && /stack-register \(Bash\)/.test(i.path)));
+  assert.ok(items.some((i) => i.kind === 'hook-differs' && i.path === 'stack-register'), JSON.stringify(items));
+
+  const late = structuredClone(base);
+  late.hooks.PreToolUse.push(late.hooks.PreToolUse.shift());
+  writeSettings(home, late);
+  assert.ok(driftOf(home).items.some((i) => i.kind === 'hook-order'), 'guard-files must stay last, our order is fixed');
+  assert.equal(install(home).status, 0);
+  assert.equal(readSettings(home).hooks.PreToolUse.at(-1).matcher, GUARD_FILES_MATCHER);
+  assert.equal(driftOf(home).status, 0);
+});
+
+test('an install from before the stack hooks existed reports the stack hooks missing (two stack-register matchers, dev-bind, session-end), then a reinstall adds them and keeps the rest', () => {
+  const home = newHome();
+  assert.equal(install(home).status, 0);
+  const s = readSettings(home);
+  s.hooks.PreToolUse = s.hooks.PreToolUse.filter((g) => !g.hooks.some((h) => /stack-/.test(String(h.args?.at(-1)))));
+  delete s.hooks.PostToolUse;
+  delete s.hooks.SessionEnd;
+  writeSettings(home, s);
+  const d = driftOf(home);
+  assert.equal(d.status, 1);
+  assert.deepEqual(d.items.map((i) => i.kind), ['hook-missing', 'hook-missing', 'hook-missing', 'hook-missing']);
+  assert.equal(install(home).status, 0);
+  assert.equal(driftOf(home).status, 0);
+});
+
+test('--uninstall removes our three stack hooks, drops the PostToolUse / SessionEnd keys it emptied, keeps foreign SessionEnd entries, and counts the hooks', () => {
+  const home = newHome();
+  assert.equal(install(home).status, 0);
+  const r = install(home, ['--uninstall', '--json']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(JSON.parse(r.stdout).hooks.removed, 8, 'stack-register x2, dev-bind, session-end, guard-git, guard-files, session-version, owner-go');
+  assert.equal(existsSync(settingsPath(home)) ? JSON.stringify(readSettings(home)) : '{}', '{}');
+
+  const home2 = newHome();
+  const before = { hooks: { SessionEnd: [{ hooks: [{ type: 'command', command: 'node ~/hb.mjs' }] }] } };
+  writeSettings(home2, before);
+  assert.equal(install(home2).status, 0);
+  assert.equal(install(home2, ['--uninstall']).status, 0);
+  assert.deepEqual(readSettings(home2), before, 'the foreign SessionEnd entry stays; ours is gone');
+});
+
+test('removeOurSettings drops an event key only when it emptied it; an empty array the owner already had stays', () => {
+  const home = '/h/.claude';
+  const merged = mergeSettings({ hooks: { Stop: [], PostToolUse: [] } }, { home });
+  const out = removeOurSettings(merged, { home });
+  assert.deepEqual(out, { hooks: { Stop: [] } }, 'PostToolUse is dropped (we emptied it), the owner\'s empty Stop stays');
+  const untouched = { hooks: { PostToolUse: [], PreToolUse: [{ matcher: 'Read', hooks: [{ type: 'command', command: 'echo x' }] }] } };
+  assert.deepEqual(removeOurSettings(untouched, { home }), untouched, 'nothing of ours: nothing changes');
+  const withOurs = mergeSettings({ hooks: { PostToolUse: [] } }, { home });
+  assert.equal('PostToolUse' in removeOurSettings(withOurs, { home }), false);
+});
+
+test('mergeSettings rejects a wrongly shaped PostToolUse / SessionEnd instead of guessing', () => {
+  assert.throws(() => mergeSettings({ hooks: { PostToolUse: {} } }, { home: '/h' }), /hooks\.PostToolUse" is not an array/);
+  assert.throws(() => mergeSettings({ hooks: { SessionEnd: 'x' } }, { home: '/h' }), /hooks\.SessionEnd" is not an array/);
+});
+
+test('the human report names the stack hooks on install and the stack-stop pause on uninstall', () => {
+  const home = newHome();
+  const r = install(home);
+  assert.match(r.stdout, /stack-stop yes \(stack-register PreToolUse, stack-dev-bind PostToolUse, stack-session-end SessionEnd\)/);
+  const u = install(home, ['--uninstall']);
+  assert.equal(u.status, 0);
+  assert.doesNotMatch(u.stdout, /stacks:/, 'no stacks state in a scratch home: nothing paused, nothing reported');
+});
+
+// ---- uninstall extras: pause, wait for workers (isolated stacks root; the real ~/.claude is never touched) ---------------------
+
+function isolatedStacks() {
+  const root = join(scratch('cp-stacks'), 'root');
+  mkdirSync(join(root, 'workers'), { recursive: true });
+  return { root, env: { PIPELINE_STACKS_HOME: root, PIPELINE_STACKS_ONLY: 'install-test' } };
+}
+
+test('uninstall pauses an existing stacks root, leaves everything in it alone and creates nothing when the root is absent', () => {
+  const home = newHome();
+  const { root, env } = isolatedStacks();
+  for (const f of ['config.json', 'mode.json', 'ledger.jsonl', 'actions.jsonl']) writeFileSync(join(root, f), `${f}\n`);
+  const before = listTree(root);
+  assert.equal(install(home).status, 0);
+  const r = install(home, ['--uninstall', '--json'], { env });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(existsSync(join(root, 'pause')), true, 'pause file touched');
+  assert.deepEqual(listTree(root), [...before, 'pause'].sort(), 'nothing else in the stacks root changed');
+  for (const f of ['config.json', 'mode.json', 'ledger.jsonl', 'actions.jsonl']) assert.equal(readFileSync(join(root, f), 'utf8'), `${f}\n`);
+  const j = JSON.parse(r.stdout);
+  assert.equal(j.stacks.paused, true);
+  assert.deepEqual(j.stacks.workersSurvived, []);
+
+  const home2 = newHome();
+  const absent = join(scratch('cp-stacks'), 'never-made');
+  assert.equal(install(home2).status, 0);
+  assert.equal(install(home2, ['--uninstall'], { env: { PIPELINE_STACKS_HOME: absent, PIPELINE_STACKS_ONLY: 'install-test' } }).status, 0);
+  assert.equal(existsSync(absent), false, 'a missing stacks root is not created');
+});
+
+test('without PIPELINE_STACKS_HOME the stacks root is the one of the home being uninstalled, never the real ~/.claude', () => {
+  const home = newHome();
+  assert.equal(install(home).status, 0);
+  const root = join(home, 'pipeline-state', 'stacks');
+  mkdirSync(root, { recursive: true });
+  const r = install(home, ['--uninstall']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(existsSync(join(root, 'pause')), true);
+  assert.match(r.stdout, /stacks:\s+paused/);
+});
+
+test('uninstall with a live worker waits, then reports the survivor by pid and still finishes (exit 0, pause in place)', { skip: process.platform === 'win32' }, async () => {
+  const home = newHome();
+  const { root, env } = isolatedStacks();
+  assert.equal(install(home).status, 0);
+  const { spawn } = await import('node:child_process');
+  const worker = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
+  try {
+    writeFileSync(join(root, 'workers', `${worker.pid}.json`), JSON.stringify({ pid: worker.pid, phase: 'waiting' }));
+    const started = Date.now();
+    const r = install(home, ['--uninstall', '--json'], { env: { ...env, PIPELINE_INSTALL_WORKER_WAIT_MS: '1500' } });
+    const took = Date.now() - started;
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(took >= 1400, `waited for the worker (${took} ms)`);
+    const j = JSON.parse(r.stdout);
+    assert.deepEqual(j.stacks.workersSurvived, [worker.pid]);
+    assert.ok(j.warnings.some((w) => w.includes(`pid ${worker.pid}`) && /still running/.test(w)), JSON.stringify(j.warnings));
+    assert.equal(existsSync(join(root, 'pause')), true);
+    assert.equal(existsSync(join(home, 'pipeline')), false, 'files are still removed');
+    assert.equal(existsSync(join(root, 'workers', `${worker.pid}.json`)), true, 'the worker file is not ours to delete');
+  } finally {
+    worker.kill('SIGKILL');
+  }
+});
+
+// ---- the CI round-trip script (it is CI-only because install.mjs refuses a Claude Code session; here it runs with the tests' scrubbed env) ----
+
+test('.github/scripts/installer-round-trip.sh passes on a scratch home and asserts the three stack hooks appear and vanish', { skip: process.platform === 'win32' || spawnSync('bash', ['-c', 'true']).status !== 0 }, () => {
+  const home = newHome({ space: true });
+  const r = run([home], { script: join(REPO, '.github', 'scripts', 'installer-round-trip.sh'), command: 'bash', cwd: REPO });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.equal((r.stdout.match(/stack hooks present: /g) ?? []).length, 2, 'asserted after install and after the idempotent reinstall');
+  assert.match(r.stdout, /stack hooks absent: /);
+  assert.match(r.stdout, /clean: no pipeline files or settings entries remain/);
+  assert.equal(existsSync(home) ? readdirSync(home).includes('pipeline') : false, false);
+});
+
+test('the round-trip script fails when a stack hook stays registered after uninstall (the assertion bites)', { skip: process.platform === 'win32' || spawnSync('bash', ['-c', 'true']).status !== 0 }, () => {
+  // Runs the script's own stack_hooks function (cut out of the file) against a real install, in both modes.
+  const home = newHome();
+  assert.equal(install(home).status, 0);
+  const script = readFileSync(join(REPO, '.github', 'scripts', 'installer-round-trip.sh'), 'utf8');
+  const fnEnd = script.indexOf('\nstep "install"');
+  const wrapper = join(scratch('cp-rt'), 'check.sh');
+  writeFileSync(wrapper, `#!/usr/bin/env bash\nset -euo pipefail\nhome_dir="$1"\n${script.slice(script.indexOf('stack_hooks() {'), fnEnd)}\nstack_hooks "$2"\n`);
+  const present = run([home, 'present'], { script: wrapper, command: 'bash', cwd: REPO });
+  assert.equal(present.status, 0, present.stdout + present.stderr);
+  const absent = run([home, 'absent'], { script: wrapper, command: 'bash', cwd: REPO });
+  assert.equal(absent.status, 1, 'hooks are still installed, so "absent" must fail');
+  assert.match(absent.stderr, /stack-register is still in settings\.json hooks\.PreToolUse/);
+  assert.match(absent.stderr, /stack-session-end is still in settings\.json hooks\.SessionEnd/);
+  assert.equal(install(home, ['--uninstall']).status, 0);
+  assert.equal(run([home, 'absent'], { script: wrapper, command: 'bash', cwd: REPO }).status, 0);
+  const missing = run([home, 'present'], { script: wrapper, command: 'bash', cwd: REPO });
+  assert.equal(missing.status, 1, 'and "present" fails once they are gone');
+  assert.match(missing.stderr, /stack-dev-bind \(PostToolUse, matcher Bash\): 0 entries, expected 1/);
 });
