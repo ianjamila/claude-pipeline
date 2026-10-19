@@ -802,13 +802,20 @@ export function localBin(name, env) {
 // place a link leads to are never a reason. A shebang whose interpreter (after `env`, `env -S`, `--split-string`, its options) is one the guard knows (node nodejs bun deno tsx ts-node python python2 python3[.N] ruby perl php): a program. Any
 // other shebang (a shell, awk, make, pwsh, busybox, a name not listed) or none at all: opened as a shell script. Binary content (ELF or Mach-O magic, a NUL byte in the first 512): a program. An unreadable file is not decided here (the caller opens it).
 const PROGRAM_INTERPRETERS = /^(?:node|nodejs|bun|deno|tsx|ts-node|python[23]?(?:\.\d+)*|ruby|perl|php)$/;
-export function binIsProgram(text) {
+// The interpreter that really runs may be a file the project controls (the allowlist names it, the project supplies it): a relative path (`#!./node`, `#!node_modules/x/node`, a bare `#!node`, resolved against the
+// working directory), an absolute path inside the project, or -- through `env` -- a name that has an entry in a node_modules/.bin of the lookup chain (the managers put those first on the PATH). Each of these is opened as a
+// shell script. `site` (binSite): { inside(abs) -> boolean, hasBin(name) -> boolean }; without it nothing is known about the project and only the shebang's own words count.
+export function binIsProgram(text, site = null) {
   if (typeof text !== 'string') return false;
   if (text.startsWith('#!')) {
     const tokens = text.slice(2).split(/\r?\n/, 1)[0].trim().split(/\s+/).filter(Boolean);
     const nm = (w) => nodePath.posix.basename(String(w ?? '').replaceAll('\\', '/'));
+    const outside = (w) => /^(?:\/|[A-Za-z]:[\\/])/.test(String(w ?? '')) && !(site?.inside?.(String(w)) ?? false); // (absolute, and not in the project)
+    if (!outside(tokens[0])) return false;
     let i = 0;
+    let viaEnv = false;
     if (nm(tokens[0]) === 'env') {
+      viaEnv = true;
       for (i = 1; i < tokens.length; i++) {
         const t = tokens[i];
         if (/^-[uC]$|^--(?:unset|chdir)$/.test(t)) i++; // options with a value
@@ -819,7 +826,28 @@ export function binIsProgram(text) {
     }
     const prog = nm(tokens[i]);
     if (prog === '') return false; // `#!` with nothing: execve fails and sh runs it
+    if (viaEnv) { // (env runs a name from the PATH, a word with a slash as that path)
+      if (/[\\/]/.test(tokens[i])) { if (!outside(tokens[i])) return false; } else if (site?.hasBin?.(prog)) return false;
+    }
     return PROGRAM_INTERPRETERS.test(prog); // (an allowlist: awk, make, pwsh, busybox applets and any name not listed are read by a shell or by a language the guard does not model, so the file is opened)
   }
   return text.slice(0, 512).includes('\u0000') || text.startsWith('\u007fELF') || text.startsWith('��');
+}
+
+// What binIsProgram needs to know about the project for the bin node_modules/.bin/NAME found at `bin` and run in `runDir`: the project is its package directory and the directory it runs in; the bins that come first on the
+// PATH are every node_modules/.bin from either of them upward. exists: file test.
+export function binSite(bin, runDir, exists, p = nodePath) {
+  const roots = [p.dirname(p.dirname(p.dirname(bin))), runDir].filter((x) => typeof x === 'string');
+  return {
+    inside: (abs) => roots.some((r) => abs === r || abs.startsWith(r === '/' ? '/' : `${r}/`)),
+    hasBin: (name) => roots.some((r) => {
+      for (let d = r, n = 0; n < MAX_WALK; n++) {
+        if (exists(p.join(d, 'node_modules', '.bin', name))) return true;
+        const up = p.dirname(d);
+        if (up === d) break;
+        d = up;
+      }
+      return false;
+    }),
+  };
 }

@@ -205,3 +205,46 @@ test('R1-B2b --ignore-scripts is ignored only for a value that is certainly true
   allowed('npm run lint --ignore-scripts true', tree);
   allowed('npm --ignore-scripts run lint', tree);
 });
+
+// ---- the interpreter a bin's shebang names may itself be a script the project controls ----------------------------------------------
+import { binIsProgram } from '../pipeline/hooks/lib/package-scripts.mjs';
+
+test('R1-S1 a bin is a program only when its interpreter is outside the project: a project-local path or a same-named node_modules/.bin entry makes it a shell script', () => {
+  const lib = { inside: (a) => a === '/p' || a.startsWith('/p/'), hasBin: (n) => n === 'node' };
+  // unit: the site decides
+  assert.equal(binIsProgram('#!/usr/bin/env node\n', { inside: lib.inside, hasBin: () => false }), true);
+  assert.equal(binIsProgram('#!/usr/bin/env node\n', lib), false, 'env finds node_modules/.bin/node first');
+  assert.equal(binIsProgram('#!/usr/bin/env python3\n', lib), true, 'a different name is not shadowed');
+  assert.equal(binIsProgram('#!/usr/bin/node\n', lib), true, 'an absolute path outside the project does not look at PATH');
+  for (const t of ['#!./node\n', '#!node_modules/x/node\n', '#!../node\n', '#!node\n', '#!/p/node\n', '#!/p/vendor/node\n', '#!/usr/bin/env ./node\n', '#!/usr/bin/env /p/node\n', '#!./env node\n', '#!/p/env node\n']) assert.equal(binIsProgram(t, { inside: lib.inside, hasBin: () => false }), false, JSON.stringify(t));
+  assert.equal(binIsProgram('#!/usr/bin/env node\n'), true, 'no site: as before');
+
+  // both guards
+  const js = (g, shebang) => `${shebang}\n${g.bad}\n`;
+  const shim = sh('echo shim'); // (a node_modules/.bin/node the project holds)
+  for (const cmd of ['npx tool', 'npm exec tool']) {
+    denied(cmd, (g) => ({ 'package.json': pkg({}), 'node_modules/.bin/tool': js(g, '#!/usr/bin/env node'), 'node_modules/.bin/node': shim }));
+    denied(cmd, (g) => ({ 'package.json': pkg({}), 'node_modules/.bin/tool': js(g, '#!./node') }));
+    denied(cmd, (g) => ({ 'package.json': pkg({}), 'node_modules/.bin/tool': js(g, '#!node_modules/x/node') }));
+    denied(cmd, (g) => ({ 'package.json': pkg({}), 'node_modules/.bin/tool': js(g, `#!${g.root}/vendor/node`) }));
+    denied(cmd, (g) => ({ 'package.json': pkg({}), 'node_modules/.bin/tool': js(g, '#!/usr/bin/env ./node') }));
+    // twins: the usual bin (no shim, an interpreter outside the project) is a program: not opened
+    allowed(cmd, (g) => ({ 'package.json': pkg({}), 'node_modules/.bin/tool': js(g, '#!/usr/bin/env node') }));
+    allowed(cmd, (g) => ({ 'package.json': pkg({}), 'node_modules/.bin/tool': js(g, '#!/usr/bin/node') }));
+    allowed(cmd, (g) => ({ 'package.json': pkg({}), 'node_modules/.bin/tool': js(g, '#!/usr/bin/env python3'), 'node_modules/.bin/node': shim }));
+    // a shim only above the package (the bin chain goes up) counts too
+    denied(cmd, (g) => ({ 'package.json': pkg({}), 'node_modules/.bin/tool': js(g, '#!/usr/bin/env node'), '../node_modules/.bin/node': shim }));
+  }
+  // the same bin called from a package script, and from the cwd's chain
+  denied('npm run lint', (g) => ({ 'package.json': pkg({ lint: 'tool' }), 'node_modules/.bin/tool': js(g, '#!/usr/bin/env node'), 'node_modules/.bin/node': shim }));
+  allowed('npm run lint', (g) => ({ 'package.json': pkg({ lint: 'tool' }), 'node_modules/.bin/tool': js(g, '#!/usr/bin/env node') }));
+});
+
+test('R1-S1b a node_modules/.bin/node in the directory the command runs in shadows the interpreter of a bin found further up', () => {
+  for (const [n, g] of Object.entries(G)) {
+    const cwd = resolve(g.root, 'sub');
+    const files = (shim) => ({ 'package.json': pkg({}), 'sub/package.json': pkg({}), 'node_modules/.bin/tool': `#!/usr/bin/env node\n${g.bad}\n`, ...(shim ? { 'sub/node_modules/.bin/node': sh('echo shim') } : {}) });
+    assert.equal(g.run('npx tool', files(true), { cwd }).decision, 'deny', `${n}: shim in the cwd`);
+    assert.equal(g.run('npx tool', files(false), { cwd }).decision, 'allow', `${n}: no shim`);
+  }
+});

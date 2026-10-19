@@ -16,7 +16,7 @@
 // ancestor process); commands that unset or override CLAUDECODE are denied here.
 import fs from 'node:fs';
 import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
-import { pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram } from './package-scripts.mjs';
+import { pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite } from './package-scripts.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
@@ -1702,10 +1702,10 @@ function judgeBinScript(name, dirs, ctx, opts, scanRaw = '', quiet = false, look
       if (!ctx.api.existsSync(bin) || ctx.readDir(bin)) continue; // (missing: nothing runs; a directory: a shell cannot run it)
       const head = ctx.readHead(bin);
       if (typeof head !== 'string') return deny(`cannot read node_modules/.bin/${name} (${bin}: missing permission), so whether it is a shell script and what it runs cannot be verified`);
-      if (!binIsProgram(head)) return deny(`${bin} is too large to verify (over 1 MB), so what it runs cannot be known`);
+      if (!binIsProgram(head, binSite(bin, d, (x) => ctx.api.existsSync(x), posix))) return deny(`${bin} is too large to verify (over 1 MB), so what it runs cannot be known`);
       continue;
     }
-    if (binIsProgram(text)) continue;
+    if (binIsProgram(text, binSite(bin, d, (x) => ctx.api.existsSync(x), posix))) continue;
     const r = judgeScriptText(text, { kind: 'shell', file: bin }, bin, d, ctx, opts); // (a bin runs where the manager runs, in the caller's directory, not in node_modules/.bin)
     if (r) return r;
   }

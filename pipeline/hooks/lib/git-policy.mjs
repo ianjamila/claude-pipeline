@@ -17,7 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
 export { withoutLiteralText, INDIRECT_EXPANSION };
-import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram } from './package-scripts.mjs';
+import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite } from './package-scripts.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit } from './script-candidates.mjs';
@@ -1241,7 +1241,7 @@ function judgeScriptText(text, sf, abs, dir, ctx, level) {
   if (kind === 'exec') {
     if (!text.startsWith('#!') && text.slice(0, 512).includes('\u0000')) return null; // a binary (the test binIsProgram uses: a shebang line makes it a script whatever follows)
     const prog = SHEBANG_PROGRAM.exec(text)?.[1] ?? '';
-    kind = /^(?:node|nodejs|deno|bun|tsx|ts-node|python[\d.]*|ruby|perl|php)$/.test(prog.split('/').pop()) ? 'interp' : 'shell';
+    kind = !sf.asShell && /^(?:node|nodejs|deno|bun|tsx|ts-node|python[\d.]*|ruby|perl|php)$/.test(prog.split('/').pop()) ? 'interp' : 'shell'; // (asShell: binKind found the interpreter to be the project's own file -- a shell script whatever the shebang names)
     // Why: the kernel starts the shebang's shell, which reads the startup files its options ask for (`#!/bin/bash -l`, `#!/bin/zsh`): judged like `bash -l f` / `zsh f`
     const sh = kind === 'shell' && ctx.execCmd ? shebangShell(text) : null;
     if (sh) {
@@ -1331,13 +1331,14 @@ function packageScriptVerdict(argv, dir, ctx, level) {
 // file, or a copy back from a backup, is not what it runs, so only a write the guard places on the bin itself (the line replacing the program) is judged.
 // What decides is the file's first bytes alone (binIsProgram): the extension and the target of a link never do, as a file without a shebang is run by sh.
 // 'open': a shell script (or one that cannot be read, which checkScriptFile refuses or sizes up); 'program': not opened.
-function binKind(bin, ctx) {
+function binKind(bin, ctx, dir) {
+  const site = binSite(bin, dir, ctx.pathExists, path);
   const text = ctx.readText(bin);
-  if (typeof text === 'string') return binIsProgram(text) ? 'program' : 'open';
+  if (typeof text === 'string') return binIsProgram(text, site) ? 'program' : 'open';
   if (!ctx.pathExists(bin) || ctx.readDir(bin)) return 'open'; // (missing: the line's own write is judged by checkScriptFile)
   const head = ctx.readHead(bin);
   if (typeof head !== 'string') return 'unreadable';
-  return binIsProgram(head) ? 'program' : 'open';
+  return binIsProgram(head, site) ? 'program' : 'open';
 }
 // `quiet`: the lookup of a command inside a package script (PATH has node_modules/.bin): a name with no bin there is an ordinary command, nothing to refuse
 function binVerdict(name, dir, ctx, level, quiet = false, lookup = dir) {
@@ -1350,13 +1351,13 @@ function binVerdict(name, dir, ctx, level, quiet = false, lookup = dir) {
     const v = checkScriptFile({ kind: 'exec', file: m, candidate: true }, dir, ctx, level);
     if (v) return v;
   }
-  const kind = bin ? binKind(bin, ctx) : null;
+  const kind = bin ? binKind(bin, ctx, dir) : null;
   if (kind === 'program') {
     const w = writtenTo(ctx.writeFrames, bin, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: true });
     return w ? judgeWrittenScript(w, { kind: 'exec', file: bin, candidate: true }, bin, dir, ctx, level) : null;
   }
   if (kind === 'unreadable') return deny(`cannot read node_modules/.bin/${name} (${bin}: missing permission), so whether it is a shell script and what it runs cannot be verified.`);
-  if (bin) return checkScriptFile({ kind: 'exec', file: bin, candidate: true }, dir, ctx, level);
+  if (bin) return checkScriptFile({ kind: 'exec', file: bin, candidate: true, asShell: kind === 'open' }, dir, ctx, level);
   return !quiet && ctx.budget.pkgBinsDirty && lineMentionsGuarded(ctx) ? deny(`package script: an earlier install on the line may add node_modules/.bin/${name}, and the line mentions a guarded operation, so what it runs cannot be verified. Run the install in a command of its own.`) : null;
 }
 function runnerBinVerdict(argv, dir, ctx, level, quiet = false, lookup = dir) {
