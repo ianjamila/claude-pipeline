@@ -164,13 +164,15 @@ export async function register(input, deps = {}) {
     return isoValue;
   };
 
-  // A failure after the prefilter matched: exit 2 with the reason, or (paused) log and let the call go.
+  // A failure after the prefilter matched: exit 2 with the reason, or log and let the call go when paused or when this machine has no
+  // usable config (the feature is inert there: installing the hooks must not change what an ordinary Bash call does).
   const fail = (reason, { stack, lockPath } = {}) => {
     let why = oneLine(reason);
     if (now() >= deadlineAt - DEADLINE_SLACK_MS) why = `deadline of ${deadlineMs} ms exceeded: ${why}`;
     const paused = isPaused(files.pause);
-    log(`${paused ? 'paused, allowing' : 'blocking'}: could not register use of stack ${stack ?? '(unknown)'} (${why})`);
-    if (paused) return { exit: 0, events };
+    const unconfigured = !paused && getCfg().status !== 'ok';
+    log(`${paused ? 'paused, allowing' : unconfigured ? 'not configured, allowing' : 'blocking'}: could not register use of stack ${stack ?? '(unknown)'} (${why})`);
+    if (paused || unconfigured) return { exit: 0, events };
     let message = `autostop could not register use of stack ${stack ?? '(unknown)'} (${why}) — retry; pause with: touch ${files.pause}`;
     if (lockPath && !why.includes(lockPath)) message += ` (lock: ${lockPath})`;
     return { exit: 2, message, events };

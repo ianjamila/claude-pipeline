@@ -196,6 +196,24 @@ for (const [name, make, reason, stack] of FAILURES) {
   });
 }
 
+// R1-B6: a machine with no (or a broken) config gets no behaviour change: a failure to register is logged, never blocking.
+for (const status of ['missing', 'invalid']) {
+  for (const [name, make, reason, stack] of FAILURES) {
+    test(`failure: ${name} with the machine config ${status} => exit 0 and a log line; config ok => still exit 2`, async () => {
+      const w = world();
+      const command = `supabase status --workdir ${w.wd('sa-corrections.stack')}`;
+      const unconfigured = { ...CFG, status, shared: new Set(), error: status === 'invalid' ? 'not valid JSON' : undefined };
+      const r = await register(bash(command, w.base), deps(w, { ...make(w), cfg: unconfigured }));
+      assert.equal(r.exit, 0);
+      assert.equal(r.message, undefined);
+      assert.ok(readFileSync(w.files.log, 'utf8').includes(`not configured, allowing: could not register use of stack ${stack}`));
+      const configured = await register(bash(command, w.base), deps(w, make(w)));
+      assert.equal(configured.exit, 2, 'unchanged once the machine is configured');
+      assert.match(configured.message, reason);
+    });
+  }
+}
+
 test('failure: the project lock is held past the deadline => exit 2 naming the lock path; paused => 0', posixOnly, async () => {
   const w = world();
   const held = tryAcquire('sa-corrections', { dir: lockDirs(w.root).project });
@@ -531,8 +549,13 @@ test('resolveSeams: an installed copy ignores every override whatever else is se
 });
 
 // ---- end to end: the real hook, fake docker / ps ----
-function e2e({ stacks, docker = {}, ps = {}, projects = 'sa-corrections' } = {}) {
+// `configured` writes an (empty, valid) machine config: without one the feature is inert and a registration failure never blocks.
+function e2e({ stacks, docker = {}, ps = {}, projects = 'sa-corrections', configured = true } = {}) {
   const w = world();
+  if (configured) {
+    mkdirSync(w.root, { recursive: true });
+    writeFileSync(w.files.config, '{}');
+  }
   const dir = join(w.base, 'fake');
   mkdirSync(dir, { recursive: true });
   const sa = w.stacks[0];
@@ -620,6 +643,11 @@ test('e2e: docker daemon down => exit 0; owner not found => exit 2 (fake ps know
   const r = lost.hook(bash(`supabase status --workdir ${lost.sa.workdir}`, lost.w.base));
   assert.equal(r.status, 2);
   assert.match(r.stderr, /owner not found/);
+  // R1-B6: the same failure on a machine with no config (the PC, hooks installed before any config) blocks nothing
+  const bare = e2e({ ps: { procs: {} }, configured: false });
+  const b = bare.hook(bash(`supabase status --workdir ${bare.sa.workdir}`, bare.w.base));
+  assert.equal(b.status, 0, b.stderr);
+  assert.match(readFileSync(bare.w.files.log, 'utf8'), /not configured, allowing: could not register use of stack/);
 });
 
 test('e2e: npm run dev writes a dev event without any docker call', posixOnly, () => {
