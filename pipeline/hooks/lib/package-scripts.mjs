@@ -101,7 +101,20 @@ const NO_SCRIPT = {
 const EXEC_SUBS = new Set(['exec', 'x', 'dlx']);
 const DIR_OPTS = new Set(['--prefix', '-C', '--dir', '--cwd']);
 const WORKSPACE_OPT = /^(?:-w|-ws|--workspaces?|--filter|-F|--filter-prod|-r|--recursive|--include-workspace-root|--workspace-root)$/;
-const MOVER_OPT = /^(?:--userconfig|--globalconfig|--script-shell|--node-options)$/; // (the same keys a .npmrc is refused for: RC_REFUSED)
+// Configuration keys that change what runs a script (the shell, the node options, the directory ...). One list for both places npm reads them: a key in a .npmrc / .yarnrc / bunfig file (rcRefusal) and the command line
+// (npm accepts every config key as an option). The workspace selectors are on the list for the files, but the command line reads and follows them (WORKSPACE_OPT), so they are no CLI mover.
+export const RC_REFUSED = new Set(['script-shell', 'node-options', 'workspaces', 'workspace', 'include-workspace-root', 'globalconfig', 'userconfig', 'shell', 'onload-script']);
+const CLI_MOVERS = [...RC_REFUSED].filter((k) => !/^(?:workspaces?|include-workspace-root)$/.test(k));
+// Is the option `key` (`--name`, the value cut off) one of them, in any spelling npm reads: the case and `_` / `-` are free (`--SCRIPT_SHELL`), `--no-NAME` sets it too, and nopt reads a unique abbreviation of a name
+// it knows as that name (`--script-sh`): a name the guard's tables do not know is tried as a prefix of each mover (any, not only a unique one: fail closed). `known`: the tables know the name (--global is a prefix of --globalconfig but is its own option).
+function cliMover(key, known) {
+  if (!key.startsWith('--')) return false;
+  const n = key.slice(2).toLowerCase().replace(/_/g, '-');
+  if (CLI_MOVERS.includes(n) || (n.startsWith('no-') && CLI_MOVERS.includes(n.slice(3)))) return true;
+  return !known && n.length >= 2 && CLI_MOVERS.some((m) => m.startsWith(n));
+}
+// --ignore-scripts: the hooks are dropped only for a value that is certainly true (nopt reads an empty value, 0, null and false as false, anything else as true; when in doubt the hooks are judged)
+const ignoreFrom = (eq, w, next) => (eq > 0 ? /^(?:true|1)$/i.test(w.slice(eq + 1)) : !/^(?:false|0)$/i.test(next ?? ''));
 const RUN_TIME = /[$`]/;
 const GLOBAL_OPT = /^(?:-[a-zA-Z]*g[a-zA-Z]*|--global(?:=(?!false$|0$).*)?)$/i;
 // `npm explore` (and its unique abbreviations: npm reads `expl` as ambiguous with explain) runs a command in node_modules/PKG. A scoped name is two path parts.
@@ -140,10 +153,10 @@ function scanOpts(words, i, pm, st) {
     const key = eq > 0 ? w.slice(0, eq) : w;
     const hasNext = i + 1 < words.length;
     if (DIR_OPTS.has(key)) st.dir = eq > 0 ? w.slice(eq + 1) : words[i + 1] ?? '';
-    if (MOVER_OPT.test(key)) st.mover = key;
+    if (cliMover(key, optKind(key, pm) !== 'unknown')) st.mover = key;
     if (WORKSPACE_OPT.test(key)) st.workspace = true;
     if (GLOBAL_OPT.test(w) || (key === '--location' && (eq > 0 ? w.slice(eq + 1) : words[i + 1]) === 'global')) st.global = true;
-    if (key === '--ignore-scripts') st.ignore = eq > 0 ? !/^(?:false|0)$/i.test(w.slice(eq + 1)) : true;
+    if (key === '--ignore-scripts') st.ignore = ignoreFrom(eq, w, words[i + 1]);
     if (key === '--no-ignore-scripts') st.ignore = false;
     if (kind === 'unknown') st.unknown.push(w);
     i += kind === 'value' && eq < 0 && hasNext ? 2 : 1;
@@ -187,9 +200,9 @@ export function pmCall(allWords) {
       const eq = w.startsWith('--') ? w.indexOf('=') : -1;
       const key = eq > 0 ? w.slice(0, eq) : w;
       if (DIR_OPTS.has(key)) st.dir = eq > 0 ? w.slice(eq + 1) : after[k + 1] ?? '';
-      if (MOVER_OPT.test(key)) st.mover = key;
+      if (cliMover(key, optKind(key, pm) !== 'unknown')) st.mover = key;
       if (WORKSPACE_OPT.test(key)) st.workspace = true;
-      if (key === '--ignore-scripts') st.ignore = eq > 0 ? !/^(?:false|0)$/i.test(w.slice(eq + 1)) : true;
+      if (key === '--ignore-scripts') st.ignore = ignoreFrom(eq, w, after[k + 1]);
       if (key === '--no-ignore-scripts') st.ignore = false;
       if (kind === 'value' && eq < 0) k++;
       else if (kind === 'unknown' && eq < 0 && after[k + 1] !== undefined && !after[k + 1].startsWith('-') && !call.unresolved) call.unresolved = `the option \`${w}\` is not known to the guard and may take the next word (\`${after[k + 1]}\`) as its value, so what \`${words.slice(0, 5).join(' ')}\` hands the script cannot be verified. Write it as --name=value.`;
@@ -507,7 +520,6 @@ const MAX_WALK = 64;
 const defaultLexists = (f) => { try { lstatSync(f); return true; } catch { return false; } }; // (a symlink loop or a dangling link exists although existsSync says no)
 // Configuration files that change what runs a script (script-shell, node-options, workspaces ... ): a key on this list in a file next to the package or in the home directory makes the scripts unknown.
 // (not `prefix`: npm takes the project from the command line's --prefix alone -- @npmcli/config loadLocalPrefix reads the 'cli' source -- so a `prefix=` in a .npmrc, which people set to move their GLOBAL packages, moves nothing here)
-const RC_REFUSED = new Set(['script-shell', 'node-options', 'workspaces', 'workspace', 'include-workspace-root', 'globalconfig', 'userconfig', 'shell', 'onload-script']);
 const GLOBAL_RCS = ['/etc/npmrc', '/usr/local/etc/npmrc', '/opt/homebrew/etc/npmrc'];
 // (the `prefix` key is no mover of the PROJECT -- see above -- but it is where npm looks for the GLOBAL configuration, <prefix>/etc/npmrc, and the one it ships with, <prefix>/lib/node_modules/npm/npmrc)
 

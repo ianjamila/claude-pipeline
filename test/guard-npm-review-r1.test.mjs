@@ -153,3 +153,52 @@ test('R1-B6 npm --prefix sub exec TOOL looks the bin up under the prefix (and th
   allowed('npm exec tool', fine);
   allowed('npm exec tool', (g) => ({ 'sub/package.json': pkg({}), 'sub/node_modules/.bin/tool': sh(g.bad), 'node_modules/.bin/tool': sh('echo hi') }));
 });
+
+// ---- follow-up to R1-B1 / R1-B2 (controller's security note) -------------------------------------------------------------------
+import { RC_REFUSED } from '../pipeline/hooks/lib/package-scripts.mjs';
+
+test('R1-B1b the CLI movers are the SAME set a .npmrc is refused for, in every spelling npm reads (underscores, case, --no-, unique abbreviations)', () => {
+  const tree = () => ({ 'package.json': pkg({ lint: 'echo hi' }) });
+  const modeled = new Set(['workspace', 'workspaces', 'include-workspace-root']); // (workspace selectors: read and followed, not refused)
+  const keys = [...RC_REFUSED].filter((k) => !modeled.has(k));
+  assert.ok(keys.length >= 6, 'the shared set is not empty');
+  for (const k of keys) {
+    for (const spelled of [k, k.toUpperCase(), k.replaceAll('-', '_')]) {
+      denied(`npm run lint --${spelled}=x`, tree, /--/);
+      denied(`npm run lint --${spelled} x`, tree);
+      denied(`npm --${spelled}=x run lint`, tree);
+      denied(`npm --${spelled} x run lint`, tree);
+    }
+    denied(`npm run lint --no-${k}`, tree);
+    denied(`npm --no-${k} run lint`, tree);
+  }
+  // a unique abbreviation of the name (nopt reads it as the option)
+  for (const cmd of ['npm run lint --script-sh ./e', 'npm run lint --node-opt=--inspect', 'npm run lint --userconf=./rc', 'npm run lint --globalconf ./rc', 'npm --onload-s ./x run lint', 'npm --script-s ./e run lint']) denied(cmd, tree);
+  // twins: options the tables know stay as they were (--global is a prefix of --globalconfig, but it is its own option)
+  allowed('npm run lint --global', tree);
+  allowed('npm run lint --silent --if-present', tree);
+  allowed('npm --silent run lint', tree);
+  allowed('npm run lint -- --script_shell x', tree);
+});
+
+test('R1-B1c an option the tables do not know is refused when a word follows it (it may take that word), and passes as a flag when none does', () => {
+  const tree = () => ({ 'package.json': pkg({ lint: 'echo hi' }) });
+  denied('npm run lint --frobnicate x', tree);
+  denied('npm --frobnicate run lint', tree);
+  denied('npm test --frobnicate x', tree);
+  allowed('npm run lint --frobnicate', tree);
+  allowed('npm run lint --frobnicate -- x', tree);
+  allowed('npm run lint --frobnicate=1', tree);
+});
+
+test('R1-B2b --ignore-scripts is ignored only for a value that is certainly true; empty, no, null, 0 forms and a following false judge the hooks', () => {
+  const tree = (g) => ({ 'package.json': pkg({ prelint: g.bad, lint: 'echo hi' }) });
+  for (const v of ['', 'false', 'FALSE', '0', '00', '0.0', 'null', 'no', 'off', 'yes', 'on']) denied(`npm run lint --ignore-scripts=${v}`, tree);
+  for (const v of ['', 'false', '0', 'no']) denied(`npm --ignore-scripts=${v} run lint`, tree);
+  denied('npm run lint --ignore-scripts false', tree);
+  denied('npm --ignore-scripts false run lint', tree);
+  denied('npm run lint --ignore-scripts --no-ignore-scripts', tree);
+  for (const v of ['true', 'TRUE', '1']) allowed(`npm run lint --ignore-scripts=${v}`, tree);
+  allowed('npm run lint --ignore-scripts true', tree);
+  allowed('npm --ignore-scripts run lint', tree);
+});
