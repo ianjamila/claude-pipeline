@@ -21,7 +21,7 @@ import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
 import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
-import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, assigningDefaults, spliceLines } from './script-candidates.mjs';
+import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
 
 const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
@@ -526,9 +526,9 @@ function refVariants(text, ctx) {
   const v1 = v0
     .replace(/['"`]\s*\+\s*['"`]/g, '')
     .replace(/['"`]\s*[,/]\s*['"`]/g, '/')
-    .replace(/\s*\/\s*(?=['"`])/g, '/')
+    .replace(/(?<!\s)\s*\/\s*(?=['"`])/g, '/')
     .replace(/\/['"`]+/g, '/')
-    .replace(/['"`]+\//g, '/');
+    .replace(/(?<!['"`])['"`]+\//g, '/'); // (a run of quotes or blanks is read from its start only: from every character it would be quadratic)
   return unique([v0, v1, braceExpand(v0, ctx)]);
 }
 
@@ -629,6 +629,13 @@ function balancedOpeners(w) {
   return out;
 }
 function makeMatchers(ctx) {
+  // The readings of a word to look for a protected path in: its own defaults / alternatives (paramReadings: too many of them is a hit) and the words a name it reads may hold (readingsOf). A word an
+  // assignment holds that the scan cannot work out (or that holds a `$`) is no hit here: collectVars makes the name a run-time variable, and a write through one is refused as such.
+  const hitReadings = (word) => {
+    const own = paramReadings(word);
+    if (own.over || !ctx.assigned?.size) return own;
+    return Object.defineProperty([...readingsOf(word, ctx.assigned)], 'over', { value: false, enumerable: false });
+  };
   const rootRes = rootRegexes(ctx);
   const ancRes = ancestorRegexes(ctx);
   const suffix = suffixRegexes(ctx.ci);
@@ -641,7 +648,8 @@ function makeMatchers(ctx) {
   const rawHit = (text, dirs, program = false) => {
     if (!text) return false;
     // Why: `${V:-~/.claude}/settings.json` is the protected file whenever V is unset or empty, so every reading of a default / alternative word is judged
-    const rs = paramReadings(String(text));
+    // (#81 t8b: and every word a NAME may hold whose assignment holds an operator or is an array, `F=ok; D=${F/ok/.claude}; echo x > ~/$D/settings.json`: readingsOf, as for a script name)
+    const rs = hitReadings(String(text));
     if (rs.over) {
       if (!program) return true;
       for (const w of String(text).split(/\s+/)) {
@@ -691,7 +699,7 @@ function makeMatchers(ctx) {
     } else if (/^[A-Za-z_]+=./.test(tok)) parts = [tok, tok.slice(tok.indexOf('=') + 1)]; // (`of=settings.json`)
     for (const part of parts) {
       if (!part) continue;
-      const rs = paramReadings(part);
+      const rs = hitReadings(part); // (#81 t8b: the words an operator or array assignment gives, see rawHit)
       if (rs.over) return true;
       // Why: a target built by a command substitution (`"$(echo ~/.claude)"/settings.json`) is only known at run time: when its own text names a protected thing it is refused
       if (/\$\(|`/.test(part) && SENSITIVE_WORDS.test(part)) return true;
@@ -1239,6 +1247,15 @@ function collectVars(cmds, ctx) {
   // writes settings.json). A name the line assigns and reads so is only known at run time wherever it is used (ctx.unknownVars: a script or a writer it picks is refused),
   // and so is every name built from it (`F=$B:r; … $F`), to a fixed point.
   for (const k of ctx.zshModified ?? []) if (given.has(k) || Object.hasOwn(ctx.inheritedVars ?? {}, k)) unknown.add(k);
+  // Why (#81 t8b): a name whose assignment holds an operator or an array the scan cannot work out (`D=${U@Q}`, `${F:abc}`, a glob it does not follow) may hold any word where it is used: a writer or a redirection that uses it is refused
+  // (the "writes through a variable whose value is only known at run time" rule below). The words it CAN work out are read by rawHit / pathHit, which judge each as the path it is.
+  // (only a name whose own value is an operator expansion or an array: one built from a command's output (`dir=$(cmd)`) stays as it was, and a name built from another is covered by the closure below)
+  for (const [k, ws] of ctx.assigned ?? []) {
+    const name = k.replace(/\[\]$/, '');
+    const raw = given.get(name)?.v;
+    if (k !== '*' && ws.includes(UNKNOWN_WORD) && raw !== undefined && !/\$\(|`/.test(raw) && (raw.startsWith('(') || /\$\{[^}]*[^\w}]/.test(raw))) unknown.add(name);
+  }
+  if (ctx.assigned?.has('*')) for (const k of given.keys()) unknown.add(k); // (more assignments than the scan follows: every name the line gives is only known at run time)
   if (aPins === null) for (const [k, r] of raws) if (r.size > 1) unknown.add(k);
   // Why (#76 / #81 t7 and the security follow-up): a name an arithmetic assigns (or appends to) holds a value the text does not give (see arithAssignedNames), whether or not the line gave it one
   // before (`(( n += 7 )); bash s$n.sh`); `dynamic`: any name the line or an outer line gave (and any other, see ctx.unknownAll below)
@@ -1955,8 +1972,25 @@ const HOME_NAMES = new Set(['HOME', 'USER', 'LOGNAME', 'USERPROFILE', 'USERNAME'
 // where it may not run, more than once, from a command's output, or by a builtin that binds it at run time; `all`: the file can set any name (eval, a nested
 // source, a parse cut short, a command named at run time), so no name is known any more. Only the first-level assignments are followed, not functions called later.
 // the names a text defines as functions (`function f`, `f()`) or aliases
+// (Linear: the regular expressions find the keyword or the `()` first, and the command boundary before it is checked by walking back over blanks. A pattern that begins with "a boundary, then blanks, then
+// the name" restarts at every boundary of a long run of them, which is quadratic: `&&&&…` and `\n\n\n…` took seconds at 200 kB.)
+const WS_BYTE = /\s/;
+function startsCommand(text, at) {
+  let i = at - 1;
+  while (i >= 0 && text[i] !== '\n' && WS_BYTE.test(text[i])) i--; // (a newline is itself a command boundary)
+  return i < 0 || '\n;&|({'.includes(text[i]);
+}
 function definedNames(text) {
-  const names = new Set([...text.matchAll(/(?:^|[\n;&|({])\s*function\s+([^\s(){;'"$`]+)/g), ...text.matchAll(/(?:^|[\n;&|({])\s*([^\s(){;'"$`=]+)\s*\(\s*\)/g)].map((m) => m[1]));
+  const names = new Set();
+  for (const m of text.matchAll(/function\s+([^\s(){;'"$`]+)/g)) if (startsCommand(text, m.index)) names.add(m[1]);
+  // (a name is read back from the `(`: the longest run of name characters before the blanks in front of it)
+  for (const m of text.matchAll(/\(\s*\)/g)) {
+    let end = m.index;
+    while (end > 0 && WS_BYTE.test(text[end - 1])) end--;
+    let start = end;
+    while (start > 0 && !WS_BYTE.test(text[start - 1]) && !"(){;'\"$`=&|".includes(text[start - 1])) start--;
+    if (start < end && startsCommand(text, start)) names.add(text.slice(start, end));
+  }
   for (const a of text.matchAll(/\balias\s+([^;&|\n]*)/g)) for (const m of a[1].matchAll(/(?:^|\s)([^\s=]+)=/g)) names.add(m[1]);
   return names;
 }

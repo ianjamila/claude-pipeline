@@ -109,12 +109,20 @@ export function spliceLines(raw) {
 }
 
 // Why: `: ${X:=w}` / `${X=w}` assigns X for the commands after it, so a later `$X` may be w: the words such an expansion assigns, by name
-const ASSIGNING = /\$\{([A-Za-z_]\w*):?=([^}]*)\}/g;
+// (The head is found first and its `}` after it, the first one at or past the head, remembered for the next head: a pattern `([^}]*)\}` scans to the end for every head of a text of
+// `${a=${a=${a=…` that never closes, which is quadratic: 12 s at 200 kB. A value over MAX_VALUE_CHARS is the unknown word, which readingsOf refuses like any word that holds `$`.)
+const ASSIGNING = /\$\{([A-Za-z_]\w*):?=/g;
 export function assigningDefaults(text) {
   const out = new Map();
-  for (const m of String(text ?? '').matchAll(ASSIGNING)) {
+  const t = String(text ?? '');
+  let close = -2;
+  for (const m of t.matchAll(ASSIGNING)) {
+    const from = m.index + m[0].length;
+    if (close !== -1 && close < from) close = t.indexOf('}', from);
+    if (close === -1) break; // (no `}` from here on: no later head closes either)
+    const v = close - from > MAX_VALUE_CHARS ? UNKNOWN_WORD : t.slice(from, close);
     const ws = out.get(m[1]) ?? [];
-    if (!ws.includes(m[2])) ws.push(m[2]);
+    if (!ws.includes(v)) ws.push(v);
     out.set(m[1], ws);
   }
   for (const [n, ws] of assignedValues(String(text ?? ''))) out.set(n, [...new Set([...(out.get(n) ?? []), ...ws])]);
@@ -130,7 +138,7 @@ export function assigningDefaults(text) {
 //     not set: that reading is left out (a `$G` of it stays a word only known at run time, judged as before).
 //   - `${F/pat/rep}` `${F//pat/rep}` `${F#p}` `${F##p}` `${F%p}` `${F%%p}` `${F^^}` `${F,,}` `${F:o:n}` on a name the text gives literal words: worked out for each (a glob `*` `?` in a pattern too). A name nothing here
 //     gives is the environment's (left out as above); any other operator on a name the text does give makes the word unknown (`$(?)`: readingsOf refuses it).
-const UNKNOWN_WORD = '$(?)';
+export const UNKNOWN_WORD = '$(?)';
 // Every limit keeps the scan linear-ish and short: a hook past its deadline is ALLOWED by the host, and a regular expression cannot be interrupted. No regular expression here matches a glob; the
 // matcher below counts its steps against one allowance per call, and a pattern, value or line over a cap gives UNKNOWN_WORD (refused when the name is used as a script), never a guess.
 const MAX_ASSIGN_WORDS = 32;
