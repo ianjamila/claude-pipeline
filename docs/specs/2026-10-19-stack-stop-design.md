@@ -186,6 +186,8 @@ owner.json, dead-pid / never-finished reclaim serialized by a guard dir, live pi
     row (a long-lived generation is would-stopped again by every sweep). A session-end would-stop is CLEAN only when its worker
     wrote an `observed` record after the last (+120 min) probe; with none, or an `observation-late` (probe fired past its grace)
     or `observation-lost` (worker died, the sweep removed its file) marker, it is **UNKNOWN** and blocks switch-on like a MISS.
+    A marker counts only for the decision whose `t` it names (`decidedAt`), and incomplete observation outranks RESTART
+    (MISS > UNKNOWN > RESTART > CLEAN).
     Sweep-sourced would-stops have no observer of their own and keep the plain CLEAN rule.
 - Sweep report `<PIPELINE_STACKS_HOME>/report.md` (latest) headlines: MISS count (7 days, must be 0 to switch on), RESTART
   count, CLEAN count and total GB that would have been freed; any missing/dangling installed hook file; a damaged
