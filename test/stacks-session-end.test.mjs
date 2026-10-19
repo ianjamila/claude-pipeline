@@ -755,3 +755,65 @@ test('an assessment that throws keeps the stack (fail closed) and the worker goe
   assert.equal(r.stacks[0].action, 'kept');
   assert.equal(w.supabaseCalls.length, 0);
 }));
+
+// ---- the feature's own processes are never consumers (observed on the real Mac: pid 36371, the worker itself, was a MISS) ----
+
+const putWorker = (w, name, body) => {
+  mkdirSync(w.files.workers, { recursive: true });
+  writeFileSync(join(w.files.workers, name), JSON.stringify(body));
+};
+
+test('re-probe: registered workers, a reused worker pid aside, and the observer itself are never recorded as uses; the probes are told to skip them', () => withWorld({ mode: 'report' }, async (w, c) => {
+  await w.lease(OWNER);
+  putWorker(w, '9001.json', { pid: 9001, birth: 77, phase: 'waiting' }); // a sibling worker, alive
+  putWorker(w, '9002.json', { pid: 9002, birth: 88, phase: 'waiting' }); // its pid has been reused by something else
+  w.alive.add(key({ pid: 9001, birth: 77 }));
+  const decisionSec = Math.floor(T0 / 1000);
+  let hits = [];
+  const seenExclude = [];
+  const evidence = {
+    ...quiet,
+    connections: (s, o) => { seenExclude.push(o.excludePids); return ok(hits.filter((h) => h.port)); },
+    processRefs: (s, o) => { seenExclude.push(o.excludePids); return ok(hits.filter((h) => !h.port)); },
+  };
+  const sleep = async (ms) => {
+    await c.sleep(ms);
+    if (c.sleeps.length === 1) {
+      hits = [
+        { pid: 9001, birth: 77, command: 'node pipeline.mjs stacks session-end --owner 101:1001 # alpha', field: 'env' },
+        { pid: process.pid, birth: decisionSec - 5, command: 'node worker # alpha', field: 'env' },
+        { pid: 9001, birth: 77, command: 'node worker', port: 54322 },
+        { pid: 9002, birth: decisionSec - 3600, command: 'psql alpha', field: 'cmdline' },
+      ];
+    }
+  };
+  const r = await runSessionEnd({ owner: OWNER, deps: depsFor(w, c, { evidence, sleep, observeAtMs: [30 * 60_000] }) });
+  assert.deepEqual(r.uses.map((u) => u.pid), [9002], 'only the process that is not ours');
+  assert.equal(outcomes(w, c.now()).summary.miss, 1);
+  assert.equal(outcomes(w, c.now()).decisions.filter((d) => d.action === 'use-observed').length, 1);
+  const reprobe = seenExclude.slice(-2);
+  for (const ex of reprobe) assert.ok(ex.has(9001) && ex.has(process.pid) && !ex.has(9002), 'the re-probe skips the live worker and itself, not a reused pid');
+}));
+
+test('re-probe: nothing but the worker itself in view => CLEAN, no use, no MISS', () => withWorld({ mode: 'report' }, async (w, c) => {
+  await w.lease(OWNER);
+  const evidence = { ...quiet, processRefs: () => (w.supabaseCalls.length || c.sleeps.length ? ok([{ pid: process.pid, birth: 1, command: 'node pipeline.mjs stacks session-end', field: 'env' }]) : ok([])) };
+  const r = await runSessionEnd({ owner: OWNER, deps: depsFor(w, c, { evidence }) });
+  assert.deepEqual(r.uses, []);
+  assert.equal(outcomes(w, c.now() + 1).summary.miss, 0);
+  assert.equal(outcomes(w, c.now() + 1).summary.clean, 1);
+}));
+
+test('worker file: the worker records its own birth (so a reused pid is not mistaken for it); a ps that cannot tell leaves it out', () => withWorld({}, async (w, c) => {
+  let seen;
+  await runSessionEnd({ owner: OWNER, deps: depsFor(w, c, { procIdentity: (pid) => ok({ pid, birth: 4242 }), devSessionEnd: async () => { seen = readWorkerFile(w.workerFile).value; return []; } }) });
+  assert.equal(seen.birth, 4242);
+  seen = undefined;
+  const w2 = makeWorld({});
+  try {
+    await runSessionEnd({ owner: OWNER, deps: depsFor(w2, c, { procIdentity: () => unknown('ps timed out'), devSessionEnd: async () => { seen = readWorkerFile(w2.workerFile).value; return []; } }) });
+    assert.equal(seen.birth, undefined);
+  } finally {
+    w2.cleanup();
+  }
+}));

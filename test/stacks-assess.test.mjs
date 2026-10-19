@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, symlinkSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildCurrent, cwdDirs, findStack, freshStack, gatherEvidence, readLedgerLocked, summarizeEvidence, SESSION_END_PROBES, SWEEP_PROBES } from '../pipeline/lib/stacks/assess.mjs';
+import { buildCurrent, cwdDirs, findStack, freshStack, gatherEvidence, ownPids, readLedgerLocked, summarizeEvidence, SESSION_END_PROBES, SWEEP_PROBES } from '../pipeline/lib/stacks/assess.mjs';
 import { checkBinding, sessionEndVerdict } from '../pipeline/lib/stacks/decide.mjs';
 import { appendEvent } from '../pipeline/lib/stacks/ledger.mjs';
 import { stackFiles, lockDirs } from '../pipeline/lib/stacks/paths.mjs';
@@ -451,6 +451,57 @@ test('summarizeEvidence is compact and names unknowns', async () => {
     assert.equal(s.binding, 'ok');
     assert.deepEqual(s.notes, ['n1']);
     assert.ok(JSON.stringify(s).length < 600);
+  } finally {
+    w.cleanup();
+  }
+});
+
+// ---- the feature's own workers are never consumers ----
+
+const putWorker = (w, name, body) => {
+  mkdirSync(w.files.workers, { recursive: true });
+  writeFileSync(join(w.files.workers, name), typeof body === 'string' ? body : JSON.stringify(body));
+};
+
+test('ownPids: pids from workers/*.json; a recorded birth must still match (a reused pid is not ours); junk is a note, never a failure', () => {
+  const w = world();
+  try {
+    assert.deepEqual([...ownPids(w.root)], [], 'no workers folder is fine');
+    putWorker(w, '4242.json', { pid: 4242, birth: 50, owner: OWNER, phase: 'waiting' });
+    putWorker(w, 'self.json', { pid: 4343 }); // no birth recorded (the hook wrote it first): the pid alone counts
+    putWorker(w, '5050.json', { pid: 5050, birth: 60 }); // the pid now belongs to another process
+    putWorker(w, '6060.json', { pid: 6060, birth: 70 }); // liveness cannot be told
+    putWorker(w, 'broken.json', '{nope');
+    putWorker(w, 'array.json', '[1]');
+    putWorker(w, 'nopid.json', { pid: 'x' });
+    putWorker(w, '7070.json.tmp', { pid: 7070 });
+    const notes = [];
+    const isAlive = (o) => (o.pid === 4242 ? ok(true) : o.pid === 5050 ? ok(false) : unknown('ps timed out'));
+    const got = ownPids(w.root, { isAlive, notes });
+    assert.deepEqual([...got].sort(), [4242, 4343]);
+    assert.equal(notes.filter((n) => /broken\.json|array\.json|nopid\.json/.test(n)).length, 3);
+    // an unreadable folder or file never throws
+    assert.deepEqual([...ownPids(w.root, { readDir: () => { throw new Error('EACCES'); }, notes: [] })], []);
+    assert.deepEqual([...ownPids(w.root, { readFile: () => { throw new Error('EACCES'); }, isAlive, notes: [] })], []);
+  } finally {
+    w.cleanup();
+  }
+});
+
+test('gatherEvidence: every probe excludes the registered workers (alive, birth-checked) and the current process', async () => {
+  const w = world();
+  try {
+    putWorker(w, '4242.json', { pid: 4242, birth: 50 });
+    putWorker(w, '5050.json', { pid: 5050, birth: 60 });
+    const seen = {};
+    const grab = (name) => (...a) => { seen[name] = a[a.length - 1].excludePids; return ok([]); };
+    const evidence = { ...clean, connections: grab('connections'), processRefs: grab('processRefs'), cwdInside: grab('cwdInside') };
+    const ctx = ctxFor(w, { evidence, isAlive: (o) => ok(o.pid === 4242) });
+    await gatherEvidence(w.stack, ctx, { probes: ['connections', 'processRefs', 'cwdProcs'] });
+    for (const name of ['connections', 'processRefs', 'cwdInside']) {
+      assert.ok(seen[name].has(4242) && seen[name].has(process.pid), `${name} excludes the worker and itself`);
+      assert.ok(!seen[name].has(5050), `${name} still counts a reused pid`);
+    }
   } finally {
     w.cleanup();
   }

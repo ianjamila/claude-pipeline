@@ -17,7 +17,9 @@
 //      `use-observed` records (R2-9: a use is { t, project, pid, birth, command?, check }; a process born before the decision is a
 //      MISS). Then the worker file is removed.
 //
-// WORKER FILE (R3-4). workers/<pid>.json = { pid, owner, startedAt, phase: waiting | decided | observing, decidedAt, decisions }.
+// WORKER FILE (R3-4). workers/<pid>.json = { pid, birth?, owner, startedAt, phase: waiting | decided | observing, decidedAt, decisions }.
+// `birth` is the worker's own process birth, added by the worker once it runs (the hook cannot afford the lookup): with it, ownPids()
+// recognises the worker only while that exact process lives. The workers listed here are never consumers of a stack nor observed uses.
 // `decidedAt` is set once and never cleared, `decisions` counts the decision records appended; both are written only AFTER those
 // records are on disk, so a poller that reads the file late (the worker may already be `observing`) still finds the decision.
 // Every update is an atomic rename.
@@ -30,12 +32,12 @@ import { acquire as realAcquire, release as realRelease } from '../locks.mjs';
 import { run as realRun } from '../proc.mjs';
 import { isShared, loadMachineConfig, loadModes } from './config.mjs';
 import { sessionEndVerdict } from './decide.mjs';
-import { findClaudeOwner, isAlive as realIsAlive } from './identity.mjs';
+import { findClaudeOwner, isAlive as realIsAlive, procIdentity as realProcIdentity } from './identity.mjs';
 import { readInventory as realReadInventory, resolveDocker } from './inventory.mjs';
 import { leasesFor } from './ledger.mjs';
 import { isolation, projectAllowed, stackFiles, stacksRoot, stacksSeam } from './paths.mjs';
 import { resolveSupabase, stopStack as realStopStack } from './act.mjs';
-import { SESSION_END_PROBES, gatherEvidence, readLedgerLocked, summarizeEvidence } from './assess.mjs';
+import { SESSION_END_PROBES, gatherEvidence, ownPids, readLedgerLocked, summarizeEvidence } from './assess.mjs';
 import { appendDecision as realAppendDecision, memoryOfProject as realMemoryOfProject } from './outcomes.mjs';
 import * as realEvidence from './evidence.mjs';
 import { devSessionEnd as realDevSessionEnd } from './dev.mjs';
@@ -259,6 +261,13 @@ export async function runSessionEnd({ owner, deps = {} } = {}) {
     const bins = deps.bins ?? realEvidence.resolveProbeBins({ env, home, ...(deps.pipelineRoot ? { root: deps.pipelineRoot } : {}) });
     const docker = deps.docker ?? resolveDocker({ env, home, platform, ...(deps.pipelineRoot ? { root: deps.pipelineRoot } : {}) });
     const supabaseBin = deps.supabaseBin ?? resolveSupabase({ env, home, platform, ...(deps.pipelineRoot ? { root: deps.pipelineRoot } : {}) });
+    // The worker's own birth goes into its file before the long wait (past the not-configured / isolation gates, which probe nothing).
+    try {
+      const id = (deps.procIdentity ?? ((p) => realProcIdentity(p, { run, platform, ...(bins.ps ? { ps: bins.ps } : {}), ...(deps.probeKill ? { kill: deps.probeKill } : {}), deadlineAt: now() + 3000, now })))(pid);
+      if (id?.ok && id.value && Number.isFinite(id.value.birth)) wf.update({ birth: id.value.birth });
+    } catch {
+      /* without a birth the worker is excluded by pid alone */
+    }
     const probeKill = deps.probeKill;
     const isAliveFn = deps.isAlive ?? ((o) => realIsAlive(o, { run, ps: bins.ps, platform, ...(probeKill ? { kill: probeKill } : {}) }));
 
@@ -415,10 +424,13 @@ export async function runSessionEnd({ owner, deps = {} } = {}) {
     async function observe(offset) {
       const seen = seenUses;
       const deadlineAt = now() + DECISION_BUDGET_MS;
-      const probeOpts = { run, ...(bins.lsof ? { lsof: bins.lsof } : {}), ...(bins.ps ? { ps: bins.ps } : {}), ...(deps.kill ? { kill: deps.kill } : {}), platform, deadlineAt, now, excludePids: new Set([process.pid]) };
+      // never a consumer, never an observed use: this process and every registered worker of the feature (sibling workers included)
+      const own = new Set([process.pid, pid, ...ownPids(root, { isAlive: isAliveFn })]);
+      const probeOpts = { run, ...(bins.lsof ? { lsof: bins.lsof } : {}), ...(bins.ps ? { ps: bins.ps } : {}), ...(deps.kill ? { kill: deps.kill } : {}), platform, deadlineAt, now, excludePids: own };
       for (const { stack, decidedMs, generation } of targets) {
         const at = iso(now());
         const add = async (check, hit, why) => {
+          if (own.has(hit.pid)) return;
           const key = `${check}|${stack.project}|${hit.pid}|${hit.birth}|${hit.port ?? ''}`;
           if (seen.has(key)) return;
           seen.add(key);

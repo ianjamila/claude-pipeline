@@ -104,6 +104,50 @@ export function freshStack(project, { run = realRun, cfg, docker = 'docker', dea
   return ok({ fresh: findStack(inv.value, project), dockerDown: inv.value.dockerDown === true });
 }
 
+// ---- the feature's own processes ----
+
+// The pids of this feature's detached session-end workers, from <root>/workers/*.json (only the `pid` field is read). A worker's
+// own command line / environment names the project it works on, so it must never count as a consumer of that stack (C2/C3/cwd) nor
+// as an observed use. A file that records `birth` only counts while that exact process is alive (a reused pid is somebody else's
+// and stays visible); a file without `birth` (the hook wrote it first) counts by pid alone. Unreadable or malformed files are a note
+// (optional `notes` array), never a failure; no workers folder => empty set. `isAlive({pid, birth})` answers ok(bool) | unknown.
+export function ownPids(root, { readDir = (d) => fs.readdirSync(d), readFile = (p) => fs.readFileSync(p, 'utf8'), isAlive = realIsAlive, notes = [] } = {}) {
+  const pids = new Set();
+  const dir = stackFiles(root).workers;
+  let names;
+  try {
+    names = readDir(dir);
+  } catch (err) {
+    if (err?.code !== 'ENOENT') notes.push(`workers folder unreadable: ${shortMsg(err)}`);
+    return pids;
+  }
+  for (const name of names) {
+    if (!/\.json$/.test(name)) continue;
+    let rec;
+    try {
+      rec = JSON.parse(readFile(path.join(dir, name)));
+    } catch (err) {
+      notes.push(`worker file ${name} unreadable: ${shortMsg(err)}`);
+      continue;
+    }
+    if (!Number.isInteger(rec?.pid) || rec.pid <= 0) {
+      notes.push(`worker file ${name} has no usable pid`);
+      continue;
+    }
+    if (Number.isFinite(rec.birth)) {
+      let alive;
+      try {
+        alive = isAlive({ pid: rec.pid, birth: rec.birth });
+      } catch {
+        alive = null;
+      }
+      if (alive?.ok !== true || alive.value !== true) continue; // gone, reused, or unknown: not provably ours, so it stays visible
+    }
+    pids.add(rec.pid);
+  }
+  return pids;
+}
+
 // ---- evidence ----
 
 // The directories a "live process with cwd inside" check covers: the stack folder plus every consumer worktree that exists.
@@ -129,7 +173,8 @@ export function cwdDirs(stack, consumers, { home = os.homedir(), platform = proc
 //   probes        which of SESSION_END_PROBES / SWEEP_PROBES to run (any subset; 'binding' is the only one needing a fresh inventory)
 //   excludeOwner  {pid, birth} whose leases do not count as "other" (the exiting session); also never charged as live
 //   ctx           { root, files?, cfg, run, docker, bins: { lsof, ps }, platform, now, kill, home, isAlive, acquire, release,
-//                   readInventory, readEvents (async () => ok(events)), evidence (override probe functions), excludePids,
+//                   readInventory, readEvents (async () => ok(events)), evidence (override probe functions), excludePids
+//                   (default this process; the registered workers from ownPids() are always added; ownPids: a Set overriding that lookup),
 //                   ghFor, listWorktrees, git, fsx }
 //   evidence      { stack, paused?, keep?, otherLiveLeases?, liveLeases?, consumers?, prStates?, cwdProcs?, connections?, processRefs?,
 //                   uptimeMs?, memory?, transcripts?, binding? }: `stack` is the FRESH stack when one was read, else the assessed one
@@ -147,7 +192,8 @@ export async function gatherEvidence(stack, ctx = {}, { probes = SESSION_END_PRO
   const ev = { ...realEvidence, ...(ctx.evidence ?? {}) };
   const deadlineAt = now() + deadlineMs;
   const isAliveFn = ctx.isAlive ?? ((o) => realIsAlive(o, { run, ps: bins.ps, kill: ctx.kill, platform, deadlineAt, now }));
-  const excludePids = ctx.excludePids ?? new Set([process.pid]);
+  // the probes skip this process, its probe children, and every registered worker of the feature (never a consumer of a stack)
+  const excludePids = new Set([...(ctx.excludePids ?? [process.pid]), ...(ctx.ownPids ?? ownPids(root, { isAlive: isAliveFn }))]);
   const probeOpts = { run, ...(bins.lsof ? { lsof: bins.lsof } : {}), ...(bins.ps ? { ps: bins.ps } : {}), ...(ctx.kill ? { kill: ctx.kill } : {}), platform, deadlineAt, now };
 
   const evidence = {};

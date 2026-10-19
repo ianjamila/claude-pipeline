@@ -31,7 +31,7 @@ import { readInventory as realReadInventory, resolveDocker } from './inventory.m
 import { leasesFor } from './ledger.mjs';
 import { isolation, lockDirs, projectAllowed, stackFiles, stacksRoot } from './paths.mjs';
 import { resolveSupabase, stopStack as realStopStack } from './act.mjs';
-import { SWEEP_PROBES, gatherEvidence, readLedgerLocked, summarizeEvidence } from './assess.mjs';
+import { SWEEP_PROBES, gatherEvidence, ownPids, readLedgerLocked, summarizeEvidence } from './assess.mjs';
 import {
   WINDOW_MS, appendDecision as realAppendDecision, memoryOfProject as realMemoryOfProject, outcomeSummary, readDecisions, renderReport, renderWeekly, wouldStops,
 } from './outcomes.mjs';
@@ -441,11 +441,13 @@ export async function runSweep({ apply = false, deps = {} } = {}) {
       const t = now();
       const prior = [...priorStops.values()].filter((r) => lower(r.project) === lower(stack.project) && Date.parse(r.t) <= t && t - Date.parse(r.t) <= WINDOW_MS);
       if (prior.length === 0) return;
+      const own = new Set([process.pid, ...ownPids(root, { isAlive: isAliveFn })]); // the feature's own workers and this sweep are never a use
       const target = prior.sort((a, b) => Date.parse(a.t) - Date.parse(b.t))[prior.length - 1];
       for (const [check, probe] of [['C2', evidence.connections], ['C3', evidence.processRefs]]) {
         if (!probe?.ok || !Array.isArray(probe.value)) continue;
         for (const hit of probe.value) {
           const pid = Number.isInteger(hit?.pid) ? hit.pid : null;
+          if (pid !== null && own.has(pid)) continue;
           const birth = Number.isFinite(hit?.birth) ? hit.birth : null;
           const key = `${check}|${lower(stack.project)}|${pid}|${birth}`;
           if (seenUse.has(key)) continue;

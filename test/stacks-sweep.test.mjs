@@ -573,3 +573,31 @@ test('ledgerUses attributes events by project, else by the stack folder; current
     ['alpha', 2, null, '2026-10-19T10:30:00.000Z', '2026-10-19T10:30:00.000Z'],
   ]);
 });
+
+// ======================================================================= the feature's own processes
+
+test('a sweep never records a registered session-end worker (or itself) as a use of a would-stop, and tells the probes to skip it', async () => {
+  await withMachine({ mode: 'report' }, async (m) => {
+    const orphan = m.spec('orphan-demo');
+    const decidedAt = T0 - 30 * 60_000;
+    await appendDecision(m.files.actions, {
+      t: new Date(decidedAt).toISOString(), source: 'session-end', project: 'orphan-demo', generation: { id: orphan.id, startedAt: orphan.startedAt }, mode: 'report', action: 'would-stop', reasons: ['x'], evidence: {},
+    });
+    mkdirSync(m.files.workers, { recursive: true });
+    writeFileSync(join(m.files.workers, '9001.json'), JSON.stringify({ pid: 9001, birth: 77, phase: 'observing' }));
+    m.alive.add(key({ pid: 9001, birth: 77 }));
+    const before = Math.floor((decidedAt - 3 * 3_600_000) / 1000);
+    m.refs['orphan-demo'] = [
+      { pid: 9001, birth: 77, command: 'node pipeline.mjs stacks session-end --owner 1:2', field: 'env' },
+      { pid: process.pid, birth: before, command: 'node pipeline.mjs stacks sweep', field: 'env' },
+      { pid: 777, birth: before, command: 'psql orphan-demo', field: 'cmdline' },
+    ];
+    m.conns['orphan-demo'] = [{ pid: 9001, birth: 77, command: 'node', port: 54323 }];
+    let excluded;
+    const processRefs = (stack, o) => { excluded = o.excludePids; return ok(m.refs[stack.project] ?? []); };
+    const r = await m.sweep({}, { evidence: { ...m.evidence, processRefs } });
+    assert.deepEqual(m.actions().filter((d) => d.action === 'use-observed').map((d) => d.use.pid), [777]);
+    assert.equal(r.outcomes.miss, 1);
+    assert.ok(excluded.has(9001) && excluded.has(process.pid));
+  });
+});
