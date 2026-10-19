@@ -633,8 +633,8 @@ function makeMatchers(ctx) {
   // assignment holds that the scan cannot work out (or that holds a `$`) is no hit here: collectVars makes the name a run-time variable, and a write through one is refused as such.
   const hitReadings = (word) => {
     const own = paramReadings(word);
-    if (own.over || !ctx.assigned?.size) return own;
-    return Object.defineProperty([...readingsOf(word, ctx.assigned)], 'over', { value: false, enumerable: false });
+    if (!ctx.assigned?.size) return own;
+    return Object.defineProperty([...readingsOf(word, ctx.assigned)], 'over', { value: own.over === true, enumerable: false }); // (too many own readings stays a hit)
   };
   const rootRes = rootRegexes(ctx);
   const ancRes = ancestorRegexes(ctx);
