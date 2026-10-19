@@ -663,6 +663,53 @@ test('verify.skippable_steps: optional list of unique step names, each also in e
   assert.ok(unknown.errors.some((e) => /verify\.skippable_steps/.test(e) && /sql-arms/.test(e) && /expected_steps/.test(e)), unknown.errors.join('|'));
 });
 
+test('verify.after_fix: full (default) | quick; the by-path map and never list are validated', () => {
+  const withVerify = (extra) => validateConfig({ ...minimal(), verify: { ...minimal().verify, ...extra } });
+  assert.equal(validateConfig(minimal()).config.verify.after_fix, 'full', 'absent = full = today');
+  assert.equal(validateConfig(minimal()).config.verify.after_fix_steps_by_path, undefined);
+  assert.equal(validateConfig(minimal()).config.verify.after_fix_never, undefined);
+  for (const mode of ['full', 'quick']) assert.equal(withVerify({ after_fix: mode }).ok, true, mode);
+  for (const bad of ['fast', '', 'QUICK', true, null, 1]) {
+    const r = withVerify({ after_fix: bad });
+    assert.equal(r.ok, false, JSON.stringify(bad));
+    assert.ok(has(r, 'verify.after_fix'), r.errors.join('|'));
+  }
+  const good = withVerify({
+    after_fix: 'quick',
+    expected_steps: ['install', 'db', 'db-grants', 'sql-arms'],
+    after_fix_steps_by_path: { 'supabase/**': ['db', 'db-grants'], 'lib/*.ts': ['db'] },
+    after_fix_never: ['sql-arms'],
+  });
+  assert.equal(good.ok, true, good.errors.join('|'));
+  assert.deepEqual(good.config.verify.after_fix_steps_by_path, { 'supabase/**': ['db', 'db-grants'], 'lib/*.ts': ['db'] });
+  assert.deepEqual(good.config.verify.after_fix_never, ['sql-arms']);
+  assert.equal(withVerify({ after_fix_steps_by_path: {} }).ok, true, 'an empty map is the same as absent');
+  for (const bad of [['supabase/**'], 'supabase/**', null, 3]) {
+    const r = withVerify({ after_fix_steps_by_path: bad });
+    assert.equal(r.ok, false, JSON.stringify(bad));
+    assert.ok(has(r, 'verify.after_fix_steps_by_path'), r.errors.join('|'));
+  }
+  for (const bad of ['db', [], ['db', ''], ['db', 3], ['db', 'db'], null, {}]) {
+    const r = withVerify({ after_fix_steps_by_path: { 'supabase/**': bad } });
+    assert.equal(r.ok, false, JSON.stringify(bad));
+    assert.ok(has(r, 'verify.after_fix_steps_by_path'), r.errors.join('|'));
+  }
+  assert.equal(withVerify({ after_fix_steps_by_path: { '': ['db'] } }).ok, false, 'empty glob');
+  for (const bad of ['sql-arms', [''], ['a', 'a'], [1], null, {}]) {
+    const r = withVerify({ after_fix_never: bad });
+    assert.equal(r.ok, false, JSON.stringify(bad));
+    assert.ok(has(r, 'verify.after_fix_never'), r.errors.join('|'));
+  }
+  const banned = withVerify({ after_fix_steps_by_path: { 'supabase/**': ['db', 'sql-arms'] }, after_fix_never: ['sql-arms'] });
+  assert.equal(banned.ok, false);
+  assert.ok(banned.errors.some((e) => /after_fix_steps_by_path/.test(e) && /sql-arms/.test(e) && /after_fix_never/.test(e)), banned.errors.join('|'));
+  const unknown = withVerify({ expected_steps: ['install'], after_fix_steps_by_path: { 'supabase/**': ['db'] } });
+  assert.equal(unknown.ok, false);
+  assert.ok(unknown.errors.some((e) => /after_fix_steps_by_path/.test(e) && /db/.test(e) && /expected_steps/.test(e)), unknown.errors.join('|'));
+  const tooComplex = withVerify({ after_fix_steps_by_path: { [Array(20).fill('*').join('/a')]: ['db'] } });
+  assert.equal(tooComplex.ok, false, 'a glob the matcher refuses is a config error, not a runtime crash');
+});
+
 test('worktrees block: defaults when absent', () => {
   const r = validateConfig(minimal());
   assert.equal(r.ok, true, r.errors.join('; '));

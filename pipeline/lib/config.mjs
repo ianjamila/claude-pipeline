@@ -5,6 +5,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseYaml } from './yaml.mjs';
+import { globToRegExp } from './glob.mjs';
 
 function deepFreeze(value) {
   if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
@@ -36,7 +37,8 @@ export const DEFAULTS = deepFreeze({
   },
   // stop_queue_wait_minutes: how long verify.quick may WAIT (for a machine-wide heavy-check slot) before it runs, on top of the
   // Stop hook's own 840 s execution allowance. 0 = no queue. The hook's timeout in .claude/settings.json must grow to match.
-  verify: { report: '.verify/report.json', screenshots: '.verify/screenshots', stop_queue_wait_minutes: 0 },
+  // after_fix: what the verifier runs after review fixes are accepted: 'full' (today) or 'quick' (see `pipeline verify plan-after-fix`).
+  verify: { report: '.verify/report.json', screenshots: '.verify/screenshots', stop_queue_wait_minutes: 0, after_fix: 'full' },
   // guard_checks: the tamper-proof "Test integrity" and "Hard-stop scan" statuses are always required on top of
   // required_checks. false only for a repo that does not run the pipeline-guards workflow (e.g. this one).
   // approvers: GitHub logins whose approval labels (human-approved, test-change-approved) count. Empty = the repo owner,
@@ -81,12 +83,13 @@ const OWNER_APPROVALS = ['label', 'chat'];
 const PROVIDERS = ['vercel', 'github-deployments', 'other'];
 // Who owns the production smoke: the ship session (prod-watch) or a CI workflow that posts the result on the merged PR.
 const WATCH_MODES = ['session', 'workflow'];
+const AFTER_FIX_MODES = ['full', 'quick'];
 
 // Allowed keys per mapping. Anything else is a typo (or a removed option) and is rejected.
 const KEYS = {
   top: [...Object.keys(DEFAULTS), 'project'],
   worktrees: ['mode', 'protect', 'min_idle_hours', 'min_merged_hours', 'delete', 'archive', 'memory_dirs'],
-  verify: ['full', 'quick', 'report', 'screenshots', 'expected_steps', 'skippable_steps', 'stop_queue_wait_minutes'],
+  verify: ['full', 'quick', 'report', 'screenshots', 'expected_steps', 'skippable_steps', 'stop_queue_wait_minutes', 'after_fix', 'after_fix_steps_by_path', 'after_fix_never'],
   ci: ['required_checks', 'e2e_label', 'draft_while_iterating', 'guard_checks', 'approvers'],
   merge: ['command', 'wait_minutes'],
   preview: ['environment', 'smoke', 'provider'],
@@ -120,6 +123,52 @@ function merge(base, over) {
     return out;
   }
   return structuredClone(over);
+}
+
+// Optional. verify.after_fix_steps_by_path: { "<glob>": [step, ...] } - the extra steps (run as `verify.full --only ...`) a
+// quick after-fix verify adds when the round's fix diff touches a matching path. verify.after_fix_never: steps that may never
+// be run that way (they stay full-verify only), so none of them may appear in the map.
+function checkAfterFix(verify, errors) {
+  const never = verify.after_fix_never;
+  let neverOk = false;
+  if (never !== undefined) {
+    if (!Array.isArray(never) || !never.every(isStr)) errors.push('verify.after_fix_never must be an array of non-empty step names');
+    else if (new Set(never).size !== never.length) errors.push('verify.after_fix_never must not repeat a step name');
+    else neverOk = true;
+  }
+  const map = verify.after_fix_steps_by_path;
+  if (map === undefined) return;
+  if (!isObj(map)) {
+    errors.push('verify.after_fix_steps_by_path must be a mapping of glob -> list of step names');
+    return;
+  }
+  const expected = Array.isArray(verify.expected_steps) && verify.expected_steps.every(isStr) ? verify.expected_steps : null;
+  for (const [glob, steps] of Object.entries(map)) {
+    const where = `verify.after_fix_steps_by_path[${JSON.stringify(glob)}]`;
+    if (!isStr(glob)) {
+      errors.push('verify.after_fix_steps_by_path globs must be non-empty strings');
+      continue;
+    }
+    try {
+      globToRegExp(glob);
+    } catch (err) {
+      errors.push(`${where}: ${err.message}`);
+      continue;
+    }
+    if (!Array.isArray(steps) || steps.length === 0 || !steps.every(isStr)) {
+      errors.push(`${where} must be a non-empty array of non-empty step names`);
+      continue;
+    }
+    if (new Set(steps).size !== steps.length) errors.push(`${where} must not repeat a step name`);
+    if (neverOk) {
+      const banned = steps.filter((n) => never.includes(n));
+      if (banned.length) errors.push(`${where} lists step(s) that verify.after_fix_never forbids: ${banned.join(', ')}`);
+    }
+    if (expected) {
+      const unknown = steps.filter((n) => !expected.includes(n));
+      if (unknown.length) errors.push(`${where} names step(s) not in verify.expected_steps: ${unknown.join(', ')}`);
+    }
+  }
 }
 
 function unknownKeys(obj, allowed, prefix, errors) {
@@ -330,6 +379,8 @@ export function validateConfig(obj) {
         if (unknown.length) errors.push(`verify.skippable_steps names step(s) not in verify.expected_steps: ${unknown.join(', ')}`);
       }
     }
+    if (!AFTER_FIX_MODES.includes(verify.after_fix)) errors.push(`verify.after_fix must be ${AFTER_FIX_MODES.join('|')}`);
+    checkAfterFix(verify, errors);
   }
 
   const mergeSec = section(config, 'merge', errors);
