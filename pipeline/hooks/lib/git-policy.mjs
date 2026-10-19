@@ -1201,7 +1201,7 @@ function checkScriptFile(sf, dir, ctx, level) {
     // quoting is lost (`'x$y.sh'` reads as `x$y.sh`): if the word as written is a file, judge it before the textual rule
     const lit = checkScriptFile({ kind: sf.kind, family: sf.family, file: sf.file, candidate: true }, dir, ctx, level);
     if (lit) return lit;
-    return sf.kind !== 'exec' && GUARDED_WORDS.test(ctx.fullText)
+    return sf.kind !== 'exec' && judgedTexts(ctx).some((x) => GUARDED_WORDS.test(x))
       ? deny(`the script "${sf.file}" is named at run time and the line mentions a guarded operation, so what it runs cannot be verified. Name the file.`)
       : null;
   }
@@ -1611,6 +1611,16 @@ function implicitStartupVerdict(st, ctx, cmd, dir) {
 // (a `cd` inside a sourced file is not followed: evalString's directory is local to each call)
 function judgeScoped(text, dir, ctx, level, sf, child = false) {
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
+  // Why (#81 Codex R1-B1): the names a text assigns (assignedOf) and the words it mentions (the dynamic-script fallback) are those of EVERY text being judged, the script's own among them
+  const scopes = (ctx.scopeTexts ??= []);
+  scopes.push(text);
+  try {
+    return judgeScopedIn(text, dir, ctx, level, sf, child);
+  } finally {
+    scopes.pop();
+  }
+}
+function judgeScopedIn(text, dir, ctx, level, sf, child) {
   if (sf.sourced && !sf.candidate) return evalString(text, dir, ctx, level + 1);
   const saved = Object.assign(Object.create(null), ctx.vars);
   const savedTaint = new Set(ctx.tainted);
@@ -1668,12 +1678,19 @@ function checkSplices(c, dir, ctx, level) {
 // script named at run time.
 // the words a `${X:=w}` / `${X=w}` anywhere on the line (this text, or the line it came from) may have assigned: a later $X may be any of them.
 // Kept with the text it was worked out from: a nested context copies the fields of its parent but judges other text (a startup file).
+// Why (#81 Codex R1-B1): a script the guard opens assigns names of its own (`F=ok.sh; G=${F/ok/run}; bash $G`), which the outer line knows nothing about: the texts judged on the way (the line, then each
+// script or text one level down, see judgeScoped) all count. Only ever more readings than the line alone gave, never fewer.
+const judgedTexts = (ctx) => [ctx.fullText, ...(ctx.scopeTexts ?? [])].filter((t, i, a) => typeof t === 'string' && a.indexOf(t) === i); // (not lineText: a startup file is judged on its own text, not with the whole line as context)
+const textsOf = (ctx) => [ctx.lineText, ...judgedTexts(ctx)].filter((t, i, a) => typeof t === 'string' && a.indexOf(t) === i);
 const assignedOf = (ctx) => {
-  if (ctx.assigned && ctx.assignedFrom === ctx.fullText) return ctx.assigned;
+  const texts = textsOf(ctx);
+  const memo = (ctx.budget.assignedMemo ??= new Map()); // (a text read again at every level: parsed once)
   const out = new Map();
-  for (const t of [ctx.lineText, ctx.fullText]) for (const [n, ws] of assigningDefaults(typeof t === 'string' ? t : '')) out.set(n, [...new Set([...(out.get(n) ?? []), ...ws])]);
-  ctx.assigned = out;
-  ctx.assignedFrom = ctx.fullText;
+  for (const t of texts) {
+    let r = memo.get(t);
+    if (!r) { r = assigningDefaults(t); memo.set(t, r); }
+    for (const [n, ws] of r) out.set(n, [...new Set([...(out.get(n) ?? []), ...ws])]);
+  }
   return out;
 };
 
@@ -1708,7 +1725,7 @@ function checkCandidateScripts(sf, dir, ctx, level) {
   };
   const c = scriptCandidates(sf, { expand, dirs: [here], joinPath: (d, r) => path.resolve(d, r), readDir, ifs: ctx.vars.IFS, assigned: assignedOf(ctx) });
   if (c.over) return deny('too many words, a glob matching too many files, or glob syntax that cannot be resolved could be the script this command runs, so it cannot be verified. Name the script file.');
-  if (c.dynamic && GUARDED_WORDS.test(ctx.fullText)) {
+  if (c.dynamic && judgedTexts(ctx).some((x) => GUARDED_WORDS.test(x))) {
     return deny('which word is the script this command runs is only known at run time ($VAR / $(...) / a glob) and the line mentions a guarded operation, so it cannot be verified. Name the file and write the options literally.');
   }
   for (const file of c.files) {

@@ -380,6 +380,7 @@ export function readingsOf(word, assigned) {
   if (!assigned?.size) return rs;
   const out = new Set(rs);
   let over = rs.over === true;
+  let cut = false; // (the list was cut at MAX_READINGS: readings are missing, not just unresolvable)
   const queue = [...rs];
   while (queue.length && !over) {
     const r = queue.shift();
@@ -393,7 +394,7 @@ export function readingsOf(word, assigned) {
           if (out.has(nr)) continue;
           out.add(nr);
           queue.push(nr);
-          if (out.size > MAX_READINGS) { over = true; break; }
+          if (out.size > MAX_READINGS) { over = true; cut = true; break; }
         }
         if (over) break;
         continue;
@@ -408,12 +409,13 @@ export function readingsOf(word, assigned) {
         if (out.has(nr)) continue;
         out.add(nr);
         queue.push(nr);
-        if (out.size > MAX_READINGS) { over = true; break; }
+        if (out.size > MAX_READINGS) { over = true; cut = true; break; }
       }
       if (over) break;
     }
   }
-  return Object.defineProperty([...out].slice(0, MAX_READINGS), 'over', { value: over, enumerable: false });
+  const list = Object.defineProperty([...out].slice(0, MAX_READINGS), 'over', { value: over, enumerable: false });
+  return Object.defineProperty(list, 'cut', { value: cut, enumerable: false });
 }
 // The command lines a program named by a variable or a default word may run, with its arguments (`G=bash; $G ev.sh`, `"${X:-bash}" ev.sh`): the policies judge each as text one level
 // deeper. `over` (a non-enumerable property of the list): the readings were cut off or are too many, and the caller refuses.
