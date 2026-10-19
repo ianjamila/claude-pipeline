@@ -113,7 +113,8 @@ export function toResult(r) {
   // `signal` is how a caller tells "killed" from a plain `exit 1`: a signalled child has no exit status, so `code`
   // falls back to 1 and stderr is empty, which is exactly what git's "no match" answer looks like.
   const code = timedOut ? (r.status || TIMEOUT_EXIT_CODE) : (r.status ?? 1);
-  return { code, stdout: r.stdout ?? '', stderr, timedOut, signal: r.signal ?? null };
+  // `pid` is the child's process id (null when it never started): a caller that scans the process table must be able to exclude its own probes.
+  return { code, stdout: r.stdout ?? '', stderr, timedOut, signal: r.signal ?? null, pid: r.pid ?? null };
 }
 
 // `env` is merged over process.env, unless `replaceEnv` is set: then `env` IS the child's whole environment (nothing is
@@ -295,7 +296,12 @@ export function splitCommand(str, platform = process.platform) {
 // gate sees). An installed copy is recognised by the INSTALLED.json manifest the installer writes into the pipeline root
 // (the directory holding bin/); the repo checkout has none. When installed, a seam is ignored with one warning on stderr.
 export const PIPELINE_ROOT = fileURLToPath(new URL('..', import.meta.url));
-export const SEAM_VARS = ['PIPELINE_GH', 'PIPELINE_CODEX', 'PIPELINE_VERCEL', 'PIPELINE_TEST_MODE', 'PIPELINE_UPDATE_REMOTE'];
+// PIPELINE_DOCKER / PS / LSOF / SUPABASE / STACKS_DEADLINE_MS belong to the stack-stop hooks: they are read through stacksSeam
+// (lib/stacks/paths.mjs), which additionally requires an isolated state root.
+export const SEAM_VARS = [
+  'PIPELINE_GH', 'PIPELINE_CODEX', 'PIPELINE_VERCEL', 'PIPELINE_TEST_MODE', 'PIPELINE_UPDATE_REMOTE',
+  'PIPELINE_DOCKER', 'PIPELINE_PS', 'PIPELINE_LSOF', 'PIPELINE_SUPABASE', 'PIPELINE_STACKS_DEADLINE_MS',
+];
 export const isInstalledCopy = (root = PIPELINE_ROOT) => existsSync(path.join(root, 'INSTALLED.json'));
 
 const warned = new Set();

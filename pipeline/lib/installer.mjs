@@ -22,9 +22,16 @@ export const GUARD_FILES_MATCHER = 'Edit|Write|MultiEdit|NotebookEdit|Bash|Power
 export const HOOK_TIMEOUT_S = 15;
 export const SESSION_HOOK_TIMEOUT_S = 10;
 export const OWNER_GO_TIMEOUT_S = 10;
-// The events whose hooks this installer manages: guard hooks on PreToolUse, the version-status hook on SessionStart, the
-// owner-go recorder (#58: the owner's chat "merge") on UserPromptSubmit.
-const HOOK_EVENTS = ['PreToolUse', 'SessionStart', 'UserPromptSubmit'];
+// The stack-stop hooks (docs/specs/2026-10-19-stack-stop-design.md): stack-register (PreToolUse, fail-closed loader, one group per
+// matcher), stack-dev-bind (PostToolUse Bash) and stack-session-end (SessionEnd), the last two plain and non-blocking.
+export const STACK_REGISTER_MATCHERS = Object.freeze(['Bash', 'Read|Edit|Write|Grep|Glob|NotebookEdit']);
+export const STACK_REGISTER_TIMEOUT_S = 30;
+export const STACK_HOOK_TIMEOUT_S = 10;
+export const STACK_DEV_BIND_MATCHER = 'Bash';
+// The events whose hooks this installer manages: guard hooks and stack-register on PreToolUse, stack-dev-bind on PostToolUse, the
+// version-status hook on SessionStart, stack-session-end on SessionEnd, the owner-go recorder (#58: the owner's chat "merge") on
+// UserPromptSubmit.
+export const HOOK_EVENTS = ['PreToolUse', 'PostToolUse', 'SessionStart', 'SessionEnd', 'UserPromptSubmit'];
 export const STAGING_REL = 'backups/.staging';
 export const TILDE_ALLOW_ENTRY = 'Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)';
 export const SUBAGENT_NOTE = 'Pinned agent models (judge=opus, arbiter=fable) still win over this env var — verified on Claude Code 2.1.285; unpinned subagents use it.';
@@ -141,7 +148,7 @@ export function buildPlan(source) {
     const entries = walkFiles(pipelineDir)
       .filter((r) => r !== 'INSTALLED.json')
       .map((r) => ({ rel: `pipeline/${r}`, abs: path.join(pipelineDir, ...r.split('/')) }));
-    for (const hook of ['guard-git.mjs', 'guard-files.mjs', 'session-version.mjs', 'owner-go.mjs']) {
+    for (const hook of ['guard-git.mjs', 'guard-files.mjs', 'session-version.mjs', 'owner-go.mjs', 'stack-register.mjs', 'stack-dev-bind.mjs', 'stack-session-end.mjs']) {
       if (!entries.some((e) => e.rel === `pipeline/hooks/${hook}`)) problems.push(`pipeline/hooks/${hook} is missing`);
     }
     if (isFile(path.join(source, 'VERSION'))) {
@@ -472,6 +479,27 @@ const ownerGoHandlerFor = (home) => ({
   timeout: OWNER_GO_TIMEOUT_S,
 });
 
+// A plain (non-blocking) handler for a stack hook: never the fail-closed loader, so a failure of a PostToolUse / SessionEnd hook
+// can never block anything.
+const stackPlainHandlerFor = (home, name) => ({
+  type: 'command',
+  command: 'node',
+  args: [joinNative(home, 'pipeline', 'hooks', `${name}.mjs`)],
+  timeout: STACK_HOOK_TIMEOUT_S,
+});
+
+// stack-register goes through the fail-closed loader (a lease that could not be written must block, see register.mjs) with its own timeout.
+const stackRegisterHandlerFor = (home) => ({ ...handlerFor(home, 'stack-register'), timeout: STACK_REGISTER_TIMEOUT_S });
+
+// Our stack-hook groups by event. PreToolUse: one stack-register group per matcher (they come BEFORE the guards, see mergeSettings).
+export function ourStackGroups(home) {
+  return {
+    PreToolUse: STACK_REGISTER_MATCHERS.map((matcher) => ({ matcher, hooks: [stackRegisterHandlerFor(home)] })),
+    PostToolUse: [{ matcher: STACK_DEV_BIND_MATCHER, hooks: [stackPlainHandlerFor(home, 'stack-dev-bind')] }],
+    SessionEnd: [{ hooks: [stackPlainHandlerFor(home, 'stack-session-end')] }],
+  };
+}
+
 export function ourHookGroups(home, { skipFileGuard = false } = {}) {
   const groups = [{ matcher: GUARD_GIT_MATCHER, hooks: [handlerFor(home, 'guard-git')] }];
   if (!skipFileGuard) groups.push({ matcher: GUARD_FILES_MATCHER, hooks: [handlerFor(home, 'guard-files')] });
@@ -498,11 +526,12 @@ function assertShape(settings) {
   }
 }
 
-// Removes our handlers from hooks.PreToolUse, hooks.SessionStart and hooks.UserPromptSubmit in place; drops groups that this leaves empty.
-// Returns the count removed.
-function stripOurHandlers(settings, home) {
+// Removes our handlers from every event in HOOK_EVENTS in place; drops groups that this leaves empty.
+// Returns the count removed; `byEvent` (when given) receives the count per event.
+function stripOurHandlers(settings, home, byEvent = null) {
   let removed = 0;
   for (const event of HOOK_EVENTS) {
+    const before = removed;
     const groups = settings.hooks?.[event];
     if (!Array.isArray(groups)) continue;
     settings.hooks[event] = groups.filter((group) => {
@@ -513,6 +542,7 @@ function stripOurHandlers(settings, home) {
       group.hooks = kept;
       return kept.length > 0;
     });
+    if (byEvent) byEvent[event] = removed - before;
   }
   return removed;
 }
@@ -523,11 +553,17 @@ export function mergeSettings(settings, { home, skipFileGuard = false }) {
   assertShape(settings);
   const out = structuredClone(settings);
   stripOurHandlers(out, home);
+  const stack = ourStackGroups(home);
   out.hooks ??= {};
+  // Order: the stack-register groups, then the guards, so guard-files stays the LAST PreToolUse entry (the only order-sensitive event).
   out.hooks.PreToolUse ??= [];
-  out.hooks.PreToolUse.push(...ourHookGroups(home, { skipFileGuard }));
+  out.hooks.PreToolUse.push(...stack.PreToolUse, ...ourHookGroups(home, { skipFileGuard }));
+  out.hooks.PostToolUse ??= [];
+  out.hooks.PostToolUse.push(...stack.PostToolUse);
   out.hooks.SessionStart ??= [];
   out.hooks.SessionStart.push(...ourSessionStartGroups(home));
+  out.hooks.SessionEnd ??= [];
+  out.hooks.SessionEnd.push(...stack.SessionEnd);
   out.hooks.UserPromptSubmit ??= [];
   out.hooks.UserPromptSubmit.push(...ourPromptGroups(home));
   out.permissions ??= {};
@@ -536,13 +572,15 @@ export function mergeSettings(settings, { home, skipFileGuard = false }) {
   return out;
 }
 
-// Pure inverse for --uninstall. A container (PreToolUse, SessionStart, UserPromptSubmit, hooks, allow, permissions) that our removal
-// leaves empty is dropped, so installing into a settings file that had none of them and uninstalling round-trips.
+// Pure inverse for --uninstall. A container (a hook event, hooks, allow, permissions) that our removal leaves empty is dropped, so
+// installing into a settings file that had none of them and uninstalling round-trips. An event array is dropped only when WE
+// emptied it (an empty one the owner had, from which we removed nothing, stays).
 export function removeOurSettings(settings, { home }) {
   assertShape(settings);
   const out = structuredClone(settings);
-  if (stripOurHandlers(out, home) > 0) {
-    for (const event of HOOK_EVENTS) if (Array.isArray(out.hooks[event]) && out.hooks[event].length === 0) delete out.hooks[event];
+  const byEvent = {};
+  if (stripOurHandlers(out, home, byEvent) > 0) {
+    for (const event of HOOK_EVENTS) if (byEvent[event] > 0 && Array.isArray(out.hooks[event]) && out.hooks[event].length === 0) delete out.hooks[event];
     if (Object.keys(out.hooks).length === 0) delete out.hooks;
   }
   const allow = out.permissions?.allow;
@@ -566,18 +604,27 @@ const scriptOf = (handler) => {
   if (/\/guard-files\.mjs/.test(text)) return 'guard-files';
   if (/\/session-version\.mjs/.test(text)) return 'session-version';
   if (/\/owner-go\.mjs/.test(text)) return 'owner-go';
+  if (/\/stack-register\.mjs/.test(text)) return 'stack-register';
+  if (/\/stack-dev-bind\.mjs/.test(text)) return 'stack-dev-bind';
+  if (/\/stack-session-end\.mjs/.test(text)) return 'stack-session-end';
   return null;
 };
 
 // Our handlers, grouped by script, each flagged exact when it equals what install writes. The guards are read from
-// hooks.PreToolUse, the status hook from hooks.SessionStart, the owner-go recorder from hooks.UserPromptSubmit; one of ours under the wrong event is `unknown`.
+// hooks.PreToolUse, the status hook from hooks.SessionStart, the owner-go recorder from hooks.UserPromptSubmit, stack-register from
+// hooks.PreToolUse (one entry per matcher; an entry on a matcher we do not write is not exact), stack-dev-bind from hooks.PostToolUse and
+// stack-session-end from hooks.SessionEnd; one of ours under the wrong event is `unknown`.
 export function inspectHooks(settings, home) {
-  const out = { 'guard-git': [], 'guard-files': [], 'session-version': [], 'owner-go': [], unknown: [] };
+  const out = { 'guard-git': [], 'guard-files': [], 'session-version': [], 'owner-go': [], 'stack-register': [], 'stack-dev-bind': [], 'stack-session-end': [], unknown: [] };
+  const stack = ourStackGroups(home);
   const expected = {
     'guard-git': { event: 'PreToolUse', matcher: GUARD_GIT_MATCHER, handler: handlerFor(home, 'guard-git') },
     'guard-files': { event: 'PreToolUse', matcher: GUARD_FILES_MATCHER, handler: handlerFor(home, 'guard-files') },
     'session-version': { event: 'SessionStart', matcher: undefined, handler: sessionHandlerFor(home) },
     'owner-go': { event: 'UserPromptSubmit', matcher: undefined, handler: ownerGoHandlerFor(home) },
+    'stack-register': { event: 'PreToolUse', matchers: STACK_REGISTER_MATCHERS, handler: stack.PreToolUse[0].hooks[0] },
+    'stack-dev-bind': { event: 'PostToolUse', matcher: STACK_DEV_BIND_MATCHER, handler: stack.PostToolUse[0].hooks[0] },
+    'stack-session-end': { event: 'SessionEnd', matcher: undefined, handler: stack.SessionEnd[0].hooks[0] },
   };
   for (const event of HOOK_EVENTS) {
     const groups = settings?.hooks?.[event];
@@ -591,7 +638,8 @@ export function inspectHooks(settings, home) {
         out[script].push({
           matcher: group.matcher,
           handler,
-          exact: group.matcher === expected[script].matcher && isDeepStrictEqual(handler, expected[script].handler),
+          exact: (expected[script].matchers ? expected[script].matchers.includes(group.matcher) : group.matcher === expected[script].matcher)
+            && isDeepStrictEqual(handler, expected[script].handler),
         });
       }
     }
@@ -674,6 +722,19 @@ export function computeDrift({ home, plan, manifest, settings, settingsProblem, 
   hookCheck('guard-files', expectGuardFiles);
   hookCheck('session-version', true, 'SessionStart');
   hookCheck('owner-go', true, 'UserPromptSubmit');
+  hookCheck('stack-dev-bind', true, 'PostToolUse');
+  hookCheck('stack-session-end', true, 'SessionEnd');
+  // stack-register: once PER MATCHER, each exactly once and exact; an entry on any other matcher is not what install writes.
+  for (const matcher of STACK_REGISTER_MATCHERS) {
+    const list = found['stack-register'].filter((e) => e.matcher === matcher);
+    const label = `stack-register (${matcher})`;
+    if (list.length === 0) add('hook-missing', label, `hook missing: ${label} is not in hooks.PreToolUse`);
+    else if (list.length > 1) add('hook-duplicated', label, `hook duplicated: ${label} appears ${list.length} times in hooks.PreToolUse`);
+    else if (!list[0].exact) add('hook-differs', label, `hook differs: the ${label} entry is not what install writes (path or timeout)`);
+  }
+  for (const e of found['stack-register']) {
+    if (!STACK_REGISTER_MATCHERS.includes(e.matcher)) add('hook-differs', 'stack-register', `hook differs: a stack-register entry has matcher ${JSON.stringify(e.matcher ?? null)}, which install does not write`);
+  }
   for (const u of found.unknown) add('hook-unknown', null, `unrecognised hook entry in the pipeline hooks dir: ${JSON.stringify(u.handler)}`);
 
   const allow = Array.isArray(settings.permissions?.allow) ? settings.permissions.allow : [];
