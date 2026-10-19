@@ -90,7 +90,8 @@ export const SAFE_STEP = /^[A-Za-z0-9_.:-]+$/;
 const KEYS = {
   top: [...Object.keys(DEFAULTS), 'project'],
   worktrees: ['mode', 'protect', 'min_idle_hours', 'min_merged_hours', 'delete', 'archive', 'memory_dirs'],
-  verify: ['full', 'quick', 'report', 'screenshots', 'expected_steps', 'skippable_steps', 'stop_queue_wait_minutes', 'after_fix', 'after_fix_steps_by_path', 'after_fix_never', 'max_parallel_full', 'max_load', 'max_load_wait_minutes'],
+  verify: ['full', 'quick', 'report', 'screenshots', 'expected_steps', 'skippable_steps', 'stop_queue_wait_minutes', 'after_fix', 'after_fix_steps_by_path', 'after_fix_never', 'max_parallel_full', 'max_load', 'max_load_wait_minutes', 'deferrable_steps', 'ci_proof', 'ci_proof_inputs', 'ci_proof_wait_minutes'],
+  ci_proof: ['workflow', 'job', 'event'],
   ci: ['required_checks', 'e2e_label', 'draft_while_iterating', 'guard_checks', 'approvers'],
   merge: ['command', 'wait_minutes'],
   preview: ['environment', 'smoke', 'provider'],
@@ -190,6 +191,72 @@ function checkSlots(verify, errors) {
     else if (load === undefined) errors.push('verify.max_load_wait_minutes needs verify.max_load');
   }
   if (load !== undefined && wait === undefined) verify.max_load_wait_minutes = 10;
+}
+
+// Optional. verify.deferrable_steps: steps whose local run the final gate may replace with a GitHub Actions run (a verify report row
+// `skipped` + `skipKind: ci`). verify.ci_proof: { <step>: { workflow, job, event } } names that run by workflow FILE and job (never
+// by a check name alone); every deferrable step needs an entry and every entry a deferrable step. verify.ci_proof_inputs: globs of
+// extra files whose change makes a PR ineligible for CI proof. verify.ci_proof_wait_minutes: how long the ship skill waits for the
+// proof (no default: unset = it does not wait). The GATE reads deferrable_steps / ci_proof / ci_proof_inputs from the base branch.
+export const CI_PROOF_WORKFLOW = /^\.github\/workflows\/[^/]+\.ya?ml$/;
+function checkCiProof(verify, errors) {
+  const { deferrable_steps: deferrable, ci_proof: proof, ci_proof_inputs: inputs, ci_proof_wait_minutes: wait } = verify;
+  let deferrableOk = false;
+  if (deferrable !== undefined) {
+    if (!Array.isArray(deferrable) || deferrable.length === 0 || !deferrable.every(isStr)) errors.push('verify.deferrable_steps must be a non-empty array of non-empty step names');
+    else if (new Set(deferrable).size !== deferrable.length) errors.push('verify.deferrable_steps must not repeat a step name');
+    else {
+      deferrableOk = true;
+      if (deferrable.some((n) => !SAFE_STEP.test(n))) errors.push('verify.deferrable_steps: step names may only use letters, digits and . _ : -');
+      if (Array.isArray(verify.expected_steps)) {
+        const unknown = deferrable.filter((n) => !verify.expected_steps.includes(n));
+        if (unknown.length) errors.push(`verify.deferrable_steps names step(s) not in verify.expected_steps: ${unknown.join(', ')}`);
+      }
+    }
+  }
+  if (proof !== undefined) {
+    if (!isObj(proof)) errors.push('verify.ci_proof must be a mapping of step -> { workflow, job, event }');
+    else {
+      for (const [step, spec] of Object.entries(proof)) {
+        const where = `verify.ci_proof[${JSON.stringify(step)}]`;
+        if ((deferrable === undefined || deferrableOk) && !(deferrable ?? []).includes(step)) errors.push(`${where}: ${step} is not listed in verify.deferrable_steps`);
+        if (!isObj(spec)) {
+          errors.push(`${where} must be a mapping with workflow, job and event`);
+          continue;
+        }
+        unknownKeys(spec, KEYS.ci_proof, `${where}.`, errors);
+        if (typeof spec.workflow !== 'string' || !CI_PROOF_WORKFLOW.test(spec.workflow) || spec.workflow.split('/').some((p) => p === '..' || p === '.')) {
+          errors.push(`${where}.workflow must be a workflow file path like .github/workflows/ci.yml`);
+        }
+        if (!isStr(spec.job)) errors.push(`${where}.job must be a non-empty job name`);
+        if (spec.event === undefined) spec.event = 'pull_request';
+        else if (!isStr(spec.event)) errors.push(`${where}.event must be a non-empty event name`);
+      }
+      if (deferrableOk) {
+        const bare = deferrable.filter((n) => !Object.hasOwn(proof, n));
+        if (bare.length) errors.push(`verify.deferrable_steps lists step(s) with no verify.ci_proof entry: ${bare.join(', ')}`);
+      }
+    }
+  } else if (deferrableOk) {
+    errors.push(`verify.deferrable_steps needs verify.ci_proof (an entry for each of: ${deferrable.join(', ')})`);
+  }
+  if (inputs !== undefined) {
+    if (!Array.isArray(inputs) || !inputs.every(isStr)) errors.push('verify.ci_proof_inputs must be an array of non-empty globs');
+    else {
+      for (const g of inputs) {
+        try {
+          globToRegExp(g);
+        } catch (err) {
+          errors.push(`verify.ci_proof_inputs[${JSON.stringify(g)}]: ${err.message}`);
+        }
+      }
+      if (proof === undefined) errors.push('verify.ci_proof_inputs needs verify.ci_proof');
+    }
+  }
+  if (wait !== undefined) {
+    if (!(typeof wait === 'number' && Number.isFinite(wait) && wait > 0)) errors.push('verify.ci_proof_wait_minutes must be a number above 0');
+    else if (proof === undefined) errors.push('verify.ci_proof_wait_minutes needs verify.ci_proof');
+  }
 }
 
 function unknownKeys(obj, allowed, prefix, errors) {
@@ -403,6 +470,7 @@ export function validateConfig(obj) {
     if (!AFTER_FIX_MODES.includes(verify.after_fix)) errors.push(`verify.after_fix must be ${AFTER_FIX_MODES.join('|')}`);
     checkAfterFix(verify, errors);
     checkSlots(verify, errors);
+    checkCiProof(verify, errors);
   }
 
   const mergeSec = section(config, 'merge', errors);

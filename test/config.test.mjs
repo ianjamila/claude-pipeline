@@ -774,3 +774,67 @@ test('verify.max_parallel_full / max_load / max_load_wait_minutes: optional, val
   assert.ok(has(withVerify({ max_load: 8 }), 'verify.max_load needs verify.max_parallel_full'));
   assert.ok(has(withVerify({ max_parallel_full: 2, max_load_wait_minutes: 5 }), 'verify.max_load_wait_minutes needs verify.max_load'));
 });
+
+test('verify.deferrable_steps / ci_proof / ci_proof_inputs / ci_proof_wait_minutes: valid shapes, defaults and every refusal', () => {
+  const withVerify = (extra) => validateConfig({ ...minimal(), verify: { ...minimal().verify, ...extra } });
+  const spec = { workflow: '.github/workflows/ci.yml', job: 'SQL arms' };
+  const good = { deferrable_steps: ['sql-arms'], ci_proof: { 'sql-arms': spec } };
+
+  const none = validateConfig(minimal());
+  for (const k of ['deferrable_steps', 'ci_proof', 'ci_proof_inputs', 'ci_proof_wait_minutes']) assert.equal(none.config.verify[k], undefined, `${k}: no default`);
+
+  const ok = withVerify({ ...good, ci_proof_inputs: ['supabase/tests/**', 'package-lock.json'], ci_proof_wait_minutes: 12.5, expected_steps: ['typecheck', 'sql-arms'] });
+  assert.equal(ok.ok, true, ok.errors.join('; '));
+  assert.equal(ok.config.verify.ci_proof['sql-arms'].event, 'pull_request', 'event defaults to pull_request');
+  assert.deepEqual(ok.config.verify.ci_proof_inputs, ['supabase/tests/**', 'package-lock.json']);
+  assert.equal(ok.config.verify.ci_proof_wait_minutes, 12.5);
+  assert.equal(withVerify({ deferrable_steps: ['a'], ci_proof: { a: { ...spec, event: 'pull_request_target' } } }).config.verify.ci_proof.a.event, 'pull_request_target');
+  assert.equal(withVerify({ ...good, ci_proof: { 'sql-arms': { ...spec, workflow: '.github/workflows/db.yaml' } } }).ok, true, '.yaml is fine');
+
+  // deferrable_steps
+  for (const bad of ['sql-arms', [], ['a', 'a'], ['a', ''], ['a', 3], null, {}]) {
+    const r = withVerify({ deferrable_steps: bad, ci_proof: { a: { ...spec } } });
+    assert.ok(has(r, 'verify.deferrable_steps'), `${JSON.stringify(bad)}: ${r.errors.join('|')}`);
+  }
+  assert.ok(has(withVerify({ deferrable_steps: ['a b'], ci_proof: { 'a b': spec } }), 'step names may only use'));
+  const unknown = withVerify({ expected_steps: ['install'], ...good });
+  assert.ok(unknown.errors.some((e) => /verify\.deferrable_steps/.test(e) && /sql-arms/.test(e) && /expected_steps/.test(e)), unknown.errors.join('|'));
+
+  // ci_proof <-> deferrable_steps must agree both ways
+  assert.ok(has(withVerify({ deferrable_steps: ['sql-arms'] }), 'verify.deferrable_steps needs verify.ci_proof'));
+  assert.ok(has(withVerify({ deferrable_steps: ['sql-arms', 'db'], ci_proof: { 'sql-arms': spec } }), 'no verify.ci_proof entry: db'));
+  assert.ok(has(withVerify({ deferrable_steps: ['sql-arms'], ci_proof: { 'sql-arms': spec, db: spec } }), 'db is not listed in verify.deferrable_steps'));
+  assert.ok(has(withVerify({ ci_proof: { 'sql-arms': spec } }), 'sql-arms is not listed in verify.deferrable_steps'), 'ci_proof without deferrable_steps');
+
+  // ci_proof entries
+  for (const bad of ['ci.yml', null, [], 5]) assert.ok(has(withVerify({ ...good, ci_proof: { 'sql-arms': bad } }), 'must be a mapping'), JSON.stringify(bad));
+  assert.ok(has(withVerify({ ...good, ci_proof: 'x' }), 'verify.ci_proof must be a mapping'));
+  for (const workflow of [undefined, '', 'ci.yml', '.github/workflows/ci.yml/', '.github/workflows/sub/ci.yml', '.github/workflows/ci.txt', '.github/other/ci.yml', '.github/workflows/', '/.github/workflows/ci.yml', '.github/workflows/../x.yml', 7]) {
+    const r = withVerify({ ...good, ci_proof: { 'sql-arms': { ...spec, workflow } } });
+    assert.ok(has(r, '.workflow must be a workflow file path'), `${JSON.stringify(workflow)}: ${r.errors.join('|')}`);
+  }
+  for (const job of [undefined, '', '   ', 3, null]) assert.ok(has(withVerify({ ...good, ci_proof: { 'sql-arms': { ...spec, job } } }), '.job must be a non-empty job name'), JSON.stringify(job));
+  for (const event of ['', 3, null]) assert.ok(has(withVerify({ ...good, ci_proof: { 'sql-arms': { ...spec, event } } }), '.event must be a non-empty event name'), JSON.stringify(event));
+  assert.ok(has(withVerify({ ...good, ci_proof: { 'sql-arms': { ...spec, branch: 'main' } } }), 'unknown key'));
+
+  // ci_proof_inputs
+  for (const bad of ['supabase/**', [''], [3], null, {}]) assert.ok(has(withVerify({ ...good, ci_proof_inputs: bad }), 'verify.ci_proof_inputs must be an array'), JSON.stringify(bad));
+  assert.ok(has(withVerify({ ci_proof_inputs: ['a/**'] }), 'verify.ci_proof_inputs needs verify.ci_proof'));
+  assert.ok(has(withVerify({ ...good, ci_proof_inputs: ['a**b**c**d**e**f**g**h**i**j**k**l**m**n**o**p**q**r'] }), 'verify.ci_proof_inputs['), 'a glob the matcher refuses');
+  assert.equal(withVerify({ ...good, ci_proof_inputs: [] }).ok, true, 'an empty list is the same as absent');
+
+  // ci_proof_wait_minutes: positive number, no default, not a ceiling
+  for (const bad of [0, -1, '5', null, true, NaN, Infinity, []]) assert.ok(has(withVerify({ ...good, ci_proof_wait_minutes: bad }), 'verify.ci_proof_wait_minutes must be a number above 0'), String(bad));
+  assert.ok(has(withVerify({ ci_proof_wait_minutes: 5 }), 'verify.ci_proof_wait_minutes needs verify.ci_proof'));
+  assert.equal(withVerify({ ...good, ci_proof_wait_minutes: 90 }).ok, true);
+});
+
+test('verify.ci_proof parses from real YAML (hyphenated step names, nested mapping, quoted job)', () => {
+  const text = [
+    'version: 1', 'project: p', 'verify:', '  full: f', '  quick: q', '  deferrable_steps: [sql-arms]', '  ci_proof:', '    sql-arms:',
+    '      workflow: .github/workflows/ci.yml', '      job: "SQL arms"', '  ci_proof_inputs: [supabase/tests/**]', '  ci_proof_wait_minutes: 25', '',
+  ].join('\n');
+  const r = validateConfig(parseYaml(text));
+  assert.equal(r.ok, true, r.errors.join('; '));
+  assert.deepEqual(r.config.verify.ci_proof, { 'sql-arms': { workflow: '.github/workflows/ci.yml', job: 'SQL arms', event: 'pull_request' } });
+});
