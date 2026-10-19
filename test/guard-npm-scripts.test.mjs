@@ -280,3 +280,34 @@ test('t9 an inline operator in a write target is read like a name assigned with 
   }
   for (const cmd of ['F=ok; echo x > ~/${F/ok/other}/settings.json', 'F=ok; echo x > ~/${F/ok/other}/a.txt', 'F=a.ts; cp a ${F%.ts}.js', 'F=ok; cat ~/${F/ok/other}/a.txt']) assert.equal(f(cmd).decision, 'allow', cmd);
 });
+
+// ---- the edges of the rule -------------------------------------------------------------------------------------------------------------------------------------
+test('t9 a script that does not exist runs no hook, and --userconfig / --globalconfig make the package.json unknown', () => {
+  ok('npm run nothing', root({ prenothing: 'bad', postnothing: 'bad', lint: 'ok' }));
+  for (const cmd of ['npm --userconfig /e/rc run lint', 'npm run lint --userconfig=/e/rc', 'pnpm --globalconfig /e/rc lint']) {
+    assert.equal(git(cmd, treeFor(root({ lint: 'ok' }), BAD_GIT)).decision, 'deny', cmd);
+    assert.equal(filesGuard(cmd, treeFor(root({ lint: 'ok' }), BAD_FILES)).decision, 'deny', cmd);
+  }
+});
+test('t9 a directory the guard lost track of is refused only when the line mentions a guarded operation', () => {
+  const t = treeFor(root({ test: 'bad' }), BAD_GIT);
+  assert.equal(git('source ./env.sh && npm test', t).decision, 'allow');
+  const r = git(`source ./env.sh && npm test; echo ${PUSH}`, t);
+  assert.equal(r.decision, 'deny');
+  assert.match(r.reason, /directory this runs in is unknown/);
+});
+test('t9 a package.json the line itself writes before the manager reads it is refused', () => {
+  const t = root({ lint: 'ok' });
+  for (const cmd of [`echo '{}' > package.json && npm run lint`, `printf '{"scripts":{"lint":"echo hi"}}' > package.json; npm run lint`, `cp other.json package.json && npm test`, `echo '{}' > sub/package.json && npm --prefix sub run lint`]) {
+    const g = git(cmd, treeFor(t, BAD_GIT));
+    assert.equal(g.decision, 'deny', `git: ${cmd}`);
+    assert.match(g.reason, /writes .*package\.json/);
+    assert.equal(filesGuard(cmd, treeFor(t, BAD_FILES)).decision, 'deny', `files: ${cmd}`);
+  }
+  // another file written before is none of its business
+  ok(`echo hi > notes.txt && npm run lint`, t);
+});
+test('t9 a package-manager call inside a script judged with a script of its own sees that script\'s variables and directory', () => {
+  bad('npm run a', { 'package.json': { scripts: { a: 'cd sub && npm run b' } }, 'sub/package.json': { scripts: { b: 'bad' } } });
+  ok('npm run a', { 'package.json': { scripts: { a: 'cd sub && npm run b' } }, 'sub/package.json': { scripts: { b: 'ok' } } });
+});
