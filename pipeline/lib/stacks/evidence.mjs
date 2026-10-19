@@ -487,8 +487,8 @@ export function transcriptRefs(stack, { dirs, sinceMs = 0, platform = process.pl
 // ---------------------------------------------------------------- C4 consumer worktrees
 
 // Sessions whose Bash tool call names the stack with --workdir: each such line's cwd. -> { cwds } | unknown.
-function transcriptCwds(stack, { dirs, sinceMs, fsx, spellings, notes }) {
-  const exp = expandTranscriptDirs(dirs, { fsx });
+function transcriptCwds(stack, { dirs, sinceMs, fsx, spellings, notes, platform }) {
+  const exp = expandTranscriptDirs(dirs, { fsx, platform });
   if (!exp.ok) return exp;
   const listed = transcriptFilesStrict(exp.value, sinceMs, fsx, notes);
   if (listed.fail !== undefined || listed.ok === false) return listed;
@@ -568,7 +568,7 @@ export function consumerWorktrees(stack, {
   for (const p of ledger) add(p, 'ledger', knownAt(p)?.branch ?? null);
   // (a) transcript backfill
   if (transcripts?.dirs?.length) {
-    const t = transcriptCwds(stack, { dirs: transcripts.dirs, sinceMs: transcripts.sinceMs ?? 0, fsx, spellings, notes });
+    const t = transcriptCwds(stack, { dirs: transcripts.dirs, sinceMs: transcripts.sinceMs ?? 0, fsx, spellings, notes, platform });
     if (t.fail !== undefined || t.ok === false) return t;
     for (const cwd of t.cwds) {
       if (stack?.workdir && isInside(cwd, stack.workdir, platform)) continue;
