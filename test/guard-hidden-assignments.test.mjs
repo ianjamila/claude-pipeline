@@ -242,12 +242,14 @@ const chain = (twice, depth, words, names = 4) => {
   }
   return out;
 };
+const cpu = () => { const u = process.cpuUsage(); return (u.user + u.system) / 1000; }; // (CPU time, not the clock: a busy machine must not fail the test)
 test('three nested scripts that each assign four names twice and loop over eight words are refused at once, not at the deadline', () => {
-  const t0 = Date.now();
+  const t0 = cpu();
   const r = files('bash F1.sh', fakeFs(PROJ, chain(true, 3, 'w1 w2 w3 w4 w5 w6 w7 w8')));
   assert.equal(r.decision, 'deny');
   assert.match(r.reason, /too many readings/, r.reason);
-  assert.ok(Date.now() - t0 < 3000, `took ${Date.now() - t0} ms`);
+  const ms = cpu() - t0;
+  assert.ok(ms < 3000, `took ${Math.round(ms)} ms of CPU`);
 });
 test('a chain with a few readings is still allowed', () => {
   assert.equal(files('bash F1.sh', fakeFs(PROJ, chain(true, 2, 'w1 w2', 2))).decision, 'allow'); // (two names twice, two words: 8 readings a level)
@@ -256,11 +258,12 @@ test('a chain with a few readings is still allowed', () => {
 });
 test('loop words alone (names assigned once) also share the allowance across nested scripts', () => {
   const words = Array.from({ length: 20 }, (_, i) => `w${i + 1}`).join(' '); // (20 + 20^2 + 20^3 readings)
-  const t0 = Date.now();
+  const t0 = cpu();
   const r = files('bash F1.sh', fakeFs(PROJ, chain(false, 3, words)));
   assert.equal(r.decision, 'deny');
   assert.match(r.reason, /too many readings/, r.reason);
-  assert.ok(Date.now() - t0 < 3000, `took ${Date.now() - t0} ms`);
+  const ms = cpu() - t0;
+  assert.ok(ms < 3000, `took ${Math.round(ms)} ms of CPU`);
 });
 
 test('program text in quotes (node -e, awk, sed) is no assignment: += and a[i]= in it change nothing', () => {
