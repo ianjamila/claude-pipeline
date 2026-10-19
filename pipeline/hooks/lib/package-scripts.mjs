@@ -308,19 +308,72 @@ const PM_CHANGE_WORDS = new Set(['pkg', 'set-script', 'init', 'create', 'edit', 
 const CONFIG_WRITE_WORDS = new Set(['set', 'delete', 'edit', 'rm', 'remove', 'unset']);
 export const BACKGROUND = /(?<![&>|])&(?![&>])/;
 
+// Where a word names, from each directory the command may run in: string[] (a glob stays in the text when allowGlob), or null (only known at run time).
+function placeWord(site, dirs, w, allowGlob) {
+  const p = site.p ?? nodePath;
+  let t = site.expand ? site.expand(String(w ?? '')) : String(w ?? '');
+  if (/[$`]/.test(t) || (!allowGlob && /[*?[\]]/.test(t)) || t === '-') return null;
+  if (t === '~' || t.startsWith('~/')) { if (!site.home) return null; t = p.join(site.home, t.slice(1)); } else if (t.startsWith('~')) return null;
+  if (p.isAbsolute(t)) return [p.resolve(t)];
+  return dirs ? dirs.map((d) => p.resolve(d, t)) : null;
+}
+
+// #81 t11: the files the manager's decisions rest on, which a command of the line may create, remove or rename before it runs (ONE helper for both guards): a node_modules directory stops the search for a
+// package.json, a package.json in a directory on the way up is the project, server.js is `npm start`'s fallback, binding.gyp turns an install into node-gyp, the rc files and pnpm-workspace.yaml set what
+// the scripts run with. markerPaths names what a command touches; pkgDirtyFor asks whether it is one of those files in the package's directory or above it.
+export const PACKAGE_MARKERS = new Set(['node_modules', 'package.json', 'server.js', 'binding.gyp', '.npmrc', '.yarnrc', '.yarnrc.yml', 'bunfig.toml', '.bunfig.toml', 'pnpm-workspace.yaml']);
+const FS_CHANGERS = new Set(['mkdir', 'touch', 'rm', 'rmdir', 'unlink', 'mv', 'cp', 'ln', 'install', 'truncate', 'dd', 'mkfifo', 'shred', 'rename', 'ditto']);
+const FS_VALUE_OPTS = new Set(['-t', '--target-directory', '-S', '--suffix', '-m', '--mode', '-o', '-g', '-r', '-d', '--date', '-s', '--size', '--reference']);
+// string[] of the paths (a glob stays in the text), `null` when one of them is only known at run time, undefined when the command is none of these
+function markerPaths(words, site) {
+  const name = baseName(words[0] ?? '');
+  if (!FS_CHANGERS.has(name)) return undefined;
+  const p = site.p ?? nodePath;
+  const dirs = site.dirs ?? null;
+  const pos = [];
+  let target = null;
+  const out = [];
+  for (let i = 1; i < words.length; i++) {
+    const w = words[i];
+    if (w === '--') { pos.push(...words.slice(i + 1)); break; }
+    if (name === 'dd') { if (w.startsWith('of=')) pos.push(w.slice(3)); continue; }
+    if (w === '-t' || w === '--target-directory') { target = words[++i] ?? ''; continue; }
+    if (w.startsWith('--target-directory=')) { target = w.slice(19); continue; }
+    if (/^-t./.test(w) && !w.startsWith('--') && !(name === 'touch' || name === 'rm')) { target = w.slice(2); continue; }
+    if (FS_VALUE_OPTS.has(w) && !(name === 'rm' && w === '-r') && !(name === 'mkdir' && w === '-p')) { i++; continue; }
+    if (w.startsWith('-') && w !== '-') continue;
+    pos.push(w);
+  }
+  const place = (w) => placeWord(site, dirs, w, true);
+  const base = (w) => String(w).replace(/\/+$/, '').split('/').pop();
+  const add = (list) => { if (list === null) { out.push(null); return; } out.push(...list); };
+  const joinTo = (dest, src) => { const d = place(dest); const b = base(site.expand ? site.expand(src) : src); return d === null || /[$`]/.test(b) ? null : d.map((x) => p.join(x, b)); };
+  if (['cp', 'mv', 'ln', 'install', 'ditto', 'rename'].includes(name)) {
+    const dest = target ?? pos[pos.length - 1];
+    const srcs = target !== null ? pos : pos.slice(0, -1);
+    if (dest === undefined) return null;
+    add(place(dest));
+    for (const src of srcs) add(joinTo(dest, src));
+    if (name === 'mv' || name === 'rename') for (const src of srcs) add(place(src)); // (the source is gone)
+  } else for (const w of pos) add(place(w));
+  return out.includes(null) ? null : out;
+}
+// which of the marker files does the glob-or-literal path component `first` name?
+function componentIsMarker(first) {
+  if (PACKAGE_MARKERS.has(first)) return [first];
+  if (!/[*?[]/.test(first)) return [];
+  let rx;
+  try { rx = new RegExp('^' + first.replace(/[.+^$(){}|\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$'); } catch { return [...PACKAGE_MARKERS]; }
+  return [...PACKAGE_MARKERS].filter((m) => rx.test(m));
+}
+
 // site: { dirs: string[] | null (where the command runs; null: unknown), expand(word) -> text, home, p (path module), text (the line) }.
 // Returns null (changes no work tree), 'any' (changes something we cannot place), { k: 'tree' | 'new', dirs: string[] | null }.
 function gitEffect(words, site) {
   const p = site.p ?? nodePath;
   let dirs = site.dirs ?? null;
   const expand = (w) => (site.expand ? site.expand(String(w ?? '')) : String(w ?? ''));
-  const moved = (w) => {
-    let t = expand(w);
-    if (/[$`*?[\]]/.test(t) || t === '-') return null;
-    if (t === '~' || t.startsWith('~/')) { if (!site.home) return null; t = p.join(site.home, t.slice(1)); } else if (t.startsWith('~')) return null;
-    if (p.isAbsolute(t)) return [p.resolve(t)];
-    return dirs ? dirs.map((d) => p.resolve(d, t)) : null;
-  };
+  const moved = (w) => placeWord(site, dirs, w, false);
   if (GIT_LINE_HAZARD.test(site.text ?? '')) return 'any'; // (every git command of such a line: the definition of an alias may come after the command that runs it)
   let relocated = false; // --git-dir / --work-tree: the work tree is wherever the option says
   let i = 1;
@@ -375,6 +428,11 @@ export function markPackageState(budget, argvs, site = {}) {
     const e = stateEffect(a, site);
     if (e === true) budget.pkgDirty = true;
     else if (e) (budget.pkgGit ??= []).push(e);
+    const mp = markerPaths(a, site);
+    if (mp !== undefined) {
+      (budget.pkgMarkers ??= []).push(mp);
+      if (mp === null || mp.some((x) => x.split('/').includes('node_modules'))) budget.pkgBinsDirty = true; // (a bin may come or go)
+    }
     if (pmCall(a)?.installGroup) budget.pkgBinsDirty = true; // (an install adds and replaces node_modules/.bin)
   }
 }
@@ -387,10 +445,12 @@ export function pmStartDirs(call, cwds, home, p = nodePath) {
   return cwds.map((c) => p.resolve(c, d));
 }
 // Did an earlier command of the line (markPackageState) change what a manager started in one of `starts` reads? env: { pathExists, real(abs) -> abs, p }; deep: the call also reaches workspace packages below.
+// env.markers: ask about the marker files only (the callers ask that after the manager's own reading of what the line writes, so a write they model keeps its own message)
 export function pkgDirtyFor(budget, starts, env = {}) {
-  if (budget.pkgDirty) return true;
-  const list = budget.pkgGit;
-  if (!list?.length) return false;
+  if (!env.markers && budget.pkgDirty) return true;
+  const list = env.markers ? [] : budget.pkgGit;
+  const markers = env.markers ? budget.pkgMarkers : [];
+  if (!list?.length && !markers?.length) return false;
   if (starts === null || starts === undefined) return true;
   const p = env.p ?? nodePath;
   const forms = (x) => { const r = env.real ? env.real(x) : x; return r && r !== x ? [x, r] : [x]; };
@@ -405,7 +465,31 @@ export function pkgDirtyFor(budget, starts, env = {}) {
     }
     return null;
   };
-  for (const e of list) {
+  // a marker file (or a directory above the package, or one of its own that the line makes) created, removed or renamed in the package directory or any directory above it
+  for (const paths of markers ?? []) {
+    if (paths === null) return true;
+    for (const o of paths) {
+      for (const s of starts) {
+        for (const so of forms(s)) {
+          for (let a = so, n = 0; n < MAX_WALK; n++) {
+            for (const oo of forms(o)) {
+              if (oo === a) return true;
+              if (oo.startsWith(a === '/' ? '/' : `${a}/`)) {
+                const first = oo.slice(a === '/' ? 1 : a.length + 1).split('/')[0];
+                const hits = componentIsMarker(first);
+                // (a node_modules directory only stops the search where there is no package.json to find first)
+                if (hits.some((m) => !(m === 'node_modules' && exists(p.join(a, 'package.json'))))) return true;
+              }
+            }
+            const up = p.dirname(a);
+            if (up === a) break;
+            a = up;
+          }
+        }
+      }
+    }
+  }
+  for (const e of list ?? []) {
     if (e.dirs === null) return true;
     for (const s of starts) {
       for (const d of e.dirs) {

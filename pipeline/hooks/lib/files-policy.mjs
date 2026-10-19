@@ -1624,6 +1624,7 @@ function judgePackageScripts(c, dirs, ctx, opts, scanRaw = '') {
       mentionsGuarded: () => makeMatchers(ctx).rawHit(scanRaw, [d]) || SENSITIVE_WORDS.test(String(scanRaw).replace(/['"`\\]/g, '')),
     });
     if (plan.refuse) return deny(plan.refuse);
+    if (pkgDirtyFor(ctx.budget, pmStartDirs(call, [d], ctx.homePosix, posix), { markers: true, pathExists: (x) => ctx.api.existsSync(x), real: (q) => realResolve(q, ctx.api), p: posix })) return deny(`package script: an earlier command on the line (mkdir, touch, rm, mv, cp, ln ...) may create, remove or rename a package.json, node_modules, server.js, binding.gyp or configuration file that \`${c.argv.slice(0, 4).join(' ')}\` depends on (in the package's directory or above it), so which script it runs cannot be verified. Run it in a command of its own`);
     for (const run of plan.runs ?? []) {
       const key = `${run.file}\u0000${run.label}\u0000${run.text}`;
       if (seen.has(key)) continue;

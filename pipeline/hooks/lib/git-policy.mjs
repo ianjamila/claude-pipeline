@@ -1231,6 +1231,7 @@ const pkgEnv = (ctx, cwd) => ({
   written: (abs) => (writtenTo(ctx.writeFrames, abs, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: true }) ? 'known' : writtenTo(ctx.writeFrames, abs, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: false }) ? 'maybe' : null),
   mentionsGuarded: () => lineMentionsGuarded(ctx),
 });
+const MARKERS_MSG = (said) => `package script: an earlier command on the line (mkdir, touch, rm, mv, cp, ln ...) may create, remove or rename a package.json, node_modules, server.js, binding.gyp or configuration file that \`${said}\` depends on (in the package's directory or above it), so which script it runs cannot be verified. Run it in a command of its own.`;
 function packageScriptVerdict(argv, dir, ctx, level) {
   const call = pmCall(argv.map((a) => expandVars(a, ctx)));
   if (!call) return null;
@@ -1252,6 +1253,7 @@ function packageScriptVerdict(argv, dir, ctx, level) {
   }
   const plan = packageScripts(call, pkgEnv(ctx, dir));
   if (plan.refuse) return deny(plan.refuse);
+  if (pkgDirtyFor(ctx.budget, pmStartDirs(call, [dir], ctx.home, path), { markers: true, pathExists: ctx.pathExists, real: (q) => realLocation(ctx.realpath, q), p: path })) return deny(MARKERS_MSG(said));
   for (const run of plan.runs ?? []) {
     const v = judgeScriptText(run.text, { kind: 'shell', file: run.label }, run.file, run.dir, ctx, level);
     if (v) return v;

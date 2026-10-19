@@ -204,3 +204,18 @@ test('t11 a name of unknown value in the words of gh api / gh pr view names no p
     assert.equal(filesGuard(M + cmd, tree).decision, 'deny', cmd);
   }
 });
+
+// ---- 8. files the manager's decisions rest on, which the same line may create, remove or rename first (both guards, one helper: markerPaths / pkgDirtyFor) ------------------------------------------
+const markTree = { '.git': 'x', 'package.json': pkg(OK_SCRIPTS), 'sub/x.txt': 'x', 'logs/a.log': 'a' };
+test('t11 a command that makes, removes or renames a package.json, node_modules, server.js, binding.gyp or rc file the manager reads makes the script unknown', () => {
+  for (const cmd of ['rm package.json && npm run lint', 'mv package.json p.json; npm run lint', 'touch sub/package.json && cd sub && npm run lint', 'mkdir -p sub/node_modules && cd sub && npm run lint', 'touch server.js && npm start',
+    'touch binding.gyp; npm install', 'ln -s other/.npmrc .npmrc && npm run lint', 'rm -rf .. && npm run lint', 'rm -rf * && npm run lint', 'mv sub/x.txt package.json && npm run lint', 'cp x.json package.json && npm run lint',
+    'touch pnpm-workspace.yaml && pnpm -r run lint', 'rm -f "$F" && npm run lint', 'mkdir sub2 && cd sub2 && npm run lint', 'install -m 644 a .npmrc && npm run lint', 'dd if=a of=package.json 2>/dev/null; npm run lint', 'cp -t . a package.json && npm run lint']) {
+    const r = both(cmd, markTree);
+    assert.equal(r.git.decision, 'deny', `git: ${cmd}`);
+    assert.equal(r.files.decision, 'deny', `files: ${cmd}`);
+  }
+  // what they do elsewhere, or to other files, leaves it alone
+  for (const cmd of ['mkdir -p out && npm run lint', 'touch logs/b.log && npm run lint', 'rm -f logs/a.log; npm test', 'rm -rf dist .next && npm run lint', 'cp package.json /tmp/p.json && npm run lint', 'mv logs/a.log logs/b.log && npm run lint',
+    'rm -rf node_modules && npm run lint', 'mkdir -p sub/out && npm run lint', 'cp src/*.txt out/ && npm run lint', 'ln -s a.log logs/c.log && npm test', 'touch /tmp/x && npm run lint']) allowed(cmd, markTree);
+});
