@@ -4,6 +4,7 @@
 // pass `now` and `host`).
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { MARKERS, clip, line } from './render.mjs';
+import { MAX_PROOFS, MAX_PROOF_STEP } from './config.mjs';
 import { addCostEntry, addRetries, addSessions, costLines, costShapeProblem, setGuardBlocks } from './run-cost.mjs';
 
 export const RECORD_VERSION = 1;
@@ -172,10 +173,9 @@ const text = (v, max) => clip(String(v ?? '').trim(), max);
 // [{ step, source: 'local' }] (the Mac ran it) or [{ step, source: 'ci', run: { id, attempt, jobId, workflow, job, url } }] (GitHub's run
 // vouched for it). Written by `P merge` from its live gate evaluation; display + audit (the append-only ci-proof-used event is the copy
 // that survives a rewritten record).
-// MAX_PROOFS / MAX_PROOF_STEP are the one source of the limits: config validation (verify.deferrable_steps, verify.ci_proof) enforces
+// MAX_PROOFS / MAX_PROOF_STEP (defined in config.mjs, the vendored module) are the one source of the limits: config validation (verify.deferrable_steps, verify.ci_proof) enforces
 // them too, so a config the validator accepts can never produce proofs this record refuses (merge would then refuse forever).
-export const MAX_PROOFS = 20;
-export const MAX_PROOF_STEP = 64;
+export { MAX_PROOFS, MAX_PROOF_STEP };
 const PROOF_STEP = new RegExp(`^[A-Za-z0-9._:-]{1,${MAX_PROOF_STEP}}$`);
 const RUN_COUNTERS = ['id', 'attempt', 'jobId'];
 

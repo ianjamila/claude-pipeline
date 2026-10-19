@@ -6,7 +6,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { parseYaml } from './yaml.mjs';
 import { globToRegExp } from './glob.mjs';
-import { MAX_PROOFS, MAX_PROOF_STEP } from './run-record.mjs';
+
+// How many verify proofs a run record holds, and how long a proof step name may be. Defined here (config.mjs is vendored into
+// project repos; run-record.mjs is not) and imported by run-record.mjs, so a config this file accepts always fits the record.
+export const MAX_PROOFS = 20;
+export const MAX_PROOF_STEP = 64;
 
 function deepFreeze(value) {
   if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
