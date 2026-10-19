@@ -522,10 +522,21 @@ function transcriptCwds(stack, { dirs, sinceMs, fsx, spellings, notes }) {
   return { cwds: [...cwds], wdirs };
 }
 
+// A directory too broad to be "a consumer of this stack": `/`, `/Users`, a home directory (fewer than 3 path segments, like
+// dev.mjs usableRoots) or the home itself. Every process on the machine is inside one of those, so it would keep every stack
+// alive forever. -> a reason string, or null when the directory is specific enough.
+export function tooBroadDir(dir, { home = os.homedir(), platform = process.platform } = {}) {
+  const segs = String(dir).replace(/\\/g, '/').split('/').filter(Boolean);
+  if (segs.length < 3) return 'fewer than 3 path segments';
+  if (home && samePath(dir, home, platform)) return 'the home directory';
+  return null;
+}
+
 const PORT_ENV_RE = (ports) => new RegExp(`(?:127\\.0\\.0\\.1|localhost):(?:${ports.join('|')})(?!\\d)`);
 
 export function consumerWorktrees(stack, {
   events = [], transcripts = null, repos = [], platform = process.platform, listWorktrees = realListWorktrees, fsx = fs, spellings = pathSpellings,
+  home: homeDir = os.homedir(),
 } = {}) {
   if (platform === 'win32') return WINDOWS();
   const notes = [];
@@ -561,6 +572,14 @@ export function consumerWorktrees(stack, {
     for (const cwd of t.cwds) {
       if (stack?.workdir && isInside(cwd, stack.workdir, platform)) continue;
       const home = known.filter((w) => isInside(cwd, w.path, platform)).sort((a, b) => b.path.length - a.path.length)[0];
+      // a cwd in no known worktree is only a guess at where the session worked: an ancestor of the stack folder (a session started
+      // in `/` or the home directory) or a too-broad directory would put every process on the machine "inside" the stack
+      const broad = home ? null : tooBroadDir(cwd, { home: homeDir, platform });
+      const ancestor = !home && stack?.workdir && !samePath(cwd, stack.workdir, platform) && isInside(stack.workdir, cwd, platform);
+      if (broad || ancestor) {
+        notes.push(`transcript cwd ${JSON.stringify(cwd)} dropped as a consumer: ${broad ?? 'it is an ancestor of the stack folder'}`);
+        continue;
+      }
       add(home ? home.path : cwd, 'transcript', home?.branch ?? null);
     }
   }

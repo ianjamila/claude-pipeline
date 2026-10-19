@@ -331,11 +331,32 @@ test('cwdProcs covers the stack folder plus every EXISTING consumer worktree, on
   const w = world();
   try {
     let dirs;
-    const consumers = ok([{ path: '/wt/a', exists: true }, { path: '/wt/gone', exists: false }, { path: w.workdir, exists: true }, { path: '/wt/b', exists: true }]);
+    const consumers = ok([{ path: '/x/wt/a', exists: true }, { path: '/x/wt/gone', exists: false }, { path: w.workdir, exists: true }, { path: '/x/wt/b', exists: true }]);
     const ctx = ctxFor(w, { evidence: { ...clean, consumerWorktrees: () => consumers, cwdInside: (d) => { dirs = d; return ok([]); } } });
     await gatherEvidence(w.stack, ctx, { probes: ['cwdProcs'] });
-    assert.deepEqual(dirs, [w.workdir, '/wt/a', '/wt/b']);
+    assert.deepEqual(dirs, [w.workdir, '/x/wt/a', '/x/wt/b']);
     assert.deepEqual(cwdDirs({ workdir: '' }, undefined), []);
+  } finally {
+    w.cleanup();
+  }
+});
+
+test('cwdProcs: worktree "none" + cwd = the stack folder: the dirs are the folder (plus real worktrees), never an ancestor; broad dirs are dropped with a note', async () => {
+  const w = world();
+  try {
+    let dirs;
+    const home = '/Users/me';
+    const consumers = ok([
+      { path: '/', exists: true }, { path: '/Users', exists: true }, { path: home, exists: true }, { path: `${home}/`, exists: true },
+      { path: `${home}/wt/a`, exists: true },
+    ]);
+    const ctx = ctxFor(w, { home, evidence: { ...clean, consumerWorktrees: () => consumers, cwdInside: (d) => { dirs = d; return ok([]); } } });
+    const { evidence } = await gatherEvidence(w.stack, ctx, { probes: ['cwdProcs'] });
+    assert.deepEqual(dirs, [w.workdir, `${home}/wt/a`], 'only the stack folder and the real worktree');
+    assert.equal(evidence.cwdProcs.ok, true);
+    assert.ok(evidence.cwdProcs.notes.some((n) => /too broad/.test(n) && n.includes(home)), 'a note says what was dropped');
+    const direct = cwdDirs({ workdir: w.workdir }, [{ path: '/', exists: true }, { path: '/Users/me', exists: true }, { path: '/a/b', exists: true }, { path: '/a/b/c', exists: true }], { home });
+    assert.deepEqual(direct, [w.workdir, '/a/b/c'], 'fewer than 3 segments or the home directory never counts');
   } finally {
     w.cleanup();
   }

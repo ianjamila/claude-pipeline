@@ -255,6 +255,17 @@ test('cwdInside: a process with its cwd (or an open file) inside a dir is a hit;
   assert.deepEqual(run.calls.find((c) => c.cmd === LSOF).args, ['-n', '-P', '-w', '-F', 'pfn']);
 });
 
+test('cwdInside: ancestors of the stack folder (/, home, its parent) are never inside it; a process in it is', () => {
+  const folder = '/private/tmp/claude-501/-Users-me/abc/scratchpad/smoke/proj';
+  const out = text(
+    cwdProc(1, '/'), cwdProc(500, '/Users/me'), cwdProc(4002, '/private/tmp/x'), cwdProc(8000, '/Users/me/elsewhere'),
+    cwdProc(4001, `${folder}/supabase`, 'ftxt', 'n/usr/bin/node'),
+  );
+  const run = cwdMachine({ snapshot: SNAP, lsofOut: out, lstart: { 4001: LSTART } });
+  const r = cwdInside([folder], cwdOpts(run));
+  assert.deepEqual(r.ok && r.value, [{ pid: 4001, birth: BIRTH, dir: folder }]);
+});
+
 test('cwdInside: a nothing-inside machine is ok([]), and the probe children are excluded from hits', () => {
   assert.deepEqual(cwdInside(DIRS, cwdOpts(cwdMachine({ snapshot: SNAP, lsofOut: baseLsof(cwdProc(4001, '/Users/me/y')) }))).value, []);
   const withProbe = baseLsof(cwdProc(4001, '/Users/me/y'), cwdProc(7002, DIRS[1]), cwdProc(7001, DIRS[1]));
@@ -350,6 +361,24 @@ test('consumerWorktrees: transcript backfill ties a session whose Bash --workdir
   const r = consumerWorktrees(stackSa, { events: [], transcripts: { dirs: [dirs], sinceMs: 0 }, repos: [base], listWorktrees, platform: 'darwin' });
   assert.equal(r.ok, true);
   assert.deepEqual(r.value.map((w) => [w.path, w.via, w.branch]), [[wt, 'transcript', 'feat/t']], 'cwd resolves to the worktree, and only the --workdir command counts');
+});
+
+test('consumerWorktrees: a transcript cwd that is / , the home directory or an ancestor of the stack folder is dropped with a note', () => {
+  const { base, mk } = makeRepo();
+  const wt = mk('t');
+  const dirs = tmp('stacks-tr ');
+  const proj = path.join(dirs, '-Users-me-proj');
+  mkdirSync(proj, { recursive: true });
+  const line = (cwd) => JSON.stringify({ cwd, message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'supabase status --workdir /Users/me/stacks/sa.stack' } }] } });
+  const cwds = ['/', '/Users', '/Users/me', '/Users/me/stacks', path.join(wt, 'sub'), '/Users/me/elsewhere/proj'];
+  writeFileSync(path.join(proj, 's1.jsonl'), `${cwds.map(line).join('\n')}\n`);
+  const listWorktrees = () => [wtEntry(base, 'main'), wtEntry(wt, 'feat/t')];
+  const r = consumerWorktrees(stackSa, { events: [], transcripts: { dirs: [dirs], sinceMs: 0 }, repos: [base], listWorktrees, platform: 'darwin', home: '/Users/me' });
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.value.map((w) => w.path).sort(), [wt, '/Users/me/elsewhere/proj'].sort());
+  for (const dropped of ['/', '/Users', '/Users/me', '/Users/me/stacks']) {
+    assert.ok(r.notes.some((n) => n.includes(JSON.stringify(dropped)) || n.includes(`${dropped} `)), `a note names ${dropped}`);
+  }
 });
 
 test('consumerWorktrees: an unreadable worktree directory is unknown, not "no env files"', rootOnly, () => {

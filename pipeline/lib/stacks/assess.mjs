@@ -107,10 +107,20 @@ export function freshStack(project, { run = realRun, cfg, docker = 'docker', dea
 // ---- evidence ----
 
 // The directories a "live process with cwd inside" check covers: the stack folder plus every consumer worktree that exists.
-export function cwdDirs(stack, consumers) {
+// A consumer that is `/`, a home directory or has fewer than 3 path segments is dropped (every process is inside it); `notes`
+// (optional array) collects what was dropped.
+export function cwdDirs(stack, consumers, { home = os.homedir(), platform = process.platform, notes = [] } = {}) {
   const dirs = [];
   if (typeof stack?.workdir === 'string' && stack.workdir !== '') dirs.push(stack.workdir);
-  for (const w of consumers ?? []) if (w?.exists !== false && typeof w?.path === 'string' && !dirs.includes(w.path)) dirs.push(w.path);
+  for (const w of consumers ?? []) {
+    if (w?.exists === false || typeof w?.path !== 'string' || dirs.includes(w.path)) continue;
+    const broad = realEvidence.tooBroadDir(w.path, { home, platform });
+    if (broad) {
+      notes.push(`consumer directory ${JSON.stringify(w.path)} left out of the cwd check: too broad (${broad})`);
+      continue;
+    }
+    dirs.push(w.path);
+  }
   return dirs;
 }
 
@@ -195,6 +205,7 @@ export async function gatherEvidence(stack, ctx = {}, { probes = SESSION_END_PRO
         transcripts: cfg.status === 'ok' && cfg.transcriptDirs.length ? { dirs: cfg.transcriptDirs, sinceMs: now() - TRANSCRIPT_WINDOW_MS } : null,
         repos: cfg.repos ?? [],
         platform,
+        home,
         ...(ctx.listWorktrees ? { listWorktrees: ctx.listWorktrees } : {}),
         ...(ctx.fsx ? { fsx: ctx.fsx } : {}),
       });
@@ -220,7 +231,9 @@ export async function gatherEvidence(stack, ctx = {}, { probes = SESSION_END_PRO
     if (!c.ok) evidence.cwdProcs = unknown(`cwdProcs need the consumer worktrees: ${c.reason}`);
     else {
       try {
-        evidence.cwdProcs = ev.cwdInside(cwdDirs(probeStack, c.value), { ...probeOpts, excludePids });
+        const notes = [];
+        const found = ev.cwdInside(cwdDirs(probeStack, c.value, { home, platform, notes }), { ...probeOpts, excludePids });
+        evidence.cwdProcs = found.ok && notes.length ? { ...found, notes: [...(found.notes ?? []), ...notes] } : found;
       } catch (err) {
         evidence.cwdProcs = unknown(`cwd probe failed: ${shortMsg(err)}`);
       }
