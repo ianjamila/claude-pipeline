@@ -46,6 +46,7 @@ export const HOOK_BUDGET_MS = 1500;
 export const WAIT_MS = 10 * 60_000;
 export const POLL_MS = 2000;
 export const OBSERVE_AT_MS = Object.freeze([30 * 60_000, 120 * 60_000]);
+const OBSERVE_GRACE_MS = 5 * 60_000;
 const DECISION_BUDGET_MS = 120_000;
 
 const oneLine = (s) => String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, 300);
@@ -361,11 +362,14 @@ export async function runSessionEnd({ owner, deps = {} } = {}) {
 
     // ---- 5. observation at +30 and +120 min ----
     if (targets.length > 0) {
-      const decidedMs = now();
+      // Measured from the EARLIEST decision time (each record's own `t`), not from after all decisions: deciding and logging take
+      // time, and a +120 min probe taken later than that would fall outside the outcome window and be dropped.
+      const decidedAll = targets.map((t) => t.decidedMs).filter(Number.isFinite);
+      const baseMs = decidedAll.length ? Math.min(...decidedAll) : now();
       wf.update({ phase: 'observing' });
       for (const offset of deps.observeAtMs ?? OBSERVE_AT_MS) {
-        await sleep(Math.max(0, decidedMs + offset - now()));
-        await observe(offset);
+        await sleep(Math.max(0, baseMs + offset - now()));
+        await observe(offset, baseMs + offset);
       }
     }
     return result;
@@ -421,14 +425,18 @@ export async function runSessionEnd({ owner, deps = {} } = {}) {
 
     // One re-probe of C1-C3 for every would-stop / stopped project. What it sees after the decision is a "use"; the first sighting
     // of each (check, process) is recorded. A probe that cannot run (e.g. no listener on a stopped stack) is a note, not a use.
-    async function observe(offset) {
+    async function observe(offset, nominalMs) {
       const seen = seenUses;
-      const deadlineAt = now() + DECISION_BUDGET_MS;
+      const slotMs = now();
+      // A timer fires a little late. A late firing within the grace is stamped with its scheduled time, so the +120 min probe is not
+      // pushed past the window by the timer's own overshoot (a much later firing keeps its real time and is judged as it is).
+      const stampMs = slotMs > nominalMs && slotMs - nominalMs <= OBSERVE_GRACE_MS ? nominalMs : slotMs;
+      const deadlineAt = slotMs + DECISION_BUDGET_MS;
       // never a consumer, never an observed use: this process and every registered worker of the feature (sibling workers included)
       const own = new Set([process.pid, pid, ...ownPids(root, { isAlive: isAliveFn })]);
       const probeOpts = { run, ...(bins.lsof ? { lsof: bins.lsof } : {}), ...(bins.ps ? { ps: bins.ps } : {}), ...(deps.kill ? { kill: deps.kill } : {}), platform, deadlineAt, now, excludePids: own };
       for (const { stack, decidedMs, generation } of targets) {
-        const at = iso(now());
+        const at = iso(stampMs);
         const add = async (check, hit, why) => {
           if (own.has(hit.pid)) return;
           const key = `${check}|${stack.project}|${hit.pid}|${hit.birth}|${hit.port ?? ''}`;

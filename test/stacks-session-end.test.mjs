@@ -13,7 +13,7 @@ import { register } from '../pipeline/lib/stacks/register.mjs';
 import { readInventory } from '../pipeline/lib/stacks/inventory.mjs';
 import { stopArgs } from '../pipeline/lib/stacks/act.mjs';
 import { appendEvent } from '../pipeline/lib/stacks/ledger.mjs';
-import { readDecisions, outcomeSummary, appendDecision } from '../pipeline/lib/stacks/outcomes.mjs';
+import { readDecisions, outcomeSummary, appendDecision, WINDOW_MS } from '../pipeline/lib/stacks/outcomes.mjs';
 import { stackFiles, lockDirs } from '../pipeline/lib/stacks/paths.mjs';
 import { parseLstart } from '../pipeline/lib/stacks/identity.mjs';
 import { ok, unknown } from '../pipeline/lib/stacks/result.mjs';
@@ -816,4 +816,41 @@ test('worker file: the worker records its own birth (so a reused pid is not mist
   } finally {
     w2.cleanup();
   }
+}));
+
+// ---- R1-B5: the +30/+120 re-probes are measured from the decision time, so the last one stays inside the outcome window ----
+
+// Logging a decision takes 5 simulated minutes, so `now()` after all decisions is later than the decision's own time.
+const slowAppend = (c) => async (file, rec, o) => { c.t += 5 * 60_000; return appendDecision(file, rec, o); };
+
+test('re-probe: a use first seen at +120 min is still inside the outcome window when logging the decision took time (MISS, not CLEAN)', () => withWorld({ mode: 'report' }, async (w, c) => {
+  await w.lease(OWNER);
+  const decisionSec = Math.floor(T0 / 1000);
+  let hits = [];
+  const evidence = { ...quiet, processRefs: () => ok(hits) };
+  const sleep = async (ms) => {
+    await c.sleep(ms);
+    if (c.sleeps.length === 2) hits = [{ pid: 777, birth: decisionSec - 3600, command: 'psql alpha.stack', field: 'cmdline' }]; // only the last probe sees it
+  };
+  const r = await runSessionEnd({ owner: OWNER, deps: depsFor(w, c, { evidence, sleep, appendDecision: slowAppend(c) }) });
+  assert.equal(r.uses.length, 1);
+  const decided = outcomes(w, c.now()).decisions.find((d) => d.action === 'would-stop');
+  assert.ok(Date.parse(r.uses[0].t) - Date.parse(decided.t) <= WINDOW_MS, 'the last re-probe is at most 2 h after the decision');
+  assert.deepEqual(c.sleeps, [25 * 60_000, 90 * 60_000], 'scheduled from the decision time, not from after the decisions');
+  const { summary } = outcomes(w, c.now());
+  assert.equal(summary.miss, 1);
+  assert.equal(summary.rows[0].outcome, 'MISS');
+}));
+
+test('re-probe: a timer that fires a little late still stamps the +120 use inside the window', () => withWorld({ mode: 'report' }, async (w, c) => {
+  await w.lease(OWNER);
+  const decisionSec = Math.floor(T0 / 1000);
+  let hits = [];
+  const evidence = { ...quiet, processRefs: () => ok(hits) };
+  const sleep = async (ms) => {
+    await c.sleep(ms + (c.sleeps.length === 1 ? 1500 : 0)); // the last real timer overshoots
+    if (c.sleeps.length === 2) hits = [{ pid: 777, birth: decisionSec - 3600, command: 'psql alpha.stack', field: 'cmdline' }];
+  };
+  await runSessionEnd({ owner: OWNER, deps: depsFor(w, c, { evidence, sleep }) });
+  assert.equal(outcomes(w, c.now()).summary.miss, 1);
 }));
