@@ -28,9 +28,9 @@
 //   2. Binding: `pull_requests` (filled at READ time, so it proves the PR link but not what was tested) must hold exactly one entry, this
 //      PR, into the default branch; `head_branch` must be the PR's head branch; `head_repository` must be this repo (not a fork).
 //   3. What was tested: GitHub exposes `referenced_workflows` with the merge commit the run executed (`ref: refs/pull/<N>/merge` + `sha`).
-//      When present, that commit's tree (API git/commits/<sha>) must equal `git rev-parse HEAD^{tree}` of the worktree: a deterministic
-//      "this run tested exactly my tree". WEAKER CASE: a run without such an entry has no tree evidence; it is accepted on the strength
-//      of steps 1-2 plus the gate's own rule that the head already holds the base tip (Step 5.2), and says so in its reason.
+//      That commit's tree (API git/commits/<sha>) must equal `git rev-parse HEAD^{tree}` of the worktree: a deterministic "this run tested
+//      exactly my tree". There is NO weaker case (controller decision, stricter than the plan's first draft): a run without a usable
+//      refs/pull/<N>/merge entry carries no evidence of what it tested, so it is 'missing' and the Mac runs the step.
 //   4. The jobs of that attempt (`runs/<id>/attempts/<n>/jobs`, paginated) must hold exactly ONE job named spec.job (a sharded job needs a
 //      configured aggregator name; 0 or 2+ -> missing). completed+success -> pass; completed+failure|timed_out -> failure; cancelled,
 //      skipped and anything else -> missing (a cancelled run was superseded, it is not red); queued/in_progress -> pending.
@@ -119,9 +119,10 @@ function checkBinding({ run, pr, base, slug, view }) {
   if (run.head_repository?.full_name !== slug) throw missing(`run ${run.id} ran a head from ${run.head_repository?.full_name ?? '(unknown)'}, not ${slug} (a fork never counts)`);
 }
 
-// The merge commit the run executed, from referenced_workflows. -> null (no entry: the weaker case) or the commit sha.
+// The merge commit the run executed, from referenced_workflows. Anything but exactly one usable refs/pull/<pr>/merge commit is missing.
 function mergeCommitOf(run, pr) {
-  if (run.referenced_workflows === undefined || run.referenced_workflows === null) return null;
+  const noEvidence = () => missing(`run ${run.id} does not say which merge commit it tested; the Mac runs the step`);
+  if (run.referenced_workflows === undefined || run.referenced_workflows === null) throw noEvidence();
   if (!Array.isArray(run.referenced_workflows)) throw missing(`run ${run.id} has unreadable referenced_workflows`);
   const wanted = `refs/pull/${pr}/merge`;
   const found = new Set();
@@ -132,7 +133,8 @@ function mergeCommitOf(run, pr) {
     found.add(w.sha);
   }
   if (found.size > 1) throw missing(`run ${run.id} executed more than one merge commit of ${wanted}`);
-  return found.size === 1 ? [...found][0] : null;
+  if (found.size === 0) throw noEvidence();
+  return [...found][0];
 }
 
 function treeOfMergeCommit({ gh, slug, sha, root, run, pr }) {
@@ -151,9 +153,10 @@ function pickJob({ gh, slug, run, spec, head }) {
   const named = jobs.filter((j) => j.name === spec.job);
   if (named.length !== 1) throw missing(`run ${run.id} attempt ${run.run_attempt} has ${named.length} jobs named "${spec.job}", expected exactly one`);
   const [job] = named;
-  if (job.run_id !== undefined && job.run_id !== run.id) throw missing(`job ${job.id} belongs to run ${job.run_id}, not ${run.id}`);
-  if (job.run_attempt !== undefined && job.run_attempt !== run.run_attempt) throw missing(`job ${job.id} is from attempt ${job.run_attempt}, not ${run.run_attempt}`);
-  if (job.head_sha !== undefined && String(job.head_sha).toLowerCase() !== head) throw missing(`job ${job.id} ran ${String(job.head_sha).slice(0, 7)}, not ${head.slice(0, 7)}`);
+  // run_id, run_attempt and head_sha are REQUIRED on the job and must match (absent = missing): the job must be this run's, this attempt's, this head's.
+  if (job.run_id !== run.id) throw missing(`job ${job.id} belongs to run ${job.run_id ?? '(unknown)'}, not ${run.id}`);
+  if (job.run_attempt !== run.run_attempt) throw missing(`job ${job.id} is from attempt ${job.run_attempt ?? '(unknown)'}, not ${run.run_attempt}`);
+  if (String(job.head_sha ?? '').toLowerCase() !== head) throw missing(`job ${job.id} ran ${job.head_sha ? String(job.head_sha).slice(0, 7) : '(unknown)'}, not ${head.slice(0, 7)}`);
   return job;
 }
 
@@ -184,7 +187,7 @@ async function lookup({ root, step, spec, pr, head, base, gh }) {
   if (!['success', 'failure', 'timed_out'].includes(run.conclusion)) throw missing(`${label} ended ${run.conclusion ?? 'without a conclusion'}`);
 
   const mergeSha = mergeCommitOf(run, pr);
-  if (mergeSha !== null) treeOfMergeCommit({ gh, slug, sha: mergeSha, root, run, pr });
+  treeOfMergeCommit({ gh, slug, sha: mergeSha, root, run, pr });
 
   const job = pickJob({ gh, slug, run, spec, head });
   if (job.status !== 'completed') {
@@ -192,7 +195,7 @@ async function lookup({ root, step, spec, pr, head, base, gh }) {
     throw missing(`job "${spec.job}" of ${label} has the unknown status "${job.status}"`);
   }
   if (job.conclusion === 'success') {
-    const how = mergeSha === null ? 'run has no referenced_workflows, so the tree is vouched for by the up-to-date head only' : `tested merge commit ${mergeSha.slice(0, 7)}, tree equal to HEAD`;
+    const how = `tested merge commit ${mergeSha.slice(0, 7)}, tree equal to HEAD`;
     return {
       state: 'pass',
       reason: `job "${spec.job}" passed in ${label} of ${spec.workflow} (${how})`,

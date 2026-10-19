@@ -212,6 +212,18 @@ test('exactly one job named like the configured one: shards alone, duplicates or
   const r7 = otherHead.addRun();
   otherHead.jobs[r7.id] = jobsFor(r7, { patch: (j) => { j.head_sha = 'a'.repeat(40); } });
   is(await lookup(otherHead), 'missing', /ran aaaaaaa, not/, 'job from another head');
+
+  // run_id, run_attempt and head_sha are REQUIRED on the job: absent is as bad as wrong
+  for (const field of ['run_id', 'run_attempt', 'head_sha']) {
+    const bare = lookupScenario();
+    const r8 = bare.addRun();
+    bare.jobs[r8.id] = jobsFor(r8, { patch: (j) => { delete j[field]; } });
+    is(await lookup(bare), 'missing', /\(unknown\)/, `job without ${field}`);
+  }
+  const wrongRun = lookupScenario();
+  const r9 = wrongRun.addRun();
+  wrongRun.jobs[r9.id] = jobsFor(r9, { patch: (j) => { j.run_id = 1; } });
+  is(await lookup(wrongRun), 'missing', /belongs to run 1, not/, 'job of another run');
 });
 
 test('job outcomes: failure and timed_out are failures; cancelled, skipped, neutral and unknown are missing (a cancelled run was superseded, not red)', async () => {
@@ -319,7 +331,7 @@ test('referenced_workflows: the merge commit\'s tree must equal HEAD\'s tree (ma
   is(await lookup(apiDown), 'missing', /GitHub lookup failed.*HTTP 502/, 'commit API error');
 });
 
-test('referenced_workflows: another PR\'s merge ref, a malformed sha or several merge commits are refused; unrelated entries are ignored; none = the documented weaker case', async () => {
+test('referenced_workflows: another PR\'s merge ref, a malformed sha or several merge commits are refused; unrelated entries are ignored; no merge-commit evidence at all is missing (no weaker case)', async () => {
   const cases = [
     ['another PR ref', [{ ref: 'refs/pull/13/merge', sha: MERGE_SHA }], /executed refs\/pull\/13\/merge, not refs\/pull\/12\/merge/],
     ['no sha', [{ ref: 'refs/pull/12/merge' }], /names no merge commit/],
@@ -343,8 +355,8 @@ test('referenced_workflows: another PR\'s merge ref, a malformed sha or several 
     const weak = lookupScenario();
     weak.addRun({ patch: { referenced_workflows: refs } });
     const res = await lookup(weak);
-    is(res, 'pass', /no referenced_workflows, so the tree is vouched for by the up-to-date head only/, `weaker case ${JSON.stringify(refs)}`);
-    assert.ok(!weak.calls.some((c) => c.includes('/git/commits/')));
+    is(res, 'missing', /run 5001 does not say which merge commit it tested; the Mac runs the step/, `no evidence ${JSON.stringify(refs)}`);
+    assert.ok(!weak.calls.some((c) => c.includes('/git/commits/') || c.includes('/jobs?')), 'nothing further is looked up');
   }
 });
 
