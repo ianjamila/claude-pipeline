@@ -55,3 +55,4 @@ full record.
 - 2026-10-19 · #78 · test: guard timing caps measure CPU time; qualifier linearity test uses an equal-work span · risk high · rounds 1 · arbiter 0 · merged
 - 2026-10-19 · #79 · fix: project commands (merge, smoke) find gh when it is only in a fallback dir · risk high · rounds 1 · arbiter 0 · awaiting-owner-merge
 - 2026-10-19 · #79 · fix: project commands (merge, smoke) find gh when it is only in a fallback dir · risk high · rounds 1 · arbiter 0 · merged
+- 2026-10-19 · #82 · feat(verify): faster verify for database-heavy PRs (after-fix quick, machine slots, CI proof) · risk high · rounds 3 · arbiter 0 · awaiting-owner-merge
