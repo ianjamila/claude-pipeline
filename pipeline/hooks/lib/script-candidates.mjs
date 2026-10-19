@@ -36,7 +36,48 @@ export function execLineOf(sf, expand) {
 // which a policy expands from the variables of the line). `over`: more readings than MAX_READINGS (the caller refuses).
 const MAX_READINGS = 32;
 // (a parameter is a name, a name[subscript], a digit or a special parameter, optionally indirect: ${1:-w}, ${@:-w}, ${A[0]:-w}, ${!A:-w})
-const PARAM_OPEN = /\$\{(!?(?:[A-Za-z_]\w*(?:\[[^\]}]*\])?|\d+|[@*#?$!-]))(:?)([-=+?])/;
+export const PARAM_OPEN = /\$\{(!?(?:[A-Za-z_]\w*(?:\[[^\]}]*\])?|\d+|[@*#?$!-]))(:?)([-=+?])/;
+// The first match of PARAM_OPEN in `s`, found without its quadratic cost: the pattern reads a subscript up to the first `]` or `}` (unbounded), so on `${a[${a[${a[…` with no closer it read to the end of the
+// text from every `${` (9 s of CPU on a 200 kB word; a hook past the host's 15 s is ALLOWED). Here a subscript's end is looked up in the sorted positions of the closers (binary search), so each `${` costs
+// O(log n) and the answer is exactly the one PARAM_OPEN gives (same index, same groups). The two sticky patterns are the parts of PARAM_OPEN that are bounded.
+const PARAM_NAME = /\$\{(!?[A-Za-z_]\w*)/y;
+const PARAM_REST = /\$\{(!?(?:\d+|[@*#?$!-]))(:?)([-=+?])/y;
+const PARAM_OP = /(:?)([-=+?])/y;
+export function paramOpen(s) {
+  let closers = null; // positions of `]` and `}`, built when a subscript is first met
+  const nextCloser = (from) => {
+    if (!closers) { closers = []; for (let k = 0; k < s.length; k++) { const ch = s.charCodeAt(k); if (ch === 93 || ch === 125) closers.push(k); } }
+    let lo = 0;
+    let hi = closers.length;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (closers[mid] < from) lo = mid + 1; else hi = mid; }
+    return lo < closers.length ? closers[lo] : -1;
+  };
+  const found = (i, end, g1, op) => Object.assign([s.slice(i, end), g1, op[1], op[2]], { index: i });
+  for (let i = s.indexOf('${'); i >= 0; i = s.indexOf('${', i + 1)) {
+    PARAM_NAME.lastIndex = i;
+    const n = PARAM_NAME.exec(s);
+    if (n) {
+      const p = i + n[0].length;
+      if (s[p] === '[') {
+        const e = nextCloser(p + 1);
+        if (e >= 0 && s[e] === ']') {
+          PARAM_OP.lastIndex = e + 1;
+          const o = PARAM_OP.exec(s);
+          if (o) return found(i, e + 1 + o[0].length, s.slice(i + 2, e + 1), o);
+        }
+      } else {
+        PARAM_OP.lastIndex = p;
+        const o = PARAM_OP.exec(s);
+        if (o) return found(i, p + o[0].length, n[1], o);
+      }
+      continue; // (a name is followed by a letter or a digit only, so the digit and special-parameter forms below cannot match here)
+    }
+    PARAM_REST.lastIndex = i;
+    const r = PARAM_REST.exec(s);
+    if (r) return Object.assign([r[0], r[1], r[2], r[3]], { index: i });
+  }
+  return null;
+}
 export function paramReadings(word) {
   let list = [word];
   let over = false;
@@ -44,7 +85,7 @@ export function paramReadings(word) {
     const next = new Set();
     let changed = false;
     for (const s of list) {
-      const m = PARAM_OPEN.exec(s);
+      const m = paramOpen(s);
       if (!m) { next.add(s); continue; }
       let depth = 1;
       let j = m.index + m[0].length;
@@ -109,13 +150,267 @@ export function spliceLines(raw) {
 }
 
 // Why: `: ${X:=w}` / `${X=w}` assigns X for the commands after it, so a later `$X` may be w: the words such an expansion assigns, by name
-const ASSIGNING = /\$\{([A-Za-z_]\w*):?=([^}]*)\}/g;
+// (The head is found first and its `}` after it, the first one at or past the head, remembered for the next head: a pattern `([^}]*)\}` scans to the end for every head of a text of
+// `${a=${a=${a=…` that never closes, which is quadratic: 12 s at 200 kB. A value over MAX_VALUE_CHARS is the unknown word, which readingsOf refuses like any word that holds `$`.)
+const ASSIGNING = /\$\{([A-Za-z_]\w*):?=/g;
 export function assigningDefaults(text) {
   const out = new Map();
-  for (const m of String(text ?? '').matchAll(ASSIGNING)) {
+  const t = String(text ?? '');
+  let close = -2;
+  for (const m of t.matchAll(ASSIGNING)) {
+    const from = m.index + m[0].length;
+    if (close !== -1 && close < from) close = t.indexOf('}', from);
+    // Defensive (mutation check): without the early break, each head searches the rest of the line with the native indexOf (a memory scan), which stays inside the 6 s bound of the 200 kB shapes.
+    if (close === -1) break; // (no `}` from here on: no later head closes either)
+    const v = close - from > MAX_VALUE_CHARS ? UNKNOWN_WORD : t.slice(from, close);
     const ws = out.get(m[1]) ?? [];
-    if (!ws.includes(m[2])) ws.push(m[2]);
+    if (!ws.includes(v)) ws.push(v);
     out.set(m[1], ws);
+  }
+  for (const [n, ws] of assignedValues(String(text ?? ''))) out.set(n, [...new Set([...(out.get(n) ?? []), ...ws])]);
+  return out;
+}
+
+// Why (#81 t8, found by the security pass, on main too): `G=${U:-run.sh}; bash $G`, `F=ok.sh; G=${F/ok/run}; bash $G`, `F=(ok.sh run.sh); bash ${F[1]}` run run.sh while both guards judged a word
+// they could not resolve (the value is kept as written, `${U:-run.sh}`, and a script that is only known at run time is let through on a line that names no guarded operation). The value
+// of an assignment that holds an expansion with an operator, or is an array, is worked out here into the words the name may hold; readingsOf then reads a later `$G` as each of them,
+// like the words a `${X:=w}` assigns (above), so each is judged as a script. The name is `NAME` for a scalar and `NAME[]` for an array (every element is a candidate for any subscript,
+// `[@]`, `[*]` or bare use, `+=` and `NAME[i]=` included).
+//   - `${U:-w}` `${U-w}` `${U:=w}` `${U=w}` `${U:+w}` `${U+w}` (paramReadings): the value of U, w, or nothing. The value of a name nothing here gives is the environment's, as for any name the line does
+//     not set: that reading is left out (a `$G` of it stays a word only known at run time, judged as before).
+//   - `${F/pat/rep}` `${F//pat/rep}` `${F#p}` `${F##p}` `${F%p}` `${F%%p}` `${F^^}` `${F,,}` `${F:o:n}` on a name the text gives literal words: worked out for each (a glob `*` `?` in a pattern too). A name nothing here
+//     gives is the environment's (left out as above); any other operator on a name the text does give makes the word unknown (`$(?)`: readingsOf refuses it).
+export const UNKNOWN_WORD = '$(?)';
+// Every limit keeps the scan linear-ish and short: a hook past its deadline is ALLOWED by the host, and a regular expression cannot be interrupted. No regular expression here matches a glob; the
+// matcher below counts its steps against one allowance per call, and a pattern, value or line over a cap gives UNKNOWN_WORD (refused when the name is used as a script), never a guess.
+const MAX_ASSIGN_WORDS = 32;
+const MAX_ASSIGN_ENTRIES = 256; // assignments that hold an expansion or an array
+const MAX_PLAIN_ENTRIES = 4096; // all assignments (plain values feed the operators)
+const WILD = '*'; // the key that stands for EVERY name: the text had more than the scan follows (readingsOf refuses any word that reads a variable)
+const wildcard = () => new Map([[WILD, [UNKNOWN_WORD]]]);
+const MAX_VALUE_CHARS = 1024; // one assigned word, scanned
+const MAX_OP_VALUE = 512; // a value an operator is applied to
+const MAX_PATTERN = 64;
+const MAX_STARS = 8;
+const MAX_GLOB_TICKS = 200_000;
+class Over extends Error {}
+// whole-string glob match with `*` and `?` (a linear two-pointer walk with the star backtrack: O(pattern x value)); every step is counted
+function globMatch(p, s, work) {
+  let pi = 0;
+  let si = 0;
+  let star = -1;
+  let mark = 0;
+  while (si < s.length) {
+    // Defensive (mutation check): the step allowance is also held by the pattern cap (MAX_PATTERN) and the star cap (MAX_STARS).
+    if (++work.n > MAX_GLOB_TICKS) throw new Over();
+    if (pi < p.length && p[pi] === '*') { star = pi++; mark = si; }
+    else if (pi < p.length && (p[pi] === '?' || p[pi] === s[si])) { pi++; si++; }
+    else if (star >= 0) { pi = star + 1; si = ++mark; }
+    else return false;
+  }
+  while (pi < p.length && p[pi] === '*') pi++;
+  return pi === p.length;
+}
+// the value with the operator applied, or undefined (not worked out: the caller makes the word unknown)
+function applyOp(v, op, arg, work) {
+  // Defensive (mutation check): the value cap is also held by the pattern and star caps (MAX_PATTERN, MAX_STARS).
+  if (v.length > MAX_OP_VALUE) return undefined;
+  if (op === '^^') return v.toUpperCase();
+  if (op === ',,') return v.toLowerCase();
+  if (op === '^') return v.slice(0, 1).toUpperCase() + v.slice(1);
+  if (op === ',') return v.slice(0, 1).toLowerCase() + v.slice(1);
+  if (op === ':') {
+    const m = /^\s{0,8}(-?\d{1,6})(?::(\d{1,6}))?$/.exec(arg);
+    if (!m) return undefined;
+    const off = +m[1] < 0 ? Math.max(0, v.length + +m[1]) : +m[1];
+    return m[2] === undefined ? v.slice(off) : v.slice(off, off + +m[2]);
+  }
+  const cut = op === '/' || op === '//' ? arg.indexOf('/') : -1;
+  const pat = cut < 0 ? arg : arg.slice(0, cut);
+  if (pat.length > MAX_PATTERN || /[[\\]/.test(pat) || pat.split('*').length - 1 > MAX_STARS) return undefined;
+  try {
+    if (op === '#' || op === '##' || op === '%' || op === '%%') {
+      const idx = [...Array(v.length + 1).keys()];
+      if (op === '#' || op === '##') { for (const i of op === '#' ? idx : idx.reverse()) if (globMatch(pat, v.slice(0, i), work)) return v.slice(i); return v; }
+      for (const i of op === '%%' ? idx : idx.reverse()) if (globMatch(pat, v.slice(i), work)) return v.slice(0, i);
+      return v;
+    }
+    if (op === '/' || op === '//') {
+      const rep = cut < 0 ? '' : arg.slice(cut + 1);
+      if (pat === '' || /^[#%]/.test(pat) || /[&\\]/.test(rep)) return undefined;
+      let out = '';
+      let i = 0;
+      while (i < v.length) {
+        let hit = -1;
+        for (let j = v.length; j > i; j--) if (globMatch(pat, v.slice(i, j), work)) { hit = j; break; } // (the longest match at this place)
+        if (hit < 0) { out += v[i++]; continue; }
+        out += rep;
+        i = hit;
+        if (op === '/') { out += v.slice(i); i = v.length; }
+      }
+      return out;
+    }
+  } catch (e) { if (e instanceof Over) return undefined; throw e; }
+  return undefined;
+}
+// the index of the `}` that closes the `${` whose `{` is at s[i], or -1 when the text between holds anything the scan cannot follow exactly (a quote, a backslash, a backtick, `$(`, `$'`)
+// or the brace never closes: the caller then makes the word unknown
+function closeBrace(s, i) {
+  let depth = 1;
+  for (let j = i + 1; j < s.length && j < i + MAX_VALUE_CHARS; j++) {
+    const c = s[j];
+    // Defensive (mutation check): a quote inside the braces is still refused by the paramReadings quote check.
+    if (c === "'" || c === '"' || c === '\\' || c === '`' || (c === '$' && (s[j + 1] === '(' || s[j + 1] === "'"))) return -1;
+    if (c === '{') depth++;
+    else if (c === '}' && --depth === 0) return j;
+  }
+  return -1;
+}
+// one word of the value at s[i...], quotes removed exactly as the shell does for what it follows (single quotes, double quotes without expansions the scan cannot follow, concatenations),
+// up to an unquoted blank or `;&|<>` (and `)` inside an array): [word, index after it]; word null when the word holds anything else (a backslash, `$'`, a backtick, `$(`, a brace or quote
+// it cannot follow, more than MAX_VALUE_CHARS). A `${…}` is kept as written, its text free of quotes (closeBrace).
+function valueWord(s, i, inArray) {
+  let w = '';
+  const stop = Math.min(s.length, i + MAX_VALUE_CHARS);
+  for (; i < stop; i++) {
+    const c = s[i];
+    if (/\s/.test(c) || ';&|<>'.includes(c) || (c === ')' && inArray) || (c === '(' && !inArray)) return [w, i];
+    if (c === '\\' || c === '`' || (c === '$' && (s[i + 1] === '(' || s[i + 1] === "'"))) return [null, i];
+    if (c === "'") { const j = s.indexOf("'", i + 1); if (j < 0 || j >= stop) return [null, i]; w += s.slice(i + 1, j); i = j; continue; }
+    if (c === '"') {
+      for (i++; i < stop && s[i] !== '"'; i++) {
+        const d = s[i];
+        if (d === '\\' || d === '`' || (d === '$' && (s[i + 1] === '(' || s[i + 1] === "'"))) return [null, i];
+        if (d === '$' && s[i + 1] === '{') { const j = closeBrace(s, i + 1); if (j < 0) return [null, i]; w += s.slice(i, j + 1); i = j; continue; }
+        w += d;
+      }
+      if (i >= stop) return [null, i];
+      continue;
+    }
+    if (c === '$' && s[i + 1] === '{') { const j = closeBrace(s, i + 1); if (j < 0) return [null, i]; w += s.slice(i, j + 1); i = j; continue; }
+    w += c;
+  }
+  return i >= s.length ? [w, i] : [null, i];
+}
+// #81 t9: an operator written where the value is used (`echo x > ~/${F/ok/.claude}/settings.json`, not only `D=${F/ok/.claude}; … $D`): each such expansion is kept under a key of its own, the
+// words it stands for, and readingsOf puts them in place of it. (`:-` `:=` `:+` `:?` forms are paramReadings' own.)
+const INLINE = '\u0001inline:';
+const INLINE_OP = /\$\{[A-Za-z_]\w*(?:\[[^\]\n]{0,64}\])?(?:\/\/?|##?|%%?|\^\^?|,,?|:(?![-=+?]))/g;
+const ASSIGN_AT = /(?<![\w$.\/-])([A-Za-z_]\w{0,63})(?:\[([^\]\n]{0,64})\])?(\+?)=/g;
+function assignedValues(text) {
+  // cheap, linear test first: an expansion, an array or an element assignment
+  if (!(text.includes('${') || text.includes('=(') || /\]\+?=/.test(text))) return new Map();
+  if (text.length > 200_000) return wildcard();
+  const found = []; // { name, array, words[] } (a word null: unknown)
+  let interesting = 0;
+  for (const m of text.matchAll(ASSIGN_AT)) {
+    if (found.length >= MAX_PLAIN_ENTRIES) return wildcard(); // (a name past the cap would not be followed)
+    let i = m.index + m[0].length;
+    if (m[2] === undefined && text[i] === '(') {
+      const words = [];
+      i++;
+      let closed = false;
+      for (let n = 0; n < 256 && i < text.length; n++) {
+        while (i < text.length && /\s/.test(text[i])) i++;
+        if (i >= text.length) break;
+        if (text[i] === ')') { closed = true; break; }
+        let [w, j] = valueWord(text, i, true);
+        if (j === i && w === '') break;
+        if (w !== null) w = w.replace(/^\[[^\]]{0,64}\]=/, '');
+        words.push(w);
+        if (w === null) break;
+        i = j;
+      }
+      if (!closed && words.at(-1) !== null) words.push(null); // (more elements than read, or no closing parenthesis: the rest is unknown)
+      found.push({ name: m[1], array: true, words });
+      if (++interesting > MAX_ASSIGN_ENTRIES) return wildcard();
+    } else {
+      const [w] = valueWord(text, i, false);
+      // a word the scan could not follow is unknown when it holds an expansion it was meant to work out (the rest are values this reading never covered)
+      if (w === null && !text.slice(i, i + 256).includes('${')) continue;
+      found.push({ name: m[1], array: m[2] !== undefined, words: [w] });
+      if (w === null || m[2] !== undefined || w.includes('${') || w.includes('$')) if (++interesting > MAX_ASSIGN_ENTRIES) return wildcard();
+    }
+  }
+  // (each distinct inline operator expansion is a name of its own, assigned the expansion as written: resolved below like any other)
+  const inline = new Set();
+  for (const m of text.matchAll(INLINE_OP)) {
+    const j = closeBrace(text, m.index + 1);
+    // (an expansion the scan cannot close, or one past the cap, would be read as written: the unknown word, like every other cap here)
+    if (j < 0 || (!inline.has(text.slice(m.index, j + 1)) && inline.size >= MAX_ASSIGN_ENTRIES)) return wildcard();
+    inline.add(text.slice(m.index, j + 1));
+  }
+  for (const expr of inline) { found.push({ name: INLINE + expr, array: false, words: [expr] }); interesting++; }
+  if (interesting > MAX_ASSIGN_ENTRIES) return wildcard();
+  if (!found.some((x) => x.array || x.words.some((w) => w === null || w.includes('${')))) return new Map();
+  const cand = new Map(); // name -> Set of words (a scalar, or any element of an array)
+  const arrays = new Set(found.filter((x) => x.array).map((x) => x.name));
+  const opNames = new Set(found.filter((x) => x.array || x.words.some((w) => w === null || (w.includes('${') && !/^\$\{[A-Za-z_]\w*\}$/.test(w)))).map((x) => x.name));
+  // a name built from one of these (`B=$A`, `B=x${A}`, `G=$F[2]`) is one of them too, to a fixed point
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const x of found) {
+      if (opNames.has(x.name)) continue;
+      if (x.words.some((w) => typeof w === 'string' && [...w.matchAll(/\$\{?([A-Za-z_]\w*)/g)].some((r) => opNames.has(r[1])))) { opNames.add(x.name); changed = true; }
+    }
+  }
+  const over = new Set(); // names that had more words than kept
+  // Defensive (mutation check): the cap on kept words is also held by the readingsOf cap (MAX_READINGS).
+  const add = (k, w) => { const set = cand.get(k) ?? new Set(); if (set.size < MAX_ASSIGN_WORDS * 2) set.add(w); else over.add(k); cand.set(k, set); };
+  const work = { n: 0 };
+  // the words a `${…}` group stands for (inner = the text between the braces): null = leave the reading out (a value the environment gives)
+  const group = (inner) => {
+    if (/^\$\{\(%\):-%[xN]\}(?::[aAcefFghlPqQrstuwWx&]){0,6}$/.test(inner)) return null; // (zsh: the path of the running script, like $0: the environment's)
+    const NAME = '([A-Za-z_]\\w*|\\d+|[@*])(?:\\[[^\\]]{0,64}\\])?';
+    let m = new RegExp(`^${NAME}$`).exec(inner);
+    if (m) return cand.has(m[1]) ? [...cand.get(m[1]), ...(over.has(m[1]) ? [UNKNOWN_WORD] : [])] : null; // (a name nothing here gives: the environment's value, left out)
+    m = new RegExp(`^${NAME}(\\/\\/?|##?|%%?|\\^\\^?|,,?|:)([\\s\\S]*)$`).exec(inner);
+    if (!m) return [UNKNOWN_WORD]; // (an operator or form not worked out -- ${U@Q} ${!U} ${#U} ${(P)U} ${U:#p} ${${U}:-x} -- on any name)
+    // (not a substring: a zsh modifier ${0:A:h} on a name nothing here gives is the environment's, as before; any other form, and a modifier on a name the text gives, is unknown)
+    if (m[2] === ':' && !/^\s{0,8}-?\d{1,6}(?::\d{1,6})?$/.test(m[3])) return /^[aAcefFghlPqQrstuwWx&]/.test(m[3]) && !cand.has(m[1]) ? null : [UNKNOWN_WORD];
+    const subj = cand.get(m[1]);
+    if (over.has(m[1])) return [UNKNOWN_WORD];
+    if (!subj) return null;
+    return [...subj].map((v) => (v === UNKNOWN_WORD ? v : applyOp(v, m[2], m[3], work) ?? UNKNOWN_WORD));
+  };
+  const resolve = (word) => {
+    const pr = paramReadings(word);
+    let alts = [...pr];
+    const done = new Set(pr.over ? [UNKNOWN_WORD] : []);
+    for (let guard = 0; guard < 64 && alts.length; guard++) {
+      const next = [];
+      for (const a of alts) {
+        const at = a.indexOf('${');
+        const bare = at < 0 ? /\$([A-Za-z_]\w*)/.exec(a) : null;
+        if (at < 0 && !bare) { if (!/[$`]/.test(a) || a.includes(UNKNOWN_WORD)) done.add(a); continue; }
+        if (bare) { for (const v of cand.get(bare[1]) ?? []) next.push(a.slice(0, bare.index) + v + a.slice(bare.index + bare[0].length)); continue; }
+        const j = closeBrace(a, at + 1);
+        if (j < 0) { done.add(UNKNOWN_WORD); continue; }
+        for (const v of group(a.slice(at + 2, j)) ?? []) next.push(a.slice(0, at) + v + a.slice(j + 1));
+      }
+      alts = [...new Set(next)];
+      // Defensive (mutation check): truncating the alternatives is also held by the readingsOf cap (MAX_READINGS).
+      if (alts.length > MAX_ASSIGN_WORDS * 2) { alts = alts.slice(0, MAX_ASSIGN_WORDS * 2); done.add(UNKNOWN_WORD); } // (alternatives dropped: unknown)
+    }
+    if (alts.length) done.add(UNKNOWN_WORD); // (not settled within the steps allowed)
+    return [...done];
+  };
+  for (let pass = 0; pass < 3; pass++) {
+    for (const x of found) {
+      for (const w of x.words) {
+        if (w === null) { if (opNames.has(x.name)) add(x.name, UNKNOWN_WORD); continue; }
+        if (!/[$`]/.test(w)) { add(x.name, w); continue; }
+        if (!opNames.has(x.name)) continue;
+        for (const r of resolve(w)) add(x.name, r);
+      }
+    }
+  }
+  const out = new Map();
+  for (const k of opNames) {
+    if (!cand.has(k)) continue;
+    const ws = [...cand.get(k)];
+    // (more words than kept: the kept ones and an unknown word, never a shorter list)
+    out.set(arrays.has(k) ? `${k}[]` : k, over.has(k) || ws.length > MAX_ASSIGN_WORDS ? [...ws.slice(0, MAX_ASSIGN_WORDS - 1), UNKNOWN_WORD] : ws);
   }
   return out;
 }
@@ -126,23 +421,42 @@ export function readingsOf(word, assigned) {
   if (!assigned?.size) return rs;
   const out = new Set(rs);
   let over = rs.over === true;
+  let cut = false; // (the list was cut at MAX_READINGS: readings are missing, not just unresolvable)
   const queue = [...rs];
   while (queue.length && !over) {
     const r = queue.shift();
-    for (const [n, ws] of assigned) {
-      if (!new RegExp(`\\$(?:\\{${n}\\}|${n}(?![A-Za-z0-9_]))`).test(r)) continue;
+    for (const [key, ws] of assigned) {
+      if (key.startsWith(INLINE)) { // (an operator expansion written in the word: replaced as a whole)
+        const expr = key.slice(INLINE.length);
+        if (!r.includes(expr)) continue;
+        for (const w of ws) {
+          if (/[$`]/.test(w)) { over = true; break; }
+          const nr = r.split(expr).join(w);
+          if (out.has(nr)) continue;
+          out.add(nr);
+          queue.push(nr);
+          if (out.size > MAX_READINGS) { over = true; cut = true; break; }
+        }
+        if (over) break;
+        continue;
+      }
+      // (an array, `NAME[]`: its elements stand for any use of the name, with a subscript or without)
+      const n = key === WILD ? '' : key.endsWith('[]') ? key.slice(0, -2) : key;
+      const ref = key === WILD ? '\\$\\{?[A-Za-z_]' : key.endsWith('[]') ? `\\$(?:\\{${n}(?:\\[[^\\]]{0,64}\\])?\\}|${n}(?![A-Za-z0-9_])(?:\\[[^\\]]{0,64}\\])?)` : `\\$(?:\\{${n}\\}|${n}(?![A-Za-z0-9_]))`;
+      if (!new RegExp(ref).test(r)) continue;
       for (const w of ws) {
         if (/[$`]/.test(w)) { over = true; break; }
-        const nr = r.replace(new RegExp(`\\$(?:\\{${n}\\}|${n}(?![A-Za-z0-9_]))`, 'g'), () => w);
+        const nr = r.replace(new RegExp(ref, 'g'), () => w);
         if (out.has(nr)) continue;
         out.add(nr);
         queue.push(nr);
-        if (out.size > MAX_READINGS) { over = true; break; }
+        if (out.size > MAX_READINGS) { over = true; cut = true; break; }
       }
       if (over) break;
     }
   }
-  return Object.defineProperty([...out].slice(0, MAX_READINGS), 'over', { value: over, enumerable: false });
+  const list = Object.defineProperty([...out].slice(0, MAX_READINGS), 'over', { value: over, enumerable: false });
+  return Object.defineProperty(list, 'cut', { value: cut, enumerable: false });
 }
 // The command lines a program named by a variable or a default word may run, with its arguments (`G=bash; $G ev.sh`, `"${X:-bash}" ev.sh`): the policies judge each as text one level
 // deeper. `over` (a non-enumerable property of the list): the readings were cut off or are too many, and the caller refuses.
@@ -165,19 +479,43 @@ export function execLinesOf(sf, expand, assigned) {
 export class GuardLimit extends Error {}
 
 // One per top-level evaluation, shared through every nested call. `now` is injectable so tests do not depend on timing.
+// Why (#81 security follow-up): the readings of a text (one per word of a loop, one per value of a name assigned twice) are multiplied again for every script it runs: three nested scripts
+// that each assign four names twice and loop over eight words were 1024 readings each, 1024^3 in all, and the check ended at the 5 s deadline instead of at once. The readings of a whole
+// evaluation, nested scripts included, share this allowance; past it the check is refused (GuardLimit), as for too many script files.
+export const MAX_TOTAL_READINGS = 1024;
 export function newEvalBudget(now = Date.now) {
   // startupOk: startup files already judged in a given state (see the policies), so a line with many shells reads ~/.zshenv once, not once each
-  return { now, deadline: now() + EVAL_DEADLINE_MS, scripts: MAX_SCRIPT_JUDGMENTS, grown: 0, startupOk: new Set() };
+  return { now, deadline: now() + EVAL_DEADLINE_MS, scripts: MAX_SCRIPT_JUDGMENTS, readings: MAX_TOTAL_READINGS, grown: 0, startupOk: new Set() };
 }
 
 export function checkDeadline(budget) {
   if (budget.now() > budget.deadline) throw new GuardLimit('the check took too long (a script chain or a command line too large to verify in time), so it cannot be verified. Split it into simpler commands or name the script file.');
 }
 
+// A reading of a text is about to be judged: one unit of the shared allowance of readings.
+export function countReading(budget) {
+  if (--budget.readings < 0) throw new GuardLimit('too many readings to check (loops over many words, or names given several values, in scripts that run scripts ...), so what they run cannot be verified. Name the script file and write the loop words or values out.');
+}
+
 // A script file is about to be judged: one unit of the shared budget.
 export function countScript(budget) {
   checkDeadline(budget);
   if (--budget.scripts < 0) throw new GuardLimit('too many script files to check (scripts that run scripts that run scripts ...), so what they run cannot be verified. Name the script file.');
+}
+
+// Why (#74): zsh applies to an UNBRACED `$NAME` a modifier after `:` (`$B:r`, `:h :t :e :a :A :l :u :q :Q :P :s/…/…/ :&`, the prefixes `:f :F :w :W :g`) and a subscript
+// after `[` (`$B[1,6]`); the hook does not know the shell, so a name followed by either is a value only known at run time and is never expanded. `${B}:r` is no
+// modifier (the value, then text) and `$H:8080` / `$A:$B` / `$X:done` have no modifier letter after the `:`, so they are worked out as before. (`:p :S :G`
+// are not modifiers of a parameter in zsh 5.9, probed. A bash-style `$B:feature/x` IS read by zsh as `:f` + `e` + `ature/x`, so it is a run-time value too.)
+// Lookahead for a regex that matches the bare name: put it after the name and after a `(?![A-Za-z0-9_])` (the name takes every letter that follows).
+const ZSH_TAIL = '\\[|:[aAcefFghlPqQrstuwWx&]';
+export const ZSH_MODIFIED = `(?!${ZSH_TAIL})`;
+// The names the texts read with a modifier or a subscript (`$B:r`, `"$B[1,6]"`): the guards' bookkeeping of a name (known value, assigned once) does not hold for
+// them, because the word the shell makes of it is not the value; they are treated as a name only known at run time.
+export function zshModifiedNames(texts) {
+  const out = new Set();
+  for (const t of texts) for (const m of String(t).matchAll(new RegExp(`\\$(\\w+)(?!\\w)(?=${ZSH_TAIL})`, 'g'))) out.add(m[1]);
+  return out;
 }
 
 // `text.replace(re, ...)` where `lookup(match, ...groups)` gives the replacement (or the match itself when nothing is known),
