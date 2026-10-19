@@ -397,7 +397,33 @@ const SETS_BY_NAME = /\b(?:eval|read|mapfile|readarray|getopts|source)\b|\bprint
 // Both the text as written and with its quotes and backslashes removed (`printf -vI""FS ,` spells the name only once they are gone).
 // Why (#81 Codex R1-B1 follow-up): a script the guard opens is judged with its own text too -- `bash wrapper.sh` hid `declare -n r=IFS; r=x` from the outer line. Whole-line comments are left out of
 // the binder test only (a comment that says "read" is no binder); the name IFS anywhere, a comment included, still counts.
-const withoutCommentLines = (s) => s.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n');
+// A line is left out only when the shell reads it as a comment: it starts (after blanks) with `#` and no quote, backtick, `$( )` or backslash-newline is open from the lines before it. A heredoc
+// anywhere (`<<`, not `<<<`) leaves everything in (its body is text of any shape). Where this scan is unsure it keeps the line: more text tested, never less.
+function withoutCommentLines(s) {
+  if (/<<(?!<)/.test(s)) return s;
+  const out = [];
+  let sq = false, dq = false, bt = false, depth = 0, cont = false;
+  for (const line of s.split('\n')) {
+    if (!cont && !sq && !dq && !bt && depth === 0 && /^\s*#/.test(line)) continue;
+    let kept = line;
+    let esc = false;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (esc) { esc = false; continue; }
+      if (sq) { if (c === "'") sq = false; continue; }
+      if (c === '\\') { esc = true; continue; }
+      if (c === "'" && !dq) { sq = true; continue; }
+      if (c === '"') { dq = !dq; continue; }
+      if (c === '`') { bt = !bt; continue; }
+      if (c === '$' && line[i + 1] === '(') { depth++; continue; }
+      if (c === ')' && depth > 0) { depth--; continue; }
+      if (c === '#' && !dq && !bt && (i === 0 || /[\s;&|(]/.test(line[i - 1]))) { kept = line.slice(0, i); esc = false; break; } // (the rest of the line is a comment)
+    }
+    out.push(kept);
+    cont = esc;
+  }
+  return out.join('\n');
+}
 // Defensive (mutation check): the binder test (SETS_BY_NAME) and the quote-stripped spelling (`I""FS`) of a script are also held by collectAssignments, which makes every name such a script binds unknown (bindsRunTimeName, indirectExpansion, tainted); only the name IFS written out (a nameref, an alias) needs this line.
 const ifsInScope = (ctx) => (ctx.scopeTexts ?? []).some((s) => [String(s), String(s).replace(/['"\\]/g, '')].some((v) => /IFS/.test(v) || SETS_BY_NAME.test(withoutCommentLines(v))));
 const ifsMayBeSet = (ctx) => ifsInScope(ctx) || [ctx.fullText ?? '', String(ctx.fullText ?? '').replace(/['"\\]/g, '')].some((t) => /IFS/.test(t) || SETS_BY_NAME.test(t)) || assignedNames(ctx).includes('IFS') || Object.hasOwn(ctx.env ?? {}, 'IFS') || ctx.tainted.size > 0;

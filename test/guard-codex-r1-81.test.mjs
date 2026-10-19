@@ -159,3 +159,19 @@ test('R1-B1 IFS siblings: a script that never touches IFS keeps a variable push 
   allowGit('bash wrapper.sh', { ...gitFiles(BAD_GIT), 'wrapper.sh': `# read the plan first\n${PUSH_B}` });
   allowGit('bash wrapper.sh', { ...gitFiles(BAD_GIT), 'wrapper.sh': `# eval and source are fine words in a comment\n  # export $X\n${PUSH_B}` });
 });
+
+// ---- R1-B1 follow-up 2: a line that starts with `#` is a comment only when the shell reads it so -------------------------------------
+// A `#` line inside a quoted string (or a heredoc, `$( )`, a continued line) is text the shell may run or build code from: it may not be left out of the IFS binder test.
+test('R1-B1 IFS: a `#` line inside a multi-line quote is no comment; real comment lines still are', () => {
+  const hid = 'N=IF; N=${N}S; declare -n r=$N; r=x';
+  for (const open of ['"', "'"]) {
+    denyGit('bash wrapper.sh', { ...gitFiles(BAD_GIT), 'wrapper.sh': `echo ${open}a\n#${open}; ${hid}\n${PUSH_B}` });
+  }
+  denyGit('bash wrapper.sh', { ...gitFiles(BAD_GIT), 'wrapper.sh': `x=$(echo a\n#); ${hid}\n${PUSH_B}` });
+  denyGit('bash wrapper.sh', { ...gitFiles(BAD_GIT), 'wrapper.sh': `cat <<E\n# ${hid}\nE\n${hid}\n${PUSH_B}` });
+  denyGit('bash wrapper.sh', { ...gitFiles(BAD_GIT), 'wrapper.sh': `echo a \\\n# b\n${hid}\n${PUSH_B}` });
+  denyGit('bash wrapper.sh', { ...gitFiles(BAD_GIT), 'wrapper.sh': `echo "it's"\n# x\necho \`a\n#\`; ${hid}\n${PUSH_B}` });
+  // real comments (after closed quotes, after a comment that holds a quote) are still left out
+  allowGit('bash wrapper.sh', { ...gitFiles(BAD_GIT), 'wrapper.sh': `echo "a b"\n# read the plan\necho 'x' # don't read\n# eval it\n${PUSH_B}` });
+  allowGit('bash wrapper.sh', { ...gitFiles(BAD_GIT), 'wrapper.sh': `echo "a\nb"\n# read the plan\n${PUSH_B}` });
+});
