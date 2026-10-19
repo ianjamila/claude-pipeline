@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { checkIntegrity, isTestFile } from '../pipeline/lib/integrity.mjs';
+import { checkIntegrity, isTestFile, isDocFile } from '../pipeline/lib/integrity.mjs';
 import { DEFAULTS } from '../pipeline/lib/config.mjs';
 
 // `files` are built inline in the shape parseUnifiedDiff returns, so these tests never run git.
@@ -537,4 +537,9 @@ test('rules combine and keep their order: deleted, binary, skip, neutered, cover
 test('an empty file list and an image asset diff are handled', () => {
   assert.deepEqual(check([]), CLEAN);
   assert.deepEqual(check([binary('M', 'e2e/a.png')]), CLEAN);
+});
+
+test('isDocFile: documentation extensions, case-insensitive, wherever the file lives', () => {
+  for (const p of ['e2e/README.md', 'docs/a.MDX', 'x/__tests__/notes.markdown', 'spec/a.rst', 'a.TXT', 'b.adoc']) assert.equal(isDocFile(p), true, p);
+  for (const p of ['src/a.mjs', 'src/a.ts', 'e2e/fixtures/seed.mjs', 'README.md.bak', 'md', undefined, null]) assert.equal(isDocFile(p), false, String(p));
 });

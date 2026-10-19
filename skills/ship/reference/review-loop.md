@@ -137,7 +137,7 @@ permissions / data-integrity / data-loss item ⇒ `needsHuman` (the CLI applies 
   Either red ⇒ fix cycle (max 2), else
   `needs-human` (park it as below, `--cause verify-red`). Then `P state mark-implemented --ids <ids>` — exit 2 `no-code-change` means the
   branch content is still what the round reviewed: the fix has not actually changed code, so go back to
-  the implementer (marking never substitutes for a fix; a green verify must show the fix).
+  the implementer (marking never substitutes for a fix; a green verify must show the fix). A commit that only adds or edits tests is not a fix either, but a documentation file (`.md` etc.) counts even under a test folder such as `e2e/`.
   Step 2.2's initial full verify and Step 5.3's gate verify stay full whatever `verify.after_fix` says: the gate
   still needs a full, clean report on the exact head.
 - `P comment --pr <pr> --kind triage` (one comment, updated in place each round): post it FIRST, so the decided

@@ -8,6 +8,7 @@ import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs
 import { effectiveReviewBase, git, isAncestor, mergeBase, revParse } from '../lib/git.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { matchAny } from '../lib/glob.mjs';
+import { isDocFile } from '../lib/integrity.mjs';
 import { MARKERS } from '../lib/render.mjs';
 import { decodeFromComment, loadState, saveState, updateItems } from '../lib/state.mjs';
 import { roundOutcome } from '../lib/triage.mjs';
@@ -225,7 +226,8 @@ async function markImplemented(rest, ctx) {
           message: `${item.id} cannot be marked implemented: the branch content is identical to what round ${round.n} reviewed (no fix has been committed)`,
         });
       }
-      // A settle-by-test commit changes the hash too, so also require a non-test file to have changed since then.
+      // A settle-by-test commit changes the hash too, so also require a non-test file (or a documentation file, which is never
+      // a test even under e2e/ or __tests__/) to have changed since then.
       // Measured from the round's head, minus whatever was merged in from the default branch since (those are not the PR's
       // change). This gate fails closed: if that range cannot be worked out exactly (git failed, or a conflicting merge
       // whose resolution is not recorded as a merge commit), the mark is refused rather than counting files the fix did not touch.
@@ -251,7 +253,7 @@ async function markImplemented(rest, ctx) {
           message: `${item.id} cannot be marked implemented: could not tell which files changed since round ${round.n} (${err.message})`,
         });
       }
-      const code = changed.filter((f) => f !== config.agent_log && !matchAny(f, config.integrity.test_globs));
+      const code = changed.filter((f) => f !== config.agent_log && (!matchAny(f, config.integrity.test_globs) || isDocFile(f)));
       if (code.length === 0) {
         throw new Fail(EXIT.USAGE, {
           ok: false, error: 'no-code-change',

@@ -87,6 +87,13 @@ export function isTestFile(path, config) {
   return typeof path === 'string' && matchAny(path, testGlobs(config));
 }
 
+// A documentation file is never a test, wherever it lives (e2e/README.md sits under a test glob but documents the suite).
+// Used only by `state mark-implemented`; the integrity check keeps treating everything under a test glob as a test file.
+const DOC_FILE = /\.(?:md|mdx|markdown|rst|txt|adoc)$/i;
+export function isDocFile(path) {
+  return typeof path === 'string' && DOC_FILE.test(path);
+}
+
 // Trimmed, capped at MAX_EXCERPT chars including the suffix (never splits a surrogate pair).
 function excerpt(text, suffix = '') {
   const room = MAX_EXCERPT - suffix.length;

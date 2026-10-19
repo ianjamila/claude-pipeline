@@ -1945,6 +1945,38 @@ test('mark-implemented: a commit that only adds or edits tests is not a fix; a s
   assert.ok(w.item('R1-B1').implemented);
 });
 
+const markAfter = (t, files) => {
+  const w = world(t);
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
+  for (const [f, body] of Object.entries(files)) w.repo.write(f, body);
+  for (const f of Object.keys(files)) w.repo.git(['add', f]);
+  w.repo.git(['commit', '-q', '-m', 'change']);
+  return { w, r: w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']) };
+};
+
+test('mark-implemented: a docs-only fix under a test folder (e2e/README.md) counts as a change', (t) => {
+  const { w, r } = markAfter(t, { 'e2e/README.md': '# E2E\nThe palette needs an SA session.\n' });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.ok(w.item('R1-B1').implemented);
+});
+
+test('mark-implemented: a doc under a __tests__ folder counts as a change', (t) => {
+  const { w, r } = markAfter(t, { 'src/__tests__/notes.md': 'notes\n' });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.ok(w.item('R1-B1').implemented);
+});
+
+test('mark-implemented: a non-doc file under a test glob, or a test file, is still not a fix', (t) => {
+  for (const files of [{ 'e2e/fixtures/seed.mjs': 'export const seed = 1;\n' }, { 'src/a.test.js': "test('x', () => {});\n" }]) {
+    const { w, r } = markAfter(t, files);
+    assertExit(r, 2, r.stderr + r.stdout);
+    assert.equal(r.json.error, 'no-code-change');
+    assert.match(r.json.message, /only test files changed/);
+    assert.ok(!w.item('R1-B1').implemented);
+  }
+});
+
 test('codex-review: with nothing accepted, a later round over an unchanged tree is still allowed', (t) => {
   const w = world(t);
   assertExit(w.codex(1, findingsOf([finding()])), 0);
