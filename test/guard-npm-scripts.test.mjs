@@ -182,7 +182,7 @@ test('t9 workspaces: the root package.json and the workspace packages are read',
 });
 test('t9 a manager setting that moves the package.json makes the script unknown', () => {
   const t = root({ lint: 'ok' });
-  for (const pre of ['npm_config_prefix=/elsewhere', 'NPM_CONFIG_PREFIX=/elsewhere', 'INIT_CWD=/elsewhere', 'npm_package_json=/elsewhere/package.json', 'npm_config_workspace=a', 'PNPM_HOME=/e', 'npm_config_dir=/e', 'YARN_CWD=/e', 'YARN_RC_FILENAME=x', 'bun_install_cache=/e']) {
+  for (const pre of ['npm_config_prefix=/elsewhere', 'NPM_CONFIG_PREFIX=/elsewhere', 'INIT_CWD=/elsewhere', 'npm_package_json=/elsewhere/package.json', 'npm_config_workspace=a', 'PNPM_HOME=/e', 'npm_config_dir=/e', 'YARN_CWD=/e', 'YARN_RC_FILENAME=x', 'bun_install_cache=/e', 'npm_config_loglevel=error', 'NPM_CONFIG_LOGLEVEL=error', 'COREPACK_HOME=/e', 'NODE_OPTIONS=--require=/e/x.js', 'npm_foo=1']) {
     for (const cmd of [`${pre} npm run lint`, `export ${pre}; npm run lint`, `env ${pre} npm run lint`, `${pre}; npm run lint`]) {
       const g = git(cmd, treeFor(t, BAD_GIT));
       assert.equal(g.decision, 'deny', `git: ${cmd}`);
@@ -190,12 +190,12 @@ test('t9 a manager setting that moves the package.json makes the script unknown'
       assert.equal(filesGuard(cmd, treeFor(t, BAD_FILES)).decision, 'deny', `files: ${cmd}`);
     }
   }
-  for (const flag of ['--cwd=/e', 'npm_config_loglevel=error', 'NPM_CONFIG_LOGLEVEL=error', 'CI=1', 'NODE_ENV=production', 'FORCE_COLOR=0']) {
+  for (const flag of ['--cwd=/e', 'CI=1', 'NODE_ENV=production', 'FORCE_COLOR=0']) {
     if (flag.startsWith('--')) continue;
     ok(`${flag} npm run lint`, t);
   }
   // a setting on a command that runs no script moves nothing
-  ok('npm_config_prefix=/e npm install', t);
+  ok('npm_config_prefix=/e npm ls', t);
 });
 test('t9 harmless scripts and commands that run no script stay allowed', () => {
   const t = { 'package.json': { scripts: { lint: 'eslint .', build: 'tsc -p .', test: 'node --test', start: 'node server.js', deploy: 'bad' } }, 'sub/x': 'x' };
@@ -204,8 +204,7 @@ test('t9 harmless scripts and commands that run no script stay allowed', () => {
     'npm run nothing', 'npm run lint:fix', 'npm run deploy-docs', 'npx prettier --check .', 'npm exec -- prettier --check .', 'pnpm exec prettier .', 'pnpm dlx create-thing', 'yarn dlx create-thing', 'bunx prettier .', 'node -e 1']) ok(cmd, t);
   // no package.json at all: nothing runs
   for (const cmd of ['npm run deploy', 'npm test', 'pnpm deploy', 'yarn deploy']) ok(cmd, { 'x.txt': 'x' });
-  // a package.json that is not valid JSON, or has no scripts: npm refuses it before running anything
-  ok('npm run deploy', { 'package.json': '{ not json' });
+  // a package.json with no scripts: nothing runs
   ok('npm run deploy', { 'package.json': pkg(undefined) });
   ok('npm run deploy', { 'package.json': '{"scripts": []}' });
   ok('npm run deploy', { 'package.json': '{"scripts": {"deploy": 5}}' });
@@ -218,7 +217,7 @@ test('t9 a package.json that cannot be read, or a script that is not text, is re
     assert.match(g.reason, /package\.json/);
     assert.equal(filesGuard(cmd, unreadable).decision, 'deny', `files: ${cmd}`);
   }
-  ok('npm install', unreadable);
+  assert.equal(git('npm install', unreadable).decision, 'deny', 'an install runs the root lifecycle scripts');
   ok('npm run', unreadable);
   // a manager option that lists or prints runs nothing
   ok('npm --version', unreadable);
@@ -318,4 +317,124 @@ test('t9 (#73 follow-up) INIT_CWD and npm_package_json move the repo merge scrip
   const exact = `npm run merge -- 7 --expect-head ${H7}`;
   assert.equal(v(exact).decision, 'allow', 'the exact approved form stays approvable');
   for (const pre of ['npm_config_prefix=/x', 'NPM_CONFIG_PREFIX=/x', 'INIT_CWD=/x', 'npm_package_json=/x/package.json', 'init_cwd=/x']) assert.equal(v(`${pre} ${exact}`).decision, 'deny', pre);
+});
+
+// ---- security review of t9: lifecycle commands, allowlists, lookup and configuration -------------------------------------------------------------------------
+test('t9 install, pack, publish and version run the root lifecycle scripts; --ignore-scripts turns them off', () => {
+  for (const [cmd, name] of [['npm install', 'postinstall'], ['npm i', 'preinstall'], ['npm ci', 'prepare'], ['npm install left-pad', 'install'], ['npm add left-pad', 'prepare'], ['npm rebuild', 'postinstall'], ['npm update', 'prepare'], ['npm up', 'prepare'],
+    ['npm dedupe', 'prepare'], ['npm prune', 'prepare'], ['npm link', 'prepare'], ['npm uninstall x', 'prepare'], ['npm it', 'prepare'], ['npm cit', 'prepare'], ['npm install-test', 'test'], ['npm audit fix', 'prepare'], ['npm pack', 'prepack'], ['npm pack', 'postpack'],
+    ['npm publish', 'prepublishOnly'], ['npm publish', 'postpublish'], ['npm version patch', 'preversion'], ['npm version patch', 'postversion'], ['npm isntall', 'prepare'], ['npm ins', 'prepare'], ['npm --silent install', 'prepare'],
+    ['yarn', 'prepare'], ['yarn install', 'prepare'], ['yarn add x', 'postinstall'], ['pnpm install', 'prepare'], ['pnpm i', 'postinstall'], ['pnpm add x', 'prepare'], ['bun install', 'postinstall'], ['bun add x', 'prepare'], ['yarn publish', 'prepublishOnly'], ['pnpm version patch', 'preversion']]) {
+    bad(cmd, root({ [name]: 'bad' }));
+  }
+  for (const cmd of ['npm install', 'npm ci', 'npm pack', 'npm publish', 'yarn', 'pnpm install', 'bun install', 'npm audit fix', 'npm install --ignore-scripts', 'npm ci --ignore-scripts=true', 'pnpm install --ignore-scripts', 'yarn --ignore-scripts']) {
+    ok(cmd.includes('ignore') ? cmd : `${cmd} --ignore-scripts`, root({ postinstall: 'bad', prepare: 'bad', prepack: 'bad', prepublishOnly: 'bad' }));
+  }
+  bad('npm ci --ignore-scripts=false', root({ prepare: 'bad' }));
+  bad('npm ci --ignore-scripts --no-ignore-scripts', root({ prepare: 'bad' }));
+  // harmless lifecycle scripts keep the install allowed
+  ok('npm install', root({ prepare: 'husky install', postinstall: 'node scripts/patch.js', test: 'bad', deploy: 'bad' }));
+  ok('npm ci', root({ lint: 'ok' }));
+  // --ignore-scripts keeps the named script but drops its hooks
+  bad('npm run deploy --ignore-scripts', root({ deploy: 'bad' }));
+  ok('npm run deploy --ignore-scripts', root({ predeploy: 'bad', deploy: 'ok', postdeploy: 'bad' }));
+  ok('npm test --ignore-scripts', root({ pretest: 'bad', test: 'ok' }));
+  // npm start without a start script runs node server.js; a native module with no install script runs node-gyp
+  bad('npm start', { 'server.js': 'bad', 'package.json': { scripts: { lint: 'ok' } } });
+  const gyp = treeFor({ 'package.json': { scripts: { lint: 'ok' } }, 'binding.gyp': '{}' }, BAD_GIT);
+  assert.equal(git('npm install', gyp).decision, 'deny');
+  assert.equal(git('npm install --ignore-scripts', gyp).decision, 'allow');
+  assert.equal(git('npm install', treeFor({ 'package.json': { scripts: { install: 'ok' } }, 'binding.gyp': '{}' }, BAD_GIT)).decision, 'allow');
+});
+test('t9 only subcommands on the explicit allowlist run no script; an unknown or abbreviated one is judged with every lifecycle script and every word as a script name', () => {
+  const t = root({ prepare: 'bad', postinstall: 'bad', test: 'bad', deploy: 'bad' });
+  for (const cmd of ['npm ls', 'npm list', 'npm view left-pad', 'npm info x', 'npm show x', 'npm outdated', 'npm whoami', 'npm search x', 'npm ping', 'npm doctor', 'npm prefix', 'npm root', 'npm explain x', 'npm why x', 'npm query x', 'npm audit', 'npm audit --json',
+    'npm cache ls', 'npm owner ls x', 'npm access list x', 'npm config get x', 'npm config list', 'npm help run', 'npm --version', 'npm -v', 'npm fund', 'npm --silent ls', 'npm --loglevel silent view x',
+    'yarn info x', 'yarn why x', 'yarn list', 'yarn config list', 'pnpm ls', 'pnpm outdated', 'pnpm why x', 'pnpm store status', 'pnpm audit', 'bun pm ls', 'bun outdated', 'bun test']) ok(cmd, t);
+  for (const cmd of ['npm frobnicate', 'npm instal', 'npm isnt', 'npm ins', 'npm rum-script deploy', 'npm run-scr deploy', 'npm explore x -- ls', 'npm edit x', 'npm diff', 'npm init x', 'npm create x', 'npm pkg get name', 'npm set-script x y', 'npm exec', 'npm x']) bad(cmd, t);
+  // a word of an unknown subcommand may be the script
+  bad('npm run-scr deploy', root({ deploy: 'bad' }));
+});
+test('t9 any variable of the managers\' families, or one named at run time, makes the script unknown', () => {
+  const t = root({ lint: 'ok' });
+  for (const cmd of ['export $N=x; npm run lint', 'declare -x $N=x; npm run lint', 'export FOO=1 $N=x; npm run lint']) {
+    assert.equal(git(cmd, treeFor(t, BAD_GIT)).decision, 'deny', `git: ${cmd}`);
+  }
+  assert.equal(filesGuard('export $N=x; npm run lint', treeFor(t, BAD_FILES)).decision, 'deny');
+  ok('export FOO=1; npm run lint', t);
+});
+test('t9 npm stops its upward search at a node_modules folder; the other managers do not', () => {
+  const tree = { 'package.json': { scripts: { deploy: 'bad' } }, 'sub/node_modules/x/index.js': 'x', 'sub/file.txt': 'x' };
+  const at = { git: { cwd: '/work/repo/sub' }, files: { cwd: '/home/u/proj/sub' } };
+  ok('npm run deploy', tree, at);
+  for (const cmd of ['pnpm run deploy', 'yarn deploy', 'bun run deploy']) bad(cmd, tree, at);
+});
+test('t9 a package.json the guard cannot read exactly is refused; a BOM is stripped and the last duplicate key wins', () => {
+  const raw = (text) => ({ 'package.json': text });
+  const g = (cmd, text) => git(cmd, raw(text));
+  for (const text of ['{ not json', '', '{"scripts": {"deploy": "echo hi",}}', '{"scripts": {"deploy": "echo hi"}} trailing', "{'scripts': {}}"]) {
+    const r = g('npm run deploy', text);
+    assert.equal(r.decision, 'deny', JSON.stringify(text));
+    assert.match(r.reason, /package\.json/);
+    assert.equal(filesGuard('npm run deploy', raw(text)).decision, 'deny');
+  }
+  assert.equal(g('npm run deploy', `﻿{"scripts": {"deploy": "${BAD_GIT}"}}`).decision, 'deny', 'a BOM does not hide the script');
+  assert.equal(g('npm run deploy', `{"scripts": {"deploy": "echo hi", "deploy": "${BAD_GIT}"}}`).decision, 'deny', 'the last duplicate wins');
+  assert.equal(g('npm run deploy', `{"scripts": {"deploy": "${BAD_GIT}", "deploy": "echo hi"}}`).decision, 'allow', 'the last duplicate wins');
+  assert.equal(g('npm run deploy', `{"scripts": {"deploy": "echo hi"}, "scripts": {"deploy": "${BAD_GIT}"}}`).decision, 'deny');
+  // a command that runs nothing does not read it
+  assert.equal(g('npm --version', '{ not json').decision, 'allow');
+  assert.equal(g('npm ls', '{ not json').decision, 'allow');
+});
+test('t9 configuration files that change the shell, the prefix or the node options make the scripts unknown', () => {
+  const t = { 'package.json': { scripts: { lint: 'ok' } } };
+  for (const rc of ['script-shell=/e/sh', 'script_shell = /e/sh', 'node-options=--require /e/x.js', 'workspaces=true', 'workspace=a', 'onload-script=/e/x.js', '; comment\nregistry=https://r.example\nscript-shell=/e/sh']) {
+    for (const where of ['.npmrc', '/home/u/.npmrc', '/etc/npmrc']) {
+      const tree = { ...t, [where]: rc };
+      const r = git('npm run lint', treeFor(tree, BAD_GIT));
+      assert.equal(r.decision, 'deny', `${where}: ${rc}`);
+      assert.match(r.reason, /npmrc/);
+      assert.equal(filesGuard('npm run lint', treeFor(tree, BAD_FILES)).decision, 'deny', `files ${where}: ${rc}`);
+    }
+  }
+  for (const cmd of ['npm install', 'pnpm lint', 'npm test']) assert.equal(git(cmd, treeFor({ ...t, '.npmrc': 'script-shell=/e/sh' }, BAD_GIT)).decision, 'deny', cmd);
+  ok('npm run lint', { ...t, '.npmrc': '# registry\nregistry=https://r.example\nsave-exact=true\n' });
+  assert.equal(git('npm run lint', treeFor({ ...t, '.npmrc': null }, BAD_GIT)).decision, 'deny', 'an unreadable .npmrc');
+  assert.equal(git('yarn lint', treeFor({ ...t, '.yarnrc.yml': 'yarnPath: .yarn/releases/x.cjs\n' }, BAD_GIT)).decision, 'deny');
+  assert.equal(git('yarn lint', treeFor({ ...t, '.yarnrc.yml': 'nodeLinker: node-modules\n' }, BAD_GIT)).decision, 'allow');
+  assert.equal(git('bun run lint', treeFor({ ...t, 'bunfig.toml': '[run]\nshell = "bun"\n' }, BAD_GIT)).decision, 'deny');
+  // the configuration is only read when a script runs
+  assert.equal(git('npm ls', treeFor({ ...t, '.npmrc': 'script-shell=/e/sh' }, BAD_GIT)).decision, 'allow');
+  // a prefix in an npmrc moves the GLOBAL packages only (npm reads the project from the command line's --prefix alone)
+  ok('npm run lint', { ...t, '/home/u/.npmrc': 'prefix=/e/global\n', '.npmrc': 'prefix=/e/global' });
+});
+test('t9 options are parsed as npm does: positionals reach the script, abbreviations and unknown options before a word refuse', () => {
+  const t = root({ shipit: 'bad', lint: 'ok' });
+  const gt = treeFor({ 'package.json': { scripts: { shipit: 'git ' + PUSH, lint: 'ok' } } }, '');
+  assert.equal(git(`npm run shipit origin ${MAIN}`, gt).decision, 'deny', 'positionals are appended without --');
+  assert.equal(git(`npm run shipit --if-present origin ${MAIN}`, gt).decision, 'deny');
+  assert.equal(git(`npm run --silent shipit -- origin ${MAIN}`, gt).decision, 'deny');
+  assert.equal(git('npm run shipit --if-present', gt).decision, 'allow');
+  for (const cmd of ['npm --loglevel silent run shipit', 'npm --loglevel=silent run shipit', 'npm -- run shipit', 'npm run -- shipit', 'npm -s run -- shipit', 'npm run shipit --loglevel silent', 'npm -ddd run shipit', 'npm --silent --no-color run shipit', 'npm run shipit --workspace=.']) bad(cmd, t);
+  for (const cmd of ['npm --foo bar run lint', 'npm --pref x run lint', 'npm --wor a run lint', 'npm run lint --foo bar', 'npm run lint --pref x', 'npm -Z run lint']) {
+    const r = git(cmd, treeFor(root({ lint: 'ok' }), BAD_GIT));
+    assert.equal(r.decision, 'deny', cmd);
+    assert.match(r.reason, /not known|may take the next word/);
+    assert.equal(filesGuard(cmd, treeFor(root({ lint: 'ok' }), BAD_FILES)).decision, 'deny', `files: ${cmd}`);
+  }
+  for (const cmd of ['npm run lint --foo', 'npm run lint --foo=bar', 'npm run lint -- --foo bar', 'npm --foo=bar run lint', 'npm run lint -ddd', 'npm run lint --json']) ok(cmd, root({ lint: 'ok' }));
+  // pnpm -w is the workspace root, not a value option
+  bad('pnpm -w run deploy', root({ deploy: 'bad' }));
+  bad('pnpm -w deploy', root({ deploy: 'bad' }));
+});
+test('t9 exec forms the parser did not unwrap are judged as a command line; a bare yarn / pnpm / bun name falls back to node_modules/.bin', () => {
+  assert.equal(git(`pnpm -r exec ${BAD_GIT}`, {}).decision, 'deny');
+  assert.equal(git(`pnpm --filter a exec ${BAD_GIT}`, {}).decision, 'deny');
+  assert.equal(git(`npm --silent exec -c '${BAD_GIT}'`, {}).decision, 'deny');
+  assert.equal(filesGuard(`pnpm -r exec ${BAD_FILES}`, {}).decision, 'deny');
+  assert.equal(git('pnpm -r exec prettier --check .', {}).decision, 'allow');
+  const bin = { 'node_modules/.bin/tool': `#!/bin/sh\n${BAD_GIT}\n`, 'package.json': { scripts: { lint: 'ok' } } };
+  for (const cmd of ['yarn tool', 'pnpm tool', 'bun run tool', 'yarn run tool']) assert.equal(git(cmd, treeFor(bin, BAD_GIT)).decision, 'deny', cmd);
+  assert.equal(git('yarn lint', treeFor(bin, BAD_GIT)).decision, 'allow');
+  assert.equal(git('yarn other', treeFor(bin, BAD_GIT)).decision, 'allow');
 });

@@ -1226,12 +1226,15 @@ function judgeScriptText(text, sf, abs, dir, ctx, level) {
 // package's directory: judged like `bash -c TEXT` run there (a script of its own: readings, nested scripts). The same text runs whatever manager spells it; see package-scripts.mjs.
 // A script, directory or setting that is only known at run time cannot be read: refused when the line mentions a guarded operation (as for `bash $F`); a setting that moves the package.json
 // (npm_config_prefix, INIT_CWD, PNPM_* ...) always, as which package.json the manager reads is then unknown.
+const NAME_AT_RUN_TIME = /(?:^|[;&|(\s])(?:export|declare|typeset|local|readonly)\s(?:[^;&|\n]*\s)?[^\s=;&|]*[$`][^\s=;&|]*(?=[\s=;&|]|$)/;
 function packageScriptVerdict(argv, dir, ctx, level) {
   const call = pmCall(argv.map((a) => expandVars(a, ctx)));
   if (!call) return null;
   // (a directory the guard lost track of -- after a sourced file or a cd it cannot follow: judged like a script named at run time)
   if (dir === null) return lineMentionsGuarded(ctx) ? deny('package script: the directory this runs in is unknown (after a cd or a sourced file the guard cannot follow) and the line mentions a guarded operation, so which package.json `' + argv.slice(0, 4).join(' ') + '` reads cannot be verified. Chain the cd with &&, or use an absolute --prefix.') : null;
-  const mover = call.mover ? '--userconfig / --globalconfig' : pmMoverName([...Object.keys(ctx.vars), ...ctx.unsureVars, ...ctx.tainted]);
+  // (a variable family the managers read, or a name exported that is only known at run time: `export $N=x`)
+  const mover = call.mover ? '--userconfig / --globalconfig' : pmMoverName([...Object.keys(ctx.vars), ...ctx.unsureVars, ...ctx.tainted]) ?? (NAME_AT_RUN_TIME.test(ctx.fullText) ? 'a variable named at run time' : null);
+  if (call.unresolved) return deny('package script: ' + call.unresolved);
   if (mover) return deny(`package script: ${mover} may point the package manager at another package.json or configuration, so which script \`${argv.slice(0, 4).join(' ')}\` runs cannot be verified. Run it without it (set the directory with --prefix).`);
   if (call.dynamic || call.dirDynamic) {
     return lineMentionsGuarded(ctx)
@@ -1247,6 +1250,11 @@ function packageScriptVerdict(argv, dir, ctx, level) {
   for (const run of plan.runs ?? []) {
     const v = judgeScriptText(run.text, { kind: 'shell', file: run.label }, run.file, run.dir, ctx, level);
     if (v) return v;
+  }
+  // (yarn / pnpm / bun NAME with no script of that name run node_modules/.bin/NAME)
+  if (call.bin && !(plan.runs ?? []).some((r) => r.name === call.main)) {
+    const bin = localBin(call.bin, { cwd: dir, pathExists: ctx.pathExists, p: path });
+    if (bin) return checkScriptFile({ kind: 'exec', file: bin, candidate: true }, dir, ctx, level);
   }
   return null;
 }

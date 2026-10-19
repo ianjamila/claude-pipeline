@@ -1595,7 +1595,8 @@ function judgePackageScripts(c, dirs, ctx, opts, scanRaw = '') {
   if (!c.argv.length) return null;
   const call = pmCall(c.argv.map((w) => expandRefs(w, ctx)));
   if (!call) return null;
-  const mover = call.mover ? '--userconfig / --globalconfig' : pmMoverName([...Object.keys(ctx.vars), ...ctx.unknownVars, ...ctx.pickUnknown, ...Object.keys(c.env ?? {})]);
+  const mover = call.mover ? '--userconfig / --globalconfig' : pmMoverName([...Object.keys(ctx.vars), ...ctx.unknownVars, ...ctx.pickUnknown, ...Object.keys(c.env ?? {})]) ?? (ctx.unknownAll ? 'a variable named at run time' : null);
+  if (call.unresolved) return deny('package script: ' + call.unresolved);
   if (mover) return deny(`package script: ${mover} may point the package manager at another package.json or configuration, so which script \`${c.argv.slice(0, 4).join(' ')}\` runs cannot be verified. Run it without it (set the directory with --prefix)`);
   if (call.dynamic || call.dirDynamic) return null;
   const seen = new Set();

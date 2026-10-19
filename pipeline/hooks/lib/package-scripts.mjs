@@ -63,89 +63,234 @@ export function pmCannotRunScript(words) {
 
 // ---- package scripts ---------------------------------------------------------------------------------------------------
 
-// What a script call runs. words: the command line's words, variables already expanded as far as the guard can. Returns null when the line runs no package script (`npm install`, `npm run` alone, a
-// manager's own command), else { pm, names, main, extra, dir, workspace, mover, dynamic }:
-//   names: the scripts the manager runs, in order (`pre<name>`, <name>, `post<name>`; `npm restart` runs its stop and start scripts too); main: the one the user named, which receives `extra`
-//   dir: the directory option's value (--prefix / -C / --dir / --cwd), or null; workspace: a workspace selection (-w, --workspaces, --filter, -r, `yarn workspace`) -- the script may be in any workspace package
-//   mover: a global option that points the manager at other configuration (--userconfig, --globalconfig); dynamic: a name or directory only known at run time
-// Why every spelling: the callers were wrong once for each of them. (npm keeps every option written before `--` for itself, so only the words after it reach the script: pmForwarded.)
-const LIFECYCLE = { test: ['test'], t: ['test'], tst: ['test'], start: ['start'], stop: ['stop'], restart: ['restart', 'stop', 'start'] };
-const LIFECYCLE_PMS = { npm: new Set(Object.keys(LIFECYCLE)), pnpm: new Set(Object.keys(LIFECYCLE)), yarn: new Set(Object.keys(LIFECYCLE)), bun: new Set(['start', 'stop', 'restart']) }; // (`bun test` is bun's own runner)
-const DIR_OPTS = new Set(['--prefix', '-C', '--dir', '--cwd']);
-const WORKSPACE_OPT = /^(?:-w|-ws|--workspaces?|--filter|-F|--filter-prod|-r|--recursive|--include-workspace-root|--workspace-root)(?:=.*)?$/;
-const MOVER_OPT = /^(?:--userconfig|--globalconfig)(?:=.*)?$/;
-const RUN_TIME = /[$`]/;
+// What a package-manager command line runs. words: the command line's words, variables already expanded as far as the guard can.
+// Allowlists that fail closed (#81 t9, security review): a subcommand that runs NO script must be on NO_SCRIPT[pm] by its exact name; every other subcommand is assumed to run scripts --
+// the named script and its hooks (`run`), the manager's lifecycle chain (`test`, `install`, `publish` ...), or, for a subcommand not known here (`npm ins`, `npm isnt`, a typo, an
+// abbreviation), every lifecycle script and every word of the line as a script name. An option the parser does not know before the subcommand, or before an argument it would take as a
+// script argument, may take the next word as its value: `unresolved`, refused. Returns null when nothing can run, else
+// { pm, sub, names, gate, main, extra, dir, workspace, mover, dynamic, dirDynamic, unresolved, bin, execText, startDefault, installGroup }:
+//   names: the scripts the manager runs, in order; gate: at least one must exist; main: the script the user named, which receives `extra`; dir: the --prefix / -C / --dir / --cwd value
+//   workspace: a workspace selection (-w, --workspaces, --filter, -r, `yarn workspace`): the script may be in any workspace package; mover: --userconfig / --globalconfig
+//   bin: a bare yarn / pnpm / bun name, which falls back to node_modules/.bin/<name> when no script has it; execText: the command `npm exec -c` / `pnpm -r exec` runs
 const hooks = (n) => [`pre${n}`, n, `post${n}`];
+const INSTALL = ['preinstall', 'install', 'postinstall', 'prepublish', 'preprepare', 'prepare', 'postprepare'];
+const PACK = ['prepack', 'preprepare', 'prepare', 'postprepare', 'postpack'];
+const PUBLISH = ['prepublish', 'prepublishOnly', ...PACK, 'prepublish', 'publish', 'postpublish'];
+const VERSION = hooks('version');
+const TEST = hooks('test');
+const START = hooks('start');
+const STOP = hooks('stop');
+const RESTART = [...hooks('restart'), ...STOP, ...START];
+const UNION = [...new Set([...INSTALL, ...PUBLISH, ...VERSION, ...TEST, ...RESTART])];
+const GROUPS = {
+  npm: [[/^(?:i|in|ins|inst|insta|instal|install|isnt|isnta|isntal|isntall|add|ci|clean-install|ic|install-clean|isntall-clean|rebuild|rb|update|up|upgrade|udpate|dedupe|ddp|find-dupes|link|ln|prune|uninstall|un|unlink|remove|rm|r)$/, INSTALL],
+    [/^(?:it|cit|install-test|install-ci-test|isntall-test)$/, [...INSTALL, ...TEST]], [/^pack$/, PACK], [/^publish$/, PUBLISH], [/^(?:version|verison)$/, VERSION]],
+  other: [[/^(?:install|i|add|remove|rm|uninstall|un|update|up|upgrade|upgrade-interactive|link|ln|unlink|rebuild|rb|prune|dedupe|import|deploy|patch-commit|patch)$/, INSTALL], [/^pack$/, PACK], [/^publish$/, PUBLISH], [/^version$/, VERSION]],
+};
+const LIFECYCLE = { test: TEST, t: TEST, tst: TEST, start: START, stop: STOP, restart: RESTART };
+const LIFECYCLE_PMS = { npm: new Set(Object.keys(LIFECYCLE)), pnpm: new Set(Object.keys(LIFECYCLE)), yarn: new Set(Object.keys(LIFECYCLE)), bun: new Set(['start', 'stop', 'restart']) }; // (`bun test` is bun's own runner)
+// Subcommands that run no script, by exact name (verified against each manager's documentation; anything else, abbreviations included, is judged or refused).
+const NO_SCRIPT = {
+  npm: new Set(['view', 'v', 'info', 'show', 'ls', 'list', 'la', 'll', 'outdated', 'help', 'whoami', 'search', 's', 'se', 'find', 'ping', 'doctor', 'prefix', 'root', 'fund', 'explain', 'why', 'query', 'audit', 'cache',
+    'owner', 'access', 'dist-tag', 'dist-tags', 'deprecate', 'unpublish', 'token', 'profile', 'team', 'org', 'star', 'stars', 'unstar', 'hook', 'completion', 'docs', 'home', 'repo', 'bugs', 'issues', 'config', 'c', 'get', 'set', 'login', 'adduser', 'logout', 'sbom', 'bin']),
+  yarn: new Set(['info', 'why', 'list', 'outdated', 'help', 'config', 'versions', 'bin', 'licenses', 'owner', 'tag', 'cache', 'check', 'whoami', 'team', 'login', 'logout']),
+  pnpm: new Set(['list', 'ls', 'll', 'la', 'outdated', 'why', 'view', 'info', 'show', 'v', 'help', 'config', 'c', 'get', 'set', 'root', 'bin', 'store', 'whoami', 'audit', 'licenses', 'ping', 'search', 'doctor', 'env', 'setup', 'completion']),
+  bun: new Set(['pm', 'upgrade', 'outdated', 'why', 'info', 'test', 'build', 'init', 'completions', 'repl']),
+};
+const EXEC_SUBS = new Set(['exec', 'x', 'dlx']);
+const DIR_OPTS = new Set(['--prefix', '-C', '--dir', '--cwd']);
+const WORKSPACE_OPT = /^(?:-w|-ws|--workspaces?|--filter|-F|--filter-prod|-r|--recursive|--include-workspace-root|--workspace-root)$/;
+const MOVER_OPT = /^(?:--userconfig|--globalconfig)$/;
+const RUN_TIME = /[$`]/;
+// Options by how they take their value. A value option takes the next word unless it is written `--name=value`; an option that is on neither list may be either: unresolved.
+const VALUE_NPM = new Set([...PM_VALUE_OPTS, '--node-options', '--omit', '--include', '--access', '--before', '--audit-level', '--install-strategy', '--lockfile-version', '--logs-dir', '--cafile', '--proxy', '--https-proxy', '--noproxy', '--user-agent', '--reporter', '--workspace-concurrency']);
+const VALUE_OTHER = new Set([...VALUE_NPM].filter((o) => o !== '-w'));
+const BOOL_LONG = new Set(['silent', 'quiet', 'color', 'no-color', 'json', 'progress', 'no-progress', 'audit', 'no-audit', 'fund', 'no-fund', 'global', 'if-present', 'ignore-scripts', 'no-ignore-scripts', 'workspaces',
+  'include-workspace-root', 'recursive', 'workspace-root', 'verbose', 'force', 'yes', 'offline', 'prefer-offline', 'prefer-online', 'production', 'dev', 'save', 'no-save', 'save-dev', 'save-exact', 'save-optional', 'save-prod',
+  'legacy-peer-deps', 'strict-peer-deps', 'package-lock', 'no-package-lock', 'package-lock-only', 'dry-run', 'parseable', 'long', 'link', 'unicode', 'engine-strict', 'foreground-scripts', 'update-notifier', 'no-update-notifier',
+  'frozen-lockfile', 'prefer-frozen-lockfile', 'shamefully-hoist', 'fix-lockfile', 'stream', 'parallel', 'sequential', 'bail', 'no-bail', 'report-summary', 'optional', 'no-optional', 'allow-same-version', 'git-tag-version',
+  'sign-git-tag', 'ignore-engines', 'ignore-platform', 'ignore-optional', 'non-interactive', 'pure-lockfile', 'immutable', 'immutable-cache', 'check-cache', 'version', 'help', 'registry-only', 'no-lockfile', 'ci', 'ws',
+  'prefer-dedupe', 'omit-lockfile-registry-resolved', 'node-gyp', 'dev-only', 'depth', 'also', 'unsafe-perm', 'no-git-tag-version', 'no-audit-level', 'access-token', 'verify-store-integrity', 'lockfile-only', 'resolution-only']);
+const SHORT_BOOL = /^-(?:[sqdgfylpDSEOPBhvVnaWL]+|ws|r)$/;
+// 'value' | 'bool' | 'unknown' for one option word (a word that starts with `-`, not `--`)
+function optKind(w, pm) {
+  const vals = pm === 'npm' ? VALUE_NPM : VALUE_OTHER;
+  if (w.startsWith('--')) {
+    const eq = w.indexOf('=');
+    const name = eq > 0 ? w.slice(0, eq) : w;
+    if (eq > 0) return 'bool'; // (the value is attached: it takes no other word)
+    if (vals.has(name)) return 'value';
+    const bare = name.slice(2);
+    return BOOL_LONG.has(bare) || (bare.startsWith('no-') && BOOL_LONG.has(bare.slice(3))) ? 'bool' : 'unknown';
+  }
+  if (vals.has(w)) return 'value';
+  return SHORT_BOOL.test(w) ? 'bool' : 'unknown';
+}
+// Reads the options at words[i...] up to the first word that is not one (or `--`), recording what they mean in st; returns the index after them.
+function scanOpts(words, i, pm, st) {
+  while (i < words.length && words[i].startsWith('-') && words[i] !== '--') {
+    const w = words[i];
+    const kind = optKind(w, pm);
+    const eq = w.startsWith('--') ? w.indexOf('=') : -1;
+    const key = eq > 0 ? w.slice(0, eq) : w;
+    const hasNext = i + 1 < words.length;
+    if (DIR_OPTS.has(key)) st.dir = eq > 0 ? w.slice(eq + 1) : words[i + 1] ?? '';
+    if (MOVER_OPT.test(key)) st.mover = true;
+    if (WORKSPACE_OPT.test(key)) st.workspace = true;
+    if (key === '--ignore-scripts') st.ignore = eq > 0 ? !/^(?:false|0)$/i.test(w.slice(eq + 1)) : true;
+    if (key === '--no-ignore-scripts') st.ignore = false;
+    if (kind === 'unknown') st.unknown.push(w);
+    i += kind === 'value' && eq < 0 && hasNext ? 2 : 1;
+  }
+  return i;
+}
 export function pmCall(allWords) {
   const words = baseName(allWords[0] ?? '') === 'corepack' ? allWords.slice(1) : allWords; // (`corepack pnpm ship`)
-  const p = pmParts(words);
-  if (!p || p.kind === 'none') return null;
-  const call = { pm: p.pm, names: [], gate: [], main: null, extra: [], dir: null, workspace: false, mover: false, dynamic: false, dirDynamic: false };
-  let scriptWords = null; // the words from the script name on
-  if (p.kind === 'run' || p.kind === 'bare') {
-    scriptWords = p.rest[0] === '--' ? p.rest.slice(1) : p.rest;
-    // yarn: `yarn workspace NAME script` / `yarn workspaces run script` -- every word after may be the script
-    if (p.kind === 'bare' && /^workspaces?$/i.test(scriptWords[0] ?? '')) {
-      call.workspace = true;
-      const cand = scriptWords.slice(1).filter((w) => !w.startsWith('-'));
-      call.names = [...new Set(cand.flatMap((n) => hooks(n)))];
-      call.gate = cand;
-      if (!cand.length) return null;
-    } else {
-      if (!scriptWords.length) return null; // `npm run` lists the scripts
-      call.main = scriptWords[0];
-      call.gate = [scriptWords[0]];
-      call.names = hooks(scriptWords[0]);
-      call.extra = pmForwarded([words[0], 'run', ...scriptWords]);
+  const pm = baseName(words[0] ?? '');
+  if (!Object.hasOwn(PM_RUN_ALIASES, pm)) return null;
+  const st = { dir: null, workspace: false, mover: false, ignore: false, unknown: [] };
+  let i = scanOpts(words, 1, pm, st);
+  if (words[i] === '--') i++; // (`npm -- run x`: the words after `--` are positional, the first is the subcommand)
+  const sub = (words[i] ?? '').toLowerCase();
+  const rest = words.slice(i + 1);
+  const call = { pm, sub, names: [], gate: [], main: null, extra: [], dir: null, workspace: false, mover: false, dynamic: false, dirDynamic: false, unresolved: null, bin: null, execText: null, startDefault: false, installGroup: false };
+  const finish = () => {
+    call.dir = st.dir; call.workspace ||= st.workspace; call.mover ||= st.mover;
+    call.dirDynamic = call.dir !== null && RUN_TIME.test(call.dir);
+    call.dynamic = call.names.some((n) => RUN_TIME.test(n)) || (call.main !== null && RUN_TIME.test(call.main)) || RUN_TIME.test(sub);
+    if (st.unknown.length && !call.unresolved) call.unresolved = `the option \`${st.unknown[0]}\` is not known to the guard and may take the next word as its value, so which subcommand or script \`${words.slice(0, 5).join(' ')}\` runs cannot be verified. Write the option as --name=value, or put it after the script name.`;
+    // --ignore-scripts: the install, pack, publish and version families run nothing; `run`, `test`, `start` ... still run their own script, without its pre / post hooks
+    if (st.ignore) {
+      if (call.main === null && !call.execText) return null;
+      const own = (n) => !/^(?:pre|post)/.test(n) || n === call.main;
+      call.names = call.names.filter(own);
+      call.gate = call.gate.filter(own);
     }
-  } else if (p.kind === 'other' && LIFECYCLE_PMS[p.pm]?.has(p.sub)) {
-    const chain = LIFECYCLE[p.sub];
-    call.main = chain[0];
-    call.gate = chain.flatMap(hooks);
-    call.names = chain.flatMap(hooks);
-    scriptWords = ['', ...p.rest.slice(1)];
-    call.extra = pmForwarded([words[0], 'run', chain[0], ...p.rest.slice(1)]);
-  } else return null;
-  // location options: before the subcommand, between `run` and the script and, for npm (it keeps every option written before `--` for itself), after the script name
-  const region = [...p.opts];
-  if (p.pm === 'npm' && scriptWords) {
-    const stop = scriptWords.indexOf('--');
-    region.push(...scriptWords.slice(1, stop < 0 ? undefined : stop));
+    return call;
+  };
+  const setNames = (list) => { call.names = [...new Set(list)]; call.gate = call.names; };
+  // the words after a script name: npm keeps the options written before `--` for itself and hands the script the other words; the rest forward everything
+  const scriptArgs = (after) => {
+    if (pm !== 'npm') { call.extra = after.filter((w) => w !== '--'); return; }
+    const out = [];
+    let k = 0;
+    for (; k < after.length && after[k] !== '--'; k++) {
+      const w = after[k];
+      if (!w.startsWith('-')) { out.push(w); continue; }
+      const kind = optKind(w, pm);
+      const eq = w.startsWith('--') ? w.indexOf('=') : -1;
+      const key = eq > 0 ? w.slice(0, eq) : w;
+      if (DIR_OPTS.has(key)) st.dir = eq > 0 ? w.slice(eq + 1) : after[k + 1] ?? '';
+      if (MOVER_OPT.test(key)) st.mover = true;
+      if (WORKSPACE_OPT.test(key)) st.workspace = true;
+      if (key === '--ignore-scripts') st.ignore = true;
+      if (key === '--no-ignore-scripts') st.ignore = false;
+      if (kind === 'value' && eq < 0) k++;
+      else if (kind === 'unknown' && eq < 0 && after[k + 1] !== undefined && !after[k + 1].startsWith('-') && !call.unresolved) call.unresolved = `the option \`${w}\` is not known to the guard and may take the next word (\`${after[k + 1]}\`) as its value, so what \`${words.slice(0, 5).join(' ')}\` hands the script cannot be verified. Write it as --name=value.`;
+    }
+    call.extra = [...out, ...after.slice(k + 1)];
+  };
+  // the options after a subcommand that is not a script call: --ignore-scripts, a directory or a workspace option still matter
+  const scanRest = () => { // (an option it does not know is of no consequence here: the subcommand is already fixed)
+    const keep = st.unknown;
+    st.unknown = [];
+    for (let k = 0; k < rest.length && rest[k] !== '--';) k = rest[k].startsWith('-') ? scanOpts(rest, k, pm, st) : k + 1;
+    st.unknown = keep;
+  };
+  const aliases = PM_RUN_ALIASES[pm];
+  if (sub === '') {
+    if (pm === 'yarn') { setNames(INSTALL); call.installGroup = true; return finish(); } // (`yarn` alone installs)
+    return null;
   }
-  for (let i = 0; i < region.length; i++) {
-    const w = region[i];
-    const eq = w.indexOf('=');
-    const key = w.startsWith('--') && eq > 0 ? w.slice(0, eq) : w;
-    if (DIR_OPTS.has(key)) { call.dir = eq > 0 && w.startsWith('--') ? w.slice(eq + 1) : region[++i] ?? ''; continue; }
-    if (MOVER_OPT.test(w)) call.mover = true;
-    if (WORKSPACE_OPT.test(w)) call.workspace = true;
-    if (PM_VALUE_OPTS.has(w) && eq < 0) i++;
+  if (aliases.includes(sub) || (pm !== 'npm' && !NO_SCRIPT[pm].has(sub) && !PM_COMMANDS.has(sub) && !LIFECYCLE_PMS[pm].has(sub))) {
+    // run NAME / bare NAME (yarn, pnpm, bun)
+    let r = aliases.includes(sub) ? rest : [words[i], ...rest];
+    const group = aliases.includes(sub) ? null : GROUPS.other.find(([re]) => re.test(sub)); // (`pnpm deploy`, `pnpm patch`: a manager command that is also a possible script name)
+    const j = scanOpts(r, 0, pm, st);
+    r = r.slice(j);
+    if (r[0] === '--') r = r.slice(1);
+    // yarn: `yarn workspace NAME script` / `yarn workspaces run script` -- every word after may be the script
+    if (!aliases.includes(sub) && /^workspaces?$/.test(sub)) {
+      st.workspace = true;
+      const cand = rest.filter((w) => !w.startsWith('-'));
+      if (!cand.length) return null;
+      setNames(cand.flatMap(hooks));
+      call.gate = cand;
+      return finish();
+    }
+    if (!r.length) return null; // `npm run` lists the scripts
+    call.main = r[0];
+    call.gate = [r[0]];
+    setNames(hooks(r[0]));
+    call.gate = [r[0]];
+    if (!aliases.includes(sub) || pm !== 'npm') call.bin = r[0]; // (yarn / bun `run NAME` and a bare name fall back to node_modules/.bin; npm and pnpm `run` do not)
+    if (group) { setNames([...call.names, ...group[1]]); call.gate = [r[0], ...group[1]]; call.installGroup = group[1] === INSTALL; }
+    scriptArgs(r.slice(1));
+    // (`pnpm --foo bar run x`: an option the parser reads as boolean may have hidden the real subcommand)
+    if (!aliases.includes(sub) && r.slice(1).some((w) => aliases.includes(w)) && !call.unresolved) call.unresolved = `\`${words.slice(0, 5).join(' ')}\` names the script \`${r[0]}\` and also the word \`run\`, so which of them the manager runs cannot be verified. Write the options as --name=value.`;
+    return finish();
   }
-  call.dirDynamic = call.dir !== null && RUN_TIME.test(call.dir);
-  call.dynamic = call.names.some((n) => RUN_TIME.test(n)) || (call.main !== null && RUN_TIME.test(call.main));
-  return call;
+  if (NO_SCRIPT[pm].has(sub)) {
+    if (sub === 'audit' && rest.includes('fix')) { scanRest(); setNames(INSTALL); call.installGroup = true; return finish(); }
+    return st.unknown.length ? finish() : null; // (an unknown option before the subcommand may have taken it as its value)
+  }
+  if (LIFECYCLE_PMS[pm].has(sub)) {
+    const chain = LIFECYCLE[sub];
+    call.main = sub === 't' || sub === 'tst' ? 'test' : sub;
+    setNames(chain);
+    call.startDefault = chain === START || chain === RESTART;
+    scriptArgs(rest);
+    return finish();
+  }
+  const groups = pm === 'npm' ? GROUPS.npm : GROUPS.other;
+  const g = groups.find(([re]) => re.test(sub));
+  if (g) { scanRest(); setNames(g[1]); call.installGroup = g[1] === INSTALL || g[1].includes('install'); return finish(); }
+  // exec forms the parser did not unwrap (options between `pnpm` and `exec`): the command is judged as a line of its own
+  if (EXEC_SUBS.has(sub)) {
+    let k = 0;
+    let text = null;
+    for (; k < rest.length; k++) {
+      const w = rest[k];
+      if (w === '-c' || w === '--call') { text = rest[k + 1] ?? ''; break; }
+      if (w.startsWith('--call=')) { text = w.slice(7); break; }
+      if (w === '--') { k++; break; }
+      if (!w.startsWith('-')) break;
+      if (optKind(w, pm) === 'value' || w === '-p' || w === '--package') k++;
+    }
+    call.execText = text ?? rest.slice(k).map(shellQuote).join(' ');
+    if (!call.execText.trim()) call.execText = null;
+  }
+  // any other subcommand: unknown to the guard, so every lifecycle script and every word as a script name may run
+  scanRest();
+  setNames([...UNION, ...rest.filter((w) => !w.startsWith('-')).flatMap(hooks)]);
+  call.installGroup = true;
+  return finish();
 }
 
-// A setting the line gives that points the manager at another package.json, another prefix or another configuration (npm_config_prefix=/x, INIT_CWD, PNPM_*, YARN_CWD ...): the script that runs is
-// then not the one the current directory shows. (#58 reads any npm_config_* the same way for the merge command; the harmless ones -- npm_config_loglevel, npm_config_yes -- stay allowed here.)
-const MOVER_NAME = /^(?:npm_config_(?:prefix|local_prefix|global_prefix|userconfig|globalconfig|workspaces?|workspaces_update|include_workspace_root|script_shell|dir|cwd|location|global|package|call|shell|node_options)|init_cwd|npm_package_json|npm_execpath|npm_node_execpath|(?:yarn|pnpm|bun|berry)_.*)$/i;
+// Names the line gives to the environment that could point the manager somewhere else (allowlist of FAMILIES, not of dangerous names): anything the package managers read as
+// configuration or that names the project a script call starts from.
+const MOVER_NAME = /^(?:npm_|yarn_|pnpm_|bun_|berry_|corepack_|node_options$|init_cwd$)/i;
 export const pmMoverName = (names) => { for (const n of names) if (MOVER_NAME.test(n)) return n; return null; };
 
 export const shellQuote = (w) => (/^[A-Za-z0-9_@%+=:,./-]+$/.test(w) ? w : `'${String(w).replace(/'/g, "'\\''")}'`);
 
-// The packages a root names under `workspaces` (npm, yarn) or pnpm-workspace.yaml: literal directories and one-level `dir/*` patterns. A pattern the listing cannot follow (`**`, `{a,b}`) is a refusal.
 const MAX_WORKSPACE_PACKAGES = 256;
-const MAX_PACKAGE_JSON_CHARS = 1_000_000;
 const MAX_WALK = 64;
+// Configuration files that change what runs a script (script-shell, node-options, workspaces ... ): a key on this list in a file next to the package or in the home directory makes the scripts unknown.
+// (not `prefix`: npm takes the project from the command line's --prefix alone -- @npmcli/config loadLocalPrefix reads the 'cli' source -- so a `prefix=` in a .npmrc, which people set to move their GLOBAL packages, moves nothing here)
+const RC_REFUSED = new Set(['script-shell', 'node-options', 'workspaces', 'workspace', 'include-workspace-root', 'globalconfig', 'userconfig', 'shell', 'onload-script']);
+const GLOBAL_RCS = ['/etc/npmrc', '/usr/local/etc/npmrc', '/opt/homebrew/etc/npmrc'];
 
 // Where the scripts are and what they hold, for one evaluation. env: { cwd (null: unknown), home, readText, pathExists, readDir, cache (a Map kept for the whole evaluation),
 // written(abs) -> 'known' | 'maybe' | null (does the line write that file before the command?), mentionsGuarded() -> boolean, p (path module), tick() }.
-// Returns { refuse: string } | { runs: [{ label, text, dir, file }] } | { none: true } (nothing runs: no package.json, no such script).
+// Returns { refuse: string } | { runs: [{ name, label, text, dir, file }] } | { none: true } (nothing runs: no package.json, no such script). Every give-up is a refusal.
 export function packageScripts(call, env) {
   const p = env.p ?? nodePath;
   env.tick?.();
   const cache = env.cache ?? new Map();
   const refuse = (msg) => ({ refuse: `package script: ${msg}` });
+  const direct = call.execText ? [{ name: null, label: `${call.pm} exec command`, text: call.execText, dir: env.cwd, file: env.cwd }] : [];
+  const end = (r) => (r.none && direct.length ? { runs: direct } : r.runs && direct.length ? { runs: [...direct, ...r.runs] } : r);
   if (env.cwd === null || env.cwd === undefined) return refuse('cannot tell which directory the package manager runs in, so which package.json it uses cannot be verified. Use an absolute --prefix, or chain the cd with &&.');
   let start = env.cwd;
   if (call.dir !== null) {
@@ -160,32 +305,36 @@ export function packageScripts(call, env) {
     if (typeof text !== 'string') rec = env.pathExists(pj) ? { unreadable: true } : { missing: true };
     else {
       try {
-        const j = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
+        const j = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text); // (duplicate keys: the last wins, as in npm)
         rec = { scripts: j && typeof j === 'object' && j.scripts && typeof j.scripts === 'object' && !Array.isArray(j.scripts) ? j.scripts : null, workspaces: Array.isArray(j?.workspaces) ? j.workspaces : Array.isArray(j?.workspaces?.packages) ? j.workspaces.packages : null };
-      } catch { rec = { invalid: true }; } // (npm refuses a package.json that is not JSON before it runs anything)
+      } catch { rec = { invalid: true }; }
     }
     cache.set(pj, rec);
     return rec;
   };
   const unreadable = (pj) => refuse(`cannot read ${pj} (missing permission, a directory or larger than 1 MB), so the scripts it holds cannot be verified.`);
+  const invalid = (pj) => refuse(`${pj} is not valid JSON that the guard can read (the manager may read it more tolerantly), so the scripts it holds cannot be verified.`);
   const writtenMsg = (pj) => refuse(`this line writes ${pj} before the package manager reads it, so what its scripts run cannot be verified. Write the file in a command of its own.`);
-  // each directory from `start` up: the nearest package.json is the project (npm's rule)
+  // each directory from `start` up: the nearest package.json is the project. npm also stops at a directory that has a node_modules folder (and then finds no package.json: nothing runs).
   const upward = (from) => {
-    const key = `up\u0000${from}`;
+    const nm = call.pm === 'npm';
+    const key = `up\u0000${nm}\u0000${from}`;
     if (cache.has(key)) return cache.get(key);
-    const out = [];
+    const walked = [];
     let found = null;
+    let atRoot = false;
     let d = from;
     for (let i = 0; i < MAX_WALK; i++) {
       const pj = p.join(d, 'package.json');
-      out.push(pj);
+      walked.push(pj);
       env.tick?.();
       if (env.pathExists(pj) || env.written?.(pj)) { found = { dir: d, file: pj }; break; }
+      if (nm && env.pathExists(p.join(d, 'node_modules'))) { atRoot = true; break; }
       const up = p.dirname(d);
-      if (up === d) break;
+      if (up === d) { atRoot = true; break; }
       d = up;
     }
-    const r = { found, walked: out };
+    const r = { found, walked, complete: found !== null || atRoot };
     cache.set(key, r);
     return r;
   };
@@ -194,21 +343,25 @@ export function packageScripts(call, env) {
     const w = env.written?.(pj);
     if (w === 'known' || (w === 'maybe' && env.mentionsGuarded?.())) return writtenMsg(pj);
   }
-  if (!up.found) return { none: true };
+  if (!up.complete) return refuse(`more than ${MAX_WALK} directories lie above ${start}, so the package.json the manager uses cannot be found.`);
+  if (!up.found) return end({ none: true });
   const candidates = [up.found];
   if (call.workspace) {
     // every ancestor that names workspaces (the project itself may be one of its packages), then their packages
     const roots = [];
     let d = up.found.dir;
+    let reached = false;
     for (let i = 0; i < MAX_WALK; i++) {
       const pj = p.join(d, 'package.json');
       const rec = env.pathExists(pj) ? read(pj) : null;
       if (rec?.unreadable) return unreadable(pj);
+      if (rec?.invalid) return invalid(pj);
       if (rec?.workspaces || env.pathExists(p.join(d, 'pnpm-workspace.yaml'))) roots.push(d);
       const parent = p.dirname(d);
-      if (parent === d) break;
+      if (parent === d) { reached = true; break; }
       d = parent;
     }
+    if (!reached) return refuse('the directory tree is too deep to look for the workspace root.');
     for (const root of roots) {
       const patterns = [];
       const rec = read(p.join(root, 'package.json'));
@@ -218,7 +371,9 @@ export function packageScripts(call, env) {
         const text = env.readText(yml);
         if (typeof text !== 'string') return unreadable(yml);
         const m = /^packages:[ \t]*\r?\n((?:[ \t]*(?:-[^\n]*)?(?:#[^\n]*)?\r?\n?)*)/m.exec(text);
+        const before = patterns.length;
         for (const line of m?.[1].split('\n') ?? []) { const q = /^\s*-\s*['"]?([^'"#\s]+)/.exec(line); if (q) patterns.push(q[1]); }
+        if (patterns.length === before) return refuse(`the workspace patterns in ${yml} cannot be read, so the packages a workspace option reaches cannot be listed.`);
       }
       if (!candidates.some((c) => c.dir === root) && env.pathExists(p.join(root, 'package.json'))) candidates.push({ dir: root, file: p.join(root, 'package.json') });
       for (const raw of patterns) {
@@ -230,6 +385,7 @@ export function packageScripts(call, env) {
         else if (/^[^*?[\]{}()!]+\/\*$/.test(pat) || pat === '*') {
           const parent = p.join(root, pat === '*' ? '' : pat.slice(0, -2));
           const names = env.readDir(parent);
+          if (names !== null && !Array.isArray(names)) return refuse(`${parent} cannot be listed, so the workspace packages in it cannot be read.`);
           dirs = Array.isArray(names) ? names.map((n) => p.join(parent, n)) : [];
         } else return refuse(`the workspace pattern \`${raw}\` in ${root} cannot be listed (only directories and \`dir/*\`), so which packages a workspace option reaches cannot be verified. Run the script from the package's own directory.`);
         for (const dd of dirs) {
@@ -245,17 +401,56 @@ export function packageScripts(call, env) {
   for (const cand of candidates) {
     const rec = read(cand.file);
     if (rec.unreadable) return unreadable(cand.file);
-    if (!rec.scripts) continue;
-    const present = (n) => Object.hasOwn(rec.scripts, n) && typeof rec.scripts[n] === 'string';
+    if (rec.invalid) return invalid(cand.file);
+    // configuration that can change the shell, the prefix or the options a script runs with
+    for (const rc of rcFiles(call, cand.dir, env, p)) {
+      const bad = rcRefusal(rc, env, cache);
+      if (bad) return refuse(bad);
+    }
+    const scripts = rec.scripts ?? {};
+    const present = (n) => Object.hasOwn(scripts, n) && typeof scripts[n] === 'string';
+    const add = (n, text) => runs.push({ name: n, label: `${p.relative(env.cwd, cand.file) || 'package.json'} script "${n}"`, text, dir: cand.dir, file: cand.file });
     // the named script must exist: npm stops with "Missing script" before a hook runs. (`npm restart` runs its stop and start scripts when it has no restart script; `yarn workspaces run X`: any word may be it)
-    if (!call.gate.some(present)) continue;
+    const defaultStart = call.startDefault && !present('start') && env.pathExists(p.join(cand.dir, 'server.js'));
+    if (call.installGroup && !present('install') && !present('preinstall') && env.pathExists(p.join(cand.dir, 'binding.gyp'))) return refuse(`${cand.dir} has a binding.gyp and no install script, so the install runs \`node-gyp rebuild\`, which the guard cannot read. Install with --ignore-scripts.`);
+    if (!call.gate.some(present) && !defaultStart) continue;
     for (const n of call.names) {
       if (!present(n)) continue;
-      const text = n === call.main && call.extra.length ? `${rec.scripts[n]} ${call.extra.map(shellQuote).join(' ')}` : rec.scripts[n];
-      runs.push({ label: `${p.relative(env.cwd, cand.file) || 'package.json'} script "${n}"`, text, dir: cand.dir, file: cand.file });
+      add(n, n === call.main && call.extra.length ? `${scripts[n]} ${call.extra.map(shellQuote).join(' ')}` : scripts[n]);
+    }
+    if (defaultStart) add('start', 'node server.js'); // (npm start without a start script)
+  }
+  return end(runs.length ? { runs } : { none: true });
+}
+
+// The configuration files the manager reads for a package in `dir`.
+function rcFiles(call, dir, env, p) {
+  const list = [p.join(dir, '.npmrc')];
+  if (env.home) list.push(p.join(env.home, '.npmrc'));
+  list.push(...GLOBAL_RCS);
+  if (call.pm === 'yarn') { list.push(p.join(dir, '.yarnrc.yml')); if (env.home) list.push(p.join(env.home, '.yarnrc.yml')); }
+  if (call.pm === 'bun') { list.push(p.join(dir, 'bunfig.toml')); if (env.home) list.push(p.join(env.home, '.bunfig.toml')); }
+  return list;
+}
+function rcRefusal(file, env, cache) {
+  const key = `rc\u0000${file}`;
+  if (cache.has(key)) return cache.get(key);
+  let msg = null;
+  if (env.pathExists(file)) {
+    const text = env.readText(file);
+    if (typeof text !== 'string') msg = `cannot read ${file} (missing permission, a directory or larger than 1 MB), so what it sets for the package manager cannot be verified.`;
+    else {
+      for (const line of text.split(/\r?\n/)) {
+        const t = line.trim();
+        if (!t || t.startsWith('#') || t.startsWith(';')) continue;
+        const m = file.endsWith('.yml') ? /^(yarnPath|scriptShell)\s*:/.exec(t) : file.endsWith('.toml') ? /^(shell)\s*=/.exec(t) : /^([A-Za-z0-9_@:/.-]+)\s*=/.exec(t);
+        const k = m?.[1]?.toLowerCase().replace(/_/g, '-');
+        if (k && (file.endsWith('.yml') ? /^(?:yarnpath|scriptshell)$/.test(k) : RC_REFUSED.has(k))) { msg = `${file} sets \`${m[1]}\`, which can change the shell, the directory or the options the scripts run with, so what they run cannot be verified. Remove it, or run the command by hand outside the guard's reach.`; break; }
+      }
     }
   }
-  return runs.length ? { runs } : { none: true };
+  cache.set(key, msg);
+  return msg;
 }
 
 // The shell script a bare command name run through a package runner (npx, npm exec, pnpm exec ...) resolves to: node_modules/.bin/<name> of the nearest directory that has it.
@@ -272,4 +467,3 @@ export function localBin(name, env) {
   }
   return null;
 }
-
