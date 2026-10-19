@@ -15,6 +15,7 @@ No file paths, function names or jargon. Always first, so the owner can decide o
 
 ## Verify
 `<verify.full>` @ `<short head sha>` (clean) → **PASS** in <mm:ss>
+<when it ran in a verify slot and waited: add "waited <waitedSeconds> s for a slot" (and "<loadWaitSeconds> s for low load"), plus any slot warning>
 | step | status | duration |
 |---|---|---|
 <rows from .verify/report.json; a row with status `skipped` (or the legacy `pass` + `skipped: true`) shows `skipped — <reason>`, never `pass`>

@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, copyFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { project, runNode, scratchDir, importVendored } from './helpers/project.mjs';
+import { CONFIG, project, runNode, scratchDir, importVendored } from './helpers/project.mjs';
 
 const template = join(dirname(fileURLToPath(import.meta.url)), '..', 'pipeline', 'templates', 'scripts', 'verify.mjs');
 const PROBE = `import { inspect } from './pipeline/lib/locks.mjs';
@@ -619,4 +619,123 @@ test('skipIf: a skipped step does not hide a later failure, and the failing step
   assert.deepEqual(reportOf(repo).steps.map((s) => s.status), ['skipped', 'fail', 'not-run']);
   assert.equal(reportOf(repo).ok, false);
   assert.match(r.out, /verify \(full\): FAIL at two - 0 passed, 1 skipped \(3 steps\)/);
+});
+
+// ---- --defer: a step GitHub CI vouches for is not run here ---------------------------------------------------------------
+
+const DEFER_CONFIG = CONFIG(undefined, [
+  '  deferrable_steps: [sql-arms, e2e]',
+  '  ci_proof:',
+  '    sql-arms:', '      workflow: .github/workflows/ci.yml', '      job: SQL arms',
+  '    e2e:', '      workflow: .github/workflows/e2e.yaml', '      job: e2e', '      event: pull_request',
+  '',
+].join('\n'));
+
+test('--defer: the step is not run, the row says skipped / skipKind ci / deferred to CI (workflow#job), and the report stays a full pass', async () => {
+  const repo = await setup({ config: DEFER_CONFIG });
+  const steps = [
+    pass('one'),
+    { name: 'sql-arms', cmd: touch('ran-sql'), quick: false, env: () => { throw new Error('env of a deferred step must not be read'); }, skipIf: () => { throw new Error('skipIf must not be consulted'); } },
+    pass('three'),
+  ];
+  const r = await verify(repo, ['--defer', 'sql-arms'], steps);
+  assert.equal(r.exitCode, 0, r.err);
+  assert.ok(!existsSync(join(repo.dir, 'ran-sql')), 'a deferred step must not run');
+  const rep = reportOf(repo);
+  assert.equal(rep.mode, 'full');
+  assert.equal(rep.ok, true);
+  assert.deepEqual(rep.expectedSteps, ['one', 'sql-arms', 'three']);
+  assert.deepEqual(rep.steps.map((s) => s.status), ['pass', 'skipped', 'pass']);
+  assert.equal(rep.steps[1].skipKind, 'ci');
+  assert.equal(rep.steps[1].skipReason, 'deferred to CI (.github/workflows/ci.yml#SQL arms)');
+  assert.deepEqual([rep.steps[1].exitCode, rep.steps[1].errorExcerpt, rep.steps[1].skipped, rep.steps[1].skipCheck], [null, '', undefined, undefined]);
+  assert.equal(readFileSync(join(repo.dir, '.verify', 'logs', 'sql-arms.log'), 'utf8'), 'skipped: deferred to CI (.github/workflows/ci.yml#SQL arms)\n');
+  assert.match(r.out, /\[skip\] sql-arms \(deferred to CI \(\.github\/workflows\/ci\.yml#SQL arms\)\)/);
+  assert.match(r.out, /verify \(full\): PASS - 2 passed, 1 skipped \(3 steps\)/);
+});
+
+test('--defer: a comma list and a repeated flag both work; each row names its own workflow and job; the other steps still run', async () => {
+  const repo = await setup({ config: DEFER_CONFIG });
+  const steps = [pass('one'), { name: 'sql-arms', cmd: touch('ran-sql'), quick: false }, { name: 'e2e', cmd: touch('ran-e2e'), quick: false }];
+  for (const argv of [['--defer', 'sql-arms,e2e'], ['--defer', 'sql-arms', '--defer', 'e2e'], ['--defer=sql-arms, e2e']]) {
+    const r = await verify(repo, argv, steps);
+    assert.equal(r.exitCode, 0, `${argv.join(' ')}: ${r.err}`);
+    const rep = reportOf(repo);
+    assert.deepEqual(rep.steps.map((s) => s.status), ['pass', 'skipped', 'skipped'], argv.join(' '));
+    assert.equal(rep.steps[1].skipReason, 'deferred to CI (.github/workflows/ci.yml#SQL arms)');
+    assert.equal(rep.steps[2].skipReason, 'deferred to CI (.github/workflows/e2e.yaml#e2e)');
+    assert.ok(!existsSync(join(repo.dir, 'ran-sql')) && !existsSync(join(repo.dir, 'ran-e2e')));
+  }
+  const one = await verify(repo, ['--defer', 'e2e'], steps);
+  assert.equal(one.exitCode, 0);
+  assert.ok(existsSync(join(repo.dir, 'ran-sql')), 'a step that is not deferred runs');
+  assert.deepEqual(reportOf(repo).steps.map((s) => s.status), ['pass', 'pass', 'skipped']);
+});
+
+test('--defer: a deferred step in a lock group does not take the lock; a group that still has a running step does', async () => {
+  const repo = await setup({ config: DEFER_CONFIG });
+  const { acquire, release } = await import(pathToFileURL(join(repo.dir, 'scripts', 'pipeline', 'lib', 'locks.mjs')).href);
+  const held = await acquire('db-demo-app', { dir: repo.lockDir, waitMs: 0 });
+  try {
+    const only = await verify(repo, ['--defer', 'sql-arms'], [pass('one'), { name: 'sql-arms', cmd: touch('ran-sql'), quick: false, lockGroup: 'db' }], { lockWaitMs: 300 });
+    assert.equal(only.exitCode, 0, `${only.err}`);
+    assert.deepEqual(reportOf(repo).steps.map((s) => s.status), ['pass', 'skipped']);
+    const mixed = await verify(repo, ['--defer', 'sql-arms'], [{ name: 'db', cmd: touch('ran-db'), quick: false, lockGroup: 'db' }, { name: 'sql-arms', cmd: touch('ran-sql'), quick: false, lockGroup: 'db' }], { lockWaitMs: 300 });
+    assert.equal(mixed.exitCode, 1, 'the running db step still needs the lock someone else holds');
+    assert.ok(!existsSync(join(repo.dir, 'ran-db')));
+  } finally {
+    release(held);
+  }
+});
+
+test('--defer: usage errors (exit 2, no report, nothing runs): not deferrable, no ci_proof, unknown step, empty, with --quick/--only, no config', async () => {
+  const repo = await setup({ config: DEFER_CONFIG });
+  const steps = [{ name: 'one', cmd: touch('ran-one'), quick: true }, { name: 'sql-arms', cmd: touch('ran-sql'), quick: true }, pass('lint')];
+  const bad = [
+    [['--defer', 'one'], /--defer one: not allowed: list it in verify\.deferrable_steps with a verify\.ci_proof entry/],
+    [['--defer', 'sql-arms,one'], /--defer one: not allowed/],
+    [['--defer', 'nope'], /--defer: unknown or empty step name\(s\): nope/],
+    [['--defer', ''], /--defer: unknown or empty step name/],
+    [['--defer', 'sql-arms,'], /--defer: unknown or empty step name/],
+    [['--defer', 'sql-arms', '--quick'], /--defer applies to a full run only/],
+    [['--defer', 'sql-arms', '--only', 'one'], /--defer applies to a full run only/],
+    [['--defer'], /./],
+  ];
+  rmSync(join(repo.dir, '.verify'), { recursive: true, force: true });
+  for (const [argv, text] of bad) {
+    const r = await verify(repo, argv, steps);
+    assert.equal(r.exitCode, 2, argv.join(' '));
+    assert.equal(r.report, null, argv.join(' '));
+    assert.match(r.err, text, argv.join(' '));
+  }
+  assert.ok(!existsSync(join(repo.dir, 'ran-one')) && !existsSync(join(repo.dir, 'ran-sql')), 'nothing ran');
+  assert.ok(!existsSync(join(repo.dir, '.verify', 'report.json')), 'no report is written for a usage error');
+
+  // a repo whose config does not list the step (or has no usable config) cannot defer it
+  const plain = await setup();
+  const r = await verify(plain, ['--defer', 'sql-arms'], steps);
+  assert.equal(r.exitCode, 2);
+  assert.match(r.err, /--defer sql-arms: not allowed/);
+  const noConfig = await setup({ config: null });
+  const n = await verify(noConfig, ['--defer', 'sql-arms'], steps);
+  assert.equal(n.exitCode, 2);
+  assert.match(n.err, /--defer sql-arms: not allowed/);
+});
+
+test('local skips carry skipKind local; a run that is not skipped (or a skipIf run:true) has no skipKind', async () => {
+  const repo = await setup({ config: DEFER_CONFIG });
+  const steps = [
+    { name: 'one', cmd: touch('ran-one'), quick: false, skipIf: () => ({ run: false, reason: 'unchanged' }) },
+    { name: 'two', cmd: touch('ran-two'), quick: false, skipIf: () => ({ run: true, reason: 'src changed' }) },
+    pass('three'),
+  ];
+  const r = await verify(repo, [], steps);
+  assert.equal(r.exitCode, 0);
+  const rep = reportOf(repo);
+  assert.deepEqual(rep.steps.map((s) => [s.status, s.skipKind]), [['skipped', 'local'], ['pass', undefined], ['pass', undefined]]);
+  assert.equal(rep.steps[0].skipReason, 'unchanged');
+  // --defer on top of a skipIf step: the deferral wins and says ci, the skipIf is not even asked
+  const both = await verify(repo, ['--defer', 'sql-arms'], [{ name: 'sql-arms', cmd: touch('ran-sql'), quick: false, skipIf: () => ({ run: false, reason: 'unchanged' }) }, pass('x')]);
+  assert.equal(both.exitCode, 0);
+  assert.deepEqual([reportOf(repo).steps[0].skipKind, reportOf(repo).steps[0].skipReason], ['ci', 'deferred to CI (.github/workflows/ci.yml#SQL arms)']);
 });

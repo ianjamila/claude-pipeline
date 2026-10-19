@@ -5,6 +5,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseYaml } from './yaml.mjs';
+import { globToRegExp } from './glob.mjs';
+
+// How many verify proofs a run record holds, and how long a proof step name may be. Defined here (config.mjs is vendored into
+// project repos; run-record.mjs is not) and imported by run-record.mjs, so a config this file accepts always fits the record.
+export const MAX_PROOFS = 20;
+export const MAX_PROOF_STEP = 64;
 
 function deepFreeze(value) {
   if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
@@ -36,7 +42,8 @@ export const DEFAULTS = deepFreeze({
   },
   // stop_queue_wait_minutes: how long verify.quick may WAIT (for a machine-wide heavy-check slot) before it runs, on top of the
   // Stop hook's own 840 s execution allowance. 0 = no queue. The hook's timeout in .claude/settings.json must grow to match.
-  verify: { report: '.verify/report.json', screenshots: '.verify/screenshots', stop_queue_wait_minutes: 0 },
+  // after_fix: what the verifier runs after review fixes are accepted: 'full' (today) or 'quick' (see `pipeline verify plan-after-fix`).
+  verify: { report: '.verify/report.json', screenshots: '.verify/screenshots', stop_queue_wait_minutes: 0, after_fix: 'full' },
   // guard_checks: the tamper-proof "Test integrity" and "Hard-stop scan" statuses are always required on top of
   // required_checks. false only for a repo that does not run the pipeline-guards workflow (e.g. this one).
   // approvers: GitHub logins whose approval labels (human-approved, test-change-approved) count. Empty = the repo owner,
@@ -81,12 +88,15 @@ const OWNER_APPROVALS = ['label', 'chat'];
 const PROVIDERS = ['vercel', 'github-deployments', 'other'];
 // Who owns the production smoke: the ship session (prod-watch) or a CI workflow that posts the result on the merged PR.
 const WATCH_MODES = ['session', 'workflow'];
+const AFTER_FIX_MODES = ['full', 'quick'];
+export const SAFE_STEP = /^[A-Za-z0-9_.:-]+$/;
 
 // Allowed keys per mapping. Anything else is a typo (or a removed option) and is rejected.
 const KEYS = {
   top: [...Object.keys(DEFAULTS), 'project'],
   worktrees: ['mode', 'protect', 'min_idle_hours', 'min_merged_hours', 'delete', 'archive', 'memory_dirs'],
-  verify: ['full', 'quick', 'report', 'screenshots', 'expected_steps', 'skippable_steps', 'stop_queue_wait_minutes'],
+  verify: ['full', 'quick', 'report', 'screenshots', 'expected_steps', 'skippable_steps', 'stop_queue_wait_minutes', 'after_fix', 'after_fix_steps_by_path', 'after_fix_never', 'max_parallel_full', 'max_load', 'max_load_wait_minutes', 'deferrable_steps', 'ci_proof', 'ci_proof_inputs', 'ci_proof_wait_minutes'],
+  ci_proof: ['workflow', 'job', 'event'],
   ci: ['required_checks', 'e2e_label', 'draft_while_iterating', 'guard_checks', 'approvers'],
   merge: ['command', 'wait_minutes'],
   preview: ['environment', 'smoke', 'provider'],
@@ -120,6 +130,142 @@ function merge(base, over) {
     return out;
   }
   return structuredClone(over);
+}
+
+// Optional. verify.after_fix_steps_by_path: { "<glob>": [step, ...] } - the extra steps (run as `verify.full --only ...`) a
+// quick after-fix verify adds when the round's fix diff touches a matching path. verify.after_fix_never: steps that may never
+// be run that way (they stay full-verify only), so none of them may appear in the map.
+function checkAfterFix(verify, errors) {
+  const never = verify.after_fix_never;
+  let neverOk = false;
+  if (never !== undefined) {
+    if (!Array.isArray(never) || !never.every(isStr)) errors.push('verify.after_fix_never must be an array of non-empty step names');
+    else if (new Set(never).size !== never.length) errors.push('verify.after_fix_never must not repeat a step name');
+    else neverOk = true;
+  }
+  const map = verify.after_fix_steps_by_path;
+  if (map === undefined) return;
+  if (!isObj(map)) {
+    errors.push('verify.after_fix_steps_by_path must be a mapping of glob -> list of step names');
+    return;
+  }
+  const expected = Array.isArray(verify.expected_steps) && verify.expected_steps.every(isStr) ? verify.expected_steps : null;
+  for (const [glob, steps] of Object.entries(map)) {
+    const where = `verify.after_fix_steps_by_path[${JSON.stringify(glob)}]`;
+    if (!isStr(glob)) {
+      errors.push('verify.after_fix_steps_by_path globs must be non-empty strings');
+      continue;
+    }
+    try {
+      globToRegExp(glob);
+    } catch (err) {
+      errors.push(`${where}: ${err.message}`);
+      continue;
+    }
+    if (!Array.isArray(steps) || steps.length === 0 || !steps.every(isStr)) {
+      errors.push(`${where} must be a non-empty array of non-empty step names`);
+      continue;
+    }
+    if (new Set(steps).size !== steps.length) errors.push(`${where} must not repeat a step name`);
+    // These names are put on a command line (`--only a,b`), so they stay shell-inert.
+    if (steps.every(isStr) && steps.some((n) => !SAFE_STEP.test(n))) errors.push(`${where}: step names may only use letters, digits and . _ : -`);
+    if (neverOk) {
+      const banned = steps.filter((n) => never.includes(n));
+      if (banned.length) errors.push(`${where} lists step(s) that verify.after_fix_never forbids: ${banned.join(', ')}`);
+    }
+    if (expected) {
+      const unknown = steps.filter((n) => !expected.includes(n));
+      if (unknown.length) errors.push(`${where} names step(s) not in verify.expected_steps: ${unknown.join(', ')}`);
+    }
+  }
+}
+
+// Optional. verify.max_parallel_full: at most this many full verifies (of any repo) run at once on one machine; the rest queue
+// (`pipeline verify slot --run`). verify.max_load (needs it): after getting a slot, wait while the 1-minute load average is above
+// this, for at most verify.max_load_wait_minutes (default 10, never above 10), then run anyway.
+function checkSlots(verify, errors) {
+  const { max_parallel_full: slots, max_load: load, max_load_wait_minutes: wait } = verify;
+  const positive = (v) => typeof v === 'number' && Number.isFinite(v) && v > 0;
+  if (slots !== undefined && !(isInt(slots) && slots >= 1)) errors.push('verify.max_parallel_full must be a positive integer');
+  if (load !== undefined) {
+    if (!positive(load)) errors.push('verify.max_load must be a positive number');
+    else if (slots === undefined) errors.push('verify.max_load needs verify.max_parallel_full (the load check runs after a slot is taken)');
+  }
+  if (wait !== undefined) {
+    if (!positive(wait) || wait > 10) errors.push('verify.max_load_wait_minutes must be a number above 0 and at most 10');
+    else if (load === undefined) errors.push('verify.max_load_wait_minutes needs verify.max_load');
+  }
+  if (load !== undefined && wait === undefined) verify.max_load_wait_minutes = 10;
+}
+
+// Optional. verify.deferrable_steps: steps whose local run the final gate may replace with a GitHub Actions run (a verify report row
+// `skipped` + `skipKind: ci`). verify.ci_proof: { <step>: { workflow, job, event } } names that run by workflow FILE and job (never
+// by a check name alone); every deferrable step needs an entry and every entry a deferrable step. verify.ci_proof_inputs: globs of
+// extra files whose change makes a PR ineligible for CI proof. verify.ci_proof_wait_minutes: how long the ship skill waits for the
+// proof (no default: unset = it does not wait). The GATE reads deferrable_steps / ci_proof / ci_proof_inputs from the base branch.
+export const CI_PROOF_WORKFLOW = /^\.github\/workflows\/[^/]+\.ya?ml$/;
+function checkCiProof(verify, errors) {
+  const { deferrable_steps: deferrable, ci_proof: proof, ci_proof_inputs: inputs, ci_proof_wait_minutes: wait } = verify;
+  let deferrableOk = false;
+  if (deferrable !== undefined) {
+    if (!Array.isArray(deferrable) || deferrable.length === 0 || !deferrable.every(isStr)) errors.push('verify.deferrable_steps must be a non-empty array of non-empty step names');
+    else if (new Set(deferrable).size !== deferrable.length) errors.push('verify.deferrable_steps must not repeat a step name');
+    else {
+      deferrableOk = true;
+      if (deferrable.length > MAX_PROOFS) errors.push(`verify.deferrable_steps lists ${deferrable.length} steps: at most ${MAX_PROOFS} (the run record holds that many proofs)`);
+      if (deferrable.some((n) => n.length > MAX_PROOF_STEP)) errors.push(`verify.deferrable_steps: step names may be at most ${MAX_PROOF_STEP} characters`);
+      if (deferrable.some((n) => !SAFE_STEP.test(n))) errors.push('verify.deferrable_steps: step names may only use letters, digits and . _ : -');
+      if (Array.isArray(verify.expected_steps)) {
+        const unknown = deferrable.filter((n) => !verify.expected_steps.includes(n));
+        if (unknown.length) errors.push(`verify.deferrable_steps names step(s) not in verify.expected_steps: ${unknown.join(', ')}`);
+      }
+    }
+  }
+  if (proof !== undefined) {
+    if (!isObj(proof)) errors.push('verify.ci_proof must be a mapping of step -> { workflow, job, event }');
+    else {
+      if (Object.keys(proof).length > MAX_PROOFS) errors.push(`verify.ci_proof has ${Object.keys(proof).length} entries: at most ${MAX_PROOFS}`);
+      if (Object.keys(proof).some((n) => n.length > MAX_PROOF_STEP)) errors.push(`verify.ci_proof: step names may be at most ${MAX_PROOF_STEP} characters`);
+      for (const [step, spec] of Object.entries(proof)) {
+        const where = `verify.ci_proof[${JSON.stringify(step)}]`;
+        if ((deferrable === undefined || deferrableOk) && !(deferrable ?? []).includes(step)) errors.push(`${where}: ${step} is not listed in verify.deferrable_steps`);
+        if (!isObj(spec)) {
+          errors.push(`${where} must be a mapping with workflow, job and event`);
+          continue;
+        }
+        unknownKeys(spec, KEYS.ci_proof, `${where}.`, errors);
+        if (typeof spec.workflow !== 'string' || !CI_PROOF_WORKFLOW.test(spec.workflow) || spec.workflow.split('/').some((p) => p === '..' || p === '.')) {
+          errors.push(`${where}.workflow must be a workflow file path like .github/workflows/ci.yml`);
+        }
+        if (!isStr(spec.job)) errors.push(`${where}.job must be a non-empty job name`);
+        if (spec.event === undefined) spec.event = 'pull_request';
+        else if (!isStr(spec.event)) errors.push(`${where}.event must be a non-empty event name`);
+      }
+      if (deferrableOk) {
+        const bare = deferrable.filter((n) => !Object.hasOwn(proof, n));
+        if (bare.length) errors.push(`verify.deferrable_steps lists step(s) with no verify.ci_proof entry: ${bare.join(', ')}`);
+      }
+    }
+  } else if (deferrableOk) {
+    errors.push(`verify.deferrable_steps needs verify.ci_proof (an entry for each of: ${deferrable.join(', ')})`);
+  }
+  if (inputs !== undefined) {
+    if (!Array.isArray(inputs) || !inputs.every(isStr)) errors.push('verify.ci_proof_inputs must be an array of non-empty globs');
+    else {
+      for (const g of inputs) {
+        try {
+          globToRegExp(g);
+        } catch (err) {
+          errors.push(`verify.ci_proof_inputs[${JSON.stringify(g)}]: ${err.message}`);
+        }
+      }
+      if (proof === undefined) errors.push('verify.ci_proof_inputs needs verify.ci_proof');
+    }
+  }
+  if (wait !== undefined) {
+    if (!(typeof wait === 'number' && Number.isFinite(wait) && wait > 0)) errors.push('verify.ci_proof_wait_minutes must be a number above 0');
+    else if (proof === undefined) errors.push('verify.ci_proof_wait_minutes needs verify.ci_proof');
+  }
 }
 
 function unknownKeys(obj, allowed, prefix, errors) {
@@ -330,6 +476,10 @@ export function validateConfig(obj) {
         if (unknown.length) errors.push(`verify.skippable_steps names step(s) not in verify.expected_steps: ${unknown.join(', ')}`);
       }
     }
+    if (!AFTER_FIX_MODES.includes(verify.after_fix)) errors.push(`verify.after_fix must be ${AFTER_FIX_MODES.join('|')}`);
+    checkAfterFix(verify, errors);
+    checkSlots(verify, errors);
+    checkCiProof(verify, errors);
   }
 
   const mergeSec = section(config, 'merge', errors);

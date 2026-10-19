@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseYaml } from '../pipeline/lib/yaml.mjs';
 import { DEFAULTS, GUARD_CHECKS, requiredChecks, stopHookTimeoutWarning, validateConfig, loadConfig, fill } from '../pipeline/lib/config.mjs';
+import { MAX_PROOFS, MAX_PROOF_STEP, normaliseProofs, proofsProblem } from '../pipeline/lib/run-record.mjs';
 
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
 const fixture = (name) => parseYaml(fs.readFileSync(path.join(fixtures, name), 'utf8'));
@@ -663,6 +664,54 @@ test('verify.skippable_steps: optional list of unique step names, each also in e
   assert.ok(unknown.errors.some((e) => /verify\.skippable_steps/.test(e) && /sql-arms/.test(e) && /expected_steps/.test(e)), unknown.errors.join('|'));
 });
 
+test('verify.after_fix: full (default) | quick; the by-path map and never list are validated', () => {
+  const withVerify = (extra) => validateConfig({ ...minimal(), verify: { ...minimal().verify, ...extra } });
+  assert.equal(validateConfig(minimal()).config.verify.after_fix, 'full', 'absent = full = today');
+  assert.equal(validateConfig(minimal()).config.verify.after_fix_steps_by_path, undefined);
+  assert.equal(validateConfig(minimal()).config.verify.after_fix_never, undefined);
+  for (const mode of ['full', 'quick']) assert.equal(withVerify({ after_fix: mode }).ok, true, mode);
+  for (const bad of ['fast', '', 'QUICK', true, null, 1]) {
+    const r = withVerify({ after_fix: bad });
+    assert.equal(r.ok, false, JSON.stringify(bad));
+    assert.ok(has(r, 'verify.after_fix'), r.errors.join('|'));
+  }
+  const good = withVerify({
+    after_fix: 'quick',
+    expected_steps: ['install', 'db', 'db-grants', 'sql-arms'],
+    after_fix_steps_by_path: { 'supabase/**': ['db', 'db-grants'], 'lib/*.ts': ['db'] },
+    after_fix_never: ['sql-arms'],
+  });
+  assert.equal(good.ok, true, good.errors.join('|'));
+  assert.deepEqual(good.config.verify.after_fix_steps_by_path, { 'supabase/**': ['db', 'db-grants'], 'lib/*.ts': ['db'] });
+  assert.deepEqual(good.config.verify.after_fix_never, ['sql-arms']);
+  assert.equal(withVerify({ after_fix_steps_by_path: {} }).ok, true, 'an empty map is the same as absent');
+  for (const bad of [['supabase/**'], 'supabase/**', null, 3]) {
+    const r = withVerify({ after_fix_steps_by_path: bad });
+    assert.equal(r.ok, false, JSON.stringify(bad));
+    assert.ok(has(r, 'verify.after_fix_steps_by_path'), r.errors.join('|'));
+  }
+  for (const bad of ['db', [], ['db', ''], ['db', 3], ['db', 'db'], null, {}]) {
+    const r = withVerify({ after_fix_steps_by_path: { 'supabase/**': bad } });
+    assert.equal(r.ok, false, JSON.stringify(bad));
+    assert.ok(has(r, 'verify.after_fix_steps_by_path'), r.errors.join('|'));
+  }
+  assert.equal(withVerify({ after_fix_steps_by_path: { '': ['db'] } }).ok, false, 'empty glob');
+  for (const bad of ['sql-arms', [''], ['a', 'a'], [1], null, {}]) {
+    const r = withVerify({ after_fix_never: bad });
+    assert.equal(r.ok, false, JSON.stringify(bad));
+    assert.ok(has(r, 'verify.after_fix_never'), r.errors.join('|'));
+  }
+  const banned = withVerify({ after_fix_steps_by_path: { 'supabase/**': ['db', 'sql-arms'] }, after_fix_never: ['sql-arms'] });
+  assert.equal(banned.ok, false);
+  assert.ok(banned.errors.some((e) => /after_fix_steps_by_path/.test(e) && /sql-arms/.test(e) && /after_fix_never/.test(e)), banned.errors.join('|'));
+  const unknown = withVerify({ expected_steps: ['install'], after_fix_steps_by_path: { 'supabase/**': ['db'] } });
+  assert.equal(unknown.ok, false);
+  assert.ok(unknown.errors.some((e) => /after_fix_steps_by_path/.test(e) && /db/.test(e) && /expected_steps/.test(e)), unknown.errors.join('|'));
+  for (const bad of ['db;rm', 'a b', '$(x)', 'a,b']) assert.equal(withVerify({ after_fix_steps_by_path: { 'x/**': [bad] } }).ok, false, `shell-unsafe step ${bad}`);
+  const tooComplex = withVerify({ after_fix_steps_by_path: { [Array(20).fill('*').join('/a')]: ['db'] } });
+  assert.equal(tooComplex.ok, false, 'a glob the matcher refuses is a config error, not a runtime crash');
+});
+
 test('worktrees block: defaults when absent', () => {
   const r = validateConfig(minimal());
   assert.equal(r.ok, true, r.errors.join('; '));
@@ -689,4 +738,128 @@ test('worktrees block: a path in delete must not also be in archive', () => {
   const r = validateConfig({ ...minimal(), worktrees: { delete: ['.review/'] } });
   assert.equal(r.ok, false);
   assert.ok(has(r, 'worktrees: .review/ is in both delete and archive'));
+});
+
+test('verify.max_parallel_full / max_load / max_load_wait_minutes: optional, validated, wait defaults to 10 with max_load', () => {
+  const withVerify = (extra) => validateConfig({ ...minimal(), verify: { ...minimal().verify, ...extra } });
+  const none = validateConfig(minimal());
+  assert.equal(none.ok, true);
+  assert.equal(none.config.verify.max_parallel_full, undefined, 'unset = no limit');
+  assert.equal(none.config.verify.max_load, undefined);
+  assert.equal(none.config.verify.max_load_wait_minutes, undefined, 'no default without max_load');
+
+  const slots = withVerify({ max_parallel_full: 2 });
+  assert.equal(slots.ok, true, slots.errors.join('; '));
+  assert.equal(slots.config.verify.max_parallel_full, 2);
+  assert.equal(slots.config.verify.max_load_wait_minutes, undefined);
+
+  const load = withVerify({ max_parallel_full: 2, max_load: 12.5 });
+  assert.equal(load.ok, true, load.errors.join('; '));
+  assert.equal(load.config.verify.max_load, 12.5);
+  assert.equal(load.config.verify.max_load_wait_minutes, 10, 'default 10 when max_load is set');
+
+  const wait = withVerify({ max_parallel_full: 1, max_load: 8, max_load_wait_minutes: 2.5 });
+  assert.equal(wait.ok, true, wait.errors.join('; '));
+  assert.equal(wait.config.verify.max_load_wait_minutes, 2.5);
+  assert.equal(withVerify({ max_parallel_full: 1, max_load: 8, max_load_wait_minutes: 10 }).ok, true, '10 is the ceiling');
+
+  for (const bad of [0, -1, 1.5, '2', null, true, [], {}, NaN, Infinity]) {
+    assert.ok(has(withVerify({ max_parallel_full: bad }), 'verify.max_parallel_full must be a positive integer'), String(bad));
+  }
+  for (const bad of [0, -3, '8', null, true, NaN, Infinity, []]) {
+    assert.ok(has(withVerify({ max_parallel_full: 2, max_load: bad }), 'verify.max_load must be a positive number'), String(bad));
+  }
+  for (const bad of [0, -1, 10.5, 11, '5', null, NaN, Infinity]) {
+    assert.ok(has(withVerify({ max_parallel_full: 2, max_load: 8, max_load_wait_minutes: bad }), 'verify.max_load_wait_minutes must be'), String(bad));
+  }
+  assert.ok(has(withVerify({ max_load: 8 }), 'verify.max_load needs verify.max_parallel_full'));
+  assert.ok(has(withVerify({ max_parallel_full: 2, max_load_wait_minutes: 5 }), 'verify.max_load_wait_minutes needs verify.max_load'));
+});
+
+test('verify.deferrable_steps / ci_proof / ci_proof_inputs / ci_proof_wait_minutes: valid shapes, defaults and every refusal', () => {
+  const withVerify = (extra) => validateConfig({ ...minimal(), verify: { ...minimal().verify, ...extra } });
+  const spec = { workflow: '.github/workflows/ci.yml', job: 'SQL arms' };
+  const good = { deferrable_steps: ['sql-arms'], ci_proof: { 'sql-arms': spec } };
+
+  const none = validateConfig(minimal());
+  for (const k of ['deferrable_steps', 'ci_proof', 'ci_proof_inputs', 'ci_proof_wait_minutes']) assert.equal(none.config.verify[k], undefined, `${k}: no default`);
+
+  const ok = withVerify({ ...good, ci_proof_inputs: ['supabase/tests/**', 'package-lock.json'], ci_proof_wait_minutes: 12.5, expected_steps: ['typecheck', 'sql-arms'] });
+  assert.equal(ok.ok, true, ok.errors.join('; '));
+  assert.equal(ok.config.verify.ci_proof['sql-arms'].event, 'pull_request', 'event defaults to pull_request');
+  assert.deepEqual(ok.config.verify.ci_proof_inputs, ['supabase/tests/**', 'package-lock.json']);
+  assert.equal(ok.config.verify.ci_proof_wait_minutes, 12.5);
+  assert.equal(withVerify({ deferrable_steps: ['a'], ci_proof: { a: { ...spec, event: 'pull_request_target' } } }).config.verify.ci_proof.a.event, 'pull_request_target');
+  assert.equal(withVerify({ ...good, ci_proof: { 'sql-arms': { ...spec, workflow: '.github/workflows/db.yaml' } } }).ok, true, '.yaml is fine');
+
+  // deferrable_steps
+  for (const bad of ['sql-arms', [], ['a', 'a'], ['a', ''], ['a', 3], null, {}]) {
+    const r = withVerify({ deferrable_steps: bad, ci_proof: { a: { ...spec } } });
+    assert.ok(has(r, 'verify.deferrable_steps'), `${JSON.stringify(bad)}: ${r.errors.join('|')}`);
+  }
+  assert.ok(has(withVerify({ deferrable_steps: ['a b'], ci_proof: { 'a b': spec } }), 'step names may only use'));
+  const unknown = withVerify({ expected_steps: ['install'], ...good });
+  assert.ok(unknown.errors.some((e) => /verify\.deferrable_steps/.test(e) && /sql-arms/.test(e) && /expected_steps/.test(e)), unknown.errors.join('|'));
+
+  // ci_proof <-> deferrable_steps must agree both ways
+  assert.ok(has(withVerify({ deferrable_steps: ['sql-arms'] }), 'verify.deferrable_steps needs verify.ci_proof'));
+  assert.ok(has(withVerify({ deferrable_steps: ['sql-arms', 'db'], ci_proof: { 'sql-arms': spec } }), 'no verify.ci_proof entry: db'));
+  assert.ok(has(withVerify({ deferrable_steps: ['sql-arms'], ci_proof: { 'sql-arms': spec, db: spec } }), 'db is not listed in verify.deferrable_steps'));
+  assert.ok(has(withVerify({ ci_proof: { 'sql-arms': spec } }), 'sql-arms is not listed in verify.deferrable_steps'), 'ci_proof without deferrable_steps');
+
+  // ci_proof entries
+  for (const bad of ['ci.yml', null, [], 5]) assert.ok(has(withVerify({ ...good, ci_proof: { 'sql-arms': bad } }), 'must be a mapping'), JSON.stringify(bad));
+  assert.ok(has(withVerify({ ...good, ci_proof: 'x' }), 'verify.ci_proof must be a mapping'));
+  for (const workflow of [undefined, '', 'ci.yml', '.github/workflows/ci.yml/', '.github/workflows/sub/ci.yml', '.github/workflows/ci.txt', '.github/other/ci.yml', '.github/workflows/', '/.github/workflows/ci.yml', '.github/workflows/../x.yml', 7]) {
+    const r = withVerify({ ...good, ci_proof: { 'sql-arms': { ...spec, workflow } } });
+    assert.ok(has(r, '.workflow must be a workflow file path'), `${JSON.stringify(workflow)}: ${r.errors.join('|')}`);
+  }
+  for (const job of [undefined, '', '   ', 3, null]) assert.ok(has(withVerify({ ...good, ci_proof: { 'sql-arms': { ...spec, job } } }), '.job must be a non-empty job name'), JSON.stringify(job));
+  for (const event of ['', 3, null]) assert.ok(has(withVerify({ ...good, ci_proof: { 'sql-arms': { ...spec, event } } }), '.event must be a non-empty event name'), JSON.stringify(event));
+  assert.ok(has(withVerify({ ...good, ci_proof: { 'sql-arms': { ...spec, branch: 'main' } } }), 'unknown key'));
+
+  // ci_proof_inputs
+  for (const bad of ['supabase/**', [''], [3], null, {}]) assert.ok(has(withVerify({ ...good, ci_proof_inputs: bad }), 'verify.ci_proof_inputs must be an array'), JSON.stringify(bad));
+  assert.ok(has(withVerify({ ci_proof_inputs: ['a/**'] }), 'verify.ci_proof_inputs needs verify.ci_proof'));
+  assert.ok(has(withVerify({ ...good, ci_proof_inputs: ['a**b**c**d**e**f**g**h**i**j**k**l**m**n**o**p**q**r'] }), 'verify.ci_proof_inputs['), 'a glob the matcher refuses');
+  assert.equal(withVerify({ ...good, ci_proof_inputs: [] }).ok, true, 'an empty list is the same as absent');
+
+  // ci_proof_wait_minutes: positive number, no default, not a ceiling
+  for (const bad of [0, -1, '5', null, true, NaN, Infinity, []]) assert.ok(has(withVerify({ ...good, ci_proof_wait_minutes: bad }), 'verify.ci_proof_wait_minutes must be a number above 0'), String(bad));
+  assert.ok(has(withVerify({ ci_proof_wait_minutes: 5 }), 'verify.ci_proof_wait_minutes needs verify.ci_proof'));
+  assert.equal(withVerify({ ...good, ci_proof_wait_minutes: 90 }).ok, true);
+});
+
+test('verify.deferrable_steps / ci_proof honour the run-record proof limits (count and step-name length), and a config at the limits makes proofs the record accepts', () => {
+  const withVerify = (extra) => validateConfig({ ...minimal(), verify: { ...minimal().verify, ...extra } });
+  const spec = { workflow: '.github/workflows/ci.yml', job: 'SQL arms' };
+  const mk = (n, len = 8) => Array.from({ length: n }, (_, i) => `s${i}`.padEnd(len, 'x'));
+  const cfgFor = (names) => ({ deferrable_steps: names, ci_proof: Object.fromEntries(names.map((s) => [s, { ...spec }])) });
+
+  const tooMany = withVerify(cfgFor(mk(MAX_PROOFS + 1)));
+  assert.ok(has(tooMany, `at most ${MAX_PROOFS}`), tooMany.errors.join('|'));
+  assert.equal(tooMany.errors.filter((e) => /verify\.ci_proof has/.test(e)).length, 1, 'ci_proof is checked too');
+  const longName = withVerify(cfgFor(['a'.repeat(MAX_PROOF_STEP + 1)]));
+  assert.ok(has(longName, `at most ${MAX_PROOF_STEP} characters`), longName.errors.join('|'));
+  assert.equal(longName.errors.filter((e) => /step names may be at most/.test(e)).length, 2, 'both deferrable_steps and ci_proof');
+
+  // exactly at the limits: the config validates AND the proofs it can produce are accepted by the run record
+  const names = mk(MAX_PROOFS, MAX_PROOF_STEP);
+  assert.ok(names.every((n) => n.length === MAX_PROOF_STEP));
+  const atLimits = withVerify(cfgFor(names));
+  assert.equal(atLimits.ok, true, atLimits.errors.join('|'));
+  const run = { id: 1, attempt: 1, jobId: 2, workflow: spec.workflow, job: spec.job, url: 'https://github.com/a/b/actions/runs/1' };
+  const proofs = atLimits.config.verify.deferrable_steps.map((step, i) => (i % 2 ? { step, source: 'local' } : { step, source: 'ci', run }));
+  assert.equal(proofsProblem(proofs), null);
+  assert.equal(normaliseProofs(proofs).length, MAX_PROOFS);
+});
+
+test('verify.ci_proof parses from real YAML (hyphenated step names, nested mapping, quoted job)', () => {
+  const text = [
+    'version: 1', 'project: p', 'verify:', '  full: f', '  quick: q', '  deferrable_steps: [sql-arms]', '  ci_proof:', '    sql-arms:',
+    '      workflow: .github/workflows/ci.yml', '      job: "SQL arms"', '  ci_proof_inputs: [supabase/tests/**]', '  ci_proof_wait_minutes: 25', '',
+  ].join('\n');
+  const r = validateConfig(parseYaml(text));
+  assert.equal(r.ok, true, r.errors.join('; '));
+  assert.deepEqual(r.config.verify.ci_proof, { 'sql-arms': { workflow: '.github/workflows/ci.yml', job: 'SQL arms', event: 'pull_request' } });
 });
