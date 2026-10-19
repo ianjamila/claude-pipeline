@@ -3,7 +3,7 @@
 // after it; listing and purging reconcile an entry that never got that far.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -251,4 +251,31 @@ test('a move that fails and whose copy is removed drops the intent (nothing repo
   try { run(f, { io }); } catch (err) { caught = err; }
   assert.deepEqual(caught.archivedItems, []);
   assert.deepEqual(readManifest(f.h).items, []);
+});
+
+// ---- R5-B1: only a stored path that is CONFIRMED absent (ENOENT) lets the intent go ---------------------------------------
+
+test('a pending entry whose stored file cannot be inspected (parent dir unreadable) is unverified: listed so, kept on append, blocks purge', { skip: process.platform === 'win32' || process.getuid?.() === 0 }, () => {
+  const { h, dir, stored, item } = seeded({ destExists: true });
+  const locked = join(dir, 's');
+  const wt = mkdtempSync(join(tmpdir(), 'wt-'));
+  writeFileSync(join(wt, 'x.txt'), 'x');
+  let b, purged;
+  chmodSync(locked, 0o000); // lstat of `stored` now fails with EACCES, not ENOENT
+  try {
+    [b] = listHolding(h);
+    archivePaths({ wtPath: wt, rels: ['x.txt'], holdingDir: h, slug: 't', pr: 7, nowMs: T }); // a different slug: the locked dir is not written to
+    purged = purgeHolding(h, { nowMs: T });
+  } finally {
+    chmodSync(locked, 0o755);
+  }
+  assert.equal(b.unverified, 1, 'reported as unverified, not dropped');
+  assert.deepEqual(b.restore, [], 'not offered for restore');
+  const kept = readManifest(h).items.find((i) => i.stored === stored);
+  assert.ok(kept, 'the pending entry survives the append');
+  assert.equal(kept.status, 'pending');
+  assert.equal(kept.original, item.original);
+  assert.deepEqual(purged.purged, []);
+  assert.match(purged.kept[0].reason, /unverified/);
+  assert.equal(readFileSync(stored, 'utf8'), '{"a":1}');
 });

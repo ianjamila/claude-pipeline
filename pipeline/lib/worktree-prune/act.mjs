@@ -113,6 +113,16 @@ const isFile = (p) => {
   }
 };
 
+// Can `p` be inspected? false only when lstat fails with something other than ENOENT (EACCES, EIO, ...): then it is not known to be gone.
+const inspectable = (p) => {
+  try {
+    lstatSync(p);
+    return true;
+  } catch (err) {
+    return err?.code === 'ENOENT';
+  }
+};
+
 // Is the file at `item.stored` the one the intent promised? (An interrupted cross-device copy leaves a truncated file.)
 function storedMatches(item) {
   if (typeof item.stored !== 'string' || !isFile(item.stored)) return false;
@@ -127,9 +137,10 @@ function storedMatches(item) {
 // An archive writes its entry as `status: 'pending'` (plus `source`) BEFORE the file moves and drops both fields once the
 // move is recorded; an entry without `status` is a finished one, so older manifests read as before. A pending entry that a
 // failed write or a crash left behind is settled by looking at the disk: the stored file is there and its size and sha256
-// match => the move happened, the entry counts as archived (and is reported as `incomplete`); no stored file => the move
-// never happened, the intent is dropped; a stored file that does NOT match (a copy cut short) => `unverified`: not offered
-// for restore, never purged, kept as pending on disk for a check by hand. Pure: nothing is written.
+// match => the move happened, the entry counts as archived (and is reported as `incomplete`); no stored file (confirmed
+// absent: ENOENT) => the move never happened, the intent is dropped; a stored file that does NOT match (a copy cut short) or
+// that cannot be inspected at all (EACCES, EIO: its parent dir became unreadable, say) => `unverified`: not offered for
+// restore, never purged, kept as pending on disk for a check by hand (dropping it would lose the original-path record). Pure: nothing is written.
 // -> { items: entries that stand, incomplete: the settled-as-archived ones, unverified: the raw pending entries to check,
 //      persist: what a rewritten manifest should hold (items + unverified, in order) }
 function settleItems(manifest) {
@@ -143,7 +154,8 @@ function settleItems(manifest) {
       persist.push(item);
       continue;
     }
-    if (typeof item.stored !== 'string' || !isFile(item.stored)) continue;
+    if (typeof item.stored !== 'string') continue;
+    if (inspectable(item.stored) && !isFile(item.stored)) continue; // absent (ENOENT), or present but not a regular file: as before
     if (!storedMatches(item)) {
       unverified.push(item);
       persist.push(item);
