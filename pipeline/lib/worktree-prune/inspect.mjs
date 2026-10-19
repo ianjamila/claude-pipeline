@@ -226,7 +226,7 @@ const LSOF_TIMEOUT_MS = 60_000;
 const LSOF_MAX_BUFFER = 64 * 1024 * 1024;
 // macOS spells every path on the boot volume a second way: /System/Volumes/Data/Users/u == /Users/u (a firmlink).
 const FIRMLINK = /^\/System\/Volumes\/Data(?=\/|$)/i;
-const unFirm = (p) => p.replace(FIRMLINK, '');
+export const unFirm = (p) => p.replace(FIRMLINK, '');
 
 // One external command, spawn failures kept visible (lib/proc.mjs `run` folds ENOENT into exit 1, which lsof also uses).
 function runCapture(cmd, args, { env } = {}) {
@@ -281,7 +281,7 @@ function lsofNameForms(raw) {
 // a file of it (fcwd, ftxt, numeric fds…), `n<name>` names that file; other field letters are ignored. `names` are decoded
 // absolute paths (plus the raw spelling), `prefixes` the decoded text before an ambiguous escape; `cwd` = a readable
 // absolute fcwd.
-function parseLsofFields(text) {
+export function parseLsofFields(text) {
   const procs = new Map();
   let cur = null;
   let fd = null;
@@ -308,7 +308,7 @@ function parseLsofFields(text) {
 // Could a name that starts with `prefix` (and then continues in some unknown way) lie inside `root`? Yes when the prefix
 // already is the root or below it, or is still a prefix of "<root>/" (the unknown rest may complete the path). Same case
 // folding as isInside on darwin.
-function prefixMayReach(prefix, root, platform) {
+export function prefixMayReach(prefix, root, platform) {
   const fold = (s) => (platform === 'darwin' || platform === 'win32' ? s.toLowerCase() : s);
   const p = fold(prefix.replace(/\\/g, '/'));
   const r = `${fold(root.replace(/\\/g, '/')).replace(/\/$/, '')}/`;
