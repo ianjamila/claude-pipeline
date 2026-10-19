@@ -36,7 +36,48 @@ export function execLineOf(sf, expand) {
 // which a policy expands from the variables of the line). `over`: more readings than MAX_READINGS (the caller refuses).
 const MAX_READINGS = 32;
 // (a parameter is a name, a name[subscript], a digit or a special parameter, optionally indirect: ${1:-w}, ${@:-w}, ${A[0]:-w}, ${!A:-w})
-const PARAM_OPEN = /\$\{(!?(?:[A-Za-z_]\w*(?:\[[^\]}]*\])?|\d+|[@*#?$!-]))(:?)([-=+?])/;
+export const PARAM_OPEN = /\$\{(!?(?:[A-Za-z_]\w*(?:\[[^\]}]*\])?|\d+|[@*#?$!-]))(:?)([-=+?])/;
+// The first match of PARAM_OPEN in `s`, found without its quadratic cost: the pattern reads a subscript up to the first `]` or `}` (unbounded), so on `${a[${a[${a[…` with no closer it read to the end of the
+// text from every `${` (9 s of CPU on a 200 kB word; a hook past the host's 15 s is ALLOWED). Here a subscript's end is looked up in the sorted positions of the closers (binary search), so each `${` costs
+// O(log n) and the answer is exactly the one PARAM_OPEN gives (same index, same groups). The two sticky patterns are the parts of PARAM_OPEN that are bounded.
+const PARAM_NAME = /\$\{(!?[A-Za-z_]\w*)/y;
+const PARAM_REST = /\$\{(!?(?:\d+|[@*#?$!-]))(:?)([-=+?])/y;
+const PARAM_OP = /(:?)([-=+?])/y;
+export function paramOpen(s) {
+  let closers = null; // positions of `]` and `}`, built when a subscript is first met
+  const nextCloser = (from) => {
+    if (!closers) { closers = []; for (let k = 0; k < s.length; k++) { const ch = s.charCodeAt(k); if (ch === 93 || ch === 125) closers.push(k); } }
+    let lo = 0;
+    let hi = closers.length;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (closers[mid] < from) lo = mid + 1; else hi = mid; }
+    return lo < closers.length ? closers[lo] : -1;
+  };
+  const found = (i, end, g1, op) => Object.assign([s.slice(i, end), g1, op[1], op[2]], { index: i });
+  for (let i = s.indexOf('${'); i >= 0; i = s.indexOf('${', i + 1)) {
+    PARAM_NAME.lastIndex = i;
+    const n = PARAM_NAME.exec(s);
+    if (n) {
+      const p = i + n[0].length;
+      if (s[p] === '[') {
+        const e = nextCloser(p + 1);
+        if (e >= 0 && s[e] === ']') {
+          PARAM_OP.lastIndex = e + 1;
+          const o = PARAM_OP.exec(s);
+          if (o) return found(i, e + 1 + o[0].length, s.slice(i + 2, e + 1), o);
+        }
+      } else {
+        PARAM_OP.lastIndex = p;
+        const o = PARAM_OP.exec(s);
+        if (o) return found(i, p + o[0].length, n[1], o);
+      }
+      continue; // (a name is followed by a letter or a digit only, so the digit and special-parameter forms below cannot match here)
+    }
+    PARAM_REST.lastIndex = i;
+    const r = PARAM_REST.exec(s);
+    if (r) return Object.assign([r[0], r[1], r[2], r[3]], { index: i });
+  }
+  return null;
+}
 export function paramReadings(word) {
   let list = [word];
   let over = false;
@@ -44,7 +85,7 @@ export function paramReadings(word) {
     const next = new Set();
     let changed = false;
     for (const s of list) {
-      const m = PARAM_OPEN.exec(s);
+      const m = paramOpen(s);
       if (!m) { next.add(s); continue; }
       let depth = 1;
       let j = m.index + m[0].length;

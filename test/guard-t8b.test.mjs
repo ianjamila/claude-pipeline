@@ -65,7 +65,7 @@ const fill = (unit) => unit.repeat(Math.ceil(LIMIT / unit.length)).slice(0, LIMI
 const SHAPES = {
   'dollar-brace': '${', 'dollar-paren': '$(', 'double-quotes': '"', 'single-quotes': "'", backticks: '`', 'open-bracket': '[', 'name-bracket': 'a[', 'nested-arith': '$((',
   'heredoc-markers': '<<E ', 'heredoc-lines': 'cat <<E\n', 'open-brace': '{', 'assign-brace': 'a=${', 'tee-operands': 'tee ', ands: '&&', newlines: '\n', 'dollar-quote': '"$', 'for-in': 'for i in ',
-  'blank-slash': ' / ', 'slash-quote': "/'", 'quote-slash': "'/", 'name-paren': 'f(){ ', 'array-open': 'a=(', backslashes: '\\',
+  'dollar-brace-subscript': '${a[', 'indirect-subscript': '${!a[', 'quoted-subscript': '"${a["', 'subscript-dollar-brace': 'a[${', 'length-subscript': '${#a[', 'for-subscript': 'for a[', 'blank-slash': ' / ', 'slash-quote': "/'", 'quote-slash': "'/", 'name-paren': 'f(){ ', 'array-open': 'a=(', backslashes: '\\',
 };
 const cpu = () => { const u = process.cpuUsage(); return (u.user + u.system) / 1000; };
 for (const [name, unit] of Object.entries(SHAPES)) {
@@ -161,4 +161,32 @@ test('H2 a 200 kB line of nested name-subscripts is answered quickly by both gua
   }
   const r = git(`${'a['.repeat(30000)}; git ${'pu' + 'sh'} origin ${'ma' + 'in'}`);
   assert.equal(r.decision, 'deny', `git: ${r.reason ?? 'allowed'}`);
+});
+
+test('H2 the parameter-open finder gives exactly the match of its pattern (it only replaced a quadratic scan of the subscript) -- 30,000 random texts', async () => {
+  const { PARAM_OPEN, paramOpen } = await import('../pipeline/hooks/lib/script-candidates.mjs');
+  const alpha = ['${', '$', '{', '}', '[', ']', 'a', 'B_', '1', '!', '@', '#', ':', '-', '=', '+', '?', ' ', '*', 'x'];
+  let seed = 12345;
+  const rnd = (n) => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; };
+  for (let k = 0; k < 30000; k++) {
+    let t = '';
+    for (let i = 1 + rnd(14); i > 0; i--) t += alpha[rnd(alpha.length)];
+    const a = PARAM_OPEN.exec(t);
+    const b = paramOpen(t);
+    assert.deepEqual(b === null ? null : [b.index, ...b], a === null ? null : [a.index, ...a], JSON.stringify(t));
+  }
+  // (and a long subscript, past anything a bounded pattern would read, is still a subscript)
+  const long = '${A[' + 'x'.repeat(5000) + ']:-w}';
+  assert.equal(paramOpen(long)?.[3], '-');
+});
+test('H2 lines of unclosed subscripts after `${` are answered well under the general bound (a pattern read to the end of the line from every `${`: 9 s)', () => {
+  for (const unit of ['${a[', '${!a[', '"${a["', 'a[${', '${#a[', '${a[1]:-${a[']) {
+    const line = fill(unit);
+    for (const [who, run] of [['guard-git', () => git(line)], ['guard-files', () => files(line)]]) {
+      const t0 = cpu();
+      run();
+      const ms = cpu() - t0;
+      assert.ok(ms < 2500, `${who}: ${Math.round(ms)} ms of CPU for ${unit}`); // (~0.2 s locally, ~4x on a Windows runner)
+    }
+  }
 });
