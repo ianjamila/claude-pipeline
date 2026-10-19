@@ -288,12 +288,15 @@ test('t9 a script that does not exist runs no hook, and --userconfig / --globalc
     assert.equal(filesGuard(cmd, treeFor(root({ lint: 'ok' }), BAD_FILES)).decision, 'deny', cmd);
   }
 });
-test('t9 a directory the guard lost track of is refused only when the line mentions a guarded operation', () => {
-  const t = treeFor(root({ test: 'bad' }), BAD_GIT);
-  assert.equal(git('source ./env.sh && npm test', t).decision, 'allow');
-  const r = git(`source ./env.sh && npm test; echo ${PUSH}`, t);
+test('t9 a directory the guard lost track of: refused when the session project has scripts to run, or the line mentions a guarded operation', () => {
+  assert.equal(git('source ./env.sh && npm test', {}).decision, 'allow', 'no project known: nothing to refuse');
+  const r = git('source ./env.sh && npm test', treeFor(root({ test: 'ok' }), BAD_GIT));
   assert.equal(r.decision, 'deny');
   assert.match(r.reason, /directory this runs in is unknown/);
+  const g = git(`source ./env.sh && npm test; echo ${PUSH}`, {});
+  assert.equal(g.decision, 'deny');
+  assert.match(g.reason, /directory this runs in is unknown/);
+  assert.equal(git('source ./env.sh && npm ls', treeFor(root({ test: 'bad' }), BAD_GIT)).decision, 'allow', 'a command that runs no script');
 });
 test('t9 a package.json the line itself writes before the manager reads it is refused', () => {
   const t = root({ lint: 'ok' });
@@ -437,4 +440,66 @@ test('t9 exec forms the parser did not unwrap are judged as a command line; a ba
   for (const cmd of ['yarn tool', 'pnpm tool', 'bun run tool', 'yarn run tool']) assert.equal(git(cmd, treeFor(bin, BAD_GIT)).decision, 'deny', cmd);
   assert.equal(git('yarn lint', treeFor(bin, BAD_GIT)).decision, 'allow');
   assert.equal(git('yarn other', treeFor(bin, BAD_GIT)).decision, 'allow');
+});
+
+// ---- second security review: what the line changes first, symlinks, parity ----------------------------------------------------------------------------------------
+import { packageScripts, pmCall } from '../pipeline/hooks/lib/package-scripts.mjs';
+test('t9 an earlier command that may change package.json, a configuration file or the work tree makes the script unknown (both guards)', () => {
+  const t = root({ lint: 'ok', test: 'ok' });
+  const befores = ['git checkout other', 'git pull', 'git merge x', 'git switch -c y', 'git reset --hard', 'git stash pop', 'git rebase main', 'git cherry-pick abc', 'git apply p.diff', 'git worktree add ../w', 'git clone u d', 'git -C sub checkout x',
+    'npm pkg set scripts.lint=x', 'npm set-script lint x', 'npm init -y', 'pnpm pkg set a=b', 'yarn config set x y', 'npm config set script-shell /bin/x', 'npm config delete prefix', 'tar xf a.tgz', 'unzip a.zip', 'patch -p1 -i p.diff', 'rsync -a src/ .'];
+  for (const b of befores) {
+    for (const sep of ['&&', ';']) {
+      const cmd = `${b} ${sep} npm run lint`;
+      const g = git(cmd, treeFor(t, BAD_GIT));
+      assert.equal(g.decision, 'deny', `git: ${cmd}`);
+      assert.match(g.reason, /package script: an earlier command/);
+      assert.equal(filesGuard(cmd, treeFor(t, BAD_FILES)).decision, 'deny', `files: ${cmd}`);
+    }
+  }
+  // a background job races the command: the order on the line does not matter
+  for (const cmd of ['npm run lint & git checkout x', 'git pull & npm test', '(git checkout x &) ; npm run lint']) {
+    assert.equal(git(cmd, treeFor(t, BAD_GIT)).decision, 'deny', `git: ${cmd}`);
+    assert.equal(filesGuard(cmd, treeFor(t, BAD_FILES)).decision, 'deny', `files: ${cmd}`);
+  }
+  // a script the line runs changes it before the next command too
+  bad('npm run a && npm run lint', { 'package.json': { scripts: { a: 'git checkout x', lint: 'ok' } } });
+  bad('npm run a', { 'package.json': { scripts: { a: 'git checkout x && npm run lint', lint: 'ok' } } });
+  // commands that change nothing it reads
+  for (const cmd of ['git status && npm run lint', 'git log -3; npm test', 'git fetch && npm run lint', 'git diff | head; npm run lint', 'npm config get prefix; npm run lint', 'echo hi > notes.txt && npm run lint', 'npm ls && npm test', 'npm install && npm test', 'npm ci && npm run lint']) ok(cmd, t);
+});
+test('t9 an install earlier on the line may add a bin: refused when the line mentions a guarded operation', () => {
+  const t = treeFor(root({ lint: 'ok' }), BAD_GIT);
+  assert.equal(git('npm ci && npx tool', t).decision, 'allow');
+  assert.equal(git(`npm ci && npx tool; echo ${PUSH}`, t).decision, 'deny');
+  assert.equal(git(`npx tool; echo ${PUSH}`, t).decision, 'allow', 'no install before: the bin is simply not there');
+});
+test('t9 a configuration file or a bin the line writes first is judged or refused', () => {
+  const t = root({ lint: 'ok' });
+  for (const cmd of [`echo 'script-shell=/e/sh' > .npmrc && npm run lint`, `printf 'node-options=--require /e/x.js' >> .npmrc; npm test`, `cp /tmp/rc .npmrc && npm run lint`]) {
+    const g = git(cmd, treeFor(t, BAD_GIT));
+    assert.equal(g.decision, 'deny', `git: ${cmd}`);
+    assert.match(g.reason, /writes .*npmrc/);
+    assert.equal(filesGuard(cmd, treeFor(t, BAD_FILES)).decision, 'deny', `files: ${cmd}`);
+  }
+  const written = git(`printf '#!/bin/sh\\n${BAD_GIT}\\n' > node_modules/.bin/tool && chmod +x node_modules/.bin/tool && npx tool`, treeFor(t, BAD_GIT));
+  assert.equal(written.decision, 'deny');
+});
+test('t9 a package.json that is a dangling link or a link loop is unreadable, not missing', () => {
+  const call = pmCall(['npm', 'run', 'lint']);
+  const env = (o) => ({ cwd: '/w/p', home: '/home/u', readText: () => null, pathExists: () => false, readDir: () => null, lexists: (f) => f === '/w/p/package.json', p: undefined, ...o });
+  const r = packageScripts(call, env());
+  assert.match(r.refuse ?? '', /cannot read \/w\/p\/package\.json/);
+  assert.deepEqual(packageScripts(call, env({ lexists: () => false })), { none: true }, 'nothing there at all');
+  // a rc file that is a link loop
+  const rc = packageScripts(call, env({ lexists: (f) => f === '/w/p/.npmrc', pathExists: (f) => f === '/w/p/package.json', readText: (f) => (f === '/w/p/package.json' ? '{"scripts":{"lint":"echo"}}' : null) }));
+  assert.match(rc.refuse ?? '', /cannot read \/w\/p\/\.npmrc/);
+});
+test('t9 both guards open the shell-script bins a runner or yarn / pnpm / bun runs; a bin in another language is left alone', () => {
+  const f = (cmd, tree) => filesGuard(cmd, treeFor(tree, BAD_FILES));
+  const shell = { 'node_modules/.bin/tool': `#!/bin/sh\n${BAD_FILES}\n`, 'package.json': { scripts: { lint: 'ok' } } };
+  for (const cmd of ['npx tool', 'npm exec tool', 'pnpm exec tool', 'yarn tool', 'pnpm tool', 'bun run tool', 'yarn run tool']) assert.equal(f(cmd, shell).decision, 'deny', `files: ${cmd}`);
+  assert.equal(f('yarn lint', shell).decision, 'allow');
+  assert.equal(f('npx other', shell).decision, 'allow');
+  assert.equal(f('npx js', { ...shell, 'node_modules/.bin/js': `#!/usr/bin/env node\n${BAD_FILES}\n` }).decision, 'allow', 'a program in another language in node_modules is not ours to judge');
 });

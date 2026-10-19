@@ -3,6 +3,7 @@
 // scriptFileOf has no reading for `npm run`, so neither guard ever opened a package script. The argv reading below (moved here from git-policy.mjs, where #58 built it for the repo's merge
 // command) is shared: git-policy.mjs judges the merge command with it as before, and both guards open the scripts with pmCall / packageScripts.
 import nodePath from 'node:path';
+import { lstatSync } from 'node:fs';
 import { commandName } from './shell-parse.mjs';
 
 const baseName = (w) => commandName(w);
@@ -272,10 +273,39 @@ export function pmCall(allWords) {
 const MOVER_NAME = /^(?:npm_|yarn_|pnpm_|bun_|berry_|corepack_|node_options$|init_cwd$)/i;
 export const pmMoverName = (names) => { for (const n of names) if (MOVER_NAME.test(n)) return n; return null; };
 
+// A name exported that is only known at run time (`export $N=x`) can be any of the variables above.
+export const NAME_AT_RUN_TIME = /(?:^|[;&|(\s])(?:export|declare|typeset|local|readonly)\s(?:[^;&|\n]*\s)?[^\s=;&|]*[$`][^\s=;&|]*(?=[\s=;&|]|$)/;
+
+// What an earlier command of the line may change before the package manager reads package.json, the configuration files or the work tree (git checkout / pull / merge ..., npm pkg set,
+// npm config set, npm init, tar x, patch ...). A writer of a NAMED file (redirect, cp, mv, sed -i, tee ...) is not here: writtenTo models those and the callers ask it for each file read.
+const GIT_CHANGERS = new Set(['checkout', 'switch', 'restore', 'reset', 'pull', 'merge', 'rebase', 'stash', 'am', 'apply', 'cherry-pick', 'revert', 'worktree', 'clean', 'read-tree', 'checkout-index', 'submodule', 'clone', 'sparse-checkout', 'bisect', 'mv', 'rm']);
+const BULK_WRITERS = new Set(['tar', 'unzip', '7z', '7za', 'rsync', 'patch', 'cpio', 'ditto', 'bsdtar', 'pax', 'unrar', 'unpigz']);
+const PM_CHANGE_WORDS = new Set(['pkg', 'set-script', 'init', 'create', 'edit', 'link', 'ln']);
+const CONFIG_WRITE_WORDS = new Set(['set', 'delete', 'edit', 'rm', 'remove', 'unset']);
+export const BACKGROUND = /(?<![&>|])&(?![&>])/;
+export function stateChanger(argv) {
+  const words = baseName(argv[0] ?? '') === 'corepack' ? argv.slice(1) : argv;
+  const name = baseName(words[0] ?? '');
+  if (name === 'git') return words.slice(1, 10).some((w) => GIT_CHANGERS.has(w));
+  if (BULK_WRITERS.has(name)) return true;
+  if (!Object.hasOwn(PM_RUN_ALIASES, name)) return false;
+  const head = words.slice(1, 8);
+  return head.some((w) => PM_CHANGE_WORDS.has(w)) || (head.some((w) => w === 'config' || w === 'c') && head.some((w) => CONFIG_WRITE_WORDS.has(w))) || (name === 'yarn' && head[0] === 'set');
+}
+// Remembers on the evaluation's shared budget what the commands in `argvs` (in the order they run, or all of them when the line puts one in the background) may change.
+export function markPackageState(budget, argvs) {
+  for (const a of argvs) {
+    if (!a.length) continue;
+    if (stateChanger(a)) budget.pkgDirty = true;
+    if (pmCall(a)?.installGroup) budget.pkgBinsDirty = true; // (an install adds and replaces node_modules/.bin)
+  }
+}
+
 export const shellQuote = (w) => (/^[A-Za-z0-9_@%+=:,./-]+$/.test(w) ? w : `'${String(w).replace(/'/g, "'\\''")}'`);
 
 const MAX_WORKSPACE_PACKAGES = 256;
 const MAX_WALK = 64;
+const defaultLexists = (f) => { try { lstatSync(f); return true; } catch { return false; } }; // (a symlink loop or a dangling link exists although existsSync says no)
 // Configuration files that change what runs a script (script-shell, node-options, workspaces ... ): a key on this list in a file next to the package or in the home directory makes the scripts unknown.
 // (not `prefix`: npm takes the project from the command line's --prefix alone -- @npmcli/config loadLocalPrefix reads the 'cli' source -- so a `prefix=` in a .npmrc, which people set to move their GLOBAL packages, moves nothing here)
 const RC_REFUSED = new Set(['script-shell', 'node-options', 'workspaces', 'workspace', 'include-workspace-root', 'globalconfig', 'userconfig', 'shell', 'onload-script']);
@@ -288,6 +318,8 @@ export function packageScripts(call, env) {
   const p = env.p ?? nodePath;
   env.tick?.();
   const cache = env.cache ?? new Map();
+  const lexists = env.lexists ?? defaultLexists;
+  const exists = (f) => env.pathExists(f) || lexists(f);
   const refuse = (msg) => ({ refuse: `package script: ${msg}` });
   const direct = call.execText ? [{ name: null, label: `${call.pm} exec command`, text: call.execText, dir: env.cwd, file: env.cwd }] : [];
   const end = (r) => (r.none && direct.length ? { runs: direct } : r.runs && direct.length ? { runs: [...direct, ...r.runs] } : r);
@@ -302,7 +334,7 @@ export function packageScripts(call, env) {
     env.tick?.();
     const text = env.readText(pj);
     let rec;
-    if (typeof text !== 'string') rec = env.pathExists(pj) ? { unreadable: true } : { missing: true };
+    if (typeof text !== 'string') rec = exists(pj) ? { unreadable: true } : { missing: true };
     else {
       try {
         const j = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text); // (duplicate keys: the last wins, as in npm)
@@ -328,7 +360,7 @@ export function packageScripts(call, env) {
       const pj = p.join(d, 'package.json');
       walked.push(pj);
       env.tick?.();
-      if (env.pathExists(pj) || env.written?.(pj)) { found = { dir: d, file: pj }; break; }
+      if (exists(pj) || env.written?.(pj)) { found = { dir: d, file: pj }; break; }
       if (nm && env.pathExists(p.join(d, 'node_modules'))) { atRoot = true; break; }
       const up = p.dirname(d);
       if (up === d) { atRoot = true; break; }
@@ -353,7 +385,7 @@ export function packageScripts(call, env) {
     let reached = false;
     for (let i = 0; i < MAX_WALK; i++) {
       const pj = p.join(d, 'package.json');
-      const rec = env.pathExists(pj) ? read(pj) : null;
+      const rec = exists(pj) ? read(pj) : null;
       if (rec?.unreadable) return unreadable(pj);
       if (rec?.invalid) return invalid(pj);
       if (rec?.workspaces || env.pathExists(p.join(d, 'pnpm-workspace.yaml'))) roots.push(d);
@@ -404,7 +436,7 @@ export function packageScripts(call, env) {
     if (rec.invalid) return invalid(cand.file);
     // configuration that can change the shell, the prefix or the options a script runs with
     for (const rc of rcFiles(call, cand.dir, env, p)) {
-      const bad = rcRefusal(rc, env, cache);
+      const bad = rcRefusal(rc, env, cache, exists);
       if (bad) return refuse(bad);
     }
     const scripts = rec.scripts ?? {};
@@ -432,11 +464,13 @@ function rcFiles(call, dir, env, p) {
   if (call.pm === 'bun') { list.push(p.join(dir, 'bunfig.toml')); if (env.home) list.push(p.join(env.home, '.bunfig.toml')); }
   return list;
 }
-function rcRefusal(file, env, cache) {
+function rcRefusal(file, env, cache, exists) {
   const key = `rc\u0000${file}`;
   if (cache.has(key)) return cache.get(key);
   let msg = null;
-  if (env.pathExists(file)) {
+  const w = env.written?.(file);
+  if (w === 'known' || (w === 'maybe' && env.mentionsGuarded?.())) msg = `this line writes ${file} before the package manager reads it, so what it sets for the scripts cannot be verified. Write it in a command of its own.`;
+  else if (exists(file)) {
     const text = env.readText(file);
     if (typeof text !== 'string') msg = `cannot read ${file} (missing permission, a directory or larger than 1 MB), so what it sets for the package manager cannot be verified.`;
     else {
@@ -460,7 +494,7 @@ export function localBin(name, env) {
   let d = env.cwd;
   for (let i = 0; i < MAX_WALK; i++) {
     const f = p.join(d, 'node_modules', '.bin', name);
-    if (env.pathExists(f)) return f;
+    if (env.pathExists(f) || env.written?.(f)) return f;
     const up = p.dirname(d);
     if (up === d) break;
     d = up;
