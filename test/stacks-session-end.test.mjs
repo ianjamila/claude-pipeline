@@ -749,6 +749,7 @@ test('F2: after the LAST probe an `observed` record is written (not after the +3
   const decided = w.actions().find((d) => d.action === 'would-stop');
   assert.deepEqual({ action: m[0].action, source: m[0].source, project: m[0].project, generation: m[0].generation }, { action: 'observed', source: 'session-end', project: 'alpha', generation: decided.generation });
   assert.equal(m[0].t, new Date(Date.parse(decided.t) + 120 * 60_000).toISOString());
+  assert.equal(m[0].decidedAt, decided.t, 'R4-B1: the marker names the decision record it observed');
   assert.ok(!r.notes.some((n) => /not recorded/.test(n)), 'a marker is stored with decision:false and is not reported as a failed decision');
   assert.deepEqual(workerSeen.targets, [{ project: 'alpha', generation: decided.generation, t: decided.t }], 'the worker file names the decided targets (for observation-lost)');
   assert.equal(workerSeen.decisions, 1, 'markers are not counted as decisions');

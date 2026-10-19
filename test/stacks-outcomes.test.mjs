@@ -243,7 +243,8 @@ test('outcomeSummary (F1): a generation first seen over 7 days ago but would-sto
 // ---- F2: CLEAN needs an observer's word for a session-end would-stop
 
 const se = (o = {}) => dec({ source: 'session-end', ...o });
-const mark = (action, offset, o = {}) => ({ t: iso(T0_MS + offset), source: 'session-end', project: 'sa-corrections', generation: gen(), action, reasons: ['r'], ...o });
+// decidedAt (R4-B1) defaults to the first would-stop's t: the decision record the marker observed.
+const mark = (action, offset, o = {}) => ({ t: iso(T0_MS + offset), source: 'session-end', project: 'sa-corrections', generation: gen(), action, reasons: ['r'], decidedAt: T0, ...o });
 
 test('outcomeSummary (F2): a session-end would-stop with an `observed` record after the window is CLEAN', () => {
   const s = outcomeSummary([se(), mark('observed', 2 * HOUR)], [], T0_MS + 3 * HOUR);
@@ -269,13 +270,55 @@ test('outcomeSummary (F2): observation-late and observation-lost are UNKNOWN; an
   assert.match(lost.rows[0].note, /worker died/);
   const ds = [se(), mark('observed', 2 * HOUR), se({ t: iso(T0_MS + DAY) })];
   assert.equal(outcomeSummary(ds, [], T0_MS + DAY + 3 * HOUR).rows[0].outcome, 'UNKNOWN');
-  assert.equal(outcomeSummary([...ds, mark('observed', DAY + 2 * HOUR)], [], T0_MS + DAY + 3 * HOUR).rows[0].outcome, 'CLEAN');
+  assert.equal(outcomeSummary([...ds, mark('observed', DAY + 2 * HOUR, { decidedAt: iso(T0_MS + DAY) })], [], T0_MS + DAY + 3 * HOUR).rows[0].outcome, 'CLEAN');
 });
 
 test('outcomeSummary (F2): a use still wins (MISS), and a sweep-sourced would-stop keeps its CLEAN rule (the sweep has no observer)', () => {
   assert.equal(outcomeSummary([se(), mark('observation-lost', HOUR)], [useAt(10 * 60_000)], T0_MS + 4 * HOUR).rows[0].outcome, 'MISS');
   const s = outcomeSummary([dec()], [], T0_MS + 4 * HOUR);
   assert.deepEqual([s.clean, s.unknown], [1, 0]);
+});
+
+// ---- R4-B1: a marker is bound to the decision record it observed
+
+test('outcomeSummary (R4-B1): session A\'s `observed` does not vouch for session B\'s later would-stop of the same generation', () => {
+  const A = se({ t: iso(T0_MS) });
+  const B = se({ t: iso(T0_MS + HOUR) });
+  const now = T0_MS + 10 * HOUR; // 13:01 in the report's terms: B's window is long over
+  const onlyA = outcomeSummary([A, B, mark('observed', 9 * HOUR, { decidedAt: A.t })], [], now);
+  assert.deepEqual([onlyA.clean, onlyA.unknown], [0, 1], 'A\'s marker is not B\'s');
+  assert.match(onlyA.rows[0].note, /no re-probe was recorded/);
+  const both = outcomeSummary([A, B, mark('observed', 9 * HOUR, { decidedAt: A.t }), mark('observed', 3 * HOUR, { decidedAt: B.t })], [], now);
+  assert.deepEqual([both.clean, both.unknown], [1, 0], 'B\'s own observed makes it CLEAN');
+  // a marker with no decidedAt (older format) never counts as observed
+  assert.equal(outcomeSummary([A, mark('observed', 2 * HOUR, { decidedAt: undefined })], [], T0_MS + 3 * HOUR).rows[0].outcome, 'UNKNOWN');
+});
+
+test('outcomeSummary (R4-B1): a delayed observation-lost / -late of an OLDER record is not charged to the newer one; one without decidedAt counts only when not older than the newest record', () => {
+  const A = se({ t: iso(T0_MS) });
+  const B = se({ t: iso(T0_MS + HOUR) });
+  const withB = (extra) => outcomeSummary([A, B, mark('observed', 3 * HOUR, { decidedAt: B.t }), extra], [], T0_MS + 10 * HOUR).rows[0];
+  assert.equal(withB(mark('observation-lost', 5 * HOUR, { decidedAt: A.t })).outcome, 'CLEAN', 'A\'s lost does not taint B');
+  assert.equal(withB(mark('observation-lost', 5 * HOUR, { decidedAt: B.t })).outcome, 'UNKNOWN');
+  assert.equal(withB(mark('observation-lost', 5 * HOUR, { decidedAt: undefined })).outcome, 'UNKNOWN', 'no decidedAt, newer than B: conservative');
+  assert.equal(withB(mark('observation-lost', 30 * 60_000, { decidedAt: undefined })).outcome, 'CLEAN', 'no decidedAt, older than B: not B\'s');
+});
+
+// ---- R4-B2: an incomplete observation outranks RESTART (but not MISS)
+
+test('outcomeSummary (R4-B2): RESTART + observation-lost / no observation after the window is UNKNOWN; RESTART + observed, or inside an open window with no marker, stays RESTART', () => {
+  const restart = useAt(30 * 60_000, { birth: born(T0_MS) + 300 });
+  const lost = outcomeSummary([se(), mark('observation-lost', 40 * 60_000)], [restart], T0_MS + 4 * HOUR);
+  assert.equal(lost.rows[0].outcome, 'UNKNOWN');
+  assert.deepEqual([lost.unknown, lost.restart], [1, 0]);
+  assert.match(lost.rows[0].note, /worker died/);
+  const none = outcomeSummary([se()], [restart], T0_MS + 2 * HOUR);
+  assert.deepEqual([none.unknown, none.restart], [1, 0], 'now >= +2 h and nobody observed');
+  assert.match(none.rows[0].note, /no re-probe was recorded/);
+  assert.equal(outcomeSummary([se(), mark('observed', 2 * HOUR)], [restart], T0_MS + 3 * HOUR).rows[0].outcome, 'RESTART');
+  assert.equal(outcomeSummary([se()], [restart], T0_MS + HOUR).rows[0].outcome, 'RESTART', 'window still open, no lost / late marker');
+  assert.equal(outcomeSummary([se(), mark('observation-late', 3 * HOUR)], [restart], T0_MS + 4 * HOUR).rows[0].outcome, 'UNKNOWN');
+  assert.equal(outcomeSummary([se(), mark('observation-lost', HOUR)], [restart, useAt(10 * 60_000)], T0_MS + 4 * HOUR).rows[0].outcome, 'MISS', 'MISS outranks UNKNOWN');
 });
 
 // ---------------------------------------------------------------- memoryOfProject

@@ -162,7 +162,7 @@ export function outcomeSummary(decisions, uses, now = Date.now()) {
     if (!isObject(rec) || !OBSERVATION_ACTIONS.includes(rec.action)) continue;
     const key = generationKey(rec);
     if (!marks.has(key)) marks.set(key, []);
-    marks.get(key).push({ action: rec.action, ms: toMs(rec.t) });
+    marks.get(key).push({ action: rec.action, ms: toMs(rec.t), decidedMs: rec.decidedAt === undefined || rec.decidedAt === null ? null : toMs(rec.decidedAt) });
   }
   const hits = new Map(); // generation key -> [{ ...use, class, against }]
   for (const use of uses ?? []) {
@@ -182,14 +182,21 @@ export function outcomeSummary(decisions, uses, now = Date.now()) {
     if (!(newestMs >= nowMs - WEEK_MS)) continue;
     const used = hits.get(key) ?? [];
     const worst = used.reduce((w, u) => (RANK[u.class] > (RANK[w] ?? 0) ? u.class : w), null);
-    let outcome = worst ?? (nowMs >= newestMs + WINDOW_MS ? 'CLEAN' : 'PENDING');
+    const windowOver = nowMs >= newestMs + WINDOW_MS;
+    let outcome = worst ?? (windowOver ? 'CLEAN' : 'PENDING');
     let note = null;
-    if (outcome === 'CLEAN' && newest.source === 'session-end') {
-      const after = (marks.get(key) ?? []).filter((m) => m.ms >= newestMs);
-      if (after.some((m) => m.action === 'observation-lost')) note = 'the worker died before its re-probes finished: nothing proves the stack was unused';
-      else if (after.some((m) => m.action === 'observation-late')) note = 'the last re-probe ran too late, outside the 2 h window: nothing proves the stack was unused';
-      else if (!after.some((m) => m.action === 'observed')) note = 'no re-probe was recorded after the would-stop: nothing proves the stack was unused';
-      if (note) outcome = 'UNKNOWN';
+    if (newest.source === 'session-end') {
+      // R4-B1: a marker vouches only for the decision record it names (decidedAt = that record's t). An `observed` without it never
+      // counts; a lost / late one without it counts only when it is not older than the newest record (a conservative reading).
+      const mine = (marks.get(key) ?? []).filter((m) => (m.decidedMs === null ? m.action !== 'observed' && m.ms >= newestMs : m.decidedMs === newestMs));
+      // R4-B2: completeness is judged on its own, whatever the provisional outcome: a RESTART at +30 then a dead worker is not RESTART.
+      if (mine.some((m) => m.action === 'observation-lost')) note = 'the worker died before its re-probes finished: nothing proves the stack was unused';
+      else if (mine.some((m) => m.action === 'observation-late')) note = 'the last re-probe ran too late, outside the 2 h window: nothing proves the stack was unused';
+      else if (windowOver && !mine.some((m) => m.action === 'observed')) note = 'no re-probe was recorded after the would-stop: nothing proves the stack was unused';
+      if (note) {
+        if (outcome === 'MISS') note = null; // a use outranks it
+        else outcome = 'UNKNOWN'; // MISS > UNKNOWN > RESTART > CLEAN
+      }
     }
     sum[outcome.toLowerCase()] += 1;
     const memBytes = typeof rec.memBytes === 'number' && Number.isFinite(rec.memBytes) ? rec.memBytes : null;

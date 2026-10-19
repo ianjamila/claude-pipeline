@@ -498,6 +498,7 @@ test('F2: a dead worker left in phase decided/observing gets an observation-lost
     const lost = m.actions().filter((d) => d.action === 'observation-lost');
     assert.equal(lost.length, 1);
     assert.deepEqual({ source: lost[0].source, project: lost[0].project, generation: lost[0].generation }, { source: 'sweep', project: 'orphan-demo', generation: gen });
+    assert.equal(lost[0].decidedAt, new Date(decidedAt).toISOString(), 'R4-B1: the marker names the decision record whose observation was lost');
     assert.equal(r.outcomes.unknown, 1, 'the would-stop nobody finished observing is UNKNOWN');
     assert.equal(r.outcomes.clean, 0);
     assert.match(readFileSync(m.files.report, 'utf8'), /MISS 0 \(\+1 unknown ⇒ not yet\)/);

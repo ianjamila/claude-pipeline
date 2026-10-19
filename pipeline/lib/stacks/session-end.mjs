@@ -453,7 +453,7 @@ export async function runSessionEnd({ owner, deps = {} } = {}) {
       for (const { stack, decidedMs, generation, action } of groupTargets) {
         const at = iso(stampMs);
         let degraded = false; // a probe that should have answered did not: the stack was not observed
-        const marker = (kind, why) => store({ t: kind === 'observed' ? at : iso(slotMs), source: 'session-end', project: stack.project, generation, action: kind, reasons: [why] }, { decision: false });
+        const marker = (kind, why) => store({ t: kind === 'observed' ? at : iso(slotMs), source: 'session-end', project: stack.project, generation, action: kind, reasons: [why], ...(Number.isFinite(decidedMs) ? { decidedAt: iso(decidedMs) } : {}) }, { decision: false }); // decidedAt: the decision record this marker observed (R4-B1)
         const add = async (check, hit, why) => {
           if (own.has(hit.pid)) return;
           const key = `${check}|${stack.project}|${hit.pid}|${hit.birth}|${hit.port ?? ''}`;

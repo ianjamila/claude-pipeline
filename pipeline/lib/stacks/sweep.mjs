@@ -283,6 +283,7 @@ export async function runSweep({ apply = false, deps = {} } = {}) {
       for (const t of l.targets) {
         const r = await appendDecision(files.actions, {
           t: iso(now()), source: 'sweep', project: t.project, generation: t.generation, action: 'observation-lost',
+          ...(t.t ? { decidedAt: t.t } : {}), // the decision record whose observation was lost (R4-B1)
           reasons: [`session-end worker ${l.name} died in phase ${l.phase} before its re-probes finished${t.t ? ` (decided ${t.t})` : ''}`],
         });
         if (!r?.ok) note(`observation-lost for ${t.project} not recorded: ${r?.reason ?? 'no answer'}`);
