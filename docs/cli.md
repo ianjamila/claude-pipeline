@@ -513,16 +513,25 @@ Vendoring also appends `scripts/pipeline/** -text` and `scripts/verify text eol=
 
 ## verify
 
-plan the verify commands for the ship loop (plan-after-fix).
+plan the verify commands for the ship loop (plan-after-fix); limit parallel full verifies (slot).
 
 ```
 pipeline verify plan-after-fix --round R [--repo DIR]   -> {ok, mode, commands, matchedSteps, base, head, files}
   verify.after_fix full (default): commands = [verify.full]. quick: commands = [verify.quick] plus, when the fixes since round R's
   reviewed head (renames count on both sides) touch a path in verify.after_fix_steps_by_path, verify.full --only <those steps>;
   run them in order, either red = fix cycle. exit 1 {ok:false, error} when round R has no recorded review state (fail closed)
+  verify.max_parallel_full set: every full command above comes back wrapped in `slot --run` (a --only run executes the database steps)
+pipeline verify slot --run [--repo DIR] -- CMD...   wait for a free slot, run CMD (inherited stdio), free the slot when it ends; exit code = CMD's
+  Slots are machine-wide (all repos); the limit is verify.max_parallel_full of the repo it runs in; unset = CMD runs at once. Waiters go in arrival order.
+  One stderr line before CMD starts: {"slot":{index,of,waitedSeconds,loadWaitSeconds,warnings}}. With verify.max_load it then waits (5-30 s jitter between
+  checks, at most verify.max_load_wait_minutes) while the 1-minute load average is above it, and proceeds with a warning when the time is up.
+  One argument is a whole shell command line ("npm run verify"); several arguments are quoted for the shell like job start. SIGINT/SIGTERM/SIGHUP go to CMD.
+pipeline verify slot --status   -> {ok, lockDir, holders[{index,pid,host,startedAt,alive}], waiters[{seq,pid,host,alive}]}   (read only; the whole machine)
 ```
 
-Exit: 0 · 1 `no-round-state` / `base-not-ancestor` (run `verify.full` instead) · 2 usage.
+Exit (plan-after-fix): 0 · 1 `no-round-state` / `base-not-ancestor` (run `verify.full` instead) · 2 usage.
+
+`slot --run` is for repos that set `verify.max_parallel_full: <n>` (a positive integer): at most n full verifies of ALL repos run at once on this machine, the rest wait in arrival order, so one machine is not overloaded by several sessions' database-heavy verifies. It wraps the command instead of an acquire/release pair because a slot is a machine lock (pipeline/lib/locks.mjs) owned by a live process: the wrapper is that process for exactly as long as the command runs, and a wrapper killed hard frees its slot through the usual dead-owner reclaim. The wrapper exits with the command's exit code (128 + n for a signal) and prints nothing on stdout. Before the command starts it writes ONE JSON line to stderr, `{"slot":{"index","of","waitedSeconds","loadWaitSeconds","warnings"}}`, which the ship summary quotes. `verify.max_load` (positive number, needs `max_parallel_full`) adds a second, optional wait AFTER the slot is held: while the 1-minute load average is above it, re-check every 5-30 s (random, so waiters do not start together) for at most `verify.max_load_wait_minutes` (default 10, at most 10), then run anyway with a warning. On Windows the load check is skipped (warning). `slot --status` is read only. `PIPELINE_LOCK_DIR` moves the lock directory (a test seam; changing it splits the machine-wide limit).
 
 ## version
 
