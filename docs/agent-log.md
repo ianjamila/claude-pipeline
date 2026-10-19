@@ -59,3 +59,4 @@ full record.
 - 2026-10-19 · #82 · feat(verify): faster verify for database-heavy PRs (after-fix quick, machine slots, CI proof) · risk high · rounds 3 · arbiter 0 · merged
 - 2026-10-19 · #81 · fix(guards): fewer false alarms after #75 + about a dozen bypasses closed (#74, #76) · risk high · rounds 3 · arbiter 0 · needs-human
 - 2026-10-19 · #87 · fix(inbox): never suggest close on age alone; never suggest merge when mergeability is unknown · risk high · rounds 1 · arbiter 0 · awaiting-owner-merge
+- 2026-10-19 · #81 · fix(guards): fewer false alarms after #75 + about a dozen bypasses closed (#74, #76) · risk high · rounds 6 · arbiter 0 · awaiting-owner-merge
