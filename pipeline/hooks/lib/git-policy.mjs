@@ -909,7 +909,7 @@ const isPmWord = (w) => Object.hasOwn(PM_RUN_ALIASES, pmName(w));
 const MOVES_DIR = /^(?:--prefix|--cwd|--dir|--workdir|--workspaces?|--filter|--filter-prod|--include-workspace-root|--userconfig|--globalconfig|--global|--location|-w|-ws|-C|-F|-g)(?:=.*)?$|^-[CwF]./;
 // (a package-manager setting the line gives — `npm_config_prefix=/chat npm run merge …`, `export npm_config_…`, `env YARN_…` — may move it the same way: npm reads
 // npm_config_* like its options, whatever the case. Fails closed on any such name; the guard's variables hold only what the line sets.)
-const pmSettingOnLine = (ctx) => [...Object.keys(ctx.vars ?? {}), ...(ctx.unsureVars ?? []), ...(ctx.tainted ?? [])].some((k) => /^(?:npm_config_|yarn_|pnpm_|bun_|berry_)/i.test(k));
+const pmSettingOnLine = (ctx) => [...Object.keys(ctx.vars ?? {}), ...(ctx.unsureVars ?? []), ...(ctx.tainted ?? [])].some((k) => /^(?:npm_config_|yarn_|pnpm_|bun_|berry_|init_cwd$|npm_package_json$)/i.test(k)); // (#81 t9: and INIT_CWD / npm_package_json, which name the project a script call starts from)
 function pmScriptRefusal(prefix, shaFlag, raw, dir, ctx) {
   const script = pmScriptOf(prefix);
   const end = raw.indexOf('--');

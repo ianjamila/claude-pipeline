@@ -311,3 +311,11 @@ test('t9 a package-manager call inside a script judged with a script of its own 
   bad('npm run a', { 'package.json': { scripts: { a: 'cd sub && npm run b' } }, 'sub/package.json': { scripts: { b: 'bad' } } });
   ok('npm run a', { 'package.json': { scripts: { a: 'cd sub && npm run b' } }, 'sub/package.json': { scripts: { b: 'ok' } } });
 });
+test('t9 (#73 follow-up) INIT_CWD and npm_package_json move the repo merge script like npm_config_prefix', () => {
+  const H7 = '7'.repeat(40);
+  const ownerGo = { mode: () => 'chat', mergeTemplates: () => [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: '--expect-head' }], approvedHead: (pr, head) => pr === 7 && head === H7 };
+  const v = (cmd) => evaluateGitCommand(cmd, { cwd: '/chat', home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], ownerGo, readText: () => null, readHead: () => null, pathExists: () => false, readDir: () => null });
+  const exact = `npm run merge -- 7 --expect-head ${H7}`;
+  assert.equal(v(exact).decision, 'allow', 'the exact approved form stays approvable');
+  for (const pre of ['npm_config_prefix=/x', 'NPM_CONFIG_PREFIX=/x', 'INIT_CWD=/x', 'npm_package_json=/x/package.json', 'init_cwd=/x']) assert.equal(v(`${pre} ${exact}`).decision, 'deny', pre);
+});
