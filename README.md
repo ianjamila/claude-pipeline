@@ -244,6 +244,8 @@ head you did not review (the receipt names the head the event carried).
   mode (skills and CLI only) and preflight says so.
 - **Local verify, lean CI.** The full verify runs on your machine; CI keeps the repo's existing
   checks plus the cheap guard jobs, and runs E2E only for high-risk PRs.
+- **Verify slots are per machine.** `verify.max_parallel_full` limits full verifies on one computer, not across your machines, and the
+  `verify.max_load` check is skipped on Windows (with a warning).
 - **Agent log lives on its own branch.** `docs/agent-log.md` can't be pushed to `main` directly and a file every PR edits would
   conflict, so each run's outcome line is pushed to the orphan branch `pipeline-agent-log` (never into a PR). If that push
   fails, the line stays queued and goes out with the next run. The PR's summary comment is the immediate record.
@@ -263,6 +265,34 @@ and `ci.approvers` (logins whose approval labels count; required for org-owned r
 fail closed with `org-repo-needs-ci.approvers`). `pipeline config` prints `warnings` for config that is valid
 but suspicious. Documentation and test files are exempt from the content rules (sensitive terms, SQL, auth) but keep
 one: a real-looking secret key literal (not marked fake inside the key itself) is still a `needs-human` hit there.
+
+### Faster verify (opt-in)
+
+Three groups of optional `verify` keys cut the wait without weakening the checks that matter. Leave them unset and
+nothing changes: every verify is the full one, and runs at once.
+
+```yaml
+verify:
+  after_fix: quick                 # full (default) | quick
+  after_fix_steps_by_path:         # glob -> steps to add when a fix touches a match
+    "supabase/**": [db, db-grants]
+  after_fix_never: [sql-arms]      # steps that must always run in a full verify
+  max_parallel_full: 2             # at most 2 full verifies at once on this machine
+  max_load: 12                     # then wait while the 1-minute load average is above 12
+  max_load_wait_minutes: 10        # ... for at most this long (default 10, maximum 10)
+```
+
+- `after_fix`: what the verifier runs after review fixes are accepted. `quick` runs `verify.quick`, plus
+  `verify.full --only <steps>` for the steps whose paths (`after_fix_steps_by_path`) the fixes touched. The first full
+  verify, and the gate's fresh full verify on the exact head that will merge, are always full and unchanged.
+  `pipeline verify plan-after-fix --round R` prints the commands.
+- `after_fix_never`: steps that may only run as part of a full verify. Listing one in `after_fix_steps_by_path` too is a config error.
+- `max_parallel_full` (positive integer): full verifies of all repos on this machine share that many slots; the rest wait
+  in arrival order (`pipeline verify slot --status` shows who holds them). `max_load` and `max_load_wait_minutes` add a
+  wait for a quiet machine after the slot is taken; when the time is up the verify runs anyway, with a warning.
+
+Rollout: the config rejects unknown keys, so set these in a repo only after every machine that works on it has run
+`pipeline update` to a version that knows them.
 
 | Variable | Meaning |
 |---|---|
