@@ -215,10 +215,24 @@ export function pmCall(allWords) {
     const j = scanOpts(r, 0, pm, st);
     r = r.slice(j);
     if (r[0] === '--') r = r.slice(1);
-    // yarn: `yarn workspace NAME script` / `yarn workspaces run script` -- every word after may be the script
+    // yarn: `yarn workspace NAME [run] script ARGS` / `yarn workspaces [foreach OPTS] run script ARGS` -- the script gets ARGS (R1-B5). A form this does not read: every word after may be the script
     if (!aliases.includes(sub) && /^workspaces?$/.test(sub)) {
       st.workspace = true;
-      const cand = rest.filter((w) => !w.startsWith('-'));
+      let w = rest.slice(scanOpts(rest, 0, pm, st));
+      let known = false;
+      if (sub === 'workspace') { w = w.slice(1); known = true; } // (NAME)
+      else if (w[0] === 'foreach') w = w.slice(scanOpts(w, 1, pm, st));
+      w = w.slice(scanOpts(w, 0, pm, st));
+      if (w[0] === 'run') { w = w.slice(1); w = w.slice(scanOpts(w, 0, pm, st)); known = true; }
+      if (w[0] === '--') w = w.slice(1);
+      if (known && w.length) {
+        call.main = w[0];
+        setNames(hooks(w[0]));
+        call.gate = [w[0]];
+        scriptArgs(w.slice(1));
+        return finish();
+      }
+      const cand = rest.filter((x) => !x.startsWith('-'));
       if (!cand.length) return null;
       setNames(cand.flatMap(hooks));
       call.gate = cand;

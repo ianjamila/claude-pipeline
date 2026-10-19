@@ -123,7 +123,7 @@ test('R1-B5 yarn workspace NAME SCRIPT ARGS and yarn workspaces run SCRIPT ARGS 
   const tree = (g) => ({ 'package.json': pkg({}, ws), 'a/package.json': pkg({ ship: g.head }) });
   const words = (g) => g.tail;
   for (const [n, g] of Object.entries(G)) {
-    for (const cmd of [`yarn workspace a ship ${words(g)}`, `yarn workspace a run ship ${words(g)}`, `yarn workspaces run ship ${words(g)}`, `yarn workspace a ship -- ${words(g)}`]) {
+    for (const cmd of [`yarn workspace a ship ${words(g)}`, `yarn workspace a run ship ${words(g)}`, `yarn workspaces run ship ${words(g)}`, `yarn workspaces foreach run ship ${words(g)}`, `yarn workspace a ship -- ${words(g)}`]) {
       assert.equal(g.run(cmd, tree(g)).decision, 'deny', `${n}: ${cmd}`);
     }
   }
