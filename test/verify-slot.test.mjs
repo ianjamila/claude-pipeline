@@ -470,7 +470,10 @@ test('CLI: SIGTERM to the wrapper reaches the verify and frees the slot', POSIX_
     assert.equal(statusOf(lockDir).holders.length, 1);
     a.p.kill('SIGTERM');
     const r = await a.done;
-    assert.equal(r.code, 42, 'the fixture exits 42 on SIGTERM: the signal was forwarded');
+    assert.ok(existsSync(path.join(work, 'a.started.sigterm')), 'the verify itself received the SIGTERM: the signal was forwarded');
+    // The exit code is the shell's: 42 where the shell exec'd the fixture (bash, macOS), 143 = killed by SIGTERM where the shell stayed
+    // in between and the group signal reached it too (dash, Linux CI).
+    assert.ok([42, 143].includes(r.code), `exit code ${r.code}: the fixture's 42 or the shell's 143`);
     assert.deepEqual(statusOf(lockDir).holders, []);
     assert.equal(readdirSync(lockDir).some((f) => f.endsWith('.lock')), false);
   } finally {
