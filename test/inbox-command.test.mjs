@@ -427,3 +427,64 @@ test('a failed required check is named; an untracked PR quiet past --stale-days 
   assert.match(stale.reason, /; also required check failed: ci$/);
   assert.deepEqual(r.json.triage.close.map((p) => p.number), [2]);
 });
+
+// ---- mergeability when git cannot say ---------------------------------------------------------
+
+// One awaiting-owner-merge PR per GitHub `mergeable` value, optionally with git on.
+function mergeableRun(mergeable, args, { prFiles = { 'b.txt': 'b\n' }, mainFiles = null } = {}) {
+  const w = world();
+  const sha = w.prBranch(1, prFiles);
+  if (mainFiles) w.advanceMain(mainFiles);
+  const fake = createFakeGh([
+    ...BASE_ENTRIES,
+    OPEN_ONLY(page([node(1, sha, { mergeable })])),
+    NO_MERGED,
+    { match: COMMENTS(1), stdoutJson: [recordComment(1, 1, sha)] },
+  ]);
+  const r = inbox(args, { w, fake });
+  assertExit(r, 0);
+  assertReadOnly(fake);
+  return r.json.prs[0];
+}
+
+test('--no-git: GitHub CONFLICTING on an awaiting-owner-merge record is failing-check, never merge', () => {
+  const p = mergeableRun('CONFLICTING', ['--no-git']);
+  assert.equal(p.conflicts, null); // the output keeps git's answer; only the classification uses GitHub's
+  assert.equal(p.mergeable, 'CONFLICTING');
+  assert.equal(p.waitingOn, 'failing-check');
+  assert.equal(p.reason, 'conflicts with main');
+  assert.notEqual(p.suggest, 'merge');
+  assert.equal(p.suggest, 'resume');
+});
+
+test('--no-git: GitHub MERGEABLE on an awaiting-owner-merge record is owner-merge / merge', () => {
+  const p = mergeableRun('MERGEABLE', ['--no-git']);
+  assert.equal(p.waitingOn, 'owner-merge');
+  assert.equal(p.suggest, 'merge');
+  assert.equal(p.nextAction, `say "merge" (head ${p.head})`);
+});
+
+test('--no-git: GitHub UNKNOWN stays owner-merge but suggests leave, with the unknown-mergeability wording', () => {
+  for (const mergeable of ['UNKNOWN', null, 'SOMETHING_NEW']) {
+    const p = mergeableRun(mergeable, ['--no-git']);
+    assert.equal(p.waitingOn, 'owner-merge', String(mergeable));
+    assert.equal(p.suggest, 'leave', String(mergeable));
+    assert.match(p.reason, /; mergeability unknown \(no git check and GitHub had not computed it\)$/);
+    assert.equal(p.nextAction, `check it merges cleanly, then say "merge" (head ${p.head})`);
+  }
+});
+
+test('with git: its answer wins over GitHub in both directions', () => {
+  // git says clean, GitHub has not computed it (or even says CONFLICTING): merge
+  for (const mergeable of ['UNKNOWN', 'CONFLICTING']) {
+    const p = mergeableRun(mergeable, []);
+    assert.equal(p.conflicts, false);
+    assert.equal(p.waitingOn, 'owner-merge', mergeable);
+    assert.equal(p.suggest, 'merge', mergeable);
+  }
+  // git says conflicts, GitHub says MERGEABLE: failing-check
+  const p = mergeableRun('MERGEABLE', [], { prFiles: { 'a.txt': 'branch edit\n' }, mainFiles: { 'a.txt': 'main edit\n' } });
+  assert.equal(p.conflicts, true);
+  assert.equal(p.waitingOn, 'failing-check');
+  assert.notEqual(p.suggest, 'merge');
+});

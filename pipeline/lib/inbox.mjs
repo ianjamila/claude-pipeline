@@ -160,6 +160,7 @@ export function classifyPr(facts, options) {
   let waitingOn;
   let reason;
   let nextAction;
+  let suggestOverride = null;
 
   const untracked = f.recordStatus === 'absent' && !record && !f.triage;
   const live = liveRun(record, nowMs, heartbeatFreshMinutes);
@@ -187,13 +188,19 @@ export function classifyPr(facts, options) {
       reason = f.needsHumanReason || 'needs-human label set (no reason recorded)';
       nextAction = `leave: owner decision needed (${reason})`;
     }
-  } else if (untracked && stale) {
-    // Nothing drives it: no record, no review state, quiet for staleDays. Whatever else is wrong with it is context for
-    // the close decision, not a reason to resume it.
+  } else if (untracked && stale && (f.isDraft || failing.length > 0)) {
+    // Nothing drives it: no record, no review state, quiet for staleDays, AND something says it is going nowhere (a draft,
+    // a red check, conflicts, blocked). Whatever else is wrong with it is context for the close decision, not a reason to
+    // resume it. Age alone is never enough: see the owner-decision branch below.
     waitingOn = 'abandoned';
     const also = [...failing.map((x) => x.text), ...(f.isDraft ? ['still a draft'] : [])];
     reason = `no pipeline history, last activity ${activity.at ? day(activity.at) : 'unknown'}${also.length ? `; also ${also.join('; ')}` : ''}`;
     nextAction = 'close';
+  } else if (untracked && stale) {
+    // Quiet and unmanaged, but ready with nothing failing: nothing says it is dead, so the pipeline does not suggest closing it.
+    waitingOn = 'owner-decision';
+    reason = `no pipeline history and quiet since ${activity.at ? day(activity.at) : 'unknown'}, but ready with nothing failing: the owner decides`;
+    nextAction = `owner decides: ${resume} adopts it, or close it`;
   } else if (failing.length > 0) {
     waitingOn = 'failing-check';
     reason = failing.map((x) => x.text).join('; ');
@@ -217,6 +224,12 @@ export function classifyPr(facts, options) {
     waitingOn = 'owner-merge';
     reason = 'gated and clean for this head; only the owner\'s "merge" is missing';
     nextAction = `say "merge" (head ${sha7(f.headRefOid)})`;
+    if (f.conflicts == null) {
+      // Mergeability unknown (no git check, GitHub not computed): the owner-merge state holds, but "merge" is not suggested.
+      reason += '; mergeability unknown (no git check and GitHub had not computed it)';
+      nextAction = `check it merges cleanly, then say "merge" (head ${sha7(f.headRefOid)})`;
+      suggestOverride = 'leave';
+    }
   } else {
     waitingOn = 'pipeline';
     if (record?.outcome === 'awaiting-owner-merge') {
@@ -248,7 +261,7 @@ export function classifyPr(facts, options) {
     reason = `${reason}; ${LABEL_FRAGMENT}`;
   }
 
-  let suggest = SUGGEST[waitingOn];
+  let suggest = suggestOverride ?? SUGGEST[waitingOn];
 
   if (f.isCrossRepository) {
     nextAction = 'fork PR: not resumable by the pipeline';
