@@ -1705,7 +1705,7 @@ function judgeBinScript(name, dirs, ctx, opts, scanRaw = '', quiet = false) {
       continue;
     }
     if (binIsProgram(text)) continue;
-    const r = judgeScriptText(text, { kind: 'shell', file: bin }, bin, posix.dirname(bin), ctx, opts);
+    const r = judgeScriptText(text, { kind: 'shell', file: bin }, bin, d, ctx, opts); // (a bin runs where the manager runs, in the caller's directory, not in node_modules/.bin)
     if (r) return r;
   }
   return null;
