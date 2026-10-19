@@ -161,6 +161,55 @@ repeats its amendments.
   consumers (one gone/merged, one OPEN) ⇒ `kept`. Tasks 11 and 12b: a damaged ledger ⇒ zero stops on both stop
   paths (session-end records `ledger damaged`, sweep lists every stack with that reason).
 
+## Revision 3 — Codex plan recheck (2026-10-19, binding; the review cap is reached, no further plan round)
+
+Recheck verdict: F1–F3, F5–F9, F11, P3 resolved; F4, F10, F12 partly; five new items, all accepted and folded here.
+**Revision 3 overrides Revision 2 where they differ** (R2-4's lsof rule, R2-5's lock names, R2-10's seam rule,
+R2-12's phase wait). The code-level Codex review and Fable's final pass on the PR re-check these.
+
+- **R3-1 (Task 6, replaces R2-4's lsof rule) — complete process evidence with separate contracts.**
+  - **C2 connections — counted from the server side.** On macOS every published stack port is forwarded by the
+    Docker/OrbStack helper, which runs as this user, so `lsof -nP -w -iTCP -sTCP:LISTEN,ESTABLISHED -F pcnT` sees the
+    helper's side of EVERY connection to a stack port, whatever user the client runs as. Contract: (a) positive
+    control — for each published port of the stack, a LISTEN socket on that port is present; missing ⇒
+    `unknown('port <p> listener not visible')`; (b) every ESTABLISHED socket whose LOCAL port is a stack port is one
+    connection; its client (the socket whose remote port is that local port) names `{pid, birth, command}` when
+    visible, else `{pid:null, birth:null, command:'hidden client'}` — a hidden client is still a connection (the
+    stack is in use; never `unknown`, never ignored); (c) lsof signal/timeout/exit other than 0/1 ⇒ unknown. A
+    healthy machine with the listeners present and zero established sockets ⇒ `ok([])` (test it).
+  - **C3 process references.** `ps -axww -o pid=,uid=,command=` covers every user's command line; `ps -axE -ww`
+    adds the environment, which macOS shows for this user's processes only. Positive control: run ps with a nonce
+    variable `PIPELINE_STACKS_PROBE=<random>` in its env; ps's own line must show it, else unknown.
+  - **cwd / open files (stack folder, consumer worktrees).** Take the `ps -axo pid=,uid=` snapshot FIRST, then the
+    whole-machine `lsof -n -P -w -F pfn`; exclude the probe's own children (`toResult` in `proc.mjs` gains
+    `pid: r.pid ?? null`, so the ps/lsof pids are known). For every pid of THIS uid in the snapshot: present in lsof
+    with a readable cwd ⇒ checked; absent ⇒ `procIdentity` — gone ⇒ fine, alive ⇒ `unknown`; present without a
+    readable cwd ⇒ `unknown` (test: same-user pid listed, cwd unreadable ⇒ unknown).
+  - **Other users' processes (stated, not silent).** Their real use of a stack is caught by C2 (server side) and by
+    C3's command line; their environment and cwd/open files cannot be read without root. `decide.mjs`'s header and a
+    one-line note in the spec's C3/C4 section state this; the report shows `hidden: N` other-user processes; the PR
+    body lists it for the owner. Test: a foreign-uid client holding a connection with no visible client socket ⇒
+    `kept` (hidden client).
+- **R3-2 (Tasks 2, 5, 6, 8, 10, 11; replaces R2-10's seam rule) — test overrides never reach installed hooks.**
+  `PIPELINE_DOCKER`, `PIPELINE_PS`, `PIPELINE_LSOF`, `PIPELINE_SUPABASE` and `PIPELINE_STACKS_DEADLINE_MS` are read
+  only through `seamValue` from `pipeline/lib/proc.mjs` (add them to `SEAM_VARS`), so an installed copy (has
+  `INSTALLED.json`) ignores them whatever else is set. In the repo checkout they are additionally honoured only when
+  `PIPELINE_STACKS_HOME` is set, its realpath differs from the default root's, and `PIPELINE_STACKS_ONLY` is set.
+  Tests: installed copy (fixture root with `INSTALLED.json`) with every override set and (a) the default root
+  supplied explicitly, (b) a custom root ⇒ overrides ignored; checkout with the default root supplied explicitly ⇒
+  ignored; checkout with a custom root + ONLY ⇒ honoured.
+- **R3-3 (all lock users; replaces R2-5's names) — disjoint lock namespaces.** Separate directories under
+  `files.locks`: `project/<id>` (id lowercased, every char outside `[a-z0-9_-]` replaced by `_`), `ledger/ledger`,
+  `sweep/sweep`, `dev/<port>`. Order unchanged: project locks (sorted) → ledger. Tests: project ids `ledger`,
+  `sweep`, `dev-3000` register and stop without waiting on themselves or on the global locks.
+- **R3-4 (Tasks 11, 15; replaces R2-12's phase wait) — a decision that cannot be missed.** The worker file keeps
+  `phase` AND a durable `decidedAt` (set once, never cleared) plus `decisions: <count>`. Step 3 of Task 15 waits for
+  `decidedAt` (≤ 3 min) and then checks the matching record in `actions.jsonl`. Test: the worker passes `decided`
+  and `observing` before the poller's first read ⇒ the poller still sees the decision.
+- **R3-5 (Task 6, PR selection).** `fetchBranchPrs` returns `createdAt` (not `updatedAt`) in CREATED_AT ascending
+  order; the fallback when no PR head matches is the LAST node (newest created), `headMatches:false`. Test with a
+  helper-shaped response (fields exactly as `BRANCH_PRS_QUERY` requests).
+
 ---
 
 ## File map
