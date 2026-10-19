@@ -1455,9 +1455,12 @@ function maskedLine(ctx) {
   return ctx.lineMasked;
 }
 // ... a guarded command, or (strictly) a guarded word: the masked line as written and with its quotes and escapes stripped
+// (t11: a JavaScript method call -- `mounts.rw.push(x)`, `_.merge(a, b)` in a `node -e` program -- is no git subcommand: a git subcommand is never a word that follows a dot and precedes a parenthesis)
+const JS_METHOD_CALL = /\.\s*(?:push|merge)\s*\(/gi;
+const mentionsGuardedWord = (text) => GUARDED_WORDS.test(text.replace(JS_METHOD_CALL, '('));
 function lineMentionsGuarded(ctx) {
   const m = maskedLine(ctx);
-  return lineHoldsGuardedCommand(ctx) || GUARDED_WORDS.test(m) || GUARDED_WORDS.test(m.replace(/['"`\\]/g, ''));
+  return lineHoldsGuardedCommand(ctx) || mentionsGuardedWord(m) || mentionsGuardedWord(m.replace(/['"`\\]/g, ''));
 }
 
 function lineHoldsGuardedCommand(ctx) {

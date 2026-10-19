@@ -182,7 +182,7 @@ test('t9 workspaces: the root package.json and the workspace packages are read',
 });
 test('t9 a manager setting that moves the package.json makes the script unknown', () => {
   const t = root({ lint: 'ok' });
-  for (const pre of ['npm_config_prefix=/elsewhere', 'NPM_CONFIG_PREFIX=/elsewhere', 'INIT_CWD=/elsewhere', 'npm_package_json=/elsewhere/package.json', 'npm_config_workspace=a', 'PNPM_HOME=/e', 'npm_config_dir=/e', 'YARN_CWD=/e', 'YARN_RC_FILENAME=x', 'bun_install_cache=/e', 'npm_config_loglevel=error', 'NPM_CONFIG_LOGLEVEL=error', 'COREPACK_HOME=/e', 'NODE_OPTIONS=--require=/e/x.js', 'npm_foo=1']) {
+  for (const pre of ['npm_config_prefix=/elsewhere', 'NPM_CONFIG_PREFIX=/elsewhere', 'INIT_CWD=/elsewhere', 'npm_package_json=/elsewhere/package.json', 'npm_config_workspace=a', 'PNPM_HOME=/e', 'npm_config_dir=/e', 'YARN_CWD=/e', 'YARN_RC_FILENAME=x', 'bun_install_cache=/e', 'npm_config_loglevel=error', 'NPM_CONFIG_LOGLEVEL=error', 'COREPACK_HOME=/e', 'npm_foo=1']) {
     for (const cmd of [`${pre} npm run lint`, `export ${pre}; npm run lint`, `env ${pre} npm run lint`, `${pre}; npm run lint`]) {
       const g = git(cmd, treeFor(t, BAD_GIT));
       assert.equal(g.decision, 'deny', `git: ${cmd}`);

@@ -270,7 +270,8 @@ export function pmCall(allWords) {
 
 // Names the line gives to the environment that could point the manager somewhere else (allowlist of FAMILIES, not of dangerous names): anything the package managers read as
 // configuration or that names the project a script call starts from.
-const MOVER_NAME = /^(?:npm_|yarn_|pnpm_|bun_|berry_|corepack_|node_options$|init_cwd$)/i;
+// (not NODE_OPTIONS, t11: it cannot move package.json or a configuration file, and the program it preloads is one the guards never judge anyway)
+const MOVER_NAME = /^(?:npm_|yarn_|pnpm_|bun_|berry_|corepack_|init_cwd$)/i;
 export const pmMoverName = (names) => { for (const n of names) if (MOVER_NAME.test(n)) return n; return null; };
 
 // A name exported that is only known at run time (`export $N=x`) can be any of the variables above.

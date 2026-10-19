@@ -118,3 +118,36 @@ test('t11 a directory or a git setting the guard cannot place keeps the line ref
   refused('git checkout x && npm run lint', { 'package.json': pkg(OK_SCRIPTS) }, EARLIER);
   refused('git -C nowhere pull && npm run lint', repoTree, EARLIER);
 });
+
+// ---- 3. NODE_OPTIONS ---------------------------------------------------------------------------------------------------------------------------------------------
+// It cannot move package.json or a configuration file, and the program it preloads is one the guards never judge: `NODE_OPTIONS=--max-old-space-size=6144 npx tsc` is a type check. The
+// variables that DO move the manager's project or configuration (npm_*, INIT_CWD ...) stay refused.
+test('t11 NODE_OPTIONS no longer makes a package script unknown; the families that move the project still do', () => {
+  const tree = { 'package.json': pkg(OK_SCRIPTS) };
+  for (const cmd of ['NODE_OPTIONS=--max-old-space-size=6144 npm run lint', 'export NODE_OPTIONS=--max-old-space-size=6144; npm test', '(NODE_OPTIONS=--max-old-space-size=6144 npm run lint > out.log 2>&1; echo done)', 'NODE_OPTIONS=--max-old-space-size=4096 npx tsc --noEmit']) allowed(cmd, tree);
+  for (const cmd of ['npm_config_prefix=/elsewhere npm run lint', 'INIT_CWD=/elsewhere npm run lint', 'export npm_package_json=/e/package.json; npm test', 'NODE_OPTIONS=x npm_config_prefix=/e npm run lint']) refused(cmd, tree, /may point the package manager at another package\.json/);
+});
+
+// ---- 2. the guarded-word scan reads a JavaScript method call as a git subcommand --------------------------------------------------------------------------------
+// `node -e '... mounts.rw.push(x) ... fs.writeFileSync(f, s)' file && npx vitest run file`: the program may write any file, so the runner's bin (not installed in this tree) "may have been written", and
+// the line was refused because the program text holds the word of a guarded subcommand. A word between a dot and a parenthesis is a method call; every other mention still counts.
+const WRITER = (extra) => `node -e 'const fs=require("fs");const f=process.argv[1];let s=fs.readFileSync(f,"utf8");${extra}fs.writeFileSync(f,s)' a.txt`;
+test('t11 a JavaScript method call is not a mention of a guarded subcommand', () => {
+  const tree = { '.git': 'x', 'package.json': pkg(OK_SCRIPTS), 'a.txt': 'a' };
+  for (const extra of ['mounts.rw.' + PUSH + '(1);', `lodash.${MERGE}(a, b);`, `rows.${PUSH} (r);`, `a.b.${PUSH}(1);b.${PUSH}(2);`]) {
+    const cmd = `${WRITER(extra)} && npx vitest run a.txt`;
+    assert.equal(git(cmd, tree).decision, 'allow', `git: ${extra}`);
+    assert.equal(filesGuard(cmd, tree).decision, 'allow', `files: ${extra}`);
+  }
+  // ... a mention that is not a method call is still one: the written bin may hold anything
+  for (const extra of [`x = "git ${PUSH} origin ${MAIN}";`, `mounts.rw.${PUSH}(1);y = "${PUSH}";`, `cp.exec("git ${PUSH} origin");`, `${PUSH}(1);`, `z = a.${PUSH};`, `a.b.${MERGE} = 1;`, `// ${MERGE} the rows\n`]) {
+    const cmd = `${WRITER(extra)} && npx vitest run a.txt`;
+    const g = git(cmd, tree);
+    assert.equal(g.decision, 'deny', `git: ${extra}`);
+    assert.match(g.reason, /may have been written by an earlier command|guarded command|guarded operation/);
+  }
+  for (const tail of [`echo ${PUSH}`, `echo "pu"sh`, `echo ${MERGE}`, `G=git; $G ${PUSH} origin ${MAIN}`, `git -C x ${PUSH}`, `git "${PUSH}" origin`, `git config alias.p ${PUSH}`, `x.${PUSH}(1); echo ${PUSH}`]) {
+    const cmd = `${WRITER('')} && npx vitest run a.txt; ${tail}`;
+    assert.equal(git(cmd, tree).decision, 'deny', `git: ${tail}`);
+  }
+});
