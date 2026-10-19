@@ -129,3 +129,33 @@ test('R1-B2: the same overflow inside a script the files guard opens', () => {
   assert.equal(filesGuard('bash s.sh', { 's.sh': body }).decision, 'deny');
   assert.equal(filesGuard('bash s.sh', { 's.sh': 'A=(a b); B=(c d); echo x > ~/${A[0]}${B[0]}/notes.txt\n' }).decision, 'allow');
 });
+
+// ---- R1-B1 follow-up: IFS set inside an opened script -------------------------------------------------------------------------------
+// `ifsMayBeSet` read only the OUTER line, so `bash wrapper.sh` hid a script that sets IFS by a nameref / alias / sourced file: `B=agent/xmain; git push origin $B` split at `x` into
+// `agent/` and `main` at run time. (A plain `IFS=x`, `read IFS`, `printf -v IFS`, `eval "I""FS=x"` were already refused: the script's own variables know them.)
+
+const PUSH_B = `B=agent/xmain; git ${PUSH} origin $B\n`;
+const IFS_SETTERS = [
+  'declare -n r=IFS; r=x',
+  'typeset -n r=IFS\nr=x',
+  'N=IFS; declare -n r=$N; r=x',
+  'alias s="IFS=x"; shopt -s expand_aliases; s',
+  'setopt aliases; alias s=IFS=x; s',
+  'source setter.sh',
+];
+
+test('R1-B1 IFS: a script that sets IFS by a nameref, an alias or a sourced file is judged with IFS possibly set', () => {
+  for (const set of IFS_SETTERS) {
+    const files = { ...gitFiles(BAD_GIT), 'setter.sh': 'IFS=x\n', 'wrapper.sh': `${set}\n${PUSH_B}` };
+    denyGit('bash wrapper.sh', files);
+    denyGit('bash outer.sh', { ...files, 'outer.sh': 'bash wrapper.sh\n' });
+    // the loop word is split too
+    denyGit('bash wrapper.sh', { ...files, 'wrapper.sh': `${set}\nD=agent; for f in $D/xmain; do git ${PUSH} origin $f; done\n` });
+  }
+});
+
+test('R1-B1 IFS siblings: a script that never touches IFS keeps a variable push argument; a comment that says "read" is no reason', () => {
+  allowGit('bash wrapper.sh', { ...gitFiles(BAD_GIT), 'wrapper.sh': `echo hi\n${PUSH_B}` });
+  allowGit('bash wrapper.sh', { ...gitFiles(BAD_GIT), 'wrapper.sh': `# read the plan first\n${PUSH_B}` });
+  allowGit('bash wrapper.sh', { ...gitFiles(BAD_GIT), 'wrapper.sh': `# eval and source are fine words in a comment\n  # export $X\n${PUSH_B}` });
+});

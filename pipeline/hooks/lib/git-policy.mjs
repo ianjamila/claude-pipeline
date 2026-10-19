@@ -395,7 +395,11 @@ const CURRENT_BRANCH_WORD = new RegExp(`(^|:)${CURRENT_BRANCH_IDIOM.source.slice
 // so the commands that assign a variable by a computed or split-up name count as well.
 const SETS_BY_NAME = /\b(?:eval|read|mapfile|readarray|getopts|source)\b|\bprintf\s+-[A-Za-z]*v|(?:^|[\s;&|(])\.\s|\b(?:export|unset|declare|typeset|local|readonly)\b[^;&|\n]*[$`'"]/;
 // Both the text as written and with its quotes and backslashes removed (`printf -vI""FS ,` spells the name only once they are gone).
-const ifsMayBeSet = (ctx) => [ctx.fullText ?? '', String(ctx.fullText ?? '').replace(/['"\\]/g, '')].some((t) => /IFS/.test(t) || SETS_BY_NAME.test(t)) || assignedNames(ctx).includes('IFS') || Object.hasOwn(ctx.env ?? {}, 'IFS') || ctx.tainted.size > 0;
+// Why (#81 Codex R1-B1 follow-up): a script the guard opens is judged with its own text too -- `bash wrapper.sh` hid `declare -n r=IFS; r=x` from the outer line. Whole-line comments are left out of
+// the binder test only (a comment that says "read" is no binder); the name IFS anywhere, a comment included, still counts.
+const withoutCommentLines = (s) => s.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n');
+const ifsInScope = (ctx) => (ctx.scopeTexts ?? []).some((s) => [String(s), String(s).replace(/['"\\]/g, '')].some((v) => /IFS/.test(v) || SETS_BY_NAME.test(withoutCommentLines(v))));
+const ifsMayBeSet = (ctx) => ifsInScope(ctx) || [ctx.fullText ?? '', String(ctx.fullText ?? '').replace(/['"\\]/g, '')].some((t) => /IFS/.test(t) || SETS_BY_NAME.test(t)) || assignedNames(ctx).includes('IFS') || Object.hasOwn(ctx.env ?? {}, 'IFS') || ctx.tainted.size > 0;
 
 function unverifiableWord(raw, ctx) {
   if (raw.includes(LITERAL_MARK)) return null; // (a word judged as the plain text it spells)
