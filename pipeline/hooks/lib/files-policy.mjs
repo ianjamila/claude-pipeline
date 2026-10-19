@@ -16,7 +16,7 @@
 // ancestor process); commands that unset or override CLAUDECODE are denied here.
 import fs from 'node:fs';
 import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
-import { pmCall, pmMoverName, packageScripts, localBin, NAME_AT_RUN_TIME, markPackageState, pkgDirtyFor, pmStartDirs, BACKGROUND } from './package-scripts.mjs';
+import { pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgDirtyFor, pmStartDirs, BACKGROUND } from './package-scripts.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
@@ -1596,7 +1596,7 @@ function judgePackageScripts(c, dirs, ctx, opts, scanRaw = '') {
   if (!c.argv.length) return null;
   const call = pmCall(c.argv.map((w) => expandRefs(w, ctx)));
   if (!call) return null;
-  const mover = call.mover ? '--userconfig / --globalconfig' : pmMoverName([...Object.keys(ctx.vars), ...ctx.unknownVars, ...ctx.pickUnknown, ...Object.keys(c.env ?? {})]) ?? (NAME_AT_RUN_TIME.test(scanRaw) ? 'a variable named at run time' : null);
+  const mover = call.mover ? '--userconfig / --globalconfig' : pmMoverName([...Object.keys(ctx.vars), ...ctx.unknownVars, ...ctx.pickUnknown, ...Object.keys(c.env ?? {})]) ?? ((ctx.nameRun ??= new Map()).get(scanRaw) ?? ctx.nameRun.set(scanRaw, nameAtRunTimeIn(scanRaw)).get(scanRaw) ? 'a variable named at run time' : null);
   if (call.unresolved) return deny('package script: ' + call.unresolved);
   if (mover) return deny(`package script: ${mover} may point the package manager at another package.json or configuration, so which script \`${c.argv.slice(0, 4).join(' ')}\` runs cannot be verified. Run it without it (set the directory with --prefix)`);
   if (pkgDirtyFor(ctx.budget, pmStartDirs(call, dirs, ctx.homePosix, posix), { pathExists: (x) => ctx.api.existsSync(x), real: (q) => realResolve(q, ctx.api), p: posix, deep: !!call.workspace })) return deny(`package script: an earlier command on the line (git checkout / pull / merge, npm pkg set, npm config set, tar x, patch ... or a background job) may change package.json, a configuration file or the work tree before \`${c.argv.slice(0, 4).join(' ')}\` reads them, so which script it runs cannot be verified. Run it in a command of its own`);

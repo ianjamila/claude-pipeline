@@ -288,11 +288,10 @@ test('t9 a script that does not exist runs no hook, and --userconfig / --globalc
     assert.equal(filesGuard(cmd, treeFor(root({ lint: 'ok' }), BAD_FILES)).decision, 'deny', cmd);
   }
 });
-test('t9 a directory the guard lost track of: refused when the session project has scripts to run, or the line mentions a guarded operation', () => {
+test('t9 a directory the guard lost track of: refused when the line mentions a guarded operation', () => {
   assert.equal(git('source ./env.sh && npm test', {}).decision, 'allow', 'no project known: nothing to refuse');
-  const r = git('source ./env.sh && npm test', treeFor(root({ test: 'ok' }), BAD_GIT));
-  assert.equal(r.decision, 'deny');
-  assert.match(r.reason, /directory this runs in is unknown/);
+  // (t11 changes this expectation: the session project's scripts no longer refuse an unknown directory by themselves -- only a line that mentions a guarded operation does, as for `bash $F`)
+  assert.equal(git('source ./env.sh && npm test', treeFor(root({ test: 'ok' }), BAD_GIT)).decision, 'allow');
   const g = git(`source ./env.sh && npm test; echo ${PUSH}`, {});
   assert.equal(g.decision, 'deny');
   assert.match(g.reason, /directory this runs in is unknown/);

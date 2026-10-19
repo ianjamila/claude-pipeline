@@ -4,7 +4,7 @@
 // command) is shared: git-policy.mjs judges the merge command with it as before, and both guards open the scripts with pmCall / packageScripts.
 import nodePath from 'node:path';
 import { lstatSync } from 'node:fs';
-import { commandName } from './shell-parse.mjs';
+import { commandName, simpleCommands } from './shell-parse.mjs';
 
 const baseName = (w) => commandName(w);
 
@@ -276,6 +276,21 @@ export const pmMoverName = (names) => { for (const n of names) if (MOVER_NAME.te
 
 // A name exported that is only known at run time (`export $N=x`) can be any of the variables above.
 export const NAME_AT_RUN_TIME = /(?:^|[;&|(\s])(?:export|declare|typeset|local|readonly)\s(?:[^;&|\n]*\s)?[^\s=;&|]*[$`][^\s=;&|]*(?=[\s=;&|]|$)/;
+
+// #81 t11: is a variable NAME given at run time to a binder (`export $N=x`) by a command of the line? Only parsed commands count: the text of a `node -e '...'` program or a quoted heredoc body
+// (`export async function f(` in a JavaScript string, a template literal's backtick) is data. The text a shell is asked to run (eval, bash -c ...) is read as written.
+const NAME_BINDERS = new Set(['export', 'declare', 'typeset', 'local', 'readonly']);
+const SHELLS_AND_EVAL = new Set(['eval', 'bash', 'sh', 'zsh', 'dash', 'ksh', 'source', '.']);
+export function nameAtRunTimeIn(text) {
+  const cmds = simpleCommands(String(text ?? ''));
+  if (!cmds || cmds.truncated) return NAME_AT_RUN_TIME.test(String(text ?? '')); // (the parser gave up: read the raw text)
+  for (const c of cmds) {
+    if (!c.argv?.length) continue;
+    if (NAME_BINDERS.has(baseName(c.argv[0])) && NAME_AT_RUN_TIME.test(c.argv.join(' '))) return true;
+    if (SHELLS_AND_EVAL.has(baseName(c.argv[0])) && c.argv.slice(1).some((w) => NAME_AT_RUN_TIME.test(w))) return true;
+  }
+  return false;
+}
 
 // What an earlier command of the line may change before the package manager reads package.json, the configuration files or the work tree (git checkout / pull / merge ..., npm pkg set,
 // npm config set, npm init, tar x, patch ...). A writer of a NAMED file (redirect, cp, mv, sed -i, tee ...) is not here: writtenTo models those and the callers ask it for each file read.

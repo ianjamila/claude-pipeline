@@ -17,7 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
 export { withoutLiteralText, INDIRECT_EXPANSION };
-import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, NAME_AT_RUN_TIME, markPackageState, pkgDirtyFor, pmStartDirs, BACKGROUND } from './package-scripts.mjs';
+import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgDirtyFor, pmStartDirs, BACKGROUND } from './package-scripts.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit } from './script-candidates.mjs';
@@ -1237,7 +1237,7 @@ function packageScriptVerdict(argv, dir, ctx, level) {
   const said = argv.slice(0, 4).join(' ');
   if (call.unresolved) return deny('package script: ' + call.unresolved);
   // (a variable family the managers read, or a name exported that is only known at run time: `export $N=x`)
-  const mover = call.mover ? '--userconfig / --globalconfig' : pmMoverName([...Object.keys(ctx.vars), ...ctx.unsureVars, ...ctx.tainted]) ?? (NAME_AT_RUN_TIME.test(ctx.fullText) ? 'a variable named at run time' : null);
+  const mover = call.mover ? '--userconfig / --globalconfig' : pmMoverName([...Object.keys(ctx.vars), ...ctx.unsureVars, ...ctx.tainted]) ?? ((ctx.nameRun ??= nameAtRunTimeIn(ctx.fullText)) ? 'a variable named at run time' : null);
   if (mover) return deny(`package script: ${mover} may point the package manager at another package.json or configuration, so which script \`${said}\` runs cannot be verified. Run it without it (set the directory with --prefix).`);
   // (an earlier command on the line, or in a script it ran, may have changed package.json, a configuration file or the work tree: markPackageState)
   if (pkgDirtyFor(ctx.budget, pmStartDirs(call, dir === null ? null : [dir], ctx.home, path), { pathExists: ctx.pathExists, real: (q) => realLocation(ctx.realpath, q), p: path, deep: !!call.workspace })) return deny(`package script: an earlier command on the line (git checkout / pull / merge, npm pkg set, npm config set, tar x, patch ... or a background job) may change package.json, a configuration file or the work tree before \`${said}\` reads them, so which script it runs cannot be verified. Run it in a command of its own.`);
@@ -1247,11 +1247,8 @@ function packageScriptVerdict(argv, dir, ctx, level) {
       : null;
   }
   if (dir === null) {
-    // a directory the guard lost track of (after a sourced file or a cd it cannot follow): the session's own project is the likely one, so scripts it would run are refused; otherwise
-    // judged like a script named at run time
-    const guess = packageScripts(call, pkgEnv(ctx, ctx.cwd));
-    if (guess.refuse || guess.runs?.length) return deny('package script: the directory this runs in is unknown (after a cd or a sourced file the guard cannot follow), and the project of the session\'s directory has scripts \`' + said + '\` could run, so which package.json it reads cannot be verified. Chain the cd with &&, or use an absolute --prefix.');
-    return lineMentionsGuarded(ctx) ? deny('package script: the directory this runs in is unknown (after a cd or a sourced file the guard cannot follow) and the line mentions a guarded operation, so which package.json \`' + said + '\` reads cannot be verified. Chain the cd with &&, or use an absolute --prefix.') : null;
+    // a directory the guard lost track of (after a sourced file or a cd it cannot follow): judged like a script named at run time (`bash $F`) -- refused when the line mentions a guarded operation (t11)
+    return lineMentionsGuarded(ctx) ? deny('package script: the directory this runs in is unknown (after a cd or a sourced file the guard cannot follow) and the line mentions a guarded operation, so which package.json `' + said + '` reads cannot be verified. Chain the cd with &&, or use an absolute --prefix.') : null;
   }
   const plan = packageScripts(call, pkgEnv(ctx, dir));
   if (plan.refuse) return deny(plan.refuse);
@@ -1450,8 +1447,10 @@ function isolatedState(ctx, fn) {
 // heredoc body that feeds a non-shell is not a command at all)? The detector is the one used for interpreter files, plus the protection / ruleset /
 // issue-close shapes of gh and git.
 // The line as the guard reads it: every command's words without the values of prose flags (commit -m, --body ...). A heredoc body is not part of it.
+// (t11: the words of a command that only reads or lists -- a grep pattern, `cat scripts/merge-pr.mjs`, `ls push-*` -- name data, and there is no way to turn them into something that runs: the line does not "mention" a guarded operation by them)
+const DATA_READERS = new Set(['grep', 'egrep', 'fgrep', 'rg', 'ls', 'wc', 'stat', 'file', 'du', 'cat', 'head', 'tail', 'diff', 'cmp']);
 function maskedLine(ctx) {
-  ctx.lineMasked ??= simpleCommands(ctx.lineText).filter((c) => c.argv.length).map((c) => [c.argv[0], ...dataLessArgs(c.argv.slice(1))].join(' ')).join('\n');
+  ctx.lineMasked ??= simpleCommands(ctx.lineText).filter((c) => c.argv.length).map((c) => [c.argv[0], ...(DATA_READERS.has(baseName(c.argv[0])) ? [] : dataLessArgs(c.argv.slice(1)))].join(' ')).join('\n');
   return ctx.lineMasked;
 }
 // ... a guarded command, or (strictly) a guarded word: the masked line as written and with its quotes and escapes stripped

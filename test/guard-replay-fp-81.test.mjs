@@ -151,3 +151,43 @@ test('t11 a JavaScript method call is not a mention of a guarded subcommand', ()
     assert.equal(git(cmd, tree).decision, 'deny', `git: ${tail}`);
   }
 });
+
+// ---- 4. a mention in a command that only reads ------------------------------------------------------------------------------------------------------------------
+// `echo ... ; npx tsc ...; npm run lint`: a program the guard cannot see (tsc, vitest, node x.mjs) may write the configuration file the manager reads, and the line was refused because it
+// "mentioned a guarded operation" in a grep pattern or a file name (`scripts/merge-pr.mjs`). The words of a command that only reads or lists are data. Others still count.
+test('t11 a guarded word in the arguments of a command that only reads is no mention; in an echo, a git command or a program text it still is', () => {
+  const tree = { '.git': 'x', 'package.json': pkg(OK_SCRIPTS), 'a.txt': 'a' };
+  for (const pre of [`grep -rn "${MERGE.toUpperCase()}_X" app | head -2`, `cat scripts/${MERGE}-pr.mjs | head -3`, `grep -c ${PUSH} log.txt`, `ls ${PUSH}-*`, `tail -8 ${MERGE}.log`, `diff a.txt ${MERGE}.txt`]) {
+    allowed(`${pre}; npx tsc --noEmit > log.txt 2>&1; npm run lint`, tree);
+  }
+  for (const pre of [`echo ${PUSH}`, `printf ${MERGE}`, `git log --oneline origin/${MAIN}..HEAD; echo ${PUSH}`, `node -e 'console.log("${PUSH}")'`, `sed -n 1p ${PUSH}.txt`, `awk 1 ${MERGE}.txt`]) {
+    const g = git(`${pre}; npx tsc --noEmit > log.txt 2>&1; npm run lint`, tree);
+    assert.equal(g.decision, 'deny', `git: ${pre}`);
+  }
+});
+
+// ---- 5. JavaScript text is no `export $NAME` -------------------------------------------------------------------------------------------------------------------
+// `node -e '... "export async function f(" ... `template ${x}` ...'`: the program text holds the word `export` and a `$` or a backtick. Only a parsed shell command binds a name.
+test('t11 an export in the text of a program or a heredoc body is no name given at run time; a real one still is', () => {
+  const tree = { '.git': 'x', 'package.json': pkg(OK_SCRIPTS), 'a.txt': 'a' };
+  const js = "node -e 'let p=\"a.txt\",s=require(\"fs\").readFileSync(p,\"utf8\");s=s.replace(\"export async function f(\", `/** ${s} */ export async function g(`);'";
+  allowed(`${js} && npm run lint`, tree);
+  allowed(`cat > x.mjs <<'EOF'\nexport const a = \`\${b}\`;\nlocal $x\nEOF\nnpm run lint`, tree);
+  for (const cmd of ['export $N=x && npm run lint', 'N=npm_config_prefix; export $N=/e; npm run lint', 'declare -x $N=1; npm run lint', 'readonly A$B=1; npm run lint', "eval 'export $N=x'; npm run lint", 'bash -c "export $N=x"; npm run lint', '(export $N=x; npm run lint)']) {
+    const g = git(cmd, tree);
+    assert.equal(g.decision, 'deny', `git: ${cmd}`);
+    assert.equal(filesGuard(cmd, tree).decision, 'deny', `files: ${cmd}`);
+  }
+});
+
+// ---- 6. a directory the guard lost track of ----------------------------------------------------------------------------------------------------------------------
+// After `source env.sh` (or a cd it cannot follow) `npm run lint` was refused because the session's project has scripts. It is judged like a script named at run time (`bash $F`): refused
+// when the line mentions a guarded operation.
+test('t11 an unknown directory refuses a package script only when the line mentions a guarded operation', () => {
+  const tree = { '.git': 'x', 'package.json': pkg(OK_SCRIPTS) };
+  for (const cmd of ['source ./env.sh && npm run lint', 'cd "$UNSET_DIR" && npm test', '. ./env.sh; npm test -- --watch=false']) assert.equal(git(cmd, tree).decision, 'allow', cmd);
+  for (const cmd of [`source ./env.sh && npm test; echo ${PUSH}`, `. ./env.sh; npm run lint && git ${PUSH} origin ${MAIN}`, `source ./env.sh && npm run lint; G=git; $G ${PUSH} x`]) {
+    const g = git(cmd, tree);
+    assert.equal(g.decision, 'deny', cmd);
+  }
+});
