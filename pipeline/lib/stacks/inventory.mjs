@@ -61,9 +61,17 @@ function dockerCall(run, docker, args, { deadlineAt, now }) {
   if (r.code !== 0) {
     const stderr = String(r.stderr ?? '');
     if (DOCKER_DOWN_RE.test(stderr)) return { down: true };
-    return { fail: unknown(`docker ${args[0]} exit ${r.code}: ${stderr.trim().split('\n')[0]}`) };
+    return { fail: unknown(`docker ${args[0]} exit ${r.code}: ${stderr.trim().split('\n')[0]}`), exited: r };
   }
   return { r };
+}
+
+// True when stderr is nothing but "No such object" lines: docker inspect names each id that vanished between `ps` and
+// `inspect` (the Supabase CLI removes containers on stop) and still prints the JSON array for the ids that exist.
+const NO_SUCH_OBJECT = /no such (object|container)/i;
+function onlyNoSuchObject(stderr) {
+  const lines = String(stderr ?? '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  return lines.length > 0 && lines.every((l) => NO_SUCH_OBJECT.test(l));
 }
 
 function hostPorts(c) {
@@ -119,17 +127,36 @@ function buildStack(project, list, { cfg, realpath }) {
 // `deadlineAt`) and fewer than 500 ms left is unknown('deadline').
 export function readInventory({ run = realRun, cfg, docker = 'docker', deadlineAt, now = Date.now, realpath = fs.realpathSync } = {}) {
   try {
-    const ps = dockerCall(run, docker, ['ps', '--all', '--filter', `label=${PROJECT_LABEL}`, '--format', '{{.ID}}'], { deadlineAt, now });
-    if (ps.fail) return ps.fail;
-    if (ps.down) return ok({ dockerDown: true, stacks: [] });
-    const ids = String(ps.r.stdout ?? '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-    if (ids.length === 0) return ok({ dockerDown: false, stacks: [] });
-    const ins = dockerCall(run, docker, ['inspect', ...ids], { deadlineAt, now });
-    if (ins.fail) return ins.fail;
-    if (ins.down) return ok({ dockerDown: true, stacks: [] });
+    // ps then inspect. A container removed in between makes inspect exit 1 with only "No such object" errors, yet its stdout is
+    // still the JSON array of the survivors (the missing ones are simply gone). When that stdout is not usable, ps+inspect is
+    // run once more (inside the same deadline) before answering unknown; any other inspect error stays unknown.
+    let out = null;
+    for (let attempt = 1; attempt <= 2 && out === null; attempt += 1) {
+      const ps = dockerCall(run, docker, ['ps', '--all', '--filter', `label=${PROJECT_LABEL}`, '--format', '{{.ID}}'], { deadlineAt, now });
+      if (ps.fail) return ps.fail;
+      if (ps.down) return ok({ dockerDown: true, stacks: [] });
+      const ids = String(ps.r.stdout ?? '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+      if (ids.length === 0) return ok({ dockerDown: false, stacks: [] });
+      const ins = dockerCall(run, docker, ['inspect', ...ids], { deadlineAt, now });
+      if (ins.down) return ok({ dockerDown: true, stacks: [] });
+      if (!ins.fail) {
+        out = String(ins.r.stdout ?? '');
+        continue;
+      }
+      if (!ins.exited || ins.exited.timedOut || ins.exited.signal || !onlyNoSuchObject(ins.exited.stderr)) return ins.fail;
+      let survivors = null;
+      try {
+        survivors = JSON.parse(String(ins.exited.stdout ?? ''));
+      } catch {
+        /* not usable: retry once below */
+      }
+      if (Array.isArray(survivors)) out = String(ins.exited.stdout);
+      else if (attempt === 2) return ins.fail;
+    }
+    if (out === null) return unknown('docker inspect failed');
     let parsed;
     try {
-      parsed = JSON.parse(String(ins.r.stdout ?? ''));
+      parsed = JSON.parse(out);
     } catch (err) {
       return unknown(`docker inspect output is not JSON: ${err.message}`);
     }

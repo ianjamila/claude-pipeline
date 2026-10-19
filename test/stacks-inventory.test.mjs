@@ -284,3 +284,64 @@ test('resolveDocker: PATH first, then the fallback list (brew, /usr/local, OrbSt
 test('resolveDocker on Windows searches nothing', () => {
   assert.equal(resolveDocker({ env: { PATH: 'C:\\x' }, home: 'C:\\h', root: tmp(), platform: 'win32' }), 'docker');
 });
+
+// A container removed between `docker ps` and `docker inspect` (anyone running `supabase stop` removes them) makes inspect
+// exit 1 with "No such object" for that id, while stdout still carries the JSON array for the ids that exist.
+const res = (over) => ({ code: 0, stdout: '', stderr: '', timedOut: false, signal: null, ...over });
+const scripted = (psR, inspectRs) => {
+  const calls = [];
+  let i = 0;
+  const run = (cmd, args) => {
+    calls.push(args[0]);
+    if (args[0] === 'ps') return psR;
+    return inspectRs[Math.min(i++, inspectRs.length - 1)];
+  };
+  run.calls = calls;
+  return run;
+};
+const survivor = container({ id: 'a', name: '/supabase_db_p', project: 'p', workdir: '/w/p' });
+
+test('inspect exit 1 with only "No such object" and a JSON array on stdout => ok with the survivors, no retry', () => {
+  const run = scripted(res({ stdout: 'a\ngone\n' }), [res({ code: 1, stdout: JSON.stringify([survivor]), stderr: 'Error: No such object: gone\n' })]);
+  const r = readInventory({ run, cfg, realpath: id });
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.value.stacks.map((s) => s.project), ['p']);
+  assert.deepEqual(run.calls, ['ps', 'inspect']);
+  const allGone = readInventory({ run: scripted(res({ stdout: 'gone\n' }), [res({ code: 1, stdout: '[]', stderr: 'Error: No such object: gone' })]), cfg, realpath: id });
+  assert.deepEqual(allGone.value, { dockerDown: false, stacks: [] });
+});
+
+test('"No such object" with empty stdout => ps+inspect is run once more; a retry that succeeds is ok', () => {
+  const gone = res({ code: 1, stdout: '', stderr: 'Error: No such object: gone' });
+  const run = scripted(res({ stdout: 'a\ngone\n' }), [gone, res({ stdout: JSON.stringify([survivor]) })]);
+  const r = readInventory({ run, cfg, realpath: id });
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.value.stacks.map((s) => s.project), ['p']);
+  assert.deepEqual(run.calls, ['ps', 'inspect', 'ps', 'inspect']);
+});
+
+test('a retry that also fails is unknown, and the retry happens only once', () => {
+  const gone = res({ code: 1, stdout: '', stderr: 'Error: No such object: gone' });
+  const run = scripted(res({ stdout: 'a\ngone\n' }), [gone]);
+  assert.equal(readInventory({ run, cfg, realpath: id }).ok, false);
+  assert.deepEqual(run.calls, ['ps', 'inspect', 'ps', 'inspect']);
+});
+
+test('any other inspect error stays unknown, even with a JSON array on stdout and with a "No such object" line mixed in', () => {
+  const body = JSON.stringify([survivor]);
+  for (const stderr of ['permission denied', 'Error: No such object: gone\nError: something else broke']) {
+    const run = scripted(res({ stdout: 'a\ngone\n' }), [res({ code: 1, stdout: body, stderr })]);
+    assert.equal(readInventory({ run, cfg, realpath: id }).ok, false, stderr);
+    assert.deepEqual(run.calls, ['ps', 'inspect'], 'no retry for an unrelated error');
+  }
+  const killed = scripted(res({ stdout: 'a\n' }), [res({ code: 1, signal: 'SIGKILL', stdout: JSON.stringify([survivor]), stderr: 'Error: No such object: gone' })]);
+  assert.equal(readInventory({ run: killed, cfg, realpath: id }).ok, false);
+});
+
+test('the retry stays inside the deadline', () => {
+  let t = 0;
+  const gone = res({ code: 1, stdout: '', stderr: 'Error: No such object: gone' });
+  const inner = scripted(res({ stdout: 'a\n' }), [gone, res({ stdout: JSON.stringify([survivor]) })]);
+  const run = (cmd, args, opts) => { const r = inner(cmd, args, opts); t += 4000; return r; };
+  assert.deepEqual(readInventory({ run, cfg, realpath: id, deadlineAt: 10000, now: () => t }), { ok: false, reason: 'deadline' });
+});
