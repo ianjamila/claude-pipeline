@@ -6,6 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, chmodSync, utimesSync } from 'node:fs';
+import fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createGitHub } from '../pipeline/lib/github.mjs';
@@ -603,4 +604,53 @@ test('resolveProbeBins: defaults, and the PIPELINE_LSOF / PIPELINE_PS seams only
   const installed = tmp('stacks-installed ');
   writeFileSync(path.join(installed, 'INSTALLED.json'), '{}');
   assert.deepEqual(resolveProbeBins({ env, home, root: installed, warn: () => {} }), { lsof: '/usr/sbin/lsof', ps: '/bin/ps' });
+});
+
+// R1-B3: a process names the stack's port as `-p <port>`, `--port=<port>` or `PGPORT=<port>`, not only as `host:port`.
+test('processRefs: -p / --port= / PGPORT= port references count (cmdline and environment)', () => {
+  const cmdLines = [
+    ' 5001   501 psql -h 127.0.0.1 -p 54422 postgres',
+    ' 5002   501 node x',
+    ' 5003   501 pg_dump --port=54422 postgres',
+    ' 5004   501 psql -p 5442 postgres',
+    ' 5005   501 psql -p 544220 postgres',
+  ];
+  const envLines = [
+    ' 5001 psql -h 127.0.0.1 -p 54422 postgres HOME=/Users/me',
+    ' 5002 node x HOME=/Users/me PGPORT=54422',
+    ' 5003 pg_dump --port=54422 postgres HOME=/Users/me',
+    ' 5004 psql -p 5442 postgres HOME=/Users/me',
+    ' 5005 psql -p 544220 postgres HOME=/Users/me',
+  ];
+  const r = processRefs(stack, refOpts(psMachine({ cmdLines, envLines })));
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.value.map((h) => h.pid), [5001, 5002, 5003]);
+  assert.ok(r.value.every((h) => h.by === 'port'));
+  assert.equal(r.value.find((h) => h.pid === 5002).field, 'env');
+});
+
+// R1-B2: only "gone" errors prove a consumer worktree is gone; any other stat failure is not an answer.
+test('consumerWorktrees: a stat that fails with EACCES leaves exists unknown; prStates then answers unknown (stack listed)', () => {
+  const { base } = makeRepo();
+  const hidden = path.join(base, '.worktrees', 'hidden');
+  const nowhere = path.join(base, '.worktrees', 'nowhere');
+  const events = [{ kind: 'use', project: 'sa', worktree: hidden }, { kind: 'use', project: 'sa', worktree: nowhere }];
+  const fsx = {
+    ...fs,
+    statSync: (p) => {
+      if (p === hidden) throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+      if (p === nowhere) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+      return fs.statSync(p);
+    },
+  };
+  const r = consumerWorktrees(stackSa, { events, repos: [], listWorktrees: () => [], fsx, platform: 'darwin' });
+  assert.equal(r.ok, true);
+  const byPath = Object.fromEntries(r.value.map((w) => [w.path, w]));
+  assert.equal(byPath[nowhere].exists, false);
+  assert.equal(byPath[hidden].exists, null);
+  const w = prWorld({ nodes: [prNode({ state: 'OPEN' })] });
+  const states = prStates([byPath[hidden]], { ...w, platform: 'darwin' });
+  assert.equal(states.ok, false);
+  assert.match(states.reason, /cannot tell whether .*hidden exists/);
+  assert.equal(w.ghCalls.length + w.gitCalls.length, 0);
 });

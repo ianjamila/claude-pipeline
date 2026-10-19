@@ -30,6 +30,7 @@ import { isInside, samePath } from '../paths.mjs';
 import { lineShowsWork, pathSpellings, parseLsofFields, prefixMayReach, unFirm } from '../worktree-prune/inspect.mjs';
 import { checkRepoIdentity, fetchBranchPrs } from '../worktree-prune/prs.mjs';
 import { procIdentity } from './identity.mjs';
+import { portRefRe } from './match.mjs';
 import { stacksSeam } from './paths.mjs';
 import { ok, unknown } from './result.mjs';
 
@@ -100,7 +101,7 @@ function matchers(stack, { ports = true, spellings = pathSpellings } = {}) {
   }
   const dirs = stack?.workdir ? [...new Set(spellings(stack.workdir))] : [];
   for (const d of dirs) out.push({ name: 'workdir', re: new RegExp(`${escapeRe(d)}${BOUND_AFTER}`) });
-  if (ports) for (const p of stack?.ports ?? []) out.push({ name: 'port', re: new RegExp(`:${p}(?!\\d)`) });
+  if (ports) for (const p of stack?.ports ?? []) out.push({ name: 'port', re: portRefRe(p) });
   return { patterns: out, dirs };
 }
 const firstMatch = (patterns, text) => {
@@ -608,8 +609,9 @@ export function consumerWorktrees(stack, {
     }
   }
   const value = [...byPath.values()].map((w) => {
+    // true / false / null (unknown): only ENOENT/ENOTDIR prove the directory is gone; EACCES, EIO ... prove nothing
     let exists = false;
-    try { exists = fsx.statSync(w.path).isDirectory(); } catch { exists = false; }
+    try { exists = fsx.statSync(w.path).isDirectory(); } catch (err) { exists = isGone(err) ? false : null; }
     return { path: w.path, exists, branch: w.branch, via: w.via };
   });
   return { ok: true, value, notes };
@@ -641,6 +643,7 @@ export function prStates(worktrees, { ghFor = (cwd) => createGitHub({ cwd }), gi
       out.set(w.path, { state: 'GONE', headMatches: true, eligible: true });
       continue;
     }
+    if (w.exists === null) return unknown(`cannot tell whether ${w.path} exists (its status could not be read)`);
     let branch;
     let head;
     let origin;

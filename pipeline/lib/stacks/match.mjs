@@ -232,6 +232,10 @@ function collector() {
   };
 }
 
+// How a command line or environment names a port: `host:<port>`, `-p <port>`, `--port <port>`, `--port=<port>`, `PGPORT=<port>`
+// (the digits must end there: 5442 is not 54422). Shared with the process probe (evidence.mjs).
+export const portRefRe = (port) => new RegExp(`(?::|-p\\s*=?\\s*|--port[=\\s]+|pgport=)["']?${port}(?!\\d)`, 'i');
+
 function textMatches(command, stacks) {
   const lower = command.toLowerCase();
   const out = { folder: [], container: [], project: [], port: [] };
@@ -243,7 +247,7 @@ function textMatches(command, stacks) {
     if (named || generic) out.container.push(s);
     if (hasWord(lower, project)) out.project.push(s);
     for (const port of s?.ports ?? []) {
-      if (lower.includes(String(port)) && new RegExp(`(?::|-p\\s*=?\\s*|--port[=\\s]+|pgport=)["']?${port}(?!\\d)`).test(lower)) { out.port.push(s); break; }
+      if (lower.includes(String(port)) && portRefRe(port).test(lower)) { out.port.push(s); break; }
     }
   }
   return out;
