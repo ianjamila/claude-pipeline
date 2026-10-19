@@ -475,3 +475,56 @@ test('CLI: usage errors (exit 2): neither/both mode, --status with other options
   assert.equal(ok.status, 0);
   assert.deepEqual(JSON.parse(ok.stdout), { ok: true, lockDir, holders: [], waiters: [] });
 });
+
+// verify.full comes from a pipeline.yml a PR can change, so `slot --run` judges the exact command line with the same guards as
+// `job start` before queueing or spawning. The denied samples are built from parts so this file never holds one verbatim.
+function guardedRepo(full) {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', `version: 1\nproject: demo\nverify:\n  full: ${JSON.stringify(full)}\n  quick: node scripts/verify.mjs --quick\n  max_parallel_full: 1\n`);
+  repo.commit('config');
+  return repo;
+}
+const parts = (...p) => p.join(' ');
+const DENIED = [
+  ['git guard', parts('git', 'pu' + 'sh', 'origin', 'ma' + 'in')],
+  ['file guard', parts('echo', 'x', '>', '~/.claude/' + 'settings.json')],
+];
+
+for (const [kind, full] of DENIED) {
+  test(`CLI: a verify.full the ${kind} denies is refused like a job (exit 1, refused JSON), with nothing queued or run`, TIMEOUT, async () => {
+    const repo = guardedRepo(full);
+    const lockDir = tmp();
+    const home = tmp(); // a stand-in HOME, so a guard that failed open could only write here
+    const env = { ...cliEnv(lockDir), HOME: home, USERPROFILE: home };
+    delete env.PIPELINE_ADMIN;
+    try {
+      const r = spawnSync(process.execPath, [BIN, 'verify', 'slot', '--run'], { cwd: repo.dir, env, encoding: 'utf8' });
+      assert.equal(r.status, 1, r.stdout + r.stderr);
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.ok, false);
+      assert.equal(out.refused, true);
+      assert.equal(typeof out.reason, 'string');
+      assert.ok(out.reason.length > 0);
+      assert.equal(r.stderr.includes('"slot"'), false, 'no slot line: nothing started');
+      assert.equal(existsSync(path.join(lockDir, 'verify-full-queue')), false, 'no ticket was taken');
+      assert.equal(readdirSync(lockDir).length, 0, 'no slot was taken');
+      assert.equal(existsSync(path.join(home, '.claude', 'settings.json')), false, 'nothing ran');
+      assert.equal(spawnSync('git', ['-C', repo.dir, 'status', '--porcelain'], { encoding: 'utf8' }).stdout, '', 'the repo is untouched');
+    } finally {
+      repo.cleanup();
+    }
+  });
+}
+
+test('CLI: an allowed verify.full still runs after the guard check', TIMEOUT, async () => {
+  const work = tmp();
+  writeFileSync(path.join(work, 'release'), '');
+  const repo = repoWith(1, { args: childArgs(work, 'ok', 0) });
+  try {
+    const r = await startCli(repo.dir, tmp()).done;
+    assert.equal(r.code, 0, r.stderr);
+    assert.ok(existsSync(path.join(work, 'ok.started')));
+  } finally {
+    repo.cleanup();
+  }
+});

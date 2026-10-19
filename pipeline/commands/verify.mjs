@@ -10,6 +10,9 @@
 // `slot --run` runs ONLY the repo's configured `verify.full` (plus a validated `--only <steps>`), never a command of the
 // caller's: the git and file guards judge the commands a session runs (and unwrap `job start NAME -- CMD`), so a wrapper that
 // took an arbitrary command would be an exec that walks past them. Any extra argument, or anything after `--`, is a usage error.
+// And since verify.full comes from the repo's pipeline.yml, which a PR can change, the exact command line it will spawn is judged by
+// the same git and file guards as `job start` (lib/command-guard.mjs) before a ticket is taken or anything is spawned; a denied
+// command exits 1 { ok:false, refused:true, reason } like a refused job.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -21,6 +24,7 @@ import { git, headSha, isAncestor, revParse } from '../lib/git.mjs';
 import { matchGlob } from '../lib/glob.mjs';
 import { defaultLockDir, INCOMPLETE_STALE_MS, inspect, isPidAlive, machineId, release, tryAcquire } from '../lib/locks.mjs';
 import { SAFE_STEP } from '../lib/config.mjs';
+import { guardVerdict } from '../lib/command-guard.mjs';
 import { loadState } from '../lib/state.mjs';
 
 export const meta = {
@@ -33,6 +37,7 @@ export const meta = {
     '  verify.max_parallel_full set: the full commands above come back as `node ~/.claude/pipeline/bin/pipeline.mjs verify slot --run [--only STEPS]`',
     'pipeline verify slot --run [--only STEP,STEP...] [--repo DIR]   wait for a free slot, run the repo\'s verify.full (with --only STEPS appended; npm gets "--" first),',
     '  inherited stdio, free the slot when it ends; exit code = verify.full\'s. It runs nothing else: any other argument, or "--", is a usage error (exit 2).',
+    '  The exact command line is judged first by the same git and file guards as `job start`: denied -> exit 1 {ok:false, refused:true, reason}, nothing queued or run.',
     '  Slots are machine-wide (all repos); the limit is verify.max_parallel_full of the repo it runs in; unset = it runs at once. Waiters go in arrival order.',
     '  One stderr line before verify.full starts: {"slot":{index,of,waitedSeconds,loadWaitSeconds,warnings}}. With verify.max_load it then waits (5-30 s jitter between',
     '  checks, at most verify.max_load_wait_minutes) while the 1-minute load average is above it, and proceeds with a warning when the time is up.',
@@ -381,6 +386,8 @@ async function slotCommand(rest, ctx) {
   const { config } = await requireConfig(root);
   const { max_parallel_full: n, max_load: maxLoad, max_load_wait_minutes: maxLoadWaitMinutes } = config.verify;
   const command = slotRunLine(config.verify, flags); // validates every flag before anything is spawned
+  const verdict = guardVerdict(command, { cwd: root, env });
+  if (!verdict.allow) return { exitCode: EXIT.FAILED, output: { ok: false, refused: true, reason: verdict.reason } };
   const poll = Number(env.PIPELINE_SLOT_POLL_MS);
   const code = await runWithSlot({ command, cwd: root, n, maxLoad, maxLoadWaitMinutes, lockDir, env, ...(poll > 0 ? { pollMs: poll } : {}) });
   // The verify's own output owns stdout, so no JSON result is printed: leave with its exit code directly.
