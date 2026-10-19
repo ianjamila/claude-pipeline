@@ -425,6 +425,28 @@ test('a use by a process born AFTER the would-stop is a RESTART; a hidden client
   });
 });
 
+test('F1: a sweep charges a use to the NEWEST would-stop of a long-lived generation, and sees the same process again for the next record', async () => {
+  await withMachine({ mode: 'report' }, async (m) => {
+    const orphan = m.spec('orphan-demo');
+    const gen = { id: orphan.id, startedAt: orphan.startedAt };
+    const rec = (t, source = 'sweep') => appendDecision(m.files.actions, { t: new Date(t).toISOString(), source, project: 'orphan-demo', generation: gen, mode: 'report', action: 'would-stop', reasons: ['x'], evidence: {} });
+    await rec(T0 - 2 * 86_400_000); // the first would-stop, two days ago: the generation has lived since
+    await rec(T0 - 30 * 60_000, 'session-end'); // a repeat 30 min ago
+    m.refs['orphan-demo'] = [{ pid: 777, birth: Math.floor((T0 - 5 * 86_400_000) / 1000), command: 'psql orphan-demo', field: 'cmdline' }];
+    const r = await m.sweep({});
+    assert.equal(m.actions().filter((d) => d.action === 'use-observed').length, 1, 'recorded against the repeat, not dropped for being 2 days after the first');
+    assert.equal(r.outcomes.miss, 1);
+    // later, a newer would-stop of the same generation: the same process still being there is a use of THAT record too
+    await rec(T0 + 60 * 60_000);
+    const later = await m.sweep({}, { now: () => T0 + 90 * 60_000 });
+    assert.equal(m.actions().filter((d) => d.action === 'use-observed').length, 2, 'the same process, a new record: not "reported once ever"');
+    assert.equal(later.outcomes.miss, 1, 'still one row for the generation');
+    // and no third record for a third sweep inside the same window
+    await m.sweep({}, { now: () => T0 + 100 * 60_000 });
+    assert.equal(m.actions().filter((d) => d.action === 'use-observed').length, 2);
+  });
+});
+
 test('a ledger lease after an open would-stop counts as a use, with the owner identity from the event', async () => {
   await withMachine({}, async (m) => {
     const orphan = m.spec('orphan-demo');

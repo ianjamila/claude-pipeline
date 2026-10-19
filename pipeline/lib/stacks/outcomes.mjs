@@ -9,18 +9,20 @@
 // strict: one damaged line makes the whole log `unknown`, never a partial answer (the register hook has its own tolerant tail
 // reader for the "just stopped?" check; this one feeds the numbers the owner switches stopping on from).
 //
-// Outcomes. Every would-stop / stopped decision is judged once per container generation (project|generation id|StartedAt):
-// the first record wins, later sweeps of the same generation only move `lastSeen`. A "use" is { t, project, pid, birth,
-// command?, check? } -- a lease, a C2 connection or a C3 reference seen after the decision, with the process identity read at
-// observation. For the newest decision of that project that is not later than the use:
+// Outcomes. Every would-stop / stopped decision is reported once per container generation (project|generation id|StartedAt),
+// as ONE row: the first record names the row, later records of the same generation (later sweeps, later sessions) only move
+// `lastSeen`. A "use" is { t, project, pid, birth, command?, check? } -- a lease, a C2 connection or a C3 reference seen after
+// the decision, with the process identity read at observation. It is judged against the NEWEST stop record of that project that
+// is not later than the use (every record of a generation counts, not only the first: in report mode a private stack lives for
+// days and is would-stopped again and again), then rolled up into that record's generation row:
 //   - the use is from 0 to 2 h (both ends inclusive) after the decision, else it is not an outcome;
 //   - birth BEFORE the decision time => MISS (a live consumer the checks missed: the safety signal);
 //   - birth at or after it => RESTART (cost only, the data was kept);
 //   - no usable birth (hidden client, process gone before ps could read it, unparsable time) => UNKNOWN (R2-9). An UNKNOWN
 //     could be a MISS, so it blocks the switch-on recommendation exactly like one: the headline reads "MISS 0 (+2 unknown
 //     => not yet)".
-// A decision's outcome is its worst use (MISS > UNKNOWN > RESTART); with no use it is CLEAN once its 2 h window is over and
-// PENDING before that. The summary covers the last 7 days.
+// A row's outcome is the worst class over all its records' uses (MISS > UNKNOWN > RESTART); with no use it is PENDING until the
+// NEWEST record's 2 h window is over, then CLEAN. The summary covers the last 7 days (by the newest record).
 //
 // Time comes in as inputs (`now`, record `t`); nothing here reads a clock except as a default argument.
 import path from 'node:path';
@@ -81,6 +83,20 @@ export function readDecisions(file) {
 const STOP_ACTIONS = new Set(['would-stop', 'stopped']);
 export const generationKey = (rec) => `${lower(rec?.project)}|${rec?.generation?.id ?? ''}|${rec?.generation?.startedAt ?? ''}`;
 
+// Every would-stop / stopped record, oldest first (log order breaks ties): what a use is charged to.
+export function stopRecords(decisions) {
+  const list = (decisions ?? []).filter((r) => isObject(r) && STOP_ACTIONS.has(r.action));
+  return list.map((r, i) => [r, i]).sort((a, b) => toMs(a[0].t) - toMs(b[0].t) || a[1] - b[1]).map(([r]) => r);
+}
+
+// The newest stop record of `project` (case-insensitive) that is not later than `atMs`; an unplaceable time (NaN) is charged to the
+// newest record of the project (classifyUse answers UNKNOWN for it). undefined when none.
+export function newestStopAt(stops, project, atMs) {
+  const p = lower(project);
+  const mine = stops.filter((r) => lower(r.project) === p);
+  return Number.isFinite(atMs) ? [...mine].reverse().find((r) => toMs(r.t) <= atMs) : mine[mine.length - 1];
+}
+
 // Map<"project|genId|startedAt", rec + lastSeen>, in log order. One record per container generation: the first would-stop /
 // stopped record wins; later records of the same generation (later sweeps) only move `lastSeen`. A restarted container has a
 // new StartedAt, so it is a new would-stop. kept / failed / skipped records are not would-stops and move nothing.
@@ -115,40 +131,43 @@ export function classifyUse(rec, use) {
 
 const RANK = { MISS: 3, UNKNOWN: 2, RESTART: 1 };
 
-// -> { miss, restart, unknown, clean, pending, gbFreed, rows } over the would-stops of the last 7 days. `uses` =
-// [{ t, project, pid, birth, command?, check? }]; each use is judged against the newest would-stop of its project that is not
-// later than the use (the use of an older generation is not charged to a newer one). rows are in decision order.
+// -> { miss, restart, unknown, clean, pending, gbFreed, rows } over the generations whose newest would-stop is from the last 7 days.
+// `uses` = [{ t, project, pid, birth, command?, check? }]; each use is judged against the newest would-stop record of its project
+// that is not later than the use (the use of an older generation is not charged to a newer one) and rolled up into that record's
+// generation row. rows are in decision order, one per generation.
 export function outcomeSummary(decisions, uses, now = Date.now()) {
   const nowMs = toMs(now);
-  const all = [...wouldStops(decisions).values()];
-  const byProject = new Map();
-  for (const rec of all) {
-    const k = lower(rec.project);
-    if (!byProject.has(k)) byProject.set(k, []);
-    byProject.get(k).push(rec);
+  const stops = stopRecords(decisions);
+  const rowOf = new Map(); // generation key -> { rec (first record) + lastSeen, newest (newest record) }
+  for (const rec of decisions ?? []) {
+    if (!isObject(rec) || !STOP_ACTIONS.has(rec.action)) continue;
+    const key = generationKey(rec);
+    const g = rowOf.get(key);
+    if (!g) rowOf.set(key, { rec: { ...rec, lastSeen: rec.t }, newest: rec });
+    else if (toMs(rec.t) >= toMs(g.newest.t)) {
+      g.newest = rec;
+      g.rec.lastSeen = rec.t;
+    }
   }
-  for (const list of byProject.values()) list.sort((a, b) => toMs(a.t) - toMs(b.t));
-  const hits = new Map(); // rec -> [{ ...use, class }]
+  const hits = new Map(); // generation key -> [{ ...use, class, against }]
   for (const use of uses ?? []) {
-    const list = byProject.get(lower(use?.project));
-    if (!list?.length) continue;
-    const at = toMs(use.t);
-    // an unplaceable time is charged to the newest would-stop (classifyUse answers UNKNOWN for it)
-    const target = Number.isFinite(at) ? [...list].reverse().find((r) => toMs(r.t) <= at) : list[list.length - 1];
+    const target = newestStopAt(stops, use?.project, toMs(use?.t));
     if (!target) continue;
     const cls = classifyUse(target, use);
     if (!cls) continue;
-    if (!hits.has(target)) hits.set(target, []);
-    hits.get(target).push({ ...use, class: cls });
+    const key = generationKey(target);
+    if (!hits.has(key)) hits.set(key, []);
+    hits.get(key).push({ ...use, class: cls, against: target.t });
   }
   const sum = { miss: 0, restart: 0, unknown: 0, clean: 0, pending: 0, gbFreed: 0, rows: [] };
   let bytes = 0;
-  for (const rec of all) {
+  for (const [key, { rec, newest }] of rowOf) {
     const decided = toMs(rec.t);
-    if (!(decided >= nowMs - WEEK_MS)) continue;
-    const used = hits.get(rec) ?? [];
+    const newestMs = toMs(newest.t);
+    if (!(newestMs >= nowMs - WEEK_MS)) continue;
+    const used = hits.get(key) ?? [];
     const worst = used.reduce((w, u) => (RANK[u.class] > (RANK[w] ?? 0) ? u.class : w), null);
-    const outcome = worst ?? (nowMs >= decided + WINDOW_MS ? 'CLEAN' : 'PENDING');
+    const outcome = worst ?? (nowMs >= newestMs + WINDOW_MS ? 'CLEAN' : 'PENDING');
     sum[outcome.toLowerCase()] += 1;
     const memBytes = typeof rec.memBytes === 'number' && Number.isFinite(rec.memBytes) ? rec.memBytes : null;
     if (memBytes !== null) bytes += memBytes;
@@ -222,7 +241,7 @@ const missHeadline = (s) => (s.unknown > 0 ? `MISS ${s.miss} (+${s.unknown} unkn
 function useLine(row, u) {
   const who = u.pid === null || u.pid === undefined ? 'hidden client' : `pid ${u.pid}${u.command ? ` (${oneLine(u.command, 80)})` : ''}`;
   const born = typeof u.birth === 'number' && Number.isFinite(u.birth) ? `born ${when(u.birth * 1000)}` : 'birth unknown';
-  return `- ${oneLine(row.project)} — would-stop ${row.t} — ${who}, ${born}, seen ${u.t}${u.check ? `, missed by the ${oneLine(u.check, 40)} check` : ''}`;
+  return `- ${oneLine(row.project)} — would-stop ${u.against ?? row.t} — ${who}, ${born}, seen ${u.t}${u.check ? `, missed by the ${oneLine(u.check, 40)} check` : ''}`;
 }
 
 function outcomeSection(title, rows, cls, none) {

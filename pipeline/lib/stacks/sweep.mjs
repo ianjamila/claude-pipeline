@@ -33,7 +33,8 @@ import { isolation, lockDirs, projectAllowed, stackFiles, stacksRoot } from './p
 import { resolveSupabase, stopStack as realStopStack } from './act.mjs';
 import { SWEEP_PROBES, gatherEvidence, ownPids, readLedgerLocked, summarizeEvidence } from './assess.mjs';
 import {
-  WINDOW_MS, appendDecision as realAppendDecision, memoryOfProject as realMemoryOfProject, outcomeSummary, readDecisions, renderReport, renderWeekly, wouldStops,
+  WINDOW_MS, appendDecision as realAppendDecision, generationKey, memoryOfProject as realMemoryOfProject, newestStopAt, outcomeSummary, readDecisions, renderReport,
+  renderWeekly, stopRecords,
 } from './outcomes.mjs';
 import { observedUses } from './session-end.mjs';
 import * as realEvidence from './evidence.mjs';
@@ -320,8 +321,17 @@ export async function runSweep({ apply = false, deps = {} } = {}) {
       ...(deps.ghFor ? { ghFor: deps.ghFor } : {}), ...(deps.git ? { git: deps.git } : {}),
     };
     const canApply = apply && modes.sweeper === 'apply' && blockedReason === null;
-    const priorStops = wouldStops(decisionsNow.ok ? decisionsNow.value : []);
-    const seenUse = new Set((decisionsNow.ok ? observedUses(decisionsNow.value) : []).map((u) => `${u.check}|${lower(u.project)}|${u.pid}|${u.birth}`));
+    // Every would-stop / stopped record, not one per generation: a use is charged to the NEWEST record not later than it (a long-lived
+    // generation is would-stopped again by every daily sweep). A sighting is "seen" per (process, newest record), so a consumer that
+    // is still there when the next record is written is a use of that record too.
+    const priorStops = stopRecords(decisionsNow.ok ? decisionsNow.value : []);
+    const seenKey = (check, project, pid, birth, target) => `${check}|${lower(project)}|${pid}|${birth}|${generationKey(target)}|${target.t}`;
+    const seenUse = new Set();
+    for (const rec of decisionsNow.ok ? decisionsNow.value : []) {
+      if (rec?.action !== 'use-observed' || !rec.use || typeof rec.use !== 'object') continue;
+      const target = newestStopAt(priorStops, rec.use.project, Date.parse(rec.use.t));
+      if (target) seenUse.add(seenKey(rec.use.check, rec.use.project, rec.use.pid, rec.use.birth, target));
+    }
     const store = async (rec) => {
       const r = await appendDecision(files.actions, rec);
       if (!r?.ok) note(`decision for ${rec.project} not recorded: ${r?.reason ?? 'no answer'}`);
@@ -439,17 +449,16 @@ export async function runSweep({ apply = false, deps = {} } = {}) {
     async function recordUses(stack, evidence) {
       if (!evidence) return;
       const t = now();
-      const prior = [...priorStops.values()].filter((r) => lower(r.project) === lower(stack.project) && Date.parse(r.t) <= t && t - Date.parse(r.t) <= WINDOW_MS);
-      if (prior.length === 0) return;
+      const target = newestStopAt(priorStops, stack.project, t); // the window is judged from the NEWEST record of the project
+      if (!target || t - Date.parse(target.t) > WINDOW_MS) return;
       const own = new Set([process.pid, ...ownPids(root, { isAlive: isAliveFn })]); // the feature's own workers and this sweep are never a use
-      const target = prior.sort((a, b) => Date.parse(a.t) - Date.parse(b.t))[prior.length - 1];
       for (const [check, probe] of [['C2', evidence.connections], ['C3', evidence.processRefs]]) {
         if (!probe?.ok || !Array.isArray(probe.value)) continue;
         for (const hit of probe.value) {
           const pid = Number.isInteger(hit?.pid) ? hit.pid : null;
           if (pid !== null && own.has(pid)) continue;
           const birth = Number.isFinite(hit?.birth) ? hit.birth : null;
-          const key = `${check}|${lower(stack.project)}|${pid}|${birth}`;
+          const key = seenKey(check, stack.project, pid, birth, target);
           if (seenUse.has(key)) continue;
           seenUse.add(key);
           const use = { t: iso(t), project: stack.project, pid, birth, check, ...(hit?.command ? { command: String(hit.command).slice(0, 200) } : {}) };

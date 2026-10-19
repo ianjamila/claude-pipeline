@@ -200,12 +200,44 @@ test('outcomeSummary: only the last 7 days of would-stops count; a use finds the
   assert.deepEqual(s2.rows.map((r) => r.outcome), ['CLEAN', 'RESTART']);
 });
 
-test('outcomeSummary: repeated sweeps of a generation never add a would-stop, and the use window is from the first record', () => {
+test('outcomeSummary: repeated sweeps of a generation never add a would-stop (one row, lastSeen moves); a use is judged from the newest record', () => {
   const ds = [0, 1, 2].map((i) => dec({ t: iso(T0_MS + i * HOUR) }));
-  const s = outcomeSummary(ds, [useAt(2.5 * HOUR)], T0_MS + 5 * HOUR);
+  const s = outcomeSummary(ds, [useAt(10 * HOUR)], T0_MS + 12 * HOUR);
   assert.equal(s.rows.length, 1);
-  assert.equal(s.clean, 1, 'a use 2.5 h after the FIRST record is outside its window');
   assert.equal(s.rows[0].lastSeen, iso(T0_MS + 2 * HOUR));
+  assert.equal(s.clean, 1, 'a use 8 h after the NEWEST record is outside its window');
+  const near = outcomeSummary(ds, [useAt(2.5 * HOUR)], T0_MS + 5 * HOUR);
+  assert.equal(near.rows.length, 1);
+  assert.equal(near.rows[0].outcome, 'MISS', 'a use 30 min after the 3rd record of the generation is its MISS, not "2.5 h after the first"');
+  assert.equal(near.rows[0].lastSeen, iso(T0_MS + 2 * HOUR));
+});
+
+test('outcomeSummary (F1): a would-stop of a days-old generation repeated on day 3, with a use 30 min later, is a MISS, not CLEAN', () => {
+  const ds = [dec({ t: iso(T0_MS) }), dec({ t: iso(T0_MS + 2 * DAY), source: 'session-end' })];
+  const u = useAt(2 * DAY + 30 * 60_000, { birth: born(T0_MS) - 5 * DAY });
+  const s = outcomeSummary(ds, [u], T0_MS + 2 * DAY + 5 * HOUR);
+  assert.equal(s.rows.length, 1, 'still one row per generation');
+  assert.deepEqual([s.miss, s.clean], [1, 0]);
+  assert.equal(s.rows[0].uses.length, 1);
+  assert.equal(s.rows[0].uses[0].against, iso(T0_MS + 2 * DAY));
+  assert.match(renderReport(baseState({ now: T0_MS + 2 * DAY + 5 * HOUR, decisions: ds, uses: [u] })), /would-stop 2026-10-21T03:00:00.000Z/);
+});
+
+test('outcomeSummary (F1): the row takes the worst class over all its records; CLEAN needs the NEWEST record\'s window to be over with no use', () => {
+  const ds = [dec({ t: iso(T0_MS) }), dec({ t: iso(T0_MS + DAY) }), dec({ t: iso(T0_MS + 2 * DAY) })];
+  const restart = useAt(DAY + 10 * 60_000, { birth: born(T0_MS + DAY) + 1 }); // a restart after the 2nd record
+  const miss = useAt(10 * 60_000); // a MISS after the 1st record
+  const all = outcomeSummary(ds, [restart, miss], T0_MS + 4 * DAY);
+  assert.deepEqual(all.rows.map((r) => r.outcome), ['MISS']);
+  assert.equal(outcomeSummary(ds, [restart], T0_MS + 4 * DAY).rows[0].outcome, 'RESTART');
+  assert.equal(outcomeSummary(ds, [], T0_MS + 2 * DAY + HOUR).rows[0].outcome, 'PENDING', 'the newest record is still inside its window');
+  assert.equal(outcomeSummary(ds, [], T0_MS + 2 * DAY + 3 * HOUR).rows[0].outcome, 'CLEAN');
+});
+
+test('outcomeSummary (F1): a generation first seen over 7 days ago but would-stopped again within them is still reported', () => {
+  const ds = [dec({ t: iso(NOW - 9 * DAY) }), dec({ t: iso(NOW - 2 * DAY) })];
+  const s = outcomeSummary(ds, [], NOW);
+  assert.equal(s.rows.length, 1);
 });
 
 // ---------------------------------------------------------------- memoryOfProject
