@@ -761,9 +761,9 @@ export function localBin(name, env) {
 
 // Is a node_modules/.bin file a program (not opened as a shell script) or a shell script (opened)? Decided ONLY by the first bytes, as the system does: the kernel picks the interpreter from
 // a `#!` line and nothing else, and a file without one fails execve (ENOEXEC) and is run by `sh` (npm / npx spawn bins through the script shell). So the extension (.js ...) and the
-// place a link leads to are never a reason. A shebang naming a shell (sh bash dash zsh ksh ash, `busybox sh`, `env [-S] bash -e`) or none at all: a shell script. A shebang naming anything
-// else (node, bun, deno, python ...): a program. Binary content (ELF or Mach-O magic, a NUL byte in the first 512): a program. An unreadable file is not decided here (the caller opens it).
-const SHELL_BASENAME = /sh[\d.]*$/;
+// place a link leads to are never a reason. A shebang whose interpreter (after `env`, `env -S`, `--split-string`, its options) is one the guard knows (node nodejs bun deno tsx ts-node python python2 python3[.N] ruby perl php): a program. Any
+// other shebang (a shell, awk, make, pwsh, busybox, a name not listed) or none at all: opened as a shell script. Binary content (ELF or Mach-O magic, a NUL byte in the first 512): a program. An unreadable file is not decided here (the caller opens it).
+const PROGRAM_INTERPRETERS = /^(?:node|nodejs|bun|deno|tsx|ts-node|python[23]?(?:\.\d+)*|ruby|perl|php)$/;
 export function binIsProgram(text) {
   if (typeof text !== 'string') return false;
   if (text.startsWith('#!')) {
@@ -781,8 +781,7 @@ export function binIsProgram(text) {
     }
     const prog = nm(tokens[i]);
     if (prog === '') return false; // `#!` with nothing: execve fails and sh runs it
-    if (prog === 'busybox') return tokens[i + 1] !== undefined && !SHELL_BASENAME.test(nm(tokens[i + 1]));
-    return !SHELL_BASENAME.test(prog);
+    return PROGRAM_INTERPRETERS.test(prog); // (an allowlist: awk, make, pwsh, busybox applets and any name not listed are read by a shell or by a language the guard does not model, so the file is opened)
   }
   return text.slice(0, 512).includes('\u0000') || text.startsWith('\u007fELF') || text.startsWith('��');
 }

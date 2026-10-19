@@ -1,8 +1,8 @@
 // Why (#89 t2 follow-up): a node_modules/.bin file is opened as a shell script or left alone, and the choice used to follow the FILE NAME (.js / .mjs / .cjs, also behind a link) next to the shebang. That is a
 // parser differential: the kernel starts the interpreter named by a `#!` line and nothing else, and a file with NO shebang fails execve (ENOEXEC) and is run by `sh` (npm / npx spawn bins through the script shell).
 // So `npx nsbin` (a .js file without a shebang, holding a guarded command) was allowed while sh would run it. The rule these tests hold, for both guards:
-//   decide ONLY by the first bytes: a shebang naming a shell (sh bash dash zsh ksh ash, busybox sh, env [-S] <shell>), no shebang, or a file that cannot be read -> opened as a shell script (or refused);
-//   a shebang naming anything else (node, bun, deno, python ...) or binary content (ELF / Mach-O magic, a NUL in the first 512 bytes) -> a program, judged only on a known write that replaces it.
+//   decide ONLY by the first bytes: a shebang naming anything but a known interpreter (a shell, awk, make, pwsh, busybox, an unknown name; env [-S] <name>), no shebang, or a file that cannot be read -> opened as a shell script (or refused);
+//   a shebang naming node, nodejs, bun, deno, tsx, ts-node, python, python2, python3[.N], ruby, perl or php (an ALLOWLIST) or binary content (ELF / Mach-O magic, a NUL in the first 512 bytes) -> a program, judged only on a known write that replaces it.
 // And a package script that calls a bin by bare name (`"x": "shbin"`, `npm run x`) opens node_modules/.bin/shbin: the managers put every node_modules/.bin from the package's directory upward on the PATH of
 // a script's commands (as `npx` and the runner lookups already resolve through localBin). A name with no bin there is an ordinary command.
 // Every loosening or tightening has its malicious twin (the same shape with a guarded bin). Guarded words are spelled in pieces: the live guard scans files passed to node tools.
@@ -66,10 +66,10 @@ const ELF = (g) => `\u007fELF\u0002\u0001\u0001\u0000\u0000\u0000${BAD[g]}\u0000
 const NUL_BYTES = (g) => `MZ\u0000\u0000${BAD[g]}`;
 
 test('the first bytes decide (binIsProgram): shells and no shebang open the file, any other interpreter and binary content do not', () => {
-  for (const t of ['#!/bin/sh\n', '#!/bin/bash -e\n', '#! /usr/bin/dash\n', '#!/usr/bin/env zsh\n', '#!/usr/bin/env -S bash -e\n', '#!/usr/bin/env -Sbash -e\n', '#!/usr/bin/env -i FOO=1 sh\n', '#!/bin/busybox sh\n', '#!/bin/ksh93\n', '#!/bin/bash5\n', '#!\n', '#!/usr/bin/env\n', 'echo hi\n', '', '\n#!/usr/bin/env node\n', ' #!/usr/bin/env node\n', 'import "./x.js"\n', '#!/bin/sh\r\ngit x\r\n']) {
+  for (const t of ['#!/bin/sh\n', '#!/bin/bash -e\n', '#! /usr/bin/dash\n', '#!/usr/bin/env zsh\n', '#!/usr/bin/env -S bash -e\n', '#!/usr/bin/env -Sbash -e\n', '#!/usr/bin/env -i FOO=1 sh\n', '#!/bin/busybox sh\n', '#!/bin/ksh93\n', '#!/usr/bin/awk -f\n', '#!/bin/busybox awk -f\n', '#!/usr/bin/env pwsh\n', '#!/usr/bin/make -f\n', '#!/usr/bin/env -S unknownlang --x\n', '#!/usr/bin/env -i FOO=1 awk -f\n', '#!/bin/bash5\n', '#!\n', '#!/usr/bin/env\n', 'echo hi\n', '', '\n#!/usr/bin/env node\n', ' #!/usr/bin/env node\n', 'import "./x.js"\n', '#!/bin/sh\r\ngit x\r\n']) {
     assert.equal(binIsProgram(t), false, JSON.stringify(t));
   }
-  for (const t of ['#!/usr/bin/env node\n', '#!/usr/bin/node\n', '#!/usr/bin/env -S node --no-warnings\n', '#!/usr/bin/env -Snode --no-warnings\n', '#!/usr/bin/env --split-string=node -r x\n', '#!/usr/bin/env bun\n', '#!/usr/bin/env deno run\n', '#!/usr/bin/python3\n', '#!/usr/bin/env -S -u X python\n', '#!/bin/busybox awk -f\n', '#!/usr/bin/awk -f\n', '\u007fELF\u0002\u0001', 'abc\u0000def', '����\u0007\u0000']) {
+  for (const t of ['#!/usr/bin/env node\n', '#!/usr/bin/node\n', '#!/usr/bin/env -S node --no-warnings\n', '#!/usr/bin/env -Snode --no-warnings\n', '#!/usr/bin/env --split-string=node -r x\n', '#!/usr/bin/env bun\n', '#!/usr/bin/env deno run\n', '#!/usr/bin/python3\n', '#!/usr/bin/env -S -u X python\n', '#!/usr/bin/python3.11\n', '#!/usr/bin/env ruby\n', '#!/usr/bin/perl -w\n', '#!/usr/bin/env php\n', '#!/usr/bin/env tsx\n', '#!/usr/bin/env ts-node\n', '#!/usr/bin/env nodejs\n', '\u007fELF\u0002\u0001', 'abc\u0000def', '����\u0007\u0000']) {
     assert.equal(binIsProgram(t), true, JSON.stringify(t));
   }
   assert.equal(binIsProgram('x'.repeat(600) + '\u0000'), false, 'a NUL after the first 512 bytes is not the binary test');
@@ -104,6 +104,11 @@ test('npx of a program (a shebang naming another interpreter, or binary content)
   // a Mach-O file reads as replacement characters
   allowed('npx tool', { tool: (g) => `����\u0007\u0000\u0000\u0001${BAD[g]}` });
   // twins: the same words behind a shell shebang, no shebang, or a NUL after the first 512 bytes (text for a shell)
+  // an interpreter the guard does not know (awk, make, pwsh, an unknown name) is no program: its text is opened like a shell script
+  denied('npx tool', { tool: (g) => `#!/usr/bin/awk -f\n${BAD[g]}\n` });
+  denied('npx tool', { tool: (g) => `#!/usr/bin/env pwsh\n${BAD[g]}\n` });
+  denied('npx tool', { tool: (g) => `#!/usr/bin/env -S unknownlang\n${BAD[g]}\n` });
+  denied('npx tool', { tool: (g) => `#!/bin/busybox awk -f\n${BAD[g]}\n` });
   denied('npx tool', { tool: SH });
   denied('npx tool', { tool: NO_SHEBANG });
   denied('npx tool', { tool: (g) => `${'#'.repeat(600)}\u0000\n${BAD[g]}\n` });
