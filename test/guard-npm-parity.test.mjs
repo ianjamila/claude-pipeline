@@ -273,3 +273,23 @@ test('t2 (security) every script that gates a package-manager call is one of the
     for (const g of call.gate) assert.ok(call.names.includes(g), `${l}: gate script ${g} is not among the judged scripts ${call.names.join(',')}`);
   }
 });
+
+test('t2 (regression) an unmodelled command with a run-time argument is no known write of package.json (with a node_modules folder present)', () => {
+  // (the package.json itself holds words the guards mind -- a dependency called tailwind-merge, a note about install.md -- as real ones do: its own current text is no write)
+  const nm = { 'node_modules/.keep': '', 'package.json': JSON.stringify({ name: 'x', scripts: GOOD, dependencies: { ['tailwind-me' + 'rge']: '^3' }, note: 'see install.md' }) };
+  for (const pre of ['lsof -p $pid', '[ -n "$pid" ] && lsof -a -p $pid -d cwd -Fn | tail -1', 'lsof -p 12', 'kill $pid', 'ls $pid']) {
+    allowed(`${pre}; npm run build`, nm);
+    allowed(`${pre} && npm test`, nm);
+  }
+  // the plain script gets the same verdict
+  for (const pre of ['lsof -p $pid']) assert.equal(git(`${pre}; bash run.sh`, { ...tree(nm), ...PLAIN }).decision, 'allow');
+  // twins: a write that names the file, a redirect, tee, an inline writer with a guarded command and a mention
+  refused('cp evil.json package.json; npm run build', nm);
+  refused('lsof -p $pid > package.json; npm run build', nm);
+  refused('tee package.json < x; npm run build', nm);
+  refused('printf x | tee package.json; npm run build', nm);
+  refusedWithMention('lsof -p $pid; cp x $T; npm run build', nm);
+  refused(`printf '${PUSH} ${CL}' > $T; npm run build`, nm); // (a maybe-write whose own text holds a guarded word)
+  refused(`lsof -p $pid; printf '${PUSH} ${CL}' >> package.json; npm run build`, nm);
+  refused(`printf '${PUSH.slice(0, 2)}' > $T; printf '${PUSH.slice(2)} ${CL.slice(0, 4)}' >> $T; printf '${CL.slice(4)}' >> $T; npm run build`, nm); // (a guarded word built in pieces: only the joined text holds it)
+});

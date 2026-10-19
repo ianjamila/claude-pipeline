@@ -1632,9 +1632,10 @@ function pkgFileWritten(ctx, abs) {
   if (writtenTo(ctx.frames, abs, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: true })?.named) return 'known';
   const w = writtenTo(ctx.frames, abs, { exists: (x) => x === abs || ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: ctx.ignoreUnmodelled === true });
   if (!w) return null;
+  const now = ctx.readText(abs); // (what the file holds now is no write: a target only known at run time leaves it as it is, and its own words are not the line's)
   const sources = w.files.map((f) => ctx.readText(f)).filter((t) => typeof t === 'string');
   const dirs = [posix.dirname(abs)];
-  if ([...w.texts, ...w.joined, ...sources].some((t) => SENSITIVE_WORDS.test(t) || makeMatchers(ctx).rawHit(t, dirs))) return 'known';
+  if ([...w.texts, ...w.joined.filter((t) => t !== now), ...sources].some((t) => SENSITIVE_WORDS.test(t) || makeMatchers(ctx).rawHit(t, dirs))) return 'known';
   return w.unknown || w.pieces || w.authored || w.programs.length || w.scans.length || w.texts.length || sources.length ? 'maybe' : null;
 }
 // #81 t9: `npm run deploy`, `npm test`, `pnpm ship`, `yarn run x`, `bun run x` run the text package.json holds for the script (and its pre / post hooks, with the words after `--` appended), in the
