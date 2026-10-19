@@ -23,7 +23,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { run as realRun, findOnPosixPath } from '../proc.mjs';
 import { acquire as realAcquire, release as realRelease, LockTimeoutError } from '../locks.mjs';
-import { loadMachineConfig, loadModes, isPaused } from './config.mjs';
+import { loadMachineConfig, loadModes, isPaused, isShared } from './config.mjs';
 import { stacksSeam, stackFiles, lockDirs, projectLockName } from './paths.mjs';
 import { checkBinding } from './decide.mjs';
 
@@ -180,7 +180,10 @@ async function stopStackLocked({
     await beforeMutate?.();
     const blockers = [];
     if (isPaused(files.pause)) blockers.push('paused');
-    if (loadMachineConfig(files.config, { home }).status !== 'ok') blockers.push('not configured');
+    // The config is judged as it is NOW: a stack the owner added to `shared` since the assessment must not be stopped.
+    const freshCfg = loadMachineConfig(files.config, { home });
+    if (freshCfg.status !== 'ok') blockers.push('not configured');
+    else if (isShared({ project: stack.project, workdir: workdirReal }, freshCfg)) blockers.push('shared');
     const fileMode = loadModes(files.mode)[modeKey];
     if (blockers.length) return kept(...blockers);
     if (mode !== 'apply') return done('would-stop', ['mode report'], { workdir: workdirReal, dbVolume });

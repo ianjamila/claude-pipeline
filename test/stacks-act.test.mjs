@@ -502,3 +502,13 @@ test('resolveSupabase: seam honoured only for an isolated root; PATH then fallba
     rmSync(base, { recursive: true, force: true });
   }
 });
+
+// R1-B1: a stack that became shared (config `shared` list) after the assessment is kept, judged on the freshly loaded config.
+test('fresh gate: the stack joins the config `shared` list between reassess and the call => kept (shared), no supabase call', async () => {
+  const w = makeWorld();
+  await check(w, { beforeMutate: () => writeFileSync(w.files.config, JSON.stringify({ shared: ['Alpha'] })) }, (r) => {
+    assert.equal(r.action, 'kept');
+    assert.deepEqual(r.reasons, ['shared']);
+    assert.equal(w.supabaseCalls.length, 0);
+  });
+});
