@@ -1144,7 +1144,23 @@ function pwshReadOnly(argv) {
 // #81 t11: gh commands that print and write no local file (`gh api URL`, `gh pr view N`, `gh run watch` ...): a name of unknown value in their words (`sha=$SHA`) names no path.
 // `gh run download`, `gh release download`, `gh pr checkout`, `gh repo clone` write local files and are not listed.
 const GH_PRINTERS = { pr: ['view', 'checks', 'list', 'diff', 'status'], run: ['view', 'list', 'watch'], issue: ['view', 'list', 'status'], repo: ['view'], auth: ['status'], workflow: ['list', 'view'], release: ['list', 'view'], label: ['list'] };
-function ghReadOnly(args) {
+// ... and only when nothing on the line can make gh run another program: gh starts a pager (GH_PAGER, PAGER, its config) and a browser (--web, GH_BROWSER, BROWSER), reads another configuration
+// (GH_CONFIG_DIR, XDG_CONFIG_HOME) and runs aliases and extensions. So the list applies only for an exact builtin pair, with no such variable set, exported or prefixed on the line (or by a sourced file or an
+// unknown mover), no --web / -w, and no `gh config|alias|extension` on the line; otherwise the command is judged as before (a writer). A pager or browser the user's OWN configuration holds is outside the
+// line's control, as for every command here (residual, same as main).
+const GH_ENV = /^(?:GH_|GITHUB_|PAGER$|MANPAGER$|BROWSER$|XDG_|HOME$|LESS)/i;
+const GH_ENV_TEXT = /(?:^|[\s;&|(`])(?:GH_|GITHUB_|XDG_)[A-Z0-9_]*\s*[+]?=|(?:^|[\s;&|(`])(?:PAGER|MANPAGER|BROWSER|HOME|LESS)\s*[+]?=|\b(?:GH_|GITHUB_|XDG_)[A-Z0-9_]*\b|\$\{?[A-Za-z_]\w*\}?\s*=/;
+const GH_CONFIGURES = /\bgh\s+(?:-\S+\s+)*(?:config|alias|extension|ext)\b/i;
+function ghEnvTouched(cmd, ctx) {
+  if (ctx.unknownAll) return true;
+  const names = [...Object.keys(cmd.env ?? {}), ...Object.keys(ctx.vars ?? {}), ...(ctx.unknownVars ?? []), ...(ctx.pickUnknown ?? []), ...(ctx.srcChanged ?? []), ...(ctx.srcTouched ?? []), ...(ctx.assigned?.keys?.() ?? [])];
+  if (names.some((n) => GH_ENV.test(n))) return true;
+  const line = ctx.ghLine ?? '';
+  return GH_ENV_TEXT.test(line) || GH_CONFIGURES.test(line);
+}
+function ghReadOnly(args, cmd, ctx) {
+  if (args.some((a) => a === '--web' || a.startsWith('--web=') || /^-[A-Za-z]*w[A-Za-z]*$/.test(a))) return false;
+  if (ghEnvTouched(cmd, ctx)) return false;
   const words = [];
   for (let i = 0; i < args.length && words.length < 2; i++) {
     const a = args[i];
@@ -1164,7 +1180,7 @@ function isReadOnly(cmd, ctx) {
   if (READ_ONLY.has(name)) return !(name === 'rg' && args.some((a) => a === '--pre' || a.startsWith('--pre=')));
   if (name === 'find') return !args.some((a) => FIND_UNSAFE.test(a));
   if (name === 'git') return gitReadOnly(args);
-  if (name === 'gh') return ghReadOnly(args);
+  if (name === 'gh') return ghReadOnly(args, cmd, ctx);
   if (name === 'jq') return !args.some((a) => /^-[A-Za-z]*i/.test(a) || a === '--in-place');
   if (name === 'sed' || name === 'gsed') return sedReadOnly(args);
   if (name === 'awk' || name === 'gawk' || name === 'mawk' || name === 'nawk') return awkReadOnly(args, cmd.env);
@@ -2301,6 +2317,7 @@ function evaluateBashForFilesFrame(command, opts) {
   if (opts._assignPins && opts._assignPins.text === command) ctx.assignPins = opts._assignPins.pins; // (this text's assignment readings, see assignReadings)
   if (opts._loopPins && opts._loopPins.text === command) ctx.loopPins = opts._loopPins.pins; // (this text's loop readings; see evaluateBashForFilesUnchecked)
   ctx.lineDefs = definedNames(typeof command === 'string' ? command : '');
+  ctx.ghLine = typeof command === 'string' ? command : ''; // (ghReadOnly: what the line says about gh's variables and configuration)
   ctx.assigned = assigningDefaults(typeof command === 'string' ? command : ''); // (and those of the line this text was made from: `: ${X:=w}; G=bash; $G $X`)
   for (const [n, ws] of opts._assigned ?? []) ctx.assigned.set(n, [...(ctx.assigned.get(n) ?? []), ...ws]);
   opts = { ...opts, _selfZero: null, _selfBash: null, _selfAbs: false, _selfZsh: false }; // (only the script file judged right now has a $0; text it runs or reads has none)

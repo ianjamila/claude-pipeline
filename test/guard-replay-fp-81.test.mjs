@@ -71,10 +71,12 @@ test('K2 git commit -qm / -am / -qam TEXT hides TEXT like -m TEXT; a word outsid
     }
   }
   // ... the clustered spelling is a git commit's: another command's words after a flag that merely ends in m are not a message
-  for (const c of [`ssh -vm hmac-sha2 "git ${PUSH} origin ${MAIN}"`, `sh -nzm x "git ${PUSH} origin ${MAIN}"`, `bash -qm "git ${PUSH} origin ${MAIN}"`]) {
+  for (const c of [`ssh -vm hmac-sha2 "git ${PUSH} origin ${MAIN}"`, `sh -nzm x "git ${PUSH} origin ${MAIN}"`, `bash -qm "git ${PUSH} origin ${MAIN}"`, `foo -qm'x; git ${PUSH} origin ${MAIN}'`, `foo -vm'x; git ${PUSH} origin ${MAIN}'`]) {
     assert.equal(gitGuard(c).decision, 'deny', `${c} -> allowed`);
     assert.equal(gitGuard(FETCH + c).decision, 'deny', `${FETCH}${c} -> allowed`);
   }
+  // ... and another git subcommand does not read the cluster as -m: `git log -qm TEXT` hides nothing
+  for (const c of [`git log -qm ${PUSH}`, `git log -vm ${MERGE}`, `git diff -qam ${PUSH}`]) assert.equal(gitGuard(FETCH + c).decision, 'deny', `${c} -> allowed`);
   for (const c of [`git commit -qm "x" ${MERGE}`, `git commit -qm x; echo ${MERGE}`, `git commit -qam "x" -- ${PUSH}.txt`, `git commit -qa ${MERGE}`, `git commit -qm x && git ${PUSH}`, `git commit -qmx ${MERGE}`]) {
     const r = gitGuard(FETCH + c);
     assert.equal(r.decision, 'deny', `${c} -> allowed`);
@@ -131,5 +133,20 @@ test('K1 caps: a line padded past the scan caps still judges the script a comput
   assert.equal(gitWithScripts(SCRIPT_TWIN).decision, 'deny');
   for (const [name, pad] of Object.entries(PADS)) {
     for (const c of [pad + SCRIPT_TWIN, SCRIPT_TWIN + '; ' + pad]) assert.equal(gitWithScripts(c).decision, 'deny', `${name}: allowed`);
+  }
+});
+
+// ---- K4 escapes: a "read-only" gh runs the pager / browser / alias / extension the environment or configuration names ------------------------------------------------------
+// (security review of #81 K4) `GH_PAGER='cp a ~/.claude/settings.json' gh pr view 1` runs the pager. The exemption holds only for an exact builtin pair with no gh / pager / browser / config variable
+// set, exported or prefixed on the line, no --web, and no `gh config|alias|extension` on the line. (A pager the user's own gh configuration holds is outside the line's control, as on main.)
+test('K4 a gh command with a pager, browser, configuration, alias or extension in play is no read-only command', () => {
+  const M = 'M=$(gh pr view 296 --json state -q .state); SHA=${M#* }; ';
+  const PAGER = `'sh -c x'`; // (a pager is a program: the line below names no protected path, so only gh being no "read-only" command can refuse it)
+  for (const cmd of [`GH_PAGER=${PAGER} gh pr view $SHA`, `PAGER=${PAGER} gh pr view $SHA`, `GH_BROWSER=${PAGER} gh pr view $SHA --web`, `BROWSER=${PAGER} gh pr view $SHA -w`, `gh pr view $SHA --web`, `gh pr view -w $SHA`,
+    `export GH_PAGER=${PAGER}; gh pr view $SHA`, `GH_PAGER=${PAGER}; export GH_PAGER; gh pr view $SHA`, `declare -x PAGER=${PAGER}; gh pr view $SHA`, `N=GH_PAGER; export $N=${PAGER}; gh pr view $SHA`,
+    `gh config set pager ${PAGER}; gh pr view $SHA`, `gh config set browser x; gh pr view $SHA`, `gh alias set v ${PAGER}; gh pr view $SHA`, `gh extension install o/r; gh pr view $SHA`,
+    `GH_CONFIG_DIR=/tmp/x gh pr view $SHA`, `XDG_CONFIG_HOME=/tmp/x gh api repos/o/r/$SHA`, `export XDG_CONFIG_HOME=/tmp/x; gh run view $SHA`, `HOME=/tmp/x gh pr checks $SHA`, `gh v $SHA`, `gh my-ext $SHA`]) {
+    const r = filesGuard(M + cmd);
+    assert.equal(r.decision, 'deny', `${cmd}: allowed`);
   }
 });
