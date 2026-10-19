@@ -1598,7 +1598,8 @@ const VAR_DECLS = new Set(['export', 'declare', 'typeset', 'local', 'readonly'])
 const ARITH_OP = String.raw`(?:\*\*|<<|>>|&&|\|\||\^\^|[-+*/%&|^])?`;
 const ARITH_ASSIGNED = new RegExp(String.raw`(?<![\w$.])([A-Za-z_]\w*)\s*(?:\[[^\]]{0,64}\]\s*)?${ARITH_OP}=(?!=)|(?<![\w$.])([A-Za-z_]\w*)\s*(?:\[[^\]]{0,64}\]\s*)?(?:\+\+|--)|(?:\+\+|--)\s*([A-Za-z_]\w*)|(?<![\w$.])([A-Za-z_]\w*)\s*\[`, 'g');
 const ARITH_ASSIGNED_DYN = new RegExp(String.raw`\$(?:\{[^}]{0,64}\}|\w+)\s*(?:\[[^\]]{0,64}\]\s*)?(?:${ARITH_OP}=(?!=)|\+\+|--)|(?:\+\+|--)\s*\$|\$\w+\s*\[`);
-const ARITH_COMPARE = new Set(['-eq', '-ne', '-lt', '-le', '-gt', '-ge']);
+const SUBSCRIPT_BUDGET = 1_000_000; // characters of subscript bodies read per text (see arithBodies)
+const ARITH_COMPARE =new Set(['-eq', '-ne', '-lt', '-le', '-gt', '-ge']);
 const ARITH_APPENDED = /(?<![\w$.\/-])([A-Za-z_]\w*)\+=/g;
 const ARITH_WORD = /(?:"[^"]*"|'[^']*'|\\.|[^\s"'\\])+/g;
 function arithBodies(s, g, cmds) {
@@ -1637,6 +1638,10 @@ function arithBodies(s, g, cmds) {
     prev = w;
   }
   // a subscript: `[` right after a name character or `}` (`${a[…]}`, `a[…]=x`, `$x[…]`), to its closing `]` (nested ones counted; at most 200 characters)
+  // (Bounded: nested or unclosed subscripts overlap -- `a[a[a[…` gives one 200-character body per `[`, 20 million characters for a 200 kB line, ~100 times what the other scans cost on that line, and
+  // a hook that runs past the host's 15 s is ALLOWED. Past SUBSCRIPT_BUDGET characters of bodies the scan stops and `out.capped` is set: arithAssignedNames then answers `dynamic`, the fail-closed
+  // reading (every name the line gave is unsure), never fewer names than the full scan.)
+  let spent = 0;
   for (let i = g.indexOf('['); i >= 0; i = g.indexOf('[', i + 1)) {
     if (i === 0 || !/[\w}]/.test(g[i - 1])) continue;
     let depth = 0;
@@ -1645,6 +1650,8 @@ function arithBodies(s, g, cmds) {
       if (g[j] === '[') depth++;
       else if (g[j] === ']') { if (depth === 0) break; depth--; }
     }
+    spent += j - i;
+    if (spent > SUBSCRIPT_BUDGET) { out.capped = true; break; }
     out.push(g.slice(i + 1, j));
   }
   // (zsh reads a bare `$x[n=3]` as a subscript also inside double quotes, where `g` has blanked the letters: the text as written)
@@ -1718,7 +1725,9 @@ export function arithAssignedNames(raw, cmds = null) {
   if (/\(\(|\$\[|\[|\+=|\$\{\w+:|(?<![\w.$/-])let\s/.test(text)) {
     const s = quotedBodiesBlank(text, cmds);
     const g = expansionText(s, cmds);
-    for (const body of arithBodies(s, g, cmds)) {
+    const bodies = arithBodies(s, g, cmds);
+    if (bodies.capped) dynamic = true; // (too many overlapping subscripts to read them all: the fail-closed reading, see the cap in arithBodies)
+    for (const body of bodies) {
       for (const m of body.matchAll(ARITH_ASSIGNED)) names.add(m[1] ?? m[2] ?? m[3] ?? m[4]);
       if (ARITH_ASSIGNED_DYN.test(body)) dynamic = true;
     }
