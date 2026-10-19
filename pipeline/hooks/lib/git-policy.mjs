@@ -397,30 +397,35 @@ const SETS_BY_NAME = /\b(?:eval|read|mapfile|readarray|getopts|source)\b|\bprint
 // Both the text as written and with its quotes and backslashes removed (`printf -vI""FS ,` spells the name only once they are gone).
 // Why (#81 Codex R1-B1 follow-up): a script the guard opens is judged with its own text too -- `bash wrapper.sh` hid `declare -n r=IFS; r=x` from the outer line. Whole-line comments are left out of
 // the binder test only (a comment that says "read" is no binder); the name IFS anywhere, a comment included, still counts.
-// A line is left out only when the shell reads it as a comment: it starts (after blanks) with `#` and no quote, backtick, `$( )` or backslash-newline is open from the lines before it. A heredoc
-// anywhere (`<<`, not `<<<`) leaves everything in (its body is text of any shape). Where this scan is unsure it keeps the line: more text tested, never less.
-// Defensive (mutation check): the heredoc exit and the `$( )` depth only keep MORE lines; a heredoc body is judged as a script of its own, and bash reads a `#` line inside `$( )` as a comment too.
+// A line is left out only when the scan is CERTAIN it is a comment line: its first non-blank character is `#` and nothing is open from the lines before it (a quote, a backtick, `$( )`, `${ }`, a
+// backslash-newline). A line is dropped whole or kept whole, never cut: a `#` in the middle of a line is read by no rule here (an escaped blank, `\ #`, makes it a word, a quote may hide it),
+// so the first such `#`, any `$'` / `$"`, or a heredoc (`<<`, not `<<<`) makes the scan unsure and every line from there on is kept. Unsure means more text tested, never less; the cost is a
+// refusal where a script has a trailing comment that says `read` (documented in the tests).
+// Defensive (mutation check): the heredoc exit, the `$( )` depth and the `${ }` depth only keep MORE lines; a heredoc body is judged as a script of its own, bash reads a `#` line inside `$( )` as a comment too, and the text of a `${x:-word}` is data, not a command.
 function withoutCommentLines(s) {
   if (/<<(?!<)/.test(s)) return s;
   const out = [];
-  let sq = false, dq = false, bt = false, depth = 0, cont = false;
+  let sq = false, dq = false, bt = false, depth = 0, braces = 0, cont = false, unsure = false;
   for (const line of s.split('\n')) {
-    if (!cont && !sq && !dq && !bt && depth === 0 && /^\s*#/.test(line)) continue;
-    let kept = line;
+    if (!unsure && !cont && !sq && !dq && !bt && depth === 0 && braces === 0 && /^\s*#/.test(line)) continue;
+    out.push(line);
+    if (unsure) continue;
     let esc = false;
-    for (let i = 0; i < line.length; i++) {
+    for (let i = 0; i < line.length && !unsure; i++) {
       const c = line[i];
       if (esc) { esc = false; continue; }
       if (sq) { if (c === "'") sq = false; continue; }
       if (c === '\\') { esc = true; continue; }
+      if (c === '$' && (line[i + 1] === "'" || line[i + 1] === '"')) { unsure = true; continue; }
       if (c === "'" && !dq) { sq = true; continue; }
       if (c === '"') { dq = !dq; continue; }
       if (c === '`') { bt = !bt; continue; }
       if (c === '$' && line[i + 1] === '(') { depth++; continue; }
+      if (c === '$' && line[i + 1] === '{') { braces++; continue; }
       if (c === ')' && depth > 0) { depth--; continue; }
-      if (c === '#' && !dq && !bt && (i === 0 ? !cont : /[\s;&|(]/.test(line[i - 1]))) { kept = line.slice(0, i); esc = false; break; } // (the rest of the line is a comment)
+      if (c === '}' && braces > 0) { braces--; continue; }
+      if (c === '#' && !dq && (i === 0 || /[\s;&|()]/.test(line[i - 1]))) unsure = true; // (a comment, or a word that only looks like one: not told apart)
     }
-    out.push(kept);
     cont = esc;
   }
   return out.join('\n');

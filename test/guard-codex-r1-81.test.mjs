@@ -172,7 +172,7 @@ test('R1-B1 IFS: a `#` line inside a multi-line quote is no comment; real commen
   denyGit('bash wrapper.sh', { ...gitFiles(BAD_GIT), 'wrapper.sh': `echo a \\\n# b\n${hid}\n${PUSH_B}` });
   denyGit('bash wrapper.sh', { ...gitFiles(BAD_GIT), 'wrapper.sh': `echo "it's"\n# x\necho \`a\n#\`; ${hid}\n${PUSH_B}` });
   // real comments (after closed quotes, after a comment that holds a quote) are still left out
-  allowGit('bash wrapper.sh', { ...gitFiles(BAD_GIT), 'wrapper.sh': `echo "a b"\n# read the plan\necho 'x' # don't read\n# eval it\n${PUSH_B}` });
+  allowGit('bash wrapper.sh', { ...gitFiles(BAD_GIT), 'wrapper.sh': `echo "a b"\n# read the plan\necho 'x'\n# eval it\n${PUSH_B}` });
   allowGit('bash wrapper.sh', { ...gitFiles(BAD_GIT), 'wrapper.sh': `echo "a\nb"\n# read the plan\n${PUSH_B}` });
 });
 
@@ -184,4 +184,23 @@ test('R1-B1 IFS: the comment scan follows escapes, continuations and apostrophes
   // an apostrophe inside double quotes, or escaped, opens no single quote: the comment lines after it are still comments
   allowGit('bash wrapper.sh', { ...gitFiles(BAD_GIT), 'wrapper.sh': `echo "it's"\n# read the plan\n${PUSH_B}` });
   allowGit('bash wrapper.sh', { ...gitFiles(BAD_GIT), 'wrapper.sh': `echo it\\'s\n# read the plan\n${PUSH_B}` });
+});
+
+// ---- Codex R3-B1: close the class -- a line is dropped whole or kept whole, and only when it is certainly a comment line ---------------------------------------
+test('R3-B1 IFS: a # in the middle of a line is read by no rule; a line is dropped only when certainly a whole-line comment', () => {
+  const hid = 'N=IF; N=${N}S; declare -n r=$N; r=x';
+  const W = (body) => ({ ...gitFiles(BAD_GIT), 'wrapper.sh': body });
+  // Codex's repro: an escaped blank (or tab) makes `#` a word, so the setter after it runs
+  denyGit('bash wrapper.sh', W(`echo \\ #; ${hid}\n${PUSH_B}`));
+  denyGit('bash wrapper.sh', W(`echo \\\t#; ${hid}\n${PUSH_B}`));
+  denyGit('bash wrapper.sh', W(`echo a#b; echo \\ #\n${hid}\n${PUSH_B}`));
+  // an open `${ }` makes the next `#` line part of the word
+  denyGit('bash wrapper.sh', W(`echo \${x:-a\n#"; ${hid}\n}\n${PUSH_B}`));
+  // a comment in the middle of a line that hid a quote cannot unbalance the scan into dropping a string's line
+  denyGit('bash wrapper.sh', W(`echo hi # say "x\necho "a\n#"; ${hid}\n${PUSH_B}`));
+  denyGit('bash wrapper.sh', W(`echo $'a\\'b\n#'; ${hid}\n${PUSH_B}`));
+  // documented false positive: a trailing comment that says `read` is tested like code
+  denyGit('bash wrapper.sh', W(`echo x # read the plan\n${PUSH_B}`));
+  // whole-line comments (also indented, also after a closed `${ }` and `$( )`) stay out
+  allowGit('bash wrapper.sh', W(`x=\${y:-a}\nz=$(echo b)\n  # read the plan\n# eval it\n${PUSH_B}`));
 });
