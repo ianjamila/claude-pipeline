@@ -758,3 +758,31 @@ export function localBin(name, env) {
   }
   return null;
 }
+
+// Is a node_modules/.bin file a program (not opened as a shell script) or a shell script (opened)? Decided ONLY by the first bytes, as the system does: the kernel picks the interpreter from
+// a `#!` line and nothing else, and a file without one fails execve (ENOEXEC) and is run by `sh` (npm / npx spawn bins through the script shell). So the extension (.js ...) and the
+// place a link leads to are never a reason. A shebang naming a shell (sh bash dash zsh ksh ash, `busybox sh`, `env [-S] bash -e`) or none at all: a shell script. A shebang naming anything
+// else (node, bun, deno, python ...): a program. Binary content (ELF or Mach-O magic, a NUL byte in the first 512): a program. An unreadable file is not decided here (the caller opens it).
+const SHELL_BASENAME = /sh[\d.]*$/;
+export function binIsProgram(text) {
+  if (typeof text !== 'string') return false;
+  if (text.startsWith('#!')) {
+    const tokens = text.slice(2).split(/\r?\n/, 1)[0].trim().split(/\s+/).filter(Boolean);
+    const nm = (w) => nodePath.posix.basename(String(w ?? '').replaceAll('\\', '/'));
+    let i = 0;
+    if (nm(tokens[0]) === 'env') {
+      for (i = 1; i < tokens.length; i++) {
+        const t = tokens[i];
+        if (/^-[uC]$|^--(?:unset|chdir)$/.test(t)) i++; // options with a value
+        else if (/^--split-string=./.test(t)) { tokens[i] = t.slice(15); break; }
+        else if (/^-S./.test(t)) { tokens[i] = t.slice(2); break; } // `-Sbash -e`
+        else if (!t.startsWith('-') && !/^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(t)) break;
+      }
+    }
+    const prog = nm(tokens[i]);
+    if (prog === '') return false; // `#!` with nothing: execve fails and sh runs it
+    if (prog === 'busybox') return tokens[i + 1] !== undefined && !SHELL_BASENAME.test(nm(tokens[i + 1]));
+    return !SHELL_BASENAME.test(prog);
+  }
+  return text.slice(0, 512).includes('\u0000') || text.startsWith('\u007fELF') || text.startsWith('��');
+}

@@ -17,7 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
 export { withoutLiteralText, INDIRECT_EXPANSION };
-import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs } from './package-scripts.mjs';
+import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram } from './package-scripts.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit } from './script-candidates.mjs';
@@ -1239,7 +1239,7 @@ function judgeScriptText(text, sf, abs, dir, ctx, level) {
   if (sf.kind === 'sql') return judgeSqlEscapes(sqlShellEscapes(text, { family: sf.family, sources: [abs] }), sf, dir, ctx, level);
   let kind = sf.kind;
   if (kind === 'exec') {
-    if (text.slice(0, 4096).includes('\u0000')) return null; // a binary
+    if (!text.startsWith('#!') && text.slice(0, 512).includes('\u0000')) return null; // a binary (the test binIsProgram uses: a shebang line makes it a script whatever follows)
     const prog = SHEBANG_PROGRAM.exec(text)?.[1] ?? '';
     kind = /^(?:node|nodejs|deno|bun|tsx|ts-node|python[\d.]*|ruby|perl|php)$/.test(prog.split('/').pop()) ? 'interp' : 'shell';
     // Why: the kernel starts the shebang's shell, which reads the startup files its options ask for (`#!/bin/bash -l`, `#!/bin/zsh`): judged like `bash -l f` / `zsh f`
@@ -1307,8 +1307,15 @@ function packageScriptVerdict(argv, dir, ctx, level) {
   const marked = pkgMarkersFor(ctx.budget, pmStartDirs(call, [dir], ctx.home, path), { pathExists: ctx.pathExists, real: (q) => realLocation(ctx.realpath, q), p: path });
   if (marked === 'known' || (marked === 'maybe' && lineMentionsGuarded(ctx))) return deny(MARKERS_MSG(said, marked));
   for (const run of plan.runs ?? []) {
-    const v = judgeScriptText(run.text, { kind: 'shell', file: run.label }, run.file, run.dir, ctx, level);
-    if (v) return v;
+    // (the manager puts every node_modules/.bin from the package's directory upward on the PATH of the script's commands: a bare command name in it may be one of those bins)
+    const outerBinDir = ctx.scriptBinDir;
+    ctx.scriptBinDir = run.dir;
+    try {
+      const v = judgeScriptText(run.text, { kind: 'shell', file: run.label }, run.file, run.dir, ctx, level);
+      if (v) return v;
+    } finally {
+      ctx.scriptBinDir = outerBinDir;
+    }
   }
   // (yarn / pnpm / bun NAME with no script of that name run node_modules/.bin/NAME)
   if (call.bin && !(plan.runs ?? []).some((r) => r.name === call.main)) return binVerdict(call.bin, dir, ctx, level);
@@ -1318,35 +1325,41 @@ function packageScriptVerdict(argv, dir, ctx, level) {
 // #81 t9: `npx tool`, `npm exec tool`, `pnpm exec tool`, `yarn tool`: a bare name is the bin node_modules/.bin/tool of the nearest directory that has one; when that is a shell script it is judged like `./tool`.
 // (A program in another language, the usual bin, is not opened: checkScriptFile leaves node_modules programs alone, and a path word is already judged as a program run by path.)
 // An install earlier on the line may add the bin: refused when the line mentions a guarded operation, as for any file that only exists at run time.
-// #89 t2: a bin that is a program in another language (a node shebang, a .js / .mjs / .cjs file or a link to one: vitest, tsc, eslint ...) is none of the shell's. The text a heredoc appends to some other
+// #89 t2: a bin that is a program in another language (a node shebang: vitest, tsc, eslint ...) is none of the shell's. The text a heredoc appends to some other
 // file, or a copy back from a backup, is not what it runs, so only a write the guard places on the bin itself (the line replacing the program) is judged.
-function isProgramBin(bin, ctx) {
+// What decides is the file's first bytes alone (binIsProgram): the extension and the target of a link never do, as a file without a shebang is run by sh.
+// 'open': a shell script (or one that cannot be read, which checkScriptFile refuses or sizes up); 'program': not opened.
+function binKind(bin, ctx) {
   const text = ctx.readText(bin);
-  if (typeof text !== 'string') return false;
-  if (text.slice(0, 4096).includes('\u0000')) return true;
-  const prog = SHEBANG_PROGRAM.exec(text)?.[1];
-  if (prog !== undefined) return /^(?:node|nodejs|deno|bun|tsx|ts-node|python[\d.]*|ruby|perl|php)$/.test(prog.split('/').pop());
-  return /\.[cm]?js$/i.test(realLocation(ctx.realpath, bin) ?? bin);
+  if (typeof text === 'string') return binIsProgram(text) ? 'program' : 'open';
+  if (!ctx.pathExists(bin) || ctx.readDir(bin)) return 'open'; // (missing: the line's own write is judged by checkScriptFile)
+  const head = ctx.readHead(bin);
+  if (typeof head !== 'string') return 'unreadable';
+  return binIsProgram(head) ? 'program' : 'open';
 }
-function binVerdict(name, dir, ctx, level) {
+// `quiet`: the lookup of a command inside a package script (PATH has node_modules/.bin): a name with no bin there is an ordinary command, nothing to refuse
+function binVerdict(name, dir, ctx, level, quiet = false) {
   // (a bin is a program file like a script: the plain-script reading of what the line writes, a missing one included)
-  const written = (abs) => (writtenTo(ctx.writeFrames, abs, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: true }) ? 'known' : writtenTo(ctx.writeFrames, abs, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: ctx.ignoreUnmodelled === true }) ? 'maybe' : null);
+  // (quiet: every command word of a script is looked up, so only a write that certainly puts a bin there counts, not one that may)
+  const written = (abs) => (writtenTo(ctx.writeFrames, abs, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: true }) ? 'known' : !quiet && writtenTo(ctx.writeFrames, abs, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: ctx.ignoreUnmodelled === true }) ? 'maybe' : null);
   const maybes = [];
   const bin = localBin(name, { cwd: dir, pathExists: ctx.pathExists, p: path, written, onMaybe: (f) => maybes.push(f) });
   for (const m of maybes) { // (a bin the line may write: judged on what it may hold, and refused when the line mentions a guarded operation)
     const v = checkScriptFile({ kind: 'exec', file: m, candidate: true }, dir, ctx, level);
     if (v) return v;
   }
-  if (bin && isProgramBin(bin, ctx)) {
+  const kind = bin ? binKind(bin, ctx) : null;
+  if (kind === 'program') {
     const w = writtenTo(ctx.writeFrames, bin, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: true });
     return w ? judgeWrittenScript(w, { kind: 'exec', file: bin, candidate: true }, bin, dir, ctx, level) : null;
   }
+  if (kind === 'unreadable') return deny(`cannot read node_modules/.bin/${name} (${bin}: missing permission), so whether it is a shell script and what it runs cannot be verified.`);
   if (bin) return checkScriptFile({ kind: 'exec', file: bin, candidate: true }, dir, ctx, level);
-  return ctx.budget.pkgBinsDirty && lineMentionsGuarded(ctx) ? deny(`package script: an earlier install on the line may add node_modules/.bin/${name}, and the line mentions a guarded operation, so what it runs cannot be verified. Run the install in a command of its own.`) : null;
+  return !quiet && ctx.budget.pkgBinsDirty && lineMentionsGuarded(ctx) ? deny(`package script: an earlier install on the line may add node_modules/.bin/${name}, and the line mentions a guarded operation, so what it runs cannot be verified. Run the install in a command of its own.`) : null;
 }
-function runnerBinVerdict(argv, dir, ctx, level) {
+function runnerBinVerdict(argv, dir, ctx, level, quiet = false) {
   const name = expandVars(argv[0], ctx);
-  return name.includes('/') ? null : binVerdict(name, dir, ctx, level);
+  return name.includes('/') ? null : binVerdict(name, dir, ctx, level, quiet);
 }
 
 function judgeSqlEscapes(escapes, sf, dir, ctx, level) {
@@ -2609,6 +2622,8 @@ function evalString(str, startDir, ctx, level, child = false) {
       // (npm exec NAME / npx NAME: the parser unwraps them to `NAME …`, marked viaRunner. NAME is a bin, never a script, but it is judged as the merge script when it carries that name: `npx npm run NAME`)
       if (!verdict && c.viaRunner) verdict = withPrefixEnv(c, ctx, () => repoMergeCommandVerdict(['npx', 'npm', 'run', argv[0]], dir, ctx));
       if (!verdict && c.viaRunner) verdict = runnerBinVerdict(argv, dir, ctx, level);
+      // (a bare command name in a package script: node_modules/.bin/NAME of the package's directory or above it comes first on the PATH; none there = an ordinary command)
+      if (!verdict && !c.viaRunner && (typeof ctx.scriptBinDir === 'string' || (c.binPath && dir !== null))) verdict = runnerBinVerdict(argv, typeof ctx.scriptBinDir === 'string' ? ctx.scriptBinDir : dir, ctx, level, true);
       if (!verdict) verdict = withPrefixEnv(c, ctx, () => packageScriptVerdict(argv, dir, ctx, level)); // (#81 t9: `npm run NAME` runs the text package.json holds for NAME)
       if (!verdict) {
         // a string or program text the parser cannot unwrap (node -e, osascript, make CMD=...) that carries a guarded command

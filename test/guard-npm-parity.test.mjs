@@ -229,11 +229,11 @@ test('t2 npx of a bin that is a program in another language is not opened as a s
     assert.equal(g.decision, 'allow', `git: ${cmd.slice(0, 60)} -> ${g.reason}`);
     assert.equal(filesGuard(cmd, tree(bin)).decision, 'allow', `files: ${cmd.slice(0, 60)}`);
   }
-  // a link to a .mjs file without a shebang line is a program too (its text is JavaScript, whatever it looks like to a shell); the same text behind a link to a shell script is not
+  // a bin without a shebang line is run by sh, whatever it is called or leads to (the kernel looks at the first bytes only: ENOEXEC, then sh): a link to a .mjs file is opened as a shell script (test/guard-npm-bins.test.mjs)
   const toMjs = (p) => (p.endsWith('.bin/vitest') ? p.replace(/node_modules\/.bin\/vitest$/, 'node_modules/vitest/vitest.mjs') : p);
-  assert.equal(git('npx vitest run x', tree({ 'node_modules/.bin/vitest': `${BAD_GIT}\n` }), { realpath: toMjs }).decision, 'allow');
+  assert.equal(git('npx vitest run x', tree({ 'node_modules/.bin/vitest': `${BAD_GIT}\n` }), { realpath: toMjs }).decision, 'deny');
   assert.equal(git('npx vitest run x', tree({ 'node_modules/.bin/vitest': `${BAD_GIT}\n` })).decision, 'deny');
-  assert.equal(filesGuard('npx vitest run x', tree({ 'node_modules/.bin/vitest': `${BAD_FILES}\n` }), { realpath: (p) => toMjs(p).replace('/work/repo', PROJ) }).decision, 'allow');
+  assert.equal(filesGuard('npx vitest run x', tree({ 'node_modules/.bin/vitest': `${BAD_FILES}\n` }), { realpath: (p) => toMjs(p).replace('/work/repo', PROJ) }).decision, 'deny');
   assert.equal(filesGuard('npx vitest run x', tree({ 'node_modules/.bin/vitest': `${BAD_FILES}\n` })).decision, 'deny');
   // twins: a shell-script bin with a guarded command; a bin the line replaces with one; a shell bin that is also rewritten by a loose write
   assert.equal(git('npx vitest run x', tree({ 'node_modules/.bin/vitest': `#!/bin/sh\n${BAD_GIT}\n` })).decision, 'deny');

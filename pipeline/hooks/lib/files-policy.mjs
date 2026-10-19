@@ -16,7 +16,7 @@
 // ancestor process); commands that unset or override CLAUDECODE are denied here.
 import fs from 'node:fs';
 import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
-import { pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs } from './package-scripts.mjs';
+import { pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram } from './package-scripts.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
@@ -1665,7 +1665,8 @@ function judgePackageScripts(c, dirs, ctx, opts, scanRaw = '') {
       if (seen.has(key)) continue;
       seen.add(key);
       // (#89 t3: `npm explore PKG -- bash run.sh` runs a file inside node_modules on purpose: that package's files are judged, which a program run by path in node_modules otherwise is not)
-      const r = judgeScriptText(run.text, { kind: 'shell', file: run.label }, run.file, run.dir, ctx, run.pkgDir ? { ...opts, _pkgDir: run.pkgDir } : opts);
+      // (the manager puts every node_modules/.bin from the package's directory upward on the PATH of the script's commands: _scriptBinDir; a bare command name in it may be one of those bins)
+      const r = judgeScriptText(run.text, { kind: 'shell', file: run.label }, run.file, run.dir, ctx, { ...opts, _scriptBinDir: run.dir, ...(run.pkgDir ? { _pkgDir: run.pkgDir } : {}) });
       if (r) return r;
     }
     // (yarn / pnpm / bun NAME with no script of that name run node_modules/.bin/NAME)
@@ -1679,21 +1680,29 @@ function judgePackageScripts(c, dirs, ctx, opts, scanRaw = '') {
 
 // #81 t9: the shell script node_modules/.bin/NAME of a bare name a package runner (or yarn / pnpm / bun) runs. judgeFoundScript leaves node_modules alone, as it should for packages' own programs, so a
 // bin that starts with a shell shebang (or none) is judged here; a program in another language is not. An install earlier on the line may add it: refused when the line refers to a protected path.
-function judgeBinScript(name, dirs, ctx, opts, scanRaw = '') {
+function judgeBinScript(name, dirs, ctx, opts, scanRaw = '', quiet = false) {
   for (const d of dirs) {
     const bin = localBin(name, { cwd: d, pathExists: (x) => ctx.api.existsSync(x), p: posix, written: (x) => writtenTo(ctx.frames, x, { exists: (y) => ctx.api.existsSync(y), readText: ctx.readText, ignoreUnmodelled: true }) });
     if (!bin) {
-      if (ctx.budget.pkgBinsDirty && (makeMatchers(ctx).rawHit(scanRaw, [d]) || SENSITIVE_WORDS.test(String(scanRaw).replace(/['"`\\]/g, '')))) return deny(`package script: an earlier install on the line may add node_modules/.bin/${name}, and the line refers to a protected pipeline file, so what it runs cannot be checked; run the install in a command of its own`);
+      if (!quiet && ctx.budget.pkgBinsDirty && (makeMatchers(ctx).rawHit(scanRaw, [d]) || SENSITIVE_WORDS.test(String(scanRaw).replace(/['"`\\]/g, '')))) return deny(`package script: an earlier install on the line may add node_modules/.bin/${name}, and the line refers to a protected pipeline file, so what it runs cannot be checked; run the install in a command of its own`);
       continue;
     }
+    // (a bin the line itself writes -- replacing the program with a shell script -- is judged on what the line puts there, as the git guard does)
+    const wr = writtenTo(ctx.frames, bin, { exists: (y) => ctx.api.existsSync(y), readText: ctx.readText, ignoreUnmodelled: true });
+    if (wr) {
+      const r = judgeWrittenScript(wr, { kind: 'exec', file: bin, candidate: true }, bin, d, ctx, opts, scanRaw);
+      if (r) return r;
+    }
+    // (what decides is the file's first bytes alone, binIsProgram: not the extension, not where a link leads. A file that cannot be read is refused, as a shell script that cannot be read is)
     const text = ctx.readText(bin);
     if (typeof text !== 'string') {
+      if (!ctx.api.existsSync(bin) || ctx.readDir(bin)) continue; // (missing: nothing runs; a directory: a shell cannot run it)
       const head = ctx.readHead(bin);
-      if (typeof head === 'string' && isShellHead(head)) return deny(`${bin} is too large to verify (over 1 MB), so what it runs cannot be known`);
+      if (typeof head !== 'string') return deny(`cannot read node_modules/.bin/${name} (${bin}: missing permission), so whether it is a shell script and what it runs cannot be verified`);
+      if (!binIsProgram(head)) return deny(`${bin} is too large to verify (over 1 MB), so what it runs cannot be known`);
       continue;
     }
-    if (text.slice(0, 4096).includes('\u0000') || INTERP_PROGRAM.test((SHEBANG_PROGRAM.exec(text)?.[1] ?? '').split('/').pop())) continue;
-    if (!SHEBANG_PROGRAM.test(text) && /\.[cm]?js$/i.test(realResolve(bin, ctx.api))) continue; // (a link to a .js file: a program)
+    if (binIsProgram(text)) continue;
     const r = judgeScriptText(text, { kind: 'shell', file: bin }, bin, posix.dirname(bin), ctx, opts);
     if (r) return r;
   }
@@ -1836,7 +1845,7 @@ function judgeScriptText(text, sf, abs, dir, ctx, opts) {
   }
   let kind = sf.kind;
   if (kind === 'exec') {
-    if (text.slice(0, 4096).includes('\u0000')) return null; // a binary
+    if (!text.startsWith('#!') && text.slice(0, 512).includes('\u0000')) return null; // a binary (the test binIsProgram uses: a shebang line makes it a script whatever follows)
     kind = INTERP_PROGRAM.test((SHEBANG_PROGRAM.exec(text)?.[1] ?? '').split('/').pop()) ? 'interp' : 'shell';
     // Why: the kernel starts the shebang's shell, which reads the startup files its options ask for (`#!/bin/bash -l`, `#!/bin/zsh`): judged like `bash -l f` / `zsh f`
     const sh = kind === 'shell' && ctx.execCmd ? shebangShell(text) : null;
@@ -2680,6 +2689,10 @@ function evaluateBashForFilesFrame(command, opts) {
       // #81 t9: and a bare name a package runner started is the bin node_modules/.bin/NAME
       if (c.viaRunner && c.argv[0] && !c.argv[0].includes('/')) {
         const v = judgeBinScript(expandRefs(c.argv[0], ctx), sdirsNow(), ctx, withLineVars(opts, c), scanRaw);
+        if (v) return v;
+      } else if (!c.viaRunner && (typeof opts._scriptBinDir === 'string' || c.binPath) && c.argv[0] && !c.argv[0].includes('/')) {
+        // (a bare command name in a package script: node_modules/.bin/NAME of the package's directory or above it comes first on the PATH; none there = an ordinary command)
+        const v = judgeBinScript(expandRefs(c.argv[0], ctx), typeof opts._scriptBinDir === 'string' ? [opts._scriptBinDir] : sdirsNow(), ctx, withLineVars(opts, c), scanRaw, true);
         if (v) return v;
       }
       markPackageState(ctx.budget, [c.argv], { dirs: cwdsNow(), expand: (w) => expandRefs(w, ctx), home: ctx.homePosix, p: posix }); // (what this command may change, for the package scripts after it)

@@ -1942,6 +1942,8 @@ function emit(ctx, argv, env, raw, depth, redirects = [], sep = ';') {
   Object.defineProperty(cmd, 'ctl', { value: ctlMarks(ctx.ctl), enumerable: false });
   // sep: the operator before it (; & && || |), for callers that care whether it surely runs; not enumerable, like `truncated`
   Object.defineProperty(cmd, 'sep', { value: sep, enumerable: false });
+  // binPath: it is part of a script text a package runner runs (node_modules/.bin is on its PATH). Not enumerable
+  if (ctx.binPath) Object.defineProperty(cmd, 'binPath', { value: true, enumerable: false });
   ctx.out.push(cmd);
   return cmd;
 }
@@ -3046,8 +3048,11 @@ class Parser {
   // `cmd` is the command object emitted for `argv` (what it reads or is fed is recorded on it, see scriptFeedsOf)
   interpret(argv, seg, cmd = null) {
     const saved = this.cmd;
+    const savedBinPath = this.ctx.binPath;
     this.cmd = cmd;
-    try { this.interpretWords(argv, seg); } finally { this.cmd = saved; }
+    // (the commands of a script text a package runner starts -- `npm exec -c TEXT`, `npx sh -c TEXT` -- run with node_modules/.bin on their PATH: binPath, see emit)
+    if (cmd?.viaRunner) this.ctx.binPath = true;
+    try { this.interpretWords(argv, seg); } finally { this.cmd = saved; this.ctx.binPath = savedBinPath; }
   }
 
   interpretWords(argv, seg) {
