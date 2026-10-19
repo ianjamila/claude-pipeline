@@ -79,3 +79,16 @@ test('K3 a guarded word in the arguments of a command that only reads is no ment
     assert.equal(r.decision, 'deny', `${c} -> allowed`);
   }
 });
+
+// ---- K4. a name of unknown value in a gh command that writes no local file ------------------------------------------------------------------------------------
+// `M=$(gh pr view ...); SHA=${M#* }; gh api "repos/o/r/deployments?sha=$SHA"`: $SHA is part of a URL. A command that can write a local file (cp, gh run download ...) with that name still is refused.
+test('K4 a name of unknown value in the words of gh api / gh pr view names no path; in a command that writes files it does', () => {
+  const M = 'M=$(gh pr view 296 --json state -q .state); SHA=${M#* }; ';
+  for (const cmd of ['gh api "repos/o/r/deployments?sha=$SHA&environment=Production" -q ".[0].id"', 'gh pr view $SHA --json state', 'gh run view $SHA', 'gh -R o/r pr checks $SHA', 'gh issue list --search $SHA']) {
+    const r = filesGuard(M + cmd);
+    assert.equal(r.decision, 'allow', `${cmd}: ${r.reason}`);
+  }
+  for (const cmd of ['cp x $SHA', 'gh run download 5 -D $SHA', 'gh release download v1 -D $SHA', 'gh pr checkout $SHA', 'gh repo clone o/r $SHA', 'gh api repos/o/r --output $SHA', 'tee $SHA < x']) {
+    assert.equal(filesGuard(M + cmd).decision, 'deny', cmd);
+  }
+});
