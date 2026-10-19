@@ -763,7 +763,8 @@ function bindsBash(text) {
   const mentions = (s) => /(?<![A-Za-z0-9_])BASH(?![A-Za-z0-9_])/.test(s.replace(BASH_REF, ''));
   if (mentions(str) || mentions(str.replace(/['"\\]/g, ''))) return true;
   if (/(?<![\w./$-])(?:source|eval)(?![\w-])/.test(str)) return true;
-  if (/(?:^|[\n;&|({`!]|\b(?:then|do|else|elif|if|while|until|builtin|command)\b)\s*\.\s+\S/.test(str)) return true;
+  // (blanks before the dot are not newlines: a newline is a boundary of its own, and `\s*` after each of 200 kB of them was quadratic)
+  if (/(?:^|[\n;&|({`!]|\b(?:then|do|else|elif|if|while|until|builtin|command)\b)[^\S\n]*\.\s+\S/.test(str)) return true;
   if (/\$'[^']*\\[xuU0-7]/.test(str)) return true;
   if (str.split('\n').some(arithAssignsByName)) return true;
   for (const m of str.matchAll(BINDERS)) {
@@ -1935,6 +1936,7 @@ function emit(ctx, argv, env, raw, depth, redirects = [], sep = ';') {
   return cmd;
 }
 
+const MAX_PARAM_WORK = 2_000_000;
 class Parser {
   constructor(ctx, src) {
     this.ctx = ctx;
@@ -2025,11 +2027,16 @@ class Parser {
 
   // End (just past the closing brace) of the plain parameter expansion `${...}` at `from`, or -1 when it holds anything lexed as code
   // (`$(`, `<(`, `>(`, `=(`, backticks, `$'`, a newline) or never closes: those take the ordinary path. Quotes and `\` inside are skipped; `${` nests.
+  // Why: a scan that never finds its close (`${${${${…`) is made from every `${` of the text, so the scans together may not read more than MAX_PARAM_WORK characters:
+  // past that every span is -1 and the ordinary path lexes the text (which polls the deadline too). At 200 kB of `${` the scans alone took 14 s.
   paramSpan(from) {
+    if ((this.spanWork ?? 0) > MAX_PARAM_WORK) return -1;
     const s = this.src;
     const n = s.length;
     let depth = 0;
-    for (let j = from; j < n; j++) {
+    let j = from;
+    try {
+    for (; j < n; j++) {
       const c = s[j];
       if (c === '\\') { j++; continue; }
       if (c === '`' || c === '\n') return -1;
@@ -2040,7 +2047,7 @@ class Parser {
         if (nx === '{') { depth++; j++; }
         continue;
       }
-      if (c === "'") { j = s.indexOf("'", j + 1); if (j < 0) return -1; continue; }
+      if (c === "'") { j = s.indexOf("'", j + 1); if (j < 0) { j = n; return -1; } continue; }
       if (c === '"') {
         for (j++; j < n && s[j] !== '"'; j++) {
           if (s[j] === '\\') j++;
@@ -2052,6 +2059,7 @@ class Parser {
       if (c === '}' && --depth === 0) return j + 1;
     }
     return -1;
+    } finally { this.spanWork = (this.spanWork ?? 0) + (j - from) + 1; }
   }
 
   // Body of a double-quoted string (this.i is just past the opening quote). Substitutions run inside it.
@@ -2169,6 +2177,8 @@ class Parser {
     let inWord = false;
     let qa = -1; // index in `cur` where quoting first appeared (-1: none)
     let bm = []; // indexes in `cur` of unquoted { , } characters (brace expansion candidates)
+    let lastCur = null; // the word as it stood after the last plain character was added, and that character: `endsWith` flattens a long word each time (200 kB of `{` took 4 s)
+    let lastCh = '';
     let wdyn = false; // the word contains an expansion that is only known at run time
     let wpat = false; // the word holds an UNQUOTED glob / pattern character (`*?[^#~`, or a glued group): the shell may expand it to file names
     let wsubs = []; // segments run by substitutions inside the word
@@ -2354,11 +2364,12 @@ class Parser {
         if (nx === '\n') this.i += 2;
         else if (nx === '\r' && s[this.i + 2] === '\n') this.i += 3;
         else if (nx === undefined) this.i++;
-        else { startSeg(); mark(); cur += nx; this.i += 2; }
+        else { startSeg(); mark(); cur += nx; lastCur = cur; lastCh = nx; this.i += 2; }
       } else if (c === "'") {
         startSeg(); mark();
         const j = s.indexOf("'", this.i + 1);
         if (j < 0) { cur += s.slice(this.i + 1); this.i = n; } else { cur += s.slice(this.i + 1, j); this.i = j + 1; }
+        lastCur = null;
       } else if (c === '"') {
         startSeg(); mark();
         this.i++;
@@ -2412,7 +2423,7 @@ class Parser {
           cur += s.slice(this.i, Math.min(j + 1, n));
           this.scanExpansions(s.slice(this.i + 2, j), depth);
           this.i = Math.min(j + 1, n);
-        } else { inWord = true; if (nx !== undefined && DYN_AFTER_DOLLAR.test(nx)) wdyn = true; cur += '$'; this.i++; }
+        } else { inWord = true; if (nx !== undefined && DYN_AFTER_DOLLAR.test(nx)) wdyn = true; cur += '$'; lastCur = cur; lastCh = '$'; this.i++; }
       } else if (c === ';') {
         endSeg(this.i);
         lastSep = ';';
@@ -2513,9 +2524,11 @@ class Parser {
       } else {
         startSeg();
         inWord = true;
-        if (!(lit > 0 && litGlob) && ((c === '{' && !cur.endsWith('$')) || c === ',' || c === '}')) bm.push(cur.length); // (the cheap test first: endsWith flattens the word built so far)
+        if (!(lit > 0 && litGlob) && ((c === '{' && !(cur === lastCur ? lastCh === '$' : cur.endsWith('$'))) || c === ',' || c === '}')) bm.push(cur.length); // (the cheap test first: endsWith flattens the word built so far)
         if (/[*?[^#~]/.test(c)) wpat = true;
         cur += c;
+        lastCur = cur;
+        lastCh = c;
         this.i++;
       }
     }
@@ -2779,7 +2792,7 @@ class Parser {
     if (cmd) Object.defineProperty(cmd, 'litWords', { value: new Set(a.filter((w) => !seg.meta.get(w)?.dyn && !seg.pat.has(w))), enumerable: false });
     if (!isExec) { seg.final = { argv: a }; seg.cmd = cmd; }
     // what the command prints and what it reads on stdin, for callers that ask which text a write of its output holds (see line-writes.mjs); lazy, most commands never need it
-    if (cmd && !isExec) Object.defineProperty(cmd, 'streams', { value: () => streamsOf(seg, a), enumerable: false });
+    if (cmd && !isExec) { let streams; Object.defineProperty(cmd, 'streams', { value: () => (streams ??= streamsOf(seg, a)), enumerable: false }); } // (worked out once: the callers only read it)
     if (fan && cmd && !isExec) this.fanOut(seg, fan, a, cmd);
     if (headDyn && cmd) {
       Object.defineProperty(cmd, 'headDyn', { value: true, enumerable: false });
