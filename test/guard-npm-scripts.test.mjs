@@ -485,6 +485,17 @@ test('t9 a configuration file or a bin the line writes first is judged or refuse
   const written = git(`printf '#!/bin/sh\\n${BAD_GIT}\\n' > node_modules/.bin/tool && chmod +x node_modules/.bin/tool && npx tool`, treeFor(t, BAD_GIT));
   assert.equal(written.decision, 'deny');
 });
+test('t2 (security) a configuration file the line writes between two manager calls is read fresh by the second call (no stale "nothing written" from the first)', () => {
+  const t = root({ lint: 'ok', test: 'ok' });
+  for (const cmd of [`npm run lint && printf "script-shell=/e/sh" > .npmrc && npm test`, `npm run lint; npm run lint; echo 'node-options=--require /e/x.js' >> .npmrc; npm run test`, `npm run lint && cp /tmp/rc .npmrc && npm test`]) {
+    const g = git(cmd, treeFor(t, BAD_GIT));
+    assert.equal(g.decision, 'deny', `git: ${cmd}`);
+    assert.match(g.reason, /writes .*npmrc/);
+    assert.equal(filesGuard(cmd, treeFor(t, BAD_FILES)).decision, 'deny', `files: ${cmd}`);
+  }
+  // a write to another file between the calls is none of its business
+  ok('npm run lint && echo hi > notes.txt && npm test', t);
+});
 test('t9 a package.json that is a dangling link or a link loop is unreadable, not missing', () => {
   const call = pmCall(['npm', 'run', 'lint']);
   const env = (o) => ({ cwd: '/w/p', home: '/home/u', readText: () => null, pathExists: () => false, readDir: () => null, lexists: (f) => f === '/w/p/package.json', p: undefined, ...o });

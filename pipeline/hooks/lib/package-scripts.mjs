@@ -697,13 +697,15 @@ function rcFiles(call, dir, env, p) {
   if (call.pm === 'bun') { list.push(p.join(dir, 'bunfig.toml')); if (env.home) list.push(p.join(env.home, '.bunfig.toml')); }
   return list;
 }
+// (the file's own text is read once per evaluation: the disk does not change while the guard looks. What the LINE writes to it is asked every time: a second manager call comes after
+// writes the first one did not see -- `npm test && echo 'script-shell=/x' > .npmrc && npm run lint`)
 function rcRefusal(file, env, cache, exists) {
+  const w = env.written?.(file);
+  if (w === 'known' || (w === 'maybe' && env.mentionsGuarded?.())) return `this line writes ${file} before the package manager reads it, so what it sets for the scripts cannot be verified. Write it in a command of its own.`;
   const key = `rc\u0000${file}`;
   if (cache.has(key)) return cache.get(key);
   let msg = null;
-  const w = env.written?.(file);
-  if (w === 'known' || (w === 'maybe' && env.mentionsGuarded?.())) msg = `this line writes ${file} before the package manager reads it, so what it sets for the scripts cannot be verified. Write it in a command of its own.`;
-  else if (exists(file)) {
+  if (exists(file)) {
     const text = env.readText(file);
     if (typeof text !== 'string') msg = `cannot read ${file} (missing permission, a directory or larger than 1 MB), so what it sets for the package manager cannot be verified.`;
     else {
