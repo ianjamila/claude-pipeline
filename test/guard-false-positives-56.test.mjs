@@ -423,9 +423,8 @@ test('#56 replay 2: loop words from a known variable, quoted [ ] words, code in 
     'BB=run.shXY; for f in $BB[1,6]; do bash $f; done',
     'B=ok; for f in $B.sh; do bash $f; B=run; done', // (the name the word reads is set twice)
   ]) denyGit(cmd, SPEC);
-  // still refused (documented): two loops over the same name, and a loop over a variable holding command output
+  // still refused (documented): a loop over a variable holding command output (two loops over the same name are read since #81 t6: test/guard-readings-scopes.test.mjs)
   for (const cmd of [
-    'for f in src/a.ts; do sed -n 1,9p "$f"; done; for f in a.mjs; do sed -n 1,9p "$f"; done',
     'F1=$(grep -rl x src); for f in ${=F1}; do sed -i.bak s/a/b/ "$f"; done',
   ]) denyGit(cmd, SPEC);
 });

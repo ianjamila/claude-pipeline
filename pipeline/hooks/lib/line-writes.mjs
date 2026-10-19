@@ -547,7 +547,9 @@ function argRecords(cmd, name, idx, lineEnv = {}, io = {}) {
     const { pos, opts, bad } = getoptStrict(args, { shortSwitch: 'aip', longOpt: ['output-error'], longSwitch: ['append', 'ignore-interrupts', 'help', 'version'] });
     if (bad) return null;
     const append = hasOpt(opts, 'a', 'append');
-    return pos.filter((p) => p !== '-').map((dest) => { const items = stdinItems(cmd); return { idx, dest, items, parts: items.parts, append }; });
+    // Defensive (mutation check): computing this per operand is also held by the memoised cmd.streams() in shell-parse.mjs (stdinItems then only copies the lists).
+    const items = stdinItems(cmd); // (once: it lists the command's whole stdin, and a tee with thousands of operands would redo it for each)
+    return pos.filter((p) => p !== '-').map((dest) => ({ idx, dest, items, parts: items.parts, append }));
   }
   if (name === 'dd') {
     const ofs = args.filter((a) => a.startsWith('of=')).map((a) => a.slice(3)); // (a repeated if= / of=: every one counts)
