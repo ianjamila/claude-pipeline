@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import {
   run, runAsync, runShell, runShellAsync, splitCommand, escapeArgument, escapeCommand, quoteForCmd, planSpawn,
   cmdExe, createResolver, toResult, shellResult,
-  gh, ghJson, GhError, codexCommand, findOnPosixPath,
+  gh, ghJson, GhError, codexCommand, findOnPosixPath, envWithGhDir,
 } from '../pipeline/lib/proc.mjs';
 
 const fakeGh = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'fake-gh.mjs');
@@ -593,4 +593,80 @@ test('findOnPosixPath skips empty and relative entries even when the cwd holds a
   } finally {
     process.chdir(before);
   }
+});
+
+// Project commands the pipeline spawns (merge.command, smoke) inherit the caller PATH; when gh is only in a fallback dir the
+// pipeline finds it for itself, so the command gets that dir appended or its own `gh` was ENOENT.
+test('envWithGhDir appends the fallback dir that holds gh when PATH lacks it', posixOnly, () => {
+  const emptyPath = scratch();
+  const fallback = fakeGhDir('x');
+  const env = { PATH: emptyPath, KEEP: '1', PIPELINE_GH: '' };
+  const out = envWithGhDir(env, { fallbackDirs: [fallback] });
+  assert.equal(out.PATH, [emptyPath, fallback].join(path.delimiter));
+  assert.equal(out.KEEP, '1');
+  assert.notEqual(out, env);
+  assert.equal(env.PATH, emptyPath, 'the input is not mutated');
+});
+
+test('envWithGhDir appends (never prepends) and works for an empty PATH', posixOnly, () => {
+  const fallback = fakeGhDir('x');
+  assert.equal(envWithGhDir({ PATH: '', PIPELINE_GH: '' }, { fallbackDirs: [fallback] }).PATH, fallback);
+});
+
+test('envWithGhDir leaves PATH alone when gh is already on it (a copy, same PATH)', posixOnly, () => {
+  const onPath = fakeGhDir('x');
+  const fallback = fakeGhDir('y');
+  const env = { PATH: onPath, PIPELINE_GH: '' };
+  const out = envWithGhDir(env, { fallbackDirs: [fallback] });
+  assert.equal(out.PATH, onPath);
+  assert.notEqual(out, env);
+});
+
+test('envWithGhDir leaves PATH alone when gh is nowhere', posixOnly, () => {
+  const p = scratch();
+  assert.equal(envWithGhDir({ PATH: p, PIPELINE_GH: '' }, { fallbackDirs: [scratch()] }).PATH, p);
+});
+
+test('envWithGhDir leaves PATH alone when PIPELINE_GH overrides gh', posixOnly, () => {
+  const p = scratch();
+  const fallback = fakeGhDir('x');
+  assert.equal(envWithGhDir({ PATH: p, PIPELINE_GH: 'node fake-gh.mjs' }, { fallbackDirs: [fallback] }).PATH, p);
+});
+
+test('envWithGhDir never counts or appends a relative or empty dir, and adds no duplicate', posixOnly, () => {
+  const dir = realpathSync.native(fakeGhDir('planted'));
+  const before = process.cwd();
+  process.chdir(dir);
+  try {
+    const p = ['', '.', 'rel'].join(path.delimiter);
+    assert.equal(envWithGhDir({ PATH: p, PIPELINE_GH: '' }, { fallbackDirs: ['.', '', 'rel'] }).PATH, p);
+    // once the dir is on PATH, gh resolves from PATH and nothing is added a second time
+    const out = envWithGhDir({ PATH: p, PIPELINE_GH: '' }, { fallbackDirs: [dir] });
+    assert.equal(out.PATH, [p, dir].join(path.delimiter));
+    assert.equal(envWithGhDir(out, { fallbackDirs: [dir] }).PATH, out.PATH);
+  } finally {
+    process.chdir(before);
+  }
+});
+
+test('envWithGhDir reads PATH from process.env when the env has none, and tolerates no env', posixOnly, () => {
+  const fallback = fakeGhDir('x');
+  const saved = process.env.PATH;
+  const savedGh = process.env.PIPELINE_GH;
+  const p = scratch();
+  process.env.PATH = p;
+  delete process.env.PIPELINE_GH;
+  try {
+    assert.equal(envWithGhDir({}, { fallbackDirs: [fallback] }).PATH, [p, fallback].join(path.delimiter));
+    assert.equal(envWithGhDir(undefined, { fallbackDirs: [fallback] }).PATH, [p, fallback].join(path.delimiter));
+  } finally {
+    process.env.PATH = saved;
+    if (savedGh !== undefined) process.env.PIPELINE_GH = savedGh;
+  }
+});
+
+test('envWithGhDir does nothing on win32', () => {
+  const p = scratch();
+  const out = envWithGhDir({ PATH: p, PIPELINE_GH: '' }, { fallbackDirs: [fakeGhDir('x')], platform: 'win32' });
+  assert.equal(out.PATH, p);
 });

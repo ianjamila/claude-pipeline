@@ -1,4 +1,5 @@
 import { test, after } from 'node:test';
+import { cpuTimed } from './helpers/timing.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -964,12 +965,10 @@ test('hand-back rule 3: a literal backslash-u text in the input is matched even 
   refused(withWire('a \\u005c b \\u00f1 ', literal), E);
   // A long ambiguous input finishes quickly: 20k backslashes against a wire of alternating escape and literal readings.
   const n = 20000;
-  const t0 = Date.now();
-  const big = proveText(withWire('\\u005c'.repeat(n) + '\\u005cu005c'.repeat(n) + ']', '\\'.repeat(n) + '\\u005c'.repeat(n) + '\\'));
-  assert.ok(Date.now() - t0 < 1000, `took ${Date.now() - t0} ms`);
+  const { r: big, ms: bigMs } = cpuTimed(() => proveText(withWire('\\u005c'.repeat(n) + '\\u005cu005c'.repeat(n) + ']', '\\'.repeat(n) + '\\u005c'.repeat(n) + '\\')));
+  assert.ok(bigMs < 1000, `took ${Math.round(bigMs)} ms of CPU`);
   assert.match(big.errors.join('\n'), E);
-  const t1 = Date.now();
-  const bigOk = proveText(withWire('\\u005c'.repeat(n) + '\\u005cu005c'.repeat(n), '\\'.repeat(n) + '\\u005c'.repeat(n)));
-  assert.ok(Date.now() - t1 < 1000, `took ${Date.now() - t1} ms`);
+  const { r: bigOk, ms: bigOkMs } = cpuTimed(() => proveText(withWire('\\u005c'.repeat(n) + '\\u005cu005c'.repeat(n), '\\'.repeat(n) + '\\u005c'.repeat(n))));
+  assert.ok(bigOkMs < 1000, `took ${Math.round(bigOkMs)} ms of CPU`);
   assert.deepEqual(bigOk.errors, []);
 });

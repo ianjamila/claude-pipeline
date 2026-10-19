@@ -2,6 +2,7 @@
 // 1 ancestor dirs, 2 redirects, 3 code-built home paths, 4 variables, 5 MCP, 6 fail-open on caps, 7 false
 // positives, 8 performance. Home is /home/u (user "u"); the filesystem is faked unless a test says otherwise.
 import { test } from 'node:test';
+import { cpuTimed } from './helpers/timing.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -488,7 +489,7 @@ table('still non-read-only', [
 // ---- 8. performance ----------------------------------------------------------------------------------
 
 test('perf: ordinary commands, long commands and brace-heavy commands stay fast', () => {
-  const timeIt = (cmd) => { const t = process.hrtime.bigint(); const r = bash(cmd); return { r, ms: Number(process.hrtime.bigint() - t) / 1e6 }; };
+  const timeIt = (cmd) => cpuTimed(() => bash(cmd)); // CPU ms: a loaded machine must not trip a cap
   const cases = [
     'npm test && git status',
     'echo a; '.repeat(20000),
@@ -500,12 +501,12 @@ test('perf: ordinary commands, long commands and brace-heavy commands stay fast'
   ];
   for (const c of cases) {
     const { ms } = timeIt(c);
-    assert.ok(ms < 1500, `${c.slice(0, 40)}... took ${ms.toFixed(0)} ms`);
+    assert.ok(ms < 1500, `${c.slice(0, 40)}... took ${ms.toFixed(0)} ms of CPU`);
   }
   const ordinary = [];
   for (let i = 0; i < 30; i++) ordinary.push(timeIt('git -C ~/.claude/pipeline log --oneline | head -3 && ls ~/.claude/skills').ms);
   ordinary.sort((a, b) => a - b);
-  assert.ok(ordinary[15] < 20, `median in-process time ${ordinary[15].toFixed(1)} ms`);
+  assert.ok(ordinary[15] < 20, `median in-process time ${ordinary[15].toFixed(1)} ms of CPU`);
 });
 
 // ---- Windows -------------------------------------------------------------------------------------
@@ -595,12 +596,13 @@ test('installer text rule: npm run denies when package.json cannot be read or pa
 
 test('size cap: an oversized command line is not scanned; it is denied only when it mentions a sensitive word', () => {
   const spam = '{a,b}'.repeat(60_000);
-  const t0 = Date.now();
-  assert.equal(bash(`echo ${spam}`).decision, 'allow');
-  assert.equal(bash(`echo ${spam}; echo x > ~/.cl""aude/settings.json`).decision, 'deny');
-  assert.equal(bash(`echo ${spam}; node ins""tall.mjs`).decision, 'deny');
-  assert.equal(bash(`echo ${spam}; export PIPELINE_""ADMIN=1`).decision, 'deny');
-  assert.ok(Date.now() - t0 < 3000);
+  const { ms } = cpuTimed(() => {
+    assert.equal(bash(`echo ${spam}`).decision, 'allow');
+    assert.equal(bash(`echo ${spam}; echo x > ~/.cl""aude/settings.json`).decision, 'deny');
+    assert.equal(bash(`echo ${spam}; node ins""tall.mjs`).decision, 'deny');
+    assert.equal(bash(`echo ${spam}; export PIPELINE_""ADMIN=1`).decision, 'deny');
+  });
+  assert.ok(ms < 3000, `took ${Math.round(ms)} ms of CPU`);
 });
 
 // ---- 9. script files hide commands (review finding 2) ----------------------------------------------------

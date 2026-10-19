@@ -42,6 +42,7 @@ const FAKE_MERGE = [
   "import { appendFileSync, copyFileSync, mkdirSync } from 'node:fs';",
   "mkdirSync('.review', { recursive: true });",
   "appendFileSync('.review/merge-calls.log', `${process.argv.slice(2).join(' ')}\\n`);",
+  "if (process.env.FAKE_MERGE_PATH_FILE) appendFileSync(process.env.FAKE_MERGE_PATH_FILE, `${process.env.PATH}\\n`);",
   "if (process.env.FAKE_MERGE_SWAP) copyFileSync(process.env.FAKE_MERGE_SWAP, process.env.PIPELINE_FAKE_GH_SCRIPT);",
   "if (process.env.FAKE_MERGE_EXIT) { process.stderr.write('merge gate refused: base moved\\n'); process.exit(Number(process.env.FAKE_MERGE_EXIT)); }",
   '',

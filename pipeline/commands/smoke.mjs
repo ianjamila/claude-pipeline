@@ -4,7 +4,7 @@
 import { EXIT, UsageError, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { fill } from '../lib/config.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
-import { runShellAsync } from '../lib/proc.mjs';
+import { envWithGhDir, runShellAsync } from '../lib/proc.mjs';
 import { inlineOptionValues, tailLines, writeReviewJson } from '../lib/finalgate.mjs';
 
 export const meta = {
@@ -36,7 +36,7 @@ export const run = guarded(async (argv, ctx) => {
 
   const r = await runShellAsync(command, {
     cwd: root,
-    env: { ...(ctx.env ?? {}), PIPELINE_SMOKE_EXPECT_TEXT: values['expect-text'] },
+    env: envWithGhDir({ ...(ctx.env ?? {}), PIPELINE_SMOKE_EXPECT_TEXT: values['expect-text'] }),
     timeoutMs: SMOKE_TIMEOUT_MS,
   });
   const result = {
