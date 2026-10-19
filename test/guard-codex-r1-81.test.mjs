@@ -115,6 +115,9 @@ test('R1-B2: too many readings of a path word is a hit (the files guard)', () =>
   // harmless siblings: a small array that is fully expanded and harmless, and a big one that names nothing protected
   assert.equal(filesGuard('A=(x0 x1); B=(y0 y1); echo x > ~/${A[0]}${B[0]}/notes.txt').decision, 'allow');
   assert.equal(filesGuard('A=(a b); B=(c d); echo x > ./${A[0]}${B[0]}/notes.txt').decision, 'allow');
+  // operator expansions written in the word (`${A[7]/zz/}`) multiply the same way
+  assert.equal(filesGuard(`${A('.cl')}; ${B('aude')}; echo x > ~/\${A[7]/zz/}\${B[7]/zz/}/settings.json`).decision, 'deny');
+  assert.equal(filesGuard('A=(a b); B=(c d); echo x > ~/${A[0]/zz/}${B[0]/zz/}/notes.txt').decision, 'allow');
   // and the small array whose readings do reach a protected path is refused, as before
   assert.equal(filesGuard('A=(x .cl); B=(y aude); echo x > ~/${A[1]}${B[1]}/settings.json').decision, 'deny');
 });

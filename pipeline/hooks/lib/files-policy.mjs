@@ -637,6 +637,7 @@ function makeMatchers(ctx) {
     // Why (#81 Codex R1-B2): readingsOf cuts its list at MAX_READINGS and says so in `cut`: readings that are missing could be the protected path, so too many is a hit like too many own readings.
     // (`over` alone is NOT a hit here: it also marks an assigned word the scan cannot work out, which collectVars handles as a run-time variable, see above.)
     const rs = readingsOf(word, ctx.assigned);
+    // (`own.over` is Defensive (mutation check): losing it is still caught by the redirect loop, which judges the target as written (rawHitOne on the unexpanded text) too.)
     return Object.defineProperty([...rs], 'over', { value: own.over === true || rs.cut === true, enumerable: false });
   };
   const rootRes = rootRegexes(ctx);
