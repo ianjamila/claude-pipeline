@@ -374,13 +374,46 @@ test('review: untracked and active => never reviewed, adopt', () => {
   assert.equal(r.suggest, 'resume');
 });
 
-test('category abandoned: untracked and stale', () => {
-  const r = cls(untrackedStale);
+test('category abandoned: untracked, stale and a draft', () => {
+  const r = cls({ ...untrackedStale, isDraft: true });
   assert.equal(r.waitingOn, 'abandoned');
   assert.equal(r.suggest, 'close');
   assert.equal(r.nextAction, 'close');
   assert.equal(r.stale, true);
-  assert.equal(r.reason, `no pipeline history, last activity ${ago(30 * DAY).slice(0, 10)}`);
+  assert.equal(r.reason, `no pipeline history, last activity ${ago(30 * DAY).slice(0, 10)}; also still a draft`);
+});
+
+test('untracked + stale: draft, failing CI or conflicts is positive evidence => abandoned / close', () => {
+  for (const over of [{ isDraft: true }, { ci: 'failed', ciFailed: ['ci'] }, { conflicts: true, baseRefName: 'main' }]) {
+    const r = cls({ ...untrackedStale, ...over });
+    assert.equal(r.waitingOn, 'abandoned', JSON.stringify(over));
+    assert.equal(r.suggest, 'close', JSON.stringify(over));
+    assert.equal(r.nextAction, 'close');
+  }
+});
+
+test('untracked + stale but ready, green and conflict-free: owner-decision / leave, never close', () => {
+  const r = cls(untrackedStale);
+  assert.equal(r.waitingOn, 'owner-decision');
+  assert.equal(r.suggest, 'leave');
+  assert.equal(r.stale, true);
+  assert.equal(r.reason, `no pipeline history and quiet since ${ago(30 * DAY).slice(0, 10)}, but ready with nothing failing: the owner decides`);
+  assert.equal(r.nextAction, 'owner decides: ship resume 7 adopts it, or close it');
+});
+
+test('untracked + stale + ready + CI pending (or unknown conflicts): leave, never close', () => {
+  for (const over of [{ ci: 'incomplete' }, { conflicts: null }, { ci: 'incomplete', conflicts: null }]) {
+    const r = cls({ ...untrackedStale, ...over });
+    assert.equal(r.waitingOn, 'owner-decision', JSON.stringify(over));
+    assert.equal(r.suggest, 'leave', JSON.stringify(over));
+  }
+});
+
+test('age alone never suggests close: no stale untracked ready PR without evidence lands in the close group', () => {
+  for (const staleDays of [0, 1, 14, 365]) {
+    const r = classifyPr(facts({ ...untrackedStale, activity: { commitDate: ago(500 * DAY), createdAt: ago(600 * DAY) } }), { ...opts, staleDays });
+    assert.notEqual(r.suggest, 'close', String(staleDays));
+  }
 });
 
 test('untracked means NO record and NO triage: triage alone is tracked', () => {
@@ -433,18 +466,16 @@ test('tie: review beats owner-merge', () => {
   assert.equal(cls({ contentHash: 'changed' }).waitingOn, 'review');
 });
 
-test('tie: untracked + stale is abandoned even with failing CI, conflicts, an incomplete CI or a draft', () => {
+test('tie: untracked + stale is abandoned even with failing CI, conflicts or a draft', () => {
   const failed = cls({ ...untrackedStale, ci: 'failed', ciFailed: ['ci'], conflicts: true, baseRefName: 'main' });
   assert.equal(failed.waitingOn, 'abandoned');
   assert.equal(failed.suggest, 'close');
   assert.equal(failed.nextAction, 'close');
   assert.match(failed.reason, /^no pipeline history, last activity \d{4}-\d{2}-\d{2}; also required check failed: ci; conflicts with main$/);
   assert.match(cls({ ...untrackedStale, conflicts: true, baseRefName: 'main' }).reason, /; also conflicts with main$/);
-  assert.equal(cls({ ...untrackedStale, ci: 'incomplete' }).waitingOn, 'abandoned');
   const draft = cls({ ...untrackedStale, isDraft: true });
   assert.equal(draft.waitingOn, 'abandoned');
   assert.match(draft.reason, /; also still a draft$/);
-  assert.equal(cls({ ...untrackedStale }).reason.includes('also'), false);
 });
 test('tie: untracked + stale is never review; an untracked ACTIVE PR with a failure is still failing-check', () => {
   assert.notEqual(cls({ ...untrackedStale, labels: ['awaiting-review'] }).waitingOn, 'review');
@@ -475,13 +506,26 @@ test('owner-merge record with a head mismatch => pipeline re-gate', () => {
   assert.equal(r.nextAction, 're-gate: ship resume 7');
 });
 
-test('owner-merge: conflicts null (unknown) is allowed, true is not', () => {
-  assert.equal(cls({ conflicts: null }).waitingOn, 'owner-merge');
+test('owner-merge: conflicts null (unknown) stays owner-merge but only suggests leave; true is failing-check', () => {
+  const r = cls({ conflicts: null });
+  assert.equal(r.waitingOn, 'owner-merge');
+  assert.equal(r.suggest, 'leave');
+  assert.equal(r.reason, 'gated and clean for this head; only the owner\'s "merge" is missing; mergeability unknown (no git check and GitHub had not computed it)');
+  assert.equal(r.nextAction, 'check it merges cleanly, then say "merge" (head a1b2c3d)');
   assert.equal(cls({ conflicts: true }).waitingOn, 'failing-check');
+  const known = cls({ conflicts: false });
+  assert.equal(known.suggest, 'merge');
+  assert.equal(known.nextAction, 'say "merge" (head a1b2c3d)');
+});
+
+test('owner-merge with unknown conflicts and local work: prefixes still apply, suggest stays leave', () => {
+  const r = cls({ conflicts: null, local: { worktree: '/w/x', unpushed: 1, dirty: 0, state: 'ahead' } });
+  assert.equal(r.suggest, 'leave');
+  assert.equal(r.nextAction, 'push/commit the local work in /w/x first; then check it merges cleanly, then say "merge" (head a1b2c3d)');
 });
 
 test('CI incomplete / failing / draft / conflicts never suggest merge', () => {
-  for (const over of [{ ci: 'incomplete' }, { ci: 'failed' }, { isDraft: true }, { conflicts: true }]) {
+  for (const over of [{ ci: 'incomplete' }, { ci: 'failed' }, { isDraft: true }, { conflicts: true }, { conflicts: null }]) {
     assert.notEqual(cls(over).suggest, 'merge');
   }
 });
@@ -496,7 +540,7 @@ test('stale boundary is inclusive at exactly staleDays', () => {
 });
 
 test('stale boundary decides abandoned vs review for an untracked PR', () => {
-  const u = (ms) => ({ ...untrackedStale, activity: { commitDate: ago(ms), createdAt: ago(60 * DAY) } });
+  const u = (ms) => ({ ...untrackedStale, isDraft: true, activity: { commitDate: ago(ms), createdAt: ago(60 * DAY) } });
   assert.equal(cls(u(14 * DAY)).waitingOn, 'abandoned');
   assert.equal(cls(u(14 * DAY - 1)).waitingOn, 'review');
 });
@@ -557,7 +601,7 @@ test('suggest map covers every waitingOn', () => {
     review: { contentHash: 'zzz' },
     'owner-merge': {},
     pipeline: { ci: 'incomplete' },
-    abandoned: untrackedStale,
+    abandoned: { ...untrackedStale, isDraft: true },
   };
   for (const [k, over] of Object.entries(samples)) {
     const r = cls(over);
