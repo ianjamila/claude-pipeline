@@ -634,6 +634,7 @@ function makeMatchers(ctx) {
   const hitReadings = (word) => {
     const own = paramReadings(word);
     if (!ctx.assigned?.size) return own;
+    // Defensive (mutation check): losing the own `over` here is still caught by the redirect loop, which judges the target as written (rawHitOne on the unexpanded text) too.
     return Object.defineProperty([...readingsOf(word, ctx.assigned)], 'over', { value: own.over === true, enumerable: false }); // (too many own readings stays a hit)
   };
   const rootRes = rootRegexes(ctx);
