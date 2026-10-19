@@ -2269,13 +2269,15 @@ function onceAssignedNames(cmds, ctx, str) {
 // cd and git / gh state). So every command of the line must be a bare assignment or a plain tool named without a path that the guard does not open as a script: a builtin
 // that only reads or tests (UNSURE_OK) or a tool that only runs a program elsewhere (OPAQUE_TOOLS: docker, npm, ps …). Anything else gives null: the product, as before.
 // Null also when a name is not plainly a group member of its own; the groups come as arrays of indexes into `names`.
-const OPAQUE_TOOLS = new Set(['npm', 'npx', 'docker', 'supabase', 'psql', 'ps', 'lsof', 'pgrep', 'pidof', 'kill', 'rm', 'mkdir', 'touch', 'cp', 'mv', 'du', 'df', 'file', 'shasum', 'diff', 'cmp', 'uname', 'whoami', 'hostname', 'id', 'wait']);
+// (t11: not npm / npx: since t9 they open and run package scripts, which read any name the line exported -- see the pmCall test below)
+const OPAQUE_TOOLS = new Set(['docker', 'supabase', 'psql', 'ps', 'lsof', 'pgrep', 'pidof', 'kill', 'rm', 'mkdir', 'touch', 'cp', 'mv', 'du', 'df', 'file', 'shasum', 'diff', 'cmp', 'uname', 'whoami', 'hostname', 'id', 'wait']);
 function independentReadings(cmds, str, names) {
   for (const c of cmds) {
     if (!c.argv.length) continue;
     const head = c.argv[0];
     if (typeof head !== 'string' || DYNAMIC.test(head) || head.includes('/') || !(UNSURE_OK.has(head) || OPAQUE_TOOLS.has(head))) return null;
     if (VAR_BUILTINS.includes(head) || VALUE_BINDERS.has(head)) continue; // (a binder is a site of the name it binds: it joins the group below)
+    if (pmCall(c.argv) || c.viaRunner) return null; // (a package manager runs scripts that read the line's names)
     if (splicesOptions(c.argv) || scriptFileOf(c.argv, c.raw, str) !== null) return null; // (defence in depth: none of these names opens a script; the readings of a script are never split)
   }
   const parent = names.map((_, i) => i);

@@ -219,3 +219,19 @@ test('t11 a command that makes, removes or renames a package.json, node_modules,
   for (const cmd of ['mkdir -p out && npm run lint', 'touch logs/b.log && npm run lint', 'rm -f logs/a.log; npm test', 'rm -rf dist .next && npm run lint', 'cp package.json /tmp/p.json && npm run lint', 'mv logs/a.log logs/b.log && npm run lint',
     'rm -rf node_modules && npm run lint', 'mkdir -p sub/out && npm run lint', 'cp src/*.txt out/ && npm run lint', 'ln -s a.log logs/c.log && npm test', 'touch /tmp/x && npm run lint']) allowed(cmd, markTree);
 });
+
+// ---- 9. a tool that runs a package script is no "plain tool" for the summed readings (t5) ----------------------------------------------------------------------------------------------------------
+// Two loops whose product is over the allowance are judged by SUM (each name's values with the others at their first) when no command of the line can read both names. `npm run x` opens a script that reads
+// any name the line exported: only the product (every pair) shows `git $a$b` is a push at one pair.
+test('t11 a loop pair over the allowance with npm run is judged on every pair: the script reads both names', () => {
+  const as = ['x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7', 'x8', 'pu'].join(' ');
+  const bs = ['y1', 'y2', 'y3', 'y4', 'y5', 'y6', 'y7', 'y8', 'sh'].join(' ');
+  const mk = (script) => ({ '.git': 'x', 'package.json': pkg({ x: script }) });
+  for (const run of ['npm run x', 'npx --no-install npm run x', 'pnpm run x', 'yarn run x', 'npm test']) {
+    const cmd = `for a in ${as}; do export a; for b in ${bs}; do export b; ${run}; done; done`;
+    const g = git(cmd, { '.git': 'x', 'package.json': pkg({ x: `git $a$b origin ${MAIN}`, test: `git $a$b origin ${MAIN}` }) });
+    assert.equal(g.decision, 'deny', `git: ${run}`);
+  }
+  // the same loops over a script that pushes nothing stay allowed
+  assert.equal(git(`for a in ${as}; do export a; for b in ${bs}; do export b; npm run x; done; done`, mk('echo $a$b')).decision, 'allow');
+});
