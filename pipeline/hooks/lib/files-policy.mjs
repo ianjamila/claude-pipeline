@@ -1142,6 +1142,20 @@ function pwshReadOnly(argv) {
   return inner.every((c) => c.argv.length === 0 || PS_READ_ONLY.has(baseOf(c.argv[0])));
 }
 
+// #81 t11: gh commands that print and write no local file (`gh api URL`, `gh pr view N`, `gh run watch` ...): a name of unknown value in their words (`sha=$SHA`) names no path.
+// `gh run download`, `gh release download`, `gh pr checkout`, `gh repo clone` write local files and are not listed.
+const GH_PRINTERS = { pr: ['view', 'checks', 'list', 'diff', 'status'], run: ['view', 'list', 'watch'], issue: ['view', 'list', 'status'], repo: ['view'], auth: ['status'], workflow: ['list', 'view'], release: ['list', 'view'], label: ['list'] };
+function ghReadOnly(args) {
+  const words = [];
+  for (let i = 0; i < args.length && words.length < 2; i++) {
+    const a = args[i];
+    if (a === '-R' || a === '--repo') { i++; continue; }
+    if (a.startsWith('-')) continue;
+    words.push(a);
+  }
+  if (words[0] === 'api') return !args.some((a) => /^(?:-o|--output|--cache)/.test(a));
+  return Object.hasOwn(GH_PRINTERS, words[0] ?? '') && GH_PRINTERS[words[0]].includes(words[1]);
+}
 function isReadOnly(cmd, ctx) {
   const argv = cmd.argv;
   if (!argv.length) return false;
@@ -1151,6 +1165,7 @@ function isReadOnly(cmd, ctx) {
   if (READ_ONLY.has(name)) return !(name === 'rg' && args.some((a) => a === '--pre' || a.startsWith('--pre=')));
   if (name === 'find') return !args.some((a) => FIND_UNSAFE.test(a));
   if (name === 'git') return gitReadOnly(args);
+  if (name === 'gh') return ghReadOnly(args);
   if (name === 'jq') return !args.some((a) => /^-[A-Za-z]*i/.test(a) || a === '--in-place');
   if (name === 'sed' || name === 'gsed') return sedReadOnly(args);
   if (name === 'awk' || name === 'gawk' || name === 'mawk' || name === 'nawk') return awkReadOnly(args, cmd.env);

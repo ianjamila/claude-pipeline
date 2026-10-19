@@ -191,3 +191,16 @@ test('t11 an unknown directory refuses a package script only when the line menti
     assert.equal(g.decision, 'deny', cmd);
   }
 });
+
+// ---- 7. a name of unknown value in a command that writes no local file ---------------------------------------------------------------------------------------------
+// `M=$(gh pr view ...); SHA=${M#* }; gh api "repos/o/r/deployments?sha=$SHA"`: $SHA is part of a URL. A command that can write a local file (cp, gh run download ...) with that name still is refused.
+test('t11 a name of unknown value in the words of gh api / gh pr view names no path; in a command that writes files it does', () => {
+  const tree = { '.git': 'x', 'package.json': pkg(OK_SCRIPTS) };
+  const M = 'M=$(gh pr view 296 --json state -q .state); SHA=${M#* }; ';
+  for (const cmd of ['gh api "repos/o/r/deployments?sha=$SHA&environment=Production" -q ".[0].id"', 'gh pr view $SHA --json state', 'gh run view $SHA', 'gh -R o/r pr checks $SHA', 'gh issue list --search $SHA']) {
+    assert.equal(filesGuard(M + cmd, tree).decision, 'allow', cmd);
+  }
+  for (const cmd of ['cp x $SHA', 'gh run download 5 -D $SHA', 'gh release download v1 -D $SHA', 'gh pr checkout $SHA', 'gh repo clone o/r $SHA', 'gh api repos/o/r --output $SHA', 'tee $SHA < x']) {
+    assert.equal(filesGuard(M + cmd, tree).decision, 'deny', cmd);
+  }
+});
