@@ -240,6 +240,44 @@ test('outcomeSummary (F1): a generation first seen over 7 days ago but would-sto
   assert.equal(s.rows.length, 1);
 });
 
+// ---- F2: CLEAN needs an observer's word for a session-end would-stop
+
+const se = (o = {}) => dec({ source: 'session-end', ...o });
+const mark = (action, offset, o = {}) => ({ t: iso(T0_MS + offset), source: 'session-end', project: 'sa-corrections', generation: gen(), action, reasons: ['r'], ...o });
+
+test('outcomeSummary (F2): a session-end would-stop with an `observed` record after the window is CLEAN', () => {
+  const s = outcomeSummary([se(), mark('observed', 2 * HOUR)], [], T0_MS + 3 * HOUR);
+  assert.deepEqual([s.clean, s.unknown, s.rows.length], [1, 0, 1], 'markers add no row and are not would-stops');
+  assert.deepEqual(wouldStops([se(), mark('observed', 2 * HOUR)]).size, 1);
+});
+
+test('outcomeSummary (F2): a session-end would-stop with no observation is UNKNOWN once its window is over (PENDING before)', () => {
+  assert.equal(outcomeSummary([se()], [], T0_MS + HOUR).rows[0].outcome, 'PENDING');
+  const s = outcomeSummary([se()], [], T0_MS + 3 * HOUR);
+  assert.deepEqual([s.clean, s.unknown], [0, 1]);
+  assert.match(s.rows[0].note, /no re-probe was recorded/);
+  const text = renderReport(baseState({ now: T0_MS + 3 * HOUR, decisions: [se()] }));
+  assert.match(text, /MISS 0 \(\+1 unknown ⇒ not yet\)/);
+  assert.match(text, /sa-corrections — would-stop .* — no re-probe was recorded/);
+  assert.match(text, /Switch-on: not yet/);
+});
+
+test('outcomeSummary (F2): observation-late and observation-lost are UNKNOWN; an observed record of an OLDER record of the generation does not vouch for the newest', () => {
+  assert.equal(outcomeSummary([se(), mark('observation-late', 3 * HOUR)], [], T0_MS + 4 * HOUR).rows[0].outcome, 'UNKNOWN');
+  const lost = outcomeSummary([se(), mark('observation-lost', 40 * 60_000)], [], T0_MS + 4 * HOUR);
+  assert.equal(lost.rows[0].outcome, 'UNKNOWN');
+  assert.match(lost.rows[0].note, /worker died/);
+  const ds = [se(), mark('observed', 2 * HOUR), se({ t: iso(T0_MS + DAY) })];
+  assert.equal(outcomeSummary(ds, [], T0_MS + DAY + 3 * HOUR).rows[0].outcome, 'UNKNOWN');
+  assert.equal(outcomeSummary([...ds, mark('observed', DAY + 2 * HOUR)], [], T0_MS + DAY + 3 * HOUR).rows[0].outcome, 'CLEAN');
+});
+
+test('outcomeSummary (F2): a use still wins (MISS), and a sweep-sourced would-stop keeps its CLEAN rule (the sweep has no observer)', () => {
+  assert.equal(outcomeSummary([se(), mark('observation-lost', HOUR)], [useAt(10 * 60_000)], T0_MS + 4 * HOUR).rows[0].outcome, 'MISS');
+  const s = outcomeSummary([dec()], [], T0_MS + 4 * HOUR);
+  assert.deepEqual([s.clean, s.unknown], [1, 0]);
+});
+
 // ---------------------------------------------------------------- memoryOfProject
 
 const stats = (rows, extra = {}) => (cmd, args) => {

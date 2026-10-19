@@ -2,7 +2,9 @@
 // R2-9, R2-13, R2-14.
 //
 // FLOW (runSweep). One run at a time (run lock `sweep`, waitMs 0: a second run answers "already running"). Then:
-//   0. housekeeping: workers/<pid>.json whose pid is provably dead (procIdentity ok(null)) is removed; a live or unknown pid is kept;
+//   0. housekeeping: workers/<pid>.json whose pid is provably dead (procIdentity ok(null)) is removed; a live or unknown pid is kept.
+//      A dead worker's file in phase `decided` / `observing` means its re-probes never finished: for each decided target the file
+//      names, an `observation-lost` marker (not a decision) is appended, so that would-stop reads UNKNOWN, not CLEAN (F2);
 //   1. gates: machine config not ok => the report says "not configured", nothing is assessed, ZERO decisions are written; a
 //      non-default root without PIPELINE_STACKS_ONLY => refused;
 //   2. the lease ledger is read once under its lock. Damaged or unreadable => every stack is LISTED with the reason `ledger damaged`
@@ -111,9 +113,12 @@ export function hookHealth({ home = os.homedir(), fsx = fs } = {}) {
 
 // ---------------------------------------------------------------- housekeeping
 
-// Removes workers/<pid>.json when that pid is provably dead; a live or unknown pid keeps its file. -> { removed, kept, errors }.
+// Removes workers/<pid>.json when that pid is provably dead; a live or unknown pid keeps its file. -> { removed, kept, errors, lost }.
+// `lost` = [{ name, phase, targets: [{ project, generation, t }] | null }] for each removed file that was `decided` / `observing`
+// (a finished worker removes its own file, so one left behind by a dead pid never finished its re-probes); `targets` is the list
+// the worker wrote into its file once it had decided, null for a file from before that field existed.
 export function cleanWorkers({ files, run = realRun, ps, kill, platform = process.platform, identity = realProcIdentity, fsx = fs } = {}) {
-  const res = { removed: [], kept: [], errors: [] };
+  const res = { removed: [], kept: [], errors: [], lost: [] };
   let names;
   try {
     names = fsx.readdirSync(files.workers);
@@ -132,8 +137,20 @@ export function cleanWorkers({ files, run = realRun, ps, kill, platform = proces
       id = { ok: false, reason: oneLine(err?.message ?? err) };
     }
     if (id?.ok && id.value === null) {
+      let body = null;
+      try {
+        body = JSON.parse(fsx.readFileSync(path.join(files.workers, name), 'utf8'));
+      } catch {
+        /* an unreadable file names no targets */
+      }
       try {
         fsx.rmSync(path.join(files.workers, name), { force: true });
+        if (body && (body.phase === 'decided' || body.phase === 'observing')) {
+          const targets = Array.isArray(body.targets)
+            ? body.targets.filter((t) => t && typeof t.project === 'string' && t.project !== '').map((t) => ({ project: t.project, generation: t.generation ?? null, t: t.t ?? null }))
+            : null;
+          res.lost.push({ name, phase: body.phase, targets });
+        }
         res.removed.push(name);
       } catch (err) {
         res.errors.push(`cannot remove ${name}: ${err?.code ?? oneLine(err?.message)}`);
@@ -256,6 +273,21 @@ export async function runSweep({ apply = false, deps = {} } = {}) {
     const appendDecision = deps.appendDecision ?? realAppendDecision;
     const stopStack = deps.stopStack ?? realStopStack;
     const ev = { ...realEvidence, ...(deps.evidence ?? {}) };
+
+    // F2: a worker that died after deciding never finished its re-probes. Marker records, written with the decisions log's append.
+    for (const l of workers.lost) {
+      if (l.targets === null) {
+        log(`worker ${l.name} died in phase ${l.phase}; its file names no targets (older format), so no observation-lost marker can be written`);
+        continue;
+      }
+      for (const t of l.targets) {
+        const r = await appendDecision(files.actions, {
+          t: iso(now()), source: 'sweep', project: t.project, generation: t.generation, action: 'observation-lost',
+          reasons: [`session-end worker ${l.name} died in phase ${l.phase} before its re-probes finished${t.t ? ` (decided ${t.t})` : ''}`],
+        });
+        if (!r?.ok) note(`observation-lost for ${t.project} not recorded: ${r?.reason ?? 'no answer'}`);
+      }
+    }
 
     const finish = (summary, extra = {}) => {
       const t = now();

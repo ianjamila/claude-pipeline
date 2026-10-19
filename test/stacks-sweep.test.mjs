@@ -479,6 +479,34 @@ test('worker files from earlier session-end workers: a use-observed record they 
 
 // ======================================================================= housekeeping
 
+test('F2: a dead worker left in phase decided/observing gets an observation-lost marker per decided target (UNKNOWN, not CLEAN); a waiting one, a live one and a finished-and-removed one get none', async () => {
+  await withMachine({}, async (m) => {
+    const orphan = m.spec('orphan-demo');
+    const gen = { id: orphan.id, startedAt: orphan.startedAt };
+    const decidedAt = T0 - 3 * 3_600_000;
+    await appendDecision(m.files.actions, { t: new Date(decidedAt).toISOString(), source: 'session-end', project: 'orphan-demo', generation: gen, mode: 'report', action: 'would-stop', reasons: ['x'], evidence: {} });
+    mkdirSync(m.files.workers, { recursive: true });
+    const put = (pid, body) => writeFileSync(join(m.files.workers, `${pid}.json`), JSON.stringify({ pid, ...body }));
+    put(111, { phase: 'observing', decisions: 1, targets: [{ project: 'orphan-demo', generation: gen, t: new Date(decidedAt).toISOString() }] }); // died mid-probes
+    put(222, { phase: 'waiting', decisions: 0 }); // died before deciding: nothing to lose
+    put(333, { phase: 'observing', decisions: 1, targets: [{ project: 'other', generation: gen, t: 'x' }] }); // alive: still observing
+    put(444, { phase: 'decided', decisions: 2 }); // an older-format file: no targets named
+    const identity = (pid) => (pid === 333 ? ok({ pid, birth: 5 }) : ok(null));
+    m.consumers['orphan-demo'] = m.consumers['sa-corrections']; // an OPEN PR keeps it today: the sweep adds no newer would-stop record of its own
+    const r = await m.sweep({}, { procIdentity: identity });
+    assert.deepEqual(r.workers, ['111.json', '222.json', '444.json']);
+    const lost = m.actions().filter((d) => d.action === 'observation-lost');
+    assert.equal(lost.length, 1);
+    assert.deepEqual({ source: lost[0].source, project: lost[0].project, generation: lost[0].generation }, { source: 'sweep', project: 'orphan-demo', generation: gen });
+    assert.equal(r.outcomes.unknown, 1, 'the would-stop nobody finished observing is UNKNOWN');
+    assert.equal(r.outcomes.clean, 0);
+    assert.match(readFileSync(m.files.report, 'utf8'), /MISS 0 \(\+1 unknown ⇒ not yet\)/);
+    // a second sweep does not duplicate the marker (the file is gone)
+    await m.sweep({}, { procIdentity: identity });
+    assert.equal(m.actions().filter((d) => d.action === 'observation-lost').length, 1);
+  });
+});
+
 test('workers/<pid>.json: a dead pid is removed, a live one and an unknown one are kept, other names are ignored', async () => {
   await withMachine({}, async (m) => {
     mkdirSync(m.files.workers, { recursive: true });
@@ -493,7 +521,7 @@ test('workers/<pid>.json: a dead pid is removed, a live one and an unknown one a
 test('cleanWorkers: no workers folder is fine; an unreadable one is an error line, not a crash', () => {
   const base = realpathSync(mkdtempSync(join(tmpdir(), 'stacks-workers-')));
   try {
-    assert.deepEqual(cleanWorkers({ files: { workers: join(base, 'none') }, identity: () => { throw new Error('unused'); } }), { removed: [], kept: [], errors: [] });
+    assert.deepEqual(cleanWorkers({ files: { workers: join(base, 'none') }, identity: () => { throw new Error('unused'); } }), { removed: [], kept: [], errors: [], lost: [] });
     writeFileSync(join(base, 'file'), 'x');
     const r = cleanWorkers({ files: { workers: join(base, 'file') } });
     assert.equal(r.errors.length, 1);

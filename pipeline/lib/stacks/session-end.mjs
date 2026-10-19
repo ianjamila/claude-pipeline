@@ -332,8 +332,9 @@ export async function runSessionEnd({ owner, deps = {} } = {}) {
     const seenUses = new Set();
     const store = async (rec, { decision = true } = {}) => {
       const r = await appendDecision(files.actions, rec);
-      if (r?.ok && decision) decisions += 1;
-      else note(`decision for ${rec.project} not recorded: ${r?.reason ?? 'no answer'}`);
+      if (r?.ok) {
+        if (decision) decisions += 1;
+      } else note(`decision for ${rec.project} not recorded: ${r?.reason ?? 'no answer'}`);
       return r;
     };
 
@@ -358,7 +359,9 @@ export async function runSessionEnd({ owner, deps = {} } = {}) {
       }
     }
     result.status = 'decided';
-    wf.update({ phase: 'decided', decidedAt: iso(now()), decisions });
+    // The decided targets go into the file too: a worker killed before its probes leaves it behind, and the sweep that removes it
+    // records `observation-lost` for exactly these (F2: a would-stop nobody observed is UNKNOWN, never CLEAN).
+    wf.update({ phase: 'decided', decidedAt: iso(now()), decisions, targets: targets.map((t) => ({ project: t.stack.project, generation: t.generation, t: iso(t.decidedMs) })) });
 
     // ---- 5. observation at +30 and +120 min ----
     if (targets.length > 0) {
@@ -430,7 +433,7 @@ export async function runSessionEnd({ owner, deps = {} } = {}) {
         },
       });
       result.stacks.push({ project: stack.project, action: r.action, reasons: r.reasons, ...(r.alert ? { alert: r.alert } : {}) });
-      if ((r.action === 'would-stop' || r.action === 'stopped') && decidedT) targets.push({ stack, decidedMs: Date.parse(decidedT), generation: stack.generation });
+      if ((r.action === 'would-stop' || r.action === 'stopped') && decidedT) targets.push({ stack, decidedMs: Date.parse(decidedT), generation: stack.generation, action: r.action });
     }
 
     // One re-probe of C1-C3 for every would-stop / stopped project. What it sees after the decision is a "use"; the first sighting
@@ -445,8 +448,12 @@ export async function runSessionEnd({ owner, deps = {} } = {}) {
       // never a consumer, never an observed use: this process and every registered worker of the feature (sibling workers included)
       const own = new Set([process.pid, pid, ...ownPids(root, { isAlive: isAliveFn })]);
       const probeOpts = { run, ...(bins.lsof ? { lsof: bins.lsof } : {}), ...(bins.ps ? { ps: bins.ps } : {}), ...(deps.kill ? { kill: deps.kill } : {}), platform, deadlineAt, now, excludePids: own };
-      for (const { stack, decidedMs, generation } of groupTargets) {
+      const lastOffset = Math.max(...(deps.observeAtMs ?? OBSERVE_AT_MS));
+      const lateMs = slotMs - nominalMs;
+      for (const { stack, decidedMs, generation, action } of groupTargets) {
         const at = iso(stampMs);
+        let degraded = false; // a probe that should have answered did not: the stack was not observed
+        const marker = (kind, why) => store({ t: kind === 'observed' ? at : iso(slotMs), source: 'session-end', project: stack.project, generation, action: kind, reasons: [why] }, { decision: false });
         const add = async (check, hit, why) => {
           if (own.has(hit.pid)) return;
           const key = `${check}|${stack.project}|${hit.pid}|${hit.birth}|${hit.port ?? ''}`;
@@ -458,8 +465,10 @@ export async function runSessionEnd({ owner, deps = {} } = {}) {
         };
         // C1: leases registered after the decision, by anyone
         const evs = await readEvents();
-        if (!evs.ok) note(`${stack.project}: C1 re-probe skipped (${evs.reason})`);
-        else {
+        if (!evs.ok) {
+          degraded = true;
+          note(`${stack.project}: C1 re-probe skipped (${evs.reason})`);
+        } else {
           for (const e of leasesFor(evs.value, stack)) {
             if (!(Date.parse(e.t) > decidedMs)) continue;
             await add('C1', { pid: e.owner?.pid, birth: e.owner?.birth, command: `lease via ${e.via ?? 'unknown'}` }, `lease by pid ${e.owner?.pid}`);
@@ -473,6 +482,7 @@ export async function runSessionEnd({ owner, deps = {} } = {}) {
             r = { ok: false, reason: oneLine(err?.message ?? err) };
           }
           if (!r?.ok) {
+            if (action === 'would-stop') degraded = true; // a stopped stack has no listener to probe; a would-stop one must still answer
             const key = `${check}|${stack.project}|probe`;
             if (!seen.has(key)) {
               seen.add(key);
@@ -481,6 +491,12 @@ export async function runSessionEnd({ owner, deps = {} } = {}) {
             continue;
           }
           for (const hit of r.value) await add(check, hit, hit.pid === null || hit.pid === undefined ? 'a hidden client holds a connection' : `pid ${hit.pid} ${oneLine(hit.command).slice(0, 80)}`);
+        }
+        // F2: the last probe of a target proves it was watched. Outside the grace the stamp is outside the 2 h window, so a use it
+        // saw would have been dropped: that is `observation-late`, never an `observed` CLEAN. A degraded probe records nothing.
+        if (offset === lastOffset) {
+          if (lateMs > OBSERVE_GRACE_MS) await marker('observation-late', `the +${Math.round(offset / 60000)} min probe ran ${Math.round(lateMs / 60000)} min late (past the ${Math.round(OBSERVE_GRACE_MS / 60000)} min grace): its time is outside the outcome window`);
+          else if (!degraded) await marker('observed', `C1-C3 re-probed at +${Math.round(offset / 60000)} min, inside the outcome window`);
         }
       }
     }

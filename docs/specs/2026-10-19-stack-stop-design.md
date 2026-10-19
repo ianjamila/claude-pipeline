@@ -182,6 +182,11 @@ owner.json, dead-pid / never-finished reclaim serialized by a guard dir, live pi
     BEFORE the would-stop time — a live consumer the checks missed. Logged with pid, command, and which check missed it.
   - **RESTART** (cost only, data kept): a new use within 2 h from a process born AFTER the would-stop time.
   - **CLEAN**: no use within 2 h; stays CLEAN-after-N-days while unused.
+    A use is charged to the newest would-stop record of the project not later than it, rolled up into that generation's single
+    row (a long-lived generation is would-stopped again by every sweep). A session-end would-stop is CLEAN only when its worker
+    wrote an `observed` record after the last (+120 min) probe; with none, or an `observation-late` (probe fired past its grace)
+    or `observation-lost` (worker died, the sweep removed its file) marker, it is **UNKNOWN** and blocks switch-on like a MISS.
+    Sweep-sourced would-stops have no observer of their own and keep the plain CLEAN rule.
 - Sweep report `<PIPELINE_STACKS_HOME>/report.md` (latest) headlines: MISS count (7 days, must be 0 to switch on), RESTART
   count, CLEAN count and total GB that would have been freed; any missing/dangling installed hook file; a damaged
   ledger (stopping disabled until `P stacks repair`, owner-run, moves the bad line to

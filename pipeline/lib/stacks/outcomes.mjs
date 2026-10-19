@@ -22,7 +22,13 @@
 //     could be a MISS, so it blocks the switch-on recommendation exactly like one: the headline reads "MISS 0 (+2 unknown
 //     => not yet)".
 // A row's outcome is the worst class over all its records' uses (MISS > UNKNOWN > RESTART); with no use it is PENDING until the
-// NEWEST record's 2 h window is over, then CLEAN. The summary covers the last 7 days (by the newest record).
+// NEWEST record's 2 h window is over, then CLEAN -- but only when somebody watched (F2). A session-end would-stop is watched by
+// its worker's +30 / +120 min probes, which write an `observed` record after the last one (`observation-late`: the probe fired
+// past its grace, so its time is outside the window; `observation-lost`: the worker died before finishing and the sweep removed
+// its file). With no `observed` record at or after the newest record, or with a late / lost one, the row is UNKNOWN: "no use"
+// proves nothing when nothing was looked at. These three actions are markers, never decisions. A sweep-sourced would-stop has no
+// observer of its own (the sweeps after it are what sees uses), so its CLEAN rule is unchanged. The summary covers the last 7 days
+// (by the newest record).
 //
 // Time comes in as inputs (`now`, record `t`); nothing here reads a clock except as a default argument.
 import path from 'node:path';
@@ -81,6 +87,8 @@ export function readDecisions(file) {
 // ---------------------------------------------------------------- would-stops
 
 const STOP_ACTIONS = new Set(['would-stop', 'stopped']);
+// Observation markers of a generation (session-end / sweep write them with `store(..., { decision: false })`); not decisions.
+export const OBSERVATION_ACTIONS = Object.freeze(['observed', 'observation-late', 'observation-lost']);
 export const generationKey = (rec) => `${lower(rec?.project)}|${rec?.generation?.id ?? ''}|${rec?.generation?.startedAt ?? ''}`;
 
 // Every would-stop / stopped record, oldest first (log order breaks ties): what a use is charged to.
@@ -149,6 +157,13 @@ export function outcomeSummary(decisions, uses, now = Date.now()) {
       g.rec.lastSeen = rec.t;
     }
   }
+  const marks = new Map(); // generation key -> [{ action, ms }]
+  for (const rec of decisions ?? []) {
+    if (!isObject(rec) || !OBSERVATION_ACTIONS.includes(rec.action)) continue;
+    const key = generationKey(rec);
+    if (!marks.has(key)) marks.set(key, []);
+    marks.get(key).push({ action: rec.action, ms: toMs(rec.t) });
+  }
   const hits = new Map(); // generation key -> [{ ...use, class, against }]
   for (const use of uses ?? []) {
     const target = newestStopAt(stops, use?.project, toMs(use?.t));
@@ -167,13 +182,21 @@ export function outcomeSummary(decisions, uses, now = Date.now()) {
     if (!(newestMs >= nowMs - WEEK_MS)) continue;
     const used = hits.get(key) ?? [];
     const worst = used.reduce((w, u) => (RANK[u.class] > (RANK[w] ?? 0) ? u.class : w), null);
-    const outcome = worst ?? (nowMs >= newestMs + WINDOW_MS ? 'CLEAN' : 'PENDING');
+    let outcome = worst ?? (nowMs >= newestMs + WINDOW_MS ? 'CLEAN' : 'PENDING');
+    let note = null;
+    if (outcome === 'CLEAN' && newest.source === 'session-end') {
+      const after = (marks.get(key) ?? []).filter((m) => m.ms >= newestMs);
+      if (after.some((m) => m.action === 'observation-lost')) note = 'the worker died before its re-probes finished: nothing proves the stack was unused';
+      else if (after.some((m) => m.action === 'observation-late')) note = 'the last re-probe ran too late, outside the 2 h window: nothing proves the stack was unused';
+      else if (!after.some((m) => m.action === 'observed')) note = 'no re-probe was recorded after the would-stop: nothing proves the stack was unused';
+      if (note) outcome = 'UNKNOWN';
+    }
     sum[outcome.toLowerCase()] += 1;
     const memBytes = typeof rec.memBytes === 'number' && Number.isFinite(rec.memBytes) ? rec.memBytes : null;
     if (memBytes !== null) bytes += memBytes;
     sum.rows.push({
       project: rec.project, t: rec.t, lastSeen: rec.lastSeen, generation: rec.generation ?? null, action: rec.action, source: rec.source ?? null,
-      memBytes, outcome, uses: used, cleanDays: outcome === 'CLEAN' ? Math.floor((nowMs - decided) / DAY_MS) : null,
+      memBytes, outcome, uses: used, ...(note ? { note } : {}), cleanDays: outcome === 'CLEAN' ? Math.floor((nowMs - decided) / DAY_MS) : null,
     });
   }
   sum.rows.sort((a, b) => toMs(a.t) - toMs(b.t));
@@ -247,7 +270,10 @@ function useLine(row, u) {
 function outcomeSection(title, rows, cls, none) {
   const picked = rows.filter((r) => r.outcome === cls);
   if (picked.length === 0) return [`## ${title}`, none, ''];
-  return [`## ${title}`, ...picked.flatMap((r) => r.uses.filter((u) => u.class === cls).map((u) => useLine(r, u))), ''];
+  return [`## ${title}`, ...picked.flatMap((r) => {
+    const lines = r.uses.filter((u) => u.class === cls).map((u) => useLine(r, u));
+    return lines.length === 0 && r.note ? [`- ${oneLine(r.project)} — would-stop ${r.lastSeen ?? r.t} — ${r.note}`] : lines;
+  }), ''];
 }
 
 function listedLine(l) {
@@ -265,7 +291,7 @@ function devLine(d) {
 function switchOn(s) {
   const total = s.miss + s.restart + s.unknown + s.clean + s.pending;
   if (s.miss > 0) return 'no — a MISS means a live consumer was missed; fix the check before switching anything on';
-  if (s.unknown > 0) return `not yet — ${s.unknown} outcome(s) without a readable process identity count as MISS until explained`;
+  if (s.unknown > 0) return `not yet — ${s.unknown} outcome(s) without a readable process identity, or never observed, count as MISS until explained`;
   if (total === 0) return 'not yet — no would-stop was recorded in the last 7 days, so there is no evidence';
   if (s.pending > 0) return `wait — ${s.pending} would-stop(s) are still inside their 2 h window`;
   return `the evidence is clean (no MISS, no unknown across ${total} would-stop(s)); switching on is the owner's decision`;
@@ -291,7 +317,7 @@ export function renderReport(state = {}) {
   ];
   const out = ['# Stack stop report', '', `Generated ${when(now)}. Outcomes cover the last 7 days.`, '', '## Headlines', ...head, ''];
   out.push(...outcomeSection('MISS — a live consumer the checks missed', s.rows, 'MISS', 'none'));
-  out.push(...outcomeSection('UNKNOWN — identity unreadable (counts as MISS until explained)', s.rows, 'UNKNOWN', 'none'));
+  out.push(...outcomeSection('UNKNOWN — identity unreadable or never observed (counts as MISS until explained)', s.rows, 'UNKNOWN', 'none'));
   out.push(...outcomeSection('RESTART — used again after the would-stop (cost only)', s.rows, 'RESTART', 'none'));
   const clean = s.rows.filter((r) => r.outcome === 'CLEAN');
   out.push('## CLEAN — unused for 2 h after the would-stop', ...(clean.length ? clean.map((r) => `- ${oneLine(r.project)} — would-stop ${r.t}, unused for ${r.cleanDays} day(s)${r.memBytes ? `, ${(r.memBytes / GIB).toFixed(2)} GB` : ''}`) : ['none']), '');

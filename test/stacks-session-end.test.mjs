@@ -661,7 +661,7 @@ test('re-probe at +30 min sees a use by a process born BEFORE the decision => MI
   assert.deepEqual({ ...r.uses[0], t: undefined }, { t: undefined, project: 'alpha', pid: 777, birth: decisionSec - 3600, check: 'C3', command: 'psql -p 54322 -c "select 1" # alpha.stack' });
   assert.equal(r.uses[0].t, new Date(T0 + 30 * 60_000).toISOString());
   const { decisions, summary } = outcomes(w, c.now());
-  assert.deepEqual(decisions.map((d) => d.action), ['would-stop', 'use-observed']);
+  assert.deepEqual(decisions.map((d) => d.action), ['would-stop', 'use-observed', 'observed'], 'F2: the last probe adds its `observed` marker');
   assert.equal(summary.miss, 1);
   assert.equal(summary.restart, 0);
   assert.equal(summary.rows[0].outcome, 'MISS');
@@ -728,6 +728,61 @@ test('observedUses extracts the use objects, ignores everything else', () => {
   assert.deepEqual(observedUses([{ action: 'stopped' }, { action: 'use-observed', use: { t: 'x', project: 'p', pid: 1, birth: 2, check: 'C3' } }, { action: 'use-observed' }, null]), [{ t: 'x', project: 'p', pid: 1, birth: 2, check: 'C3' }]);
   assert.deepEqual(observedUses(undefined), []);
 });
+
+// ---- F2: a would-stop nobody observed is UNKNOWN, never CLEAN ----
+
+const markers = (w) => w.actions().filter((d) => ['observed', 'observation-late', 'observation-lost'].includes(d.action));
+
+test('F2: after the LAST probe an `observed` record is written (not after the +30 one); the row is CLEAN, and the marker is not a decision', () => withWorld({ mode: 'report' }, async (w, c) => {
+  await w.lease(OWNER);
+  let atFirstProbe;
+  let workerSeen;
+  const sleep = async (ms) => {
+    await c.sleep(ms);
+    if (c.sleeps.length === 1) workerSeen = readWorkerFile(w.workerFile).value;
+    if (c.sleeps.length === 2) atFirstProbe = markers(w).length;
+  };
+  const r = await runSessionEnd({ owner: OWNER, deps: depsFor(w, c, { sleep }) });
+  assert.equal(atFirstProbe, 0, 'nothing is marked after the +30 min probe');
+  const m = markers(w);
+  assert.equal(m.length, 1);
+  const decided = w.actions().find((d) => d.action === 'would-stop');
+  assert.deepEqual({ action: m[0].action, source: m[0].source, project: m[0].project, generation: m[0].generation }, { action: 'observed', source: 'session-end', project: 'alpha', generation: decided.generation });
+  assert.equal(m[0].t, new Date(Date.parse(decided.t) + 120 * 60_000).toISOString());
+  assert.ok(!r.notes.some((n) => /not recorded/.test(n)), 'a marker is stored with decision:false and is not reported as a failed decision');
+  assert.deepEqual(workerSeen.targets, [{ project: 'alpha', generation: decided.generation, t: decided.t }], 'the worker file names the decided targets (for observation-lost)');
+  assert.equal(workerSeen.decisions, 1, 'markers are not counted as decisions');
+  const { summary } = outcomes(w, c.now());
+  assert.deepEqual([summary.clean, summary.unknown], [1, 0]);
+}));
+
+test('F2: the +120 min timer firing past its grace (Mac slept) writes observation-late, no observed, and the row is UNKNOWN', () => withWorld({ mode: 'report' }, async (w, c) => {
+  await w.lease(OWNER);
+  const sleep = async (ms) => { await c.sleep(ms + (c.sleeps.length === 1 ? 3 * 3_600_000 : 0)); }; // the last timer fires 3 h late
+  await runSessionEnd({ owner: OWNER, deps: depsFor(w, c, { sleep }) });
+  const m = markers(w);
+  assert.deepEqual(m.map((d) => d.action), ['observation-late']);
+  assert.match(m[0].reasons[0], /late/);
+  const { summary } = outcomes(w, c.now());
+  assert.deepEqual([summary.clean, summary.unknown], [0, 1]);
+  assert.match(summary.rows[0].note, /too late/);
+}));
+
+test('F2: a late firing inside the grace is still observed; a would-stop probe that could not answer is not observed (UNKNOWN)', () => withWorld({ mode: 'report' }, async (w, c) => {
+  await w.lease(OWNER);
+  await runSessionEnd({ owner: OWNER, deps: depsFor(w, c, { sleep: async (ms) => { await c.sleep(ms + (c.sleeps.length === 1 ? 60_000 : 0)); } }) });
+  assert.deepEqual(markers(w).map((d) => d.action), ['observed']);
+  const w2 = makeWorld({ mode: 'report' });
+  try {
+    const c2 = clock();
+    await w2.lease(OWNER);
+    await runSessionEnd({ owner: OWNER, deps: depsFor(w2, c2, { evidence: { ...quiet, processRefs: () => (c2.sleeps.length ? unknown('ps failed') : ok([])) } }) });
+    assert.deepEqual(markers(w2), [], 'C3 never answered for a would-stop: nothing proves it was watched');
+    assert.equal(outcomes(w2, c2.now()).summary.unknown, 1);
+  } finally {
+    w2.cleanup();
+  }
+}));
 
 // ---- misc ----
 
