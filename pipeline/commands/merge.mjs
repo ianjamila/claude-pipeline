@@ -11,7 +11,7 @@ import { guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { headSha } from '../lib/git.mjs';
 import { currentProduction } from '../lib/deploy.mjs';
-import { runShellAsync } from '../lib/proc.mjs';
+import { envWithGhDir, runShellAsync } from '../lib/proc.mjs';
 import { postEvent } from '../lib/run-events.mjs';
 import { readSummaryComment } from '../lib/summary-comment.mjs';
 import { createRunRecorder, inFlightSince } from '../lib/run-progress.mjs';
@@ -178,7 +178,8 @@ export const run = guarded(async (argv, ctx) => {
       // 4. Merge with the approved head (fill is strict: a missing {sha} throws instead of merging whatever head exists).
       const { waitMs, pollMs } = mergeTiming(config, ctx.env ?? process.env);
       const command = fill(config.merge.command, { pr: String(pr), sha: gate.head }, { strict: true });
-      const ran = await runShellAsync(command, { cwd: root, env: ctx.env, timeoutMs: (config.merge.wait_minutes + 5) * 60_000 });
+      // The project command (eaglewatch: scripts/merge-pr.mjs) spawns gh itself: give it the dir gh() would have found.
+      const ran = await runShellAsync(command, { cwd: root, env: envWithGhDir(ctx.env), timeoutMs: (config.merge.wait_minutes + 5) * 60_000 });
       const commandOutput = tailLines(`${ran.stdout}${ran.stderr ? `\n${ran.stderr}` : ''}`, 30);
 
       // MERGED is MERGED: a merge commit GitHub cannot name yet is a warning, not a refusal (exit 1 means "nothing merged", and

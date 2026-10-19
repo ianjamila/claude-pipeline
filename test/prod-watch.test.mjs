@@ -3,9 +3,9 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, readdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, readdirSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname, resolve } from 'node:path';
+import path, { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, REPO_VIEW } from './helpers/fakegh-env.mjs';
@@ -631,6 +631,20 @@ test('createSmoke fills {url} strictly, passes expect-text through the environme
   const timedOut = createSmoke({ production: { smoke: 'x {url}' }, runShell: async () => ({ code: 0, stdout: '', stderr: '', timedOut: true }) });
   assert.equal((await timedOut({ url: 'https://a.b' })).ok, false, 'a timeout is never a pass');
   await assert.rejects(createSmoke({ production: { smoke: 'x {url} {sha}' }, runShell: async () => ({}) })({ url: 'https://a.b' }), /no value for \{sha\}/);
+});
+
+test('createSmoke appends the dir of a fallback-only gh to the smoke command PATH', { skip: process.platform === 'win32' }, async () => {
+  const fallback = mkdtempSync(join(tmpdir(), 'cp-smoke-gh-'));
+  writeFileSync(join(fallback, 'gh'), '#!/bin/sh\n');
+  chmodSync(join(fallback, 'gh'), 0o755);
+  const emptyPath = mkdtempSync(join(tmpdir(), 'cp-smoke-path-'));
+  const seen = [];
+  const smoke = createSmoke({
+    production: { smoke: 'x {url}' }, cwd: '/repo', env: { PATH: emptyPath, PIPELINE_GH: '' }, ghFallbackDirs: [fallback],
+    runShell: async (command, opts) => { seen.push(opts); return { code: 0, stdout: '', stderr: '', timedOut: false }; },
+  });
+  await smoke({ url: 'https://a.b', expectText: null });
+  assert.equal(seen[0].env.PATH, [emptyPath, fallback].join(path.delimiter));
 });
 
 // ---- the real git revert ----------------------------------------------------------------------------------------------
