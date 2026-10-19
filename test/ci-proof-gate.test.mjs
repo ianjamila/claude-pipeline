@@ -250,11 +250,11 @@ test('evaluateGate: the injected ciProof decides, the check keeps its name, and 
   assert.equal(Object.hasOwn(pending, 'proofs'), false);
 });
 
-test('evaluateGate: with the default (stub) lookup a CI deferral is ci-proof-missing; a local run records source local; no keys -> no proofs field', async () => {
+test('evaluateGate: with the default (real) lookup and no run on GitHub a CI deferral is ci-proof-missing; a local run records source local; no keys -> no proofs field', async () => {
   const stubbed = await gateFor(setup({ report: ciRow }));
   assert.equal(stubbed.ok, false);
   assert.deepEqual(stubbed.failed, ['verify-report']);
-  assert.match(stubbed.checks.find((c) => c.name === 'verify-report').detail, /ci-proof-missing:unit \(not implemented\)/);
+  assert.match(stubbed.checks.find((c) => c.name === 'verify-report').detail, /ci-proof-missing:unit \(the GitHub lookup failed/);
 
   const local = await gateFor(setup());
   assert.equal(local.ok, true, JSON.stringify(local.checks.filter((c) => !c.ok)));
@@ -274,7 +274,7 @@ test('final-gate CLI + merge: a gate with proofs is accepted by the merge comman
   assert.equal(r.json.merged, true);
 });
 
-test('final-gate CLI: a ci deferral with the not-yet-built lookup fails verify-report with ci-proof-missing and exit 1', () => {
+test('final-gate CLI: a ci deferral with no run on GitHub fails verify-report with ci-proof-missing and exit 1', () => {
   const s = setup({ report: ciRow });
   const r = s.gate();
   assertExit(r, 1, `${r.stderr}${r.stdout}`);
