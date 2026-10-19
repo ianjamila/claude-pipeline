@@ -175,6 +175,11 @@ test('H2 the parameter-open finder gives exactly the match of its pattern (it on
     const b = paramOpen(t);
     assert.deepEqual(b === null ? null : [b.index, ...b], a === null ? null : [a.index, ...a], JSON.stringify(t));
   }
+  for (const t of ['${a[]:-w}', '${a[}:-w}', '${a[x}]:-w}', '${a[x]}:-w}', '${a[1]-w}', '${!a[1]:+w}', '${a[1]x:-w}', '${a[${b[1]:-w}', '${a[${b}]:=w}', 'x ${a[ ${A[2]:?w}', '${a[1]', '${a[', '${!!:-w}', '${@:-w}', '${10:-w}', '${A:-${B[}]:-w}}']) {
+    const a = PARAM_OPEN.exec(t);
+    const b = paramOpen(t);
+    assert.deepEqual(b === null ? null : [b.index, ...b], a === null ? null : [a.index, ...a], t);
+  }
   // (and a long subscript, past anything a bounded pattern would read, is still a subscript)
   const long = '${A[' + 'x'.repeat(5000) + ']:-w}';
   assert.equal(paramOpen(long)?.[3], '-');
