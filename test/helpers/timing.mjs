@@ -11,6 +11,14 @@ export function cpuTime(fn) {
   return (d.user + d.system) / 1000;
 }
 
+// Runs `fn` once; returns its value and the CPU ms it burned. Load-proof like cpuTime, for caps that also need the result.
+export function cpuTimed(fn) {
+  const t0 = process.cpuUsage();
+  const r = fn();
+  const d = process.cpuUsage(t0);
+  return { r, ms: (d.user + d.system) / 1000 };
+}
+
 // The fastest of `runs` samples; `sample()` returns a number of ms.
 export function bestOf(runs, sample) {
   let best = Infinity;

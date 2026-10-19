@@ -3,6 +3,7 @@
 // `review-package`: ~315 refusals in 21 days). Patterns are not commands, but whatever runs inside them (a substitution) or in an arm still is,
 // and a pattern the shells would reject is parsed as before (as commands: strict).
 import { test } from 'node:test';
+import { cpuTimed } from './helpers/timing.mjs';
 import assert from 'node:assert/strict';
 import { simpleCommands } from '../pipeline/hooks/lib/shell-parse.mjs';
 
@@ -99,9 +100,8 @@ test('case: nested patterns that fail after a substitution cannot multiply the w
   for (const b of builds) for (const k of [25, 60]) {
     let t = 'true';
     for (let j = 0; j < k; j++) t = b(t);
-    const started = Date.now();
-    const cs = simpleCommands(t);
-    assert.ok(Date.now() - started < 5000, `finished in reasonable time (${k} levels)`);
+    const { r: cs, ms } = cpuTimed(() => simpleCommands(t));
+    assert.ok(ms < 5000, `finished in reasonable time (${k} levels): ${Math.round(ms)} ms of CPU`);
     assert.equal(cs.truncated, true);
   }
 });
