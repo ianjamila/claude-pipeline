@@ -31,7 +31,7 @@ export function stackFiles(root) {
     ledgerBad: f('ledger.bad.jsonl'),
     actions: f('actions.jsonl'),
     report: f('report.md'),
-    weekly: f('weekly.md'),
+    weekly: f('weekly-section.md'),
     cache: f('inventory.json'),
     locks: f('locks'), // base directory; the lock users below each get their own subdirectory
     workers: f('workers'),

@@ -311,14 +311,14 @@ test('e2e worker through the CLI: not configured => records it and decides nothi
 
 // ======================================================================= the stacks command
 
-test('stacks session-end: --owner is required and must be PID:BIRTH; other subcommands are not wired yet', async () => {
+test('stacks session-end: --owner is required and must be PID:BIRTH; an unknown subcommand is a usage error', async () => {
   assert.deepEqual(parseOwner('123:1792378037'), { pid: 123, birth: 1792378037 });
   for (const bad of [undefined, '', '123', '123:', ':5', 'a:b', '0:5', '-1:5', '1:2:3', '12 :5']) assert.throws(() => parseOwner(bad), UsageError, String(bad));
   if (process.platform === 'win32') return;
   await assert.rejects(() => runStacksCommand(['session-end']), UsageError);
   await assert.rejects(() => runStacksCommand(['session-end', '--owner', 'x']), UsageError);
   await assert.rejects(() => runStacksCommand(['session-end', '--owner', '1:2', '--bogus']), UsageError);
-  await assert.rejects(() => runStacksCommand(['sweep']), UsageError);
+  await assert.rejects(() => runStacksCommand(['bogus']), UsageError);
   await assert.rejects(() => runStacksCommand([]), UsageError);
 });
 

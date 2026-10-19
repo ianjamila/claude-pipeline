@@ -412,10 +412,15 @@ PATH of project commands: `merge.command` (merge), the `smoke` commands (smoke, 
 
 ## stacks
 
-stop private local Supabase stacks and dev servers once nobody needs them (session-end worker).
+stop private local Supabase stacks and dev servers once nobody needs them (daily sweep, session-end worker, status, repair, init, schedule).
 
 ```
+pipeline stacks sweep [--apply] [--summary-only]   -> {ok, summary, stopped:[...], wouldStop:[...], listed:[...], kept:[...]}
 pipeline stacks session-end --owner PID:BIRTH   -> {ok, waited, stacks:[...], dev:[...]}
+pipeline stacks status   -> {ok, configured, modes, paused, leases:[...], report}
+pipeline stacks repair   -> {ok, moved}
+pipeline stacks init [--write]   -> {ok, config, written}
+pipeline stacks schedule (--install [--at HH:MM] | --remove | --status)   -> {ok, installed|removed, label, timezone, warning?}
 ```
 
 ## state
