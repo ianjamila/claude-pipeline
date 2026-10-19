@@ -6,7 +6,7 @@
 //
 // A container without the `com.supabase.cli.workdir` label (the live DRMed stack has only the project label), or one whose
 // project's containers disagree about the workdir, has workdir null: "workdir unknown", never a guess, and the deciders
-// treat that as report-only. The stack folder is the workdir (the directory holding supabase/config.toml).
+// treat that as report-only. The stack workdir is the directory holding supabase/config.toml; its folder is that directory's basename (e.g. sa-corrections.stack).
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -105,7 +105,7 @@ function buildStack(project, list, { cfg, realpath }) {
     project,
     workdir,
     workdirExists,
-    folder: workdir,
+    folder: workdir === null ? null : path.basename(workdir),
     shared: isShared({ project, workdir }, cfg),
     generation: db ? { id: String(db.Id), startedAt: String(db.State?.StartedAt ?? '') } : null,
     containers: list.map((c) => ({ id: String(c.Id), name: stripSlash(c.Name), running: Boolean(c.State?.Running), startedAt: String(c.State?.StartedAt ?? '') })),

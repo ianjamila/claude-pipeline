@@ -46,7 +46,7 @@ test('containers are grouped by project label; ports deduped and sorted; generat
   assert.deepEqual(sa.volumes, ['cache', 'logs', 'supabase_db_sa']);
   assert.equal(sa.dbVolume, 'supabase_db_sa');
   assert.equal(sa.workdir, '/w/sa.stack');
-  assert.equal(sa.folder, '/w/sa.stack');
+  assert.equal(sa.folder, 'sa.stack');
   assert.equal(sa.shared, false);
   const other = r.value.stacks.find((s) => s.project === 'other');
   assert.equal(other.generation, null, 'no db container => no generation');
