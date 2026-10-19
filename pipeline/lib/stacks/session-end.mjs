@@ -362,14 +362,24 @@ export async function runSessionEnd({ owner, deps = {} } = {}) {
 
     // ---- 5. observation at +30 and +120 min ----
     if (targets.length > 0) {
-      // Measured from the EARLIEST decision time (each record's own `t`), not from after all decisions: deciding and logging take
-      // time, and a +120 min probe taken later than that would fall outside the outcome window and be dropped.
-      const decidedAll = targets.map((t) => t.decidedMs).filter(Number.isFinite);
-      const baseMs = decidedAll.length ? Math.min(...decidedAll) : now();
+      // Each target is measured from its OWN decision time (its record's `t`), not from the earliest one: decisions happen one after
+      // another (evidence + lock wait each), and a later stack's +120 min probe taken at the first stack's +120 min would fall
+      // short of the end of its own 2 h outcome window. Probes due at the same instant share one wait.
+      const slots = [];
+      for (const target of targets) {
+        const decidedMs = Number.isFinite(target.decidedMs) ? target.decidedMs : now();
+        for (const offset of deps.observeAtMs ?? OBSERVE_AT_MS) slots.push({ target, offset, nominalMs: decidedMs + offset });
+      }
+      slots.sort((x, y) => x.nominalMs - y.nominalMs);
       wf.update({ phase: 'observing' });
-      for (const offset of deps.observeAtMs ?? OBSERVE_AT_MS) {
-        await sleep(Math.max(0, baseMs + offset - now()));
-        await observe(offset, baseMs + offset);
+      for (let i = 0; i < slots.length;) {
+        const { nominalMs } = slots[i];
+        const group = slots.filter((s) => s.nominalMs === nominalMs);
+        i += group.length;
+        await sleep(Math.max(0, nominalMs - now()));
+        for (const offset of [...new Set(group.map((s) => s.offset))]) {
+          await observe(offset, nominalMs, group.filter((s) => s.offset === offset).map((s) => s.target));
+        }
       }
     }
     return result;
@@ -425,7 +435,7 @@ export async function runSessionEnd({ owner, deps = {} } = {}) {
 
     // One re-probe of C1-C3 for every would-stop / stopped project. What it sees after the decision is a "use"; the first sighting
     // of each (check, process) is recorded. A probe that cannot run (e.g. no listener on a stopped stack) is a note, not a use.
-    async function observe(offset, nominalMs) {
+    async function observe(offset, nominalMs, groupTargets) {
       const seen = seenUses;
       const slotMs = now();
       // A timer fires a little late. A late firing within the grace is stamped with its scheduled time, so the +120 min probe is not
@@ -435,7 +445,7 @@ export async function runSessionEnd({ owner, deps = {} } = {}) {
       // never a consumer, never an observed use: this process and every registered worker of the feature (sibling workers included)
       const own = new Set([process.pid, pid, ...ownPids(root, { isAlive: isAliveFn })]);
       const probeOpts = { run, ...(bins.lsof ? { lsof: bins.lsof } : {}), ...(bins.ps ? { ps: bins.ps } : {}), ...(deps.kill ? { kill: deps.kill } : {}), platform, deadlineAt, now, excludePids: own };
-      for (const { stack, decidedMs, generation } of targets) {
+      for (const { stack, decidedMs, generation } of groupTargets) {
         const at = iso(stampMs);
         const add = async (check, hit, why) => {
           if (own.has(hit.pid)) return;

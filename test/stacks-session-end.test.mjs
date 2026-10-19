@@ -854,3 +854,35 @@ test('re-probe: a timer that fires a little late still stamps the +120 use insid
   await runSessionEnd({ owner: OWNER, deps: depsFor(w, c, { evidence, sleep }) });
   assert.equal(outcomes(w, c.now()).summary.miss, 1);
 }));
+
+// ---- R2-B1: each stack's re-probes are measured from ITS OWN decision time, not from the earliest one ----
+
+test('re-probe: two stacks decided minutes apart are each observed at their own decision + 120 min (a late use on the second is not lost)', () => withWorld({ mode: 'report' }, async (w, c) => {
+  const betaWorkdir = join(w.base, 'beta.stack');
+  mkdirSync(join(betaWorkdir, 'supabase'), { recursive: true });
+  writeFileSync(join(betaWorkdir, 'supabase', 'config.toml'), 'project_id = "beta"\n');
+  const betaContainer = () => container({ id: 'dbid0002', name: '/supabase_db_beta', project: 'beta', workdir: betaWorkdir, running: true, ports: { '5432/tcp': [{ HostPort: '54422' }] }, dbVolume: 'supabase_db_beta' });
+  const run = (cmd, args = [], opts = {}) => fakeDocker({ ps: `${GEN_ID}\ndbid0002\n`, inspect: [w.container(), betaContainer()], volumes: [DB_VOLUME, 'supabase_db_beta'] })(cmd, args, opts);
+  await w.lease(OWNER);
+  await w.lease(OWNER, { project: 'beta', workdir: betaWorkdir });
+  const decisionSec = Math.floor(T0 / 1000);
+  let betaHit = false;
+  const evidence = { ...quiet, processRefs: (stack) => ok(betaHit && stack.project === 'beta' ? [{ pid: 777, birth: decisionSec - 3600, command: 'psql beta.stack', field: 'cmdline' }] : []) };
+  // deciding the first stack takes 5 simulated minutes (its evidence and its log line), so the second is decided later
+  const slowFirst = async (file, rec, o) => { if (rec.project === 'alpha') c.t += 5 * 60_000; return appendDecision(file, rec, o); };
+  // the use shows up only after the first stack's last probe time (its own decision + 120 min), before the second's
+  const sleep = async (ms) => {
+    await c.sleep(ms);
+    if (c.sleeps.length === 2) betaHit = true;
+  };
+  const r = await runSessionEnd({ owner: OWNER, deps: depsFor(w, c, { run, evidence, sleep, appendDecision: slowFirst, observeAtMs: [120 * 60_000] }) });
+  const decided = Object.fromEntries(w.actions().filter((d) => d.action === 'would-stop').map((d) => [d.project, Date.parse(d.t)]));
+  assert.deepEqual(Object.keys(decided).sort(), ['alpha', 'beta']);
+  assert.ok(decided.beta - decided.alpha >= 5 * 60_000, 'the second stack was decided at least 5 min after the first');
+  assert.equal(c.sleeps.length, 2, 'one wait per distinct probe time');
+  assert.equal(r.uses.length, 1, 'the late use on the second stack is recorded');
+  assert.equal(r.uses[0].project, 'beta');
+  assert.equal(r.uses[0].t, new Date(decided.beta + 120 * 60_000).toISOString(), 'stamped at the second stack\'s own decision + 120 min');
+  assert.equal(outcomes(w, c.now()).decisions.filter((d) => d.action === 'use-observed' && d.project === 'beta').length, 1);
+  assert.equal(outcomes(w, c.now()).summary.miss, 1);
+}));
