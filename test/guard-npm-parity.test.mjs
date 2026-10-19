@@ -281,6 +281,15 @@ test('t2 (regression) an unmodelled command with a run-time argument is no known
     allowed(`${pre}; npm run build`, nm);
     allowed(`${pre} && npm test`, nm);
   }
+  // a program we do not model that is handed package.json and a lock file (words the guards mind inside) does not copy the lock file over package.json
+  const lock = { ...nm, 'package-lock.json': JSON.stringify({ name: 'x', packages: { ['node_modules/tailwind-me' + 'rge']: { note: 'see install.md' } } }) };
+  for (const pre of ['mytool package-lock.json package.json', 'git diff --name-only HEAD -- package-lock.json package.json | head', 'mytool -o package.json --from package-lock.json']) allowed(`${pre}; npm run build`, lock);
+  refused('cp package-lock.json package.json; npm run build', lock); // (a copy that names both: the lock file is what runs)
+  refused('mv package-lock.json package.json; npm run build', lock);
+  refused('cat package-lock.json > package.json; npm run build', lock);
+  // an append to a file only known at run time: package.json's own words in front of it are not the appended text
+  for (const pre of ["printf '\\nok\\n' >> $T", "echo ok >> $T/x.ts", "F=a.ts; cp $F b.bak; printf '\\nok\\n' >> $F; cp b.bak $F"]) allowed(`${pre}; npm run build`, nm);
+  refused(`printf '\\n${PUSH} ${CL}\\n' >> package.json; npm run build`, nm);
   // the plain script gets the same verdict
   for (const pre of ['lsof -p $pid']) assert.equal(git(`${pre}; bash run.sh`, { ...tree(nm), ...PLAIN }).decision, 'allow');
   // twins: a write that names the file, a redirect, tee, an inline writer with a guarded command and a mention

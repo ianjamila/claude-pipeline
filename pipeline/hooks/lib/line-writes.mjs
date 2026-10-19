@@ -1687,6 +1687,7 @@ const MAX_CHAIN = 24; // a file copied from a file copied from a file ... (longe
 // { texts, files, scans, unknown } or null when no write reaches it. `files` are the sources (and their own sources, in turn): the
 // caller judges each as the script it is. `exists(path)`: is there a file now (a missing one may have been created by an unmodelled command).
 // `ignoreUnmodelled`: the real home's startup files (no word on the line names them) are not "a missing script that something may have created".
+// `genericAsUnknown`: a program we do not model that is handed the file's name among its words is an unknown write, not a copy of the files among its words (a package manager's file check).
 // `viaUnmodelled` in the result: the answer depends on a command we do not model (a cached verdict must not outlive a new one). `named`: some write names this very file (an exact target, not a subtree or a target only known at run time).
 // `readText(path)`: the text of a file now (string, or null). `joined`: the whole texts the file may hold when several writes build it (appends, cat A B);
 // `pieces`: it is built from pieces and cannot be put together (a piece unknown, computed or too many), so no single piece can be judged for what the file runs.
@@ -1713,9 +1714,9 @@ export function joinedReadings(parts, cap = 32) {
   return acc;
 }
 
-export function writtenTo(frames, target, { exists, readText = () => null, ignoreUnmodelled = false }) {
+export function writtenTo(frames, target, { exists, readText = () => null, ignoreUnmodelled = false, genericAsUnknown = false }) {
   if (!frames.length || !frames.some((f) => f.recs.length || f.unmodelled.size)) return null;
-  const st = { texts: new Set(), files: new Set(), scans: new Set(), programs: new Set(), authored: false, unknown: false, any: false, seen: new Set(), ignoreUnmodelled, viaUnmodelled: false };
+  const st = { texts: new Set(), files: new Set(), scans: new Set(), programs: new Set(), authored: false, unknown: false, any: false, seen: new Set(), ignoreUnmodelled, genericAsUnknown, viaUnmodelled: false };
   const upto = frames.length - 1;
   collect(frames, upto, frames[upto].i, target, st, 0, exists);
   if (!st.any) return null;
@@ -1783,6 +1784,7 @@ function collect(frames, upto, asOf, P, st, depth, exists) {
   const pairs = linkPairs(frames, upto, asOf);
   const names = pairs.length ? namesOf(pairs, P) : [P];
   for (const h of hitsOn(frames, upto, asOf, P)) {
+    if (h.rec.generic !== undefined && st.genericAsUnknown) { st.any = true; st.unknown = true; continue; } // (a program we do not model, handed words that may name the file: it may write the file, with content nobody knows -- its other words are not a source it copies from)
     if (h.loose && st.ignoreUnmodelled) continue; // (the real home's startup files: only the line's exact writes reach them, not a target known only at run time)
     if (!h.loose && !h.rec.subtree && h.items.some((it) => it.abs === undefined)) st.named = true; // (a write that names this very file, not one that may reach it: the target of a redirect, cp, mv, sed -i ..., not a tar x or a worktree add below a directory, nor a file some directory copy may carry in)
     absorb(frames, h.fi, h.f, h.rec, h.items, h.P, st, depth, exists);
