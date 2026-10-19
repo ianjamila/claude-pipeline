@@ -69,7 +69,7 @@ test('the first bytes decide (binIsProgram): shells and no shebang open the file
   for (const t of ['#!/bin/sh\n', '#!/bin/bash -e\n', '#! /usr/bin/dash\n', '#!/usr/bin/env zsh\n', '#!/usr/bin/env -S bash -e\n', '#!/usr/bin/env -Sbash -e\n', '#!/usr/bin/env -i FOO=1 sh\n', '#!/bin/busybox sh\n', '#!/bin/ksh93\n', '#!/bin/bash5\n', '#!\n', '#!/usr/bin/env\n', 'echo hi\n', '', '\n#!/usr/bin/env node\n', ' #!/usr/bin/env node\n', 'import "./x.js"\n', '#!/bin/sh\r\ngit x\r\n']) {
     assert.equal(binIsProgram(t), false, JSON.stringify(t));
   }
-  for (const t of ['#!/usr/bin/env node\n', '#!/usr/bin/node\n', '#!/usr/bin/env -S node --no-warnings\n', '#!/usr/bin/env bun\n', '#!/usr/bin/env deno run\n', '#!/usr/bin/python3\n', '#!/usr/bin/env -S -u X python\n', '#!/bin/busybox awk -f\n', '#!/usr/bin/awk -f\n', '\u007fELF\u0002\u0001', 'abc\u0000def', '����\u0007\u0000']) {
+  for (const t of ['#!/usr/bin/env node\n', '#!/usr/bin/node\n', '#!/usr/bin/env -S node --no-warnings\n', '#!/usr/bin/env -Snode --no-warnings\n', '#!/usr/bin/env --split-string=node -r x\n', '#!/usr/bin/env bun\n', '#!/usr/bin/env deno run\n', '#!/usr/bin/python3\n', '#!/usr/bin/env -S -u X python\n', '#!/bin/busybox awk -f\n', '#!/usr/bin/awk -f\n', '\u007fELF\u0002\u0001', 'abc\u0000def', '����\u0007\u0000']) {
     assert.equal(binIsProgram(t), true, JSON.stringify(t));
   }
   assert.equal(binIsProgram('x'.repeat(600) + '\u0000'), false, 'a NUL after the first 512 bytes is not the binary test');
