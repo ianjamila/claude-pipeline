@@ -292,21 +292,24 @@ export function nameAtRunTimeIn(text) {
   return false;
 }
 
-// What an earlier command of the line may change before the package manager reads package.json, the configuration files or the work tree (git checkout / pull / merge ..., npm pkg set,
-// npm config set, npm init, tar x, patch ...). A writer of a NAMED file (redirect, cp, mv, sed -i, tee ...) is not here: writtenTo models those and the callers ask it for each file read.
-// #81 t11: a git command counts only when its SUBCOMMAND changes files in a work tree (`git log`, `git commit -m "merge x"`, `git fetch` do not), and only for a package directory that work tree
-// holds: the repository of the directory it runs in (`-C`, cd), or the one new directory `git worktree add` creates. A directory the guard cannot work out, on either side, counts.
-const GIT_TREE_SUBS = new Set(['checkout', 'switch', 'restore', 'pull', 'merge', 'rebase', 'am', 'apply', 'cherry-pick', 'revert', 'clean', 'read-tree', 'submodule', 'sparse-checkout', 'bisect', 'mv', 'rm', 'filter-branch']);
-const GIT_ANY_SUBS = new Set(['clone', 'checkout-index']); // (they write where the line says: --prefix=DIR, a new clone)
-const GIT_STASH_CHANGERS = new Set(['push', 'save', 'pop', 'apply', 'branch']);
-const GIT_WORKTREE_QUIET = new Set(['list', 'prune', 'remove', 'move', 'lock', 'unlock', 'repair']);
-const GIT_RESET_HARD = /^--(?:h|ha|har|hard|me|mer|merg|merge|k|ke|kee|keep)$/; // (git accepts any unambiguous prefix of a long option)
-// a line that can move the work tree, the git directory or the meaning of a subcommand (an alias defined on the line): its git commands count wherever they run
-const GIT_LINE_HAZARD = /GIT_(?:DIR|WORK_TREE|CONFIG\w*|COMMON_DIR)|--work-tree|--git-dir|core\.worktree|\balias\./i;
-const BULK_WRITERS = new Set(['tar', 'unzip', '7z', '7za', 'rsync', 'patch', 'cpio', 'ditto', 'bsdtar', 'pax', 'unrar', 'unpigz']);
+// What an earlier command of the line does to the files a package manager reads (package.json, the configuration files, node_modules, server.js ...).
+// #89 t2: the rule is the one both guards apply to a plain script file (`bash run.sh`): the file is judged as it is, and refused when the line WRITES it ('known': writtenTo places the write, or the command
+// names the path) or MAY write it ('maybe': a target only known at run time) while the line mentions a guarded operation. A git command that changes the work tree (checkout, pull, worktree add ...), a bulk
+// writer (tar, rsync, patch ...) and a background job are no reason of their own: `git checkout other && bash run.sh` is allowed, so is `git checkout other && npm test`.
+// What a script file has no counterpart for stays here:
+//   - the manager's own writes (npm pkg set, npm set-script, npm config set, npm init ...): known changes of package.json and the configuration, refused whatever the line says;
+//   - a command that creates, removes or renames a marker file (rm -rf node_modules, mv package.json x, touch server.js): a path the command names is known, one only known at run time (`cp $F x.bak`) is maybe;
+//   - an install, which adds and replaces node_modules/.bin (pkgBinsDirty).
+// A writer of a NAMED file (redirect, cp, mv, sed -i, tee ...) is not here: writtenTo models those and the callers ask it for each file read.
 const PM_CHANGE_WORDS = new Set(['pkg', 'set-script', 'init', 'create', 'edit', 'link', 'ln']);
 const CONFIG_WRITE_WORDS = new Set(['set', 'delete', 'edit', 'rm', 'remove', 'unset']);
-export const BACKGROUND = /(?<![&>|])&(?![&>])/;
+function managerWrites(argv) {
+  const words = baseName(argv[0] ?? '') === 'corepack' ? argv.slice(1) : argv;
+  const name = baseName(words[0] ?? '');
+  if (!Object.hasOwn(PM_RUN_ALIASES, name)) return false;
+  const head = words.slice(1, 8);
+  return head.some((w) => PM_CHANGE_WORDS.has(w)) || (head.some((w) => w === 'config' || w === 'c') && head.some((w) => CONFIG_WRITE_WORDS.has(w))) || (name === 'yarn' && head[0] === 'set');
+}
 
 // Where a word names, from each directory the command may run in: string[] (a glob stays in the text when allowGlob), or null (only known at run time).
 const UNKNOWN_HEAD = '\u0000?/';
@@ -331,8 +334,10 @@ function placeWord(site, dirs, w, allowGlob) {
 // the scripts run with. markerPaths names what a command touches; pkgDirtyFor asks whether it is one of those files in the package's directory or above it.
 export const PACKAGE_MARKERS = new Set(['node_modules', 'package.json', 'server.js', 'binding.gyp', '.npmrc', '.yarnrc', '.yarnrc.yml', 'bunfig.toml', '.bunfig.toml', 'pnpm-workspace.yaml']);
 const FS_CHANGERS = new Set(['mkdir', 'touch', 'rm', 'rmdir', 'unlink', 'mv', 'cp', 'ln', 'install', 'truncate', 'dd', 'mkfifo', 'shred', 'rename', 'ditto']);
-const FS_VALUE_OPTS = new Set(['-t', '--target-directory', '-S', '--suffix', '-m', '--mode', '-o', '-g', '-r', '-d', '--date', '-s', '--size', '--reference']);
-// string[] of the paths (a glob stays in the text), `null` when one of them is only known at run time, undefined when the command is none of these
+// (options that take the next word, by command: `ln -s` and `cp -r` are flags, `install -d` creates directories, `touch -r REF` and `truncate -s SIZE` take a value)
+const FS_VALUE_OPTS = { cp: ['-S', '--suffix'], mv: ['-S', '--suffix'], ln: ['-S', '--suffix'], install: ['-S', '--suffix', '-m', '--mode', '-o', '-g'], mkdir: ['-m', '--mode'], mkfifo: ['-m', '--mode'], touch: ['-d', '--date', '-r', '--reference', '-t'], truncate: ['-s', '--size', '-r', '--reference'], dd: [] };
+// string[] of the paths (a glob stays in the text; UNKNOWN_HEAD + the literal tail when only the directory is unknown), with a `null` for each one only known at run time; undefined when the command is none of these.
+// The array's `gone` is the set of those the command removes or moves away (rm, rmdir, unlink, the source of mv): a node_modules folder only matters when it goes (one that appears hides the package.json above it, which was judged anyway).
 function markerPaths(words, site) {
   const name = baseName(words[0] ?? '');
   if (!FS_CHANGERS.has(name)) return undefined;
@@ -341,6 +346,7 @@ function markerPaths(words, site) {
   const pos = [];
   let target = null;
   const out = [];
+  const gone = new Set();
   for (let i = 1; i < words.length; i++) {
     const w = words[i];
     if (w === '--') { pos.push(...words.slice(i + 1)); break; }
@@ -348,7 +354,7 @@ function markerPaths(words, site) {
     if (w === '-t' || w === '--target-directory') { target = words[++i] ?? ''; continue; }
     if (w.startsWith('--target-directory=')) { target = w.slice(19); continue; }
     if (/^-t./.test(w) && !w.startsWith('--') && !(name === 'touch' || name === 'rm')) { target = w.slice(2); continue; }
-    if (FS_VALUE_OPTS.has(w) && !(name === 'rm' && w === '-r') && !(name === 'mkdir' && w === '-p')) { i++; continue; }
+    if (FS_VALUE_OPTS[name]?.includes(w)) { i++; continue; }
     if (w.startsWith('-') && w !== '-') continue;
     pos.push(w);
   }
@@ -359,12 +365,14 @@ function markerPaths(words, site) {
   if (['cp', 'mv', 'ln', 'install', 'ditto', 'rename'].includes(name)) {
     const dest = target ?? pos[pos.length - 1];
     const srcs = target !== null ? pos : pos.slice(0, -1);
-    if (dest === undefined) return null;
-    add(place(dest));
+    if (dest === undefined) return [null];
+    // (a destination written as a directory -- `.`, `..`, `dir/` -- is not created or replaced itself: what lands in it is joinTo's)
+    if (!/(?:^|\/)\.{0,2}\/?$/.test(dest)) add(place(dest));
     for (const src of srcs) add(joinTo(dest, src));
-    if (name === 'mv' || name === 'rename') for (const src of srcs) add(place(src)); // (the source is gone)
-  } else for (const w of pos) add(place(w));
-  return out.includes(null) ? null : out;
+    if (name === 'mv' || name === 'rename') for (const src of srcs) { const l = place(src); add(l); for (const x of l ?? []) gone.add(x); } // (the source is gone)
+  } else for (const w of pos) { const l = place(w); add(l); if (['rm', 'rmdir', 'unlink', 'shred'].includes(name)) for (const x of l ?? []) gone.add(x); }
+  out.gone = gone;
+  return out;
 }
 // which of the marker files does the glob-or-literal path component `first` name?
 function componentIsMarker(first) {
@@ -375,71 +383,18 @@ function componentIsMarker(first) {
   return [...PACKAGE_MARKERS].filter((m) => rx.test(m));
 }
 
-// site: { dirs: string[] | null (where the command runs; null: unknown), expand(word) -> text, home, p (path module), text (the line) }.
-// Returns null (changes no work tree), 'any' (changes something we cannot place), { k: 'tree' | 'new', dirs: string[] | null }.
-function gitEffect(words, site) {
-  const p = site.p ?? nodePath;
-  let dirs = site.dirs ?? null;
-  const expand = (w) => (site.expand ? site.expand(String(w ?? '')) : String(w ?? ''));
-  const moved = (w) => placeWord(site, dirs, w, false);
-  if (GIT_LINE_HAZARD.test(site.text ?? '')) return 'any'; // (every git command of such a line: the definition of an alias may come after the command that runs it)
-  let relocated = false; // --git-dir / --work-tree: the work tree is wherever the option says
-  let i = 1;
-  for (; i < words.length; i++) {
-    const t = words[i];
-    if (t === '-C') { dirs = moved(words[++i]); continue; }
-    if (t === '-c' || t === '--namespace' || t === '--super-prefix' || t === '--config-env') { i++; continue; }
-    if (t === '--git-dir' || t === '--work-tree') { relocated = true; i++; continue; }
-    if (t.startsWith('--git-dir=') || t.startsWith('--work-tree=')) { relocated = true; continue; }
-    if (t.startsWith('-')) continue;
-    break;
-  }
-  if (i >= words.length) return null;
-  const sub = expand(words[i]);
-  if (/[$`*?[\]]/.test(sub)) return 'any'; // (the subcommand is only known at run time)
-  const args = words.slice(i + 1);
-  let kind = null;
-  if (GIT_TREE_SUBS.has(sub)) kind = 'tree';
-  else if (GIT_ANY_SUBS.has(sub)) kind = 'any';
-  else if (sub === 'reset') kind = args.some((a) => GIT_RESET_HARD.test(a)) ? 'tree' : null;
-  else if (sub === 'stash') kind = args[0] === undefined || args[0].startsWith('-') || GIT_STASH_CHANGERS.has(args[0]) ? 'tree' : null;
-  else if (sub === 'worktree') kind = args[0] === 'add' ? 'new' : args[0] === undefined || GIT_WORKTREE_QUIET.has(args[0]) ? null : 'any';
-  if (kind === null) return null;
-  if (kind === 'any' || relocated) return 'any';
-  if (kind === 'tree') return { k: 'tree', dirs, nested: sub !== 'submodule' }; // (nested: a repository below this work tree keeps its own files; submodule update writes into them)
-  // worktree add [-f] [-b BRANCH] [--reason R] PATH [COMMIT]: the new directory is PATH
-  let target = null;
-  for (let j = 1; j < args.length; j++) {
-    const t = args[j];
-    if (t === '-b' || t === '-B' || t === '--reason') { j++; continue; }
-    if (t === '--') { target = args[j + 1] ?? null; break; }
-    if (t.startsWith('-')) continue;
-    target = t;
-    break;
-  }
-  return target === null ? 'any' : { k: 'new', dirs: moved(target) };
-}
-// true: some later package script cannot be trusted whatever its directory; an object: a git change placed in a directory; null: nothing
-function stateEffect(argv, site) {
-  const words = baseName(argv[0] ?? '') === 'corepack' ? argv.slice(1) : argv;
-  const name = baseName(words[0] ?? '');
-  if (name === 'git') { const e = gitEffect(words, site); return e === 'any' ? true : e; }
-  if (BULK_WRITERS.has(name)) return true;
-  if (!Object.hasOwn(PM_RUN_ALIASES, name)) return null;
-  const head = words.slice(1, 8);
-  return head.some((w) => PM_CHANGE_WORDS.has(w)) || (head.some((w) => w === 'config' || w === 'c') && head.some((w) => CONFIG_WRITE_WORDS.has(w))) || (name === 'yarn' && head[0] === 'set') ? true : null;
-}
-// Remembers on the evaluation's shared budget what the commands in `argvs` (in the order they run, or all of them when the line puts one in the background: site.dirs null) may change.
+// Remembers on the evaluation's shared budget what the commands in `argvs` (in the order they run) did to those files. site: { dirs: string[] | null (where the command runs; null: unknown), expand(word) -> text, home, p (path module) }.
 export function markPackageState(budget, argvs, site = {}) {
   for (const a of argvs) {
     if (!a.length) continue;
-    const e = stateEffect(a, site);
-    if (e === true) budget.pkgDirty = true;
-    else if (e) (budget.pkgGit ??= []).push(e);
+    if (managerWrites(a)) budget.pkgDirty = true;
     const mp = markerPaths(a, site);
     if (mp !== undefined) {
-      (budget.pkgMarkers ??= []).push(mp);
-      if (mp === null || mp.some((x) => x.split('/').includes('node_modules'))) budget.pkgBinsDirty = true; // (a bin may come or go)
+      const maybe = mp.filter((x) => x === null || x.startsWith(UNKNOWN_HEAD));
+      const known = mp.filter((x) => x !== null && !x.startsWith(UNKNOWN_HEAD));
+      if (known.length) (budget.pkgMarkers ??= []).push({ paths: known, gone: mp.gone });
+      if (maybe.length) (budget.pkgMarkersMaybe ??= []).push(maybe);
+      if (mp.some((x) => x === null || x.split('/').includes('node_modules'))) budget.pkgBinsDirty = true; // (a bin may come or go)
     }
     if (pmCall(a)?.installGroup) budget.pkgBinsDirty = true; // (an install adds and replaces node_modules/.bin)
   }
@@ -452,48 +407,32 @@ export function pmStartDirs(call, cwds, home, p = nodePath) {
   const d = call.dir === '~' || call.dir.startsWith('~/') ? p.join(home ?? '', call.dir.slice(1)) : call.dir;
   return cwds.map((c) => p.resolve(c, d));
 }
-// Did an earlier command of the line (markPackageState) change what a manager started in one of `starts` reads? env: { pathExists, real(abs) -> abs, p }; deep: the call also reaches workspace packages below.
-// env.markers: ask about the marker files only (the callers ask that after the manager's own reading of what the line writes, so a write they model keeps its own message)
-export function pkgDirtyFor(budget, starts, env = {}) {
-  if (!env.markers && budget.pkgDirty) return true;
-  const list = env.markers ? [] : budget.pkgGit;
-  const markers = env.markers ? budget.pkgMarkers : [];
-  if (!list?.length && !markers?.length) return false;
-  if (starts === null || starts === undefined) return true;
+// Did an earlier command of the line run the manager's own write (npm pkg set, npm config set, npm init ...)? It changes package.json or the configuration for every manager call after it.
+export const pkgOwnWrite = (budget) => budget.pkgDirty === true;
+// Did an earlier command of the line (markPackageState) create, remove or rename a marker file in the package directory of a manager started in one of `starts`, or above it?
+// 'known': a path the command names (a glob that matches a marker too); 'maybe': one only known at run time (`cp $F x.bak`, `rm -rf $D/node_modules`): the callers refuse it only when the line mentions a guarded operation.
+// env: { pathExists, real(abs) -> abs, p (path module) }
+export function pkgMarkersFor(budget, starts, env = {}) {
+  const known = budget.pkgMarkers ?? [];
+  const maybe = budget.pkgMarkersMaybe ?? [];
+  if (!known.length && !maybe.length) return null;
+  if (starts === null || starts === undefined) return known.length ? 'known' : 'maybe';
   const p = env.p ?? nodePath;
   const forms = (x) => { const r = env.real ? env.real(x) : x; return r && r !== x ? [x, r] : [x]; };
-  const inside = (a, b) => forms(a).some((x) => forms(b).some((y) => x === y || x.startsWith(y.endsWith('/') ? y : `${y}/`)));
   const exists = (x) => env.pathExists?.(x) === true;
-  const rootOf = (d) => { // the nearest directory at or above `d` that holds a .git (a directory, or the file a linked work tree has)
-    for (let x = d, n = 0; n < MAX_WALK; n++) {
-      if (exists(p.join(x, '.git'))) return x;
-      const up = p.dirname(x);
-      if (up === x) return null;
-      x = up;
-    }
-    return null;
-  };
-  // a marker file (or a directory above the package, or one of its own that the line makes) created, removed or renamed in the package directory or any directory above it
-  for (const paths of markers ?? []) {
-    if (paths === null) return true;
+  for (const { paths, gone } of known) {
     for (const o of paths) {
-      if (o.startsWith(UNKNOWN_HEAD)) {
-        // somewhere under a directory only known at run time: a marker (or glob) among the literal components, or a name that is one of the package directory's own ancestors, may be it
-        const comps = o.slice(UNKNOWN_HEAD.length).split('/');
-        const names = new Set(starts.flatMap((x) => forms(x)).flatMap((x) => x.split('/')).filter(Boolean));
-        if (comps.some((c) => componentIsMarker(c).length || names.has(c))) return true;
-        continue;
-      }
       for (const s of starts) {
         for (const so of forms(s)) {
           for (let a = so, n = 0; n < MAX_WALK; n++) {
             for (const oo of forms(o)) {
-              if (oo === a) return true;
+              if (oo === a) return 'known';
               if (oo.startsWith(a === '/' ? '/' : `${a}/`)) {
-                const first = oo.slice(a === '/' ? 1 : a.length + 1).split('/')[0];
+                const rest = oo.slice(a === '/' ? 1 : a.length + 1);
+                const first = rest.split('/')[0];
                 const hits = componentIsMarker(first);
-                // (a node_modules directory only stops the search where there is no package.json to find first)
-                if (hits.some((m) => !(m === 'node_modules' && exists(p.join(a, 'package.json'))))) return true;
+                // (a node_modules directory only matters when it goes, and where there is no package.json next to it to be found first: it stops the search there)
+                if (hits.some((m) => (m === 'node_modules' ? gone.has(o) && rest === first && !exists(p.join(a, 'package.json')) : true))) return 'known';
               }
             }
             const up = p.dirname(a);
@@ -504,32 +443,16 @@ export function pkgDirtyFor(budget, starts, env = {}) {
       }
     }
   }
-  for (const e of list ?? []) {
-    if (e.dirs === null) return true;
-    for (const s of starts) {
-      for (const d of e.dirs) {
-        if (e.k === 'new') { if (inside(s, d) || (env.deep && inside(d, s))) return true; continue; }
-        const root = rootOf(d);
-        if (root === null) return true;
-        if (!(inside(s, root) || (env.deep && inside(root, s)))) continue;
-        // a repository of its own below that work tree (a linked work tree in .worktrees/) keeps its own files, and a package.json inside it is the one the manager finds
-        const own = rootOf(s);
-        if (own !== null && own !== root && inside(own, root) && e.nested && !env.deep) {
-          let hit = false;
-          for (let x = s, n = 0; n < MAX_WALK && !hit; n++) {
-            if (exists(p.join(x, 'package.json'))) hit = true;
-            if (x === own) break;
-            const up = p.dirname(x);
-            if (up === x) break;
-            x = up;
-          }
-          if (hit) continue;
-        }
-        return true;
-      }
+  for (const paths of maybe) {
+    for (const o of paths) {
+      if (o === null) return 'maybe';
+      // somewhere under a directory only known at run time: a marker (or glob) among the literal components, or a name that is one of the package directory's own ancestors, may be it
+      const comps = o.slice(UNKNOWN_HEAD.length).split('/');
+      const names = new Set(starts.flatMap((x) => forms(x)).flatMap((x) => x.split('/')).filter(Boolean));
+      if (comps.some((c) => componentIsMarker(c).length || names.has(c))) return 'maybe';
     }
   }
-  return false;
+  return null;
 }
 
 export const shellQuote = (w) => (/^[A-Za-z0-9_@%+=:,./-]+$/.test(w) ? w : `'${String(w).replace(/'/g, "'\\''")}'`);
@@ -591,7 +514,8 @@ export function packageScripts(call, env) {
       const pj = p.join(d, 'package.json');
       walked.push(pj);
       env.tick?.();
-      if (exists(pj) || env.written?.(pj)) { found = { dir: d, file: pj }; break; }
+      // (a package.json the line only MAY write is not the project yet: the one above it is what runs if the write does not happen, and is judged -- the maybe itself is refused below when the line mentions a guarded operation)
+      if (exists(pj) || env.written?.(pj) === 'known') { found = { dir: d, file: pj }; break; }
       if (nm && env.pathExists(p.join(d, 'node_modules'))) { atRoot = true; break; }
       const up = p.dirname(d);
       if (up === d) { atRoot = true; break; }
@@ -605,6 +529,15 @@ export function packageScripts(call, env) {
   for (const pj of up.walked) {
     const w = env.written?.(pj);
     if (w === 'known' || (w === 'maybe' && env.mentionsGuarded?.())) return writtenMsg(pj);
+  }
+  // (a directory below the project that the line may turn into one -- it writes its package.json, or may -- has its own configuration files: what the line writes to them counts)
+  for (const pj of up.walked) {
+    const dir = p.dirname(pj);
+    if (up.found && dir === up.found.dir) break;
+    for (const rc of dirRcFiles(call, dir, p)) {
+      const w = env.written?.(rc);
+      if (w === 'known' || (w === 'maybe' && env.mentionsGuarded?.())) return refuse(`this line writes ${rc} before the package manager reads it, so what it sets for the scripts cannot be verified. Write it in a command of its own.`);
+    }
   }
   if (!up.complete) return refuse(`more than ${MAX_WALK} directories lie above ${start}, so the package.json the manager uses cannot be found.`);
   if (!up.found) return end({ none: true });
@@ -689,6 +622,7 @@ export function packageScripts(call, env) {
 }
 
 // The configuration files the manager reads for a package in `dir`.
+const dirRcFiles = (call, dir, p) => [p.join(dir, '.npmrc'), ...(call.pm === 'yarn' ? [p.join(dir, '.yarnrc.yml')] : []), ...(call.pm === 'bun' ? [p.join(dir, 'bunfig.toml')] : [])];
 function rcFiles(call, dir, env, p) {
   const list = [p.join(dir, '.npmrc')];
   if (env.home) list.push(p.join(env.home, '.npmrc'));
@@ -722,14 +656,18 @@ function rcRefusal(file, env, cache, exists) {
   return msg;
 }
 
-// The shell script a bare command name run through a package runner (npx, npm exec, pnpm exec ...) resolves to: node_modules/.bin/<name> of the nearest directory that has it.
+// The shell script a bare command name run through a package runner (npx, npm exec, pnpm exec ...) resolves to: node_modules/.bin/<name> of the nearest directory that has it, or that the line certainly writes.
+// A directory where the line only MAY write it (env.written -> 'maybe') does not stop the search -- the bin above it is what runs if the write does not happen -- and is handed to env.onMaybe instead.
 export function localBin(name, env) {
   const p = env.p ?? nodePath;
   if (env.cwd === null || env.cwd === undefined || !/^[A-Za-z0-9_@][A-Za-z0-9_.@-]*$/.test(name)) return null;
   let d = env.cwd;
   for (let i = 0; i < MAX_WALK; i++) {
     const f = p.join(d, 'node_modules', '.bin', name);
-    if (env.pathExists(f) || env.written?.(f)) return f;
+    if (env.pathExists(f)) return f;
+    const w = env.written?.(f);
+    if (w === 'maybe') env.onMaybe?.(f);
+    else if (w) return f;
     const up = p.dirname(d);
     if (up === d) break;
     d = up;

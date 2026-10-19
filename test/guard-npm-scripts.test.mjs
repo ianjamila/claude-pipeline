@@ -443,10 +443,9 @@ test('t9 exec forms the parser did not unwrap are judged as a command line; a ba
 
 // ---- second security review: what the line changes first, symlinks, parity ----------------------------------------------------------------------------------------
 import { packageScripts, pmCall } from '../pipeline/hooks/lib/package-scripts.mjs';
-test('t9 an earlier command that may change package.json, a configuration file or the work tree makes the script unknown (both guards)', () => {
+test('t9 the manager\'s own writes earlier on the line (npm pkg set, config set ...) make the script unknown (both guards); a git work tree change, a bulk writer or a background job do not (#89 t2: parity with a script file)', () => {
   const t = root({ lint: 'ok', test: 'ok' });
-  const befores = ['git checkout other', 'git pull', 'git merge x', 'git switch -c y', 'git reset --hard', 'git stash pop', 'git rebase main', 'git cherry-pick abc', 'git apply p.diff', 'git clone u d', 'git -C sub checkout x',
-    'npm pkg set scripts.lint=x', 'npm set-script lint x', 'npm init -y', 'pnpm pkg set a=b', 'yarn config set x y', 'npm config set script-shell /bin/x', 'npm config delete prefix', 'tar xf a.tgz', 'unzip a.zip', 'patch -p1 -i p.diff', 'rsync -a src/ .'];
+  const befores = ['npm pkg set scripts.lint=x', 'npm set-script lint x', 'npm init -y', 'pnpm pkg set a=b', 'yarn config set x y', 'npm config set script-shell /bin/x', 'npm config delete prefix'];
   for (const b of befores) {
     for (const sep of ['&&', ';']) {
       const cmd = `${b} ${sep} npm run lint`;
@@ -456,15 +455,13 @@ test('t9 an earlier command that may change package.json, a configuration file o
       assert.equal(filesGuard(cmd, treeFor(t, BAD_FILES)).decision, 'deny', `files: ${cmd}`);
     }
   }
-  // (t11: `git worktree add ../w` creates one directory elsewhere: it changes nothing a manager started here reads, and one started in w is refused -- test/guard-replay-fp-81.test.mjs)
-  // a background job races the command: the order on the line does not matter
-  for (const cmd of ['npm run lint & git checkout x', 'git pull & npm test', '(git checkout x &) ; npm run lint']) {
-    assert.equal(git(cmd, treeFor(t, BAD_GIT)).decision, 'deny', `git: ${cmd}`);
-    assert.equal(filesGuard(cmd, treeFor(t, BAD_FILES)).decision, 'deny', `files: ${cmd}`);
-  }
-  // a script the line runs changes it before the next command too
-  bad('npm run a && npm run lint', { 'package.json': { scripts: { a: 'git checkout x', lint: 'ok' } } });
-  bad('npm run a', { 'package.json': { scripts: { a: 'git checkout x && npm run lint', lint: 'ok' } } });
+  // (t11: `git worktree add ../w` creates one directory elsewhere; #89 t2: none of these is followed any more, as `git checkout other && bash run.sh` is not -- test/guard-npm-parity.test.mjs holds them and their twins)
+  for (const b of ['git checkout other', 'git pull', 'git merge x', 'git switch -c y', 'git reset --hard', 'git stash pop', 'git rebase main', 'git cherry-pick abc', 'git apply p.diff', 'git clone u d', 'git -C sub checkout x', 'tar xf a.tgz', 'unzip a.zip', 'patch -p1 -i p.diff', 'rsync -a src/ .']) ok(`${b} && npm run lint`, t);
+  for (const cmd of ['npm run lint & git checkout x', 'git pull & npm test', '(git checkout x &) ; npm run lint']) ok(cmd, t);
+  // a script the line runs changes it before the next command too -- when it is one of the manager's own writes
+  bad('npm run a && npm run lint', { 'package.json': { scripts: { a: 'npm pkg set scripts.lint=x', lint: 'ok' } } });
+  bad('npm run a', { 'package.json': { scripts: { a: 'npm config set script-shell /bin/x && npm run lint', lint: 'ok' } } });
+  ok('npm run a && npm run lint', { 'package.json': { scripts: { a: 'git checkout x', lint: 'ok' } } });
   // commands that change nothing it reads
   for (const cmd of ['git status && npm run lint', 'git log -3; npm test', 'git fetch && npm run lint', 'git diff | head; npm run lint', 'npm config get prefix; npm run lint', 'echo hi > notes.txt && npm run lint', 'npm ls && npm test', 'npm install && npm test', 'npm ci && npm run lint']) ok(cmd, t);
 });

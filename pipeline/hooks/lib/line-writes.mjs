@@ -1687,7 +1687,7 @@ const MAX_CHAIN = 24; // a file copied from a file copied from a file ... (longe
 // { texts, files, scans, unknown } or null when no write reaches it. `files` are the sources (and their own sources, in turn): the
 // caller judges each as the script it is. `exists(path)`: is there a file now (a missing one may have been created by an unmodelled command).
 // `ignoreUnmodelled`: the real home's startup files (no word on the line names them) are not "a missing script that something may have created".
-// `viaUnmodelled` in the result: the answer depends on a command we do not model (a cached verdict must not outlive a new one).
+// `viaUnmodelled` in the result: the answer depends on a command we do not model (a cached verdict must not outlive a new one). `named`: some write names this very file (an exact target, not a subtree or a target only known at run time).
 // `readText(path)`: the text of a file now (string, or null). `joined`: the whole texts the file may hold when several writes build it (appends, cat A B);
 // `pieces`: it is built from pieces and cannot be put together (a piece unknown, computed or too many), so no single piece can be judged for what the file runs.
 // The texts a file may hold after the line's writes to it (w: a writtenTo result), with `disk` its text now (null when missing: '' then, as a write may fail),
@@ -1725,7 +1725,7 @@ export function writtenTo(frames, target, { exists, readText = () => null, ignor
   // Why: the unknown text of an in-place sed is the edit's own result: once every text it leaves is built (the program emulated for every text it may get) it is judged as a text, not as run-time content
   if (st.sedEdit && (built === null || io.pieces || io.sedRefused)) st.unknown = true;
   const joined = (built ?? []).filter((x) => !st.texts.has(x));
-  return { texts: [...st.texts], files: [...st.files], scans: [...st.scans], programs: [...st.programs], authored: st.authored, unknown: st.unknown, viaUnmodelled: st.viaUnmodelled, joined, pieces: io.pieces || st.cut === true };
+  return { texts: [...st.texts], files: [...st.files], scans: [...st.scans], programs: [...st.programs], authored: st.authored, unknown: st.unknown, viaUnmodelled: st.viaUnmodelled, named: st.named === true, joined, pieces: io.pieces || st.cut === true };
 }
 
 // The links the line makes before the command: [alias, real, frame] for `ln -s REAL ALIAS` (and a hard link). A directory alias makes
@@ -1784,6 +1784,7 @@ function collect(frames, upto, asOf, P, st, depth, exists) {
   const names = pairs.length ? namesOf(pairs, P) : [P];
   for (const h of hitsOn(frames, upto, asOf, P)) {
     if (h.loose && st.ignoreUnmodelled) continue; // (the real home's startup files: only the line's exact writes reach them, not a target known only at run time)
+    if (!h.loose && !h.rec.subtree && h.items.some((it) => it.abs === undefined)) st.named = true; // (a write that names this very file, not one that may reach it: the target of a redirect, cp, mv, sed -i ..., not a tar x or a worktree add below a directory, nor a file some directory copy may carry in)
     absorb(frames, h.fi, h.f, h.rec, h.items, h.P, st, depth, exists);
     if (certainReplace(h) && !copyMayFail(frames, h, exists)) st.lastReplace = [h.fi, h.rec.idx]; // an exact write that replaces the file: what came before it no longer matters
   }

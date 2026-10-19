@@ -17,7 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
 export { withoutLiteralText, INDIRECT_EXPANSION };
-import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgDirtyFor, pmStartDirs, BACKGROUND } from './package-scripts.mjs';
+import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs } from './package-scripts.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit } from './script-candidates.mjs';
@@ -1266,10 +1266,23 @@ function judgeScriptText(text, sf, abs, dir, ctx, level) {
 // (npm_config_prefix, INIT_CWD, PNPM_* ...) always, as which package.json the manager reads is then unknown.
 const pkgEnv = (ctx, cwd) => ({
   cwd, home: ctx.home, readText: ctx.readText, pathExists: ctx.pathExists, readDir: ctx.readDir, cache: (ctx.budget.pkgCache ??= new Map()), p: path, tick: () => checkDeadline(ctx.budget),
-  written: (abs) => (writtenTo(ctx.writeFrames, abs, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: true }) ? 'known' : writtenTo(ctx.writeFrames, abs, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: false }) ? 'maybe' : null),
+  written: (abs) => pkgFileWritten(ctx, abs),
   mentionsGuarded: () => lineMentionsGuarded(ctx),
 });
-const MARKERS_MSG = (said) => `package script: an earlier command on the line (mkdir, touch, rm, mv, cp, ln ...) may create, remove or rename a package.json, node_modules, server.js, binding.gyp or configuration file that \`${said}\` depends on (in the package's directory or above it), so which script it runs cannot be verified. Run it in a command of its own.`;
+// #89 t2: do the line's writes reach a file the manager reads (package.json, a configuration file)? Asked like the plain-script path asks about a script file (checkScriptFile): 'known' is a write that names the file;
+// 'maybe' is one it cannot (a target only known at run time, a link it cannot follow, an extraction below a directory). A file that is missing is NOT "something an unmodelled command may have created" here (a rc file is usually missing, and the
+// existing run.sh of `node -e '...' && bash run.sh` is not either): only the writes themselves count.
+// A write that may reach the file but is certain to hold nothing the guard minds (a copy from a source that does not exist) is none; one whose text or source mentions a guarded operation is refused as a known write.
+function pkgFileWritten(ctx, abs) {
+  if (writtenTo(ctx.writeFrames, abs, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: true })?.named) return 'known';
+  const w = writtenTo(ctx.writeFrames, abs, { exists: (x) => x === abs || ctx.pathExists(x), readText: ctx.readText, ignoreUnmodelled: ctx.ignoreUnmodelled === true });
+  if (!w) return null;
+  const sources = w.files.map((f) => ctx.readText(f)).filter((t) => typeof t === 'string');
+  if ([...w.texts, ...w.joined, ...sources].some((t) => GUARDED_WORDS.test(t) || guardedCommandText(t))) return 'known';
+  return w.unknown || w.pieces || w.authored || w.programs.length || w.scans.length || w.texts.length || sources.length ? 'maybe' : null;
+}
+
+const MARKERS_MSG = (said, kind) => `package script: an earlier command on the line (mkdir, touch, rm, mv, cp, ln ...) ${kind === 'known' ? 'creates, removes or renames' : 'may create, remove or rename (a path only known at run time), while the line mentions a guarded operation,'} a package.json, node_modules, server.js, binding.gyp or configuration file that \`${said}\` depends on (in the package's directory or above it), so which script it runs cannot be verified. Run it in a command of its own.`;
 function packageScriptVerdict(argv, dir, ctx, level) {
   const call = pmCall(argv.map((a) => expandVars(a, ctx)));
   if (!call) return null;
@@ -1278,8 +1291,8 @@ function packageScriptVerdict(argv, dir, ctx, level) {
   // (a variable family the managers read, or a name exported that is only known at run time: `export $N=x`)
   const mover = call.mover ? '--userconfig / --globalconfig' : pmMoverName([...Object.keys(ctx.vars), ...ctx.unsureVars, ...ctx.tainted]) ?? ((ctx.nameRun ??= nameAtRunTimeIn(ctx.fullText)) ? 'a variable named at run time' : null);
   if (mover) return deny(`package script: ${mover} may point the package manager at another package.json or configuration, so which script \`${said}\` runs cannot be verified. Run it without it (set the directory with --prefix).`);
-  // (an earlier command on the line, or in a script it ran, may have changed package.json, a configuration file or the work tree: markPackageState)
-  if (pkgDirtyFor(ctx.budget, pmStartDirs(call, dir === null ? null : [dir], ctx.home, path), { pathExists: ctx.pathExists, real: (q) => realLocation(ctx.realpath, q), p: path, deep: !!call.workspace })) return deny(`package script: an earlier command on the line (git checkout / pull / merge, npm pkg set, npm config set, tar x, patch ... or a background job) may change package.json, a configuration file or the work tree before \`${said}\` reads them, so which script it runs cannot be verified. Run it in a command of its own.`);
+  // (the manager's own write earlier on the line, or in a script it ran, changed package.json or a configuration file: markPackageState)
+  if (pkgOwnWrite(ctx.budget)) return deny(`package script: an earlier command on the line (npm pkg set, npm set-script, npm config set, npm init ...) changes package.json or the package manager's configuration before \`${said}\` reads them, so which script it runs cannot be verified. Run it in a command of its own.`);
   if (call.dynamic || call.dirDynamic) {
     return lineMentionsGuarded(ctx)
       ? deny('package script: the script (or directory) \`' + said + '\` runs is only known at run time and the line mentions a guarded operation, so what it runs cannot be verified. Name the script.')
@@ -1291,7 +1304,8 @@ function packageScriptVerdict(argv, dir, ctx, level) {
   }
   const plan = packageScripts(call, pkgEnv(ctx, dir));
   if (plan.refuse) return deny(plan.refuse);
-  if (pkgDirtyFor(ctx.budget, pmStartDirs(call, [dir], ctx.home, path), { markers: true, pathExists: ctx.pathExists, real: (q) => realLocation(ctx.realpath, q), p: path })) return deny(MARKERS_MSG(said));
+  const marked = pkgMarkersFor(ctx.budget, pmStartDirs(call, [dir], ctx.home, path), { pathExists: ctx.pathExists, real: (q) => realLocation(ctx.realpath, q), p: path });
+  if (marked === 'known' || (marked === 'maybe' && lineMentionsGuarded(ctx))) return deny(MARKERS_MSG(said, marked));
   for (const run of plan.runs ?? []) {
     const v = judgeScriptText(run.text, { kind: 'shell', file: run.label }, run.file, run.dir, ctx, level);
     if (v) return v;
@@ -1304,9 +1318,29 @@ function packageScriptVerdict(argv, dir, ctx, level) {
 // #81 t9: `npx tool`, `npm exec tool`, `pnpm exec tool`, `yarn tool`: a bare name is the bin node_modules/.bin/tool of the nearest directory that has one; when that is a shell script it is judged like `./tool`.
 // (A program in another language, the usual bin, is not opened: checkScriptFile leaves node_modules programs alone, and a path word is already judged as a program run by path.)
 // An install earlier on the line may add the bin: refused when the line mentions a guarded operation, as for any file that only exists at run time.
+// #89 t2: a bin that is a program in another language (a node shebang, a .js / .mjs / .cjs file or a link to one: vitest, tsc, eslint ...) is none of the shell's. The text a heredoc appends to some other
+// file, or a copy back from a backup, is not what it runs, so only a write the guard places on the bin itself (the line replacing the program) is judged.
+function isProgramBin(bin, ctx) {
+  const text = ctx.readText(bin);
+  if (typeof text !== 'string') return false;
+  if (text.slice(0, 4096).includes('\u0000')) return true;
+  const prog = SHEBANG_PROGRAM.exec(text)?.[1];
+  if (prog !== undefined) return /^(?:node|nodejs|deno|bun|tsx|ts-node|python[\d.]*|ruby|perl|php)$/.test(prog.split('/').pop());
+  return /\.[cm]?js$/i.test(realLocation(ctx.realpath, bin) ?? bin);
+}
 function binVerdict(name, dir, ctx, level) {
-  const env = { cwd: dir, pathExists: ctx.pathExists, p: path, written: pkgEnv(ctx, dir).written };
-  const bin = localBin(name, env);
+  // (a bin is a program file like a script: the plain-script reading of what the line writes, a missing one included)
+  const written = (abs) => (writtenTo(ctx.writeFrames, abs, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: true }) ? 'known' : writtenTo(ctx.writeFrames, abs, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: ctx.ignoreUnmodelled === true }) ? 'maybe' : null);
+  const maybes = [];
+  const bin = localBin(name, { cwd: dir, pathExists: ctx.pathExists, p: path, written, onMaybe: (f) => maybes.push(f) });
+  for (const m of maybes) { // (a bin the line may write: judged on what it may hold, and refused when the line mentions a guarded operation)
+    const v = checkScriptFile({ kind: 'exec', file: m, candidate: true }, dir, ctx, level);
+    if (v) return v;
+  }
+  if (bin && isProgramBin(bin, ctx)) {
+    const w = writtenTo(ctx.writeFrames, bin, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: true });
+    return w ? judgeWrittenScript(w, { kind: 'exec', file: bin, candidate: true }, bin, dir, ctx, level) : null;
+  }
   if (bin) return checkScriptFile({ kind: 'exec', file: bin, candidate: true }, dir, ctx, level);
   return ctx.budget.pkgBinsDirty && lineMentionsGuarded(ctx) ? deny(`package script: an earlier install on the line may add node_modules/.bin/${name}, and the line mentions a guarded operation, so what it runs cannot be verified. Run the install in a command of its own.`) : null;
 }
@@ -2513,8 +2547,6 @@ function evalString(str, startDir, ctx, level, child = false) {
   // the subshells open at the command being walked, outermost first: { id, dir, uncertain } as they were when it started (null: marks not trusted, see subshellsTrusted)
   const subs = subshellsTrusted(cmds) ? [] : null;
   try {
-  // (a job in the background races every other command of the line: what any of them may change counts before the first)
-  if (BACKGROUND.test(str)) markPackageState(ctx.budget, cmds.map((x) => x.argv), { dirs: null, expand: (w) => expandVars(w, ctx), home: ctx.home, p: path, text: ctx.fullText });
   for (const [i, c] of cmds.entries()) {
     checkDeadline(ctx.budget); // a lookup (branch, labels) can take seconds; the evaluation as a whole may not
     const argv = c.argv;
@@ -2624,7 +2656,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       if (startupList.some((st) => !st.implicit)) withStartupScope(c, ctx, judgeRest); else judgeRest();
     }
     if (verdict && verdict.decision === 'deny') return verdict;
-    markPackageState(ctx.budget, [argv], { dirs: dir === null ? null : [dir], expand: (w) => expandVars(w, ctx), home: ctx.home, p: path, text: ctx.fullText }); // (what this command may change, for the package scripts after it)
+    markPackageState(ctx.budget, [argv], { dirs: dir === null ? null : [dir], expand: (w) => expandVars(w, ctx), home: ctx.home, p: path }); // (what this command may change, for the package scripts after it)
     if (SOURCING.includes(name)) {
       // what the sourced file did is not modelled: every later command sees an unknown directory, branch and variables
       forgetState();
