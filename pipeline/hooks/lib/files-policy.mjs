@@ -1650,7 +1650,9 @@ function judgePackageScripts(c, dirs, ctx, opts, scanRaw = '') {
   if (call.unresolved) return deny('package script: ' + call.unresolved);
   if (mover) return deny(`package script: ${mover} may point the package manager at another package.json or configuration, so which script \`${c.argv.slice(0, 4).join(' ')}\` runs cannot be verified. Run it without it (set the directory with --prefix)`);
   if (pkgOwnWrite(ctx.budget)) return deny(`package script: an earlier command on the line (npm pkg set, npm set-script, npm config set, npm init ...) changes package.json or the package manager's configuration before \`${c.argv.slice(0, 4).join(' ')}\` reads them, so which script it runs cannot be verified. Run it in a command of its own`);
-  if (call.dynamic || call.dirDynamic) return null;
+  if (call.dynamic || call.dirDynamic) { // (a script or directory only known at run time cannot be read: refused when the line refers to a protected file, as for `bash $F`)
+    return dirs.some((d) => makeMatchers(ctx).rawHit(scanRaw, [d])) ? deny('package script: the script (or directory) `' + c.argv.slice(0, 4).join(' ') + '` runs is only known at run time and the line refers to a protected pipeline file, so what it runs cannot be verified. Name the script.') : null;
+  }
   const seen = new Set();
   for (const d of dirs) {
     const mentionsGuarded = () => makeMatchers(ctx).rawHit(scanRaw, [d]) || SENSITIVE_WORDS.test(String(scanRaw).replace(/['"`\\]/g, ''));
@@ -2691,7 +2693,10 @@ function evaluateBashForFilesFrame(command, opts) {
       }
       // #81 t9: and a bare name a package runner started is the bin node_modules/.bin/NAME
       if (c.viaRunner && c.argv[0] && !c.argv[0].includes('/')) {
-        const prefixes = (c.runnerDirs ?? []).map((x) => expandRefs(x, ctx)).filter((x) => !/[$`]/.test(x)).map((x) => (x === '~' || x.startsWith('~/') ? posix.join(ctx.homePosix ?? '', x.slice(1)) : x));
+        const expanded = (c.runnerDirs ?? []).map((x) => expandRefs(x, ctx));
+        // (a directory only known at run time: the bin may be in any place, so what it runs is unknown -- refused when the line refers to a protected file, as for `bash $D/tool`)
+        if (expanded.some((x) => x === '' || /[$`*?[{]/.test(x)) && makeMatchers(ctx).rawHit(scanRaw, sdirsNow())) return deny('which word is the script this command runs is only known at run time ($VAR / $(...) / a glob) and the line refers to a protected pipeline file; name the file and write the options literally');
+        const prefixes = expanded.filter((x) => !/[$`]/.test(x)).map((x) => (x === '~' || x.startsWith('~/') ? posix.join(ctx.homePosix ?? '', x.slice(1)) : x));
         const v = judgeBinScript(expandRefs(c.argv[0], ctx), sdirsNow(), ctx, withLineVars(opts, c), scanRaw, false, prefixes);
         if (v) return v;
       } else if (!c.viaRunner && (typeof opts._scriptBinDir === 'string' || c.binPath) && c.argv[0] && !c.argv[0].includes('/')) {

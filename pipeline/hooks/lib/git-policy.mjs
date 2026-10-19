@@ -2627,10 +2627,14 @@ function evalString(str, startDir, ctx, level, child = false) {
       if (!verdict && c.viaRunner) {
         verdict = runnerBinVerdict(argv, dir, ctx, level);
         // (R1-B6: `npx --prefix sub tool`: the bin may come from the prefix's node_modules/.bin; it still runs in the working directory)
-        for (const pfx of dir === null ? [] : c.runnerDirs ?? []) {
+        for (const pfx of c.runnerDirs ?? []) {
           if (verdict) break;
           const w = expandVars(pfx, ctx);
-          if (/[$`]/.test(w)) continue;
+          if (w === '' || /[$`*?[{]/.test(w)) { // (a directory only known at run time: the bin may be in any place, as for `bash $D/tool`)
+            if (lineMentionsGuarded(ctx)) verdict = deny('package script: the script (or directory) `' + argv.slice(0, 4).join(' ') + '` runs is only known at run time and the line mentions a guarded operation, so what it runs cannot be verified. Name the script.');
+            continue;
+          }
+          if (dir === null) continue;
           verdict = runnerBinVerdict(argv, dir, ctx, level, false, path.resolve(dir, w === '~' || w.startsWith('~/') ? path.join(ctx.home ?? '', w.slice(1)) : w));
         }
       }

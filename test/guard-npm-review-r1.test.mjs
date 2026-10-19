@@ -248,3 +248,27 @@ test('R1-S1b a node_modules/.bin/node in the directory the command runs in shado
     assert.equal(g.run('npx tool', files(false), { cwd }).decision, 'allow', `${n}: no shim`);
   }
 });
+
+// ---- R1-B6 follow-up: a runner directory only known at run time (controller's probe) ---------------------------------------------
+test('R1-B6b npx / npm exec --prefix $D tool: the bin directory is only known at run time, refused when the line mentions a guarded operation (as for bash $D/tool)', () => {
+  const tree = () => ({ 'sub/package.json': pkg({}), 'sub/node_modules/.bin/tool': sh('echo hi') });
+  const mention = (g) => `echo ${g.bad}`;
+  for (const call of ['npx --prefix $D tool', 'npx --prefix=$D tool', 'npm exec --prefix=$D tool', 'npm exec --prefix $D -- tool', 'npx --prefix "$(pwd)/sub" tool', 'npx --prefix sub/* tool']) {
+    for (const [n, g] of Object.entries(G)) {
+      const v = g.run(`${call}; ${mention(g)}`, tree());
+      assert.equal(v.decision, 'deny', `${n}: ${call} with a mention -> allowed`);
+      assert.match(v.reason, /only known at run time|run time/, `${n}: ${call}`);
+      // twin: no mention of a guarded operation = parity with `bash $D/tool`, allowed
+      const w = g.run(call, tree());
+      assert.equal(w.decision, 'allow', `${n}: ${call} without a mention -> ${w.reason}`);
+    }
+  }
+  // the dynamic spelling the guard already refused, for the same message
+  for (const [n, g] of Object.entries(G)) {
+    assert.equal(g.run(`npm --prefix $D exec tool; ${mention(g)}`, tree()).decision, 'deny', `${n}: npm --prefix $D exec`);
+    assert.equal(g.run(`bash $D/tool; ${mention(g)}`, tree()).decision, 'deny', `${n}: bash $D/tool`);
+  }
+  // known by assignment: the real bin is read
+  denied('D=sub; npx --prefix $D tool', (g) => ({ 'sub/package.json': pkg({}), 'sub/node_modules/.bin/tool': sh(g.bad) }));
+  allowed('D=sub; npx --prefix $D tool', tree);
+});
