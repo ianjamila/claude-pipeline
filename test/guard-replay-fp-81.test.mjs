@@ -150,3 +150,12 @@ test('K4 a gh command with a pager, browser, configuration, alias or extension i
     assert.equal(r.decision, 'deny', `${cmd}: allowed`);
   }
 });
+test('K4 a sourced file that sets a gh / pager variable leaves gh a writer, whatever the file says it sets', () => {
+  const M = 'M=$(gh pr view 296 --json state -q .state); SHA=${M#* }; ';
+  for (const body of ['export GH_PAGER="sh -c x"', 'PAGER="sh -c x"; export PAGER', 'export BROWSER=x']) {
+    const o = { readText: (p) => (p.endsWith('/env.sh') ? body : null), pathExists: (p) => p.endsWith('/env.sh') };
+    assert.equal(filesGuard(M + '. ./env.sh; gh pr view $SHA', o).decision, 'deny', body);
+  }
+  const clean = { readText: (p) => (p.endsWith('/env.sh') ? 'export FOO=1' : null), pathExists: (p) => p.endsWith('/env.sh') };
+  assert.equal(filesGuard(M + 'gh pr view $SHA', clean).decision, 'allow');
+});
