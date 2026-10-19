@@ -1438,8 +1438,10 @@ function isolatedState(ctx, fn) {
 // heredoc body that feeds a non-shell is not a command at all)? The detector is the one used for interpreter files, plus the protection / ruleset /
 // issue-close shapes of gh and git.
 // The line as the guard reads it: every command's words without the values of prose flags (commit -m, --body ...). A heredoc body is not part of it.
+// (t11: the words of a command that only reads or lists -- a grep pattern, `cat scripts/merge-pr.mjs`, `ls push-*` -- name data, and there is no way to turn them into something that runs: the line does not "mention" a guarded operation by them)
+const DATA_READERS = new Set(['grep', 'egrep', 'fgrep', 'rg', 'ls', 'wc', 'stat', 'file', 'du', 'cat', 'head', 'tail', 'diff', 'cmp']);
 function maskedLine(ctx) {
-  ctx.lineMasked ??= simpleCommands(ctx.lineText).filter((c) => c.argv.length).map((c) => [c.argv[0], ...dataLessArgs(c.argv.slice(1))].join(' ')).join('\n');
+  ctx.lineMasked ??= simpleCommands(ctx.lineText).filter((c) => c.argv.length).map((c) => [c.argv[0], ...(DATA_READERS.has(baseName(c.argv[0])) ? [] : dataLessArgs(c.argv.slice(1)))].join(' ')).join('\n');
   return ctx.lineMasked;
 }
 // ... a guarded command, or (strictly) a guarded word: the masked line as written and with its quotes and escapes stripped

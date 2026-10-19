@@ -64,3 +64,18 @@ test('K2 git commit -qm / -am / -qam TEXT hides TEXT like -m TEXT; a word outsid
     assert.equal(r.decision, 'deny', `${c} -> allowed`);
   }
 });
+
+// ---- K3. a mention in a command that only reads ---------------------------------------------------------------------------------------------------------------
+// `grep -rn "MERGE_X" app`, `cat scripts/merge-pr.mjs | head -3`, `ls push-*`: the words of a command that only reads or lists name data. Others (echo, a git command, a program text, sed, awk) still count.
+test('K3 a guarded word in the arguments of a command that only reads is no mention; in an echo, a git command or a program text it still is', () => {
+  for (const c of [`grep -rn "${MERGE.toUpperCase()}_X" app | head -2`, `cat scripts/${MERGE}-pr.mjs | head -3`, `grep -c ${PUSH} log.txt`, `ls ${PUSH}-*`, `tail -8 ${MERGE}.log`, `diff a.txt ${MERGE}.txt`,
+    `rg ${PUSH} src`, `wc -l ${MERGE}.txt`, `stat ${PUSH}.log`, `file ${MERGE}.bin`, `du -sh ${PUSH}`, `cmp a ${MERGE}`, `head -3 /usr/bin/${PUSH}`, `/bin/cat ${MERGE}.txt`]) {
+    const r = gitGuard(FETCH + c);
+    assert.equal(r.decision, 'allow', `${c}: ${r.reason}`);
+  }
+  for (const c of [`echo ${PUSH}`, `printf ${MERGE}`, `git log --oneline origin/${MAIN}..HEAD; echo ${PUSH}`, `node -e 'console.log("${PUSH}")'`, `sed -n 1p ${PUSH}.txt`, `awk 1 ${MERGE}.txt`,
+    `grep x f; echo ${PUSH}`, `cat f; git ${PUSH}`, `ls f && git ${PUSH} origin ${MAIN}`, `cat f | xargs git ${PUSH}`, `cat f | sh -c "git ${PUSH}"`, `ls $(git ${PUSH} origin ${MAIN})`, `cat f; xargs ${PUSH} < f`]) {
+    const r = gitGuard(FETCH + c);
+    assert.equal(r.decision, 'deny', `${c} -> allowed`);
+  }
+});
