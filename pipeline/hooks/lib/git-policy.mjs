@@ -399,6 +399,7 @@ const SETS_BY_NAME = /\b(?:eval|read|mapfile|readarray|getopts|source)\b|\bprint
 // the binder test only (a comment that says "read" is no binder); the name IFS anywhere, a comment included, still counts.
 // A line is left out only when the shell reads it as a comment: it starts (after blanks) with `#` and no quote, backtick, `$( )` or backslash-newline is open from the lines before it. A heredoc
 // anywhere (`<<`, not `<<<`) leaves everything in (its body is text of any shape). Where this scan is unsure it keeps the line: more text tested, never less.
+// Defensive (mutation check): the heredoc exit and the `$( )` depth only keep MORE lines; a heredoc body is judged as a script of its own, and bash reads a `#` line inside `$( )` as a comment too.
 function withoutCommentLines(s) {
   if (/<<(?!<)/.test(s)) return s;
   const out = [];
@@ -417,7 +418,7 @@ function withoutCommentLines(s) {
       if (c === '`') { bt = !bt; continue; }
       if (c === '$' && line[i + 1] === '(') { depth++; continue; }
       if (c === ')' && depth > 0) { depth--; continue; }
-      if (c === '#' && !dq && !bt && (i === 0 || /[\s;&|(]/.test(line[i - 1]))) { kept = line.slice(0, i); esc = false; break; } // (the rest of the line is a comment)
+      if (c === '#' && !dq && !bt && (i === 0 ? !cont : /[\s;&|(]/.test(line[i - 1]))) { kept = line.slice(0, i); esc = false; break; } // (the rest of the line is a comment)
     }
     out.push(kept);
     cont = esc;

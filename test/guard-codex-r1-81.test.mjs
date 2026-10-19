@@ -175,3 +175,13 @@ test('R1-B1 IFS: a `#` line inside a multi-line quote is no comment; real commen
   allowGit('bash wrapper.sh', { ...gitFiles(BAD_GIT), 'wrapper.sh': `echo "a b"\n# read the plan\necho 'x' # don't read\n# eval it\n${PUSH_B}` });
   allowGit('bash wrapper.sh', { ...gitFiles(BAD_GIT), 'wrapper.sh': `echo "a\nb"\n# read the plan\n${PUSH_B}` });
 });
+
+test('R1-B1 IFS: the comment scan follows escapes, continuations and apostrophes inside double quotes', () => {
+  const hid = 'N=IF; N=${N}S; declare -n r=$N; r=x';
+  // an escaped quote does not close the string; a backslash-newline joins `x` and `#` into one word, so the `;` after it ends a command
+  denyGit('bash wrapper.sh', { ...gitFiles(BAD_GIT), 'wrapper.sh': `echo "a\\"\n#"; ${hid}\n${PUSH_B}` });
+  denyGit('bash wrapper.sh', { ...gitFiles(BAD_GIT), 'wrapper.sh': `echo x\\\n#; ${hid}\n${PUSH_B}` });
+  // an apostrophe inside double quotes, or escaped, opens no single quote: the comment lines after it are still comments
+  allowGit('bash wrapper.sh', { ...gitFiles(BAD_GIT), 'wrapper.sh': `echo "it's"\n# read the plan\n${PUSH_B}` });
+  allowGit('bash wrapper.sh', { ...gitFiles(BAD_GIT), 'wrapper.sh': `echo it\\'s\n# read the plan\n${PUSH_B}` });
+});
