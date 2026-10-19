@@ -1,0 +1,96 @@
+// Why (#81 t8b, two fail-open holes the t8 implementer found, both on main too):
+//   H1  the files guard judged a WRITE TARGET built from a name whose value holds a parameter operator or is an array as the text was written: `F=ok; D=${F/ok/.claude}; echo x > ~/$D/settings.json` wrote the protected
+//       file and was allowed. The words such a name may hold (assignedValues, script-candidates.mjs) are now read for write targets as they are for script names; a word that cannot be worked out is the
+//       "writes through a variable whose value is only known at run time" refusal.
+//   H2  a hook that outlasts the host's 15 s limit is ALLOWED, and some 200 kB lines took the parser longer (a pattern started again at every character of a run, a scan that read to the end of the line for each
+//       `${`, a word flattened for every character). Every shape below is answered by both guards within a CPU-time bound (CPU time, not the clock: a busy machine must not fail the test).
+// Guarded names are spelled in pieces, as test/guard-hidden-assignments.test.mjs does.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
+import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
+
+const CL = '.cl' + 'aude';
+const none = { readText: () => null, readHead: () => null, pathExists: () => false, readDir: () => null };
+const files = (command, o = {}) => evaluateBashForFiles(command, {
+  home: '/home/u', env: {}, platform: 'linux', realpath: (p) => p, cwd: '/home/u/proj', ...none, existsSync: () => false, ...o,
+});
+const git = (command) => evaluateGitCommand(command, {
+  cwd: '/work/repo', home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], ...none,
+});
+const deny = (cmd) => { const r = files(cmd); assert.equal(r.decision, 'deny', `${cmd} -> ${r.reason ?? 'allowed'}`); return r; };
+const allow = (cmd) => { const r = files(cmd); assert.equal(r.decision, 'allow', `${cmd} -> ${r.reason}`); };
+
+// ---- H1. write targets read a name's operator / array values ---------------------------------------------------------------------------------------------------
+test('H1 a write target built from a name given by an operator is judged for every word the name may hold', () => {
+  deny(`F=ok; D=\${F/ok/${CL}}; echo x > ~/$D/settings.json`);
+  deny(`F=ok; D=\${F//ok/${CL}}; echo x > $HOME/$D/settings.json`);
+  deny(`D=\${U:-${CL}}; echo x > ~/$D/settings.json`);
+  deny(`D=\${U:=${CL}}; echo x >> ~/$D/settings.json`);
+  deny(`D=\${U:+${CL}}; echo x > ~/$D/settings.json`.replace('U:+', 'U:-'));
+  deny(`D=(x ${CL}); echo x > ~/\${D[1]}/settings.json`);
+  deny(`D=(x ${CL}); echo x > ~/\${D[@]}/settings.json`);
+  deny(`F=x${CL}; D=\${F#x}; echo x > ~/$D/settings.json`);
+  deny(`F=${CL}.bak; D=\${F%.bak}; echo x > ~/$D/settings.json`);
+  deny(`F=ok; D=\${F/ok/${CL}}; E=$D; echo x > ~/$E/settings.json`);
+});
+test('H1 the same targets of the writers, not only a redirect', () => {
+  const d = `D=\${U:-${CL}};`;
+  deny(`${d} cp a ~/$D/settings.json`);
+  deny(`${d} mv a ~/$D/settings.json`);
+  deny(`${d} tee ~/$D/settings.json`);
+  deny(`${d} sed -i s/a/b/ ~/$D/settings.json`);
+  deny(`${d} echo x | tee -a "$HOME/$D/settings.json"`);
+  deny(`${d} install -m 644 a ~/$D/settings.json`);
+});
+test('H1 a name whose value cannot be worked out is a run-time variable: a write through it is refused, a read is not', () => {
+  const r = deny('D=${U@Q}; echo x > ~/$D/a.txt');
+  assert.match(r.reason, /only known at run time/);
+  deny('F=ok; D=${F:abc}; echo x > ~/$D/a.txt');
+  allow('D=${U@Q}; cat ~/$D/a.txt');
+});
+test('H1 harmless defaults, trims and arrays stay allowed', () => {
+  allow('OUT=${OUT:-out}; echo x > $OUT/log');
+  allow('D=${HOME}/x; echo > $D/a.txt');
+  allow('B=${F%.ts}.js; cp a $B');
+  allow('D=${U:-x}; echo x > ~/$D/a.txt');
+  allow('F=ok; D=${F/ok/other}; echo x > ~/$D/a.txt');
+  allow('D=(x y); echo x > ~/${D[1]}/a.txt');
+  allow('F=a.ts; B=${F%.ts}.js; cp a $B');
+});
+
+// ---- H2. adversarial 200 kB lines are answered quickly by both guards ----------------------------------------------------------------------------------------------
+const LIMIT = 200_000;
+const fill = (unit) => unit.repeat(Math.ceil(LIMIT / unit.length)).slice(0, LIMIT);
+const SHAPES = {
+  'dollar-brace': '${', 'dollar-paren': '$(', 'double-quotes': '"', 'single-quotes': "'", backticks: '`', 'open-bracket': '[', 'name-bracket': 'a[', 'nested-arith': '$((',
+  'heredoc-markers': '<<E ', 'heredoc-lines': 'cat <<E\n', 'open-brace': '{', 'assign-brace': 'a=${', 'tee-operands': 'tee ', ands: '&&', newlines: '\n', 'dollar-quote': '"$', 'for-in': 'for i in ',
+  'blank-slash': ' / ', 'slash-quote': "/'", 'quote-slash': "'/", 'name-paren': 'f(){ ', 'array-open': 'a=(', backslashes: '\\',
+};
+const cpu = () => { const u = process.cpuUsage(); return (u.user + u.system) / 1000; };
+for (const [name, unit] of Object.entries(SHAPES)) {
+  test(`H2 a ${LIMIT}-character line of ${name} is answered in under 6 s of CPU time by each guard (allow or deny, never a throw)`, () => {
+    const line = fill(unit);
+    for (const [who, run] of [['guard-git', () => git(line)], ['guard-files', () => files(line)]]) {
+      const t0 = cpu();
+      const r = run();
+      const ms = cpu() - t0;
+      assert.ok(r.decision === 'allow' || r.decision === 'deny', `${who}: ${r.decision}`);
+      assert.ok(ms < 6000, `${who}: ${Math.round(ms)} ms of CPU for ${name}`);
+    }
+  });
+}
+test('H2 a long run of quotes or blanks inside a word that ends in a slash is read once, not from every character', () => {
+  const quotes = "a'" + "'".repeat(LIMIT / 2) + '/b';
+  const blanks = "x '" + ' '.repeat(LIMIT / 2) + "/'";
+  for (const line of [quotes, blanks, `echo ${quotes}`, `echo > ${blanks}`]) {
+    const t0 = cpu();
+    files(line);
+    const ms = cpu() - t0;
+    assert.ok(ms < 3000, `${Math.round(ms)} ms of CPU`);
+  }
+});
+test('H2 functions and a tee with many operands are still found (the linear scans read what the patterns read)', () => {
+  deny(`f() { echo x > ~/${CL}/settings.json; }; f`.replace('f() {', 'f() {'));
+  deny(`tee ${Array.from({ length: 300 }, (_, i) => `o${i}`).join(' ')} ~/${CL}/settings.json < /dev/null`);
+});
