@@ -16,7 +16,7 @@
 // ancestor process); commands that unset or override CLAUDECODE are denied here.
 import fs from 'node:fs';
 import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
-import { pmCall, pmMoverName, packageScripts, localBin, NAME_AT_RUN_TIME, markPackageState, BACKGROUND } from './package-scripts.mjs';
+import { pmCall, pmMoverName, packageScripts, localBin, NAME_AT_RUN_TIME, markPackageState, pkgDirtyFor, pmStartDirs, BACKGROUND } from './package-scripts.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
@@ -1311,7 +1311,8 @@ function assignReadings(command, opts) {
 const SKIP_READING = new Set(['HOME', 'USER', 'LOGNAME', 'USERPROFILE', 'USERNAME']); // (collectVars never records these)
 
 // Directories the command line may be operating in: the hook's cwd plus every `cd` target (chained ones too).
-function collectDirs(cmds, ctx) {
+// cdOnly: the directories a cd / pushd leads to (where the shell can be), without those only a command option names (git -C DIR, tar -C DIR ...)
+function collectDirs(cmds, ctx, cdOnly = false) {
   const dirs = [ctx.cwd];
   const addDir = (e, globAt = -1) => {
     for (const d of [...dirs]) {
@@ -1331,7 +1332,7 @@ function collectDirs(cmds, ctx) {
   };
   for (const [ci, c] of cmds.entries()) {
     // commands that run relative to another directory: git -C DIR, tar -C DIR, unzip -d DIR, make -C DIR, cp -t DIR
-    for (const b of baseDirsOf(c.argv)) addDir(expandRefs(b, ctx));
+    if (!cdOnly) for (const b of baseDirsOf(c.argv)) addDir(expandRefs(b, ctx));
     const cdName = baseOf(c.argv[0] ?? '');
     if (!CD_CMDS.has(cdName)) continue;
     let t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
@@ -1598,7 +1599,7 @@ function judgePackageScripts(c, dirs, ctx, opts, scanRaw = '') {
   const mover = call.mover ? '--userconfig / --globalconfig' : pmMoverName([...Object.keys(ctx.vars), ...ctx.unknownVars, ...ctx.pickUnknown, ...Object.keys(c.env ?? {})]) ?? (NAME_AT_RUN_TIME.test(scanRaw) ? 'a variable named at run time' : null);
   if (call.unresolved) return deny('package script: ' + call.unresolved);
   if (mover) return deny(`package script: ${mover} may point the package manager at another package.json or configuration, so which script \`${c.argv.slice(0, 4).join(' ')}\` runs cannot be verified. Run it without it (set the directory with --prefix)`);
-  if (ctx.budget.pkgDirty) return deny(`package script: an earlier command on the line (git checkout / pull / merge, npm pkg set, npm config set, tar x, patch ... or a background job) may change package.json, a configuration file or the work tree before \`${c.argv.slice(0, 4).join(' ')}\` reads them, so which script it runs cannot be verified. Run it in a command of its own`);
+  if (pkgDirtyFor(ctx.budget, pmStartDirs(call, dirs, ctx.homePosix, posix), { pathExists: (x) => ctx.api.existsSync(x), real: (q) => realResolve(q, ctx.api), p: posix, deep: !!call.workspace })) return deny(`package script: an earlier command on the line (git checkout / pull / merge, npm pkg set, npm config set, tar x, patch ... or a background job) may change package.json, a configuration file or the work tree before \`${c.argv.slice(0, 4).join(' ')}\` reads them, so which script it runs cannot be verified. Run it in a command of its own`);
   if (call.dynamic || call.dirDynamic) return null;
   const seen = new Set();
   for (const d of dirs) {
@@ -2395,6 +2396,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // a name held in a variable (N=PIPELINE_ADMIN; env $N=1 claude)
   if (Object.keys(ctx.vars).length && setsAdmin(substVars(flat, ctx.vars, ctx.budget), ctx.platform)) return deny('the command sets PIPELINE_ADMIN through a variable; only the owner may set it, when launching Claude Code');
   const dirs = collectDirs(cmds, ctx);
+  const cwdDirs = collectDirs(cmds, ctx, true);
   const frame = newWriteFrame(cmds, {
     text: raw,
     expand: (w) => {
@@ -2549,10 +2551,11 @@ function evaluateBashForFilesFrame(command, opts) {
     if (['declare', 'typeset', 'local'].includes(cn) && c.argv.slice(1).some((a) => /^-[A-Za-z]*n/.test(a))) for (const a of c.argv.slice(1)) { const t = /^[A-Za-z_]\w*=([A-Za-z_]\w*)/.exec(a); if (t) { names.push(t[1]); ctx.declared?.unknown.add(t[1]); } }
     for (const k of names) { ctx.pickUnknown.add(k); if (Object.hasOwn(ctx.vars, k)) ctx.unknownVars.add(k); }
   };
+  const cwdsNow = () => (unknownCwd() ? unique([...cwdDirs, ...assumedCwds(ctx)]) : cwdDirs); // (where the shell itself can be: a package manager starts there, not in a git -C directory)
   const sdirsNow = () => (unknownCwd() ? unique([...dirs, ...assumedCwds(ctx)]) : dirs); // (a sourced file may make the directory unknown part-way through the line)
   if ((opts._depth ?? 0) < 4) {
     // (a job in the background races every other command of the line: what any of them may change counts before the first)
-    if (BACKGROUND.test(raw)) markPackageState(ctx.budget, cmds.map((x) => x.argv));
+    if (BACKGROUND.test(raw)) markPackageState(ctx.budget, cmds.map((x) => x.argv), { dirs: null, expand: (w) => expandRefs(w, ctx), home: ctx.homePosix, p: posix, text: raw });
     for (const [idx, c] of cmds.entries()) {
       frame.i = idx;
       if (ctx.srcChanged.size || ctx.unknownVars.size) snaps[idx] = { changed: new Set(ctx.srcChanged), unknownV: new Set(ctx.unknownVars) }; // (what is true when this command runs: a later plain assignment must not clean it)
@@ -2611,7 +2614,7 @@ function evaluateBashForFilesFrame(command, opts) {
       }
       // #81 t9: `npm run NAME` and its kin run the text package.json holds for NAME
       {
-        const v = judgePackageScripts(c, sdirsNow(), ctx, withLineVars(opts, c), scanRaw);
+        const v = judgePackageScripts(c, cwdsNow(), ctx, withLineVars(opts, c), scanRaw);
         if (v) return v;
       }
       // script text that reaches a shell without being named (`bash < f.sh`, `cat f.sh | bash`, `eval "$(cat f.sh)"`): its files are judged like `bash f.sh`
@@ -2625,7 +2628,7 @@ function evaluateBashForFilesFrame(command, opts) {
         const v = judgeBinScript(expandRefs(c.argv[0], ctx), sdirsNow(), ctx, withLineVars(opts, c), scanRaw);
         if (v) return v;
       }
-      markPackageState(ctx.budget, [c.argv]); // (what this command may change, for the package scripts after it)
+      markPackageState(ctx.budget, [c.argv], { dirs: cwdsNow(), expand: (w) => expandRefs(w, ctx), home: ctx.homePosix, p: posix, text: raw }); // (what this command may change, for the package scripts after it)
       undo?.();
     }
   } else {

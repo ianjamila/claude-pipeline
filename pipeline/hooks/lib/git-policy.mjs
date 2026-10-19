@@ -17,7 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
 export { withoutLiteralText, INDIRECT_EXPANSION };
-import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, NAME_AT_RUN_TIME, markPackageState, BACKGROUND } from './package-scripts.mjs';
+import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, NAME_AT_RUN_TIME, markPackageState, pkgDirtyFor, pmStartDirs, BACKGROUND } from './package-scripts.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit } from './script-candidates.mjs';
@@ -1240,7 +1240,7 @@ function packageScriptVerdict(argv, dir, ctx, level) {
   const mover = call.mover ? '--userconfig / --globalconfig' : pmMoverName([...Object.keys(ctx.vars), ...ctx.unsureVars, ...ctx.tainted]) ?? (NAME_AT_RUN_TIME.test(ctx.fullText) ? 'a variable named at run time' : null);
   if (mover) return deny(`package script: ${mover} may point the package manager at another package.json or configuration, so which script \`${said}\` runs cannot be verified. Run it without it (set the directory with --prefix).`);
   // (an earlier command on the line, or in a script it ran, may have changed package.json, a configuration file or the work tree: markPackageState)
-  if (ctx.budget.pkgDirty) return deny(`package script: an earlier command on the line (git checkout / pull / merge, npm pkg set, npm config set, tar x, patch ... or a background job) may change package.json, a configuration file or the work tree before \`${said}\` reads them, so which script it runs cannot be verified. Run it in a command of its own.`);
+  if (pkgDirtyFor(ctx.budget, pmStartDirs(call, dir === null ? null : [dir], ctx.home, path), { pathExists: ctx.pathExists, real: (q) => realLocation(ctx.realpath, q), p: path, deep: !!call.workspace })) return deny(`package script: an earlier command on the line (git checkout / pull / merge, npm pkg set, npm config set, tar x, patch ... or a background job) may change package.json, a configuration file or the work tree before \`${said}\` reads them, so which script it runs cannot be verified. Run it in a command of its own.`);
   if (call.dynamic || call.dirDynamic) {
     return lineMentionsGuarded(ctx)
       ? deny('package script: the script (or directory) \`' + said + '\` runs is only known at run time and the line mentions a guarded operation, so what it runs cannot be verified. Name the script.')
@@ -2451,7 +2451,7 @@ function evalString(str, startDir, ctx, level, child = false) {
   const subs = subshellsTrusted(cmds) ? [] : null;
   try {
   // (a job in the background races every other command of the line: what any of them may change counts before the first)
-  if (BACKGROUND.test(str)) markPackageState(ctx.budget, cmds.map((x) => x.argv));
+  if (BACKGROUND.test(str)) markPackageState(ctx.budget, cmds.map((x) => x.argv), { dirs: null, expand: (w) => expandVars(w, ctx), home: ctx.home, p: path, text: ctx.fullText });
   for (const [i, c] of cmds.entries()) {
     checkDeadline(ctx.budget); // a lookup (branch, labels) can take seconds; the evaluation as a whole may not
     const argv = c.argv;
@@ -2561,7 +2561,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       if (startupList.some((st) => !st.implicit)) withStartupScope(c, ctx, judgeRest); else judgeRest();
     }
     if (verdict && verdict.decision === 'deny') return verdict;
-    markPackageState(ctx.budget, [argv]); // (what this command may change, for the package scripts after it)
+    markPackageState(ctx.budget, [argv], { dirs: dir === null ? null : [dir], expand: (w) => expandVars(w, ctx), home: ctx.home, p: path, text: ctx.fullText }); // (what this command may change, for the package scripts after it)
     if (SOURCING.includes(name)) {
       // what the sourced file did is not modelled: every later command sees an unknown directory, branch and variables
       forgetState();

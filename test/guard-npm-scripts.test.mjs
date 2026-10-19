@@ -446,7 +446,7 @@ test('t9 exec forms the parser did not unwrap are judged as a command line; a ba
 import { packageScripts, pmCall } from '../pipeline/hooks/lib/package-scripts.mjs';
 test('t9 an earlier command that may change package.json, a configuration file or the work tree makes the script unknown (both guards)', () => {
   const t = root({ lint: 'ok', test: 'ok' });
-  const befores = ['git checkout other', 'git pull', 'git merge x', 'git switch -c y', 'git reset --hard', 'git stash pop', 'git rebase main', 'git cherry-pick abc', 'git apply p.diff', 'git worktree add ../w', 'git clone u d', 'git -C sub checkout x',
+  const befores = ['git checkout other', 'git pull', 'git merge x', 'git switch -c y', 'git reset --hard', 'git stash pop', 'git rebase main', 'git cherry-pick abc', 'git apply p.diff', 'git clone u d', 'git -C sub checkout x',
     'npm pkg set scripts.lint=x', 'npm set-script lint x', 'npm init -y', 'pnpm pkg set a=b', 'yarn config set x y', 'npm config set script-shell /bin/x', 'npm config delete prefix', 'tar xf a.tgz', 'unzip a.zip', 'patch -p1 -i p.diff', 'rsync -a src/ .'];
   for (const b of befores) {
     for (const sep of ['&&', ';']) {
@@ -457,6 +457,7 @@ test('t9 an earlier command that may change package.json, a configuration file o
       assert.equal(filesGuard(cmd, treeFor(t, BAD_FILES)).decision, 'deny', `files: ${cmd}`);
     }
   }
+  // (t11: `git worktree add ../w` creates one directory elsewhere: it changes nothing a manager started here reads, and one started in w is refused -- test/guard-replay-fp-81.test.mjs)
   // a background job races the command: the order on the line does not matter
   for (const cmd of ['npm run lint & git checkout x', 'git pull & npm test', '(git checkout x &) ; npm run lint']) {
     assert.equal(git(cmd, treeFor(t, BAD_GIT)).decision, 'deny', `git: ${cmd}`);

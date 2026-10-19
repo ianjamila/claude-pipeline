@@ -278,27 +278,143 @@ export const NAME_AT_RUN_TIME = /(?:^|[;&|(\s])(?:export|declare|typeset|local|r
 
 // What an earlier command of the line may change before the package manager reads package.json, the configuration files or the work tree (git checkout / pull / merge ..., npm pkg set,
 // npm config set, npm init, tar x, patch ...). A writer of a NAMED file (redirect, cp, mv, sed -i, tee ...) is not here: writtenTo models those and the callers ask it for each file read.
-const GIT_CHANGERS = new Set(['checkout', 'switch', 'restore', 'reset', 'pull', 'merge', 'rebase', 'stash', 'am', 'apply', 'cherry-pick', 'revert', 'worktree', 'clean', 'read-tree', 'checkout-index', 'submodule', 'clone', 'sparse-checkout', 'bisect', 'mv', 'rm']);
+// #81 t11: a git command counts only when its SUBCOMMAND changes files in a work tree (`git log`, `git commit -m "merge x"`, `git fetch` do not), and only for a package directory that work tree
+// holds: the repository of the directory it runs in (`-C`, cd), or the one new directory `git worktree add` creates. A directory the guard cannot work out, on either side, counts.
+const GIT_TREE_SUBS = new Set(['checkout', 'switch', 'restore', 'pull', 'merge', 'rebase', 'am', 'apply', 'cherry-pick', 'revert', 'clean', 'read-tree', 'submodule', 'sparse-checkout', 'bisect', 'mv', 'rm', 'filter-branch']);
+const GIT_ANY_SUBS = new Set(['clone', 'checkout-index']); // (they write where the line says: --prefix=DIR, a new clone)
+const GIT_STASH_CHANGERS = new Set(['push', 'save', 'pop', 'apply', 'branch']);
+const GIT_WORKTREE_QUIET = new Set(['list', 'prune', 'remove', 'move', 'lock', 'unlock', 'repair']);
+const GIT_RESET_HARD = /^--(?:h|ha|har|hard|me|mer|merg|merge|k|ke|kee|keep)$/; // (git accepts any unambiguous prefix of a long option)
+// a line that can move the work tree, the git directory or the meaning of a subcommand (an alias defined on the line): its git commands count wherever they run
+const GIT_LINE_HAZARD = /GIT_(?:DIR|WORK_TREE|CONFIG\w*|COMMON_DIR)|--work-tree|--git-dir|core\.worktree|\balias\./i;
 const BULK_WRITERS = new Set(['tar', 'unzip', '7z', '7za', 'rsync', 'patch', 'cpio', 'ditto', 'bsdtar', 'pax', 'unrar', 'unpigz']);
 const PM_CHANGE_WORDS = new Set(['pkg', 'set-script', 'init', 'create', 'edit', 'link', 'ln']);
 const CONFIG_WRITE_WORDS = new Set(['set', 'delete', 'edit', 'rm', 'remove', 'unset']);
 export const BACKGROUND = /(?<![&>|])&(?![&>])/;
-export function stateChanger(argv) {
+
+// site: { dirs: string[] | null (where the command runs; null: unknown), expand(word) -> text, home, p (path module), text (the line) }.
+// Returns null (changes no work tree), 'any' (changes something we cannot place), { k: 'tree' | 'new', dirs: string[] | null }.
+function gitEffect(words, site) {
+  const p = site.p ?? nodePath;
+  let dirs = site.dirs ?? null;
+  const expand = (w) => (site.expand ? site.expand(String(w ?? '')) : String(w ?? ''));
+  const moved = (w) => {
+    let t = expand(w);
+    if (/[$`*?[\]]/.test(t) || t === '-') return null;
+    if (t === '~' || t.startsWith('~/')) { if (!site.home) return null; t = p.join(site.home, t.slice(1)); } else if (t.startsWith('~')) return null;
+    if (p.isAbsolute(t)) return [p.resolve(t)];
+    return dirs ? dirs.map((d) => p.resolve(d, t)) : null;
+  };
+  if (GIT_LINE_HAZARD.test(site.text ?? '')) return 'any'; // (every git command of such a line: the definition of an alias may come after the command that runs it)
+  let relocated = false; // --git-dir / --work-tree: the work tree is wherever the option says
+  let i = 1;
+  for (; i < words.length; i++) {
+    const t = words[i];
+    if (t === '-C') { dirs = moved(words[++i]); continue; }
+    if (t === '-c' || t === '--namespace' || t === '--super-prefix' || t === '--config-env') { i++; continue; }
+    if (t === '--git-dir' || t === '--work-tree') { relocated = true; i++; continue; }
+    if (t.startsWith('--git-dir=') || t.startsWith('--work-tree=')) { relocated = true; continue; }
+    if (t.startsWith('-')) continue;
+    break;
+  }
+  if (i >= words.length) return null;
+  const sub = expand(words[i]);
+  if (/[$`*?[\]]/.test(sub)) return 'any'; // (the subcommand is only known at run time)
+  const args = words.slice(i + 1);
+  let kind = null;
+  if (GIT_TREE_SUBS.has(sub)) kind = 'tree';
+  else if (GIT_ANY_SUBS.has(sub)) kind = 'any';
+  else if (sub === 'reset') kind = args.some((a) => GIT_RESET_HARD.test(a)) ? 'tree' : null;
+  else if (sub === 'stash') kind = args[0] === undefined || args[0].startsWith('-') || GIT_STASH_CHANGERS.has(args[0]) ? 'tree' : null;
+  else if (sub === 'worktree') kind = args[0] === 'add' ? 'new' : args[0] === undefined || GIT_WORKTREE_QUIET.has(args[0]) ? null : 'any';
+  if (kind === null) return null;
+  if (kind === 'any' || relocated) return 'any';
+  if (kind === 'tree') return { k: 'tree', dirs, nested: sub !== 'submodule' }; // (nested: a repository below this work tree keeps its own files; submodule update writes into them)
+  // worktree add [-f] [-b BRANCH] [--reason R] PATH [COMMIT]: the new directory is PATH
+  let target = null;
+  for (let j = 1; j < args.length; j++) {
+    const t = args[j];
+    if (t === '-b' || t === '-B' || t === '--reason') { j++; continue; }
+    if (t === '--') { target = args[j + 1] ?? null; break; }
+    if (t.startsWith('-')) continue;
+    target = t;
+    break;
+  }
+  return target === null ? 'any' : { k: 'new', dirs: moved(target) };
+}
+// true: some later package script cannot be trusted whatever its directory; an object: a git change placed in a directory; null: nothing
+function stateEffect(argv, site) {
   const words = baseName(argv[0] ?? '') === 'corepack' ? argv.slice(1) : argv;
   const name = baseName(words[0] ?? '');
-  if (name === 'git') return words.slice(1, 10).some((w) => GIT_CHANGERS.has(w));
+  if (name === 'git') { const e = gitEffect(words, site); return e === 'any' ? true : e; }
   if (BULK_WRITERS.has(name)) return true;
-  if (!Object.hasOwn(PM_RUN_ALIASES, name)) return false;
+  if (!Object.hasOwn(PM_RUN_ALIASES, name)) return null;
   const head = words.slice(1, 8);
-  return head.some((w) => PM_CHANGE_WORDS.has(w)) || (head.some((w) => w === 'config' || w === 'c') && head.some((w) => CONFIG_WRITE_WORDS.has(w))) || (name === 'yarn' && head[0] === 'set');
+  return head.some((w) => PM_CHANGE_WORDS.has(w)) || (head.some((w) => w === 'config' || w === 'c') && head.some((w) => CONFIG_WRITE_WORDS.has(w))) || (name === 'yarn' && head[0] === 'set') ? true : null;
 }
-// Remembers on the evaluation's shared budget what the commands in `argvs` (in the order they run, or all of them when the line puts one in the background) may change.
-export function markPackageState(budget, argvs) {
+// Remembers on the evaluation's shared budget what the commands in `argvs` (in the order they run, or all of them when the line puts one in the background: site.dirs null) may change.
+export function markPackageState(budget, argvs, site = {}) {
   for (const a of argvs) {
     if (!a.length) continue;
-    if (stateChanger(a)) budget.pkgDirty = true;
+    const e = stateEffect(a, site);
+    if (e === true) budget.pkgDirty = true;
+    else if (e) (budget.pkgGit ??= []).push(e);
     if (pmCall(a)?.installGroup) budget.pkgBinsDirty = true; // (an install adds and replaces node_modules/.bin)
   }
+}
+// The directories a package-manager call starts from (where its package.json is looked for): the directories it runs in, moved by --prefix / --dir. null: not known.
+export function pmStartDirs(call, cwds, home, p = nodePath) {
+  if (!Array.isArray(cwds) || cwds.some((c) => typeof c !== 'string')) return null;
+  if (call.dirDynamic) return null;
+  if (call.dir === null || call.dir === undefined) return cwds;
+  const d = call.dir === '~' || call.dir.startsWith('~/') ? p.join(home ?? '', call.dir.slice(1)) : call.dir;
+  return cwds.map((c) => p.resolve(c, d));
+}
+// Did an earlier command of the line (markPackageState) change what a manager started in one of `starts` reads? env: { pathExists, real(abs) -> abs, p }; deep: the call also reaches workspace packages below.
+export function pkgDirtyFor(budget, starts, env = {}) {
+  if (budget.pkgDirty) return true;
+  const list = budget.pkgGit;
+  if (!list?.length) return false;
+  if (starts === null || starts === undefined) return true;
+  const p = env.p ?? nodePath;
+  const forms = (x) => { const r = env.real ? env.real(x) : x; return r && r !== x ? [x, r] : [x]; };
+  const inside = (a, b) => forms(a).some((x) => forms(b).some((y) => x === y || x.startsWith(y.endsWith('/') ? y : `${y}/`)));
+  const exists = (x) => env.pathExists?.(x) === true;
+  const rootOf = (d) => { // the nearest directory at or above `d` that holds a .git (a directory, or the file a linked work tree has)
+    for (let x = d, n = 0; n < MAX_WALK; n++) {
+      if (exists(p.join(x, '.git'))) return x;
+      const up = p.dirname(x);
+      if (up === x) return null;
+      x = up;
+    }
+    return null;
+  };
+  for (const e of list) {
+    if (e.dirs === null) return true;
+    for (const s of starts) {
+      for (const d of e.dirs) {
+        if (e.k === 'new') { if (inside(s, d) || (env.deep && inside(d, s))) return true; continue; }
+        const root = rootOf(d);
+        if (root === null) return true;
+        if (!(inside(s, root) || (env.deep && inside(root, s)))) continue;
+        // a repository of its own below that work tree (a linked work tree in .worktrees/) keeps its own files, and a package.json inside it is the one the manager finds
+        const own = rootOf(s);
+        if (own !== null && own !== root && inside(own, root) && e.nested && !env.deep) {
+          let hit = false;
+          for (let x = s, n = 0; n < MAX_WALK && !hit; n++) {
+            if (exists(p.join(x, 'package.json'))) hit = true;
+            if (x === own) break;
+            const up = p.dirname(x);
+            if (up === x) break;
+            x = up;
+          }
+          if (hit) continue;
+        }
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 export const shellQuote = (w) => (/^[A-Za-z0-9_@%+=:,./-]+$/.test(w) ? w : `'${String(w).replace(/'/g, "'\\''")}'`);
