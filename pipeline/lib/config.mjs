@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { parseYaml } from './yaml.mjs';
 import { globToRegExp } from './glob.mjs';
+import { MAX_PROOFS, MAX_PROOF_STEP } from './run-record.mjs';
 
 function deepFreeze(value) {
   if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
@@ -207,6 +208,8 @@ function checkCiProof(verify, errors) {
     else if (new Set(deferrable).size !== deferrable.length) errors.push('verify.deferrable_steps must not repeat a step name');
     else {
       deferrableOk = true;
+      if (deferrable.length > MAX_PROOFS) errors.push(`verify.deferrable_steps lists ${deferrable.length} steps: at most ${MAX_PROOFS} (the run record holds that many proofs)`);
+      if (deferrable.some((n) => n.length > MAX_PROOF_STEP)) errors.push(`verify.deferrable_steps: step names may be at most ${MAX_PROOF_STEP} characters`);
       if (deferrable.some((n) => !SAFE_STEP.test(n))) errors.push('verify.deferrable_steps: step names may only use letters, digits and . _ : -');
       if (Array.isArray(verify.expected_steps)) {
         const unknown = deferrable.filter((n) => !verify.expected_steps.includes(n));
@@ -217,6 +220,8 @@ function checkCiProof(verify, errors) {
   if (proof !== undefined) {
     if (!isObj(proof)) errors.push('verify.ci_proof must be a mapping of step -> { workflow, job, event }');
     else {
+      if (Object.keys(proof).length > MAX_PROOFS) errors.push(`verify.ci_proof has ${Object.keys(proof).length} entries: at most ${MAX_PROOFS}`);
+      if (Object.keys(proof).some((n) => n.length > MAX_PROOF_STEP)) errors.push(`verify.ci_proof: step names may be at most ${MAX_PROOF_STEP} characters`);
       for (const [step, spec] of Object.entries(proof)) {
         const where = `verify.ci_proof[${JSON.stringify(step)}]`;
         if ((deferrable === undefined || deferrableOk) && !(deferrable ?? []).includes(step)) errors.push(`${where}: ${step} is not listed in verify.deferrable_steps`);

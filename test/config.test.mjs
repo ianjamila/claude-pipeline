@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseYaml } from '../pipeline/lib/yaml.mjs';
 import { DEFAULTS, GUARD_CHECKS, requiredChecks, stopHookTimeoutWarning, validateConfig, loadConfig, fill } from '../pipeline/lib/config.mjs';
+import { MAX_PROOFS, MAX_PROOF_STEP, normaliseProofs, proofsProblem } from '../pipeline/lib/run-record.mjs';
 
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
 const fixture = (name) => parseYaml(fs.readFileSync(path.join(fixtures, name), 'utf8'));
@@ -827,6 +828,30 @@ test('verify.deferrable_steps / ci_proof / ci_proof_inputs / ci_proof_wait_minut
   for (const bad of [0, -1, '5', null, true, NaN, Infinity, []]) assert.ok(has(withVerify({ ...good, ci_proof_wait_minutes: bad }), 'verify.ci_proof_wait_minutes must be a number above 0'), String(bad));
   assert.ok(has(withVerify({ ci_proof_wait_minutes: 5 }), 'verify.ci_proof_wait_minutes needs verify.ci_proof'));
   assert.equal(withVerify({ ...good, ci_proof_wait_minutes: 90 }).ok, true);
+});
+
+test('verify.deferrable_steps / ci_proof honour the run-record proof limits (count and step-name length), and a config at the limits makes proofs the record accepts', () => {
+  const withVerify = (extra) => validateConfig({ ...minimal(), verify: { ...minimal().verify, ...extra } });
+  const spec = { workflow: '.github/workflows/ci.yml', job: 'SQL arms' };
+  const mk = (n, len = 8) => Array.from({ length: n }, (_, i) => `s${i}`.padEnd(len, 'x'));
+  const cfgFor = (names) => ({ deferrable_steps: names, ci_proof: Object.fromEntries(names.map((s) => [s, { ...spec }])) });
+
+  const tooMany = withVerify(cfgFor(mk(MAX_PROOFS + 1)));
+  assert.ok(has(tooMany, `at most ${MAX_PROOFS}`), tooMany.errors.join('|'));
+  assert.equal(tooMany.errors.filter((e) => /verify\.ci_proof has/.test(e)).length, 1, 'ci_proof is checked too');
+  const longName = withVerify(cfgFor(['a'.repeat(MAX_PROOF_STEP + 1)]));
+  assert.ok(has(longName, `at most ${MAX_PROOF_STEP} characters`), longName.errors.join('|'));
+  assert.equal(longName.errors.filter((e) => /step names may be at most/.test(e)).length, 2, 'both deferrable_steps and ci_proof');
+
+  // exactly at the limits: the config validates AND the proofs it can produce are accepted by the run record
+  const names = mk(MAX_PROOFS, MAX_PROOF_STEP);
+  assert.ok(names.every((n) => n.length === MAX_PROOF_STEP));
+  const atLimits = withVerify(cfgFor(names));
+  assert.equal(atLimits.ok, true, atLimits.errors.join('|'));
+  const run = { id: 1, attempt: 1, jobId: 2, workflow: spec.workflow, job: spec.job, url: 'https://github.com/a/b/actions/runs/1' };
+  const proofs = atLimits.config.verify.deferrable_steps.map((step, i) => (i % 2 ? { step, source: 'local' } : { step, source: 'ci', run }));
+  assert.equal(proofsProblem(proofs), null);
+  assert.equal(normaliseProofs(proofs).length, MAX_PROOFS);
 });
 
 test('verify.ci_proof parses from real YAML (hyphenated step names, nested mapping, quoted job)', () => {

@@ -172,9 +172,12 @@ const text = (v, max) => clip(String(v ?? '').trim(), max);
 // [{ step, source: 'local' }] (the Mac ran it) or [{ step, source: 'ci', run: { id, attempt, jobId, workflow, job, url } }] (GitHub's run
 // vouched for it). Written by `P merge` from its live gate evaluation; display + audit (the append-only ci-proof-used event is the copy
 // that survives a rewritten record).
-const PROOF_STEP = /^[A-Za-z0-9._:-]{1,64}$/;
+// MAX_PROOFS / MAX_PROOF_STEP are the one source of the limits: config validation (verify.deferrable_steps, verify.ci_proof) enforces
+// them too, so a config the validator accepts can never produce proofs this record refuses (merge would then refuse forever).
+export const MAX_PROOFS = 20;
+export const MAX_PROOF_STEP = 64;
+const PROOF_STEP = new RegExp(`^[A-Za-z0-9._:-]{1,${MAX_PROOF_STEP}}$`);
 const RUN_COUNTERS = ['id', 'attempt', 'jobId'];
-const MAX_PROOFS = 20;
 
 function proofProblem(p) {
   if (!isPlainObject(p) || !isStr(p.step) || !PROOF_STEP.test(p.step)) return 'bad step name';
