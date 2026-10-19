@@ -13,7 +13,7 @@
 // And since verify.full comes from the repo's pipeline.yml, which a PR can change, the exact command line it will spawn is judged by
 // the same git and file guards as `job start` (lib/command-guard.mjs) before a ticket is taken or anything is spawned; a denied
 // command exits 1 { ok:false, refused:true, reason } like a refused job.
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -214,6 +214,54 @@ function tryTakeSlot(n, env) {
   return null;
 }
 
+// The verify command runs in its own process group (POSIX) so a signal reaches the whole tree, not just the shell, and the slot
+// is held until the whole group has exited. Windows: taskkill walks the tree. Fake children (tests) have no pid: child.kill.
+const GROUP_GRACE_MS = 30_000;
+const GROUP_KILLED_WAIT_MS = 5000;
+const GROUP_POLL_MS = 50;
+
+function signalTree(child, sig) {
+  if (child.pid === undefined) {
+    child.kill(sig);
+    return;
+  }
+  if (process.platform === 'win32') {
+    spawnSync('taskkill', ['/T', '/F', '/PID', String(child.pid)], { cwd: os.tmpdir(), windowsHide: true });
+    return;
+  }
+  try {
+    process.kill(-child.pid, sig);
+  } catch {
+    try { child.kill(sig); } catch { /* already gone */ }
+  }
+}
+
+const groupAlive = (pgid) => {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM';
+  }
+};
+
+async function waitGroupGone(pgid, ms, sleep) {
+  const end = Date.now() + ms;
+  while (groupAlive(pgid)) {
+    if (Date.now() >= end) return false;
+    await sleep(GROUP_POLL_MS);
+  }
+  return true;
+}
+
+// After the shell has exited, never report done while anything it started is still running: wait (bounded), then SIGKILL the group.
+async function drainGroup(child, sleep) {
+  if (child.pid === undefined || process.platform === 'win32') return;
+  if (await waitGroupGone(child.pid, GROUP_GRACE_MS, sleep)) return;
+  try { process.kill(-child.pid, 'SIGKILL'); } catch { /* gone */ }
+  await waitGroupGone(child.pid, GROUP_KILLED_WAIT_MS, sleep);
+}
+
 const signalExit = (sig) => 128 + (os.constants.signals[sig] ?? 0);
 
 function exitCodeOf(code, signal) {
@@ -253,7 +301,7 @@ export async function runWithSlot({
   const warnings = [];
   let received = null; // first termination signal seen
   let child = null;
-  const handlers = SIGNALS.map((sig) => [sig, () => { received ??= sig; if (child) child.kill(sig); }]);
+  const handlers = SIGNALS.map((sig) => [sig, () => { received ??= sig; if (child) signalTree(child, sig); }]);
   for (const [sig, fn] of handlers) proc.on(sig, fn);
 
   let ticket = null;
@@ -301,7 +349,7 @@ export async function runWithSlot({
 
     return await new Promise((resolve) => {
       try {
-        child = spawnFn(command, { shell: true, cwd, env: childEnv, stdio: 'inherit' });
+        child = spawnFn(command, { shell: true, cwd, env: childEnv, stdio: 'inherit', detached: process.platform !== 'win32' });
       } catch (err) {
         stderr.write(`verify slot: could not start the command: ${err.message}\n`);
         resolve(127);
@@ -311,8 +359,10 @@ export async function runWithSlot({
         stderr.write(`verify slot: could not run the command: ${err.message}\n`);
         resolve(127);
       });
-      child.on('close', (code, signal) => resolve(exitCodeOf(code, signal)));
-      if (received) child.kill(received); // a signal landed between the last check and the spawn
+      child.on('close', (code, signal) => {
+        drainGroup(child, realSleep).then(() => resolve(exitCodeOf(code, signal)), () => resolve(exitCodeOf(code, signal)));
+      });
+      if (received) signalTree(child, received); // a signal landed between the last check and the spawn
     });
   } finally {
     for (const [sig, fn] of handlers) proc.off(sig, fn);

@@ -18,6 +18,7 @@ import { createTmpRepo } from './helpers/tmprepo.mjs';
 process.env.PIPELINE_MACHINE_ID ||= 'test-machine-id';
 const BIN = fileURLToPath(new URL('../pipeline/bin/pipeline.mjs', import.meta.url));
 const CHILD = fileURLToPath(new URL('./fixtures/slot-child.mjs', import.meta.url));
+const STUBBORN = fileURLToPath(new URL('./fixtures/slot-stubborn.mjs', import.meta.url));
 const ECHO = fileURLToPath(new URL('./fixtures/slot-echo.mjs', import.meta.url));
 const HOST = os.hostname();
 const MACHINE = process.env.PIPELINE_MACHINE_ID;
@@ -456,7 +457,10 @@ test('CLI: two different repos share the one machine slot; the second runs after
   }
 });
 
-test('CLI: SIGTERM to the wrapper reaches the verify and frees the slot', TIMEOUT, async () => {
+// Signals and process groups are POSIX; Windows takes the taskkill path, which these assertions do not describe.
+const POSIX_ONLY = { ...TIMEOUT, skip: process.platform === 'win32' };
+
+test('CLI: SIGTERM to the wrapper reaches the verify and frees the slot', POSIX_ONLY, async () => {
   const work = tmp();
   const repo = repoWith(1, { args: childArgs(work, 'a') });
   const lockDir = tmp();
@@ -471,6 +475,31 @@ test('CLI: SIGTERM to the wrapper reaches the verify and frees the slot', TIMEOU
     assert.equal(readdirSync(lockDir).some((f) => f.endsWith('.lock')), false);
   } finally {
     writeFileSync(path.join(work, 'release'), ''); // never leave the fixture polling
+    repo.cleanup();
+  }
+});
+
+test('CLI: the slot stays held until the whole verify process tree has exited (compound command, SIGTERM ignored for a while)', POSIX_ONLY, async () => {
+  const work = tmp();
+  const marker = (n) => path.join(work, n);
+  const repo = createTmpRepo();
+  const full = `${[process.execPath, STUBBORN, marker('started'), marker('term'), marker('done')].map(q).join(' ')} && true`; // the shell stays the parent
+  repo.write('.claude/pipeline.yml', `version: 1\nproject: demo\nverify:\n  full: ${JSON.stringify(full)}\n  quick: node scripts/verify.mjs --quick\n  max_parallel_full: 1\n`);
+  repo.commit('config');
+  const lockDir = tmp();
+  try {
+    const a = startCli(repo.dir, lockDir);
+    await until(() => existsSync(marker('started')), 'verify to start');
+    assert.equal(statusOf(lockDir).holders.length, 1);
+    a.p.kill('SIGTERM');
+    await until(() => existsSync(marker('term')), 'the signal to reach the verify');
+    assert.equal(existsSync(marker('done')), false);
+    assert.equal(statusOf(lockDir).holders.length, 1, 'the verify is still running, so the slot is still held');
+    const r = await a.done;
+    assert.equal(existsSync(marker('done')), true, 'the wrapper waited for the verify to finish');
+    assert.equal(r.code, 128 + os.constants.signals.SIGTERM, "the shell's exit status is the wrapper's");
+    assert.deepEqual(statusOf(lockDir).holders, []);
+  } finally {
     repo.cleanup();
   }
 });
