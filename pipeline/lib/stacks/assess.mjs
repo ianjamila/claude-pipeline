@@ -134,15 +134,17 @@ export function ownPids(root, { readDir = (d) => fs.readdirSync(d), readFile = (
       notes.push(`worker file ${name} has no usable pid`);
       continue;
     }
-    if (Number.isFinite(rec.birth)) {
-      let alive;
-      try {
-        alive = isAlive({ pid: rec.pid, birth: rec.birth });
-      } catch {
-        alive = null;
-      }
-      if (alive?.ok !== true || alive.value !== true) continue; // gone, reused, or unknown: not provably ours, so it stays visible
+    // Fail closed: a pid is excluded only when its recorded birth still matches. A file with no birth (the worker died before
+    // recording it) may by now name an unrelated process that reused the pid, so it stays visible; the current process is
+    // excluded separately by pid.
+    if (!Number.isFinite(rec.birth)) continue;
+    let alive;
+    try {
+      alive = isAlive({ pid: rec.pid, birth: rec.birth });
+    } catch {
+      alive = null;
     }
+    if (alive?.ok !== true || alive.value !== true) continue; // gone, reused, or unknown: not provably ours, so it stays visible
     pids.add(rec.pid);
   }
   return pids;

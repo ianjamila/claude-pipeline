@@ -468,7 +468,7 @@ test('ownPids: pids from workers/*.json; a recorded birth must still match (a re
   try {
     assert.deepEqual([...ownPids(w.root)], [], 'no workers folder is fine');
     putWorker(w, '4242.json', { pid: 4242, birth: 50, owner: OWNER, phase: 'waiting' });
-    putWorker(w, 'self.json', { pid: 4343 }); // no birth recorded (the hook wrote it first): the pid alone counts
+    putWorker(w, 'self.json', { pid: 4343 }); // no birth recorded: not provably ours, so it stays visible (R1-B4)
     putWorker(w, '5050.json', { pid: 5050, birth: 60 }); // the pid now belongs to another process
     putWorker(w, '6060.json', { pid: 6060, birth: 70 }); // liveness cannot be told
     putWorker(w, 'broken.json', '{nope');
@@ -478,11 +478,30 @@ test('ownPids: pids from workers/*.json; a recorded birth must still match (a re
     const notes = [];
     const isAlive = (o) => (o.pid === 4242 ? ok(true) : o.pid === 5050 ? ok(false) : unknown('ps timed out'));
     const got = ownPids(w.root, { isAlive, notes });
-    assert.deepEqual([...got].sort(), [4242, 4343]);
+    assert.deepEqual([...got].sort(), [4242]);
     assert.equal(notes.filter((n) => /broken\.json|array\.json|nopid\.json/.test(n)).length, 3);
     // an unreadable folder or file never throws
     assert.deepEqual([...ownPids(w.root, { readDir: () => { throw new Error('EACCES'); }, notes: [] })], []);
     assert.deepEqual([...ownPids(w.root, { readFile: () => { throw new Error('EACCES'); }, isAlive, notes: [] })], []);
+  } finally {
+    w.cleanup();
+  }
+});
+
+// R1-B4: a worker file without a recorded birth does not hide its pid, even when the pid is alive.
+test('gatherEvidence: a birthless worker file whose pid is alive is not excluded (the current process still is)', async () => {
+  const w = world();
+  try {
+    putWorker(w, '4343.json', { pid: 4343 });
+    putWorker(w, '4242.json', { pid: 4242, birth: 50 });
+    const seen = {};
+    const grab = (name) => (...a) => { seen[name] = a[a.length - 1].excludePids; return ok([]); };
+    const evidence = { ...clean, connections: grab('connections'), processRefs: grab('processRefs'), cwdInside: grab('cwdInside') };
+    await gatherEvidence(w.stack, ctxFor(w, { evidence, isAlive: () => ok(true) }), { probes: ['connections', 'processRefs', 'cwdProcs'] });
+    for (const name of ['connections', 'processRefs', 'cwdInside']) {
+      assert.ok(!seen[name].has(4343), `${name} still counts the birthless pid`);
+      assert.ok(seen[name].has(4242) && seen[name].has(process.pid), `${name} excludes the verified worker and itself`);
+    }
   } finally {
     w.cleanup();
   }
