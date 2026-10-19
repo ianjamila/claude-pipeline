@@ -113,15 +113,15 @@ test('t9 a script that runs another script or file is followed', () => {
   ok('npm run deploy', { 'package.json': { scripts: { deploy: 'npm run inner', inner: 'ok' } } });
 });
 test('t9 the words after -- are appended to the script text', () => {
-  const t = { 'package.json': { scripts: { x: 'git ' + PUSH, f: 'cp a' } } };
+  const t = { 'package.json': { scripts: { shipit: 'git ' + PUSH, f: 'cp a' } } };
   const g = (cmd) => git(cmd, treeFor(t, ''));
-  assert.equal(g('npm run x').decision, 'allow', 'a bare push of the agent branch is allowed');
-  assert.equal(g(`npm run x -- origin ${MAIN}`).decision, 'deny');
-  assert.equal(g(`npm run x -- --force`).decision, 'deny', 'a forced push is refused');
-  assert.equal(g(`pnpm run x origin ${MAIN}`).decision, 'deny');
-  assert.equal(g(`yarn x origin ${MAIN}`).decision, 'deny');
+  assert.equal(g('npm run shipit').decision, 'allow', 'a bare push of the agent branch is allowed');
+  assert.equal(g(`npm run shipit -- origin ${MAIN}`).decision, 'deny');
+  assert.equal(g(`npm run shipit -- --force`).decision, 'deny', 'a forced push is refused');
+  assert.equal(g(`pnpm run shipit origin ${MAIN}`).decision, 'deny');
+  assert.equal(g(`yarn shipit origin ${MAIN}`).decision, 'deny');
   // npm keeps every option written before -- for itself: only the words after it reach the script
-  assert.equal(g(`npm run x --if-present`).decision, 'allow');
+  assert.equal(g(`npm run shipit --if-present`).decision, 'allow');
   const f = (cmd) => filesGuard(cmd, treeFor(t, ''));
   assert.equal(f('npm run f -- b').decision, 'allow');
   assert.equal(f(`npm run f -- ~/${CL}/settings.json`).decision, 'deny');
@@ -241,7 +241,7 @@ test('t9 the package.json is read once per evaluation, and the work counts again
   assert.equal(git('npm run s0', treeFor(root(chain), BAD_GIT)).decision, 'deny');
 });
 test('t9 npm exec / npx of a path or a node_modules/.bin shell script opens it; package JS is not opened', () => {
-  const tree = { 'node_modules/.bin/tool': '#!/bin/sh\nbad\n', 'bin/run.sh': '#!/bin/sh\nbad\n', 'node_modules/.bin/jstool': '#!/usr/bin/env node\nbad\n', 'node_modules/.bin/fine': '#!/bin/sh\nok\n' };
+  const tree = { 'node_modules/.bin/tool': `#!/bin/sh\n${BAD_GIT}\n`, 'bin/run.sh': `#!/bin/sh\n${BAD_GIT}\n`, 'node_modules/.bin/jstool': `#!/usr/bin/env node\n${BAD_GIT}\n`, 'node_modules/.bin/fine': '#!/bin/sh\necho hi\n' };
   const g = (cmd, tr = tree) => git(cmd, treeFor(tr, BAD_GIT));
   assert.equal(g('npx tool').decision, 'deny');
   assert.equal(g('npm exec tool').decision, 'deny');

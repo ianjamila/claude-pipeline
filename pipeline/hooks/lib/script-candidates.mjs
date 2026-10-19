@@ -251,6 +251,10 @@ function valueWord(s, i, inArray) {
   }
   return i >= s.length ? [w, i] : [null, i];
 }
+// #81 t9: an operator written where the value is used (`echo x > ~/${F/ok/.claude}/settings.json`, not only `D=${F/ok/.claude}; … $D`): each such expansion is kept under a key of its own, the
+// words it stands for, and readingsOf puts them in place of it. (`:-` `:=` `:+` `:?` forms are paramReadings' own.)
+const INLINE = '\u0001inline:';
+const INLINE_OP = /\$\{[A-Za-z_]\w*(?:\[[^\]\n]{0,64}\])?(?:\/\/?|##?|%%?|\^\^?|,,?|:(?![-=+?]))/g;
 const ASSIGN_AT = /(?<![\w$.\/-])([A-Za-z_]\w{0,63})(?:\[([^\]\n]{0,64})\])?(\+?)=/g;
 function assignedValues(text) {
   // cheap, linear test first: an expansion, an array or an element assignment
@@ -287,6 +291,15 @@ function assignedValues(text) {
       if (w === null || m[2] !== undefined || w.includes('${') || w.includes('$')) if (++interesting > MAX_ASSIGN_ENTRIES) return wildcard();
     }
   }
+  // (each distinct inline operator expansion is a name of its own, assigned the expansion as written: resolved below like any other)
+  const inline = new Set();
+  for (const m of text.matchAll(INLINE_OP)) {
+    const j = closeBrace(text, m.index + 1);
+    if (j < 0 || inline.size >= MAX_ASSIGN_ENTRIES) continue;
+    inline.add(text.slice(m.index, j + 1));
+  }
+  for (const expr of inline) { found.push({ name: INLINE + expr, array: false, words: [expr] }); interesting++; }
+  if (interesting > MAX_ASSIGN_ENTRIES) return wildcard();
   if (!found.some((x) => x.array || x.words.some((w) => w === null || w.includes('${')))) return new Map();
   const cand = new Map(); // name -> Set of words (a scalar, or any element of an array)
   const arrays = new Set(found.filter((x) => x.array).map((x) => x.name));
@@ -370,6 +383,20 @@ export function readingsOf(word, assigned) {
   while (queue.length && !over) {
     const r = queue.shift();
     for (const [key, ws] of assigned) {
+      if (key.startsWith(INLINE)) { // (an operator expansion written in the word: replaced as a whole)
+        const expr = key.slice(INLINE.length);
+        if (!r.includes(expr)) continue;
+        for (const w of ws) {
+          if (/[$`]/.test(w)) { over = true; break; }
+          const nr = r.split(expr).join(w);
+          if (out.has(nr)) continue;
+          out.add(nr);
+          queue.push(nr);
+          if (out.size > MAX_READINGS) { over = true; break; }
+        }
+        if (over) break;
+        continue;
+      }
       // (an array, `NAME[]`: its elements stand for any use of the name, with a subscript or without)
       const n = key === WILD ? '' : key.endsWith('[]') ? key.slice(0, -2) : key;
       const ref = key === WILD ? '\\$\\{?[A-Za-z_]' : key.endsWith('[]') ? `\\$(?:\\{${n}(?:\\[[^\\]]{0,64}\\])?\\}|${n}(?![A-Za-z0-9_])(?:\\[[^\\]]{0,64}\\])?)` : `\\$(?:\\{${n}\\}|${n}(?![A-Za-z0-9_]))`;

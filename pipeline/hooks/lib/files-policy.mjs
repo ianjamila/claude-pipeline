@@ -16,6 +16,7 @@
 // ancestor process); commands that unset or override CLAUDECODE are denied here.
 import fs from 'node:fs';
 import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
+import { pmCall, pmMoverName, packageScripts } from './package-scripts.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
@@ -1587,6 +1588,35 @@ function judgeScriptFile(sf, dirs, ctx, opts, scanRaw = '', keepBackslash = fals
   return null;
 }
 
+// #81 t9: `npm run deploy`, `npm test`, `pnpm ship`, `yarn run x`, `bun run x` run the text package.json holds for the script (and its pre / post hooks, with the words after `--` appended), in the
+// package's directory: judged like `bash -c TEXT` run there. See package-scripts.mjs. A script or directory only known at run time is left to the textual rules on the whole line (as a script named
+// at run time is); a setting that moves the package.json (npm_config_prefix, INIT_CWD, PNPM_* ...) is refused, as which package.json the manager reads is then unknown.
+function judgePackageScripts(c, dirs, ctx, opts, scanRaw = '') {
+  if (!c.argv.length) return null;
+  const call = pmCall(c.argv.map((w) => expandRefs(w, ctx)));
+  if (!call) return null;
+  const mover = call.mover ? '--userconfig / --globalconfig' : pmMoverName([...Object.keys(ctx.vars), ...ctx.unknownVars, ...ctx.pickUnknown, ...Object.keys(c.env ?? {})]);
+  if (mover) return deny(`package script: ${mover} may point the package manager at another package.json or configuration, so which script \`${c.argv.slice(0, 4).join(' ')}\` runs cannot be verified. Run it without it (set the directory with --prefix)`);
+  if (call.dynamic || call.dirDynamic) return null;
+  const seen = new Set();
+  for (const d of dirs) {
+    const plan = packageScripts(call, {
+      cwd: d, home: ctx.homePosix, readText: ctx.readText, pathExists: (x) => ctx.api.existsSync(x), readDir: ctx.readDir, cache: (ctx.budget.pkgCache ??= new Map()), p: posix, tick: () => checkDeadline(ctx.budget),
+      written: (abs) => (writtenTo(ctx.frames, abs, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: true }) ? 'known' : writtenTo(ctx.frames, abs, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: ctx.ignoreUnmodelled === true }) ? 'maybe' : null),
+      mentionsGuarded: () => makeMatchers(ctx).rawHit(scanRaw, [d]) || SENSITIVE_WORDS.test(String(scanRaw).replace(/['"`\\]/g, '')),
+    });
+    if (plan.refuse) return deny(plan.refuse);
+    for (const run of plan.runs ?? []) {
+      const key = `${run.file}\u0000${run.label}\u0000${run.text}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const r = judgeScriptText(run.text, { kind: 'shell', file: run.label }, run.file, run.dir, ctx, opts);
+      if (r) return r;
+    }
+  }
+  return null;
+}
+
 // Several files that feed ONE shell (`cat a b | bash`): the shell reads their texts one after the other, so they are judged joined, in the order
 // the command names them, repeats included (a protected name split across them is one name). `scan`: the text a rewriting command prints from
 // them (in an order we do not know): refused when the joined text refers to a protected file or switch, read in either order. Run in every
@@ -2548,6 +2578,11 @@ function evaluateBashForFilesFrame(command, opts) {
         if (v) return v;
         if (sf.kind === 'shell' && ['source', '.'].includes(baseOf(c.argv[0] ?? ''))) absorbSourced(sf, dirs, ctx); // (a sourced file runs in this shell: what it sets is the line's from here)
       }
+      // #81 t9: `npm run NAME` and its kin run the text package.json holds for NAME
+      {
+        const v = judgePackageScripts(c, sdirsNow(), ctx, withLineVars(opts, c), scanRaw);
+        if (v) return v;
+      }
       // script text that reaches a shell without being named (`bash < f.sh`, `cat f.sh | bash`, `eval "$(cat f.sh)"`): its files are judged like `bash f.sh`
       for (const fd of scriptFeedsOf(c, raw, (w) => expandRefs(w, ctx))) {
         withPath(fd);
@@ -2560,7 +2595,7 @@ function evaluateBashForFilesFrame(command, opts) {
     // at the depth limit nothing is followed any further: a named script, a fed file or a startup file the line names is refused; the
     // implicit one (the real home's, which no word names) is judged here, once per evaluation like at the top level
     for (const c of cmds) {
-      if (scriptFileOf(c.argv) || scriptFeedsOf(c).length) return deny('scripts run scripts too deeply to check');
+      if (scriptFileOf(c.argv) || scriptFeedsOf(c).length || pmCall(c.argv)) return deny('scripts run scripts too deeply to check');
       for (const st of startupFilesOf(c, cmds, { env: startupEnv, inherited: inheritedStartup })) {
         if (!st.implicit) return deny('scripts run scripts too deeply to check');
         const v = judgeStartupFile(st);
