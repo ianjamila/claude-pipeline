@@ -90,7 +90,7 @@ const SAFE_STEP = /^[A-Za-z0-9_.:-]+$/;
 const KEYS = {
   top: [...Object.keys(DEFAULTS), 'project'],
   worktrees: ['mode', 'protect', 'min_idle_hours', 'min_merged_hours', 'delete', 'archive', 'memory_dirs'],
-  verify: ['full', 'quick', 'report', 'screenshots', 'expected_steps', 'skippable_steps', 'stop_queue_wait_minutes', 'after_fix', 'after_fix_steps_by_path', 'after_fix_never'],
+  verify: ['full', 'quick', 'report', 'screenshots', 'expected_steps', 'skippable_steps', 'stop_queue_wait_minutes', 'after_fix', 'after_fix_steps_by_path', 'after_fix_never', 'max_parallel_full', 'max_load', 'max_load_wait_minutes'],
   ci: ['required_checks', 'e2e_label', 'draft_while_iterating', 'guard_checks', 'approvers'],
   merge: ['command', 'wait_minutes'],
   preview: ['environment', 'smoke', 'provider'],
@@ -172,6 +172,24 @@ function checkAfterFix(verify, errors) {
       if (unknown.length) errors.push(`${where} names step(s) not in verify.expected_steps: ${unknown.join(', ')}`);
     }
   }
+}
+
+// Optional. verify.max_parallel_full: at most this many full verifies (of any repo) run at once on one machine; the rest queue
+// (`pipeline verify slot --run`). verify.max_load (needs it): after getting a slot, wait while the 1-minute load average is above
+// this, for at most verify.max_load_wait_minutes (default 10, never above 10), then run anyway.
+function checkSlots(verify, errors) {
+  const { max_parallel_full: slots, max_load: load, max_load_wait_minutes: wait } = verify;
+  const positive = (v) => typeof v === 'number' && Number.isFinite(v) && v > 0;
+  if (slots !== undefined && !(isInt(slots) && slots >= 1)) errors.push('verify.max_parallel_full must be a positive integer');
+  if (load !== undefined) {
+    if (!positive(load)) errors.push('verify.max_load must be a positive number');
+    else if (slots === undefined) errors.push('verify.max_load needs verify.max_parallel_full (the load check runs after a slot is taken)');
+  }
+  if (wait !== undefined) {
+    if (!positive(wait) || wait > 10) errors.push('verify.max_load_wait_minutes must be a number above 0 and at most 10');
+    else if (load === undefined) errors.push('verify.max_load_wait_minutes needs verify.max_load');
+  }
+  if (load !== undefined && wait === undefined) verify.max_load_wait_minutes = 10;
 }
 
 function unknownKeys(obj, allowed, prefix, errors) {
@@ -384,6 +402,7 @@ export function validateConfig(obj) {
     }
     if (!AFTER_FIX_MODES.includes(verify.after_fix)) errors.push(`verify.after_fix must be ${AFTER_FIX_MODES.join('|')}`);
     checkAfterFix(verify, errors);
+    checkSlots(verify, errors);
   }
 
   const mergeSec = section(config, 'merge', errors);

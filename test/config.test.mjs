@@ -738,3 +738,39 @@ test('worktrees block: a path in delete must not also be in archive', () => {
   assert.equal(r.ok, false);
   assert.ok(has(r, 'worktrees: .review/ is in both delete and archive'));
 });
+
+test('verify.max_parallel_full / max_load / max_load_wait_minutes: optional, validated, wait defaults to 10 with max_load', () => {
+  const withVerify = (extra) => validateConfig({ ...minimal(), verify: { ...minimal().verify, ...extra } });
+  const none = validateConfig(minimal());
+  assert.equal(none.ok, true);
+  assert.equal(none.config.verify.max_parallel_full, undefined, 'unset = no limit');
+  assert.equal(none.config.verify.max_load, undefined);
+  assert.equal(none.config.verify.max_load_wait_minutes, undefined, 'no default without max_load');
+
+  const slots = withVerify({ max_parallel_full: 2 });
+  assert.equal(slots.ok, true, slots.errors.join('; '));
+  assert.equal(slots.config.verify.max_parallel_full, 2);
+  assert.equal(slots.config.verify.max_load_wait_minutes, undefined);
+
+  const load = withVerify({ max_parallel_full: 2, max_load: 12.5 });
+  assert.equal(load.ok, true, load.errors.join('; '));
+  assert.equal(load.config.verify.max_load, 12.5);
+  assert.equal(load.config.verify.max_load_wait_minutes, 10, 'default 10 when max_load is set');
+
+  const wait = withVerify({ max_parallel_full: 1, max_load: 8, max_load_wait_minutes: 2.5 });
+  assert.equal(wait.ok, true, wait.errors.join('; '));
+  assert.equal(wait.config.verify.max_load_wait_minutes, 2.5);
+  assert.equal(withVerify({ max_parallel_full: 1, max_load: 8, max_load_wait_minutes: 10 }).ok, true, '10 is the ceiling');
+
+  for (const bad of [0, -1, 1.5, '2', null, true, [], {}, NaN, Infinity]) {
+    assert.ok(has(withVerify({ max_parallel_full: bad }), 'verify.max_parallel_full must be a positive integer'), String(bad));
+  }
+  for (const bad of [0, -3, '8', null, true, NaN, Infinity, []]) {
+    assert.ok(has(withVerify({ max_parallel_full: 2, max_load: bad }), 'verify.max_load must be a positive number'), String(bad));
+  }
+  for (const bad of [0, -1, 10.5, 11, '5', null, NaN, Infinity]) {
+    assert.ok(has(withVerify({ max_parallel_full: 2, max_load: 8, max_load_wait_minutes: bad }), 'verify.max_load_wait_minutes must be'), String(bad));
+  }
+  assert.ok(has(withVerify({ max_load: 8 }), 'verify.max_load needs verify.max_parallel_full'));
+  assert.ok(has(withVerify({ max_parallel_full: 2, max_load_wait_minutes: 5 }), 'verify.max_load_wait_minutes needs verify.max_load'));
+});
