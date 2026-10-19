@@ -290,6 +290,11 @@ test('t2 (regression) an unmodelled command with a run-time argument is no known
   // an append to a file only known at run time: package.json's own words in front of it are not the appended text
   for (const pre of ["printf '\\nok\\n' >> $T", "echo ok >> $T/x.ts", "F=a.ts; cp $F b.bak; printf '\\nok\\n' >> $F; cp b.bak $F"]) allowed(`${pre}; npm run build`, nm);
   refused(`printf '\\n${PUSH} ${CL}\\n' >> package.json; npm run build`, nm);
+  // a write to a path only known at run time stays a maybe for package.json: refused once the line mentions a guarded operation, whatever writes it
+  for (const w of ['lsof -p $pid > $F', 'lsof -p $pid | tee $F', 'tee $F < x', 'cp a $F', 'dd if=a of=$F', 'echo ok >> $F', 'mytool --out $F']) {
+    refusedWithMention(`${w}; npm run build`, { ...nm, x: 'ok\n', a: 'ok\n' });
+    refusedWithMention(`[ -n "$pid" ] && ${w}; npm run build`, { ...nm, x: 'ok\n', a: 'ok\n' });
+  }
   // the plain script gets the same verdict
   for (const pre of ['lsof -p $pid']) assert.equal(git(`${pre}; bash run.sh`, { ...tree(nm), ...PLAIN }).decision, 'allow');
   // twins: a write that names the file, a redirect, tee, an inline writer with a guarded command and a mention
