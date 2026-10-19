@@ -119,6 +119,7 @@ export function assigningDefaults(text) {
   for (const m of t.matchAll(ASSIGNING)) {
     const from = m.index + m[0].length;
     if (close !== -1 && close < from) close = t.indexOf('}', from);
+    // Defensive (mutation check): without the early break, each head searches the rest of the line with the native indexOf (a memory scan), which stays inside the 6 s bound of the 200 kB shapes.
     if (close === -1) break; // (no `}` from here on: no later head closes either)
     const v = close - from > MAX_VALUE_CHARS ? UNKNOWN_WORD : t.slice(from, close);
     const ws = out.get(m[1]) ?? [];

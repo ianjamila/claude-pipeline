@@ -94,3 +94,23 @@ test('H2 functions and a tee with many operands are still found (the linear scan
   deny(`f() { echo x > ~/${CL}/settings.json; }; f`.replace('f() {', 'f() {'));
   deny(`tee ${Array.from({ length: 300 }, (_, i) => `o${i}`).join(' ')} ~/${CL}/settings.json < /dev/null`);
 });
+
+// ---- more cover for the pieces above ---------------------------------------------------------------------------------------------------------------------------
+test('H1 more assignments than the scan follows make every name the line gives a run-time variable', () => {
+  const filler = Array.from({ length: 300 }, (_, i) => `A${i}=\${U:-x};`).join(' ');
+  deny(`${filler} D=\${U:-${CL}}; echo x > ~/$D/settings.json`);
+});
+test('H1 an assigned word longer than the scan keeps is the unknown word, not a guess', async () => {
+  const { assigningDefaults } = await import('../pipeline/hooks/lib/script-candidates.mjs');
+  assert.deepEqual(assigningDefaults(`: \${X:=${'a'.repeat(2000)}}`).get('X'), ['$(?)']);
+  assert.deepEqual(assigningDefaults(': ${X:=w}; : ${X=v}').get('X'), ['w', 'v']);
+});
+test('H2 a line of open braces is read without flattening the word for each one (well under the general bound)', () => {
+  const line = fill('{');
+  for (const run of [() => git(line), () => files(line)]) {
+    const t0 = cpu();
+    run();
+    const ms = cpu() - t0;
+    assert.ok(ms < 1000, `${Math.round(ms)} ms of CPU`);
+  }
+});

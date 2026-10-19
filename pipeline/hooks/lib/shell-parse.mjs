@@ -2792,6 +2792,7 @@ class Parser {
     if (cmd) Object.defineProperty(cmd, 'litWords', { value: new Set(a.filter((w) => !seg.meta.get(w)?.dyn && !seg.pat.has(w))), enumerable: false });
     if (!isExec) { seg.final = { argv: a }; seg.cmd = cmd; }
     // what the command prints and what it reads on stdin, for callers that ask which text a write of its output holds (see line-writes.mjs); lazy, most commands never need it
+    // Defensive (mutation check): without the memo the single stdinItems call in line-writes.mjs (tee) keeps a tee with thousands of operands linear.
     if (cmd && !isExec) { let streams; Object.defineProperty(cmd, 'streams', { value: () => (streams ??= streamsOf(seg, a)), enumerable: false }); } // (worked out once: the callers only read it)
     if (fan && cmd && !isExec) this.fanOut(seg, fan, a, cmd);
     if (headDyn && cmd) {
