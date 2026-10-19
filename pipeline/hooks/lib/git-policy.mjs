@@ -398,6 +398,7 @@ const SETS_BY_NAME = /\b(?:eval|read|mapfile|readarray|getopts|source)\b|\bprint
 // Why (#81 Codex R1-B1 follow-up): a script the guard opens is judged with its own text too -- `bash wrapper.sh` hid `declare -n r=IFS; r=x` from the outer line. Whole-line comments are left out of
 // the binder test only (a comment that says "read" is no binder); the name IFS anywhere, a comment included, still counts.
 const withoutCommentLines = (s) => s.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n');
+// Defensive (mutation check): the binder test (SETS_BY_NAME) and the quote-stripped spelling (`I""FS`) of a script are also held by collectAssignments, which makes every name such a script binds unknown (bindsRunTimeName, indirectExpansion, tainted); only the name IFS written out (a nameref, an alias) needs this line.
 const ifsInScope = (ctx) => (ctx.scopeTexts ?? []).some((s) => [String(s), String(s).replace(/['"\\]/g, '')].some((v) => /IFS/.test(v) || SETS_BY_NAME.test(withoutCommentLines(v))));
 const ifsMayBeSet = (ctx) => ifsInScope(ctx) || [ctx.fullText ?? '', String(ctx.fullText ?? '').replace(/['"\\]/g, '')].some((t) => /IFS/.test(t) || SETS_BY_NAME.test(t)) || assignedNames(ctx).includes('IFS') || Object.hasOwn(ctx.env ?? {}, 'IFS') || ctx.tainted.size > 0;
 
