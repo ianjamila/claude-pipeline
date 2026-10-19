@@ -22,7 +22,10 @@ test('the repo checkout is not an installed copy, so seams are honoured', () => 
   assert.equal(seamValue('PIPELINE_GH', { PIPELINE_GH: 'node fake.mjs' }), 'node fake.mjs');
   assert.equal(seamFlag('PIPELINE_TEST_MODE', { PIPELINE_TEST_MODE: '1' }), true);
   assert.equal(seamFlag('PIPELINE_TEST_MODE', { PIPELINE_TEST_MODE: 'yes' }), false);
-  assert.deepEqual(SEAM_VARS.slice().sort(), ['PIPELINE_CODEX', 'PIPELINE_GH', 'PIPELINE_TEST_MODE', 'PIPELINE_UPDATE_REMOTE', 'PIPELINE_VERCEL']);
+  assert.deepEqual(SEAM_VARS.slice().sort(), [
+    'PIPELINE_CODEX', 'PIPELINE_DOCKER', 'PIPELINE_GH', 'PIPELINE_LSOF', 'PIPELINE_PS', 'PIPELINE_STACKS_DEADLINE_MS', 'PIPELINE_SUPABASE',
+    'PIPELINE_TEST_MODE', 'PIPELINE_UPDATE_REMOTE', 'PIPELINE_VERCEL',
+  ]);
 });
 
 test('a root with INSTALLED.json ignores every seam and warns once per variable', (t) => {
