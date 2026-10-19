@@ -34,6 +34,11 @@ verify:
   # after_fix_steps_by_path:       # optional: glob -> steps to add (`verify.full --only a,b`) when the round's fixes touch a match
   #   "supabase/**": [db, db-grants]
   # after_fix_never: [sql-arms]    # optional: steps that must stay full-verify only; one listed in the map above is a config error
+  # max_parallel_full: 2        # optional, positive integer: at most this many FULL verifies (of any repo) run at once on this machine; the
+  #                                # rest wait in arrival order. The ship skill then runs `P verify slot --run -- <verify.full>`. Unset = no limit.
+  # max_load: 12                # optional, positive number, needs max_parallel_full: after getting a slot, wait while the 1-minute load
+  #                                # average is above this (re-checked every 5-30 s), then run anyway with a warning. Not on Windows.
+  # max_load_wait_minutes: 10   # optional, default 10, at most 10: how long that load wait may last
 
 ci:
   required_checks: ["Test integrity", "Hard-stop scan"]   # + your CI job names

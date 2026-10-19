@@ -137,7 +137,11 @@ note it in the summary and carry on, never stop the run for it.
    is JSON `[{id, title, spec}]`, `spec` = acceptance criteria + the tests to write. After each later task: push, then
    `P checkpoint --pr N --step build --task-done <id>`. A `checkpoint` exit 1 `unpushed` ⇒ `git push`; `behind` ⇒
    `git pull --ff-only`; `diverged` ⇒ stop and report; then checkpoint again.
-2. Dispatch the **verifier** with `verify.full` (from `P config`). Green ⇒ `P checkpoint --pr N --step verify
+2. Dispatch the **verifier** with `verify.full` (from `P config`). When `verify.max_parallel_full` is set, every full verify (here, Step 5.3,
+   and the full runs of review-loop §6) runs as `node ~/.claude/pipeline/bin/pipeline.mjs verify slot --run -- <verify.full>` instead,
+   so only that many run at once on this machine; the wrapper passes the exit code through and prints one stderr line
+   `{"slot":{…,"waitedSeconds","loadWaitSeconds","warnings"}}`: the verifier reports it, and the controller puts the waits (and any
+   warning) in the summary when they are above 0. Green ⇒ `P checkpoint --pr N --step verify
    --verify-report`, then Step 3.
 3. Red ⇒ dispatch an implementer with the failing step + excerpt (paths, not logs). Max **3 fix
    cycles**. Still red ⇒ stop early, in this order:
@@ -187,7 +191,7 @@ for items without a ruling yet; `P triage validate --round R --from-tag "pipelin
 --test-file …` runs it) → arbiter if `P arbiter needed` says so (`arbiter` agent, no model param,
 one batched call; its prompt starts with the `promptHeader` from `P arbiter needed`, pasted verbatim) → `P arbiter apply --round R --tag "pipeline-arbiter R<R> <digest8>"` (proves
 Fable from the subagent transcript; the tag is the Agent call's description) → implement ACCEPTED
-items (implementer + verifier: `verify.full`, or with `verify.after_fix: quick` the commands from `P verify plan-after-fix --round R`; Steps 2.2 and 5.3 stay full) → `P followups create --round R` for FOLLOW-UP →
+items (implementer + verifier: `verify.full`, or with `verify.after_fix: quick` the commands from `P verify plan-after-fix --round R`, already slot-wrapped when `verify.max_parallel_full` is set; Steps 2.2 and 5.3 stay full) → `P followups create --round R` for FOLLOW-UP →
 `P comment --pr N --kind triage`. After each round: `P checkpoint --pr N --step review --round R`. Exit when
 `P state outcome` says `clean`. Order and replay traps (triage comment BEFORE `followups create`, `P state
 discard-round` for an interrupted round): `reference/review-loop.md`. Not clean after the
@@ -227,7 +231,7 @@ Details and every exit code: `reference/gates-and-exits.md`. First: `P checkpoin
      merged-externally`. Neither pushes. Stop.
    - 3 ⇒ GitHub unavailable: retry once; still 3 ⇒ `P summary --pr N --outcome stopped --cause update-branch:github
      --action "GitHub was unreachable: re-run ship resume when it is back"`, stop.
-3. Verifier: fresh `verify.full` on the current head (must be clean, full mode). Then
+3. Verifier: fresh `verify.full` on the current head (must be clean, full mode; in a slot when `verify.max_parallel_full` is set, see Step 2.2). Then
    `P state outcome`: if `coverageValid` is `false` the PR content changed since the last clean
    review round (an update-branch, a late fix) ⇒ go back to Step 4 for a new round, then return here.
 4. High risk (from the Step 5.1 `P risk`) ⇒ `gh pr edit N --add-label <ci.e2e_label>` (if configured).
