@@ -112,7 +112,8 @@ test('K4 a name of unknown value in the words of gh api / gh pr view names no pa
 // (security review of #81 K1) More distinct inline expansions than the scan keeps (256) used to leave the later ones unrecorded, so a line padded with harmless ones and then
 // `F=ok; echo x > ~/${F/ok/.claude}/settings.json` was judged by its literal text. The scans' other caps (assignments, the parser's span budget, 200 kB) are pinned beside it.
 const SCRIPT_TWIN = `F=ok.sh; G=\${F/ok/run}; bash $G`;
-const gitWithScripts = (c) => gitGuard(c, { readText: (p) => (p.endsWith('/run.sh') ? `git ${PUSH} origin ${MAIN}` : p.endsWith('/ok.sh') ? 'echo ok' : null), pathExists: (p) => /\/(run|ok)\.sh$/.test(p) });
+const ENVSH = /[\\/]env\.sh$/; // (the mocks match either path separator: a Windows path ends in `\run.sh`)
+const gitWithScripts =(c) => gitGuard(c, { readText: (p) => (/[\\/]run\.sh$/.test(p) ? `git ${PUSH} origin ${MAIN}` : /[\\/]ok\.sh$/.test(p) ? 'echo ok' : null), pathExists: (p) => /[\\/](run|ok)\.sh$/.test(p) });
 const PADS = {
   'distinct inline replace x300': 'echo ' + Array.from({ length: 300 }, (_, i) => `\${V/a/b${i}}`).join(' ') + '; ',
   'distinct inline trim x300': 'echo ' + Array.from({ length: 300 }, (_, i) => `\${V#b${i}}`).join(' ') + '; ',
@@ -153,9 +154,9 @@ test('K4 a gh command with a pager, browser, configuration, alias or extension i
 test('K4 a sourced file that sets a gh / pager variable leaves gh a writer, whatever the file says it sets', () => {
   const M = 'M=$(gh pr view 296 --json state -q .state); SHA=${M#* }; ';
   for (const body of ['export GH_PAGER="sh -c x"', 'PAGER="sh -c x"; export PAGER', 'export BROWSER=x']) {
-    const o = { readText: (p) => (p.endsWith('/env.sh') ? body : null), pathExists: (p) => p.endsWith('/env.sh') };
+    const o = { readText: (p) => (ENVSH.test(p) ? body : null), pathExists: (p) => ENVSH.test(p) };
     assert.equal(filesGuard(M + '. ./env.sh; gh pr view $SHA', o).decision, 'deny', body);
   }
-  const clean = { readText: (p) => (p.endsWith('/env.sh') ? 'export FOO=1' : null), pathExists: (p) => p.endsWith('/env.sh') };
+  const clean = { readText: (p) => (ENVSH.test(p) ? 'export FOO=1' : null), pathExists: (p) => ENVSH.test(p) };
   assert.equal(filesGuard(M + 'gh pr view $SHA', clean).decision, 'allow');
 });
