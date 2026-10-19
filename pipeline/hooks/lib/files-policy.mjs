@@ -16,6 +16,7 @@
 // ancestor process); commands that unset or override CLAUDECODE are denied here.
 import fs from 'node:fs';
 import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
+import { pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgDirtyFor, pmStartDirs, BACKGROUND } from './package-scripts.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
@@ -1344,7 +1345,8 @@ function assignReadings(command, opts) {
 const SKIP_READING = new Set(['HOME', 'USER', 'LOGNAME', 'USERPROFILE', 'USERNAME']); // (collectVars never records these)
 
 // Directories the command line may be operating in: the hook's cwd plus every `cd` target (chained ones too).
-function collectDirs(cmds, ctx) {
+// cdOnly: the directories a cd / pushd leads to (where the shell can be), without those only a command option names (git -C DIR, tar -C DIR ...)
+function collectDirs(cmds, ctx, cdOnly = false) {
   const dirs = [ctx.cwd];
   const addDir = (e, globAt = -1) => {
     for (const d of [...dirs]) {
@@ -1364,7 +1366,7 @@ function collectDirs(cmds, ctx) {
   };
   for (const [ci, c] of cmds.entries()) {
     // commands that run relative to another directory: git -C DIR, tar -C DIR, unzip -d DIR, make -C DIR, cp -t DIR
-    for (const b of baseDirsOf(c.argv)) addDir(expandRefs(b, ctx));
+    if (!cdOnly) for (const b of baseDirsOf(c.argv)) addDir(expandRefs(b, ctx));
     const cdName = baseOf(c.argv[0] ?? '');
     if (!CD_CMDS.has(cdName)) continue;
     let t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
@@ -1617,6 +1619,65 @@ function judgeScriptFile(sf, dirs, ctx, opts, scanRaw = '', keepBackslash = fals
     if (!ctx.api.existsSync(abs)) continue;
     const v = judgeFoundScript(sf, abs, d || ctx.cwd, ctx, opts);
     if (v) return v;
+  }
+  return null;
+}
+
+// #81 t9: `npm run deploy`, `npm test`, `pnpm ship`, `yarn run x`, `bun run x` run the text package.json holds for the script (and its pre / post hooks, with the words after `--` appended), in the
+// package's directory: judged like `bash -c TEXT` run there. See package-scripts.mjs. A script or directory only known at run time is left to the textual rules on the whole line (as a script named
+// at run time is); a setting that moves the package.json (npm_config_prefix, INIT_CWD, PNPM_* ...) is refused, as which package.json the manager reads is then unknown.
+function judgePackageScripts(c, dirs, ctx, opts, scanRaw = '') {
+  if (!c.argv.length) return null;
+  const call = pmCall(c.argv.map((w) => expandRefs(w, ctx)));
+  if (!call) return null;
+  const mover = call.mover ? '--userconfig / --globalconfig' : pmMoverName([...Object.keys(ctx.vars), ...ctx.unknownVars, ...ctx.pickUnknown, ...Object.keys(c.env ?? {})]) ?? ((ctx.nameRun ??= new Map()).get(scanRaw) ?? ctx.nameRun.set(scanRaw, nameAtRunTimeIn(scanRaw)).get(scanRaw) ? 'a variable named at run time' : null);
+  if (call.unresolved) return deny('package script: ' + call.unresolved);
+  if (mover) return deny(`package script: ${mover} may point the package manager at another package.json or configuration, so which script \`${c.argv.slice(0, 4).join(' ')}\` runs cannot be verified. Run it without it (set the directory with --prefix)`);
+  if (pkgDirtyFor(ctx.budget, pmStartDirs(call, dirs, ctx.homePosix, posix), { pathExists: (x) => ctx.api.existsSync(x), real: (q) => realResolve(q, ctx.api), p: posix, deep: !!call.workspace })) return deny(`package script: an earlier command on the line (git checkout / pull / merge, npm pkg set, npm config set, tar x, patch ... or a background job) may change package.json, a configuration file or the work tree before \`${c.argv.slice(0, 4).join(' ')}\` reads them, so which script it runs cannot be verified. Run it in a command of its own`);
+  if (call.dynamic || call.dirDynamic) return null;
+  const seen = new Set();
+  for (const d of dirs) {
+    const plan = packageScripts(call, {
+      cwd: d, home: ctx.homePosix, readText: ctx.readText, pathExists: (x) => ctx.api.existsSync(x), readDir: ctx.readDir, cache: (ctx.budget.pkgCache ??= new Map()), p: posix, tick: () => checkDeadline(ctx.budget),
+      written: (abs) => (writtenTo(ctx.frames, abs, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: true }) ? 'known' : writtenTo(ctx.frames, abs, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: ctx.ignoreUnmodelled === true }) ? 'maybe' : null),
+      mentionsGuarded: () => makeMatchers(ctx).rawHit(scanRaw, [d]) || SENSITIVE_WORDS.test(String(scanRaw).replace(/['"`\\]/g, '')),
+    });
+    if (plan.refuse) return deny(plan.refuse);
+    if (pkgDirtyFor(ctx.budget, pmStartDirs(call, [d], ctx.homePosix, posix), { markers: true, pathExists: (x) => ctx.api.existsSync(x), real: (q) => realResolve(q, ctx.api), p: posix })) return deny(`package script: an earlier command on the line (mkdir, touch, rm, mv, cp, ln ...) may create, remove or rename a package.json, node_modules, server.js, binding.gyp or configuration file that \`${c.argv.slice(0, 4).join(' ')}\` depends on (in the package's directory or above it), so which script it runs cannot be verified. Run it in a command of its own`);
+    for (const run of plan.runs ?? []) {
+      const key = `${run.file}\u0000${run.label}\u0000${run.text}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const r = judgeScriptText(run.text, { kind: 'shell', file: run.label }, run.file, run.dir, ctx, opts);
+      if (r) return r;
+    }
+    // (yarn / pnpm / bun NAME with no script of that name run node_modules/.bin/NAME)
+    if (call.bin && !(plan.runs ?? []).some((r) => r.name === call.main)) {
+      const r = judgeBinScript(call.bin, [d], ctx, opts, scanRaw);
+      if (r) return r;
+    }
+  }
+  return null;
+}
+
+// #81 t9: the shell script node_modules/.bin/NAME of a bare name a package runner (or yarn / pnpm / bun) runs. judgeFoundScript leaves node_modules alone, as it should for packages' own programs, so a
+// bin that starts with a shell shebang (or none) is judged here; a program in another language is not. An install earlier on the line may add it: refused when the line refers to a protected path.
+function judgeBinScript(name, dirs, ctx, opts, scanRaw = '') {
+  for (const d of dirs) {
+    const bin = localBin(name, { cwd: d, pathExists: (x) => ctx.api.existsSync(x), p: posix, written: (x) => writtenTo(ctx.frames, x, { exists: (y) => ctx.api.existsSync(y), readText: ctx.readText, ignoreUnmodelled: true }) });
+    if (!bin) {
+      if (ctx.budget.pkgBinsDirty && (makeMatchers(ctx).rawHit(scanRaw, [d]) || SENSITIVE_WORDS.test(String(scanRaw).replace(/['"`\\]/g, '')))) return deny(`package script: an earlier install on the line may add node_modules/.bin/${name}, and the line refers to a protected pipeline file, so what it runs cannot be checked; run the install in a command of its own`);
+      continue;
+    }
+    const text = ctx.readText(bin);
+    if (typeof text !== 'string') {
+      const head = ctx.readHead(bin);
+      if (typeof head === 'string' && isShellHead(head)) return deny(`${bin} is too large to verify (over 1 MB), so what it runs cannot be known`);
+      continue;
+    }
+    if (text.slice(0, 4096).includes('\u0000') || INTERP_PROGRAM.test((SHEBANG_PROGRAM.exec(text)?.[1] ?? '').split('/').pop())) continue;
+    const r = judgeScriptText(text, { kind: 'shell', file: bin }, bin, posix.dirname(bin), ctx, opts);
+    if (r) return r;
   }
   return null;
 }
@@ -2371,6 +2432,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // a name held in a variable (N=PIPELINE_ADMIN; env $N=1 claude)
   if (Object.keys(ctx.vars).length && setsAdmin(substVars(flat, ctx.vars, ctx.budget), ctx.platform)) return deny('the command sets PIPELINE_ADMIN through a variable; only the owner may set it, when launching Claude Code');
   const dirs = collectDirs(cmds, ctx);
+  const cwdDirs = collectDirs(cmds, ctx, true);
   const frame = newWriteFrame(cmds, {
     text: raw,
     expand: (w) => {
@@ -2525,8 +2587,11 @@ function evaluateBashForFilesFrame(command, opts) {
     if (['declare', 'typeset', 'local'].includes(cn) && c.argv.slice(1).some((a) => /^-[A-Za-z]*n/.test(a))) for (const a of c.argv.slice(1)) { const t = /^[A-Za-z_]\w*=([A-Za-z_]\w*)/.exec(a); if (t) { names.push(t[1]); ctx.declared?.unknown.add(t[1]); } }
     for (const k of names) { ctx.pickUnknown.add(k); if (Object.hasOwn(ctx.vars, k)) ctx.unknownVars.add(k); }
   };
+  const cwdsNow = () => (unknownCwd() ? unique([...cwdDirs, ...assumedCwds(ctx)]) : cwdDirs); // (where the shell itself can be: a package manager starts there, not in a git -C directory)
   const sdirsNow = () => (unknownCwd() ? unique([...dirs, ...assumedCwds(ctx)]) : dirs); // (a sourced file may make the directory unknown part-way through the line)
   if ((opts._depth ?? 0) < 4) {
+    // (a job in the background races every other command of the line: what any of them may change counts before the first)
+    if (BACKGROUND.test(raw)) markPackageState(ctx.budget, cmds.map((x) => x.argv), { dirs: null, expand: (w) => expandRefs(w, ctx), home: ctx.homePosix, p: posix, text: raw });
     for (const [idx, c] of cmds.entries()) {
       frame.i = idx;
       if (ctx.srcChanged.size || ctx.unknownVars.size) snaps[idx] = { changed: new Set(ctx.srcChanged), unknownV: new Set(ctx.unknownVars) }; // (what is true when this command runs: a later plain assignment must not clean it)
@@ -2583,19 +2648,30 @@ function evaluateBashForFilesFrame(command, opts) {
         if (v) return v;
         if (sf.kind === 'shell' && ['source', '.'].includes(baseOf(c.argv[0] ?? ''))) absorbSourced(sf, dirs, ctx); // (a sourced file runs in this shell: what it sets is the line's from here)
       }
+      // #81 t9: `npm run NAME` and its kin run the text package.json holds for NAME
+      {
+        const v = judgePackageScripts(c, cwdsNow(), ctx, withLineVars(opts, c), scanRaw);
+        if (v) return v;
+      }
       // script text that reaches a shell without being named (`bash < f.sh`, `cat f.sh | bash`, `eval "$(cat f.sh)"`): its files are judged like `bash f.sh`
       for (const fd of scriptFeedsOf(c, raw, (w) => expandRefs(w, ctx))) {
         withPath(fd);
         const v = judgeScriptFile(fd, sdirsNow(), ctx, withLineVars(opts, c), scanRaw);
         if (v) return v;
       }
+      // #81 t9: and a bare name a package runner started is the bin node_modules/.bin/NAME
+      if (c.viaRunner && c.argv[0] && !c.argv[0].includes('/')) {
+        const v = judgeBinScript(expandRefs(c.argv[0], ctx), sdirsNow(), ctx, withLineVars(opts, c), scanRaw);
+        if (v) return v;
+      }
+      markPackageState(ctx.budget, [c.argv], { dirs: cwdsNow(), expand: (w) => expandRefs(w, ctx), home: ctx.homePosix, p: posix, text: raw }); // (what this command may change, for the package scripts after it)
       undo?.();
     }
   } else {
     // at the depth limit nothing is followed any further: a named script, a fed file or a startup file the line names is refused; the
     // implicit one (the real home's, which no word names) is judged here, once per evaluation like at the top level
     for (const c of cmds) {
-      if (scriptFileOf(c.argv) || scriptFeedsOf(c).length) return deny('scripts run scripts too deeply to check');
+      if (scriptFileOf(c.argv) || scriptFeedsOf(c).length || pmCall(c.argv)) return deny('scripts run scripts too deeply to check');
       for (const st of startupFilesOf(c, cmds, { env: startupEnv, inherited: inheritedStartup })) {
         if (!st.implicit) return deny('scripts run scripts too deeply to check');
         const v = judgeStartupFile(st);

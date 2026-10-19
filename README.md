@@ -220,8 +220,10 @@ head you did not review (the receipt names the head the event carried).
 - **Hooks stop accidents, not adversaries.** guard-git and guard-files catch direct and casually
   disguised attempts (subshells, `bash -c`, `eval`, env prefixes, the `pipeline job` wrapper), not
   a determined adversary with encoded payloads. GitHub branch protection is the hard boundary.
-  Coverage: Bash and PowerShell, `Monitor` commands, MCP tool calls and shell script files that contain
-  a guarded command. They also deny a command line too long to be read in full (when it contains a
+  Coverage: Bash and PowerShell, `Monitor` commands, MCP tool calls, shell script files and package scripts (`npm run NAME`, `npm test`, `pnpm NAME`, `yarn NAME`, `bun run NAME`, with their
+  `pre` / `post` hooks, read from the nearest package.json or the one `--prefix` / `-C` / `--dir` / `--cwd` / a workspace option names) that contain
+  a guarded command. Install, pack, publish and version run their lifecycle scripts (`prepare`, `postinstall` ...), which are opened too (`--ignore-scripts` turns them off). Any
+  `npm_*` / `yarn_*` / `pnpm_*` / `bun_*` / `COREPACK_*` variable, `INIT_CWD`, a .npmrc that sets `script-shell` or `node-options`, a subcommand or option the guard does not know, and an earlier command on the line that may change package.json or the work tree where the package is (`git checkout` / `pull` / `merge` ... in that repository, `git worktree add` of the directory it runs in, `npm pkg set`, a background job) make the script unknown, and it is refused. They also deny a command line too long to be read in full (when it contains a
   guarded word), a push to a dynamic destination (only `$(git branch --show-current)`,
   `$(git rev-parse --abbrev-ref HEAD)` or a variable assigned a literal in the same command are
   understood; ship pushes `git push -u origin agent/<slug>`), `unset CLAUDECODE`, and setting
