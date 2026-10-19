@@ -512,3 +512,47 @@ test('fresh gate: the stack joins the config `shared` list between reassess and 
     assert.equal(w.supabaseCalls.length, 0);
   });
 });
+
+test('report mode: the project lock is NOT held during the evidence re-check (a new session can take it at once); the decision is still logged', async () => {
+  const w = makeWorld({ mode: 'report' });
+  const dir = lockDirs(w.root).project;
+  let probe = null;
+  const reassess = async () => {
+    probe = tryAcquire(projectLockName('alpha'), { dir });
+    if (probe.acquired) release(probe.lock);
+    return w.reassess();
+  };
+  await check(w, { mode: 'report', reassess }, (r) => {
+    assert.equal(probe.acquired, true, 'the lock was free while the re-check ran');
+    assert.equal(r.action, 'would-stop');
+    assert.equal(w.supabaseCalls.length, 0);
+    assert.deepEqual(w.logs.map((l) => l.action), ['would-stop']);
+  });
+});
+
+test('report mode never waits on a busy project lock (nothing is mutated, so no skipped-lock)', async () => {
+  const w = makeWorld({ mode: 'report' });
+  const held = tryAcquire(projectLockName('alpha'), { dir: lockDirs(w.root).project });
+  assert.equal(held.acquired, true);
+  try {
+    await check(w, { mode: 'report' }, (r) => assert.equal(r.action, 'would-stop'));
+  } finally {
+    release(held.lock);
+  }
+});
+
+test('apply mode: the project lock is still held during the evidence re-check', async () => {
+  const w = makeWorld();
+  const dir = lockDirs(w.root).project;
+  let heldDuring = null;
+  const reassess = async () => {
+    const p = tryAcquire(projectLockName('alpha'), { dir });
+    heldDuring = !p.acquired;
+    if (p.acquired) release(p.lock);
+    return w.reassess();
+  };
+  await check(w, { reassess }, (r) => {
+    assert.equal(heldDuring, true);
+    assert.equal(r.action, 'stopped');
+  });
+});

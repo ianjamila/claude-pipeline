@@ -4,7 +4,9 @@
 // - The ONLY mutating call is `supabase stop --workdir <realpath>`, argv built by stopArgs (the single place). Never a bare
 //   stop, `--project-id`, `--all` or `--no-backup`; never `docker rm`, `docker stop` or `docker volume rm`. This file's docker
 //   calls are read-only (`inspect`, `volume inspect`). A workdir that does not exist (or is not its own realpath) => no call.
-// - Everything below runs while holding the project lock (`project/<id>`, see paths.mjs). Under it, in this order:
+// - Everything below runs while holding the project lock (`project/<id>`, see paths.mjs) in apply mode; in report mode (the
+//   caller's `mode`; nothing can be mutated) the same steps run without the lock, so a long evidence re-check never blocks a
+//   new session. Under it, in this order:
 //   1. the generation container is looked at: gone or not running => `already-stopped` (a second session that left at the
 //      same moment lands here and makes no call);
 //   2. `reassess()` re-runs the inventory and the caller's verdict; the verdict must still be `stop` and checkBinding must
@@ -135,11 +137,16 @@ async function stopStackLocked({
   if (typeof reassess !== 'function') return kept('no reassess function: cannot re-check');
   if (!files) return kept('no state root');
 
-  let lock;
-  try {
-    lock = await acquire(projectLockName(stack.project), { dir: lockDirs(root).project, waitMs: lockWaitMs, pollMs });
-  } catch (err) {
-    return done('skipped-lock', [err instanceof LockTimeoutError ? `project lock busy for ${Math.round(lockWaitMs / 1000)} s: skipped` : `project lock failed: ${err?.message ?? err}`]);
+  // Report mode (the caller's) can only end in kept / already-stopped / would-stop: nothing is mutated, so the project lock buys
+  // nothing, and holding it across the machine-wide evidence re-check would make a new session's first stack-naming call
+  // (register.mjs waits on this same lock) wait and be blocked. Apply mode keeps the lock across the re-check and the stop.
+  let lock = null;
+  if (mode === 'apply') {
+    try {
+      lock = await acquire(projectLockName(stack.project), { dir: lockDirs(root).project, waitMs: lockWaitMs, pollMs });
+    } catch (err) {
+      return done('skipped-lock', [err instanceof LockTimeoutError ? `project lock busy for ${Math.round(lockWaitMs / 1000)} s: skipped` : `project lock failed: ${err?.message ?? err}`]);
+    }
   }
   try {
     await afterLock?.();
@@ -214,7 +221,7 @@ async function stopStackLocked({
   } finally {
     await Promise.allSettled(pending); // the decision is on disk before anyone else can take the lock
     try {
-      release(lock);
+      if (lock) release(lock);
     } catch {
       /* a failed release must not hide the decision; a stale lock is reclaimed by its dead owner check */
     }
