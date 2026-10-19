@@ -23,3 +23,17 @@ test('skipOf: a legacy row falls back to command only when it is a "(skipped ...
   assert.deepEqual(skipOf({ name: 'a', status: 'pass', skipped: true, command: '(skipped — deps unchanged)' }), { name: 'a', reason: '(skipped — deps unchanged)' });
   assert.deepEqual(skipOf({ name: 'a', status: 'pass', skipped: true, skipCheck: 'why', command: 'npm test' }), { name: 'a', reason: 'why' });
 });
+
+test('skipOf: a string skipKind comes back as `kind` (ci, local or any other string); no skipKind means no `kind` key at all', () => {
+  assert.deepEqual(skipOf({ name: 'a', status: 'skipped', skipReason: 'deferred to CI (.github/workflows/ci.yml#SQL arms)', skipKind: 'ci' }), { name: 'a', reason: 'deferred to CI (.github/workflows/ci.yml#SQL arms)', kind: 'ci' });
+  assert.deepEqual(skipOf({ name: 'a', status: 'skipped', skipReason: 'no inputs changed', skipKind: 'local' }), { name: 'a', reason: 'no inputs changed', kind: 'local' });
+  assert.deepEqual(skipOf({ name: 'a', status: 'skipped', skipReason: 'x', skipKind: 'weird' }), { name: 'a', reason: 'x', kind: 'weird' });
+  assert.deepEqual(skipOf({ name: 'a', status: 'skipped', skipReason: 'x', skipKind: '' }), { name: 'a', reason: 'x', kind: '' });
+  for (const skipKind of [undefined, null, 5, true, {}, ['ci']]) {
+    const k = skipOf({ name: 'a', status: 'skipped', skipReason: 'x', skipKind });
+    assert.deepEqual(k, { name: 'a', reason: 'x' }, JSON.stringify(skipKind));
+    assert.equal(Object.hasOwn(k, 'kind'), false, JSON.stringify(skipKind));
+  }
+  assert.equal(skipOf({ name: 'a', status: 'pass', skipKind: 'ci' }), null, 'a kind alone does not make a skip');
+  assert.equal(skipOf({ name: 'a', status: 'fail', skipKind: 'ci' }), null);
+});

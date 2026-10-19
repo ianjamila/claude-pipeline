@@ -19,8 +19,10 @@ import { summaryLine, outsideReport } from '../pipeline/lib/worktree-prune/run.m
 const here = dirname(fileURLToPath(import.meta.url));
 const bin = join(here, '..', 'pipeline', 'bin', 'pipeline.mjs');
 const holdLock = join(here, 'fixtures', 'hold-lock.mjs');
-// /proc is how a process inside a worktree is seen; elsewhere the answer is "cannot check" and the worktree is kept.
+// /proc (Linux) or lsof (macOS) is how a process inside a worktree is seen; elsewhere the answer is "cannot check" and the
+// worktree is kept.
 const LINUX = process.platform === 'linux';
+const INSPECTS = LINUX || process.platform === 'darwin';
 
 const scratch = [];
 const tmp = (prefix) => {
@@ -152,7 +154,7 @@ function world() {
 
 const slugs = (list) => list.map((x) => x.slug).sort();
 const assertDoneEvaluated = (w, json, key) => {
-  if (LINUX) assert.deepEqual(slugs(json[key]), ['done'], JSON.stringify(json.kept));
+  if (INSPECTS) assert.deepEqual(slugs(json[key]), ['done'], JSON.stringify(json.kept));
   else assert.match(w.keptReason(json, 'done'), /cannot check running processes/);
 };
 
@@ -166,7 +168,7 @@ test('report mode (default): the eligible worktree is reported, nothing on disk 
   assert.equal(r.json.mode, 'report');
   assert.equal(r.json.notify, undefined, 'nothing removed or restored: no push');
   assertDoneEvaluated(w, r.json, 'wouldRemove');
-  if (LINUX) assert.ok(r.json.wouldRemove[0].bytes > 0);
+  if (INSPECTS) assert.ok(r.json.wouldRemove[0].bytes > 0);
   assert.deepEqual(r.json.removed, []);
   assert.match(w.keptReason(r.json, 'open'), /open PR #2/);
   assert.equal(w.keptReason(r.json, 'nopr'), 'no PR');

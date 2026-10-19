@@ -11,11 +11,13 @@ import { guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { headSha } from '../lib/git.mjs';
 import { currentProduction } from '../lib/deploy.mjs';
-import { runShellAsync } from '../lib/proc.mjs';
+import { envWithGhDir, runShellAsync } from '../lib/proc.mjs';
 import { postEvent } from '../lib/run-events.mjs';
+import { proofLine } from '../lib/run-record.mjs';
 import { readSummaryComment } from '../lib/summary-comment.mjs';
 import { createRunRecorder, inFlightSince } from '../lib/run-progress.mjs';
 import { bringUpToDate, updateTiming } from '../lib/updatebranch.mjs';
+import { approvedRequest } from '../hooks/lib/owner-go.mjs';
 import {
   GATE_FILE, PR_FIELDS, abandonMerge, evaluateGate, gateRefusals, localContentHash, mergeTiming, preMergeProblems, readReviewJson,
   tailLines, waitBlockers, waitForMerge, writeReviewJson,
@@ -23,8 +25,11 @@ import {
 
 export const meta = {
   summary: 'merge the PR if (and only if) the final gate passes again, live; waits for MERGED',
-  usage: 'pipeline merge --pr N [--owner-approved-head SHA] [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?, warnings?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment. While it runs the run record of the PR shows inFlight {kind: merge} and step merge; a prod-before event comment (the known-good deployment) is posted before the merge command, and when that post fails nothing is merged (error pre-merge); warnings lists a run record write that failed (never fatal). A run record marked resumed (`P checkpoint --resumed`: a run taken over by ship resume) refuses with error pre-merge unless --owner-approved-head names the full gate head: only the owner\'s \"merge\" for that head supplies it; so does a run record that cannot be checked (unreadable, invalid or unsupported: it may be a resumed one)',
+  usage: 'pipeline merge --pr N [--owner-approved-head SHA --owner-approved-items DIGEST] [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?, warnings?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment. While it runs the run record of the PR shows inFlight {kind: merge} and step merge; a prod-before event comment (the known-good deployment) is posted before the merge command, and when that post fails nothing is merged (error pre-merge); for a repo with verify.deferrable_steps the proofs of the live gate (where each deferrable step was proved: the Mac, or a GitHub run and attempt) are recorded in the run record and in an append-only ci-proof-used event comment before the merge command too, and when either write fails nothing is merged (error pre-merge); warnings lists a run record write that failed (never fatal). A run record marked resumed (`P checkpoint --resumed`: a run taken over by ship resume) refuses with error pre-merge unless the owner approved it; so does a run record that cannot be checked (unreadable, invalid or unsupported: it may be a resumed one), and with owner_approval: chat a gate with ownerMerge > 0. Approved = --owner-approved-head names the full gate head, --owner-approved-items the gate\'s ownerItems, AND the owner-go hook recorded the owner\'s \"merge\" for exactly that PR, head and item set (the flags alone refuse); the live gate must still show those ownerItems',
 };
+
+const APPROVAL_FLAGS = "--owner-approved-head <full head> --owner-approved-items <the gate's ownerItems>";
+const OWNER_MERGE_REASON = `the final gate left items for the owner (owner_approval: chat): the owner must say "merge" for this exact head and item set (then pass ${APPROVAL_FLAGS})`;
 
 const refuse = (error, reasons, extra = {}) => ({
   exitCode: EXIT.FAILED,
@@ -32,7 +37,9 @@ const refuse = (error, reasons, extra = {}) => ({
 });
 
 export const run = guarded(async (argv, ctx) => {
-  const { values } = parseCommandArgs(argv, { pr: { type: 'string' }, repo: { type: 'string' }, 'owner-approved-head': { type: 'string' } }, { allowPositionals: false });
+  const { values } = parseCommandArgs(argv, {
+    pr: { type: 'string' }, repo: { type: 'string' }, 'owner-approved-head': { type: 'string' }, 'owner-approved-items': { type: 'string' },
+  }, { allowPositionals: false });
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
@@ -55,7 +62,20 @@ export const run = guarded(async (argv, ctx) => {
     // run was taken over by `ship resume`; if so the owner's approval of THIS exact head must come in as a flag. Read before
     // anything irreversible. A record that cannot be checked (unreadable comments, an invalid or newer record) fails CLOSED: it
     // may be a resumed one, so it needs the same approval. No record (absent) or a legacy comment is an ordinary run.
-    const ownerApproved = values['owner-approved-head'] === gate.head && /^[0-9a-f]{40}$/.test(gate.head);
+    // Why (#58): the flags were the agent's own word. They now only name what the owner approved: the owner-go recorder (a
+    // UserPromptSubmit hook that only the owner's typed prompt reaches) must hold a "merge" for exactly this PR, this full head
+    // and this owner-item set, as shown to the owner in the reply right before it (Head and 🔀 lines). See hooks/lib/owner-go.mjs.
+    let approvalProblem = null;
+    if (values['owner-approved-head'] !== undefined) {
+      if (values['owner-approved-head'] !== gate.head || !/^[0-9a-f]{40}$/.test(gate.head)) approvalProblem = '--owner-approved-head is not the gate head';
+      else if (typeof gate.ownerItems !== 'string') approvalProblem = 'the gate file names no owner-item set (written by an older final-gate): run final-gate again';
+      else if (values['owner-approved-items'] !== gate.ownerItems) approvalProblem = `--owner-approved-items is not the gate's owner-item set (${gate.ownerItems})`;
+      else if (!approvedRequest({ pr, head: gate.head, items: gate.ownerItems })) {
+        approvalProblem = `no owner "merge" is recorded for #${pr} head ${gate.head.slice(0, 12)} items ${gate.ownerItems}: show the request (Owner-merge approval in the ship skill) and wait for the owner to type "merge"`;
+      }
+    }
+    const ownerApproved = values['owner-approved-head'] !== undefined && approvalProblem === null;
+    const withProblem = (reason) => (approvalProblem ? `${reason} (${approvalProblem})` : reason);
     let unchecked = null;
     let existing = null;
     try {
@@ -66,13 +86,17 @@ export const run = guarded(async (argv, ctx) => {
     }
     if (!ownerApproved) {
       if (existing?.status === 'ok' && existing.record.resumed) {
-        const reason = 'resumed run: the owner must approve this exact head (pass --owner-approved-head <sha>)';
+        const reason = withProblem(`resumed run: the owner must say "merge" for this exact head (then pass ${APPROVAL_FLAGS})`);
         return refuse('pre-merge', [reason], { reason });
       }
       if (unchecked) {
-        const reason = `${unchecked}, so the resumed-run guard cannot be checked: the owner must approve this exact head (pass --owner-approved-head <sha>)`;
+        const reason = withProblem(`${unchecked}, so the resumed-run guard cannot be checked: the owner must say "merge" for this exact head (then pass ${APPROVAL_FLAGS})`);
         return refuse('pre-merge', [reason], { reason });
       }
+      // Why (#58): with owner_approval: chat a head the final gate left items for the owner on (ownerMerge > 0: hard-stop paths, test
+      // changes) merged with no approval, or with one for an older head, because the flag was only read for resumed runs. Checked here
+      // from the gate file (before anything touches GitHub) and again on the live gate below (the file is local and could be edited).
+      if (Number(gate.ownerMerge) > 0) return refuse('pre-merge', [withProblem(OWNER_MERGE_REASON)], { reason: withProblem(OWNER_MERGE_REASON) });
     }
     const warnings = [];
 
@@ -111,6 +135,12 @@ export const run = guarded(async (argv, ctx) => {
     if (fresh.head !== gate.head || fresh.contentHash !== gate.contentHash) {
       return refuse('live-check', ['the live gate is for a different head or patch than final-gate.json approved']);
     }
+    if (Number(fresh.ownerMerge) > 0 && !ownerApproved) return refuse('pre-merge', [withProblem(OWNER_MERGE_REASON)], { reason: withProblem(OWNER_MERGE_REASON) });
+    // (an item added or swapped since the owner said "merge", same head: the owner never saw it)
+    if (ownerApproved && fresh.ownerItems !== gate.ownerItems) {
+      const reason = `the owner items changed since the owner said "merge" (now ${fresh.ownerItems}, approved ${gate.ownerItems}): show them and ask again`;
+      return refuse('pre-merge', [reason], { reason });
+    }
 
     if (prodBefore) {
       writeReviewJson(root, 'prod-before.json', {
@@ -146,10 +176,31 @@ export const run = guarded(async (argv, ctx) => {
         }
       }
 
+      // 3d. Which proof each deferrable verify step stood on (T2: the Mac, or a GitHub run), taken from THIS live evaluation, never the
+      // saved gate (gate passed on run A, now run B: B is recorded). Fail CLOSED like 3c: the append-only event first, then the run
+      // record, and when either cannot be written nothing is merged. A repo without verify.deferrable_steps has no proofs: no calls.
+      const proofs = Array.isArray(fresh.proofs) ? fresh.proofs : [];
+      if (proofs.length > 0) {
+        const refuseProof = (why, detail) => {
+          const reason = `could not record the verify proof on the PR (${why})`;
+          return refuse('pre-merge', [reason], { reason, ...(detail ? { detail: String(detail).slice(0, 200) } : {}) });
+        };
+        try {
+          postEvent(gh, pr, 'ci-proof-used', `pr${pr}-${gate.head.slice(0, 12)}`,
+            `Verify proof used to merge #${pr} at ${gate.head.slice(0, 12)}: ${proofs.map(proofLine).join('; ')}.`, {
+              repo: gh.repo().slug, pr, head: gate.head, proofs,
+            });
+        } catch (err) {
+          return refuseProof('ci-proof-used event', err?.message ?? err);
+        }
+        if (recorder.update({ proofs }) === null) return refuseProof('run record', recorder.warnings.at(-1));
+      }
+
       // 4. Merge with the approved head (fill is strict: a missing {sha} throws instead of merging whatever head exists).
       const { waitMs, pollMs } = mergeTiming(config, ctx.env ?? process.env);
       const command = fill(config.merge.command, { pr: String(pr), sha: gate.head }, { strict: true });
-      const ran = await runShellAsync(command, { cwd: root, env: ctx.env, timeoutMs: (config.merge.wait_minutes + 5) * 60_000 });
+      // The project command (eaglewatch: scripts/merge-pr.mjs) spawns gh itself: give it the dir gh() would have found.
+      const ran = await runShellAsync(command, { cwd: root, env: envWithGhDir(ctx.env), timeoutMs: (config.merge.wait_minutes + 5) * 60_000 });
       const commandOutput = tailLines(`${ran.stdout}${ran.stderr ? `\n${ran.stderr}` : ''}`, 30);
 
       // MERGED is MERGED: a merge commit GitHub cannot name yet is a warning, not a refusal (exit 1 means "nothing merged", and

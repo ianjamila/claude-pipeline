@@ -4,7 +4,7 @@
 import { line } from './render.mjs';
 import { packJson, unpackJson } from './run-record.mjs';
 
-export const EVENT_KINDS = Object.freeze(['prod-before', 'rollback-intent', 'rollback-result', 'recovery-reported']);
+export const EVENT_KINDS = Object.freeze(['prod-before', 'rollback-intent', 'rollback-result', 'recovery-reported', 'ci-proof-used']);
 
 const EVENT_ID = /^[A-Za-z0-9._-]{1,64}$/;
 const EVENT_START = /^<!-- claude-pipeline:event:([a-z-]+):([A-Za-z0-9._-]{1,64}) -->/;

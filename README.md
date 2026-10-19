@@ -23,6 +23,7 @@ Into `~/.claude` (or `$CLAUDE_CONFIG_DIR`):
 | hook `guard-git` (matcher `Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks pushes/force-pushes to `main`, admin merges, protection edits, approval-label changes, whether typed in a shell, a `Monitor` command, a script file or an MCP tool call |
 | hook `guard-files` (matcher `Edit\|Write\|MultiEdit\|NotebookEdit\|Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks agents editing the pipeline's own files and settings — **installed last**, after the proofs |
 | hook `session-version` (SessionStart) | tells you at the top of a session when the installed pipeline is stale, edited, half-installed or older than a repo's vendored copy; silent when all is well (see [Staying current](#staying-current)) |
+| hook `owner-go` (UserPromptSubmit) | records your chat "merge" (a prompt that starts with "merge") against the PR, head and owner items the reply before it showed, so `P merge` and the guards can tell your approval from the agent's word (`owner_approval: chat`, resumed runs); never blocks or changes a prompt |
 | settings allow entries | `Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)` so pipeline calls don't prompt |
 
 A manifest (`~/.claude/pipeline/INSTALLED.json`: version, git SHA, file hashes) lets the installer
@@ -31,7 +32,7 @@ refuse to overwrite skills or agents it didn't install, and lets `--check` repor
 - **Fail-closed guards.** The two guard hooks are started through a small loader, not directly. If
   the hook file cannot be loaded (deleted, half-written, a syntax error) the loader blocks the
   tool call with exit 2 instead of letting Claude Code treat the crash as "allowed". The
-  `session-version` status hook is the one exception: it never blocks anything.
+  `session-version` status hook and the `owner-go` recorder are the exceptions: they never block anything.
 - **Complete-install marker.** The installer writes the manifest with `"complete": false` first and
   flips it to `true` as its very last step, so an install that was interrupted (or whose later
   steps failed) is never mistaken for a good one. `--check`, `pipeline version` and the session
@@ -189,6 +190,7 @@ Hard-stop PRs still go through the full review loop first, so you always get a r
 | Pause switch | | | ✅ can't close the pause issue | ✅ |
 | Production smoke + rollback | | | | ✅ prod-watch |
 | Agents can't edit their own rules | ✅ protection edits need admin | | ✅ guard-files / guard-git | |
+| Owner items (`owner_approval: chat`) and resumed runs merge only on your chat "merge" for that head and item set | | | ✅ owner-go records (guard-files protects them); guard-git refuses a direct merge in a chat repo without one | ✅ `P merge` checks the record |
 
 The label-based approvals rely on the local hook because the agents use your GitHub account.
 
@@ -225,12 +227,28 @@ head you did not review (the receipt names the head the event carried).
   understood; ship pushes `git push -u origin agent/<slug>`), `unset CLAUDECODE`, and setting
   `PIPELINE_GH`, `PIPELINE_CODEX`, `PIPELINE_VERCEL`, `PIPELINE_TEST_MODE` or `PIPELINE_UPDATE_REMOTE` on a `pipeline.mjs` command;
   the installed CLI ignores those five seam variables altogether (they exist for the test suite).
+- **Your chat "merge" is checked locally.** The owner-go hook records only prompts you type (Claude Code never runs it for
+  the model or a subagent), and `P merge` and guard-git trust only those records. But the agent runs as your OS user and with
+  your GitHub token: a program the guards cannot see into (a script that builds the record path at run time, a test that
+  calls the recorder's library, `curl` with your token, a local edit of the refs or `pipeline.yml` the guard reads) can still
+  forge or skip it, and chat-mode CI passes owner items. It stops mistakes and casual workarounds, not a determined agent. The
+  server-side backstop is a second GitHub identity plus a ruleset (issue #65). A direct `gh pr merge` in a chat repo must pin
+  the head (`--match-head-commit`, or the head flag of the repo's merge command) the owner said "merge" for in this session. When
+  the repo's merge command is a package script (`npm run merge -- {pr} --expect-head {sha}`), only that exact shape typed by hand is approvable: the
+  template's own words, then `--`, the PR and the pin, with nothing between the script name and `--` and no manager option before it. Any other way
+  of running the script (another manager or spelling, `run-script`, a wrapper such as `npx npm@11`, `--prefix` / `-C` / `--cwd` / workspace options,
+  words before `--`) is refused in a chat repo; the refusal names the exact form. Merge through `P merge --pr N` otherwise. The chat
+  mode is read from the repository the command runs in: a nested or separate clone whose own `pipeline.yml` is not chat is
+  not caught (a protected registry of chat repos is the planned fix).
 - **Branch protection needs GitHub Pro** for private repos. Without it a repo runs in `gate`
   mode (skills and CLI only) and preflight says so.
 - **Local verify, lean CI.** The full verify runs on your machine; CI keeps the repo's existing
   checks plus the cheap guard jobs, and runs E2E only for high-risk PRs.
-- **Agent log is delayed.** `docs/agent-log.md` can't be pushed to `main` directly, so each run's
-  outcome line is committed in the *next* ship PR. The PR's summary comment is the immediate record.
+- **Verify slots are per machine.** `verify.max_parallel_full` limits full verifies on one computer, not across your machines, and the
+  `verify.max_load` check is skipped on Windows (with a warning).
+- **Agent log lives on its own branch.** `docs/agent-log.md` can't be pushed to `main` directly and a file every PR edits would
+  conflict, so each run's outcome line is pushed to the orphan branch `pipeline-agent-log` (never into a PR). If that push
+  fails, the line stays queued and goes out with the next run. The PR's summary comment is the immediate record.
 - **Rollback race.** prod-watch re-reads the live deployment before and after rolling back and
   reports `superseded`, `recovered` or `rollback-failed`; a deploy from a merge outside the run
   can still race it, but is always detected, never silent. After a Vercel rollback, Vercel stops
@@ -247,6 +265,54 @@ and `ci.approvers` (logins whose approval labels count; required for org-owned r
 fail closed with `org-repo-needs-ci.approvers`). `pipeline config` prints `warnings` for config that is valid
 but suspicious. Documentation and test files are exempt from the content rules (sensitive terms, SQL, auth) but keep
 one: a real-looking secret key literal (not marked fake inside the key itself) is still a `needs-human` hit there.
+
+### Faster verify (opt-in)
+
+Three groups of optional `verify` keys cut the wait without weakening the checks that matter. Leave them unset and
+nothing changes: every verify is the full one, and runs at once.
+
+```yaml
+verify:
+  after_fix: quick                 # full (default) | quick
+  after_fix_steps_by_path:         # glob -> steps to add when a fix touches a match
+    "supabase/**": [db, db-grants]
+  after_fix_never: [sql-arms]      # steps that must always run in a full verify
+  max_parallel_full: 2             # at most 2 full verifies at once on this machine
+  max_load: 12                     # then wait while the 1-minute load average is above 12
+  max_load_wait_minutes: 10        # ... for at most this long (default 10, maximum 10)
+```
+
+- `after_fix`: what the verifier runs after review fixes are accepted. `quick` runs `verify.quick`, plus
+  `verify.full --only <steps>` for the steps whose paths (`after_fix_steps_by_path`) the fixes touched. The first full
+  verify, and the gate's fresh full verify on the exact head that will merge, are always full and unchanged.
+  `pipeline verify plan-after-fix --round R` prints the commands.
+- `after_fix_never`: steps that may only run as part of a full verify. Listing one in `after_fix_steps_by_path` too is a config error.
+- `max_parallel_full` (positive integer): full verifies of all repos on this machine share that many slots; the rest wait
+  in arrival order (`pipeline verify slot --status` shows who holds them; `pipeline verify slot --run` runs only the repo's own `verify.full` in a slot, never another command). `max_load` and `max_load_wait_minutes` add a
+  wait for a quiet machine after the slot is taken; when the time is up the verify runs anyway, with a warning.
+
+A fourth, stricter group lets GitHub's own test run replace one slow local step at the final gate:
+
+```yaml
+verify:
+  deferrable_steps: [sql-arms]     # steps whose local run a GitHub Actions run may replace
+  ci_proof:
+    sql-arms: { workflow: .github/workflows/migration-replay.yml, job: "SQL arms", event: pull_request }
+  ci_proof_inputs: [supabase/tests/sql-arms/**]   # extra paths that make a PR ineligible
+  ci_proof_wait_minutes: 20        # how long ship waits for that run (unset = it does not wait)
+```
+
+- Safety rule: the Mac is skipped for a step only when the final gate finds a passed run of exactly that workflow file and job, on this
+  exact commit, for this pull request (not a fork), whose merged test copy has the same files as the pull request's head, and the pull
+  request changed neither the CI setup (`.github/**`), the pipeline settings, the verify scripts nor `ci_proof_inputs`. The three settings are
+  read from the main branch, never from the pull request. Anything unclear (no run, still running, cancelled, a GitHub error) sends the step
+  back to the Mac; `merge` records which proof was used (Mac, or GitHub run and attempt) on the pull request.
+- `ci_proof_wait_minutes` is the longest ship waits for the GitHub run before it runs the step on the Mac instead; set it from the measured CI time.
+- Rollout: eaglewatch enables `ci_proof` only after its PR B (draft runs, always-report, sharded jobs with one aggregator job) and one measured database PR.
+  Until then it uses only `after_fix` and the slot limit.
+
+Rollout: the config rejects unknown keys, so set these in a repo only after every machine that works on it has run
+`pipeline update` to a version that knows them.
 
 | Variable | Meaning |
 |---|---|

@@ -13,9 +13,14 @@ import { matchAny } from './lib/glob.mjs';
 import { runShellAsync } from './lib/proc.mjs';
 
 export const MAX_BLOCKS = 3;
-export const RUN_TIMEOUT_MS = 840_000; // the hook's own timeout is 900 s; leave room to report
+export const EXECUTION_TIMEOUT_MS = 840_000; // the hook's own timeout is 900 s; leave room to report
+export const RUN_TIMEOUT_MS = EXECUTION_TIMEOUT_MS; // the name earlier callers import
 const EXCERPT_LINES = 15;
 const NOT_CODE = ['**/*.md', 'docs/**'];
+
+// What verify.quick may take in all: the execution allowance plus verify.stop_queue_wait_minutes, the time it may spend
+// waiting for a machine-wide heavy-check slot first. The hook's timeout in .claude/settings.json must grow by the same.
+export const runTimeoutMs = (config) => EXECUTION_TIMEOUT_MS + (config?.verify?.stop_queue_wait_minutes ?? 0) * 60_000;
 
 const allow = (output = null) => ({ decision: 'allow', output });
 const block = (reason) => ({ decision: 'block', output: { decision: 'block', reason } });
@@ -109,10 +114,10 @@ function readReport(root, config, stampBefore) {
 /**
  * Decide whether Claude may stop. Returns { decision: 'allow'|'block', output } where output is the JSON object to print
  * on stdout (or null for a silent allow).
- * deps (all optional, for tests): env, run (runShellAsync shape), timeoutMs, cacheFile, loadConfig, fingerprint.
+ * deps (all optional, for tests): env, run (runShellAsync shape), timeoutMs (default runTimeoutMs(config)), cacheFile, loadConfig, fingerprint.
  */
 export async function decide(input = {}, deps = {}) {
-  const d = { env: process.env, run: runShellAsync, timeoutMs: RUN_TIMEOUT_MS, ...deps };
+  const d = { env: process.env, run: runShellAsync, ...deps };
   try {
     return await evaluate(input ?? {}, d);
   } catch (err) {
@@ -144,7 +149,8 @@ async function evaluate(input, d) {
   if (cached && cached.result === 'pass' && cached.fingerprint === fingerprint) return allow();
 
   const stampBefore = reportStamp(root, config);
-  const r = await d.run(config.verify.quick, { cwd: root, env: { PIPELINE_STOP_HOOK: '1' }, timeoutMs: d.timeoutMs });
+  const timeoutMs = d.timeoutMs ?? runTimeoutMs(config);
+  const r = await d.run(config.verify.quick, { cwd: root, env: { PIPELINE_STOP_HOOK: '1' }, timeoutMs });
   if (r.code === 0 && !r.timedOut) {
     writeCache(cacheFile, { fingerprint, result: 'pass', blocks: 0 });
     return allow();
@@ -160,7 +166,7 @@ async function evaluate(input, d) {
   const report = readReport(root, config, stampBefore);
   // stderr last: a crash message lands at the end, which is where the tail looks.
   const output = `${r.stdout ?? ''}\n${r.stderr ?? ''}`;
-  const why = r.timedOut ? `timed out after ${Math.round(d.timeoutMs / 60_000)} min` : `exit ${r.code}`;
+  const why = r.timedOut ? `timed out after ${Math.round(timeoutMs / 60_000)} min` : `exit ${r.code}`;
   const step = report ? report.step : why;
   const excerpt = report && report.excerpt.trim() ? tail(report.excerpt) : tail(output);
 

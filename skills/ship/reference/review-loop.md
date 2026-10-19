@@ -35,12 +35,14 @@ already holds. A `P state outcome` with `followupsPending: true` means a publish
   --round <round> --base <base> --head <head> --effort <effort>` → `P job wait codex-r<round> --run-id
   <runId> --timeout 540` until done (`replaced` ⇒ start the job again). Then read `exitCode` and the
   JSON in `tail`:
-  - 0: round recorded: `counts`, `preRuled` (items answered from the cache), `lightLane`.
+  - 0: round recorded: `counts`, `preRuled` (items answered from the cache), `lightLane`. Commits merged in from the
+    base branch since the previous round ("Update branch") are not shown to Codex. If the output has `baseOnly: true`
+    the round was only such a merge: Codex did not run, there are no items, and it counts as a clean round with no findings.
   - 3 (`unavailable: true`, reason quota / auth / unavailable / error / malformed / github) ⇒
     `gh pr edit <pr> --add-label awaiting-review`, `P comment --pr <pr> --kind awaiting-review
     --reason "<reason>"`, `P summary --pr <pr> --outcome awaiting-review --built "…"` (works with no
     review state, i.e. in round 1) plus `--cause codex:<reason> --action "Say \"resume pipeline reviews\" when Codex is back"`,
-    `P agent-log queue --line "<agentLogLine>"`, stop. Never treat a
+    `P agent-log publish --line "<agentLogLine>"`, stop. Never treat a
     failed Codex run as "no findings".
   - 2 `error: empty-range`: earlier rounds accepted items but the branch content is unchanged — the
     "fix" did not change code. Go back to step 6 and make the real change.
@@ -129,10 +131,15 @@ permissions / data-integrity / data-loss item ⇒ `needsHuman` (the CLI applies 
 
 - ACCEPT (not yet implemented): one implementer dispatch with the list (`P state show --round
   <round> --accepted`): fix each, add/adjust tests where behaviour changes, quick verify, commit,
-  `git push origin agent/<slug>`. Then the verifier runs `verify.full`. Red ⇒ fix cycle (max 2), else
+  `git push origin agent/<slug>`. Then the verifier runs `verify.full` (`P config` `verify.after_fix: full`, the default).
+  When `verify.after_fix` is `quick`, run `P verify plan-after-fix --round <round>` instead and have the verifier run each
+  command in its `commands` list, in order (a quick check, then the extra full steps the fixes touched; run them exactly as printed: with `verify.max_parallel_full` set the full ones come back as `verify slot --run [--only <steps>]`); exit 1 ⇒ run `verify.full` (as `verify slot --run` when `verify.max_parallel_full` is set, SKILL.md Step 2.2).
+  Either red ⇒ fix cycle (max 2), else
   `needs-human` (park it as below, `--cause verify-red`). Then `P state mark-implemented --ids <ids>` — exit 2 `no-code-change` means the
   branch content is still what the round reviewed: the fix has not actually changed code, so go back to
-  the implementer (marking never substitutes for a fix; a green `verify.full` must show the fix).
+  the implementer (marking never substitutes for a fix; a green verify must show the fix).
+  Step 2.2's initial full verify and Step 5.3's gate verify stay full whatever `verify.after_fix` says: the gate
+  still needs a full, clean report on the exact head.
 - `P comment --pr <pr> --kind triage` (one comment, updated in place each round): post it FIRST, so the decided
   items are published before any issue exists. A run that dies after this point resumes from that comment.
 - FOLLOW-UP: `P followups create --round <round>` (one issue each, label `agent-suggestion`). Each issue body starts
@@ -156,7 +163,7 @@ permissions / data-integrity / data-loss item ⇒ `needsHuman` (the CLI applies 
 **Park needs-human** (every `needs-human` stop in this loop is this exact sequence, never a bare label):
 `gh pr edit <pr> --add-label needs-human`, `P comment --pr <pr> --kind needs-human --reason "…"` (no `--hits-file`),
 `P summary --pr <pr> --outcome needs-human --action "<the one thing the owner does>" --cause review:<reason>`
-(`<reason>`: `unresolved`, `needs-human-items`, `judge:not-found` …), `P agent-log queue --line "<agentLogLine>"`, stop.
+(`<reason>`: `unresolved`, `needs-human-items`, `judge:not-found` …), `P agent-log publish --line "<agentLogLine>"`, stop.
 With `owner_approval: chat` and `needsHuman` items, the `--action` is "Rule on <ids> in chat (accept / follow-up / reject), remove needs-human, then say ship resume N".
 An arbiter ruling that parked an item makes the push an arbiter escalation by itself: summary reads the state.
 
@@ -174,5 +181,5 @@ word in chat, never by you. When the owner rules on it ("accept R4-B1", "follow-
 3. ACCEPT: it is not clean until built and reviewed: implement it (step 6), `P state mark-implemented`, and run a new round.
 4. The owner removes `needs-human` (never you) and says `ship resume <pr>`; resume routes to `review` or `gate`.
 
-Any commit after the last clean round that changes PR content (anything except the agent-log
-line) invalidates coverage — `P final-gate` will demand another round.
+Any commit after the last clean round that changes PR content (the agent log is never committed to a
+PR branch) invalidates coverage — `P final-gate` will demand another round.

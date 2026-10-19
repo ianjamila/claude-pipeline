@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { cpuTimed } from './helpers/timing.mjs';
 import assert from 'node:assert/strict';
 import { splitArgs, simpleCommands, commandName, allRedirects, scriptFileOf } from '../pipeline/hooks/lib/shell-parse.mjs';
 
@@ -214,10 +215,9 @@ test('exactly 500 commands is not truncated', () => {
 
 test('pathological nesting does not blow the stack or hang', () => {
   for (const s of ['$('.repeat(100000), '('.repeat(100000), '`'.repeat(100001), 'bash -c "'.repeat(5000), '{ '.repeat(50000), '<<'.repeat(50000)]) {
-    const started = Date.now();
-    const cmds = simpleCommands(s);
+    const { r: cmds, ms } = cpuTimed(() => simpleCommands(s));
     assert.ok(Array.isArray(cmds));
-    assert.ok(Date.now() - started < 5000, 'finished in reasonable time');
+    assert.ok(ms < 5000, `finished in reasonable time (${Math.round(ms)} ms of CPU)`);
   }
 });
 

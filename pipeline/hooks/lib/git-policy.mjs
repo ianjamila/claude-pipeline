@@ -15,10 +15,11 @@
 import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText } from './shell-parse.mjs';
+import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
+export { withoutLiteralText, INDIRECT_EXPANSION };
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
-import { scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit } from './script-candidates.mjs';
+import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit } from './script-candidates.mjs';
 
 const PROTECTED_BRANCHES = ['main', 'master'];
 const APPROVAL_LABELS = ['human-approved', 'test-change-approved'];
@@ -126,6 +127,18 @@ function parseOpts(args, { longValue = [], shortValue = '', abbrev = false } = {
   return { flags, positionals };
 }
 
+// Every flag `gh pr merge` has (short: -A -b -F -d -m -r -s -t -R -h)
+const GH_MERGE_LONG = ['admin', 'author-email', 'auto', 'body', 'body-file', 'delete-branch', 'disable-auto', 'help', 'match-head-commit', 'merge', 'rebase', 'repo', 'squash', 'subject'];
+const GH_MERGE_SHORT = 'AbFdmrstRh';
+// A boolean long flag's effective setting (the last one wins, as in gh): 'on', 'off' (also when absent) or 'bad' (a value gh would reject).
+function boolFlag(flags, name) {
+  const last = flags.filter((f) => !f.short && f.name === name).at(-1);
+  if (!last) return 'off';
+  if (last.value === null) return 'on';
+  const v = last.value.toLowerCase();
+  return v === '1' || v === 't' || v === 'true' ? 'on' : v === '0' || v === 'f' || v === 'false' ? 'off' : 'bad';
+}
+
 const flagValues = (flags, longNames, shortNames = '') => flags
   .filter((f) => (f.short ? shortNames.includes(f.name) : longNames.includes(f.name)) && f.value !== null)
   .map((f) => f.value);
@@ -135,8 +148,11 @@ const flagValues = (flags, longNames, shortNames = '') => flags
 // $NAME / ${NAME} that an earlier command on the same line assigned; anything else is left as written.
 // A value is substituted as written (never expanded again), but a long value used in many words still multiplies, so the
 // text produced is capped per result and per evaluation (substitute throws GuardLimit, which evaluateGitCommand denies).
+// (an unbraced name that zsh would read a modifier or a subscript after is left as written: ZSH_MODIFIED, #74; `${B}:r` is no modifier). Defence in depth: collectAssignments already makes a name the line assigns and reads so unsure, so the guard also holds without this lookahead for those; it keeps
+// the text of one reaching expandVars by another way (a value from a sourced file, a script judged alone) from being read as the value.
+const EXPAND_RE = new RegExp(`\\$(?:\\{([A-Za-z_][A-Za-z0-9_]*)\\}|([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_])${ZSH_MODIFIED})`, 'g');
 function expandVars(text, ctx) {
-  return substitute(ctx.budget, String(text), /\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g, (m, a, b) => ctx.vars[a ?? b] ?? m);
+  return substitute(ctx.budget, String(text), EXPAND_RE, (m, a, b) => ctx.vars[a ?? b] ?? m);
 }
 
 // Everything a script judged here can depend on: the directory, the nesting level and the line's variable / branch / config / alias state.
@@ -150,7 +166,13 @@ const knownValues = (ctx, n) => [ctx.vars[n], unsureVar(ctx, n) ? `$${n}` : unde
 // A variable assigned more than once in what is judged (`B=main; false && B=agent/x`) is unknown from then on: which
 // assignment ran depends on control flow the parser does not model, so its value is left as `$B` (dynamic).
 // Only an assignment on the line itself (level 0) makes a tainted variable known again; one inside a judged script is ignored for it.
+// #81: the readings of one text (the line, or a script the guard opened) belong to that text's level: a script judged under a reading of the line, or
+// a script it runs, has none of the line's pins and may take readings of its own (judgeReadings puts the outer ones back when it is done).
+const pinsAt = (ctx, level) => (ctx.pins && ctx.pinsLevel === level ? ctx.pins : undefined);
 function setVar(ctx, k, v, level) {
+  // (a reading of the line pins how its one assignment of k went: it ran, or it did not; see judgeReadings)
+  const pins = pinsAt(ctx, level);
+  if (pins?.has(k)) { if (pins.get(k) === 'set') ctx.vars[k] = v; return; }
   if (level === 0) ctx.tainted.delete(k);
   else if (ctx.tainted.has(k)) return;
   if (sameValue(ctx, k, v)) return;
@@ -159,6 +181,15 @@ function setVar(ctx, k, v, level) {
 // Why: a name set again to the literal value it already holds (a startup file the nested shell reads again) is still certain; it is not "assigned more than once".
 const sameValue = (ctx, k, v) => !DYNAMIC.test(v) && !ctx.unsureVars.has(k) && !ctx.tainted.has(k) && Object.hasOwn(ctx.vars, k) && ctx.vars[k] === v;
 const recordVars = (env, ctx, level) => { for (const k of Object.keys(env)) setVar(ctx, k, env[k], level); };
+// Why (#56, a live bypass on main): `S=run; F=$S.sh; bash $F` ran run.sh while the guard read `bash $S.sh`, a script only known at run time, allowed on a line
+// that names no guarded operation. The shell works a value out when it assigns it, so a bare assignment's value is expanded here with what is known at that
+// point, left to right (`A=1 B=$A`). Only when the assignment's own text shows that every `$` in it expands: the parser removes quotes, so `F='$S'` and
+// `F=$S` give the same value; a single quote or a backslash in the text keeps the value as written (unknown at run time, as before).
+function recordAssigned(c, ctx, level) {
+  const raw = typeof c.raw === 'string' ? c.raw : '';
+  const exact = raw !== '' && !/['\\]/.test(raw);
+  for (const k of Object.keys(c.env)) setVar(ctx, k, exact && c.env[k].includes('$') ? expandVars(c.env[k], ctx) : c.env[k], level);
+}
 
 // A variable whose value is unknown: assigned more than once (or where it may not run), or tainted (a script that may
 // or may not be the one sourced earlier on the line may have set it).
@@ -364,7 +395,44 @@ const CURRENT_BRANCH_WORD = new RegExp(`(^|:)${CURRENT_BRANCH_IDIOM.source.slice
 // so the commands that assign a variable by a computed or split-up name count as well.
 const SETS_BY_NAME = /\b(?:eval|read|mapfile|readarray|getopts|source)\b|\bprintf\s+-[A-Za-z]*v|(?:^|[\s;&|(])\.\s|\b(?:export|unset|declare|typeset|local|readonly)\b[^;&|\n]*[$`'"]/;
 // Both the text as written and with its quotes and backslashes removed (`printf -vI""FS ,` spells the name only once they are gone).
-const ifsMayBeSet = (ctx) => [ctx.fullText ?? '', String(ctx.fullText ?? '').replace(/['"\\]/g, '')].some((t) => /IFS/.test(t) || SETS_BY_NAME.test(t)) || assignedNames(ctx).includes('IFS') || Object.hasOwn(ctx.env ?? {}, 'IFS') || ctx.tainted.size > 0;
+// Why (#81 Codex R1-B1 follow-up): a script the guard opens is judged with its own text too -- `bash wrapper.sh` hid `declare -n r=IFS; r=x` from the outer line. Whole-line comments are left out of
+// the binder test only (a comment that says "read" is no binder); the name IFS anywhere, a comment included, still counts.
+// A line is left out only when the scan is CERTAIN it is a comment line: its first non-blank character is `#` and nothing is open from the lines before it (a quote, a backtick, `$( )`, `${ }`, a
+// backslash-newline). A line is dropped whole or kept whole, never cut: a `#` in the middle of a line is read by no rule here (an escaped blank, `\ #`, makes it a word, a quote may hide it),
+// so the first such `#`, any `$'` / `$"`, or a heredoc (`<<`, not `<<<`) makes the scan unsure and every line from there on is kept. Unsure means more text tested, never less; the cost is a
+// refusal where a script has a trailing comment that says `read` (documented in the tests).
+// Defensive (mutation check): the heredoc exit, the `$( )` depth and the `${ }` depth only keep MORE lines; a heredoc body is judged as a script of its own, bash reads a `#` line inside `$( )` as a comment too, and the text of a `${x:-word}` is data, not a command.
+function withoutCommentLines(s) {
+  if (/<<(?!<)/.test(s)) return s;
+  const out = [];
+  let sq = false, dq = false, bt = false, depth = 0, braces = 0, cont = false, unsure = false;
+  for (const line of s.split('\n')) {
+    if (!unsure && !cont && !sq && !dq && !bt && depth === 0 && braces === 0 && /^\s*#/.test(line)) continue;
+    out.push(line);
+    if (unsure) continue;
+    let esc = false;
+    for (let i = 0; i < line.length && !unsure; i++) {
+      const c = line[i];
+      if (esc) { esc = false; continue; }
+      if (sq) { if (c === "'") sq = false; continue; }
+      if (c === '\\') { esc = true; continue; }
+      if (c === '$' && (line[i + 1] === "'" || line[i + 1] === '"')) { unsure = true; continue; }
+      if (c === "'" && !dq) { sq = true; continue; }
+      if (c === '"') { dq = !dq; continue; }
+      if (c === '`') { bt = !bt; continue; }
+      if (c === '$' && line[i + 1] === '(') { depth++; continue; }
+      if (c === '$' && line[i + 1] === '{') { braces++; continue; }
+      if (c === ')' && depth > 0) { depth--; continue; }
+      if (c === '}' && braces > 0) { braces--; continue; }
+      if (c === '#' && !dq && (i === 0 || /[\s;&|()]/.test(line[i - 1]))) unsure = true; // (a comment, or a word that only looks like one: not told apart)
+    }
+    cont = esc;
+  }
+  return out.join('\n');
+}
+// Defensive (mutation check): the binder test (SETS_BY_NAME) and the quote-stripped spelling (`I""FS`) of a script are also held by collectAssignments, which makes every name such a script binds unknown (bindsRunTimeName, indirectExpansion, tainted); only the name IFS written out (a nameref, an alias) needs this line.
+const ifsInScope = (ctx) => (ctx.scopeTexts ?? []).some((s) => [String(s), String(s).replace(/['"\\]/g, '')].some((v) => /IFS/.test(v) || SETS_BY_NAME.test(withoutCommentLines(v))));
+const ifsMayBeSet = (ctx) => ifsInScope(ctx) || [ctx.fullText ?? '', String(ctx.fullText ?? '').replace(/['"\\]/g, '')].some((t) => /IFS/.test(t) || SETS_BY_NAME.test(t)) || assignedNames(ctx).includes('IFS') || Object.hasOwn(ctx.env ?? {}, 'IFS') || ctx.tainted.size > 0;
 
 function unverifiableWord(raw, ctx) {
   if (raw.includes(LITERAL_MARK)) return null; // (a word judged as the plain text it spells)
@@ -432,7 +500,7 @@ function pushReading(args, dir, gitDir, ctx, configs) {
   if (repoGiven || (positionals.length && !looksLikeRemote(positionals[0]))) refspecs = positionals;
   else refspecs = positionals.slice(1);
   if (refspecs.length === 0) {
-    if (dir === null) return deny('cannot tell which directory this `git push` runs in (unresolved cd / -C), so the current branch cannot be verified.');
+    if (dir === null) return deny('cannot tell which directory this `git push` runs in (unresolved cd / -C), so the current branch cannot be verified. Rewrite: name the branch (`git push origin agent/x`), or give the directory literally (`git -C /abs/repo push`, or `cd /abs/repo && git push`).');
     if (ctx.cfgDirty || ctx.envCfgDirty || configs.some((c) => RISKY_CONFIG(c.key, c.value))) {
       return deny('this line changes upstream/push configuration (git config, branch -u, -c push.default/remote.*.push), so where a bare `git push` goes cannot be verified. Push explicitly: git push -u origin HEAD:agent/<slug>.');
     }
@@ -721,13 +789,19 @@ function graphqlMutations(query) {
   return names;
 }
 
-function checkGraphql(body) {
+function checkGraphql(body, dir = null, ctx = null) {
   for (const q of body.queries) {
     if (/^\s*(\$\(|`|\$\{?[A-Za-z_])/.test(q)) return deny('the graphql query is built at run time, so it cannot be verified. Pass the query text directly.');
     const names = graphqlMutations(q);
     if (names === null) return deny('the graphql query contains a mutation that cannot be parsed, so it cannot be verified.');
     const bad = names.find((n) => !GRAPHQL_ALLOWED_MUTATIONS.has(n));
     if (bad) return deny(`the graphql mutation ${bad} is not on the allowed list (${[...GRAPHQL_ALLOWED_MUTATIONS].join(', ')}). ${OWNER_ONLY}`);
+    // #58: auto-merge names the PR by its node id, which says nothing about whether the owner said "merge" for it, nor which repository it is in.
+    // Why (#58 round 3): the node id can name a PR in a chat repo whatever directory this runs in, so the target repository can never be resolved
+    // here: it is judged as a chat repo's (the owner's "merge" is needed, and a node id cannot match one), not as the current directory's.
+    if (names.includes('enablePullRequestAutoMerge') && ctx?.ownerGo) {
+      return deny('turning on auto-merge through the API skips the owner\'s "merge": it names the PR by a node id, so its repository (owner_approval: chat?) and head cannot be checked. Use `gh pr merge <N> --auto --match-head-commit <sha>` after the owner said "merge", or `P merge`.');
+    }
   }
   if (body.unknown) return deny('cannot verify the graphql body (--input - / unreadable file).');
   return null;
@@ -817,7 +891,163 @@ function checkApi(rest, env, dir, ctx) {
   if (/\/git\/refs\/heads\/(main|master)$/i.test(p)) return deny(`${method} to the main/master ref is a push to main. It is blocked.`);
   if (method === 'POST' && /\/git\/refs$/i.test(p) && /refs\/heads\/(main|master)\b/i.test(haystack)) return deny('creating the main/master ref through the API is blocked.');
 
-  if (/^graphql$/i.test(ep)) return checkGraphql(body);
+  if (/^graphql$/i.test(ep)) return checkGraphql(body, dir, ctx);
+  return null;
+}
+
+// ---- #58: direct merges in an owner_approval: chat repo ----------------------------------------------------------------
+// Why: P merge checks the owner's recorded "merge" (hooks/lib/owner-go.mjs) before it merges an owner item, but a plain
+// `gh pr merge`, the repo's own merge command or auto-merge through the API skipped P merge entirely (Codex design review of #58,
+// verified). In a chat repo each of them now needs the owner's "merge" naming that PR in this session. P merge runs the merge
+// command as its own child process, which the guard never sees, so low-risk PRs still merge on their own through P merge.
+// Without the owner-go wiring (tests, older callers) nothing here applies.
+function ownerGoMode(dir, ctx) {
+  if (!ctx?.ownerGo) return 'none';
+  if (dir === null) return 'chat'; // (which repository is unknown)
+  try {
+    return ctx.ownerGo.mode(dir);
+  } catch {
+    return 'chat'; // (a pipeline.yml that cannot be read)
+  }
+}
+const prNumberOf = (w) => {
+  const m = /^#?(\d{1,7})$/.exec(String(w ?? '')) ?? /\/pull\/(\d{1,7})(?:[/?#]|$)/.exec(String(w ?? ''));
+  return m ? Number(m[1]) : null;
+};
+// `elsewhere`: the command names another repository (-R, a PR URL), whose mode is unknown here: judged as a chat repo.
+// `head`: the head the command pins (gh: --match-head-commit; the repo command: the flag before its {sha}); a merge that pins no full
+// head could land a later push the owner never saw, so it is refused, and the owner's "merge" must be for exactly that head.
+function directMergeVerdict(pr, head, dir, ctx, what, elsewhere = false, pinFlag = '--match-head-commit') {
+  if (!ctx?.ownerGo) return null;
+  if (!elsewhere && ownerGoMode(dir, ctx) !== 'chat') return null;
+  const where = elsewhere ? 'a merge named by -R, a PR URL or GH_REPO (its repository may need the owner)' : 'in this repository (owner_approval: chat) a merge';
+  const via = `Merge through \`P merge --pr ${pr ?? 'N'}\` (it merges a low-risk PR itself), or show the request (Head and 🔀 lines) and wait for the owner to type "merge".`;
+  if (pr === null) return deny(`${what} without a literal PR number: ${where} needs the owner's "merge" for that PR and head. Name the PR number (run from the repository), or ${via[0].toLowerCase()}${via.slice(1)}`);
+  if (!pinFlag) return deny(`${what} #${pr}: ${where} needs the owner's "merge" for the head it lands, and this merge command pins no head. ${via}`);
+  if (!/^[0-9a-f]{40}$/.test(String(head ?? ''))) return deny(`${what} #${pr}: ${where} must pin the head the owner said "merge" for: add \`${pinFlag} <full 40-character head>\`. ${via}`);
+  let ok = false;
+  try {
+    ok = ctx.ownerGo.approvedHead(pr, head) === true;
+  } catch { /* unreadable records: not approved */ }
+  if (ok) return null;
+  return deny(`${what} #${pr}: ${where} needs the owner's "merge" for #${pr} at head ${head.slice(0, 12)} in this session, and none is recorded. ${via}`);
+}
+// Package-manager spellings of one script: `npm --silent run merge`, `npm run-script merge`, `npm rum merge`, `pnpm merge`, `yarn merge` all run
+// script "merge". canonPm drops the global options (before the subcommand and between `run` and the script) and maps the aliases to
+// `<pm> run <script> …`; an option it does not know is read as a flag without a value. (The value-taking ones it knows are skipped with their value.)
+const PM_RUN_ALIASES = { npm: ['run', 'run-script', 'rum', 'urn'], pnpm: ['run', 'run-script'], yarn: ['run'], bun: ['run'] };
+const PM_VALUE_OPTS = new Set(['--prefix', '--workspace', '-w', '--userconfig', '--globalconfig', '--cache', '--loglevel', '--registry', '--dir', '-C', '--filter', '-F', '--cwd', '--use-yarnrc', '--tag', '--scope', '--otp', '--script-shell']);
+const PM_WRAPPERS = new Set(['npx', 'pnpx', 'bunx', 'corepack', 'exec', 'x', 'dlx']);
+const PM_COMMANDS = new Set(['install', 'i', 'add', 'remove', 'rm', 'uninstall', 'update', 'up', 'upgrade', 'exec', 'dlx', 'x', 'test', 't', 'start', 'stop', 'restart', 'publish', 'pack', 'link', 'unlink', 'init', 'create', 'audit', 'outdated', 'list', 'ls', 'why', 'info', 'view', 'config', 'cache', 'version', 'help', 'login', 'logout', 'whoami', 'ci', 'rebuild', 'prune', 'dedupe', 'store', 'env', 'patch', 'import', 'fetch', 'run']);
+function canonPm(words) {
+  const pm = baseName(words[0] ?? '');
+  const aliases = PM_RUN_ALIASES[pm];
+  if (!aliases) return words;
+  const skipOpts = (i) => { while (i < words.length && words[i].startsWith('-') && words[i] !== '--') i += PM_VALUE_OPTS.has(words[i]) ? 2 : 1; return i; };
+  let i = skipOpts(1);
+  const sub = (words[i] ?? '').toLowerCase();
+  if (sub === '' || sub === '--') return words;
+  if (aliases.includes(sub)) {
+    i = skipOpts(i + 1);
+    return [words[0], 'run', ...words.slice(i)];
+  }
+  if (pm !== 'npm' && !PM_COMMANDS.has(sub)) return [words[0], 'run', ...words.slice(i)]; // (`yarn merge`, `pnpm merge`: a script)
+  return [words[0], ...words.slice(i)];
+}
+// The script a template runs through a package manager ('' when it is not one).
+// (canonPm output of a package manager's script call: `<pm> run <script> …`)
+const isPmRun = (c) => c.length > 2 && c[1] === 'run' && Object.hasOwn(PM_RUN_ALIASES, baseName(c[0]));
+const pmScriptOf = (prefix) => { const c = canonPm(prefix); return isPmRun(c) ? c[2] : ''; };
+// The words the script itself receives. Why (#58 round 3): npm keeps every option written before `--` for itself (`npm run merge 7 --expect-head=H`
+// hands the script only `7`), so for npm only the words AFTER `--` count; yarn and pnpm forward the words after the script name.
+const pmForwarded = (c) => (baseName(c[0]) === 'npm' ? (c.indexOf('--', 3) < 0 ? [] : c.slice(c.indexOf('--', 3) + 1)) : c.slice(3).filter((w) => w !== '--'));
+// Subcommands that cannot run a repo script (read-only queries, installs): `npm view merge version` names the word `merge` and is no merge.
+// (an unknown subcommand, `run`, `exec`, `x`, `dlx`, `explore`, `test`, `start` … stay judged as before)
+const PM_NO_SCRIPT = new Set(['view', 'v', 'info', 'show', 'ls', 'll', 'la', 'list', 'outdated', 'help', 'help-search', 'search', 's', 'find', 'why', 'explain', 'config', 'whoami', 'bin', 'root', 'prefix', 'ping', 'audit', 'fund', 'docs', 'home', 'repo', 'bugs',
+  'install', 'i', 'add', 'remove', 'rm', 'uninstall', 'un', 'update', 'up', 'upgrade']);
+const PM_BOOL_OPTS = new Set(['--silent', '-s', '--quiet', '-q', '--no-color', '--json', '--no-progress', '--no-audit', '--no-fund', '-g', '--global']);
+// (only options it knows may precede the subcommand: an unknown one could take the next word as its value and leave the real subcommand behind it)
+function pmCannotRunScript(words) {
+  if (!Object.hasOwn(PM_RUN_ALIASES, baseName(words[0] ?? ''))) return false;
+  let i = 1;
+  while (i < words.length && words[i].startsWith('-') && words[i] !== '--') {
+    if (PM_VALUE_OPTS.has(words[i])) i += 2;
+    else if (PM_BOOL_OPTS.has(words[i])) i += 1;
+    else return false;
+  }
+  return PM_NO_SCRIPT.has(String(words[i] ?? '').toLowerCase());
+}
+
+// The repo's own merge command (pipeline.yml merge.command, e.g. `npm run merge -- {pr} --expect-head {sha}`) typed by hand. A `gh …`
+// command is judged as gh.
+// Why (#58 round 4, strict shape): when the template is a package script, the guard does not try to recognise every package runner (npm / yarn /
+// pnpm / bun, wrappers, `run-script`, `--prefix` / `-C` / `--cwd` / workspaces, words before `--` that npm forwards …). Only the template's exact
+// spelling — its own words, then the PR and the pin after them, with nothing in between — is approvable (read as before: PR and head against the
+// owner-go record). Any other command that may run that script is refused in a chat repo with the canonical form named. A manager option that
+// moves the target directory is judged as a chat repo whatever the current directory is.
+const pmName = (w) => baseName(String(w ?? '')).replace(/@[^@/]*$/, '').toLowerCase();
+const isPmWord = (w) => Object.hasOwn(PM_RUN_ALIASES, pmName(w));
+const MOVES_DIR = /^(?:--prefix|--cwd|--dir|--workdir|--workspaces?|--filter|--filter-prod|--include-workspace-root|--userconfig|--globalconfig|--global|--location|-w|-ws|-C|-F|-g)(?:=.*)?$|^-[CwF]./;
+// (a package-manager setting the line gives — `npm_config_prefix=/chat npm run merge …`, `export npm_config_…`, `env YARN_…` — may move it the same way: npm reads
+// npm_config_* like its options, whatever the case. Fails closed on any such name; the guard's variables hold only what the line sets.)
+const pmSettingOnLine = (ctx) => [...Object.keys(ctx.vars ?? {}), ...(ctx.unsureVars ?? []), ...(ctx.tainted ?? [])].some((k) => /^(?:npm_config_|yarn_|pnpm_|bun_|berry_)/i.test(k));
+function pmScriptRefusal(prefix, shaFlag, raw, dir, ctx) {
+  const script = pmScriptOf(prefix);
+  const end = raw.indexOf('--');
+  const before = raw.slice(1, end < 0 ? undefined : end);
+  // (the manager, or a wrapper — npx / pnpx / bunx / corepack / exec / dlx … — that runs one, with the script's name on the line or a word built at run time before `--`)
+  const same = isPmWord(raw[0]);
+  const wrapped = (same || PM_WRAPPERS.has(pmName(raw[0]))) && raw.some((w) => PM_WRAPPERS.has(String(w).toLowerCase())) && raw.some(isPmWord);
+  const mayRun = ((same && (before.includes(script) || before.some((w) => DYNAMIC.test(w)))) || (wrapped && raw.includes(script))) && !pmCannotRunScript(raw);
+  if (!mayRun) return undefined;
+  const moved = before.some((w) => MOVES_DIR.test(w) || w === 'workspace') || pmSettingOnLine(ctx);
+  if (!moved && ownerGoMode(dir, ctx) !== 'chat') return null;
+  const canon = `${prefix.join(' ')} <PR>${shaFlag ? ` ${shaFlag} <full 40-character head>` : ''}`;
+  return deny(`\`${raw.join(' ').slice(0, 120)}\` may run the merge script \`${script}\`, and ${moved ? 'a manager option moves its target directory, so it is judged as a chat repository' : 'in this repository (owner_approval: chat)'} a merge needs the owner's "merge" for that PR and head. Only the exact form \`${canon}\` is checked against the owner's record (nothing between the script name and \`--\`, no manager options, no wrapper). Use it, or merge through \`P merge --pr N\` (it merges a low-risk PR itself).`);
+}
+function repoMergeCommandVerdict(argv, dir, ctx) {
+  if (!ctx?.ownerGo) return null;
+  // (an unknown directory is judged by the session's own; a pipeline.yml that cannot be read leaves `npm run merge` as the guess, as the mode of an unreadable one is chat)
+  let templates = [];
+  try {
+    templates = ctx.ownerGo.mergeTemplates(dir ?? ctx.cwd) ?? [];
+  } catch {
+    templates = [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: null }];
+  }
+  const raw = argv.map((a) => expandVars(a, ctx));
+  const usable = templates.filter((t) => Array.isArray(t.prefix) && t.prefix.length && baseName(t.prefix[0]) !== 'gh');
+  // Package-script templates: the canonical shape of any of them is approvable; anything else that may run a template's script is refused.
+  const scripts = usable.filter((t) => pmScriptOf(t.prefix));
+  for (const { prefix, shaFlag } of scripts) {
+    if (pmSettingOnLine(ctx)) break; // (judged below as a moved target)
+    if (raw.length < prefix.length || baseName(raw[0]) !== baseName(prefix[0]) || !prefix.every((w, i) => i === 0 || raw[i] === w)) continue;
+    // (npm keeps every option written before `--` for itself: a template without `--` hands the script no option)
+    const tail = raw.slice(prefix.length);
+    const given = baseName(prefix[0]) === 'npm' && !prefix.includes('--') ? tail.filter((w) => !w.startsWith('-')) : tail;
+    let head = null;
+    if (shaFlag) {
+      // (exactly one head flag: with two, which one the script honours is unknown)
+      const vals = given.flatMap((w, j, all) => (w === shaFlag ? [all[j + 1]] : w.startsWith(`${shaFlag}=`) ? [w.slice(shaFlag.length + 1)] : []));
+      head = vals.length === 1 ? vals[0] ?? null : null;
+    }
+    return directMergeVerdict(prNumberOf(given[0]), head, dir, ctx, `\`${prefix.join(' ')}\``, false, shaFlag);
+  }
+  for (const { prefix, shaFlag } of scripts) {
+    const v = pmScriptRefusal(prefix, shaFlag, raw, dir, ctx);
+    if (v !== undefined) return v;
+  }
+  for (const { prefix, shaFlag } of usable) {
+    if (pmScriptOf(prefix)) continue;
+    const plain = raw.filter((w) => w !== '--');
+    const p = prefix.filter((w) => w !== '--');
+    if (plain.length < p.length || baseName(plain[0]) !== baseName(p[0]) || !p.slice(1).every((w, i) => plain[i + 1] === w)) continue;
+    let head = null;
+    if (shaFlag) {
+      const vals = plain.flatMap((w, j, all) => (w === shaFlag ? [all[j + 1]] : w.startsWith(`${shaFlag}=`) ? [w.slice(shaFlag.length + 1)] : []));
+      head = vals.length === 1 ? vals[0] ?? null : null;
+    }
+    return directMergeVerdict(prNumberOf(plain[p.length]), head, dir, ctx, `\`${prefix.join(' ')}\``, false, shaFlag);
+  }
   return null;
 }
 
@@ -866,7 +1096,19 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
 
   if (group === 'pr' && verb === 'merge') {
     if (rest.some((t) => t === '--admin' || t.startsWith('--admin='))) return deny(`\`gh pr merge --admin\` bypasses the merge gate and is blocked. Use \`--auto\` / the pipeline merge command. ${OWNER_ONLY}`);
-    return null;
+    const { flags, positionals } = parseOpts(rest, { longValue: ['author-email', 'body', 'body-file', 'match-head-commit', 'repo', 'subject'], shortValue: 'AbFtR' });
+    // (a real `--disable-auto` flag whose LAST setting is on, with `--auto` not on, turns a queued merge off and merges nothing. `--disable-auto`
+    // as the value of --subject / --body …, `--disable-auto=false`, or one next to `--auto` is no cancellation: the PR merges)
+    // (and only when every flag is one gh pr merge has, and no word is built at run time: an unknown flag or a `$(…)` word could be what makes it a merge)
+    const known = flags.every((f) => (f.short ? GH_MERGE_SHORT.includes(f.name) : GH_MERGE_LONG.includes(f.name)));
+    if (known && !rest.some((t) => DYNAMIC.test(t)) && boolFlag(flags, 'disable-auto') === 'on' && boolFlag(flags, 'auto') === 'off') return null;
+    // (gh reads the repository from -R, a PR URL or GH_REPO: set on this command, earlier on the line (unknown if it ran) or inherited. An empty GH_REPO selects nothing)
+    const ghRepo = envVar(env, ctx, 'GH_REPO');
+    const viaEnv = !ghRepo.known || (Object.hasOwn(env, 'GH_REPO') ? ghRepo.value !== '' : (ghRepo.value !== undefined && ghRepo.value !== '') || (typeof ctx.env?.GH_REPO === 'string' && ctx.env.GH_REPO !== ''));
+    const elsewhere = flagValues(flags, ['repo'], 'R').length > 0 || /\/pull\//.test(positionals[0] ?? '') || viaEnv;
+    // (gh uses the LAST --match-head-commit: a repeated one could pin another head than the one checked, so it pins nothing)
+    const pins = flagValues(flags, ['match-head-commit']);
+    return directMergeVerdict(prNumberOf(positionals[0]), pins.length === 1 ? pins[0] : null, dir, ctx, '`gh pr merge`', elsewhere);
   }
 
   if ((group === 'pr' || group === 'issue') && (verb === 'edit' || verb === 'create')) {
@@ -996,7 +1238,8 @@ function checkScriptFile(sf, dir, ctx, level) {
     // quoting is lost (`'x$y.sh'` reads as `x$y.sh`): if the word as written is a file, judge it before the textual rule
     const lit = checkScriptFile({ kind: sf.kind, family: sf.family, file: sf.file, candidate: true }, dir, ctx, level);
     if (lit) return lit;
-    return sf.kind !== 'exec' && GUARDED_WORDS.test(ctx.fullText)
+    // Defensive (mutation check): every word with a `$` is `ambiguous` and goes to checkCandidateScripts above, whose own fallback (judgedTexts) holds this; kept for a word that reaches here as a plain name.
+    return sf.kind !== 'exec' && judgedTexts(ctx).some((x) => GUARDED_WORDS.test(x))
       ? deny(`the script "${sf.file}" is named at run time and the line mentions a guarded operation, so what it runs cannot be verified. Name the file.`)
       : null;
   }
@@ -1057,7 +1300,7 @@ function judgeScriptText(text, sf, abs, dir, ctx, level) {
     return why ? deny(`the program ${sf.file} contains a guarded command (${why}); it cannot be verified by the guard. Run the operation directly.`) : null;
   }
   if (level >= MAX_NESTING) return deny(`the script ${sf.file} is nested too deeply (scripts running scripts) to verify.`);
-  const v = judgeScoped(text, dir, ctx, level, sf);
+  const v = judgeScoped(text, dir, ctx, level, sf, !sf.sourced); // (a script of its own takes readings (judgeReadings); a sourced file shares the line's variables, which evalString's check after `source` makes unsure: the same as before)
   return v.decision === 'deny' ? deny(`the script ${sf.file} would run a blocked command: ${v.reason}`) : null;
 }
 
@@ -1233,14 +1476,20 @@ function isolatedState(ctx, fn) {
 // heredoc body that feeds a non-shell is not a command at all)? The detector is the one used for interpreter files, plus the protection / ruleset /
 // issue-close shapes of gh and git.
 // The line as the guard reads it: every command's words without the values of prose flags (commit -m, --body ...). A heredoc body is not part of it.
+// (a `git ... commit` command: the only one whose clustered flags -qm, -am, -qam are read as -m)
+const isCommit = (argv) => baseName(argv[0] ?? '') === 'git' && argv.slice(1).includes('commit');
 function maskedLine(ctx) {
-  ctx.lineMasked ??= simpleCommands(ctx.lineText).filter((c) => c.argv.length).map((c) => [c.argv[0], ...dataLessArgs(c.argv.slice(1))].join(' ')).join('\n');
+  ctx.lineMasked ??= simpleCommands(ctx.lineText).filter((c) => c.argv.length).map((c) => [c.argv[0], ...dataLessArgs(c.argv.slice(1), isCommit(c.argv))].join(' ')).join('\n');
   return ctx.lineMasked;
 }
 // ... a guarded command, or (strictly) a guarded word: the masked line as written and with its quotes and escapes stripped
+// (t11: a JavaScript method call -- `mounts.rw.push(x)`, `_.merge(a, b)` in a `node -e` program -- is no git subcommand: the name follows a dot that is part of the same word, with something to its
+// left (`x.push(`). A bare `push(` or `.push(` is not excluded: in zsh `push(N)` is a glob with a qualifier that names the file `push`.)
+const JS_METHOD_CALL = /[\w$\])]\.(?:push|merge)\(/gi;
+const mentionsGuardedWord = (text) => GUARDED_WORDS.test(text.replace(JS_METHOD_CALL, '('));
 function lineMentionsGuarded(ctx) {
   const m = maskedLine(ctx);
-  return lineHoldsGuardedCommand(ctx) || GUARDED_WORDS.test(m) || GUARDED_WORDS.test(m.replace(/['"`\\]/g, ''));
+  return lineHoldsGuardedCommand(ctx) || mentionsGuardedWord(m) || mentionsGuardedWord(m.replace(/['"`\\]/g, ''));
 }
 
 function lineHoldsGuardedCommand(ctx) {
@@ -1248,7 +1497,7 @@ function lineHoldsGuardedCommand(ctx) {
     ctx.lineHolds = false;
     for (const c of simpleCommands(ctx.lineText)) {
       if (!c.argv.length) continue;
-      const args = dataLessArgs(c.argv.slice(1));
+      const args = dataLessArgs(c.argv.slice(1), isCommit(c.argv));
       const text = [c.argv[0], ...args].join(' ');
       // (a push whose destination merely STARTS with main / master counts too: printf '%.19s' can cut a longer word down to it)
       if (guardedCommandText(text) || /git\s+(?:-\S+\s+)*push\b[^;&|\n]*\b(?:main|master)/i.test(text) || (['git', 'gh'].includes(baseName(c.argv[0])) && /(?:^|\s)(?:protection|ruleset|rulesets)(?=\s|$)|issue\s+close/i.test(text))) { ctx.lineHolds = true; break; }
@@ -1398,15 +1647,25 @@ function implicitStartupVerdict(st, ctx, cmd, dir) {
 //   gitAliases, ghAliases         config on disk: kept; one a speculative candidate (re)defines is also unsure (aliasUnsure)
 //   cwd, home, fullText, readers  constants of the evaluation; budget (script reads, deadline, expansion) is shared on purpose (never restored)
 // (a `cd` inside a sourced file is not followed: evalString's directory is local to each call)
-function judgeScoped(text, dir, ctx, level, sf) {
+function judgeScoped(text, dir, ctx, level, sf, child = false) {
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
+  // Why (#81 Codex R1-B1): the names a text assigns (assignedOf) and the words it mentions (the dynamic-script fallback) are those of EVERY text being judged, the script's own among them
+  const scopes = (ctx.scopeTexts ??= []);
+  scopes.push(text);
+  try {
+    return judgeScopedIn(text, dir, ctx, level, sf, child);
+  } finally {
+    scopes.pop();
+  }
+}
+function judgeScopedIn(text, dir, ctx, level, sf, child) {
   if (sf.sourced && !sf.candidate) return evalString(text, dir, ctx, level + 1);
   const saved = Object.assign(Object.create(null), ctx.vars);
   const savedTaint = new Set(ctx.tainted);
   const savedUnsure = new Set(ctx.unsureVars);
   const spec = sf.candidate ? { branches: new Map(ctx.branches), git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases } } : null;
   try {
-    return evalString(text, dir, ctx, level + 1);
+    return evalString(text, dir, ctx, level + 1, child);
   } finally {
     if (spec) { // anything added, changed or removed: unknown (it may not have run), never the candidate's value nor the old one
       for (const d of new Set([...spec.branches.keys(), ...ctx.branches.keys()])) {
@@ -1457,12 +1716,20 @@ function checkSplices(c, dir, ctx, level) {
 // script named at run time.
 // the words a `${X:=w}` / `${X=w}` anywhere on the line (this text, or the line it came from) may have assigned: a later $X may be any of them.
 // Kept with the text it was worked out from: a nested context copies the fields of its parent but judges other text (a startup file).
+// (the line itself, ctx.lineText, was always read here and still is -- Defensive (mutation check): no test tells it from the judged texts, it is kept so no reading the line gave is lost)
+// Why (#81 Codex R1-B1): a script the guard opens assigns names of its own (`F=ok.sh; G=${F/ok/run}; bash $G`), which the outer line knows nothing about: the texts judged on the way (the line, then each
+// script or text one level down, see judgeScoped) all count. Only ever more readings than the line alone gave, never fewer.
+const judgedTexts = (ctx) => [ctx.fullText, ...(ctx.scopeTexts ?? [])].filter((t, i, a) => typeof t === 'string' && a.indexOf(t) === i); // (not lineText: a startup file is judged on its own text, not with the whole line as context)
+const textsOf = (ctx) => [ctx.lineText, ...judgedTexts(ctx)].filter((t, i, a) => typeof t === 'string' && a.indexOf(t) === i);
 const assignedOf = (ctx) => {
-  if (ctx.assigned && ctx.assignedFrom === ctx.fullText) return ctx.assigned;
+  const texts = textsOf(ctx);
+  const memo = (ctx.budget.assignedMemo ??= new Map()); // (a text read again at every level: parsed once. Defensive (mutation check): speed only, the verdict is the same without it)
   const out = new Map();
-  for (const t of [ctx.lineText, ctx.fullText]) for (const [n, ws] of assigningDefaults(typeof t === 'string' ? t : '')) out.set(n, [...new Set([...(out.get(n) ?? []), ...ws])]);
-  ctx.assigned = out;
-  ctx.assignedFrom = ctx.fullText;
+  for (const t of texts) {
+    let r = memo.get(t);
+    if (!r) { r = assigningDefaults(t); memo.set(t, r); }
+    for (const [n, ws] of r) out.set(n, [...new Set([...(out.get(n) ?? []), ...ws])]);
+  }
   return out;
 };
 
@@ -1497,7 +1764,7 @@ function checkCandidateScripts(sf, dir, ctx, level) {
   };
   const c = scriptCandidates(sf, { expand, dirs: [here], joinPath: (d, r) => path.resolve(d, r), readDir, ifs: ctx.vars.IFS, assigned: assignedOf(ctx) });
   if (c.over) return deny('too many words, a glob matching too many files, or glob syntax that cannot be resolved could be the script this command runs, so it cannot be verified. Name the script file.');
-  if (c.dynamic && GUARDED_WORDS.test(ctx.fullText)) {
+  if (c.dynamic && judgedTexts(ctx).some((x) => GUARDED_WORDS.test(x))) {
     return deny('which word is the script this command runs is only known at run time ($VAR / $(...) / a glob) and the line mentions a guarded operation, so it cannot be verified. Name the file and write the options literally.');
   }
   for (const file of c.files) {
@@ -1518,12 +1785,19 @@ const STATE_GIT = new Set(['checkout', 'switch', 'branch', 'rebase', 'symbolic-r
 
 // Collects every assignment on the line BEFORE any command is judged. A name assigned more than once, or assigned
 // where it may not run (after && / ||, in a pipeline, a subshell, an if / loop / case), is unsure for the whole line.
-function collectAssignments(cmds, ctx, topLevelLocal = false) {
+function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0, text = null) {
   const counts = new Map();
-  const bump = (k, n) => counts.set(k, (counts.get(k) ?? (k in ctx.vars || ctx.unsureVars.has(k) ? 1 : 0)) + n);
+  const implicit = new Set();
+  const bump = (k, n) => { if (pinsAt(ctx, level)?.has(k)) return; counts.set(k, (counts.get(k) ?? (k in ctx.vars || ctx.unsureVars.has(k) ? 1 : 0)) + n); };
   const from = flowStart(cmds);
   for (const [i, c] of cmds.entries()) {
     const n = mayNotRun(cmds, from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) ? 2 : 1;
+    // Why (#56, a live bypass on main): `for f in run.sh; do bash $f; done` ran run.sh while the guard read `bash $f` as a value from the environment. A loop
+    // variable takes each word of the list in turn (or the positional parameters): it is set on the line, more than once.
+    // A list that is one run-time word (`for p in $(lsof -t …)`) gives the name one value only known at run time, like `P=$(lsof -t …)` (see computedLoopWord;
+    // the walk records it): counted once, so the value is judged where it lands (a script, a directory, a ref) instead of refusing every command it reaches.
+    // Once even where the loop may not run (an empty list, `false && for …`): an unknown value already stands for any value, the one held before included.
+    if (c.argv[0] === 'for' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '')) bump(c.argv[1], computedLoopWord(c) === null ? 2 : 1);
     // builtins that bind a variable without a NAME=value word: its value is whatever was read / parsed at run time
     if (c.argv.length && VALUE_BINDERS.has(baseName(c.argv[0]))) {
       for (const a of c.argv.slice(1)) {
@@ -1531,6 +1805,7 @@ function collectAssignments(cmds, ctx, topLevelLocal = false) {
         if (m) bump(m[1], 2);
       }
     }
+    for (const k of implicitBindsOf(c)) implicit.add(k); // (`read` sets REPLY, `getopts` OPTARG, `[[ =~ ]]` MATCH, `k[0]=`, `$_` …: see implicitBindsOf)
     for (const k of Object.keys(c.env)) if (!sameValue(ctx, k, c.env[k])) bump(k, n);
     if (c.argv.length && VAR_BUILTINS.includes(baseName(c.argv[0]))) {
       // `declare -n X=F` makes X a NAMEREF: $X reads $F at run time, while the text says "F". Unknown, like a binder.
@@ -1544,7 +1819,66 @@ function collectAssignments(cmds, ctx, topLevelLocal = false) {
       for (const k of d.bare) if (odd || d.transform !== null || localHere) bump(k, 2);
     }
   }
+  // (only the ones the line assigns or reads: an unsure name nobody uses changes nothing. `$_` / `status` / RANDOM …, which every command sets, only when
+  // the line assigns them: `$_` in a ruby / perl program word is that program's)
+  // Why (#74): zsh reads `$B:r` / `$B[1,6]` (an unbraced name and a modifier or subscript) as another word than the one expandVars gives (`B=run.sh.x; bash $B:r` runs run.sh).
+  // A name the line assigns and reads so is only known at run time wherever it is used, like one assigned twice; what is built from it is unsure too (unsureVarReachingCommand).
+  for (const k of zshModifiedNames(cmds.flatMap((c) => [...c.argv, ...Object.values(c.env), ...(c.redirects ?? []).map((r) => r.target ?? '')]))) if (counts.has(k) || k in ctx.vars) { bump(k, 2); (ctx.zshNames ??= new Set()).add(k); }
+  if (implicit.size) { const reads = namesReadOn(cmds); for (const k of implicit) if (counts.has(k) || k in ctx.vars || (reads.has(k) && !SHELL_SET_NAMES.includes(k))) bump(k, 2); }
   for (const [k, n] of counts) if (n > 1) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
+  // Why (#81 security follow-up, on main too): the parser reads `$((n=7))` as an assignment but not `$(( n = 7 ))`, `((n++))`, `while ((n++ < 7))`, `$[n=7]`, a `[[ x -eq n=7 ]]` operand, a subscript
+  // (`${a[n=7]}`, `a[n=7]=x`) or a substring offset (`${x:n=3:1}`), and not an append (`n+=7`, `export n+=7`): `n=2; [[ n=7 -eq 7 ]]; bash s$n.sh` ran s7.sh while the guard read s2.sh. A name
+  // such text assigns is unsure, whether or not the line gave it a value (see arithAssignedNames); one that assigns through a name (`(( $m = 7 ))`) may set any name, as an indirect expansion does.
+  const ar = typeof text === 'string' ? arithAssignedNames(text, cmds) : null;
+  if (ar) for (const k of ar.names) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
+  // Why (#56, a live bypass on main): `F=ok.sh; export $N=run.sh; bash $F` ran run.sh when N held F, while the guard judged ok.sh. A binder whose
+  // NAME is only known at run time (export / declare / local / typeset / readonly, read, mapfile, getopts, unset, let, select, printf -v) may set
+  // any variable: every name the line assigns or reads is unknown from here on.
+  // (#56, Codex review of 8b86e2b: zsh `${(P)N::=main}` assigns the variable N names, a bash `${!N…}` reads or sets through it: the same, on main too)
+  if (ar?.dynamic || cmds.some(bindsRunTimeName) || cmds.some((c) => indirectExpansion(c, cmds)) || (cmds.heredocSpans ?? []).some?.((s) => !s[2]) && (typeof text !== "string" || indirectExpansionOnLine(text, cmds))) for (const k of [...Object.keys(ctx.vars), ...namesReadOn(cmds)]) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
+}
+const zshModifiedReason = (n) => `$${n} is followed by \`:\` and a letter or by \`[\` (\`$${n}:r\`, \`$${n}[1,6]\`): zsh reads that as a modifier or a subscript and applies it to the value, so the word it makes is only known at run time. Write the word out, or brace the name (\`\${${n}}:r\`) when the text after it is meant literally.`;
+// A zsh parameter expansion with flags (`${(P)N::=x}` assigns the variable N names) or a bash indirect one (`${!N}`), anywhere in a command's words.
+// (#56 replay of 96848c2: judged on the command's own text, single-quoted parts blanked — a `node -e '…${(x)}…'` program is no expansion; its words, quotes
+// removed, when the text is not there or the line has an unquoted heredoc, whose body expands and is not in the command's text: then the line's whole
+// text being judged is looked at (the line, or the script the guard opened: not ctx.fullText, which is the outer line — `bash run.sh` hid a body in
+// run.sh), unquoted bodies as written; security review of 5188c68)
+const indirectExpansion = (c, cmds) => (typeof c.raw === 'string' && c.raw && !(cmds?.heredocSpans ?? []).some?.((s) => !s[2]) ? indirectExpansionOnLine(c.raw, null) : argvIndirect(c));
+const argvIndirect = (c) => [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')].some((w) => INDIRECT_EXPANSION.test(String(w)));
+// A command that binds a variable whose name is only known at run time (see collectAssignments).
+function bindsRunTimeName(c) {
+  if (!c.argv.length) return false;
+  const nm = baseName(c.argv[0]);
+  const words = c.argv.slice(1);
+  if (VAR_BUILTINS.includes(nm)) return words.some((w) => DYNAMIC.test(w.includes('=') ? w.slice(0, w.indexOf('=')) : w));
+  if (ZSH_NAME_BINDERS.has(nm) || (nm === 'print' && words.some((w) => /^-[A-Za-z]*v/.test(w)))) return true; // (zsh binders whose operands are not read: any name, see ZSH_NAME_BINDERS)
+  if (!VALUE_BINDERS.has(nm)) return false;
+  if (nm === 'printf' && !words.some((w) => /^-[A-Za-z]*v/.test(w))) return false;
+  return words.some((w) => DYNAMIC.test(w));
+}
+// Every `$NAME` / `${NAME…}` the line's words, prefixes and redirections read.
+function namesReadOn(cmds) {
+  const out = new Set();
+  for (const c of cmds) {
+    for (const w of [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')]) {
+      for (const m of String(w).matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)/g)) out.add(m[1]);
+    }
+  }
+  return out;
+}
+
+// Why (#56 replay): `for p in $(lsof -t -i :4000); do ps -p $p; done` was refused once loop variables stopped being read as environment values (about 660
+// lines in 21 days: ps, kill, gh pr view, git log, cp). The single list word, a command substitution, is one value only known at run time, the
+// same as `P=$(lsof -t -i :4000)`, and is judged the same way wherever it lands. Null for any other list: literal words are read one by one (judgeReadings),
+// and several words of which some are computed, a variable (`L=run.sh; for f in $L`: its value is known, and splits), `for f; do` (the positional
+// parameters) or a list with quotes or globs around the expansion stay refused. Where the value lands it is judged like `F=$(cmd)` today: a script picked
+// by it is refused only when the line mentions a guarded operation (scriptFileOf), the same known limit as `bash $(ls *.sh)`.
+// #81: "a single command-substitution word" is what the PARSER says the word is (c.subWords: one substitution covers the whole word, however deep its parentheses, quotes and
+// nested substitutions go), not a pattern over the text. A list that is a split variable (`F=$(cmd); for f in ${=F}`) stays refused, as test/guard-false-positives-56 documents.
+function computedLoopWord(c) {
+  const argv = c.argv;
+  if (argv[0] !== 'for' || argv[2] !== 'in' || argv.length !== 4) return null;
+  return c.subWords?.has(argv[3]) ? argv[3] : null;
 }
 
 // Commands that may be handed an unsure value: they print, compare, count or wait, and run nothing. An ALLOWLIST on purpose
@@ -1568,19 +1902,32 @@ const STATE_HAZARD_CMDS = new Set([
   'zmodload', 'unfunction', 'emulate',
 ]);
 // `set` is everywhere (`set -euo pipefail`); only an option outside these (zsh `set -o autocd`, …) is a hazard.
-const SAFE_SET_ARG = /^(?:[-+][euxvfCo]+|pipefail|errexit|nounset|xtrace|verbose|noglob|noclobber|--)$/;
+// (-a / allexport only exports later assignments: whether an earlier one reaches a command is already unknown to the checks that care, GIT_DIR / GH_REPO)
+const SAFE_SET_ARG = /^(?:[-+][euxvfCoa]+|pipefail|errexit|nounset|xtrace|verbose|noglob|noclobber|allexport|--)$/;
 const isStateHazard = (c) => {
   if (!c.argv.length) return false;
   const nm = baseName(c.argv[0]);
   return STATE_HAZARD_CMDS.has(nm) || (nm === 'set' && c.argv.slice(1).some((a) => !SAFE_SET_ARG.test(a)));
 };
+// (the names of builtins and shells that run a string as shell code in the current shell, or whose string may define what the line later calls; `declare` and the like keep the old answer too)
+// Defensive (mutation check): dropping `eval` here is still caught by the parser's `fns` list and the eval / trap gates in onceAssignedNames.
+// Defensive (mutation check): dropping `trap` here is still caught by the eval / trap gates in onceAssignedNames and the parser's `fns` list.
+const EVALUATES_HERE = new Set(['eval', 'source', '.', 'trap', 'alias', 'unalias', 'builtin', 'command', 'exec', 'fc', 'let', '((', 'mapfile', 'readarray', 'complete', 'bind', 'coproc', 'declare', 'typeset', 'local', 'readonly', 'integer', 'float',
+  'sh', 'bash', 'zsh', 'dash', 'ksh', 'ash', 'fish', 'csh', 'tcsh', 'functions', 'autoload', 'zmodload', 'emulate', 'setopt', 'shopt', 'enable', 'hash', 'printf']);
+// Defensive (mutation check): a dynamic head counted as data is still caught by the eval / trap gates in onceAssignedNames and the parser's `fns` list.
+const readsOnlyData = (c) => dataOnly(c) || (c.argv.length > 0 && !DYNAMIC.test(c.argv[0]) && !EVALUATES_HERE.has(baseName(c.argv[0])) && !(baseName(c.argv[0]) === 'export' && c.argv.some((w) => w.includes('['))));
 const FUNCTION_DEF = /(?:^|[\s;&|(){])(?:function\s+[^\s(){};&|<>]+|[A-Za-z_][\w.:-]*\s*\(\s*\))/;
 // `source` / `.` run a file in THIS shell: it may cd, check out a branch or reassign any variable.
 const SOURCING = ['source', '.'];
 // Why: only unquoted text defines a function: `create function f(uuid)` in a psql -c, `fn()` in a node -e program or a commit message is data. That holds only when every command on the line is
 // one that never evaluates its words in the current shell (external programs and plain builtins below); anything else (eval, a shell, source, trap, mapfile -C, complete -C, bind -x, fc, let / (( )),
 // export / declare / printf -v with a subscript, a name known only at run time, an assignment to PROMPT_COMMAND ...) reads quoted text as code, and so does a heredoc (an apostrophe in its body would unbalance the quotes).
-const DATA_COMMANDS = new Set(['git', 'gh', 'node', 'nodejs', 'python', 'python3', 'deno', 'bun', 'ruby', 'perl', 'cat', 'echo', 'printf', 'grep', 'egrep', 'fgrep', 'rg', 'sed', 'awk', 'jq', 'psql', 'mysql', 'sqlite3', 'npm', 'npx', 'pnpm', 'yarn', 'supabase', 'curl', 'wget', 'ls', 'head', 'tail', 'wc', 'sort', 'uniq', 'cut', 'tr', 'tee', 'diff', 'mkdir', 'rm', 'cp', 'mv', 'touch', 'find', 'date', 'sleep', 'cd', 'pwd', 'true', 'false', 'rsync', 'tar', 'ln', 'chmod', 'open', 'tsc', 'vitest']);
+const DATA_COMMANDS = new Set(['git', 'gh', 'node', 'nodejs', 'python', 'python3', 'deno', 'bun', 'ruby', 'perl', 'cat', 'echo', 'printf', 'grep', 'egrep', 'fgrep', 'rg', 'sed', 'awk', 'jq', 'psql', 'mysql', 'sqlite3', 'npm', 'npx', 'pnpm', 'yarn', 'supabase', 'curl', 'wget', 'ls', 'head', 'tail', 'wc', 'sort', 'uniq', 'cut', 'tr', 'tee', 'diff', 'mkdir', 'rm', 'cp', 'mv', 'touch', 'find', 'date', 'sleep', 'cd', 'pwd', 'true', 'false', 'rsync', 'tar', 'ln', 'chmod', 'open', 'tsc', 'vitest',
+  // (#56 replay: `npx tsx s.mjs` after `cat > s.mjs <<'EOF'` holding `process.cwd()` made the directory unknown: external programs, like the ones above)
+  'tsx', 'ts-node', 'bunx', 'pnpx', 'playwright', 'eslint', 'prettier', 'stat', 'basename', 'dirname', 'realpath', 'readlink', 'cmp', 'du',
+  'shasum', 'sha256sum', 'md5', 'file', 'lsof', 'ps', 'zip', 'unzip', 'gzip',
+  // (shell keywords and test builtins the parser emits as commands: they run no quoted text; `grep "function base" f; for f in *.mjs; do …` was refused)
+  'for', 'do', 'if', 'then', 'elif', 'else', 'while', 'until', 'case', 'select', '!', ':', 'test', '[', 'break', 'continue']);
 const dataOnly = (c) => {
   if (!c.argv.length) return !Object.keys(c.env ?? {}).some((k) => /^(?:PROMPT_COMMAND|PS[0-4]|BASH_ENV|ENV|IFS|PATH|CDPATH)$/.test(k));
   const nm = baseName(c.argv[0]);
@@ -1612,11 +1959,35 @@ function unquotedText(s) {
   }
   return out;
 }
+// Why (#56): a heredoc body is the input of the command it is attached to, and every command here only reads it as data (`cat > fix.mjs <<'EOF'` with a
+// `function rep(a, b)` in the JavaScript): its text is blanked out, at the places the parser read it from, before looking for a definition. Its `$(...)` run in
+// subshells (a function defined there is gone when it ends) and are commands of their own in `cmds`, judged by dataOnly like the rest. A body the parser could
+// not locate in the line (read out of backticks or another text, no terminator) keeps the old answer: a heredoc is a hazard.
+// #81 t8: the parser lists the functions the text really defines (cmds.fns: `f()`, `function f`, zsh `f g ()`, also in an eval string or a script it unwraps), so a `name()` it did not list sits in
+// text that is not shell code here: the argument of an external program (`docker exec db psql -c "select now()"`). Only a command that reads its words as code IN THIS SHELL can make such text
+// a definition (EVALUATES_HERE: eval, source, trap, alias, a shell ... and a name known only at run time); with one of those on the line the old answer stands.
 function definesFunction(str, cmds) {
   if (!FUNCTION_DEF.test(str)) return false;
-  if (/<</.test(str) || !cmds.every(dataOnly)) return true;
-  const u = unquotedText(str);
+  // Defensive (mutation check): without the parser's real function definitions the unquotedText scan still refuses a text that defines a function.
+  if (cmds.fns instanceof Set ? cmds.fns.size > 0 || !cmds.every(readsOnlyData) : !cmds.every(dataOnly)) return true;
+  const text = withoutHeredocBodies(str, cmds);
+  if (text === null) return true;
+  const u = unquotedText(text);
   return u === null || FUNCTION_DEF.test(u);
+}
+// The line with every heredoc body blanked out (same length, newlines kept), or null when a body could not be located (see heredocSpans in shell-parse.mjs).
+function withoutHeredocBodies(str, cmds) {
+  if (!/<</.test(str)) return str;
+  const spans = cmds.heredocSpans;
+  if (!Array.isArray(spans)) return null;
+  let out = '';
+  let at = 0;
+  for (const [a, b] of [...spans].sort((x, y) => x[0] - y[0])) {
+    if (a < at || b > str.length) return null; // (spans that overlap or run past the text: not ours to trust)
+    out += str.slice(at, a) + str.slice(a, b).replace(/[^\n]/g, ' ');
+    at = b;
+  }
+  return out + str.slice(at);
 }
 
 // An unsure variable (assigned more than once, or where it may not run) that reaches a command whose effect may depend on
@@ -1686,7 +2057,393 @@ function subshellsTrusted(cmds) {
   return true;
 }
 
-function evalString(str, startDir, ctx, level) {
+// ---- #56: a variable assigned once, where the assignment may not run ------------------------------------------------------------
+// Why: `cd /wt && F=src/a.ts; sed -n 1,9p $F`, `if …; then S=/x; fi; node a.mjs $S`, `for f in a b; do F=/tmp/$f; node a.mjs $F; done` were refused (about
+// 1,600 lines in 21 days of transcripts) because F "may not be assigned". With ONE assignment of F on the line, every use after it sees one of two values: the
+// assigned text (the assignment ran) or the value the line started with (it did not). Both cases are judged, each as a whole line ("readings"): F pinned to its
+// text, and F never assigned (an unknown value, as for any variable the line does not set). The line is allowed only when every reading is; a guarded use
+// (`git push origin $B`, `bash $F`, `xargs` fed $F) is then judged on the real text in the first reading and as an unknown value in the second, exactly as
+// the rest of the guard judges those. Uniform readings cover the real run only when the uses cannot see different values within one run, so a name qualifies
+// only when: it has exactly one assignment, a bare `F=value` (not a prefix, not in $( ), a pipeline stage or a background job); nothing else on the line can bind
+// it (no read / declare / export / printf -v / for / arithmetic / ${F:=…} / eval / source / function definitions / aliases or traps, no command named at run
+// time); its value does not read itself; and every use comes after the assignment, in the subshells it is in, and outside unquoted heredoc bodies (those expand
+// when their command runs, which may come before). Anything else keeps the denial. At most 4 names (16 readings) per line.
+const MAX_READINGS = 64;
+const varWordRe = (k) => new RegExp(`(?<![A-Za-z0-9_])${k}(?![A-Za-z0-9_])`, 'g');
+const bindWordRe = (k) => new RegExp(`(?<![A-Za-z0-9_]|\\$|\\$\\{)${k}(?![A-Za-z0-9_])`); // (the name, not a `$k` / `${k` read of it)
+// #81: literal loop text beyond LOOP_WORD_IN: what the parser unquoted. No `$` or backtick (an expansion), brace or backslash, and no leading `=` (zsh expands `=cmd`).
+// (A value is substituted as written and never read again, so quotes, `;&|<>` and the like in it do no harm; `eval "$c"` re-reads it exactly as the shell would.) An UNQUOTED word with a character zsh may read as a pattern (`^ # ~ ( ) |`, parser: not in litWords) is not text: refused, as is `~user`. A leading `~/` is the home
+// directory like anywhere else on the line, only when the header holds no quote or backslash (a quoted `"~/x"` is the literal text, and the parser's word does not say which it was).
+// Not here: `*?[` globs (LOOP_WORD_IN, judged as candidates where the word lands).
+// (The `$` test is defence in depth: a word with `$` is routed to the expand reading (`expand` in onceAssignedNames), which loopWordAt refuses unless it works out to plain text.)
+const LOOP_TEXT = /^(?!=)[^$\x60{}\\]*$/;
+function loopTextWord(w, site) {
+  if (!LOOP_TEXT.test(w)) return false;
+  if (w === '~' || w.startsWith('~/')) return !/['"\\]/.test(String(site.raw ?? "'"));
+  // (An unquoted `~user`, `^x` or `*.sh~x` is never in litWords. The pattern test is defence in depth for a script position: scriptFileOf reads such a word as a glob that cannot be resolved and refuses it.)
+  return site.litWords?.has(w) === true || !/[\^#~()|]/.test(w);
+}
+// A loop word the readings follow: literal text (globs included) and `$NAME` / `${NAME}`; what it is worked out to must be literal text (LOOP_WORD).
+// (not a name followed by `[` or `:`: zsh reads `$B[1,6]` as a subscript and `$B:r` as a modifier, where this guard would read text; nor a word that starts
+// with `=`: zsh expands `=cmd` to the path of a command. The name takes every letter that follows: `$BB:r` must not read as `$B` + `B:r`)
+const LOOP_WORD = /^[A-Za-z0-9_@%+=:,./*?[\]-]+$/;
+const LOOP_WORD_IN = /^(?!=)(?:[A-Za-z0-9_@%+=:,./*?[\]-]|\$[A-Za-z_][A-Za-z0-9_]*(?![A-Za-z0-9_[:])|\$\{[A-Za-z_][A-Za-z0-9_]*\}(?![\[:]))+$/;
+// names a shell, git, gh, an interpreter or this guard read for themselves (where they act is not only where the line expands them): never read
+const SPECIAL_NAMES = /^(?:PATH|IFS|HOME|CDPATH|ENV|BASH_ENV|ZDOTDIR|PWD|OLDPWD|SHELL|SHELLOPTS|BASHOPTS|POSIXLY_CORRECT|PS\d|PROMPT_COMMAND|FPATH|MAILPATH|EDITOR|VISUAL|PAGER|TMOUT|HISTFILE|GIT\w*|GH_\w*|BASH\w*|ZSH\w*|LD_\w*|DYLD_\w*|NODE_\w*|NPM_\w*|PYTHON\w*|PERL\w*|RUBY\w*|PIPELINE_\w*|CLAUDE\w*|path|cdpath|fpath|manpath|mailpath|psvar|prompt\w*|precmd\w*|preexec\w*|chpwd\w*|periodic\w*|zshaddhistory\w*|zshexit\w*)$/;
+// #81: the scan in onceAssignedNames counts a bare mention of a name as a possible assignment. These three tell a mention that is provably not one.
+// awk's `-v NAME=value`: the mention follows `-v ` and the same command segment (up to a ; & | or newline) holds the word awk, so NAME= is awk's.
+// Anything else keeps being counted (`sort -v f=1`, `awk … && f=x`, `f=x` after the awk command all stay).
+// (The `-v` and awk-word tests are defence in depth: another layer already holds a real `-v NAME=` binder, `declare -v f=x` is a binder site the parser sees
+// (sites.length !== 1), and every other `-v NAME=` is an argument word. They keep the skip to the one command whose `-v` is known to be awk's.)
+function isAwkVar(text, i) {
+  if (!/(?:^|\s)-v\s+$/.test(text.slice(Math.max(0, i - 40), i))) return false;
+  const before = text.slice(0, i);
+  const seg = before.slice(Math.max(before.lastIndexOf(';'), before.lastIndexOf('&'), before.lastIndexOf('|'), before.lastIndexOf('\n')) + 1);
+  return /(?:^|\s)(?:awk|gawk|mawk|nawk)\s/.test(seg);
+}
+// A name read inside `$(( … ))`. The body must look like arithmetic (operators, numbers, names, parentheses: no `;`, quote, backtick, command
+// substitution, and no two words side by side, which is how `read n` or `echo n` would look inside a `$((cmd); …)` that is really a subshell), and the
+// name must not be assigned, incremented or indexed there (`n=`, `n+=`, `n<<=`, `n**=`, `n++`, `++n`, `n[0]=`).
+const ARITH_ASSIGN_AFTER = /^\s*(?:(?:\*\*|&&|\|\||\^\^|<<|>>|[-+*/%&|^])?=(?!=)|\+\+|--|\[)/;
+function enclosingArith(text, i) {
+  const open = text.lastIndexOf('$((', i);
+  if (open < 0) return null;
+  let depth = 0;
+  for (let j = open + 3; j < text.length; j++) {
+    const c = text[j];
+    if (c === '(') depth++;
+    else if (c === ')') { if (depth > 0) depth--; else return text[j + 1] === ')' && j >= i ? text.slice(open + 3, j) : null; }
+  }
+  return null;
+}
+// (The body and enclosure tests are defence in depth: ARITH_ASSIGN_AFTER and the test for `++` / `--` before the name catch every assignment form, and a binder
+// that takes the name as a word (`read n`) is a site the parser sees. They keep the skip to text that really is arithmetic.)
+function isArithRead(text, i, len) {
+  const body = enclosingArith(text, i);
+  if (body === null) return false;
+  if (!/^[\w\s+\-*/%&|^<>=!?:,()~.${}[\]]*$/.test(body) || /\w\s+\w/.test(body) || /\$\((?!\()/.test(body)) return false;
+  if (ARITH_ASSIGN_AFTER.test(text.slice(i + len)) || /(?:\+\+|--)\s*$/.test(text.slice(0, i))) return false;
+  return true;
+}
+// A bare word of the loop's own list that spells the loop's name (`for f in b c d e f`): the words are what the readings follow, so it is no assignment.
+// The header found in the text must be the site's own (the same words), so quoted text that looks like a header never hides a later `read f`.
+function isLoopListWord(text, i, k, site) {
+  if (site.argv[0] !== 'for' || !/\s$/.test(text.slice(i - 1, i)) || !/^(?:\s|;|$)/.test(text.slice(i + k.length, i + k.length + 1))) return false;
+  const head = new RegExp(`(?:^|[\\s;&|(){])for\\s+${k}\\s+in\\s+([^;\\n]*)`).exec(text);
+  if (!head) return false;
+  const start = head.index + head[0].length - head[1].length;
+  if (i < start || i >= start + head[1].length) return false;
+  // (defence in depth: quoted text is blanked by withoutLiteralText, and every `for NAME` in the text counts as an assignment, so a second header makes the count 2)
+  const words = head[1].trim().split(/\s+/);
+  const mine = site.argv.slice(3);
+  return words.length === mine.length && words.every((w, x) => w === mine[x]);
+}
+// Why (#81 t8): `PSQL=/usr/bin/psql; for f in a b; do $PSQL -At -c "select 1" $f; done` and `S=/x; for n in 1 2; do $S/run.sh $S/m$n.sql; done` switched the readings off for the whole line,
+// because the command word is only known at run time. The word is read only when it is plain text and `$NAME` / `${NAME}` (no quote or backslash around the command, no modifier or subscript),
+// and each name is given by the line itself as literal text: assigned once, before, in the same subshells (a bare `NAME=value`), or by a reading (each of its values literal, none "not set").
+// The resolved first word is then checked like a word written out: not a builtin that binds a name, sources, evals or changes the shell (BIND_HEADS).
+const HEAD_IN = /^(?!=)(?:[A-Za-z0-9_@%+=:,./-]|\$[A-Za-z_][A-Za-z0-9_]*(?![A-Za-z0-9_[:])|\$\{[A-Za-z_][A-Za-z0-9_]*\}(?![\[:]))+$/;
+const HEAD_VALUE = /^[A-Za-z0-9_@%+=:,./ -]*$/;
+const BIND_HEADS = new Set([...SOURCING, 'eval', ...VAR_BUILTINS, ...VALUE_BINDERS, ...STATE_HAZARD_CMDS, 'set', 'builtin', 'command', 'exec', 'coproc', 'fc', 'let', '((', 'for', 'select', 'vared', 'zparseopts', 'print', 'compdef', 'noglob', 'time', 'nohup', 'env', 'xargs']);
+function headResolves(c, cmds, ctx, out, text) {
+  const head = c.argv[0];
+  if (!HEAD_IN.test(head)) return false;
+  // (the command word as written, after the keywords and prefix assignments that may come first in the segment: it is the head itself or the head in double quotes, so no single quote or backslash is in it)
+  const toks = String(c.raw ?? '').trim().split(/\s+/);
+  const wordAt = toks.findIndex((t) => t === head || t === `"${head}"`);
+  if (wordAt < 0 || !toks.slice(0, wordAt).every((t) => /^(?:[A-Za-z_][A-Za-z0-9_]*=\S*|do|then|else|elif|if|while|until|\{|\(|!|&&|\|\||time)$/.test(t))) return false;
+  if (head.includes('/')) return true; // (a program by path is never a builtin)
+  const at = cmds.indexOf(c);
+  const valuesOf = (k) => {
+    const o = out.find((x) => x.k === k);
+    const site = cmds.findIndex((x) => !x.argv.length && Object.hasOwn(x.env ?? {}, k));
+    if (o) {
+      const vals = o.modes.map((m) => (m === 'set' ? (site >= 0 ? cmds[site].env[k] : null) : typeof m === 'object' && !m.expand ? m.val : null));
+      return vals.every((v) => typeof v === 'string' && HEAD_VALUE.test(v)) ? vals : null;
+    }
+    if (ctx.unsureVars.has(k) || ctx.tainted.has(k) || SPECIAL_NAMES.test(k)) return null;
+    if (site < 0) return Object.hasOwn(ctx.vars, k) && HEAD_VALUE.test(ctx.vars[k]) ? [ctx.vars[k]] : null; // (given by an earlier line)
+    const mine = [...text.matchAll(varWordRe(k))].filter((m) => !/\$\{?$/.test(text.slice(Math.max(0, m.index - 2), m.index)));
+    const x = cmds[site];
+    if (mine.length !== 1 || text[mine[0].index + k.length] !== '=' || site > at || x.depth > 0 || ranInSubshell(cmds, site) || !Array.isArray(x.grp) || !Array.isArray(c.grp) || x.grp.some((id, j) => c.grp[j] !== id)) return null;
+    return HEAD_VALUE.test(x.env[k]) ? [x.env[k]] : null;
+  };
+  let words = [head];
+  for (const k of new Set([...head.matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)/g)].map((m) => m[1]))) {
+    const vals = valuesOf(k);
+    if (!vals) return false;
+    words = words.flatMap((w) => [...new Set(vals)].map((v) => w.replace(new RegExp(`\\$(?:\\{${k}\\}|${k}(?![A-Za-z0-9_]))`, 'g'), () => v)));
+    if (words.length > 16) return false;
+  }
+  return words.every((w) => {
+    const nm = baseName(w.trim().split(/\s+/)[0] ?? '');
+    return nm !== '' && !BIND_HEADS.has(nm) && !bindsRunTimeName({ ...c, argv: [nm, ...c.argv.slice(1)] });
+  });
+}
+function onceAssignedNames(cmds, ctx, str) {
+  if (ctx.tainted.size || cmds.truncated || cmds.dynamicOther || definesFunction(str, cmds) || cmds.some(isStateHazard) || !subshellsTrusted(cmds) || indirectExpansionOnLine(str, cmds)) return [];
+  const heads = []; // (#81 t8: the commands named by a variable; each is resolved below, once the readings are known, and judged as the command it names)
+  for (const c of cmds) {
+    if (!c.argv.length) continue;
+    const nm = baseName(c.argv[0]);
+    if (DYNAMIC.test(c.argv[0])) { heads.push(c); continue; }
+    if (SOURCING.includes(nm) || nm === 'eval' || bindsRunTimeName(c)) return [];
+    // Why (#56 replay): only a binder whose NAME is only known at run time may set any name (`export $X=1`, `read $V`); a value that expands
+    // (`export PATH=/x:$PATH`, the first command of many lines) names its target. printf binds only with -v.
+    if (VAR_BUILTINS.includes(nm)) {
+      if (declAttrs(c.argv).unknown || c.argv.slice(1).some((w) => DYNAMIC.test(w.includes('=') ? w.slice(0, w.indexOf('=')) : w))) return [];
+    } else if (VALUE_BINDERS.has(nm) && (nm !== 'printf' || c.argv.some((w) => /^-[A-Za-z]*v/.test(w)))) {
+      if (c.argv.slice(1).some((w) => DYNAMIC.test(w))) return [];
+    }
+  }
+  const ar = arithAssignedNames(str, cmds); // (an arithmetic can assign a name the text scan below does not show. Defence in depth for the skip of ar.names and ar.dynamic below: the mention scan already refuses a name whose assignment it sees, and collectAssignments made the names unsure)
+  if (ar.dynamic) return [];
+  const spans = /<</.test(str) ? cmds.heredocSpans : [];
+  if (!Array.isArray(spans)) return [];
+  const blank = withoutHeredocBodies(str, cmds);
+  const text = blank === null ? null : withoutLiteralText(blank, { dqData: true });
+  if (text === null) return [];
+  const live = spans.filter(([, , quoted]) => !quoted).map(([a, b]) => str.slice(a, b)); // (unquoted bodies: they expand when their command runs)
+  const mentions = (c, k) => {
+    const re = new RegExp(`\\$\\{?${k}(?![A-Za-z0-9_])`);
+    return [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')].some((w) => re.test(String(w)));
+  };
+  const out = [];
+  const modified = zshModifiedNames(cmds.flatMap((c) => [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')])); // (#74: `$k:r` / `$k[1]` is not the value a reading gives k)
+  for (const k of ctx.unsureVars) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k) || SPECIAL_NAMES.test(k) || modified.has(k) || ar.names.has(k)) continue;
+    const sites = [];
+    for (const [i, c] of cmds.entries()) {
+      const nm = c.argv.length ? baseName(c.argv[0]) : '';
+      // (a binder's word binds k when it names k itself: `$k` / `${k…}` there is a value it reads, `printf '%s' $p` without -v binds nothing; #56 replay)
+      const binder = VAR_BUILTINS.includes(nm) || (VALUE_BINDERS.has(nm) && (nm !== 'printf' || c.argv.some((w) => /^-[A-Za-z]*v/.test(w)))) || nm === 'for' || nm === 'select';
+      if (Object.hasOwn(c.env ?? {}, k) || (binder && c.argv.slice(1).some((a) => bindWordRe(k).test(a))) || implicitBindsOf(c).includes(k)) sites.push(i);
+    }
+    // #81 t6: a name that only `for` loops one after another bind (`for n in 1 2; do …; done; for n in 3 4; do …; done`) takes every word of every list (below)
+    const isForSite = (c) => c.argv[0] === 'for' && c.argv[1] === k && c.argv[2] === 'in' && c.argv.length > 3;
+    // (defence in depth for the all-`for` test: loopsInSequence below counts the `for k in` headers, and a binder site is not one, so it refuses the line too)
+    if (sites.length === 0 || (sites.length > 1 && !sites.every((i) => isForSite(cmds[i])))) continue;
+    const s = sites[0];
+    const site = cmds[s];
+    // (every site, not only the first: defence in depth for the later ones, whose bad word the union of the words finds at every use anyway)
+    if (sites.some((i) => cmds[i].depth > 0 || ranInSubshell(cmds, i))) continue;
+    // (every loop in the same subshell as the first: a loop in `( … )` or a pipe stage mixed with one outside it is not read. Defence in depth for the pipe / background loop,
+    // which markClosedOut marks as conditional, so the readings below also hold the unset name; the subshell loop is the case this stops: its value is lost outside it)
+    if (sites.some((i) => !Array.isArray(cmds[i].grp) || cmds[i].grp.length !== site.grp?.length || cmds[i].grp.some((id, j) => id !== site.grp[j]))) continue;
+    // the values it can take: a bare assignment's text (or none: it did not run), or each word of a `for k in …` list
+    let modes;
+    if (!site.argv.length) {
+      if (new RegExp(`\\$\\{?${k}(?![A-Za-z0-9_])`).test(String(site.env[k]))) continue; // (its value reads itself)
+      modes = ['set', 'skip'];
+    } else if (isForSite(site)) {
+      // (each word as written: a glob stands for the files it matches, judged as candidates where the word lands; a word that splits or brace-expands is not read)
+      // Why (#56 replay): `B=app/x && for f in $B/a.ts $B/b.ts` and `for f in "app/[id]/page.tsx"` were refused. A word may also hold `[…]` (a glob class, judged like
+      // `*`) and `$NAME` / `${NAME}`: such a word is worked out when the walk reaches the `for` (loopWordAt), with what is known there. Not when the header holds a
+      // single quote or a backslash (`'$B'` is the text $B, which the argv no longer shows), nor where IFS may be set (ifsMayBeSet: it changes how the value splits).
+      // #81: a word may also be any other literal text the parser has unquoted (a space, parentheses, a `#` or `^`, empty: loopTextWord), and a word that is one command substitution
+      // (site.subWords): its value is only known at run time and is judged where it lands, as `for p in $(…)` alone is (computedLoopWord); the literal words beside it are read one by one.
+      // #81 t6: with several loops the readings are every word of every list (deduplicated), and the unset name when any loop may not run. A use anywhere (in a loop's body,
+      // between the loops, after them) sees a word of one of the lists or the value the name had before, so each is covered; a bad word in ANY list is found at every use
+      // (the same as before for one loop: a union of one). Nothing here depends on which loop a use is in, so a nested loop would be read soundly too; it stays refused (below).
+      const seen = new Map();
+      let mayNot = false;
+      let bad = false;
+      for (const si of sites) {
+        const lp = cmds[si];
+        const words = lp.argv.slice(3);
+        const computed = (w) => lp.subWords?.has(w) === true;
+        const textual = (w) => !computed(w) && !LOOP_WORD_IN.test(w) && loopTextWord(w, lp);
+        if (!words.every((w) => computed(w) || LOOP_WORD_IN.test(w) || textual(w))) { bad = true; break; }
+        const expand = words.some((w) => w.includes('$') && !computed(w));
+        if (expand && (/['\\]/.test(String(lp.raw ?? "'")) || ifsMayBeSet(ctx) || words.some((w) => [...w.matchAll(/\$\{?(\w+)/g)].some((x) => x[1] === k)))) { bad = true; break; }
+        for (const w of words) {
+          const m = w.includes('$') && !computed(w) ? { val: w, expand: true } : { val: w };
+          seen.set((m.expand ? 'x' : 'v') + w, m);
+        }
+        // (#56, Codex review of 8b86e2b: `false && for b in agent/x; do :; done; git push origin $b` pushes the value b had before. Where the loop may not run, or a
+        // word is a glob that may match nothing, the name may also keep that value: one more reading, the name not set by the line)
+        // (the `for` itself carries its own loop mark, so mayNotRun cannot tell; after any earlier loop mark it may sit in an outer loop that runs no time.
+        // For a later loop of the same name that look-back would always find the earlier loop: a loop opened between them is judged by the first loop's look-back and the readings above)
+        const ctl = lp.ctl;
+        if (!ctl || cmds.ctlBroken || cmds.truncated || ctl.cond || ctl.fn || ctl.trap || lp.sep === '&&' || lp.sep === '||' || (si === s && cmds.slice(0, s).some((c) => !c.ctl || c.ctl.loop)) || words.some((w) => /[*?[]/.test(w))) mayNot = true;
+      }
+      if (bad) continue;
+      // loops one after another, none inside another (a nested loop that reuses the name keeps the denial): between two headers every loop opened is closed
+      // (defence in depth: the readings above are sound for a nested loop too; this keeps the refusal that was asked for. A miscount can only refuse more, or read a nested loop soundly.)
+      if (sites.length > 1 && !loopsInSequence(text, k, sites.length)) continue;
+      modes = [...seen.values()];
+      if (mayNot) modes.push('skip');
+    } else continue;
+    if (live.some((b) => varWordRe(k).test(b))) continue;
+    // every mention in the text the shell reads: one assignment, the rest plain references (no ${k:=…} / ${k=…}, no k[…], no other bare word k)
+    let assigns = 0;
+    let odd = false;
+    for (const m of text.matchAll(varWordRe(k))) {
+      const before = text.slice(Math.max(0, m.index - 2), m.index);
+      const after = text.slice(m.index + k.length, m.index + k.length + 2);
+      if (before.endsWith('${')) { if (/^(?::?=|::)/.test(after) || after[0] === '[') odd = true; continue; } // (zsh `${k::=x}` assigns too)
+      if (before.endsWith('$')) { if (after[0] === '[') odd = true; continue; }
+      // (a name right after - . / is part of an option or a path, `ps -p $p`, `cd /tmp/p`: no assignment can start there)
+      // (nor right after a backslash: `\s` / `\n` in a regex, or `\n=x` outside quotes, is text or one word that starts with the backslash. #81)
+      if (/--\s*$/.test(text.slice(Math.max(0, m.index - 40), m.index)) && enclosingArith(text, m.index) !== null) { odd = true; continue; } // ($((--n)) decrements; the `-` below is a path or an option otherwise)
+      if (/[-./\\]$/.test(before)) continue;
+      if (after[0] === '=' && isAwkVar(text, m.index)) continue; // (awk's `-v NAME=value` sets awk's variable, not the shell's. #81)
+      if (isArithRead(text, m.index, k.length)) continue; // (a read inside $(( )); an assignment operator there is not skipped. #81)
+      if (isLoopListWord(text, m.index, k, site)) continue; // (`for f in b c f`: a word of the list. #81)
+      if (after[0] === '=') { assigns++; continue; }
+      if (/(?:^|[\s;&|(){])for\s+$/.test(text.slice(Math.max(0, m.index - 8), m.index)) && site.argv[0] === 'for') { assigns++; continue; } // (the loop's own name)
+      odd = true;
+    }
+    if (odd || assigns !== sites.length) continue;
+    let ok = true;
+    for (const [i, c] of cmds.entries()) {
+      if (sites.includes(i) || !mentions(c, k)) continue;
+      if (i < s || !Array.isArray(c.grp) || site.grp.some((id, j) => c.grp[j] !== id)) { ok = false; break; }
+    }
+    if (ok) out.push({ k, modes });
+  }
+  // #81 t8: a command named by a variable can bind a name or run code in this shell (`X=read; $X f`, `X=eval`) when it is one of those; it is read only when every name in its word
+  // has literal text (one value, or each value of a reading) and no value names such a builtin (a head with a `/` is a program by path, whatever the names hold)
+  if (heads.length && !heads.every((c) => headResolves(c, cmds, ctx, out, text))) return [];
+  // #81 t5: asked for only when the product is over the cap (judgeReadings): which names can be read one group at a time
+  out.split = () => independentReadings(cmds, str, out);
+  return out;
+}
+// #81 t5: the readings of names that cannot meet are counted by SUM (each name's own values with the others at their first), not multiplied. Names meet when one command reads
+// both (also a `for` header, an assignment and the names its value is built from); a command is then judged on its own words and nothing else only when the line holds no
+// command that could run a script or change the state the others are judged in (a script may read any name the line has set; a write may be the script a later command runs;
+// cd and git / gh state). So every command of the line must be a bare assignment or a plain tool named without a path that the guard does not open as a script: a builtin
+// that only reads or tests (UNSURE_OK) or a tool that only runs a program elsewhere (OPAQUE_TOOLS: docker, npm, ps …). Anything else gives null: the product, as before.
+// Null also when a name is not plainly a group member of its own; the groups come as arrays of indexes into `names`.
+const OPAQUE_TOOLS = new Set(['npm', 'npx', 'docker', 'supabase', 'psql', 'ps', 'lsof', 'pgrep', 'pidof', 'kill', 'rm', 'mkdir', 'touch', 'cp', 'mv', 'du', 'df', 'file', 'shasum', 'diff', 'cmp', 'uname', 'whoami', 'hostname', 'id', 'wait']);
+function independentReadings(cmds, str, names) {
+  for (const c of cmds) {
+    if (!c.argv.length) continue;
+    const head = c.argv[0];
+    if (typeof head !== 'string' || DYNAMIC.test(head) || head.includes('/') || !(UNSURE_OK.has(head) || OPAQUE_TOOLS.has(head))) return null;
+    if (VAR_BUILTINS.includes(head) || VALUE_BINDERS.has(head)) continue; // (a binder is a site of the name it binds: it joins the group below)
+    if (splicesOptions(c.argv) || scriptFileOf(c.argv, c.raw, str) !== null) return null; // (defence in depth: none of these names opens a script; the readings of a script are never split)
+  }
+  const parent = names.map((_, i) => i);
+  const find = (i) => { while (parent[i] !== i) i = parent[i] = parent[parent[i]]; return i; };
+  const reads = names.map(({ k }) => new RegExp(`\\$\\{?${k}(?![A-Za-z0-9_])`));
+  const bare = names.map(({ k }) => varWordRe(k));
+  for (const c of cmds) {
+    const text = [c.raw ?? '', ...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')].join('\n');
+    // (a name read as `$k` / `${k…}`; as a bare word only where the shell reads a bare word as a name -- arithmetic, `[[ ]]`, `let`, a subscript -- or binds it: a `for` / binder word, a prefix assignment.
+    // Elsewhere a bare `p` is a flag (`ps -p`), not the name.)
+    const nm = c.argv.length ? c.argv[0] : '';
+    const bareOk = /\(\(|\[|\blet\b/.test(text);
+    const binds = nm === 'for' || nm === 'select' || VAR_BUILTINS.includes(nm) || VALUE_BINDERS.has(nm);
+    let first = -1;
+    for (let i = 0; i < names.length; i++) {
+      const { k } = names[i];
+      if (!reads[i].test(text) && !(bareOk && bare[i].test(text)) && !(binds && c.argv.slice(1).some((a) => bare[i].test(a))) && !Object.hasOwn(c.env ?? {}, k) && !implicitBindsOf(c).includes(k)) continue;
+      if (first < 0) first = i; else parent[find(i)] = find(first);
+    }
+  }
+  const groups = new Map();
+  for (let i = 0; i < names.length; i++) { const r = find(i); groups.set(r, [...(groups.get(r) ?? []), i]); }
+  return [...groups.values()];
+}
+// #81 t6: the `for NAME in` headers in the (quote-blanked) text are `count` in number and each one's loop is closed before the next opens
+function loopsInSequence(text, k, count) {
+  const heads = [...text.matchAll(new RegExp(`(?:^|[\\s;&|(){])for\\s+${k}\\s+in(?=\\s)`, 'g'))].map((m) => m.index + m[0].indexOf('for'));
+  if (heads.length !== count) return false;
+  const opens = /(?:^|[\s;&|(){])(?:for|while|until|select|repeat|foreach)(?=\s|$)/g;
+  const closes = /(?:^|[\s;&|(){])done(?=[\s;&|(){}]|$)/g;
+  for (let j = 0; j + 1 < heads.length; j++) {
+    const seg = text.slice(heads[j] - 1 < 0 ? 0 : heads[j] - 1, heads[j + 1]);
+    if ((seg.match(opens) ?? []).length !== (seg.match(closes) ?? []).length) return false;
+  }
+  return true;
+}
+// A reading's loop word that holds `$NAME` gets its value where the `for` runs (every use of the loop name comes after it): the names it reads must be known
+// there and give literal text, else the reading is refused. Null when the value is set.
+function loopWordAt(k, ctx) {
+  const v = expandVars(ctx.pins.get(k).val, ctx);
+  if (v.includes('$') || !LOOP_WORD.test(v)) return deny(`$${k} takes a loop word built from a variable whose value is not known here (or is not plain text), so its value at run time cannot be verified. Rewrite: write the loop words out.`);
+  ctx.vars[k] = v;
+  return null;
+}
+// Judges the line once per reading of the names (each assignment ran, or did not); the first denial wins. Null when there is nothing to read.
+// #81: also for a script the guard opened (evalString's `child`: a shell of its own), whose text is read like a line of its own: a loop in the script, a name it assigns once.
+// (The line's own names reach it as they are: a name the script assigns once is then judged both ways too, so a collision with the line's loop name (`for n in 1 2; do bash brief.sh $n; done`
+// with `n=$2` in brief.sh) is read by the same readings. A name the line exports reaches the script, one it does not export may not; the script is judged as if all did, the stricter way.)
+// What the script leaves behind for the text that ran it is the union of its readings: a branch, an alias or a config the readings leave differently is unknown, as for a candidate script
+// (defence in depth: a name that reaches a git command is refused as unsure in the reading where its assignment did not run, so the readings do not leave different states in practice).
+function judgeReadings(str, startDir, ctx, level, names, saved) {
+  if (pinsAt(ctx, level) || names.length === 0) return null;
+  // each reading is one mode per name. Names that cannot meet (independentReadings) are read a group at a time, the others at their first mode: the sum of the groups' sizes
+  // (each at most the cap, the sum too) instead of their product; else every combination of all of them, at most the cap
+  let plan = null;
+  const product = (idx) => idx.reduce((n, i) => n * names[i].modes.length, 1);
+  const all = names.map((_, i) => i);
+  if (product(all) > MAX_READINGS) {
+    const groups = names.split?.();
+    // (the per-group test is defence in depth: a group over the cap makes the sum over the cap too)
+    if (!groups || groups.length < 2 || groups.some((g) => product(g) > MAX_READINGS) || groups.reduce((n, g) => n + product(g), 1 - groups.length) > MAX_READINGS) return null;
+    plan = [];
+    groups.forEach((g, gi) => {
+      for (let r = gi === 0 ? 0 : 1; r < product(g); r++) {
+        const pick = names.map(() => 0);
+        let rest = r;
+        for (const i of g) { pick[i] = rest % names[i].modes.length; rest = Math.floor(rest / names[i].modes.length); }
+        plan.push(pick);
+      }
+    });
+  }
+  const total = plan ? plan.length : product(all);
+  const outer = [ctx.pins, ctx.pinsLevel];
+  let dirty = false;
+  let envDirty = false;
+  const moved = new Set(); // (directories whose branch some reading left different from the start; alias keys likewise: see below)
+  const redefined = new Set();
+  try {
+    for (let r = 0; r < total; r++) {
+      checkDeadline(ctx.budget);
+      countReading(ctx.budget); // (the readings of the whole evaluation, nested scripts included, share one allowance)
+      restoreLineState(ctx, saved);
+      ctx.pinsLevel = level;
+      ctx.pins = new Map();
+      let rest = r;
+      for (const [x, { k, modes }] of names.entries()) {
+        const m = plan ? modes[plan[r][x]] : modes[rest % modes.length];
+        rest = Math.floor(rest / modes.length);
+        ctx.pins.set(k, m);
+        if (typeof m === 'object') ctx.vars[k] = m.val; // (a loop variable: every use comes after the `for`, so it holds the word from the start)
+      }
+      const v = evalString(str, startDir, ctx, level);
+      if (v.decision === 'deny') return v;
+      dirty ||= ctx.cfgDirty;
+      envDirty ||= ctx.envCfgDirty;
+      // (t4 state-union, security review: the end state of EVERY reading is compared with the start, not only the last one's: a branch or alias an earlier reading changed
+      // and the last did not would stay known. The readings are alternatives, so whatever any of them changed is unknown afterwards.)
+      for (const d of new Set([...saved.branches.keys(), ...ctx.branches.keys()])) {
+        const a = saved.branches.get(d);
+        const b = ctx.branches.get(d);
+        if (a?.name !== b?.name || a?.trackMain !== b?.trackMain) moved.add(d);
+      }
+      for (const [kind, now] of [['git', ctx.gitAliases], ['gh', ctx.ghAliases]]) {
+        const was = saved[kind === 'git' ? 'gitAliases' : 'ghAliases'];
+        for (const n of new Set([...Object.keys(was), ...Object.keys(now)])) if (was[n] !== now[n]) redefined.add(`${kind}:${n}`);
+      }
+    }
+    if (level > 0 && total > 1) {
+      // (config is only ever set; a branch or alias that differs from the state the script started with, in any reading, may or may not have changed)
+      // (the alias part is defence in depth: the candidate-script comparison (spec.git vs ctx.gitAliases) makes a redefined alias unsure as well)
+      ctx.cfgDirty = dirty;
+      ctx.envCfgDirty = envDirty;
+      for (const d of moved) ctx.branches.set(d, { name: null, trackMain: false });
+      for (const a of redefined) ctx.aliasUnsure.add(a);
+    }
+    return allowed();
+  } finally {
+    [ctx.pins, ctx.pinsLevel] = outer;
+  }
+}
+
+function evalString(str, startDir, ctx, level, child = false) {
   checkDeadline(ctx.budget);
   if (level > MAX_NESTING) return deny('pipeline job start / alias is nested too deeply to verify.');
   const cmds = simpleCommands(str, { env: ctx.env, bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline }); // a scan that outlasts the deadline gives up: truncated, so denied
@@ -1694,14 +2451,20 @@ function evalString(str, startDir, ctx, level) {
   // 500 `true;` must not slip through on a word match).
   if (cmds.truncated) return deny('command too complex to verify (the parser gave up). Split it into simpler commands.');
   if (cmds.dynamic && GUARDED_WORDS.test(str)) {
-    return deny('the command that runs is only known at run time ($VAR / $(...) / piped into a shell) and the line mentions a guarded operation, so it cannot be verified. Write the command out literally.');
+    return deny('the command that runs is only known at run time ($VAR / $(...) / piped into a shell) and the line mentions a guarded operation, so it cannot be verified. Rewrite: write the command out literally (`git push origin agent/x`, not `$G push` or `... | sh`); if the guarded words are only text (a commit message, a PR body), put that text in a file (`git commit -F msg.txt`, `gh pr create --body-file body.md`).');
   }
   // A variable whose value is not certain (see collectAssignments) denies the line when it reaches git / gh, a command
   // that runs code, cd / pushd / popd or a command name: the checks below read the expanded text.
-  collectAssignments(cmds, ctx, !definesFunction(str, cmds));
+  const saved = (level === 0 || child) && !pinsAt(ctx, level) ? lineState(ctx) : null; // (the state before this line's assignments: each reading starts from it)
+  collectAssignments(cmds, ctx, !definesFunction(str, cmds), level, str);
   if (ctx.unsureVars.size || ctx.tainted.size) {
     const unsure = unsureVarReachingCommand(cmds, ctx);
-    if (unsure !== null) return deny(`$${unsure} is assigned more than once (or where it may not run) on this line, so its value at run time cannot be verified. Assign it once, unconditionally.`);
+    if (unsure !== null) {
+      const read = saved && judgeReadings(str, startDir, ctx, level, onceAssignedNames(cmds, ctx, str), saved);
+      if (read) return read;
+      if (ctx.zshNames?.has(unsure)) return deny(zshModifiedReason(unsure));
+      return deny(`$${unsure} is assigned more than once (or where it may not run) on this line, so its value at run time cannot be verified. Rewrite: assign it once, as the first command of the line (\`${unsure}=value; …\`), or write the value out where it is used.`);
+    }
   }
   let dir = startDir;
   const cdp = cdpathMaybe(cmds, ctx);
@@ -1770,7 +2533,7 @@ function evalString(str, startDir, ctx, level) {
     }
     frame.i = i;
     dirAt.set(i, dir);
-    if (!argv.length) { recordVars(c.env, ctx, level); continue; } // a bare `NAME=value`
+    if (!argv.length) { recordAssigned(c, ctx, level); continue; } // a bare `NAME=value`
     const name = baseName(argv[0]);
     let verdict = null;
     if (VAR_BUILTINS.includes(name)) {
@@ -1779,17 +2542,23 @@ function evalString(str, startDir, ctx, level) {
         // (a value that still holds a `$` is not worked out: the case change would apply to what it expands to)
         if (d.transform && DYNAMIC.test(v)) { delete ctx.vars[k]; ctx.unsureVars.add(k); } else setVar(ctx, k, applyTransform(v, d.transform), level);
       }
-    } else if (name === 'cd' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name, argv, ctx, cdp, c.env ?? {});
+    } else if (name === 'for' && pinsAt(ctx, level)?.get(argv[1])?.expand) verdict = loopWordAt(argv[1], ctx);
+    else if (name === 'for' && computedLoopWord(c) !== null) setVar(ctx, argv[1], computedLoopWord(c), level);
+    else if (name === 'cd' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name, argv, ctx, cdp, c.env ?? {});
     else if (name === 'git' || name === 'gh') {
       const unsure = unsureVarUsed([...argv.slice(1), ...Object.values(c.env)], ctx);
-      if (unsure !== null) verdict = deny(`$${unsure} was assigned more than once on this line, so its value (and what this ${name} command does with it) cannot be verified. Assign it once, or write the value out.`);
+      if (unsure !== null && ctx.zshNames?.has(unsure)) verdict = deny(zshModifiedReason(unsure));
+      else if (unsure !== null) verdict = deny(`$${unsure} was assigned more than once on this line, so its value (and what this ${name} command does with it) cannot be verified. Assign it once, or write the value out.`);
       else verdict = name === 'git' ? checkGit(argv, c.env, dir, ctx, c.raw ?? '') : checkGh(argv, c.env, dir, ctx, c.raw ?? '');
     }
     else {
       for (const inner of jobStartCommands(argv, ctx) ?? []) {
-        const v = evalString(inner, dir, ctx, level + 1);
+        // Why (#58 round 3): the job runs in THIS command's environment, so its prefix (`GH_REPO=o/chat … job start m -- gh pr merge 8`) names the
+        // merge's repository exactly as it would for the merge typed directly.
+        const v = withPrefixEnv(c, ctx, () => evalString(inner, dir, ctx, level + 1));
         if (v.decision === 'deny') { verdict = v; break; }
       }
+      if (!verdict) verdict = withPrefixEnv(c, ctx, () => repoMergeCommandVerdict(argv, dir, ctx)); // (#58; with its prefix: `npm_config_prefix=/chat npm run merge …`)
       if (!verdict) {
         // a string or program text the parser cannot unwrap (node -e, osascript, make CMD=...) that carries a guarded command
         const why = catchAllReason(argv);
@@ -1880,12 +2649,13 @@ function evaluateGitOnce(command, {
   realpath = realpathSync.native, // symlinks followed when a write and a script are compared (tests fake it)
   now = Date.now, // injectable clock (tests)
   env = {}, // the hook process's environment (BASH_ENV / ENV / ZDOTDIR name startup files the shells run); {} keeps tests hermetic
+  ownerGo = null, // #58: { mode(dir), mergeTemplates(dir), approvedHead(pr, head) } (git-wiring.mjs ownerGoWiring); null = no direct-merge check
 } = {}, bashState) {
   const text = typeof command === 'string' ? command : String(command ?? '');
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   const base = cwd || process.cwd();
   const ctx = {
-    cwd: base, home, currentBranch, pushDestination, issueLabels, readText, pathExists, readDir, readHead, realpath, env, budget: bashState?.carry ? { ...bashState.carry, startupOk: new Set(), startupFx: undefined } : newEvalBudget(now), fullText: text, lineText: text,
+    cwd: base, home, currentBranch, pushDestination, issueLabels, ownerGo, readText, pathExists, readDir, readHead, realpath, env, budget: bashState?.carry ? { ...bashState.carry, startupOk: new Set(), startupFx: undefined } : newEvalBudget(now), fullText: text, lineText: text,
     vars: Object.create(null), unsureVars: new Set(), tainted: new Set(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
     branches: new Map(), cfgDirty: false, envCfgDirty: false, writeFrames: [], bashState,
   };

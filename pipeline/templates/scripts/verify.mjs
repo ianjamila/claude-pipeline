@@ -4,6 +4,8 @@
 //   node scripts/verify.mjs                full run: every step, in order, stop at the first failure
 //   node scripts/verify.mjs --quick        only steps marked quick:true (using quickCmd when a step has one)
 //   node scripts/verify.mjs --only a,b     just those steps (report mode "partial"; never a substitute for a full run)
+//   node scripts/verify.mjs --defer a,b    full run, but steps a,b are NOT run: reported skipped with skipKind "ci" (final-gate then needs a
+//                                          GitHub CI proof for them; only steps in verify.deferrable_steps with a verify.ci_proof entry)
 //   node scripts/verify.mjs --list         print the steps
 // Writes .verify/report.json (+ .verify/logs/<step>.log). Exit 0 all passed (or skipped), 1 a step failed, 2 refused or usage error.
 // Safety: it refuses to run at all when a database variable (NEXT_PUBLIC_SUPABASE_URL, SUPABASE_URL, DATABASE_URL,
@@ -35,7 +37,7 @@ const PROJECT = 'my-app'; // must match `project:` in .claude/pipeline.yml (name
 // skipIf    function({ cwd, env, git, mode }) -> null | { run: true, reason } | { run: false, reason, log? }:
 //           consulted ONLY in a FULL run (never --quick or --only), after the env checks. null runs the step; `{ run: true,
 //           reason }` also runs it but records `skipCheck: <reason>`. `{ run: false, reason }` skips it: the row becomes
-//           status 'skipped' + skipReason (final-gate then accepts it only if the step is listed in verify.skippable_steps),
+//           status 'skipped' + skipKind 'local' + skipReason (final-gate then accepts it only if the step is listed in verify.skippable_steps),
 //           and `log` (default: the reason) is written to .verify/logs/<step>.log. `git` is the report's git block. It must
 //           fail closed: a throw or any other answer runs the step and records `skipCheck: skip check failed: <why>`.
 const STEPS = [
@@ -229,12 +231,20 @@ export async function runVerify(opts = {}) {
 
   let values;
   try {
-    ({ values } = parseArgs({ args: argv, options: { quick: { type: 'boolean' }, only: { type: 'string' }, list: { type: 'boolean' } }, allowPositionals: false, strict: true }));
+    ({ values } = parseArgs({ args: argv, options: { quick: { type: 'boolean' }, only: { type: 'string' }, defer: { type: 'string', multiple: true }, list: { type: 'boolean' } }, allowPositionals: false, strict: true }));
     validateSteps(steps);
     if (values.only !== undefined) {
       const known = new Set(steps.map((s) => s.name));
       const unknown = values.only.split(',').map((s) => s.trim()).filter((s) => s && !known.has(s));
       if (unknown.length > 0 || values.only.trim() === '') throw new UsageError(`unknown step(s): ${unknown.join(', ') || '(none given)'}. Steps: ${[...known].join(', ')}`);
+    }
+    if (values.defer !== undefined) {
+      const known = new Set(steps.map((s) => s.name));
+      const named = values.defer.flatMap((v) => v.split(',')).map((x) => x.trim());
+      const unknown = named.filter((x) => x && !known.has(x));
+      if (named.length === 0 || named.some((x) => !x) || unknown.length > 0) throw new UsageError(`--defer: unknown or empty step name(s): ${unknown.join(', ') || '(none given)'}. Steps: ${[...known].join(', ')}`);
+      // A deferred step is only meaningful in a full run: --quick / --only reports are never accepted by final-gate anyway.
+      if (values.quick || values.only !== undefined) throw new UsageError('--defer applies to a full run only (not with --quick or --only)');
     }
   } catch (e) {
     warn(`verify: ${e.message}`);
@@ -253,11 +263,23 @@ export async function runVerify(opts = {}) {
     warn(`verify: no steps selected for mode ${mode}`);
     return { exitCode: 2, report: null };
   }
+  const deferNames = values.defer === undefined ? [] : [...new Set(values.defer.flatMap((v) => v.split(',')).map((x) => x.trim()))];
   const commandOf = (s) => (values.quick && s.quickCmd ? s.quickCmd : s.cmd);
 
   const loaded = await loadConfig(cwd);
   if (!loaded.ok) warn(`verify: ignoring unusable .claude/pipeline.yml (${loaded.errors.join('; ')}); using defaults`);
   const config = loaded.ok ? loaded.config : null;
+  // --defer: each step must be one the repo's own config lets CI vouch for (verify.deferrable_steps) and say where (verify.ci_proof).
+  // The reason names that workflow and job; final-gate reads the authoritative copy from the base branch.
+  const deferred = new Map();
+  for (const name of deferNames) {
+    const spec = config?.verify?.deferrable_steps?.includes(name) ? config.verify.ci_proof?.[name] : undefined;
+    if (!spec) {
+      warn(`verify: --defer ${name}: not allowed: list it in verify.deferrable_steps with a verify.ci_proof entry in .claude/pipeline.yml`);
+      return { exitCode: 2, report: null };
+    }
+    deferred.set(name, `deferred to CI (${spec.workflow}#${spec.job})`);
+  }
   const reportFile = resolve(cwd, config?.verify?.report ?? '.verify/report.json');
   const logsDir = join(cwd, '.verify', 'logs');
   const lockName = (group) => `${group}-${slug(config?.project ?? basename(cwd))}`;
@@ -305,6 +327,16 @@ export async function runVerify(opts = {}) {
     // One step. Returns true to continue, false to stop (failure).
     async function runStep(s) {
       const r = row(s);
+      if (deferred.has(s.name)) { // not run here at all: not even its env function, skipIf or db lock work
+        const t1 = Date.now();
+        r.status = 'skipped';
+        r.skipKind = 'ci';
+        r.skipReason = deferred.get(s.name);
+        writeFileSync(join(logsDir, `${s.name}.log`), `skipped: ${r.skipReason}\n`);
+        r.durationMs = Date.now() - t1;
+        say(`[skip] ${s.name} (${r.skipReason})`);
+        return true;
+      }
       const stepEnv = typeof s.env === 'function' ? await s.env() : (s.env ?? {});
       const badNow = [...nonLocalDb({ ...env, ...stepEnv }), ...nonLocalEnvFiles(fileDefs, { ...env, ...stepEnv })];
       if (badNow.length > 0) throw new Refused(refusal(badNow, `step ${s.name}'s env`));
@@ -330,6 +362,7 @@ export async function runVerify(opts = {}) {
       if (skip) {
         const t1 = Date.now();
         r.status = 'skipped';
+        r.skipKind = 'local';
         r.skipReason = skip.reason.trim();
         writeFileSync(join(logsDir, `${s.name}.log`), skip.log ?? `skipped: ${r.skipReason}\n`);
         r.durationMs = Date.now() - t1;
@@ -358,8 +391,11 @@ export async function runVerify(opts = {}) {
 
     let stopped = false;
     for (const seg of segmentsOf(selected)) {
-      if (!seg.group) {
-        stopped = !(await runStep(seg.steps[0]));
+      if (!seg.group || seg.steps.every((x) => deferred.has(x.name))) { // no lock for a group whose steps are all deferred (none of them runs)
+        for (const x of seg.steps) {
+          stopped = !(await runStep(x));
+          if (stopped) break;
+        }
       } else {
         let lastNote = -Infinity;
         try {

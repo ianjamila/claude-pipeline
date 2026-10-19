@@ -39,14 +39,21 @@ export function guardedCommandText(text) {
   return null;
 }
 
+const COMMIT_CLUSTER_VALUE = /^-[aqsvnezSu]+m$/;
+const COMMIT_CLUSTER_ATTACHED = /^-[aqsvnezSu]+m./;
 // The words of `argv` that are not the value of a message-like flag.
-export function dataLessArgs(args) {
+// `commit`: the command is a git commit, whose boolean flags may come in front of the message flag in one word (-qm TEXT, -am TEXT, -qam"TEXT"): the text is a message too, hidden exactly like -m's
+// (one word; a substitution in it is judged on its own, as for -m). Any other command keeps only the spellings above.
+export function dataLessArgs(args, commit = false) {
   const out = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     const name = a.split('=')[0];
     if (MESSAGE_FLAGS.has(name)) { if (!a.includes('=')) i++; continue; }
     if (/^-[mtFbn].+/.test(a) && !a.startsWith('--') && MESSAGE_FLAGS.has(a.slice(0, 2))) continue; // -m"text", -tpattern
+    // #81 t11: git's own boolean flags in front of the message flag (`git commit -qm TEXT`, `-am TEXT`, `-qam"TEXT"`): the text is a message too
+    if (commit && COMMIT_CLUSTER_VALUE.test(a)) { i++; continue; }
+    if (commit && COMMIT_CLUSTER_ATTACHED.test(a)) continue;
     out.push(a);
   }
   return out;

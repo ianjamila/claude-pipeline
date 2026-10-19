@@ -7,6 +7,7 @@
 // The file system is faked (like test/guard-git.test.mjs and test/guard-files-bypass.test.mjs); the guarded text only
 // ever lives in fake file contents.
 import { test } from 'node:test';
+import { cpuTimed } from './helpers/timing.mjs';
 import assert from 'node:assert/strict';
 import { resolve, dirname, basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -616,14 +617,15 @@ test('G5: a ] that was escaped or quoted inside a bracket reaches the guard as a
 
 test('G5: many brackets in one segment stay cheap and fail closed', () => {
   const seg = '[a]b]'.repeat(30);
-  const t0 = Date.now();
-  denyBoth(`bash ${seg}.sh`, { [`${'x'.repeat(30)}.sh`]: 'bad' }); // matched through the 30 "one char" readings
-  allowBoth(`bash ${seg}.sh`, { 'zz.sh': 'ok', [`${'x'.repeat(31)}.sh`]: 'ok' });
-  const names = Object.fromEntries(Array.from({ length: 200 }, (_, i) => [`${'a'.repeat(40)}${i}.sh`, 'ok']));
-  // (the work cap may refuse this one; what matters is that it is quick and never throws)
-  const r = both(`bash ${'[a]*]'.repeat(30)}z.sh`, names);
-  assert.ok(['allow', 'deny'].includes(r.git.decision) && ['allow', 'deny'].includes(r.files.decision));
-  assert.ok(Date.now() - t0 < 3000, `took ${Date.now() - t0} ms`);
+  const { ms } = cpuTimed(() => {
+    denyBoth(`bash ${seg}.sh`, { [`${'x'.repeat(30)}.sh`]: 'bad' }); // matched through the 30 "one char" readings
+    allowBoth(`bash ${seg}.sh`, { 'zz.sh': 'ok', [`${'x'.repeat(31)}.sh`]: 'ok' });
+    const names = Object.fromEntries(Array.from({ length: 200 }, (_, i) => [`${'a'.repeat(40)}${i}.sh`, 'ok']));
+    // (the work cap may refuse this one; what matters is that it is quick and never throws)
+    const r = both(`bash ${'[a]*]'.repeat(30)}z.sh`, names);
+    assert.ok(['allow', 'deny'].includes(r.git.decision) && ['allow', 'deny'].includes(r.files.decision));
+  });
+  assert.ok(ms < 3000, `took ${Math.round(ms)} ms of CPU`);
 });
 
 // ---- round 5: a file whose name holds $ or a backtick ----------------------------------------------------------------
@@ -652,7 +654,7 @@ test('G6: a quoted or escaped $ / backtick in a file name is also tried as a lit
 
 test('G7: a huge or pathological glob segment is refused quickly, and a directory read that throws is refused', () => {
   const names = Object.fromEntries(Array.from({ length: 50 }, (_, i) => [`${'a'.repeat(200)}${i}.sh`, 'ok']));
-  const time = (fn) => { const t0 = Date.now(); const r = fn(); return { r, ms: Date.now() - t0 }; };
+  const time = cpuTimed; // CPU ms, not wall: a loaded machine must not trip the cap
   const cmds = [
     `bash ${'[a]*'.repeat(1250)}.sh`, // 5,000 characters: longer than any real segment
     `bash ${'*'.repeat(5000)}.sh`,
@@ -663,7 +665,7 @@ test('G7: a huge or pathological glob segment is refused quickly, and a director
     const { r, ms } = time(() => both(c, names));
     assert.equal(r.git.decision, 'deny', `git: ${c.slice(0, 30)}`);
     assert.equal(r.files.decision, 'deny', `files: ${c.slice(0, 30)}`);
-    assert.ok(ms < 1500, `${c.slice(0, 30)} took ${ms} ms`);
+    assert.ok(ms < 1500, `${c.slice(0, 30)} took ${Math.round(ms)} ms of CPU`);
   }
   // an ordinary segment is untouched by the caps
   allowBoth('bash a*b?.sh', { 'ok.sh': 'ok' });

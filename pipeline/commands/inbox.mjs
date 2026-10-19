@@ -98,6 +98,15 @@ function localFacts({ root, prs, warnings }) {
   return { perPr, worktrees };
 }
 
+// Merge conflicts as the classifier sees them: git's trial merge when it ran (it wins), else what GitHub computed
+// (--no-git, git < 2.38, a failed fetch); null when neither knows.
+function conflictsFact(gitConflicts, mergeable) {
+  if (gitConflicts !== null && gitConflicts !== undefined) return gitConflicts;
+  if (mergeable === 'CONFLICTING') return true;
+  if (mergeable === 'MERGEABLE') return false;
+  return null;
+}
+
 // The classifier's view of one PR's local state: null when this machine holds nothing for the branch.
 function localForClassifier(s, branch) {
   if (!s || (s.state === 'none' && s.worktrees.length === 0)) return null;
@@ -138,7 +147,7 @@ export const run = guarded(async (argv, ctx) => {
       const ci = ciInfo.status;
       const classified = classifyPr({
         number: p.number, title: p.title, isDraft: p.isDraft, labels: p.labels, headRefOid: p.headRefOid,
-        isCrossRepository: p.isCrossRepository, baseRefName: p.baseRefName, ci, ciFailed: ciInfo.failed, conflicts: g.conflicts, alreadyOnBase: g.alreadyOnBase,
+        isCrossRepository: p.isCrossRepository, baseRefName: p.baseRefName, ci, ciFailed: ciInfo.failed, conflicts: conflictsFact(g.conflicts, p.mergeable), alreadyOnBase: g.alreadyOnBase,
         record: a.record, recordStatus: a.recordStatus, triage: a.triage, contentHash: g.contentHash,
         needsHumanReason: a.needsHumanReason, needsHumanHardStopOnly: a.needsHumanHardStopOnly,
         activity: { commitDate: p.commitDate, commentUpdatedAts: a.commentUpdatedAts, reviewDates: p.reviewDates, createdAt: p.createdAt },

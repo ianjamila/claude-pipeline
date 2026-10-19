@@ -6,7 +6,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import { toPosix } from './paths.mjs';
+import { canonicalPath, toPosix } from './paths.mjs';
+
+// Kept exported from here: callers have imported it from the installer.
+export { canonicalPath };
 
 export const SKILLS = ['ship', 'verify', 'pipeline-setup'];
 export const AGENTS = ['implementer', 'verifier', 'judge', 'arbiter'];
@@ -18,8 +21,10 @@ export const GUARD_GIT_MATCHER = 'Bash|PowerShell|Monitor|mcp__.*';
 export const GUARD_FILES_MATCHER = 'Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|Monitor|mcp__.*';
 export const HOOK_TIMEOUT_S = 15;
 export const SESSION_HOOK_TIMEOUT_S = 10;
-// The events whose hooks this installer manages: guard hooks on PreToolUse, the version-status hook on SessionStart.
-const HOOK_EVENTS = ['PreToolUse', 'SessionStart'];
+export const OWNER_GO_TIMEOUT_S = 10;
+// The events whose hooks this installer manages: guard hooks on PreToolUse, the version-status hook on SessionStart, the
+// owner-go recorder (#58: the owner's chat "merge") on UserPromptSubmit.
+const HOOK_EVENTS = ['PreToolUse', 'SessionStart', 'UserPromptSubmit'];
 export const STAGING_REL = 'backups/.staging';
 export const TILDE_ALLOW_ENTRY = 'Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)';
 export const SUBAGENT_NOTE = 'Pinned agent models (judge=opus, arbiter=fable) still win over this env var — verified on Claude Code 2.1.285; unpinned subagents use it.';
@@ -136,7 +141,7 @@ export function buildPlan(source) {
     const entries = walkFiles(pipelineDir)
       .filter((r) => r !== 'INSTALLED.json')
       .map((r) => ({ rel: `pipeline/${r}`, abs: path.join(pipelineDir, ...r.split('/')) }));
-    for (const hook of ['guard-git.mjs', 'guard-files.mjs', 'session-version.mjs']) {
+    for (const hook of ['guard-git.mjs', 'guard-files.mjs', 'session-version.mjs', 'owner-go.mjs']) {
       if (!entries.some((e) => e.rel === `pipeline/hooks/${hook}`)) problems.push(`pipeline/hooks/${hook} is missing`);
     }
     if (isFile(path.join(source, 'VERSION'))) {
@@ -300,20 +305,6 @@ export function pathsDifferingFromHead(paths, headBlobs, hashes) {
   return paths.filter((p, i) => headBlobs.get(p) !== hashes[i]);
 }
 
-// The real location of `p`: symlinks resolved on the deepest ancestor that exists, the not-yet-created rest appended.
-// A claude-home reached through an alias (a symlinked ~/.claude, a second mount point) must name the same lock.
-export function canonicalPath(p) {
-  let cur = path.resolve(p);
-  const rest = [];
-  for (;;) {
-    try { return path.join(fs.realpathSync.native(cur), ...rest); } catch { /* not there yet: try the parent */ }
-    const parent = path.dirname(cur);
-    if (parent === cur) return path.resolve(p);
-    rest.unshift(path.basename(cur));
-    cur = parent;
-  }
-}
-
 // Where the write lock for `home` lives: inside the destination itself, so it is scoped to that home and never to
 // whoever happens to run the installer.
 export const installLockDir = (home) => path.join(canonicalPath(home), 'backups', '.locks');
@@ -473,6 +464,14 @@ const sessionHandlerFor = (home) => ({
   timeout: SESSION_HOOK_TIMEOUT_S,
 });
 
+// The owner-go recorder is NOT started through the fail-closed loader either: an exit 2 on UserPromptSubmit would swallow the owner's prompt.
+const ownerGoHandlerFor = (home) => ({
+  type: 'command',
+  command: 'node',
+  args: [joinNative(home, 'pipeline', 'hooks', 'owner-go.mjs')],
+  timeout: OWNER_GO_TIMEOUT_S,
+});
+
 export function ourHookGroups(home, { skipFileGuard = false } = {}) {
   const groups = [{ matcher: GUARD_GIT_MATCHER, hooks: [handlerFor(home, 'guard-git')] }];
   if (!skipFileGuard) groups.push({ matcher: GUARD_FILES_MATCHER, hooks: [handlerFor(home, 'guard-files')] });
@@ -481,6 +480,9 @@ export function ourHookGroups(home, { skipFileGuard = false } = {}) {
 
 // Our own group (no matcher: every start source), appended after whatever the owner already has on SessionStart.
 export const ourSessionStartGroups = (home) => [{ hooks: [sessionHandlerFor(home)] }];
+
+// Our own UserPromptSubmit group (no matcher: that event has none), appended after the owner's own.
+export const ourPromptGroups = (home) => [{ hooks: [ownerGoHandlerFor(home)] }];
 
 function assertShape(settings) {
   if (!isPlainObject(settings)) throw new SettingsShapeError('settings.json must contain a JSON object');
@@ -496,7 +498,7 @@ function assertShape(settings) {
   }
 }
 
-// Removes our handlers from hooks.PreToolUse and hooks.SessionStart in place; drops groups that this leaves empty.
+// Removes our handlers from hooks.PreToolUse, hooks.SessionStart and hooks.UserPromptSubmit in place; drops groups that this leaves empty.
 // Returns the count removed.
 function stripOurHandlers(settings, home) {
   let removed = 0;
@@ -526,13 +528,15 @@ export function mergeSettings(settings, { home, skipFileGuard = false }) {
   out.hooks.PreToolUse.push(...ourHookGroups(home, { skipFileGuard }));
   out.hooks.SessionStart ??= [];
   out.hooks.SessionStart.push(...ourSessionStartGroups(home));
+  out.hooks.UserPromptSubmit ??= [];
+  out.hooks.UserPromptSubmit.push(...ourPromptGroups(home));
   out.permissions ??= {};
   out.permissions.allow ??= [];
   for (const entry of ourAllowEntries(home)) if (!out.permissions.allow.includes(entry)) out.permissions.allow.push(entry);
   return out;
 }
 
-// Pure inverse for --uninstall. A container (PreToolUse, SessionStart, hooks, allow, permissions) that our removal
+// Pure inverse for --uninstall. A container (PreToolUse, SessionStart, UserPromptSubmit, hooks, allow, permissions) that our removal
 // leaves empty is dropped, so installing into a settings file that had none of them and uninstalling round-trips.
 export function removeOurSettings(settings, { home }) {
   assertShape(settings);
@@ -561,17 +565,19 @@ const scriptOf = (handler) => {
   if (/\/guard-git\.mjs/.test(text)) return 'guard-git';
   if (/\/guard-files\.mjs/.test(text)) return 'guard-files';
   if (/\/session-version\.mjs/.test(text)) return 'session-version';
+  if (/\/owner-go\.mjs/.test(text)) return 'owner-go';
   return null;
 };
 
 // Our handlers, grouped by script, each flagged exact when it equals what install writes. The guards are read from
-// hooks.PreToolUse, the status hook from hooks.SessionStart; one of ours under the wrong event is `unknown`.
+// hooks.PreToolUse, the status hook from hooks.SessionStart, the owner-go recorder from hooks.UserPromptSubmit; one of ours under the wrong event is `unknown`.
 export function inspectHooks(settings, home) {
-  const out = { 'guard-git': [], 'guard-files': [], 'session-version': [], unknown: [] };
+  const out = { 'guard-git': [], 'guard-files': [], 'session-version': [], 'owner-go': [], unknown: [] };
   const expected = {
     'guard-git': { event: 'PreToolUse', matcher: GUARD_GIT_MATCHER, handler: handlerFor(home, 'guard-git') },
     'guard-files': { event: 'PreToolUse', matcher: GUARD_FILES_MATCHER, handler: handlerFor(home, 'guard-files') },
     'session-version': { event: 'SessionStart', matcher: undefined, handler: sessionHandlerFor(home) },
+    'owner-go': { event: 'UserPromptSubmit', matcher: undefined, handler: ownerGoHandlerFor(home) },
   };
   for (const event of HOOK_EVENTS) {
     const groups = settings?.hooks?.[event];
@@ -667,6 +673,7 @@ export function computeDrift({ home, plan, manifest, settings, settingsProblem, 
   hookCheck('guard-git', true);
   hookCheck('guard-files', expectGuardFiles);
   hookCheck('session-version', true, 'SessionStart');
+  hookCheck('owner-go', true, 'UserPromptSubmit');
   for (const u of found.unknown) add('hook-unknown', null, `unrecognised hook entry in the pipeline hooks dir: ${JSON.stringify(u.handler)}`);
 
   const allow = Array.isArray(settings.permissions?.allow) ? settings.permissions.allow : [];

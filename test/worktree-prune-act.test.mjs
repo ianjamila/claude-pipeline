@@ -1,10 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, symlinkSync, utimesSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
-import { archivePaths, listHolding, purgeHolding, holdingRoot, removeWorktree, restoreLeftovers, QUARANTINE_DIR } from '../pipeline/lib/worktree-prune/act.mjs';
+import { tryAcquire, release } from '../pipeline/lib/locks.mjs';
+import { archivePaths, archivePathsLocked, holdingLockName, listHolding, purgeHolding, purgeHoldingLocked, holdingRoot, removeWorktree, restoreLeftovers, QUARANTINE_DIR } from '../pipeline/lib/worktree-prune/act.mjs';
 
 // Same fixture as test/worktree-prune-inspect.test.mjs: a repo with an origin, an ignore list and a .worktrees dir.
 function world() {
@@ -103,6 +106,26 @@ test('archive: an unparseable same-day manifest is set aside (first free .corrup
   const r = purgeHolding(h, { nowMs: T + 90 * day });
   assert.deepEqual(r.purged, []);
   assert.match(r.kept.find((k) => k.batch === '2026-10-13').reason, /MANIFEST\.json\.corrupt-1/);
+});
+
+test('purgeHoldingLocked: holding lock held elsewhere => nothing deleted and reported busy; once released the old batch goes', async () => {
+  const h = mkdtempSync(join(tmpdir(), 'hold-')); const lockDir = mkdtempSync(join(tmpdir(), 'locks-'));
+  const batch = join(h, '2026-09-01'); mkdirSync(batch);
+  writeFileSync(join(batch, 'MANIFEST.json'), JSON.stringify({ version: 1, items: [{ original: '/x', stored: join(batch, 'x'), size: 0, sha256: '', archivedAt: new Date(T - 40 * day).toISOString() }] }));
+  const held = tryAcquire(holdingLockName(h), { dir: lockDir });
+  assert.ok(held.acquired);
+  try {
+    const r = await purgeHoldingLocked(h, { nowMs: T, lockDir, lockWaitMs: 150 });
+    assert.deepEqual(r.purged, []);
+    assert.match(r.skipped, /holding folder.*busy|lock/i);
+    assert.equal(existsSync(batch), true);
+  } finally {
+    release(held.lock);
+  }
+  const r2 = await purgeHoldingLocked(h, { nowMs: T, lockDir, lockWaitMs: 2000 });
+  assert.deepEqual(r2.purged, ['2026-09-01']);
+  assert.equal(r2.skipped, undefined);
+  assert.equal(existsSync(batch), false);
 });
 
 test('list: restore commands quote paths with spaces; an unreadable manifest still lists', () => {
@@ -376,4 +399,95 @@ test('restoreLeftovers: dotted slug splits on the last dot; taken target and pla
   assert.equal(existsSync(join(quarantineOf(repo), 'gone.run3', 'left.txt')), true);
   assert.equal(r.nodot.restored, false);
   assert.deepEqual(restoreLeftovers(mkdtempSync(join(tmpdir(), 'empty-')), '.worktrees'), [], 'no quarantine dir => nothing to do');
+});
+
+// --- #63: two clones of one repo share one holding folder under different run locks ---------------------------------
+const childScript = join(dirname(fileURLToPath(import.meta.url)), 'helpers', 'prune-archive-child.mjs');
+const runChild = (args) => {
+  const p = spawn(process.execPath, [childScript, JSON.stringify(args)], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let err = '';
+  p.stderr.on('data', (d) => { err += d; });
+  const done = new Promise((resolve) => p.on('exit', (code) => resolve({ code, err })));
+  return { done, exited: () => p.exitCode !== null };
+};
+const waitFor = async (cond, ms = 10_000) => {
+  const until = Date.now() + ms;
+  while (!cond() && Date.now() < until) await new Promise((r) => setTimeout(r, 25));
+  assert.ok(cond(), 'timed out waiting');
+};
+
+test('archive: two clones archiving the same name into one holding folder at once keep both archives and both manifest entries', async () => {
+  const h = mkdtempSync(join(tmpdir(), 'hold-')); const lockDir = mkdtempSync(join(tmpdir(), 'locks-')); const sync = mkdtempSync(join(tmpdir(), 'sync-'));
+  const mk = (content) => { const wt = mkdtempSync(join(tmpdir(), 'wt-')); mkdirSync(join(wt, '.review')); writeFileSync(join(wt, '.review', 'state.json'), content); return wt; };
+  const common = { rels: ['.review/state.json'], holdingDir: h, slug: 'agent-x', nowMs: T, lockDir, lockWaitMs: 20_000 };
+  const a = runChild({ ...common, wtPath: mk('from-A'), readyFile: join(sync, 'ready'), goFile: join(sync, 'go') });
+  await waitFor(() => existsSync(join(sync, 'ready'))); // A has picked its name and not yet moved the file
+  const b = runChild({ ...common, wtPath: mk('from-B') });
+  await waitFor(() => b.exited(), 1500).catch(() => {}); // unlocked, B finishes at once; locked, B must wait for A
+  writeFileSync(join(sync, 'go'), 'go');
+  const [ra, rb] = await Promise.all([a.done, b.done]);
+  assert.equal(ra.code, 0, ra.err); assert.equal(rb.code, 0, rb.err);
+  const l = listHolding(h);
+  assert.equal(l.length, 1); assert.equal(l[0].items, 2, 'both manifest entries survive');
+  const m = JSON.parse(readFileSync(join(h, l[0].batch, 'MANIFEST.json'), 'utf8'));
+  assert.deepEqual(m.items.map((i) => readFileSync(i.stored, 'utf8')).sort(), ['from-A', 'from-B']);
+  assert.equal(new Set(m.items.map((i) => i.stored)).size, 2);
+});
+
+test('archive: a destination that appears after the name was picked is never overwritten', () => {
+  const wt = mkdtempSync(join(tmpdir(), 'wt-')); const h = mkdtempSync(join(tmpdir(), 'hold-'));
+  writeFileSync(join(wt, 'a.txt'), 'new');
+  let planted = false;
+  const r = archivePaths({
+    wtPath: wt, rels: ['a.txt'], holdingDir: h, slug: 's', pr: 1, nowMs: T,
+    hooks: { afterPick: (stored) => { if (!planted) { planted = true; writeFileSync(stored, 'someone else got here first'); } } },
+  });
+  const first = r.items[0].stored.replace(/\.\d+$/, '');
+  assert.equal(readFileSync(first, 'utf8'), 'someone else got here first');
+  assert.notEqual(r.items[0].stored, first);
+  assert.equal(readFileSync(r.items[0].stored, 'utf8'), 'new');
+});
+
+test('removeWorktree: the holding folder lock cannot be had in time => nothing archived, moved back intact, kept with a reason', async () => {
+  const { repo, add } = world(); const wt = add('agent-x', 'agent/x');
+  mkdirSync(join(wt, '.review')); writeFileSync(join(wt, '.review', 'state.json'), '{"keep":1}');
+  const h = mkdtempSync(join(tmpdir(), 'h-')); const lockDir = mkdtempSync(join(tmpdir(), 'locks-'));
+  const held = tryAcquire(holdingLockName(h), { dir: lockDir });
+  assert.ok(held.acquired);
+  try {
+    const r = await removeWorktree({ root: repo.dir, wt: { slug: 'agent-x', path: wt }, cfg: { delete: [], archive: ['.review/'] }, pr: 9, holdingDir: h, lockDir, lockWaitMs: 150, runId: 'rlock', runStartMs: Date.now() + 5000, settleMs: 0, procOpts: noProcs() });
+    assert.equal(r.removed, false);
+    assert.equal(r.restored, true);
+    assert.match(r.reason, /holding folder.*lock/i);
+    assert.equal(readFileSync(join(wt, '.review', 'state.json'), 'utf8'), '{"keep":1}');
+    assert.deepEqual(listHolding(h), []);
+  } finally {
+    release(held.lock);
+  }
+});
+
+test('removeWorktree: the holding folder lock is released afterwards (a second removal into the same folder works)', async () => {
+  const { repo, add } = world(); const h = mkdtempSync(join(tmpdir(), 'h-')); const lockDir = mkdtempSync(join(tmpdir(), 'locks-'));
+  for (const [i, slug] of ['agent-x', 'agent-y'].entries()) {
+    const wt = add(slug, `agent/${slug}`);
+    mkdirSync(join(wt, '.review')); writeFileSync(join(wt, '.review', 'state.json'), `{"n":${i}}`);
+    const r = await removeWorktree({ root: repo.dir, wt: { slug, path: wt }, cfg: { delete: [], archive: ['.review/'] }, pr: 9, holdingDir: h, lockDir, lockWaitMs: 2000, runId: `rr${i}`, runStartMs: Date.now() + 5000, settleMs: 0, procOpts: noProcs() });
+    assert.equal(r.removed, true, r.reason);
+  }
+  assert.equal(listHolding(h)[0].items, 2);
+});
+
+test('holdingLockName: a symlink alias of the holding folder names the same lock', { skip: process.platform === 'win32' }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'hl-'));
+  const real = join(base, 'holding'); mkdirSync(real);
+  const alias = join(base, 'alias'); symlinkSync(real, alias);
+  assert.equal(holdingLockName(alias), holdingLockName(real));
+});
+
+test('holdingLockName: a holding folder not created yet, under a symlinked parent, names the same lock as under the real parent', { skip: process.platform === 'win32' }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'hl-'));
+  const realParent = join(base, 'parent'); mkdirSync(realParent);
+  const aliasParent = join(base, 'parent-alias'); symlinkSync(realParent, aliasParent);
+  assert.equal(holdingLockName(join(aliasParent, 'not', 'yet')), holdingLockName(join(realParent, 'not', 'yet')));
+  assert.notEqual(holdingLockName(join(realParent, 'a')), holdingLockName(join(realParent, 'b')));
 });

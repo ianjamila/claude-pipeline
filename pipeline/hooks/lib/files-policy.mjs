@@ -19,9 +19,9 @@ import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
-import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText } from './shell-parse.mjs';
+import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
-import { scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, substitute, GuardLimit, execLinesOf, paramReadings, assigningDefaults, spliceLines } from './script-candidates.mjs';
+import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
 
 const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
@@ -41,12 +41,14 @@ const PROTECTED_REL = [
   '.claude/agents/arbiter.md',
   '.claude/pipeline',
   '.claude/settings.json',
+  // #58: the owner's recorded chat "merge" (hooks/lib/owner-go.mjs): only the owner-go hook writes it, P merge and the guard read it
+  '.claude/pipeline-state/owner-go',
 ];
 
 // The directories that hold them. Writing INTO them is fine (history, projects, CLAUDE.md, other skills), but
 // replacing, deleting, moving or running a repo command in them reaches the protected files, so for a
 // non-read-only command a word that IS one of these (exactly, not a child) counts as a protected reference.
-const ANCESTOR_REL = ['.claude', '.claude/skills', '.claude/agents'];
+const ANCESTOR_REL = ['.claude', '.claude/skills', '.claude/agents', '.claude/pipeline-state'];
 
 // Why: a name assigned from a changed name is changed too (`X=$D; echo x > $X/s`, `E=$D bash w.sh`): the assignments of the line (a bare `NAME=value`, a declaration's
 // `NAME=value`) and `extra` (the prefix values of the command a child frame is started by) taint the name they set, until nothing new is added.
@@ -70,6 +72,8 @@ function taintClosure(base, cmds, extra = {}, isNew = () => false, active = fals
     } else if (active && cn === 'read') for (const a of c.argv.slice(1)) always(a);
     else if (active && (cn === 'mapfile' || cn === 'readarray')) { always('MAPFILE'); for (const a of c.argv.slice(1)) always(a); }
     else if (active && cn === 'printf') { const i = c.argv.indexOf('-v'); if (i > 0) always(c.argv[i + 1] ?? ''); }
+    // (#56, Codex recheck of d925d42: the names a builtin sets without being given them, and zsh binders whose operands are not read: every name they mention)
+    if (active) { for (const k of implicitBindsOf(c)) always(k); if (ZSH_NAME_BINDERS.has(cn) || (cn === 'print' && c.argv.some((a) => /^-[A-Za-z]*v/.test(a)))) for (const a of c.argv.slice(1)) for (const m of a.matchAll(/[A-Za-z_]\w*/g)) always(m[0]); }
   }
   sets.push(...Object.entries(extra));
   for (let grew = true; grew;) { grew = false; for (const [k, v] of sets) if (!set.has(k) && refs(v)) { set.add(k); grew = true; } }
@@ -282,7 +286,10 @@ function lexicalTarget(target, ctx) {
   return s.length > 1 && s.endsWith('/') ? s.slice(0, -1) : s;
 }
 
-const PROTECTED_MSG = 'skills, agents, ~/.claude/pipeline and ~/.claude/settings.json can only be changed by the owner with PIPELINE_ADMIN=1';
+// #58: the owner-go recorder (installed in ~/.claude/pipeline/hooks, or a source checkout's pipeline/hooks) and its library.
+const OWNER_GO_RECORDER = /(?:^|\/)hooks\/(?:lib\/)?owner-go\.mjs$/i;
+
+const PROTECTED_MSG = 'skills, agents, ~/.claude/pipeline, ~/.claude/settings.json and the owner-go records (~/.claude/pipeline-state/owner-go) can only be changed by the owner with PIPELINE_ADMIN=1';
 
 // MCP servers (a filesystem server, any other server's write tools, a browser or IDE that runs code) reach the
 // same files without Edit/Write. Their tool_input has no fixed shape, so values are picked out by key name.
@@ -476,10 +483,13 @@ const mayHoldBackslash = (w, ctx) => w.includes('\\') || Object.values(ctx.keptV
 
 // $NAME / ${NAME} for variables assigned earlier on the same line (D=$HOME/.claude; echo x > $D/settings.json).
 // Values are stored already expanded, and a value used in many words multiplies: the produced text is capped (substitute).
+// (an unbraced name that zsh would read a modifier or a subscript after is left as written: ZSH_MODIFIED, #74; `${B}:r` is no modifier). Defence in depth: collectVars already makes a name the line assigns, inherits or sources and reads so unknown (ctx.unknownVars); this keeps the text of one
+// reaching substVars by another way from being read as the value.
+const SUBST_RE = new RegExp(`\\$\\{(\\w+)\\}|\\$(\\w+)(?!\\w)${ZSH_MODIFIED}`, 'g');
 function substVars(text, vars, budget) {
   let t = text;
   for (let pass = 0; pass < 4 && t.includes('$'); pass++) {
-    const next = substitute(budget, t, /\$\{(\w+)\}|\$(\w+)/g, (m, a, b) => (Object.hasOwn(vars, a ?? b) ? vars[a ?? b] : m));
+    const next = substitute(budget, t, SUBST_RE, (m, a, b) => (Object.hasOwn(vars, a ?? b) ? vars[a ?? b] : m));
     if (next === t) break;
     t = next;
   }
@@ -516,9 +526,9 @@ function refVariants(text, ctx) {
   const v1 = v0
     .replace(/['"`]\s*\+\s*['"`]/g, '')
     .replace(/['"`]\s*[,/]\s*['"`]/g, '/')
-    .replace(/\s*\/\s*(?=['"`])/g, '/')
+    .replace(/(?<!\s)\s*\/\s*(?=['"`])/g, '/')
     .replace(/\/['"`]+/g, '/')
-    .replace(/['"`]+\//g, '/');
+    .replace(/(?<!['"`])['"`]+\//g, '/'); // (a run of quotes or blanks is read from its start only: from every character it would be quadratic)
   return unique([v0, v1, braceExpand(v0, ctx)]);
 }
 
@@ -619,6 +629,17 @@ function balancedOpeners(w) {
   return out;
 }
 function makeMatchers(ctx) {
+  // The readings of a word to look for a protected path in: its own defaults / alternatives (paramReadings: too many of them is a hit) and the words a name it reads may hold (readingsOf). A word an
+  // assignment holds that the scan cannot work out (or that holds a `$`) is no hit here: collectVars makes the name a run-time variable, and a write through one is refused as such.
+  const hitReadings = (word) => {
+    const own = paramReadings(word);
+    if (!ctx.assigned?.size) return own;
+    // Why (#81 Codex R1-B2): readingsOf cuts its list at MAX_READINGS and says so in `cut`: readings that are missing could be the protected path, so too many is a hit like too many own readings.
+    // (`over` alone is NOT a hit here: it also marks an assigned word the scan cannot work out, which collectVars handles as a run-time variable, see above.)
+    const rs = readingsOf(word, ctx.assigned);
+    // (`own.over` is Defensive (mutation check): losing it is still caught by the redirect loop, which judges the target as written (rawHitOne on the unexpanded text) too.)
+    return Object.defineProperty([...rs], 'over', { value: own.over === true || rs.cut === true, enumerable: false });
+  };
   const rootRes = rootRegexes(ctx);
   const ancRes = ancestorRegexes(ctx);
   const suffix = suffixRegexes(ctx.ci);
@@ -631,7 +652,9 @@ function makeMatchers(ctx) {
   const rawHit = (text, dirs, program = false) => {
     if (!text) return false;
     // Why: `${V:-~/.claude}/settings.json` is the protected file whenever V is unset or empty, so every reading of a default / alternative word is judged
-    const rs = paramReadings(String(text));
+    // (#81 t8b: and every word a NAME may hold whose assignment holds an operator or is an array, `F=ok; D=${F/ok/.claude}; echo x > ~/$D/settings.json`: readingsOf, as for a script name)
+    // Defensive (mutation check): reading only paramReadings here is still caught by pathHit, which reads the assigned words for the same target.
+    const rs = hitReadings(String(text));
     if (rs.over) {
       if (!program) return true;
       for (const w of String(text).split(/\s+/)) {
@@ -681,7 +704,8 @@ function makeMatchers(ctx) {
     } else if (/^[A-Za-z_]+=./.test(tok)) parts = [tok, tok.slice(tok.indexOf('=') + 1)]; // (`of=settings.json`)
     for (const part of parts) {
       if (!part) continue;
-      const rs = paramReadings(part);
+      // Defensive (mutation check): reading only paramReadings here is still caught by rawHit, which reads the assigned words for the same target.
+      const rs = hitReadings(part); // (#81 t8b: the words an operator or array assignment gives, see rawHit)
       if (rs.over) return true;
       // Why: a target built by a command substitution (`"$(echo ~/.claude)"/settings.json`) is only known at run time: when its own text names a protected thing it is refused
       if (/\$\(|`/.test(part) && SENSITIVE_WORDS.test(part)) return true;
@@ -987,6 +1011,7 @@ function mayRebind(name, cmds, raw) {
   const re = (s) => new RegExp(s.replaceAll('NAME', name));
   // (a `${...}` that mentions the name and assigns -- `${N:=x}`, `${N::=x}`, `${(flags)N=x}`, `${N+=}`)
   if (re('\\$\\{[^}]*\\bNAME\\b[^}]*=|\\$\\{!?NAME\\[|\\bNAME\\[[^\\]]*\\]\\+?=|\\b(?:for|select|foreach)\\s+NAME\\b|\\(\\([^)]*\\bNAME\\b|\\{NAME\\}\\s*(?:[<>]|&>)|\\bNAME\\+=').test(raw)) return true; // (`${N:=x}`, `N[1]=`, a loop variable, arithmetic)
+  if (cmds.some((c) => implicitBindsOf(c).includes(name))) return true; // (`[[ x =~ y ]]` sets MATCH, `read` REPLY …: see implicitBindsOf)
   return !onlyNonBinders(cmds);
 }
 function modelZshSelfDirs(cmds, raw, ctx) {
@@ -1087,10 +1112,12 @@ function gitReadOnly(args) {
   return !args.slice(i + 1).some((a) => a === '--output' || a.startsWith('--output=') || a === '--ext-diff');
 }
 
+// (not the owner-go recorder: run by hand with made-up input it would write an owner "merge" -- Codex design review of #58)
 function isPipelineTool(arg, ctx) {
   if (typeof arg !== 'string') return false;
   const e = expandRefs(arg, ctx);
   if (!isAbs(e)) return false;
+  if (OWNER_GO_RECORDER.test(e)) return false;
   return samePath(e, `${ctx.homePosix}/.claude/pipeline/bin/pipeline.mjs`, ctx.platform)
     || isInside(e, `${ctx.homePosix}/.claude/pipeline/hooks`, ctx.platform);
 }
@@ -1099,6 +1126,7 @@ function isPipelineTool(arg, ctx) {
 function pipelineToolInRaw(raw, ctx) {
   const t = expandRefs(raw, ctx);
   const root = escapeRe(`${ctx.homePosix}/.claude/pipeline`);
+  if (/owner-go/i.test(t)) return false;
   return new RegExp(`^\\s*(?:\\S*/)?node(?:\\.exe)?\\s+["']?${root}/(?:bin/pipeline\\.mjs|hooks/[^\\s'"]*)(?:["']?\\s|["']?$)`, ctx.ci ? 'i' : '').test(t);
 }
 
@@ -1116,6 +1144,36 @@ function pwshReadOnly(argv) {
   return inner.every((c) => c.argv.length === 0 || PS_READ_ONLY.has(baseOf(c.argv[0])));
 }
 
+// #81 t11: gh commands that print and write no local file (`gh api URL`, `gh pr view N`, `gh run watch` ...): a name of unknown value in their words (`sha=$SHA`) names no path.
+// `gh run download`, `gh release download`, `gh pr checkout`, `gh repo clone` write local files and are not listed.
+const GH_PRINTERS = { pr: ['view', 'checks', 'list', 'diff', 'status'], run: ['view', 'list', 'watch'], issue: ['view', 'list', 'status'], repo: ['view'], auth: ['status'], workflow: ['list', 'view'], release: ['list', 'view'], label: ['list'] };
+// ... and only when nothing on the line can make gh run another program: gh starts a pager (GH_PAGER, PAGER, its config) and a browser (--web, GH_BROWSER, BROWSER), reads another configuration
+// (GH_CONFIG_DIR, XDG_CONFIG_HOME) and runs aliases and extensions. So the list applies only for an exact builtin pair, with no such variable set, exported or prefixed on the line (or by a sourced file or an
+// unknown mover), no --web / -w, and no `gh config|alias|extension` on the line; otherwise the command is judged as before (a writer). A pager or browser the user's OWN configuration holds is outside the
+// line's control, as for every command here (residual, same as main).
+const GH_ENV = /^(?:GH_|GITHUB_|PAGER$|MANPAGER$|BROWSER$|XDG_|HOME$|LESS)/i;
+const GH_ENV_TEXT = /(?:^|[\s;&|(`])(?:GH_|GITHUB_|XDG_)[A-Z0-9_]*\s*[+]?=|(?:^|[\s;&|(`])(?:PAGER|MANPAGER|BROWSER|HOME|LESS)\s*[+]?=|\b(?:GH_|GITHUB_|XDG_)[A-Z0-9_]*\b|\$\{?[A-Za-z_]\w*\}?\s*=/;
+const GH_CONFIGURES = /\bgh\s+(?:-\S+\s+)*(?:config|alias|extension|ext)\b/i;
+function ghEnvTouched(cmd, ctx) {
+  if (ctx.unknownAll) return true;
+  const names = [...Object.keys(cmd.env ?? {}), ...Object.keys(ctx.vars ?? {}), ...(ctx.unknownVars ?? []), ...(ctx.pickUnknown ?? []), ...(ctx.srcChanged ?? []), ...(ctx.srcTouched ?? []), ...(ctx.assigned?.keys?.() ?? [])];
+  if (names.some((n) => GH_ENV.test(n))) return true;
+  const line = ctx.ghLine ?? '';
+  return GH_ENV_TEXT.test(line) || GH_CONFIGURES.test(line);
+}
+function ghReadOnly(args, cmd, ctx) {
+  if (args.some((a) => a === '--web' || a.startsWith('--web=') || /^-[A-Za-z]*w[A-Za-z]*$/.test(a))) return false;
+  if (ghEnvTouched(cmd, ctx)) return false;
+  const words = [];
+  for (let i = 0; i < args.length && words.length < 2; i++) {
+    const a = args[i];
+    if (a === '-R' || a === '--repo') { i++; continue; }
+    if (a.startsWith('-')) continue;
+    words.push(a);
+  }
+  if (words[0] === 'api') return !args.some((a) => /^(?:-o|--output|--cache)/.test(a));
+  return Object.hasOwn(GH_PRINTERS, words[0] ?? '') && GH_PRINTERS[words[0]].includes(words[1]);
+}
 function isReadOnly(cmd, ctx) {
   const argv = cmd.argv;
   if (!argv.length) return false;
@@ -1125,6 +1183,7 @@ function isReadOnly(cmd, ctx) {
   if (READ_ONLY.has(name)) return !(name === 'rg' && args.some((a) => a === '--pre' || a.startsWith('--pre=')));
   if (name === 'find') return !args.some((a) => FIND_UNSAFE.test(a));
   if (name === 'git') return gitReadOnly(args);
+  if (name === 'gh') return ghReadOnly(args, cmd, ctx);
   if (name === 'jq') return !args.some((a) => /^-[A-Za-z]*i/.test(a) || a === '--in-place');
   if (name === 'sed' || name === 'gsed') return sedReadOnly(args);
   if (name === 'awk' || name === 'gawk' || name === 'mawk' || name === 'nawk') return awkReadOnly(args, cmd.env);
@@ -1179,17 +1238,36 @@ function collectVars(cmds, ctx) {
   // ways not worked out: such a name keeps the text as written, but is listed in ctx.unknownVars (a script or a writer it picks is refused)
   const attrs = new Map();
   const unknown = new Set();
-  const set = (k, v) => {
+  // Why (#56, Codex review of 8b86e2b): `F=settings.json; printf x > ~/.claude/$F; for F in safe; do :; done` judged the write with the loop's word (the last
+  // value). A name a loop reading sets that the line also gives another value holds one of them where it is used: it is only known at run time (ctx.unknownVars).
+  // (Two plain assignments still keep the last value, as on main: `if …; then out=$3; else out=$dir/x; fi; … > "$out"` is common; issue: judge each value.)
+  const given = new Map();
+  // Why (#76): a name the line gives more than one value is judged once per value (assignReadings): ctx.assignPins pins every plain assignment of it to the one raw value of this reading,
+  // or is null when there are too many readings: such a name is only known at run time. (A loop word is not a plain assignment: loopPins.)
+  const aPins = ctx.assignPins;
+  const raws = new Map();
+  const set = (k, v, loop = false) => {
     if (SKIP.has(k)) return;
+    if (!loop) {
+      raws.set(k, (raws.get(k) ?? new Set()).add(String(v)));
+      if (aPins?.has(k)) v = aPins.get(k);
+    }
+    const was = given.get(k);
+    if (was && was.v !== String(v) && (loop || was.loop)) unknown.add(k);
+    given.set(k, { v: String(v), loop: loop || was?.loop === true });
     const t = attrs.get(k) ?? null;
     vars[k] = applyTransform(expandHomeRefs(substVars(toPosix(String(v)).replace(USER_RE, ctx.user), vars, ctx.budget), ctx.homePosix), t);
     kept[k] = applyTransform(expandHomeRefs(substVars(toPosix(String(v).replace(/\\/g, bs)).replace(USER_RE, ctx.user), kept, ctx.budget), ctx.homePosix).split(bs).join('\\'), t);
   };
+  const pins = ctx.loopPins; // (see loopReadings: the word each loop variable holds in this reading, or null: every one is only known at run time)
   for (const c of cmds) {
+    if (pins !== undefined && c.argv[0] === 'for' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '')) {
+      if (pins === null || !pins.has(c.argv[1])) unknown.add(c.argv[1]); else if (pins.get(c.argv[1]) !== LOOP_NOT_RUN) set(c.argv[1], pins.get(c.argv[1]), true);
+    }
     for (const [k, v] of Object.entries(c.env ?? {})) set(k, v);
     // (`set -- ev.sh`: the positional parameters, so `bash $1` is that file)
     if (baseOf(c.argv[0] ?? '') === 'set' && !c.argv.some((a) => /^[-+][A-Za-z]*A/.test(a))) { const w = setPositionals(c.argv); if (w) for (let i = 1; i <= 9; i++) set(String(i), i <= w.length ? w[i - 1] : ''); }
-    if (['export', 'declare', 'typeset', 'local', 'readonly'].includes(baseOf(c.argv[0] ?? ''))) {
+    if (['export', 'declare', 'typeset', 'local', 'readonly', 'integer', 'float'].includes(baseOf(c.argv[0] ?? ''))) {
       const d = declAttrs(c.argv);
       for (const k of d.bare) {
         if (d.transform) { attrs.set(k, d.transform); if (Object.hasOwn(vars, k)) { vars[k] = applyTransform(vars[k], d.transform); kept[k] = applyTransform(kept[k], d.transform); } }
@@ -1202,11 +1280,68 @@ function collectVars(cmds, ctx) {
       }
     }
   }
+  // Why (#74): zsh reads `$B:r` / `$B[1,6]` (an unbraced name and a modifier or subscript) as another word than the one substVars gives (`B=settings.json.x; cp x ~/.claude/$B:r`
+  // writes settings.json). A name the line assigns and reads so is only known at run time wherever it is used (ctx.unknownVars: a script or a writer it picks is refused),
+  // and so is every name built from it (`F=$B:r; … $F`), to a fixed point.
+  for (const k of ctx.zshModified ?? []) if (given.has(k) || Object.hasOwn(ctx.inheritedVars ?? {}, k)) unknown.add(k);
+  // Why (#81 t8b): a name whose assignment holds an operator or an array the scan cannot work out (`D=${U@Q}`, `${F:abc}`, a glob it does not follow) may hold any word where it is used: a writer or a redirection that uses it is refused
+  // (the "writes through a variable whose value is only known at run time" rule below). The words it CAN work out are read by rawHit / pathHit, which judge each as the path it is.
+  // (only a name whose own value is an operator expansion or an array: one built from a command's output (`dir=$(cmd)`) stays as it was, and a name built from another is covered by the closure below)
+  for (const [k, ws] of ctx.assigned ?? []) {
+    const name = k.replace(/\[\]$/, '');
+    const raw = given.get(name)?.v;
+    if (k !== '*' && ws.includes(UNKNOWN_WORD) && raw !== undefined && !/\$\(|`/.test(raw) && (raw.startsWith('(') || /\$\{[^}]*[^\w}]/.test(raw))) unknown.add(name);
+  }
+  // Defensive (mutation check): with more assignments than the scan follows, the target is still judged by rawHit / pathHit on the expanded values (expandRefs) as on main.
+  if (ctx.assigned?.has('*')) for (const k of given.keys()) unknown.add(k); // (more assignments than the scan follows: every name the line gives is only known at run time)
+  if (aPins === null) for (const [k, r] of raws) if (r.size > 1) unknown.add(k);
+  // Why (#76 / #81 t7 and the security follow-up): a name an arithmetic assigns (or appends to) holds a value the text does not give (see arithAssignedNames), whether or not the line gave it one
+  // before (`(( n += 7 )); bash s$n.sh`); `dynamic`: any name the line or an outer line gave (and any other, see ctx.unknownAll below)
+  for (const k of ctx.arith?.names ?? []) unknown.add(k);
+  if (ctx.arith?.dynamic) for (const k of [...given.keys(), ...Object.keys(ctx.inheritedVars ?? {})]) unknown.add(k);
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const [k, g] of given) if (!unknown.has(k) && [...g.v.matchAll(/\$\{?(\w+)/g)].some((m) => unknown.has(m[1]))) { unknown.add(k); changed = true; }
+  }
   ctx.keptVars = kept;
   ctx.unknownVars = unknown;
   ctx.declared = { transform: attrs, unknown: new Set(unknown) }; // (attributes stay with the name: a later plain assignment does not clear them)
   return vars;
 }
+
+// Why (#76): `F=settings.json; printf x > ~/.claude/$F; F=safe` was judged with F's LAST value. A name the text gives more than one value (a plain `F=v`, `export F=v`, `declare F=v`;
+// a loop variable is loopReadings') is judged once per value ("readings"): each reading is the whole text with every assignment of the name taken as that one value, and the text is
+// allowed only when every reading is. So a use sees each value the name may hold there, and the harmless `if …; then out=$3; else out="$dir/x"; fi; … > "$out"` stays allowed (both
+// values are harmless). Order is not told: a value given only AFTER the last use is judged too, and so is one that a later assignment replaces before the use (stricter, never looser).
+// More than MAX_ASSIGN_READINGS readings in all: each such name is only known at run time (a script or a writer it picks is refused).
+const MAX_ASSIGN_READINGS = 16;
+function assignReadings(command, opts) {
+  // (cheap test first, so a text with no name assigned twice is not parsed again. Defence in depth: the `names.length` test below drops the same texts, only after the parse)
+  const seen = new Set();
+  let twice = false;
+  for (const m of command.matchAll(/(?<![\w$.\/-])([A-Za-z_]\w*)\+?=/g)) { if (seen.has(m[1])) { twice = true; break; } seen.add(m[1]); }
+  if (!twice) return null;
+  const cmds = simpleCommands(command, { env: opts.env ?? process.env });
+  const values = new Map();
+  const add = (k, v) => { if (!SKIP_READING.has(k)) values.set(k, [...new Set([...(values.get(k) ?? []), String(v)])]); };
+  for (const c of cmds) {
+    for (const [k, v] of Object.entries(c.env ?? {})) add(k, v);
+    if (['export', 'declare', 'typeset', 'local', 'readonly'].includes(baseOf(c.argv[0] ?? ''))) for (const [k, v] of declAttrs(c.argv).assigns) add(k, v);
+  }
+  const names = [...values.keys()].filter((k) => values.get(k).length > 1 && /^[A-Za-z_]\w*$/.test(k));
+  if (!names.length) return null;
+  const total = names.reduce((n, k) => n * values.get(k).length, 1);
+  if (total > MAX_ASSIGN_READINGS) return [null];
+  const out = [];
+  for (let r = 0; r < total; r++) {
+    const pins = new Map();
+    let rest = r;
+    for (const k of names) { const ws = values.get(k); pins.set(k, ws[rest % ws.length]); rest = Math.floor(rest / ws.length); }
+    out.push(pins);
+  }
+  return out;
+}
+const SKIP_READING = new Set(['HOME', 'USER', 'LOGNAME', 'USERPROFILE', 'USERNAME']); // (collectVars never records these)
 
 // Directories the command line may be operating in: the hook's cwd plus every `cd` target (chained ones too).
 function collectDirs(cmds, ctx) {
@@ -1875,15 +2010,32 @@ const HOME_NAMES = new Set(['HOME', 'USER', 'LOGNAME', 'USERPROFILE', 'USERNAME'
 // where it may not run, more than once, from a command's output, or by a builtin that binds it at run time; `all`: the file can set any name (eval, a nested
 // source, a parse cut short, a command named at run time), so no name is known any more. Only the first-level assignments are followed, not functions called later.
 // the names a text defines as functions (`function f`, `f()`) or aliases
+// (Linear: the regular expressions find the keyword or the `()` first, and the command boundary before it is checked by walking back over blanks. A pattern that begins with "a boundary, then blanks, then
+// the name" restarts at every boundary of a long run of them, which is quadratic: `&&&&…` and `\n\n\n…` took seconds at 200 kB.)
+const WS_BYTE = /\s/;
+function startsCommand(text, at) {
+  let i = at - 1;
+  while (i >= 0 && text[i] !== '\n' && WS_BYTE.test(text[i])) i--; // (a newline is itself a command boundary)
+  return i < 0 || '\n;&|({'.includes(text[i]);
+}
 function definedNames(text) {
-  const names = new Set([...text.matchAll(/(?:^|[\n;&|({])\s*function\s+([^\s(){;'"$`]+)/g), ...text.matchAll(/(?:^|[\n;&|({])\s*([^\s(){;'"$`=]+)\s*\(\s*\)/g)].map((m) => m[1]));
+  const names = new Set();
+  for (const m of text.matchAll(/function\s+([^\s(){;'"$`]+)/g)) if (startsCommand(text, m.index)) names.add(m[1]);
+  // (a name is read back from the `(`: the longest run of name characters before the blanks in front of it)
+  for (const m of text.matchAll(/\(\s*\)/g)) {
+    let end = m.index;
+    while (end > 0 && WS_BYTE.test(text[end - 1])) end--;
+    let start = end;
+    while (start > 0 && !WS_BYTE.test(text[start - 1]) && !"(){;'\"$`=&|".includes(text[start - 1])) start--;
+    if (start < end && startsCommand(text, start)) names.add(text.slice(start, end));
+  }
   for (const a of text.matchAll(/\balias\s+([^;&|\n]*)/g)) for (const m of a[1].matchAll(/(?:^|\s)([^\s=]+)=/g)) names.add(m[1]);
   return names;
 }
 // Why: the names a binder command sets: those it is given (an option may carry its name, `printf -vF`, `wait -pF`), the ones it binds without being given them, and a nameref's target.
 // weird: a word that is not a plain name (`read "$1"`, `unset $n`): any name may be bound.
 function bindsOf(name, argv) {
-  const names = new Set(name === 'getopts' ? ['OPTARG', 'OPTIND'] : name === 'mapfile' || name === 'readarray' ? ['MAPFILE'] : name === 'read' || name === 'select' ? ['REPLY'] : []);
+  const names = new Set(implicitBindsOf({ argv: [name, ...argv.slice(1)] }));
   let weird = false;
   for (const a of argv.slice(1)) {
     const m = /^[A-Za-z_]\w*/.exec(a);
@@ -1926,6 +2078,9 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
     const name = baseOf(c.argv[0]);
     // Why: a function or alias the LINE defines may stand behind a name that looks harmless (`ls() { read F; }`), and a nameref (`declare -n r=F`) binds F through another name
     if (ctx.lineDefs?.has(name) || (['declare', 'typeset', 'local'].includes(name) && c.argv.slice(1).some((a) => /^[-+][A-Za-z]*n/.test(a)))) { out.all = true; continue; }
+    // (#56, Codex recheck of d925d42: zsh binders whose operands are not read may bind any name; `read` / `[[ =~ ]]` … set names they are not given)
+    if (ZSH_NAME_BINDERS.has(name) || (name === 'print' && c.argv.slice(1).some((a) => /^-[A-Za-z]*v/.test(a)))) { out.all = true; continue; }
+    for (const k of implicitBindsOf(c)) set(k, null, false);
     if (VAR_COMMANDS.has(name)) {
       const d = declAttrs(c.argv);
       for (const [k, v] of d.assigns) set(k, v, sure && !d.unknown && !d.transform && name !== 'local');
@@ -2059,7 +2214,7 @@ function absorbSourced(rec, dirs, ctx) {
   if (effs.length > 1) for (const k of merged.keys()) if (!effs.every((e) => e.vars.has(k))) merged.set(k, null);
   for (const [k, v] of merged) {
     ctx.srcTouched.add(k);
-    if (v === null) { delete ctx.vars[k]; delete ctx.keptVars?.[k]; ctx.pickUnknown.add(k); ctx.srcChanged.add(k); continue; }
+    if (v === null || ctx.zshModified?.has(k)) { delete ctx.vars[k]; delete ctx.keptVars?.[k]; ctx.pickUnknown.add(k); ctx.srcChanged.add(k); continue; } // (#74: a sourced name this line reads as `$N:r` is only known at run time)
     ctx.pickUnknown.delete(k);
     ctx.srcChanged.delete(k);
     ctx.vars[k] = expandHomeRefs(substVars(toPosix(v).replace(USER_RE, ctx.user), ctx.vars, ctx.budget), ctx.homePosix);
@@ -2090,6 +2245,33 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
     // (the second pass spends what the first left, so every cap still ends in a denial; only the startup-file memo starts empty)
     return evaluateBashForFilesUnchecked(command, { ...opts, _budget: { ...budget, startupOk: new Set() }, _bashState: { bound: true, rewrote: false } });
   }
+  // Why (#56, a live bypass on main): `for f in settings.json; do cp x ~/.claude/$f; done` wrote a protected file while $f was read as a value from the
+  // environment (any name the line does not set). A loop variable takes each word of its list in turn: the text is judged once per word ("readings"; a
+  // word that expands stands as written, so a `$(…)` or a glob is judged as if it were written where the variable is). Past 64 readings every loop
+  // variable is only known at run time (a script or a writer it picks is refused).
+  if (typeof command === 'string' && opts._loopPins?.text !== command && /(?:^|[\s;&|(){])for\s/.test(command)) {
+    const readings = loopReadings(command, opts);
+    if (readings) {
+      for (const pins of readings) {
+        countReading(opts._budget);
+        const v = evaluateBashForFilesUnchecked(command, { ...opts, _loopPins: { text: command, pins } });
+        if (v.decision !== 'allow') return v;
+      }
+      return allow();
+    }
+  }
+  // Why (#76): the same for a name the text assigns more than once (see assignReadings)
+  if (typeof command === 'string' && opts._assignPins?.text !== command) {
+    const readings = assignReadings(command, opts);
+    if (readings) {
+      for (const pins of readings) {
+        countReading(opts._budget);
+        const v = evaluateBashForFilesUnchecked(command, { ...opts, _assignPins: { text: command, pins } });
+        if (v.decision !== 'allow') return v;
+      }
+      return allow();
+    }
+  }
   if (!opts._frames) opts = { ...opts, _frames: [] }; // the writes of this line and of the scripts it runs (shared with nested calls, popped on the way out)
   const depth = opts._frames.length;
   try {
@@ -2102,13 +2284,43 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
     opts._frames.length = depth;
   }
 }
+const MAX_LOOP_READINGS = 64;
+// (a reading where the loop did not run: the name is not set by the line, as main read every loop variable)
+const LOOP_NOT_RUN = Symbol('loop not run');
+// A zsh parameter expansion with flags (`${(P)N::=x}` assigns the variable N names) or a bash indirect one (`${!N}`).
+// The readings of a text's loop variables: one Map (name -> word) per combination, [null] when there are too many, null when the text has no loop.
+function loopReadings(command, opts) {
+  const cmds = simpleCommands(command, { env: opts.env ?? process.env });
+  const loops = new Map();
+  for (const c of cmds) {
+    if (c.argv[0] !== 'for' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '')) continue;
+    const words = c.argv[2] === 'in' ? c.argv.slice(3) : ['$@'];
+    loops.set(c.argv[1], [...new Set([...(loops.get(c.argv[1]) ?? []), ...(words.length ? words : ['']), LOOP_NOT_RUN])]);
+  }
+  if (!loops.size) return null;
+  if (indirectExpansionOnLine(command, cmds)) return [null]; // (an indirect expansion may set any loop variable: every one is only known at run time)
+  const names = [...loops.keys()];
+  const total = names.reduce((n, k) => n * loops.get(k).length, 1);
+  if (total > MAX_LOOP_READINGS) return [null];
+  const out = [];
+  for (let r = 0; r < total; r++) {
+    const pins = new Map();
+    let rest = r;
+    for (const k of names) { const ws = loops.get(k); pins.set(k, ws[rest % ws.length]); rest = Math.floor(rest / ws.length); }
+    out.push(pins);
+  }
+  return out;
+}
 function evaluateBashForFilesFrame(command, opts) {
   if (!opts._budget) opts = { ...opts, _budget: newEvalBudget(opts.now) }; // one budget for this evaluation and every script it reads
   const assumedCwd = opts._assumedCwd === true; // (a rerun of the line with the cwd assumed to be a protected directory; what it runs is judged normally)
   if (assumedCwd) opts = { ...opts, _assumedCwd: false };
   checkDeadline(opts._budget);
   const ctx = makeCtx(opts);
+  if (opts._assignPins && opts._assignPins.text === command) ctx.assignPins = opts._assignPins.pins; // (this text's assignment readings, see assignReadings)
+  if (opts._loopPins && opts._loopPins.text === command) ctx.loopPins = opts._loopPins.pins; // (this text's loop readings; see evaluateBashForFilesUnchecked)
   ctx.lineDefs = definedNames(typeof command === 'string' ? command : '');
+  ctx.ghLine = typeof command === 'string' ? command : ''; // (ghReadOnly: what the line says about gh's variables and configuration)
   ctx.assigned = assigningDefaults(typeof command === 'string' ? command : ''); // (and those of the line this text was made from: `: ${X:=w}; G=bash; $G $X`)
   for (const [n, ws] of opts._assigned ?? []) ctx.assigned.set(n, [...(ctx.assigned.get(n) ?? []), ...ws]);
   opts = { ...opts, _selfZero: null, _selfBash: null, _selfAbs: false, _selfZsh: false }; // (only the script file judged right now has a $0; text it runs or reads has none)
@@ -2146,12 +2358,15 @@ function evaluateBashForFilesFrame(command, opts) {
   if (changesClaudeCode(cmds, scanRaw)) return deny('the command unsets or overrides CLAUDECODE, the marker the installer uses to refuse to run inside Claude Code; only the owner may change it, from a terminal');
   if (setsSeamForPipeline(cmds)) return deny('the command sets a pipeline test seam (PIPELINE_GH, PIPELINE_CODEX, PIPELINE_VERCEL, PIPELINE_TEST_MODE, PIPELINE_UPDATE_REMOTE) for the pipeline CLI; a fake gh/codex/vercel could satisfy the merge gate, and a foreign update remote would install foreign code, so only the owner does that, from a terminal');
   modelZshSelfDirs(cmds, raw, ctx);
+  ctx.inheritedVars = opts._vars ?? {}; // (#74: collectVars also marks a name the line only reads with a zsh modifier, when an outer line gave it its value)
+  ctx.zshModified = zshModifiedNames(cmds.flatMap((c) => [...(c.argv ?? []), ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')])); // (the names this line reads as `$N:r` / `$N[1]`)
+  ctx.arith = arithAssignedNames(raw, cmds);
   ctx.vars = collectVars(cmds, ctx);
   if (opts._vars) { ctx.vars = { ...opts._vars, ...ctx.vars }; ctx.keptVars = { ...(opts._keptVars ?? {}), ...ctx.keptVars }; } // variables the line set before the shell that runs this file started
   for (const k of opts._unknownW ?? []) ctx.unknownVars.add(k);
   ctx.pickUnknown = new Set(opts._unknown ?? []); // (a name the line gave a run-time value: only a script it picks is refused; the writer rule is for the names above)
   ctx.srcTouched = new Set(); // names a sourced file set on this line (a later plain assignment of one is the value again)
-  ctx.unknownAll = opts._unknownAll === true;
+  ctx.unknownAll = opts._unknownAll === true || ctx.arith.dynamic; // (an arithmetic that assigns through a name may set any name, also one the line never gave. Defence in depth for the names the line gave: collectVars marks every one when arith.dynamic)
   ctx.srcChanged = new Set(opts._srcChanged ?? []); // names an unfollowable sourced file may have changed (a write target that uses one is refused)
   // a name held in a variable (N=PIPELINE_ADMIN; env $N=1 claude)
   if (Object.keys(ctx.vars).length && setsAdmin(substVars(flat, ctx.vars, ctx.budget), ctx.platform)) return deny('the command sets PIPELINE_ADMIN through a variable; only the owner may set it, when launching Claude Code');
@@ -2291,11 +2506,22 @@ function evaluateBashForFilesFrame(command, opts) {
   // Why: after a cd into a directory only known at run time a relative script may be in the directories the line knows OR in any protected one (or above one): each is looked in
   // Why: a binder on the line (`read F`, `mapfile`, `getopts`, `printf -v F`, a nameref's target) gives its names a run-time value: a script they pick is refused, and a writer that uses a name the line had
   // given a value is refused, whatever the line assigned before. Applied as the command is reached (a name the line gave a value is also in unknownVars, which the per-command snapshots carry, so a loop binder reaches the commands above it and a later plain assignment does not clean an earlier use).
+  const lineIndirect = typeof raw === 'string' && indirectExpansionOnLine(raw, cmds); // (only the text the shell expands: see indirectExpansionOnLine)
   const markBound = (c) => {
+    // (#56, Codex review of 8b86e2b; on main too: zsh `${(P)N::=~/.claude/settings.json}` / a bash `${!N…}` may set any name, like `export $N=…`)
+    if (lineIndirect) { ctx.unknownAll = true; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.unknownVars.add(k); ctx.srcChanged.add(k); } }
     if (!c.argv.length) return;
     const cn = baseOf(c.argv[0]);
     const names = [];
+    // Why (#56, a live bypass on main): `F=/tmp/x; printf -v $N ~/.claude/settings.json; cp a $F` and `declare "$N=~/.claude"; cp a $HOME/settings.json`
+    // wrote the protected file when N held F / HOME. A binder whose name is only known at run time may set any name: every name is unknown from here on,
+    // as after a sourced file that cannot be followed.
+    const anyName = (LINE_BINDERS.has(cn) && (cn !== 'printf' || c.argv.some((a) => /^-[A-Za-z]*v/.test(a))) && bindsOf(cn, c.argv).weird)
+      || (['export', 'declare', 'typeset', 'local', 'readonly', 'unset', 'let'].includes(cn) && c.argv.slice(1).some((a) => /[$`]/.test(a.includes('=') ? a.slice(0, a.indexOf('=')) : a)))
+      || ZSH_NAME_BINDERS.has(cn) || (cn === 'print' && c.argv.some((a) => /^-[A-Za-z]*v/.test(a))); // (#56, Codex recheck of d925d42: zsh binders whose operands are not read)
+    if (anyName) { ctx.unknownAll = true; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.unknownVars.add(k); ctx.srcChanged.add(k); } }
     if (LINE_BINDERS.has(cn) && (cn !== 'printf' || c.argv.some((a) => /^-v/.test(a)))) names.push(...bindsOf(cn, c.argv).names);
+    names.push(...implicitBindsOf(c)); // (`[[ x =~ y ]]` sets MATCH, a (#m) pattern flag too: see implicitBindsOf)
     if (['declare', 'typeset', 'local'].includes(cn) && c.argv.slice(1).some((a) => /^-[A-Za-z]*n/.test(a))) for (const a of c.argv.slice(1)) { const t = /^[A-Za-z_]\w*=([A-Za-z_]\w*)/.exec(a); if (t) { names.push(t[1]); ctx.declared?.unknown.add(t[1]); } }
     for (const k of names) { ctx.pickUnknown.add(k); if (Object.hasOwn(ctx.vars, k)) ctx.unknownVars.add(k); }
   };
@@ -2386,12 +2612,22 @@ function evaluateBashForFilesFrame(command, opts) {
   const insideRoot = opts._writesOnly !== true && dirs.some((d) => ctx.hit(d) || ctx.hitAncestor(d)); // cwd or a `cd` target is a protected dir (or its parent): relative words and bare commands reach it
   const protectedInRaw = m.rawHit(scanRaw, dirs);
 
+  // #58: running the owner-go recorder (any copy) by hand would write an owner "merge" the owner never typed. Only Claude Code runs it,
+  // on the owner's prompt. Reading, diffing or committing the file stays allowed: only a runtime (or the file run by path) is refused.
+  for (const c of cmds) {
+    if (!c.argv.length) continue;
+    const runs = RUNTIMES.has(baseOf(c.argv[0])) || OWNER_GO_RECORDER.test(toPosix(c.argv[0]));
+    if (runs && c.argv.some((w) => /owner-go\.mjs/i.test(toPosix(expandRefs(w, ctx))))) {
+      return deny('the owner-go recorder records the owner\'s chat "merge"; only Claude Code runs it, on a prompt the owner types (PIPELINE_ADMIN=1 for the owner)');
+    }
+  }
+
   // a path built from a name whose value is only known at run time (typeset -L4 D=...) may be anywhere: a writer or a redirection that uses it is refused
   if (ctx.unknownVars.size || snaps.some((x) => x?.unknownV.size)) {
     for (const [ci, c] of cmds.entries()) {
       const refs = (w) => [...String(w).matchAll(/\$\{?(\w+)/g)].some((x) => ctx.unknownVars.has(x[1]) || snaps[ci]?.unknownV.has(x[1]));
       if ((c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && refs(r.target ?? '')) || (c.argv.length && !['export', 'declare', 'typeset', 'local', 'readonly'].includes(baseOf(c.argv[0])) && !isReadOnly(c, ctx) && (c.argv.some(refs) || Object.values(c.env ?? {}).some(refs)))) {
-        return deny('the command writes through a variable whose value is only known at run time (a width or integer attribute), so the file it reaches cannot be checked; write the path out');
+        return deny('the command writes through a variable whose value is only known at run time (a width or integer attribute, a loop word and another value on the line, or a binder such as `export $N=…` / `printf -v $N` / `${(P)N::=…}` whose name is only known at run time), so the file it reaches cannot be checked; write the path out');
       }
     }
   }
@@ -2419,7 +2655,7 @@ function evaluateBashForFilesFrame(command, opts) {
       const script = scriptFileOf(c.argv)?.file;
       const operands = script === undefined ? c.argv : c.argv.filter((w, i) => w !== script || c.argv.indexOf(w) !== i);
       if ((c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && changed(r.target ?? '')) || (writes && (operands.some(changed) || Object.entries(c.env ?? {}).some(([k, v]) => !PATH_LISTS.has(k) && taintedEnv(v))))) {
-        return deny('the command writes through a variable that a sourced file may have changed, so the file it reaches cannot be checked; write the path out');
+        return deny('the command writes through a variable that a sourced file (or a binder whose name is only known at run time) may have changed, so the file it reaches cannot be checked; write the path out');
       }
     }
   }

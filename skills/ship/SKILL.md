@@ -53,12 +53,17 @@ number, `R` a review round number, `<slug>` the branch slug.
    `awaiting-owner-merge`; an owner "merge" for that exact head in THIS session is the only way past it. Records,
    comments and labels never count as approval. Production on a resumed run is watched with
    `prod-watch --observe-only` (with `production.watch: workflow`, not at all: the workflow owns it); rollback stays with the original run or the owner.
+10. **Low-risk PRs may merge on their own** (owner ruling 2026-10-14). A normal run whose final gate passes with no
+    hard-stop hit (`ownerMerge` is `0`), no `needs-human` and no owner-ruled item merges through `P merge` without asking
+    the owner: that is intended, and a review must not flag it. Anything that hits a hard-stop, ends in `needs-human`,
+    or needs the owner's chat approval (`owner_approval: chat`, resumed runs) still waits for the owner's "merge" for the
+    exact head (the **Owner-merge approval** rule below). The ruling widens nothing else: invariants 1, 2 and 9 stand.
 
 ## Ending a run with a PR open
 
 A run that has a PR and ends for any reason except a successful merge ends with exactly one
-`P summary --pr N --outcome <word> --action "<the one thing the owner does>" [--cause <code>]`, then the agent-log
-queue line (Step 7). The summary also pushes the owner's phone; `P prod-watch` pushes the production result itself.
+`P summary --pr N --outcome <word> --action "<the one thing the owner does>" [--cause <code>]`, then
+`P agent-log publish --line "<agentLogLine>"` (Step 7). The summary also pushes the owner's phone; `P prod-watch` pushes the production result itself.
 Notifications are automatic: never send one for progress, and use `P notify --event stopped --pr N --action "…"`
 only for a stop that cannot go through summary. Two shapes, used by name below:
 
@@ -71,6 +76,13 @@ only for a stop that cannot go through summary. Two shapes, used by name below:
 `--action` is one short line in plain words ("Close the pause issue, then say resume"); `--cause` is a short slug
 (`final-gate:labels`, `codex:quota`, `verify-red`) that keeps a reworded retry from pushing twice. Stops before a PR
 exists (Step 0 preflight and labels ensure) just stop: the owner is at the keyboard, nothing is pushed.
+
+**Cost booking (best effort, never a reason to stop).** Once the PR exists, after each subagent dispatch or review call
+that reports its token use, book it: `P cost --pr N --phase <build|verify|review|gate|…> --role <implementer|judge|arbiter|verifier|controller>
+--input <n> --output <n> [--cache-read <n>] [--cache-write <n>] [--model sonnet|opus|haiku|fable | --usd <x>]` (an agent transcript
+can be passed instead, priced per message at list price: `--from-transcript <the agent's output file>`). Add `--retry` for each fix-and-reverify retry, and `--session <this session's id>` once per
+session so `P summary` can count the guard blocks. `P summary` shows the totals and the per-phase / per-role breakdown. A failed
+`P cost` is a warning only; skip it when no figures are available.
 
 ## Step 0 — opt-out, preflight
 
@@ -125,7 +137,11 @@ note it in the summary and carry on, never stop the run for it.
    is JSON `[{id, title, spec}]`, `spec` = acceptance criteria + the tests to write. After each later task: push, then
    `P checkpoint --pr N --step build --task-done <id>`. A `checkpoint` exit 1 `unpushed` ⇒ `git push`; `behind` ⇒
    `git pull --ff-only`; `diverged` ⇒ stop and report; then checkpoint again.
-2. Dispatch the **verifier** with `verify.full` (from `P config`). Green ⇒ `P checkpoint --pr N --step verify
+2. Dispatch the **verifier** with `verify.full` (from `P config`). When `verify.max_parallel_full` is set, every full verify (here, Step 5.3,
+   and the full runs of review-loop §6) runs as `node ~/.claude/pipeline/bin/pipeline.mjs verify slot --run` (it runs `verify.full` itself; nothing goes after it) instead,
+   so only that many run at once on this machine; the wrapper passes the exit code through and prints one stderr line
+   `{"slot":{…,"waitedSeconds","loadWaitSeconds","warnings"}}`: the verifier reports it, and the controller puts the waits (and any
+   warning) in the summary when they are above 0. Green ⇒ `P checkpoint --pr N --step verify
    --verify-report`, then Step 3.
 3. Red ⇒ dispatch an implementer with the failing step + excerpt (paths, not logs). Max **3 fix
    cycles**. Still red ⇒ stop early, in this order:
@@ -134,7 +150,7 @@ note it in the summary and carry on, never stop the run for it.
    gh pr edit N --add-label pipeline-blocked --body-file <body file>
    P comment --pr N --kind blocked
    P summary --pr N --outcome blocked --cause verify-red --action "Read the blocked comment: verify stays red after 3 fixes" --built "<what was attempted and where it stuck>"
-   P agent-log queue --line "<agentLogLine from the summary output>"
+   P agent-log publish --line "<agentLogLine from the summary output>"
    ```
    (The PR exists since the first checkpoint: label it, no second `gh pr create`. `blocked` works without review
    state; the PR body carries the verify report table.) Stop.
@@ -175,7 +191,7 @@ for items without a ruling yet; `P triage validate --round R --from-tag "pipelin
 --test-file …` runs it) → arbiter if `P arbiter needed` says so (`arbiter` agent, no model param,
 one batched call; its prompt starts with the `promptHeader` from `P arbiter needed`, pasted verbatim) → `P arbiter apply --round R --tag "pipeline-arbiter R<R> <digest8>"` (proves
 Fable from the subagent transcript; the tag is the Agent call's description) → implement ACCEPTED
-items (implementer + verifier full verify) → `P followups create --round R` for FOLLOW-UP →
+items (implementer + verifier: `verify.full`, or with `verify.after_fix: quick` the commands from `P verify plan-after-fix --round R`, already slot-wrapped when `verify.max_parallel_full` is set; Steps 2.2 and 5.3 stay full) → `P followups create --round R` for FOLLOW-UP →
 `P comment --pr N --kind triage`. After each round: `P checkpoint --pr N --step review --round R`. Exit when
 `P state outcome` says `clean`. Order and replay traps (triage comment BEFORE `followups create`, `P state
 discard-round` for an interrupted round): `reference/review-loop.md`. Not clean after the
@@ -188,7 +204,7 @@ rules in chat, record it with `P triage owner-ruling` (**Owner rules in chat** i
 Codex `exitCode: 3` at any point (Codex unavailable) ⇒ `gh pr edit N --add-label awaiting-review`,
 `P comment --pr N --kind awaiting-review --reason "<reason from the JSON>"`,
 `P summary --pr N --outcome awaiting-review --cause codex:<reason> --action "Say \"resume pipeline reviews\" when Codex is back" --built "<what is done>"` (works even in round 1, when no
-review state exists yet), `P agent-log queue --line "<agentLogLine>"`, stop.
+review state exists yet), `P agent-log publish --line "<agentLogLine>"` (exit 3 is fine: the line stays queued), stop.
 
 ## Step 5 — final gate
 
@@ -196,9 +212,7 @@ Details and every exit code: `reference/gates-and-exits.md`. First: `P checkpoin
 
 1. Recompute the checks on the head as it is NOW (review fixes may have moved risk): `P risk`,
    `P hardstops … > .review/hardstops.json` and `P integrity`, as in Step 3.2. A new blocking
-   hard-stop hit ⇒ Step 3.5. Then, only when `production.watch` is `workflow` (read it from `P config`), `P agent-log close
-   --queue` (queues the production results the workflow posted on earlier merged PRs; exit 1 = some PRs could not be read: still run `agent-log stage` and name them in the summary; exit 3 = GitHub unavailable: skip the close, still stage); then `P agent-log stage --pr N`
-   (commits this run's log line + queued lines into the PR branch) and `git push origin agent/<slug>`.
+   hard-stop hit ⇒ Step 3.5. (The agent log is never committed to the PR branch: Step 7 publishes it to the `pipeline-agent-log` branch.)
 2. Up to date with the base — docs-only and light-lane PRs too, so the gate (and the CI it waits on)
    judges the tree that will land: `P job start update -- node ~/.claude/pipeline/bin/pipeline.mjs
    update-branch --pr N` → `P job wait update --run-id <runId> --timeout 540` (repeat until `done`).
@@ -217,9 +231,16 @@ Details and every exit code: `reference/gates-and-exits.md`. First: `P checkpoin
      merged-externally`. Neither pushes. Stop.
    - 3 ⇒ GitHub unavailable: retry once; still 3 ⇒ `P summary --pr N --outcome stopped --cause update-branch:github
      --action "GitHub was unreachable: re-run ship resume when it is back"`, stop.
-3. Verifier: fresh `verify.full` on the current head (must be clean, full mode). Then
+   **CI proof (only when `P config` shows `verify.ci_proof`).** Right after this step run `gh pr ready N` (do not wait for 5.5): the
+   CI job that can vouch for a deferrable step skips draft PRs, so it must start now and run in parallel with the verify below.
+3. Verifier: fresh `verify.full` on the current head (must be clean, full mode; in a slot when `verify.max_parallel_full` is set, see Step 2.2). Then
    `P state outcome`: if `coverageValid` is `false` the PR content changed since the last clean
    review round (an update-branch, a late fix) ⇒ go back to Step 4 for a new round, then return here.
+   With `verify.ci_proof` configured, the verifier passes `--defer <step>` to `verify.full` for each step in `verify.deferrable_steps`
+   (the gate decides whether GitHub's run may stand in; you do not): the Mac then skips that step and the gate needs the CI proof in 5.7.
+   Skip the `--defer` for a step when this PR touches `.github/**`, `.claude/pipeline.yml`, `scripts/verify*` or a `verify.ci_proof_inputs`
+   path (it would be refused anyway), or when the PR is a fork. Without `verify.ci_proof` never pass `--defer`.
+   In a slot (`verify.max_parallel_full`) that is `node ~/.claude/pipeline/bin/pipeline.mjs verify slot --run --defer <step,step>`.
 4. High risk (from the Step 5.1 `P risk`) ⇒ `gh pr edit N --add-label <ci.e2e_label>` (if configured).
 5. Draft ⇒ `gh pr ready N`. Wait for CI on this head: checks can take a few seconds to appear after
    a push (`gh pr checks --watch` then exits 1 "no checks reported"), so poll first:
@@ -240,18 +261,26 @@ Details and every exit code: `reference/gates-and-exits.md`. First: `P checkpoin
    `labels` / `preflight` failures use `P summary --pr N --outcome stopped --cause final-gate:<check> --action "<which
    label, issue or setting blocks the merge>"` (details in `reference/gates-and-exits.md`).
    `behind-base:` in the `pr-open` detail (main moved since 5.2) ⇒ Step 5.2, then 5.3 onward.
+   **CI proof causes** (the `verify-report` detail; `reference/gates-and-exits.md`): `ci-proof-pending:<step>` ⇒ wait for the GitHub run, as a job
+   for at most `verify.ci_proof_wait_minutes` minutes in total (e.g. `P job start ciproof -- bash -c 'gh pr checks N --watch'`, then
+   `P job wait ciproof …`), and run `P final-gate` again. Past that limit, `ci-proof-missing:<step>` (any reason) or `ci-proof-failed:<step>`
+   after a fix ⇒ run a fresh FULL `verify.full` WITHOUT `--defer` at once (never `--only`: the gate refuses a partial report; in a slot when
+   `verify.max_parallel_full` is set), then `P final-gate` again; do not wait, do not retry the lookup. `ci-proof-failed` is a red step: fix the
+   cause first (new commit ⇒ back to 5.1). With no `ci_proof_wait_minutes` set do not wait at all.
 
 ## Step 6 — merge and production
 
 **Every `P merge` attempt (the first, a retry, one after an update-branch or a new head) first passes the
 **Owner-merge approval** rule below.** With `owner_approval: label` its `ownerMerge` count rule is a no-op, but its
 resumed-run rule is not: a run in Resume mode or on an adopted PR never calls `P merge` without the owner's "merge"
-(`P merge` itself refuses a resumed record, or one it cannot check, without `--owner-approved-head`). `P merge`,
+(`P merge` itself refuses a resumed record, or one it cannot check, without the owner's recorded "merge": see below). `P merge`,
 `P prod-watch --pr N` and `P update-branch` keep the record's in-flight marker themselves (no checkpoint needed around
 them). `P merge` posts the `prod-before` event before merging and refuses (`error: pre-merge`, nothing merged) when it
-cannot: see `reference/gates-and-exits.md`.
+cannot: see `reference/gates-and-exits.md`. For a repo with `verify.deferrable_steps` it likewise records which proof each deferrable step
+used (the Mac, or GitHub run <id> attempt <n>) in the run record and a `ci-proof-used` event, taken from its own live gate check, and refuses the same way
+when it cannot; the PR summary shows one line per step (`<step> proof: GitHub run <id> attempt <n>` or `<step> proof: Mac`).
 
-1. `P job start merge -- node ~/.claude/pipeline/bin/pipeline.mjs merge --pr N` (a resumed run adds `--owner-approved-head <sha>`, see below) → `P job wait
+1. `P job start merge -- node ~/.claude/pipeline/bin/pipeline.mjs merge --pr N` (an owner-approved run adds `--owner-approved-head <sha> --owner-approved-items <ownerItems>`, see below) → `P job wait
    merge --run-id <runId> --timeout 540`; read `exitCode` and the JSON in `tail`:
    - 0 ⇒ merged. `mergeSha` is the merge commit; `null` (with a `warning`) means GitHub did not
      name it yet: still run prod-watch, with `--pr N` alone (2 below). Never skip prod-watch unless `production.watch` is `workflow` (2 below).
@@ -269,7 +298,7 @@ cannot: see `reference/gates-and-exits.md`.
    the project smokes production and posts the result on the merged PR, and nothing is rolled back. prod-watch is what
    sends the production push, so here no production push is sent: the workflow owns that result. Summary outcome
    `merged` (it pushes nothing); tell the user the workflow posts the production result on the PR and never rolls back (a later ship run
-   copies it into the agent log, Step 5.1). Otherwise merged ⇒ `P job start prod -- node ~/.claude/pipeline/bin/pipeline.mjs prod-watch --sha
+   copies it into the agent log, Step 7). Otherwise merged ⇒ `P job start prod -- node ~/.claude/pipeline/bin/pipeline.mjs prod-watch --sha
    <mergeSha> --pr N [--expect-text …]` (no `mergeSha`: `prod-watch --pr N`, it reads the merge
    commit itself) → `P job wait prod --run-id <runId> --timeout 540`. `--expect-text` must be text
    the NEW build shows: smokes of a rolled-back or superseded deployment ignore it. Read the
@@ -291,33 +320,52 @@ cannot: see `reference/gates-and-exits.md`.
 too. Without it, STOP: `chat` ⇒ `P checkpoint --pr N --step awaiting-owner-merge`, `P summary --pr N --outcome
 awaiting-owner-merge --built "…"`, and the reply's last two lines below (items may be none); `label` ⇒ add `needs-human`,
 `P comment --pr N --kind needs-human --reason "resumed run: the owner merges"`, `P summary --pr N --outcome needs-human
---built "…"`. When the owner says "merge" for that head, run `P merge --pr N --owner-approved-head <sha>` (the full 40-character
-head the gate covered; any other head is refused).
+--built "…"`. When the owner says "merge" for that head, run `P merge --pr N --owner-approved-head <sha> --owner-approved-items <ownerItems>`
+(the full 40-character head and the `ownerItems` of the gate that covered it; anything else is refused).
 
 Owner-merge items are hard-stop hits or test-integrity violations that `label` mode would block. Immediately before
 each `P merge`, take the `ownerMerge` count of the `P final-gate --pr N` that covers the head you are about to merge:
 - `0` ⇒ merge as usual.
 - `> 0` (also review items the owner ruled in chat with `P triage owner-ruling`: the gate's `review` detail lists their ids and the
   owner's quotes; show them in the stop comment) ⇒ merge ONLY if the owner said "merge" in THIS session for exactly this head sha and no owner-merge item beyond
-  the ones shown to them. A "merge" given for an earlier head never carries over: a new commit, an update-branch, a rebase or
+  the ones shown to them, with `P merge --pr N --owner-approved-head <full 40-character head> --owner-approved-items <ownerItems>` (`P merge` refuses an
+  `ownerMerge > 0` head without the owner's recorded "merge" for that head and item set). A "merge" given for an earlier head never carries over: a new commit, an update-branch, a rebase or
   a retry after a head change (Step 5.2, a `behind-base` return, a refreshed gate) needs a new stop. If there is no such
   approval, STOP:
-  1. Post one comment: `gh pr comment N --body "<each item: rule, file, one-line why; head <sha7>; the owner merges by saying \"merge\" in chat>"`.
-  2. `P checkpoint --pr N --step awaiting-owner-merge`, then `P summary --pr N --outcome awaiting-owner-merge --action "Check the listed items, then say \"merge\" for head <sha7>" --built "…"`, queue the agent-log line (Step 7), end the run with
-     outcome `awaiting-owner-merge`, keep the worktree. The reply's LAST two lines are exactly (7 = the first 7 characters of the head):
-     `Head <sha7>`
+  1. Post one comment: `gh pr comment N --body "<each item: rule, file, one-line why; head <sha12>; the owner merges by saying \"merge\" in chat>"`.
+  2. `P checkpoint --pr N --step awaiting-owner-merge`, then `P summary --pr N --outcome awaiting-owner-merge --action "Check the listed items, then say \"merge\" for head <sha12>" --built "…"`, publish the agent-log line (Step 7), end the run with
+     outcome `awaiting-owner-merge`, keep the worktree. The reply's LAST two lines are exactly (sha12 = the first 12 characters of
+     the head; ownerItems = the gate's `ownerItems`, `none` when there are no items):
+     `Head <sha12> · items <ownerItems>`
      `🔀 Ready to merge #N — say "merge"`
+     Several PRs at once: one `#N head <sha12> · items <ownerItems>` line per PR, then `🔀 Ready to merge #N, #M — say "merge"`.
 - When the owner then says "merge" and the head and items are unchanged, run Step 6 (final gate again if the base moved,
   `P merge`, prod-watch, rollback handling). If the head changed or new items appeared after they said "merge",
   show the updated items and the new head and stop again, with a new `awaiting-owner-merge` summary for that head.
 The owner's chat message is the approval; never add an approval label yourself (invariant 2).
 
+**How the "merge" is recorded (#58).** The owner-go hook (UserPromptSubmit) records a prompt the owner types that STARTS with
+"merge" ("merge", "merge #N", "merge <sha12>"; never "do not merge" or "merge?"), bound to the Head / items lines of the reply
+right before it, and says so in one context line (`[claude-pipeline owner-go] the owner's "merge" is recorded: #N head … items …`).
+`P merge` checks that record: the flags only name it. So: always end the request reply with the two lines above (the record binds
+only to the LAST reply: if anything else was said since, show the request again); never type, quote or simulate the owner's
+prompt, run the owner-go hook, or write `~/.claude/pipeline-state/owner-go` (the guards refuse it). No record ⇒ `P merge` says
+"no owner \"merge\" is recorded": show the request again and wait. In an `owner_approval: chat` repo a direct `gh pr merge`, the repo's
+merge command typed by hand, or auto-merge through the API is refused too unless the owner said "merge" for that PR and head in this
+session (and it pins the head: `--match-head-commit <full head>`); `P merge` is the normal way.
+
 ## Step 7 — summary
 
 `P summary --pr N --outcome <outcome> --action "<the one thing the owner does>" --built "<2–3 sentences>"` posts the summary comment
-(outliers first) and prints `agentLogLine`. Queue that line — `P agent-log queue --line
-"<agentLogLine>"` — for every outcome except a clean `merged` (that run's line was staged in
-Step 5.1). Then tell the user, in plain English: what shipped, PR link, outcome, follow-up issues,
+(outliers first) and prints `agentLogLine` (for `--outcome merged` also `pendingLogLine`, the same line ending
+`merged — prod smoke pending`, which `agent-log close` later resolves). Log it for EVERY outcome, a clean `merged` run included:
+when `production.watch` is `workflow` (read it from `P config`) first `P agent-log close --queue` (queues the production results the
+workflow posted on earlier merged PRs; exit 1 = some PRs could not be read: still publish and name them in the summary; exit 3 =
+GitHub unavailable: skip the close, still publish), then `P agent-log publish --line "<line>"` with `pendingLogLine` for a merged run
+under `workflow` and `agentLogLine` otherwise. `publish` appends every queued line plus this one to `docs/agent-log.md` on the
+`pipeline-agent-log` branch and pushes only that branch: it commits nothing to the PR branch, so no new head to approve and no
+conflicts. Exit 3 (push or network failed) is fine: the lines stay queued and go out with the next run; say so in the summary.
+Then tell the user, in plain English: what shipped, PR link, outcome, follow-up issues,
 anything needing them. Release the worktree's keep lock: `P worktrees unkeep agent-<slug> --run agent-<slug>`, then
 `P worktrees prune --notify` and read `summary` (or `skipped`). Prune removes the worktree once its PR has been merged
 for 24 h and keeps it while the PR waits for a human or for Codex; never remove it by hand.
@@ -364,7 +412,7 @@ the owner's next move.
    Then `P worktrees keep <worktree dir name> --reason "ship run <worktree dir name>"` (the directory name of the worktree
    in use, e.g. `agent-<slug>`; the same id Step 7 passes to `unkeep --run`). `P preflight`. Then take the run over: `P checkpoint --pr N --step <enter> --resumed` (`followups` ⇒ `--step review`;
    for `adopt: true` step 5's checkpoint is the take-over and carries `--resumed`). The flag marks the record, so `P merge`
-   will not run without `--owner-approved-head` even after a later session picks the run up. The plan's `stop` is where the run ends, with its `P summary --outcome <stop>` (Step 5 / Owner-merge approval).
+   will not run without the owner's recorded "merge" (and `--owner-approved-head`) even after a later session picks the run up. The plan's `stop` is where the run ends, with its `P summary --outcome <stop>` (Step 5 / Owner-merge approval).
 4. `P state show --pr N`; read `source`. `quarantined` ⇒ tell the owner the local `.review/` went to `quarantinedTo`
    and the published state was restored. Exit 2 `no-state` is normal when Codex was down in round 1.
 5. `adopt: true` (no run record: the PR was not started by the pipeline) ⇒ Step 3.2 checks on the real diff, then
@@ -375,7 +423,7 @@ the owner's next move.
 7. After a clean review, `P review-complete --pr N` removes `awaiting-review` (exit 1 ⇒ the review is not valid for
    this head: run another round). Every route that reaches Step 5 ends at the plan's `stop` (invariant 9), with its
    `P summary --outcome awaiting-owner-merge` (chat) or `needs-human` (label), see **Owner-merge approval** "Resumed runs". Step 6
-   runs only after the owner says "merge" for the head the gate covered, and then with `--owner-approved-head <sha>`.
+   runs only after the owner says "merge" for the head the gate covered, and then with `--owner-approved-head <sha> --owner-approved-items <ownerItems>`.
 
 ## Promoting suggestions
 

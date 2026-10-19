@@ -24,6 +24,27 @@ verify:
   # skippable_steps: [db]          # optional: steps verify may skip (report status "skipped" + a reason, e.g. a slow db step
   #                                # when nothing it depends on changed). final-gate refuses a skipped step not listed here;
   #                                # absent = no step may be skipped. Every name must also be in expected_steps (when set).
+  # stop_queue_wait_minutes: 5   # optional, integer 0..30, default 0: minutes verify.quick may WAIT (e.g. for a machine-wide
+  #                                # heavy-check slot) before it runs. The Stop hook adds this to its 840 s execution allowance, so
+  #                                # raise the hook's "timeout" in .claude/settings.json to 900 + minutes * 60 seconds (5 -> 1200);
+  #                                # `P config` warns when it is lower.
+  # after_fix: quick            # optional, full (default) | quick: what the verifier runs after review fixes are accepted. quick = verify.quick,
+  #                                # plus verify.full --only <steps> when the fixes touch a path below (`P verify plan-after-fix --round R`
+  #                                # prints the commands). The first full verify and the final gate's verify stay full.
+  # after_fix_steps_by_path:       # optional: glob -> steps to add (`verify.full --only a,b`) when the round's fixes touch a match
+  #   "supabase/**": [db, db-grants]
+  # after_fix_never: [sql-arms]    # optional: steps that must stay full-verify only; one listed in the map above is a config error
+  # max_parallel_full: 2        # optional, positive integer: at most this many FULL verifies (of any repo) run at once on this machine; the
+  #                                # rest wait in arrival order. The ship skill then runs `P verify slot --run` (which runs verify.full itself). Unset = no limit.
+  # max_load: 12                # optional, positive number, needs max_parallel_full: after getting a slot, wait while the 1-minute load
+  #                                # average is above this (re-checked every 5-30 s), then run anyway with a warning. Not on Windows.
+  # max_load_wait_minutes: 10   # optional, default 10, at most 10: how long that load wait may last
+  # deferrable_steps: [sql-arms]   # optional: steps whose local run a GitHub Actions run may replace at the final gate (verify.mjs --defer <step>
+  #                                # reports them skipped with skipKind "ci"). Needs ci_proof below. The gate reads these settings from the BASE branch.
+  # ci_proof:                      # optional: for each deferrable step, the workflow FILE and job that vouch for it (never matched by check name alone)
+  #   sql-arms: { workflow: .github/workflows/migration-replay.yml, job: "SQL arms", event: pull_request }   # job: one aggregator job for a sharded matrix
+  # ci_proof_inputs: ["supabase/tests/sql-arms/**"]   # optional: extra paths that make a PR ineligible (.github/**, .claude/pipeline.yml, scripts/verify* always do)
+  # ci_proof_wait_minutes: 20      # optional, above 0: the most ship waits for that run before running the step on the Mac (unset = no waiting)
 
 ci:
   required_checks: ["Test integrity", "Hard-stop scan"]   # + your CI job names
@@ -88,4 +109,4 @@ review:
   max_rounds: 3
   light_lane_max_lines: 50
 
-agent_log: docs/agent-log.md
+agent_log: docs/agent-log.md   # one line per run; kept on the orphan branch `pipeline-agent-log` (`pipeline agent-log publish`), never committed to a PR branch

@@ -8,7 +8,7 @@ import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fill } from './config.mjs';
 import { git as gitRun, NETWORK_TIMEOUT_MS } from './git.mjs';
-import { runShellAsync } from './proc.mjs';
+import { envWithGhDir, runShellAsync } from './proc.mjs';
 import { resolvedRollbacks, unresolvedRollbacks } from './run-events.mjs';
 import { OUTCOME_NEXT, OUTCOME_STEP, applyCheckpoint, bindRecord, emptyRecord, prodStillOpen } from './run-record.mjs';
 import { readSummaryComment, writeSummaryComment } from './summary-comment.mjs';
@@ -116,11 +116,11 @@ export function knownGoodFromEvents(events, environment) {
 
 // The production smoke: the project's configured command with {url} (strict: a missing value is an error, never a
 // half-filled command), expect-text passed through the environment. Never rejects; a timeout is a failed smoke.
-export function createSmoke({ production, cwd, env, runShell = runShellAsync }) {
+export function createSmoke({ production, cwd, env, runShell = runShellAsync, ghFallbackDirs }) {
   return async ({ url, expectText }) => {
     const command = fill(production.smoke, { url }, { strict: true });
     // '' (not undefined) so an expect-text exported in the caller's own environment cannot leak into this run.
-    const r = await runShell(command, { cwd, env: { ...env, PIPELINE_SMOKE_EXPECT_TEXT: expectText ?? '' }, timeoutMs: SMOKE_TIMEOUT_MS });
+    const r = await runShell(command, { cwd, env: envWithGhDir({ ...env, PIPELINE_SMOKE_EXPECT_TEXT: expectText ?? '' }, { fallbackDirs: ghFallbackDirs }), timeoutMs: SMOKE_TIMEOUT_MS });
     return { ok: r.code === 0 && !r.timedOut, code: r.code, tail: tail(`${r.stdout}\n${r.stderr}`, 3000) };
   };
 }
