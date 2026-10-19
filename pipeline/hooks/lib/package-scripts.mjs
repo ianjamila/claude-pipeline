@@ -580,6 +580,8 @@ export function packageScripts(call, env) {
   if (!up.complete) return refuse(`more than ${MAX_WALK} directories lie above ${start}, so the package.json the manager uses cannot be found.`);
   if (!up.found) return end({ none: true });
   const candidates = [up.found];
+  // (R1-B3: every file the workspace search reads -- an ancestor's package.json and pnpm-workspace.yaml, each package's package.json -- is asked what the line writes, as the upward walk's are; a file the line CREATES counts)
+  const writtenRefusal = (f) => { const w = env.written?.(f); return w === 'known' || (w === 'maybe' && env.mentionsGuarded?.()) ? writtenMsg(f) : null; };
   if (call.workspace) {
     // every ancestor that names workspaces (the project itself may be one of its packages), then their packages
     const roots = [];
@@ -587,6 +589,8 @@ export function packageScripts(call, env) {
     let reached = false;
     for (let i = 0; i < MAX_WALK; i++) {
       const pj = p.join(d, 'package.json');
+      const wr = writtenRefusal(pj) ?? writtenRefusal(p.join(d, 'pnpm-workspace.yaml'));
+      if (wr) return wr;
       const rec = exists(pj) ? read(pj) : null;
       if (rec?.unreadable) return unreadable(pj);
       if (rec?.invalid) return invalid(pj);
@@ -626,6 +630,8 @@ export function packageScripts(call, env) {
         } else return refuse(`the workspace pattern \`${raw}\` in ${root} cannot be listed (only directories and \`dir/*\`), so which packages a workspace option reaches cannot be verified. Run the script from the package's own directory.`);
         for (const dd of dirs) {
           const pj = p.join(dd, 'package.json');
+          const wr = writtenRefusal(pj);
+          if (wr) return wr;
           if (!env.pathExists(pj) || candidates.some((c) => c.file === pj)) continue;
           if (candidates.length >= MAX_WORKSPACE_PACKAGES) return refuse(`${root} holds more than ${MAX_WORKSPACE_PACKAGES} workspace packages, so the scripts a workspace option reaches cannot all be verified. Run the script from the package's own directory.`);
           candidates.push({ dir: dd, file: pj });

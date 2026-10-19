@@ -100,11 +100,11 @@ test('R1-B3 a workspace package.json the line writes or creates before the manag
   // the workspace list itself: a pnpm-workspace.yaml and the root package.json the line writes
   const pnpm = (g) => ({ 'package.json': pkg({}), 'pnpm-workspace.yaml': 'packages:\n  - "packages/*"\n', 'packages/a/package.json': pkg({ lint: 'echo hi' }), 'other.yaml': `packages:\n  - "packages/*"\n# ${g.bad}\n` });
   denied('cp other.yaml pnpm-workspace.yaml && pnpm --filter a run lint', pnpm, /writes .*pnpm-workspace\.yaml/);
-  // twins: a write to something else, a copy that holds nothing guarded, and the plain workspace call
+  // twins: a write to something else, and the plain workspace call
   allowed('npm run lint -w ./packages/a', tree);
   allowed('echo hi > notes.txt && npm run lint -w ./packages/a', tree);
   allowed('cp replacement.json packages/a/notes.json && npm run lint -w ./packages/a', tree);
-  allowed('cp harmless.json packages/a/package.json && npm run lint -w ./packages/a', (g) => ({ ...tree(g), 'harmless.json': pkg({ lint: 'echo fine' }) }));
+  allowed('cp replacement.json packages/b/notes.json && npm run lint -w ./packages/a', (g) => ({ ...tree(g), 'packages/b/keep': 'x' }));
 });
 
 test('R1-B4 a node_modules/.bin script is judged in the caller\'s directory, not node_modules/.bin (both guards)', () => {
