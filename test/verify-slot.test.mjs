@@ -375,6 +375,17 @@ test('slotRunLine: appends --only, with the npm -- forwarding plan-after-fix use
   assert.equal(slotRunLine({ full: 'npm run verify -- --x' }, { only: 'db' }), 'npm run verify -- --x --only db');
 });
 
+test('slotRunLine: --defer appends only steps in verify.deferrable_steps, never with --only', () => {
+  const verify = { full: 'node scripts/verify.mjs', deferrable_steps: ['sql-arms'] };
+  assert.equal(slotRunLine(verify, { defer: 'sql-arms' }), 'node scripts/verify.mjs --defer sql-arms');
+  assert.equal(slotRunLine({ ...verify, full: 'npm run verify' }, { defer: 'sql-arms' }), 'npm run verify -- --defer sql-arms');
+  assert.throws(() => slotRunLine(verify, { defer: 'db' }), /not in verify.deferrable_steps: db/);
+  assert.throws(() => slotRunLine({ full: 'node scripts/verify.mjs' }, { defer: 'sql-arms' }), /not in verify.deferrable_steps/);
+  assert.throws(() => slotRunLine(verify, { defer: 'sql-arms;x' }), /step names may only use/);
+  assert.throws(() => slotRunLine(verify, { defer: 'sql-arms,sql-arms' }), /listed twice/);
+  assert.throws(() => slotRunLine(verify, { defer: 'sql-arms', only: 'db' }), /not with --only/);
+});
+
 test('CLI: anything but verify.full is refused with exit 2 and nothing is spawned', TIMEOUT, async () => {
   const work = tmp();
   const marker = path.join(work, 'argv.json');

@@ -35,12 +35,13 @@ export const meta = {
     '  reviewed head (renames count on both sides) touch a path in verify.after_fix_steps_by_path, verify.full --only <those steps>;',
     '  run them in order, either red = fix cycle. exit 1 {ok:false, error} when round R has no recorded review state (fail closed)',
     '  verify.max_parallel_full set: the full commands above come back as `node ~/.claude/pipeline/bin/pipeline.mjs verify slot --run [--only STEPS]`',
-    'pipeline verify slot --run [--only STEP,STEP...] [--repo DIR]   wait for a free slot, run the repo\'s verify.full (with --only STEPS appended; npm gets "--" first),',
+    'pipeline verify slot --run [--only STEP,STEP... | --defer STEP,STEP...] [--repo DIR]   wait for a free slot, run the repo\'s verify.full (with --only STEPS appended; npm gets "--" first),',
     '  inherited stdio, free the slot when it ends; exit code = verify.full\'s. It runs nothing else: any other argument, or "--", is a usage error (exit 2).',
     '  The exact command line is judged first by the same git and file guards as `job start`: denied -> exit 1 {ok:false, refused:true, reason}, nothing queued or run.',
     '  Slots are machine-wide (all repos); the limit is verify.max_parallel_full of the repo it runs in; unset = it runs at once. Waiters go in arrival order.',
     '  One stderr line before verify.full starts: {"slot":{index,of,waitedSeconds,loadWaitSeconds,warnings}}. With verify.max_load it then waits (5-30 s jitter between',
     '  checks, at most verify.max_load_wait_minutes) while the 1-minute load average is above it, and proceeds with a warning when the time is up.',
+    '  --defer STEPS (each in verify.deferrable_steps) is appended like --only, for the gate\'s full verify of a repo with verify.ci_proof; not with --only.',
     '  SIGINT/SIGTERM/SIGHUP go to the running verify. STEPS: letters, digits and . _ : - only, no repeats, each in verify.expected_steps when that is set.',
     'pipeline verify slot --status   -> {ok, lockDir, holders[{index,pid,host,startedAt,alive}], waiters[{seq,pid,host,alive}]}   (read only; the whole machine)',
   ].join('\n'),
@@ -49,10 +50,15 @@ export const meta = {
 // `--only` takes a comma list (template scripts/verify.mjs). npm swallows flags that come before `--`, so an
 // `npm run ...` command gets one inserted unless it already forwards its arguments.
 export function withOnly(command, steps) {
-  const only = `--only ${steps.join(',')}`;
+  return withFlag(command, 'only', steps);
+}
+
+// `--<flag> a,b` appended the same way (`--only`, and `--defer` for a slot run of a repo with verify.deferrable_steps).
+export function withFlag(command, flag, steps) {
+  const arg = `--${flag} ${steps.join(',')}`;
   const trimmed = command.trim();
   const forwards = /\s--(\s|$)/.test(trimmed);
-  return /^npm\s+run(\s|$)/.test(trimmed) && !forwards ? `${trimmed} -- ${only}` : `${trimmed} ${only}`;
+  return /^npm\s+run(\s|$)/.test(trimmed) && !forwards ? `${trimmed} -- ${arg}` : `${trimmed} ${arg}`;
 }
 
 // Paths of `git diff -M --name-status -z from..to`, a rename counted on BOTH sides (moving a file out of a mapped
@@ -357,12 +363,27 @@ const RUN_FLAGS = {
       return { steps };
     },
   },
+  // Steps the verify leaves to a GitHub CI proof (template scripts/verify.mjs --defer): each must be in verify.deferrable_steps.
+  defer: {
+    option: { type: 'string' },
+    parse(raw, verify) {
+      const steps = raw.split(',');
+      if (steps.some((n) => !SAFE_STEP.test(n))) throw new UsageError('verify slot --defer: step names may only use letters, digits and . _ : - (comma separated)');
+      if (new Set(steps).size !== steps.length) throw new UsageError('verify slot --defer: a step is listed twice');
+      const deferrable = Array.isArray(verify.deferrable_steps) ? verify.deferrable_steps : [];
+      const unknown = steps.filter((n) => !deferrable.includes(n));
+      if (unknown.length > 0) throw new UsageError(`verify slot --defer: not in verify.deferrable_steps: ${unknown.join(', ')}`);
+      return { steps };
+    },
+  },
 };
 
 // The one command `slot --run` may start: verify.full from the config, plus the validated flags. Exported for tests.
 export function slotRunLine(verify, flags) {
-  const steps = flags.only !== undefined ? RUN_FLAGS.only.parse(flags.only, verify).steps : [];
-  return steps.length > 0 ? withOnly(verify.full, steps) : verify.full;
+  if (flags.only !== undefined && flags.defer !== undefined) throw new UsageError('verify slot: --defer applies to a full run only (not with --only)');
+  if (flags.only !== undefined) return withFlag(verify.full, 'only', RUN_FLAGS.only.parse(flags.only, verify).steps);
+  if (flags.defer !== undefined) return withFlag(verify.full, 'defer', RUN_FLAGS.defer.parse(flags.defer, verify).steps);
+  return verify.full;
 }
 
 // Test seams (environment): PIPELINE_LOCK_DIR moves the machine lock directory, PIPELINE_SLOT_POLL_MS the queue poll interval.

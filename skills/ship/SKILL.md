@@ -240,6 +240,7 @@ Details and every exit code: `reference/gates-and-exits.md`. First: `P checkpoin
    (the gate decides whether GitHub's run may stand in; you do not): the Mac then skips that step and the gate needs the CI proof in 5.7.
    Skip the `--defer` for a step when this PR touches `.github/**`, `.claude/pipeline.yml`, `scripts/verify*` or a `verify.ci_proof_inputs`
    path (it would be refused anyway), or when the PR is a fork. Without `verify.ci_proof` never pass `--defer`.
+   In a slot (`verify.max_parallel_full`) that is `node ~/.claude/pipeline/bin/pipeline.mjs verify slot --run --defer <step,step>`.
 4. High risk (from the Step 5.1 `P risk`) ⇒ `gh pr edit N --add-label <ci.e2e_label>` (if configured).
 5. Draft ⇒ `gh pr ready N`. Wait for CI on this head: checks can take a few seconds to appear after
    a push (`gh pr checks --watch` then exits 1 "no checks reported"), so poll first:
