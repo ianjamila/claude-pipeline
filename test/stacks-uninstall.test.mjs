@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { stacksUninstall, uninstallStacksRoot, SCHEDULE_NAME, WORKER_WAIT_MS } from '../pipeline/lib/stacks/uninstall.mjs';
 import { scheduleLabel, scheduleMarker } from '../pipeline/lib/schedule.mjs';
 
@@ -41,8 +41,8 @@ const LABEL = scheduleLabel(SCHEDULE_NAME);
 test('the label and root the uninstall works on', () => {
   assert.equal(LABEL, 'com.claude-pipeline.stacks-sweep');
   assert.equal(WORKER_WAIT_MS, 120_000);
-  assert.equal(uninstallStacksRoot({ home: '/u/.claude', env: {} }), '/u/.claude/pipeline-state/stacks');
-  assert.equal(uninstallStacksRoot({ home: '/u/.claude', env: { PIPELINE_STACKS_HOME: '/x/iso' } }), '/x/iso');
+  assert.equal(uninstallStacksRoot({ home: '/u/.claude', env: {} }), join('/u/.claude', 'pipeline-state', 'stacks'));
+  assert.equal(uninstallStacksRoot({ home: '/u/.claude', env: { PIPELINE_STACKS_HOME: '/x/iso' } }), resolve('/x/iso'));
 });
 
 test('an existing root is paused (the pause file only); nothing else in it changes', () => {

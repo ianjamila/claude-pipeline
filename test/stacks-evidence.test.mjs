@@ -382,6 +382,11 @@ test('consumerWorktrees: a transcript cwd that is / , the home directory or an a
   }
 });
 
+test('consumerWorktrees: win32 => unknown, no I/O', () => {
+  const noIo = () => assert.fail('no I/O on win32');
+  assert.deepEqual(consumerWorktrees(stackSa, { events: [], transcripts: { dirs: ['/x'], sinceMs: 0 }, repos: ['/r'], listWorktrees: noIo, platform: 'win32' }), { ok: false, reason: 'windows' });
+});
+
 test('consumerWorktrees: an unreadable worktree directory is unknown, not "no env files"', rootOnly, () => {
   const { base, mk } = makeRepo();
   const a = mk('locked');

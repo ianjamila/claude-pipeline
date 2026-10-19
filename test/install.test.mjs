@@ -106,9 +106,11 @@ const ownerGo = (home) => ({
   hooks: [{ type: 'command', command: 'node', args: [joinNative(home, 'pipeline', 'hooks', 'owner-go.mjs')], timeout: 10 }],
 });
 // The stack-stop hooks: stack-register through the fail-closed loader (30 s) once per matcher, dev-bind and session-end plain (10 s).
+// The installer keeps the style of the claude-home it is given (joinNative), so a POSIX-style '/h/.claude' stays POSIX on Windows too.
+const stackRegisterHandler = (home) => ({ ...loaded(home, 'stack-register'), args: ['--input-type=module', '-e', HOOK_LOADER, joinNative(home, 'pipeline', 'hooks', 'stack-register.mjs')], timeout: 30 });
 const stackRegisters = (home) => [
-  { matcher: 'Bash', hooks: [{ ...loaded(home, 'stack-register'), timeout: 30 }] },
-  { matcher: 'Read|Edit|Write|Grep|Glob|NotebookEdit', hooks: [{ ...loaded(home, 'stack-register'), timeout: 30 }] },
+  { matcher: 'Bash', hooks: [stackRegisterHandler(home)] },
+  { matcher: 'Read|Edit|Write|Grep|Glob|NotebookEdit', hooks: [stackRegisterHandler(home)] },
 ];
 const stackDevBind = (home) => ({
   matcher: 'Bash', hooks: [{ type: 'command', command: 'node', args: [joinNative(home, 'pipeline', 'hooks', 'stack-dev-bind.mjs')], timeout: 10 }],
@@ -1799,11 +1801,12 @@ test('uninstall pauses an existing stacks root, leaves everything in it alone an
   assert.equal(install(home).status, 0);
   const r = install(home, ['--uninstall', '--json'], { env });
   assert.equal(r.status, 0, r.stderr);
-  assert.equal(existsSync(join(root, 'pause')), true, 'pause file touched');
-  assert.deepEqual(listTree(root), [...before, 'pause'].sort(), 'nothing else in the stacks root changed');
+  const windows = process.platform === 'win32'; // stack-stop is not supported on Windows: uninstall must leave the stacks root exactly as it was
+  assert.equal(existsSync(join(root, 'pause')), !windows, windows ? 'win32: no pause file, the root is untouched' : 'pause file touched');
+  assert.deepEqual(listTree(root), windows ? before : [...before, 'pause'].sort(), 'nothing else in the stacks root changed');
   for (const f of ['config.json', 'mode.json', 'ledger.jsonl', 'actions.jsonl']) assert.equal(readFileSync(join(root, f), 'utf8'), `${f}\n`);
   const j = JSON.parse(r.stdout);
-  assert.equal(j.stacks.paused, true);
+  assert.equal(j.stacks.paused, !windows);
   assert.deepEqual(j.stacks.workersSurvived, []);
 
   const home2 = newHome();
@@ -1820,6 +1823,11 @@ test('without PIPELINE_STACKS_HOME the stacks root is the one of the home being 
   mkdirSync(root, { recursive: true });
   const r = install(home, ['--uninstall']);
   assert.equal(r.status, 0, r.stderr);
+  if (process.platform === 'win32') { // stack-stop is not supported on Windows: nothing is paused, nothing is written
+    assert.equal(existsSync(join(root, 'pause')), false);
+    assert.doesNotMatch(r.stdout, /stacks:\s+paused/);
+    return;
+  }
   assert.equal(existsSync(join(root, 'pause')), true);
   assert.match(r.stdout, /stacks:\s+paused/);
 });

@@ -63,7 +63,7 @@ test('config ok: ids lowercased, ~ expanded against the injected home, defaults 
   assert.deepEqual(cfg.memoryDirs, [`${home}/mem/a`]);
   assert.deepEqual(cfg.memoryExclude, ['note.md'], 'file names are not paths');
   assert.deepEqual(cfg.devPorts, [3000, 4000, 4017]);
-  assert.deepEqual(cfg.transcriptDirs, [`${home}/.claude*/projects`], 'default keeps the glob; the evidence code expands it strictly');
+  assert.deepEqual(cfg.transcriptDirs, [join(home, '.claude*', 'projects')], 'default keeps the glob; the evidence code expands it strictly');
   writeFileSync(join(d, 'e.json'), '{}');
   const empty = loadMachineConfig(join(d, 'e.json'), { home });
   assert.equal(empty.status, 'ok');

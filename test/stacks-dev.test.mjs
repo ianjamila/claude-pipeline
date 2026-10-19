@@ -18,6 +18,9 @@ import { ok, unknown } from '../pipeline/lib/stacks/result.mjs';
 process.env.PIPELINE_MACHINE_ID ||= 'test-machine-id'; // lock owner records never create ~/.claude/pipeline-state/machine-id
 
 const posixOnly = { skip: process.platform === 'win32' && 'POSIX only' };
+// The stack code refuses on win32 by design (tested explicitly below). Every other test drives the POSIX logic with an injected
+// platform, so it runs the same on every CI runner; on macOS / Linux the real platform is kept.
+const PLAT = process.platform === 'win32' ? 'linux' : process.platform;
 const here = dirname(fileURLToPath(import.meta.url));
 const HOOK = join(here, '..', 'pipeline', 'hooks', 'stack-dev-bind.mjs');
 const FAKE_PS = join(here, 'fixtures', 'fake-ps-bin.mjs');
@@ -113,7 +116,7 @@ const record = (d, over = {}) => ({
   port: 3000, tPre: iso(T0), tPost: iso(T0 + 2), ...over,
 });
 const NOW = (T0 + 30) * 1000;
-const bindOpts = (w, over = {}) => ({ owner: OWNER, run: w.run, ...w.bins, kill: w.probeKill, now: () => NOW, others: [], ...over });
+const bindOpts = (w, over = {}) => ({ owner: OWNER, run: w.run, ...w.bins, kill: w.probeKill, now: () => NOW, others: [], platform: PLAT, ...over });
 
 // ---------------------------------------------------------------- listeners
 
@@ -121,7 +124,7 @@ test('listeners: pid, birth (UTC) and cwd of the LISTEN socket owner; a dead pid
   const d = dirs();
   const w = std(d);
   w.listen[3000] = [300, 301];
-  const r = listeners(3000, { run: w.run, ...w.bins, kill: w.probeKill });
+  const r = listeners(3000, { run: w.run, ...w.bins, kill: w.probeKill, platform: PLAT });
   assert.deepEqual(r, ok([{ pid: 300, birth: T0 + 4, cwd: d.wt }]));
 });
 
@@ -129,7 +132,7 @@ test('listeners: lsof says nothing found (clean silent exit 1) => ok([]); every 
   const d = dirs();
   const empty = std(d);
   empty.listen = {};
-  assert.deepEqual(listeners(3000, { run: empty.run, ...empty.bins, kill: empty.probeKill }), ok([]));
+  assert.deepEqual(listeners(3000, { run: empty.run, ...empty.bins, kill: empty.probeKill, platform: PLAT }), ok([]));
   const failures = {
     timeout: { code: 124, stdout: '', stderr: '', timedOut: true, signal: null },
     signal: { code: 1, stdout: '', stderr: '', timedOut: false, signal: 'SIGKILL' },
@@ -141,7 +144,7 @@ test('listeners: lsof says nothing found (clean silent exit 1) => ok([]); every 
   for (const [name, r] of Object.entries(failures)) {
     const w = std(d);
     const run = (cmd, args) => (cmd === 'LSOF' && args.some((a) => a.startsWith('-iTCP:')) ? r : w.run(cmd, args));
-    const got = listeners(3000, { run, ...w.bins, kill: w.probeKill });
+    const got = listeners(3000, { run, ...w.bins, kill: w.probeKill, platform: PLAT });
     assert.equal(got.ok, false, name);
   }
 });
@@ -149,13 +152,13 @@ test('listeners: lsof says nothing found (clean silent exit 1) => ok([]); every 
 test('listeners: an alive listener whose cwd lsof cannot show => unknown; one that vanished meanwhile is dropped', () => {
   const d = dirs();
   const hidden = world({ procs: { 300: { ppid: 1, birth: T0 + 4 } }, listen: { 3000: [300] } }); // alive, no cwd
-  assert.equal(listeners(3000, { run: hidden.run, ...hidden.bins, kill: hidden.probeKill }).ok, false);
+  assert.equal(listeners(3000, { run: hidden.run, ...hidden.bins, kill: hidden.probeKill, platform: PLAT }).ok, false);
   const w = std(d);
   const run = (cmd, args) => {
     if (cmd === 'LSOF' && args.includes('-p')) delete w.procs[300]; // exits between the two lsof calls
     return w.run(cmd, args);
   };
-  assert.deepEqual(listeners(3000, { run, ...w.bins, kill: w.probeKill }), ok([]));
+  assert.deepEqual(listeners(3000, { run, ...w.bins, kill: w.probeKill, platform: PLAT }), ok([]));
 });
 
 test('listeners: win32 => unknown and no subprocess', () => {
@@ -316,7 +319,7 @@ const bindEv = (d, over = {}) => ({
 });
 const endOpts = (d, w, over = {}) => ({
   run: w.run, ...w.bins, kill: w.kill, probeKill: w.probeKill, sleep: w.sleep, root: d.root, home: d.dir, mode: 'apply', now: () => NOW,
-  ownerExitedAt: NOW - 7000, ...over,
+  ownerExitedAt: NOW - 7000, platform: PLAT, ...over,
 });
 
 test('session end, apply: exactly ONE SIGTERM to the bound listener, a 10 s re-check, no SIGKILL', posixOnly, async () => {
@@ -481,7 +484,7 @@ test('devRows: owned / orphan candidate / unknown; report only', () => {
   ];
   const alive = new Map([[`${OWNER.pid}:${OWNER.birth}`, true], ['8:8', false]]);
   const rows = devRows({
-    ports: [3000, 3001, 3002, 3003], events, run: w.run, ...w.bins, kill: w.probeKill, now: () => NOW,
+    ports: [3000, 3001, 3002, 3003], events, run: w.run, ...w.bins, kill: w.probeKill, now: () => NOW, platform: PLAT,
     isAlive: (o) => ok(alive.get(`${o.pid}:${o.birth}`)),
   });
   const by = Object.fromEntries(rows.map((r) => [r.port, r]));
@@ -504,16 +507,16 @@ test('devRows: a failed probe is a row with verdict unknown (not "no listener");
   const d = dirs();
   const w = std(d);
   const failing = () => ({ code: 124, stdout: '', stderr: '', timedOut: true, signal: null });
-  const bad = devRows({ ports: [3000], events: [], run: failing, ...w.bins, now: () => NOW });
+  const bad = devRows({ ports: [3000], events: [], run: failing, ...w.bins, now: () => NOW, platform: PLAT });
   assert.equal(bad.length, 1);
   assert.equal(bad[0].verdict, 'unknown');
   const events = [bindEv(d)];
-  const unk = devRows({ ports: [3000], events, run: w.run, ...w.bins, kill: w.probeKill, now: () => NOW, isAlive: () => unknown('ps timed out') });
+  const unk = devRows({ ports: [3000], events, run: w.run, ...w.bins, kill: w.probeKill, now: () => NOW, platform: PLAT, isAlive: () => unknown('ps timed out') });
   assert.equal(unk[0].verdict, 'unknown');
   assert.equal(unk[0].boundOwnerAlive, null);
   const pr = { state: 'MERGED', headMatches: true, eligible: true };
   const withPr = devRows({
-    ports: [3000], events, run: w.run, ...w.bins, kill: w.probeKill, now: () => NOW, isAlive: () => ok(false),
+    ports: [3000], events, run: w.run, ...w.bins, kill: w.probeKill, now: () => NOW, platform: PLAT, isAlive: () => ok(false),
     prStates: (wts) => ok(new Map(wts.map((x) => [x.path, pr]))),
   });
   assert.equal(withPr[0].verdict, 'orphan candidate');
@@ -565,7 +568,7 @@ test('resolveDevBins: PIPELINE_LSOF / PIPELINE_PS are honoured only for an isola
 test('psLookup: ppid via ps; birth only on request; a dead pid is unknown', () => {
   const d = dirs();
   const w = std(d);
-  const look = psLookup({ run: w.run, ps: 'PS', kill: w.probeKill });
+  const look = psLookup({ run: w.run, ps: 'PS', kill: w.probeKill, platform: PLAT });
   assert.deepEqual(look(300), ok({ ppid: 200 }));
   assert.deepEqual(look(100, { withBirth: true }), ok({ ppid: 1, birth: OWNER.birth }));
   assert.equal(look(9999).ok, false);

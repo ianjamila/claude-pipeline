@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, realpathSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { mergeSettings, STACK_REGISTER_MATCHERS } from '../pipeline/lib/installer.mjs';
 import { runSweep, hookHealth, cleanWorkers, ledgerUses, currentLeases, STACK_HOOKS } from '../pipeline/lib/stacks/sweep.mjs';
 import { stopArgs } from '../pipeline/lib/stacks/act.mjs';
@@ -539,7 +539,7 @@ test('hookHealth: nothing installed reads as "not installed" for each stack hook
     let h = hookHealth({ home });
     assert.equal(h.length, STACK_HOOKS.length);
     for (const row of h) {
-      assert.match(row.file, /\.claude\/pipeline\/hooks\/stack-[a-z-]+\.mjs$/);
+      assert.match(row.file, /\.claude[\\/]pipeline[\\/]hooks[\\/]stack-[a-z-]+\.mjs$/);
       assert.match(row.problem, /hook file missing \(not installed\); settings\.json is missing/);
     }
     const hooksDir = join(home, '.claude', 'pipeline', 'hooks');
@@ -601,7 +601,7 @@ test('hookHealth reads only the injected home', () => {
   const fsx = { readFileSync: (p) => { seen.push(p); const e = new Error('nope'); e.code = 'ENOENT'; throw e; }, statSync: (p) => { seen.push(p); throw new Error('gone'); } };
   hookHealth({ home: '/nowhere/home', fsx });
   assert.ok(seen.length >= 4);
-  assert.ok(seen.every((p) => p.startsWith('/nowhere/home/')));
+  assert.ok(seen.every((p) => p.startsWith(`${join('/nowhere', 'home')}${sep}`)), 'every path read is under the injected home');
 });
 
 // ======================================================================= leases

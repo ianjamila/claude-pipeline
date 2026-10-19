@@ -98,7 +98,8 @@ test('init --write creates config.json (loads as ok, ~ expanded) and never overw
     const cfg = loadMachineConfig(s.files.config, { home: s.base });
     assert.equal(cfg.status, 'ok');
     assert.deepEqual([...cfg.shared].sort(), ['drmed', 'e2e-ci', 'eaglewatch-pipeline']);
-    assert.deepEqual(cfg.repos, [join(s.base, 'Claude', 'eaglewatch'), join(s.base, 'Claude', 'DRMed')]);
+    // `~` is expanded by plain concatenation (expandHome), so the rest of the path keeps the '/' the config wrote
+    assert.deepEqual(cfg.repos, [`${s.base}/Claude/eaglewatch`, `${s.base}/Claude/DRMed`]);
     assert.deepEqual(cfg.devPorts, [3000, 4000, 4017]);
     writeFileSync(s.files.config, '{"shared":["mine"]}');
     const again = await run(['init', '--write'], s.ctx());
