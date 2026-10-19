@@ -309,9 +309,17 @@ const CONFIG_WRITE_WORDS = new Set(['set', 'delete', 'edit', 'rm', 'remove', 'un
 export const BACKGROUND = /(?<![&>|])&(?![&>])/;
 
 // Where a word names, from each directory the command may run in: string[] (a glob stays in the text when allowGlob), or null (only known at run time).
+const UNKNOWN_HEAD = '\u0000?/';
 function placeWord(site, dirs, w, allowGlob) {
   const p = site.p ?? nodePath;
   let t = site.expand ? site.expand(String(w ?? '')) : String(w ?? '');
+  if (allowGlob && /[$`]/.test(t) && !t.endsWith('/')) {
+    // `$TMPDIR/rac.bak`, `$S/out`: the directory is unknown, the name after it is not. Kept as UNKNOWN_HEAD + the literal components after the last unknown one.
+    const parts = t.split('/');
+    let last = -1;
+    parts.forEach((x, i) => { if (/[$`]/.test(x)) last = i; });
+    if (last >= 0 && last < parts.length - 1 && parts.slice(last + 1).every((x) => x && !/[$`]/.test(x))) return [UNKNOWN_HEAD + parts.slice(last + 1).join('/')];
+  }
   if (/[$`]/.test(t) || (!allowGlob && /[*?[\]]/.test(t)) || t === '-') return null;
   if (t === '~' || t.startsWith('~/')) { if (!site.home) return null; t = p.join(site.home, t.slice(1)); } else if (t.startsWith('~')) return null;
   if (p.isAbsolute(t)) return [p.resolve(t)];
@@ -347,7 +355,7 @@ function markerPaths(words, site) {
   const place = (w) => placeWord(site, dirs, w, true);
   const base = (w) => String(w).replace(/\/+$/, '').split('/').pop();
   const add = (list) => { if (list === null) { out.push(null); return; } out.push(...list); };
-  const joinTo = (dest, src) => { const d = place(dest); const b = base(site.expand ? site.expand(src) : src); return d === null || /[$`]/.test(b) ? null : d.map((x) => p.join(x, b)); };
+  const joinTo = (dest, src) => { const d = place(dest); const b = base(site.expand ? site.expand(src) : src); return d === null || /[$`]/.test(b) ? null : d.map((x) => (x.startsWith(UNKNOWN_HEAD) ? x : p.join(x, b))); };
   if (['cp', 'mv', 'ln', 'install', 'ditto', 'rename'].includes(name)) {
     const dest = target ?? pos[pos.length - 1];
     const srcs = target !== null ? pos : pos.slice(0, -1);
@@ -469,6 +477,13 @@ export function pkgDirtyFor(budget, starts, env = {}) {
   for (const paths of markers ?? []) {
     if (paths === null) return true;
     for (const o of paths) {
+      if (o.startsWith(UNKNOWN_HEAD)) {
+        // somewhere under a directory only known at run time: a marker (or glob) among the literal components, or a name that is one of the package directory's own ancestors, may be it
+        const comps = o.slice(UNKNOWN_HEAD.length).split('/');
+        const names = new Set(starts.flatMap((x) => forms(x)).flatMap((x) => x.split('/')).filter(Boolean));
+        if (comps.some((c) => componentIsMarker(c).length || names.has(c))) return true;
+        continue;
+      }
       for (const s of starts) {
         for (const so of forms(s)) {
           for (let a = so, n = 0; n < MAX_WALK; n++) {

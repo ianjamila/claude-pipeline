@@ -210,14 +210,17 @@ const markTree = { '.git': 'x', 'package.json': pkg(OK_SCRIPTS), 'sub/x.txt': 'x
 test('t11 a command that makes, removes or renames a package.json, node_modules, server.js, binding.gyp or rc file the manager reads makes the script unknown', () => {
   for (const cmd of ['rm package.json && npm run lint', 'mv package.json p.json; npm run lint', 'touch sub/package.json && cd sub && npm run lint', 'mkdir -p sub/node_modules && cd sub && npm run lint', 'touch server.js && npm start',
     'touch binding.gyp; npm install', 'ln -s other/.npmrc .npmrc && npm run lint', 'rm -rf .. && npm run lint', 'rm -rf * && npm run lint', 'mv sub/x.txt package.json && npm run lint', 'cp x.json package.json && npm run lint',
-    'touch pnpm-workspace.yaml && pnpm -r run lint', 'rm -f "$F" && npm run lint', 'mkdir sub2 && cd sub2 && npm run lint', 'install -m 644 a .npmrc && npm run lint', 'dd if=a of=package.json 2>/dev/null; npm run lint', 'cp -t . a package.json && npm run lint']) {
+    'touch pnpm-workspace.yaml && pnpm -r run lint', 'rm -f "$F" && npm run lint', 'mkdir sub2 && cd sub2 && npm run lint', 'install -m 644 a .npmrc && npm run lint', 'dd if=a of=package.json 2>/dev/null; npm run lint', 'cp -t . a package.json && npm run lint', 'rm -rf $X/package.json && npm run lint', 'mkdir -p $X/node_modules/a && cd sub && npm run lint', 'touch $X/*.json && npm run lint', 'rm -rf $X/ && npm run lint']) {
     const r = both(cmd, markTree);
     assert.equal(r.git.decision, 'deny', `git: ${cmd}`);
     assert.equal(r.files.decision, 'deny', `files: ${cmd}`);
   }
+  // (a directory only known at run time with the package directory's own name after it may be the package directory)
+  assert.equal(git('rm -rf $X/repo && npm run lint', markTree).decision, 'deny');
+  assert.equal(filesGuard('rm -rf $X/proj && npm run lint', markTree).decision, 'deny');
   // what they do elsewhere, or to other files, leaves it alone
   for (const cmd of ['mkdir -p out && npm run lint', 'touch logs/b.log && npm run lint', 'rm -f logs/a.log; npm test', 'rm -rf dist .next && npm run lint', 'cp package.json /tmp/p.json && npm run lint', 'mv logs/a.log logs/b.log && npm run lint',
-    'rm -rf node_modules && npm run lint', 'mkdir -p sub/out && npm run lint', 'cp src/*.txt out/ && npm run lint', 'ln -s a.log logs/c.log && npm test', 'touch /tmp/x && npm run lint']) allowed(cmd, markTree);
+    'rm -rf node_modules && npm run lint', 'cp package.json $TMPDIR/p.bak && npm run lint', 'mkdir -p $TMP/out/logs && npm run lint', 'rm -rf $X/dist && npm test', 'mkdir -p sub/out && npm run lint', 'cp src/*.txt out/ && npm run lint', 'ln -s a.log logs/c.log && npm test', 'touch /tmp/x && npm run lint']) allowed(cmd, markTree);
 });
 
 // ---- 9. a tool that runs a package script is no "plain tool" for the summed readings (t5) ----------------------------------------------------------------------------------------------------------
