@@ -653,13 +653,29 @@ export function packageScripts(call, env) {
         // (t11: only a literal path or a single trailing /* is read, inside the tree: an absolute path, a .. segment, a backslash or an empty pattern leaves the workspace set unknown)
         if (pat === '' || pat.startsWith('/') || /(?:^|\/)\.\.(?:\/|$)|\\|^~/.test(pat)) return refuse(`the workspace pattern \`${raw}\` in ${root} leaves the project directory or is not a plain path, so which packages a workspace option reaches cannot be verified. Run the script from the package's own directory.`);
         let dirs;
+        let wildParent = null;
         if (!/[*?[\]{}()!]/.test(pat)) dirs = [p.join(root, pat)];
         else if (/^[^*?[\]{}()!]+\/\*$/.test(pat) || pat === '*') {
           const parent = p.join(root, pat === '*' ? '' : pat.slice(0, -2));
           const names = env.readDir(parent);
           if (names !== null && !Array.isArray(names)) return refuse(`${parent} cannot be listed, so the workspace packages in it cannot be read.`);
           dirs = Array.isArray(names) ? names.map((n) => p.join(parent, n)) : [];
+          wildParent = parent;
         } else return refuse(`the workspace pattern \`${raw}\` in ${root} cannot be listed (only directories and \`dir/*\`), so which packages a workspace option reaches cannot be verified. Run the script from the package's own directory.`);
+        // (R2-B2: a `dir/*` also matches a directory the line CREATES, which the listing does not hold yet: the package.json it writes at PARENT/NAME for any NAME the line spells out, or for a name only
+        // known at run time (a probe name no word can be), counts as the ones in the listed directories do -- the written known / maybe rule. A bulk writer into PARENT matches the probe name too)
+        if (wildParent !== null) {
+          const listed = new Set(dirs);
+          const spelled = [...new Set(env.lineNames?.() ?? [])].filter((n) => !listed.has(p.join(wildParent, n)));
+          if (spelled.length > MAX_LINE_NAMES) {
+            if (env.mentionsGuarded?.()) return refuse(`the line names more than ${MAX_LINE_NAMES} different words, so which package.json it creates in ${wildParent} (a workspace directory) cannot be verified. Write it in a command of its own.`);
+          } else {
+            for (const n of [...spelled, '\u0001new']) {
+              const wr = writtenRefusal(p.join(wildParent, n, 'package.json'));
+              if (wr) return wr;
+            }
+          }
+        }
         for (const dd of dirs) {
           const pj = p.join(dd, 'package.json');
           const wr = writtenRefusal(pj);
@@ -840,14 +856,50 @@ export function binSite(bin, runDir, exists, p = nodePath) {
   const roots = [p.dirname(p.dirname(p.dirname(bin))), runDir].filter((x) => typeof x === 'string');
   return {
     inside: (abs) => roots.some((r) => abs === r || abs.startsWith(r === '/' ? '/' : `${r}/`)),
-    hasBin: (name) => roots.some((r) => {
+    hasBin: (name) => findBin(name) !== null,
+    findBin,
+    resolve: (w) => (runDir ? p.resolve(runDir, w) : null),
+  };
+  function findBin(name) {
+    for (const r of roots) {
       for (let d = r, n = 0; n < MAX_WALK; n++) {
-        if (exists(p.join(d, 'node_modules', '.bin', name))) return true;
+        const f = p.join(d, 'node_modules', '.bin', name);
+        if (exists(f)) return f;
         const up = p.dirname(d);
         if (up === d) break;
         d = up;
       }
-      return false;
-    }),
-  };
+    }
+    return null;
+  }
+}
+
+// R2-B1: the file that really runs a bin (with the bin as its argument) when its shebang names one the project controls -- the same cases binIsProgram turns away from "program": an absolute path inside the
+// project, a relative path (resolved in the directory the bin runs in), or -- through `env` -- a name with an entry in a node_modules/.bin of the lookup chain. null: none (a program, or an interpreter outside
+// the project), or one that cannot be placed (an `env` name that is not a bin there: the relative word is not a file the guard can find). The caller judges that file as it judges a bin (opened as a shell script unless
+// it is itself a program), the bin's own text as well; a loop or a chain deeper than MAX_BIN_INTERPRETERS is refused.
+export const MAX_BIN_INTERPRETERS = 4;
+const MAX_LINE_NAMES = 64;
+// The names a command line spells out (every word, split at separators and slashes): the directories it may create.
+export const lineNames = (text) => String(text ?? '').split(/[\s'"`$()<>|&;=,:{}[\]*?\\/]+/).filter((n) => n && n !== '.' && n !== '..');
+export function binInterpreter(text, site = null) {
+  if (typeof text !== 'string' || !text.startsWith('#!') || !site) return null;
+  const tokens = text.slice(2).split(/\r?\n/, 1)[0].trim().split(/\s+/).filter(Boolean);
+  const nm = (w) => nodePath.posix.basename(String(w ?? '').replaceAll('\\', '/'));
+  const isAbs = (w) => /^(?:\/|[A-Za-z]:[\\/])/.test(String(w ?? ''));
+  const place = (w) => (isAbs(w) ? (site.inside?.(String(w)) ? String(w) : null) : (site.resolve?.(String(w)) ?? null));
+  if (!tokens.length) return null;
+  if (nm(tokens[0]) !== 'env' || !(isAbs(tokens[0]) && !site.inside?.(tokens[0]))) return place(tokens[0]); // (a project's own file named env is the interpreter itself)
+  let i = 1;
+  for (; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (/^-[uC]$|^--(?:unset|chdir)$/.test(t)) i++;
+    else if (/^--split-string=./.test(t)) { tokens[i] = t.slice(15); break; }
+    else if (/^-S./.test(t)) { tokens[i] = t.slice(2); break; }
+    else if (!t.startsWith('-') && !/^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(t)) break;
+  }
+  const w = tokens[i];
+  if (w === undefined || nm(w) === '') return null;
+  if (/[\\/]/.test(w)) return place(w);
+  return site.findBin?.(nm(w)) ?? null;
 }

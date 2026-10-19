@@ -272,3 +272,50 @@ test('R1-B6b npx / npm exec --prefix $D tool: the bin directory is only known at
   denied('D=sub; npx --prefix $D tool', (g) => ({ 'sub/package.json': pkg({}), 'sub/node_modules/.bin/tool': sh(g.bad) }));
   allowed('D=sub; npx --prefix $D tool', tree);
 });
+
+// ---- round 2 (Codex items R2-B1, R2-B2) ------------------------------------------------------------------------------------------
+test('R2-B1 the interpreter a bin\'s shebang resolves to in the project (a shadowing node_modules/.bin/NAME, an absolute in-project path) is itself judged, as a shell script, besides the bin\'s text', () => {
+  const tool = '#!/usr/bin/env node\necho hi\n'; // (harmless text: what runs is the shadowing interpreter, with the bin as its argument)
+  for (const cmd of ['npx tool', 'npm exec tool']) {
+    denied(cmd, (g) => ({ 'package.json': pkg({}), 'node_modules/.bin/tool': tool, 'node_modules/.bin/node': sh(g.bad) }));
+    denied(cmd, (g) => ({ 'package.json': pkg({}), 'node_modules/.bin/tool': `#!${g.root}/vendor/node\necho hi\n`, 'vendor/node': sh(g.bad) }));
+    denied(cmd, (g) => ({ 'package.json': pkg({}), 'node_modules/.bin/tool': tool, '../node_modules/.bin/node': sh(g.bad) })); // (found further up the chain)
+    // a chain: the shadowing node is itself env-run through another shadowing name
+    denied(cmd, (g) => ({ 'package.json': pkg({}), 'node_modules/.bin/tool': tool, 'node_modules/.bin/node': '#!/usr/bin/env shim\necho hi\n', 'node_modules/.bin/shim': sh(g.bad) }));
+    // a self-shadow (the interpreter is env node, which finds itself) cannot be verified: refused
+    denied(cmd, () => ({ 'package.json': pkg({}), 'node_modules/.bin/tool': tool, 'node_modules/.bin/node': '#!/usr/bin/env node\necho hi\n' }), /interpreter|cannot be verified|loop|nested/i);
+    // twins: a harmless shadow, a program shadow (python), no shadow
+    allowed(cmd, () => ({ 'package.json': pkg({}), 'node_modules/.bin/tool': tool, 'node_modules/.bin/node': sh('echo shim') }));
+    allowed(cmd, (g) => ({ 'package.json': pkg({}), 'node_modules/.bin/tool': tool, 'node_modules/.bin/node': `#!/usr/bin/env python3\n${g.bad}\n` }));
+    allowed(cmd, (g) => ({ 'package.json': pkg({}), 'node_modules/.bin/tool': `${tool}${g.bad}\n` }));
+  }
+  // a package script and a yarn call reach the same bin
+  denied('npm run lint', (g) => ({ 'package.json': pkg({ lint: 'tool' }), 'node_modules/.bin/tool': tool, 'node_modules/.bin/node': sh(g.bad) }));
+  denied('yarn tool', (g) => ({ 'package.json': pkg({}), 'node_modules/.bin/tool': tool, 'node_modules/.bin/node': sh(g.bad) }));
+  allowed('npm run lint', () => ({ 'package.json': pkg({ lint: 'tool' }), 'node_modules/.bin/tool': tool, 'node_modules/.bin/node': sh('echo shim') }));
+  // too deep a chain (more than 4 interpreters) is refused whatever it holds
+  const chain = (n, last) => Object.fromEntries([...Array(n).keys()].map((i) => [`node_modules/.bin/i${i}`, i === n - 1 ? last : `#!/usr/bin/env i${i + 1}\necho hi\n`]));
+  denied('npx tool', (g) => ({ 'package.json': pkg({}), 'node_modules/.bin/tool': '#!/usr/bin/env i0\necho hi\n', ...chain(7, sh('echo end')) }), /interpreter|cannot be verified|nested/i);
+});
+
+test('R2-B2 a package.json the line creates in a directory a `dir/*` workspace pattern will match is checked, as one in an existing directory', () => {
+  const ws = { workspaces: ['packages/*'] };
+  const tree = (g) => ({ 'package.json': pkg({}, ws), 'packages/a/package.json': pkg({ lint: 'echo hi' }), 'replacement.json': pkg({ lint: g.bad }) });
+  denied('mkdir -p packages/b && cp replacement.json packages/b/package.json && npm run lint --workspaces', tree, /writes .*package\.json/);
+  denied('mkdir packages/b && cp replacement.json packages/b/package.json && npm run lint -w packages/b', tree, /writes .*package\.json/);
+  denied('mkdir -p packages/b && cp replacement.json packages/b/package.json && npm run lint --workspaces', (g) => ({ ...tree(g), 'packages/keep': 'x' }), /writes .*package\.json/);
+  denied('mkdir -p packages/b && echo "{}" > packages/b/package.json && cp replacement.json packages/b/package.json && npm run lint --workspaces', tree, /writes .*package\.json/);
+  // pnpm: the pattern comes from pnpm-workspace.yaml
+  const pnpm = (g) => ({ 'package.json': pkg({}), 'pnpm-workspace.yaml': 'packages:\n  - "packages/*"\n', 'packages/a/package.json': pkg({ lint: 'echo hi' }), 'replacement.json': pkg({ lint: g.bad }) });
+  denied('mkdir -p packages/b && cp replacement.json packages/b/package.json && pnpm -r run lint', pnpm, /writes .*package\.json/);
+  // a new directory whose name is only known at run time, and a bulk copy into the pattern's parent
+  denied('mkdir -p packages/$N && cp replacement.json packages/$N/package.json && npm run lint --workspaces', tree, /writes .*package\.json|run time/);
+  denied('cp -r template packages && npm run lint --workspaces', (g) => ({ ...tree(g), 'template/package.json': pkg({ lint: g.bad }) }), /writes .*package\.json/);
+  allowed('mkdir -p packages/$N && cp replacement.json packages/$N/README.md && npm run lint --workspaces', tree);
+  // twins: the line writes something else in the new directory, or a package.json outside the pattern's parent
+  allowed('mkdir -p packages/b && cp replacement.json packages/b/README.md && npm run lint --workspaces', tree);
+  allowed('mkdir -p packages/b && echo hi > packages/b/notes.txt && npm run lint --workspaces', tree);
+  allowed('mkdir -p other/b && cp replacement.json other/b/package.json && npm run lint --workspaces', tree);
+  allowed('mkdir -p packages/b/deep && cp replacement.json packages/b/deep/package.json && npm run lint --workspaces', tree);
+  allowed('npm run lint --workspaces', tree);
+});

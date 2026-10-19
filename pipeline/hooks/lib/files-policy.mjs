@@ -16,7 +16,7 @@
 // ancestor process); commands that unset or override CLAUDECODE are denied here.
 import fs from 'node:fs';
 import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
-import { pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite } from './package-scripts.mjs';
+import { pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames } from './package-scripts.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
@@ -1660,6 +1660,7 @@ function judgePackageScripts(c, dirs, ctx, opts, scanRaw = '') {
       cwd: d, home: ctx.homePosix, nodePrefix: ctx.nodePrefix, readText: ctx.readText, pathExists: (x) => ctx.api.existsSync(x), readDir: ctx.readDir, cache: (ctx.budget.pkgCache ??= new Map()), p: posix, tick: () => checkDeadline(ctx.budget),
       written: (abs) => pkgFileWritten(ctx, abs),
       mentionsGuarded,
+      lineNames: () => lineNames(scanRaw),
     });
     if (plan.refuse) return deny(plan.refuse);
     const marked = pkgMarkersFor(ctx.budget, pmStartDirs(call, [d], ctx.homePosix, posix), { pathExists: (x) => ctx.api.existsSync(x), real: (q) => realResolve(q, ctx.api), p: posix });
@@ -1710,8 +1711,29 @@ function judgeBinScript(name, dirs, ctx, opts, scanRaw = '', quiet = false, look
     if (binIsProgram(text, binSite(bin, d, (x) => ctx.api.existsSync(x), posix))) continue;
     const r = judgeScriptText(text, { kind: 'shell', file: bin }, bin, d, ctx, opts); // (a bin runs where the manager runs, in the caller's directory, not in node_modules/.bin)
     if (r) return r;
+    const ri = judgeBinInterpreters(bin, text, d, ctx, opts);
+    if (ri) return ri;
   }
   return null;
+}
+// R2-B1: the shebang of an opened bin names a file the project controls (binInterpreter): THAT file runs, with the bin as its argument, so it is judged as the bin is (a shell script unless it is itself a program), and the one
+// its own shebang names after it. A loop or a chain of more than MAX_BIN_INTERPRETERS cannot be verified: refused.
+function judgeBinInterpreters(bin, text, d, ctx, opts) {
+  const site = binSite(bin, d, (x) => ctx.api.existsSync(x), posix);
+  const seen = new Set([bin]);
+  for (let cur = text; ;) {
+    const interp = binInterpreter(cur, site);
+    if (!interp) return null;
+    if (seen.has(interp) || seen.size > MAX_BIN_INTERPRETERS) return deny(`${bin} runs through the interpreter ${interp}, which loops back or sits in a chain of more than ${MAX_BIN_INTERPRETERS} interpreters, so what it runs cannot be verified`);
+    seen.add(interp);
+    if (!ctx.api.existsSync(interp) || ctx.readDir(interp)) return null; // (missing: execve fails, nothing runs)
+    const itext = ctx.readText(interp);
+    if (typeof itext !== 'string') return deny(`cannot read the interpreter ${interp} of ${bin} (missing permission or larger than 1 MB), so what it runs cannot be verified`);
+    if (binIsProgram(itext, site)) return null;
+    const r = judgeScriptText(itext, { kind: 'shell', file: interp }, interp, d, ctx, opts);
+    if (r) return r;
+    cur = itext;
+  }
 }
 
 // Several files that feed ONE shell (`cat a b | bash`): the shell reads their texts one after the other, so they are judged joined, in the order

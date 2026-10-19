@@ -17,7 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
 export { withoutLiteralText, INDIRECT_EXPANSION };
-import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite } from './package-scripts.mjs';
+import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames } from './package-scripts.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit } from './script-candidates.mjs';
@@ -1268,6 +1268,7 @@ const pkgEnv = (ctx, cwd) => ({
   cwd, home: ctx.home, nodePrefix: ctx.nodePrefix, readText: ctx.readText, pathExists: ctx.pathExists, readDir: ctx.readDir, cache: (ctx.budget.pkgCache ??= new Map()), p: path, tick: () => checkDeadline(ctx.budget),
   written: (abs) => pkgFileWritten(ctx, abs),
   mentionsGuarded: () => lineMentionsGuarded(ctx),
+  lineNames: () => lineNames(ctx.fullText),
 });
 // #89 t2: do the line's writes reach a file the manager reads (package.json, a configuration file)? Asked like the plain-script path asks about a script file (checkScriptFile): 'known' is a write that names the file;
 // 'maybe' is one it cannot (a target only known at run time, a link it cannot follow, an extraction below a directory). A file that is missing is NOT "something an unmodelled command may have created" here (a rc file is usually missing, and the
@@ -1340,6 +1341,25 @@ function binKind(bin, ctx, dir) {
   if (typeof head !== 'string') return 'unreadable';
   return binIsProgram(head, site) ? 'program' : 'open';
 }
+// R2-B1: the shebang of an opened bin names a file the project controls (binInterpreter): THAT file runs, with the bin as its argument, so it is judged as the bin is (opened as a shell script unless it is itself a program),
+// and the one its own shebang names after it. A loop (a node_modules/.bin/node whose shebang finds itself) or a chain of more than MAX_BIN_INTERPRETERS cannot be verified: refused.
+function interpreterVerdict(bin, dir, ctx, level) {
+  const site = binSite(bin, dir, ctx.pathExists, path);
+  const seen = new Set([bin]);
+  for (let cur = bin; ;) {
+    const interp = binInterpreter(ctx.readText(cur), site);
+    if (!interp) return null;
+    if (seen.has(interp) || seen.size > MAX_BIN_INTERPRETERS) return deny(`${bin} runs through the interpreter ${interp}, which loops back or sits in a chain of more than ${MAX_BIN_INTERPRETERS} interpreters, so what it runs cannot be verified.`);
+    seen.add(interp);
+    if (!ctx.pathExists(interp) || ctx.readDir(interp)) return null; // (missing: execve fails, nothing runs)
+    const kind = binKind(interp, ctx, dir);
+    if (kind === 'unreadable') return deny(`cannot read the interpreter ${interp} of ${bin} (missing permission), so what it runs cannot be verified.`);
+    if (kind !== 'open') return null;
+    const v = checkScriptFile({ kind: 'exec', file: interp, candidate: true, asShell: true }, dir, ctx, level);
+    if (v) return v;
+    cur = interp;
+  }
+}
 // `quiet`: the lookup of a command inside a package script (PATH has node_modules/.bin): a name with no bin there is an ordinary command, nothing to refuse
 function binVerdict(name, dir, ctx, level, quiet = false, lookup = dir) {
   // (a bin is a program file like a script: the plain-script reading of what the line writes, a missing one included)
@@ -1357,7 +1377,10 @@ function binVerdict(name, dir, ctx, level, quiet = false, lookup = dir) {
     return w ? judgeWrittenScript(w, { kind: 'exec', file: bin, candidate: true }, bin, dir, ctx, level) : null;
   }
   if (kind === 'unreadable') return deny(`cannot read node_modules/.bin/${name} (${bin}: missing permission), so whether it is a shell script and what it runs cannot be verified.`);
-  if (bin) return checkScriptFile({ kind: 'exec', file: bin, candidate: true, asShell: kind === 'open' }, dir, ctx, level);
+  if (bin) {
+    const own = checkScriptFile({ kind: 'exec', file: bin, candidate: true, asShell: kind === 'open' }, dir, ctx, level);
+    return own ?? (kind === 'open' ? interpreterVerdict(bin, dir, ctx, level) : null);
+  }
   return !quiet && ctx.budget.pkgBinsDirty && lineMentionsGuarded(ctx) ? deny(`package script: an earlier install on the line may add node_modules/.bin/${name}, and the line mentions a guarded operation, so what it runs cannot be verified. Run the install in a command of its own.`) : null;
 }
 function runnerBinVerdict(argv, dir, ctx, level, quiet = false, lookup = dir) {
