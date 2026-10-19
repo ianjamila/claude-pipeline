@@ -231,9 +231,15 @@ Details and every exit code: `reference/gates-and-exits.md`. First: `P checkpoin
      merged-externally`. Neither pushes. Stop.
    - 3 ⇒ GitHub unavailable: retry once; still 3 ⇒ `P summary --pr N --outcome stopped --cause update-branch:github
      --action "GitHub was unreachable: re-run ship resume when it is back"`, stop.
+   **CI proof (only when `P config` shows `verify.ci_proof`).** Right after this step run `gh pr ready N` (do not wait for 5.5): the
+   CI job that can vouch for a deferrable step skips draft PRs, so it must start now and run in parallel with the verify below.
 3. Verifier: fresh `verify.full` on the current head (must be clean, full mode; in a slot when `verify.max_parallel_full` is set, see Step 2.2). Then
    `P state outcome`: if `coverageValid` is `false` the PR content changed since the last clean
    review round (an update-branch, a late fix) ⇒ go back to Step 4 for a new round, then return here.
+   With `verify.ci_proof` configured, the verifier passes `--defer <step>` to `verify.full` for each step in `verify.deferrable_steps`
+   (the gate decides whether GitHub's run may stand in; you do not): the Mac then skips that step and the gate needs the CI proof in 5.7.
+   Skip the `--defer` for a step when this PR touches `.github/**`, `.claude/pipeline.yml`, `scripts/verify*` or a `verify.ci_proof_inputs`
+   path (it would be refused anyway), or when the PR is a fork. Without `verify.ci_proof` never pass `--defer`.
 4. High risk (from the Step 5.1 `P risk`) ⇒ `gh pr edit N --add-label <ci.e2e_label>` (if configured).
 5. Draft ⇒ `gh pr ready N`. Wait for CI on this head: checks can take a few seconds to appear after
    a push (`gh pr checks --watch` then exits 1 "no checks reported"), so poll first:
@@ -254,6 +260,12 @@ Details and every exit code: `reference/gates-and-exits.md`. First: `P checkpoin
    `labels` / `preflight` failures use `P summary --pr N --outcome stopped --cause final-gate:<check> --action "<which
    label, issue or setting blocks the merge>"` (details in `reference/gates-and-exits.md`).
    `behind-base:` in the `pr-open` detail (main moved since 5.2) ⇒ Step 5.2, then 5.3 onward.
+   **CI proof causes** (the `verify-report` detail; `reference/gates-and-exits.md`): `ci-proof-pending:<step>` ⇒ wait for the GitHub run, as a job
+   for at most `verify.ci_proof_wait_minutes` minutes in total (e.g. `P job start ciproof -- bash -c 'gh pr checks N --watch'`, then
+   `P job wait ciproof …`), and run `P final-gate` again. Past that limit, `ci-proof-missing:<step>` (any reason) or `ci-proof-failed:<step>`
+   after a fix ⇒ run a fresh FULL `verify.full` WITHOUT `--defer` at once (never `--only`: the gate refuses a partial report; in a slot when
+   `verify.max_parallel_full` is set), then `P final-gate` again; do not wait, do not retry the lookup. `ci-proof-failed` is a red step: fix the
+   cause first (new commit ⇒ back to 5.1). With no `ci_proof_wait_minutes` set do not wait at all.
 
 ## Step 6 — merge and production
 
@@ -263,7 +275,9 @@ resumed-run rule is not: a run in Resume mode or on an adopted PR never calls `P
 (`P merge` itself refuses a resumed record, or one it cannot check, without the owner's recorded "merge": see below). `P merge`,
 `P prod-watch --pr N` and `P update-branch` keep the record's in-flight marker themselves (no checkpoint needed around
 them). `P merge` posts the `prod-before` event before merging and refuses (`error: pre-merge`, nothing merged) when it
-cannot: see `reference/gates-and-exits.md`.
+cannot: see `reference/gates-and-exits.md`. For a repo with `verify.deferrable_steps` it likewise records which proof each deferrable step
+used (the Mac, or GitHub run <id> attempt <n>) in the run record and a `ci-proof-used` event, taken from its own live gate check, and refuses the same way
+when it cannot; the PR summary shows one line per step (`<step> proof: GitHub run <id> attempt <n>` or `<step> proof: Mac`).
 
 1. `P job start merge -- node ~/.claude/pipeline/bin/pipeline.mjs merge --pr N` (an owner-approved run adds `--owner-approved-head <sha> --owner-approved-items <ownerItems>`, see below) → `P job wait
    merge --run-id <runId> --timeout 540`; read `exitCode` and the JSON in `tail`:

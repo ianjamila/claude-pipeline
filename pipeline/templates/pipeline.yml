@@ -39,6 +39,12 @@ verify:
   # max_load: 12                # optional, positive number, needs max_parallel_full: after getting a slot, wait while the 1-minute load
   #                                # average is above this (re-checked every 5-30 s), then run anyway with a warning. Not on Windows.
   # max_load_wait_minutes: 10   # optional, default 10, at most 10: how long that load wait may last
+  # deferrable_steps: [sql-arms]   # optional: steps whose local run a GitHub Actions run may replace at the final gate (verify.mjs --defer <step>
+  #                                # reports them skipped with skipKind "ci"). Needs ci_proof below. The gate reads these settings from the BASE branch.
+  # ci_proof:                      # optional: for each deferrable step, the workflow FILE and job that vouch for it (never matched by check name alone)
+  #   sql-arms: { workflow: .github/workflows/migration-replay.yml, job: "SQL arms", event: pull_request }   # job: one aggregator job for a sharded matrix
+  # ci_proof_inputs: ["supabase/tests/sql-arms/**"]   # optional: extra paths that make a PR ineligible (.github/**, .claude/pipeline.yml, scripts/verify* always do)
+  # ci_proof_wait_minutes: 20      # optional, above 0: the most ship waits for that run before running the step on the Mac (unset = no waiting)
 
 ci:
   required_checks: ["Test integrity", "Hard-stop scan"]   # + your CI job names

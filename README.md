@@ -291,6 +291,26 @@ verify:
   in arrival order (`pipeline verify slot --status` shows who holds them; `pipeline verify slot --run` runs only the repo's own `verify.full` in a slot, never another command). `max_load` and `max_load_wait_minutes` add a
   wait for a quiet machine after the slot is taken; when the time is up the verify runs anyway, with a warning.
 
+A fourth, stricter group lets GitHub's own test run replace one slow local step at the final gate:
+
+```yaml
+verify:
+  deferrable_steps: [sql-arms]     # steps whose local run a GitHub Actions run may replace
+  ci_proof:
+    sql-arms: { workflow: .github/workflows/migration-replay.yml, job: "SQL arms", event: pull_request }
+  ci_proof_inputs: [supabase/tests/sql-arms/**]   # extra paths that make a PR ineligible
+  ci_proof_wait_minutes: 20        # how long ship waits for that run (unset = it does not wait)
+```
+
+- Safety rule: the Mac is skipped for a step only when the final gate finds a passed run of exactly that workflow file and job, on this
+  exact commit, for this pull request (not a fork), whose merged test copy has the same files as the pull request's head, and the pull
+  request changed neither the CI setup (`.github/**`), the pipeline settings, the verify scripts nor `ci_proof_inputs`. The three settings are
+  read from the main branch, never from the pull request. Anything unclear (no run, still running, cancelled, a GitHub error) sends the step
+  back to the Mac; `merge` records which proof was used (Mac, or GitHub run and attempt) on the pull request.
+- `ci_proof_wait_minutes` is the longest ship waits for the GitHub run before it runs the step on the Mac instead; set it from the measured CI time.
+- Rollout: eaglewatch enables `ci_proof` only after its PR B (draft runs, always-report, sharded jobs with one aggregator job) and one measured database PR.
+  Until then it uses only `after_fix` and the slot limit.
+
 Rollout: the config rejects unknown keys, so set these in a repo only after every machine that works on it has run
 `pipeline update` to a version that knows them.
 
