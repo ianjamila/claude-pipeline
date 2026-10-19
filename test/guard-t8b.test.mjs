@@ -152,11 +152,12 @@ test('H2 overlapping subscripts: past the body budget the arithmetic scan answer
 });
 test('H2 a 200 kB line of nested name-subscripts is answered quickly by both guards, and the git guard still judges what follows', () => {
   const line = fill('a[');
-  for (const run of [() => git(line), () => files(line)]) {
+  // (bounds: ~0.2 s / 0.4 s locally, ~4x that on a Windows runner; the uncapped scan took 2.7 s locally, 10 s there)
+  for (const [run, bound] of [[() => git(line), 1500], [() => files(line), 3000]]) {
     const t0 = cpu();
     run();
     const ms = cpu() - t0;
-    assert.ok(ms < 3000, `${Math.round(ms)} ms of CPU`);
+    assert.ok(ms < bound, `${Math.round(ms)} ms of CPU`);
   }
   const r = git(`${'a['.repeat(30000)}; git ${'pu' + 'sh'} origin ${'ma' + 'in'}`);
   assert.equal(r.decision, 'deny', `git: ${r.reason ?? 'allowed'}`);
