@@ -401,7 +401,7 @@ test('untracked + stale but ready, green and conflict-free: owner-decision / lea
   assert.equal(r.nextAction, 'owner decides: ship resume 7 adopts it, or close it');
 });
 
-test('untracked + stale + ready + CI pending (or unknown conflicts): leave, never close', () => {
+test('untracked + stale + ready, CI not finished or conflicts unknown: leave, never close', () => {
   for (const over of [{ ci: 'incomplete' }, { conflicts: null }, { ci: 'incomplete', conflicts: null }]) {
     const r = cls({ ...untrackedStale, ...over });
     assert.equal(r.waitingOn, 'owner-decision', JSON.stringify(over));
