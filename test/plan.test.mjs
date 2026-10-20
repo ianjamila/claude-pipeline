@@ -284,3 +284,25 @@ test('setext underlines and thematic breaks inside the Scope section are refused
   assert.ok(parsePlan(PLAN.replace('* `docs/x.md` (the doc)', '* `docs/x.md` (the doc)\n```\n---\n***\n```\n    ---')));
   assert.ok(parsePlan(PLAN.replace('b works', 'b works\n---\n***')));
 });
+
+test('N1: raw HTML and autolinks that start first win over a later code span (left to right)', () => {
+  const tail = ' z `` ` ``';
+  for (const frag of ['x <a title="`">y <!-- hidden -->', 'x <http://a/`> <!-- hidden -->', 'x <a title="`">y &#8238; &amp;', 'x <a`@b.co> <!-- hidden -->', 'x </b > <!-- hidden -->', 'x <?pi ` ?> <!-- hidden -->', 'x <!-- ` --> y']) {
+    const text = PLAN.replace('b works', `${frag}${tail}`);
+    assert.throws(() => parsePlan(text), (e) => e instanceof PlanError && e.problems.some((p) => /raw HTML\/comment|HTML character reference/.test(p) && p.includes(`at line ${lineWith(text, frag)} `)), frag);
+  }
+  // spans that start first, and plain text around lone < characters, stay fine
+  assert.ok(parsePlan(PLAN.replace('b works', 'a `<a title="x">` and `<!-- c -->` then 1 < 2 and <https://e.co/a?b=1> works')));
+});
+
+test('N2: backticks pair across the lines of a paragraph, so a line is clean only under both pairings', () => {
+  for (const [a, b] of [['a ` b', 'x ` <!-- hidden -->'], ['a ` b', 'x ` <span hidden>q</span>'], ['a ` b', 'x ` &#8238; y'], ['a <b', 'c> `x`']]) {
+    const text = PLAN.replace('b works', `${a}\n${b}\nworks`);
+    assert.throws(() => parsePlan(text), (e) => e instanceof PlanError && e.problems.length > 0, `${a} / ${b}`);
+  }
+  const text = PLAN.replace('b works', 'a ` b\nx ` <!-- hidden -->\nworks');
+  assert.throws(() => parsePlan(text), (e) => e.problems.some((p) => p.includes(`raw HTML/comment at line ${lineWith(text, 'x ` <!--')} `)));
+  // a blank line or a fence ends the paragraph: no pairing across it
+  assert.ok(parsePlan(PLAN.replace('b works', 'a ` b\n\nx `<!-- c -->` y\nworks')));
+  assert.ok(parsePlan(PLAN.replace('b works', 'uses `one`\nand `<tag>` here\nworks')));
+});

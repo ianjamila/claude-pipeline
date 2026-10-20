@@ -19,30 +19,81 @@ const FENCE_CLOSE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
 // plan holding any (outside fences and inline code spans) is refused. The tag-line test is deliberately wider than
 // CommonMark's 0-3 spaces of indent (a list continuation can indent an HTML block further).
 const HTML_COMMENT = /<!--/;
-// Inline code spans per CommonMark: a backslash-escaped ASCII punctuation mark outside a span is literal text (so \` opens
-// nothing), a span opens at a run of N backticks and closes only at the next run of EXACTLY N; an unclosed run is literal.
-// Only closed spans are masked. Everything else (including escaped backticks) stays visible to the raw-HTML / entity checks.
-function maskCodeSpans(line) {
+// Inline constructs per CommonMark, scanned left to right: whichever construct STARTS first wins. A backslash-escaped ASCII
+// punctuation mark is literal; a raw-HTML construct (tag, comment, PI, declaration, CDATA) or autolink that starts first is kept
+// verbatim (its backticks pair with nothing); a code span opens at a run of N backticks and closes only at the next run of
+// EXACTLY N (an unclosed run is literal). Only closed spans are masked, so everything else still meets the raw-HTML / entity
+// checks. The scan runs over one line AND over a whole paragraph-ish block (backticks pair across lines): scanInline returns
+// {text, map} where map[k] is the 0-based line, within the scanned text, that produced text[k].
+const ATTR = '\\s+[A-Za-z_:][A-Za-z0-9_.:-]*(?:\\s*=\\s*(?:[^\\s"\'=<>`]+|\'[^\']*\'|"[^"]*"))?';
+const TAG_RE = new RegExp(`<[A-Za-z][A-Za-z0-9-]*(?:${ATTR})*\\s*/?>|</[A-Za-z][A-Za-z0-9-]*\\s*>|<![A-Za-z][^>]*>`, 'y');
+const AUTO_RE = /<(?:[A-Za-z][A-Za-z0-9+.-]{1,31}:[^\s<>]*|[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*)>/y;
+const PUNCT = /[!-\/:-@[-`{-~]/;
+function scanInline(src) {
+  const lineAt = new Uint32Array(src.length + 1);
+  for (let k = 0, ln = 0; k < src.length; k++) { lineAt[k] = ln; if (src[k] === '\n') ln += 1; }
   let out = '';
-  for (let i = 0; i < line.length;) {
-    const c = line[i];
-    if (c === '\\' && i + 1 < line.length && /[!-\/:-@[-`{-~]/.test(line[i + 1])) { out += line.slice(i, i + 2); i += 2; continue; }
-    if (c !== '`') { out += c; i += 1; continue; }
-    let n = 1;
-    while (line[i + n] === '`') n += 1;
-    let close = -1;
-    for (let j = i + n; j < line.length;) {
-      if (line[j] !== '`') { j += 1; continue; }
-      let m = 1;
-      while (line[j + m] === '`') m += 1;
-      if (m === n) { close = j; break; }
-      j += m;
+  const map = [];
+  const emit = (a, b) => { out += src.slice(a, b); for (let k = a; k < b; k++) map.push(lineAt[k]); };
+  const none = new Set(); // closers / terminators already known to be absent from the rest of the text
+  const endOf = (open, close, from) => {
+    if (none.has(close)) return -1;
+    const j = src.indexOf(close, from);
+    if (j < 0) none.add(close);
+    return j < 0 ? -1 : j + close.length;
+  };
+  for (let i = 0; i < src.length;) {
+    const c = src[i];
+    if (c === '\\' && i + 1 < src.length && PUNCT.test(src[i + 1])) { emit(i, i + 2); i += 2; continue; }
+    if (c === '<') {
+      let end = -1;
+      if (src.startsWith('<!--', i)) {
+        end = src.startsWith('<!-->', i) ? i + 5 : src.startsWith('<!--->', i) ? i + 6 : endOf('<!--', '-->', i + 4);
+      } else if (src.startsWith('<?', i)) end = endOf('<?', '?>', i + 2);
+      else if (src.startsWith('<![CDATA[', i)) end = endOf('<![CDATA[', ']]>', i + 9);
+      if (end < 0) {
+        for (const re of [AUTO_RE, TAG_RE]) {
+          re.lastIndex = i;
+          const m = re.exec(src);
+          if (m) { end = i + m[0].length; break; }
+        }
+      }
+      if (end > i) { emit(i, end); i = end; continue; }
+      emit(i, i + 1); i += 1; continue;
     }
-    if (close < 0) { out += line.slice(i, i + n); i += n; continue; }
+    if (c !== '`') { emit(i, i + 1); i += 1; continue; }
+    let n = 1;
+    while (src[i + n] === '`') n += 1;
+    let close = -1;
+    if (!none.has(`\`${n}`)) {
+      for (let j = i + n; j < src.length;) {
+        if (src[j] !== '`') { j += 1; continue; }
+        let m = 1;
+        while (src[j + m] === '`') m += 1;
+        if (m === n) { close = j; break; }
+        j += m;
+      }
+      if (close < 0) none.add(`\`${n}`);
+    }
+    if (close < 0) { emit(i, i + n); i += n; continue; }
     i = close + n;
   }
-  return out;
+  return { text: out, map };
 }
+// What the owner would not see as written: raw HTML / comments, character references, link titles -> [[kind, line]].
+function htmlFindings({ text, map }) {
+  const found = [];
+  for (const m of text.matchAll(/<!--/g)) found.push(['html', map[m.index]]);
+  for (const m of text.matchAll(INLINE_TAG)) if (!AUTOLINK.test(m[0])) found.push(['html', map[m.index]]);
+  for (const m of text.matchAll(new RegExp(HTML_REF.source, 'g'))) found.push(['ref', map[m.index]]);
+  for (const m of text.matchAll(new RegExp(LINK_TITLE.source, 'g'))) found.push(['title', map[m.index]]);
+  return found;
+}
+const MESSAGES = {
+  html: (n) => `raw HTML/comment at line ${n} is hidden when rendered: write it as text or inside a code block`,
+  ref: (n) => `HTML character reference at line ${n} renders differently from its bytes: write the character itself`,
+  title: (n) => `link title at line ${n} is hidden when rendered`,
+};
 const HTML_TAG_LINE = /^\s*(?:<\/?[A-Za-z][A-Za-z0-9-]*(?:[\s/>]|$)|<!)/;
 // A link reference definition renders as nothing, but its title text would still reach the implementers.
 const LINK_DEF = /^\s{0,3}\[[^\]]+\]:\s*\S/;
@@ -130,13 +181,23 @@ export function parsePlan(text, { path: ownPath } = {}) {
     for (const ch of new Set(l.match(INVISIBLE) ?? [])) problems.push(`invisible character U+${ch.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')} at line ${i + 1}`);
     if (!mask[i] && LINK_DEF.test(l)) problems.push(`link reference definition at line ${i + 1} is hidden when rendered`);
     if (mask[i]) return;
-    const bare = maskCodeSpans(l);
-    if (HTML_COMMENT.test(bare) || HTML_TAG_LINE.test(l) || (bare.match(INLINE_TAG) ?? []).some((t) => !AUTOLINK.test(t))) {
-      problems.push(`raw HTML/comment at line ${i + 1} is hidden when rendered: write it as text or inside a code block`);
-    }
-    if (HTML_REF.test(bare)) problems.push(`HTML character reference at line ${i + 1} renders differently from its bytes: write the character itself`);
-    if (LINK_TITLE.test(bare)) problems.push(`link title at line ${i + 1} is hidden when rendered`);
+    const found = htmlFindings(scanInline(l));
+    if (HTML_TAG_LINE.test(l)) found.push(['html', 0]);
+    for (const kind of ['html', 'ref', 'title']) if (found.some((x) => x[0] === kind)) problems.push(MESSAGES[kind](i + 1));
   });
+  // Backticks pair across the lines of a paragraph: the same checks over each run of consecutive non-blank, non-fenced lines.
+  for (let i = 0; i < lines.length;) {
+    if (mask[i] || lines[i].trim() === '') { i += 1; continue; }
+    let j = i;
+    while (j < lines.length && !mask[j] && lines[j].trim() !== '') j += 1;
+    if (j - i > 1) {
+      for (const [kind, rel] of htmlFindings(scanInline(lines.slice(i, j).join('\n')))) {
+        const msg = MESSAGES[kind](i + rel + 1);
+        if (!problems.includes(msg)) problems.push(msg);
+      }
+    }
+    i = j;
+  }
 
   const pe = sectionLines(lines, mask, 'In plain English');
   if (pe?.duplicate) problems.push('duplicate ## In plain English section');
