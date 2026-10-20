@@ -24,6 +24,7 @@ const REVERT_BRANCH = /^agent\/revert-[A-Za-z0-9._-]+$/;
 
 // A pause label (pipeline-rollback) stops further agent merges; only outcomes where production state is uncertain or was
 // changed by us carry it. The other outcomes need a human to look, but do not freeze the pipeline.
+const REVERT_STOP_CAUSE = 'revert-pr';
 const PAUSING = new Set(['recovered', 'rollback-failed', 'changed-during-recovery', 'rollback-skipped']);
 const URGENT = new Set(['rollback-failed', 'changed-during-recovery', 'rollback-skipped']);
 
@@ -236,9 +237,12 @@ const NEXT_STEPS = {
   'rollback-skipped': ['Production may be unhealthy: check it now.', 'Roll back by hand to the last known-good deployment if needed.', 'This issue carries `pipeline-rollback`, which PAUSES further agent merges: close it when production is verified.'],
 };
 
+// owner_approval: chat has no needs-human label: the revert PR is a draft and the owner decides (marks it ready in the GitHub UI).
+const CHAT_RECOVERED_STEP = 'Review the draft revert PR (owner decision): mark it ready for review in the GitHub UI to merge it, or fix forward.';
+
 const VERCEL_NOTE = 'After a rollback Vercel stops auto-assigning production domains to new deployments until one is promoted. A later merge will build but will NOT go live by itself: promote the fixed deployment (`vercel promote <url>` or the dashboard) to resume.';
 
-function issueBody(outcome, ev, prod) {
+function issueBody(outcome, ev, prod, chat = false) {
   const L = [];
   if (URGENT.has(outcome)) L.push('**URGENT: production may be unhealthy and needs a human now.**', '');
   L.push(HEADLINE[outcome] ?? `Outcome: ${outcome}`, '');
@@ -271,7 +275,8 @@ function issueBody(outcome, ev, prod) {
     L.push('');
   }
   if (ev.notes.length) L.push('## Notes', ...ev.notes.map((n) => `- ${n}`), '');
-  L.push('## Next steps', ...(NEXT_STEPS[outcome] ?? ['Investigate.']).map((s, i) => `${i + 1}. ${s}`), '', '_Opened by claude-pipeline `prod-watch`._');
+  const steps = chat && outcome === 'recovered' ? [CHAT_RECOVERED_STEP, ...NEXT_STEPS.recovered.slice(1)] : (NEXT_STEPS[outcome] ?? ['Investigate.']);
+  L.push('## Next steps', ...steps.map((s, i) => `${i + 1}. ${s}`), '', '_Opened by claude-pipeline `prod-watch`._');
   return L.join('\n');
 }
 
@@ -366,6 +371,7 @@ async function watch(opts, deps) {
   const observe = opts.observeOnly === true;
   const events = deps.events ?? null;
   const prod = config.production;
+  const chat = config.owner_approval === 'chat';
   const retryWaitMs = opts.retryWaitMs ?? RETRY_WAIT_MS;
   const notLiveChecks = opts.notLiveChecks ?? NOT_LIVE_CHECKS;
   const { findDeployment, smoke, inspectAlias, rollback, github, git, lock } = deps;
@@ -427,9 +433,10 @@ async function watch(opts, deps) {
 
   async function report(outcome) {
     if (observe || outcome === 'merged') return; // observe-only never opens an issue or a revert PR, nor adds a pause label
-    const labels = [PAUSING.has(outcome) ? 'pipeline-rollback' : 'needs-human'];
+    // Chat mode has no needs-human label: only the outcomes that pause merges carry a label (pipeline-rollback).
+    const labels = PAUSING.has(outcome) ? ['pipeline-rollback'] : (chat ? [] : ['needs-human']);
     try {
-      ev.issue = await github.issueCreate({ title: issueTitle(outcome, { pr, sha }), body: issueBody(outcome, ev, prod), labels });
+      ev.issue = await github.issueCreate({ title: issueTitle(outcome, { pr, sha }), body: issueBody(outcome, ev, prod, chat), labels });
     } catch (err) {
       ev.issueError = String(err?.message ?? err);
     }
@@ -448,9 +455,19 @@ async function watch(opts, deps) {
       if (pr && github.prView) {
         try { title = (await github.prView(pr, ['title'])).title || subject; } catch { /* the commit subject will do */ }
       }
+      // Chat: a DRAFT with no label, left a draft (nothing here un-drafts it; the owner marks it ready in the GitHub UI). A draft blocks merge.
       ev.revertPr = await github.prCreate({
-        title: `Revert ${pr ? `#${pr}` : sha.slice(0, 7)}: ${title}`, body: revertBody(ev, ev.issue, subject), head: branch, base, labels: ['needs-human'],
+        title: `Revert ${pr ? `#${pr}` : sha.slice(0, 7)}: ${title}`, body: revertBody(ev, ev.issue, subject), head: branch, base,
+        ...(chat ? { draft: true, labels: [] } : { labels: ['needs-human'] }),
       });
+      if (chat && deps.ownerStopEvent && ev.revertPr?.number) {
+        // Best effort: the draft is the blocker, the event only makes the stop visible to resume / inbox / the gate.
+        try {
+          await deps.ownerStopEvent(ev.revertPr.number, { cause: REVERT_STOP_CAUSE, head: null });
+        } catch (err) {
+          ev.warnings.push(`could not record the owner-stop event on revert PR #${ev.revertPr.number} (it stays a draft): ${err?.message ?? err}`);
+        }
+      }
       await comment(`Revert PR opened: ${ev.revertPr?.url ?? `#${ev.revertPr?.number}`}`);
     } catch (err) {
       ev.revertPrError = String(err?.message ?? err);

@@ -171,6 +171,14 @@ function postStop(gh, pr, record) {
     stopEventData({ slug: record.repo, pr, stop: record.stop, host: d.host ?? os.hostname(), autoMergeDisarmed: d.autoMergeDisarmed }));
 }
 
+// Best-effort owner stop on a PR this run just created (the draft revert PR of prod-watch): one event, no pending file, no lock, no
+// record copy. Throws when GitHub refuses; the caller decides what that means. Returns the stop id.
+export function postOwnerStopEvent({ gh, pr, cause = DEFAULT_CAUSE, head = null, host = os.hostname(), deps = {} }) {
+  const stop = { id: (deps.newId ?? newStopId)(), cause, head: /^[0-9a-f]{40}$/.test(String(head)) ? head : null, at: new Date((deps.now ?? Date.now)()).toISOString() };
+  postStop(gh, pr, { repo: gh.repo().slug, stop, detail: { host, autoMergeDisarmed: null } });
+  return stop.id;
+}
+
 // ---- flush ------------------------------------------------------------------------------------------------------------------
 
 // INSIDE the lock. For every pending file of this PR: an event with its id exists (open or released) => delete the file; else post it,

@@ -360,9 +360,12 @@ test('stop: every route that can reach Step 5 names the owner stop: awaiting-own
 });
 
 test('stop: routes that never reach Step 5 have none', () => {
-  for (const over of [{ state: 'CLOSED' }, { state: 'MERGED' }, { isCrossRepository: true }, { labels: ['needs-human'], recordStatus: 'absent', record: null }, { local: local({ state: 'diverged', unpushed: 1 }) }]) {
+  for (const over of [{ state: 'CLOSED' }, { state: 'MERGED' }, { isCrossRepository: true }, { local: local({ state: 'diverged', unpushed: 1 }) }]) {
     assert.equal(plan(over, { ownerApproval: 'chat' }).stop, null, JSON.stringify(Object.keys(over)));
   }
+  // the label-only decision is label mode; chat reads open needsHuman items instead
+  assert.equal(plan({ labels: ['needs-human'], recordStatus: 'absent', record: null }, { ownerApproval: 'label' }).stop, null);
+  assert.equal(plan({ triage: cleanTriage({ clean: false, needsHumanItems: ['R1-1'] }) }, { ownerApproval: 'chat' }).stop, null);
 });
 
 test('owner ruled in chat and removed needs-human: a record that ended needs-human resumes at the gate (or the review), it does not stop', () => {
@@ -377,4 +380,54 @@ test('owner ruled in chat and removed needs-human: a record that ended needs-hum
   const accept = plan({ record: ended, triage: cleanTriage({ clean: false }) }, { ownerApproval: 'chat' });
   assert.equal(accept.enter, 'review');
   assert.equal(accept.stop, 'awaiting-owner-merge');
+});
+
+// ---- chat mode: the needs-human label is never read (owner stops are events) -------------------
+
+const stopEv = (id, over = {}) => ({ kind: 'owner-stop', id, commentId: 10, dataStatus: 'ok', data: { cause: 'hard-stop' }, ...over });
+const releaseEv = (id) => ({ kind: 'owner-stop-released', id, commentId: 11, dataStatus: 'ok', data: {} });
+const chat = { ownerApproval: 'chat' };
+
+test('chat: a leftover needs-human label with no stop and a clean review routes to the gate, no label note', () => {
+  for (const rec of [record({ step: 'ended', outcome: 'needs-human' }), record({ step: 'gate', outcome: 'awaiting-owner-merge' }), record()]) {
+    const p = plan({ labels: ['needs-human'], record: rec }, chat);
+    assert.equal(p.enter, 'gate');
+    assert.equal(p.stop, 'awaiting-owner-merge');
+    assert.ok(!p.notes.some((n) => /needs-human label/.test(n)), JSON.stringify(p.notes));
+    assert.ok(!p.notes.some((n) => /label mode/.test(n)), JSON.stringify(p.notes));
+  }
+  // unreadable record + label: label mode says decision, chat does not read the label
+  assert.equal(plan({ labels: ['needs-human'], recordStatus: 'absent', record: null, triage: null }, { ownerApproval: 'label' }).enter, 'decision');
+  assert.notEqual(plan({ labels: ['needs-human'], recordStatus: 'absent', record: null, triage: null }, chat).enter, 'decision');
+});
+
+test('chat: open needsHuman review items => decision naming the ids; label not required', () => {
+  const t = cleanTriage({ clean: false, needsHumanItems: ['R1-2', 'R1-5'] });
+  const p = plan({ triage: t }, chat);
+  assert.equal(p.enter, 'decision');
+  assert.match(p.reason, /need the owner's ruling in chat/);
+  assert.match(p.reason, /R1-2/);
+  assert.match(p.reason, /R1-5/);
+  assert.equal(p.stop, null);
+  assert.deepEqual(p.worktree, { action: 'none' });
+  // label mode ignores the item list here (the label decides) and routes as before
+  assert.notEqual(plan({ triage: t }, { ownerApproval: 'label' }).enter, 'decision');
+});
+
+test('chat: an open owner stop adds a note and leaves the route alone; a released stop adds none', () => {
+  const open = plan({ events: [stopEv('aabbccdd')] }, chat);
+  assert.equal(open.enter, 'gate');
+  assert.ok(open.notes.some((n) => /stop aabbccdd is open/.test(n) && /--resumed/.test(n) && /owner's reply/.test(n)), JSON.stringify(open.notes));
+  const released = plan({ events: [stopEv('aabbccdd'), releaseEv('aabbccdd')] }, chat);
+  assert.ok(!released.notes.some((n) => /is open/.test(n)));
+  // an unreadable stop payload still counts as open
+  assert.ok(plan({ events: [stopEv('11223344', { dataStatus: 'bad', data: null })] }, chat).notes.some((n) => /stop 11223344 is open/.test(n)));
+  // label mode never reads owner stops
+  assert.ok(!plan({ events: [stopEv('aabbccdd')] }, { ownerApproval: 'label' }).notes.some((n) => /is open/.test(n)));
+});
+
+test('chat: the label-still-on decision is label mode only', () => {
+  const ended = record({ step: 'ended', outcome: 'needs-human' });
+  assert.equal(plan({ labels: ['needs-human'], record: ended }, { ownerApproval: 'label' }).enter, 'decision');
+  assert.equal(plan({ labels: ['needs-human'], record: ended }, chat).enter, 'gate');
 });
