@@ -80,7 +80,7 @@ test('a rule in both disable_rules and report_only_rules is a config error', () 
 const SAMPLES = [
   ['R1-data-write', { files: [file('lib/x.ts', { added: ["await sb.from('t').delete().eq('id', 1);"] })] }, {}],
   ['R2-auth', { files: [file('src/auth/session.ts')] }, {}],
-  ['R2-auth-removed', { files: [file('lib/x.ts', { removed: ['  await requireSAScope(ctx);'] })] }, { auth_calls: ['requireSAScope'] }],
+  ['R2-auth-removed', { files: [file('lib/x.ts', { removed: ['  await requireTeamScope(ctx);'] })] }, { auth_calls: ['requireTeamScope'] }],
   ['R3-secrets', { files: [file('.env')] }, {}],
   ['R4-config', { files: [file('CLAUDE.md', { added: ['be nice'] })] }, {}],
   ['R5-major-dep', { files: [], basePkg: pkg({ next: '15.5.15' }), headPkg: pkg({ next: '16.0.0' }) }, {}],
@@ -135,9 +135,9 @@ test('report_only_paths: a match is one advisory P-path hit; no match, no hit', 
 });
 
 test('a file matching both paths and report_only_paths blocks: exactly one, blocking hit', () => {
-  const c = ro([], { paths: ['lib/dtr/**'], reportPaths: ['lib/dtr/**', 'lib/**'] });
-  const hits = classify({ files: [file('lib/dtr/a.ts'), file('lib/other.ts')], config: c });
-  assert.deepEqual(hits.map((h) => [h.rule, h.file, Boolean(h.advisory)]), [['P-path', 'lib/dtr/a.ts', false], ['P-path', 'lib/other.ts', true]]);
+  const c = ro([], { paths: ['lib/timesheets/**'], reportPaths: ['lib/timesheets/**', 'lib/**'] });
+  const hits = classify({ files: [file('lib/timesheets/a.ts'), file('lib/other.ts')], config: c });
+  assert.deepEqual(hits.map((h) => [h.rule, h.file, Boolean(h.advisory)]), [['P-path', 'lib/timesheets/a.ts', false], ['P-path', 'lib/other.ts', true]]);
 });
 
 test('report_only_paths cannot soften another rule on the same file', () => {

@@ -50,12 +50,12 @@ test('realistic eaglewatch config is ok', () => {
   assert.equal(c.ci.required_checks.length, 5);
   assert.equal(c.preview.environment, 'Preview');
   assert.equal(c.preview.provider, 'github-deployments');
-  assert.equal(c.production.url, 'https://ewiapp.eaglewatch.ph');
+  assert.equal(c.production.url, 'https://app.example.com');
   assert.equal(c.production.provider, 'vercel');
   assert.equal(c.production.rollback.command, 'vercel rollback --yes');
   assert.ok(c.hard_stops.paths.includes('supabase/migrations/**'));
   assert.equal(c.hard_stops.patterns[0].name, 'facial-recognition');
-  assert.deepEqual(c.hard_stops.auth_calls, ['requireSAScope', 'getAccessibleDetachmentIds']);
+  assert.deepEqual(c.hard_stops.auth_calls, ['requireTeamScope', 'getAccessibleTeamIds']);
   assert.equal(c.smoke_checks.length, 2);
   // arrays replace, objects merge
   assert.deepEqual(c.integrity.test_globs, ['**/*.test.*', 'e2e/**']);

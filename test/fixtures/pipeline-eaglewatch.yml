@@ -27,7 +27,7 @@ preview:
   smoke: "node scripts/pipeline/smoke.mjs --base {url}"
 
 production:
-  url: https://ewiapp.eaglewatch.ph
+  url: https://app.example.com
   provider: vercel
   environment: Production
   smoke: "node scripts/pipeline/smoke.mjs --base {url} --production"
@@ -47,7 +47,7 @@ smoke_checks:
 risk:
   high_risk_paths:
     - supabase/migrations/**
-    - app/api/payroll/**
+    - app/api/billing/**
   medium_lines: 150
   high_lines: 600
   medium_files: 10
@@ -61,8 +61,8 @@ hard_stops:
     - name: facial-recognition
       regex: "face(api|[-_]?recog)|liveness|rekognition"
   auth_calls:
-    - requireSAScope
-    - getAccessibleDetachmentIds
+    - requireTeamScope
+    - getAccessibleTeamIds
 
 integrity:
   test_globs:

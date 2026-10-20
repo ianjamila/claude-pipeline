@@ -27,7 +27,7 @@ Spec §17 (R1–R13) supersedes earlier text. Per-task deltas; each bullet is ma
 
 - **Order:** Task 5.4's CI-side templates (`ci-guard.mjs`, `stop-verify.mjs`, `smoke.mjs`) move to new **Task 1.11** (before Task 2.1 `vendor`). Installer tests (4.1) use fixture source trees under `test/fixtures/src-tree/`, not the real skills.
 - **1.4 git:** add `patchId(base, head, {exclude:[paths]})` (`git diff <mergeBase>..head -- . ':!<p>'` piped to `git patch-id --stable`), `commitTime(sha)`.
-- **1.5 hardstops (R7):** add `R2-auth-removed`, `R2-sql-removed`, `R1-migration-edited` (status M/D/R under any `**/migrations/**`), config `hard_stops.auth_calls: []`; renames test old AND new paths. New test rows: removed `await requireSAScope(` (with `auth_calls:['requireSAScope']`) → hit; removed `requireRole(` generic → hit; removed `using (owner = auth.uid())` line in a new multi-line `create policy` replaced by `using (true)` → hit (R2-sql-removed + added `create policy` line); edit of an existing migration file → R1-migration-edited; rename `lib/auth/x.ts`→`lib/x.ts` → R2 via old path; test-file removals of `requireRole(` → no hit.
+- **1.5 hardstops (R7):** add `R2-auth-removed`, `R2-sql-removed`, `R1-migration-edited` (status M/D/R under any `**/migrations/**`), config `hard_stops.auth_calls: []`; renames test old AND new paths. New test rows: removed `await requireTeamScope(` (with `auth_calls:['requireTeamScope']`) → hit; removed `requireRole(` generic → hit; removed `using (owner = auth.uid())` line in a new multi-line `create policy` replaced by `using (true)` → hit (R2-sql-removed + added `create policy` line); edit of an existing migration file → R1-migration-edited; rename `lib/auth/x.ts`→`lib/x.ts` → R2 via old path; test-file removals of `requireRole(` → no hit.
 - **1.7 transcript (R13):** `proveModel` also returns `firstUserText`, `finalAssistantText`, `finalStopReason`; new `extractRulings({finalAssistantText})` (last fenced ```json block, else whole text). Tests: digest present/absent, `stop_reason` ≠ `end_turn` → fail, truncated (no final assistant) → fail.
 - **1.9 triage/state:** state records per round `{head, patchId}` of the reviewed diff and `reviewClean:{patchId, head}` when a round exits clean; `roundOutcome` unchanged; new `reviewValidFor(state, patchId)`.
 - **1.10 jobs (R6):** `startJob` refuses commands that `guard-git`/`guard-files` evaluators deny (import `evaluateGitCommand`, `evaluateBashForFiles` from the hooks; Task 3.x must therefore export those evaluators and 1.10's guard check lands after 3.2/3.3 — implement 1.10 with an injectable `policy` defaulting to allow, then wire the real evaluators in Task 3.3 Step "wire jobs").
@@ -158,7 +158,7 @@ Tests (each a `test()`):
 
 `globToRegExp(glob)` and `matchAny(path, globs)`; POSIX-normalised input; supports `**`, `*`, `?`, `{a,b}`, leading `!` negation in `matchAny` lists (last match wins); dotfiles matched by `*`.
 
-Table test (path, glob, expected): (`a/b/c.ts`,`a/**`,T) (`a/b/c.ts`,`**/*.ts`,T) (`c.ts`,`**/*.ts`,T) (`a/b.test.ts`,`**/*.test.*`,T) (`.github/workflows/x.yml`,`.github/**`,T) (`lib/sa-payroll/x.ts`,`lib/sa-payroll/**`,T) (`lib/payroll.ts`,`lib/payroll/**`,F) (`app/api/cron/sa-payroll-x/route.ts`,`app/api/cron/sa-payroll-*/**`,T) (`x/middleware.ts`,`**/middleware.{ts,js,mjs}`,T) (`middleware.ts`,`**/middleware.{ts,js,mjs}`,T) (`scripts/reseed_x.mjs`,`scripts/reseed_*`,T) (`scripts/sub/reseed_x.mjs`,`scripts/reseed_*`,F). `matchAny('a/b.ts',['**','!a/**'])` → F.
+Table test (path, glob, expected): (`a/b/c.ts`,`a/**`,T) (`a/b/c.ts`,`**/*.ts`,T) (`c.ts`,`**/*.ts`,T) (`a/b.test.ts`,`**/*.test.*`,T) (`.github/workflows/x.yml`,`.github/**`,T) (`lib/team-billing/x.ts`,`lib/team-billing/**`,T) (`lib/payroll.ts`,`lib/payroll/**`,F) (`app/api/cron/team-billing-x/route.ts`,`app/api/cron/team-billing-*/**`,T) (`x/middleware.ts`,`**/middleware.{ts,js,mjs}`,T) (`middleware.ts`,`**/middleware.{ts,js,mjs}`,T) (`scripts/reseed_x.mjs`,`scripts/reseed_*`,T) (`scripts/sub/reseed_x.mjs`,`scripts/reseed_*`,F). `matchAny('a/b.ts',['**','!a/**'])` → F.
 
 - [ ] Tests → impl → PASS → commit `feat: glob matcher`.
 
@@ -225,7 +225,7 @@ Hard-stop test table (fixture file contents built inline):
 |18|`middleware.ts` modified|R2|
 |19|`app/x/page.tsx` adds `createAdminClient(`|R2|
 |20|migration file deleted|R1|
-|21|config `hard_stops.paths:['lib/sa-payroll/**']`, `lib/sa-payroll/a.ts`|P-path (+R6)|
+|21|config `hard_stops.paths:['lib/hr-payroll/**']`, `lib/hr-payroll/a.ts`|P-path (+R6)|
 |22|config pattern `{name:'face', regex:'face(api|-recog)', paths:['**/*.ts']}` matched on added line|P-pattern|
 |23|`app/(public)/login/page.tsx` text change|none|
 |24|rename `lib/util.ts`→`lib/payroll/util.ts`|R6 on new path|

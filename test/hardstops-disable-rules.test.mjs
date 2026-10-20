@@ -58,9 +58,9 @@ test('disabling one rule leaves the others on the same file', () => {
 test('disabling R6 does not hide a destructive payroll migration or a project path', () => {
   const mig = 'supabase/migrations/20261009000000_payroll.sql';
   const hits = classify({
-    files: [file(mig, { status: 'A', added: ['DROP TABLE payroll_runs;'] }), file('lib/dtr-actions.ts')],
+    files: [file(mig, { status: 'A', added: ['DROP TABLE payroll_runs;'] }), file('lib/timesheet-actions.ts')],
     sqlStatements: [{ file: mig, text: 'DROP TABLE payroll_runs;' }],
-    config: off(['R6-sensitive'], { paths: ['lib/dtr-actions.ts'] }),
+    config: off(['R6-sensitive'], { paths: ['lib/timesheet-actions.ts'] }),
   });
   assert.deepEqual(rulesOf(hits), ['P-path', 'R1-destructive']);
 });
