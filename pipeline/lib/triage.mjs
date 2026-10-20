@@ -311,8 +311,23 @@ export function roundOutcome(state) {
     unimplemented.length === 0 &&
     newAccepted.length === 0 &&
     coverageValid;
-  const reachedMax = Number.isFinite(state?.maxRounds) && rounds.length >= state.maxRounds && !clean;
-  return { clean, openBlocking, newAccepted, needsHuman, pending, unimplemented, reachedMax, coverageValid };
+  // Why: a PR whose LAST allowed round only accepted items that were then fixed and verified is not in trouble,
+  // it just has fixes nobody re-reviewed (owner ruling 2026-10-20). One extra round rechecks them instead of
+  // parking. It is the last: rounds.length > maxRounds is the record that it was used, so extraRound is false
+  // afterwards and anything not clean parks as before. A stale coverage hash with no new accepts does not qualify.
+  const capped = Number.isFinite(state?.maxRounds);
+  const extraRound =
+    capped &&
+    rounds.length === state.maxRounds &&
+    !clean &&
+    pending.length === 0 &&
+    needsHuman.length === 0 &&
+    openBlocking.length === 0 &&
+    unimplemented.length === 0 &&
+    newAccepted.length > 0;
+  const effectiveMaxRounds = capped ? state.maxRounds + (extraRound || rounds.length > state.maxRounds ? 1 : 0) : null;
+  const reachedMax = capped && !clean && rounds.length >= state.maxRounds && !extraRound;
+  return { clean, openBlocking, newAccepted, needsHuman, pending, unimplemented, reachedMax, extraRound, effectiveMaxRounds, coverageValid };
 }
 
 // True when the MOST RECENT clean round (one that accepted nothing new) reviewed exactly `contentHash`, no later
