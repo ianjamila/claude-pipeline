@@ -702,6 +702,35 @@ test('re-probe: a lease registered after the decision by a process born before i
   assert.equal(outcomes(w, c.now()).summary.miss, 1, 'birth 2000 s is long before the decision');
 }));
 
+test('re-probe (C1 provenance): the use carries the lease\'s own time, the probe stamp as seenAt and the lease\'s session id; the use-observed record keeps the probe time', () => withWorld({ mode: 'report' }, async (w, c) => {
+  await w.lease(OWNER);
+  let leaseT = null;
+  const sleep = async (ms) => {
+    await c.sleep(ms);
+    leaseT = new Date(c.now() - 60_000).toISOString();
+    if (c.sleeps.length === 1) await w.lease(OTHER, { t: leaseT, via: 'bash', session_id: 'aaaa-bbbb' });
+  };
+  const r = await runSessionEnd({ owner: OWNER, deps: depsFor(w, c, { sleep, observeAtMs: [30 * 60_000] }) });
+  assert.equal(r.uses.length, 1);
+  const u = r.uses[0];
+  assert.equal(u.t, leaseT, 't is the lease event\'s own time');
+  assert.equal(u.sessionId, 'aaaa-bbbb');
+  assert.ok(Date.parse(u.seenAt) > Date.parse(leaseT), 'seenAt is the probe stamp');
+  const rec = readDecisions(w.files.actions).value.find((d) => d.action === 'use-observed');
+  assert.equal(rec.t, u.seenAt, 'the record itself is stamped with the probe time');
+  assert.deepEqual(rec.use, u);
+}));
+
+test('re-probe (C1 provenance): a lease without a session id records sessionId null', () => withWorld({ mode: 'report' }, async (w, c) => {
+  await w.lease(OWNER);
+  const sleep = async (ms) => {
+    await c.sleep(ms);
+    if (c.sleeps.length === 1) await w.lease(OTHER, { t: new Date(c.now() - 60_000).toISOString(), via: 'bash' });
+  };
+  const r = await runSessionEnd({ owner: OWNER, deps: depsFor(w, c, { sleep, observeAtMs: [30 * 60_000] }) });
+  assert.equal(r.uses[0].sessionId, null);
+}));
+
 test('re-probe: nothing seen => CLEAN after 2 h; a probe that cannot run (no listener on a stopped stack) is a note, not a use', () => withWorld({}, async (w, c) => {
   await w.lease(OWNER);
   const evidence = { ...quiet, connections: (s, o) => (w.supabaseCalls.length ? unknown('port 54322 listener not visible') : ok([])) };

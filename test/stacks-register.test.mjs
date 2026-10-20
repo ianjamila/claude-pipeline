@@ -120,17 +120,35 @@ test('a lease is written for every case of the match table, one line per stack',
   }
 });
 
-test('file tools: a path inside the stack folder is a lease; elsewhere nothing', async () => {
+test('file tools: a write inside the stack folder is a lease; reading it, or a path elsewhere, is not', async () => {
   const w = world();
-  for (const tool of ['Read', 'Edit', 'Write', 'Grep', 'Glob']) {
+  for (const tool of ['Edit', 'Write']) {
     const r = await register(fileTool(tool, join(w.wd('sa-corrections.stack'), 'supabase', 'config.toml')), deps(w));
     assert.equal(r.exit, 0, tool);
   }
-  assert.equal(lines(w.files.ledger).length, 5);
+  assert.equal(lines(w.files.ledger).length, 2);
   assert.ok(lines(w.files.ledger).every((e) => e.project === 'sa-corrections' && e.tool !== 'Bash'));
-  const none = await register(fileTool('Read', join(w.base, 'notes.md')), deps(w));
+  for (const tool of ['Read', 'Grep', 'Glob']) {
+    const r = await register(fileTool(tool, join(w.wd('sa-corrections.stack'), 'supabase', 'config.toml')), deps(w));
+    assert.equal(r.exit, 0, tool);
+  }
+  assert.equal(lines(w.files.ledger).length, 2, 'reading a stack is inspection, not use');
+  const none = await register(fileTool('Edit', join(w.base, 'notes.md')), deps(w));
   assert.equal(none.exit, 0);
-  assert.equal(lines(w.files.ledger).length, 5);
+  assert.equal(lines(w.files.ledger).length, 2);
+});
+
+test('a read-only Bash inspection of a stack writes no lease; the same stack used in the command still does', async () => {
+  const w = world();
+  const wd = w.wd('sa-corrections.stack');
+  for (const command of [`docker ps --filter name=sa-corrections`, `ls ${wd}`, `cat ${wd}/supabase/config.toml | head -3`]) {
+    const r = await register(bash(command, w.base), deps(w));
+    assert.equal(r.exit, 0, command);
+  }
+  assert.equal(existsSync(w.files.ledger), false);
+  const used = await register(bash(`docker ps --filter name=sa-corrections && supabase status --workdir ${wd}`, w.base), deps(w));
+  assert.equal(used.exit, 0);
+  assert.equal(lines(w.files.ledger).length, 1);
 });
 
 test('shared-only commands exit 0 and write no line (e2e-ci, a -pipeline id, a .verify workdir)', async () => {
@@ -365,9 +383,25 @@ test('just stopped after the snapshot: Bash is blocked with the restart message;
   assert.equal(lines(w.files.ledger).length, 1);
   assert.equal(dropped, 1, 'the stale inventory cache is dropped after a restart');
 
+  const edit = await register(fileTool('Edit', join(wd, 'supabase', 'config.toml')), deps(w, snapshotNow(w)));
+  assert.equal(edit.exit, 0);
+  assert.equal(lines(w.files.ledger).length, 2);
+
   const read = await register(fileTool('Read', join(wd, 'supabase', 'config.toml')), deps(w, snapshotNow(w)));
   assert.equal(read.exit, 0);
-  assert.equal(lines(w.files.ledger).length, 2);
+  assert.equal(lines(w.files.ledger).length, 2, 'Read appends no lease');
+});
+
+test('just stopped: a read-only docker ps of the stack passes with no lease; docker ps && supabase status is still blocked', async () => {
+  const w = stoppedWorld(new Date(Date.now()).toISOString());
+  const wd = w.wd('sa-corrections.stack');
+  const ps = await register(bash('docker ps --filter name=sa-corrections', w.base), deps(w, snapshotNow(w)));
+  assert.equal(ps.exit, 0);
+  assert.equal(existsSync(w.files.ledger), false);
+  const both = await register(bash(`docker ps --filter name=sa-corrections && supabase status --workdir ${wd}`, w.base), deps(w, snapshotNow(w)));
+  assert.equal(both.exit, 2);
+  assert.match(both.message, /was just stopped automatically/);
+  assert.equal(existsSync(w.files.ledger), false);
 });
 
 test('a stop older than the inventory snapshot, or of another project, does not block', async () => {
