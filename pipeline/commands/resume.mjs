@@ -8,6 +8,8 @@ import { NETWORK_TIMEOUT_MS, git, reviewContentHash, revParse } from '../lib/git
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { localBranchState } from '../lib/local-branches.mjs';
 import { analyseComments } from '../lib/pr-facts.mjs';
+import { accountHome, readPlanApprovals } from '../hooks/lib/owner-go.mjs';
+import { planResumeFacts, bindOf } from '../lib/plan-state.mjs';
 import { GhError } from '../lib/proc.mjs';
 import { planResume } from '../lib/resume-plan.mjs';
 import { unresolvedRollbacks } from '../lib/run-events.mjs';
@@ -21,9 +23,12 @@ export const meta = {
     '  -> {ok, prs[{number, title, headRefName, url, why}]}: open PRs labelled awaiting-review, plus open PRs whose run record',
     '     (written by this GitHub user) is readable and has no outcome yet (a run that stopped mid-way)',
     'pipeline resume plan --pr N [--repo DIR]',
-    '  -> {ok, pr, title, url, prState, branch, base, liveHead, enter, reason, adopt, confirm, autoMerge, worktree, stop, recordStatus, record,',
-    '      events, local, mergeSha, notes[], warnings[]}; read-only (its only git writes are fetches: the PR head, the base and origin/<branch>)',
-    '     enter: closed | ended | observe-prod | not-resumable | local-work | decision | build | verify | review | followups | gate',
+    '  -> {ok, pr, title, url, prState, branch, base, liveHead, enter, reason, adopt, planApproveFirst, confirm, autoMerge, worktree, stop, recordStatus, record,',
+    '      plan, events, local, mergeSha, notes[], warnings[]}; read-only (its only git writes are fetches: the PR head, the base and origin/<branch>)',
+    '     enter: closed | ended | observe-prod | not-resumable | local-work | decision | plan | owner-ui-merge | build | verify | review | followups | gate',
+    '     plan (null on a PR with no plan evidence): {approval: none|unverified|verified|lost, openWork, needsApproveCheckpoint, activeBlob, lostReason}; enter plan = show the plan request again and wait for "approve" (stop awaiting-plan-approval);',
+    '     decision with a lost plan = the evidence is missing or edited; owner-ui-merge = handed to the owner for a GitHub merge (report only);',
+    '     planApproveFirst: true = run `P plan approve` (it reuses the posted approval and copies the tasks into the record) before building;',
     '     adopt: no run record (the PR was not started by the pipeline); confirm: {host, step, minutesAgo, why} when another run may be live,',
     '     stop: where a run on a route that can reach Step 5 ends, never at a merge: awaiting-owner-merge (owner_approval chat) | needs-human (label mode); null on the other routes',
     '     autoMerge: {armed, action: disarm} when an unattended auto-merge is queued, worktree: {action: reuse|add-existing-ref|add-from-remote|none, path?, then?}',
@@ -134,6 +139,24 @@ function eventsView(events) {
   };
 }
 
+// Plan evidence for the router (spec §7): approval judged against the owner's local records and the approved plan's git blob.
+// A blob this clone cannot read is `lost`, never a silent skip of the plan step.
+function planFactsFor({ root, a, bind, home }) {
+  return planResumeFacts({
+    events: a.events,
+    bind,
+    recordPlan: a.record?.plan ?? null,
+    localRecords: readPlanApprovals({ home }),
+    recordTasks: a.record?.tasks,
+    readBlob: (b) => {
+      if (!/^[0-9a-f]{40}$/.test(String(b))) return null;
+      try { return git(['cat-file', 'blob', b], { cwd: root }); } catch { return null; }
+    },
+  });
+}
+
+const planView = (p) => (p.evidence ? { approval: p.approval, openWork: p.openWork, needsApproveCheckpoint: p.needsApproveCheckpoint, activeBlob: p.active?.blob ?? null, lostReason: p.lostReason ?? null } : null);
+
 async function plan(argv, ctx) {
   const { values } = parseCommandArgs(argv.slice(1), { pr: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
   const pr = intOption(values, 'pr', { required: true, min: 1 });
@@ -153,11 +176,12 @@ async function plan(argv, ctx) {
     const open = prState === 'OPEN' && view.isCrossRepository !== true;
     const g = open ? gitFacts({ root, config, pr, view, warnings }) : { contentHash: null, local: null };
 
+    const planFacts = planFactsFor({ root, a, bind: bindOf({ repo, pr, branch: view.headRefName }), home: ctx.home ?? accountHome() });
     const result = planResume({
       state: prState, isCrossRepository: view.isCrossRepository === true, labels, liveHead: view.headRefOid,
       autoMergeArmed: view.autoMergeRequest != null, host: hostname(),
       recordStatus: a.recordStatus, record: a.record, triage: a.triage, contentHash: g.contentHash,
-      needsHumanReason: a.needsHumanReason, events: a.events, local: g.local,
+      needsHumanReason: a.needsHumanReason, events: a.events, local: g.local, plan: planFacts,
     }, { now: Date.now(), ownerApproval: config.owner_approval });
 
     return {
@@ -175,6 +199,7 @@ async function plan(argv, ctx) {
         ...result,
         recordStatus: a.recordStatus,
         record: recordView(a.record),
+        plan: planView(planFacts),
         events: eventsView(a.events),
         local: g.local && { state: g.local.state, localRef: g.local.localRef, unpushed: g.local.unpushed, dirty: g.local.dirty, worktrees: g.local.worktrees },
         mergeSha: view.mergeCommit?.oid ?? a.record?.mergeSha ?? null,

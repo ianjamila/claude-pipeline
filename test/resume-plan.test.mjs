@@ -331,7 +331,7 @@ test('autoMerge: armed with no live merge is disarmed; a live in-flight merge ke
 
 test('the plan always has the full shape', () => {
   const p = plan({});
-  assert.deepEqual(Object.keys(p).sort(), ['adopt', 'autoMerge', 'confirm', 'enter', 'notes', 'reason', 'stop', 'worktree']);
+  assert.deepEqual(Object.keys(p).sort(), ['adopt', 'autoMerge', 'confirm', 'enter', 'notes', 'planApproveFirst', 'reason', 'stop', 'worktree']);
   assert.ok(Array.isArray(p.notes));
 });
 
@@ -377,4 +377,89 @@ test('owner ruled in chat and removed needs-human: a record that ended needs-hum
   const accept = plan({ record: ended, triage: cleanTriage({ clean: false }) }, { ownerApproval: 'chat' });
   assert.equal(accept.enter, 'review');
   assert.equal(accept.stop, 'awaiting-owner-merge');
+});
+
+// ---- ship redesign: the plan step and the owner-ui-merge hand-off ------------------------------
+
+const planFacts = (over = {}) => ({ evidence: true, active: { blob: 'b'.repeat(40) }, approval: 'none', openWork: true, needsApproveCheckpoint: false, ...over });
+
+test('plan: no approval with open work enters plan and stops at awaiting-plan-approval, whatever the record says', () => {
+  const p = plan({ plan: planFacts(), record: record({ step: 'gate', outcome: 'stopped' }) });
+  assert.equal(p.enter, 'plan');
+  assert.equal(p.adopt, false);
+  assert.equal(p.stop, 'awaiting-plan-approval');
+  assert.equal(p.planApproveFirst, false);
+  assert.match(p.reason, /bbbbbbbbbbbb/);
+  // report-only: nothing to build a worktree for
+  assert.deepEqual(p.worktree, { action: 'none' });
+});
+
+test('plan: no active proposal names the command that records one', () => {
+  const p = plan({ plan: planFacts({ active: null }) });
+  assert.equal(p.enter, 'plan');
+  assert.match(p.reason, /P plan record/);
+});
+
+test('plan: an unverified approval with open work re-shows the request; with no open work it routes normally', () => {
+  assert.equal(plan({ plan: planFacts({ approval: 'unverified' }) }).enter, 'plan');
+  const done = plan({ plan: planFacts({ approval: 'unverified', openWork: false }) });
+  assert.equal(done.enter, 'gate');
+  assert.equal(done.stop, 'needs-human');
+});
+
+test('plan: lost or tampered evidence fails closed into decision and names the recovery', () => {
+  const p = plan({ plan: planFacts({ approval: 'lost', lostReason: 'the approved plan blob is missing' }) });
+  assert.equal(p.enter, 'decision');
+  assert.match(p.reason, /missing/);
+  assert.match(p.reason, /approve/);
+  assert.equal(p.stop, null);
+});
+
+test('plan: approval event posted but the checkpoint failed builds, re-running P plan approve first', () => {
+  const p = plan({
+    plan: planFacts({ approval: 'verified', needsApproveCheckpoint: true }),
+    record: record({ step: 'plan', tasks: [], verify: null }),
+    triage: null,
+  });
+  assert.equal(p.enter, 'build');
+  assert.equal(p.planApproveFirst, true);
+  assert.equal(p.stop, 'needs-human');
+  // once the record has the approved tasks the flag is gone and open tasks route to build as before
+  const q = plan({
+    plan: planFacts({ approval: 'verified', needsApproveCheckpoint: false }),
+    record: record({ step: 'build', tasks: [{ id: 't1', title: 'T1', spec: 's', done: false }], verify: null }),
+  });
+  assert.equal(q.enter, 'build');
+  assert.equal(q.planApproveFirst, false);
+});
+
+test('plan: a verified approval with the record up to date routes like any other run', () => {
+  assert.equal(plan({ plan: planFacts({ approval: 'verified', openWork: false }) }).enter, 'gate');
+});
+
+test('plan: local diverged work still wins over the plan step', () => {
+  assert.equal(plan({ plan: planFacts(), local: local({ state: 'diverged', unpushed: 2 }) }).enter, 'local-work');
+});
+
+test('plan: facts without a plan key route exactly as before (planApproveFirst false)', () => {
+  const p = plan({});
+  assert.equal(p.enter, 'gate');
+  assert.equal(p.planApproveFirst, false);
+  // plan facts with no evidence (a legacy PR) add nothing
+  assert.equal(plan({ plan: { evidence: false, approval: 'none', openWork: true } }).enter, 'gate');
+});
+
+test('owner-ui-merge: an open PR whose record handed it to the owner is report-only', () => {
+  const p = plan({ record: record({ step: 'awaiting-owner-merge', outcome: 'owner-ui-merge' }) });
+  assert.equal(p.enter, 'owner-ui-merge');
+  assert.deepEqual(p.worktree, { action: 'none' });
+  assert.equal(p.stop, null);
+  assert.equal(p.confirm, null);
+  assert.match(p.reason, /does not merge/);
+});
+
+test('owner-ui-merge: once the owner merged it, production is observed', () => {
+  const p = plan({ state: 'MERGED', record: record({ step: 'awaiting-owner-merge', outcome: 'owner-ui-merge' }) });
+  assert.equal(p.enter, 'observe-prod');
+  assert.ok(p.notes.some((n) => /never roll production back/.test(n)));
 });

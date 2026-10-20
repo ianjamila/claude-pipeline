@@ -45,6 +45,7 @@ function setup(t, { text = planText(), yml = pipelineYml() } = {}) {
     { match: '-X POST repos/acme/widgets/issues/7/comments', stdoutJson: { id: 9000, html_url: 'https://x/9000' } },
     { match: '-X PATCH repos/acme/widgets/issues/comments/', stdoutJson: { id: 9001, html_url: 'https://x/9001' } },
   ];
+  w.script = script;
   w.sync = () => fake.setScript(script());
   w.add = (body, id = w.nextId++) => { w.comments.push({ id, user: { login: 'me' }, body, created_at: '2026-10-19T09:00:00Z', updated_at: '2026-10-19T09:00:00Z', html_url: `https://x/${id}` }); return id; };
   // What the commands posted (POST) or rewrote (PATCH) becomes the comment list the next call reads.
@@ -443,4 +444,37 @@ test('approve: the owner record of ANOTHER repo (same PR number, blob and scope)
   r = await w.call(['approve', '--pr', '7']);
   assert.equal(r.exitCode, 0, JSON.stringify(r.output));
   assert.equal(w.events().filter((e) => e.kind === 'plan-approved').length, 1);
+});
+
+// ---- T9 d3: resume sees "approved, but the checkpoint never landed" and routes to build via P plan approve ----
+
+const prViewOpen = (w) => ({ match: '^pr view 7', stdoutJson: { number: 7, title: 'PR 7', url: 'https://x/pull/7', state: 'OPEN', isDraft: false, headRefName: 'agent/x', headRefOid: w.headOid, baseRefName: 'main', isCrossRepository: false, labels: [], autoMergeRequest: null, mergeCommit: null } });
+
+test('d3: approval event posted but its checkpoint failed -> resume plan builds with planApproveFirst; P plan approve repairs; the next resume has no flag', async (t) => {
+  const { run: resumeRun } = await import('../pipeline/commands/resume.mjs');
+  const w = setup(t);
+  await w.call(['record', '--pr', '7', '--file', REL]); w.absorb();
+  const owner = w.approves(w.blob(), w.digest());
+  // the plan-approved event landed; the summary upsert that copies the approved tasks did not: the record is still `plan`, no tasks
+  w.add(renderEvent('plan-approved', `${w.blob().slice(0, 12)}-${owner.record_id.slice(0, 8)}`, 'Plan approved', {
+    ...BIND, path: REL, blob: w.blob(), scopeDigest: w.digest(), recordId: owner.record_id, promptSha256: owner.prompt_sha256,
+  }));
+  w.sync();
+  assert.deepEqual([w.summary().step, w.summary().tasks.length], ['plan', 0]);
+  const resumePlan = async () => {
+    w.fake.setScript([prViewOpen(w), ...w.script()]);
+    return resumeRun(['plan', '--pr', '7'], { cwd: w.repo.dir, env: { ...process.env, ...w.fake.env }, home: w.home });
+  };
+  const first = await resumePlan();
+  assert.equal(first.exitCode, 0, JSON.stringify(first.output));
+  assert.deepEqual([first.output.enter, first.output.planApproveFirst], ['build', true]);
+  assert.deepEqual([first.output.plan.approval, first.output.plan.needsApproveCheckpoint], ['verified', true]);
+  w.sync();
+  const r = await w.call(['approve', '--pr', '7']);
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.equal(r.output.event.reused, true, 'the posted approval is reused, not posted again');
+  w.absorb();
+  assert.deepEqual([w.summary().step, w.summary().tasks.length], ['build', 1]);
+  const second = await resumePlan();
+  assert.deepEqual([second.output.enter, second.output.planApproveFirst], ['build', false]);
 });

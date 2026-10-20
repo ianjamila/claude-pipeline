@@ -19,7 +19,7 @@ import { unresolvedRollbacks } from './run-events.mjs';
 const MINUTE = 60000;
 
 // Routes the skill acts on; the rest only report.
-const REPORT_ONLY = new Set(['closed', 'ended', 'not-resumable', 'decision']);
+const REPORT_ONLY = new Set(['closed', 'ended', 'not-resumable', 'decision', 'plan', 'owner-ui-merge']);
 const NO_RECORD = new Set(['absent', 'legacy', 'invalid', 'unsupported', 'mismatch']);
 
 const firstSentence = (s) => {
@@ -50,7 +50,9 @@ function liveInFlight(record, nowMs, fallbackMinutes) {
 
 function routeMerged(facts, record) {
   const rollbackOpen = unresolvedRollbacks(facts.events).length > 0;
-  const midMerge = facts.recordStatus === 'ok' && record != null && prodStillOpen(record) && (record.step === 'merge' || record.step === 'prod-watch');
+  // An owner-ui-merge hand-off ends with an outcome but production was never watched: the owner's GitHub merge starts that.
+  const handedOff = record?.outcome === 'owner-ui-merge';
+  const midMerge = facts.recordStatus === 'ok' && record != null && (handedOff || (prodStillOpen(record) && (record.step === 'merge' || record.step === 'prod-watch')));
   if (!rollbackOpen && !midMerge) {
     return { enter: 'ended', reason: record?.outcome ? `already merged; the run ended ${record.outcome}` : 'already merged; nothing left to resume' };
   }
@@ -62,7 +64,8 @@ function routeMerged(facts, record) {
     enter: 'observe-prod',
     reason: rollbackOpen
       ? 'merged, and a rollback was started but its result was never recorded'
-      : `merged, but the run stopped in the ${record.step} step before production was confirmed`,
+      : handedOff ? 'merged by the owner in GitHub after the hand-off; production was never watched'
+        : `merged, but the run stopped in the ${record.step} step before production was confirmed`,
     notes,
   };
 }
@@ -103,6 +106,18 @@ function route(facts, record) {
         : `uncommitted work in ${where}: commit or stash it first`,
     };
   }
+  // Plan evidence (spec §§3, 7): judged against the approved plan blob, never the run record alone. Absent `facts.plan` = a legacy
+  // caller: no plan routing.
+  const p = facts.plan;
+  if (p?.evidence) {
+    if (p.approval === 'lost') return { enter: 'decision', reason: `plan evidence lost or tampered (${p.lostReason ?? 'unknown'}): re-show the active plan request; the owner's new "approve" clears it` };
+    if (p.approval !== 'verified' && p.openWork) return { enter: 'plan', reason: p.active ? `plan ${p.active.blob.slice(0, 12)} is not approved on this machine: show its request and wait for "approve"` : 'no active plan proposal: run P plan record' };
+    // The approval event was posted but its checkpoint failed (spec §7): the approval is verified here, so resume builds, after
+    // re-running the idempotent `P plan approve`, which copies the approved tasks into the record.
+    if (p.approval === 'verified' && p.needsApproveCheckpoint) return { enter: 'build', reason: 'the plan is approved but the run record missed it: run P plan approve (reuses the event, copies the approved tasks), then build the open tasks', planApproveFirst: true };
+  }
+  if (record?.outcome === 'owner-ui-merge') return { enter: 'owner-ui-merge', reason: 'handed to the owner for a GitHub merge; the pipeline does not merge' };
+
   // The label means "owner decides now" only once the run has stopped there (outcome needs-human) or when we cannot read the
   // run. Step 3.5 adds it as soon as a hard-stop hit lands, BEFORE the review loop: a usable record with no outcome (or a
   // resumable one) is a run that is still going or stalled, and it resumes normally.
@@ -190,6 +205,6 @@ export function planResume(facts, { now, heartbeatFreshMinutes = 90, ownerApprov
   if (autoMerge) notes.push('auto-merge is armed on this PR with no live merge of this run: disarm it and report');
 
   const worktree = planWorktree(enter, f, notes);
-  const stop = STOPS_AT_OWNER.has(enter) ? (ownerApproval === 'chat' ? 'awaiting-owner-merge' : 'needs-human') : null;
-  return { enter, reason: picked.reason, adopt: noRecord, confirm, autoMerge, worktree, stop, notes };
+  const stop = enter === 'plan' ? 'awaiting-plan-approval' : STOPS_AT_OWNER.has(enter) ? (ownerApproval === 'chat' ? 'awaiting-owner-merge' : 'needs-human') : null;
+  return { enter, reason: picked.reason, adopt: noRecord, confirm, autoMerge, worktree, stop, notes, planApproveFirst: picked.planApproveFirst === true };
 }
