@@ -1297,7 +1297,7 @@ function placeOf(f, rec) {
 // - isAbs(path), p: the policy's path functions (node:path or node:path.posix), ci: compare names ignoring case
 // - real(path): the path with symlinks followed (a missing tail kept), or null when it cannot be told; omitted: paths are taken as written
 // - stamp(idx) (optional): changes whenever locate() would answer differently for the command at idx (the directory it runs in becomes known); tick() (optional): reads the evaluation's clock and throws when it is past its deadline
-export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, real = null, readText = null, text = null, stamp = null, tick = null }) {
+export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, driveRel = false, real = null, readText = null, text = null, stamp = null, tick = null }) {
   // an awk program file (-f FILE): the text of every place the word may name; null when it cannot be told (a run-time word, a file we cannot read, a place we do not know)
   const readProgram = readText ? (word, idx) => {
     const e = expand(word);
@@ -1313,7 +1313,7 @@ export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, real
   const seps = cmds.filter((c) => c.sep === '&').length;
   const opaque = lone > seps || cmds.some(startsBackground);
   const bgWork = seps > 0 || opaque;
-  return { cmds, recs: w.recs, unmodelled: w.unmodelled, from: flowStart(cmds), i: -1, expand, locate, isAbs, p, ci, real, stamp, tick, deferred: hasDeferred(cmds), opaque, bgWork };
+  return { cmds, recs: w.recs, unmodelled: w.unmodelled, from: flowStart(cmds), i: -1, expand, locate, isAbs, p, ci, driveRel, real, stamp, tick, deferred: hasDeferred(cmds), opaque, bgWork };
 }
 
 // commands that start a job which outlives them (a `&` is read from the text)
@@ -1625,6 +1625,8 @@ function partAlternatives(frames, h, io, depth) {
 // (the pattern a word stands for depends on the word alone: true = anything, or a matcher ({ test(P) }); built once, not once per name asked)
 const DYNAMIC_PATTERNS = new Map();
 function dynamicMayBe(f, word, P, below = false) {
+  // (driveRel, Windows: `D:foo` is relative to the cwd of drive D, which nobody knows -- a part only known at run time, like `$X`)
+  if (f.driveRel && /^[A-Za-z]:(?![/\\\s])/.test(word)) word = `$DRIVE_RELATIVE_${String(word).slice(2)}`;
   const key = `${f.ci ? 1 : 0}${below ? 1 : 0}${word}`;
   let pat = DYNAMIC_PATTERNS.get(key);
   if (pat === undefined) {
@@ -1687,7 +1689,8 @@ const MAX_CHAIN = 24; // a file copied from a file copied from a file ... (longe
 // { texts, files, scans, unknown } or null when no write reaches it. `files` are the sources (and their own sources, in turn): the
 // caller judges each as the script it is. `exists(path)`: is there a file now (a missing one may have been created by an unmodelled command).
 // `ignoreUnmodelled`: the real home's startup files (no word on the line names them) are not "a missing script that something may have created".
-// `viaUnmodelled` in the result: the answer depends on a command we do not model (a cached verdict must not outlive a new one).
+// `genericAsUnknown`: a program we do not model that is handed the file's name among its words is an unknown write, not a copy of the files among its words (a package manager's file check).
+// `viaUnmodelled` in the result: the answer depends on a command we do not model (a cached verdict must not outlive a new one). `named`: some write names this very file (an exact target, not a subtree or a target only known at run time).
 // `readText(path)`: the text of a file now (string, or null). `joined`: the whole texts the file may hold when several writes build it (appends, cat A B);
 // `pieces`: it is built from pieces and cannot be put together (a piece unknown, computed or too many), so no single piece can be judged for what the file runs.
 // The texts a file may hold after the line's writes to it (w: a writtenTo result), with `disk` its text now (null when missing: '' then, as a write may fail),
@@ -1713,9 +1716,18 @@ export function joinedReadings(parts, cap = 32) {
   return acc;
 }
 
-export function writtenTo(frames, target, { exists, readText = () => null, ignoreUnmodelled = false }) {
+// The same frames compared without case (what the caches hold is case-dependent, so the copy starts without them).
+function caseFolded(f) {
+  return { ...f, ci: true, resolved: undefined, ancestors: undefined, relMemo: undefined, targets: undefined, canonCache: undefined };
+}
+// foldCase: compare names without case whatever the platform says (the files a package manager reads: macOS and Windows file systems ignore case, and over-refusing on Linux fails closed)
+export function writtenTo(frames, target, { exists, readText = () => null, ignoreUnmodelled = false, genericAsUnknown = false, foldCase = false }) {
+  if (foldCase && frames.some((f) => !f.ci)) {
+    const copies = frames.map((f) => (f.ci ? f : caseFolded(f)));
+    try { return writtenTo(copies, target, { exists, readText, ignoreUnmodelled, genericAsUnknown }); } finally { copies.forEach((c, i) => { if (c.unresolved && !frames[i].unresolved) frames[i].unresolved = true; }); }
+  }
   if (!frames.length || !frames.some((f) => f.recs.length || f.unmodelled.size)) return null;
-  const st = { texts: new Set(), files: new Set(), scans: new Set(), programs: new Set(), authored: false, unknown: false, any: false, seen: new Set(), ignoreUnmodelled, viaUnmodelled: false };
+  const st = { texts: new Set(), files: new Set(), scans: new Set(), programs: new Set(), authored: false, unknown: false, any: false, seen: new Set(), ignoreUnmodelled, genericAsUnknown, viaUnmodelled: false };
   const upto = frames.length - 1;
   collect(frames, upto, frames[upto].i, target, st, 0, exists);
   if (!st.any) return null;
@@ -1725,7 +1737,7 @@ export function writtenTo(frames, target, { exists, readText = () => null, ignor
   // Why: the unknown text of an in-place sed is the edit's own result: once every text it leaves is built (the program emulated for every text it may get) it is judged as a text, not as run-time content
   if (st.sedEdit && (built === null || io.pieces || io.sedRefused)) st.unknown = true;
   const joined = (built ?? []).filter((x) => !st.texts.has(x));
-  return { texts: [...st.texts], files: [...st.files], scans: [...st.scans], programs: [...st.programs], authored: st.authored, unknown: st.unknown, viaUnmodelled: st.viaUnmodelled, joined, pieces: io.pieces || st.cut === true };
+  return { texts: [...st.texts], files: [...st.files], scans: [...st.scans], programs: [...st.programs], authored: st.authored, unknown: st.unknown, viaUnmodelled: st.viaUnmodelled, named: st.named === true, joined, pieces: io.pieces || st.cut === true };
 }
 
 // The links the line makes before the command: [alias, real, frame] for `ln -s REAL ALIAS` (and a hard link). A directory alias makes
@@ -1783,7 +1795,9 @@ function collect(frames, upto, asOf, P, st, depth, exists) {
   const pairs = linkPairs(frames, upto, asOf);
   const names = pairs.length ? namesOf(pairs, P) : [P];
   for (const h of hitsOn(frames, upto, asOf, P)) {
+    if (h.rec.generic !== undefined && st.genericAsUnknown) { st.any = true; st.unknown = true; continue; } // (a program we do not model, handed words that may name the file: it may write the file, with content nobody knows -- its other words are not a source it copies from)
     if (h.loose && st.ignoreUnmodelled) continue; // (the real home's startup files: only the line's exact writes reach them, not a target known only at run time)
+    if (!h.loose && !h.rec.subtree && h.items.some((it) => it.abs === undefined)) st.named = true; // (a write that names this very file, not one that may reach it: the target of a redirect, cp, mv, sed -i ..., not a tar x or a worktree add below a directory, nor a file some directory copy may carry in)
     absorb(frames, h.fi, h.f, h.rec, h.items, h.P, st, depth, exists);
     if (certainReplace(h) && !copyMayFail(frames, h, exists)) st.lastReplace = [h.fi, h.rec.idx]; // an exact write that replaces the file: what came before it no longer matters
   }
