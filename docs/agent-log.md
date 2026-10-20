@@ -74,3 +74,4 @@ full record.
 - 2026-10-20 · #89 · guards open package-manager scripts · risk high · rounds 8 · arbiter 0 · merged
 - 2026-10-20 · #94 · fix(stacks): no false MISS from read-only looks or idle sessions · risk high · rounds 2 · arbiter 0 · stopped
 - 2026-10-20 · #98 · verify: vendored run-history lib — one line per verify run · risk high · rounds 2 · arbiter 0 · stopped
+- 2026-10-20 · #93 · tests: machine-proof speed checks (scaled CPU caps + step counts) · risk high · rounds 2 · arbiter 0 · stopped
