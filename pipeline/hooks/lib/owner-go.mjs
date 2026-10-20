@@ -150,7 +150,7 @@ function notOwnerPrompt(input) {
 const OPEN_APPEND = constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
 
 // Each folder from <home>/.claude down must be a real directory (a symlink would move the records elsewhere).
-function realDirChain(home, rel) {
+export function realDirChain(home, rel) {
   let p = home;
   for (const part of rel.split('/')) {
     p = path.join(p, part);
