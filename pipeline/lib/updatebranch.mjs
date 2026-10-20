@@ -81,16 +81,30 @@ async function waitForNewHead({ gh, pr, from, waitMs, pollMs, now, sleep }) {
 // successor (an external push that raced the update) is `head-moved` and nothing more is written. Waiting for the new head's
 // checks is opt-in (`waitChecks: true`): the ship flow marks the PR ready and labels it AFTER updating, and checks that only
 // start then (draft-skipped workflows, label-gated e2e) would otherwise be waited on forever. Merge needs no check wait either.
-export async function bringUpToDate({
+// Every return carries `updates`: the {headBefore, baseTip} pair (both 40-hex SHAs; `base` stays the branch name) of each update
+// whose result was confirmed as the merge of the base tip into the head, so a cycle-cap / checks-failed / head-timeout exit after a
+// confirmed update still reports it. A THROW after one carries the same array on the error (`err.updates`), so the caller can record
+// it before rethrowing (the busy-main hand-off counts these, cp #88).
+export async function bringUpToDate(opts) {
+  const updates = [];
+  try {
+    return await updateLoop(opts, updates);
+  } catch (err) {
+    if (err !== null && typeof err === 'object') err.updates = updates;
+    throw err;
+  }
+}
+
+async function updateLoop({
   gh, pr, expectHead = null, maxCycles = MAX_UPDATE_CYCLES, waitChecks = false,
   headWaitMs = HEAD_WAIT_MS, checksWaitMs = CHECKS_WAIT_MS, pollMs = POLL_MS, now = Date.now, sleep = defaultSleep,
-}) {
+}, updates) {
   let cycles = 0;
   let startHead = null;
   let known = expectHead;
   let base = null;
   const out = (outcome, extra = {}) => ({
-    ok: outcome === 'up-to-date', outcome, updated: cycles > 0, cycles, base, startHead, ...extra,
+    ok: outcome === 'up-to-date', outcome, updated: cycles > 0, cycles, base, startHead, updates: updates.map((u) => ({ ...u })), ...extra,
   });
 
   for (;;) {
@@ -124,6 +138,7 @@ export async function bringUpToDate({
     if (parents.length !== 2 || parents[0] !== head || parents[1] !== baseSha) {
       return out('head-moved', { head: next, message: `the PR head became ${next}, which is not the merge of ${baseSha} into ${head} (parents: ${parents.join(', ') || 'none'}): someone pushed during the update; re-read, nothing more was written` });
     }
+    updates.push({ headBefore: head, baseTip: baseSha });
     known = next;
     if (waitChecks) {
       const verdict = await waitForChecks({ gh, pr, waitMs: checksWaitMs, pollMs, now, sleep });

@@ -480,3 +480,47 @@ test('merge: the update step is bounded to one cycle (a head that is still behin
   assert.equal(puts(s).length, 1);
   assert.deepEqual(s.mergeCalls(), []);
 });
+
+// ---- the confirmed update pairs (busy-main hand-off, cp #88) -----------------------------------------------------------
+
+test('bringUpToDate reports every confirmed update as {headBefore, baseTip} on EVERY exit', async () => {
+  const none = await run(world({ behind: [0] }), { expectHead: A });
+  assert.deepEqual(none.updates, [], 'up-to-date with no update: no pairs');
+  const w = world({ behind: [1, 0] });
+  const one = await run(w, { expectHead: A });
+  assert.deepEqual(one.updates, [{ headBefore: A, baseTip: BASE_SHA }]);
+  assert.equal(one.base, 'main', 'base stays the branch name');
+  const two = await run(world({ behind: [1, 1, 0] }), { expectHead: A });
+  assert.deepEqual(two.updates, [{ headBefore: A, baseTip: BASE_SHA }, { headBefore: B, baseTip: BASE_SHA }]);
+});
+
+test('a cycle-cap, checks-failed or checks-timeout exit after a confirmed update still reports the pair; an unconfirmed one does not', async () => {
+  const cap = await run(world({ behind: [1, 1, 1] }), { expectHead: A, maxCycles: 1 });
+  assert.equal(cap.outcome, 'cycle-cap');
+  assert.equal(cap.updates.length, 1);
+  assert.match(cap.updates[0].baseTip, /^[0-9a-f]{40}$/);
+  assert.match(cap.updates[0].headBefore, /^[0-9a-f]{40}$/);
+  const failed = await run(world({ checks: [[{ name: 'ci', bucket: 'fail' }]] }), { expectHead: A });
+  assert.equal(failed.outcome, 'checks-failed');
+  assert.equal(failed.updates.length, 1);
+  assert.equal((await run(world({ checks: [[]] }), { expectHead: A })).updates.length, 1);
+  // not confirmed: a conflict, a refused pin, a head that never changed, a foreign successor
+  for (const w of [world({ update: 'conflict' }), world({ update: 'head-moved' }), world({ pushAfterUpdate: A }), world({ race: true })]) {
+    assert.deepEqual((await run(w, { expectHead: A })).updates, []);
+  }
+});
+
+test('a throw after a confirmed update carries the pairs on the error; a throw before any update carries none', async () => {
+  const w = world({ behind: [1, 1, 0] });
+  const original = w.gh.prView;
+  let reads = 0;
+  w.gh.prView = (...args) => {
+    reads += 1;
+    if (reads >= 4) throw new GhError({ code: 1, stderr: 'gh: Server Error (HTTP 502)', args: ['pr', 'view'] });
+    return original(...args);
+  };
+  await assert.rejects(run(w, { expectHead: A, waitChecks: false }), (err) => err instanceof GhError && err.updates.length === 1 && err.updates[0].headBefore === A);
+  const early = world();
+  early.gh.prView = () => { throw new GhError({ code: 1, stderr: 'gh: Server Error (HTTP 502)', args: ['pr', 'view'] }); };
+  await assert.rejects(run(early, { expectHead: A }), (err) => err instanceof GhError && Array.isArray(err.updates) && err.updates.length === 0);
+});
