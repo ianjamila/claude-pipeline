@@ -60,10 +60,14 @@ family or a `review.security.paths` glob (and again in a later round whose range
 out), `fable` once when `review.final_pass: risky`, the PR is high risk and Codex found nothing BLOCKING. You cannot declare or
 skip one: until every obligation of every round is met the round is not clean, `P review-complete` refuses and the gate's
 `review` check fails. For each obligation in the output (nothing to do when the list is empty):
-1. `P review header --pr <pr> --round <round> --source <s> --base <reviewBase> --head <head>` (pure; `reviewBase` / `head` are the
-   `--base` / `--head` you gave `codex-review`, so it can run while Codex is still going). It prints `promptHeader` and `digest`.
+1. Take the `promptHeader` the `obligations` output already printed for this source and paste it as is. Only when you need it earlier
+   or again, run `P review header --pr <pr> --round <round> --source <s> --base <reviewBase> --head <head>` (pure) with the round's
+   RECORDED `reviewBase` (`rounds[<round>].reviewBase` in `.review/state.json`), NOT the raw `--base` you gave `codex-review`: after a
+   base merge the round is diffed against a synthetic tree or the whole-PR base, and the obligation digest hashes that, so the raw
+   base gives a different `INPUT-DIGEST` and `review add` rejects the answer. It prints `promptHeader` and `digest`.
 2. Dispatch `security-reviewer` (security) or `fable-reviewer` with `mode: pr` (fable), NO `model` parameter. The prompt starts with
-   the `promptHeader` pasted verbatim as its first two lines, then the absolute worktree path, `base`, `head` and the PR title. The Agent
+   the `promptHeader` pasted verbatim as its first two lines, then the absolute worktree path, the round's `reviewBase`, `head` and the PR title, and tell the reviewer that `reviewBase` may be a tree
+   object, so it diffs with `git diff <base> <head>` (two-dot), never `<base>...<head>`. The Agent
    `description` is the tag `pipeline-<s> R<round> <digest8>` (`<digest8>` = the first 8 characters of `digest`), e.g.
    `pipeline-security R1 1a2b3c4d`.
 3. `P review add --round <round> --source <s> --tag "pipeline-<s> R<round> <digest8>"`. It proves from the transcript that the

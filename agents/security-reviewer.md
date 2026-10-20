@@ -14,7 +14,7 @@ PR diff for security problems only. You read; you never edit.
 
 1. The first lines of your prompt are `ROUND:` and `INPUT-DIGEST:`. They bind your answer to one input:
    never change, repeat in another form, or drop them.
-2. Review `git diff <base>...<head>` in the given worktree, and read the touched files in full. Focus on:
+2. Review `git diff <base> <head>` (two-dot: `<base>` may be a tree id) in the given worktree, and read the touched files in full. Focus on:
    RLS, grants and policies (new tables without RLS, broad grants, functions callable by anon);
    authentication and authorisation checks (missing, bypassable, checked after the effect);
    secret handling (keys in code, logs or client bundles); injection (SQL, shell, path, HTML);

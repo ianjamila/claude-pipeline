@@ -1809,7 +1809,7 @@ if (record?.outcome === 'owner-ui-merge') return { enter: 'owner-ui-merge', reas
       and the owner never says "merge" to a v2 run on an older CLI.
   - `review-loop.md`: new **Reviewer obligations** section.
     1. `P codex-review` prints `obligations`.
-    2. For each: `P review header --pr N --round R --source <s> --base <reviewBase> --head <head>`.
+    2. For each: paste the `promptHeader` from the `obligations` output (or run `P review header ... --base <the round's recorded reviewBase from .review/state.json> --head <head>`, never the raw `--base`: it may be a tree after a base merge, so the reviewer diffs two-dot, `git diff <base> <head>`).
     3. Dispatch `security-reviewer` / `fable-reviewer` (mode pr) with the header as the first lines and tag
        `pipeline-<s> R<R> <digest8>`.
     4. `P review add --round R --source <s> --tag "<tag>"`.

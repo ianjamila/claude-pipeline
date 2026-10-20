@@ -16,7 +16,7 @@ what the author and the earlier reviewers missed. You read; you never edit.
    never change, repeat in another form, or drop them.
 2. Mode `plan`: attack the plan at the given path against the code it describes (wrong file names, missing
    steps, scope that does not match the tasks, untested behaviour). Mode `pr`: review
-   `git diff <base>...<head>` in the given worktree, with the touched files read in full.
+   `git diff <base> <head>` (two-dot: `<base>` may be a tree id) in the given worktree, with the touched files read in full.
 3. Read-only: no edits, no git writes, no network.
 4. Final message: ONE ```json block matching `pipeline/schemas/codex-findings.schema.json`:
    `summary`, `blocking`, `suggestions`, `worth_considering`; each finding has `title`, `file`, `line`,
