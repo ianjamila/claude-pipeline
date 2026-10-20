@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { gzipSync } from 'node:zlib';
 import { MARKERS } from '../pipeline/lib/render.mjs';
 import {
-  OUTCOMES, OUTCOME_NEXT, OUTCOME_STEP, STEPS, STATUS_END, STATUS_START, LIMITS,
-  applyCheckpoint, bindRecord, decodeRecord, emptyRecord, encodeRecord, recordForOutcome, renderStatusBlock,
+  OUTCOMES, OUTCOME_NEXT, OUTCOME_STEP, RECORD_VERSION, STEPS, STATUS_END, STATUS_START, LIMITS,
+  applyCheckpoint, bindRecord, decodeRecord, emptyRecord, encodeRecord, outcomeNext, recordForOutcome, renderStatusBlock,
 } from '../pipeline/lib/run-record.mjs';
 
 const ID = { repo: 'acme/widgets', pr: 7, branch: 'feat/x', baseRef: 'main' };
@@ -86,8 +86,8 @@ test('oversize payload (decompresses past the cap) is invalid, not an allocation
   assert.equal(decodeRecord(`${MARKERS.summary}\n${big}`).status, 'invalid');
 });
 
-test('v > 1 is unsupported, v 0 / missing is invalid', () => {
-  assert.equal(decodeRecord(`${MARKERS.summary}\n${rawMarker({ ...emptyRecord(ID), v: 2 })}`).status, 'unsupported');
+test('v > RECORD_VERSION is unsupported, v 0 / missing is invalid', () => {
+  assert.equal(decodeRecord(`${MARKERS.summary}\n${rawMarker({ ...emptyRecord(ID), v: RECORD_VERSION + 1 })}`).status, 'unsupported');
   assert.equal(decodeRecord(`${MARKERS.summary}\n${rawMarker({ ...emptyRecord(ID), v: 0 })}`).status, 'invalid');
   const { v, ...noV } = emptyRecord(ID);
   assert.equal(decodeRecord(`${MARKERS.summary}\n${rawMarker(noV)}`).status, 'invalid');
@@ -251,4 +251,95 @@ test('renderStatusBlock: a bare record says running and has dashes', () => {
   assert.match(block, /\*\*Outcome:\*\* running/);
   assert.match(block, /\*\*Next:\*\* —/);
   assert.match(block, /\*\*Heartbeat:\*\* —/);
+});
+
+// ---- owner stop display copy (owner_approval: chat) -------------------------------------------------------------------
+
+const STOP = { id: 'ab12cd34', cause: 'merge:command-failed', head: 'a'.repeat(40), at: '2026-10-20T08:00:00.000Z' };
+const decodeOf = (rec, opts) => decodeRecord(`${MARKERS.summary}\n${rawMarker(rec)}`, opts);
+
+test('ownerStop copy: applyCheckpoint sets it, later patches keep it, null clears it; v is 2 only while it is present', () => {
+  const base = emptyRecord(ID);
+  assert.equal(base.v, 1, 'a fresh record is readable by old CLIs');
+  const stopped = applyCheckpoint(base, { ownerStop: STOP }, CTX);
+  assert.deepEqual(stopped.ownerStop, STOP);
+  assert.equal(stopped.v, 2);
+  const later = applyCheckpoint(stopped, { step: 'review', round: 2, outcome: null }, CTX);
+  assert.deepEqual(later.ownerStop, STOP, 'an ordinary patch keeps the copy (unknown keys survive the clone)');
+  assert.equal(later.v, 2);
+  const cleared = applyCheckpoint(later, { ownerStop: null }, CTX);
+  assert.equal('ownerStop' in cleared, false);
+  assert.equal(cleared.v, 1, 'back to 1 once the copy is gone');
+  assert.equal(applyCheckpoint(base, { step: 'verify' }, CTX).v, 1, 'no copy, no event: v stays 1');
+  // a record that says v 2 without a copy is brought back to 1 on the next write
+  assert.equal(applyCheckpoint({ ...base, v: 2 }, { step: 'verify' }, CTX).v, 1);
+});
+
+test('ownerStop copy: normalised to {id, cause, head, at}; a malformed patch throws', () => {
+  const r = applyCheckpoint(emptyRecord(ID), { ownerStop: { id: 'ab12cd34', at: STOP.at, extra: 'x' } }, CTX);
+  assert.deepEqual(r.ownerStop, { id: 'ab12cd34', cause: null, head: null, at: STOP.at });
+  for (const bad of ['ab12cd34', [], { ...STOP, id: 'nope' }, { ...STOP, id: 5 }, { ...STOP, cause: 'bad cause!' }, { ...STOP, cause: 7 }, { ...STOP, head: 5 }, { ...STOP, at: undefined }]) {
+    assert.throws(() => applyCheckpoint(emptyRecord(ID), { ownerStop: bad }, CTX), /ownerStop/, JSON.stringify(bad));
+  }
+});
+
+test('ownerStop copy: survives encode/decode; a malformed copy => invalid', () => {
+  const rec = applyCheckpoint(emptyRecord(ID), { ownerStop: STOP }, CTX);
+  const decoded = decodeRecord(withMarker(rec));
+  assert.equal(decoded.status, 'ok');
+  assert.deepEqual(decoded.record.ownerStop, STOP);
+  for (const bad of ['x', [], 5, { ...STOP, id: '' }, { ...STOP, id: 'ZZZZZZZZ' }, { ...STOP, cause: 'a b' }, { ...STOP, head: 7 }, { ...STOP, at: null }, {}]) {
+    assert.equal(decodeOf({ ...rec, ownerStop: bad }).status, 'invalid', JSON.stringify(bad));
+  }
+  assert.equal(decodeOf({ ...rec, ownerStop: { ...STOP, cause: null, head: null } }).status, 'ok', 'cause and head may be null');
+});
+
+test('rollout tripwire: an OLD CLI (max version 1) reads a record with an open stop as unsupported, an ordinary one as ok', () => {
+  const stopped = applyCheckpoint(emptyRecord(ID), { ownerStop: STOP }, CTX);
+  assert.equal(RECORD_VERSION, 2);
+  assert.equal(decodeOf(stopped).status, 'ok', 'this CLI reads it');
+  assert.equal(decodeOf(stopped, { maxVersion: 1 }).status, 'unsupported', 'the old CLI would refuse it and demand the owner\'s "merge"');
+  assert.equal(decodeOf(applyCheckpoint(emptyRecord(ID), { step: 'verify' }, CTX), { maxVersion: 1 }).status, 'ok', 'ordinary records stay readable by old CLIs');
+  assert.equal(decodeOf({ ...emptyRecord(ID), v: 3 }).status, 'unsupported');
+});
+
+test('outcomeNext: label mode (and no mode) is today\'s text for every outcome; chat only changes needs-human', () => {
+  for (const o of OUTCOMES) {
+    assert.equal(outcomeNext(o), OUTCOME_NEXT[o], o);
+    assert.equal(outcomeNext(o, { ownerApproval: 'label', stop: STOP, pr: 7 }), OUTCOME_NEXT[o], `${o} label`);
+    if (o !== 'needs-human') assert.equal(outcomeNext(o, { ownerApproval: 'chat', stop: STOP, pr: 7 }), OUTCOME_NEXT[o], `${o} chat`);
+  }
+  assert.equal(OUTCOME_NEXT['needs-human'], 'owner review: add `human-approved`, then merge', 'the label text is untouched');
+  assert.equal(outcomeNext('needs-human', { ownerApproval: 'chat', stop: STOP, pr: 7 }), 'owner reply needed in chat (stop ab12cd34): ship resume 7');
+  assert.equal(outcomeNext('needs-human', { ownerApproval: 'chat', pr: 7 }), 'owner reply needed in chat: ship resume 7');
+  assert.equal(outcomeNext('needs-human', { ownerApproval: 'chat' }), 'owner reply needed in chat: ship resume N');
+  assert.equal(outcomeNext('needs-human', { ownerApproval: 'weird', pr: 7 }), OUTCOME_NEXT['needs-human'], 'an unknown mode is label behaviour');
+});
+
+test('recordForOutcome: label mode writes no copy and stays v 1 (needs-human included); chat mode writes the chat text and the copy it is given', () => {
+  const label = recordForOutcome(null, { ...ID, outcome: 'needs-human', ...CTX }).record;
+  assert.deepEqual([label.v, label.next, 'ownerStop' in label], [1, OUTCOME_NEXT['needs-human'], false]);
+  const labelWithStop = recordForOutcome(null, { ...ID, outcome: 'needs-human', ownerApproval: 'label', ownerStop: STOP, ...CTX }).record;
+  assert.equal('ownerStop' in labelWithStop, false, 'label mode never records a stop');
+  const chatNoStop = recordForOutcome(null, { ...ID, outcome: 'needs-human', ownerApproval: 'chat', ...CTX }).record;
+  assert.deepEqual([chatNoStop.v, chatNoStop.outcome, chatNoStop.next, 'ownerStop' in chatNoStop], [1, 'needs-human', 'owner reply needed in chat: ship resume 7', false]);
+  const chat = recordForOutcome(null, { ...ID, outcome: 'needs-human', ownerApproval: 'chat', ownerStop: STOP, ...CTX }).record;
+  assert.deepEqual([chat.v, chat.next, chat.ownerStop], [2, 'owner reply needed in chat (stop ab12cd34): ship resume 7', STOP]);
+});
+
+test('recordForOutcome: a later outcome (stopped, merged...) neither clears nor sets the copy; only the event is the authority', () => {
+  const stopped = applyCheckpoint(emptyRecord(ID), { ownerStop: STOP }, CTX);
+  for (const ownerApproval of [undefined, 'label', 'chat']) {
+    const after = recordForOutcome(stopped, { ...ID, outcome: 'stopped', ownerApproval, ...CTX }).record;
+    assert.deepEqual([after.outcome, after.ownerStop, after.v], ['stopped', STOP, 2], String(ownerApproval));
+  }
+});
+
+test('the status block shows the open stop only while the copy is present', () => {
+  const plain = renderStatusBlock(emptyRecord(ID));
+  assert.doesNotMatch(plain, /Owner stop/);
+  const shown = renderStatusBlock(applyCheckpoint(emptyRecord(ID), { ownerStop: STOP }, CTX));
+  assert.match(shown, /^- \*\*Owner stop:\*\* ab12cd34 \(merge:command-failed\)$/m);
+  const noCause = renderStatusBlock(applyCheckpoint(emptyRecord(ID), { ownerStop: { ...STOP, cause: null } }, CTX));
+  assert.match(noCause, /^- \*\*Owner stop:\*\* ab12cd34$/m);
 });
