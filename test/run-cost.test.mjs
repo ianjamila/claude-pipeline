@@ -2,14 +2,15 @@
 // cost / guard-block lines of `P summary`. The CLI tests run the real CLI against the scripted gh fake (gate-env).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { cli, scenario, ghEntries, PR } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
 import {
-  PHASES, ROLES, addCostEntry, listPriceUsd, modelFamily, addRetries, addSessions, costLines, costReport, emptyCost, readGuardLog, setGuardBlocks, usageFromTranscript,
+  MAX_COST_ENTRIES, PHASES, ROLES, addCostEntry, bookCost, listPriceUsd, modelFamily, addRetries, addSessions, costLines, costReport, emptyCost, readGuardLog, setGuardBlocks, usageFromTranscript,
 } from '../pipeline/lib/run-cost.mjs';
 import {
   STEPS, applyCheckpoint, decodeRecord, emptyRecord, encodeRecord, recordForOutcome, renderStatusBlock,
@@ -355,4 +356,103 @@ test('P summary: the per-session guard denies are recorded and reported', () => 
   const absent = scenario();
   withComment(absent, existing(withCost({ entry: entry(), sessions: ['s1'] })));
   assert.equal(summary(absent, [], { PIPELINE_GUARD_LOG_FILE: join(tmp(), 'nope.jsonl') }).json.cost.guardBySession, null);
+});
+
+// ---- keyed entries: one execution, booked once ----------------------------------------------------------------------------
+
+const E = (input) => ({ phase: 'plan', role: 'codex', input, output: 1, cacheRead: 0, cacheWrite: 0, usd: 0.5 });
+
+test('bookCost: the same execution key replaces its entry; totals stay derived', () => {
+  let c = bookCost(emptyCost(), E(100), { key: 'codex:s1' });
+  c = bookCost(c, E(150), { key: 'codex:s1' });
+  assert.equal(c.total.input, 150);
+  assert.equal(c.total.calls, 1);
+  assert.equal(c.byPhase.plan.input, 150);
+  assert.equal(c.byRole.codex.input, 150);
+  c = bookCost(c, E(10), { key: 'agent:x' });
+  assert.equal(c.total.input, 160);
+  assert.throws(() => bookCost(c, E(1), { key: 'nope' }), /execution key/);
+});
+
+test('bookCost: unkeyed bookings stay, a replaced key may change phase and role, and the new roles/phase exist', () => {
+  assert.ok(['codex', 'fable', 'security', 'screenshot'].every((r) => ROLES.includes(r)) && PHASES[0] === 'plan');
+  let c = addCostEntry(emptyCost(), entry());
+  c = bookCost(c, E(100), { key: 'plan:p1' });
+  c = bookCost(c, entry({ phase: 'review', role: 'judge', input: 7 }), { key: 'plan:p1' });
+  assert.deepEqual([c.total.input, c.total.calls], [107, 2]);
+  assert.equal(c.byPhase.plan, undefined, 'an emptied bucket is dropped');
+  assert.equal(c.byRole.codex, undefined);
+  assert.equal(c.byRole.judge.input, 7);
+  assert.equal(c.byPhase.build.input, 100);
+  assert.deepEqual(Object.keys(c.entries), ['plan:p1']);
+});
+
+test('bookCost never evicts: at the limit a new key is refused, an existing key still replaces, totals never double', () => {
+  let c = emptyCost();
+  for (let i = 0; i < MAX_COST_ENTRIES; i++) c = bookCost(c, E(1), { key: `agent:a${i}` });
+  assert.throws(() => bookCost(c, E(1), { key: 'agent:new' }), /cost-entries-full/);
+  const again = bookCost(c, E(5), { key: 'agent:a0' }); // the oldest key, replayed (retry / other machine)
+  assert.equal(again.total.input, MAX_COST_ENTRIES - 1 + 5);
+  assert.equal(again.total.calls, MAX_COST_ENTRIES);
+});
+
+// The stateful gh remembers comments between calls (the scripted fake is static); drop acknowledges a write and stores nothing.
+function statefulGh(comments = []) {
+  const dir = mkdtempSync(join(tmpdir(), 'cp-statefulgh-'));
+  const stateFile = join(dir, 'state.json');
+  writeFileSync(stateFile, JSON.stringify({ comments, next: 100, writes: 0 }));
+  const script = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'stateful-gh.mjs');
+  return {
+    env: (drop = false) => ({ PIPELINE_GH: `node "${script}"`, PIPELINE_STATEFUL_GH_STATE: stateFile, ...(drop ? { PIPELINE_STATEFUL_GH_DROP: '1' } : {}) }),
+    state: () => JSON.parse(readFileSync(stateFile, 'utf8')),
+  };
+}
+const keyedCli = (s, gh, args, { drop = false } = {}) => cli(['cost', '--pr', String(PR), '--phase', 'plan', '--role', 'codex', ...args], { dir: s.repo.dir, fake: { env: gh.env(drop) }, env: s.env });
+const recordOf = (gh) => decodeRecord(gh.state().comments.at(-1).body).record;
+
+test('P cost --execution: the same key booked twice leaves one call; a different key adds', () => {
+  const s = scenario();
+  const gh = statefulGh();
+  assertExit(keyedCli(s, gh, ['--input', '100', '--usd', '0.5', '--execution', 'codex:s1']), 0);
+  const r = keyedCli(s, gh, ['--input', '150', '--usd', '0.7', '--execution', 'codex:s1']);
+  assertExit(r, 0);
+  assert.equal(r.json.cost.total.calls, 1);
+  assert.equal(r.json.cost.total.input, 150);
+  assert.equal(recordOf(gh).cost.entries['codex:s1'].input, 150);
+  const r2 = keyedCli(s, gh, ['--input', '5', '--execution', 'agent:x']);
+  assertExit(r2, 0);
+  assert.equal(r2.json.cost.total.calls, 2);
+});
+
+test('P cost --execution: a write GitHub acknowledges but never stores exits 1 not-persisted after 3 attempts', () => {
+  const s = scenario();
+  const gh = statefulGh();
+  const r = keyedCli(s, gh, ['--input', '100', '--usd', '0.5', '--execution', 'codex:s1'], { drop: true });
+  assertExit(r, 1);
+  assert.deepEqual([r.json.ok, r.json.error, r.json.key], [false, 'not-persisted', 'codex:s1']);
+  assert.equal(gh.state().writes, 3);
+});
+
+test('P cost --execution: a bad key or no amount is a usage error; without --execution nothing changes', () => {
+  const s = scenario();
+  const gh = statefulGh();
+  assertExit(keyedCli(s, gh, ['--input', '1', '--execution', 'nope']), 2);
+  assertExit(keyedCli(s, gh, ['--retry', '--execution', 'codex:s1']), 2);
+  assert.equal(gh.state().writes, 0);
+  assertExit(keyedCli(s, gh, ['--input', '1']), 0);
+  assert.equal(recordOf(gh).cost.entries, undefined);
+});
+
+test('P cost --execution: a new key at 200 entries exits 1 cost-entries-full and writes nothing; an existing key still replaces', () => {
+  const s = scenario();
+  let c = emptyCost();
+  for (let i = 0; i < MAX_COST_ENTRIES; i++) c = bookCost(c, E(1), { key: `agent:a${i}` });
+  let body = '';
+  writeSummaryComment({ viewer: () => 'me', listComments: () => [], upsertComment: (n, m, b) => { body = b; return { id: 7, url: 'u', action: 'created' }; } }, PR, { record: { ...rec(), cost: c } });
+  const gh = statefulGh([{ id: 7, user: { login: 'me' }, body, html_url: 'https://x/7' }]);
+  const r = keyedCli(s, gh, ['--input', '1', '--execution', 'agent:new']);
+  assertExit(r, 1);
+  assert.deepEqual([r.json.ok, r.json.error], [false, 'cost-entries-full']);
+  assert.equal(gh.state().writes, 0);
+  assertExit(keyedCli(s, gh, ['--input', '9', '--execution', 'agent:a0']), 0);
 });

@@ -249,7 +249,7 @@ test('checkpoint: a run record that belongs to another PR is replaced, with a wa
 
 test('checkpoint: a record from a newer pipeline version is never overwritten', () => {
   const s = scenario();
-  withComment(s, existingSummary({ record: baseRecord({ v: 2 }) }));
+  withComment(s, existingSummary({ record: baseRecord({ v: 3 }) }));
   const r = checkpoint(s, ['--step', 'review']);
   assertExit(r, 2);
   assert.match(r.json.message, /newer pipeline version/);

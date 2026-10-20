@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { gzipSync } from 'node:zlib';
 import { MARKERS } from '../pipeline/lib/render.mjs';
 import {
-  OUTCOMES, OUTCOME_NEXT, OUTCOME_STEP, STEPS, STATUS_END, STATUS_START, LIMITS,
+  RECORD_VERSION, OUTCOMES, OUTCOME_NEXT, OUTCOME_STEP, STEPS, STATUS_END, STATUS_START, LIMITS,
   applyCheckpoint, bindRecord, decodeRecord, emptyRecord, encodeRecord, recordForOutcome, renderStatusBlock,
 } from '../pipeline/lib/run-record.mjs';
 
@@ -19,7 +19,7 @@ test('every outcome has a step, a next line, and a known step', () => {
   for (const o of OUTCOMES) assert.ok(STEPS.includes(OUTCOME_STEP[o]), o);
   assert.equal(OUTCOME_STEP['awaiting-owner-merge'], 'awaiting-owner-merge');
   // prod-unknown: prod-watch never learned the result, so the merged run stays in its prod-watch step (stranded, resumable).
-  assert.deepEqual(OUTCOMES.filter((o) => OUTCOME_STEP[o] !== 'ended'), ['awaiting-owner-merge', 'prod-unknown']);
+  assert.deepEqual(OUTCOMES.filter((o) => OUTCOME_STEP[o] !== 'ended'), ['awaiting-owner-merge', 'prod-unknown', 'awaiting-plan-approval', 'owner-ui-merge']);
   assert.equal(OUTCOME_STEP['prod-unknown'], 'prod-watch');
 });
 
@@ -86,8 +86,8 @@ test('oversize payload (decompresses past the cap) is invalid, not an allocation
   assert.equal(decodeRecord(`${MARKERS.summary}\n${big}`).status, 'invalid');
 });
 
-test('v > 1 is unsupported, v 0 / missing is invalid', () => {
-  assert.equal(decodeRecord(`${MARKERS.summary}\n${rawMarker({ ...emptyRecord(ID), v: 2 })}`).status, 'unsupported');
+test('v > 2 is unsupported, v 0 / missing is invalid', () => {
+  assert.equal(decodeRecord(`${MARKERS.summary}\n${rawMarker({ ...emptyRecord(ID), v: 3 })}`).status, 'unsupported');
   assert.equal(decodeRecord(`${MARKERS.summary}\n${rawMarker({ ...emptyRecord(ID), v: 0 })}`).status, 'invalid');
   const { v, ...noV } = emptyRecord(ID);
   assert.equal(decodeRecord(`${MARKERS.summary}\n${rawMarker(noV)}`).status, 'invalid');
@@ -251,4 +251,55 @@ test('renderStatusBlock: a bare record says running and has dashes', () => {
   assert.match(block, /\*\*Outcome:\*\* running/);
   assert.match(block, /\*\*Next:\*\* —/);
   assert.match(block, /\*\*Heartbeat:\*\* —/);
+});
+
+// ---- v2: the plan step, plan / behindBaseUpdate / handoff patches, task specSha ----------------------------------------------
+
+const AT = { host: 'mac', now: Date.parse('2026-10-19T00:00:00Z') };
+const H = (c) => c.repeat(40);
+
+test('v2: plan step first, new outcomes routed, v1 records still read, writes upgrade to v2', () => {
+  assert.equal(RECORD_VERSION, 2);
+  assert.equal(STEPS[0], 'plan');
+  assert.equal(OUTCOME_STEP['awaiting-plan-approval'], 'plan');
+  assert.equal(OUTCOME_STEP['owner-ui-merge'], 'awaiting-owner-merge');
+  const v1 = { ...emptyRecord(ID), v: 1 };
+  assert.equal(decodeRecord(`${MARKERS.summary}\n${encodeRecord(v1)}`).status, 'ok');
+  assert.equal(applyCheckpoint(v1, { step: 'plan' }, AT).v, 2);
+  assert.equal(decodeRecord(`${MARKERS.summary}\n${encodeRecord({ ...v1, v: 3 })}`).status, 'unsupported');
+});
+
+test('plan, behindBaseUpdate (distinct pairs, capped) and handoff patches', () => {
+  let r = emptyRecord(ID);
+  r = applyCheckpoint(r, { plan: { path: 'docs/plans/p.md', blob: H('a'), scopeDigest: 'b'.repeat(12), state: 'proposed' } }, AT);
+  assert.equal(r.plan.state, 'proposed');
+  assert.throws(() => applyCheckpoint(r, { plan: { path: 'p', blob: 'zz', scopeDigest: 'b'.repeat(12), state: 'proposed' } }, AT), /plan/);
+  const pair = { headBefore: H('1'), baseTip: H('2') };
+  r = applyCheckpoint(r, { behindBaseUpdate: pair }, AT);
+  r = applyCheckpoint(r, { behindBaseUpdate: pair }, AT);
+  assert.equal(r.behindBaseUpdates.length, 1);
+  r = applyCheckpoint(r, { handoff: { head: H('3'), baseTip: H('4'), at: '2026-10-19T00:00:00Z' } }, AT);
+  assert.equal(r.handoff.baseTip, H('4'));
+  assert.equal(decodeRecord(`${MARKERS.summary}\n${encodeRecord(r)}`).status, 'ok');
+});
+
+test('behindBaseUpdates keeps the last 20 distinct pairs; a bad pair or handoff is refused and a record with one is invalid', () => {
+  let r = emptyRecord(ID);
+  for (let i = 0; i < 25; i++) r = applyCheckpoint(r, { behindBaseUpdate: { headBefore: i.toString(16).padStart(40, '0'), baseTip: H('2') } }, AT);
+  assert.equal(r.behindBaseUpdates.length, 20);
+  assert.equal(r.behindBaseUpdates.at(-1).headBefore, (24).toString(16).padStart(40, '0'));
+  assert.throws(() => applyCheckpoint(r, { behindBaseUpdate: { headBefore: 'x', baseTip: H('2') } }, AT), /behindBaseUpdate/);
+  assert.throws(() => applyCheckpoint(r, { handoff: { head: H('3'), baseTip: 'nope', at: 'now' } }, AT), /handoff/);
+  assert.equal(applyCheckpoint(r, { handoff: null }, AT).handoff, null);
+  for (const bad of [{ plan: { path: 'p', blob: 'zz' } }, { behindBaseUpdates: [{ headBefore: 'x' }] }, { handoff: { head: 'x' } }, { tasks: [{ id: 'T1', specSha: 'nope' }] }]) {
+    assert.equal(decodeRecord(`${MARKERS.summary}\n${encodeRecord({ ...emptyRecord(ID), ...bad })}`).status, 'invalid', JSON.stringify(bad));
+  }
+});
+
+test('task done survives only while specSha is unchanged', () => {
+  let r = emptyRecord(ID);
+  r = applyCheckpoint(r, { tasks: [{ id: 'T1', title: 't', spec: 's', specSha: 'a'.repeat(12) }], done: ['T1'] }, AT);
+  assert.equal(applyCheckpoint(r, { tasks: [{ id: 'T1', title: 't', spec: 's', specSha: 'a'.repeat(12) }] }, AT).tasks[0].done, true);
+  assert.equal(applyCheckpoint(r, { tasks: [{ id: 'T1', title: 't', spec: 's2', specSha: 'c'.repeat(12) }] }, AT).tasks[0].done, false);
+  assert.equal(applyCheckpoint(r, { tasks: [{ id: 'T1' }] }, AT).tasks[0].done, true, 'no specSha in the patch: the earlier one and done stay');
 });
