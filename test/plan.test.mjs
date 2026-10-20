@@ -150,7 +150,7 @@ test('raw HTML and comments are refused anywhere outside fences and code spans, 
   assert.throws(() => parsePlan(two), (e) => e.problems.some((p) => p.includes(`line ${lineOf(two, '<details>')} `)) && e.problems.some((p) => p.includes(`line ${lineOf(two, '<!-- x -->')} `)));
   // fenced samples and inline code spans are fine, and so are comparison signs in prose
   assert.ok(parsePlan(PLAN + '```\n<!--\n<details>\n```\n'));
-  assert.ok(parsePlan(PLAN.replace('b works', 'b `<!--` and `<div>` works, 1 < 2 and a <b>c')));
+  assert.ok(parsePlan(PLAN.replace('b works', 'b `<!--` and `<div>` works, 1 < 2')));
 });
 
 test('the Scope section ends at the first task heading: a backticked bullet in a task body is not scope', () => {
@@ -195,4 +195,50 @@ test('link reference definitions outside fences are refused; inline links and fe
   assert.throws(() => parsePlan(PLAN.replace('b works', 'b works\n   [Ref one]:\t<http://x> \'t\'')), /link reference definition at line/);
   assert.ok(parsePlan(PLAN.replace('b works', 'b [x](/u) works\n[not a def] text')));
   assert.ok(parsePlan(PLAN.replace('b works', 'b works\n```\n[x]: /u "hidden"\n```')));
+});
+
+const lineWith = (text, needle) => text.split('\n').findIndex((l) => l.includes(needle)) + 1;
+
+test('Scope entries are plain printable ASCII: no spaces, no NBSP / ideographic space / look-alikes', () => {
+  const bad = ['src/a b.mjs', 'src/a b.mjs', 'src/ a.mjs', '　src/a.mjs', 'src/а.mjs', 'src/café.mjs', 'src/．a.mjs'];
+  for (const e of bad) {
+    const text = withScope(`- \`${e}\``);
+    assert.throws(() => parsePlan(text), (x) => x instanceof PlanError && x.problems.includes(`scope entry at line ${lineWith(text, e)} must be plain ASCII`), JSON.stringify(e));
+  }
+  assert.deepEqual(parsePlan(withScope('- ` src/z.mjs `\n- `a/**/[b]?.{x,y}`')).scope, [...SCOPE_OK, 'src/z.mjs', 'a/**/[b]?.{x,y}']);
+});
+
+test('more invisible code points are refused (fillers, variation selectors, tag characters, annotation marks)', () => {
+  for (const cp of [0x115F, 0x1160, 0x3164, 0xFFA0, 0x180E, 0x2061, 0x2064, 0xFFF9, 0xFFFB, 0xE0000, 0xE0041, 0xE007F, 0xFE00, 0xFE0F, 0xE0100, 0xE01EF]) {
+    const label = `U+${cp.toString(16).toUpperCase().padStart(4, '0')}`;
+    const text = PLAN.replace('b works', `b ${String.fromCodePoint(cp)}works`);
+    assert.throws(() => parsePlan(text), (e) => e instanceof PlanError && e.problems.includes(`invisible character ${label} at line ${lineWith(text, String.fromCodePoint(cp))}`), label);
+  }
+  assert.ok(parsePlan(PLAN.replace('b works', 'b é中\u{1F4CB} works'))); // ordinary non-ASCII text is fine in prose
+});
+
+test('HTML character references are refused outside fences and code spans; a lone & is fine', () => {
+  for (const ref of ['&#8238;', '&#x202E;', '&#X202e;', '&amp;', '&nbsp;', '&NotEqualTilde;']) {
+    const text = PLAN.replace('b works', `b ${ref} works`);
+    assert.throws(() => parsePlan(text), (e) => e instanceof PlanError && e.problems.some((p) => p.includes(`HTML character reference at line ${lineWith(text, ref)} `)), ref);
+  }
+  assert.ok(parsePlan(PLAN.replace('b works', 'b & c && d &x y; a&b works')));
+  assert.ok(parsePlan(PLAN.replace('b works', 'b `&amp;` works\n```\n&#x202E; &amp;\n```')));
+});
+
+test('inline raw HTML tags are refused anywhere on a line; autolinks, code spans, fences and bare < are fine', () => {
+  for (const frag of ['a <span hidden>x</span>', 'Plan <blob40> here', 'x </b> y', 'a <!-- c --> b', 'a <!DOCTYPE x> b', 'a <br/> b', 'a <img src=x onerror=y> b']) {
+    const text = PLAN.replace('b works', `${frag} works`);
+    assert.throws(() => parsePlan(text), (e) => e instanceof PlanError && e.problems.some((p) => p.includes(`raw HTML/comment at line ${lineWith(text, frag)} `)), frag);
+  }
+  assert.ok(parsePlan(PLAN.replace('b works', 'see <https://example.com/a?b=1> and <mailto:a@b.co> works')));
+  assert.ok(parsePlan(PLAN.replace('b works', 'a `<blob40>` b, 1 < 2, 3 > 2, a<-b, x <= y works\n```\n<span hidden>&amp;\n```')));
+});
+
+test('link and image titles are refused outside fences and code spans', () => {
+  for (const frag of ['[x](/u "hidden")', "[x](/u 'hidden')", '![i](/p.png "hidden")', '[x](<http://a b> "t" )', '[x](/u   "t")']) {
+    const text = PLAN.replace('b works', `${frag} works`);
+    assert.throws(() => parsePlan(text), (e) => e instanceof PlanError && e.problems.includes(`link title at line ${lineWith(text, frag)} is hidden when rendered`), frag);
+  }
+  assert.ok(parsePlan(PLAN.replace('b works', '[x](/u) and `[x](/u "t")` and (say "hi") works\n```\n[x](/u "t")\n```')));
 });

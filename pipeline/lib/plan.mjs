@@ -25,7 +25,13 @@ const HTML_TAG_LINE = /^\s*(?:<\/?[A-Za-z][A-Za-z0-9-]*(?:[\s/>]|$)|<!)/;
 const LINK_DEF = /^\s{0,3}\[[^\]]+\]:\s*\S/;
 // Characters that reorder or hide text, plus C0/C1 controls other than tab and newline (\r is normalised away first).
 // A BOM at offset 0 is stripped instead of refused.
-const INVISIBLE = /[\u202A-\u202E\u2066-\u2069\u200E\u200F\u061C\u200B-\u200D\u2060\uFEFF\u00AD\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/gu;
+const INVISIBLE = /[\u202A-\u202E\u2066-\u2069\u200E\u200F\u061C\u200B-\u200D\u2060\uFEFF\u00AD\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u115F\u1160\u3164\uFFA0\u180E\u2061-\u2064\uFFF9-\uFFFB\uFE00-\uFE0F\u{E0000}-\u{E007F}\u{E0100}-\u{E01EF}]/gu;
+// Renders differently from its bytes: character references, inline tags (autolinks excepted) and link / image titles.
+const HTML_REF = /&(?:#\d+|#[xX][0-9a-fA-F]+|[A-Za-z][A-Za-z0-9]*);/;
+const INLINE_TAG = /<[A-Za-z/!][^>]*>/g;
+const AUTOLINK = /^<[A-Za-z][A-Za-z0-9+.-]{1,31}:[^\s<>]*>$/;
+const LINK_TITLE = /\]\([^)]*?\s+(?:"[^"]*"|'[^']*')\s*\)/;
+const SCOPE_ASCII = /^[\x21-\x7E]+$/;
 // Scope must also be a flat list: no blockquoted or nested items.
 const QUOTED_ITEM = /^\s*>[\s>]*[-*+]\s+`/;
 const NESTED_ITEM = /^(?: {2,}|\t)\s*[-*+]\s+`/;
@@ -67,7 +73,7 @@ function sectionLines(lines, mask, title, { stopAtTask = false } = {}) {
   const stop = stopAtTask ? /^(?:## |### Task\b)/ : /^## /;
   let end = lines.findIndex((l, i) => i > start && !mask[i] && stop.test(l));
   if (end < 0) end = lines.length;
-  return { lines: lines.slice(start + 1, end), mask: mask.slice(start + 1, end), duplicate };
+  return { lines: lines.slice(start + 1, end), mask: mask.slice(start + 1, end), from: start + 1, duplicate };
 }
 
 function trimBlank(arr) {
@@ -94,9 +100,13 @@ export function parsePlan(text, { path: ownPath } = {}) {
   lines.forEach((l, i) => {
     for (const ch of new Set(l.match(INVISIBLE) ?? [])) problems.push(`invisible character U+${ch.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')} at line ${i + 1}`);
     if (!mask[i] && LINK_DEF.test(l)) problems.push(`link reference definition at line ${i + 1} is hidden when rendered`);
-    if (!mask[i] && (HTML_COMMENT.test(l.replace(CODE_SPAN, '')) || HTML_TAG_LINE.test(l))) {
+    if (mask[i]) return;
+    const bare = l.replace(CODE_SPAN, '');
+    if (HTML_COMMENT.test(bare) || HTML_TAG_LINE.test(l) || (bare.match(INLINE_TAG) ?? []).some((t) => !AUTOLINK.test(t))) {
       problems.push(`raw HTML/comment at line ${i + 1} is hidden when rendered: write it as text or inside a code block`);
     }
+    if (HTML_REF.test(bare)) problems.push(`HTML character reference at line ${i + 1} renders differently from its bytes: write the character itself`);
+    if (LINK_TITLE.test(bare)) problems.push(`link title at line ${i + 1} is hidden when rendered`);
   });
 
   const pe = sectionLines(lines, mask, 'In plain English');
@@ -117,7 +127,8 @@ export function parsePlan(text, { path: ownPath } = {}) {
       if (NESTED_ITEM.test(l)) { refuse('it contains a nested list item (indented 2+ spaces)'); return; }
       const m = SCOPE_ITEM.exec(l);
       if (!m) return;
-      const e = m[1].trim();
+      const e = m[1].replace(/^[ \t]+|[ \t]+$/g, '');
+      if (!SCOPE_ASCII.test(e)) { problems.push(`scope entry at line ${sc.from + i + 1} must be plain ASCII`); return; }
       const why = scopeProblem(e);
       if (why) problems.push(`scope entry ${JSON.stringify(e)}: ${why}`);
       else if (!scope.includes(e)) scope.push(e);
