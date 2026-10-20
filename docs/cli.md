@@ -312,7 +312,7 @@ pipeline plan record --pr N --file PATH [--request-file F] [--repo DIR]
   -> show the owner requestLines VERBATIM (the first line, then the 📋 line) together with the plan's plain-English section and Scope list; the owner types "approve"
 pipeline plan approve --pr N [--repo DIR]
   -> {ok, blob, scopeDigest, event:{id, reused}, stepChanged, repaired, warnings}; needs the owner's "approve" recorded by the owner-go hook for the active plan (24 h; an approval event already on the PR is repaired for 30 days); posts one plan-approved event, copies the approved tasks into the run record and moves a plan-stage (or stopped/blocked with open tasks) run to build
-  -> exit 1 {error: no-proposal | no-approval | superseded | scope-mismatch | lost | record-unreadable}, 3 GitHub unavailable
+  -> exit 1 {error: no-proposal | no-approval | superseded | scope-mismatch | lost | plan-changed | record-unreadable}, 3 GitHub unavailable
 pipeline plan risk --pr N [--repo DIR]
   -> {ok, level: low|medium|high, reasons, blob}; high when the plan's Scope can touch a high-risk, hard-stop or security path or a task names a risky area; medium for more than 3 tasks or more than risk.medium_files scope entries
 ```
