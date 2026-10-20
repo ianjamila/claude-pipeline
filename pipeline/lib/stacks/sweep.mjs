@@ -35,7 +35,7 @@ import { isolation, lockDirs, projectAllowed, stackFiles, stacksRoot } from './p
 import { resolveSupabase, stopStack as realStopStack } from './act.mjs';
 import { SWEEP_PROBES, gatherEvidence, ownPids, readLedgerLocked, summarizeEvidence } from './assess.mjs';
 import {
-  WINDOW_MS, appendDecision as realAppendDecision, generationKey, memoryOfProject as realMemoryOfProject, newestStopAt, outcomeSummary, readDecisions, renderReport,
+  WINDOW_MS, appendDecision as realAppendDecision, generationKey, memoryOfProject as realMemoryOfProject, newestStopAt, outcomeSummary, quietCandidates, readDecisions, renderReport,
   renderWeekly, stopRecords,
 } from './outcomes.mjs';
 import { observedUses } from './session-end.mjs';
@@ -290,15 +290,46 @@ export async function runSweep({ apply = false, deps = {} } = {}) {
       }
     }
 
+    // A born-before C1 lease is a RESTART, not a MISS, only when its owner's own transcript shows nothing but read-only inspection
+    // from its birth to the decision (evidence.ownerQuiet). One proof per (owner, decision); no usable config or transcript dirs, or a
+    // thrown error, leaves the use a MISS. The verdict rides on the use as use.quiet = { decision, verdict, why }.
+    const attachQuietProofs = (decisions, uses, ledgerCoverage) => {
+      if (cfg.status !== 'ok' || !cfg.transcriptDirs?.length) return;
+      const proofOf = deps.ownerQuiet ?? ev.ownerQuiet;
+      const cache = new Map();
+      for (const { use, decision } of quietCandidates(decisions, uses, { ledgerCoverage })) {
+        const k = `${lower(use.project)}|${use.pid}|${use.birth}|${decision.t}`;
+        let q = cache.get(k);
+        if (q === undefined) {
+          try {
+            const r = proofOf({
+              sessionId: use.sessionId, birthMs: use.birth * 1000, decidedMs: Date.parse(decision.t), dirs: cfg.transcriptDirs, platform,
+              ...(deps.fsx ? { fsx: deps.fsx } : {}),
+            });
+            q = r?.ok && (r.value?.verdict === 'quiet' || r.value?.verdict === 'active')
+              ? { verdict: r.value.verdict, why: oneLine(r.value.why) }
+              : { verdict: 'unknown', why: oneLine(r?.reason ?? 'no answer') };
+          } catch (err) {
+            q = { verdict: 'unknown', why: oneLine(err?.message ?? err) };
+          }
+          cache.set(k, q);
+          if (q.verdict !== 'quiet') note(`${use.project}: owner ${use.pid} of a lease before the ${decision.t} would-stop is ${q.verdict}: ${q.why}`);
+        }
+        use.quiet = { decision: decision.t, verdict: q.verdict, why: q.why };
+      }
+    };
+
     const finish = (summary, extra = {}) => {
       const t = now();
       const d = readDecisions(files.actions);
       const decisions = d.ok ? d.value : [];
       if (!d.ok) note(`decisions log unreadable: ${d.reason}`);
       const uses = [...observedUses(decisions), ...(extra.uses ?? [])];
-      const sum = outcomeSummary(decisions, uses, t);
+      const ledgerCoverage = extra.ledgerCoverage ?? { ok: false };
+      attachQuietProofs(decisions, uses, ledgerCoverage);
+      const sum = outcomeSummary(decisions, uses, t, { ledgerCoverage });
       const rs = {
-        now: t, decisions, uses, config: cfg.status, paused, modes, hooks, ledger: extra.ledger ?? { ok: true },
+        now: t, decisions, uses, config: cfg.status, paused, modes, hooks, ledger: extra.ledger ?? { ok: true }, ledgerCoverage,
         listed: result.listed.map((l) => ({ project: l.project, verdict: 'listed', reasons: l.reasons, ...(l.hidden ? { hidden: l.hidden } : {}) })),
         dev: result.dev, reportPath: files.report,
       };
@@ -331,7 +362,15 @@ export async function runSweep({ apply = false, deps = {} } = {}) {
     const docker = deps.docker ?? resolveDocker({ env, home, platform, ...(deps.pipelineRoot ? { root: deps.pipelineRoot } : {}) });
     const supabaseBin = deps.supabaseBin ?? resolveSupabase({ env, home, platform, ...(deps.pipelineRoot ? { root: deps.pipelineRoot } : {}) });
     const inventory = (deps.readInventory ?? realReadInventory)({ run, cfg, docker, deadlineAt: now() + 60_000, now });
+    // What the ledger provably covers: legacy worker observations are dropped only when it was read, never repaired, and starts early enough.
+    let repaired = false;
+    try {
+      repaired = (deps.fsx ?? fs).existsSync(files.ledgerBad);
+    } catch {
+      repaired = true; // cannot tell: treat as repaired (nothing is dropped)
+    }
     const extra = {
+      ledgerCoverage: events.ok ? { ok: true, repaired, firstT: events.value?.[0]?.t ?? null } : { ok: false },
       ledger: events.ok ? { ok: true } : { ok: false, reason: events.reason },
       uses: events.ok ? ledgerUses(events.value, inventory?.ok ? inventory.value.stacks : []) : [],
     };
