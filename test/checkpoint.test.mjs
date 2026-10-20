@@ -237,6 +237,19 @@ test('checkpoint: the resting steps keep the outcome', () => {
   assert.equal(r.json.record.outcome, 'awaiting-owner-merge');
 });
 
+test('checkpoint: the hand-off outcome owner-ui-merge rests at awaiting-owner-merge and survives a re-checkpoint; any other step clears it', () => {
+  const s = scenario();
+  withComment(s, existingSummary({ record: baseRecord({ step: 'awaiting-owner-merge', outcome: 'owner-ui-merge' }) }));
+  const r = checkpoint(s, ['--step', 'awaiting-owner-merge']);
+  assertExit(r, 0);
+  assert.deepEqual([r.json.record.step, r.json.record.outcome], ['awaiting-owner-merge', 'owner-ui-merge']);
+  const s2 = scenario();
+  withComment(s2, existingSummary({ record: baseRecord({ step: 'awaiting-owner-merge', outcome: 'owner-ui-merge' }) }));
+  const again = checkpoint(s2, ['--step', 'build']);
+  assertExit(again, 0);
+  assert.equal(again.json.record.outcome, null, 'the owner declined the hand-off or the run resumed: not handed off any more');
+});
+
 test('checkpoint: a run record that belongs to another PR is replaced, with a warning', () => {
   const s = scenario();
   withComment(s, existingSummary({ record: baseRecord({ pr: 99, branch: 'agent/other', request: 'someone else' }) }));
