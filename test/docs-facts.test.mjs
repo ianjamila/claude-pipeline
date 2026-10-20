@@ -159,7 +159,7 @@ test('the rollout notes name the eaglewatch leftover label and the update-everyw
   const readme = read('README.md').replace(/\s*\n\s*/g, ' ');
   assert.ok(readme.includes('pipeline update') && readme.includes('leftover `needs-human` label') && readme.includes('eaglewatch'));
   assert.ok(/EVERY machine/.test(readme));
-  assert.ok(read('skills/ship/SKILL.md').includes('leftover `needs-human` label still blocks `P merge`'));
+  assert.ok(read('skills/ship/SKILL.md').replace(/\s*\n\s*/g, ' ').includes('leftover `needs-human` label still blocks `P merge`'));
   for (const doc of ['pipeline/templates/CLAUDE-block.md', 'pipeline/templates/CODEOWNERS']) {
     assert.match(read(doc), /owner_approval: chat/, `${doc} must say what chat mode does`);
   }

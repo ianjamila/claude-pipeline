@@ -56,7 +56,7 @@ number, `R` a review round number, `<slug>` the branch slug.
    comments and labels never count as approval. Production on a resumed run is watched with
    `prod-watch --observe-only` (with `production.watch: workflow`, not at all: the workflow owns it); rollback stays with the original run or the owner.
 10. **Low-risk PRs may merge on their own** (owner ruling 2026-10-14). A normal run whose final gate passes with no
-    hard-stop hit (`ownerMerge` is `0`), no needs-human stop and no owner-ruled item merges through `P merge` without asking
+    hard-stop hit (`ownerMerge` is `0`), no needs-human outcome and no owner-ruled item merges through `P merge` without asking
     the owner: that is intended, and a review must not flag it. Anything that hits a hard-stop, ends in `needs-human`,
     or needs the owner's chat approval (`owner_approval: chat`, resumed runs) still waits for the owner's "merge" for the
     exact head (the **Owner-merge approval** rule below). The ruling widens nothing else: invariants 1, 2 and 9 stand.
@@ -364,23 +364,21 @@ prompt, run the owner-go hook, or write `~/.claude/pipeline-state/owner-go` (the
 "no owner \"merge\" is recorded": show the request again and wait. A typed "merge" is stored as kind `approve`; "ship resume N" records NO merge approval.
 In an `owner_approval: chat` repo agents never merge directly: `gh pr merge` (any form, `--auto` too), the repo's merge command typed by hand, API
 auto-merge and `curl` to the merge API are always refused, whatever the owner said. Merge only with `P merge --pr N`: it reads the owner's recorded
-"merge" (for the newest stop id, see above) and any open stop. Never merge a revert PR yourself: prod-watch leaves it a draft, the owner marks it ready.
+"merge" (given to a request that carried the newest `Stopped` line) and refuses while an owner block is unreleased. Never merge a revert PR yourself: prod-watch leaves it a draft, the owner marks it ready.
 
 ## Owner stops (`owner_approval: chat`) — what releases one
 
-A stop is an append-only `owner-stop` event on the PR (the authority; the run record only mirrors it) plus, if GitHub was unreachable, a pending file on this
-computer. The gate (`labels`), `P merge` (error `pre-merge`, before it touches the branch), its last look and every auto-merge poll refuse while one is open.
-1. The owner types `ship resume N` (also `/ship resume N`, `resume N`), or "merge" to a reply that offered it. The hook records it against the stop id(s)
-   in your LAST reply; you cannot type or fake it. A newer message of yours in between loses the binding: print the stop lines again.
-2. `git pull --ff-only` if a `P merge` / `update-branch` moved the branch, then `P checkpoint --pr N --step gate|review --resumed` (the step `P resume plan`
-   gave). It releases every stop the owner named. Exit 1: `owner-release-missing` (no recorded reply for that id: show the stop lines, wait; if the owner did
-   answer, the hook is old: `pipeline update`), `owner-stop-open` (a checkpoint without `--resumed` while a stop is open), `owner-stop-held` (the stop has not
-   reached GitHub: retry when it is reachable).
-3. `P final-gate`, then the normal Step 5 to 6. A release does not clear review items, and `P merge` still wants the recorded "merge" for the exact head and
-   items, given to a request that carried the newest `Stopped` line: if a stop appeared after the owner said "merge", they say "merge" again.
-4. First prompt of a NEW session is `ship resume N`: nothing was shown before it, so it records no release. Read `P resume plan` (its `notes` name each open
-   stop; plan, list and inbox are read-only and never flush a pending stop), print the stop lines, ask for one confirming `resume N`, then step 2.
-In eaglewatch-style repos with their own merge script, a leftover `needs-human` label still blocks `P merge` until that script is updated: the owner removes it in GitHub.
+A stop (opened by `P summary --outcome needs-human`) is an append-only `owner-stop` event on the PR (the authority; the run record only mirrors it) plus, if GitHub was
+unreachable, a pending file on this computer. The gate (`labels`), `P merge` (error `pre-merge`, before it touches the branch), its last look and every auto-merge poll
+refuse while one is open. **Release:** (1) the owner types `ship resume N` (also `/ship resume N`, `resume N`), or "merge" to a reply that offered it; the hook records it
+against the stop id(s) in your LAST reply, you cannot type or fake it, and a newer message of yours in between loses the binding (print the lines again). (2) `git pull --ff-only`
+if a `P merge` / `update-branch` moved the branch, then `P checkpoint --pr N --step gate|review --resumed` (the step `P resume plan` gave); it releases every stop the owner named.
+Exit 1: `owner-release-missing` (no recorded reply for that id: show the lines, wait; if the owner did answer, the hook is old: `pipeline update`), `owner-stop-open` (a checkpoint
+without `--resumed`), `owner-stop-held` (not on GitHub yet: retry when reachable). (3) `P final-gate`, then Step 5 to 6; a release does not clear review items, and `P merge` still
+wants the recorded "merge" for the exact head and items, given to a request that carried the newest `Stopped` line (a new stop after "merge" means they say "merge" again).
+(4) A NEW session whose first prompt is `ship resume N` records no release (nothing was shown before it): read `P resume plan` (its `notes` name each open stop; plan, list and
+inbox are read-only and never flush a pending stop), print the lines, ask for one confirming `resume N`, then (2). In eaglewatch (its own merge script) a leftover
+`needs-human` label still blocks `P merge` until that script is updated: the owner removes it in GitHub.
 
 ## Step 7 — summary
 
@@ -473,7 +471,7 @@ read the issue, link it in the PR body (`Closes #123`).
 | prod smoke fails | prod-watch handles rollback + issue + revert PR and pushes the owner; `summary` with its outcome word; tell the user. With `production.watch: workflow` there is no prod-watch: the workflow's PR comment is the record, nothing is rolled back and no production push is sent; tell the user |
 | pause/rollback issue open | PR stays open: `summary --outcome stopped --cause merge-paused --action "Close the pause/rollback issue"`, explain |
 | `checkpoint` exit 1 `unpushed` / `behind` / `diverged` | `git push origin agent/<slug>` / `git pull --ff-only` / `summary --outcome stopped --cause checkpoint:diverged --action …`, stop and report; checkpoint again |
-| `checkpoint --resumed` / `merge` refused by an owner stop (`owner-release-missing`, `owner-stop-open`, `owner-stop-held`, `pre-merge`) | show the `Stopped` line(s), wait for the owner's own `ship resume N` (**Owner stops**); never retry in a loop |
+| `checkpoint --resumed` / `merge` refused by an owner hold (`owner-release-missing`, `owner-stop-open`, `owner-stop-held`, `pre-merge`) | show the `Stopped` line(s) again, wait for the owner's own `ship resume N` (**Owner stops**); never retry in a loop |
 | `resume plan` has `confirm` | ask the owner whether the other run stopped; wait; never start on a guess |
 | `resume plan` `enter: local-work` | report the diverged/dirty/unpushed worktree, stop; never reset it |
 | `merge` `error: pre-merge` naming `prod-before` | nothing merged (the rollback evidence could not be posted): retry once, then `summary --outcome stopped --cause merge:prod-before --action …`, tell the user |

@@ -158,7 +158,7 @@ permissions / data-integrity / data-loss item ⇒ `needsHuman` (the CLI applies 
   coverage matches the current content hash) ⇒ leave the loop.
 - `needsHuman` non-empty ⇒ **park needs-human** (label mode: label; both: comment, `P summary --outcome needs-human`), stop.
 - else if `<round>` < max ⇒ round `<round>`+1 (reviews only the diff since this round's head).
-- else ⇒ **park needs-human** with the unresolved list (same sequence), stop.
+- else ⇒ **park needs-human** with the unresolved list (same sequence, `P summary` included), stop.
 
 **Park needs-human** (every `needs-human` stop in this loop is this exact sequence, never a bare label). `owner_approval: label`:
 `gh pr edit <pr> --add-label needs-human`, `P comment --pr <pr> --kind needs-human --reason "…"` (no `--hits-file`),
@@ -182,7 +182,7 @@ word in chat, never by you. When the owner rules on it ("accept R4-B1", "follow-
    then post the triage comment again for the issue links.
 3. ACCEPT: it is not clean until built and reviewed: implement it (step 6), `P state mark-implemented`, and run a new round.
 4. No label to remove. After the owner's rulings, they type `ship resume <pr>` (or `/ship resume <pr>`); then `git pull --ff-only` if the branch moved and run
-   `P checkpoint --pr <pr> --step review|gate --resumed` (the step `P resume plan` names; it releases the stop only on the owner's recorded reply, see **Owner stops** in
+   `P checkpoint --pr <pr> --step review|gate --resumed` (the step `P resume plan` names; it releases the stop the summary opened only on the owner's recorded reply, see **Owner stops** in
    `SKILL.md`). Resume routes to `review` or `gate`; unresolved items still fail the `review` check after a release.
 
 Any commit after the last clean round that changes PR content (the agent log is never committed to a
