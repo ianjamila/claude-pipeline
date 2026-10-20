@@ -2066,12 +2066,12 @@ test('time: a word with many run-time parts is matched against a path in linear 
   const classes = '[Cc][Rr][Ee][Aa][Tt][Ee] [Oo][Rr] [Rr][Ee][Pp][Ll][Aa][Cc][Ee] [Ff][Uu][Nn][Cc][Tt][Ii][Oo][Nn] public.x';
   const line = `git grep -l x -- d | sort | xargs -I{} sh -c 'grep -l -i "create or replace function public.x" {} >/dev/null && echo {}'; sed -n '/${classes}/,/\\$\\$;/p' $f | head -30`;
   const { r, ms } = cpuTimed(() => git(line, fakeFs(GIT_ROOT, { 'ok.sh': 'echo hi' }, DIRS)));
-  assert.ok(ms < 2000, `took ${Math.round(ms)} ms of CPU`);
+  assertCpuUnder(ms, 2000, 'time: 14 bracket globs matched against a path');
   assert.equal(r.decision, 'allow', r.reason);
   const long = `/${'a'.repeat(3000)}`;
   const m = cpuTimed(() => piecesMatch(['/', ...Array(40).fill('a'), 'b'], long, { abs: true }));
   assert.equal(m.r, false);
-  assert.ok(m.ms < 500, `took ${Math.round(m.ms)} ms of CPU`);
+  assertCpuUnder(m.ms, 500, 'time: piecesMatch on a 3000-character path');
 });
 
 test('time: piecesMatch answers as the regex it replaces did (anything between pieces; start of the path / of a name; end of the path / of a directory)', () => {

@@ -4,7 +4,7 @@
 // quadratic sort (60,000 parts ran past the host's 15 s hook limit, which ALLOWS the command). Each test pins the dangerous case next to the workflow that must pass.
 // Fake file systems like guard-a2-shell-s8.test.mjs.
 import { test } from 'node:test';
-import { cpuTimed } from './helpers/timing.mjs';
+import { assertCpuUnder, cpuTimed } from './helpers/timing.mjs';
 import assert from 'node:assert/strict';
 import { resolve, dirname, basename } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
@@ -97,7 +97,7 @@ test('S9: a stream of many parts is refused quickly, not judged part by part pas
   both(few, { a: 'select 1;\n' }, 'deny');
   const many = `{ echo "#"; cat ${Array(60000).fill('a').join(' ')}; } | psql`;
   const { ms } = cpuTimed(() => both(many, { a: 'select 1;\n' }, 'deny'));
-  assert.ok(ms < 5000, `took ${Math.round(ms)} ms of CPU`);
+  assertCpuUnder(ms, 5000, 'S9 stream of 60,000 parts');
   // a migration of a few parts stays allowed
   both(`{ echo "begin;"; cat ${Array(8).fill('m.sql').join(' ')}; echo "commit;"; } | psql`, SQL, 'allow');
 });

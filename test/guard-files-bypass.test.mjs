@@ -2,7 +2,7 @@
 // 1 ancestor dirs, 2 redirects, 3 code-built home paths, 4 variables, 5 MCP, 6 fail-open on caps, 7 false
 // positives, 8 performance. Home is /home/u (user "u"); the filesystem is faked unless a test says otherwise.
 import { test } from 'node:test';
-import { cpuTimed } from './helpers/timing.mjs';
+import { assertCpuUnder, cpuTimed } from './helpers/timing.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -501,12 +501,12 @@ test('perf: ordinary commands, long commands and brace-heavy commands stay fast'
   ];
   for (const c of cases) {
     const { ms } = timeIt(c);
-    assert.ok(ms < 1500, `${c.slice(0, 40)}... took ${ms.toFixed(0)} ms of CPU`);
+    assertCpuUnder(ms, 1500, `perf ${c.slice(0, 40)}...`);
   }
   const ordinary = [];
   for (let i = 0; i < 30; i++) ordinary.push(timeIt('git -C ~/.claude/pipeline log --oneline | head -3 && ls ~/.claude/skills').ms);
   ordinary.sort((a, b) => a - b);
-  assert.ok(ordinary[15] < 20, `median in-process time ${ordinary[15].toFixed(1)} ms of CPU`);
+  assertCpuUnder(ordinary[15], 20, 'median in-process time of an ordinary command');
 });
 
 // ---- Windows -------------------------------------------------------------------------------------
@@ -602,7 +602,7 @@ test('size cap: an oversized command line is not scanned; it is denied only when
     assert.equal(bash(`echo ${spam}; node ins""tall.mjs`).decision, 'deny');
     assert.equal(bash(`echo ${spam}; export PIPELINE_""ADMIN=1`).decision, 'deny');
   });
-  assert.ok(ms < 3000, `took ${Math.round(ms)} ms of CPU`);
+  assertCpuUnder(ms, 3000, 'size cap: oversized command line');
 });
 
 // ---- 9. script files hide commands (review finding 2) ----------------------------------------------------
