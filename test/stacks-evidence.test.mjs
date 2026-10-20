@@ -12,7 +12,7 @@ import path from 'node:path';
 import { createGitHub } from '../pipeline/lib/github.mjs';
 import { BRANCH_PRS_QUERY } from '../pipeline/lib/worktree-prune/prs.mjs';
 import {
-  resolveProbeBins, connections, processRefs, cwdInside, consumerWorktrees, prStates, transcriptRefs, memoryRefs, expandTranscriptDirs,
+  resolveProbeBins, connections, processRefs, cwdInside, consumerWorktrees, prStates, transcriptRefs, memoryRefs, expandTranscriptDirs, ownerQuiet,
 } from '../pipeline/lib/stacks/evidence.mjs';
 
 const posixOnly = { skip: process.platform === 'win32' && 'POSIX only' };
@@ -658,4 +658,131 @@ test('consumerWorktrees: a stat that fails with EACCES leaves exists unknown; pr
   assert.equal(states.ok, false);
   assert.match(states.reason, /cannot tell whether .*hidden exists/);
   assert.equal(w.ghCalls.length + w.gitCalls.length, 0);
+});
+
+// ---- ownerQuiet: did the lease owner's own transcript show anything but read-only inspection between its birth and the decision? ----
+const SID = '2f3b1ba8-1923-483d-a19d-75cb8b15a778';
+const OQ_BIRTH = Date.parse('2026-10-20T03:16:20.000Z');
+const OQ_DECIDED = Date.parse('2026-10-20T03:16:22.749Z');
+const marker = (hook, iso, sessionId = SID) => JSON.stringify({ type: 'attachment', sessionId, timestamp: iso, attachment: { type: 'hook_success', hookName: hook } });
+const toolLine = (iso, name, input = {}) => JSON.stringify({ type: 'assistant', timestamp: iso, message: { role: 'assistant', content: [{ type: 'tool_use', name, input }] } });
+const textLine = (iso, role, text) => JSON.stringify({ type: role, timestamp: iso, message: { role, content: role === 'user' ? text : [{ type: 'text', text }] } });
+const startup = marker('SessionStart:startup', '2026-10-20T03:16:21.000Z');
+
+function oqWorld(lines, { subagents = {} } = {}) {
+  const dirs = tmp('stacks-oq ');
+  const proj = path.join(dirs, 'proj');
+  mkdirSync(proj, { recursive: true });
+  writeFileSync(path.join(proj, `${SID}.jsonl`), `${lines.join('\n')}\n`);
+  for (const [name, subLines] of Object.entries(subagents)) {
+    mkdirSync(path.join(proj, SID, 'subagents'), { recursive: true });
+    writeFileSync(path.join(proj, SID, 'subagents', name), `${subLines.join('\n')}\n`);
+  }
+  return { dirs, proj, run: (o = {}) => ownerQuiet({ sessionId: SID, birthMs: OQ_BIRTH, decidedMs: OQ_DECIDED, dirs: [dirs], platform: 'darwin', ...o }) };
+}
+const verdictOf = (r) => (r.ok ? r.value.verdict : `unknown: ${r.reason}`);
+
+test('ownerQuiet: a startup session that only talked is quiet', () => {
+  const w = oqWorld([startup, textLine('2026-10-20T03:16:21.500Z', 'user', 'check the stack'), textLine('2026-10-20T03:16:22.000Z', 'assistant', 'the stack autostop-live looks fine')]);
+  const r = w.run();
+  assert.equal(verdictOf(r), 'quiet');
+  assert.equal(path.basename(r.value.file), `${SID}.jsonl`);
+});
+
+test('ownerQuiet: a resumed session is quiet even when its OLDER lines (before birth) used a stack', () => {
+  const w = oqWorld([
+    toolLine('2026-10-19T10:00:00.000Z', 'Bash', { command: 'supabase start --workdir /x/y.stack' }),
+    marker('SessionStart:resume', '2026-10-20T03:16:21.000Z'),
+    toolLine('2026-10-20T03:16:21.800Z', 'Bash', { command: 'docker inspect --format x some_container' }),
+  ]);
+  assert.equal(verdictOf(w.run()), 'quiet');
+});
+
+test('ownerQuiet: the resume marker may come AFTER the decision (live 72631 shape) and the session is still quiet', () => {
+  const w = oqWorld([marker('SessionStart:resume', '2026-10-20T03:16:39.000Z'), toolLine('2026-10-20T03:16:40.000Z', 'Bash', { command: 'node later.mjs' })]);
+  assert.equal(verdictOf(w.run()), 'quiet', 'the later non-read-only call is after the decision, outside the window');
+});
+
+test('ownerQuiet: no start marker of this process is unknown (a late resume marker, the wrong session id, none at all)', () => {
+  const late = oqWorld([marker('SessionStart:resume', '2026-10-20T03:18:30.000Z')]);
+  assert.match(verdictOf(late.run()), /^unknown: no start marker/);
+  const other = oqWorld([marker('SessionStart:startup', '2026-10-20T03:16:21.000Z', 'ffffffff-0000-4000-8000-000000000000')]);
+  assert.match(verdictOf(other.run()), /^unknown: no start marker/);
+  const none = oqWorld([textLine('2026-10-20T03:16:21.500Z', 'user', 'hello')]);
+  assert.match(verdictOf(none.run()), /^unknown: no start marker/);
+});
+
+test('ownerQuiet: a first marker of SessionStart:clear or :compact is unknown (an earlier transcript of this process exists elsewhere)', () => {
+  for (const hook of ['SessionStart:clear', 'SessionStart:compact']) {
+    const w = oqWorld([marker(hook, '2026-10-20T03:16:21.000Z'), marker('SessionStart:resume', '2026-10-20T03:16:30.000Z')]);
+    assert.match(verdictOf(w.run()), /^unknown: started by \/clear/, hook);
+  }
+});
+
+test('ownerQuiet: read-only Bash and the file tools in the window are quiet; anything else is active and names the tool', () => {
+  const quiet = oqWorld([startup, toolLine('2026-10-20T03:16:21.600Z', 'Bash', { command: 'docker ps --filter name=autostop-live' }), toolLine('2026-10-20T03:16:21.700Z', 'Read', { file_path: '/x' }), toolLine('2026-10-20T03:16:21.800Z', 'Grep', { pattern: 'x' }), toolLine('2026-10-20T03:16:21.900Z', 'Glob', { pattern: '*' }), toolLine('2026-10-20T03:16:22.000Z', 'ToolSearch', { query: 'x' })]);
+  assert.equal(verdictOf(quiet.run()), 'quiet');
+  const cases = [
+    ['Bash', { command: 'node smoke.mjs' }, /Bash.*03:16:21\.600/],
+    ['Edit', { file_path: '/x', old_string: 'a', new_string: 'b' }, /Edit/],
+    ['Agent', { prompt: 'go' }, /Agent/],
+    ['mcp__x__y', {}, /mcp__x__y/],
+  ];
+  for (const [name, input, why] of cases) {
+    const r = oqWorld([startup, toolLine('2026-10-20T03:16:21.600Z', name, input)]).run();
+    assert.equal(verdictOf(r), 'active', name);
+    assert.match(r.value.why, why, name);
+  }
+});
+
+test('ownerQuiet: a <bash-input> (a ! command, no hook runs) in the window is active', () => {
+  const w = oqWorld([startup, textLine('2026-10-20T03:16:21.600Z', 'user', '<bash-input>docker ps</bash-input>')]);
+  assert.equal(verdictOf(w.run()), 'active');
+});
+
+test('ownerQuiet: a tool call outside the window (after the decision, or long before birth) does not count', () => {
+  const w = oqWorld([toolLine('2026-10-20T03:00:00.000Z', 'Edit', {}), startup, toolLine('2026-10-20T03:16:22.900Z', 'Bash', { command: 'node smoke.mjs' })]);
+  assert.equal(verdictOf(w.run()), 'quiet');
+});
+
+test('ownerQuiet: a subagent transcript with a non-read-only Bash in the window is active; a quiet one is quiet', () => {
+  const busy = oqWorld([startup], { subagents: { 'agent-a.jsonl': [toolLine('2026-10-20T03:16:21.900Z', 'Bash', { command: 'psql -p 54322 -c "select 1"' })] } });
+  const r = busy.run();
+  assert.equal(verdictOf(r), 'active');
+  assert.match(r.value.why, /agent-a\.jsonl/);
+  const calm = oqWorld([startup], { subagents: { 'agent-a.jsonl': [toolLine('2026-10-20T03:16:21.900Z', 'Read', { file_path: '/x' })] } });
+  assert.equal(verdictOf(calm.run()), 'quiet');
+});
+
+test('ownerQuiet: a line that is not valid JSON is active; a timestamp-less line is active only when it holds a tool call', () => {
+  assert.equal(verdictOf(oqWorld([startup, '{"timestamp": "2026-10-20T03:16:21.6']).run()), 'active');
+  const noTs = (blocks) => JSON.stringify({ message: { content: blocks } });
+  assert.equal(verdictOf(oqWorld([startup, noTs([{ type: 'tool_use', name: 'Read', input: {} }])]).run()), 'active');
+  assert.equal(verdictOf(oqWorld([startup, noTs([{ type: 'text', text: 'hi' }])]).run()), 'quiet');
+});
+
+test('ownerQuiet: prose that names a stack is not use', () => {
+  const w = oqWorld([startup, textLine('2026-10-20T03:16:21.500Z', 'user', 'please run supabase stop on autostop-live'), textLine('2026-10-20T03:16:21.900Z', 'assistant', 'docker rm -f autostop-live would remove it')]);
+  assert.equal(verdictOf(w.run()), 'quiet');
+});
+
+test('ownerQuiet: no transcript, two transcripts of the id, a bad session id, an unreadable file or a windows host are unknown', () => {
+  const none = oqWorld([startup]);
+  assert.match(verdictOf(none.run({ sessionId: '11111111-2222-4333-8444-555555555555' })), /^unknown: no transcript/);
+  assert.match(verdictOf(none.run({ sessionId: '../etc' })), /^unknown: .*session id/);
+  assert.match(verdictOf(none.run({ sessionId: undefined })), /^unknown: .*session id/);
+  const fsx = { ...fs, openSync: (f, ...rest) => { if (String(f).endsWith('.jsonl')) throw Object.assign(new Error('EACCES: denied'), { code: 'EACCES' }); return fs.openSync(f, ...rest); } };
+  assert.match(verdictOf(none.run({ fsx })), /^unknown: cannot read .*EACCES/);
+  assert.deepEqual(none.run({ platform: 'win32' }), { ok: false, reason: 'windows' });
+  const other = path.join(none.dirs, 'proj2');
+  mkdirSync(other);
+  writeFileSync(path.join(other, `${SID}.jsonl`), `${startup}\n`);
+  assert.match(verdictOf(none.run()), /^unknown: .*more than one/);
+});
+
+test('ownerQuiet: an unreadable subagents directory is unknown; a missing one is fine', () => {
+  const w = oqWorld([startup]);
+  const fsx = { ...fs, readdirSync: (d, ...rest) => { if (String(d).endsWith('subagents')) throw Object.assign(new Error('EACCES'), { code: 'EACCES' }); return fs.readdirSync(d, ...rest); } };
+  assert.equal(verdictOf(w.run()), 'quiet');
+  assert.match(verdictOf(w.run({ fsx })), /^unknown: cannot read .*subagents/);
 });
