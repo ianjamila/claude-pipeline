@@ -318,3 +318,59 @@ test('an unknown subcommand is a usage error', async (t) => {
   const w = setup(t);
   await assert.rejects(() => w.call(['nope']), /usage: pipeline plan record\|approve\|risk/);
 });
+
+// ---- security review F4 / F6 / F8 ----------------------------------------------------------------------------------------------
+
+test('F6: approve refuses when the active proposal\'s blob is not the blob at its path in the checkout', async (t) => {
+  const w = setup(t);
+  await w.call(['record', '--pr', '7', '--file', REL]); w.absorb();
+  const blobA = w.blob();
+  const digestA = w.digest();
+  w.recommit(planText({ scope: ['src/**', 'evil/**'] }), 'sneak an edit');
+  assert.notEqual(w.blob(), blobA);
+  w.approves(blobA, digestA);
+  const before = w.posts().length;
+  const r = await w.call(['approve', '--pr', '7']);
+  assert.deepEqual([r.exitCode, r.output.error], [1, 'plan-changed']);
+  assert.equal(w.posts().length, before, 'nothing was posted');
+});
+
+test('F8: approve refuses a legacy run record; record keeps a later-stage step', async (t) => {
+  const w = setup(t);
+  await w.call(['record', '--pr', '7', '--file', REL]); w.absorb();
+  w.approves(w.blob(), w.digest());
+  const c = w.comments.find((x) => x.id === w.summaryId);
+  const saved = c.body;
+  c.body = `${MARKERS.summary}\n\nold pre-record summary, no record block`;
+  w.sync();
+  const before = w.posts().length;
+  const r = await w.call(['approve', '--pr', '7']);
+  assert.deepEqual([r.exitCode, r.output.error], [1, 'record-unreadable']);
+  assert.equal(w.posts().length, before);
+  // record at a later stage must not pull the run back to the plan stage
+  c.body = saved; w.sync();
+  w.setSummary(rec0({ step: 'gate' }));
+  const again = await w.call(['record', '--pr', '7', '--file', REL]);
+  assert.equal(again.exitCode, 0, JSON.stringify(again.output));
+  w.absorb();
+  assert.deepEqual([w.summary().step, w.summary().plan.state], ['gate', 'proposed']);
+});
+
+test('F4: approve does not repair from an older approval event once the owner approved a newer plan', async (t) => {
+  const w = setup(t);
+  const textA = planText();
+  await w.call(['record', '--pr', '7', '--file', REL]); w.absorb();
+  const blobA = w.blob(), digestA = w.digest();
+  w.approves(blobA, digestA);
+  assert.equal((await w.call(['approve', '--pr', '7'])).exitCode, 0); w.absorb();
+  w.recommit(planText({ scope: ['src/**', 'lib/**'] }), 'plan B');
+  await w.call(['record', '--pr', '7', '--file', REL]); w.absorb();
+  w.approves(w.blob(), w.digest(), { at: T0 + 1000, session: 'sess-2' }); // the owner approved B; `approve` has not run for it
+  w.recommit(textA, 'back to plan A');
+  assert.equal(w.blob(), blobA);
+  await w.call(['record', '--pr', '7', '--file', REL]); w.absorb();
+  const before = w.events().filter((e) => e.kind === 'plan-approved').length;
+  const r = await w.call(['approve', '--pr', '7']);
+  assert.deepEqual([r.exitCode, r.output.error], [1, 'superseded']);
+  assert.equal(w.events().filter((e) => e.kind === 'plan-approved').length, before);
+});

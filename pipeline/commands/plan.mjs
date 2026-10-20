@@ -10,7 +10,7 @@ import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs
 import { git, headSha } from '../lib/git.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { PlanError, parsePlan, planRequestLines, scopeDigest } from '../lib/plan.mjs';
-import { activeProposal, bindOf, latestApproval, matchingLocalRecord } from '../lib/plan-state.mjs';
+import { activeProposal, bindOf, latestApproval, matchingLocalRecord, newestLocalRecord } from '../lib/plan-state.mjs';
 import { scopeMayHitGlob, securityGlobs } from '../lib/risk.mjs';
 import { LIMITS, bindRecord } from '../lib/run-record.mjs';
 import { VIEW_FIELDS, createRunRecorder } from '../lib/run-progress.mjs';
@@ -27,7 +27,7 @@ export const meta = {
     '  -> show the owner requestLines VERBATIM (the first line, then the 📋 line) together with the plan\'s plain-English section and Scope list; the owner types "approve"',
     'pipeline plan approve --pr N [--repo DIR]',
     '  -> {ok, blob, scopeDigest, event:{id, reused}, stepChanged, repaired, warnings}; needs the owner\'s "approve" recorded by the owner-go hook for the active plan (24 h; an approval event already on the PR is repaired for 30 days); posts one plan-approved event, copies the approved tasks into the run record and moves a plan-stage (or stopped/blocked with open tasks) run to build',
-    '  -> exit 1 {error: no-proposal | no-approval | superseded | scope-mismatch | lost | record-unreadable}, 3 GitHub unavailable',
+    '  -> exit 1 {error: no-proposal | no-approval | superseded | scope-mismatch | lost | plan-changed | record-unreadable}, 3 GitHub unavailable',
     'pipeline plan risk --pr N [--repo DIR]',
     '  -> {ok, level: low|medium|high, reasons, blob}; high when the plan\'s Scope can touch a high-risk, hard-stop or security path or a task names a risky area; medium for more than 3 tasks or more than risk.medium_files scope entries',
   ].join('\n'),
@@ -142,8 +142,11 @@ async function record(argv, ctx) {
       });
       event = { id: posted.id, reused: false };
     }
+    // Re-recording moves the run to the plan stage only from build / plan (or a fresh record): a later-stage record is never reset.
+    const cur = px.summary.status === 'ok' ? px.summary.record : null;
+    const toPlan = cur === null || cur.step === 'build' || cur.step === 'plan';
     const recorder = createRunRecorder({ gh: px.gh, pr: px.pr });
-    recorder.update({ step: 'plan', outcome: null, plan: { path: rel, blob, scopeDigest: digest, state: 'proposed' }, ...(request !== undefined ? { request } : {}) }, { initialStep: 'plan' });
+    recorder.update({ ...(toPlan ? { step: 'plan', outcome: null } : {}), plan: { path: rel, blob, scopeDigest: digest, state: 'proposed' }, ...(request !== undefined ? { request } : {}) }, { initialStep: 'plan' });
     return {
       exitCode: EXIT.OK,
       output: {
@@ -172,9 +175,13 @@ async function approve(argv, ctx) {
     const parsed = parseBlob(readBlob, active.blob);
     const digest = scopeDigest(parsed.scope);
     if (digest !== active.scopeDigest) throw fail('lost', 'the recorded scope digest does not match the plan blob: record the plan again');
+    // The approved plan must be the committed file at its path (as `record` pins it): never approve a blob the checkout does not hold there.
+    let atPath = null;
+    try { atPath = active.path ? git(['rev-parse', `HEAD:${active.path}`], { cwd: root }).trim() : null; } catch { atPath = null; }
+    if (atPath !== active.blob) throw fail('plan-changed', `the active plan blob ${active.blob.slice(0, 12)} is not the committed ${active.path || '(no path)'} at HEAD (${atPath ? atPath.slice(0, 12) : 'missing'}): check out the PR head, or record the plan again`);
     // A record we cannot read may be a gate-stage one: never reset it (spec B1).
-    if (px.summary.status === 'unsupported' || px.summary.status === 'invalid') {
-      throw fail('record-unreadable', `the run record on this PR is ${px.summary.status} (from a newer pipeline, damaged or another PR's): update the pipeline CLI or fix the summary comment first; nothing was posted`);
+    if (['unsupported', 'invalid', 'legacy'].includes(px.summary.status)) {
+      throw fail('record-unreadable', `the run record on this PR is ${px.summary.status} (from a newer or older pipeline, damaged or another PR's): update the pipeline CLI or fix the summary comment first; nothing was posted`);
     }
     const home = ctx.home ?? accountHome();
     const now = () => nowOf(ctx);
@@ -186,8 +193,10 @@ async function approve(argv, ctx) {
     const wasApproved = (e) => e.kind === 'plan-approved' && e.dataStatus === 'ok' && !e.tampered && e.data?.blob === active.blob
       && e.data?.repo === px.bind.repo && e.data?.pr === px.bind.pr && e.data?.branch === px.bind.branch;
     const old = readPlanApprovals({ home, now, maxAgeMs: PLAN_RECORD_MAX_AGE_MS });
+    // Only an event whose record is the owner's NEWEST for this PR repairs: an older approved plan replayed later is not (F4).
+    const newestOld = newestLocalRecord(old, px.pr);
     const repairEvent = existingApproval.status === 'approved'
-      ? px.events.filter(wasApproved).reverse().find((e) => matchingLocalRecord(old, wantRec({ recordId: e.data.recordId, promptSha256: e.data.promptSha256 })))
+      ? px.events.filter(wasApproved).reverse().find((e) => { const m = matchingLocalRecord(old, wantRec({ recordId: e.data.recordId, promptSha256: e.data.promptSha256 })); return m !== null && newestOld !== null && m.recordId === newestOld.recordId; })
       : undefined;
 
     let event;
