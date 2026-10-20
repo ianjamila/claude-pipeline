@@ -71,3 +71,4 @@ full record.
 - 2026-10-20 · #95 · feat(review): one extra review round when only accepted fixes are open · risk high · rounds 1 · arbiter 0 · awaiting-owner-merge
 - 2026-10-20 · #95 · feat(review): one extra review round when only accepted fixes are open · risk high · rounds 1 · arbiter 0 · merged
 - 2026-10-20 · #89 · guards open package-manager scripts · risk high · rounds 8 · arbiter 0 · awaiting-owner-merge
+- 2026-10-20 · #89 · guards open package-manager scripts · risk high · rounds 8 · arbiter 0 · merged
