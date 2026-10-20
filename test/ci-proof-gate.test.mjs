@@ -134,6 +134,17 @@ test('the spec handed to ciProof is the base branch\'s, with the event defaulted
   assert.equal(again.calls[0].spec.job, 'Unit tests');
 });
 
+test('a ci_proof entry with steps reaches ciProof as a fresh copy (steps included); a pass whose run carries steps is accepted as is', async () => {
+  const steps = ['Typecheck', 'Vitest'];
+  const s = setup({ yml: ymlWith({ steps }), report: ciRow });
+  const r = await judge(s, async ({ spec }) => { spec.steps.push('tampered'); return { state: 'pass', reason: 'ok', run: { ...RUN, steps } }; });
+  accepted(r, 'pass');
+  assert.deepEqual(r.calls[0].spec, { ...SPEC, steps: [...steps, 'tampered'] });
+  assert.deepEqual(r.proofs, [{ step: 'unit', source: 'ci', run: { ...RUN, steps } }]);
+  const again = await judge(setup({ yml: ymlWith({ steps }), report: ciRow }), async ({ spec }) => ({ state: 'pass', reason: String(spec.steps), run: RUN }));
+  assert.deepEqual(again.calls[0].spec.steps, steps, 'a lookup that mutates its spec cannot change what a later run sees');
+});
+
 test('the base is fetched first: a base commit that exists only on the remote is what counts', async () => {
   const s = setup({ yml: ymlWith(), report: ciRow });
   // the remote's main moves on (another clone pushes): the gate must fetch it, not trust the stale local origin/main
