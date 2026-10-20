@@ -121,3 +121,54 @@ test('pipeline-setup: ignores the worktree dir, pins verify.expected_steps, ment
     assert.ok(setup.includes(needle), `pipeline-setup must mention ${needle}`);
   }
 });
+
+// ---- ship redesign (T10): the prose the controller follows must name what the CLI really does ------------------------------
+
+test('ship redesign: SKILL.md carries the route line, the plan step and the approve request', () => {
+  const ship = read('skills/ship/SKILL.md');
+  for (const needle of [
+    'Route:', 'reference/plan-stage.md', '📋 Ready to approve plan', 'P plan record', 'P plan approve', 'awaiting-plan-approval',
+    'P handoff check', 'owner-ui-merge', 'planApproveFirst', 'screenshot-reviewer', 'model: haiku', 'Reviewer obligations',
+  ]) assert.ok(ship.includes(needle), `SKILL.md must mention ${needle}`);
+  assert.ok(ship.split('\n').length <= 500, 'SKILL.md is over 500 lines');
+  // The invariants stay: no model parameter to judge / arbiter, merge only through P merge.
+  assert.match(ship, /Never pass a `model` parameter when invoking `judge` or `arbiter`/);
+  assert.match(ship, /Nothing merges except through `P merge`/);
+});
+
+test('ship redesign: plan-stage.md covers the whole plan stage, including the hardening', () => {
+  const doc = read('skills/ship/reference/plan-stage.md');
+  for (const needle of [
+    'P plan risk', 'P plan start', 'P plan review', 'P plan findings', 'Plan <blob40> · scope', '[skip ci]', '--request-file', 'pipeline update',
+    '--claim', 'plan-changed', 'unpushed', 'record-unreadable', 'plan.dir', 'newest', 'already-started', 'cap', 'cumulative', 'pipeline-fable-plan',
+  ]) assert.ok(doc.includes(needle), `plan-stage.md must mention ${needle}`);
+});
+
+test('ship redesign: the small-plan example in plan-stage.md is a plan the parser accepts', async () => {
+  const { parsePlan } = await import('../pipeline/lib/plan.mjs');
+  const doc = read('skills/ship/reference/plan-stage.md');
+  const m = doc.match(/````markdown\n([\s\S]*?)\n````/);
+  assert.ok(m, 'plan-stage.md must hold the small-plan example in a ````markdown fence');
+  const parsed = parsePlan(`${m[1]}\n`, { path: 'docs/plans/2026-10-20-search-case.md' });
+  assert.ok(parsed.tasks.length >= 1 && parsed.scope.length >= 1);
+});
+
+test('ship redesign: review-loop, gates-and-exits, pr-and-summary and the verify skill carry the new rules', () => {
+  const loop = read('skills/ship/reference/review-loop.md');
+  for (const needle of ['P review header', 'P review add', 'obligations', 'Reviewer obligations', 'pipeline-security', 'review:']) assert.ok(loop.includes(needle), `review-loop.md must mention ${needle}`);
+  const gates = read('skills/ship/reference/gates-and-exits.md');
+  for (const needle of ['plan-scope', 'owner-ui-merge', 'P handoff check', 'outside', 'unverified', 'lost', 'none', 'awaiting-owner-merge']) assert.ok(gates.includes(needle), `gates-and-exits.md must mention ${needle}`);
+  const pr = read('skills/ship/reference/pr-and-summary.md');
+  for (const needle of ['Plan: <path> @ <blob12>', 'awaiting-plan-approval', 'owner-ui-merge']) assert.ok(pr.includes(needle), `pr-and-summary.md must mention ${needle}`);
+  const verify = read('skills/verify/SKILL.md');
+  for (const needle of ['screenshot-reviewer', 'Explore', 'haiku']) assert.ok(verify.includes(needle), `verify/SKILL.md must mention ${needle}`);
+});
+
+test('ship redesign: docs/cli.md states the plan hardening and the v2 record; VERSION is 0.2.0', () => {
+  const cli = read('docs/cli.md');
+  for (const needle of [
+    'plan-changed', 'record-unreadable', 'unpushed', '--claim', 'plan-scope', 'record version 2', 'cumulative', 'owner-ui-merge', 'planApproveFirst',
+    'raw HTML', 'newest local plan record',
+  ]) assert.ok(cli.includes(needle), `docs/cli.md must mention ${needle}`);
+  assert.equal(read('VERSION').trim(), '0.2.0');
+});
