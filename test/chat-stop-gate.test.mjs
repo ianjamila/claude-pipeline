@@ -187,3 +187,34 @@ test('chat: a leftover needs-human label that appears while waiting does not end
   assertExit(l, 1);
   assert.match(l.json.reason, /blocking label\(s\): needs-human/);
 });
+
+// ---- R1-B4: a stop + release pair that lands after the merge request was read (the history, not just open stops, is compared) ----------
+
+const releaseComment = (id) => ({
+  id: cid++, user: { login: 'me' },
+  body: renderEvent('owner-stop-released', id, `Owner stop ${id} released`, { repo: 'acme/widgets', pr: PR, id, at: '2026-10-20T09:00:00.000Z', host: 'box', releaseRef: { kind: 'resume', session: 'x', ts: 'x', prompt_sha256: 'x' } }),
+});
+const S2 = '7c1d4e90';
+
+test('chat: a new stop AND its release appearing between the live gate and the merge command refuses (the approval was for the older history)', () => {
+  const s = scenario({ yml: chatYml() });
+  assertExit(s.gate(), 0);
+  stopAppearsAtLastLook(s, [stopComment(S2), releaseComment(S2)]);
+  const r = s.merge();
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'pre-merge');
+  assert.match(r.json.reasons.join(), /owner stop history changed since the merge request was read/);
+  assert.deepEqual(s.mergeCalls(), [], 'the merge command must not run');
+});
+
+test('chat: a new stop AND its release appearing while auto-merge is queued ends the wait blocked and disables auto-merge', () => {
+  const s = scenario({ yml: chatYml(), gh: { mergeView: { state: 'OPEN', mergeCommit: null } } });
+  assertExit(s.gate(), 0);
+  const swap = swapTo(s, ghEntries({ prHead: s.head, mergeView: { state: 'OPEN', mergeCommit: null }, comments: [stopComment(S2), releaseComment(S2)] }));
+  const r = s.merge({ ...swap, ...WAIT });
+  assertExit(r, 1);
+  assert.equal(r.json.merged, false);
+  assert.equal(r.json.autoMergeDisabled, true);
+  assert.match(r.json.reason, /a blocker appeared while waiting: .*owner stop history changed/);
+  assert.ok(s.fake.lines().includes('pr merge 12 --disable-auto'));
+});

@@ -454,3 +454,25 @@ test('review dir helpers do not need a git repo', () => {
   writeReviewJson(dir, 'a.json', { ok: true });
   assert.match(readFileSync(join(dir, '.review', 'a.json'), 'utf8'), /"ok": true/);
 });
+
+const releaseBody = (id) => renderEvent('owner-stop-released', id, 'released', { repo: 'o/r', pr: 12, id, at: '2026-10-20T09:00:00.000Z', host: 'h', releaseRef: { kind: 'resume', session: 'x', ts: 'x', prompt_sha256: 'x' } });
+
+test('preMergeProblems / waitBlockers: expectedStops compares the stop HISTORY (newest id, released ids), so a released new stop is caught; unchanged history and label mode are not', async () => {
+  const chatArgs = { pr: 12, head: SHA, ownerApproval: 'chat', root: NOROOT };
+  const history = [mine(stopBody('ab12cd34'), 1), mine(releaseBody('ab12cd34'), 2)];
+  const same = { stopId: 'ab12cd34', released: ['ab12cd34'] };
+  assert.deepEqual(await preMergeProblems({ gh: chatGh({ view: OPEN_VIEW, comments: history }), ...chatArgs, expectedStops: same }), []);
+  const grown = [...history, mine(stopBody('7c1d4e90'), 3), mine(releaseBody('7c1d4e90'), 4)];
+  const changed = await preMergeProblems({ gh: chatGh({ view: OPEN_VIEW, comments: grown }), ...chatArgs, expectedStops: same });
+  assert.match(changed.join(), /owner stop history changed since the merge request was read \(newest stop ab12cd34 -> 7c1d4e90, released 1 -> 2\)/);
+  // a release alone (the same newest stop) also changes it
+  const releasedLater = await preMergeProblems({ gh: chatGh({ view: OPEN_VIEW, comments: history }), ...chatArgs, expectedStops: { stopId: 'ab12cd34', released: [] } });
+  assert.match(releasedLater.join(), /history changed/);
+  // no stops at the start, one released pair now
+  assert.match((await waitBlockers(chatGh({ comments: [mine(stopBody('ab12cd34'), 1), mine(releaseBody('ab12cd34'), 2)] }), { ...chatArgs, expectedStops: { stopId: null, released: [] } })({ labels: [] })).join(), /history changed.*none -> ab12cd34/);
+  assert.match((await waitBlockers(chatGh({ commentsError: new Error('HTTP 502') }), { ...chatArgs, expectedStops: same })({ labels: [] })).join(), /owner stops could not be read/);
+  // label mode: expectedStops is ignored and no comments are listed
+  const label = chatGh({ view: OPEN_VIEW, comments: grown });
+  assert.deepEqual(await preMergeProblems({ gh: label, pr: 12, head: SHA, expectedStops: same }), []);
+  assert.equal(label.calls.comments, 0);
+});

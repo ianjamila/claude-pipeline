@@ -83,6 +83,14 @@ export function newestStopId(events) {
   return best ? String(best.id) : null;
 }
 
+// The owner-stop history of a PR as one comparable value: the newest stop id and the ids of the stops released (a release whose payload
+// cannot be read releases nothing, so it is left out, like openOwnerStops). A merge request is bound to this: any stop or release that lands
+// after it was read changes it.
+export function stopHistory(events) {
+  const released = [...new Set((events ?? []).filter((e) => e.kind === 'owner-stop-released' && e.dataStatus === 'ok').map((e) => String(e.id)))].sort();
+  return { stopId: newestStopId(events), released };
+}
+
 export const readEvents =(gh, pr) => listEvents(gh.listComments(pr), gh.viewer());
 
 // Always a new comment: this never calls upsertComment, so a second event can never rewrite a first one.

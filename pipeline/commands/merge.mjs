@@ -12,7 +12,7 @@ import { createGitHub, guardGh } from '../lib/github.mjs';
 import { headSha } from '../lib/git.mjs';
 import { currentProduction } from '../lib/deploy.mjs';
 import { envWithGhDir, runShellAsync } from '../lib/proc.mjs';
-import { newestStopId, postEvent, readEvents } from '../lib/run-events.mjs';
+import { newestStopId, postEvent, readEvents, stopHistory } from '../lib/run-events.mjs';
 import { ownerStopProblems } from '../lib/owner-stop.mjs';
 import { proofLine } from '../lib/run-record.mjs';
 import { readSummaryComment } from '../lib/summary-comment.mjs';
@@ -65,6 +65,7 @@ export const run = guarded(async (argv, ctx) => {
     // (no stop at all = no requirement, so label mode and untouched PRs behave as before).
     let stopId = null;
     let anyRelease = false;
+    let expectedStops; // the history the approval below is bound to; the last look and every wait poll refuse when it changes
     if (config.owner_approval === 'chat') {
       const open = await ownerStopProblems({ gh, pr, root, ownerApproval: 'chat', deps: ctx.ownerStopDeps });
       if (open.length > 0) {
@@ -75,6 +76,7 @@ export const run = guarded(async (argv, ctx) => {
         const events = readEvents(gh, pr);
         stopId = newestStopId(events);
         anyRelease = events.some((e) => e.kind === 'owner-stop-released');
+        expectedStops = stopHistory(events);
       } catch (err) {
         const reason = `owner stops could not be read from GitHub (${String(err?.message ?? err).slice(0, 160)}): nothing is merged`;
         return refuse('pre-merge', [reason], { reason });
@@ -183,7 +185,7 @@ export const run = guarded(async (argv, ctx) => {
     }, { initialStep: 'merge' });
     const attempt = async () => {
       // 3b. The live gate ran slow probes after it read the PR: look at GitHub once more, right before the merge command.
-      const late = await preMergeProblems({ gh, pr, head: gate.head, ownerApproval: config.owner_approval, root, deps: ctx.ownerStopDeps });
+      const late = await preMergeProblems({ gh, pr, head: gate.head, ownerApproval: config.owner_approval, root, deps: ctx.ownerStopDeps, expectedStops });
       if (late.length > 0) return refuse('pre-merge', late);
 
       // 3c. Fail CLOSED: the prod-before event is the only copy of the rollback target that survives this machine (prod-watch
@@ -243,7 +245,7 @@ export const run = guarded(async (argv, ctx) => {
 
       // 5. Wait for MERGED, re-checking the blockers on every poll. If the command failed it may still have merged (a
       // branch-delete error after a merge exits non-zero), so look once before calling it a failure.
-      const outcome = await waitForMerge({ gh, pr, waitMs: ran.code === 0 ? waitMs : 0, pollMs, blockers: waitBlockers(gh, { pr, root, ownerApproval: config.owner_approval, deps: ctx.ownerStopDeps }) });
+      const outcome = await waitForMerge({ gh, pr, waitMs: ran.code === 0 ? waitMs : 0, pollMs, blockers: waitBlockers(gh, { pr, root, ownerApproval: config.owner_approval, deps: ctx.ownerStopDeps, expectedStops }) });
       if (outcome.state === 'merged') {
         return merged(outcome.mergeSha, ran.code === 0 ? {} : { commandExitCode: ran.code, note: 'the merge command exited non-zero but the PR is MERGED' });
       }

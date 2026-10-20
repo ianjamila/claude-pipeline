@@ -27,6 +27,7 @@ import { skipOf } from './verify-steps.mjs';
 import { NETWORK_TIMEOUT_MS, commitTime, diffFiles, git, headSha, mergeBase, revParse, reviewBaseRef, reviewContentHash, showFile, treeFingerprint } from './git.mjs';
 import { ownerItemsDigest } from '../hooks/lib/owner-go.mjs';
 import { ownerStopProblems } from './owner-stop.mjs';
+import { readEvents, stopHistory } from './run-events.mjs';
 
 export const GATE_FILE = 'final-gate.json';
 export const BLOCKING_LABELS = Object.freeze(['needs-human', 'awaiting-review', 'pipeline-blocked']);
@@ -734,7 +735,9 @@ async function readMergeSha({ gh, pr, first, sleep, pollMs }) {
 // preview) after that read, so a label, a pause issue or a new push can have landed since. Returns the reasons the merge
 // must not run (empty = go). An unreadable PR is a reason.
 // Chat mode also reads `autoMergeRequest` and asks the owner-stop reader (events, this PR passed explicitly); label mode: today's exact read, no extra call.
-export async function preMergeProblems({ gh, pr, head, ownerApproval = 'label', root, deps }) {
+// `expectedStops` (chat, from P merge): the owner-stop history read when the merge request was checked ({stopId, released}); a stop or a release
+// that landed since (a stop the owner already released leaves no OPEN stop to see) is a reason too.
+export async function preMergeProblems({ gh, pr, head, ownerApproval = 'label', root, deps, expectedStops }) {
   let view;
   try {
     view = gh.prView(pr, ['state', 'headRefOid', 'labels', 'isDraft', ...(ownerApproval === 'chat' ? ['autoMergeRequest'] : [])]);
@@ -745,21 +748,34 @@ export async function preMergeProblems({ gh, pr, head, ownerApproval = 'label', 
   if (view?.state !== 'OPEN') problems.push(`PR state is ${view?.state}`);
   if (view?.isDraft !== false) problems.push('PR is a draft');
   if (view?.headRefOid !== head) problems.push(`PR head is now ${short(view?.headRefOid)}, the gate approved ${short(head)}`);
-  problems.push(...(await waitBlockers(gh, { pr, root, ownerApproval, deps })(view)));
+  problems.push(...(await waitBlockers(gh, { pr, root, ownerApproval, deps, expectedStops })(view)));
   return problems;
+}
+
+// Chat only: the stop history now against the one the merge request was checked with. Unreadable counts as changed (fail closed).
+function stopHistoryProblems(gh, pr, expected) {
+  let now;
+  try {
+    now = stopHistory(readEvents(gh, pr));
+  } catch (err) {
+    return [`owner stops could not be read from GitHub (${String(err?.message ?? err).slice(0, 160)}): nothing is merged`];
+  }
+  if (now.stopId === (expected.stopId ?? null) && now.released.join(',') === (expected.released ?? []).join(',')) return [];
+  return [`owner stop history changed since the merge request was read (newest stop ${expected.stopId ?? 'none'} -> ${now.stopId ?? 'none'}, released ${(expected.released ?? []).length} -> ${now.released.length}): run the gate again and ask the owner`];
 }
 
 // What can stop a queued merge while we wait: a blocking label, or an open pause/rollback issue. Anything unreadable
 // counts as a blocker (the safe direction here is "disable auto-merge").
 // Chat mode: `needs-human` is ignored, every poll asks the owner-stop reader for THIS PR (a new stop, a pending stop or a failed read is a blocker) and
 // the polled view must carry `autoMergeRequest` (`extraFields`).
-export function waitBlockers(gh, { pr, root, ownerApproval = 'label', deps } = {}) {
+export function waitBlockers(gh, { pr, root, ownerApproval = 'label', deps, expectedStops } = {}) {
   const chat = ownerApproval === 'chat';
   const blockers = async (view) => {
     const problems = [];
     if (!validLabels(view?.labels)) problems.push('PR labels could not be read (labels is missing or malformed)');
     else if (blockingLabelsOf(view.labels, { ownerApproval }).length > 0) problems.push(`blocking label(s): ${blockingLabelsOf(view.labels, { ownerApproval }).join(', ')}`);
     if (chat) problems.push(...(await ownerStopProblems({ gh, pr, root, ownerApproval, autoMergeRequest: view?.autoMergeRequest, deps })));
+    if (chat && expectedStops) problems.push(...stopHistoryProblems(gh, pr, expectedStops));
     for (const label of ['pipeline-pause', 'pipeline-rollback']) {
       try {
         const issues = gh.listIssues({ label });
