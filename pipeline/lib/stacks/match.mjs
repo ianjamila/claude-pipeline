@@ -150,7 +150,8 @@ function withoutSafeRedirects(command, platform) {
 function isInspection(words) {
   const [cmd, ...args] = words;
   if (READ_ONLY_WORDS.has(cmd)) return true;
-  if (cmd === 'rg') return !args.some((a) => a === '--pre' || a.startsWith('--pre='));
+  // --pre and --hostname-bin each run a program, so an rg that carries either is not an inspection.
+  if (cmd === 'rg') return !args.some((a) => a === '--pre' || a.startsWith('--pre=') || a === '--hostname-bin' || a.startsWith('--hostname-bin='));
   if (cmd === 'find') return !args.some((a) => FIND_WRITERS.has(a));
   if (cmd === 'docker') {
     if (DOCKER_READ_SUBS.has(args[0])) return true;
@@ -163,6 +164,7 @@ function isInspection(words) {
 export function readOnlyCommand(command, platform = process.platform) {
   if (typeof command !== 'string' || command === '') return false;
   if (/[$`]|<\(|>\(/.test(command)) return false;
+  if (/\\\r?\n/.test(command)) return false; // a line continuation can split `-exec` / `--pre` past the token checks
   const text = withoutSafeRedirects(command, platform);
   if (text === null) return false;
   let inspected = false;

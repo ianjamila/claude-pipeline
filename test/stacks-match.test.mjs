@@ -287,6 +287,19 @@ test('readOnlyCommand: anything else, or nothing to inspect, is not read-only', 
   for (const v of [undefined, null, 5, {}]) assert.equal(readOnlyCommand(v, 'linux'), false);
 });
 
+test('readOnlyCommand: rg --hostname-bin runs a program, so it is not read-only (either form)', () => {
+  assert.equal(readOnlyCommand('rg --hostname-bin=../demo.stack/q --hyperlink-format=x foo', 'linux'), false);
+  assert.equal(readOnlyCommand('rg --hostname-bin ../q --hyperlink-format=x foo', 'linux'), false);
+  assert.equal(readOnlyCommand('rg --hyperlink-format=x foo', 'linux'), true);
+});
+
+test('readOnlyCommand: a backslash-newline line continuation can hide a flag, so it is not read-only', () => {
+  assert.equal(readOnlyCommand('find x.stack -ex\\\nec rm {} ;', 'linux'), false);
+  assert.equal(readOnlyCommand('rg --p\\\nre=x foo', 'linux'), false);
+  assert.equal(readOnlyCommand('rg --p\\\r\nre=x foo', 'linux'), false);
+  assert.equal(readOnlyCommand('ls \\\n-la', 'linux'), false);
+});
+
 test('readOnlyCommand: the platform is injected (a Windows-style path parses without throwing)', () => {
   assert.equal(readOnlyCommand('ls C:\\w\\x.stack', 'win32'), true);
   assert.equal(readOnlyCommand('cd C:\\w && cat a.txt', 'win32'), true);
