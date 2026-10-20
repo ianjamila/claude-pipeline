@@ -374,3 +374,24 @@ test('F4: approve does not repair from an older approval event once the owner ap
   assert.deepEqual([r.exitCode, r.output.error], [1, 'superseded']);
   assert.equal(w.events().filter((e) => e.kind === 'plan-approved').length, before);
 });
+
+test('N3: approve refuses when local HEAD is not the PR head', async (t) => {
+  const w = setup(t);
+  await w.call(['record', '--pr', '7', '--file', REL]); w.absorb();
+  w.approves(w.blob(), w.digest());
+  w.headOid = 'd'.repeat(40); w.sync();
+  const before = w.posts().length;
+  const r = await w.call(['approve', '--pr', '7']);
+  assert.deepEqual([r.exitCode, r.output.error], [1, 'unpushed']);
+  assert.equal(w.posts().length, before);
+});
+
+test('N4: record refuses an unreadable (legacy, invalid or foreign) run record and posts nothing', async (t) => {
+  for (const make of [() => `${MARKERS.summary}\n\nold pre-record summary`, () => [MARKERS.summary, '', encodeRecord({ ...rec0({ step: 'gate' }), pr: 8 })].join('\n'), () => [MARKERS.summary, '', encodeRecord({ ...rec0({ step: 'gate' }), v: 3 })].join('\n')]) {
+    const w = setup(t);
+    w.summaryId = w.add(make()); w.sync();
+    const r = await w.call(['record', '--pr', '7', '--file', REL]);
+    assert.deepEqual([r.exitCode, r.output.error], [1, 'record-unreadable']);
+    assert.equal(w.posts().length, 0, 'nothing posted');
+  }
+});

@@ -34,11 +34,11 @@ export const meta = {
   usage: [
     'pipeline plan record --pr N --file PATH [--request-file F] [--repo DIR]',
     '  -> {ok, blob, scopeDigest, path, scope, tasks:[{id,title,specSha}], requestLines, event:{id, reused}, warnings}; posts one plan-proposed event (none when this blob is already the active proposal) and checkpoints step plan',
-    '  -> exit 1 {error: dirty | unpushed | plan-invalid} (the file must be committed and pushed, and parse as a plan that lists itself in its Scope), 3 GitHub unavailable',
+    '  -> exit 1 {error: dirty | unpushed | plan-invalid | record-unreadable} (the file must be committed and pushed, and parse as a plan that lists itself in its Scope), 3 GitHub unavailable',
     '  -> show the owner requestLines VERBATIM (the first line, then the 📋 line) together with the plan\'s plain-English section and Scope list; the owner types "approve"',
     'pipeline plan approve --pr N [--repo DIR]',
     '  -> {ok, blob, scopeDigest, event:{id, reused}, stepChanged, repaired, warnings}; needs the owner\'s "approve" recorded by the owner-go hook for the active plan (24 h; an approval event already on the PR is repaired for 30 days); posts one plan-approved event, copies the approved tasks into the run record and moves a plan-stage (or stopped/blocked with open tasks) run to build',
-    '  -> exit 1 {error: no-proposal | no-approval | superseded | scope-mismatch | lost | plan-changed | record-unreadable}, 3 GitHub unavailable',
+    '  -> exit 1 {error: no-proposal | no-approval | superseded | scope-mismatch | lost | plan-changed | unpushed | record-unreadable}, 3 GitHub unavailable',
     'pipeline plan risk --pr N [--repo DIR]',
     '  -> {ok, level: low|medium|high, reasons, blob}; high when the plan\'s Scope can touch a high-risk, hard-stop or security path or a task names a risky area; medium for more than 3 tasks or more than risk.medium_files scope entries',
     'pipeline plan start --pr N --reviewer codex|fable --key KEY [--extra TEXT] [--repo DIR]',
@@ -47,9 +47,9 @@ export const meta = {
     'pipeline plan review --pr N --key KEY [--extra TEXT] [--effort high|xhigh] [--model M] [--prior FILE] [--repo DIR]',
     '  -> {ok, key, n, counts:{blocking, suggestions, worth_considering}, path, resumed, cost: booked|not-reported|failed:...}; reserves the launch itself (as `start`, --extra passes through), runs Codex over the active plan, writes .review/plan/KEY.json and .md; the second run is a recheck (--prior FILE = the first run\'s markdown) and resumes the first run\'s Codex session when it has one',
     '  -> exit 1 {error: cap | already-started | stale-start | superseded | no-proposal | lost}, 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|malformed|github, session} (the key stays consumed; .review/plan/KEY.failed.json keeps the session)',
-    'pipeline plan findings --pr N --key KEY --tag TAG [--projects-dir DIR] [--max-age-ms N] [--repo DIR]',
-    '  -> {ok, key, n, counts, path, errors}; takes the Fable plan review from the subagent transcript tagged TAG after proving the model (claude-fable- at effort high), the prompt header of the valid start and a transcript no older than the start; nothing is written on any refusal',
-    '  -> exit 1 {error: no-start | stale-start | exists, or errors:[...]}, 2 no transcript for TAG',
+    'pipeline plan findings --pr N --key KEY --tag TAG --claim CLAIM [--projects-dir DIR] [--max-age-ms N] [--repo DIR]',
+    '  -> {ok, key, n, counts, path, errors}; --claim = the claim `plan start` returned; takes the Fable plan review from the subagent transcript tagged TAG after proving the model (claude-fable- at effort high), the prompt header of the valid start and a transcript no older than the start, then re-lists the PR and checks the claim is still the earliest for the key; nothing is written on any refusal',
+    '  -> exit 1 {error: no-start | stale-start | superseded | exists, or errors:[...]}, 2 no transcript for TAG, 3 GitHub could not confirm the claim',
   ].join('\n'),
 };
 
@@ -143,6 +143,10 @@ async function record(argv, ctx) {
     if (local !== px.view.headRefOid) {
       throw fail('unpushed', `local HEAD ${local.slice(0, 7)} is not the PR head ${String(px.view.headRefOid).slice(0, 7)}: push first, then record the plan`);
     }
+    // Same refusal list as `approve`: never start a fresh record over one we cannot read (it may be a gate-stage one).
+    if (['unsupported', 'invalid', 'legacy'].includes(px.summary.status)) {
+      throw fail('record-unreadable', `the run record on this PR is ${px.summary.status} (from a newer or older pipeline, damaged or another PR's): update the pipeline CLI or fix the summary comment first; nothing was posted`);
+    }
     let plan;
     try {
       plan = parsePlan(readBlobFrom(root)(blob), { path: rel });
@@ -195,6 +199,9 @@ async function approve(argv, ctx) {
     const parsed = parseBlob(readBlob, active.blob);
     const digest = scopeDigest(parsed.scope);
     if (digest !== active.scopeDigest) throw fail('lost', 'the recorded scope digest does not match the plan blob: record the plan again');
+    // Like `record`: the checkout must be the PR head, so what is pinned below is what the PR holds.
+    const local = headSha({ cwd: root });
+    if (local !== px.view.headRefOid) throw fail('unpushed', `local HEAD ${local.slice(0, 7)} is not the PR head ${String(px.view.headRefOid).slice(0, 7)}: check out / push the PR head, then approve`);
     // The approved plan must be the committed file at its path (as `record` pins it): never approve a blob the checkout does not hold there.
     let atPath = null;
     try { atPath = active.path ? git(['rev-parse', `HEAD:${active.path}`], { cwd: root }).trim() : null; } catch { atPath = null; }
@@ -513,11 +520,13 @@ async function review(argv, ctx) {
 
 async function findings(argv, ctx) {
   const { values } = parseCommandArgs(argv, {
-    pr: { type: 'string' }, key: { type: 'string' }, tag: { type: 'string' }, 'projects-dir': { type: 'string' }, 'max-age-ms': { type: 'string' }, repo: { type: 'string' },
+    pr: { type: 'string' }, key: { type: 'string' }, tag: { type: 'string' }, claim: { type: 'string' }, 'projects-dir': { type: 'string' }, 'max-age-ms': { type: 'string' }, repo: { type: 'string' },
   }, { allowPositionals: false });
   intOption(values, 'pr', { required: true, min: 1 });
   const key = keyOption(values);
   const tag = requireOption(values, 'tag');
+  const claim = requireOption(values, 'claim');
+  if (!/^[0-9a-f]{16}$/.test(claim)) throw new UsageError('--claim must be the 16-hex claim `plan start` returned');
   const maxAgeMs = intOption(values, 'max-age-ms', { min: 1 });
   const root = resolveRepo(values, ctx);
   await requireConfig(root);
@@ -566,6 +575,10 @@ async function findings(argv, ctx) {
     if (errors.length > 0 || result === null) {
       return { exitCode: EXIT.FAILED, output: { ok: false, key, error: 'unproven', message: 'the transcript was not accepted: nothing was recorded', errors } };
     }
+
+    // The claim recheck `review` does after its run: is this caller's reservation still the earliest, and the plan still the reviewed one?
+    const verdict = standing(px, { reviewer: 'fable', key, claim, planBlob: start.planBlob }); // a GhError becomes exit 3 (guardGh)
+    if (!verdict.ok) throw fail(verdict.error, verdict.message, { key });
 
     const n = FABLE_BASE_N + Math.max(1, starts.filter((x) => x.reviewer === 'fable' && x.valid).findIndex((x) => x.key === key) + 1);
     const items = assignIds(result, n, () => '', { contentHash: start.planBlob });

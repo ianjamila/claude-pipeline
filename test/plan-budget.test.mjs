@@ -196,7 +196,7 @@ function installTranscript(w, { prompt, text, tag, ts = '2026-10-19T09:30:00.000
   writeFileSync(join(dir, `agent-${agentId}.meta.json`), JSON.stringify({ toolUseId: 'toolu_01', spawnDepth: 1, agentType, description: tag }));
   return projects;
 }
-const findingsArgs = (key, tag, projects, more = []) => ['findings', '--pr', '7', '--key', key, '--tag', tag, '--projects-dir', projects, ...more];
+const findingsArgs = (key, tag, projects, claim, more = []) => ['findings', '--pr', '7', '--key', key, '--tag', tag, '--claim', claim, '--projects-dir', projects, ...more];
 
 test('findings: refuses a key with no valid start, a transcript older than the start, a prompt without the header, an existing file', async (t) => {
   const w = world(t);
@@ -205,29 +205,30 @@ test('findings: refuses a key with no valid start, a transcript older than the s
   const good = (header) => installTranscript(w, { prompt: `${header}\nReview the plan.`, text: fenced(findingsOf([finding()])), tag: TAG });
 
   // no start at all
-  const noStart = await w.call(findingsArgs('f1', TAG, good('ROUND: plan\nINPUT-DIGEST: ' + '0'.repeat(64))));
+  const noStart = await w.call(findingsArgs('f1', TAG, good('ROUND: plan\nINPUT-DIGEST: ' + '0'.repeat(64)), '0'.repeat(16)));
   assert.deepEqual([noStart.exitCode, noStart.output.error], [1, 'no-start']);
 
   const start = await w.call(startArgs('fable', 'f1'));
   const header = start.output.promptHeader;
+  const claim = start.output.claim;
 
   // a transcript whose first line is older than the start event
-  const old = await w.call(findingsArgs('f1', TAG, installTranscript(w, { prompt: `${header}\nGo.`, text: fenced(findingsOf()), tag: TAG, ts: '2026-10-19T08:00:00.000Z' })));
+  const old = await w.call(findingsArgs('f1', TAG, installTranscript(w, { prompt: `${header}\nGo.`, text: fenced(findingsOf()), tag: TAG, ts: '2026-10-19T08:00:00.000Z' }), claim));
   assert.equal(old.exitCode, 1);
   assert.match(old.output.errors.join(' '), /older than/);
 
   // a first user message without the header
-  const noHeader = await w.call(findingsArgs('f1', TAG, good('Please review the plan.')));
+  const noHeader = await w.call(findingsArgs('f1', TAG, good('Please review the plan.'), claim));
   assert.equal(noHeader.exitCode, 1);
   assert.match(noHeader.output.errors.join(' '), /ROUND: plan|INPUT-DIGEST/);
 
   // the wrong model
-  const wrong = await w.call(findingsArgs('f1', TAG, installTranscript(w, { prompt: `${header}\nGo.`, text: fenced(findingsOf()), tag: TAG, model: 'claude-opus-5-1' })));
+  const wrong = await w.call(findingsArgs('f1', TAG, installTranscript(w, { prompt: `${header}\nGo.`, text: fenced(findingsOf()), tag: TAG, model: 'claude-opus-5-1' }), claim));
   assert.equal(wrong.exitCode, 1);
   assert.ok(!existsSync(join(w.repo.dir, '.review', 'plan', 'f1.json')), 'nothing written on any refusal');
 
   // a proven transcript is accepted and written
-  const ok = await w.call(findingsArgs('f1', TAG, good(header)));
+  const ok = await w.call(findingsArgs('f1', TAG, good(header), claim));
   assert.equal(ok.exitCode, 0, JSON.stringify(ok.output));
   assert.deepEqual(ok.output.counts, { blocking: 1, suggestions: 0, worth_considering: 0 });
   const written = JSON.parse(readFileSync(join(w.repo.dir, '.review', 'plan', 'f1.json'), 'utf8'));
@@ -236,7 +237,7 @@ test('findings: refuses a key with no valid start, a transcript older than the s
   assert.match(readFileSync(join(w.repo.dir, '.review', 'plan', 'f1.md'), 'utf8'), /Fable plan review/);
 
   // already recorded
-  const again = await w.call(findingsArgs('f1', TAG, good(header)));
+  const again = await w.call(findingsArgs('f1', TAG, good(header), claim));
   assert.deepEqual([again.exitCode, again.output.error], [1, 'exists']);
 });
 
@@ -244,7 +245,7 @@ test('findings: no transcript is exit 2; a plan re-recorded after the start is s
   const w = world(t);
   await w.record();
   const start = await w.call(startArgs('fable', 'f1'));
-  const none = await w.call(findingsArgs('f1', 'plan-fable f1', mkdtempSync(join(w.scratch, 'empty-'))));
+  const none = await w.call(findingsArgs('f1', 'plan-fable f1', mkdtempSync(join(w.scratch, 'empty-')), start.output.claim));
   assert.equal(none.exitCode, 2);
   // the plan changes: a new blob is the active proposal
   w.repo.write(REL, planText(' Changed.'));
@@ -252,7 +253,7 @@ test('findings: no transcript is exit 2; a plan re-recorded after the start is s
   w.edit((s) => { s.head = head; });
   await w.record();
   const projects = installTranscript(w, { prompt: `${start.output.promptHeader}\nGo.`, text: fenced(findingsOf()), tag: 'plan-fable f1' });
-  const stale = await w.call(findingsArgs('f1', 'plan-fable f1', projects));
+  const stale = await w.call(findingsArgs('f1', 'plan-fable f1', projects, start.output.claim));
   assert.deepEqual([stale.exitCode, stale.output.error], [1, 'stale-start']);
 });
 

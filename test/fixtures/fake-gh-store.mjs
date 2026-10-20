@@ -3,6 +3,7 @@
 //   { head, headRef, comments: [{id, user, body, created_at, updated_at, hideForGets?}], nextId, hidePosted?, failPostAfterStore? }
 //   hidePosted         comments created by a POST are stored but never listed (a listing that lags forever)
 //   hideForGets: n     (per comment) the comment is left out of the next n listings, then appears (eventual consistency)
+//   failGetsAfter: n   the first n listings work, every later one fails (HTTP 502)
 //   failPostAfterStore the next POST stores its comment and then fails with HTTP 502 (an ambiguous POST); decremented
 // Answers: api user, repo view, pr view, GET/POST issue comments of acme/widgets #7, PATCH issues/comments/ID.
 import { readFileSync, writeFileSync, appendFileSync } from 'node:fs';
@@ -44,6 +45,10 @@ else if (/-X POST repos\/acme\/widgets\/issues\/7\/comments/.test(joined)) {
   save();
   out({ id: c.id, html_url: `https://x/${c.id}` });
 } else if (/^api repos\/acme\/widgets\/issues\/7\/comments --paginate/.test(joined)) {
+  if (store.failGetsAfter !== undefined) {
+    if (store.failGetsAfter <= 0) { process.stderr.write('HTTP 502: Bad Gateway'); process.exitCode = 1; save(); process.exit(); }
+    store.failGetsAfter -= 1;
+  }
   const shown = store.comments.filter((c) => !c.hidden && !(c.hideForGets > 0));
   for (const c of store.comments) if (c.hideForGets > 0) c.hideForGets -= 1;
   save();
