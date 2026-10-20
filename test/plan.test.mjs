@@ -242,3 +242,28 @@ test('link and image titles are refused outside fences and code spans', () => {
   }
   assert.ok(parsePlan(PLAN.replace('b works', '[x](/u) and `[x](/u "t")` and (say "hi") works\n```\n[x](/u "t")\n```')));
 });
+
+test('code spans follow CommonMark: unequal backtick runs and escaped backticks do not hide raw HTML (F1)', () => {
+  for (const frag of ['a ``<!-- hidden -->` z', 'a \\`<!-- hidden \\` z', 'a ``<span hidden>zz</span>` z', 'a \\`<span hidden>zz</span>\\` z', 'a ```<!-- h -->`` z', 'a ``` <!-- h --> z']) {
+    const text = PLAN.replace('b works', `${frag} works`);
+    assert.throws(() => parsePlan(text), (e) => e instanceof PlanError && e.problems.some((p) => p.includes(`raw HTML/comment at line ${lineWith(text, frag)} `)), frag);
+  }
+  assert.throws(() => parsePlan(PLAN.replace('b works', 'a \\`&amp;\\` works')), (e) => e instanceof PlanError && e.problems.some((p) => p.includes('HTML character reference')));
+  // genuine spans (equal runs, a shorter run inside, escaped backslash before the opener) still mask their content
+  assert.ok(parsePlan(PLAN.replace('b works', 'x `<!-- c -->` and ``a`<b>`` and `` `<i>` `` and \\\\`<u>` works')));
+});
+
+test('an ATX heading inside the Scope section other than the one that ends it is refused (F2)', () => {
+  for (const h of ['  ## Notes', '# Appendix', '### Details', ' ### Details', '#', '###### x']) {
+    const text = PLAN.replace('* `docs/x.md` (the doc)', `${h}\n* \`docs/x.md\` (the doc)`);
+    assert.throws(() => parsePlan(text), (e) => e instanceof PlanError && e.problems.some((p) => p.includes(`heading at line ${text.split("\n").indexOf(h) + 1} `)), h);
+  }
+  // a heading inside a fence, or 4 spaces of indent (code), is not a heading; the next ## ends the section as before
+  assert.ok(parsePlan(PLAN.replace('* `docs/x.md` (the doc)', '* `docs/x.md` (the doc)\n```\n## Notes\n```\n    # code')));
+  assert.ok(parsePlan(PLAN.replace('### Task T1', '##  Notes ##\n- `evil/**`\n\n### Task T1')).scope.length === 3);
+});
+
+test('outsideScope refuses a missing or non-array file list (F7)', () => {
+  for (const files of [undefined, null, 'src/a.mjs', {}]) assert.throws(() => outsideScope({ files, scope: ['src/**'] }), /files/);
+  assert.deepEqual(outsideScope({ files: [], scope: ['src/**'] }), []);
+});

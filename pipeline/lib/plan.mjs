@@ -19,7 +19,30 @@ const FENCE_CLOSE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
 // plan holding any (outside fences and inline code spans) is refused. The tag-line test is deliberately wider than
 // CommonMark's 0-3 spaces of indent (a list continuation can indent an HTML block further).
 const HTML_COMMENT = /<!--/;
-const CODE_SPAN = /(`+)(?:(?!\1)[^])+?\1/g;
+// Inline code spans per CommonMark: a backslash-escaped ASCII punctuation mark outside a span is literal text (so \` opens
+// nothing), a span opens at a run of N backticks and closes only at the next run of EXACTLY N; an unclosed run is literal.
+// Only closed spans are masked. Everything else (including escaped backticks) stays visible to the raw-HTML / entity checks.
+function maskCodeSpans(line) {
+  let out = '';
+  for (let i = 0; i < line.length;) {
+    const c = line[i];
+    if (c === '\\' && i + 1 < line.length && /[!-\/:-@[-`{-~]/.test(line[i + 1])) { out += line.slice(i, i + 2); i += 2; continue; }
+    if (c !== '`') { out += c; i += 1; continue; }
+    let n = 1;
+    while (line[i + n] === '`') n += 1;
+    let close = -1;
+    for (let j = i + n; j < line.length;) {
+      if (line[j] !== '`') { j += 1; continue; }
+      let m = 1;
+      while (line[j + m] === '`') m += 1;
+      if (m === n) { close = j; break; }
+      j += m;
+    }
+    if (close < 0) { out += line.slice(i, i + n); i += n; continue; }
+    i = close + n;
+  }
+  return out;
+}
 const HTML_TAG_LINE = /^\s*(?:<\/?[A-Za-z][A-Za-z0-9-]*(?:[\s/>]|$)|<!)/;
 // A link reference definition renders as nothing, but its title text would still reach the implementers.
 const LINK_DEF = /^\s{0,3}\[[^\]]+\]:\s*\S/;
@@ -34,6 +57,7 @@ const LINK_TITLE = /\]\([^)]*?\s+(?:"[^"]*"|'[^']*')\s*\)/;
 const SCOPE_ASCII = /^[\x21-\x7E]+$/;
 // Scope must also be a flat list: no blockquoted or nested items.
 const QUOTED_ITEM = /^\s*>[\s>]*[-*+]\s+`/;
+const ATX_HEADING = /^ {0,3}#{1,6}(?:\s|$)/;
 const NESTED_ITEM = /^(?: {2,}|\t)\s*[-*+]\s+`/;
 
 export class PlanError extends Error {
@@ -101,7 +125,7 @@ export function parsePlan(text, { path: ownPath } = {}) {
     for (const ch of new Set(l.match(INVISIBLE) ?? [])) problems.push(`invisible character U+${ch.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')} at line ${i + 1}`);
     if (!mask[i] && LINK_DEF.test(l)) problems.push(`link reference definition at line ${i + 1} is hidden when rendered`);
     if (mask[i]) return;
-    const bare = l.replace(CODE_SPAN, '');
+    const bare = maskCodeSpans(l);
     if (HTML_COMMENT.test(bare) || HTML_TAG_LINE.test(l) || (bare.match(INLINE_TAG) ?? []).some((t) => !AUTOLINK.test(t))) {
       problems.push(`raw HTML/comment at line ${i + 1} is hidden when rendered: write it as text or inside a code block`);
     }
@@ -123,6 +147,7 @@ export function parsePlan(text, { path: ownPath } = {}) {
     const refuse = (why) => { if (!flagged.has(why)) { flagged.add(why); problems.push(`the "## Scope" section must be a flat list the owner can read as written: ${why}`); } };
     sc.lines.forEach((l, i) => {
       if (sc.mask[i]) return;
+      if (ATX_HEADING.test(l)) { problems.push(`heading at line ${sc.from + i + 1} sits inside the "## Scope" section: entries under it render under that heading, so end Scope with a column-0 "## " heading`); return; }
       if (QUOTED_ITEM.test(l)) { refuse('it contains a scope item inside a blockquote'); return; }
       if (NESTED_ITEM.test(l)) { refuse('it contains a nested list item (indented 2+ spaces)'); return; }
       const m = SCOPE_ITEM.exec(l);
@@ -162,8 +187,9 @@ export function parsePlan(text, { path: ownPath } = {}) {
 export const scopeDigest = (scope) => sha([...new Set(scope.map(String))].sort().join('\n')).slice(0, 12);
 
 export function outsideScope({ files, scope }) {
+  if (!Array.isArray(files)) throw new TypeError('outsideScope: files must be an array of changed files');
   const out = new Set();
-  for (const f of files ?? []) {
+  for (const f of files) {
     for (const p of new Set([f.oldPath, f.newPath, f.path].filter((x) => typeof x === 'string' && x !== '' && x !== '/dev/null'))) {
       if (!matchAny(p, scope)) out.add(p);
     }
