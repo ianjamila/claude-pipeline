@@ -67,7 +67,14 @@ export const DEFAULTS = deepFreeze({
     effort: { low: 'medium', medium: 'medium', high: 'high', followup: 'medium' },
     max_rounds: 3,
     light_lane_max_lines: 50,
+    // final_pass: a Fable final review pass on risky PRs ('off' | 'risky'). security: 'off' or { paths } - extra globs that
+    // make a change security-relevant (migrations and *.sql always count unless 'off').
+    final_pass: 'off',
+    security: { paths: [] },
   },
+  // plan: every ship run proposes a plan under 'dir' and waits for the owner's typed "approve"; required: false makes the
+  // plan-scope gate check report only.
+  plan: { dir: 'docs/plans', required: true },
   agent_log: 'docs/agent-log.md',
 });
 
@@ -88,6 +95,7 @@ const OWNER_APPROVALS = ['label', 'chat'];
 const PROVIDERS = ['vercel', 'github-deployments', 'other'];
 // Who owns the production smoke: the ship session (prod-watch) or a CI workflow that posts the result on the merged PR.
 const WATCH_MODES = ['session', 'workflow'];
+const REVIEW_FINAL_PASS = ['off', 'risky'];
 const AFTER_FIX_MODES = ['full', 'quick'];
 export const SAFE_STEP = /^[A-Za-z0-9_.:-]+$/;
 
@@ -106,7 +114,9 @@ const KEYS = {
   hard_stops: ['paths', 'patterns', 'auth_calls', 'disable_rules', 'report_only_rules', 'report_only_paths'],
   pattern: ['name', 'regex', 'paths'],
   integrity: ['test_globs'],
-  review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines'],
+  review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines', 'final_pass', 'security'],
+  security: ['paths'],
+  plan: ['dir', 'required'],
   smoke: ['path', 'status', 'contains', 'location_contains'],
 };
 
@@ -505,6 +515,20 @@ export function validateConfig(obj) {
         else if (!EFFORTS.includes(review.effort[lane])) errors.push(`review.effort.${lane} must be one of ${EFFORTS.join('|')}`);
       }
     }
+    if (!REVIEW_FINAL_PASS.includes(review.final_pass)) errors.push(`review.final_pass must be ${REVIEW_FINAL_PASS.join(' or ')}`);
+    if (review.security !== 'off') {
+      if (!isObj(review.security)) errors.push('review.security must be off or a mapping');
+      else {
+        unknownKeys(review.security, KEYS.security, 'review.security.', errors);
+        checkStrArray(review.security.paths, 'review.security.paths', errors);
+      }
+    }
+  }
+
+  const plan = section(config, 'plan', errors);
+  if (plan) {
+    if (!isStr(plan.dir) || plan.dir.startsWith('/') || plan.dir.split('/').includes('..')) errors.push('plan.dir must be a relative path');
+    if (typeof plan.required !== 'boolean') errors.push('plan.required must be true or false');
   }
 
   const risk = section(config, 'risk', errors);

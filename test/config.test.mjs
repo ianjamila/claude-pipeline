@@ -863,3 +863,22 @@ test('verify.ci_proof parses from real YAML (hyphenated step names, nested mappi
   assert.equal(r.ok, true, r.errors.join('; '));
   assert.deepEqual(r.config.verify.ci_proof, { 'sql-arms': { workflow: '.github/workflows/ci.yml', job: 'SQL arms', event: 'pull_request' } });
 });
+
+test('plan and review.final_pass / review.security: defaults, accepted values, refusals', () => {
+  const ok = validateConfig(minimal());
+  assert.deepEqual(ok.config.plan, { dir: 'docs/plans', required: true });
+  assert.equal(ok.config.review.final_pass, 'off');
+  assert.deepEqual(ok.config.review.security, { paths: [] });
+  assert.equal(validateConfig({ ...minimal(), plan: { required: false } }).ok, true);
+  assert.equal(validateConfig({ ...minimal(), review: { security: 'off' } }).config.review.security, 'off');
+  assert.deepEqual(validateConfig({ ...minimal(), review: { security: { paths: ['auth/**'] } } }).config.review.security, { paths: ['auth/**'] });
+  assert.equal(validateConfig({ ...minimal(), review: { final_pass: 'risky' } }).ok, true);
+  assert.ok(has(validateConfig({ ...minimal(), plan: { dir: '/abs' } }), 'plan.dir must be a relative path'));
+  assert.ok(has(validateConfig({ ...minimal(), plan: { dir: '../x' } }), 'plan.dir must be a relative path'));
+  assert.ok(has(validateConfig({ ...minimal(), plan: { required: 'yes' } }), 'plan.required'));
+  assert.ok(has(validateConfig({ ...minimal(), plan: { extra: 1 } }), 'unknown key: plan.extra'));
+  assert.ok(has(validateConfig({ ...minimal(), review: { final_pass: 'always' } }), 'review.final_pass'));
+  assert.ok(has(validateConfig({ ...minimal(), review: { security: { paths: [1] } } }), 'review.security.paths'));
+  assert.ok(has(validateConfig({ ...minimal(), review: { security: { nope: 1 } } }), 'unknown key: review.security.nope'));
+  assert.ok(has(validateConfig({ ...minimal(), review: { security: 'on' } }), 'review.security'));
+});
