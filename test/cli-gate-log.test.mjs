@@ -14,6 +14,7 @@ import { applyCheckpoint, decodeRecord, emptyRecord, encodeRecord } from '../pip
 import { listEvents, openOwnerStops, renderEvent } from '../pipeline/lib/run-events.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { run as summaryRun } from '../pipeline/commands/summary.mjs';
+import { run as commentRun } from '../pipeline/commands/comment.mjs';
 import { UnavailableError } from '../pipeline/lib/cli.mjs';
 import { LEDGER_NAME } from '../pipeline/lib/notify.mjs';
 import { ownerStopsDir } from '../pipeline/lib/owner-stop.mjs';
@@ -663,4 +664,40 @@ test('summary: keeps the run record a checkpoint wrote (tasks survive), records 
   assert.deepEqual([decoded.record.outcome, decoded.record.head, decoded.record.agentLogLine], ['awaiting-owner-merge', 'e'.repeat(40), r.json.agentLogLine]);
   assert.match(body, /### Outcome/);
   assert.ok(!fake.lines().some((l) => l.includes('-X POST')));
+});
+
+// R1-B1: the local pending stop is written before ANY GitHub call, so an outage at the very first lookup cannot lose it.
+const allDownGh = () => createFakeGh([
+  { match: '^pr view', code: 1, stderr: 'HTTP 502' },
+  ME, REPO,
+  { match: '^api ', code: 1, stderr: 'HTTP 502' },
+]);
+
+test('summary --outcome needs-human in chat, GitHub down at the FIRST call (pr view): the pending stop file still exists and the reply goes to stderr', async () => {
+  const t = await summaryIn(chatRepo(), ['--outcome', 'needs-human'], { fake: allDownGh() });
+  assert.ok(t.error instanceof UnavailableError, `expected the unavailable error, got ${t.error}`);
+  assert.deepEqual(t.stops.heldFiles(), ['acme__widgets__12__5f3a9c2e.json']);
+  assert.match(t.stderr, /Stopped #12 · stop 5f3a9c2e/);
+  assert.equal(t.rig.fetchCalls.length, 1, 'the push is still sent');
+});
+
+test('comment --kind summary --outcome needs-human in chat, GitHub down at the FIRST call (pr view): the pending stop file still exists', async () => {
+  const repo = chatRepo();
+  const stops = stopRig();
+  const fake = allDownGh();
+  const orig = process.stderr.write;
+  const err = [];
+  process.stderr.write = (c) => { err.push(String(c)); return true; };
+  let res;
+  let error;
+  try {
+    res = await commentRun(['--pr', String(PR), '--kind', 'summary', '--outcome', 'needs-human'], { cwd: repo.dir, env: { ...process.env, ...fake.env }, ownerStopDeps: stops.deps });
+  } catch (e) {
+    error = e;
+  } finally {
+    process.stderr.write = orig;
+  }
+  assert.ok(error instanceof UnavailableError || (res && res.exitCode !== 0), `the command must not succeed: ${error ?? JSON.stringify(res)}`);
+  assert.deepEqual(stops.heldFiles(), ['acme__widgets__12__5f3a9c2e.json']);
+  assert.match(err.join(''), /Stopped #12 · stop 5f3a9c2e/);
 });

@@ -174,15 +174,27 @@ export const run = guarded(async (argv, ctx) => {
   const replyToStderr = (reply) => { if (reply) process.stderr.write(`${reply}\n`); };
   try {
     result = await guardGh(async () => {
-      const view = gh.prView(pr, ['title', 'headRefName', 'baseRefName', 'headRefOid']);
-      ({ title } = view);
+      // Chat + needs-human: the owner stop is written locally BEFORE any GitHub call (the PR lookup included), so an outage at the
+      // very first call cannot lose it; the head is not known yet, which a stop does not need. It is posted BEFORE the summary comment.
+      const stopFirst = ownerApproval === 'chat' && outcome === 'needs-human';
+      const openStop = async (head) => {
+        try {
+          stopStep = await ownerStopForOutcome({ gh, pr, root, outcome, ownerApproval, cause: values.cause, head, env: ctx.env, deps: ctx.ownerStopDeps });
+        } catch (err) {
+          replyToStderr(err.reply);
+          throw err;
+        }
+      };
+      if (stopFirst) await openStop(null);
+      let view;
       try {
-        // Chat + needs-human: the owner stop is posted BEFORE the summary comment (an append-only event; the record only copies it).
-        stopStep = await ownerStopForOutcome({ gh, pr, root, outcome, ownerApproval, cause: values.cause, head: view.headRefOid, env: ctx.env, deps: ctx.ownerStopDeps });
+        view = gh.prView(pr, ['title', 'headRefName', 'baseRefName', 'headRefOid']);
       } catch (err) {
-        replyToStderr(err.reply);
+        replyToStderr(stopStep.reply); // the stop stands: the controller still prints the reply
         throw err;
       }
+      ({ title } = view);
+      if (!stopFirst) await openStop(view.headRefOid);
       const stopOut = stopStep.ownerStop ? { ownerStop: stopStep.ownerStop, reply: stopStep.reply } : {};
       try {
         const sections = summarySections(state, { outcome: detail ? `${outcome} — ${detail}` : outcome, built: values.built, followups: followupsOf(state), modelProofs: readModelProofs(root, state) });

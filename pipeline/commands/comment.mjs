@@ -68,9 +68,18 @@ async function ownerApprovalOf(root) {
 // The summary comment also carries the run record: write the sections through the one writer, which keeps an existing
 // record (and sets how the run ended on it).
 async function summaryKind(gh, pr, sections, outcome, ownerApproval, { root, ctx }) {
-  const view = gh.prView(pr, ['headRefName', 'baseRefName', 'headRefOid']);
-  // Chat + needs-human: the owner stop is an append-only event posted BEFORE the record is written (the record only copies it).
-  const step = await ownerStopForOutcome({ gh, pr, root, outcome, ownerApproval, head: view.headRefOid, env: ctx.env, deps: ctx.ownerStopDeps });
+  // Chat + needs-human: the owner stop is an append-only event posted BEFORE the record is written (the record only copies it), and
+  // it is written locally BEFORE any GitHub call (the PR lookup included), so an outage at the first call cannot lose it.
+  const stopFirst = ownerApproval === 'chat' && outcome === 'needs-human';
+  let step = stopFirst ? await ownerStopForOutcome({ gh, pr, root, outcome, ownerApproval, head: null, env: ctx.env, deps: ctx.ownerStopDeps }) : null;
+  let view;
+  try {
+    view = gh.prView(pr, ['headRefName', 'baseRefName', 'headRefOid']);
+  } catch (err) {
+    if (step?.reply) process.stderr.write(`${step.reply}\n`);
+    throw err;
+  }
+  step ??= await ownerStopForOutcome({ gh, pr, root, outcome, ownerApproval, head: view.headRefOid, env: ctx.env, deps: ctx.ownerStopDeps });
   const stopOut = step.ownerStop ? { ownerStop: step.ownerStop, reply: step.reply } : {};
   try {
     const existing = readSummaryComment(gh, pr);
