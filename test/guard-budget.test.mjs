@@ -12,6 +12,7 @@ import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { runHook } from '../pipeline/hooks/lib/hook-io.mjs';
 import { MAX_SCRIPT_JUDGMENTS, EVAL_DEADLINE_MS } from '../pipeline/hooks/lib/script-candidates.mjs';
+import { assertCpuUnder, assertLinear, assertLinearSteps, assertSteps, cpuTime, cpuTimed, virtualClock } from './helpers/timing.mjs';
 
 function fakeFs(root, files, dirs = []) {
   const abs = (p) => resolve(root, p);
@@ -59,14 +60,25 @@ const both = [
 ];
 const timed = cpuTimed; // CPU ms, not wall: a loaded machine must not trip a cap
 
+// Step bounds: clock reads (the policy's injected `now`) counted along the completed path, the same on every machine. CEIL = 2x the count
+// measured on this branch (2 significant figures), FLOOR = floor(count / 4); the clock's deadline lands at 2 x CEIL reads.
+const STEPS = {
+  'guard-git': { tree: { floor: 164, ceil: 1400 }, paren: { floor: 11, ceil: 88 }, bomb: { floor: 38, ceil: 310 } }, // measured 657, 44, 152
+  'guard-files': { tree: { floor: 100, ceil: 810 }, paren: { floor: 10, ceil: 84 }, bomb: { floor: 37, ceil: 300 } }, // measured 403, 42, 149
+};
+const clockFor = ({ ceil }) => virtualClock(EVAL_DEADLINE_MS / (2 * ceil));
+
 // ---- one budget for every script file read -----------------------------------------------------------------------
 
 for (const [name, run] of both) {
   test(`${name}: a tree of 500 plain 'bash next.sh' lines, 4 levels deep, is denied quickly (budget on every script read)`, () => {
-    const { r, ms } = timed(() => run('bash n1_0.sh', tree(500, 4)));
+    const bounds = STEPS[name].tree;
+    const c = clockFor(bounds);
+    const { r, ms } = timed(() => run('bash n1_0.sh', tree(500, 4), { now: c.now }));
     assert.equal(r.decision, 'deny');
     assert.match(r.reason, /too many script files/);
-    assert.ok(ms < 3000, `took ${Math.round(ms)} ms of CPU`);
+    assertCpuUnder(ms, 3000, `${name} 500-line tree`);
+    assertSteps(c.reads, { ...bounds, label: `${name} 500-line tree` });
   });
 
   test(`${name}: a smaller tree (20 lines, 3 levels = 421 reads) is denied: the budget counts named scripts, not only candidates`, () => {
@@ -133,7 +145,7 @@ test('guard-files: a x10-per-level variable chain is denied quickly instead of g
   const { r, ms } = timed(() => files(`${chainLine(7)}; echo ok`, filesFs({})));
   assert.equal(r.decision, 'deny');
   assert.match(r.reason, /expand to more text/);
-  assert.ok(ms < 3000, `took ${Math.round(ms)} ms of CPU`);
+  assertCpuUnder(ms, 3000, 'guard-files x10 variable chain');
 });
 
 test('guard-files: a short chain that stays small is still allowed', () => {
@@ -145,7 +157,7 @@ test('guard-git: a 60k-character value repeated 1000 times in one word is denied
   const { r, ms } = timed(() => git(line, gitFs({})));
   assert.equal(r.decision, 'deny');
   assert.match(r.reason, /expand to more text/);
-  assert.ok(ms < 3000, `took ${Math.round(ms)} ms of CPU`);
+  assertCpuUnder(ms, 3000, 'guard-git 60k value x1000');
 });
 
 test('guard-git: a 60k-character value passed as 5000 separate arguments is denied quickly (total across the line)', () => {
@@ -153,7 +165,7 @@ test('guard-git: a 60k-character value passed as 5000 separate arguments is deni
   const { r, ms } = timed(() => git(line, gitFs({})));
   assert.equal(r.decision, 'deny');
   assert.match(r.reason, /expand to more text/);
-  assert.ok(ms < 3000, `took ${Math.round(ms)} ms of CPU`);
+  assertCpuUnder(ms, 3000, 'guard-git 60k value as 5000 arguments');
 });
 
 test('guard-files: the same 60k value repeated is denied quickly', () => {
@@ -161,7 +173,7 @@ test('guard-files: the same 60k value repeated is denied quickly', () => {
   const { r, ms } = timed(() => files(line, filesFs({})));
   assert.equal(r.decision, 'deny');
   assert.match(r.reason, /expand to more text/);
-  assert.ok(ms < 3000, `took ${Math.round(ms)} ms of CPU`);
+  assertCpuUnder(ms, 3000, 'guard-files 60k value x1000');
 });
 
 test('guard-git: a few small variables on a git line are still judged normally', () => {
@@ -241,7 +253,6 @@ test('guard-files: a big file judged as program text is not an expansion (PATH=.
 // ---- review R1-B1: the parameter-expansion scan is one linear pass and obeys the deadline -------------------------------------------
 // `: ${x:-` + 150,000 `(` + `}` used to rescan the rest of the body for every `(` (quadratic: ~21 s, past the hook timeout, which Claude Code
 // reads as allow). The text after it is a push to the protected branch, built at run time so this file holds no guarded text.
-import { assertLinear, cpuTime, cpuTimed } from './helpers/timing.mjs';
 
 const parenBomb = (n, tail) => `: \${x:-${'('.repeat(n)}}; ${tail}`;
 const MAIN_PUSH = `git push origin ${'ma'}${'in'}`;
@@ -253,12 +264,23 @@ for (const [name, run] of both) {
   test(`${name}: the parenthesis scan inside \${...} is linear (CPU time at 2n vs n)`, () => {
     const sample = (n) => () => cpuTime(() => decide(parenBomb(n, 'echo hi')));
     assertLinear(sample(20_000), sample(40_000), { label: `${name} paren scan` });
+    // the same scan counted in clock reads (one per 1024 characters): the count must follow the input, not the machine
+    const bounds = STEPS[name].paren;
+    const counted = (n) => { const c = clockFor(bounds); const r = decide(parenBomb(n, 'echo hi'), { now: c.now }); assert.equal(r.decision, 'allow'); return c.reads; };
+    const half = counted(20_000);
+    const full = counted(40_000);
+    assertLinearSteps(half, full, `${name} paren scan`);
+    assertSteps(full, { ...bounds, label: `${name} paren scan at 40000` });
   });
 
   test(`${name}: 150,000 open parentheses in \${...} then a guarded command is denied, and fast`, () => {
-    const { r, ms } = timed(() => decide(parenBomb(150_000, BAD)));
+    const bounds = STEPS[name].bomb;
+    const c = clockFor(bounds);
+    const { r, ms } = timed(() => decide(parenBomb(150_000, BAD), { now: c.now }));
     assert.equal(r.decision, 'deny');
-    assert.ok(ms < 3000, `took ${Math.round(ms)} ms of CPU`);
+    assert.doesNotMatch(r.reason, /took too long|too complex/); // judged to the end: the guarded command after the parentheses is what is refused
+    assertCpuUnder(ms, 3000, `${name} 150,000 parentheses`);
+    assertSteps(c.reads, { ...bounds, label: `${name} 150,000 parentheses` });
   });
 
   test(`${name}: the parenthesis scan checks the evaluation's deadline (injected clock): past it is a denial, not an allow`, () => {
@@ -291,14 +313,14 @@ for (const [name, run] of both) {
   test(`${name}: a guarded command followed by a 120,000-character nested qualifier group is denied, and fast`, () => {
     const { r, ms } = timed(() => run(`${BAD}\n${nestedQualifier(40_000)}`, {}));
     assert.equal(r.decision, 'deny');
-    assert.ok(ms < 2000, `took ${Math.round(ms)} ms of CPU`);
+    assertCpuUnder(ms, 2000, `${name} nested qualifier`);
   });
 }
 
 test('qualifier scan: a deeply nested group is parsed fast and the parse is truncated', () => {
   const { r, ms } = timed(() => simpleCommands(nestedQualifier(40_000)));
   assert.equal(r.truncated, true);
-  assert.ok(ms < 2000, `took ${Math.round(ms)} ms of CPU`);
+  assertCpuUnder(ms, 2000, 'nested qualifier parse');
 });
 
 test('qualifier scan: the scan is linear (CPU time: one parse of 16n vs 16 parses of n)', () => {
@@ -311,6 +333,8 @@ test('qualifier scan: the scan is linear (CPU time: one parse of 16n vs 16 parse
   const small = () => cpuTime(() => { for (let i = 0; i < 16; i++) parse(4_000); });
   const large = () => cpuTime(() => parse(64_000));
   assertLinear(small, large, { label: 'qualifier scan', factor: 1, ratio: 4 });
+  // Why CPU only: this shape is cut off by the code cap after 2-15 clock reads at every size (30 at n = 500, 8 at 4,000, 2 at 64,000),
+  // so a count would not follow the input and a quadratic scan would pass it.
 });
 
 test('qualifier scan: more than MAX_QUALIFIER_CODES distinct codes is truncated, 32 or fewer is not', () => {
