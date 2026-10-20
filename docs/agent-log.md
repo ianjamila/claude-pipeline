@@ -76,3 +76,4 @@ full record.
 - 2026-10-20 · #98 · verify: vendored run-history lib — one line per verify run · risk high · rounds 2 · arbiter 0 · stopped
 - 2026-10-20 · #93 · tests: machine-proof speed checks (scaled CPU caps + step counts) · risk high · rounds 2 · arbiter 0 · stopped
 - 2026-10-20 · #100 · ci-proof for tests + stacks report count and consumer fixes · risk high · rounds 3 · arbiter 0 · merged-externally
+- 2026-10-20 · #99 · guards refuse over-long lines; linear DEFAULTED_WORD; CPU-time timing tests · risk high · rounds 2 · arbiter 0 · awaiting-owner-merge
