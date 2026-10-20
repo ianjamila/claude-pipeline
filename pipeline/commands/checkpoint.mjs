@@ -9,6 +9,9 @@ import { guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { GitError, headSha, isAncestor, treeFingerprint } from '../lib/git.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { LIMITS, STEPS, applyCheckpoint } from '../lib/run-record.mjs';
+import { openOwnerStops, postEvent, readEvents } from '../lib/run-events.mjs';
+import { flushPendingStops, removePendingStop } from '../lib/owner-stop.mjs';
+import { approvedRelease } from '../hooks/lib/owner-go.mjs';
 import { VIEW_FIELDS, baseRecordFor } from '../lib/run-progress.mjs';
 import { readSummaryComment, writeSummaryComment } from '../lib/summary-comment.mjs';
 
@@ -20,6 +23,7 @@ export const meta = {
     '  -> {ok, url, action, record, warnings}; exit 1 {error: unpushed | behind | diverged} (local HEAD is not the PR head on GitHub), 2 usage, 3 GitHub unavailable',
     "  --request-file: the user's request, text, at most 2 KB · --tasks-file: JSON [{id, title, spec}] · --task-done ID: mark one task done (repeatable)",
     '  --resumed: this run was taken over by `ship resume` (or adopts a PR): stamps record.resumed {at, host, head}, which later checkpoints keep and which makes `P merge` require the owner\'s recorded "merge" (--owner-approved-head + --owner-approved-items)',
+    "  owner_approval: chat: an open owner stop (no needs-human label exists) makes every checkpoint but `ended` / `awaiting-owner-merge` exit 1 {error: owner-stop-open}; `--resumed` releases it, and only with the owner's typed reply (`ship resume N`, or `merge` to a reply that offered it) recorded for that PR and stop id by the owner-go hook: exit 1 {error: owner-release-missing, stops, released} otherwise (nothing is posted for a stop without that record); a stop held only on this machine (GitHub unreachable) exits 1 {error: owner-stop-held}",
     "  --verify-report: copy {head, tree, mode, ok, failedStep} of the verify report, only when its head and tree are this HEAD's (otherwise a warning)",
   ].join('\n'),
 };
@@ -101,7 +105,7 @@ export const run = guarded(async (argv, ctx) => {
 
   const local = headSha({ cwd: root });
   const gh = createGitHub({ cwd: root, env: ctx.env });
-  return guardGh(() => {
+  return guardGh(async () => {
     const view = gh.prView(pr, [...VIEW_FIELDS]);
     const remote = view.headRefOid;
     if (local !== remote) {
@@ -131,6 +135,43 @@ export const run = guarded(async (argv, ctx) => {
     patch.head = local;
     if (values.resumed) patch.resumed = { at: new Date().toISOString(), host: hostname(), head: local };
 
+    // Chat mode: owner stops are events, never a label. Open stop + no --resumed = refused; --resumed releases only what the owner released
+    // (the owner-go record for this PR and stop id), release event FIRST, then the record copy and the local pending file.
+    let released = [];
+    if (config.owner_approval === 'chat') {
+      const resting = step === 'ended' || step === 'awaiting-owner-merge';
+      const flushed = await flushPendingStops({ gh, pr, root, deps: ctx.ownerStopDeps });
+      if (flushed.remaining.length > 0 && !resting) {
+        const ids = flushed.remaining.map((r) => r.id);
+        return { exitCode: EXIT.FAILED, output: { ok: false, error: 'owner-stop-held', stops: ids, message: `owner stop ${ids.join(', ')} has not reached GitHub yet (${flushed.remaining[0].why}): it blocks merging on this machine; tell the owner, and retry once GitHub is reachable` } };
+      }
+      const open = openOwnerStops(readEvents(gh, pr));
+      if (open.length > 0 && !values.resumed && !resting) {
+        const ids = open.map((e) => String(e.id));
+        return { exitCode: EXIT.FAILED, output: { ok: false, error: 'owner-stop-open', stops: ids, message: `owner stop ${ids.join(', ')} is open on #${pr}: only the owner's reply releases it. Show the Stopped line(s) and wait for "ship resume ${pr}"; then \`checkpoint --resumed\`` } };
+      }
+      if (open.length > 0 && values.resumed) {
+        const ownerGoDeps = ctx.ownerGoDeps ?? {};
+        const slug = gh.repo().slug;
+        const missing = [];
+        for (const e of open) {
+          const id = String(e.id);
+          const rec = approvedRelease({ pr, stop: id, ...ownerGoDeps });
+          if (!rec) { missing.push(id); continue; }
+          postEvent(gh, pr, 'owner-stop-released', id, `Owner stop ${id} on #${pr} released by the owner's reply.`, {
+            repo: slug, pr, id, at: new Date().toISOString(), host: hostname(),
+            releaseRef: { kind: rec.kind === 'resume' ? 'resume' : 'merge', session: rec.session, ts: rec.ts, prompt_sha256: rec.prompt_sha256 },
+          });
+          released.push(id);
+          try { await removePendingStop({ pr, root, id, deps: ctx.ownerStopDeps }); } catch { /* the event is the authority: a leftover file only repeats a flush that finds the release */ }
+        }
+        if (missing.length > 0) {
+          return { exitCode: EXIT.FAILED, output: { ok: false, error: 'owner-release-missing', stops: missing, released, message: `the owner has not released stop ${missing.join(', ')} (no recorded "ship resume ${pr}" / "merge" naming it): show the stop lines and wait; if the owner already answered and the hook is old, run \`pipeline update\`` } };
+        }
+      }
+      if (values.resumed) { patch.ownerStop = null; patch.outcome = null; }
+    }
+
     const existing = readSummaryComment(gh, pr);
     if (existing.status === 'unsupported') throw new UsageError('the summary comment carries a run record from a newer pipeline version: update the pipeline CLI first');
     const base = baseRecordFor(existing, { repo: gh.repo().slug, pr, branch: view.headRefName, baseRef: view.baseRefName });
@@ -142,6 +183,6 @@ export const run = guarded(async (argv, ctx) => {
       throw new UsageError(err.message);
     }
     const posted = writeSummaryComment(gh, pr, { record, existing });
-    return { exitCode: EXIT.OK, output: { ok: true, url: posted.url, action: posted.action, record, warnings } };
+    return { exitCode: EXIT.OK, output: { ok: true, url: posted.url, action: posted.action, record, warnings, ...(released.length ? { released } : {}) } };
   });
 });

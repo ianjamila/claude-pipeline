@@ -71,6 +71,7 @@ pipeline checkpoint --pr N --step build|verify|pr|review|gate|awaiting-owner-mer
   -> {ok, url, action, record, warnings}; exit 1 {error: unpushed | behind | diverged} (local HEAD is not the PR head on GitHub), 2 usage, 3 GitHub unavailable
   --request-file: the user's request, text, at most 2 KB · --tasks-file: JSON [{id, title, spec}] · --task-done ID: mark one task done (repeatable)
   --resumed: this run was taken over by `ship resume` (or adopts a PR): stamps record.resumed {at, host, head}, which later checkpoints keep and which makes `P merge` require the owner's recorded "merge" (--owner-approved-head + --owner-approved-items)
+  owner_approval: chat: an open owner stop (no needs-human label exists) makes every checkpoint but `ended` / `awaiting-owner-merge` exit 1 {error: owner-stop-open}; `--resumed` releases it, and only with the owner's typed reply (`ship resume N`, or `merge` to a reply that offered it) recorded for that PR and stop id by the owner-go hook: exit 1 {error: owner-release-missing, stops, released} otherwise (nothing is posted for a stop without that record); a stop held only on this machine (GitHub unreachable) exits 1 {error: owner-stop-held}
   --verify-report: copy {head, tree, mode, ok, failedStep} of the verify report, only when its head and tree are this HEAD's (otherwise a warning)
 ```
 
@@ -150,7 +151,7 @@ Exit: 0 deployed · 1 the deployment failed · 3 nothing finished in time (or Gi
 prove this PR head is verified, reviewed, CI-green and smoked; writes .review/final-gate.json.
 
 ```
-pipeline final-gate --pr N [--repo DIR]   -> {ok, repo, pr, base, head, tree, contentHash, checks[{name,ok,detail}], failed[], at, proofs?}; exit 0 all checks pass, 1 any fails (pr-open detail starts "behind-base:" when the PR is behind its base: update the branch and re-verify), 3 GitHub unavailable
+pipeline final-gate --pr N [--repo DIR]   -> {ok, repo, pr, base, head, tree, contentHash, checks[{name,ok,detail}], failed[], at, proofs?, stop? (owner_approval: chat only: {id} of the newest owner stop, null when the PR never had one: a merge request for a PR with a stop id carries "Stopped #N · stop <id>" above its Head line)}; exit 0 all checks pass, 1 any fails (pr-open detail starts "behind-base:" when the PR is behind its base: update the branch and re-verify), 3 GitHub unavailable
 ```
 
 Exit: 0 every check passes (writes .review/final-gate.json) · 1 any check fails · 3 GitHub (`gh`) unavailable.
