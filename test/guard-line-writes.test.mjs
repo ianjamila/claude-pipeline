@@ -8,7 +8,7 @@
 // operation / a protected file. A missing script after a command the guard cannot model (make, npm run ...) is treated the same way.
 // The file system is faked (like test/guard-script-expansion.test.mjs); guarded text only lives in fake file contents or in the constants below.
 import { test } from 'node:test';
-import { cpuTimed } from './helpers/timing.mjs';
+import { cpuTimed, assertCpuUnder, assertSteps } from './helpers/timing.mjs';
 import assert from 'node:assert/strict';
 import { resolve, dirname, basename, posix } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
@@ -2093,12 +2093,31 @@ test('time: piecesMatch answers as the regex it replaces did (anything between p
   }
 });
 
+test('applySed reports its regex work through the optional meter', () => {
+  const text = Array.from({ length: 200 }, (_, i) => `const v${i} = foo(${i}); // bar`).join('\n') + '\n';
+  const w = { n: 0 };
+  const out = applySed({ args: ['-i', 's/foo/x/', 'f'], word: 'f' }, text, w);
+  assert.notEqual(out, null);
+  assert.ok(w.n > 0, `the meter stayed at ${w.n}`);
+  const again = applySed({ args: ['-i', 's/foo/x/', 'f'], word: 'f' }, text);
+  assert.deepEqual(again, out); // (no meter: same result)
+});
+
 test('time: applySed refuses (null) a program whose regex work on the text could outlast the hook; ordinary edits are still computed', () => {
   const line = `${'ab'.repeat(1000)}\n`; // (2,000 characters: every program below is over MAX_WORK on the FIRST line, so none of them runs at all)
-  for (const prog of ['s/.*a.*b.*c/x/', '/.*a.*b.*c/d', 's/[ab]*[ab]*[ab]*c/x/', 's/[ab]\\{0,255\\}[ab]\\{0,255\\}c/x/']) {
-    const s = cpuTimed(() => applySed({ args: ['-i', prog, 'f'], word: 'f' }, line.repeat(4)));
+  // (the work the meter counts is plain arithmetic on the text, the same on every machine; FLOOR = measured / 4, CEIL = 2 x measured rounded up to 2 significant figures)
+  const programs = [
+    { prog: 's/.*a.*b.*c/x/', floor: 4006003000500, ceil: 3.3e13 }, // measured: 16024012002001
+    { prog: '/.*a.*b.*c/d', floor: 4006003000500, ceil: 3.3e13 }, // measured: 16024012002001
+    { prog: 's/[ab]*[ab]*[ab]*c/x/', floor: 4006003000500, ceil: 3.3e13 }, // measured: 16024012002001
+    { prog: 's/[ab]\\{0,255\\}[ab]\\{0,255\\}c/x/', floor: 32768000, ceil: 2.7e8 }, // measured: 131072001
+  ];
+  for (const { prog, floor, ceil } of programs) {
+    const w = { n: 0 };
+    const s = cpuTimed(() => applySed({ args: ['-i', prog, 'f'], word: 'f' }, line.repeat(4), w));
     assert.equal(s.r, null, prog);
-    assert.ok(s.ms < 500, `${prog} took ${Math.round(s.ms)} ms of CPU`);
+    assertSteps(w.n, { floor, ceil, label: `applySed work for ${prog}` });
+    assertCpuUnder(s.ms, 500, `applySed ${prog}`);
   }
   const file = Array.from({ length: 2000 }, (_, i) => `const v${i} = foo(${i}); // ${'x'.repeat(40)} bar`).join('\n') + '\n';
   for (const prog of ['s/foo.*bar/x/', 's/foo/x/g', '/v1[0-9]*/d', 's/^const //']) assert.notEqual(applySed({ args: ['-i', prog, 'f'], word: 'f' }, file), null, prog);

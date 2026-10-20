@@ -547,13 +547,13 @@ export function emulatedShape(args) {
 
 // Every text the in-place edit `sed <args>` may leave in the file named by the word `word` when it held `text`, or null (not emulated exactly). A reading in which the word
 // is not edited (BSD takes the first word after a bare -i as its suffix) leaves the text as it is.
-export function applySed({ args, word, vars = [], posix = false }, text) {
+// `work` ({ n }, optional) receives the regex work units the edit is charged, so a test can count them.
+export function applySed({ args, word, vars = [], posix = false }, text, work = { n: 0 }) {
   if (text.length > MAX_TEXT) return null;
   if (posix || process.env.POSIXLY_CORRECT !== undefined || !emulatedShape(args)) return null; // (L5f: anything outside the plain shapes is "built from pieces", as before the emulation)
   const readings = prepare(args, new Set(vars));
   if (readings === null) return null;
   const outs = new Set();
-  const work = { n: 0 };
   for (const r of readings) {
     // a reading in which this sed does not edit in place (its -i is an -e value, or an operand) leaves the text as it is
     if (!r.inPlace) { outs.add(text); continue; }
