@@ -12,7 +12,7 @@ import { acquire, release } from '../pipeline/lib/locks.mjs';
 import { stackFiles, lockDirs } from '../pipeline/lib/stacks/paths.mjs';
 import { connections, processRefs } from '../pipeline/lib/stacks/evidence.mjs';
 import {
-  appendDecision, readDecisions, wouldStops, classifyUse, outcomeSummary, memoryOfProject, renderReport, renderWeekly, WINDOW_MS,
+  appendDecision, readDecisions, wouldStops, classifyUse, outcomeSummary, quietCandidates, memoryOfProject, renderReport, renderWeekly, WINDOW_MS,
 } from '../pipeline/lib/stacks/outcomes.mjs';
 
 process.env.PIPELINE_MACHINE_ID ||= 'test-machine-id';
@@ -549,4 +549,164 @@ test('a decisions log written by appendDecision survives a torn tail only as unk
   await appendDecision(file, dec());
   appendFileSync(file, '{"t":"2026-10-19T03:00:00.000Z","project":"x"');
   assert.equal(readDecisions(file).ok, false);
+});
+
+// ---------------------------------------------------------------- the quiet rule (C1 born before the decision) and C1 provenance
+
+test('classifyUse (quiet rule): a C1 use born before the decision is RESTART only with a quiet proof for exactly this decision and no prior sign', () => {
+  const t = iso(T0_MS + 10 * 60_000);
+  const c1 = (o = {}) => ({ t, pid: 5, birth: born(T0_MS) - 30, check: 'C1', quiet: { decision: T0, verdict: 'quiet' }, ...o });
+  assert.equal(classifyUse(rec0, c1()), 'RESTART');
+  assert.equal(classifyUse(rec0, c1({ priorSign: false })), 'RESTART');
+  assert.equal(classifyUse(rec0, c1({ quiet: { decision: iso(T0_MS - HOUR), verdict: 'quiet' } })), 'MISS', 'a proof for another decision proves nothing here');
+  assert.equal(classifyUse(rec0, c1({ quiet: { decision: T0, verdict: 'active' } })), 'MISS');
+  assert.equal(classifyUse(rec0, c1({ quiet: { decision: T0, verdict: 'unknown' } })), 'MISS');
+  assert.equal(classifyUse(rec0, c1({ quiet: 'quiet' })), 'MISS', 'quiet must be an object');
+  assert.equal(classifyUse(rec0, c1({ quiet: undefined })), 'MISS');
+  assert.equal(classifyUse(rec0, c1({ priorSign: true })), 'MISS', 'a prior sign beats the proof');
+  for (const check of ['C2', 'C3', 'connection', undefined]) assert.equal(classifyUse(rec0, c1({ check })), 'MISS', `${check} never changes`);
+  assert.equal(classifyUse(rec0, c1({ birth: null })), 'UNKNOWN', 'no identity stays UNKNOWN');
+  assert.equal(classifyUse(rec0, c1({ t: iso(T0_MS + 3 * HOUR) })), null, 'outside the window it is not an outcome');
+  assert.equal(classifyUse(rec0, c1({ birth: born(T0_MS) + 5 })), 'RESTART', 'born after is a RESTART as ever');
+});
+
+// The live shape, 2026-10-20: one container generation, two session-end would-stops, two sessions that leased the stack just
+// after each, and the legacy worker probe records written at +30 min by the installed code.
+const L_GEN = { id: '21ae0000-0000-4000-8000-000000000279', startedAt: '2026-10-20T02:51:51.546261985Z' };
+const L_NOW = Date.parse('2026-10-20T06:00:00Z');
+const L_P = 'autostop-live';
+const lStop = (t) => ({ t, source: 'session-end', project: L_P, generation: L_GEN, mode: 'report', action: 'would-stop', reasons: ['r'] });
+const sStop = (t) => ({ ...lStop(t), source: 'sweep' }); // a sweep-sourced would-stop has no observer: its CLEAN / RESTART rules are unchanged
+const lObs = (t, decidedAt) => ({ t, source: 'session-end', project: L_P, generation: L_GEN, action: 'observed', reasons: ['r'], decidedAt });
+const S1 = '2026-10-20T03:14:13.119Z';
+const S2 = '2026-10-20T03:16:22.749Z';
+const LIVE_DECS = [lStop(S1), lStop(S2), lObs('2026-10-20T05:14:13.119Z', S1), lObs('2026-10-20T05:16:22.749Z', S2)];
+const S_A = 'e51acd5e-a3c0-4e8d-81ac-b36d727d3abe';
+const S_B = '2f3b1ba8-1923-483d-a19d-75cb8b15a778';
+const lease = (t, pid, birth, sessionId, o = {}) => ({ t, project: L_P, pid, birth, check: 'C1', command: 'lease via Bash', sessionId, ledger: true, ...o });
+const liveLedger = () => [
+  lease('2026-10-20T03:14:48.267Z', 9705, 1792466041, S_A), lease('2026-10-20T03:15:36.847Z', 9705, 1792466041, S_A),
+  lease('2026-10-20T03:17:06.895Z', 72631, 1792466180, S_B), lease('2026-10-20T03:18:16.289Z', 72631, 1792466180, S_B),
+];
+const legacy = (t, pid, birth) => ({ t, project: L_P, pid, birth, check: 'C1', command: 'lease via Bash' });
+const liveLegacy = () => [legacy('2026-10-20T03:44:13.000Z', 9705, 1792466041), legacy('2026-10-20T03:46:22.000Z', 72631, 1792466180)];
+const COVER = { ok: true, repaired: false, firstT: '2026-10-20T01:00:00.000Z' };
+const withQuiet = (uses, targets) => uses.map((u) => ({ ...u, quiet: { decision: targets[u.pid === 9705 ? 0 : 1], verdict: 'quiet' } }));
+
+test('outcomeSummary (live shape): with quiet proofs and a complete ledger the two false MISSes are ONE RESTART row', () => {
+  const uses = [...withQuiet(liveLedger(), [S1, S2]), ...liveLegacy()];
+  const s = outcomeSummary(LIVE_DECS, uses, L_NOW, { ledgerCoverage: COVER });
+  assert.deepEqual([s.miss, s.unknown, s.restart, s.rows.length], [0, 0, 1, 1]);
+  assert.equal(s.rows[0].outcome, 'RESTART');
+  assert.equal(s.rows[0].uses.length, 4, 'the legacy duplicates are gone');
+  assert.ok(s.rows[0].uses.every((u) => u.class === 'RESTART' && /born before the would-stop, first use after it \(transcript quiet\)/.test(u.why)));
+});
+
+test('outcomeSummary (live shape): without the proofs it is MISS, exactly as before', () => {
+  const s = outcomeSummary(LIVE_DECS, [...liveLedger(), ...liveLegacy()], L_NOW, { ledgerCoverage: COVER });
+  assert.deepEqual([s.miss, s.restart, s.rows.length], [1, 0, 1]);
+  const none = outcomeSummary(LIVE_DECS, [...liveLedger(), ...liveLegacy()], L_NOW);
+  assert.equal(none.miss, 1);
+  assert.equal(none.rows[0].uses.length, 6, 'no coverage given: the legacy observations stay');
+});
+
+test('outcomeSummary (live shape): a proof for the other decision does not help', () => {
+  const uses = withQuiet(liveLedger(), [S2, S1]); // swapped
+  const s = outcomeSummary(LIVE_DECS, uses, L_NOW, { ledgerCoverage: COVER });
+  assert.equal(s.miss, 1);
+});
+
+test('outcomeSummary (live shape): a repaired ledger keeps the legacy 9705 observation, which has a prior sign => MISS', () => {
+  const uses = [...withQuiet(liveLedger(), [S1, S2]), ...withQuiet(liveLegacy(), [S2, S2])];
+  const s = outcomeSummary(LIVE_DECS, uses, L_NOW, { ledgerCoverage: { ...COVER, repaired: true } });
+  assert.equal(s.miss, 1);
+  const kept = s.rows[0].uses.filter((u) => u.class === 'MISS');
+  assert.deepEqual(kept.map((u) => [u.pid, u.against]), [[9705, S2]], 'charged to the later would-stop, with its earlier leases as the prior sign');
+});
+
+test('outcomeSummary (live shape): a ledger that began after the first would-stop, or an unread one, keeps the legacy observations => MISS', () => {
+  const uses = [...withQuiet(liveLedger(), [S1, S2]), ...withQuiet(liveLegacy(), [S2, S2])];
+  assert.equal(outcomeSummary(LIVE_DECS, uses, L_NOW, { ledgerCoverage: { ...COVER, firstT: '2026-10-20T03:14:30.000Z' } }).miss, 1);
+  assert.equal(outcomeSummary(LIVE_DECS, uses, L_NOW, { ledgerCoverage: { ...COVER, ok: false } }).miss, 1);
+  assert.equal(outcomeSummary(LIVE_DECS, uses, L_NOW, { ledgerCoverage: { ok: true, repaired: false, firstT: null } }).miss, 1);
+  assert.equal(outcomeSummary(LIVE_DECS, uses, L_NOW, { ledgerCoverage: undefined }).miss, 1);
+});
+
+test('outcomeSummary: a legacy observation with no session-end would-stop of its project in the 2 h 10 min before it stays', () => {
+  const far = legacy('2026-10-20T05:50:00.000Z', 9705, 1792466041); // > 2 h 10 min after S2, inside no window of its own
+  const s = outcomeSummary(LIVE_DECS, [far], L_NOW, { ledgerCoverage: COVER });
+  assert.equal(s.rows[0].uses.length, 0, 'out of every window: not an outcome (and not dropped for a wrong reason)');
+  const sweepStop = [{ ...lStop(S1), source: 'sweep' }, lObs('2026-10-20T05:14:13.119Z', S1)];
+  const near = legacy('2026-10-20T03:44:13.000Z', 9705, 1792466041);
+  const s2 = outcomeSummary(sweepStop, [near], L_NOW, { ledgerCoverage: COVER });
+  assert.equal(s2.miss, 1, 'only session-end stop records show the worker ran');
+});
+
+test('outcomeSummary (prior sign): an earlier lease by the same pid and birth, even before the decision, keeps the use a MISS', () => {
+  const early = lease('2026-10-20T03:10:00.000Z', 9705, 1792466041, S_A);
+  const first = lease('2026-10-20T03:14:48.267Z', 9705, 1792466041, S_A, { quiet: { decision: S1, verdict: 'quiet' } });
+  assert.equal(outcomeSummary([sStop(S1)], [early, first], L_NOW).miss, 1);
+  const other = outcomeSummary([sStop(S1)], [first], L_NOW);
+  assert.equal(other.restart, 1, 'the same use alone is a RESTART');
+});
+
+test('outcomeSummary (prior sign): the same pid with another birth (pid reuse) is not a prior sign', () => {
+  const reused = lease('2026-10-20T03:10:00.000Z', 9705, 1700000000, 'old-session');
+  const first = lease('2026-10-20T03:14:48.267Z', 9705, 1792466041, S_A, { quiet: { decision: S1, verdict: 'quiet' } });
+  const s = outcomeSummary([sStop(S1)], [reused, first], L_NOW);
+  assert.equal(s.rows[0].uses.find((u) => u.sessionId === S_A).class, 'RESTART');
+});
+
+test('outcomeSummary (prior sign): an earlier C2 observation of the same owner is a prior sign, whatever its source', () => {
+  const c2 = { t: '2026-10-20T03:13:00.000Z', project: L_P.toUpperCase(), pid: 9705, birth: 1792466041, check: 'C2' };
+  const first = lease('2026-10-20T03:14:48.267Z', 9705, 1792466041, S_A, { quiet: { decision: S1, verdict: 'quiet' } });
+  assert.equal(outcomeSummary([sStop(S1)], [c2, first], L_NOW).miss, 1);
+  const later = { ...c2, t: '2026-10-20T03:14:20.000Z' }; // after the decision: not a prior sign
+  assert.equal(outcomeSummary([sStop(S1)], [later, first], L_NOW).rows[0].uses.find((u) => u.check === 'C1').class, 'RESTART');
+});
+
+test('outcomeSummary: a C1 duplicate (ledger lease + worker observation of the same lease) is counted once, preferring the ledger one', () => {
+  const led = lease('2026-10-20T03:14:48.267Z', 9705, 1792466041, S_A);
+  const obs = { ...led, ledger: undefined, seenAt: '2026-10-20T03:44:13.000Z', command: 'lease via Bash' };
+  delete obs.ledger;
+  for (const order of [[led, obs], [obs, led]]) {
+    const s = outcomeSummary([sStop(S1)], order, L_NOW);
+    assert.equal(s.rows[0].uses.length, 1);
+    assert.equal(s.rows[0].uses[0].ledger, true);
+  }
+  // the duplicate must not make the lease its own prior sign
+  const withQ = { ...led, quiet: { decision: S1, verdict: 'quiet' } };
+  assert.equal(outcomeSummary([sStop(S1)], [withQ, obs], L_NOW).restart, 1);
+});
+
+test('quietCandidates: the C1 uses that are MISS only for want of a proof; none that have a prior sign, a quiet proof, no session or no identity', () => {
+  const c = quietCandidates(LIVE_DECS, [...liveLedger(), ...liveLegacy()], { ledgerCoverage: COVER });
+  assert.deepEqual(c.map((x) => [x.use.pid, x.use.t, x.decision.t]), [
+    [9705, '2026-10-20T03:14:48.267Z', S1], [9705, '2026-10-20T03:15:36.847Z', S1],
+    [72631, '2026-10-20T03:17:06.895Z', S2], [72631, '2026-10-20T03:18:16.289Z', S2],
+  ]);
+  assert.deepEqual([...new Set(c.map((x) => `${x.use.pid}|${x.decision.t}`))], [`9705|${S1}`, `72631|${S2}`], 'two (owner, decision) pairs need a transcript');
+  // a repaired ledger keeps the legacy 9705 observation (prior sign) => it is not a candidate
+  const kept = quietCandidates(LIVE_DECS, [...liveLedger(), ...liveLegacy()], { ledgerCoverage: { ...COVER, repaired: true } });
+  assert.ok(!kept.some((x) => !x.use.ledger && x.use.pid === 9705), 'a use with a prior sign needs no proof');
+  assert.ok(kept.some((x) => !x.use.ledger && x.use.pid === 72631) === false, 'legacy 72631 has no session id');
+  const early = lease('2026-10-20T03:10:00.000Z', 9705, 1792466041, S_A);
+  assert.deepEqual(quietCandidates(LIVE_DECS, [early, ...liveLedger()], {}).map((x) => x.use.pid), [72631, 72631], 'the 9705 uses have a prior sign');
+  assert.deepEqual(quietCandidates(LIVE_DECS, withQuiet(liveLedger(), [S1, S2]), {}), [], 'proofs already attached');
+  assert.deepEqual(quietCandidates(LIVE_DECS, [lease('2026-10-20T03:14:48.267Z', 9705, 1792466041, null)], {}), [], 'no session id');
+  assert.deepEqual(quietCandidates(LIVE_DECS, [lease('2026-10-20T03:14:48.267Z', 9705, null, S_A)], {}), [], 'no identity');
+  assert.deepEqual(quietCandidates(LIVE_DECS, [lease('2026-10-20T03:14:48.267Z', 9705, 1792466041 + 100, S_A)], {}), [], 'born after: a RESTART already');
+  assert.deepEqual(quietCandidates(LIVE_DECS, [{ ...lease('2026-10-20T03:14:48.267Z', 9705, 1792466041, S_A), check: 'C2' }], {}), [], 'C2 never');
+  assert.deepEqual(quietCandidates(LIVE_DECS, [lease('2026-10-20T08:00:00.000Z', 9705, 1792466041, S_A)], {}), [], 'outside the window');
+});
+
+test('renderReport / renderWeekly pass ledgerCoverage to the summary; a RESTART by the quiet rule says why', () => {
+  const uses = [...withQuiet(liveLedger(), [S1, S2]), ...liveLegacy()];
+  const state = { now: L_NOW, decisions: LIVE_DECS, uses, ledgerCoverage: COVER };
+  const r = renderReport(state);
+  assert.match(r, /MISS 0 \(must be 0 to switch on\)/);
+  assert.match(r, /RESTART 1/);
+  assert.match(r, /born before the would-stop, first use after it \(transcript quiet\)/);
+  assert.match(renderWeekly(state), /MISS 0 \(must be 0 to switch on\); RESTART 1/);
+  assert.match(renderReport({ ...state, ledgerCoverage: undefined }), /MISS 1/);
 });
