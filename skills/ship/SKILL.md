@@ -481,7 +481,7 @@ read the issue, link it in the PR body (`Closes #123`).
 | prod smoke fails | prod-watch handles rollback + issue + revert PR and pushes the owner; `summary` with its outcome word; tell the user. With `production.watch: workflow` there is no prod-watch: the workflow's PR comment is the record, nothing is rolled back and no production push is sent; tell the user |
 | pause/rollback issue open | PR stays open: `summary --outcome stopped --cause merge-paused --action "Close the pause/rollback issue"`, explain |
 | `plan approve` exit 1 `superseded` / `no-approval` | the owner has not approved THIS plan: re-show the active request (`reference/plan-stage.md`), wait |
-| `plan approve` exit 1 `plan-changed` / `unpushed` / `record-unreadable` | re-record and re-show (changed) / push (unpushed) / stop and tell the owner (unreadable run record) |
+| `plan approve` exit 1 `plan-changed` / `unpushed` / `record-unreadable` | re-record and re-show (changed) / push (unpushed) / unreadable run record: `P summary --pr N --outcome stopped --cause plan:record-unreadable --action "Check the PR's run record comment"` and tell the owner |
 | gate `plan-scope: lost` | the plan evidence is missing or edited: re-show the active request; the owner's new "approve" clears it |
 | `plan start` exit 1 `cap` | ask the owner for an extra (`--extra "<their words>"`) or to skip the review |
 | `plan start` / `plan review` exit 1 `already-started` | do NOT launch (the key is consumed); a new run needs a new key within the cap or an owner extra |
