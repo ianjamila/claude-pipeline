@@ -395,3 +395,30 @@ test('N4: record refuses an unreadable (legacy, invalid or foreign) run record a
     assert.equal(w.posts().length, 0, 'nothing posted');
   }
 });
+
+// ---- plan.dir ----------------------------------------------------------------------------------------------------------------
+
+test('record refuses a plan path outside config plan.dir (usage error, exit 2, nothing posted), via the real CLI', (t) => {
+  const w = setup(t);
+  const cli = (file) => spawnSync(process.execPath, [bin, 'plan', 'record', '--pr', '7', '--file', file], { cwd: w.repo.dir, env: { ...process.env, ...w.fake.env }, encoding: 'utf8' });
+  for (const file of ['notes/p.md', 'docs/plans-evil/p.md', 'p.md']) {
+    w.repo.write(file, planText().replace(`\`${REL}\``, `\`${file}\``));
+    w.headOid = w.repo.commit(`plan at ${file}`);
+    w.sync();
+    const r = cli(file);
+    assert.equal(r.status, 2, `${file}: ${r.stdout}${r.stderr}`);
+    assert.match(`${r.stdout}${r.stderr}`, /outside plan\.dir \(docs\/plans\)/);
+  }
+  assert.equal(w.posts().length, 0, 'nothing was posted');
+  assert.equal(cli(REL).status, 0, 'a path inside plan.dir still records');
+});
+
+test('record honours a configured plan.dir and refuses the default one then', async (t) => {
+  const w = setup(t, { yml: pipelineYml().replace('plan:\n', 'plan:\n  dir: plans/\n') });
+  w.repo.write('plans/q.md', planText().replace(`\`${REL}\``, '`plans/q.md`'));
+  w.headOid = w.repo.commit('plan in plans/');
+  w.sync();
+  await assert.rejects(() => w.call(['record', '--pr', '7', '--file', REL]), /outside plan\.dir \(plans\/\)/);
+  const r = await w.call(['record', '--pr', '7', '--file', 'plans/q.md']);
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+});

@@ -34,7 +34,7 @@ export const meta = {
   usage: [
     'pipeline plan record --pr N --file PATH [--request-file F] [--repo DIR]',
     '  -> {ok, blob, scopeDigest, path, scope, tasks:[{id,title,specSha}], requestLines, event:{id, reused}, warnings}; posts one plan-proposed event (none when this blob is already the active proposal) and checkpoints step plan',
-    '  -> exit 1 {error: dirty | unpushed | plan-invalid | record-unreadable} (the file must be committed and pushed, and parse as a plan that lists itself in its Scope), 3 GitHub unavailable',
+    '  -> exit 1 {error: dirty | unpushed | plan-invalid | record-unreadable} (the file must be committed and pushed, and parse as a plan that lists itself in its Scope), 2 usage (the file must sit under config plan.dir, default docs/plans; nothing is posted), 3 GitHub unavailable',
     '  -> show the owner requestLines VERBATIM (the first line, then the 📋 line) together with the plan\'s plain-English section and Scope list; the owner types "approve"',
     'pipeline plan approve --pr N [--repo DIR]',
     '  -> {ok, blob, scopeDigest, event:{id, reused}, stepChanged, repaired, warnings}; needs the owner\'s "approve" recorded by the owner-go hook for the active plan (24 h; an approval event already on the PR is repaired for 30 days); posts one plan-approved event, copies the approved tasks into the run record and moves a plan-stage (or stopped/blocked with open tasks) run to build',
@@ -117,10 +117,13 @@ async function record(argv, ctx) {
   intOption(values, 'pr', { required: true, min: 1 });
   const file = requireOption(values, 'file');
   const root = resolveRepo(values, ctx);
-  await requireConfig(root);
+  const { config } = await requireConfig(root);
   const abs = path.resolve(ctx.cwd ?? process.cwd(), file);
   const rel = path.relative(root, abs).split(path.sep).join('/');
   if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) throw new UsageError(`--file must be inside the repository (${file})`);
+  // The plan lives under config plan.dir: a plan anywhere else is refused before anything is read or posted.
+  const planDir = path.posix.normalize(config.plan.dir).replace(/\/+$/, '');
+  if (planDir !== '.' && !rel.startsWith(`${planDir}/`)) throw new UsageError(`--file ${rel} is outside plan.dir (${config.plan.dir}): write the plan there`);
   const request = values['request-file'] !== undefined ? readRequest(root, values['request-file']) : undefined;
 
   let blob;
