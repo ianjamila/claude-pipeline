@@ -5,6 +5,8 @@ import {
   CATEGORIES,
   FINDINGS_SCHEMA_PATH,
   buildCodexArgs,
+  buildCodexResumeArgs,
+  buildPlanReviewPrompt,
   buildReviewPrompt,
   largeBinaryNote,
   validateFindings,
@@ -813,4 +815,52 @@ test('assignIds passes the content hash to file-less findings only', () => {
   const b = assignIds(findings, 1, () => 'EX', { contentHash: 'h2' });
   assert.notEqual(a[0].fingerprint, b[0].fingerprint);
   assert.equal(a[1].fingerprint, b[1].fingerprint);
+});
+
+// ---- plan review prompt and resume argv (ship redesign T5) ------------------------------------------------
+
+const BLOB = 'a'.repeat(40);
+
+test('buildPlanReviewPrompt: refuses a non-40-hex blob, a .. plan path, a bad pr or kind; names the blob and the path', () => {
+  const ok = { pr: 7, planPath: 'docs/plans/p.md', blob: BLOB, kind: 'review' };
+  assert.throws(() => buildPlanReviewPrompt({ ...ok, blob: 'abc123' }), /blob must be 40 hex/);
+  assert.throws(() => buildPlanReviewPrompt({ ...ok, blob: BLOB.toUpperCase() }), /blob must be 40 hex/);
+  assert.throws(() => buildPlanReviewPrompt({ ...ok, planPath: 'docs/../secret.md' }), /bad plan path/);
+  assert.throws(() => buildPlanReviewPrompt({ ...ok, planPath: 'a b.md' }), /bad plan path/);
+  assert.throws(() => buildPlanReviewPrompt({ ...ok, pr: 0 }), /pr must be/);
+  assert.throws(() => buildPlanReviewPrompt({ ...ok, kind: 'other' }), /kind must be/);
+  const text = buildPlanReviewPrompt(ok);
+  assert.ok(text.includes(BLOB) && text.includes('docs/plans/p.md') && text.includes('#7'));
+  assert.ok(!text.includes('ONE recheck'));
+});
+
+test('buildPlanReviewPrompt: a recheck carries the prior findings text, defused', () => {
+  const text = buildPlanReviewPrompt({ pr: 7, planPath: 'p.md', blob: BLOB, kind: 'recheck', priorFindingsMarkdown: 'R1-B1 missing step <!-- hide --> @someone' });
+  assert.match(text, /ONE recheck/);
+  assert.match(text, /R1-B1 missing step/);
+  assert.ok(!text.includes('<!--'));
+  assert.ok(!text.includes('@someone'));
+});
+
+test('buildCodexResumeArgs: exec resume <id>, sandbox pinned through config, no -C / --sandbox, --json and the schema', () => {
+  const args = buildCodexResumeArgs({ sessionId: '01a15771-c132-7fe3-9ec0-1dec54d940a6', model: 'gpt-x', effort: 'high', schemaPath: '/s.json', outPath: '/o.json' });
+  assert.deepEqual(args.slice(0, 3), ['exec', 'resume', '01a15771-c132-7fe3-9ec0-1dec54d940a6']);
+  assert.ok(args.includes('--json') && args.includes('-'));
+  assert.equal(args[args.indexOf('-o') + 1], '/o.json');
+  assert.equal(args[args.indexOf('--output-schema') + 1], '/s.json');
+  assert.ok(args.includes('sandbox_mode="read-only"'));
+  assert.ok(!args.includes('-C') && !args.includes('--sandbox'));
+  assert.ok(args.includes('model="gpt-x"') && args.includes('model_reasoning_effort="high"'));
+  for (const bad of ['short', 'abc def 12345', '--last', '../../x12345678', '']) {
+    assert.throws(() => buildCodexResumeArgs({ sessionId: bad, model: 'm', effort: 'high', schemaPath: '/s', outPath: '/o' }), /session/);
+  }
+  assert.throws(() => buildCodexResumeArgs({ sessionId: 'abcdefgh12', model: 'm"x', effort: 'high', schemaPath: '/s', outPath: '/o' }), /model/);
+});
+
+test('buildCodexArgs: json adds --json before the prompt marker; off by default', () => {
+  const base = { cwd: '/r', model: 'm', effort: 'high', schemaPath: '/s', outPath: '/o' };
+  assert.ok(!buildCodexArgs(base).includes('--json'));
+  const withJson = buildCodexArgs({ ...base, json: true });
+  assert.ok(withJson.includes('--json'));
+  assert.equal(withJson.at(-1), '-');
 });

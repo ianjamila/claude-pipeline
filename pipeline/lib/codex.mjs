@@ -36,7 +36,7 @@ const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 // ---------- argv ----------
 
 // model and effort are spliced into TOML values (-c key="value"), so reject anything that could escape the quotes.
-export function buildCodexArgs({ cwd, model, effort, schemaPath, outPath }) {
+export function buildCodexArgs({ cwd, model, effort, schemaPath, outPath, json = false }) {
   if (!EFFORTS.includes(effort)) throw new Error(`invalid effort ${JSON.stringify(effort)}: expected one of ${EFFORTS.join('|')}`);
   if (typeof model !== 'string' || !MODEL_RE.test(model)) throw new Error(`invalid model ${JSON.stringify(model)}: expected ${MODEL_RE}`);
   for (const [name, value] of [['cwd', cwd], ['schemaPath', schemaPath], ['outPath', outPath]]) {
@@ -44,7 +44,27 @@ export function buildCodexArgs({ cwd, model, effort, schemaPath, outPath }) {
   }
   return [
     'exec', '--sandbox', 'read-only', '--color', 'never', '--skip-git-repo-check',
+    ...(json ? ['--json'] : []),
     '-C', cwd, '-o', outPath, '--output-schema', schemaPath,
+    '-c', `model="${model}"`, '-c', `model_reasoning_effort="${effort}"`,
+    '-', // prompt arrives on stdin
+  ];
+}
+
+// `codex exec resume` takes neither -C nor --sandbox: the spawn cwd carries the repo and the sandbox is re-pinned through the config
+// key (verified on codex-cli 0.154: it does take --json, -o and --output-schema). The session id is spliced into argv, so only
+// the plain ids Codex prints are accepted (no leading "-": it could not be read as an option).
+const SESSION_RE = /^[A-Za-z0-9_-]{8,}$/;
+export function buildCodexResumeArgs({ sessionId, model, effort, schemaPath, outPath }) {
+  if (!SESSION_RE.test(String(sessionId)) || String(sessionId).startsWith('-')) throw new Error('invalid session id: expected /^[A-Za-z0-9_-]{8,}$/ not starting with "-"');
+  if (!EFFORTS.includes(effort)) throw new Error(`invalid effort ${JSON.stringify(effort)}: expected one of ${EFFORTS.join('|')}`);
+  if (typeof model !== 'string' || !MODEL_RE.test(model)) throw new Error(`invalid model ${JSON.stringify(model)}: expected ${MODEL_RE}`);
+  for (const [name, value] of [['schemaPath', schemaPath], ['outPath', outPath]]) {
+    if (!nonEmptyString(value)) throw new Error(`${name} is required`);
+  }
+  return [
+    'exec', 'resume', sessionId, '-c', 'sandbox_mode="read-only"', '--json',
+    '-o', outPath, '--output-schema', schemaPath,
     '-c', `model="${model}"`, '-c', `model_reasoning_effort="${effort}"`,
     '-', // prompt arrives on stdin
   ];
@@ -139,6 +159,22 @@ export function buildReviewPrompt({ pr, title, body, base, head, risk, round, li
     if (omitted > 0) lines.push(`(${omitted} earlier rulings omitted)`);
   }
   return lines.join('\n') + '\n';
+}
+
+// The prompt for a PLAN review (ship redesign): the reviewer reads the plan file and the repository, not a diff. Everything that is
+// spliced into the text is checked first: the pr is a number, the blob is 40 hex, the path is a plain repository-relative path.
+export function buildPlanReviewPrompt({ pr, planPath, blob, kind, priorFindingsMarkdown = '' }) {
+  if (!Number.isInteger(pr) || pr <= 0) throw new Error('pr must be a positive integer');
+  if (!/^[0-9a-f]{40}$/.test(String(blob))) throw new Error('blob must be 40 hex');
+  if (!/^[A-Za-z0-9._/-]+$/.test(String(planPath)) || String(planPath).split('/').includes('..')) throw new Error('bad plan path');
+  if (kind !== 'review' && kind !== 'recheck') throw new Error('kind must be review|recheck');
+  return [
+    `You are reviewing an IMPLEMENTATION PLAN for pull request #${pr}, not a diff. The plan is the file ${planPath} (git blob ${blob}); read it, then read the repository code it changes (read-only).`,
+    'Find what would make the plan fail its own goal or the spec it cites: missing requirements, wrong file/function names, steps that contradict the code, unsafe orderings, missing tests, placeholders.',
+    'BLOCKING = following the plan as written would ship a bug, a security/approval hole, or break an existing invariant. SUGGESTIONS = concrete improvements. WORTH_CONSIDERING = optional.',
+    'Each finding: title, file (the plan path or the code file), line (0 if none), category, detail, reasoning, testable. Answer with JSON matching the schema.',
+    ...(kind === 'recheck' ? ['This is the ONE recheck. Your earlier findings are below; say for each whether the revised plan resolves it, and report only unresolved or new problems.', '', defuseMarkdown(priorFindingsMarkdown)] : []),
+  ].join('\n') + '\n';
 }
 
 // ---------- findings validation ----------

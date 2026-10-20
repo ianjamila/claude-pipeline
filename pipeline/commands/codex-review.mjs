@@ -12,20 +12,19 @@
 // such a merge is recorded as `baseOnly` without running Codex. The state is
 // read-modified-written under the per-PR lock, but the lock is NOT held while Codex runs (up to 30 minutes): the
 // state is read again under the lock once Codex has answered, and a round recorded in the meantime wins.
-import { existsSync, readFileSync, rmSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import {
-  FINDINGS_SCHEMA_PATH, assignIds, buildCodexArgs, buildReviewPrompt, classifyCodexFailure, largeBinaryNote, renderFindingsMarkdown,
-  validateFindings,
+  FINDINGS_SCHEMA_PATH, assignIds, buildCodexArgs, buildReviewPrompt, largeBinaryNote, renderFindingsMarkdown,
 } from '../lib/codex.mjs';
+import { CODEX_TIMEOUT_MS, askCodex } from '../lib/codex-run.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import {
   GitError, NETWORK_TIMEOUT_MS, diffFiles, effectiveReviewBase, git, headSha, mergeBase, reviewPatch, revParse, showFile,
 } from '../lib/git.mjs';
 import { collectHardStops } from '../lib/hardstops.mjs';
 import { createGitHub } from '../lib/github.mjs';
-import { GhError, codexCommand, runAsync } from '../lib/proc.mjs';
+import { GhError } from '../lib/proc.mjs';
 import { assessRisk, isLightLane } from '../lib/risk.mjs';
 import { addRound, emptyState, loadState, saveState } from '../lib/state.mjs';
 import { reuseRuled, ruledCacheFrom } from '../lib/triage.mjs';
@@ -48,16 +47,7 @@ export const meta = {
   ].join('\n'),
 };
 
-export const CODEX_TIMEOUT_MS = 30 * 60 * 1000;
-// A file system may round mtimes down (1-2 s on some); the file was unlinked before the run, so this only has to
-// tell "written during this run" from "left over from long ago".
-const MTIME_SLACK_MS = 2000;
-const DETAIL_CHARS = 1000;
-
-const tail = (s) => {
-  const text = String(s ?? '').trim();
-  return text.length > DETAIL_CHARS ? text.slice(-DETAIL_CHARS) : text;
-};
+export { CODEX_TIMEOUT_MS };
 
 const unavailable = (reason, extra = {}) => new Fail(EXIT.UNAVAILABLE, { ok: false, unavailable: true, reason, ...extra });
 
@@ -208,42 +198,17 @@ export const run = guarded(async (argv, ctx) => {
 
   const headMoved = () => new Fail(EXIT.USAGE, { ok: false, error: 'head-moved', message: 'HEAD moved while Codex was reviewing; run the round again' });
   // Runs Codex over the prepared prompt and returns its validated findings (every failure is an exit-3 Fail).
-  const askCodex = async () => {
-    // Whatever is at the output path now was not written by this run; remove it so it can never be read as this
-    // run's answer. (The mtime check below is the second line of defence, the tree kill on timeout the third.)
-    rmSync(outPath, { force: true });
-    const startedAt = Date.now();
-    const { cmd, prefixArgs } = codexCommand(ctx.env);
-    const timeoutMs = Number(ctx.env?.PIPELINE_CODEX_TIMEOUT_MS) || CODEX_TIMEOUT_MS;
-    // On a timeout the whole process tree is killed, so a helper Codex started cannot write its answer afterwards.
-    const r = await runAsync(cmd, [...prefixArgs, ...args], { cwd: root, env: ctx.env, input: prompt, timeoutMs });
-    // A spawn failure is reported as stderr "spawn <cmd> ENOENT"; classify it as the missing binary it is.
-    const spawnError = /^spawn(?:Sync)? .*\bENOENT\b/.test(r.stderr) ? { code: 'ENOENT', message: r.stderr } : undefined;
-    if (r.code !== 0 || r.timedOut) {
-      rmSync(outPath, { force: true });
-      const reason = classifyCodexFailure({ code: r.code, stderr: r.stderr, stdout: r.stdout, timedOut: r.timedOut, spawnError });
-      throw unavailable(reason, { code: r.code, timedOut: r.timedOut, detail: tail(r.stderr || r.stdout) });
+  const askRound = async () => {
+    const r = await askCodex({ root, args, prompt, outPath, env: ctx.env, afterRun: () => { if (headSha(o) !== head) throw headMoved(); } });
+    if (!r.ok) {
+      throw unavailable(r.reason, r.reason === 'malformed' ? { errors: r.errors } : { code: r.code, timedOut: r.timedOut, detail: r.detail });
     }
-
-    if (headSha(o) !== head) throw headMoved();
-
-    let findings;
-    try {
-      if (!existsSync(outPath)) throw new Error('codex exited 0 but wrote no output file');
-      if (statSync(outPath).mtimeMs < startedAt - MTIME_SLACK_MS) throw new Error('codex output file predates this run');
-      findings = JSON.parse(readFileSync(outPath, 'utf8'));
-    } catch (err) {
-      throw unavailable('malformed', { errors: [err.message] });
-    }
-    const checked = validateFindings(findings);
-    if (!checked.ok) throw unavailable('malformed', { errors: checked.errors });
-
-    return findings;
+    return r.findings;
   };
   // A base-merge-only round has nothing to ask about: zero findings, and the round says why.
   const findings = baseOnly
     ? { summary: 'Only the base branch was merged in since the previous round; Codex was not run.', blocking: [], suggestions: [], worth_considering: [] }
-    : await askCodex();
+    : await askRound();
 
   const fileCache = new Map();
   const excerptFor = (file, line) => {
