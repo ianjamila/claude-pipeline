@@ -21,6 +21,11 @@ const FENCE_CLOSE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
 const HTML_COMMENT = /<!--/;
 const CODE_SPAN = /(`+)(?:(?!\1)[^])+?\1/g;
 const HTML_TAG_LINE = /^\s*(?:<\/?[A-Za-z][A-Za-z0-9-]*(?:[\s/>]|$)|<!)/;
+// A link reference definition renders as nothing, but its title text would still reach the implementers.
+const LINK_DEF = /^\s{0,3}\[[^\]]+\]:\s*\S/;
+// Characters that reorder or hide text, plus C0/C1 controls other than tab and newline (\r is normalised away first).
+// A BOM at offset 0 is stripped instead of refused.
+const INVISIBLE = /[\u202A-\u202E\u2066-\u2069\u200E\u200F\u061C\u200B-\u200D\u2060\uFEFF\u00AD\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/gu;
 // Scope must also be a flat list: no blockquoted or nested items.
 const QUOTED_ITEM = /^\s*>[\s>]*[-*+]\s+`/;
 const NESTED_ITEM = /^(?: {2,}|\t)\s*[-*+]\s+`/;
@@ -83,10 +88,12 @@ export function scopeProblem(e) {
 export function parsePlan(text, { path: ownPath } = {}) {
   if (typeof text !== 'string') throw new PlanError(['the plan is not text']);
   if (Buffer.byteLength(text) > MAX_PLAN_BYTES) throw new PlanError([`the plan is larger than ${MAX_PLAN_BYTES} bytes`]);
-  const lines = text.replace(/\r\n?/g, '\n').split('\n');
+  const lines = text.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').split('\n');
   const mask = fenceMask(lines);
   const problems = [];
   lines.forEach((l, i) => {
+    for (const ch of new Set(l.match(INVISIBLE) ?? [])) problems.push(`invisible character U+${ch.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')} at line ${i + 1}`);
+    if (!mask[i] && LINK_DEF.test(l)) problems.push(`link reference definition at line ${i + 1} is hidden when rendered`);
     if (!mask[i] && (HTML_COMMENT.test(l.replace(CODE_SPAN, '')) || HTML_TAG_LINE.test(l))) {
       problems.push(`raw HTML/comment at line ${i + 1} is hidden when rendered: write it as text or inside a code block`);
     }

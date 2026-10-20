@@ -163,3 +163,36 @@ test('a second unmasked "## Scope" or "## In plain English" section is refused',
   // a duplicate inside a fence is masked, so it is fine
   assert.ok(parsePlan(PLAN.replace('b works', 'b works\n```\n## Scope\n## In plain English\n```')));
 });
+
+test('invisible and reordering characters are refused anywhere, fences included, naming the line and code point', () => {
+  const cases = {
+    rloInScopeEntry: [withScope('- `src/‮evil.mjs`'), 'U+202E'],
+    zwspInTask: [PLAN.replace('b works', 'b wor​ks'), 'U+200B'],
+    zwspInFence: [PLAN + '```\nhid​den\n```\n', 'U+200B'],
+    isolate: [PLAN.replace('b works', 'b ⁦works'), 'U+2066'],
+    lrm: [PLAN.replace('b works', 'b ‎works'), 'U+200E'],
+    alm: [PLAN.replace('b works', 'b ؜works'), 'U+061C'],
+    wordJoiner: [PLAN.replace('b works', 'b ⁠works'), 'U+2060'],
+    softHyphen: [PLAN.replace('b works', 'b wor­ks'), 'U+00AD'],
+    midBom: [PLAN.replace('b works', 'b ﻿works'), 'U+FEFF'],
+    c0: [PLAN.replace('b works', 'b \u0007works'), 'U+0007'],
+    c1: [PLAN.replace('b works', 'b \u0085works'), 'U+0085'],
+    del: [PLAN.replace('b works', 'b \u007Fworks'), 'U+007F'],
+  };
+  for (const [name, [text, cp]] of Object.entries(cases)) {
+    const line = text.split('\n').findIndex((l) => l.includes(String.fromCodePoint(parseInt(cp.slice(2), 16)))) + 1;
+    assert.throws(() => parsePlan(text), (e) => e instanceof PlanError && e.problems.includes(`invisible character ${cp} at line ${line}`), name);
+  }
+  // tab, newline and CRLF stay fine; a leading BOM is stripped, not refused
+  assert.ok(parsePlan(PLAN.replace('b works', 'b\tworks')));
+  assert.deepEqual(parsePlan(`﻿${PLAN}`).scope, SCOPE_OK);
+  // every offending line is listed
+  assert.throws(() => parsePlan(PLAN.replace('a works.', 'a​ works.').replace('b works', 'b‌ works')), (e) => e.problems.filter((p) => p.startsWith('invisible character')).length === 2);
+});
+
+test('link reference definitions outside fences are refused; inline links and fenced definitions are fine', () => {
+  assert.throws(() => parsePlan(PLAN.replace('b works', 'b works\n[x]: /u "hidden"')), (e) => e instanceof PlanError && /link reference definition at line \d+ is hidden when rendered/.test(e.message));
+  assert.throws(() => parsePlan(PLAN.replace('b works', 'b works\n   [Ref one]:\t<http://x> \'t\'')), /link reference definition at line/);
+  assert.ok(parsePlan(PLAN.replace('b works', 'b [x](/u) works\n[not a def] text')));
+  assert.ok(parsePlan(PLAN.replace('b works', 'b works\n```\n[x]: /u "hidden"\n```')));
+});
