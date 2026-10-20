@@ -238,7 +238,8 @@ export function recordApproval(input, { home = accountHome(), now = Date.now } =
       // PRs the owner approved for a direct merge: those the reply asked about (narrowed by the prompt), plus any the prompt names
       const prs = [...new Set([...shown.prs.filter(wanted), ...a.prs])];
       // "merge" releases the stops of a reply that offered a merge (its 🔀 last line), for the PRs the prompt allows
-      const releases = stops.ending === 'merge' ? stops.stops.filter((s) => wanted(s.pr)) : [];
+      // (the same head filter as the approval: "merge <sha>" naming a head the request does not show releases nothing for that PR)
+      const releases = stops.ending === 'merge' ? stops.stops.filter((s) => wanted(s.pr) && (a.shas.length === 0 || requests.some((r) => r.pr === s.pr))) : [];
       record = { v: 1, kind: 'approve', ts: new Date(now()).toISOString(), session, prompt_sha256: createHash('sha256').update(String(input.prompt)).digest('hex'), cwd: typeof input.cwd === 'string' ? input.cwd : null, prs, requests, releases };
     } else {
       // "resume N" releases the stops of a reply that ended with either last line, for the PRs it names, and approves NO merge.
@@ -301,13 +302,15 @@ export function readApprovals({ home = accountHome(), session = null, now = Date
       if (r?.v !== 1 || `${r.session}.jsonl` !== name) continue;
       const at = Date.parse(r.ts);
       if (!Number.isFinite(at) || at > t + FUTURE_SKEW_MS || t - at > maxAgeMs) continue;
+      // Only the two kinds the recorder writes: a record of any other kind approves nothing, and a "resume" record never carries a merge request.
+      if (r.kind !== 'approve' && r.kind !== 'resume') continue;
       out.push({
         ts: r.ts,
         session: r.session,
-        kind: r.kind === 'resume' ? 'resume' : 'approve', // ('approve' = the owner typed "merge"; releaseRef.kind says 'merge')
+        kind: r.kind, // ('approve' = the owner typed "merge"; releaseRef.kind says 'merge')
         prompt_sha256: typeof r.prompt_sha256 === 'string' ? r.prompt_sha256 : null,
         prs: Array.isArray(r.prs) ? r.prs.filter(Number.isInteger) : [],
-        requests: Array.isArray(r.requests) ? r.requests.filter((q) => Number.isInteger(q?.pr) && typeof q.head === 'string' && typeof q.items === 'string') : [],
+        requests: r.kind === 'approve' && Array.isArray(r.requests) ? r.requests.filter((q) => Number.isInteger(q?.pr) && typeof q.head === 'string' && typeof q.items === 'string') : [],
         releases: Array.isArray(r.releases) ? r.releases.filter((x) => Number.isInteger(x?.pr) && /^[0-9a-f]{8}$/.test(String(x.stop))).map((x) => ({ pr: x.pr, stop: String(x.stop) })) : [],
       });
     }
@@ -316,12 +319,13 @@ export function readApprovals({ home = accountHome(), session = null, now = Date
 }
 
 // P merge: did the owner say "merge" for exactly this PR, this full head and this owner-item set (any session, last 24 h)?
-// `stop` (the PR's newest owner-stop id, when it has ever had a stop): the request the owner answered must also have listed that id on a
-// `Stopped #N · stop <id>` line, so an approval given before the stop (its request carried no id) can never be replayed after it.
+// `stop` (an id, or a list of ids: the PR's newest owner-stop id and every open one, when it has ever had a stop): the request the owner answered must
+// also have listed EVERY one of them on a `Stopped #N · stop <id>` line, so an approval given before the stop (its request carried no id) can never be replayed after it.
 export function approvedRequest({ pr, head, items, stop = null, ...opts }) {
   if (!/^[0-9a-f]{40}$/.test(String(head)) || typeof items !== 'string') return false;
+  const need = [...new Set([].concat(stop ?? []).map(String))];
   return readApprovals(opts).some((r) => r.requests.some((q) => q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head) && q.items === items
-    && (stop === null || (Array.isArray(q.stops) && q.stops.includes(stop)))));
+    && need.every((id) => Array.isArray(q.stops) && q.stops.includes(id))));
 }
 
 // `P checkpoint --resumed`: did the owner release THIS stop of THIS PR (a typed `ship resume N`, or `merge` after a reply that offered it), any session,

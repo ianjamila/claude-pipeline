@@ -12,7 +12,8 @@ import { createGitHub, guardGh } from '../lib/github.mjs';
 import { headSha } from '../lib/git.mjs';
 import { currentProduction } from '../lib/deploy.mjs';
 import { envWithGhDir, runShellAsync } from '../lib/proc.mjs';
-import { newestStopId, postEvent, readEvents } from '../lib/run-events.mjs';
+import { newestStopId, openOwnerStops, postEvent, readEvents } from '../lib/run-events.mjs';
+import { flushPendingStops } from '../lib/owner-stop.mjs';
 import { proofLine } from '../lib/run-record.mjs';
 import { readSummaryComment } from '../lib/summary-comment.mjs';
 import { createRunRecorder, inFlightSince } from '../lib/run-progress.mjs';
@@ -59,13 +60,22 @@ export const run = guarded(async (argv, ctx) => {
     if (refusals.length > 0) return refuse('gate', refusals);
 
     // 1.5 Owner stops (chat mode): a release event marks the run as resumed, and the owner's "merge" must have been given to a request that carried the PR's
-    // NEWEST stop id (no stop at all = no requirement, so label mode and untouched PRs behave as before). A failed read refuses: it may hide a stop.
+    // NEWEST stop id and every OPEN one (no stop at all = no requirement, so label mode and untouched PRs behave as before). A stop that is still open (no
+    // owner release) blocks the merge unless the owner's "merge" answered a request that listed it; a stop held on this machine that has not reached GitHub blocks it
+    // outright. A failed read refuses: it may hide a stop.
     let stopId = null;
+    let openIds = [];
     let anyRelease = false;
     if (config.owner_approval === 'chat') {
       try {
+        const flushed = await flushPendingStops({ gh, pr, root, deps: ctx.ownerStopDeps });
+        if (flushed.remaining.length > 0) {
+          const reason = `owner stop ${flushed.remaining.map((r) => r.id ?? '?').join(', ')} has not reached GitHub yet (${flushed.remaining[0].why}): nothing is merged`;
+          return refuse('pre-merge', [reason], { reason });
+        }
         const events = readEvents(gh, pr);
         stopId = newestStopId(events);
+        openIds = openOwnerStops(events).map((e) => String(e.id));
         anyRelease = events.some((e) => e.kind === 'owner-stop-released');
       } catch (err) {
         const reason = `owner stops could not be read from GitHub (${String(err?.message ?? err).slice(0, 160)}): nothing is merged`;
@@ -85,9 +95,9 @@ export const run = guarded(async (argv, ctx) => {
       if (values['owner-approved-head'] !== gate.head || !/^[0-9a-f]{40}$/.test(gate.head)) approvalProblem = '--owner-approved-head is not the gate head';
       else if (typeof gate.ownerItems !== 'string') approvalProblem = 'the gate file names no owner-item set (written by an older final-gate): run final-gate again';
       else if (values['owner-approved-items'] !== gate.ownerItems) approvalProblem = `--owner-approved-items is not the gate's owner-item set (${gate.ownerItems})`;
-      else if (!approvedRequest({ pr, head: gate.head, items: gate.ownerItems, stop: stopId })) {
+      else if (!approvedRequest({ pr, head: gate.head, items: gate.ownerItems, stop: [...new Set([stopId, ...openIds].filter(Boolean))] })) {
         approvalProblem = stopId
-          ? `no owner "merge" is recorded for #${pr} head ${gate.head.slice(0, 12)} items ${gate.ownerItems} that carries the newest owner stop ${stopId}: show the request with its \`Stopped #${pr} · stop ${stopId}\` line above the Head line and wait for the owner to type "merge"`
+          ? `no owner "merge" is recorded for #${pr} head ${gate.head.slice(0, 12)} items ${gate.ownerItems} that carries the owner stop(s) ${[...new Set([stopId, ...openIds])].join(', ')}: show the request with a \`Stopped #${pr} · stop <id>\` line for each of them above the Head line and wait for the owner to type "merge"`
           : `no owner "merge" is recorded for #${pr} head ${gate.head.slice(0, 12)} items ${gate.ownerItems}: show the request (Owner-merge approval in the ship skill) and wait for the owner to type "merge"`;
       }
     }
@@ -102,6 +112,10 @@ export const run = guarded(async (argv, ctx) => {
       unchecked = `the run record could not be read (${String(err?.message ?? err).slice(0, 200)})`;
     }
     if (!ownerApproved) {
+      if (openIds.length > 0) {
+        const reason = withProblem(`owner stop ${openIds.join(', ')} is open on #${pr}: only the owner's reply releases it (\`ship resume ${pr}\`, or "merge" when offered, then pass ${APPROVAL_FLAGS})`);
+        return refuse('pre-merge', [reason], { reason });
+      }
       if ((existing?.status === 'ok' && existing.record.resumed) || anyRelease) {
         const reason = withProblem(`resumed run: the owner must say "merge" for this exact head (then pass ${APPROVAL_FLAGS})`);
         return refuse('pre-merge', [reason], { reason });

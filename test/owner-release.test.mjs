@@ -173,3 +173,32 @@ test('final-gate prints the newest stop id in chat mode (null with none); label 
   assert.deepEqual(s.gate().json.stop, { id: S2 });
   assert.equal(withStops(ymlFor(), stopComment(S1)).gate().json.stop, undefined);
 });
+
+// ---- P merge on a PR with an OPEN owner stop (the label no longer blocks it in chat mode) ---------------------------------------------------
+const S5 = '3333cccc';
+const S6 = '4444dddd';
+
+test('an open owner stop blocks P merge even for a low-risk head with no owner items and no release', () => {
+  const s = withStops(chatYml(), stopComment(S5));
+  assertExit(s.gate(), 0);
+  const r = merge(s);
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'pre-merge');
+  assert.match(r.json.reason, new RegExp(`open owner stop.*${S5}|${S5}.*open`, 's'));
+  assert.deepEqual(s.mergeCalls(), []);
+});
+
+test('several open stops: the owner\'s "merge" must have been given to a request that carried EVERY open id, not just the newest', (t) => {
+  const s = withStops(chatYml(), stopComment(S5), stopComment(S6));
+  assertExit(s.gate(), 0);
+  const items = s.gateFile().ownerItems;
+  ownerSays(t, 'merge', stopReply(PR, S6, { merge: { head: s.head, items } })); // the reply listed only the newest id
+  const r = merge(s, approvalFlags(s.head, items));
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'pre-merge');
+  assert.match(r.json.reason, new RegExp(S5));
+  assert.deepEqual(s.mergeCalls(), []);
+  ownerSays(t, 'merge', stopReply(PR, [S5, S6], { merge: { head: s.head, items } }));
+  assertExit(merge(s, approvalFlags(s.head, items)), 0);
+  assert.equal(s.mergeCalls().length, 1);
+});
