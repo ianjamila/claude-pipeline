@@ -867,6 +867,30 @@ test('smoke bypass: the value never appears in the serialized result (pass, fail
   }
 });
 
+test('smoke bypass: redactJson scrubs string values only, so a key like true/1/" neither corrupts the JSON nor leaks', async () => {
+  const { redactJson } = await importVendored((await project()).dir, 'smoke');
+  const result = { ok: true, status: 200, bypassHeader: true, checks: [{ path: '/', ok: false, status: 429, reason: 'got true and 1' }] };
+  for (const key of ['true', '1', '200']) {
+    const parsed = JSON.parse(redactJson(result, key));
+    assert.equal(parsed.ok, true, key);
+    assert.equal(parsed.status, 200, key);
+    assert.equal(parsed.bypassHeader, true, key);
+    assert.equal(parsed.checks[0].ok, false, key);
+    assert.equal(parsed.checks[0].status, 429, key);
+  }
+  assert.equal(JSON.parse(redactJson(result, 'true')).checks[0].reason, 'got [redacted] and 1');
+  // a key with JSON-special characters: the escaped form in serialized text would have dodged a text-level replace
+  for (const key of ['a"b', 'a\\b', '"']) {
+    const echoed = { ok: false, checks: [{ reason: `server echoed ${key} back`, vercelId: `iad1::${key}` }] };
+    const parsed = JSON.parse(redactJson(echoed, key));
+    assert.equal(parsed.checks[0].reason, 'server echoed [redacted] back', key);
+    assert.equal(parsed.checks[0].vercelId, 'iad1::[redacted]', key);
+  }
+  // empty / whitespace / missing secret: output unchanged
+  assert.equal(redactJson(result, '  '), JSON.stringify(result, null, 2));
+  assert.equal(redactJson(result, undefined), JSON.stringify(result, null, 2));
+});
+
 test('smoke bypass: a value that is not a legal header value is a usage error that does not quote it', async () => {
   const { runSmoke, SmokeUsageError } = await importVendored((await project()).dir, 'smoke');
   const bad = 'sk live\nsecret-bit';

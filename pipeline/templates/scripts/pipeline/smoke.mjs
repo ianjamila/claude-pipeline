@@ -193,13 +193,16 @@ export async function runSmoke(options, deps = {}) {
   return { ok, base, production: Boolean(options.production), bypassHeader, checks: results, expectText: expect };
 }
 
+// Serialize for output with the secret blanked out of every string VALUE (keys are fixed code names). Scrubbing the serialized
+// text instead would corrupt the JSON for a key like `true`/`1`/`"` and miss a key JSON escapes (`"`, `\`).
+export function redactJson(obj, secret) {
+  const s = typeof secret === 'string' ? secret.trim() : '';
+  return JSON.stringify(obj, s ? (k, v) => (typeof v === 'string' ? v.split(s).join('[redacted]') : v) : undefined, 2);
+}
+
 export async function main(argv = process.argv.slice(2), { env = process.env, cwd = process.cwd(), deps = {} } = {}) {
   // Defence in depth: whatever is printed (a result field not scrubbed per field, an error message) never carries the bypass value.
-  const secret = typeof env.PIPELINE_SMOKE_BYPASS_KEY === 'string' ? env.PIPELINE_SMOKE_BYPASS_KEY.trim() : '';
-  const out = (obj) => {
-    const text = JSON.stringify(obj, null, 2);
-    process.stdout.write(`${secret ? text.split(secret).join('[redacted]') : text}\n`);
-  };
+  const out = (obj) => process.stdout.write(`${redactJson(obj, env.PIPELINE_SMOKE_BYPASS_KEY)}\n`);
   try {
     const { values } = parseArgs({
       args: argv,
