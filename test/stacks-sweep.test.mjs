@@ -617,6 +617,8 @@ test('ledgerUses attributes events by project, else by the stack folder; current
   ];
   const uses = ledgerUses(events, [stack]);
   assert.deepEqual(uses.map((u) => `${u.project}:${u.pid}`), ['alpha:1', 'alpha:1', 'alpha:2']);
+  assert.ok(uses.every((u) => u.ledger === true && u.sessionId === null), 'ledger uses are marked and carry the event session id (null here)');
+  assert.equal(ledgerUses([{ t: '2026-10-19T10:00:00.000Z', kind: 'use', owner: { pid: 1, birth: 10 }, project: 'alpha', session_id: 'sess-1' }])[0].sessionId, 'sess-1');
   const isAlive = (o) => (o.pid === 1 ? ok(true) : o.pid === 2 ? unknown('ps timed out') : ok(false));
   const leases = currentLeases(events, { stacks: [stack], isAlive });
   assert.deepEqual(leases.map((l) => [l.project, l.owner.pid, l.alive, l.since, l.last]), [
@@ -650,5 +652,97 @@ test('a sweep never records a registered session-end worker (or itself) as a use
     assert.deepEqual(m.actions().filter((d) => d.action === 'use-observed').map((d) => d.use.pid), [777]);
     assert.equal(r.outcomes.miss, 1);
     assert.ok(excluded.has(9001) && excluded.has(process.pid));
+  });
+});
+
+// ======================================================================= owner quiet proof (born-before C1 leases)
+
+const SID = '2f3b1ba8-1923-483d-a19d-75cb8b15a778';
+// A session-end would-stop 90 min before T0, and an owner born a minute before it that leased the stack 10 and 20 min after it.
+async function quietWorld(m, { leases = 2, legacyObservation = false } = {}) {
+  const orphan = m.spec('orphan-demo');
+  const decidedAt = T0 - 90 * 60_000;
+  const gen = { id: orphan.id, startedAt: orphan.startedAt };
+  const owner = { pid: 4300, birth: Math.floor((decidedAt - 60_000) / 1000) };
+  await m.lease({ pid: 4999, birth: Math.floor((decidedAt - 3_600_000) / 1000) }, 'orphan-demo', { t: new Date(decidedAt - 30 * 60_000).toISOString() }); // the ledger began before the decision
+  await appendDecision(m.files.actions, { t: new Date(decidedAt).toISOString(), source: 'session-end', project: 'orphan-demo', generation: gen, mode: 'report', action: 'would-stop', reasons: ['x'], evidence: {} });
+  for (let i = 0; i < leases; i++) await m.lease(owner, 'orphan-demo', { t: new Date(decidedAt + (10 + 10 * i) * 60_000).toISOString(), session_id: SID });
+  if (legacyObservation) {
+    await appendDecision(m.files.actions, {
+      t: new Date(decidedAt + 30 * 60_000).toISOString(), source: 'session-end', project: 'orphan-demo', generation: gen, action: 'use-observed', reasons: ['C1'],
+      use: { t: new Date(decidedAt + 30 * 60_000).toISOString(), project: 'orphan-demo', pid: owner.pid, birth: owner.birth, check: 'C1', command: 'lease via Bash' },
+    });
+  }
+  return { decidedAt, owner };
+}
+const fakeProof = (verdict, why = 'fake') => {
+  const calls = [];
+  const fn = (args) => { calls.push(args); return verdict === 'unknown' ? unknown(why) : ok({ verdict, file: '/f.jsonl', why }); };
+  fn.calls = calls;
+  return fn;
+};
+
+test('a quiet owner transcript turns a born-before lease into a RESTART: outcomes say so and report.md shows the reason', async () => {
+  await withMachine({}, async (m) => {
+    const { decidedAt, owner } = await quietWorld(m);
+    const proof = fakeProof('quiet');
+    const r = await m.sweep({}, { ownerQuiet: proof });
+    assert.deepEqual([r.outcomes.miss, r.outcomes.restart], [0, 1]);
+    assert.match(readFileSync(m.files.report, 'utf8'), /born before the would-stop, first use after it \(transcript quiet\)/);
+    assert.equal(proof.calls.length, 1, 'one proof for the owner and decision, not one per lease');
+    assert.deepEqual(proof.calls[0], { sessionId: SID, birthMs: owner.birth * 1000, decidedMs: decidedAt, dirs: [join(m.home, '.claude*', 'projects')], platform: 'linux' });
+  });
+});
+
+test('an active, unknown or throwing owner proof leaves the lease a MISS and says why in the notes', async () => {
+  for (const [name, proof] of [['active', fakeProof('active', 'Edit at 03:16:21')], ['unknown', fakeProof('unknown', 'no start marker')], ['throws', () => { throw new Error('boom'); }]]) {
+    await withMachine({}, async (m) => {
+      await quietWorld(m);
+      const r = await m.sweep({}, { ownerQuiet: proof });
+      assert.deepEqual([r.outcomes.miss, r.outcomes.restart], [1, 0], name);
+      assert.match(r.notes.join('\n'), /orphan-demo: owner 4300 .* is (active|unknown)/, name);
+    });
+  }
+});
+
+test('no transcriptDirs in the config: no proof is asked for and the lease stays a MISS', async () => {
+  await withMachine({}, async (m) => {
+    writeFileSync(m.files.config, JSON.stringify({ shared: ['e2e-ci', 'DRMed', 'eaglewatch-pipeline'], devPorts: [], transcriptDirs: [] }));
+    await quietWorld(m);
+    const proof = fakeProof('quiet');
+    const r = await m.sweep({}, { ownerQuiet: proof });
+    assert.equal(proof.calls.length, 0);
+    assert.deepEqual([r.outcomes.miss, r.outcomes.restart], [1, 0]);
+  });
+});
+
+test('a proof is not asked for a lease without a session id, nor when the config is not ok', async () => {
+  await withMachine({}, async (m) => {
+    const { owner } = await quietWorld(m, { leases: 0 });
+    await m.lease(owner, 'orphan-demo', { t: new Date(T0 - 70 * 60_000).toISOString() }); // no session_id
+    const proof = fakeProof('quiet');
+    const r = await m.sweep({}, { ownerQuiet: proof });
+    assert.equal(proof.calls.length, 0);
+    assert.equal(r.outcomes.miss, 1);
+  });
+  await withMachine({ config: false }, async (m) => {
+    await quietWorld(m);
+    const proof = fakeProof('quiet');
+    await m.sweep({}, { ownerQuiet: proof });
+    assert.equal(proof.calls.length, 0);
+  });
+});
+
+test('ledgerCoverage reaches outcomeSummary: a legacy worker observation is dropped only while ledger.bad.jsonl does not exist', async () => {
+  await withMachine({}, async (m) => {
+    await quietWorld(m, { legacyObservation: true });
+    const r = await m.sweep({}, { ownerQuiet: fakeProof('quiet') });
+    assert.deepEqual([r.outcomes.miss, r.outcomes.restart], [0, 1], 'complete ledger: the legacy observation is the same lease, judged at its true time');
+  });
+  await withMachine({}, async (m) => {
+    await quietWorld(m, { legacyObservation: true });
+    writeFileSync(m.files.ledgerBad, '{"t":"x"}\n'); // the ledger was repaired once: its completeness cannot be shown
+    const r = await m.sweep({}, { ownerQuiet: fakeProof('quiet') });
+    assert.equal(r.outcomes.miss, 1, 'the legacy observation stays, and it carries no proof');
   });
 });

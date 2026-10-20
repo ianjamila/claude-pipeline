@@ -454,12 +454,12 @@ export async function runSessionEnd({ owner, deps = {} } = {}) {
         const at = iso(stampMs);
         let degraded = false; // a probe that should have answered did not: the stack was not observed
         const marker = (kind, why) => store({ t: kind === 'observed' ? at : iso(slotMs), source: 'session-end', project: stack.project, generation, action: kind, reasons: [why], ...(Number.isFinite(decidedMs) ? { decidedAt: iso(decidedMs) } : {}) }, { decision: false }); // decidedAt: the decision record this marker observed (R4-B1)
-        const add = async (check, hit, why) => {
+        const add = async (check, hit, why, extra = {}) => {
           if (own.has(hit.pid)) return;
           const key = `${check}|${stack.project}|${hit.pid}|${hit.birth}|${hit.port ?? ''}`;
           if (seen.has(key)) return;
           seen.add(key);
-          const use = { t: at, project: stack.project, pid: hit.pid ?? null, birth: hit.birth ?? null, check, ...(hit.command ? { command: String(hit.command).slice(0, 200) } : {}) };
+          const use = { t: at, project: stack.project, pid: hit.pid ?? null, birth: hit.birth ?? null, check, ...(hit.command ? { command: String(hit.command).slice(0, 200) } : {}), ...extra };
           result.uses.push(use);
           await store({ t: at, source: 'session-end', project: stack.project, generation, action: 'use-observed', reasons: [`${check} at +${Math.round(offset / 60000)} min: ${why}`], use }, { decision: false });
         };
@@ -471,7 +471,9 @@ export async function runSessionEnd({ owner, deps = {} } = {}) {
         } else {
           for (const e of leasesFor(evs.value, stack)) {
             if (!(Date.parse(e.t) > decidedMs)) continue;
-            await add('C1', { pid: e.owner?.pid, birth: e.owner?.birth, command: `lease via ${e.via ?? 'unknown'}` }, `lease by pid ${e.owner?.pid}`);
+            // provenance: `t` is the lease's own time (so the same lease read from the ledger is the same use), `seenAt` the probe stamp
+            // (it marks the new format), `sessionId` the session that wrote the lease (the owner's transcript is found by it)
+            await add('C1', { pid: e.owner?.pid, birth: e.owner?.birth, command: `lease via ${e.via ?? 'unknown'}` }, `lease by pid ${e.owner?.pid}`, { t: e.t, seenAt: at, sessionId: e.session_id ?? null });
           }
         }
         for (const [check, fn] of [['C2', () => ev.connections(stack, probeOpts)], ['C3', () => ev.processRefs(stack, probeOpts)]]) {

@@ -30,7 +30,7 @@ import { isInside, samePath } from '../paths.mjs';
 import { lineShowsWork, pathSpellings, parseLsofFields, prefixMayReach, unFirm } from '../worktree-prune/inspect.mjs';
 import { checkRepoIdentity, fetchBranchPrs } from '../worktree-prune/prs.mjs';
 import { procIdentity } from './identity.mjs';
-import { portRefRe } from './match.mjs';
+import { portRefRe, readOnlyCommand } from './match.mjs';
 import { stacksSeam } from './paths.mjs';
 import { ok, unknown } from './result.mjs';
 
@@ -372,17 +372,28 @@ export function expandTranscriptDirs(dirs, { fsx = fs, platform = process.platfo
 
 // *.jsonl under <dir>/<project>/ and <dir>/<project>/<session>/subagents/ modified at or after sinceMs. A configured root that
 // does not exist is a note; any other failure to list or stat is unknown.
+// readdir with the strict rules: a missing configured root is a note (top), a vanished inner directory is empty, anything
+// else is { fail: unknown }.
+function listDirStrict(fsx, d, { top = false, notes = [] } = {}) {
+  try {
+    return { entries: fsx.readdirSync(d, { withFileTypes: true }) };
+  } catch (err) {
+    if (top && isMissing(err)) { notes.push(`${d} does not exist`); return { entries: [] }; }
+    if (!top && isGone(err)) return { entries: [] };
+    return { fail: unknown(`cannot read ${d}: ${err?.code ?? shortMsg(err)}`) };
+  }
+}
+
+// The subagent transcripts of one session: <projectDir>/<session>/subagents/*.jsonl. -> { files } | { fail }.
+function subagentFiles(fsx, pdir, session) {
+  const sub = listDirStrict(fsx, path.join(pdir, session, 'subagents'));
+  if (sub.fail) return sub;
+  return { files: sub.entries.filter((x) => x.name.endsWith('.jsonl') && !x.isDirectory()).map((x) => path.join(pdir, session, 'subagents', x.name)) };
+}
+
 function transcriptFilesStrict(dirs, sinceMs, fsx, notes) {
   const files = [];
-  const list = (d, { top = false } = {}) => {
-    try {
-      return { entries: fsx.readdirSync(d, { withFileTypes: true }) };
-    } catch (err) {
-      if (top && isMissing(err)) { notes.push(`${d} does not exist`); return { entries: [] }; }
-      if (!top && isGone(err)) return { entries: [] };
-      return { fail: unknown(`cannot read ${d}: ${err?.code ?? shortMsg(err)}`) };
-    }
-  };
+  const list = (d, opts) => listDirStrict(fsx, d, { ...opts, notes });
   const add = (file) => {
     let st;
     try {
@@ -406,10 +417,10 @@ function transcriptFilesStrict(dirs, sinceMs, fsx, notes) {
           const bad = add(path.join(pdir, e.name));
           if (bad) return bad;
         } else if (e.isDirectory()) {
-          const sub = list(path.join(pdir, e.name, 'subagents'));
+          const sub = subagentFiles(fsx, pdir, e.name);
           if (sub.fail) return sub.fail;
-          for (const s of sub.entries.filter((x) => x.name.endsWith('.jsonl') && !x.isDirectory())) {
-            const bad = add(path.join(pdir, e.name, 'subagents', s.name));
+          for (const file of sub.files) {
+            const bad = add(file);
             if (bad) return bad;
           }
         }
@@ -482,6 +493,112 @@ export function transcriptRefs(stack, { dirs, sinceMs = 0, platform = process.pl
     }
   }
   return { ok: true, value: hits, notes };
+}
+
+// ---------------------------------------------------------------- owner quiet proof (false-MISS fix, spec 2026-10-19 §6)
+
+const SESSION_ID_RE = /^[0-9a-f-]{8,}$/i;
+const START_SLACK_BEFORE_MS = 5000;
+const START_WINDOW_AFTER_MS = 120000;
+const READ_TOOLS = new Set(['Read', 'Grep', 'Glob', 'ToolSearch']);
+
+const lineBlocks = (obj) => [obj?.message?.content, obj?.content].filter(Array.isArray).flat();
+const timeOf = (obj) => (obj?.timestamp === undefined || obj?.timestamp === null ? NaN : Date.parse(String(obj.timestamp)));
+
+// Text a user typed on a line (string content or text blocks); a `<bash-input>` there is a `!` command, which runs without hooks.
+function userHasBashInput(obj) {
+  if (obj?.type !== 'user' && obj?.message?.role !== 'user') return false;
+  const texts = [obj.message?.content, obj.content].flatMap((c) => (typeof c === 'string' ? [c] : Array.isArray(c) ? c.filter((b) => b?.type === 'text' && typeof b.text === 'string').map((b) => b.text) : []));
+  return texts.some((t) => t.includes('<bash-input>'));
+}
+
+// Why this line is more than read-only inspection (a short label), or null. `strict` (no usable timestamp): any tool call counts.
+function unexplained(obj, { strict, platform }) {
+  if (userHasBashInput(obj)) return 'a <bash-input> command';
+  for (const b of lineBlocks(obj)) {
+    if (b?.type !== 'tool_use') continue;
+    const name = typeof b.name === 'string' ? b.name : '?';
+    if (strict) return `${name} on a line without a timestamp`;
+    if (READ_TOOLS.has(name)) continue;
+    if (name === 'Bash' && typeof b.input?.command === 'string' && readOnlyCommand(b.input.command, platform)) continue;
+    return name === 'Bash' ? `Bash: ${String(b.input?.command ?? '').slice(0, 80)}` : name;
+  }
+  return null;
+}
+
+// Did the process that held a stack lease do anything but read-only inspection between its birth and the decision, according to its
+// own session transcript? -> ok({ verdict: 'quiet' | 'active', file, why }) | unknown. The transcript must show the process STARTED in
+// it (a SessionStart:startup / :resume hook line near the birth; after /clear or /compact an earlier transcript of the same process
+// exists under another id and cannot be found), otherwise unknown. Only the owner's own tool calls are judged here: a child or
+// hook process is judged by its own C2 / C3 uses. Fail closed: unknown and active both leave the use a MISS.
+export function ownerQuiet({ sessionId, birthMs, decidedMs, dirs, fsx = fs, platform = process.platform } = {}) {
+  if (platform === 'win32') return WINDOWS();
+  if (typeof sessionId !== 'string' || !SESSION_ID_RE.test(sessionId)) return unknown('no usable session id');
+  if (!Number.isFinite(birthMs) || !Number.isFinite(decidedMs)) return unknown('no usable birth or decision time');
+  const exp = expandTranscriptDirs(dirs, { fsx, platform });
+  if (!exp.ok) return exp;
+  const mains = new Map(); // realpath -> { file, pdir }
+  for (const dir of exp.value) {
+    const top = listDirStrict(fsx, dir, { top: true });
+    if (top.fail) return top.fail;
+    for (const project of top.entries.filter((e) => e.isDirectory() || e.isSymbolicLink())) {
+      const pdir = path.join(dir, project.name);
+      const inner = listDirStrict(fsx, pdir);
+      if (inner.fail) return inner.fail;
+      if (!inner.entries.some((e) => e.name === `${sessionId}.jsonl` && !e.isDirectory())) continue;
+      const file = path.join(pdir, `${sessionId}.jsonl`);
+      let real = file;
+      try { real = fsx.realpathSync(file); } catch { /* keep the joined path */ }
+      if (!mains.has(real)) mains.set(real, { file, pdir });
+    }
+  }
+  if (mains.size === 0) return unknown(`no transcript for session ${sessionId}`);
+  if (mains.size > 1) return unknown(`more than one transcript for session ${sessionId}`);
+  const { file, pdir } = [...mains.values()][0];
+  const subs = subagentFiles(fsx, pdir, sessionId);
+  if (subs.fail) return subs.fail;
+
+  const lo = birthMs - START_SLACK_BEFORE_MS;
+  let first = null; // earliest SessionStart marker of this session in [birth - 5 s, birth + 120 s]
+  let active = null;
+  const scan = (f, isMain) => {
+    scanLines(fsx, f, (line) => {
+      if (line.trim() === '') return false;
+      let obj;
+      try { obj = JSON.parse(line); } catch {
+        active ??= `${path.basename(f)}: a line is not valid JSON`;
+        return !isMain; // a subagent file needs no further reading; the main file is read on for the start marker
+      }
+      const t = timeOf(obj);
+      if (isMain && obj?.attachment?.type === 'hook_success' && typeof obj.attachment.hookName === 'string' && obj.attachment.hookName.startsWith('SessionStart:')
+        && obj.sessionId === sessionId && t >= lo && t <= birthMs + START_WINDOW_AFTER_MS && (first === null || t < first.t)) {
+        first = { t, hook: obj.attachment.hookName };
+      }
+      if (active !== null) return !isMain;
+      if (obj?.type === 'api-request-blob') return false; // a timestamp-less copy of the request payload (the whole history so far), not an event
+      const finite = Number.isFinite(t);
+      if (finite && (t < lo || t > decidedMs)) return false;
+      const why = unexplained(obj, { strict: !finite, platform });
+      if (why !== null) {
+        active = `${why} at ${finite ? new Date(t).toISOString() : 'an unknown time'} in ${path.basename(f)}`;
+        return !isMain;
+      }
+      return false;
+    });
+  };
+  try {
+    scan(file, true);
+    if (first === null) return unknown('no start marker of this process in its transcript');
+    if (first.hook !== 'SessionStart:startup' && first.hook !== 'SessionStart:resume') return unknown(`started by /clear or /compact (${first.hook}): an earlier transcript of this process cannot be found`);
+    for (const f of subs.files) {
+      if (active !== null) break;
+      scan(f, false);
+    }
+  } catch (err) {
+    return unknown(`cannot read ${file}: ${err?.code ?? shortMsg(err)}`);
+  }
+  if (active !== null) return ok({ verdict: 'active', file, why: active });
+  return ok({ verdict: 'quiet', file, why: `start ${first.hook} at ${new Date(first.t).toISOString()}; only read-only inspection until the decision` });
 }
 
 // ---------------------------------------------------------------- C4 consumer worktrees
@@ -573,15 +690,20 @@ export function consumerWorktrees(stack, {
     for (const cwd of t.cwds) {
       if (stack?.workdir && isInside(cwd, stack.workdir, platform)) continue;
       const home = known.filter((w) => isInside(cwd, w.path, platform)).sort((a, b) => b.path.length - a.path.length)[0];
-      // a cwd in no known worktree is only a guess at where the session worked: an ancestor of the stack folder (a session started
-      // in `/` or the home directory) or a too-broad directory would put every process on the machine "inside" the stack
+      // a cwd in no known worktree is only a guess at where the session worked, so it is not a consumer: a shell in some other
+      // directory (an ancestor of the stack folder, `/`, the home directory, a notes folder) would keep the stack alive for nothing.
+      // The too-broad / ancestor notes say why the common cases were dropped; any other outside cwd gets the generic note.
       const broad = home ? null : tooBroadDir(cwd, { home: homeDir, platform });
       const ancestor = !home && stack?.workdir && !samePath(cwd, stack.workdir, platform) && isInside(stack.workdir, cwd, platform);
       if (broad || ancestor) {
         notes.push(`transcript cwd ${JSON.stringify(cwd)} dropped as a consumer: ${broad ?? 'it is an ancestor of the stack folder'}`);
         continue;
       }
-      add(home ? home.path : cwd, 'transcript', home?.branch ?? null);
+      if (!home) {
+        notes.push(`transcript cwd ${JSON.stringify(cwd)} dropped as a consumer: it is in no known worktree of a configured repo`);
+        continue;
+      }
+      add(home.path, 'transcript', home.branch ?? null);
     }
   }
   // (b) .env* at the root of every worktree of a configured repo

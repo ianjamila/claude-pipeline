@@ -166,7 +166,8 @@ global git guard stay on regardless.
 
 Private local stacks (one per worktree) keep eating memory after the work is done. `P stacks` stops the ones nobody uses.
 
-- **Measure first.** Every mode (`sessionEnd`, `sweeper`, `devServers`) starts as `report`: it logs what it *would* stop and stops nothing. Check `P stacks status`. After 7 days with `MISS 0` (a stack it would have stopped was used within 2 h), flip one mode to `apply` in `~/.claude/pipeline-state/stacks/mode.json`. Only you do that.
+- **Measure first.** Every mode (`sessionEnd`, `sweeper`, `devServers`) starts as `report`: it logs what it *would* stop and stops nothing. Check `P stacks status`. After 7 days with `MISS 0` (a stack it would have stopped was used within 2 h by a process that was already running), flip one mode to `apply` in `~/.claude/pipeline-state/stacks/mode.json`. Only you do that.
+- **What counts as use.** Starting, stopping, querying or editing a stack registers a lease; just looking (`docker ps`, `docker logs`, `ls`, `grep`, the Read / Grep / Glob tools) does not. A session that was alive at the would-stop but only inspected the stack until then is a RESTART, not a MISS, when its own transcript shows nothing but read-only work (needs the config's `transcriptDirs`); anything doubtful stays a MISS.
 - **Pause.** `touch ~/.claude/pipeline-state/stacks/pause` stops everything on every path; delete the file to resume.
 - **Keep list.** `~/.claude/pipeline-state/stacks/keep` holds one project id per line (`#` comments); a listed project is never stopped.
 - **Setup.** `P stacks init --write` writes the machine config (which ids are shared, which repos to scan). `P stacks schedule --install` adds the daily sweep. Install writes neither.
@@ -234,8 +235,10 @@ head you did not review (the receipt names the head the event carried).
 - **Hooks stop accidents, not adversaries.** guard-git and guard-files catch direct and casually
   disguised attempts (subshells, `bash -c`, `eval`, env prefixes, the `pipeline job` wrapper), not
   a determined adversary with encoded payloads. GitHub branch protection is the hard boundary.
-  Coverage: Bash and PowerShell, `Monitor` commands, MCP tool calls and shell script files that contain
-  a guarded command. They also deny a command line too long to be read in full (when it contains a
+  Coverage: Bash and PowerShell, `Monitor` commands, MCP tool calls, shell script files and package scripts (`npm run NAME`, `npm test`, `pnpm NAME`, `yarn NAME`, `bun run NAME`, with their
+  `pre` / `post` hooks, read from the nearest package.json or the one `--prefix` / `-C` / `--dir` / `--cwd` / a workspace option names) that contain
+  a guarded command. Install, pack, publish and version run their lifecycle scripts (`prepare`, `postinstall` ...), which are opened too (`--ignore-scripts` turns them off). Any
+  `npm_*` / `yarn_*` / `pnpm_*` / `bun_*` / `COREPACK_*` variable, `INIT_CWD`, a .npmrc (the project's, the user's, and the global one under the prefix the user's or the project's `prefix=` / `--prefix` / node's own place names: `<prefix>/etc/npmrc`) that sets `script-shell`, `node-options` or `globalconfig`, a `prefix=` the guard cannot work out (an unknown `${VAR}`), a subcommand or option the guard does not know, and the manager's own writes earlier on the line (`npm pkg set`, `npm set-script`, `npm config set`, `npm init` ...) make the script unknown, and it is refused. `npm explore PKG -- CMD` runs CMD in `node_modules/PKG` of the project: CMD is judged like `bash -c CMD` run there, a file it runs inside that package is opened (a program run by path in node_modules is not otherwise), and a PKG that is not a plain name (a variable, a glob, `..`, a path) or a `-g` explore is refused; without CMD it opens an interactive shell and there is nothing to judge. A line that writes package.json or a configuration file before the manager reads it is refused too, and one that may write it (a target only known at run time) when it also mentions a guarded operation: the same rule as for a script file, so, like a script file, a `git checkout`, a `git worktree add`, a `tar x` or a background job earlier on the line is not followed. They also deny a command line too long to be read in full (when it contains a
   guarded word), a push to a dynamic destination (only `$(git branch --show-current)`,
   `$(git rev-parse --abbrev-ref HEAD)` or a variable assigned a literal in the same command are
   understood; ship pushes `git push -u origin agent/<slug>`), `unset CLAUDECODE`, and setting
