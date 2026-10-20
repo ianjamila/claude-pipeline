@@ -17,6 +17,13 @@ verify:
   report: .verify/report.json
   screenshots: .verify/screenshots
   expected_steps: [tests]
+  # The gate may take GitHub's "test (ubuntu)" run on the exact head as proof for `tests` instead of a full local run, so a
+  # busy Mac (several sessions' suites at once) no longer blocks a merge. A PR that touches the CI setup, this file or the
+  # verify scripts still runs the tests on the Mac. "test (windows)" stays a required check of its own.
+  deferrable_steps: [tests]
+  ci_proof:
+    tests: { workflow: .github/workflows/ci.yml, job: "test (ubuntu)", event: pull_request }
+  ci_proof_wait_minutes: 25      # ubuntu job ~9 min + queue; past this the Mac runs the tests
 
 ci:
   required_checks: ["test (ubuntu)", "test (windows)"]

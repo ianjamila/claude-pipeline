@@ -220,7 +220,8 @@ export function quietCandidates(decisions, uses, { ledgerCoverage } = {}) {
 // -> { miss, restart, unknown, clean, pending, gbFreed, rows } over the generations whose newest would-stop is from the last 7 days.
 // `uses` = [{ t, project, pid, birth, command?, check?, quiet?, sessionId?, ledger?, seenAt? }]; each use is judged against the newest would-stop record of its project
 // that is not later than the use (the use of an older generation is not charged to a newer one) and rolled up into that record's
-// generation row. rows are in decision order, one per generation.
+// generation row. rows are in decision order, one per generation (a stack run); a row's `decisions` is how many would-stop / stopped
+// records that generation has, and the counts above are of rows, not of decisions.
 export function outcomeSummary(decisions, uses, now = Date.now(), { ledgerCoverage } = {}) {
   const nowMs = toMs(now);
   const stops = stopRecords(decisions);
@@ -229,10 +230,13 @@ export function outcomeSummary(decisions, uses, now = Date.now(), { ledgerCovera
     if (!isObject(rec) || !STOP_ACTIONS.has(rec.action)) continue;
     const key = generationKey(rec);
     const g = rowOf.get(key);
-    if (!g) rowOf.set(key, { rec: { ...rec, lastSeen: rec.t }, newest: rec });
-    else if (toMs(rec.t) >= toMs(g.newest.t)) {
-      g.newest = rec;
-      g.rec.lastSeen = rec.t;
+    if (!g) rowOf.set(key, { rec: { ...rec, lastSeen: rec.t }, newest: rec, decisions: 1 });
+    else {
+      g.decisions += 1;
+      if (toMs(rec.t) >= toMs(g.newest.t)) {
+        g.newest = rec;
+        g.rec.lastSeen = rec.t;
+      }
     }
   }
   const marks = new Map(); // generation key -> [{ action, ms }]
@@ -253,7 +257,7 @@ export function outcomeSummary(decisions, uses, now = Date.now(), { ledgerCovera
   }
   const sum = { miss: 0, restart: 0, unknown: 0, clean: 0, pending: 0, gbFreed: 0, rows: [] };
   let bytes = 0;
-  for (const [key, { rec, newest }] of rowOf) {
+  for (const [key, { rec, newest, decisions: decisionCount }] of rowOf) {
     const decided = toMs(rec.t);
     const newestMs = toMs(newest.t);
     if (!(newestMs >= nowMs - WEEK_MS)) continue;
@@ -280,7 +284,7 @@ export function outcomeSummary(decisions, uses, now = Date.now(), { ledgerCovera
     if (memBytes !== null) bytes += memBytes;
     sum.rows.push({
       project: rec.project, t: rec.t, lastSeen: rec.lastSeen, generation: rec.generation ?? null, action: rec.action, source: rec.source ?? null,
-      memBytes, outcome, uses: used, ...(note ? { note } : {}), cleanDays: outcome === 'CLEAN' ? Math.floor((nowMs - decided) / DAY_MS) : null,
+      memBytes, decisions: decisionCount, outcome, uses: used, ...(note ? { note } : {}), cleanDays: outcome === 'CLEAN' ? Math.floor((nowMs - decided) / DAY_MS) : null,
     });
   }
   sum.rows.sort((a, b) => toMs(a.t) - toMs(b.t));
@@ -351,12 +355,19 @@ function useLine(row, u) {
   return `- ${oneLine(row.project)} — would-stop ${u.against ?? row.t} — ${who}, ${born}, seen ${u.t}${u.check ? `, missed by the ${oneLine(u.check, 40)} check` : ''}${u.why ? ` — ${oneLine(u.why, 120)}` : ''}`;
 }
 
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+const decisionsOf = (rows) => rows.reduce((n, r) => n + (r.decisions ?? 1), 0);
+const runsAndDecisions = (rows) => `${plural(rows.length, 'stack run')} (${plural(decisionsOf(rows), 'would-stop decision')})`;
+
+// One heading per stack generation (the unit the headline counts), its uses nested under it.
 function outcomeSection(title, rows, cls, none) {
   const picked = rows.filter((r) => r.outcome === cls);
   if (picked.length === 0) return [`## ${title}`, none, ''];
   return [`## ${title}`, ...picked.flatMap((r) => {
-    const lines = r.uses.filter((u) => u.class === cls).map((u) => useLine(r, u));
-    return lines.length === 0 && r.note ? [`- ${oneLine(r.project)} — would-stop ${r.lastSeen ?? r.t} — ${r.note}`] : lines;
+    const mine = r.uses.filter((u) => u.class === cls);
+    const run = r.generation?.startedAt ? `stack run started ${oneLine(r.generation.startedAt, 40)}` : 'stack run';
+    const head = `- ${oneLine(r.project)} — ${run} — ${cls}: ${plural(r.decisions ?? 1, 'would-stop decision')}, ${plural(mine.length, 'use')}${mine.length === 0 && r.note ? ` — ${r.note}` : ''}`;
+    return [head, ...mine.map((u) => `  ${useLine(r, u)}`)];
   }), ''];
 }
 
@@ -378,7 +389,7 @@ function switchOn(s) {
   if (s.unknown > 0) return `not yet — ${s.unknown} outcome(s) without a readable process identity, or never observed, count as MISS until explained`;
   if (total === 0) return 'not yet — no would-stop was recorded in the last 7 days, so there is no evidence';
   if (s.pending > 0) return `wait — ${s.pending} would-stop(s) are still inside their 2 h window`;
-  return `the evidence is clean (no MISS, no unknown across ${total} would-stop(s)); switching on is the owner's decision`;
+  return `the evidence is clean (no MISS, no unknown across ${runsAndDecisions(s.rows)}); switching on is the owner's decision`;
 }
 
 // state = { now, decisions, uses, config?: 'ok'|'missing'|'invalid', paused?, modes?, hooks?: [{ file, problem }],
@@ -393,7 +404,7 @@ export function renderReport(state = {}) {
     ...(state.config && state.config !== 'ok' ? [`- NOT CONFIGURED (config.json ${state.config}): nothing is assessed or stopped; registration only records`] : []),
     ...(state.paused ? ['- PAUSED (pause file present): nothing is stopped'] : []),
     `- ${missHeadline(s)}`,
-    `- RESTART ${s.restart} (cost only; the data was kept)`,
+    `- RESTART ${plural(s.restart, 'stack run')} (${plural(decisionsOf(s.rows.filter((r) => r.outcome === 'RESTART')), 'would-stop decision')}; cost only; the data was kept)`,
     `- CLEAN ${s.clean}${s.pending ? ` (+${s.pending} still inside the 2 h window)` : ''}`,
     `- GB freed ${s.gbFreed.toFixed(2)} (memory of the containers that would have been stopped, last 7 days)`,
     `- Switch-on: ${switchOn(s)}`,
