@@ -31,9 +31,10 @@ const MAX_INPUT_BYTES = 1_000_000;
 const MAX_LINE_CHARS = 200_000; // a longer command line is not parsed (the hook has a 15 s budget)
 const OWNER_ONLY = 'This is reserved for the repository owner.';
 
-// The only graphql mutations an agent may run (comments, PR lifecycle, review threads). Everything else is denied.
+// The only graphql mutations an agent may run (new comments, PR lifecycle, review threads). Everything else is denied.
+// (updateIssueComment is NOT here: run events are PR comments, and editing a comment could rewrite one; docs/plans/2026-10-20-chat-mode-no-needs-human.md D1.)
 const GRAPHQL_ALLOWED_MUTATIONS = new Set([
-  'addComment', 'updateIssueComment', 'createPullRequest', 'enablePullRequestAutoMerge', 'disablePullRequestAutoMerge',
+  'addComment', 'createPullRequest', 'enablePullRequestAutoMerge', 'disablePullRequestAutoMerge',
   'markPullRequestReadyForReview', 'convertPullRequestToDraft', 'addPullRequestReview', 'resolveReviewThread', 'minimizeComment',
 ]);
 const PUSH_LONG_VALUE = ['repo', 'receive-pack', 'exec', 'push-option', 'recurse-submodules'];
@@ -85,6 +86,16 @@ const labelRe = (name) => new RegExp(`(?<![A-Za-z0-9_-])${escapeRe(name)}(?![A-Z
 const mentionsAny = (text, names) => names.some((n) => labelRe(n).test(text));
 const splitLabels = (v) => String(v ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
 const safeDecode = (s) => { try { return decodeURIComponent(s); } catch { return s; } };
+// Run events of the two owner-stop kinds (run-events.mjs) are comments that START with this marker. Only the pipeline CLI may post them: a forged
+// release would otherwise unblock a stopped PR. Matched case-insensitively on the DECODED text (percent-, \\uXXXX- and \\xXX-escapes undone).
+const EVENT_MARKER = /claude-pipeline:event:owner-stop/i;
+const unescapeText = (s) => safeDecode(String(s ?? '')
+  .replace(/\\u\{?([0-9a-f]{4,6})\}?/gi, (m, h) => { try { return String.fromCodePoint(parseInt(h, 16)); } catch { return m; } })
+  .replace(/\\x([0-9a-f]{2})/gi, (m, h) => String.fromCharCode(parseInt(h, 16))));
+const mentionsEventMarker = (...texts) => texts.some((x) => EVENT_MARKER.test(unescapeText(x)));
+const EVENT_FORGE = 'the text carries a claude-pipeline owner-stop event marker. Those comments are posted only by the pipeline CLI (P summary / P checkpoint), after the owner\'s reply. ' + 'This is reserved for the repository owner.';
+const COMMENT_UNREADABLE = 'the comment text cannot be read here (--input - / stdin / an unreadable file), so it cannot be checked for a pipeline event marker. Pass the text with --body, -f body=... or a readable file.';
+const COMMENT_ROUTE = /^repos\/[^/]+\/[^/]+\/(?:issues\/[^/]+\/comments|pulls\/[^/]+\/(?:comments|reviews))$/i;
 const stripHeads = (b) => String(b).replace(/^refs\/heads\//, '').replace(/^heads\//, '');
 
 function defaultReadText(file) {
@@ -795,7 +806,11 @@ function checkGraphql(body, dir = null, ctx = null) {
     const names = graphqlMutations(q);
     if (names === null) return deny('the graphql query contains a mutation that cannot be parsed, so it cannot be verified.');
     const bad = names.find((n) => !GRAPHQL_ALLOWED_MUTATIONS.has(n));
+    if (bad === 'updateIssueComment') return deny(`editing a comment through graphql (updateIssueComment) is blocked: run events are comments and must not be rewritten. ${OWNER_ONLY}`);
     if (bad) return deny(`the graphql mutation ${bad} is not on the allowed list (${[...GRAPHQL_ALLOWED_MUTATIONS].join(', ')}). ${OWNER_ONLY}`);
+    // (the query text AND the variables: `-f body=...`, `-F body=@file`, an --input JSON's values)
+    if (names.some((n) => ['addComment', 'addPullRequestReview', 'addPullRequestReviewComment', 'addPullRequestReviewThreadReply'].includes(n))
+      && mentionsEventMarker(q, body.text, ...body.fields.map((x) => x.value), ...body.queries)) return deny(EVENT_FORGE);
     // #58: auto-merge names the PR by its node id, which says nothing about whether the owner said "merge" for it, nor which repository it is in.
     // Why (#58 round 3): the node id can name a PR in a chat repo whatever directory this runs in, so the target repository can never be resolved
     // here: it is judged as a chat repo's (the owner's "merge" is needed, and a node id cannot match one), not as the current directory's.
@@ -835,6 +850,9 @@ function checkApi(rest, env, dir, ctx) {
   const ep = normaliseEndpoint(positionals[0]);
   const p = `/${ep}`;
 
+  // -- run events are PR comments: a comment is never edited or deleted (chat mode's owner stops; the viewer's token could rewrite one)
+  if (/^repos\/[^/]+\/[^/]+\/issues\/comments\/[^/]+$/i.test(ep)) return deny(`${method} to an issue/PR comment is blocked: pipeline run events and owner stops live in comments and must not be rewritten or removed. Post a new comment instead.`);
+
   // -- published rules: protection, rulesets, repo settings, access, Actions permissions
   if (/\/branches\/.+\/protection/i.test(p)) return deny(`${method} to branch protection is blocked. ${OWNER_ONLY}`);
   if (/\/branches\/[^/]+\/rename$/i.test(p)) return deny(`renaming a branch through the API is blocked. ${OWNER_ONLY}`);
@@ -847,6 +865,11 @@ function checkApi(rest, env, dir, ctx) {
   const haystack = safeDecode(`${rest.join('\n')}\n${body.text}`);
   const approval = mentionsAny(haystack, APPROVAL_LABELS);
   const guard = mentionsAny(haystack, GUARD_LABELS);
+  // -- a comment (or review) that carries an owner-stop event marker is forged, and one whose text cannot be read cannot be shown not to be
+  if (COMMENT_ROUTE.test(ep)) {
+    if (body.unknown) return deny(COMMENT_UNREADABLE);
+    if (mentionsEventMarker(haystack, ...body.fields.map((x) => x.value))) return deny(EVENT_FORGE);
+  }
   const dynamicLabel = body.fields.some((f) => /^(labels(\[\])?|name|new_name)$/.test(f.key) && DYNAMIC.test(f.value));
 
   // -- labels: adding approval labels, removing/renaming guard labels, replacing or clearing a whole set
@@ -1044,6 +1067,27 @@ function repoMergeCommandVerdict(argv, dir, ctx) {
   return null;
 }
 
+// `gh pr|issue comment`: no --edit-last / --delete-last (a run event could be rewritten), no owner-stop event marker in the text, and the text must be readable.
+function checkGhComment(rest, dir, ctx) {
+  const { flags } = parseOpts(rest, { longValue: ['body', 'body-file', 'repo'], shortValue: 'bFR' });
+  if (flags.some((f) => !f.short && (f.name === 'edit-last' || f.name === 'delete-last'))) {
+    return deny('editing or deleting the last comment (--edit-last / --delete-last) is blocked: pipeline run events and owner stops live in comments and must not be rewritten or removed. Post a new comment instead.');
+  }
+  const texts = [rest.join('\n'), ctx.fullText ?? ''];
+  for (const fl of flags) {
+    if (fl.value === null) continue;
+    if (fl.short ? fl.name === 'b' : fl.name === 'body') texts.push(fl.value);
+    else if (fl.short ? fl.name === 'F' : fl.name === 'body-file') {
+      if (fl.value === '-' || dir === null) return deny(COMMENT_UNREADABLE);
+      countScript(ctx.budget);
+      const text = ctx.readText(path.resolve(dir, fl.value));
+      if (typeof text !== 'string') return deny(COMMENT_UNREADABLE);
+      texts.push(text);
+    }
+  }
+  return mentionsEventMarker(...texts) ? deny(EVENT_FORGE) : null;
+}
+
 function checkGh(argv, env, dir, ctx, raw, level = 0) {
   // The group and verb must be written literally (`gh pr $X`, `gh pr ${X%-base}`, `gh pr "$(printf merge)"`): a variable's
   // value on the line is not proof — `X=merge; true || X=view; gh pr $X` runs merge.
@@ -1086,6 +1130,8 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
     if (ALL_LABELS.includes(name)) return deny(`\`gh label ${verb} ${name}\` would break a pipeline label and is blocked. ${OWNER_ONLY}`);
     return null;
   }
+
+  if ((group === 'pr' || group === 'issue') && verb === 'comment') return checkGhComment(rest, dir, ctx);
 
   if (group === 'pr' && verb === 'merge') {
     if (rest.some((t) => t === '--admin' || t.startsWith('--admin='))) return deny(`\`gh pr merge --admin\` bypasses the merge gate and is blocked. Use \`--auto\` / the pipeline merge command. ${OWNER_ONLY}`);
@@ -1131,6 +1177,79 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
       const v = checkIssueHold(n, repoArgs, dir, ctx, verb);
       if (v) return v;
     }
+  }
+  return null;
+}
+
+// ---- curl / wget / httpie / xh to GitHub ------------------------------------------------------------------
+// Why: with the viewer's token such a command can merge a PR, rewrite a comment (a run event), post a forged one or call graphql without touching any `gh` rule.
+// A call to github.com / api.github.com with a non-GET method is rewritten as the `gh api` call it is and judged by checkApi (+ the merge / refs rules below).
+// Residual: `node -e "fetch(...)"`, `python -c`, any program the agent writes.
+const HTTP_TOOLS = new Set(['curl', 'wget', 'http', 'https', 'xh', 'xhs']);
+const GH_HOST = /(?:^|\.)github\.com$/i;
+const HTTP_VALUE_FLAGS = new Set(['-H', '--header', '-o', '--output', '-u', '--user', '-A', '--user-agent', '-e', '--referer', '-b', '--cookie', '-c', '--cookie-jar', '-w', '--write-out', '--connect-timeout', '-m', '--max-time',
+  '--retry', '-x', '--proxy', '--cacert', '--cert', '--key', '-K', '--config', '-a', '--auth', '--session', '-O', '--output-document', '--header-file', '--timeout', '-t', '--tries', '--user-agent', '--password']);
+const HTTP_DATA_FLAGS = new Set(['-d', '--data', '--data-raw', '--data-binary', '--data-ascii', '--data-urlencode', '--json', '-T', '--upload-file', '-F', '--form', '--form-string', '--post-data', '--post-file', '--body-data', '--body-file']);
+const HTTP_FILE_FLAGS = new Set(['-T', '--upload-file', '--post-file', '--body-file']);
+function checkHttpTool(argv, dir, ctx) {
+  const words = argv.slice(1).map((a) => expandVars(a, ctx));
+  let method = null;
+  let implied = false;
+  const urls = [];
+  const data = [];
+  let unknown = false;
+  const readData = (v, isFile) => {
+    let value = v;
+    if (!isFile && !value.startsWith('@') && !/^[^=\s]+=@/.test(value)) { data.push(value); return; }
+    const p = isFile ? value : (value.startsWith('@') ? value.slice(1) : value.slice(value.indexOf('=@') + 2));
+    if (p === '-' || p === '' || dir === null) { unknown = true; return; }
+    countScript(ctx.budget);
+    const text = ctx.readText(path.resolve(dir, p));
+    if (typeof text === 'string') { data.push(text); data.push(value); } else unknown = true;
+  };
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    if (w === '--') { urls.push(...words.slice(i + 1)); break; }
+    const eq = w.startsWith('--') ? w.indexOf('=') : -1;
+    const flag = eq > 0 ? w.slice(0, eq) : (/^-[A-Za-z]./.test(w) && !w.startsWith('--') ? w.slice(0, 2) : w);
+    const attached = eq > 0 ? w.slice(eq + 1) : (/^-[A-Za-z]./.test(w) && !w.startsWith('--') ? w.slice(2) : null);
+    const value = () => (attached !== null ? attached : (words[++i] ?? ''));
+    if (flag === '-X' || flag === '--request' || flag === '--method') { method = value().toUpperCase(); continue; }
+    if (HTTP_DATA_FLAGS.has(flag)) { implied = true; readData(value(), HTTP_FILE_FLAGS.has(flag)); continue; }
+    if (HTTP_VALUE_FLAGS.has(flag)) { value(); continue; }
+    if (w.startsWith('-')) continue;
+    if (/^[A-Z]{3,7}$/.test(w) && ['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(w) && urls.length === 0 && method === null) { method = w; continue; }
+    if (!/:\/\//.test(w) && (/^[A-Za-z0-9_.\[\]-]+(?::=|=@?|:)/.test(w) && !/^[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?:[/:]|$)/.test(w))) {
+      if (!/^[A-Za-z0-9_.\[\]-]+==/.test(w) && /=/.test(w)) { implied = true; readData(w, false); } // (httpie / xh data item; `key==v` is a query parameter, `Name:v` a header)
+      continue;
+    }
+    urls.push(w);
+  }
+  const nonGet = (method !== null && !['GET', 'HEAD', 'OPTIONS'].includes(method)) || (method === null && implied);
+  const verb = method !== null && !['GET', 'HEAD', 'OPTIONS'].includes(method) ? method : 'POST';
+  for (const w of urls) {
+    const host = (/^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/)?(?:[^/@?#]*@)?([^/:?#]*)/.exec(w) ?? [])[1] ?? '';
+    const hostUnknown = host === '' || DYNAMIC.test(host);
+    if (!hostUnknown && !GH_HOST.test(host)) continue;
+    if (!nonGet) {
+      if (!hostUnknown && DYNAMIC.test(w) && /\$\(|`/.test(w)) return deny('the URL is built at run time ($(...) / backticks) for a github.com host, so what it calls cannot be verified. Write the URL out.');
+      continue;
+    }
+    if (hostUnknown || DYNAMIC.test(w)) return deny(`${verb} to a URL built at run time ($VAR / $(...)) that may point at github.com cannot be verified. Write the URL out.`);
+    const ep = normaliseEndpoint(/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(w) ? w : `https://${w}`);
+    if (/^repos\/[^/]+\/[^/]+\/pulls\/\d+\/merge$/i.test(ep)) return deny(`merging through the API bypasses the merge gate, like --admin. ${OWNER_ONLY}`);
+    if (/\/merges$/i.test(`/${ep}`)) return deny(`merging branches through the API can move main without a PR. ${OWNER_ONLY}`);
+    if (/\/git\/refs(\/|$)/i.test(`/${ep}`)) return deny(`${verb} to git refs through the API is blocked. ${OWNER_ONLY}`);
+    const queries = [];
+    for (const d of data) {
+      try {
+        const j = JSON.parse(d);
+        for (const o of Array.isArray(j) ? j : [j]) if (o && typeof o.query === 'string') queries.push(o.query);
+      } catch { if (/\bmutation\b/.test(d)) queries.push(d); }
+    }
+    const rest = ['-X', verb, ep, ...data.flatMap((d) => ['-f', `data=${d}`]), ...queries.flatMap((q) => ['-f', `query=${q}`]), ...(unknown ? ['--input', '-'] : [])];
+    const v = checkApi(rest, {}, dir, ctx);
+    if (v) return v;
   }
   return null;
 }
@@ -2551,6 +2670,7 @@ function evalString(str, startDir, ctx, level, child = false) {
         const v = withPrefixEnv(c, ctx, () => evalString(inner, dir, ctx, level + 1));
         if (v.decision === 'deny') { verdict = v; break; }
       }
+      if (!verdict && HTTP_TOOLS.has(name)) verdict = checkHttpTool(argv, dir, ctx);
       if (!verdict) verdict = withPrefixEnv(c, ctx, () => repoMergeCommandVerdict(argv, dir, ctx)); // (#58; with its prefix: `npm_config_prefix=/chat npm run merge …`)
       if (!verdict) {
         // a string or program text the parser cannot unwrap (node -e, osascript, make CMD=...) that carries a guarded command
