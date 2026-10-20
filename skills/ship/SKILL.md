@@ -191,7 +191,7 @@ note it in the summary and carry on, never stop the run for it.
 
 ## Step 4 — review loop
 
-Follow `reference/review-loop.md` exactly. In short, per round `R` (max `review.max_rounds`):
+Follow `reference/review-loop.md` exactly. In short, per round `R` (max `review.max_rounds`, plus one extra round when `P state outcome` says `extraRound`):
 Codex (`P codex-review --pr N --round R …` as a job; light lane with nothing but WORTH CONSIDERING items ⇒
 `P triage light-lane --round R` and skip the judge) → judge (`judge` agent, no model param, only
 for items without a ruling yet; `P triage validate --round R --from-tag "pipeline-judge R<R> <d8>"`)

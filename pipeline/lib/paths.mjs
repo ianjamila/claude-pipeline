@@ -25,16 +25,18 @@ export function expandHome(p, home = os.homedir()) {
   return p;
 }
 
-const isAbsolutePosix = (s) => s.startsWith('/') || /^[A-Za-z]:\//.test(s);
+// (a drive letter makes a path absolute on Windows only: on macOS / Linux `D:/x` is a relative path, a directory named `D:`)
+const isAbsolutePosix = (s, platform = process.platform) => s.startsWith('/') || (platform === 'win32' && /^[A-Za-z]:\//.test(s));
 
 // Normalised POSIX form: absolute, ".." resolved, no trailing slash (except a bare root), and
 // lower-cased on case-insensitive platforms.
 function normalise(p, platform) {
   let s = toPosix(p);
-  if (!isAbsolutePosix(s)) s = `${toPosix(process.cwd())}/${s}`;
+  if (!isAbsolutePosix(s, platform)) s = `${toPosix(process.cwd())}/${s}`;
   const unc = /^\/\/[^/]/.test(s); // keep a UNC prefix; posix.normalize would collapse "//" to "/"
-  s = path.posix.normalize(s);
-  if (unc) s = `/${s}`;
+  // (on Windows `..` stops at the drive root and at the share root of a UNC path)
+  if (platform === 'win32' && (DRIVE.test(s) || UNC.test(s))) s = drivePosix.normalize(s);
+  else { s = path.posix.normalize(s); if (unc) s = `/${s}`; }
   if (s.length > 1 && s.endsWith('/')) s = s.slice(0, -1);
   return platform === 'win32' || platform === 'darwin' ? s.toLowerCase() : s;
 }
@@ -69,3 +71,47 @@ export function canonicalPath(p) {
     cur = parent;
   }
 }
+
+// node:path.posix for paths in the guards' POSIX form (toPosix), where a Windows drive path stays `D:/dir/file`. The plain posix functions do not know `D:/` is absolute: posix.resolve('D:/a', 'b') puts the
+// process directory in front, and posix.dirname('D:/a') is 'D:', then '.', so a walk upward leaves the drive. Here a drive is a root: resolve clamps `..` at it, dirname stops at `D:/`.
+const posix = path.posix;
+const DRIVE = /^([A-Za-z]:)(\/.*)?$/;
+const UNC = /^(\/\/[^/]+\/[^/]+)(\/.*)?$/; // //server/share/x: the share is the root
+const rooted = (s) => s.startsWith('/') || DRIVE.test(s);
+const split = (s) => { const m = DRIVE.exec(s) ?? UNC.exec(s); return m ? [m[1], m[2] ?? '/'] : ['', s]; };
+// Is this path module one of Windows' (native win32, or the POSIX form with drives)? Only there is `D:` a drive.
+export const isWinModule = (m) => m === drivePosix || m === path.win32;
+export const drivePosix = {
+  ...posix,
+  isAbsolute: (s) => rooted(String(s)),
+  resolve(...parts) {
+    let out = '';
+    for (let i = parts.length - 1; i >= 0 && !rooted(out); i--) {
+      const s = String(parts[i] ?? '');
+      if (s !== '') out = out === '' ? s : `${s}/${out}`;
+    }
+    if (!rooted(out)) out = `${toPosix(process.cwd())}/${out}`;
+    const [drive, rest] = split(out);
+    return `${drive}${posix.resolve('/', rest)}`;
+  },
+  dirname(s) {
+    const [drive, rest] = split(String(s));
+    return drive ? `${drive}${posix.dirname(rest)}` : posix.dirname(s);
+  },
+  // (normalize and join: a drive or a share is a root that `..` does not leave, and the `//` of a UNC path stays)
+  normalize(s) {
+    const [drive, rest] = split(String(s));
+    if (!drive) return posix.normalize(s);
+    const r = posix.resolve('/', rest);
+    return `${drive}${r !== '/' && rest.endsWith('/') ? `${r}/` : r}`;
+  },
+  join(...parts) {
+    const j = parts.map(String).filter((x) => x !== '').join('/');
+    return j === '' ? '.' : drivePosix.normalize(j);
+  },
+  relative(a, b) {
+    const [da, ra] = split(this.resolve(a));
+    const [db, rb] = split(this.resolve(b));
+    return da.toLowerCase() === db.toLowerCase() ? posix.relative(ra, rb) : `${db}${rb}`;
+  },
+};
