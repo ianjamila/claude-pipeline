@@ -166,7 +166,8 @@ global git guard stay on regardless.
 
 Private local stacks (one per worktree) keep eating memory after the work is done. `P stacks` stops the ones nobody uses.
 
-- **Measure first.** Every mode (`sessionEnd`, `sweeper`, `devServers`) starts as `report`: it logs what it *would* stop and stops nothing. Check `P stacks status`. After 7 days with `MISS 0` (a stack it would have stopped was used within 2 h), flip one mode to `apply` in `~/.claude/pipeline-state/stacks/mode.json`. Only you do that.
+- **Measure first.** Every mode (`sessionEnd`, `sweeper`, `devServers`) starts as `report`: it logs what it *would* stop and stops nothing. Check `P stacks status`. After 7 days with `MISS 0` (a stack it would have stopped was used within 2 h by a process that was already running), flip one mode to `apply` in `~/.claude/pipeline-state/stacks/mode.json`. Only you do that.
+- **What counts as use.** Starting, stopping, querying or editing a stack registers a lease; just looking (`docker ps`, `docker logs`, `ls`, `grep`, the Read / Grep / Glob tools) does not. A session that was alive at the would-stop but only inspected the stack until then is a RESTART, not a MISS, when its own transcript shows nothing but read-only work (needs the config's `transcriptDirs`); anything doubtful stays a MISS.
 - **Pause.** `touch ~/.claude/pipeline-state/stacks/pause` stops everything on every path; delete the file to resume.
 - **Keep list.** `~/.claude/pipeline-state/stacks/keep` holds one project id per line (`#` comments); a listed project is never stopped.
 - **Setup.** `P stacks init --write` writes the machine config (which ids are shared, which repos to scan). `P stacks schedule --install` adds the daily sweep. Install writes neither.
