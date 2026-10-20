@@ -145,6 +145,15 @@ export const run = guarded(async (argv, ctx) => {
       const ls = local.perPr.get(p.number) ?? null;
       const ciInfo = ciDetail(p.contexts, required);
       const ci = ciInfo.status;
+      // How far the base moved since the hand-off (GitHub's own count; best effort: a failed compare only drops the remark).
+      let handoffMoved;
+      if (a.record?.outcome === 'owner-ui-merge' && a.record.handoff?.baseTip) {
+        try {
+          handoffMoved = gh.compare(a.record.handoff.baseTip, p.baseRefName).aheadBy ?? 0;
+        } catch (err) {
+          warnings.push(`#${p.number}: could not count the commits on ${p.baseRefName} since the hand-off: ${describe(err)}`);
+        }
+      }
       const classified = classifyPr({
         number: p.number, title: p.title, isDraft: p.isDraft, labels: p.labels, headRefOid: p.headRefOid,
         isCrossRepository: p.isCrossRepository, baseRefName: p.baseRefName, ci, ciFailed: ciInfo.failed, conflicts: conflictsFact(g.conflicts, p.mergeable), alreadyOnBase: g.alreadyOnBase,
@@ -152,6 +161,7 @@ export const run = guarded(async (argv, ctx) => {
         needsHumanReason: a.needsHumanReason, needsHumanHardStopOnly: a.needsHumanHardStopOnly,
         activity: { commitDate: p.commitDate, commentUpdatedAts: a.commentUpdatedAts, reviewDates: p.reviewDates, createdAt: p.createdAt },
         local: localForClassifier(ls, p.headRefName),
+        handoffMoved,
       }, { staleDays, now, ownerApproval: config.owner_approval });
       return {
         ...classified,

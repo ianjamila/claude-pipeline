@@ -724,3 +724,36 @@ test('ciDetail: names the failed and the missing required checks', () => {
   assert.equal(ciDetail([], []).status, 'incomplete');
   assert.deepEqual(ciDetail([run('x', 'COMPLETED', 'TIMED_OUT')], []).failed, ['x']);
 });
+
+// ---- ship redesign: awaiting-plan-approval and owner-ui-merge --------------------------------------
+
+test('awaiting-plan-approval: the owner reads the plan and says approve; leave it alone', () => {
+  const r = cls({ record: record({ step: 'plan', outcome: 'awaiting-plan-approval' }), triage: null });
+  assert.equal(r.waitingOn, 'plan-approval');
+  assert.equal(r.suggest, 'leave');
+  assert.match(r.reason, /plan waiting for the owner's "approve"/);
+  assert.match(r.nextAction, /read the plan, then say "approve"/);
+});
+
+test('awaiting-plan-approval with the needs-human label (hard-stop plan) is still a plan-approval wait', () => {
+  const r = cls({ labels: ['needs-human'], record: record({ step: 'plan', outcome: 'awaiting-plan-approval' }), triage: null });
+  assert.equal(r.waitingOn, 'plan-approval');
+});
+
+test('owner-ui-merge: handed off for a GitHub merge, never the pipeline; the move since the hand-off is shown', () => {
+  const r = cls({ record: record({ step: 'awaiting-owner-merge', outcome: 'owner-ui-merge' }) });
+  assert.equal(r.waitingOn, 'owner-github-merge');
+  assert.equal(r.suggest, 'leave');
+  assert.match(r.reason, /handed off for a GitHub merge/);
+  assert.doesNotMatch(r.reason, /main moved/);
+  assert.match(r.nextAction, /merge in GitHub if you accept the hand-off \(head a1b2c3d\)/);
+  const moved = cls({ record: record({ step: 'awaiting-owner-merge', outcome: 'owner-ui-merge' }), handoffMoved: 3 });
+  assert.equal(moved.waitingOn, 'owner-github-merge');
+  assert.match(moved.reason, /main moved 3 commits since the hand-off/);
+  assert.match(cls({ record: record({ outcome: 'owner-ui-merge' }), handoffMoved: 1 }).reason, /main moved 1 commits? since the hand-off/);
+});
+
+test('owner-ui-merge: a failing check still wins over the hand-off', () => {
+  const r = cls({ ci: 'failed', ciFailed: ['ci'], record: record({ step: 'awaiting-owner-merge', outcome: 'owner-ui-merge' }) });
+  assert.equal(r.waitingOn, 'failing-check');
+});

@@ -77,13 +77,15 @@ const SUGGEST = {
   'failing-check': 'resume',
   review: 'resume',
   'owner-merge': 'merge',
+  'plan-approval': 'leave',
+  'owner-github-merge': 'leave',
   pipeline: 'resume',
   abandoned: 'close',
 };
 
 const LABEL_FRAGMENT = 'needs-human label present: the run continues but ends at the owner (no merge)';
 
-const RESUMABLE_OUTCOMES = new Set(['awaiting-review', 'blocked', 'awaiting-owner-merge', 'stopped']);
+const RESUMABLE_OUTCOMES = new Set(['awaiting-review', 'blocked', 'awaiting-owner-merge', 'stopped', 'awaiting-plan-approval', 'owner-ui-merge']);
 
 const NEVER_GATED_STEPS = new Set(['build', 'verify', 'pr']);
 
@@ -213,6 +215,15 @@ export function classifyPr(facts, options) {
     waitingOn = 'review';
     reason = `never reviewed: ${resume} adopts it`;
     nextAction = resume;
+  } else if (record?.outcome === 'awaiting-plan-approval') {
+    waitingOn = 'plan-approval';
+    reason = 'plan waiting for the owner\'s "approve"';
+    nextAction = 'read the plan, then say "approve"';
+  } else if (record?.outcome === 'owner-ui-merge') {
+    // The pipeline handed a green PR to the owner for a GitHub merge: it never merges it, and it is not "pipeline" work.
+    waitingOn = 'owner-github-merge';
+    reason = `handed off for a GitHub merge${f.handoffMoved > 0 ? `; main moved ${f.handoffMoved} commits since the hand-off` : ''}`;
+    nextAction = `merge in GitHub if you accept the hand-off (head ${sha7(f.headRefOid)})`;
   } else if (
     record?.outcome === 'awaiting-owner-merge' &&
     !midRunLabel && // with the label the gate ends in needs-human, never in an owner-merge

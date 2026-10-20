@@ -488,3 +488,38 @@ test('with git: its answer wins over GitHub in both directions', () => {
   assert.equal(p.waitingOn, 'failing-check');
   assert.notEqual(p.suggest, 'merge');
 });
+
+test('owner-ui-merge hand-off: owner-github-merge, with the commits main moved since the hand-off counted by GitHub; a failed compare only warns', () => {
+  const w = world();
+  const sha = w.prBranch(1, { 'b.txt': 'b\n' });
+  const handoff = { head: sha, baseTip: w.base, at: ago(DAY) };
+  const comments = { match: COMMENTS(1), stdoutJson: [recordComment(1, 1, sha, { step: 'awaiting-owner-merge', outcome: 'owner-ui-merge', handoff })] };
+  const fake = createFakeGh([
+    ...BASE_ENTRIES,
+    OPEN_ONLY(page([node(1, sha)])),
+    NO_MERGED,
+    comments,
+    { match: '^api repos/acme/widgets/compare/', stdoutJson: { status: 'ahead', behind_by: 0, ahead_by: 3, base: w.base } },
+  ]);
+  const r = inbox(['--no-git'], { w, fake });
+  assertExit(r, 0);
+  assert.equal(r.json.prs[0].waitingOn, 'owner-github-merge');
+  assert.equal(r.json.prs[0].suggest, 'leave');
+  assert.match(r.json.prs[0].reason, /main moved 3 commits since the hand-off/);
+  assert.equal(r.json.triage.leave.length, 1);
+  const compare = fake.calls().find((c) => c.argv.join(' ').startsWith('api repos/acme/widgets/compare/'));
+  assert.ok(compare.argv.join(' ').includes(`compare/${w.base}...main`), 'counted from the hand-off base tip to the base branch');
+
+  const failing = createFakeGh([
+    ...BASE_ENTRIES,
+    OPEN_ONLY(page([node(1, sha)])),
+    NO_MERGED,
+    comments,
+    { match: '^api repos/acme/widgets/compare/', code: 1, stderr: 'boom' },
+  ]);
+  const r2 = inbox(['--no-git'], { w, fake: failing });
+  assertExit(r2, 0);
+  assert.equal(r2.json.prs[0].waitingOn, 'owner-github-merge');
+  assert.doesNotMatch(r2.json.prs[0].reason, /main moved/);
+  assert.ok(r2.json.warnings.some((x) => /since the hand-off/.test(x)));
+});
