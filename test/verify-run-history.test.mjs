@@ -170,7 +170,7 @@ test('appendHistory: throws when the folder cannot be made (a parent is a file)'
 const CONFIG = 'version: 1\nproject: history-test\ndefault_branch: main\nverify:\n  full: node scripts/verify.mjs\n  quick: node scripts/verify.mjs --quick\n  expected_steps: [a, b]\n';
 const sink = () => { const parts = []; return { write: (s) => { parts.push(s); return true; }, text: () => parts.join('') }; };
 const nodeCmd = (js) => `node -e "${js}"`;
-const OK = nodeCmd('process.exit(0)');
+const OK = nodeCmd("console.log('step ok')");
 
 async function runInRepo(steps, argv, { historyFile, env } = {}) {
   const repo = await project({ config: CONFIG });
