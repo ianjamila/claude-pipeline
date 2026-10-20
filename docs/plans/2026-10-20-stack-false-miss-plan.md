@@ -24,33 +24,7 @@ match (so `echo name | xargs supabase stop`, `cat f | psql -p <port>`, `ls && su
 
 Revision 2 (Codex B1): before any of this, the WHOLE raw command is not read-only when it contains anything that can run a
 program inside an argument, quoted or not: `$(`, a backtick, `<(`, `>(`, `${` (an expansion can hold `$(…)`), or a word
-`eval` / `exec` / `source` / `.`. Revision 3 (Codex recheck B1): ANY `# Stack stop: two false-MISS causes — plan (2026-10-20)
-
-Spec: docs/specs/2026-10-19-stack-stop-design.md (§1 register hook, §6 measurement). Measure-first is unchanged: no mode.json is installed, so every
-mode resolves to report (configuration, not a code invariant: apply mode still stops). This PR changes what counts as a lease (a) and how a lease-only use is classified (b).
-
-## Evidence (live checks 2026-10-20, report mode)
-
-Test stack `autostop-live`, two session-end would-stops, two MISSes, both false:
-
-| would-stop (session-end) | use (ledger `use`, check C1) | owner | owner birth | what it ran |
-|---|---|---|---|---|
-| 03:14:13.119Z | 03:14:48.267Z via folder | pid 9705 | 03:14:01Z (1792466041) | `docker ps --filter name=<stack>` |
-| 03:16:22.749Z | 03:17:06.895Z via folder | pid 72631 | 03:16:20Z (1792466180) | `docker inspect … label=…<stack>` |
-
-Neither process had any lease, connection or process reference for the stack at or before the decision. Both were born a
-few seconds before it (a new / resumed session starting while the old one exited), so the birth-only rule called them MISS.
-
-## (a) read-only inspection is not use — `pipeline/lib/stacks/match.mjs`
-
-New exported `readOnlyCommand(command, platform)`; `bashTargets` returns `[]` when it is true. A Bash command is read-only
-only when EVERY simple command in it (`segmentsOf` + `splitCommand`, the same parse as today) is either neutral (`cd`,
-`pushd`, `popd`) or a read-only inspection, and at least one is an inspection. Anything else keeps today's whole-command
-match (so `echo name | xargs supabase stop`, `cat f | psql -p <port>`, `ls && supabase status` all still lease).
-
-Revision 2 (Codex B1): before any of this, the WHOLE raw command is not read-only when it contains anything that can run a
-program inside an argument, quoted or not: `$(`, a backtick, `<(`, `>(`, `${` (an expansion can hold `$(…)`), or a word
-`eval` / `exec` / `source` / `.`.  makes it not read-only (an expanded variable can inject `-exec psql …`). Regression cases: `cat "$(psql -p <port>)"`,
+`eval` / `exec` / `source` / `.`. Revision 3 (Codex recheck B1): ANY `$` makes it not read-only (an expanded variable can inject `-exec psql …`). Regression cases: `cat "$(psql -p <port>)"`,
 `ls "`supabase status`"`, `X="$(psql …)" ls`, `grep x <(psql …)`, `ls ${D:-$(supabase …)}` all still lease.
 
 Read-only inspection = command word (after leading `VAR=value` words) in this list, with these guards:
