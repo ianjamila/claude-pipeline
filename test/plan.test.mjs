@@ -135,3 +135,30 @@ test('HTML comments and tags outside the Scope section are not refused', () => {
 test('the Scope section ends at the first task heading: a backticked bullet in a task body is not scope', () => {
   assert.deepEqual(parsePlan(PLAN.replace('b works', 'b works\n- `evil/**`')).scope, SCOPE_OK);
 });
+
+test('an HTML comment masks headings like a fence: a fake Scope inside one before the real Scope is ignored', () => {
+  const evil = PLAN.replace('## Scope', '<!--\n## Scope\n- `evil/**`\n-->\n## Scope');
+  const p = parsePlan(evil);
+  assert.deepEqual(p.scope, SCOPE_OK);
+  assert.deepEqual(p.tasks.map((t) => t.id), ['T1', 'T2']);
+  // a one-line comment, and a comment hiding a task heading, mask only what they cover
+  assert.deepEqual(parsePlan(PLAN.replace('## Scope', '<!-- note -->\n## Scope')).scope, SCOPE_OK);
+  const hidden = PLAN.replace('b works', '<!--\n### Task T9: Fake\n-->\nb works');
+  assert.deepEqual(parsePlan(hidden).tasks.map((t) => t.id), ['T1', 'T2']);
+  // a fence marker inside a comment is not a fence; a comment marker inside a fence or a code span is not a comment
+  const fenceInComment = PLAN.replace('## Scope', '<!--\n```\n-->\n## Scope');
+  assert.deepEqual(parsePlan(fenceInComment).scope, SCOPE_OK);
+  assert.deepEqual(parsePlan(PLAN + '```\n<!--\n```\n').tasks.map((t) => t.id), ['T1', 'T2']);
+  assert.deepEqual(parsePlan(PLAN.replace('b works', 'b `<!--` works\n### Task T3: Real\nc')).tasks.map((t) => t.id), ['T1', 'T2', 'T3']);
+});
+
+test('an unclosed HTML comment before the real Scope hides it to the end: PlanError (missing Scope)', () => {
+  assert.throws(() => parsePlan(PLAN.replace('## Scope', '<!-- never closed\n## Scope')), (e) => e instanceof PlanError && /missing "## Scope"/.test(e.message));
+});
+
+test('a second unmasked "## Scope" or "## In plain English" section is refused', () => {
+  assert.throws(() => parsePlan(PLAN.replace('### Task T1', '## Scope\n- `evil/**`\n\n### Task T1')), (e) => e instanceof PlanError && /duplicate ## Scope section/.test(e.message));
+  assert.throws(() => parsePlan(PLAN.replace('### Task T1', '## In plain English\nother\n\n### Task T1')), (e) => e instanceof PlanError && /duplicate ## In plain English section/.test(e.message));
+  // a duplicate inside a fence or comment is masked, so it is fine
+  assert.ok(parsePlan(PLAN.replace('b works', 'b works\n```\n## Scope\n```\n<!--\n## In plain English\n-->')));
+});
