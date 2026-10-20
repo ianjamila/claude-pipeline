@@ -607,7 +607,7 @@ test('roundOutcome: clean when every item is settled, nothing accepted, and the 
   ];
   const o = roundOutcome(stateOf([round(1, []), round(2, items)]));
   assert.deepEqual(o, {
-    clean: true, openBlocking: [], newAccepted: [], needsHuman: [], pending: [], unimplemented: [], reachedMax: false, coverageValid: true,
+    clean: true, openBlocking: [], newAccepted: [], needsHuman: [], pending: [], unimplemented: [], unmetObligations: [], reachedMax: false, coverageValid: true,
   });
 });
 

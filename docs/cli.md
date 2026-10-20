@@ -84,7 +84,8 @@ run one Codex review round over base..head and record its findings.
 
 ```
 pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium|high|xhigh [--model M] [--repo DIR]
-  -> {ok, round, counts:{blocking, suggestions, worth_considering}, preRuled, lightLane, path}
+  -> {ok, round, counts:{blocking, suggestions, worth_considering}, preRuled, lightLane, path, obligations:[{source, promptHeader}]}
+  obligations: reviewers this round owes (security on a security-relevant PR, the optional Fable final pass), derived here; dispatch each with its promptHeader pasted verbatim, then `pipeline review add`
   --base must be the PR's merge base for round 1 and the previous round's toHead after that, else exit 2 {error:base-mismatch}
   exit 2 {error:empty-range} when earlier rounds accepted items and the branch content is unchanged since the last round (base == head)
   commits merged in from the PR's base branch since the previous round are left out of the reviewed diff; a round that only merged them in
@@ -410,6 +411,23 @@ No usable run record means `adopt: true`; a published review state is still hono
 
 Exit: 0 · 2 usage / PR not found · 3 GitHub (`gh`) unavailable.
 
+## review
+
+reviewer obligations of a review round: the prompt header, and proving + adding a reviewer's findings.
+
+```
+pipeline review header --pr N --round R --source security|fable --base SHA --head SHA [--repo DIR]
+  -> {ok, promptHeader, digest}; paste promptHeader verbatim as the first two lines of the reviewer's prompt (`codex-review` also prints it per owed reviewer)
+pipeline review add --round R --source security|fable --tag TAG [--projects-dir DIR] [--max-age-ms N] [--repo DIR]
+  -> {ok, round, source, added:[ids], errors}; proves the model (security: claude-sonnet-, no effort; fable: claude-fable- at effort high) and the header,
+     then adds the findings as items R<n>-X<B|S|W><i> (security) / R<n>-F<B|S|W><i> (fable) and marks the obligation met;
+     exit 1 {error: no-obligation | already-met} or an unproven answer (obligation failed, a human looks; add may be run again), 2 no transcript
+```
+
+Exit: 0 · 1 `no-obligation` / `already-met` / an unproven answer (the obligation is marked failed and the round needs a human; `add` may be run again with a new transcript) · 2 usage, no state, no transcript · 3 GitHub (`gh`) unavailable (`header`, only when no review state exists yet).
+
+Obligations are derived by `codex-review` from the round's own inputs, never declared by the controller: `security` in round 1 of a security-relevant PR (a SQL / migration / `supabase/` path, an R1-R3 hard-stop hit, or a `review.security.paths` glob; `review.security: off` opts out) and again in a later round whose own range touches such a path; `fable` once, when `review.final_pass: risky`, the PR is high risk and the round has no BLOCKING Codex item. Until every obligation of every round is `met`, the review is not clean (`state outcome`), `review-complete` refuses and names the unmet ones, and a failed one appears in `needsHuman` as `R<n>:<source>-proof`.
+
 ## review-complete
 
 remove awaiting-review once the review is valid for the current content.
@@ -426,7 +444,7 @@ Exit: 0 label removed · 1 review not valid for this head · 2 usage · 3 label 
 assess the risk level of a branch diff.
 
 ```
-pipeline risk --base REF --head REF [--repo DIR]   -> {ok, level, reasons, lightLane, changedLines, fileCount, hardStops, base, head, mergeBase}
+pipeline risk --base REF --head REF [--repo DIR]   -> {ok, level, reasons, lightLane, security, securityReasons, changedLines, fileCount, hardStops, base, head, mergeBase}
 ```
 
 Exit: 0 whenever a level could be computed (it is a report, not a gate) · 2 usage / config / git.

@@ -7,6 +7,7 @@ import {
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { gunzipSync, gzipSync } from 'node:zlib';
+import { OBLIGATION_SOURCES } from './obligations.mjs';
 
 const STATE_MARKER = /<!-- claude-pipeline:state:([A-Za-z0-9+/=]+) -->/g;
 // A PR comment is at most 64 KiB, so real state is tiny; cap decompression so a hostile comment
@@ -138,15 +139,21 @@ export function decodeFromComment(body) {
 }
 
 // reviewBase / reviewBaseKind: what the round was actually diffed against (see git.mjs#effectiveReviewBase); baseOnly: the
-// round only merged the base branch in, so Codex did not run. Each is recorded only when given.
-export function addRound(state, { n, fromHead, toHead, contentHashAtToHead, items, reviewBase, reviewBaseKind, baseOnly }) {
+// round only merged the base branch in, so Codex did not run. obligations: the extra reviewers this round owes
+// (lib/obligations.mjs). Each is recorded only when given (an empty obligations list is not recorded).
+export function addRound(state, { n, fromHead, toHead, contentHashAtToHead, items, reviewBase, reviewBaseKind, baseOnly, obligations }) {
   if (!Array.isArray(items)) throw new Error(`round ${n}: items must be an array`);
+  if (obligations !== undefined) {
+    if (!Array.isArray(obligations) || !obligations.every((o) => isPlainObject(o) && OBLIGATION_SOURCES.includes(o.source))) {
+      throw new Error(`round ${n}: obligations must be an array of known sources (${OBLIGATION_SOURCES.join(', ')})`);
+    }
+  }
   if (state.rounds.some((r) => r.n === n)) throw new Error(`round ${n} already exists in the review state`);
   return {
     ...state,
     rounds: [...state.rounds, {
       n, fromHead, toHead, ...(reviewBase === undefined ? {} : { reviewBase, reviewBaseKind }), contentHashAtToHead,
-      ...(baseOnly === true ? { baseOnly: true } : {}), items: structuredClone(items),
+      ...(baseOnly === true ? { baseOnly: true } : {}), ...(obligations?.length ? { obligations: structuredClone(obligations) } : {}), items: structuredClone(items),
     }],
   };
 }

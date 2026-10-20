@@ -299,6 +299,10 @@ export function roundOutcome(state) {
   const openBlocking = idsOf(everything.filter(isOpenBlocking));
   const unimplemented = idsOf(everything.filter(isUnimplementedAccept));
   const newAccepted = idsOf((last?.items ?? []).filter(isNewAccept));
+  // Reviewer obligations (lib/obligations.mjs): a pending one is unfinished work, a failed one (unproven answer) needs a human.
+  const obligations = rounds.flatMap((r) => (r.obligations ?? []).map((o) => ({ ...o, n: r.n })));
+  const unmetObligations = obligations.filter((o) => o.status === 'pending').map((o) => `R${o.n}:${o.source}`);
+  needsHuman.push(...obligations.filter((o) => o.status === 'failed').map((o) => `R${o.n}:${o.source}-proof`));
   const coverageValid =
     last !== undefined &&
     hasContentHash(last.contentHashAtToHead) &&
@@ -310,9 +314,10 @@ export function roundOutcome(state) {
     openBlocking.length === 0 &&
     unimplemented.length === 0 &&
     newAccepted.length === 0 &&
+    unmetObligations.length === 0 &&
     coverageValid;
   const reachedMax = Number.isFinite(state?.maxRounds) && rounds.length >= state.maxRounds && !clean;
-  return { clean, openBlocking, newAccepted, needsHuman, pending, unimplemented, reachedMax, coverageValid };
+  return { clean, openBlocking, newAccepted, needsHuman, pending, unimplemented, unmetObligations, reachedMax, coverageValid };
 }
 
 // True when the MOST RECENT clean round (one that accepted nothing new) reviewed exactly `contentHash`, no later
@@ -322,6 +327,7 @@ export function reviewValidFor(state, contentHash) {
   if (!hasContentHash(contentHash)) return false;
   if (allItems(state).some(unresolved)) return false;
   const rounds = state?.rounds ?? [];
+  if (rounds.some((r) => (r.obligations ?? []).some((o) => o.status !== 'met'))) return false;
   const isClean = (round) => (round.items ?? []).every((item) => !isNewAccept(item));
   const lastClean = rounds.findLast(isClean);
   if (lastClean === undefined || lastClean !== rounds.at(-1)) return false;

@@ -25,7 +25,8 @@ import {
 import { collectHardStops } from '../lib/hardstops.mjs';
 import { createGitHub } from '../lib/github.mjs';
 import { GhError } from '../lib/proc.mjs';
-import { assessRisk, isLightLane } from '../lib/risk.mjs';
+import { assessRisk, assessSecurity, isLightLane } from '../lib/risk.mjs';
+import { obligationDigest, promptHeader, requiredObligations } from '../lib/obligations.mjs';
 import { addRound, emptyState, loadState, saveState } from '../lib/state.mjs';
 import { reuseRuled, ruledCacheFrom } from '../lib/triage.mjs';
 import {
@@ -37,7 +38,8 @@ export const meta = {
   summary: 'run one Codex review round over base..head and record its findings',
   usage: [
     'pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium|high|xhigh [--model M] [--repo DIR]',
-    '  -> {ok, round, counts:{blocking, suggestions, worth_considering}, preRuled, lightLane, path}',
+    '  -> {ok, round, counts:{blocking, suggestions, worth_considering}, preRuled, lightLane, path, obligations:[{source, promptHeader}]}',
+    '  obligations: reviewers this round owes (security on a security-relevant PR, the optional Fable final pass), derived here; dispatch each with its promptHeader pasted verbatim, then `pipeline review add`',
     '  --base must be the PR\'s merge base for round 1 and the previous round\'s toHead after that, else exit 2 {error:base-mismatch}',
     '  exit 2 {error:empty-range} when earlier rounds accepted items and the branch content is unchanged since the last round (base == head)',
     '  commits merged in from the PR\'s base branch since the previous round are left out of the reviewed diff; a round that only merged them in',
@@ -176,6 +178,13 @@ export const run = guarded(async (argv, ctx) => {
       ? effectiveReviewBase({ from: base, forkPoint }, o)
       : { base, kind: 'previous' };
   }
+  // Security trigger: for the whole PR (round 1) or, later, for this round's own range (previous toHead..head) only, so a docs-only
+  // fix round does not owe a second security review. (A synthetic review base is a tree, which diffFiles cannot take.) Git work
+  // stays outside the lock.
+  const sec = assessSecurity({ files, hits, config });
+  const rangeFiles = round > 1 ? diffFiles(base, head, o) : files;
+  const changedInRange = new Set(rangeFiles.flatMap((f) => [f.oldPath, f.newPath, f.path]).filter(Boolean));
+  const secInRange = round > 1 && assessSecurity({ files: rangeFiles, hits: hits.filter((h) => changedInRange.has(h.file)), config }).security;
   // Large binary documents would overflow the buffer; they are named at the end of the patch and in the prompt instead.
   const { patch, skipped: largeBinaries } = reviewPatch(review.base, head, o);
   // Only the base branch was merged in since the last round: there is nothing of the PR's own to review.
@@ -224,6 +233,7 @@ export const run = guarded(async (argv, ctx) => {
     }
     return excerptWindow(fileCache.get(file), line)?.lines.join('\n') ?? '';
   };
+  let obligations = [];
   const items = await withReviewLock(root, pr, ctx, async () => {
     // Codex took a while: whatever happened to the review meanwhile (another session recorded this round, the PR's
     // state was replaced) is read again, and what is there now wins.
@@ -236,14 +246,20 @@ export const run = guarded(async (argv, ctx) => {
     }
     const base0 = fresh ?? emptyState({ repo: slug, pr, branch: view.headRefName ?? 'HEAD', risk: level, lightLane, maxRounds: config.review.max_rounds });
     const ruled = reuseRuled(assignIds(findings, round, excerptFor, { contentHash: hashAtHead }), ruledCacheFrom(allItems(base0)));
+    // Reviewer obligations: derived from this round's own inputs. `repo` is the state's (slug is only read when no state existed).
+    const owed = requiredObligations({
+      round, security: sec.security, securityInRange: secInRange, level, finalPass: config.review.final_pass,
+      blockingCount: findings.blocking.length, priorRounds: base0.rounds,
+    }).map((source) => ({ source, status: 'pending', digest: obligationDigest({ repo: base0.repo, pr, source, base: review.base, head }) }));
     const next = addRound({ ...base0, risk: level, lightLane, currentContentHash: hashAtHead }, {
-      n: round, fromHead: base, toHead: head, contentHashAtToHead: hashAtHead, items: ruled,
+      n: round, fromHead: base, toHead: head, contentHashAtToHead: hashAtHead, items: ruled, obligations: owed,
       reviewBase: review.base, reviewBaseKind: review.kind, ...(baseOnly ? { baseOnly: true } : {}),
     });
     writeJson(path.join(dir, 'codex.json'), { findings, items: ruled });
     writeFileAtomic(path.join(dir, 'codex.md'), renderFindingsMarkdown(findings, round, ruled));
     saveState(root, next);
     state = next;
+    obligations = owed;
     return ruled;
   });
 
@@ -261,6 +277,7 @@ export const run = guarded(async (argv, ctx) => {
       preRuled: items.filter((i) => i.final).length,
       lightLane: state.lightLane,
       path: dir,
+      obligations: obligations.map((ob) => ({ source: ob.source, promptHeader: promptHeader(round, ob.digest) })),
     },
   };
 });

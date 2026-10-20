@@ -29,6 +29,7 @@ function whyNot(state, hash) {
   if (o.openBlocking.length > 0 || o.unimplemented.length > 0) {
     return `accepted items are not implemented: ${[...new Set([...o.openBlocking, ...o.unimplemented])].join(', ')}`;
   }
+  if (o.unmetObligations.length > 0) return `reviewer obligations not met: ${o.unmetObligations.join(', ')} (run the reviewer, then \`pipeline review add\`)`;
   if (!o.coverageValid) return 'no review round covers the current content (the branch changed since the last review)';
   return 'the last review round accepted new items that still need a round to review their fixes';
 }
