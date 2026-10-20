@@ -196,7 +196,7 @@ function stopRig({ disarm = () => true } = {}) {
   return {
     home, calls,
     deps: { home, remoteUrl: () => 'git@github.com:acme/widgets.git', newId: () => '5f3a9c2e', hostname: () => 'testbox', lock: { waitMs: 2000, pollMs: 5 }, disableAutoMerge: (a) => { calls.push(a.pr); return disarm(a); } },
-    pending: () => (existsSync(ownerStopsDir(home)) ? readdirSync(ownerStopsDir(home)) : []),
+    heldFiles: () => (existsSync(ownerStopsDir(home)) ? readdirSync(ownerStopsDir(home)) : []),
   };
 }
 
@@ -440,7 +440,7 @@ test('summary --outcome needs-human in chat: the owner-stop event is posted befo
   assert.equal(t.res.output.reply, 'Stopped #12 · stop 5f3a9c2e\n⏸ Waiting on you for #12 — rule in chat, then say "ship resume 12"');
   const rec = posted(t.fake).record;
   assert.deepEqual([rec.v, rec.ownerStop.id, rec.next], [2, '5f3a9c2e', 'owner reply needed in chat (stop 5f3a9c2e): ship resume 12']);
-  assert.deepEqual(t.stops.pending(), [], 'the pending file is gone once the event posted');
+  assert.deepEqual(t.stops.heldFiles(), [], 'the pending file is gone once the event posted');
   assert.deepEqual(t.stops.calls, [12], 'auto-merge was disarmed');
   assert.equal(t.rig.fetchCalls.length, 1);
   assert.equal(t.rig.fetchCalls[0].body.message, 'Needs you: Rule in chat, then say "ship resume 12" (widgets)');
@@ -460,7 +460,7 @@ test('summary --outcome needs-human in label mode: no event, no pending file, no
   const t = await summaryIn(pushRepo(), ['--outcome', 'needs-human']);
   assert.equal(t.res.exitCode, 0);
   assert.equal(writesOf(t.fake).length, 1);
-  assert.deepEqual([t.res.output.ownerStop, t.res.output.reply, t.stops.calls, t.stops.pending()], [undefined, undefined, [], []]);
+  assert.deepEqual([t.res.output.ownerStop, t.res.output.reply, t.stops.calls, t.stops.heldFiles()], [undefined, undefined, [], []]);
   assert.equal(t.rig.fetchCalls[0].body.message, 'Needs you: Read the needs-human comment and decide (widgets)');
 });
 
@@ -475,7 +475,7 @@ test('summary --outcome needs-human in chat, GitHub unreadable at the stop: exit
   assert.match(t.error.message, /owner stop 5f3a9c2e is held locally/);
   assert.match(t.stderr, /Stopped #12 · stop 5f3a9c2e\n⏸ Waiting on you for #12/);
   assert.equal(t.rig.fetchCalls.length, 1, 'the push is still sent');
-  assert.deepEqual(t.stops.pending(), ['acme__widgets__12__5f3a9c2e.json']);
+  assert.deepEqual(t.stops.heldFiles(), ['acme__widgets__12__5f3a9c2e.json']);
 });
 
 test('summary --outcome needs-human in chat: the summary comment failing to write is a warning only; the stop stands and the reply is returned', async () => {
@@ -493,7 +493,7 @@ test('summary --outcome needs-human in chat: the summary comment failing to writ
   assert.equal(t.res.output.ownerStop.id, '5f3a9c2e');
   assert.match(t.res.output.reply, /^Stopped #12 · stop 5f3a9c2e/);
   assert.equal(writesOf(fake).filter((w) => w.body.includes('claude-pipeline:event:owner-stop:5f3a9c2e')).length, 1);
-  assert.deepEqual(t.stops.pending(), []);
+  assert.deepEqual(t.stops.heldFiles(), []);
 });
 
 // ---- agent-log ------------------------------------------------------------------------------------
