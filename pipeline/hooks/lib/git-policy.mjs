@@ -1227,6 +1227,7 @@ function checkHttpTool(argv, dir, ctx, tool = 'curl') {
   let urlFile = false;
   let configs = 0;
   let configUnreadable = false;
+  let globoff = false; // curl -g / --globoff: without it curl expands [a-b] ranges and {x,y} lists in a URL, even a quoted one
   let requestTarget = false; // curl --request-target: the path sent, whatever the URL says
   let strangeFlag = null; // an option this parser does not know that carries a /repos/ path
   const readData = (v, isFile) => {
@@ -1258,6 +1259,7 @@ function checkHttpTool(argv, dir, ctx, tool = 'curl') {
       words = [...words.slice(0, i + 1), ...curlConfigWords(text).map((x) => expandVars(x, ctx)), ...words.slice(i + 1)];
       continue;
     }
+    if (tool === 'curl' && (w === '-g' || w === '--globoff')) { globoff = true; continue; }
     if (tool === 'curl' && flag === '--request-target') { requestTarget = true; value(); continue; }
     if (URL_FILE_FLAGS.has(flag) && tool === 'wget') { value(); urlFile = true; continue; }
     if (HTTP_DATA_FLAGS.has(flag) && !(httpie && flag.length === 2 && flag !== '-F')) { implied = true; readData(value(), HTTP_FILE_FLAGS.has(flag)); continue; }
@@ -1284,12 +1286,15 @@ function checkHttpTool(argv, dir, ctx, tool = 'curl') {
   if (nonGet && urls.length === 0) return deny(`${verb} with no URL on the command line (it comes from stdin, xargs or a config), so what it calls cannot be verified. Write the URL out.`);
   for (const w of urls) {
     const host = (/^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/)?(?:[^/@?#]*@)?([^/:?#]*)/.exec(w) ?? [])[1] ?? '';
+    // (curl expands `pulls/[3-3]/merge` to `pulls/3/merge` and `comments,comments}` lists, so the endpoint judged below is not the one called; same test as line-writes.mjs)
+    const globbed = tool === 'curl' && !globoff && /[[{]/.test(w) && !/^\[[0-9A-Fa-f:.]*\]$/.test(host);
     const hostUnknown = host === '' || DYNAMIC.test(host) || /[{}]/.test(host); // ({} is the placeholder of xargs / find: the URL comes from elsewhere)
-    if (!hostUnknown && !GH_HOST.test(host)) continue;
+    if (!hostUnknown && !GH_HOST.test(host) && !(globbed && /[[{]/.test(host))) continue; // (a glob in the host can expand to github.com)
     if (!nonGet) {
       if (!hostUnknown && DYNAMIC.test(w) && /\$\(|`/.test(w)) return deny('the URL is built at run time ($(...) / backticks) for a github.com host, so what it calls cannot be verified. Write the URL out.');
       continue;
     }
+    if (globbed) return deny(`${verb} to a URL with curl globbing ([a-b] / {x,y}) that may point at github.com: curl expands it, so the endpoint it calls cannot be verified. Pass -g / --globoff or write the URL literally.`);
     if (hostUnknown || DYNAMIC.test(w)) return deny(`${verb} to a URL built at run time ($VAR / $(...)) that may point at github.com cannot be verified. Write the URL out.`);
     if (requestTarget) return deny(`${verb} with curl --request-target to a github.com host: it replaces the path of the URL, so the endpoint it calls cannot be verified. Put the path in the URL.`);
     if (strangeFlag) return deny(`${verb} to a github.com host with an option this guard does not know (${strangeFlag}) that carries a repository path: it may replace the endpoint, so the call cannot be verified. Put the path in the URL.`);

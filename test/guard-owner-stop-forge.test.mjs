@@ -70,6 +70,28 @@ test('curl / wget / httpie / xh: non-GET calls to github.com that merge, move re
   ]) allow(cmd);
 });
 
+// ---- curl URL globbing (review R3-B1): curl expands [a-b] / {x,y} in a quoted URL unless -g / --globoff, so the endpoint judged is not the one called ----
+test('curl: a globbed GitHub URL on a write is denied; with -g / --globoff / bundled -sg it is judged literally; plain URLs and reads behave as before', () => {
+  const merge = (flags) => `curl ${flags} -X PUT -H 'Authorization: token x' 'https://api.github.com/repos/o/r/pulls/[3-3]/merge'`;
+  const forge = (flags) => `curl ${flags} -X POST -d '{"body":"${MARK.replaceAll('"', '\\"')}"}' 'https://api.github.com/repos/o/r/issues/3/{comments,comments}'`;
+  for (const cmd of [
+    merge(''), forge(''), merge('-s'), merge('-sS'), forge('-s'), 'curl -X PUT "https://api.github.com/repos/o/r/pulls/{3,4}/merge"', 'curl -X POST -d x "https://api.github.com/repos/o/r/issues/[1-9]/comments"',
+    'curl -X PUT "https://api.github.com/repos/o/r/pulls/3/merge" -d x https://api.github.com/repos/o/r/pulls/[3-3]/merge', 'curl -X PUT "https://api.[g]ithub.com/repos/o/r/pulls/3/merge"', 'curl -X PUT "https://{api.github.com,x.test}/repos/o/r/pulls/3/merge"',
+  ]) { const r = deny(cmd); if (!/merge|merging|glob/i.test(r.reason)) assert.fail(cmd); }
+  assert.match(deny(merge('')).reason, /globbing/);
+  assert.match(deny(forge('')).reason, /globbing/);
+  // -g / --globoff (also bundled, and after the URL): curl does not expand, the URL is judged as written
+  for (const cmd of [merge('-g'), merge('--globoff'), merge('-sg'), merge('-gs'), forge('-g'), forge('--globoff'), forge('-sg'),
+    "curl -X PUT 'https://api.github.com/repos/o/r/pulls/[3-3]/merge' -g"]) allow(cmd);
+  // a literal [3-3] with -g is not the merge endpoint, but a literal merge URL still is
+  deny('curl -g -X PUT https://api.github.com/repos/o/r/pulls/3/merge');
+  deny(`curl -sg -d '{"body":"${MARK.replaceAll('"', '\\"')}"}' https://api.github.com/repos/o/r/issues/3/comments`);
+  // reads, non-GitHub hosts and plain URLs are unchanged
+  for (const cmd of ["curl 'https://api.github.com/repos/o/r/pulls/[3-3]'", "curl 'https://api.github.com/repos/o/r/issues/{1,2}/comments'", "curl -X POST 'https://example.com/x/[1-3]'", "curl -X POST -d '{\"a\":1}' https://example.com/x",
+    'curl -X POST -g http://[::1]:8080/x', "curl -d '{\"body\":\"hello\"}' https://api.github.com/repos/o/r/issues/3/comments", 'curl https://api.github.com/repos/o/r/pulls/3']) allow(cmd);
+  deny('curl -X PUT https://api.github.com/repos/o/r/pulls/3/merge');
+});
+
 // ---- run-time bodies: a comment text built at run time cannot be checked for the marker, so it is refused like an unreadable one ----
 test('a comment body built at run time ($(...) / $VAR / backticks) is denied on every comment-creating route; literal and quoted-heredoc bodies stay allowed', () => {
   const heredoc = (tag = "'EOF'", body = 'all green\nsecond line') => `<<${tag}\n${body}\nEOF\n`;
