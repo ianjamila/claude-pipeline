@@ -1,5 +1,9 @@
 // Read-only HTTP smoke test for a preview or production URL. It can only GET: no cookies, no auth headers, no request
 // bodies, redirects are reported rather than followed, so pointing it at production cannot change anything there.
+// One optional extra header exists: `smoke_bypass_header` (a lowercase x-… name in pipeline.yml) with its secret value in
+// the PIPELINE_SMOKE_BYPASS_KEY environment variable. It is a firewall hint for the configured origin (e.g. a Vercel
+// Firewall "Bypass" rule for CI runner IPs), NOT app authentication; it is never sent to loopback, never printed (the
+// output only says whether it was sent: `bypassHeader`), and the request stays a cookie-less GET.
 // Checks come from `smoke_checks` in .claude/pipeline.yml (default: GET / must answer 2xx/3xx). `--expect-text` proves
 // the deployed page is the new build, not just any page that answers.
 // Exit codes: 0 all checks pass, 1 a check failed, 2 usage/config error (including a non-https remote base URL).
@@ -7,7 +11,7 @@
 import { existsSync, realpathSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
-import { loadConfig } from './lib/config.mjs';
+import { loadConfig, SMOKE_BYPASS_HEADER_RE } from './lib/config.mjs';
 
 export const TIMEOUT_MS = 15_000;
 export const MAX_BODY_BYTES = 2 * 1024 * 1024;
@@ -35,6 +39,23 @@ export function normaliseBase(raw) {
   return u.origin + u.pathname.replace(/\/+$/, '');
 }
 
+// The request headers, and whether the bypass header is among them. Sent only when a name AND a non-empty value are
+// configured and the base is not loopback. `scrub` blanks the value out of any text that may reach the output (a reason
+// quoting a server-echoed location or a fetch error message), so the secret can never be printed.
+function bypassHeaders(bypass, base) {
+  const none = { headers: HEADERS, sent: false, scrub: (s) => s };
+  const name = bypass?.header;
+  const value = typeof bypass?.value === 'string' ? bypass.value.trim() : '';
+  if (!name || !value || LOOPBACK.has(new URL(base).hostname)) return none;
+  if (typeof name !== 'string' || !SMOKE_BYPASS_HEADER_RE.test(name)) {
+    throw new SmokeUsageError('smoke_bypass_header must be a lowercase header name matching /^x-[a-z0-9-]{1,60}$/');
+  }
+  // Visible ASCII only: a space/newline/control character is never a legal secret and would make fetch throw an error
+  // that quotes the value. The message below deliberately does not.
+  if (!/^[\x21-\x7e]+$/.test(value)) throw new SmokeUsageError('PIPELINE_SMOKE_BYPASS_KEY must be printable ASCII without spaces');
+  return { headers: { ...HEADERS, [name]: value }, sent: true, scrub: (s) => s.split(value).join('[redacted]') };
+}
+
 // Reads at most MAX_BODY_BYTES, then abandons the rest of the stream.
 async function readCapped(res) {
   if (!res.body) return '';
@@ -51,8 +72,8 @@ async function readCapped(res) {
   return new TextDecoder('utf-8').decode(Buffer.concat(chunks).subarray(0, MAX_BODY_BYTES));
 }
 
-async function attempt(url, fetchFn) {
-  const res = await fetchFn(url, { method: 'GET', redirect: 'manual', headers: HEADERS, signal: AbortSignal.timeout(TIMEOUT_MS) });
+async function attempt(url, fetchFn, headers) {
+  const res = await fetchFn(url, { method: 'GET', redirect: 'manual', headers, signal: AbortSignal.timeout(TIMEOUT_MS) });
   const is2xx = res.status >= 200 && res.status < 300;
   const body = is2xx ? await readCapped(res) : null;
   if (!is2xx) await res.body?.cancel().catch(() => {});
@@ -77,13 +98,13 @@ function verdict(check, got) {
 }
 
 // One check with retries. Returns { result, body } (body kept for --expect-text, never printed).
-async function runCheck(base, check, { fetchFn, sleep }) {
+async function runCheck(base, check, { fetchFn, sleep, headers, scrub }) {
   const started = Date.now();
   let got = null;
   let error = null;
   for (let i = 0; ; i++) {
     try {
-      got = await attempt(base + check.path, fetchFn);
+      got = await attempt(base + check.path, fetchFn, headers);
       error = null;
     } catch (err) {
       got = null;
@@ -96,23 +117,25 @@ async function runCheck(base, check, { fetchFn, sleep }) {
   const ms = Date.now() - started;
   if (error) {
     const why = error.name === 'TimeoutError' ? `timed out after ${TIMEOUT_MS / 1000}s` : (error.cause?.code ?? error.cause?.message ?? error.message);
-    return { result: { path: check.path, status: null, ok: false, reason: `network error: ${why}`, ms, vercelId: null }, body: null };
+    return { result: { path: check.path, status: null, ok: false, reason: scrub(`network error: ${why}`), ms, vercelId: null }, body: null };
   }
   const reasons = verdict(check, got);
   return {
-    result: { path: check.path, status: got.status, ok: reasons.length === 0, reason: reasons.length ? reasons.join('; ') : null, ms, vercelId: got.vercelId },
+    result: { path: check.path, status: got.status, ok: reasons.length === 0, reason: reasons.length ? scrub(reasons.join('; ')) : null, ms, vercelId: got.vercelId },
     body: got.body,
   };
 }
 
 /**
- * options: { base, production, checks: [{path, status?, contains?, location_contains?}], expectText?, expectPath? }
+ * options: { base, production, checks: [{path, status?, contains?, location_contains?}], expectText?, expectPath?,
+ *             bypass?: { header, value } }   (sent only when both are set and the base is not loopback)
  * deps (tests): fetch, sleep. Throws SmokeUsageError for a bad base URL.
  */
 export async function runSmoke(options, deps = {}) {
   const fetchFn = deps.fetch ?? globalThis.fetch;
   const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   const base = normaliseBase(options.base);
+  const { headers, sent: bypassHeader, scrub } = bypassHeaders(options.bypass, base);
   let checks = options.checks?.length ? options.checks : [{ path: '/' }];
   const expectText = options.expectText || null;
   // An --expect-path outside the configured checks is fetched as one more check (must answer 200).
@@ -123,7 +146,7 @@ export async function runSmoke(options, deps = {}) {
   const results = [];
   const bodies = [];
   for (const check of checks) {
-    const { result, body } = await runCheck(base, check, { fetchFn, sleep });
+    const { result, body } = await runCheck(base, check, { fetchFn, sleep, headers, scrub });
     results.push(result);
     bodies.push(body);
   }
@@ -138,7 +161,7 @@ export async function runSmoke(options, deps = {}) {
       : { found: bodies[i] !== null && bodies[i].includes(expectText), path: results[i].path };
   }
   const ok = results.every((r) => r.ok) && (expect === null || expect.found);
-  return { ok, base, production: Boolean(options.production), checks: results, expectText: expect };
+  return { ok, base, production: Boolean(options.production), bypassHeader, checks: results, expectText: expect };
 }
 
 export async function main(argv = process.argv.slice(2), { env = process.env, cwd = process.cwd(), deps = {} } = {}) {
@@ -162,6 +185,7 @@ export async function main(argv = process.argv.slice(2), { env = process.env, cw
       checks: loaded.ok ? loaded.config.smoke_checks : [],
       expectText: values['expect-text'] ?? env.PIPELINE_SMOKE_EXPECT_TEXT,
       expectPath: values['expect-path'],
+      bypass: { header: loaded.ok ? loaded.config.smoke_bypass_header : null, value: env.PIPELINE_SMOKE_BYPASS_KEY },
     }, deps);
     out(result);
     return result.ok ? 0 : 1;

@@ -521,7 +521,7 @@ before(async () => {
   server = http.createServer((req, res) => {
     hits.push(`${req.method} ${req.url}`);
     if (req.method !== 'GET') violations.push(`non-GET: ${req.method} ${req.url}`);
-    for (const h of ['cookie', 'authorization', 'proxy-authorization']) if (req.headers[h]) violations.push(`${h} header sent to ${req.url}`);
+    for (const h of ['cookie', 'authorization', 'proxy-authorization', 'x-smoke-key']) if (req.headers[h]) violations.push(`${h} header sent to ${req.url}`);
     if (req.headers['user-agent'] !== 'claude-pipeline-smoke/1') violations.push(`user-agent: ${req.headers['user-agent']}`);
     if (req.headers['cache-control'] !== 'no-cache') violations.push('cache-control not no-cache');
     if (req.url === '/login') {
@@ -729,6 +729,126 @@ test('smoke: an invalid pipeline.yml is an error, not a silent default', async (
   const r = await smoke(repo, ['--base', baseUrl]);
   assert.equal(r.code, 2);
   assert.match(r.json.message, /invalid \.claude\/pipeline\.yml/);
+});
+
+// ---- smoke_bypass_header: a firewall hint, sent only to a configured, non-loopback origin ----
+const KEY = 'sk_live_Zx9-secret.VALUE~42';
+const BYPASS = { header: 'x-smoke-key', value: KEY };
+const HTTPS_BASE = 'https://app.example.com';
+const okFetch = (seen) => async (url, init) => {
+  seen.push({ url: String(url), init });
+  return new Response('<h1>hi</h1>', { status: 200, headers: { 'x-vercel-id': 'iad1::z' } });
+};
+
+test('smoke bypass: header is sent with the configured name and the env value, bypassHeader true', async () => {
+  const { runSmoke } = await importVendored((await project()).dir, 'smoke');
+  const seen = [];
+  const r = await runSmoke({ base: HTTPS_BASE, checks: [{ path: '/' }, { path: '/login' }], bypass: BYPASS }, { fetch: okFetch(seen), ...noSleep });
+  assert.equal(r.ok, true);
+  assert.equal(r.bypassHeader, true);
+  assert.equal(seen.length, 2);
+  for (const s of seen) {
+    assert.equal(s.init.headers['x-smoke-key'], KEY);
+    assert.equal(s.init.redirect, 'manual');
+    assert.equal(s.init.method, 'GET');
+    assert.equal(s.init.headers['user-agent'], 'claude-pipeline-smoke/1');
+  }
+  assert.ok(!JSON.stringify(r).includes(KEY), 'the value is not in the result');
+});
+
+test('smoke bypass: not sent when the env value is missing/empty or the header is not configured; bypassHeader false, no error', async () => {
+  const { runSmoke } = await importVendored((await project()).dir, 'smoke');
+  for (const bypass of [undefined, null, { header: 'x-smoke-key', value: undefined }, { header: 'x-smoke-key', value: '' }, { header: 'x-smoke-key', value: '   ' }, { header: null, value: KEY }]) {
+    const seen = [];
+    const r = await runSmoke({ base: HTTPS_BASE, checks: [{ path: '/' }], bypass }, { fetch: okFetch(seen), ...noSleep });
+    assert.equal(r.ok, true);
+    assert.equal(r.bypassHeader, false, JSON.stringify(bypass));
+    assert.equal(Object.keys(seen[0].init.headers).some((h) => h.toLowerCase().startsWith('x-smoke')), false);
+  }
+});
+
+test('smoke bypass: never sent to a loopback base, even when configured and the env value is set', async () => {
+  const { runSmoke } = await importVendored((await project()).dir, 'smoke');
+  for (const base of ['http://localhost:3000', 'http://127.0.0.1:3000', 'http://[::1]:3000', 'https://localhost']) {
+    const seen = [];
+    const r = await runSmoke({ base, checks: [{ path: '/' }], bypass: BYPASS }, { fetch: okFetch(seen), ...noSleep });
+    assert.equal(r.bypassHeader, false, base);
+    assert.equal(seen[0].init.headers['x-smoke-key'], undefined, base);
+  }
+});
+
+test('smoke bypass: the value never appears in the serialized result (pass, failing check, network error, echoing server)', async () => {
+  const { runSmoke } = await importVendored((await project()).dir, 'smoke');
+  const cases = {
+    pass: async () => new Response('fine', { status: 200 }),
+    failingStatus: async () => new Response('nope', { status: 429 }),
+    failingBody: async () => new Response('no match here', { status: 200 }),
+    // a server (or fetch implementation) that echoes the secret back into what the reasons quote
+    echoLocation: async (u, init) => new Response(null, { status: 307, headers: { location: `/x?k=${init.headers['x-smoke-key']}` } }),
+    networkError: async (u, init) => { throw Object.assign(new TypeError('fetch failed'), { cause: { code: `ECONNRESET ${init.headers['x-smoke-key']}` } }); },
+    messageWithValue: async (u, init) => { throw new Error(`bad header value "${init.headers['x-smoke-key']}"`); },
+  };
+  for (const [name, fetch] of Object.entries(cases)) {
+    const r = await runSmoke({
+      base: HTTPS_BASE,
+      checks: [{ path: '/', contains: ['wanted text'], location_contains: 'wanted' }],
+      expectText: 'wanted text',
+      bypass: BYPASS,
+    }, { fetch, ...noSleep });
+    const text = JSON.stringify(r, null, 2);
+    assert.ok(!text.includes(KEY), `${name}: value leaked: ${text}`);
+    assert.equal(r.bypassHeader, true, name);
+    if (name !== 'pass') assert.equal(r.ok, false, name);
+  }
+});
+
+test('smoke bypass: a value that is not a legal header value is a usage error that does not quote it', async () => {
+  const { runSmoke, SmokeUsageError } = await importVendored((await project()).dir, 'smoke');
+  const bad = 'sk live\nsecret-bit';
+  await assert.rejects(
+    runSmoke({ base: HTTPS_BASE, checks: [{ path: '/' }], bypass: { header: 'x-smoke-key', value: bad } }, { fetch: okFetch([]), ...noSleep }),
+    (e) => e instanceof SmokeUsageError && !e.message.includes('secret-bit'),
+  );
+  await assert.rejects(
+    runSmoke({ base: HTTPS_BASE, checks: [{ path: '/' }], bypass: { header: 'Authorization', value: KEY } }, { fetch: okFetch([]), ...noSleep }),
+    (e) => e instanceof SmokeUsageError && !e.message.includes(KEY),
+  );
+});
+
+test('smoke bypass: CLI against a loopback server with the header configured and the env set -> bypassHeader false, nothing sent', async () => {
+  const repo = await project({ config: CONFIG(undefined, `smoke_bypass_header: x-smoke-key\n${SMOKE_CHECKS}`) });
+  const r = await smoke(repo, ['--base', baseUrl], { env: { PIPELINE_SMOKE_BYPASS_KEY: KEY } });
+  assert.equal(r.code, 0, r.stdout);
+  assert.equal(r.json.bypassHeader, false, 'loopback: not sent');
+  assert.ok(!r.stdout.includes(KEY) && !r.stderr.includes(KEY));
+  // (the after() hook fails the file if the loopback server ever saw an x-smoke-key header)
+});
+
+test('smoke bypass: main threads the configured name and PIPELINE_SMOKE_BYPASS_KEY to the request; config without the key never sends', async () => {
+  const { main } = await importVendored((await project()).dir, 'smoke');
+  const run = async (yml, env) => {
+    const repo = await project({ config: CONFIG(undefined, yml) });
+    const seen = [];
+    let out = '';
+    const orig = process.stdout.write.bind(process.stdout);
+    process.stdout.write = (c, ...rest) => (typeof c === 'string' && c.startsWith('{') ? ((out += c), true) : orig(c, ...rest)); // the test runner writes binary chunks here too
+    let code;
+    try { code = await main(['--base', HTTPS_BASE], { env, cwd: repo.dir, deps: { fetch: okFetch(seen), ...noSleep } }); } finally { process.stdout.write = orig; }
+    return { code, seen, out, json: JSON.parse(out) };
+  };
+  const sent = await run('smoke_bypass_header: x-smoke-key\n', { PIPELINE_SMOKE_BYPASS_KEY: KEY });
+  assert.equal(sent.code, 0, sent.out);
+  assert.equal(sent.seen[0].init.headers['x-smoke-key'], KEY);
+  assert.equal(sent.json.bypassHeader, true);
+  assert.ok(!sent.out.includes(KEY));
+  const noEnv = await run('smoke_bypass_header: x-smoke-key\n', {});
+  assert.equal(noEnv.code, 0, noEnv.out);
+  assert.equal(noEnv.json.bypassHeader, false);
+  assert.equal(noEnv.seen[0].init.headers['x-smoke-key'], undefined);
+  const notConfigured = await run('', { PIPELINE_SMOKE_BYPASS_KEY: KEY });
+  assert.equal(notConfigured.json.bypassHeader, false);
+  assert.equal(notConfigured.seen[0].init.headers['x-smoke-key'], undefined);
+  assert.equal(Object.keys(notConfigured.seen[0].init.headers).length, 2, 'only user-agent and cache-control');
 });
 
 test('every template is a plain script module with a short why-header', () => {
