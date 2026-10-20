@@ -46,7 +46,8 @@ Use implementer subagents for the file work; give each the exact template path +
   + permission/policy tests → production build → Playwright E2E smoke (screenshots to
   `.verify/screenshots/`). `--quick` = typecheck + lint + tests related to changed files.
 - Writes `.verify/report.json` (per step: status `pass|fail|not-run|skipped`, duration, error excerpt, `skipReason` when skipped; plus `mode`,
-  `expectedSteps`, git head/tree/dirty). Fail fast.
+  `expectedSteps`, git head/tree/dirty). Fail fast. It also appends one JSON line per run (project, dir, head, mode, ok, exit code,
+  timings, per-step status) to the machine-wide `~/.claude/pipeline-state/verify-runs.jsonl` (`VERIFY_RUN_HISTORY=<path|off>`; off in CI) via the vendored `lib/verify-run-history.mjs`.
 - Add missing tooling: Vitest (JS/TS unit), Playwright (`e2e/smoke/*.spec.ts`, own config +
   port), pgTAP (`supabase/tests/*.test.sql`, run by `supabase test db`). Start each with at least
   one real test (pgTAP: one allowed-role and one denied-role check using `set local role` +

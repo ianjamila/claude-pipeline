@@ -18,12 +18,14 @@ if (files.length === 0) {
 }
 // Owner push notifications are off for the whole suite: no test may ever send a real push.
 // A fixed machine id keeps lock tests from creating ~/.claude/pipeline-state/machine-id on the developer's machine.
+// VERIFY_RUN_HISTORY=off keeps every verify run in the suite out of the developer's real ~/.claude/pipeline-state/verify-runs.jsonl.
 // The secrets file is pointed at a path that never exists, so even a test that forgets to inject one cannot read the real
 // ~/.config/claude-secrets.sh (test/notify.test.mjs has the guard).
 const env = {
   ...process.env,
   PIPELINE_MACHINE_ID: process.env.PIPELINE_MACHINE_ID || 'test-machine-id',
   PIPELINE_NOTIFY: 'off',
+  VERIFY_RUN_HISTORY: 'off',
   PIPELINE_SECRETS_FILE: join(tmpdir(), `pipeline-tests-no-secrets-${process.pid}`, 'claude-secrets.sh'),
 };
 const r = spawnSync(process.execPath, ['--test', ...files], { stdio: 'inherit', env });

@@ -525,6 +525,8 @@ pipeline vendor --repo DIR [--check]
 
 Exit: 0 copied / no drift · 1 drift found (`--check`) · 2 usage.
 
+The vendored `lib/` includes `verify-run-history.mjs`, which the verify template uses to append one JSON line per run (v1: project, dir, head, mode, ok, exitCode, timings, steps with any skipReason/skipCheck, error) to `~/.claude/pipeline-state/verify-runs.jsonl` (`VERIFY_RUN_HISTORY=<path>` moves it, `off` or `CI` disables it; rotated to `.1` past 2 MiB under a lock; failures only warn on stderr). The local Command Centre wallboard reads it to count runs per day.
+
 Vendoring also appends `scripts/pipeline/** -text` and `scripts/verify text eol=lf` to the project's `.gitattributes` (idempotent; output `gitattributes` lists what was added), so a Windows autocrlf checkout cannot make the byte comparison drift. `--check` warns when the entries are missing.
 
 ## verify

@@ -8,6 +8,7 @@
 //                                          GitHub CI proof for them; only steps in verify.deferrable_steps with a verify.ci_proof entry)
 //   node scripts/verify.mjs --list         print the steps
 // Writes .verify/report.json (+ .verify/logs/<step>.log). Exit 0 all passed (or skipped), 1 a step failed, 2 refused or usage error.
+// Each run also appends one JSON line to ~/.claude/pipeline-state/verify-runs.jsonl (VERIFY_RUN_HISTORY=<path> moves it, =off or CI disables it).
 // Safety: it refuses to run at all when a database variable (NEXT_PUBLIC_SUPABASE_URL, SUPABASE_URL, DATABASE_URL,
 // POSTGRES_URL*, DIRECT_URL, SUPABASE_DB_URL, PGHOST, PGHOSTADDR; also a host=/hostaddr= inside a URL) points anywhere but
 // localhost, in the environment, in a step's env or in a repo-root .env / .env.local / .env.test / .env.development file,
@@ -22,6 +23,7 @@ import { loadConfig } from './pipeline/lib/config.mjs';
 import { headSha, isClean, mergeBase, revParse, treeFingerprint } from './pipeline/lib/git.mjs';
 import { withLock } from './pipeline/lib/locks.mjs';
 import { runShell, runShellAsync } from './pipeline/lib/proc.mjs';
+import { appendHistory, buildHistoryLine, historyPath } from './pipeline/lib/verify-run-history.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const PROJECT = 'my-app'; // must match `project:` in .claude/pipeline.yml (names the dedicated Supabase and its lock)
@@ -222,10 +224,11 @@ function writeReport(file, report) {
 /**
  * Runs verify. Returns { exitCode, report } (report is null when nothing ran: usage error or --list).
  * opts: argv, cwd (repo root; default = the directory above scripts/), env (default process.env), steps (default STEPS),
- *       lockDir (default: the machine-wide lock directory), lockWaitMs (default: 30 min), out (stdout-like), err (stderr-like).
+ *       lockDir (default: the machine-wide lock directory), lockWaitMs (default: 30 min), historyFile (default: see historyPath),
+ *       out (stdout-like), err (stderr-like).
  */
 export async function runVerify(opts = {}) {
-  const { argv = [], cwd = ROOT, env = process.env, steps = STEPS, lockDir, lockWaitMs, out = process.stdout, err = process.stderr } = opts;
+  const { argv = [], cwd = ROOT, env = process.env, steps = STEPS, lockDir, lockWaitMs, historyFile, out = process.stdout, err = process.stderr } = opts;
   const say = (s) => out.write(`${s}\n`);
   const warn = (s) => err.write(`${s}\n`);
 
@@ -301,6 +304,13 @@ export async function runVerify(opts = {}) {
     report.ok = exitCode === 0;
     if (error) report.error = error;
     writeReport(reportFile, report);
+    // Best effort: the machine-wide run history must never change the exit code or the report.
+    try {
+      const file = historyPath(env, historyFile);
+      if (file) appendHistory(file, buildHistoryLine(report, { project: config?.project ?? basename(cwd), dir: resolve(cwd), exitCode }), { lockDir });
+    } catch (e) {
+      warn(`verify: run history not written: ${e.message}`);
+    }
     return { exitCode, report };
   };
 
