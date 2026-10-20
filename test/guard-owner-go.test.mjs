@@ -18,7 +18,6 @@ const posix = (dir) => String(dir).replace(/\\/g, '/').replace(/^[A-Za-z]:/, '')
 const ownerGo = {
   mode: (dir) => (posix(dir).startsWith('/chat') ? 'chat' : posix(dir).startsWith('/broken') ? (() => { throw new Error('bad yml'); })() : 'none'),
   mergeTemplates: (dir) => (posix(dir).startsWith('/chat') ? [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: '--expect-head' }, { prefix: ['node', 'scripts/m.mjs'], shaFlag: null }] : []),
-  approvedHead: (pr, head) => pr === 7 && head === H7,
 };
 const opts = (cwd) => ({ cwd, home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], ownerGo });
 const verdict = (cmd, cwd = '/chat') => evaluateGitCommand(cmd, opts(cwd));
