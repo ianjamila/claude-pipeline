@@ -632,6 +632,29 @@ test('outcomeSummary (live shape): a ledger that began after the first would-sto
   assert.equal(outcomeSummary(LIVE_DECS, uses, L_NOW, { ledgerCoverage: undefined }).miss, 1);
 });
 
+test('outcomeSummary (live shape): a legacy observation is dropped only when a ledger lease of the same owner lies after the stop record, up to it', () => {
+  const legacyOnly = liveLegacy();
+  // no ledger use at all: the ledger snapshot was read before the lease arrived, so the observation stays
+  const none = outcomeSummary(LIVE_DECS, legacyOnly, L_NOW, { ledgerCoverage: COVER });
+  assert.equal(none.miss, 1, 'no ledger lease => the observation is the only sign of the lease');
+  assert.equal(none.rows[0].uses.length, 2);
+  // a matching ledger lease in the window: dropped
+  const withLease = outcomeSummary(LIVE_DECS, [...liveLedger(), ...liveLegacy()], L_NOW, { ledgerCoverage: COVER });
+  assert.equal(withLease.rows[0].uses.length, 4);
+  // a ledger lease of the same owner only BEFORE the earliest stop record: the observation stays
+  const before = [lease('2026-10-20T03:10:00.000Z', 9705, 1792466041, S_A)];
+  const kept = outcomeSummary(LIVE_DECS, [...before, legacy('2026-10-20T03:44:13.000Z', 9705, 1792466041)], L_NOW, { ledgerCoverage: COVER });
+  assert.ok(kept.rows[0].uses.some((u) => !u.ledger && u.pid === 9705), 'the observation stays');
+  // a ledger lease of ANOTHER owner (pid or birth), or another project, does not vouch for it
+  for (const other of [lease('2026-10-20T03:14:48.267Z', 9706, 1792466041, S_A), lease('2026-10-20T03:14:48.267Z', 9705, 1792466042, S_A), lease('2026-10-20T03:14:48.267Z', 9705, 1792466041, S_A, { project: 'other' })]) {
+    const s = outcomeSummary(LIVE_DECS, [other, legacy('2026-10-20T03:44:13.000Z', 9705, 1792466041)], L_NOW, { ledgerCoverage: COVER });
+    assert.ok(s.rows[0].uses.some((u) => !u.ledger && u.pid === 9705), 'the observation stays');
+  }
+  // a ledger lease AFTER the observation does not vouch for it either
+  const after = outcomeSummary(LIVE_DECS, [lease('2026-10-20T03:50:00.000Z', 9705, 1792466041, S_A), legacy('2026-10-20T03:44:13.000Z', 9705, 1792466041)], L_NOW, { ledgerCoverage: COVER });
+  assert.ok(after.rows[0].uses.some((u) => !u.ledger && u.pid === 9705), 'the observation stays');
+});
+
 test('outcomeSummary: a legacy observation with no session-end would-stop of its project in the 2 h 10 min before it stays', () => {
   const far = legacy('2026-10-20T05:50:00.000Z', 9705, 1792466041); // > 2 h 10 min after S2, inside no window of its own
   const s = outcomeSummary(LIVE_DECS, [far], L_NOW, { ledgerCoverage: COVER });

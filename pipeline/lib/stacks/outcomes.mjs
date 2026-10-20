@@ -155,9 +155,11 @@ const ownerKey = (u) => (Number.isFinite(u?.pid) && Number.isFinite(u?.birth) ? 
 // The uses an outcome is judged on, each with its target decision and prior sign: [{ use, target, priorSign }] (uses with no
 // target decision are left out). Shared by outcomeSummary and quietCandidates so both see the same set.
 //  (i) exact C1 duplicates (same project, pid, birth, t) are one use, the ledger copy preferred;
-//  (ii) a legacy worker C1 observation (no `ledger`, no `seenAt`) is dropped when `ledgerCoverage` = { ok: true, repaired: false,
-//       firstT } shows the ledger complete over its span: some session-end stop record of its project lies in [t - 2 h 10 min, t) and
-//       the earliest of them is not older than the ledger's first event. Otherwise it stays;
+//  (ii) a legacy worker C1 observation O (no `ledger`, no `seenAt`) is dropped when `ledgerCoverage` = { ok: true, repaired: false,
+//       firstT } shows the ledger complete over its span (some session-end stop record of its project lies in [t - 2 h 10 min, t) and
+//       the earliest of them is not older than the ledger's first event) AND the uses hold a LEDGER C1 use of the same project, pid
+//       and birth, timed after that earliest stop record and not after O.t (the lease O stands for is in this snapshot; a ledger
+//       read before the lease arrived must not erase the only sign of it). Otherwise it stays;
 //  (iii) priorSign: any OTHER use of the same project + pid + birth (finite) at or before the target decision.
 function judgedUses(stops, uses, ledgerCoverage) {
   const firstMs = ledgerCoverage?.ok === true && ledgerCoverage.repaired === false ? toMs(ledgerCoverage.firstT) : NaN;
@@ -180,7 +182,12 @@ function judgedUses(stops, uses, ledgerCoverage) {
     const ut = toMs(use.t);
     if (!Number.isFinite(ut)) return true;
     const mine = sessionStops.filter((r) => lower(r.project) === lower(use.project) && toMs(r.t) >= ut - SPAN_MS && toMs(r.t) < ut);
-    return !(mine.length > 0 && Math.min(...mine.map((r) => toMs(r.t))) >= firstMs);
+    if (mine.length === 0) return true;
+    const earliest = Math.min(...mine.map((r) => toMs(r.t)));
+    if (!(earliest >= firstMs)) return true;
+    const k = ownerKey(use);
+    const vouched = k !== null && kept.some((l) => l.ledger && l.check === 'C1' && ownerKey(l) === k && toMs(l.t) > earliest && toMs(l.t) <= ut);
+    return !vouched;
   });
   const byOwner = new Map(); // owner key -> [{ use, ms }]
   for (const use of live) {
