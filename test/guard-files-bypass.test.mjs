@@ -674,7 +674,7 @@ test('inode identity: a path that is the same file as a protected root (hard lin
   fs.writeFileSync(path.join(home, '.claude', 'settings.json'), '{}');
   fs.mkdirSync(path.join(home, 'elsewhere'));
   fs.linkSync(path.join(home, '.claude', 'settings.json'), path.join(home, 'elsewhere', 'alias.json'));
-  const real = { home, env: {}, platform: process.platform === 'win32' ? 'linux' : process.platform };
+  const real = { home, env: {}, platform: process.platform };
   const w = (file_path) => evaluateFileTool({ tool_name: 'Write', tool_input: { file_path, content: 'x' }, cwd: home }, real).decision;
   if (process.platform !== 'win32') assert.equal(w(path.join(home, 'elsewhere', 'alias.json')), 'deny', 'hard link to settings.json');
   assert.equal(w(path.join(home, 'elsewhere', 'other.json')), 'allow');
