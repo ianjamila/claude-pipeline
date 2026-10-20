@@ -5,11 +5,11 @@ import { EXIT, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { diffFiles, mergeBase } from '../lib/git.mjs';
 import { collectHardStops } from '../lib/hardstops.mjs';
-import { assessRisk, isLightLane } from '../lib/risk.mjs';
+import { assessRisk, assessSecurity, isLightLane } from '../lib/risk.mjs';
 
 export const meta = {
   summary: 'assess the risk level of a branch diff',
-  usage: 'pipeline risk --base REF --head REF [--repo DIR]   -> {ok, level, reasons, lightLane, changedLines, fileCount, hardStops, base, head, mergeBase}',
+  usage: 'pipeline risk --base REF --head REF [--repo DIR]   -> {ok, level, reasons, lightLane, security, securityReasons, changedLines, fileCount, hardStops, base, head, mergeBase}',
 };
 
 export const run = guarded(async (argv, ctx) => {
@@ -26,10 +26,11 @@ export const run = guarded(async (argv, ctx) => {
   const hits = await collectHardStops({ base, head, cwd: root, config });
   const { level, reasons, changedLines, fileCount } = assessRisk({ files, hits, config });
   const lightLane = isLightLane({ level, changedLines, hits, config });
+  const { security, reasons: securityReasons } = assessSecurity({ files, hits, config });
   return {
     exitCode: EXIT.OK,
     output: {
-      ok: true, level, reasons, lightLane, changedLines, fileCount, hardStops: hits, base, head, mergeBase: mergeBase(base, head, o),
+      ok: true, level, reasons, lightLane, security, securityReasons, changedLines, fileCount, hardStops: hits, base, head, mergeBase: mergeBase(base, head, o),
     },
   };
 });

@@ -101,7 +101,7 @@ const isNonCode = (p) => {
 // `docs/migrations/notes.md` documents migrations; it is not one.
 const isMigrationPath = (p) => !/\.md$/.test(p) && inc(p, MIGRATION_GLOBS);
 // "SQL file": `**/*.sql` or anything under a migrations dir.
-const isSqlPath = (p) => inc(p, ['**/*.sql']) || isMigrationPath(p);
+export const isSqlPath = (p) => inc(p, ['**/*.sql']) || isMigrationPath(p);
 // "Code file": not markdown, not under docs/, not a GENUINE test file. An EXCLUSION test, so it matches the path as written.
 // A test glob never hides code that really runs: a migration (the Supabase CLI applies `<n>_<name>.sql` whatever the name
 // says), any .sql outside supabase/tests/, a route handler / server entry, or a Next page under a directory that happens

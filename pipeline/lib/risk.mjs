@@ -8,6 +8,7 @@
 import { diffStats } from './diff.mjs';
 import { matchAny, normalizeGlob } from './glob.mjs';
 import { DEFAULTS } from './config.mjs';
+import { isSqlPath } from './hardstops.mjs';
 
 const LEVELS = ['low', 'medium', 'high'];
 const matches = (p, globs) => matchAny(p, globs, { nocase: true });
@@ -93,6 +94,21 @@ export function securityGlobs(config) {
   const sec = config?.review?.security;
   const extra = sec === 'off' ? [] : (Array.isArray(sec?.paths) ? sec.paths : DEFAULTS.review.security.paths);
   return ['**/*.sql', '**/migrations/**', 'supabase/**', ...extra];
+}
+
+// Security review trigger: a database/security path in the diff, or a hard-stop of the destructive/migration (R1), auth/RLS (R2)
+// or secrets (R3) families. review.security: 'off' switches the review off; otherwise review.security.paths add globs.
+const SECURITY_RULE = (rule) => /^R1-/.test(rule) || /^R2-/.test(rule) || rule === 'R3-secrets';
+export function assessSecurity({ files, hits, config }) {
+  if (config.review.security === 'off') return { security: false, reasons: ['security review off (review.security: off)'] };
+  const reasons = [];
+  const globs = securityGlobs(config);
+  const paths = [...new Set(files.flatMap((f) => [f.oldPath, f.newPath, f.path]).filter((p) => typeof p === 'string' && p))];
+  const sql = paths.filter((p) => isSqlPath(p) || matches(p, globs));
+  if (sql.length) reasons.push(`database/security path: ${sql.slice(0, 5).join(', ')}${sql.length > 5 ? ' …' : ''}`);
+  const rules = [...new Set(hits.filter((h) => SECURITY_RULE(h.rule)).map((h) => h.rule))];
+  if (rules.length) reasons.push(`hard-stop family: ${rules.join(', ')}`);
+  return { security: reasons.length > 0, reasons };
 }
 
 const MAX_BRACE_ALTERNATIVES = 32;

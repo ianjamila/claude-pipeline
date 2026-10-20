@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DEFAULTS } from '../pipeline/lib/config.mjs';
-import { assessRisk, isLightLane, scopeMayHitGlob, securityGlobs } from '../pipeline/lib/risk.mjs';
+import { assessRisk, assessSecurity, isLightLane, scopeMayHitGlob, securityGlobs } from '../pipeline/lib/risk.mjs';
 
 const config = (risk = {}) => {
   const c = structuredClone(DEFAULTS);
@@ -184,4 +184,29 @@ test('securityGlobs: sql, migrations and supabase always; configured paths unles
   assert.deepEqual(securityGlobs({ review: { security: { paths: ['auth/**'] } } }), ['**/*.sql', '**/migrations/**', 'supabase/**', 'auth/**']);
   assert.deepEqual(securityGlobs({ review: { security: 'off' } }), ['**/*.sql', '**/migrations/**', 'supabase/**']);
   assert.deepEqual(securityGlobs({}), ['**/*.sql', '**/migrations/**', 'supabase/**']);
+});
+
+// ---- assessSecurity (ship redesign T7) ------------------------------------------------------------------------------
+test("assessSecurity: a plain new migration is security; an auth hit is; docs only is not; off and configured paths", () => {
+  const sec = (files, hits = [], review = {}) => {
+    const c = structuredClone(DEFAULTS);
+    c.review = { ...c.review, ...review };
+    return assessSecurity({ files, hits, config: c });
+  };
+  const mig = sec([file("supabase/migrations/1_t.sql", 4, { status: "A" })]);
+  assert.equal(mig.security, true);
+  assert.match(mig.reasons[0], /database\/security path: supabase\/migrations\/1_t.sql/);
+  const auth = sec([file("src/x.ts", 4)], [hit("R2-auth", "src/x.ts")]);
+  assert.equal(auth.security, true);
+  assert.match(auth.reasons.join(" "), /hard-stop family: R2-auth/);
+  assert.equal(sec([file("src/x.ts", 4)], [hit("R3-secrets", "src/x.ts")]).security, true);
+  assert.equal(sec([file("src/x.ts", 4)], [hit("R5-other", "src/x.ts")]).security, false, "other hard-stop families are not the security trigger");
+  assert.deepEqual(sec([file("docs/a.md", 4)]), { security: false, reasons: [] });
+  const off = sec([file("supabase/migrations/1_t.sql", 4)], [hit("R2-auth")], { security: "off" });
+  assert.equal(off.security, false);
+  assert.match(off.reasons[0], /off/);
+  assert.equal(sec([file("src/auth/a.ts", 4)], [], { security: { paths: ["src/auth/**"] } }).security, true);
+  assert.equal(sec([file("src/auth/a.ts", 4)]).security, false);
+  const renamed = sec([file("lib/b.ts", 4, { status: "R", oldPath: "supabase/old.sql" })]);
+  assert.equal(renamed.security, true, "a rename out of a security path is still a change to it");
 });

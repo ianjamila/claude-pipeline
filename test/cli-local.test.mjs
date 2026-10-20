@@ -144,6 +144,8 @@ test('risk: a migration with DROP TABLE is high risk and reports the R1 hard-sto
   assert.equal(r.json.mergeBase, base);
   assert.equal(r.json.fileCount, 1);
   assert.equal(r.json.changedLines, 1);
+  assert.equal(r.json.security, true);
+  assert.match(r.json.securityReasons.join(' '), /supabase\/migrations\/2_x\.sql/);
   assert.notEqual(head, base);
 });
 
@@ -158,6 +160,7 @@ test('risk: a small UI change is low risk and qualifies for the light lane', (t)
   assert.equal(r.json.level, 'low');
   assert.equal(r.json.lightLane, true);
   assert.deepEqual(r.json.hardStops, []);
+  assert.deepEqual([r.json.security, r.json.securityReasons], [false, []]);
 });
 
 test('risk: needs config, --base and --head; a bad ref is exit 2', (t) => {
