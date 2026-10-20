@@ -139,7 +139,7 @@ async function runCheck(target, { fetchFn, sleep, scrub }) {
   }
   const reasons = verdict(check, got);
   return {
-    result: { path: check.path, status: got.status, ok: reasons.length === 0, reason: reasons.length ? scrub(reasons.join('; ')) : null, ms, vercelId: got.vercelId },
+    result: { path: check.path, status: got.status, ok: reasons.length === 0, reason: reasons.length ? scrub(reasons.join('; ')) : null, ms, vercelId: got.vercelId === null ? null : scrub(got.vercelId) },
     body: got.body,
   };
 }
@@ -194,7 +194,12 @@ export async function runSmoke(options, deps = {}) {
 }
 
 export async function main(argv = process.argv.slice(2), { env = process.env, cwd = process.cwd(), deps = {} } = {}) {
-  const out = (obj) => process.stdout.write(`${JSON.stringify(obj, null, 2)}\n`);
+  // Defence in depth: whatever is printed (a result field not scrubbed per field, an error message) never carries the bypass value.
+  const secret = typeof env.PIPELINE_SMOKE_BYPASS_KEY === 'string' ? env.PIPELINE_SMOKE_BYPASS_KEY.trim() : '';
+  const out = (obj) => {
+    const text = JSON.stringify(obj, null, 2);
+    process.stdout.write(`${secret ? text.split(secret).join('[redacted]') : text}\n`);
+  };
   try {
     const { values } = parseArgs({
       args: argv,

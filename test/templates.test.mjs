@@ -848,6 +848,8 @@ test('smoke bypass: the value never appears in the serialized result (pass, fail
     failingBody: async () => new Response('no match here', { status: 200 }),
     // a server (or fetch implementation) that echoes the secret back into what the reasons quote
     echoLocation: async (u, init) => new Response(null, { status: 307, headers: { location: `/x?k=${init.headers['x-smoke-key']}` } }),
+    // the secret echoed into a response header the result copies (x-vercel-id)
+    echoVercelId: async (u, init) => new Response('fine', { status: 200, headers: { 'x-vercel-id': `iad1::${init.headers['x-smoke-key']}` } }),
     networkError: async (u, init) => { throw Object.assign(new TypeError('fetch failed'), { cause: { code: `ECONNRESET ${init.headers['x-smoke-key']}` } }); },
     messageWithValue: async (u, init) => { throw new Error(`bad header value "${init.headers['x-smoke-key']}"`); },
   };
