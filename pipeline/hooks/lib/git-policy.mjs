@@ -808,6 +808,19 @@ function graphqlMutations(query) {
   return names;
 }
 
+// A comment-creating mutation whose text is built at run time: a command substitution or backtick anywhere in the document (graphql has
+// neither), a `$name`/`${name}` inside a string literal (a shell variable there), or a `$name` outside one that the operation never declares
+// (a graphql variable always is declared, so an undeclared one is a shell variable). Literal graphql variables stay allowed.
+const GRAPHQL_STRINGS = /"""[\s\S]*?"""|"(?:\\.|[^"\\\n])*"/g;
+function graphqlBuiltAtRunTime(q) {
+  if ((q.match(GRAPHQL_STRINGS) ?? []).some((s) => runTimeText(s))) return true;
+  // (comments are kept for the substitution test: the shell expands them too, and an output with a newline ends the comment)
+  const outside = q.replace(GRAPHQL_STRINGS, '""');
+  if (/\$\(|\$\{|`/.test(outside)) return true;
+  const declared = new Set([...stripGraphql(q).matchAll(/\$([A-Za-z_]\w*)\s*:/g)].map((m) => m[1]));
+  return [...outside.matchAll(/\$([A-Za-z_]\w*)/g)].some((m) => !declared.has(m[1]));
+}
+
 function checkGraphql(body, dir = null, ctx = null) {
   for (const q of body.queries) {
     if (/^\s*(\$\(|`|\$\{?[A-Za-z_])/.test(q)) return deny('the graphql query is built at run time, so it cannot be verified. Pass the query text directly.');
@@ -819,6 +832,8 @@ function checkGraphql(body, dir = null, ctx = null) {
     // (the query text AND the variables: `-f body=...`, `-F body=@file`, an --input JSON's values)
     if (names.some((n) => COMMENT_MUTATIONS.includes(n))
       && mentionsEventMarker(q, body.text, ...body.fields.map((x) => x.value), ...body.queries)) return deny(EVENT_FORGE);
+    // (the query text itself, built at run time: `body:"$(cat f)"`, `body:"$BODY"`: the marker never appears in the text the guard reads)
+    if (names.some((n) => COMMENT_MUTATIONS.includes(n)) && graphqlBuiltAtRunTime(q)) return deny(COMMENT_RUNTIME);
     // (the variables of a comment mutation: `-f b="$(cat file)"`. The query itself is judged above; `data` is the curl route's own check)
     if (names.some((n) => COMMENT_MUTATIONS.includes(n)) && body.fields.some((x) => x.rt && x.key !== 'query' && x.key !== 'data')) return deny(COMMENT_RUNTIME);
     // #58: auto-merge names the PR by its node id, which says nothing about whether the owner said "merge" for it, nor which repository it is in.
@@ -1256,6 +1271,8 @@ function checkHttpTool(argv, dir, ctx, tool = 'curl') {
   let urlFile = false;
   let configs = 0;
   let configUnreadable = false;
+  let requestTarget = false; // curl --request-target: the path sent, whatever the URL says
+  let strangeFlag = null; // an option this parser does not know that carries a /repos/ path
   const readData = (v, isFile) => {
     const value = v;
     const urlenc = /^[^=@\s]*@(.+)$/.exec(value); // --data-urlencode name@file
@@ -1285,10 +1302,14 @@ function checkHttpTool(argv, dir, ctx, tool = 'curl') {
       words = [...words.slice(0, i + 1), ...curlConfigWords(text).map((x) => expandVars(x, ctx)), ...words.slice(i + 1)];
       continue;
     }
+    if (tool === 'curl' && flag === '--request-target') { requestTarget = true; value(); continue; }
     if (URL_FILE_FLAGS.has(flag) && tool === 'wget') { value(); urlFile = true; continue; }
     if (HTTP_DATA_FLAGS.has(flag) && !(httpie && flag.length === 2 && flag !== '-F')) { implied = true; readData(value(), HTTP_FILE_FLAGS.has(flag)); continue; }
     if (valueFlags.has(flag)) { value(); continue; }
-    if (w.startsWith('-')) continue;
+    if (w.startsWith('-')) {
+      if (eq > 0 && /(?:^|[/=])(?:repos|repositories)\/[^/]+\/[^/]+/i.test(w.slice(eq + 1))) strangeFlag ??= flag;
+      continue;
+    }
     if (httpie && HTTP_METHODS.includes(w.toUpperCase())) { methods.push(w.toUpperCase()); continue; }
     if (!httpie && /^[A-Z]{3,7}$/.test(w) && HTTP_METHODS.includes(w) && urls.length === 0 && methods.length === 0) { methods.push(w); continue; }
     if (!/:\/\//.test(w) && (/^[A-Za-z0-9_.\[\]-]+(?::=|=@?|:)/.test(w) && !/^[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?:[/:]|$)/.test(w))) {
@@ -1314,6 +1335,8 @@ function checkHttpTool(argv, dir, ctx, tool = 'curl') {
       continue;
     }
     if (hostUnknown || DYNAMIC.test(w)) return deny(`${verb} to a URL built at run time ($VAR / $(...)) that may point at github.com cannot be verified. Write the URL out.`);
+    if (requestTarget) return deny(`${verb} with curl --request-target to a github.com host: it replaces the path of the URL, so the endpoint it calls cannot be verified. Put the path in the URL.`);
+    if (strangeFlag) return deny(`${verb} to a github.com host with an option this guard does not know (${strangeFlag}) that carries a repository path: it may replace the endpoint, so the call cannot be verified. Put the path in the URL.`);
     const ep = normaliseEndpoint(/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(w) ? w : `https://${w}`);
     if (/^repos\/[^/]+\/[^/]+\/pulls\/\d+\/merge$/i.test(ep)) return deny(`merging through the API bypasses the merge gate, like --admin. ${OWNER_ONLY}`);
     if (/\/merges$/i.test(`/${ep}`)) return deny(`merging branches through the API can move main without a PR. ${OWNER_ONLY}`);
