@@ -9,6 +9,9 @@ import { pathToFileURL } from 'node:url';
 import { createTmpRepo } from './tmprepo.mjs';
 import { run as vendor } from '../../pipeline/commands/vendor.mjs';
 
+// Tests that run the verify template must not write the developer's real machine-wide run history (a test that wants it passes its own env).
+process.env.VERIFY_RUN_HISTORY ??= 'off';
+
 export const CONFIG = (quick = 'node -e "process.exit(0)"', extra = '') => `version: 1
 project: demo-app
 verify:
