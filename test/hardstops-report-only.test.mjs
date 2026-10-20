@@ -80,7 +80,7 @@ test('a rule in both disable_rules and report_only_rules is a config error', () 
 const SAMPLES = [
   ['R1-data-write', { files: [file('lib/x.ts', { added: ["await sb.from('t').delete().eq('id', 1);"] })] }, {}],
   ['R2-auth', { files: [file('src/auth/session.ts')] }, {}],
-  ['R2-auth-removed', { files: [file('lib/x.ts', { removed: ['  await requireSAScope(ctx);'] })] }, { auth_calls: ['requireSAScope'] }],
+  ['R2-auth-removed', { files: [file('lib/x.ts', { removed: ['  await requireTeamScope(ctx);'] })] }, { auth_calls: ['requireTeamScope'] }],
   ['R3-secrets', { files: [file('.env')] }, {}],
   ['R4-config', { files: [file('CLAUDE.md', { added: ['be nice'] })] }, {}],
   ['R5-major-dep', { files: [], basePkg: pkg({ next: '15.5.15' }), headPkg: pkg({ next: '16.0.0' }) }, {}],

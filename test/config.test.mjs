@@ -55,7 +55,7 @@ test('realistic eaglewatch config is ok', () => {
   assert.equal(c.production.rollback.command, 'vercel rollback --yes');
   assert.ok(c.hard_stops.paths.includes('supabase/migrations/**'));
   assert.equal(c.hard_stops.patterns[0].name, 'facial-recognition');
-  assert.deepEqual(c.hard_stops.auth_calls, ['requireSAScope', 'getAccessibleDetachmentIds']);
+  assert.deepEqual(c.hard_stops.auth_calls, ['requireTeamScope', 'getAccessibleTeamIds']);
   assert.equal(c.smoke_checks.length, 2);
   // arrays replace, objects merge
   assert.deepEqual(c.integrity.test_globs, ['**/*.test.*', 'e2e/**']);

@@ -85,8 +85,8 @@ for (const [name, input, expected] of TABLE) {
 
 test('removed project auth call (auth_calls) in code -> R2-auth-removed', () => {
   const hits = classify({
-    config: cfg({ auth_calls: ['requireSAScope'] }),
-    files: [file('lib/x.ts', { removed: ['  await requireSAScope(ctx);'] })],
+    config: cfg({ auth_calls: ['requireTeamScope'] }),
+    files: [file('lib/x.ts', { removed: ['  await requireTeamScope(ctx);'] })],
   });
   assert.deepEqual(rulesOf(hits), ['R2-auth-removed']);
   assert.equal(hits[0].file, 'lib/x.ts');
@@ -94,10 +94,10 @@ test('removed project auth call (auth_calls) in code -> R2-auth-removed', () => 
 });
 
 test('auth_calls names are what flag a project-specific guard (no generic pattern matches it)', () => {
-  const f = [file('lib/x.ts', { removed: ['const ids = await getAccessibleDetachmentIds(user);'] })];
+  const f = [file('lib/x.ts', { removed: ['const ids = await getAccessibleTeamIds(user);'] })];
   assert.deepEqual(rulesOf(classify({ config: cfg(), files: f })), []);
   assert.deepEqual(
-    rulesOf(classify({ config: cfg({ auth_calls: ['getAccessibleDetachmentIds'] }), files: f })),
+    rulesOf(classify({ config: cfg({ auth_calls: ['getAccessibleTeamIds'] }), files: f })),
     ['R2-auth-removed'],
   );
 });

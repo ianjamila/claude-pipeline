@@ -61,8 +61,8 @@ hard_stops:
     - name: facial-recognition
       regex: "face(api|[-_]?recog)|liveness|rekognition"
   auth_calls:
-    - requireSAScope
-    - getAccessibleDetachmentIds
+    - requireTeamScope
+    - getAccessibleTeamIds
 
 integrity:
   test_globs:
