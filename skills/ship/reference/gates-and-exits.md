@@ -31,6 +31,10 @@ A stop on any failed check below follows "Ending a run with a PR open" in `SKILL
 | | `ci-proof-missing:<step> (…)` | no usable GitHub proof: no run, a cancelled or skipped run (a draft PR), another PR or fork, a tree that is not this head's, a PR that touches `.github/**`, `.claude/pipeline.yml`, `scripts/verify*` or `verify.ci_proof_inputs`, settings the base branch does not have, or any GitHub error. Run a fresh FULL `verify.full` WITHOUT `--defer` at once (never `--only`: the gate refuses a partial report), then the gate again. Never wait on this |
 | `hardstops` | blocking hits (report-only hits pass: the detail says `N report-only`; with `owner_approval: chat` it passes and says `N owner-merge`, and the gate output has `ownerMerge` > 0) | Step 3.5 (`needs-human`); chat mode: **Owner-merge approval** in SKILL.md |
 | `integrity` | test weakening (chat mode: passes, `N owner-merge test-integrity violation(s)`, counted in `ownerMerge`) | implementer restores the tests, or `needs-human` (chat mode: **Owner-merge approval**) |
+| `plan-scope` | `plan-scope none` (no plan evidence at all: a legacy or adopted PR) | an owner-merge item in chat mode (`ownerMerge` > 0; the owner's "merge" covers it); in label mode the check fails: `needs-human`. `plan.required: false` only reports |
+| | `plan-scope outside <file>` (a changed file, by its old path for a deletion and by both paths for a rename, that no Scope entry of the approved plan matches; the plan's own file is in its Scope) | an owner-merge item per file: show the files in the stop comment and the `Head … · items …` line; the owner may amend the plan (Step 1.5, new "approve") or accept the files by saying "merge" for this head and item set. Label mode: `needs-human` |
+| | `plan-scope unverified <host>` (the approval event is on the PR but no owner-go plan record on THIS machine vouches for it: another machine, or a forged pointer) | an owner-merge item, never an auto-merge: the owner's "merge" for the head and items covers it (a machine switch is a resume, which already needs it) |
+| | `lost` (a proposal or approval is edited, unreadable, for another PR or missing; or the approved blob is not in this clone; any `plan.required: true` failure to read the changed files or the PR's comments) | the check FAILS in every mode: stop. Re-show the active plan request (`reference/plan-stage.md`); the owner's new "approve" (`P plan approve --pr N`) clears it. If the owner's record is gone too, `needs-human` + `P summary --outcome needs-human --cause final-gate:plan-scope --action "…"` |
 | `review` | no clean round covers the current content, or open items (an item the owner ruled in chat with `P triage owner-ruling` passes but the detail lists `N owner-ruled item(s), owner-merge: <id "quote">` and `ownerMerge` > 0) | Step 4 (a new round), then Step 5 again; chat mode: **Owner-merge approval** in SKILL.md |
 | `ci` | checks failing / not passing | fix the cause (new commit ⇒ Step 5.1); `required check(s) missing` ⇒ `needs-human` + `P summary --outcome needs-human --cause final-gate:ci --action "…"` (the CI config is wrong) |
 | `preview` | no/old smoke evidence, deployment mismatch | redo Step 5.6 on the current head |
@@ -38,6 +42,25 @@ A stop on any failed check below follows "Ending a run with a PR open" in `SKILL
 **Chat mode (`owner_approval: chat`):** every "merge again", "retry" and "back to Step 5" in this table ends at a new `P merge`, and each
 one passes the **Owner-merge approval** rule in SKILL.md first: with `ownerMerge` > 0 a retry on the SAME head needs no new
 approval, but any new head (update-branch, `head-moved`, a fix commit) needs the owner's "merge" again for that sha.
+
+## `P handoff check --pr N [--post]` (busy main, owner merges in GitHub)
+
+Run in Step 5.2 on the SECOND recorded base update (`behindBaseUpdates` holds the confirmed pairs that `P merge` and `P update-branch` appended;
+one update during a CI wait is routine and keeps today's loop), before any further update-branch. The gate stays untouched: this exit exists
+only for a head whose live gate fails ONLY `pr-open: behind-base`. Eligible = branch protection provably does NOT require up-to-date
+branches, that gate result, a clean `git merge-tree` of the head with the base tip, and `verify.quick` passing on that prospective merge.
+
+| exit | meaning → do |
+|---|---|
+| 0 `eligible: true` | with `--post`: re-checked the head and the gate, posted ONE hand-off comment (head, base tip, what was and was not verified, the base's commits since with file overlap, the gate's owner-merge items, the production line) and recorded `handoff` in the run record. Then `P summary --pr N --outcome owner-ui-merge --action "Merge in GitHub if you accept the hand-off"` (pushes the owner's phone; step `awaiting-owner-merge`), `P agent-log publish --line "<agentLogLine>"`, keep the worktree, STOP. Never merge it, never say it was verified against main: the comment says what was not |
+| 1 `eligible: false`, `reasons[]` | fewer than 2 recorded updates, protection requires up-to-date branches or is unreadable, the gate fails on anything else (fix that first), a merge conflict, or quick verify red: take today's path (Step 5.2 update-branch, re-verify, gate). With `--post`: "the PR changed during the check" ⇒ run it again |
+| 3 | GitHub unavailable: retry once, then the `stopped` shape (`--cause handoff:github`) |
+
+**Outcome `owner-ui-merge`** (record step `awaiting-owner-merge`). Owner-merge items do not block it: the owner's click in GitHub is the
+approval, and the comment lists them. `P resume plan` routes `owner-ui-merge` (report only) and, once the owner has merged, `observe-prod`
+(with `production.watch: session` nobody watches production until the owner says `ship resume N`; observe-only, never a rollback);
+`P inbox` shows `owner GitHub merge`, suggest `leave`. This is not `awaiting-owner-merge` (the pipeline merges after the owner's "merge") and not
+`needs-human`; do not add a label.
 
 ## `P update-branch --pr N` (job)
 

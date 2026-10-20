@@ -39,7 +39,8 @@ no pipeline; I can't certify it end-to-end. Want me to run pipeline-setup?"
    A step with status `skipped` did not run: say so and quote its `skipReason`; it is not a pass, and the
    final gate accepts it only when the owner listed it in `verify.skippable_steps`.
 3. Fix the first failing step (it fails fast), rerun. Repeat until `ok: true`.
-4. Never make it green by weakening checks: no skipping, deleting, or loosening tests, no
+4. Lookups (where a file is, what a script does) go to an Explore agent with `model: haiku`; do not hand it judgment calls.
+5. Never make it green by weakening checks: no skipping, deleting, or loosening tests, no
    lowering coverage thresholds, no editing verify scripts or CI config to dodge a failure.
 
 ## 3. Rules by change type
@@ -47,7 +48,9 @@ no pipeline; I can't certify it end-to-end. Want me to run pipeline-setup?"
 - **UI change** — capture Playwright screenshots of every affected page/state (the e2e step
   saves to `.verify/screenshots/`; for pages it doesn't cover, use the Playwright MCP
   `browser_take_screenshot` against the local dev server). Then **Read each image and look at
-  it**: layout, text, overflow, dark mode if relevant. Note one line per screenshot.
+  it**: layout, text, overflow, dark mode if relevant. Note one line per screenshot. In ship the
+  `screenshot-reviewer` agent (Sonnet) does the looking and returns one line per image (the verifier, a Haiku agent, never reads
+  screenshots); outside ship, read them yourself.
 - **Database change** (migration, policy, grant, function) — add a test that proves the
   permission model: the right roles are **allowed** and the wrong roles are **denied**, executed
   as real session roles (Supabase: pgTAP in `supabase/tests/` with `set local role

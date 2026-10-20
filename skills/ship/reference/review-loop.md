@@ -52,6 +52,30 @@ already holds. A `P state outcome` with `followupsPending: true` means a publish
   `R<round>-S<k>` / `R<round>-W<k>`. Items whose fingerprint was already ruled have a `final`
   (pre-filled from the cache) and are not re-triaged.
 
+### 1b. Reviewer obligations (security, optional Fable final pass)
+
+`P codex-review` prints `obligations` (`[{source, promptHeader}]`, source `security` or `fable`), derived by the CLI from the
+round's own range and the config: `security` in round 1 of a PR that touches SQL / migrations / `supabase/`, hits an R1-R3 hard-stop
+family or a `review.security.paths` glob (and again in a later round whose range touches such a path; `review.security: off` opts
+out), `fable` once when `review.final_pass: risky`, the PR is high risk and Codex found nothing BLOCKING. You cannot declare or
+skip one: until every obligation of every round is met the round is not clean, `P review-complete` refuses and the gate's
+`review` check fails. For each obligation in the output (nothing to do when the list is empty):
+1. `P review header --pr <pr> --round <round> --source <s> --base <reviewBase> --head <head>` (pure; `reviewBase` / `head` are the
+   `--base` / `--head` you gave `codex-review`, so it can run while Codex is still going). It prints `promptHeader` and `digest`.
+2. Dispatch `security-reviewer` (security) or `fable-reviewer` with `mode: pr` (fable), NO `model` parameter. The prompt starts with
+   the `promptHeader` pasted verbatim as its first two lines, then the absolute worktree path, `base`, `head` and the PR title. The Agent
+   `description` is the tag `pipeline-<s> R<round> <digest8>` (`<digest8>` = the first 8 characters of `digest`), e.g.
+   `pipeline-security R1 1a2b3c4d`.
+3. `P review add --round <round> --source <s> --tag "pipeline-<s> R<round> <digest8>"`. It proves from the transcript that the
+   right model (Sonnet / Fable, effort high) answered THIS round's input, validates the JSON, and adds the findings as items
+   `R<round>-X<B|S|W><k>` (security) / `R<round>-F<B|S|W><k>` (fable). An empty proven answer meets the obligation. Exit 2
+   `no transcript`: wait a few seconds, retry once. Exit 1 `no-obligation` / `already-met`: nothing to add.
+4. An unproven answer (wrong model, wrong header, unparsable) marks the obligation failed and parks `needsHuman` item
+   `R<round>-<s>-proof`. Re-dispatch the reviewer once (a new transcript) and `review add` again, or **park needs-human**; with
+   `owner_approval: chat` the owner can rule on it in chat (**Owner rules in chat**). Never edit state by hand.
+5. The judge (step 3) then triages the `X` / `F` items exactly like Codex items: they are in `.review/state.json`, not in
+   `codex.json`, so list their ids in the judge prompt next to the Codex ones; same arbiter, same ACCEPT / FOLLOW-UP / REJECT.
+
 ### 2. Light lane shortcut
 
 If `P risk` said `lightLane: true` and Codex returned no BLOCKING and no SUGGESTION items
@@ -62,7 +86,7 @@ If `P risk` said `lightLane: true` and Codex returned no BLOCKING and no SUGGEST
 
 Skip the judge when no item is pending: Codex returned nothing, or `preRuled` equals the sum of
 `counts` (every item was answered from the cache). Otherwise the pending items are the entries of
-`codex.json` → `items` that have no `final`; list their ids in the prompt.
+`codex.json` → `items` that have no `final`, plus any `X` / `F` item added by `P review add` (step 1b) that has none; list their ids in the prompt.
 
 Compute a digest: `shasum -a 256 .review/round-<round>/codex.json` (first 8 chars = `<d8>`). Invoke
 the `judge` agent — **no `model` parameter** — with `description: "pipeline-judge R<round> <d8>"`
