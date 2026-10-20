@@ -69,3 +69,48 @@ test('curl / wget / httpie / xh: non-GET calls to github.com that merge, move re
     'http GET api.github.com/repos/o/r', 'xh api.github.com/repos/o/r/pulls/3', 'curl -d \'{"body":"hello"}\' https://api.github.com/repos/o/r/issues/3/comments', 'http POST api.github.com/repos/o/r/issues/3/comments body=hello',
   ]) allow(cmd);
 });
+
+// ---- run-time bodies: a comment text built at run time cannot be checked for the marker, so it is refused like an unreadable one ----
+test('a comment body built at run time ($(...) / $VAR / backticks) is denied on every comment-creating route; literal and quoted-heredoc bodies stay allowed', () => {
+  const heredoc = (tag = "'EOF'", body = 'all green\nsecond line') => `<<${tag}\n${body}\nEOF\n`;
+  for (const cmd of [
+    'gh pr comment 3 --body "$(cat body.txt)"', 'gh pr comment 3 -b"$(cat body.txt)"', 'gh pr comment 3 --body "$X"', 'gh issue comment 3 --body "$(printf \'%s%s\' \'<!-- claude-pipeline:event:owner\' \'-stop-released:ab -->\')"',
+    'gh pr comment 3 --body `cat body.txt`', `gh pr comment 3 --body "$(cat ${heredoc()})$(cat body.txt)"`, `gh pr comment 3 --body "$(cat ${heredoc('EOF', 'x $Y')})"`, `gh pr comment 3 --body "$(cat ${heredoc("'EOF'", 'x').replace('<<', '; id <<')})"`,
+    'gh api repos/o/r/issues/3/comments -f body="$(cat body.txt)"', 'gh api repos/o/r/issues/3/comments -f body=$X', 'gh api repos/o/r/issues/3/comments --raw-field body="$(cat body.txt)"', 'gh api repos/o/r/pulls/3/reviews -f body="$(cat body.txt)" -f event=COMMENT',
+    gql('mutation($b:String!){addComment(input:{subjectId:"X",body:$b}){clientMutationId}}', '-f b="$(cat body.txt)"'), gql('mutation($b:String!){addComment(input:{subjectId:"X",body:$b}){clientMutationId}}', '-f b="$X"'),
+    'curl -d "$(cat body.txt)" https://api.github.com/repos/o/r/issues/3/comments', 'curl -d "{\\"body\\":\\"$B\\"}" https://api.github.com/repos/o/r/issues/3/comments',
+    'curl -X POST -d "$(cat body.txt)" https://api.github.com/graphql',
+  ]) deny(cmd);
+  for (const cmd of [
+    `gh pr comment 3 --body "$(cat ${heredoc()})"`, `gh pr comment 3 --body "$(cat ${heredoc('EOF', 'plain text')})"`, `gh api repos/o/r/issues/3/comments -f body="$(cat ${heredoc()})"`,
+    'gh pr comment 3 --body hello', "gh api repos/o/r/issues/3/comments -f body='costs 5'", gql('mutation($b:String!){addComment(input:{subjectId:"X",body:$b}){clientMutationId}}', '-f b=hello'),
+    'curl -s https://api.github.com/repos/o/r/issues/3/comments', 'gh pr view 3 --json body --jq .body',
+  ]) allow(cmd);
+});
+
+test('gh pr|issue comment --editor / -e: the text is typed in an editor the guard cannot see, so it is denied', () => {
+  for (const cmd of ['gh pr comment 3 --editor', 'gh pr comment 3 -e', 'GH_EDITOR="cp forged.txt" gh issue comment 3 --editor']) deny(cmd);
+});
+
+// ---- curl / wget / httpie / xh: forms the shell or the tool reads differently from the first parser ----
+test('curl-family parser differentials: bundled short flags, --url, trailing-dot host, config files, --next, URLs from stdin / a file, lowercase httpie methods and value flags', () => {
+  files['/work/repo/curlrc'] = '# a config\nurl = "https://api.github.com/repos/o/r/pulls/3/merge"\nrequest = "PUT"\n';
+  files['/work/repo/curlrc2'] = 'X = PUT\nurl https://api.github.com/repos/o/r/pulls/3/merge\n';
+  files['/work/repo/curlrc-ok'] = 'silent\nurl = "https://example.com/x"\n';
+  files['/work/repo/body.txt'] = `done\n${MARK}\n`;
+  for (const cmd of [
+    'curl -sXPUT https://api.github.com/repos/o/r/pulls/3/merge', 'curl -sSXPUT https://api.github.com/repos/o/r/pulls/3/merge', 'curl -sX PUT https://api.github.com/repos/o/r/pulls/3/merge', 'curl -sd @body.txt https://api.github.com/repos/o/r/issues/3/comments',
+    'curl --url=https://api.github.com/repos/o/r/pulls/3/merge -X PUT', 'curl --url https://api.github.com/repos/o/r/pulls/3/merge -X PUT',
+    'curl -X PUT https://api.github.com./repos/o/r/pulls/3/merge', 'curl -X PUT https://API.GITHUB.COM./repos/o/r/pulls/3/merge',
+    'curl -K curlrc', 'curl --config curlrc', 'curl -K curlrc2', 'curl -K - ', 'curl -K missing.rc', 'curl --config=curlrc',
+    'curl -X PUT https://api.github.com/repos/o/r/pulls/3/merge --next -X GET https://example.com', 'curl -X PUT https://api.github.com/repos/o/r/pulls/3/merge --next https://example.com',
+    'curl --next -d x https://api.github.com/repos/o/r/pulls/3/merge', 'curl -X GET https://example.com --next -d x https://api.github.com/repos/o/r/pulls/3/merge',
+    'curl --data-urlencode body@body.txt https://api.github.com/repos/o/r/issues/3/comments',
+    'echo https://api.github.com/repos/o/r/pulls/3/merge | xargs curl -X PUT', 'xargs -a urls curl -X PUT', 'xargs -I{} curl -X PUT {} < urls', 'curl -X PUT', 'wget -i urls --method=PUT', 'wget --input-file=urls --post-data=x',
+    'http -b put api.github.com/repos/o/r/pulls/3/merge', 'xh --ignore-stdin -p b PUT api.github.com/repos/o/r/pulls/3/merge', 'xh -p=b put api.github.com/repos/o/r/pulls/3/merge', 'http --print=b Put https://api.github.com/repos/o/r/pulls/3/merge', 'https delete api.github.com/repos/o/r/issues/comments/9',
+  ]) deny(cmd);
+  for (const cmd of [
+    'curl -K curlrc-ok', 'curl -sSL https://example.com/x', 'curl -sX GET https://api.github.com/repos/o/r/pulls/3', 'curl -sSO https://github.com/o/r/archive/main.tar.gz', 'curl -X PUT https://example.com/x --next https://api.github.com/repos/o/r/pulls/3',
+    'echo x | xargs curl -s', 'wget -qO- https://api.github.com/repos/o/r', 'wget -i urls', 'http -b GET api.github.com/repos/o/r', 'xh --ignore-stdin -p b api.github.com/repos/o/r', 'http -p=b api.github.com/repos/o/r/pulls/3',
+  ]) allow(cmd);
+});

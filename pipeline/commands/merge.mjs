@@ -97,7 +97,7 @@ export const run = guarded(async (argv, ctx) => {
       else if (values['owner-approved-items'] !== gate.ownerItems) approvalProblem = `--owner-approved-items is not the gate's owner-item set (${gate.ownerItems})`;
       else if (!approvedRequest({ pr, head: gate.head, items: gate.ownerItems, stop: [...new Set([stopId, ...openIds].filter(Boolean))] })) {
         approvalProblem = stopId
-          ? `no owner "merge" is recorded for #${pr} head ${gate.head.slice(0, 12)} items ${gate.ownerItems} that carries the owner stop(s) ${[...new Set([stopId, ...openIds])].join(', ')}: show the request with a \`Stopped #${pr} · stop <id>\` line for each of them above the Head line and wait for the owner to type "merge"`
+          ? `no owner "merge" is recorded for #${pr} head ${gate.head.slice(0, 12)} items ${gate.ownerItems} that carries ${[...new Set([stopId, ...openIds])].map((i) => `stop ${i}`).join(' and ')}: show the request with a \`Stopped #${pr} · stop <id>\` line for each of them above the Head line and wait for the owner to type "merge"`
           : `no owner "merge" is recorded for #${pr} head ${gate.head.slice(0, 12)} items ${gate.ownerItems}: show the request (Owner-merge approval in the ship skill) and wait for the owner to type "merge"`;
       }
     }

@@ -94,7 +94,15 @@ const unescapeText = (s) => safeDecode(String(s ?? '')
   .replace(/\\x([0-9a-f]{2})/gi, (m, h) => String.fromCharCode(parseInt(h, 16))));
 const mentionsEventMarker = (...texts) => texts.some((x) => EVENT_MARKER.test(unescapeText(x)));
 const EVENT_FORGE = 'the text carries a claude-pipeline owner-stop event marker. Those comments are posted only by the pipeline CLI (P summary / P checkpoint), after the owner\'s reply. ' + 'This is reserved for the repository owner.';
+const COMMENT_MUTATIONS = ['addComment', 'addPullRequestReview', 'addPullRequestReviewComment', 'addPullRequestReviewThreadReply'];
 const COMMENT_UNREADABLE = 'the comment text cannot be read here (--input - / stdin / an unreadable file), so it cannot be checked for a pipeline event marker. Pass the text with --body, -f body=... or a readable file.';
+// A comment text built at run time ($VAR, $(...), backticks) cannot be checked for the marker, so it is refused like an unreadable one. The one run-time form that IS
+// readable: `$(cat <<'EOF' ... EOF)` (a quoted heredoc is literal; an unquoted one only when its body has no $ ` or backslash), because the heredoc body is part of the line
+// the marker scan reads. Nothing may follow the delimiter on the heredoc line, and nothing else on the word may be dynamic.
+const COMMENT_RUNTIME = 'the comment text is built at run time ($VAR / $(...) / backticks), so it cannot be checked for a pipeline event marker. Write the text out (a literal --body, or a quoted heredoc `"$(cat <<\'EOF\' ... EOF)"`) or pass a readable --body-file.';
+const QUOTED_HEREDOC_SUBST = /\$\(\s*cat\s+<<-?\s*(['"])(\w+)\1[ \t]*\n[\s\S]*?\n[ \t]*\2[ \t]*\n?\s*\)/g;
+const BARE_HEREDOC_SUBST = /\$\(\s*cat\s+<<-?\s*([A-Za-z_]\w*)[ \t]*\n([\s\S]*?)\n[ \t]*\1[ \t]*\n?\s*\)/g;
+const runTimeText = (v) => DYNAMIC.test(String(v ?? '').replace(QUOTED_HEREDOC_SUBST, '').replace(BARE_HEREDOC_SUBST, (m, _d, body) => (/[$`\\]/.test(body) ? m : '')));
 const COMMENT_ROUTE = /^repos\/[^/]+\/[^/]+\/(?:issues\/[^/]+\/comments|pulls\/[^/]+\/(?:comments|reviews))$/i;
 const stripHeads = (b) => String(b).replace(/^refs\/heads\//, '').replace(/^heads\//, '');
 
@@ -741,7 +749,7 @@ function gatherBody(flags, dir, ctx) {
       let value = eq < 0 ? '' : f.value.slice(eq + 1);
       const at = typed ? /^@(.+)$/.exec(value) : null;
       if (at) value = fromFile(at[1]) ?? '';
-      fields.push({ key, value });
+      fields.push({ key, value, rt: !at && runTimeText(value) });
       if (key === 'query') queries.push(value);
     } else if (!f.short && f.name === 'input') {
       if (f.value === '-') { unknown = true; text += `\n${ctx.fullText}`; continue; }
@@ -809,8 +817,10 @@ function checkGraphql(body, dir = null, ctx = null) {
     if (bad === 'updateIssueComment') return deny(`editing a comment through graphql (updateIssueComment) is blocked: run events are comments and must not be rewritten. ${OWNER_ONLY}`);
     if (bad) return deny(`the graphql mutation ${bad} is not on the allowed list (${[...GRAPHQL_ALLOWED_MUTATIONS].join(', ')}). ${OWNER_ONLY}`);
     // (the query text AND the variables: `-f body=...`, `-F body=@file`, an --input JSON's values)
-    if (names.some((n) => ['addComment', 'addPullRequestReview', 'addPullRequestReviewComment', 'addPullRequestReviewThreadReply'].includes(n))
+    if (names.some((n) => COMMENT_MUTATIONS.includes(n))
       && mentionsEventMarker(q, body.text, ...body.fields.map((x) => x.value), ...body.queries)) return deny(EVENT_FORGE);
+    // (the variables of a comment mutation: `-f b="$(cat file)"`. The query itself is judged above; `data` is the curl route's own check)
+    if (names.some((n) => COMMENT_MUTATIONS.includes(n)) && body.fields.some((x) => x.rt && x.key !== 'query' && x.key !== 'data')) return deny(COMMENT_RUNTIME);
     // #58: auto-merge names the PR by its node id, which says nothing about whether the owner said "merge" for it, nor which repository it is in.
     // Why (#58 round 3): the node id can name a PR in a chat repo whatever directory this runs in, so the target repository can never be resolved
     // here: it is judged as a chat repo's (the owner's "merge" is needed, and a node id cannot match one), not as the current directory's.
@@ -869,6 +879,7 @@ function checkApi(rest, env, dir, ctx) {
   if (COMMENT_ROUTE.test(ep)) {
     if (body.unknown) return deny(COMMENT_UNREADABLE);
     if (mentionsEventMarker(haystack, ...body.fields.map((x) => x.value))) return deny(EVENT_FORGE);
+    if (body.fields.some((x) => x.rt)) return deny(COMMENT_RUNTIME);
   }
   const dynamicLabel = body.fields.some((f) => /^(labels(\[\])?|name|new_name)$/.test(f.key) && DYNAMIC.test(f.value));
 
@@ -1073,10 +1084,15 @@ function checkGhComment(rest, dir, ctx) {
   if (flags.some((f) => !f.short && (f.name === 'edit-last' || f.name === 'delete-last'))) {
     return deny('editing or deleting the last comment (--edit-last / --delete-last) is blocked: pipeline run events and owner stops live in comments and must not be rewritten or removed. Post a new comment instead.');
   }
+  // (--editor: the text is typed in an editor the guard cannot see)
+  if (flags.some((f) => f.short ? f.name === 'e' : f.name === 'editor')) return deny(COMMENT_UNREADABLE);
   const texts = [rest.join('\n'), ctx.fullText ?? ''];
   for (const fl of flags) {
     if (fl.value === null) continue;
-    if (fl.short ? fl.name === 'b' : fl.name === 'body') texts.push(fl.value);
+    if (fl.short ? fl.name === 'b' : fl.name === 'body') {
+      if (runTimeText(fl.value)) return deny(COMMENT_RUNTIME);
+      texts.push(fl.value);
+    }
     else if (fl.short ? fl.name === 'F' : fl.name === 'body-file') {
       if (fl.value === '-' || dir === null) return deny(COMMENT_UNREADABLE);
       countScript(ctx.budget);
@@ -1186,22 +1202,65 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
 // A call to github.com / api.github.com with a non-GET method is rewritten as the `gh api` call it is and judged by checkApi (+ the merge / refs rules below).
 // Residual: `node -e "fetch(...)"`, `python -c`, any program the agent writes.
 const HTTP_TOOLS = new Set(['curl', 'wget', 'http', 'https', 'xh', 'xhs']);
-const GH_HOST = /(?:^|\.)github\.com$/i;
-const HTTP_VALUE_FLAGS = new Set(['-H', '--header', '-o', '--output', '-u', '--user', '-A', '--user-agent', '-e', '--referer', '-b', '--cookie', '-c', '--cookie-jar', '-w', '--write-out', '--connect-timeout', '-m', '--max-time',
-  '--retry', '-x', '--proxy', '--cacert', '--cert', '--key', '-K', '--config', '-a', '--auth', '--session', '-O', '--output-document', '--header-file', '--timeout', '-t', '--tries', '--user-agent', '--password']);
+const GH_HOST = /(?:^|\.)github\.com\.?$/i; // (a trailing dot is the same host)
+// Flags whose NEXT word is their value, per tool: a flag missing here would leave its value among the URL candidates (harmless), but a flag listed here that is
+// a switch in that tool would swallow the URL (a hole), so the sets are per tool.
+const CURL_VALUE_FLAGS = new Set(['-H', '--header', '-o', '--output', '-u', '--user', '-A', '--user-agent', '-e', '--referer', '-b', '--cookie', '-c', '--cookie-jar', '-w', '--write-out', '--connect-timeout', '-m', '--max-time', '--retry', '--retry-delay',
+  '--retry-max-time', '-x', '--proxy', '--cacert', '--cert', '-E', '--key', '--resolve', '--connect-to', '--interface', '--limit-rate', '--max-redirs', '-r', '--range', '-C', '--continue-at', '-D', '--dump-header', '-y', '-Y', '-z', '-Q', '--proxy-user', '-U', '--oauth2-bearer', '--aws-sigv4']);
+const WGET_VALUE_FLAGS = new Set(['-o', '--output-file', '-a', '--append-output', '-e', '--execute', '-t', '--tries', '-T', '--timeout', '-O', '--output-document', '-w', '--wait', '-P', '--directory-prefix', '-U', '--user-agent', '-B', '--base', '-Q', '--quota', '-l', '--level',
+  '-A', '--accept', '-R', '--reject', '-D', '--domains', '-I', '--include-directories', '-X', '--exclude-directories', '--header', '--user', '--password', '--http-user', '--http-password', '--referer', '--load-cookies', '--save-cookies', '--certificate', '--ca-certificate', '--private-key']);
+const HTTPIE_VALUE_FLAGS = new Set(['-A', '--auth-type', '-a', '--auth', '-o', '--output', '-p', '--print', '-s', '--style', '--pretty', '--ssl', '--verify', '--cert', '--cert-key', '--cert-key-pass', '--proxy', '--timeout', '--max-redirects', '--max-headers', '--session', '--session-read-only',
+  '--default-scheme', '--format-options', '--response-charset', '--response-mime', '--path-as-is', '--bearer', '--unsorted', '--sorted', '--ciphers']);
 const HTTP_DATA_FLAGS = new Set(['-d', '--data', '--data-raw', '--data-binary', '--data-ascii', '--data-urlencode', '--json', '-T', '--upload-file', '-F', '--form', '--form-string', '--post-data', '--post-file', '--body-data', '--body-file']);
 const HTTP_FILE_FLAGS = new Set(['-T', '--upload-file', '--post-file', '--body-file']);
-function checkHttpTool(argv, dir, ctx) {
-  const words = argv.slice(1).map((a) => expandVars(a, ctx));
-  let method = null;
+const URL_FILE_FLAGS = new Set(['-i', '--input-file']); // wget reads its URLs from a file
+const CURL_SHORT_VALUE = 'XHdobuAecwmxKFTEyYzrCDQU';
+const HTTP_METHODS = ['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH', 'DELETE'];
+const SAFE_METHODS = ['GET', 'HEAD', 'OPTIONS'];
+// A curl config file (-K) as the words it stands for: "url = \"...\"" -> --url ...; "silent" -> --silent; "X = PUT" -> -X PUT. Comments and blank lines are skipped.
+function curlConfigWords(text) {
+  const out = [];
+  for (const raw of String(text).split(/\r?\n/)) {
+    const ln = raw.trim();
+    if (!ln || ln.startsWith('#')) continue;
+    const m = /^(-{0,2}[A-Za-z][A-Za-z0-9-]*)\s*(?:[=:]\s*|\s+)?([\s\S]*)$/.exec(ln);
+    if (!m) continue;
+    const name = m[1].replace(/^-+/, '');
+    out.push(name.length === 1 ? `-${name}` : `--${name}`);
+    let v = m[2].trim();
+    if (/^"[\s\S]*"$/.test(v)) v = v.slice(1, -1).replace(/\\(.)/g, '$1');
+    if (v !== '') out.push(v);
+  }
+  return out;
+}
+function checkHttpTool(argv, dir, ctx, tool = 'curl') {
+  const httpie = ['http', 'https', 'xh', 'xhs'].includes(tool);
+  const valueFlags = tool === 'curl' ? CURL_VALUE_FLAGS : tool === 'wget' ? WGET_VALUE_FLAGS : HTTPIE_VALUE_FLAGS;
+  // curl bundles short flags (-sXPUT, -sSd@f): split them into separate words, a value-taking letter ends the bundle
+  const unbundle = (w) => {
+    if (tool !== 'curl' || !/^-[A-Za-z]/.test(w) || w.length <= 2) return [w];
+    const out = [];
+    for (let k = 1; k < w.length; k++) {
+      out.push(`-${w[k]}`);
+      if (CURL_SHORT_VALUE.includes(w[k])) { if (k + 1 < w.length) out.push(w.slice(k + 1)); break; }
+    }
+    return out;
+  };
+  let words = argv.slice(1).map((a) => expandVars(a, ctx)).flatMap(unbundle);
+  const methods = [];
   let implied = false;
+  let sawNext = false;
   const urls = [];
   const data = [];
   let unknown = false;
+  let urlFile = false;
+  let configs = 0;
+  let configUnreadable = false;
   const readData = (v, isFile) => {
-    let value = v;
-    if (!isFile && !value.startsWith('@') && !/^[^=\s]+=@/.test(value)) { data.push(value); return; }
-    const p = isFile ? value : (value.startsWith('@') ? value.slice(1) : value.slice(value.indexOf('=@') + 2));
+    const value = v;
+    const urlenc = /^[^=@\s]*@(.+)$/.exec(value); // --data-urlencode name@file
+    if (!isFile && !value.startsWith('@') && !/^[^=\s]+=@/.test(value) && !urlenc) { data.push(value); return; }
+    const p = isFile ? value : (value.startsWith('@') ? value.slice(1) : urlenc && !value.includes('=') ? urlenc[1] : value.slice(value.indexOf('=@') + 2));
     if (p === '-' || p === '' || dir === null) { unknown = true; return; }
     countScript(ctx.budget);
     const text = ctx.readText(path.resolve(dir, p));
@@ -1211,25 +1270,44 @@ function checkHttpTool(argv, dir, ctx) {
     const w = words[i];
     if (w === '--') { urls.push(...words.slice(i + 1)); break; }
     const eq = w.startsWith('--') ? w.indexOf('=') : -1;
-    const flag = eq > 0 ? w.slice(0, eq) : (/^-[A-Za-z]./.test(w) && !w.startsWith('--') ? w.slice(0, 2) : w);
-    const attached = eq > 0 ? w.slice(eq + 1) : (/^-[A-Za-z]./.test(w) && !w.startsWith('--') ? w.slice(2) : null);
+    const flag = eq > 0 ? w.slice(0, eq) : (!httpie && /^-[A-Za-z]./.test(w) && !w.startsWith('--') ? w.slice(0, 2) : w);
+    const attached = eq > 0 ? w.slice(eq + 1) : (!httpie && /^-[A-Za-z]./.test(w) && !w.startsWith('--') ? w.slice(2) : null);
     const value = () => (attached !== null ? attached : (words[++i] ?? ''));
-    if (flag === '-X' || flag === '--request' || flag === '--method') { method = value().toUpperCase(); continue; }
-    if (HTTP_DATA_FLAGS.has(flag)) { implied = true; readData(value(), HTTP_FILE_FLAGS.has(flag)); continue; }
-    if (HTTP_VALUE_FLAGS.has(flag)) { value(); continue; }
+    if (flag === '--next' || flag === '-:') { sawNext = true; continue; }
+    if (flag === '-X' || flag === '--request' || flag === '--method') { methods.push(value().toUpperCase()); continue; }
+    if (tool === 'curl' && (flag === '--url')) { urls.push(value()); continue; }
+    if (tool === 'curl' && (flag === '-K' || flag === '--config')) {
+      const file = value();
+      if (file === '-' || file === '' || dir === null || ++configs > 3) { configUnreadable = true; continue; }
+      countScript(ctx.budget);
+      const text = ctx.readText(path.resolve(dir, file));
+      if (typeof text !== 'string') { configUnreadable = true; continue; }
+      words = [...words.slice(0, i + 1), ...curlConfigWords(text).map((x) => expandVars(x, ctx)), ...words.slice(i + 1)];
+      continue;
+    }
+    if (URL_FILE_FLAGS.has(flag) && tool === 'wget') { value(); urlFile = true; continue; }
+    if (HTTP_DATA_FLAGS.has(flag) && !(httpie && flag.length === 2 && flag !== '-F')) { implied = true; readData(value(), HTTP_FILE_FLAGS.has(flag)); continue; }
+    if (valueFlags.has(flag)) { value(); continue; }
     if (w.startsWith('-')) continue;
-    if (/^[A-Z]{3,7}$/.test(w) && ['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(w) && urls.length === 0 && method === null) { method = w; continue; }
+    if (httpie && HTTP_METHODS.includes(w.toUpperCase())) { methods.push(w.toUpperCase()); continue; }
+    if (!httpie && /^[A-Z]{3,7}$/.test(w) && HTTP_METHODS.includes(w) && urls.length === 0 && methods.length === 0) { methods.push(w); continue; }
     if (!/:\/\//.test(w) && (/^[A-Za-z0-9_.\[\]-]+(?::=|=@?|:)/.test(w) && !/^[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?:[/:]|$)/.test(w))) {
       if (!/^[A-Za-z0-9_.\[\]-]+==/.test(w) && /=/.test(w)) { implied = true; readData(w, false); } // (httpie / xh data item; `key==v` is a query parameter, `Name:v` a header)
       continue;
     }
     urls.push(w);
   }
-  const nonGet = (method !== null && !['GET', 'HEAD', 'OPTIONS'].includes(method)) || (method === null && implied);
-  const verb = method !== null && !['GET', 'HEAD', 'OPTIONS'].includes(method) ? method : 'POST';
+  // (a curl config file may set the URL, the method and the data: one that cannot be read here is refused whatever else the line says)
+  if (configUnreadable) return deny('the curl config file (-K / --config) cannot be read here (stdin, a missing file or too many), and it may set the URL and the method, so the call cannot be verified. Put the options on the command line.');
+  // Every method named anywhere counts (--next starts a new transfer with its own options: the last -X must not hide an earlier PUT). Data without a method is a POST.
+  const bad = methods.find((m) => !SAFE_METHODS.includes(m));
+  const nonGet = bad !== undefined || (implied && (methods.length === 0 || sawNext));
+  const verb = bad ?? 'POST';
+  if (nonGet && (urlFile || unknown && urls.length === 0)) return deny(`${verb} whose URL or config comes from a file / stdin / a config file that cannot be read here, so what it calls cannot be verified. Write the URL on the command line.`);
+  if (nonGet && urls.length === 0) return deny(`${verb} with no URL on the command line (it comes from stdin, xargs or a config), so what it calls cannot be verified. Write the URL out.`);
   for (const w of urls) {
     const host = (/^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/)?(?:[^/@?#]*@)?([^/:?#]*)/.exec(w) ?? [])[1] ?? '';
-    const hostUnknown = host === '' || DYNAMIC.test(host);
+    const hostUnknown = host === '' || DYNAMIC.test(host) || /[{}]/.test(host); // ({} is the placeholder of xargs / find: the URL comes from elsewhere)
     if (!hostUnknown && !GH_HOST.test(host)) continue;
     if (!nonGet) {
       if (!hostUnknown && DYNAMIC.test(w) && /\$\(|`/.test(w)) return deny('the URL is built at run time ($(...) / backticks) for a github.com host, so what it calls cannot be verified. Write the URL out.');
@@ -1240,6 +1318,9 @@ function checkHttpTool(argv, dir, ctx) {
     if (/^repos\/[^/]+\/[^/]+\/pulls\/\d+\/merge$/i.test(ep)) return deny(`merging through the API bypasses the merge gate, like --admin. ${OWNER_ONLY}`);
     if (/\/merges$/i.test(`/${ep}`)) return deny(`merging branches through the API can move main without a PR. ${OWNER_ONLY}`);
     if (/\/git\/refs(\/|$)/i.test(`/${ep}`)) return deny(`${verb} to git refs through the API is blocked. ${OWNER_ONLY}`);
+    // (a body built at run time on a comment route, or a graphql document with a command substitution, cannot be read)
+    if (COMMENT_ROUTE.test(ep) && data.some((d) => runTimeText(d))) return deny(COMMENT_RUNTIME);
+    if (ep === 'graphql' && data.some((d) => /\$\(|`|\$\{/.test(d))) return deny('the graphql document is built at run time, so it cannot be verified. Write the query text out.');
     const queries = [];
     for (const d of data) {
       try {
@@ -2670,7 +2751,7 @@ function evalString(str, startDir, ctx, level, child = false) {
         const v = withPrefixEnv(c, ctx, () => evalString(inner, dir, ctx, level + 1));
         if (v.decision === 'deny') { verdict = v; break; }
       }
-      if (!verdict && HTTP_TOOLS.has(name)) verdict = checkHttpTool(argv, dir, ctx);
+      if (!verdict && HTTP_TOOLS.has(name)) verdict = checkHttpTool(argv, dir, ctx, name);
       if (!verdict) verdict = withPrefixEnv(c, ctx, () => repoMergeCommandVerdict(argv, dir, ctx)); // (#58; with its prefix: `npm_config_prefix=/chat npm run merge …`)
       if (!verdict) {
         // a string or program text the parser cannot unwrap (node -e, osascript, make CMD=...) that carries a guarded command
