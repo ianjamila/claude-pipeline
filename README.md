@@ -375,3 +375,6 @@ The repo is onboarded to itself (`.claude/pipeline.yml`) with **every path a har
 change to the pipeline never auto-merges: ship builds, verifies and reviews it, then hands you a
 `needs-human` PR. `scripts/verify.mjs` is the project template with only its steps changed;
 `test/self-verify.test.mjs` fails if the two drift.
+Every verify run (the template, so every onboarded repo) also appends one JSON line to the machine-wide
+`~/.claude/pipeline-state/verify-runs.jsonl` for the local Command Centre wallboard; `VERIFY_RUN_HISTORY=<path>`
+moves it, `VERIFY_RUN_HISTORY=off` (or `CI`) disables it. The test runner sets it to `off`.
