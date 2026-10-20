@@ -376,10 +376,30 @@ test('consumerWorktrees: a transcript cwd that is / , the home directory or an a
   const listWorktrees = () => [wtEntry(base, 'main'), wtEntry(wt, 'feat/t')];
   const r = consumerWorktrees(stackSa, { events: [], transcripts: { dirs: [dirs], sinceMs: 0 }, repos: [base], listWorktrees, platform: 'darwin', home: '/Users/me' });
   assert.equal(r.ok, true);
-  assert.deepEqual(r.value.map((w) => w.path).sort(), [wt, '/Users/me/elsewhere/proj'].sort());
-  for (const dropped of ['/', '/Users', '/Users/me', '/Users/me/stacks']) {
+  assert.deepEqual(r.value.map((w) => w.path), [wt], 'a cwd in no known worktree is no consumer either');
+  for (const dropped of ['/', '/Users', '/Users/me', '/Users/me/stacks', '/Users/me/elsewhere/proj']) {
     assert.ok(r.notes.some((n) => n.includes(JSON.stringify(dropped)) || n.includes(`${dropped} `)), `a note names ${dropped}`);
   }
+});
+
+test('consumerWorktrees: a transcript cwd in no known worktree is dropped with a note; one inside a known worktree maps to that worktree', () => {
+  const { base, mk } = makeRepo();
+  const wt = mk('t');
+  const dirs = tmp('stacks-tr ');
+  const proj = path.join(dirs, '-Users-me-proj');
+  mkdirSync(proj, { recursive: true });
+  const line = (cwd) => JSON.stringify({ cwd, message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'supabase status --workdir /Users/me/stacks/sa.stack' } }] } });
+  const outside = '/Users/me/claude-memory/home';
+  writeFileSync(path.join(proj, 's1.jsonl'), `${[outside, path.join(wt, 'deep', 'sub')].map(line).join('\n')}\n`);
+  const listWorktrees = () => [wtEntry(base, 'main'), wtEntry(wt, 'feat/t')];
+  const r = consumerWorktrees(stackSa, { events: [], transcripts: { dirs: [dirs], sinceMs: 0 }, repos: [base], listWorktrees, platform: 'darwin', home: '/Users/me' });
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.value.map((w) => [w.path, w.via, w.branch]), [[wt, 'transcript', 'feat/t']]);
+  assert.ok(r.notes.includes(`transcript cwd ${JSON.stringify(outside)} dropped as a consumer: it is in no known worktree of a configured repo`));
+  // alone, the outside cwd leaves no consumer at all
+  writeFileSync(path.join(proj, 's1.jsonl'), `${line(outside)}\n`);
+  const only = consumerWorktrees(stackSa, { events: [], transcripts: { dirs: [dirs], sinceMs: 0 }, repos: [base], listWorktrees, platform: 'darwin', home: '/Users/me' });
+  assert.deepEqual(only.value, []);
 });
 
 test('consumerWorktrees: win32 => unknown, no I/O', () => {
