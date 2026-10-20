@@ -4,7 +4,7 @@
 // command) is shared: git-policy.mjs judges the merge command with it as before, and both guards open the scripts with pmCall / packageScripts.
 import nodePath from 'node:path';
 import { lstatSync } from 'node:fs';
-import { commandName, simpleCommands } from './shell-parse.mjs';
+import { commandName, simpleCommands, splitArgs } from './shell-parse.mjs';
 
 const baseName = (w) => commandName(w);
 
@@ -853,6 +853,7 @@ export function binIsProgram(text, site = null) {
 // What binIsProgram needs to know about the project for the bin node_modules/.bin/NAME found at `bin` and run in `runDir`: the project is its package directory and the directory it runs in; the bins that come first on the
 // PATH are every node_modules/.bin from either of them upward. exists: file test.
 export function binSite(bin, runDir, exists, p = nodePath) {
+  // (R3-B2: the PATH order is the run directory and its parents FIRST -- the manager puts the nearest node_modules/.bin of where it runs ahead of the others -- then the bin's own package directory)
   const roots = [p.dirname(p.dirname(p.dirname(bin))), runDir].filter((x) => typeof x === 'string');
   return {
     inside: (abs) => roots.some((r) => abs === r || abs.startsWith(r === '/' ? '/' : `${r}/`)),
@@ -881,7 +882,15 @@ export function binSite(bin, runDir, exists, p = nodePath) {
 export const MAX_BIN_INTERPRETERS = 4;
 const MAX_LINE_NAMES = 64;
 // The names a command line spells out (every word, split at separators and slashes): the directories it may create.
-export const lineNames = (text) => String(text ?? '').split(/[\s'"`$()<>|&;=,:{}[\]*?\\/]+/).filter((n) => n && n !== '.' && n !== '..');
+// (R3-B1: also the names of the shell WORDS -- quote-aware, so a directory 'new package' is one name, not two: each word is cut at the separators and slashes but keeps its spaces)
+export const lineNames = (text) => {
+  const s = String(text ?? '');
+  const out = s.split(/[\s'"`$()<>|&;=,:{}[\]*?\\/]+/);
+  let words = [];
+  try { words = splitArgs(s); } catch { words = []; }
+  for (const w of words) out.push(...w.split(/[`$()<>|&;=,:{}[\]*?\\/]+/));
+  return out.filter((n) => n && n !== '.' && n !== '..');
+};
 export function binInterpreter(text, site = null) {
   if (typeof text !== 'string' || !text.startsWith('#!') || !site) return null;
   const tokens = text.slice(2).split(/\r?\n/, 1)[0].trim().split(/\s+/).filter(Boolean);

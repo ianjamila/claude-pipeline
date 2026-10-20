@@ -319,3 +319,22 @@ test('R2-B2 a package.json the line creates in a directory a `dir/*` workspace p
   allowed('mkdir -p packages/b/deep && cp replacement.json packages/b/deep/package.json && npm run lint --workspaces', tree);
   allowed('npm run lint --workspaces', tree);
 });
+
+// ---- round 3 (Codex items R3-B1, R3-B2) ------------------------------------------------------------------------------------------
+test('R3-B1 a new workspace directory whose quoted name holds a space is checked, as one without', () => {
+  const ws = { workspaces: ['packages/*'] };
+  const tree = (g) => ({ 'package.json': pkg({}, ws), 'packages/a/package.json': pkg({ lint: 'echo hi' }), 'replacement.json': pkg({ lint: g.bad }) });
+  const harmless = () => ({ 'package.json': pkg({}, ws), 'packages/a/package.json': pkg({ lint: 'echo hi' }), 'replacement.json': pkg({ lint: 'echo fine' }) });
+  const tail = '&& npm run lint --workspaces';
+  denied(`mkdir -p 'packages/new package' && cp replacement.json 'packages/new package/package.json' ${tail}`, tree, /writes .*package\.json/);
+  denied(`mkdir -p "packages/new package" && cp replacement.json "packages/new package/package.json" ${tail}`, tree, /writes .*package\.json/);
+  denied(`mkdir -p packages/new\\ package && cp replacement.json packages/new\\ package/package.json ${tail}`, tree, /writes .*package\.json/);
+  denied(`mkdir -p packages/'new package' && cp replacement.json packages/'new package'/package.json ${tail}`, tree, /writes .*package\.json/);
+  denied(`mkdir -p 'packages/new package';cp replacement.json 'packages/new package/package.json' ${tail}`, tree, /writes .*package\.json/);
+  // twins: a harmless replacement, another file in the new directory, a package.json outside the pattern's parent
+  // (a package.json the line itself writes into a workspace directory is refused whatever it holds -- R1-B3's known-write rule -- so a harmless replacement.json is no twin: the plain-named directory is refused too)
+  denied(`mkdir -p packages/b && cp replacement.json packages/b/package.json ${tail}`, harmless, /writes .*package\.json/);
+  denied(`mkdir -p 'packages/new package' && cp replacement.json 'packages/new package/package.json' ${tail}`, harmless, /writes .*package\.json/);
+  allowed(`mkdir -p 'packages/new package' && cp replacement.json 'packages/new package/README.md' ${tail}`, tree);
+  allowed(`mkdir -p 'other/new package' && cp replacement.json 'other/new package/package.json' ${tail}`, tree);
+});
