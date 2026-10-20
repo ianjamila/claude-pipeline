@@ -88,7 +88,7 @@ const DEVICE_PREFIX = /^\/\/[?.]\/(?=[A-Za-z]:\/)/; // \\?\C:\ and \\.\C:\ forms
 let drivePaths = false;
 const isAbs = (s) => s.startsWith('/') || (drivePaths && /^[A-Za-z]:\//.test(s));
 const pathsFor = () => (drivePaths ? drivePosix : posix);
-const DRIVE_RELATIVE = /^[A-Za-z]:(?![/:\s])/; // D:foo (a drive and no slash), not D:/foo
+const DRIVE_RELATIVE = /^[A-Za-z]:(?![/\s])/; // D:foo or D: (a drive and no slash), not D:/foo
 const caseInsensitive = (platform) => platform === 'win32' || platform === 'darwin';
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
 const unique = (a) => [...new Set(a)];

@@ -138,6 +138,27 @@ test('win32: a drive-relative word (D:foo) is a run-time-unknown path, judged as
   assert.equal(run('echo x > D:/work/proj/sub/notes.txt && npm test'), 'allow');
   assert.equal(run('cat D:/work/proj/package.json && npm test'), 'allow');
 });
+test('win32: the bare drive (D:) and a quoted drive-relative word are run-time-unknown too', () => {
+  const files = { 'D:/work/proj/package.json': JSON.stringify({ name: 'x', version: '1.0.0', scripts: { test: 'echo hi' } }) };
+  const dirs = ['D:/', 'D:/work', 'D:/work/proj', 'D:/home/u'];
+  const run = (cmd) => evaluateBashForFiles(cmd, { home: 'D:/home/u', env: {}, platform: 'win32', realpath: (p) => p, cwd: 'D:/work/proj', ...posixFs(files, dirs) }).decision;
+  // (`D:` alone is the working directory of drive D; `D:` followed by a slash is the drive root, a known path)
+  for (const shape of ['cd # && npm test', 'echo x > # && npm test', 'cp x # && npm test', 'npm --prefix # test', `echo x > #/${CL}/settings.json`]) {
+    for (const tail of ['', `; echo ${CL}`]) {
+      for (const word of ['D:', 'D:"foo"', '"D:"foo', "'D:foo'", "D:'foo'", '"D:foo"']) {
+        if (word === 'D:' && shape.includes('#/')) continue; // (`D:/x` is the drive root's x: a known path)
+        const cmd = shape.replaceAll('#', word) + tail;
+        const unknown = run(shape.replaceAll('#', '$X') + tail);
+        assert.ok(unknown !== 'deny' || run(cmd) === 'deny', `${cmd}: allowed, but the same line with $X is refused`); // (never looser than a path only known at run time)
+      }
+    }
+  }
+  assert.equal(run(`echo x > D: && npm test; echo ${CL}`), 'deny', 'the bare drive as a redirect target');
+  assert.equal(run(`cp x D: && npm test; echo ${CL}`), 'deny');
+  // twins: the drive root with a slash is a known absolute path, not the project's
+  assert.equal(run(`echo x > D:/notes.txt && npm test; echo ${CL}`), 'allow');
+  assert.equal(run('cd D:/work/proj && npm test'), 'allow');
+});
 test('win32: a UNC path has its own root (the share), never a local /srv/share path', () => {
   assert.equal(drivePosix.resolve('//srv/share/x/..'), '//srv/share/');
   assert.equal(drivePosix.resolve('//srv/share/../..'), '//srv/share/', '`..` stops at the share root');

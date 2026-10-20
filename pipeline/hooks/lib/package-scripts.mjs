@@ -371,7 +371,7 @@ function managerWrites(argv) {
 }
 
 // `D:foo`: a drive and no slash, relative to the working directory of that drive (Windows only)
-const driveRelative = (w) => /^[A-Za-z]:(?![/\\:\s])/.test(String(w));
+const driveRelative = (w) => /^[A-Za-z]:(?![/\\\s])/.test(String(w));
 // Where a word names, from each directory the command may run in: string[] (a glob stays in the text when allowGlob), or null (only known at run time).
 const UNKNOWN_HEAD = '\u0000?/';
 function placeWord(site, dirs, w, allowGlob) {

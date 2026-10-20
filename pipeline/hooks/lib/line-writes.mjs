@@ -1626,7 +1626,7 @@ function partAlternatives(frames, h, io, depth) {
 const DYNAMIC_PATTERNS = new Map();
 function dynamicMayBe(f, word, P, below = false) {
   // (driveRel, Windows: `D:foo` is relative to the cwd of drive D, which nobody knows -- a part only known at run time, like `$X`)
-  if (f.driveRel && /^[A-Za-z]:(?![/\\:\s])/.test(word)) word = `$${String(word).slice(2)}`;
+  if (f.driveRel && /^[A-Za-z]:(?![/\\\s])/.test(word)) word = `$DRIVE_RELATIVE_${String(word).slice(2)}`;
   const key = `${f.ci ? 1 : 0}${below ? 1 : 0}${word}`;
   let pat = DYNAMIC_PATTERNS.get(key);
   if (pat === undefined) {
