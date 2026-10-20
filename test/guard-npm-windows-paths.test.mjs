@@ -78,7 +78,7 @@ test('paths: a drive letter is no root for a posix platform (isInside, samePath,
   assert.equal(isWinModule(path.win32), true);
   assert.equal(isWinModule(path.posix), false);
   assert.equal(isInside('D:/work/x', 'D:/work', 'win32'), true);
-  const here = process.cwd().replace(/\\/g, '/');
+  const here = '.'; // (the working directory, spelled so that no host path decides it)
   assert.equal(samePath('D:/..', here, 'linux'), true, 'off Windows D:/.. is the working directory');
   assert.equal(samePath('D:/..', here, 'darwin'), true);
   assert.equal(samePath('D:/..', 'D:/', 'win32'), true, 'on Windows it stays on the drive');

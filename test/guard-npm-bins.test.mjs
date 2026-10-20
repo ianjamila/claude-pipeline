@@ -16,6 +16,8 @@ import { binIsProgram } from '../pipeline/hooks/lib/package-scripts.mjs';
 const PUSH = 'pu' + 'sh';
 const MAIN = 'ma' + 'in';
 const CL = '.cl' + 'aude';
+// the platform the guard is told: these fixtures spell their paths with the host's node:path (resolve), and on Windows `D:\...` is a path only for platform 'win32'
+const PLATFORM = process.platform === 'win32' ? 'win32' : 'linux';
 const GIT_ROOT = '/work/repo';
 const PROJ = '/home/u/proj';
 // what a guarded command is per guard, and a string that only MENTIONS one (JavaScript text that holds the words, never runs them)
@@ -46,7 +48,7 @@ const run = (guard, cmd, files, { pkgDir = '', ...o } = {}) => {
   const cwd = resolve(root, pkgDir);
   return guard === 'git'
     ? evaluateGitCommand(cmd, { cwd, home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fs, ...o })
-    : evaluateBashForFiles(cmd, { home: '/home/u', env: {}, platform: 'linux', realpath: (p) => p, cwd, ...fs, existsSync: fs.pathExists, ...o });
+    : evaluateBashForFiles(cmd, { home: '/home/u', env: {}, platform: PLATFORM, realpath: (p) => p, cwd, ...fs, existsSync: fs.pathExists, ...o });
 };
 const GUARDS = ['git', 'files'];
 // `bins`: name -> (guard) => file text (null = exists but cannot be read); scripts: package.json scripts

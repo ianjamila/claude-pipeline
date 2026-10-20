@@ -13,6 +13,18 @@ import { mkdtempSync, mkdirSync, symlinkSync, lstatSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
+// a real symlink is a privilege on Windows: only that fixture is skipped where it cannot be made (as in guard-files.test.mjs), never an assertion
+const link = (t, target, at) => {
+  try {
+    symlinkSync(target, at);
+    return true;
+  } catch (e) {
+    if (e.code === 'EPERM' || e.code === 'EACCES') { t.skip('cannot create symlinks here'); return false; }
+    throw e;
+  }
+};
+// the platform the guard is told: these fixtures spell their paths with the host's node:path (resolve), and on Windows `D:\...` is a path only for platform 'win32'
+const PLATFORM = process.platform === 'win32' ? 'win32' : 'linux';
 
 const PUSH = 'pu' + 'sh';
 const MAIN = 'ma' + 'in';
@@ -45,7 +57,7 @@ const G = {
   } },
   files: { root: PROJ, bad: `cp a ~/${CL}/settings.json`, head: 'cp', tail: `a /home/u/${CL}/settings.json`, run: (cmd, files, o = {}) => {
     const fs = fakeFs(PROJ, files);
-    return evaluateBashForFiles(cmd, { home: '/home/u', env: {}, platform: 'linux', realpath: (p) => p, cwd: PROJ, ...fs, existsSync: fs.pathExists, ...o });
+    return evaluateBashForFiles(cmd, { home: '/home/u', env: {}, platform: PLATFORM, realpath: (p) => p, cwd: PROJ, ...fs, existsSync: fs.pathExists, ...o });
   } },
 };
 const pkg = (scripts, extra = {}) => JSON.stringify({ name: 'x', version: '1.0.0', scripts, ...extra });
@@ -354,16 +366,16 @@ test('R3-B2 a shebang interpreter is looked up in the caller\'s PATH order: the 
 // Why (#89 gate flake, test/guard-a2-shell `cd $UNSET && npm test`): packageScripts asked the REAL disk (lstat) whether a package.json link exists even when the caller evaluated over a fake file system;
 // on macOS the fake paths (/home/u/...) hit the autofs mount of /home and each lstat stalled ~1.4 s, past the evaluation deadline. A fake file system must see no real disk. No wall clock here: a REAL
 // dangling link sits where the fake file system has nothing, and where "it exists" would change the verdict (a package.json that cannot be read: refused).
-test('a guard evaluating over a fake file system does not look at the real disk for links', () => {
+test('a guard evaluating over a fake file system does not look at the real disk for links', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'pkg-lexists-'));
   try {
     const proj = join(dir, 'proj');
     mkdirSync(proj);
-    symlinkSync(join(dir, 'no-such-target'), join(proj, 'package.json')); // dangling: existsSync says no, lstat says yes
+    if (!link(t, join(dir, 'no-such-target'), join(proj, 'package.json'))) return; // dangling: existsSync says no, lstat says yes
     const fs = fakeFs(proj, {}); // the fake file system holds the directory and nothing else
     const run = {
       git: (o = {}) => evaluateGitCommand('npm test', { cwd: proj, home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fs, ...o }),
-      files: (o = {}) => evaluateBashForFiles('npm test', { home: '/home/u', env: {}, platform: 'linux', realpath: (p) => p, cwd: proj, ...fs, existsSync: fs.pathExists, ...o }),
+      files: (o = {}) => evaluateBashForFiles('npm test', { home: '/home/u', env: {}, platform: PLATFORM, realpath: (p) => p, cwd: proj, ...fs, existsSync: fs.pathExists, ...o }),
     };
     const real = (f) => { try { lstatSync(f); return true; } catch { return false; } };
     for (const [n, go] of Object.entries(run)) {
@@ -381,11 +393,11 @@ test('a guard evaluating over a fake file system does not look at the real disk 
   }
 });
 
-test('with the real file system (no fake) a dangling package.json link still counts as existing', () => {
+test('with the real file system (no fake) a dangling package.json link still counts as existing', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'pkg-lexists-real-'));
   try {
-    symlinkSync(join(dir, 'no-such-target'), join(dir, 'package.json'));
-    const files = evaluateBashForFiles('npm test', { home: dir, env: {}, platform: 'linux', cwd: dir });
+    if (!link(t, join(dir, 'no-such-target'), join(dir, 'package.json'))) return;
+    const files = evaluateBashForFiles('npm test', { home: dir, env: {}, platform: PLATFORM, cwd: dir });
     assert.equal(files.decision, 'deny', 'files guard: a dangling package.json link was ignored');
     assert.match(files.reason, /cannot read .*package\.json/);
     const git = evaluateGitCommand('npm test', { cwd: dir, home: dir, env: {}, currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [] });
