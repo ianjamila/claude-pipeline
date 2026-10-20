@@ -1580,8 +1580,8 @@ test('the comment says what was and was not verified, shows overlap, items and t
        : null` (403/404/throw → `null` = not provably off → not eligible; Codex plan R1-6).
     3. `gate = await evaluateGate({ root, config, pr, gh, env: ctx.env, home: ctx.home })`; `H = gate.head`. Local
        `git rev-parse HEAD` must equal `H` (else exit 1 `head-moved`).
-    4. `git fetch origin <base>`; `baseTip = rev-parse origin/<base>`; `mergeTree = git merge-tree --write-tree H
-       <baseTip>` (exit 0 → tree sha; non-zero → conflict).
+    4. `git fetch origin <base>`; `baseTip = rev-parse origin/<base>`;
+       `mergeTree = git merge-tree --write-tree H <baseTip>` (exit 0 → tree sha; non-zero → conflict).
     5. Quick verify:
        - commit the tree: `git commit-tree <tree> -p H -p <baseTip> -m "handoff check"`, with env
          `GIT_AUTHOR_NAME/EMAIL` and `GIT_COMMITTER_NAME/EMAIL` = `claude-pipeline <pipeline@localhost>`;
