@@ -21,7 +21,7 @@ export const run = guarded(async (argv, ctx) => {
 
   removeReviewFile(root, GATE_FILE);
   return guardGh(async () => {
-    const gate = await evaluateGate({ root, config, pr, gh, env: ctx.env });
+    const gate = await evaluateGate({ root, config, pr, gh, env: ctx.env, home: ctx.home });
     writeReviewJson(root, GATE_FILE, gate);
     return { exitCode: gate.ok ? EXIT.OK : EXIT.FAILED, output: gate };
   });

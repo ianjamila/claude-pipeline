@@ -15,7 +15,7 @@ test('final-gate: a fully evidenced PR passes every check and writes the gate fi
   const r = s.gate();
   assertExit(r, 0);
   assert.equal(r.json.ok, true);
-  assert.deepEqual(r.json.checks.map((c) => c.name), ['pr-open', 'labels', 'preflight', 'verify-report', 'hardstops', 'integrity', 'review', 'ci']);
+  assert.deepEqual(r.json.checks.map((c) => c.name), ['pr-open', 'labels', 'preflight', 'verify-report', 'hardstops', 'integrity', 'plan-scope', 'review', 'ci']);
   assert.ok(r.json.checks.every((c) => c.ok), JSON.stringify(r.json.checks));
   const file = s.gateFile();
   assert.deepEqual(file, r.json);

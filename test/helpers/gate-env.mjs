@@ -55,8 +55,8 @@ const FAKE_SMOKE = [
   '',
 ].join('\n');
 
-export function ymlFor({ preview = false, production = false, smokeCommand = 'node scripts/fake-smoke.mjs {url}' } = {}) {
-  let yml = pipelineYml('gate', ['ci']);
+export function ymlFor({ preview = false, production = false, plan = false, smokeCommand = 'node scripts/fake-smoke.mjs {url}' } = {}) {
+  let yml = pipelineYml('gate', ['ci'], { plan });
   yml += 'merge:\n  command: node scripts/fake-merge.mjs {pr} {sha}\n  wait_minutes: 1\n';
   if (preview) yml += `preview:\n  environment: Preview\n  smoke: ${smokeCommand}\n`;
   if (production) {
