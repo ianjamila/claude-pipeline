@@ -575,6 +575,7 @@ export function ownerQuiet({ sessionId, birthMs, decidedMs, dirs, fsx = fs, plat
         first = { t, hook: obj.attachment.hookName };
       }
       if (active !== null) return !isMain;
+      if (obj?.type === 'api-request-blob') return false; // a timestamp-less copy of the request payload (the whole history so far), not an event
       const finite = Number.isFinite(t);
       if (finite && (t < lo || t > decidedMs)) return false;
       const why = unexplained(obj, { strict: !finite, platform });

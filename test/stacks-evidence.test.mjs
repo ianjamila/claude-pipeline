@@ -761,6 +761,11 @@ test('ownerQuiet: a line that is not valid JSON is active; a timestamp-less line
   assert.equal(verdictOf(oqWorld([startup, noTs([{ type: 'text', text: 'hi' }])]).run()), 'quiet');
 });
 
+test('ownerQuiet: an api-request-blob line (a timestamp-less copy of the request history, tool calls included) is not activity', () => {
+  const blob = JSON.stringify({ type: 'api-request-blob', sessionId: SID, hash: 'h', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } });
+  assert.equal(verdictOf(oqWorld([blob, startup, blob]).run()), 'quiet');
+});
+
 test('ownerQuiet: prose that names a stack is not use', () => {
   const w = oqWorld([startup, textLine('2026-10-20T03:16:21.500Z', 'user', 'please run supabase stop on autostop-live'), textLine('2026-10-20T03:16:21.900Z', 'assistant', 'docker rm -f autostop-live would remove it')]);
   assert.equal(verdictOf(w.run()), 'quiet');
