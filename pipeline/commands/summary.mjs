@@ -19,6 +19,8 @@ import { inlineOptionValues } from '../lib/finalgate.mjs';
 import { readModelProofs } from '../lib/review-context.mjs';
 import { headSha } from '../lib/git.mjs';
 import { classifyOutcome, defaultAction, notifyEvent } from '../lib/notify.mjs';
+import { GhError } from '../lib/proc.mjs';
+import { ownerStopForOutcome } from '../lib/owner-stop.mjs';
 
 export const meta = {
   summary: 'upsert the PR summary comment and print the agent-log line',
@@ -97,7 +99,7 @@ function localHead(root) {
 }
 
 // The event to push for this outcome, or null (and why not). Decided before any GitHub call.
-function planPush({ outcome, state, values, root }) {
+function planPush({ outcome, state, values, root, ownerApproval, pr }) {
   const { known, event } = classifyOutcome(outcome);
   if (!known) return { event: null, reason: 'unclassified-outcome' };
   if (!event) return { event: null, reason: 'no-event' };
@@ -113,7 +115,7 @@ function planPush({ outcome, state, values, root }) {
   const action = values.action
     || (outcome === 'blocked' ? 'Verify stays red after 3 fixes: read the blocked comment'
       : outcome === 'awaiting-review' ? `Codex review is unavailable${cause ? ` (${cause})` : ''}: say "resume pipeline reviews" later`
-        : defaultAction(kind, { head, ids }));
+        : defaultAction(kind, { head, ids, ownerApproval, pr }));
   return { event: { event: kind, outcome, action, ids, ...(head ? { head } : {}), ...(cause ? { cause } : {}) } };
 }
 
@@ -156,38 +158,59 @@ export const run = guarded(async (argv, ctx) => {
   }
 
   // Classified before any GitHub call, so a GitHub outage cannot change whether the owner hears about this stop.
-  const plan = planPush({ outcome, state, values, root });
+  const ownerApproval = await ownerApprovalOf(root);
+  const plan = planPush({ outcome, state, values, root, ownerApproval, pr });
   if (plan.reason === 'unclassified-outcome') {
     process.stderr.write(`summary: outcome "${outcome.slice(0, 40)}" is not classified for owner notifications: no push sent\n`);
   }
 
-  const ownerApproval = await ownerApprovalOf(root);
   const gh = createGitHub({ cwd: root, env: ctx.env });
   let title;
   let url;
   let result;
+  let stopStep = { warnings: [] };
+  // The reply lines go to stderr when the command cannot return them (the stop is held locally, or the summary failed after it):
+  // the controller still prints them to the owner.
+  const replyToStderr = (reply) => { if (reply) process.stderr.write(`${reply}\n`); };
   try {
-    result = await guardGh(() => {
+    result = await guardGh(async () => {
       const view = gh.prView(pr, ['title', 'headRefName', 'baseRefName', 'headRefOid']);
       ({ title } = view);
-      const sections = summarySections(state, { outcome: detail ? `${outcome} — ${detail}` : outcome, built: values.built, followups: followupsOf(state), modelProofs: readModelProofs(root, state) });
-      const agentLogLine = buildAgentLogLine({ state, pr, title, outcome });
-      // The run record rides in the same comment: keep the one a checkpoint wrote, set how the run ended.
-      const existing = readSummaryComment(gh, pr);
-      if (existing.status === 'unsupported') throw new UsageError('the summary comment carries a run record from a newer pipeline version: update the pipeline CLI first');
-      const guard = guardBlocksFor(existing.status === 'ok' ? existing.record : null, values.session ?? [], ctx);
-      const { record, warnings } = recordForOutcome(existing.status === 'ok' ? existing.record : null, {
-        repo: gh.repo().slug, pr, branch: view.headRefName, baseRef: view.baseRefName, head: view.headRefOid,
-        outcome, detail, agentLogLine, host: hostname(), now: Date.now(), sessions: values.session, guardBlocks: guard.blocks, guardBySession: guard.bySession, ownerApproval,
-      });
-      warnings.push(...guard.warnings);
-      const posted = writeSummaryComment(gh, pr, { record, sections, existing });
-      const prUrl = typeof posted.url === 'string' ? posted.url.replace(/#.*$/, '') : '';
-      if (/\/pull\/\d+$/.test(prUrl)) url = prUrl;
-      const output = { ok: true, url: posted.url, action: posted.action, agentLogLine, step: record.step, cost: costReport(record.cost), warnings };
-      // A merged run under `production.watch: workflow` logs the line `agent-log close` later resolves from the CI smoke result.
-      if (outcome === 'merged') output.pendingLogLine = buildAgentLogLine({ state, pr, title, outcome: DEFAULT_OUTCOME });
-      return { exitCode: EXIT.OK, output };
+      try {
+        // Chat + needs-human: the owner stop is posted BEFORE the summary comment (an append-only event; the record only copies it).
+        stopStep = await ownerStopForOutcome({ gh, pr, root, outcome, ownerApproval, cause: values.cause, head: view.headRefOid, env: ctx.env, deps: ctx.ownerStopDeps });
+      } catch (err) {
+        replyToStderr(err.reply);
+        throw err;
+      }
+      const stopOut = stopStep.ownerStop ? { ownerStop: stopStep.ownerStop, reply: stopStep.reply } : {};
+      try {
+        const sections = summarySections(state, { outcome: detail ? `${outcome} — ${detail}` : outcome, built: values.built, followups: followupsOf(state), modelProofs: readModelProofs(root, state) });
+        const agentLogLine = buildAgentLogLine({ state, pr, title, outcome });
+        // The run record rides in the same comment: keep the one a checkpoint wrote, set how the run ended.
+        const existing = readSummaryComment(gh, pr);
+        if (existing.status === 'unsupported') throw new UsageError('the summary comment carries a run record from a newer pipeline version: update the pipeline CLI first');
+        const guard = guardBlocksFor(existing.status === 'ok' ? existing.record : null, values.session ?? [], ctx);
+        const { record, warnings } = recordForOutcome(existing.status === 'ok' ? existing.record : null, {
+          repo: gh.repo().slug, pr, branch: view.headRefName, baseRef: view.baseRefName, head: view.headRefOid,
+          outcome, detail, agentLogLine, host: hostname(), now: Date.now(), sessions: values.session, guardBlocks: guard.blocks, guardBySession: guard.bySession, ownerApproval, ownerStop: stopStep.ownerStop,
+        });
+        warnings.push(...guard.warnings, ...stopStep.warnings);
+        const posted = writeSummaryComment(gh, pr, { record, sections, existing });
+        const prUrl = typeof posted.url === 'string' ? posted.url.replace(/#.*$/, '') : '';
+        if (/\/pull\/\d+$/.test(prUrl)) url = prUrl;
+        const output = { ok: true, url: posted.url, action: posted.action, agentLogLine, step: record.step, cost: costReport(record.cost), warnings, ...stopOut };
+        // A merged run under `production.watch: workflow` logs the line `agent-log close` later resolves from the CI smoke result.
+        if (outcome === 'merged') output.pendingLogLine = buildAgentLogLine({ state, pr, title, outcome: DEFAULT_OUTCOME });
+        return { exitCode: EXIT.OK, output };
+      } catch (err) {
+        // The stop already stands on GitHub (it is the authority), so a summary comment that would not write is a warning, not a lost stop.
+        if (stopStep.ownerStop && err instanceof GhError) {
+          return { exitCode: EXIT.OK, output: { ok: true, warnings: [`summary comment not written (${String(err.message).slice(0, 160)}); owner stop ${stopStep.ownerStop.id} stands on GitHub`, ...stopStep.warnings], ...stopOut } };
+        }
+        replyToStderr(stopStep.reply);
+        throw err;
+      }
     });
   } finally {
     // Whether or not GitHub answered. When it threw, the error keeps its exit code and the push is still sent.

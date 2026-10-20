@@ -350,3 +350,16 @@ export async function ownerStopProblems({ gh, pr, root, ownerApproval, autoMerge
   return problems;
 }
 
+
+// What `P summary` / `P comment --kind summary` do about owner stops for one outcome. Label mode: nothing, no gh call. Chat +
+// `needs-human`: open the stop (throws as openOwnerStop does) and hand back the display copy and the reply lines. Any other chat
+// outcome never creates or clears a stop; it only flushes a stop held locally (best effort: a failure is a warning, the stop still blocks).
+export async function ownerStopForOutcome({ gh, pr, root, outcome, ownerApproval, cause, head, env, deps = {} }) {
+  if (ownerApproval !== 'chat') return { warnings: [] };
+  if (outcome === 'needs-human') {
+    const o = await openOwnerStop({ gh, pr, root, cause: cause ?? DEFAULT_CAUSE, head, env, deps });
+    return { ownerStop: o.stop, reply: o.reply, ids: o.ids, autoMergeDisarmed: o.autoMergeDisarmed, warnings: [] };
+  }
+  const f = await flushPendingStops({ gh, pr, root, deps });
+  return { warnings: f.remaining.map((r) => `owner stop ${r.id ?? '?'} is still held on this machine (${r.why}): P merge refuses until it reaches GitHub`) };
+}

@@ -10,7 +10,10 @@ import { MARKERS, triageComment, summarySections, needsHumanComment, blockedComm
 import { recordForOutcome } from '../lib/run-record.mjs';
 import { readSummaryComment, writeSummaryComment } from '../lib/summary-comment.mjs';
 import { createGitHub, commandCwd, guardGh, requireRepoRoot } from '../lib/github.mjs';
+import { GhError } from '../lib/proc.mjs';
 import { readModelProofs } from '../lib/review-context.mjs';
+import { Fail } from '../lib/cmd-common.mjs';
+import { ownerStopForOutcome } from '../lib/owner-stop.mjs';
 
 export const meta = {
   summary: 'render and upsert a pipeline PR comment (triage, summary, needs-human, blocked, awaiting-review)',
@@ -64,16 +67,29 @@ async function ownerApprovalOf(root) {
 
 // The summary comment also carries the run record: write the sections through the one writer, which keeps an existing
 // record (and sets how the run ended on it).
-function summaryKind(gh, pr, sections, outcome, ownerApproval) {
+async function summaryKind(gh, pr, sections, outcome, ownerApproval, { root, ctx }) {
   const view = gh.prView(pr, ['headRefName', 'baseRefName', 'headRefOid']);
-  const existing = readSummaryComment(gh, pr);
-  if (existing.status === 'unsupported') throw new UsageError('the summary comment carries a run record from a newer pipeline version: update the pipeline CLI first');
-  const { record, warnings } = recordForOutcome(existing.status === 'ok' ? existing.record : null, {
-    repo: gh.repo().slug, pr, branch: view.headRefName, baseRef: view.baseRefName, head: view.headRefOid,
-    outcome, host: hostname(), now: Date.now(), ownerApproval,
-  });
-  const r = writeSummaryComment(gh, pr, { record, sections, existing });
-  return { exitCode: EXIT.OK, output: { ok: true, kind: 'summary', pr, action: r.action, url: r.url, id: r.id, step: record.step, warnings } };
+  // Chat + needs-human: the owner stop is an append-only event posted BEFORE the record is written (the record only copies it).
+  const step = await ownerStopForOutcome({ gh, pr, root, outcome, ownerApproval, head: view.headRefOid, env: ctx.env, deps: ctx.ownerStopDeps });
+  const stopOut = step.ownerStop ? { ownerStop: step.ownerStop, reply: step.reply } : {};
+  try {
+    const existing = readSummaryComment(gh, pr);
+    if (existing.status === 'unsupported') throw new UsageError('the summary comment carries a run record from a newer pipeline version: update the pipeline CLI first');
+    const { record, warnings } = recordForOutcome(existing.status === 'ok' ? existing.record : null, {
+      repo: gh.repo().slug, pr, branch: view.headRefName, baseRef: view.baseRefName, head: view.headRefOid,
+      outcome, host: hostname(), now: Date.now(), ownerApproval, ownerStop: step.ownerStop,
+    });
+    warnings.push(...step.warnings);
+    const r = writeSummaryComment(gh, pr, { record, sections, existing });
+    return { exitCode: EXIT.OK, output: { ok: true, kind: 'summary', pr, action: r.action, url: r.url, id: r.id, step: record.step, warnings, ...stopOut } };
+  } catch (err) {
+    // The stop already stands on GitHub (it is the authority): a display copy that would not write is a warning, not a lost stop.
+    if (step.ownerStop && err instanceof GhError) {
+      return { exitCode: EXIT.OK, output: { ok: true, kind: 'summary', pr, warnings: [`summary comment not written (${String(err.message).slice(0, 160)}); owner stop ${step.ownerStop.id} stands on GitHub`, ...step.warnings], ...stopOut } };
+    }
+    if (step.reply) process.stderr.write(`${step.reply}\n`);
+    throw err;
+  }
 }
 
 export async function run(argv, ctx) {
@@ -127,8 +143,16 @@ export async function run(argv, ctx) {
 
   const ownerApproval = kind === 'summary' ? await ownerApprovalOf(root) : 'label';
   const gh = createGitHub({ cwd, env: ctx.env });
-  return guardGh(() => {
-    if (kind === 'summary') return summaryKind(gh, pr, body, values.outcome, ownerApproval);
+  return guardGh(async () => {
+    if (kind === 'summary') {
+      try {
+        return await summaryKind(gh, pr, body, values.outcome, ownerApproval, { root, ctx });
+      } catch (err) {
+        if (err.reply) process.stderr.write(`${err.reply}\n`); // the stop is held locally: the controller still prints the reply
+        if (err instanceof Fail) return { exitCode: err.exitCode, output: err.output };
+        throw err;
+      }
+    }
     const r = gh.upsertComment(pr, MARKER_OF[kind], body);
     return { exitCode: EXIT.OK, output: { ok: true, kind, pr, action: r.action, url: r.url, id: r.id } };
   });

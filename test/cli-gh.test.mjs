@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { writeFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, createFakeCodex, fullProtection, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
@@ -179,6 +180,7 @@ const commentWorld = (existing = []) => createFakeGh([
   { match: 'issues/4/comments --paginate', stdoutJson: existing },
   { match: '^api -X PATCH repos/acme/widgets/issues/comments/(\\d+) ', stdoutJson: { id: 21, html_url: 'https://x/21' } },
   { match: '^api -X POST repos/acme/widgets/issues/4/comments ', stdoutJson: { id: 77, html_url: 'https://x/77' } },
+  { match: '^pr merge 4 --disable-auto', code: 0 },
 ]);
 
 test('comment triage: PATCHes the existing marker comment with the rendered body', () => {
@@ -250,20 +252,31 @@ test('comment summary: keeps the run record a checkpoint wrote (tasks survive) a
 test('comment summary: needs-human "next" follows owner_approval; after a stop the event stays open however the record is replaced', () => {
   const stop = { id: 'ab12cd34', cause: 'merge:command-failed', head: 'a'.repeat(40), at: '2026-10-20T08:00:00.000Z' };
   const event = { id: 3, user: { login: 'me' }, body: renderEvent('owner-stop', stop.id, 'Owner stop ab12cd34 on #4.', { repo: 'acme/widgets', pr: 4, ...stop }) };
+  // The spawned CLI keeps its pending stop files under the real home, named after the LOCAL remote: a random owner keeps parallel tests apart.
   const chat = () => {
     const repo = stateRepo();
     repo.write('.claude/pipeline.yml', `${pipelineYml()}owner_approval: chat\n`);
+    repo.git(['remote', 'add', 'origin', `git@github.com:cptest${randomBytes(4).toString('hex')}/widgets.git`]);
     return repo;
   };
-  const sentRecord = (fake) => decodeRecord(JSON.parse(fake.calls().find((c) => c.argv.includes('POST') || c.argv.includes('PATCH')).stdin).body).record;
+  const writes = (fake) => fake.calls().filter((c) => c.argv.includes('POST') || c.argv.includes('PATCH')).map((c) => JSON.parse(c.stdin).body);
+  const sentRecord = (fake) => decodeRecord(writes(fake).find((b) => b.startsWith(MARKERS.summary))).record;
 
   const label = commentWorld();
   assertExit(cli(['comment', '--pr', '4', '--kind', 'summary', '--outcome', 'needs-human'], { repo: stateRepo(), fake: label }), 0);
   const rl = sentRecord(label);
   assert.deepEqual([rl.v, rl.next, 'ownerStop' in rl], [1, 'owner review: add `human-approved`, then merge', false]);
   const chatFake = commentWorld();
-  assertExit(cli(['comment', '--pr', '4', '--kind', 'summary', '--outcome', 'needs-human'], { repo: chat(), fake: chatFake }), 0);
-  assert.equal(sentRecord(chatFake).next, 'owner reply needed in chat: ship resume 4');
+  const created = cli(['comment', '--pr', '4', '--kind', 'summary', '--outcome', 'needs-human'], { repo: chat(), fake: chatFake });
+  assertExit(created, 0);
+  const [evBody, ...rest] = writes(chatFake);
+  const stopId = /^<!-- claude-pipeline:event:owner-stop:([0-9a-f]{8}) -->/.exec(evBody)?.[1];
+  assert.ok(stopId, 'the owner-stop event is the first write');
+  assert.ok(rest[0].startsWith(MARKERS.summary));
+  assert.equal(sentRecord(chatFake).next, `owner reply needed in chat (stop ${stopId}): ship resume 4`);
+  assert.equal(created.json.ownerStop.id, stopId);
+  assert.equal(created.json.reply, `Stopped #4 · stop ${stopId}\n⏸ Waiting on you for #4 — rule in chat, then say "ship resume 4"`);
+  assert.ok(!chatFake.lines().some((l) => /label/.test(l)), 'no label call');
 
   const ID4 = { repo: 'acme/widgets', pr: 4, branch: 'feat/w', baseRef: 'main' };
   const withCopy = applyCheckpoint(emptyRecord(ID4), { step: 'review', ownerStop: stop }, { host: 'mac', now: 0 });

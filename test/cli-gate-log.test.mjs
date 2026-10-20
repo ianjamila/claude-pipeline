@@ -2,7 +2,7 @@
 // covered against a real origin in agent-log-publish.test.mjs).
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
@@ -16,6 +16,7 @@ import { assertExit } from './helpers/assert-exit.mjs';
 import { run as summaryRun } from '../pipeline/commands/summary.mjs';
 import { UnavailableError } from '../pipeline/lib/cli.mjs';
 import { LEDGER_NAME } from '../pipeline/lib/notify.mjs';
+import { ownerStopsDir } from '../pipeline/lib/owner-stop.mjs';
 
 // ---- summary --------------------------------------------------------------------------------------
 
@@ -187,13 +188,25 @@ function pushRepo(state = summaryState()) {
   return repo;
 }
 
-async function summaryIn(repo, args, { fake = summaryGh(), rig = notifyRig() } = {}) {
+// Owner-stop seams for in-process runs: a private home (pending files, locks), the repo identity without a git remote, a fixed stop id.
+function stopRig({ disarm = () => true } = {}) {
+  const home = mkdtempSync(join(tmpdir(), 'cp-summary-stops-'));
+  scratchDirs.push(home);
+  const calls = [];
+  return {
+    home, calls,
+    deps: { home, remoteUrl: () => 'git@github.com:acme/widgets.git', newId: () => '5f3a9c2e', hostname: () => 'testbox', lock: { waitMs: 2000, pollMs: 5 }, disableAutoMerge: (a) => { calls.push(a.pr); return disarm(a); } },
+    pending: () => (existsSync(ownerStopsDir(home)) ? readdirSync(ownerStopsDir(home)) : []),
+  };
+}
+
+async function summaryIn(repo, args, { fake = summaryGh(), rig = notifyRig(), stops = stopRig() } = {}) {
   const stderr = [];
   const orig = process.stderr.write;
   process.stderr.write = (c, ...rest) => { stderr.push(String(c)); return true; };
   try {
     const argv = ['--pr', String(PR), ...args];
-    const ctx = { cwd: repo.dir, env: { ...process.env, ...fake.env }, notifyDeps: rig.deps };
+    const ctx = { cwd: repo.dir, env: { ...process.env, ...fake.env }, notifyDeps: rig.deps, ownerStopDeps: stops.deps };
     let res;
     let error;
     try {
@@ -201,7 +214,7 @@ async function summaryIn(repo, args, { fake = summaryGh(), rig = notifyRig() } =
     } catch (err) {
       error = err;
     }
-    return { res, error, rig, fake, stderr: stderr.join('') };
+    return { res, error, rig, fake, stops, stderr: stderr.join('') };
   } finally {
     process.stderr.write = orig;
   }
@@ -368,10 +381,8 @@ const chatRepo = (yml = CHAT_YML) => {
   repo.write('.claude/pipeline.yml', yml);
   return repo;
 };
-const posted = (fake) => {
-  const call = fake.calls().find((c) => c.argv.includes('POST') || c.argv.includes('PATCH'));
-  return decodeRecord(JSON.parse(call.stdin).body);
-};
+const writesOf = (fake) => fake.calls().filter((c) => c.argv.includes('POST') || c.argv.includes('PATCH')).map((c) => ({ call: c, body: JSON.parse(c.stdin).body }));
+const posted = (fake) => decodeRecord(writesOf(fake).find((w) => w.body.startsWith(MARKERS.summary)).body);
 
 test('summary --outcome needs-human: "next" follows owner_approval (label text unchanged; chat text; unreadable config falls back to label)', async () => {
   const label = await summaryIn(pushRepo(), ['--outcome', 'needs-human']);
@@ -380,7 +391,7 @@ test('summary --outcome needs-human: "next" follows owner_approval (label text u
   const chat = await summaryIn(chatRepo(), ['--outcome', 'needs-human']);
   const rc = posted(chat.fake).record;
   assert.equal(rc.outcome, 'needs-human');
-  assert.equal(rc.next, 'owner reply needed in chat: ship resume 12');
+  assert.equal(rc.next, 'owner reply needed in chat (stop 5f3a9c2e): ship resume 12');
   const broken = await summaryIn(chatRepo('version: 1\nbogus_key: true\nowner_approval: chat\n'), ['--outcome', 'needs-human']);
   assert.equal(posted(broken.fake).record.next, 'owner review: add `human-approved`, then merge', 'an unreadable config is label behaviour, as today');
   const other = await summaryIn(chatRepo(), ['--outcome', 'stopped']);
@@ -412,6 +423,77 @@ test('summary --outcome stopped after a stop: the event stays open however the r
   assert.deepEqual([kept.ownerStop, kept.v], [STOP, 2]);
   const none = await summaryIn(chatRepo(), ['--outcome', 'stopped'], { fake: summaryGh([stopEvent(), variants['copy hand-removed']]) });
   assert.deepEqual(['ownerStop' in posted(none.fake).record, posted(none.fake).record.v], [false, 1]);
+});
+
+// T2: chat + needs-human creates the stop (event first, then the summary); label mode is untouched.
+test('summary --outcome needs-human in chat: the owner-stop event is posted before the summary, the reply and copy are returned, no label, the push names the way out', async () => {
+  const t = await summaryIn(chatRepo(), ['--outcome', 'needs-human', '--cause', 'merge:command-failed']);
+  assert.equal(t.error, undefined);
+  assert.equal(t.res.exitCode, 0);
+  const writes = writesOf(t.fake);
+  assert.equal(writes.length, 2);
+  assert.ok(writes[0].body.startsWith('<!-- claude-pipeline:event:owner-stop:5f3a9c2e -->'), 'the event comes first');
+  assert.ok(writes[1].body.startsWith(MARKERS.summary));
+  assert.ok(!t.fake.lines().some((l) => /label/.test(l)), 'no label call');
+  assert.equal(t.res.output.ownerStop.id, '5f3a9c2e');
+  assert.equal(t.res.output.ownerStop.cause, 'merge:command-failed');
+  assert.equal(t.res.output.reply, 'Stopped #12 · stop 5f3a9c2e\n⏸ Waiting on you for #12 — rule in chat, then say "ship resume 12"');
+  const rec = posted(t.fake).record;
+  assert.deepEqual([rec.v, rec.ownerStop.id, rec.next], [2, '5f3a9c2e', 'owner reply needed in chat (stop 5f3a9c2e): ship resume 12']);
+  assert.deepEqual(t.stops.pending(), [], 'the pending file is gone once the event posted');
+  assert.deepEqual(t.stops.calls, [12], 'auto-merge was disarmed');
+  assert.equal(t.rig.fetchCalls.length, 1);
+  assert.equal(t.rig.fetchCalls[0].body.message, 'Needs you: Rule in chat, then say "ship resume 12" (widgets)');
+});
+
+test('summary --outcome needs-human in chat: an open stop is reused (no second event); other outcomes never create one', async () => {
+  const again = await summaryIn(chatRepo(), ['--outcome', 'needs-human'], { fake: summaryGh([stopEvent()]) });
+  assert.equal(again.res.output.ownerStop.id, STOP.id, 'the existing stop, not a new id');
+  assert.equal(writesOf(again.fake).filter((w) => w.body.includes('claude-pipeline:event:')).length, 0, 'no second event');
+  const stopped = await summaryIn(chatRepo(), ['--outcome', 'stopped']);
+  assert.equal(writesOf(stopped.fake).filter((w) => w.body.includes('claude-pipeline:event:')).length, 0);
+  assert.equal(stopped.res.output.ownerStop, undefined);
+  assert.deepEqual(stopped.stops.calls, []);
+});
+
+test('summary --outcome needs-human in label mode: no event, no pending file, no disarm, no reply (unchanged)', async () => {
+  const t = await summaryIn(pushRepo(), ['--outcome', 'needs-human']);
+  assert.equal(t.res.exitCode, 0);
+  assert.equal(writesOf(t.fake).length, 1);
+  assert.deepEqual([t.res.output.ownerStop, t.res.output.reply, t.stops.calls, t.stops.pending()], [undefined, undefined, [], []]);
+  assert.equal(t.rig.fetchCalls[0].body.message, 'Needs you: Read the needs-human comment and decide (widgets)');
+});
+
+test('summary --outcome needs-human in chat, GitHub unreadable at the stop: exit 3, one push, the pending file stays, the reply goes to stderr', async () => {
+  const fake = createFakeGh([
+    { match: '^pr view 12 --json title', stdoutJson: { title: 'Add widget' } },
+    ME, REPO,
+    { match: '^api repos/acme/widgets/issues/12/comments --paginate', code: 1, stderr: 'HTTP 502' },
+  ]);
+  const t = await summaryIn(chatRepo(), ['--outcome', 'needs-human'], { fake });
+  assert.ok(t.error instanceof UnavailableError);
+  assert.match(t.error.message, /owner stop 5f3a9c2e is held locally/);
+  assert.match(t.stderr, /Stopped #12 · stop 5f3a9c2e\n⏸ Waiting on you for #12/);
+  assert.equal(t.rig.fetchCalls.length, 1, 'the push is still sent');
+  assert.deepEqual(t.stops.pending(), ['acme__widgets__12__5f3a9c2e.json']);
+});
+
+test('summary --outcome needs-human in chat: the summary comment failing to write is a warning only; the stop stands and the reply is returned', async () => {
+  const fake = createFakeGh([
+    { match: '^pr view 12 --json title', stdoutJson: { title: 'Add widget' } },
+    ME, REPO,
+    { match: '^api repos/acme/widgets/issues/12/comments --paginate', stdoutJson: [summaryComment(null)] },
+    { match: '^api -X POST repos/acme/widgets/issues/12/comments', stdoutJson: { id: 5, html_url: 'https://github.com/acme/widgets/pull/12#issuecomment-5' } },
+    { match: '^api -X PATCH repos/acme/widgets/issues/comments/9', code: 1, stderr: 'HTTP 502' },
+  ]);
+  const t = await summaryIn(chatRepo(), ['--outcome', 'needs-human'], { fake });
+  assert.equal(t.error, undefined);
+  assert.equal(t.res.exitCode, 0);
+  assert.match(t.res.output.warnings[0], /summary comment not written.*owner stop 5f3a9c2e stands on GitHub/);
+  assert.equal(t.res.output.ownerStop.id, '5f3a9c2e');
+  assert.match(t.res.output.reply, /^Stopped #12 · stop 5f3a9c2e/);
+  assert.equal(writesOf(fake).filter((w) => w.body.includes('claude-pipeline:event:owner-stop:5f3a9c2e')).length, 1);
+  assert.deepEqual(t.stops.pending(), []);
 });
 
 // ---- agent-log ------------------------------------------------------------------------------------
