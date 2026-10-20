@@ -10,7 +10,7 @@ import { MAX_UPDATE_CYCLES, bringUpToDate, updateTiming } from '../lib/updatebra
 
 export const meta = {
   summary: 'bring the PR branch up to date with its base on GitHub (update-branch with expected_head_sha), return the new head (checks are not waited for by default)',
-  usage: 'pipeline update-branch --pr N [--expect-head SHA] [--max-cycles N=3] [--wait-checks] [--repo DIR]   -> {ok, outcome, updated, cycles, base, startHead, head, localHead, pullNeeded, message?, warnings?}; outcome up-to-date (exit 0; when updated: git pull --ff-only, then re-verify and run the gate on `head`; checks are NOT waited for unless --wait-checks) | rebase-needed | head-moved | cycle-cap | head-timeout | not-open | (with --wait-checks) checks-failed | checks-timeout (exit 1; rebase-needed = the update conflicts, needs-human), 3 GitHub unavailable. While it runs the run record of the PR shows inFlight {kind: update-branch}; warnings lists a record write that failed (never fatal)',
+  usage: 'pipeline update-branch --pr N [--expect-head SHA] [--max-cycles N=3] [--wait-checks] [--repo DIR]   -> {ok, outcome, updated, cycles, base, startHead, updates[{headBefore, baseTip}], head, localHead, pullNeeded, message?, warnings?}; outcome up-to-date (exit 0; when updated: git pull --ff-only, then re-verify and run the gate on `head`; checks are NOT waited for unless --wait-checks) | rebase-needed | head-moved | cycle-cap | head-timeout | not-open | (with --wait-checks) checks-failed | checks-timeout (exit 1; rebase-needed = the update conflicts, needs-human), 3 GitHub unavailable. While it runs the run record of the PR shows inFlight {kind: update-branch}; every update GitHub confirmed (also on a failing exit, or a throw after it) is appended to behindBaseUpdates in the run record (the busy-main hand-off, `P handoff check`, needs 2); warnings lists a record write that failed (never fatal)',
 };
 
 export const run = guarded(async (argv, ctx) => {
@@ -31,10 +31,18 @@ export const run = guarded(async (argv, ctx) => {
     // The record is display: a failed write is a warning in the output, never a failure of the update.
     const recorder = createRunRecorder({ gh, pr });
     recorder.update({ inFlight: inFlightSince(recorder, 'update-branch', 30) }, { initialStep: 'gate' });
+    // Every update GitHub confirmed is recorded (the busy-main hand-off counts them), also when the call throws after one: the
+    // pairs ride on the error. The cleanup never reads `r` (undefined after a throw) and the record dedups pairs.
     let r;
+    let pairs = [];
     try {
       r = await bringUpToDate({ gh, pr, expectHead, maxCycles, waitChecks: values['wait-checks'] === true, ...updateTiming(ctx.env) });
+      pairs = r.updates;
+    } catch (err) {
+      pairs = err?.updates ?? [];
+      throw err;
     } finally {
+      for (const u of pairs) recorder.update({ behindBaseUpdate: u });
       recorder.update({ inFlight: null });
     }
     const head = r.head ?? null;

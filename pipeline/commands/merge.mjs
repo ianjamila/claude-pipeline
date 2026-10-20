@@ -103,12 +103,24 @@ export const run = guarded(async (argv, ctx) => {
     // 1b. Main may have moved since the gate ran: the gate, and the CI it waited on, then judged a tree that is NOT the one that
     // would land. Bring the branch up to date on GitHub (one update; expected_head_sha = the approved head), then refuse: the new
     // head needs its own verify + gate, so nothing merges on this attempt. Up to date already => carry on.
-    const synced = await bringUpToDate({ gh, pr, expectHead: gate.head, maxCycles: 1, waitChecks: false, ...updateTiming(ctx.env) });
+    // Every update GitHub confirmed is recorded BEFORE anything branches on the outcome (cycle-cap, checks-failed and head-timeout after
+    // a confirmed update too, and a throw after one: the pairs ride on the error). The busy-main hand-off counts them (cp #88).
+    const recorder = createRunRecorder({ gh, pr });
+    const recordUpdates = (updates) => { for (const u of updates ?? []) recorder.update({ behindBaseUpdate: u }, { initialStep: 'gate' }); };
+    const recorderWarnings = () => (recorder.warnings.length > 0 ? { warnings: [...recorder.warnings] } : {});
+    let synced;
+    try {
+      synced = await bringUpToDate({ gh, pr, expectHead: gate.head, maxCycles: 1, waitChecks: false, ...updateTiming(ctx.env) });
+    } catch (err) {
+      recordUpdates(err?.updates);
+      throw err;
+    }
+    recordUpdates(synced.updates);
     if (!synced.ok) {
-      return refuse('behind-base', [synced.message ?? `could not bring the branch up to date (${synced.outcome})`], { outcome: synced.outcome, updated: synced.updated, head: synced.head ?? null });
+      return refuse('behind-base', [synced.message ?? `could not bring the branch up to date (${synced.outcome})`], { outcome: synced.outcome, updated: synced.updated, head: synced.head ?? null, ...recorderWarnings() });
     }
     if (synced.updated) {
-      return refuse('behind-base', [`the base moved: the branch was updated to ${synced.head}; pull it, re-verify and run final-gate on that head`], { outcome: 'updated', updated: true, head: synced.head });
+      return refuse('behind-base', [`the base moved: the branch was updated to ${synced.head}; pull it, re-verify and run final-gate on that head`], { outcome: 'updated', updated: true, head: synced.head, ...recorderWarnings() });
     }
 
     // 2. The known-good production deployment: it is what a rollback restores, so without it nothing may merge.
@@ -151,7 +163,6 @@ export const run = guarded(async (argv, ctx) => {
     // 3a. From here a merge may happen: show it in the run record (inFlight, cleared on EVERY exit below), and leave the
     // known-good deployment as an append-only event (3c below), so a rollback target outlives a rewritten record.
     // The record is display, the checks are the safety: a failed write is a warning, never a refusal.
-    const recorder = createRunRecorder({ gh, pr });
     recorder.update({
       step: 'merge', outcome: null, head: gate.head,
       inFlight: inFlightSince(recorder, 'merge', 2 * config.merge.wait_minutes + 15),
