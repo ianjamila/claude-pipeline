@@ -23,6 +23,8 @@ import { run as runProc, runAsync, overrideCommand } from './proc.mjs';
 // owner is the one who ended it). A word that is not a key here is unclassified: no push, and the caller says so.
 export const OUTCOME_EVENTS = Object.freeze({
   'awaiting-owner-merge': 'owner-merge',
+  'awaiting-plan-approval': 'plan-approval', // the plan is waiting for the owner's typed "approve"
+  'owner-ui-merge': 'owner-ui-merge', // a green PR handed to the owner for a GitHub merge
   'needs-human': 'needs-human', // the caller upgrades it to 'arbiter-escalation' when the review state says so
   blocked: 'stopped',
   'awaiting-review': 'stopped',
@@ -50,9 +52,13 @@ export function classifyOutcome(word) {
 }
 
 // The one thing to do for each push event when the caller gave no --action.
-export function defaultAction(event, { head, ids = [], reason } = {}) {
+export function defaultAction(event, { head, ids = [], reason, pr } = {}) {
   const h = head ? String(head).slice(0, 7) : '';
   switch (event) {
+    case 'plan-approval':
+      return `Plan for ${pr ? `#${pr}` : 'this PR'} needs your approval: read it, then say "approve"`;
+    case 'owner-ui-merge':
+      return `${pr ? `PR #${pr}` : 'The PR'} is green: merge it in GitHub if you accept the hand-off`;
     case 'owner-merge':
       return `Check the listed items, then say "merge"${h ? ` for head ${h}` : ''}`;
     case 'arbiter-escalation':
@@ -66,6 +72,8 @@ export function defaultAction(event, { head, ids = [], reason } = {}) {
 
 const EVENTS = Object.freeze({
   'owner-merge': { label: 'Ready to merge', priority: 4, tag: 'white_check_mark' },
+  'plan-approval': { label: 'Plan needs approval', priority: 4, tag: 'memo' },
+  'owner-ui-merge': { label: 'Merge in GitHub', priority: 4, tag: 'white_check_mark' },
   'needs-human': { label: 'Needs you', priority: 4, tag: 'raising_hand' },
   'arbiter-escalation': { label: 'Arbiter escalation', priority: 4, tag: 'scales' },
   stopped: { label: 'Run stopped', priority: 4, tag: 'octagonal_sign' },

@@ -7,10 +7,10 @@ import { notifyEvent, testEvent } from '../lib/notify.mjs';
 
 export const meta = {
   summary: 'send the owner a push notification (ntfy, plus a Windows toast under WSL2)',
-  usage: 'pipeline notify --test [--repo DIR]   |   pipeline notify --event owner-merge|needs-human|arbiter-escalation|stopped --pr N --action TEXT [--cause CODE] [--repo DIR]   -> {ok, sent, reason?, transports:{ntfy, toast}}',
+  usage: 'pipeline notify --test [--repo DIR]   |   pipeline notify --event owner-merge|plan-approval|owner-ui-merge|needs-human|arbiter-escalation|stopped --pr N --action TEXT [--cause CODE] [--repo DIR]   -> {ok, sent, reason?, transports:{ntfy, toast}}',
 };
 
-const EVENT_NAMES = ['owner-merge', 'needs-human', 'arbiter-escalation', 'stopped'];
+const EVENT_NAMES = ['owner-merge', 'plan-approval', 'owner-ui-merge', 'needs-human', 'arbiter-escalation', 'stopped'];
 const CAUSE_RE = /^[A-Za-z0-9:_.-]{1,60}$/;
 
 export async function run(argv, ctx = {}) {

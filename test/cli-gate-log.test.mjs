@@ -229,6 +229,8 @@ test('summary push: each outcome that needs the owner sends exactly one push wit
     { outcome: 'blocked', state: null, label: 'Run stopped', text: /^Run stopped: Verify stays red after 3 fixes: read the blocked comment \(widgets\)$/ },
     { outcome: 'awaiting-review', state: null, label: 'Run stopped', text: /^Run stopped: Codex review is unavailable: say "resume pipeline reviews" later \(widgets\)$/ },
     { outcome: 'stopped', state: null, label: 'Run stopped', text: /^Run stopped: Read the PR: the run stopped \(widgets\)$/ },
+    { outcome: 'awaiting-plan-approval', state: null, label: 'Plan needs approval', text: /^Plan needs approval: Plan for #12 needs your approval: read it, then say "approve" \(widgets\)$/ },
+    { outcome: 'owner-ui-merge', state: summaryState(), label: 'Merge in GitHub', text: /^Merge in GitHub: PR #12 is green: merge it in GitHub if you accept the hand-off \(widgets\)$/ },
   ];
   for (const c of cases) {
     const repo = pushRepo(c.state);
@@ -309,8 +311,8 @@ test('summary push: --action and --cause flow into the event; --cause is part of
   await assert.rejects(summaryIn(repo, ['--outcome', 'stopped', '--cause', 'bad cause!'], { rig }).then((r) => { if (r.error) throw r.error; }), /--cause must be a short code/);
 });
 
-test('summary push: `stopped`, `closed` and `merged-externally` work with no review state', async () => {
-  for (const outcome of ['stopped', 'closed', 'merged-externally']) {
+test('summary push: `stopped`, `closed`, `merged-externally` and `awaiting-plan-approval` work with no review state', async () => {
+  for (const outcome of ['stopped', 'closed', 'merged-externally', 'awaiting-plan-approval']) {
     const t = await summaryIn(pushRepo(null), ['--outcome', outcome]);
     assert.equal(t.error, undefined, outcome);
     assert.equal(t.res.exitCode, 0, outcome);

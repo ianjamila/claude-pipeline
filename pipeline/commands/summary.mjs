@@ -28,7 +28,7 @@ export const meta = {
 // These stops never reach a review round (verify red three times, Codex out in round 1) or happen after the run's state
 // is no longer the point (a stop on a gate, the owner closing the PR, an outside merge), so there may be no state.json to
 // render from. They still get a comment and a log line: rounds are empty, the verify report (if any) names where it stopped.
-const NO_STATE_OUTCOMES = new Set(['blocked', 'awaiting-review', 'stopped', 'closed', 'merged-externally']);
+const NO_STATE_OUTCOMES = new Set(['blocked', 'awaiting-review', 'stopped', 'closed', 'merged-externally', 'awaiting-plan-approval']);
 const CAUSE_RE = /^[A-Za-z0-9:_.-]{1,60}$/;
 
 async function verifyDetail(root) {
@@ -88,7 +88,7 @@ function localHead(root) {
 }
 
 // The event to push for this outcome, or null (and why not). Decided before any GitHub call.
-function planPush({ outcome, state, values, root }) {
+function planPush({ outcome, state, values, root, pr }) {
   const { known, event } = classifyOutcome(outcome);
   if (!known) return { event: null, reason: 'unclassified-outcome' };
   if (!event) return { event: null, reason: 'no-event' };
@@ -104,7 +104,7 @@ function planPush({ outcome, state, values, root }) {
   const action = values.action
     || (outcome === 'blocked' ? 'Verify stays red after 3 fixes: read the blocked comment'
       : outcome === 'awaiting-review' ? `Codex review is unavailable${cause ? ` (${cause})` : ''}: say "resume pipeline reviews" later`
-        : defaultAction(kind, { head, ids }));
+        : defaultAction(kind, { head, ids, pr }));
   return { event: { event: kind, outcome, action, ids, ...(head ? { head } : {}), ...(cause ? { cause } : {}) } };
 }
 
@@ -147,7 +147,7 @@ export const run = guarded(async (argv, ctx) => {
   }
 
   // Classified before any GitHub call, so a GitHub outage cannot change whether the owner hears about this stop.
-  const plan = planPush({ outcome, state, values, root });
+  const plan = planPush({ outcome, state, values, root, pr });
   if (plan.reason === 'unclassified-outcome') {
     process.stderr.write(`summary: outcome "${outcome.slice(0, 40)}" is not classified for owner notifications: no push sent\n`);
   }

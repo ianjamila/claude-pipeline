@@ -102,10 +102,10 @@ const STOP = { event: 'stopped', pr: 12, title: 'Fix the thing', action: 'Read t
 
 // ---- outcome map ----------------------------------------------------------------------------------------------------------
 
-test('outcome map: only stopped/blocked/awaiting-review/needs-human/awaiting-owner-merge push; the rest are explicit no-push', () => {
+test('outcome map: only stopped/blocked/awaiting-review/needs-human/awaiting-owner-merge/awaiting-plan-approval/owner-ui-merge push; the rest are explicit no-push', () => {
   assert.deepEqual(
     Object.entries(OUTCOME_EVENTS).filter(([, e]) => e).map(([o, e]) => `${o}=${e}`).sort(),
-    ['awaiting-owner-merge=owner-merge', 'awaiting-review=stopped', 'blocked=stopped', 'needs-human=needs-human', 'stopped=stopped'],
+    ['awaiting-owner-merge=owner-merge', 'awaiting-plan-approval=plan-approval', 'awaiting-review=stopped', 'blocked=stopped', 'needs-human=needs-human', 'owner-ui-merge=owner-ui-merge', 'stopped=stopped'],
   );
   for (const o of ['merged', 'no-production', 'closed', 'merged-externally', 'superseded', 'recovered', 'rollback-failed', 'changed-during-recovery', 'rollback-skipped', 'not-live', 'deploy-failed', 'deploy-not-observed']) {
     assert.ok(Object.hasOwn(OUTCOME_EVENTS, o) && OUTCOME_EVENTS[o] === null, `${o} must be an explicit null`);
@@ -126,6 +126,8 @@ test('default actions name the one thing to do', () => {
   assert.equal(defaultAction('needs-human'), 'Read the needs-human comment and decide');
   assert.equal(defaultAction('arbiter-escalation', { ids: ['a1', 'b2'] }), 'Rule on a1, b2 in the triage comment');
   assert.equal(defaultAction('stopped'), 'Read the PR: the run stopped');
+  assert.equal(defaultAction('plan-approval', { pr: 9 }), 'Plan for #9 needs your approval: read it, then say "approve"');
+  assert.equal(defaultAction('owner-ui-merge', { pr: 9 }), 'PR #9 is green: merge it in GitHub if you accept the hand-off');
 });
 
 // ---- message --------------------------------------------------------------------------------------------------------------
@@ -136,6 +138,8 @@ test('message per event: title #N + PR title, body "<label>: <action> (repo)", p
     ['needs-human', 'Needs you'],
     ['arbiter-escalation', 'Arbiter escalation'],
     ['stopped', 'Run stopped'],
+    ['plan-approval', 'Plan needs approval'],
+    ['owner-ui-merge', 'Merge in GitHub'],
   ];
   for (const [event, label] of cases) {
     const m = buildMessage({ event, pr: 5, title: 'Add a thing', action: 'Do the one thing' }, { repoName: 'eaglewatch', click: 'https://github.com/o/eaglewatch/pull/5' });
