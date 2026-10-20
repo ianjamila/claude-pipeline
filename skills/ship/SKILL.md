@@ -16,14 +16,16 @@ number, `R` a review round number, `<slug>` the branch slug.
 ## Invariants (never break these)
 
 1. Nothing merges except through `P merge`, and only after `P final-gate` passed for the exact
-   head being merged. Never run `gh pr merge`, `npm run merge`, or the GitHub UI yourself.
+   head being merged. Never run `gh pr merge`, `npm run merge`, or the GitHub UI yourself. In an `owner_approval: chat` repo the guard
+   refuses every direct merge (`gh pr merge` in any form incl. `--auto`, the merge command typed by hand, `curl` to the merge API): only `P merge`.
 2. Never push to `main`/`master`, never force-push, never add `human-approved` /
    `test-change-approved`, never remove `needs-human` / `pipeline-blocked` / `pipeline-pause` /
    `pipeline-rollback` labels, never close pause/rollback issues. `awaiting-review` comes off only
    through `P review-complete` (Resume mode), never by hand. (Hooks also block these; don't try to
-   route around them.) Always push with an explicit name: `git push -u origin agent/<slug>`.
+   route around them.) Never edit or delete a PR comment or post one holding a `claude-pipeline:event` marker; pass comment text
+   literally (`--body`, `--body-file` or a heredoc): a body built at run time is refused in every repo. Always push with an explicit name: `git push -u origin agent/<slug>`.
 3. Hard-stops are decided by `P hardstops`, never by your judgment. A BLOCKING hit (`blocking` array, i.e.
-   `ok: false`) means the PR ends in `needs-human`, however harmless it looks. Report-only hits (`advisory`
+   `ok: false`) means the PR ends in **needs-human** (shape below), however harmless it looks. Report-only hits (`advisory`
    array: rules the project downgraded in `hard_stops.report_only_rules` / `report_only_paths`) never stop the
    PR and never need `human-approved`; list them in the PR body.
    **`owner_approval: chat`** (`P config`): blocking hits come back inside `advisory` with `ownerMerge: true` and
@@ -54,7 +56,7 @@ number, `R` a review round number, `<slug>` the branch slug.
    comments and labels never count as approval. Production on a resumed run is watched with
    `prod-watch --observe-only` (with `production.watch: workflow`, not at all: the workflow owns it); rollback stays with the original run or the owner.
 10. **Low-risk PRs may merge on their own** (owner ruling 2026-10-14). A normal run whose final gate passes with no
-    hard-stop hit (`ownerMerge` is `0`), no `needs-human` and no owner-ruled item merges through `P merge` without asking
+    hard-stop hit (`ownerMerge` is `0`), no needs-human stop and no owner-ruled item merges through `P merge` without asking
     the owner: that is intended, and a review must not flag it. Anything that hits a hard-stop, ends in `needs-human`,
     or needs the owner's chat approval (`owner_approval: chat`, resumed runs) still waits for the owner's "merge" for the
     exact head (the **Owner-merge approval** rule below). The ruling widens nothing else: invariants 1, 2 and 9 stand.
@@ -67,8 +69,14 @@ A run that has a PR and ends for any reason except a successful merge ends with 
 Notifications are automatic: never send one for progress, and use `P notify --event stopped --pr N --action "…"`
 only for a stop that cannot go through summary. Two shapes, used by name below:
 
-- **needs-human**: `gh pr edit N --add-label needs-human`, `P comment --pr N --kind needs-human --reason "…"`, then
+- **needs-human**, `owner_approval: label` (default): `gh pr edit N --add-label needs-human`, `P comment --pr N --kind needs-human --reason "…"`, then
   `P summary --pr N --outcome needs-human --action "…" --cause <code>`.
+- **needs-human**, `owner_approval: chat`: the same WITHOUT the label (never add `needs-human`; one already on the PR is ignored). The summary
+  opens an **owner stop** and returns `ownerStop` and `reply`: print `reply` verbatim as the LAST lines of your message
+  (`Stopped #N · stop <id>`, then `⏸ Waiting on you for #N — rule in chat, then say "ship resume N"`; a `⚠ auto-merge could not be disarmed` line
+  goes above them: tell the owner) and wait. Exit 3 (GitHub down): the stop is held on this computer and blocks merging here; the lines come on
+  stderr, print them anyway. Only the owner's own typed reply releases a stop: **Owner stops** below.
+  Everywhere below, "**needs-human**" is this shape in the repo's mode.
 - **stopped**: `P summary --pr N --outcome stopped --action "…" --cause <code>`; `--outcome blocked` /
   `awaiting-review` / `awaiting-owner-merge` have their own steps. `closed` (the owner closed the PR) and
   `merged-externally` push nothing.
@@ -174,12 +182,12 @@ note it in the summary and carry on, never stop the run for it.
 4. UI change ⇒ `P artifacts push --pr N --dir .verify/screenshots`
    (pushes the images to the `pipeline-artifacts` branch, never your worktree; returns markdown
    image links), then update the PR body with them (`gh pr edit N --body-file <file>`).
-5. BLOCKING hard-stop hits (`blocking` non-empty; report-only hits alone do not count) ⇒ `gh pr edit N --add-label needs-human` and post
+5. BLOCKING hard-stop hits (`blocking` non-empty; report-only hits alone do not count) ⇒ the **needs-human** shape (label mode: `gh pr edit N --add-label needs-human`) and post
    `P comment --pr N --kind needs-human --reason "<one paragraph: why, what was verified, what the owner does>" --hits-file .review/hardstops.json`.
    Then still run the review loop (Step 4) so the owner gets a reviewed PR, but skip Steps 5–6
    (no merge). End with `P summary --pr N --outcome needs-human --action "…" --cause hard-stop`.
    `owner_approval: chat`: when `ownerMerge` (from `P hardstops` or `P integrity`) is non-empty instead, do NOT
-   add `needs-human`; list the items in the PR body under "Owner merges in chat" and carry on with Steps 4–5; the **Owner-merge approval** rule gates the merge.
+   open a stop; list the items in the PR body under "Owner merges in chat" and carry on with Steps 4–5; the **Owner-merge approval** rule gates the merge.
 
 ## Step 4 — review loop
 
@@ -195,10 +203,10 @@ items (implementer + verifier: `verify.full`, or with `verify.after_fix: quick` 
 `P comment --pr N --kind triage`. After each round: `P checkpoint --pr N --step review --round R`. Exit when
 `P state outcome` says `clean`. Order and replay traps (triage comment BEFORE `followups create`, `P state
 discard-round` for an interrupted round): `reference/review-loop.md`. Not clean after the
-last round, or any item `needsHuman` ⇒ label `needs-human`, post
+last round, or any item `needsHuman` ⇒ **needs-human** (label mode: label it), post
 `P comment --pr N --kind needs-human --reason "…"` (no `--hits-file`),
 `P summary --pr N --outcome needs-human --action "…" --cause review:<reason>`, stop. With `owner_approval: chat` and items still `needsHuman`, that
-summary's `--action` is "Rule on <ids> in chat (accept / follow-up / reject), remove needs-human, then say ship resume N"; when the owner
+summary's `--action` is "Rule on <ids> in chat (accept / follow-up / reject), then say ship resume N"; when the owner
 rules in chat, record it with `P triage owner-ruling` (**Owner rules in chat** in `reference/review-loop.md`).
 
 Codex `exitCode: 3` at any point (Codex unavailable) ⇒ `gh pr edit N --add-label awaiting-review`,
@@ -259,7 +267,8 @@ Details and every exit code: `reference/gates-and-exits.md`. First: `P checkpoin
 7. `P final-gate --pr N`. Any failed check ⇒ fix the cause (a new commit ⇒ back to 5.1; PR
    content changed ⇒ Step 4 too) or, if it isn't fixable by you, stop: **needs-human** (`--cause final-gate:<check>`) after the summary; for the
    `labels` / `preflight` failures use `P summary --pr N --outcome stopped --cause final-gate:<check> --action "<which
-   label, issue or setting blocks the merge>"` (details in `reference/gates-and-exits.md`).
+   label, issue or setting blocks the merge>"` (details in `reference/gates-and-exits.md`; chat mode: `labels` naming an open owner stop is the owner's to
+   release, show `Stopped #N · stop <id>` and wait).
    `behind-base:` in the `pr-open` detail (main moved since 5.2) ⇒ Step 5.2, then 5.3 onward.
    **CI proof causes** (the `verify-report` detail; `reference/gates-and-exits.md`): `ci-proof-pending:<step>` ⇒ wait for the GitHub run, as a job
    for at most `verify.ci_proof_wait_minutes` minutes in total (e.g. `P job start ciproof -- bash -c 'gh pr checks N --watch'`, then
@@ -284,7 +293,7 @@ when it cannot; the PR summary shows one line per step (`<step> proof: GitHub ru
    merge --run-id <runId> --timeout 540`; read `exitCode` and the JSON in `tail`:
    - 0 ⇒ merged. `mergeSha` is the merge commit; `null` (with a `warning`) means GitHub did not
      name it yet: still run prod-watch, with `--pr N` alone (2 below). Never skip prod-watch unless `production.watch` is `workflow` (2 below).
-   - 1 ⇒ NOT merged. `error: gate | behind-base | live-check | pre-merge`, or a `reason` (merge command failed,
+   - 1 ⇒ NOT merged. `error: gate | behind-base | live-check | pre-merge` (chat: also an open owner stop), or a `reason` (merge command failed,
      not merged in time, PR closed, blocker appeared): act per `reference/gates-and-exits.md`.
      "Update the branch" cases (`error: behind-base` — merge already updated the branch itself, or could not
      (`outcome`: `rebase-needed` ⇒ **needs-human**, `--cause merge:rebase-needed`) — or `behind-base:` in a live
@@ -318,7 +327,7 @@ when it cannot; the PR summary shows one line per step (`<step> proof: GitHub ru
 **Resumed runs, in both modes:** a run in Resume mode or on an adopted PR (its run record carries `resumed`) never calls
 `P merge` without the owner's "merge" for that exact head in this session, whatever `ownerMerge` says and in `label` mode
 too. Without it, STOP: `chat` ⇒ `P checkpoint --pr N --step awaiting-owner-merge`, `P summary --pr N --outcome
-awaiting-owner-merge --built "…"`, and the reply's last two lines below (items may be none); `label` ⇒ add `needs-human`,
+awaiting-owner-merge --built "…"`, and the reply's last lines below (items may be none); `label` ⇒ add `needs-human`,
 `P comment --pr N --kind needs-human --reason "resumed run: the owner merges"`, `P summary --pr N --outcome needs-human
 --built "…"`. When the owner says "merge" for that head, run `P merge --pr N --owner-approved-head <sha> --owner-approved-items <ownerItems>`
 (the full 40-character head and the `ownerItems` of the gate that covered it; anything else is refused).
@@ -338,6 +347,8 @@ each `P merge`, take the `ownerMerge` count of the `P final-gate --pr N` that co
      the head; ownerItems = the gate's `ownerItems`, `none` when there are no items):
      `Head <sha12> · items <ownerItems>`
      `🔀 Ready to merge #N — say "merge"`
+     A PR that EVER had an owner stop (`P final-gate` prints `stop: {id}`, `null` otherwise) carries `Stopped #N · stop <that id>` directly above its `Head` line
+     (several open stops: one line each; a `⚠ auto-merge could not be disarmed` line goes above them). The owner's "merge" binds to the stop id shown, so a "merge" given before a stop never carries over.
      Several PRs at once: one `#N head <sha12> · items <ownerItems>` line per PR, then `🔀 Ready to merge #N, #M — say "merge"`.
 - When the owner then says "merge" and the head and items are unchanged, run Step 6 (final gate again if the base moved,
   `P merge`, prod-watch, rollback handling). If the head changed or new items appeared after they said "merge",
@@ -350,9 +361,26 @@ right before it, and says so in one context line (`[claude-pipeline owner-go] th
 `P merge` checks that record: the flags only name it. So: always end the request reply with the two lines above (the record binds
 only to the LAST reply: if anything else was said since, show the request again); never type, quote or simulate the owner's
 prompt, run the owner-go hook, or write `~/.claude/pipeline-state/owner-go` (the guards refuse it). No record ⇒ `P merge` says
-"no owner \"merge\" is recorded": show the request again and wait. In an `owner_approval: chat` repo a direct `gh pr merge`, the repo's
-merge command typed by hand, or auto-merge through the API is refused too unless the owner said "merge" for that PR and head in this
-session (and it pins the head: `--match-head-commit <full head>`); `P merge` is the normal way.
+"no owner \"merge\" is recorded": show the request again and wait. A typed "merge" is stored as kind `approve`; "ship resume N" records NO merge approval.
+In an `owner_approval: chat` repo agents never merge directly: `gh pr merge` (any form, `--auto` too), the repo's merge command typed by hand, API
+auto-merge and `curl` to the merge API are always refused, whatever the owner said. Merge only with `P merge --pr N`: it reads the owner's recorded
+"merge" (for the newest stop id, see above) and any open stop. Never merge a revert PR yourself: prod-watch leaves it a draft, the owner marks it ready.
+
+## Owner stops (`owner_approval: chat`) — what releases one
+
+A stop is an append-only `owner-stop` event on the PR (the authority; the run record only mirrors it) plus, if GitHub was unreachable, a pending file on this
+computer. The gate (`labels`), `P merge` (error `pre-merge`, before it touches the branch), its last look and every auto-merge poll refuse while one is open.
+1. The owner types `ship resume N` (also `/ship resume N`, `resume N`), or "merge" to a reply that offered it. The hook records it against the stop id(s)
+   in your LAST reply; you cannot type or fake it. A newer message of yours in between loses the binding: print the stop lines again.
+2. `git pull --ff-only` if a `P merge` / `update-branch` moved the branch, then `P checkpoint --pr N --step gate|review --resumed` (the step `P resume plan`
+   gave). It releases every stop the owner named. Exit 1: `owner-release-missing` (no recorded reply for that id: show the stop lines, wait; if the owner did
+   answer, the hook is old: `pipeline update`), `owner-stop-open` (a checkpoint without `--resumed` while a stop is open), `owner-stop-held` (the stop has not
+   reached GitHub: retry when it is reachable).
+3. `P final-gate`, then the normal Step 5 to 6. A release does not clear review items, and `P merge` still wants the recorded "merge" for the exact head and
+   items, given to a request that carried the newest `Stopped` line: if a stop appeared after the owner said "merge", they say "merge" again.
+4. First prompt of a NEW session is `ship resume N`: nothing was shown before it, so it records no release. Read `P resume plan` (its `notes` name each open
+   stop; plan, list and inbox are read-only and never flush a pending stop), print the stop lines, ask for one confirming `resume N`, then step 2.
+In eaglewatch-style repos with their own merge script, a leftover `needs-human` label still blocks `P merge` until that script is updated: the owner removes it in GitHub.
 
 ## Step 7 — summary
 
@@ -394,7 +422,7 @@ the owner's next move.
    - `autoMerge.action: disarm` ⇒ `gh pr merge N --disable-auto`, tell the owner.
 2. Route on `enter`:
    - `closed` / `ended` / `not-resumable` ⇒ report `reason`, stop.
-   - `decision` ⇒ show the `needs-human` reason, stop (the owner decides; with `owner_approval: chat` and review items `needsHuman`, tell them to rule on the ids in chat, see **Owner rules in chat** in `reference/review-loop.md`). The label alone does not mean this: Step 3.5 adds it before the review loop, so a run whose record is mid-run or ended `awaiting-review` / `blocked` / `awaiting-owner-merge` resumes as usual (the plan's `notes` say the run still ends in `needs-human`, no merge); `decision` is only for an ended `needs-human` outcome or no usable record.
+   - `decision` ⇒ show the `needs-human` reason, stop (the owner decides; with `owner_approval: chat` it means review items `needsHuman`: tell them to rule on the ids in chat, see **Owner rules in chat** in `reference/review-loop.md`; the label is never read there, and an open owner stop only adds a `notes` line, see **Owner stops**). In label mode the label alone does not mean this: Step 3.5 adds it before the review loop, so a run whose record is mid-run or ended `awaiting-review` / `blocked` / `awaiting-owner-merge` resumes as usual (the plan's `notes` say the run still ends in `needs-human`, no merge); `decision` is only for an ended `needs-human` outcome or no usable record.
    - `local-work` ⇒ report the worktree state (diverged / dirty / unpushed), stop. Never reset or discard it.
    - `observe-prod` with `production.watch: workflow` (`P config`) ⇒ do NOT run prod-watch: the project's CI workflow owns
      the production smoke and posts its result on the merged PR (Step 5.2). Close the record: `P state show --pr N` (rebuilds
@@ -405,12 +433,12 @@ the owner's next move.
      `rollbackInterrupted`, then release the lock: `P worktrees unkeep agent-<slug>-prod --run agent-<slug>-prod`. prod-watch records the outcome itself (run record `step: ended`, `outcome` set, summary sections kept; a
      `deploy-not-observed` outcome stays open to watch again), so nothing else needs writing and the next `resume plan` routes `ended`. `needs-owner` ⇒
      tell the owner at once. Never roll back.
-   - `build | verify | review | followups | gate` ⇒ steps 3–5, then the matching step. A run that ended `needs-human` for review items and whose label the owner removed after ruling in chat routes here (`gate` once the rulings made the review clean, `review` while an ACCEPT still has to be built and reviewed).
+   - `build | verify | review | followups | gate` ⇒ steps 3–5, then the matching step. A run that ended `needs-human` for review items and whose items the owner ruled in chat (label mode: and removed the label) routes here (`gate` once the rulings made the review clean, `review` while an ACCEPT still has to be built and reviewed).
 3. Worktree per `worktree.action`: `reuse` ⇒ `cd` into `path`; `add-existing-ref` ⇒ `git worktree add <path> <branch>`;
    `add-from-remote` ⇒ `git fetch origin <branch>` then `git worktree add --no-track -b <branch> <path> origin/<branch>`;
    never `-B`. Then `then: ff-only` ⇒ `git merge --ff-only <liveHead>` (the plan's exact `liveHead` sha; `plan` already refreshed `origin/<branch>`, but never trust a tracking ref), `then: push` ⇒ `git push origin <branch>`.
    Then `P worktrees keep <worktree dir name> --reason "ship run <worktree dir name>"` (the directory name of the worktree
-   in use, e.g. `agent-<slug>`; the same id Step 7 passes to `unkeep --run`). `P preflight`. Then take the run over: `P checkpoint --pr N --step <enter> --resumed` (`followups` ⇒ `--step review`;
+   in use, e.g. `agent-<slug>`; the same id Step 7 passes to `unkeep --run`). `P preflight`. Then take the run over: `P checkpoint --pr N --step <enter> --resumed` (with an open owner stop this is the release: **Owner stops**; `followups` ⇒ `--step review`;
    for `adopt: true` step 5's checkpoint is the take-over and carries `--resumed`). The flag marks the record, so `P merge`
    will not run without the owner's recorded "merge" (and `--owner-approved-head`) even after a later session picks the run up. The plan's `stop` is where the run ends, with its `P summary --outcome <stop>` (Step 5 / Owner-merge approval).
 4. `P state show --pr N`; read `source`. `quarantined` ⇒ tell the owner the local `.review/` went to `quarantinedTo`
@@ -437,7 +465,7 @@ read the issue, link it in the PR body (`Closes #123`).
 | verify red after 3 fix cycles | draft PR + `pipeline-blocked`, `summary --outcome blocked --action …`, stop |
 | blocking hard-stop hit | review loop, then `needs-human` + `summary --outcome needs-human --action …`, stop (`owner_approval: chat`: review loop, gate, then `summary --outcome awaiting-owner-merge`) |
 | Codex unavailable / quota (`exitCode: 3`) | `awaiting-review`, `summary --outcome awaiting-review --action …`, stop |
-| `P arbiter apply` proof fails | items → `needs-human` (the CLI marks them), `summary --outcome needs-human --action …`, stop (chat mode: the action is "Rule on <ids> in chat (accept / follow-up / reject), remove needs-human, then say ship resume N") |
+| `P arbiter apply` proof fails | items → `needs-human` (the CLI marks them), `summary --outcome needs-human --action …`, stop (chat mode: the action is "Rule on <ids> in chat (accept / follow-up / reject), then say ship resume N") |
 | `triage validate` / `arbiter apply` exit 2 `not-found` | transcript not written yet: wait ~10 s, retry once, then `needs-human` + `summary --outcome needs-human --action …` |
 | final gate fails, can't fix | `needs-human` + `summary --outcome needs-human --action …` (`labels` / `preflight`: `summary --outcome stopped --action …`), stop |
 | `behind-base:` / base moved | `P update-branch --pr N` (Step 5.2), re-verify, new round if content changed (max 2 times, then `needs-human` + `summary --outcome needs-human --action …`); `rebase-needed` ⇒ the same |
@@ -445,6 +473,7 @@ read the issue, link it in the PR body (`Closes #123`).
 | prod smoke fails | prod-watch handles rollback + issue + revert PR and pushes the owner; `summary` with its outcome word; tell the user. With `production.watch: workflow` there is no prod-watch: the workflow's PR comment is the record, nothing is rolled back and no production push is sent; tell the user |
 | pause/rollback issue open | PR stays open: `summary --outcome stopped --cause merge-paused --action "Close the pause/rollback issue"`, explain |
 | `checkpoint` exit 1 `unpushed` / `behind` / `diverged` | `git push origin agent/<slug>` / `git pull --ff-only` / `summary --outcome stopped --cause checkpoint:diverged --action …`, stop and report; checkpoint again |
+| `checkpoint --resumed` / `merge` refused by an owner stop (`owner-release-missing`, `owner-stop-open`, `owner-stop-held`, `pre-merge`) | show the `Stopped` line(s), wait for the owner's own `ship resume N` (**Owner stops**); never retry in a loop |
 | `resume plan` has `confirm` | ask the owner whether the other run stopped; wait; never start on a guess |
 | `resume plan` `enter: local-work` | report the diverged/dirty/unpushed worktree, stop; never reset it |
 | `merge` `error: pre-merge` naming `prod-before` | nothing merged (the rollback evidence could not be posted): retry once, then `summary --outcome stopped --cause merge:prod-before --action …`, tell the user |

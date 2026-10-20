@@ -50,7 +50,8 @@ which render for anyone who can see the private repo.
 comment; `--reason` is required (the command exits 2 without it). Write one paragraph: why (hard-stop
 rules + files, or unresolved review items, or model-proof failure), what was verified and reviewed,
 and exactly what the owner should do: review, then add `human-approved` and merge (`npm run merge
--- <N>` or the project's merge command) — or close. For a hard-stop, save the `P hardstops` output
+-- <N>` or the project's merge command) — or close. With `owner_approval: chat` there is no label and no approval label: the owner rules in chat and types `ship resume <N>`
+(or "merge" when offered), and the comment says so. For a hard-stop, save the `P hardstops` output
 first (`P hardstops --base origin/<default_branch> --head HEAD > .review/hardstops.json`, after
 `mkdir -p .review`; exit 1 just means blocking hits) and pass it as `--hits-file .review/hardstops.json` (a JSON
 array, or the `P hardstops` object itself: its `blocking` list is used); leave `--hits-file` out when there are no blocking hits.
@@ -73,7 +74,7 @@ Evidence is never kept only in that editable record: `prod-before` (before the m
 ## Summary comment (Step 7)
 
 `P summary --pr <N> --outcome <outcome> --built "<2–3 sentences>"` (outcome: `merged`, `blocked`,
-`needs-human`, `awaiting-review`, `awaiting-owner-merge` (chat mode, stopped before the merge), or a prod-watch outcome such as `recovered`, `rollback-failed`,
+`needs-human` (chat mode: also opens the owner stop and returns `ownerStop` and `reply`), `awaiting-review`, `awaiting-owner-merge` (chat mode, stopped before the merge), or a prod-watch outcome such as `recovered`, `rollback-failed`,
 `superseded`, `not-live`, `deploy-failed`, `needs-owner` (observe-only: the live smoke fails, nothing was changed)) keeps the status block and the record
 (setting `step: ended` and the outcome) and the summary sections that follow; it prints `agentLogLine` and renders, in this order. `blocked` and
 `awaiting-review` also work before any review round exists (verify red 3 times, Codex out in round 1):

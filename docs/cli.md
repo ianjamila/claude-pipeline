@@ -108,6 +108,8 @@ pipeline comment --pr N --kind triage|summary|needs-human|blocked|awaiting-revie
 
 Exit: 0 comment posted/updated · 2 usage · 3 GitHub (`gh`) unavailable.
 
+`--kind summary --outcome needs-human` behaves as `pipeline summary --outcome needs-human` does in a chat repo (it opens the owner stop and prints `ownerStop` and `reply`); `--kind needs-human` only posts the note and never labels, in either mode.
+
 ## config
 
 load and validate .claude/pipeline.yml.
@@ -207,6 +209,8 @@ pipeline inbox [--stale-days 14] [--merged-days 7] [--no-git] [--repo DIR]
 ```
 
 Never comments, labels, closes, merges or creates a ref. Facts: one paginated GraphQL query for the open PRs (page size 20) and one for PRs merged within `--merged-days`; per PR the full paginated comment list (our run record, review state, needs-human reason and run events are read from the viewer's own comments only, so a forged marker from someone else is ignored; a record bound to another PR or branch is ignored with a warning). Git, unless `--no-git`: ONE `git fetch --no-tags origin +refs/heads/<base>:refs/remotes/origin/<base> refs/pull/<n>/head …` per distinct base (the only things it writes are fetched objects and that remote-tracking ref), then per PR `git merge-tree --write-tree` for `conflicts` / `alreadyOnBase` and the review content hash (the gate's own, agent log excluded) as `contentHash`. `--no-git`, git older than 2.38 or a failed fetch leave those facts `null` and add a `warnings` entry; with `--no-git` `local` is `{unpushed: null, orphanWorktrees: null}`. `local` lists branches with unpushed commits, uncommitted changes or a diverged ref, and worktrees under `worktree_dir` whose branch has no open PR (listed only). CI is judged against the required checks (`ci.required_checks` plus the guard contexts unless `ci.guard_checks: false`): `passed` only when every one has a successful row.
+
+In an `owner_approval: chat` repo a leftover `needs-human` label changes nothing: a PR is `owner-decision` only with an open owner stop or open `needsHuman` review items (`nextAction` "leave: owner decision needed (…); rule or reply in chat, then ship resume N"), and `awaiting-owner-merge` with a leftover label is still `owner-merge`.
 
 Each PR carries `waitingOn` (`nothing-left` · `running` · `owner-decision` · `failing-check` · `review` · `owner-merge` · `pipeline` · `abandoned`), `reason`, `nextAction`, `lastActivity`, `stale` and `suggest` (`merge` · `resume` · `close` · `leave`, also the keys of `triage`). A PR with no run record and no review state whose last activity is older than `--stale-days` is `abandoned` (close) only when something also says it is going nowhere: a draft, a failed required check or conflicts (these are appended to the reason: "; also …"). Age alone never suggests close: a quiet PR that is ready with nothing failing is `owner-decision` (leave; `ship resume <n>` adopts it, or the owner closes it). `owner-merge` suggests `merge` only when the PR is known to merge cleanly (git's trial merge, or with `--no-git` / git < 2.38 GitHub's `mergeable`: `CONFLICTING` counts as a conflict, `MERGEABLE` as clean); when mergeability is unknown it stays `owner-merge` but suggests `leave`; `failing-check` names the failed required checks (`ciFailed`) or the base it conflicts with. `strandedAfterMerge` lists PRs merged within `--merged-days` whose run stopped in the merge / prod-watch step or has a `rollback-intent` without a `rollback-result`.
 
@@ -327,6 +331,10 @@ pipeline prod-watch (--sha MERGE_SHA [--pr N] | --pr N) [--expect-text T] [--ret
 
 Events and the run record (with `--pr`): immediately BEFORE the rollback it posts a `rollback-intent` event on the PR (merge sha, failing deployment, rollback target); if that comment cannot be posted nothing is rolled back (`rollback-skipped`, "could not record the rollback intent on the PR"). Right after the rollback and its check it posts `rollback-result` (`ok`, `liveAfter`, `verified`), and after the incident issue / revert PR `recovery-reported`. Each is a NEW comment, never edited (ids `<sha7>-<n>`); failing to post the last two is only a warning. The watch also shows itself in the PR's run record (`inFlight` kind `prod-watch`, max `production.deploy_timeout_minutes` + 30 minutes, step `prod-watch`) and clears that on every exit; a record that cannot be written is a `warnings` entry, never a failure.
 
+Event kinds (a closed list in `pipeline/lib/run-events.mjs`; each is its own append-only comment by the viewer, matched by id): `prod-before`, `rollback-intent`, `rollback-result`, `recovery-reported`, `ci-proof-used`, and, for `owner_approval: chat`, `owner-stop` and `owner-stop-released` (a stop is open until a readable release event for the same id; the guards refuse an agent's edit, delete or forged copy of any of these comments).
+
+`owner_approval: chat`: the revert PR is created as a DRAFT with no label and is never un-drafted by the CLI (the owner marks it ready in GitHub after looking; a draft blocks `merge`), an `owner-stop` event is posted on it best-effort (a failure is a warning), and a non-pausing incident issue carries no `needs-human` label. Label mode keeps the labelled, non-draft revert PR.
+
 `--observe-only` runs the same deployment lookup, smokes and outcome detection, but never rolls back, opens an issue or revert PR, adds a label, posts an event or takes the recovery lock. A failing smoke that a normal watch would have rolled back (or ended in `rollback-skipped` / `changed-during-recovery`) is outcome `needs-owner`: `reason` plus `evidence` {`underlying` (what a normal watch would have ended with), `failingDeployment`, `liveDeployment`, `knownGood`, `smokeFailure`}. It needs no PR branch, so it can run from a detached worktree at the merge commit: the known-good target is `.review/prod-before.json` when present, else the newest `prod-before` event on the PR. If the PR has a `rollback-intent` with no `rollback-result` of the same id, the JSON carries `rollbackInterrupted: {intent, liveNow}` (the live deployment now), whatever the outcome. With `--pr N` it then writes the outcome into the run record (`step: ended`, summary sections kept) unless the record already has one; `deploy-not-observed` is not recorded (it learned nothing), and no event is posted, so an open `rollback-intent` stays open.
 
 Exit: 0 outcome `merged` (or no production configured) · 1 any other outcome (recovered, rollback-failed, needs-owner, ...), or with --pr only: the PR is not MERGED · 3 deployment not observed / GitHub unavailable / the merge commit could not be read.
@@ -361,6 +369,8 @@ pipeline resume plan --pr N [--repo DIR]
   exit 2 when the PR does not exist
 ```
 
+With `owner_approval: chat` an open owner stop (read from the PR's events) adds the note "stop <id> is open: `P checkpoint --resumed` needs the owner's reply …" and does not change `enter`; `plan`, `list` and `inbox` stay read-only and never flush a pending stop file (checkpoint, final-gate, merge, summary and comment do). In a NEW session the owner's `ship resume N` is the first prompt, so no stop reply precedes it and nothing is released: print the stop lines from the notes and ask for one confirming `resume N`.
+
 `list` shows what a session can pick up: PRs parked as `awaiting-review` and open PRs whose run record (written by this GitHub user) has no outcome, i.e. a run that stopped mid-way. `plan` reads the PR, its comments (run record, review state, events), the local branch and the worktrees holding it, and routes the resume by the pure rules in `pipeline/lib/resume-plan.mjs`:
 
 | `enter` | When |
@@ -370,7 +380,7 @@ pipeline resume plan --pr N [--repo DIR]
 | `observe-prod` | merged, but the run stopped in `merge` / `prod-watch`, or a `rollback-intent` has no `rollback-result`: watch production from a detached worktree of `origin/<base>` at the merge commit; never roll back |
 | `not-resumable` | fork PR |
 | `local-work` | the local branch diverged from the PR, or a worktree holding it is dirty: the owner decides |
-| `decision` | `needs-human`; `reason` is our needs-human comment's first sentence |
+| `decision` | label mode: `needs-human`; `reason` is our needs-human comment's first sentence. `owner_approval: chat`: the label is never read; open `needsHuman` review items only ("review items need the owner's ruling in chat: <ids>") |
 | `build` / `verify` | the record has tasks not done / no passing verify for the live head and the run had only reached build or verify |
 | `review` | no review state, an incomplete round, content changed since the last round, a round that is not clean, or `awaiting-review` |
 | `followups` | published follow-ups without an issue |
@@ -459,6 +469,8 @@ pipeline summary --pr N --outcome O [--built TEXT] [--action TEXT] [--cause CODE
 ```
 
 Exit: 0 · 2 usage / no state · 3 GitHub (`gh`) unavailable.
+
+**Owner stop (`owner_approval: chat`, `--outcome needs-human [--cause C]`).** No `needs-human` label exists in chat mode. The command opens an owner stop: a local pending file first (`~/.claude/pipeline-state/owner-stops/`, protected by guard-files), then an append-only `owner-stop` event comment on the PR (the authority; every gate, `merge` and checkpoint reads events, never the record), after disarming a queued auto-merge (`autoMergeDisarmed` in the event). The output gains `ownerStop` `{id, cause, head, at}` and `reply`: the lines the controller prints verbatim as the last lines of its message (`Stopped #N · stop <id>`, then `⏸ Waiting on you for #N — rule in chat, then say "ship resume N"`; a `⚠ auto-merge could not be disarmed` line above them when that failed; several open stops: one `Stopped` line each). A second call reuses the open stop. Exit 3 when GitHub could not be reached: the pending file stays and blocks merging on this machine, the push is still sent and `reply` goes to stderr. The run record keeps a display copy `ownerStop` (record version 2, so an older CLI reads it as `unsupported` and demands the owner's "merge"). Other outcomes never open or clear a stop; label mode adds no event, no copy and no `reply`. Only the owner's typed reply releases a stop (`checkpoint --resumed`).
 
 Without `.review/state.json` only `--outcome blocked`, `awaiting-review`, `stopped`, `closed` and `merged-externally` are accepted (the early-stop paths: verify red three times, Codex out in round 1, a stop on a gate or merge refusal, the owner closing the PR, a merge made outside the pipeline): the comment is rendered with no rounds (a `blocked` one names the failing step from the verify report) and `agentLogLine` is still printed. Any other outcome without state is exit 2.
 

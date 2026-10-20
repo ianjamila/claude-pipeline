@@ -1,6 +1,6 @@
-# Hard-stop paths: changes here never auto-merge. The pipeline labels such PRs needs-human and
-# the owner approves by adding the `human-approved` label (single GitHub identity, so this file
-# documents ownership rather than enforcing reviews).
+# Hard-stop paths: changes here never auto-merge. In label mode the pipeline labels such PRs needs-human and
+# the owner approves by adding the `human-approved` label; with owner_approval: chat there is no label and the owner
+# says "merge" in chat (single GitHub identity, so this file documents ownership rather than enforcing reviews).
 # pipeline-setup fills the two placeholders: {{OWNER}} = the repo owner's handle (e.g. @your-login), and the
 # {{HARD_STOP_LINES}} line below is replaced by one line per project hard-stop path:  /supabase/migrations/  @your-login
 # {{HARD_STOP_LINES}}
