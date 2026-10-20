@@ -1288,7 +1288,7 @@ function checkHttpTool(argv, dir, ctx, tool = 'curl') {
     // (curl expands `pulls/[3-3]/merge` to `pulls/3/merge` and `{comments,comments}` lists, so the endpoint judged below is not the one called.
     // -g / --globoff is NOT trusted to switch this off: a later --no-globoff, a -g taken as the value of an option this parser does not
     // know, or a config file can each leave globbing on, and no real GitHub write needs [ or { in its URL.)
-    const v6 = /^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/)?(?:[^/@?#]*@)?\[[0-9A-Fa-f:.]*\]/.exec(w); // an IPv6 literal host ([::1]) is not a glob and not github.com
+    const v6 = /^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/)?(?:[^/@?#]*@)?\[[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*\](?=[:/?#]|$)/.exec(w); // an IPv6 literal host ([::1], always with a colon, ending the host) is not a glob and not github.com
     const globbed = tool === 'curl' && /[[{]/.test(v6 ? w.slice(v6[0].length) : w);
     const hostUnknown = host === '' || DYNAMIC.test(host) || /[{}]/.test(host); // ({} is the placeholder of xargs / find: the URL comes from elsewhere)
     if (!hostUnknown && !GH_HOST.test(host) && !(globbed && !v6 && /[[{]/.test(host))) continue; // (a glob in the host can expand to github.com)

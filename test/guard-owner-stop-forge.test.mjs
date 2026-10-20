@@ -82,7 +82,9 @@ test('curl: a globbed GitHub URL on a write is denied, also with -g / --globoff 
   assert.match(deny(forge('')).reason, /globbing/);
   // -g / --globoff is not trusted (a later --no-globoff, a -g eaten as another option's value, or a config file can leave globbing on)
   for (const cmd of [merge('-g'), merge('--globoff'), merge('-sg'), merge('-gs'), forge('-g'), forge('--globoff'), forge('-sg'),
-    "curl -X PUT 'https://api.github.com/repos/o/r/pulls/[3-3]/merge' -g", merge('-g --no-globoff'), merge('--proxy-header -g'), merge('-o -g')]) assert.match(deny(cmd).reason, /globbing/, cmd);
+    "curl -X PUT 'https://api.github.com/repos/o/r/pulls/[3-3]/merge' -g", merge('-g --no-globoff'), merge('--proxy-header -g'), merge('-o -g'),
+    // a bracket host that is not an IPv6 literal (no colon, or not the whole host) is a glob, not an exemption
+    'curl -X PUT "https://[a]pi.github.com/repos/o/r/pulls/3/merge"', 'curl -X PUT "https://[3]/repos/o/r/pulls/3/merge"', 'curl -X PUT "https://[::1]api.github.com/repos/o/r/pulls/3/merge"']) assert.match(deny(cmd).reason, /globbing/, cmd);
   // a literal merge URL is still the merge endpoint with -g
   deny('curl -g -X PUT https://api.github.com/repos/o/r/pulls/3/merge');
   deny(`curl -sg -d '{"body":"${MARK.replaceAll('"', '\\"')}"}' https://api.github.com/repos/o/r/issues/3/comments`);
