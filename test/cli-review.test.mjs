@@ -1945,6 +1945,46 @@ test('mark-implemented: a commit that only adds or edits tests is not a fix; a s
   assert.ok(w.item('R1-B1').implemented);
 });
 
+test('mark-implemented: a testing finding is fixed by a test-only commit; a bug finding still is not (#53)', (t) => {
+  const w = world(t);
+  const testing = finding({ title: 'Cover the old-code path', file: 'src/a.js', category: 'testing' });
+  assertExit(w.codex(1, findingsOf([finding()], [testing])), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'], 'R1-S1': ['ACCEPT'] }), 0);
+  w.repo.write('src/a.test.js', "test('old path', () => {});\n");
+  w.repo.git(['add', 'src/a.test.js']);
+  w.repo.git(['commit', '-q', '-m', 'test only']);
+
+  const marked = w.cli(['state', 'mark-implemented', '--ids', 'R1-S1']);
+  assertExit(marked, 0, marked.stderr + marked.stdout);
+  assert.ok(w.item('R1-S1').implemented);
+  const bug = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assertExit(bug, 2, bug.stdout);
+  assert.equal(bug.json.error, 'no-code-change', 'the same test-only commit never clears a bug finding');
+  assert.ok(!w.item('R1-B1').implemented);
+});
+
+test('mark-implemented: a fix to the finding\'s own file counts even under a test glob; another test file does not (#53)', (t) => {
+  const w = world(t);
+  w.repo.write('e2e/fixtures/env.ts', 'export const env = {};\n');
+  const head = w.repo.commit('add a launch helper');
+  assertExit(w.codex(1, findingsOf([finding({ file: 'e2e/fixtures/env.ts' })]), { to: head }), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
+
+  w.repo.write('e2e/other.spec.ts', "test('x', () => {});\n");
+  w.repo.git(['add', 'e2e/other.spec.ts']);
+  w.repo.git(['commit', '-q', '-m', 'another test']);
+  const other = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assertExit(other, 2, other.stdout);
+  assert.equal(other.json.error, 'no-code-change');
+
+  w.repo.write('e2e/fixtures/env.ts', 'export const env = { TZ: "UTC" };\n');
+  w.repo.git(['add', 'e2e/fixtures/env.ts']);
+  w.repo.git(['commit', '-q', '-m', 'fix the helper']);
+  const marked = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assertExit(marked, 0, marked.stderr + marked.stdout);
+  assert.ok(w.item('R1-B1').implemented);
+});
+
 test('codex-review: with nothing accepted, a later round over an unchanged tree is still allowed', (t) => {
   const w = world(t);
   assertExit(w.codex(1, findingsOf([finding()])), 0);

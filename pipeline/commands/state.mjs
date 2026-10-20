@@ -31,6 +31,7 @@ export const meta = {
     'pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, followupsPending}; exit 0 whether or not clean',
     'pipeline state mark-implemented --ids a,b [--repo DIR]',
     '  -> exit 2 {error:no-code-change} unless the branch content differs from what the accepting round reviewed',
+    '     and a non-test file changed since (a test file counts for a testing finding or the finding\'s own file)',
     'pipeline state record-followup --id ID --url URL [--repo DIR]',
     'pipeline state set-outcome --outcome TEXT [--repo DIR]',
   ].join('\n'),
@@ -251,11 +252,16 @@ async function markImplemented(rest, ctx) {
           message: `${item.id} cannot be marked implemented: could not tell which files changed since round ${round.n} (${err.message})`,
         });
       }
-      const code = changed.filter((f) => f !== config.agent_log && !matchAny(f, config.integrity.test_globs));
-      if (code.length === 0) {
+      const own = changed.filter((f) => f !== config.agent_log);
+      const code = own.filter((f) => !matchAny(f, config.integrity.test_globs));
+      // A test file is the fix itself when the finding is about the tests (category testing) or names that very file
+      // (a helper under a test glob, #53). A settle-by-test commit touches neither, so it still does not count.
+      const itemFile = String(item.file ?? '').replace(/^\.\//, '');
+      const testFix = own.length > 0 && (item.category === 'testing' || (itemFile !== '' && own.includes(itemFile)));
+      if (code.length === 0 && !testFix) {
         throw new Fail(EXIT.USAGE, {
           ok: false, error: 'no-code-change',
-          message: `${item.id} cannot be marked implemented: since round ${round.n} only test files changed (${changed.join(', ') || 'nothing'}); commit the fix itself`,
+          message: `${item.id} cannot be marked implemented: since round ${round.n} only test files changed (${changed.join(', ') || 'nothing'}); commit the fix itself (a test-only fix counts only for a testing finding or one about that test file)`,
         });
       }
     }
