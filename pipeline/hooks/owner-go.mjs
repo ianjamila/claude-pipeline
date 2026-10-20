@@ -6,12 +6,8 @@
 // agent can run `P merge` with the matching flags; nothing is printed otherwise.
 try {
   const { readHookInput } = await import('./lib/hook-io.mjs');
-  const { recordApproval } = await import('./lib/owner-go.mjs');
+  const { hookMessage, recordApproval } = await import('./lib/owner-go.mjs');
   const record = recordApproval(await readHookInput());
-  if (record) {
-    const shown = record.requests.map((q) => `#${q.pr} head ${q.head} items ${q.items}`);
-    const prs = record.prs.map((n) => `#${n}`).join(', ');
-    process.stdout.write(`[claude-pipeline owner-go] the owner's "merge" is recorded: ${shown.length ? shown.join('; ') : 'no Head/items request was shown in the last merge request'}${prs ? `; PRs ${prs}` : ''}.\n`);
-  }
+  if (record) process.stdout.write(hookMessage(record));
 } catch { /* never block or break a prompt */ }
 process.exitCode = 0;

@@ -800,7 +800,7 @@ function checkGraphql(body, dir = null, ctx = null) {
     // Why (#58 round 3): the node id can name a PR in a chat repo whatever directory this runs in, so the target repository can never be resolved
     // here: it is judged as a chat repo's (the owner's "merge" is needed, and a node id cannot match one), not as the current directory's.
     if (names.includes('enablePullRequestAutoMerge') && ctx?.ownerGo) {
-      return deny('turning on auto-merge through the API skips the owner\'s "merge": it names the PR by a node id, so its repository (owner_approval: chat?) and head cannot be checked. Use `gh pr merge <N> --auto --match-head-commit <sha>` after the owner said "merge", or `P merge`.');
+      return deny('turning on auto-merge through the API skips the owner\'s "merge": it names the PR by a node id, so its repository (owner_approval: chat?) and head cannot be checked. In an owner_approval: chat repository agents merge only through `P merge --pr N`.');
     }
   }
   if (body.unknown) return deny('cannot verify the graphql body (--input - / unreadable file).');
@@ -896,10 +896,12 @@ function checkApi(rest, env, dir, ctx) {
 }
 
 // ---- #58: direct merges in an owner_approval: chat repo ----------------------------------------------------------------
-// Why: P merge checks the owner's recorded "merge" (hooks/lib/owner-go.mjs) before it merges an owner item, but a plain
+// Why: P merge checks the owner's recorded "merge" (hooks/lib/owner-go.mjs) and every open owner stop before it merges, but a plain
 // `gh pr merge`, the repo's own merge command or auto-merge through the API skipped P merge entirely (Codex design review of #58,
-// verified). In a chat repo each of them now needs the owner's "merge" naming that PR in this session. P merge runs the merge
-// command as its own child process, which the guard never sees, so low-risk PRs still merge on their own through P merge.
+// verified). Since the chat-mode-without-needs-human change (docs/plans/2026-10-20-chat-mode-no-needs-human.md, N2) an agent merges
+// in a chat repo ONLY through P merge: a same-head "merge" given before a stop would otherwise still open a direct merge, and the direct
+// path reads no stop. P merge runs the merge command as its own child process, which the guard never sees, so it keeps working.
+// `gh pr merge --disable-auto` stays allowed (it cancels). Label mode and repos without a pipeline config are untouched.
 // Without the owner-go wiring (tests, older callers) nothing here applies.
 function ownerGoMode(dir, ctx) {
   if (!ctx?.ownerGo) return 'none';
@@ -917,20 +919,12 @@ const prNumberOf = (w) => {
 // `elsewhere`: the command names another repository (-R, a PR URL), whose mode is unknown here: judged as a chat repo.
 // `head`: the head the command pins (gh: --match-head-commit; the repo command: the flag before its {sha}); a merge that pins no full
 // head could land a later push the owner never saw, so it is refused, and the owner's "merge" must be for exactly that head.
-function directMergeVerdict(pr, head, dir, ctx, what, elsewhere = false, pinFlag = '--match-head-commit') {
+const CHAT_MERGE_ROUTE = 'in an owner_approval: chat repository agents merge only through `P merge --pr N` (it checks the owner\'s "merge" and any open owner stop); the owner merges in the GitHub UI.';
+function directMergeVerdict(pr, head, dir, ctx, what, elsewhere = false) {
   if (!ctx?.ownerGo) return null;
   if (!elsewhere && ownerGoMode(dir, ctx) !== 'chat') return null;
-  const where = elsewhere ? 'a merge named by -R, a PR URL or GH_REPO (its repository may need the owner)' : 'in this repository (owner_approval: chat) a merge';
-  const via = `Merge through \`P merge --pr ${pr ?? 'N'}\` (it merges a low-risk PR itself), or show the request (Head and 🔀 lines) and wait for the owner to type "merge".`;
-  if (pr === null) return deny(`${what} without a literal PR number: ${where} needs the owner's "merge" for that PR and head. Name the PR number (run from the repository), or ${via[0].toLowerCase()}${via.slice(1)}`);
-  if (!pinFlag) return deny(`${what} #${pr}: ${where} needs the owner's "merge" for the head it lands, and this merge command pins no head. ${via}`);
-  if (!/^[0-9a-f]{40}$/.test(String(head ?? ''))) return deny(`${what} #${pr}: ${where} must pin the head the owner said "merge" for: add \`${pinFlag} <full 40-character head>\`. ${via}`);
-  let ok = false;
-  try {
-    ok = ctx.ownerGo.approvedHead(pr, head) === true;
-  } catch { /* unreadable records: not approved */ }
-  if (ok) return null;
-  return deny(`${what} #${pr}: ${where} needs the owner's "merge" for #${pr} at head ${head.slice(0, 12)} in this session, and none is recorded. ${via}`);
+  const where = elsewhere ? ' (a merge named by -R, a PR URL or GH_REPO: its repository may be a chat repository)' : '';
+  return deny(`${what}${pr === null ? '' : ` #${pr}`}${where}: ${CHAT_MERGE_ROUTE}`);
 }
 // Package-manager spellings of one script: `npm --silent run merge`, `npm run-script merge`, `npm rum merge`, `pnpm merge`, `yarn merge` all run
 // script "merge". canonPm drops the global options (before the subcommand and between `run` and the script) and maps the aliases to
@@ -1002,8 +996,7 @@ function pmScriptRefusal(prefix, shaFlag, raw, dir, ctx) {
   if (!mayRun) return undefined;
   const moved = before.some((w) => MOVES_DIR.test(w) || w === 'workspace') || pmSettingOnLine(ctx);
   if (!moved && ownerGoMode(dir, ctx) !== 'chat') return null;
-  const canon = `${prefix.join(' ')} <PR>${shaFlag ? ` ${shaFlag} <full 40-character head>` : ''}`;
-  return deny(`\`${raw.join(' ').slice(0, 120)}\` may run the merge script \`${script}\`, and ${moved ? 'a manager option moves its target directory, so it is judged as a chat repository' : 'in this repository (owner_approval: chat)'} a merge needs the owner's "merge" for that PR and head. Only the exact form \`${canon}\` is checked against the owner's record (nothing between the script name and \`--\`, no manager options, no wrapper). Use it, or merge through \`P merge --pr N\` (it merges a low-risk PR itself).`);
+  return deny(`\`${raw.join(' ').slice(0, 120)}\` may run the merge script \`${script}\`${moved ? ' (a manager option moves its target directory, so it is judged as a chat repository)' : ''}: ${CHAT_MERGE_ROUTE}`);
 }
 function repoMergeCommandVerdict(argv, dir, ctx) {
   if (!ctx?.ownerGo) return null;

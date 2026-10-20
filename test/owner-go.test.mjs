@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
-  approvedPr, approvedRequest, lastRequestText, ownerGoDir, ownerItemsDigest, parseApproval, presentedRequests, readApprovals, recordApproval,
+  approvedRelease, approvedRequest, hookMessage, lastRequestText, ownerGoDir, ownerItemsDigest, parseApproval, parseResume, presentedRequests, presentedStops, readApprovals, recordApproval,
 } from '../pipeline/hooks/lib/owner-go.mjs';
 
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
@@ -121,20 +121,13 @@ test('owner-go: approvals last a day, never come from the future, and must be in
   assert.equal(approvedRequest({ ...q, head: HEAD.slice(0, 12), now: () => at }), false, 'the full head is required');
   assert.equal(approvedRequest({ ...q, items: 'none', now: () => at }), false, 'another item set');
   assert.equal(approvedRequest({ ...q, pr: 59, now: () => at }), false, 'another PR');
-  // the guard's question: this PR at this full head, this session
-  const g = { pr: 58, head: HEAD, session: 'sess-1', home, now: () => at };
-  assert.equal(approvedPr(g), true);
-  assert.equal(approvedPr({ ...g, session: 'sess-2' }), false);
-  assert.equal(approvedPr({ ...g, pr: 59 }), false);
-  assert.equal(approvedPr({ ...g, head: HEAD.slice(0, 12) }), false, 'a full head only');
-  assert.equal(approvedPr({ ...g, head: 'f'.repeat(40) }), false, 'another head');
   // a PR merely named in the prompt approves no head
   recordApproval(input(home, 'merge #60', [said('nothing shown')]), { home, now: () => at });
-  assert.equal(approvedPr({ ...g, pr: 60 }), false);
+  assert.equal(approvedRequest({ ...q, pr: 60, now: () => at }), false);
   // a line copied into another session's file does not count there
   const line = readFileSync(join(ownerGoDir(home), 'sess-1.jsonl'), 'utf8');
   writeFileSync(join(ownerGoDir(home), 'sess-2.jsonl'), line);
-  assert.equal(approvedPr({ ...g, session: 'sess-2' }), false);
+  assert.deepEqual(readApprovals({ home, session: 'sess-2', now: () => at }), []);
 });
 
 test('owner-go: the owner-item digest is order-free and "none" without items', () => {
@@ -225,4 +218,97 @@ test('owner-go: a user message with no tool_result is a prompt, text or not', ()
   const now = () => Date.parse('2026-10-14T10:00:00Z');
   const stale = { hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: 'merge', transcript_path: transcript(home, [user('go'), said(REQUEST), image, tools, user('merge')]) };
   assert.deepEqual(recordApproval(stale, { home, now }).requests, []);
+});
+
+// ---- chat mode without needs-human: the owner's reply releases a stop (docs/plans/2026-10-20-chat-mode-no-needs-human.md, D2) ----
+const S1 = '5f3a9c2e';
+const S2 = '0a1b2c3d';
+const WAIT = (pr, ids) => `Stopped #${pr} · stop ${ids}\n⏸ Waiting on you for #${pr} — rule in chat, then say "ship resume ${pr}"`;
+const OFFER = (pr, ids, extra = '') => `${[].concat(ids).map((id) => `Stopped #${pr} · stop ${id}`).join('\n')}\nHead ${HEAD.slice(0, 12)} · items ${ITEMS}${extra}\n🔀 Ready to merge #${pr} — say "merge"`;
+const atNow = () => Date.parse('2026-10-20T10:00:00Z');
+
+test('owner-go: parseResume accepts ship resume N / resume N / #N, with or without a leading slash; anything else is no release', () => {
+  for (const [p, want] of [
+    ['ship resume 12', [12]], ['resume 12', [12]], ['resume #12', [12]], ['Resume 12 please', [12]], ['/ship resume 12', [12]], ['/resume 12', [12]],
+    ['ship resume #12.', [12]], ['resume 12 and 13', [12, 13]],
+  ]) assert.deepEqual(parseResume(p)?.prs, want, p);
+  for (const p of ['resume?', 'resume 12?', 'do not resume', 'resume later', 'resume', 'resume pipeline reviews', '/merge 12', '/other resume 12', 'ship resumed 12', 'please resume 12', '', null]) {
+    assert.equal(parseResume(p), null, String(p));
+  }
+});
+
+test('owner-go: stop lines bind in the terminal block only; several ids for one PR all bind; a line away from the last line binds nothing', () => {
+  assert.deepEqual(presentedStops(WAIT(12, S1)), { ending: 'wait', prs: [12], stops: [{ pr: 12, stop: S1 }] });
+  assert.deepEqual(presentedStops(OFFER(12, [S1, S2])).stops, [{ pr: 12, stop: S1 }, { pr: 12, stop: S2 }]);
+  assert.equal(presentedStops(OFFER(12, S1)).ending, 'merge');
+  // the same line twice is one binding; a stop line for a PR that is not on the last line binds nothing
+  assert.deepEqual(presentedStops(`Stopped #12 · stop ${S1}\nStopped #12 · stop ${S1}\n⏸ Waiting on you for #12 — x`).stops, [{ pr: 12, stop: S1 }]);
+  assert.deepEqual(presentedStops(`Stopped #99 · stop ${S1}\n⏸ Waiting on you for #12 — x`).stops, []);
+  // prose between the stop line and the last line, text after the last line, an earlier block: nothing
+  assert.deepEqual(presentedStops(`Stopped #12 · stop ${S1}\nSome prose.\n⏸ Waiting on you for #12 — x`).stops, []);
+  assert.deepEqual(presentedStops(`${WAIT(12, S1)}\nAnd one more thing.`), { ending: null, prs: [], stops: [] });
+  // a bad id is no stop line
+  assert.deepEqual(presentedStops('Stopped #12 · stop nothex12\n⏸ Waiting on you for #12 — x').stops, []);
+  // the request block still works with a stop line above the Head line, and the request carries the ids
+  assert.deepEqual(presentedRequests(OFFER(12, [S1, S2])), { prs: [12], requests: [{ pr: 12, head: HEAD.slice(0, 12), items: ITEMS, stops: [S1, S2] }] });
+  assert.deepEqual(presentedRequests(REQUEST).requests, [{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS }], 'no stop line: no stops key');
+  // a ⏸ last line is a request for lastRequestText too
+  const home = tmp();
+  assert.match(lastRequestText(transcript(home, [user('go'), said(WAIT(12, S1)), user('ship resume 12')]), { prompt: 'ship resume 12' }), /Waiting on you for #12/);
+});
+
+test('owner-go: "resume N" records a release and NO merge approval; "merge" records the request (with its stops) AND the release', () => {
+  const home = tmp();
+  const r = recordApproval(input(home, 'ship resume 12', [said(OFFER(12, S1))]), { home, now: atNow });
+  assert.deepEqual(r.requests, [], 'a resume never approves a merge');
+  assert.deepEqual(r.releases, [{ pr: 12, stop: S1 }]);
+  assert.equal(r.kind, 'resume');
+  assert.equal(approvedRequest({ pr: 12, head: HEAD, items: ITEMS, home, now: atNow }), false);
+  assert.deepEqual(recordApproval(input(home, '/ship resume 12', [said(WAIT(12, S1))]), { home, now: atNow }).releases, [{ pr: 12, stop: S1 }]);
+  assert.equal(recordApproval(input(home, 'resume 13', [said(WAIT(12, S1))]), { home, now: atNow }), null, 'another PR: nothing recorded');
+  assert.equal(recordApproval(input(home, 'ship resume 12', [said('hello')]), { home, now: atNow }), null, 'a new session: no stop line before it');
+  const m = recordApproval(input(home, 'merge', [said(OFFER(12, [S1, S2]))]), { home, now: atNow });
+  assert.deepEqual(m.requests, [{ pr: 12, head: HEAD.slice(0, 12), items: ITEMS, stops: [S1, S2] }]);
+  assert.deepEqual(m.releases, [{ pr: 12, stop: S1 }, { pr: 12, stop: S2 }]);
+  assert.equal(m.kind, 'approve');
+  const w = recordApproval(input(home, 'merge', [said(WAIT(12, S1))]), { home, now: atNow });
+  assert.deepEqual(w.releases, [], 'the reply offered no merge: "merge" releases nothing');
+  assert.deepEqual(w.requests, []);
+  assert.deepEqual(recordApproval(input(home, 'merge', [said(REQUEST)]), { home, now: atNow }).releases, []);
+});
+
+test('owner-go: approvedRelease is bound to the exact PR and stop id, any session, a day at most; the record data comes along', () => {
+  const home = tmp();
+  recordApproval(input(home, 'ship resume 12', [said(WAIT(12, S1))]), { home, now: atNow });
+  const q = { pr: 12, stop: S1, home, now: atNow };
+  const got = approvedRelease(q);
+  assert.equal(got.kind, 'resume');
+  assert.equal(got.session, 'sess-1');
+  assert.match(got.prompt_sha256, /^[0-9a-f]{64}$/);
+  assert.equal(got.ts, new Date(atNow()).toISOString());
+  assert.equal(approvedRelease({ ...q, stop: S2 }), null, 'another stop id');
+  assert.equal(approvedRelease({ ...q, pr: 13 }), null, 'another PR');
+  assert.equal(approvedRelease({ ...q, now: () => atNow() + 25 * 3600_000 }), null, 'older than a day');
+  assert.equal(approvedRelease({ ...q, stop: 'zz' }), null);
+});
+
+test('owner-go: stop-id binding: approvedRequest with a stop accepts only a request that lists it', () => {
+  const home = tmp();
+  recordApproval(input(home, 'merge', [said(REQUEST.replace('#58', '#12'))]), { home, now: atNow }); // a pre-stop approval, no stops
+  const q = { pr: 12, head: HEAD, items: ITEMS, home, now: atNow };
+  assert.equal(approvedRequest(q), true);
+  assert.equal(approvedRequest({ ...q, stop: null }), true, 'no stop argument: unchanged');
+  assert.equal(approvedRequest({ ...q, stop: S1 }), false, 'the approval predates the stop');
+  recordApproval(input(home, 'merge', [said(OFFER(12, [S1]))]), { home, now: atNow });
+  assert.equal(approvedRequest({ ...q, stop: S1 }), true);
+  assert.equal(approvedRequest({ ...q, stop: S2 }), false, 'a later stop needs its own approval');
+});
+
+test('owner-go hook: the context line names a recorded release and says a resume approves no merge', () => {
+  const home = tmp();
+  const record = recordApproval(input(home, 'ship resume 12', [said(WAIT(12, S1))]), { home, now: atNow });
+  const text = hookMessage(record);
+  assert.match(text, /release.*#12.*stop 5f3a9c2e/);
+  assert.match(text, /no merge approval/i);
+  assert.match(hookMessage(recordApproval(input(home, 'merge', [said(REQUEST)]), { home, now: atNow })), /^\[claude-pipeline owner-go\] the owner's "merge" is recorded: #58 head/);
 });

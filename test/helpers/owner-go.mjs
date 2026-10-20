@@ -30,3 +30,15 @@ export const mergeRequest = (pr, head, items) => `Owner items listed above.\nHea
 
 // The flags P merge takes for it.
 export const approvalFlags = (head, items) => ['--owner-approved-head', head, '--owner-approved-items', items];
+
+// ---- owner stops (chat mode): the reply the controller prints at a stop, and the owner's release ---------------------------
+// Needs a ruling or a resume: `Stopped` line(s), then the ⏸ line. With `merge: {head, items}` it is the retry offer instead
+// (`Stopped` line(s), Head line, 🔀 line). `ids` may be one id or several (one `Stopped` line each).
+export function stopReply(pr, ids, { merge = null } = {}) {
+  const lines = [].concat(ids).map((id) => `Stopped #${pr} · stop ${id}`);
+  if (merge) return `${lines.join('\n')}\nHead ${merge.head.slice(0, 12)} · items ${merge.items}\n🔀 Ready to merge #${pr} — say "merge"`;
+  return `${lines.join('\n')}\n⏸ Waiting on you for #${pr} — rule in chat, then say "ship resume ${pr}"`;
+}
+
+// What the recorder writes when the owner types `ship resume <pr>` after `reply`.
+export const resumeSays = (t, pr, reply, prompt = `ship resume ${pr}`) => ownerSays(t, prompt, reply);

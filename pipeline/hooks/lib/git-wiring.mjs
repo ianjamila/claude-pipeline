@@ -6,7 +6,6 @@ import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { run, gh } from '../../lib/proc.mjs';
 import { parseYaml } from '../../lib/yaml.mjs';
-import { approvedPr } from './owner-go.mjs';
 
 const LOOKUP_TIMEOUT_MS = 5000;
 const PUSH_LOOKUP_TIMEOUT_MS = 3000;
@@ -47,13 +46,13 @@ export function realGitWiring() {
 // is never read), in every version at hand: the working tree, HEAD and the remote's default branch. Any one of them saying chat
 // makes it a chat repo, so a local edit or an uncommitted file cannot switch the check off (a rewritten local ref still can:
 // the documented residual). A pipeline.yml that cannot be parsed throws: the policy then treats the repo as chat (fail closed).
-// Whether the owner said "merge" comes from the owner-go records of THIS session, for the exact PR and head (lib/owner-go.mjs).
+// (Chat repos: an agent never merges directly, whatever the owner said; `P merge` reads the owner-go records itself. git-policy.mjs directMergeVerdict.)
 const COMMITTED_REFS = ['HEAD', 'origin/HEAD', 'origin/main', 'origin/master'];
 const defaultGitShow = (root, ref) => {
   const r = run('git', ['-C', root, 'show', `${ref}:.claude/pipeline.yml`], { timeoutMs: LOOKUP_TIMEOUT_MS });
   return r.code === 0 ? r.stdout : null;
 };
-export function ownerGoWiring(session, { readText = (p) => readFileSync(p, 'utf8'), exists = existsSync, gitShow = defaultGitShow } = {}) {
+export function ownerGoWiring(_session, { readText = (p) => readFileSync(p, 'utf8'), exists = existsSync, gitShow = defaultGitShow } = {}) {
   const rootOf = (dir) => {
     let d = path.resolve(dir);
     for (;;) {
@@ -94,6 +93,5 @@ export function ownerGoWiring(session, { readText = (p) => readFileSync(p, 'utf8
       }
       return out;
     },
-    approvedHead: (pr, head) => approvedPr({ pr, head, session }),
   };
 }
