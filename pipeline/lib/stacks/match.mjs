@@ -1,7 +1,9 @@
 // Which private Supabase stacks (and dev-server ports) does one tool call name? The register hook runs this before every
 // tool call, so the rules are: (1) over-match, never under-match. A stack named in quoted text, after `true ||`, or in a
 // command we cannot even parse still gets a lease; a spurious lease only delays a stop, a missed one lets a stack be
-// stopped under a running session. This module never removes a target and never returns a "revoke". (2) A parse problem
+// stopped under a running session. This module never removes a target and never returns a "revoke". The one exception is
+// read-only inspection (`readOnlyCommand`; the Read / Grep / Glob file tools): a call made only of those names no stack,
+// because looking at a stack is not using it and must not keep it alive or blame a session for it. (2) A parse problem
 // (an unterminated quote, a variable we cannot resolve) falls back to a whole-word search of the raw text. (3) `prefilter`
 // is the cheap gate that runs on EVERY tool call: string and regex work only, no fs, no subprocess. (4) fs access
 // (exists / realpath / readFile) and the platform are injected; paths are compared in POSIX form through
@@ -15,6 +17,7 @@ import { expandHome, isInside, samePath, toPosix } from '../paths.mjs';
 export const DEV_RE = /\b(?:next\s+(?:dev|start)|npm\s+(?:run\s+)?(?:dev|start)|npm\s+start)\b/;
 
 const FILE_TOOLS = new Set(['Read', 'Edit', 'Write', 'Grep', 'Glob', 'NotebookEdit']);
+const READ_ONLY_FILE_TOOLS = new Set(['Read', 'Grep', 'Glob']);
 const BASH_PREFILTER_RE = /supabase|\.stack\b|psql|docker\s+exec|:\d{4,5}\b|SUPABASE|PG[A-Z]+=/;
 const SUPABASE_TOKEN_RE = /(?:^|[\\/])supabase(?:@[^\\/]*)?(?:\.exe|\.cmd)?$/i;
 const MAX_NESTING = 2;
@@ -102,6 +105,77 @@ function commandWords(tokens) {
   let i = 0;
   while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i])) i++;
   return tokens.slice(i);
+}
+
+// ---- read-only inspection ----
+// An inspection is not use: `docker ps`, `ls <folder>`, `grep x <folder>/config.toml` look at a stack without needing it, so a
+// command made only of them names no stack. The test is strict, so anything doubtful stays a use (rule 1): every simple
+// command must be a cd-like or a listed inspection, the raw text must hold nothing that can run a program inside an argument
+// (a `$` expansion, a backtick, `<(`, `>(`), and the only output redirections allowed are to /dev/null or an fd dup.
+const NEUTRAL_WORDS = new Set(['cd', 'pushd', 'popd']);
+const READ_ONLY_WORDS = new Set(['ls', 'cat', 'head', 'tail', 'grep', 'egrep', 'fgrep', 'wc', 'stat', 'du', 'df', 'jq', 'realpath', 'readlink', 'basename', 'dirname', 'pwd', 'which', 'cut', 'tr', 'diff', 'cmp', 'lsof', 'ps', 'pgrep']);
+const FIND_WRITERS = new Set(['-exec', '-execdir', '-ok', '-okdir', '-delete', '-fprint', '-fprint0', '-fprintf', '-fls']);
+const DOCKER_READ_SUBS = new Set(['ps', 'inspect', 'logs', 'stats', 'top', 'port', 'images', 'events', 'version', 'info', 'diff']);
+const DOCKER_GROUPS = new Set(['container', 'image', 'volume', 'network', 'system']);
+const DOCKER_READ_SUBS2 = new Set(['ls', 'list', 'ps', 'inspect', 'logs', 'stats', 'top', 'port', 'diff', 'history', 'df', 'info', 'events']);
+// An output redirection that writes nothing a stack could care about: to /dev/null, or an fd dup (`>&2`, `2>&1`).
+const SAFE_REDIRECT_RE = /(?:\d*|&)>>?(?:&\d+|\s*\/dev\/null)(?![^\s;&|()])/y;
+
+// The command with its safe redirections blanked out, or null when an unquoted `>` is left (a write to a file).
+function withoutSafeRedirects(command, platform) {
+  let out = '';
+  let quote = null;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (quote) {
+      out += ch;
+      if (ch === '\\' && quote === '"' && platform !== 'win32' && i + 1 < command.length) out += command[++i];
+      else if (ch === quote) quote = null;
+    } else if (ch === '\\' && platform !== 'win32' && i + 1 < command.length) {
+      out += ch + command[++i];
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+      out += ch;
+    } else if (ch === '>' || ((ch === '&' || /\d/.test(ch)) && (i === 0 || /[\s;&|()]/.test(command[i - 1])))) {
+      SAFE_REDIRECT_RE.lastIndex = i;
+      const m = SAFE_REDIRECT_RE.exec(command);
+      if (m) { out += ' '; i += m[0].length - 1; } else if (ch === '>') return null; else out += ch;
+    } else {
+      out += ch;
+    }
+  }
+  return out;
+}
+
+function isInspection(words) {
+  const [cmd, ...args] = words;
+  if (READ_ONLY_WORDS.has(cmd)) return true;
+  if (cmd === 'rg') return !args.some((a) => a === '--pre' || a.startsWith('--pre='));
+  if (cmd === 'find') return !args.some((a) => FIND_WRITERS.has(a));
+  if (cmd === 'docker') {
+    if (DOCKER_READ_SUBS.has(args[0])) return true;
+    return DOCKER_GROUPS.has(args[0]) && DOCKER_READ_SUBS2.has(args[1]);
+  }
+  return false;
+}
+
+// True only when EVERY simple command is a cd-like or a read-only inspection and at least one is an inspection. Never throws.
+export function readOnlyCommand(command, platform = process.platform) {
+  if (typeof command !== 'string' || command === '') return false;
+  if (/[$`]|<\(|>\(/.test(command)) return false;
+  const text = withoutSafeRedirects(command, platform);
+  if (text === null) return false;
+  let inspected = false;
+  for (const seg of segmentsOf(text, platform)) {
+    let tokens;
+    try { tokens = splitCommand(seg, platform); } catch { return false; }
+    const words = commandWords(tokens);
+    if (words.length === 0) return false;
+    if (NEUTRAL_WORDS.has(words[0])) continue;
+    if (!isInspection(words)) return false;
+    inspected = true;
+  }
+  return inspected;
 }
 
 // ---- paths in POSIX form ----
@@ -254,6 +328,7 @@ function textMatches(command, stacks) {
 }
 
 function bashTargets({ command, cwd, stacks, exists, realpath, readFile, platform, home }) {
+  if (readOnlyCommand(command, platform)) return [];
   const found = collector();
   const segs = parseCommand(command, platform);
   const chain = chainFrom(segs, cwd, home);
@@ -319,6 +394,7 @@ function bashTargets({ command, cwd, stacks, exists, realpath, readFile, platfor
 }
 
 function fileTargets({ tool, input, cwd, stacks, realpath, platform }) {
+  if (READ_ONLY_FILE_TOOLS.has(tool)) return [];
   const found = collector();
   const candidates = fileToolPaths(input);
   if (tool === 'Glob' && typeof input?.pattern === 'string') candidates.push(globPrefix(input.pattern));
