@@ -6,7 +6,7 @@
 // Guarded names are spelled in pieces (as test/guard-hidden-assignments.test.mjs does), also inside the fake package.json contents: the live guard scans files passed to node tools.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolve, dirname, basename } from 'node:path';
+import { resolve, dirname, basename, posix } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 
@@ -495,7 +495,7 @@ test('t2 (security) a configuration file the line writes between two manager cal
 });
 test('t9 a package.json that is a dangling link or a link loop is unreadable, not missing', () => {
   const call = pmCall(['npm', 'run', 'lint']);
-  const env = (o) => ({ cwd: '/w/p', home: '/home/u', readText: () => null, pathExists: () => false, readDir: () => null, lexists: (f) => f === '/w/p/package.json', p: undefined, ...o });
+  const env = (o) => ({ cwd: '/w/p', home: '/home/u', readText: () => null, pathExists: () => false, readDir: () => null, lexists: (f) => f === '/w/p/package.json', p: posix, ...o }); // (posix: the fixture names POSIX paths; the native module on Windows would join them with backslashes)
   const r = packageScripts(call, env());
   assert.match(r.refuse ?? '', /cannot read \/w\/p\/package\.json/);
   assert.deepEqual(packageScripts(call, env({ lexists: () => false })), { none: true }, 'nothing there at all');

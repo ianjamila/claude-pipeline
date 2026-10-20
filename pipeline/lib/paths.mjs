@@ -69,3 +69,33 @@ export function canonicalPath(p) {
     cur = parent;
   }
 }
+
+// node:path.posix for paths in the guards' POSIX form (toPosix), where a Windows drive path stays `D:/dir/file`. The plain posix functions do not know `D:/` is absolute: posix.resolve('D:/a', 'b') puts the
+// process directory in front, and posix.dirname('D:/a') is 'D:', then '.', so a walk upward leaves the drive. Here a drive is a root: resolve clamps `..` at it, dirname stops at `D:/`.
+const posix = path.posix;
+const DRIVE = /^([A-Za-z]:)(\/.*)?$/;
+const rooted = (s) => s.startsWith('/') || DRIVE.test(s);
+const split = (s) => { const m = DRIVE.exec(s); return m ? [m[1], m[2] ?? '/'] : ['', s]; };
+export const drivePosix = {
+  ...posix,
+  isAbsolute: (s) => rooted(String(s)),
+  resolve(...parts) {
+    let out = '';
+    for (let i = parts.length - 1; i >= 0 && !rooted(out); i--) {
+      const s = String(parts[i] ?? '');
+      if (s !== '') out = out === '' ? s : `${s}/${out}`;
+    }
+    if (!rooted(out)) out = `${toPosix(process.cwd())}/${out}`;
+    const [drive, rest] = split(out);
+    return `${drive}${posix.resolve('/', rest)}`;
+  },
+  dirname(s) {
+    const [drive, rest] = split(String(s));
+    return drive ? `${drive}${posix.dirname(rest)}` : posix.dirname(s);
+  },
+  relative(a, b) {
+    const [da, ra] = split(this.resolve(a));
+    const [db, rb] = split(this.resolve(b));
+    return da.toLowerCase() === db.toLowerCase() ? posix.relative(ra, rb) : `${db}${rb}`;
+  },
+};

@@ -102,7 +102,7 @@ const rcAllows = (cmd, tree, o, why) => { const r = eachGuard(cmd, { ...base, ..
 test('t3 the user .npmrc prefix= names the directory of the global npmrc (script-shell / node-options there make the scripts unknown)', () => {
   for (const bad of ['script-shell=/tmp/s', 'node-options=--require /e/x.js', 'globalconfig=/tmp/c']) {
     const r = rcDenies('npm test', { '/home/u/.npmrc': 'prefix=/x/pfx\n', '/x/pfx/etc/npmrc': `${bad}\n` }, {}, `${bad} under the user prefix`);
-    assert.match(r.git.reason, /\/x\/pfx\/etc\/npmrc|\/home\/u\/\.npmrc/);
+    assert.match(r.git.reason, /[\\/]x[\\/]pfx[\\/]etc[\\/]npmrc|[\\/]home[\\/]u[\\/]\.npmrc/); // (the git guard names the path in the platform's own form)
   }
   rcAllows('npm test', { '/home/u/.npmrc': 'prefix=/x/pfx\n', '/x/pfx/etc/npmrc': 'registry=https://r.example\nsave-exact=true\n' }, {}, 'a harmless key under the user prefix');
   rcAllows('npm test', { '/home/u/.npmrc': 'prefix=/x/pfx\n' }, {}, 'no global npmrc at the prefix');

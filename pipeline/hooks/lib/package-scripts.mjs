@@ -3,6 +3,7 @@
 // scriptFileOf has no reading for `npm run`, so neither guard ever opened a package script. The argv reading below (moved here from git-policy.mjs, where #58 built it for the repo's merge
 // command) is shared: git-policy.mjs judges the merge command with it as before, and both guards open the scripts with pmCall / packageScripts.
 import nodePath from 'node:path';
+import { toPosix, drivePosix } from '../../lib/paths.mjs';
 import { lstatSync } from 'node:fs';
 import { commandName, simpleCommands, splitArgs } from './shell-parse.mjs';
 
@@ -475,18 +476,20 @@ export function pkgMarkersFor(budget, starts, env = {}) {
   const maybe = budget.pkgMarkersMaybe ?? [];
   if (!known.length && !maybe.length) return null;
   if (starts === null || starts === undefined) return known.length ? 'known' : 'maybe';
-  const p = env.p ?? nodePath;
-  const forms = (x) => { const r = env.real ? env.real(x) : x; return r && r !== x ? [x, r] : [x]; };
+  // (the paths are compared as text in their POSIX form: a Windows guard hands over backslash paths, which have no `/` to split on or to start with)
+  const p = drivePosix;
+  const forms = (x) => { const r = env.real ? env.real(x) : x; return (r && r !== x ? [x, r] : [x]).map(toPosix); };
   const exists = (x) => env.pathExists?.(x) === true;
   for (const { paths, gone } of known) {
     for (const o of paths) {
       for (const s of starts) {
         for (const so of forms(s)) {
           for (let a = so, n = 0; n < MAX_WALK; n++) {
+            const at = a.endsWith('/') ? a : `${a}/`;
             for (const oo of forms(o)) {
               if (oo === a) return 'known';
-              if (oo.startsWith(a === '/' ? '/' : `${a}/`)) {
-                const rest = oo.slice(a === '/' ? 1 : a.length + 1);
+              if (oo.startsWith(at)) {
+                const rest = oo.slice(at.length);
                 const first = rest.split('/')[0];
                 const hits = componentIsMarker(first);
                 // (a node_modules directory only matters when it goes, and where there is no package.json next to it to be found first: it stops the search there)
@@ -855,8 +858,12 @@ export function binIsProgram(text, site = null) {
 export function binSite(bin, runDir, exists, p = nodePath) {
   // (R3-B2: the PATH order is the run directory and its parents FIRST -- the manager puts the nearest node_modules/.bin of where it runs ahead of the others -- then the bin's own package directory)
   const roots = [runDir, p.dirname(p.dirname(p.dirname(bin)))].filter((x) => typeof x === 'string');
+  // (compared in POSIX form: a Windows root is `D:\dir`, a shebang names `D:/dir/x` or `/dir/x` -- no drive: the current one --, and Windows names ignore case)
+  const fold = (x) => { const s = toPosix(x); return process.platform === 'win32' ? s.toLowerCase() : s; };
+  const bare = (x) => x.replace(/^[A-Za-z]:(?=\/|$)/, '');
+  const under = (a, r) => a === r || a.startsWith(r.endsWith('/') ? r : `${r}/`);
   return {
-    inside: (abs) => roots.some((r) => abs === r || abs.startsWith(r === '/' ? '/' : `${r}/`)),
+    inside: (abs) => { const a = fold(abs); return roots.some((r) => { const q = fold(r); return under(a, q) || (!/^[A-Za-z]:/.test(a) && under(a, bare(q))); }); },
     hasBin: (name) => findBin(name) !== null,
     findBin,
     resolve: (w) => (runDir ? p.resolve(runDir, w) : null),
