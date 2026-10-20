@@ -64,3 +64,74 @@ test('planRequestLines renders the exact two terminal lines', () => {
     '📋 Ready to approve plan #7 — say "approve"',
   ]);
 });
+
+// Amendment r4: what the owner sees rendered (CommonMark) must be what parsePlan reads.
+const SCOPE_OK = ['src/a.mjs', 'test/**', 'docs/x.md'];
+const withScope = (extra) => PLAN.replace('* `docs/x.md` (the doc)', `* \`docs/x.md\` (the doc)\n${extra}`);
+
+test('a 4-backtick fence is not closed by a 3-backtick line: the later Scope stays masked', () => {
+  const fenced = PLAN + ['````markdown', '```', '## Scope', '- `evil/**`', '### Task T9: Fake', '````', ''].join('\n');
+  const p = parsePlan(fenced);
+  assert.deepEqual(p.scope, SCOPE_OK);
+  assert.deepEqual(p.tasks.map((t) => t.id), ['T1', 'T2']);
+  assert.ok(p.tasks[1].text.includes('- `evil/**`'), 'the masked block stays in the task text');
+});
+
+test('a fence closes only on the same character, at least as long, with nothing else on the line', () => {
+  const body = ['## Scope', '- `evil/**`', '### Task T9: Fake'];
+  for (const [open, notClose] of [['````', '```'], ['```', '~~~'], ['~~~~', '~~~'], ['```', '``` x'], ['```', '```` x']]) {
+    const p = parsePlan(PLAN + [open, notClose, ...body, ''].join('\n'));
+    assert.deepEqual(p.scope, SCOPE_OK, `${open} not closed by ${notClose}`);
+    assert.deepEqual(p.tasks.map((t) => t.id), ['T1', 'T2']);
+  }
+  // a longer closer, up to 3 spaces of indent and trailing spaces do close it
+  const closed = parsePlan(PLAN + ['```', 'x', '   ````   ', '### Task T3: Real', 'c', ''].join('\n'));
+  assert.deepEqual(closed.tasks.map((t) => t.id), ['T1', 'T2', 'T3']);
+});
+
+test('an unclosed fence masks to the end of the text', () => {
+  const p = parsePlan(PLAN + ['```', '### Task T9: Fake', '## Scope', '- `evil/**`', ''].join('\n'));
+  assert.deepEqual(p.tasks.map((t) => t.id), ['T1', 'T2']);
+  assert.deepEqual(p.scope, SCOPE_OK);
+});
+
+test('a line indented 4+ spaces (or a tab) is never a fence; a backtick fence with a backtick in its info string is not one', () => {
+  for (const ind of ['    ', '     ', '\t']) {
+    const p = parsePlan(PLAN + [`${ind}\`\`\``, '### Task T3: Real', 'c', ''].join('\n'));
+    assert.deepEqual(p.tasks.map((t) => t.id), ['T1', 'T2', 'T3'], JSON.stringify(ind));
+  }
+  const p = parsePlan(PLAN + ['``` a`b', '### Task T3: Real', 'c', ''].join('\n'));
+  assert.deepEqual(p.tasks.map((t) => t.id), ['T1', 'T2', 'T3']);
+  // a tilde fence may have a backtick in its info string, and up to 3 spaces of indent is still a fence
+  const q = parsePlan(PLAN + ['   ~~~ a`b', '### Task T9: Fake', '~~~', ''].join('\n'));
+  assert.deepEqual(q.tasks.map((t) => t.id), ['T1', 'T2']);
+});
+
+test('Scope refuses HTML comments, raw HTML tag lines, blockquoted and nested items (each listed)', () => {
+  const bad = {
+    comment: ['<!-- - `evil/**` -->', /HTML comment/],
+    multiline: ['<!--', '- `evil/**`', '-->', /HTML comment/],
+    tag: ['<details>', /HTML/],
+    tagAttrs: ['  <div hidden>', /HTML/],
+    quote: ['> - `x`', /blockquote/],
+    nestedQuote: ['> > * `x`', /blockquote/],
+    nested: ['  - `x`', /nested/],
+    nested4: ['    - `x`', /nested/],
+    nestedTab: ['\t- `x`', /nested/],
+  };
+  for (const [name, [...lines]] of Object.entries(bad)) {
+    const re = lines.pop();
+    assert.throws(() => parsePlan(withScope(lines.join('\n'))), (e) => e instanceof PlanError && re.test(e.message), name);
+  }
+  assert.throws(() => parsePlan(withScope('<!-- a -->\n> - `x`')), (e) => e instanceof PlanError && /HTML comment/.test(e.message) && /blockquote/.test(e.message));
+  // fenced samples inside Scope are code, so they are fine; plain prose and flat items still parse
+  assert.deepEqual(parsePlan(withScope('Note: flat list.\n```\n<!-- x -->\n> - `y`\n```\n- ` other/** `')).scope, [...SCOPE_OK, 'other/**']);
+});
+
+test('HTML comments and tags outside the Scope section are not refused', () => {
+  assert.ok(parsePlan(PLAN + '<details>\n<!-- note -->\n'));
+});
+
+test('the Scope section ends at the first task heading: a backticked bullet in a task body is not scope', () => {
+  assert.deepEqual(parsePlan(PLAN.replace('b works', 'b works\n- `evil/**`')).scope, SCOPE_OK);
+});

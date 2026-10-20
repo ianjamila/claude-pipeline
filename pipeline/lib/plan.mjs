@@ -10,8 +10,16 @@ export const MAX_SCOPE_ENTRIES = 500;
 export const PLAN_LINE_RE = /^\s*Plan\s+([0-9a-f]{40})\s*(?:·|\|)\s*scope\s+([0-9a-f]{12})\s*$/;
 export const PLAN_READY_RE = /📋\s*Ready to approve plan\s+#(\d{1,6})\b/;
 const TASK_HEAD = /^### Task ([A-Za-z0-9._-]{1,64}):[ \t]+(\S.*?)\s*$/;
-const SCOPE_ITEM = /^\s*[-*]\s+`([^`\n]+)`/;
-const FENCE = /^\s*(```|~~~)/;
+const SCOPE_ITEM = /^ ?[-*]\s+`([^`\n]+)`/;
+// CommonMark fences: opener = up to 3 spaces + a run of 3+ backticks or tildes (a backtick info string holds no backtick);
+// closer = same character, at least as long, up to 3 spaces, only spaces after. 4+ spaces of indent (or a tab) is code.
+const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+const FENCE_CLOSE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
+// Scope must read the same rendered and parsed: no comments, raw HTML, blockquoted or nested items.
+const HTML_COMMENT = /<!--/;
+const HTML_TAG_LINE = /^\s*<\/?[A-Za-z][A-Za-z0-9-]*(?:[\s/>]|$)/;
+const QUOTED_ITEM = /^\s*>[\s>]*[-*+]\s+`/;
+const NESTED_ITEM = /^(?: {2,}|\t)\s*[-*+]\s+`/;
 
 export class PlanError extends Error {
   constructor(problems) {
@@ -22,24 +30,31 @@ export class PlanError extends Error {
 
 const sha = (s) => createHash('sha256').update(s).digest('hex');
 
-// Line i is inside a fenced code block (the fence lines themselves count as inside).
+// Line i is inside a fenced code block (the fence lines themselves count as inside); an unclosed fence runs to the end.
 function fenceMask(lines) {
   const mask = [];
   let open = null;
   for (const l of lines) {
-    const m = FENCE.exec(l);
-    if (open) { mask.push(true); if (m && m[1] === open) open = null; continue; }
-    if (m) { open = m[1]; mask.push(true); continue; }
+    if (open) {
+      mask.push(true);
+      const c = FENCE_CLOSE.exec(l);
+      if (c && c[1][0] === open[0] && c[1].length >= open.length) open = null;
+      continue;
+    }
+    const m = FENCE_OPEN.exec(l);
+    if (m && !(m[1][0] === '`' && m[2].includes('`'))) { open = m[1]; mask.push(true); continue; }
     mask.push(false);
   }
   return mask;
 }
 
-function sectionLines(lines, mask, title) {
+// A section runs to the next `## ` heading, or (stopAtTask) to the first `### Task` heading: task bodies are not Scope.
+function sectionLines(lines, mask, title, { stopAtTask = false } = {}) {
   const re = new RegExp(`^## ${title}\\s*$`, 'i');
   const start = lines.findIndex((l, i) => !mask[i] && re.test(l));
   if (start < 0) return null;
-  let end = lines.findIndex((l, i) => i > start && !mask[i] && /^## /.test(l));
+  const stop = stopAtTask ? /^(?:## |### Task\b)/ : /^## /;
+  let end = lines.findIndex((l, i) => i > start && !mask[i] && stop.test(l));
   if (end < 0) end = lines.length;
   return { lines: lines.slice(start + 1, end), mask: mask.slice(start + 1, end) };
 }
@@ -70,12 +85,18 @@ export function parsePlan(text, { path: ownPath } = {}) {
   const plainEnglish = pe ? trimBlank(pe.lines).join('\n') : '';
   if (!plainEnglish) problems.push('missing or empty "## In plain English" section');
 
-  const sc = sectionLines(lines, mask, 'Scope');
+  const sc = sectionLines(lines, mask, 'Scope', { stopAtTask: true });
   const scope = [];
   if (!sc) problems.push('missing "## Scope" section');
   else {
+    const flagged = new Set();
+    const refuse = (why) => { if (!flagged.has(why)) { flagged.add(why); problems.push(`the "## Scope" section must be a flat list the owner can read as written: ${why}`); } };
     sc.lines.forEach((l, i) => {
       if (sc.mask[i]) return;
+      if (HTML_COMMENT.test(l)) refuse('it contains an HTML comment');
+      if (HTML_TAG_LINE.test(l)) refuse('it contains a raw HTML tag line');
+      if (QUOTED_ITEM.test(l)) { refuse('it contains a scope item inside a blockquote'); return; }
+      if (NESTED_ITEM.test(l)) { refuse('it contains a nested list item (indented 2+ spaces)'); return; }
       const m = SCOPE_ITEM.exec(l);
       if (!m) return;
       const e = m[1].trim();
