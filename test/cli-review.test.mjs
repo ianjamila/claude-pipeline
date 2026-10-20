@@ -1258,6 +1258,7 @@ test('state outcome: a round with nothing to fix is clean; coverage follows the 
   assert.equal(clean.json.coverageValid, true);
   assert.equal(clean.json.currentContentHash, w.state().rounds[0].contentHashAtToHead);
   assert.deepEqual([clean.json.rounds, clean.json.maxRounds, clean.json.reachedMax], [1, 3, false]);
+  assert.deepEqual([clean.json.extraRound, clean.json.effectiveMaxRounds], [false, 3]);
 
   // content changed after the review: exit stays 0, clean turns false
   w.repo.write('src/b.js', `${bFile}export const extra = 1;\n`);
