@@ -2459,8 +2459,8 @@ function evaluateBashForFilesFrame(command, opts) {
   ctx.assigned = new Map([...(opts._assigned ?? [])].map(([n, ws]) => [n, [...ws]]));
   for (const [n, ws] of assigningDefaults(raw)) ctx.assigned.set(n, [...new Set([...(ctx.assigned.get(n) ?? []), ...ws])]);
   if (raw.length > MAX_LINE_CHARS) {
-    // too long to scan in the time budget: judged by what it mentions once quotes and escapes are removed
-    return SENSITIVE_WORDS.test(raw.replace(/['"`\\]/g, '')) ? deny('the command line is too long to check and mentions a protected pipeline file or switch; split it into simpler commands') : allow();
+    // Why (#84): too long to scan in the time budget, so refused whatever it says (a padded `bash w.sh` names no protected file itself); the same cap judges script texts
+    return deny(`the command line is too long to check (${raw.length} characters; the limit is ${MAX_LINE_CHARS}); split it into simpler commands, or write long text to a file with the Write tool`);
   }
 
   // 1 and 2: the admin switch and the hook switch, however the words are quoted or escaped
