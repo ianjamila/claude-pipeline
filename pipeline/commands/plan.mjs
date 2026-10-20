@@ -21,7 +21,7 @@ import { run as costRun } from './cost.mjs';
 import { sha256, writeFileAtomic, writeJson } from '../lib/review-context.mjs';
 import { extractJsonBlock, findSubagentTranscript, proveModel } from '../lib/transcript.mjs';
 import { PlanError, parsePlan, planRequestLines, scopeDigest } from '../lib/plan.mjs';
-import { activeProposal, bindOf, latestApproval, matchingLocalRecord, newestLocalRecord, startsValidity } from '../lib/plan-state.mjs';
+import { activeProposal, bindOf, latestApproval, matchingLocalRecord, newestLocalRecord, recordsForRepo, startsValidity } from '../lib/plan-state.mjs';
 import { scopeMayHitGlob, securityGlobs } from '../lib/risk.mjs';
 import { LIMITS, bindRecord } from '../lib/run-record.mjs';
 import { VIEW_FIELDS, createRunRecorder } from '../lib/run-progress.mjs';
@@ -222,7 +222,7 @@ async function approve(argv, ctx) {
     const existingApproval = latestApproval(px.events, px.bind);
     const wasApproved = (e) => e.kind === 'plan-approved' && e.dataStatus === 'ok' && !e.tampered && e.data?.blob === active.blob
       && e.data?.repo === px.bind.repo && e.data?.pr === px.bind.pr && e.data?.branch === px.bind.branch;
-    const old = readPlanApprovals({ home, now, maxAgeMs: PLAN_RECORD_MAX_AGE_MS });
+    const old = recordsForRepo(readPlanApprovals({ home, now, maxAgeMs: PLAN_RECORD_MAX_AGE_MS }), px.bind.repo);
     // Only an event whose record is the owner's NEWEST for this PR repairs: an older approved plan replayed later is not (F4).
     const newestOld = newestLocalRecord(old, px.pr);
     const repairEvent = existingApproval.status === 'approved'
@@ -235,7 +235,7 @@ async function approve(argv, ctx) {
       repaired = true;
       event = { id: repairEvent.commentId, reused: true };
     } else {
-      const recs = readPlanApprovals({ home, now, maxAgeMs: MAX_AGE_MS }).filter((r) => r.pr === px.pr).sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts));
+      const recs = recordsForRepo(readPlanApprovals({ home, now, maxAgeMs: MAX_AGE_MS }), px.bind.repo).filter((r) => r.pr === px.pr).sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts));
       const rec = recs[0];
       if (!rec) throw fail('no-approval', 'the owner has not typed "approve" for this plan in the last 24 hours (the hook records it): show the plan request and wait');
       if (rec.blob !== active.blob) throw fail('superseded', `the owner approved plan ${rec.blob.slice(0, 12)}, but the active plan is ${active.blob.slice(0, 12)}: show the active plan request again`);

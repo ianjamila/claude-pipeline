@@ -168,3 +168,20 @@ test('F7: a missing or non-array changed-file list is a lost verdict, even for a
   }
   assert.equal(verdict({ events: [approved(A, RID1, PSHA)], readBlob: readAB, files: files1, localRecords: local }).ok, true);
 });
+
+// ---- approval replay across repos --------------------------------------------------------------------------------------------
+test('a local record of ANOTHER repo (same pr, blob, scope) is no approval; the same repo and a record without repo still verify', () => {
+  const base = rec(A, RID1, PSHA, '2026-10-19T10:00:00Z');
+  const run = (r) => verdict({ events: [approved(A, RID1, PSHA)], readBlob: readAB, files: files1, localRecords: [r] });
+  assert.deepEqual(run({ ...base, repo: 'other/place' }).ownerItems, ['plan-scope unverified mac']);
+  assert.deepEqual(run({ ...base, repo: 'A/B' }).ownerItems, [], 'same repo, GitHub case differences do not matter');
+  assert.deepEqual(run({ ...base, repo: null }).ownerItems, [], 'a record without repo (older, or recorded outside a repo) still matches');
+  assert.deepEqual(run(base).ownerItems, []);
+  // a foreign record never outvotes the owner's newest record of THIS repo
+  const mine = rec(A, RID1, PSHA, '2026-10-19T10:00:00Z');
+  const foreignNewer = { ...rec(B, RID2, PSHA2, '2026-10-19T11:00:00Z'), repo: 'other/place' };
+  assert.deepEqual(verdict({ events: [approved(A, RID1, PSHA)], readBlob: readAB, files: files1, localRecords: [{ ...mine, repo: 'a/b' }, foreignNewer] }).ownerItems, []);
+  // resume facts and the "a plan was proposed" trace ignore foreign records too
+  assert.equal(facts({ events: [ev('plan-proposed', { blob: A, scopeDigest: SCOPE_D }), approved(A, RID1, PSHA)], localRecords: [{ ...base, repo: 'other/place' }] }).approval, 'unverified');
+  assert.equal(verdict({ localRecords: [{ ...base, repo: 'other/place' }], files: files1 }).ownerItems[0], 'plan-scope none');
+});

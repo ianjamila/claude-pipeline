@@ -307,3 +307,33 @@ test('plan records are read for 30 days, never from the future, and subagent pro
 // The 24 h issuance window and the UTC / future-skew boundaries are checked by `P plan approve` (T4 tests):
 // a record exactly 24 h old is accepted, 24 h + 1 s refused; a record dated in the future beyond the existing skew
 // allowance (owner-go.mjs ~245) is refused; timestamps are compared as UTC epoch ms.
+
+test('a plan record carries the repo (owner/name from the cwd\'s origin) and omits it outside a git repo', () => {
+  const repoDir = mkdtempSync(join(tmpdir(), 'owner-go-repo-'));
+  const g = (...a) => spawnSync('git', ['-C', repoDir, ...a], { encoding: 'utf8' });
+  assert.equal(g('init', '-q').status, 0);
+  mkdirSync(join(repoDir, 'sub'));
+  for (const [url, want] of [
+    ['git@github.com:Acme/Widgets.git', 'Acme/Widgets'],
+    ['https://github.com/acme/widgets', 'acme/widgets'],
+    ['https://user:tok@github.com/acme/widgets.git/', 'acme/widgets'],
+  ]) {
+    g('remote', 'remove', 'origin');
+    assert.equal(g('remote', 'add', 'origin', url).status, 0);
+    const home = tmp();
+    // any subdirectory of the repo gives the same origin
+    const rec = recordApproval(input(home, 'approve', [said(PLAN_REQ)], { cwd: join(repoDir, 'sub') }), { home, now: () => NOW });
+    assert.equal(rec.repo, want, url);
+    assert.equal(readPlanApprovals({ home, now: () => NOW })[0].repo, want);
+    assert.deepEqual(rec.plan, { pr: 58, blob: BLOB, scopeDigest: SCOPE }, 'the presented request is unchanged');
+  }
+  // no origin, a non-git folder and a missing folder: no repo, and never a throw
+  g('remote', 'remove', 'origin');
+  for (const cwd of [repoDir, tmp(), join(repoDir, 'does-not-exist')]) {
+    const home = tmp();
+    const rec = recordApproval(input(home, 'approve', [said(PLAN_REQ)], { cwd }), { home, now: () => NOW });
+    assert.ok(rec, cwd);
+    assert.equal(Object.hasOwn(rec, 'repo'), false, cwd);
+    assert.equal(readPlanApprovals({ home, now: () => NOW })[0].repo, null);
+  }
+});

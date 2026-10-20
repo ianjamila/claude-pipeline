@@ -73,11 +73,11 @@ function setup(t, { text = planText(), yml = pipelineYml() } = {}) {
   w.blob = () => repo.git(['rev-parse', `HEAD:${REL}`]).trim();
   w.recommit = (text, msg = 'edit plan') => { repo.write(REL, text); w.headOid = repo.commit(msg); w.sync(); };
   // The owner types "approve" after the request lines of the plan with this blob; the recorder writes the line at `at`.
-  w.approves = (blob, digest, { at = T0, pr = 7, session = 'sess-1' } = {}) => {
+  w.approves = (blob, digest, { at = T0, pr = 7, session = 'sess-1', cwd = home } = {}) => {
     const reply = `Plan ${blob} · scope ${digest}\n📋 Ready to approve plan #${pr} — say "approve"`;
     const tf = join(home, `t-${session}-${at}.jsonl`);
     writeFileSync(tf, [{ type: 'user', message: { content: 'go' } }, { type: 'assistant', message: { content: [{ type: 'text', text: reply }] } }, { type: 'user', message: { content: 'approve' } }].map((e) => JSON.stringify(e)).join('\n') + '\n');
-    const rec = recordApproval({ hook_event_name: 'UserPromptSubmit', session_id: session, cwd: home, prompt: 'approve', transcript_path: tf }, { home, now: () => at });
+    const rec = recordApproval({ hook_event_name: 'UserPromptSubmit', session_id: session, cwd, prompt: 'approve', transcript_path: tf }, { home, now: () => at });
     assert.ok(rec, 'the recorder wrote the owner record');
     return rec;
   };
@@ -421,4 +421,26 @@ test('record honours a configured plan.dir and refuses the default one then', as
   await assert.rejects(() => w.call(['record', '--pr', '7', '--file', REL]), /outside plan\.dir \(plans\/\)/);
   const r = await w.call(['record', '--pr', '7', '--file', 'plans/q.md']);
   assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+});
+
+// ---- approval replay across repos --------------------------------------------------------------------------------------------
+
+test('approve: the owner record of ANOTHER repo (same PR number, blob and scope) is no approval; the same repo works', async (t) => {
+  const w = setup(t);
+  await w.call(['record', '--pr', '7', '--file', REL]); w.absorb();
+  const clone = (origin) => {
+    const dir = mkdtempSync(join(tmpdir(), 'plan-origin-'));
+    for (const a of [['init', '-q'], ['remote', 'add', 'origin', origin]]) assert.equal(spawnSync('git', ['-C', dir, ...a]).status, 0);
+    return dir;
+  };
+  const rec = w.approves(w.blob(), w.digest(), { cwd: clone('git@github.com:other/place.git'), session: 'sess-foreign' });
+  assert.equal(rec.repo, 'other/place');
+  let r = await w.call(['approve', '--pr', '7']);
+  assert.deepEqual([r.exitCode, r.output.error], [1, 'no-approval']);
+  assert.equal(w.events().filter((e) => e.kind === 'plan-approved').length, 0, 'nothing posted');
+  // the owner's approval recorded in THIS repo (origin acme/widgets) is accepted, and the foreign record does not get in its way
+  w.approves(w.blob(), w.digest(), { cwd: clone('https://github.com/acme/widgets.git'), session: 'sess-mine', at: T0 + 1000 });
+  r = await w.call(['approve', '--pr', '7']);
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.equal(w.events().filter((e) => e.kind === 'plan-approved').length, 1);
 });

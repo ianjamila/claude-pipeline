@@ -23,6 +23,11 @@ export function activeProposal(events, bind) {
   return { status: 'ok', event: last, blob: last.data.blob, path: String(last.data.path ?? ''), scopeDigest: last.data.scopeDigest, n: props.length };
 }
 
+// Records of THIS repo: a record that names another repo is no evidence here (same PR number + byte-identical plan blob in a
+// different repo must not replay an approval). A record without `repo` (older, or recorded outside a repo) is kept: it matches on
+// pr + blob + scope digest alone (the documented residual). GitHub's case differences do not matter.
+export const recordsForRepo = (records, repo) => (records ?? []).filter((r) => r.repo == null || String(r.repo).toLowerCase() === String(repo).toLowerCase());
+
 const tsOf = (r) => { const n = Date.parse(r?.ts); return Number.isFinite(n) ? n : -Infinity; };
 // The owner's newest approval record for this PR (any blob): the only one an approval is verified against (a replayed
 // event for an older approved blob must not out-vote a newer "approve", F4).
@@ -63,7 +68,8 @@ function parsedBlob(readBlob, blob) {
   try { return { plan: parsePlan(text) }; } catch (err) { return { error: `the approved plan no longer parses (${err.message})` }; }
 }
 
-export function planScopeVerdict({ events, bind, recordPlan, localRecords, readBlob, files, required, ownerApproval }) {
+export function planScopeVerdict({ events, bind, recordPlan, localRecords: allRecords, readBlob, files, required, ownerApproval }) {
+  const localRecords = recordsForRepo(allRecords, bind.repo);
   const lost = (reason) => ({ status: 'lost', reason });
   let v;
   const ap = latestApproval(events, bind, localRecords);
@@ -120,7 +126,8 @@ export function startsValidity(events, { caps = { codex: 2, fable: 1 } } = {}) {
 // Open work is judged against the APPROVED blob's tasks, never against the record alone (Codex plan R1-5): when the
 // plan-approved event was posted but the checkpoint that copies tasks failed, the record has no tasks (or stale ones),
 // and every approved task that is not done in the record with the same specSha is open.
-export function planResumeFacts({ events, bind, recordPlan, localRecords, recordTasks, readBlob }) {
+export function planResumeFacts({ events, bind, recordPlan, localRecords: allRecords, recordTasks, readBlob }) {
+  const localRecords = recordsForRepo(allRecords, bind.repo);
   const active = activeProposal(events, bind);
   const ap = latestApproval(events, bind, localRecords);
   const evidence = active.status !== 'none' || ap.status !== 'none' || recordPlan != null || (localRecords ?? []).some((r) => r.pr === bind.pr);

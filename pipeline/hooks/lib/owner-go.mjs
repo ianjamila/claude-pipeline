@@ -11,11 +11,16 @@
 // reply right before it asked for: `Plan <blob40> · scope <digest12>` + `📋 Ready to approve plan #N — say "approve"`. Those lines
 // carry `kind: 'plan'`; merge readers never see them. `P plan approve` accepts one for 24 h after it was issued (that window is
 // checked there), but the record stays readable for 30 days so an interrupted run can repair from it.
+// A plan record also carries `repo` ("owner/name" from the hook cwd's `origin`) when it can be derived, so the same PR number and a
+// byte-identical plan blob in ANOTHER repo cannot reuse the approval (matching treats a differing repo as no match). RESIDUAL: a record
+// without `repo` (written before this field, or in a session that started outside a repo / without an origin) still matches on
+// pr + blob + scope digest alone.
 // Residual (owner ruling 2026-10-14, the "cheap step"): the agent runs as the same OS user, so a program the guards cannot
 // see into can still write the folder; the transcript the recorder reads is a file of that user; and the agent's GitHub
 // token is the owner's. A second GitHub identity + a ruleset is the server-side backstop (issue #65).
 import { createHash, randomBytes } from 'node:crypto';
 import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, writeSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -205,6 +210,22 @@ function realDirChain(home, rel) {
   return true;
 }
 
+// "owner/name" from the origin URL of the repo that holds `cwd` (any subdirectory or worktree gives the same one), or null. Never
+// throws and is time-boxed: a hook must not hang on git. Accepts https / ssh / scp-like URLs, with or without `.git`.
+export function repoFromCwd(cwd) {
+  try {
+    if (typeof cwd !== 'string' || cwd === '' || !path.isAbsolute(cwd)) return null;
+    const env = { ...process.env };
+    for (const k of Object.keys(env)) if (k.startsWith('GIT_')) delete env[k];
+    const r = spawnSync('git', ['-C', cwd, 'remote', 'get-url', 'origin'], { encoding: 'utf8', timeout: 2000, env, stdio: ['ignore', 'pipe', 'ignore'] });
+    if (r.status !== 0) return null;
+    const m = /([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/*$/.exec(r.stdout.trim());
+    return m ? `${m[1]}/${m[2]}` : null;
+  } catch {
+    return null;
+  }
+}
+
 // The recorder. Writes one line to <home>/.claude/pipeline-state/owner-go/<session>.jsonl for an owner prompt that approves;
 // returns the record, or null (not an approval, a subagent, no session, or the write failed). Never throws.
 export function recordApproval(input, { home = accountHome(), now = Date.now } = {}) {
@@ -236,7 +257,8 @@ export function recordApproval(input, { home = accountHome(), now = Date.now } =
       if (!shown) return null;
       if (pa.prs.length && !pa.prs.includes(shown.pr)) return null;
       if (pa.blobs.length && !pa.blobs.some((b) => shown.blob.startsWith(b))) return null;
-      record = { ...base, kind: 'plan', record_id: randomBytes(8).toString('hex'), prs: [], requests: [], plan: shown };
+      const repo = repoFromCwd(base.cwd);
+      record = { ...base, kind: 'plan', record_id: randomBytes(8).toString('hex'), ...(repo ? { repo } : {}), prs: [], requests: [], plan: shown };
     }
     return appendRecord(home, session, record) ? record : null;
   } catch {
@@ -327,7 +349,7 @@ export function readPlanApprovals({ home = accountHome(), session = null, now = 
     const p = r.kind === 'plan' ? r.plan : null;
     if (!Number.isInteger(p?.pr) || !/^[0-9a-f]{40}$/.test(String(p.blob)) || !/^[0-9a-f]{12}$/.test(String(p.scopeDigest))) continue;
     if (!/^[0-9a-f]{16}$/.test(String(r.record_id))) continue;
-    out.push({ ts: r.ts, session: r.session, recordId: r.record_id, promptSha256: r.prompt_sha256, pr: p.pr, blob: p.blob, scopeDigest: p.scopeDigest });
+    out.push({ ts: r.ts, session: r.session, recordId: r.record_id, promptSha256: r.prompt_sha256, repo: typeof r.repo === 'string' && r.repo !== '' ? r.repo : null, pr: p.pr, blob: p.blob, scopeDigest: p.scopeDigest });
   }
   return out;
 }
