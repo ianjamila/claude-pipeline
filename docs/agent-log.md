@@ -33,3 +33,6 @@ full record.
 - 2026-10-14 · #64 · feat(worktrees): macOS support (lsof process check, launchd schedule) + outside report skips non-project scratch · risk high · rounds 3 · arbiter 1 · awaiting-owner-merge
 - 2026-10-14 · #64 · feat(worktrees): macOS support (lsof process check, launchd schedule) + outside report skips non-project scratch · risk high · rounds 3 · arbiter 1 · merged — prod smoke pending
 - 2026-10-14 · #68 · fix(review): accept confidence "medium"; lsof gets a minimal env · risk high · rounds 1 · arbiter 0 · merged — prod smoke pending
+- 2026-10-14 · #69 · tools: keep the guard replay / probe / mutation tools (tools/guard-replay) · risk high · rounds 3 · arbiter 0 · stopped
+- 2026-10-14 · #66 · fix: reviews skip main's merged-in code; agent log off PR branches · risk high · rounds 4 · arbiter 1 · stopped
+- 2026-10-15 · #70 · fix(worktrees): config fallback for keep/unkeep/prune + record evidence moves before making them (#59) · risk high · rounds 2 · arbiter 0 · merged — prod smoke pending
