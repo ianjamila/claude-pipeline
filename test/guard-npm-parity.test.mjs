@@ -307,3 +307,35 @@ test('t2 (regression) an unmodelled command with a run-time argument is no known
   refused(`lsof -p $pid; printf '${PUSH} ${CL}' >> package.json; npm run build`, nm);
   refused(`printf '${PUSH.slice(0, 2)}' > $T; printf '${PUSH.slice(2)} ${CL.slice(0, 4)}' >> $T; printf '${CL.slice(4)}' >> $T; npm run build`, nm); // (a guarded word built in pieces: only the joined text holds it)
 });
+
+// Case: macOS (APFS) and Windows file systems ignore case, so `rm Package.json` removes the package.json the manager reads. Every watched name is compared without case, on every platform
+// (a different `Package.json` on Linux is over-refused: failing closed). Each shape has its twin that only reads the file.
+test('case: a marker or rc file written under another case is the same file (rm, mv, cp, ln, touch, redirect, glob)', () => {
+  const shapes = ['rm Package.json', 'rm -f PACKAGE.JSON', 'mv PACKAGE.JSON x', 'mv Package.json p.old', 'cp evil.json Package.json', 'cp evil.json ./PACKAGE.json', 'ln -sf evil.json Package.Json', 'rm -rf Package.j*', 'rm -rf PACK*.json',
+    'touch SERVER.JS', 'touch Binding.Gyp', 'cp rc .NPMRC', 'rm .NpmRc', 'mv .YARNRC.YML x', 'rm Bunfig.toml', 'rm .Bunfig.toml', 'rm PNPM-Workspace.yaml', 'rm .YARNRC'];
+  for (const lit of shapes) {
+    refused(`${lit} && npm test`);
+    refused(`${lit}; npm run lint`);
+  }
+  // a path below a directory written in another case, and a parent's package.json removed by an absolute path in another case
+  assert.equal(git('rm /Work/Repo/package.json && npm test', tree()).decision, 'deny', 'git: the directory in another case');
+  assert.equal(git('rm /WORK/repo/PACKAGE.JSON && npm test', tree()).decision, 'deny', 'git: directory and name in another case');
+  assert.equal(filesGuard('rm /Home/U/Proj/package.json && npm test', tree()).decision, 'deny', 'files: the directory in another case');
+  assert.equal(filesGuard('rm /HOME/u/proj/PACKAGE.JSON && npm test', tree()).decision, 'deny', 'files: directory and name in another case');
+  assert.equal(git('rm /Work/Other/package.json && npm test', tree()).decision, 'allow', 'git: another directory');
+  assert.equal(filesGuard('rm /Home/U/Other/package.json && npm test', tree()).decision, 'allow', 'files: another directory');
+  for (const w of ["echo x > .NPMRC", "printf 'script-shell=/e/sh' > .NpmRc", "echo '{}' > Package.json", "echo '{}' > PACKAGE.JSON", "echo x >> .NPMRC", "printf x | tee Package.json"]) {
+    refused(`${w} && npm test`);
+    refused(`${w}; npm run lint`);
+  }
+  refused('echo x > .Yarnrc.yml && yarn test'); // (the rc file of the manager that reads it)
+  refused('echo x > .YARNRC.YML; yarn run lint');
+  // the guarded script of a package.json that was replaced under another name is what runs
+  refusedBadScript('cp evil.json Package.json && npm test');
+  refusedBadScript("echo '{}' > PACKAGE.JSON && npm test");
+  // twins: reading the same files (any case), or writing files that are no marker, stays allowed
+  for (const ok of ['cat Package.json', 'cat PACKAGE.JSON | head', 'grep name Package.json', 'ls .NPMRC', 'cp Package.json p.bak', 'cp .NPMRC rc.bak', 'echo x > notes.txt', 'echo x > Notes.TXT', 'touch Server.mjs', 'rm Readme.md', 'mv Package.json.bak Old.bak']) {
+    allowed(`${ok} && npm test`);
+    allowed(`${ok}; npm run lint`);
+  }
+});

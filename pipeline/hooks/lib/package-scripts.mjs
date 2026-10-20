@@ -434,11 +434,13 @@ function markerPaths(words, site) {
   return out;
 }
 // which of the marker files does the glob-or-literal path component `first` name?
+// (compared without case, on every platform: macOS and Windows file systems ignore it, so `rm Package.json` removes the file the manager reads; on Linux that over-refuses a different `Package.json`, which fails closed)
 function componentIsMarker(first) {
-  if (PACKAGE_MARKERS.has(first)) return [first];
+  const low = first.toLowerCase();
+  if (PACKAGE_MARKERS.has(low)) return [low];
   if (!/[*?[]/.test(first)) return [];
   let rx;
-  try { rx = new RegExp('^' + first.replace(/[.+^$(){}|\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$'); } catch { return [...PACKAGE_MARKERS]; }
+  try { rx = new RegExp('^' + low.replace(/[.+^$(){}|\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$', 'i'); } catch { return [...PACKAGE_MARKERS]; }
   return [...PACKAGE_MARKERS].filter((m) => rx.test(m));
 }
 
@@ -453,7 +455,7 @@ export function markPackageState(budget, argvs, site = {}) {
       const known = mp.filter((x) => x !== null && !x.startsWith(UNKNOWN_HEAD));
       if (known.length) (budget.pkgMarkers ??= []).push({ paths: known, gone: mp.gone });
       if (maybe.length) (budget.pkgMarkersMaybe ??= []).push(maybe);
-      if (mp.some((x) => x === null || x.split('/').includes('node_modules'))) budget.pkgBinsDirty = true; // (a bin may come or go)
+      if (mp.some((x) => x === null || x.toLowerCase().split('/').includes('node_modules'))) budget.pkgBinsDirty = true; // (a bin may come or go)
     }
     if (pmCall(a)?.installGroup) budget.pkgBinsDirty = true; // (an install adds and replaces node_modules/.bin)
   }
@@ -480,16 +482,19 @@ export function pkgMarkersFor(budget, starts, env = {}) {
   const p = drivePosix;
   const forms = (x) => { const r = env.real ? env.real(x) : x; return (r && r !== x ? [x, r] : [x]).map(toPosix); };
   const exists = (x) => env.pathExists?.(x) === true;
+  const fold = (x) => x.toLowerCase();
   for (const { paths, gone } of known) {
     for (const o of paths) {
       for (const s of starts) {
         for (const so of forms(s)) {
           for (let a = so, n = 0; n < MAX_WALK; n++) {
             const at = a.endsWith('/') ? a : `${a}/`;
+            const fa = fold(a), fat = fold(at); // (paths are compared without case too: see componentIsMarker)
             for (const oo of forms(o)) {
-              if (oo === a) return 'known';
-              if (oo.startsWith(at)) {
-                const rest = oo.slice(at.length);
+              const fo = fold(oo);
+              if (fo === fa) return 'known';
+              if (fo.startsWith(fat)) {
+                const rest = fo.slice(fat.length);
                 const first = rest.split('/')[0];
                 const hits = componentIsMarker(first);
                 // (a node_modules directory only matters when it goes, and where there is no package.json next to it to be found first: it stops the search there)
@@ -509,8 +514,8 @@ export function pkgMarkersFor(budget, starts, env = {}) {
       if (o === null) return 'maybe';
       // somewhere under a directory only known at run time: a marker (or glob) among the literal components, or a name that is one of the package directory's own ancestors, may be it
       const comps = o.slice(UNKNOWN_HEAD.length).split('/');
-      const names = new Set(starts.flatMap((x) => forms(x)).flatMap((x) => x.split('/')).filter(Boolean));
-      if (comps.some((c) => componentIsMarker(c).length || names.has(c))) return 'maybe';
+      const names = new Set(starts.flatMap((x) => forms(x)).flatMap((x) => x.split('/')).filter(Boolean).map(fold));
+      if (comps.some((c) => componentIsMarker(c).length || names.has(fold(c)))) return 'maybe';
     }
   }
   return null;

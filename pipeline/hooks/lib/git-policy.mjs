@@ -1275,8 +1275,8 @@ const pkgEnv = (ctx, cwd) => ({
 // existing run.sh of `node -e '...' && bash run.sh` is not either): only the writes themselves count.
 // A write that may reach the file but is certain to hold nothing the guard minds (a copy from a source that does not exist) is none; one whose text or source mentions a guarded operation is refused as a known write.
 function pkgFileWritten(ctx, abs) {
-  if (writtenTo(ctx.writeFrames, abs, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: true })?.named) return 'known';
-  const w = writtenTo(ctx.writeFrames, abs, { exists: (x) => x === abs || ctx.pathExists(x), readText: ctx.readText, ignoreUnmodelled: ctx.ignoreUnmodelled === true, genericAsUnknown: true });
+  if (writtenTo(ctx.writeFrames, abs, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: true, foldCase: true })?.named) return 'known';
+  const w = writtenTo(ctx.writeFrames, abs, { exists: (x) => x === abs || ctx.pathExists(x), readText: ctx.readText, ignoreUnmodelled: ctx.ignoreUnmodelled === true, genericAsUnknown: true, foldCase: true });
   if (!w) return null;
   const now = ctx.readText(abs); // (what the file holds now is no write: a target only known at run time leaves it as it is, and its own words are not the line's, whether it stands alone or in front of an append)
   const added = (t) => (typeof now === 'string' && now !== '' ? t.split(now).join('') : t);

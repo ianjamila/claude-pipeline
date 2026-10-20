@@ -1714,7 +1714,16 @@ export function joinedReadings(parts, cap = 32) {
   return acc;
 }
 
-export function writtenTo(frames, target, { exists, readText = () => null, ignoreUnmodelled = false, genericAsUnknown = false }) {
+// The same frames compared without case (what the caches hold is case-dependent, so the copy starts without them).
+function caseFolded(f) {
+  return { ...f, ci: true, resolved: undefined, ancestors: undefined, relMemo: undefined, targets: undefined, canonCache: undefined };
+}
+// foldCase: compare names without case whatever the platform says (the files a package manager reads: macOS and Windows file systems ignore case, and over-refusing on Linux fails closed)
+export function writtenTo(frames, target, { exists, readText = () => null, ignoreUnmodelled = false, genericAsUnknown = false, foldCase = false }) {
+  if (foldCase && frames.some((f) => !f.ci)) {
+    const copies = frames.map((f) => (f.ci ? f : caseFolded(f)));
+    try { return writtenTo(copies, target, { exists, readText, ignoreUnmodelled, genericAsUnknown }); } finally { copies.forEach((c, i) => { if (c.unresolved && !frames[i].unresolved) frames[i].unresolved = true; }); }
+  }
   if (!frames.length || !frames.some((f) => f.recs.length || f.unmodelled.size)) return null;
   const st = { texts: new Set(), files: new Set(), scans: new Set(), programs: new Set(), authored: false, unknown: false, any: false, seen: new Set(), ignoreUnmodelled, genericAsUnknown, viaUnmodelled: false };
   const upto = frames.length - 1;
