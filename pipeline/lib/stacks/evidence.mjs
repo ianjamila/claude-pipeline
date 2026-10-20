@@ -690,15 +690,20 @@ export function consumerWorktrees(stack, {
     for (const cwd of t.cwds) {
       if (stack?.workdir && isInside(cwd, stack.workdir, platform)) continue;
       const home = known.filter((w) => isInside(cwd, w.path, platform)).sort((a, b) => b.path.length - a.path.length)[0];
-      // a cwd in no known worktree is only a guess at where the session worked: an ancestor of the stack folder (a session started
-      // in `/` or the home directory) or a too-broad directory would put every process on the machine "inside" the stack
+      // a cwd in no known worktree is only a guess at where the session worked, so it is not a consumer: a shell in some other
+      // directory (an ancestor of the stack folder, `/`, the home directory, a notes folder) would keep the stack alive for nothing.
+      // The too-broad / ancestor notes say why the common cases were dropped; any other outside cwd gets the generic note.
       const broad = home ? null : tooBroadDir(cwd, { home: homeDir, platform });
       const ancestor = !home && stack?.workdir && !samePath(cwd, stack.workdir, platform) && isInside(stack.workdir, cwd, platform);
       if (broad || ancestor) {
         notes.push(`transcript cwd ${JSON.stringify(cwd)} dropped as a consumer: ${broad ?? 'it is an ancestor of the stack folder'}`);
         continue;
       }
-      add(home ? home.path : cwd, 'transcript', home?.branch ?? null);
+      if (!home) {
+        notes.push(`transcript cwd ${JSON.stringify(cwd)} dropped as a consumer: it is in no known worktree of a configured repo`);
+        continue;
+      }
+      add(home.path, 'transcript', home.branch ?? null);
     }
   }
   // (b) .env* at the root of every worktree of a configured repo

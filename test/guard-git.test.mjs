@@ -1223,10 +1223,10 @@ test('the installed matchers cover Monitor and MCP tools for guard-git', async (
 
 // ---- time budget (review finding 12) ----------------------------------------------------------------------
 
-test('an oversized command line is not parsed: denied when it mentions a guarded word (quotes stripped), allowed otherwise', () => {
+test('an oversized command line is not parsed: denied whatever it says (#84)', () => {
   const spam = '{a,b}'.repeat(60_000); // 300 KB
   const { ms } = cpuTimed(() => {
-    assert.equal(evaluate(`echo ${spam}`).decision, 'allow');
+    assert.equal(evaluate(`echo ${spam}`).decision, 'deny');
     assert.equal(evaluate(`echo ${spam}; git push origin main`).decision, 'deny');
     assert.equal(evaluate(`echo ${spam}; g''it pu"sh" origin main`).decision, 'deny');
     assert.equal(evaluate(`echo ${spam}; gh pr edit 1 --add-label human-""approved`).decision, 'deny');
@@ -1489,7 +1489,7 @@ test('script content is judged with the same rules, including truncation and siz
   assert.equal(evaluate('bash t.sh', withFiles({ 't.sh': huge })).decision, 'deny');
   const big = `# ${'x'.repeat(250_000)}\ngit push origin main`;
   assert.equal(evaluate('bash t.sh', withFiles({ 't.sh': big })).decision, 'deny');
-  assert.equal(evaluate('bash t.sh', withFiles({ 't.sh': `# ${'x'.repeat(250_000)}\nls` })).decision, 'allow');
+  assert.equal(evaluate('bash t.sh', withFiles({ 't.sh': `# ${'x'.repeat(250_000)}\nls` })).decision, 'deny', 'a script over the 200,000-character cap is refused whatever it runs (#84)');
   assert.equal(evaluate('bash a.sh', withFiles({ 'a.sh': 'bash a.sh' })).decision, 'deny', 'a script that runs itself is cut off by the nesting limit, fail closed');
 });
 

@@ -489,7 +489,7 @@ test('CLI: the slot stays held until the whole verify process tree has exited (c
   const work = tmp();
   const marker = (n) => path.join(work, n);
   const repo = createTmpRepo();
-  const full = `${[process.execPath, STUBBORN, marker('started'), marker('term'), marker('done')].map(q).join(' ')} && true`; // the shell stays the parent
+  const full = `${[process.execPath, STUBBORN, marker('started'), marker('term'), marker('done'), marker('release')].map(q).join(' ')} && true`; // the shell stays the parent
   repo.write('.claude/pipeline.yml', `version: 1\nproject: demo\nverify:\n  full: ${JSON.stringify(full)}\n  quick: node scripts/verify.mjs --quick\n  max_parallel_full: 1\n`);
   repo.commit('config');
   const lockDir = tmp();
@@ -501,11 +501,13 @@ test('CLI: the slot stays held until the whole verify process tree has exited (c
     await until(() => existsSync(marker('term')), 'the signal to reach the verify');
     assert.equal(existsSync(marker('done')), false);
     assert.equal(statusOf(lockDir).holders.length, 1, 'the verify is still running, so the slot is still held');
+    writeFileSync(marker('release'), '');
     const r = await a.done;
     assert.equal(existsSync(marker('done')), true, 'the wrapper waited for the verify to finish');
     assert.equal(r.code, 128 + os.constants.signals.SIGTERM, "the shell's exit status is the wrapper's");
     assert.deepEqual(statusOf(lockDir).holders, []);
   } finally {
+    writeFileSync(marker('release'), ''); // a failed assertion must not leave the helper running for 60 s
     repo.cleanup();
   }
 });

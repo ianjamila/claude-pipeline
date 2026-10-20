@@ -499,14 +499,58 @@ const INTERP_VALUE_FLAGS = new Set(['-r', '--require', '--import', '--loader', '
 // Why: a command whose OPTIONS can make it run code (a shell's `-c` / `-s`, `source`, an interpreter, find -exec, sed -e / w, awk, make) and that has a word with a default / alternative
 // (`bash ${A:--c ./ev.sh}`): the word may be an option when A is unset, so the policies judge the line again with each reading (see spliceLines).
 const SPLICE_HEADS = new Set(['source', '.', 'eval', 'find', 'awk', 'gawk', 'mawk', 'sed', 'gsed', 'make', 'gmake']);
-const DEFAULTED_WORD = /\$\{!?(?:[A-Za-z_]\w*(?:\[[^\]}]*\])?|\d+|[@*#?$!-]):?[-=+]/;
+// Why: the word holds `${NAME:-w}` / `${NAME-w}` / `${NAME=w}` / `${NAME+w}` (NAME: a name with an optional subscript, a number or a special parameter, optionally indirect). It was the pattern
+// /\$\{!?(?:[A-Za-z_]\w*(?:\[[^\]}]*\])?|\d+|[@*#?$!-]):?[-=+]/ tested anywhere in the word; its subscript (`[^\]}]*`, unbounded: a longer one must still match, or the word is let through) was read up to the
+// first `]` or `}` from every `${a[`, so a 200 kB word of `${a[` took ~5 s of CPU per call (the files guard 5.2 s, at its deadline; a hook past the host's 15 s is ALLOWED). Here the next closer is looked up once and
+// reused (the starts only move forward), so the word is read once; the answer is exactly the pattern's (test/guard-t8b.test.mjs checks it against the pattern).
+const isWordChar = (c) => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95;
+export function isDefaultedWord(w) {
+  const n = w.length;
+  let from = 0; // the next `]` or `}` at or after `closeAt`'s search start is `closeAt` (n: none); valid for any start in [from, closeAt]
+  let closeAt = -1;
+  const nextCloser = (start) => {
+    if (closeAt >= start && from <= start) return closeAt;
+    let k = start;
+    while (k < n && w[k] !== ']' && w[k] !== '}') k++;
+    from = start;
+    closeAt = k;
+    return k;
+  };
+  const operator = (k) => { // `:?[-=+]` at k
+    if (w[k] === ':') k++;
+    return w[k] === '-' || w[k] === '=' || w[k] === '+';
+  };
+  const parameter = (k) => { // a name (with its subscript), digits or one special character at k, then the operator
+    const c = w.charCodeAt(k);
+    if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95) {
+      let e = k + 1;
+      while (e < n && isWordChar(w.charCodeAt(e))) e++;
+      if (w[e] === '[') {
+        const close = nextCloser(e + 1);
+        return close < n && w[close] === ']' && operator(close + 1);
+      }
+      return operator(e);
+    }
+    if (c >= 48 && c <= 57) {
+      let e = k + 1;
+      while (e < n && w.charCodeAt(e) >= 48 && w.charCodeAt(e) <= 57) e++;
+      return operator(e);
+    }
+    return k < n && '@*#?$!-'.includes(w[k]) && operator(k + 1);
+  };
+  for (let i = w.indexOf('${'); i >= 0; i = w.indexOf('${', i + 1)) {
+    if (w[i + 2] === '!' && parameter(i + 3)) return true;
+    if (parameter(i + 2)) return true;
+  }
+  return false;
+}
 export function splicesOptions(argv) {
   if (!argv?.length) return false;
   const name = base(argv[0]);
-  return (SHELLS.has(name) || INTERPRETER.test(name) || SPLICE_HEADS.has(name)) && argv.slice(1).some((w) => DEFAULTED_WORD.test(w));
+  return (SHELLS.has(name) || INTERPRETER.test(name) || SPLICE_HEADS.has(name)) && argv.slice(1).some(isDefaultedWord);
 }
 // the command's own text; a record without one is rebuilt from its words (a word with an expansion stays bare so it splits)
-export const spliceText = (c) => (typeof c.raw === 'string' && c.raw ? c.raw : c.argv.map((w) => (DEFAULTED_WORD.test(w) || /^[\w@%+=:,./-]+$/.test(w) ? w : `"${w.replace(/[\\"`$]/g, '\\$&')}"`)).join(' '));
+export const spliceText = (c) => (typeof c.raw === 'string' && c.raw ? c.raw : c.argv.map((w) => (isDefaultedWord(w) || /^[\w@%+=:,./-]+$/.test(w) ? w : `"${w.replace(/[\\"`$]/g, '\\$&')}"`)).join(' '));
 
 // The file a command will read and run: `bash f`, `source f`, `. f`, `node f.mjs`, `python f.py`, `./f`.
 // {kind:'shell'} is run as a shell script (the caller judges its commands), {kind:'interp'} is program text in

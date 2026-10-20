@@ -50,3 +50,18 @@ test('CI job names are exactly the required checks', async () => {
   const shells = [...ci.matchAll(/^\s*shell:\s*(\S+)/gm)].map((m) => m[1]);
   assert.deepEqual(shells, ['bash'], 'one workflow-wide default, bash, and no step overrides it');
 });
+
+// ci-proof.mjs accepts a run only when its referenced_workflows names the PR merge commit, and GitHub fills that only
+// for a run that references a reusable workflow: without the anchor every proof is "missing" (the Mac runs the suite).
+test('the CI proof for tests names a real job of ci.yml, and ci.yml keeps the never-running proof anchor', async () => {
+  const cfg = await selfConfig();
+  assert.deepEqual(cfg.verify.deferrable_steps, ['tests']);
+  assert.deepEqual(cfg.verify.ci_proof.tests, { workflow: '.github/workflows/ci.yml', job: 'test (ubuntu)', event: 'pull_request' });
+  assert.ok(cfg.ci.required_checks.includes(cfg.verify.ci_proof.tests.job), 'the proof job is a required check');
+  const ci = read('.github/workflows/ci.yml');
+  const anchor = /^ {2}proof-anchor:\n((?: {4}.*\n)+)/m.exec(ci);
+  assert.ok(anchor, 'ci.yml has a proof-anchor job');
+  assert.match(anchor[1], /^ {4}if: \$\{\{ false \}\}$/m, 'the anchor never runs');
+  assert.match(anchor[1], /^ {4}uses: \.\/\.github\/workflows\/proof-anchor\.yml$/m);
+  assert.match(read('.github/workflows/proof-anchor.yml'), /^on:\n {2}workflow_call:\n/m, 'the anchor is callable only');
+});

@@ -246,7 +246,7 @@ const cpu = () => { const u = process.cpuUsage(); return (u.user + u.system) / 1
 test('three nested scripts that each assign four names twice and loop over eight words are refused at once, not at the deadline', () => {
   const t0 = cpu();
   const w0 = Date.now();
-  const r = files('bash F1.sh', fakeFs(PROJ, chain(true, 3, 'w1 w2 w3 w4 w5 w6 w7 w8')));
+  const r = files('bash F1.sh', fakeFs(PROJ, chain(true, 3, 'w1 w2 w3 w4 w5 w6 w7 w8')), { now: cpu }); // (the guard's 5 s deadline in CPU time too: at load 100+ the clock deadline fired first and the reason was not the reading cap)
   assert.equal(r.decision, 'deny');
   assert.match(r.reason, /too many readings/, r.reason);
   const ms = cpu() - t0;
@@ -263,11 +263,15 @@ test('a chain with a few readings is still allowed', () => {
 test('loop words alone (names assigned once) also share the allowance across nested scripts', () => {
   const words = Array.from({ length: 20 }, (_, i) => `w${i + 1}`).join(' '); // (20 + 20^2 + 20^3 readings)
   const t0 = cpu();
-  const r = files('bash F1.sh', fakeFs(PROJ, chain(false, 3, words)));
+  const w0 = Date.now();
+  const r = files('bash F1.sh', fakeFs(PROJ, chain(false, 3, words)), { now: cpu }); // (deadline in CPU time, as above)
   assert.equal(r.decision, 'deny');
   assert.match(r.reason, /too many readings/, r.reason);
   const ms = cpu() - t0;
-  assert.ok(ms < 3000, `took ${Math.round(ms)} ms of CPU`);
+  const wall = Date.now() - w0;
+  // Either clock under 3 s proves the refusal came long before the 5 s deadline: CPU time is inflated on a CI runner whose cores
+  // are shared with parallel test files (GC threads, contention), the clock on a merely busy machine.
+  assert.ok(ms < 3000 || wall < 3000, `took ${Math.round(ms)} ms of CPU and ${wall} ms of clock`);
 });
 
 test('program text in quotes (node -e, awk, sed) is no assignment: += and a[i]= in it change nothing', () => {

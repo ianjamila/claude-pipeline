@@ -594,10 +594,10 @@ test('installer text rule: npm run denies when package.json cannot be read or pa
 
 // ---- 8b. time budget (review finding 12) ---------------------------------------------------------------
 
-test('size cap: an oversized command line is not scanned; it is denied only when it mentions a sensitive word', () => {
+test('size cap: an oversized command line is not scanned; it is denied whatever it says (#84)', () => {
   const spam = '{a,b}'.repeat(60_000);
   const { ms } = cpuTimed(() => {
-    assert.equal(bash(`echo ${spam}`).decision, 'allow');
+    assert.equal(bash(`echo ${spam}`).decision, 'deny');
     assert.equal(bash(`echo ${spam}; echo x > ~/.cl""aude/settings.json`).decision, 'deny');
     assert.equal(bash(`echo ${spam}; node ins""tall.mjs`).decision, 'deny');
     assert.equal(bash(`echo ${spam}; export PIPELINE_""ADMIN=1`).decision, 'deny');

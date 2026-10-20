@@ -79,6 +79,14 @@ jobs:
         if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
         run: ./.github/scripts/installer-round-trip.sh "$RUNNER_TEMP/claude home 24"
 
+  # Never runs (if: false). Referencing a reusable workflow is what makes GitHub record the commit this run tested
+  # (referenced_workflows: refs/pull/<N>/merge + sha), which the final gate's CI proof for `tests` requires
+  # (.claude/pipeline.yml verify.ci_proof, pipeline/lib/ci-proof.mjs). Remove it and every proof is "missing".
+  proof-anchor:
+    if: ${{ false }}
+    permissions: {}
+    uses: ./.github/workflows/proof-anchor.yml
+
   test-windows:
     name: test (windows)
     runs-on: windows-latest

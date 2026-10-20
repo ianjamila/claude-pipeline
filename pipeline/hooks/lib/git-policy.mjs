@@ -2729,9 +2729,11 @@ function evalString(str, startDir, ctx, level, child = false) {
   }
 }
 
-// Text too long to parse inside the time budget is judged by what it mentions once quotes and escapes are removed.
+// Why (#84): text too long to parse inside the time budget is refused whatever it says. Judging it by the guarded words it
+// names let a padded `bash run.sh` (run.sh holds the push) through, and the file may be one the line only names by a variable.
+// No real use is lost: no Bash command in 30 days of transcripts (70,887) was over 100 kB.
 function judgeLongText(text) {
-  return GUARDED_WORDS.test(text.replace(/['"`\\]/g, '')) ? deny('this text is too long to verify and mentions a guarded operation. Split it into simpler commands.') : allowed();
+  return deny(`this text is too long to verify (${text.length} characters; the limit is ${MAX_LINE_CHARS}). Split it into simpler commands, or write long text to a file with the Write tool.`);
 }
 
 // Why: "${BASH:-bash}" is rewritten to bash while no text judged so far can bind BASH (see simpleCommands); a text that binds it and is judged after a rewrite makes the verdict stale, so the whole
