@@ -123,8 +123,10 @@ book tokens / USD / retries of one agent call in the run record (shown by `P sum
 
 ```
 pipeline cost --pr N --phase build|verify|pr|review|gate|merge|... --role implementer|judge|arbiter|verifier|controller|other
-              [--input N] [--output N] [--cache-read N] [--cache-write N] [--usd X | --model M] [--from-transcript FILE] [--retry] [--session ID]... [--repo DIR]
+              [--input N] [--output N] [--cache-read N] [--cache-write N] [--usd X | --model M] [--from-transcript FILE] [--retry] [--session ID]... [--execution KEY] [--repo DIR]
   -> {ok, recorded, cost, warnings}; exit 2 usage (a negative or non-numeric amount), 3 GitHub unavailable
+  --execution KEY (agent:ID | codex:ID | ctl:ID | plan:ID): book this spend ONCE under KEY; booking the same KEY again replaces its entry (never double-counts),
+  and the write is read back (up to 3 attempts): exit 1 {error: "not-persisted", key} when it never showed up, exit 1 {error: "cost-entries-full"} at 200 keys.
   An unknown --role is booked as `other`, an unknown --phase as `other`. --from-transcript FILE: sum the message.usage of a Claude transcript (JSONL, at most 50 MB);
   explicit --input/--output/--cache-* then add to it. --retry alone (no amounts) only counts a retry.
   USD: --usd X as given; otherwise list price (opus / sonnet / haiku / fable) of each transcript message's own model (--model M prices the messages
@@ -298,6 +300,24 @@ The real ntfy publish tolerates slow networks: it raises Node's per-address conn
 One push per event: a ledger under `~/.claude/pipeline-state/` (`notify-ledger.jsonl`) makes a replay of the same event a no-op (`reason: duplicate`). Identity is repo, PR, event, head, outcome, open needs-human ids and `--cause`, never the action text. The whole call is capped at 15 s.
 
 Exit: `--test` 0 when ntfy accepted the push, 1 when it did not · `--event` 0 whether or not a push went out (read `sent` / `reason`) · 2 usage.
+
+## plan
+
+the plan stage: record the committed plan, record the owner's "approve", rate the plan's risk.
+
+```
+pipeline plan record --pr N --file PATH [--request-file F] [--repo DIR]
+  -> {ok, blob, scopeDigest, path, scope, tasks:[{id,title,specSha}], requestLines, event:{id, reused}, warnings}; posts one plan-proposed event (none when this blob is already the active proposal) and checkpoints step plan
+  -> exit 1 {error: dirty | unpushed | plan-invalid} (the file must be committed and pushed, and parse as a plan that lists itself in its Scope), 3 GitHub unavailable
+  -> show the owner requestLines VERBATIM (the first line, then the 📋 line) together with the plan's plain-English section and Scope list; the owner types "approve"
+pipeline plan approve --pr N [--repo DIR]
+  -> {ok, blob, scopeDigest, event:{id, reused}, stepChanged, repaired, warnings}; needs the owner's "approve" recorded by the owner-go hook for the active plan (24 h; an approval event already on the PR is repaired for 30 days); posts one plan-approved event, copies the approved tasks into the run record and moves a plan-stage (or stopped/blocked with open tasks) run to build
+  -> exit 1 {error: no-proposal | no-approval | superseded | scope-mismatch | lost | record-unreadable}, 3 GitHub unavailable
+pipeline plan risk --pr N [--repo DIR]
+  -> {ok, level: low|medium|high, reasons, blob}; high when the plan's Scope can touch a high-risk, hard-stop or security path or a task names a risky area; medium for more than 3 tasks or more than risk.medium_files scope entries
+```
+
+Exit: `record`: 0 recorded · 1 refused (dirty, unpushed, plan-invalid) · `approve`: 0 recorded (or repaired) · 1 refused (no-proposal, no-approval, superseded, scope-mismatch, lost, record-unreadable) · 3 GitHub unavailable, or the approval is on the PR but the run record was not updated (run it again) · `risk`: 0 a level · 1 no usable plan · 2 usage / config / git. The Plan events are pointers: scope and tasks are always re-read from the approved git blob, and an approval counts only with the owner-go record the hook wrote for the owner's typed "approve".
 
 ## preflight
 

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DEFAULTS } from '../pipeline/lib/config.mjs';
-import { assessRisk, isLightLane } from '../pipeline/lib/risk.mjs';
+import { assessRisk, isLightLane, scopeMayHitGlob, securityGlobs } from '../pipeline/lib/risk.mjs';
 
 const config = (risk = {}) => {
   const c = structuredClone(DEFAULTS);
@@ -155,4 +155,33 @@ test('a hard-stop hit keeps a many-file change high (the file-count rule never d
   assert.equal(r.reasons[0], 'hard-stop: R4-pipeline');
   assert.match(r.reasons.join('|'), /11 files > 10/);
   assert.equal(isLightLane({ level: r.level, changedLines: r.changedLines, hits: [hit()], config: config() }), false);
+});
+
+// ---- scopeMayHitGlob / securityGlobs (ship redesign T4) -----------------------------------------------------------
+test('scopeMayHitGlob: literal entries match exactly, globs by compatible prefix and tail', () => {
+  const sec = securityGlobs({ review: { security: { paths: [] } } });
+  const hits = (entry, globs = sec) => globs.some((g) => scopeMayHitGlob(entry, g));
+  assert.equal(hits('docs/a.md'), false);
+  assert.equal(hits('supabase/migrations/x.sql'), true);
+  assert.equal(scopeMayHitGlob('src/**', '**/*.sql'), true);
+  assert.equal(scopeMayHitGlob('docs/**/*.md', '**/*.sql'), false);
+  assert.equal(scopeMayHitGlob('**', 'anything/at/all.txt'), true);
+  assert.equal(scopeMayHitGlob('db/*.SQL', '**/*.sql'), true);
+  // normalisation: ./ and / dropped, trailing / is a directory, backslashes are slashes
+  assert.equal(scopeMayHitGlob('./supabase/x.txt', 'supabase/**'), true);
+  assert.equal(scopeMayHitGlob('db/', '**/migrations/**'), true);
+  assert.equal(scopeMayHitGlob('db\\a.md', 'db/**'), true);
+  // braces expand; nested braces stay conservative
+  assert.equal(scopeMayHitGlob('src/{a,b}.sql', '**/*.sql'), true);
+  assert.equal(scopeMayHitGlob('src/{a,b}.md', '**/*.sql'), false);
+  assert.equal(scopeMayHitGlob('src/{a,{b,c}}.md', 'src/x.sql'), true);
+  // different directories never overlap
+  assert.equal(scopeMayHitGlob('docs/**', 'supabase/**'), false);
+  assert.equal(scopeMayHitGlob('docs/a.md', 'DOCS/**'), true);
+});
+
+test('securityGlobs: sql, migrations and supabase always; configured paths unless review.security is off', () => {
+  assert.deepEqual(securityGlobs({ review: { security: { paths: ['auth/**'] } } }), ['**/*.sql', '**/migrations/**', 'supabase/**', 'auth/**']);
+  assert.deepEqual(securityGlobs({ review: { security: 'off' } }), ['**/*.sql', '**/migrations/**', 'supabase/**']);
+  assert.deepEqual(securityGlobs({}), ['**/*.sql', '**/migrations/**', 'supabase/**']);
 });

@@ -27,7 +27,7 @@ function normalizePath(p) {
 
 // Same, for globs, plus: a leading `/` is dropped (everything is repo-relative) and a trailing `/`
 // names a directory, so `lib/payroll/` becomes `lib/payroll/**`.
-function normalizeGlob(g) {
+export function normalizeGlob(g) {
   if (typeof g !== 'string') throw new TypeError(`glob must be a string, got ${typeof g}`);
   let s = g.replaceAll('\\', '/');
   while (s.startsWith('./') || s.startsWith('/')) s = s.slice(s.startsWith('/') ? 1 : 2);

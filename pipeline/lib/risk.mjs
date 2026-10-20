@@ -6,7 +6,7 @@
 // Bad inputs throw TypeError: a `hits` that is not an array (a forgotten await gives a Promise) or a threshold that is
 // not a finite number (a string compares wrongly, NaN never trips) must never quietly downgrade a PR to "low".
 import { diffStats } from './diff.mjs';
-import { matchAny } from './glob.mjs';
+import { matchAny, normalizeGlob } from './glob.mjs';
 import { DEFAULTS } from './config.mjs';
 
 const LEVELS = ['low', 'medium', 'high'];
@@ -84,4 +84,55 @@ export function isLightLane({ level, changedLines, hits, config }) {
   if (!Array.isArray(hits)) throw new TypeError('isLightLane: hits must be an array');
   const cap = number('review', 'light_lane_max_lines', config?.review?.light_lane_max_lines, DEFAULTS.review.light_lane_max_lines);
   return level === 'low' && hits.length === 0 && changedLines < cap;
+}
+
+// ---- plan scope vs risk globs (ship redesign: `P plan risk`, security trigger) ---------------------------------------------
+// Globs that make a change security-relevant on their own: SQL, migrations and supabase/ always, plus the configured paths
+// unless review.security is 'off' (which only drops the configured ones).
+export function securityGlobs(config) {
+  const sec = config?.review?.security;
+  const extra = sec === 'off' ? [] : (Array.isArray(sec?.paths) ? sec.paths : DEFAULTS.review.security.paths);
+  return ['**/*.sql', '**/migrations/**', 'supabase/**', ...extra];
+}
+
+const MAX_BRACE_ALTERNATIVES = 32;
+const WILD = /[*?[]/;
+
+// One level of brace alternatives, expanded. Nested braces, an unclosed group or more than 32 alternatives become a
+// wildcard tail instead (head + `**`): conservative, it can only widen what the entry is taken to match.
+function expandOnce(g) {
+  const open = g.indexOf('{');
+  if (open < 0) return [g];
+  const close = g.indexOf('}', open);
+  const body = close < 0 ? null : g.slice(open + 1, close);
+  if (body === null || body.includes('{')) return [`${g.slice(0, open)}**`];
+  const alts = body.split(',');
+  if (alts.length > MAX_BRACE_ALTERNATIVES) return [`${g.slice(0, open)}**`];
+  return alts.flatMap((a) => expandOnce(g.slice(0, open) + a + g.slice(close + 1)));
+}
+
+const staticPrefix = (g) => {
+  const segs = g.split('/');
+  const i = segs.findIndex((s) => WILD.test(s));
+  return (i < 0 ? segs : segs.slice(0, i)).join('/').toLowerCase();
+};
+// The literal text after the last wildcard in the last segment (the whole last segment when it has none).
+const tailOf = (g) => {
+  const last = g.split('/').at(-1);
+  const m = [...last].findLastIndex((c) => WILD.test(c));
+  return (m < 0 ? last : last.slice(m + 1)).toLowerCase();
+};
+const prefixCompatible = (a, b) => a === '' || b === '' || a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+const tailCompatible = (a, b) => a === '' || b === '' || a.endsWith(b) || b.endsWith(a);
+
+// Could the plan Scope entry match a path that `glob` also matches? Conservative: may over-flag, never misses a real overlap
+// (a bare static-prefix test made the empty prefix of `**/*.sql` match everything). Both sides are normalised the way
+// glob.mjs does it first, so `./db/`, `db\\` and `db/**` agree.
+export function scopeMayHitGlob(entry, glob) {
+  const entries = expandOnce(normalizeGlob(String(entry)));
+  const globs = expandOnce(normalizeGlob(String(glob)));
+  return entries.some((e) => globs.some((g) => {
+    if (!WILD.test(e)) return matchAny(e, [g], { nocase: true });
+    return prefixCompatible(staticPrefix(e), staticPrefix(g)) && tailCompatible(tailOf(e), tailOf(g));
+  }));
 }
