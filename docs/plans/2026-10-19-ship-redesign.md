@@ -46,6 +46,7 @@ up the pipeline hands the owner a green PR to merge in GitHub with an honest not
 - `pipeline/lib/notify.mjs`
 - `pipeline/lib/installer.mjs`
 - `pipeline/lib/pr-facts.mjs`
+- `pipeline/lib/updatebranch.mjs`
 - `pipeline/commands/plan.mjs`
 - `pipeline/commands/review.mjs`
 - `pipeline/commands/handoff.mjs`
@@ -58,6 +59,7 @@ up the pipeline hands the owner a green PR to merge in GitHub with an honest not
 - `pipeline/commands/summary.mjs`
 - `pipeline/commands/risk.mjs`
 - `pipeline/commands/final-gate.mjs`
+- `pipeline/commands/review-complete.mjs`
 - `pipeline/hooks/lib/owner-go.mjs`
 - `pipeline/hooks/owner-go.mjs`
 - `pipeline/hooks/lib/files-policy.mjs`
@@ -99,6 +101,21 @@ up the pipeline hands the owner a green PR to merge in GitHub with an honest not
    `go` → T5 test with a fake gh that drops the new comment.
 5. Legacy PRs and test fixtures with no plan events: chat mode → one `plan-scope none` item; label mode → the gate fails;
    `plan.required: false` → report only. Existing gate tests must keep passing via the helper default → T6.
+6. Event data is a pointer: a forged `path` exempts nothing (T4 `trustedPlanPath`, T6 test h); one key = at most one
+   paid launch, owned by the earliest comment's `claim` (T5 tests 2, 2b).
+7. Partial failures resume safely: approval event posted + checkpoint failed → `build` via `P plan approve` (T9 d2/d3);
+   a confirmed branch update is recorded on every `bringUpToDate` exit (T8).
+
+## Revision log
+- r2 (2026-10-20, Codex astra-xhigh plan review, 8 P1 / 4 P2 / 1 P3, all verified against the code and folded):
+  R1-1 trusted plan path (T4/T6); R1-2 launch ownership by `claim` + extras after a void start (T4/T5); R1-3
+  `lastRequestText` plan marker + duplicate-line rejection (T3); R1-4 decoded summary used directly (T4/T6); R1-5 resume
+  judged against the approved blob's tasks + `needsApproveCheckpoint` (T4/T9); R1-6 `protection.json` + update pairs
+  from `bringUpToDate` on every exit (T8); R1-7 CI-tested base from the run, pinned `gate.head`, re-check before post
+  (T8); R1-8 round-range files + `base0.repo` (T7); R1-9 `scopeMayHitGlob` (T4); R1-10 Codex session/usage via
+  `--json` + `exec resume` (T5); R1-11 no cost-entry eviction (T2); R1-12 fenced-text assertion + config keys moved to
+  T4; P3 `runShellAsync` (T8). Spec clarification (R1-2): a void start takes no slot, so one owner extra after it buys
+  exactly one more run.
 
 ---
 
@@ -157,7 +174,7 @@ test('headings inside fenced code blocks are ignored', () => {
   const p = parsePlan(fenced);
   assert.deepEqual(p.scope, ['src/a.mjs', 'test/**', 'docs/x.md']);
   assert.deepEqual(p.tasks.map((t) => t.id), ['T1', 'T2']);
-  assert.ok(!p.tasks[1].text.includes('### Task T9'), 'a fenced block stays part of the task text');
+  assert.ok(p.tasks[1].text.includes('### Task T9'), 'a fenced block stays part of the task text (full definition)');
 });
 
 test('missing sections, empty scope, bad entries and duplicate ids are refused with every problem listed', () => {
@@ -349,7 +366,9 @@ export const planRequestLines = ({ pr, blob, scopeDigest: d }) => [
   - `listEvents` entries gain `createdAt` and `tampered` (`created_at` and `updated_at` both present and different)
   - `ROLES` += `'codex', 'fable', 'security', 'screenshot'`; `PHASES` += `'plan'`
   - `bookCost(cost, entry, { key }) → cost` (key matches `EXEC_KEY_RE = /^(agent|codex|ctl|plan):[A-Za-z0-9._:-]{1,120}$/`;
-    same key replaces), `MAX_COST_ENTRIES = 200`
+    same key replaces), `MAX_COST_ENTRIES = 200`. Invariant: `total`/`byPhase`/`byRole` = unkeyed bookings + the sum of
+    `entries`; nothing is ever evicted, so a replayed key is always recognised. At the limit a NEW key throws
+    `cost-entries-full` (replacing an existing key still works); `P cost` exits 1 with that error (Codex plan R1-11).
   - `P cost … --execution KEY`
 
 - [ ] **Step 1: Failing tests**
@@ -412,7 +431,7 @@ test('plan event kinds render and parse; an edited comment is tampered; createdA
 
 ```js
 // test/run-cost.test.mjs (append)
-import { bookCost, emptyCost } from '../pipeline/lib/run-cost.mjs';
+import { MAX_COST_ENTRIES, bookCost, emptyCost } from '../pipeline/lib/run-cost.mjs';
 const E = (input) => ({ phase: 'plan', role: 'codex', input, output: 1, cacheRead: 0, cacheWrite: 0, usd: 0.5 });
 
 test('bookCost: the same execution key replaces its entry; totals stay derived', () => {
@@ -425,6 +444,15 @@ test('bookCost: the same execution key replaces its entry; totals stay derived',
   c = bookCost(c, E(10), { key: 'agent:x' });
   assert.equal(c.total.input, 160);
   assert.throws(() => bookCost(c, E(1), { key: 'nope' }), /execution key/);
+});
+
+test('bookCost never evicts: at the limit a new key is refused, an existing key still replaces, totals never double', () => {
+  let c = emptyCost();
+  for (let i = 0; i < MAX_COST_ENTRIES; i++) c = bookCost(c, E(1), { key: `agent:a${i}` });
+  assert.throws(() => bookCost(c, E(1), { key: 'agent:new' }), /cost-entries-full/);
+  const again = bookCost(c, E(5), { key: 'agent:a0' }); // the oldest key, replayed (retry / other machine)
+  assert.equal(again.total.input, MAX_COST_ENTRIES - 1 + 5);
+  assert.equal(again.total.calls, MAX_COST_ENTRIES);
 });
 ```
 
@@ -479,14 +507,11 @@ export function bookCost(cost, entry, { key } = {}) {
   if (!EXEC_KEY_RE.test(String(key))) throw new Error(`bad execution key ${JSON.stringify(String(key).slice(0, 40))}`);
   let c = cost ?? emptyCost();
   const old = c.entries?.[key];
+  // Never evict: an evicted key would be booked again on replay while its old amount stays in the totals.
+  if (!old && Object.keys(c.entries ?? {}).length >= MAX_COST_ENTRIES) throw new Error(`cost-entries-full: ${MAX_COST_ENTRIES} keyed entries already booked on this PR`);
   if (old) c = subtractCostEntry(c, old);
   c = addCostEntry(c, entry);
-  const kept = { ...(c.entries ?? {}) };
-  delete kept[key];
-  kept[key] = normalisedEntry(entry); // { phase, role (normalised), input, output, cacheRead, cacheWrite, usd } exactly as addCostEntry stored them
-  const keys = Object.keys(kept);
-  for (const k of keys.slice(0, Math.max(0, keys.length - MAX_COST_ENTRIES))) delete kept[k];
-  return { ...c, entries: kept };
+  return { ...c, entries: { ...(c.entries ?? {}), [key]: normalisedEntry(entry) } }; // { phase, role (normalised), input, output, cacheRead, cacheWrite, usd } exactly as addCostEntry stored them
 }
 ```
     `subtractCostEntry` mirrors `addCostEntry` (same normalisation, subtracts every amount and one `call` from `total`,
@@ -550,6 +575,20 @@ test('presentedPlanRequest binds only the terminal two-line block', () => {
   assert.equal(presentedPlanRequest(`${PLAN_REQ}\nmore text`), null);
   assert.equal(presentedPlanRequest(PLAN_REQ.replace(BLOB, BLOB.slice(0, 12))), null, 'a 12-hex blob is refused');
   assert.equal(presentedPlanRequest(PLAN_REQ.replace('\n📋', '\nprose\n📋')), null);
+  // Spec §2a ambiguity: exactly ONE Plan line and ONE 📋 line in the whole reply, and no 🔀 merge line.
+  const other = `Plan ${'ef'.repeat(20)} · scope ${SCOPE}`;
+  assert.equal(presentedPlanRequest(PLAN_REQ.replace('Here is the plan.\n', `Here is the plan.\n${other}\n`)), null, 'consecutive duplicate Plan lines');
+  assert.equal(presentedPlanRequest(`Old: Plan ${BLOB} · scope ${SCOPE}\n${PLAN_REQ}`), null, 'a second Plan line anywhere');
+  assert.equal(presentedPlanRequest(`🔀 Ready to merge #58 — say "merge"\n${PLAN_REQ}`), null, 'mixed merge + plan request');
+});
+
+test('the recorder reads a reply that ends with ONLY the plan request (no merge marker), and still refuses a stale one', () => {
+  const home = tmp();
+  // said() replies have no 🔀 line: lastRequestText must accept the 📋 marker on the plan path.
+  assert.equal(recordApproval(input(home, 'approve', [said(PLAN_REQ)]), { home, now: () => NOW })?.kind, 'plan');
+  // A later assistant turn with text but no request makes the old request stale (same slot rule as merge).
+  const home2 = tmp();
+  assert.equal(recordApproval(input(home2, 'approve', [said(PLAN_REQ), said('Working on it.')]), { home: home2, now: () => NOW }), null);
 });
 
 test('"approve" after a plan request writes a plan record; merge readers never see it', () => {
@@ -592,6 +631,9 @@ test('plan records are read for 30 days, never from the future, and subagent pro
   assert.equal(readPlanApprovals({ home, now: () => NOW - 10 * 60_000 }).length, 0);
   assert.equal(recordApproval(input(home, 'approve', [said(PLAN_REQ)], { agent_id: 'x' }), { home, now: () => NOW }), null);
 });
+// The 24 h issuance window and the UTC / future-skew boundaries are checked by `P plan approve` (T4 tests):
+// a record exactly 24 h old is accepted, 24 h + 1 s refused; a record dated in the future beyond the existing skew
+// allowance (owner-go.mjs ~245) is refused; timestamps are compared as UTC epoch ms.
 ```
 
 - [ ] **Step 2: Run** `node scripts/test.mjs owner-go` → FAIL.
@@ -622,21 +664,29 @@ export function parsePlanApproval(prompt) {
 }
 
 // The plan request a reply ENDS with: the last non-blank line is the 📋 line and the line right above it the Plan line.
+// Ambiguous replies record nothing (spec §2a): any other Plan / 📋 line anywhere in the reply, or any 🔀 merge line.
 export function presentedPlanRequest(text) {
   const lines = String(text ?? '').split(/\r?\n/);
   while (lines.length && !lines.at(-1).trim()) lines.pop();
   const ready = PLAN_READY_RE.exec(lines.at(-1) ?? '');
   const plan = PLAN_LINE_RE.exec(lines.at(-2) ?? '');
   if (!ready || !plan) return null;
+  const count = (re) => lines.filter((l) => re.test(l)).length;
+  if (count(PLAN_LINE_RE) !== 1 || count(PLAN_READY_RE) !== 1 || count(READY_LINE) !== 0) return null;
   return { pr: Number(ready[1]), blob: plan[1], scopeDigest: plan[2] };
 }
 ```
+  `lastRequestText` today returns a reply only when it matches the MERGE marker (`READY_LINE`, ~139), so a reply ending
+  in the plan request reads as `''` (Codex plan R1-3). Give it an option `lastRequestText(transcriptPath, { prompt,
+  ready = READY_LINE })` and use `ready` in the final test; the merge path passes nothing (unchanged behaviour), the plan
+  path passes `ready: PLAN_READY_RE`. The slot/staleness logic above that line is shared and NOT changed. Check that
+  `READY_LINE` is a non-global regex (`.test` on a `/g` regex is stateful); if it is global, use a non-global copy.
   `recordApproval`: after the `notOwnerPrompt` / session checks, `const a = parseApproval(input?.prompt)`; when `a` is
   null, try the plan path:
 ```js
 const pa = parsePlanApproval(input?.prompt);
 if (!pa) return null;
-const shown = presentedPlanRequest(lastRequestText(String(input?.transcript_path ?? ''), { prompt: String(input.prompt) }));
+const shown = presentedPlanRequest(lastRequestText(String(input?.transcript_path ?? ''), { prompt: String(input.prompt), ready: PLAN_READY_RE }));
 if (!shown) return null;
 if (pa.prs.length && !pa.prs.includes(shown.pr)) return null;
 if (pa.blobs.length && !pa.blobs.some((b) => shown.blob.startsWith(b))) return null;
@@ -662,8 +712,9 @@ record = { v: 1, kind: 'plan', ts, session, prompt_sha256, record_id: randomByte
 **Files:**
 - Create: `pipeline/lib/plan-state.mjs`
 - Create: `pipeline/commands/plan.mjs` (subcommands `record`, `approve`, `risk`; T5 adds `start`, `review`, `findings`)
-- Modify: `pipeline/lib/risk.mjs` (export `globsMayOverlap`)
-- Test: `test/plan-state.test.mjs`, `test/plan-command.test.mjs`
+- Modify: `pipeline/lib/risk.mjs` (export `scopeMayHitGlob`, `securityGlobs`)
+- Modify: `pipeline/lib/config.mjs` (the T6 keys, moved here)
+- Test: `test/plan-state.test.mjs`, `test/plan-command.test.mjs`, `test/risk.test.mjs` (extend), `test/config.test.mjs` (extend)
 
 **Interfaces:**
 - Consumes: T1 (`parsePlan`, `scopeDigest`, `planRequestLines`, `PlanError`), T2 (`listEvents` with `tampered`,
@@ -674,9 +725,10 @@ record = { v: 1, kind: 'plan', ts, session, prompt_sha256, record_id: randomByte
   - `activeProposal(events, bind) → { status: 'none' } | { status: 'lost', reason } | { status: 'ok', event, blob, path, scopeDigest, n }`
   - `latestApproval(events, bind) → { status: 'none' } | { status: 'lost', reason } | { status: 'approved', event, blob, path, recordId, promptSha256, host }`
   - `matchingLocalRecord(records, { pr, blob, scopeDigest, recordId, promptSha256 }) → record | null`
-  - `planScopeVerdict({ events, bind, recordPlan, localRecords, readBlob, files, required, ownerApproval, host }) → { ok, detail, ownerMerge, ownerItems }` (used by T6)
-  - `startsValidity(events, { caps = { codex: 2, fable: 1 } }) → Array<{ reviewer, key, commentId, createdAt, valid, extra, planBlob }>` (used by T5)
-  - `planResumeFacts({ events, bind, recordPlan, localRecords, recordTasks }) → { evidence: boolean, active, approval: 'verified'|'unverified'|'none'|'lost', openWork: boolean, lostReason? }` (used by T9)
+  - `trustedPlanPath({ path, blob, planDir, blobAtPath }) → string | null`
+  - `planScopeVerdict({ events, bind, recordPlan, localRecords, readBlob, blobAtPath, planDir, files, required, ownerApproval, host }) → { ok, detail, ownerMerge, ownerItems }` (used by T6)
+  - `startsValidity(events, { caps = { codex: 2, fable: 1 } }) → Array<{ reviewer, key, commentId, createdAt, valid, extra, planBlob, claim }>` (used by T5)
+  - `planResumeFacts({ events, bind, recordPlan, localRecords, recordTasks, readBlob }) → { evidence: boolean, active, approval: 'verified'|'unverified'|'none'|'lost', openWork: boolean, needsApproveCheckpoint: boolean, lostReason? }` (used by T9)
 - Produces (`P plan`):
   - `pipeline plan record --pr N --file PATH [--request-file F] [--repo DIR]` → `{ ok, blob, scopeDigest, path, tasks: [{id, title, specSha}], requestLines, event: { id, reused } }`; exit 1 `dirty|unpushed|plan-invalid`, 3 GitHub
   - `pipeline plan approve --pr N [--repo DIR]` → `{ ok, blob, scopeDigest, event: { id, reused }, stepChanged }`; exit 1 `no-proposal|no-approval|superseded|scope-mismatch|lost`
@@ -711,7 +763,8 @@ test('a tampered or unreadable event newer than the latest approval blocks fallb
 });
 
 const verdict = (over) => planScopeVerdict({
-  events: [], bind: BIND, recordPlan: null, localRecords: [], readBlob: () => null,
+  events: [], bind: BIND, recordPlan: null, localRecords: [], readBlob: () => null, planDir: 'docs/plans',
+  blobAtPath: (p, b) => p === 'docs/plans/p.md' && b === A,
   files: [{ oldPath: 'src/a.mjs', newPath: 'src/a.mjs', path: 'src/a.mjs' }], required: true, ownerApproval: 'chat', host: 'mac', ...over,
 });
 
@@ -739,10 +792,27 @@ test('approved: verified vs unverified, outside files listed, plan file allowed'
   assert.deepEqual(verdict({ events: [ap], readBlob, files, localRecords: local }).ownerItems, ['plan-scope outside x.mjs']);
 });
 
+test('a copied approval pointer with a substituted path exempts nothing (Codex plan R1-1)', () => {
+  const readBlob = (b) => (b === A ? PLAN(['src/**']) : null);
+  const local = [{ pr: 7, blob: A, scopeDigest: scopeDigest(['src/**']), recordId: '1'.repeat(16), promptSha256: 'p' }];
+  const forged = ev('plan-approved', { blob: A, path: 'x.mjs', recordId: '1'.repeat(16), promptSha256: 'p', host: 'mac' });
+  const files = [{ path: 'x.mjs', oldPath: 'x.mjs', newPath: 'x.mjs' }];
+  assert.deepEqual(verdict({ events: [forged], readBlob, files, localRecords: local }).ownerItems, ['plan-scope outside x.mjs']);
+  // a path under plan.dir whose committed content is NOT the approved blob is not exempt either
+  const other = ev('plan-approved', { blob: A, path: 'docs/plans/q.md', recordId: '1'.repeat(16), promptSha256: 'p', host: 'mac' });
+  const q = [{ path: 'docs/plans/q.md', oldPath: 'docs/plans/q.md', newPath: 'docs/plans/q.md' }];
+  assert.deepEqual(verdict({ events: [other], readBlob, files: q, localRecords: local }).ownerItems, ['plan-scope outside docs/plans/q.md']);
+});
+
 test('startsValidity: duplicate keys collapse, caps per PR, extras count only from their position on', () => {
   const s = (reviewer, key, extra) => ev('plan-review-started', { reviewer, key, planBlob: A, ...(extra ? { extra } : {}) });
   const evs = [s('codex', 'k1'), s('codex', 'k1'), s('codex', 'k2'), s('codex', 'k3'), s('codex', 'k4', 'owner: one more'), s('fable', 'f1'), s('fable', 'f2')];
   assert.deepEqual(startsValidity(evs).map((x) => [x.key, x.valid]), [['k1', true], ['k2', true], ['k3', false], ['k4', true], ['f1', true], ['f2', false]]);
+  // a later extra never revives k3; a second extra is needed for a fifth run
+  const more = [...evs, s('codex', 'k5'), s('codex', 'k6', 'owner: again')];
+  assert.deepEqual(startsValidity(more).filter((x) => x.reviewer === 'codex').map((x) => x.valid), [true, true, false, true, false, true]);
+  // an edited start counts against every reviewer
+  assert.equal(startsValidity([s('codex', 'k1'), ev('plan-review-started', { reviewer: 'codex', key: 'k2', planBlob: A }, { tampered: true }), s('codex', 'k3')]).at(-1).valid, false);
 });
 ```
 
@@ -792,7 +862,15 @@ function parsedBlob(readBlob, blob) {
   try { return { plan: parsePlan(text) }; } catch (err) { return { error: `the approved plan no longer parses (${err.message})` }; }
 }
 
-export function planScopeVerdict({ events, bind, recordPlan, localRecords, readBlob, files, required, ownerApproval, host }) {
+// blobAtPath(path, blob) → true only when some commit in merge-base..head has `<commit>:<path>` equal to blob (the
+// caller runs `git log --format=%H <mergeBase>..<head> -- <path>` + `git rev-parse <c>:<path>`; any git error → false).
+export function trustedPlanPath({ path: p, blob, planDir, blobAtPath }) {
+  const dir = String(planDir ?? '').replace(/\/+$/, '');
+  if (typeof p !== 'string' || !dir || !p.startsWith(`${dir}/`) || !p.endsWith('.md') || p.split('/').includes('..')) return null;
+  return blobAtPath(p, blob) === true ? p : null;
+}
+
+export function planScopeVerdict({ events, bind, recordPlan, localRecords, readBlob, blobAtPath, planDir, files, required, ownerApproval, host }) {
   const lost = (reason) => ({ status: 'lost', reason });
   let v;
   const ap = latestApproval(events, bind);
@@ -805,7 +883,10 @@ export function planScopeVerdict({ events, bind, recordPlan, localRecords, readB
     else {
       const digest = scopeDigest(p.plan.scope);
       const verified = matchingLocalRecord(localRecords, { pr: bind.pr, blob: ap.blob, scopeDigest: digest, recordId: ap.recordId, promptSha256: ap.promptSha256 });
-      const items = outsideScope({ files, scope: p.plan.scope, planPath: ap.path }).map((f) => `plan-scope outside ${f}`);
+      // The event's `path` is a pointer an agent can forge (Codex plan R1-1): exempt it only when it is a Markdown file
+      // under plan.dir AND git proves the APPROVED blob was committed at that path on this branch.
+      const planPath = trustedPlanPath({ path: ap.path, blob: ap.blob, planDir, blobAtPath });
+      const items = outsideScope({ files, scope: p.plan.scope, planPath }).map((f) => `plan-scope outside ${f}`);
       if (!verified) items.push(`plan-scope unverified ${ap.host}`);
       v = { status: 'approved', items, verified: Boolean(verified) };
     }
@@ -836,32 +917,53 @@ export function startsValidity(events, { caps = { codex: 2, fable: 1 } } = {}) {
     const extra = typeof e.data.extra === 'string' && e.data.extra.trim() ? e.data.extra.trim() : null;
     if (extra) extras[r] += 1;
     const valid = used[r] < caps[r] + extras[r];
-    used[r] += 1;
-    out.push({ reviewer: r, key: e.data.key, commentId: e.commentId, createdAt: e.createdAt, valid, extra, planBlob: e.data.planBlob ?? null });
+    // A void start launched nothing, so it takes no slot: one owner extra after it buys exactly one more run
+    // (clarifies spec §3 "position": the position among slot-taking starts). It is never revived later.
+    if (valid) used[r] += 1;
+    out.push({ reviewer: r, key: e.data.key, commentId: e.commentId, createdAt: e.createdAt, valid, extra, planBlob: e.data.planBlob ?? null, claim: typeof e.data.claim === 'string' ? e.data.claim : null });
   }
   return out;
 }
 
-export function planResumeFacts({ events, bind, recordPlan, localRecords, recordTasks }) {
+// Open work is judged against the APPROVED blob's tasks, never against the record alone (Codex plan R1-5): when the
+// plan-approved event was posted but the checkpoint that copies tasks failed, the record has no tasks (or stale ones),
+// and every approved task that is not done in the record with the same specSha is open.
+export function planResumeFacts({ events, bind, recordPlan, localRecords, recordTasks, readBlob }) {
   const active = activeProposal(events, bind);
   const ap = latestApproval(events, bind);
   const evidence = active.status !== 'none' || ap.status !== 'none' || recordPlan != null || (localRecords ?? []).some((r) => r.pr === bind.pr);
-  if (active.status === 'lost') return { evidence, active: null, approval: 'lost', openWork: true, lostReason: active.reason };
-  if (ap.status === 'lost') return { evidence, active, approval: 'lost', openWork: true, lostReason: ap.reason };
+  if (active.status === 'lost') return { evidence, active: null, approval: 'lost', openWork: true, needsApproveCheckpoint: false, lostReason: active.reason };
+  if (ap.status === 'lost') return { evidence, active, approval: 'lost', openWork: true, needsApproveCheckpoint: false, lostReason: ap.reason };
   const approvedActive = ap.status === 'approved' && active.status === 'ok' && ap.blob === active.blob;
-  const verified = approvedActive && matchingLocalRecord(localRecords, { pr: bind.pr, blob: ap.blob, scopeDigest: active.scopeDigest, recordId: ap.recordId, promptSha256: ap.promptSha256 });
-  const approval = verified ? 'verified' : approvedActive ? 'unverified' : 'none';
-  const openWork = !approvedActive || (recordTasks ?? []).some((t) => t.done !== true);
-  return { evidence, active: active.status === 'ok' ? active : null, approval, openWork };
+  if (!approvedActive) return { evidence, active: active.status === 'ok' ? active : null, approval: 'none', openWork: true, needsApproveCheckpoint: false };
+  const p = parsedBlob(readBlob, ap.blob);
+  if (p.error) return { evidence, active, approval: 'lost', openWork: true, needsApproveCheckpoint: false, lostReason: p.error };
+  const verified = matchingLocalRecord(localRecords, { pr: bind.pr, blob: ap.blob, scopeDigest: scopeDigest(p.plan.scope), recordId: ap.recordId, promptSha256: ap.promptSha256 });
+  const done = new Set((recordTasks ?? []).filter((t) => t.done === true && typeof t.specSha === 'string').map((t) => `${t.id}\n${t.specSha}`));
+  const openWork = p.plan.tasks.some((t) => !done.has(`${t.id}\n${t.specSha}`));
+  // The approval event exists but the record never got it (checkpoint failed): resume re-runs `P plan approve`, which
+  // reuses the event and copies the approved tasks into the record before any build step.
+  const needsApproveCheckpoint = recordPlan?.blob !== ap.blob || recordPlan?.state !== 'approved'
+    || p.plan.tasks.some((t) => !(recordTasks ?? []).some((r) => r.id === t.id && r.specSha === t.specSha));
+  return { evidence, active, approval: verified ? 'verified' : 'unverified', openWork, needsApproveCheckpoint };
 }
 ```
+  Tests (append to `test/plan-state.test.mjs`): an approved active plan with `recordTasks: []` and `recordPlan: null`
+  → `openWork: true, needsApproveCheckpoint: true`; the same with every task done at the matching `specSha` and
+  `recordPlan.state: 'approved'` → `openWork: false, needsApproveCheckpoint: false`; a record task done at an OLD
+  `specSha` → open; a blob that is not in the clone → `approval: 'lost'`.
 
 - [ ] **Step 4: `pipeline/commands/plan.mjs`** — dispatcher like `commands/triage.mjs` (`SUBCOMMANDS` map + `guarded`), with
   `meta.usage` lines starting `pipeline plan <sub>` for every subcommand (the skills-commands test reads them). Shared
   helper `prContext(values, ctx)` → `{ root, config, pr, gh, viewer, comments, events, bind, summary }` where `gh =
   createGitHub({ cwd: root, env: ctx.env })`, `view = gh.prView(pr, ['headRefOid', 'headRefName', 'baseRefName'])`,
   `bind = { repo: gh.repo().slug, pr, branch: view.headRefName }`, `comments = gh.listComments(pr)`, `events =
-  listEvents(comments, gh.viewer())`, `summary = summaryFromComments(comments, viewer)` decoded with `decodeRecord`.
+  listEvents(comments, gh.viewer())`, `summary = summaryFromComments(comments, viewer)`. `summaryFromComments` ALREADY
+  decodes (`summary-comment.mjs:22` returns `{ status, record?, sections, url, id }`, no `body`): use `summary.status`
+  / `summary.record` directly, never `decodeRecord` again (Codex plan R1-4). A record whose `repo`/`pr`/`branch` differ
+  from `bind` is treated as unreadable (`status: 'invalid'`). `approve` refuses (exit 1 `record-unreadable`) when
+  `summary.status` is `unsupported` or `invalid`, so it can never reset a gate-stage record it could not read; only
+  `absent` counts as "no record".
   Wrap GitHub calls in `guardGh` (exit 3). `readBlob = (b) => { try { return git(['cat-file', 'blob', b], { cwd: root }); } catch { return null; } }` (use the `git` runner from `pipeline/lib/git.mjs`).
   - `record`:
     1. `rel` = repo-relative `--file` (must be inside the repo, ≤ `MAX_PLAN_BYTES`).
@@ -896,12 +998,22 @@ export function planResumeFacts({ events, bind, recordPlan, localRecords, record
     2. `riskGlobs = [...config.risk.high_risk_paths, ...config.hard_stops.paths, ...securityGlobs(config)]`, where
        `securityGlobs` = `['**/*.sql', '**/migrations/**', 'supabase/**', ...(config.review.security === 'off' ? [] :
        config.review.security.paths)]`. Its definition is shared with T7; put it in `risk.mjs`.
-    3. `high` when any scope entry `globsMayOverlap` any risk glob, or a task text matches
+    3. `high` when any scope entry `scopeMayHitGlob` any risk glob, or a task text matches
        `/\b(migration|rls|row[- ]level|grant|revoke|policy|auth|secret|token|password|payroll|money|concurrency|lock)\b/i`.
     4. Else `medium` when tasks > 3 or scope > `config.risk.medium_files`; else `low`. `reasons` name each trigger.
-  - `globsMayOverlap(a, b)` (in `risk.mjs`, exported): `staticPrefix(g)` = the segments before the first segment
-    containing `*`, `?`, `[` or `{`, joined with `/`. Overlap when one prefix equals the other or starts with it +
-    `/`. The empty prefix overlaps everything (conservative: may over-flag, never under-flags).
+  - `scopeMayHitGlob(entry, glob)` (in `risk.mjs`, exported; Codex plan R1-9: a bare static-prefix test made the empty
+    prefix of `**/*.sql` match everything, so every plan was high):
+    - a LITERAL entry (no `*?[{`) → exact `matchAny(entry, [glob], { nocase: true })` (`glob.mjs` semantics);
+    - two globs → overlap only when BOTH hold: (a) static prefixes compatible (one equals or starts with the other +
+      `/`; the empty prefix is compatible with any), and (b) tails compatible: `tail(g)` = the literal text after the
+      last wildcard in the last segment (`**/*.sql` → `.sql`, `src/**` → `''`); compatible when either tail is `''` or
+      one ends with the other (case-insensitive). Conservative: may over-flag, never misses a real overlap.
+    - Tests (`test/risk.test.mjs`): `docs/a.md` vs default globs → no; `supabase/migrations/x.sql` → yes; `src/**` vs
+      `**/*.sql` → yes; `docs/**/*.md` vs `**/*.sql` → no; `**` vs anything → yes; `db/*.SQL` vs `**/*.sql` → yes.
+  - Config keys move here from T6 (Codex plan R1-12: `risk` reads `config.review.security`, so its default must exist
+    at this commit): add `DEFAULTS.plan`, `DEFAULTS.review.final_pass`, `DEFAULTS.review.security`, their `KEYS` and
+    validation exactly as written in T6 Step 3 `config.mjs`, with T6's `test/config.test.mjs` cases. T6 then only adds
+    the gate check.
   - Tests `test/plan-command.test.mjs`: use `createTmpRepo()` (`test/helpers/tmprepo.mjs`) + `createFakeGh(entries)`
     (`test/helpers/fakegh-env.mjs`, entry format as in `test/cli-review.test.mjs`) and spawn `pipeline/bin/pipeline.mjs`.
     Cases:
@@ -913,10 +1025,14 @@ export function planResumeFacts({ events, bind, recordPlan, localRecords, record
     - with a matching record → posts `plan-approved` and sets `step: build` + tasks. Write the record with
       `recordApproval` into a temp `home`, then import `run` from `pipeline/commands/plan.mjs` and pass `ctx.home` (no
       env override exists: `accountHome()` ignores `$HOME` on purpose);
-    - `approve` again at `step: gate` → event reused/posted, `stepChanged: false`, step stays `gate`;
+    - `approve` again at `step: gate` → event reused/posted, `stepChanged: false`, step stays `gate`; the same at
+      `step: awaiting-owner-merge` (the summary comment is the fake gh's real comment shape, decoded once);
+    - `approve` with an `unsupported` (v: 3) summary record → exit 1 `record-unreadable`, nothing posted;
+    - `approve` 24 h boundary: a local record exactly 24 h old → ok; 24 h + 1 s → `no-approval`; a record 10 min in the
+      future beyond the skew allowance → `no-approval`;
     - `risk`: a scope `supabase/migrations/x.sql` → `high`; `docs/a.md` with one task in a repo whose
       `hard_stops.paths` is the default → `low`.
-- [ ] **Step 5: Run** `node scripts/test.mjs plan-state plan-command plan.test` → PASS.
+- [ ] **Step 5: Run** `node scripts/test.mjs plan-state plan-command plan.test risk config self-verify` → PASS.
 - [ ] **Step 6: Commit** `feat(plan): plan evidence logic and P plan record/approve/risk`.
 
 ---
@@ -926,7 +1042,7 @@ export function planResumeFacts({ events, bind, recordPlan, localRecords, record
 **Files:**
 - Create: `pipeline/lib/codex-run.mjs` (moved `askCodex` from `commands/codex-review.mjs` 211-242, behaviour unchanged)
 - Modify: `pipeline/commands/codex-review.mjs` (import `askCodex` from `codex-run.mjs`)
-- Modify: `pipeline/lib/codex.mjs` (add `buildPlanReviewPrompt`)
+- Modify: `pipeline/lib/codex.mjs` (add `buildPlanReviewPrompt`, `buildCodexResumeArgs`; `buildCodexArgs` gains an optional `json` flag)
 - Modify: `pipeline/commands/plan.mjs` (add `start`, `review`, `findings`)
 - Test: `test/plan-budget.test.mjs`, `test/codex.test.mjs` (extend)
 
@@ -935,7 +1051,9 @@ export function planResumeFacts({ events, bind, recordPlan, localRecords, record
   (`lib/transcript.mjs`); `buildCodexArgs`, `validateFindings`, `assignIds`, `renderFindingsMarkdown`,
   `FINDINGS_SCHEMA_PATH` (`lib/codex.mjs`); `sha256` (`lib/review-context.mjs`).
 - Produces:
-  - `askCodex({ root, args, prompt, outPath, env, timeoutMs }) → { ok: true, findings } | { ok: false, reason }` (exit-3 reasons as today)
+  - `askCodex({ root, args, prompt, outPath, env, timeoutMs, json = false }) → { ok: true, findings, session, usage } | { ok: false, reason, session }` (exit-3 reasons as today; `json: false` = today's behaviour, `session`/`usage` null)
+  - `buildCodexResumeArgs({ sessionId, model, effort, schemaPath, outPath }) → string[]` (in `codex.mjs`; `sessionId` must match `/^[A-Za-z0-9_-]{8,}$/`)
+  - `pipeline plan start` exit 1 `{ error: 'already-started' }` (key already exists, or another caller's claim won)
   - `buildPlanReviewPrompt({ pr, planPath, blob, kind: 'review'|'recheck', priorFindingsMarkdown = '' }) → string`
   - `pipeline plan start --pr N --reviewer codex|fable --key KEY [--extra TEXT] [--repo DIR]` → exit 0 `{ go: true, key, reviewer, planBlob, promptHeader? }` (fable: `ROUND: plan\nINPUT-DIGEST: <64 hex>`), exit 1 `{ error: 'cap' }`, exit 3 `{ error: 'not-visible' }`
   - `pipeline plan review --pr N --key KEY [--effort high|xhigh] [--model M] [--prior FILE] [--repo DIR]` → `{ ok, key, counts, path }`
@@ -946,7 +1064,10 @@ export function planResumeFacts({ events, bind, recordPlan, localRecords, record
   `createFakeGh`). Cases:
   1. Two `start --reviewer codex` with different keys → both `go`; a third → exit 1 `cap`; `--extra "owner: one more"`
      → `go`.
-  2. A retry with an existing key posts no comment (the fake gh records POSTs) and returns the same decision.
+  2. A retry with an existing key posts no comment (the fake gh records POSTs) and exits 1 `already-started` — it
+     never returns `go` twice for one key.
+  2b. Two racing callers with the same key (fake gh lists BOTH comments after both POSTs): exactly one gets `go` (the
+     one whose `claim` is on the earliest comment), the other `already-started`; count `go` results = 1.
   3. A fake gh whose `listComments` omits the comment just created → exit 3 `not-visible`, never `go`.
   4. A POST that fails with a 502 but whose comment appears on the re-list → decided normally (ambiguous POST).
   5. `start --reviewer fable` prints `promptHeader` with `ROUND: plan` and a 64-hex digest that changes with the key.
@@ -981,26 +1102,52 @@ export function buildPlanReviewPrompt({ pr, planPath, blob, kind, priorFindingsM
   ].join('\n');
 }
 ```
-  - `start`:
+  - `start` — launch ownership (Codex plan R1-2: reusing an existing key must NOT authorise another paid launch; spec
+    §3 "a valid start is consumed even if the run then crashes"):
     1. Validate `--key` (`/^[A-Za-z0-9._-]{1,48}$/`) and `--reviewer`; require an active proposal (`ok`).
-    2. `find = () => startsValidity(listEvents(gh.listComments(pr), viewer)).find((s) => s.reviewer === reviewer && s.key === key)`.
-    3. If found, decide from it. Otherwise `postEvent(gh, pr, 'plan-review-started', `${reviewer}-${key}`, `Plan review
-       started: ${reviewer} ${key}`, { ...bind, reviewer, key, planBlob: active.blob, ...(extra ? { extra } : {}), at,
-       host })`.
-    4. Catch a `GhError` from the POST and still re-list. After the POST, `find()` again: not found → exit 3
-       `not-visible`.
-    5. `valid` → exit 0 `go: true`; else exit 1 `cap`.
-    6. For fable, `promptHeader = `ROUND: plan\nINPUT-DIGEST: ${sha256([bind.repo, pr, 'fable-plan', active.blob, key].join('\n'))}``.
+    2. `find = () => startsValidity(listEvents(gh.listComments(pr), viewer)).find((s) => s.reviewer === reviewer && s.key === key)`
+       (the EARLIEST comment with that key, duplicates collapsed).
+    3. If found BEFORE posting → exit 1 `{ error: 'already-started', valid, commentId }`: this caller never launches
+       (a retry after a crash, or a second controller). The slot is consumed; another run needs a new key (cap or extra).
+    4. Otherwise `claim = randomBytes(8).toString('hex')` and `postEvent(gh, pr, 'plan-review-started', `${reviewer}-${key}`,
+       `Plan review started: ${reviewer} ${key}`, { ...bind, reviewer, key, planBlob: active.blob, claim, ...(extra ? {
+       extra } : {}), at, host })`.
+    5. Catch a `GhError` from the POST and still re-list (ambiguous POST). After the POST, `find()` again: not found →
+       exit 3 `not-visible`.
+    6. `found.claim !== claim` → exit 1 `already-started` (another caller's comment is the earliest: it owns the launch).
+    7. `found.valid` → exit 0 `{ go: true, key, reviewer, planBlob: found.planBlob, claim }`; else exit 1 `cap`.
+    8. For fable, `promptHeader = `ROUND: plan\nINPUT-DIGEST: ${sha256([bind.repo, pr, 'fable-plan', found.planBlob, key].join('\n'))}``.
+    9. The launch is bound to `found.planBlob`: `review` and `findings` refuse (exit 1 `stale-start`) when the active
+       proposal's blob is no longer `found.planBlob`.
   - `review`:
-    1. Run the `start` logic for `codex` (exit 1/3 passthrough).
+    1. Run the `start` logic for `codex` (exit 1/3 passthrough; only `go: true` continues — exactly one launch per key).
     2. Prompt: `kind` is `recheck` when another valid codex start with an earlier `commentId` exists; `--prior FILE`
-       supplies its markdown.
-    3. `args = buildCodexArgs({ cwd: root, model: values.model ?? config.review.codex_model, effort: values.effort ??
-       'high', schemaPath: FINDINGS_SCHEMA_PATH, outPath: .review/plan/<key>-raw.json })`.
-    4. `askCodex(...)`; on failure → exit 3 with its reason.
-    5. `items = assignIds(findings, n, () => '', { contentHash: active.blob })` with `n` = the start's position among
+       supplies its markdown (always, also when resuming, so the recheck works without a session).
+    3. Session (Codex plan R1-10; spec §3 "a recheck resumes the first run's Codex session when one exists"): for a
+       recheck, read `.review/plan/<earlier key>.json` `session`. When it is a valid id, `args = buildCodexResumeArgs({
+       sessionId, model, effort, schemaPath, outPath })` = `['exec', 'resume', <id>, '-c', 'sandbox_mode="read-only"',
+       '--json', '-o', outPath, '--output-schema', schemaPath, '-c', model…, '-c', effort…, '-']` (`resume` accepts
+       neither `-C` nor `--sandbox`: the spawn cwd carries the repo, and the sandbox is re-pinned through the config
+       key, as `~/.claude/skills/codex-review/scripts/review.mjs` ~120 does; verified on codex-cli 0.154: `exec resume`
+       takes `--json`, `-o` and `--output-schema`). Otherwise a fresh run with `buildCodexArgs` (+ `--json`) and the
+       prior findings in the prompt; the output notes `resumed: false`.
+    4. `askCodex(...)` gains a `json: true` mode: parse stdout JSONL, take `thread_id` from the `thread.started` event
+       as `session` and `usage` (`input_tokens`, `cached_input_tokens`, `output_tokens`) from the LAST
+       `turn.completed`; either missing → `null` (never guessed). Return `{ ok, findings, session, usage }`. On failure
+       → exit 3 with its reason; the `session` is still written to `.review/plan/<key>.failed.json` when known.
+    5. `items = assignIds(findings, n, () => '', { contentHash: found.planBlob })` with `n` = the start's position among
        valid codex starts.
-    6. Write `.review/plan/<key>.json` + `.md` (`renderFindingsMarkdown(findings, n, items)`).
+    6. Write `.review/plan/<key>.json` (`{ findings, items, blob, reviewer, key, session, resumedFrom, usage }`) + `.md`
+       (`renderFindingsMarkdown(findings, n, items)`), then book cost when `session` is known: `bookCost` key
+       `codex:<session>`, phase `plan`, role `codex`, tokens from `usage` (input = input_tokens − cached, cacheRead =
+       cached, output = output_tokens), `usd: 0` (Codex is not billed to Claude); `usage: null` → no booking, the output
+       says `cost: 'not-reported'` and the approval request says so. The booking goes through the same
+       verify-after-write path as `P cost --execution` (T2).
+    7. Tests (`test/plan-budget.test.mjs`, fake `codex` bin printing JSONL): session + usage captured and booked once
+       (re-running `review` with the same key exits `already-started`, no second booking); a recheck resumes the first
+       session (fake codex records its argv: `exec resume <id>`); missing `thread.started` → fresh recheck with
+       `resumed: false`, `cost: 'not-reported'`; an interrupted run (fake codex exits 1 after `thread.started`) → exit
+       3, `<key>.failed.json` holds the session, and the key is consumed.
   - `findings`:
     1. Require a valid `fable` start for `key` and no existing `.review/plan/<key>.json`.
     2. `found = findSubagentTranscript({ tag, projectsDir, maxAgeMs })` (null → exit 2).
@@ -1016,10 +1163,10 @@ export function buildPlanReviewPrompt({ pr, planPath, blob, kind, priorFindingsM
 
 ---
 
-### Task T6: Config keys + gate check `plan-scope`
+### Task T6: Gate check `plan-scope` (config keys land in T4)
 
 **Files:**
-- Modify: `pipeline/lib/config.mjs` (`DEFAULTS` 24-72, `KEYS` 95-111, `validateConfig` ~436/499)
+- Reference only: `pipeline/lib/config.mjs` (`DEFAULTS` 24-72, `KEYS` 95-111, `validateConfig` ~436/499) — edited in T4
 - Modify: `pipeline/lib/finalgate.mjs` (`CANONICAL_CHECKS` 38, `evaluateGate` 614-647, new `planScopeCheck`)
 - Modify: `pipeline/commands/final-gate.mjs` (pass `home: ctx.home` through)
 - Modify: `test/helpers/gate-env.mjs`, `test/helpers/fakegh-env.mjs` (`pipelineYml`), `test/helpers/ci-proof-env.mjs`: the
@@ -1036,7 +1183,7 @@ export function buildPlanReviewPrompt({ pr, planPath, blob, kind, priorFindingsM
   - `evaluateGate({ …, home })` (optional, default `accountHome()`)
 
 - [ ] **Step 1: Failing tests**
-  - `test/config.test.mjs`:
+  - `test/config.test.mjs` (WRITTEN IN T4 with the keys; listed here as the reference):
     - defaults: `config.plan` deep-equals `{ dir: 'docs/plans', required: true }`, `review.final_pass === 'off'`, and
       `review.security` deep-equals `{ paths: [] }`;
     - accepted: `plan.required: false`, `review.security: off`, `review.security: {paths: ["auth/**"]}`;
@@ -1055,7 +1202,8 @@ export function buildPlanReviewPrompt({ pr, planPath, blob, kind, priorFindingsM
 - [ ] **Step 2: Run** `node scripts/test.mjs config plan-gate finalgate` → FAIL.
 
 - [ ] **Step 3: Implement**
-  - `config.mjs`:
+  - `config.mjs` — ALREADY DONE in T4 (moved there so `P plan risk` has its defaults); this is the reference text T4
+    implements, and the `test/config.test.mjs` cases above are written in T4. T6 changes nothing in config.mjs:
     - `DEFAULTS.plan = { dir: 'docs/plans', required: true }`;
     - `DEFAULTS.review.final_pass = 'off'` and `DEFAULTS.review.security = { paths: [] }`;
     - `KEYS.plan = ['dir', 'required']`; `KEYS.review` += `'final_pass', 'security'`.
@@ -1085,14 +1233,19 @@ async function planScopeCheck({ root, config, diff, gh, pr, home }) {
   const viewer = gh.viewer();
   const comments = gh.listComments(pr);
   const view = gh.prView(pr, ['headRefName']);
+  // summaryFromComments already decodes: { status, record? } (Codex plan R1-4). A summary we cannot read while plan
+  // events exist is covered by the events; a readable record with a plan but no events is `lost` (verdict).
   const summary = summaryFromComments(comments, viewer);
-  const decoded = summary ? decodeRecord(summary.body) : { status: 'absent' };
+  const bind = bindOf({ repo: gh.repo().slug, pr, branch: view.headRefName });
+  const own = summary.status === 'ok' && summary.record?.repo === bind.repo && summary.record?.pr === pr;
   const verdict = planScopeVerdict({
     events: listEvents(comments, viewer),
-    bind: bindOf({ repo: gh.repo().slug, pr, branch: view.headRefName }),
-    recordPlan: decoded.status === 'ok' ? decoded.record.plan ?? null : null,
+    bind,
+    recordPlan: own ? summary.record.plan ?? null : null,
     localRecords: readPlanApprovals({ home }),
     readBlob: (b) => { try { return git(['cat-file', 'blob', b], { cwd: root }); } catch { return null; } },
+    blobAtPath: (p, b) => committedAt({ root, base: d.mergeBase, head: d.head, path: p, blob: b }),
+    planDir: config.plan.dir,
     files: d.files,
     required: config.plan.required,
     ownerApproval: config.owner_approval,
@@ -1101,8 +1254,13 @@ async function planScopeCheck({ root, config, diff, gh, pr, home }) {
   return check('plan-scope', verdict.ok, verdict.detail, verdict.ownerMerge, verdict.ownerItems);
 }
 ```
-    (Check `summaryFromComments`' return shape in `summary-comment.mjs:22` and use its body field; an unreadable record
-    with plan events is still covered by the events.)
+    `committedAt({ root, base, head, path, blob })` (in `finalgate.mjs`): `git log --format=%H <base>..<head> -- <path>`
+    (cap 200 commits), then true when any `git rev-parse <c>:<path>` equals `blob`; any git error → false. Take the
+    merge base / head from whatever `diff()` already computed (check its return fields; if it does not expose them,
+    compute `mergeBase(baseRef, head)` the same way the integrity check does). Extra tests in `plan-gate.test.mjs`:
+    - (g) summary-only evidence: a readable record with `plan` but no plan events → `lost` (proves the decoded summary
+      is used: with the old `decodeRecord(summary.body)` bug it reads `none`);
+    - (h) a forged approval comment whose `path` names a changed source file → that file is still an item.
   - Update `test/finalgate.test.mjs`'s `checksOf` default via `CANONICAL_CHECKS` (it already imports it). Update
     `docs/cli.md` (gate checks list).
 - [ ] **Step 4: Run** `node scripts/test.mjs config plan-gate finalgate ci-proof-gate cli-gate gate-fix merge-owner-approval owner-approval-chat self-verify` → PASS.
@@ -1114,7 +1272,8 @@ async function planScopeCheck({ root, config, diff, gh, pr, home }) {
 
 **Files:**
 - Modify: `pipeline/lib/hardstops.mjs` (export `isSqlPath` ~104)
-- Modify: `pipeline/lib/risk.mjs` (add `assessSecurity`, `securityGlobs`), `pipeline/commands/risk.mjs` (output)
+- Modify: `pipeline/lib/risk.mjs` (add `assessSecurity`; `securityGlobs` exists from T4), `pipeline/commands/risk.mjs` (output)
+- Modify: `pipeline/commands/review-complete.mjs` (`whyNot` names unmet obligations)
 - Create: `pipeline/lib/obligations.mjs`
 - Modify: `pipeline/lib/state.mjs` (`addRound` keeps `obligations`), `pipeline/lib/triage.mjs` (`roundOutcome` 293, `reviewValidFor` 321)
 - Modify: `pipeline/commands/codex-review.mjs` (write obligations at round creation)
@@ -1188,7 +1347,7 @@ test('an unmet obligation keeps a round with zero items from being clean; failed
   - `hardstops.mjs`: `export const isSqlPath = …` (no behaviour change).
   - `risk.mjs`:
 ```js
-export const securityGlobs = (config) => ['**/*.sql', '**/migrations/**', 'supabase/**', ...(config.review.security === 'off' ? [] : config.review.security.paths)];
+// securityGlobs: already exported by T4 (same definition).
 const SECURITY_RULE = (rule) => /^R1-/.test(rule) || /^R2-/.test(rule) || rule === 'R3-secrets';
 export function assessSecurity({ files, hits, config }) {
   if (config.review.security === 'off') return { security: false, reasons: ['security review off (review.security: off)'] };
@@ -1217,14 +1376,26 @@ export function requiredObligations({ round, security, securityInRange, level, f
 export const obligationDigest = ({ repo, pr, source, base, head }) => createHash('sha256').update([repo, pr, source, base, head].join('\n')).digest('hex');
 export const promptHeader = (round, digest) => `ROUND: ${round}\nINPUT-DIGEST: ${digest}`;
 ```
-  - `codex-review.mjs`, inside the review lock just before `addRound`:
-    1. `sec = assessSecurity({ files, hits, config })` (full range, from step 10's `files`/`hits`).
-    2. `inRange = round > 1 && assessSecurity({ files: diffFiles(base, head, o), hits: hits.filter((h) =>
-       changedInRange.has(h.file)), config }).security`.
-    3. `obligations = requiredObligations({ round, security: sec.security, securityInRange: inRange, level,
+  - `codex-review.mjs`, inside the review lock just before `addRound` (Codex plan R1-8: every input is defined here,
+    for every round):
+    1. `sec = assessSecurity({ files, hits, config })` (full range: `files` = `diffFiles(forkPoint, head, o)` ~172,
+       `hits` ~173).
+    2. The round's own range is `base` (this round's `fromHead`, the previous round's head) .. `head`:
+       `rangeFiles = round > 1 ? diffFiles(base, head, o) : files`;
+       `changedInRange = new Set(rangeFiles.flatMap((f) => [f.oldPath, f.newPath, f.path]).filter(Boolean))`;
+       `inRange = round > 1 && assessSecurity({ files: rangeFiles, hits: hits.filter((h) => changedInRange.has(h.file)),
+       config }).security`. Compute `rangeFiles` BEFORE taking the lock (git work outside the lock, like `files`).
+    3. `repo = base0.repo` (set by `emptyState` from `slug` on round 1, loaded from state on later rounds — `slug` is
+       only initialised when no state exists, ~127-130, so it must not be used here).
+    4. `obligations = requiredObligations({ round, security: sec.security, securityInRange: inRange, level,
        finalPass: config.review.final_pass, blockingCount: findings.blocking.length, priorRounds: base0.rounds })
-       .map((source) => ({ source, status: 'pending', digest: obligationDigest({ repo: slug, pr, source, base:
+       .map((source) => ({ source, status: 'pending', digest: obligationDigest({ repo, pr, source, base:
        review.base, head }) }))`.
+    5. Test (`test/review-add.test.mjs`, end to end through `P codex-review` with a fake codex, then `P review header`
+       and `P review add`): round 1 touches `supabase/migrations/1.sql` → security obligation; round 2 changes the SQL
+       file again → a new round-2 security obligation whose digest has the real `owner/repo` (no `undefined`), and a
+       transcript with the header from `P review header` is accepted (`met`); round 2 touching only `docs/a.md` → no
+       obligation.
     4. Pass `obligations` into `addRound` and print them in the command output (`obligations: [{source, promptHeader}]`)
        so the controller knows what to dispatch.
     `state.mjs` `addRound` copies `obligations` when given (an array of known sources); `loadState` / comment decoding
@@ -1288,11 +1459,15 @@ const failedObligations = obl.filter((o) => o.status === 'failed').map((o) => `R
 **Files:**
 - Create: `pipeline/lib/handoff.mjs` (pure eligibility + comment rendering)
 - Create: `pipeline/commands/handoff.mjs`
-- Modify: `pipeline/commands/merge.mjs` (~104-112: record the update), `pipeline/commands/update-branch.mjs` (~33-38)
-- Test: `test/handoff.test.mjs`, `test/handoff-command.test.mjs`
+- Modify: `pipeline/lib/updatebranch.mjs` (`bringUpToDate` returns the confirmed update pairs)
+- Modify: `pipeline/commands/merge.mjs` (~104-112: record the updates), `pipeline/commands/update-branch.mjs` (~33-38)
+- Test: `test/handoff.test.mjs`, `test/handoff-command.test.mjs`, `test/update-branch.test.mjs` (extend)
 
 **Interfaces:**
-- Consumes: `evaluateGate` (T6), `createRunRecorder`, `bringUpToDate` result `{ updated, startHead, base, head }`, `gh.protection(branch)` (`github.mjs:347`), record `behindBaseUpdates` / `handoff` (T2).
+- Consumes: `evaluateGate` (T6), `createRunRecorder`, `bringUpToDate` result `{ updated, startHead, base (a branch NAME), head, updates }`, `gh.protection(branch)` → `{ status, json }` (`github.mjs:347`; 200 = `json` holds the protection, 403/404 = answers), `runShellAsync` (`proc.mjs` ~232), `ciProof`-style run listing (`ci-proof.mjs`), record `behindBaseUpdates` / `handoff` (T2).
+- `bringUpToDate` gains `updates: Array<{ headBefore, baseTip }>` on EVERY return (`out()`): one pair pushed right
+  after the parents check confirms `next` is the merge of `baseSha` into `head` (both 40-hex SHAs; `base` stays the
+  branch name). So a `cycle-cap`, `checks-failed` or `head-timeout` exit after a confirmed update still reports it.
 - Produces:
   - `handoffEligibility({ updates, strict, gate, mergeTreeOk, quickVerifyOk }) → { eligible, reasons: string[] }`
   - `renderHandoffComment({ pr, head, baseTip, ciBase, commits: [{sha, subject, files}], prFiles, ownerItems, productionWatch }) → string` (starts with `MARKERS`-style marker `<!-- claude-pipeline:handoff -->`)
@@ -1348,35 +1523,52 @@ test('the comment says what was and was not verified, shows overlap, items and t
         GitHub merge until you say `ship resume N` (observe-only, never rolls back)"; `workflow`: "the project's
         workflow posts the production result on this PR"; `none`: "no production environment";
       - last line: "Merge in GitHub only if you accept this; the pipeline will not merge."
-  - `commands/handoff.mjs check`:
-    1. Read the record (`readSummaryComment`): `updates = record.behindBaseUpdates?.length ?? 0`.
-    2. `strict = gh.protection(base)?.required_status_checks?.strict` (any error or missing → `null`).
-    3. `gate = await evaluateGate({ root, config, pr, gh, env: ctx.env, home: ctx.home })`.
-    4. `git fetch origin <base>`; `baseTip = rev-parse origin/<base>`; `mergeTree = git merge-tree --write-tree HEAD
+  - `commands/handoff.mjs check` — everything is pinned to `H = gate.head` (never the mutable `HEAD`; Codex plan R1-7):
+    1. Read the record (`readSummaryComment`; use `.status`/`.record`): `updates = record.behindBaseUpdates?.length ?? 0`.
+    2. `p = gh.protection(baseRefName)`: `strict = p.status === 200 ? p.json?.required_status_checks?.strict ?? false
+       : null` (403/404/throw → `null` = not provably off → not eligible; Codex plan R1-6).
+    3. `gate = await evaluateGate({ root, config, pr, gh, env: ctx.env, home: ctx.home })`; `H = gate.head`. Local
+       `git rev-parse HEAD` must equal `H` (else exit 1 `head-moved`).
+    4. `git fetch origin <base>`; `baseTip = rev-parse origin/<base>`; `mergeTree = git merge-tree --write-tree H
        <baseTip>` (exit 0 → tree sha; non-zero → conflict).
     5. Quick verify:
-       - commit the tree: `git commit-tree <tree> -p HEAD -p <baseTip> -m "handoff check"`, with env
+       - commit the tree: `git commit-tree <tree> -p H -p <baseTip> -m "handoff check"`, with env
          `GIT_AUTHOR_NAME/EMAIL` and `GIT_COMMITTER_NAME/EMAIL` = `claude-pipeline <pipeline@localhost>`;
        - `git worktree add --detach <os.tmpdir()>/cp-handoff-<pr>-<rand> <commit>`;
        - symlink `node_modules` from `root` when it exists;
-       - run `config.verify.quick` there via `sh -c` with a 10-minute timeout (`runAsync` from `proc.mjs`);
+       - run `config.verify.quick` there with `runShellAsync(command, { cwd: tmp, timeoutMs: 10 * 60_000 })`
+         (`proc.mjs` ~232: platform shell, kills the process tree on timeout; never a hardcoded `sh -c`; P3);
        - in `finally`: `git worktree remove --force <tmp>`, then `git worktree prune`.
     6. Skip the quick verify when an earlier condition already failed (report `quickVerify: { skipped: true }`).
-    7. `commits` = `git log --format=%H%x09%s <mergeBase(HEAD, baseTip)>..<baseTip>` + `git diff --name-only` per
+    7. `commits` = `git log --format=%H%x09%s <mergeBase(H, baseTip)>..<baseTip>` + `git diff --name-only` per
        commit (cap 50 commits).
-    8. `prFiles` = `diffFiles(mergeBase, 'HEAD')` paths.
-    9. `ciBase` = the base sha GitHub's merge ref used: `gh.prView(pr, ['potentialMergeCommit'])`, its second parent
-       when available; else write `unknown`.
+    8. `prFiles` = `diffFiles(mergeBase(H, baseTip), H)` paths.
+    9. `ciBase` = the base the COMPLETED CI run on `H` actually tested, never today's `potentialMergeCommit` (it moves
+       with main; `ci-proof.mjs` 28-33): `ciTestedBase({ gh, pr, head: H })` in `handoff.mjs` lists
+       `actions/runs?head_sha=H&event=pull_request` (paginated like `ci-proof.mjs`), keeps completed runs bound to this
+       PR, reads each run's `referenced_workflows` entry with `ref: refs/pull/<N>/merge` → that commit's parents (API
+       `git/commits/<sha>`); the tested base = the parent that is not `H`. All runs agree → that sha; none usable or
+       they disagree → `'unknown'`, and the comment says "CI on head merged with main@unknown (could not prove which
+       base CI used)".
     10. `ownerItems` = `gate.checks.flatMap((c) => c.ownerItems ?? [])`; `production = config.production?.watch ??
         (config.production ? 'session' : 'none')`.
-    11. With `--post` and eligible: `gh.createComment(pr, renderHandoffComment(...))` and
-        `createRunRecorder(...).update({ handoff: { head, baseTip, at } })`.
-  - `merge.mjs` (after `synced.updated`, before returning `behind-base`):
-    `createRunRecorder({ gh, pr }).update({ behindBaseUpdate: { headBefore: gate.head, baseTip: synced.base } }, { initialStep: 'gate' })`
-    (best effort; warnings into the refusal's `extra.warnings`). `bringUpToDate`'s `base` is the base sha it compared
-    with; verify in `updatebranch.mjs` and use the field that holds the base tip.
-  - `update-branch.mjs`: in the same `recorder.update` that clears `inFlight` (`finally`), add
-    `behindBaseUpdate: { headBefore: r.startHead, baseTip: r.base }` when `r.updated === true`.
+    11. With `--post` and eligible, re-validate right before publishing: `gh.prView(pr, ['headRefOid'])` and local
+        `HEAD` both still equal `H`, and a fresh `evaluateGate` still meets the eligibility gate condition (only
+        `pr-open` behind-base fails) with the same `head`. Any change → exit 1 `{ eligible: false, reasons: ['the PR
+        changed during the check: run it again'] }`, nothing posted. Else `gh.createComment(pr,
+        renderHandoffComment(...))` and `createRunRecorder(...).update({ handoff: { head: H, baseTip, at } })`.
+  - `merge.mjs`: right after `bringUpToDate` returns and BEFORE any branch on its outcome (so `cycle-cap`,
+    `checks-failed`, `head-timeout` after a confirmed update are recorded too):
+    `for (const u of synced.updates) recorder.update({ behindBaseUpdate: u }, { initialStep: 'gate' })` (one recorder,
+    best effort; warnings into the refusal's `extra.warnings`).
+  - `update-branch.mjs`: in the `finally` that clears `inFlight`, record EVERY pair of `r.updates` (one
+    `recorder.update({ behindBaseUpdate: u })` per pair before the `inFlight`-clearing update; the record dedups pairs).
+  - Extra tests: `bringUpToDate` with `maxCycles: 1` whose base moves again → `cycle-cap` AND `updates.length === 1`
+    with 40-hex `baseTip`; `merge` on that path records the pair; `handoff check` with protection `{ status: 200, json:
+    { required_status_checks: { strict: false } } }` → strict passes, `{ status: 404 }` → not eligible; base moved
+    after CI (the run's merge commit parent ≠ today's base) → the comment names the run's base, not today's; a fake
+    gh whose PR head changes between the check and the post → nothing posted; `runShellAsync` is the runner (a quick
+    verify command that is a shell builtin chain `true && true` passes on every platform).
 - [ ] **Step 4: Run** `node scripts/test.mjs handoff cli-gate-merge gate-fix-merge update-branch` → PASS.
 - [ ] **Step 5: Commit** `feat(handoff): hand a fully verified busy-main PR to the owner for a GitHub merge (#88)`.
 
@@ -1394,7 +1586,7 @@ test('the comment says what was and was not verified, shows overlap, items and t
 **Interfaces:**
 - Consumes: `planResumeFacts` (T4), `readPlanApprovals` (T3), outcomes (T2).
 - Produces:
-  - `planResume(facts)` with `facts.plan = { evidence, active, approval, openWork, lostReason? }` (absent = legacy, no plan routing)
+  - `planResume(facts)` with `facts.plan = { evidence, active, approval, openWork, needsApproveCheckpoint, lostReason? }` (absent = legacy, no plan routing)
   - new `enter` values: `plan` (re-show the request, stop) and `owner-ui-merge` (report-only)
   - `stop` for `plan` = `awaiting-plan-approval`
   - inbox `waitingOn` += `plan-approval` (suggest `leave`), `owner-github-merge` (suggest `leave`)
@@ -1407,6 +1599,12 @@ test('the comment says what was and was not verified, shows overlap, items and t
     - (b) `approval: 'unverified', openWork: true` → `plan`;
     - (c) `approval: 'unverified', openWork: false` → normal routing (e.g. `gate`);
     - (d) `approval: 'lost'` → `enter: 'decision'` with the reason naming the recovery;
+    - (d2) `approval: 'verified', openWork: true, needsApproveCheckpoint: true` with a record at `step: 'plan'` and
+      NO tasks (the event-success / checkpoint-failure sequence) → `enter: 'build'`, `planApproveFirst: true` — never
+      review or gate;
+    - (d3) end to end in `test/resume*.test.mjs` (command level): post `plan-approved` through a fake gh whose summary
+      upsert fails, then `P resume plan` → `build` with `planApproveFirst`; then `P plan approve` succeeds, the record
+      holds the approved tasks, and a second `P resume plan` routes to `build` WITHOUT `planApproveFirst`;
     - (e) no `plan` key → identical to today's routing for every existing fixture (run the whole file);
     - (f) state `OPEN` with record outcome `owner-ui-merge` → `enter: 'owner-ui-merge'`;
     - (g) state `MERGED` with record outcome `owner-ui-merge` → `observe-prod`.
@@ -1425,10 +1623,13 @@ test('the comment says what was and was not verified, shows overlap, items and t
     - `REPORT_ONLY` += `'plan', 'owner-ui-merge'`.
     - In `route()`, right after the `local-work` check (line ~99) and before the needs-human `decision`:
 ```js
-const p = f.plan;
+const p = facts.plan; // route(facts, record): the parameter is `facts` (Codex plan R1-5)
 if (p?.evidence) {
   if (p.approval === 'lost') return { enter: 'decision', reason: `plan evidence lost or tampered (${p.lostReason ?? 'unknown'}): re-show the active plan request; the owner's new "approve" clears it` };
   if (p.approval !== 'verified' && p.openWork) return { enter: 'plan', reason: p.active ? `plan ${p.active.blob.slice(0, 12)} is not approved on this machine: show its request and wait for "approve"` : 'no active plan proposal: run P plan record' };
+  // Approval event posted but its checkpoint failed (spec §7): the approval is verified here, so resume builds — after
+  // re-running the idempotent `P plan approve`, which copies the approved tasks into the record.
+  if (p.approval === 'verified' && p.needsApproveCheckpoint) return { enter: 'build', reason: 'the plan is approved but the run record missed it: run P plan approve (reuses the event, copies the approved tasks), then build the open tasks', planApproveFirst: true };
 }
 if (record?.outcome === 'owner-ui-merge') return { enter: 'owner-ui-merge', reason: 'handed to the owner for a GitHub merge; the pipeline does not merge' };
 ```
@@ -1437,7 +1638,10 @@ if (record?.outcome === 'owner-ui-merge') return { enter: 'owner-ui-merge', reas
   - `commands/resume.mjs`:
     - Compute `plan = planResumeFacts({ events: listEvents(comments, viewer) /* full events with data */, bind,
       recordPlan: record?.plan ?? null, localRecords: readPlanApprovals({ home: ctx.home }), recordTasks:
-      record?.tasks })`.
+      record?.tasks, readBlob: (b) => { try { return git(['cat-file', 'blob', b], { cwd: root }); } catch { return
+      null; } } })` (resume runs in the PR's worktree; a missing blob → `approval: 'lost'` → `decision`, never a silent
+      skip of the plan step). Check the actual `enter` value list in `resume-plan.mjs` and use the existing name for the
+      build step if it is not `build`.
     - `analyseComments` returns only `{kind,id}` events: extend `pr-facts.mjs` `analyseComments` to also return
       `fullEvents` (the `listEvents` output). Pass `plan` into `planResume`; show `plan` in the output.
   - `inbox.mjs`:
@@ -1512,7 +1716,10 @@ if (record?.outcome === 'owner-ui-merge') return { enter: 'owner-ui-merge', reas
     - Failure table rows:
       - `plan approve` exit 1 `superseded|no-approval` ⇒ re-show the active request;
       - gate `plan-scope: lost` ⇒ re-show the request, the owner re-approves;
-      - `plan start` exit 1 `cap` ⇒ ask the owner for an extra or skip.
+      - `plan start` exit 1 `cap` ⇒ ask the owner for an extra or skip;
+      - `plan start` / `plan review` exit 1 `already-started` ⇒ do NOT launch (the key is consumed); a new run needs a
+        new key within the cap or an owner extra;
+      - `P resume plan` → `build` with `planApproveFirst` ⇒ run `P plan approve --pr N` first.
     - Model notes: "Explore with `model: haiku` for lookups."
     - Trim elsewhere if needed to stay ≤ 500 lines (move the Inbox section's detail into `reference/pr-and-summary.md`
       if required).
@@ -1566,8 +1773,8 @@ if (record?.outcome === 'owner-ui-merge') return { enter: 'owner-ui-merge', reas
   - it posts one `plan-proposed` comment that the immediate re-list returns (read-your-writes), with comment ids rising;
   - running it again reuses it.
 - [ ] **Step 3:** two `plan start --reviewer codex --key live-1` runs started at the same time from two shells, using the
-  worktree CLI (owner-run if the guard refuses parallel shells): exactly one `go`, the other reuses the same key. Note
-  the comment ids.
+  worktree CLI (owner-run if the guard refuses parallel shells): exactly one `go`, the other exits 1
+  `already-started`. Note the comment ids and both `claim` values.
 - [ ] **Step 4:** paste the results into the PR body under "Integration evidence"; delete nothing (events are
   append-only; they document this PR's own plan stage).
 
