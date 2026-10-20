@@ -69,8 +69,9 @@ function baseFacts({ root, head, baseTip }) {
     return { sha, subject: subject.join('\t'), files };
   });
   const totalCommits = Number.parseInt(git(['rev-list', '--count', `${mb}..${baseTip}`], o).trim(), 10);
-  // The union of every commit's paths (as the per-commit listing above), not the net diff: a change reverted inside the range still counts.
-  const baseFiles = [...new Set(git(['log', '--format=', '--name-only', '-z', '-m', '--first-parent', '--no-renames', `${mb}..${baseTip}`], o).split('\0').filter(Boolean))];
+  // The union of every commit's paths, not the net diff (a change reverted inside the range still counts), over EVERY commit of the range
+  // (side branches merged into main too); a merge is diffed against its first parent, like the listing above (git >= 2.31).
+  const baseFiles = [...new Set(git(['log', '--format=', '--name-only', '-z', '--diff-merges=first-parent', '--no-renames', `${mb}..${baseTip}`], o).split('\0').filter(Boolean))];
   const prFiles = [...new Set(diffFiles(mb, head, o).flatMap((f) => [f.path, f.oldPath, f.newPath].filter(Boolean)))];
   return { commits, totalCommits: Number.isInteger(totalCommits) ? totalCommits : commits.length, truncated: totalCommits > commits.length, baseFiles, prFiles };
 }

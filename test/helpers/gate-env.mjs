@@ -143,6 +143,7 @@ export function ghEntries(o) {
 // Each option breaks exactly one thing. Evidence files all live in gitignored dirs, so they never change the tree.
 export function scenario(opts = {}) {
   const repo = createTmpRepo();
+  if (opts.preCommit) { opts.preCommit(repo); repo.commit('pre'); } // history before the base commit (a merge-base that is not the root)
   repo.write('.claude/pipeline.yml', opts.yml ?? ymlFor(opts));
   repo.write('.gitignore', '.verify/\n.review/\n');
   repo.write('src/app.js', 'export const a = 1;\n');

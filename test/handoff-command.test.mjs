@@ -124,9 +124,10 @@ const git = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf8', en
 
 // A PR that is BEHIND a main that already moved once in the bare origin (from-main.txt, plus an optional conflicting edit).
 // `shared`: a file main's OLDEST commit also adds, byte for byte as the PR does (a clean merge); `revert`: main then removes it again
-// (a change that nets out); `later`: that many more main commits after that.
-function world({ updates = 2, quick = 'node scripts/quick.mjs', conflict = false, gh = {}, yml = null, change, comments, shared = null, later = 0, revert = false } = {}) {
-  const s = scenario({ yml: (yml ?? ymlFor()).replace('npm run verify:quick', quick), baseFiles: { 'scripts/quick.mjs': QUICK }, ...(change ? { change } : {}) });
+// (a change that nets out); `side`: a branch forked BEFORE the PR's base (it carries pre.txt) adds and removes `side.file` and is merged
+// into main with --no-ff; `later`: that many more main commits after that.
+function world({ updates = 2, quick = 'node scripts/quick.mjs', conflict = false, gh = {}, yml = null, change, comments, shared = null, later = 0, revert = false, side = null } = {}) {
+  const s = scenario({ yml: (yml ?? ymlFor()).replace('npm run verify:quick', quick), baseFiles: { 'scripts/quick.mjs': QUICK }, ...(change ? { change } : {}), ...(side ? { preCommit: (r) => r.write('pre.txt', 'before the base\n') } : {}) });
   const origin = mkdtempSync(join(tmpdir(), 'cp-handoff-origin-'));
   git(origin, ['init', '--bare', '-q', '-b', 'main']);
   s.oldBase = s.repo.git(['rev-parse', 'main']).trim();
@@ -143,6 +144,16 @@ function world({ updates = 2, quick = 'node scripts/quick.mjs', conflict = false
   if (revert) {
     git(work, ['rm', '-q', shared.file]);
     git(work, ['commit', '-q', '-m', 'main reverts the shared file']);
+  }
+  if (side) {
+    git(work, ['checkout', '-q', '-b', 'side', `${s.oldBase}~1`]);
+    writeFileSync(join(work, side.file), side.content);
+    git(work, ['add', '-A']);
+    git(work, ['commit', '-q', '-m', 'side adds its file']);
+    git(work, ['rm', '-q', side.file]);
+    git(work, ['commit', '-q', '-m', 'side removes its file']);
+    git(work, ['checkout', '-q', 'main']);
+    git(work, ['merge', '-q', '--no-ff', '-m', 'merge side', 'side']);
   }
   for (let i = 0; i < later; i += 1) {
     writeFileSync(join(work, `later-${i}.txt`), `${i}\n`);
@@ -255,6 +266,16 @@ test('handoff check: a change on main that is reverted inside the range still sh
   assertExit(r, 0, r.stdout);
   assert.equal(r.json.truncated, false);
   assert.deepEqual(r.json.overlap, ['shared.txt']);
+});
+
+test('handoff check: commits on a side branch merged into main count for the overlap; files changed only before the base do not', () => {
+  const content = 'shared by both\n';
+  const s = world({ side: { file: 'side.txt', content }, change: (r) => { r.write('src/app.js', 'export const a = 2;\n'); r.write('side.txt', content); r.write('pre.txt', 'the PR changes it too\n'); } });
+  const r = s.check();
+  assertExit(r, 0, r.stdout);
+  assert.ok(r.json.overlap.includes('side.txt'), `overlap: ${r.json.overlap.join()}`);
+  assert.ok(!r.json.overlap.includes('src/app.js'), 'src/app.js only changed before the base (a diff against the side parent would list it)');
+  assert.ok(!r.json.overlap.includes('pre.txt'), 'pre.txt only changed before the base');
 });
 
 test('handoff check --post: posts one comment naming the base CI used (not today\'s), and records handoff', () => {
