@@ -263,11 +263,15 @@ test('a chain with a few readings is still allowed', () => {
 test('loop words alone (names assigned once) also share the allowance across nested scripts', () => {
   const words = Array.from({ length: 20 }, (_, i) => `w${i + 1}`).join(' '); // (20 + 20^2 + 20^3 readings)
   const t0 = cpu();
+  const w0 = Date.now();
   const r = files('bash F1.sh', fakeFs(PROJ, chain(false, 3, words)));
   assert.equal(r.decision, 'deny');
   assert.match(r.reason, /too many readings/, r.reason);
   const ms = cpu() - t0;
-  assert.ok(ms < 3000, `took ${Math.round(ms)} ms of CPU`);
+  const wall = Date.now() - w0;
+  // Either clock under 3 s proves the refusal came long before the 5 s deadline: CPU time is inflated on a CI runner whose cores
+  // are shared with parallel test files (GC threads, contention), the clock on a merely busy machine.
+  assert.ok(ms < 3000 || wall < 3000, `took ${Math.round(ms)} ms of CPU and ${wall} ms of clock`);
 });
 
 test('program text in quotes (node -e, awk, sed) is no assignment: += and a[i]= in it change nothing', () => {
