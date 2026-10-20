@@ -80,6 +80,57 @@ for (const [name, unit] of Object.entries(SHAPES)) {
     }
   });
 }
+// ---- a word with a default (`${A:-w}`) after a command that can take options: the word is looked at once, not once per `${a[` ----------------------------------------------------------------------
+const OLD_DEFAULTED_WORD = /\$\{!?(?:[A-Za-z_]\w*(?:\[[^\]}]*\])?|\d+|[@*#?$!-]):?[-=+]/; // (what shell-parse.mjs tested before isDefaultedWord: unbounded subscript, ~5 s of CPU on a 200 kB word)
+test('H2 a long word of unclosed subscripts after a command that can take options is answered in under 1 s of CPU time by each guard (allow or deny, never a throw)', () => {
+  const prefixes = ['bash ', 'source ', 'node ', 'find . '];
+  const units = ['${a[', '${a[x', '${a[${b[', '${!a[', '${a[1]:-${a[', '${a[]'];
+  for (const prefix of prefixes) {
+    for (const unit of units) {
+      const line = prefix + unit.repeat(Math.floor((LIMIT - prefix.length) / unit.length));
+      assert.ok(line.length <= LIMIT);
+      for (const [who, run] of [['guard-git', () => git(line)], ['guard-files', () => files(line)]]) {
+        const t0 = cpu();
+        const r = run();
+        const ms = cpu() - t0;
+        assert.ok(r.decision === 'allow' || r.decision === 'deny', `${who}: ${r.decision}`);
+        assert.ok(ms < 1000, `${who}: ${Math.round(ms)} ms of CPU for ${prefix}${unit}...`); // (~0.2 s locally on the worst shape)
+      }
+    }
+  }
+});
+test('H2 isDefaultedWord reads a word in linear time (the pattern read to the end of the word from every `${a[`)', async () => {
+  const { isDefaultedWord } = await import('../pipeline/hooks/lib/shell-parse.mjs');
+  const { assertLinear, cpuTime } = await import('./helpers/timing.mjs');
+  for (const unit of ['${a[', '${a[x', '${a[${b[', '${!a[']) {
+    const at = (n) => () => { const w = unit.repeat(Math.floor(n / unit.length)); return cpuTime(() => assert.equal(isDefaultedWord(w), false)); };
+    assertLinear(at(100_000), at(200_000), { label: `isDefaultedWord on ${unit}`, ratio: 4, slackMs: 25 });
+  }
+  // a long subscript is still a subscript (no bound: a bound would let the word through)
+  assert.equal(isDefaultedWord('${A[' + 'x'.repeat(190_000) + ']:-w}'), true);
+  assert.equal(isDefaultedWord('${a[' .repeat(40_000) + 'x]:-w}'), true);
+});
+test('H2 isDefaultedWord gives exactly the boolean of the pattern it replaced -- 60,000 random words and the known examples', async () => {
+  const { isDefaultedWord } = await import('../pipeline/hooks/lib/shell-parse.mjs');
+  const alpha = ['${', '${', '${a', '${!', '$', '{', '}', '[', '[', ']', ']', '!', 'a', '1', '@', ':', ':-', '-', '=', '+', 'x', '_', '#', '?', '*', '\n', '${a[x]:-', '${!A[', '${1-', '${@:+', '[x]', ']:-w}'];
+  let seed = 987654321; // (mulberry32: the low bits of a plain LCG cycle, which starves some token pairs)
+  const rnd = (n) => { seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return Math.floor((((t ^ (t >>> 14)) >>> 0) / 4294967296) * n); };
+  let hits = 0;
+  for (let k = 0; k < 60000; k++) {
+    let t = '';
+    for (let i = 1 + rnd(16); i > 0; i--) t += alpha[rnd(alpha.length)];
+    const want = OLD_DEFAULTED_WORD.test(t);
+    if (want) hits++;
+    assert.equal(isDefaultedWord(t), want, JSON.stringify(t));
+  }
+  assert.ok(hits > 2000, `the fuzz must reach matching words (${hits})`);
+  for (const t of ['${A:-w}', '${A-w}', '${A:=w}', '${A=w}', '${A:+w}', '${A+w}', '${A:?w}', '${A?w}', '${1:-w}', '${12-w}', '${@:-w}', '${*-w}', '${#-w}', '${?:-w}', '${$-w}', '${!-w}', '${!!-w}', '${!A:-w}', '${!A[1]:-w}',
+    '${A[0]:-w}', '${A[}:-w}', '${A[x}]:-w}', '${A[x]}:-w}', '${A[1]x:-w}', '${A[${B[1]:-w}', '${A[${B}]:=w}', '${A[${B[}]:-w}', 'x${A[ ${B[2]-w}', '${A[1]', '${A[', '${A', '${', '${A:}', '${A:x}', '${A%x}', '${A/x/y}', '--opt=${A:--c}', 'a${A[\n]:-w}', '${a b:-w}', '${:-w}', '${!:-w}', '${!}', '${}']) {
+    assert.equal(isDefaultedWord(t), OLD_DEFAULTED_WORD.test(t), t);
+  }
+  assert.equal(isDefaultedWord('${A:-w}'), true);
+  assert.equal(isDefaultedWord('${A%x}'), false);
+});
 test('H2 a long run of quotes or blanks inside a word that ends in a slash is read once, not from every character', () => {
   const quotes = "a'" + "'".repeat(LIMIT / 2) + '/b';
   const blanks = "x '" + ' '.repeat(LIMIT / 2) + "/'";
