@@ -169,6 +169,7 @@ test('fresh install into an empty home (path with a space): files, manifest, hoo
   for (const rel of [
     'skills/ship/SKILL.md', 'skills/ship/reference/notes.md', 'skills/verify/SKILL.md', 'skills/pipeline-setup/SKILL.md',
     'agents/implementer.md', 'agents/verifier.md', 'agents/judge.md', 'agents/arbiter.md',
+    'agents/fable-reviewer.md', 'agents/security-reviewer.md', 'agents/screenshot-reviewer.md',
     'pipeline/bin/pipeline.mjs', 'pipeline/hooks/guard-git.mjs', 'pipeline/hooks/guard-files.mjs',
     'pipeline/hooks/stack-register.mjs', 'pipeline/hooks/stack-dev-bind.mjs', 'pipeline/hooks/stack-session-end.mjs',
     'pipeline/lib/answer.mjs', 'pipeline/templates/example.md', 'pipeline/VERSION', 'pipeline/INSTALLED.json',
@@ -884,8 +885,10 @@ test('buildPlan and walkFiles read the fixture: sorted, excluded names skipped, 
   assert.ok(plan.files.has('pipeline/VERSION'));
   assert.ok(plan.files.has('skills/ship/reference/notes.md'));
   assert.ok(plan.files.has('agents/arbiter.md'));
+  assert.ok(plan.files.has('agents/fable-reviewer.md') && plan.files.has('agents/screenshot-reviewer.md'));
   assert.deepEqual(plan.units.map((u) => u.rel), [
     'pipeline', 'agents/implementer.md', 'agents/verifier.md', 'agents/judge.md', 'agents/arbiter.md',
+    'agents/fable-reviewer.md', 'agents/security-reviewer.md', 'agents/screenshot-reviewer.md',
     'skills/ship', 'skills/verify', 'skills/pipeline-setup',
   ]);
   const walked = walkFiles(join(FIXTURE, 'skills'));

@@ -39,6 +39,9 @@ const PROTECTED_REL = [
   '.claude/agents/verifier.md',
   '.claude/agents/judge.md',
   '.claude/agents/arbiter.md',
+  '.claude/agents/fable-reviewer.md',
+  '.claude/agents/security-reviewer.md',
+  '.claude/agents/screenshot-reviewer.md',
   '.claude/pipeline',
   '.claude/settings.json',
   // #58: the owner's recorded chat "merge" (hooks/lib/owner-go.mjs): only the owner-go hook writes it, P merge and the guard read it

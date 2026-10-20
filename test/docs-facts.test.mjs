@@ -98,6 +98,21 @@ test('agents: implementer and verifier inherit effort (spec 5.4); judge and arbi
   assert.match(read('agents/judge.md'), /every pending item exactly once/);
 });
 
+test('agents: verifier runs on haiku and reads no screenshots; reviewers are pinned (ship redesign T7)', () => {
+  const front = (doc) => read(doc).split('---')[1];
+  assert.match(front('agents/verifier.md'), /^model: haiku$/m);
+  assert.ok(!/screenshot/i.test(read('agents/verifier.md')), 'screenshot reading moved to the screenshot-reviewer');
+  assert.match(front('agents/fable-reviewer.md'), /^model: fable$/m);
+  assert.match(front('agents/fable-reviewer.md'), /^effort: high$/m);
+  for (const name of ['security-reviewer', 'screenshot-reviewer']) {
+    assert.match(front(`agents/${name}.md`), /^model: sonnet$/m);
+    assert.ok(!/^effort:/m.test(front(`agents/${name}.md`)), `${name} pins no effort`);
+    assert.ok(front(`agents/${name}.md`).includes(`name: ${name}\n`));
+  }
+  assert.match(front('agents/screenshot-reviewer.md'), /^tools: Read, Glob$/m);
+  assert.ok(read('agents/screenshot-reviewer.md').includes('.verify/screenshots/*'));
+});
+
 test('pipeline-setup: ignores the worktree dir, pins verify.expected_steps, mentions the executable shim and the ci keys', () => {
   const setup = read('skills/pipeline-setup/SKILL.md');
   for (const needle of ['<worktree_dir>/', 'verify.expected_steps', '100755', 'ci.approvers', 'ci.guard_checks', '.gitattributes', '{{OWNER}}', '--reason']) {
