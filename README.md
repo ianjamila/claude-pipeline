@@ -284,6 +284,17 @@ fail closed with `org-repo-needs-ci.approvers`). `pipeline config` prints `warni
 but suspicious. Documentation and test files are exempt from the content rules (sensitive terms, SQL, auth) but keep
 one: a real-looking secret key literal (not marked fake inside the key itself) is still a `needs-human` hit there.
 
+### Smoke firewall bypass header (opt-in)
+
+If a firewall (for example Vercel's) answers 429 to CI runner IPs, the production smoke can send one secret header that a
+firewall "Bypass" rule matches. Set `smoke_bypass_header: x-smoke-key` in `pipeline.yml` (a lowercase `x-` name; default
+`null` = nothing extra is sent), list where it may go in `smoke_bypass_origins: ["https://www.example.com"]` (required
+when the header is set; exact https origins, no wildcards or paths) and put the secret in the `PIPELINE_SMOKE_BYPASS_KEY` environment variable, never in a file.
+It is a firewall hint, not app authentication: the smoke stays a cookie-less, GET-only request, the header goes only to a base whose
+origin is exactly in `smoke_bypass_origins` (never a preview URL, another host or localhost; redirects are not followed), and the value is never printed. The smoke's JSON gains
+`bypassHeader: true|false` (whether it was sent); a configured name with no environment value is `false`, not an error.
+Re-vendor (`pipeline vendor`) so the project's `scripts/pipeline/smoke.mjs` and `lib/config.mjs` know the key.
+
 ### Faster verify (opt-in)
 
 Three groups of optional `verify` keys cut the wait without weakening the checks that matter. Leave them unset and
@@ -337,6 +348,7 @@ Rollout: the config rejects unknown keys, so set these in a repo only after ever
 | `PIPELINE_OFF=1` | ship, verify and the Stop hook stand down for the session |
 | `PIPELINE_ADMIN=1` | allows the installer and `protect --apply` from a Claude session |
 | `PIPELINE_MACHINE_ID` | stable id for this machine in the lock files (default: one generated once) |
+| `PIPELINE_SMOKE_BYPASS_KEY` | secret value of the `smoke_bypass_header` header (see "Smoke firewall bypass header"); read only by `scripts/pipeline/smoke.mjs`, never printed |
 | `PIPELINE_SMOKE_PORT` | the e2e smoke server's port; printed by `supabase-local env`, read by `playwright.smoke.config.ts` |
 | `PIPELINE_TEST_COMMIT_AS_IS`, `PIPELINE_TEST_FORCE_ARBITER`, `PIPELINE_ARBITER_MODEL_OVERRIDE` | proof switches: see `skills/ship/reference/proof-switches.md` |
 

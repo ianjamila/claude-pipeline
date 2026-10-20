@@ -86,6 +86,14 @@ production: null
 #  # "other" nothing is automatic: it opens a needs-human issue and prints rollback.command for a person to run.
 
 smoke_checks: []               # GET-only, unauthenticated: [{path: /, status: [200], contains: ["…"]}]
+# smoke_bypass_header: x-smoke-key   # optional, default null. NAME of one extra request header the smoke sends to the
+#                              # configured (non-localhost) origin as a firewall hint, e.g. for a Vercel Firewall "Bypass"
+#                              # rule that lets CI runner IPs through. Lowercase, /^x-[a-z0-9-]{1,60}$/. NOT app auth: the
+#                              # smoke stays a cookie-less GET. The secret VALUE is never written here: set the environment
+#                              # variable PIPELINE_SMOKE_BYPASS_KEY (e.g. from a CI secret). Without it nothing extra is sent.
+# smoke_bypass_origins: ["https://www.example.com"]   # default []. REQUIRED (non-empty) when smoke_bypass_header is set:
+#                              # the header goes ONLY to a base whose origin equals one of these exactly (https, no path,
+#                              # no trailing slash, no wildcard). A preview URL, any other host or localhost never gets it.
 
 risk:
   high_risk_paths: []

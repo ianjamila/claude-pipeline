@@ -36,7 +36,7 @@ export function runNode(args, { cwd, env = {}, input } = {}) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, args, {
       cwd,
-      env: { ...process.env, PIPELINE_OFF: undefined, GITHUB_STEP_SUMMARY: undefined, PIPELINE_SMOKE_EXPECT_TEXT: undefined, ...env },
+      env: { ...process.env, PIPELINE_OFF: undefined, GITHUB_STEP_SUMMARY: undefined, PIPELINE_SMOKE_EXPECT_TEXT: undefined, PIPELINE_SMOKE_BYPASS_KEY: undefined, ...env },
     });
     let stdout = '';
     let stderr = '';

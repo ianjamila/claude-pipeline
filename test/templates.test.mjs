@@ -521,7 +521,7 @@ before(async () => {
   server = http.createServer((req, res) => {
     hits.push(`${req.method} ${req.url}`);
     if (req.method !== 'GET') violations.push(`non-GET: ${req.method} ${req.url}`);
-    for (const h of ['cookie', 'authorization', 'proxy-authorization']) if (req.headers[h]) violations.push(`${h} header sent to ${req.url}`);
+    for (const h of ['cookie', 'authorization', 'proxy-authorization', 'x-smoke-key']) if (req.headers[h]) violations.push(`${h} header sent to ${req.url}`);
     if (req.headers['user-agent'] !== 'claude-pipeline-smoke/1') violations.push(`user-agent: ${req.headers['user-agent']}`);
     if (req.headers['cache-control'] !== 'no-cache') violations.push('cache-control not no-cache');
     if (req.url === '/login') {
@@ -729,6 +729,217 @@ test('smoke: an invalid pipeline.yml is an error, not a silent default', async (
   const r = await smoke(repo, ['--base', baseUrl]);
   assert.equal(r.code, 2);
   assert.match(r.json.message, /invalid \.claude\/pipeline\.yml/);
+});
+
+// ---- smoke_bypass_header: a firewall hint, sent only to a configured, non-loopback origin ----
+const KEY = 'sk_live_Zx9-secret.VALUE~42';
+const HTTPS_BASE = 'https://app.example.com';
+const BYPASS = { header: 'x-smoke-key', value: KEY, origins: [HTTPS_BASE] };
+const okFetch = (seen) => async (url, init) => {
+  seen.push({ url: String(url), init });
+  return new Response('<h1>hi</h1>', { status: 200, headers: { 'x-vercel-id': 'iad1::z' } });
+};
+
+test('smoke bypass: header is sent with the configured name and the env value, bypassHeader true', async () => {
+  const { runSmoke } = await importVendored((await project()).dir, 'smoke');
+  const seen = [];
+  const r = await runSmoke({ base: HTTPS_BASE, checks: [{ path: '/' }, { path: '/login' }], bypass: BYPASS }, { fetch: okFetch(seen), ...noSleep });
+  assert.equal(r.ok, true);
+  assert.equal(r.bypassHeader, true);
+  assert.equal(seen.length, 2);
+  for (const s of seen) {
+    assert.equal(s.init.headers['x-smoke-key'], KEY);
+    assert.equal(s.init.redirect, 'manual');
+    assert.equal(s.init.method, 'GET');
+    assert.equal(s.init.headers['user-agent'], 'claude-pipeline-smoke/1');
+  }
+  assert.ok(!JSON.stringify(r).includes(KEY), 'the value is not in the result');
+});
+
+test('smoke bypass: not sent when the env value is missing/empty or the header is not configured; bypassHeader false, no error', async () => {
+  const { runSmoke } = await importVendored((await project()).dir, 'smoke');
+  for (const bypass of [undefined, null, { header: 'x-smoke-key', value: undefined, origins: [HTTPS_BASE] }, { header: 'x-smoke-key', value: '', origins: [HTTPS_BASE] }, { header: 'x-smoke-key', value: '   ', origins: [HTTPS_BASE] }, { header: null, value: KEY, origins: [HTTPS_BASE] }]) {
+    const seen = [];
+    const r = await runSmoke({ base: HTTPS_BASE, checks: [{ path: '/' }], bypass }, { fetch: okFetch(seen), ...noSleep });
+    assert.equal(r.ok, true);
+    assert.equal(r.bypassHeader, false, JSON.stringify(bypass));
+    assert.equal(Object.keys(seen[0].init.headers).some((h) => h.toLowerCase().startsWith('x-smoke')), false);
+  }
+});
+
+test('smoke bypass: never sent to a loopback base, even when configured and the env value is set', async () => {
+  const { runSmoke } = await importVendored((await project()).dir, 'smoke');
+  for (const base of ['http://localhost:3000', 'http://127.0.0.1:3000', 'http://[::1]:3000', 'https://localhost']) {
+    const seen = [];
+    const r = await runSmoke({ base, checks: [{ path: '/' }], bypass: { ...BYPASS, origins: [base, new URL(base).origin] } }, { fetch: okFetch(seen), ...noSleep });
+    assert.equal(r.bypassHeader, false, base);
+    assert.equal(seen[0].init.headers['x-smoke-key'], undefined, base);
+  }
+});
+
+test('smoke bypass: only an exactly listed origin gets the header (other host, scheme, port, subdomain, suffix, path prefix, no list)', async () => {
+  const { runSmoke } = await importVendored((await project()).dir, 'smoke');
+  const cases = [
+    ['https://app.example.com', ['https://app.example.com'], true],
+    ['https://app.example.com/some/prefix', ['https://app.example.com'], true],
+    ['https://evil.example', ['https://app.example.com'], false],
+    ['https://preview-abc.vercel.app', ['https://app.example.com'], false],
+    ['https://app.example.com:8443', ['https://app.example.com'], false],
+    ['https://sub.app.example.com', ['https://app.example.com'], false],
+    ['https://app.example.com.evil.example', ['https://app.example.com'], false],
+    ['https://eapp.example.com', ['https://app.example.com'], false],
+    ['https://app.example.com', ['https://app.example.com:8443'], false],
+    ['https://app.example.com', ['http://app.example.com'], false],
+    ['https://app.example.com', ['*.example.com', 'example.com', '.example.com'], false],
+    ['https://app.example.com', [], false],
+    ['https://app.example.com', undefined, false],
+    ['https://app.example.com:8443', ['https://app.example.com', 'https://app.example.com:8443'], true],
+  ];
+  for (const [base, origins, expected] of cases) {
+    const seen = [];
+    const r = await runSmoke({ base, checks: [{ path: '/' }], bypass: { header: 'x-smoke-key', value: KEY, origins } }, { fetch: okFetch(seen), ...noSleep });
+    assert.equal(r.bypassHeader, expected, `${base} vs ${JSON.stringify(origins)}`);
+    assert.equal(seen[0].init.headers['x-smoke-key'], expected ? KEY : undefined, base);
+  }
+});
+
+test('smoke bypass: a request path that could change the host is a usage error before any request; the secret is never sent', async () => {
+  const { runSmoke, SmokeUsageError } = await importVendored((await project()).dir, 'smoke');
+  const evil = ['//evil.example/x', '@evil.example/x', '/\\evil.example', '/a\\b', 'evil.example', 'https://evil.example/', '/a\nb', ''];
+  for (const p of evil) {
+    const calls = [];
+    const fetch = async (url, init) => { calls.push({ url: String(url), init }); return new Response('build 42', { status: 200 }); };
+    const asExpectPath = runSmoke({ base: HTTPS_BASE, checks: [{ path: '/' }], expectText: 'build', expectPath: p, bypass: BYPASS }, { fetch, ...noSleep });
+    await assert.rejects(asExpectPath, (e) => e instanceof SmokeUsageError && !e.message.includes(KEY), `expect-path ${JSON.stringify(p)}`);
+    const asCheck = runSmoke({ base: HTTPS_BASE, checks: [{ path: '/' }, { path: p }], bypass: BYPASS }, { fetch, ...noSleep });
+    await assert.rejects(asCheck, (e) => e instanceof SmokeUsageError && !e.message.includes(KEY), `check path ${JSON.stringify(p)}`);
+    assert.deepEqual(calls, [], `no request at all for ${JSON.stringify(p)} (not even the valid first check)`);
+  }
+  // also without expect text: an --expect-path that is malformed is refused, not silently ignored
+  await assert.rejects(runSmoke({ base: HTTPS_BASE, checks: [{ path: '/' }], expectPath: '//evil.example/x' }, { fetch: okFetch([]), ...noSleep }), SmokeUsageError);
+});
+
+test('smoke bypass: CLI refuses a host-changing --expect-path with exit 2 and no request', async () => {
+  const repo = await project({ config: CONFIG(undefined, SMOKE_CHECKS) });
+  const before = hits.length;
+  for (const p of ['//evil.example/x', '@evil.example/x', '/\\evil.example']) {
+    const r = await smoke(repo, ['--base', baseUrl, '--expect-text', 'x', `--expect-path=${p}`], { env: { PIPELINE_SMOKE_BYPASS_KEY: KEY } });
+    assert.equal(r.code, 2, `${p}: ${r.stdout}`);
+    assert.equal(r.json.error, 'usage');
+    assert.ok(!r.stdout.includes(KEY));
+  }
+  assert.equal(hits.length, before);
+});
+
+test('smoke bypass: a normal path keeps the base path prefix, stays on the base origin and gets the header', async () => {
+  const { runSmoke } = await importVendored((await project()).dir, 'smoke');
+  const seen = [];
+  const r = await runSmoke({ base: 'https://app.example.com/pre/', checks: [{ path: '/login?x=1' }, { path: '/@user' }, { path: '/a//b' }], bypass: BYPASS }, { fetch: okFetch(seen), ...noSleep });
+  assert.equal(r.ok, true);
+  assert.deepEqual(seen.map((s) => s.url), ['https://app.example.com/pre/login?x=1', 'https://app.example.com/pre/@user', 'https://app.example.com/pre/a//b']);
+  assert.ok(seen.every((s) => new URL(s.url).origin === HTTPS_BASE && s.init.headers['x-smoke-key'] === KEY));
+});
+
+test('smoke bypass: the value never appears in the serialized result (pass, failing check, network error, echoing server)', async () => {
+  const { runSmoke } = await importVendored((await project()).dir, 'smoke');
+  const cases = {
+    pass: async () => new Response('fine', { status: 200 }),
+    failingStatus: async () => new Response('nope', { status: 429 }),
+    failingBody: async () => new Response('no match here', { status: 200 }),
+    // a server (or fetch implementation) that echoes the secret back into what the reasons quote
+    echoLocation: async (u, init) => new Response(null, { status: 307, headers: { location: `/x?k=${init.headers['x-smoke-key']}` } }),
+    // the secret echoed into a response header the result copies (x-vercel-id)
+    echoVercelId: async (u, init) => new Response('fine', { status: 200, headers: { 'x-vercel-id': `iad1::${init.headers['x-smoke-key']}` } }),
+    networkError: async (u, init) => { throw Object.assign(new TypeError('fetch failed'), { cause: { code: `ECONNRESET ${init.headers['x-smoke-key']}` } }); },
+    messageWithValue: async (u, init) => { throw new Error(`bad header value "${init.headers['x-smoke-key']}"`); },
+  };
+  for (const [name, fetch] of Object.entries(cases)) {
+    const r = await runSmoke({
+      base: HTTPS_BASE,
+      checks: [{ path: '/', contains: ['wanted text'], location_contains: 'wanted' }],
+      expectText: 'wanted text',
+      bypass: BYPASS,
+    }, { fetch, ...noSleep });
+    const text = JSON.stringify(r, null, 2);
+    assert.ok(!text.includes(KEY), `${name}: value leaked: ${text}`);
+    assert.equal(r.bypassHeader, true, name);
+    if (name !== 'pass') assert.equal(r.ok, false, name);
+  }
+});
+
+test('smoke bypass: redactJson scrubs string values only, so a key like true/1/" neither corrupts the JSON nor leaks', async () => {
+  const { redactJson } = await importVendored((await project()).dir, 'smoke');
+  const result = { ok: true, status: 200, bypassHeader: true, checks: [{ path: '/', ok: false, status: 429, reason: 'got true and 1' }] };
+  for (const key of ['true', '1', '200']) {
+    const parsed = JSON.parse(redactJson(result, key));
+    assert.equal(parsed.ok, true, key);
+    assert.equal(parsed.status, 200, key);
+    assert.equal(parsed.bypassHeader, true, key);
+    assert.equal(parsed.checks[0].ok, false, key);
+    assert.equal(parsed.checks[0].status, 429, key);
+  }
+  assert.equal(JSON.parse(redactJson(result, 'true')).checks[0].reason, 'got [redacted] and 1');
+  // a key with JSON-special characters: the escaped form in serialized text would have dodged a text-level replace
+  for (const key of ['a"b', 'a\\b', '"']) {
+    const echoed = { ok: false, checks: [{ reason: `server echoed ${key} back`, vercelId: `iad1::${key}` }] };
+    const parsed = JSON.parse(redactJson(echoed, key));
+    assert.equal(parsed.checks[0].reason, 'server echoed [redacted] back', key);
+    assert.equal(parsed.checks[0].vercelId, 'iad1::[redacted]', key);
+  }
+  // empty / whitespace / missing secret: output unchanged
+  assert.equal(redactJson(result, '  '), JSON.stringify(result, null, 2));
+  assert.equal(redactJson(result, undefined), JSON.stringify(result, null, 2));
+});
+
+test('smoke bypass: a value that is not a legal header value is a usage error that does not quote it', async () => {
+  const { runSmoke, SmokeUsageError } = await importVendored((await project()).dir, 'smoke');
+  const bad = 'sk live\nsecret-bit';
+  await assert.rejects(
+    runSmoke({ base: HTTPS_BASE, checks: [{ path: '/' }], bypass: { header: 'x-smoke-key', value: bad, origins: [HTTPS_BASE] } }, { fetch: okFetch([]), ...noSleep }),
+    (e) => e instanceof SmokeUsageError && !e.message.includes('secret-bit'),
+  );
+  await assert.rejects(
+    runSmoke({ base: HTTPS_BASE, checks: [{ path: '/' }], bypass: { header: 'Authorization', value: KEY, origins: [HTTPS_BASE] } }, { fetch: okFetch([]), ...noSleep }),
+    (e) => e instanceof SmokeUsageError && !e.message.includes(KEY),
+  );
+});
+
+test('smoke bypass: CLI against a loopback server with the header configured and the env set -> bypassHeader false, nothing sent', async () => {
+  const repo = await project({ config: CONFIG(undefined, `smoke_bypass_header: x-smoke-key\nsmoke_bypass_origins: ["https://localhost"]\n${SMOKE_CHECKS}`) });
+  const r = await smoke(repo, ['--base', baseUrl], { env: { PIPELINE_SMOKE_BYPASS_KEY: KEY } });
+  assert.equal(r.code, 0, r.stdout);
+  assert.equal(r.json.bypassHeader, false, 'loopback: not sent');
+  assert.ok(!r.stdout.includes(KEY) && !r.stderr.includes(KEY));
+  // (the after() hook fails the file if the loopback server ever saw an x-smoke-key header)
+});
+
+const BYPASS_YML = `smoke_bypass_header: x-smoke-key\nsmoke_bypass_origins: ["${HTTPS_BASE}"]\n`;
+
+test('smoke bypass: main threads the configured name and PIPELINE_SMOKE_BYPASS_KEY to the request; config without the key never sends', async () => {
+  const { main } = await importVendored((await project()).dir, 'smoke');
+  const run = async (yml, env) => {
+    const repo = await project({ config: CONFIG(undefined, yml) });
+    const seen = [];
+    let out = '';
+    const orig = process.stdout.write.bind(process.stdout);
+    process.stdout.write = (c, ...rest) => (typeof c === 'string' && c.startsWith('{') ? ((out += c), true) : orig(c, ...rest)); // the test runner writes binary chunks here too
+    let code;
+    try { code = await main(['--base', HTTPS_BASE], { env, cwd: repo.dir, deps: { fetch: okFetch(seen), ...noSleep } }); } finally { process.stdout.write = orig; }
+    return { code, seen, out, json: JSON.parse(out) };
+  };
+  const sent = await run(BYPASS_YML, { PIPELINE_SMOKE_BYPASS_KEY: KEY });
+  assert.equal(sent.code, 0, sent.out);
+  assert.equal(sent.seen[0].init.headers['x-smoke-key'], KEY);
+  assert.equal(sent.json.bypassHeader, true);
+  assert.ok(!sent.out.includes(KEY));
+  const noEnv = await run(BYPASS_YML, {});
+  assert.equal(noEnv.code, 0, noEnv.out);
+  assert.equal(noEnv.json.bypassHeader, false);
+  assert.equal(noEnv.seen[0].init.headers['x-smoke-key'], undefined);
+  const notConfigured = await run('', { PIPELINE_SMOKE_BYPASS_KEY: KEY });
+  assert.equal(notConfigured.json.bypassHeader, false);
+  assert.equal(notConfigured.seen[0].init.headers['x-smoke-key'], undefined);
+  assert.equal(Object.keys(notConfigured.seen[0].init.headers).length, 2, 'only user-agent and cache-control');
 });
 
 test('every template is a plain script module with a short why-header', () => {

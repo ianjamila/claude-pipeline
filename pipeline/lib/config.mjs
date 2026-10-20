@@ -54,6 +54,13 @@ export const DEFAULTS = deepFreeze({
   preview: null,
   production: null,
   smoke_checks: [],
+  // smoke_bypass_header: NAME of a request header the smoke sends to the configured origin as a firewall hint (e.g. a
+  // Vercel Firewall "Bypass" rule for CI runner IPs). The secret VALUE is never in this file: smoke.mjs reads it from the
+  // PIPELINE_SMOKE_BYPASS_KEY environment variable. null = no extra header.
+  smoke_bypass_header: null,
+  // smoke_bypass_origins: the ONLY origins the header may be sent to (exact match, https, e.g. "https://www.example.com").
+  // Required (non-empty) when smoke_bypass_header is set; a preview URL, any other host or localhost never gets the header.
+  smoke_bypass_origins: [],
   risk: { high_risk_paths: [], medium_lines: 150, high_lines: 600, medium_files: 10 },
   hard_stops: { paths: [], patterns: [], auth_calls: [], disable_rules: [], report_only_rules: [], report_only_paths: [] },
   integrity: {
@@ -89,6 +96,25 @@ const PROVIDERS = ['vercel', 'github-deployments', 'other'];
 // Who owns the production smoke: the ship session (prod-watch) or a CI workflow that posts the result on the merged PR.
 const WATCH_MODES = ['session', 'workflow'];
 const AFTER_FIX_MODES = ['full', 'quick'];
+// Lowercase "x-" + 1..60 of [a-z0-9-]: no standard header (authorization, cookie, ...) can match, so the smoke can never
+// be turned into an authenticated request by configuration. smoke.mjs imports this too, so both sides agree.
+export const SMOKE_BYPASS_HEADER_RE = /^x-[a-z0-9-]{1,60}$/;
+// An https origin exactly as `new URL(x).origin` prints it (no path, query, fragment, credentials, default port or uppercase).
+export function isSmokeBypassOrigin(x) {
+  if (typeof x !== 'string') return false;
+  try {
+    const u = new URL(x);
+    return u.protocol === 'https:' && !u.username && !u.password && x === u.origin && /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/.test(u.hostname); // no wildcards
+  } catch {
+    return false;
+  }
+}
+// A smoke request path: one leading "/" (never "//"), no backslash, no control characters. A path that does not start with a
+// single "/" could turn "https://site" + path into another host ("@evil.example/x" -> userinfo; "//evil" or "/\\evil" -> a
+// protocol-relative or backslash host), so the smoke refuses it; smoke.mjs imports this too and re-checks the final origin.
+export function isSmokePath(p) {
+  return typeof p === 'string' && p.startsWith('/') && !p.startsWith('//') && !/[\\\x00-\x1f\x7f]/.test(p);
+}
 export const SAFE_STEP = /^[A-Za-z0-9_.:-]+$/;
 
 // Allowed keys per mapping. Anything else is a typo (or a removed option) and is rejected.
@@ -418,7 +444,7 @@ function checkSmokeChecks(checks, errors) {
     const at = `smoke_checks[${i}]`;
     if (!isObj(item)) return errors.push(`${at} must be a mapping with a path`);
     unknownKeys(item, KEYS.smoke, `${at}.`, errors);
-    if (typeof item.path !== 'string' || !item.path.startsWith('/')) errors.push(`${at}.path is required and must start with '/'`);
+    if (!isSmokePath(item.path)) errors.push(`${at}.path is required, must start with a single '/' (not '//') and contain no backslash or control character`);
     if (item.status !== undefined) {
       const ok = Array.isArray(item.status) && item.status.length > 0 && item.status.every((s) => inRange(s, 100, 599));
       if (!ok) errors.push(`${at}.status must be a non-empty array of integers 100..599`);
@@ -563,6 +589,15 @@ export function validateConfig(obj) {
   if (config.preview !== null) checkPreview(config.preview, errors);
   if (config.production !== null) checkProduction(config.production, errors);
   checkSmokeChecks(config.smoke_checks, errors);
+  if (config.smoke_bypass_header !== null && !(typeof config.smoke_bypass_header === 'string' && SMOKE_BYPASS_HEADER_RE.test(config.smoke_bypass_header))) {
+    errors.push('smoke_bypass_header must be null or a lowercase header name matching /^x-[a-z0-9-]{1,60}$/ (e.g. x-smoke-key); the secret value belongs in the PIPELINE_SMOKE_BYPASS_KEY environment variable, not in this file');
+  }
+  const origins = config.smoke_bypass_origins;
+  if (!Array.isArray(origins) || !origins.every(isSmokeBypassOrigin)) {
+    errors.push('smoke_bypass_origins must be an array of https origins exactly as written by new URL(x).origin, e.g. "https://www.example.com" (no path, trailing slash, query, fragment, credentials or default port)');
+  } else if (config.smoke_bypass_header !== null && origins.length === 0) {
+    errors.push('smoke_bypass_origins must list at least one https origin when smoke_bypass_header is set: the header is only ever sent to a listed origin');
+  }
 
   return errors.length === 0 ? { ok: true, errors, warnings, config } : { ok: false, errors, warnings, config: null };
 }
