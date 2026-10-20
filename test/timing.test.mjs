@@ -98,6 +98,12 @@ test('factorFrom: PIPELINE_TIMING_FACTOR overrides when positive and finite, cla
   for (const bad of ['abc', '-2', '0', 'Infinity']) assert.equal(factorFrom(4 * REF_MS, { PIPELINE_TIMING_FACTOR: bad }), 4, bad);
 });
 
+// The factor is in the test NAME so it shows in the full-suite log: node --test drops console.log output when it runs many files.
+const runnerFactor = machineFactor();
+test(`timing factor on this runner: ${runnerFactor.toFixed(2)} (reference ${REF_MS} ms)`, () => {
+  assert.ok(runnerFactor >= 1 && runnerFactor <= 8);
+});
+
 test('machineFactor is memoized and cpuCap multiplies by it', () => {
   const f = machineFactor();
   assert.ok(f >= 1 && f <= 8);
@@ -145,7 +151,8 @@ test('assertSteps: the unit names what is counted in the message', () => {
 });
 
 test('assertLinearSteps: at most 2.5x the half-size count plus 4', () => {
-  assert.throws(() => assertLinearSteps(10, 30, 'q'), /q:/);
+  assert.throws(() => assertLinearSteps(10, 30, 'q'), /q: 30 clock reads at n > 2\.5 x 10 at n\/2 \+ 4/);
+  assert.throws(() => assertLinearSteps(10, 30, 'q', { unit: 'regex work units' }), /q: 30 regex work units at n > 2\.5/);
   assert.doesNotThrow(() => assertLinearSteps(10, 24, 'q'));
   assert.doesNotThrow(() => assertLinearSteps(10, 29, 'q'));
 });

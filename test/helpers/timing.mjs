@@ -124,7 +124,7 @@ export function assertSteps(reads, { floor, ceil, label, unit = 'clock reads' })
   assert.ok(reads >= floor && reads <= ceil, `${label}: ${reads} ${unit}, expected ${floor}..${ceil}`);
 }
 
-// Linear scaling in reads: the full-size run reads at most 2.5x the half-size run plus 4.
-export function assertLinearSteps(readsHalf, readsFull, label) {
-  assert.ok(readsFull <= 2.5 * readsHalf + 4, `${label}: ${readsFull} clock reads at n > 2.5 x ${readsHalf} at n/2 + 4`);
+// Linear scaling in reads: the full-size run reads at most 2.5x the half-size run plus 4. `unit` names what is counted in the failure message.
+export function assertLinearSteps(readsHalf, readsFull, label, { unit = 'clock reads' } = {}) {
+  assert.ok(readsFull <= 2.5 * readsHalf + 4, `${label}: ${readsFull} ${unit} at n > 2.5 x ${readsHalf} at n/2 + 4`);
 }

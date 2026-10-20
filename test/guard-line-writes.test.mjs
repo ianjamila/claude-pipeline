@@ -2124,7 +2124,7 @@ test('time: applySed refuses (null) a program whose regex work on the text could
     const full = { n: 0 };
     assert.notEqual(applySed({ args: ['-i', prog, 'f'], word: 'f' }, fileOf(1000), half), null, prog);
     assert.notEqual(applySed({ args: ['-i', prog, 'f'], word: 'f' }, file, full), null, prog);
-    assertLinearSteps(half.n, full.n, `applySed work for ${prog}`);
+    assertLinearSteps(half.n, full.n, `applySed work for ${prog}`, { unit: 'regex work units' });
     assertSteps(full.n, { floor, ceil, label: `applySed work for ${prog}`, unit: 'regex work units' });
   }
   for (const prog of ['s/foo.*bar/x/', 's/foo/x/g', '/v1[0-9]*/d', 's/^const //']) assert.notEqual(applySed({ args: ['-i', prog, 'f'], word: 'f' }, file), null, prog);
