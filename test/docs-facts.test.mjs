@@ -106,9 +106,11 @@ test('agents: verifier runs on haiku and reads no screenshots; reviewers are pin
   assert.match(front('agents/fable-reviewer.md'), /^effort: high$/m);
   for (const name of ['security-reviewer', 'screenshot-reviewer']) {
     assert.match(front(`agents/${name}.md`), /^model: sonnet$/m);
-    assert.ok(!/^effort:/m.test(front(`agents/${name}.md`)), `${name} pins no effort`);
     assert.ok(front(`agents/${name}.md`).includes(`name: ${name}\n`));
   }
+  // `review add` proves the security review at effort high, so the agent pins it; the screenshot reviewer pins none.
+  assert.match(front('agents/security-reviewer.md'), /^effort: high$/m);
+  assert.ok(!/^effort:/m.test(front('agents/screenshot-reviewer.md')));
   assert.match(front('agents/screenshot-reviewer.md'), /^tools: Read, Glob$/m);
   assert.ok(read('agents/screenshot-reviewer.md').includes('.verify/screenshots/*'));
 });

@@ -19,7 +19,7 @@ export const meta = {
     'pipeline review header --pr N --round R --source security|fable --base SHA --head SHA [--repo DIR]',
     '  -> {ok, promptHeader, digest}; paste promptHeader verbatim as the first two lines of the reviewer\'s prompt (`codex-review` also prints it per owed reviewer)',
     'pipeline review add --round R --source security|fable --tag TAG [--projects-dir DIR] [--max-age-ms N] [--repo DIR]',
-    '  -> {ok, round, source, added:[ids], errors}; proves the model (security: claude-sonnet-, no effort; fable: claude-fable- at effort high) and the header,',
+    '  -> {ok, round, source, added:[ids], errors}; proves the model (security: claude-sonnet- at effort high; fable: claude-fable- at effort high) and the header,',
     '     then adds the findings as items R<n>-X<B|S|W><i> (security) / R<n>-F<B|S|W><i> (fable) and marks the obligation met;',
     '     exit 1 {error: no-obligation | already-met} or an unproven answer (obligation failed, a human looks; add may be run again), 2 no transcript',
   ].join('\n'),
@@ -29,11 +29,7 @@ const SOURCE_FACTS = {
   security: { prefix: 'claude-sonnet-', agentType: 'security-reviewer', letter: 'X' },
   fable: { prefix: 'claude-fable-', agentType: 'fable-reviewer', letter: 'F' },
 };
-// proveModel always demands an effort. A Sonnet reviewer pins none, so its transcript lines carry no effort at all: a sentinel
-// no line can carry stands for "no effort", and the one error that absence produces is the only one dropped. A line that DOES
-// carry an effort still fails the proof.
-const NO_EFFORT = '(none)';
-const ABSENT_EFFORT = /^unexpected effort undefined on line \d+$/;
+// Both reviewers pin effort high in their agent files, so both are proven at high through the normal proveModel path.
 
 function sourceOption(values) {
   const source = requireOption(values, 'source');
@@ -103,9 +99,9 @@ async function add(argv, ctx) {
     const metaText = found.metaPath === null ? undefined : readOrFail(found.metaPath, 'meta');
 
     const proof = proveModel({
-      jsonlText, metaText, expectModelPrefix: facts.prefix, expectEffort: source === 'fable' ? 'high' : NO_EFFORT, expectMetaModel: null, expectAgentType: facts.agentType,
+      jsonlText, metaText, expectModelPrefix: facts.prefix, expectEffort: 'high', expectMetaModel: null, expectAgentType: facts.agentType,
     });
-    const errors = source === 'fable' ? [...proof.errors] : proof.errors.filter((e) => !ABSENT_EFFORT.test(e));
+    const errors = [...proof.errors];
     const prompt = proof.firstUserText ?? '';
     if (!new RegExp(`^ROUND: ${n}[ \\t]*$`, 'm').test(prompt)) errors.push(`the reviewer's prompt does not carry ROUND: ${n}`);
     if (!new RegExp(`^INPUT-DIGEST: ${obligation.digest}[ \\t]*$`, 'm').test(prompt)) errors.push("the reviewer's prompt does not carry this round's INPUT-DIGEST");

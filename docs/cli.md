@@ -419,7 +419,7 @@ reviewer obligations of a review round: the prompt header, and proving + adding 
 pipeline review header --pr N --round R --source security|fable --base SHA --head SHA [--repo DIR]
   -> {ok, promptHeader, digest}; paste promptHeader verbatim as the first two lines of the reviewer's prompt (`codex-review` also prints it per owed reviewer)
 pipeline review add --round R --source security|fable --tag TAG [--projects-dir DIR] [--max-age-ms N] [--repo DIR]
-  -> {ok, round, source, added:[ids], errors}; proves the model (security: claude-sonnet-, no effort; fable: claude-fable- at effort high) and the header,
+  -> {ok, round, source, added:[ids], errors}; proves the model (security: claude-sonnet- at effort high; fable: claude-fable- at effort high) and the header,
      then adds the findings as items R<n>-X<B|S|W><i> (security) / R<n>-F<B|S|W><i> (fable) and marks the obligation met;
      exit 1 {error: no-obligation | already-met} or an unproven answer (obligation failed, a human looks; add may be run again), 2 no transcript
 ```

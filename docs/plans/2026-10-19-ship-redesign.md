@@ -1388,7 +1388,7 @@ test('an unmet obligation keeps a round with zero items from being clean; failed
   - `test/docs-facts.test.mjs`:
     - `verifier.md` has `model: haiku`;
     - `fable-reviewer.md` has `model: fable` + `effort: high`;
-    - `security-reviewer.md` and `screenshot-reviewer.md` have `model: sonnet` and no `effort:`.
+    - `security-reviewer.md` has `model: sonnet` + `effort: high`; `screenshot-reviewer.md` has `model: sonnet` and no `effort:`.
   - `test/install.test.mjs`: the three new agents install and appear in the manifest.
   - `test/guard-files.test.mjs`: a Write to `~/.claude/agents/fable-reviewer.md` is denied.
 
@@ -1467,9 +1467,8 @@ const failedObligations = obl.filter((o) => o.status === 'failed').map((o) => `R
          `already-met`.
       2. `findSubagentTranscript({ tag, … })` (null → exit 2).
       3. `proveModel({ …, expectModelPrefix: source === 'fable' ? 'claude-fable-' : 'claude-sonnet-', expectEffort:
-         source === 'fable' ? 'high' : null, expectMetaModel: null, expectAgentType: source === 'fable' ?
-         'fable-reviewer' : 'security-reviewer' })`. Check how `proveModel` treats a null `expectEffort` and keep Sonnet
-         (no effort line) passing.
+         'high', expectMetaModel: null, expectAgentType: source === 'fable' ? 'fable-reviewer' : 'security-reviewer' })`.
+         Both agents pin `effort: high` (a live Sonnet transcript carries it), so the normal proof path serves both (r5).
       4. The header (`^ROUND: R$`, `^INPUT-DIGEST: <obligation.digest>$`) must be in `firstUserText`.
       5. `extractJsonBlock` → `validateFindings`.
       6. Any error → set the obligation `{ status: 'failed', reason: errors.join('; ').slice(0, 300), tag }`, save,
@@ -1488,7 +1487,7 @@ const failedObligations = obl.filter((o) => o.status === 'failed').map((o) => `R
       4. Final message: ONE ```json block matching `pipeline/schemas/codex-findings.schema.json` (summary, blocking,
          suggestions, worth_considering; each finding: title, file, line, category, detail, reasoning, testable).
       5. Empty lists are fine.
-    - `agents/security-reviewer.md`: same output contract; `model: sonnet`, no effort, `tools: Read, Grep, Glob, Bash`,
+    - `agents/security-reviewer.md`: same output contract; `model: sonnet`, `effort: high`, `tools: Read, Grep, Glob, Bash`,
       `color: orange`. Focus: RLS/grants/policies, auth checks, secret handling, injection, data exposure in migrations
       and app code of the diff.
     - `agents/screenshot-reviewer.md`: `model: sonnet`, no effort, `tools: Read, Glob`, `color: yellow`. Read every

@@ -70,7 +70,7 @@ function world(t, { yml = pipelineYml() } = {}) {
       return h.json;
     },
     // <projects>/<encoded-cwd>/<session>/subagents/agent-<id>.{jsonl,meta.json}: the layout Claude Code writes.
-    transcript({ prompt, text, model = 'claude-sonnet-5-1', effort, agentType = 'security-reviewer', tag = 'sec R1' }) {
+    transcript({ prompt, text, model = 'claude-sonnet-5-1', effort = 'high', agentType = 'security-reviewer', tag = 'sec R1' }) {
       const root = join(scratch, `projects-${Math.random().toString(36).slice(2, 8)}`);
       const dir = join(root, '-tmp-work', 'session-1', 'subagents');
       mkdirSync(dir, { recursive: true });
@@ -157,11 +157,14 @@ test('review add: an Opus transcript fails the obligation and puts it in needsHu
   assert.equal(o.clean, false);
 });
 
-test('review add: a Sonnet transcript that carries an effort is refused (the reviewer pins none)', (t) => {
-  const w = readyForSecurity(t);
-  const r = w.add(1, 'security', sonnet(w, { effort: 'high' }));
-  assertExit(r, 1, JSON.stringify(r.json));
-  assert.match(r.json.errors.join('; '), /unexpected effort high/);
+test('review add: the security review is pinned to Sonnet at effort high: an effort-less or other-effort transcript is refused', (t) => {
+  for (const effort of [null, 'medium', 'xhigh']) {
+    const w = readyForSecurity(t);
+    const r = w.add(1, 'security', sonnet(w, { effort }));
+    assertExit(r, 1, `${effort}: ${JSON.stringify(r.json)}`);
+    assert.match(r.json.errors.join('; '), new RegExp(`unexpected effort ${effort ?? 'undefined'}`), String(effort));
+    assert.equal(w.state().rounds[0].obligations[0].status, 'failed');
+  }
 });
 
 test('review add: a header with another head\'s digest, a wrong agent type or a missing round line fails the obligation', (t) => {
@@ -230,7 +233,7 @@ test('final pass: final_pass risky on a high-risk PR with no BLOCKING owes a Fab
   assertExit(r, 0, r.stderr + r.stdout);
   assert.deepEqual(w.state().rounds[0].obligations.map((o) => o.source), ['security', 'fable']);
   const h = w.header(1, 'fable');
-  const bad = w.add(1, 'fable', w.transcript({ prompt: h.promptHeader, text: fenced(findingsOf()), model: 'claude-fable-5-1', agentType: 'fable-reviewer', tag: 'fable R1' }), 'fable R1');
+  const bad = w.add(1, 'fable', w.transcript({ prompt: h.promptHeader, text: fenced(findingsOf()), model: 'claude-fable-5-1', effort: null, agentType: 'fable-reviewer', tag: 'fable R1' }), 'fable R1');
   assertExit(bad, 1, JSON.stringify(bad.json));
   assert.match(bad.json.errors.join('; '), /unexpected effort undefined/, 'Fable must be proven at effort high');
   const good = w.add(1, 'fable', w.transcript({ prompt: h.promptHeader, text: fenced(findingsOf([finding({ title: 'Attack' })])), model: 'claude-fable-5-1', effort: 'high', agentType: 'fable-reviewer', tag: 'fable R1' }), 'fable R1');

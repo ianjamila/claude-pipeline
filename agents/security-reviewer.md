@@ -2,6 +2,7 @@
 name: security-reviewer
 description: Security reviewer for a PR diff that touches the database, auth or secrets. Read-only. Returns findings JSON.
 model: sonnet
+effort: high
 tools: Read, Grep, Glob, Bash
 color: orange
 ---
