@@ -607,7 +607,7 @@ test('roundOutcome: clean when every item is settled, nothing accepted, and the 
   ];
   const o = roundOutcome(stateOf([round(1, []), round(2, items)]));
   assert.deepEqual(o, {
-    clean: true, openBlocking: [], newAccepted: [], needsHuman: [], pending: [], unimplemented: [], reachedMax: false, coverageValid: true,
+    clean: true, openBlocking: [], newAccepted: [], needsHuman: [], pending: [], unimplemented: [], reachedMax: false, extraRound: false, effectiveMaxRounds: 3, coverageValid: true,
   });
 });
 
@@ -682,6 +682,28 @@ test('roundOutcome: newAccepted is last-round only, an implemented earlier ACCEP
   assert.equal(o.clean, true);
 });
 
+// One extra round past the cap, only when the last round's sole open items are accepted fixes already implemented.
+const fixed = (n) => item({ id: `R${n}-B1`, bucket: 'BLOCKING', final: settled('ACCEPT', 'judge'), implemented: true });
+const upTo = (n, last, hash = 'h-final') => [...Array.from({ length: n - 1 }, (_, i) => round(i + 1, [fixed(i + 1)])), round(n, last, hash)];
+const extraCases = [
+  ['at the cap, only implemented new accepts and a stale hash', () => stateOf(upTo(3, [fixed(3)], 'h-old')), { extraRound: true, reachedMax: false, effectiveMaxRounds: 4, clean: false }],
+  ['at the cap with an unimplemented accept too', () => stateOf(upTo(3, [fixed(3), item({ id: 'R3-S1', bucket: 'SUGGESTION', final: settled('ACCEPT', 'judge') })], 'h-old')), { extraRound: false, reachedMax: true, effectiveMaxRounds: 3 }],
+  ['at the cap with a needsHuman item', () => stateOf(upTo(3, [fixed(3), item({ id: 'R3-B2', final: settled('REJECT', 'arbiter', { needsHuman: true }) })], 'h-old')), { extraRound: false, reachedMax: true, effectiveMaxRounds: 3 }],
+  ['at the cap with an open BLOCKING accept', () => stateOf(upTo(3, [fixed(3), item({ id: 'R3-B2', bucket: 'BLOCKING', final: settled('ACCEPT', 'judge') })], 'h-old')), { extraRound: false, reachedMax: true, effectiveMaxRounds: 3 }],
+  ['at the cap with a pending item', () => stateOf(upTo(3, [fixed(3), item({ id: 'R3-S1', bucket: 'SUGGESTION' })], 'h-old')), { extraRound: false, reachedMax: true, effectiveMaxRounds: 3 }],
+  ['at the cap, no new accepts, only a stale hash', () => stateOf(upTo(3, [item({ id: 'R3-S1', bucket: 'SUGGESTION', final: settled('REJECT') })], 'h-old')), { extraRound: false, reachedMax: true, effectiveMaxRounds: 3 }],
+  ['the extra round (4) accepted again', () => stateOf(upTo(4, [fixed(4)])), { extraRound: false, reachedMax: true, effectiveMaxRounds: 4, clean: false }],
+  ['the extra round (4) is clean', () => stateOf(upTo(4, [])), { extraRound: false, reachedMax: false, effectiveMaxRounds: 4, clean: true }],
+  ['below the cap with new accepts', () => stateOf(upTo(2, [fixed(2)])), { extraRound: false, reachedMax: false, effectiveMaxRounds: 3, clean: false }],
+  ['no maxRounds', () => stateOf(upTo(3, [fixed(3)]), { maxRounds: undefined }), { extraRound: false, reachedMax: false, effectiveMaxRounds: null }],
+];
+for (const [name, build, want] of extraCases) {
+  test(`roundOutcome extraRound: ${name}`, () => {
+    const o = roundOutcome(build());
+    for (const [k, v] of Object.entries(want)) assert.equal(o[k], v, `${k}`);
+  });
+}
+
 test('roundOutcome: no rounds yet is not clean', () => {
   const o = roundOutcome(stateOf([]));
   assert.equal(o.clean, false);
@@ -689,12 +711,18 @@ test('roundOutcome: no rounds yet is not clean', () => {
   assert.equal(o.reachedMax, false);
 });
 
-test('roundOutcome: reachedMax after three unclean rounds, not before, and not when clean', () => {
+test('roundOutcome: reachedMax after the extra round is also unclean, not before, and not when clean', () => {
   const accepting = (n) => round(n, [item({ id: `R${n}-B1`, bucket: 'BLOCKING', final: settled('ACCEPT', 'judge'), implemented: true })]);
   assert.equal(roundOutcome(stateOf([accepting(1), accepting(2)])).reachedMax, false);
+  // three rounds whose last only accepted implemented fixes: one extra round, not a park
   const three = roundOutcome(stateOf([accepting(1), accepting(2), accepting(3)]));
-  assert.equal(three.reachedMax, true);
+  assert.equal(three.reachedMax, false);
+  assert.equal(three.extraRound, true);
   assert.equal(three.clean, false);
+  const four = roundOutcome(stateOf([accepting(1), accepting(2), accepting(3), accepting(4)]));
+  assert.equal(four.reachedMax, true);
+  assert.equal(four.extraRound, false);
+  assert.equal(four.clean, false);
   const cleanThird = roundOutcome(stateOf([accepting(1), accepting(2), round(3, [])]));
   assert.equal(cleanThird.clean, true);
   assert.equal(cleanThird.reachedMax, false, 'a clean exit on the last allowed round is not a failure');

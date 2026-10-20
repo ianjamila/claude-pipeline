@@ -2,7 +2,7 @@
 
 `P` = `node ~/.claude/pipeline/bin/pipeline.mjs`. Run from the PR worktree. `<pr>` is the pull
 request number, `<round>` the round number (1, 2, 3). One round = one Codex pass + triage + (maybe)
-arbitration + implementation. Max `review.max_rounds` (default 3). Commands run as jobs report their
+arbitration + implementation. Max `review.max_rounds` (default 3), + one extra round when the last round's only open items are accepted fixes (`extraRound`). Commands run as jobs report their
 real code as `exitCode` in `job wait` (see Invariant 8 in `SKILL.md`).
 
 ## Replaying a review (resume, or a second machine)
@@ -158,6 +158,7 @@ permissions / data-integrity / data-loss item ⇒ `needsHuman` (the CLI applies 
   coverage matches the current content hash) ⇒ leave the loop.
 - `needsHuman` non-empty ⇒ **park needs-human** (label, comment, `P summary --outcome needs-human`), stop.
 - else if `<round>` < max ⇒ round `<round>`+1 (reviews only the diff since this round's head).
+- else if `extraRound` ⇒ ONE extra round `<round>`+1 (the last: it reviews only the fixes since this round's head; afterwards `extraRound` is false, so anything not clean parks).
 - else ⇒ **park needs-human** with the unresolved list (same label, comment, `P summary`), stop.
 
 **Park needs-human** (every `needs-human` stop in this loop is this exact sequence, never a bare label):
