@@ -122,6 +122,9 @@ up the pipeline hands the owner a green PR to merge in GitHub with an honest not
   normalised (`db/` → `db/**`, braces) + command-level risk tests; `plan review --extra` (Codex keys reserved only
   through `plan review`); listing-lag `superseded` re-check; hand-off renders the final gate's items; update-branch
   cleanup null-safe with pairs on throws; two test fixtures corrected; Codex usage per execution + cumulative probe.
+- r4 (2026-10-20, during the build; commit security review of T1 flagged a parser differential): T1 Step 3b —
+  CommonMark fence rules, no HTML comments / nested items in Scope, the approval request shows the parsed Scope list.
+  Built as a separate commit after T2 (T1 was already committed).
 
 ---
 
@@ -351,6 +354,21 @@ export const planRequestLines = ({ pr, blob, scopeDigest: d }) => [
 ];
 ```
 
+- [ ] **Step 3b: Hardening (amendment r4, commit security review 2026-10-20: parser differential).** What the owner
+  sees rendered must be what the parser reads:
+  - fences follow CommonMark: an opening fence is ≤ 3 spaces of indent + a run of ≥ 3 backticks or tildes; it closes
+    only on a line of the SAME character, at least as LONG as the opener, ≤ 3 spaces indent, nothing else on it but
+    spaces; an unclosed fence runs to the end of the text. A backtick fence whose info string contains a backtick is
+    not a fence;
+  - `## ` headings and `### Task` headings count only at ≤ 3 spaces indent (the regexes already anchor at column 0:
+    keep that);
+  - the `## Scope` section is refused (`PlanError`) when it contains `<!--`, a raw HTML tag line, or a scope item inside a
+    blockquote / nested list deeper than one level: the scope is a flat list the owner can read as written;
+  - tests: a ```` (4-backtick) fence closed by ``` hides a later `## Scope` from neither the viewer nor the parser (the
+    parser keeps it masked until a ≥ 4-backtick close); `<!-- - `evil/**` -->` inside Scope → `PlanError`; a
+    4-space-indented ``` line is not a fence.
+  - `P plan record` already prints `scope` (the parsed list): the approval request (T10 `plan-stage.md` template)
+    shows THAT list verbatim, never the raw markdown, next to the `scope <digest12>` it binds.
 - [ ] **Step 4: Run** `node scripts/test.mjs plan.test` → PASS.
 - [ ] **Step 5: Commit** `git add pipeline/lib/plan.mjs test/plan.test.mjs && git commit -m "feat(plan): plan parser, scope digest and scope matcher"` (+ trailer).
 
@@ -1783,8 +1801,8 @@ if (record?.outcome === 'owner-ui-merge') return { enter: 'owner-ui-merge', reas
         printed `promptHeader` as the first lines, Agent description = the tag `pipeline-fable-plan <key>` → `P plan
         findings --pr N --key <key> --tag "<tag>"`;
     - cost booking `P cost --pr N --phase plan --role codex|fable --execution codex:<session>|agent:<id> …`;
-    - the approval request template (summary, plan or Scope in full, reviewer tally, plan token total, extras, two
-      lines);
+    - the approval request template (summary, the Scope list EXACTLY as `P plan record` printed it — the parsed list,
+      never the rendered markdown (amendment r4) — reviewer tally, plan token total, extras, two lines);
     - amendment rules;
     - the machine-switch rule (resume re-shows the request only while build work remains);
     - the rollout rule: both machines run `node ~/.claude/pipeline/bin/pipeline.mjs update` before any new-style run,
