@@ -14,6 +14,7 @@ export const MAX_LINE_BYTES = 4000;
 export const MAX_FILE_BYTES = 2 * 1024 * 1024; // past this the file moves to <file>.1 (one generation is kept)
 const MAX_ERROR = 300;
 const MAX_SKIP = 200;
+const MAX_PROJECT = 200; // config accepts any project string; `dir` stays whole (readers match on it)
 const LOCK_NAME = 'verify-run-history';
 
 const cut = (s, n) => s.slice(0, n);
@@ -31,7 +32,7 @@ export function historyPath(env = {}, override) {
   return home ? join(home, '.claude', 'pipeline-state', 'verify-runs.jsonl') : null;
 }
 
-/** The JSON line (no trailing newline) for a finished run. `report` is the object verify wrote to .verify/report.json. */
+/** The JSON line (no trailing newline) for a finished run; throws when even the step-less line is over the limit (a very long `dir`). `report` is the object verify wrote to .verify/report.json. */
 export function buildHistoryLine(report, { project, dir, exitCode }) {
   const rows = report.steps ?? [];
   const plain = rows.map((s) => ({ name: s.name, status: s.status, durationMs: s.durationMs }));
@@ -42,7 +43,7 @@ export function buildHistoryLine(report, { project, dir, exitCode }) {
   }));
   const entry = (steps) => ({
     v: 1,
-    project,
+    project: cut(String(project), MAX_PROJECT),
     dir,
     head: report.git?.head ?? null,
     mode: report.mode,
@@ -58,7 +59,9 @@ export function buildHistoryLine(report, { project, dir, exitCode }) {
     const line = JSON.stringify(entry(steps));
     if (Buffer.byteLength(line) < MAX_LINE_BYTES) return line;
   }
-  return JSON.stringify(entry([]));
+  const bare = JSON.stringify(entry([]));
+  if (Buffer.byteLength(bare) < MAX_LINE_BYTES) return bare;
+  throw new Error(`line would be ${Buffer.byteLength(bare)} bytes even without steps (limit ${MAX_LINE_BYTES})`);
 }
 
 /**

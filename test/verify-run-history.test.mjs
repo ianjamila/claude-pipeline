@@ -47,6 +47,15 @@ test('buildHistoryLine: exactly the agreed keys and values, skip fields only on 
   assert.equal('sqlArms' in o, false, 'no project-specific top-level key');
 });
 
+test('buildHistoryLine: a huge project is cut to 200 and the line stays under the limit; a huge dir throws instead of writing', async () => {
+  const { MAX_LINE_BYTES } = await import('../pipeline/lib/verify-run-history.mjs');
+  const line = buildHistoryLine(report(), { ...OPTS, project: 'p'.repeat(5000) });
+  assert.ok(Buffer.byteLength(line) + 1 <= MAX_LINE_BYTES);
+  assert.equal(JSON.parse(line).project, 'p'.repeat(200));
+  assert.equal(JSON.parse(line).dir, OPTS.dir);
+  assert.throws(() => buildHistoryLine(report(), { ...OPTS, dir: '/d'.repeat(3000) }), /even without steps/);
+});
+
 test('buildHistoryLine: head is null without git; error only when set; error cut to 300, skip fields to 200', () => {
   const o = JSON.parse(buildHistoryLine(report({ git: { head: null } }), OPTS));
   assert.equal(o.head, null);
