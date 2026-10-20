@@ -135,9 +135,9 @@ test('report_only_paths: a match is one advisory P-path hit; no match, no hit', 
 });
 
 test('a file matching both paths and report_only_paths blocks: exactly one, blocking hit', () => {
-  const c = ro([], { paths: ['lib/dtr/**'], reportPaths: ['lib/dtr/**', 'lib/**'] });
-  const hits = classify({ files: [file('lib/dtr/a.ts'), file('lib/other.ts')], config: c });
-  assert.deepEqual(hits.map((h) => [h.rule, h.file, Boolean(h.advisory)]), [['P-path', 'lib/dtr/a.ts', false], ['P-path', 'lib/other.ts', true]]);
+  const c = ro([], { paths: ['lib/timesheets/**'], reportPaths: ['lib/timesheets/**', 'lib/**'] });
+  const hits = classify({ files: [file('lib/timesheets/a.ts'), file('lib/other.ts')], config: c });
+  assert.deepEqual(hits.map((h) => [h.rule, h.file, Boolean(h.advisory)]), [['P-path', 'lib/timesheets/a.ts', false], ['P-path', 'lib/other.ts', true]]);
 });
 
 test('report_only_paths cannot soften another rule on the same file', () => {

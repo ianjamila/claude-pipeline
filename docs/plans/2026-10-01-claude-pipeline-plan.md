@@ -158,7 +158,7 @@ Tests (each a `test()`):
 
 `globToRegExp(glob)` and `matchAny(path, globs)`; POSIX-normalised input; supports `**`, `*`, `?`, `{a,b}`, leading `!` negation in `matchAny` lists (last match wins); dotfiles matched by `*`.
 
-Table test (path, glob, expected): (`a/b/c.ts`,`a/**`,T) (`a/b/c.ts`,`**/*.ts`,T) (`c.ts`,`**/*.ts`,T) (`a/b.test.ts`,`**/*.test.*`,T) (`.github/workflows/x.yml`,`.github/**`,T) (`lib/sa-payroll/x.ts`,`lib/sa-payroll/**`,T) (`lib/payroll.ts`,`lib/payroll/**`,F) (`app/api/cron/sa-payroll-x/route.ts`,`app/api/cron/sa-payroll-*/**`,T) (`x/middleware.ts`,`**/middleware.{ts,js,mjs}`,T) (`middleware.ts`,`**/middleware.{ts,js,mjs}`,T) (`scripts/reseed_x.mjs`,`scripts/reseed_*`,T) (`scripts/sub/reseed_x.mjs`,`scripts/reseed_*`,F). `matchAny('a/b.ts',['**','!a/**'])` → F.
+Table test (path, glob, expected): (`a/b/c.ts`,`a/**`,T) (`a/b/c.ts`,`**/*.ts`,T) (`c.ts`,`**/*.ts`,T) (`a/b.test.ts`,`**/*.test.*`,T) (`.github/workflows/x.yml`,`.github/**`,T) (`lib/team-billing/x.ts`,`lib/team-billing/**`,T) (`lib/payroll.ts`,`lib/payroll/**`,F) (`app/api/cron/team-billing-x/route.ts`,`app/api/cron/team-billing-*/**`,T) (`x/middleware.ts`,`**/middleware.{ts,js,mjs}`,T) (`middleware.ts`,`**/middleware.{ts,js,mjs}`,T) (`scripts/reseed_x.mjs`,`scripts/reseed_*`,T) (`scripts/sub/reseed_x.mjs`,`scripts/reseed_*`,F). `matchAny('a/b.ts',['**','!a/**'])` → F.
 
 - [ ] Tests → impl → PASS → commit `feat: glob matcher`.
 
@@ -225,7 +225,7 @@ Hard-stop test table (fixture file contents built inline):
 |18|`middleware.ts` modified|R2|
 |19|`app/x/page.tsx` adds `createAdminClient(`|R2|
 |20|migration file deleted|R1|
-|21|config `hard_stops.paths:['lib/sa-payroll/**']`, `lib/sa-payroll/a.ts`|P-path (+R6)|
+|21|config `hard_stops.paths:['lib/hr-payroll/**']`, `lib/hr-payroll/a.ts`|P-path (+R6)|
 |22|config pattern `{name:'face', regex:'face(api|-recog)', paths:['**/*.ts']}` matched on added line|P-pattern|
 |23|`app/(public)/login/page.tsx` text change|none|
 |24|rename `lib/util.ts`→`lib/payroll/util.ts`|R6 on new path|

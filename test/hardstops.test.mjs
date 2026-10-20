@@ -48,7 +48,7 @@ const TABLE = [
   ['20 migration deleted', { files: [file(MIG, { status: 'D', removed: ['create table t(id int);'] })] },
     ['R1-destructive', 'R1-migration-edited']],
   ['21 config path + payroll path', {
-    files: [file('lib/sa-payroll/a.ts')], config: cfg({ paths: ['lib/sa-payroll/**'] }),
+    files: [file('lib/hr-payroll/a.ts')], config: cfg({ paths: ['lib/hr-payroll/**'] }),
   }, ['P-path', 'R6-sensitive']],
   ['22 config pattern on an added line', {
     files: [file('lib/x.ts', { added: ["import faceapi from 'faceapi';"] })],

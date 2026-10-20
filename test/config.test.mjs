@@ -50,7 +50,7 @@ test('realistic eaglewatch config is ok', () => {
   assert.equal(c.ci.required_checks.length, 5);
   assert.equal(c.preview.environment, 'Preview');
   assert.equal(c.preview.provider, 'github-deployments');
-  assert.equal(c.production.url, 'https://ewiapp.eaglewatch.ph');
+  assert.equal(c.production.url, 'https://app.example.com');
   assert.equal(c.production.provider, 'vercel');
   assert.equal(c.production.rollback.command, 'vercel rollback --yes');
   assert.ok(c.hard_stops.paths.includes('supabase/migrations/**'));

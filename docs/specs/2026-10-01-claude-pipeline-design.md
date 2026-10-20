@@ -289,7 +289,7 @@ preview:
   environment: Preview
   smoke: "node scripts/pipeline/smoke.mjs --base {url}"
 production:
-  url: https://ewiapp.eaglewatch.ph
+  url: https://app.example.com
   environment: Production
   deploy_timeout_minutes: 20
   watch: session            # session | workflow (see §10.1)
@@ -556,23 +556,13 @@ and only adds lines. Line format:
 - **Merge command**: `npm run merge -- {pr}` (existing gate: obliged checks, head-SHA binding,
   freshness, squash). Gate extended to refuse PRs labelled `needs-human`, `awaiting-review`,
   `pipeline-blocked`.
-- **Hard-stop extras** (inferred): `supabase/migrations/**`, `supabase/config.toml`,
-  `scripts/sql-arms/**` (prod apply is manual); `middleware.ts`, `lib/supabase/**`,
-  `lib/auth*`, `lib/roles.ts`, `lib/admin-rbac/**`, `lib/impersonation/**`,
-  `lib/rate-limit/**`, `app/auth/**`, `app/api/public/**`, `app/api/webhooks/**`,
-  `app/api/cron/**`, `app/dashboard/admin/settings/impersonation-actions.ts`; payroll
-  (`lib/payroll/**`, `lib/sa-payroll/**`, `components/reports/sa-payroll/**`,
-  `app/dashboard/reports/securityassistant/payroll/**`,
-  `app/dashboard/reports/admin/sa-payroll/**`,
-  `app/dashboard/admin/clients/payroll-periods/**`,
-  `app/dashboard/admin/clients/batches/payroll-actions.ts`, `app/api/cron/sa-payroll-*`,
-  `lib/dtr-actions.ts`, `lib/dtr-scope.ts`, `lib/dtr/**`, `lib/dmc/**`, `lib/soundoff/pair.ts`);
-  biometrics (`lib/biometrics/**`, `app/dashboard/admin/manhour/biometrics/**`,
-  `app/dashboard/admin/anomalies/biometrics-staleness/**`, `lib/manhour/biometrics-links.ts`,
-  `lib/ias/**`); facial-recognition rule for any future `face|facial|liveness|rekognition`
-  code; prod-writing scripts (`scripts/reseed_*`, `scripts/backfill_*`, `scripts/fix_*`,
-  `scripts/import-*`, `scripts/storage-cleanup/**`, `scripts/sql/**`); `vercel.json`;
-  merge-gate scripts; `next.config.ts`; `package.json` scripts.
+- **Hard-stop extras** (inferred): the database migrations and config (prod apply is manual);
+  middleware, auth, roles, admin-RBAC and impersonation code, rate limiting, public endpoints,
+  webhooks and cron routes; payroll and time-record code; biometrics code; a
+  facial-recognition rule for any future `face|facial|liveness|rekognition` code;
+  prod-writing scripts; deploy config, merge-gate scripts, the framework config and
+  `package.json` scripts. The exact globs live in the project's own (private)
+  `.claude/pipeline.yml`, not in this public repo.
 - **pgTAP**: `supabase/tests/` with RLS tests on synthetic fixtures (owner/role allowed, other
   roles denied) for at least one guarded table; runs in verify and in `Replay from zero`.
 - **E2E smoke**: new `e2e/smoke/*.spec.ts` (login page renders; seeded admin reaches the
