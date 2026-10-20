@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { ciProof } from '../pipeline/lib/ci-proof.mjs';
-import { MERGE_SHA, SLUG, SPEC, jobsFor, lookupScenario, runFor } from './helpers/ci-proof-lookup-env.mjs';
+import { MERGE_SHA, SLUG, SPEC, jobsFor, lookupScenario, runFor, stepsList } from './helpers/ci-proof-lookup-env.mjs';
 
 const lookup = (s) => ciProof(s.args);
 const is = (res, state, text, label) => {
@@ -410,4 +410,116 @@ test('unusable inputs never reach GitHub: a bad spec, PR, head, base or a worktr
   is(await ciProof(undefined), 'missing', null, 'no arguments at all');
   is(await ciProof({}), 'missing', null, 'empty arguments');
   is(await ciProof({ ...a, root: '/nonexistent/dir/for/ci-proof' }), 'missing', /GitHub lookup failed|HEAD/, 'unreadable worktree');
+});
+
+// ---- required job steps (spec.steps, rule 5) -------------------------------------------------------
+
+const WORK = ['Typecheck', 'Vitest'];
+// A scenario whose aggregator job carries `steps` laid out like checks.yml's "Typecheck + Vitest"; the spec asks for WORK to have succeeded.
+function stepScenario({ outcomes, names, listing = true, steps = WORK } = {}) {
+  const s = lookupScenario();
+  const run = s.addRun();
+  s.jobs[run.id] = jobsFor(run, { patch: (j) => { if (listing) j.steps = stepsList(outcomes, names); } });
+  const args = s.args;
+  return { s, run, ask: () => ciProof({ ...args, spec: { ...args.spec, steps } }) };
+}
+
+test('steps: the job and every named step succeeded -> pass, naming the steps in the reason and on the run', async () => {
+  const { s, ask } = stepScenario();
+  const res = await ask();
+  is(res, 'pass', /job "SQL arms" passed in run 5001 attempt 1.*; steps succeeded: "Typecheck", "Vitest"/);
+  assert.deepEqual(res.run.steps, WORK);
+  assert.ok(!s.calls.some((c) => c.includes('/actions/jobs/')), 'the listing already had the steps: no extra read');
+});
+
+test('steps: the docs-only case (job success, every work step skipped) is missing, not a pass', async () => {
+  const skipped = { Typecheck: ['completed', 'skipped'], Vitest: ['completed', 'skipped'], Install: ['completed', 'skipped'] };
+  const { ask } = stepScenario({ outcomes: skipped });
+  is(await ask(), 'missing', /step "Typecheck" of job "SQL arms" in run 5001 attempt 1 did not succeed \(skipped\); the Mac runs the step/, 'both skipped');
+  const one = stepScenario({ outcomes: { Vitest: ['completed', 'skipped'] } });
+  is(await one.ask(), 'missing', /step "Vitest" .*\(skipped\)/, 'one of two skipped');
+});
+
+test('steps: absent, listed twice, failure under a green job, cancelled, neutral, unfinished and unknown conclusions are all missing', async () => {
+  const absent = stepScenario({ names: ['Set up job', 'Checkout', 'Typecheck'] });
+  is(await absent.ask(), 'missing', /step "Vitest" is not in job "SQL arms"/, 'absent');
+  const twice = stepScenario({ names: ['Set up job', 'Typecheck', 'Vitest', 'Vitest'] });
+  is(await twice.ask(), 'missing', /step "Vitest" is listed 2 times in job "SQL arms"/, 'duplicated');
+  for (const [label, outcome, text] of [
+    ['failure under success (continue-on-error)', ['completed', 'failure'], /\(failure\)/],
+    ['cancelled', ['completed', 'cancelled'], /\(cancelled\)/],
+    ['neutral', ['completed', 'neutral'], /\(neutral\)/],
+    ['unknown conclusion', ['completed', 'surprising'], /\(surprising\)/],
+    ['no conclusion', ['completed', null], /\(no conclusion\)/],
+    ['still running', ['in_progress', null], /\(in_progress\)/],
+    ['pending', ['pending', null], /\(pending\)/],
+  ]) {
+    const t = stepScenario({ outcomes: { Typecheck: outcome } });
+    const res = await t.ask();
+    is(res, 'missing', text, label);
+    assert.match(res.reason, /step "Typecheck"/, label);
+  }
+  const garbage = stepScenario();
+  garbage.s.jobs[5001].jobs.find((j) => j.name === SPEC.job).steps.push('not an object');
+  is(await garbage.ask(), 'missing', /unreadable entry in its steps/, 'a malformed entry');
+});
+
+test('steps: the job\'s own verdict still wins - a failed job is failure and a pending job is pending without looking at steps', async () => {
+  const red = stepScenario();
+  red.s.jobs[5001].jobs.find((j) => j.name === SPEC.job).conclusion = 'failure';
+  is(await red.ask(), 'failure', /job "SQL arms" failure/);
+  const running = stepScenario();
+  Object.assign(running.s.jobs[5001].jobs.find((j) => j.name === SPEC.job), { status: 'in_progress', conclusion: null });
+  is(await running.ask(), 'pending', /is in_progress/);
+});
+
+test('steps: a job object without steps in the listing costs one actions/jobs/<id> read; nothing usable there is missing', async () => {
+  const fetched = stepScenario({ listing: false });
+  const job = fetched.s.jobs[5001].jobs.find((j) => j.name === SPEC.job);
+  fetched.s.jobDetail[job.id] = { ...job, steps: stepsList() };
+  const res = await fetched.ask();
+  is(res, 'pass', /steps succeeded/, 'steps read from the job');
+  assert.equal(fetched.s.calls.filter((c) => c === `GET repos/${SLUG}/actions/jobs/${job.id}`).length, 1, 'exactly one extra read');
+
+  const emptyList = stepScenario({ listing: false });
+  const j2 = emptyList.s.jobs[5001].jobs.find((j) => j.name === SPEC.job);
+  j2.steps = [];
+  emptyList.s.jobDetail[j2.id] = { ...j2, steps: stepsList({ Vitest: ['completed', 'skipped'] }) };
+  is(await emptyList.ask(), 'missing', /step "Vitest" .*\(skipped\)/, 'an empty listed steps array is not usable: the fallback is read, and its verdict counts');
+
+  const noSteps = stepScenario({ listing: false });
+  is(await noSteps.ask(), 'missing', /lists no steps, so its required steps cannot be checked/, 'the job read has no steps either');
+
+  const wrongJob = stepScenario({ listing: false });
+  const j3 = wrongJob.s.jobs[5001].jobs.find((j) => j.name === SPEC.job);
+  wrongJob.s.jobDetail[j3.id] = { ...j3, id: j3.id + 1, steps: stepsList() };
+  is(await wrongJob.ask(), 'missing', /is not that job/, 'a reply for another job');
+
+  const broken = stepScenario({ listing: false });
+  broken.s.fail.add('/actions/jobs/');
+  const bad = await broken.ask();
+  is(bad, 'missing', /gh api .*\/actions\/jobs\/\d+ failed/, 'the extra read fails');
+  assert.match(bad.reason, /^the GitHub lookup failed:/);
+});
+
+test('steps: without spec.steps nothing changes - no extra call, no steps on the run, the same reason', async () => {
+  const s = lookupScenario();
+  const run = s.addRun();
+  s.jobs[run.id] = jobsFor(run, { patch: (j) => { j.steps = stepsList({ Typecheck: ['completed', 'skipped'] }); } });
+  const res = await lookup(s);
+  is(res, 'pass', /^job "SQL arms" passed in run 5001 attempt 1 of .*\(tested merge commit d{7}, tree equal to HEAD\)$/);
+  assert.equal('steps' in res.run, false);
+  assert.ok(!s.calls.some((c) => c.includes('/actions/jobs/')));
+});
+
+test('steps: an unusable spec.steps is missing before any GitHub call', async () => {
+  const s = lookupScenario();
+  s.addRun();
+  const a = s.args;
+  for (const [label, steps] of [['empty', []], ['duplicates', ['a', 'a']], ['non-string', ['a', 3]], ['blank', ['  ']], ['a string', 'Typecheck'], ['null', null], ['an object', {}]]) {
+    s.calls.length = 0;
+    const res = await ciProof({ ...a, spec: { ...a.spec, steps } });
+    is(res, 'missing', /steps is not a non-empty list of distinct step names/, label);
+    assert.deepEqual(s.calls, [], `${label}: no GitHub call`);
+  }
 });

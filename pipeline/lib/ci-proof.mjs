@@ -5,8 +5,8 @@
 // Contract (finalgate.mjs#verifyReportCheck relies on it):
 //   ciProof({ root, step, spec, pr, head, tree, base, gh, env }) -> Promise<{ state, reason, run? }>
 //     root   the PR worktree          step  the deferred step's name (e.g. 'sql-arms')
-//     spec   { workflow, job, event } from the BASE branch's verify.ci_proof[step] (workflow = '.github/workflows/<file>.yml', event
-//            already defaulted to 'pull_request'); never the PR's own copy
+//     spec   { workflow, job, event, steps? } from the BASE branch's verify.ci_proof[step] (workflow = '.github/workflows/<file>.yml', event
+//            already defaulted to 'pull_request'; steps = optional names of steps inside the job, see rule 5); never the PR's own copy
 //     pr     the PR number            head  the PR head SHA the gate is judging            tree  `git rev-parse HEAD^{tree}`-style
 //            fingerprint the gate computed (treeFingerprint) for that head (not used here: HEAD^{tree} is read from `root`)
 //     base   { ref, sha } the default branch name and its tip as fetched just now (origin/<ref>)
@@ -16,7 +16,8 @@
 //          'failure' the run completed and the job did not succeed
 //          'missing' no usable run, anything ineligible, or any API/parse error (fail closed; a cancelled or skipped run counts as missing)
 //   reason one short human line (always present; shown in the gate detail)
-//   run    required for 'pass', ignored otherwise: { id, attempt, jobId, workflow, job, url } - the run/attempt/job that was used
+//   run    required for 'pass', ignored otherwise: { id, attempt, jobId, workflow, job, url, steps? } - the run/attempt/job that was used
+//          (steps = the step names rule 5 checked, present only when spec.steps was set)
 // The caller treats a throw, an unknown state, or a 'pass' without `run` as 'missing': nothing here can make the gate pass by failing.
 //
 // How the run is chosen and bound (plan "Run selection" / "The run must belong to THIS PR"):
@@ -34,6 +35,14 @@
 //   4. The jobs of that attempt (`runs/<id>/attempts/<n>/jobs`, paginated) must hold exactly ONE job named spec.job (a sharded job needs a
 //      configured aggregator name; 0 or 2+ -> missing). completed+success -> pass; completed+failure|timed_out -> failure; cancelled,
 //      skipped and anything else -> missing (a cancelled run was superseded, it is not red); queued/in_progress -> pending.
+//   5. Optional spec.steps (non-empty, distinct, non-empty names). A job can report `success` while every work step inside it was skipped
+//      (a step-level "docs-only" skip), so a green job alone proves nothing there. When spec.steps is set, a job that is completed+success
+//      (rule 4) is a pass ONLY IF each named step appears EXACTLY ONCE in that job's `steps` with status completed and conclusion success.
+//      Absent, listed twice, skipped, cancelled, neutral, failure (a continue-on-error step under a green job), unknown, or a malformed
+//      steps list -> 'missing' (the Mac runs the step; never 'failure': the job itself was green), the reason names the step. The steps come
+//      from the jobs listing; a job object without a usable steps array costs ONE extra `actions/jobs/<jobId>` read (still nothing usable ->
+//      missing). A spec.steps that is not a non-empty array of distinct non-empty strings is an unusable spec -> missing, before any call.
+//      Without spec.steps nothing here changes: no extra call, the same result and the same reason as before.
 // No retries, no waiting: the skill decides how long to wait for 'pending'.
 import { git } from './git.mjs';
 
@@ -160,8 +169,36 @@ function pickJob({ gh, slug, run, spec, head }) {
   return job;
 }
 
+// Rule 5: the steps of the (completed, successful) job - from the listing when it carries them, else one `actions/jobs/<id>` read.
+function stepsOf({ gh, slug, job }) {
+  if (Array.isArray(job.steps) && job.steps.length > 0) return job.steps;
+  const body = gh.api('GET', `repos/${slug}/actions/jobs/${job.id}`);
+  if (!isObject(body) || body.id !== job.id) throw missing(`GitHub's reply for job ${job.id} is not that job (needed to read its steps)`);
+  if (!Array.isArray(body.steps) || body.steps.length === 0) throw missing(`job ${job.id} lists no steps, so its required steps cannot be checked`);
+  return body.steps;
+}
+
+// Each required step must be listed exactly once and be completed+success. Returns nothing; throws a 'missing' naming the first offender.
+function checkSteps({ gh, slug, job, spec, label }) {
+  const listed = stepsOf({ gh, slug, job });
+  for (const st of listed) {
+    if (!isObject(st) || typeof st.name !== 'string') throw missing(`job "${spec.job}" of ${label} has an unreadable entry in its steps`);
+  }
+  for (const name of spec.steps) {
+    const hits = listed.filter((st) => st.name === name);
+    if (hits.length !== 1) throw missing(`step "${name}" is ${hits.length === 0 ? 'not in' : `listed ${hits.length} times in`} job "${spec.job}" of ${label}; the Mac runs the step`);
+    const [st] = hits;
+    if (st.status !== 'completed' || st.conclusion !== 'success') {
+      throw missing(`step "${name}" of job "${spec.job}" in ${label} did not succeed (${st.status === 'completed' ? st.conclusion ?? 'no conclusion' : st.status ?? 'no status'}); the Mac runs the step`);
+    }
+  }
+}
+
 async function lookup({ root, step, spec, pr, head, base, gh }) {
   if (!isObject(spec) || !WORKFLOW.test(String(spec.workflow ?? '')) || !isStr(spec.job) || !isStr(spec.event)) throw missing(`verify.ci_proof.${step} is not a usable { workflow, job, event }`);
+  if (spec.steps !== undefined && !(Array.isArray(spec.steps) && spec.steps.length > 0 && spec.steps.every((n) => isStr(n) && n.trim() !== '') && new Set(spec.steps).size === spec.steps.length)) {
+    throw missing(`verify.ci_proof.${step}.steps is not a non-empty list of distinct step names`);
+  }
   if (!Number.isInteger(pr) || pr < 1) throw missing('no PR number to bind the run to');
   if (typeof head !== 'string' || !SHA.test(head)) throw missing('no full head SHA to look for');
   if (!isObject(base) || !isStr(base.ref)) throw missing('no base branch to bind the run to');
@@ -195,11 +232,15 @@ async function lookup({ root, step, spec, pr, head, base, gh }) {
     throw missing(`job "${spec.job}" of ${label} has the unknown status "${job.status}"`);
   }
   if (job.conclusion === 'success') {
+    if (spec.steps !== undefined) checkSteps({ gh, slug, job, spec, label });
     const how = `tested merge commit ${mergeSha.slice(0, 7)}, tree equal to HEAD`;
     return {
       state: 'pass',
-      reason: `job "${spec.job}" passed in ${label} of ${spec.workflow} (${how})`,
-      run: { id: run.id, attempt: run.run_attempt, jobId: job.id, workflow: spec.workflow, job: spec.job, url: isStr(run.html_url) ? run.html_url : `https://github.com/${slug}/actions/runs/${run.id}` },
+      reason: `job "${spec.job}" passed in ${label} of ${spec.workflow} (${how})${spec.steps !== undefined ? `; steps succeeded: ${spec.steps.map((n) => `"${n}"`).join(', ')}` : ''}`,
+      run: {
+        id: run.id, attempt: run.run_attempt, jobId: job.id, workflow: spec.workflow, job: spec.job, url: isStr(run.html_url) ? run.html_url : `https://github.com/${slug}/actions/runs/${run.id}`,
+        ...(spec.steps !== undefined ? { steps: [...spec.steps] } : {}),
+      },
     };
   }
   if (job.conclusion === 'failure' || job.conclusion === 'timed_out') return { state: 'failure', reason: `job "${spec.job}" ${job.conclusion} in ${label} of ${spec.workflow}` };

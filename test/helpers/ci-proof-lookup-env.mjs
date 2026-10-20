@@ -38,6 +38,16 @@ export function jobsFor(run, { patch } = {}) {
   return body;
 }
 
+// The steps array of a real job object (name, status, conclusion, number), as a checks.yml-like job lays them out. `outcomes` maps a step
+// name to [status, conclusion]; every other step is completed+success. A docs-only PR skips every work step: pass `skipped` for them.
+export const STEP_NAMES = ['Set up job', 'Checkout', 'Detect docs-only', 'Install', 'Typecheck', 'Vitest', 'Post Checkout', 'Complete job'];
+export function stepsList(outcomes = {}, names = STEP_NAMES) {
+  return names.map((name, i) => {
+    const [status, conclusion] = outcomes[name] ?? ['completed', 'success'];
+    return { name, status, conclusion, number: i + 1, started_at: '2026-10-20T01:00:00.000Z', completed_at: '2026-10-20T01:00:05.000Z' };
+  });
+}
+
 const GH_ERROR = (msg) => Object.assign(new Error(msg), { name: 'GhError' });
 
 // A ready scenario: repo + head + fake gh. `s.runs` / `s.jobs[runId]` / `s.view` / `s.mergeTree` can be changed before calling ciProof(s.args).
@@ -53,6 +63,7 @@ export function lookupScenario() {
     view: { headRefOid: head, headRefName: BRANCH, baseRefName: 'main' },
     fail: new Set(), // path fragments whose GET throws a GhError
     totals: {}, // path fragment -> total_count override
+    jobDetail: {}, // job id -> the body of GET actions/jobs/<id> (default: the listed job object itself)
   };
   s.addRun = (opts = {}) => {
     const run = runFor({ head, ...opts });
@@ -87,6 +98,11 @@ export function lookupScenario() {
         const body = s.jobs[m[1]];
         if (!body) throw GH_ERROR(`no jobs for run ${m[1]} (HTTP 404)`);
         return page(body.jobs, 'jobs', path, override(path) ?? body.total_count);
+      }
+      if ((m = /\/actions\/jobs\/(\d+)$/.exec(path))) {
+        const hit = Object.values(s.jobs).flatMap((b) => b.jobs).find((j) => j.id === Number(m[1]));
+        if (!hit) throw GH_ERROR(`no job ${m[1]} (HTTP 404)`);
+        return s.jobDetail[hit.id] ?? hit;
       }
       if ((m = /\/git\/commits\/([0-9a-f]{40})$/.exec(path))) {
         if (m[1] !== MERGE_SHA) throw GH_ERROR('unknown commit (HTTP 404)');

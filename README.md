@@ -325,6 +325,12 @@ verify:
   request changed neither the CI setup (`.github/**`), the pipeline settings, the verify scripts nor `ci_proof_inputs`. The three settings are
   read from the main branch, never from the pull request. Anything unclear (no run, still running, cancelled, a GitHub error) sends the step
   back to the Mac; `merge` records which proof was used (Mac, or GitHub run and attempt) on the pull request.
+- `steps` (optional, per `ci_proof` entry): a list of step names inside that job, e.g. `ci_proof: { typecheck: { workflow: .github/workflows/checks.yml, job: "Typecheck + Vitest", steps: ["Typecheck", "Vitest"] } }`.
+  A job with a step-level skip (a docs-only PR) reports `success` although every work step was skipped, so for such a job the green job alone
+  proves nothing. With `steps`, the proof is taken only when each named step appears exactly once in the job and is `completed` with
+  conclusion `success`; absent, repeated, skipped, cancelled or failed (even under a green job) sends the step back to the Mac. Names are matched
+  exactly (case and spaces), at most 20 names of at most 200 characters, no repeats. The job's `steps` come from the run's jobs listing, or one extra read of the job.
+  A repo's `scripts/pipeline/lib/config.mjs` (vendored) must know `steps` before the key is set: run `pipeline update`, then `pipeline vendor` in the repo.
 - `ci_proof_wait_minutes` is the longest ship waits for the GitHub run before it runs the step on the Mac instead; set it from the measured CI time.
 - Rollout: eaglewatch enables `ci_proof` only after its PR B (draft runs, always-report, sharded jobs with one aggregator job) and one measured database PR.
   Until then it uses only `after_fix` and the slot limit.
