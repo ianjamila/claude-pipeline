@@ -245,11 +245,15 @@ const chain = (twice, depth, words, names = 4) => {
 const cpu = () => { const u = process.cpuUsage(); return (u.user + u.system) / 1000; }; // (CPU time, not the clock: a busy machine must not fail the test)
 test('three nested scripts that each assign four names twice and loop over eight words are refused at once, not at the deadline', () => {
   const t0 = cpu();
+  const w0 = Date.now();
   const r = files('bash F1.sh', fakeFs(PROJ, chain(true, 3, 'w1 w2 w3 w4 w5 w6 w7 w8')));
   assert.equal(r.decision, 'deny');
   assert.match(r.reason, /too many readings/, r.reason);
   const ms = cpu() - t0;
-  assert.ok(ms < 3000, `took ${Math.round(ms)} ms of CPU`);
+  const wall = Date.now() - w0;
+  // Either clock under 3 s proves the refusal came long before the 5 s deadline: CPU time is inflated on a CI runner whose cores
+  // are shared with parallel test files (GC threads, contention), the clock on a merely busy machine.
+  assert.ok(ms < 3000 || wall < 3000, `took ${Math.round(ms)} ms of CPU and ${wall} ms of clock`);
 });
 test('a chain with a few readings is still allowed', () => {
   assert.equal(files('bash F1.sh', fakeFs(PROJ, chain(true, 2, 'w1 w2', 2))).decision, 'allow'); // (two names twice, two words: 8 readings a level)

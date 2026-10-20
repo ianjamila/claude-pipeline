@@ -412,6 +412,19 @@ Exit: 0 passed · 1 failed · 2 not configured / usage.
 
 PATH of project commands: `merge.command` (merge), the `smoke` commands (smoke, prod-watch) run with the caller's environment. When `gh` is not on that `PATH` but the pipeline's own `gh()` finds it in a fixed install dir (`/opt/homebrew/bin`, `/usr/local/bin`, `/home/linuxbrew/.linuxbrew/bin`, `/usr/bin`), that directory is APPENDED to the command's `PATH`, so a command that spawns `gh` itself (a sandbox `PATH` often lacks `/opt/homebrew/bin`) no longer fails `spawn gh ENOENT`. Unchanged on Windows, under a `PIPELINE_GH` override, or when `gh` is nowhere.
 
+## stacks
+
+stop private local Supabase stacks and dev servers once nobody needs them (daily sweep, session-end worker, status, repair, init, schedule).
+
+```
+pipeline stacks sweep [--apply] [--summary-only]   -> {ok, summary, stopped:[...], wouldStop:[...], listed:[...], kept:[...]}
+pipeline stacks session-end --owner PID:BIRTH   -> {ok, waited, stacks:[...], dev:[...]}
+pipeline stacks status   -> {ok, configured, modes, paused, leases:[...], report}
+pipeline stacks repair   -> {ok, moved}
+pipeline stacks init [--write]   -> {ok, config, written}
+pipeline stacks schedule (--install [--at HH:MM] | --remove | --status)   -> {ok, installed|removed, label, timezone, warning?}
+```
+
 ## state
 
 show or update the review loop state (.review/state.json).
@@ -429,6 +442,7 @@ pipeline state discard-round --round R [--pr N] [--repo DIR]
 pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, followupsPending}; exit 0 whether or not clean
 pipeline state mark-implemented --ids a,b [--repo DIR]
   -> exit 2 {error:no-code-change} unless the branch content differs from what the accepting round reviewed
+     and a non-test file changed since (a test file counts for a testing finding or the finding's own file)
 pipeline state record-followup --id ID --url URL [--repo DIR]
 pipeline state set-outcome --outcome TEXT [--repo DIR]
 ```
