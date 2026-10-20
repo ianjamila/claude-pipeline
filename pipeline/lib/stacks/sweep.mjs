@@ -162,7 +162,7 @@ export function cleanWorkers({ files, run = realRun, ps, kill, platform = proces
 
 // ---------------------------------------------------------------- leases (status and outcomes)
 
-// Ledger `use` events as outcome "uses": { t, project, pid, birth, check: 'C1', command }. The project is the event's own, else the
+// Ledger `use` events as outcome "uses": { t, project, pid, birth, check: 'C1', command, sessionId, ledger: true }. The project is the event's own, else the
 // inventory stack the event's folder/workdir names; an event that names neither is not attributable and is skipped.
 export function ledgerUses(events, stacks = []) {
   const out = [];
@@ -171,7 +171,7 @@ export function ledgerUses(events, stacks = []) {
     let project = typeof e.project === 'string' && e.project !== '' ? e.project : null;
     if (project === null) project = stacks.find((s) => leasesFor([e], s).length > 0)?.project ?? null;
     if (project === null) continue;
-    out.push({ t: e.t, project, pid: e.owner.pid ?? null, birth: Number.isFinite(e.owner.birth) ? e.owner.birth : null, check: 'C1', command: `lease via ${e.via ?? 'unknown'}` });
+    out.push({ t: e.t, project, pid: e.owner.pid ?? null, birth: Number.isFinite(e.owner.birth) ? e.owner.birth : null, check: 'C1', command: `lease via ${e.via ?? 'unknown'}`, sessionId: e.session_id ?? null, ledger: true });
   }
   return out;
 }

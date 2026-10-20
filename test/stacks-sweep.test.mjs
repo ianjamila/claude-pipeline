@@ -617,6 +617,8 @@ test('ledgerUses attributes events by project, else by the stack folder; current
   ];
   const uses = ledgerUses(events, [stack]);
   assert.deepEqual(uses.map((u) => `${u.project}:${u.pid}`), ['alpha:1', 'alpha:1', 'alpha:2']);
+  assert.ok(uses.every((u) => u.ledger === true && u.sessionId === null), 'ledger uses are marked and carry the event session id (null here)');
+  assert.equal(ledgerUses([{ t: '2026-10-19T10:00:00.000Z', kind: 'use', owner: { pid: 1, birth: 10 }, project: 'alpha', session_id: 'sess-1' }])[0].sessionId, 'sess-1');
   const isAlive = (o) => (o.pid === 1 ? ok(true) : o.pid === 2 ? unknown('ps timed out') : ok(false));
   const leases = currentLeases(events, { stacks: [stack], isAlive });
   assert.deepEqual(leases.map((l) => [l.project, l.owner.pid, l.alive, l.since, l.last]), [
