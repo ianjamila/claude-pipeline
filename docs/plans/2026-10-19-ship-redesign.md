@@ -1174,8 +1174,8 @@ export function buildPlanReviewPrompt({ pr, planPath, blob, kind, priorFindingsM
     2. Prompt: `kind` is `recheck` when another valid codex start with an earlier `commentId` exists; `--prior FILE`
        supplies its markdown (always, also when resuming, so the recheck works without a session).
     3. Session (Codex plan R1-10; spec §3 "a recheck resumes the first run's Codex session when one exists"): for a
-       recheck, read `.review/plan/<earlier key>.json` `session`. When it is a valid id, `args = buildCodexResumeArgs({
-       sessionId, model, effort, schemaPath, outPath })` = `['exec', 'resume', <id>, '-c', 'sandbox_mode="read-only"',
+       recheck, read `.review/plan/<earlier key>.json` `session`. When it is a valid id,
+       `args = buildCodexResumeArgs({ sessionId, model, effort, schemaPath, outPath })` = `['exec', 'resume', SESSION_ID, '-c', 'sandbox_mode="read-only"',
        '--json', '-o', outPath, '--output-schema', schemaPath, '-c', model…, '-c', effort…, '-']` (`resume` accepts
        neither `-C` nor `--sandbox`: the spawn cwd carries the repo, and the sandbox is re-pinned through the config
        key, as `~/.claude/skills/codex-review/scripts/review.mjs` ~120 does; verified on codex-cli 0.154: `exec resume`
@@ -1560,8 +1560,9 @@ test('the comment says what was and was not verified, shows overlap, items and t
 
 - [ ] **Step 3: Implement**
   - `handoff.mjs`:
-    - `handoffEligibility` reasons: `fewer than 2 base updates`; `branch protection requires up-to-date branches (or
-      could not be read)` when `strict !== false`; `the live gate fails more than behind-base: <names>`; `the live gate
+    - `handoffEligibility` reasons: `fewer than 2 base updates`;
+      `branch protection requires up-to-date branches (or could not be read)` when `strict !== false`;
+      `the live gate fails more than behind-base: <names>`; `the live gate
       is not behind base`; `merge-tree conflicts with main`; `quick verify failed on head merged with main`.
     - The gate condition: `failed = gate.checks.filter((c) => !c.ok)`; it must be exactly one check named `pr-open`
       whose detail starts with `behind-base`.
@@ -1794,12 +1795,12 @@ if (record?.outcome === 'owner-ui-merge') return { enter: 'owner-ui-merge', reas
     - commit `[skip ci]`;
     - risk + reviewer matrix (spec §3 table);
     - the exact reserve/launch sequence:
-      - Codex: `P job start planreview -- node ~/.claude/pipeline/bin/pipeline.mjs plan review --pr N --key
-        codex-<blob12>-1 --effort xhigh` → `P job wait …`; fix, `P plan record`, then the recheck with key
+      - Codex:
+        `P job start planreview -- node ~/.claude/pipeline/bin/pipeline.mjs plan review --pr N --key codex-<blob12>-1 --effort xhigh` → `P job wait …`; fix, `P plan record`, then the recheck with key
         `codex-<blob12>-2 --prior .review/plan/<first key>.md`;
       - Fable: `P plan start --pr N --reviewer fable --key fable-<blob12>-1` → dispatch `fable-reviewer` with the
-        printed `promptHeader` as the first lines, Agent description = the tag `pipeline-fable-plan <key>` → `P plan
-        findings --pr N --key <key> --tag "<tag>"`;
+        printed `promptHeader` as the first lines, Agent description = the tag `pipeline-fable-plan <key>` →
+        `P plan findings --pr N --key <key> --tag "<tag>"`;
     - cost booking `P cost --pr N --phase plan --role codex|fable --execution codex:<session>|agent:<id> …`;
     - the approval request template (summary, the Scope list EXACTLY as `P plan record` printed it — the parsed list,
       never the rendered markdown (amendment r4) — reviewer tally, plan token total, extras, two lines);
@@ -1819,7 +1820,7 @@ if (record?.outcome === 'owner-ui-merge') return { enter: 'owner-ui-merge', reas
     - `plan-scope` rows (`none`, `outside`, `unverified`, `lost`, label mode);
     - `P handoff check` exit codes and reasons;
     - outcome `owner-ui-merge`.
-  - `pr-and-summary.md`: PR body gains "Plan: <path> @ <blob12>, approved <date>" and the plan-phase cost line.
+  - `pr-and-summary.md`: PR body gains `Plan: <path> @ <blob12>, approved <date>` and the plan-phase cost line.
   - `skills/verify/SKILL.md`: screenshots are read by `screenshot-reviewer` (Sonnet); lookups via Explore on Haiku.
   - `docs/cli.md`: `plan`, `review`, `handoff` commands; `cost --execution`; the gate's `plan-scope` check; record v2.
   - `VERSION`: `0.2.0`.
