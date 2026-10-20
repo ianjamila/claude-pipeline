@@ -410,6 +410,8 @@ pipeline smoke --target preview|production --url URL [--expect-text T] [--sha SH
 
 Exit: 0 passed · 1 failed · 2 not configured / usage.
 
+Optional firewall bypass: with `smoke_bypass_header: x-smoke-key` (lowercase `x-` name, default null) in `.claude/pipeline.yml` and the secret in the `PIPELINE_SMOKE_BYPASS_KEY` environment variable, the vendored `scripts/pipeline/smoke.mjs` sends that one header to the configured non-loopback origin so a firewall "Bypass" rule can let a CI runner through. It is a firewall hint, not app auth (still a cookie-less GET, redirects not followed). The value is read from the environment only (the smoke command inherits the caller's environment here and in prod-watch) and is never printed: the smoke's JSON gains `bypassHeader: true|false` (whether it was sent; false when the env value is missing or the base is localhost).
+
 PATH of project commands: `merge.command` (merge), the `smoke` commands (smoke, prod-watch) run with the caller's environment. When `gh` is not on that `PATH` but the pipeline's own `gh()` finds it in a fixed install dir (`/opt/homebrew/bin`, `/usr/local/bin`, `/home/linuxbrew/.linuxbrew/bin`, `/usr/bin`), that directory is APPENDED to the command's `PATH`, so a command that spawns `gh` itself (a sandbox `PATH` often lacks `/opt/homebrew/bin`) no longer fails `spawn gh ENOENT`. Unchanged on Windows, under a `PIPELINE_GH` override, or when `gh` is nowhere.
 
 ## stacks
