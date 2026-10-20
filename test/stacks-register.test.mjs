@@ -693,9 +693,11 @@ test('e2e Review Focus 3: a 100 000-line ledger is never read; unrelated and mat
   bigLedger(x.w.files.ledger);
   const spyLog = join(x.dir, 'spy.log');
   // The child's own CPU time (user + system at exit, written by CPU_PROBE), not the clock: a busy machine (load 70+) failed the wall-clock form twice.
+  // The hook's own deadline is the default 20 s here, not the harness's 1.5 s: at load 100+ the cache refresh through the fake docker outlasted
+  // 1.5 s of clock and the hook failed closed (exit 2). The deadline has tests of its own (the docker / ps hang tests above).
   const run = (name, command) => {
     const cpuLog = join(x.dir, `cpu-${name}.log`);
-    const r = x.hook(bash(command, x.w.base), { nodeArgs: ['--import', SPY, '--import', CPU_PROBE], extraEnv: { FS_SPY_LOG: spyLog, CPU_PROBE_LOG: cpuLog } });
+    const r = x.hook(bash(command, x.w.base), { nodeArgs: ['--import', SPY, '--import', CPU_PROBE], extraEnv: { FS_SPY_LOG: spyLog, CPU_PROBE_LOG: cpuLog, PIPELINE_STACKS_DEADLINE_MS: '20000' } });
     return { ...r, cpu: Number(readFileSync(cpuLog, 'utf8')) };
   };
   const matchingCommand = `supabase status --workdir ${x.sa.workdir}`;
