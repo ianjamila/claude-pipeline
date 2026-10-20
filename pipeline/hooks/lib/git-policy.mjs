@@ -1259,7 +1259,6 @@ function checkHttpTool(argv, dir, ctx, tool = 'curl') {
       words = [...words.slice(0, i + 1), ...curlConfigWords(text).map((x) => expandVars(x, ctx)), ...words.slice(i + 1)];
       continue;
     }
-    if (tool === 'curl' && (w === '-g' || w === '--globoff')) { globoff = true; continue; }
     if (tool === 'curl' && flag === '--request-target') { requestTarget = true; value(); continue; }
     if (URL_FILE_FLAGS.has(flag) && tool === 'wget') { value(); urlFile = true; continue; }
     if (HTTP_DATA_FLAGS.has(flag) && !(httpie && flag.length === 2 && flag !== '-F')) { implied = true; readData(value(), HTTP_FILE_FLAGS.has(flag)); continue; }
@@ -1286,15 +1285,18 @@ function checkHttpTool(argv, dir, ctx, tool = 'curl') {
   if (nonGet && urls.length === 0) return deny(`${verb} with no URL on the command line (it comes from stdin, xargs or a config), so what it calls cannot be verified. Write the URL out.`);
   for (const w of urls) {
     const host = (/^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/)?(?:[^/@?#]*@)?([^/:?#]*)/.exec(w) ?? [])[1] ?? '';
-    // (curl expands `pulls/[3-3]/merge` to `pulls/3/merge` and `comments,comments}` lists, so the endpoint judged below is not the one called; same test as line-writes.mjs)
-    const globbed = tool === 'curl' && !globoff && /[[{]/.test(w) && !/^\[[0-9A-Fa-f:.]*\]$/.test(host);
+    // (curl expands `pulls/[3-3]/merge` to `pulls/3/merge` and `{comments,comments}` lists, so the endpoint judged below is not the one called.
+    // -g / --globoff is NOT trusted to switch this off: a later --no-globoff, a -g taken as the value of an option this parser does not
+    // know, or a config file can each leave globbing on, and no real GitHub write needs [ or { in its URL.)
+    const v6 = /^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/)?(?:[^/@?#]*@)?\[[0-9A-Fa-f:.]*\]/.exec(w); // an IPv6 literal host ([::1]) is not a glob and not github.com
+    const globbed = tool === 'curl' && /[[{]/.test(v6 ? w.slice(v6[0].length) : w);
     const hostUnknown = host === '' || DYNAMIC.test(host) || /[{}]/.test(host); // ({} is the placeholder of xargs / find: the URL comes from elsewhere)
-    if (!hostUnknown && !GH_HOST.test(host) && !(globbed && /[[{]/.test(host))) continue; // (a glob in the host can expand to github.com)
+    if (!hostUnknown && !GH_HOST.test(host) && !(globbed && !v6 && /[[{]/.test(host))) continue; // (a glob in the host can expand to github.com)
     if (!nonGet) {
       if (!hostUnknown && DYNAMIC.test(w) && /\$\(|`/.test(w)) return deny('the URL is built at run time ($(...) / backticks) for a github.com host, so what it calls cannot be verified. Write the URL out.');
       continue;
     }
-    if (globbed) return deny(`${verb} to a URL with curl globbing ([a-b] / {x,y}) that may point at github.com: curl expands it, so the endpoint it calls cannot be verified. Pass -g / --globoff or write the URL literally.`);
+    if (globbed) return deny(`${verb} to a URL with curl globbing ([a-b] / {x,y}) that may point at github.com: curl expands it, so the endpoint it calls cannot be verified (-g / --globoff does not change this). Write the URL without [ ] { }.`);
     if (hostUnknown || DYNAMIC.test(w)) return deny(`${verb} to a URL built at run time ($VAR / $(...)) that may point at github.com cannot be verified. Write the URL out.`);
     if (requestTarget) return deny(`${verb} with curl --request-target to a github.com host: it replaces the path of the URL, so the endpoint it calls cannot be verified. Put the path in the URL.`);
     if (strangeFlag) return deny(`${verb} to a github.com host with an option this guard does not know (${strangeFlag}) that carries a repository path: it may replace the endpoint, so the call cannot be verified. Put the path in the URL.`);

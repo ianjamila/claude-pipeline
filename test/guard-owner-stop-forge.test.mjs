@@ -71,7 +71,7 @@ test('curl / wget / httpie / xh: non-GET calls to github.com that merge, move re
 });
 
 // ---- curl URL globbing (review R3-B1): curl expands [a-b] / {x,y} in a quoted URL unless -g / --globoff, so the endpoint judged is not the one called ----
-test('curl: a globbed GitHub URL on a write is denied; with -g / --globoff / bundled -sg it is judged literally; plain URLs and reads behave as before', () => {
+test('curl: a globbed GitHub URL on a write is denied, also with -g / --globoff (not trusted); plain URLs and reads behave as before', () => {
   const merge = (flags) => `curl ${flags} -X PUT -H 'Authorization: token x' 'https://api.github.com/repos/o/r/pulls/[3-3]/merge'`;
   const forge = (flags) => `curl ${flags} -X POST -d '{"body":"${MARK.replaceAll('"', '\\"')}"}' 'https://api.github.com/repos/o/r/issues/3/{comments,comments}'`;
   for (const cmd of [
@@ -80,10 +80,10 @@ test('curl: a globbed GitHub URL on a write is denied; with -g / --globoff / bun
   ]) { const r = deny(cmd); if (!/merge|merging|glob/i.test(r.reason)) assert.fail(cmd); }
   assert.match(deny(merge('')).reason, /globbing/);
   assert.match(deny(forge('')).reason, /globbing/);
-  // -g / --globoff (also bundled, and after the URL): curl does not expand, the URL is judged as written
+  // -g / --globoff is not trusted (a later --no-globoff, a -g eaten as another option's value, or a config file can leave globbing on)
   for (const cmd of [merge('-g'), merge('--globoff'), merge('-sg'), merge('-gs'), forge('-g'), forge('--globoff'), forge('-sg'),
-    "curl -X PUT 'https://api.github.com/repos/o/r/pulls/[3-3]/merge' -g"]) allow(cmd);
-  // a literal [3-3] with -g is not the merge endpoint, but a literal merge URL still is
+    "curl -X PUT 'https://api.github.com/repos/o/r/pulls/[3-3]/merge' -g", merge('-g --no-globoff'), merge('--proxy-header -g'), merge('-o -g')]) assert.match(deny(cmd).reason, /globbing/, cmd);
+  // a literal merge URL is still the merge endpoint with -g
   deny('curl -g -X PUT https://api.github.com/repos/o/r/pulls/3/merge');
   deny(`curl -sg -d '{"body":"${MARK.replaceAll('"', '\\"')}"}' https://api.github.com/repos/o/r/issues/3/comments`);
   // reads, non-GitHub hosts and plain URLs are unchanged
