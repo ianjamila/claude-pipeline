@@ -285,9 +285,10 @@ one: a real-looking secret key literal (not marked fake inside the key itself) i
 
 If a firewall (for example Vercel's) answers 429 to CI runner IPs, the production smoke can send one secret header that a
 firewall "Bypass" rule matches. Set `smoke_bypass_header: x-smoke-key` in `pipeline.yml` (a lowercase `x-` name; default
-`null` = nothing extra is sent) and put the secret in the `PIPELINE_SMOKE_BYPASS_KEY` environment variable, never in a file.
-It is a firewall hint, not app authentication: the smoke stays a cookie-less, GET-only request, the header goes only to the
-configured origin (never to localhost; redirects are not followed), and the value is never printed. The smoke's JSON gains
+`null` = nothing extra is sent), list where it may go in `smoke_bypass_origins: ["https://www.example.com"]` (required
+when the header is set; exact https origins, no wildcards or paths) and put the secret in the `PIPELINE_SMOKE_BYPASS_KEY` environment variable, never in a file.
+It is a firewall hint, not app authentication: the smoke stays a cookie-less, GET-only request, the header goes only to a base whose
+origin is exactly in `smoke_bypass_origins` (never a preview URL, another host or localhost; redirects are not followed), and the value is never printed. The smoke's JSON gains
 `bypassHeader: true|false` (whether it was sent); a configured name with no environment value is `false`, not an error.
 Re-vendor (`pipeline vendor`) so the project's `scripts/pipeline/smoke.mjs` and `lib/config.mjs` know the key.
 

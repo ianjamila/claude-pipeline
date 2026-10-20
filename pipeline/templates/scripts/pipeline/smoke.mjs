@@ -2,8 +2,9 @@
 // bodies, redirects are reported rather than followed, so pointing it at production cannot change anything there.
 // One optional extra header exists: `smoke_bypass_header` (a lowercase x-… name in pipeline.yml) with its secret value in
 // the PIPELINE_SMOKE_BYPASS_KEY environment variable. It is a firewall hint for the configured origin (e.g. a Vercel
-// Firewall "Bypass" rule for CI runner IPs), NOT app authentication; it is never sent to loopback, never printed (the
-// output only says whether it was sent: `bypassHeader`), and the request stays a cookie-less GET.
+// Firewall "Bypass" rule for CI runner IPs), NOT app authentication. It is sent only when the base's origin is exactly one
+// of `smoke_bypass_origins` (never a preview URL, another host or loopback), never printed (the output only says whether
+// it was sent: `bypassHeader`), and the request stays a cookie-less GET.
 // Checks come from `smoke_checks` in .claude/pipeline.yml (default: GET / must answer 2xx/3xx). `--expect-text` proves
 // the deployed page is the new build, not just any page that answers.
 // Exit codes: 0 all checks pass, 1 a check failed, 2 usage/config error (including a non-https remote base URL).
@@ -40,16 +41,18 @@ export function normaliseBase(raw) {
 }
 
 // The request headers, and whether the bypass header is among them. Sent only when a name AND a non-empty value are
-// configured and the base is not loopback. `scrub` blanks the value out of any text that may reach the output (a reason
+// configured and the base's origin is exactly one of bypass.origins (and not loopback). `scrub` blanks the value out of any text that may reach the output (a reason
 // quoting a server-echoed location or a fetch error message), so the secret can never be printed.
 function bypassHeaders(bypass, base) {
   const none = { headers: HEADERS, sent: false, scrub: (s) => s };
   const name = bypass?.header;
   const value = typeof bypass?.value === 'string' ? bypass.value.trim() : '';
-  if (!name || !value || LOOPBACK.has(new URL(base).hostname)) return none;
+  if (!name || !value) return none;
   if (typeof name !== 'string' || !SMOKE_BYPASS_HEADER_RE.test(name)) {
     throw new SmokeUsageError('smoke_bypass_header must be a lowercase header name matching /^x-[a-z0-9-]{1,60}$/');
   }
+  const { hostname, origin } = new URL(base);
+  if (LOOPBACK.has(hostname) || !Array.isArray(bypass.origins) || !bypass.origins.includes(origin)) return none;
   // Visible ASCII only: a space/newline/control character is never a legal secret and would make fetch throw an error
   // that quotes the value. The message below deliberately does not.
   if (!/^[\x21-\x7e]+$/.test(value)) throw new SmokeUsageError('PIPELINE_SMOKE_BYPASS_KEY must be printable ASCII without spaces');
@@ -128,7 +131,8 @@ async function runCheck(base, check, { fetchFn, sleep, headers, scrub }) {
 
 /**
  * options: { base, production, checks: [{path, status?, contains?, location_contains?}], expectText?, expectPath?,
- *             bypass?: { header, value } }   (sent only when both are set and the base is not loopback)
+ *             bypass?: { header, value, origins } }   (sent only when header and value are set and the base's origin is
+ *             exactly one of origins; never to loopback)
  * deps (tests): fetch, sleep. Throws SmokeUsageError for a bad base URL.
  */
 export async function runSmoke(options, deps = {}) {
@@ -185,7 +189,11 @@ export async function main(argv = process.argv.slice(2), { env = process.env, cw
       checks: loaded.ok ? loaded.config.smoke_checks : [],
       expectText: values['expect-text'] ?? env.PIPELINE_SMOKE_EXPECT_TEXT,
       expectPath: values['expect-path'],
-      bypass: { header: loaded.ok ? loaded.config.smoke_bypass_header : null, value: env.PIPELINE_SMOKE_BYPASS_KEY },
+      bypass: {
+        header: loaded.ok ? loaded.config.smoke_bypass_header : null,
+        origins: loaded.ok ? loaded.config.smoke_bypass_origins : [],
+        value: env.PIPELINE_SMOKE_BYPASS_KEY,
+      },
     }, deps);
     out(result);
     return result.ok ? 0 : 1;

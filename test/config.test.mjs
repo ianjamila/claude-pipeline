@@ -251,11 +251,11 @@ test('smoke_bypass_header: defaults to null; accepts a lowercase x- name; reject
   assert.equal(dflt.ok, true, dflt.errors.join('; '));
   assert.equal(dflt.config.smoke_bypass_header, null);
   assert.equal(DEFAULTS.smoke_bypass_header, null);
-  const ok = validateConfig({ ...minimal(), smoke_bypass_header: 'x-smoke-key' });
+  const ok = validateConfig({ ...minimal(), smoke_bypass_header: 'x-smoke-key', smoke_bypass_origins: ['https://www.example.com'] });
   assert.equal(ok.ok, true, ok.errors.join('; '));
   assert.equal(ok.config.smoke_bypass_header, 'x-smoke-key');
   assert.equal(validateConfig({ ...minimal(), smoke_bypass_header: null }).ok, true);
-  const bad = (v) => validateConfig({ ...minimal(), smoke_bypass_header: v });
+  const bad = (v) => validateConfig({ ...minimal(), smoke_bypass_header: v, smoke_bypass_origins: ['https://www.example.com'] });
   // Auth / cookie names can never pass: the x- prefix rule is the whole guard.
   for (const v of ['Authorization', 'authorization', 'cookie', 'proxy-authorization', 'x-', 'X-Smoke-Key', 'x-Smoke', 'x-smoke key', 'x-smoke_key', 'x-' + 'a'.repeat(61), '', ' x-smoke-key', 'x-smoke-key\n', 5, true, ['x-smoke-key'], {}]) {
     const r = bad(v);
@@ -264,6 +264,30 @@ test('smoke_bypass_header: defaults to null; accepts a lowercase x- name; reject
   }
   assert.equal(bad('x-' + 'a'.repeat(60)).ok, true, '60 chars after x- is the limit');
   assert.ok(has(bad('Authorization'), 'lowercase'), 'the message says what is accepted');
+});
+
+test('smoke_bypass_origins: default [], required non-empty with smoke_bypass_header, exact https origins only', () => {
+  assert.deepEqual(validateConfig(minimal()).config.smoke_bypass_origins, []);
+  assert.deepEqual(DEFAULTS.smoke_bypass_origins, []);
+  const withHeader = (origins) => validateConfig({ ...minimal(), smoke_bypass_header: 'x-smoke-key', ...(origins === undefined ? {} : { smoke_bypass_origins: origins }) });
+  const ok = withHeader(['https://www.eaglewatch.ph', 'https://app.example.com:8443']);
+  assert.equal(ok.ok, true, ok.errors.join('; '));
+  assert.deepEqual(ok.config.smoke_bypass_origins, ['https://www.eaglewatch.ph', 'https://app.example.com:8443']);
+  // header set but no origins: an error that names the key
+  for (const origins of [undefined, []]) assert.ok(has(withHeader(origins), 'smoke_bypass_origins must list at least one'), JSON.stringify(origins));
+  // header unset: origins may be empty, and any listed entry is still validated
+  assert.equal(validateConfig({ ...minimal(), smoke_bypass_origins: [] }).ok, true);
+  assert.ok(has(validateConfig({ ...minimal(), smoke_bypass_origins: ['http://x.example'] }), 'smoke_bypass_origins'));
+  for (const bad of [
+    'https://www.eaglewatch.ph', 5, null, {},
+    ['http://www.eaglewatch.ph'], ['https://www.eaglewatch.ph/'], ['https://www.eaglewatch.ph/app'], ['https://www.eaglewatch.ph?x=1'],
+    ['https://www.eaglewatch.ph#f'], ['https://user:pw@www.eaglewatch.ph'], ['https://www.eaglewatch.ph:443'], ['HTTPS://WWW.EAGLEWATCH.PH'],
+    ['www.eaglewatch.ph'], ['*.eaglewatch.ph'], ['https://*.eaglewatch.ph'], [''], [5], [null], ['https://ok.example', 'ftp://x.example'], ['not a url'], ['https://x.example\n'],
+  ]) {
+    const r = withHeader(bad);
+    assert.equal(r.ok, false, `${JSON.stringify(bad)} must be rejected`);
+    assert.ok(has(r, 'smoke_bypass_origins'), r.errors.join('; '));
+  }
 });
 
 test('unknown top-level key (typo) is rejected', () => {
