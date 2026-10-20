@@ -1,0 +1,16 @@
+# Called (never run) by ci.yml's proof-anchor job. A workflow run that references a reusable workflow gets a
+# referenced_workflows entry naming the commit it checked out (refs/pull/<N>/merge + sha on a PR run); the final gate's CI
+# proof (pipeline/lib/ci-proof.mjs) needs exactly that to tie the "test (ubuntu)" run to the PR's tree. Without it every
+# proof lookup is "missing" and the Mac runs the whole suite. Keep it trivial: nothing here ever executes.
+name: proof anchor
+
+on:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "never runs; see ci.yml proof-anchor"

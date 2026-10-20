@@ -259,7 +259,7 @@ test('outcomeSummary (F2): a session-end would-stop with no observation is UNKNO
   assert.match(s.rows[0].note, /no re-probe was recorded/);
   const text = renderReport(baseState({ now: T0_MS + 3 * HOUR, decisions: [se()] }));
   assert.match(text, /MISS 0 \(\+1 unknown ⇒ not yet\)/);
-  assert.match(text, /sa-corrections — would-stop .* — no re-probe was recorded/);
+  assert.match(text, /sa-corrections — stack run .* — UNKNOWN: 1 would-stop decision, 0 uses — no re-probe was recorded/);
   assert.match(text, /Switch-on: not yet/);
 });
 
@@ -732,4 +732,25 @@ test('renderReport / renderWeekly pass ledgerCoverage to the summary; a RESTART 
   assert.match(r, /born before the would-stop, first use after it \(transcript quiet\)/);
   assert.match(renderWeekly(state), /MISS 0 \(must be 0 to switch on\); RESTART 1/);
   assert.match(renderReport({ ...state, ledgerCoverage: undefined }), /MISS 1/);
+});
+
+test('renderReport: one generation with two would-stop decisions and several RESTART uses is 1 stack run in the headline and ONE group in the section', () => {
+  const uses = [...withQuiet(liveLedger(), [S1, S2]), ...liveLegacy()];
+  const state = { now: L_NOW, decisions: LIVE_DECS, uses, ledgerCoverage: COVER };
+  const s = outcomeSummary(state.decisions, state.uses, L_NOW, { ledgerCoverage: COVER });
+  assert.deepEqual([s.restart, s.rows.length, s.rows[0].decisions, s.rows[0].uses.length], [1, 1, 2, 4], 'classification is unchanged: one RESTART row');
+  const text = renderReport(state);
+  assert.match(text, /^- RESTART 1 stack run \(2 would-stop decisions; cost only/m);
+  assert.match(text, /^- CLEAN 0/m);
+  const section = text.split('## RESTART')[1].split(/\n## /)[0].split('\n').filter(Boolean).slice(1);
+  const heads = section.filter((l) => l.startsWith('- '));
+  assert.equal(heads.length, 1, 'one heading for the one stack run');
+  assert.match(heads[0], /RESTART: 2 would-stop decisions, 4 uses/);
+  const nested = section.filter((l) => l.startsWith('  - '));
+  assert.equal(nested.length, 4, 'every use is listed under the heading');
+  assert.equal(new Set(nested.map((l) => /would-stop (\S+) /.exec(l)[1])).size, 2, 'the uses name both would-stop times');
+  assert.ok(nested.some((l) => l.includes(S1)) && nested.some((l) => l.includes(S2)));
+  // the switch-on line counts the same unit
+  const clean = renderReport({ now: L_NOW, decisions: [lStop(S1), lStop(S2), lObs('2026-10-20T05:14:13.119Z', S1), lObs('2026-10-20T05:16:22.749Z', S2)], uses: [], ledgerCoverage: COVER });
+  assert.match(clean, /no unknown across 1 stack run \(2 would-stop decisions\)/);
 });
