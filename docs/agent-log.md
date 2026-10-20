@@ -66,3 +66,4 @@ full record.
 - 2026-10-19 · #83 · feat(stacks): stop private Supabase stacks nobody uses (measure-first) · risk high · rounds 7 · arbiter 0 · merged
 - 2026-10-19 · #90 · fix(state): mark-implemented accepts a test-only fix for a testing finding or the finding's own file (#53) · risk high · rounds 1 · arbiter 0 · awaiting-owner-merge
 - 2026-10-19 · #90 · fix(state): mark-implemented accepts a test-only fix for a testing finding or the finding's own file (#53) · risk high · rounds 1 · arbiter 0 · merged
+- 2026-10-20 · #70 · fix(worktrees): config fallback for keep/unkeep/prune + record evidence moves before making them (#59) · risk high · rounds 7 · arbiter 0 · awaiting-owner-merge
