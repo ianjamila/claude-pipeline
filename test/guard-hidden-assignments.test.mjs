@@ -14,6 +14,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolve, dirname, basename } from 'node:path';
+import { assertCpuUnder, assertSteps, cpuCap, cpuTimed, virtualClock } from './helpers/timing.mjs';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 
@@ -242,18 +243,25 @@ const chain = (twice, depth, words, names = 4) => {
   }
   return out;
 };
-const cpu = () => { const u = process.cpuUsage(); return (u.user + u.system) / 1000; }; // (CPU time, not the clock: a busy machine must not fail the test)
+// Step bounds: clock reads of the evaluation (injected `now`) until the readings cap refuses the chain. CEIL = 2x the count measured on this branch
+// (2 significant figures), FLOOR = floor(count / 4); the clock's deadline lands at 2 x CEIL reads, so a refusal that came late is "took too long", not this one.
+const READINGS = {
+  chain: { floor: 245, ceil: 2000 }, // measured 983
+  words: { floor: 283, ceil: 2300 }, // measured 1133
+};
+const clockFor = ({ ceil }) => virtualClock(5000 / (2 * ceil)); // (5000 = EVAL_DEADLINE_MS)
 test('three nested scripts that each assign four names twice and loop over eight words are refused at once, not at the deadline', () => {
-  const t0 = cpu();
+  const c = clockFor(READINGS.chain);
   const w0 = Date.now();
-  const r = files('bash F1.sh', fakeFs(PROJ, chain(true, 3, 'w1 w2 w3 w4 w5 w6 w7 w8')));
+  const { r, ms } = cpuTimed(() => files('bash F1.sh', fakeFs(PROJ, chain(true, 3, 'w1 w2 w3 w4 w5 w6 w7 w8')), { now: c.now }));
+  const wall = Date.now() - w0;
   assert.equal(r.decision, 'deny');
   assert.match(r.reason, /too many readings/, r.reason);
-  const ms = cpu() - t0;
-  const wall = Date.now() - w0;
+  assert.doesNotMatch(r.reason, /took too long/);
+  assertSteps(c.reads, { ...READINGS.chain, label: 'nested scripts assigning four names twice' });
   // Either clock under 3 s proves the refusal came long before the 5 s deadline: CPU time is inflated on a CI runner whose cores
   // are shared with parallel test files (GC threads, contention), the clock on a merely busy machine.
-  assert.ok(ms < 3000 || wall < 3000, `took ${Math.round(ms)} ms of CPU and ${wall} ms of clock`);
+  assert.ok(ms < cpuCap(3000) || wall < cpuCap(3000), `took ${Math.round(ms)} ms of CPU and ${wall} ms of clock (cap ${Math.round(cpuCap(3000))} ms, base 3000)`);
 });
 test('a chain with a few readings is still allowed', () => {
   assert.equal(files('bash F1.sh', fakeFs(PROJ, chain(true, 2, 'w1 w2', 2))).decision, 'allow'); // (two names twice, two words: 8 readings a level)
@@ -262,12 +270,13 @@ test('a chain with a few readings is still allowed', () => {
 });
 test('loop words alone (names assigned once) also share the allowance across nested scripts', () => {
   const words = Array.from({ length: 20 }, (_, i) => `w${i + 1}`).join(' '); // (20 + 20^2 + 20^3 readings)
-  const t0 = cpu();
-  const r = files('bash F1.sh', fakeFs(PROJ, chain(false, 3, words)));
+  const c = clockFor(READINGS.words);
+  const { r, ms } = cpuTimed(() => files('bash F1.sh', fakeFs(PROJ, chain(false, 3, words)), { now: c.now }));
   assert.equal(r.decision, 'deny');
   assert.match(r.reason, /too many readings/, r.reason);
-  const ms = cpu() - t0;
-  assert.ok(ms < 3000, `took ${Math.round(ms)} ms of CPU`);
+  assert.doesNotMatch(r.reason, /took too long/);
+  assertCpuUnder(ms, 3000, 'loop words alone shared across nested scripts');
+  assertSteps(c.reads, { ...READINGS.words, label: 'loop words alone shared across nested scripts' });
 });
 
 test('program text in quotes (node -e, awk, sed) is no assignment: += and a[i]= in it change nothing', () => {

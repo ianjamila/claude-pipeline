@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync, execFileSync } from 'node:child_process';
-import { cpuTimed } from './helpers/timing.mjs';
+import { assertCpuUnder, cpuTimed } from './helpers/timing.mjs';
 import { mkdtempSync, writeFileSync, rmSync, realpathSync, readFileSync, cpSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
@@ -1231,13 +1231,13 @@ test('an oversized command line is not parsed: denied when it mentions a guarded
     assert.equal(evaluate(`echo ${spam}; g''it pu"sh" origin main`).decision, 'deny');
     assert.equal(evaluate(`echo ${spam}; gh pr edit 1 --add-label human-""approved`).decision, 'deny');
   });
-  assert.ok(ms < 3000, `the size cap must keep the hook far below its 15 s timeout (${Math.round(ms)} ms of CPU)`);
+  assertCpuUnder(ms, 3000, 'size cap keeps the hook far below its 15 s timeout');
 });
 
 test('brace spam just under the size cap is cut off by the expansion budget, not by the clock', () => {
   const spam = Array.from({ length: 12_000 }, () => '{a,b,c}').join(' ');
   const { ms } = cpuTimed(() => evaluate(`echo ${spam}`));
-  assert.ok(ms < 3000, `took ${Math.round(ms)} ms of CPU`);
+  assertCpuUnder(ms, 3000, 'brace spam under the size cap');
 });
 
 // ---- dynamic push destinations and env-supplied git config (review findings 3 and 4) -------------------

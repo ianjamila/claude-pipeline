@@ -5,19 +5,11 @@ import assert from 'node:assert/strict';
 import { classifyHardStops, collectHardStops, scanEnvLine, parsePythonDeps, enclosingStatements } from '../pipeline/lib/hardstops.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { MIG, pkg, cfg, file, rulesOf, classify, run } from './helpers/hardstops.mjs';
-import { assertLinear, bestOf } from './helpers/timing.mjs';
+import { assertLinear, assertCpuUnder, bestOf, cpuTimed } from './helpers/timing.mjs';
 
 const A = (path, ...added) => file(path, { status: 'A', added });
 const flags = (files, opts) => rulesOf(run(files, opts));
 const details = (hits) => hits.map((h) => h.detail);
-// CPU time (user + system) a call burns, in ms. The ReDoS guards below are about work done, not wall-clock: under machine load
-// a wall-clock budget flakes, while CPU time stays put (a quadratic regex still blows it).
-function cpuMs(fn) {
-  const t0 = process.cpuUsage();
-  const value = fn();
-  const d = process.cpuUsage(t0);
-  return { value, ms: (d.user + d.system) / 1000 };
-}
 
 // A repo with `base` files on main and a `feat` branch checked out; `collect(repo)` classifies feat against main.
 function branchRepo(base = {}) {
@@ -523,8 +515,8 @@ test('11 R2-auth-removed ignores a deleted comment or bare string, not a deleted
 test('13 a changed line over 20,000 chars skips every regex and flags the file; a 1 MB line is instant', () => {
   const big = 'alter table x '.repeat(75_000); // ~1 MB, no RENAME and no `;`: quadratic for a naive regex
   for (const f of [A(MIG, big), file('lib/a.ts', { removed: ['require'.padEnd(1_000_000, 'Auth')] }), A('public/vendor.min.js', 'function a(b){return b.require(c)}'.repeat(40_000))]) {
-    const { value: hits, ms } = cpuMs(() => run([f]));
-    assert.ok(ms < 1000, `took ${Math.round(ms)}ms of CPU`);
+    const { r: hits, ms } = cpuTimed(() => run([f]));
+    assertCpuUnder(ms, 1000, `13 changed line over the cap (${f.path})`);
     assert.ok(rulesOf(hits).includes('R0-unscannable'), f.path);
   }
 });
@@ -537,8 +529,8 @@ test('13 lines just under the cap with adversarial shapes stay fast for every ru
   ];
   for (const text of shapes) {
     for (const f of [A(MIG, text), file('lib/a.ts', { added: [text], removed: [text] })]) {
-      const { ms } = cpuMs(() => run([f]));
-      assert.ok(ms < 1000, `${text.slice(0, 20)}... took ${Math.round(ms)}ms of CPU`);
+      const { ms } = cpuTimed(() => run([f]));
+      assertCpuUnder(ms, 1000, `13 adversarial shape ${text.slice(0, 20)}... (${f.path})`);
     }
   }
 });
@@ -546,8 +538,8 @@ test('13 lines just under the cap with adversarial shapes stay fast for every ru
 test('13 a line stuffed with import specifiers stays fast (and is flagged as unreadable import list)', () => {
   const many = (n, f) => Array.from({ length: n }, (_, i) => f(i)).join(' ');
   for (const text of [many(1500, (i) => `from 'a${i}'`), many(600, (i) => `import('./x/y/z/w/v/u${i}')`), many(700, (i) => `require('a/b/c/d/e${i}');`)]) {
-    const { value: hits, ms } = cpuMs(() => run([file('lib/a.ts', { added: [text] })]));
-    assert.ok(ms < 500, `${text.slice(0, 20)}... took ${Math.round(ms)}ms of CPU`);
+    const { r: hits, ms } = cpuTimed(() => run([file('lib/a.ts', { added: [text] })]));
+    assertCpuUnder(ms, 500, `13 import specifiers ${text.slice(0, 20)}...`);
     assert.ok(rulesOf(hits).includes('R0-unscannable'), text.slice(0, 20));
   }
 });
@@ -565,7 +557,7 @@ test('13 the whole-file import scan stays linear on a ~1.5 MB file of adversaria
   const shapes = [[';from a import ', 100_000, 'a.py'], ['from' + ' ', 1_500_000, 'a.ts', true], ['require("', 190_000, 'a.ts'], [';import a, ', 100_000, 'a.py'], ['"""\n', 250_000, 'a.py'],
     ['from a import (\n', 90_000, 'a.py'], ['import a, \\\n', 120_000, 'a.py']];
   const once = (text, name) => run([file(`lib/${name}`, { added: ['x = 1'] })], { headFiles: new Map([[`lib/${name}`, text]]) });
-  const cpu = (text, name, reps) => () => cpuMs(() => { for (let i = 0; i < reps; i++) once(text, name); }).ms;
+  const cpu = (text, name, reps) => () => cpuTimed(() => { for (let i = 0; i < reps; i++) once(text, name); }).ms;
   for (const [unit, n, name, padOnly] of shapes) {
     const make = (k) => (padOnly ? `from${' '.repeat(k)}` : unit.repeat(k));
     const smallText = make(n / 16), fullText = make(n);
@@ -576,21 +568,21 @@ test('13 the whole-file import scan stays linear on a ~1.5 MB file of adversaria
     const reps = Math.min(200, Math.max(1, Math.ceil(60 / Math.max(best, 0.3))));
     const label = `${unit.slice(0, 16)}...`;
     const { hi } = assertLinear(cpu(smallText, name, reps), cpu(fullText, name, reps), { label, factor: 16, ratio: 64 });
-    assert.ok(hi / reps < 8000, `${label} took ${Math.round(hi / reps)}ms of CPU`);
+    assertCpuUnder(hi / reps, 8000, `13 whole-file import scan ${label}`);
   }
 });
 
 test('13 an oversized SQL statement is unscannable instead of regex-scanned', () => {
-  const { value: hits, ms } = cpuMs(() => classify({ files: [], config: cfg(), sqlStatements: [{ file: MIG, text: 'alter table x '.repeat(75_000) }] }));
-  assert.ok(ms < 1000, `took ${Math.round(ms)}ms of CPU`);
+  const { r: hits, ms } = cpuTimed(() => classify({ files: [], config: cfg(), sqlStatements: [{ file: MIG, text: 'alter table x '.repeat(75_000) }] }));
+  assertCpuUnder(ms, 1000, '13 oversized SQL statement');
   assert.deepEqual(rulesOf(hits), ['R0-unscannable']);
 });
 
 test('13 a normal 5000-line diff stays linear', () => {
   const lines = Array.from({ length: 5000 }, (_, i) => `export const v${i} = (a: number) => a + ${i}; // helper ${i}`);
   const sql = Array.from({ length: 5000 }, (_, i) => `insert into public.t${i % 10} (a, b) values (${i}, 'row ${i}');`);
-  const { ms } = cpuMs(() => run([A('lib/big.ts', ...lines), A(MIG, ...sql)], { sqlStatements: [] }));
-  assert.ok(ms < 2000, `took ${Math.round(ms)}ms of CPU`);
+  const { ms } = cpuTimed(() => run([A('lib/big.ts', ...lines), A(MIG, ...sql)], { sqlStatements: [] }));
+  assertCpuUnder(ms, 2000, '13 normal 5000-line diff');
 });
 
 // ---- 14. the pure classifier cannot silently lose coverage ----------------------------------------------------

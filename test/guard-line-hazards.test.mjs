@@ -10,6 +10,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolve, dirname, basename } from 'node:path';
+import { assertCpuUnder, assertLinearSteps, assertSteps, cpuTime, virtualClock } from './helpers/timing.mjs';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { assigningDefaults } from '../pipeline/hooks/lib/script-candidates.mjs';
@@ -41,11 +42,12 @@ const git = (command, fsOpts, o = {}) => evaluateGitCommand(command, {
 const files = (command, fsOpts, o = {}) => evaluateBashForFiles(command, {
   home: '/home/u', env: {}, platform: 'linux', realpath: (p) => p, cwd: PROJ, ...fsOpts, existsSync: fsOpts.pathExists, ...o,
 });
-function both(command, spec, dirs = ['scripts']) {
+// `o.git` / `o.files` add options (e.g. an injected clock) to that guard's call.
+function both(command, spec, dirs = ['scripts'], o = {}) {
   const mk = (bad, ok) => Object.fromEntries(Object.entries(spec).map(([k, v]) => [k, v === 'bad' ? bad : v === 'ok' ? ok : v]));
   return {
-    git: git(command, fakeFs(GIT_ROOT, mk(BAD_GIT, 'git status'), dirs)),
-    files: files(command, fakeFs(PROJ, mk(BAD_FILES, 'echo hi'), dirs)),
+    git: git(command, fakeFs(GIT_ROOT, mk(BAD_GIT, 'git status'), dirs), o.git),
+    files: files(command, fakeFs(PROJ, mk(BAD_FILES, 'echo hi'), dirs), o.files),
   };
 }
 // run.sh / run2.sh / scripts/run2.sh hold the guarded command; ok.sh / run1.sh / scripts/run1.sh are harmless
@@ -185,7 +187,6 @@ test('B5 a name nothing on the line sets is no looser than before: the reading o
 
 // ---- B6. crafted long inputs finish quickly in both guards (a hook past its deadline is ALLOWED by the host) -------------------------------------------------------
 test('B6 adversarial 200 kB lines are answered quickly by the reading itself, and shorter ones by both guards', () => {
-  const cpu = () => { const u = process.cpuUsage(); return (u.user + u.system) / 1000; }; // (CPU time, not the clock: a busy machine must not fail the test)
   const globs = [
     'F=' + 'a'.repeat(5000) + '.sh; G=${F#*a*a*a*a*a*a*a*a*a*b}; bash $G',
     'F=' + 'a'.repeat(300) + '.sh; G=${F#*a*a*a*a*a*a*a*a*a*b}; bash $G',
@@ -198,19 +199,42 @@ test('B6 adversarial 200 kB lines are answered quickly by the reading itself, an
     '${U:-' + 'x'.repeat(n * 9) + '}', 'G="' + '${U:-"'.repeat(n * 3),
   ];
   for (const c of [...globs, ...big(20000)]) {
-    const t0 = cpu();
-    assigningDefaults(c);
-    const own = cpu() - t0;
-    assert.ok(own < 500, `${own} ms in assigningDefaults for ${c.slice(0, 40)}...`);
+    assertCpuUnder(cpuTime(() => assigningDefaults(c)), 500, `assigningDefaults for ${c.slice(0, 40)}...`);
   }
   // (the parser alone takes seconds on a full-size one, on main too: the guards get the shorter ones)
   for (const c of [...globs, ...big(1500)]) {
-    const t0 = cpu();
-    both(c, SPEC);
-    const ms = cpu() - t0;
-    assert.ok(ms < 8000, `${ms} ms for ${c.slice(0, 40)}...`);
+    assertCpuUnder(cpuTime(() => both(c, SPEC)), 8000, `both guards for ${c.slice(0, 40)}...`);
   }
 });
+// Step bounds for the two B6 shapes whose clock reads grow with the input (the others stop after 2-13 reads however long the line is): clock reads
+// counted per guard on the completed path. CEIL = 2x the count measured at n = 1500 on this branch (2 significant figures), FLOOR = floor(count / 4).
+const B6_STEPS = {
+  assign: { git: { floor: 1875, ceil: 16000 }, files: { floor: 1875, ceil: 16000 } }, // measured 7503, 7502
+  defaults: { git: { floor: 5, ceil: 44 }, files: { floor: 4, ceil: 34 } }, // measured 22, 17
+};
+const b6Shape = { assign: (n) => 'a=${a}'.repeat(n * 5), defaults: (n) => '${U:-' + 'x'.repeat(n * 9) + '}' };
+for (const shape of ['assign', 'defaults']) {
+  test(`B6 ${shape === 'assign' ? '7,500 self-assignments' : 'a 13,500-character default'}: clock reads follow the line length, in both guards`, () => {
+    const run = (n) => {
+      const line = b6Shape[shape](n);
+      const g = virtualClock(5000 / (2 * B6_STEPS[shape].git.ceil));
+      const f = virtualClock(5000 / (2 * B6_STEPS[shape].files.ceil));
+      const { git: rg, files: rf } = both(line, SPEC, ['scripts'], { git: { now: g.now }, files: { now: f.now } });
+      for (const r of [rg, rf]) assert.doesNotMatch(r.reason ?? '', /took too long|too complex/);
+      return { rg, rf, g: g.reads, f: f.reads };
+    };
+    const half = run(750);
+    const full = run(1500);
+    // (the self-assignments end in the files guard's expansion cap, which refuses them; the git guard judges the whole line)
+    assert.equal(full.rg.decision, 'allow');
+    assert.equal(full.rf.decision, shape === 'assign' ? 'deny' : 'allow');
+    if (shape === 'assign') assert.match(full.rf.reason, /variables expand to more text than can be checked/);
+    assertLinearSteps(half.g, full.g, `B6 ${shape} (git)`);
+    assertLinearSteps(half.f, full.f, `B6 ${shape} (files)`);
+    assertSteps(full.g, { ...B6_STEPS[shape].git, label: `B6 ${shape} (git) at n = 1500` });
+    assertSteps(full.f, { ...B6_STEPS[shape].files, label: `B6 ${shape} (files) at n = 1500` });
+  });
+}
 test('B6 a glob with many stars on a long value is an unknown word, not a long search', () => {
   denyBoth('F=' + 'a'.repeat(200) + '.sh; G=${F#*a*a*a*a*a*a*a*a*a*b}; bash $G');
   denyBoth('F=run.sh; G=${F#*a*a*a*a*a*a*a*a*a*b}; bash $G'.replace('#*a*a*a*a*a*a*a*a*a*b', '%.sh*q*q*q*q*q*q*q*q*q'));

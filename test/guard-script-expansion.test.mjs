@@ -7,7 +7,7 @@
 // The file system is faked (like test/guard-git.test.mjs and test/guard-files-bypass.test.mjs); the guarded text only
 // ever lives in fake file contents.
 import { test } from 'node:test';
-import { cpuTimed } from './helpers/timing.mjs';
+import { assertCpuUnder, cpuTimed } from './helpers/timing.mjs';
 import assert from 'node:assert/strict';
 import { resolve, dirname, basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -625,7 +625,7 @@ test('G5: many brackets in one segment stay cheap and fail closed', () => {
     const r = both(`bash ${'[a]*]'.repeat(30)}z.sh`, names);
     assert.ok(['allow', 'deny'].includes(r.git.decision) && ['allow', 'deny'].includes(r.files.decision));
   });
-  assert.ok(ms < 3000, `took ${Math.round(ms)} ms of CPU`);
+  assertCpuUnder(ms, 3000, 'G5 many brackets in one segment');
 });
 
 // ---- round 5: a file whose name holds $ or a backtick ----------------------------------------------------------------
@@ -665,7 +665,7 @@ test('G7: a huge or pathological glob segment is refused quickly, and a director
     const { r, ms } = time(() => both(c, names));
     assert.equal(r.git.decision, 'deny', `git: ${c.slice(0, 30)}`);
     assert.equal(r.files.decision, 'deny', `files: ${c.slice(0, 30)}`);
-    assert.ok(ms < 1500, `${c.slice(0, 30)} took ${Math.round(ms)} ms of CPU`);
+    assertCpuUnder(ms, 1500, `G7 ${c.slice(0, 30)}`);
   }
   // an ordinary segment is untouched by the caps
   allowBoth('bash a*b?.sh', { 'ok.sh': 'ok' });
