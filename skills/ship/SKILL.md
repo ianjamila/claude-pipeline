@@ -59,6 +59,10 @@ number, `R` a review round number, `<slug>` the branch slug.
     or needs the owner's chat approval (`owner_approval: chat`, resumed runs) still waits for the owner's "merge" for the
     exact head (the **Owner-merge approval** rule below). The ruling widens nothing else: invariants 1, 2 and 9 stand.
 
+**Model notes.** Explore (pure lookups) runs with `model: haiku`. The verifier is Haiku (its file pins it; screenshots go to
+`screenshot-reviewer`, Sonnet). `security-reviewer` is Sonnet and `fable-reviewer` Fable, both at effort high: their files pin
+them and `P review add` / `P plan findings` prove it, so never pass a `model` to them either (invariant 5 stands unchanged).
+
 ## Ending a run with a PR open
 
 A run that has a PR and ends for any reason except a successful merge ends with exactly one
@@ -70,7 +74,7 @@ only for a stop that cannot go through summary. Two shapes, used by name below:
 - **needs-human**: `gh pr edit N --add-label needs-human`, `P comment --pr N --kind needs-human --reason "…"`, then
   `P summary --pr N --outcome needs-human --action "…" --cause <code>`.
 - **stopped**: `P summary --pr N --outcome stopped --action "…" --cause <code>`; `--outcome blocked` /
-  `awaiting-review` / `awaiting-owner-merge` have their own steps. `closed` (the owner closed the PR) and
+  `awaiting-review` / `awaiting-owner-merge` / `awaiting-plan-approval` (Step 1.5) / `owner-ui-merge` (Step 5.2) have their own steps. `closed` (the owner closed the PR) and
   `merged-externally` push nothing.
 
 `--action` is one short line in plain words ("Close the pause issue, then say resume"); `--cause` is a short slug
@@ -81,7 +85,9 @@ exists (Step 0 preflight and labels ensure) just stop: the owner is at the keybo
 that reports its token use, book it: `P cost --pr N --phase <build|verify|review|gate|…> --role <implementer|judge|arbiter|verifier|controller>
 --input <n> --output <n> [--cache-read <n>] [--cache-write <n>] [--model sonnet|opus|haiku|fable | --usd <x>]` (an agent transcript
 can be passed instead, priced per message at list price: `--from-transcript <the agent's output file>`). Add `--retry` for each fix-and-reverify retry, and `--session <this session's id>` once per
-session so `P summary` can count the guard blocks. `P summary` shows the totals and the per-phase / per-role breakdown. A failed
+session so `P summary` can count the guard blocks. The plan stage books `--phase plan` (roles `codex`, `fable`) with
+`--execution agent:<id>` / `codex:<session>`, which makes a rebooking replace its entry; PR-stage reviewers book `--role security` / `fable`,
+the screenshot reviewer `--role screenshot`. `P summary` shows the totals and the per-phase / per-role breakdown. A failed
 `P cost` is a warning only; skip it when no figures are available.
 
 ## Step 0 — opt-out, preflight
@@ -106,6 +112,9 @@ session so `P summary` can count the guard blocks. `P summary` shows the totals 
   (only when `worktrees.mode: on`; otherwise it reports). Read `summary` (or `skipped`); never act on `kept` yourself.
 - `inbox` argument ("ship inbox", "what is each PR waiting on") → **Inbox** below (read-only; skip Steps 1–7).
 - `resume <pr>` argument or "resume pipeline reviews" → **Resume mode** below.
+- **Route.** For a new request, before Step 1 write ONE line: `Route: ship | brainstorm first | debug first | superpowers-only | plan + several ships`
+  and a short reason. Decide silently; ask only when two routes are equally plausible. `plan + several ships` = one plan the owner splits
+  into PRs for a stated reason; each ship run records its own plan file (a subset) and gets its own approval. Only `ship` continues here.
 
 ## Step 1 — branch
 
@@ -122,6 +131,21 @@ The run id in the reason is the worktree's directory name (no PR exists yet); St
 `keep` / `unkeep` exiting 2 with `no-such-worktree` (the worktree is not a direct child of `worktree_dir`) is a warning:
 note it in the summary and carry on, never stop the run for it.
 
+## Step 1.5 — plan (owner approves before any code)
+
+Every run, small ones too. Read `reference/plan-stage.md` now: plan sizes, the required sections and what the parser refuses,
+the risk/reviewer matrix, the exact reserve-then-launch sequence for each reviewer, the request template, error handling.
+1. Write the plan in `plan.dir`; commit it with `[skip ci]`, `git push -u origin agent/<slug>`, `gh pr create --draft`.
+2. `P plan record --pr N --file <plan> --request-file <file>` (committed and pushed, or exit 1 `dirty` / `unpushed`).
+3. `P plan risk --pr N`; tell the owner the risk and the reviewers BEFORE reviewing (they may skip or add Fable).
+4. Reviews, each reserved before it is launched: `P plan review` (Codex, as a job), `P plan start --reviewer fable` then
+   `fable-reviewer` then `P plan findings … --claim`. Fix, commit `[skip ci]`, push, `P plan record` again.
+5. Show the approval request, ending with exactly the two lines `Plan <blob40> · scope <scopeDigest12>` and
+   `📋 Ready to approve plan #N — say "approve"` (the Scope list is the one `P plan record` printed).
+6. `P summary --pr N --outcome awaiting-plan-approval --action "Read the plan, then say \"approve\""` → STOP. Issue-driven runs stop here.
+7. Only after the owner's "approve" in THIS session: `P plan approve --pr N` (its errors: `reference/plan-stage.md`), then Step 2.
+   Never run it on your own say-so; the CLI needs the owner's recorded prompt and refuses without it.
+
 ## Step 2 — build and verify
 
 1. Split the work into small tasks. For each, dispatch the **implementer** agent with: the task,
@@ -130,14 +154,14 @@ note it in the summary and carry on, never stop the run for it.
    system context prescribes for commits (`Co-Authored-By: …`); pass it verbatim every time so
    every commit ends with it. Independent tasks may run in parallel only if they touch different
    files.
-   **Checkpoints** (so another machine can continue; detail in `reference/pr-and-summary.md`). When the FIRST task
-   commits: `git push -u origin agent/<slug>`, `gh pr create --draft --title "<title>" --body-file <file>` (body: the
-   request + the task list; ignore `ci.draft_while_iterating` here, Step 5.5 readies it), then
-   `P checkpoint --pr N --step build --request-file <file> --tasks-file <file> --task-done <first id>`. The tasks file
-   is JSON `[{id, title, spec}]`, `spec` = acceptance criteria + the tests to write. After each later task: push, then
-   `P checkpoint --pr N --step build --task-done <id>`. A `checkpoint` exit 1 `unpushed` ⇒ `git push`; `behind` ⇒
-   `git pull --ff-only`; `diverged` ⇒ stop and report; then checkpoint again.
-2. Dispatch the **verifier** with `verify.full` (from `P config`). When `verify.max_parallel_full` is set, every full verify (here, Step 5.3,
+   The tasks are the approved plan's (`P plan approve` copied them into the run record), and each implementer gets the
+   task's FULL text from the plan file at the approved blob (`git show <blob>`), not the clipped copy in the record. The draft PR
+   already exists (Step 1.5; ignore `ci.draft_while_iterating` here, Step 5.5 readies it).
+   **Checkpoints** (so another machine can continue; detail in `reference/pr-and-summary.md`). After each task: push, then
+   `P checkpoint --pr N --step build --task-done <id>` (no `--tasks-file` for a planned run; a resumed or adopted run with no plan
+   still passes one, JSON `[{id, title, spec}]`, with `--request-file` on the first checkpoint). A `checkpoint` exit 1
+   `unpushed` ⇒ `git push`; `behind` ⇒ `git pull --ff-only`; `diverged` ⇒ stop and report; then checkpoint again.
+2. Dispatch the **verifier** (Haiku; it runs the command and reports, nothing else) with `verify.full` (from `P config`). When `verify.max_parallel_full` is set, every full verify (here, Step 5.3,
    and the full runs of review-loop §6) runs as `node ~/.claude/pipeline/bin/pipeline.mjs verify slot --run` (it runs `verify.full` itself; nothing goes after it) instead,
    so only that many run at once on this machine; the wrapper passes the exit code through and prints one stderr line
    `{"slot":{…,"waitedSeconds","loadWaitSeconds","warnings"}}`: the verifier reports it, and the controller puts the waits (and any
@@ -171,7 +195,8 @@ note it in the summary and carry on, never stop the run for it.
    `reference/pr-and-summary.md`: in plain English (first), what & why, verify summary (step table + head sha), tests added,
    screenshots, risk level + reasons, hard-stop hits (blocking, and report-only under their own heading). Keep it
    a draft (Step 5.5 readies it). End the step with `P checkpoint --pr N --step pr`.
-4. UI change ⇒ `P artifacts push --pr N --dir .verify/screenshots`
+4. UI change ⇒ dispatch `screenshot-reviewer` (Sonnet) on `.verify/screenshots` and paste its lines (one per image, then its
+   `Problems:` line) into the PR body; a problem it names is fixed like a red verify step. Then `P artifacts push --pr N --dir .verify/screenshots`
    (pushes the images to the `pipeline-artifacts` branch, never your worktree; returns markdown
    image links), then update the PR body with them (`gh pr edit N --body-file <file>`).
 5. BLOCKING hard-stop hits (`blocking` non-empty; report-only hits alone do not count) ⇒ `gh pr edit N --add-label needs-human` and post
@@ -183,7 +208,8 @@ note it in the summary and carry on, never stop the run for it.
 
 ## Step 4 — review loop
 
-Follow `reference/review-loop.md` exactly. In short, per round `R` (max `review.max_rounds`):
+Follow `reference/review-loop.md` exactly. The round's `obligations` (from `P codex-review`) are dispatched before the judge:
+see `reference/review-loop.md` **Reviewer obligations**; a round with an unmet obligation is not clean. In short, per round `R` (max `review.max_rounds`):
 Codex (`P codex-review --pr N --round R …` as a job; light lane with nothing but WORTH CONSIDERING items ⇒
 `P triage light-lane --round R` and skip the judge) → judge (`judge` agent, no model param, only
 for items without a ruling yet; `P triage validate --round R --from-tag "pipeline-judge R<R> <d8>"`)
@@ -222,6 +248,11 @@ Details and every exit code: `reference/gates-and-exits.md`. First: `P checkpoin
    labelled, 5.4-5.5): the CI wait in 5.5 and the gate in 5.7 judge the new head. Read `exitCode` and
    the JSON in `tail`:
    - 0 `up-to-date` ⇒ if `pullNeeded`, `git pull --ff-only` (the gate now names `head`; 5.3 onward re-verifies it).
+   - **Busy main.** On the SECOND recorded base update (the gate or `P merge` returns `behind-base` again on a head that is otherwise fully
+     verified), run `P handoff check --pr N --post` BEFORE another update-branch. Exit 0 (eligible) ⇒ the hand-off comment is posted and
+     recorded: `P summary --pr N --outcome owner-ui-merge --action "Merge in GitHub if you accept the hand-off"`, `P agent-log publish --line "<agentLogLine>"`,
+     keep the worktree, STOP (the pipeline never merges it; `reference/gates-and-exits.md`). Exit 1 (not eligible: read `reasons`) ⇒ today's path.
+     With fewer than 2 recorded updates the check just says so. It is the owner's explicit risk to take; never describe it as verified against main.
    - 1 `rebase-needed` (the update conflicts) or `cycle-cap` ⇒ **needs-human** (`--cause update-branch:<outcome>`,
      `--action "Rebase or merge the base into the branch by hand"`), stop after the summary.
    - 1 `head-moved` (someone pushed since you verified, or the new head is not GitHub's merge commit; nothing more
@@ -288,7 +319,7 @@ when it cannot; the PR summary shows one line per step (`<step> proof: GitHub ru
      not merged in time, PR closed, blocker appeared): act per `reference/gates-and-exits.md`.
      "Update the branch" cases (`error: behind-base` — merge already updated the branch itself, or could not
      (`outcome`: `rebase-needed` ⇒ **needs-human**, `--cause merge:rebase-needed`) — or `behind-base:` in a live
-     check) ⇒ back to Step 5.2, re-verify, a new review round if content changed; max 2 such returns, then
+     check) ⇒ back to Step 5.2 (the second recorded update runs `P handoff check --pr N --post` there first), re-verify, a new review round if content changed; max 2 such returns, then
      **needs-human** (`--cause merge:behind-base`).
    - 3 ⇒ `error: production-unknown` (no known-good production deployment recorded) or GitHub
      unavailable: nothing merged; wait a minute and retry once, then
@@ -395,6 +426,10 @@ the owner's next move.
 2. Route on `enter`:
    - `closed` / `ended` / `not-resumable` ⇒ report `reason`, stop.
    - `decision` ⇒ show the `needs-human` reason, stop (the owner decides; with `owner_approval: chat` and review items `needsHuman`, tell them to rule on the ids in chat, see **Owner rules in chat** in `reference/review-loop.md`). The label alone does not mean this: Step 3.5 adds it before the review loop, so a run whose record is mid-run or ended `awaiting-review` / `blocked` / `awaiting-owner-merge` resumes as usual (the plan's `notes` say the run still ends in `needs-human`, no merge); `decision` is only for an ended `needs-human` outcome or no usable record.
+   - `plan` ⇒ no approved plan this machine can vouch for yet: show the active plan request (the plain-English section, the Scope list from
+     `P plan record`, the reviewer tally and the two request lines, `reference/plan-stage.md`), `P summary --pr N --outcome awaiting-plan-approval`, stop.
+     Never approve for the owner.
+   - `owner-ui-merge` ⇒ the PR was handed to the owner for a GitHub merge: report that, stop (report-only; the pipeline does not merge it).
    - `local-work` ⇒ report the worktree state (diverged / dirty / unpushed), stop. Never reset or discard it.
    - `observe-prod` with `production.watch: workflow` (`P config`) ⇒ do NOT run prod-watch: the project's CI workflow owns
      the production smoke and posts its result on the merged PR (Step 5.2). Close the record: `P state show --pr N` (rebuilds
@@ -405,7 +440,8 @@ the owner's next move.
      `rollbackInterrupted`, then release the lock: `P worktrees unkeep agent-<slug>-prod --run agent-<slug>-prod`. prod-watch records the outcome itself (run record `step: ended`, `outcome` set, summary sections kept; a
      `deploy-not-observed` outcome stays open to watch again), so nothing else needs writing and the next `resume plan` routes `ended`. `needs-owner` ⇒
      tell the owner at once. Never roll back.
-   - `build | verify | review | followups | gate` ⇒ steps 3–5, then the matching step. A run that ended `needs-human` for review items and whose label the owner removed after ruling in chat routes here (`gate` once the rulings made the review clean, `review` while an ACCEPT still has to be built and reviewed).
+   - `build | verify | review | followups | gate` ⇒ steps 3–5, then the matching step. `build` with `planApproveFirst: true` ⇒ run `P plan approve --pr N` first
+     (it reuses the posted approval and copies the approved tasks), then build. A run that ended `needs-human` for review items and whose label the owner removed after ruling in chat routes here (`gate` once the rulings made the review clean, `review` while an ACCEPT still has to be built and reviewed).
 3. Worktree per `worktree.action`: `reuse` ⇒ `cd` into `path`; `add-existing-ref` ⇒ `git worktree add <path> <branch>`;
    `add-from-remote` ⇒ `git fetch origin <branch>` then `git worktree add --no-track -b <branch> <path> origin/<branch>`;
    never `-B`. Then `then: ff-only` ⇒ `git merge --ff-only <liveHead>` (the plan's exact `liveHead` sha; `plan` already refreshed `origin/<branch>`, but never trust a tracking ref), `then: push` ⇒ `git push origin <branch>`.
@@ -444,6 +480,13 @@ read the issue, link it in the PR body (`Closes #123`).
 | merge exit 3 `production-unknown` | nothing merged; `summary --outcome stopped --action …`, stop, tell the user |
 | prod smoke fails | prod-watch handles rollback + issue + revert PR and pushes the owner; `summary` with its outcome word; tell the user. With `production.watch: workflow` there is no prod-watch: the workflow's PR comment is the record, nothing is rolled back and no production push is sent; tell the user |
 | pause/rollback issue open | PR stays open: `summary --outcome stopped --cause merge-paused --action "Close the pause/rollback issue"`, explain |
+| `plan approve` exit 1 `superseded` / `no-approval` | the owner has not approved THIS plan: re-show the active request (`reference/plan-stage.md`), wait |
+| `plan approve` exit 1 `plan-changed` / `unpushed` / `record-unreadable` | re-record and re-show (changed) / push (unpushed) / stop and tell the owner (unreadable run record) |
+| gate `plan-scope: lost` | the plan evidence is missing or edited: re-show the active request; the owner's new "approve" clears it |
+| `plan start` exit 1 `cap` | ask the owner for an extra (`--extra "<their words>"`) or to skip the review |
+| `plan start` / `plan review` exit 1 `already-started` | do NOT launch (the key is consumed); a new run needs a new key within the cap or an owner extra |
+| `resume plan` → `build` with `planApproveFirst` | run `P plan approve --pr N` first |
+| `handoff check` exit 1 | not eligible (`reasons`): today's loop (update the branch, re-verify) |
 | `checkpoint` exit 1 `unpushed` / `behind` / `diverged` | `git push origin agent/<slug>` / `git pull --ff-only` / `summary --outcome stopped --cause checkpoint:diverged --action …`, stop and report; checkpoint again |
 | `resume plan` has `confirm` | ask the owner whether the other run stopped; wait; never start on a guess |
 | `resume plan` `enter: local-work` | report the diverged/dirty/unpushed worktree, stop; never reset it |
