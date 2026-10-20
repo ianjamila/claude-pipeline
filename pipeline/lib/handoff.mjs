@@ -41,7 +41,9 @@ const PRODUCTION = {
 const MAX_LISTED = 50;
 
 // The PR comment. Commit subjects and file names come from other people's commits: defused (no markup, no mentions) and flat.
-export function renderHandoffComment({ pr, head, baseTip, ciBase, commits = [], prFiles = [], ownerItems = [], productionWatch = 'none', itemsChanged = false }) {
+// `overlap`: the PR files main also changed over its whole range (the command computes it; commits are only the listed ones). Without
+// it, it is derived from `commits` and `prFiles`. `totalCommits` > listed commits means some were left out, and the comment says so.
+export function renderHandoffComment({ pr, head, baseTip, ciBase, commits = [], totalCommits = commits.length, overlap: knownOverlap, prFiles = [], ownerItems = [], productionWatch = 'none', itemsChanged = false }) {
   const mine = new Set(prFiles);
   const ciText = ciBase === 'unknown' || !SHA40.test(String(ciBase)) ? 'unknown (could not prove which base CI used)' : short(ciBase);
   const lines = [
@@ -56,9 +58,10 @@ export function renderHandoffComment({ pr, head, baseTip, ciBase, commits = [], 
     const files = (c.files ?? []).slice(0, 8).map((f) => defuse(flat(f))).join(', ');
     lines.push(`  - ${short(c.sha)} ${clip(defuse(flat(c.subject)), 120)}${files ? ` (${files}${(c.files ?? []).length > 8 ? ', …' : ''})` : ''}`);
   }
-  if (commits.length > shown.length) lines.push(`  - … and ${commits.length - shown.length} more`);
-  if (commits.length === 0) lines.push('  - none');
-  const overlap = [...new Set(commits.flatMap((c) => c.files ?? []).filter((f) => mine.has(f)))];
+  const total = Math.max(totalCommits, commits.length);
+  if (total > shown.length) lines.push(`  - … and ${total - shown.length} more; ${total - shown.length} of main's ${total} commits are not listed (the overlap line below still covers all of them)`);
+  if (total === 0) lines.push('  - none');
+  const overlap = knownOverlap ?? [...new Set(commits.flatMap((c) => c.files ?? []).filter((f) => mine.has(f)))];
   lines.push(overlap.length > 0
     ? `- Overlap: touches this PR's files: ${overlap.slice(0, 20).map((f) => defuse(flat(f))).join(', ')}${overlap.length > 20 ? ', …' : ''}`
     : "- Overlap: none of this PR's files");

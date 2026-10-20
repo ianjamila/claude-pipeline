@@ -128,3 +128,11 @@ test('ciTestedBase: a short page before total_count is an incomplete listing (un
   const short = { ...fakeGh({ runs: [] }), api: () => ({ total_count: 150, workflow_runs: many.slice(0, 50) }) };
   assert.equal(ciTestedBase({ gh: short, pr: 12, head: H }), 'unknown');
 });
+
+test('the comment uses the whole-range overlap it is given and says when commits were left out', () => {
+  const base = { pr: 4, head: 'a'.repeat(40), baseTip: 'b'.repeat(40), ciBase: 'unknown', commits: [{ sha: 'e'.repeat(40), subject: 'y', files: ['docs/z.md'] }], prFiles: ['src/a.mjs'], ownerItems: [] };
+  const cut = renderHandoffComment({ ...base, totalCommits: 120, overlap: ['src/a.mjs'] });
+  assert.match(cut, /touches this PR's files: src\/a\.mjs/);
+  assert.match(cut, /119 of main's 120 commits are not listed/);
+  assert.doesNotMatch(renderHandoffComment(base), /not listed/);
+});

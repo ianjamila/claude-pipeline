@@ -123,7 +123,8 @@ const QUICK = [
 const git = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@x.invalid', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@x.invalid' } }).trim();
 
 // A PR that is BEHIND a main that already moved once in the bare origin (from-main.txt, plus an optional conflicting edit).
-function world({ updates = 2, quick = 'node scripts/quick.mjs', conflict = false, gh = {}, yml = null, change, comments } = {}) {
+// `shared`: a file main's OLDEST commit also adds, byte for byte as the PR does (a clean merge); `later`: that many more main commits after it.
+function world({ updates = 2, quick = 'node scripts/quick.mjs', conflict = false, gh = {}, yml = null, change, comments, shared = null, later = 0 } = {}) {
   const s = scenario({ yml: (yml ?? ymlFor()).replace('npm run verify:quick', quick), baseFiles: { 'scripts/quick.mjs': QUICK }, ...(change ? { change } : {}) });
   const origin = mkdtempSync(join(tmpdir(), 'cp-handoff-origin-'));
   git(origin, ['init', '--bare', '-q', '-b', 'main']);
@@ -135,7 +136,14 @@ function world({ updates = 2, quick = 'node scripts/quick.mjs', conflict = false
   writeFileSync(join(work, 'from-main.txt'), 'main moved\n');
   if (conflict) writeFileSync(join(work, 'src/app.js'), 'export const a = 3;\n');
   git(work, ['add', '-A']);
+  if (shared) writeFileSync(join(work, shared.file), shared.content);
+  git(work, ['add', '-A']);
   git(work, ['commit', '-q', '-m', conflict ? 'main edits the same line' : 'main adds a file']);
+  for (let i = 0; i < later; i += 1) {
+    writeFileSync(join(work, `later-${i}.txt`), `${i}\n`);
+    git(work, ['add', '-A']);
+    git(work, ['commit', '-q', '-m', `later ${i}`]);
+  }
   git(work, ['push', '-q', 'origin', 'main']);
   s.newBase = git(work, ['rev-parse', 'HEAD']);
   s.entries = (o = {}) => ghEntries({ prHead: s.head, mergeStateStatus: 'BEHIND', comments: comments ?? (updates > 0 ? [summaryWith(updates)] : []), extra: [PATCH_77, ...(gh.extra ?? [])], ...gh, ...o });
@@ -218,6 +226,21 @@ test('handoff check: eligible runs the quick verify on the merged tree (a platfo
   assert.deepEqual(r.json.overlap, []);
   assert.equal(r.json.ciBase, 'unknown', 'no CI run listing: never guessed');
   assert.deepEqual(handoffPosts(s.fake), []);
+});
+
+test('handoff check: overlap covers the whole range, not just the 50 listed commits; the comment says commits were left out', () => {
+  const content = 'shared by both\n';
+  const s = world({ shared: { file: 'shared.txt', content }, later: 54, change: (r) => { r.write('src/app.js', 'export const a = 2;\n'); r.write('shared.txt', content); } });
+  const r = s.check(['--post']);
+  assertExit(r, 0, r.stdout);
+  assert.equal(r.json.commits.length, 50);
+  assert.equal(r.json.totalCommits, 55);
+  assert.equal(r.json.truncated, true);
+  assert.deepEqual(r.json.overlap, ['shared.txt'], 'the oldest (unlisted) commit touches a PR file');
+  const posts = handoffPosts(s.fake);
+  assert.equal(posts.length, 1);
+  assert.match(posts[0], /touches this PR's files: shared\.txt/);
+  assert.match(posts[0], /5 of main's 55 commits are not listed/);
 });
 
 test('handoff check --post: posts one comment naming the base CI used (not today\'s), and records handoff', () => {

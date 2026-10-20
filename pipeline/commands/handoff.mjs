@@ -18,7 +18,7 @@ import { readSummaryComment } from '../lib/summary-comment.mjs';
 
 export const meta = {
   summary: 'busy-main hand-off: decide whether a fully verified PR can be handed to the owner to merge in GitHub, and post the honest comment',
-  usage: 'pipeline handoff check --pr N [--post] [--repo DIR]   -> exit 0 {ok, eligible: true, head, baseTip, ciBase, commits[{sha, subject, files}], overlap[], ownerItems[], itemsChanged?, quickVerify{ok, exitCode, tail}, production, posted?{id, url}, warnings?}; exit 1 {ok: false, eligible: false, reasons[], head?, baseTip?, quickVerify?} (never an error: a missing fact is "not eligible"); 3 GitHub unavailable. Eligible = the run record holds >= 2 confirmed base updates (behindBaseUpdates), branch protection provably does NOT require up-to-date branches, the LIVE final gate fails ONLY pr-open behind-base, git merge-tree of the gate head with the base tip is clean, and verify.quick passes on that merge in a temporary worktree (removed afterwards; a failed condition skips the quick verify). Everything is pinned to the gate head. --post re-checks the PR head and the gate right before posting one hand-off comment (the final gate\'s owner items; itemsChanged: true when they differ from the first gate\'s) and records handoff {head, baseTip, at} in the run record; any change exits 1 "the PR changed during the check: run it again" and posts nothing. It never merges',
+  usage: 'pipeline handoff check --pr N [--post] [--repo DIR]   -> exit 0 {ok, eligible: true, head, baseTip, ciBase, commits[{sha, subject, files}] (the newest 50), totalCommits, truncated, overlap[] (over the whole main range, not just the listed commits), ownerItems[], itemsChanged?, quickVerify{ok, exitCode, tail}, production, posted?{id, url}, warnings?}; exit 1 {ok: false, eligible: false, reasons[], head?, baseTip?, quickVerify?} (never an error: a missing fact is "not eligible"); 3 GitHub unavailable. Eligible = the run record holds >= 2 confirmed base updates (behindBaseUpdates), branch protection provably does NOT require up-to-date branches, the LIVE final gate fails ONLY pr-open behind-base, git merge-tree of the gate head with the base tip is clean, and verify.quick passes on that merge in a temporary worktree (removed afterwards; a failed condition skips the quick verify). Everything is pinned to the gate head. --post re-checks the PR head and the gate right before posting one hand-off comment (the final gate\'s owner items; itemsChanged: true when they differ from the first gate\'s) and records handoff {head, baseTip, at} in the run record; any change exits 1 "the PR changed during the check: run it again" and posts nothing. It never merges',
 };
 
 const QUICK_TIMEOUT_MS = 10 * 60_000;
@@ -57,7 +57,8 @@ async function quickVerifyOnMerge({ root, command, tree, head, baseTip, pr, env 
   }
 }
 
-// main's commits since the fork point with their files (capped), and the files this PR changes.
+// main's commits since the fork point with their files (the LISTED ones are capped), every file main changed in the whole range
+// (never capped: the overlap must not depend on which commits are shown), and the files this PR changes.
 function baseFacts({ root, head, baseTip }) {
   const o = { cwd: root };
   const mb = mergeBase(head, baseTip, o);
@@ -67,8 +68,10 @@ function baseFacts({ root, head, baseTip }) {
     const files = git(['diff-tree', '--no-commit-id', '--name-only', '-r', '-m', '--first-parent', '-z', sha], o).split('\0').filter(Boolean);
     return { sha, subject: subject.join('\t'), files };
   });
+  const totalCommits = Number.parseInt(git(['rev-list', '--count', `${mb}..${baseTip}`], o).trim(), 10);
+  const baseFiles = git(['diff', '--name-only', '--no-renames', '-z', mb, baseTip], o).split('\0').filter(Boolean);
   const prFiles = [...new Set(diffFiles(mb, head, o).flatMap((f) => [f.path, f.oldPath, f.newPath].filter(Boolean)))];
-  return { commits, prFiles };
+  return { commits, totalCommits: Number.isInteger(totalCommits) ? totalCommits : commits.length, truncated: totalCommits > commits.length, baseFiles, prFiles };
 }
 
 async function check(argv, ctx) {
@@ -130,13 +133,13 @@ async function check(argv, ctx) {
     if (!verdict.eligible) return notEligible([...reasons, ...verdict.reasons], { head: H, baseTip, quickVerify });
 
     // 7-10. What the owner is shown.
-    const { commits, prFiles } = baseFacts({ root, head: H, baseTip });
+    const { commits, totalCommits, truncated, baseFiles, prFiles } = baseFacts({ root, head: H, baseTip });
     const touched = new Set(prFiles);
-    const overlap = [...new Set(commits.flatMap((c) => c.files).filter((f) => touched.has(f)))];
+    const overlap = [...new Set(baseFiles.filter((f) => touched.has(f)))];
     const ciBase = ciTestedBase({ gh, pr, head: H });
     const production = config.production?.watch ?? (config.production ? 'session' : 'none');
     const itemsOf = (g) => g.checks.flatMap((c) => c.ownerItems ?? []);
-    const output = { ok: true, eligible: true, head: H, baseTip, ciBase, commits, overlap, ownerItems: itemsOf(gate), quickVerify, production };
+    const output = { ok: true, eligible: true, head: H, baseTip, ciBase, commits, totalCommits, truncated, overlap, ownerItems: itemsOf(gate), quickVerify, production };
     if (values.post !== true) return { exitCode: EXIT.OK, output };
 
     // 11. Re-validate right before publishing: nothing may have changed during the (slow) quick verify.
@@ -146,7 +149,7 @@ async function check(argv, ctx) {
     if (final.head !== H || !handoffEligibility({ updates, strict, gate: final, mergeTreeOk: true, quickVerifyOk: true }).eligible) return changed();
     const itemsChanged = final.ownerItems !== gate.ownerItems;
     const finalItems = itemsOf(final);
-    const body = renderHandoffComment({ pr, head: H, baseTip, ciBase, commits, prFiles, ownerItems: finalItems, productionWatch: production, itemsChanged });
+    const body = renderHandoffComment({ pr, head: H, baseTip, ciBase, commits, totalCommits, overlap, ownerItems: finalItems, productionWatch: production, itemsChanged });
     const posted = gh.createComment(pr, body);
     const recorder = createRunRecorder({ gh, pr });
     recorder.update({ handoff: { head: H, baseTip, at: new Date().toISOString() } }, { initialStep: 'gate' });
