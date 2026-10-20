@@ -83,7 +83,11 @@ function taintClosure(base, cmds, extra = {}, isNew = () => false, active = fals
 
 const DEVICE_PREFIX = /^\/\/[?.]\/(?=[A-Za-z]:\/)/; // \\?\C:\ and \\.\C:\ forms
 
-const isAbs = (s) => s.startsWith('/') || /^[A-Za-z]:\//.test(s);
+// Whether a drive letter makes a path absolute (`D:/x`) depends on the platform of the evaluation (makeCtx sets it; the evaluation is synchronous): on macOS / Linux `D:/..` is a relative path
+// (a directory named `D:`, then the parent), not the root of a drive, and a guard that read it as a drive would see a write the shell makes into the working directory as one to another place.
+let drivePaths = false;
+const isAbs = (s) => s.startsWith('/') || (drivePaths && /^[A-Za-z]:\//.test(s));
+const pathsFor = () => (drivePaths ? drivePosix : posix);
 const caseInsensitive = (platform) => platform === 'win32' || platform === 'darwin';
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
 const unique = (a) => [...new Set(a)];
@@ -181,6 +185,7 @@ function defaultReadText(file) {
 
 function makeCtx(opts) {
   const platform = opts.platform ?? process.platform;
+  drivePaths = platform === 'win32';
   const homeNative = opts.home || os.homedir();
   const homePosix = posixHome(homeNative);
   let cwd = toPosix(opts.cwd || process.cwd()).replace(DEVICE_PREFIX, '');
@@ -1659,13 +1664,13 @@ function judgePackageScripts(c, dirs, ctx, opts, scanRaw = '') {
   for (const d of dirs) {
     const mentionsGuarded = () => makeMatchers(ctx).rawHit(scanRaw, [d]) || SENSITIVE_WORDS.test(String(scanRaw).replace(/['"`\\]/g, ''));
     const plan = packageScripts(call, {
-      cwd: d, home: ctx.homePosix, nodePrefix: ctx.nodePrefix, readText: ctx.readText, pathExists: (x) => ctx.api.existsSync(x), lexists: ctx.api.lexists, readDir: ctx.readDir, cache: (ctx.budget.pkgCache ??= new Map()), p: drivePosix, tick: () => checkDeadline(ctx.budget),
+      cwd: d, home: ctx.homePosix, nodePrefix: ctx.nodePrefix, readText: ctx.readText, pathExists: (x) => ctx.api.existsSync(x), lexists: ctx.api.lexists, readDir: ctx.readDir, cache: (ctx.budget.pkgCache ??= new Map()), p: pathsFor(), tick: () => checkDeadline(ctx.budget),
       written: (abs) => pkgFileWritten(ctx, abs),
       mentionsGuarded,
       lineNames: () => lineNames(scanRaw),
     });
     if (plan.refuse) return deny(plan.refuse);
-    const marked = pkgMarkersFor(ctx.budget, pmStartDirs(call, [d], ctx.homePosix, drivePosix), { pathExists: (x) => ctx.api.existsSync(x), real: (q) => realResolve(q, ctx.api), p: drivePosix });
+    const marked = pkgMarkersFor(ctx.budget, pmStartDirs(call, [d], ctx.homePosix, pathsFor()), { pathExists: (x) => ctx.api.existsSync(x), real: (q) => realResolve(q, ctx.api), p: pathsFor() });
     if (marked === 'known' || (marked === 'maybe' && mentionsGuarded())) return deny(`package script: an earlier command on the line (mkdir, touch, rm, mv, cp, ln ...) ${marked === 'known' ? 'creates, removes or renames' : 'may create, remove or rename (a path only known at run time), while the line mentions a guarded operation,'} a package.json, node_modules, server.js, binding.gyp or configuration file that \`${c.argv.slice(0, 4).join(' ')}\` depends on (in the package's directory or above it), so which script it runs cannot be verified. Run it in a command of its own`);
     for (const run of plan.runs ?? []) {
       const key = `${run.file}\u0000${run.label}\u0000${run.text}`;
@@ -1689,8 +1694,8 @@ function judgePackageScripts(c, dirs, ctx, opts, scanRaw = '') {
 // bin that starts with a shell shebang (or none) is judged here; a program in another language is not. An install earlier on the line may add it: refused when the line refers to a protected path.
 function judgeBinScript(name, dirs, ctx, opts, scanRaw = '', quiet = false, lookups = null, only = false) {
   // (`lookups`: places to look for the bin from besides the directory it runs in -- a package runner's --prefix --, each judged as run in every dir of `dirs`; `only`: instead of that directory)
-  for (const [d, l] of dirs.flatMap((x) => [...(only ? [] : [[x, x]]), ...(lookups ?? []).map((y) => [x, drivePosix.resolve(x, y)])])) {
-    const bin = localBin(name, { cwd: l, pathExists: (x) => ctx.api.existsSync(x), p: drivePosix, written: (x) => writtenTo(ctx.frames, x, { exists: (y) => ctx.api.existsSync(y), readText: ctx.readText, ignoreUnmodelled: true }) });
+  for (const [d, l] of dirs.flatMap((x) => [...(only ? [] : [[x, x]]), ...(lookups ?? []).map((y) => [x, pathsFor().resolve(x, y)])])) {
+    const bin = localBin(name, { cwd: l, pathExists: (x) => ctx.api.existsSync(x), p: pathsFor(), written: (x) => writtenTo(ctx.frames, x, { exists: (y) => ctx.api.existsSync(y), readText: ctx.readText, ignoreUnmodelled: true }) });
     if (!bin) {
       if (!quiet && ctx.budget.pkgBinsDirty && (makeMatchers(ctx).rawHit(scanRaw, [d]) || SENSITIVE_WORDS.test(String(scanRaw).replace(/['"`\\]/g, '')))) return deny(`package script: an earlier install on the line may add node_modules/.bin/${name}, and the line refers to a protected pipeline file, so what it runs cannot be checked; run the install in a command of its own`);
       continue;
@@ -1707,10 +1712,10 @@ function judgeBinScript(name, dirs, ctx, opts, scanRaw = '', quiet = false, look
       if (!ctx.api.existsSync(bin) || ctx.readDir(bin)) continue; // (missing: nothing runs; a directory: a shell cannot run it)
       const head = ctx.readHead(bin);
       if (typeof head !== 'string') return deny(`cannot read node_modules/.bin/${name} (${bin}: missing permission), so whether it is a shell script and what it runs cannot be verified`);
-      if (!binIsProgram(head, binSite(bin, d, (x) => ctx.api.existsSync(x), drivePosix))) return deny(`${bin} is too large to verify (over 1 MB), so what it runs cannot be known`);
+      if (!binIsProgram(head, binSite(bin, d, (x) => ctx.api.existsSync(x), pathsFor()))) return deny(`${bin} is too large to verify (over 1 MB), so what it runs cannot be known`);
       continue;
     }
-    if (binIsProgram(text, binSite(bin, d, (x) => ctx.api.existsSync(x), drivePosix))) continue;
+    if (binIsProgram(text, binSite(bin, d, (x) => ctx.api.existsSync(x), pathsFor()))) continue;
     const r = judgeScriptText(text, { kind: 'shell', file: bin }, bin, d, ctx, opts); // (a bin runs where the manager runs, in the caller's directory, not in node_modules/.bin)
     if (r) return r;
     const ri = judgeBinInterpreters(bin, text, d, ctx, opts);
@@ -1721,7 +1726,7 @@ function judgeBinScript(name, dirs, ctx, opts, scanRaw = '', quiet = false, look
 // R2-B1: the shebang of an opened bin names a file the project controls (binInterpreter): THAT file runs, with the bin as its argument, so it is judged as the bin is (a shell script unless it is itself a program), and the one
 // its own shebang names after it. A loop or a chain of more than MAX_BIN_INTERPRETERS cannot be verified: refused.
 function judgeBinInterpreters(bin, text, d, ctx, opts) {
-  const site = binSite(bin, d, (x) => ctx.api.existsSync(x), drivePosix);
+  const site = binSite(bin, d, (x) => ctx.api.existsSync(x), pathsFor());
   const seen = new Set([bin]);
   for (let cur = text; ;) {
     const interp = binInterpreter(cur, site);
@@ -2499,7 +2504,7 @@ function evaluateBashForFilesFrame(command, opts) {
       return /[$`*?[{]/.test(e) || (e.startsWith('~') && !isAbs(e)) ? null : e;
     },
     locate: (e, idx) => (isAbs(e) ? [posix.normalize(e)] : dirs.map((d) => posix.join(d, e))),
-    isAbs, p: drivePosix, ci: ctx.ci,
+    isAbs, p: pathsFor(), ci: ctx.ci,
     real: (q) => realResolve(q, ctx.api),
     readText: (q) => ctx.readText(q), // (an awk program file is read to see what it writes)
     tick: () => checkDeadline(ctx.budget),
@@ -2730,7 +2735,7 @@ function evaluateBashForFilesFrame(command, opts) {
           : judgeBinScript(expandRefs(c.argv[0], ctx), sdirsNow(), ctx, withLineVars(opts, c), scanRaw, true);
         if (v) return v;
       }
-      markPackageState(ctx.budget, [c.argv], { dirs: cwdsNow(), expand: (w) => expandRefs(w, ctx), home: ctx.homePosix, p: drivePosix }); // (what this command may change, for the package scripts after it)
+      markPackageState(ctx.budget, [c.argv], { dirs: cwdsNow(), expand: (w) => expandRefs(w, ctx), home: ctx.homePosix, p: pathsFor() }); // (what this command may change, for the package scripts after it)
       undo?.();
     }
   } else {

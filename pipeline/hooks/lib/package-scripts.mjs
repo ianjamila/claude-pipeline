@@ -3,7 +3,7 @@
 // scriptFileOf has no reading for `npm run`, so neither guard ever opened a package script. The argv reading below (moved here from git-policy.mjs, where #58 built it for the repo's merge
 // command) is shared: git-policy.mjs judges the merge command with it as before, and both guards open the scripts with pmCall / packageScripts.
 import nodePath from 'node:path';
-import { toPosix, drivePosix } from '../../lib/paths.mjs';
+import { toPosix, drivePosix, isWinModule } from '../../lib/paths.mjs';
 import { lstatSync } from 'node:fs';
 import { commandName, simpleCommands, splitArgs } from './shell-parse.mjs';
 
@@ -479,7 +479,8 @@ export function pkgMarkersFor(budget, starts, env = {}) {
   if (!known.length && !maybe.length) return null;
   if (starts === null || starts === undefined) return known.length ? 'known' : 'maybe';
   // (the paths are compared as text in their POSIX form: a Windows guard hands over backslash paths, which have no `/` to split on or to start with)
-  const p = drivePosix;
+  // (a drive is a root only for a Windows path module: on macOS / Linux `D:/..` is a relative path, so the plain POSIX functions)
+  const p = isWinModule(env.p ?? nodePath) ? drivePosix : nodePath.posix;
   const forms = (x) => { const r = env.real ? env.real(x) : x; return (r && r !== x ? [x, r] : [x]).map(toPosix); };
   const exists = (x) => env.pathExists?.(x) === true;
   const fold = (x) => x.toLowerCase();
@@ -834,7 +835,8 @@ export function binIsProgram(text, site = null) {
   if (text.startsWith('#!')) {
     const tokens = text.slice(2).split(/\r?\n/, 1)[0].trim().split(/\s+/).filter(Boolean);
     const nm = (w) => nodePath.posix.basename(String(w ?? '').replaceAll('\\', '/'));
-    const outside = (w) => /^(?:\/|[A-Za-z]:[\\/])/.test(String(w ?? '')) && !(site?.inside?.(String(w)) ?? false); // (absolute, and not in the project)
+    const win = site?.win ?? process.platform === 'win32';
+    const outside = (w) => (win ? /^(?:\/|[A-Za-z]:[\\/])/ : /^\//).test(String(w ?? '')) && !(site?.inside?.(String(w)) ?? false); // (absolute, and not in the project)
     if (!outside(tokens[0])) return false;
     let i = 0;
     let viaEnv = false;
@@ -864,14 +866,16 @@ export function binSite(bin, runDir, exists, p = nodePath) {
   // (R3-B2: the PATH order is the run directory and its parents FIRST -- the manager puts the nearest node_modules/.bin of where it runs ahead of the others -- then the bin's own package directory)
   const roots = [runDir, p.dirname(p.dirname(p.dirname(bin)))].filter((x) => typeof x === 'string');
   // (compared in POSIX form: a Windows root is `D:\dir`, a shebang names `D:/dir/x` or `/dir/x` -- no drive: the current one --, and Windows names ignore case)
-  const fold = (x) => { const s = toPosix(x); return process.platform === 'win32' ? s.toLowerCase() : s; };
-  const bare = (x) => x.replace(/^[A-Za-z]:(?=\/|$)/, '');
+  const win = isWinModule(p); // (a drive letter is a drive on Windows only)
+  const fold = (x) => { const s = toPosix(x); return win ? s.toLowerCase() : s; };
+  const bare = (x) => (win ? x.replace(/^[A-Za-z]:(?=\/|$)/, '') : x);
   const under = (a, r) => a === r || a.startsWith(r.endsWith('/') ? r : `${r}/`);
   return {
-    inside: (abs) => { const a = fold(abs); return roots.some((r) => { const q = fold(r); return under(a, q) || (!/^[A-Za-z]:/.test(a) && under(a, bare(q))); }); },
+    inside: (abs) => { const a = fold(abs); return roots.some((r) => { const q = fold(r); return under(a, q) || (win && !/^[A-Za-z]:/.test(a) && under(a, bare(q))); }); },
     hasBin: (name) => findBin(name) !== null,
     findBin,
     resolve: (w) => (runDir ? p.resolve(runDir, w) : null),
+    win,
   };
   function findBin(name) {
     for (const r of roots) {
@@ -907,7 +911,7 @@ export function binInterpreter(text, site = null) {
   if (typeof text !== 'string' || !text.startsWith('#!') || !site) return null;
   const tokens = text.slice(2).split(/\r?\n/, 1)[0].trim().split(/\s+/).filter(Boolean);
   const nm = (w) => nodePath.posix.basename(String(w ?? '').replaceAll('\\', '/'));
-  const isAbs = (w) => /^(?:\/|[A-Za-z]:[\\/])/.test(String(w ?? ''));
+  const isAbs = (w) => (site.win ? /^(?:\/|[A-Za-z]:[\\/])/ : /^\//).test(String(w ?? ''));
   const place = (w) => (isAbs(w) ? (site.inside?.(String(w)) ? String(w) : null) : (site.resolve?.(String(w)) ?? null));
   if (!tokens.length) return null;
   if (nm(tokens[0]) !== 'env' || !(isAbs(tokens[0]) && !site.inside?.(tokens[0]))) return place(tokens[0]); // (a project's own file named env is the interpreter itself)

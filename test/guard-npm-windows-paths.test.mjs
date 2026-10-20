@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { drivePosix } from '../pipeline/lib/paths.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
+import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { markPackageState, pkgMarkersFor, binSite } from '../pipeline/hooks/lib/package-scripts.mjs';
 
 test('drivePosix: a drive is a root (resolve, dirname, isAbsolute, relative), the rest is posix', () => {
@@ -62,4 +63,55 @@ test('binSite: a shebang path in the project is inside whether the project is na
   const px = binSite('/home/u/proj/node_modules/.bin/tool', '/home/u/proj', () => false, path.posix);
   assert.equal(px.inside('/home/u/proj/vendor/node'), true);
   assert.equal(px.inside('/home/u/project/node'), false);
+});
+
+// Why (security review of c13944f): a drive letter is a drive on Windows ONLY. On macOS / Linux `D:/..` is a relative path (a directory named `D:`, then its parent), so
+// `echo x > D:/../<protected>` and `rm D:/../package.json` act on the working directory. Reading `D:` as a drive root (drivePosix, the files guard's isAbs) put `..` at the drive and the write elsewhere.
+const CL = '.cl' + 'aude';
+const posixFs = (files, dirs) => {
+  const D = new Set(dirs);
+  return { readText: (p) => (typeof files[p] === 'string' ? files[p] : null), readHead: () => null, readDir: () => null, pathExists: (p) => p in files || D.has(p), existsSync: (p) => p in files || D.has(p), lexists: () => false };
+};
+test('paths: a drive letter is no root for a posix platform (isInside, samePath, isWinModule)', async () => {
+  const { isInside, samePath, isWinModule } = await import('../pipeline/lib/paths.mjs');
+  assert.equal(isWinModule(drivePosix), true);
+  assert.equal(isWinModule(path.win32), true);
+  assert.equal(isWinModule(path.posix), false);
+  assert.equal(isInside('D:/work/x', 'D:/work', 'win32'), true);
+  const here = process.cwd().replace(/\\/g, '/');
+  assert.equal(samePath('D:/..', here, 'linux'), true, 'off Windows D:/.. is the working directory');
+  assert.equal(samePath('D:/..', here, 'darwin'), true);
+  assert.equal(samePath('D:/..', 'D:/', 'win32'), true, 'on Windows it stays on the drive');
+  assert.equal(samePath('D:/a/../b', 'D:/b', 'win32'), true);
+});
+test('files guard on linux and darwin: `D:/..` is the working directory, so writes through it are judged where they land', () => {
+  const files = { '/home/u/proj/package.json': JSON.stringify({ name: 'x', version: '1.0.0', scripts: { test: 'echo hi' } }) };
+  const dirs = ['/', '/home', '/home/u', '/home/u/proj'];
+  const run = (platform, cwd, cmd) => evaluateBashForFiles(cmd, { home: '/home/u', env: {}, platform, realpath: (p) => p, cwd, ...posixFs(files, dirs) });
+  for (const platform of ['linux', 'darwin']) {
+    for (const cmd of [`echo x > D:/../${CL}/settings.json`, `echo x > d:/../${CL}/settings.json`, `cp x D:/../${CL}/settings.json`, `cd D:/.. && echo x > ${CL}/settings.json`, `echo x > D:/sub/../../${CL}/settings.json`]) {
+      assert.equal(run(platform, '/home/u', cmd).decision, 'deny', `${platform}: ${cmd}`);
+    }
+    for (const cmd of ['cp evil.json D:/../package.json && npm test', 'rm D:/../package.json && npm test', 'echo x > D:/../.npmrc && npm test', 'cd D:/.. && rm package.json && npm test', 'mv D:/../package.json x; npm run test']) {
+      assert.equal(run(platform, '/home/u/proj', cmd).decision, 'deny', `${platform}: ${cmd}`);
+    }
+    // twins: the same shapes that leave the protected place and the package file alone
+    for (const cmd of [`echo x > D:/../notes.txt`, 'cat D:/../package.json && npm test', 'cp D:/../package.json p.bak && npm test', 'npm test']) {
+      assert.equal(run(platform, '/home/u/proj', cmd).decision, 'allow', `${platform}: ${cmd}`);
+    }
+  }
+});
+test('files guard on win32: `D:/..` is the root of the drive, so it never reaches a directory above it', () => {
+  const files = { 'D:/work/proj/package.json': JSON.stringify({ name: 'x', version: '1.0.0', scripts: { test: 'echo hi' } }) };
+  const dirs = ['D:/', 'D:/work', 'D:/work/proj', 'D:/home/u'];
+  const run = (cmd) => evaluateBashForFiles(cmd, { home: 'D:/home/u', env: {}, platform: 'win32', realpath: (p) => p, cwd: 'D:/work/proj', ...posixFs(files, dirs) });
+  assert.equal(run('rm D:/../work/proj/package.json && npm test').decision, 'deny', '`..` stays on the drive: D:/work/proj/package.json');
+  assert.equal(run('rm D:/../../../elsewhere/package.json && npm test').decision, 'allow', 'above the drive root there is nothing: D:/elsewhere/package.json');
+});
+test('git guard (native paths): `D:/..` is a relative path off Windows', { skip: process.platform === 'win32' }, () => {
+  const files = { '/work/repo/package.json': JSON.stringify({ name: 'x', version: '1.0.0', scripts: { test: 'echo hi' } }) };
+  const dirs = ['/', '/work', '/work/repo', '/home/u'];
+  const run = (cmd) => evaluateGitCommand(cmd, { cwd: '/work/repo', home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...posixFs(files, dirs) });
+  for (const cmd of ['rm D:/../package.json && npm test', 'cp evil.json D:/../package.json && npm test', 'mv D:/../package.json x; npm run test']) assert.equal(run(cmd).decision, 'deny', cmd);
+  for (const cmd of ['cat D:/../package.json && npm test', 'rm D:/../notes.txt && npm test']) assert.equal(run(cmd).decision, 'allow', cmd);
 });

@@ -25,15 +25,16 @@ export function expandHome(p, home = os.homedir()) {
   return p;
 }
 
-const isAbsolutePosix = (s) => s.startsWith('/') || /^[A-Za-z]:\//.test(s);
+// (a drive letter makes a path absolute on Windows only: on macOS / Linux `D:/x` is a relative path, a directory named `D:`)
+const isAbsolutePosix = (s, platform = process.platform) => s.startsWith('/') || (platform === 'win32' && /^[A-Za-z]:\//.test(s));
 
 // Normalised POSIX form: absolute, ".." resolved, no trailing slash (except a bare root), and
 // lower-cased on case-insensitive platforms.
 function normalise(p, platform) {
   let s = toPosix(p);
-  if (!isAbsolutePosix(s)) s = `${toPosix(process.cwd())}/${s}`;
+  if (!isAbsolutePosix(s, platform)) s = `${toPosix(process.cwd())}/${s}`;
   const unc = /^\/\/[^/]/.test(s); // keep a UNC prefix; posix.normalize would collapse "//" to "/"
-  s = path.posix.normalize(s);
+  s = platform === 'win32' && /^[A-Za-z]:\//.test(s) ? drivePosix.resolve(s) : path.posix.normalize(s); // (on Windows `..` stops at the drive root)
   if (unc) s = `/${s}`;
   if (s.length > 1 && s.endsWith('/')) s = s.slice(0, -1);
   return platform === 'win32' || platform === 'darwin' ? s.toLowerCase() : s;
@@ -76,6 +77,8 @@ const posix = path.posix;
 const DRIVE = /^([A-Za-z]:)(\/.*)?$/;
 const rooted = (s) => s.startsWith('/') || DRIVE.test(s);
 const split = (s) => { const m = DRIVE.exec(s); return m ? [m[1], m[2] ?? '/'] : ['', s]; };
+// Is this path module one of Windows' (native win32, or the POSIX form with drives)? Only there is `D:` a drive.
+export const isWinModule = (m) => m === drivePosix || m === path.win32;
 export const drivePosix = {
   ...posix,
   isAbsolute: (s) => rooted(String(s)),
