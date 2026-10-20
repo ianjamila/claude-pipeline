@@ -109,10 +109,10 @@ test('a line indented 4+ spaces (or a tab) is never a fence; a backtick fence wi
 
 test('Scope refuses HTML comments, raw HTML tag lines, blockquoted and nested items (each listed)', () => {
   const bad = {
-    comment: ['<!-- - `evil/**` -->', /HTML comment/],
-    multiline: ['<!--', '- `evil/**`', '-->', /HTML comment/],
-    tag: ['<details>', /HTML/],
-    tagAttrs: ['  <div hidden>', /HTML/],
+    comment: ['<!-- - `evil/**` -->', /raw HTML\/comment at line \d+ is hidden when rendered/],
+    multiline: ['<!--', '- `evil/**`', '-->', /raw HTML\/comment at line \d+/],
+    tag: ['<details>', /raw HTML\/comment at line \d+/],
+    tagAttrs: ['  <div hidden>', /raw HTML\/comment at line \d+/],
     quote: ['> - `x`', /blockquote/],
     nestedQuote: ['> > * `x`', /blockquote/],
     nested: ['  - `x`', /nested/],
@@ -123,42 +123,43 @@ test('Scope refuses HTML comments, raw HTML tag lines, blockquoted and nested it
     const re = lines.pop();
     assert.throws(() => parsePlan(withScope(lines.join('\n'))), (e) => e instanceof PlanError && re.test(e.message), name);
   }
-  assert.throws(() => parsePlan(withScope('<!-- a -->\n> - `x`')), (e) => e instanceof PlanError && /HTML comment/.test(e.message) && /blockquote/.test(e.message));
+  assert.throws(() => parsePlan(withScope('<!-- a -->\n> - `x`')), (e) => e instanceof PlanError && /raw HTML\/comment/.test(e.message) && /blockquote/.test(e.message));
   // fenced samples inside Scope are code, so they are fine; plain prose and flat items still parse
   assert.deepEqual(parsePlan(withScope('Note: flat list.\n```\n<!-- x -->\n> - `y`\n```\n- ` other/** `')).scope, [...SCOPE_OK, 'other/**']);
 });
 
-test('HTML comments and tags outside the Scope section are not refused', () => {
-  assert.ok(parsePlan(PLAN + '<details>\n<!-- note -->\n'));
+test('raw HTML and comments are refused anywhere outside fences and code spans, each with its line number', () => {
+  const lineOf = (text, needle) => text.split('\n').findIndex((l) => l.includes(needle)) + 1;
+  const bad = {
+    commentInTask: PLAN.replace('b works', 'b works\n<!-- hidden -->'),
+    commentMidLine: PLAN.replace('b works', 'b <!-- hidden --> works'),
+    multilineInTask: PLAN.replace('b works', '<!--\n### Task T9: Fake\n-->\nb works'),
+    commentBeforeScope: PLAN.replace('## Scope', '<!--\n## Scope\n- `evil/**`\n-->\n## Scope'),
+    unclosedBeforeScope: PLAN.replace('## Scope', '<!-- never closed\n## Scope'),
+    detailsBeforeScope: PLAN.replace('## Scope', '<details>\n## Scope'),
+    closingTag: PLAN.replace('b works', 'b works\n</div>'),
+    indentedTag: PLAN.replace('b works', 'b works\n   <span hidden>x</span>'),
+    declaration: PLAN.replace('b works', 'b works\n<!DOCTYPE html>'),
+    selfClosing: PLAN.replace('b works', 'b works\n<br/>'),
+  };
+  for (const [name, text] of Object.entries(bad)) {
+    assert.throws(() => parsePlan(text), (e) => e instanceof PlanError && /raw HTML\/comment at line \d+ is hidden when rendered: write it as text or inside a code block/.test(e.message), name);
+  }
+  // the line number is 1-based and every offending line is listed
+  const two = PLAN.replace('b works', 'b works\n<details>\ntext\n<!-- x -->');
+  assert.throws(() => parsePlan(two), (e) => e.problems.some((p) => p.includes(`line ${lineOf(two, '<details>')} `)) && e.problems.some((p) => p.includes(`line ${lineOf(two, '<!-- x -->')} `)));
+  // fenced samples and inline code spans are fine, and so are comparison signs in prose
+  assert.ok(parsePlan(PLAN + '```\n<!--\n<details>\n```\n'));
+  assert.ok(parsePlan(PLAN.replace('b works', 'b `<!--` and `<div>` works, 1 < 2 and a <b>c')));
 });
 
 test('the Scope section ends at the first task heading: a backticked bullet in a task body is not scope', () => {
   assert.deepEqual(parsePlan(PLAN.replace('b works', 'b works\n- `evil/**`')).scope, SCOPE_OK);
 });
 
-test('an HTML comment masks headings like a fence: a fake Scope inside one before the real Scope is ignored', () => {
-  const evil = PLAN.replace('## Scope', '<!--\n## Scope\n- `evil/**`\n-->\n## Scope');
-  const p = parsePlan(evil);
-  assert.deepEqual(p.scope, SCOPE_OK);
-  assert.deepEqual(p.tasks.map((t) => t.id), ['T1', 'T2']);
-  // a one-line comment, and a comment hiding a task heading, mask only what they cover
-  assert.deepEqual(parsePlan(PLAN.replace('## Scope', '<!-- note -->\n## Scope')).scope, SCOPE_OK);
-  const hidden = PLAN.replace('b works', '<!--\n### Task T9: Fake\n-->\nb works');
-  assert.deepEqual(parsePlan(hidden).tasks.map((t) => t.id), ['T1', 'T2']);
-  // a fence marker inside a comment is not a fence; a comment marker inside a fence or a code span is not a comment
-  const fenceInComment = PLAN.replace('## Scope', '<!--\n```\n-->\n## Scope');
-  assert.deepEqual(parsePlan(fenceInComment).scope, SCOPE_OK);
-  assert.deepEqual(parsePlan(PLAN + '```\n<!--\n```\n').tasks.map((t) => t.id), ['T1', 'T2']);
-  assert.deepEqual(parsePlan(PLAN.replace('b works', 'b `<!--` works\n### Task T3: Real\nc')).tasks.map((t) => t.id), ['T1', 'T2', 'T3']);
-});
-
-test('an unclosed HTML comment before the real Scope hides it to the end: PlanError (missing Scope)', () => {
-  assert.throws(() => parsePlan(PLAN.replace('## Scope', '<!-- never closed\n## Scope')), (e) => e instanceof PlanError && /missing "## Scope"/.test(e.message));
-});
-
 test('a second unmasked "## Scope" or "## In plain English" section is refused', () => {
   assert.throws(() => parsePlan(PLAN.replace('### Task T1', '## Scope\n- `evil/**`\n\n### Task T1')), (e) => e instanceof PlanError && /duplicate ## Scope section/.test(e.message));
   assert.throws(() => parsePlan(PLAN.replace('### Task T1', '## In plain English\nother\n\n### Task T1')), (e) => e instanceof PlanError && /duplicate ## In plain English section/.test(e.message));
-  // a duplicate inside a fence or comment is masked, so it is fine
-  assert.ok(parsePlan(PLAN.replace('b works', 'b works\n```\n## Scope\n```\n<!--\n## In plain English\n-->')));
+  // a duplicate inside a fence is masked, so it is fine
+  assert.ok(parsePlan(PLAN.replace('b works', 'b works\n```\n## Scope\n## In plain English\n```')));
 });
