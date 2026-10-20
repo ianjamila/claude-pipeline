@@ -18,7 +18,7 @@ import {
 
 const MERGE_SHA = 'a'.repeat(40);
 const OTHER_SHA = 'b'.repeat(40);
-const HOST = 'ewiapp-abc-team.vercel.app';
+const HOST = 'myapp-abc-team.vercel.app';
 const pendingLine = (n, date = '2026-10-09') => `- ${date} · #${n} · fix(x): something · risk low · rounds 1 · arbiter 0 · ${DEFAULT_OUTCOME}`;
 const resolved = (n, { date = '2026-10-12', outcome = 'passed', host = HOST, obs = '2026-10-12 12:05', run = '999' } = {}) =>
   `- ${date} · #${n} · prod smoke ${outcome} · deploy ${host} · observed ${obs} · run ${run}`;
