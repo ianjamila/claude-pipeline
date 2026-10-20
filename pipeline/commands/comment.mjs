@@ -53,15 +53,24 @@ async function reportPath(root) {
   return resolve(root, cfg.ok ? cfg.config.verify.report : DEFAULTS.verify.report);
 }
 
+// owner_approval from the repo's config; an unreadable config is label behaviour, as before.
+async function ownerApprovalOf(root) {
+  try {
+    const cfg = await loadConfig(root);
+    if (cfg.ok) return cfg.config.owner_approval;
+  } catch { /* label behaviour */ }
+  return 'label';
+}
+
 // The summary comment also carries the run record: write the sections through the one writer, which keeps an existing
 // record (and sets how the run ended on it).
-function summaryKind(gh, pr, sections, outcome) {
+function summaryKind(gh, pr, sections, outcome, ownerApproval) {
   const view = gh.prView(pr, ['headRefName', 'baseRefName', 'headRefOid']);
   const existing = readSummaryComment(gh, pr);
   if (existing.status === 'unsupported') throw new UsageError('the summary comment carries a run record from a newer pipeline version: update the pipeline CLI first');
   const { record, warnings } = recordForOutcome(existing.status === 'ok' ? existing.record : null, {
     repo: gh.repo().slug, pr, branch: view.headRefName, baseRef: view.baseRefName, head: view.headRefOid,
-    outcome, host: hostname(), now: Date.now(),
+    outcome, host: hostname(), now: Date.now(), ownerApproval,
   });
   const r = writeSummaryComment(gh, pr, { record, sections, existing });
   return { exitCode: EXIT.OK, output: { ok: true, kind: 'summary', pr, action: r.action, url: r.url, id: r.id, step: record.step, warnings } };
@@ -116,9 +125,10 @@ export async function run(argv, ctx) {
     body = awaitingReviewComment(values.reason ?? '');
   }
 
+  const ownerApproval = kind === 'summary' ? await ownerApprovalOf(root) : 'label';
   const gh = createGitHub({ cwd, env: ctx.env });
   return guardGh(() => {
-    if (kind === 'summary') return summaryKind(gh, pr, body, values.outcome);
+    if (kind === 'summary') return summaryKind(gh, pr, body, values.outcome, ownerApproval);
     const r = gh.upsertComment(pr, MARKER_OF[kind], body);
     return { exitCode: EXIT.OK, output: { ok: true, kind, pr, action: r.action, url: r.url, id: r.id } };
   });

@@ -79,6 +79,15 @@ export function openNeedsHuman(state) {
   return { arbiter, ids: [...arbiter, ...other] };
 }
 
+// owner_approval from the repo's config; an unreadable config is label behaviour, as before (P merge needs a valid one anyway).
+async function ownerApprovalOf(root) {
+  try {
+    const loaded = await loadConfig(root);
+    if (loaded.ok) return loaded.config.owner_approval;
+  } catch { /* label behaviour */ }
+  return 'label';
+}
+
 function localHead(root) {
   try {
     return headSha({ cwd: root });
@@ -152,6 +161,7 @@ export const run = guarded(async (argv, ctx) => {
     process.stderr.write(`summary: outcome "${outcome.slice(0, 40)}" is not classified for owner notifications: no push sent\n`);
   }
 
+  const ownerApproval = await ownerApprovalOf(root);
   const gh = createGitHub({ cwd: root, env: ctx.env });
   let title;
   let url;
@@ -168,7 +178,7 @@ export const run = guarded(async (argv, ctx) => {
       const guard = guardBlocksFor(existing.status === 'ok' ? existing.record : null, values.session ?? [], ctx);
       const { record, warnings } = recordForOutcome(existing.status === 'ok' ? existing.record : null, {
         repo: gh.repo().slug, pr, branch: view.headRefName, baseRef: view.baseRefName, head: view.headRefOid,
-        outcome, detail, agentLogLine, host: hostname(), now: Date.now(), sessions: values.session, guardBlocks: guard.blocks, guardBySession: guard.bySession,
+        outcome, detail, agentLogLine, host: hostname(), now: Date.now(), sessions: values.session, guardBlocks: guard.blocks, guardBySession: guard.bySession, ownerApproval,
       });
       warnings.push(...guard.warnings);
       const posted = writeSummaryComment(gh, pr, { record, sections, existing });

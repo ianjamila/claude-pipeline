@@ -10,6 +10,7 @@ import { emptyState, saveState } from '../pipeline/lib/state.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
 import { applyCheckpoint, decodeRecord, emptyRecord, encodeRecord } from '../pipeline/lib/run-record.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
+import { listEvents, openOwnerStops, renderEvent } from '../pipeline/lib/run-events.mjs';
 
 const bin = join(dirname(fileURLToPath(import.meta.url)), '..', 'pipeline', 'bin', 'pipeline.mjs');
 
@@ -243,6 +244,48 @@ test('comment summary: keeps the run record a checkpoint wrote (tasks survive) a
   const odd = cli(['comment', '--pr', '4', '--kind', 'summary', '--outcome', 'wild'], { repo, fake: commentWorld(existing()) });
   assertExit(odd, 0);
   assert.equal(odd.json.warnings.length, 1);
+});
+
+// An owner stop (owner_approval: chat) is an append-only event; `comment --kind summary` only writes the display record.
+test('comment summary: needs-human "next" follows owner_approval; after a stop the event stays open however the record is replaced', () => {
+  const stop = { id: 'ab12cd34', cause: 'merge:command-failed', head: 'a'.repeat(40), at: '2026-10-20T08:00:00.000Z' };
+  const event = { id: 3, user: { login: 'me' }, body: renderEvent('owner-stop', stop.id, 'Owner stop ab12cd34 on #4.', { repo: 'acme/widgets', pr: 4, ...stop }) };
+  const chat = () => {
+    const repo = stateRepo();
+    repo.write('.claude/pipeline.yml', `${pipelineYml()}owner_approval: chat\n`);
+    return repo;
+  };
+  const sentRecord = (fake) => decodeRecord(JSON.parse(fake.calls().find((c) => c.argv.includes('POST') || c.argv.includes('PATCH')).stdin).body).record;
+
+  const label = commentWorld();
+  assertExit(cli(['comment', '--pr', '4', '--kind', 'summary', '--outcome', 'needs-human'], { repo: stateRepo(), fake: label }), 0);
+  const rl = sentRecord(label);
+  assert.deepEqual([rl.v, rl.next, 'ownerStop' in rl], [1, 'owner review: add `human-approved`, then merge', false]);
+  const chatFake = commentWorld();
+  assertExit(cli(['comment', '--pr', '4', '--kind', 'summary', '--outcome', 'needs-human'], { repo: chat(), fake: chatFake }), 0);
+  assert.equal(sentRecord(chatFake).next, 'owner reply needed in chat: ship resume 4');
+
+  const ID4 = { repo: 'acme/widgets', pr: 4, branch: 'feat/w', baseRef: 'main' };
+  const withCopy = applyCheckpoint(emptyRecord(ID4), { step: 'review', ownerStop: stop }, { host: 'mac', now: 0 });
+  const summary = (rec) => ({ id: 21, user: { login: 'me' }, body: `${MARKERS.summary}\n\nold${rec ? `\n\n${encodeRecord(rec)}` : ''}` });
+  const variants = {
+    'record with the copy': summary(withCopy),
+    'copy hand-removed': summary(applyCheckpoint(withCopy, { ownerStop: null }, { host: 'mac', now: 0 })),
+    'record blanked': summary(null),
+    'record replaced': summary(applyCheckpoint(emptyRecord({ ...ID4, pr: 99 }), { step: 'verify' }, { host: 'mac', now: 0 })),
+  };
+  for (const [what, existing] of Object.entries(variants)) {
+    const fake = commentWorld([event, existing]);
+    assertExit(cli(['comment', '--pr', '4', '--kind', 'summary', '--outcome', 'stopped'], { repo: chat(), fake }), 0, what);
+    const writes = fake.calls().filter((c) => c.argv.includes('POST') || c.argv.includes('PATCH'));
+    assert.equal(writes.length, 1, `${what}: exactly one write, never an event comment`);
+    const after = [event];
+    if (writes[0].argv.includes('PATCH')) after.push({ ...existing, body: JSON.parse(writes[0].stdin).body });
+    assert.deepEqual(openOwnerStops(listEvents(after, 'me')).map((e) => e.id), [stop.id], `${what}: the stop is still open`);
+  }
+  const keep = commentWorld([event, variants['record with the copy']]);
+  assertExit(cli(['comment', '--pr', '4', '--kind', 'summary', '--outcome', 'stopped'], { repo: chat(), fake: keep }), 0);
+  assert.deepEqual(sentRecord(keep).ownerStop, stop, 'the display copy survives an ordinary outcome');
 });
 
 test('comment blocked: renders from .verify/report.json', () => {
