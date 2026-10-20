@@ -803,6 +803,43 @@ test('smoke bypass: only an exactly listed origin gets the header (other host, s
   }
 });
 
+test('smoke bypass: a request path that could change the host is a usage error before any request; the secret is never sent', async () => {
+  const { runSmoke, SmokeUsageError } = await importVendored((await project()).dir, 'smoke');
+  const evil = ['//evil.example/x', '@evil.example/x', '/\\evil.example', '/a\\b', 'evil.example', 'https://evil.example/', '/a\nb', ''];
+  for (const p of evil) {
+    const calls = [];
+    const fetch = async (url, init) => { calls.push({ url: String(url), init }); return new Response('build 42', { status: 200 }); };
+    const asExpectPath = runSmoke({ base: HTTPS_BASE, checks: [{ path: '/' }], expectText: 'build', expectPath: p, bypass: BYPASS }, { fetch, ...noSleep });
+    await assert.rejects(asExpectPath, (e) => e instanceof SmokeUsageError && !e.message.includes(KEY), `expect-path ${JSON.stringify(p)}`);
+    const asCheck = runSmoke({ base: HTTPS_BASE, checks: [{ path: '/' }, { path: p }], bypass: BYPASS }, { fetch, ...noSleep });
+    await assert.rejects(asCheck, (e) => e instanceof SmokeUsageError && !e.message.includes(KEY), `check path ${JSON.stringify(p)}`);
+    assert.deepEqual(calls, [], `no request at all for ${JSON.stringify(p)} (not even the valid first check)`);
+  }
+  // also without expect text: an --expect-path that is malformed is refused, not silently ignored
+  await assert.rejects(runSmoke({ base: HTTPS_BASE, checks: [{ path: '/' }], expectPath: '//evil.example/x' }, { fetch: okFetch([]), ...noSleep }), SmokeUsageError);
+});
+
+test('smoke bypass: CLI refuses a host-changing --expect-path with exit 2 and no request', async () => {
+  const repo = await project({ config: CONFIG(undefined, SMOKE_CHECKS) });
+  const before = hits.length;
+  for (const p of ['//evil.example/x', '@evil.example/x', '/\\evil.example']) {
+    const r = await smoke(repo, ['--base', baseUrl, '--expect-text', 'x', `--expect-path=${p}`], { env: { PIPELINE_SMOKE_BYPASS_KEY: KEY } });
+    assert.equal(r.code, 2, `${p}: ${r.stdout}`);
+    assert.equal(r.json.error, 'usage');
+    assert.ok(!r.stdout.includes(KEY));
+  }
+  assert.equal(hits.length, before);
+});
+
+test('smoke bypass: a normal path keeps the base path prefix, stays on the base origin and gets the header', async () => {
+  const { runSmoke } = await importVendored((await project()).dir, 'smoke');
+  const seen = [];
+  const r = await runSmoke({ base: 'https://app.example.com/pre/', checks: [{ path: '/login?x=1' }, { path: '/@user' }, { path: '/a//b' }], bypass: BYPASS }, { fetch: okFetch(seen), ...noSleep });
+  assert.equal(r.ok, true);
+  assert.deepEqual(seen.map((s) => s.url), ['https://app.example.com/pre/login?x=1', 'https://app.example.com/pre/@user', 'https://app.example.com/pre/a//b']);
+  assert.ok(seen.every((s) => new URL(s.url).origin === HTTPS_BASE && s.init.headers['x-smoke-key'] === KEY));
+});
+
 test('smoke bypass: the value never appears in the serialized result (pass, failing check, network error, echoing server)', async () => {
   const { runSmoke } = await importVendored((await project()).dir, 'smoke');
   const cases = {

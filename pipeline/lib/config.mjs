@@ -109,6 +109,12 @@ export function isSmokeBypassOrigin(x) {
     return false;
   }
 }
+// A smoke request path: one leading "/" (never "//"), no backslash, no control characters. A path that does not start with a
+// single "/" could turn "https://site" + path into another host ("@evil.example/x" -> userinfo; "//evil" or "/\\evil" -> a
+// protocol-relative or backslash host), so the smoke refuses it; smoke.mjs imports this too and re-checks the final origin.
+export function isSmokePath(p) {
+  return typeof p === 'string' && p.startsWith('/') && !p.startsWith('//') && !/[\\\x00-\x1f\x7f]/.test(p);
+}
 export const SAFE_STEP = /^[A-Za-z0-9_.:-]+$/;
 
 // Allowed keys per mapping. Anything else is a typo (or a removed option) and is rejected.
@@ -438,7 +444,7 @@ function checkSmokeChecks(checks, errors) {
     const at = `smoke_checks[${i}]`;
     if (!isObj(item)) return errors.push(`${at} must be a mapping with a path`);
     unknownKeys(item, KEYS.smoke, `${at}.`, errors);
-    if (typeof item.path !== 'string' || !item.path.startsWith('/')) errors.push(`${at}.path is required and must start with '/'`);
+    if (!isSmokePath(item.path)) errors.push(`${at}.path is required, must start with a single '/' (not '//') and contain no backslash or control character`);
     if (item.status !== undefined) {
       const ok = Array.isArray(item.status) && item.status.length > 0 && item.status.every((s) => inRange(s, 100, 599));
       if (!ok) errors.push(`${at}.status must be a non-empty array of integers 100..599`);

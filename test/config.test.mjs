@@ -290,6 +290,18 @@ test('smoke_bypass_origins: default [], required non-empty with smoke_bypass_hea
   }
 });
 
+test('smoke_checks path cannot change the request host (no //, no authority tricks, no backslash, no control chars)', () => {
+  const bad = (p) => validateConfig({ ...minimal(), smoke_checks: [{ path: p }] });
+  for (const p of ['//evil.example', '//evil.example/x', '@evil.example/x', 'evil.example/x', '/\\evil.example', '/a\\b', '/a\nb', '/a\tb', '/a\u0000b', 'https://evil.example/', '', 5]) {
+    const r = bad(p);
+    assert.equal(r.ok, false, `${JSON.stringify(p)} must be rejected`);
+    assert.ok(has(r, 'smoke_checks[0].path'), r.errors.join('; '));
+  }
+  for (const p of ['/', '/login', '/@user', '/a/b?x=1&y=2', '/a//b', '/healthz#x']) {
+    assert.equal(bad(p).ok, true, `${p} is fine`);
+  }
+});
+
 test('unknown top-level key (typo) is rejected', () => {
   const r = validateConfig({ ...minimal(), verfy: { full: 'x' } });
   assert.equal(r.ok, false);

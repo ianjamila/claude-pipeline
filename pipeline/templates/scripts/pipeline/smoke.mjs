@@ -12,7 +12,7 @@
 import { existsSync, realpathSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
-import { loadConfig, SMOKE_BYPASS_HEADER_RE } from './lib/config.mjs';
+import { loadConfig, SMOKE_BYPASS_HEADER_RE, isSmokePath } from './lib/config.mjs';
 
 export const TIMEOUT_MS = 15_000;
 export const MAX_BODY_BYTES = 2 * 1024 * 1024;
@@ -40,23 +40,37 @@ export function normaliseBase(raw) {
   return u.origin + u.pathname.replace(/\/+$/, '');
 }
 
-// The request headers, and whether the bypass header is among them. Sent only when a name AND a non-empty value are
-// configured and the base's origin is exactly one of bypass.origins (and not loopback). `scrub` blanks the value out of any text that may reach the output (a reason
-// quoting a server-echoed location or a fetch error message), so the secret can never be printed.
-function bypassHeaders(bypass, base) {
-  const none = { headers: HEADERS, sent: false, scrub: (s) => s };
+// Request URL for one path: built from the validated base, then checked to still be on the base's origin with no
+// credentials. Throws SmokeUsageError (the caller makes no request at all) for anything that could reach another host.
+function requestUrl(base, path) {
+  if (!isSmokePath(path)) throw new SmokeUsageError(`smoke path must start with a single '/' (not '//') and contain no backslash or control character: ${JSON.stringify(path)}`);
+  const b = new URL(base);
+  const u = new URL(base + path);
+  if (u.origin !== b.origin || u.username || u.password) throw new SmokeUsageError(`smoke path leaves the base origin: ${JSON.stringify(path)}`);
+  return u;
+}
+
+// The bypass plan: validated once; `headersFor(url)` then decides per REQUEST URL. The header is attached only when a name
+// AND a non-empty value are configured and the request URL's origin is exactly one of bypass.origins (never loopback).
+// `scrub` blanks the value out of any text that may reach the output (a reason quoting a server-echoed location or a fetch
+// error message), so the secret can never be printed.
+function bypassPlan(bypass) {
   const name = bypass?.header;
   const value = typeof bypass?.value === 'string' ? bypass.value.trim() : '';
-  if (!name || !value) return none;
+  if (!name || !value) return { headersFor: () => ({ headers: HEADERS, sent: false }), scrub: (s) => s };
   if (typeof name !== 'string' || !SMOKE_BYPASS_HEADER_RE.test(name)) {
     throw new SmokeUsageError('smoke_bypass_header must be a lowercase header name matching /^x-[a-z0-9-]{1,60}$/');
   }
-  const { hostname, origin } = new URL(base);
-  if (LOOPBACK.has(hostname) || !Array.isArray(bypass.origins) || !bypass.origins.includes(origin)) return none;
   // Visible ASCII only: a space/newline/control character is never a legal secret and would make fetch throw an error
   // that quotes the value. The message below deliberately does not.
   if (!/^[\x21-\x7e]+$/.test(value)) throw new SmokeUsageError('PIPELINE_SMOKE_BYPASS_KEY must be printable ASCII without spaces');
-  return { headers: { ...HEADERS, [name]: value }, sent: true, scrub: (s) => s.split(value).join('[redacted]') };
+  const origins = Array.isArray(bypass.origins) ? bypass.origins : [];
+  return {
+    headersFor: (u) => (LOOPBACK.has(u.hostname) || !origins.includes(u.origin)
+      ? { headers: HEADERS, sent: false }
+      : { headers: { ...HEADERS, [name]: value }, sent: true }),
+    scrub: (s) => s.split(value).join('[redacted]'),
+  };
 }
 
 // Reads at most MAX_BODY_BYTES, then abandons the rest of the stream.
@@ -101,13 +115,14 @@ function verdict(check, got) {
 }
 
 // One check with retries. Returns { result, body } (body kept for --expect-text, never printed).
-async function runCheck(base, check, { fetchFn, sleep, headers, scrub }) {
+async function runCheck(target, { fetchFn, sleep, scrub }) {
+  const { check, url, headers } = target;
   const started = Date.now();
   let got = null;
   let error = null;
   for (let i = 0; ; i++) {
     try {
-      got = await attempt(base + check.path, fetchFn, headers);
+      got = await attempt(url, fetchFn, headers);
       error = null;
     } catch (err) {
       got = null;
@@ -139,7 +154,10 @@ export async function runSmoke(options, deps = {}) {
   const fetchFn = deps.fetch ?? globalThis.fetch;
   const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   const base = normaliseBase(options.base);
-  const { headers, sent: bypassHeader, scrub } = bypassHeaders(options.bypass, base);
+  const plan = bypassPlan(options.bypass);
+  if (options.expectPath !== undefined && options.expectPath !== null && !isSmokePath(options.expectPath)) {
+    throw new SmokeUsageError(`--expect-path must start with a single '/' (not '//') and contain no backslash or control character: ${JSON.stringify(options.expectPath)}`);
+  }
   let checks = options.checks?.length ? options.checks : [{ path: '/' }];
   const expectText = options.expectText || null;
   // An --expect-path outside the configured checks is fetched as one more check (must answer 200).
@@ -147,10 +165,17 @@ export async function runSmoke(options, deps = {}) {
     checks = [...checks, { path: options.expectPath, status: [200] }];
   }
 
+  // Every URL is built and checked before the first request, so a bad path means no request at all.
+  const targets = checks.map((check) => {
+    const u = requestUrl(base, check.path);
+    return { check, url: u.href, ...plan.headersFor(u) };
+  });
+  const bypassHeader = targets.some((x) => x.sent);
+
   const results = [];
   const bodies = [];
-  for (const check of checks) {
-    const { result, body } = await runCheck(base, check, { fetchFn, sleep, headers, scrub });
+  for (const target of targets) {
+    const { result, body } = await runCheck(target, { fetchFn, sleep, scrub: plan.scrub });
     results.push(result);
     bodies.push(body);
   }
