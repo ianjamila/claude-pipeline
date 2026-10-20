@@ -303,7 +303,7 @@ Exit: `--test` 0 when ntfy accepted the push, 1 when it did not · `--event` 0 w
 
 ## plan
 
-the plan stage: record the committed plan, record the owner's "approve", rate the plan's risk.
+the plan stage: record the committed plan, record the owner's "approve", rate its risk, reserve and run its reviews.
 
 ```
 pipeline plan record --pr N --file PATH [--request-file F] [--repo DIR]
@@ -315,9 +315,18 @@ pipeline plan approve --pr N [--repo DIR]
   -> exit 1 {error: no-proposal | no-approval | superseded | scope-mismatch | lost | plan-changed | record-unreadable}, 3 GitHub unavailable
 pipeline plan risk --pr N [--repo DIR]
   -> {ok, level: low|medium|high, reasons, blob}; high when the plan's Scope can touch a high-risk, hard-stop or security path or a task names a risky area; medium for more than 3 tasks or more than risk.medium_files scope entries
+pipeline plan start --pr N --reviewer codex|fable --key KEY [--extra TEXT] [--repo DIR]
+  -> {ok, go:true, key, reviewer, planBlob, claim, promptHeader}; reserves one paid launch BEFORE it happens (one event; caps per PR: codex 2 = review + recheck, fable 1; --extra = the owner's words, recorded verbatim, buys one more); start the Fable reviewer with promptHeader (ROUND: plan / INPUT-DIGEST: ...) pasted verbatim as the first two lines
+  -> exit 1 {error: cap | already-started | use-plan-review | no-proposal | lost} (a key that already exists never launches twice; use-plan-review = Codex reviews are reserved only by `plan review`, which launches the run itself), 3 {error: not-visible} or GitHub unavailable (the new event was not listed back: nothing may launch)
+pipeline plan review --pr N --key KEY [--extra TEXT] [--effort high|xhigh] [--model M] [--prior FILE] [--repo DIR]
+  -> {ok, key, n, counts:{blocking, suggestions, worth_considering}, path, resumed, cost: booked|not-reported|failed:...}; reserves the launch itself (as `start`, --extra passes through), runs Codex over the active plan, writes .review/plan/KEY.json and .md; the second run is a recheck (--prior FILE = the first run's markdown) and resumes the first run's Codex session when it has one
+  -> exit 1 {error: cap | already-started | stale-start | superseded | no-proposal | lost}, 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|malformed|github, session} (the key stays consumed; .review/plan/KEY.failed.json keeps the session)
+pipeline plan findings --pr N --key KEY --tag TAG [--projects-dir DIR] [--max-age-ms N] [--repo DIR]
+  -> {ok, key, n, counts, path, errors}; takes the Fable plan review from the subagent transcript tagged TAG after proving the model (claude-fable- at effort high), the prompt header of the valid start and a transcript no older than the start; nothing is written on any refusal
+  -> exit 1 {error: no-start | stale-start | exists, or errors:[...]}, 2 no transcript for TAG
 ```
 
-Exit: `record`: 0 recorded · 1 refused (dirty, unpushed, plan-invalid) · `approve`: 0 recorded (or repaired) · 1 refused (no-proposal, no-approval, superseded, scope-mismatch, lost, record-unreadable) · 3 GitHub unavailable, or the approval is on the PR but the run record was not updated (run it again) · `risk`: 0 a level · 1 no usable plan · 2 usage / config / git. The Plan events are pointers: scope and tasks are always re-read from the approved git blob, and an approval counts only with the owner-go record the hook wrote for the owner's typed "approve".
+Exit: `record`: 0 recorded · 1 refused (dirty, unpushed, plan-invalid) · `approve`: 0 recorded (or repaired) · 1 refused (no-proposal, no-approval, superseded, scope-mismatch, lost, plan-changed, record-unreadable) · 3 GitHub unavailable, or the approval is on the PR but the run record was not updated (run it again) · `risk`: 0 a level · 1 no usable plan · `start`: 0 go (launch it) · 1 cap / already-started / use-plan-review / no usable plan · 3 not-visible (the reservation was not listed back: nothing may launch) or GitHub unavailable · `review`: 0 recorded · 1 cap / already-started / stale-start / superseded (a paid run that no longer counts is kept in `.review/plan/KEY.superseded.json`) · 3 Codex or GitHub unavailable (the key stays consumed) · `findings`: 0 recorded · 1 refused (nothing written) · 2 no transcript · 2 usage / config / git. The Plan events are pointers: scope and tasks are always re-read from the approved git blob, and an approval counts only with the owner-go record the hook wrote for the owner's typed "approve".
 
 ## preflight
 

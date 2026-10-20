@@ -1,16 +1,27 @@
-// `pipeline plan record | approve | risk`: the plan stage of a ship run (spec 2026-10-19 §§2-3). `record` pins the committed
-// plan file by its git blob and posts a `plan-proposed` pointer event; `approve` turns the owner's typed "approve" (a local
-// owner-go plan record, never the agent's say-so) into a `plan-approved` pointer and the run record's tasks; `risk` rates the
-// active plan before it is reviewed. Events are POINTERS: scope and tasks are always re-parsed from the approved blob.
-import { readFileSync } from 'node:fs';
+// `pipeline plan record | approve | risk | start | review | findings`: the plan stage of a ship run (spec 2026-10-19 §§2-3).
+// `record` pins the committed plan file by its git blob and posts a `plan-proposed` pointer event; `approve` turns the owner's
+// typed "approve" (a local owner-go plan record, never the agent's say-so) into a `plan-approved` pointer and the run record's
+// tasks; `risk` rates the active plan before it is reviewed. `start` reserves one paid plan-review launch against the per-PR
+// budget (Codex 2, Fable 1, owner extras), `review` runs the Codex plan review under such a reservation and `findings` takes
+// the proven Fable plan review. Events are POINTERS: scope and tasks are always re-parsed from the approved blob.
+import { randomBytes } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import path from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
+import {
+  FINDINGS_SCHEMA_PATH, assignIds, buildCodexArgs, buildCodexResumeArgs, buildPlanReviewPrompt, renderFindingsMarkdown, validateFindings,
+} from '../lib/codex.mjs';
+import { askCodex, usageDelta } from '../lib/codex-run.mjs';
 import { git, headSha } from '../lib/git.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
+import { GhError } from '../lib/proc.mjs';
+import { run as costRun } from './cost.mjs';
+import { sha256, writeFileAtomic, writeJson } from '../lib/review-context.mjs';
+import { extractJsonBlock, findSubagentTranscript, proveModel } from '../lib/transcript.mjs';
 import { PlanError, parsePlan, planRequestLines, scopeDigest } from '../lib/plan.mjs';
-import { activeProposal, bindOf, latestApproval, matchingLocalRecord, newestLocalRecord } from '../lib/plan-state.mjs';
+import { activeProposal, bindOf, latestApproval, matchingLocalRecord, newestLocalRecord, startsValidity } from '../lib/plan-state.mjs';
 import { scopeMayHitGlob, securityGlobs } from '../lib/risk.mjs';
 import { LIMITS, bindRecord } from '../lib/run-record.mjs';
 import { VIEW_FIELDS, createRunRecorder } from '../lib/run-progress.mjs';
@@ -19,7 +30,7 @@ import { summaryFromComments } from '../lib/summary-comment.mjs';
 import { MAX_AGE_MS, PLAN_RECORD_MAX_AGE_MS, accountHome, readPlanApprovals } from '../hooks/lib/owner-go.mjs';
 
 export const meta = {
-  summary: 'the plan stage: record the committed plan, record the owner\'s "approve", rate the plan\'s risk',
+  summary: 'the plan stage: record the committed plan, record the owner\'s "approve", rate its risk, reserve and run its reviews',
   usage: [
     'pipeline plan record --pr N --file PATH [--request-file F] [--repo DIR]',
     '  -> {ok, blob, scopeDigest, path, scope, tasks:[{id,title,specSha}], requestLines, event:{id, reused}, warnings}; posts one plan-proposed event (none when this blob is already the active proposal) and checkpoints step plan',
@@ -30,6 +41,15 @@ export const meta = {
     '  -> exit 1 {error: no-proposal | no-approval | superseded | scope-mismatch | lost | plan-changed | record-unreadable}, 3 GitHub unavailable',
     'pipeline plan risk --pr N [--repo DIR]',
     '  -> {ok, level: low|medium|high, reasons, blob}; high when the plan\'s Scope can touch a high-risk, hard-stop or security path or a task names a risky area; medium for more than 3 tasks or more than risk.medium_files scope entries',
+    'pipeline plan start --pr N --reviewer codex|fable --key KEY [--extra TEXT] [--repo DIR]',
+    '  -> {ok, go:true, key, reviewer, planBlob, claim, promptHeader}; reserves one paid launch BEFORE it happens (one event; caps per PR: codex 2 = review + recheck, fable 1; --extra = the owner\'s words, recorded verbatim, buys one more); start the Fable reviewer with promptHeader (ROUND: plan / INPUT-DIGEST: ...) pasted verbatim as the first two lines',
+    '  -> exit 1 {error: cap | already-started | use-plan-review | no-proposal | lost} (a key that already exists never launches twice; use-plan-review = Codex reviews are reserved only by `plan review`, which launches the run itself), 3 {error: not-visible} or GitHub unavailable (the new event was not listed back: nothing may launch)',
+    'pipeline plan review --pr N --key KEY [--extra TEXT] [--effort high|xhigh] [--model M] [--prior FILE] [--repo DIR]',
+    '  -> {ok, key, n, counts:{blocking, suggestions, worth_considering}, path, resumed, cost: booked|not-reported|failed:...}; reserves the launch itself (as `start`, --extra passes through), runs Codex over the active plan, writes .review/plan/KEY.json and .md; the second run is a recheck (--prior FILE = the first run\'s markdown) and resumes the first run\'s Codex session when it has one',
+    '  -> exit 1 {error: cap | already-started | stale-start | superseded | no-proposal | lost}, 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|malformed|github, session} (the key stays consumed; .review/plan/KEY.failed.json keeps the session)',
+    'pipeline plan findings --pr N --key KEY --tag TAG [--projects-dir DIR] [--max-age-ms N] [--repo DIR]',
+    '  -> {ok, key, n, counts, path, errors}; takes the Fable plan review from the subagent transcript tagged TAG after proving the model (claude-fable- at effort high), the prompt header of the valid start and a transcript no older than the start; nothing is written on any refusal',
+    '  -> exit 1 {error: no-start | stale-start | exists, or errors:[...]}, 2 no transcript for TAG',
   ].join('\n'),
 };
 
@@ -49,7 +69,7 @@ function prContext(values, ctx, root) {
   // summaryFromComments already decodes: use .status / .record, never decodeRecord(summary.body) (Codex plan R1-4).
   let summary = summaryFromComments(comments, viewer);
   if (summary.status === 'ok' && bindRecord(summary.record, bind).length) summary = { ...summary, status: 'invalid', record: undefined };
-  return { pr, gh, view, comments, events: listEvents(comments, viewer), bind, summary };
+  return { pr, gh, view, viewer, comments, events: listEvents(comments, viewer), bind, summary };
 }
 
 const readBlobFrom = (root) => (blob) => {
@@ -275,7 +295,289 @@ async function risk(argv, ctx) {
   });
 }
 
-const SUBCOMMANDS = { record, approve, risk };
+// ---- the reviewer budget: start, review, findings --------------------------------------------------------------------------
+// A plan review is a paid run. Its slot is reserved by ONE event comment posted BEFORE the launch; the launch is owned by the
+// caller whose `claim` is on the earliest comment for the key, and a reserved key is consumed even when the run then crashes.
+
+const KEY_RE = /^[A-Za-z0-9._-]{1,48}$/;
+const EXTRA_MAX = 500;
+const PRIOR_MAX = 100_000;
+const SESSION_RE = /^[A-Za-z0-9_-]{8,}$/;
+// Fable plan reviews number their findings from here, so an id never collides with a Codex review's R1-/R2- ids.
+const FABLE_BASE_N = 100;
+
+function keyOption(values) {
+  const key = requireOption(values, 'key');
+  if (!KEY_RE.test(key)) throw new UsageError(`--key must match ${KEY_RE} (letters, digits, . _ -; at most 48)`);
+  return key;
+}
+
+function extraOption(values) {
+  if (values.extra === undefined) return undefined;
+  const text = values.extra.trim();
+  if (text === '') throw new UsageError('--extra must not be empty: it records the owner\'s words');
+  if (text.length > EXTRA_MAX) throw new UsageError(`--extra is longer than ${EXTRA_MAX} characters`);
+  return text;
+}
+
+const startOf = (comments, viewer, reviewer, key) => startsValidity(listEvents(comments, viewer)).find((x) => x.reviewer === reviewer && x.key === key);
+const planDirOf = (root) => path.join(root, '.review', 'plan');
+const keyDigest = (px, planBlob, key) => sha256([px.bind.repo, px.pr, 'fable-plan', planBlob, key].join('\n'));
+
+// Reserve one launch: the claim protocol. Returns the valid start this caller owns, or throws the exit-1/3 reason it may not launch.
+function reserve(px, { reviewer, key, extra, ctx }) {
+  const active = activeOrFail(px.events, px.bind);
+  const before = startOf(px.comments, px.viewer, reviewer, key);
+  if (before) {
+    throw fail('already-started', `${reviewer} key ${key} was already started (comment ${before.commentId}); a started key never launches twice, another run needs a new key`, { valid: before.valid, commentId: before.commentId });
+  }
+  const claim = randomBytes(8).toString('hex');
+  try {
+    postEvent(px.gh, px.pr, 'plan-review-started', `${reviewer}-${key}`, `Plan review started: ${reviewer} ${key}`, {
+      ...px.bind, reviewer, key, planBlob: active.blob, claim, ...(extra ? { extra } : {}), at: isoOf(ctx), host: hostname(),
+    });
+  } catch (err) {
+    // An ambiguous POST (timeout, 502) may still have created the comment: the re-list below decides.
+    if (!(err instanceof GhError)) throw err;
+  }
+  const found = startOf(px.gh.listComments(px.pr), px.viewer, reviewer, key);
+  if (!found) throw new Fail(EXIT.UNAVAILABLE, { ok: false, error: 'not-visible', message: 'the reservation comment was not listed back by GitHub: nothing may launch; run the command again (it re-checks the key)' });
+  if (found.claim !== claim) throw fail('already-started', `another caller's reservation for ${reviewer} key ${key} is the earliest (comment ${found.commentId}): it owns the launch`, { commentId: found.commentId });
+  if (!found.valid) throw fail('cap', `the per-PR ${reviewer} budget is used up (the start is recorded and takes no slot): the owner can allow one more with --extra "<their words>"`, { commentId: found.commentId });
+  return { found, claim, active };
+}
+
+async function start(argv, ctx) {
+  const { values } = parseCommandArgs(argv, { pr: { type: 'string' }, reviewer: { type: 'string' }, key: { type: 'string' }, extra: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
+  intOption(values, 'pr', { required: true, min: 1 });
+  const reviewer = requireOption(values, 'reviewer');
+  if (reviewer !== 'codex' && reviewer !== 'fable') throw new UsageError('--reviewer must be codex or fable');
+  const key = keyOption(values);
+  const extra = extraOption(values);
+  const root = resolveRepo(values, ctx);
+  await requireConfig(root);
+  if (reviewer === 'codex') throw fail('use-plan-review', 'Codex plan reviews are reserved only by `pipeline plan review` (it launches the run itself), so no key can be burnt that nobody launches');
+  return guardGh(() => {
+    const px = prContext(values, ctx, root);
+    const { found, claim } = reserve(px, { reviewer, key, extra, ctx });
+    return {
+      exitCode: EXIT.OK,
+      output: {
+        ok: true, go: true, key, reviewer, planBlob: found.planBlob, claim,
+        ...(reviewer === 'fable' ? { promptHeader: `ROUND: plan\nINPUT-DIGEST: ${keyDigest(px, found.planBlob, key)}` } : {}),
+      },
+    };
+  });
+}
+
+// After a paid run: is this caller's reservation still the one that counts, and is the plan still the one that was reviewed?
+// A run that no longer counts is written to <key>.superseded.json only (never a review, never booked); the owner sees it in the cost line.
+function standing(px, { reviewer, key, claim, planBlob }) {
+  const comments = px.gh.listComments(px.pr);
+  const active = activeProposal(listEvents(comments, px.viewer), px.bind);
+  if (active.status !== 'ok' || active.blob !== planBlob) return { ok: false, error: 'stale-start', message: 'the active plan changed while the review ran: the result is set aside, not counted' };
+  const now = startOf(comments, px.viewer, reviewer, key);
+  if (!now || (claim !== null && now.claim !== claim) || !now.valid) return { ok: false, error: 'superseded', message: 'another caller\'s reservation for this key is the earliest (or the start is no longer valid): the result is set aside, not counted' };
+  return { ok: true };
+}
+
+const setAside = (root, key, payload) => {
+  mkdirSync(planDirOf(root), { recursive: true });
+  writeJson(path.join(planDirOf(root), `${key}.superseded.json`), payload);
+};
+
+const readJsonOrNull = (file) => {
+  try { return JSON.parse(readFileSync(file, 'utf8')); } catch { return null; }
+};
+
+const countsOf = (f) => ({ blocking: f.blocking.length, suggestions: f.suggestions.length, worth_considering: f.worth_considering.length });
+
+async function review(argv, ctx) {
+  const { values } = parseCommandArgs(argv, {
+    pr: { type: 'string' }, key: { type: 'string' }, extra: { type: 'string' }, effort: { type: 'string' }, model: { type: 'string' }, prior: { type: 'string' }, repo: { type: 'string' },
+  }, { allowPositionals: false });
+  intOption(values, 'pr', { required: true, min: 1 });
+  const key = keyOption(values);
+  const extra = extraOption(values);
+  const effort = values.effort ?? 'high';
+  if (effort !== 'high' && effort !== 'xhigh') throw new UsageError('--effort must be high or xhigh');
+  const root = resolveRepo(values, ctx);
+  const { config } = await requireConfig(root);
+  const model = values.model ?? config.review.codex_model;
+  let priorText;
+  if (values.prior !== undefined) {
+    const abs = path.resolve(ctx.cwd ?? process.cwd(), values.prior);
+    try {
+      priorText = readFileSync(abs, 'utf8');
+    } catch (err) {
+      throw new UsageError(`--prior: cannot read ${values.prior} (${err.code ?? err.message})`);
+    }
+    if (Buffer.byteLength(priorText) > PRIOR_MAX) throw new UsageError(`--prior: ${values.prior} is larger than ${PRIOR_MAX} bytes`);
+  }
+
+  return guardGh(async () => {
+    const px = prContext(values, ctx, root);
+    // Everything that could refuse the launch is checked BEFORE the slot is reserved: a reserved key is consumed.
+    const act = activeOrFail(px.events, px.bind);
+    try {
+      buildPlanReviewPrompt({ pr: px.pr, planPath: act.path, blob: act.blob, kind: 'review' });
+      buildCodexArgs({ cwd: root, model, effort, schemaPath: FINDINGS_SCHEMA_PATH, outPath: path.join(planDirOf(root), 'x.raw.json'), json: true });
+    } catch (err) {
+      throw err.message.startsWith('invalid') ? new UsageError(err.message) : fail('plan-invalid', err.message);
+    }
+    const { found, claim, active } = reserve(px, { reviewer: 'codex', key, extra, ctx });
+    const planBlob = found.planBlob;
+    // The launch is bound to the blob it reserved for.
+    if (active.blob !== planBlob) throw fail('stale-start', 'the active plan is not the one this start reserved');
+    const dir = planDirOf(root);
+    mkdirSync(dir, { recursive: true });
+
+    const validCodex = startsValidity(listEvents(px.gh.listComments(px.pr), px.viewer)).filter((x) => x.reviewer === 'codex' && x.valid);
+    const n = Math.max(1, validCodex.findIndex((x) => x.key === key) + 1);
+    const earlier = validCodex.slice(0, Math.max(0, n - 1)).reverse();
+    const kind = earlier.length > 0 ? 'recheck' : 'review';
+    // The first run's session, usage and markdown: the most recent earlier start that completed.
+    let from = null;
+    for (const e of earlier) {
+      const done = readJsonOrNull(path.join(dir, `${e.key}.json`));
+      if (done) { from = { key: e.key, session: done.session, usage: done.usage, md: path.join(dir, `${e.key}.md`) }; break; }
+    }
+    let prior = priorText;
+    if (kind === 'recheck' && prior === undefined && from && existsSync(from.md)) prior = readFileSync(from.md, 'utf8');
+
+    let prompt;
+    try {
+      prompt = buildPlanReviewPrompt({ pr: px.pr, planPath: active.path, blob: planBlob, kind, priorFindingsMarkdown: prior ?? '' });
+    } catch (err) {
+      throw fail('plan-invalid', err.message);
+    }
+    const outPath = path.join(dir, `${key}.raw.json`);
+    let args;
+    let resumed = false;
+    try {
+      if (kind === 'recheck' && from && typeof from.session === 'string' && SESSION_RE.test(from.session) && !from.session.startsWith('-')) {
+        args = buildCodexResumeArgs({ sessionId: from.session, model, effort, schemaPath: FINDINGS_SCHEMA_PATH, outPath });
+        resumed = true;
+      } else {
+        args = buildCodexArgs({ cwd: root, model, effort, schemaPath: FINDINGS_SCHEMA_PATH, outPath, json: true });
+      }
+    } catch (err) {
+      throw new UsageError(err.message);
+    }
+
+    const r = await askCodex({ root, args, prompt, outPath, env: ctx.env, json: true });
+    if (!r.ok) {
+      writeJson(path.join(dir, `${key}.failed.json`), { key, reviewer: 'codex', blob: planBlob, reason: r.reason, session: r.session ?? null, at: isoOf(ctx), ...(r.errors ? { errors: r.errors } : {}), ...(r.detail ? { detail: r.detail } : {}) });
+      return {
+        exitCode: EXIT.UNAVAILABLE,
+        output: { ok: false, unavailable: true, reason: r.reason, key, session: r.session ?? null, ...(r.errors ? { errors: r.errors } : { code: r.code, timedOut: r.timedOut, detail: r.detail }) },
+      };
+    }
+
+    let verdict;
+    try {
+      verdict = standing(px, { reviewer: 'codex', key, claim, planBlob });
+    } catch (err) {
+      if (!(err instanceof GhError)) throw err;
+      setAside(root, key, { key, reviewer: 'codex', blob: planBlob, reason: 'github-unavailable', findings: r.findings, session: r.session, usage: r.usage, at: isoOf(ctx) });
+      return { exitCode: EXIT.UNAVAILABLE, output: { ok: false, unavailable: true, reason: 'github', key, message: 'the run finished but GitHub could not confirm the reservation: the result is set aside, not counted' } };
+    }
+    if (!verdict.ok) {
+      setAside(root, key, { key, reviewer: 'codex', blob: planBlob, reason: verdict.error, findings: r.findings, session: r.session, usage: r.usage, at: isoOf(ctx) });
+      throw fail(verdict.error, verdict.message, { key, path: path.join(dir, `${key}.superseded.json`) });
+    }
+
+    const items = assignIds(r.findings, n, () => '', { contentHash: planBlob });
+    writeJson(path.join(dir, `${key}.json`), {
+      findings: r.findings, items, blob: planBlob, reviewer: 'codex', key, session: r.session, resumedFrom: resumed ? from.key : null, usage: r.usage,
+    });
+    writeFileAtomic(path.join(dir, `${key}.md`), renderFindingsMarkdown(r.findings, n, items));
+
+    // Codex usage is cumulative over a resumed thread (see codex-run.mjs): a recheck books only its own share.
+    let cost = 'not-reported';
+    const own = r.session && r.usage ? (resumed ? usageDelta(r.usage, from.usage) : r.usage) : null;
+    if (own) {
+      const booked = await costRun([
+        '--pr', String(px.pr), '--phase', 'plan', '--role', 'codex', '--execution', `codex:${r.session}:${key}`,
+        '--input', String(Math.max(0, own.input_tokens - own.cached_input_tokens)), '--cache-read', String(own.cached_input_tokens),
+        '--output', String(own.output_tokens), '--usd', '0', '--repo', root,
+      ], ctx);
+      cost = booked.output?.ok ? 'booked' : `failed:${booked.output?.error ?? 'not-recorded'}`;
+    }
+    return {
+      exitCode: EXIT.OK,
+      output: { ok: true, key, n, kind, resumed, counts: countsOf(r.findings), path: path.join(dir, `${key}.json`), session: r.session, cost },
+    };
+  });
+}
+
+async function findings(argv, ctx) {
+  const { values } = parseCommandArgs(argv, {
+    pr: { type: 'string' }, key: { type: 'string' }, tag: { type: 'string' }, 'projects-dir': { type: 'string' }, 'max-age-ms': { type: 'string' }, repo: { type: 'string' },
+  }, { allowPositionals: false });
+  intOption(values, 'pr', { required: true, min: 1 });
+  const key = keyOption(values);
+  const tag = requireOption(values, 'tag');
+  const maxAgeMs = intOption(values, 'max-age-ms', { min: 1 });
+  const root = resolveRepo(values, ctx);
+  await requireConfig(root);
+  return guardGh(() => {
+    const px = prContext(values, ctx, root);
+    const comments = px.gh.listComments(px.pr);
+    const starts = startsValidity(listEvents(comments, px.viewer));
+    const start = starts.find((x) => x.reviewer === 'fable' && x.key === key);
+    if (!start || !start.valid) throw fail('no-start', `no valid fable start for key ${key} on this PR (run \`pipeline plan start --reviewer fable\` first)`);
+    const active = activeOrFail(listEvents(comments, px.viewer), px.bind);
+    if (active.blob !== start.planBlob) throw fail('stale-start', 'the active plan is no longer the one this start reserved: the review would not be of the plan the owner sees');
+    const dir = planDirOf(root);
+    const outJson = path.join(dir, `${key}.json`);
+    if (existsSync(outJson)) throw fail('exists', `findings for key ${key} are already recorded (${outJson})`);
+
+    const found = findSubagentTranscript({ tag, projectsDir: values['projects-dir'], ...(maxAgeMs !== undefined ? { maxAgeMs } : {}) });
+    if (!found) throw new Fail(EXIT.USAGE, { ok: false, error: 'not-found', message: `no recent subagent transcript tagged ${JSON.stringify(tag)}` });
+    const readOr = (file, what) => {
+      try { return readFileSync(file, 'utf8'); } catch (err) { throw new Fail(EXIT.USAGE, { ok: false, error: 'read', message: `cannot read ${what} ${file}: ${err.code ?? err.message}` }); }
+    };
+    const jsonlText = readOr(found.jsonlPath, 'transcript');
+    const metaText = found.metaPath === null ? undefined : readOr(found.metaPath, 'meta');
+
+    const errors = [];
+    // The transcript must start at or after the start event: an older one answers an older prompt.
+    let firstTs = NaN;
+    try { firstTs = Date.parse(JSON.parse(jsonlText.split('\n').find((l) => l.trim() !== '') ?? '').timestamp); } catch { firstTs = NaN; }
+    const startedTs = Date.parse(start.createdAt ?? '');
+    if (!Number.isFinite(firstTs) || !Number.isFinite(startedTs)) errors.push('the transcript\'s first line or the start event has no readable timestamp');
+    else if (firstTs < startedTs) errors.push(`the transcript begins at ${new Date(firstTs).toISOString()}, older than the start event (${start.createdAt})`);
+
+    const proof = proveModel({ jsonlText, metaText, expectModelPrefix: 'claude-fable-', expectEffort: 'high', expectMetaModel: null, expectAgentType: 'fable-reviewer' });
+    errors.push(...proof.errors);
+    const digest = keyDigest(px, start.planBlob, key);
+    if (!/^ROUND: plan[ \t]*$/m.test(proof.firstUserText ?? '')) errors.push('the reviewer\'s prompt does not carry ROUND: plan');
+    if (!new RegExp(`^INPUT-DIGEST: ${digest}[ \\t]*$`, 'm').test(proof.firstUserText ?? '')) errors.push('the reviewer\'s prompt does not carry this start\'s INPUT-DIGEST');
+
+    let result = null;
+    try {
+      result = extractJsonBlock(proof.finalAssistantText);
+      const checked = validateFindings(result);
+      if (!checked.ok) { errors.push(...checked.errors.map((e) => `findings: ${e}`)); result = null; }
+    } catch {
+      errors.push('findings: no JSON found in the reviewer\'s final message');
+    }
+    if (errors.length > 0 || result === null) {
+      return { exitCode: EXIT.FAILED, output: { ok: false, key, error: 'unproven', message: 'the transcript was not accepted: nothing was recorded', errors } };
+    }
+
+    const n = FABLE_BASE_N + Math.max(1, starts.filter((x) => x.reviewer === 'fable' && x.valid).findIndex((x) => x.key === key) + 1);
+    const items = assignIds(result, n, () => '', { contentHash: start.planBlob });
+    mkdirSync(dir, { recursive: true });
+    writeJson(outJson, { findings: result, items, blob: start.planBlob, reviewer: 'fable', key, transcript: found.jsonlPath });
+    writeFileAtomic(path.join(dir, `${key}.md`), renderFindingsMarkdown(result, n, items).replace(/^# Codex review — round \d+/, '# Fable plan review'));
+    return { exitCode: EXIT.OK, output: { ok: true, key, n, counts: countsOf(result), path: outJson, errors: [] } };
+  });
+}
+
+
+const SUBCOMMANDS = { record, approve, risk, start, review, findings };
 
 export const run = guarded(async (argv, ctx) => {
   const [sub, ...rest] = argv;
