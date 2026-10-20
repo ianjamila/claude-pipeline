@@ -17,7 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
 export { withoutLiteralText, INDIRECT_EXPANSION };
-import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames } from './package-scripts.mjs';
+import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames, defaultLexists } from './package-scripts.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit } from './script-candidates.mjs';
@@ -1265,7 +1265,7 @@ function judgeScriptText(text, sf, abs, dir, ctx, level) {
 // A script, directory or setting that is only known at run time cannot be read: refused when the line mentions a guarded operation (as for `bash $F`); a setting that moves the package.json
 // (npm_config_prefix, INIT_CWD, PNPM_* ...) always, as which package.json the manager reads is then unknown.
 const pkgEnv = (ctx, cwd) => ({
-  cwd, home: ctx.home, nodePrefix: ctx.nodePrefix, readText: ctx.readText, pathExists: ctx.pathExists, readDir: ctx.readDir, cache: (ctx.budget.pkgCache ??= new Map()), p: path, tick: () => checkDeadline(ctx.budget),
+  cwd, home: ctx.home, nodePrefix: ctx.nodePrefix, readText: ctx.readText, pathExists: ctx.pathExists, lexists: ctx.lexists, readDir: ctx.readDir, cache: (ctx.budget.pkgCache ??= new Map()), p: path, tick: () => checkDeadline(ctx.budget),
   written: (abs) => pkgFileWritten(ctx, abs),
   mentionsGuarded: () => lineMentionsGuarded(ctx),
   lineNames: () => lineNames(ctx.fullText),
@@ -2751,6 +2751,7 @@ function evaluateGitOnce(command, {
   readText = defaultReadText,
   readHead = defaultReadHead,
   pathExists = existsSync,
+  lexists = pathExists === existsSync ? defaultLexists : () => false, // (a caller that fakes pathExists gets no real-disk lstat)
   readDir = defaultReadDir,
   realpath = realpathSync.native, // symlinks followed when a write and a script are compared (tests fake it)
   now = Date.now, // injectable clock (tests)
@@ -2762,7 +2763,7 @@ function evaluateGitOnce(command, {
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   const base = cwd || process.cwd();
   const ctx = {
-    cwd: base, home, nodePrefix, currentBranch, pushDestination, issueLabels, ownerGo, readText, pathExists, readDir, readHead, realpath, env, budget: bashState?.carry ? { ...bashState.carry, startupOk: new Set(), startupFx: undefined } : newEvalBudget(now), fullText: text, lineText: text,
+    cwd: base, home, nodePrefix, currentBranch, pushDestination, issueLabels, ownerGo, readText, pathExists, lexists, readDir, readHead, realpath, env, budget: bashState?.carry ? { ...bashState.carry, startupOk: new Set(), startupFx: undefined } : newEvalBudget(now), fullText: text, lineText: text,
     vars: Object.create(null), unsureVars: new Set(), tainted: new Set(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
     branches: new Map(), cfgDirty: false, envCfgDirty: false, writeFrames: [], bashState,
   };

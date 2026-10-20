@@ -8,7 +8,9 @@
 // Every case has its benign twin. Guarded words are spelled in pieces: the live guard scans files passed to node tools.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolve, dirname, basename } from 'node:path';
+import { resolve, dirname, basename, join } from 'node:path';
+import { mkdtempSync, mkdirSync, symlinkSync, lstatSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 
@@ -347,4 +349,49 @@ test('R3-B2 a shebang interpreter is looked up in the caller\'s PATH order: the 
   // twins: the nearer node is harmless (the far one is not reached), and the same layout run from the root
   allowed('cd sub && npx tool', (g) => ({ ...tree(g), 'sub/node_modules/.bin/node': sh('echo shim') }));
   allowed('npx tool', tree);
+});
+
+// Why (#89 gate flake, test/guard-a2-shell `cd $UNSET && npm test`): packageScripts asked the REAL disk (lstat) whether a package.json link exists even when the caller evaluated over a fake file system;
+// on macOS the fake paths (/home/u/...) hit the autofs mount of /home and each lstat stalled ~1.4 s, past the evaluation deadline. A fake file system must see no real disk. No wall clock here: a REAL
+// dangling link sits where the fake file system has nothing, and where "it exists" would change the verdict (a package.json that cannot be read: refused).
+test('a guard evaluating over a fake file system does not look at the real disk for links', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pkg-lexists-'));
+  try {
+    const proj = join(dir, 'proj');
+    mkdirSync(proj);
+    symlinkSync(join(dir, 'no-such-target'), join(proj, 'package.json')); // dangling: existsSync says no, lstat says yes
+    const fs = fakeFs(proj, {}); // the fake file system holds the directory and nothing else
+    const run = {
+      git: (o = {}) => evaluateGitCommand('npm test', { cwd: proj, home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fs, ...o }),
+      files: (o = {}) => evaluateBashForFiles('npm test', { home: '/home/u', env: {}, platform: 'linux', realpath: (p) => p, cwd: proj, ...fs, existsSync: fs.pathExists, ...o }),
+    };
+    const real = (f) => { try { lstatSync(f); return true; } catch { return false; } };
+    for (const [n, go] of Object.entries(run)) {
+      const v = go();
+      assert.equal(v.decision, 'allow', `${n}: the real disk's dangling link was seen -> ${v.reason}`);
+      // an explicit lexists is still honoured (a caller that wants links counted): the dangling package.json exists but cannot be read
+      const w = go({ lexists: real });
+      assert.equal(w.decision, 'deny', `${n}: an explicit lexists was ignored`);
+      assert.match(w.reason, /cannot read .*package\.json/, n);
+      // a lexists that says no changes nothing
+      assert.equal(go({ lexists: () => false }).decision, 'allow', n);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('with the real file system (no fake) a dangling package.json link still counts as existing', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pkg-lexists-real-'));
+  try {
+    symlinkSync(join(dir, 'no-such-target'), join(dir, 'package.json'));
+    const files = evaluateBashForFiles('npm test', { home: dir, env: {}, platform: 'linux', cwd: dir });
+    assert.equal(files.decision, 'deny', 'files guard: a dangling package.json link was ignored');
+    assert.match(files.reason, /cannot read .*package\.json/);
+    const git = evaluateGitCommand('npm test', { cwd: dir, home: dir, env: {}, currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [] });
+    assert.equal(git.decision, 'deny', 'git guard: a dangling package.json link was ignored');
+    assert.match(git.reason, /cannot read .*package\.json/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -16,7 +16,7 @@
 // ancestor process); commands that unset or override CLAUDECODE are denied here.
 import fs from 'node:fs';
 import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
-import { pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames } from './package-scripts.mjs';
+import { pmCall, pmMoverName, packageScripts, defaultLexists, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames } from './package-scripts.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath } from '../../lib/paths.mjs';
@@ -190,6 +190,8 @@ function makeCtx(opts) {
     realpath: opts.realpath ?? fs.realpathSync.native,
     existsSync: opts.existsSync ?? fs.existsSync,
     readlink: opts.readlink ?? (opts.existsSync ? () => null : readLinkIfAny),
+    // does a link (even a dangling or looping one) exist: a caller that fakes the filesystem gets no real-disk lstat (it stalls on macOS autofs mounts such as /home, and a fake path is no real one)
+    lexists: opts.lexists ?? (opts.existsSync ? () => false : defaultLexists),
     // dev:ino of a path (null when missing); a caller that fakes the filesystem gets no inode comparison
     statId: opts.statId ?? (opts.existsSync || platform === 'win32' ? () => null : realStatId),
   };
@@ -1657,7 +1659,7 @@ function judgePackageScripts(c, dirs, ctx, opts, scanRaw = '') {
   for (const d of dirs) {
     const mentionsGuarded = () => makeMatchers(ctx).rawHit(scanRaw, [d]) || SENSITIVE_WORDS.test(String(scanRaw).replace(/['"`\\]/g, ''));
     const plan = packageScripts(call, {
-      cwd: d, home: ctx.homePosix, nodePrefix: ctx.nodePrefix, readText: ctx.readText, pathExists: (x) => ctx.api.existsSync(x), readDir: ctx.readDir, cache: (ctx.budget.pkgCache ??= new Map()), p: posix, tick: () => checkDeadline(ctx.budget),
+      cwd: d, home: ctx.homePosix, nodePrefix: ctx.nodePrefix, readText: ctx.readText, pathExists: (x) => ctx.api.existsSync(x), lexists: ctx.api.lexists, readDir: ctx.readDir, cache: (ctx.budget.pkgCache ??= new Map()), p: posix, tick: () => checkDeadline(ctx.budget),
       written: (abs) => pkgFileWritten(ctx, abs),
       mentionsGuarded,
       lineNames: () => lineNames(scanRaw),

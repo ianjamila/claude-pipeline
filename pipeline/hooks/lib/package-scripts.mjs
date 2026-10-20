@@ -517,13 +517,13 @@ export const shellQuote = (w) => (/^[A-Za-z0-9_@%+=:,./-]+$/.test(w) ? w : `'${S
 
 const MAX_WORKSPACE_PACKAGES = 256;
 const MAX_WALK = 64;
-const defaultLexists = (f) => { try { lstatSync(f); return true; } catch { return false; } }; // (a symlink loop or a dangling link exists although existsSync says no)
+export const defaultLexists = (f) => { try { lstatSync(f); return true; } catch { return false; } }; // (a symlink loop or a dangling link exists although existsSync says no)
 // Configuration files that change what runs a script (script-shell, node-options, workspaces ... ): a key on this list in a file next to the package or in the home directory makes the scripts unknown.
 // (not `prefix`: npm takes the project from the command line's --prefix alone -- @npmcli/config loadLocalPrefix reads the 'cli' source -- so a `prefix=` in a .npmrc, which people set to move their GLOBAL packages, moves nothing here)
 const GLOBAL_RCS = ['/etc/npmrc', '/usr/local/etc/npmrc', '/opt/homebrew/etc/npmrc'];
 // (the `prefix` key is no mover of the PROJECT -- see above -- but it is where npm looks for the GLOBAL configuration, <prefix>/etc/npmrc, and the one it ships with, <prefix>/lib/node_modules/npm/npmrc)
 
-// Where the scripts are and what they hold, for one evaluation. env: { cwd (null: unknown), home, readText, pathExists, readDir, cache (a Map kept for the whole evaluation),
+// Where the scripts are and what they hold, for one evaluation. env: { cwd (null: unknown), home, readText, pathExists, lexists (does a link, even a dangling or looping one, exist; a caller over a fake file system passes one that reads no real disk), readDir, cache (a Map kept for the whole evaluation),
 // written(abs) -> 'known' | 'maybe' | null (does the line write that file before the command?), mentionsGuarded() -> boolean, p (path module), tick() }.
 // Returns { refuse: string } | { runs: [{ name, label, text, dir, file }] } | { none: true } (nothing runs: no package.json, no such script). Every give-up is a refusal.
 export function packageScripts(call, env) {
