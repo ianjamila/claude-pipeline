@@ -1,9 +1,10 @@
 // A scriptable stand-in for `gh`, so tests never touch GitHub. Point PIPELINE_GH at
 // `node <this file>` and describe the replies in the JSON file named by PIPELINE_FAKE_GH_SCRIPT:
-//   [{ match: "<regex source>", stdout?, stdoutJson?, stderr?, code? }]
+//   [{ match: "<regex source>", stdout?, stdoutJson?, stderr?, code?, afterLog? }]
+// `afterLog` (regex source): the entry only applies once an EARLIER call matching it is in the log (a world that changes mid-run).
 // The first entry whose regex matches the space-joined argv wins. Every call is also appended to
 // PIPELINE_FAKE_GH_LOG (one JSON line: argv, cwd, stdin) so tests can assert what was run.
-import { readFileSync, appendFileSync } from 'node:fs';
+import { readFileSync, appendFileSync, existsSync } from 'node:fs';
 
 // stdin is read only when something is piped in; a 200 ms cap means an idle inherited stdin never hangs us.
 function readStdin() {
@@ -28,6 +29,10 @@ function readStdin() {
 
 const argv = process.argv.slice(2);
 const stdin = await readStdin();
+// Calls made BEFORE this one (the log is appended below), for entries that only apply `afterLog`.
+const priorCalls = process.env.PIPELINE_FAKE_GH_LOG && existsSync(process.env.PIPELINE_FAKE_GH_LOG)
+  ? readFileSync(process.env.PIPELINE_FAKE_GH_LOG, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l).argv.join(' '))
+  : [];
 
 if (process.env.PIPELINE_FAKE_GH_LOG) {
   appendFileSync(process.env.PIPELINE_FAKE_GH_LOG, `${JSON.stringify({ argv, cwd: process.cwd(), stdin })}\n`);
@@ -36,7 +41,7 @@ if (process.env.PIPELINE_FAKE_GH_LOG) {
 const scriptPath = process.env.PIPELINE_FAKE_GH_SCRIPT;
 const entries = scriptPath ? JSON.parse(readFileSync(scriptPath, 'utf8')) : [];
 const joined = argv.join(' ');
-const hit = entries.find((e) => new RegExp(e.match).test(joined));
+const hit = entries.find((e) => new RegExp(e.match).test(joined) && (!e.afterLog || priorCalls.some((c) => new RegExp(e.afterLog).test(c))));
 
 if (!hit) {
   process.stderr.write(`fake-gh: no match for ${joined}`);

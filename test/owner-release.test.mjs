@@ -3,7 +3,7 @@
 // the PR's newest stop id. Real CLI against the scripted gh fake; the owner's replies are recorded in the real owner-go folder under random sessions (ownerSays).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cli, scenario, ymlFor, PR } from './helpers/gate-env.mjs';
+import { cli, scenario, ymlFor, ghEntries, PR } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { approvalFlags, mergeRequest, ownerSays, resumeSays, stopReply } from './helpers/owner-go.mjs';
 import { renderEvent, parseEvent } from '../pipeline/lib/run-events.mjs';
@@ -178,27 +178,34 @@ test('final-gate prints the newest stop id in chat mode (null with none); label 
 const S5 = '3333cccc';
 const S6 = '4444dddd';
 
+// The stops appear AFTER final-gate wrote a valid gate file (the gate itself now fails on an open stop: test/chat-stop-gate.test.mjs), so these exercise P merge's own step 1.5.
+const stopsAfterGate = (s, ...comments) => s.fake.setScript(ghEntries({ prHead: s.head, comments }));
+
 test('an open owner stop blocks P merge even for a low-risk head with no owner items and no release', () => {
-  const s = withStops(chatYml(), stopComment(S5));
+  const s = withStops(chatYml());
   assertExit(s.gate(), 0);
+  stopsAfterGate(s, stopComment(S5));
   const r = merge(s);
   assertExit(r, 1);
   assert.equal(r.json.error, 'pre-merge');
-  assert.match(r.json.reason, new RegExp(`open owner stop.*${S5}|${S5}.*open`, 's'));
+  assert.match(r.json.reason, new RegExp(`open owner stop.*${S5}|owner stop ${S5}.*open`, 's'));
   assert.deepEqual(s.mergeCalls(), []);
+  assert.equal(withStops(chatYml(), stopComment(S5)).gate().json.failed.join(), 'labels', 'and the gate itself fails on it');
 });
 
-test('several open stops: the owner\'s "merge" must have been given to a request that carried EVERY open id, not just the newest', (t) => {
-  const s = withStops(chatYml(), stopComment(S5), stopComment(S6));
+test('several open stops block P merge even when the owner\'s "merge" listed every id; once released, the merge needs the newest id and then goes through', (t) => {
+  const s = withStops(chatYml());
   assertExit(s.gate(), 0);
   const items = s.gateFile().ownerItems;
-  ownerSays(t, 'merge', stopReply(PR, S6, { merge: { head: s.head, items } })); // the reply listed only the newest id
+  stopsAfterGate(s, stopComment(S5), stopComment(S6));
+  ownerSays(t, 'merge', stopReply(PR, [S5, S6], { merge: { head: s.head, items } })); // the reply listed both ids
   const r = merge(s, approvalFlags(s.head, items));
   assertExit(r, 1);
   assert.equal(r.json.error, 'pre-merge');
   assert.match(r.json.reason, new RegExp(S5));
-  assert.deepEqual(s.mergeCalls(), []);
-  ownerSays(t, 'merge', stopReply(PR, [S5, S6], { merge: { head: s.head, items } }));
+  assert.match(r.json.reason, new RegExp(S6));
+  assert.deepEqual(s.mergeCalls(), [], 'an approval never merges over an open stop: the release comes first (P checkpoint --resumed)');
+  stopsAfterGate(s, stopComment(S5), stopComment(S6), releaseComment(S5), releaseComment(S6));
   assertExit(merge(s, approvalFlags(s.head, items)), 0);
   assert.equal(s.mergeCalls().length, 1);
 });
