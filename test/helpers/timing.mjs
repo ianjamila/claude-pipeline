@@ -54,8 +54,7 @@ export const REF_MS = 134;
 const MIN_FACTOR = 1;
 const MAX_FACTOR = 8;
 
-// A fixed workload shaped like guard work: a 1 MB string scanned by char code, regex passes, Map/Set inserts and slicing.
-// Why a checksum: it is returned so the JIT cannot drop the work.
+// A fixed workload shaped like guard work: a 1 MB string scanned by char code, regex passes, Map/Set inserts and slicing; it returns a checksum so the JIT cannot drop the work.
 export function referenceWork() {
   const unit = 'git commit -m "msg" && echo \'a b\' | sed -e "s/x/y/g" $(ls -la) # note\n';
   let text = '';
@@ -120,9 +119,9 @@ export function virtualExpired(limitReads) {
   return e;
 }
 
-// A step check: the clock was read between `floor` (proves the meter sees the work) and `ceil` times.
-export function assertSteps(reads, { floor, ceil, label }) {
-  assert.ok(reads >= floor && reads <= ceil, `${label}: ${reads} clock reads, expected ${floor}..${ceil}`);
+// A step check: the count was between `floor` (proves the meter sees the work) and `ceil`. `unit` names what is counted in the failure message.
+export function assertSteps(reads, { floor, ceil, label, unit = 'clock reads' }) {
+  assert.ok(reads >= floor && reads <= ceil, `${label}: ${reads} ${unit}, expected ${floor}..${ceil}`);
 }
 
 // Linear scaling in reads: the full-size run reads at most 2.5x the half-size run plus 4.

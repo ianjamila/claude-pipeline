@@ -2,7 +2,7 @@
 // The "clock" here is fake (numbers computed from the size), so these tests cannot flake themselves.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { assertCpuUnder, assertLinear, assertLinearSteps, assertSteps, bestOf, cpuCap, cpuTime, cpuTimed, factorFrom, machineFactor, REF_MS, referenceWork, virtualClock, virtualExpired } from './helpers/timing.mjs';
+import { assertCpuUnder, assertLinear, assertLinearSteps, assertSteps, bestOf, cpuCap, cpuTime, cpuTimed, factorFrom, machineFactor, REF_MS, virtualClock, virtualExpired } from './helpers/timing.mjs';
 import { checkDeadline, GuardLimit, newEvalBudget } from '../pipeline/hooks/lib/script-candidates.mjs';
 
 const fake = (cost, n) => () => cost(n);
@@ -105,13 +105,14 @@ test('machineFactor is memoized and cpuCap multiplies by it', () => {
   assert.equal(cpuCap(1000), 1000 * f);
 });
 
-test('referenceWork is deterministic', () => {
-  assert.equal(referenceWork(), referenceWork());
-});
-
 test('assertCpuUnder names the measurement, the base cap, the factor and the scaled cap', () => {
   assert.throws(() => assertCpuUnder(1e9, 5, 'x'), /x: 1000000000ms > 5ms x[\d.]+ = [\d.]+ms/);
   assert.doesNotThrow(() => assertCpuUnder(0, 5, 'x'));
+});
+
+test('assertCpuUnder: exactly at the scaled cap fails, just under passes', () => {
+  assert.throws(() => assertCpuUnder(cpuCap(5), 5, 'x'), /x:/);
+  assert.doesNotThrow(() => assertCpuUnder(cpuCap(5) - 0.001, 5, 'x'));
 });
 
 test('virtualClock counts reads; an evaluation budget on it expires at a fixed read count', () => {
@@ -137,6 +138,10 @@ test('assertSteps: the count must sit between floor and ceiling and the message 
   assert.doesNotThrow(() => assertSteps(5, { floor: 1, ceil: 10, label: 'z' }));
   assert.doesNotThrow(() => assertSteps(1, { floor: 1, ceil: 10, label: 'z' }));
   assert.doesNotThrow(() => assertSteps(10, { floor: 1, ceil: 10, label: 'z' }));
+});
+
+test('assertSteps: the unit names what is counted in the message', () => {
+  assert.throws(() => assertSteps(0, { floor: 1, ceil: 10, label: 'z', unit: 'regex work units' }), /z: 0 regex work units, expected 1\.\.10/);
 });
 
 test('assertLinearSteps: at most 2.5x the half-size count plus 4', () => {
