@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { activeProposal, latestApproval, planResumeFacts, planScopeVerdict, startsValidity } from '../pipeline/lib/plan-state.mjs';
+import { activeProposal, latestApproval, matchingLocalRecord, planResumeFacts, planScopeVerdict, startsValidity } from '../pipeline/lib/plan-state.mjs';
 import { parsePlan, scopeDigest } from '../pipeline/lib/plan.mjs';
 const BIND = { repo: 'a/b', pr: 7, branch: 'agent/x' };
 const A = 'a'.repeat(40), B = 'b'.repeat(40);
+const PSHA = 'f'.repeat(64);
 let id = 0;
 const ev = (kind, data, extra = {}) => ({ kind, id: `e${++id}`, commentId: id, createdAt: `2026-10-19T00:00:${String(id).padStart(2, '0')}Z`, tampered: false, dataStatus: 'ok', data: { ...BIND, ...data }, ...extra });
 const PLAN = (scope) => `## In plain English\nx\n\n## Scope\n${scope.map((s) => `- \`${s}\``).join('\n')}\n\n### Task T1: t\nbody\n`;
@@ -17,7 +18,7 @@ test('active proposal = latest; restoring an earlier blob makes it active again'
 });
 
 test('a tampered or unreadable event newer than the latest approval blocks fallback', () => {
-  const ok = ev('plan-approved', { blob: A, recordId: '1'.repeat(16), promptSha256: 'p' });
+  const ok = ev('plan-approved', { blob: A, recordId: '1'.repeat(16), promptSha256: PSHA });
   assert.equal(latestApproval([ok], BIND).status, 'approved');
   assert.equal(latestApproval([ok, ev('plan-proposed', { blob: B }, { tampered: true })], BIND).status, 'lost');
   assert.equal(latestApproval([ok, ev('plan-approved', {}, { dataStatus: 'invalid' })], BIND).status, 'lost');
@@ -38,28 +39,28 @@ test('lost: proposal without approval, record plan without events, local record 
   assert.equal(verdict({ events: [ev('plan-proposed', { blob: A })] }).ok, false);
   assert.equal(verdict({ recordPlan: { blob: A } }).ok, false);
   assert.equal(verdict({ localRecords: [{ pr: 7, blob: A }] }).ok, false);
-  const ap = ev('plan-approved', { blob: A, path: 'docs/plans/p.md', recordId: '1'.repeat(16), promptSha256: 'p', host: 'mac' });
+  const ap = ev('plan-approved', { blob: A, path: 'docs/plans/p.md', recordId: '1'.repeat(16), promptSha256: PSHA, host: 'mac' });
   assert.match(verdict({ events: [ap] }).detail, /lost/);
 });
 
 test('approved: verified vs unverified, outside files listed, plan file allowed', () => {
-  const ap = ev('plan-approved', { blob: A, path: 'docs/plans/p.md', recordId: '1'.repeat(16), promptSha256: 'p', host: 'pc' });
+  const ap = ev('plan-approved', { blob: A, path: 'docs/plans/p.md', recordId: '1'.repeat(16), promptSha256: PSHA, host: 'pc' });
   const readBlob = (b) => (b === A ? PLAN(['src/**', 'docs/plans/p.md']) : null);
   const files = [{ path: 'src/a.mjs', oldPath: 'src/a.mjs', newPath: 'src/a.mjs' }, { path: 'x.mjs', oldPath: 'x.mjs', newPath: 'x.mjs' }, { path: 'docs/plans/p.md', oldPath: 'docs/plans/p.md', newPath: 'docs/plans/p.md' }];
   const unverified = verdict({ events: [ap], readBlob, files });
   assert.deepEqual(unverified.ownerItems.sort(), ['plan-scope outside x.mjs', 'plan-scope unverified pc']);
-  const local = [{ pr: 7, blob: A, scopeDigest: scopeDigest(['src/**', 'docs/plans/p.md']), recordId: '1'.repeat(16), promptSha256: 'p' }];
+  const local = [{ pr: 7, blob: A, scopeDigest: scopeDigest(['src/**', 'docs/plans/p.md']), recordId: '1'.repeat(16), promptSha256: PSHA }];
   assert.deepEqual(verdict({ events: [ap], readBlob, files, localRecords: local }).ownerItems, ['plan-scope outside x.mjs']);
 });
 
 test('a copied approval pointer with a substituted path exempts nothing (Codex plan R1-1)', () => {
   const readBlob = (b) => (b === A ? PLAN(['src/**']) : null);
-  const local = [{ pr: 7, blob: A, scopeDigest: scopeDigest(['src/**']), recordId: '1'.repeat(16), promptSha256: 'p' }];
-  const forged = ev('plan-approved', { blob: A, path: 'x.mjs', recordId: '1'.repeat(16), promptSha256: 'p', host: 'mac' });
+  const local = [{ pr: 7, blob: A, scopeDigest: scopeDigest(['src/**']), recordId: '1'.repeat(16), promptSha256: PSHA }];
+  const forged = ev('plan-approved', { blob: A, path: 'x.mjs', recordId: '1'.repeat(16), promptSha256: PSHA, host: 'mac' });
   const files = [{ path: 'x.mjs', oldPath: 'x.mjs', newPath: 'x.mjs' }];
   assert.deepEqual(verdict({ events: [forged], readBlob, files, localRecords: local }).ownerItems, ['plan-scope outside x.mjs']);
   // copy-modify-substitute: an unplanned plan-dir file named by a fresh pointer is still an item
-  const other = ev('plan-approved', { blob: A, path: 'docs/plans/q.md', recordId: '1'.repeat(16), promptSha256: 'p', host: 'mac' });
+  const other = ev('plan-approved', { blob: A, path: 'docs/plans/q.md', recordId: '1'.repeat(16), promptSha256: PSHA, host: 'mac' });
   const q = [{ path: 'docs/plans/q.md', oldPath: 'docs/plans/q.md', newPath: 'docs/plans/q.md' }];
   assert.deepEqual(verdict({ events: [other], readBlob, files: q, localRecords: local }).ownerItems, ['plan-scope outside docs/plans/q.md']);
 });
@@ -89,7 +90,7 @@ const P1 = PLAN(['src/**']);
 const SCOPE_D = scopeDigest(['src/**']);
 const T1 = parsePlan(P1).tasks[0];
 const facts = (over) => planResumeFacts({
-  events: [ev('plan-proposed', { blob: A, scopeDigest: SCOPE_D }), ev('plan-approved', { blob: A, recordId: '1'.repeat(16), promptSha256: 'p', scopeDigest: SCOPE_D })],
+  events: [ev('plan-proposed', { blob: A, scopeDigest: SCOPE_D }), ev('plan-approved', { blob: A, recordId: '1'.repeat(16), promptSha256: PSHA, scopeDigest: SCOPE_D })],
   bind: BIND, recordPlan: null, localRecords: [], recordTasks: [], readBlob: (b) => (b === A ? P1 : null), ...over,
 });
 
@@ -99,7 +100,7 @@ test('resume facts: approved plan with an empty record has open work and needs t
 });
 
 test('resume facts: every task done at the matching specSha and an approved record plan: no open work, no checkpoint', () => {
-  const local = [{ pr: 7, blob: A, scopeDigest: SCOPE_D, recordId: '1'.repeat(16), promptSha256: 'p' }];
+  const local = [{ pr: 7, blob: A, scopeDigest: SCOPE_D, recordId: '1'.repeat(16), promptSha256: PSHA }];
   const f = facts({ recordPlan: { blob: A, state: 'approved' }, recordTasks: [{ id: 'T1', specSha: T1.specSha, done: true }], localRecords: local });
   assert.deepEqual([f.approval, f.openWork, f.needsApproveCheckpoint], ['verified', false, false]);
 });
@@ -120,4 +121,50 @@ test('resume facts: no evidence at all; a proposal without approval', () => {
   assert.equal(planResumeFacts({ events: [], bind: BIND, recordPlan: null, localRecords: [], recordTasks: [], readBlob: () => null }).evidence, false);
   const f = planResumeFacts({ events: [ev('plan-proposed', { blob: A })], bind: BIND, recordPlan: null, localRecords: [], recordTasks: [], readBlob: () => null });
   assert.deepEqual([f.evidence, f.approval, f.active.blob], [true, 'none', A]);
+});
+
+// ---- security review F3 / F4 / F7 ----------------------------------------------------------------------------------------------
+const RID1 = '1'.repeat(16), RID2 = '2'.repeat(16), PSHA2 = 'e'.repeat(64);
+const readAB = (b) => (b === A ? PLAN(['src/**']) : b === B ? PLAN(['src/**']) : null);
+const rec = (blob, recordId, promptSha256, ts) => ({ pr: 7, blob, scopeDigest: SCOPE_D, recordId, promptSha256, ts });
+const approved = (blob, recordId, promptSha256) => ev('plan-approved', { blob, scopeDigest: SCOPE_D, recordId, promptSha256, host: 'mac' });
+const files1 = [{ path: 'src/a.mjs', oldPath: 'src/a.mjs', newPath: 'src/a.mjs' }];
+
+test('F3: an approval event without recordId / promptSha256 (or malformed ones) verifies against no local record', () => {
+  const local = [rec(A, RID1, PSHA, '2026-10-19T10:00:00Z')];
+  for (const data of [{ blob: A }, { blob: A, recordId: RID1 }, { blob: A, promptSha256: PSHA }, { blob: A, recordId: 'short', promptSha256: PSHA }, { blob: A, recordId: RID1, promptSha256: 'p' }]) {
+    const forged = ev('plan-approved', { scopeDigest: SCOPE_D, host: 'mac', ...data });
+    assert.deepEqual(verdict({ events: [forged], readBlob: readAB, files: files1, localRecords: local }).ownerItems, ['plan-scope unverified mac'], JSON.stringify(data));
+    const f = facts({ events: [ev('plan-proposed', { blob: A, scopeDigest: SCOPE_D }), forged], localRecords: local });
+    assert.equal(f.approval, 'unverified', JSON.stringify(data));
+  }
+  assert.equal(matchingLocalRecord(local, { pr: 7, blob: A, scopeDigest: SCOPE_D }), null);
+  assert.ok(matchingLocalRecord(local, { pr: 7, blob: A, scopeDigest: SCOPE_D, recordId: RID1, promptSha256: PSHA }));
+});
+
+test('F4: a replayed approval event for an older blob does not out-vote the owner\'s newer approval', () => {
+  const local = [rec(A, RID1, PSHA, '2026-10-19T10:00:00Z'), rec(B, RID2, PSHA2, '2026-10-19T11:00:00Z')];
+  const eA = approved(A, RID1, PSHA), eB = approved(B, RID2, PSHA2);
+  const replay = approved(A, RID1, PSHA); // newest comment id, old blob
+  assert.deepEqual(latestApproval([eA, eB, replay], BIND, local).blob, B);
+  assert.deepEqual(verdict({ events: [eA, eB, replay], readBlob: readAB, files: files1, localRecords: local }).ownerItems, []);
+  // the newest local record has no usable event yet: the replayed older approval is unverified, fail closed
+  const only = [rec(A, RID1, PSHA, '2026-10-19T10:00:00Z'), rec(B, RID2, PSHA2, '2026-10-19T11:00:00Z')];
+  assert.deepEqual(verdict({ events: [eA, replay], readBlob: readAB, files: files1, localRecords: only }).ownerItems, ['plan-scope unverified mac']);
+  // resume: the active proposal is B, approved by the newest record
+  const prop = (blob) => ev('plan-proposed', { blob, scopeDigest: SCOPE_D });
+  const fr = facts({ events: [prop(A), eA, prop(B), eB, replay], localRecords: local, readBlob: readAB });
+  assert.deepEqual([fr.approval, fr.active.blob], ['verified', B]);
+  // without any local record newer than the replay's own, the old blob still verifies (nothing to out-vote it)
+  assert.equal(facts({ events: [prop(A), eA], localRecords: [local[0]] }).approval, 'verified');
+});
+
+test('F7: a missing or non-array changed-file list is a lost verdict, even for a plan that is otherwise fine', () => {
+  const local = [rec(A, RID1, PSHA, '2026-10-19T10:00:00Z')];
+  for (const files of [undefined, null, 'src/a.mjs']) {
+    const v = verdict({ events: [approved(A, RID1, PSHA)], readBlob: readAB, files, localRecords: local });
+    assert.equal(v.ok, false);
+    assert.match(v.detail, /^lost: /);
+  }
+  assert.equal(verdict({ events: [approved(A, RID1, PSHA)], readBlob: readAB, files: files1, localRecords: local }).ok, true);
 });
