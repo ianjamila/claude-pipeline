@@ -14,6 +14,8 @@ ancestry re-walk, file-tool block; P3 a–j) → rev 4 (all folded in) → rev 5
 01a15213-80de-7d11-a002-0204cf9e1fa6. Review cap reached: no further review rounds on the spec; the code gets its
 own Codex review inside ship.
 
+Revision 2026-10-20: two false MISSes in report mode led to (a) read-only inspection no longer registering a lease (§1) and (b) a born-before C1 lease with a quiet owner transcript counting as RESTART, not MISS (§6, Known limits). Plan: docs/plans/2026-10-20-stack-false-miss-plan.md.
+
 ## Goal
 Private stacks stop by themselves once nobody needs them. Shared stacks are never touched. Nothing is deleted
 (`supabase stop` keeps the data volume; `supabase start --workdir X` restarts it with its data). Anything that cannot
@@ -95,6 +97,16 @@ column later.)
 - Registers the session for EVERY private stack the input names in any way (workdir resolved against the hook cwd and
   any `cd` in the text, folder name, project id, container name, published port; bare `supabase <cmd>` by upward
   `supabase/config.toml` search; file-tool paths inside the stack folder). Over-matching only adds leases.
+- **Read-only inspection is not use** (Revision 2026-10-20; live false MISSes, see docs/plans/2026-10-20-stack-false-miss-plan.md): looking at a
+  stack does not register it. `Read`, `Grep`, `Glob` never register (`Edit`/`Write`/`NotebookEdit` still do). A Bash command
+  registers nothing only when EVERY simple command in it is a `cd`/`pushd`/`popd` or a read-only inspection (at least one of
+  those): `ls cat head tail grep wc stat du df jq realpath readlink basename dirname pwd which cut tr diff cmp lsof ps pgrep`,
+  `rg` without `--pre`, `find` without `-exec/-delete/-fprint…`, `docker ps|inspect|logs|stats|top|port|images|events|version|info|diff`
+  and `docker container|image|volume|network|system ls|list|ps|inspect|logs|stats|top|port|diff|history|df|info|events`
+  (the FIRST word after `docker` decides; a leading flag is not read-only), with output redirected nowhere but `/dev/null`.
+  Anything that can run or write something — `$`, backticks, `<(`, `eval/exec/source/.`, `bash -c`, `xargs`, `env`, `sudo`,
+  `echo`/`printf`/`sed`/`awk`, an unparsable segment — keeps today's whole-command match (over-match stays the rule).
+  Consequence: the "just stopped automatically" block below never fires for a read-only inspection (`docker ps` of a stopped stack).
   `supabase start --workdir X` for a stack not running yet registers by folder; the lease applies once a container
   with that workdir label exists.
 - **Fail closed for required registration:** once the prefilter matched and the input targets (or may target) a
@@ -180,7 +192,23 @@ owner.json, dead-pid / never-finished reclaim serialized by a guard dir, live pi
   each sweep):
   - **MISS** (the safety signal): a lease, C2 connection or C3 reference within 2 h from a process whose birth is
     BEFORE the would-stop time — a live consumer the checks missed. Logged with pid, command, and which check missed it.
-  - **RESTART** (cost only, data kept): a new use within 2 h from a process born AFTER the would-stop time.
+  - **RESTART** (cost only, data kept): a new use within 2 h from a process born AFTER the would-stop time. Revision
+    2026-10-20: a born-before **C1 lease** is also a RESTART when its owner process provably did nothing with the stack before
+    the decision (the "alive but not yet using it" case: a session that starts or resumes while the old one exits). Proof,
+    all of it required (`evidence.ownerQuiet`, computed by the sweep from the owner's own session transcript and the lease
+    event's `session_id`): (1) no PRIOR SIGN: no other use (C1/C2/C3, ledger or observed) of the same project by the same
+    `{pid, birth}` at or before the decision; (2) the transcript `<projects>/<dir>/<session>.jsonl` exists once (none or several
+    ⇒ unknown) and holds a `SessionStart:startup|resume` hook line of that session in [birth − 5 s, birth + 120 s] as the FIRST
+    SessionStart line there (it may come after the decision; `:clear`/`:compact` first, or none ⇒ unknown: an earlier
+    transcript of the same process cannot be found); (3) from birth − 5 s to the decision, that file and its `subagents/*.jsonl`
+    hold only text, hook lines and tool calls of `Read`/`Grep`/`Glob`/`ToolSearch` or a read-only Bash (the rule above); any other
+    tool call (Bash, Edit, Write, Agent, Skill, MCP, …), any `<bash-input>` (`!` commands run without hooks) or a line that is not
+    valid JSON ⇒ active. Stack names are NOT matched: any unexplained activity counts. Active or unknown ⇒ MISS (fail closed);
+    C2/C3 uses are never reclassified. Provenance: the worker's C1 observation carries the lease's own time (`seenAt` = probe
+    time, `sessionId`), and an exact duplicate of a ledger lease is one use; a LEGACY worker observation (no `seenAt`, written
+    by the first worker version) is dropped as that same lease only while the ledger is provably complete over its span (read OK,
+    `ledger.bad.jsonl` absent, first ledger event not later than the earliest session-end would-stop of the project in the 2 h 10 min
+    before the observation), else it stays and is judged at its probe time. Report lines for such a RESTART say "transcript quiet".
   - **CLEAN**: no use within 2 h; stays CLEAN-after-N-days while unused.
     A use is charged to the newest would-stop record of the project not later than it, rolled up into that generation's single
     row (a long-lived generation is would-stopped again by every sweep). A session-end would-stop is CLEAN only when its worker
@@ -281,6 +309,11 @@ CLAUDE.md shared-stacks bullet gains one line only when a mode is switched to `a
   (each leaves a log line that says what was decided).
 
 ## Known limits
+- (Revision 2026-10-20) The quiet proof covers what the owner process ITSELF did through tool calls. A child or hook process it
+  started is a separate process judged by its own C2/C3/C1 uses; one that ended before the decision was not a live consumer.
+  A busy session that did unrelated non-read-only work (an Edit, an Agent call) between its birth and the decision stays a MISS,
+  even if that work never touched the stack: over-reporting is by design, the MISS count is a safety signal. Transcripts
+  must be readable under `transcriptDirs` (config); without them every born-before C1 lease stays a MISS.
 - Unregistered consumers that hold no connection, no env/cmdline reference and no cwd in a consumer worktree can be
   missed. Measure-first exists for this: near-misses show whether it happens before anything is stopped.
 - A session that crashed while its worktree's PR is open keeps its stack until that PR is merged/closed (condition 3).

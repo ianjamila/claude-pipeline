@@ -12,11 +12,18 @@
 // Outcomes. Every would-stop / stopped decision is reported once per container generation (project|generation id|StartedAt),
 // as ONE row: the first record names the row, later records of the same generation (later sweeps, later sessions) only move
 // `lastSeen`. A "use" is { t, project, pid, birth, command?, check? } -- a lease, a C2 connection or a C3 reference seen after
-// the decision, with the process identity read at observation. It is judged against the NEWEST stop record of that project that
+// the decision, with the process identity read at observation. A C1 use is the lease's own time `t` (ledger uses carry `ledger: true`
+// and the lease's `sessionId`; the session-end worker's observation carries `t` = the lease time, `seenAt` = its probe stamp and
+// `sessionId`), so the same lease read twice is one use (exact duplicates are dropped, the ledger copy kept); an older worker
+// observation (no `seenAt`: judged at its probe time, which can charge a lease to a later decision) is dropped only when the ledger
+// provably covers its span (`ledgerCoverage`). It is judged against the NEWEST stop record of that project that
 // is not later than the use (every record of a generation counts, not only the first: in report mode a private stack lives for
 // days and is would-stopped again and again), then rolled up into that record's generation row:
 //   - the use is from 0 to 2 h (both ends inclusive) after the decision, else it is not an outcome;
-//   - birth BEFORE the decision time => MISS (a live consumer the checks missed: the safety signal);
+//   - birth BEFORE the decision time => MISS (a live consumer the checks missed: the safety signal) -- except a C1 lease that is the
+//     owner's FIRST sign of the stack (no earlier use of the same pid + birth in any source) and whose own transcript proves it did
+//     nothing but read-only work from its birth to the decision (`use.quiet`, computed for exactly this decision by the sweep): the
+//     process was alive but had not used the stack yet, so stopping it was not a miss => RESTART, with a `why`;
 //   - birth at or after it => RESTART (cost only, the data was kept);
 //   - no usable birth (hidden client, process gone before ps could read it, unparsable time) => UNKNOWN (R2-9). An UNKNOWN
 //     could be a MISS, so it blocks the switch-on recommendation exactly like one: the headline reads "MISS 0 (+2 unknown
@@ -125,7 +132,8 @@ export function wouldStops(decisions) {
 
 // ---------------------------------------------------------------- outcomes
 
-// 'MISS' | 'RESTART' | 'UNKNOWN' | null. `use` = { t, pid, birth } (birth = epoch seconds). null = not an outcome of `rec`.
+// 'MISS' | 'RESTART' | 'UNKNOWN' | null. `use` = { t, pid, birth, check?, quiet?, priorSign? } (birth = epoch seconds). null = not an outcome of `rec`.
+// A born-before C1 use is RESTART only when `use.quiet` = { decision, verdict: 'quiet' } is for exactly `rec.t` and `priorSign` is not true.
 export function classifyUse(rec, use) {
   if (!isObject(rec) || !isObject(use)) return null;
   const decided = toMs(rec.t);
@@ -134,16 +142,86 @@ export function classifyUse(rec, use) {
   const dt = at - decided;
   if (dt < 0 || dt > WINDOW_MS) return null;
   if (typeof use.birth !== 'number' || !Number.isFinite(use.birth)) return 'UNKNOWN';
-  return use.birth * 1000 < decided ? 'MISS' : 'RESTART';
+  if (use.birth * 1000 >= decided) return 'RESTART';
+  const q = use.quiet;
+  return use.check === 'C1' && isObject(q) && q.decision === rec.t && q.verdict === 'quiet' && use.priorSign !== true ? 'RESTART' : 'MISS';
 }
 
 const RANK = { MISS: 3, UNKNOWN: 2, RESTART: 1 };
 
+const SPAN_MS = WINDOW_MS + 10 * 60_000; // the worker's whole observation span (+120 min probe plus its grace)
+const ownerKey = (u) => (Number.isFinite(u?.pid) && Number.isFinite(u?.birth) ? `${lower(u.project)}|${u.pid}|${u.birth}` : null);
+
+// The uses an outcome is judged on, each with its target decision and prior sign: [{ use, target, priorSign }] (uses with no
+// target decision are left out). Shared by outcomeSummary and quietCandidates so both see the same set.
+//  (i) exact C1 duplicates (same project, pid, birth, t) are one use, the ledger copy preferred;
+//  (ii) a legacy worker C1 observation O (no `ledger`, no `seenAt`) is dropped when `ledgerCoverage` = { ok: true, repaired: false,
+//       firstT } shows the ledger complete over its span (some session-end stop record of its project lies in [t - 2 h 10 min, t) and
+//       the earliest of them is not older than the ledger's first event) AND the uses hold a LEDGER C1 use of the same project, pid
+//       and birth, timed after that earliest stop record and not after O.t (the lease O stands for is in this snapshot; a ledger
+//       read before the lease arrived must not erase the only sign of it). Otherwise it stays;
+//  (iii) priorSign: any OTHER use of the same project + pid + birth (finite) at or before the target decision.
+function judgedUses(stops, uses, ledgerCoverage) {
+  const firstMs = ledgerCoverage?.ok === true && ledgerCoverage.repaired === false ? toMs(ledgerCoverage.firstT) : NaN;
+  const sessionStops = stops.filter((r) => r.source === 'session-end');
+  const kept = [];
+  const at = new Map(); // duplicate key -> index in kept
+  for (const use of uses ?? []) {
+    if (!isObject(use)) continue;
+    const owner = use.check === 'C1' ? ownerKey(use) : null;
+    const dupKey = owner !== null && Number.isFinite(toMs(use.t)) ? `${owner}|${toMs(use.t)}` : null;
+    if (dupKey !== null && at.has(dupKey)) {
+      if (use.ledger && !kept[at.get(dupKey)].ledger) kept[at.get(dupKey)] = use;
+      continue;
+    }
+    if (dupKey !== null) at.set(dupKey, kept.length);
+    kept.push(use);
+  }
+  const live = kept.filter((use) => {
+    if (use.check !== 'C1' || use.ledger || use.seenAt || !Number.isFinite(firstMs)) return true;
+    const ut = toMs(use.t);
+    if (!Number.isFinite(ut)) return true;
+    const mine = sessionStops.filter((r) => lower(r.project) === lower(use.project) && toMs(r.t) >= ut - SPAN_MS && toMs(r.t) < ut);
+    if (mine.length === 0) return true;
+    const earliest = Math.min(...mine.map((r) => toMs(r.t)));
+    if (!(earliest >= firstMs)) return true;
+    const k = ownerKey(use);
+    const vouched = k !== null && kept.some((l) => l.ledger && l.check === 'C1' && ownerKey(l) === k && toMs(l.t) > earliest && toMs(l.t) <= ut);
+    return !vouched;
+  });
+  const byOwner = new Map(); // owner key -> [{ use, ms }]
+  for (const use of live) {
+    const k = ownerKey(use);
+    if (k !== null && Number.isFinite(toMs(use.t))) byOwner.set(k, [...(byOwner.get(k) ?? []), { use, ms: toMs(use.t) }]);
+  }
+  const out = [];
+  for (const use of live) {
+    const target = newestStopAt(stops, use.project, toMs(use.t));
+    if (!target) continue;
+    const k = ownerKey(use);
+    const priorSign = k !== null && (byOwner.get(k) ?? []).some((o) => o.use !== use && o.ms <= toMs(target.t));
+    out.push({ use, target, priorSign });
+  }
+  return out;
+}
+
+// -> [{ use, decision }]: the C1 uses that are MISS only because no quiet proof is attached (in the window, born before the
+// decision, no prior sign, no proof yet for this decision, a session id and a finite pid + birth): the ones whose owner transcript the sweep must read. Several uses
+// of one owner share a decision (and so a proof): the caller computes one proof per (owner, decision).
+export function quietCandidates(decisions, uses, { ledgerCoverage } = {}) {
+  const out = [];
+  for (const { use, target, priorSign } of judgedUses(stopRecords(decisions), uses, ledgerCoverage)) {
+    if (use.check !== 'C1' || priorSign || (isObject(use.quiet) && use.quiet.decision === target.t) || typeof use.sessionId !== 'string' || use.sessionId === '' || ownerKey(use) === null) continue;
+    if (classifyUse(target, { ...use, priorSign }) === 'MISS') out.push({ use, decision: target });
+  }
+  return out;
+}
+
 // -> { miss, restart, unknown, clean, pending, gbFreed, rows } over the generations whose newest would-stop is from the last 7 days.
-// `uses` = [{ t, project, pid, birth, command?, check? }]; each use is judged against the newest would-stop record of its project
+// `uses` = [{ t, project, pid, birth, command?, check?, quiet?, sessionId?, ledger?, seenAt? }]; each use is judged against the newest would-stop record of its project
 // that is not later than the use (the use of an older generation is not charged to a newer one) and rolled up into that record's
 // generation row. rows are in decision order, one per generation.
-export function outcomeSummary(decisions, uses, now = Date.now()) {
+export function outcomeSummary(decisions, uses, now = Date.now(), { ledgerCoverage } = {}) {
   const nowMs = toMs(now);
   const stops = stopRecords(decisions);
   const rowOf = new Map(); // generation key -> { rec (first record) + lastSeen, newest (newest record) }
@@ -165,14 +243,13 @@ export function outcomeSummary(decisions, uses, now = Date.now()) {
     marks.get(key).push({ action: rec.action, ms: toMs(rec.t), decidedMs: rec.decidedAt === undefined || rec.decidedAt === null ? null : toMs(rec.decidedAt) });
   }
   const hits = new Map(); // generation key -> [{ ...use, class, against }]
-  for (const use of uses ?? []) {
-    const target = newestStopAt(stops, use?.project, toMs(use?.t));
-    if (!target) continue;
-    const cls = classifyUse(target, use);
+  for (const { use, target, priorSign } of judgedUses(stops, uses, ledgerCoverage)) {
+    const cls = classifyUse(target, { ...use, priorSign });
     if (!cls) continue;
     const key = generationKey(target);
     if (!hits.has(key)) hits.set(key, []);
-    hits.get(key).push({ ...use, class: cls, against: target.t });
+    const byQuiet = cls === 'RESTART' && use.check === 'C1' && use.birth * 1000 < toMs(target.t);
+    hits.get(key).push({ ...use, class: cls, against: target.t, ...(byQuiet ? { why: 'born before the would-stop, first use after it (transcript quiet)' } : {}) });
   }
   const sum = { miss: 0, restart: 0, unknown: 0, clean: 0, pending: 0, gbFreed: 0, rows: [] };
   let bytes = 0;
@@ -271,7 +348,7 @@ const missHeadline = (s) => (s.unknown > 0 ? `MISS ${s.miss} (+${s.unknown} unkn
 function useLine(row, u) {
   const who = u.pid === null || u.pid === undefined ? 'hidden client' : `pid ${u.pid}${u.command ? ` (${oneLine(u.command, 80)})` : ''}`;
   const born = typeof u.birth === 'number' && Number.isFinite(u.birth) ? `born ${when(u.birth * 1000)}` : 'birth unknown';
-  return `- ${oneLine(row.project)} — would-stop ${u.against ?? row.t} — ${who}, ${born}, seen ${u.t}${u.check ? `, missed by the ${oneLine(u.check, 40)} check` : ''}`;
+  return `- ${oneLine(row.project)} — would-stop ${u.against ?? row.t} — ${who}, ${born}, seen ${u.t}${u.check ? `, missed by the ${oneLine(u.check, 40)} check` : ''}${u.why ? ` — ${oneLine(u.why, 120)}` : ''}`;
 }
 
 function outcomeSection(title, rows, cls, none) {
@@ -305,12 +382,12 @@ function switchOn(s) {
 }
 
 // state = { now, decisions, uses, config?: 'ok'|'missing'|'invalid', paused?, modes?, hooks?: [{ file, problem }],
-//           ledger?: { ok, reason }, listed?: [{ project, verdict, reasons, hidden? }], dev?: [...], reportPath? }
+//           ledger?: { ok, reason }, ledgerCoverage?: { ok, repaired, firstT }, listed?: [{ project, verdict, reasons, hidden? }], dev?: [...], reportPath? }
 // Sections in the spec's order: alerts, MISS, RESTART, CLEAN, GB freed; dangling hook files; damaged ledger; listed stacks;
 // dev servers.
 export function renderReport(state = {}) {
   const now = toMs(state.now ?? Date.now());
-  const s = outcomeSummary(state.decisions, state.uses, now);
+  const s = outcomeSummary(state.decisions, state.uses, now, { ledgerCoverage: state.ledgerCoverage });
   const head = [
     ...alertLines(state.decisions, null),
     ...(state.config && state.config !== 'ok' ? [`- NOT CONFIGURED (config.json ${state.config}): nothing is assessed or stopped; registration only records`] : []),
@@ -346,7 +423,7 @@ export function renderReport(state = {}) {
 // The section for the weekly worktree report (no top heading: the report's include supplies it). Last 7 days only.
 export function renderWeekly(state = {}) {
   const now = toMs(state.now ?? Date.now());
-  const s = outcomeSummary(state.decisions, state.uses, now);
+  const s = outcomeSummary(state.decisions, state.uses, now, { ledgerCoverage: state.ledgerCoverage });
   const stopped = s.rows.filter((r) => r.action === 'stopped').length;
   const orphans = (state.dev ?? []).filter((d) => d.verdict === 'orphan candidate');
   const alerts = alertLines(state.decisions, now - WEEK_MS);

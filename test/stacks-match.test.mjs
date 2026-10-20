@@ -5,7 +5,7 @@
 // ubuntu AND windows), and a prefilter that does string work only. exists / realpath / readFile are an in-memory fake fs.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { DEV_RE, devTargets, prefilter, cwdChain, stackTargets, isStartCommand, readProjectId } from '../pipeline/lib/stacks/match.mjs';
+import { DEV_RE, devTargets, prefilter, cwdChain, stackTargets, isStartCommand, readProjectId, readOnlyCommand } from '../pipeline/lib/stacks/match.mjs';
 
 const posixOnly = { skip: process.platform === 'win32' && 'POSIX only' };
 const posixKey = (p) => String(p).replace(/\\/g, '/');
@@ -88,7 +88,7 @@ test('space-in-path stack: --workdir resolves to the stack folder with its space
 
 test('space-in-path stack: an unquoted/backslash-escaped path and a plain mention still name it', () => {
   assert.deepEqual(projects(targets('supabase status --workdir ../sub\\ detach.stack', '/w/.worktrees/x')), ['sub-detach']);
-  assert.deepEqual(projects(targets('ls "/w/.worktrees/sub detach.stack/supabase"', '/')), ['sub-detach']);
+  assert.deepEqual(projects(targets('cp -r "/w/.worktrees/sub detach.stack/supabase" /tmp/x', '/')), ['sub-detach']);
 });
 
 test('--workdir=X form, and a workdir resolved through a symlink', () => {
@@ -125,9 +125,9 @@ test('a segment with --workdir does not also search upward from the cwd', () => 
 });
 
 test('inventory matches by folder, project, container and port, with their via', () => {
-  assert.deepEqual(targets('ls ../sa-corrections.stack', '/x'), [{ project: 'sa-corrections', folder: 'sa-corrections.stack', workdir: '/w/.worktrees/sa-corrections.stack', via: 'folder' }]);
+  assert.deepEqual(targets('cp -r ../sa-corrections.stack /tmp/x', '/x'), [{ project: 'sa-corrections', folder: 'sa-corrections.stack', workdir: '/w/.worktrees/sa-corrections.stack', via: 'folder' }]);
   assert.equal(targets('echo sa-corrections', '/x')[0].via, 'project');
-  assert.equal(targets('docker logs supabase_kong_sa-corrections', '/x')[0].via, 'container');
+  assert.equal(targets('docker restart supabase_kong_sa-corrections', '/x')[0].via, 'container');
   assert.equal(targets('psql -h localhost -p 54422 -c "select 1"', '/x')[0].via, 'port');
   assert.equal(targets('curl http://localhost:54521/rest/v1/', '/x')[0].project, 'sub-detach');
   assert.equal(targets('PGPORT=54422 psql', '/x')[0].via, 'port');
@@ -190,30 +190,119 @@ test('a throwing exists / realpath / readFile never throws out and never drops a
 // ---- file tools ----
 const fileTargets = (tool, input, cwd = '/w/x') => stackTargets({ tool, input, cwd, inventory, ...base, platform: 'linux' });
 
-test('Read / Edit / Write / NotebookEdit of a path inside a stack folder', () => {
-  assert.deepEqual(projects(fileTargets('Read', { file_path: '/w/.worktrees/sa-corrections.stack/supabase/config.toml' })), ['sa-corrections']);
-  assert.equal(fileTargets('Read', { file_path: '/w/.worktrees/sa-corrections.stack/supabase/config.toml' })[0].via, 'path');
+test('Edit / Write / NotebookEdit of a path inside a stack folder', () => {
+  assert.equal(fileTargets('Edit', { file_path: '/w/.worktrees/sa-corrections.stack/supabase/config.toml' })[0].via, 'path');
   assert.deepEqual(projects(fileTargets('Edit', { file_path: '/w/.worktrees/sub detach.stack/.env' })), ['sub-detach']);
   assert.deepEqual(projects(fileTargets('Write', { file_path: '../sa-corrections.stack/x.sql' }, '/w/.worktrees/x')), ['sa-corrections']);
   assert.deepEqual(projects(fileTargets('NotebookEdit', { notebook_path: '/w/.worktrees/sa-corrections.stack/n.ipynb' })), ['sa-corrections']);
 });
 
-test('Grep / Glob: path, and the literal prefix of a glob pattern', () => {
-  assert.deepEqual(projects(fileTargets('Grep', { pattern: 'x', path: '/w/.worktrees/sa-corrections.stack' })), ['sa-corrections']);
-  assert.deepEqual(projects(fileTargets('Glob', { pattern: '/w/.worktrees/sub detach.stack/**/*.sql' })), ['sub-detach']);
-  assert.deepEqual(fileTargets('Grep', { pattern: 'sa-corrections' }), []); // the search text is not a path
+test('Read / Grep / Glob are read-only inspection: they name no stack, even inside a stack folder', () => {
+  assert.deepEqual(fileTargets('Read', { file_path: '/w/.worktrees/sa-corrections.stack/supabase/config.toml' }), []);
+  assert.deepEqual(fileTargets('Grep', { pattern: 'x', path: '/w/.worktrees/sa-corrections.stack' }), []);
+  assert.deepEqual(fileTargets('Glob', { pattern: '/w/.worktrees/sub detach.stack/**/*.sql' }), []);
+  assert.deepEqual(fileTargets('Grep', { pattern: 'sa-corrections' }), []);
+});
+
+test('Write / Edit: a path inside the folder, and a relative path through the folder name', () => {
+  assert.deepEqual(projects(fileTargets('Write', { file_path: '/w/.worktrees/sa-corrections.stack/supabase/x.sql' })), ['sa-corrections']);
+  const t = fileTargets('Edit', { file_path: 'sub detach.stack/.env' }, '/elsewhere');
+  assert.deepEqual(t, [{ project: 'sub-detach', folder: 'sub detach.stack', workdir: '/w/.worktrees/sub detach.stack', via: 'folder' }]);
 });
 
 test('a path outside every stack folder is not a target, nor is a sibling that shares a prefix', () => {
-  assert.deepEqual(fileTargets('Read', { file_path: '/w/.worktrees/other/README.md' }), []);
-  assert.deepEqual(fileTargets('Read', { file_path: '/w/.worktrees/sa-corrections.stack-old/x' }), []);
+  assert.deepEqual(fileTargets('Edit', { file_path: '/w/.worktrees/other/README.md' }), []);
+  assert.deepEqual(fileTargets('Edit', { file_path: '/w/.worktrees/sa-corrections.stack-old/x' }), []);
 });
 
 test('a symlinked path into a stack folder resolves to it', () => {
   const fs2 = fakeFs({ files: { '/real/sa.stack/supabase/config.toml': cfgToml('sa-corrections') }, links: { '/w/alias': '/real/sa.stack' } });
   const inv = { stacks: [stack('sa-corrections', '/real/sa.stack', [54421])] };
-  const t = stackTargets({ tool: 'Read', input: { file_path: '/w/alias' }, cwd: '/w', inventory: inv, ...fs2, platform: 'linux' });
+  const t = stackTargets({ tool: 'Write', input: { file_path: '/w/alias' }, cwd: '/w', inventory: inv, ...fs2, platform: 'linux' });
   assert.deepEqual(projects(t), ['sa-corrections']);
+});
+
+// ---- read-only inspection is not use ----
+const readOnlyTable = [
+  ['docker ps --filter name=sa-corrections', '/x'],
+  ['docker inspect supabase_db_sa-corrections', '/x'],
+  ['docker logs supabase_kong_sa-corrections', '/x'],
+  ['docker container ls --filter label=x=sa-corrections', '/x'],
+  ['grep -n x ../sa-corrections.stack/supabase/config.toml', '/w/.worktrees/x'],
+  ['ls ../sa-corrections.stack', '/w/.worktrees/x'],
+  ['cat ../sa-corrections.stack/supabase/config.toml | head -3', '/w/.worktrees/x'],
+  ['lsof -i :54422', '/x'],
+  ['ps aux | grep sa-corrections', '/x'],
+  ['cd ../sa-corrections.stack && ls', '/w/.worktrees/x'],
+  ['docker ps 2>/dev/null | grep sa-corrections', '/x'],
+  ['find ../sa-corrections.stack -name x', '/w/.worktrees/x'],
+];
+for (const [command, cwd] of readOnlyTable) {
+  test(`read-only: ${command.slice(0, 70)} names no stack`, () => {
+    assert.deepEqual(targets(command, cwd), []);
+  });
+}
+
+const stillUseTable = [
+  'docker exec supabase_db_sa-corrections psql',
+  'docker restart supabase_kong_sa-corrections',
+  'ls ../sa-corrections.stack > out.txt',
+  'cat x | psql -p 54422',
+  'find ../sa-corrections.stack -delete',
+  'rg --pre x sa-corrections',
+  'echo sa-corrections | xargs echo',
+  'bash -c "docker ps --filter name=sa-corrections"',
+  'cd ../sa-corrections.stack && supabase status',
+  'docker --context x ps sa-corrections',
+  'sed -n 1p ../sa-corrections.stack/x',
+  'cat "$(psql -p 54422 -c \'select 1\')"',
+  'ls "`echo sa-corrections`"',
+  'X="$(psql -p 54422)" ls',
+  'grep x <(psql -p 54422)',
+  'ls ${D:-../sa-corrections.stack}',
+  'find ../sa-corrections.stack $FIND_ACTION',
+  'ls $HOME/sa-corrections',
+];
+for (const command of stillUseTable) {
+  test(`still a use: ${command.slice(0, 70)}`, () => {
+    assert.deepEqual(projects(targets(command, '/w/.worktrees/x')), ['sa-corrections']);
+  });
+}
+
+test('readOnlyCommand: inspections, neutral commands and /dev/null redirections are read-only', () => {
+  for (const c of ['ls', 'ls -la /tmp', 'cd /a && ls', 'pushd /a; cat f', 'cat a | head -3 | wc -l', 'FOO=1 ls', 'docker ps', 'docker container ls', 'docker system df', 'docker volume ls', 'rg x .', 'find . -name x -type f',
+    'ls >/dev/null', 'ls 2>/dev/null', 'ls &>/dev/null', 'ls >>/dev/null', 'ls > /dev/null', 'ls 2> /dev/null', 'ls 2>&1', 'ls >&2', 'docker ps 2>&1 | grep x', 'jq . f', 'ps aux']) {
+    assert.equal(readOnlyCommand(c, 'linux'), true, c);
+  }
+});
+
+test('readOnlyCommand: anything else, or nothing to inspect, is not read-only', () => {
+  const no = ['', 'cd /a', 'cd /a && cd /b', 'FOO=1', 'echo hi', 'printf x', 'ls && git status', 'ls; supabase status', 'ls | xargs rm', 'env ls', 'sudo ls', 'timeout 5 ls', 'watch ls', 'bash -c "ls"', 'sh -c ls', 'zsh -c ls',
+    'sed -n 1p f', 'awk 1 f', 'sort f', 'uniq f', 'tree .', 'curl localhost', 'psql -p 1', 'node a.js', 'npm test', 'supabase status',
+    'docker exec x ls', 'docker cp a b', 'docker start x', 'docker stop x', 'docker rm x', 'docker run x', 'docker compose ps', 'docker --context x ps', 'docker -H x ps', 'docker', 'docker container rm x', 'docker system prune',
+    'rg --pre x y', 'rg --pre=x y', 'find . -exec ls {} +', 'find . -execdir ls {} +', 'find . -ok ls {} ;', 'find . -okdir ls {} ;', 'find . -delete', 'find . -fprint f', 'find . -fprint0 f', 'find . -fprintf f x', 'find . -fls f',
+    'ls > out.txt', 'ls >out.txt', 'ls >> out.txt', 'ls 2>err.txt', 'ls &>out', 'ls > /dev/nullx', 'ls >/dev/null/x', 'ls 2>', 'cat f > /dev/null > g',
+    'ls $X', 'ls "$X"', 'ls $(pwd)', 'ls `pwd`', 'ls <(pwd)', 'ls >(cat)', 'ls ${X}', 'eval ls', 'exec ls', 'source f', '. f', 'ls; . f', 'echo ok; ls', 'ls "unterminated', 'ls $', 'ls \$'];
+  for (const c of no) assert.equal(readOnlyCommand(c, 'linux'), false, c);
+  for (const v of [undefined, null, 5, {}]) assert.equal(readOnlyCommand(v, 'linux'), false);
+});
+
+test('readOnlyCommand: rg --hostname-bin runs a program, so it is not read-only (either form)', () => {
+  assert.equal(readOnlyCommand('rg --hostname-bin=../demo.stack/q --hyperlink-format=x foo', 'linux'), false);
+  assert.equal(readOnlyCommand('rg --hostname-bin ../q --hyperlink-format=x foo', 'linux'), false);
+  assert.equal(readOnlyCommand('rg --hyperlink-format=x foo', 'linux'), true);
+});
+
+test('readOnlyCommand: a backslash-newline line continuation can hide a flag, so it is not read-only', () => {
+  assert.equal(readOnlyCommand('find x.stack -ex\\\nec rm {} ;', 'linux'), false);
+  assert.equal(readOnlyCommand('rg --p\\\nre=x foo', 'linux'), false);
+  assert.equal(readOnlyCommand('rg --p\\\r\nre=x foo', 'linux'), false);
+  assert.equal(readOnlyCommand('ls \\\n-la', 'linux'), false);
+});
+
+test('readOnlyCommand: the platform is injected (a Windows-style path parses without throwing)', () => {
+  assert.equal(readOnlyCommand('ls C:\\w\\x.stack', 'win32'), true);
+  assert.equal(readOnlyCommand('cd C:\\w && cat a.txt', 'win32'), true);
 });
 
 // ---- devTargets / DEV_RE ----
@@ -323,14 +412,14 @@ test('win32: backslash paths are resolved and compared without crashing', () => 
   assert.deepEqual(projects(run('supabase status', 'C:\\w\\.worktrees\\e2e-wt\\app')), ['e2e-ci']);
   assert.deepEqual(projects(run('cd C:\\w\\.worktrees\\e2e-wt && supabase status', 'C:\\')), ['e2e-ci']);
   assert.deepEqual(cwdChain('cd ..\\y', 'C:\\w\\x', { platform: 'win32' }), ['C:\\w\\x', 'C:/w/y']);
-  const t = stackTargets({ tool: 'Read', input: { file_path: 'C:\\w\\.worktrees\\sa-corrections.stack\\supabase\\config.toml' }, cwd: 'C:\\', inventory: winInv, ...wfs, platform: 'win32' });
+  const t = stackTargets({ tool: 'Edit', input: { file_path: 'C:\\w\\.worktrees\\sa-corrections.stack\\supabase\\config.toml' }, cwd: 'C:\\', inventory: winInv, ...wfs, platform: 'win32' });
   assert.deepEqual(projects(t), ['sa-corrections']);
   assert.equal(prefilter({ tool: 'Read', input: { file_path: 'C:\\w\\x.stack\\a' }, inventory: winInv, platform: 'win32' }), true);
   assert.equal(prefilter({ tool: 'Read', input: { file_path: 'C:\\w\\.worktrees\\sa-corrections.stack\\a' }, inventory: winInv, platform: 'win32' }), true);
 });
 
 test('win32 vs POSIX: case differences match only where the platform ignores case', posixOnly, () => {
-  const t = stackTargets({ tool: 'Read', input: { file_path: '/W/.worktrees/sa-corrections.stack/a' }, cwd: '/', inventory, ...base, platform: 'linux' });
+  const t = stackTargets({ tool: 'Edit', input: { file_path: '/W/.worktrees/sa-corrections.stack/a' }, cwd: '/', inventory, ...base, platform: 'linux' });
   // linux is case-sensitive for paths: the folder segment still names the stack, the path comparison alone does not
   assert.deepEqual(projects(t), ['sa-corrections']);
 });
