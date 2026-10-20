@@ -42,11 +42,12 @@ const git = (command, fsOpts, o = {}) => evaluateGitCommand(command, {
 const files = (command, fsOpts, o = {}) => evaluateBashForFiles(command, {
   home: '/home/u', env: {}, platform: 'linux', realpath: (p) => p, cwd: PROJ, ...fsOpts, existsSync: fsOpts.pathExists, ...o,
 });
-function both(command, spec, dirs = ['scripts']) {
+// `o.git` / `o.files` add options (e.g. an injected clock) to that guard's call.
+function both(command, spec, dirs = ['scripts'], o = {}) {
   const mk = (bad, ok) => Object.fromEntries(Object.entries(spec).map(([k, v]) => [k, v === 'bad' ? bad : v === 'ok' ? ok : v]));
   return {
-    git: git(command, fakeFs(GIT_ROOT, mk(BAD_GIT, 'git status'), dirs)),
-    files: files(command, fakeFs(PROJ, mk(BAD_FILES, 'echo hi'), dirs)),
+    git: git(command, fakeFs(GIT_ROOT, mk(BAD_GIT, 'git status'), dirs), o.git),
+    files: files(command, fakeFs(PROJ, mk(BAD_FILES, 'echo hi'), dirs), o.files),
   };
 }
 // run.sh / run2.sh / scripts/run2.sh hold the guarded command; ok.sh / run1.sh / scripts/run1.sh are harmless
@@ -214,13 +215,11 @@ const B6_STEPS = {
 const b6Shape = { assign: (n) => 'a=${a}'.repeat(n * 5), defaults: (n) => '${U:-' + 'x'.repeat(n * 9) + '}' };
 for (const shape of ['assign', 'defaults']) {
   test(`B6 ${shape === 'assign' ? '7,500 self-assignments' : 'a 13,500-character default'}: clock reads follow the line length, in both guards`, () => {
-    const mk = (bad, ok) => Object.fromEntries(Object.entries(SPEC).map(([k, v]) => [k, v === 'bad' ? bad : v === 'ok' ? ok : v]));
     const run = (n) => {
       const line = b6Shape[shape](n);
       const g = virtualClock(5000 / (2 * B6_STEPS[shape].git.ceil));
       const f = virtualClock(5000 / (2 * B6_STEPS[shape].files.ceil));
-      const rg = git(line, fakeFs(GIT_ROOT, mk(BAD_GIT, 'git status'), ['scripts']), { now: g.now });
-      const rf = files(line, fakeFs(PROJ, mk(BAD_FILES, 'echo hi'), ['scripts']), { now: f.now });
+      const { git: rg, files: rf } = both(line, SPEC, ['scripts'], { git: { now: g.now }, files: { now: f.now } });
       for (const r of [rg, rf]) assert.doesNotMatch(r.reason ?? '', /took too long|too complex/);
       return { rg, rf, g: g.reads, f: f.reads };
     };
@@ -229,6 +228,7 @@ for (const shape of ['assign', 'defaults']) {
     // (the self-assignments end in the files guard's expansion cap, which refuses them; the git guard judges the whole line)
     assert.equal(full.rg.decision, 'allow');
     assert.equal(full.rf.decision, shape === 'assign' ? 'deny' : 'allow');
+    if (shape === 'assign') assert.match(full.rf.reason, /variables expand to more text than can be checked/);
     assertLinearSteps(half.g, full.g, `B6 ${shape} (git)`);
     assertLinearSteps(half.f, full.f, `B6 ${shape} (files)`);
     assertSteps(full.g, { ...B6_STEPS[shape].git, label: `B6 ${shape} (git) at n = 1500` });
