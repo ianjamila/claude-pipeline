@@ -26,6 +26,7 @@ const HOOK = join(here, '..', 'pipeline', 'hooks', 'stack-register.mjs');
 const FAKE_DOCKER = join(here, 'fixtures', 'fake-docker-bin.mjs');
 const FAKE_PS = join(here, 'fixtures', 'fake-ps-bin.mjs');
 const SPY = join(here, 'fixtures', 'fs-spy-preload.mjs');
+const CPU_PROBE = join(here, 'fixtures', 'cpu-probe-preload.mjs');
 const HOLD = join(here, 'fixtures', 'hold-lock.mjs');
 const LSTART = 'Mon Oct 19 02:47:17 2026';
 const OWNER = { pid: 4242, birth: 1000 };
@@ -691,17 +692,25 @@ test('e2e Review Focus 3: a 100 000-line ledger is never read; unrelated and mat
   const x = e2e();
   bigLedger(x.w.files.ledger);
   const spyLog = join(x.dir, 'spy.log');
-  const opts = { nodeArgs: ['--import', SPY], extraEnv: { FS_SPY_LOG: spyLog } };
-  const unrelated = x.hook(bash('git status', x.w.base), opts);
+  // The child's own CPU time (user + system at exit, written by CPU_PROBE), not the clock: a busy machine (load 70+) failed the wall-clock form twice.
+  const run = (name, command) => {
+    const cpuLog = join(x.dir, `cpu-${name}.log`);
+    const r = x.hook(bash(command, x.w.base), { nodeArgs: ['--import', SPY, '--import', CPU_PROBE], extraEnv: { FS_SPY_LOG: spyLog, CPU_PROBE_LOG: cpuLog } });
+    return { ...r, cpu: Number(readFileSync(cpuLog, 'utf8')) };
+  };
+  const matchingCommand = `supabase status --workdir ${x.sa.workdir}`;
+  const unrelated = run('unrelated', 'git status');
   assert.equal(unrelated.status, 0, unrelated.stderr);
-  const first = x.hook(bash(`supabase status --workdir ${x.sa.workdir}`, x.w.base), opts); // refreshes the cache through the fake docker
-  const matching = x.hook(bash(`supabase status --workdir ${x.sa.workdir}`, x.w.base), opts); // cache hit: the steady state
+  const first = run('first', matchingCommand); // refreshes the cache through the fake docker
+  const matching = run('matching', matchingCommand); // cache hit: the steady state
   assert.equal(first.status, 0, first.stderr);
   assert.equal(matching.status, 0, matching.stderr);
-  console.log(`# e2e, 100k-line ledger (whole process incl. node start): unrelated ${unrelated.ms.toFixed(0)} ms, matching (cache refresh) ${first.ms.toFixed(0)} ms, matching (cache hit) ${matching.ms.toFixed(0)} ms`);
-  assert.ok(unrelated.ms < 1000, `unrelated took ${unrelated.ms} ms`);
-  assert.ok(matching.ms < 1000, `matching took ${matching.ms} ms`);
-  assert.ok(first.ms < 1000, `matching with a refresh took ${first.ms} ms`);
+  const both = (r) => `${r.cpu.toFixed(0)} ms CPU (${r.ms.toFixed(0)} ms clock)`;
+  console.log(`# e2e, 100k-line ledger (whole process incl. node start): unrelated ${both(unrelated)}, matching (cache refresh) ${both(first)}, matching (cache hit) ${both(matching)}`);
+  for (const [what, r] of [['unrelated', unrelated], ['matching', matching], ['matching with a refresh', first]]) {
+    assert.ok(Number.isFinite(r.cpu) && r.cpu > 0, `${what}: no CPU reading from the child`);
+    assert.ok(r.cpu < 1000, `${what} took ${r.cpu} ms of CPU (${r.ms} ms of clock)`);
+  }
   const ops = readFileSync(spyLog, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
   const onLedger = ops.filter((o) => o.file === x.w.files.ledger);
   assert.ok(onLedger.every((o) => o.op === 'openSync' && o.flags === 'a'), `ledger opened other than for append: ${JSON.stringify(onLedger)}`);
