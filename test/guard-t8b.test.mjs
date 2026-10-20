@@ -82,7 +82,10 @@ for (const [name, unit] of Object.entries(SHAPES)) {
 }
 // ---- a word with a default (`${A:-w}`) after a command that can take options: the word is looked at once, not once per `${a[` ----------------------------------------------------------------------
 const OLD_DEFAULTED_WORD = /\$\{!?(?:[A-Za-z_]\w*(?:\[[^\]}]*\])?|\d+|[@*#?$!-]):?[-=+]/; // (what shell-parse.mjs tested before isDefaultedWord: unbounded subscript, ~5 s of CPU on a 200 kB word)
-test('H2 a long word of unclosed subscripts after a command that can take options is answered in under 1 s of CPU time by each guard (allow or deny, never a throw)', () => {
+// Why: the Windows CI runner is ~3-4x slower than a Mac (the worst shape: 0.33 s on the Mac, 1.08 s on Windows); 4 s there is still far below
+// the old pattern's ~20 s on that runner (5.2 s on the Mac) and below the guard's 5 s deadline.
+const SUBSCRIPT_CAP_MS = process.platform === 'win32' ? 4000 : 1000;
+test(`H2 a long word of unclosed subscripts after a command that can take options is answered in under ${SUBSCRIPT_CAP_MS} ms of CPU time by each guard (allow or deny, never a throw)`, () => {
   const prefixes = ['bash ', 'source ', 'node ', 'find . '];
   const units = ['${a[', '${a[x', '${a[${b[', '${!a[', '${a[1]:-${a[', '${a[]'];
   for (const prefix of prefixes) {
@@ -94,7 +97,7 @@ test('H2 a long word of unclosed subscripts after a command that can take option
         const r = run();
         const ms = cpu() - t0;
         assert.ok(r.decision === 'allow' || r.decision === 'deny', `${who}: ${r.decision}`);
-        assert.ok(ms < 1000, `${who}: ${Math.round(ms)} ms of CPU for ${prefix}${unit}...`); // (~0.2 s locally on the worst shape)
+        assert.ok(ms < SUBSCRIPT_CAP_MS, `${who}: ${Math.round(ms)} ms of CPU for ${prefix}${unit}...`); // (~0.2-0.33 s on a Mac on the worst shape)
       }
     }
   }
