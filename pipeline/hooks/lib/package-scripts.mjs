@@ -370,6 +370,8 @@ function managerWrites(argv) {
   return head.some((w) => PM_CHANGE_WORDS.has(w)) || (head.some((w) => w === 'config' || w === 'c') && head.some((w) => CONFIG_WRITE_WORDS.has(w))) || (name === 'yarn' && head[0] === 'set');
 }
 
+// `D:foo`: a drive and no slash, relative to the working directory of that drive (Windows only)
+const driveRelative = (w) => /^[A-Za-z]:(?![/\\:\s])/.test(String(w));
 // Where a word names, from each directory the command may run in: string[] (a glob stays in the text when allowGlob), or null (only known at run time).
 const UNKNOWN_HEAD = '\u0000?/';
 function placeWord(site, dirs, w, allowGlob) {
@@ -383,6 +385,7 @@ function placeWord(site, dirs, w, allowGlob) {
     if (last >= 0 && last < parts.length - 1 && parts.slice(last + 1).every((x) => x && !/[$`]/.test(x))) return [UNKNOWN_HEAD + parts.slice(last + 1).join('/')];
   }
   if (/[$`]/.test(t) || (!allowGlob && /[*?[\]]/.test(t)) || t === '-') return null;
+  if (isWinModule(p) && driveRelative(t)) return null; // (`D:foo`: relative to the working directory of drive D, which is not known)
   if (t === '~' || t.startsWith('~/')) { if (!site.home) return null; t = p.join(site.home, t.slice(1)); } else if (t.startsWith('~')) return null;
   if (p.isAbsolute(t)) return [p.resolve(t)];
   return dirs ? dirs.map((d) => p.resolve(d, t)) : null;
@@ -464,6 +467,7 @@ export function markPackageState(budget, argvs, site = {}) {
 export function pmStartDirs(call, cwds, home, p = nodePath) {
   if (!Array.isArray(cwds) || cwds.some((c) => typeof c !== 'string')) return null;
   if (call.dirDynamic) return null;
+  if (isWinModule(p) && typeof call.dir === 'string' && driveRelative(call.dir)) return null;
   if (call.dir === null || call.dir === undefined) return cwds;
   const d = call.dir === '~' || call.dir.startsWith('~/') ? p.join(home ?? '', call.dir.slice(1)) : call.dir;
   return cwds.map((c) => p.resolve(c, d));

@@ -34,8 +34,9 @@ function normalise(p, platform) {
   let s = toPosix(p);
   if (!isAbsolutePosix(s, platform)) s = `${toPosix(process.cwd())}/${s}`;
   const unc = /^\/\/[^/]/.test(s); // keep a UNC prefix; posix.normalize would collapse "//" to "/"
-  s = platform === 'win32' && /^[A-Za-z]:\//.test(s) ? drivePosix.resolve(s) : path.posix.normalize(s); // (on Windows `..` stops at the drive root)
-  if (unc) s = `/${s}`;
+  // (on Windows `..` stops at the drive root and at the share root of a UNC path)
+  if (platform === 'win32' && (DRIVE.test(s) || UNC.test(s))) s = drivePosix.normalize(s);
+  else { s = path.posix.normalize(s); if (unc) s = `/${s}`; }
   if (s.length > 1 && s.endsWith('/')) s = s.slice(0, -1);
   return platform === 'win32' || platform === 'darwin' ? s.toLowerCase() : s;
 }
@@ -75,8 +76,9 @@ export function canonicalPath(p) {
 // process directory in front, and posix.dirname('D:/a') is 'D:', then '.', so a walk upward leaves the drive. Here a drive is a root: resolve clamps `..` at it, dirname stops at `D:/`.
 const posix = path.posix;
 const DRIVE = /^([A-Za-z]:)(\/.*)?$/;
+const UNC = /^(\/\/[^/]+\/[^/]+)(\/.*)?$/; // //server/share/x: the share is the root
 const rooted = (s) => s.startsWith('/') || DRIVE.test(s);
-const split = (s) => { const m = DRIVE.exec(s); return m ? [m[1], m[2] ?? '/'] : ['', s]; };
+const split = (s) => { const m = DRIVE.exec(s) ?? UNC.exec(s); return m ? [m[1], m[2] ?? '/'] : ['', s]; };
 // Is this path module one of Windows' (native win32, or the POSIX form with drives)? Only there is `D:` a drive.
 export const isWinModule = (m) => m === drivePosix || m === path.win32;
 export const drivePosix = {
@@ -95,6 +97,17 @@ export const drivePosix = {
   dirname(s) {
     const [drive, rest] = split(String(s));
     return drive ? `${drive}${posix.dirname(rest)}` : posix.dirname(s);
+  },
+  // (normalize and join: a drive or a share is a root that `..` does not leave, and the `//` of a UNC path stays)
+  normalize(s) {
+    const [drive, rest] = split(String(s));
+    if (!drive) return posix.normalize(s);
+    const r = posix.resolve('/', rest);
+    return `${drive}${r !== '/' && rest.endsWith('/') ? `${r}/` : r}`;
+  },
+  join(...parts) {
+    const j = parts.map(String).filter((x) => x !== '').join('/');
+    return j === '' ? '.' : drivePosix.normalize(j);
   },
   relative(a, b) {
     const [da, ra] = split(this.resolve(a));

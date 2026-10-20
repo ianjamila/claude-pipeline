@@ -1297,7 +1297,7 @@ function placeOf(f, rec) {
 // - isAbs(path), p: the policy's path functions (node:path or node:path.posix), ci: compare names ignoring case
 // - real(path): the path with symlinks followed (a missing tail kept), or null when it cannot be told; omitted: paths are taken as written
 // - stamp(idx) (optional): changes whenever locate() would answer differently for the command at idx (the directory it runs in becomes known); tick() (optional): reads the evaluation's clock and throws when it is past its deadline
-export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, real = null, readText = null, text = null, stamp = null, tick = null }) {
+export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, driveRel = false, real = null, readText = null, text = null, stamp = null, tick = null }) {
   // an awk program file (-f FILE): the text of every place the word may name; null when it cannot be told (a run-time word, a file we cannot read, a place we do not know)
   const readProgram = readText ? (word, idx) => {
     const e = expand(word);
@@ -1313,7 +1313,7 @@ export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, real
   const seps = cmds.filter((c) => c.sep === '&').length;
   const opaque = lone > seps || cmds.some(startsBackground);
   const bgWork = seps > 0 || opaque;
-  return { cmds, recs: w.recs, unmodelled: w.unmodelled, from: flowStart(cmds), i: -1, expand, locate, isAbs, p, ci, real, stamp, tick, deferred: hasDeferred(cmds), opaque, bgWork };
+  return { cmds, recs: w.recs, unmodelled: w.unmodelled, from: flowStart(cmds), i: -1, expand, locate, isAbs, p, ci, driveRel, real, stamp, tick, deferred: hasDeferred(cmds), opaque, bgWork };
 }
 
 // commands that start a job which outlives them (a `&` is read from the text)
@@ -1625,6 +1625,8 @@ function partAlternatives(frames, h, io, depth) {
 // (the pattern a word stands for depends on the word alone: true = anything, or a matcher ({ test(P) }); built once, not once per name asked)
 const DYNAMIC_PATTERNS = new Map();
 function dynamicMayBe(f, word, P, below = false) {
+  // (driveRel, Windows: `D:foo` is relative to the cwd of drive D, which nobody knows -- a part only known at run time, like `$X`)
+  if (f.driveRel && /^[A-Za-z]:(?![/\\:\s])/.test(word)) word = `$${String(word).slice(2)}`;
   const key = `${f.ci ? 1 : 0}${below ? 1 : 0}${word}`;
   let pat = DYNAMIC_PATTERNS.get(key);
   if (pat === undefined) {

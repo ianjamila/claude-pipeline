@@ -115,3 +115,62 @@ test('git guard (native paths): `D:/..` is a relative path off Windows', { skip:
   for (const cmd of ['rm D:/../package.json && npm test', 'cp evil.json D:/../package.json && npm test', 'mv D:/../package.json x; npm run test']) assert.equal(run(cmd).decision, 'deny', cmd);
   for (const cmd of ['cat D:/../package.json && npm test', 'rm D:/../notes.txt && npm test']) assert.equal(run(cmd).decision, 'allow', cmd);
 });
+
+// Why (controller ruling on the drivePosix scan): two Windows-only readings that put a path somewhere else than the shell does.
+//  - `D:foo` (a drive and no slash) is relative to the cwd OF THAT DRIVE, which nobody here can know: it is judged as a path only known at run time, never against the host's directory.
+//  - `//srv/share/x` (UNC) has its own root, the share: `..` stops there and it is no local `/srv/share/x` (resolve and join used to collapse the double slash).
+test('win32: a drive-relative word (D:foo) is a run-time-unknown path, judged as `$X` is', () => {
+  const files = { 'D:/work/proj/package.json': JSON.stringify({ name: 'x', version: '1.0.0', scripts: { test: 'echo hi' } }) };
+  const dirs = ['D:/', 'D:/work', 'D:/work/proj', 'D:/home/u'];
+  const run = (cmd) => evaluateBashForFiles(cmd, { home: 'D:/home/u', env: {}, platform: 'win32', realpath: (p) => p, cwd: 'D:/work/proj', ...posixFs(files, dirs) }).decision;
+  const shapes = ['cd # && npm test', 'echo x > #/package.json && npm test', 'cp x #/package.json && npm test', `echo x > #/${CL}/settings.json`, 'rm #/package.json && npm test', 'npm --prefix # test'];
+  for (const shape of shapes) {
+    for (const tail of ['', `; echo ${CL}`]) {
+      const rel = run(shape.replaceAll('#', 'D:foo') + tail);
+      assert.equal(rel, run(shape.replaceAll('#', '$X') + tail), `${shape}${tail}: as a path only known at run time`);
+    }
+  }
+  // the unknown reading refuses these, so the drive-relative word must too (it used to land in the host's directory and pass)
+  assert.equal(run(`echo x > D:foo/${CL}/settings.json`), 'deny');
+  assert.equal(run(`echo x > D:foo/package.json && npm test; echo ${CL}`), 'deny');
+  assert.equal(run(`rm D:foo/package.json && npm test; echo ${CL}`), 'deny');
+  // twins: a drive path with a slash is the drive's, known
+  assert.equal(run('echo x > D:/work/proj/sub/notes.txt && npm test'), 'allow');
+  assert.equal(run('cat D:/work/proj/package.json && npm test'), 'allow');
+});
+test('win32: a UNC path has its own root (the share), never a local /srv/share path', () => {
+  assert.equal(drivePosix.resolve('//srv/share/x/..'), '//srv/share/');
+  assert.equal(drivePosix.resolve('//srv/share/../..'), '//srv/share/', '`..` stops at the share root');
+  assert.equal(drivePosix.resolve('//srv/share/a', '../b'), '//srv/share/b');
+  assert.equal(drivePosix.resolve('D:/a', '//srv/share/x'), '//srv/share/x', 'an absolute UNC word replaces the directory');
+  assert.equal(drivePosix.dirname('//srv/share/x'), '//srv/share/');
+  assert.equal(drivePosix.dirname('//srv/share'), '//srv/share/', 'the walk upward ends at the share');
+  assert.equal(drivePosix.join('//srv/share', 'a', '..', '..', 'b'), '//srv/share/b');
+  assert.equal(drivePosix.normalize('//srv/share/./a/../b'), '//srv/share/b');
+  assert.equal(drivePosix.join('D:/a', '..', '..'), 'D:/');
+  assert.equal(drivePosix.relative('//srv/share/a', '//srv/share/b/c'), '../b/c');
+  assert.equal(drivePosix.isAbsolute('//srv/share/x'), true);
+  assert.equal(path.posix.resolve('//srv/share/x'), '/srv/share/x', 'the plain posix functions collapse it (posix: `//x` is a normal absolute path)');
+});
+test('win32: a UNC package.json removed first is seen; the same name on the local drive is another file', () => {
+  const unc = '//srv/share/proj';
+  const files = { [`${unc}/package.json`]: JSON.stringify({ name: 'x', version: '1.0.0', scripts: { test: 'echo hi' } }) };
+  const dirs = ['D:/', '//srv/share/', '//srv/share', unc, '/srv', '/srv/share', '/srv/share/proj', 'D:/home/u'];
+  const run = (cmd, cwd = unc) => evaluateBashForFiles(cmd, { home: 'D:/home/u', env: {}, platform: 'win32', realpath: (p) => p, cwd, ...posixFs(files, dirs) }).decision;
+  assert.equal(run('npm test'), 'allow');
+  for (const cmd of ['rm //srv/share/proj/package.json && npm test', 'rm package.json && npm test', 'mv ../proj/package.json x && npm test', 'rm //srv/share/x/../proj/package.json && npm test', 'rm //srv/share/../../proj/package.json && npm test', 'cp evil.json //srv/share/proj/package.json && npm test']) {
+    assert.equal(run(cmd), 'deny', cmd);
+  }
+  // twins: the local /srv/share/proj/package.json is a different file
+  for (const cmd of ['rm /srv/share/proj/package.json && npm test', 'cat //srv/share/proj/package.json && npm test']) assert.equal(run(cmd), 'allow', cmd);
+});
+test('posix: `//x` and `D:foo` stay plain posix paths (a normal absolute path, a directory named D:foo)', () => {
+  const files = { '/home/u/proj/package.json': JSON.stringify({ name: 'x', version: '1.0.0', scripts: { test: 'echo hi' } }) };
+  const dirs = ['/', '/home', '/home/u', '/home/u/proj'];
+  const run = (platform, cmd) => evaluateBashForFiles(cmd, { home: '/home/u', env: {}, platform, realpath: (p) => p, cwd: '/home/u/proj', ...posixFs(files, dirs) }).decision;
+  for (const platform of ['linux', 'darwin']) {
+    assert.equal(run(platform, 'rm //home/u/proj/package.json && npm test'), 'deny', `${platform}: //home/u/proj is /home/u/proj`);
+    assert.equal(run(platform, 'rm D:foo/package.json && npm test'), 'allow', `${platform}: a relative path in a directory named D:foo`);
+    assert.equal(run(platform, 'rm D:foo/../package.json && npm test'), 'deny', `${platform}: D:foo/.. is the working directory`);
+  }
+});
