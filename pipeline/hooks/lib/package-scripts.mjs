@@ -854,7 +854,7 @@ export function binIsProgram(text, site = null) {
 // PATH are every node_modules/.bin from either of them upward. exists: file test.
 export function binSite(bin, runDir, exists, p = nodePath) {
   // (R3-B2: the PATH order is the run directory and its parents FIRST -- the manager puts the nearest node_modules/.bin of where it runs ahead of the others -- then the bin's own package directory)
-  const roots = [p.dirname(p.dirname(p.dirname(bin))), runDir].filter((x) => typeof x === 'string');
+  const roots = [runDir, p.dirname(p.dirname(p.dirname(bin)))].filter((x) => typeof x === 'string');
   return {
     inside: (abs) => roots.some((r) => abs === r || abs.startsWith(r === '/' ? '/' : `${r}/`)),
     hasBin: (name) => findBin(name) !== null,

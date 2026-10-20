@@ -338,3 +338,13 @@ test('R3-B1 a new workspace directory whose quoted name holds a space is checked
   allowed(`mkdir -p 'packages/new package' && cp replacement.json 'packages/new package/README.md' ${tail}`, tree);
   allowed(`mkdir -p 'other/new package' && cp replacement.json 'other/new package/package.json' ${tail}`, tree);
 });
+
+test('R3-B2 a shebang interpreter is looked up in the caller\'s PATH order: the run directory and its parents first, then the bin\'s own directory', () => {
+  const tool = '#!/usr/bin/env node\necho hi\n';
+  // /repo/node_modules/.bin/tool and a harmless node there; a forbidden node in /repo/sub, where the command runs
+  const tree = (g) => ({ 'package.json': pkg({}), 'node_modules/.bin/tool': tool, 'node_modules/.bin/node': sh('echo shim'), 'sub/package.json': pkg({}), 'sub/node_modules/.bin/node': sh(g.bad) });
+  for (const cmd of ['cd sub && npx tool', 'cd sub && npm exec tool']) denied(cmd, tree);
+  // twins: the nearer node is harmless (the far one is not reached), and the same layout run from the root
+  allowed('cd sub && npx tool', (g) => ({ ...tree(g), 'sub/node_modules/.bin/node': sh('echo shim') }));
+  allowed('npx tool', tree);
+});
