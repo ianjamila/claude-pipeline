@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createGitHub } from '../pipeline/lib/github.mjs';
-import { EVENT_KINDS, listEvents, parseEvent, postEvent, readEvents, renderEvent, resolvedRollbacks, unresolvedRollbacks } from '../pipeline/lib/run-events.mjs';
+import { EVENT_KINDS, listEvents, newestStopId, openOwnerStops, parseEvent, postEvent, readEvents, renderEvent, resolvedRollbacks, unresolvedRollbacks } from '../pipeline/lib/run-events.mjs';
 import { createFakeGh, REPO_VIEW } from './helpers/fakegh-env.mjs';
 
 const REPO = { match: '^repo view', stdoutJson: REPO_VIEW };
@@ -116,4 +116,63 @@ test('resolvedRollbacks: the rollback-results of this merge (readable payload on
   assert.deepEqual(resolvedRollbacks(events, { mergeSha: 'AAA' }).map((e) => e.id), ['a-1', 'a-2']);
   assert.deepEqual(resolvedRollbacks(events, { mergeSha: 'CCC' }), []);
   assert.deepEqual(resolvedRollbacks(undefined, { mergeSha: 'AAA' }), []);
+});
+
+// ---- owner stops (owner_approval: chat): an append-only stop, released only by a readable release of the SAME id --------
+
+const STOP = { repo: 'acme/widgets', pr: 4, id: 'ab12cd34', cause: 'merge:command-failed', head: 'a'.repeat(40), at: '2026-10-20T08:00:00.000Z', host: 'mac', autoMergeDisarmed: true };
+const stopComment = (cid, id = 'ab12cd34', { login = 'me', kind = 'owner-stop', body } = {}) => ({
+  id: cid, user: { login }, body: body ?? renderEvent(kind, id, `Owner stop ${id}`, { ...STOP, id }),
+});
+const BAD_PAYLOAD = (kind, id) => `<!-- claude-pipeline:event:${kind}:${id} -->\n\nsentence\n\n<!-- claude-pipeline:event-data:AAAA -->`;
+const openIds = (comments) => openOwnerStops(listEvents(comments, 'me')).map((e) => e.id);
+
+test('EVENT_KINDS holds the two owner-stop kinds, and both round-trip', () => {
+  for (const kind of ['owner-stop', 'owner-stop-released']) {
+    assert.ok(EVENT_KINDS.includes(kind), kind);
+    const e = parseEvent(renderEvent(kind, 'ab12cd34', 'Owner stop ab12cd34 on #4.', STOP));
+    assert.deepEqual([e.kind, e.id, e.dataStatus, e.data.cause], [kind, 'ab12cd34', 'ok', 'merge:command-failed']);
+  }
+});
+
+test('openOwnerStops: open until a readable release of the SAME id; oldest first', () => {
+  assert.deepEqual(openIds([]), []);
+  assert.deepEqual(openIds([stopComment(1)]), ['ab12cd34']);
+  assert.deepEqual(openIds([stopComment(1), stopComment(2, 'ab12cd34', { kind: 'owner-stop-released' })]), []);
+  assert.deepEqual(openIds([stopComment(3, '22222222'), stopComment(1, '11111111')]), ['11111111', '22222222'], 'oldest comment first');
+  const oneReleased = [stopComment(1, '11111111'), stopComment(2, '22222222'), stopComment(3, '11111111', { kind: 'owner-stop-released' })];
+  assert.deepEqual(openIds(oneReleased), ['22222222'], 'a release closes only its own id');
+  assert.deepEqual(openOwnerStops(undefined), []);
+});
+
+test('openOwnerStops: an unreadable-payload stop is open; an unreadable release releases nothing; a release for an unknown id is ignored', () => {
+  assert.deepEqual(openIds([stopComment(1, 'ab12cd34', { body: BAD_PAYLOAD('owner-stop', 'ab12cd34') })]), ['ab12cd34']);
+  const noData = '<!-- claude-pipeline:event:owner-stop:ab12cd34 -->\n\nsentence';
+  assert.deepEqual(openIds([stopComment(1, 'ab12cd34', { body: noData })]), ['ab12cd34'], 'a stop with no payload still counts');
+  assert.deepEqual(openIds([stopComment(1), stopComment(2, 'ab12cd34', { body: BAD_PAYLOAD('owner-stop-released', 'ab12cd34') })]), ['ab12cd34']);
+  assert.deepEqual(openIds([stopComment(1), stopComment(2, 'ab12cd34', { body: '<!-- claude-pipeline:event:owner-stop-released:ab12cd34 -->\n\ns' })]), ['ab12cd34'], 'absent payload is unreadable too');
+  assert.deepEqual(openIds([stopComment(1), stopComment(2, 'ffffffff', { kind: 'owner-stop-released' })]), ['ab12cd34'], 'unknown id');
+  assert.deepEqual(openIds([stopComment(2, 'ffffffff', { kind: 'owner-stop-released' })]), []);
+});
+
+test('openOwnerStops: another user\'s stop or release, and a quoted marker, are ignored', () => {
+  assert.deepEqual(openIds([stopComment(1, 'ab12cd34', { login: 'mallory' })]), [], 'a stop from someone else is not an event');
+  assert.deepEqual(openIds([stopComment(1), stopComment(2, 'ab12cd34', { kind: 'owner-stop-released', login: 'mallory' })]), ['ab12cd34'], 'a release from someone else releases nothing');
+  const quoted = `> quoting\n${renderEvent('owner-stop', 'ab12cd34', 's', STOP)}`;
+  assert.deepEqual(openIds([stopComment(1, 'ab12cd34', { body: quoted })]), []);
+  const quotedRelease = `see ${renderEvent('owner-stop-released', 'ab12cd34', 's', STOP)}`;
+  assert.deepEqual(openIds([stopComment(1), stopComment(2, 'ab12cd34', { body: quotedRelease })]), ['ab12cd34']);
+});
+
+test('newestStopId: the newest owner-stop by comment id, released or not; null with none', () => {
+  const ev = (comments) => listEvents(comments, 'me');
+  assert.equal(newestStopId([]), null);
+  assert.equal(newestStopId(undefined), null);
+  assert.equal(newestStopId(ev([stopComment(1, 'ab12cd34', { kind: 'owner-stop-released' })])), null, 'a release alone is not a stop');
+  assert.equal(newestStopId(ev([stopComment(5, '11111111')])), '11111111');
+  const released = [stopComment(5, '11111111'), stopComment(9, '22222222'), stopComment(10, '22222222', { kind: 'owner-stop-released' })];
+  assert.equal(newestStopId(ev(released)), '22222222', 'released still counts');
+  assert.equal(newestStopId(ev([stopComment(100, '11111111'), stopComment(9, '22222222')])), '11111111', 'by comment id, not list order');
+  assert.equal(newestStopId(ev([stopComment(10, 'aaaaaaaa'), stopComment(9, 'bbbbbbbb', { login: 'mallory' })])), 'aaaaaaaa');
+  assert.equal(newestStopId(ev([stopComment(2, 'ab12cd34', { body: BAD_PAYLOAD('owner-stop', 'ab12cd34') })])), 'ab12cd34', 'an unreadable stop still counts');
 });
