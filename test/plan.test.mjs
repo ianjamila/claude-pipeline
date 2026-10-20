@@ -267,3 +267,20 @@ test('outsideScope refuses a missing or non-array file list (F7)', () => {
   for (const files of [undefined, null, 'src/a.mjs', {}]) assert.throws(() => outsideScope({ files, scope: ['src/**'] }), /files/);
   assert.deepEqual(outsideScope({ files: [], scope: ['src/**'] }), []);
 });
+
+test('a scope item whose code span is not exactly one single-backtick span is refused (CommonMark mismatch)', () => {
+  for (const item of ['- `a``b`', '- `a`` x', '- ``a`b``', '- ``a``', '* `a``', '- `src/x`` `y`']) {
+    const text = PLAN.replace('* `docs/x.md` (the doc)', `* \`docs/x.md\` (the doc)\n${item}`);
+    assert.throws(() => parsePlan(text), (e) => e instanceof PlanError && e.problems.some((p) => p.includes(`scope item at line ${lineWith(text, item)} `)), item);
+  }
+  assert.deepEqual(parsePlan(PLAN.replace('* `docs/x.md` (the doc)', '* `docs/x.md` (the doc)\n- `lib/y.mjs` and `z` (note)')).scope, [...SCOPE_OK, 'lib/y.mjs']);
+});
+
+test('setext underlines and thematic breaks inside the Scope section are refused; outside Scope and in fences they are fine', () => {
+  for (const line of ['---', '===', '-', '=', '  ---  ', ' ===', '***', '___', '- - -', '* * *', '_ _ _', '  ***', '----------']) {
+    const text = PLAN.replace('* `docs/x.md` (the doc)', `* \`docs/x.md\` (the doc)\n${line}`);
+    assert.throws(() => parsePlan(text), (e) => e instanceof PlanError && e.problems.some((p) => p.includes(`at line ${text.split('\n').indexOf(line) + 1} `) && /setext|thematic/.test(p)), JSON.stringify(line));
+  }
+  assert.ok(parsePlan(PLAN.replace('* `docs/x.md` (the doc)', '* `docs/x.md` (the doc)\n```\n---\n***\n```\n    ---')));
+  assert.ok(parsePlan(PLAN.replace('b works', 'b works\n---\n***')));
+});

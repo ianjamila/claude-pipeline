@@ -57,6 +57,11 @@ const LINK_TITLE = /\]\([^)]*?\s+(?:"[^"]*"|'[^']*')\s*\)/;
 const SCOPE_ASCII = /^[\x21-\x7E]+$/;
 // Scope must also be a flat list: no blockquoted or nested items.
 const QUOTED_ITEM = /^\s*>[\s>]*[-*+]\s+`/;
+// A list item that opens with a backtick must be exactly one single-backtick span (`a``b` renders as a``b, not a).
+const ITEM_OPENS_SPAN = /^ ?[-*]\s+`/;
+// Setext underlines and thematic breaks also change what heading an entry renders under.
+const SETEXT_UNDERLINE = /^ {0,3}(?:=+|-+)[ \t]*$/;
+const THEMATIC_BREAK = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
 const ATX_HEADING = /^ {0,3}#{1,6}(?:\s|$)/;
 const NESTED_ITEM = /^(?: {2,}|\t)\s*[-*+]\s+`/;
 
@@ -150,8 +155,12 @@ export function parsePlan(text, { path: ownPath } = {}) {
       if (ATX_HEADING.test(l)) { problems.push(`heading at line ${sc.from + i + 1} sits inside the "## Scope" section: entries under it render under that heading, so end Scope with a column-0 "## " heading`); return; }
       if (QUOTED_ITEM.test(l)) { refuse('it contains a scope item inside a blockquote'); return; }
       if (NESTED_ITEM.test(l)) { refuse('it contains a nested list item (indented 2+ spaces)'); return; }
+      if (SETEXT_UNDERLINE.test(l) || THEMATIC_BREAK.test(l)) { problems.push(`setext underline or thematic break at line ${sc.from + i + 1} sits inside the "## Scope" section: it changes which heading the entries render under`); return; }
       const m = SCOPE_ITEM.exec(l);
-      if (!m) return;
+      if (!m || l[m[0].length] === '`') {
+        if (ITEM_OPENS_SPAN.test(l)) problems.push(`scope item at line ${sc.from + i + 1} must be exactly one single-backtick code span (a longer or unbalanced backtick run renders differently from what is parsed)`);
+        return;
+      }
       const e = m[1].replace(/^[ \t]+|[ \t]+$/g, '');
       if (!SCOPE_ASCII.test(e)) { problems.push(`scope entry at line ${sc.from + i + 1} must be plain ASCII`); return; }
       const why = scopeProblem(e);
