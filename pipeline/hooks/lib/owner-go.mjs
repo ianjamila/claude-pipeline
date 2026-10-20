@@ -7,10 +7,14 @@
 // `P merge` then needs a record for exactly that PR, head and owner-item set; the guard needs one (for that PR, in that
 // session) before a direct `gh pr merge` / the repo's merge command in an owner_approval: chat repo. guard-files keeps
 // agents from writing the folder or running the recorder.
+// Plan approvals (ship redesign): the same recorder also writes down an owner prompt that STARTS with "approve", bound to what the
+// reply right before it asked for: `Plan <blob40> · scope <digest12>` + `📋 Ready to approve plan #N — say "approve"`. Those lines
+// carry `kind: 'plan'`; merge readers never see them. `P plan approve` accepts one for 24 h after it was issued (that window is
+// checked there), but the record stays readable for 30 days so an interrupted run can repair from it.
 // Residual (owner ruling 2026-10-14, the "cheap step"): the agent runs as the same OS user, so a program the guards cannot
 // see into can still write the folder; the transcript the recorder reads is a file of that user; and the agent's GitHub
 // token is the owner's. A second GitHub identity + a ruleset is the server-side backstop (issue #65).
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, writeSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -21,6 +25,7 @@ const FUTURE_SKEW_MS = 5 * 60 * 1000;
 const TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024;
 const MAX_RECORD_BYTES = 1024 * 1024; // one session file; a bigger one is not read
 const SESSION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+export const PLAN_RECORD_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // plan records stay readable for 30 days
 export const HEAD_CHARS = 12; // the head is shown (and matched) by its first 12 characters at least
 
 // The account's home from the OS user database, NOT $HOME: `HOME=/tmp/x P merge …` must not point the check at a folder the agent
@@ -34,6 +39,10 @@ export function accountHome() {
 }
 
 export const ownerGoDir = (home = accountHome()) => path.join(home, ...OWNER_GO_REL.split('/'));
+
+// Same text as pipeline/lib/plan.mjs (a parity test keeps them equal; this file must not import lib/).
+export const PLAN_LINE_RE = /^\s*Plan\s+([0-9a-f]{40})\s*(?:·|\|)\s*scope\s+([0-9a-f]{12})\s*$/;
+export const PLAN_READY_RE = /📋\s*Ready to approve plan\s+#(\d{1,6})\b/;
 
 // The words that may follow "merge" in an approval besides its targets (#N, N, a head prefix).
 const FILLER = /^(?:and|it|both|all|them|these|those|please|pls|now|go|ok|okay|thanks|thank|you|thx|ty)$/i;
@@ -57,12 +66,42 @@ export function parseApproval(prompt) {
   return { prs: [...new Set(prs)], shas: [...new Set(shas)] };
 }
 
+// "approve", "approved", "approve #58", "approve <blob prefix ≥7>", with the merge fillers. Anything else is not an approval.
+// Returns null or { prs, blobs }.
+export function parsePlanApproval(prompt) {
+  const t = String(prompt ?? '').trim();
+  const m = /^approved?(?![A-Za-z0-9_-])([\s\S]*)$/i.exec(t);
+  if (!m || m[1].includes('?')) return null;
+  const prs = [];
+  const blobs = [];
+  for (const tok of m[1].replace(/[.,!;:]+/g, ' ').split(/\s+/).filter(Boolean)) {
+    let x;
+    if ((x = /^#?(\d{1,6})$/.exec(tok))) prs.push(Number(x[1]));
+    else if (/^[0-9a-f]{7,40}$/i.test(tok)) blobs.push(tok.toLowerCase());
+    else if (!FILLER.test(tok)) return null;
+  }
+  return { prs: [...new Set(prs)], blobs: [...new Set(blobs)] };
+}
+
 // The merge request a reply ENDS with. The reply's last lines are the request (skills/ship): optional `Head <sha12> · items <digest>`
 // lines (or, for several PRs, `#N head <sha12> · items <digest>`) directly above the 🔀 line, which is the last non-blank line.
 // Only that terminal block binds: an earlier block in the same reply, a Head line with prose between it and the 🔀 line, or any
 // text after the 🔀 line binds nothing, and a PR bound twice (two heads, or the same line twice) is ambiguous, so it binds nothing.
 // Returns { prs: [N…] (every PR on the 🔀 line; [] when the reply does not end with it), requests: [{ pr, head, items }] }.
 const READY_LINE = /🔀\s*Ready to merge\s+([^\n]*)/;
+// The plan request a reply ENDS with: the last non-blank line is the 📋 line and the line right above it the Plan line.
+// Ambiguous replies record nothing (spec §2a): any other Plan / 📋 line anywhere in the reply, or any 🔀 merge line.
+export function presentedPlanRequest(text) {
+  const lines = String(text ?? '').split(/\r?\n/);
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  const ready = PLAN_READY_RE.exec(lines.at(-1) ?? '');
+  const plan = PLAN_LINE_RE.exec(lines.at(-2) ?? '');
+  if (!ready || !plan) return null;
+  const count = (re) => lines.filter((l) => re.test(l)).length;
+  if (count(PLAN_LINE_RE) !== 1 || count(PLAN_READY_RE) !== 1 || count(READY_LINE) !== 0) return null;
+  return { pr: Number(ready[1]), blob: plan[1], scopeDigest: plan[2] };
+}
+
 const HEAD_LINE = new RegExp(`^\\s*(?:#(\\d+)\\s+)?head\\s+([0-9a-f]{${HEAD_CHARS},40})\\s*(?:·|\\|)\\s*items\\s+([0-9a-f]{12}|none)\\s*$`, 'i');
 export function presentedRequests(text) {
   const lines = String(text ?? '').split(/\r?\n/);
@@ -85,13 +124,14 @@ export function presentedRequests(text) {
   return { prs, requests: [...bound.values()].filter(Boolean) };
 }
 
-// The text of the last assistant reply in the transcript when it holds a 🔀 merge request ('' when none). Only the
+// The text of the last assistant reply in the transcript when it holds a request line ('' when none): the 🔀 merge marker by default,
+// or the marker passed as `ready` (the plan path passes PLAN_READY_RE). Only the
 // transcript's last 4 MB are read. A reply is every assistant text block between two prompts.
 // `prompt` is the text being submitted (the UserPromptSubmit hook's input.prompt). Why (#58 round 3): the hook may run before or after the
 // transcript gets that prompt, so the newest prompt entry is "the current one" (its empty slot skipped) only when its text IS that prompt;
 // any other newest prompt is an older, unanswered one, and the empty reply slot after it is the reply to use: no request, the one before is stale.
 // Without `prompt` the newest prompt entry is taken to be the current one.
-export function lastRequestText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, prompt } = {}) {
+export function lastRequestText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, prompt, ready = READY_LINE } = {}) {
   let raw = '';
   try {
     if (!lstatSync(transcriptPath).isFile()) return '';
@@ -136,7 +176,7 @@ export function lastRequestText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BY
   // older request is never revived by a later "merge": the agent shows it again.
   const current = lastIsPrompt && (prompt === undefined || plain(prompt) === lastPromptText);
   const last = replies.length - 1 - (current && replies.length > 1 ? 1 : 0);
-  return READY_LINE.test(replies[last]) ? replies[last] : '';
+  return ready.test(replies[last]) ? replies[last] : '';
 }
 
 // Is this hook input a subagent's (or not a prompt at all)? Those never approve anything.
@@ -172,45 +212,60 @@ export function recordApproval(input, { home = accountHome(), now = Date.now } =
     if (notOwnerPrompt(input)) return null;
     const session = String(input?.session_id ?? '');
     if (!SESSION_RE.test(session)) return null;
-    const a = parseApproval(input?.prompt);
-    if (!a) return null;
-    const shown = presentedRequests(lastRequestText(String(input?.transcript_path ?? ''), { prompt: String(input.prompt) }));
-    const wanted = (pr) => a.prs.length === 0 || a.prs.includes(pr);
-    const shaOk = (head) => a.shas.length === 0 || a.shas.some((s) => head.startsWith(s) || s.startsWith(head));
-    const requests = shown.requests.filter((r) => wanted(r.pr) && shaOk(r.head));
-    // PRs the owner approved for a direct merge: those the reply asked about (narrowed by the prompt), plus any the prompt names
-    const prs = [...new Set([...shown.prs.filter(wanted), ...a.prs])];
-    const record = {
+    const base = {
       v: 1,
       ts: new Date(now()).toISOString(),
       session,
-      prompt_sha256: createHash('sha256').update(String(input.prompt)).digest('hex'),
-      cwd: typeof input.cwd === 'string' ? input.cwd : null,
-      prs,
-      requests,
+      prompt_sha256: createHash('sha256').update(String(input?.prompt)).digest('hex'),
+      cwd: typeof input?.cwd === 'string' ? input.cwd : null,
     };
-    if (!realDirChain(home, OWNER_GO_REL)) return null;
-    const file = path.join(ownerGoDir(home), `${session}.jsonl`);
-    try {
-      if (!lstatSync(file).isFile()) return null;
-    } catch (err) {
-      if (err?.code !== 'ENOENT') return null;
+    const a = parseApproval(input?.prompt);
+    let record;
+    if (a) {
+      const shown = presentedRequests(lastRequestText(String(input?.transcript_path ?? ''), { prompt: String(input.prompt) }));
+      const wanted = (pr) => a.prs.length === 0 || a.prs.includes(pr);
+      const shaOk = (head) => a.shas.length === 0 || a.shas.some((s) => head.startsWith(s) || s.startsWith(head));
+      const requests = shown.requests.filter((r) => wanted(r.pr) && shaOk(r.head));
+      // PRs the owner approved for a direct merge: those the reply asked about (narrowed by the prompt), plus any the prompt names
+      const prs = [...new Set([...shown.prs.filter(wanted), ...a.prs])];
+      record = { ...base, prs, requests }; // no `kind`: merge lines are unchanged; readers treat a missing kind as a merge record
+    } else {
+      const pa = parsePlanApproval(input?.prompt);
+      if (!pa) return null;
+      const shown = presentedPlanRequest(lastRequestText(String(input?.transcript_path ?? ''), { prompt: String(input.prompt), ready: PLAN_READY_RE }));
+      if (!shown) return null;
+      if (pa.prs.length && !pa.prs.includes(shown.pr)) return null;
+      if (pa.blobs.length && !pa.blobs.some((b) => shown.blob.startsWith(b))) return null;
+      record = { ...base, kind: 'plan', record_id: randomBytes(8).toString('hex'), prs: [], requests: [], plan: shown };
     }
-    const fd = openSync(file, OPEN_APPEND, 0o600);
-    try {
-      if (!fstatSync(fd).isFile()) return null;
-      writeSync(fd, `${JSON.stringify(record)}\n`);
-    } finally {
-      closeSync(fd);
-    }
-    return record;
+    return appendRecord(home, session, record) ? record : null;
   } catch {
     return null;
   }
 }
 
-// Every valid record younger than maxAgeMs, from one session's file or (session null) from all of them. Never throws.
-export function readApprovals({ home = accountHome(), session = null, now = Date.now, maxAgeMs = MAX_AGE_MS } = {}) {
+// Appends one record line to <home>/.claude/pipeline-state/owner-go/<session>.jsonl through real folders and files only.
+function appendRecord(home, session, record) {
+  if (!realDirChain(home, OWNER_GO_REL)) return false;
+  const file = path.join(ownerGoDir(home), `${session}.jsonl`);
+  try {
+    if (!lstatSync(file).isFile()) return false;
+  } catch (err) {
+    if (err?.code !== 'ENOENT') return false;
+  }
+  const fd = openSync(file, OPEN_APPEND, 0o600);
+  try {
+    if (!fstatSync(fd).isFile()) return false;
+    writeSync(fd, `${JSON.stringify(record)}\n`);
+  } finally {
+    closeSync(fd);
+  }
+  return true;
+}
+
+// Every parsed line (v 1, in its own session's file, not from the future, younger than maxAgeMs), from one session's file or
+// (session null) from all of them. Never throws.
+function readRecordLines({ home, session, now, maxAgeMs }) {
   const dir = ownerGoDir(home);
   const out = [];
   let names = [];
@@ -244,13 +299,35 @@ export function readApprovals({ home = accountHome(), session = null, now = Date
       if (r?.v !== 1 || `${r.session}.jsonl` !== name) continue;
       const at = Date.parse(r.ts);
       if (!Number.isFinite(at) || at > t + FUTURE_SKEW_MS || t - at > maxAgeMs) continue;
-      out.push({
-        ts: r.ts,
-        session: r.session,
-        prs: Array.isArray(r.prs) ? r.prs.filter(Number.isInteger) : [],
-        requests: Array.isArray(r.requests) ? r.requests.filter((q) => Number.isInteger(q?.pr) && typeof q.head === 'string' && typeof q.items === 'string') : [],
-      });
+      out.push(r);
     }
+  }
+  return out;
+}
+
+// The merge approvals: plan records (kind 'plan') are never merge approvals and are skipped.
+export function readApprovals({ home = accountHome(), session = null, now = Date.now, maxAgeMs = MAX_AGE_MS } = {}) {
+  const out = [];
+  for (const r of readRecordLines({ home, session, now, maxAgeMs })) {
+    if (r.kind === 'plan') continue;
+    out.push({
+      ts: r.ts,
+      session: r.session,
+      prs: Array.isArray(r.prs) ? r.prs.filter(Number.isInteger) : [],
+      requests: Array.isArray(r.requests) ? r.requests.filter((q) => Number.isInteger(q?.pr) && typeof q.head === 'string' && typeof q.items === 'string') : [],
+    });
+  }
+  return out;
+}
+
+// The plan approvals ("approve" records), valid for 30 days. `P plan approve` applies the 24 h issuance window itself.
+export function readPlanApprovals({ home = accountHome(), session = null, now = Date.now, maxAgeMs = PLAN_RECORD_MAX_AGE_MS } = {}) {
+  const out = [];
+  for (const r of readRecordLines({ home, session, now, maxAgeMs })) {
+    const p = r.kind === 'plan' ? r.plan : null;
+    if (!Number.isInteger(p?.pr) || !/^[0-9a-f]{40}$/.test(String(p.blob)) || !/^[0-9a-f]{12}$/.test(String(p.scopeDigest))) continue;
+    if (!/^[0-9a-f]{16}$/.test(String(r.record_id))) continue;
+    out.push({ ts: r.ts, session: r.session, recordId: r.record_id, promptSha256: r.prompt_sha256, pr: p.pr, blob: p.blob, scopeDigest: p.scopeDigest });
   }
   return out;
 }

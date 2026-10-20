@@ -10,6 +10,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   approvedPr, approvedRequest, lastRequestText, ownerGoDir, ownerItemsDigest, parseApproval, presentedRequests, readApprovals, recordApproval,
+  parsePlanApproval, presentedPlanRequest, readPlanApprovals, PLAN_RECORD_MAX_AGE_MS,
 } from '../pipeline/hooks/lib/owner-go.mjs';
 
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
@@ -226,3 +227,83 @@ test('owner-go: a user message with no tool_result is a prompt, text or not', ()
   const stale = { hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: 'merge', transcript_path: transcript(home, [user('go'), said(REQUEST), image, tools, user('merge')]) };
   assert.deepEqual(recordApproval(stale, { home, now }).requests, []);
 });
+
+// T3 (ship redesign): the owner's "approve" for a plan
+const BLOB = 'ab'.repeat(20);
+const SCOPE = 'cd'.repeat(6);
+const PLAN_REQ = `Here is the plan.\nPlan ${BLOB} · scope ${SCOPE}\n📋 Ready to approve plan #58 — say "approve"`;
+const MERGE_REQ = `Two items.\nHead ${'e'.repeat(12)} · items none\n🔀 Ready to merge #58 — say "merge"`;
+const NOW = Date.parse('2026-10-19T10:00:00Z');
+
+test('parsePlanApproval accepts approve forms and refuses questions and negations', () => {
+  assert.deepEqual(parsePlanApproval('approve'), { prs: [], blobs: [] });
+  assert.deepEqual(parsePlanApproval('Approved #58.'), { prs: [58], blobs: [] });
+  assert.deepEqual(parsePlanApproval(`approve ${BLOB.slice(0, 7)}`), { prs: [], blobs: [BLOB.slice(0, 7)] });
+  for (const p of ['approve?', "don't approve", 'approve later', 'why approve', 'merge']) assert.equal(parsePlanApproval(p), null, p);
+});
+
+test('presentedPlanRequest binds only the terminal two-line block', () => {
+  assert.deepEqual(presentedPlanRequest(PLAN_REQ), { pr: 58, blob: BLOB, scopeDigest: SCOPE });
+  assert.equal(presentedPlanRequest(`${PLAN_REQ}\nmore text`), null);
+  assert.equal(presentedPlanRequest(PLAN_REQ.replace(BLOB, BLOB.slice(0, 12))), null, 'a 12-hex blob is refused');
+  assert.equal(presentedPlanRequest(PLAN_REQ.replace('\n📋', '\nprose\n📋')), null);
+  // Spec §2a ambiguity: exactly ONE Plan line and ONE 📋 line in the whole reply, and no 🔀 merge line.
+  const other = `Plan ${'ef'.repeat(20)} · scope ${SCOPE}`;
+  assert.equal(presentedPlanRequest(PLAN_REQ.replace('Here is the plan.\n', `Here is the plan.\n${other}\n`)), null, 'consecutive duplicate Plan lines');
+  assert.equal(presentedPlanRequest(`Plan ${BLOB} · scope ${SCOPE}\nsome prose\n${PLAN_REQ}`), null, 'a second Plan line anywhere');
+  assert.ok(presentedPlanRequest(`Old: Plan ${BLOB} · scope ${SCOPE}\n${PLAN_REQ}`), 'a quoted line that is not a whole Plan line is prose');
+  assert.equal(presentedPlanRequest(`🔀 Ready to merge #58 — say "merge"\n${PLAN_REQ}`), null, 'mixed merge + plan request');
+});
+
+test('the recorder reads a reply that ends with ONLY the plan request (no merge marker), and still refuses a stale one', () => {
+  const home = tmp();
+  // said() replies have no 🔀 line: lastRequestText must accept the 📋 marker on the plan path.
+  assert.equal(recordApproval(input(home, 'approve', [said(PLAN_REQ)]), { home, now: () => NOW })?.kind, 'plan');
+  // A later assistant turn with text but no request makes the old request stale (same slot rule as merge).
+  const home2 = tmp();
+  assert.equal(recordApproval(input(home2, 'approve', [said(PLAN_REQ), said('Working on it.')]), { home: home2, now: () => NOW }), null);
+});
+
+test('"approve" after a plan request writes a plan record; merge readers never see it', () => {
+  const home = tmp();
+  const rec = recordApproval(input(home, 'approve', [said(PLAN_REQ)]), { home, now: () => NOW });
+  assert.equal(rec.kind, 'plan');
+  assert.match(rec.record_id, /^[0-9a-f]{16}$/);
+  assert.deepEqual(rec.plan, { pr: 58, blob: BLOB, scopeDigest: SCOPE });
+  assert.equal(readApprovals({ home, now: () => NOW }).length, 0);
+  assert.equal(readPlanApprovals({ home, now: () => NOW })[0].blob, BLOB);
+});
+
+test('cross-kind: "approve" after a merge request and "merge" after a plan request record nothing of the other kind', () => {
+  const home = tmp();
+  assert.equal(recordApproval(input(home, 'approve', [said(MERGE_REQ)]), { home, now: () => NOW }), null);
+  recordApproval(input(home, 'merge', [said(PLAN_REQ)]), { home, now: () => NOW });
+  assert.equal(readPlanApprovals({ home, now: () => NOW }).length, 0);
+  assert.equal(approvedRequest({ pr: 58, head: 'e'.repeat(40), items: 'none', home, now: () => NOW }), false);
+});
+
+test('approve narrowed by #N or blob prefix; a mismatch records nothing', () => {
+  const home = tmp();
+  assert.equal(recordApproval(input(home, 'approve #59', [said(PLAN_REQ)]), { home, now: () => NOW }), null);
+  assert.equal(recordApproval(input(home, `approve ${'f'.repeat(7)}`, [said(PLAN_REQ)]), { home, now: () => NOW }), null);
+  assert.ok(recordApproval(input(home, `approve #58 ${BLOB.slice(0, 8)}`, [said(PLAN_REQ)]), { home, now: () => NOW }));
+});
+
+test('the request-line regexes match pipeline/lib/plan.mjs exactly', async () => {
+  const plan = await import('../pipeline/lib/plan.mjs');
+  const og = await import('../pipeline/hooks/lib/owner-go.mjs');
+  assert.equal(og.PLAN_LINE_RE.source, plan.PLAN_LINE_RE.source);
+  assert.equal(og.PLAN_READY_RE.source, plan.PLAN_READY_RE.source);
+});
+
+test('plan records are read for 30 days, never from the future, and subagent prompts never record', () => {
+  const home = tmp();
+  recordApproval(input(home, 'approve', [said(PLAN_REQ)]), { home, now: () => NOW });
+  assert.equal(readPlanApprovals({ home, now: () => NOW + PLAN_RECORD_MAX_AGE_MS - 1000 }).length, 1);
+  assert.equal(readPlanApprovals({ home, now: () => NOW + PLAN_RECORD_MAX_AGE_MS + 1000 }).length, 0);
+  assert.equal(readPlanApprovals({ home, now: () => NOW - 10 * 60_000 }).length, 0);
+  assert.equal(recordApproval(input(home, 'approve', [said(PLAN_REQ)], { agent_id: 'x' }), { home, now: () => NOW }), null);
+});
+// The 24 h issuance window and the UTC / future-skew boundaries are checked by `P plan approve` (T4 tests):
+// a record exactly 24 h old is accepted, 24 h + 1 s refused; a record dated in the future beyond the existing skew
+// allowance (owner-go.mjs ~245) is refused; timestamps are compared as UTC epoch ms.
