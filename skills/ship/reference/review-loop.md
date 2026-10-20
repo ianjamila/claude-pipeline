@@ -62,7 +62,7 @@ skip one: until every obligation of every round is met the round is not clean, `
 `review` check fails. For each obligation in the output (nothing to do when the list is empty):
 1. Take the `promptHeader` the `obligations` output already printed for this source and paste it as is. Only when you need it earlier
    or again, run `P review header --pr <pr> --round <round> --source <s> --base <reviewBase> --head <head>` (pure) with the round's
-   RECORDED `reviewBase` (`rounds[<round>].reviewBase` in `.review/state.json`), NOT the raw `--base` you gave `codex-review`: after a
+   RECORDED `reviewBase` (`rounds.find((r) => r.n === <round>).reviewBase` in `.review/state.json`: name the round by its `n` field, not by array position), NOT the raw `--base` you gave `codex-review`: after a
    base merge the round is diffed against a synthetic tree or the whole-PR base, and the obligation digest hashes that, so the raw
    base gives a different `INPUT-DIGEST` and `review add` rejects the answer. It prints `promptHeader` and `digest`.
 2. Dispatch `security-reviewer` (security) or `fable-reviewer` with `mode: pr` (fable), NO `model` parameter. The prompt starts with

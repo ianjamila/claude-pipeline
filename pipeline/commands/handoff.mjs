@@ -58,7 +58,7 @@ async function quickVerifyOnMerge({ root, command, tree, head, baseTip, pr, env 
 }
 
 // main's commits since the fork point with their files (the LISTED ones are capped), every file main changed in the whole range
-// (never capped: the overlap must not depend on which commits are shown), and the files this PR changes.
+// (never capped, per commit: the overlap must not depend on which commits are shown), and the files this PR changes.
 function baseFacts({ root, head, baseTip }) {
   const o = { cwd: root };
   const mb = mergeBase(head, baseTip, o);
@@ -69,7 +69,8 @@ function baseFacts({ root, head, baseTip }) {
     return { sha, subject: subject.join('\t'), files };
   });
   const totalCommits = Number.parseInt(git(['rev-list', '--count', `${mb}..${baseTip}`], o).trim(), 10);
-  const baseFiles = git(['diff', '--name-only', '--no-renames', '-z', mb, baseTip], o).split('\0').filter(Boolean);
+  // The union of every commit's paths (as the per-commit listing above), not the net diff: a change reverted inside the range still counts.
+  const baseFiles = [...new Set(git(['log', '--format=', '--name-only', '-z', '-m', '--first-parent', '--no-renames', `${mb}..${baseTip}`], o).split('\0').filter(Boolean))];
   const prFiles = [...new Set(diffFiles(mb, head, o).flatMap((f) => [f.path, f.oldPath, f.newPath].filter(Boolean)))];
   return { commits, totalCommits: Number.isInteger(totalCommits) ? totalCommits : commits.length, truncated: totalCommits > commits.length, baseFiles, prFiles };
 }
