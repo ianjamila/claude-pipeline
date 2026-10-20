@@ -12,7 +12,8 @@ import { createGitHub, guardGh } from '../lib/github.mjs';
 import { headSha } from '../lib/git.mjs';
 import { currentProduction } from '../lib/deploy.mjs';
 import { envWithGhDir, runShellAsync } from '../lib/proc.mjs';
-import { postEvent } from '../lib/run-events.mjs';
+import { newestStopId, postEvent, readEvents, stopHistory } from '../lib/run-events.mjs';
+import { ownerStopProblems } from '../lib/owner-stop.mjs';
 import { proofLine } from '../lib/run-record.mjs';
 import { readSummaryComment } from '../lib/summary-comment.mjs';
 import { createRunRecorder, inFlightSince } from '../lib/run-progress.mjs';
@@ -25,7 +26,7 @@ import {
 
 export const meta = {
   summary: 'merge the PR if (and only if) the final gate passes again, live; waits for MERGED',
-  usage: 'pipeline merge --pr N [--owner-approved-head SHA --owner-approved-items DIGEST] [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?, warnings?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment. While it runs the run record of the PR shows inFlight {kind: merge} and step merge; a prod-before event comment (the known-good deployment) is posted before the merge command, and when that post fails nothing is merged (error pre-merge); for a repo with verify.deferrable_steps the proofs of the live gate (where each deferrable step was proved: the Mac, or a GitHub run and attempt) are recorded in the run record and in an append-only ci-proof-used event comment before the merge command too, and when either write fails nothing is merged (error pre-merge); warnings lists a run record write that failed (never fatal). A run record marked resumed (`P checkpoint --resumed`: a run taken over by ship resume) refuses with error pre-merge unless the owner approved it; so does a run record that cannot be checked (unreadable, invalid or unsupported: it may be a resumed one), and with owner_approval: chat a gate with ownerMerge > 0. Approved = --owner-approved-head names the full gate head, --owner-approved-items the gate\'s ownerItems, AND the owner-go hook recorded the owner\'s \"merge\" for exactly that PR, head and item set (the flags alone refuse); the live gate must still show those ownerItems',
+  usage: 'pipeline merge --pr N [--owner-approved-head SHA --owner-approved-items DIGEST] [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?, warnings?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment. While it runs the run record of the PR shows inFlight {kind: merge} and step merge; a prod-before event comment (the known-good deployment) is posted before the merge command, and when that post fails nothing is merged (error pre-merge); for a repo with verify.deferrable_steps the proofs of the live gate (where each deferrable step was proved: the Mac, or a GitHub run and attempt) are recorded in the run record and in an append-only ci-proof-used event comment before the merge command too, and when either write fails nothing is merged (error pre-merge); warnings lists a run record write that failed (never fatal). A run record marked resumed (`P checkpoint --resumed`: a run taken over by ship resume) refuses with error pre-merge unless the owner approved it; so does a run record that cannot be checked (unreadable, invalid or unsupported: it may be a resumed one), and with owner_approval: chat a gate with ownerMerge > 0. With owner_approval: chat the needs-human label is ignored and an open owner stop (an owner-stop event the owner has not released, a stop held on this machine that has not reached GitHub, or an events list that cannot be read) refuses with error pre-merge before the branch is touched, at the last look before the merge command and on every poll of the wait (which then ends blocked with auto-merge disabled). Approved = --owner-approved-head names the full gate head, --owner-approved-items the gate\'s ownerItems, AND the owner-go hook recorded the owner\'s \"merge\" for exactly that PR, head and item set (the flags alone refuse); the live gate must still show those ownerItems',
 };
 
 const APPROVAL_FLAGS = "--owner-approved-head <full head> --owner-approved-items <the gate's ownerItems>";
@@ -58,6 +59,30 @@ export const run = guarded(async (argv, ctx) => {
     });
     if (refusals.length > 0) return refuse('gate', refusals);
 
+    // 1.5 Owner stops (chat mode), BEFORE anything touches the branch. The one reader (ownerStopProblems: a stop held on this machine is flushed first, the events are
+    // read for THIS PR, a failed read counts as open) refuses on any open stop, whatever the owner said: a stop is released by the owner's reply (`P checkpoint --resumed`),
+    // never merged over. Then a release event marks the run as resumed, and the owner's "merge" must have been given to a request that carried the PR's NEWEST stop id
+    // (no stop at all = no requirement, so label mode and untouched PRs behave as before).
+    let stopId = null;
+    let anyRelease = false;
+    let expectedStops; // the history the approval below is bound to; the last look and every wait poll refuse when it changes
+    if (config.owner_approval === 'chat') {
+      const open = await ownerStopProblems({ gh, pr, root, ownerApproval: 'chat', deps: ctx.ownerStopDeps });
+      if (open.length > 0) {
+        const reason = `${open.join('; ')}: nothing is merged`;
+        return refuse('pre-merge', [reason], { reason });
+      }
+      try {
+        const events = readEvents(gh, pr);
+        stopId = newestStopId(events);
+        anyRelease = events.some((e) => e.kind === 'owner-stop-released');
+        expectedStops = stopHistory(events);
+      } catch (err) {
+        const reason = `owner stops could not be read from GitHub (${String(err?.message ?? err).slice(0, 160)}): nothing is merged`;
+        return refuse('pre-merge', [reason], { reason });
+      }
+    }
+
     // 1a. A resumed run never merges on its own: the run record (viewer-authored, so not forgeable by a commenter) says whether this
     // run was taken over by `ship resume`; if so the owner's approval of THIS exact head must come in as a flag. Read before
     // anything irreversible. A record that cannot be checked (unreadable comments, an invalid or newer record) fails CLOSED: it
@@ -70,8 +95,10 @@ export const run = guarded(async (argv, ctx) => {
       if (values['owner-approved-head'] !== gate.head || !/^[0-9a-f]{40}$/.test(gate.head)) approvalProblem = '--owner-approved-head is not the gate head';
       else if (typeof gate.ownerItems !== 'string') approvalProblem = 'the gate file names no owner-item set (written by an older final-gate): run final-gate again';
       else if (values['owner-approved-items'] !== gate.ownerItems) approvalProblem = `--owner-approved-items is not the gate's owner-item set (${gate.ownerItems})`;
-      else if (!approvedRequest({ pr, head: gate.head, items: gate.ownerItems })) {
-        approvalProblem = `no owner "merge" is recorded for #${pr} head ${gate.head.slice(0, 12)} items ${gate.ownerItems}: show the request (Owner-merge approval in the ship skill) and wait for the owner to type "merge"`;
+      else if (!approvedRequest({ pr, head: gate.head, items: gate.ownerItems, stop: stopId })) {
+        approvalProblem = stopId
+          ? `no owner "merge" is recorded for #${pr} head ${gate.head.slice(0, 12)} items ${gate.ownerItems} that carries stop ${stopId}: show the request with its \`Stopped #${pr} · stop ${stopId}\` line above the Head line and wait for the owner to type "merge"`
+          : `no owner "merge" is recorded for #${pr} head ${gate.head.slice(0, 12)} items ${gate.ownerItems}: show the request (Owner-merge approval in the ship skill) and wait for the owner to type "merge"`;
       }
     }
     const ownerApproved = values['owner-approved-head'] !== undefined && approvalProblem === null;
@@ -85,7 +112,7 @@ export const run = guarded(async (argv, ctx) => {
       unchecked = `the run record could not be read (${String(err?.message ?? err).slice(0, 200)})`;
     }
     if (!ownerApproved) {
-      if (existing?.status === 'ok' && existing.record.resumed) {
+      if ((existing?.status === 'ok' && existing.record.resumed) || anyRelease) {
         const reason = withProblem(`resumed run: the owner must say "merge" for this exact head (then pass ${APPROVAL_FLAGS})`);
         return refuse('pre-merge', [reason], { reason });
       }
@@ -158,7 +185,7 @@ export const run = guarded(async (argv, ctx) => {
     }, { initialStep: 'merge' });
     const attempt = async () => {
       // 3b. The live gate ran slow probes after it read the PR: look at GitHub once more, right before the merge command.
-      const late = await preMergeProblems({ gh, pr, head: gate.head });
+      const late = await preMergeProblems({ gh, pr, head: gate.head, ownerApproval: config.owner_approval, root, deps: ctx.ownerStopDeps, expectedStops });
       if (late.length > 0) return refuse('pre-merge', late);
 
       // 3c. Fail CLOSED: the prod-before event is the only copy of the rollback target that survives this machine (prod-watch
@@ -218,7 +245,7 @@ export const run = guarded(async (argv, ctx) => {
 
       // 5. Wait for MERGED, re-checking the blockers on every poll. If the command failed it may still have merged (a
       // branch-delete error after a merge exits non-zero), so look once before calling it a failure.
-      const outcome = await waitForMerge({ gh, pr, waitMs: ran.code === 0 ? waitMs : 0, pollMs, blockers: waitBlockers(gh) });
+      const outcome = await waitForMerge({ gh, pr, waitMs: ran.code === 0 ? waitMs : 0, pollMs, blockers: waitBlockers(gh, { pr, root, ownerApproval: config.owner_approval, deps: ctx.ownerStopDeps, expectedStops }) });
       if (outcome.state === 'merged') {
         return merged(outcome.mergeSha, ran.code === 0 ? {} : { commandExitCode: ran.code, note: 'the merge command exited non-zero but the PR is MERGED' });
       }

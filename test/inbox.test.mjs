@@ -229,10 +229,13 @@ test('owner-decision without a recorded reason still explains itself', () => {
   assert.ok(r.reason.length > 0);
 });
 
-test('label-mode leftover: chat repo + hard-stop-only needs-human', () => {
-  const r = cls({ labels: ['needs-human'], record: atOwner, needsHumanReason: 'migrations', needsHumanHardStopOnly: true }, { ownerApproval: 'chat' });
-  assert.equal(r.waitingOn, 'owner-decision');
-  assert.equal(r.reason, 'label-mode leftover: remove the needs-human label, then ship resume 7');
+test('chat repo: a leftover needs-human label (hard-stop-only or not) with no stop event changes nothing', () => {
+  for (const hardStopOnly of [true, false]) {
+    const r = cls({ labels: ['needs-human'], record: atOwner, needsHumanReason: 'migrations', needsHumanHardStopOnly: hardStopOnly }, { ownerApproval: 'chat' });
+    assert.notEqual(r.waitingOn, 'owner-decision', String(hardStopOnly));
+    assert.doesNotMatch(r.reason, /label/);
+    assert.doesNotMatch(r.reason, /migrations/);
+  }
 });
 
 test('label-mode repo keeps hard-stop-only needs-human as a plain owner decision', () => {
@@ -241,10 +244,45 @@ test('label-mode repo keeps hard-stop-only needs-human as a plain owner decision
   assert.doesNotMatch(r.reason, /label-mode leftover/);
 });
 
-test('chat repo, needs-human NOT hard-stop-only, is a plain owner decision', () => {
-  const r = cls({ labels: ['needs-human'], record: atOwner, needsHumanReason: 'judge disagreed', needsHumanHardStopOnly: false }, { ownerApproval: 'chat' });
-  assert.doesNotMatch(r.reason, /label-mode leftover/);
-  assert.match(r.reason, /judge disagreed/);
+const stopEv = (id, over = {}) => ({ kind: 'owner-stop', id, commentId: 10, dataStatus: 'ok', data: { cause: 'hard-stop' }, ...over });
+const releaseEv = (id) => ({ kind: 'owner-stop-released', id, commentId: 11, dataStatus: 'ok', data: {} });
+const chatOpts = { ownerApproval: 'chat' };
+
+test('chat repo: an open owner stop event => owner-decision, with the cause and what to type; a released stop is not', () => {
+  const r = cls({ events: [stopEv('aabbccdd')] }, chatOpts);
+  assert.equal(r.waitingOn, 'owner-decision');
+  assert.equal(r.suggest, 'leave');
+  assert.match(r.reason, /stop aabbccdd/);
+  assert.match(r.reason, /hard-stop/);
+  assert.equal(r.nextAction, 'leave: owner decision needed (stop aabbccdd: hard-stop); rule or reply in chat, then ship resume 7');
+  assert.equal(cls({ events: [stopEv('aabbccdd'), releaseEv('aabbccdd')] }, chatOpts).waitingOn, 'owner-merge');
+  // an unreadable stop payload still counts as open (fail closed)
+  assert.equal(cls({ events: [stopEv('11223344', { dataStatus: 'bad', data: null })] }, chatOpts).waitingOn, 'owner-decision');
+  // label mode never reads owner stops
+  assert.equal(cls({ events: [stopEv('aabbccdd')] }, { ownerApproval: 'label' }).waitingOn, 'owner-merge');
+});
+
+test('chat repo: open needsHuman review items => owner-decision naming the ids', () => {
+  const r = cls({ triage: triage({ clean: false, needsHumanItems: ['R1-2', 'R1-5'] }) }, chatOpts);
+  assert.equal(r.waitingOn, 'owner-decision');
+  assert.match(r.reason, /R1-2, R1-5/);
+  assert.match(r.nextAction, /^leave: owner decision needed \(.*R1-2, R1-5.*\); rule or reply in chat, then ship resume 7$/);
+  assert.equal(cls({ triage: triage({ clean: false, needsHumanItems: ['R1-2'] }) }, { ownerApproval: 'label' }).waitingOn, 'review');
+});
+
+test('chat repo: awaiting-owner-merge + a leftover label is owner-merge, not pipeline; label mode still re-gates', () => {
+  const chatR = cls({ labels: ['needs-human'], record: midRun({ step: 'awaiting-owner-merge', outcome: 'awaiting-owner-merge', head: HEAD }) }, chatOpts);
+  assert.equal(chatR.waitingOn, 'owner-merge');
+  assert.equal(chatR.suggest, 'merge');
+  assert.doesNotMatch(chatR.reason, /label/);
+  const labelR = cls({ labels: ['needs-human'], record: midRun({ step: 'awaiting-owner-merge', outcome: 'awaiting-owner-merge', head: HEAD }) }, { ownerApproval: 'label' });
+  assert.equal(labelR.waitingOn, 'pipeline');
+});
+
+test('chat repo: a mid-run record with the label does not get the label fragment', () => {
+  const r = cls({ labels: ['needs-human'], record: midRun() }, chatOpts);
+  assert.equal(r.waitingOn, 'pipeline');
+  assert.ok(!r.reason.includes('needs-human label present'));
 });
 
 // A run that stalls mid-review on a hard-stop PR carries the label before it has stopped: only a run that ENDED (or one we

@@ -23,7 +23,7 @@ Into `~/.claude` (or `$CLAUDE_CONFIG_DIR`):
 | hook `guard-git` (matcher `Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks pushes/force-pushes to `main`, admin merges, protection edits, approval-label changes, whether typed in a shell, a `Monitor` command, a script file or an MCP tool call |
 | hook `guard-files` (matcher `Edit\|Write\|MultiEdit\|NotebookEdit\|Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks agents editing the pipeline's own files and settings — **installed last**, after the proofs |
 | hook `session-version` (SessionStart) | tells you at the top of a session when the installed pipeline is stale, edited, half-installed or older than a repo's vendored copy; silent when all is well (see [Staying current](#staying-current)) |
-| hook `owner-go` (UserPromptSubmit) | records your chat "merge" (a prompt that starts with "merge") against the PR, head and owner items the reply before it showed, so `P merge` and the guards can tell your approval from the agent's word (`owner_approval: chat`, resumed runs); never blocks or changes a prompt |
+| hook `owner-go` (UserPromptSubmit) | records your chat "merge" (a prompt that starts with "merge") against the PR, head and owner items the reply before it showed, so `P merge` and the guards can tell your approval from the agent's word (`owner_approval: chat`, resumed runs); it also records `ship resume N` / `resume N` as the release of an owner stop; never blocks or changes a prompt |
 | hook `stack-register` (PreToolUse on `Bash` and the file tools `Read\|Edit\|Write\|Grep\|Glob\|NotebookEdit`, 30 s) | records which private Supabase stack a session is about to use, before the tool runs; **fail-closed** like the guards (an unloadable file blocks with exit 2) |
 | hook `stack-dev-bind` (PostToolUse on `Bash`, 10 s) | notes which stack a dev server you started is bound to; non-blocking |
 | hook `stack-session-end` (SessionEnd, 10 s) | when a session ends (not on `/clear`) it starts a detached worker that decides whether that session's stacks can be stopped; non-blocking |
@@ -182,12 +182,22 @@ smoke opens a `pipeline-rollback` issue that has the same effect until you close
 
 | Label | Meaning | What you do |
 |---|---|---|
-| `needs-human` | a blocking hard-stop (migration, auth/RLS, secrets, pipeline files, major dependency bump, sensitive personal data, project extras; a project can make the non-database ones report-only, except the guard core `R4-pipeline` (workflows, `.claude/`, CODEOWNERS, pipeline scripts, files the CI checks read), via `hard_stops.report_only_rules` / `report_only_paths`: listed, never blocking) or something the pipeline couldn't settle | read the PR and its summary comment; to approve add `human-approved` in the GitHub UI (while the PR still shows the commit you reviewed), `Hard-stop scan` re-runs, then merge. A new push drops the approval: re-apply it |
+| `needs-human` | a blocking hard-stop (migration, auth/RLS, secrets, pipeline files, major dependency bump, sensitive personal data, project extras; a project can make the non-database ones report-only, except the guard core `R4-pipeline` (workflows, `.claude/`, CODEOWNERS, pipeline scripts, files the CI checks read), via `hard_stops.report_only_rules` / `report_only_paths`: listed, never blocking) or something the pipeline couldn't settle (label mode only: see the chat-mode note below the table) | read the PR and its summary comment; to approve add `human-approved` in the GitHub UI (while the PR still shows the commit you reviewed), `Hard-stop scan` re-runs, then merge. A new push drops the approval: re-apply it |
 | `pipeline-blocked` | verify stayed red after three fix cycles | the draft PR has the failing step and log excerpt |
 | `awaiting-review` | Codex was unavailable | say "resume pipeline reviews" later |
 | `test-change-approved` (you add it) | approves a PR that weakens or deletes tests; like `human-approved` it covers only the commit it was applied to | — |
 
 Hard-stop PRs still go through the full review loop first, so you always get a reviewed PR.
+
+**Chat mode (`owner_approval: chat`) never adds the `needs-human` label** and ignores one already on a PR. A stop is a PR comment, a phone push, and a
+chat message ending `Stopped #123 · stop 3fa9c2e1` then `⏸ Waiting on you for #123`. You release it by typing `ship resume 123` (also `/ship resume 123`,
+`resume 123`), or "merge" when Claude offered a merge; only your own typed message counts, Claude cannot release a stop. A typed "merge" never carries over
+a stop: if something stopped after you said it, say "merge" again to the new request, which shows the new stop line. A new session starts with
+`ship resume 123`: Claude shows the stop line and you confirm once with `resume 123`. Claude then runs `git pull --ff-only` and `P checkpoint --resumed`,
+the final gate and `P merge`. What still needs you: rulings on review items, hard-stop files, every merge with owner items. Stops are append-only events on
+the PR (the authority); if GitHub was down at the moment of a stop it is held on that computer until it reconnects. Rolling out: run `pipeline update` on
+EVERY machine (Mac and PC) before switching a repo to chat; an old install ignores the new stop events. eaglewatch: its own merge script still refuses a
+leftover `needs-human` label until its merge-check change lands, so remove old labels in GitHub meanwhile.
 
 ## Enforcement — what stops what
 
@@ -205,7 +215,7 @@ Hard-stop PRs still go through the full review loop first, so you always get a r
 | Pause switch | | | ✅ can't close the pause issue | ✅ |
 | Production smoke + rollback | | | | ✅ prod-watch |
 | Agents can't edit their own rules | ✅ protection edits need admin | | ✅ guard-files / guard-git | |
-| Owner items (`owner_approval: chat`) and resumed runs merge only on your chat "merge" for that head and item set | | | ✅ owner-go records (guard-files protects them); guard-git refuses a direct merge in a chat repo without one | ✅ `P merge` checks the record |
+| Owner items (`owner_approval: chat`) and resumed runs merge only on your chat "merge" for that head and item set | | | ✅ owner-go records (guard-files protects them); guard-git always refuses a direct merge in a chat repo (only `P merge` merges) | ✅ `P merge` checks the record |
 
 The label-based approvals rely on the local hook because the agents use your GitHub account.
 
@@ -250,12 +260,10 @@ head you did not review (the receipt names the head the event carried).
   your GitHub token: a program the guards cannot see into (a script that builds the record path at run time, a test that
   calls the recorder's library, `curl` with your token, a local edit of the refs or `pipeline.yml` the guard reads) can still
   forge or skip it, and chat-mode CI passes owner items. It stops mistakes and casual workarounds, not a determined agent. The
-  server-side backstop is a second GitHub identity plus a ruleset (issue #65). A direct `gh pr merge` in a chat repo must pin
-  the head (`--match-head-commit`, or the head flag of the repo's merge command) the owner said "merge" for in this session. When
-  the repo's merge command is a package script (`npm run merge -- {pr} --expect-head {sha}`), only that exact shape typed by hand is approvable: the
-  template's own words, then `--`, the PR and the pin, with nothing between the script name and `--` and no manager option before it. Any other way
-  of running the script (another manager or spelling, `run-script`, a wrapper such as `npx npm@11`, `--prefix` / `-C` / `--cwd` / workspace options,
-  words before `--`) is refused in a chat repo; the refusal names the exact form. Merge through `P merge --pr N` otherwise. The chat
+  server-side backstop is a second GitHub identity plus a ruleset (issue #65). In a chat repo the guard always refuses an agent's direct
+  merge: `gh pr merge` in any form (`--auto` too), the repo's merge command typed by hand (any spelling) and `curl` / `wget` calls to the
+  merge API; agents merge only through `P merge --pr N`, which checks your recorded "merge" and any open owner stop. A revert PR opened by
+  prod-watch in a chat repo is a draft with no label: you mark it ready after looking. The chat
   mode is read from the repository the command runs in: a nested or separate clone whose own `pipeline.yml` is not chat is
   not caught (a protected registry of chat repos is the planned fix).
 - **Branch protection needs GitHub Pro** for private repos. Without it a repo runs in `gate`
@@ -276,8 +284,8 @@ head you did not review (the receipt names the head the event carried).
 
 `.claude/pipeline.yml` is documented in its template (`pipeline/templates/pipeline.yml`). Three keys deserve a
 mention: `owner_approval` (`label` by default; `chat` drops the approval labels: blocking hard-stops and test-integrity
-violations no longer fail CI, the ship skill stops before the merge, lists them in a PR comment and merges when you say
-"merge" in chat; the PR ends as `awaiting-owner-merge`), `ci.guard_checks` (default `true`: the `Test integrity` and `Hard-stop scan` statuses are always
+violations no longer fail CI, the ship skill stops before the merge, lists them in a PR comment and `P merge` merges when you say
+"merge" in chat; the PR ends as `awaiting-owner-merge`; `chat` also never adds `needs-human`, see "When a PR stops for you"), `ci.guard_checks` (default `true`: the `Test integrity` and `Hard-stop scan` statuses are always
 required on top of `ci.required_checks`; `false` only for a repo that does not run `pipeline-guards.yml`)
 and `ci.approvers` (logins whose approval labels count; required for org-owned repos, otherwise approvals
 fail closed with `org-repo-needs-ci.approvers`). `pipeline config` prints `warnings` for config that is valid
@@ -355,7 +363,7 @@ executable.
   `model_not_found`; it never silently falls back).
   With `owner_approval: chat` you can instead rule on the disputed items in chat: the run records it with
   `pipeline triage owner-ruling` (your exact words are published in the triage comment), you still say "merge"
-  yourself, then remove `needs-human` and say `ship resume N`.
+  yourself, then say `ship resume N` (there is no label to remove in a chat repo).
 - **Installer refuses** "inside a Claude Code session": run it from your own terminal.
 - **`--check` reports drift:** someone edited an installed file (or an install did not finish); run `node ~/.claude/pipeline/bin/pipeline.mjs update`, or re-run `./install.sh`.
 - **A merge didn't happen:** the run's summary comment and `.review/final-gate.json` in the

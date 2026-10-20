@@ -156,16 +156,18 @@ permissions / data-integrity / data-loss item ⇒ `needsHuman` (the CLI applies 
 `P state outcome` (exit 0 whether or not clean; read `clean`) →
 - `clean` (no open BLOCKING, no new ACCEPTED this round, nothing `needsHuman`, and review
   coverage matches the current content hash) ⇒ leave the loop.
-- `needsHuman` non-empty ⇒ **park needs-human** (label, comment, `P summary --outcome needs-human`), stop.
+- `needsHuman` non-empty ⇒ **park needs-human** (label mode: label; both: comment, `P summary --outcome needs-human`), stop.
 - else if `<round>` < max ⇒ round `<round>`+1 (reviews only the diff since this round's head).
 - else if `extraRound` ⇒ ONE extra round `<round>`+1 (the last: it reviews only the fixes since this round's head; afterwards `extraRound` is false, so anything not clean parks).
-- else ⇒ **park needs-human** with the unresolved list (same label, comment, `P summary`), stop.
+- else ⇒ **park needs-human** with the unresolved list (same sequence, `P summary` included), stop.
 
-**Park needs-human** (every `needs-human` stop in this loop is this exact sequence, never a bare label):
+**Park needs-human** (every `needs-human` stop in this loop is this exact sequence, never a bare label). `owner_approval: label`:
 `gh pr edit <pr> --add-label needs-human`, `P comment --pr <pr> --kind needs-human --reason "…"` (no `--hits-file`),
 `P summary --pr <pr> --outcome needs-human --action "<the one thing the owner does>" --cause review:<reason>`
 (`<reason>`: `unresolved`, `needs-human-items`, `judge:not-found` …), `P agent-log publish --line "<agentLogLine>"`, stop.
-With `owner_approval: chat` and `needsHuman` items, the `--action` is "Rule on <ids> in chat (accept / follow-up / reject), remove needs-human, then say ship resume N".
+`owner_approval: chat`: the same WITHOUT the label (it is never added, and one already there is ignored): the summary opens an owner stop, so print its `reply`
+lines (`Stopped #N · stop <id>`, then the `⏸ Waiting on you` line) verbatim as the last lines of your message before you stop. With `needsHuman` items the `--action` is
+"Rule on <ids> in chat (accept / follow-up / reject), then say ship resume N".
 An arbiter ruling that parked an item makes the push an arbiter escalation by itself: summary reads the state.
 
 ### Owner rules in chat (`owner_approval: chat` only)
@@ -180,7 +182,9 @@ word in chat, never by you. When the owner rules on it ("accept R4-B1", "follow-
 2. `P comment --pr <pr> --kind triage` (re-post, so the ruling is published), then `P followups create --round <round>` for FOLLOW-UP,
    then post the triage comment again for the issue links.
 3. ACCEPT: it is not clean until built and reviewed: implement it (step 6), `P state mark-implemented`, and run a new round.
-4. The owner removes `needs-human` (never you) and says `ship resume <pr>`; resume routes to `review` or `gate`.
+4. No label to remove. After the owner's rulings, they type `ship resume <pr>` (or `/ship resume <pr>`); then `git pull --ff-only` if the branch moved and run
+   `P checkpoint --pr <pr> --step review|gate --resumed` (the step `P resume plan` names; it releases the stop the summary opened only on the owner's recorded reply, see **Owner stops** in
+   `SKILL.md`). Resume routes to `review` or `gate`; unresolved items still fail the `review` check after a release.
 
 Any commit after the last clean round that changes PR content (the agent log is never committed to a
 PR branch) invalidates coverage — `P final-gate` will demand another round.

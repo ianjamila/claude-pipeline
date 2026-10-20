@@ -35,6 +35,7 @@ test('protectedRoots lists the pipeline files under <home>/.claude in POSIX form
     '/home/u/.claude/pipeline',
     '/home/u/.claude/settings.json',
     '/home/u/.claude/pipeline-state/owner-go',
+    '/home/u/.claude/pipeline-state/owner-stops',
   ]);
   assert.equal(protectedRoots('C:\\Users\\u\\')[0], 'C:/Users/u/.claude/skills/ship');
 });
@@ -874,6 +875,14 @@ test('hook: a script file in the real working directory is read by the hook', (t
   const run = (command) => runHook({ tool_name: 'Bash', tool_input: { command }, cwd: path.join(home, 'proj') }, { home });
   for (const c of ['bash w.sh', './w.sh', 'source w.sh', 'env bash w.sh']) assert.equal(JSON.parse(run(c).stdout).hookSpecificOutput.permissionDecision, 'deny', c);
   assert.equal(run('bash ok.sh').stdout, '');
+});
+
+// ---- owner stops: the local pending stop files (owner_approval: chat) -------------------------------------------------
+test('owner-stops: the pending stop folder is protected from every write; reading it stays open', () => {
+  const R = '/home/u/.claude/pipeline-state/owner-stops';
+  assert.equal(file('Write', { file_path: `${R}/o__r__1__ab12cd34.json`, content: '{}' }), 'deny');
+  for (const cmd of [`rm ${R}/o__r__1__ab12cd34.json`, `rm -rf ${R}`, `echo '{}' > ${R}/x.json`]) assert.equal(bash(cmd), 'deny', cmd);
+  assert.equal(bash(`cat ${R}/o__r__1__ab12cd34.json`), 'allow');
 });
 
 // ---- #58: the owner-go records and recorder ---------------------------------------------------------------------------

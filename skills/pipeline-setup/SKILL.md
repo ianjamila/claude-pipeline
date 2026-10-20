@@ -8,7 +8,7 @@ when_to_use: Onboarding any git repo (any stack) to the autonomous pipeline, re-
 
 `P` = `node ~/.claude/pipeline/bin/pipeline.mjs`. Templates live in
 `~/.claude/pipeline/templates/`. The onboarding PR touches pipeline files, so it is a hard-stop
-by definition: it ends `needs-human` and the owner merges it. Never push to `main`.
+by definition: it ends `needs-human` (label mode, the new config's default) and the owner merges it. Never push to `main`.
 
 ## a. Audit (changes nothing in the repo yet)
 

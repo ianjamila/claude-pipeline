@@ -150,6 +150,7 @@ export const run = guarded(async (argv, ctx) => {
         isCrossRepository: p.isCrossRepository, baseRefName: p.baseRefName, ci, ciFailed: ciInfo.failed, conflicts: conflictsFact(g.conflicts, p.mergeable), alreadyOnBase: g.alreadyOnBase,
         record: a.record, recordStatus: a.recordStatus, triage: a.triage, contentHash: g.contentHash,
         needsHumanReason: a.needsHumanReason, needsHumanHardStopOnly: a.needsHumanHardStopOnly,
+        events: a.events,
         activity: { commitDate: p.commitDate, commentUpdatedAts: a.commentUpdatedAts, reviewDates: p.reviewDates, createdAt: p.createdAt },
         local: localForClassifier(ls, p.headRefName),
       }, { staleDays, now, ownerApproval: config.owner_approval });

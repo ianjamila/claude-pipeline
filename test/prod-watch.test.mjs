@@ -89,6 +89,7 @@ function harness(over = {}) {
   const issueCreate = seq(over.issueCreate ?? [{ number: 50, url: 'https://github.com/acme/widgets/issues/50' }]);
   const prCreate = seq(over.prCreate ?? [{ number: 51, url: 'https://github.com/acme/widgets/pull/51' }]);
   const issueComment = seq([null]);
+  const ownerStopCalls = [];
   const revertBranch = seq(over.revertBranch ?? [{ branch: 'agent/revert-12', subject: 'Add widget (#12)' }]);
   const findDeployment = seq(over.findDeployment ?? [{ state: 'success', id: 11, url: 'https://ours-abc-team.vercel.app', createdAt: DEPLOYED_AT }]);
   const sleeps = [];
@@ -126,6 +127,7 @@ function harness(over = {}) {
       deploymentStatuses: async (id) => (over.ghStatuses ?? {})[id] ?? [],
     },
     git: { revertBranch: async (a) => { mark('revert'); return revertBranch(a); } },
+    ...(over.ownerStopEvent === false ? {} : { ownerStopEvent: async (n, d) => { mark('ownerstop'); ownerStopCalls.push([n, d]); if (over.ownerStopFail) throw new Error('gh api: 502 Bad Gateway'); } }),
     sleep: async (ms) => { sleeps.push(ms); if (over.sleep) over.sleep(ms, sleeps.length); },
     now: () => T + 5000,
     lock: over.lock ?? (async (name, fn) => {
@@ -143,7 +145,7 @@ function harness(over = {}) {
     note: () => {},
   };
   return {
-    log, held, sleeps, locks, posted, recordCalls, smoke, inspect, rollbackFn, issueCreate, prCreate, issueComment, revertBranch, findDeployment,
+    log, held, sleeps, locks, posted, ownerStopCalls, recordCalls, smoke, inspect, rollbackFn, issueCreate, prCreate, issueComment, revertBranch, findDeployment,
     go: (opts = {}) => runProdWatch({ config: over.config ?? config(), sha: SHA, pr: 12, root: '/repo', ...opts }, deps),
   };
 }
@@ -301,6 +303,83 @@ test('recovered: failing smoke on our live deployment rolls back to the known-go
   assert.match(pr.body, /issues\/50/);
   assert.equal(r.revertPr.number, 51);
   assert.equal(r.issue.number, 50);
+});
+
+// ---- owner_approval: chat (no needs-human label anywhere) -------------------------------------------------------------
+
+const chatConfig = () => ({ ...config(), owner_approval: 'chat' });
+
+test('chat: non-pausing outcomes open the incident issue with NO labels; pausing outcomes keep pipeline-rollback', async () => {
+  for (const [name, h] of [
+    ['deploy-failed', harness({ config: chatConfig(), findDeployment: [{ state: 'failure', id: 11, url: 'https://ours-abc-team.vercel.app', createdAt: DEPLOYED_AT }] })],
+    ['deploy-not-observed', harness({ config: chatConfig(), findDeployment: [{ state: 'timeout' }] })],
+    ['superseded', harness({ config: chatConfig(), smoke: [FAIL, FAIL, PASS], inspect: [NEWER] })],
+  ]) {
+    const r = await h.go();
+    assert.equal(r.outcome, name);
+    assert.deepEqual(h.issueCreate.calls[0][0].labels, [], name);
+  }
+  const failed = harness({ config: chatConfig(), smoke: [FAIL, FAIL, FAIL], inspect: [OURS, OURS, OURS], rollback: [{ ok: false, code: 1, tail: 'boom' }] });
+  const r = await failed.go();
+  assert.equal(r.outcome, 'rollback-failed');
+  assert.deepEqual(failed.issueCreate.calls[0][0].labels, ['pipeline-rollback']);
+});
+
+test('chat recovered: the revert PR is a draft with no label, an owner-stop event is posted on the NEW PR, and nothing un-drafts it', async () => {
+  const h = harness({ config: chatConfig(), smoke: [FAIL, FAIL, PASS], inspect: [OURS, OURS, OLDER] });
+  const r = await h.go();
+  assert.equal(r.outcome, 'recovered');
+  const call = h.prCreate.calls[0][0];
+  assert.equal(call.draft, true);
+  assert.deepEqual(call.labels, []);
+  assert.equal(r.revertPr.number, 51);
+  assert.equal(h.ownerStopCalls.length, 1);
+  assert.equal(h.ownerStopCalls[0][0], 51);
+  assert.match(h.ownerStopCalls[0][1].cause, /^[A-Za-z0-9:_.-]{1,60}$/);
+  assert.ok(h.log.indexOf('pr') < h.log.indexOf('ownerstop'));
+  assert.equal(h.held.ownerstop, true, 'posted inside the production lock like the rest of the recovery');
+  assert.deepEqual(h.issueCreate.calls[0][0].labels, ['pipeline-rollback']);
+  assert.equal(r.warnings, undefined);
+  // the next steps are mode-aware
+  const body = h.issueCreate.calls[0][0].body;
+  assert.doesNotMatch(body, /needs-human/);
+  assert.match(body, /draft/);
+  assert.match(body, /owner decision/);
+});
+
+test('chat recovered: a failing owner-stop post is a warning only; the revert PR still exists as a draft', async () => {
+  const h = harness({ config: chatConfig(), smoke: [FAIL, FAIL, PASS], inspect: [OURS, OURS, OLDER], ownerStopFail: true });
+  const r = await h.go();
+  assert.equal(r.outcome, 'recovered');
+  assert.equal(r.revertPr.number, 51);
+  assert.equal(h.prCreate.calls[0][0].draft, true);
+  assert.equal(r.revertPrError, undefined);
+  assert.ok(r.warnings.some((w) => /owner-stop/.test(w) && /502/.test(w)), JSON.stringify(r.warnings));
+});
+
+test('chat recovered without a PR number (--sha only): the owner-stop event still goes on the revert PR', async () => {
+  const h = harness({ config: chatConfig(), smoke: [FAIL, FAIL, PASS], inspect: [OURS, OURS, OLDER] });
+  const r = await h.go({ pr: null });
+  assert.equal(r.outcome, 'recovered');
+  assert.equal(h.ownerStopCalls[0][0], 51);
+});
+
+test('chat: a revert PR that was not created posts no owner-stop event', async () => {
+  const h = harness({ config: chatConfig(), smoke: [FAIL, FAIL, PASS], inspect: [OURS, OURS, OLDER], revertBranch: [new Error('CONFLICT')] });
+  await h.go();
+  assert.equal(h.ownerStopCalls.length, 0);
+});
+
+test('label mode keeps the labelled, non-draft revert PR, needs-human issues, and posts no owner-stop event', async () => {
+  const h = harness({ smoke: [FAIL, FAIL, PASS], inspect: [OURS, OURS, OLDER] });
+  await h.go();
+  assert.deepEqual(h.prCreate.calls[0][0].labels, ['needs-human']);
+  assert.notEqual(h.prCreate.calls[0][0].draft, true);
+  assert.equal(h.ownerStopCalls.length, 0);
+  assert.match(h.issueCreate.calls[0][0].body, /revert PR \(needs-human\)/);
+  const d = harness({ findDeployment: [{ state: 'failure', id: 11, url: 'https://ours-abc-team.vercel.app', createdAt: DEPLOYED_AT }] });
+  await d.go();
+  assert.deepEqual(d.issueCreate.calls[0][0].labels, ['needs-human']);
 });
 
 test('recovered: the issue carries the evidence a human needs', async () => {
@@ -1359,7 +1438,7 @@ test('createRunRecordTracker: with no summary comment yet a new record is made f
 const NEW_HOST = 'app-new-team.vercel.app';
 const OLD_HOST = 'app-old-team.vercel.app';
 
-function cliWorld({ healthy, ownedByUs = true, aliasCreatedAt = T + 2000 } = {}) {
+function cliWorld({ healthy, ownedByUs = true, aliasCreatedAt = T + 2000, chat = false } = {}) {
   const { repo, bare } = repoWithOrigin();
   repo.write('app.txt', 'v2\n');
   const merge = repo.commit('Add widget (#12)');
@@ -1377,6 +1456,7 @@ function cliWorld({ healthy, ownedByUs = true, aliasCreatedAt = T + 2000 } = {})
     `  smoke: 'node "${fakeVercelPath}" --smoke {url}'`,
     '  rollback:',
     '    command: vercel rollback {deployment} --yes',
+    ...(chat ? ['owner_approval: chat'] : []),
     '',
   ].join('\n'));
   mkdirSync(join(repo.dir, '.review'), { recursive: true });
@@ -1501,6 +1581,38 @@ test('CLI recovered: real rollback via fake vercel, revert pushed to the bare or
   assert.equal(w.repo.git(['--git-dir', w.bare, 'show', 'agent/revert-12:app.txt']), 'v1\n');
   assert.equal(w.repo.git(['worktree', 'list', '--porcelain']).match(/^worktree /gm).length, 1);
   assert.deepEqual(readdirSync(join(w.repo.dir, '.worktrees')), []);
+});
+
+test('CLI chat recovered: draft unlabelled revert PR, owner-stop event on the NEW PR, with --pr and with --sha alone; issue gets no needs-human', () => {
+  for (const withPr of [true, false]) {
+    const w = cliWorld({ healthy: [OLD_HOST], chat: true });
+    if (withPr) withEmptyPrComments(w);
+    const r = w.cli(['--sha', w.merge, ...(withPr ? ['--pr', '12'] : []), '--retry-wait', '0']);
+    assert.equal(r.code, 1, r.stderr);
+    assert.equal(r.json.outcome, 'recovered');
+    assert.equal(r.json.revertPr.number, 78);
+    const calls = w.gh.calls();
+    const prCall = calls.find((c) => c.argv[0] === 'pr' && c.argv[1] === 'create');
+    assert.ok(prCall.argv.includes('--draft'), 'created as a draft');
+    assert.ok(!prCall.argv.includes('--label'), 'no label');
+    assert.ok(!calls.some((c) => c.argv[0] === 'pr' && c.argv[1] === 'ready'), 'never un-drafted');
+    assert.ok(!calls.some((c) => /needs-human/.test(c.argv.join(' ') + c.stdin) && c !== prCall && /issues\/77/.test(c.argv.join(' '))), 'no needs-human anywhere');
+    const stop = calls.find((c) => /issues\/78\/comments/.test(c.argv.join(' ')));
+    assert.ok(stop, 'owner-stop event posted on the revert PR #78');
+    assert.match(JSON.parse(stop.stdin).body, /owner-stop/);
+    const issue = JSON.parse(calls.find((c) => c.argv.join(' ').startsWith('api -X POST repos/acme/widgets/issues') && !/comments/.test(c.argv.join(' '))).stdin);
+    assert.deepEqual(issue.labels, ['pipeline-rollback']);
+  }
+});
+
+test('CLI chat recovered: the owner-stop post failing leaves exit 1 recovered with a warning and the draft PR', () => {
+  const w = cliWorld({ healthy: [OLD_HOST], chat: true });
+  w.gh.setScript([{ match: '^api -X POST repos/acme/widgets/issues/78/comments', code: 1, stderr: 'HTTP 502' }, ...JSON.parse(readFileSync(w.gh.env.PIPELINE_FAKE_GH_SCRIPT, 'utf8'))]);
+  const r = w.cli(['--sha', w.merge, '--retry-wait', '0']);
+  assert.equal(r.code, 1, r.stderr);
+  assert.equal(r.json.outcome, 'recovered');
+  assert.equal(r.json.revertPr.number, 78);
+  assert.ok(r.json.warnings.some((x) => /owner-stop/.test(x)), JSON.stringify(r.json.warnings));
 });
 
 test('CLI not-live: smoke passes but production keeps serving an older deployment (exit 1, issue, nothing rolled back)', () => {

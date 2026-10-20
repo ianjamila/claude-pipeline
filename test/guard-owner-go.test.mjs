@@ -18,7 +18,6 @@ const posix = (dir) => String(dir).replace(/\\/g, '/').replace(/^[A-Za-z]:/, '')
 const ownerGo = {
   mode: (dir) => (posix(dir).startsWith('/chat') ? 'chat' : posix(dir).startsWith('/broken') ? (() => { throw new Error('bad yml'); })() : 'none'),
   mergeTemplates: (dir) => (posix(dir).startsWith('/chat') ? [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: '--expect-head' }, { prefix: ['node', 'scripts/m.mjs'], shaFlag: null }] : []),
-  approvedHead: (pr, head) => pr === 7 && head === H7,
 };
 const opts = (cwd) => ({ cwd, home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], ownerGo });
 const verdict = (cmd, cwd = '/chat') => evaluateGitCommand(cmd, opts(cwd));
@@ -26,39 +25,39 @@ const deny = (cmd, cwd) => { const v = verdict(cmd, cwd); assert.equal(v.decisio
 const allow = (cmd, cwd) => assert.equal(verdict(cmd, cwd).decision, 'allow', `${cmd} @ ${cwd}: ${verdict(cmd, cwd).reason}`);
 
 test('#58 chat repo: a direct `gh pr merge` needs the owner\'s recorded "merge" for that PR at the head it pins', () => {
-  allow(`gh pr merge 7 --squash --auto --delete-branch --match-head-commit ${H7}`);
+  deny(`gh pr merge 7 --squash --auto --delete-branch --match-head-commit ${H7}`);
   for (const cmd of [`gh pr merge 8 --squash --match-head-commit ${H8}`, `gh pr merge https://github.com/o/r/pull/8 --match-head-commit ${H8}`, `gh pr merge -R o/r 8 --match-head-commit ${H8}`]) {
-    assert.match(deny(cmd).reason, /needs the owner's "merge" for #8 at head 888888888888 in this session, and none is recorded/);
+    assert.match(deny(cmd).reason, /agents merge only through `P merge --pr N`/);
   }
   // the head the owner approved, and only that one
-  assert.match(deny(`gh pr merge 7 --squash --match-head-commit ${H8}`).reason, /#7 at head 888888888888/);
+  assert.match(deny(`gh pr merge 7 --squash --match-head-commit ${H8}`).reason, /agents merge only through `P merge --pr N`/);
   for (const cmd of ['gh pr merge 7 --squash --auto', 'gh pr merge 7 --match-head-commit 7777777', `gh pr merge 7 --subject ${H7}`,
     `gh pr merge 7 --match-head-commit ${H7} --match-head-commit ${H8}`, `gh pr merge 7 --match-head-commit=${H7} --match-head-commit=${H7}`]) {
-    assert.match(deny(cmd).reason, /must pin the head the owner said "merge" for: add `--match-head-commit <full 40-character head>`/, cmd);
+    assert.match(deny(cmd).reason, /agents merge only through `P merge --pr N`/, cmd);
   }
-  assert.match(deny('gh pr merge --squash --auto').reason, /without a literal PR number/, 'the current branch\'s PR cannot be checked');
-  assert.match(deny('gh pr merge agent/feature').reason, /without a literal PR number/);
-  assert.match(deny('gh pr merge #8').reason, /without a literal PR number/, '(` #8` is a shell comment: no PR is named)');
+  assert.match(deny('gh pr merge --squash --auto').reason, /agents merge only through `P merge --pr N`/, 'the current branch\'s PR cannot be checked');
+  assert.match(deny('gh pr merge agent/feature').reason, /agents merge only through `P merge --pr N`/);
+  assert.match(deny('gh pr merge #8').reason, /agents merge only through `P merge --pr N`/, '(` #8` is a shell comment: no PR is named)');
   for (const cmd of ['gh pr merge 8 --disable-auto', 'gh pr view 8', 'gh pr checks 8']) allow(cmd);
   // a value flag never passes for the PR number
   assert.match(deny(`gh pr merge --subject 7 8 --match-head-commit ${H8}`).reason, /#8/);
 });
 
 test('#58 chat repo: the repo\'s own merge command typed by hand is judged the same way', () => {
-  allow(`npm run merge -- 7 --no-update --expect-head ${H7}`);
-  allow(`npm run merge -- 7 --expect-head=${H7}`);
+  deny(`npm run merge -- 7 --no-update --expect-head ${H7}`);
+  deny(`npm run merge -- 7 --expect-head=${H7}`);
   deny(`npm run merge -- 8 --no-update --expect-head ${H8}`);
-  assert.match(deny('npm run merge -- 7 --no-update').reason, /must pin the head .*add `--expect-head <full 40-character head>`/);
-  assert.match(deny(`npm run merge -- 7 --expect-head ${H7} --expect-head ${H8}`).reason, /must pin the head/, 'a repeated head flag pins nothing');
+  assert.match(deny('npm run merge -- 7 --no-update').reason, /agents merge only through `P merge --pr N`/);
+  assert.match(deny(`npm run merge -- 7 --expect-head ${H7} --expect-head ${H8}`).reason, /agents merge only through `P merge --pr N`/, 'a repeated head flag pins nothing');
   deny(`npm run merge 8 --expect-head ${H8}`);
-  assert.match(deny('node scripts/m.mjs 7').reason, /pins no head/, 'a merge command without {sha} cannot be bound to a head');
+  assert.match(deny('node scripts/m.mjs 7').reason, /agents merge only through `P merge --pr N`/, 'a merge command without {sha} cannot be bound to a head');
   allow('npm run build');
   allow('npm run merge-report'); // (another script)
 });
 
 test('#58 chat repo: auto-merge through the GraphQL API is refused (its node id cannot be checked)', () => {
   const q = "gh api graphql -f query='mutation { enablePullRequestAutoMerge(input: {pullRequestId: \"PR_x\"}) { clientMutationId } }'";
-  assert.match(deny(q).reason, /auto-merge through the API skips the owner's "merge"/);
+  assert.match(deny(q).reason, /auto-merge through the API skips the owner/);
   // (round 3: the node id may name a PR in a chat repo whatever the current directory is, so no directory makes it safe)
   for (const cwd of ['/other', '/broken']) assert.match(deny(q, cwd).reason, /auto-merge through the API skips the owner's "merge".*P merge/s, cwd);
   deny(`cd /other && ${q}`, '/chat');
@@ -73,11 +72,11 @@ test('#58 chat repo: auto-merge through the GraphQL API is refused (its node id 
 test('#58 other repos merge as before; an unknown directory or an unreadable pipeline.yml fails closed', () => {
   for (const cmd of ['gh pr merge 8 --squash --auto', 'gh pr merge --squash', 'npm run merge -- 8']) allow(cmd, '/other');
   deny(`gh pr merge 8 --squash --match-head-commit ${H8}`, '/broken');
-  allow(`gh pr merge 7 --squash --match-head-commit ${H7}`, '/broken');
+  deny(`gh pr merge 7 --squash --match-head-commit ${H7}`, '/broken');
   // -R / a PR URL from another repo's directory: that repository's mode is unknown here
   deny(`gh pr merge -R o/chat 8 --match-head-commit ${H8}`, '/other');
   deny(`gh pr merge https://github.com/o/chat/pull/8 --match-head-commit ${H8}`, '/other');
-  allow(`gh pr merge -R o/chat 7 --match-head-commit ${H7}`, '/other');
+  deny(`gh pr merge -R o/chat 7 --match-head-commit ${H7}`, '/other');
   // a cd the guard cannot follow leaves the directory unknown
   deny(`false && cd /x; gh pr merge 8 --match-head-commit ${H8}`, '/other');
   // without the wiring (older callers) nothing changes
@@ -92,11 +91,11 @@ test('#58 a job started through the pipeline runner is judged the same way', () 
 test('#58 round 3: a GH_REPO on the job-start line (or in the hook\'s environment) reaches the merge inside the job', () => {
   const job = 'node ~/.claude/pipeline/bin/pipeline.mjs job start m --';
   // from a directory that is not a chat repo, GH_REPO names the repository: judged as a merge elsewhere (as for a direct `gh pr merge`)
-  assert.match(deny(`GH_REPO=o/chat ${job} gh pr merge 8 --squash --match-head-commit ${H8}`, '/other').reason, /#8 at head 888888888888/);
+  assert.match(deny(`GH_REPO=o/chat ${job} gh pr merge 8 --squash --match-head-commit ${H8}`, '/other').reason, /agents merge only through `P merge --pr N`/);
   deny(`GH_REPO=o/chat ${job} gh pr merge 8 --squash`, '/other');
   deny(`env GH_REPO=o/chat ${job} gh pr merge 8 --squash`, '/other');
   // the owner's recorded "merge" for that PR and head still lets it through
-  allow(`GH_REPO=o/chat ${job} gh pr merge 7 --squash --match-head-commit ${H7}`, '/other');
+  deny(`GH_REPO=o/chat ${job} gh pr merge 7 --squash --match-head-commit ${H7}`, '/other');
   // no GH_REPO / not a merge: untouched
   allow(`${job} gh pr merge 8 --squash`, '/other');
   allow(`GH_REPO=o/chat ${job} gh pr view 8`, '/other');
@@ -136,7 +135,7 @@ test('#58 ownerGoWiring: the repository root\'s pipeline.yml in every version at
   assert.deepEqual(shown.mergeTemplates(label).map((t) => t.prefix[0]).sort(), ['gh', 'npm']);
   const broken = repo('broken', 'owner_approval: [chat\n  : :');
   assert.throws(() => w.mode(broken));
-  assert.equal(w.approvedHead(1, 'a'.repeat(40)), false, 'no record for a made-up session');
+  assert.equal(w.approvedHead, undefined, 'the wiring no longer answers whether the owner said merge: chat repos merge only through P merge');
 });
 
 // Codex review (#58) finding 1: only a real, effective cancellation skips the check
@@ -162,13 +161,13 @@ test('#58 GH_REPO (command prefix, earlier on the line, or inherited) selects an
   const pin7 = `--match-head-commit ${H7}`;
   for (const cmd of [`GH_REPO=o/chat gh pr merge 8 --squash ${pin8}`, `env GH_REPO=o/chat gh pr merge 8 ${pin8}`, `export GH_REPO=o/chat; gh pr merge 8 ${pin8}`,
     `GH_REPO=o/chat; gh pr merge 8 ${pin8}`, `GH_REPO=o/chat gh pr merge 8 --squash --auto`, `false && export GH_REPO=o/x; gh pr merge 8 ${pin8}`]) {
-    assert.match(deny(cmd, '/other').reason, /named by -R or a PR URL|may need the owner|needs the owner's "merge"|must pin/, cmd);
+    assert.match(deny(cmd, '/other').reason, /may be a chat repository|agents merge only through/, cmd);
   }
-  allow(`GH_REPO=o/chat gh pr merge 7 --squash ${pin7}`, '/other');
-  allow(`export GH_REPO=o/chat; gh pr merge 7 --squash ${pin7}`, '/other');
+  deny(`GH_REPO=o/chat gh pr merge 7 --squash ${pin7}`, '/other');
+  deny(`export GH_REPO=o/chat; gh pr merge 7 --squash ${pin7}`, '/other');
   const inherited = (cmd, env) => evaluateGitCommand(cmd, { ...opts('/other'), env });
   assert.equal(inherited(`gh pr merge 8 --squash ${pin8}`, { GH_REPO: 'o/chat' }).decision, 'deny', 'the hook process\'s own GH_REPO');
-  assert.equal(inherited(`gh pr merge 7 --squash ${pin7}`, { GH_REPO: 'o/chat' }).decision, 'allow');
+  assert.equal(inherited(`gh pr merge 7 --squash ${pin7}`, { GH_REPO: 'o/chat' }).decision, 'deny');
   assert.equal(inherited(`gh pr merge 8 --squash ${pin8}`, {}).decision, 'allow', 'no GH_REPO: the directory\'s repository, which is not a chat repo');
   allow('GH_REPO= gh pr merge 8 --squash', '/other'); // (an empty GH_REPO selects nothing)
   allow('GH_REPO=o/chat gh pr view 8', '/other');
@@ -189,8 +188,7 @@ test('#58 the repo\'s merge script run through another npm / pnpm / yarn spellin
     bad(`${pre} 8 --expect-head ${H8}`);
     unpinned(`${pre} 7`);
     // (round 4: only a template's own spelling is approvable; every other spelling of the script is refused even with a record)
-    if (['npm run merge --', 'pnpm run merge --', 'yarn merge'].includes(pre)) ok(`${pre} 7 --expect-head ${H7}`);
-    else bad(`${pre} 7 --expect-head ${H7}`);
+    bad(`${pre} 7 --expect-head ${H7}`); // (every spelling, the template's own too: chat repos merge only through P merge)
   }
   // another script, or a word that only appears after `--`, is not the merge command
   for (const cmd of ['npm --silent run build', 'npm run-script merge-report', 'npm --silent run build -- merge', 'npm test', 'npm install merge-deep', 'pnpm build', 'yarn build']) ok(cmd);
@@ -255,7 +253,7 @@ test('#58 round 3: the merge script through yarn / pnpm / npm is the merge comma
   for (const cmd of [`yarn run merge 8 --expect-head ${H8}`, `yarn merge 8 --expect-head ${H8}`, `pnpm run merge 8 --expect-head ${H8}`, `pnpm merge 8 --expect-head ${H8}`,
     `pnpm run merge -- 8 --expect-head ${H8}`, `yarn --silent merge 8 --expect-head ${H8}`, `npm run-script merge -- 8 --expect-head ${H8}`, `yarn merge 7`, `pnpm merge 7 --no-update`,
     `yarn --mystery val run merge 8 --expect-head ${H8}`]) assert.equal(d(cmd, npmOnly).decision, 'deny', cmd);
-  assert.match(d(`yarn merge 8 --expect-head ${H8}`, npmOnly).reason, /npm run merge -- <PR> --expect-head/); // (round 4: it names the canonical form, not the PR)
+  assert.match(d(`yarn merge 8 --expect-head ${H8}`, npmOnly).reason, /P merge --pr N/); // (round 4: it names the canonical form, not the PR)
   assert.match(d('pnpm merge 7', npmOnly).reason, /P merge --pr N/);
   // (round 4: yarn / pnpm forms with a record were allowed here; with an npm template no other manager is approvable any more)
   for (const cmd of [`yarn run merge 7 --expect-head ${H7}`, `yarn merge 7 --expect-head=${H7}`, `pnpm run merge 7 --expect-head ${H7}`, `pnpm merge 7 --expect-head ${H7}`, `pnpm merge -- 7 --expect-head ${H7}`]) assert.equal(d(cmd, npmOnly).decision, 'deny', cmd);
@@ -266,7 +264,7 @@ test('#58 round 3: the merge script through yarn / pnpm / npm is the merge comma
     assert.equal(d(`npm run merge -- 8 --expect-head ${H8}`, o).decision, 'deny', prefix.join(' '));
     // (round 4: was 'allow' — with a yarn / pnpm template the npm spelling is no longer approvable; the template's own spelling is)
     assert.equal(d(`npm run merge -- 7 --expect-head ${H7}`, o).decision, 'deny', prefix.join(' '));
-    assert.equal(d(`${prefix.join(' ')} 7 --expect-head ${H7}`, o).decision, 'allow', prefix.join(' '));
+    assert.equal(d(`${prefix.join(' ')} 7 --expect-head ${H7}`, o).decision, 'deny', prefix.join(' '));
   }
 });
 
@@ -277,10 +275,10 @@ test('#58 round 3: npm keeps the options written before `--` for itself, so only
   for (const cmd of [`npm run merge 7 --expect-head=${H7}`, `npm run merge 7 --expect-head ${H7}`, `npm run merge --expect-head=${H7} -- 7`, `npm run-script merge 7 --expect-head ${H7}`, `npm --silent run merge 7 --expect-head=${H7}`]) {
     assert.equal(d(cmd).decision, 'deny', cmd);
   }
-  assert.match(d(`npm run merge 7 --expect-head=${H7}`).reason, /npm run merge -- <PR> --expect-head <full 40-character head>/); // (round 4: the canonical form is named)
-  assert.match(d(`npm run merge -- 7 --expect-head ${H7} --expect-head ${H8}`).reason, /must pin the head/);
+  assert.match(d(`npm run merge 7 --expect-head=${H7}`).reason, /P merge --pr N/); // (round 4: the canonical form is named)
+  assert.match(d(`npm run merge -- 7 --expect-head ${H7} --expect-head ${H8}`).reason, /agents merge only through `P merge --pr N`/);
   // (round 4: `npm run merge --if-present -- …`, `npm run-script merge -- …` and the yarn / pnpm forms were allowed with a record; only the template's shape is now)
-  assert.equal(d(`npm run merge -- 7 --expect-head=${H7}`).decision, 'allow');
+  assert.equal(d(`npm run merge -- 7 --expect-head=${H7}`).decision, 'deny');
   for (const cmd of [`npm run merge --if-present -- 7 --expect-head ${H7}`, `npm run-script merge -- 7 --no-update --expect-head ${H7}`, `yarn merge 7 --expect-head=${H7}`, `pnpm merge 7 --expect-head ${H7}`, `pnpm run merge 7 --expect-head=${H7}`]) assert.equal(d(cmd).decision, 'deny', cmd);
   assert.equal(d(`yarn merge 7 --expect-head ${H8}`).decision, 'deny');
 });
@@ -306,11 +304,11 @@ test('#58 round 4: only the template\'s exact shape is approvable; every other w
   const only = (prefix) => ({ ...opts('/other'), ownerGo: { ...ownerGo, mode: () => 'chat', mergeTemplates: () => [{ prefix, shaFlag: '--expect-head' }] } });
   const npmOnly = only(['npm', 'run', 'merge', '--']);
   const d = (cmd, o = npmOnly) => evaluateGitCommand(cmd, o);
-  const CANON = /npm run merge -- <PR> --expect-head <full 40-character head>/;
+  const CANON = /P merge --pr N/;
   // canonical: allowed with a record, refused without one
-  assert.equal(d(`npm run merge -- 7 --expect-head ${H7}`).decision, 'allow', d(`npm run merge -- 7 --expect-head ${H7}`).reason);
-  assert.equal(d(`npm run merge -- 7 --no-update --expect-head=${H7}`).decision, 'allow');
-  assert.match(d(`npm run merge -- 8 --expect-head ${H8}`).reason, /#8 at head 888888888888/);
+  assert.equal(d(`npm run merge -- 7 --expect-head ${H7}`).decision, 'deny', d(`npm run merge -- 7 --expect-head ${H7}`).reason);
+  assert.equal(d(`npm run merge -- 7 --no-update --expect-head=${H7}`).decision, 'deny');
+  assert.match(d(`npm run merge -- 8 --expect-head ${H8}`).reason, /agents merge only through `P merge --pr N`/);
   // words before `--` reach npm / the script: Codex P1 (`npm run merge 8 -- 7` forwards 8 and 7)
   for (const cmd of [`npm run merge 8 -- 7 --expect-head=${H7}`, `npm run merge 8 -- 7 --expect-head ${H7}`]) assert.match(d(cmd).reason, CANON, cmd);
   // an option or a spelling that moves the target directory, from a cwd that is not the chat repo
@@ -336,11 +334,11 @@ test('#58 round 4: only the template\'s exact shape is approvable; every other w
   assert.match(d('npm frobnicate merge').reason, CANON);
   // other managers' templates: the template's own spelling is the one approvable shape
   const pnpmT = only(['pnpm', 'run', 'merge', '--']);
-  assert.equal(d(`pnpm run merge -- 7 --expect-head ${H7}`, pnpmT).decision, 'allow');
-  assert.match(d(`npm run merge -- 7 --expect-head ${H7}`, pnpmT).reason, /pnpm run merge -- <PR> --expect-head <full 40-character head>/);
+  assert.equal(d(`pnpm run merge -- 7 --expect-head ${H7}`, pnpmT).decision, 'deny');
+  assert.match(d(`npm run merge -- 7 --expect-head ${H7}`, pnpmT).reason, /P merge --pr N/);
   const yarnT = only(['yarn', 'merge']);
-  assert.equal(d(`yarn merge 7 --expect-head ${H7}`, yarnT).decision, 'allow');
-  assert.match(d(`yarn run merge 7 --expect-head ${H7}`, yarnT).reason, /yarn merge <PR> --expect-head/);
+  assert.equal(d(`yarn merge 7 --expect-head ${H7}`, yarnT).decision, 'deny');
+  assert.match(d(`yarn run merge 7 --expect-head ${H7}`, yarnT).reason, /P merge --pr N/);
   // not a chat repo (from its own cwd): nothing changes, but a directory option makes the target unknown, so it is judged as chat
   const none = { ...opts('/other'), ownerGo: { ...ownerGo, mode: () => 'none', mergeTemplates: () => [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: '--expect-head' }] } };
   assert.equal(d(`bun run merge 8 --expect-head ${H8}`, none).decision, 'allow');
@@ -353,10 +351,30 @@ test('#58 round 4: only the template\'s exact shape is approvable; every other w
     assert.equal(d(cmd.replaceAll(' 8 ', ' 7 ').replaceAll(H8, H7)).decision, 'deny', `${cmd} (chat, with a record)`);
   }
   assert.equal(d(`npm run merge -- 8 --expect-head ${H8}`, none).decision, 'allow'); // (unchanged in a repo without owner_approval: chat)
-  assert.equal(d(`FOO=1 npm run merge -- 7 --expect-head ${H7}`).decision, 'allow'); // (an unrelated variable changes nothing)
+  assert.equal(d(`FOO=1 npm run merge -- 7 --expect-head ${H7}`).decision, 'deny'); // (an unrelated variable changes nothing)
   // several templates: any one canonical shape is approvable
   const many = { ...opts('/chat'), ownerGo: { ...ownerGo, mergeTemplates: () => [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: '--expect-head' }, { prefix: ['yarn', 'merge'], shaFlag: '--expect-head' }] } };
-  assert.equal(d(`yarn merge 7 --expect-head ${H7}`, many).decision, 'allow');
-  assert.equal(d(`npm run merge -- 7 --expect-head ${H7}`, many).decision, 'allow');
+  assert.equal(d(`yarn merge 7 --expect-head ${H7}`, many).decision, 'deny');
+  assert.equal(d(`npm run merge -- 7 --expect-head ${H7}`, many).decision, 'deny');
   assert.equal(d(`pnpm merge 7 --expect-head ${H7}`, many).decision, 'deny');
+});
+
+// chat mode without needs-human (N2): an agent merges in a chat repo ONLY through `P merge`. No recorded "merge", same-head or not, opens a direct merge
+test('chat-mode merges (N2): `gh pr merge` in any shape, auto-merge and the hand-typed merge command are refused; cancelling and other repos are not', () => {
+  const ROUTE_RE = /agents merge only through `P merge --pr N`/;
+  for (const cmd of [
+    `gh pr merge 7 --match-head-commit ${H7}`, `gh pr merge 7 --squash --auto --match-head-commit ${H7}`, 'gh pr merge 7 --auto', 'gh pr merge 7', `gh pr merge 7 --admin`,
+    `npm run merge -- 7 --expect-head ${H7}`, `npm run merge -- 7 --no-update --expect-head=${H7}`, `node ~/.claude/pipeline/bin/pipeline.mjs job start m -- gh pr merge 7 --match-head-commit ${H7}`,
+  ]) {
+    const v = deny(cmd);
+    assert.ok(ROUTE_RE.test(v.reason) || /--admin/.test(cmd), `${cmd}: ${v.reason}`);
+  }
+  // the pipeline's own merge step and cancelling a queued merge stay allowed
+  for (const cmd of ['node ~/.claude/pipeline/bin/pipeline.mjs merge --pr 7', 'gh pr merge 7 --disable-auto', 'gh pr view 7', 'gh pr checks 7']) allow(cmd);
+  // label-mode / no-config repositories behave as before (the wiring answers 'none' here)
+  for (const cmd of [`gh pr merge 7 --match-head-commit ${H7}`, 'gh pr merge 7 --auto', `npm run merge -- 7 --expect-head ${H7}`]) allow(cmd, '/other');
+  const label = { ...opts('/lbl'), ownerGo: { ...ownerGo, mode: () => 'label' } };
+  assert.equal(evaluateGitCommand('gh pr merge 7 --squash --auto', label).decision, 'allow');
+  // the wiring has no approvedHead any more: nothing a record says can open a direct merge
+  assert.equal(ownerGo.approvedHead, undefined);
 });

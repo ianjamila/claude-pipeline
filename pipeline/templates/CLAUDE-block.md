@@ -13,6 +13,7 @@
   them after approval.
 - **Hard-stop PRs** (migrations, auth/RLS/permissions, secrets/env, pipeline files, major
   dependency upgrades, sensitive personal data, and the project extras in
-  `.claude/pipeline.yml`) end as `needs-human`. Only the owner adds `human-approved`.
+  `.claude/pipeline.yml`) end as `needs-human`. Only the owner adds `human-approved`. With `owner_approval: chat` there is no label: the PR
+  stops with a `Stopped #N · stop <id>` line and only the owner's own `ship resume N` / "merge" releases it; agents merge only through `P merge`.
 - Synthetic test data only.
 <!-- claude-pipeline:end -->

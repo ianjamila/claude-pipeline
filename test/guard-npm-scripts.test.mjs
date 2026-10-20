@@ -314,11 +314,14 @@ test('t9 a package-manager call inside a script judged with a script of its own 
 });
 test('t9 (#73 follow-up) INIT_CWD and npm_package_json move the repo merge script like npm_config_prefix', () => {
   const H7 = '7'.repeat(40);
-  const ownerGo = { mode: () => 'chat', mergeTemplates: () => [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: '--expect-head' }], approvedHead: (pr, head) => pr === 7 && head === H7 };
-  const v = (cmd) => evaluateGitCommand(cmd, { cwd: '/chat', home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], ownerGo, readText: () => null, readHead: () => null, pathExists: () => false, readDir: () => null });
+  // (since chat mode without needs-human, a chat repository refuses every direct merge, the exact form included: agents merge only through P merge.
+  // A label-mode directory allows the exact form, and a setting that moves the script's target is still judged as a chat repository.)
+  const ownerGo = (mode) => ({ mode: () => mode, mergeTemplates: () => [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: '--expect-head' }] });
+  const v = (cmd, mode) => evaluateGitCommand(cmd, { cwd: '/repo', home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], ownerGo: ownerGo(mode), readText: () => null, readHead: () => null, pathExists: () => false, readDir: () => null });
   const exact = `npm run merge -- 7 --expect-head ${H7}`;
-  assert.equal(v(exact).decision, 'allow', 'the exact approved form stays approvable');
-  for (const pre of ['npm_config_prefix=/x', 'NPM_CONFIG_PREFIX=/x', 'INIT_CWD=/x', 'npm_package_json=/x/package.json', 'init_cwd=/x']) assert.equal(v(`${pre} ${exact}`).decision, 'deny', pre);
+  assert.equal(v(exact, 'label').decision, 'allow', 'the exact form is allowed in a label-mode directory');
+  assert.match(v(exact, 'chat').reason ?? '', /agents merge only through `P merge --pr N`/, 'a chat repository refuses even the exact form');
+  for (const pre of ['npm_config_prefix=/x', 'NPM_CONFIG_PREFIX=/x', 'INIT_CWD=/x', 'npm_package_json=/x/package.json', 'init_cwd=/x']) assert.equal(v(`${pre} ${exact}`, 'label').decision, 'deny', pre);
 });
 
 // ---- security review of t9: lifecycle commands, allowlists, lookup and configuration -------------------------------------------------------------------------

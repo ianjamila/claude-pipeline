@@ -5,9 +5,10 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { renderEvent } from '../pipeline/lib/run-events.mjs';
 import {
   BLOCKING_LABELS, CANONICAL_CHECKS, GATE_MAX_AGE_MS, abandonMerge, blockingLabelsOf, expectedCheckNames, gateRefusals, inlineOptionValues,
-  isDocsOnly, isLogOnly, labelNames, labelsCheck, mergeTiming, readPrSettled, readReviewJson, tailLines, waitForMerge, writeReviewJson,
+  isDocsOnly, isLogOnly, labelNames, labelsCheck, mergeTiming, preMergeProblems, readPrSettled, readReviewJson, tailLines, waitBlockers, waitForMerge, writeReviewJson,
 } from '../pipeline/lib/finalgate.mjs';
 import {
   AGENT_LOG_HEADER, appendLines, assertSingleLine, buildAgentLogLine, countArbiterCalls, resolveLogPath,
@@ -107,6 +108,84 @@ test('labelsCheck: labels must be a list of objects with string names; anything 
     assert.match(c.detail, /labels/, JSON.stringify(labels));
   }
   assert.equal(labelsCheck(undefined).ok, false);
+});
+
+// ---- chat mode: the needs-human label is ignored and the owner-stop reader is consulted (plan D3 / T4) ----------------------------------------------
+
+test('blockingLabelsOf / labelsCheck in chat mode: needs-human (any case) is ignored, the other blockers stay, stop problems fail; label mode keeps its exact text', () => {
+  const chat = { ownerApproval: 'chat' };
+  assert.deepEqual(blockingLabelsOf([{ name: 'Needs-Human' }, { name: 'awaiting-review' }], chat), ['awaiting-review']);
+  assert.deepEqual(blockingLabelsOf([{ name: 'needs-human' }]), ['needs-human'], 'the default is unchanged');
+  assert.deepEqual(blockingLabelsOf([{ name: 'needs-human' }], { ownerApproval: 'label' }), ['needs-human']);
+  assert.equal(labelsCheck({ labels: [{ name: 'needs-human' }] }).detail, 'blocking label(s): needs-human');
+  assert.equal(labelsCheck({ labels: [] }).detail, 'no blocking labels');
+  const ignored = labelsCheck({ labels: [{ name: 'needs-human' }] }, chat);
+  assert.deepEqual([ignored.ok, ignored.detail], [true, 'no blocking labels (needs-human ignored: owner_approval chat)']);
+  assert.equal(labelsCheck({ labels: [] }, chat).detail, 'no blocking labels');
+  const stop = labelsCheck({ labels: [] }, { ...chat, stopProblems: ['owner stop ab12cd34 (x) is open'] });
+  assert.deepEqual([stop.ok, stop.detail], [false, 'owner stop ab12cd34 (x) is open']);
+  const both = labelsCheck({ labels: [{ name: 'pipeline-blocked' }] }, { ...chat, stopProblems: ['owner stop ab12cd34 (x) is open'] });
+  assert.equal(both.detail, 'blocking label(s): pipeline-blocked; owner stop ab12cd34 (x) is open');
+  assert.equal(labelsCheck({ labels: null }, chat).ok, false, 'unreadable labels still fail closed');
+  assert.equal(labelsCheck({ labels: [] }, { stopProblems: ['x'] }).ok, true, 'label mode never looks at stop problems');
+});
+
+const stopBody = (id) => renderEvent('owner-stop', id, 'stop', { repo: 'o/r', pr: 12, id, cause: 'merge:command-failed', head: null, at: '2026-10-20T08:00:00.000Z', host: 'h', autoMergeDisarmed: true });
+function chatGh({ view, comments = [], issues = {}, commentsError = null } = {}) {
+  const calls = { views: [], comments: 0 };
+  return {
+    calls,
+    prView: (pr, fields) => { calls.views.push([pr, [...fields]]); return view; },
+    listIssues: ({ label }) => issues[label] ?? [],
+    listComments: () => { calls.comments += 1; if (commentsError) throw commentsError; return comments; },
+    viewer: () => 'me',
+  };
+}
+const mine = (body, id = 1) => ({ id, user: { login: 'me' }, body });
+const NOROOT = mkdtempSync(join(tmpdir(), 'finalgate-noremote-'));
+const OPEN_VIEW = { state: 'OPEN', headRefOid: SHA, isDraft: false, labels: [] };
+
+test('preMergeProblems: chat adds autoMergeRequest to the read, ignores needs-human and reports an open stop; label mode reads exactly the old fields and never lists comments', async () => {
+  const chatArgs = { pr: 12, head: SHA, ownerApproval: 'chat', root: NOROOT };
+  const clean = chatGh({ view: OPEN_VIEW });
+  assert.deepEqual(await preMergeProblems({ gh: clean, ...chatArgs }), []);
+  assert.deepEqual(clean.calls.views, [[12, ['state', 'headRefOid', 'labels', 'isDraft', 'autoMergeRequest']]]);
+  assert.deepEqual(await preMergeProblems({ gh: chatGh({ view: { ...OPEN_VIEW, labels: [{ name: 'needs-human' }] } }), ...chatArgs }), []);
+  const stopped = await preMergeProblems({ gh: chatGh({ view: OPEN_VIEW, comments: [mine(stopBody('ab12cd34'))] }), ...chatArgs });
+  assert.match(stopped.join(), /owner stop ab12cd34 \(merge:command-failed\) is open/);
+  const armed = await preMergeProblems({ gh: chatGh({ view: { ...OPEN_VIEW, autoMergeRequest: { enabledAt: 'x' } }, comments: [mine(stopBody('ab12cd34'))] }), ...chatArgs });
+  assert.match(armed.join(), /auto-merge is armed on a stopped PR: gh pr merge 12 --disable-auto/);
+  const unreadable = await preMergeProblems({ gh: chatGh({ view: OPEN_VIEW, commentsError: new Error('HTTP 502') }), ...chatArgs });
+  assert.match(unreadable.join(), /owner stops could not be read from GitHub \(HTTP 502\)/);
+  const label = chatGh({ view: OPEN_VIEW, comments: [mine(stopBody('ab12cd34'))] });
+  assert.deepEqual(await preMergeProblems({ gh: label, pr: 12, head: SHA }), []);
+  assert.deepEqual(label.calls.views, [[12, ['state', 'headRefOid', 'labels', 'isDraft']]]);
+  assert.equal(label.calls.comments, 0, 'label mode: no extra gh call');
+});
+
+test('waitBlockers: the polling view carries autoMergeRequest in chat only; a new stop or a read failure is a blocker on that poll; label mode is untouched', async () => {
+  const args = { pr: 12, root: NOROOT, ownerApproval: 'chat' };
+  const view = { labels: [{ name: 'needs-human' }] };
+  const chat = waitBlockers(chatGh({}), args);
+  assert.deepEqual(chat.extraFields, ['autoMergeRequest']);
+  assert.deepEqual(await chat(view), []);
+  assert.match((await waitBlockers(chatGh({ comments: [mine(stopBody('ab12cd34'))] }), args)(view)).join(), /owner stop ab12cd34/);
+  assert.match((await waitBlockers(chatGh({ commentsError: new Error('HTTP 502') }), args)(view)).join(), /owner stops could not be read/);
+  assert.match((await waitBlockers(chatGh({}), args)({ labels: null })).join(), /labels could not be read/, 'malformed labels still block');
+  const label = chatGh({ comments: [mine(stopBody('ab12cd34'))] });
+  const plain = waitBlockers(label);
+  assert.equal(plain.extraFields, undefined);
+  assert.deepEqual(await plain(view), ['blocking label(s): needs-human']);
+  assert.equal(label.calls.comments, 0);
+});
+
+test('waitForMerge asks for labels (and the blocker\'s extra fields) only when it has blockers', async () => {
+  const seen = [];
+  const gh = { prView: (pr, fields) => { seen.push([...fields]); return { state: 'MERGED', mergeCommit: { oid: SHA } }; } };
+  await waitForMerge({ gh, pr: 1, waitMs: 0, pollMs: 1 });
+  await waitForMerge({ gh, pr: 1, waitMs: 0, pollMs: 1, blockers: Object.assign(async () => [], { extraFields: ['autoMergeRequest'] }) });
+  await waitForMerge({ gh, pr: 1, waitMs: 0, pollMs: 1, blockers: async () => [] });
+  assert.deepEqual(seen, [['state', 'mergeCommit'], ['state', 'mergeCommit', 'labels', 'autoMergeRequest'], ['state', 'mergeCommit', 'labels']]);
 });
 
 test('tailLines: last N lines, colours stripped, long lines clipped, trailing blanks dropped', () => {
@@ -374,4 +453,26 @@ test('review dir helpers do not need a git repo', () => {
   const dir = mkdtempSync(join(tmpdir(), 'cp-rj2-'));
   writeReviewJson(dir, 'a.json', { ok: true });
   assert.match(readFileSync(join(dir, '.review', 'a.json'), 'utf8'), /"ok": true/);
+});
+
+const releaseBody = (id) => renderEvent('owner-stop-released', id, 'released', { repo: 'o/r', pr: 12, id, at: '2026-10-20T09:00:00.000Z', host: 'h', releaseRef: { kind: 'resume', session: 'x', ts: 'x', prompt_sha256: 'x' } });
+
+test('preMergeProblems / waitBlockers: expectedStops compares the stop HISTORY (newest id, released ids), so a released new stop is caught; unchanged history and label mode are not', async () => {
+  const chatArgs = { pr: 12, head: SHA, ownerApproval: 'chat', root: NOROOT };
+  const history = [mine(stopBody('ab12cd34'), 1), mine(releaseBody('ab12cd34'), 2)];
+  const same = { stopId: 'ab12cd34', released: ['ab12cd34'] };
+  assert.deepEqual(await preMergeProblems({ gh: chatGh({ view: OPEN_VIEW, comments: history }), ...chatArgs, expectedStops: same }), []);
+  const grown = [...history, mine(stopBody('7c1d4e90'), 3), mine(releaseBody('7c1d4e90'), 4)];
+  const changed = await preMergeProblems({ gh: chatGh({ view: OPEN_VIEW, comments: grown }), ...chatArgs, expectedStops: same });
+  assert.match(changed.join(), /owner stop history changed since the merge request was read \(newest stop ab12cd34 -> 7c1d4e90, released 1 -> 2\)/);
+  // a release alone (the same newest stop) also changes it
+  const releasedLater = await preMergeProblems({ gh: chatGh({ view: OPEN_VIEW, comments: history }), ...chatArgs, expectedStops: { stopId: 'ab12cd34', released: [] } });
+  assert.match(releasedLater.join(), /history changed/);
+  // no stops at the start, one released pair now
+  assert.match((await waitBlockers(chatGh({ comments: [mine(stopBody('ab12cd34'), 1), mine(releaseBody('ab12cd34'), 2)] }), { ...chatArgs, expectedStops: { stopId: null, released: [] } })({ labels: [] })).join(), /history changed.*none -> ab12cd34/);
+  assert.match((await waitBlockers(chatGh({ commentsError: new Error('HTTP 502') }), { ...chatArgs, expectedStops: same })({ labels: [] })).join(), /owner stops could not be read/);
+  // label mode: expectedStops is ignored and no comments are listed
+  const label = chatGh({ view: OPEN_VIEW, comments: grown });
+  assert.deepEqual(await preMergeProblems({ gh: label, pr: 12, head: SHA, expectedStops: same }), []);
+  assert.equal(label.calls.comments, 0);
 });

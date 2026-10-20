@@ -14,7 +14,7 @@
 // from the other side (a record marked `resumed` needs --owner-approved-head).
 
 import { prodStillOpen } from './run-record.mjs';
-import { unresolvedRollbacks } from './run-events.mjs';
+import { openOwnerStops, unresolvedRollbacks } from './run-events.mjs';
 
 const MINUTE = 60000;
 
@@ -86,9 +86,12 @@ const LABEL_NOTE = 'needs-human label present: the run continues but ends at the
 // Outcomes that still have work in front of them (the review was postponed, verify was red, the gate ran, a blocker stopped
 // the gate or merge) resume even with the label; `needs-human` itself, or anything else that ended an open PR, is the owner's.
 const RESUMABLE_OUTCOMES = new Set(['awaiting-review', 'blocked', 'awaiting-owner-merge', 'stopped']);
-const midRunLabel = (facts, record) => facts.labels.includes('needs-human') && record != null && (record.outcome == null || RESUMABLE_OUTCOMES.has(record.outcome));
+// owner_approval: chat never reads the label (owner stops are events, see owner-stop.mjs), so it is never "mid-run".
+const midRunLabel = (facts, record, chat = false) => !chat && facts.labels.includes('needs-human') && record != null && (record.outcome == null || RESUMABLE_OUTCOMES.has(record.outcome));
 
-function route(facts, record) {
+const idList = (ids) => ids.map((i) => String(i?.id ?? i)).join(', ');
+
+function route(facts, record, chat = false) {
   if (facts.state === 'CLOSED') return { enter: 'closed', reason: 'the PR is closed without a merge' };
   if (facts.state === 'MERGED') return routeMerged(facts, record);
   if (facts.isCrossRepository) return { enter: 'not-resumable', reason: 'fork PR: the pipeline cannot push to or resume it' };
@@ -106,8 +109,14 @@ function route(facts, record) {
   // The label means "owner decides now" only once the run has stopped there (outcome needs-human) or when we cannot read the
   // run. Step 3.5 adds it as soon as a hard-stop hit lands, BEFORE the review loop: a usable record with no outcome (or a
   // resumable one) is a run that is still going or stalled, and it resumes normally.
-  if (facts.labels.includes('needs-human') && !midRunLabel(facts, record)) {
+  if (!chat && facts.labels.includes('needs-human') && !midRunLabel(facts, record)) {
     return { enter: 'decision', reason: firstSentence(facts.needsHumanReason) || 'needs-human label set (no reason recorded)' };
+  }
+  // Chat: review items whose ruling is the owner's are the decision (no label needed). An open owner stop does not change the
+  // route: the owner's `ship resume N` is what releases it, so the run must be able to continue (see the note in planResume).
+  const needsHumanItems = facts.triage?.needsHumanItems ?? [];
+  if (chat && needsHumanItems.length > 0) {
+    return { enter: 'decision', reason: `review items need the owner's ruling in chat: ${idList(needsHumanItems)}` };
   }
 
   if (record) {
@@ -154,10 +163,16 @@ export function planResume(facts, { now, heartbeatFreshMinutes = 90, ownerApprov
   const f = { ...facts, labels: facts.labels ?? [], events: facts.events ?? [] };
   const nowMs = new Date(now).getTime();
   const record = f.recordStatus === 'ok' ? (f.record ?? null) : null;
-  const picked = route({ ...f, record }, record);
+  const chat = ownerApproval === 'chat';
+  const picked = route({ ...f, record }, record, chat);
   const enter = picked.enter;
   const notes = [...(picked.notes ?? [])];
-  if (!REPORT_ONLY.has(enter) && enter !== 'local-work' && enter !== 'observe-prod' && midRunLabel(f, record)) {
+  if (chat && f.state === 'OPEN') {
+    for (const e of openOwnerStops(f.events)) {
+      notes.push(`stop ${e.id} is open: \`P checkpoint --resumed\` needs the owner's reply (they type "ship resume <pr>" or "merge" after the Stopped line); say so and wait`);
+    }
+  }
+  if (!REPORT_ONLY.has(enter) && enter !== 'local-work' && enter !== 'observe-prod' && midRunLabel(f, record, chat)) {
     notes.push(LABEL_NOTE);
     if (enter === 'gate') notes.push('Step 5 ends in needs-human (label mode) after the gate: there is no owner-merge stop; report it and do not merge');
   }

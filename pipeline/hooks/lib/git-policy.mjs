@@ -32,9 +32,10 @@ const MAX_INPUT_BYTES = 1_000_000;
 const MAX_LINE_CHARS = 200_000; // a longer command line is not parsed (the hook has a 15 s budget)
 const OWNER_ONLY = 'This is reserved for the repository owner.';
 
-// The only graphql mutations an agent may run (comments, PR lifecycle, review threads). Everything else is denied.
+// The only graphql mutations an agent may run (new comments, PR lifecycle, review threads). Everything else is denied.
+// (updateIssueComment is NOT here: run events are PR comments, and editing a comment could rewrite one; docs/plans/2026-10-20-chat-mode-no-needs-human.md D1.)
 const GRAPHQL_ALLOWED_MUTATIONS = new Set([
-  'addComment', 'updateIssueComment', 'createPullRequest', 'enablePullRequestAutoMerge', 'disablePullRequestAutoMerge',
+  'addComment', 'createPullRequest', 'enablePullRequestAutoMerge', 'disablePullRequestAutoMerge',
   'markPullRequestReadyForReview', 'convertPullRequestToDraft', 'addPullRequestReview', 'resolveReviewThread', 'minimizeComment',
 ]);
 const PUSH_LONG_VALUE = ['repo', 'receive-pack', 'exec', 'push-option', 'recurse-submodules'];
@@ -86,6 +87,24 @@ const labelRe = (name) => new RegExp(`(?<![A-Za-z0-9_-])${escapeRe(name)}(?![A-Z
 const mentionsAny = (text, names) => names.some((n) => labelRe(n).test(text));
 const splitLabels = (v) => String(v ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
 const safeDecode = (s) => { try { return decodeURIComponent(s); } catch { return s; } };
+// Run events of the two owner-stop kinds (run-events.mjs) are comments that START with this marker. Only the pipeline CLI may post them: a forged
+// release would otherwise unblock a stopped PR. Matched case-insensitively on the DECODED text (percent-, \\uXXXX- and \\xXX-escapes undone).
+const EVENT_MARKER = /claude-pipeline:event:owner-stop/i;
+const unescapeText = (s) => safeDecode(String(s ?? '')
+  .replace(/\\u\{?([0-9a-f]{4,6})\}?/gi, (m, h) => { try { return String.fromCodePoint(parseInt(h, 16)); } catch { return m; } })
+  .replace(/\\x([0-9a-f]{2})/gi, (m, h) => String.fromCharCode(parseInt(h, 16))));
+const mentionsEventMarker = (...texts) => texts.some((x) => EVENT_MARKER.test(unescapeText(x)));
+const EVENT_FORGE = 'the text carries a claude-pipeline owner-stop event marker. Those comments are posted only by the pipeline CLI (P summary / P checkpoint), after the owner\'s reply. ' + 'This is reserved for the repository owner.';
+const COMMENT_MUTATIONS = ['addComment', 'addPullRequestReview', 'addPullRequestReviewComment', 'addPullRequestReviewThreadReply'];
+const COMMENT_UNREADABLE = 'the comment text cannot be read here (--input - / stdin / an unreadable file), so it cannot be checked for a pipeline event marker. Pass the text with --body, -f body=... or a readable file.';
+// A comment text built at run time ($VAR, $(...), backticks) cannot be checked for the marker, so it is refused like an unreadable one. The one run-time form that IS
+// readable: `$(cat <<'EOF' ... EOF)` (a quoted heredoc is literal; an unquoted one only when its body has no $ ` or backslash), because the heredoc body is part of the line
+// the marker scan reads. Nothing may follow the delimiter on the heredoc line, and nothing else on the word may be dynamic.
+const COMMENT_RUNTIME = 'the comment text is built at run time ($VAR / $(...) / backticks), so it cannot be checked for a pipeline event marker. Write the text out (a literal --body, or a quoted heredoc `"$(cat <<\'EOF\' ... EOF)"`) or pass a readable --body-file.';
+const QUOTED_HEREDOC_SUBST = /\$\(\s*cat\s+<<-?\s*(['"])(\w+)\1[ \t]*\n[\s\S]*?\n[ \t]*\2[ \t]*\n?\s*\)/g;
+const BARE_HEREDOC_SUBST = /\$\(\s*cat\s+<<-?\s*([A-Za-z_]\w*)[ \t]*\n([\s\S]*?)\n[ \t]*\1[ \t]*\n?\s*\)/g;
+const runTimeText = (v) => DYNAMIC.test(String(v ?? '').replace(QUOTED_HEREDOC_SUBST, '').replace(BARE_HEREDOC_SUBST, (m, _d, body) => (/[$`\\]/.test(body) ? m : '')));
+const COMMENT_ROUTE = /^repos\/[^/]+\/[^/]+\/(?:issues\/[^/]+\/comments|pulls\/[^/]+\/(?:comments|reviews))$/i;
 const stripHeads = (b) => String(b).replace(/^refs\/heads\//, '').replace(/^heads\//, '');
 
 function defaultReadText(file) {
@@ -731,7 +750,7 @@ function gatherBody(flags, dir, ctx) {
       let value = eq < 0 ? '' : f.value.slice(eq + 1);
       const at = typed ? /^@(.+)$/.exec(value) : null;
       if (at) value = fromFile(at[1]) ?? '';
-      fields.push({ key, value });
+      fields.push({ key, value, rt: !at && runTimeText(value) });
       if (key === 'query') queries.push(value);
     } else if (!f.short && f.name === 'input') {
       if (f.value === '-') { unknown = true; text += `\n${ctx.fullText}`; continue; }
@@ -790,18 +809,39 @@ function graphqlMutations(query) {
   return names;
 }
 
+// A comment-creating mutation whose text is built at run time: a command substitution or backtick anywhere in the document (graphql has
+// neither), a `$name`/`${name}` inside a string literal (a shell variable there), or a `$name` outside one that the operation never declares
+// (a graphql variable always is declared, so an undeclared one is a shell variable). Literal graphql variables stay allowed.
+const GRAPHQL_STRINGS = /"""[\s\S]*?"""|"(?:\\.|[^"\\\n])*"/g;
+function graphqlBuiltAtRunTime(q) {
+  if ((q.match(GRAPHQL_STRINGS) ?? []).some((s) => runTimeText(s))) return true;
+  // (comments are kept for the substitution test: the shell expands them too, and an output with a newline ends the comment)
+  const outside = q.replace(GRAPHQL_STRINGS, '""');
+  if (/\$\(|\$\{|`/.test(outside)) return true;
+  const declared = new Set([...stripGraphql(q).matchAll(/\$([A-Za-z_]\w*)\s*:/g)].map((m) => m[1]));
+  return [...outside.matchAll(/\$([A-Za-z_]\w*)/g)].some((m) => !declared.has(m[1]));
+}
+
 function checkGraphql(body, dir = null, ctx = null) {
   for (const q of body.queries) {
     if (/^\s*(\$\(|`|\$\{?[A-Za-z_])/.test(q)) return deny('the graphql query is built at run time, so it cannot be verified. Pass the query text directly.');
     const names = graphqlMutations(q);
     if (names === null) return deny('the graphql query contains a mutation that cannot be parsed, so it cannot be verified.');
     const bad = names.find((n) => !GRAPHQL_ALLOWED_MUTATIONS.has(n));
+    if (bad === 'updateIssueComment') return deny(`editing a comment through graphql (updateIssueComment) is blocked: run events are comments and must not be rewritten. ${OWNER_ONLY}`);
     if (bad) return deny(`the graphql mutation ${bad} is not on the allowed list (${[...GRAPHQL_ALLOWED_MUTATIONS].join(', ')}). ${OWNER_ONLY}`);
+    // (the query text AND the variables: `-f body=...`, `-F body=@file`, an --input JSON's values)
+    if (names.some((n) => COMMENT_MUTATIONS.includes(n))
+      && mentionsEventMarker(q, body.text, ...body.fields.map((x) => x.value), ...body.queries)) return deny(EVENT_FORGE);
+    // (the query text itself, built at run time: `body:"$(cat f)"`, `body:"$BODY"`: the marker never appears in the text the guard reads)
+    if (names.some((n) => COMMENT_MUTATIONS.includes(n)) && graphqlBuiltAtRunTime(q)) return deny(COMMENT_RUNTIME);
+    // (the variables of a comment mutation: `-f b="$(cat file)"`. The query itself is judged above; `data` is the curl route's own check)
+    if (names.some((n) => COMMENT_MUTATIONS.includes(n)) && body.fields.some((x) => x.rt && x.key !== 'query' && x.key !== 'data')) return deny(COMMENT_RUNTIME);
     // #58: auto-merge names the PR by its node id, which says nothing about whether the owner said "merge" for it, nor which repository it is in.
     // Why (#58 round 3): the node id can name a PR in a chat repo whatever directory this runs in, so the target repository can never be resolved
     // here: it is judged as a chat repo's (the owner's "merge" is needed, and a node id cannot match one), not as the current directory's.
     if (names.includes('enablePullRequestAutoMerge') && ctx?.ownerGo) {
-      return deny('turning on auto-merge through the API skips the owner\'s "merge": it names the PR by a node id, so its repository (owner_approval: chat?) and head cannot be checked. Use `gh pr merge <N> --auto --match-head-commit <sha>` after the owner said "merge", or `P merge`.');
+      return deny('turning on auto-merge through the API skips the owner\'s "merge": it names the PR by a node id, so its repository (owner_approval: chat?) and head cannot be checked. In an owner_approval: chat repository agents merge only through `P merge --pr N`.');
     }
   }
   if (body.unknown) return deny('cannot verify the graphql body (--input - / unreadable file).');
@@ -836,6 +876,9 @@ function checkApi(rest, env, dir, ctx) {
   const ep = normaliseEndpoint(positionals[0]);
   const p = `/${ep}`;
 
+  // -- run events are PR comments: a comment is never edited or deleted (chat mode's owner stops; the viewer's token could rewrite one)
+  if (/^repos\/[^/]+\/[^/]+\/issues\/comments\/[^/]+$/i.test(ep)) return deny(`${method} to an issue/PR comment is blocked: pipeline run events and owner stops live in comments and must not be rewritten or removed. Post a new comment instead.`);
+
   // -- published rules: protection, rulesets, repo settings, access, Actions permissions
   if (/\/branches\/.+\/protection/i.test(p)) return deny(`${method} to branch protection is blocked. ${OWNER_ONLY}`);
   if (/\/branches\/[^/]+\/rename$/i.test(p)) return deny(`renaming a branch through the API is blocked. ${OWNER_ONLY}`);
@@ -848,6 +891,12 @@ function checkApi(rest, env, dir, ctx) {
   const haystack = safeDecode(`${rest.join('\n')}\n${body.text}`);
   const approval = mentionsAny(haystack, APPROVAL_LABELS);
   const guard = mentionsAny(haystack, GUARD_LABELS);
+  // -- a comment (or review) that carries an owner-stop event marker is forged, and one whose text cannot be read cannot be shown not to be
+  if (COMMENT_ROUTE.test(ep)) {
+    if (body.unknown) return deny(COMMENT_UNREADABLE);
+    if (mentionsEventMarker(haystack, ...body.fields.map((x) => x.value))) return deny(EVENT_FORGE);
+    if (body.fields.some((x) => x.rt)) return deny(COMMENT_RUNTIME);
+  }
   const dynamicLabel = body.fields.some((f) => /^(labels(\[\])?|name|new_name)$/.test(f.key) && DYNAMIC.test(f.value));
 
   // -- labels: adding approval labels, removing/renaming guard labels, replacing or clearing a whole set
@@ -897,10 +946,12 @@ function checkApi(rest, env, dir, ctx) {
 }
 
 // ---- #58: direct merges in an owner_approval: chat repo ----------------------------------------------------------------
-// Why: P merge checks the owner's recorded "merge" (hooks/lib/owner-go.mjs) before it merges an owner item, but a plain
+// Why: P merge checks the owner's recorded "merge" (hooks/lib/owner-go.mjs) and every open owner stop before it merges, but a plain
 // `gh pr merge`, the repo's own merge command or auto-merge through the API skipped P merge entirely (Codex design review of #58,
-// verified). In a chat repo each of them now needs the owner's "merge" naming that PR in this session. P merge runs the merge
-// command as its own child process, which the guard never sees, so low-risk PRs still merge on their own through P merge.
+// verified). Since the chat-mode-without-needs-human change (docs/plans/2026-10-20-chat-mode-no-needs-human.md, N2) an agent merges
+// in a chat repo ONLY through P merge: a same-head "merge" given before a stop would otherwise still open a direct merge, and the direct
+// path reads no stop. P merge runs the merge command as its own child process, which the guard never sees, so it keeps working.
+// `gh pr merge --disable-auto` stays allowed (it cancels). Label mode and repos without a pipeline config are untouched.
 // Without the owner-go wiring (tests, older callers) nothing here applies.
 function ownerGoMode(dir, ctx) {
   if (!ctx?.ownerGo) return 'none';
@@ -918,20 +969,12 @@ const prNumberOf = (w) => {
 // `elsewhere`: the command names another repository (-R, a PR URL), whose mode is unknown here: judged as a chat repo.
 // `head`: the head the command pins (gh: --match-head-commit; the repo command: the flag before its {sha}); a merge that pins no full
 // head could land a later push the owner never saw, so it is refused, and the owner's "merge" must be for exactly that head.
-function directMergeVerdict(pr, head, dir, ctx, what, elsewhere = false, pinFlag = '--match-head-commit') {
+const CHAT_MERGE_ROUTE = 'in an owner_approval: chat repository agents merge only through `P merge --pr N` (it checks the owner\'s "merge" and any open owner stop); the owner merges in the GitHub UI.';
+function directMergeVerdict(pr, head, dir, ctx, what, elsewhere = false) {
   if (!ctx?.ownerGo) return null;
   if (!elsewhere && ownerGoMode(dir, ctx) !== 'chat') return null;
-  const where = elsewhere ? 'a merge named by -R, a PR URL or GH_REPO (its repository may need the owner)' : 'in this repository (owner_approval: chat) a merge';
-  const via = `Merge through \`P merge --pr ${pr ?? 'N'}\` (it merges a low-risk PR itself), or show the request (Head and 🔀 lines) and wait for the owner to type "merge".`;
-  if (pr === null) return deny(`${what} without a literal PR number: ${where} needs the owner's "merge" for that PR and head. Name the PR number (run from the repository), or ${via[0].toLowerCase()}${via.slice(1)}`);
-  if (!pinFlag) return deny(`${what} #${pr}: ${where} needs the owner's "merge" for the head it lands, and this merge command pins no head. ${via}`);
-  if (!/^[0-9a-f]{40}$/.test(String(head ?? ''))) return deny(`${what} #${pr}: ${where} must pin the head the owner said "merge" for: add \`${pinFlag} <full 40-character head>\`. ${via}`);
-  let ok = false;
-  try {
-    ok = ctx.ownerGo.approvedHead(pr, head) === true;
-  } catch { /* unreadable records: not approved */ }
-  if (ok) return null;
-  return deny(`${what} #${pr}: ${where} needs the owner's "merge" for #${pr} at head ${head.slice(0, 12)} in this session, and none is recorded. ${via}`);
+  const where = elsewhere ? ' (a merge named by -R, a PR URL or GH_REPO: its repository may be a chat repository)' : '';
+  return deny(`${what}${pr === null ? '' : ` #${pr}`}${where}: ${CHAT_MERGE_ROUTE}`);
 }
 // (the package-manager argv reading -- PM_RUN_ALIASES, canonPm, pmScriptOf ... -- lives in package-scripts.mjs: the two guards open package scripts with it too)
 // The repo's own merge command (pipeline.yml merge.command, e.g. `npm run merge -- {pr} --expect-head {sha}`) typed by hand. A `gh …`
@@ -958,8 +1001,7 @@ function pmScriptRefusal(prefix, shaFlag, raw, dir, ctx) {
   if (!mayRun) return undefined;
   const moved = before.some((w) => MOVES_DIR.test(w) || w === 'workspace') || pmSettingOnLine(ctx);
   if (!moved && ownerGoMode(dir, ctx) !== 'chat') return null;
-  const canon = `${prefix.join(' ')} <PR>${shaFlag ? ` ${shaFlag} <full 40-character head>` : ''}`;
-  return deny(`\`${raw.join(' ').slice(0, 120)}\` may run the merge script \`${script}\`, and ${moved ? 'a manager option moves its target directory, so it is judged as a chat repository' : 'in this repository (owner_approval: chat)'} a merge needs the owner's "merge" for that PR and head. Only the exact form \`${canon}\` is checked against the owner's record (nothing between the script name and \`--\`, no manager options, no wrapper). Use it, or merge through \`P merge --pr N\` (it merges a low-risk PR itself).`);
+  return deny(`\`${raw.join(' ').slice(0, 120)}\` may run the merge script \`${script}\`${moved ? ' (a manager option moves its target directory, so it is judged as a chat repository)' : ''}: ${CHAT_MERGE_ROUTE}`);
 }
 function repoMergeCommandVerdict(argv, dir, ctx) {
   if (!ctx?.ownerGo) return null;
@@ -1007,6 +1049,32 @@ function repoMergeCommandVerdict(argv, dir, ctx) {
   return null;
 }
 
+// `gh pr|issue comment`: no --edit-last / --delete-last (a run event could be rewritten), no owner-stop event marker in the text, and the text must be readable.
+function checkGhComment(rest, dir, ctx) {
+  const { flags } = parseOpts(rest, { longValue: ['body', 'body-file', 'repo'], shortValue: 'bFR' });
+  if (flags.some((f) => !f.short && (f.name === 'edit-last' || f.name === 'delete-last'))) {
+    return deny('editing or deleting the last comment (--edit-last / --delete-last) is blocked: pipeline run events and owner stops live in comments and must not be rewritten or removed. Post a new comment instead.');
+  }
+  // (--editor: the text is typed in an editor the guard cannot see)
+  if (flags.some((f) => f.short ? f.name === 'e' : f.name === 'editor')) return deny(COMMENT_UNREADABLE);
+  const texts = [rest.join('\n'), ctx.fullText ?? ''];
+  for (const fl of flags) {
+    if (fl.value === null) continue;
+    if (fl.short ? fl.name === 'b' : fl.name === 'body') {
+      if (runTimeText(fl.value)) return deny(COMMENT_RUNTIME);
+      texts.push(fl.value);
+    }
+    else if (fl.short ? fl.name === 'F' : fl.name === 'body-file') {
+      if (fl.value === '-' || dir === null) return deny(COMMENT_UNREADABLE);
+      countScript(ctx.budget);
+      const text = ctx.readText(path.resolve(dir, fl.value));
+      if (typeof text !== 'string') return deny(COMMENT_UNREADABLE);
+      texts.push(text);
+    }
+  }
+  return mentionsEventMarker(...texts) ? deny(EVENT_FORGE) : null;
+}
+
 function checkGh(argv, env, dir, ctx, raw, level = 0) {
   // The group and verb must be written literally (`gh pr $X`, `gh pr ${X%-base}`, `gh pr "$(printf merge)"`): a variable's
   // value on the line is not proof — `X=merge; true || X=view; gh pr $X` runs merge.
@@ -1049,6 +1117,8 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
     if (ALL_LABELS.includes(name)) return deny(`\`gh label ${verb} ${name}\` would break a pipeline label and is blocked. ${OWNER_ONLY}`);
     return null;
   }
+
+  if ((group === 'pr' || group === 'issue') && verb === 'comment') return checkGhComment(rest, dir, ctx);
 
   if (group === 'pr' && verb === 'merge') {
     if (rest.some((t) => t === '--admin' || t.startsWith('--admin='))) return deny(`\`gh pr merge --admin\` bypasses the merge gate and is blocked. Use \`--auto\` / the pipeline merge command. ${OWNER_ONLY}`);
@@ -1094,6 +1164,159 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
       const v = checkIssueHold(n, repoArgs, dir, ctx, verb);
       if (v) return v;
     }
+  }
+  return null;
+}
+
+// ---- curl / wget / httpie / xh to GitHub ------------------------------------------------------------------
+// Why: with the viewer's token such a command can merge a PR, rewrite a comment (a run event), post a forged one or call graphql without touching any `gh` rule.
+// A call to github.com / api.github.com with a non-GET method is rewritten as the `gh api` call it is and judged by checkApi (+ the merge / refs rules below).
+// Residual: `node -e "fetch(...)"`, `python -c`, any program the agent writes.
+const HTTP_TOOLS = new Set(['curl', 'wget', 'http', 'https', 'xh', 'xhs']);
+const GH_HOST = /(?:^|\.)github\.com\.?$/i; // (a trailing dot is the same host)
+// Flags whose NEXT word is their value, per tool: a flag missing here would leave its value among the URL candidates (harmless), but a flag listed here that is
+// a switch in that tool would swallow the URL (a hole), so the sets are per tool.
+const CURL_VALUE_FLAGS = new Set(['-H', '--header', '-o', '--output', '-u', '--user', '-A', '--user-agent', '-e', '--referer', '-b', '--cookie', '-c', '--cookie-jar', '-w', '--write-out', '--connect-timeout', '-m', '--max-time', '--retry', '--retry-delay',
+  '--retry-max-time', '-x', '--proxy', '--cacert', '--cert', '-E', '--key', '--resolve', '--connect-to', '--interface', '--limit-rate', '--max-redirs', '-r', '--range', '-C', '--continue-at', '-D', '--dump-header', '-y', '-Y', '-z', '-Q', '--proxy-user', '-U', '--oauth2-bearer', '--aws-sigv4']);
+const WGET_VALUE_FLAGS = new Set(['-o', '--output-file', '-a', '--append-output', '-e', '--execute', '-t', '--tries', '-T', '--timeout', '-O', '--output-document', '-w', '--wait', '-P', '--directory-prefix', '-U', '--user-agent', '-B', '--base', '-Q', '--quota', '-l', '--level',
+  '-A', '--accept', '-R', '--reject', '-D', '--domains', '-I', '--include-directories', '-X', '--exclude-directories', '--header', '--user', '--password', '--http-user', '--http-password', '--referer', '--load-cookies', '--save-cookies', '--certificate', '--ca-certificate', '--private-key']);
+const HTTPIE_VALUE_FLAGS = new Set(['-A', '--auth-type', '-a', '--auth', '-o', '--output', '-p', '--print', '-s', '--style', '--pretty', '--ssl', '--verify', '--cert', '--cert-key', '--cert-key-pass', '--proxy', '--timeout', '--max-redirects', '--max-headers', '--session', '--session-read-only',
+  '--default-scheme', '--format-options', '--response-charset', '--response-mime', '--path-as-is', '--bearer', '--unsorted', '--sorted', '--ciphers']);
+const HTTP_DATA_FLAGS = new Set(['-d', '--data', '--data-raw', '--data-binary', '--data-ascii', '--data-urlencode', '--json', '-T', '--upload-file', '-F', '--form', '--form-string', '--post-data', '--post-file', '--body-data', '--body-file']);
+const HTTP_FILE_FLAGS = new Set(['-T', '--upload-file', '--post-file', '--body-file']);
+const URL_FILE_FLAGS = new Set(['-i', '--input-file']); // wget reads its URLs from a file
+const CURL_SHORT_VALUE = 'XHdobuAecwmxKFTEyYzrCDQU';
+const HTTP_METHODS = ['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH', 'DELETE'];
+const SAFE_METHODS = ['GET', 'HEAD', 'OPTIONS'];
+// A curl config file (-K) as the words it stands for: "url = \"...\"" -> --url ...; "silent" -> --silent; "X = PUT" -> -X PUT. Comments and blank lines are skipped.
+function curlConfigWords(text) {
+  const out = [];
+  for (const raw of String(text).split(/\r?\n/)) {
+    const ln = raw.trim();
+    if (!ln || ln.startsWith('#')) continue;
+    const m = /^(-{0,2}[A-Za-z][A-Za-z0-9-]*)\s*(?:[=:]\s*|\s+)?([\s\S]*)$/.exec(ln);
+    if (!m) continue;
+    const name = m[1].replace(/^-+/, '');
+    out.push(name.length === 1 ? `-${name}` : `--${name}`);
+    let v = m[2].trim();
+    if (/^"[\s\S]*"$/.test(v)) v = v.slice(1, -1).replace(/\\(.)/g, '$1');
+    if (v !== '') out.push(v);
+  }
+  return out;
+}
+function checkHttpTool(argv, dir, ctx, tool = 'curl') {
+  const httpie = ['http', 'https', 'xh', 'xhs'].includes(tool);
+  const valueFlags = tool === 'curl' ? CURL_VALUE_FLAGS : tool === 'wget' ? WGET_VALUE_FLAGS : HTTPIE_VALUE_FLAGS;
+  // curl bundles short flags (-sXPUT, -sSd@f): split them into separate words, a value-taking letter ends the bundle
+  const unbundle = (w) => {
+    if (tool !== 'curl' || !/^-[A-Za-z]/.test(w) || w.length <= 2) return [w];
+    const out = [];
+    for (let k = 1; k < w.length; k++) {
+      out.push(`-${w[k]}`);
+      if (CURL_SHORT_VALUE.includes(w[k])) { if (k + 1 < w.length) out.push(w.slice(k + 1)); break; }
+    }
+    return out;
+  };
+  let words = argv.slice(1).map((a) => expandVars(a, ctx)).flatMap(unbundle);
+  const methods = [];
+  let implied = false;
+  let sawNext = false;
+  const urls = [];
+  const data = [];
+  let unknown = false;
+  let urlFile = false;
+  let configs = 0;
+  let configUnreadable = false;
+  let globoff = false; // curl -g / --globoff: without it curl expands [a-b] ranges and {x,y} lists in a URL, even a quoted one
+  let requestTarget = false; // curl --request-target: the path sent, whatever the URL says
+  let strangeFlag = null; // an option this parser does not know that carries a /repos/ path
+  const readData = (v, isFile) => {
+    const value = v;
+    const urlenc = /^[^=@\s]*@(.+)$/.exec(value); // --data-urlencode name@file
+    if (!isFile && !value.startsWith('@') && !/^[^=\s]+=@/.test(value) && !urlenc) { data.push(value); return; }
+    const p = isFile ? value : (value.startsWith('@') ? value.slice(1) : urlenc && !value.includes('=') ? urlenc[1] : value.slice(value.indexOf('=@') + 2));
+    if (p === '-' || p === '' || dir === null) { unknown = true; return; }
+    countScript(ctx.budget);
+    const text = ctx.readText(path.resolve(dir, p));
+    if (typeof text === 'string') { data.push(text); data.push(value); } else unknown = true;
+  };
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    if (w === '--') { urls.push(...words.slice(i + 1)); break; }
+    const eq = w.startsWith('--') ? w.indexOf('=') : -1;
+    const flag = eq > 0 ? w.slice(0, eq) : (!httpie && /^-[A-Za-z]./.test(w) && !w.startsWith('--') ? w.slice(0, 2) : w);
+    const attached = eq > 0 ? w.slice(eq + 1) : (!httpie && /^-[A-Za-z]./.test(w) && !w.startsWith('--') ? w.slice(2) : null);
+    const value = () => (attached !== null ? attached : (words[++i] ?? ''));
+    if (flag === '--next' || flag === '-:') { sawNext = true; continue; }
+    if (flag === '-X' || flag === '--request' || flag === '--method') { methods.push(value().toUpperCase()); continue; }
+    if (tool === 'curl' && (flag === '--url')) { urls.push(value()); continue; }
+    if (tool === 'curl' && (flag === '-K' || flag === '--config')) {
+      const file = value();
+      if (file === '-' || file === '' || dir === null || ++configs > 3) { configUnreadable = true; continue; }
+      countScript(ctx.budget);
+      const text = ctx.readText(path.resolve(dir, file));
+      if (typeof text !== 'string') { configUnreadable = true; continue; }
+      words = [...words.slice(0, i + 1), ...curlConfigWords(text).map((x) => expandVars(x, ctx)), ...words.slice(i + 1)];
+      continue;
+    }
+    if (tool === 'curl' && flag === '--request-target') { requestTarget = true; value(); continue; }
+    if (URL_FILE_FLAGS.has(flag) && tool === 'wget') { value(); urlFile = true; continue; }
+    if (HTTP_DATA_FLAGS.has(flag) && !(httpie && flag.length === 2 && flag !== '-F')) { implied = true; readData(value(), HTTP_FILE_FLAGS.has(flag)); continue; }
+    if (valueFlags.has(flag)) { value(); continue; }
+    if (w.startsWith('-')) {
+      if (eq > 0 && /(?:^|[/=])(?:repos|repositories)\/[^/]+\/[^/]+/i.test(w.slice(eq + 1))) strangeFlag ??= flag;
+      continue;
+    }
+    if (httpie && HTTP_METHODS.includes(w.toUpperCase())) { methods.push(w.toUpperCase()); continue; }
+    if (!httpie && /^[A-Z]{3,7}$/.test(w) && HTTP_METHODS.includes(w) && urls.length === 0 && methods.length === 0) { methods.push(w); continue; }
+    if (!/:\/\//.test(w) && (/^[A-Za-z0-9_.\[\]-]+(?::=|=@?|:)/.test(w) && !/^[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?:[/:]|$)/.test(w))) {
+      if (!/^[A-Za-z0-9_.\[\]-]+==/.test(w) && /=/.test(w)) { implied = true; readData(w, false); } // (httpie / xh data item; `key==v` is a query parameter, `Name:v` a header)
+      continue;
+    }
+    urls.push(w);
+  }
+  // (a curl config file may set the URL, the method and the data: one that cannot be read here is refused whatever else the line says)
+  if (configUnreadable) return deny('the curl config file (-K / --config) cannot be read here (stdin, a missing file or too many), and it may set the URL and the method, so the call cannot be verified. Put the options on the command line.');
+  // Every method named anywhere counts (--next starts a new transfer with its own options: the last -X must not hide an earlier PUT). Data without a method is a POST.
+  const bad = methods.find((m) => !SAFE_METHODS.includes(m));
+  const nonGet = bad !== undefined || (implied && (methods.length === 0 || sawNext));
+  const verb = bad ?? 'POST';
+  if (nonGet && (urlFile || unknown && urls.length === 0)) return deny(`${verb} whose URL or config comes from a file / stdin / a config file that cannot be read here, so what it calls cannot be verified. Write the URL on the command line.`);
+  if (nonGet && urls.length === 0) return deny(`${verb} with no URL on the command line (it comes from stdin, xargs or a config), so what it calls cannot be verified. Write the URL out.`);
+  for (const w of urls) {
+    const host = (/^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/)?(?:[^/@?#]*@)?([^/:?#]*)/.exec(w) ?? [])[1] ?? '';
+    // (curl expands `pulls/[3-3]/merge` to `pulls/3/merge` and `{comments,comments}` lists, so the endpoint judged below is not the one called.
+    // -g / --globoff is NOT trusted to switch this off: a later --no-globoff, a -g taken as the value of an option this parser does not
+    // know, or a config file can each leave globbing on, and no real GitHub write needs [ or { in its URL.)
+    const v6 = /^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/)?(?:[^/@?#]*@)?\[[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*\](?=[:/?#]|$)/.exec(w); // an IPv6 literal host ([::1], always with a colon, ending the host) is not a glob and not github.com
+    const globbed = tool === 'curl' && /[[{]/.test(v6 ? w.slice(v6[0].length) : w);
+    const hostUnknown = host === '' || DYNAMIC.test(host) || /[{}]/.test(host); // ({} is the placeholder of xargs / find: the URL comes from elsewhere)
+    if (!hostUnknown && !GH_HOST.test(host) && !(globbed && !v6 && /[[{]/.test(host))) continue; // (a glob in the host can expand to github.com)
+    if (!nonGet) {
+      if (!hostUnknown && DYNAMIC.test(w) && /\$\(|`/.test(w)) return deny('the URL is built at run time ($(...) / backticks) for a github.com host, so what it calls cannot be verified. Write the URL out.');
+      continue;
+    }
+    if (globbed) return deny(`${verb} to a URL with curl globbing ([a-b] / {x,y}) that may point at github.com: curl expands it, so the endpoint it calls cannot be verified (-g / --globoff does not change this). Write the URL without [ ] { }.`);
+    if (hostUnknown || DYNAMIC.test(w)) return deny(`${verb} to a URL built at run time ($VAR / $(...)) that may point at github.com cannot be verified. Write the URL out.`);
+    if (requestTarget) return deny(`${verb} with curl --request-target to a github.com host: it replaces the path of the URL, so the endpoint it calls cannot be verified. Put the path in the URL.`);
+    if (strangeFlag) return deny(`${verb} to a github.com host with an option this guard does not know (${strangeFlag}) that carries a repository path: it may replace the endpoint, so the call cannot be verified. Put the path in the URL.`);
+    const ep = normaliseEndpoint(/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(w) ? w : `https://${w}`);
+    if (/^repos\/[^/]+\/[^/]+\/pulls\/\d+\/merge$/i.test(ep)) return deny(`merging through the API bypasses the merge gate, like --admin. ${OWNER_ONLY}`);
+    if (/\/merges$/i.test(`/${ep}`)) return deny(`merging branches through the API can move main without a PR. ${OWNER_ONLY}`);
+    if (/\/git\/refs(\/|$)/i.test(`/${ep}`)) return deny(`${verb} to git refs through the API is blocked. ${OWNER_ONLY}`);
+    // (a body built at run time on a comment route, or a graphql document with a command substitution, cannot be read)
+    if (COMMENT_ROUTE.test(ep) && data.some((d) => runTimeText(d))) return deny(COMMENT_RUNTIME);
+    if (ep === 'graphql' && data.some((d) => /\$\(|`|\$\{/.test(d))) return deny('the graphql document is built at run time, so it cannot be verified. Write the query text out.');
+    const queries = [];
+    for (const d of data) {
+      try {
+        const j = JSON.parse(d);
+        for (const o of Array.isArray(j) ? j : [j]) if (o && typeof o.query === 'string') queries.push(o.query);
+      } catch { if (/\bmutation\b/.test(d)) queries.push(d); }
+    }
+    const rest = ['-X', verb, ep, ...data.flatMap((d) => ['-f', `data=${d}`]), ...queries.flatMap((q) => ['-f', `query=${q}`]), ...(unknown ? ['--input', '-'] : [])];
+    const v = checkApi(rest, {}, dir, ctx);
+    if (v) return v;
   }
   return null;
 }
@@ -2644,6 +2867,7 @@ function evalString(str, startDir, ctx, level, child = false) {
         const v = withPrefixEnv(c, ctx, () => evalString(inner, dir, ctx, level + 1));
         if (v.decision === 'deny') { verdict = v; break; }
       }
+      if (!verdict && HTTP_TOOLS.has(name)) verdict = checkHttpTool(argv, dir, ctx, name);
       if (!verdict) verdict = withPrefixEnv(c, ctx, () => repoMergeCommandVerdict(argv, dir, ctx)); // (#58; with its prefix: `npm_config_prefix=/chat npm run merge …`)
       // (npm exec NAME / npx NAME: the parser unwraps them to `NAME …`, marked viaRunner. NAME is a bin, never a script, but it is judged as the merge script when it carries that name: `npx npm run NAME`)
       if (!verdict && c.viaRunner) verdict = withPrefixEnv(c, ctx, () => repoMergeCommandVerdict(['npx', 'npm', 'run', argv[0]], dir, ctx));

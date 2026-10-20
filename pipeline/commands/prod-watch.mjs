@@ -15,6 +15,7 @@ import { GhError, gh as ghRun } from '../lib/proc.mjs';
 import {
   createGitOps, createRunRecordTracker, createSmoke, exitCodeFor, knownGoodFromEvents, readKnownGood, resolveMergeSha, runProdWatch,
 } from '../lib/prodwatch.mjs';
+import { postOwnerStopEvent } from '../lib/owner-stop.mjs';
 import { postEvent, readEvents } from '../lib/run-events.mjs';
 import { inspectAlias, linkedProjectDir, rollback } from '../lib/vercel.mjs';
 
@@ -28,8 +29,8 @@ const CALL_TIMEOUT_MS = 60_000;
 
 // `gh pr create` (body on stdin, so no text is ever shell-quoted). The new PR's number comes from the URL it prints.
 function prCreator({ cwd, env }) {
-  return ({ title, body, head, base, labels = [] }) => {
-    const args = ['pr', 'create', '--head', head, '--base', base, '--title', title, '--body-file', '-', ...labels.flatMap((l) => ['--label', l])];
+  return ({ title, body, head, base, labels = [], draft = false }) => {
+    const args = ['pr', 'create', '--head', head, '--base', base, '--title', title, '--body-file', '-', ...(draft ? ['--draft'] : []), ...labels.flatMap((l) => ['--label', l])];
     const r = ghRun(args, { cwd, env, input: body, timeoutMs: CALL_TIMEOUT_MS });
     if (r.code !== 0 || r.timedOut) throw new GhError({ code: r.code, stderr: r.stderr, args, timedOut: r.timedOut });
     const url = r.stdout.split(/\s+/).find((t) => /^https?:\/\//.test(t)) ?? null;
@@ -91,6 +92,8 @@ export const run = guarded(async (argv, ctx) => {
       deploymentStatuses: (id) => gh.deploymentStatuses(id),
     },
     git: createGitOps({ root }),
+    // Chat mode: the owner-stop event on the NEW revert PR. Built unconditionally (it needs no PR number of the merge), so `--sha` alone works.
+    ownerStopEvent: (n, data) => postOwnerStopEvent({ gh, pr: n, ...data, host: hostname() }),
     // Events and the run record live on the PR, so they exist only when the PR is known.
     ...(pr === undefined ? {} : {
       events: { post: (kind, id, sentence, data) => postEvent(gh, pr, kind, id, sentence, data), list: () => readEvents(gh, pr) },

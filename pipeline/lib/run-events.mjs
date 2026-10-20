@@ -4,7 +4,7 @@
 import { line } from './render.mjs';
 import { packJson, unpackJson } from './run-record.mjs';
 
-export const EVENT_KINDS = Object.freeze(['prod-before', 'rollback-intent', 'rollback-result', 'recovery-reported', 'ci-proof-used']);
+export const EVENT_KINDS = Object.freeze(['prod-before', 'rollback-intent', 'rollback-result', 'recovery-reported', 'ci-proof-used', 'owner-stop', 'owner-stop-released']);
 
 const EVENT_ID = /^[A-Za-z0-9._-]{1,64}$/;
 const EVENT_START = /^<!-- claude-pipeline:event:([a-z-]+):([A-Za-z0-9._-]{1,64}) -->/;
@@ -65,7 +65,33 @@ export function resolvedRollbacks(events, { mergeSha = null } = {}) {
   return (events ?? []).filter((e) => e.kind === 'rollback-result' && e.dataStatus === 'ok' && (!mergeSha || e.data?.mergeSha === mergeSha));
 }
 
-export const readEvents = (gh, pr) => listEvents(gh.listComments(pr), gh.viewer());
+// Owner stops (owner_approval: chat): `owner-stop` events (id = the stop id) with no `owner-stop-released` of the SAME id.
+// Oldest first. Events are the authority, never the run record. Fail closed: a stop whose payload cannot be read still
+// counts, and a release whose payload cannot be read releases nothing.
+export function openOwnerStops(events) {
+  const released = new Set((events ?? []).filter((e) => e.kind === 'owner-stop-released' && e.dataStatus === 'ok').map((e) => String(e.id)));
+  return (events ?? []).filter((e) => e.kind === 'owner-stop' && !released.has(String(e.id)));
+}
+
+// The id of the newest `owner-stop` event (by comment id), released or not; null when the PR never had one. A merge request
+// for such a PR must carry this id (the owner's "merge" is bound to it).
+export function newestStopId(events) {
+  let best = null;
+  for (const e of events ?? []) {
+    if (e.kind === 'owner-stop' && (best === null || Number(e.commentId) > Number(best.commentId))) best = e;
+  }
+  return best ? String(best.id) : null;
+}
+
+// The owner-stop history of a PR as one comparable value: the newest stop id and the ids of the stops released (a release whose payload
+// cannot be read releases nothing, so it is left out, like openOwnerStops). A merge request is bound to this: any stop or release that lands
+// after it was read changes it.
+export function stopHistory(events) {
+  const released = [...new Set((events ?? []).filter((e) => e.kind === 'owner-stop-released' && e.dataStatus === 'ok').map((e) => String(e.id)))].sort();
+  return { stopId: newestStopId(events), released };
+}
+
+export const readEvents =(gh, pr) => listEvents(gh.listComments(pr), gh.viewer());
 
 // Always a new comment: this never calls upsertComment, so a second event can never rewrite a first one.
 export function postEvent(gh, pr, kind, id, sentence, data) {

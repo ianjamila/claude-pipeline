@@ -7,7 +7,12 @@ import { MARKERS, clip, line } from './render.mjs';
 import { MAX_PROOFS, MAX_PROOF_STEP } from './config.mjs';
 import { addCostEntry, addRetries, addSessions, costLines, costShapeProblem, setGuardBlocks } from './run-cost.mjs';
 
-export const RECORD_VERSION = 1;
+// The highest version this CLI reads. A record is written as version 2 ONLY while it carries an `ownerStop` display copy
+// (an open owner stop, owner_approval: chat) and as version 1 otherwise, so ordinary records stay readable by older CLIs.
+// An older CLI reads the version-2 record as `unsupported` and so demands the owner's "merge": the rollout tripwire for
+// installs that do not know owner-stop events yet (run-events.mjs holds the authority).
+export const RECORD_VERSION = 2;
+const BASE_VERSION = 1;
 
 export const STEPS = Object.freeze(['build', 'verify', 'pr', 'review', 'gate', 'awaiting-owner-merge', 'merge', 'prod-watch', 'ended']);
 
@@ -67,6 +72,14 @@ export const OUTCOME_NEXT = Object.freeze({
   'needs-owner': 'owner: production fails the smoke and was left alone, check it and the rollback target',
 });
 
+// "Next" for a run that stopped at `outcome`. Label mode (and any unknown mode) is OUTCOME_NEXT unchanged; in chat mode a
+// `needs-human` stop is an owner stop that only the owner's typed reply releases, so there is no label to add.
+export function outcomeNext(outcome, { ownerApproval = 'label', stop = null, pr = null } = {}) {
+  if (ownerApproval !== 'chat' || outcome !== 'needs-human') return OUTCOME_NEXT[outcome];
+  const n = Number.isInteger(pr) && pr > 0 ? pr : 'N';
+  return `owner reply needed in chat${stop?.id ? ` (stop ${stop.id})` : ''}: ship resume ${n}`;
+}
+
 // A merged run whose production result is still unknown: no outcome yet, or `prod-unknown`.
 export const prodStillOpen = (record) => record?.outcome == null || record.outcome === 'prod-unknown';
 
@@ -93,7 +106,7 @@ export function unpackJson(b64) {
 
 export function emptyRecord({ repo, pr, branch, baseRef }) {
   return {
-    v: RECORD_VERSION,
+    v: BASE_VERSION,
     repo: repo ?? '',
     pr,
     branch: branch ?? '',
@@ -118,6 +131,18 @@ export function emptyRecord({ repo, pr, branch, baseRef }) {
 
 export const encodeRecord = (record) => `<!-- claude-pipeline:record:${packJson(record)} -->`;
 
+// The display copy of an open owner stop: {id, cause, head, at}. The event is the authority; this only shows it.
+const STOP_ID = /^[0-9a-f]{8}$/;
+const STOP_CAUSE = /^[A-Za-z0-9:_.-]{1,60}$/;
+function ownerStopProblem(s) {
+  if (!isPlainObject(s)) return 'not an object';
+  if (!isStr(s.id) || !STOP_ID.test(s.id)) return 'bad stop id';
+  if (s.cause != null && !(isStr(s.cause) && STOP_CAUSE.test(s.cause))) return 'bad cause';
+  if (s.head != null && !(isStr(s.head) && s.head.length <= 64)) return 'bad head';
+  if (!isStr(s.at) || s.at === '' || s.at.length > 64) return 'bad time';
+  return null;
+}
+
 function shapeProblem(r) {
   if (!isPlainObject(r)) return 'not an object';
   if (!Number.isInteger(r.v) || r.v < 1) return 'bad version';
@@ -135,13 +160,18 @@ function shapeProblem(r) {
     const why = proofsProblem(r.proofs);
     if (why) return `bad proofs: ${why}`;
   }
+  if (r.ownerStop !== undefined) {
+    const why = ownerStopProblem(r.ownerStop);
+    if (why) return `bad ownerStop: ${why}`;
+  }
   // `cost` is optional: a record from before cost attribution has none.
   return costShapeProblem(r.cost);
 }
 
 // Never throws. `body` is a comment body the caller already knows is viewer-authored. Only a body that STARTS with the
 // summary marker is a summary: a quoted marker (or a forged record) elsewhere is not. The LAST record marker wins.
-export function decodeRecord(body) {
+// `maxVersion` is the newest version the reader understands (tests pass 1 to play an older CLI).
+export function decodeRecord(body, { maxVersion = RECORD_VERSION } = {}) {
   if (typeof body !== 'string' || !body.startsWith(MARKERS.summary)) return { status: 'absent' };
   const matches = [...body.matchAll(RECORD_MARKER)];
   if (matches.length === 0) return { status: 'legacy' };
@@ -151,7 +181,7 @@ export function decodeRecord(body) {
   } catch {
     return { status: 'invalid' };
   }
-  if (isPlainObject(record) && Number.isInteger(record.v) && record.v > RECORD_VERSION) return { status: 'unsupported' };
+  if (isPlainObject(record) && Number.isInteger(record.v) && record.v > maxVersion) return { status: 'unsupported' };
   return shapeProblem(record) ? { status: 'invalid' } : { status: 'ok', record };
 }
 
@@ -242,7 +272,7 @@ function normaliseInFlight(v) {
 
 // Returns a NEW record. `patch` keys (all optional): step, outcome, next, detail, head, request, tasks (the full list,
 // done kept for ids it omits `done` for), done (ids to mark done), verify, round, mergeSha, inFlight (object | null),
-// agentLogLine, cliVersion, proofs ([{step, source: 'local'} | {step, source: 'ci', run: {id, attempt, jobId, workflow, job, url}}], replaces the list; set by `P merge`), cost ({entry: {phase, role, input, output, cacheRead, cacheWrite, usd}, retries: n to add, sessions: [ids], guardBlocks: n | null, guardBySession: {id: n}; see run-cost.mjs), resumed ({at, host, head}: a run taken over by `ship resume`; set once, never cleared). Every call stamps the heartbeat and appends a history entry (capped, oldest dropped).
+// agentLogLine, cliVersion, proofs ([{step, source: 'local'} | {step, source: 'ci', run: {id, attempt, jobId, workflow, job, url}}], replaces the list; set by `P merge`), cost ({entry: {phase, role, input, output, cacheRead, cacheWrite, usd}, retries: n to add, sessions: [ids], guardBlocks: n | null, guardBySession: {id: n}; see run-cost.mjs), resumed ({at, host, head}: a run taken over by `ship resume`; set once, never cleared), ownerStop ({id, cause, head, at}: the display copy of an open owner stop, which makes the record version 2; null clears it). Every call stamps the heartbeat and appends a history entry (capped, oldest dropped).
 export function applyCheckpoint(record, patch, { host, now }) {
   const next = structuredClone(record);
   if (patch.step !== undefined) {
@@ -290,6 +320,21 @@ export function applyCheckpoint(record, patch, { host, now }) {
     next.resumed = { at: String(patch.resumed.at ?? ''), host: String(patch.resumed.host ?? ''), head: String(patch.resumed.head ?? '') };
   }
 
+  if (patch.ownerStop !== undefined) {
+    if (patch.ownerStop === null) {
+      delete next.ownerStop;
+    } else {
+      const copy = isPlainObject(patch.ownerStop)
+        ? { id: patch.ownerStop.id, cause: patch.ownerStop.cause ?? null, head: patch.ownerStop.head ?? null, at: patch.ownerStop.at }
+        : patch.ownerStop;
+      const why = ownerStopProblem(copy);
+      if (why) throw new Error(`ownerStop: ${why}`);
+      next.ownerStop = copy;
+    }
+  }
+  // Version 2 exactly while the copy is present, so an ordinary record stays readable by older CLIs.
+  next.v = isPlainObject(next.ownerStop) ? RECORD_VERSION : BASE_VERSION;
+
   const at = new Date(now).toISOString();
   next.heartbeat = { host: String(host ?? ''), at };
   next.history = [...next.history, { step: next.step, head: next.head, host: next.heartbeat.host, at }].slice(-LIMITS.history);
@@ -299,7 +344,7 @@ export function applyCheckpoint(record, patch, { host, now }) {
 // The record to write when `P summary` / `P comment --kind summary` ends a run. An existing record is kept (and updated)
 // when it belongs to this PR; otherwise a fresh one is made from what the caller knows. An outcome that is not in
 // OUTCOMES is still shown in the comment, but never enters the record: it only adds a warning.
-export function recordForOutcome(existing, { repo, pr, branch, baseRef, head, outcome, detail, agentLogLine, host, now, sessions, guardBlocks, guardBySession }) {
+export function recordForOutcome(existing, { repo, pr, branch, baseRef, head, outcome, detail, agentLogLine, host, now, sessions, guardBlocks, guardBySession, ownerApproval = 'label', ownerStop }) {
   const warnings = [];
   let base = existing;
   if (base) {
@@ -318,7 +363,9 @@ export function recordForOutcome(existing, { repo, pr, branch, baseRef, head, ou
   if (OUTCOMES.includes(outcome)) {
     patch.outcome = outcome;
     patch.step = OUTCOME_STEP[outcome];
-    patch.next = OUTCOME_NEXT[outcome];
+    // The copy is only ever SET here, after the stop event was posted (never cleared: a release clears it); label mode has none.
+    if (ownerApproval === 'chat' && ownerStop) patch.ownerStop = ownerStop;
+    patch.next = outcomeNext(outcome, { ownerApproval, stop: patch.ownerStop ?? base.ownerStop, pr });
     patch.detail = detail ?? '';
     patch.inFlight = null;
   } else {
@@ -343,6 +390,7 @@ export function renderStatusBlock(record) {
     `- **Next:** ${r.next ? line(r.next, LIMITS.text) : '—'}`,
     `- **Head:** ${head} · **Round:** ${line(r.round ?? 0)}${total ? ` · **Tasks:** ${done}/${total} done` : ''}`,
   ];
+  if (r.ownerStop?.id) out.push(`- **Owner stop:** ${line(r.ownerStop.id)}${r.ownerStop.cause ? ` (${line(r.ownerStop.cause)})` : ''}`);
   if (f) out.push(`- **In flight:** ${line(f.kind)} on ${line(f.host)} since ${line(f.startedAt)}${f.maxMinutes ? ` (max ${line(f.maxMinutes)} min)` : ''}`);
   for (const p of Array.isArray(r.proofs) ? r.proofs : []) out.push(`- ${proofLine(p)}`);
   out.push(...costLines(r.cost));

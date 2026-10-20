@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, realpathSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -393,4 +393,67 @@ test('plan: owner_approval chat names awaiting-owner-merge as the stop; the reco
   assert.equal(r.json.enter, 'gate');
   assert.equal(r.json.stop, 'awaiting-owner-merge');
   assert.deepEqual(r.json.record.resumed, resumed);
+});
+
+// ---- chat mode: the label is never read; owner stops are events; plan/list stay read-only ------------------------------
+
+function chatWorld(extraComments = [], { labels = [], items = [] } = {}) {
+  const w = world();
+  const sha = w.prBranch(7, { 'b.txt': 'b\n' });
+  w.repo.write('.claude/pipeline.yml', `${pipelineYml('github', ['ci'])}owner_approval: chat\n`);
+  const hash = reviewContentHash({ branch: 'main', agentLog: AGENT_LOG, head: sha, baseSha: w.base }, { cwd: w.repo.dir });
+  const resumed = { at: '2026-10-12T08:00:00.000Z', host: 'pc-2', head: sha };
+  const fake = createFakeGh([
+    ...BASE_ENTRIES,
+    { match: VIEW(7), stdoutJson: view(7, sha, { labels: labels.map((name) => ({ name })) }) },
+    { match: COMMENTS(7), stdoutJson: [recordComment(1, 7, { head: sha, round: 1, resumed, verify: { head: sha, tree: 't', mode: 'full', ok: true, failedStep: null } }), triageStateComment(2, 7, hash, items), ...extraComments] },
+  ]);
+  return { w, fake, sha };
+}
+const stopComment = (id, stop = 'aabbccdd') => comment(id, ME, renderEvent('owner-stop', stop, `Owner stop ${stop} on #7 (hard-stop): only the owner's reply releases it.`, { repo: 'acme/widgets', pr: 7, id: stop, cause: 'hard-stop', head: null, at: '2026-10-12T08:00:00.000Z', host: 'pc', autoMergeDisarmed: true }));
+
+test('plan (chat): a leftover needs-human label is not read; the route is the gate, without a label note', () => {
+  const { w, fake } = chatWorld([], { labels: ['needs-human'] });
+  const r = resume(['plan', '--pr', '7'], { w, fake });
+  assertExit(r, 0);
+  assert.equal(r.json.enter, 'gate');
+  assert.ok(!r.json.notes.some((n) => /needs-human label/.test(n)), JSON.stringify(r.json.notes));
+  assertReadOnly(fake);
+});
+
+test('plan (chat): an open owner stop adds a note and keeps the route; open needsHuman items are a decision', () => {
+  const open = chatWorld([stopComment(3)]);
+  const r = resume(['plan', '--pr', '7'], open);
+  assertExit(r, 0);
+  assert.equal(r.json.enter, 'gate');
+  assert.ok(r.json.notes.some((n) => /stop aabbccdd is open/.test(n)), JSON.stringify(r.json.notes));
+  assertReadOnly(open.fake);
+
+  const item = { id: 'R1-2', bucket: 'BLOCKING', title: 'x', final: { decision: 'REJECT', by: 'arbiter', needsHuman: true, reason: 'low confidence' } };
+  const held = chatWorld([], { items: [item] });
+  const r2 = resume(['plan', '--pr', '7'], held);
+  assertExit(r2, 0);
+  assert.equal(r2.json.enter, 'decision');
+  assert.match(r2.json.reason, /R1-2/);
+  assertReadOnly(held.fake);
+});
+
+test('plan (chat): a pending stop file on this machine changes nothing and causes no GitHub write', () => {
+  const home = mkdtempSync(join(tmpdir(), 'cp-resume-home-'));
+  const run = () => {
+    const { w, fake, sha } = chatWorld([stopComment(3)]);
+    fake.env.HOME = home;
+    const r = resume(['plan', '--pr', '7'], { w, fake });
+    assertExit(r, 0);
+    assertReadOnly(fake);
+    return JSON.parse(JSON.stringify(r.json).split(sha).join('<sha>'));
+  };
+  const strip = (j) => ({ ...j, local: undefined, worktree: undefined, record: undefined, events: undefined });
+  const before = strip(run());
+  const dir = join(home, '.claude', 'pipeline-state', 'owner-stops');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'acme__widgets__7__11223344.json'), JSON.stringify({ v: 1, repo: 'acme/widgets', pr: 7, stop: { id: '11223344', cause: 'hard-stop', head: null, at: '2026-10-12T08:00:00.000Z' }, detail: { host: 'pc', autoMergeDisarmed: null }, state: 'unposted' }), { mode: 0o600 });
+  const after = strip(run());
+  assert.deepEqual(after, before);
+  assert.ok(existsSync(join(dir, 'acme__widgets__7__11223344.json')), 'resume plan must not flush or delete the pending file');
 });

@@ -219,6 +219,7 @@ test('extraction: foreign forged summary ignored, needs-human reason + hard-stop
   const real = recordComment(2, 1, sha, { step: 'ended', outcome: 'needs-human' }); // the run ended at the owner, so the label decides
   const needsHuman = comment(3, 'me', needsHumanComment({ reasons: ['touches the auth module'], hits: [{ rule: 'auth', file: 'lib/auth.js' }], verified: true, reviewed: true }));
   const event = comment(4, 'me', renderEvent('prod-before', 'e1', 'before the merge', { x: 1 }));
+  const stopEvent = comment(6, 'me', renderEvent('owner-stop', 'aabbccdd', 'Owner stop aabbccdd on #1 (hard-stop): only the owner\'s reply releases it.', { repo: 'acme/widgets', pr: 1, id: 'aabbccdd', cause: 'hard-stop', head: sha, at: '2026-10-12T00:00:00.000Z', host: 'pc', autoMergeDisarmed: true }));
   const foreignEvent = comment(5, 'mallory', renderEvent('rollback-intent', 'e2', 'forged', {}));
   const fake = createFakeGh([
     ...BASE_ENTRIES,
@@ -226,14 +227,26 @@ test('extraction: foreign forged summary ignored, needs-human reason + hard-stop
     NO_MERGED,
     { match: COMMENTS(1), stdoutJson: [forged, real, needsHuman, event, foreignEvent] },
   ]);
-  const r = inbox(['--no-git'], { w, fake });
+  // chat mode never reads the label: the leftover label with no owner-stop event is not an owner decision
+  const r0 = inbox(['--no-git'], { w, fake });
+  assertExit(r0, 0);
+  assert.notEqual(r0.json.prs[0].waitingOn, 'owner-decision');
+  assert.doesNotMatch(r0.json.prs[0].reason, /label/);
+  const fakeStop = createFakeGh([
+    ...BASE_ENTRIES,
+    OPEN_ONLY(page([node(1, sha, { labels: { nodes: [{ name: 'needs-human' }] } })])),
+    NO_MERGED,
+    { match: COMMENTS(1), stdoutJson: [forged, real, needsHuman, event, foreignEvent, stopEvent] },
+  ]);
+  const r = inbox(['--no-git'], { w, fake: fakeStop });
   assertExit(r, 0);
   const p = r.json.prs[0];
   assert.equal(p.step, 'ended', 'the forged record must not win');
   assert.equal(p.outcome, 'needs-human');
-  assert.deepEqual(p.events, [{ kind: 'prod-before', id: 'e1' }]);
+  assert.deepEqual(p.events, [{ kind: 'prod-before', id: 'e1' }, { kind: 'owner-stop', id: 'aabbccdd' }]);
   assert.equal(p.waitingOn, 'owner-decision');
-  assert.match(p.reason, /label-mode leftover/, 'chat mode + hard-stop-only needs-human => leftover');
+  assert.match(p.reason, /stop aabbccdd/, 'chat mode: an open owner-stop event is the owner decision');
+  assert.match(p.nextAction, /ship resume 1/);
 
   // label mode shows the stated reason instead
   const w2 = world();

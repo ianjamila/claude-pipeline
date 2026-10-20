@@ -1,6 +1,8 @@
 // `ship inbox` classifier: plain facts in, plain classification out. No IO, no gh, no git, no clock reads —
 // the caller gathers the facts and injects `now`. Plan: docs/plans/2026-10-12-ship-inbox-resume-plan.md, section F.
 
+import { openOwnerStops } from './run-events.mjs';
+
 const MINUTE = 60000;
 const DAY = 86400000;
 
@@ -169,7 +171,21 @@ export function classifyPr(facts, options) {
   // Step 3.5 labels a hard-stop PR before the review loop: with a usable record that has no outcome the run has not stopped
   // at the owner yet (or ended with work left: awaiting-review, blocked, awaiting-owner-merge), so the label does not decide the
   // category; only a run that ended at the owner, or an unreadable record, does.
-  const midRunLabel = f.labels.includes('needs-human') && f.recordStatus === 'ok' && record != null && (record.outcome == null || RESUMABLE_OUTCOMES.has(record.outcome));
+  // owner_approval: chat never reads the label: the owner's decisions are owner-stop events and review items needing a ruling.
+  const chat = ownerApproval === 'chat';
+  const ownerDecisions = [];
+  if (chat) {
+    for (const e of openOwnerStops(f.events)) {
+      const cause = e.dataStatus === 'ok' && e.data?.cause ? e.data.cause : 'unreadable';
+      ownerDecisions.push({ reason: `owner stop ${e.id} (${cause}) is open`, detail: `stop ${e.id}: ${cause}` });
+    }
+    const items = f.triage?.needsHumanItems ?? [];
+    if (items.length > 0) {
+      const ids = items.map((i) => String(i?.id ?? i)).join(', ');
+      ownerDecisions.push({ reason: `review items need the owner's ruling in chat: ${ids}`, detail: `review items ${ids}` });
+    }
+  }
+  const midRunLabel = !chat && f.labels.includes('needs-human') && f.recordStatus === 'ok' && record != null && (record.outcome == null || RESUMABLE_OUTCOMES.has(record.outcome));
 
   if (f.alreadyOnBase === true) {
     waitingOn = 'nothing-left';
@@ -179,11 +195,11 @@ export function classifyPr(facts, options) {
     waitingOn = 'running';
     reason = `a run is live on ${live.host}`;
     nextAction = `leave: running on ${live.host}, ${minutesAgo(live.at, nowMs)} min ago`;
-  } else if (f.labels.includes('needs-human') && !midRunLabel) {
+  } else if (chat ? ownerDecisions.length > 0 : f.labels.includes('needs-human') && !midRunLabel) {
     waitingOn = 'owner-decision';
-    if (ownerApproval === 'chat' && f.needsHumanHardStopOnly) {
-      reason = `label-mode leftover: remove the needs-human label, then ${resume}`;
-      nextAction = `remove the needs-human label, then ${resume}`;
+    if (chat) {
+      reason = ownerDecisions.map((d) => d.reason).join('; ');
+      nextAction = `leave: owner decision needed (${ownerDecisions.map((d) => d.detail).join('; ')}); rule or reply in chat, then ${resume}`;
     } else {
       reason = f.needsHumanReason || 'needs-human label set (no reason recorded)';
       nextAction = `leave: owner decision needed (${reason})`;
@@ -215,7 +231,7 @@ export function classifyPr(facts, options) {
     nextAction = resume;
   } else if (
     record?.outcome === 'awaiting-owner-merge' &&
-    !midRunLabel && // with the label the gate ends in needs-human, never in an owner-merge
+    !midRunLabel && // label mode: with the label the gate ends in needs-human, never in an owner-merge (chat: midRunLabel is always false)
     record.head === f.headRefOid &&
     !f.isDraft &&
     f.ci === 'passed' &&

@@ -118,11 +118,11 @@ test('the newest viewer summary comment is the one read and the one edited', () 
 });
 
 test('an unsupported (newer) record is never dropped by a sections-only write; a deliberate record write replaces it', () => {
-  const v2 = encodeRecord({ ...emptyRecord(ID), v: 2 });
-  const gh = memoryGh([{ id: 5, user: { login: 'me' }, body: `${MARKERS.summary}\n\n${SECTIONS}\n\n${v2}`, html_url: 'u' }]);
+  const newer = encodeRecord({ ...emptyRecord(ID), v: 3 });
+  const gh = memoryGh([{ id: 5, user: { login: 'me' }, body: `${MARKERS.summary}\n\n${SECTIONS}\n\n${newer}`, html_url: 'u' }]);
   assert.equal(readSummaryComment(gh, 4).status, 'unsupported');
   assert.throws(() => writeSummaryComment(gh, 4, { sections: 'x' }), /newer pipeline version/);
-  assert.ok(gh.comments[0].body.includes(v2));
+  assert.ok(gh.comments[0].body.includes(newer));
   writeSummaryComment(gh, 4, { record: emptyRecord(ID) });
   assert.equal(readSummaryComment(gh, 4).status, 'ok');
 });
