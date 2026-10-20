@@ -232,7 +232,7 @@ test('evaluateGate: the injected ciProof decides, the check keeps its name, and 
   let seen = null;
   const gate = await gateFor(s, { ciProof: async (args) => { seen = args; return { state: 'pass', reason: 'ok', run: RUN }; } });
   assert.equal(gate.ok, true, JSON.stringify(gate.checks.filter((c) => !c.ok)));
-  assert.deepEqual(gate.checks.map((c) => c.name), ['pr-open', 'labels', 'preflight', 'verify-report', 'hardstops', 'integrity', 'review', 'ci']);
+  assert.deepEqual(gate.checks.map((c) => c.name), ['pr-open', 'labels', 'preflight', 'verify-report', 'hardstops', 'integrity', 'plan-scope', 'review', 'ci']);
   assert.deepEqual(gate.proofs, [{ step: 'unit', source: 'ci', run: RUN }]);
   assert.equal(seen.pr, PR);
   assert.equal(typeof seen.gh.prView, 'function', 'the real gh client is passed through');

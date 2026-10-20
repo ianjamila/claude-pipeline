@@ -7,10 +7,10 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 // Who spent the tokens. Anything not named here is booked as `other` (never dropped, never a new key).
-export const ROLES = Object.freeze(['implementer', 'judge', 'arbiter', 'verifier', 'controller', 'other']);
+export const ROLES = Object.freeze(['implementer', 'judge', 'arbiter', 'verifier', 'controller', 'codex', 'fable', 'security', 'screenshot', 'other']);
 // The run's phases are the record steps (a test pins this list to run-record's STEPS: that module imports this one, so it
 // cannot be imported back); a phase the caller invents is booked as `other`.
-export const PHASES = Object.freeze(['build', 'verify', 'pr', 'review', 'gate', 'awaiting-owner-merge', 'merge', 'prod-watch', 'ended', 'other']);
+export const PHASES = Object.freeze(['plan', 'build', 'verify', 'pr', 'review', 'gate', 'awaiting-owner-merge', 'merge', 'prod-watch', 'ended', 'other']);
 
 export const MAX_SESSIONS = 20;
 const SESSION_RE = /^[A-Za-z0-9_.:-]{1,80}$/;
@@ -39,23 +39,68 @@ function addTotals(into, add) {
   return t;
 }
 
-// entry: {phase, role, input, output, cacheRead, cacheWrite, usd}. Returns a NEW cost object (input is not touched).
-export function addCostEntry(cost, entry) {
-  const next = structuredClone(isPlainObject(cost) ? { ...emptyCost(), ...cost } : emptyCost());
-  const add = {
+// An entry as the ledger books it: validated amounts, phase and role normalised. This exact shape is what a keyed entry stores.
+export function normalisedEntry(entry) {
+  return {
+    phase: normalisePhase(entry?.phase),
+    role: normaliseRole(entry?.role),
     input: amount(entry?.input, 'input tokens', { integer: true }),
     output: amount(entry?.output, 'output tokens', { integer: true }),
     cacheRead: amount(entry?.cacheRead, 'cache-read tokens', { integer: true }),
     cacheWrite: amount(entry?.cacheWrite, 'cache-write tokens', { integer: true }),
     usd: amount(entry?.usd, 'usd', { integer: false }),
-    calls: 1,
   };
-  const phase = normalisePhase(entry?.phase);
-  const role = normaliseRole(entry?.role);
+}
+
+// entry: {phase, role, input, output, cacheRead, cacheWrite, usd}. Returns a NEW cost object (input is not touched).
+export function addCostEntry(cost, entry) {
+  const next = structuredClone(isPlainObject(cost) ? { ...emptyCost(), ...cost } : emptyCost());
+  const { phase, role, ...amounts } = normalisedEntry(entry);
+  const add = { ...amounts, calls: 1 };
   next.total = addTotals(next.total, add);
   next.byPhase[phase] = addTotals(next.byPhase[phase], add);
   next.byRole[role] = addTotals(next.byRole[role], add);
   return next;
+}
+
+// The exact reverse of addCostEntry for an entry that was booked (same normalisation): every amount and one call come off
+// the total, the phase and the role, never below 0. A phase / role bucket left with no calls is dropped.
+export function subtractCostEntry(cost, entry) {
+  const next = structuredClone(isPlainObject(cost) ? { ...emptyCost(), ...cost } : emptyCost());
+  const { phase, role, ...amounts } = normalisedEntry(entry);
+  const take = (totals) => {
+    const t = { ...emptyTotals(), ...(isPlainObject(totals) ? totals : {}) };
+    for (const k of ['input', 'output', 'cacheRead', 'cacheWrite']) t[k] = Math.max(0, (Number(t[k]) || 0) - amounts[k]);
+    t.calls = Math.max(0, (Number(t.calls) || 0) - 1);
+    t.usd = Math.max(0, Math.round(((Number(t.usd) || 0) - amounts.usd) * 1e6) / 1e6);
+    return t;
+  };
+  next.total = take(next.total);
+  for (const [map, key] of [[next.byPhase, phase], [next.byRole, role]]) {
+    if (!isPlainObject(map[key])) continue;
+    map[key] = take(map[key]);
+    if (map[key].calls === 0) delete map[key];
+  }
+  return next;
+}
+
+export const MAX_COST_ENTRIES = 200;
+export const EXEC_KEY_RE = /^(agent|codex|ctl|plan):[A-Za-z0-9._:-]{1,120}$/;
+
+// One execution's usage, booked once: booking the same key again REPLACES its earlier entry (a retry, or the same
+// transcript booked on another machine, never double-counts). `total` / `byPhase` / `byRole` stay the unkeyed bookings plus
+// the sum of `entries`. Nothing is ever evicted (an evicted key would be booked again on replay while its old amount
+// stays in the totals): at the limit a NEW key throws `cost-entries-full`, an existing key still replaces.
+export function bookCost(cost, entry, { key } = {}) {
+  if (key === undefined) return addCostEntry(cost, entry);
+  if (!EXEC_KEY_RE.test(String(key))) throw new Error(`bad execution key ${JSON.stringify(String(key).slice(0, 40))}`);
+  let c = isPlainObject(cost) ? { ...emptyCost(), ...cost } : emptyCost();
+  const entries = isPlainObject(c.entries) ? c.entries : {};
+  const old = Object.hasOwn(entries, key) ? entries[key] : undefined;
+  if (!old && Object.keys(entries).length >= MAX_COST_ENTRIES) throw new Error(`cost-entries-full: ${MAX_COST_ENTRIES} keyed entries already booked on this PR`);
+  if (old) c = subtractCostEntry(c, old);
+  c = addCostEntry(c, entry);
+  return { ...c, entries: { ...entries, [key]: normalisedEntry(entry) } };
 }
 
 export function addSessions(cost, ids) {
@@ -93,6 +138,7 @@ export function costShapeProblem(cost) {
   if (cost === undefined || cost === null) return null;
   if (!isPlainObject(cost)) return 'bad cost';
   if (!isPlainObject(cost.total) || !isPlainObject(cost.byPhase) || !isPlainObject(cost.byRole)) return 'bad cost';
+  if (cost.entries !== undefined && (!isPlainObject(cost.entries) || !Object.values(cost.entries).every(isPlainObject))) return 'bad cost';
   return null;
 }
 

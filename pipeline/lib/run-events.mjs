@@ -1,10 +1,12 @@
 // Run events: append-only evidence that must outlive the editable run record (the rollback target, a rollback that
 // began, the incident it opened). Each event is its OWN PR comment, created once and never edited, so no later writer
 // can erase it. Only comments the viewer wrote that START with an event marker count; a quoted marker is not an event.
+// An event comment that was EDITED afterwards (updated_at differs from created_at) is `tampered`: readers that rely on an
+// event must treat a tampered one as unreadable.
 import { line } from './render.mjs';
 import { packJson, unpackJson } from './run-record.mjs';
 
-export const EVENT_KINDS = Object.freeze(['prod-before', 'rollback-intent', 'rollback-result', 'recovery-reported', 'ci-proof-used']);
+export const EVENT_KINDS = Object.freeze(['prod-before', 'rollback-intent', 'rollback-result', 'recovery-reported', 'ci-proof-used', 'plan-proposed', 'plan-approved', 'plan-review-started']);
 
 const EVENT_ID = /^[A-Za-z0-9._-]{1,64}$/;
 const EVENT_START = /^<!-- claude-pipeline:event:([a-z-]+):([A-Za-z0-9._-]{1,64}) -->/;
@@ -47,7 +49,13 @@ export function listEvents(comments, viewerLogin) {
     .map((c) => ({ c, event: parseEvent(c.body) }))
     .filter((x) => x.event)
     .sort((a, b) => Number(a.c.id) - Number(b.c.id))
-    .map(({ c, event }) => ({ commentId: c.id, url: c.html_url ?? null, ...event }));
+    .map(({ c, event }) => ({
+      commentId: c.id,
+      url: c.html_url ?? null,
+      createdAt: c.created_at ?? null,
+      tampered: Boolean(c.created_at && c.updated_at && c.updated_at !== c.created_at),
+      ...event,
+    }));
 }
 
 // Rollback attempts whose `rollback-intent` has no `rollback-result` OF THE SAME ID (attempts are `<sha7>-<n>`, so an

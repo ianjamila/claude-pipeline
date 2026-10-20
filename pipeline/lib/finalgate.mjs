@@ -25,7 +25,12 @@ import { parseYaml } from './yaml.mjs';
 import { ownerRuledItems, reviewValidFor } from './triage.mjs';
 import { skipOf } from './verify-steps.mjs';
 import { NETWORK_TIMEOUT_MS, commitTime, diffFiles, git, headSha, mergeBase, revParse, reviewBaseRef, reviewContentHash, showFile, treeFingerprint } from './git.mjs';
-import { ownerItemsDigest } from '../hooks/lib/owner-go.mjs';
+import { accountHome, ownerItemsDigest, readPlanApprovals } from '../hooks/lib/owner-go.mjs';
+import { bindOf, planScopeVerdict } from './plan-state.mjs';
+import { listEvents } from './run-events.mjs';
+import { bindRecord } from './run-record.mjs';
+import { VIEW_FIELDS } from './run-progress.mjs';
+import { summaryFromComments } from './summary-comment.mjs';
 
 export const GATE_FILE = 'final-gate.json';
 export const BLOCKING_LABELS = Object.freeze(['needs-human', 'awaiting-review', 'pipeline-blocked']);
@@ -35,7 +40,7 @@ export const PR_FIELDS = Object.freeze(['state', 'headRefOid', 'baseRefName', 'i
 
 // What a gate must contain: exactly these checks (plus `preview` when config.preview is set), each once and passing.
 // `merge` refuses a gate file that lacks any of them, so a hand-written or truncated file cannot vouch for a merge.
-export const CANONICAL_CHECKS = Object.freeze(['pr-open', 'labels', 'preflight', 'verify-report', 'hardstops', 'integrity', 'review', 'ci']);
+export const CANONICAL_CHECKS = Object.freeze(['pr-open', 'labels', 'preflight', 'verify-report', 'hardstops', 'integrity', 'plan-scope', 'review', 'ci']);
 export const expectedCheckNames = (previewConfigured) => (previewConfigured ? [...CANONICAL_CHECKS, 'preview'] : [...CANONICAL_CHECKS]);
 
 // `gh pr view` computes `mergeable` lazily: UNKNOWN right after a push. Re-read this many times, this far apart.
@@ -454,6 +459,44 @@ async function hardstopsCheck({ root, config, diff }) {
   return check('hardstops', false, `${blocking.length} hard-stop hit(s): ${shown}${blocking.length > 5 ? '; ...' : ''}${note}`);
 }
 
+// The approved plan's scope against the real changed-file list (spec 2026-10-19 §4). Evidence: the PR's plan events (pointers),
+// the owner's local plan records (the trust root) and the approved git blob (scope and tasks are re-parsed from it, never read
+// from an event). Fails closed: no diff, no comments or no PR view is a failed check, never a skipped one.
+export async function planScopeCheck({ root, config, diff, gh, pr, home }) {
+  const d = diff();
+  if (!d.ok) return check('plan-scope', false, `could not diff against the base: ${d.error}`);
+  let viewer;
+  let comments;
+  let bind;
+  try {
+    viewer = gh.viewer();
+    comments = gh.listComments(pr);
+    bind = bindOf({ repo: gh.repo().slug, pr, branch: gh.prView(pr, [...VIEW_FIELDS]).headRefName });
+  } catch (err) {
+    // plan.required: false is an opt-out: a GitHub read that fails must not block a merge on evidence nobody asked for. When the plan
+    // IS required the failure propagates and the gate records a failed check (never a pass).
+    if (config.plan.required) throw err;
+    return check('plan-scope', true, `report only (plan.required: false): the PR's plan evidence could not be read (${String(err?.message ?? err).split('\n')[0]})`);
+  }
+  // summaryFromComments already decodes ({ status, record }): a readable record of THIS PR whose plan has no events is `lost`.
+  const summary = summaryFromComments(comments, viewer);
+  const own = summary.status === 'ok' && bindRecord(summary.record, bind).length === 0;
+  const verdict = planScopeVerdict({
+    events: listEvents(comments, viewer),
+    bind,
+    recordPlan: own ? summary.record.plan ?? null : null,
+    localRecords: readPlanApprovals({ home }),
+    readBlob: (b) => {
+      if (!/^[0-9a-f]{40}$/.test(String(b))) return null;
+      try { return git(['cat-file', 'blob', b], { cwd: root }); } catch { return null; }
+    },
+    files: d.files,
+    required: config.plan.required,
+    ownerApproval: config.owner_approval,
+  });
+  return check('plan-scope', verdict.ok, verdict.detail, verdict.ownerMerge, verdict.ownerItems);
+}
+
 function integrityCheck({ config, diff }) {
   const d = diff();
   if (!d.ok) return check('integrity', false, `could not diff against the base: ${d.error}`);
@@ -611,7 +654,7 @@ async function safely(name, fn) {
 
 // Runs every check (no short-circuit, so one run reports every problem). A gh failure on the PR lookup itself throws:
 // the caller maps it to exit 3, because without the PR there is nothing to judge.
-export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultSleep, ciProof = defaultCiProof }) {
+export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultSleep, ciProof = defaultCiProof, home = accountHome() }) {
   const o = { cwd: root };
   const head = headSha(o);
   const info = await readPrSettled({ gh, pr, fields: [...PR_FIELDS], sleep, pauseMs: mergeablePause(env) });
@@ -641,6 +684,7 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
     await safely('verify-report', () => verifyReportCheck({ root, config, head, tree, o, pr, gh, env, ciProof, proofs })),
     await safely('hardstops', () => hardstopsCheck({ root, config, diff })),
     await safely('integrity', () => integrityCheck({ config, diff })),
+    await safely('plan-scope', () => planScopeCheck({ root, config, diff, gh, pr, home })),
     await safely('review', () => reviewCheck({ root, config, pr, diff, hash, hashError })),
     await safely('ci', () => ciCheck({ gh, pr, head, diff, config, explicitEmpty: ciExplicitlyEmpty(root) })),
   ];

@@ -117,3 +117,19 @@ test('resolvedRollbacks: the rollback-results of this merge (readable payload on
   assert.deepEqual(resolvedRollbacks(events, { mergeSha: 'CCC' }), []);
   assert.deepEqual(resolvedRollbacks(undefined, { mergeSha: 'AAA' }), []);
 });
+
+const cm = (id, body, extra = {}) => ({ id, body, user: { login: 'me' }, created_at: '2026-10-19T00:00:00Z', updated_at: '2026-10-19T00:00:00Z', ...extra });
+
+test('plan event kinds render and parse; an edited comment is tampered; createdAt is kept', () => {
+  const body = renderEvent('plan-proposed', 'aaaaaaaaaaaa-1', 'Plan proposed', { blob: 'a'.repeat(40) });
+  const ev = listEvents([cm(2, body), cm(1, body, { updated_at: '2026-10-19T01:00:00Z' })], 'me');
+  assert.deepEqual(ev.map((e) => [e.commentId, e.tampered]), [[1, true], [2, false]]);
+  assert.equal(ev[1].createdAt, '2026-10-19T00:00:00Z');
+  for (const k of ['plan-approved', 'plan-review-started']) assert.ok(renderEvent(k, 'x', 's', {}));
+});
+
+test('a comment with no timestamps is not tampered and has a null createdAt', () => {
+  const body = renderEvent('plan-approved', 'x', 's', {});
+  const [e] = listEvents([{ id: 1, body, user: { login: 'me' } }], 'me');
+  assert.deepEqual([e.tampered, e.createdAt], [false, null]);
+});

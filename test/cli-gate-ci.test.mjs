@@ -276,7 +276,7 @@ test('final-gate: every named required check must be `pass`; `skipping` only und
 
 test('final-gate: no configured required checks and none reported by branch protection fails closed; an explicit empty list may fall back to all checks', () => {
   // Decision: the default (a config that never mentions ci.required_checks) is "CI is not wired up", which is never merge evidence.
-  const unconfigured = 'version: 1\nproject: demo\nenforcement: gate\nverify:\n  full: npm run verify\n  quick: npm run verify:quick\n';
+  const unconfigured = 'version: 1\nproject: demo\nenforcement: gate\nverify:\n  full: npm run verify\n  quick: npm run verify:quick\nplan:\n  required: false\n';
   const closed = scenario({ yml: unconfigured, gh: { requiredCi: 'error' } }).gate();
   assertOnlyFails(closed, 'ci', /no required checks are configured/);
   // ... but when protection DOES report required checks, those are judged even though the config names none.

@@ -63,7 +63,9 @@ export const REPO_VIEW = { nameWithOwner: 'acme/widgets', defaultBranchRef: { na
 
 // A minimal valid .claude/pipeline.yml declaring the given enforcement mode and required checks.
 // guardChecks stays false here: most tests are about the configured list, not the always-required guard contexts.
-export const pipelineYml = (enforcement = 'github', checks = ['ci'], { guardChecks = false } = {}) => [
+// plan: false (default) writes `plan.required: false` so the plan-scope gate check only reports and existing gate scenarios
+// keep their meaning; plan: true omits it (the check is enforced, as in a real repo).
+export const pipelineYml = (enforcement = 'github', checks = ['ci'], { guardChecks = false, plan = false } = {}) => [
   'version: 1',
   'project: demo',
   `enforcement: ${enforcement}`,
@@ -73,5 +75,6 @@ export const pipelineYml = (enforcement = 'github', checks = ['ci'], { guardChec
   'ci:',
   `  required_checks: [${checks.join(', ')}]`,
   `  guard_checks: ${guardChecks}`,
+  ...(plan ? [] : ['plan:', '  required: false']),
   '',
 ].join('\n');

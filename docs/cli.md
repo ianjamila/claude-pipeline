@@ -123,8 +123,10 @@ book tokens / USD / retries of one agent call in the run record (shown by `P sum
 
 ```
 pipeline cost --pr N --phase build|verify|pr|review|gate|merge|... --role implementer|judge|arbiter|verifier|controller|other
-              [--input N] [--output N] [--cache-read N] [--cache-write N] [--usd X | --model M] [--from-transcript FILE] [--retry] [--session ID]... [--repo DIR]
+              [--input N] [--output N] [--cache-read N] [--cache-write N] [--usd X | --model M] [--from-transcript FILE] [--retry] [--session ID]... [--execution KEY] [--repo DIR]
   -> {ok, recorded, cost, warnings}; exit 2 usage (a negative or non-numeric amount), 3 GitHub unavailable
+  --execution KEY (agent:ID | codex:ID | ctl:ID | plan:ID): book this spend ONCE under KEY; booking the same KEY again replaces its entry (never double-counts),
+  and the write is read back (up to 3 attempts): exit 1 {error: "not-persisted", key} when it never showed up, exit 1 {error: "cost-entries-full"} at 200 keys.
   An unknown --role is booked as `other`, an unknown --phase as `other`. --from-transcript FILE: sum the message.usage of a Claude transcript (JSONL, at most 50 MB);
   explicit --input/--output/--cache-* then add to it. --retry alone (no amounts) only counts a retry.
   USD: --usd X as given; otherwise list price (opus / sonnet / haiku / fable) of each transcript message's own model (--model M prices the messages
@@ -154,6 +156,8 @@ pipeline final-gate --pr N [--repo DIR]   -> {ok, repo, pr, base, head, tree, co
 ```
 
 Exit: 0 every check passes (writes .review/final-gate.json) · 1 any check fails · 3 GitHub (`gh`) unavailable.
+
+The checks, in order: `pr-open`, `labels`, `preflight`, `verify-report`, `hardstops`, `integrity`, `plan-scope`, `review`, `ci` (plus `preview` when configured). `plan-scope` compares the PR's real changed-file list (a deletion counts by its old path, a rename by both paths) with the Scope of the plan the owner approved: the scope is re-parsed from the approved git blob, and the approval counts only when the owner-go hook recorded it (the owner's newest plan record for the PR) and the `plan-approved` event on the PR points at it. Each file outside the scope is an item `plan-scope outside <file>`; an approval no local record vouches for is `plan-scope unverified <host>`; a PR with no plan at all is `plan-scope none`. With `owner_approval: chat` the items are owner-merge items (they enter `ownerItems`, the check stays ok); in label mode any item fails the check. The owner-go recorder stamps a plan record with the repo (`owner/name`, from the origin of the hook's working directory) when it can, and a record naming another repo is no evidence here (the same PR number and a byte-identical plan in another repo cannot replay an approval; `plan approve` and the gate both ignore it). Residual: a record without `repo` (written before this field, or in a session that started outside a repo or without an origin) still matches on PR, blob and scope digest alone. A plan that was proposed or approved but whose evidence is edited, unreadable, for another PR or missing (`lost`), and (with `plan.required: true`) any failure to read the changed files or the PR's comments, fails the check in every mode. `plan.required: false` makes the check report only: it still fails when the changed files cannot be read, but unreadable PR comments are then a report-only pass.
 
 `proofs` appears only for a repo with `verify.deferrable_steps`, when `verify-report` passed: `[{step, source: "local"}]` for a step the Mac ran, `[{step, source: "ci", run: {id, attempt, jobId, workflow, job, url}}]` for a step a GitHub Actions run vouched for (a report row `skipped` with `skipKind: "ci"`). The gate reads `deferrable_steps`, `ci_proof` and `ci_proof_inputs` from the BASE branch's `.claude/pipeline.yml`, never the PR's, and takes the proof only when ALL hold: the PR touches none of `.github/**`, `.claude/pipeline.yml`, `scripts/verify*` or `ci_proof_inputs`; the newest `pull_request` run of the configured workflow file for this exact head belongs to this PR (one `pull_requests` entry, this PR into the base branch, its head branch, a head from this repo, not a fork); the merge commit that run executed (`refs/pull/N/merge` in `referenced_workflows`) has the same tree as the PR head (a run that does not say is not accepted); and exactly one job there has the configured name and succeeded. A newer queued or running run is `ci-proof-pending:<step>`; a red job is `ci-proof-failed:<step>`; everything else, including any GitHub error and a cancelled or skipped run, is `ci-proof-missing:<step>`: the Mac must run the step. `pipeline merge` re-evaluates the proof live and records the one it used.
 
@@ -298,6 +302,33 @@ The real ntfy publish tolerates slow networks: it raises Node's per-address conn
 One push per event: a ledger under `~/.claude/pipeline-state/` (`notify-ledger.jsonl`) makes a replay of the same event a no-op (`reason: duplicate`). Identity is repo, PR, event, head, outcome, open needs-human ids and `--cause`, never the action text. The whole call is capped at 15 s.
 
 Exit: `--test` 0 when ntfy accepted the push, 1 when it did not · `--event` 0 whether or not a push went out (read `sent` / `reason`) · 2 usage.
+
+## plan
+
+the plan stage: record the committed plan, record the owner's "approve", rate its risk, reserve and run its reviews.
+
+```
+pipeline plan record --pr N --file PATH [--request-file F] [--repo DIR]
+  -> {ok, blob, scopeDigest, path, scope, tasks:[{id,title,specSha}], requestLines, event:{id, reused}, warnings}; posts one plan-proposed event (none when this blob is already the active proposal) and checkpoints step plan
+  -> exit 1 {error: dirty | unpushed | plan-invalid | record-unreadable} (the file must be committed and pushed, and parse as a plan that lists itself in its Scope), 2 usage (the file must sit under config plan.dir, default docs/plans; nothing is posted), 3 GitHub unavailable
+  -> show the owner requestLines VERBATIM (the first line, then the 📋 line) together with the plan's plain-English section and Scope list; the owner types "approve"
+pipeline plan approve --pr N [--repo DIR]
+  -> {ok, blob, scopeDigest, event:{id, reused}, stepChanged, repaired, warnings}; needs the owner's "approve" recorded by the owner-go hook for the active plan (24 h; an approval event already on the PR is repaired for 30 days); posts one plan-approved event, copies the approved tasks into the run record and moves a plan-stage (or stopped/blocked with open tasks) run to build
+  -> exit 1 {error: no-proposal | no-approval | superseded | scope-mismatch | lost | plan-changed | unpushed | record-unreadable}, 3 GitHub unavailable
+pipeline plan risk --pr N [--repo DIR]
+  -> {ok, level: low|medium|high, reasons, blob}; high when the plan's Scope can touch a high-risk, hard-stop or security path or a task names a risky area; medium for more than 3 tasks or more than risk.medium_files scope entries
+pipeline plan start --pr N --reviewer codex|fable --key KEY [--extra TEXT] [--repo DIR]
+  -> {ok, go:true, key, reviewer, planBlob, claim, promptHeader}; reserves one paid launch BEFORE it happens (one event; caps per PR: codex 2 = review + recheck, fable 1; --extra = the owner's words, recorded verbatim, buys one more); start the Fable reviewer with promptHeader (ROUND: plan / INPUT-DIGEST: ...) pasted verbatim as the first two lines
+  -> exit 1 {error: cap | already-started | use-plan-review | no-proposal | lost} (a key that already exists never launches twice; use-plan-review = Codex reviews are reserved only by `plan review`, which launches the run itself), 3 {error: not-visible} or GitHub unavailable (the new event was not listed back: nothing may launch)
+pipeline plan review --pr N --key KEY [--extra TEXT] [--effort high|xhigh] [--model M] [--prior FILE] [--repo DIR]
+  -> {ok, key, n, counts:{blocking, suggestions, worth_considering}, path, resumed, cost: booked|not-reported|failed:...}; reserves the launch itself (as `start`, --extra passes through), runs Codex over the active plan, writes .review/plan/KEY.json and .md; the second run is a recheck (--prior FILE = the first run's markdown) and resumes the first run's Codex session when it has one
+  -> exit 1 {error: cap | already-started | stale-start | superseded | no-proposal | lost}, 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|malformed|github, session} (the key stays consumed; .review/plan/KEY.failed.json keeps the session)
+pipeline plan findings --pr N --key KEY --tag TAG --claim CLAIM [--projects-dir DIR] [--max-age-ms N] [--repo DIR]
+  -> {ok, key, n, counts, path, errors}; --claim = the claim `plan start` returned; takes the Fable plan review from the subagent transcript tagged TAG after proving the model (claude-fable- at effort high), the prompt header of the valid start and a transcript no older than the start, then re-lists the PR and checks the claim is still the earliest for the key; nothing is written on any refusal
+  -> exit 1 {error: no-start | stale-start | superseded | exists, or errors:[...]}, 2 no transcript for TAG, 3 GitHub could not confirm the claim
+```
+
+Exit: `record`: 0 recorded · 1 refused (dirty, unpushed, plan-invalid) · `approve`: 0 recorded (or repaired) · 1 refused (no-proposal, no-approval, superseded, scope-mismatch, lost, plan-changed, record-unreadable) · 3 GitHub unavailable, or the approval is on the PR but the run record was not updated (run it again) · `risk`: 0 a level · 1 no usable plan · `start`: 0 go (launch it) · 1 cap / already-started / use-plan-review / no usable plan · 3 not-visible (the reservation was not listed back: nothing may launch) or GitHub unavailable · `review`: 0 recorded · 1 cap / already-started / stale-start / superseded (a paid run that no longer counts is kept in `.review/plan/KEY.superseded.json`) · 3 Codex or GitHub unavailable (the key stays consumed) · `findings`: 0 recorded · 1 refused (nothing written) · 2 no transcript · 2 usage / config / git. The Plan events are pointers: scope and tasks are always re-read from the approved git blob, and an approval counts only with the owner-go record the hook wrote for the owner's typed "approve".
 
 ## preflight
 

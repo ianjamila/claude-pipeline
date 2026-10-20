@@ -5,11 +5,13 @@
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { MARKERS, clip, line } from './render.mjs';
 import { MAX_PROOFS, MAX_PROOF_STEP } from './config.mjs';
-import { addCostEntry, addRetries, addSessions, costLines, costShapeProblem, setGuardBlocks } from './run-cost.mjs';
+import { addCostEntry, addRetries, bookCost, addSessions, costLines, costShapeProblem, setGuardBlocks } from './run-cost.mjs';
 
-export const RECORD_VERSION = 1;
+// v2 (ship redesign): adds the `plan` step, the plan / behindBaseUpdates / handoff fields and task `specSha`. A v1 record still
+// decodes (every new field is optional); every write upgrades it to v2.
+export const RECORD_VERSION = 2;
 
-export const STEPS = Object.freeze(['build', 'verify', 'pr', 'review', 'gate', 'awaiting-owner-merge', 'merge', 'prod-watch', 'ended']);
+export const STEPS = Object.freeze(['plan', 'build', 'verify', 'pr', 'review', 'gate', 'awaiting-owner-merge', 'merge', 'prod-watch', 'ended']);
 
 // null while the run is going; otherwise how it ended: every `P summary` outcome, then every prod-watch outcome.
 export const OUTCOMES = Object.freeze([
@@ -17,9 +19,10 @@ export const OUTCOMES = Object.freeze([
   'stopped', 'closed', 'merged-externally', 'prod-unknown',
   'superseded', 'recovered', 'rollback-failed', 'changed-during-recovery', 'rollback-skipped',
   'not-live', 'deploy-failed', 'deploy-not-observed', 'no-production', 'needs-owner',
+  'awaiting-plan-approval', 'owner-ui-merge',
 ]);
 
-// Exhaustive: an outcome the run stopped at. `awaiting-owner-merge` is a place the run waits; `prod-unknown` (prod-watch
+// Exhaustive: an outcome the run stopped at. `awaiting-owner-merge`, `awaiting-plan-approval` and `owner-ui-merge` are places the run waits; `prod-unknown` (prod-watch
 // exited with no outcome) leaves the merged run in its prod-watch step, so the inbox lists it as stranded and resume
 // observes production again; every other outcome ends it.
 export const OUTCOME_STEP = Object.freeze({
@@ -42,6 +45,8 @@ export const OUTCOME_STEP = Object.freeze({
   'deploy-not-observed': 'ended',
   'no-production': 'ended',
   'needs-owner': 'ended',
+  'awaiting-plan-approval': 'plan',
+  'owner-ui-merge': 'awaiting-owner-merge',
 });
 
 // What a reader should do once the run stopped at this outcome (shown as "Next" in the status block).
@@ -65,6 +70,8 @@ export const OUTCOME_NEXT = Object.freeze({
   'deploy-not-observed': 'check production by hand',
   'no-production': 'nothing: no production environment',
   'needs-owner': 'owner: production fails the smoke and was left alone, check it and the rollback target',
+  'awaiting-plan-approval': 'owner reads the plan and says "approve"',
+  'owner-ui-merge': 'owner merges in GitHub if they accept the hand-off',
 });
 
 // A merged run whose production result is still unknown: no outcome yet, or `prod-unknown`.
@@ -82,6 +89,47 @@ export const LIMITS = Object.freeze({ request: 2048, spec: 1024, title: 200, tex
 const MAX_TASK_ID = 64;
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const isStr = (v) => typeof v === 'string';
+const SHA40 = /^[0-9a-f]{40}$/;
+const SHA12 = /^[0-9a-f]{12}$/;
+const MAX_PLAN_PATH = 200;
+const MAX_BEHIND_UPDATES = 20;
+
+// ---- v2 fields: the plan, the branch updates that were confirmed, the busy-main hand-off -----------------------------------
+// Each *Problem returns null or why; each normalise* returns a NEW trimmed object or throws naming the field, so a bad
+// value can never be recorded half-way (and a record the shape check refuses is never written).
+function planProblem(p) {
+  if (!isPlainObject(p)) return 'not an object';
+  if (!isStr(p.path) || p.path === '' || p.path.length > MAX_PLAN_PATH) return `path must be text of at most ${MAX_PLAN_PATH} characters`;
+  if (!isStr(p.blob) || !SHA40.test(p.blob)) return 'blob must be 40 hex characters';
+  if (!isStr(p.scopeDigest) || !SHA12.test(p.scopeDigest)) return 'scopeDigest must be 12 hex characters';
+  if (p.state !== 'proposed' && p.state !== 'approved') return "state must be 'proposed' or 'approved'";
+  return null;
+}
+function pairProblem(p) {
+  if (!isPlainObject(p) || !isStr(p.headBefore) || !SHA40.test(p.headBefore) || !isStr(p.baseTip) || !SHA40.test(p.baseTip)) return 'headBefore and baseTip must be 40 hex characters';
+  return null;
+}
+function handoffProblem(h) {
+  if (!isPlainObject(h)) return 'not an object';
+  if (!isStr(h.head) || !SHA40.test(h.head) || !isStr(h.baseTip) || !SHA40.test(h.baseTip)) return 'head and baseTip must be 40 hex characters';
+  if (!isStr(h.at)) return 'at must be text';
+  return null;
+}
+function normalisePlan(p) {
+  const why = planProblem(p);
+  if (why) throw new Error(`plan: ${why}`);
+  return { path: p.path, blob: p.blob, scopeDigest: p.scopeDigest, state: p.state };
+}
+function normalisePair(p) {
+  const why = pairProblem(p);
+  if (why) throw new Error(`behindBaseUpdate: ${why}`);
+  return { headBefore: p.headBefore, baseTip: p.baseTip };
+}
+function normaliseHandoff(h) {
+  const why = handoffProblem(h);
+  if (why) throw new Error(`handoff: ${why}`);
+  return { head: h.head, baseTip: h.baseTip, at: clip(h.at, 64) };
+}
 
 // base64 never contains "--", so the payload cannot terminate the HTML comment early.
 export const packJson = (value) => gzipSync(Buffer.from(JSON.stringify(value))).toString('base64');
@@ -127,6 +175,7 @@ function shapeProblem(r) {
   if (!Array.isArray(r.tasks) || !Array.isArray(r.history)) return 'tasks/history are not lists';
   // Every reader (status block, checkpoint, resume plan) indexes these entries: one bad entry would throw in all of them.
   if (!r.tasks.every((t) => isPlainObject(t) && isStr(t.id) && t.id !== '' && t.id.length <= MAX_TASK_ID && (t.done === undefined || typeof t.done === 'boolean'))) return 'bad task';
+  if (r.tasks.some((t) => t.specSha !== undefined && !(isStr(t.specSha) && SHA12.test(t.specSha)))) return 'bad task specSha';
   if (!r.history.every(isPlainObject)) return 'bad history entry';
   if (r.inFlight != null && !isPlainObject(r.inFlight)) return 'bad inFlight';
   if (r.heartbeat != null && !isPlainObject(r.heartbeat)) return 'bad heartbeat';
@@ -134,6 +183,17 @@ function shapeProblem(r) {
   if (r.proofs !== undefined) {
     const why = proofsProblem(r.proofs);
     if (why) return `bad proofs: ${why}`;
+  }
+  if (r.plan !== undefined) {
+    const why = planProblem(r.plan);
+    if (why) return `bad plan: ${why}`;
+  }
+  if (r.behindBaseUpdates !== undefined) {
+    if (!Array.isArray(r.behindBaseUpdates) || r.behindBaseUpdates.length > MAX_BEHIND_UPDATES || !r.behindBaseUpdates.every((p) => pairProblem(p) === null)) return 'bad behindBaseUpdates';
+  }
+  if (r.handoff != null) {
+    const why = handoffProblem(r.handoff);
+    if (why) return `bad handoff: ${why}`;
   }
   // `cost` is optional: a record from before cost attribution has none.
   return costShapeProblem(r.cost);
@@ -221,11 +281,15 @@ export const proofLine = (p) => `${line(p.step)} proof: ${p.source === 'ci' ? `G
 function normaliseTask(t, previous) {
   if (!isPlainObject(t) || t.id === undefined || t.id === null || String(t.id) === '') throw new Error('a task needs an id');
   if (String(t.id).length > MAX_TASK_ID) throw new Error(`task id ${JSON.stringify(String(t.id).slice(0, 20))}… is longer than ${MAX_TASK_ID} characters`);
+  // A task whose spec changed (its specSha differs) is not done any more, unless the patch says so explicitly.
+  const specSha = t.specSha ?? previous?.specSha;
+  const changed = typeof t.specSha === 'string' && typeof previous?.specSha === 'string' && t.specSha !== previous.specSha;
   return {
     id: String(t.id),
     title: text(t.title ?? previous?.title, LIMITS.title),
     spec: text(t.spec ?? previous?.spec, LIMITS.spec),
-    done: t.done === undefined ? previous?.done === true : t.done === true,
+    ...(typeof specSha === 'string' && SHA12.test(specSha) ? { specSha } : {}),
+    done: t.done === undefined ? (!changed && previous?.done === true) : t.done === true,
   };
 }
 
@@ -241,10 +305,11 @@ function normaliseInFlight(v) {
 }
 
 // Returns a NEW record. `patch` keys (all optional): step, outcome, next, detail, head, request, tasks (the full list,
-// done kept for ids it omits `done` for), done (ids to mark done), verify, round, mergeSha, inFlight (object | null),
-// agentLogLine, cliVersion, proofs ([{step, source: 'local'} | {step, source: 'ci', run: {id, attempt, jobId, workflow, job, url}}], replaces the list; set by `P merge`), cost ({entry: {phase, role, input, output, cacheRead, cacheWrite, usd}, retries: n to add, sessions: [ids], guardBlocks: n | null, guardBySession: {id: n}; see run-cost.mjs), resumed ({at, host, head}: a run taken over by `ship resume`; set once, never cleared). Every call stamps the heartbeat and appends a history entry (capped, oldest dropped).
+// done kept for ids it omits `done` for, unless the task's optional specSha (12 hex) changed), plan ({path, blob, scopeDigest, state: 'proposed' | 'approved'}), behindBaseUpdate ({headBefore, baseTip}: a confirmed branch update, appended once per distinct pair, at most 20 kept), handoff ({head, baseTip, at} | null), done (ids to mark done), verify, round, mergeSha, inFlight (object | null),
+// agentLogLine, cliVersion, proofs ([{step, source: 'local'} | {step, source: 'ci', run: {id, attempt, jobId, workflow, job, url}}], replaces the list; set by `P merge`), cost ({entry: {phase, role, input, output, cacheRead, cacheWrite, usd}, keyedEntry: {key, entry} (one execution's usage, booked once: see bookCost), retries: n to add, sessions: [ids], guardBlocks: n | null, guardBySession: {id: n}; see run-cost.mjs), resumed ({at, host, head}: a run taken over by `ship resume`; set once, never cleared). Every call stamps the heartbeat and appends a history entry (capped, oldest dropped).
 export function applyCheckpoint(record, patch, { host, now }) {
   const next = structuredClone(record);
+  next.v = RECORD_VERSION;
   if (patch.step !== undefined) {
     if (!STEPS.includes(patch.step)) throw new Error(`unknown step ${JSON.stringify(patch.step)}`);
     next.step = patch.step;
@@ -275,10 +340,18 @@ export function applyCheckpoint(record, patch, { host, now }) {
   if (patch.agentLogLine !== undefined) next.agentLogLine = patch.agentLogLine;
   if (patch.proofs !== undefined) next.proofs = normaliseProofs(patch.proofs);
   if (patch.cliVersion !== undefined) next.cliVersion = patch.cliVersion;
+  if (patch.plan !== undefined) next.plan = normalisePlan(patch.plan);
+  if (patch.behindBaseUpdate != null) {
+    const p = normalisePair(patch.behindBaseUpdate);
+    const list = next.behindBaseUpdates ?? [];
+    if (!list.some((x) => x.headBefore === p.headBefore && x.baseTip === p.baseTip)) next.behindBaseUpdates = [...list, p].slice(-MAX_BEHIND_UPDATES);
+  }
+  if (patch.handoff !== undefined) next.handoff = patch.handoff === null ? null : normaliseHandoff(patch.handoff);
   if (patch.cost != null) {
     if (!isPlainObject(patch.cost)) throw new Error('cost must be an object');
     let cost = next.cost;
     if (patch.cost.entry !== undefined) cost = addCostEntry(cost, patch.cost.entry);
+    if (patch.cost.keyedEntry !== undefined) cost = bookCost(cost, patch.cost.keyedEntry?.entry, { key: patch.cost.keyedEntry?.key });
     if (patch.cost.retries !== undefined) cost = addRetries(cost, patch.cost.retries);
     if (patch.cost.sessions !== undefined) cost = addSessions(cost, patch.cost.sessions);
     if (patch.cost.guardBlocks !== undefined) cost = setGuardBlocks(cost, patch.cost.guardBlocks, patch.cost.guardBySession);
