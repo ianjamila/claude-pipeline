@@ -54,6 +54,10 @@ export const DEFAULTS = deepFreeze({
   preview: null,
   production: null,
   smoke_checks: [],
+  // smoke_bypass_header: NAME of a request header the smoke sends to the configured origin as a firewall hint (e.g. a
+  // Vercel Firewall "Bypass" rule for CI runner IPs). The secret VALUE is never in this file: smoke.mjs reads it from the
+  // PIPELINE_SMOKE_BYPASS_KEY environment variable. null = no extra header.
+  smoke_bypass_header: null,
   risk: { high_risk_paths: [], medium_lines: 150, high_lines: 600, medium_files: 10 },
   hard_stops: { paths: [], patterns: [], auth_calls: [], disable_rules: [], report_only_rules: [], report_only_paths: [] },
   integrity: {
@@ -89,6 +93,9 @@ const PROVIDERS = ['vercel', 'github-deployments', 'other'];
 // Who owns the production smoke: the ship session (prod-watch) or a CI workflow that posts the result on the merged PR.
 const WATCH_MODES = ['session', 'workflow'];
 const AFTER_FIX_MODES = ['full', 'quick'];
+// Lowercase "x-" + 1..60 of [a-z0-9-]: no standard header (authorization, cookie, ...) can match, so the smoke can never
+// be turned into an authenticated request by configuration. smoke.mjs imports this too, so both sides agree.
+export const SMOKE_BYPASS_HEADER_RE = /^x-[a-z0-9-]{1,60}$/;
 export const SAFE_STEP = /^[A-Za-z0-9_.:-]+$/;
 
 // Allowed keys per mapping. Anything else is a typo (or a removed option) and is rejected.
@@ -563,6 +570,9 @@ export function validateConfig(obj) {
   if (config.preview !== null) checkPreview(config.preview, errors);
   if (config.production !== null) checkProduction(config.production, errors);
   checkSmokeChecks(config.smoke_checks, errors);
+  if (config.smoke_bypass_header !== null && !(typeof config.smoke_bypass_header === 'string' && SMOKE_BYPASS_HEADER_RE.test(config.smoke_bypass_header))) {
+    errors.push('smoke_bypass_header must be null or a lowercase header name matching /^x-[a-z0-9-]{1,60}$/ (e.g. x-smoke-key); the secret value belongs in the PIPELINE_SMOKE_BYPASS_KEY environment variable, not in this file');
+  }
 
   return errors.length === 0 ? { ok: true, errors, warnings, config } : { ok: false, errors, warnings, config: null };
 }

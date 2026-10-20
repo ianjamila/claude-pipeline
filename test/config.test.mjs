@@ -246,6 +246,26 @@ test('smoke_checks item shape', () => {
   assert.ok(has(validateConfig({ ...minimal(), smoke_checks: 'x' }), 'smoke_checks'));
 });
 
+test('smoke_bypass_header: defaults to null; accepts a lowercase x- name; rejects everything else', () => {
+  const dflt = validateConfig(minimal());
+  assert.equal(dflt.ok, true, dflt.errors.join('; '));
+  assert.equal(dflt.config.smoke_bypass_header, null);
+  assert.equal(DEFAULTS.smoke_bypass_header, null);
+  const ok = validateConfig({ ...minimal(), smoke_bypass_header: 'x-smoke-key' });
+  assert.equal(ok.ok, true, ok.errors.join('; '));
+  assert.equal(ok.config.smoke_bypass_header, 'x-smoke-key');
+  assert.equal(validateConfig({ ...minimal(), smoke_bypass_header: null }).ok, true);
+  const bad = (v) => validateConfig({ ...minimal(), smoke_bypass_header: v });
+  // Auth / cookie names can never pass: the x- prefix rule is the whole guard.
+  for (const v of ['Authorization', 'authorization', 'cookie', 'proxy-authorization', 'x-', 'X-Smoke-Key', 'x-Smoke', 'x-smoke key', 'x-smoke_key', 'x-' + 'a'.repeat(61), '', ' x-smoke-key', 'x-smoke-key\n', 5, true, ['x-smoke-key'], {}]) {
+    const r = bad(v);
+    assert.equal(r.ok, false, `${JSON.stringify(v)} must be rejected`);
+    assert.ok(has(r, 'smoke_bypass_header'), r.errors.join('; '));
+  }
+  assert.equal(bad('x-' + 'a'.repeat(60)).ok, true, '60 chars after x- is the limit');
+  assert.ok(has(bad('Authorization'), 'lowercase'), 'the message says what is accepted');
+});
+
 test('unknown top-level key (typo) is rejected', () => {
   const r = validateConfig({ ...minimal(), verfy: { full: 'x' } });
   assert.equal(r.ok, false);
