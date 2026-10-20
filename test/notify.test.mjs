@@ -124,6 +124,9 @@ test('an unknown outcome word is unclassified: no push', () => {
 test('default actions name the one thing to do', () => {
   assert.equal(defaultAction('owner-merge', { head: 'abcdef0123' }), 'Check the listed items, then say "merge" for head abcdef0');
   assert.equal(defaultAction('needs-human'), 'Read the needs-human comment and decide');
+  assert.equal(defaultAction('needs-human', { ownerApproval: 'label', pr: 7 }), 'Read the needs-human comment and decide', 'label mode is unchanged');
+  assert.equal(defaultAction('needs-human', { ownerApproval: 'chat', pr: 7 }), 'Rule in chat, then say "ship resume 7"');
+  assert.equal(defaultAction('arbiter-escalation', { ownerApproval: 'chat', pr: 7 }), 'Rule on the escalated items in the triage comment', 'chat changes needs-human only');
   assert.equal(defaultAction('arbiter-escalation', { ids: ['a1', 'b2'] }), 'Rule on a1, b2 in the triage comment');
   assert.equal(defaultAction('stopped'), 'Read the PR: the run stopped');
 });

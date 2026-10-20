@@ -50,7 +50,7 @@ export function classifyOutcome(word) {
 }
 
 // The one thing to do for each push event when the caller gave no --action.
-export function defaultAction(event, { head, ids = [], reason } = {}) {
+export function defaultAction(event, { head, ids = [], reason, ownerApproval = 'label', pr } = {}) {
   const h = head ? String(head).slice(0, 7) : '';
   switch (event) {
     case 'owner-merge':
@@ -58,6 +58,8 @@ export function defaultAction(event, { head, ids = [], reason } = {}) {
     case 'arbiter-escalation':
       return ids.length ? `Rule on ${ids.join(', ')} in the triage comment` : 'Rule on the escalated items in the triage comment';
     case 'needs-human':
+      // chat mode has no label to remove: the owner answers in chat
+      if (ownerApproval === 'chat' && pr) return `Rule in chat, then say "ship resume ${pr}"`;
       return 'Read the needs-human comment and decide';
     default:
       return reason ? `Read the PR: ${reason}` : 'Read the PR: the run stopped';

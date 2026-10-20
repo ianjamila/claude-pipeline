@@ -43,6 +43,8 @@ const PROTECTED_REL = [
   '.claude/settings.json',
   // #58: the owner's recorded chat "merge" (hooks/lib/owner-go.mjs): only the owner-go hook writes it, P merge and the guard read it
   '.claude/pipeline-state/owner-go',
+  // owner stops (owner_approval: chat): the local pending stop files that keep a PR blocked until the stop reaches GitHub (pipeline/lib/owner-stop.mjs)
+  '.claude/pipeline-state/owner-stops',
 ];
 
 // The directories that hold them. Writing INTO them is fine (history, projects, CLAUDE.md, other skills), but
