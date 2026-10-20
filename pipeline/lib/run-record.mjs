@@ -283,7 +283,8 @@ function normaliseTask(t, previous) {
   if (String(t.id).length > MAX_TASK_ID) throw new Error(`task id ${JSON.stringify(String(t.id).slice(0, 20))}… is longer than ${MAX_TASK_ID} characters`);
   // A task whose spec changed (its specSha differs) is not done any more, unless the patch says so explicitly.
   const specSha = t.specSha ?? previous?.specSha;
-  const changed = typeof t.specSha === 'string' && typeof previous?.specSha === 'string' && t.specSha !== previous.specSha;
+  // A previous task with no specSha (a legacy record) counts as changed: its done flag says nothing about this spec.
+  const changed = typeof t.specSha === 'string' && previous !== undefined && t.specSha !== previous.specSha;
   return {
     id: String(t.id),
     title: text(t.title ?? previous?.title, LIMITS.title),

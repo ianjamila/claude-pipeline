@@ -303,3 +303,12 @@ test('task done survives only while specSha is unchanged', () => {
   assert.equal(applyCheckpoint(r, { tasks: [{ id: 'T1', title: 't', spec: 's2', specSha: 'c'.repeat(12) }] }, AT).tasks[0].done, false);
   assert.equal(applyCheckpoint(r, { tasks: [{ id: 'T1' }] }, AT).tasks[0].done, true, 'no specSha in the patch: the earlier one and done stay');
 });
+
+test('a legacy done task (no specSha) is not done once the approved plan task replaces it', () => {
+  let r = emptyRecord(ID);
+  r = applyCheckpoint(r, { tasks: [{ id: 'T1', title: 't', spec: 's' }], done: ['T1'] }, AT);
+  assert.equal(r.tasks[0].done, true, 'the legacy task is done');
+  assert.equal(applyCheckpoint(r, { tasks: [{ id: 'T1', specSha: 'a'.repeat(12) }] }, AT).tasks[0].done, false, 'a spec we never saw is not done');
+  const withSha = applyCheckpoint(emptyRecord(ID), { tasks: [{ id: 'T1', specSha: 'a'.repeat(12) }], done: ['T1'] }, AT);
+  assert.equal(applyCheckpoint(withSha, { tasks: [{ id: 'T1', specSha: 'a'.repeat(12) }] }, AT).tasks[0].done, true, 'equal hashes keep done');
+});
