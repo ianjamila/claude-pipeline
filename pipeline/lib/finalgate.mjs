@@ -465,10 +465,19 @@ async function hardstopsCheck({ root, config, diff }) {
 export async function planScopeCheck({ root, config, diff, gh, pr, home }) {
   const d = diff();
   if (!d.ok) return check('plan-scope', false, `could not diff against the base: ${d.error}`);
-  const viewer = gh.viewer();
-  const comments = gh.listComments(pr);
-  const view = gh.prView(pr, [...VIEW_FIELDS]);
-  const bind = bindOf({ repo: gh.repo().slug, pr, branch: view.headRefName });
+  let viewer;
+  let comments;
+  let bind;
+  try {
+    viewer = gh.viewer();
+    comments = gh.listComments(pr);
+    bind = bindOf({ repo: gh.repo().slug, pr, branch: gh.prView(pr, [...VIEW_FIELDS]).headRefName });
+  } catch (err) {
+    // plan.required: false is an opt-out: a GitHub read that fails must not block a merge on evidence nobody asked for. When the plan
+    // IS required the failure propagates and the gate records a failed check (never a pass).
+    if (config.plan.required) throw err;
+    return check('plan-scope', true, `report only (plan.required: false): the PR's plan evidence could not be read (${String(err?.message ?? err).split('\n')[0]})`);
+  }
   // summaryFromComments already decodes ({ status, record }): a readable record of THIS PR whose plan has no events is `lost`.
   const summary = summaryFromComments(comments, viewer);
   const own = summary.status === 'ok' && bindRecord(summary.record, bind).length === 0;

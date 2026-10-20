@@ -177,8 +177,8 @@ test('fail closed: a diff that cannot be read, or a gh/comment read that throws,
   const noDiff = await planScopeCheck({ root: '.', config, diff: () => ({ ok: false, error: 'bad ref' }), gh, pr: PR, home: homeDir() });
   assert.deepEqual([noDiff.name, noDiff.ok], ['plan-scope', false]);
   assert.match(noDiff.detail, /could not diff against the base: bad ref/);
-  // a throwing comment read: evaluateGate records a failed check (even report-only), it does not skip the check
-  const sc = setup({ chat: true, required: false });
+  // a throwing comment read: evaluateGate records a failed check when the plan is required, it does not skip the check
+  const sc = setup({ chat: true });
   const { config: cfg } = await loadConfig(sc.repo.dir);
   const env = { ...process.env, ...sc.fake.env, ...createFakeCodex().env, PIPELINE_NOTIFY: 'off', PIPELINE_MERGEABLE_PAUSE_MS: '1' };
   const real = createGitHub({ cwd: sc.repo.dir, env });
@@ -186,4 +186,13 @@ test('fail closed: a diff that cannot be read, or a gh/comment read that throws,
   const gate = await evaluateGate({ root: sc.repo.dir, config: cfg, pr: PR, gh: broken, env, home: homeDir() });
   assert.equal(scopeCheck(gate).ok, false);
   assert.match(scopeCheck(gate).detail, /could not evaluate: gh down/);
+
+  // plan.required: false is an opt-out: the same unreadable evidence is a report-only pass (the file list still fails closed above)
+  const off = setup({ chat: true, required: false });
+  const { config: offCfg } = await loadConfig(off.repo.dir);
+  const offEnv = { ...process.env, ...off.fake.env, ...createFakeCodex().env, PIPELINE_NOTIFY: 'off', PIPELINE_MERGEABLE_PAUSE_MS: '1' };
+  const offGh = { ...createGitHub({ cwd: off.repo.dir, env: offEnv }), listComments: () => { throw new Error('gh down'); } };
+  const offGate = await evaluateGate({ root: off.repo.dir, config: offCfg, pr: PR, gh: offGh, env: offEnv, home: homeDir() });
+  assert.equal(scopeCheck(offGate).ok, true);
+  assert.match(scopeCheck(offGate).detail, /report only \(plan\.required: false\).*gh down/);
 });
