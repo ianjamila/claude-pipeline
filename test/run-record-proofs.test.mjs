@@ -17,6 +17,12 @@ test('proofLine: GitHub run and attempt for a ci proof, Mac for a local one', ()
   assert.equal(proofLine(MAC), 'typecheck proof: Mac');
 });
 
+test('a ci proof whose run also names the checked job steps is valid; the record keeps the run fields it knows', () => {
+  const withSteps = { ...CI, run: { ...RUN, steps: ['Typecheck', 'Vitest'] } };
+  assert.equal(proofsProblem([withSteps]), null);
+  assert.deepEqual(normaliseProofs([withSteps]), [CI]);
+});
+
 test('the status block prints one line per proof; a record without proofs prints none', () => {
   const rec = applyCheckpoint(base(), { proofs: [CI, MAC] }, at);
   const block = renderStatusBlock(rec);

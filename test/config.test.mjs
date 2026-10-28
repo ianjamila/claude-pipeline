@@ -818,6 +818,22 @@ test('verify.deferrable_steps / ci_proof / ci_proof_inputs / ci_proof_wait_minut
   for (const event of ['', 3, null]) assert.ok(has(withVerify({ ...good, ci_proof: { 'sql-arms': { ...spec, event } } }), '.event must be a non-empty event name'), JSON.stringify(event));
   assert.ok(has(withVerify({ ...good, ci_proof: { 'sql-arms': { ...spec, branch: 'main' } } }), 'unknown key'));
 
+  // ci_proof.<step>.steps: optional names of steps inside the job that must have succeeded
+  const withSteps = (steps) => withVerify({ ...good, ci_proof: { 'sql-arms': { ...spec, steps } } });
+  const stepsOk = withSteps(['Typecheck', 'Vitest']);
+  assert.equal(stepsOk.ok, true, stepsOk.errors.join('; '));
+  assert.deepEqual(stepsOk.config.verify.ci_proof['sql-arms'].steps, ['Typecheck', 'Vitest']);
+  assert.equal(withVerify(good).config.verify.ci_proof['sql-arms'].steps, undefined, 'no default');
+  for (const bad of [[], 'Typecheck', null, {}, 5, ['a', 3], ['a', ''], ['a', '  '], [null]]) {
+    assert.ok(has(withSteps(bad), '.steps must be a non-empty array of non-empty step names'), JSON.stringify(bad));
+  }
+  assert.ok(has(withSteps(['a', 'b', 'a']), '.steps must not repeat a step name'));
+  assert.ok(has(withSteps(Array.from({ length: 21 }, (_, i) => `s${i}`)), '.steps lists 21 steps: at most 20'));
+  assert.equal(withSteps(Array.from({ length: 20 }, (_, i) => `s${i}`)).ok, true, '20 steps is the limit');
+  assert.ok(has(withSteps(['x'.repeat(201)]), 'step names may be at most 200 characters'));
+  assert.equal(withSteps(['x'.repeat(200)]).ok, true);
+  assert.ok(has(withVerify({ ...good, ci_proof: { 'sql-arms': { ...spec, step: ['Typecheck'] } } }), 'unknown key: verify.ci_proof["sql-arms"].step'), 'a typo of steps is refused');
+
   // ci_proof_inputs
   for (const bad of ['supabase/**', [''], [3], null, {}]) assert.ok(has(withVerify({ ...good, ci_proof_inputs: bad }), 'verify.ci_proof_inputs must be an array'), JSON.stringify(bad));
   assert.ok(has(withVerify({ ci_proof_inputs: ['a/**'] }), 'verify.ci_proof_inputs needs verify.ci_proof'));
