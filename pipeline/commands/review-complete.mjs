@@ -12,7 +12,7 @@ import { createGitHub, guardGh } from '../lib/github.mjs';
 import { assessRisk, reviewLane } from '../lib/risk.mjs';
 import { loadState } from '../lib/state.mjs';
 import { reviewValidFor, roundOutcome } from '../lib/triage.mjs';
-import { currentContentHash, readModelProofs, reviewBaseRef, withReviewLock } from '../lib/review-context.mjs';
+import { currentContentHash, reviewBaseRef, withReviewLock } from '../lib/review-context.mjs';
 
 export const meta = {
   summary: 'post the review-complete comment (and remove awaiting-review) once the review is valid for the current content',
@@ -56,6 +56,12 @@ function laneProblem(state, root, config, base) {
   const proven = state.rounds.some((r) => r.fableRequired === true && r.arbiter?.proofOk === true);
   return proven ? null : `the PR needs the Fable review pass (${lane.reasons.join('; ')}), but no review round ran a proven one`;
 }
+
+// The Fable review passes that count: proven ones of Fable rounds, in round order (a dispute-mode ruling or a failed
+// attempt is not a Fable review). Empty for a judge-only PR, so its digest is null.
+export const fableProofs = (state) => (state?.rounds ?? [])
+  .filter((r) => r.fableRequired === true && r.arbiter?.proofOk === true && r.modelProof && typeof r.modelProof === 'object')
+  .map((r) => ({ round: r.n, transcript: r.modelProof.transcript, models: r.modelProof.models, ...(r.modelProof.effort ? { effort: r.modelProof.effort } : {}) }));
 
 export function reviewRecord(state, { contentHash, base, head, modelProofs, defaultCodexModel }) {
   const last = state.rounds.at(-1);
@@ -118,7 +124,7 @@ export const run = guarded(async (argv, ctx) => {
       if (lane) return { exitCode: EXIT.FAILED, output: { ok: false, reason: lane, currentContentHash: hash } };
 
       const record = reviewRecord(state, {
-        contentHash: hash, base, head: local, modelProofs: readModelProofs(root, state), defaultCodexModel: config.review.codex_model,
+        contentHash: hash, base, head: local, modelProofs: fableProofs(state), defaultCodexModel: config.review.codex_model,
       });
       const body = reviewCompleteBody(record);
       // Retrying after a crash must not stack identical comments: our own latest marker comment with this exact body stands.

@@ -322,9 +322,11 @@ export function reuseRuled(items, ruledCache) {
     // The issue filed for the earlier item is the issue for this one: carrying it keeps `followups create` from
     // filing the same suggestion again every round.
     if (typeof followupIssue === 'string' && followupIssue !== '' && !next.followupIssue) next.followupIssue = followupIssue;
-    // The same finding (same code, same kind) was already accepted AND fixed: carrying the fix keeps it from reading as an
-    // unimplemented ACCEPT that `mark-implemented` can never clear (no code changes for an already-fixed finding).
-    if (final.decision === 'ACCEPT' && implemented === true) next.implemented = true;
+    // The same suggestion (same code, same kind) was already accepted AND fixed: carrying the fix keeps it from reading as an
+    // unimplemented ACCEPT that `mark-implemented` can never clear. Never for a BLOCKING or security / data finding: raised
+    // again on unchanged code, that is evidence the fix may be missing, so it stays open (and parks for a human) instead.
+    const carriesFix = next.bucket !== 'BLOCKING' && !SECURITY_CATEGORIES.includes(next.category);
+    if (final.decision === 'ACCEPT' && implemented === true && carriesFix) next.implemented = true;
     return next;
   });
 }
@@ -338,7 +340,8 @@ export function ruledCacheFrom(items) {
     if (item.fingerprint && item.final && !item.final.needsHuman && item.final.by !== 'light-lane') {
       const prev = Object.hasOwn(cache, item.fingerprint) ? cache[item.fingerprint] : null;
       const issue = item.followupIssue || prev?.followupIssue || null;
-      const fixed = item.final.decision === 'ACCEPT' && (item.implemented === true || (prev?.decision === 'ACCEPT' && prev.implemented === true));
+      // Newest wins: a later copy that is not marked fixed clears the flag.
+      const fixed = item.final.decision === 'ACCEPT' && item.implemented === true;
       cache[item.fingerprint] = {
         ...structuredClone(item.final), bucket: item.bucket, category: item.category, ...(issue ? { followupIssue: issue } : {}),
         ...(fixed ? { implemented: true } : {}),

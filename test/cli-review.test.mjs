@@ -1522,7 +1522,8 @@ test('Fable review: its own findings become items R<n>-F<k>; Codex items are rul
   assert.equal(w.state().rounds[0].items.filter((i) => i.id === 'R1-F1').length, 1);
 });
 
-test('Fable review: a finding an earlier round settled, raised again unchanged, takes the cached ruling (no fresh ACCEPT)', (t) => {
+// Round 1: a proven Fable pass raises finding1 (FOLLOW-UP). Round 2 (an unrelated change): Fable raises it again as ACCEPT.
+function twoFableRounds(t) {
   const w = world(t, { yml: SENSITIVE_YML });
   assertExit(w.codex(1, findingsOf()), 0);
   assertExit(w.cli(['arbiter', 'needed', '--round', '1']), 0);
@@ -1536,15 +1537,39 @@ test('Fable review: a finding an earlier round settled, raised again unchanged, 
   assertExit(w.codex(2, findingsOf(), { from: w.head, to: head2 }), 0);
   const needed2 = w.cli(['arbiter', 'needed', '--round', '2']);
   assert.deepEqual([needed2.json.mode, needed2.json.scope], ['review', 'round']);
-  const projects = installTranscript(w, {
-    agentId: 'a3',
+  const applyRound2 = (agentId) => w.cli(['arbiter', 'apply', '--round', '2', '--projects-dir', installTranscript(w, {
+    agentId,
     jsonl: transcript({ prompt: promptFor(needed2.json.digest, 2), text: fenced({ rulings: [], findings: [{ ...finding1, ruling: 'ACCEPT' }] }) }),
     meta: { agentType: 'arbiter', description: needed2.json.tag },
-  });
-  const r2 = w.cli(['arbiter', 'apply', '--round', '2', '--projects-dir', projects]);
+  })]);
+  return { w, applyRound2 };
+}
+
+test('Fable review: a finding an earlier Fable pass settled, raised again unchanged, takes the cached ruling (no fresh ACCEPT)', (t) => {
+  const { w, applyRound2 } = twoFableRounds(t);
+  const r2 = applyRound2('a3');
   assertExit(r2, 0, r2.stdout);
   assert.deepEqual([w.item('R2-F1').final.by, w.item('R2-F1').final.decision], ['cache', 'FOLLOW-UP']);
   assert.deepEqual(w.cli(['state', 'outcome']).json.newAccepted, []);
+});
+
+test('Fable review: a weaker earlier ruling (the judge) never overrules a finding a proven Fable pass raises', (t) => {
+  const { w, applyRound2 } = twoFableRounds(t);
+  editState(w, (s) => { s.rounds[0].items[0].final.by = 'judge'; }); // as if the Sonnet judge had ruled it in round 1
+  const r2 = applyRound2('a4');
+  assertExit(r2, 0, r2.stdout);
+  assert.deepEqual([w.item('R2-F1').final.by, w.item('R2-F1').final.decision], ['arbiter', 'ACCEPT']);
+});
+
+test('arbiter apply: a Fable round whose input was not written in review mode is refused (stale-input), never proven', (t) => {
+  const w = world(t, { yml: SENSITIVE_YML });
+  assertExit(w.codex(1, findingsOf()), 0);
+  assertExit(w.cli(['arbiter', 'needed', '--round', '1']), 0);
+  editState(w, (s) => { delete s.rounds[0].arbiter.mode; }); // an older install, a restored or edited state
+  const r = arbiterRun(w, { text: fenced({ rulings: [] }) });
+  assertExit(r, 2, r.stdout);
+  assert.equal(r.json.error, 'stale-input');
+  assert.deepEqual(w.cli(['state', 'outcome']).json.fablePending, [1]);
 });
 
 test('codex-review: rounds stop at review.max_rounds plus ONE extra confirm round (exit 2 round-cap)', (t) => {

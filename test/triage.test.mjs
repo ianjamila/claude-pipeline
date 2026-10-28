@@ -1257,22 +1257,29 @@ test('roundCapProblem: rounds stop at maxRounds plus ONE extra confirm round, on
   assert.equal(roundCapProblem({ rounds: [] }, 9), null); // not capped without a finite maxRounds
 });
 
-test('reuseRuled: an ACCEPT that was already fixed comes back implemented (else mark-implemented could never clear it)', () => {
-  const fixed = item({ fingerprint: 'fx', final: settled('ACCEPT'), implemented: true });
-  const notYet = item({ fingerprint: 'nf', final: settled('ACCEPT'), implemented: false });
-  const rejected = item({ fingerprint: 'rj', final: settled('REJECT'), implemented: true });
-  const cache = ruledCacheFrom([fixed, notYet, rejected]);
+test('reuseRuled: a fixed SUGGESTION comes back implemented; a re-raised BLOCKING or security finding never does (fail closed)', () => {
+  const sugg = { bucket: 'SUGGESTION', category: 'maintainability' };
+  const fixed = item({ ...sugg, fingerprint: 'fx', final: settled('ACCEPT'), implemented: true });
+  const notYet = item({ ...sugg, fingerprint: 'nf', final: settled('ACCEPT'), implemented: false });
+  const rejected = item({ ...sugg, fingerprint: 'rj', final: settled('REJECT'), implemented: true });
+  const blocking = item({ fingerprint: 'bl', final: settled('ACCEPT'), implemented: true }); // BLOCKING, logic
+  const security = item({ bucket: 'SUGGESTION', category: 'auth', fingerprint: 'se', final: settled('ACCEPT'), implemented: true });
+  const cache = ruledCacheFrom([fixed, notYet, rejected, blocking, security]);
   assert.equal(cache.fx.implemented, true);
   assert.equal(cache.nf.implemented, undefined);
   assert.equal(cache.rj.implemented, undefined, 'only an ACCEPT carries a fix');
-  const [a, b, c] = reuseRuled([item({ fingerprint: 'fx' }), item({ fingerprint: 'nf' }), item({ fingerprint: 'rj' })], cache);
+  const again = (base) => item({ bucket: base.bucket, category: base.category, fingerprint: base.fingerprint });
+  const [a, b, c, d, e] = reuseRuled([fixed, notYet, rejected, blocking, security].map(again), cache);
   assert.deepEqual([a.final.by, a.final.decision, a.implemented], ['cache', 'ACCEPT', true]);
   assert.equal(a.final.implemented, undefined, 'the flag is not part of the final');
-  assert.equal(b.implemented, false);
-  assert.equal(c.implemented, false);
-  // The reused, fixed ACCEPT is neither unimplemented nor a new accept: the round can be clean.
+  assert.deepEqual([b.implemented, c.implemented], [false, false]);
+  assert.deepEqual([d.final.decision, d.implemented], ['ACCEPT', false], 'a re-raised BLOCKING finding stays open');
+  assert.deepEqual([e.final.decision, e.implemented], ['ACCEPT', false], 'a re-raised security finding stays open');
+  // The reused, fixed suggestion is neither unimplemented nor a new accept: the round can be clean.
   const o = roundOutcome({ rounds: [round(1, [fixed]), round(2, [a])], maxRounds: 2, currentContentHash: 'h-final' });
   assert.deepEqual([o.clean, o.unimplemented], [true, []]);
-  // A later unfixed copy of the same finding does not erase the earlier fix.
-  assert.equal(ruledCacheFrom([fixed, item({ fingerprint: 'fx', final: settled('ACCEPT', 'cache'), implemented: false })]).fx.implemented, true);
+  const ob = roundOutcome({ rounds: [round(1, [blocking]), round(2, [d])], maxRounds: 2, currentContentHash: 'h-final' });
+  assert.deepEqual(ob.unimplemented, [d.id]);
+  // Newest wins: a later copy that is not marked fixed clears the flag.
+  assert.equal(ruledCacheFrom([fixed, item({ ...sugg, fingerprint: 'fx', final: settled('ACCEPT', 'cache'), implemented: false })]).fx.implemented, undefined);
 });

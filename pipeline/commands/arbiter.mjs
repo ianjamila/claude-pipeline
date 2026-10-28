@@ -331,8 +331,13 @@ function applyLocked({ n, agentId, givenTag, expectModelPrefix, expectEffort, ma
   if (!asksRound.test(proof.firstUserText)) errors.push(`the arbiter's prompt does not carry ROUND: ${n}`);
   if (!asksDigest.test(proof.firstUserText)) errors.push("the arbiter's prompt does not carry the stored INPUT-DIGEST");
   errors.push(...checkInputFile(path.join(roundDir(root, n), 'arbiter-input.md'), n, stored.inputDigest));
+  // The mode comes from the ROUND, not from the stored input: a Fable round whose input was written in dispute mode (an
+  // older install, a restored or edited state) must never be proven by a plain {rulings} answer that reviewed nothing.
+  const review = isFableRound(round);
+  if (review && stored.mode !== 'review') {
+    throw new Fail(EXIT.USAGE, { ok: false, error: 'stale-input', message: `round ${n} is a Fable review round but its arbiter input is not a review input: run \`arbiter needed\` again` });
+  }
   // A review mode input names the diff Fable read by its digest; the file must still be exactly that diff.
-  const review = stored.mode === 'review';
   if (review) errors.push(...checkDiffFile(stored));
 
   let rulings = null;
@@ -357,7 +362,10 @@ function applyLocked({ n, agentId, givenTag, expectModelPrefix, expectEffort, ma
   const fresh = proofOk && review
     ? fableFindingItems(rulings.findings, n, { transcript: found.jsonlPath, fingerprintFor: fingerprintAt(round.toHead, state.currentContentHash, root) })
     : [];
-  const cache = ruledCacheFrom(state.rounds.filter((r) => r.n < n).flatMap((r) => r.items ?? []));
+  // Only a ruling at least as strong as this proven pass may stand in for it: an earlier Fable (arbiter) ruling or the
+  // owner's word. A judge's REJECT or an earlier cache copy must never overrule what Fable just raised.
+  const cache = Object.fromEntries(Object.entries(ruledCacheFrom(state.rounds.filter((r) => r.n < n).flatMap((r) => r.items ?? [])))
+    .filter(([, entry]) => entry.by === 'arbiter' || isOwnerRuled({ final: entry })));
   const reused = reuseRuled(fresh.map(({ final, ...rest }) => rest), cache);
   const findingItems = fresh.map((item, i) => (reused[i].final ? reused[i] : item));
   const items = [...finalizeWithoutArbiter(ruled, { lightLane: state.lightLane, force: forceArbiter(env) }), ...findingItems];
