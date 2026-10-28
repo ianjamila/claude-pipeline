@@ -78,3 +78,5 @@ full record.
 - 2026-10-20 · #100 · ci-proof for tests + stacks report count and consumer fixes · risk high · rounds 3 · arbiter 0 · merged-externally
 - 2026-10-20 · #99 · guards refuse over-long lines; linear DEFAULTED_WORD; CPU-time timing tests · risk high · rounds 2 · arbiter 0 · awaiting-owner-merge
 - 2026-10-20 · #99 · guards refuse over-long lines; linear DEFAULTED_WORD; CPU-time timing tests · risk high · rounds 2 · arbiter 0 · merged
+- 2026-10-20 · #97 · smoke: optional firewall-bypass header bound to an origin allowlist · risk high · rounds 3 · arbiter 0 · awaiting-owner-merge
+- 2026-10-28 · #101 · ci-proof: a project can require named job steps to have run and succeeded · risk high · rounds 1 · arbiter 0 · awaiting-owner-merge
