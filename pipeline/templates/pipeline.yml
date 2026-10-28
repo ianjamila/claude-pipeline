@@ -115,7 +115,8 @@ hard_stops:                    # project extras on top of the universal list
 review:
   codex_model: gpt-6-astra
   effort: {low: medium, medium: medium, high: high, followup: medium}
-  max_rounds: 3
+  max_rounds: 2                 # plus one confirm round when the last round only accepted fixes
   light_lane_max_lines: 50
+  arbiter_always_paths: []      # globs: a PR touching one gets the Fable review pass every round, even at low risk
 
 agent_log: docs/agent-log.md   # one line per run; kept on the orphan branch `pipeline-agent-log` (`pipeline agent-log publish`), never committed to a PR branch

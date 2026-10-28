@@ -17,7 +17,8 @@ test('minimal valid config is ok and defaults are filled', () => {
   const r = validateConfig(fixture('pipeline-valid.yml'));
   assert.equal(r.ok, true, r.errors.join('; '));
   assert.deepEqual(r.errors, []);
-  assert.equal(r.config.review.max_rounds, 3);
+  assert.equal(r.config.review.max_rounds, 2);
+  assert.deepEqual(r.config.review.arbiter_always_paths, []);
   assert.equal(r.config.merge.command, DEFAULTS.merge.command);
   assert.equal(r.config.project, 'demo-app');
   assert.equal(r.config.verify.report, '.verify/report.json');
@@ -162,6 +163,15 @@ test('review.max_rounds outside 1..5 is rejected; effort values validated', () =
   assert.equal(validateConfig({ ...minimal(), review: { max_rounds: 5 } }).ok, true);
   const e = validateConfig({ ...minimal(), review: { effort: { high: 'ultra' } } });
   assert.ok(has(e, 'review.effort.high'));
+});
+
+test('review.arbiter_always_paths: a list of glob strings, anything else rejected naming the key', () => {
+  const ok = validateConfig({ ...minimal(), review: { arbiter_always_paths: ['lib/auth/**', 'middleware.ts'] } });
+  assert.equal(ok.ok, true, ok.errors.join('; '));
+  assert.deepEqual(ok.config.review.arbiter_always_paths, ['lib/auth/**', 'middleware.ts']);
+  for (const bad of ['lib/auth/**', [1], { a: 1 }, null]) {
+    assert.ok(has(validateConfig({ ...minimal(), review: { arbiter_always_paths: bad } }), 'review.arbiter_always_paths'), JSON.stringify(bad));
+  }
 });
 
 test('production without smoke is rejected; production: null is ok', () => {

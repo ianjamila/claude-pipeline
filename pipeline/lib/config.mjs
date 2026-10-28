@@ -76,8 +76,10 @@ export const DEFAULTS = deepFreeze({
   review: {
     codex_model: 'gpt-6-astra',
     effort: { low: 'medium', medium: 'medium', high: 'high', followup: 'medium' },
-    max_rounds: 3,
+    max_rounds: 2,
     light_lane_max_lines: 50,
+    // Paths whose every review round gets the Fable pass (triage + its own review), whatever the risk level.
+    arbiter_always_paths: [],
   },
   agent_log: 'docs/agent-log.md',
 });
@@ -136,7 +138,7 @@ const KEYS = {
   hard_stops: ['paths', 'patterns', 'auth_calls', 'disable_rules', 'report_only_rules', 'report_only_paths'],
   pattern: ['name', 'regex', 'paths'],
   integrity: ['test_globs'],
-  review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines'],
+  review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines', 'arbiter_always_paths'],
   smoke: ['path', 'status', 'contains', 'location_contains'],
 };
 
@@ -539,6 +541,7 @@ export function validateConfig(obj) {
   if (review) {
     if (!inRange(review.max_rounds, 1, 5)) errors.push('review.max_rounds must be an integer 1..5');
     checkPosInt(review.light_lane_max_lines, 'review.light_lane_max_lines', errors);
+    checkStrArray(review.arbiter_always_paths, 'review.arbiter_always_paths', errors);
     if (!isObj(review.effort)) errors.push('review.effort must be a mapping');
     else {
       for (const lane of Object.keys(review.effort)) {
