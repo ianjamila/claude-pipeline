@@ -314,7 +314,7 @@ export function reuseRuled(items, ruledCache) {
     const next = structuredClone(item);
     if (next.final || !next.fingerprint) return next;
     if (!Object.hasOwn(ruledCache, next.fingerprint)) return next;
-    const { bucket, category, followupIssue, ...final } = structuredClone(ruledCache[next.fingerprint]);
+    const { bucket, category, followupIssue, implemented, ...final } = structuredClone(ruledCache[next.fingerprint]);
     if (bucket !== next.bucket || category !== next.category) return next;
     const dismissal = final.decision === 'REJECT' || final.decision === 'FOLLOW-UP';
     if (dismissal && SECURITY_CATEGORIES.includes(next.category) && !isOwnerRuled({ final })) return next;
@@ -322,6 +322,9 @@ export function reuseRuled(items, ruledCache) {
     // The issue filed for the earlier item is the issue for this one: carrying it keeps `followups create` from
     // filing the same suggestion again every round.
     if (typeof followupIssue === 'string' && followupIssue !== '' && !next.followupIssue) next.followupIssue = followupIssue;
+    // The same finding (same code, same kind) was already accepted AND fixed: carrying the fix keeps it from reading as an
+    // unimplemented ACCEPT that `mark-implemented` can never clear (no code changes for an already-fixed finding).
+    if (final.decision === 'ACCEPT' && implemented === true) next.implemented = true;
     return next;
   });
 }
@@ -333,9 +336,12 @@ export function ruledCacheFrom(items) {
   for (const item of items) {
     // A light-lane rejection is a default ("not triaged"), not a ruling: nobody looked at it.
     if (item.fingerprint && item.final && !item.final.needsHuman && item.final.by !== 'light-lane') {
-      const issue = item.followupIssue || (Object.hasOwn(cache, item.fingerprint) ? cache[item.fingerprint].followupIssue : null);
+      const prev = Object.hasOwn(cache, item.fingerprint) ? cache[item.fingerprint] : null;
+      const issue = item.followupIssue || prev?.followupIssue || null;
+      const fixed = item.final.decision === 'ACCEPT' && (item.implemented === true || (prev?.decision === 'ACCEPT' && prev.implemented === true));
       cache[item.fingerprint] = {
         ...structuredClone(item.final), bucket: item.bucket, category: item.category, ...(issue ? { followupIssue: issue } : {}),
+        ...(fixed ? { implemented: true } : {}),
       };
     }
   }

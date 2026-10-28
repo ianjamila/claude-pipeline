@@ -1256,3 +1256,23 @@ test('roundCapProblem: rounds stop at maxRounds plus ONE extra confirm round, on
   assert.match(roundCapProblem(three, 4), /and its one extra round/);
   assert.equal(roundCapProblem({ rounds: [] }, 9), null); // not capped without a finite maxRounds
 });
+
+test('reuseRuled: an ACCEPT that was already fixed comes back implemented (else mark-implemented could never clear it)', () => {
+  const fixed = item({ fingerprint: 'fx', final: settled('ACCEPT'), implemented: true });
+  const notYet = item({ fingerprint: 'nf', final: settled('ACCEPT'), implemented: false });
+  const rejected = item({ fingerprint: 'rj', final: settled('REJECT'), implemented: true });
+  const cache = ruledCacheFrom([fixed, notYet, rejected]);
+  assert.equal(cache.fx.implemented, true);
+  assert.equal(cache.nf.implemented, undefined);
+  assert.equal(cache.rj.implemented, undefined, 'only an ACCEPT carries a fix');
+  const [a, b, c] = reuseRuled([item({ fingerprint: 'fx' }), item({ fingerprint: 'nf' }), item({ fingerprint: 'rj' })], cache);
+  assert.deepEqual([a.final.by, a.final.decision, a.implemented], ['cache', 'ACCEPT', true]);
+  assert.equal(a.final.implemented, undefined, 'the flag is not part of the final');
+  assert.equal(b.implemented, false);
+  assert.equal(c.implemented, false);
+  // The reused, fixed ACCEPT is neither unimplemented nor a new accept: the round can be clean.
+  const o = roundOutcome({ rounds: [round(1, [fixed]), round(2, [a])], maxRounds: 2, currentContentHash: 'h-final' });
+  assert.deepEqual([o.clean, o.unimplemented], [true, []]);
+  // A later unfixed copy of the same finding does not erase the earlier fix.
+  assert.equal(ruledCacheFrom([fixed, item({ fingerprint: 'fx', final: settled('ACCEPT', 'cache'), implemented: false })]).fx.implemented, true);
+});
