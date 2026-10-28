@@ -59,10 +59,17 @@ Do not describe or speculate about which model you are; provenance is verified s
 
 ## Output — ONLY this JSON in one fenced block
 
-One `rulings` entry per input item (an empty list when there are none). In REVIEW mode `findings`
-is required (an empty list when you found nothing); in DISPUTE mode leave it out.
+One `rulings` entry per input item (an empty list when there are none).
+
+REVIEW mode — `findings` is required (`[]` when you found nothing):
 
 ```json
 {"rulings":[{"id":"R1-S2","ruling":"REJECT","confidence":"high","reasoning":"…"}],
  "findings":[{"bucket":"BLOCKING","category":"auth","title":"…","file":"lib/x.ts","line":42,"detail":"…","ruling":"ACCEPT","confidence":"high","reasoning":"…"}]}
+```
+
+DISPUTE mode — no `findings` key at all (even `[]` is refused):
+
+```json
+{"rulings":[{"id":"R1-S2","ruling":"REJECT","confidence":"high","reasoning":"…"}]}
 ```

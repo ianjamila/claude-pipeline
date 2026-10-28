@@ -18,7 +18,7 @@ import { seamFlag } from '../lib/proc.mjs';
 import { saveState, updateItems } from '../lib/state.mjs';
 import { extractJsonBlock, findSubagentTranscript, proveModel } from '../lib/transcript.mjs';
 import {
-  applyRulings, arbiterNeeded, fableFindingItems, finalizeWithoutArbiter, isOwnerRuled, validateRulings,
+  applyRulings, arbiterNeeded, fableFindingItems, finalizeWithoutArbiter, isOwnerRuled, reuseRuled, ruledCacheFrom, validateRulings,
 } from '../lib/triage.mjs';
 import {
   ensureRoundDir, excerptWindow, findRound, oneLine, patchRound, readFileOrFail, requireState, roundDir, sha256,
@@ -304,6 +304,11 @@ function applyLocked({ n, agentId, givenTag, expectModelPrefix, expectEffort, ma
   if (!stored || !Array.isArray(stored.items) || typeof stored.inputDigest !== 'string') {
     throw new Fail(EXIT.USAGE, { ok: false, error: 'no-arbiter-input', message: `round ${n} has no arbiter input: run \`arbiter needed\` first` });
   }
+  // A proven Fable review is final: applying another transcript would re-add its findings under the same ids (and could
+  // swap a BLOCKING finding for a milder one). Re-reviewing means a new round.
+  if (stored.mode === 'review' && stored.proofOk === true) {
+    throw new Fail(EXIT.USAGE, { ok: false, error: 'already-applied', message: `round ${n} already has a proven Fable review; it is not applied again` });
+  }
   const tag = givenTag ?? stored.tag;
 
   const found = findSubagentTranscript({ agentId, tag: agentId === undefined ? tag : undefined, projectsDir, maxAgeMs });
@@ -347,9 +352,14 @@ function applyLocked({ n, agentId, givenTag, expectModelPrefix, expectEffort, ma
     : { rulings: stored.items.map((id) => ({ id, ruling: null, confidence: 'low', reasoning: 'unverified' })) };
   const ruled = applyRulings(round.items, applied, { proofOk, transcript: found.jsonlPath });
   // Fable's own findings count only when proven; an unproven answer adds nothing (the round stays Fable-pending).
-  const findingItems = proofOk && review
+  // A finding an earlier round already settled (same fingerprint, bucket and category) takes that ruling from the cache,
+  // like a repeated Codex item, so re-raising it does not start a fresh ACCEPT (the cache keeps its security exceptions).
+  const fresh = proofOk && review
     ? fableFindingItems(rulings.findings, n, { transcript: found.jsonlPath, fingerprintFor: fingerprintAt(round.toHead, state.currentContentHash, root) })
     : [];
+  const cache = ruledCacheFrom(state.rounds.filter((r) => r.n < n).flatMap((r) => r.items ?? []));
+  const reused = reuseRuled(fresh.map(({ final, ...rest }) => rest), cache);
+  const findingItems = fresh.map((item, i) => (reused[i].final ? reused[i] : item));
   const items = [...finalizeWithoutArbiter(ruled, { lightLane: state.lightLane, force: forceArbiter(env) }), ...findingItems];
 
   const dir = ensureRoundDir(root, n);

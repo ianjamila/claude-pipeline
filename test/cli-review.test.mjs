@@ -1512,6 +1512,39 @@ test('Fable review: its own findings become items R<n>-F<k>; Codex items are rul
   const o = w.cli(['state', 'outcome']).json;
   assert.deepEqual([o.clean, o.openBlocking, o.newAccepted], [false, ['R1-F1'], ['R1-F1']]);
   assert.deepEqual(JSON.parse(readFileSync(w.roundFile(1, 'rulings.json'), 'utf8')).findings, answer.findings);
+
+  // A proven review is final: another transcript cannot re-add (or soften) its findings.
+  const softer = { ...answer, findings: [{ ...answer.findings[0], bucket: 'WORTH_CONSIDERING', ruling: 'FOLLOW-UP' }] };
+  const again = arbiterRun(w, { text: fenced(softer), agentId: 'a2' });
+  assertExit(again, 2, again.stdout);
+  assert.equal(again.json.error, 'already-applied');
+  assert.deepEqual([w.item('R1-F1').bucket, w.item('R1-F1').final.decision], ['BLOCKING', 'ACCEPT']);
+  assert.equal(w.state().rounds[0].items.filter((i) => i.id === 'R1-F1').length, 1);
+});
+
+test('Fable review: a finding an earlier round settled, raised again unchanged, takes the cached ruling (no fresh ACCEPT)', (t) => {
+  const w = world(t, { yml: SENSITIVE_YML });
+  assertExit(w.codex(1, findingsOf()), 0);
+  assertExit(w.cli(['arbiter', 'needed', '--round', '1']), 0);
+  const finding1 = {
+    bucket: 'SUGGESTION', category: 'maintainability', title: 'Name w3 better', file: 'src/b.js', line: 3, detail: 'w3 says nothing',
+    ruling: 'FOLLOW-UP', confidence: 'high', reasoning: 'src/b.js:3 is a vague name',
+  };
+  assertExit(arbiterRun(w, { text: fenced({ rulings: [], findings: [finding1] }) }), 0);
+  w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
+  const head2 = w.repo.commit('unrelated change');
+  assertExit(w.codex(2, findingsOf(), { from: w.head, to: head2 }), 0);
+  const needed2 = w.cli(['arbiter', 'needed', '--round', '2']);
+  assert.deepEqual([needed2.json.mode, needed2.json.scope], ['review', 'round']);
+  const projects = installTranscript(w, {
+    agentId: 'a3',
+    jsonl: transcript({ prompt: promptFor(needed2.json.digest, 2), text: fenced({ rulings: [], findings: [{ ...finding1, ruling: 'ACCEPT' }] }) }),
+    meta: { agentType: 'arbiter', description: needed2.json.tag },
+  });
+  const r2 = w.cli(['arbiter', 'apply', '--round', '2', '--projects-dir', projects]);
+  assertExit(r2, 0, r2.stdout);
+  assert.deepEqual([w.item('R2-F1').final.by, w.item('R2-F1').final.decision], ['cache', 'FOLLOW-UP']);
+  assert.deepEqual(w.cli(['state', 'outcome']).json.newAccepted, []);
 });
 
 test('codex-review: rounds stop at review.max_rounds plus ONE extra confirm round (exit 2 round-cap)', (t) => {
