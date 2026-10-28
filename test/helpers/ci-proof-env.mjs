@@ -15,11 +15,11 @@ export const SPEC = { workflow: '.github/workflows/ci.yml', job: 'Unit tests', e
 export const RUN = { id: 777, attempt: 2, jobId: 888, workflow: '.github/workflows/ci.yml', job: 'Unit tests', url: 'https://github.com/acme/widgets/actions/runs/777' };
 
 // pipeline.yml text: the standard gate yml plus verify keys.
-export const ymlWith = ({ skippable, deferrable = ['unit'], inputs, proof = true } = {}) => {
+export const ymlWith = ({ skippable, deferrable = ['unit'], inputs, proof = true, steps } = {}) => {
   const lines = [];
   if (skippable) lines.push(`  skippable_steps: [${skippable.join(', ')}]`);
   if (deferrable) lines.push(`  deferrable_steps: [${deferrable.join(', ')}]`);
-  if (proof && deferrable) lines.push('  ci_proof:', ...deferrable.flatMap((n) => [`    ${n}:`, '      workflow: .github/workflows/ci.yml', '      job: Unit tests']));
+  if (proof && deferrable) lines.push('  ci_proof:', ...deferrable.flatMap((n) => [`    ${n}:`, '      workflow: .github/workflows/ci.yml', '      job: Unit tests', ...(steps ? [`      steps: [${steps.map((n) => JSON.stringify(n)).join(', ')}]`] : [])]));
   if (inputs) lines.push(`  ci_proof_inputs: [${inputs.join(', ')}]`);
   return ymlFor().replace('  quick: npm run verify:quick\n', `  quick: npm run verify:quick\n${lines.join('\n')}${lines.length ? '\n' : ''}`);
 };

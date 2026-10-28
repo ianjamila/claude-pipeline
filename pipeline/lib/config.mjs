@@ -11,6 +11,10 @@ import { globToRegExp } from './glob.mjs';
 // project repos; run-record.mjs is not) and imported by run-record.mjs, so a config this file accepts always fits the record.
 export const MAX_PROOFS = 20;
 export const MAX_PROOF_STEP = 64;
+// verify.ci_proof.<step>.steps: how many CI job steps one proof may require, and how long a GitHub step name may be (the longest
+// real step names are a short sentence; the cap only keeps a hostile or mistaken config small).
+export const MAX_PROOF_JOB_STEPS = 20;
+export const MAX_PROOF_JOB_STEP_NAME = 200;
 
 function deepFreeze(value) {
   if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
@@ -122,7 +126,7 @@ const KEYS = {
   top: [...Object.keys(DEFAULTS), 'project'],
   worktrees: ['mode', 'protect', 'min_idle_hours', 'min_merged_hours', 'delete', 'archive', 'memory_dirs'],
   verify: ['full', 'quick', 'report', 'screenshots', 'expected_steps', 'skippable_steps', 'stop_queue_wait_minutes', 'after_fix', 'after_fix_steps_by_path', 'after_fix_never', 'max_parallel_full', 'max_load', 'max_load_wait_minutes', 'deferrable_steps', 'ci_proof', 'ci_proof_inputs', 'ci_proof_wait_minutes'],
-  ci_proof: ['workflow', 'job', 'event'],
+  ci_proof: ['workflow', 'job', 'event', 'steps'],
   ci: ['required_checks', 'e2e_label', 'draft_while_iterating', 'guard_checks', 'approvers'],
   merge: ['command', 'wait_minutes'],
   preview: ['environment', 'smoke', 'provider'],
@@ -226,7 +230,9 @@ function checkSlots(verify, errors) {
 
 // Optional. verify.deferrable_steps: steps whose local run the final gate may replace with a GitHub Actions run (a verify report row
 // `skipped` + `skipKind: ci`). verify.ci_proof: { <step>: { workflow, job, event } } names that run by workflow FILE and job (never
-// by a check name alone); every deferrable step needs an entry and every entry a deferrable step. verify.ci_proof_inputs: globs of
+// by a check name alone); every deferrable step needs an entry and every entry a deferrable step. An entry may also carry `steps`:
+// the exact names of steps INSIDE that job that must each have run and succeeded (a job with a step-level skip, e.g. a docs-only
+// PR, reports success although every work step was skipped; ci-proof.mjs rule 5 then refuses the proof). verify.ci_proof_inputs: globs of
 // extra files whose change makes a PR ineligible for CI proof. verify.ci_proof_wait_minutes: how long the ship skill waits for the
 // proof (no default: unset = it does not wait). The GATE reads deferrable_steps / ci_proof / ci_proof_inputs from the base branch.
 export const CI_PROOF_WORKFLOW = /^\.github\/workflows\/[^/]+\.ya?ml$/;
@@ -248,7 +254,7 @@ function checkCiProof(verify, errors) {
     }
   }
   if (proof !== undefined) {
-    if (!isObj(proof)) errors.push('verify.ci_proof must be a mapping of step -> { workflow, job, event }');
+    if (!isObj(proof)) errors.push('verify.ci_proof must be a mapping of step -> { workflow, job, event, steps? }');
     else {
       if (Object.keys(proof).length > MAX_PROOFS) errors.push(`verify.ci_proof has ${Object.keys(proof).length} entries: at most ${MAX_PROOFS}`);
       if (Object.keys(proof).some((n) => n.length > MAX_PROOF_STEP)) errors.push(`verify.ci_proof: step names may be at most ${MAX_PROOF_STEP} characters`);
@@ -266,6 +272,15 @@ function checkCiProof(verify, errors) {
         if (!isStr(spec.job)) errors.push(`${where}.job must be a non-empty job name`);
         if (spec.event === undefined) spec.event = 'pull_request';
         else if (!isStr(spec.event)) errors.push(`${where}.event must be a non-empty event name`);
+        if (spec.steps !== undefined) {
+          const st = spec.steps;
+          if (!Array.isArray(st) || st.length === 0 || !st.every(isStr)) errors.push(`${where}.steps must be a non-empty array of non-empty step names`);
+          else if (new Set(st).size !== st.length) errors.push(`${where}.steps must not repeat a step name`);
+          else {
+            if (st.length > MAX_PROOF_JOB_STEPS) errors.push(`${where}.steps lists ${st.length} steps: at most ${MAX_PROOF_JOB_STEPS}`);
+            if (st.some((n) => n.length > MAX_PROOF_JOB_STEP_NAME)) errors.push(`${where}.steps: step names may be at most ${MAX_PROOF_JOB_STEP_NAME} characters`);
+          }
+        }
       }
       if (deferrableOk) {
         const bare = deferrable.filter((n) => !Object.hasOwn(proof, n));

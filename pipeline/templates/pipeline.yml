@@ -43,6 +43,7 @@ verify:
   #                                # reports them skipped with skipKind "ci"). Needs ci_proof below. The gate reads these settings from the BASE branch.
   # ci_proof:                      # optional: for each deferrable step, the workflow FILE and job that vouch for it (never matched by check name alone)
   #   sql-arms: { workflow: .github/workflows/migration-replay.yml, job: "SQL arms", event: pull_request }   # job: one aggregator job for a sharded matrix
+  #   # optional per entry: steps: ["Typecheck", "Vitest"]   # step names inside the job that must each have run and succeeded (a job with a docs-only skip is green with every step skipped)
   # ci_proof_inputs: ["supabase/tests/sql-arms/**"]   # optional: extra paths that make a PR ineligible (.github/**, .claude/pipeline.yml, scripts/verify* always do)
   # ci_proof_wait_minutes: 20      # optional, above 0: the most ship waits for that run before running the step on the Mac (unset = no waiting)
 
