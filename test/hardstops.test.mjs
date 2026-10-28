@@ -48,7 +48,7 @@ const TABLE = [
   ['20 migration deleted', { files: [file(MIG, { status: 'D', removed: ['create table t(id int);'] })] },
     ['R1-destructive', 'R1-migration-edited']],
   ['21 config path + payroll path', {
-    files: [file('lib/sa-payroll/a.ts')], config: cfg({ paths: ['lib/sa-payroll/**'] }),
+    files: [file('lib/hr-payroll/a.ts')], config: cfg({ paths: ['lib/hr-payroll/**'] }),
   }, ['P-path', 'R6-sensitive']],
   ['22 config pattern on an added line', {
     files: [file('lib/x.ts', { added: ["import faceapi from 'faceapi';"] })],
@@ -85,8 +85,8 @@ for (const [name, input, expected] of TABLE) {
 
 test('removed project auth call (auth_calls) in code -> R2-auth-removed', () => {
   const hits = classify({
-    config: cfg({ auth_calls: ['requireSAScope'] }),
-    files: [file('lib/x.ts', { removed: ['  await requireSAScope(ctx);'] })],
+    config: cfg({ auth_calls: ['requireTeamScope'] }),
+    files: [file('lib/x.ts', { removed: ['  await requireTeamScope(ctx);'] })],
   });
   assert.deepEqual(rulesOf(hits), ['R2-auth-removed']);
   assert.equal(hits[0].file, 'lib/x.ts');
@@ -94,10 +94,10 @@ test('removed project auth call (auth_calls) in code -> R2-auth-removed', () => 
 });
 
 test('auth_calls names are what flag a project-specific guard (no generic pattern matches it)', () => {
-  const f = [file('lib/x.ts', { removed: ['const ids = await getAccessibleDetachmentIds(user);'] })];
+  const f = [file('lib/x.ts', { removed: ['const ids = await getAccessibleTeamIds(user);'] })];
   assert.deepEqual(rulesOf(classify({ config: cfg(), files: f })), []);
   assert.deepEqual(
-    rulesOf(classify({ config: cfg({ auth_calls: ['getAccessibleDetachmentIds'] }), files: f })),
+    rulesOf(classify({ config: cfg({ auth_calls: ['getAccessibleTeamIds'] }), files: f })),
     ['R2-auth-removed'],
   );
 });
