@@ -89,11 +89,17 @@ test('ship teaches reading the job exit code and every prod-watch outcome the CL
   for (const needle of ['behind-base:', 'pre-merge', 'live-check', 'production-unknown', 'mergeSha: null']) assert.ok(table.includes(needle), `gates-and-exits.md must cover ${needle}`);
 });
 
-test('agents: implementer and verifier inherit effort (spec 5.4); judge and arbiter pin it', () => {
+test('agents: implementer and verifier inherit effort (spec 5.4); judge (Sonnet), arbiter (Fable) and Explore (Haiku) pin theirs', () => {
   const front = (doc) => read(doc).split('---')[1];
   assert.ok(!/^effort:/m.test(front('agents/implementer.md')));
   assert.ok(!/^effort:/m.test(front('agents/verifier.md')));
-  assert.match(front('agents/judge.md'), /^effort: high$/m);
+  assert.match(front('agents/judge.md'), /^effort: medium$/m);
+  assert.match(front('agents/judge.md'), /^model: sonnet$/m);
+  assert.match(front('agents/verifier.md'), /^model: haiku$/m);
+  assert.match(front('agents/Explore.md'), /^name: Explore$/m);
+  assert.match(front('agents/Explore.md'), /^model: haiku$/m);
+  assert.match(front('agents/Explore.md'), /^effort: low$/m);
+  assert.match(front('agents/Explore.md'), /^tools: Read, Grep, Glob$/m);
   assert.match(front('agents/arbiter.md'), /^effort: high$/m);
   assert.match(read('agents/judge.md'), /every pending item exactly once/);
 });

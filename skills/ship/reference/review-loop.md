@@ -1,8 +1,11 @@
 # Review loop (ship Step 4)
 
 `P` = `node ~/.claude/pipeline/bin/pipeline.mjs`. Run from the PR worktree. `<pr>` is the pull
-request number, `<round>` the round number (1, 2, 3). One round = one Codex pass + triage + (maybe)
-arbitration + implementation. Max `review.max_rounds` (default 3), + one extra round when the last round's only open items are accepted fixes (`extraRound`). Commands run as jobs report their
+request number, `<round>` the round number (1, 2, 3). One round = one Codex pass + ONE reviewer after it + implementation.
+The reviewer is the `reviewer` that `codex-review` printed: `judge` (a low-risk PR: steps 2–4, then step 5 only for disputes) or
+`fable` (medium/high risk, or a sensitive path: skip steps 2–4, go straight to step 5, which is then the whole review).
+Max `review.max_rounds` (default 2), + one extra round when the last round's only open items are accepted fixes (`extraRound`);
+`codex-review` itself refuses any other round (exit 2 `round-cap`). Commands run as jobs report their
 real code as `exitCode` in `job wait` (see Invariant 8 in `SKILL.md`).
 
 ## Replaying a review (resume, or a second machine)
@@ -99,6 +102,13 @@ possible settle test; no test result yet):
 
 ### 5. Arbiter (at most one call per round)
 
+**Fable round** (`reviewer: fable`): `arbiter needed` returns `mode: review` and `needed: true` even when Codex found nothing — the
+Fable pass rules on every Codex item AND reviews the diff itself (its input names `fable-diff.patch`: the whole PR the first time).
+Call it exactly as below; the prompt's last line is `Read <inputPath>, rule on every item in it and review the diff it names.`
+Its own findings come back as items `R<round>-F<k>` (ACCEPT ⇒ step 6 like any accepted item). The round is not clean until
+`arbiter apply` exits 0 (`state outcome` → `fablePending`): on exit 1 run `arbiter needed` again and call the arbiter once
+more; failing twice ⇒ **park needs-human** (`--cause arbiter:model-proof`). `needed: false, done: true` = already proven.
+
 `P arbiter needed --round <round>` → `{needed, items, inputPath, digest, digest8, tag, promptHeader}`; `tag` is
 `pipeline-arbiter R<round> <digest8>`; `promptHeader` is the two header lines below, ready to paste.
 If `needed`: invoke the `arbiter` agent — **no `model` parameter** — with
@@ -148,8 +158,10 @@ permissions / data-integrity / data-loss item ⇒ `needsHuman` (the CLI applies 
   `duplicates` in the output are reported to the owner, never closed. Then post `P comment --pr <pr> --kind triage`
   AGAIN so the comment carries the issue links.
 - REJECT: nothing (listed in the summary with the reason).
-- Clean exit: `P review-complete --pr <pr>` is only for the resume path (it removes `awaiting-review`
-  after a valid review); the normal loop ends at step 7.
+- Clean exit (step 7 `clean`): `P review-complete --pr <pr>` (after pushing: its HEAD must be the PR's head). It posts the
+  review-complete comment (marker line + JSON `{contentHash, base, head, rounds, codexModel, modelProofDigest}`) and takes
+  `awaiting-review` off. Mark the PR ready (`gh pr ready`) only after it exits 0; exit 1 ⇒ read `reason` (usually a new
+  commit since the last round, or a Fable pass still owed) and go back to the round it names.
 
 ### 7. Exit check
 

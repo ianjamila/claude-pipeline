@@ -36,8 +36,9 @@ export const meta = {
   ].join('\n'),
 };
 
-const JUDGE_MODEL_PREFIX = 'claude-opus-';
-const JUDGE_EFFORT = 'high';
+// agents/judge.md pins the judge to Sonnet at effort medium (low-risk rounds only; a Fable round has no judge).
+const JUDGE_MODEL_PREFIX = 'claude-sonnet-';
+const JUDGE_EFFORT = 'medium';
 
 const forceArbiter = (env) => (env ?? process.env).PIPELINE_TEST_FORCE_ARBITER === '1';
 
@@ -84,6 +85,13 @@ function validate(rest, ctx) {
 function validateLocked(values, n, root, ctx) {
   const state = requireState(root);
   const round = findRound(state, n);
+  // One reviewer layer after Codex: a Fable round's items are ruled by the Fable pass alone (arbiter needed/apply).
+  if (round.fableRequired === true) {
+    throw new Fail(EXIT.USAGE, {
+      ok: false, error: 'fable-round',
+      message: `round ${n} is reviewed by the Fable pass, not the judge: run \`arbiter needed --round ${n}\``,
+    });
+  }
 
   const { text, judgeProof } = judgeOutput(values, ctx);
   const invalid = (errors) => ({

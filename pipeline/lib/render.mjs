@@ -88,8 +88,8 @@ function findingLabel(item) {
 }
 
 const codexView = (item) =>
-  `Codex: ${line(item.bucket)}${item.category ? ` (${line(item.category)})` : ''} — ${line(item.codexReasoning || item.detail, 200)}`;
-const opusView = (item) => (item.judge ? `Opus: ${line(item.judge.decision)} (${line(item.judge.reason)})` : 'Opus: not triaged');
+  `${item.source === 'fable' ? 'Fable finding' : 'Codex'}: ${line(item.bucket)}${item.category ? ` (${line(item.category)})` : ''} — ${line(item.codexReasoning || item.detail, 200)}`;
+const judgeView = (item) => (item.judge ? `Judge: ${line(item.judge.decision)} (${line(item.judge.reason)})` : 'Judge: not triaged');
 
 function fmtModels(p) {
   const m = p.models;
@@ -105,7 +105,7 @@ function outliersSection(entries, modelProofs) {
   const arbitrated = entries.filter(({ item }) => item.arbiter);
   for (const { item } of unique(arbitrated)) {
     const a = item.arbiter;
-    out.push(`- ${findingLabel(item)} · ${codexView(item)} · ${opusView(item)} · Fable: ${line(a.ruling)} (${line(a.confidence)}) — ${line(a.reasoning)}`);
+    out.push(`- ${findingLabel(item)} · ${codexView(item)} · ${judgeView(item)} · Fable: ${line(a.ruling)} (${line(a.confidence)}) — ${line(a.reasoning)}`);
   }
   for (const { item } of unique(entries.filter(({ item: i }) => !i.arbiter && i.judge))) {
     const j = item.judge;
@@ -114,7 +114,7 @@ function outliersSection(entries, modelProofs) {
     const closeCall = item.final?.by !== 'test' && decision === 'REJECT' && j.confidence !== 'high';
     if (!strong && !closeCall) continue;
     const settled = item.final ? `final: ${line(item.final.decision ?? 'unknown')} by ${line(item.final.by)}` : 'final: pending';
-    out.push(`- ${findingLabel(item)} · ${codexView(item)} · ${opusView(item)} · ${settled} _(${strong ? 'strong disagreement' : 'close call'})_`);
+    out.push(`- ${findingLabel(item)} · ${codexView(item)} · ${judgeView(item)} · ${settled} _(${strong ? 'strong disagreement' : 'close call'})_`);
   }
   for (const { item } of unique(entries.filter(({ item: i }) => i.final?.ownerQuote))) {
     out.push(`- ${findingLabel(item)} · Owner (chat): ${line(item.final.decision)} — "${line(item.final.ownerQuote, 300)}"`);

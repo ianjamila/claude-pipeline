@@ -12,7 +12,8 @@ import { canonicalPath, toPosix } from './paths.mjs';
 export { canonicalPath };
 
 export const SKILLS = ['ship', 'verify', 'pipeline-setup'];
-export const AGENTS = ['implementer', 'verifier', 'judge', 'arbiter'];
+// Explore: a Haiku stand-in for Claude Code's built-in Explore agent (same name, so it takes the built-in's place).
+export const AGENTS = ['implementer', 'verifier', 'judge', 'arbiter', 'Explore'];
 export const EXCLUDED_NAMES = new Set(['node_modules', '.DS_Store']);
 // Skipped only directly under the walked root (pipeline/, skills/<name>/): a nested reference/test/ is content.
 export const EXCLUDED_TOP_LEVEL = new Set(['test']);
@@ -34,7 +35,7 @@ export const STACK_DEV_BIND_MATCHER = 'Bash';
 export const HOOK_EVENTS = ['PreToolUse', 'PostToolUse', 'SessionStart', 'SessionEnd', 'UserPromptSubmit'];
 export const STAGING_REL = 'backups/.staging';
 export const TILDE_ALLOW_ENTRY = 'Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)';
-export const SUBAGENT_NOTE = 'Pinned agent models (judge=opus, arbiter=fable) still win over this env var — verified on Claude Code 2.1.285; unpinned subagents use it.';
+export const SUBAGENT_NOTE = 'Pinned agent models (judge=sonnet, arbiter=fable, verifier=haiku, Explore=haiku) still win over this env var — verified on Claude Code 2.1.285; unpinned subagents use it.';
 const MODEL_VAR = 'CLAUDE_CODE_SUBAGENT_MODEL';
 const VERSION_TIMEOUT_MS = 10000;
 const SAFE_ROOTS = new Set(['skills', 'agents', 'pipeline']);

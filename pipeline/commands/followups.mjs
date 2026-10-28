@@ -44,7 +44,9 @@ export function issueBody(item, pr) {
   const lines = [
     String(item.detail ?? '').trim(),
     '',
-    `**Codex reasoning:** ${String(item.codexReasoning ?? '').trim()}`,
+    item.source === 'fable'
+      ? `**Raised by the Fable review:** ${String(item.arbiter?.reasoning ?? '').trim()}`
+      : `**Codex reasoning:** ${String(item.codexReasoning ?? '').trim()}`,
     '',
     `**${decidedBy} (why this is a follow-up, not part of the PR):** ${String(item.final?.reason ?? item.judge?.reason ?? '').trim()}`,
     '',

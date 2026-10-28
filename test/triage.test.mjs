@@ -22,6 +22,10 @@ import {
   applyOwnerRuling,
   isOwnerRuled,
   ownerRuledItems,
+  fablePendingRounds,
+  fableFindingItems,
+  roundCapProblem,
+  FABLE_FINDINGS_MAX,
 } from '../pipeline/lib/triage.mjs';
 
 // ---- fixtures -------------------------------------------------------------------------------
@@ -607,7 +611,7 @@ test('roundOutcome: clean when every item is settled, nothing accepted, and the 
   ];
   const o = roundOutcome(stateOf([round(1, []), round(2, items)]));
   assert.deepEqual(o, {
-    clean: true, openBlocking: [], newAccepted: [], needsHuman: [], pending: [], unimplemented: [], reachedMax: false, extraRound: false, effectiveMaxRounds: 3, coverageValid: true,
+    clean: true, openBlocking: [], newAccepted: [], needsHuman: [], pending: [], unimplemented: [], reachedMax: false, extraRound: false, effectiveMaxRounds: 3, coverageValid: true, fablePending: [],
   });
 });
 
@@ -1157,4 +1161,98 @@ test('arbiterNeeded: judge "medium" confidence needs the arbiter', () => {
   for (const bucket of ['BLOCKING', 'SUGGESTION', 'WORTH_CONSIDERING']) {
     assert.equal(arbiterNeeded(judged(bucket, 'ACCEPT', 'medium')), true, bucket);
   }
+});
+
+// ---- Phase 2: Fable review rounds -----------------------------------------------------------
+
+const fableFinding = (over = {}) => ({
+  bucket: 'BLOCKING', category: 'auth', title: 'role check skipped', file: 'lib/auth.ts', line: 3, detail: 'a guest reaches it',
+  ruling: 'ACCEPT', confidence: 'high', reasoning: 'lib/auth.ts:3 returns early', ...over,
+});
+
+test('fablePendingRounds: a fableRequired round is pending until its arbiter pass is proven; baseOnly and judge rounds never are', () => {
+  const rounds = [
+    round(1, [], 'h1', { fableRequired: true }),
+    round(2, [], 'h2', { fableRequired: true, arbiter: { proofOk: false } }),
+    round(3, [], 'h3', { fableRequired: true, arbiter: { proofOk: true } }),
+    round(4, [], 'h4', { fableRequired: true, baseOnly: true }),
+    round(5, [], 'h-final'),
+  ];
+  assert.deepEqual(fablePendingRounds({ rounds }), [1, 2]);
+  assert.deepEqual(fablePendingRounds(null), []);
+});
+
+test('a sensitive round with ZERO Codex findings is not clean and not valid until the Fable pass is proven', () => {
+  const pending = stateOf([round(1, [], 'h-final', { fableRequired: true })]);
+  const o = roundOutcome(pending);
+  assert.equal(o.clean, false);
+  assert.deepEqual(o.fablePending, [1]);
+  assert.equal(o.extraRound, false);
+  assert.equal(reviewValidFor(pending, 'h-final'), false);
+  const unproven = stateOf([round(1, [], 'h-final', { fableRequired: true, arbiter: { proofOk: false } })]);
+  assert.equal(roundOutcome(unproven).clean, false);
+  const proven = stateOf([round(1, [], 'h-final', { fableRequired: true, arbiter: { proofOk: true } })]);
+  assert.equal(roundOutcome(proven).clean, true);
+  assert.equal(reviewValidFor(proven, 'h-final'), true);
+  // An earlier pending round blocks too: the clean last round does not vouch for it.
+  const early = stateOf([round(1, [], 'h1', { fableRequired: true }), round(2, [], 'h-final', { fableRequired: true, arbiter: { proofOk: true } })]);
+  assert.equal(reviewValidFor(early, 'h-final'), false);
+});
+
+test('validateRulings review mode: findings are required (an empty list is fine) and checked; dispute mode refuses them', () => {
+  assert.equal(validateRulings({ rulings: [], findings: [] }, [], { review: true }).ok, true);
+  assert.equal(validateRulings({ rulings: [], findings: [fableFinding()] }, [], { review: true }).ok, true);
+  const missing = validateRulings({ rulings: [] }, [], { review: true });
+  assert.equal(missing.ok, false);
+  assert.match(missing.errors.join('|'), /findings must be an array/);
+  assert.match(validateRulings({ rulings: [], findings: [] }, []).errors.join('|'), /only accepted in a Fable review round/);
+  const bad = [
+    [{ ruling: 'REJECT' }, /ruling must be one of ACCEPT\|FOLLOW-UP/],
+    [{ bucket: 'blocking' }, /bucket must be one of/],
+    [{ category: 'Security' }, /category must be one of/],
+    [{ line: -1 }, /line must be an integer/],
+    [{ line: 1.5 }, /line must be an integer/],
+    [{ title: ' ' }, /title must be a non-empty string/],
+    [{ confidence: 'sure' }, /confidence must be one of/],
+    [{ file: null }, /file must be a string/],
+    [{ extra: 1 }, /unexpected key "extra"/],
+    [{ detail: 'x'.repeat(4001) }, /longer than 4000/],
+  ];
+  for (const [over, re] of bad) {
+    const r = validateRulings({ rulings: [], findings: [fableFinding(over)] }, [], { review: true });
+    assert.equal(r.ok, false, JSON.stringify(over));
+    assert.match(r.errors.join('|'), re, JSON.stringify(over));
+  }
+  const many = Array.from({ length: FABLE_FINDINGS_MAX + 1 }, () => fableFinding());
+  assert.match(validateRulings({ rulings: [], findings: many }, [], { review: true }).errors.join('|'), /at most 20 findings/);
+});
+
+test('fableFindingItems: ids R<n>-F<k>, ruled by the arbiter; low confidence or a deferred blocking security finding -> human', () => {
+  const items = fableFindingItems([
+    fableFinding(),
+    fableFinding({ bucket: 'SUGGESTION', category: 'maintainability', ruling: 'FOLLOW-UP' }),
+    fableFinding({ confidence: 'low' }),
+    fableFinding({ ruling: 'FOLLOW-UP' }),
+  ], 2, { transcript: '/t.jsonl', fingerprintFor: (f) => `fp:${f.title}` });
+  assert.deepEqual(items.map((i) => i.id), ['R2-F1', 'R2-F2', 'R2-F3', 'R2-F4']);
+  assert.ok(items.every((i) => i.source === 'fable' && i.round === 2 && i.final.by === 'arbiter' && i.fingerprint === 'fp:role check skipped'));
+  assert.deepEqual(items.map((i) => [i.final.decision, i.final.needsHuman]), [['ACCEPT', false], ['FOLLOW-UP', false], ['ACCEPT', true], ['FOLLOW-UP', true]]);
+  assert.equal(items[0].arbiter.transcript, '/t.jsonl');
+  assert.throws(() => fableFindingItems([fableFinding({ ruling: 'REJECT' })], 1), /invalid findings/);
+  assert.throws(() => fableFindingItems([], 0), /invalid round/);
+  // A proven ACCEPT finding is new work: the round is not clean until it is fixed and reviewed again.
+  const s = stateOf([round(1, fableFindingItems([fableFinding()], 1), 'h-final', { fableRequired: true, arbiter: { proofOk: true } })]);
+  assert.equal(roundOutcome(s).clean, false);
+  assert.deepEqual(roundOutcome(s).openBlocking, ['R1-F1']);
+});
+
+test('roundCapProblem: rounds stop at maxRounds plus ONE extra confirm round, only when roundOutcome grants it', () => {
+  const fixedAccept = (n) => item({ id: `R${n}-B1`, round: n, final: settled('ACCEPT'), implemented: true });
+  const twoRounds = (last) => ({ rounds: [round(1, []), round(2, [last])], maxRounds: 2, currentContentHash: 'h-new' });
+  assert.equal(roundCapProblem(twoRounds(fixedAccept(2)), 2), null);
+  assert.equal(roundCapProblem(twoRounds(fixedAccept(2)), 3), null); // extraRound: only accepted, fixed items open
+  assert.match(roundCapProblem(twoRounds(item({ id: 'R2-B1', final: null })), 3), /only one extra round is allowed/);
+  const three = { rounds: [round(1, []), round(2, [fixedAccept(2)]), round(3, [fixedAccept(3)])], maxRounds: 2, currentContentHash: 'h-new' };
+  assert.match(roundCapProblem(three, 4), /and its one extra round/);
+  assert.equal(roundCapProblem({ rounds: [] }, 9), null); // not capped without a finite maxRounds
 });

@@ -199,17 +199,17 @@ test('summaryComment: the order holds even when everything is empty', () => {
   assert.ok(section(body, '### Outcome').includes('**blocked**'));
 });
 
-test('summaryComment: Outliers lists arbiter rulings as finding · Codex · Opus · Fable', () => {
+test('summaryComment: Outliers lists arbiter rulings as finding · Codex · Judge · Fable', () => {
   const out = section(summaryComment(richState(), richOpts()), '### Outliers');
   const line = out.split('\n').find((l) => l.includes('R1-B1'));
   assert.ok(line.includes('Missing auth check'), line);
   assert.ok(line.includes('app/x.ts:7'), line);
   assert.ok(line.includes(' · Codex: BLOCKING'), line);
   assert.ok(line.includes('anyone can call it'), line);
-  assert.ok(line.includes(' · Opus: REJECT (middleware covers it)'), line);
+  assert.ok(line.includes(' · Judge: REJECT (middleware covers it)'), line);
   assert.ok(line.includes(' · Fable: ACCEPT (high) — middleware skips this route'), line);
-  // finding comes first, then Codex, then Opus, then Fable.
-  assert.ok(line.indexOf('Codex:') < line.indexOf('Opus:') && line.indexOf('Opus:') < line.indexOf('Fable:'));
+  // finding comes first, then Codex, then Judge, then Fable.
+  assert.ok(line.indexOf('Codex:') < line.indexOf('Judge:') && line.indexOf('Judge:') < line.indexOf('Fable:'));
 });
 
 test('summaryComment: Outliers carries the model-proof lines', () => {

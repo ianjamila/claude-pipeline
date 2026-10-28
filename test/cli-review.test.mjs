@@ -87,6 +87,9 @@ function world(t, { gh = GH, light = false, yml = pipelineYml() } = {}) {
   const repo = createTmpRepo();
   t.after(() => repo.cleanup());
   repo.write('.claude/pipeline.yml', yml);
+  // As pipeline-setup leaves a real repo: the review's own files are never part of a commit (a fix commit would
+  // otherwise carry .review/ and look like a big, medium-risk change).
+  repo.write('.gitignore', '.review/\n');
   repo.write('src/a.js', aFile(false));
   repo.write('src/b.js', bFile);
   const base = repo.commit('init');
@@ -214,7 +217,10 @@ test('codex-review: a valid findings file becomes round 1 with ids, state, codex
   assert.equal(r.json.path, join(w.repo.dir, '.review', 'round-1'));
 
   const state = w.state();
-  assert.deepEqual([state.pr, state.repo, state.branch, state.risk, state.lightLane, state.maxRounds], [7, 'acme/widgets', 'feat/x', 'low', false, 3]);
+  assert.deepEqual([state.pr, state.repo, state.branch, state.risk, state.lightLane, state.maxRounds], [7, 'acme/widgets', 'feat/x', 'low', false, 2]);
+  assert.equal(r.json.reviewer, 'judge', 'a low-risk PR with no sensitive path is triaged by the judge');
+  assert.equal(state.reviewer, 'judge');
+  assert.deepEqual([state.rounds[0].fableRequired, state.rounds[0].codexModel, state.rounds[0].forkPoint], [undefined, 'gpt-6-astra', w.base]);
   const round = state.rounds[0];
   assert.deepEqual([round.n, round.fromHead, round.toHead], [1, w.base, w.head]);
   assert.equal(round.contentHashAtToHead, contentHash('main', 'HEAD', { cwd: w.repo.dir, exclude: ['docs/agent-log.md'] }));
@@ -612,7 +618,7 @@ test('codex-review: when the code around a ruled finding changed, the ruling is 
 
 const JUDGE_TAG = 'pipeline-judge R1 abcd1234';
 
-function judgeTranscript(w, decisions, { model = 'claude-opus-5-1', effort = 'high', agentType = 'judge' } = {}) {
+function judgeTranscript(w, decisions, { model = 'claude-sonnet-5-5', effort = 'medium', agentType = 'judge' } = {}) {
   const items = Object.entries(decisions).map(([id, [decision, confidence = 'high']]) => ({
     id, decision, confidence, reason: `judge: ${decision} ${id}`, disputedBug: false, settleTest: { possible: false, plan: '' },
   }));
@@ -647,11 +653,11 @@ test('triage validate --from-tag: the judge JSON is read from the transcript and
 test('triage validate: a judge transcript on the wrong model is only a recorded warning, the decisions still apply', (t) => {
   const w = world(t);
   assertExit(w.codex(1, standardFindings()), 0);
-  const projects = judgeTranscript(w, STANDARD_JUDGE, { model: 'claude-sonnet-5-5' });
+  const projects = judgeTranscript(w, STANDARD_JUDGE, { model: 'claude-opus-5-5' });
   const r = w.cli(['triage', 'validate', '--round', '1', '--from-tag', JUDGE_TAG, '--projects-dir', projects]);
   assertExit(r, 0);
   assert.equal(r.json.judgeProof.ok, false);
-  assert.ok(r.json.judgeProof.errors.some((e) => /unexpected model claude-sonnet-5-5/.test(e)));
+  assert.ok(r.json.judgeProof.errors.some((e) => /unexpected model claude-opus-5-5/.test(e)));
   assert.equal(w.item('R1-B1').final.decision, 'ACCEPT');
 });
 
@@ -783,7 +789,7 @@ test('arbiter needed: nothing to arbitrate is {needed:false}; otherwise writes t
   assertExit(w.codex(1, standardFindings()), 0);
   const untriaged = w.cli(['arbiter', 'needed', '--round', '1']);
   assertExit(untriaged, 0);
-  assert.deepEqual(untriaged.json, { needed: false, items: [] });
+  assert.deepEqual(untriaged.json, { needed: false, items: [], mode: 'dispute' });
   assert.ok(!existsSync(w.roundFile(1, 'arbiter-input.md')));
 
   assertExit(w.judge(1, STANDARD_JUDGE), 0);
@@ -810,7 +816,7 @@ test('arbiter needed: nothing to arbitrate is {needed:false}; otherwise writes t
   assert.ok(!text.includes('## R1-B1') && !text.includes('## R1-W1'), 'only items that need the arbiter are in the input');
 
   const stored = w.state().rounds[0].arbiter;
-  assert.deepEqual(stored, { inputDigest: r.json.digest, items: ['R1-S1', 'R1-S2'], tag: r.json.tag });
+  assert.deepEqual(stored, { inputDigest: r.json.digest, items: ['R1-S1', 'R1-S2'], tag: r.json.tag, mode: 'dispute' });
   assert.equal(w.cli(['arbiter', 'needed', '--round', '1']).json.digest, r.json.digest, 'deterministic for unchanged state');
 });
 
@@ -1257,8 +1263,8 @@ test('state outcome: a round with nothing to fix is clean; coverage follows the 
   assert.equal(clean.json.clean, true);
   assert.equal(clean.json.coverageValid, true);
   assert.equal(clean.json.currentContentHash, w.state().rounds[0].contentHashAtToHead);
-  assert.deepEqual([clean.json.rounds, clean.json.maxRounds, clean.json.reachedMax], [1, 3, false]);
-  assert.deepEqual([clean.json.extraRound, clean.json.effectiveMaxRounds], [false, 3]);
+  assert.deepEqual([clean.json.rounds, clean.json.maxRounds, clean.json.reachedMax], [1, 2, false]);
+  assert.deepEqual([clean.json.extraRound, clean.json.effectiveMaxRounds], [false, 2]);
 
   // content changed after the review: exit stays 0, clean turns false
   w.repo.write('src/b.js', `${bFile}export const extra = 1;\n`);
@@ -1331,9 +1337,17 @@ test('state show --pr rebuilds a lost state from the newest triage comment of ou
 // ---- review-complete --------------------------------------------------------------------------
 
 const REMOVE_LABEL = { match: '^pr edit 7 --remove-label awaiting-review', code: 0 };
+// What review-complete asks and posts: who we are, our earlier comments (none), then the new marker comment.
+const REVIEW_COMMENT = [
+  { match: '^api user', stdout: 'me\n' },
+  { match: 'issues/7/comments --paginate', stdoutJson: [] },
+  { match: '^api -X POST repos/acme/widgets/issues/7/comments ', stdoutJson: { id: 77, html_url: 'https://github.com/acme/widgets/pull/7#issuecomment-77' } },
+];
+const postedBodies = (w) => w.fake.calls().filter((c) => /^api -X POST repos\/acme\/widgets\/issues\/7\/comments /.test(c.argv.join(' '))).map((c) => JSON.parse(c.stdin).body);
+const reviewJson = (body) => JSON.parse(/```json\n(.*)\n```/.exec(body)[1]);
 
 test('review-complete: removes awaiting-review only when the review is valid for the current content', (t) => {
-  const w = world(t, { gh: [...GH, REMOVE_LABEL] });
+  const w = world(t, { gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT] });
   assertExit(w.cli(['review-complete', '--pr', '7']), 1, 'no state: no review has run');
   assertExit(w.codex(1, findingsOf()), 0);
 
@@ -1356,7 +1370,7 @@ test('review-complete: removes awaiting-review only when the review is valid for
 });
 
 test('review-complete: unresolved items or an unimplemented ACCEPT keep the label', (t) => {
-  const w = world(t, { gh: [...GH, REMOVE_LABEL] });
+  const w = world(t, { gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT] });
   assertExit(w.codex(1, findingsOf([finding()])), 0);
   const pending = w.cli(['review-complete', '--pr', '7']);
   assertExit(pending, 1);
@@ -1370,7 +1384,7 @@ test('review-complete: unresolved items or an unimplemented ACCEPT keep the labe
 });
 
 test('review-complete: Codex outage then recovery (exit 3, then a clean review, then the label comes off)', (t) => {
-  const w = world(t, { gh: [...GH, REMOVE_LABEL] });
+  const w = world(t, { gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT] });
   const outage = w.codex(1, findingsOf(), { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_STDERR: 'usage limit reached' } });
   assertExit(outage, 3);
   assertExit(w.cli(['review-complete', '--pr', '7']), 1, 'nothing was reviewed yet');
@@ -1381,9 +1395,141 @@ test('review-complete: Codex outage then recovery (exit 3, then a clean review, 
 });
 
 test('review-complete: a gh failure while removing the label is exit 3, not success', (t) => {
-  const w = world(t, { gh: [...GH, { match: '^pr edit', code: 1, stderr: 'HTTP 502' }] });
+  const w = world(t, { gh: [...GH, ...REVIEW_COMMENT, { match: '^pr edit', code: 1, stderr: 'HTTP 502' }] });
   assertExit(w.codex(1, findingsOf()), 0);
   assertExit(w.cli(['review-complete', '--pr', '7']), 3);
+});
+
+test('review-complete: posts the marker comment with {contentHash, base, head, rounds, codexModel, modelProofDigest}; an identical one is reused', (t) => {
+  const w = world(t, { gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT] });
+  assertExit(w.codex(1, findingsOf()), 0);
+  const r = w.cli(['review-complete', '--pr', '7']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.posted, true);
+  assert.deepEqual(r.json.comment, { id: 77, url: 'https://github.com/acme/widgets/pull/7#issuecomment-77' });
+  const [body] = postedBodies(w);
+  assert.ok(body.startsWith('<!-- claude-pipeline:review-complete v1 -->\n'), body);
+  const record = reviewJson(body);
+  assert.deepEqual(Object.keys(record), ['contentHash', 'base', 'head', 'rounds', 'codexModel', 'modelProofDigest']);
+  assert.deepEqual(record, {
+    contentHash: w.state().rounds[0].contentHashAtToHead, base: w.base, head: w.head, rounds: 1, codexModel: 'gpt-6-astra', modelProofDigest: null,
+  });
+  assert.deepEqual(r.json.review, record);
+  // The hash is the one a guard can recompute from git alone: contentHash(base, head) minus the agent log.
+  assert.equal(record.contentHash, contentHash(record.base, record.head, { cwd: w.repo.dir, exclude: ['docs/agent-log.md'] }));
+
+  // A retry finds our own identical latest comment and posts nothing new; someone else's copy does not count.
+  w.fake.setScript([
+    ...GH.map((e) => (e.match === '^pr view 7' ? { ...e, stdoutJson: { baseRefName: 'main', headRefOid: w.head, ...e.stdoutJson } } : e)),
+    REMOVE_LABEL,
+    { match: '^api user', stdout: 'me\n' },
+    { match: 'issues/7/comments --paginate', stdoutJson: [{ id: 76, user: { login: 'mallory' }, body: 'x' }, { id: 77, user: { login: 'me' }, body, html_url: 'u77' }] },
+  ]);
+  const again = w.cli(['review-complete', '--pr', '7']);
+  assertExit(again, 0, again.stdout);
+  assert.deepEqual([again.json.reused, again.json.comment], [true, { id: 77, url: 'u77' }]);
+  assert.equal(postedBodies(w).length, 1);
+});
+
+// A world whose only change is to a path the config sends to Fable every round, at low risk.
+const SENSITIVE_YML = `${pipelineYml()}review:\n  arbiter_always_paths: [src/a.js]\n`;
+const FABLE_CLEAN = { rulings: [], findings: [] };
+
+test('a sensitive PR with ZERO Codex findings still requires the Fable pass: not clean, no review-complete, until a proven pass', (t) => {
+  const w = world(t, { gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT], yml: SENSITIVE_YML });
+  const r = w.codex(1, findingsOf());
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.reviewer, r.json.reviewerReasons, r.json.lightLane], ['fable', ['sensitive path: src/a.js'], false]);
+  assert.equal(w.state().risk, 'low', 'the lane, not the risk level, sends it to Fable');
+  assert.deepEqual(w.state().rounds[0].sensitivePaths, ['src/a.js']);
+  // Codex was given the attacker's brief for the sensitive file.
+  assert.match(w.captured()[0].stdin, /## Attacker's brief[\s\S]*```sensitive paths\nsrc\/a\.js\n```/);
+
+  const pending = w.cli(['state', 'outcome']).json;
+  assert.deepEqual([pending.clean, pending.fablePending], [false, [1]]);
+  const early = w.cli(['review-complete', '--pr', '7']);
+  assertExit(early, 1);
+  assert.match(early.json.reason, /Fable review pass has not been proven for round 1/);
+  assert.equal(postedBodies(w).length, 0);
+  const judged = w.judge(1, {});
+  assertExit(judged, 2);
+  assert.equal(judged.json.error, 'fable-round', 'one reviewer layer: no judge on a Fable round');
+
+  const needed = w.cli(['arbiter', 'needed', '--round', '1']);
+  assertExit(needed, 0, needed.stdout);
+  assert.deepEqual([needed.json.needed, needed.json.mode, needed.json.items, needed.json.scope], [true, 'review', [], 'whole-pr']);
+  const input = readFileSync(needed.json.inputPath, 'utf8');
+  assert.match(input, /Mode: REVIEW/);
+  assert.match(input, /your own review is the whole job/);
+  assert.match(input, /Sensitive files \(attack them/);
+  const diff = readFileSync(needed.json.diffPath, 'utf8');
+  assert.match(diff, /compute\(x\.y\)/, 'the whole PR diff is what Fable reviews');
+  assert.ok(input.includes(`Diff sha256: ${sha256(diff)}`));
+
+  // An answer without its own review (no findings list) does not count: the round stays pending.
+  assertExit(arbiterRun(w, { text: fenced({ rulings: [] }) }), 1);
+  assert.deepEqual(w.cli(['state', 'outcome']).json.fablePending, [1]);
+  // A diff edited after needed fails the proof too.
+  assertExit(w.cli(['arbiter', 'needed', '--round', '1']), 0);
+  writeFileSync(w.state().rounds[0].arbiter.diffPath, 'nothing to see\n');
+  const tampered = arbiterRun(w, { text: fenced(FABLE_CLEAN) });
+  assertExit(tampered, 1);
+  assert.ok(tampered.json.errors.some((e) => /no longer matches the digest/.test(e)), JSON.stringify(tampered.json.errors));
+
+  // needed again (rewrites the diff), then a proven, clean Fable pass: clean, and review-complete carries the proof digest.
+  assertExit(w.cli(['arbiter', 'needed', '--round', '1']), 0);
+  const proven = arbiterRun(w, { text: fenced(FABLE_CLEAN) });
+  assertExit(proven, 0, proven.stdout);
+  assert.deepEqual([proven.json.mode, proven.json.findings], ['review', []]);
+  assert.equal(w.cli(['state', 'outcome']).json.clean, true);
+  assert.deepEqual(w.cli(['arbiter', 'needed', '--round', '1']).json, { needed: false, items: [], mode: 'review', done: true });
+  const done = w.cli(['review-complete', '--pr', '7']);
+  assertExit(done, 0, done.stdout);
+  assert.match(reviewJson(postedBodies(w).at(-1)).modelProofDigest, /^[0-9a-f]{64}$/);
+});
+
+test('Fable review: its own findings become items R<n>-F<k>; Codex items are ruled in the same pass; an ACCEPT reopens the loop', (t) => {
+  const w = world(t, { yml: SENSITIVE_YML });
+  assertExit(w.codex(1, findingsOf([], [finding({ title: 'Rename helper', file: 'src/b.js', line: 3, category: 'maintainability' })])), 0);
+  const needed = w.cli(['arbiter', 'needed', '--round', '1']);
+  assert.deepEqual([needed.json.mode, needed.json.items], ['review', ['R1-S1']], 'an untriaged Codex item goes straight to Fable');
+  const answer = {
+    rulings: [{ id: 'R1-S1', ruling: 'REJECT', confidence: 'high', reasoning: 'src/b.js:3 is fine' }],
+    findings: [{
+      bucket: 'BLOCKING', category: 'bug', title: 'x can be undefined', file: 'src/a.js', line: 12, detail: 'compute(x.y) with x undefined throws',
+      ruling: 'ACCEPT', confidence: 'high', reasoning: 'src/a.js:12 dereferences x',
+    }],
+  };
+  const r = arbiterRun(w, { text: fenced(answer) });
+  assertExit(r, 0, r.stdout);
+  assert.deepEqual(r.json.findings, [{ id: 'R1-F1', bucket: 'BLOCKING', ruling: 'ACCEPT', needsHuman: false }]);
+  assert.equal(w.item('R1-S1').final.decision, 'REJECT');
+  const f1 = w.item('R1-F1');
+  assert.deepEqual([f1.source, f1.final.by, f1.file, f1.line], ['fable', 'arbiter', 'src/a.js', 12]);
+  assert.match(f1.fingerprint, /^[0-9a-f]{40}$/);
+  const o = w.cli(['state', 'outcome']).json;
+  assert.deepEqual([o.clean, o.openBlocking, o.newAccepted], [false, ['R1-F1'], ['R1-F1']]);
+  assert.deepEqual(JSON.parse(readFileSync(w.roundFile(1, 'rulings.json'), 'utf8')).findings, answer.findings);
+});
+
+test('codex-review: rounds stop at review.max_rounds plus ONE extra confirm round (exit 2 round-cap)', (t) => {
+  const w = world(t, { yml: `${pipelineYml()}review:\n  max_rounds: 1\n` });
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
+  w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
+  const head2 = w.repo.commit('fix');
+  assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']), 0);
+  const extra = w.codex(2, findingsOf([finding({ title: 'Another', file: 'src/b.js', line: 2 })]), { from: w.head, to: head2 });
+  assertExit(extra, 0, 'the one confirm round: round 1 only accepted a fix');
+  assertExit(w.judge(2, { 'R2-B1': ['ACCEPT'] }), 0);
+  w.repo.write('src/b.js', bFile.replace('w2 = 2', 'w2 = 22'));
+  const head3 = w.repo.commit('fix 2');
+  assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R2-B1']), 0);
+  const capped = w.codex(3, findingsOf(), { from: head2, to: head3 });
+  assertExit(capped, 2, capped.stdout);
+  assert.equal(capped.json.error, 'round-cap');
+  assert.match(capped.json.message, /review\.max_rounds \(1\) and its one extra round/);
+  assert.equal(w.captured().length, 2, 'Codex never ran for the capped round');
 });
 
 // ---- followups create -------------------------------------------------------------------------
@@ -1690,7 +1836,7 @@ test('followups create: a finding already filed (any round, cache reuse or not) 
 // -- review-complete
 
 test('review-complete: refuses when the local HEAD is not the head GitHub holds for the PR', (t) => {
-  const w = world(t, { gh: [...GH, REMOVE_LABEL] });
+  const w = world(t, { gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT] });
   assertExit(w.codex(1, findingsOf()), 0);
   w.prHead('0'.repeat(40));
   const r = w.cli(['review-complete', '--pr', '7']);
@@ -1703,7 +1849,7 @@ test('review-complete: refuses when the local HEAD is not the head GitHub holds 
 });
 
 test('review-complete: reads the labels back and exits 3 when awaiting-review is still on the PR', (t) => {
-  const w = world(t, { gh: [{ match: '^pr view 7 --json labels', stdoutJson: { labels: [{ name: 'awaiting-review' }, { name: 'agent-build' }] } }, ...GH, REMOVE_LABEL] });
+  const w = world(t, { gh: [{ match: '^pr view 7 --json labels', stdoutJson: { labels: [{ name: 'awaiting-review' }, { name: 'agent-build' }] } }, ...GH, REMOVE_LABEL, ...REVIEW_COMMENT] });
   assertExit(w.codex(1, findingsOf()), 0);
   const r = w.cli(['review-complete', '--pr', '7']);
   assertExit(r, 3, r.stdout);
@@ -1714,10 +1860,8 @@ test('review-complete: reads the labels back and exits 3 when awaiting-review is
 });
 
 test('review-complete: a clean first round does not count once a later round accepted something (R3\')', (t) => {
-  const w = world(t, { gh: [...GH, REMOVE_LABEL] });
-  w.repo.write('.gitignore', '.review/\n'); // keep the state files out of the commits below, so the content hash is only the code
-  const head1 = w.repo.commit('ignore the review directory');
-  w.prHead(head1);
+  const w = world(t, { gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT] });
+  const head1 = w.head; // the world already ignores .review/, so the content hash is only the code
   assertExit(w.codex(1, findingsOf(), { to: head1 }), 0);
   w.repo.write('src/c.js', 'export const c = 1;\n');
   const head2 = w.repo.commit('more');
@@ -1787,7 +1931,7 @@ test('codex-review: a round recorded while Codex was running is not overwritten 
 });
 
 test('every command that changes the review state waits for the per-PR lock (and gives up with exit 2 lock-timeout)', async (t) => {
-  const w = world(t, { gh: [...GH, REMOVE_LABEL] });
+  const w = world(t, { gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT] });
   assertExit(w.codex(1, standardFindings()), 0);
   assertExit(w.judge(1, STANDARD_JUDGE), 0);
   assert.equal(w.cli(['arbiter', 'needed', '--round', '1']).json.needed, true);

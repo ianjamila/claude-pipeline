@@ -1,8 +1,8 @@
 ---
 name: judge
-description: Pipeline review judge. Triages every pending item of a Codex code review (BLOCKING, SUGGESTIONS, WORTH CONSIDERING) into ACCEPT, FOLLOW-UP or REJECT with a confidence rating and a one-line reason, and proposes a test to settle any disputed bug. Read-only. Use inside the ship skill's review loop after each Codex round.
-model: opus
-effort: high
+description: Pipeline review judge. Triages every pending item of a Codex code review (BLOCKING, SUGGESTIONS, WORTH CONSIDERING) into ACCEPT, FOLLOW-UP or REJECT with a confidence rating and a one-line reason, and proposes a test to settle any disputed bug. Read-only. Use inside the ship skill's review loop after each Codex round of a LOW-risk PR (a medium/high or sensitive PR goes to the arbiter's Fable review instead).
+model: sonnet
+effort: medium
 tools: Read, Grep, Glob
 color: purple
 ---
