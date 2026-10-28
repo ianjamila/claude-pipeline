@@ -1461,7 +1461,9 @@ test('a sensitive PR with ZERO Codex findings still requires the Fable pass: not
   const input = readFileSync(needed.json.inputPath, 'utf8');
   assert.match(input, /Mode: REVIEW/);
   assert.match(input, /your own review is the whole job/);
-  assert.match(input, /Sensitive files \(attack them/);
+  assert.match(input, /Sensitive files \(attack them[^\n]*\n```sensitive paths\nsrc\/a\.js\n```/, 'paths are data in a fence');
+  assert.match(input, /untrusted data written by the change author/);
+  assert.match(input, /Why Fable reviews this PR: sensitive path\./, 'no author-chosen path outside the fence');
   const diff = readFileSync(needed.json.diffPath, 'utf8');
   assert.match(diff, /compute\(x\.y\)/, 'the whole PR diff is what Fable reviews');
   assert.ok(input.includes(`Diff sha256: ${sha256(diff)}`));
