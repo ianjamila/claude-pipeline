@@ -3,6 +3,8 @@
 // pipeline files (skills, agents, ~/.claude/pipeline, ~/.claude/settings.json), delete or overwrite the dirs
 // that hold them (~/.claude, ~/.claude/skills, ~/.claude/agents), switch hooks off (`disableAllHooks`) or set
 // the admin switch (`PIPELINE_ADMIN`). Only a Claude Code process launched with PIPELINE_ADMIN=1 bypasses it.
+// It also keeps agents from writing a repo's review state (.review/state.json and the proofs beside it, in any directory: see
+// REVIEW_FILE_SRC), which only the pipeline commands write.
 // Bash is judged on text, so the checks lean towards denying (`rm ~/.claude/pipeline`, `cp x ~/.claude/pipeline`); echo/printf are
 // read-only (their redirects are still judged) and the value of a message flag (git -m, gh --body, a test runner's -t) is prose; the hook
 // stops accidents and casual circumvention, not an adversary who builds the path out of pieces at run time.
@@ -28,7 +30,7 @@ const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
 const MAX_LINE_CHARS = 200_000; // a longer command line is not parsed (the hook has a 15 s budget)
 // What an unparsed or truncated line is judged by: any word that names a protected file, a switch or an installer.
-const SENSITIVE_WORDS = /\.claude|PIPELINE_ADMIN|disableAllHooks|CLAUDECODE|install\.|\bprotect\b/i;
+const SENSITIVE_WORDS = /\.claude|PIPELINE_ADMIN|disableAllHooks|CLAUDECODE|install\.|\bprotect\b|\.review\W+(?:state|round-|final-gate|prod-before|[\w.-]*smoke)/i;
 
 // ---- the protected set ------------------------------------------------------------------------
 
@@ -50,6 +52,26 @@ const PROTECTED_REL = [
 // replacing, deleting, moving or running a repo command in them reaches the protected files, so for a
 // non-read-only command a word that IS one of these (exactly, not a child) counts as a protected reference.
 const ANCESTOR_REL = ['.claude', '.claude/skills', '.claude/agents', '.claude/pipeline-state'];
+
+// Phase 3b (Fable attacker pass on #107): a repo's review state and the proofs beside it. `pipeline review-complete` trusts
+// .review/state.json (a clean review of the current content there is what lets it post the review-complete comment that the
+// `Cross-model review` status is read from), and the gate and merge read the rest. Only pipeline commands write them, from their own
+// process, which this hook never sees; an agent that hand-wrote them would get a genuine comment for a review that never ran.
+// Protected in ANY directory (each checkout and worktree has its own .review/), by name: state.json (and its tmp files), every
+// round-<n>/ folder (codex.json, diff.patch, arbiter-input.md, model-proof.json …), final-gate.json, <target>-smoke.json and
+// prod-before.json. The .review folder itself is the directory that holds them (replacing or moving it reaches them); `mkdir` of it
+// stays allowed, as it only makes an empty folder (the ship skill runs `mkdir -p .review`, then writes hardstops.json, which the
+// agent produces itself and is not protected). The state's other source, the PR triage comment, is guarded in git-policy.mjs.
+const REVIEW_FILE_SRC = String.raw`(?:^|/)\.review/(?:state\.json(?:\.[^/]*)?|round-\d+(?:/.*)?|final-gate\.json(?:\.[^/]*)?|[^/]+-smoke\.json(?:\.[^/]*)?|prod-before\.json(?:\.[^/]*)?)$`;
+const REVIEW_DIR_SRC = String.raw`(?:^|/)\.review/*$`;
+// One name of each kind, for globs: a glob that can match one of them can match a protected file.
+const REVIEW_SAMPLES = ['state.json', 'state.json.1.tmp', 'round-1', 'final-gate.json', 'preview-smoke.json', 'production-smoke.json', 'prod-before.json'];
+// A wildcard matches a name that starts with a dot (the .review folder) only when the line may switch that on: bash dotglob (shopt, or
+// BASHOPTS), zsh globdots / GLOB_DOTS, GLOBIGNORE (bash then matches dot names), a zsh (D) glob qualifier. Otherwise only a segment that
+// itself starts with a dot can match it (`.r*`, `.review`), as in every shell.
+const DOT_GLOB = { test: (s) => /dotglob|glob_?dots|GLOBIGNORE/i.test(s) || /\([^)\s]*D[^)\s]*\)/.test(s) };
+// The same names in command or program text, wherever they sit (a literal path, or one built from pieces: '.review', 'state.json').
+const reviewTextBody = (sep) => `(?<![\\w.\\-])\\.review${sep}(?:state\\.json|round-\\d+(?![\\w.\\-])|final-gate\\.json|[\\w.\\-]*-smoke\\.json|prod-before\\.json)`;
 
 // Why: a name assigned from a changed name is changed too (`X=$D; echo x > $X/s`, `E=$D bash w.sh`): the assignments of the line (a bare `NAME=value`, a declaration's
 // `NAME=value`) and `extra` (the prefix values of the command a child frame is started by) taint the name they set, until nothing new is added.
@@ -211,6 +233,10 @@ function makeCtx(opts) {
   // (the whole tree below ~/.claude, not just the protected entries and the directories that hold them: a `..` from projects/ climbs back to them)
   const treeRoots = unique([...withWindowsAliases([`${base}/.claude`], homePosix, platform), realResolve(`${base}/.claude`, api)]);
   const ci = caseInsensitive(platform);
+  const reviewFile = new RegExp(REVIEW_FILE_SRC, ci ? 'i' : '');
+  const reviewDir = new RegExp(REVIEW_DIR_SRC, ci ? 'i' : '');
+  const pipelineHit = (p) => { const q = unFirm(p); return roots.some((r) => isInside(q, r, platform)); };
+  const pipelineAncestor = (p) => { const q = unFirm(p); return ancestors.some((a) => samePath(q, a, platform)); };
   let rootIds = null;
   return {
     platform, homeNative, homePosix, cwd, api, roots, lexRoots, ancestors, lexAncestors, ci,
@@ -229,8 +255,13 @@ function makeCtx(opts) {
     admin: (opts.env ?? process.env).PIPELINE_ADMIN === '1',
     env: opts.env ?? process.env,
     bashState: opts._bashState, // the BASH rewrite record of the whole evaluation (see evaluateBashForFilesUnchecked)
-    hit: (p) => { const q = unFirm(p); return roots.some((r) => isInside(q, r, platform)); },
-    hitAncestor: (p) => { const q = unFirm(p); return ancestors.some((a) => samePath(q, a, platform)); },
+    // (hit / hitAncestor: the installed pipeline files and, in any directory, a repo's review state (REVIEW_FILE_SRC). trusted: only
+    // the installed pipeline files, whose programs are not judged on their content when run.)
+    hit: (p) => pipelineHit(p) || reviewFile.test(unFirm(p)),
+    trusted: pipelineHit,
+    hitAncestor: (p) => pipelineAncestor(p) || reviewDir.test(unFirm(p)),
+    hitPipelineAncestor: pipelineAncestor,
+    reviewFile, reviewDir,
     hitTree: (p) => { const q = unFirm(p); return treeRoots.some((r) => isInside(q, r, platform)); },
     unFirm,
     // Is `p`, or the nearest existing directory above it, the very same file or directory (same device and inode) as a
@@ -299,7 +330,7 @@ function lexicalTarget(target, ctx) {
 // #58: the owner-go recorder (installed in ~/.claude/pipeline/hooks, or a source checkout's pipeline/hooks) and its library.
 const OWNER_GO_RECORDER = /(?:^|\/)hooks\/(?:lib\/)?owner-go\.mjs$/i;
 
-const PROTECTED_MSG = 'skills, agents, ~/.claude/pipeline, ~/.claude/settings.json and the owner-go records (~/.claude/pipeline-state/owner-go) can only be changed by the owner with PIPELINE_ADMIN=1';
+const PROTECTED_MSG = 'skills, agents, ~/.claude/pipeline, ~/.claude/settings.json and the owner-go records (~/.claude/pipeline-state/owner-go) can only be changed by the owner with PIPELINE_ADMIN=1; a repo\'s review state (.review/state.json, .review/round-<n>/, final-gate.json, *-smoke.json, prod-before.json) only by the pipeline commands that write it (pipeline state, codex-review, triage, arbiter, final-gate …)';
 
 // MCP servers (a filesystem server, any other server's write tools, a browser or IDE that runs code) reach the
 // same files without Edit/Write. Their tool_input has no fixed shape, so values are picked out by key name.
@@ -657,6 +688,26 @@ function makeMatchers(ctx) {
   const ancRes = ancestorRegexes(ctx);
   const suffix = suffixRegexes(ctx.ci);
   const ancestors = rootsAndAncestors(ctx);
+  const reviewText = new RegExp(reviewTextBody(SEP), ctx.ci ? 'i' : '');
+  // A glob that can match a repo's review folder or a protected file in it (REVIEW_FILE_SRC), wherever it is: a segment that can be
+  // `.review`, then the end (the folder itself) or a segment that can be one of the protected names. `**` can stand for the folder and
+  // for a round folder, so anything after it counts. A wildcard reaches a dot name only with DOT_GLOB on the line.
+  const reviewGlob = (g) => {
+    const segs = g.split('/');
+    const can = (seg, name) => {
+      if (seg === '**') return ctx.dotGlob === true || !name.startsWith('.');
+      if (!/[*?[]/.test(seg)) return ctx.ci ? seg.toLowerCase() === name.toLowerCase() : seg === name;
+      if (name.startsWith('.') && !seg.startsWith('.') && ctx.dotGlob !== true) return false;
+      return !!segmentRe(seg, ctx.ci)?.test(name);
+    };
+    for (let i = 0; i < segs.length; i++) {
+      if (!can(segs[i], '.review')) continue;
+      const rest = segs.slice(i + 1).filter((s) => s !== '');
+      if (rest.length === 0 || segs[i] === '**' || rest[0] === '**') return true;
+      if (REVIEW_SAMPLES.some((n) => can(rest[0], n)) && (rest.length === 1 || can(rest[0], 'round-1'))) return true;
+    }
+    return false;
+  };
 
   // Is a protected file named in `text`? By absolute path (in any of its spellings), by a tail with an unknown
   // prefix, or by a relative tail that lands in a protected root from one of `dirs`.
@@ -682,6 +733,7 @@ function makeMatchers(ctx) {
   const rawHitOne = (text, dirs) => {
     for (const v of refVariants(String(text), ctx)) {
       if (rootRes.some((re) => re.test(v))) return true;
+      if (reviewText.test(v)) return true; // (a repo's review state: protected wherever it is, so the name alone is the reference)
       if (!(ctx.ci ? v.toLowerCase() : v).includes('.claude')) continue;
       if (suffix.nonlit.test(v)) return true;
       if (dirs) {
@@ -699,6 +751,7 @@ function makeMatchers(ctx) {
     const star = g.search(/[*?[]/);
     const lit = g.slice(0, g.lastIndexOf('/', star) + 1) || '/';
     if (ctx.hit(lit)) return true;
+    if (reviewGlob(g)) return true;
     // a glob that can match a protected root or anything inside one (~/.claude/skills/*/SKILL.md, ~/.c*/pipeline/x) ...
     if (ctx.roots.some((r) => globReaches(g, r, ctx.ci))) return true;
     // ... or a directory that holds them (~/.cla*, ~/.claude/*)
@@ -727,7 +780,7 @@ function makeMatchers(ctx) {
         const bases = isAbs(e) ? [''] : dirs;
         for (const d of bases) {
           const full = isAbs(e) ? pathsFor().normalize(e) : pathsFor().join(d, e);
-          if (/[*?[]/.test(full) ? globHit(full) : (ctx.hit(full) || (withAncestors && ctx.hitAncestor(full))) && (!plausible || plausible(full, e)) ) return true;
+          if (/[*?[]/.test(full) ? globHit(full) : (ctx.hit(full) || (withAncestors === 'pipeline' ? ctx.hitPipelineAncestor(full) : withAncestors && ctx.hitAncestor(full))) && (!plausible || plausible(full, e)) ) return true;
         }
       }
     }
@@ -745,6 +798,8 @@ const CD_CMDS = new Set(['cd', 'pushd', 'popd', 'set-location', 'sl']);
 // Why: the directories an unknown `cd` may land in that matter: each protected directory (a file cannot be a cwd), each directory above one, and the home's parents.
 function assumedCwds(ctx) {
   const dirs = [...ctx.lexRoots.filter((r) => !/\.\w+$/.test(posix.basename(r))), ...ctx.lexAncestors];
+  // (and a repo's review folders, protected wherever they are (REVIEW_FILE_SRC): the cwd's own spelling stands for every one of them)
+  dirs.push(pathsFor().join(ctx.cwd, '.review'), pathsFor().join(ctx.cwd, '.review', 'round-1'));
   for (let d = ctx.homePosix, n = 0; n < 16; n++) {
     dirs.push(d);
     const up = pathsFor().dirname(d);
@@ -1771,7 +1826,7 @@ function judgeJoinedScripts(sf, dirs, ctx, opts, scanRaw = '') {
       for (const pc of sf.pieces ?? sf.joined.map((file) => ({ file }))) {
         if (Object.hasOwn(pc, 'text')) { parts.push([pc.text]); continue; }
         const abs = abss[fi++];
-        if (ctx.hit(abs) || ctx.hit(realResolve(abs, ctx.api)) || inNodeModules(abs, opts)) continue;
+        if (ctx.trusted(abs) || ctx.trusted(realResolve(abs, ctx.api)) || inNodeModules(abs, opts)) continue;
         checkDeadline(ctx.budget);
         const exists = ctx.api.existsSync(abs);
         const text = exists ? ctx.readText(abs) : null;
@@ -1847,7 +1902,7 @@ function judgeSqlLines(sf, dirs, ctx, opts) {
 const inNodeModules = (abs, opts) => /\/node_modules\//.test(abs) && !(opts?._pkgDir && (abs === opts._pkgDir || abs.startsWith(`${opts._pkgDir}/`)));
 // One existing script file (`abs`, found in directory `dir`).
 function judgeFoundScript(sf, abs, dir, ctx, opts) {
-  if (ctx.hit(abs) || ctx.hit(realResolve(abs, ctx.api)) || inNodeModules(abs, opts)) return null;
+  if (ctx.trusted(abs) || ctx.trusted(realResolve(abs, ctx.api)) || inNodeModules(abs, opts)) return null;
   checkDeadline(ctx.budget);
   const text = ctx.readText(abs);
   if (typeof text !== 'string') {
@@ -1955,7 +2010,7 @@ function judgeWrittenScript(w, sf, abs, dir, ctx, opts, scanRaw) {
   // (only where an interpreter runs it, or it is the command word: handed to another program as an argument it still counts)
   const esc = String(sf.file).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const own = new RegExp(`(^|[\\s;&|(])((?:node|nodejs|bash|sh|zsh|dash|deno|bun|tsx|python3?|ruby|perl|php)\\s+)?${esc}(?=$|[\\s;&|)])`, 'g');
-  const rest = ctx.hit(abs) ? scanRaw.replace(own, (m, lead, interp) => (interp || !/\s/.test(lead) ? `${lead}${interp ?? ''} ` : m)) : scanRaw;
+  const rest = ctx.trusted(abs) ? scanRaw.replace(own, (m, lead, interp) => (interp || !/\s/.test(lead) ? `${lead}${interp ?? ''} ` : m)) : scanRaw;
   if (w.unknown && (makeMatchers(ctx).rawHit(rest, [dir]) || SENSITIVE_WORDS.test(rest.replace(/['"`\\]/g, '')))) {
     return deny(`the script ${sf.file} may have been written by an earlier command on the line (its content is only known at run time) and the line refers to a protected pipeline file or switch, so what it runs cannot be checked; write the file out literally`);
   }
@@ -2455,6 +2510,7 @@ function evaluateBashForFilesFrame(command, opts) {
   if (ctx.admin) return allow();
   const raw = typeof command === 'string' ? command : '';
   if (!raw.trim()) return allow();
+  ctx.dotGlob = DOT_GLOB.test(raw) || DOT_GLOB.test(String(ctx.env.BASHOPTS ?? '')); // (makeMatchers: may a wildcard match the .review folder)
   // the words a `${X:=w}` on the line (or the line this text came from) may have assigned: a later $X may be any of them
   ctx.assigned = new Map([...(opts._assigned ?? [])].map(([n, ws]) => [n, [...ws]]));
   for (const [n, ws] of assigningDefaults(raw)) ctx.assigned.set(n, [...new Set([...(ctx.assigned.get(n) ?? []), ...ws])]);
@@ -2898,15 +2954,16 @@ function evaluateBashForFilesFrame(command, opts) {
   const winAncestor = (c) => c.raw.includes('\\') && m.ancestorRaw(rawOfCmd(c));
   // Why: in a rerun that assumes the directory (after a cd only known at run time) every relative word resolves inside the assumed protected directory (`npm`, `test`), so a word counts only when it can name
   // a protected file: one that exists there, a new name in a directory that exists there (it has a `/`), or the name of a protected file or directory itself
-  const leaves = new Set(ctx.lexRoots.map((q) => posix.basename(q)));
+  const leaves = new Set([...ctx.lexRoots.map((q) => posix.basename(q)), ...REVIEW_SAMPLES]);
   const plausible = opts._writesOnly === true ? (full, e) => ctx.api.existsSync(full) || (e.includes('/') && ctx.api.existsSync(pathsFor().dirname(full))) || leaves.has(posix.basename(full)) || /^\.{1,2}\/?$|\/$/.test(e) : null;
-  const tokenHit = (t) => m.rawHit(t, dirs) || m.pathHit(t, dirs, true, plausible);
+  const tokenHit = (t, anc = true) => m.rawHit(t, dirs) || m.pathHit(t, dirs, anc, plausible);
   const tokenHitAll = (t) => m.rawHit(t, dirs) || m.pathHit(t, dirs, true);
   // does the command name a protected file anywhere (source or destination)?
-  const names = (c) => insideRoot
+  // (anc 'pipeline': a repo's .review folder does not count as a holder, see mentions)
+  const names = (c, anc = true) => insideRoot
     || m.rawHit(rawOfCmd(c), dirs) || winAncestor(c)
     || Object.values(c.env).some((v) => m.rawHit(v, dirs))
-    || (!tooMany && opts._writesOnly !== true && wordsOf(c).some(tokenHit)); // (a rerun that only assumes a directory judges writes: a bare word that resolves into it names nothing)
+    || (!tooMany && opts._writesOnly !== true && wordsOf(c).some((t) => tokenHit(t, anc))); // (a rerun that only assumes a directory judges writes: a bare word that resolves into it names nothing)
   // does it WRITE one? cp / rsync / install only write their destination
   const mentions = (c) => {
     const name = baseOf(c.argv[0] ?? '');
@@ -2915,6 +2972,8 @@ function evaluateBashForFilesFrame(command, opts) {
     if (opts._writesOnly === true && (impliesCwdWrite(c) || (runsInlineCode(c, ctx) && WRITE_HINT.test(c.raw ?? c.argv.join(' '))))) return true;
     // (a destination word is never filtered: a writer may create a protected name that does not exist yet)
     if (DEST_ONLY.has(name)) return destsOf(wordsOf(c), name).some(tokenHitAll);
+    // (mkdir of a repo's .review folder itself only makes an empty folder, which holds nothing: see REVIEW_FILE_SRC)
+    if (name === 'mkdir') return names(c, 'pipeline');
     return names(c) || (MOVERS.has(name) && destsOf(wordsOf(c), name).some(tokenHitAll));
   };
   const mentioning = cmds.filter(mentions);
@@ -2926,7 +2985,7 @@ function evaluateBashForFilesFrame(command, opts) {
   }
   // A reference no single command names lives in a heredoc body or in program text the shell parser cut into
   // pieces (a Python or JS one-liner): then every command on the line must be read-only.
-  const unaccounted = protectedInRaw && !cmds.some(names);
+  const unaccounted = protectedInRaw && !cmds.some((c) => names(c));
   if (!mentioning.length && !unaccounted) return allow();
 
   // A read-only command can still feed a writer further down the pipe (find ... | xargs rm, ls ... | sh).

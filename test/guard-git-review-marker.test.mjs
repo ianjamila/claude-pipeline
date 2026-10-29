@@ -5,7 +5,9 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
+import { evaluateGitCommand, STATE_MARKER_TEXT, TRIAGE_MARKER_TEXT } from '../pipeline/hooks/lib/git-policy.mjs';
+import { MARKERS } from '../pipeline/lib/render.mjs';
+import { encodeForComment } from '../pipeline/lib/state.mjs';
 
 const dir = mkdtempSync(join(tmpdir(), 'marker-'));
 const MARKER = '<!-- claude-pipeline:review-complete v1 -->';
@@ -151,4 +153,32 @@ test('ordinary comments, reads and the review-complete command itself still pass
     'node /opt/pipeline/bin/pipeline.mjs review-complete --pr 5',
     'node /opt/pipeline/bin/pipeline.mjs merge --pr 5 --owner-go',
   ]) assert.equal(decide(command), 'allow', command);
+});
+
+// Phase 3b: `pipeline state show --pr N` rebuilds .review/state.json from the newest triage comment of the viewer (the agent's own
+// login), so the triage and state markers may only come from `pipeline comment --kind triage`, like the review-complete marker.
+test('Phase 3b: the triage and review-state markers are refused like the review-complete marker', () => {
+  const state = encodeForComment({ version: 1, pr: 5, rounds: [] });
+  writeFileSync(join(dir, 'triage.md'), `${MARKERS.triage}\n${state}\n`);
+  for (const command of [
+    `gh pr comment 5 --body '${MARKERS.triage}'`,
+    `gh pr comment 5 --body '${state}'`,
+    'gh pr comment 5 -b "x <!-- CLAUDE-PIPELINE:TRIAGE -->"',
+    'gh pr comment 5 --body-file triage.md',
+    'gh pr review 5 --comment -F triage.md',
+    `gh api repos/acme/app/issues/5/comments -f body='${MARKERS.triage}'`,
+    'gh api -X PATCH repos/acme/app/issues/comments/9 --input triage.md',
+    "gh api repos/acme/app/issues/5/comments -f body='claude-pipeline\\u003astate:x'",
+    "printf 'claude-pipeline:triage' > new2.md && gh pr comment 5 -F new2.md",
+  ]) assert.equal(decide(command), 'deny', command);
+  for (const command of [
+    'gh pr view 5 --comments',
+    'node /opt/pipeline/bin/pipeline.mjs comment --pr 5 --kind triage',
+    'node /opt/pipeline/bin/pipeline.mjs state show --pr 5',
+  ]) assert.equal(decide(command), 'allow', command);
+});
+
+test('Phase 3b: the guarded marker texts are the ones the pipeline writes', () => {
+  assert.ok(MARKERS.triage.includes(TRIAGE_MARKER_TEXT));
+  assert.ok(encodeForComment({ pr: 1 }).includes(STATE_MARKER_TEXT));
 });

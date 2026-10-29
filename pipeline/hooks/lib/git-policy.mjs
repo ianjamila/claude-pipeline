@@ -79,7 +79,7 @@ const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 // lowercase basename without .exe/.cmd/.bat/.com; handles /usr/bin/git and C:\Git\bin\GIT.EXE alike
 const baseName = (w) => commandName(w);
 // A command the parser could only partly resolve (`$g push`, `bash -c "$X"`, `curl … | sh`) is judged by what it mentions.
-const GUARDED_WORDS = /push|merge|human-approved|test-change-approved|needs-human|pipeline-pause|pipeline-rollback|pipeline-blocked|awaiting-review|protection|ruleset|issue\s+close|claude-pipeline:review-complete/i;
+const GUARDED_WORDS = /push|merge|human-approved|test-change-approved|needs-human|pipeline-pause|pipeline-rollback|pipeline-blocked|awaiting-review|protection|ruleset|issue\s+close|claude-pipeline:(?:review-complete|triage|state:)/i;
 const isProtectedBranch = (b) => PROTECTED_BRANCHES.includes(String(b).toLowerCase());
 const isPrefixOf = (name, full, min = 1) => name.length >= min && full.startsWith(name);
 // Label names are case-insensitive on GitHub; a name only counts when it is not part of a longer one.
@@ -1023,10 +1023,18 @@ function repoMergeCommandVerdict(argv, dir, ctx) {
 // body piped in on stdin from a file, or a client of the agent's own, is not seen; nor is a body file that a process started by
 // an EARLIER command (a background job) rewrites between this check and gh reading it (Fable attacker pass): the hook judges one
 // command line, not what else is running. The local review state itself (.review/state.json, which review-complete trusts) is
-// not protected here: tracked as an open item before ci.review_check is turned on anywhere.
-const REVIEW_MARKER_RE = new RegExp(escapeRe(REVIEW_MARKER_TEXT), 'i');
+// protected by the files guard (files-policy.mjs, REVIEW_FILE_SRC).
+// Phase 3b: the triage comment's markers are refused the same way. `pipeline state show --pr N` rebuilds (or, when they disagree,
+// replaces) .review/state.json from the newest triage comment of the viewer, which is the agent's own login, so a hand-posted one
+// would become a review state the files guard never saw written. Only `pipeline comment --pr N --kind triage` posts it, from its
+// own process. (TRIAGE_MARKER_TEXT / STATE_MARKER_TEXT: lib/render.mjs MARKERS.triage and lib/state.mjs encodeForComment, kept in
+// step by test/guard-git-review-marker.test.mjs.)
+export const TRIAGE_MARKER_TEXT = 'claude-pipeline:triage';
+export const STATE_MARKER_TEXT = 'claude-pipeline:state:';
+const POSTED_MARKERS = [REVIEW_MARKER_TEXT, TRIAGE_MARKER_TEXT, STATE_MARKER_TEXT];
+const REVIEW_MARKER_RE = new RegExp(POSTED_MARKERS.map(escapeRe).join('|'), 'i');
 const mentionsReviewMarker = (text) => REVIEW_MARKER_RE.test(String(text ?? '')) || REVIEW_MARKER_RE.test(safeDecode(String(text ?? '')));
-const REVIEW_MARKER_DENIED = `the text carries the review-complete marker (${REVIEW_MARKER_TEXT}), which only \`pipeline review-complete --pr N\` may post: it checks that a clean review covers the current content first. Run it instead.`;
+const REVIEW_MARKER_DENIED = `the text carries a marker only the pipeline posts: the review-complete marker (${REVIEW_MARKER_TEXT}) comes only from \`pipeline review-complete --pr N\`, which checks that a clean review covers the current content first; the triage and review-state markers (${TRIAGE_MARKER_TEXT}, ${STATE_MARKER_TEXT}) only from \`pipeline comment --pr N --kind triage\`, which renders the local review state. Run those instead.`;
 // gh commands that post or edit text on a PR or issue (where the workflow reads the comments), by group and verb.
 const TEXT_VERBS = { pr: ['comment', 'create', 'edit', 'review', 'close', 'merge'], issue: ['comment', 'create', 'edit', 'close'] };
 // gh's short flags for those verbs (gh 2.x): text = value is posted text or a body file; value = other value-taking; bool = switches.
@@ -1062,7 +1070,7 @@ function reviewMarkerVerdict(group, verb, rest, dir, ctx) {
   const LONG_REFUSED = new Set(['editor', 'template', 'recover']);
   const SHORT_TEXT = table.text;
   const SHORT_REFUSED = 'eT';
-  const EDITOR_DENIED = 'the text would come from an editor, a template or a recovered draft, which the guard cannot read for the review-complete marker. Pass the text with --body or a literal --body-file.';
+  const EDITOR_DENIED = 'the text would come from an editor, a template or a recovered draft, which the guard cannot read for the pipeline markers (review-complete, triage). Pass the text with --body or a literal --body-file.';
   const texts = [];
   const files = [];
   for (let i = 0; i < rest.length; i++) {
@@ -1100,22 +1108,22 @@ function reviewMarkerVerdict(group, verb, rest, dir, ctx) {
     }
   }
   if (texts.some((t) => DYNAMIC.test(t))) {
-    return deny('the comment text (or its file name) is built at run time ($VAR / $(...) / backticks), so it cannot be checked for the review-complete marker. Write the body to a file and pass --body-file with a literal name.');
+    return deny('the comment text (or its file name) is built at run time ($VAR / $(...) / backticks), so it cannot be checked for the pipeline markers (review-complete, triage). Write the body to a file and pass --body-file with a literal name.');
   }
   for (const file of files) {
     if (file === '-') continue; // (stdin: the residual above; a here-string is in the line itself)
     // a name the shell rewrites before gh sees it (~, a glob, a brace list) names some other file than the one read here
-    if (/^~|[*?[\]{}]/.test(file)) return deny(`the body file name ${file} is expanded by the shell (~, a glob or a brace list), so which file is posted cannot be verified for the review-complete marker. Name the file literally.`);
-    if (dir === null) return deny('cannot tell which directory this runs in, so the body file cannot be checked for the review-complete marker. Use an absolute path, or chain the cd with &&.');
+    if (/^~|[*?[\]{}]/.test(file)) return deny(`the body file name ${file} is expanded by the shell (~, a glob or a brace list), so which file is posted cannot be verified for the pipeline markers (review-complete, triage). Name the file literally.`);
+    if (dir === null) return deny('cannot tell which directory this runs in, so the body file cannot be checked for the pipeline markers (review-complete, triage). Use an absolute path, or chain the cd with &&.');
     const abs = path.resolve(dir, file);
     // a body file an earlier command on this line wrote (or may have written) holds text that does not exist yet: refused
     if (writtenTo(ctx.writeFrames, abs, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: ctx.ignoreUnmodelled === true }) !== null) {
-      return deny(`${file} may be written earlier on this line, so the body that is posted cannot be checked for the review-complete marker. Write the file in a command of its own.`);
+      return deny(`${file} may be written earlier on this line, so the body that is posted cannot be checked for the pipeline markers (review-complete, triage). Write the file in a command of its own.`);
     }
     countScript(ctx.budget);
     // (fail closed: a file that is missing, not a regular file, too large or unreadable cannot be checked)
     const text = ctx.readText(abs);
-    if (typeof text !== 'string') return deny(`the body file ${file} cannot be read here (missing, not a regular file, or over ${MAX_INPUT_BYTES} bytes), so it cannot be checked for the review-complete marker.`);
+    if (typeof text !== 'string') return deny(`the body file ${file} cannot be read here (missing, not a regular file, or over ${MAX_INPUT_BYTES} bytes), so it cannot be checked for the pipeline markers (review-complete, triage).`);
     if (mentionsReviewMarker(text)) return deny(REVIEW_MARKER_DENIED);
   }
   return null;
@@ -1149,12 +1157,12 @@ function apiReviewMarkerVerdict(ep, rawEp, haystack, body, dir, ctx) {
   const graphql = /^graphql$/i.test(ep);
   const runTimeEndpoint = DYNAMIC.test(String(rawEp ?? ''));
   if (!graphql && !runTimeEndpoint && !API_COMMENT_PATH.test(ep)) return null;
-  if (body.unknown) return deny('the body of this API write comes from stdin or a file that cannot be read here, so it cannot be checked for the review-complete marker. Pass a readable file with a literal name.');
+  if (body.unknown) return deny('the body of this API write comes from stdin or a file that cannot be read here, so it cannot be checked for the pipeline markers (review-complete, triage). Pass a readable file with a literal name.');
   for (const file of body.files) {
-    if (/^~|[*?[\]{}]/.test(file) || DYNAMIC.test(file)) return deny(`the input file name ${file} is expanded by the shell, so which file is sent cannot be verified for the review-complete marker. Name the file literally.`);
-    if (dir === null) return deny('cannot tell which directory this runs in, so the input file cannot be checked for the review-complete marker. Use an absolute path, or chain the cd with &&.');
+    if (/^~|[*?[\]{}]/.test(file) || DYNAMIC.test(file)) return deny(`the input file name ${file} is expanded by the shell, so which file is sent cannot be verified for the pipeline markers (review-complete, triage). Name the file literally.`);
+    if (dir === null) return deny('cannot tell which directory this runs in, so the input file cannot be checked for the pipeline markers (review-complete, triage). Use an absolute path, or chain the cd with &&.');
     if (writtenTo(ctx.writeFrames, path.resolve(dir, file), { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: ctx.ignoreUnmodelled === true }) !== null) {
-      return deny(`${file} may be written earlier on this line, so the body that is sent cannot be checked for the review-complete marker. Write the file in a command of its own.`);
+      return deny(`${file} may be written earlier on this line, so the body that is sent cannot be checked for the pipeline markers (review-complete, triage). Write the file in a command of its own.`);
     }
   }
   // Whether the query word holds an expansion is the shell parser's fact (cmd.litWords: the words without one), never a search of
@@ -1178,7 +1186,7 @@ function apiReviewMarkerVerdict(ep, rawEp, haystack, body, dir, ctx) {
   }
   const comment = !graphql || body.queries.some((q) => COMMENT_MUTATION.test(q));
   if (comment && body.fields.some((f) => f.key !== 'query' && typeof f.written === 'string' && DYNAMIC.test(f.written))) {
-    return deny('a field of this API write is built at run time ($VAR / $(...) / backticks), so it cannot be checked for the review-complete marker. Write the body to a file and pass it with a literal name (-F body=@file or --input file).');
+    return deny('a field of this API write is built at run time ($VAR / $(...) / backticks), so it cannot be checked for the pipeline markers (review-complete, triage). Write the body to a file and pass it with a literal name (-F body=@file or --input file).');
   }
   return null;
 }
