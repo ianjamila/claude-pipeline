@@ -169,7 +169,7 @@ permissions / data-integrity / data-loss item ⇒ `needsHuman` (the CLI applies 
 - `clean` (no open BLOCKING, no new ACCEPTED this round, nothing `needsHuman`, and review
   coverage matches the current content hash) ⇒ leave the loop.
 - `needsHuman` non-empty ⇒ **park needs-human** (label, comment, `P summary --outcome needs-human`), stop.
-- else if `<round>` < max ⇒ round `<round>`+1 (reviews only the diff since this round's head).
+- else if `reviewedRounds` < `maxRounds` (both in the output; base-only rounds are not counted) ⇒ round `<round>`+1 (reviews only the diff since this round's head).
 - else if `extraRound` ⇒ ONE extra round `<round>`+1 (the last: it reviews only the fixes since this round's head; afterwards `extraRound` is false, so anything not clean parks).
 - else ⇒ **park needs-human** with the unresolved list (same label, comment, `P summary`), stop.
 
