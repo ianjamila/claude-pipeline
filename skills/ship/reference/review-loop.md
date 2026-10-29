@@ -40,7 +40,7 @@ already holds. A `P state outcome` with `followupsPending: true` means a publish
   JSON in `tail`:
   - 0: round recorded: `counts`, `preRuled` (items answered from the cache), `lightLane`. Commits merged in from the
     base branch since the previous round ("Update branch") are not shown to Codex. If the output has `baseOnly: true`
-    the round was only such a merge: Codex did not run, there are no items, and it counts as a clean round with no findings.
+    the round was only such a merge: Codex did not run, there are no items, and it does not count toward `max_rounds`. It is not a review: it carries the last reviewed round's result forward to the merged-in content, so it is clean only if that reviewed round was (an accepted fix still needs its reviewed round).
   - 3 (`unavailable: true`, reason quota / auth / unavailable / error / malformed / github) ⇒
     `gh pr edit <pr> --add-label awaiting-review`, `P comment --pr <pr> --kind awaiting-review
     --reason "<reason>"`, `P summary --pr <pr> --outcome awaiting-review --built "…"` (works with no
