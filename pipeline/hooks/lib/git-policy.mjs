@@ -165,7 +165,7 @@ function expandVars(text, ctx) {
 
 // Everything a script judged here can depend on: the directory, the nesting level and the line's variable / branch / config / alias state.
 // (and the writes of the line that count for the command: a script the line wrote is judged on what was written)
-const stateFingerprint = (ctx, dir, level) => JSON.stringify([dir, level, ctx.vars, [...ctx.unsureVars], [...ctx.tainted], [...ctx.branches], ctx.cfgDirty, ctx.envCfgDirty, ctx.gitAliases, ctx.ghAliases, [...ctx.aliasUnsure], writeSignature(ctx.writeFrames)]);
+const stateFingerprint = (ctx, dir, level) => JSON.stringify([dir, level, ctx.vars, [...ctx.unsureVars], [...ctx.tainted], [...ctx.branches], ctx.cfgDirty, ctx.envCfgDirty, ctx.ghRepoDirty === true, ctx.gitAliases, ctx.ghAliases, [...ctx.aliasUnsure], writeSignature(ctx.writeFrames)]);
 
 // What the policy's own tracking knows about variable `n` for a use the command's prefix does not override: its value, and
 // `$n` when it is unsure or tainted (the callers read that as "run-time value").
@@ -604,7 +604,8 @@ function trackConfig(args, ctx) {
   const key = String(positionals[0] ?? '').toLowerCase();
   if (key.startsWith('alias.') && positionals.length >= 2) ctx.gitAliases[key.slice('alias.'.length)] = positionals[1];
   if (writes && RISKY_CONFIG(key, String(positionals[1] ?? ''))) ctx.cfgDirty = true;
-  if (writes && (DYNAMIC.test(key) || key.startsWith('remote.') || key === '')) ctx.ghRepoDirty = true; // (see directMergeVerdict)
+  // (see directMergeVerdict; security review of de62b36: url.<base>.insteadOf rewrites a remote's URL, include / includeIf pull in other config)
+  if (writes && (DYNAMIC.test(key) || key === '' || /^(?:remote|url|include|includeif|core)\./.test(key))) ctx.ghRepoDirty = true;
 }
 
 function trackGit(sub, args, g, ctx) {
@@ -612,6 +613,7 @@ function trackGit(sub, args, g, ctx) {
   if (sub === 'checkout' || sub === 'switch') trackSwitch(sub, args, d, ctx);
   else if (sub === 'branch') trackBranch(args, d, g.gitDir, ctx);
   else if (sub === 'config') trackConfig(args, ctx);
+  else if (sub === 'remote' && args.some((w) => ['add', 'set-url', 'rename', 'remove', 'rm'].includes(w))) ctx.ghRepoDirty = true; // (aliases expanded: see directMergeVerdict)
   else if (sub === 'rebase') {
     // `git rebase <upstream> <branch>` checks <branch> out first
     const { positionals } = parseOpts(args, { longValue: ['onto', 'exec', 'strategy', 'strategy-option', 'whitespace'], shortValue: 'xsXC' });
@@ -951,6 +953,8 @@ function ghEnvValue(env, ctx, name, unset = envUnset(env, name)) {
   if (Object.hasOwn(ctx.vars, name)) return ctx.vars[name];
   return ctx.env?.[name];
 }
+// (security review of de62b36) a line that names a git config file may write it (a redirect, a program): the remotes read before it may not hold
+const GIT_CONFIG_FILE = /(?:^|[\s/'"=])(?:\.git\/config|\.gitconfig|gitconfig|\.config\/git\/)/i;
 const GH_CONFIG_NAMES = ['GH_CONFIG_DIR', 'XDG_CONFIG_HOME', 'APPDATA', 'AppData', 'HOME'];
 // (Fable attacker pass) and the git environment gh reads the checkout's remotes and gh-resolved through: another repository (GIT_DIR …)
 // or injected config (GIT_CONFIG_COUNT/KEY_n/VALUE_n …)
@@ -985,7 +989,7 @@ function directMergeVerdict(pr, head, dir, ctx, what, elsewhere = false, pinFlag
   if (!elsewhere && ownerGoMode(dir, ctx) !== 'chat') return null;
   // (Fable attacker pass: a remote changed earlier on the line, or gh's default repository set, points gh at a repository the remotes
   // read before the line never named: `git remote set-url …`, `git config remote.….gh-resolved …`, `gh repo set-default …`)
-  if (ctx.ghRepoDirty) named = null;
+  if (ctx.ghRepoDirty || GIT_CONFIG_FILE.test(String(ctx.fullText ?? ''))) named = null;
   const where = elsewhere ? 'a merge named by -R, a PR URL or GH_REPO (its repository may need the owner)' : 'in this repository (owner_approval: chat) a merge';
   const via = `Merge through \`P merge --pr ${pr ?? 'N'}\` (it merges a low-risk PR itself), or show the request (Head and 🔀 lines) and wait for the owner to type "merge".`;
   if (pr === null) return deny(`${what} without a literal PR number: ${where} needs the owner's "merge" for that PR and head. Name the PR number (run from the repository), or ${via[0].toLowerCase()}${via.slice(1)}`);
@@ -1276,6 +1280,7 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
   const args = argv.slice(1).map((a) => expandVars(a, ctx));
   const { group, verb, rest } = splitGh(args);
   if (!group) return null;
+  if (group === 'repo' && verb === 'set-default') ctx.ghRepoDirty = true; // (also reached through a gh alias: see directMergeVerdict)
 
   // aliases: `gh alias set NAME EXPANSION` is checked as if it ran, and a name defined on this line is expanded
   if (group === 'alias' && verb === 'set') {
@@ -1966,6 +1971,7 @@ function implicitStartupVerdict(st, ctx, cmd, dir) {
   const carry = (r) => {
     for (const [d, e] of r.branches) if (ctx.branches.get(d) !== e) ctx.branches.set(d, e);
     if (r.cfgDirty) ctx.cfgDirty = true;
+    if (r.ghRepoDirty) ctx.ghRepoDirty = true;
     Object.assign(ctx.gitAliases, r.git);
     Object.assign(ctx.ghAliases, r.gh);
     for (const n of r.unsure) ctx.aliasUnsure.add(n);
@@ -1982,7 +1988,7 @@ function implicitStartupVerdict(st, ctx, cmd, dir) {
   fresh.fullText = typeof text === 'string' ? text : '';
   const v = checkScriptFile(rec, dir, fresh, 0);
   const done = {
-    verdict: v, branches: new Map(fresh.branches), cfgDirty: fresh.cfgDirty, git: { ...fresh.gitAliases }, gh: { ...fresh.ghAliases }, unsure: [...fresh.aliasUnsure],
+    verdict: v, branches: new Map(fresh.branches), cfgDirty: fresh.cfgDirty, ghRepoDirty: fresh.ghRepoDirty === true, git: { ...fresh.gitAliases }, gh: { ...fresh.ghAliases }, unsure: [...fresh.aliasUnsure],
     sens: (ctx.budget.unmodelledSeen ?? 0) !== seen0, flag,
   };
   memo.set(key, done);

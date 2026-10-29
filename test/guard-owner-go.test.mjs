@@ -433,7 +433,12 @@ test('Phase 3b: a line that changes the remotes, gh\'s default repository or gh\
   for (const cmd of [`git config remote.origin.gh-resolved o/other && gh pr merge 7 ${pin7}`, `git remote set-url origin git@github.com:o/other.git; gh pr merge 7 ${pin7}`,
     `git remote add up git@github.com:o/other.git && gh pr merge 7 ${pin7}`, `gh repo set-default o/other && gh pr merge 7 ${pin7}`, `git config "$K" o/other; gh pr merge 7 ${pin7}`,
     `GIT_DIR=/other/.git gh pr merge 7 ${pin7}`, `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.gh-resolved GIT_CONFIG_VALUE_0=o/other gh pr merge 7 ${pin7}`,
-    `export GIT_WORK_TREE=/other; gh pr merge 7 ${pin7}`, `git remote set-url origin git@github.com:o/other.git; npm run merge -- 7 --expect-head ${H7}`]) {
+    `export GIT_WORK_TREE=/other; gh pr merge 7 ${pin7}`, `git remote set-url origin git@github.com:o/other.git; npm run merge -- 7 --expect-head ${H7}`,
+    // (security review of de62b36: URL rewriting, an alias, a write to the config file itself)
+    `git config url.git@github.com:o/other.insteadOf git@github.com:o/chat && gh pr merge 7 ${pin7}`, `git config include.path /tmp/x; gh pr merge 7 ${pin7}`,
+    `git config alias.r remote; git r set-url origin git@github.com:o/other.git; gh pr merge 7 ${pin7}`,
+    `gh alias set sd 'repo set-default' && gh sd o/other && gh pr merge 7 ${pin7}`,
+    `printf '[remote "origin"]\\n' >> .git/config; gh pr merge 7 ${pin7}`, `cp /tmp/x ~/.gitconfig && gh pr merge 7 ${pin7}`]) {
     assert.equal(verdict(cmd).decision, 'deny', cmd);
   }
   for (const cmd of [`git fetch origin && gh pr merge 7 ${pin7}`, `git config user.name x; gh pr merge 7 ${pin7}`, `git remote -v && gh pr merge 7 ${pin7}`]) allow(cmd);
