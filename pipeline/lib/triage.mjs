@@ -370,6 +370,20 @@ export function markLightLane(items) {
 export const countsTowardCap = (r) => r?.baseOnly !== true && r?.resolutionOnly !== true;
 export const reviewedRoundCount = (state) => (state?.rounds ?? []).filter(countsTowardCap).length;
 
+// The rounds whose new accepts still wait for a round that reviews their fixes: from the end back through the rounds that
+// reviewed nothing of their own (baseOnly, skipped) and the resolution-only ones (their own accepts count, and so do the
+// earlier round's, which a conflict resolved before the fix was made must not hide), up to the first round that counts toward
+// the cap. Without that, a resolution round recorded between an accept and its fix would strand the confirm round.
+const roundsAwaitingFixReview = (rounds) => {
+  const out = [];
+  for (let i = rounds.length - 1; i >= 0; i -= 1) {
+    if (rounds[i]?.baseOnly === true) continue;
+    out.push(rounds[i]);
+    if (countsTowardCap(rounds[i])) break;
+  }
+  return out;
+};
+
 const isNewAccept = (item) => item.final?.decision === 'ACCEPT' && item.final.by !== 'cache';
 const isUnimplementedAccept = (item) => item.final?.decision === 'ACCEPT' && !item.implemented;
 const isOpenBlocking = (item) => item.bucket === 'BLOCKING' && (!item.final || isUnimplementedAccept(item));
@@ -397,7 +411,7 @@ export function roundOutcome(state) {
   // no items, and must neither hide those accepts (clean) nor strand the confirm round once the fixes are made (extraRound).
   // A resolutionOnly round is reviewed (it has items, accepts and a Fable obligation like any round); only the cap skips it.
   const lastReviewed = rounds.findLast((r) => r?.baseOnly !== true);
-  const newAccepted = idsOf((lastReviewed?.items ?? []).filter(isNewAccept));
+  const newAccepted = idsOf(roundsAwaitingFixReview(rounds).flatMap((r) => r.items ?? []).filter(isNewAccept));
   const coverageValid =
     last !== undefined &&
     hasContentHash(last.contentHashAtToHead) &&
@@ -465,6 +479,6 @@ export function reviewValidFor(state, contentHash) {
   const rounds = state?.rounds ?? [];
   const isClean = (round) => (round.items ?? []).every((item) => !isNewAccept(item));
   const lastReviewed = rounds.findLast((round) => round.baseOnly !== true);
-  if (lastReviewed === undefined || !isClean(lastReviewed)) return false;
+  if (lastReviewed === undefined || !roundsAwaitingFixReview(rounds).every(isClean)) return false;
   return rounds.at(-1).contentHashAtToHead === contentHash;
 }
