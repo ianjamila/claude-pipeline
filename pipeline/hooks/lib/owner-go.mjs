@@ -333,21 +333,20 @@ export function approvedPr({ repo, pr, head, session, ...opts }) {
 // What an owner's answer to a ruling request decides, per item. Security reviews of f17b251, ff8090f and 009d435: reading decisions
 // out of free text (a fragment, a word read for the wrong item, "don't accept", a contradicting word left over) always left a way to
 // pass words for a ruling the owner did not give, so the answer is now ONLY the decisions, nothing else: `R1-B1: accept, R2-S3: reject`
-// (each asked id at most once; `:` `-` `=` or a space between id and decision; commas, semicolons, full stops, `and` between pairs),
-// or, when the request asked about exactly one item, the bare decision (`follow-up`). Any other word, an id not asked, or an id twice,
-// and the answer decides nothing (the owner's reasons go in another message). Returns Map(ID upper case → ACCEPT | FOLLOW-UP | REJECT).
+// (each asked id at most once; `:` `-` `=` or a space between id and decision; commas, semicolons, full stops, `and` between pairs).
+// The id is always written (Fable attacker pass: the ruling line is the agent's, so a bare "accept" answering an unrelated question
+// under it would rule). Any other word, an id not asked, or an id twice, and the answer decides nothing (the owner's reasons go in
+// another message). Returns Map(ID upper case → ACCEPT | FOLLOW-UP | REJECT).
 const DECISION = '(accept|follow[- ]?up|reject)';
 const ITEM = '(r\\d{1,4}-[a-z]{1,8}\\d{1,4})';
 const decisionOf = (w) => (/^accept/i.test(w) ? 'ACCEPT' : /^reject/i.test(w) ? 'REJECT' : 'FOLLOW-UP');
 const SEP = '(?:\\s*[,;.]\\s*|\\s+and\\s+|\\s+)';
 const PAIR = `${ITEM}\\s*[:=–—-]?\\s*${DECISION}`;
 const PAIRS_ONLY = new RegExp(`^${PAIR}(?:${SEP}${PAIR})*[.!]?$`, 'i');
-const BARE_ONLY = new RegExp(`^${DECISION}[.!]?$`, 'i');
 export function rulingsIn(answer, askedIds) {
   const a = String(answer ?? '').replace(/\s+/g, ' ').trim();
   const asked = (askedIds ?? []).map((x) => String(x).toUpperCase());
   const out = new Map();
-  if (asked.length === 1 && BARE_ONLY.test(a)) return out.set(asked[0], decisionOf(BARE_ONLY.exec(a)[1]));
   if (!PAIRS_ONLY.test(a)) return out;
   for (const [, id, d] of a.matchAll(new RegExp(PAIR, 'gi'))) {
     const k = id.toUpperCase();

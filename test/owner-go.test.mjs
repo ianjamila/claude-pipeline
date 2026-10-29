@@ -124,7 +124,7 @@ test('owner-go: a ruling is recorded only after a reply that ends with the rulin
 
 // Security reviews of f17b251 / ff8090f: the answer is read in one fixed form, so a negation, a loose answer to several items or
 // a decision written for another item never passes for the owner's ruling.
-test('owner-go: rulingsIn reads an answer that is only "<id>: <decision>" pairs, or a bare decision when one item was asked', () => {
+test('owner-go: rulingsIn reads an answer that is only "<id>: <decision>" pairs, the id always written', () => {
   const two = ['R1-B1', 'R2-S3'];
   const read = (answer, asked = two) => Object.fromEntries(rulingsIn(answer, asked));
   assert.deepEqual(read('R1-B1: accept. R2-S3 - reject'), { 'R1-B1': 'ACCEPT', 'R2-S3': 'REJECT' });
@@ -137,9 +137,8 @@ test('owner-go: rulingsIn reads an answer that is only "<id>: <decision>" pairs,
     assert.deepEqual(read(bad), {}, bad);
   }
   const one = (answer) => read(answer, ['R1-B1']);
-  assert.deepEqual(one('Follow-up.'), { 'R1-B1': 'FOLLOW-UP' }, 'one item asked: a bare decision');
   assert.deepEqual(one('R1-B1: reject'), { 'R1-B1': 'REJECT' });
-  for (const bad of ['Yes, file it as a follow-up', 'ok', 'accept the first, reject the rest', 'accept R2-S3', 'do not accept', 'no follow-up', 'accept accept']) {
+  for (const bad of ['Follow-up.', 'accept', 'Yes, file it as a follow-up', 'ok', 'accept the first, reject the rest', 'accept R2-S3', 'do not accept', 'no follow-up', 'accept accept']) {
     assert.deepEqual(one(bad), {}, bad);
   }
   assert.deepEqual(read('accept'), {}, 'a bare decision when two items were asked');

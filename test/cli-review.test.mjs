@@ -2716,9 +2716,9 @@ test('summary reads model proofs from the state rounds, the files only as a fall
 
 const CHAT_YML = `${pipelineYml()}owner_approval: chat\n`;
 // (an owner answer to a ruling request is only the decisions: hooks/lib/owner-go.mjs rulingsIn)
-const QUOTE = 'Follow-up.';
+const QUOTE = 'R1-B1: follow-up.';
 const REJECT_QUOTE = 'R1-S1: reject';
-const ACCEPT_QUOTE = 'accept';
+const ACCEPT_QUOTE = 'R1-B1: accept';
 
 // A round whose listed items an arbiter left waiting for a human (what `arbiter apply` does on a failed model proof).
 function waitingForHuman(w, decisions) {
