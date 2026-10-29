@@ -103,14 +103,15 @@ test('owner-go: a ruling is recorded only after a reply that ends with the rulin
   for (const bad of [`${ASK}\nanything after`, '⚖️ Owner ruling needed #58: R1-B1', '⚖️ Owner ruling needed: R1-B1 · repo o/r', '⚖️ Owner ruling needed #58: all of them · repo o/r']) {
     assert.equal(presentedRuling(bad), null, bad);
   }
-  const answer = 'R1-B1: reject, it is fine as is.  R2-S3 follow-up';
+  const answer = 'R1-B1: reject,  R2-S3 follow-up';
   const r = recordRuling(input(home, answer, [said(ASK)]), { home, now });
   assert.deepEqual([r.kind, r.repo, r.pr, r.ids, r.prompt], ['ruling', 'o/r', 58, ['R1-B1', 'R2-S3'], answer]);
-  const ruled = (o) => ownerRuled({ repo: 'o/r', pr: 58, id: 'R1-B1', quote: 'r1-b1: REJECT, it is fine as is. r2-s3 follow-up', decision: 'REJECT', home, now, ...o });
+  const ruled = (o) => ownerRuled({ repo: 'o/r', pr: 58, id: 'R1-B1', quote: 'r1-b1: REJECT, r2-s3 follow-up', decision: 'REJECT', home, now, ...o });
   assert.equal(ruled({}), true, 'the whole answer, white space and case aside');
   assert.equal(ruled({ id: 'R2-S3', decision: 'FOLLOW-UP' }), true, 'each item its own decision');
   assert.equal(ruled({ id: 'R2-S3', decision: 'REJECT' }), false, 'the decision written for another item');
-  assert.equal(ruled({ quote: 'R1-B1: reject, it is fine as is.' }), false, 'a part of the answer');
+  assert.equal(ruled({ quote: 'R1-B1: reject' }), false, 'a part of the answer');
+  assert.equal(recordRuling(input(home, `R1-B1: accept${' '.repeat(1000)}.`, [said(ASK)]), { home, now }), null, 'an answer over 1000 characters is not recorded (never cut)');
   assert.equal(ruled({ decision: 'ACCEPT' }), false);
   assert.equal(ruled({ id: 'R3-B1' }), false, 'an item not asked about');
   assert.equal(ruled({ quote: '  ' }), false, 'an empty quote');
@@ -123,24 +124,25 @@ test('owner-go: a ruling is recorded only after a reply that ends with the rulin
 
 // Security reviews of f17b251 / ff8090f: the answer is read in one fixed form, so a negation, a loose answer to several items or
 // a decision written for another item never passes for the owner's ruling.
-test('owner-go: rulingsIn reads only "<id>: <decision>" pairs, or a bare decision when one item was asked', () => {
+test('owner-go: rulingsIn reads an answer that is only "<id>: <decision>" pairs, or a bare decision when one item was asked', () => {
   const two = ['R1-B1', 'R2-S3'];
   const read = (answer, asked = two) => Object.fromEntries(rulingsIn(answer, asked));
-  assert.deepEqual(read('R1-B1: accept. R2-S3 - reject, it is fine'), { 'R1-B1': 'ACCEPT', 'R2-S3': 'REJECT' });
-  assert.deepEqual(read('r1-b1 followup, r2-s3=Follow up'), { 'R1-B1': 'FOLLOW-UP', 'R2-S3': 'FOLLOW-UP' });
-  assert.deepEqual(read('accept one, reject the other'), {}, 'several items asked: each must be named');
-  assert.deepEqual(read('accept R1-B1'), {}, 'the decision before the id is not the form');
-  assert.deepEqual(read('R1-B1: accept, R1-B1: reject'), {}, 'two decisions for one item');
-  assert.deepEqual(read('R1-B10: accept'), {}, 'R1-B10 is another item, not asked');
-  assert.deepEqual(read("R1-B1: don't accept, R2-S3: reject"), {}, 'a negated decision: the answer decides nothing');
-  assert.deepEqual(read('R1-B1: accept rather than reject'), {}, 'rather than: decides nothing');
+  assert.deepEqual(read('R1-B1: accept. R2-S3 - reject'), { 'R1-B1': 'ACCEPT', 'R2-S3': 'REJECT' });
+  assert.deepEqual(read('r1-b1 followup, r2-s3=Follow up!'), { 'R1-B1': 'FOLLOW-UP', 'R2-S3': 'FOLLOW-UP' });
+  assert.deepEqual(read('R1-B1: accept and R2-S3: reject'), { 'R1-B1': 'ACCEPT', 'R2-S3': 'REJECT' });
+  assert.deepEqual(read('R2-S3: reject'), { 'R2-S3': 'REJECT' }, 'some of the asked items');
+  // anything but decisions decides nothing (security reviews of f17b251, ff8090f, 009d435)
+  for (const bad of ['R1-B1: accept, it is fine', 'accept one, reject the other', 'accept R1-B1', 'R1-B1: accept, R1-B1: reject', 'R1-B1: accept, R1-B1: accept',
+    'R1-B10: accept', "R1-B1: don’t accept", 'R1-B1: accept rather than reject', 'R1-B1: accept, R2-S3: reject. R1-B1 is fine', 'R1-B1: accepted', '']) {
+    assert.deepEqual(read(bad), {}, bad);
+  }
   const one = (answer) => read(answer, ['R1-B1']);
-  assert.deepEqual(one('Yes, file it as a follow-up, not part of this PR.'), { 'R1-B1': 'FOLLOW-UP' }, 'one item asked: a bare decision');
-  assert.deepEqual(one('ok'), {}, 'no decision');
-  assert.deepEqual(one('accept the first, reject the rest'), {}, 'two decisions');
-  assert.deepEqual(one('accept R2-S3'), {}, 'names another item');
-  assert.deepEqual(one('do not accept it'), {}, 'negated');
-  assert.deepEqual(one('no follow-up needed'), {}, 'negated');
+  assert.deepEqual(one('Follow-up.'), { 'R1-B1': 'FOLLOW-UP' }, 'one item asked: a bare decision');
+  assert.deepEqual(one('R1-B1: reject'), { 'R1-B1': 'REJECT' });
+  for (const bad of ['Yes, file it as a follow-up', 'ok', 'accept the first, reject the rest', 'accept R2-S3', 'do not accept', 'no follow-up', 'accept accept']) {
+    assert.deepEqual(one(bad), {}, bad);
+  }
+  assert.deepEqual(read('accept'), {}, 'a bare decision when two items were asked');
 });
 
 test('owner-go: records are written and read only through real folders and files', { skip: process.platform === 'win32' }, () => {

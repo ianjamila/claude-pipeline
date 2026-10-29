@@ -2715,9 +2715,10 @@ test('summary reads model proofs from the state rounds, the files only as a fall
 // ---- triage owner-ruling (owner_approval: chat) -----------------------------------------------
 
 const CHAT_YML = `${pipelineYml()}owner_approval: chat\n`;
-const QUOTE = 'Yes, file it as a follow-up, not part of this PR.';
-const REJECT_QUOTE = 'Reject R1-S1, it is fine as is.';
-const ACCEPT_QUOTE = 'Accept it, fix it in this PR.';
+// (an owner answer to a ruling request is only the decisions: hooks/lib/owner-go.mjs rulingsIn)
+const QUOTE = 'Follow-up.';
+const REJECT_QUOTE = 'R1-S1: reject';
+const ACCEPT_QUOTE = 'accept';
 
 // A round whose listed items an arbiter left waiting for a human (what `arbiter apply` does on a failed model proof).
 function waitingForHuman(w, decisions) {
@@ -2797,7 +2798,7 @@ test('triage owner-ruling: needs the owner\'s recorded answer to a ruling reques
   assert.equal(ownerRules(t, QUOTE, rulingRequest(7, ['R1-B1', 'not-an-id'])), null, 'a line naming something that is no item id asks nothing');
   assertExit(w.cli(rule('R1-B1', 'FOLLOW-UP')), 1);
   assert.equal(w.item('R1-B1').final.by, 'arbiter', 'state untouched');
-  ownerAnswers(t, { prompt: QUOTE.toUpperCase().replace(/ /g, '\n  ') }); // (white space and case aside)
+  ownerAnswers(t, { prompt: `\n  ${QUOTE.toUpperCase()}  ` }); // (white space and case aside)
   assertExit(w.cli(rule('R1-B1', 'FOLLOW-UP')), 0);
   assert.equal(w.item('R1-B1').final.ownerQuote, QUOTE);
 });
@@ -2806,7 +2807,7 @@ test('triage owner-ruling: an answer that rules on several items names each one 
   const w = world(t, { yml: CHAT_YML });
   assertExit(w.codex(1, findingsOf([finding()], [finding({ title: 'Rename helper', file: 'src/b.js', line: 3 })])), 0);
   waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP', 'R1-S1': 'REJECT' });
-  const both = 'R1-B1: follow-up, not part of this PR. R1-S1: reject, it is fine.';
+  const both = 'R1-B1: follow-up; R1-S1: reject.';
   ownerAnswers(t, { prompt: both, ids: ['R1-B1', 'R1-S1'] });
   assertExit(w.cli(rule('R1-S1', 'FOLLOW-UP', { quote: both })), 1, 'the decision written for the other item');
   assertExit(w.cli(rule('R1-B1', 'FOLLOW-UP', { quote: both })), 0);

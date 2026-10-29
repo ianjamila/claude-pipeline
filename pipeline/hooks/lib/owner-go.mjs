@@ -239,7 +239,7 @@ function appendRecord(home, session, record) {
   return record;
 }
 
-export const RULING_PROMPT_MAX = 4000; // the owner's words kept for a ruling (a longer prompt is cut: a quote must come from its start)
+export const RULING_PROMPT_MAX = 1000; // a ruling answer is only decisions (rulingsIn); a longer prompt is no answer and is not recorded (never cut)
 
 // Phase 3b, the ruling recorder (same hook, same folder): when the reply right before the owner's prompt ends with the ruling line
 // (presentedRuling), writes the prompt's words, bound to that repository, PR and those item ids. Returns the record, or null. Never throws.
@@ -247,14 +247,14 @@ export function recordRuling(input, { home = accountHome(), now = Date.now } = {
   try {
     if (notOwnerPrompt(input)) return null;
     const session = String(input?.session_id ?? '');
-    if (!SESSION_RE.test(session) || typeof input?.prompt !== 'string' || input.prompt.trim() === '') return null;
+    if (!SESSION_RE.test(session) || typeof input?.prompt !== 'string' || input.prompt.trim() === '' || input.prompt.length > RULING_PROMPT_MAX) return null;
     const asked = presentedRuling(lastReplyText(String(input?.transcript_path ?? ''), { prompt: input.prompt }));
     if (!asked) return null;
     return appendRecord(home, session, {
       v: 1, kind: 'ruling', ts: new Date(now()).toISOString(), session,
       prompt_sha256: createHash('sha256').update(input.prompt).digest('hex'),
       cwd: typeof input.cwd === 'string' ? input.cwd : null,
-      repo: asked.repo, pr: asked.pr, ids: asked.ids, prompt: input.prompt.slice(0, RULING_PROMPT_MAX),
+      repo: asked.repo, pr: asked.pr, ids: asked.ids, prompt: input.prompt,
     });
   } catch {
     return null;
@@ -330,35 +330,30 @@ export function approvedPr({ repo, pr, head, session, ...opts }) {
   return readApprovals({ ...opts, session }).some((r) => r.requests.some((q) => q.repo === key && q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head)));
 }
 
-// What an owner's answer to a ruling request decides, per item (security reviews of f17b251 and ff8090f: a fragment of the answer,
-// a decision word read for the wrong item, or a negated one, "don't accept", must never pass for the owner's ruling). The answer is
-// read in ONE fixed form: `R1-B1: accept` (or `follow-up` / `reject`; `:` `-` `=` or nothing between, any words after) for each item.
-// Only when the request asked about exactly one item may the answer be a bare decision ("follow-up, not part of this PR"), and then
-// it must name no other item and only that one decision. Any negation before a decision word, or two decisions for one item, and
-// the answer decides nothing. Returns Map(ID upper case → ACCEPT | FOLLOW-UP | REJECT), only for asked ids.
-const DECISION = '(accept(?:s|ed)?|follow[- ]?ups?|reject(?:s|ed)?)';
-const ITEM = 'r\\d{1,4}-[a-z]{1,8}\\d{1,4}';
+// What an owner's answer to a ruling request decides, per item. Security reviews of f17b251, ff8090f and 009d435: reading decisions
+// out of free text (a fragment, a word read for the wrong item, "don't accept", a contradicting word left over) always left a way to
+// pass words for a ruling the owner did not give, so the answer is now ONLY the decisions, nothing else: `R1-B1: accept, R2-S3: reject`
+// (each asked id at most once; `:` `-` `=` or a space between id and decision; commas, semicolons, full stops, `and` between pairs),
+// or, when the request asked about exactly one item, the bare decision (`follow-up`). Any other word, an id not asked, or an id twice,
+// and the answer decides nothing (the owner's reasons go in another message). Returns Map(ID upper case → ACCEPT | FOLLOW-UP | REJECT).
+const DECISION = '(accept|follow[- ]?up|reject)';
+const ITEM = '(r\\d{1,4}-[a-z]{1,8}\\d{1,4})';
 const decisionOf = (w) => (/^accept/i.test(w) ? 'ACCEPT' : /^reject/i.test(w) ? 'REJECT' : 'FOLLOW-UP');
-const NEGATED = new RegExp(`\\b(?:not|no|don'?t|do not|never|instead of|rather than)\\s+(?:\\S+\\s+)?${DECISION}\\b`, 'i');
+const SEP = '(?:\\s*[,;.]\\s*|\\s+and\\s+|\\s+)';
+const PAIR = `${ITEM}\\s*[:=–—-]?\\s*${DECISION}`;
+const PAIRS_ONLY = new RegExp(`^${PAIR}(?:${SEP}${PAIR})*[.!]?$`, 'i');
+const BARE_ONLY = new RegExp(`^${DECISION}[.!]?$`, 'i');
 export function rulingsIn(answer, askedIds) {
-  const a = String(answer ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const a = String(answer ?? '').replace(/\s+/g, ' ').trim();
   const asked = (askedIds ?? []).map((x) => String(x).toUpperCase());
   const out = new Map();
-  if (NEGATED.test(a)) return out;
-  const pairs = [...a.matchAll(new RegExp(`\\b(${ITEM})\\b\\s*[:=–—-]?\\s*${DECISION}\\b`, 'gi'))];
-  if (pairs.length > 0) {
-    const seen = new Map();
-    for (const [, id, d] of pairs) {
-      const k = id.toUpperCase();
-      seen.set(k, seen.has(k) && seen.get(k) !== decisionOf(d) ? null : decisionOf(d));
-    }
-    for (const [k, v] of seen) if (v !== null && asked.includes(k)) out.set(k, v);
-    return out;
+  if (asked.length === 1 && BARE_ONLY.test(a)) return out.set(asked[0], decisionOf(BARE_ONLY.exec(a)[1]));
+  if (!PAIRS_ONLY.test(a)) return out;
+  for (const [, id, d] of a.matchAll(new RegExp(PAIR, 'gi'))) {
+    const k = id.toUpperCase();
+    if (!asked.includes(k) || out.has(k)) return new Map();
+    out.set(k, decisionOf(d));
   }
-  if (asked.length !== 1) return out;
-  if ([...a.matchAll(new RegExp(`\\b${ITEM}\\b`, 'gi'))].some((m) => m[0].toUpperCase() !== asked[0])) return out;
-  const said = new Set([...a.matchAll(new RegExp(`\\b${DECISION}\\b`, 'gi'))].map((m) => decisionOf(m[1])));
-  if (said.size === 1) out.set(asked[0], [...said][0]);
   return out;
 }
 
