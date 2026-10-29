@@ -44,16 +44,16 @@ test('merge: refuses a failed gate, another PR\'s gate, a stale gate and a gate 
   attempt('not ok', (g) => { g.ok = false; }, /did not pass/);
   attempt('a failing check', (g) => { g.checks[0].ok = false; }, /failing or missing/);
   attempt('other PR', (g) => { g.pr = 13; }, /#13/);
-  attempt('stale', (g) => { g.at = new Date(Date.now() - 31 * 60_000).toISOString(); }, /minutes old/);
+  attempt('stale', (g) => { g.at = new Date(Date.now() - 25 * 3_600_000).toISOString(); }, /minutes old \(limit 1440\)/);
   attempt('other head', (g) => { g.head = 'a'.repeat(40); }, /worktree is at/);
   attempt('other patch', (g) => { g.contentHash = 'f'.repeat(64); }, /content hash differs/);
   attempt('other repo', (g) => { g.repo = 'someone/else'; }, /someone\/else/);
 });
 
-test('merge: a gate that is 29 minutes old is still fresh', () => {
+test('merge: a gate that is 23 hours old is still fresh (the limit is a day, not the old 30 minutes)', () => {
   const s = scenario();
   assertExit(s.gate(), 0);
-  s.editGate((g) => { g.at = new Date(Date.now() - 29 * 60_000).toISOString(); });
+  s.editGate((g) => { g.at = new Date(Date.now() - 23 * 3_600_000).toISOString(); });
   const r = s.merge();
   assertExit(r, 0, r.stdout);
 });

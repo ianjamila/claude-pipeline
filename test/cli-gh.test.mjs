@@ -10,6 +10,8 @@ import { emptyState, saveState } from '../pipeline/lib/state.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
 import { applyCheckpoint, decodeRecord, emptyRecord, encodeRecord } from '../pipeline/lib/run-record.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
+import { LABELS } from '../pipeline/commands/labels.mjs';
+import { GITHUB_ACTIONS_APP_ID, unpinnedChecks } from '../pipeline/commands/protect.mjs';
 
 const bin = join(dirname(fileURLToPath(import.meta.url)), '..', 'pipeline', 'bin', 'pipeline.mjs');
 
@@ -55,7 +57,7 @@ test('labels ensure: creates missing labels, edits mismatched ones, leaves corre
   assert.equal(r.json.ok, true);
   assert.deepEqual(r.json.unchanged.sort(), ['needs-human', 'pipeline-pause']);
   assert.deepEqual(r.json.updated.sort(), ['agent-build', 'awaiting-review']);
-  assert.deepEqual(r.json.created.sort(), ['agent-suggestion', 'human-approved', 'pipeline-blocked', 'pipeline-rollback', 'test-change-approved']);
+  assert.deepEqual(r.json.created.sort(), ['agent-suggestion', 'human-approved', 'pipeline-blocked', 'pipeline-recheck', 'pipeline-rollback', 'test-change-approved']);
   const lines = fake.lines();
   assert.ok(lines.includes('label create pipeline-blocked --color d93f0b --description Verify could not be made green'));
   assert.ok(lines.includes('label edit awaiting-review --color fbca04 --description Cross-model review pending (Codex unavailable)'));
@@ -75,12 +77,14 @@ test('labels ensure: a second run is a no-op once everything matches', () => {
     ['agent-build', '1d76db', 'Ask the pipeline to build this'],
     ['human-approved', '0e8a16', 'Owner approved this head (hard-stop)'],
     ['test-change-approved', '0e8a16', 'Owner approved a test change'],
+    ['pipeline-recheck', 'c5def5', 'Added and removed by review-complete to re-run the guards'],
   ].map(([name, color, description]) => ({ name, color, description }));
   const fake = createFakeGh([{ match: '^label list', stdoutJson: all }]);
   const r = cli(['labels', 'ensure'], { repo, fake });
   assertExit(r, 0);
   assert.deepEqual([r.json.created, r.json.updated], [[], []]);
-  assert.equal(r.json.unchanged.length, 9);
+  assert.equal(r.json.unchanged.length, 10);
+  assert.ok(r.json.unchanged.includes('pipeline-recheck'));
   assert.equal(fake.calls().length, 1);
 });
 
@@ -95,6 +99,12 @@ test('labels ensure: a create that hits "already exists" falls back to an edit',
   assertExit(r, 0);
   assert.ok(r.json.updated.includes('needs-human'));
   assert.ok(fake.lines().includes('label edit needs-human --color b60205 --description Waiting for the owner'));
+});
+
+test('LABELS includes pipeline-recheck (the label review-complete adds and removes to re-run the guards)', () => {
+  const l = LABELS.find((x) => x.name === 'pipeline-recheck');
+  assert.ok(l, 'pipeline-recheck is ensured');
+  assert.equal(l.color, 'c5def5');
 });
 
 test('labels: anything other than "ensure" is a usage error; a gh failure is exit 3', () => {
@@ -123,6 +133,20 @@ test('preflight exits 0 when the pipeline may merge', () => {
   assertExit(r, 0);
   assert.equal(r.json.canMerge, true);
   assert.equal(r.json.enforcement.mode, 'github');
+});
+
+test('preflight: with ci.review_check, protection must also require Cross-model review', () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', `${pipelineYml('github', ['ci'], { guardChecks: true })}  review_check: true\n`);
+  repo.commit('init');
+  const guarded = ['ci', 'Test integrity', 'Hard-stop scan'];
+  const without = cli(['preflight'], { repo, fake: healthy([{ match: 'branches/main/protection', stdoutJson: fullProtection(guarded) }]), env: createFakeCodex().env });
+  assertExit(without, 1);
+  assert.equal(without.json.canMerge, false);
+  assert.ok(JSON.stringify(without.json).includes('required_check:Cross-model review'), JSON.stringify(without.json));
+  const withIt = cli(['preflight'], { repo, fake: healthy([{ match: 'branches/main/protection', stdoutJson: fullProtection([...guarded, 'Cross-model review']) }]), env: createFakeCodex().env });
+  assertExit(withIt, 0);
+  assert.equal(withIt.json.canMerge, true);
 });
 
 test('preflight exits 1 when it may not merge (declared github, protection missing)', () => {
@@ -400,7 +424,7 @@ test('resume list: open PRs labelled awaiting-review, each with a why', () => {
 // ---- protect --------------------------------------------------------------------------------
 
 const PROTECTION_PAYLOAD = {
-  required_status_checks: { strict: false, checks: [{ context: 'ci' }, { context: 'e2e' }] },
+  required_status_checks: { strict: false, checks: [{ context: 'ci', app_id: 15368 }, { context: 'e2e', app_id: 15368 }] },
   enforce_admins: true,
   required_pull_request_reviews: { required_approving_review_count: 0, dismiss_stale_reviews: false, require_code_owner_reviews: false },
   restrictions: null,
@@ -440,7 +464,7 @@ test('protect: checks default to ci.required_checks; none at all is a usage erro
   const fake = createFakeGh([REPO]);
   const fromConfig = cli(['protect'], { repo: repoWith('github', ['ci', 'build']), fake });
   assertExit(fromConfig, 0);
-  assert.deepEqual(fromConfig.json.requests[0].body.required_status_checks.checks, [{ context: 'ci' }, { context: 'build' }]);
+  assert.deepEqual(fromConfig.json.requests[0].body.required_status_checks.checks, [{ context: 'ci', app_id: 15368 }, { context: 'build', app_id: 15368 }]);
   const none = cli(['protect'], { repo: repoWith('github', []), fake });
   assertExit(none, 2);
   assert.match(none.json.message, /no required checks/);
@@ -463,6 +487,45 @@ test('protect: the guard contexts are added to the config list (and are enough o
   assert.deepEqual(cli(['protect', '--checks', 'x'], { repo, fake }).json.checks, ['x']);
 });
 
+// A read-back whose required checks GitHub reports pinned to the Actions app.
+function pinnedProtection(checks) {
+  const p = fullProtection(checks);
+  p.required_status_checks.checks = checks.map((context) => ({ context, app_id: GITHUB_ACTIONS_APP_ID }));
+  return p;
+}
+
+test('protect: the Actions app id is 15368, and every required check in the payload is pinned to it', () => {
+  assert.equal(GITHUB_ACTIONS_APP_ID, 15368);
+  const fake = createFakeGh([REPO]);
+  const r = cli(['protect', '--checks', 'ci,Test integrity'], { repo: repoWith(), fake });
+  assertExit(r, 0);
+  assert.deepEqual(r.json.requests[0].body.required_status_checks.checks.map((c) => c.app_id), [15368, 15368]);
+});
+
+test('unpinnedChecks: names every required check the read-back does not pin to the Actions app', () => {
+  const row = (context, app_id) => ({ context, app_id });
+  const json = (rows) => ({ required_status_checks: { checks: rows } });
+  assert.deepEqual(unpinnedChecks(json([row('a', 15368), row('b', 15368)]), ['a', 'b']), []);
+  assert.deepEqual(unpinnedChecks(json([row('a', 15368), row('b', null)]), ['a', 'b']), ['b']);
+  assert.deepEqual(unpinnedChecks(json([row('a', -1), row('b', 42)]), ['a', 'b']), ['a', 'b'], 'any other app id (or "any app") is unpinned');
+  assert.deepEqual(unpinnedChecks(json([row('a', 15368)]), ['a', 'missing']), ['missing'], 'a check with no row is unpinned');
+  assert.deepEqual(unpinnedChecks(json([row('a', 15368)]), []), []);
+  for (const empty of [{}, null, undefined, { required_status_checks: {} }]) {
+    assert.deepEqual(unpinnedChecks(empty, ['a']), ['a'], JSON.stringify(empty));
+  }
+});
+
+test('protect: ci.review_check adds Cross-model review to the checks (after the guard checks)', () => {
+  const fake = createFakeGh([REPO]);
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', `${pipelineYml('github', ['ci'], { guardChecks: true })}  review_check: true\n`);
+  repo.commit('init');
+  const r = cli(['protect'], { repo, fake });
+  assertExit(r, 0);
+  assert.deepEqual(r.json.checks, ['ci', 'Test integrity', 'Hard-stop scan', 'Cross-model review']);
+  assert.deepEqual(r.json.requests[0].body.required_status_checks.checks.map((c) => c.context), r.json.checks);
+});
+
 const writeEntries = [
   { match: '^api -X PUT repos/acme/widgets/branches/main/protection ', stdoutJson: {} },
   { match: '^api -X PATCH repos/acme/widgets ', stdoutJson: {} },
@@ -483,11 +546,11 @@ test('protect --apply with PIPELINE_ADMIN=1: PUT, PATCH, PUT in order, then read
   const fake = createFakeGh([
     REPO,
     ...writeEntries,
-    { match: '^api repos/acme/widgets/branches/main/protection$', stdoutJson: fullProtection(['ci', 'e2e']) },
+    { match: '^api repos/acme/widgets/branches/main/protection$', stdoutJson: pinnedProtection(['ci', 'e2e']) },
   ]);
   const r = cli(['protect', '--apply', '--checks', 'ci,e2e'], { repo: repoWith(), fake, env: { PIPELINE_ADMIN: '1' } });
   assertExit(r, 0);
-  assert.deepEqual([r.json.ok, r.json.applied, r.json.mode, r.json.missing], [true, true, 'github', []]);
+  assert.deepEqual([r.json.ok, r.json.applied, r.json.mode, r.json.missing, r.json.unpinned], [true, true, 'github', [], []]);
   const calls = fake.calls();
   const writes = calls.filter((c) => c.argv.includes('-X'));
   assert.deepEqual(writes.map((c) => `${c.argv[c.argv.indexOf('-X') + 1]} ${c.argv[c.argv.indexOf('-X') + 2]}`), [
@@ -502,13 +565,29 @@ test('protect --apply with PIPELINE_ADMIN=1: PUT, PATCH, PUT in order, then read
   assert.equal(calls.at(-1).argv.join(' '), 'api repos/acme/widgets/branches/main/protection');
 });
 
+test('protect --apply: a read-back that does not pin the checks to the Actions app is not ok (exit 1), though nothing is missing', () => {
+  // fullProtection reports app_id null: GitHub accepted the contexts but any app may satisfy them.
+  const fake = createFakeGh([REPO, ...writeEntries, { match: '^api repos/acme/widgets/branches/main/protection$', stdoutJson: fullProtection(['ci', 'e2e']) }]);
+  const r = cli(['protect', '--apply', '--checks', 'ci,e2e'], { repo: repoWith(), fake, env: { PIPELINE_ADMIN: '1' } });
+  assertExit(r, 1);
+  assert.deepEqual([r.json.ok, r.json.applied, r.json.mode, r.json.missing, r.json.unpinned], [false, true, 'github', [], ['ci', 'e2e']]);
+  // one pinned, one not: only the unpinned one is named
+  const half = pinnedProtection(['ci', 'e2e']);
+  half.required_status_checks.checks[1].app_id = null;
+  const fake2 = createFakeGh([REPO, ...writeEntries, { match: '^api repos/acme/widgets/branches/main/protection$', stdoutJson: half }]);
+  const r2 = cli(['protect', '--apply', '--checks', 'ci,e2e'], { repo: repoWith(), fake: fake2, env: { PIPELINE_ADMIN: '1' } });
+  assertExit(r2, 1);
+  assert.deepEqual(r2.json.unpinned, ['e2e']);
+});
+
 test('protect --apply: a read-back that still misses settings is not ok (exit 1)', () => {
-  const weak = fullProtection(['ci']);
+  const weak = pinnedProtection(['ci']);
   weak.enforce_admins = { enabled: false };
   const fake = createFakeGh([REPO, ...writeEntries, { match: '^api repos/acme/widgets/branches/main/protection$', stdoutJson: weak }]);
   const r = cli(['protect', '--apply', '--checks', 'ci'], { repo: repoWith(), fake, env: { PIPELINE_ADMIN: '1' } });
   assertExit(r, 1);
   assert.deepEqual([r.json.ok, r.json.mode, r.json.missing], [false, 'gate', ['enforce_admins']]);
+  assert.deepEqual(r.json.unpinned, []);
 });
 
 test('protect --apply: 403 on a free plan is exit 1 with reason plan (and stops at the first write)', () => {

@@ -128,7 +128,7 @@ load and validate .claude/pipeline.yml.
 pipeline config [--repo DIR]   -> {ok, path, config}; exit 2 when missing or invalid
 ```
 
-Exit: 0 valid · 2 missing or invalid (`errors` listed). A valid config may carry `warnings` (e.g. `ci.required_checks` omits the guard contexts `Test integrity` / `Hard-stop scan`, or `verify.stop_queue_wait_minutes` is above 0 and the Stop hook running `stop-verify` in `.claude/settings.json` has a `timeout` below 900 + minutes * 60 seconds). `verify.stop_queue_wait_minutes` (integer 0..30, default 0) is the time `verify.quick` may spend queued before it runs: the Stop hook's run limit is 840 s plus that many minutes, so set the hook's `timeout` to 900 + minutes * 60 (5 -> 1200).
+Exit: 0 valid · 2 missing or invalid (`errors` listed). A valid config may carry `warnings` (e.g. `ci.required_checks` omits the guard contexts `Test integrity` / `Hard-stop scan`, or `verify.stop_queue_wait_minutes` is above 0 and the Stop hook running `stop-verify` in `.claude/settings.json` has a `timeout` below 900 + minutes * 60 seconds). `verify.stop_queue_wait_minutes` (integer 0..30, default 0) is the time `verify.quick` may spend queued before it runs: the Stop hook's run limit is 840 s plus that many minutes, so set the hook's `timeout` to 900 + minutes * 60 (5 -> 1200). `ci.review_check` (boolean, default false) adds the `Cross-model review` status to the guard workflow and to every required-check list (preflight, `protect`, the final gate); `true` with `ci.guard_checks: false` is an error (nothing would post it). Turn it on in the same change that applies branch protection with it.
 
 ## cost
 
@@ -269,7 +269,7 @@ Exit: 0 · 3 GitHub (`gh`) unavailable.
 merge the PR if (and only if) the final gate passes again, live; waits for MERGED.
 
 ```
-pipeline merge --pr N [--owner-approved-head SHA --owner-approved-items DIGEST] [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?, warnings?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment. While it runs the run record of the PR shows inFlight {kind: merge} and step merge; a prod-before event comment (the known-good deployment) is posted before the merge command, and when that post fails nothing is merged (error pre-merge); for a repo with verify.deferrable_steps the proofs of the live gate (where each deferrable step was proved: the Mac, or a GitHub run and attempt) are recorded in the run record and in an append-only ci-proof-used event comment before the merge command too, and when either write fails nothing is merged (error pre-merge); warnings lists a run record write that failed (never fatal). A run record marked resumed (`P checkpoint --resumed`: a run taken over by ship resume) refuses with error pre-merge unless the owner approved it; so does a run record that cannot be checked (unreadable, invalid or unsupported: it may be a resumed one), and with owner_approval: chat a gate with ownerMerge > 0. Approved = --owner-approved-head names the full gate head, --owner-approved-items the gate's ownerItems, AND the owner-go hook recorded the owner's "merge" for exactly that PR, head and item set (the flags alone refuse); the live gate must still show those ownerItems
+pipeline merge --pr N [--owner-approved-head SHA --owner-approved-items DIGEST | --owner-go] [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?, warnings?} ; --owner-go (work that never ran ship: no final-gate.json) merges the local HEAD when the owner-go hook recorded the owner's "merge" for this PR, that head and items none, the PR is open, not a draft, MERGEABLE, not behind its base, without a blocking label and every required check is green on that head (error owner-go / live-check / pre-merge otherwise; output mode owner-go, no prodBefore, nothing written); exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment. While it runs the run record of the PR shows inFlight {kind: merge} and step merge; a prod-before event comment (the known-good deployment) is posted before the merge command, and when that post fails nothing is merged (error pre-merge); for a repo with verify.deferrable_steps the proofs of the live gate (where each deferrable step was proved: the Mac, or a GitHub run and attempt) are recorded in the run record and in an append-only ci-proof-used event comment before the merge command too, and when either write fails nothing is merged (error pre-merge); warnings lists a run record write that failed (never fatal). A run record marked resumed (`P checkpoint --resumed`: a run taken over by ship resume) refuses with error pre-merge unless the owner approved it; so does a run record that cannot be checked (unreadable, invalid or unsupported: it may be a resumed one), and with owner_approval: chat a gate with ownerMerge > 0. Approved = --owner-approved-head names the full gate head, --owner-approved-items the gate's ownerItems, AND the owner-go hook recorded the owner's "merge" for exactly that PR, head and item set (the flags alone refuse); the live gate must still show those ownerItems
 ```
 
 Exit: 0 merged (a merge commit GitHub cannot name yet is `mergeSha: null` plus a `warning`; prod-watch resolves it) · 1 not merged / refused by the live gate or by the last pre-merge look at GitHub (run final-gate again; `behind-base`: the base moved, the branch was just updated on GitHub, so pull, re-verify and gate the new head) · 3 GitHub unavailable, or no known-good production deployment.
@@ -277,6 +277,8 @@ Exit: 0 merged (a merge commit GitHub cannot name yet is `mergeSha: null` plus a
 Resumed runs: `merge` reads the PR's run record (the viewer's own summary comment) before anything irreversible; when it carries `resumed` (set by `checkpoint --resumed`, never cleared), `merge` refuses with exit 1 `{merged: false, error: pre-merge, reason: resumed run: the owner must say "merge" for this exact head (then pass …)}` unless the owner approved it (below). A record that cannot be checked fails closed: unreadable comments, or an `invalid` / `unsupported` (newer version) record, refuse the same way (`reason: <the run record could not be read (…) | the run record is invalid|unsupported>, so the resumed-run guard cannot be checked: …`), because it may be a resumed one. No record (`absent`) or a `legacy` comment is an ordinary run.
 
 Owner approval (#58): with `owner_approval: chat` a gate with `ownerMerge > 0`, and any resumed or unchecked run, merges only with `--owner-approved-head <full gate head> --owner-approved-items <the gate's ownerItems>` AND a record of the owner-go hook (`~/.claude/pipeline-state/owner-go/<session>.jsonl` under the account's home, never `$HOME`; written only when the owner types a prompt starting with "merge" right after a reply that showed `Head <sha12> · items <ownerItems>` and the 🔀 line; valid 24 h) for exactly that PR, head and item set. The flags alone refuse (the reason then ends with `(no owner "merge" is recorded for #N head … items …)`). The live gate must still show the approved `ownerItems`, else `reason: the owner items changed since the owner said "merge" …`. `final-gate` reports `ownerItems` (a 12-character digest of the owner items, `none` without any).
+
+Owner-go (`--owner-go`, owner decision 2026-10-28): the route for work that never ran the ship loop (no verify report, no review state, no `final-gate.json`). The reply asking for the merge ends with `Head <sha12> · items none` above the 🔀 line; once the owner types "merge" the owner-go hook records it, and `merge --pr N --owner-go` then checks, in this order: the record for this PR, the local HEAD and items `none` (else `error: owner-go`, nothing read from GitHub); the live PR (open, not a draft, MERGEABLE, not behind its base, at the local HEAD, no blocking label) and every required check green on that head, guard statuses and `Cross-model review` only with their provenance (else `error: live-check` with the failing checks); the last pre-merge look (`error: pre-merge`). It runs `merge.command` pinned to the head (`{sha}`) and waits for MERGED like the gated route. It proves no verify step, writes no gate file, records no prod-before deployment (output `warnings` says so when `production` is configured: prod-watch then has no rollback target) and refuses `--owner-approved-head` / `--owner-approved-items` (usage, exit 2). The final gate file itself is now valid for 24 h (the owner's "merge" window): `merge` re-runs the whole gate live anyway.
 
 Run record: right after `.review/prod-before.json` is written, and before the merge command, `merge` sets the record's `inFlight` `{kind: merge, host, startedAt, maxMinutes: 2 × merge.wait_minutes + 15}` and `step: merge`, and posts, after the last look at GitHub and still before the merge command, a `prod-before` event (always a NEW comment: repo, environment, pr, `headBeforeMerge` = the approved PR head, `deployment {id, sha, url}`) when a known-good deployment was recorded (no `production` configured: no event). On every exit `inFlight` is cleared: merged → `step: prod-watch` and `mergeSha`; not merged → `step: gate`. The event fails CLOSED: it is the only cross-machine copy of the rollback target, so when it cannot be posted nothing is merged (exit 1, `error: pre-merge`, `reason: could not record the rollback target on the PR (prod-before event)`; `inFlight` is cleared). The run record itself is display: a failed record write is listed in `warnings` and never fails the merge.
 
@@ -322,7 +324,7 @@ pipeline preflight [--repo DIR]   (exit 0 can merge, 1 cannot, 2 config missing/
 
 Exit: 0 pipeline may merge · 1 it may not (`reasons`) · 2 config missing or invalid.
 
-Branch protection must require `ci.required_checks` AND, unless `ci.guard_checks: false`, the guard contexts `Test integrity` and `Hard-stop scan`; `protect` sets that same list.
+Branch protection must require `ci.required_checks` AND, unless `ci.guard_checks: false`, the guard contexts `Test integrity` and `Hard-stop scan` (plus `Cross-model review` with `ci.review_check: true`); `protect` sets that same list.
 
 ## prod-watch
 
@@ -353,7 +355,9 @@ print (or with --apply, set) the GitHub branch protection and repo settings the 
 pipeline protect [--apply] [--checks a,b] [--repo DIR]   (--apply needs PIPELINE_ADMIN=1)
 ```
 
-Exit: 0 dry run printed, or applied with nothing missing · 1 no admin rights / plan limit, or something still missing after applying · 2 usage (`--apply` without `PIPELINE_ADMIN=1`) · 3 GitHub (`gh`) unavailable.
+Exit: 0 dry run printed, or applied with nothing missing or unpinned · 1 no admin rights / plan limit, or something still missing or `unpinned` after applying · 2 usage (`--apply` without `PIPELINE_ADMIN=1`) · 3 GitHub (`gh`) unavailable.
+
+Every required check is pinned to the GitHub Actions app (`app_id: 15368`): only a status a workflow posted with `GITHUB_TOKEN` satisfies it, never one posted with a person's token (which agents share), so `Test integrity`, `Hard-stop scan` and `Cross-model review` cannot be posted from a terminal. Do not list a check another app posts (a deploy provider) in `ci.required_checks`: nothing could satisfy it. The read-back after `--apply` lists checks GitHub reports without that pin in `unpinned` and fails. The default list is `requiredChecks` (`ci.required_checks`, the guard contexts unless `ci.guard_checks: false`, and `Cross-model review` with `ci.review_check: true`).
 
 ## resume
 
@@ -397,7 +401,7 @@ Exit: 0 · 2 usage / PR not found · 3 GitHub (`gh`) unavailable.
 post the review-complete comment (and remove awaiting-review) once the review is valid for the current content.
 
 ```
-pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, posted|reused, comment:{id, url}, review, removed}; exit 1 {ok:false, reason} when the review is not valid
+pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, posted|reused, comment:{id, url}, review, removed, recheck, recheckError?}; exit 1 {ok:false, reason} when the review is not valid
   the checked-out HEAD must be the head GitHub holds for the PR; the PR must have had every Fable pass its risk or paths need
   the comment starts with the line `<!-- claude-pipeline:review-complete v1 -->` and carries the JSON {contentHash, base, head, rounds, codexModel, modelProofDigest}
   (base = the merge base the content hash is measured from; modelProofDigest = sha256 of the Fable model proofs, null when no Fable pass ran);
@@ -411,6 +415,13 @@ comment exists. The comment is append-only evidence (a new comment per new head,
 `contentHash(base, head)` minus the agent log (git.mjs), so a check that fetches only git data can recompute it.
 Validity is the state's (every round clean, coverage = this content) PLUS a lane re-check from the PR itself: a PR whose
 files, size or recorded risk call for the Fable pass is refused unless some round ran a proven one.
+
+With `ci.review_check: true` the guard workflow turns this comment into the `Cross-model review` status (success only when
+the newest such comment by an allowed author names the content hash of the PR head). A comment starts no workflow, so
+`recheck` says how the guards learn about it: `on-ready` (a draft: marking it ready starts them), `label-removed`
+(removing `awaiting-review` already did), `triggered` (a ready PR: the command added and removed the label
+`pipeline-recheck`, created by `P labels`), or `failed` with `recheckError` (the comment stands; add and remove any label
+by hand). A failed nudge never changes the exit code.
 
 ## risk
 
@@ -555,7 +566,7 @@ pipeline vendor --repo DIR [--check]
 
 Exit: 0 copied / no drift · 1 drift found (`--check`) · 2 usage.
 
-Vendoring also appends `scripts/pipeline/** -text` and `scripts/verify text eol=lf` to the project's `.gitattributes` (idempotent; output `gitattributes` lists what was added), so a Windows autocrlf checkout cannot make the byte comparison drift. `--check` warns when the entries are missing.
+Vendoring also appends `scripts/pipeline/** -text` and `scripts/verify text eol=lf` to the project's `.gitattributes` (idempotent; output `gitattributes` lists what was added), so a Windows autocrlf checkout cannot make the byte comparison drift. `--check` warns when the entries are missing. The vendored libs include `lib/review-marker.mjs` (the review-complete marker and its parser, used by the guards for `Cross-model review`).
 
 ## verify
 

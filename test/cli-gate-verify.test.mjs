@@ -1,6 +1,7 @@
 // final-gate, part 2: every way the verify report can be wrong, then hardstops, integrity and review.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { addRound, saveState } from '../pipeline/lib/state.mjs';
@@ -32,6 +33,93 @@ test('final-gate: each way the verify report can be wrong fails verify-report', 
     assert.deepEqual(r.json.failed, ['verify-report'], label);
     assert.match(named(r.json, 'verify-report').detail, detail, label);
   }
+});
+
+// ---- final-gate: a verify report for another commit with HEAD's tree ------------------------------
+
+// Amends the PR commit's message only (same tree, new sha) and points the fake PR at the new head. `date`: the amended commit's
+// committer date. -> the new head.
+function reword(s, { date } = {}) {
+  execFileSync('git', ['commit', '--amend', '-q', '-m', 'feature, reworded'], {
+    cwd: s.repo.dir, env: { ...process.env, ...(date ? { GIT_COMMITTER_DATE: date } : {}) },
+  });
+  const head = s.repo.git(['rev-parse', 'HEAD']).trim();
+  assert.notEqual(head, s.head, 'the amend made a new commit');
+  assert.equal(s.repo.git(['rev-parse', `${head}^{tree}`]).trim(), s.repo.git(['rev-parse', `${s.head}^{tree}`]).trim(), 'same tree');
+  s.fake.setScript(ghEntries({ prHead: head }));
+  return head;
+}
+
+test('final-gate: a verify report for an earlier commit with HEAD\'s tree (an amended message) stands, and the detail says so', () => {
+  const s = scenario();
+  const head = reword(s);
+  const r = s.gate();
+  assertExit(r, 0, JSON.stringify(r.json?.checks.filter((c) => !c.ok)));
+  assert.equal(r.json.head, head);
+  assert.match(named(r.json, 'verify-report').detail, new RegExp(`full verify passed at ${s.head.slice(0, 8)}, the same tree as HEAD ${head.slice(0, 8)} \\(5 steps\\)`));
+});
+
+test('final-gate: the same-tree report must be younger than the VERIFIED commit, not than the amended HEAD', () => {
+  // HEAD's committer date is an hour ahead of the report; the verified commit is older than the report: still fine.
+  const later = scenario();
+  reword(later, { date: new Date(Date.now() + 3_600_000).toISOString() });
+  const ok = later.gate();
+  assertExit(ok, 0, JSON.stringify(ok.json?.checks.filter((c) => !c.ok)));
+  // a report that finished before the verified commit was made is refused
+  const early = scenario({ report: (rep) => { rep.finishedAt = '2020-01-01T00:00:00.000Z'; } });
+  reword(early);
+  const r = early.gate();
+  assertExit(r, 1);
+  assert.deepEqual(r.json.failed, ['verify-report']);
+  assert.match(named(r.json, 'verify-report').detail, /report finished before the verified commit was made/);
+});
+
+test('final-gate: a report for another commit with a DIFFERENT tree, or for a sha that is not in the repository, is refused', () => {
+  const moved = scenario();
+  moved.repo.write('src/app.js', 'export const a = 3;\n');
+  const head = moved.repo.commit('a real change after verify');
+  moved.fake.setScript(ghEntries({ prHead: head }));
+  const a = moved.gate();
+  assertExit(a, 1);
+  assert.match(named(a.json, 'verify-report').detail, new RegExp(`report is for ${moved.head.slice(0, 8)}, HEAD is ${head.slice(0, 8)} \\(its tree is not HEAD's tree\\)`));
+  assert.ok(a.json.failed.includes('verify-report'));
+
+  const unknown = scenario({ report: (rep) => { rep.git.head = 'e'.repeat(40); } });
+  const b = unknown.gate();
+  assertExit(b, 1);
+  assert.deepEqual(b.json.failed, ['verify-report']);
+  assert.match(named(b.json, 'verify-report').detail, /report is for eeeeeeee, HEAD is [0-9a-f]{8} \(that commit is not in this repository\)/);
+
+  // a value that is no sha at all gets the plain message
+  const junk = scenario({ report: (rep) => { rep.git.head = 'not-a-sha'; } });
+  const c = junk.gate();
+  assertExit(c, 1);
+  assert.doesNotMatch(named(c.json, 'verify-report').detail, /\(its tree|\(that commit/);
+});
+
+test('final-gate: a same-tree report whose tree fingerprint was taken for HEAD (not for the verified commit) is refused', () => {
+  const s = scenario();
+  const head = reword(s);
+  const asHead = treeFingerprint({ cwd: s.repo.dir });
+  assert.notEqual(asHead, treeFingerprint({ cwd: s.repo.dir }, { asHead: s.head }), 'the two fingerprints differ (they hash different heads)');
+  const file = join(s.repo.dir, '.verify', 'report.json');
+  const report = JSON.parse(readFileSync(file, 'utf8'));
+  report.git.tree = asHead;
+  writeFileSync(file, JSON.stringify(report));
+  const r = s.gate();
+  assertExit(r, 1);
+  assert.deepEqual(r.json.failed, ['verify-report']);
+  assert.match(named(r.json, 'verify-report').detail, /the working tree changed since verify ran/);
+  assert.equal(r.json.head, head);
+});
+
+test('final-gate: a same-tree report does not cover a working tree that changed since (dirty or untracked file)', () => {
+  const s = scenario();
+  reword(s);
+  s.repo.write('src/untracked.js', 'export const u = 1;\n');
+  const r = s.gate();
+  assertExit(r, 1);
+  assert.match(named(r.json, 'verify-report').detail, /the working tree changed since verify ran/);
 });
 
 test('final-gate: verify.expected_steps in the config overrides the report\'s own expectedSteps', () => {

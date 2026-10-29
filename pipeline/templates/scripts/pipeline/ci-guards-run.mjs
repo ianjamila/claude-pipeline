@@ -1,14 +1,17 @@
 // Orchestrator the pipeline-guards workflow runs on a BASE checkout (never PR code): fetches the PR head as data,
-// decides which human approval labels still count, runs both guards and publishes the two required commit statuses.
+// decides which human approval labels still count, runs both guards and publishes the two required commit statuses, plus
+// `Cross-model review` with ci.review_check (REVIEW_KEY below).
 // TWO PHASES, so the verdict can be bound to an artifact only this run can upload (issue #3):
-//   phase 1 (default): everything below except publishing. Writes `verdict.json` (the PR, head, base, the per-check state
-//     and description, the labels to remove, the receipt this process posted) into $PIPELINE_VERDICT_DIR (default
-//     $RUNNER_TEMP/pipeline-verdict) and appends `artifact=<name>` to $GITHUB_OUTPUT: the name carries the head, both
-//     states and the receipt (verdictArtifactName in lib/guard-provenance.mjs). The workflow then uploads that file under
-//     that name (actions/upload-artifact).
-//   phase 2 (`--publish`, after the upload succeeded): re-checks that the PR head is still the verdict's, posts the two
-//     statuses, and only then removes invalid approval labels. A status therefore never exists without its artifact, and
-//     the final gate / later runs accept a status only when the artifact of the run it points at says the same.
+//   phase 1 (default): everything below except publishing. Writes `verdict.json` (version 2: the PR, head, base, the
+//     per-check state and description, the labels to remove, the receipt this process posted) into $PIPELINE_VERDICT_DIR
+//     (default $RUNNER_TEMP/pipeline-verdict) and appends `artifact=<name>` to $GITHUB_OUTPUT: the name carries the head,
+//     the three states (review `off` when not checked) and the receipt (verdictArtifactName in lib/guard-provenance.mjs:
+//     pipeline-verdict_v2_…; v1 names from older runs are still read for the two guards and receipts). The workflow then
+//     uploads that file under that name (actions/upload-artifact).
+//   phase 2 (`--publish`, after the upload succeeded): re-checks that the PR head is still the verdict's, posts the
+//     statuses (not the review one when it is `off`), and only then removes invalid approval labels. A status therefore
+//     never exists without its artifact, and the final gate / later runs accept a status only when the artifact of the run
+//     it points at says the same.
 // The superseded path (a newer commit exists) posts its error statuses right away in either phase and writes no verdict.
 // Why approvals are bound by a RECEIPT: an approval must cover exactly the commit the owner reviewed. When a `labeled`
 // event for an approval label (human-approved, test-change-approved) arrives from an allowed approver and the event's
