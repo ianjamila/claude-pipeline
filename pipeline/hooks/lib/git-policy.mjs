@@ -15,7 +15,7 @@
 import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
+import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames, envUnset } from './shell-parse.mjs';
 export { withoutLiteralText, INDIRECT_EXPANSION };
 import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames, defaultLexists } from './package-scripts.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
@@ -922,18 +922,34 @@ const prNumberOf = (w) => {
   return m ? Number(m[1]) : null;
 };
 // owner/name of a repository as gh takes it ([HOST/]OWNER/REPO, a URL, a PR URL), or null when the text is not one.
+// (security review of 26cfb30: the owner's "merge" names owner/name on github.com, so a host other than github.com — a GitHub
+// Enterprise server, a mirror — names another repository with the same owner/name: null, which refuses the merge)
 const repoSlugOf = (v) => {
-  const m = /^(?:[a-z][a-z0-9+.-]*:\/\/[^/]+\/|[^/\s]+\.[^/\s]+\/)?([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?(?:\/pull\/\d+[^\s]*)?\/?$/.exec(String(v ?? '').trim());
-  return m && !DYNAMIC.test(String(v)) ? `${m[1]}/${m[2]}` : null;
+  const m = /^(?:[a-z][a-z0-9+.-]*:\/\/([^/]+)\/|([^/\s]+\.[^/\s]+)\/)?([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?(?:\/pull\/\d+[^\s]*)?\/?$/i.exec(String(v ?? '').trim());
+  if (!m || DYNAMIC.test(String(v))) return null;
+  const host = m[1] ?? m[2];
+  return host === undefined || host.toLowerCase() === 'github.com' ? `${m[3]}/${m[4]}` : null;
 };
-// Phase 3b: the repository a GH_REPO points gh at (this command's prefix, an assignment earlier on the line that surely ran, or the
-// hook's own environment): undefined when none is set (or it is empty), null when it is set to something that cannot be read.
-function ghRepoEnvSlug(env, ctx) {
-  let value;
-  if (Object.hasOwn(env, 'GH_REPO')) value = env.GH_REPO;
-  else if (unsureVar(ctx, 'GH_REPO')) return null;
-  else if (Object.hasOwn(ctx.vars, 'GH_REPO')) value = ctx.vars.GH_REPO;
-  else value = ctx.env?.GH_REPO;
+// The value a variable that selects gh's repository (GH_REPO, GH_HOST) has for this command: this command's prefix, an assignment
+// earlier on the line that surely ran, or the hook's own environment, unless an `env -u NAME` / `env -i` / `env -` in front of the
+// command took it out (envUnset). undefined when unset; null when it cannot be known.
+function ghEnvValue(env, ctx, name, unset = envUnset(env, name)) {
+  if (unset === true) return undefined;
+  if (unset === null) return null;
+  if (Object.hasOwn(env, name)) return env[name];
+  if (unsureVar(ctx, name)) return null;
+  if (Object.hasOwn(ctx.vars, name)) return ctx.vars[name];
+  return ctx.env?.[name];
+}
+// Phase 3b: the repository a GH_REPO points gh at: undefined when none is set (or it is empty), null when it is set to something
+// that cannot be read. Also null whenever GH_HOST is (or may be) set to a host other than github.com: gh then reads -R owner/name,
+// GH_REPO and the checkout's remotes on that host, and the owner's "merge" names a repository on github.com.
+// `envOf`: the command whose `env` wrappers may have removed either variable (when `env` holds only values already in ctx.vars).
+function ghRepoEnvSlug(env, ctx, envOf = env) {
+  const host = ghEnvValue(env, ctx, 'GH_HOST', envUnset(envOf, 'GH_HOST'));
+  if (host === null || (typeof host === 'string' && host !== '' && host.trim().toLowerCase() !== 'github.com')) return null;
+  const value = ghEnvValue(env, ctx, 'GH_REPO', envUnset(envOf, 'GH_REPO'));
+  if (value === null) return null;
   return typeof value === 'string' && value !== '' ? repoSlugOf(value) : undefined;
 }
 // `elsewhere`: the command names another repository (-R, a PR URL), whose mode is unknown here: judged as a chat repo.
@@ -954,7 +970,7 @@ function directMergeVerdict(pr, head, dir, ctx, what, elsewhere = false, pinFlag
   if (repo === undefined) {
     try { repo = dir === null ? null : ctx.ownerGo.repoOf(dir) ?? null; } catch { repo = null; }
   }
-  if (!repo) return deny(`${what} #${pr}: which repository it merges in cannot be told (the checkout's remotes name none or several, or -R / a PR URL / GH_REPO is built at run time or disagrees), and the owner's "merge" names its repository. Name it with -R owner/name, or ${via[0].toLowerCase()}${via.slice(1)}`);
+  if (!repo) return deny(`${what} #${pr}: which repository it merges in cannot be told (the checkout's remotes name none, several or one off github.com; -R / a PR URL / GH_REPO is built at run time, disagrees or names a host other than github.com; or GH_HOST is set), and the owner's "merge" names its repository. Name it with -R owner/name, or ${via[0].toLowerCase()}${via.slice(1)}`);
   let ok = false;
   try {
     ok = ctx.ownerGo.approvedHead(pr, head, repo) === true;
@@ -990,7 +1006,7 @@ function pmScriptRefusal(prefix, shaFlag, raw, dir, ctx) {
   const canon = `${prefix.join(' ')} <PR>${shaFlag ? ` ${shaFlag} <full 40-character head>` : ''}`;
   return deny(`\`${raw.join(' ').slice(0, 120)}\` may run the merge script \`${script}\`, and ${moved ? 'a manager option moves its target directory, so it is judged as a chat repository' : 'in this repository (owner_approval: chat)'} a merge needs the owner's "merge" for that PR and head. Only the exact form \`${canon}\` is checked against the owner's record (nothing between the script name and \`--\`, no manager options, no wrapper). Use it, or merge through \`P merge --pr N\` (it merges a low-risk PR itself).`);
 }
-function repoMergeCommandVerdict(argv, dir, ctx) {
+function repoMergeCommandVerdict(argv, dir, ctx, cmdEnv = {}) {
   if (!ctx?.ownerGo) return null;
   // (an unknown directory is judged by the session's own; a pipeline.yml that cannot be read leaves `npm run merge` as the guess, as the mode of an unreadable one is chat)
   let templates = [];
@@ -1015,7 +1031,7 @@ function repoMergeCommandVerdict(argv, dir, ctx) {
       const vals = given.flatMap((w, j, all) => (w === shaFlag ? [all[j + 1]] : w.startsWith(`${shaFlag}=`) ? [w.slice(shaFlag.length + 1)] : []));
       head = vals.length === 1 ? vals[0] ?? null : null;
     }
-    return directMergeVerdict(prNumberOf(given[0]), head, dir, ctx, `\`${prefix.join(' ')}\``, false, shaFlag, ghRepoEnvSlug({}, ctx));
+    return directMergeVerdict(prNumberOf(given[0]), head, dir, ctx, `\`${prefix.join(' ')}\``, false, shaFlag, ghRepoEnvSlug({}, ctx, cmdEnv));
   }
   for (const { prefix, shaFlag } of scripts) {
     const v = pmScriptRefusal(prefix, shaFlag, raw, dir, ctx);
@@ -1031,7 +1047,7 @@ function repoMergeCommandVerdict(argv, dir, ctx) {
       const vals = plain.flatMap((w, j, all) => (w === shaFlag ? [all[j + 1]] : w.startsWith(`${shaFlag}=`) ? [w.slice(shaFlag.length + 1)] : []));
       head = vals.length === 1 ? vals[0] ?? null : null;
     }
-    return directMergeVerdict(prNumberOf(plain[p.length]), head, dir, ctx, `\`${prefix.join(' ')}\``, false, shaFlag, ghRepoEnvSlug({}, ctx));
+    return directMergeVerdict(prNumberOf(plain[p.length]), head, dir, ctx, `\`${prefix.join(' ')}\``, false, shaFlag, ghRepoEnvSlug({}, ctx, cmdEnv));
   }
   return null;
 }
@@ -2865,9 +2881,9 @@ function evalString(str, startDir, ctx, level, child = false) {
         const v = withPrefixEnv(c, ctx, () => evalString(inner, dir, ctx, level + 1));
         if (v.decision === 'deny') { verdict = v; break; }
       }
-      if (!verdict) verdict = withPrefixEnv(c, ctx, () => repoMergeCommandVerdict(argv, dir, ctx)); // (#58; with its prefix: `npm_config_prefix=/chat npm run merge …`)
+      if (!verdict) verdict = withPrefixEnv(c, ctx, () => repoMergeCommandVerdict(argv, dir, ctx, c.env)); // (#58; with its prefix: `npm_config_prefix=/chat npm run merge …`)
       // (npm exec NAME / npx NAME: the parser unwraps them to `NAME …`, marked viaRunner. NAME is a bin, never a script, but it is judged as the merge script when it carries that name: `npx npm run NAME`)
-      if (!verdict && c.viaRunner) verdict = withPrefixEnv(c, ctx, () => repoMergeCommandVerdict(['npx', 'npm', 'run', argv[0]], dir, ctx));
+      if (!verdict && c.viaRunner) verdict = withPrefixEnv(c, ctx, () => repoMergeCommandVerdict(['npx', 'npm', 'run', argv[0]], dir, ctx, c.env));
       if (!verdict && c.viaRunner) {
         verdict = runnerBinVerdict(argv, dir, ctx, level);
         // (R1-B6: `npx --prefix sub tool`: the bin may come from the prefix's node_modules/.bin; it still runs in the working directory)

@@ -357,7 +357,8 @@ prompt, run the owner-go hook, or write `~/.claude/pipeline-state/owner-go` (the
 "no owner \"merge\" is recorded": show the request again and wait. In an `owner_approval: chat` repo a direct `gh pr merge`, the repo's
 merge command typed by hand, or auto-merge through the API is refused too unless the owner said "merge" for that repository, PR and head in this
 session (and it pins the head: `--match-head-commit <full head>`; the repository is the one `-R`, a PR URL or GH_REPO names, else the
-checkout's when all its remotes name one); `P merge` is the normal way.
+checkout's when all its remotes name one; only on github.com: another host, or any GH_HOST but github.com, is refused, and an `env -u` /
+`env -i` that drops GH_REPO counts); `P merge` is the normal way.
 
 ## Step 7 — summary
 

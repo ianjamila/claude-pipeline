@@ -60,10 +60,14 @@ const defaultRemotes = (dir) => {
   const r = run('git', ['-C', dir, 'remote', '-v'], { timeoutMs: LOOKUP_TIMEOUT_MS });
   return r.code === 0 ? r.stdout : null;
 };
-// owner/name from a remote URL (git@host:owner/name.git, https://host/owner/name, ssh://git@host/owner/name.git), or null.
+// owner/name from a github.com remote URL (git@github.com:owner/name.git, https://github.com/owner/name, ssh://git@github.com/owner/name.git),
+// or null. (security review of 26cfb30: a remote on another host — GitHub Enterprise, a mirror, a local path — holds another repository
+// with the same owner/name, and the owner's "merge" names one on github.com)
 export function remoteSlug(url) {
-  const m = /[:/]([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/.exec(String(url ?? '').trim());
-  return m ? `${m[1]}/${m[2]}` : null;
+  const s = String(url ?? '').trim();
+  const m = /^[a-z][a-z0-9+.-]*:\/\/(?:[^@/]*@)?([^/:@]+)(?::\d*)?\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/i.exec(s)
+    ?? /^(?:[^@/:]*@)?([^/:@]+):(?!\/)([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/.exec(s);
+  return m && m[1].toLowerCase() === 'github.com' ? `${m[2]}/${m[3]}` : null;
 }
 export function repoOfRemotes(text) {
   if (typeof text !== 'string') return null;

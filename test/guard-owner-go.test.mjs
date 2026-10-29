@@ -393,3 +393,58 @@ test('Phase 3b: the checkout\'s repository is read from its remotes, and only wh
   assert.equal(remotes(''), null);
   assert.equal(remotes(null), null, 'git failed');
 });
+
+// Phase 3b security review (26cfb30), finding 1: the owner's "merge" names owner/name on github.com. A host other than github.com (in
+// -R, a PR URL, GH_REPO or a remote) names another repository with the same owner/name, and GH_HOST moves every one of them there.
+test('Phase 3b: a merge on a host other than github.com, or with GH_HOST set, is not the repository the owner named', () => {
+  const pin7 = `--match-head-commit ${H7}`;
+  for (const cmd of [`gh pr merge -R ghe.corp/o/chat 7 ${pin7}`, `gh pr merge https://ghe.corp/o/chat/pull/7 ${pin7}`, `GH_REPO=ghe.corp/o/chat gh pr merge 7 ${pin7}`,
+    `GH_REPO=https://ghe.corp/o/chat gh pr merge 7 ${pin7}`, `GH_HOST=ghe.corp gh pr merge 7 ${pin7}`, `GH_HOST=ghe.corp gh pr merge -R o/chat 7 ${pin7}`,
+    `env GH_HOST=ghe.corp gh pr merge -R github.com/o/chat 7 ${pin7}`, `export GH_HOST=ghe.corp; gh pr merge 7 ${pin7}`, `GH_HOST="$H" gh pr merge 7 ${pin7}`,
+    `GH_HOST=ghe.corp npm run merge -- 7 --expect-head ${H7}`, `export GH_HOST=ghe.corp; npm run merge -- 7 --expect-head ${H7}`]) {
+    assert.match(deny(cmd).reason, /cannot be told .*names a host other than github\.com.*GH_HOST is set/, cmd);
+  }
+  const inherited = (cmd, env) => evaluateGitCommand(cmd, { ...opts('/chat'), env });
+  assert.equal(inherited(`gh pr merge 7 ${pin7}`, { GH_HOST: 'ghe.corp' }).decision, 'deny', 'the hook process\'s own GH_HOST');
+  assert.equal(inherited(`npm run merge -- 7 --expect-head ${H7}`, { GH_HOST: 'ghe.corp' }).decision, 'deny');
+  // github.com itself, an empty GH_HOST, or one an `env -u` takes away: unchanged
+  allow(`GH_HOST=github.com gh pr merge 7 ${pin7}`);
+  allow(`GH_HOST= gh pr merge -R https://GitHub.com/o/chat 7 ${pin7}`);
+  assert.equal(inherited(`env -u GH_HOST gh pr merge 7 ${pin7}`, { GH_HOST: 'ghe.corp' }).decision, 'allow');
+  // the checkout's remotes: only github.com ones name a repository
+  const remotes = (text) => ownerGoWiring('sess', { gitShow: () => null, remotes: () => text }).repoOf('/x');
+  assert.equal(remotes('origin\tssh://git@github.com:22/o/chat.git (fetch)\nhttps\thttps://tok@GitHub.com/o/chat (fetch)\n'), 'o/chat');
+  for (const url of ['git@ghe.corp:o/chat.git', 'https://ghe.corp/o/chat', 'ssh://git@ghe.corp/o/chat.git', '/srv/git/o/chat.git', 'file:///srv/o/chat', 'https://github.com.evil/o/chat']) {
+    assert.equal(remotes(`origin\t${url} (fetch)\n`), null, url);
+  }
+  assert.equal(remotes('origin\tgit@github.com:o/chat.git (fetch)\nmirror\tgit@ghe.corp:o/chat.git (fetch)\n'), null, 'gh may pick the other host');
+});
+
+// Phase 3b security review (26cfb30), finding 2: an `env` wrapper that takes GH_REPO / GH_HOST out of gh's environment (-u NAME, -i, a
+// bare `-`) leaves gh on the checkout's repository, whatever the hook's own environment or the line set before.
+test('Phase 3b: GH_REPO removed by `env -u` / `env -i` / `env -` is not the repository gh merges in', () => {
+  const pin7 = `--match-head-commit ${H7}`;
+  // (from /other, whose repository is o/other, with GH_REPO=o/chat inherited: removing it merges o/other #7, which the owner never named)
+  const inherited = (cmd, cwd = '/other', env = { GH_REPO: 'o/chat' }) => evaluateGitCommand(cmd, { ...opts(cwd), env });
+  for (const cmd of [`env -u GH_REPO gh pr merge 7 ${pin7}`, `env -uGH_REPO gh pr merge 7 ${pin7}`, `env --unset=GH_REPO gh pr merge 7 ${pin7}`,
+    `env --unset GH_REPO gh pr merge 7 ${pin7}`, `env --uns GH_REPO gh pr merge 7 ${pin7}`, `env -i gh pr merge 7 ${pin7}`, `env -iv gh pr merge 7 ${pin7}`,
+    `env - gh pr merge 7 ${pin7}`, `env --ignore-environment gh pr merge 7 ${pin7}`, `env --ignore-e gh pr merge 7 ${pin7}`, `env -iu GH_HOST gh pr merge 7 ${pin7}`,
+    `GH_REPO=o/chat env -u GH_REPO gh pr merge 7 ${pin7}`, `env GH_REPO=o/chat env -u GH_REPO gh pr merge 7 ${pin7}`, `env GH_REPO=o/chat env -i gh pr merge 7 ${pin7}`,
+    `env --frobnicate gh pr merge 7 ${pin7}`, `env -Z gh pr merge 7 ${pin7}`]) {
+    assert.equal(inherited(cmd).decision, 'deny', cmd);
+  }
+  // the merge command reads gh's repository the same way (/chat whose remotes name none: only the inherited GH_REPO named o/chat)
+  const noRepo = (cmd) => evaluateGitCommand(cmd, { ...opts('/chat'), env: { GH_REPO: 'o/chat' }, ownerGo: { ...ownerGo, repoOf: () => null } });
+  assert.equal(noRepo(`npm run merge -- 7 --expect-head ${H7}`).decision, 'allow');
+  for (const cmd of [`env -u GH_REPO npm run merge -- 7 --expect-head ${H7}`, `env -i PATH=/usr/bin npm run merge -- 7 --expect-head ${H7}`]) {
+    assert.equal(noRepo(cmd).decision, 'deny', cmd);
+  }
+  // set again after the removal, or another name removed: read as before
+  for (const cmd of [`env -i GH_REPO=o/chat gh pr merge 7 ${pin7}`, `env -u GH_REPO GH_REPO=o/chat gh pr merge 7 ${pin7}`, `env -u GH_REPO env GH_REPO=o/chat gh pr merge 7 ${pin7}`,
+    `env -u OTHER gh pr merge 7 ${pin7}`, `env -0v gh pr merge 7 ${pin7}`]) {
+    assert.equal(inherited(cmd).decision, 'allow', `${cmd}: ${inherited(cmd).reason}`);
+  }
+  assert.equal(inherited(`env -i GH_REPO=o/chat gh pr merge 7 ${pin7}`, '/other', { GH_REPO: 'o/fork', GH_HOST: 'ghe.corp' }).decision, 'allow', '-i took the inherited GH_HOST too');
+  // (and a short option group no longer hides gh: `env -iu GH_REPO gh …` runs gh, not a command named GH_REPO)
+  assert.equal(verdict(`env -iu GH_REPO gh pr merge 8 --match-head-commit ${H8}`).decision, 'deny');
+});

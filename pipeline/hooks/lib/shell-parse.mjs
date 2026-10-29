@@ -208,27 +208,84 @@ function skipOpts(argv, i, shortVal = '', longVal = [], seen = null) {
 const rest = (argv, i, env = {}) => (i < argv.length ? { argv: argv.slice(i), env } : null);
 const plain = (shortVal, longVal) => (argv) => rest(argv, skipOpts(argv, 1, shortVal, longVal));
 
+// Phase 3b (security review): what an `env` wrapper takes out of the environment of the command it starts (-u NAME, -i, a bare `-`), kept on
+// the command's env object (not enumerable: the object still lists only what was set) as { all, removed, setAfter, unsure }. A name set by a later
+// `env NAME=v` is back (setAfter); an option this reading does not know may remove anything (unsure). Read it with envUnset.
+const ENV_UNSET = Symbol('envUnset');
+const ENV_LONG = ['ignore-environment', 'null', 'unset', 'chdir', 'split-string', 'block-signal', 'default-signal', 'ignore-signal', 'list-signal-handling', 'debug', 'help', 'version'];
+// (GNU getopt takes any unambiguous prefix of a long option: `--uns GH_REPO`, `--ignore-e`)
+const envLong = (name) => (ENV_LONG.includes(name) ? name : (ENV_LONG.filter((o) => o.startsWith(name)).length === 1 ? ENV_LONG.find((o) => o.startsWith(name)) : null));
+// true: the env wrappers in front of the command removed NAME (and none set it again); null: one may have (an option not understood); false: not removed.
+export function envUnset(env, name) {
+  const u = env?.[ENV_UNSET];
+  if (!u || u.setAfter.has(name)) return false;
+  if (u.all || u.removed.has(name)) return true;
+  return u.unsure ? null : false;
+}
+function unsetState(env) {
+  if (!env[ENV_UNSET]) Object.defineProperty(env, ENV_UNSET, { value: { all: false, removed: new Set(), setAfter: new Set(), unsure: false }, enumerable: false });
+  return env[ENV_UNSET];
+}
+// Applies one env wrapper's removals (`edits`, from unwrapEnv) to the env built so far, before that wrapper's own assignments are added.
+function applyEnvEdits(env, edits) {
+  if (!edits) return;
+  const u = unsetState(env);
+  if (edits.all) { u.all = true; u.removed.clear(); u.setAfter.clear(); u.unsure = false; }
+  for (const n of edits.removed) { u.removed.add(n); u.setAfter.delete(n); }
+  if (edits.unsure) u.unsure = true;
+}
 function unwrapEnv(argv) {
   let a = argv;
   const env = {};
+  const edits = { all: false, removed: [], unsure: false };
   let i = 1;
   let optsDone = false;
   while (i < a.length) {
     const t = a[i];
     if (!optsDone && t === '--') { optsDone = true; i++; continue; }
-    if (!optsDone && t.startsWith('-') && t.length > 1) {
-      if (/^-[A-Za-z]*S/.test(t) || t.startsWith('--split-string')) {
-        // -S "git push -f": the string is split into words and becomes the command line
-        let str;
-        let end = i + 1;
-        if (t.startsWith('--split-string=')) str = t.slice('--split-string='.length);
-        else if (t === '--split-string' || t === '-S') { str = a[i + 1] ?? ''; end = i + 2; }
-        else str = t.slice(t.indexOf('S') + 1);
-        a = [...a.slice(0, i), ...splitArgs(str), ...a.slice(end)];
+    if (!optsDone && t === '-') { edits.all = true; i++; continue; } // (a bare `-` is -i)
+    if (!optsDone && t.startsWith('--')) {
+      const eq = t.indexOf('=');
+      const name = envLong(eq < 0 ? t.slice(2) : t.slice(2, eq));
+      const inline = eq < 0 ? undefined : t.slice(eq + 1);
+      if (name === 'split-string') {
+        // --split-string "git push -f": the string is split into words and becomes the command line
+        const str = inline ?? a[i + 1] ?? '';
+        a = [...a.slice(0, i), ...splitArgs(str), ...a.slice(inline === undefined ? i + 2 : i + 1)];
         continue;
       }
-      const valued = t === '-u' || t === '-C' || t === '-P' || t === '--unset' || t === '--chdir';
-      i += valued ? 2 : 1;
+      const valued = name === 'unset' || name === 'chdir';
+      const value = valued ? inline ?? a[i + 1] : undefined;
+      if (name === 'ignore-environment') edits.all = true;
+      else if (name === 'unset') edits.removed.push(value ?? '');
+      else if (name === null) edits.unsure = true;
+      i += valued && inline === undefined ? 2 : 1;
+      continue;
+    }
+    if (!optsDone && t.startsWith('-') && t.length > 1) {
+      // a group of short options (-iv, -iu NAME, -uNAME, -vS "git push -f"): a valued one takes the rest of the word, or the next word
+      let step = 1;
+      let split = null;
+      for (let k = 1; k < t.length; k++) {
+        const c = t[k];
+        if (c === 'i') { edits.all = true; continue; }
+        if (c === '0' || c === 'v') continue;
+        if (c === 'u' || c === 'C' || c === 'P' || c === 'S') {
+          const glued = t.slice(k + 1);
+          const value = glued !== '' ? glued : a[i + 1];
+          if (glued === '') step = 2;
+          if (c === 'u') edits.removed.push(value ?? '');
+          if (c === 'S') split = value ?? '';
+          break;
+        }
+        edits.unsure = true;
+      }
+      if (split !== null) {
+        // -S "git push -f": the string is split into words and becomes the command line
+        a = [...a.slice(0, i), ...splitArgs(split), ...a.slice(i + step)];
+        continue;
+      }
+      i += step;
       continue;
     }
     const kv = /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/.exec(t);
@@ -236,7 +293,9 @@ function unwrapEnv(argv) {
     setEnv(env, kv[1], kv[2]);
     i++;
   }
-  return rest(a, i, env);
+  const out = rest(a, i, env);
+  if (out && (edits.all || edits.removed.length || edits.unsure)) Object.defineProperty(out, 'envEdits', { value: edits, enumerable: false });
+  return out;
 }
 
 function unwrapCommand(argv) {
@@ -2838,7 +2897,11 @@ class Parser {
         }
       }
       if (!fan && (base(a[0]) === 'xargs' || base(a[0]) === 'parallel')) fan = a;
-      for (const k of Object.keys(un.env)) setEnv(env, k, un.env[k]);
+      applyEnvEdits(env, un.envEdits);
+      for (const k of Object.keys(un.env)) {
+        setEnv(env, k, un.env[k]);
+        env[ENV_UNSET]?.setAfter.add(k);
+      }
       a = this.winFix(un.argv, seg);
     }
     // Why: bash sets $BASH to its own path (zsh leaves it unset), so `"${BASH:-bash}" f.sh` runs f.sh with bash: read as bash, unless the text (or the environment) can bind
